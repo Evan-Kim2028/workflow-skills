@@ -551,7 +551,7 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
     var t = r.tokens || {}, tot = tokTotal(t);
     var td = el("td", {class: "n", title: "total " + fmtN(tot) + " \u00B7 input " + fmtN(t.input) + " \u00B7 output " + fmtN(t.output) + " \u00B7 cache read " + fmtN(t.cache_read) + " \u00B7 cache write " + fmtN(t.cache_write)});
     if (!tot && r.context_tokens && !r.ended_at) {
-      td.appendChild(el("span", {class: "ctx-est", text: "~" + fmtN(r.context_tokens)}));
+      td.appendChild(document.createTextNode("~" + fmtN(r.context_tokens))); td.appendChild(el("span", {class: "cached", text: " live"}));
       td.title = "Estimate: context window now. Billed tokens arrive when the run ends.";
       return td;
     }
@@ -822,7 +822,7 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
       var wn = el("div", {class: "working-now"}, [el("b", {text: "\u25CF Working now (" + nLive + ")"})]);
       workingIds.forEach(function (tid) { live[tid].forEach(function (r) {
         var slug = String(r.label || "").replace(new RegExp("^" + plan.ws.toLowerCase() + "[-._]?", "i"), "").replace(tid, "").replace(/^[-._]+/, "");
-        var pill = el("button", {class: "wn-pill", title: (r.label || "") + " \u00B7 " + modelName(tierKey(r)) + " \u00B7 " + fmtDur(r.elapsed_s)}, [el("i"), el("span", {class: "wn-id", text: tid}), el("span", {class: "wn-slug", text: slug}), el("span", {class: "wn-tok", text: tokTotal(r.tokens) ? fmtN(tokTotal(r.tokens)) + " \u00B7 " + cachedPct(r.tokens) + "% cached" : (r.context_tokens ? "~" + fmtN(r.context_tokens) : "")})]);
+        var pill = el("button", {class: "wn-pill", title: (r.label || "") + " \u00B7 " + modelName(tierKey(r)) + " \u00B7 " + fmtDur(r.elapsed_s)}, [el("i"), el("span", {class: "wn-id", text: tid}), el("span", {class: "wn-slug", text: slug}), el("span", {class: "wn-tok", text: tokTotal(r.tokens) ? fmtN(tokTotal(r.tokens)) + " \u00B7 " + cachedPct(r.tokens) + "% cached" : (r.context_tokens ? "~" + fmtN(r.context_tokens) + " \u00B7 live" : "")})]);
         pill.firstChild.style.background = colorOf(tierKey(r));
         pill.addEventListener("click", function () { openRun(r); });
         wn.appendChild(pill);
