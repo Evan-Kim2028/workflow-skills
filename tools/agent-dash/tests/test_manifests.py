@@ -75,6 +75,13 @@ class ManifestUnitTests(unittest.TestCase):
         self.assertEqual(rows[1]["model"], "glm-5.3")
         self.assertEqual(rows[1]["session_uuid"], "22222222-2222-2222-2222-222222222222")
 
+    def test_composer_model_is_its_own_tier(self):
+        self.assertEqual(manifests.tier_of("composer-2.5"), "composer")
+        self.assertEqual(manifests.tier_of("grok-4.7"), "grok")
+        self.assertEqual(manifests.tier_of("glm-5.3"), "glm")
+        self.assertIsNone(manifests.tier_of(None))
+        self.assertIsNone(manifests.tier_of(""))
+
     def test_verdict_regex(self):
         self.assertEqual(manifests.verdict_of("PASS\n"), "PASS")
         self.assertEqual(manifests.verdict_of("PASS. more text\n"), "PASS")
@@ -334,6 +341,20 @@ class ManifestPollTests(unittest.TestCase):
         self.assertEqual(shell["verdict"], "BLOCKED")
         self.assertEqual(shell["clock_source"], "mtime")
         self.assertEqual(shell["status"], "done")
+
+    def test_composer_cursor_row_is_not_grok(self):
+        _write(
+            os.path.join(self.scratch, "cursor-sessions.tsv"),
+            "comp-row\t-\t1700000010\tcomposer-2.5\n",
+            NOW,
+        )
+        _write(os.path.join(self.scratch, "cursor", "out-comp-row.md"), "PASS\n", NOW)
+        manifests.poll(self.store, self._cfg(), NOW)
+        rows = [row for row in self.store.runs.values() if row.get("label") == "comp-row"]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["source"], "grok")
+        self.assertEqual(rows[0]["model"], "composer-2.5")
+        self.assertEqual(rows[0]["tier"], "composer")
 
     def test_growth_live_label_and_died_early(self):
         _write(

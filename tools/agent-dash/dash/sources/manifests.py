@@ -31,6 +31,8 @@ import os
 import re
 import stat
 
+from dash.models import model_key
+
 NAME = "manifests"
 INTERVAL_S = 2
 
@@ -79,6 +81,9 @@ def reset_state() -> None:
 def tier_of(model: str | None) -> str | None:
     if not model or not isinstance(model, str):
         return None
+    _family, key = model_key(model)
+    if key.startswith("composer"):
+        return "composer"
     text = model.lower()
     for name in ("opus", "sonnet", "haiku", "muse", "glm", "grok"):
         if name in text:
