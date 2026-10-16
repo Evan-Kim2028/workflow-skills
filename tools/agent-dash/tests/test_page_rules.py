@@ -1,5 +1,6 @@
 """Static rules for the dashboard pages: every chart has axes, every number is compact."""
 import os
+import subprocess
 
 os.environ["AGENT_DASH_IGNORE_LOCAL"] = "1"
 os.environ.setdefault("AGENT_DASH_WORKSTREAMS", os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "fixtures", "bundles"))
@@ -45,6 +46,24 @@ class PageRules(unittest.TestCase):
                     continue
                 for bad in (".toFixed(", "toLocaleString()"):
                     self.assertNotIn(bad, body, f"{path.name}:{name} formats a number with {bad}; use fmtN/fmtUsd/fmtDur")
+
+    def test_unknown_duration_is_a_dash(self):
+        script = (
+            "const fs=require('fs');"
+            "const src=fs.readFileSync(process.argv[1],'utf8').replace('})(window);','})(global);');"
+            "eval(src);"
+            "const dash='\\u2013';"
+            "if(AD.fmtDur(null)!==dash) process.exit(2);"
+            "if(AD.fmtDur(undefined)!==dash) process.exit(3);"
+            "if(AD.fmtDur(0)!=='0s') process.exit(4);"
+            "if(AD.fmtDur(90)!=='1m 30s') process.exit(5);"
+        )
+        proc = subprocess.run(
+            ["node", "-e", script, str(STATIC / "format.js")],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr or proc.stdout)
 
 
 if __name__ == "__main__":

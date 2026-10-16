@@ -613,6 +613,138 @@ class StoreTest(unittest.TestCase):
         ranged = self.store.snapshot(now, "all", since=now - 10)
         self.assertEqual(ranged["counts"]["finished_in_range"], 0)
 
+    def test_null_started_at_is_not_written_over_a_known_start(self):
+        self.store.upsert_run(
+            {
+                "run_id": "muse:s:ws2-notes",
+                "source": "muse",
+                "tier": "muse",
+                "label": "ws2-notes",
+                "status": "running",
+                "started_at": 1792167605.0,
+                "clock_source": "manifest",
+            }
+        )
+        self.store.upsert_run(
+            {
+                "run_id": "muse:s:ws2-notes",
+                "source": "muse",
+                "started_at": None,
+                "status": "running",
+            }
+        )
+        row = self.store.get_run("muse:s:ws2-notes")
+        self.assertEqual(row["started_at"], 1792167605.0)
+        self.assertEqual(row["clock_source"], "manifest")
+
+    def test_elapsed_is_null_when_the_start_is_unknown(self):
+        self.store.upsert_run(
+            {
+                "run_id": "muse:s:bare",
+                "source": "muse",
+                "tier": "muse",
+                "label": "bare",
+                "status": "unknown",
+            }
+        )
+        runs = self.store.query_runs(1000.0, None, None, None, 10)
+        self.assertEqual(len(runs), 1)
+        self.assertIsNone(runs[0]["started_at"])
+        self.assertIsNone(runs[0]["elapsed_s"])
+        self.assertIsNone(runs[0]["context_tokens"])
+
+    def test_context_tokens_are_latest_and_excluded_from_totals(self):
+        now = 1_700_000_000.0
+        run_id = "grok:chat:ws1-47-extract-rebase"
+        self.store.upsert_run(
+            {
+                "run_id": run_id,
+                "source": "grok",
+                "tier": "grok",
+                "label": "ws1-47-extract-rebase",
+                "session_id": "chat",
+                "status": "running",
+                "started_at": now - 10,
+            }
+        )
+        self.store.add_usage(
+            {
+                "ts": now - 5,
+                "session_id": "chat",
+                "run_id": run_id,
+                "model": "grok-4",
+                "tool": "grok-context",
+                "message_id": "ctx-1",
+                "input": 1000,
+                "output": 500000,
+            }
+        )
+        self.store.add_usage(
+            {
+                "ts": now - 1,
+                "session_id": "chat",
+                "run_id": run_id,
+                "model": "grok-4",
+                "tool": "grok-context",
+                "message_id": "ctx-2",
+                "input": 113622,
+                "output": 500000,
+            }
+        )
+        snap = self.store.snapshot(now, "all")
+        run = snap["running"][0]
+        self.assertEqual(run["context_tokens"], 113622)
+        self.assertEqual(run["tokens"]["input"], 0)
+        self.assertEqual(snap["totals"]["tokens"]["input"], 0)
+        listed = self.store.query_runs(now, None, None, None, 10)
+        self.assertEqual(listed[0]["context_tokens"], 113622)
+        buckets = self.store.query_usage("tool", "hour", None, None)
+        self.assertEqual(sum(row["input"] for row in buckets), 0)
+
+    def test_reassign_keeps_the_labeled_start_and_raises_the_end(self):
+        src = "muse:s:s"
+        dst = "muse:s:ws2-notes"
+        self.store.upsert_run(
+            {
+                "run_id": dst,
+                "source": "muse",
+                "tier": "muse",
+                "label": "ws2-notes",
+                "session_id": "s",
+                "status": "done",
+                "started_at": 1792167605.0,
+                "ended_at": 1792167605.0,
+                "clock_source": "manifest",
+            }
+        )
+        self.store.upsert_run(
+            {
+                "run_id": src,
+                "source": "muse",
+                "tier": "muse",
+                "session_id": "s",
+                "status": "unknown",
+                "started_at": None,
+                "ended_at": 1792167600.0,
+            }
+        )
+        self.store.add_usage(
+            {
+                "ts": 1792167848.6732,
+                "session_id": "s",
+                "run_id": src,
+                "tool": "muse",
+                "message_id": "late",
+                "input": 12,
+                "output": 1,
+            }
+        )
+        self.assertTrue(self.store.reassign_run(src, dst))
+        kept = self.store.get_run(dst)
+        self.assertIsNone(self.store.get_run(src))
+        self.assertEqual(kept["started_at"], 1792167605.0)
+        self.assertEqual(kept["ended_at"], 1792167848.6732)
+
 
 class ProcessParseTest(unittest.TestCase):
     def test_etime_and_label_and_ps_line(self):
@@ -831,6 +963,98 @@ class ProcessParseTest(unittest.TestCase):
                                 raise AssertionError("process sample stored argv or a prompt")
             finally:
                 store.close()
+
+    def test_reconcile_raises_a_premature_end_to_last_usage(self):
+        sid = "d9000a2a-f4c1-45bd-ac06-b65dd4e8d579"
+        label = "ws2-WS2.14-prod-columns"
+        run_id = "muse:%s:%s" % (sid, label)
+        start = 1792167605.0
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "dash.sqlite")
+            try:
+                store.upsert_run(
+                    {
+                        "run_id": run_id,
+                        "source": "muse",
+                        "tier": "muse",
+                        "label": label,
+                        "session_id": sid,
+                        "status": "done",
+                        "started_at": start,
+                        "ended_at": start,
+                        "clock_source": "manifest",
+                    }
+                )
+                store.add_usage(
+                    {
+                        "ts": 1792167848.6732,
+                        "session_id": sid,
+                        "run_id": run_id,
+                        "tool": "muse",
+                        "message_id": "last",
+                        "input": 10,
+                        "output": 1,
+                    }
+                )
+                reconcile_running(store, 1792168000.0, [])
+                row = store.get_run(run_id)
+                view = store.query_runs(1792169000.0, "WS2", None, None, 10)
+            finally:
+                store.close()
+        self.assertEqual(row["status"], "done")
+        self.assertEqual(row["started_at"], start)
+        self.assertEqual(row["ended_at"], 1792167848.6732)
+        self.assertAlmostEqual(view[0]["elapsed_s"], 1792167848.6732 - start)
+
+    def test_reconcile_closes_a_dead_muse_and_fills_the_start(self):
+        sid = "971a8090-feb6-46fc-80f4-f458a744b07a"
+        label = "ws2-WS2.17-drop-gate-rev1"
+        run_id = "muse:%s:%s" % (sid, label)
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "dash.sqlite")
+            try:
+                store.upsert_run(
+                    {
+                        "run_id": run_id,
+                        "source": "muse",
+                        "tier": "muse",
+                        "label": label,
+                        "session_id": sid,
+                        "status": "running",
+                        "pid": 999999,
+                    }
+                )
+                store.add_usage(
+                    {
+                        "ts": 1792167818.0,
+                        "session_id": sid,
+                        "run_id": run_id,
+                        "tool": "muse",
+                        "message_id": "first",
+                        "input": 4,
+                        "output": 1,
+                    }
+                )
+                store.add_usage(
+                    {
+                        "ts": 1792167946.0,
+                        "session_id": sid,
+                        "run_id": run_id,
+                        "tool": "muse",
+                        "message_id": "last",
+                        "input": 4,
+                        "output": 1,
+                    }
+                )
+                ended = reconcile_running(store, 1792168000.0, [])
+                row = store.get_run(run_id)
+            finally:
+                store.close()
+        self.assertEqual(ended, 1)
+        self.assertEqual(row["status"], "done")
+        self.assertEqual(row["started_at"], 1792167818.0)
+        self.assertEqual(row["ended_at"], 1792167946.0)
+        self.assertIsNone(row["pid"])
 
 
 class HubTest(unittest.TestCase):

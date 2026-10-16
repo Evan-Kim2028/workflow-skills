@@ -24,7 +24,8 @@
   }
 
   function fmtDur(seconds) {
-    seconds = Math.max(0, +seconds || 0);
+    if (seconds == null || !isFinite(+seconds)) return "\u2013";
+    seconds = Math.max(0, +seconds);
     if (seconds < 60) return Math.round(seconds) + "s";
     if (seconds < 3600) return Math.floor(seconds / 60) + "m " + Math.round(seconds % 60) + "s";
     return Math.floor(seconds / 3600) + "h " + Math.round((seconds % 3600) / 60) + "m";

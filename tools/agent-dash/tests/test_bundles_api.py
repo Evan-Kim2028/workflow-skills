@@ -116,6 +116,13 @@ class BundlesApiTest(unittest.TestCase):
         bundle = json.loads(body)
         self.assertEqual(bundle["bundle"]["title"], "Example")
         self.assertEqual(bundle["plan"]["dag"]["groups"][0]["tasks"][0]["id"], "WS9.1")
+        self.assertIsNone(bundle["start_prompt"])
+        prompt_path = Path(self.tmp.name) / "WS9" / "START-PROMPT.md"
+        prompt_path.write_text("You are the WS9 (Example) lead.\n", encoding="utf-8")
+        status, _, body = get(self.port, "/api/bundle?ws=WS9")
+        self.assertEqual(json.loads(body)["start_prompt"], "You are the WS9 (Example) lead.\n")
+        status, _, body = get(self.port, "/api/plan?ws=WS9")
+        self.assertEqual(json.loads(body)["start_prompt"], "You are the WS9 (Example) lead.\n")
         status, content_type, body = get(self.port, "/bundle/WS9/page.html")
         self.assertEqual(status, 200)
         self.assertIn("text/html", content_type)

@@ -33,6 +33,9 @@ class WsCliTest(unittest.TestCase):
         root = Path(self.tmp.name) / "WS9"
         self.assertTrue((root / "plan.json").is_file())
         self.assertTrue((root / "layout.json").is_file())
+        prompt = (root / "START-PROMPT.md").read_text(encoding="utf-8")
+        self.assertIn("WS9", prompt)
+        self.assertIn("Example workstream", prompt)
         self.assertFalse((root / "plan.json.tmp").exists())
         program = root.parent / "OVERVIEW"
         program.mkdir()

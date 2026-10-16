@@ -10,7 +10,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from dash.bundles import approvals_all, approvals_for, bundle_plan_view, list_bundles, load_bundle_api, read_page, workstream_plan_ids
+from dash.bundles import approvals_all, approvals_for, bundle_plan_view, list_bundles, load_bundle_api, read_page, start_prompt_text, workstream_plan_ids
 from dash.plans import PlanError, PlanNotFound, load as load_plan
 from dash.pricing import health_block
 from dash.store import DEFAULT_LONG_RUNNING_S
@@ -181,6 +181,8 @@ class Handler(BaseHTTPRequestHandler):
             except PlanError:
                 self._json(500, {"error": "plan unreadable", "ws": ws})
                 return
+        if isinstance(body, dict) and "start_prompt" not in body:
+            body["start_prompt"] = start_prompt_text(ws)
         self._json(200, body)
 
     def _plan_page(self):

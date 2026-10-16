@@ -171,7 +171,12 @@ def load_bundle_api(ws: str) -> dict | None:
     if not isinstance(meta, dict) or not isinstance(plan, dict):
         return None
     approvals = approvals_for(ws)
-    return {"bundle": meta, "plan": plan, "approvals": approvals if approvals is not None else empty_approvals(ws)}
+    return {
+        "bundle": meta,
+        "plan": plan,
+        "approvals": approvals if approvals is not None else empty_approvals(ws),
+        "start_prompt": start_prompt_text(ws),
+    }
 
 
 def _view_groups(value) -> list:
@@ -214,7 +219,14 @@ def bundle_plan_view(ws: str) -> dict | None:
     for item in narrative.get("phases") or []:
         if isinstance(item, dict):
             phases.append({"name": item.get("name"), "goal": item.get("goal"), "gate": item.get("gate")})
-    return {"ws": ws, "cols": cols, "groups": _view_groups(dag.get("groups")), "edges": edges, "phases": phases}
+    return {
+        "ws": ws,
+        "cols": cols,
+        "groups": _view_groups(dag.get("groups")),
+        "edges": edges,
+        "phases": phases,
+        "start_prompt": start_prompt_text(ws),
+    }
 
 
 def read_page(ws: str) -> bytes | None:
@@ -322,6 +334,39 @@ def _template_layout() -> dict:
     }
 
 
+def _template_start_prompt(ws: str, title: str) -> str:
+    lower = ws.lower()
+    return (
+        f"You are the {ws} ({title}) lead.\n"
+        "\n"
+        "Read this bundle's kickoff brief, KICKOFF.md, when that file is there, and run the workstream from it.\n"
+        "The plan, the waves, and the done criteria live in the bundle.\n"
+        "\n"
+        f"Label each worker run `{lower}-<task-id>-<slug>`.\n"
+        f"Move a task with `python3 agent_dash.py ws task {ws} <task-id> <status>`.\n"
+        f"Read `ws approvals {ws}` before any production step. Run one production step at a time.\n"
+        "\n"
+        f"The plan view for {ws} is on the local dashboard.\n"
+    )
+
+
+def start_prompt_text(ws: str, root: Path | None = None) -> str | None:
+    """Text of START-PROMPT.md, or None when the bundle has no such file."""
+    path = bundle_dir(ws, root)
+    if path is None:
+        return None
+    file = path / "START-PROMPT.md"
+    try:
+        if not file.is_file() or file.stat().st_size > _MAX_BYTES:
+            return None
+        text = file.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    if not text.strip():
+        return None
+    return text
+
+
 def cmd_new(ws: str, title: str, root: Path | None = None) -> int:
     if not _ID.match(ws):
         print(f"bad id {ws}", flush=True)
@@ -347,6 +392,7 @@ def cmd_new(ws: str, title: str, root: Path | None = None) -> int:
     )
     _atomic_write(dest / "plan.json", json.dumps(_template_plan(ws), indent=2) + "\n")
     _atomic_write(dest / "layout.json", json.dumps(_template_layout(), indent=2) + "\n")
+    _atomic_write(dest / "START-PROMPT.md", _template_start_prompt(ws, title.strip()))
     _atomic_write(
         dest / "visuals.html",
         '<header>\n<p class="thesis">Replace this thesis. Render copies narrative.thesis over it.</p>\n</header>\n',

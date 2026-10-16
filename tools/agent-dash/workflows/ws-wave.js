@@ -16,18 +16,34 @@ export const meta = {
 //   maxFixRounds: 2, defaultTier: "default", reviewTier: "default",
 //   lanes: [{ task: "WS7.K1", slug: "kind-checker", tier: "default"|"auto", branch: "ws7/kind-checker",
 //             worktree: "/abs/<worktree>", brief: "what to build, files, stop rules", tests: "pytest a.py b.py",
-//             review: true }]
+//             review: true, oneWay: true, reviewFocus: "one check" | ["check A", "check B"] }]
 // }
 // tier is a registry worker name, or "default", or "auto". defaultTier defaults to "default".
 // reviewTier defaults to defaultTier. The runner prints the tier it actually used.
+// reviewFocus is optional: a string, or a list of strings. The review prompt names each one
+// and requires evidence. oneWay is optional. A oneWay lane must have a non-empty reviewFocus,
+// and it is reviewed even when review is false. The lane result carries checks when the
+// reviewer returns them: [{check, passed, evidence}].
 const A = args || {}
 const WS = A.ws
 const LOWER = String(WS || '').toLowerCase()
 const MAX_FIX = A.maxFixRounds == null ? 2 : A.maxFixRounds
 const DEFAULT_TIER = A.defaultTier || 'default'
 const REVIEW_TIER = A.reviewTier || DEFAULT_TIER
+
+function focusOf(lane) {
+  const raw = lane && lane.reviewFocus
+  const items = Array.isArray(raw) ? raw : (raw == null || raw === '' ? [] : [raw])
+  return items.map((item) => String(item).trim()).filter(Boolean)
+}
+
 if (!WS || !A.repo || !A.runDir || !A.template || !A.runner || !A.dash || !Array.isArray(A.lanes) || !A.lanes.length) {
   throw new Error('ws-wave needs args {ws, repo, runDir, template, runner, dash, lanes[]}')
+}
+for (const lane of A.lanes) {
+  if (lane && lane.oneWay && !focusOf(lane).length) {
+    throw new Error(`ws-wave lane ${lane.task || '(unnamed)'} is oneWay and needs reviewFocus`)
+  }
 }
 
 const RUN = {
@@ -39,6 +55,19 @@ const RUN = {
     findings: { type: 'string', description: 'for reviews: the numbered findings verbatim (at most 4000 characters); otherwise ""' },
     commits: { type: 'string', description: 'output of git log --oneline origin/main..HEAD in the worktree, or ""' },
     tier: { type: 'string', description: 'tier= value from the last STATUS line of the runner' },
+    checks: {
+      type: 'array',
+      description: 'one entry per reviewFocus item, when the lane named any',
+      items: {
+        type: 'object',
+        properties: {
+          check: { type: 'string' },
+          passed: { type: 'boolean' },
+          evidence: { type: 'string', description: 'command plus output, or file:line' },
+        },
+        required: ['check', 'passed', 'evidence'],
+      },
+    },
   },
   required: ['status', 'verdict', 'summary', 'findings', 'commits', 'tier'],
 }
@@ -52,7 +81,7 @@ function wrapperPrompt(o) {
     `3. Read the report file named in out=... and the last 40 lines of the err= file if the status is failed.`,
     `4. Run: git -C ${o.workspace} log --oneline origin/main..HEAD (empty is fine).`,
     o.after ? `5. ${o.after}` : ``,
-    `Return the structured result. tier is the tier= value from the last STATUS line (the worker the runner actually used). verdict is the report's first verdict word (PASS, PARTIAL, BLOCKED, APPROVE, APPROVE_WITH_NITS, APPROVE_WITH_CHANGES, REQUEST_CHANGES) or "none".`,
+    `Return the structured result. tier is the tier= value from the last STATUS line (the worker the runner actually used). verdict is the report's first verdict word (PASS, PARTIAL, BLOCKED, APPROVE, APPROVE_WITH_NITS, APPROVE_WITH_CHANGES, REQUEST_CHANGES) or "none". When the report lists a per-check result, put each one in checks as {check, passed, evidence}. A check with no evidence is passed: false. Omit checks when the report lists none.`,
     ``,
     `TASK block:`,
     `<<<TASK`,
@@ -71,12 +100,20 @@ function buildTask(lane) {
 }
 
 function reviewTask(lane, round) {
-  return [
+  const lines = [
     `READ-ONLY adversarial review, round ${round}, of branch ${lane.branch} in worktree ${lane.worktree} against origin/main, for workstream ${WS} task ${lane.task} (${lane.slug}). Do not edit, commit or push.`,
     `The task was:\n${lane.brief}`,
     `Check: correctness against the task; nothing outside its scope; repo rules in AGENTS.md (no inline # comments in Python, one writer per table, no new Iceberg gold writer); tests are meaningful and pass. Re-run: ${lane.tests || 'the test files the diff touches'}.`,
     `Output exactly: first line "VERDICT: APPROVE" or "VERDICT: APPROVE_WITH_NITS" or "VERDICT: REQUEST_CHANGES"; then numbered findings "severity - file:line - problem - fix". Only REQUEST_CHANGES for real defects, not style.`,
-  ].join('\n\n')
+  ]
+  const focus = focusOf(lane)
+  if (focus.length) {
+    const numbered = focus.map((item, i) => `${i + 1}. ${item}`).join('\n')
+    lines.push(
+      `You MUST check and report each of these, each with evidence (command plus output, or file:line):\n${numbered}\nA check without evidence counts as failed. If any check fails or lacks evidence, the verdict is REQUEST_CHANGES.`
+    )
+  }
+  return lines.join('\n\n')
 }
 
 function fixTask(lane, round, findings) {
@@ -114,12 +151,17 @@ const results = await pipeline(
       log(`${lane.task}: build ${built ? built.status + ' ' + built.verdict : 'died'}; escalating to the lead`)
       return out
     }
-    if (lane.review === false) { out.final = 'built'; return out }
+    if (lane.review === false && !lane.oneWay) { out.final = 'built'; return out }
     for (let round = 1; round <= MAX_FIX + 1; round++) {
       const rev = await run(lane, 'rev', round, reviewTask(lane, round), {
         after: `If the verdict starts with APPROVE, run: ${status(lane, 'pr')}`,
       })
-      out.rounds.push({ round, review: rev })
+      const roundRow = { round, review: rev }
+      if (rev && Array.isArray(rev.checks) && rev.checks.length) {
+        roundRow.checks = rev.checks
+        out.checks = rev.checks
+      }
+      out.rounds.push(roundRow)
       if (!rev || rev.status !== 'done') { out.final = 'review-failed'; break }
       if (/^APPROVE/.test(rev.verdict)) { out.final = rev.verdict; break }
       if (round > MAX_FIX) { out.final = 'needs-lead'; log(`${lane.task}: still REQUEST_CHANGES after ${MAX_FIX} fix rounds`); break }

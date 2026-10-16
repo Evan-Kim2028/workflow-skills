@@ -182,8 +182,16 @@ class Store:
             merged = dict(existing or {})
             merged["run_id"] = run_id
             for key in RUN_INPUT:
-                if key in row:
-                    merged[key] = row[key]
+                if key not in row:
+                    continue
+                if (
+                    key == "started_at"
+                    and row[key] is None
+                    and existing
+                    and existing.get("started_at") is not None
+                ):
+                    continue
+                merged[key] = row[key]
             merged["label"] = clean_label(merged.get("label"))
             if not merged.get("status"):
                 merged["status"] = "unknown"
@@ -426,6 +434,18 @@ class Store:
                     "UPDATE process_samples SET run_id=? WHERE run_id=?",
                     (dst_id, src_id),
                 )
+                last = self._conn.execute(
+                    "SELECT MAX(ts) AS ts FROM usage_events WHERE run_id=? AND ts IS NOT NULL AND COALESCE(tool, '') != ?",
+                    (dst_id, _ESTIMATE_TOOL),
+                ).fetchone()
+                if (
+                    merged.get("status") != "running"
+                    and merged.get("ended_at") is not None
+                    and last
+                    and last["ts"] is not None
+                    and float(last["ts"]) > float(merged["ended_at"])
+                ):
+                    merged["ended_at"] = float(last["ts"])
                 self._write_run(merged)
                 self._conn.execute("DELETE FROM runs WHERE run_id=?", (src_id,))
                 for hour in hours:
@@ -450,6 +470,48 @@ class Store:
             if self.reassign_run(src_id, dst_id):
                 moved += 1
         return moved
+
+    def repair_muse_clocks(self) -> int:
+        """Fill a missing muse start from the earliest usage event.
+
+        A finished row whose end is earlier than its latest usage event is
+        raised to that event. A running row stays open. Returns how many
+        rows changed.
+        """
+        with self._lock:
+            runs = [
+                dict(row)
+                for row in self._conn.execute(
+                    "SELECT run_id, status, started_at, ended_at, clock_source FROM runs WHERE source='muse'"
+                )
+            ]
+        changed = 0
+        for run in runs:
+            with self._lock:
+                usage = self._conn.execute(
+                    """SELECT MIN(ts) AS first_ts, MAX(ts) AS last_ts
+                       FROM usage_events
+                       WHERE run_id=? AND ts IS NOT NULL AND COALESCE(tool, '') != ?""",
+                    (run["run_id"], _ESTIMATE_TOOL),
+                ).fetchone()
+            patch = {"run_id": run["run_id"]}
+            if run.get("started_at") is None and usage and usage["first_ts"] is not None:
+                patch["started_at"] = float(usage["first_ts"])
+                if not run.get("clock_source"):
+                    patch["clock_source"] = "muse_log"
+            if (
+                run.get("status") != "running"
+                and run.get("ended_at") is not None
+                and usage
+                and usage["last_ts"] is not None
+                and float(usage["last_ts"]) > float(run["ended_at"])
+            ):
+                patch["ended_at"] = float(usage["last_ts"])
+            if len(patch) == 1:
+                continue
+            self.upsert_run(patch)
+            changed += 1
+        return changed
 
     def last_activity(self, run_id: str, started_at=None):
         with self._lock:
@@ -491,8 +553,9 @@ class Store:
         long_running_s = long_running_s or DEFAULT_LONG_RUNNING_S
         with self._lock:
             raw, usage, parents = self._scoped_usage()
+            context = self._context_by_run()
             rss = self._rss_maps(now)
-            runs = [self._run_view(row, now, usage, rss) for row in raw]
+            runs = [self._run_view(row, now, usage, rss, context) for row in raw]
             visible = [run for run in runs if _in_ws(run, ws)]
             shown = [run for run in visible if run["run_id"] not in parents]
             running = [run for run in shown if run["status"] == "running"]
@@ -527,12 +590,13 @@ class Store:
     def query_runs(self, now: float, ws: str | None, since: float | None, until: float | None, limit: int) -> list:
         with self._lock:
             raw, usage, parents = self._scoped_usage()
+            context = self._context_by_run()
             rss = self._rss_maps(now)
             rows = []
             for row in raw:
                 if row["run_id"] in parents:
                     continue
-                view = self._run_view(row, now, usage, rss)
+                view = self._run_view(row, now, usage, rss, context)
                 if not _in_ws(view, ws):
                     continue
                 if since is not None and (view["ended_at"] or now) < since:
@@ -1014,6 +1078,24 @@ class Store:
             out[run_id] = _fold_events(events)
         return out
 
+    def _context_by_run(self) -> dict:
+        """Latest grok-context input per run. Caller holds the lock.
+
+        These rows are a context-window estimate. They stay out of totals.
+        """
+        rows = self._conn.execute(
+            """SELECT run_id, input_tokens FROM usage_events
+               WHERE tool=? AND run_id IS NOT NULL
+               ORDER BY ts ASC, message_id ASC""",
+            (_ESTIMATE_TOOL,),
+        ).fetchall()
+        latest = {}
+        for row in rows:
+            if row["input_tokens"] is None:
+                continue
+            latest[row["run_id"]] = int(row["input_tokens"])
+        return latest
+
     def _rss_maps(self, now: float) -> tuple[dict, dict]:
         rows = self._conn.execute(
             """SELECT pid, rss_kb, run_id, ts FROM process_samples
@@ -1029,7 +1111,7 @@ class Store:
                 by_pid[row["pid"]] = row["rss_kb"]
         return by_run, by_pid
 
-    def _run_view(self, row, now: float, usage: dict, rss: tuple[dict, dict]) -> dict:
+    def _run_view(self, row, now: float, usage: dict, rss: tuple[dict, dict], context: dict | None = None) -> dict:
         data = dict(row)
         present = data["run_id"] in usage
         folded, cost, _unpriced = usage.get(data["run_id"], (_zeros(), 0.0, False))
@@ -1066,6 +1148,7 @@ class Store:
             "rss_kb": rss_kb,
             "tokens": tokens,
             "cost_usd": cost_usd,
+            "context_tokens": None if not context or data["run_id"] not in context else context[data["run_id"]],
         }
 
     def _alerts(self, runs: list, now: float, long_running_s: dict) -> list:

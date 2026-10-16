@@ -180,7 +180,9 @@ def reconcile_running(store, now: float, processes=None) -> int:
     session with a labeled run is linked to that run (``parent_session_id``
     = the labeled run id) so it is not a second agent; a live process is
     recorded on the labeled run. Orphan muse usage is moved onto the labeled
-    run and the orphan row is deleted. Returns how many rows were ended
+    run and the orphan row is deleted. A missing muse start is filled from
+    the earliest usage event, and a finished end that sits before the latest
+    usage event is raised to it. Returns how many rows were ended
     because the process was gone.
     """
     if processes is None:
@@ -188,6 +190,9 @@ def reconcile_running(store, now: float, processes=None) -> int:
     repair = getattr(store, "repair_muse_orphans", None)
     if callable(repair):
         repair()
+    clocks = getattr(store, "repair_muse_clocks", None)
+    if callable(clocks):
+        clocks()
     ended = 0
     rows = list(store.running_tool_runs())
     extra = getattr(store, "unknown_tool_runs", None)
@@ -228,6 +233,8 @@ def reconcile_running(store, now: float, processes=None) -> int:
             patch["parent_session_id"] = labeled
         store.upsert_run(patch)
         ended += 1
+    if callable(clocks):
+        clocks()
     return ended
 
 

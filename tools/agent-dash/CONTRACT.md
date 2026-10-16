@@ -77,7 +77,8 @@ Workstream attribution happens in core (`attribution.py`), not in sources: label
  "by_workstream": [{"ws": "WS7", "running": 0, "done": 0, "tokens": 0, "cost_usd": 0.0, "last_activity": 0}]}
 ```
 `Run` = `{run_id, source, tier, model, label, workstream, ws_confidence, session_id, parent_session_id, status, verdict,
-started_at, ended_at, elapsed_s, clock_source, out_bytes, out_growing, err_bytes, pid, rss_kb, tokens: {input, output, cache_read, cache_write}, cost_usd}`.
+started_at, ended_at, elapsed_s, clock_source, out_bytes, out_growing, err_bytes, pid, rss_kb, tokens: {input, output, cache_read, cache_write}, cost_usd, context_tokens}`.
+`context_tokens` is the latest `grok-context` input for that run, or null. It is a context-window estimate. It is not part of `tokens`, totals, buckets, or cost. `elapsed_s` is null when `started_at` is null.
 `recent` = runs ended in the last 60 minutes, newest first, max 50.
 
 `GET /api/stream` -> SSE. Event `tick` every 2 s: `{"seq": n, "running": [Run], "alerts_count": n}`; the page refetches snapshot when `seq` changes.
@@ -114,6 +115,7 @@ Each bundle:
 | `approvals.json` | Optional. `{ws, decided_at, decided_by, items: [{id, step, status, reversible, conditions}]}`. `status` is `pending`, `approved`, or `denied`. `reversible` is a boolean. `decided_at` is an ISO-8601 UTC string or null. |
 | `visuals.html` | Hand-made sections keyed by h2 title. |
 | `layout.json` | Which visual sections land in Why, End state, Plan, Agent-friendly, and Reference. |
+| `START-PROMPT.md` | Optional. Paste-ready prompt that starts this workstream's lead. `ws new` writes a template. |
 
 `dash/planrender.py` `render(bundle_dir)` writes `page.html` in this order: Approvals, Why, End state, Plan, Progress, Decided, Agent-friendly, Reference. Approvals is an empty `data-plan-approvals` node. Progress is an empty `data-plan-progress` node. The page fills both from the live bundle. Deferred tasks stay on the map and leave the counts.
 
@@ -133,7 +135,8 @@ HTTP, still GET only, 127.0.0.1:
 
 - `GET /plan` serves the same shell as `GET /`.
 - `GET /api/bundles` returns `{bundles: [{id, title, short, order, kind}]}`, program first, then `order`.
-- `GET /api/bundle?ws=<ID>` returns `{bundle, plan, approvals}` from that directory. Missing `approvals.json` is an empty item list.
+- `GET /api/bundle?ws=<ID>` returns `{bundle, plan, approvals, start_prompt}` from that directory. Missing `approvals.json` is an empty item list. `start_prompt` is the text of `START-PROMPT.md`, or null.
+- `GET /api/plan?ws=<ID>` includes `start_prompt` the same way when that bundle has the file, and null otherwise.
 - `GET /api/approvals?ws=<ID|all>` returns one record, or `{approvals: [...]}` for `all`.
 - `GET /bundle/<ID>/page.html` returns that file only. The resolved path has to stay inside the bundle directory.
 

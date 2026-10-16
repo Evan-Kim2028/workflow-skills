@@ -6,9 +6,13 @@ the ``subagent/`` children of those logs. Token rows come from
 are taken as stored, and cache read is ``max(cached_tokens, cache_read_tokens)``.
 
 Run ids are ``muse:<session_uuid>:<label>``. The label comes from
-``muse-sessions.tsv`` (``label``, session uuid, started epoch). When no
-manifest row exists, the label slot is the session uuid and ``session_id``
-on the run and on each usage row is that same uuid.
+``muse-sessions.tsv`` (``label``, session uuid, started epoch), including a
+file nested one level under the scratchpad such as ``runs/muse-sessions.tsv``.
+The run's ``started_at`` is that epoch. When no manifest row exists, it is
+the timestamp of the first event in ``session.jsonl``. The label slot is
+then the session uuid, and ``session_id`` on the run and on each usage row
+is that same uuid. A later row for the same session may fill a blank label.
+It does not replace a known start with an empty one.
 
 ``cfg["roots"]["muse_sessions"]`` overrides the session root. Scratchpads come
 from ``roots.scratchpads`` (one path, a list, or a glob). The default is no
@@ -79,7 +83,11 @@ def _poll(store, cfg, now):
                 _keep_latest(manifests, row)
 
     for row in manifests.values():
-        _upsert_run(store, row["session_id"], manifests, None, None, False, None, processes)
+        sid = row.get("session_id")
+        path = _locate(sessions, sid)
+        if not path and isinstance(sid, str):
+            path = _locate(sessions, sid.lower())
+        _upsert_run(store, sid, manifests, None, None, False, None, processes, path)
     _adopt_live_labels(store, manifests, processes)
 
     files = _candidate_files(store, sessions, manifests, now, fresh_hours, scan_s)
@@ -184,13 +192,14 @@ def _drain_files(store, files, key, budget, per_file, now, processes, manifests)
 
 
 def _repair(store):
-    fn = getattr(store, "repair_muse_orphans", None)
-    if not callable(fn):
-        return
-    try:
-        fn()
-    except Exception:
-        _fail("orphan")
+    for name, where in (("repair_muse_orphans", "orphan"), ("repair_muse_clocks", "clock")):
+        fn = getattr(store, name, None)
+        if not callable(fn):
+            continue
+        try:
+            fn()
+        except Exception:
+            _fail(where)
 
 
 def _tail_file(store, path, sid, manifests, muse_parent, budget, per_file, now, processes):
@@ -249,6 +258,7 @@ def _tail_file(store, path, sid, manifests, muse_parent, budget, per_file, now, 
             started_at_zero and first_ts is not None,
             first_ts,
             processes,
+            path,
         )
     return budget
 
@@ -292,13 +302,14 @@ def _parse_line(line, fallback_sid):
     }
 
 
-def _upsert_run(store, sid, manifests, muse_parent, model, have_log_start, log_ts, processes=None):
+def _upsert_run(store, sid, manifests, muse_parent, model, have_log_start, log_ts, processes=None, log_path=None):
     row = _manifest_row(manifests, sid)
     ident = row["session_id"] if row and row.get("session_id") else sid
     label = _label(ident, row)
     parent = muse_parent or (row or {}).get("parent_session_id")
+    run_id = "muse:%s:%s" % (ident, label)
     run = {
-        "run_id": "muse:%s:%s" % (ident, label),
+        "run_id": run_id,
         "source": "muse",
         "tier": "muse",
         "session_id": ident,
@@ -309,12 +320,10 @@ def _upsert_run(store, sid, manifests, muse_parent, model, have_log_start, log_t
         run["model"] = model
     if parent:
         run["parent_session_id"] = parent
-    if row and row.get("started_at") is not None:
-        run["started_at"] = row["started_at"]
-        run["clock_source"] = "manifest"
-    elif have_log_start and log_ts is not None:
-        run["started_at"] = log_ts
-        run["clock_source"] = "muse_log"
+    start, clock = _start_clock(store, run_id, row, have_log_start, log_ts, log_path)
+    if start is not None:
+        run["started_at"] = start
+        run["clock_source"] = clock
     apply_liveness(store, run, "muse", processes)
     try:
         store.upsert_run(run)
@@ -459,10 +468,104 @@ def _parse_manifest(text):
 
 
 def _keep_latest(manifests, row):
+    """Keep one manifest row per session.
+
+    A later row may replace the label. It must not replace a known start
+    epoch with an empty one. When both epochs are set, the later one wins.
+    """
     key = row["session_id"].lower() if isinstance(row.get("session_id"), str) else row.get("session_id")
     prev = manifests.get(key)
-    if prev is None or (row.get("started_at") or -1) >= (prev.get("started_at") or -1):
-        manifests[key] = row
+    if prev is None:
+        manifests[key] = dict(row)
+        return
+    new_ts = row.get("started_at")
+    old_ts = prev.get("started_at")
+    if new_ts is None and old_ts is not None:
+        merged = dict(prev)
+        _fill_blank(merged, row, ("label", "parent_session_id"))
+        manifests[key] = merged
+        return
+    if old_ts is None and new_ts is not None:
+        merged = dict(row)
+        _fill_blank(merged, prev, ("label", "parent_session_id"))
+        manifests[key] = merged
+        return
+    if (new_ts or -1) >= (old_ts or -1):
+        merged = dict(row)
+        if merged.get("started_at") is None and old_ts is not None:
+            merged["started_at"] = old_ts
+        _fill_blank(merged, prev, ("label", "parent_session_id"))
+        manifests[key] = merged
+        return
+    manifests[key] = prev
+
+
+def _fill_blank(dest, src, keys):
+    for key in keys:
+        if not dest.get(key) and src.get(key):
+            dest[key] = src[key]
+
+
+def _start_clock(store, run_id, row, have_log_start, log_ts, log_path):
+    """Manifest epoch, else the first session.jsonl event, else the chunk."""
+    if row and row.get("started_at") is not None:
+        return row["started_at"], "manifest"
+    if _stored_start(store, run_id) is not None:
+        return None, None
+    if log_path:
+        first = _file_first_ts(log_path)
+        if first is not None:
+            return first, "muse_log"
+    if have_log_start and log_ts is not None:
+        return log_ts, "muse_log"
+    return None, None
+
+
+def _stored_start(store, run_id):
+    getter = getattr(store, "get_run", None)
+    if not callable(getter):
+        return None
+    try:
+        prev = getter(run_id)
+    except Exception:
+        return None
+    if not prev:
+        return None
+    return prev.get("started_at")
+
+
+def _file_first_ts(path, limit=262144):
+    """Timestamp of the first JSON event in a session log, or None.
+
+    Reads at most ``limit`` bytes. Does not move the tail offset.
+    """
+    try:
+        fh = open(path, "rb")
+    except OSError:
+        return None
+    used = 0
+    try:
+        while used < limit:
+            line = fh.readline(limit - used)
+            if not line:
+                return None
+            used += len(line)
+            if b"recorded_at" not in line and b'"timestamp"' not in line:
+                continue
+            try:
+                obj = json.loads(line.decode("utf-8", "replace"))
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(obj, dict):
+                continue
+            ts = _epoch_num(obj.get("recorded_at"))
+            if ts is None:
+                ts = _epoch_num(obj.get("timestamp"))
+            if ts is not None:
+                return ts
+    finally:
+        fh.close()
+    return None
 
 
 def _fresh(store, root, now, hours, scan_s):

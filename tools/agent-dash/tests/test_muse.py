@@ -651,6 +651,62 @@ class MuseTests(unittest.TestCase):
             self.assertEqual(summed(store, SID)["input"], 9)
             self.assertNotIn(os.path.abspath(cold), store.offsets)
 
+    def test_runs_subdir_manifest_sets_started_at(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sessions = os.path.join(tmp, "sessions")
+            os.makedirs(sessions)
+            pad = os.path.join(tmp, "enc", HUB, "scratchpad", "runs")
+            os.makedirs(pad)
+            with open(os.path.join(pad, "muse-sessions.tsv"), "w") as fh:
+                fh.write("ws2-WS2.14-prod-columns\t%s\t1792167605\n" % SID)
+            store = Store()
+            self.poll(store, self.cfg(sessions, os.path.join(tmp, "enc")), 1792168000)
+            run = store.runs["muse:%s:ws2-WS2.14-prod-columns" % SID]
+            self.assertEqual(run["started_at"], 1792167605.0)
+            self.assertEqual(run["clock_source"], "manifest")
+            self.assertEqual(run["parent_session_id"], HUB)
+
+    def test_label_merge_does_not_drop_the_epoch(self):
+        manifests = {}
+        muse._keep_latest(manifests, {"label": "from-file", "session_id": SID, "started_at": 1792167605.0})
+        muse._keep_latest(manifests, {"label": "from-live", "session_id": SID, "started_at": None})
+        row = manifests[SID.lower()]
+        self.assertEqual(row["started_at"], 1792167605.0)
+        self.assertEqual(row["label"], "from-file")
+        manifests = {}
+        muse._keep_latest(manifests, {"label": "from-live", "session_id": SID, "started_at": None})
+        muse._keep_latest(manifests, {"label": "from-file", "session_id": SID, "started_at": 1792167605.0})
+        row = manifests[SID.lower()]
+        self.assertEqual(row["started_at"], 1792167605.0)
+        self.assertEqual(row["label"], "from-file")
+
+    def test_first_session_event_is_the_start_when_the_tail_is_past_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sessions = os.path.join(tmp, "sessions")
+            scratch = os.path.join(tmp, "scratch")
+            os.makedirs(scratch)
+            sid = "dddddddd-dddd-4ddd-8ddd-dddddddddddd"
+            now = time.time()
+            day = datetime.fromtimestamp(now, timezone.utc)
+            path = os.path.join(
+                sessions, "%04d" % day.year, "%02d" % day.month, "%02d" % day.day, sid, "session.jsonl"
+            )
+            os.makedirs(os.path.dirname(path))
+            first = {"recorded_at": 1792152000000000, "payload": {"event": {"kind": "started"}}}
+            line1 = (json.dumps(first) + "\n").encode()
+            line2 = mc(sid, "a", input=6, output=1, recorded_at=1792152090000000)
+            with open(path, "wb") as fh:
+                fh.write(line1 + line2)
+            store = Store()
+            st = os.stat(path)
+            store.set_offset(os.path.abspath(path), st.st_ino, len(line1), st.st_size, st.st_mtime)
+            cfg = self.cfg(sessions, scratch, fresh_hours=36, dir_scan_s=0)
+            self.poll(store, cfg, now)
+            run = store.runs["muse:%s:%s" % (sid, sid)]
+            self.assertEqual(run["started_at"], 1792152000.0)
+            self.assertEqual(run["clock_source"], "muse_log")
+            self.assertEqual(summed(store, sid)["input"], 6)
+
     def test_missing_root(self):
         store = Store()
         self.poll(

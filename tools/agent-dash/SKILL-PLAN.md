@@ -8,7 +8,9 @@ A new session adds a workstream by writing a bundle, not by editing the dashboar
 python3 agent_dash.py ws new WS4 "Read path"
 ```
 
-That writes `bundle.json`, a template `plan.json`, `layout.json`, and an empty `visuals.html`. `ws validate WS4` should already pass.
+That writes `bundle.json`, a template `plan.json`, `layout.json`, an empty `visuals.html`, and `START-PROMPT.md`. `ws validate WS4` should already pass.
+
+`START-PROMPT.md` is the paste-ready prompt that starts this workstream's lead in a fresh session. Edit it so it names the kickoff brief and the done criteria. The bundle API and the plan API return that text as `start_prompt`. A missing file is null.
 
 Fill `plan.json` before you render. The shape is the decision record: `dag`, `decisions`, `motivation`, `agent_friendly`, `narrative`. Task status is `todo`, `pr`, `prog`, `done`, or `deferred`. A deferred task can set `moved_to` to a workstream id and a `note`. Keep done tasks in the dag so the map shows progress.
 
