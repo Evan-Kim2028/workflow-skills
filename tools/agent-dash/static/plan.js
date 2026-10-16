@@ -357,6 +357,10 @@
     if (hit.html) main.innerHTML = hit.html;
     else main.innerHTML = '<p class="sub">This bundle has no page yet.</p>';
     renderApprovals(main, id, hit.approvals || {items: []});
+    if (String(id).toUpperCase() === "OVERVIEW" && window.DashProgram) {
+      var top = document.createElement("div"); top.className = "program-host"; top.style.margin = "4px 0 18px";
+      main.insertBefore(top, main.firstChild); window.DashProgram.mount(top);
+    }
     if (hit.html) {
       captureMermaid(main);
       runMermaid();
