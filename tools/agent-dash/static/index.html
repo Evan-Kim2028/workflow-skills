@@ -246,6 +246,23 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
 .dag.focus .dedges path.e-up{opacity:1;stroke:var(--warning);stroke-width:2;stroke-dasharray:6 6;animation:flow 1s linear infinite reverse}
 .dag.focus .dedges path.e-down{opacity:1;stroke:var(--s1);stroke-width:2;stroke-dasharray:6 6;animation:flow 1s linear infinite}
 @media (prefers-reduced-motion: reduce){.dag.focus .dedges path{animation:none}}
+.tedges{position:absolute;inset:0;pointer-events:none;z-index:3;overflow:visible}
+.tedges path.tl{fill:none;stroke-width:1.3;stroke-dasharray:4 5;opacity:.55;animation:flow 1.1s linear infinite}
+.tedges path.tl.near{stroke-width:2;opacity:1}
+.tedges path.tl.t-up{stroke:var(--warning);animation-direction:reverse}
+.tedges path.tl.t-down{stroke:var(--s1)}
+.tedges .tm.t-up{fill:var(--warning)}
+.tedges .tm.t-down{fill:var(--s1)}
+.dag.tfocus .dedges path{opacity:.08}
+.dag.tfocus .dnode{opacity:.35;transition:opacity .2s ease}
+.dag.tfocus .dnode.t-lit{opacity:1}
+.dag.tfocus .chip{opacity:.28;transition:opacity .15s ease}
+.dag.tfocus .chip.t-self,.dag.tfocus .chip.t-up,.dag.tfocus .chip.t-down{opacity:1}
+.dag.tfocus .chip.t-self{outline:2.5px solid var(--ink);outline-offset:2px}
+.dag.tfocus .chip.t-up{box-shadow:0 0 0 2px var(--warning)}
+.dag.tfocus .chip.t-down{box-shadow:0 0 0 2px var(--s1)}
+.dag.tfocus .chip.t-near{font-weight:700}
+@media (prefers-reduced-motion: reduce){.tedges path.tl{animation:none}}
 </style>
 </head>
 <body>
@@ -827,7 +844,7 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
     });
     function attText(a) { return a.runs + " run" + (a.runs > 1 ? "s" : "") + ": " + (a.runs - a.reviews) + " build, " + a.reviews + " review" + (a.reviews === 1 ? "" : "s") + (a.sentBack ? ", " + a.sentBack + " sent back (changes, partial or blocked)" : ""); }
     var nLive = Object.keys(live).reduce(function (a, k) { return a + live[k].length; }, 0);
-    var c = el("div", {class: "card", id: "exec-progress", "data-nav": "Plan progress"}, [el("div", {style: "display:flex;align-items:baseline;gap:10px;flex-wrap:wrap"}, [el("h2", {text: plan.ws + " plan progress" + (nLive ? " · " + nLive + " agent" + (nLive > 1 ? "s" : "") + " working" : "")}), (plan.start_prompt ? copyBtn(plan.start_prompt) : null), el("a", {class: "planbtn", href: planUrl(plan.ws), onclick: function (ev) { ev.preventDefault(); openPlan(plan.ws); }, text: "Open the " + plan.ws + " plan"})]), el("p", {class: "sub", text: "Every task by group, coloured by state (legend below). The badge on a working chip is the agent tool and count; \u21BBN is how many agent runs worked the task in this range (amber edge: sent back twice or more; hover for builds vs reviews). Arrows show what each group waits on; hover a group to light up its chain (amber: what it waits on, blue: what waits on it)."})]);
+    var c = el("div", {class: "card", id: "exec-progress", "data-nav": "Plan progress"}, [el("div", {style: "display:flex;align-items:baseline;gap:10px;flex-wrap:wrap"}, [el("h2", {text: plan.ws + " plan progress" + (nLive ? " · " + nLive + " agent" + (nLive > 1 ? "s" : "") + " working" : "")}), (plan.start_prompt ? copyBtn(plan.start_prompt) : null), el("a", {class: "planbtn", href: planUrl(plan.ws), onclick: function (ev) { ev.preventDefault(); openPlan(plan.ws); }, text: "Open the " + plan.ws + " plan"})]), el("p", {class: "sub", text: "Every task by group, coloured by state (legend below). The badge on a working chip is the agent tool and count; \u21BBN is how many agent runs worked the task in this range (amber edge: sent back twice or more; hover for builds vs reviews). Arrows show what each group waits on; hover a group to light up its chain. Hover a task chip to see the tasks it waits on (amber) and the tasks it unblocks (blue), inside its tile and across tiles; click a chip to pin it. Chips in a tile run left to right in the order they can start."})]);
     var workingIds = Object.keys(live);
     if (workingIds.length) {
       var wn = el("div", {class: "working-now"}, [el("b", {text: "\u25CF Working now (" + nLive + ")"})]);
@@ -846,7 +863,12 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
     var wrap = el("div", {class: "dag-scroll"}), dag = el("div", {class: "dag"}), svg = s("svg", {class: "dedges"}); dag.appendChild(svg); wrap.appendChild(dag);
     dag.style.gridTemplateColumns = "repeat(" + plan.cols.length + ",1fr)";
     var cols = plan.cols.map(function (n) { var d = el("div", {class: "dcol"}, [el("div", {class: "dcolh", text: n})]); dag.appendChild(d); return d; });
-    var nodes = {};
+    var nodes = {}, chipEl = {}, tGroup = {}, tTitle = {}, tUp = {}, tDown = {}, depth = {};
+    plan.groups.forEach(function (g) { g.tasks.forEach(function (t) { tGroup[t.id] = g.id; tTitle[t.id] = t.title || ""; }); });
+    plan.groups.forEach(function (g) { g.tasks.forEach(function (t) { (t.deps || []).forEach(function (d) { if (!tGroup[d] || d === t.id) return; (tUp[t.id] = tUp[t.id] || []).push(d); (tDown[d] = tDown[d] || []).push(t.id); }); }); });
+    var hasTaskDeps = Object.keys(tUp).length > 0;
+    function depthOf(id, seen) { if (depth[id] != null) return depth[id]; seen = seen || {}; if (seen[id]) return 0; seen[id] = 1; var d = 0; (tUp[id] || []).forEach(function (p) { d = Math.max(d, 1 + depthOf(p, seen)); }); return (depth[id] = d); }
+    function tList(ids) { return ids.map(function (d) { return d + " " + tTitle[d]; }).join("; "); }
     plan.groups.forEach(function (g) {
       var cnt = {done: 0, wip: 0, prog: 0, pr: 0, todo: 0, moved: 0, deferred: 0}; g.tasks.forEach(function (t) { cnt[t.status || "todo"] = (cnt[t.status || "todo"] || 0) + 1; });
       var live = g.tasks.length - (cnt.moved || 0) - (cnt.deferred || 0);
@@ -856,12 +878,19 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
       n.appendChild(el("div", {class: "m", text: cnt.done + " done · " + (cnt.wip ? cnt.wip + " in progress · " : "") + cnt.pr + " waiting to merge · " + cnt.prog + " waiting on prod · " + cnt.todo + " not started" + (cnt.deferred ? " · " + cnt.deferred + " deferred" : "") + (gr ? " · " + fmtN(gr) + " runs, " + fmtN(gv) + " reviews" : "")}));
       var mini = el("div", {class: "mini"}); [["done", "var(--good)"], ["pr", "var(--warning)"], ["prog", "var(--s5)"]].forEach(function (p) { var sp = el("span"); sp.style.width = (live ? 100 * cnt[p[0]] / live : 0) + "%"; sp.style.background = p[1]; sp.style.display = "block"; mini.appendChild(sp); }); n.appendChild(mini);
       var gLive = 0;
-      var ch = el("div", {class: "chips"}); g.tasks.forEach(function (t) {
+      var ordered = hasTaskDeps ? g.tasks.map(function (t, i) { return [depthOf(t.id), i, t]; }).sort(function (a, b) { return a[0] - b[0] || a[1] - b[1]; }).map(function (x) { return x[2]; }) : g.tasks;
+      var ch = el("div", {class: "chips"}); ordered.forEach(function (t) {
         var st = t.status || "todo", rs = live[t.id] || [], jr = just[t.id];
         var cp = el("span", {class: "chip " + st + (rs.length ? " live" : "") + (jr && !rs.length ? " just" : ""), title: t.id + " · " + (t.title || "") + " · " + st + (t.moved_to ? " to " + t.moved_to : "") + (t.note ? " (" + t.note + ")" : "") + (rs.length ? " · working: " + rs.map(function (r) { return (r.label || r.run_id) + " (" + (r.tier || "") + ", " + fmtDur(r.elapsed_s) + ")"; }).join(", ") : "") + (jr && !rs.length ? " · just finished: " + (jr.label || "") + (jr.verdict ? " " + jr.verdict : "") : "")}, [t.id]);
         var sk = plan.ws + ":" + t.id; if (prevSt[sk] && prevSt[sk] !== st) cp.classList.add("changed"); prevSt[sk] = st;
         var at = att[t.id]; if (at) { cp.title += " · " + attText(at); if (at.runs > 1) cp.appendChild(el("span", {class: "att" + (at.sentBack >= 2 ? " hot" : ""), text: "\u21BB" + fmtN(at.runs)})); }
+        if (t.wave) cp.title += "\nWave: " + t.wave;
+        if (tUp[t.id]) cp.title += "\nWaits on: " + tList(tUp[t.id]);
+        if (tDown[t.id]) cp.title += "\nUnblocks: " + tList(tDown[t.id]);
         if (rs.length) { gLive += rs.length; var b = el("span", {class: "ag", text: String(rs.length)}); b.style.background = colorOf(tierKey(rs[0])); cp.appendChild(b); cp.style.cursor = "pointer"; cp.addEventListener("click", function () { openRun(rs[0]); }); }
+        else if (hasTaskDeps) { cp.style.cursor = "pointer"; cp.addEventListener("click", function (ev) { ev.stopPropagation(); pinned = pinned === t.id ? null : t.id; if (pinned) focusTask(t.id); else { clearTask(); groupEnter(g.id); } }); }
+        if (hasTaskDeps) { cp.addEventListener("mouseenter", function () { focusTask(t.id); }); cp.addEventListener("mouseleave", function () { if (pinned) focusTask(pinned); else { clearTask(); groupEnter(g.id); } }); }
+        chipEl[t.id] = cp;
         ch.appendChild(cp); }); 
       if (gLive) { n.insertBefore(el("div", {class: "live-n", text: "\u25CF " + gLive + " agent" + (gLive > 1 ? "s" : "") + " working"}), n.children[1]); n.classList.add("s-live"); }
       n.appendChild(ch);
@@ -910,24 +939,56 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
     var up = {}, down = {};
     (plan.edges || []).forEach(function (e) { (down[e[0]] = down[e[0]] || []).push(e[1]); (up[e[1]] = up[e[1]] || []).push(e[0]); });
     function reach(start, map) { var seen = {}, stack = [start]; while (stack.length) { var x = stack.pop(); (map[x] || []).forEach(function (y) { if (!seen[y]) { seen[y] = 1; stack.push(y); } }); } return seen; }
+    function groupEnter(gid) {
+      if (pinned) return;
+      var ups = reach(gid, up), downs = reach(gid, down);
+      dag.classList.add("focus");
+      Object.keys(nodes).forEach(function (k) { nodes[k].classList.toggle("f-self", k === gid); nodes[k].classList.toggle("f-up", !!ups[k]); nodes[k].classList.toggle("f-down", !!downs[k]); });
+      [].forEach.call(svg.querySelectorAll("path"), function (pth) {
+        var a = pth.getAttribute("data-a"), b = pth.getAttribute("data-b");
+        var on = (b === gid || ups[b]) && (a === gid || ups[a]) ? "e-up" : (a === gid || downs[a]) && (b === gid || downs[b]) ? "e-down" : "";
+        pth.classList.remove("e-up", "e-down"); if (on) pth.classList.add(on);
+      });
+    }
+    function groupClear() {
+      dag.classList.remove("focus");
+      Object.keys(nodes).forEach(function (k) { nodes[k].classList.remove("f-self", "f-up", "f-down"); });
+      [].forEach.call(svg.querySelectorAll("path"), function (pth) { pth.classList.remove("e-up", "e-down"); });
+    }
     Object.keys(nodes).forEach(function (gid) {
-      var n = nodes[gid];
-      n.addEventListener("mouseenter", function () {
-        var ups = reach(gid, up), downs = reach(gid, down);
-        dag.classList.add("focus");
-        Object.keys(nodes).forEach(function (k) { nodes[k].classList.toggle("f-self", k === gid); nodes[k].classList.toggle("f-up", !!ups[k]); nodes[k].classList.toggle("f-down", !!downs[k]); });
-        [].forEach.call(svg.querySelectorAll("path"), function (pth) {
-          var a = pth.getAttribute("data-a"), b = pth.getAttribute("data-b");
-          var on = (b === gid || ups[b]) && (a === gid || ups[a]) ? "e-up" : (a === gid || downs[a]) && (b === gid || downs[b]) ? "e-down" : "";
-          pth.classList.remove("e-up", "e-down"); if (on) pth.classList.add(on);
-        });
-      });
-      n.addEventListener("mouseleave", function () {
-        dag.classList.remove("focus");
-        Object.keys(nodes).forEach(function (k) { nodes[k].classList.remove("f-self", "f-up", "f-down"); });
-        [].forEach.call(svg.querySelectorAll("path"), function (pth) { pth.classList.remove("e-up", "e-down"); });
-      });
+      nodes[gid].addEventListener("mouseenter", function () { groupEnter(gid); });
+      nodes[gid].addEventListener("mouseleave", function () { if (!pinned) { groupClear(); clearTask(); } });
     });
+    /* Task focus: lines from the chips a task waits on (amber) and to the chips it unblocks (blue), across tiles. */
+    var pinned = null, tsvg = s("svg", {class: "tedges"}); dag.appendChild(tsvg);
+    dag.addEventListener("click", function (ev) { if (pinned && !(ev.target.closest && ev.target.closest(".chip"))) { pinned = null; clearTask(); groupClear(); } });
+    function clearTask() {
+      dag.classList.remove("tfocus");
+      Object.keys(chipEl).forEach(function (k) { chipEl[k].classList.remove("t-self", "t-up", "t-down", "t-near"); });
+      Object.keys(nodes).forEach(function (k) { nodes[k].classList.remove("t-lit"); });
+      while (tsvg.firstChild) tsvg.removeChild(tsvg.firstChild);
+    }
+    function focusTask(id) {
+      clearTask(); groupClear();
+      var ups = reach(id, tUp), downs = reach(id, tDown), box = dag.getBoundingClientRect();
+      dag.classList.add("tfocus");
+      tsvg.setAttribute("width", dag.scrollWidth); tsvg.setAttribute("height", dag.scrollHeight);
+      function lit(k, cls) { if (!chipEl[k]) return; chipEl[k].classList.add(cls); nodes[tGroup[k]].classList.add("t-lit"); }
+      lit(id, "t-self"); Object.keys(ups).forEach(function (k) { lit(k, "t-up"); }); Object.keys(downs).forEach(function (k) { lit(k, "t-down"); });
+      (tUp[id] || []).concat(tDown[id] || []).forEach(function (k) { if (chipEl[k]) chipEl[k].classList.add("t-near"); });
+      var defs = s("defs"); ["t-up", "t-down"].forEach(function (c) { var m = s("marker", {id: "tm-" + plan.ws + "-" + c, viewBox: "0 0 10 10", refX: "9", refY: "5", markerWidth: "6", markerHeight: "6", orient: "auto-start-reverse"}); m.appendChild(s("path", {d: "M0,0 L10,5 L0,10 z", class: "tm " + c})); defs.appendChild(m); }); tsvg.appendChild(defs);
+      function link(a, b, cls, near) {
+        var A = chipEl[a], Bc = chipEl[b]; if (!A || !Bc) return;
+        var ra = A.getBoundingClientRect(), rb = Bc.getBoundingClientRect(), L = box.left, T = box.top, d;
+        var ax = ra.left + ra.width / 2 - L, ay = ra.top + ra.height / 2 - T, bx = rb.left + rb.width / 2 - L, by = rb.top + rb.height / 2 - T;
+        if (tGroup[a] === tGroup[b] && Math.abs(ay - by) < 4) { var y0 = ra.top - T, lift = 14 + Math.min(40, Math.abs(bx - ax) * .25); d = "M" + ax + "," + y0 + " C" + ax + "," + (y0 - lift) + " " + bx + "," + (y0 - lift) + " " + bx + "," + (rb.top - T - 2); }
+        else if (Math.abs(bx - ax) > Math.abs(by - ay)) { var x1 = bx > ax ? ra.right - L : ra.left - L, x2 = bx > ax ? rb.left - L - 2 : rb.right - L + 2, mx = (x1 + x2) / 2; d = "M" + x1 + "," + ay + " C" + mx + "," + ay + " " + mx + "," + by + " " + x2 + "," + by; }
+        else { var y1 = by > ay ? ra.bottom - T : ra.top - T, y2 = by > ay ? rb.top - T - 2 : rb.bottom - T + 2, my = (y1 + y2) / 2; d = "M" + ax + "," + y1 + " C" + ax + "," + my + " " + bx + "," + my + " " + bx + "," + y2; }
+        tsvg.appendChild(s("path", {d: d, class: "tl " + cls + (near ? " near" : ""), "marker-end": "url(#tm-" + plan.ws + "-" + cls + ")"}));
+      }
+      Object.keys(ups).concat([id]).forEach(function (x) { (tUp[x] || []).forEach(function (d) { if (ups[d]) link(d, x, "t-up", x === id); }); });
+      Object.keys(downs).forEach(function (y) { (tUp[y] || []).forEach(function (d) { if (d === id || downs[d]) link(d, y, "t-down", d === id); }); });
+    }
     if (plan.phases && plan.phases.length) { var ph = el("div", {class: "phases"}); plan.phases.forEach(function (p) { ph.appendChild(el("div", {class: "phase"}, [el("b", {text: p.name}), p.goal, el("br"), el("small", {text: "Gate: " + (p.gate || "")})])); }); c.appendChild(ph); }
     return c;
   }

@@ -79,6 +79,24 @@ class WsCliTest(unittest.TestCase):
         )
         self.assertEqual(validate_bundle("WS4"), [])
 
+    def test_task_deps_validate(self):
+        self.assertEqual(cmd_ws(["new", "WS5", "Deps"]), 0)
+        path = Path(self.tmp.name) / "WS5" / "plan.json"
+        plan = json.loads(path.read_text(encoding="utf-8"))
+        tasks = [task for group in plan["dag"]["groups"] for task in group["tasks"]]
+        first = tasks[0]["id"]
+        tasks[-1]["deps"] = [first] if tasks[-1]["id"] != first else []
+        path.write_text(json.dumps(plan), encoding="utf-8")
+        self.assertEqual(validate_bundle("WS5"), [])
+        tasks[0]["deps"] = ["WS5.missing", first]
+        path.write_text(json.dumps(plan), encoding="utf-8")
+        issues = validate_bundle("WS5")
+        self.assertTrue(any("unknown task WS5.missing" in item for item in issues))
+        self.assertTrue(any("waits on itself" in item for item in issues))
+        tasks[0]["deps"] = "nope"
+        path.write_text(json.dumps(plan), encoding="utf-8")
+        self.assertTrue(any("deps must be a list" in item for item in validate_bundle("WS5")))
+
     def test_task_updates_atomically(self):
         self.assertEqual(cmd_ws(["new", "WS3", "Third"]), 0)
         self.assertEqual(set_task("WS3", "WS3.1", "done", None, None), 0)

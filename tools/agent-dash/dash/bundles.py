@@ -203,6 +203,11 @@ def _view_groups(value) -> list:
                 row["moved_to"] = task.get("moved_to")
             if task.get("note"):
                 row["note"] = task.get("note")
+            deps = task.get("deps")
+            if isinstance(deps, list):
+                row["deps"] = [item for item in deps if isinstance(item, str)]
+            if isinstance(task.get("wave"), str):
+                row["wave"] = task.get("wave")
             tasks.append(row)
         groups.append({"id": item.get("id"), "col": item.get("col"), "title": item.get("title"), "tasks": tasks})
     return groups
@@ -308,7 +313,7 @@ def _template_plan(ws: str) -> dict:
                     "id": "start",
                     "col": 0,
                     "title": "First group",
-                    "tasks": [{"id": f"{ws}.1", "title": "First task", "status": "todo"}],
+                    "tasks": [{"id": f"{ws}.1", "title": "First task", "status": "todo", "deps": []}],
                 }
             ],
             "edges": [],
@@ -466,6 +471,19 @@ def _validate_dag(issues: list[str], dag) -> None:
                     issues.append(f"plan.json: task {tid} moved_to must look like WS2")
                 if "note" in task and not isinstance(task.get("note"), str):
                     issues.append(f"plan.json: task {tid} note must be a string")
+    for group in groups:
+        for task in (group.get("tasks") if isinstance(group, dict) and isinstance(group.get("tasks"), list) else []):
+            if not isinstance(task, dict) or "deps" not in task:
+                continue
+            deps = task.get("deps")
+            if not isinstance(deps, list) or not all(isinstance(item, str) for item in deps):
+                issues.append(f"plan.json: task {task.get('id')} deps must be a list of task ids")
+                continue
+            for dep in deps:
+                if dep not in seen:
+                    issues.append(f"plan.json: task {task.get('id')} waits on unknown task {dep}")
+                elif dep == task.get("id"):
+                    issues.append(f"plan.json: task {dep} waits on itself")
     edges = dag.get("edges")
     if not isinstance(edges, list):
         issues.append("plan.json: dag.edges must be a list")

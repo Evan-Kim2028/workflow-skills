@@ -29,7 +29,7 @@ A bundle is a directory of the words for one workstream. The default root is `~/
 
 The planner skill also asks for an execution plan, `KICKOFF.md`, and `START-PROMPT.md` inside the bundle. The `ws` commands do not create those. They are the lead's brief, written by the person or session doing the planning.
 
-`plan.json` is a decision record and a task graph. `dag.cols` is the column titles, left to right. Each group has an id, a column index, a title, and tasks. Each task has an id, a title, and a status. An edge is a pair of group ids. In the shipped sample plans the pair points from the earlier group to the later one, and the later group waits on the earlier one. The map draws that line.
+`plan.json` is a decision record and a task graph. `dag.cols` is the column titles, left to right. Each group has an id, a column index, a title, and tasks. Each task has an id, a title, a status, and `deps`: the ids of the tasks it waits on, in any group. A task may also name its `wave`. An edge is a pair of group ids. In the shipped sample plans the pair points from the earlier group to the later one, and the later group waits on the earlier one. The map draws that line. Task `deps` are finer: inside a tile, chips run left to right in the order they can start, and hovering a chip draws lines to the tasks it waits on (amber) and the tasks it unblocks (blue), across tiles. Click a chip to pin it. Plan at task level: every re-plan updates `deps`, and `ws validate` fails on a dep that names an unknown task or the task itself.
 
 ## Task states and the progress map
 

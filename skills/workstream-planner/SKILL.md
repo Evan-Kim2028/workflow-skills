@@ -21,10 +21,13 @@ Tool: `~/.claude/tools/agent-dash/` (`agent_dash.py`). Bundles live in `~/.local
    - Add a motivation section: today, after, costs, and an honest "where it is not better".
    - Add an agent-friendly litmus, e.g. "one agent adds a lane in ≤5 files".
    - Decisions are made from evidence plus a review, not by asking the owner. Ask the owner only about intent and approvals.
-3. **Task DAG.**
-   - Columns are phases, groups hold tasks `{id, title, status}`, and edges mean "waits on".
+3. **Task DAG, with task-level dependencies.**
+   - Columns are phases, groups hold tasks `{id, title, status, deps, wave}`, and group edges mean "waits on".
+   - **Every task carries `deps`**: the task ids that must be on main (or done, for a production step) before it can start. Deps cross groups. Group edges alone are not enough; the owner reads how tasks relate inside a tile and across tiles. A task with nothing to wait on has `deps: []`.
+   - Derive deps from the execution plan (step 5): a lane in a later wave waits on the tasks its start condition names, sequential holds chain one to the next, and a production step waits on the code task it rolls out. Add `wave` (the wave's human name) when the task is in a lane. Update both whenever the waves change.
    - Task ids are stable machine keys, e.g. `WS4.3`.
-   - Statuses are `todo | pr | prog | done | deferred`. A deferred task carries `moved_to` and `note`.
+   - Statuses are `todo | wip | pr | prog | done | deferred`. A deferred task carries `moved_to` and `note`.
+   - `ws validate` fails on a dep that names an unknown task or the task itself.
 4. **Visuals first.** The owner reads pictures before text. Put these in `visuals.html`:
    - a before and after diagram;
    - a chart of the main benefit;
@@ -39,6 +42,7 @@ Tool: `~/.claude/tools/agent-dash/` (`agent_dash.py`). Bundles live in `~/.local
    - a file-overlap matrix from the code;
    - waves of lanes that share no file or test file;
    - per lane: worker tier, branch, worktree, brief, explicit test command, and review checks (`reviewFocus`), with `oneWay` lanes flagged;
+   - per wave, a start condition that names task ids, so the task `deps` in `plan.json` follow from it;
    - merge trains (a change ships alone only when small, migration-free and sharing no test file; otherwise it joins a train of at most 8), with each train's local scoped test list;
    - the critical path;
    - coordination points with other workstreams;
@@ -52,6 +56,7 @@ Tool: `~/.claude/tools/agent-dash/` (`agent_dash.py`). Bundles live in `~/.local
 
 ## Rules
 
+- **Plan at task level.** Strategy, re-plans and wave changes always update task `deps`, not only group edges and prose.
 - **Name things, not numbers.** Never cite a decision, task, PR, ADR or issue by its number alone. Put a brief phrase first; the number can follow in parentheses.
 - **Use workers for the heavy lifting.** Research, drafting, reviews and patches go to the authorized worker tiers in the worker registry (`workers.local.json`, muse by default). The planner thread decides, unifies and draws.
 - **Don't keep the owner waiting.** If something can start safely, ship it with a note to the lead rather than chaining one more improvement in front of the owner's start.
