@@ -1,6 +1,7 @@
 import os
 
 os.environ["AGENT_DASH_IGNORE_LOCAL"] = "1"
+os.environ.setdefault("AGENT_DASH_WORKSTREAMS", os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "fixtures", "bundles"))
 import os
 import sys
 import tempfile

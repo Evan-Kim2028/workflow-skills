@@ -428,43 +428,45 @@ tr.clk{cursor:pointer}tr.clk:hover td{background:var(--surface-2)}
     c.appendChild(el("p", {class: "sub", text: "Input, output and cache tokens summed per hour, stacked by " + state.groupBy + ". Hover a bar for the split."}));
     var B = state.usage;
     if (!B.length) { c.appendChild(el("div", {class: "empty", text: "No usage in this window."})); return c; }
-    var keysOrder = state.groupBy === "model" ? ["opus", "sonnet", "haiku", "grok", "muse", "glm", "other"] : null;
+    var keysOrder = state.groupBy === "model" ? ["opus", "fable", "sonnet", "haiku", "grok", "muse", "glm", "other"] : null;
     var hours = {}, keys = {};
     B.forEach(function (b) { var k = state.groupBy === "model" ? modelKey(b.key) : (b.key || "unattributed"); var tot = (b.input || 0) + (b.output || 0) + (b.cache_read || 0) + (b.cache_write || 0); hours[b.t] = hours[b.t] || {}; hours[b.t][k] = (hours[b.t][k] || 0) + tot; keys[k] = 1; });
     var ks = keysOrder ? keysOrder.filter(function (k) { return keys[k]; }) : Object.keys(keys).sort();
     var ts = Object.keys(hours).map(Number).sort(function (a, b) { return a - b; });
     var max = 0; ts.forEach(function (t) { var sum = 0; ks.forEach(function (k) { sum += hours[t][k] || 0; }); max = Math.max(max, sum); });
-    var lg = el("div", {class: "legend"}); ks.forEach(function (k) { var sp = el("span"); var sw = el("i", {class: "sw"}); sw.style.background = colorOf(k, state.groupBy); sp.appendChild(sw); sp.appendChild(document.createTextNode(k)); lg.appendChild(sp); }); c.appendChild(lg);
-    var W = 900, H = 246, L = 58, R = 8, T = 18, Bm = 34, pw = W - L - R, ph = H - T - Bm, bw = Math.max(3, pw / Math.max(ts.length, 1) - 2);
-    var svg = s("svg", {viewBox: "0 0 " + W + " " + H, width: "100%", role: "img", "aria-label": "Tokens per hour stacked by " + state.groupBy});
+    var lg = el("div", {class: "legend"}); ks.forEach(function (k) { var sp = el("span"); var sw = el("i", {class: "sw"}); sw.style.background = colorOf(k, state.groupBy); sp.appendChild(sw); sp.appendChild(document.createTextNode(state.groupBy === "model" ? modelName(k) : k)); lg.appendChild(sp); }); c.appendChild(lg);
+    var W = CW(), H = 270, L = 64, R = 14, T = 28, Bm = 42, pw = W - L - R, ph = H - T - Bm, h0 = Math.floor(since() / 3600) * 3600, nH = Math.max(1, Math.ceil((Date.now() / 1000 - h0) / 3600)), slot = pw / nH, bw = Math.max(3, Math.min(28, slot - 4));
+    var svg = s("svg", {viewBox: "0 0 " + W + " " + H, width: W, height: H, style: "display:block;max-width:100%", role: "img", "aria-label": "Tokens per hour stacked by " + state.groupBy});
     var nice = niceMax(max), xt = [];
     ts.forEach(function (t, idx) {
-      var x = L + idx * (pw / ts.length) + 1, y0 = T + ph;
+      var x = L + Math.max(0, Math.floor((t - h0) / 3600)) * slot + (slot - bw) / 2, y0 = T + ph;
       ks.forEach(function (k, ki) { var v = hours[t][k] || 0; if (!v) return; var h = ph * v / nice; var top = y0 - h; var r = s("rect", {x: x, y: top + (ki ? 1 : 0), width: bw, height: Math.max(0, h - (ki ? 1 : 0)), rx: 2, fill: colorOf(k, state.groupBy)}); svg.appendChild(r); y0 = top; });
       var hit = s("rect", {x: x - 1, y: T, width: bw + 2, height: ph, fill: "transparent"});
-      hit.addEventListener("mousemove", function (ev) { showTip(ev, new Date(t * 1000).toLocaleString([], {month: "short", day: "numeric", hour: "2-digit", minute: "2-digit"}), ks.filter(function (k) { return hours[t][k]; }).map(function (k) { return {k: k, v: fmtN(hours[t][k]), c: colorOf(k, state.groupBy)}; })); });
+      hit.addEventListener("mousemove", function (ev) { showTip(ev, new Date(t * 1000).toLocaleString([], {month: "short", day: "numeric", hour: "2-digit", minute: "2-digit"}), ks.filter(function (k) { return hours[t][k]; }).map(function (k) { return {k: state.groupBy === "model" ? modelName(k) : k, v: fmtN(hours[t][k]), c: colorOf(k, state.groupBy)}; })); });
       hit.addEventListener("mouseleave", hideTip); svg.appendChild(hit);
-      if (idx % Math.ceil(ts.length / 8) === 0) xt.push({x: x + bw / 2, label: fmtT(t)});
+      
     });
+    var every = Math.max(1, Math.ceil(nH / Math.max(2, Math.floor(pw / 90)))); for (var hi = 0; hi <= nH; hi += every) xt.push({x: L + hi * slot, label: fmtT(h0 + hi * 3600), anchor: hi === 0 ? "start" : "middle"});
     var axg = axes(svg, {L: L, T: T, pw: pw, ph: ph, yMax: nice, xTicks: xt, yTitle: "tokens", xTitle: "hour"}); svg.insertBefore(axg, svg.firstChild); c.appendChild(svg);
     return c;
   }
+  function CW() { var m = document.getElementById("main"); var w = m && m.clientWidth ? m.clientWidth : 1100; return Math.max(560, Math.floor(w - 36)); }
   function niceMax(v) { if (v <= 0) return 1; var p = Math.pow(10, Math.floor(Math.log10(v))); var m = v / p; return (m <= 1 ? 1 : m <= 2 ? 2 : m <= 5 ? 5 : 10) * p; }
 
   /* live agents over time: one strip per tool */
   function concChart(snap) {
-    var c = el("div", {class: "card"}, [el("h2", {text: "Live agents over time"}), el("p", {class: "sub", text: "One strip per tool on its own count, for this view's scope."})]);
+    var c = el("div", {class: "card"}, [el("h2", {text: "Live agents over time"}), el("p", {class: "sub", text: "Agents running at each moment, one strip per tool on its own scale (0 to that tool's peak), for this view's scope."})]);
     var P = state.conc; if (!P.length) { c.appendChild(el("div", {class: "empty", text: "No samples yet."})); return c; }
     var tools = [["grok", "Grok 4.7"], ["muse", "muse"], ["glm", "GLM"], ["claude", "Claude"]];
     var t0 = P[0].t, t1 = P[P.length - 1].t;
     tools.forEach(function (tl) {
       var mx = 1; P.forEach(function (p) { mx = Math.max(mx, p[tl[0]] || 0); }); mx = Math.max(2, Math.ceil(mx / 2) * 2);
-      var last = tl === tools[tools.length - 1], W = 900, H = last ? 98 : 74, L = 110, R = 8, T = 14, Bm = last ? 34 : 6, pw = W - L - R, ph = H - T - Bm;
-      var svg = s("svg", {viewBox: "0 0 " + W + " " + H, width: "100%", role: "img", "aria-label": tl[1] + " live runs over time"});
+      var last = tl === tools[tools.length - 1], W = CW(), H = last ? 104 : 66, L = 120, R = 14, T = 10, Bm = last ? 42 : 8, pw = W - L - R, ph = H - T - Bm;
+      var svg = s("svg", {viewBox: "0 0 " + W + " " + H, width: W, height: H, style: "display:block;max-width:100%", role: "img", "aria-label": tl[1] + " live runs over time"});
       var nm = s("text", {x: 0, y: T + ph / 2 + 4, class: "ax"}); nm.textContent = tl[1]; nm.setAttribute("style", "fill:var(--ink-2);font:600 12px var(--font)"); svg.appendChild(nm);
       var X = function (t) { return L + pw * (t - t0) / Math.max(1, t1 - t0); }, Y = function (v) { return T + ph - ph * v / mx; };
       var tt6 = timeTicks(t0, t1, X, 6); if (!last) tt6.forEach(function (k) { k.label = ""; });
-      axes(svg, {L: L, T: T, pw: pw, ph: ph, yMax: mx, yTicks: 2, xTicks: tt6, yTitle: "agents", xTitle: last ? "time" : null});
+      axes(svg, {L: L, T: T, pw: pw, ph: ph, yMax: mx, yTicks: 1, xTicks: tt6, xTitle: last ? "time" : null});
       var d = "M" + X(P[0].t) + "," + Y(0);
       P.forEach(function (p) { d += " L" + X(p.t) + "," + Y(p[tl[0]] || 0); });
       d += " L" + X(t1) + "," + Y(0) + " Z";
@@ -510,16 +512,16 @@ tr.clk{cursor:pointer}tr.clk:hover td{background:var(--surface-2)}
     var groups = {}; R.forEach(function (r) { var g = r.workstream || "other"; (groups[g] = groups[g] || []).push(r); });
     var order = Object.keys(groups).sort(function (x, y) { var a = /(\d+)/.exec(x), b = /(\d+)/.exec(y); return (a ? +a[1] : 999) - (b ? +b[1] : 999) || x.localeCompare(y); });
     if (state.ws !== "all" && expanded[state.ws] === undefined) expanded[state.ws] = true;
-    var W = 1100, L = 120, Rm = 10, pw = W - L - Rm, stripH = 30, rowH = 7, rowGap = 2;
+    var W = CW(), L = 150, Rm = 14, pw = W - L - Rm, stripH = 30, rowH = 7, rowGap = 2;
     var X = function (t) { return L + pw * (Math.max(t, t0) - t0) / (now - t0); };
     var blocks = [], H = 12;
     order.forEach(function (g) {
       var subs = [], hh = 0;
       if (expanded[g]) { var byM = {}; groups[g].forEach(function (r) { var k = tierKey(r); (byM[k] = byM[k] || []).push(r); });
         MODELS.forEach(function (m) { if (!byM[m[0]]) return; var rows = packRows(byM[m[0]], 20); var h = Math.max(rows.length * (rowH + rowGap), 14) + 6; subs.push({k: m[0], name: m[1], runs: byM[m[0]], rows: rows, dy: hh, h: h}); hh += h; }); }
-      blocks.push({g: g, runs: groups[g], subs: subs, y: H}); H += stripH + 10 + (subs.length ? hh + 8 : 0); });
+      blocks.push({g: g, runs: groups[g], subs: subs, y: H}); H += stripH + 24 + (subs.length ? hh + 10 : 0); });
     var plotB = H; H += 34;
-    var svg = s("svg", {viewBox: "0 0 " + W + " " + H, width: "100%", role: "img", "aria-label": "Run activity per workstream over time"});
+    var svg = s("svg", {viewBox: "0 0 " + W + " " + H, width: W, height: H, style: "display:block;max-width:100%", role: "img", "aria-label": "Run activity per workstream over time"});
     var gTicks = timeTicks(t0, now, X, 6); gTicks.forEach(function (k) { svg.appendChild(s("line", {x1: k.x, x2: k.x, y1: 4, y2: plotB, class: "gl"})); });
     var step = Math.max(60, Math.round((now - t0) / 300));
     blocks.forEach(function (bk) {
@@ -539,7 +541,7 @@ tr.clk{cursor:pointer}tr.clk:hover td{background:var(--surface-2)}
       bk.runs.forEach(function (r) {
         if (!r.ended_at || r.ended_at < t0) return; var oc = outcomeColor(r); if (!oc) return;
         var bad = oc === "var(--critical)";
-        var m = bad ? s("text", {x: X(r.ended_at), y: y0 + stripH + 8, "text-anchor": "middle"}) : s("circle", {cx: X(r.ended_at), cy: y0 + stripH + 4, r: 2.6, fill: oc});
+        var m = bad ? s("text", {x: X(r.ended_at), y: y0 + stripH + 14, "text-anchor": "middle"}) : s("circle", {cx: X(r.ended_at), cy: y0 + stripH + 10, r: 2.6, fill: oc});
         if (bad) { m.textContent = "✕"; m.setAttribute("style", "fill:var(--critical);font:700 10px var(--font)"); }
         m.style.cursor = "pointer"; m.addEventListener("click", function () { openRun(r); });
         m.addEventListener("mousemove", function (ev) { showTip(ev, r.label || r.run_id, [{k: "outcome", v: r.verdict || r.status}, {k: "model", v: r.model || modelName(tierKey(r))}, {k: "ended", v: fmtT(r.ended_at)}]); }); m.addEventListener("mouseleave", hideTip);
@@ -549,10 +551,10 @@ tr.clk{cursor:pointer}tr.clk:hover td{background:var(--surface-2)}
       hit.addEventListener("mousemove", function (ev) { var bb = svg.getBoundingClientRect(); var tt = t0 + (now - t0) * ((ev.clientX - bb.left) * W / bb.width - L) / pw; var act = bk.runs.filter(function (r) { return r.started_at <= tt && (r.ended_at || now) >= tt; }); var byT = {}; act.forEach(function (r) { var k = tierKey(r); byT[k] = (byT[k] || 0) + 1; }); showTip(ev, bk.g + " at " + fmtT(tt), [{k: "running", v: String(act.length)}].concat(Object.keys(byT).map(function (k) { return {k: modelName(k), v: String(byT[k])}; }))); });
       hit.addEventListener("mouseleave", hideTip); hit.addEventListener("click", function () { expanded[bk.g] = !expanded[bk.g]; drawMain(); }); hit.style.cursor = "pointer";
       svg.appendChild(hit);
-      var base = y0 + stripH + 12;
+      var base = y0 + stripH + 26;
       bk.subs.forEach(function (sb, si) {
         var sy = base + sb.dy;
-        if (si) svg.appendChild(s("line", {x1: 0, x2: W - Rm, y1: sy - 4, y2: sy - 4, class: "gl"}));
+        if (si) svg.appendChild(s("line", {x1: 0, x2: W - Rm, y1: sy - 5, y2: sy - 5, class: "gl"}));
         var ml = s("text", {x: 10, y: sy + 9}); ml.textContent = sb.name + " \u00B7 " + sb.runs.length; ml.setAttribute("style", "fill:var(--ink-2);font:600 11.5px var(--font)"); svg.appendChild(ml);
         var ry = sy;
         sb.rows.forEach(function (row) {
@@ -572,7 +574,7 @@ tr.clk{cursor:pointer}tr.clk:hover td{background:var(--surface-2)}
     var defs = s("defs", {}); var pat = s("pattern", {id: "hatch", width: 6, height: 6, patternUnits: "userSpaceOnUse", patternTransform: "rotate(45)"}); pat.appendChild(s("rect", {width: 6, height: 6, fill: "var(--surface-2)"})); pat.appendChild(s("line", {x1: 0, y1: 0, x2: 0, y2: 6, stroke: "var(--muted)", "stroke-width": 2})); defs.appendChild(pat); svg.insertBefore(defs, svg.firstChild);
     axes(svg, {L: L, T: 4, pw: pw, ph: plotB - 4, xTicks: gTicks, xTitle: "time", yTitle: null});
     svg.appendChild(s("line", {x1: X(now), x2: X(now), y1: 4, y2: plotB, stroke: "var(--s1)", "stroke-width": 1.5}));
-    c.appendChild(el("div", {style: "overflow-x:auto"}, [svg]));
+    c.appendChild(svg);
     return c;
   }
 
@@ -638,7 +640,7 @@ tr.clk{cursor:pointer}tr.clk:hover td{background:var(--surface-2)}
     });
     var all = tot.done + tot.prog + tot.pr + tot.todo;
     var lg = el("div", {class: "plegend"});
-    [["live", "agent working now"], ["pr", "waiting to merge (open PR)"], ["prog", "merged, waiting on a prod step"], ["done", "done"], ["just", "finished in the last 15 min"], ["todo", "not started"], ["deferred", "deferred or moved to another workstream"]].forEach(function (p) { var ch2 = el("span", {class: "chip " + (p[0] === "just" ? "done just" : p[0])}, ["\u2007\u2007"]); lg.appendChild(el("span", {style: "display:inline-flex;align-items:center;gap:6px"}, [ch2, p[1]])); });
+    [["live", "agent working now"], ["pr", "waiting to merge (open PR)"], ["prog", "merged, waiting on a prod step"], ["done", "done"], ["just", "finished in the last 15 min"], ["todo", "not started"], ["deferred", "deferred or moved to another workstream"]].forEach(function (p) { var ch2 = el("span", {class: "chip " + (p[0] === "just" ? "done just" : p[0])}, [p[0] === "live" ? "\u25CF" : p[0] === "todo" ? "\u00B7" : "\u2009"]); lg.appendChild(el("span", {style: "display:inline-flex;align-items:center;gap:6px"}, [ch2, p[1]])); });
     c.appendChild(lg);
     c.appendChild(el("div", {style: "font:12.5px var(--mono);color:var(--ink-2);margin-bottom:8px", text: tot.done + " of " + all + " done · " + tot.pr + " waiting to merge · " + tot.prog + " waiting on prod · " + tot.todo + " not started" + (tot.deferred ? " · " + tot.deferred + " deferred" : "")}));
     c.appendChild(wrap);
@@ -654,7 +656,7 @@ tr.clk{cursor:pointer}tr.clk:hover td{background:var(--surface-2)}
         svg.appendChild(s("path", {d: d}));
       });
     }
-    requestAnimationFrame(function () { requestAnimationFrame(draw); }); window.addEventListener("resize", draw);
+    requestAnimationFrame(function () { requestAnimationFrame(draw); }); window.__adPlanDraw = draw;
     if (plan.phases && plan.phases.length) { var ph = el("div", {class: "phases"}); plan.phases.forEach(function (p) { ph.appendChild(el("div", {class: "phase"}, [el("b", {text: p.name}), p.goal, el("br"), el("small", {text: "Gate: " + (p.gate || "")})])); }); c.appendChild(ph); }
     return c;
   }
@@ -710,6 +712,8 @@ tr.clk{cursor:pointer}tr.clk:hover td{background:var(--surface-2)}
     });
     return c;
   }
+  var resizeT = null;
+  window.addEventListener("resize", function () { clearTimeout(resizeT); resizeT = setTimeout(function () { if (state.view === "exec") drawMain(); else if (window.__adPlanDraw) window.__adPlanDraw(); }, 150); });
   function drawMain() {
     var m = document.getElementById("main"); m.innerHTML = "";
     var snap = state.snap || {running: [], recent: [], alerts: [], caps: {}, totals: {tokens: {}}};
@@ -721,7 +725,7 @@ tr.clk{cursor:pointer}tr.clk:hover td{background:var(--surface-2)}
     m.appendChild(g1);
     if (state.ws === "all" && state.wss.length) { m.appendChild(el("h2", {style: "font-size:14px;margin:20px 0 8px", text: "Workstreams"})); m.appendChild(wsCards()); }
     if (state.plan) { var pw = el("div", {style: "margin-top:14px"}); pw.appendChild(planCard(state.plan, snap)); m.appendChild(pw); }
-    var g2 = el("div", {class: "grid g-2", style: "margin-top:14px"}); g2.appendChild(tokenChart()); g2.appendChild(concChart(snap)); m.appendChild(g2);
+    var g2 = el("div", {class: "grid", style: "margin-top:14px;gap:14px"}); g2.appendChild(tokenChart()); g2.appendChild(concChart(snap)); m.appendChild(g2);
     var g3 = el("div", {style: "margin-top:14px"}); g3.appendChild(gantt()); m.appendChild(g3);
     var g4 = el("div", {style: "margin-top:14px"}); g4.appendChild(runsTable("Finished in the last hour", "Newest first.", snap.recent || [], "Nothing finished in the last hour.")); m.appendChild(g4);
   }

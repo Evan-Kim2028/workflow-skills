@@ -44,7 +44,7 @@
     g.appendChild(s("line", {x1: x0, x2: x0, y1: o.T, y2: yb, class: "bl"}));
     g.appendChild(s("line", {x1: x0, x2: x1, y1: yb, y2: yb, class: "bl"}));
     (o.xTicks || []).forEach(function (tk) { g.appendChild(s("line", {x1: tk.x, x2: tk.x, y1: yb, y2: yb + 4, class: "bl"})); if (tk.label) { var lt = s("text", {x: tk.x, y: yb + 15, "text-anchor": tk.anchor || "middle"}); lt.textContent = tk.label; g.appendChild(lt); } });
-    if (o.yTitle) { var yt = s("text", {x: x0 - 7, y: o.T - 2, "text-anchor": "end", class: "axt"}); yt.textContent = o.yTitle; g.appendChild(yt); }
+    if (o.yTitle) { var yt = s("text", {x: x0, y: Math.max(10, o.T - 12), "text-anchor": "start", class: "axt"}); yt.textContent = o.yTitle; g.appendChild(yt); }
     if (o.xTitle) { var xt = s("text", {x: x1, y: yb + 28, "text-anchor": "end", class: "axt"}); xt.textContent = o.xTitle; g.appendChild(xt); }
     svg.appendChild(g); return g;
   }

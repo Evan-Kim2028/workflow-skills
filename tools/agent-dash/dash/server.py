@@ -171,16 +171,16 @@ class Handler(BaseHTTPRequestHandler):
             raise ValueError("ws required")
         if not _WS.match(ws):
             raise ValueError("bad ws")
-        try:
-            body = load_plan(ws)
-        except PlanNotFound:
-            body = bundle_plan_view(ws)
-            if body is None:
+        body = bundle_plan_view(ws)
+        if body is None:
+            try:
+                body = load_plan(ws)
+            except PlanNotFound:
                 self._json(404, {"error": "plan not found", "ws": ws})
                 return
-        except PlanError:
-            self._json(500, {"error": "plan unreadable", "ws": ws})
-            return
+            except PlanError:
+                self._json(500, {"error": "plan unreadable", "ws": ws})
+                return
         self._json(200, body)
 
     def _plan_page(self):
