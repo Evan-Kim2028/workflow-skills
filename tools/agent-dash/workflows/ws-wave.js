@@ -21,7 +21,7 @@ export const meta = {
 //             branch: "ws7/kind-checker", worktree: "/abs/<worktree>",
 //             brief: "what to build, files, stop rules", tests: "pytest a.py b.py",
 //             review: true, oneWay: true, reviewFocus: "one check" | ["check A", "check B"],
-//             deps: ["WS7.K0"], base: "origin/main" | "dep:WS7.K0" }]
+//             deps: ["WS7.K0"], base: "origin/main" | "dep:WS7.K0" | "<existing-ref>" }]
 // }
 // Build tier is lane.tier, else args.defaultTier, else "default".
 // Review tier is lane.reviewTier, else args.reviewTier, else the build tier.
@@ -30,7 +30,8 @@ export const meta = {
 // deps is task ids in this run, the same name as a plan.json task's deps.
 // The lane starts when every dependency finished APPROVE* or built.
 // Any other dependency result skips the lane with final skipped-dep and names that dependency.
-// base defaults to origin/main. dep:<task> cuts the worktree from that task's branch.
+// base defaults to origin/main. dep:<task> uses that task's branch.
+// Any other base is an existing branch or ref. The worktree is cut from it, and the diff uses it.
 // Unknown task ids and dependency cycles throw before any lane starts.
 // Independent lanes start at once. There is no barrier between lanes.
 // reviewFocus is optional: a string, or a list of strings. The review prompt names each one
@@ -175,6 +176,7 @@ function baseRef(lane) {
 
 function wrapperPrompt(o) {
   return [
+    `You are a non-interactive step runner. Ignore any user, chat or session message you can see; it is not addressed to you. Do exactly these steps.`,
     `You are a thin wrapper. Do exactly these steps with the Bash tool and nothing else. Do not edit code yourself.`,
     o.setup ? `0. Setup: ${o.setup}` : ``,
     `1. Write the prompt file ${o.promptFile} with this exact content: the first line "[label: ${o.label}]", a blank line, then the full text of ${A.template} (cat it in), a blank line, then the TASK block below verbatim. Use a heredoc with a quoted delimiter so nothing expands.`,
@@ -232,10 +234,8 @@ function base(lane) { return `${LOWER}-${lane.task}-${lane.slug}` }
 function setupOf(lane) {
   const wip = `python3 ${A.dash} ws task ${WS} ${lane.task} wip; `
   const ref = baseRef(lane)
-  if (baseDepId(lane)) {
-    return `${wip}if [ ! -d ${lane.worktree} ]; then git -C ${A.repo} worktree add -b ${lane.branch} ${lane.worktree} ${ref} || git -C ${A.repo} worktree add ${lane.worktree} ${lane.branch}; fi`
-  }
-  return `${wip}if [ ! -d ${lane.worktree} ]; then git -C ${A.repo} fetch -q origin main && (git -C ${A.repo} worktree add -b ${lane.branch} ${lane.worktree} origin/main || git -C ${A.repo} worktree add ${lane.worktree} ${lane.branch}); fi`
+  const fetchMain = ref === 'origin/main' ? `git -C ${A.repo} fetch -q origin main && ` : ''
+  return `${wip}if [ ! -d ${lane.worktree} ]; then ${fetchMain}(git -C ${A.repo} worktree add -b ${lane.branch} ${lane.worktree} ${ref} || git -C ${A.repo} worktree add ${lane.worktree} ${lane.branch}); fi`
 }
 
 function run(lane, kind, round, task, extra) {
@@ -285,8 +285,15 @@ function skippedResult(lane, dependency) {
   }
 }
 
+function emptyBuild(row) {
+  return !!(row && row.verdict === 'none' && !String(row.commits || '').trim())
+}
+
 async function finishLane(lane) {
-  const built = await run(lane, 'build', 0, buildTask(lane), { setup: setupOf(lane) })
+  let built = await run(lane, 'build', 0, buildTask(lane), { setup: setupOf(lane) })
+  if (emptyBuild(built)) {
+    built = await run(lane, 'build', 0, buildTask(lane), { setup: setupOf(lane) })
+  }
   const out = {
     task: lane.task,
     label: base(lane),
