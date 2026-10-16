@@ -13,6 +13,7 @@ The dashboard is read by a visual thinker. Every view answers its question with 
 - Workstream tab: the same views filtered to that workstream, plus the plan progress map directly under the tiles.
 - Plan view: no approvals section. Approvals stay a file the lead reads (`approvals.json`, `ws approvals`); the owner wants nothing on the page that "needs" them.
 - Run details open in the right-hand drawer; Escape closes it.
+- Section dock (left, floating, macOS-dock style): compact dots that magnify and expand to names on hover, pinned (names always), or hidden (slim edge handle); the mode button cycles them and the choice is remembered. At most five groups.
 
 ## Color (reference palette, validated; do not invent hues)
 

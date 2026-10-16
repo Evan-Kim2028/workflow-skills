@@ -10,8 +10,6 @@
   nav.className = "sidenav";
   nav.id = "sidenav";
   nav.setAttribute("aria-label", "Sections");
-  nav.setAttribute("inert", "");
-  nav.setAttribute("aria-hidden", "true");
 
   var list = document.createElement("div");
   list.className = "sidenav-list";
@@ -19,6 +17,23 @@
   foot.className = "sidenav-foot";
   nav.appendChild(list);
   nav.appendChild(foot);
+  /* Dock modes: compact (dots, expands on hover), pinned (names always), hidden (slim handle). Remembered per browser. */
+  var MODES = ["compact", "pinned", "hidden"];
+  var mode = "compact";
+  try { mode = localStorage.getItem("agent-dash-dock") || "compact"; } catch (e) {}
+  if (MODES.indexOf(mode) < 0) mode = "compact";
+  var modeBtn = document.createElement("button");
+  modeBtn.type = "button";
+  modeBtn.className = "dock-mode";
+  function applyMode() {
+    MODES.forEach(function (m) { document.documentElement.classList.toggle("dock-" + m, m === mode); });
+    modeBtn.textContent = mode === "compact" ? "\u21E5" : mode === "pinned" ? "\u21E4" : "\u2630";
+    modeBtn.title = mode === "compact" ? "Pin section names" : mode === "pinned" ? "Hide the section dock" : "Show the section dock";
+    try { localStorage.setItem("agent-dash-dock", mode); } catch (e) {}
+  }
+  modeBtn.addEventListener("click", function (ev) { ev.stopPropagation(); mode = MODES[(MODES.indexOf(mode) + 1) % MODES.length]; applyMode(); });
+  nav.appendChild(modeBtn);
+  applyMode();
   document.body.appendChild(hot);
   document.body.appendChild(nav);
 
@@ -132,9 +147,7 @@
   function sync() {
     var on = opened();
     nav.classList.toggle("is-open", on);
-    nav.setAttribute("aria-hidden", on ? "false" : "true");
-    if (on) nav.removeAttribute("inert");
-    else nav.setAttribute("inert", "");
+
     if (btn) btn.setAttribute("aria-expanded", on ? "true" : "false");
   }
 
