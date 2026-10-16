@@ -161,6 +161,7 @@ tr.clk{cursor:pointer}tr.clk:hover td{background:var(--surface-2)}
 <button type="button" id="view-plan" aria-pressed="false">Plan</button>
 <button type="button" id="view-exec" aria-pressed="true">Execution</button>
 </nav>
+<button type="button" id="nav-sections" aria-expanded="false" aria-controls="sidenav" aria-keyshortcuts="[" title="Section list">Sections</button>
 <span class="sp"></span>
 <span class="seg-ctl" id="range"><button data-h="6" aria-pressed="false">6 h</button><button data-h="12" aria-pressed="true">12 h</button><button data-h="24" aria-pressed="false">24 h</button><button data-h="72" aria-pressed="false">3 d</button></span>
 <button id="theme" title="Toggle light or dark">Theme</button>
@@ -374,7 +375,7 @@ tr.clk{cursor:pointer}tr.clk:hover td{background:var(--surface-2)}
     run.forEach(function (r) { var k = tierKey(r); byTier[k] = (byTier[k] || 0) + 1; });
     var tk = snap.totals ? snap.totals.tokens : {};
     var allTok = (tk.input || 0) + (tk.output || 0) + (tk.cache_read || 0) + (tk.cache_write || 0);
-    var g = el("div", {class: "grid g-tiles"});
+    var g = el("div", {class: "grid g-tiles", id: "exec-tiles", "data-nav": "Tiles"});
     var cn = snap.counts || {}, lbt = cn.live_by_tool || {}, fv = cn.finished_by_verdict || {};
     var liveSub = Object.keys(lbt).filter(function (k) { return lbt[k]; }).map(function (k) { return modelName(k === "claude" ? "opus" : k).replace("Opus", "Claude") + " " + fmtN(lbt[k]); }).join(" \u00B7 ") || "idle";
     var bad = (fv.BLOCKED || 0) + (fv.REQUEST_CHANGES || 0), part = (fv.PARTIAL || 0) + (fv.APPROVE_WITH_CHANGES || 0);
@@ -390,7 +391,10 @@ tr.clk{cursor:pointer}tr.clk:hover td{background:var(--surface-2)}
   function statusEl(r) { var st = r.status || "unknown"; return el("span", {class: "st " + st}, [el("i"), st === "died_early" ? "died early" : st]); }
 
   function runsTable(title, sub, runs, empty) {
-    var c = el("div", {class: "card"}, [el("h2", {text: title}), el("p", {class: "sub", text: sub})]);
+    var attrs = {class: "card", "data-nav": title === "Running now" ? "Running now / Alerts" : title};
+    if (title === "Running now") attrs.id = "exec-running";
+    else if (title === "Finished in the last hour") attrs.id = "exec-finished";
+    var c = el("div", attrs, [el("h2", {text: title}), el("p", {class: "sub", text: sub})]);
     if (!runs.length) { c.appendChild(el("div", {class: "empty", text: empty})); return c; }
     var tb = el("tbody");
     runs.forEach(function (r) {
@@ -421,7 +425,7 @@ tr.clk{cursor:pointer}tr.clk:hover td{background:var(--surface-2)}
 
   /* stacked bars: tokens per hour */
   function tokenChart() {
-    var c = el("div", {class: "card"});
+    var c = el("div", {class: "card", id: "exec-tokens", "data-nav": "Tokens per hour"});
     var hdr = el("div", {style: "display:flex;align-items:baseline;gap:10px;flex-wrap:wrap"}, [el("h2", {text: "Tokens per hour"})]);
     var seg = el("span", {class: "seg-ctl", style: "margin-left:auto"});
     [["model", "By model"], ["workstream", "By workstream"]].forEach(function (g) { seg.appendChild(el("button", {"aria-pressed": String(state.groupBy === g[0]), onclick: function () { state.groupBy = g[0]; loadUsage().then(drawMain); }}, [g[1]])); });
@@ -457,7 +461,7 @@ tr.clk{cursor:pointer}tr.clk:hover td{background:var(--surface-2)}
 
   /* live agents over time: one strip per tool */
   function concChart(snap) {
-    var c = el("div", {class: "card"}, [el("h2", {text: "Live agents over time"}), el("p", {class: "sub", text: "Agents running at each moment, one strip per tool on its own scale (0 to that tool's peak), for this view's scope."})]);
+    var c = el("div", {class: "card", id: "exec-live", "data-nav": "Live agents over time"}, [el("h2", {text: "Live agents over time"}), el("p", {class: "sub", text: "Agents running at each moment, one strip per tool on its own scale (0 to that tool's peak), for this view's scope."})]);
     var P = state.conc; if (!P.length) { c.appendChild(el("div", {class: "empty", text: "No samples yet."})); return c; }
     var tools = [["grok", "Grok 4.7"], ["muse", "muse"], ["glm", "GLM"], ["claude", "Claude"]];
     var t1 = Date.now() / 1000, t0 = t1 - state.hours * 3600; P = P.filter(function (p) { return p.t >= t0 - 60; }); if (!P.length) { c.appendChild(el("div", {class: "empty", text: "No samples in this window."})); return c; }
@@ -505,7 +509,7 @@ tr.clk{cursor:pointer}tr.clk:hover td{background:var(--surface-2)}
   var OUTCOME = {run: ["var(--s1)", "\u25CF", "running"], ok: ["var(--good)", "\u2713", "finished"], part: ["var(--warning)", "\u25D0", "partial"], bad: ["var(--critical)", "\u2715", "died or blocked"], unk: ["var(--muted)", "?", "ended, outcome unknown"]};
   function outcomeColor(r) { var o = outcomeOf(r); return o === "run" || o === "unk" ? null : OUTCOME[o][0]; }
   function gantt() {
-    var c = el("div", {class: "card"}, [el("h2", {text: "Run timeline"}), el("p", {class: "sub", text: "One lane per workstream; the strip is how many agents ran at each moment. Click a lane to open it: one row per model, each bar a run, coloured by how it ended. Hover a bar for the run, click it for details."})]);
+    var c = el("div", {class: "card", id: "exec-timeline", "data-nav": "Run timeline"}, [el("h2", {text: "Run timeline"}), el("p", {class: "sub", text: "One lane per workstream; the strip is how many agents ran at each moment. Click a lane to open it: one row per model, each bar a run, coloured by how it ended. Hover a bar for the run, click it for details."})]);
     var now = Date.now() / 1000, t0 = now - state.hours * 3600;
     var R = state.runs.filter(function (r) { return r.started_at && (r.ended_at || now) >= t0; });
     if (!R.length) { c.appendChild(el("div", {class: "empty", text: "No runs in this window."})); return c; }
@@ -639,7 +643,7 @@ tr.clk{cursor:pointer}tr.clk:hover td{background:var(--surface-2)}
     });
     function attText(a) { return a.runs + " run" + (a.runs > 1 ? "s" : "") + ": " + (a.runs - a.reviews) + " build, " + a.reviews + " review" + (a.reviews === 1 ? "" : "s") + (a.sentBack ? ", " + a.sentBack + " sent back (changes, partial or blocked)" : ""); }
     var nLive = Object.keys(live).reduce(function (a, k) { return a + live[k].length; }, 0);
-    var c = el("div", {class: "card"}, [el("div", {style: "display:flex;align-items:baseline;gap:10px;flex-wrap:wrap"}, [el("h2", {text: plan.ws + " plan progress" + (nLive ? " · " + nLive + " agent" + (nLive > 1 ? "s" : "") + " working" : "")}), el("a", {class: "planbtn", href: planUrl(plan.ws), onclick: function (ev) { ev.preventDefault(); openPlan(plan.ws); }, text: "Open the " + plan.ws + " plan"})]), el("p", {class: "sub", text: "Every task by group, coloured by state (legend below). The badge on a working chip is the agent tool and count; \u21BBN is how many agent runs worked the task in this range (amber edge: sent back twice or more; hover for builds vs reviews). Arrows show what each group waits on."})]);
+    var c = el("div", {class: "card", id: "exec-progress", "data-nav": "Plan progress"}, [el("div", {style: "display:flex;align-items:baseline;gap:10px;flex-wrap:wrap"}, [el("h2", {text: plan.ws + " plan progress" + (nLive ? " · " + nLive + " agent" + (nLive > 1 ? "s" : "") + " working" : "")}), el("a", {class: "planbtn", href: planUrl(plan.ws), onclick: function (ev) { ev.preventDefault(); openPlan(plan.ws); }, text: "Open the " + plan.ws + " plan"})]), el("p", {class: "sub", text: "Every task by group, coloured by state (legend below). The badge on a working chip is the agent tool and count; \u21BBN is how many agent runs worked the task in this range (amber edge: sent back twice or more; hover for builds vs reviews). Arrows show what each group waits on."})]);
     if (unassigned.length) { var ua = el("div", {class: "unassigned"}, [el("b", {style: "font-size:12px;color:var(--ink-2)", text: "Running, not mapped to a task:"})]); unassigned.forEach(function (r) { var sp = el("span", {title: (r.tier || "") + " · " + fmtDur(r.elapsed_s), text: r.label || r.run_id}); sp.style.borderColor = colorOf(tierKey(r)); ua.appendChild(sp); }); c.appendChild(ua); }
     var tot = {done: 0, prog: 0, pr: 0, todo: 0, deferred: 0};
     var wrap = el("div", {class: "dag-scroll"}), dag = el("div", {class: "dag"}), svg = s("svg", {class: "dedges"}); dag.appendChild(svg); wrap.appendChild(dag);
@@ -711,7 +715,7 @@ tr.clk{cursor:pointer}tr.clk:hover td{background:var(--surface-2)}
   }
   function needsCard() {
     var list = state.approvals || [];
-    var c = el("div", {class: "card needs-you"}, [el("h2", {text: "Needs you"}), el("p", {class: "sub", text: "Pending decisions for this view."})]);
+    var c = el("div", {class: "card needs-you", id: "exec-needs", "data-nav": "Needs you"}, [el("h2", {text: "Needs you"}), el("p", {class: "sub", text: "Pending decisions for this view."})]);
     if (!list.length) { c.appendChild(el("p", {class: "needs-line", text: "No approvals recorded."})); return c; }
     list.forEach(function (block) {
       var items = block.items || [];
@@ -749,7 +753,7 @@ tr.clk{cursor:pointer}tr.clk:hover td{background:var(--surface-2)}
     var g1 = el("div", {style: "margin-top:14px"});
     g1.appendChild(runsTable("Running now", "Click a row for details. Output ▲ means the out file grew since the last poll.", snap.running || [], "Nothing running."));
     m.appendChild(g1);
-    if (state.ws === "all" && state.wss.length) { m.appendChild(el("h2", {style: "font-size:14px;margin:20px 0 8px", text: "Workstreams"})); var wc = wsCards(); m.appendChild(wc); if (!Object.keys(planSum).length) loadPlanSums().then(function () { var n = wsCards(); wc.replaceWith(n); }); else loadPlanSums(); }
+    if (state.ws === "all" && state.wss.length) { m.appendChild(el("h2", {id: "exec-workstreams", "data-nav": "Workstreams", style: "font-size:14px;margin:20px 0 8px", text: "Workstreams"})); var wc = wsCards(); m.appendChild(wc); if (!Object.keys(planSum).length) loadPlanSums().then(function () { var n = wsCards(); wc.replaceWith(n); }); else loadPlanSums(); }
     if (state.plan) { var pw = el("div", {style: "margin-top:14px"}); pw.appendChild(planCard(state.plan, snap)); m.appendChild(pw); }
     var g2 = el("div", {class: "grid", style: "margin-top:14px;gap:14px"}); g2.appendChild(tokenChart()); g2.appendChild(concChart(snap)); m.appendChild(g2);
     var g3 = el("div", {style: "margin-top:14px"}); g3.appendChild(gantt()); m.appendChild(g3);
@@ -856,5 +860,6 @@ tr.clk{cursor:pointer}tr.clk:hover td{background:var(--surface-2)}
   }, 30000);
 })();
 </script>
+<script src="/static/sidenav.js"></script>
 </body>
 </html>
