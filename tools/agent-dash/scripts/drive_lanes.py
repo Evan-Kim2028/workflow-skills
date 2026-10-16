@@ -439,10 +439,30 @@ def prompt_file_text(label, template, task):
     return f"[label: {label}]\n\n{body}\n\n{task_text}\n"
 
 
-def git_call(hooks, argv):
+def git_result(hooks, argv):
     if any(part in ("push", "merge", "rebase", "commit") for part in argv):
         raise RuntimeError("drive_lanes does not push, merge, rebase, or commit")
-    return int(hooks["git"](argv))
+    result = hooks["git"](argv)
+    if isinstance(result, tuple):
+        code = int(result[0])
+        text = "" if len(result) < 2 or result[1] is None else str(result[1])
+        return code, text
+    return int(result), ""
+
+
+def git_call(hooks, argv):
+    code, _text = git_result(hooks, argv)
+    return code
+
+
+def commit_log(worktree, ref, hooks):
+    code, text = git_result(
+        hooks,
+        ["git", "-C", str(worktree), "log", "--oneline", f"{ref}..HEAD"],
+    )
+    if code != 0:
+        return ""
+    return text.strip()
 
 
 def ensure_worktree(spec, lane, ref, hooks):
@@ -468,14 +488,14 @@ def mark(spec, lane, status, hooks):
         print(f"{lane['task']}: status {status} failed: {exc}", file=sys.stderr)
 
 
-def step_row(status, verdict, report, tier, model, findings):
+def step_row(status, verdict, report, tier, model, findings, commits=""):
     published = "none" if verdict in ("", "none", "empty") else verdict
     return {
         "status": status,
         "verdict": published,
         "summary": report[:SUMMARY_LIMIT],
         "findings": findings[:FINDINGS_LIMIT],
-        "commits": "",
+        "commits": commits,
         "tier": tier,
         "model": model,
     }
@@ -504,13 +524,16 @@ def launch(spec, lane, kind, round_n, task, gate, hooks, by_task):
             str(LAUNCH_MAX_WAIT),
             model,
         ]
-        _code, stdout, _err = hooks["runner"](argv)
-        parsed = parse_status(stdout)
-        out_path = parsed["out"] or str(run_dir / f"out-{label}.md")
         pid_path = run_dir / f"{label}.pid"
         pattern = gate.pattern(gate_name, model) if gate_name else ""
-        if parsed["state"] == "running":
+        parsed = {"state": "failed", "out": "", "err": "", "tier": "", "model": "", "reason": "no-status"}
+        while True:
+            _code, stdout, _err = hooks["runner"](argv)
+            parsed = parse_status(stdout)
+            if parsed["state"] != "running":
+                break
             wait_worker(pid_path, pattern, hooks)
+        out_path = parsed["out"] or str(run_dir / f"out-{label}.md")
         report = read_report(out_path)
         if not report.strip():
             status, verdict = "failed", "empty"
@@ -519,7 +542,8 @@ def launch(spec, lane, kind, round_n, task, gate, hooks, by_task):
         else:
             status, verdict = "done", first_verdict(report)
         findings = report[:PROMPT_FINDINGS_LIMIT] if kind == "rev" else ""
-        row = step_row(status, verdict, report, parsed["tier"], parsed["model"], findings)
+        commits = commit_log(lane["worktree"], diff_base(lane, by_task), hooks)
+        row = step_row(status, verdict, report, parsed["tier"], parsed["model"], findings, commits)
         row["_report"] = report
         row["_label"] = label
         return row
@@ -582,7 +606,7 @@ def finish_lane(spec, lane, start, findings, gate, hooks, by_task):
         out["tier"] = built.get("tier") or ""
         out["model"] = built.get("model") or ""
         out["runs"].append(run_record("build", built))
-        if bad_step(built, BUILD_OK):
+        if bad_step(built, BUILD_OK) or not str(built.get("commits") or "").strip():
             out["final"] = "build-failed"
             return out
         if not wants_review(lane):
@@ -711,7 +735,7 @@ def default_runner(argv):
 
 def default_git(argv):
     proc = subprocess.run(list(argv), check=False, capture_output=True, text=True)
-    return proc.returncode
+    return proc.returncode, proc.stdout
 
 
 def default_dash(argv):

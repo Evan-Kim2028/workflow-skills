@@ -23,8 +23,9 @@ REGISTRY = json.loads((ROOT / "workers.example.json").read_text(encoding="utf-8"
 
 
 class Fake:
-    def __init__(self, report):
+    def __init__(self, report, log_text="abc1234 built\n"):
         self.report = report
+        self.log_text = log_text
         self.calls = []
         self.git_calls = []
         self.dash_calls = []
@@ -38,6 +39,7 @@ class Fake:
             self.calls.append(list(argv))
             self._pid += 1
             pid = self._pid
+            seen = sum(1 for call in self.calls if call[2] == argv[2])
             self.alive_left[pid] = 1
         label = argv[2]
         run_dir = Path(argv[5])
@@ -50,7 +52,12 @@ class Fake:
         (run_dir / f"{label}.pid").write_text(f"{pid}\n", encoding="utf-8")
         (run_dir / f"{label}.tier").write_text(f"{tier}\n{model}\n", encoding="utf-8")
         err = run_dir / f"err-{label}.log"
-        state = "failed" if not str(text).strip() else "running"
+        if not str(text).strip():
+            state = "failed"
+        elif seen == 1:
+            state = "running"
+        else:
+            state = "done"
         line = f"STATUS: {state} out={out} err={err} tier={tier}"
         if model:
             line += f" model={model}"
@@ -73,6 +80,8 @@ class Fake:
     def git(self, argv):
         with self.lock:
             self.git_calls.append(list(argv))
+        if "log" in argv:
+            return 0, self.log_text
         return 0
 
     def dash(self, argv):
@@ -97,6 +106,13 @@ class Fake:
     def labels(self):
         with self.lock:
             return [call[2] for call in self.calls]
+
+
+def first_call(fake, label):
+    for call in fake.calls:
+        if call[2] == label:
+            return call
+    raise AssertionError(label)
 
 
 def make_spec(root, lanes, **extra):
@@ -143,7 +159,7 @@ class DriveLanesTest(unittest.TestCase):
             spec = make_spec(tmp, [lane(tmp)])
             summary, code = mod.drive(spec, hooks=fake.hooks())
             self.assertEqual(code, 0)
-            self.assertEqual(fake.labels(), ["ws7-A-a", "ws7-A-a-rev1"])
+            self.assertEqual(fake.labels(), ["ws7-A-a", "ws7-A-a", "ws7-A-a-rev1", "ws7-A-a-rev1"])
             self.assertEqual(summary["approved"], [{"task": "A", "branch": "ws7/a", "worktree": spec["lanes"][0]["worktree"]}])
             self.assertEqual(summary["needsLead"], [])
             self.assertEqual(summary["lanes"][0]["final"], "APPROVE")
@@ -177,12 +193,21 @@ class DriveLanesTest(unittest.TestCase):
             self.assertEqual(code, 0)
             self.assertEqual(
                 fake.labels(),
-                ["ws7-A-a", "ws7-A-a-rev1", "ws7-A-a-fix1", "ws7-A-a-rev2"],
+                [
+                    "ws7-A-a",
+                    "ws7-A-a",
+                    "ws7-A-a-rev1",
+                    "ws7-A-a-rev1",
+                    "ws7-A-a-fix1",
+                    "ws7-A-a-fix1",
+                    "ws7-A-a-rev2",
+                    "ws7-A-a-rev2",
+                ],
             )
             self.assertEqual(summary["lanes"][0]["final"], "APPROVE")
             roles = [row["role"] for row in summary["lanes"][0]["runs"]]
             self.assertEqual(roles, ["build", "review", "fix", "review"])
-            fix_prompt = Path(fake.calls[2][4]).read_text(encoding="utf-8")
+            fix_prompt = Path(first_call(fake, "ws7-A-a-fix1")[4]).read_text(encoding="utf-8")
             self.assertIn("1. bug - a.py:1 - wrong - fix it", fix_prompt)
             self.assertEqual(statuses(fake, "A"), ["wip", "pr"])
 
@@ -211,7 +236,7 @@ class DriveLanesTest(unittest.TestCase):
             spec = make_spec(tmp, [lane(tmp)])
             summary, code = mod.drive(spec, hooks=fake.hooks())
             self.assertEqual(code, 3)
-            self.assertEqual(fake.labels(), ["ws7-A-a"])
+            self.assertEqual(fake.labels(), ["ws7-A-a", "ws7-A-a"])
             self.assertEqual(summary["lanes"][0]["final"], "build-failed")
             self.assertEqual(summary["needsLead"][0]["final"], "build-failed")
             self.assertEqual(summary["approved"], [])
@@ -301,7 +326,7 @@ class DriveLanesTest(unittest.TestCase):
             fake = Fake(lambda _label: "VERDICT: APPROVE\n")
             code = mod.main([spec_path(tmp, spec), "--only", "A", "--start", "rev"], hooks=fake.hooks())
             self.assertEqual(code, 0)
-            self.assertEqual(fake.labels(), ["ws7-A-a-rev3"])
+            self.assertEqual(fake.labels(), ["ws7-A-a-rev3", "ws7-A-a-rev3"])
             self.assertEqual(statuses(fake, "A"), ["pr"])
             prompt = Path(fake.calls[0][4]).read_text(encoding="utf-8")
             self.assertIn("round 3", prompt)
@@ -315,7 +340,7 @@ class DriveLanesTest(unittest.TestCase):
             )
             _summary, code = mod.drive(spec, hooks=fake.hooks())
             self.assertEqual(code, 0)
-            prompt = Path(fake.calls[1][4]).read_text(encoding="utf-8")
+            prompt = Path(first_call(fake, "ws7-A-a-rev1")[4]).read_text(encoding="utf-8")
             self.assertIn("the index lists every note", prompt)
             self.assertIn("1. the index lists every note", prompt)
             self.assertIn("2. the flag is set", prompt)
@@ -380,7 +405,7 @@ class DriveLanesTest(unittest.TestCase):
             self.assertEqual(code, 0)
             self.assertEqual(summary["lanes"][0]["final"], "APPROVE")
             self.assertIn("ws7-A-a-rev1", fake.labels())
-            prompt = Path(fake.calls[1][4]).read_text(encoding="utf-8")
+            prompt = Path(first_call(fake, "ws7-A-a-rev1")[4]).read_text(encoding="utf-8")
             self.assertIn("flag is set", prompt)
 
     def test_tier_cap(self):
@@ -426,7 +451,7 @@ class DriveLanesTest(unittest.TestCase):
                     spec,
                     hooks={
                         "runner": runner,
-                        "git": lambda _argv: 0,
+                        "git": lambda argv: (0, "abc1234 built\n") if "log" in argv else 0,
                         "dash": lambda _argv: 0,
                         "sleep": lambda _seconds: None,
                         "pid_alive": lambda _pid: False,
@@ -478,13 +503,120 @@ class DriveLanesTest(unittest.TestCase):
             summary, code = mod.drive(spec, hooks=fake.hooks())
             self.assertEqual(code, 0)
             self.assertEqual(summary["lanes"][0]["final"], "APPROVE")
-            build = Path(fake.calls[0][4]).read_text(encoding="utf-8")
-            review = Path(fake.calls[1][4]).read_text(encoding="utf-8")
+            build = Path(first_call(fake, "ws7-A-a")[4]).read_text(encoding="utf-8")
+            review = Path(first_call(fake, "ws7-A-a-rev1")[4]).read_text(encoding="utf-8")
             self.assertIn("The diff base is release/ws7.", build)
             self.assertIn("against release/ws7", review)
             joined = [" ".join(cmd) for cmd in fake.git_calls]
             self.assertTrue(any("worktree add -b ws7/a" in cmd and cmd.endswith("release/ws7") for cmd in joined))
             self.assertFalse(any("origin/main" in cmd or "fetch" in cmd for cmd in joined))
+
+    def test_running_then_quota_then_done_on_the_next_tier(self):
+        muse_model = REGISTRY["workers"]["muse"]["model"]
+        grok_model = REGISTRY["workers"]["grok"]["model"]
+        phases = []
+        printed = []
+        dead_before_retry = []
+
+        with tempfile.TemporaryDirectory() as tmp:
+            fake = Fake(lambda _label: "PASS\nbuilt\n")
+
+            def runner(argv):
+                label = argv[2]
+                run_dir = Path(argv[5])
+                run_dir.mkdir(parents=True, exist_ok=True)
+                out = run_dir / f"out-{label}.md"
+                err = run_dir / f"err-{label}.log"
+                with fake.lock:
+                    fake.calls.append(list(argv))
+                    seen = sum(1 for call in fake.calls if call[2] == label)
+                    fake._pid += 1
+                    pid = fake._pid
+                if label != "ws7-A-a":
+                    out.write_text("PASS\nbuilt\n", encoding="utf-8")
+                    err.write_text("", encoding="utf-8")
+                    model = argv[7]
+                    line = f"STATUS: done out={out} err={err} tier={argv[1]}"
+                    if model:
+                        line += f" model={model}"
+                    return 0, line + "\n", ""
+                (run_dir / f"{label}.pid").write_text(f"{pid}\n", encoding="utf-8")
+                if seen == 1:
+                    with fake.lock:
+                        fake.alive_left[pid] = 1
+                    out.write_text("", encoding="utf-8")
+                    err.write_text("", encoding="utf-8")
+                    phases.append("running")
+                    line = f"STATUS: running out={out} err={err} tier=muse model={muse_model}"
+                    printed.append(line)
+                    return 0, line + "\n", ""
+                if seen == 2:
+                    with fake.lock:
+                        previous = [item for item in fake.alive_left if item != pid]
+                        dead_before_retry.append(bool(previous) and all(fake.alive_left[item] == 0 for item in previous))
+                        fake.alive_left[pid] = 1
+                    err.write_text("HTTP 429 rate limit\n", encoding="utf-8")
+                    out.write_text("", encoding="utf-8")
+                    phases.append("quota")
+                    line = f"STATUS: running out={out} err={err} tier=grok model={grok_model} reason=quota"
+                    printed.append(line)
+                    return 0, line + "\n", ""
+                out.write_text("PASS\nbuilt\n", encoding="utf-8")
+                phases.append("done")
+                line = f"STATUS: done out={out} err={err} tier=grok model={grok_model}"
+                printed.append(line)
+                return 0, line + "\n", ""
+
+            hooks = fake.hooks()
+            hooks["runner"] = runner
+            spec = make_spec(
+                tmp,
+                [
+                    lane(tmp, "A", "a", tier="auto", review=False),
+                    lane(tmp, "B", "b", deps=["A"], review=False),
+                ],
+            )
+            summary, code = mod.drive(spec, hooks=hooks)
+            by_task = {row["task"]: row for row in summary["lanes"]}
+            self.assertEqual(code, 0)
+            self.assertEqual(phases, ["running", "quota", "done"])
+            self.assertEqual(dead_before_retry, [True])
+            self.assertTrue(printed[0].startswith("STATUS: running"))
+            self.assertIn("tier=muse", printed[0])
+            self.assertTrue(printed[1].startswith("STATUS: running"))
+            self.assertIn("reason=quota", printed[1])
+            self.assertIn("tier=grok", printed[1])
+            self.assertTrue(printed[2].startswith("STATUS: done"))
+            self.assertIn("tier=grok", printed[2])
+            self.assertIn(grok_model, printed[2])
+            self.assertIn("429", (Path(spec["runDir"]) / "err-ws7-A-a.log").read_text(encoding="utf-8"))
+            self.assertEqual(by_task["A"]["final"], "built")
+            self.assertEqual(by_task["A"]["tier"], "grok")
+            self.assertEqual(by_task["A"]["model"], grok_model)
+            self.assertEqual(by_task["A"]["runs"], [{"role": "build", "tier": "grok", "model": grok_model}])
+            self.assertEqual(by_task["B"]["final"], "built")
+            self.assertEqual([label for label in fake.labels() if label.startswith("ws7-A-")], ["ws7-A-a", "ws7-A-a", "ws7-A-a"])
+            self.assertIn("ws7-B-b", fake.labels())
+            self.assertGreaterEqual(fake.sleeps, 2)
+
+    def test_pass_with_empty_git_log_is_build_failed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fake = Fake(lambda _label: "PASS\nbuilt nothing\n", log_text="")
+            spec = make_spec(tmp, [lane(tmp)])
+            summary, code = mod.drive(spec, hooks=fake.hooks())
+            self.assertEqual(code, 3)
+            lane_row = summary["lanes"][0]
+            self.assertEqual(lane_row["final"], "build-failed")
+            self.assertEqual(lane_row["build"]["status"], "done")
+            self.assertEqual(lane_row["build"]["verdict"], "PASS")
+            self.assertEqual(lane_row["build"]["commits"], "")
+            self.assertEqual(summary["approved"], [])
+            self.assertEqual(summary["needsLead"][0]["final"], "build-failed")
+            self.assertEqual(fake.labels(), ["ws7-A-a", "ws7-A-a"])
+            logs = [cmd for cmd in fake.git_calls if "log" in cmd]
+            self.assertEqual(len(logs), 1)
+            self.assertEqual(logs[0][3:], ["log", "--oneline", "origin/main..HEAD"])
+            self.assertEqual(logs[0][2], spec["lanes"][0]["worktree"])
 
     def test_cli_rejects_resume_without_only(self):
         self.assertEqual(mod.main(["missing.json", "--start", "rev"]), 2)

@@ -85,11 +85,11 @@ Workers come from a registry: `tools/agent-dash/workers.example.json`, replaced 
 
 ## A wave
 
-One wave is a set of lanes that do not share a file or a test file. Independent lanes start at once. A lane with `deps` waits until each named task in this run has finished `APPROVE*` or `built`. Any other dependency result returns `skipped-dep` and names the dependency. `base: "dep:<task>"` cuts the worktree from that task's branch. Unknown ids and cycles throw before any lane starts.
+One wave is a set of lanes that do not share a file or a test file. Independent lanes start at once. A lane with `deps` waits until each named task in this run has finished `APPROVE*` or `built`. Any other dependency result returns `skipped-dep` and names the dependency. `base` is `origin/main`, `dep:<task>`, or any other existing branch or ref. `dep:<task>` cuts the worktree from that task's branch. Any other ref cuts the worktree from that ref. Unknown ids and cycles throw before any lane starts.
 
 For each lane that starts, the sequence is:
 
-1. Mark the task `wip`, then create the git worktree if it is missing, on the lane branch, from `origin/main` or from the dependency branch when `base` is `dep:<task>`.
+1. Mark the task `wip`, then create the git worktree if it is missing, on the lane branch, from `origin/main`, from the dependency branch when `base` is `dep:<task>`, or from the other ref named in `base`.
 2. Build. The wrapper writes the prompt, runs `run_worker.sh`, and waits. A build that is blocked, dies, or has no commits stops the lane as `build-failed`.
 3. Review, unless the lane sets `"review": false` and is not `oneWay`. A passing review, verdict starting with `APPROVE`, moves the task to `pr` and stops the loop. The lane is `approved`.
 4. Fix, then review again. `maxFixRounds` defaults to 2. When the last extra review still asks for changes, the lane is `needsLead`.
