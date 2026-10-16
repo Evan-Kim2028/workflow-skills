@@ -315,49 +315,13 @@
     });
   }
 
-  function renderApprovals(root, ws, data) {
-    var host = root.querySelector("[data-plan-approvals]");
-    if (!host) {
-      var section = el("section", {id: String(ws).toLowerCase() + "-approvals", class: "pl-sec lay"});
-      section.appendChild(el("h2", {}, [el("span", {class: "eb", text: "Approvals"}), document.createTextNode("Owner decisions")]));
-      host = el("div", {"data-plan-approvals": "true"});
-      section.appendChild(host);
-      var header = root.querySelector("header");
-      if (header && header.parentNode) header.parentNode.insertBefore(section, header.nextSibling);
-      else root.insertBefore(section, root.firstChild);
-    }
-    var sectionEl = host.closest ? host.closest("section") : null;
-    if (sectionEl) sectionEl.id = String(ws).toLowerCase() + "-approvals";
-    host.innerHTML = "";
-    var items = (data && data.items) || [];
-    if (!items.length) {
-      host.appendChild(el("p", {class: "sub", text: "No approvals yet."}));
-      return;
-    }
-    [["pending", "Needs you"], ["approved", "Approved"], ["denied", "Denied"]].forEach(function (pair) {
-      var rows = items.filter(function (item) { return item.status === pair[0]; });
-      var group = el("div", {class: "ap-group"});
-      group.appendChild(el("h3", {id: String(ws).toLowerCase() + "-approvals-" + pair[0], text: pair[1]}));
-      if (!rows.length) group.appendChild(el("p", {class: "sub", text: "None."}));
-      rows.forEach(function (item) {
-        var way = item.reversible ? "reversible" : "one-way";
-        var row = el("div", {class: "ap-row"});
-        row.appendChild(el("div", {class: "ap-step", text: item.step || item.id}));
-        row.appendChild(el("span", {class: "ap-badge " + (item.reversible ? "rev" : "oneway"), text: way}));
-        row.appendChild(el("div", {class: "ap-cond", text: item.conditions || ""}));
-        group.appendChild(row);
-      });
-      host.appendChild(group);
-    });
-  }
-
   function paint(id, hit) {
     var main = document.getElementById("plan-body");
     if (!main || current !== id) return;
     if (hit.html) main.innerHTML = hit.html;
     else main.innerHTML = '<p class="sub">This bundle has no page yet.</p>';
     if (String(id).toUpperCase() === "OVERVIEW" && window.DashProgram) {
-      var top = document.createElement("div"); top.className = "program-host"; top.style.margin = "4px 0 18px";
+      var top = document.createElement("section"); top.id = "ov-where"; top.className = "program-host"; top.style.margin = "4px 0 18px";
       main.insertBefore(top, main.firstChild); window.DashProgram.mount(top);
     }
     if (hit.html) {

@@ -38,6 +38,24 @@
     return out || "part";
   }
 
+  /* At most five top-level groups; a group's sections show only while you are in it. */
+  function planGroup(label) {
+    var l = String(label || "").toLowerCase();
+    if (l === "where we are" || l === "workstreams") return "Where we are";
+    if (l === "why") return "Why";
+    if (l === "end state" || l === "end outcome" || l === "plan" || l === "progress") return "Plan";
+    if (l === "decided" || l === "decisions" || l === "agent-friendly") return "Decisions";
+    return "Reference";
+  }
+  function execGroup(label) {
+    var l = String(label || "").toLowerCase();
+    if (l === "where we are" || l === "summary" || l.indexOf("running now") === 0) return "Now";
+    if (l.indexOf("plan progress") >= 0) return "Plan progress";
+    return "Activity";
+  }
+  function groupOfId(id) { for (var i = 0; i < items.length; i++) if (items[i].id === id) return items[i].group; return null; }
+  var renderedGroup = null;
+
   function heading(node) {
     var eb = node.querySelector(".eb");
     return String((eb ? eb.textContent : node.textContent) || "").replace(/\s+/g, " ").trim();
@@ -70,14 +88,7 @@
       if (!h2) return;
       var label = heading(h2);
       if (!label) return;
-      out.push({id: section.id, label: label, depth: 0});
-      [].forEach.call(section.querySelectorAll("h3"), function (h3) {
-        if (h3.closest("section") !== section) return;
-        var sub = heading(h3);
-        if (!sub) return;
-        if (!h3.id) h3.id = nextId(section.id, sub);
-        out.push({id: h3.id, label: sub, depth: 1});
-      });
+      out.push({id: section.id, label: label, depth: 1, group: planGroup(label)});
     });
     return out;
   }
@@ -88,7 +99,7 @@
       var label = node.getAttribute("data-nav");
       if (!label) return;
       if (!node.id) node.id = "exec-" + slug(label);
-      out.push({id: node.id, label: label, depth: 0});
+      out.push({id: node.id, label: label, depth: 1, group: execGroup(label)});
     });
     return out;
   }
@@ -144,16 +155,32 @@
       list.appendChild(empty);
       return;
     }
-    items.forEach(function (item) {
-      var link = document.createElement("a");
-      link.href = "#" + item.id;
-      if (item.depth) link.className = "is-sub";
-      link.textContent = item.label;
-      link.title = item.label;
-      link.addEventListener("click", function (ev) { go(item, ev); });
-      list.appendChild(link);
+    var cur = groupOfId(currentId) || items[0].group;
+    renderedGroup = cur;
+    var order = [], byGroup = {};
+    items.forEach(function (item) { var g = item.group || item.label; if (!byGroup[g]) { byGroup[g] = []; order.push(g); } byGroup[g].push(item); });
+    order.forEach(function (g) {
+      var kids = byGroup[g];
+      var head = document.createElement("a");
+      head.href = "#" + kids[0].id;
+      head.className = "is-group" + (g === cur ? " is-active-group" : "");
+      head.textContent = g;
+      head.title = g;
+      head.addEventListener("click", function (ev) { go(kids[0], ev); });
+      list.appendChild(head);
+      if (g !== cur || kids.length < 2) return;
+      kids.forEach(function (item) {
+        var link = document.createElement("a");
+        link.href = "#" + item.id;
+        link.className = "is-sub";
+        link.textContent = item.label;
+        link.title = item.label;
+        link.addEventListener("click", function (ev) { go(item, ev); });
+        list.appendChild(link);
+      });
     });
   }
+
 
   function buttonLabel(node) {
     var parts = [];
@@ -238,6 +265,7 @@
   function setCurrent(id) {
     var changed = id !== currentId;
     currentId = id || "";
+    if (groupOfId(currentId) && groupOfId(currentId) !== renderedGroup) renderList();
     var active = null;
     [].forEach.call(list.querySelectorAll("a"), function (link) {
       if (currentId && link.getAttribute("href") === "#" + currentId) {

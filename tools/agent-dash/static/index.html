@@ -135,7 +135,7 @@ tr.clk{cursor:pointer}tr.clk:hover td{background:var(--surface-2)}
 [hidden]{display:none !important}
 .view-toggle{display:inline-flex;border:1px solid var(--ring);border-radius:6px;overflow:hidden}
 .view-toggle button{border:0;border-radius:0;background:transparent;color:var(--ink-2);font-weight:600;padding:6px 12px}
-.view-toggle button[aria-pressed="true"]{background:var(--surface-2);color:var(--ink)}
+.view-toggle button[aria-pressed="true"]{background:var(--s1);color:#fff}
 .needs-you{margin-bottom:14px}
 .needs-line{margin:4px 0;font-size:13px;color:var(--ink-2)}
 .needs-row{display:flex;flex-wrap:wrap;gap:8px 12px;align-items:baseline;padding:6px 0;border-bottom:1px solid var(--grid);font-size:13.5px}
@@ -227,10 +227,17 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
 .wn-pill{display:inline-flex;align-items:center;gap:6px;font:12px var(--mono);padding:3px 10px 3px 6px;border-radius:999px;border:1px solid color-mix(in srgb,var(--s1) 45%,var(--ring));background:color-mix(in srgb,var(--s1) 10%,var(--surface))}
 .wn-pill i{width:8px;height:8px;border-radius:50%;animation:livering 1.8s ease-out infinite}
 .wn-pill .wn-id{font-weight:700;color:var(--ink)}.wn-pill .wn-slug{color:var(--ink-2)}
+
+/* floating top bar: title, view toggle, range, theme and the workstream tabs stay visible while scrolling */
+.topbar{position:sticky;top:0;z-index:35;margin:-18px -20px 14px;padding:10px 20px 0;background:color-mix(in srgb,var(--page) 88%,transparent);-webkit-backdrop-filter:blur(10px);backdrop-filter:blur(10px);border-bottom:1px solid var(--grid)}
+.topbar header{position:static;margin:0;padding:0;background:none;-webkit-backdrop-filter:none;backdrop-filter:none}
+.topbar .tabs{margin:8px 0 0;border-bottom:0}
+[data-nav], [data-sec], .lay, #plan-body h2, #plan-body h3, #plan-body section { scroll-margin-top: 120px; }
 </style>
 </head>
 <body>
 <div class="wrap">
+<div class="topbar">
 <header class="shell">
 <h1 id="title">Agent dashboard</h1>
 <span class="live"><span class="dot" id="live-dot"></span><span id="live-txt">connecting</span></span>
@@ -244,6 +251,7 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
 <button id="theme" title="Toggle light or dark">Theme</button>
 </header>
 <nav class="tabs" id="tabs" role="tablist" aria-label="Workstreams"></nav>
+</div>
 <div id="exec-view">
 <main id="main"></main>
 <p class="foot" id="foot"></p>
