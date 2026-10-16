@@ -46,6 +46,12 @@ class LaunchEchoTest(unittest.TestCase):
         self.assertEqual(kept, [real["run_id"], alone["run_id"], late["run_id"]])
         self.assertEqual(real["verdict"], "PASS")
 
+    def test_wrapper_with_the_same_label_is_not_a_twin(self):
+        wrapper = {"run_id": "claude-workflow:s:wf/a", "label": "ws4-WS4.3-deal-sql", "source": "claude-workflow", "status": "running", "started_at": 1000.0, "ended_at": None, "clock_source": "transcript"}
+        worker = {"run_id": "muse:u:ws4-WS4.3-deal-sql", "label": "ws4-WS4.3-deal-sql", "source": "muse", "status": "running", "started_at": 1010.0, "ended_at": None, "clock_source": "manifest", "pid": 9}
+        kept = [row["run_id"] for row in _drop_launch_echoes([wrapper, worker])]
+        self.assertEqual(kept, [wrapper["run_id"], worker["run_id"]])
+
 
 class OneRunPerProcessTest(unittest.TestCase):
     def test_same_label_and_pid_keeps_the_real_row(self):

@@ -1530,8 +1530,9 @@ def _drop_launch_echoes(rows: list) -> list:
 
     A launcher writes a manifest row for every worker it starts, and the
     worker's own transcript (Cursor chat, muse session) makes a second row for
-    the same run. A manifest row whose label matches a non-manifest run that
-    started within ten minutes is that same run: it is dropped, and its verdict
+    the same run. A manifest row whose label matches a non-manifest run from
+    the same source that started within ten minutes is that same run (a
+    ws-wave Haiku wrapper shares its muse run's label but is not it): it is dropped, and its verdict
     and output size fill any gap in the twin. A manifest row with no twin stays.
     """
     by_label: dict = {}
@@ -1546,7 +1547,7 @@ def _drop_launch_echoes(rows: list) -> list:
                 if (
                     other is not row
                     and other.get("clock_source") != "manifest"
-                    and other.get("source") not in ("shell", None)
+                    and other.get("source") == row.get("source")
                     and other.get("started_at") is not None
                     and abs(other["started_at"] - start) <= 600
                 ):
