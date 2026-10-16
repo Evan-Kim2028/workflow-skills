@@ -61,7 +61,28 @@ python3 ~/.claude/tools/agent-dash/agent_dash.py ws approvals WS4
 
 Pending items show in the dashboard's "Needs you" card and in the Plan page's Approvals section.
 
-## 4. Execute each wave with the `ws-wave` workflow
+## 4. Two ways to run a wave
+
+`drive_lanes.py` is the default for a build, review, and fix loop. It calls the runner, waits on the worker, and reads the verdict line. A Claude wrapper can answer a chat message and drop the lane. This driver cannot, and the step costs no Claude tokens.
+
+`ws-wave` is the workflow. Use it when you want the run in the workflow progress view. Same lane JSON either way. The driver reads that JSON from a file. Exit 0 when nothing needs the lead, and 3 when something does. It writes `drive-<task>.json` in the run directory and prints the same result shape as `ws-wave`. It does not push, open a pull request, merge, or touch production.
+
+```bash
+python3 ~/.claude/tools/agent-dash/scripts/drive_lanes.py /absolute/path/lanes.json
+python3 ~/.claude/tools/agent-dash/scripts/drive_lanes.py /absolute/path/lanes.json --only WS4.1 --start rev
+```
+
+`--only` drives one task. `--start rev` or `--start fix` resumes a lane, and `--findings` is the review file for a fix resume.
+
+Stack a dependent lane on its dependency's branch (`base` `dep:<task>`) instead of waiting for the merge, and never rebase or amend a member branch other lanes are stacked on.
+
+Assemble the train while lanes are still in review.
+
+Ship code-only members in their own train ahead of prod-affecting ones so the next wave unblocks.
+
+One writer per worktree, but a second writer on a different branch and worktree may run at once.
+
+### Workflow progress view
 
 In the lead session, call Claude Code's Workflow tool with:
 

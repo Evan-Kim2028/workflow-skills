@@ -1,6 +1,6 @@
 ---
 name: workstream-lead
-description: Run a planned workstream end to end as its lead session. Read the bundle's kickoff brief, run each wave with the ws-wave workflow so registry workers (muse, cursor-agent Grok and Composer, GLM via grok-build) do the work, move task status so the dashboard tracks it, act only on approved production steps, coordinate with other leads, and hand off cleanly. Use when a session is told "you are the WS<n> lead", is given a START-PROMPT, or picks up a workstream mid-flight.
+description: Run a planned workstream end to end as its lead session. Read the bundle's kickoff brief, run each wave with drive_lanes.py so registry workers (muse, cursor-agent Grok and Composer, GLM via grok-build) do the work, use the ws-wave workflow when you want its progress view, move task status so the dashboard tracks it, act only on approved production steps, coordinate with other leads, and hand off cleanly. Use when a session is told "you are the WS<n> lead", is given a START-PROMPT, or picks up a workstream mid-flight.
 ---
 
 # Workstream lead
@@ -21,7 +21,7 @@ The lead plans, decides, verifies and reports. Workers do everything else. Relat
 ## Each wave
 
 1. Build the lane list from the execution plan. Lanes in one wave share no file or test file. Use `reviewFocus` for lanes that need explicit checks, and `oneWay: true` for irreversible or production-adjacent lanes.
-2. Run the `ws-wave` workflow. Use the Workflow tool with `scriptPath: <abs>/agent-dash/workflows/ws-wave.js`. The wrapper is `wrapperModel` (default `haiku`) and `wrapperEffort` (default `low`). Each lane can set `tier`, `reviewTier`, `fixTier`, `model`, `reviewModel`, and `fixModel`. Tiers are registry names: `default` (muse), `grok`, `composer`, `glm`, `glm-flash`, or `auto`. `deps` lists task ids in this run, the same name as in `plan.json`. The lane starts when each of those finished `APPROVE*` or `built`. Otherwise the result is `skipped-dep` and names the dependency. `base: "dep:<task>"` cuts the worktree from that task's branch. Independent lanes start together. Unknown ids and cycles throw.
+2. Run the wave with `drive_lanes.py`. That is the default. Pass the same JSON object `ws-wave` takes, as a file. `--only` drives one task. `--start rev` or `--start fix` resumes a lane, and `--findings` is the review file for a fix resume. Each lane can set `tier`, `reviewTier`, `fixTier`, `model`, `reviewModel`, and `fixModel`. Tiers are registry names: `default` (muse), `grok`, `composer`, `glm`, `glm-flash`, or `auto`. `deps` lists task ids in this run, the same name as in `plan.json`. The lane starts when each of those finished `APPROVE*` or `built`. Otherwise the result is `skipped-dep` and names the dependency. `base` of `dep:<task>` cuts the worktree from that task's branch. Independent lanes start together. Unknown ids and cycles throw. Use the `ws-wave` workflow when you want the progress view. See "Two ways to run a wave".
 
    One wave can mix a Grok build, a Composer review, and a stacked follow-on:
 
@@ -41,6 +41,27 @@ The lead plans, decides, verifies and reports. Workers do everything else. Relat
 5. Start the next wave as soon as its start condition holds. Don't wait on lower wave numbers. A task is ready when every id in its `deps` is done or merged.
 6. When you re-plan (split, merge, move or add a task, or change a wave), update the task `deps` and `wave` in `plan.json` in the same step, then run `ws validate`.
 
+## Two ways to run a wave
+
+`drive_lanes.py` runs a build, review, and fix loop as a plain process. It calls the runner, waits on the worker, and reads the verdict line. A Claude wrapper can answer a chat message and drop the lane. This driver cannot, and the step costs no Claude tokens.
+
+`ws-wave` is the workflow. Use it when you want the run in the workflow progress view. The script path is `<abs>/agent-dash/workflows/ws-wave.js`. `wrapperModel` defaults to `haiku` and `wrapperEffort` defaults to `low`.
+
+Same lane JSON either way. Exit 0 when nothing needs the lead, and 3 when something does. The driver writes `drive-<task>.json` in the run directory and prints the same result shape as `ws-wave`. It does not push, open a pull request, merge, or touch production.
+
+```bash
+python3 <abs>/agent-dash/scripts/drive_lanes.py /absolute/path/lanes.json
+python3 <abs>/agent-dash/scripts/drive_lanes.py /absolute/path/lanes.json --only WS4.1 --start rev
+```
+
+Stack a dependent lane on its dependency's branch (`base` `dep:<task>`) instead of waiting for the merge, and never rebase or amend a member branch other lanes are stacked on.
+
+Assemble the train while lanes are still in review.
+
+Ship code-only members in their own train ahead of prod-affecting ones so the next wave unblocks.
+
+One writer per worktree, but a second writer on a different branch and worktree may run at once.
+
 ## Production steps
 
 - Act only on items marked `approved` in `approvals.json`, and follow their conditions. Run one production step at a time across all workstreams that share the slot.
@@ -50,7 +71,7 @@ The lead plans, decides, verifies and reports. Workers do everything else. Relat
 ## Labels, logging, tokens
 
 - Run labels are `<id lowercase>-<task-id>-<slug>`, plus `-rev<n>` and `-fix<n>` for reviews and fixes. The dashboard pins each run onto its task chip and counts attempts.
-- Launch workers only through the tool's launchers (`scripts/run_worker.sh`, or `ws-wave`), which log billed tokens and session manifests. Never launch Grok with `--output-format text`.
+- Launch workers only through the tool's launchers (`scripts/run_worker.sh`, `scripts/drive_lanes.py`, or `ws-wave`), which log billed tokens and session manifests. Never launch Grok with `--output-format text`.
 
 ## Merging fast: trains and local CI
 
