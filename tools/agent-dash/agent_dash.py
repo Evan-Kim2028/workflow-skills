@@ -14,7 +14,7 @@ import time
 from pathlib import Path
 
 from dash.bundles import cmd_ws
-from dash.locate import expand
+from dash.locate import expand, ignore_local
 from dash.pricing import reprice as reprice_usage
 from dash.server import DashServer
 from dash.sources import Registry
@@ -84,7 +84,8 @@ def load_cfg(path: Path | None = None) -> dict:
         _merge_file(cfg, Path(chosen))
     else:
         _merge_file(cfg, ROOT / "config.example.json")
-        _merge_file(cfg, ROOT / "config.local.json")
+        if not ignore_local():
+            _merge_file(cfg, ROOT / "config.local.json")
     _apply_env(cfg)
     _expand_cfg(cfg)
     cfg.pop("caps", None)

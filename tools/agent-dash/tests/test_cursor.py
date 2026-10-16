@@ -1,4 +1,7 @@
 """Cursor-agent source tests. Synthetic chats plus a read-only smoke on a local home."""
+import os
+
+os.environ["AGENT_DASH_IGNORE_LOCAL"] = "1"
 
 import importlib.util
 import json

@@ -33,6 +33,11 @@ def expand(value: str) -> str:
     return text
 
 
+def ignore_local() -> bool:
+    """True when AGENT_DASH_IGNORE_LOCAL is set, so tests see only the shipped example files."""
+    return os.environ.get("AGENT_DASH_IGNORE_LOCAL", "") not in ("", "0")
+
+
 def layered_path(stem: str, env: str, directory: Path | None = None) -> Path | None:
     """Local file replaces the example. ``env`` names an optional path override."""
     override = os.environ.get(env)
@@ -42,7 +47,7 @@ def layered_path(stem: str, env: str, directory: Path | None = None) -> Path | N
     local = base / f"{stem}.local.json"
     example = base / f"{stem}.example.json"
     plain = base / f"{stem}.json"
-    if local.is_file():
+    if local.is_file() and not ignore_local():
         return local
     if example.is_file():
         return example

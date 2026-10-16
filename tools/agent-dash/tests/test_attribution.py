@@ -1,3 +1,6 @@
+import os
+
+os.environ["AGENT_DASH_IGNORE_LOCAL"] = "1"
 import json
 import os
 import sys

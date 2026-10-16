@@ -1,4 +1,7 @@
 """Config defaults. No personal sessions."""
+import os
+
+os.environ["AGENT_DASH_IGNORE_LOCAL"] = "1"
 
 import json
 import os
@@ -31,6 +34,8 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(set(found), {str(one), str(two)})
 
     def test_local_file_replaces_example(self):
+        self.addCleanup(os.environ.__setitem__, "AGENT_DASH_IGNORE_LOCAL", "1")
+        os.environ["AGENT_DASH_IGNORE_LOCAL"] = ""
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
             (base / "map.example.json").write_text(

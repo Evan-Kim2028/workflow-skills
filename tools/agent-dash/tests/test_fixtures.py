@@ -1,4 +1,7 @@
 """Shape checks for the API fixtures, plus a small read of the example sessions."""
+import os
+
+os.environ["AGENT_DASH_IGNORE_LOCAL"] = "1"
 
 import json
 import os

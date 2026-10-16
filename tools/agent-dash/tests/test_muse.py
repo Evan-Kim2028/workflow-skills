@@ -1,4 +1,7 @@
 """Tests for dash/sources/muse.py. Synthetic fixtures plus one bounded smoke."""
+import os
+
+os.environ["AGENT_DASH_IGNORE_LOCAL"] = "1"
 
 import contextlib
 import importlib.util

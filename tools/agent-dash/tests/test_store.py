@@ -1,4 +1,7 @@
 import os
+
+os.environ["AGENT_DASH_IGNORE_LOCAL"] = "1"
+import os
 import sys
 import tempfile
 import time

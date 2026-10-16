@@ -1,4 +1,7 @@
 """Static rules for the dashboard pages: every chart has axes, every number is compact."""
+import os
+
+os.environ["AGENT_DASH_IGNORE_LOCAL"] = "1"
 import re
 import unittest
 from pathlib import Path
