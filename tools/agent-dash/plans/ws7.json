@@ -1,0 +1,94 @@
+{
+  "ws": "WS7",
+  "dag": {
+    "cols": [
+      "Frame",
+      "Pages",
+      "Data",
+      "Ship"
+    ],
+    "groups": [
+      {
+        "id": "frame",
+        "col": 0,
+        "title": "Frame",
+        "tasks": [
+          {
+            "id": "WS7.FRAME",
+            "title": "App shell",
+            "status": "done"
+          }
+        ]
+      },
+      {
+        "id": "pages",
+        "col": 1,
+        "title": "Pages",
+        "tasks": [
+          {
+            "id": "WS7.LANDING",
+            "title": "Landing page",
+            "status": "prog"
+          },
+          {
+            "id": "WS7.NOTES",
+            "title": "Notes page",
+            "status": "todo"
+          }
+        ]
+      },
+      {
+        "id": "data",
+        "col": 2,
+        "title": "Data",
+        "tasks": [
+          {
+            "id": "WS7.FEED",
+            "title": "Feed the page from the API",
+            "status": "pr"
+          }
+        ]
+      },
+      {
+        "id": "ship",
+        "col": 3,
+        "title": "Ship",
+        "tasks": [
+          {
+            "id": "WS7.CHECK",
+            "title": "Check the empty and error states",
+            "status": "todo"
+          }
+        ]
+      }
+    ],
+    "edges": [
+      [
+        "frame",
+        "pages"
+      ],
+      [
+        "pages",
+        "data"
+      ],
+      [
+        "data",
+        "ship"
+      ]
+    ]
+  },
+  "narrative": {
+    "phases": [
+      {
+        "name": "Pages",
+        "goal": "Landing renders with fixture data.",
+        "gate": "The notes page has a layout."
+      },
+      {
+        "name": "Ship",
+        "goal": "Empty and error states are checked.",
+        "gate": "The check task is done."
+      }
+    ]
+  }
+}

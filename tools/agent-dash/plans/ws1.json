@@ -1,0 +1,125 @@
+{
+  "ws": "WS1",
+  "dag": {
+    "cols": [
+      "Foundations",
+      "Build",
+      "Wire",
+      "Prove"
+    ],
+    "groups": [
+      {
+        "id": "scope",
+        "col": 0,
+        "title": "Scope",
+        "tasks": [
+          {
+            "id": "1",
+            "title": "Write the outline",
+            "status": "done"
+          },
+          {
+            "id": "4",
+            "title": "Freeze the types",
+            "status": "done"
+          }
+        ]
+      },
+      {
+        "id": "store",
+        "col": 0,
+        "title": "Store",
+        "tasks": [
+          {
+            "id": "12",
+            "title": "Schema migration",
+            "status": "prog"
+          },
+          {
+            "id": "13",
+            "title": "Backfill the empty tables",
+            "status": "todo"
+          }
+        ]
+      },
+      {
+        "id": "match",
+        "col": 1,
+        "title": "Match",
+        "tasks": [
+          {
+            "id": "20",
+            "title": "Matcher core",
+            "status": "done"
+          },
+          {
+            "id": "21",
+            "title": "Conflict rule",
+            "status": "pr"
+          }
+        ]
+      },
+      {
+        "id": "cut",
+        "col": 2,
+        "title": "Cut over",
+        "tasks": [
+          {
+            "id": "30",
+            "title": "First source",
+            "status": "prog"
+          },
+          {
+            "id": "31",
+            "title": "Second source",
+            "status": "todo"
+          }
+        ]
+      },
+      {
+        "id": "prove",
+        "col": 3,
+        "title": "Prove",
+        "tasks": [
+          {
+            "id": "40",
+            "title": "Gate the sample set",
+            "status": "todo"
+          }
+        ]
+      }
+    ],
+    "edges": [
+      [
+        "scope",
+        "store"
+      ],
+      [
+        "store",
+        "match"
+      ],
+      [
+        "match",
+        "cut"
+      ],
+      [
+        "cut",
+        "prove"
+      ]
+    ]
+  },
+  "narrative": {
+    "phases": [
+      {
+        "name": "Shape",
+        "goal": "Types and the store agree.",
+        "gate": "The sample set loads."
+      },
+      {
+        "name": "Cut over",
+        "goal": "One source reads the new store.",
+        "gate": "The gate task is done."
+      }
+    ]
+  }
+}

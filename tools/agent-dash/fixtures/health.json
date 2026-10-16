@@ -1,0 +1,48 @@
+{
+  "ok": true,
+  "sources": [
+    {
+      "name": "claude",
+      "last_poll": 1761999959,
+      "last_error": null,
+      "lag_s": 1
+    },
+    {
+      "name": "manifests",
+      "last_poll": 1761999959,
+      "last_error": null,
+      "lag_s": 1
+    },
+    {
+      "name": "muse",
+      "last_poll": 1761999959,
+      "last_error": null,
+      "lag_s": 1
+    },
+    {
+      "name": "grok_cli",
+      "last_poll": 1761999959,
+      "last_error": null,
+      "lag_s": 1
+    },
+    {
+      "name": "cursor",
+      "last_poll": 1761999959,
+      "last_error": null,
+      "lag_s": 1
+    },
+    {
+      "name": "process",
+      "last_poll": 1761999959,
+      "last_error": null,
+      "lag_s": 1
+    },
+    {
+      "name": "hub",
+      "last_poll": 1761999959,
+      "last_error": null,
+      "lag_s": 1
+    }
+  ],
+  "_note": "Seeded synthetic data for the offline preview. Seed 1. No local sessions are read."
+}

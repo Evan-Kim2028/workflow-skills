@@ -1,0 +1,4 @@
+*.local.json
+__pycache__/
+*.sqlite*
+.DS_Store

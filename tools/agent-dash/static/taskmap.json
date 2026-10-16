@@ -1,0 +1,14 @@
+{
+  "_doc": "Run label -> plan task id. Keys are exact labels or /regex/ strings. Copy to taskmap.local.json to override. The page reloads the resolved file every refresh.",
+  "WS1": {
+    "ws1-schema": "12",
+    "/^ws1-migrate/": "13"
+  },
+  "WS2": {
+    "ws2-routes": "WS2.3"
+  },
+  "WS7": {
+    "ws7-landing": "WS7.LANDING",
+    "/^ws7-notes/": "WS7.NOTES"
+  }
+}

@@ -1,0 +1,133 @@
+{
+  "workstreams": [
+    {
+      "ws": "WS0",
+      "name": "Stabilize",
+      "tk": {
+        "backlog": 3,
+        "todo": 1,
+        "doing": 0,
+        "review": 0,
+        "done": 2,
+        "cancelled": 0
+      },
+      "running": 0,
+      "tokens": 0,
+      "cost_usd": 0,
+      "plan": false
+    },
+    {
+      "ws": "WS1",
+      "name": "Identity",
+      "tk": {
+        "backlog": 2,
+        "todo": 1,
+        "doing": 1,
+        "review": 0,
+        "done": 4,
+        "cancelled": 0
+      },
+      "running": 3,
+      "tokens": 436889,
+      "cost_usd": 2.0176,
+      "plan": true
+    },
+    {
+      "ws": "WS2",
+      "name": "Public API",
+      "tk": {
+        "backlog": 2,
+        "todo": 0,
+        "doing": 1,
+        "review": 1,
+        "done": 3,
+        "cancelled": 0
+      },
+      "running": 2,
+      "tokens": 360883,
+      "cost_usd": 0.4083,
+      "plan": true
+    },
+    {
+      "ws": "WS3",
+      "name": "Gateway",
+      "tk": {
+        "backlog": 1,
+        "todo": 0,
+        "doing": 0,
+        "review": 0,
+        "done": 1,
+        "cancelled": 0
+      },
+      "running": 0,
+      "tokens": 0,
+      "cost_usd": 0,
+      "plan": false
+    },
+    {
+      "ws": "WS4",
+      "name": "Offers",
+      "tk": {
+        "backlog": 1,
+        "todo": 1,
+        "doing": 0,
+        "review": 0,
+        "done": 1,
+        "cancelled": 0
+      },
+      "running": 0,
+      "tokens": 0,
+      "cost_usd": 0,
+      "plan": false
+    },
+    {
+      "ws": "WS5",
+      "name": "Clients",
+      "tk": {
+        "backlog": 1,
+        "todo": 0,
+        "doing": 0,
+        "review": 0,
+        "done": 2,
+        "cancelled": 0
+      },
+      "running": 0,
+      "tokens": 0,
+      "cost_usd": 0,
+      "plan": false
+    },
+    {
+      "ws": "WS6",
+      "name": "Cleanup",
+      "tk": {
+        "backlog": 2,
+        "todo": 0,
+        "doing": 0,
+        "review": 0,
+        "done": 0,
+        "cancelled": 1
+      },
+      "running": 0,
+      "tokens": 0,
+      "cost_usd": 0,
+      "plan": false
+    },
+    {
+      "ws": "WS7",
+      "name": "Launch",
+      "tk": {
+        "backlog": 1,
+        "todo": 0,
+        "doing": 1,
+        "review": 0,
+        "done": 2,
+        "cancelled": 0
+      },
+      "running": 3,
+      "tokens": 317741,
+      "cost_usd": 0.4934,
+      "plan": true
+    }
+  ],
+  "_note": "Seeded synthetic data for the offline preview. Seed 1. No local sessions are read."
+}

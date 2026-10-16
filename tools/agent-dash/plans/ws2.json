@@ -1,0 +1,94 @@
+{
+  "ws": "WS2",
+  "dag": {
+    "cols": [
+      "Contract",
+      "Routes",
+      "Clients",
+      "Remove"
+    ],
+    "groups": [
+      {
+        "id": "contract",
+        "col": 0,
+        "title": "Contract",
+        "tasks": [
+          {
+            "id": "WS2.1",
+            "title": "Publish the route list",
+            "status": "done"
+          }
+        ]
+      },
+      {
+        "id": "routes",
+        "col": 1,
+        "title": "Routes",
+        "tasks": [
+          {
+            "id": "WS2.3",
+            "title": "Read route",
+            "status": "prog"
+          },
+          {
+            "id": "WS2.4",
+            "title": "List route",
+            "status": "todo"
+          }
+        ]
+      },
+      {
+        "id": "clients",
+        "col": 2,
+        "title": "Clients",
+        "tasks": [
+          {
+            "id": "WS2.8",
+            "title": "Point the client at the new route",
+            "status": "pr"
+          }
+        ]
+      },
+      {
+        "id": "remove",
+        "col": 3,
+        "title": "Remove",
+        "tasks": [
+          {
+            "id": "WS2.9",
+            "title": "Delete the old handler",
+            "status": "todo"
+          }
+        ]
+      }
+    ],
+    "edges": [
+      [
+        "contract",
+        "routes"
+      ],
+      [
+        "routes",
+        "clients"
+      ],
+      [
+        "routes",
+        "remove"
+      ]
+    ]
+  },
+  "narrative": {
+    "phases": [
+      {
+        "name": "Routes",
+        "goal": "The read route answers.",
+        "gate": "A client can call it."
+      },
+      {
+        "name": "Remove",
+        "goal": "The old handler is gone.",
+        "gate": "No caller remains."
+      }
+    ]
+  }
+}

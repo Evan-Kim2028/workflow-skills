@@ -1,0 +1,473 @@
+"""Tests for dash.sources.manifests. Synthetic fixtures plus a bounded real-file smoke."""
+
+from __future__ import annotations
+
+import json
+import os
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from dash.sources import manifests  # noqa: E402
+
+PARENT = "cccccccc-cccc-cccc-cccc-cccccccccccc"
+OTHER = "dddddddd-dddd-dddd-dddd-dddddddddddd"
+MUSE = "11111111-1111-1111-1111-111111111111"
+GLM = "22222222-2222-2222-2222-222222222222"
+NOW = 1_792_000_000
+SECRET = "SECRET_PROMPT"
+ERR_TEXT = "UNIQUE_ERR_TEXT"
+
+
+class MemStore:
+    def __init__(self):
+        self.offsets = {}
+        self.runs = {}
+
+    def get_offset(self, path):
+        return self.offsets.get(path)
+
+    def set_offset(self, path, inode, offset, size, mtime):
+        self.offsets[path] = (inode, offset)
+
+    def upsert_run(self, row):
+        self.runs[row["run_id"]] = row
+
+
+def _write(path, data, mtime):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    mode = "wb" if isinstance(data, bytes) else "w"
+    with open(path, mode) as fh:
+        fh.write(data)
+    os.utime(path, (mtime, mtime))
+
+
+def _dump(store):
+    return json.dumps(list(store.runs.values()), default=str)
+
+
+class ManifestUnitTests(unittest.TestCase):
+    def test_parse_tsv_header_cursor_and_glm(self):
+        text = "\n".join(
+            [
+                "label\tsession_id\tstarted",
+                "note-row\t-\t1700000003",
+                "rev-ws\t22222222-2222-2222-2222-222222222222\t1700000002\tglm-5.3",
+                "skip-me",
+                "# comment",
+            ]
+        )
+        rows = manifests.parse_manifest_text(text)
+        self.assertEqual(len(rows), 2)
+        self.assertIsNone(rows[0]["session_uuid"])
+        self.assertEqual(rows[0]["label"], "note-row")
+        self.assertEqual(rows[0]["started_at"], 1700000003)
+        self.assertEqual(rows[1]["model"], "glm-5.3")
+        self.assertEqual(rows[1]["session_uuid"], "22222222-2222-2222-2222-222222222222")
+
+    def test_verdict_regex(self):
+        self.assertEqual(manifests.verdict_of("PASS\n"), "PASS")
+        self.assertEqual(manifests.verdict_of("PASS. more text\n"), "PASS")
+        self.assertEqual(manifests.verdict_of("PARTIAL. gap\n"), "PARTIAL")
+        self.assertEqual(manifests.verdict_of("BLOCKED\n"), "BLOCKED")
+        self.assertEqual(manifests.verdict_of("VERDICT: APPROVE\n"), "APPROVE")
+        self.assertEqual(
+            manifests.verdict_of("VERDICT: APPROVE_WITH_CHANGES\n"),
+            "APPROVE_WITH_CHANGES",
+        )
+        self.assertEqual(
+            manifests.verdict_of("VERDICT: REQUEST_CHANGES\n"), "REQUEST_CHANGES"
+        )
+        self.assertEqual(manifests.verdict_of("narration\nPASS\n"), "PASS")
+        self.assertIsNone(manifests.verdict_of("The model said hello\n"))
+        self.assertIsNone(manifests.verdict_of("VERDICT:APPROVE\n"))
+
+    def test_classify_matrix(self):
+        base = dict(err_has_sigterm=False, err_nonempty=False, err_known=True)
+        self.assertEqual(
+            manifests.classify_status(
+                out_bytes=10, prev_out_bytes=0, label_alive=False, **base
+            ),
+            "running",
+        )
+        self.assertEqual(
+            manifests.classify_status(
+                out_bytes=0,
+                prev_out_bytes=None,
+                label_alive=True,
+                err_has_sigterm=True,
+                err_nonempty=True,
+            ),
+            "running",
+        )
+        self.assertEqual(
+            manifests.classify_status(
+                out_bytes=0,
+                prev_out_bytes=None,
+                label_alive=None,
+                err_has_sigterm=True,
+                err_nonempty=True,
+            ),
+            "killed",
+        )
+        self.assertEqual(
+            manifests.classify_status(
+                out_bytes=0,
+                prev_out_bytes=None,
+                label_alive=False,
+                err_has_sigterm=False,
+                err_nonempty=True,
+            ),
+            "died_early",
+        )
+        self.assertEqual(
+            manifests.classify_status(
+                out_bytes=0,
+                prev_out_bytes=None,
+                label_alive=None,
+                err_has_sigterm=False,
+                err_nonempty=True,
+            ),
+            "unknown",
+        )
+        self.assertEqual(
+            manifests.classify_status(
+                out_bytes=0,
+                prev_out_bytes=None,
+                label_alive=None,
+                err_has_sigterm=False,
+                err_nonempty=False,
+            ),
+            "unknown",
+        )
+        self.assertEqual(
+            manifests.classify_status(
+                out_bytes=20,
+                prev_out_bytes=None,
+                label_alive=None,
+                err_has_sigterm=False,
+                err_nonempty=False,
+            ),
+            "done",
+        )
+        self.assertEqual(
+            manifests.classify_status(
+                out_bytes=20,
+                prev_out_bytes=20,
+                label_alive=False,
+                err_has_sigterm=False,
+                err_nonempty=False,
+            ),
+            "done",
+        )
+        self.assertEqual(
+            manifests.classify_status(
+                out_bytes=0,
+                prev_out_bytes=None,
+                label_alive=False,
+                err_has_sigterm=False,
+                err_nonempty=False,
+            ),
+            "done",
+        )
+        self.assertEqual(
+            manifests.classify_status(
+                out_bytes=8,
+                prev_out_bytes=8,
+                label_alive=None,
+                err_has_sigterm=False,
+                err_nonempty=False,
+                err_known=False,
+            ),
+            "unknown",
+        )
+
+
+class ManifestPollTests(unittest.TestCase):
+    def setUp(self):
+        manifests.reset_state()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.store = MemStore()
+        self.root = self.tmp.name
+        self.scratch = os.path.join(self.root, "enc", PARENT, "scratchpad")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+        manifests.reset_state()
+
+    def _cfg(self, **extra):
+        cfg = {
+            "scratch_root": self.root,
+            "dir_scan_s": 0,
+            "live_window_s": 36 * 3600,
+            "read_budgets": {"per_file": 1024 * 1024, "per_tick": 1024 * 1024},
+        }
+        cfg.update(extra)
+        return cfg
+
+    def test_poll_maps_rows_and_ignores_nested_and_prompts(self):
+        _write(
+            os.path.join(self.scratch, "muse-sessions.tsv"),
+            f"alpha\t{MUSE}\t1700000000\n",
+            NOW,
+        )
+        _write(
+            os.path.join(self.scratch, "glm-sessions.tsv"),
+            f"rev\t{GLM}\t1700000002\tglm-5.3\n",
+            NOW,
+        )
+        _write(
+            os.path.join(self.scratch, "cursor-sessions.tsv"),
+            "dash-preview\t-\t1700000001\n",
+            NOW,
+        )
+        _write(
+            os.path.join(self.scratch, "grok-sessions.tsv"),
+            "label\tsession_id\tstarted\nnote-row\t-\t1700000003\n",
+            NOW,
+        )
+        _write(
+            os.path.join(self.scratch, "muse", "out-alpha.md"),
+            f"PASS\n{SECRET}\n",
+            NOW,
+        )
+        _write(
+            os.path.join(self.scratch, "muse", "err-alpha.log"),
+            f"{ERR_TEXT}\nreceived SIGTERM\n",
+            NOW,
+        )
+        _write(
+            os.path.join(self.scratch, "muse", "alpha.md"),
+            f"{SECRET}\n",
+            NOW,
+        )
+        _write(
+            os.path.join(self.scratch, "muse", "out-DECOY.md"),
+            "PASS\n",
+            NOW,
+        )
+        _write(
+            os.path.join(self.scratch, "muse", "nested", "out-NESTED.md"),
+            "PASS\n",
+            NOW,
+        )
+        _write(
+            os.path.join(self.scratch, "head-check", "out-DECOY.md"),
+            f"PASS\n{SECRET}\n",
+            NOW,
+        )
+        _write(
+            os.path.join(self.scratch, "cursor", "out-dash-preview.md"),
+            "notes only\n",
+            NOW,
+        )
+        _write(
+            os.path.join(self.scratch, "exec", "out-job.md"),
+            "BLOCKED\n",
+            NOW,
+        )
+        _write(
+            os.path.join(self.scratch, "exec", "nested", "out-INNER.md"),
+            "PASS\n",
+            NOW,
+        )
+        _write(
+            os.path.join(self.scratch, "exec", "out-old.md"),
+            "PASS\n",
+            NOW - 40 * 3600,
+        )
+        ignored = os.path.join(self.root, "enc", "not-a-session", "scratchpad")
+        _write(
+            os.path.join(ignored, "muse-sessions.tsv"),
+            "ignored-session\t-\t1700000099\n",
+            NOW,
+        )
+        manifests.poll(self.store, self._cfg(), NOW)
+        blob = _dump(self.store)
+        self.assertNotIn(SECRET, blob)
+        self.assertNotIn(ERR_TEXT, blob)
+        labels = {row["label"] for row in self.store.runs.values()}
+        self.assertNotIn("DECOY", labels)
+        self.assertNotIn("NESTED", labels)
+        self.assertNotIn("INNER", labels)
+        self.assertNotIn("old", labels)
+        self.assertNotIn("ignored-session", labels)
+
+        muse = self.store.runs[f"muse:{MUSE}:alpha"]
+        self.assertEqual(muse["source"], "muse")
+        self.assertEqual(muse["tier"], "muse")
+        self.assertEqual(muse["parent_session_id"], PARENT)
+        self.assertEqual(muse["status"], "killed")
+        self.assertEqual(muse["verdict"], "PASS")
+        self.assertGreater(muse["out_bytes"], 0)
+        self.assertGreater(muse["err_bytes"], 0)
+
+        glm = self.store.runs[f"glm:{GLM}:rev"]
+        self.assertEqual(glm["model"], "glm-5.3")
+        self.assertEqual(glm["tier"], "glm")
+        self.assertEqual(glm["parent_session_id"], PARENT)
+        self.assertEqual(glm["status"], "unknown")
+
+        cursor = self.store.runs[f"grok:{PARENT}:cursor/dash-preview@1700000001"]
+        self.assertEqual(cursor["source"], "grok")
+        self.assertEqual(cursor["tier"], "grok")
+        self.assertIsNone(cursor.get("session_id"))
+        self.assertIsNone(cursor.get("verdict"))
+        self.assertEqual(cursor["status"], "done")
+
+        grok = self.store.runs[f"grok:{PARENT}:note-row@1700000003"]
+        self.assertEqual(grok["source"], "grok")
+        self.assertNotIn("cursor/", grok["run_id"])
+
+        shell = self.store.runs[f"shell:{PARENT}:job"]
+        self.assertEqual(shell["source"], "shell")
+        self.assertEqual(shell["verdict"], "BLOCKED")
+        self.assertEqual(shell["clock_source"], "mtime")
+        self.assertEqual(shell["status"], "done")
+
+    def test_growth_live_label_and_died_early(self):
+        _write(
+            os.path.join(self.scratch, "muse-sessions.tsv"),
+            f"alpha\t{MUSE}\t1700000000\nbeta\t{MUSE}\t1700000001\n",
+            NOW,
+        )
+        out = os.path.join(self.scratch, "muse", "out-alpha.md")
+        err = os.path.join(self.scratch, "muse", "err-beta.log")
+        _write(out, b"", NOW)
+        _write(err, b"boom\n", NOW)
+        store = MemStore()
+        manifests.poll(store, self._cfg(), NOW)
+        self.assertEqual(store.runs[f"muse:{MUSE}:alpha"]["status"], "unknown")
+        self.assertEqual(store.runs[f"muse:{MUSE}:beta"]["status"], "unknown")
+
+        with open(out, "ab") as fh:
+            fh.write(b"still going\n")
+        os.utime(out, (NOW + 2, NOW + 2))
+        manifests.poll(store, self._cfg(), NOW + 2)
+        self.assertEqual(store.runs[f"muse:{MUSE}:alpha"]["status"], "running")
+
+        store.live_labels = lambda: []
+        manifests.poll(store, self._cfg(), NOW + 3)
+        self.assertEqual(store.runs[f"muse:{MUSE}:beta"]["status"], "died_early")
+
+        store.live_labels = lambda: ["beta"]
+        manifests.poll(store, self._cfg(), NOW + 4)
+        self.assertEqual(store.runs[f"muse:{MUSE}:beta"]["status"], "running")
+
+    def test_process_samples_ttl(self):
+        _write(
+            os.path.join(self.scratch, "muse-sessions.tsv"),
+            f"alpha\t{MUSE}\t1700000000\n",
+            NOW,
+        )
+        _write(os.path.join(self.scratch, "muse", "out-alpha.md"), b"", NOW)
+
+        class Sampled(MemStore):
+            def process_samples(self):
+                return [{"label": "alpha", "ts": NOW - 5, "pid": 9}]
+
+        store = Sampled()
+        manifests.poll(store, self._cfg(process_ttl_s=30), NOW)
+        self.assertEqual(store.runs[f"muse:{MUSE}:alpha"]["status"], "running")
+
+        class Stale(MemStore):
+            def process_samples(self):
+                return [{"label": "alpha", "ts": NOW - 500}]
+
+        stale = Stale()
+        manifests.reset_state()
+        manifests.poll(stale, self._cfg(process_ttl_s=30), NOW)
+        self.assertEqual(stale.runs[f"muse:{MUSE}:alpha"]["status"], "done")
+
+    def test_report_fallback_and_out_wins(self):
+        _write(
+            os.path.join(self.scratch, "muse-sessions.tsv"),
+            f"alpha\t{MUSE}\t1700000000\nbeta\t{MUSE}\t1700000004\n",
+            NOW,
+        )
+        _write(
+            os.path.join(self.scratch, "muse", "out-alpha.md"),
+            "PASS\n",
+            NOW,
+        )
+        _write(
+            os.path.join(self.scratch, "muse", "report-alpha.md"),
+            "BLOCKED\n",
+            NOW,
+        )
+        _write(
+            os.path.join(self.scratch, "muse", "out-beta.md"),
+            "The model said hello\n",
+            NOW,
+        )
+        _write(
+            os.path.join(self.scratch, "muse", "report-beta.md"),
+            "VERDICT: APPROVE_WITH_CHANGES\n",
+            NOW,
+        )
+        manifests.poll(self.store, self._cfg(), NOW)
+        self.assertEqual(self.store.runs[f"muse:{MUSE}:alpha"]["verdict"], "PASS")
+        self.assertEqual(
+            self.store.runs[f"muse:{MUSE}:beta"]["verdict"], "APPROVE_WITH_CHANGES"
+        )
+
+    def test_budget_retries_verdict(self):
+        tsv = f"alpha\t{MUSE}\t1700000000\n".encode()
+        _write(os.path.join(self.scratch, "muse-sessions.tsv"), tsv, NOW)
+        _write(
+            os.path.join(self.scratch, "muse", "out-alpha.md"),
+            b"PASS\n" + (b"x" * 40),
+            NOW,
+        )
+        cfg = self._cfg()
+        cfg["read_budgets"] = {"per_file": 1024 * 1024, "per_tick": len(tsv) + 1}
+        manifests.poll(self.store, cfg, NOW)
+        run = self.store.runs[f"muse:{MUSE}:alpha"]
+        self.assertIsNone(run.get("verdict"))
+        manifests.poll(self.store, cfg, NOW + 1)
+        self.assertEqual(self.store.runs[f"muse:{MUSE}:alpha"]["verdict"], "PASS")
+
+    def test_backfill_includes_old_exec(self):
+        _write(
+            os.path.join(self.scratch, "exec", "out-old.md"),
+            b"PASS\n",
+            NOW - 40 * 3600,
+        )
+        manifests.poll(self.store, self._cfg(), NOW)
+        self.assertEqual(self.store.runs, {})
+        manifests.poll(
+            self.store, self._cfg(mode="backfill", session_id=PARENT), NOW
+        )
+        self.assertEqual(self.store.runs[f"shell:{PARENT}:old"]["verdict"], "PASS")
+
+    def test_other_session_not_mixed_into_backfill(self):
+        other = os.path.join(self.root, "enc", OTHER, "scratchpad")
+        _write(
+            os.path.join(other, "muse-sessions.tsv"),
+            f"alpha\t{MUSE}\t1700000000\n",
+            NOW,
+        )
+        manifests.poll(self.store, self._cfg(backfill_session=PARENT), NOW)
+        self.assertEqual(self.store.runs, {})
+
+
+class ManifestSmokeTests(unittest.TestCase):
+    @unittest.skipUnless(os.environ.get("AGENT_DASH_SMOKE") == "1", "set AGENT_DASH_SMOKE=1 to read a local scratchpad")
+    def test_manifest_parses(self):
+        root = os.environ.get("AGENT_DASH_SMOKE_SCRATCH")
+        if not root or not os.path.isdir(root):
+            self.skipTest("AGENT_DASH_SMOKE_SCRATCH is not set")
+        found = list(Path(root).glob("*/scratchpad/muse-sessions.tsv"))
+        if not found:
+            self.skipTest("no muse-sessions.tsv under AGENT_DASH_SMOKE_SCRATCH")
+        rows = manifests.parse_manifest_text(found[0].read_text(encoding="utf-8")[:65536])
+        self.assertGreaterEqual(len(rows), 1)
+
+
+if __name__ == "__main__":
+    unittest.main()

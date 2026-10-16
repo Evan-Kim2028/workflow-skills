@@ -1,0 +1,605 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Agent execution</title>
+<style>
+:root{
+  color-scheme:light;
+  --page:#f9f9f7;--surface:#fcfcfb;--surface-2:#f0efec;--ink:#0b0b0b;--ink-2:#52514e;--muted:#898781;
+  --grid:#e1e0d9;--axis:#c3c2b7;--ring:rgba(11,11,11,.10);
+  --s1:#2a78d6;--s2:#eb6834;--s3:#1baf7a;--s4:#eda100;--s5:#e87ba4;--s6:#008300;--s7:#6250d6;--s8:#e34948;
+  --good:#0ca30c;--warning:#fab219;--serious:#ec835a;--critical:#d03b3b;--good-ink:#006300;
+  --other:#a8a69e;
+  --font:system-ui,-apple-system,"Segoe UI",sans-serif;--mono:ui-monospace,Menlo,Consolas,monospace;
+}
+@media (prefers-color-scheme:dark){:root:where(:not([data-theme="light"])){
+  color-scheme:dark;--page:#0d0d0d;--surface:#1a1a19;--surface-2:#242422;--ink:#f0efec;--ink-2:#c3c2b7;--muted:#898781;
+  --grid:#2c2c2a;--axis:#383835;--ring:rgba(255,255,255,.10);
+  --s1:#3987e5;--s2:#d95926;--s3:#199e70;--s4:#c98500;--s5:#d55181;--s6:#008300;--s7:#9085e9;--s8:#e66767;--good-ink:#0ca30c;--other:#5f5e59}}
+:root[data-theme="dark"]{
+  color-scheme:dark;--page:#0d0d0d;--surface:#1a1a19;--surface-2:#242422;--ink:#f0efec;--ink-2:#c3c2b7;--muted:#898781;
+  --grid:#2c2c2a;--axis:#383835;--ring:rgba(255,255,255,.10);
+  --s1:#3987e5;--s2:#d95926;--s3:#199e70;--s4:#c98500;--s5:#d55181;--s6:#008300;--s7:#9085e9;--s8:#e66767;--good-ink:#0ca30c;--other:#5f5e59}
+*{box-sizing:border-box}
+body{margin:0;background:var(--page);color:var(--ink);font:14px/1.45 var(--font)}
+.wrap{max-width:1400px;margin:0 auto;padding:18px 20px 40px}
+header{display:flex;align-items:center;gap:14px;flex-wrap:wrap}
+h1{font-size:20px;margin:0;font-weight:650}
+.live{display:inline-flex;align-items:center;gap:6px;font-size:12.5px;color:var(--ink-2)}
+.dot{width:8px;height:8px;border-radius:50%;background:var(--muted)}
+.dot.on{background:var(--good);box-shadow:0 0 0 3px color-mix(in srgb,var(--good) 25%,transparent)}
+.sp{flex:1}
+button,select{font:inherit;color:var(--ink);background:var(--surface);border:1px solid var(--ring);border-radius:6px;padding:5px 10px;cursor:pointer}
+.tabs{display:flex;gap:2px;margin:14px 0 16px;border-bottom:1px solid var(--grid);overflow-x:auto}
+.tab{border:0;border-bottom:2px solid transparent;border-radius:0;background:none;padding:8px 12px;color:var(--ink-2);font-weight:600;white-space:nowrap}
+.tab[aria-selected="true"]{color:var(--ink);border-bottom-color:var(--s1)}
+.tab .c{font:500 11px var(--mono);color:var(--muted);margin-left:6px}
+.grid{display:grid;gap:14px}
+.g-tiles{grid-template-columns:repeat(auto-fit,minmax(170px,1fr))}
+.g-2{grid-template-columns:repeat(auto-fit,minmax(min(100%,560px),1fr))}
+.card{background:var(--surface);border:1px solid var(--ring);border-radius:10px;padding:14px 16px;min-width:0}
+.card h2{font-size:13.5px;margin:0 0 2px;font-weight:650}
+.card .sub{font-size:12.5px;color:var(--ink-2);margin:0 0 10px}
+.tile .v{font-size:28px;font-weight:650;line-height:1.1}
+.tile .l{font-size:12.5px;color:var(--ink-2)}
+.tile .x{font:12px var(--mono);color:var(--muted);margin-top:4px}
+.legend{display:flex;flex-wrap:wrap;gap:4px 14px;font-size:12px;color:var(--ink-2);margin:0 0 8px}
+.legend span{display:inline-flex;align-items:center;gap:6px}
+.sw{width:10px;height:10px;border-radius:2px;display:inline-block}
+svg{display:block;overflow:visible}
+.ax text,.ax{fill:var(--muted);font:11px var(--font)}
+.gl{stroke:var(--grid);stroke-width:1}
+.bl{stroke:var(--axis);stroke-width:1}
+.axt{fill:var(--ink-2);font:600 11px var(--font)}
+.tip{position:fixed;pointer-events:none;background:var(--surface);border:1px solid var(--ring);border-radius:8px;padding:8px 10px;font-size:12px;box-shadow:0 6px 20px rgba(0,0,0,.18);z-index:20;min-width:140px;display:none}
+.tip b{display:block;margin-bottom:4px}
+.tip .r{display:flex;justify-content:space-between;gap:14px;font-variant-numeric:tabular-nums}
+.tip .r i{display:inline-block;width:8px;height:8px;border-radius:2px;margin-right:6px}
+table{border-collapse:collapse;width:100%;font-size:13px}
+th{font-size:11.5px;color:var(--muted);font-weight:600;text-align:left;padding:6px 8px;border-bottom:1px solid var(--grid);white-space:nowrap}
+td{padding:6px 8px;border-bottom:1px solid var(--grid);vertical-align:middle}
+td.n{text-align:right;font-variant-numeric:tabular-nums;font-family:var(--mono);font-size:12px}
+tr.clk{cursor:pointer}tr.clk:hover td{background:var(--surface-2)}
+.tier{display:inline-flex;align-items:center;gap:6px;font:600 11.5px var(--mono)}
+.st{display:inline-flex;align-items:center;gap:5px;font-size:12px;white-space:nowrap}
+.st i{width:8px;height:8px;border-radius:50%}
+.st.running i{background:var(--s1);animation:pulse 1.4s infinite}
+.st.done i{background:var(--good)}.st.killed i,.st.died_early i{background:var(--critical)}.st.unknown i{background:var(--muted)}
+@keyframes pulse{50%{opacity:.35}}
+@media (prefers-reduced-motion:reduce){.st.running i{animation:none}}
+.vd{font:600 11px var(--mono);padding:2px 6px;border-radius:4px;background:var(--surface-2);color:var(--ink-2)}
+.grow{color:var(--good-ink);font-size:11px;margin-left:4px}
+.lbl{font-family:var(--mono);font-size:12.5px}
+.ws{font:600 11.5px var(--mono);color:var(--ink-2)}
+.meter{display:grid;grid-template-columns:70px minmax(0,1fr) 54px;gap:10px;align-items:center;margin:7px 0;font-size:12.5px}
+.meter .trk{position:relative;height:14px;background:var(--surface-2);border-radius:3px}
+.meter .fill{position:absolute;left:0;top:0;bottom:0;border-radius:3px}
+.meter .cap{position:absolute;top:-3px;bottom:-3px;border-left:2px dashed var(--ink)}
+.meter .n{text-align:right;font:12px var(--mono)}
+.alert{display:flex;gap:10px;align-items:flex-start;padding:7px 0;border-bottom:1px solid var(--grid);font-size:13px}
+.alert .ic{font:700 11px var(--mono);padding:2px 6px;border-radius:4px;color:#fff;flex:0 0 auto}
+.alert .ic.died_early,.alert .ic.killed{background:var(--critical)}.alert .ic.long_running{background:var(--serious)}.alert .ic.over_cap{background:var(--warning);color:#0b0b0b}
+.empty{color:var(--muted);font-size:13px;padding:8px 0}
+.wsc{cursor:pointer}.wsc:hover{border-color:var(--s1)}
+.wsc .top{display:flex;justify-content:space-between;align-items:baseline}
+.wsc .id{font:700 15px var(--mono)}
+.wsc .bar{display:flex;height:8px;border-radius:4px;overflow:hidden;background:var(--surface-2);margin:8px 0 4px;gap:2px}
+.wsc .bar span{display:block;height:100%}
+.kv{display:grid;grid-template-columns:auto 1fr;gap:4px 12px;font-size:13px}
+.kv dt{color:var(--muted)}.kv dd{margin:0;font-family:var(--mono);font-size:12.5px;overflow-wrap:anywhere}
+.drawer{position:fixed;top:0;right:0;bottom:0;width:min(440px,100%);background:var(--surface);border-left:1px solid var(--ring);box-shadow:-8px 0 30px rgba(0,0,0,.15);padding:18px;transform:translateX(105%);transition:transform .18s;z-index:30;overflow:auto}
+.drawer.open{transform:none}
+.seg-ctl{display:inline-flex;border:1px solid var(--ring);border-radius:6px;overflow:hidden}
+.seg-ctl button{border:0;border-radius:0;padding:4px 10px;font-size:12px}
+.seg-ctl button[aria-pressed="true"]{background:var(--surface-2);font-weight:650}
+/* plan DAG */
+.dag-scroll{overflow-x:auto;border:1px solid var(--ring);border-radius:10px;background:var(--surface-2)}
+.dag{position:relative;min-width:1000px;display:grid;grid-template-columns:repeat(5,1fr);gap:30px;padding:14px}
+.dcol{display:flex;flex-direction:column;gap:12px;position:relative;z-index:1}
+.dcolh{font-size:12px;font-weight:700;color:var(--ink-2);text-transform:uppercase;letter-spacing:.04em}
+.dnode{background:var(--surface);border:1.5px solid var(--ring);border-radius:10px;padding:8px 10px}
+.dnode.s-done{border-color:var(--good)}.dnode.s-prog{border-color:var(--s5)}.dnode.s-live{border-color:var(--s1);box-shadow:0 0 0 2px color-mix(in srgb,var(--s1) 25%,transparent)}
+.dnode h4{margin:0 0 2px;font-size:13px}
+.dnode .m{font-size:11.5px;color:var(--muted);margin-bottom:6px}
+.dnode .mini{display:flex;height:5px;border-radius:3px;overflow:hidden;background:var(--grid);margin-bottom:6px}
+.chips{display:flex;flex-wrap:wrap;gap:4px}
+.chip{font:11px var(--mono);padding:2px 6px;border-radius:5px;border:1.5px solid var(--grid);color:var(--muted);border-style:dashed;display:inline-flex;align-items:center;gap:3px}
+.chip::before{font-size:10px;line-height:1}
+.chip.done{border-style:solid;border-color:var(--good);color:var(--good-ink);background:color-mix(in srgb,var(--good) 14%,transparent)}
+.chip.done::before{content:"\2713"}
+.chip.pr{border-style:solid;border-color:var(--warning);color:var(--ink);background:color-mix(in srgb,var(--warning) 22%,transparent)}
+.chip.pr::before{content:"\29D7"}
+.chip.prog{border-style:solid;border-color:var(--s5);color:var(--ink);background:color-mix(in srgb,var(--s5) 20%,transparent)}
+.chip.prog::before{content:"\21E1"}
+.chip.deferred{border-style:dotted;opacity:.6}
+.chip.deferred::before{content:"\21B7"}
+.chip.live{border-style:solid;border-color:var(--s1);background:var(--s1);color:#fff;box-shadow:0 0 0 3px color-mix(in srgb,var(--s1) 30%,transparent);animation:pulse 1.6s infinite}
+.chip.live::before{content:"\25CF"}
+.chip .ag{display:inline-block;min-width:14px;height:14px;line-height:14px;text-align:center;border-radius:7px;font:700 10px var(--mono);color:#fff;margin-left:2px;padding:0 3px;box-shadow:0 0 0 1.5px #fff}
+.chip.just{outline:2.5px solid var(--good);outline-offset:1px}
+.dnode .live-n{font:600 11.5px var(--mono);color:var(--s1);margin-bottom:4px}
+.unassigned{display:flex;flex-wrap:wrap;gap:6px;margin:8px 0}
+.unassigned span{font:12px var(--mono);border:1.5px solid var(--ring);border-radius:5px;padding:2px 6px}
+.plegend{display:flex;flex-wrap:wrap;gap:6px 12px;margin:0 0 10px;font-size:12px;color:var(--ink-2)}
+.plegend .chip{pointer-events:none}
+@media (prefers-reduced-motion:reduce){.chip.live{animation:none}}
+.dedges{position:absolute;inset:0;pointer-events:none;z-index:0}
+.dedges path{fill:none;stroke:var(--muted);stroke-width:1.4;opacity:.6}
+.phases{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:8px;margin-top:12px}
+.phase{border-left:3px solid var(--s1);padding:2px 0 2px 10px;font-size:12.5px}
+.phase b{display:block;font-size:13px}
+.phase small{color:var(--muted)}
+.foot{margin-top:22px;font-size:12px;color:var(--muted)}
+</style>
+</head>
+<body>
+<div class="wrap">
+<header>
+<h1>Agent execution</h1>
+<span class="live"><span class="dot" id="live-dot"></span><span id="live-txt">connecting</span></span>
+<span class="sp"></span>
+<span class="seg-ctl" id="range"><button data-h="6" aria-pressed="false">6 h</button><button data-h="24" aria-pressed="true">24 h</button><button data-h="72" aria-pressed="false">3 d</button></span>
+<button id="theme" title="Toggle light or dark">Theme</button>
+</header>
+<nav class="tabs" id="tabs" role="tablist"></nav>
+<main id="main"></main>
+<p class="foot" id="foot"></p>
+</div>
+<div class="tip" id="tip"></div>
+<aside class="drawer" id="drawer" aria-label="Run details"></aside>
+<script>
+(function () {
+  "use strict";
+  var Q = new URLSearchParams(location.search);
+  var FIX = Q.has("fixtures");
+  var state = {ws: Q.get("ws") || "all", hours: 24, snap: null, runs: [], usage: [], conc: [], wss: [], plan: null, seq: -1, groupBy: "model"};
+  var SERIES = {opus: "--s1", haiku: "--s2", sonnet: "--s3", grok: "--s4", muse: "--s5", glm: "--s6", fable: "--s7", other: "--other"};
+  var MODELS = [["opus", "Opus"], ["fable", "Fable"], ["sonnet", "Sonnet"], ["haiku", "Haiku"], ["grok", "Grok 4.7"], ["muse", "muse"], ["glm", "GLM"], ["other", "Other"]];
+  function modelName(k) { for (var i = 0; i < MODELS.length; i++) if (MODELS[i][0] === k) return MODELS[i][1]; return k; }
+  var WSCOL = ["--s1", "--s2", "--s3", "--s4", "--s5", "--s6", "--s7"];
+  var wsColor = {};
+  function wsNum(w) { var m = /(\d+)/.exec(w.ws || ""); return m ? +m[1] : 999; }
+  function shown(list) { return list.filter(function (w) { return w.plan; }).sort(function (x, y) { return wsNum(x) - wsNum(y); }); }
+  function cssv(n) { return getComputedStyle(document.documentElement).getPropertyValue(n).trim(); }
+  function tierKey(r) { var t = (r.tier || r.model || "").toLowerCase(); for (var k in SERIES) if (t.indexOf(k) >= 0) return k; return "other"; }
+  function modelKey(m) { m = (m || "").toLowerCase(); for (var k in SERIES) if (m.indexOf(k) >= 0) return k; return "other"; }
+  function colorOf(key, kind) {
+    if (kind === "workstream") { if (!key || key === "null") return "var(--other)"; if (!wsColor[key]) wsColor[key] = WSCOL[Object.keys(wsColor).length % WSCOL.length]; return "var(" + wsColor[key] + ")"; }
+    return "var(" + (SERIES[key] || "--other") + ")";
+  }
+  var NF = new Intl.NumberFormat("en", {notation: "compact", maximumFractionDigits: 1});
+  var UF = new Intl.NumberFormat("en", {style: "currency", currency: "USD", notation: "compact", maximumFractionDigits: 1});
+  function fmtDate(t) { return new Date(t * 1000).toLocaleString([], {month: "short", day: "numeric", hour: "2-digit", minute: "2-digit"}); }
+  function fmtN(n) { return NF.format(+n || 0); }
+  function fmtUsd(n) { return n == null ? "\u2013" : (Math.abs(n) < 1 ? "$" + (+n).toFixed(2) : UF.format(n)); }
+  /* axes: every chart gets an x axis and a y axis with compact tick labels and short titles (DESIGN.md) */
+  function axes(svg, o) {
+    var g = s("g", {class: "ax"}), x0 = o.L, x1 = o.L + o.pw, yb = o.T + o.ph;
+    if (o.yMax != null) {
+      var n = o.yTicks || 4;
+      for (var i = 0; i <= n; i++) { var v = o.yMax * i / n, y = yb - o.ph * i / n; if (i && o.grid !== false) g.appendChild(s("line", {x1: x0, x2: x1, y1: y, y2: y, class: "gl"})); g.appendChild(s("line", {x1: x0 - 4, x2: x0, y1: y, y2: y, class: "bl"})); var tx = s("text", {x: x0 - 7, y: y + 3.5, "text-anchor": "end"}); tx.textContent = (o.yFmt || fmtN)(v); g.appendChild(tx); }
+    }
+    g.appendChild(s("line", {x1: x0, x2: x0, y1: o.T, y2: yb, class: "bl"}));
+    g.appendChild(s("line", {x1: x0, x2: x1, y1: yb, y2: yb, class: "bl"}));
+    (o.xTicks || []).forEach(function (tk) { g.appendChild(s("line", {x1: tk.x, x2: tk.x, y1: yb, y2: yb + 4, class: "bl"})); if (tk.label) { var lt = s("text", {x: tk.x, y: yb + 15, "text-anchor": tk.anchor || "middle"}); lt.textContent = tk.label; g.appendChild(lt); } });
+    if (o.yTitle) { var yt = s("text", {x: x0 - 7, y: o.T - 2, "text-anchor": "end", class: "axt"}); yt.textContent = o.yTitle; g.appendChild(yt); }
+    if (o.xTitle) { var xt = s("text", {x: x1, y: yb + 28, "text-anchor": "end", class: "axt"}); xt.textContent = o.xTitle; g.appendChild(xt); }
+    svg.appendChild(g); return g;
+  }
+  function timeTicks(t0, t1, X, n) { var out = []; n = n || 6; for (var i = 0; i <= n; i++) { var t = t0 + (t1 - t0) * i / n; out.push({x: X(t), label: i === n && Math.abs(t1 - Date.now() / 1000) < 120 ? "now" : fmtT(t), anchor: i === 0 ? "start" : i === n ? "end" : "middle"}); } return out; }
+  function fmtDur(s) { s = Math.max(0, +s || 0); if (s < 60) return Math.round(s) + "s"; if (s < 3600) return Math.floor(s / 60) + "m " + Math.round(s % 60) + "s"; return Math.floor(s / 3600) + "h " + Math.round((s % 3600) / 60) + "m"; }
+  function fmtT(t) { var d = new Date(t * 1000); return d.toLocaleTimeString([], {hour: "2-digit", minute: "2-digit"}); }
+  function el(tag, attrs, kids) { var e = document.createElement(tag); if (attrs) for (var k in attrs) { if (k === "text") e.textContent = attrs[k]; else if (k === "html") e.innerHTML = attrs[k]; else if (k.slice(0, 2) === "on") e.addEventListener(k.slice(2), attrs[k]); else e.setAttribute(k, attrs[k]); } (kids || []).forEach(function (c) { if (c) e.appendChild(typeof c === "string" ? document.createTextNode(c) : c); }); return e; }
+  var NS = "http://www.w3.org/2000/svg";
+  function s(tag, attrs) { var e = document.createElementNS(NS, tag); for (var k in attrs) e.setAttribute(k, attrs[k]); return e; }
+
+  var FIXMAP = {"/api/snapshot": "snapshot", "/api/runs": "runs", "/api/usage": "usage-model-hour", "/api/concurrency": "concurrency", "/api/sessions": "sessions", "/api/workstreams": "workstreams", "/api/health": "health"};
+  function api(path, params) {
+    var qs = new URLSearchParams(params || {}).toString();
+    if (FIX) {
+      var base = FIXMAP[path] || path.replace("/api/", "");
+      if (path === "/api/usage" && params && params.group === "workstream") base = "usage-workstream-hour";
+      if (path === "/api/plan") base = "plan-" + params.ws;
+      if (path === "/api/snapshot" && params && params.ws && params.ws !== "all") base = "snapshot-" + params.ws;
+      return fetch("../fixtures/" + base + ".json").then(function (r) { if (!r.ok) throw new Error(r.status); return r.json(); });
+    }
+    return fetch(path + (qs ? "?" + qs : "")).then(function (r) { if (!r.ok) throw new Error(r.status); return r.json(); });
+  }
+
+  /* tooltip */
+  var tip = document.getElementById("tip");
+  function showTip(ev, title, rows) {
+    tip.innerHTML = ""; tip.appendChild(el("b", {text: title}));
+    rows.forEach(function (r) { var d = el("div", {class: "r"}); var a = el("span"); if (r.c) { var i = el("i"); i.style.background = r.c; a.appendChild(i); } a.appendChild(document.createTextNode(r.k)); d.appendChild(a); d.appendChild(el("span", {text: r.v})); tip.appendChild(d); });
+    tip.style.display = "block";
+    var x = ev.clientX + 14, y = ev.clientY + 14, w = tip.offsetWidth, h = tip.offsetHeight;
+    if (x + w > innerWidth - 8) x = ev.clientX - w - 14; if (y + h > innerHeight - 8) y = ev.clientY - h - 14;
+    tip.style.left = x + "px"; tip.style.top = y + "px";
+  }
+  function hideTip() { tip.style.display = "none"; }
+
+  /* tabs */
+  function renderTabs() {
+    var t = document.getElementById("tabs"); t.innerHTML = "";
+    var list = [{ws: "all", name: "Overall"}].concat(shown(state.wss).map(function (w) { return {ws: w.ws, name: w.ws + (w.name ? " " + w.name : ""), running: w.running}; }));
+    list.forEach(function (w) {
+      var b = el("button", {class: "tab", role: "tab", "aria-selected": String(state.ws === w.ws), onclick: function () { go(w.ws); }}, [w.name]);
+      if (w.running) b.appendChild(el("span", {class: "c", text: w.running + " live"}));
+      t.appendChild(b);
+    });
+  }
+  function go(ws) { state.ws = ws; var u = new URL(location.href); if (ws === "all") u.searchParams.delete("ws"); else u.searchParams.set("ws", ws); history.replaceState(null, "", u); renderTabs(); refreshAll(); }
+
+  /* components */
+  function tiles(snap) {
+    var run = snap.running || [], byTier = {};
+    run.forEach(function (r) { var k = tierKey(r); byTier[k] = (byTier[k] || 0) + 1; });
+    var tk = snap.totals ? snap.totals.tokens : {};
+    var allTok = (tk.input || 0) + (tk.output || 0) + (tk.cache_read || 0) + (tk.cache_write || 0);
+    var g = el("div", {class: "grid g-tiles"});
+    [["Running now", run.length, Object.keys(byTier).map(function (k) { return k + " " + byTier[k]; }).join(" · ") || "idle"],
+     ["Finished, last hour", (snap.recent || []).length, (snap.recent || []).filter(function (r) { return r.status === "died_early" || r.status === "killed"; }).length + " died or killed"],
+     ["Tokens", fmtN(allTok), "out " + fmtN(tk.output) + " · cache read " + fmtN(tk.cache_read)],
+     ["Est. cost (priced models)", fmtUsd(snap.totals && snap.totals.cost_usd), (snap.totals && snap.totals.unpriced_runs || 0) + " runs unpriced (GLM, Grok, muse)"],
+     ["Alerts", (snap.alerts || []).length, (snap.alerts || []).slice(0, 2).map(function (a) { return a.kind.replace("_", " "); }).join(" · ") || "none"]
+    ].forEach(function (t) { g.appendChild(el("div", {class: "card tile"}, [el("div", {class: "v", text: String(t[1])}), el("div", {class: "l", text: t[0]}), el("div", {class: "x", text: t[2]})])); });
+    return g;
+  }
+
+  function capMeters(snap) {
+    var c = el("div", {class: "card"}, [el("h2", {text: "Concurrency vs caps"}), el("p", {class: "sub", text: "Live parent processes per tool. The dashed line is the cap."})]);
+    var caps = snap.caps || {};
+    [["grok", "Grok 4.7"], ["muse", "muse"], ["glm", "GLM"], ["claude", "Claude"]].forEach(function (p) {
+      var v = caps[p[0]] || {live: 0, cap: null}, cap = v.cap || Math.max(10, v.live), max = Math.max(cap, v.live, 1) * 1.15;
+      var m = el("div", {class: "meter"}), trk = el("div", {class: "trk"}), f = el("div", {class: "fill"});
+      f.style.width = (100 * v.live / max) + "%"; f.style.background = v.cap && v.live > v.cap ? "var(--critical)" : colorOf(p[0] === "claude" ? "opus" : p[0]);
+      trk.appendChild(f);
+      if (v.cap) { var cl = el("div", {class: "cap"}); cl.style.left = (100 * v.cap / max) + "%"; trk.appendChild(cl); }
+      m.appendChild(el("span", {text: p[1]})); m.appendChild(trk); m.appendChild(el("span", {class: "n", text: v.live + (v.cap ? " / " + v.cap : "")}));
+      c.appendChild(m);
+    });
+    return c;
+  }
+
+  function statusEl(r) { var st = r.status || "unknown"; return el("span", {class: "st " + st}, [el("i"), st === "died_early" ? "died early" : st]); }
+
+  function runsTable(title, sub, runs, empty) {
+    var c = el("div", {class: "card"}, [el("h2", {text: title}), el("p", {class: "sub", text: sub})]);
+    if (!runs.length) { c.appendChild(el("div", {class: "empty", text: empty})); return c; }
+    var tb = el("tbody");
+    runs.forEach(function (r) {
+      var k = tierKey(r);
+      var tr = el("tr", {class: "clk", onclick: function () { openRun(r); }});
+      var tier = el("span", {class: "tier"}); var sw = el("i", {class: "sw"}); sw.style.background = colorOf(k); tier.appendChild(sw); tier.appendChild(document.createTextNode(r.tier || k));
+      tr.appendChild(el("td", null, [tier]));
+      tr.appendChild(el("td", null, [el("span", {class: "lbl", text: r.label || r.run_id})]));
+      tr.appendChild(el("td", null, [el("span", {class: "ws", text: r.workstream || "–"})]));
+      tr.appendChild(el("td", {class: "n", text: fmtDur(r.elapsed_s)}));
+      var ob = el("td", {class: "n", text: fmtN(r.out_bytes) + "B"}); if (r.out_growing) ob.appendChild(el("span", {class: "grow", text: "▲"})); tr.appendChild(ob);
+      tr.appendChild(el("td", {class: "n", text: fmtN(r.tokens ? (r.tokens.input || 0) + (r.tokens.output || 0) : 0)}));
+      tr.appendChild(el("td", null, [statusEl(r), r.verdict ? el("span", {class: "vd", text: r.verdict}) : null]));
+      tb.appendChild(tr);
+    });
+    var t = el("table", null, [el("thead", null, [el("tr", null, ["Tool", "Label", "WS", "Elapsed", "Output", "Tokens", "Status"].map(function (h, i) { return el("th", {style: i >= 3 && i <= 5 ? "text-align:right" : ""}, [h]); }))]), tb]);
+    c.appendChild(el("div", {style: "overflow-x:auto"}, [t]));
+    return c;
+  }
+
+  function alertsCard(snap) {
+    var c = el("div", {class: "card"}, [el("h2", {text: "Alerts"}), el("p", {class: "sub", text: "Runs that died early or were killed, ran past their tier cap, or pushed a tool over its concurrency cap."})]);
+    var a = snap.alerts || [];
+    if (!a.length) c.appendChild(el("div", {class: "empty", text: "Nothing needs attention."}));
+    a.slice(0, 12).forEach(function (x) { c.appendChild(el("div", {class: "alert"}, [el("span", {class: "ic " + x.kind, text: x.kind.replace("_", " ")}), el("div", null, [el("span", {class: "lbl", text: x.label || x.run_id}), el("div", {style: "color:var(--ink-2);font-size:12.5px", text: x.detail || ""})])])); });
+    return c;
+  }
+
+  /* stacked bars: tokens per hour */
+  function tokenChart() {
+    var c = el("div", {class: "card"});
+    var hdr = el("div", {style: "display:flex;align-items:baseline;gap:10px;flex-wrap:wrap"}, [el("h2", {text: "Tokens per hour"})]);
+    var seg = el("span", {class: "seg-ctl", style: "margin-left:auto"});
+    [["model", "By model"], ["workstream", "By workstream"]].forEach(function (g) { seg.appendChild(el("button", {"aria-pressed": String(state.groupBy === g[0]), onclick: function () { state.groupBy = g[0]; loadUsage().then(drawMain); }}, [g[1]])); });
+    if (state.ws === "all") hdr.appendChild(seg);
+    c.appendChild(hdr);
+    c.appendChild(el("p", {class: "sub", text: "Input, output and cache tokens summed per hour, stacked by " + state.groupBy + ". Hover a bar for the split."}));
+    var B = state.usage;
+    if (!B.length) { c.appendChild(el("div", {class: "empty", text: "No usage in this window."})); return c; }
+    var keysOrder = state.groupBy === "model" ? ["opus", "sonnet", "haiku", "grok", "muse", "glm", "other"] : null;
+    var hours = {}, keys = {};
+    B.forEach(function (b) { var k = state.groupBy === "model" ? modelKey(b.key) : (b.key || "unattributed"); var tot = (b.input || 0) + (b.output || 0) + (b.cache_read || 0) + (b.cache_write || 0); hours[b.t] = hours[b.t] || {}; hours[b.t][k] = (hours[b.t][k] || 0) + tot; keys[k] = 1; });
+    var ks = keysOrder ? keysOrder.filter(function (k) { return keys[k]; }) : Object.keys(keys).sort();
+    var ts = Object.keys(hours).map(Number).sort(function (a, b) { return a - b; });
+    var max = 0; ts.forEach(function (t) { var sum = 0; ks.forEach(function (k) { sum += hours[t][k] || 0; }); max = Math.max(max, sum); });
+    var lg = el("div", {class: "legend"}); ks.forEach(function (k) { var sp = el("span"); var sw = el("i", {class: "sw"}); sw.style.background = colorOf(k, state.groupBy); sp.appendChild(sw); sp.appendChild(document.createTextNode(k)); lg.appendChild(sp); }); c.appendChild(lg);
+    var W = 900, H = 246, L = 58, R = 8, T = 18, Bm = 34, pw = W - L - R, ph = H - T - Bm, bw = Math.max(3, pw / Math.max(ts.length, 1) - 2);
+    var svg = s("svg", {viewBox: "0 0 " + W + " " + H, width: "100%", role: "img", "aria-label": "Tokens per hour stacked by " + state.groupBy});
+    var nice = niceMax(max), xt = [];
+    ts.forEach(function (t, idx) {
+      var x = L + idx * (pw / ts.length) + 1, y0 = T + ph;
+      ks.forEach(function (k, ki) { var v = hours[t][k] || 0; if (!v) return; var h = ph * v / nice; var top = y0 - h; var r = s("rect", {x: x, y: top + (ki ? 1 : 0), width: bw, height: Math.max(0, h - (ki ? 1 : 0)), rx: 2, fill: colorOf(k, state.groupBy)}); svg.appendChild(r); y0 = top; });
+      var hit = s("rect", {x: x - 1, y: T, width: bw + 2, height: ph, fill: "transparent"});
+      hit.addEventListener("mousemove", function (ev) { showTip(ev, new Date(t * 1000).toLocaleString([], {month: "short", day: "numeric", hour: "2-digit", minute: "2-digit"}), ks.filter(function (k) { return hours[t][k]; }).map(function (k) { return {k: k, v: fmtN(hours[t][k]), c: colorOf(k, state.groupBy)}; })); });
+      hit.addEventListener("mouseleave", hideTip); svg.appendChild(hit);
+      if (idx % Math.ceil(ts.length / 8) === 0) xt.push({x: x + bw / 2, label: fmtT(t)});
+    });
+    var axg = axes(svg, {L: L, T: T, pw: pw, ph: ph, yMax: nice, xTicks: xt, yTitle: "tokens", xTitle: "hour"}); svg.insertBefore(axg, svg.firstChild); c.appendChild(svg);
+    return c;
+  }
+  function niceMax(v) { if (v <= 0) return 1; var p = Math.pow(10, Math.floor(Math.log10(v))); var m = v / p; return (m <= 1 ? 1 : m <= 2 ? 2 : m <= 5 ? 5 : 10) * p; }
+
+  /* live agents over time: one strip per tool */
+  function concChart(snap) {
+    var c = el("div", {class: "card"}, [el("h2", {text: "Live agents over time"}), el("p", {class: "sub", text: "One strip per tool on its own count, for this view's scope."})]);
+    var P = state.conc; if (!P.length) { c.appendChild(el("div", {class: "empty", text: "No samples yet."})); return c; }
+    var caps = snap.caps || {}, tools = [["grok", "Grok 4.7"], ["muse", "muse"], ["glm", "GLM"], ["claude", "Claude"]];
+    var t0 = P[0].t, t1 = P[P.length - 1].t;
+    tools.forEach(function (tl) {
+      var cap = null; var mx = Math.max(cap || 0, 1); P.forEach(function (p) { mx = Math.max(mx, p[tl[0]] || 0); }); mx = Math.max(2, Math.ceil(mx / 2) * 2);
+      var last = tl === tools[tools.length - 1], W = 900, H = last ? 98 : 74, L = 110, R = 8, T = 14, Bm = last ? 34 : 6, pw = W - L - R, ph = H - T - Bm;
+      var svg = s("svg", {viewBox: "0 0 " + W + " " + H, width: "100%", role: "img", "aria-label": tl[1] + " live runs over time"});
+      var nm = s("text", {x: 0, y: T + ph / 2 + 4, class: "ax"}); nm.textContent = tl[1]; nm.setAttribute("style", "fill:var(--ink-2);font:600 12px var(--font)"); svg.appendChild(nm);
+      var X = function (t) { return L + pw * (t - t0) / Math.max(1, t1 - t0); }, Y = function (v) { return T + ph - ph * v / mx; };
+      var tt6 = timeTicks(t0, t1, X, 6); if (!last) tt6.forEach(function (k) { k.label = ""; });
+      axes(svg, {L: L, T: T, pw: pw, ph: ph, yMax: mx, yTicks: 2, xTicks: tt6, yTitle: "agents", xTitle: last ? "time" : null});
+      var d = "M" + X(P[0].t) + "," + Y(0);
+      P.forEach(function (p) { d += " L" + X(p.t) + "," + Y(p[tl[0]] || 0); });
+      d += " L" + X(t1) + "," + Y(0) + " Z";
+      var col = colorOf(tl[0] === "claude" ? "opus" : tl[0]);
+      svg.appendChild(s("path", {d: d, fill: col, "fill-opacity": ".22", stroke: "none"}));
+      var ln = "M" + P.map(function (p) { return X(p.t) + "," + Y(p[tl[0]] || 0); }).join(" L");
+      svg.appendChild(s("path", {d: ln, fill: "none", stroke: col, "stroke-width": 2}));
+      if (cap) { svg.appendChild(s("line", {x1: L, x2: W - R, y1: Y(cap), y2: Y(cap), stroke: "currentColor", "stroke-dasharray": "4 3", "stroke-width": 1.2, style: "color:var(--ink-2)"})); var ct = s("text", {x: W - R, y: Y(cap) - 3, "text-anchor": "end", class: "ax"}); ct.textContent = "cap " + cap; svg.appendChild(ct); }
+      var hit = s("rect", {x: L, y: T, width: pw, height: ph, fill: "transparent"});
+      hit.addEventListener("mousemove", function (ev) { var bb = svg.getBoundingClientRect(); var tt = t0 + (t1 - t0) * ((ev.clientX - bb.left) * W / bb.width - L) / pw; var best = P[0]; P.forEach(function (p) { if (Math.abs(p.t - tt) < Math.abs(best.t - tt)) best = p; }); showTip(ev, fmtT(best.t), tools.map(function (q) { return {k: q[1], v: String(best[q[0]] || 0), c: colorOf(q[0] === "claude" ? "opus" : q[0])}; })); });
+      hit.addEventListener("mouseleave", hideTip); svg.appendChild(hit);
+      c.appendChild(svg);
+    });
+    return c;
+  }
+
+  /* timeline: one activity strip per workstream, expandable into packed lanes */
+  var expanded = {};
+  function packRows(runs, gapS) {
+    var rows = [];
+    runs.slice().sort(function (x, y) { return x.started_at - y.started_at; }).forEach(function (r) {
+      var end = r.ended_at || Date.now() / 1000, placed = false;
+      for (var i = 0; i < rows.length; i++) { if (rows[i].end + gapS <= r.started_at) { rows[i].runs.push(r); rows[i].end = end; placed = true; break; } }
+      if (!placed) rows.push({end: end, runs: [r]});
+    });
+    return rows;
+  }
+  function outcomeOf(r) {
+    if (!r.ended_at) return "run";
+    if (r.status === "died_early" || r.status === "killed" || r.verdict === "BLOCKED" || r.verdict === "REQUEST_CHANGES") return "bad";
+    if (r.verdict === "PARTIAL" || r.verdict === "APPROVE_WITH_CHANGES") return "part";
+    if (r.status === "done") return "ok";
+    return "unk";
+  }
+  var OUTCOME = {run: ["var(--s1)", "\u25CF", "running"], ok: ["var(--good)", "\u2713", "finished"], part: ["var(--warning)", "\u25D0", "partial"], bad: ["var(--critical)", "\u2715", "died or blocked"], unk: ["var(--muted)", "?", "ended, outcome unknown"]};
+  function outcomeColor(r) { var o = outcomeOf(r); return o === "run" || o === "unk" ? null : OUTCOME[o][0]; }
+  function gantt() {
+    var c = el("div", {class: "card"}, [el("h2", {text: "Run timeline"}), el("p", {class: "sub", text: "One lane per workstream; the strip is how many agents ran at each moment. Click a lane to open it: one row per model, each bar a run, coloured by how it ended. Hover a bar for the run, click it for details."})]);
+    var now = Date.now() / 1000, t0 = now - state.hours * 3600;
+    var R = state.runs.filter(function (r) { return r.started_at && (r.ended_at || now) >= t0; });
+    if (!R.length) { c.appendChild(el("div", {class: "empty", text: "No runs in this window."})); return c; }
+    var lg = el("div", {class: "legend"}); ["run", "ok", "part", "bad"].forEach(function (k) { var o = OUTCOME[k], sp = el("span"); var sw = el("i", {class: "sw"}); sw.style.background = o[0]; sp.appendChild(sw); sp.appendChild(document.createTextNode(o[1] + " " + o[2])); lg.appendChild(sp); });
+    c.appendChild(lg);
+    var groups = {}; R.forEach(function (r) { var g = r.workstream || "other"; (groups[g] = groups[g] || []).push(r); });
+    var order = Object.keys(groups).sort(function (x, y) { var a = /(\d+)/.exec(x), b = /(\d+)/.exec(y); return (a ? +a[1] : 999) - (b ? +b[1] : 999) || x.localeCompare(y); });
+    if (state.ws !== "all" && expanded[state.ws] === undefined) expanded[state.ws] = true;
+    var W = 1100, L = 120, Rm = 10, pw = W - L - Rm, stripH = 30, rowH = 7, rowGap = 2;
+    var X = function (t) { return L + pw * (Math.max(t, t0) - t0) / (now - t0); };
+    var blocks = [], H = 12;
+    order.forEach(function (g) {
+      var subs = [], hh = 0;
+      if (expanded[g]) { var byM = {}; groups[g].forEach(function (r) { var k = tierKey(r); (byM[k] = byM[k] || []).push(r); });
+        MODELS.forEach(function (m) { if (!byM[m[0]]) return; var rows = packRows(byM[m[0]], 20); var h = Math.max(rows.length * (rowH + rowGap), 14) + 6; subs.push({k: m[0], name: m[1], runs: byM[m[0]], rows: rows, dy: hh, h: h}); hh += h; }); }
+      blocks.push({g: g, runs: groups[g], subs: subs, y: H}); H += stripH + 10 + (subs.length ? hh + 8 : 0); });
+    var plotB = H; H += 34;
+    var svg = s("svg", {viewBox: "0 0 " + W + " " + H, width: "100%", role: "img", "aria-label": "Run activity per workstream over time"});
+    var gTicks = timeTicks(t0, now, X, 6); gTicks.forEach(function (k) { svg.appendChild(s("line", {x1: k.x, x2: k.x, y1: 4, y2: plotB, class: "gl"})); });
+    var step = Math.max(60, Math.round((now - t0) / 300));
+    blocks.forEach(function (bk) {
+      var col = colorOf(bk.g, "workstream"), y0 = bk.y;
+      var lab = s("text", {x: 0, y: y0 + stripH / 2 + 4}); lab.textContent = (expanded[bk.g] ? "▾ " : "▸ ") + bk.g; lab.setAttribute("style", "fill:var(--ink);font:700 12px var(--mono);cursor:pointer");
+      var cnt = s("text", {x: 0, y: y0 + stripH / 2 + 17, class: "ax"}); cnt.textContent = bk.runs.length + " runs";
+      var hitL = s("rect", {x: 0, y: y0, width: L - 6, height: stripH, fill: "transparent"}); hitL.style.cursor = "pointer";
+      hitL.addEventListener("click", function () { expanded[bk.g] = !expanded[bk.g]; drawMain(); });
+      svg.appendChild(lab); svg.appendChild(cnt); svg.appendChild(hitL);
+      var pts = [], mx = 1;
+      for (var t = t0; t <= now; t += step) { var n = 0; bk.runs.forEach(function (r) { if (r.started_at <= t && (r.ended_at || now) >= t) n++; }); pts.push([t, n]); mx = Math.max(mx, n); }
+      var Y = function (v) { return y0 + stripH - (stripH - 4) * v / mx; };
+      svg.appendChild(s("rect", {x: L, y: y0, width: pw, height: stripH, rx: 4, fill: "var(--surface-2)"}));
+      var d = "M" + X(pts[0][0]) + "," + (y0 + stripH); pts.forEach(function (p) { d += " L" + X(p[0]) + "," + Y(p[1]); }); d += " L" + X(now) + "," + (y0 + stripH) + " Z";
+      svg.appendChild(s("path", {d: d, fill: col, "fill-opacity": ".55", stroke: col, "stroke-width": 1.2}));
+      [[0, y0 + stripH], [mx, y0 + 4]].forEach(function (p) { svg.appendChild(s("line", {x1: L - 4, x2: L, y1: p[1], y2: p[1], class: "bl"})); var tk = s("text", {x: L - 7, y: p[1] + 3.5, "text-anchor": "end", class: "ax"}); tk.textContent = fmtN(p[0]); svg.appendChild(tk); });
+      bk.runs.forEach(function (r) {
+        if (!r.ended_at || r.ended_at < t0) return; var oc = outcomeColor(r); if (!oc) return;
+        var bad = oc === "var(--critical)";
+        var m = bad ? s("text", {x: X(r.ended_at), y: y0 + stripH + 8, "text-anchor": "middle"}) : s("circle", {cx: X(r.ended_at), cy: y0 + stripH + 4, r: 2.6, fill: oc});
+        if (bad) { m.textContent = "✕"; m.setAttribute("style", "fill:var(--critical);font:700 10px var(--font)"); }
+        m.style.cursor = "pointer"; m.addEventListener("click", function () { openRun(r); });
+        m.addEventListener("mousemove", function (ev) { showTip(ev, r.label || r.run_id, [{k: "outcome", v: r.verdict || r.status}, {k: "model", v: r.model || modelName(tierKey(r))}, {k: "ended", v: fmtT(r.ended_at)}]); }); m.addEventListener("mouseleave", hideTip);
+        svg.appendChild(m);
+      });
+      var hit = s("rect", {x: L, y: y0, width: pw, height: stripH, fill: "transparent"});
+      hit.addEventListener("mousemove", function (ev) { var bb = svg.getBoundingClientRect(); var tt = t0 + (now - t0) * ((ev.clientX - bb.left) * W / bb.width - L) / pw; var act = bk.runs.filter(function (r) { return r.started_at <= tt && (r.ended_at || now) >= tt; }); var byT = {}; act.forEach(function (r) { var k = tierKey(r); byT[k] = (byT[k] || 0) + 1; }); showTip(ev, bk.g + " at " + fmtT(tt), [{k: "running", v: String(act.length)}].concat(Object.keys(byT).map(function (k) { return {k: modelName(k), v: String(byT[k])}; }))); });
+      hit.addEventListener("mouseleave", hideTip); hit.addEventListener("click", function () { expanded[bk.g] = !expanded[bk.g]; drawMain(); }); hit.style.cursor = "pointer";
+      svg.appendChild(hit);
+      var base = y0 + stripH + 12;
+      bk.subs.forEach(function (sb, si) {
+        var sy = base + sb.dy;
+        if (si) svg.appendChild(s("line", {x1: 0, x2: W - Rm, y1: sy - 4, y2: sy - 4, class: "gl"}));
+        var ml = s("text", {x: 10, y: sy + 9}); ml.textContent = sb.name + " \u00B7 " + sb.runs.length; ml.setAttribute("style", "fill:var(--ink-2);font:600 11.5px var(--font)"); svg.appendChild(ml);
+        var ry = sy;
+        sb.rows.forEach(function (row) {
+          row.runs.forEach(function (r) {
+            var x1 = X(r.started_at), x2 = X(r.ended_at || now), o = OUTCOME[outcomeOf(r)];
+            var bar = s("rect", {x: x1, y: ry, width: Math.max(2.5, x2 - x1 - 1), height: rowH, rx: 2, fill: r.clock_source === "mtime" ? "url(#hatch)" : o[0], stroke: r.clock_source === "mtime" ? o[0] : "none"});
+            if (!r.ended_at) { bar.setAttribute("stroke", "var(--ink)"); bar.setAttribute("stroke-width", "1"); }
+            bar.style.cursor = "pointer";
+            bar.addEventListener("mousemove", function (ev) { showTip(ev, r.label || r.run_id, [{k: "model", v: r.model || sb.name}, {k: "outcome", v: o[1] + " " + (r.verdict || o[2]), c: o[0]}, {k: "elapsed", v: fmtDur((r.ended_at || now) - r.started_at)}, {k: "workstream", v: r.workstream || "unattributed"}]); });
+            bar.addEventListener("mouseleave", hideTip); bar.addEventListener("click", function () { openRun(r); });
+            svg.appendChild(bar);
+          });
+          ry += rowH + rowGap;
+        });
+      });
+    });
+    var defs = s("defs", {}); var pat = s("pattern", {id: "hatch", width: 6, height: 6, patternUnits: "userSpaceOnUse", patternTransform: "rotate(45)"}); pat.appendChild(s("rect", {width: 6, height: 6, fill: "var(--surface-2)"})); pat.appendChild(s("line", {x1: 0, y1: 0, x2: 0, y2: 6, stroke: "var(--muted)", "stroke-width": 2})); defs.appendChild(pat); svg.insertBefore(defs, svg.firstChild);
+    axes(svg, {L: L, T: 4, pw: pw, ph: plotB - 4, xTicks: gTicks, xTitle: "time", yTitle: null});
+    svg.appendChild(s("line", {x1: X(now), x2: X(now), y1: 4, y2: plotB, stroke: "var(--s1)", "stroke-width": 1.5}));
+    c.appendChild(el("div", {style: "overflow-x:auto"}, [svg]));
+    return c;
+  }
+
+  /* workstream cards */
+  function wsCards() {
+    var c = el("div", {class: "grid g-tiles"});
+    shown(state.wss).forEach(function (w) {
+      var tk = w.tk || {}, tot = ["backlog", "todo", "doing", "review", "done", "cancelled"].reduce(function (a, k) { return a + (tk[k] || 0); }, 0);
+      var card = el("div", {class: "card wsc", onclick: function () { go(w.ws); }});
+      var top = el("div", {class: "top"}, [el("span", {class: "id", text: w.ws}), el("span", {class: "st " + (w.running ? "running" : "done")}, [el("i"), w.running ? w.running + " running" : "idle"])]);
+      card.appendChild(top); card.appendChild(el("div", {style: "font-size:13px;color:var(--ink-2)", text: w.name || ""}));
+      var bar = el("div", {class: "bar", role: "img", "aria-label": (tk.done || 0) + " of " + tot + " tracker issues done"});
+      [["done", "var(--good)"], ["review", "var(--s1)"], ["doing", "var(--s1)"]].forEach(function (p) { if (!tk[p[0]] || !tot) return; var sp = el("span"); sp.style.width = (100 * tk[p[0]] / tot) + "%"; sp.style.background = p[1]; bar.appendChild(sp); });
+      card.appendChild(bar);
+      card.appendChild(el("div", {style: "font:12px var(--mono);color:var(--muted)", text: (tk.done || 0) + "/" + tot + " issues · " + fmtN(w.tokens) + " tok · " + fmtUsd(w.cost_usd)}));
+      c.appendChild(card);
+    });
+    return c;
+  }
+
+
+  var TASKMAP = {};
+  function loadTaskmap() { return fetch(FIX ? "taskmap.json" : "/static/taskmap.json").then(function (r) { return r.ok ? r.json() : {}; }).then(function (j) { TASKMAP = j || {}; }).catch(function () {}); }
+  function taskOf(r, ws) {
+    var lab = r.label || "", ov = TASKMAP[ws] || {}, m;
+    if (ov[lab]) return ov[lab];
+    for (var k in ov) if (k.charAt(0) === "/" && k.length > 2) { try { if (new RegExp(k.slice(1, -1), "i").test(lab)) return ov[k]; } catch (e) {} }
+    if (ws === "WS1") { m = /(?:^|[^a-z0-9])ws1[-._]?(\d+[a-z]?)/i.exec(lab) || /WS1\.(\d+[a-z]?)/.exec(lab); if (m) return m[1].toLowerCase(); }
+    if (ws === "WS2") { m = /ws2[-._]([0-9]+[a-z0-9]*)/i.exec(lab); if (m) return "WS2." + m[1]; }
+    if (ws === "WS7") { m = /\b([PS]0-\d+)\b/i.exec(lab); if (m) return m[1].toUpperCase(); m = /ws7[-._]([0-9a-z]+)/i.exec(lab); if (m) return "WS7." + m[1].toUpperCase(); }
+    return null;
+  }
+
+  /* plan DAG for a workstream */
+  function planCard(plan, snap) {
+    var live = {}, just = {}, unassigned = [], now = Date.now() / 1000;
+    ((snap && snap.running) || []).forEach(function (r) { if (r.workstream && r.workstream !== plan.ws) return; var t = taskOf(r, plan.ws); if (t) (live[t] = live[t] || []).push(r); else if (r.workstream === plan.ws) unassigned.push(r); });
+    ((snap && snap.recent) || []).forEach(function (r) { if (r.ended_at && now - r.ended_at < 900) { var t = taskOf(r, plan.ws); if (t) just[t] = r; } });
+    var nLive = Object.keys(live).reduce(function (a, k) { return a + live[k].length; }, 0);
+    var c = el("div", {class: "card"}, [el("h2", {text: plan.ws + " plan progress" + (nLive ? " · " + nLive + " agent" + (nLive > 1 ? "s" : "") + " working" : "")}), el("p", {class: "sub", text: "Every task by group, coloured by state (legend below). The badge on a working chip is the agent tool and count. Arrows show what each group waits on."})]);
+    if (unassigned.length) { var ua = el("div", {class: "unassigned"}, [el("b", {style: "font-size:12px;color:var(--ink-2)", text: "Running, not mapped to a task:"})]); unassigned.forEach(function (r) { var sp = el("span", {title: (r.tier || "") + " · " + fmtDur(r.elapsed_s), text: r.label || r.run_id}); sp.style.borderColor = colorOf(tierKey(r)); ua.appendChild(sp); }); c.appendChild(ua); }
+    var tot = {done: 0, prog: 0, pr: 0, todo: 0, deferred: 0};
+    var wrap = el("div", {class: "dag-scroll"}), dag = el("div", {class: "dag"}), svg = s("svg", {class: "dedges"}); dag.appendChild(svg); wrap.appendChild(dag);
+    dag.style.gridTemplateColumns = "repeat(" + plan.cols.length + ",1fr)";
+    var cols = plan.cols.map(function (n) { var d = el("div", {class: "dcol"}, [el("div", {class: "dcolh", text: n})]); dag.appendChild(d); return d; });
+    var nodes = {};
+    plan.groups.forEach(function (g) {
+      var cnt = {done: 0, prog: 0, pr: 0, todo: 0, moved: 0, deferred: 0}; g.tasks.forEach(function (t) { cnt[t.status || "todo"] = (cnt[t.status || "todo"] || 0) + 1; });
+      var live = g.tasks.length - (cnt.moved || 0) - (cnt.deferred || 0);
+      var n = el("div", {class: "dnode " + (live && cnt.done === live ? "s-done" : (cnt.done + cnt.prog + cnt.pr ? "s-prog" : ""))});
+      n.appendChild(el("h4", {text: g.title}));
+      n.appendChild(el("div", {class: "m", text: cnt.done + " done · " + cnt.pr + " waiting to merge · " + cnt.prog + " waiting on prod · " + cnt.todo + " not started" + (cnt.deferred ? " · " + cnt.deferred + " deferred" : "")}));
+      var mini = el("div", {class: "mini"}); [["done", "var(--good)"], ["pr", "var(--warning)"], ["prog", "var(--s5)"]].forEach(function (p) { var sp = el("span"); sp.style.width = (live ? 100 * cnt[p[0]] / live : 0) + "%"; sp.style.background = p[1]; sp.style.display = "block"; mini.appendChild(sp); }); n.appendChild(mini);
+      var gLive = 0;
+      var ch = el("div", {class: "chips"}); g.tasks.forEach(function (t) {
+        var st = t.status || "todo", rs = live[t.id] || [], jr = just[t.id];
+        var cp = el("span", {class: "chip " + st + (rs.length ? " live" : "") + (jr && !rs.length ? " just" : ""), title: t.id + " · " + (t.title || "") + " · " + st + (t.moved_to ? " to " + t.moved_to : "") + (t.note ? " (" + t.note + ")" : "") + (rs.length ? " · working: " + rs.map(function (r) { return (r.label || r.run_id) + " (" + (r.tier || "") + ", " + fmtDur(r.elapsed_s) + ")"; }).join(", ") : "") + (jr && !rs.length ? " · just finished: " + (jr.label || "") + (jr.verdict ? " " + jr.verdict : "") : "")}, [t.id]);
+        if (rs.length) { gLive += rs.length; var b = el("span", {class: "ag", text: String(rs.length)}); b.style.background = colorOf(tierKey(rs[0])); cp.appendChild(b); cp.style.cursor = "pointer"; cp.addEventListener("click", function () { openRun(rs[0]); }); }
+        ch.appendChild(cp); }); 
+      if (gLive) { n.insertBefore(el("div", {class: "live-n", text: "\u25CF " + gLive + " agent" + (gLive > 1 ? "s" : "") + " working"}), n.children[1]); n.classList.add("s-live"); }
+      n.appendChild(ch);
+      cols[g.col].appendChild(n); nodes[g.id] = n; ["done", "prog", "pr", "todo", "deferred"].forEach(function (k) { tot[k] += cnt[k] || 0; });
+    });
+    var all = tot.done + tot.prog + tot.pr + tot.todo;
+    var lg = el("div", {class: "plegend"});
+    [["live", "agent working now"], ["pr", "waiting to merge (open PR)"], ["prog", "merged, waiting on a prod step"], ["done", "done"], ["just", "finished in the last 15 min"], ["todo", "not started"], ["deferred", "deferred or moved to another workstream"]].forEach(function (p) { var ch2 = el("span", {class: "chip " + (p[0] === "just" ? "done just" : p[0])}, ["\u2007\u2007"]); lg.appendChild(el("span", {style: "display:inline-flex;align-items:center;gap:6px"}, [ch2, p[1]])); });
+    c.appendChild(lg);
+    c.appendChild(el("div", {style: "font:12.5px var(--mono);color:var(--ink-2);margin-bottom:8px", text: tot.done + " of " + all + " done · " + tot.pr + " waiting to merge · " + tot.prog + " waiting on prod · " + tot.todo + " not started" + (tot.deferred ? " · " + tot.deferred + " deferred" : "")}));
+    c.appendChild(wrap);
+    function draw() {
+      while (svg.firstChild) svg.removeChild(svg.firstChild);
+      var box = dag.getBoundingClientRect(); if (!box.width) return;
+      svg.setAttribute("width", dag.scrollWidth); svg.setAttribute("height", dag.scrollHeight);
+      (plan.edges || []).forEach(function (e) {
+        if (!nodes[e[0]] || !nodes[e[1]]) return;
+        var a = nodes[e[0]].getBoundingClientRect(), b = nodes[e[1]].getBoundingClientRect(), d;
+        if (Math.abs(a.left - b.left) < 4) { var x1 = a.left + a.width * .85 - box.left, y1 = a.bottom - box.top, x2 = b.left + b.width * .85 - box.left, y2 = b.top - box.top; d = "M" + x1 + "," + y1 + " C" + (x1 + 14) + "," + (y1 + 10) + " " + (x2 + 14) + "," + (y2 - 10) + " " + x2 + "," + y2; }
+        else { var X1 = a.right - box.left, Y1 = a.top + Math.min(26, a.height / 2) - box.top, X2 = b.left - box.left - 2, Y2 = b.top + Math.min(26, b.height / 2) - box.top, mx = (X1 + X2) / 2; d = "M" + X1 + "," + Y1 + " C" + mx + "," + Y1 + " " + mx + "," + Y2 + " " + X2 + "," + Y2; }
+        svg.appendChild(s("path", {d: d}));
+      });
+    }
+    requestAnimationFrame(function () { requestAnimationFrame(draw); }); window.addEventListener("resize", draw);
+    if (plan.phases && plan.phases.length) { var ph = el("div", {class: "phases"}); plan.phases.forEach(function (p) { ph.appendChild(el("div", {class: "phase"}, [el("b", {text: p.name}), p.goal, el("br"), el("small", {text: "Gate: " + (p.gate || "")})])); }); c.appendChild(ph); }
+    return c;
+  }
+
+  /* run drawer */
+  var drawer = document.getElementById("drawer");
+  function openRun(r) {
+    drawer.innerHTML = "";
+    drawer.appendChild(el("div", {style: "display:flex;align-items:center;gap:10px"}, [el("h2", {style: "margin:0;font-size:16px", text: r.label || r.run_id}), el("span", {class: "sp"}), el("button", {onclick: function () { drawer.classList.remove("open"); }}, ["Close"])]));
+    drawer.appendChild(el("p", {style: "margin:6px 0 14px"}, [statusEl(r), r.verdict ? el("span", {class: "vd", style: "margin-left:8px", text: r.verdict}) : null]));
+    var tk = r.tokens || {};
+    var kv = el("dl", {class: "kv"});
+    [["Model", r.model || modelName(tierKey(r))], ["Launched by", r.source], ["Workstream", (r.workstream || "–") + (r.ws_confidence ? " (" + r.ws_confidence + ")" : "")], ["Session", r.session_id], ["Parent", r.parent_session_id], ["Started", r.started_at ? fmtDate(r.started_at) : "–"], ["Ended", r.ended_at ? fmtDate(r.ended_at) : "running"], ["Elapsed", fmtDur(r.elapsed_s)], ["Clock", r.clock_source], ["Output", fmtN(r.out_bytes) + "B" + (r.out_growing ? " (growing)" : "")], ["Errors", fmtN(r.err_bytes) + "B"], ["PID", r.pid || "–"], ["Memory", r.rss_kb ? fmtN(r.rss_kb * 1024) + "B" : "–"], ["Tokens in / out", fmtN(tk.input) + " / " + fmtN(tk.output)], ["Cache read / write", fmtN(tk.cache_read) + " / " + fmtN(tk.cache_write)], ["Est. cost", fmtUsd(r.cost_usd)]].forEach(function (p) { kv.appendChild(el("dt", {text: p[0]})); kv.appendChild(el("dd", {text: p[1] == null ? "–" : String(p[1])})); });
+    drawer.appendChild(kv);
+    drawer.classList.add("open");
+  }
+  document.addEventListener("keydown", function (e) { if (e.key === "Escape") drawer.classList.remove("open"); });
+
+  /* layout */
+  function drawMain() {
+    var m = document.getElementById("main"); m.innerHTML = "";
+    var snap = state.snap || {running: [], recent: [], alerts: [], caps: {}, totals: {tokens: {}}};
+    m.appendChild(tiles(snap));
+    var g1 = el("div", {class: "grid g-2", style: "margin-top:14px"});
+    g1.appendChild(runsTable("Running now", "Click a row for details. Output ▲ means the out file grew since the last poll.", snap.running || [], "Nothing running."));
+    var right = el("div", {class: "grid"}); right.appendChild(alertsCard(snap)); g1.appendChild(right);
+    m.appendChild(g1);
+    if (state.ws === "all" && state.wss.length) { m.appendChild(el("h2", {style: "font-size:14px;margin:20px 0 8px", text: "Workstreams"})); m.appendChild(wsCards()); }
+    if (state.plan) { var pw = el("div", {style: "margin-top:14px"}); pw.appendChild(planCard(state.plan, snap)); m.appendChild(pw); }
+    var g2 = el("div", {class: "grid g-2", style: "margin-top:14px"}); g2.appendChild(tokenChart()); g2.appendChild(concChart(snap)); m.appendChild(g2);
+    var g3 = el("div", {style: "margin-top:14px"}); g3.appendChild(gantt()); m.appendChild(g3);
+    var g4 = el("div", {style: "margin-top:14px"}); g4.appendChild(runsTable("Finished in the last hour", "Newest first.", snap.recent || [], "Nothing finished in the last hour.")); m.appendChild(g4);
+  }
+
+  function since() { return Math.floor(Date.now() / 1000 - state.hours * 3600); }
+  function wsParam() { return state.ws === "all" ? {} : {ws: state.ws}; }
+  function loadUsage() { var p = Object.assign({group: state.ws === "all" ? state.groupBy : "model", bucket: "hour", since: since()}, wsParam()); return api("/api/usage", p).then(function (j) { state.usage = j.buckets || []; }).catch(function () { state.usage = []; }); }
+  function refreshAll() {
+    var ws = wsParam();
+    var jobs = [
+      api("/api/snapshot", Object.assign({ws: state.ws}, {})).then(function (j) { state.snap = j; state.seq = j.seq; }),
+      api("/api/runs", Object.assign({since: since(), limit: 400}, ws)).then(function (j) { state.runs = j.runs || []; }).catch(function () { state.runs = []; }),
+      loadUsage(),
+      api("/api/concurrency", Object.assign({since: since(), step: 60}, ws)).then(function (j) { state.conc = j.points || []; }).catch(function () { state.conc = []; }),
+      api("/api/workstreams").then(function (j) { state.wss = j.workstreams || []; renderTabs(); }).catch(function () {}),
+      state.ws !== "all" ? api("/api/plan", {ws: state.ws}).then(function (j) { state.plan = j && j.groups ? j : null; }).catch(function () { state.plan = null; }) : Promise.resolve(state.plan = null)
+    ];
+    return Promise.all(jobs.map(function (p) { return p.catch(function () {}); })).then(function () { drawMain(); setLive(true); document.getElementById("foot").textContent = "Updated " + new Date().toLocaleTimeString() + (FIX ? " · fixture data" : "") + " · read-only, 127.0.0.1"; }).catch(function () { setLive(false); });
+  }
+  function setLive(ok) { document.getElementById("live-dot").className = "dot" + (ok ? " on" : ""); document.getElementById("live-txt").textContent = ok ? "live" : "offline"; }
+
+  function stream() {
+    if (FIX || !window.EventSource) return;
+    var es = new EventSource("/api/stream");
+    es.addEventListener("tick", function (ev) { try { var d = JSON.parse(ev.data); if (d.seq !== state.seq) refreshSnapshot(); } catch (e) {} setLive(true); });
+    es.onerror = function () { setLive(false); };
+  }
+  function refreshSnapshot() { api("/api/snapshot", {ws: state.ws}).then(function (j) { state.snap = j; state.seq = j.seq; drawMain(); }).catch(function () {}); }
+
+  document.getElementById("range").addEventListener("click", function (e) { var b = e.target.closest("button"); if (!b) return; state.hours = +b.dataset.h; [].forEach.call(this.children, function (x) { x.setAttribute("aria-pressed", String(x === b)); }); refreshAll(); });
+  document.getElementById("theme").addEventListener("click", function () { var r = document.documentElement, cur = r.getAttribute("data-theme"), dark = cur ? cur === "dark" : matchMedia("(prefers-color-scheme: dark)").matches; r.setAttribute("data-theme", dark ? "light" : "dark"); try { localStorage.setItem("agent-dash-theme", dark ? "light" : "dark"); } catch (e) {} drawMain(); });
+  try { var th = localStorage.getItem("agent-dash-theme"); if (th) document.documentElement.setAttribute("data-theme", th); } catch (e) {}
+
+  renderTabs(); loadTaskmap().then(refreshAll); stream();
+  setInterval(function () { loadTaskmap().then(refreshAll); }, 30000);
+})();
+</script>
+</body>
+</html>

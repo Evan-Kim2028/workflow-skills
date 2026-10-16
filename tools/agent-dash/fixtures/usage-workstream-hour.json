@@ -1,0 +1,131 @@
+{
+  "buckets": [
+    {
+      "t": 1761976800,
+      "key": "PLANNING",
+      "input": 6054,
+      "output": 1406,
+      "cache_read": 9237,
+      "cache_write": 2642,
+      "cost_usd": 0.0985
+    },
+    {
+      "t": 1761976800,
+      "key": "WS1",
+      "input": 31934,
+      "output": 18640,
+      "cache_read": 90891,
+      "cache_write": 13902,
+      "cost_usd": 0.8709
+    },
+    {
+      "t": 1761976800,
+      "key": "WS2",
+      "input": 20729,
+      "output": 9348,
+      "cache_read": 64855,
+      "cache_write": 8922,
+      "cost_usd": 0.2048
+    },
+    {
+      "t": 1761976800,
+      "key": "WS7",
+      "input": 25984,
+      "output": 10219,
+      "cache_read": 58098,
+      "cache_write": 12651,
+      "cost_usd": 0.3013
+    },
+    {
+      "t": 1761980400,
+      "key": "WS1",
+      "input": 46693,
+      "output": 27387,
+      "cache_read": 92112,
+      "cache_write": 18081,
+      "cost_usd": 1.0157
+    },
+    {
+      "t": 1761980400,
+      "key": "WS2",
+      "input": 37176,
+      "output": 18771,
+      "cache_read": 81386,
+      "cache_write": 14440,
+      "cost_usd": 0.1894
+    },
+    {
+      "t": 1761980400,
+      "key": "WS7",
+      "input": 41501,
+      "output": 17327,
+      "cache_read": 50601,
+      "cache_write": 13177,
+      "cost_usd": 0.18
+    },
+    {
+      "t": 1761994800,
+      "key": "TOOLS",
+      "input": 3866,
+      "output": 1814,
+      "cache_read": 3122,
+      "cache_write": 1405,
+      "cost_usd": 0.0
+    },
+    {
+      "t": 1761994800,
+      "key": "WS1",
+      "input": 21361,
+      "output": 13516,
+      "cache_read": 35675,
+      "cache_write": 9128,
+      "cost_usd": 0.0276
+    },
+    {
+      "t": 1761994800,
+      "key": "WS2",
+      "input": 19309,
+      "output": 12093,
+      "cache_read": 52116,
+      "cache_write": 7452,
+      "cost_usd": 0.0141
+    },
+    {
+      "t": 1761994800,
+      "key": "WS7",
+      "input": 17618,
+      "output": 8797,
+      "cache_read": 39921,
+      "cache_write": 7886,
+      "cost_usd": 0.0121
+    },
+    {
+      "t": 1761998400,
+      "key": "WS1",
+      "input": 4772,
+      "output": 1738,
+      "cache_read": 9132,
+      "cache_write": 1927,
+      "cost_usd": 0.1034
+    },
+    {
+      "t": 1761998400,
+      "key": "WS2",
+      "input": 4824,
+      "output": 2266,
+      "cache_read": 5290,
+      "cache_write": 1906,
+      "cost_usd": 0.0
+    },
+    {
+      "t": 1761998400,
+      "key": "WS7",
+      "input": 5504,
+      "output": 1914,
+      "cache_read": 6494,
+      "cache_write": 49,
+      "cost_usd": 0.0
+    }
+  ],
+  "_note": "Seeded synthetic data for the offline preview. Seed 1. No local sessions are read."
+}

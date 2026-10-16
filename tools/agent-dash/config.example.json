@@ -1,0 +1,15 @@
+{
+  "roots": {
+    "claude_projects": "$HOME/.claude/projects",
+    "claude_sessions": "$HOME/.claude/sessions",
+    "muse_sessions": "$HOME/.local/share/muse/sessions",
+    "grok_sessions": "$HOME/.grok/sessions",
+    "grok_log": "$HOME/.grok/logs/unified.jsonl",
+    "cursor_home": "$HOME/.cursor",
+    "scratchpads": ["$HOME/agent-scratch/*"]
+  },
+  "hub_dir": "",
+  "issues_dir": "",
+  "workstreams_tsv": "",
+  "state_dir": "$HOME/.local/share/agent-dash"
+}

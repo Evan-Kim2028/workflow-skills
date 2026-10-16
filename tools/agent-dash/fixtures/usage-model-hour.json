@@ -1,0 +1,194 @@
+{
+  "buckets": [
+    {
+      "t": 1761976800,
+      "key": "glm",
+      "input": 8025,
+      "output": 4670,
+      "cache_read": 21039,
+      "cache_write": 3827,
+      "cost_usd": 0.0
+    },
+    {
+      "t": 1761976800,
+      "key": "grok",
+      "input": 12494,
+      "output": 3621,
+      "cache_read": 28572,
+      "cache_write": 3943,
+      "cost_usd": 0.0
+    },
+    {
+      "t": 1761976800,
+      "key": "haiku",
+      "input": 18744,
+      "output": 7741,
+      "cache_read": 61119,
+      "cache_write": 6598,
+      "cost_usd": 0.0719
+    },
+    {
+      "t": 1761976800,
+      "key": "muse",
+      "input": 9991,
+      "output": 3954,
+      "cache_read": 18762,
+      "cache_write": 7997,
+      "cost_usd": 0.0
+    },
+    {
+      "t": 1761976800,
+      "key": "opus",
+      "input": 15526,
+      "output": 8890,
+      "cache_read": 52929,
+      "cache_write": 8825,
+      "cost_usd": 1.1445
+    },
+    {
+      "t": 1761976800,
+      "key": "sonnet",
+      "input": 19921,
+      "output": 10737,
+      "cache_read": 40660,
+      "cache_write": 6927,
+      "cost_usd": 0.2591
+    },
+    {
+      "t": 1761980400,
+      "key": "glm",
+      "input": 23772,
+      "output": 6573,
+      "cache_read": 18071,
+      "cache_write": 5523,
+      "cost_usd": 0.0
+    },
+    {
+      "t": 1761980400,
+      "key": "grok",
+      "input": 8427,
+      "output": 9127,
+      "cache_read": 20806,
+      "cache_write": 5920,
+      "cost_usd": 0.0
+    },
+    {
+      "t": 1761980400,
+      "key": "haiku",
+      "input": 31332,
+      "output": 14155,
+      "cache_read": 59170,
+      "cache_write": 9620,
+      "cost_usd": 0.1202
+    },
+    {
+      "t": 1761980400,
+      "key": "muse",
+      "input": 20547,
+      "output": 9945,
+      "cache_read": 31036,
+      "cache_write": 6938,
+      "cost_usd": 0.0
+    },
+    {
+      "t": 1761980400,
+      "key": "opus",
+      "input": 12796,
+      "output": 6778,
+      "cache_read": 30398,
+      "cache_write": 6286,
+      "cost_usd": 0.8637
+    },
+    {
+      "t": 1761980400,
+      "key": "sonnet",
+      "input": 28496,
+      "output": 16907,
+      "cache_read": 64618,
+      "cache_write": 11411,
+      "cost_usd": 0.4012
+    },
+    {
+      "t": 1761994800,
+      "key": "glm",
+      "input": 11306,
+      "output": 7531,
+      "cache_read": 28824,
+      "cache_write": 5168,
+      "cost_usd": 0.0
+    },
+    {
+      "t": 1761994800,
+      "key": "grok",
+      "input": 19470,
+      "output": 10055,
+      "cache_read": 45678,
+      "cache_write": 7477,
+      "cost_usd": 0.0
+    },
+    {
+      "t": 1761994800,
+      "key": "haiku",
+      "input": 11833,
+      "output": 6771,
+      "cache_read": 13633,
+      "cache_write": 5394,
+      "cost_usd": 0.0538
+    },
+    {
+      "t": 1761994800,
+      "key": "muse",
+      "input": 19545,
+      "output": 11863,
+      "cache_read": 42699,
+      "cache_write": 7832,
+      "cost_usd": 0.0
+    },
+    {
+      "t": 1761998400,
+      "key": "glm",
+      "input": 1792,
+      "output": 1254,
+      "cache_read": 6244,
+      "cache_write": 4,
+      "cost_usd": 0.0
+    },
+    {
+      "t": 1761998400,
+      "key": "grok",
+      "input": 5666,
+      "output": 2004,
+      "cache_read": 3359,
+      "cache_write": 474,
+      "cost_usd": 0.0
+    },
+    {
+      "t": 1761998400,
+      "key": "haiku",
+      "input": 3304,
+      "output": 478,
+      "cache_read": 4842,
+      "cache_write": 209,
+      "cost_usd": 0.0064
+    },
+    {
+      "t": 1761998400,
+      "key": "muse",
+      "input": 3934,
+      "output": 1173,
+      "cache_read": 6239,
+      "cache_write": 2397,
+      "cost_usd": 0.0
+    },
+    {
+      "t": 1761998400,
+      "key": "opus",
+      "input": 404,
+      "output": 1009,
+      "cache_read": 232,
+      "cache_write": 798,
+      "cost_usd": 0.097
+    }
+  ],
+  "_note": "Seeded synthetic data for the offline preview. Seed 1. No local sessions are read."
+}
