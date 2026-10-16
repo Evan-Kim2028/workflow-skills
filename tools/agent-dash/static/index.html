@@ -113,6 +113,8 @@ tr.clk{cursor:pointer}tr.clk:hover td{background:var(--surface-2)}
 .chip.prog::before{content:"\21E1"}
 .chip.deferred{border-style:dotted;opacity:.6}
 .chip.deferred::before{content:"\21B7"}
+.chip .att{font:600 9.5px var(--mono);color:var(--muted);margin-left:3px;padding:0 3px;border-radius:4px;border:1px solid var(--grid)}
+.chip .att.hot{color:var(--ink);border-color:var(--warning)}
 .chip.live{border-style:solid;border-color:var(--s1);background:var(--s1);color:#fff;box-shadow:0 0 0 3px color-mix(in srgb,var(--s1) 30%,transparent);animation:pulse 1.6s infinite}
 .chip.live::before{content:"\25CF"}
 .chip .ag{display:inline-block;min-width:14px;height:14px;line-height:14px;text-align:center;border-radius:7px;font:700 10px var(--mono);color:#fff;margin-left:2px;padding:0 3px;box-shadow:0 0 0 1.5px #fff}
@@ -603,8 +605,8 @@ tr.clk{cursor:pointer}tr.clk:hover td{background:var(--surface-2)}
     if (ov[lab]) return ov[lab];
     for (var k in ov) if (k.charAt(0) === "/" && k.length > 2) { try { if (new RegExp(k.slice(1, -1), "i").test(lab)) return ov[k]; } catch (e) {} }
     if (ws === "WS1") { m = /(?:^|[^a-z0-9])ws1[-._]?(\d+[a-z]?)/i.exec(lab) || /WS1\.(\d+[a-z]?)/.exec(lab); if (m) return m[1].toLowerCase(); }
-    if (ws === "WS2") { m = /ws2[-._]([0-9]+[a-z0-9]*)/i.exec(lab); if (m) return "WS2." + m[1]; }
-    if (ws === "WS7") { m = /\b([PS]0-\d+)\b/i.exec(lab); if (m) return m[1].toUpperCase(); m = /ws7[-._]([0-9a-z]+)/i.exec(lab); if (m) return "WS7." + m[1].toUpperCase(); }
+    if (ws === "WS2") { m = /WS2\.([0-9]+[a-z0-9]*|[A-Z][0-9]*)/i.exec(lab) || /ws2[-._]([0-9]+[a-z0-9]*)/i.exec(lab); if (m) return "WS2." + (/^[a-z]/i.test(m[1]) ? m[1].toUpperCase() : m[1]); }
+    if (ws === "WS7") { m = /\b([PS]0-\d+)\b/i.exec(lab); if (m) return m[1].toUpperCase(); m = /WS7\.([0-9a-z]+)/i.exec(lab) || /ws7[-._]([0-9a-z]+)/i.exec(lab); if (m) return "WS7." + m[1].toUpperCase(); }
     return null;
   }
 
@@ -613,8 +615,18 @@ tr.clk{cursor:pointer}tr.clk:hover td{background:var(--surface-2)}
     var live = {}, just = {}, unassigned = [], now = Date.now() / 1000;
     ((snap && snap.running) || []).forEach(function (r) { if (r.workstream && r.workstream !== plan.ws) return; var t = taskOf(r, plan.ws); if (t) (live[t] = live[t] || []).push(r); else if (r.workstream === plan.ws) unassigned.push(r); });
     ((snap && snap.recent) || []).forEach(function (r) { if (r.ended_at && now - r.ended_at < 900) { var t = taskOf(r, plan.ws); if (t) just[t] = r; } });
+    var att = {}, seenRun = {};
+    (state.runs || []).concat((snap && snap.running) || [], (snap && snap.recent) || []).forEach(function (r) {
+      var id = r.run_id || r.label; if (!id || seenRun[id]) return; seenRun[id] = 1;
+      if (r.workstream && r.workstream !== plan.ws) return; var t = taskOf(r, plan.ws); if (!t) return;
+      var a = att[t] = att[t] || {runs: 0, reviews: 0, sentBack: 0}; a.runs++;
+      var isRev = /(^|[-_ ])(rev|review)/i.test(r.label || "") || /^(APPROVE|REQUEST_CHANGES)/.test(r.verdict || "");
+      if (isRev) a.reviews++;
+      if (r.verdict === "REQUEST_CHANGES" || r.verdict === "APPROVE_WITH_CHANGES" || r.verdict === "PARTIAL" || r.verdict === "BLOCKED") a.sentBack++;
+    });
+    function attText(a) { return a.runs + " run" + (a.runs > 1 ? "s" : "") + ": " + (a.runs - a.reviews) + " build, " + a.reviews + " review" + (a.reviews === 1 ? "" : "s") + (a.sentBack ? ", " + a.sentBack + " sent back (changes, partial or blocked)" : ""); }
     var nLive = Object.keys(live).reduce(function (a, k) { return a + live[k].length; }, 0);
-    var c = el("div", {class: "card"}, [el("div", {style: "display:flex;align-items:baseline;gap:10px;flex-wrap:wrap"}, [el("h2", {text: plan.ws + " plan progress" + (nLive ? " · " + nLive + " agent" + (nLive > 1 ? "s" : "") + " working" : "")}), el("a", {class: "planbtn", href: planUrl(plan.ws), onclick: function (ev) { ev.preventDefault(); openPlan(plan.ws); }, text: "Open the " + plan.ws + " plan"})]), el("p", {class: "sub", text: "Every task by group, coloured by state (legend below). The badge on a working chip is the agent tool and count. Arrows show what each group waits on."})]);
+    var c = el("div", {class: "card"}, [el("div", {style: "display:flex;align-items:baseline;gap:10px;flex-wrap:wrap"}, [el("h2", {text: plan.ws + " plan progress" + (nLive ? " · " + nLive + " agent" + (nLive > 1 ? "s" : "") + " working" : "")}), el("a", {class: "planbtn", href: planUrl(plan.ws), onclick: function (ev) { ev.preventDefault(); openPlan(plan.ws); }, text: "Open the " + plan.ws + " plan"})]), el("p", {class: "sub", text: "Every task by group, coloured by state (legend below). The badge on a working chip is the agent tool and count; \u21BBN is how many agent runs worked the task in this range (amber edge: sent back twice or more; hover for builds vs reviews). Arrows show what each group waits on."})]);
     if (unassigned.length) { var ua = el("div", {class: "unassigned"}, [el("b", {style: "font-size:12px;color:var(--ink-2)", text: "Running, not mapped to a task:"})]); unassigned.forEach(function (r) { var sp = el("span", {title: (r.tier || "") + " · " + fmtDur(r.elapsed_s), text: r.label || r.run_id}); sp.style.borderColor = colorOf(tierKey(r)); ua.appendChild(sp); }); c.appendChild(ua); }
     var tot = {done: 0, prog: 0, pr: 0, todo: 0, deferred: 0};
     var wrap = el("div", {class: "dag-scroll"}), dag = el("div", {class: "dag"}), svg = s("svg", {class: "dedges"}); dag.appendChild(svg); wrap.appendChild(dag);
@@ -626,12 +638,14 @@ tr.clk{cursor:pointer}tr.clk:hover td{background:var(--surface-2)}
       var live = g.tasks.length - (cnt.moved || 0) - (cnt.deferred || 0);
       var n = el("div", {class: "dnode " + (live && cnt.done === live ? "s-done" : (cnt.done + cnt.prog + cnt.pr ? "s-prog" : ""))});
       n.appendChild(el("h4", {text: g.title}));
-      n.appendChild(el("div", {class: "m", text: cnt.done + " done · " + cnt.pr + " waiting to merge · " + cnt.prog + " waiting on prod · " + cnt.todo + " not started" + (cnt.deferred ? " · " + cnt.deferred + " deferred" : "")}));
+      var gr = 0, gv = 0; g.tasks.forEach(function (t) { var a = att[t.id]; if (a) { gr += a.runs; gv += a.reviews; } });
+      n.appendChild(el("div", {class: "m", text: cnt.done + " done · " + cnt.pr + " waiting to merge · " + cnt.prog + " waiting on prod · " + cnt.todo + " not started" + (cnt.deferred ? " · " + cnt.deferred + " deferred" : "") + (gr ? " · " + fmtN(gr) + " runs, " + fmtN(gv) + " reviews" : "")}));
       var mini = el("div", {class: "mini"}); [["done", "var(--good)"], ["pr", "var(--warning)"], ["prog", "var(--s5)"]].forEach(function (p) { var sp = el("span"); sp.style.width = (live ? 100 * cnt[p[0]] / live : 0) + "%"; sp.style.background = p[1]; sp.style.display = "block"; mini.appendChild(sp); }); n.appendChild(mini);
       var gLive = 0;
       var ch = el("div", {class: "chips"}); g.tasks.forEach(function (t) {
         var st = t.status || "todo", rs = live[t.id] || [], jr = just[t.id];
         var cp = el("span", {class: "chip " + st + (rs.length ? " live" : "") + (jr && !rs.length ? " just" : ""), title: t.id + " · " + (t.title || "") + " · " + st + (t.moved_to ? " to " + t.moved_to : "") + (t.note ? " (" + t.note + ")" : "") + (rs.length ? " · working: " + rs.map(function (r) { return (r.label || r.run_id) + " (" + (r.tier || "") + ", " + fmtDur(r.elapsed_s) + ")"; }).join(", ") : "") + (jr && !rs.length ? " · just finished: " + (jr.label || "") + (jr.verdict ? " " + jr.verdict : "") : "")}, [t.id]);
+        var at = att[t.id]; if (at) { cp.title += " · " + attText(at); if (at.runs > 1) cp.appendChild(el("span", {class: "att" + (at.sentBack >= 2 ? " hot" : ""), text: "\u21BB" + fmtN(at.runs)})); }
         if (rs.length) { gLive += rs.length; var b = el("span", {class: "ag", text: String(rs.length)}); b.style.background = colorOf(tierKey(rs[0])); cp.appendChild(b); cp.style.cursor = "pointer"; cp.addEventListener("click", function () { openRun(rs[0]); }); }
         ch.appendChild(cp); }); 
       if (gLive) { n.insertBefore(el("div", {class: "live-n", text: "\u25CF " + gLive + " agent" + (gLive > 1 ? "s" : "") + " working"}), n.children[1]); n.classList.add("s-live"); }

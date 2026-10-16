@@ -99,6 +99,10 @@ Do this whenever you publish that artifact. The script only reads the HTML you p
 
 **Change the look.** Edit `DESIGN.md` first, then `static/index.html`. Check JS syntax (`node --check` on the extracted script), then view the page in both themes and on the fixture preview.
 
+## Running a workstream wave as a workflow
+
+`tools/agent-dash/workflows/ws-wave.js` runs one wave of independent lanes in Claude Code's Workflow tool (`scriptPath` to the file, `args` as documented at its top). Each lane is built by a Grok or muse worker in its own worktree, reviewed adversarially by Grok, and fixed until approved or out of rounds. Every step is a low-effort Haiku wrapper around `scripts/run_worker.sh`, so the heavy work stays on Grok and muse. Approved lanes move to `pr` via `ws task`. The lead keeps trains, merges, production steps and cross-session coordination, and starts one workflow per wave.
+
 ## Building with workers
 
 Backend work goes to workers, each prompt starting with a `[label: dash-<name>]` line plus the worker rules, `CONTRACT.md`, and the files that worker owns. Keep the page, the charts, and the design spec in one place, and verify every change on the live page before calling it done.
