@@ -101,7 +101,7 @@ Do this whenever you publish that artifact. The script only reads the HTML you p
 
 ## Running a workstream wave as a workflow
 
-`tools/agent-dash/workflows/ws-wave.js` runs one wave of independent lanes in Claude Code's Workflow tool (`scriptPath` to the file, `args` as documented at its top). Each lane is built by a muse (default) or Grok worker in its own worktree, reviewed adversarially (muse by default), and fixed until approved or out of rounds. Every step is a low-effort Haiku wrapper around `scripts/run_worker.sh`, so the heavy work stays on Grok and muse. Approved lanes move to `pr` via `ws task`. The lead keeps trains, merges, production steps and cross-session coordination, and starts one workflow per wave. Full walk-through, from plan to approvals to waves: `tools/agent-dash/docs/workstream-lead.md`.
+`tools/agent-dash/workflows/ws-wave.js` runs one wave of independent lanes in Claude Code's Workflow tool (`scriptPath` to the file, `args` as documented at its top). Each lane is built, reviewed, and fixed by a worker from the registry (`workers.example.json`, replaced by `workers.local.json` on a machine). The tier is `default`, `auto`, or a worker name. `defaultTier` defaults to `default`. `auto` fails over when a worker is at its cap or cooling down after a quota error. Every step is a low-effort Haiku wrapper around `scripts/run_worker.sh`. The lane result includes the tier the runner actually used. Approved lanes move to `pr` via `ws task`. The lead keeps trains, merges, production steps and cross-session coordination, and starts one workflow per wave. Full walk-through, from plan to approvals to waves: `tools/agent-dash/docs/workstream-lead.md`.
 
 ## Building with workers
 

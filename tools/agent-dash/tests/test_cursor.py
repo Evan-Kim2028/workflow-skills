@@ -722,6 +722,16 @@ class CursorTests(unittest.TestCase):
         self.assertNotIn("SECRET_PATH_DO_NOT_STORE", text)
         self.assertNotIn(SENTINEL, text)
 
+    def test_encoded_cwd_root_finds_cursor_sessions(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            enc = os.path.join(tmp, "enc")
+            pad = os.path.join(enc, PARENT, "scratchpad")
+            os.makedirs(pad)
+            with open(os.path.join(pad, "cursor-sessions.tsv"), "w") as fh:
+                fh.write("dash-preview\t-\t1700000001\n")
+            found = dict(mod._manifest_dirs(enc, "cursor-sessions.tsv", None))
+            self.assertEqual(found, {os.path.realpath(pad): PARENT})
+
     def test_registry_discovers_cursor(self):
         from dash.sources import discover
 

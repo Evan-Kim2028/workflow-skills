@@ -437,6 +437,20 @@ class ManifestPollTests(unittest.TestCase):
         manifests.poll(self.store, cfg, NOW + 1)
         self.assertEqual(self.store.runs[f"muse:{MUSE}:alpha"]["verdict"], "PASS")
 
+    def test_encoded_root_attributes_glm_sessions(self):
+        enc = os.path.join(self.root, "enc")
+        _write(
+            os.path.join(self.scratch, "glm-sessions.tsv"),
+            f"rev\t{GLM}\t1700000002\tglm-5.3\n",
+            NOW,
+        )
+        manifests.poll(self.store, self._cfg(scratch_root=enc), NOW)
+        glm = self.store.runs[f"glm:{GLM}:rev"]
+        self.assertEqual(glm["model"], "glm-5.3")
+        self.assertEqual(glm["source"], "glm")
+        self.assertEqual(glm["tier"], "glm")
+        self.assertEqual(glm["parent_session_id"], PARENT)
+
     def test_backfill_includes_old_exec(self):
         _write(
             os.path.join(self.scratch, "exec", "out-old.md"),

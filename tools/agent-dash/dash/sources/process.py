@@ -129,12 +129,15 @@ def match_agent(source: str, pid, label, processes: list[dict], session_id=None)
 
 
 def apply_liveness(store, run: dict, source: str, processes) -> None:
-    """Set ``running`` only while the process is alive.
+    """Set ``running`` while the process is alive.
 
     When the process is gone and the stored row was ``running``, mark it
     ``done`` (a labeled or verdicted run) or ``unknown``, with ``ended_at``
-    at the last activity. A failed process listing (``processes is None``)
-    leaves the row alone. Other terminal statuses are not rewritten.
+    at the last activity. An open ``unknown`` row is revived when a process
+    matches, and closed (``done``, with ``ended_at``) when it does not.
+    A failed process listing (``processes is None``) leaves the row alone.
+    Other terminal statuses are not rewritten. An ``unknown`` row that
+    already has ``ended_at`` is left alone.
     """
     if processes is None or not run.get("run_id"):
         return
@@ -149,7 +152,19 @@ def apply_liveness(store, run: dict, source: str, processes) -> None:
         run["pid"] = proc["pid"]
         run["ended_at"] = None
         return
-    if not existing or existing.get("status") != "running":
+    if not existing:
+        return
+    status = existing.get("status")
+    if status == "unknown":
+        if existing.get("ended_at") is not None:
+            return
+        run["status"] = "done"
+        run["ended_at"] = _last_activity(
+            store, run["run_id"], existing.get("started_at") or run.get("started_at")
+        ) or time.time()
+        run["pid"] = None
+        return
+    if status != "running":
         return
     run["status"] = "done" if label or existing.get("verdict") else "unknown"
     run["ended_at"] = _last_activity(store, run["run_id"], existing.get("started_at") or run.get("started_at"))
@@ -160,14 +175,19 @@ def reconcile_running(store, now: float, processes=None) -> int:
     """End grok, muse, and glm rows still marked running after the process is gone.
 
     A muse row still marked unknown is adopted when a live process matches
-    its prompt-file label or session uuid. An unlabeled row that shares a
+    its prompt-file label or session uuid, and closed (``done`` with
+    ``ended_at``) when nothing matches. An unlabeled row that shares a
     session with a labeled run is linked to that run (``parent_session_id``
     = the labeled run id) so it is not a second agent; a live process is
-    recorded on the labeled run. Returns how many rows were ended because
-    the process was gone.
+    recorded on the labeled run. Orphan muse usage is moved onto the labeled
+    run and the orphan row is deleted. Returns how many rows were ended
+    because the process was gone.
     """
     if processes is None:
         processes = live_agent_processes(now)
+    repair = getattr(store, "repair_muse_orphans", None)
+    if callable(repair):
+        repair()
     ended = 0
     rows = list(store.running_tool_runs())
     extra = getattr(store, "unknown_tool_runs", None)
@@ -191,6 +211,10 @@ def reconcile_running(store, now: float, processes=None) -> int:
                 _mark_running(store, row["run_id"], proc["pid"])
             continue
         if row.get("status") != "running":
+            if row.get("status") == "unknown" and row.get("ended_at") is None and not labeled:
+                _close_open_unknown(store, row, now)
+                ended += 1
+                continue
             if labeled and row.get("parent_session_id") != labeled:
                 _link_shadow(store, row, labeled, now)
             continue
@@ -205,6 +229,20 @@ def reconcile_running(store, now: float, processes=None) -> int:
         store.upsert_run(patch)
         ended += 1
     return ended
+
+
+def _close_open_unknown(store, row: dict, now: float) -> None:
+    ended_at = _last_activity(store, row["run_id"], row.get("started_at"))
+    if ended_at is None:
+        ended_at = float(now)
+    store.upsert_run(
+        {
+            "run_id": row["run_id"],
+            "status": "done",
+            "ended_at": ended_at,
+            "pid": None,
+        }
+    )
 
 
 def _mark_running(store, run_id: str, pid: int) -> None:

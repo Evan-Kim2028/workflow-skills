@@ -68,6 +68,34 @@ class Store:
     def get_run(self, run_id):
         return self.runs.get(run_id)
 
+    def reassign_run(self, src, dst):
+        if src not in self.runs or dst not in self.runs or src == dst:
+            return False
+        source = self.runs[src]
+        target = self.runs[dst]
+        for key in ("model", "started_at", "clock_source"):
+            if not target.get(key) and source.get(key):
+                target[key] = source[key]
+        for row in self.usage.values():
+            if row.get("run_id") == src:
+                row["run_id"] = dst
+        del self.runs[src]
+        return True
+
+    def repair_muse_orphans(self):
+        import sys
+
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        if root not in sys.path:
+            sys.path.insert(0, root)
+        from dash.store import muse_orphan_pairs
+
+        moved = 0
+        for src, dst in muse_orphan_pairs(list(self.runs.values())):
+            if self.reassign_run(src, dst):
+                moved += 1
+        return moved
+
 
 def mc(sid, rec_id, **fields):
     usage = {
@@ -437,11 +465,8 @@ class MuseTests(unittest.TestCase):
             self.assertEqual(run["label"], "ws2-WS2.14-cards-list")
             self.assertEqual(run["status"], "running")
             self.assertEqual(run["pid"], 42)
-            retired = store.runs[shadow]
-            self.assertEqual(retired["status"], "unknown")
-            self.assertEqual(retired["parent_session_id"], labeled)
-            self.assertIsNone(retired.get("pid"))
-            self.assertEqual(store.usage[("muse", SID, "old")]["run_id"], shadow)
+            self.assertNotIn(shadow, store.runs)
+            self.assertEqual(store.usage[("muse", SID, "old")]["run_id"], labeled)
 
     def test_shadow_retires_when_session_uuid_case_differs(self):
         upper = "abcdefab-cdef-4abc-8def-abcdefabcdef"
@@ -483,9 +508,7 @@ class MuseTests(unittest.TestCase):
                 muse.live_agent_processes = original
             self.assertEqual(store.runs[labeled]["status"], "running")
             self.assertEqual(store.runs[labeled]["pid"], 77)
-            self.assertEqual(store.runs[shadow]["status"], "unknown")
-            self.assertEqual(store.runs[shadow]["parent_session_id"], labeled)
-            self.assertIsNone(store.runs[shadow].get("pid"))
+            self.assertNotIn(shadow, store.runs)
 
     def test_live_prompt_file_labels_a_run_before_the_tsv_row(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -524,9 +547,109 @@ class MuseTests(unittest.TestCase):
             self.assertEqual(run["label"], "ws2-WS2.14-prod-columns")
             self.assertEqual(run["status"], "running")
             self.assertEqual(run["pid"], 50)
-            self.assertEqual(store.runs[shadow]["status"], "unknown")
-            self.assertEqual(store.runs[shadow]["parent_session_id"], labeled)
-            self.assertIsNone(store.runs[shadow].get("pid"))
+            self.assertNotIn(shadow, store.runs)
+
+    def test_zero_byte_read_does_not_create_a_run(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sessions = os.path.join(tmp, "sessions")
+            scratch = os.path.join(tmp, "scratch")
+            os.makedirs(scratch)
+            sid = "dddddddd-dddd-4ddd-8ddd-dddddddddddd"
+            now = time.time()
+            day = datetime.fromtimestamp(now, timezone.utc)
+            path = os.path.join(
+                sessions, "%04d" % day.year, "%02d" % day.month, "%02d" % day.day, sid, "session.jsonl"
+            )
+            os.makedirs(os.path.dirname(path))
+            open(path, "wb").close()
+            store = Store()
+            cfg = self.cfg(sessions, scratch, fresh_hours=36, dir_scan_s=0)
+            self.poll(store, cfg, now)
+            self.assertEqual(store.runs, {})
+            self.assertEqual(store.usage, {})
+
+    def test_manifest_moves_orphan_usage_onto_the_labeled_run(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sessions = os.path.join(tmp, "sessions")
+            scratch = os.path.join(tmp, "scratch")
+            os.makedirs(scratch)
+            sid = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee"
+            now = time.time()
+            day = datetime.fromtimestamp(now, timezone.utc)
+            path = os.path.join(
+                sessions, "%04d" % day.year, "%02d" % day.month, "%02d" % day.day, sid, "session.jsonl"
+            )
+            os.makedirs(os.path.dirname(path))
+            with open(path, "wb") as fh:
+                fh.write(mc(sid, "early", input=40, output=3, model="muse-1"))
+            store = Store()
+            cfg = self.cfg(sessions, scratch, fresh_hours=36, dir_scan_s=0)
+            self.poll(store, cfg, now)
+            orphan = "muse:%s:%s" % (sid, sid)
+            self.assertIn(orphan, store.runs)
+            self.assertEqual(store.usage[("muse", sid, "early")]["run_id"], orphan)
+            with open(os.path.join(scratch, "muse-sessions.tsv"), "w") as fh:
+                fh.write("ws2-notes\t%s\t1792152010\n" % sid)
+            self.poll(store, cfg, now + 5)
+            labeled = "muse:%s:ws2-notes" % sid
+            self.assertNotIn(orphan, store.runs)
+            self.assertEqual(store.usage[("muse", sid, "early")]["run_id"], labeled)
+            self.assertEqual(summed(store, sid)["input"], 40)
+            self.assertEqual(store.runs[labeled]["model"], "muse-1")
+            self.assertEqual(store.runs[labeled]["label"], "ws2-notes")
+
+    def test_cold_rotation_visits_every_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sessions = os.path.join(tmp, "sessions")
+            scratch = os.path.join(tmp, "scratch")
+            os.makedirs(scratch)
+            now = time.time()
+            day = datetime.fromtimestamp(now, timezone.utc)
+            day_dir = os.path.join(sessions, "%04d" % day.year, "%02d" % day.month, "%02d" % day.day)
+            paths = []
+            blob = b"x" * 63 + b"\n"
+            for i in range(4):
+                sid = "f000000%d-0000-4000-8000-00000000000%d" % (i, i)
+                path = os.path.join(day_dir, sid, "session.jsonl")
+                os.makedirs(os.path.dirname(path))
+                with open(path, "wb") as fh:
+                    fh.write(blob)
+                paths.append(os.path.abspath(path))
+            store = Store()
+            cfg = self.cfg(sessions, scratch, fresh_hours=36, dir_scan_s=0, recent_s=0)
+            cfg["read_budget"] = {"per_file": len(blob), "per_tick": len(blob)}
+            for step in range(4):
+                self.poll(store, cfg, now + step)
+            for path in paths:
+                self.assertEqual(store.offsets[path][1], len(blob))
+
+    def test_manifest_file_is_read_before_cold_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sessions = os.path.join(tmp, "sessions")
+            scratch = os.path.join(tmp, "scratch")
+            os.makedirs(scratch)
+            now = time.time()
+            day = datetime.fromtimestamp(now, timezone.utc)
+            day_dir = os.path.join(sessions, "%04d" % day.year, "%02d" % day.month, "%02d" % day.day)
+            hot = os.path.join(day_dir, SID, "session.jsonl")
+            cold = os.path.join(day_dir, SID2, "session.jsonl")
+            os.makedirs(os.path.dirname(hot))
+            os.makedirs(os.path.dirname(cold))
+            with open(hot, "wb") as fh:
+                fh.write(mc(SID, "hot", input=9, output=1))
+            with open(cold, "wb") as fh:
+                fh.write(b"y" * 4000 + b"\n")
+            tsv = os.path.join(scratch, "muse-sessions.tsv")
+            with open(tsv, "w") as fh:
+                fh.write("ws2-hot\t%s\t1792152010\n" % SID)
+            per_tick = os.path.getsize(tsv) + os.path.getsize(hot)
+            per_file = max(per_tick, os.path.getsize(cold))
+            store = Store()
+            cfg = self.cfg(sessions, scratch, fresh_hours=36, dir_scan_s=0, recent_s=0)
+            cfg["read_budget"] = {"per_file": per_file, "per_tick": per_tick}
+            self.poll(store, cfg, now)
+            self.assertEqual(summed(store, SID)["input"], 9)
+            self.assertNotIn(os.path.abspath(cold), store.offsets)
 
     def test_missing_root(self):
         store = Store()

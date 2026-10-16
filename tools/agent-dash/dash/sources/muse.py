@@ -14,9 +14,14 @@ on the run and on each usage row is that same uuid.
 from ``roots.scratchpads`` (one path, a list, or a glob). The default is no
 scratch root. Budgets come from
 ``read_budgets`` or ``read_budget`` (``per_file``, ``per_tick``), default 4 MB
-and 8 MB. ``fresh_hours`` (default 36, ``0`` skips mtime discovery) and
+and 8 MB. Each tick reads manifest-known logs and logs modified within
+``recent_s`` (default 15 minutes) before rotating through the rest.
+``fresh_hours`` (default 36, ``0`` skips mtime discovery) and
 ``dir_scan_s`` (default 15) bound directory scans. ``backfill_session`` limits
 manifest discovery to that Claude session and skips the fresh scan.
+A zero-byte read does not create a run. When a labeled run exists for a
+session, usage stored on the unlabeled ``muse:<sid>:<sid>`` row moves onto
+the labeled run and that row is deleted.
 """
 
 import glob
@@ -35,6 +40,7 @@ INTERVAL_S = 2
 DEFAULT_SESSIONS = os.path.expanduser("~/.local/share/muse/sessions")
 PER_FILE_DEFAULT = 4 * 1024 * 1024
 PER_TICK_DEFAULT = 8 * 1024 * 1024
+RECENT_S = 15 * 60
 
 _FRESH = {}
 _LOCATE = {}
@@ -77,25 +83,17 @@ def _poll(store, cfg, now):
     _adopt_live_labels(store, manifests, processes)
 
     files = _candidate_files(store, sessions, manifests, now, fresh_hours, scan_s)
-    if not files or budget <= 0:
-        return
-
-    rec = _offset(store, "muse:rotate")
-    idx = int(rec[1]) if rec else 0
-    n = len(files)
-    idx %= n
-    scanned = 0
-    while scanned < n and budget > 0:
-        path, sid, muse_parent = files[idx]
-        budget = _tail_file(
-            store, path, sid, manifests, muse_parent, budget, per_file, now, processes
+    recent_s = _recent_s(cfg)
+    if files and budget > 0:
+        hot, cold = _split_priority(files, manifests, now, recent_s)
+        budget = _drain_files(
+            store, hot, "muse:rotate-hot", budget, per_file, now, processes, manifests
         )
-        idx = (idx + 1) % n
-        scanned += 1
-    try:
-        store.set_offset("muse:rotate", 0, idx, n, now)
-    except Exception:
-        _fail("rotate")
+        if budget > 0:
+            _drain_files(
+                store, cold, "muse:rotate", budget, per_file, now, processes, manifests
+            )
+    _repair(store)
 
 
 def _candidate_files(store, root, manifests, now, fresh_hours, scan_s):
@@ -131,6 +129,68 @@ def _candidate_files(store, root, manifests, now, fresh_hours, scan_s):
             seen.add(cpath)
             expanded.append((cpath, cid, sid))
     return expanded
+
+
+def _recent_s(cfg):
+    try:
+        return float(cfg.get("recent_s", RECENT_S))
+    except (TypeError, ValueError):
+        return RECENT_S
+
+
+def _split_priority(files, manifests, now, recent_s):
+    """Manifest-known and recently modified logs, then everything else."""
+    known = set()
+    for key in manifests:
+        if isinstance(key, str):
+            known.add(key.lower())
+    hot = []
+    cold = []
+    for path, sid, muse_parent in files:
+        sid_l = sid.lower() if isinstance(sid, str) else ""
+        parent_l = muse_parent.lower() if isinstance(muse_parent, str) else ""
+        recent = False
+        if recent_s > 0:
+            try:
+                recent = now - os.path.getmtime(path) <= recent_s
+            except OSError:
+                recent = False
+        if sid_l in known or parent_l in known or recent:
+            hot.append((path, sid, muse_parent))
+        else:
+            cold.append((path, sid, muse_parent))
+    return hot, cold
+
+
+def _drain_files(store, files, key, budget, per_file, now, processes, manifests):
+    if not files or budget <= 0:
+        return budget
+    n = len(files)
+    rec = _offset(store, key)
+    idx = int(rec[1]) % n if rec else 0
+    scanned = 0
+    while scanned < n and budget > 0:
+        path, sid, muse_parent = files[idx]
+        budget = _tail_file(
+            store, path, sid, manifests, muse_parent, budget, per_file, now, processes
+        )
+        idx = (idx + 1) % n
+        scanned += 1
+    try:
+        store.set_offset(key, 0, idx, n, now)
+    except Exception:
+        _fail("rotate")
+    return budget
+
+
+def _repair(store):
+    fn = getattr(store, "repair_muse_orphans", None)
+    if not callable(fn):
+        return
+    try:
+        fn()
+    except Exception:
+        _fail("orphan")
 
 
 def _tail_file(store, path, sid, manifests, muse_parent, budget, per_file, now, processes):
@@ -177,7 +237,7 @@ def _tail_file(store, path, sid, manifests, muse_parent, budget, per_file, now, 
                 )
             except Exception:
                 _fail("usage")
-    if not models and started_at_zero:
+    if not models and started_at_zero and raw:
         models[sid] = None
     for esid, model in models.items():
         _upsert_run(
@@ -524,11 +584,28 @@ def _manifest_dirs(root, filename, only=None):
     def emit_session(sess_dir, sess_name):
         if not _is_uuid(sess_name) or (only is not None and sess_name != only):
             return
-        tsv = os.path.join(sess_dir, "scratchpad", filename)
+        pad_dir = os.path.join(sess_dir, "scratchpad")
+        tsv = os.path.join(pad_dir, filename)
         if os.path.isfile(tsv):
             item = emit(os.path.dirname(tsv))
             if item:
                 yield item
+        try:
+            children = os.scandir(pad_dir)
+        except OSError:
+            return
+        with children:
+            for child in children:
+                try:
+                    if not child.is_dir(follow_symlinks=False):
+                        continue
+                except OSError:
+                    continue
+                nested = os.path.join(child.path, filename)
+                if os.path.isfile(nested):
+                    item = emit(child.path)
+                    if item:
+                        yield (item[0], sess_name)
 
     direct = os.path.join(root, filename)
     if os.path.isfile(direct):

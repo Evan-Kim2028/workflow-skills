@@ -676,6 +676,75 @@ class ProcessParseTest(unittest.TestCase):
         self.assertEqual(muse["status"], "done")
         self.assertEqual(muse["ended_at"], 50)
 
+    def test_reconcile_moves_orphan_usage_and_deletes_the_row(self):
+        sid = "ABCDEFAB-CDEF-4ABC-8DEF-ABCDEFABCDEF"
+        lower = sid.lower()
+        labeled = "muse:%s:ws2-notes" % sid
+        orphan = "muse:%s:%s" % (lower, lower)
+        now = 1_700_000_100.0
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "dash.sqlite")
+            try:
+                store.upsert_run(
+                    {
+                        "run_id": labeled,
+                        "source": "muse",
+                        "tier": "muse",
+                        "label": "ws2-notes",
+                        "session_id": sid,
+                        "status": "unknown",
+                        "started_at": now - 50,
+                    }
+                )
+                store.upsert_run(
+                    {
+                        "run_id": orphan,
+                        "source": "muse",
+                        "tier": "muse",
+                        "session_id": lower,
+                        "model": "muse-spark-1.3",
+                        "status": "unknown",
+                        "started_at": now - 80,
+                        "clock_source": "muse_log",
+                    }
+                )
+                store.add_usage(
+                    {
+                        "ts": now - 40,
+                        "session_id": lower,
+                        "run_id": orphan,
+                        "model": "muse-spark-1.3",
+                        "tool": "muse",
+                        "message_id": "early",
+                        "input": 50,
+                        "output": 4,
+                        "cache_read": 1,
+                        "cache_write": 0,
+                        "reasoning": 2,
+                    }
+                )
+                ended = reconcile_running(store, now, [])
+                usage = store._conn.execute(
+                    "SELECT run_id, input_tokens FROM usage_events"
+                ).fetchone()
+                buckets = store._conn.execute(
+                    "SELECT workstream, input_tokens FROM usage_buckets"
+                ).fetchall()
+                kept = store.get_run(labeled)
+                gone = store.get_run(orphan)
+            finally:
+                store.close()
+        self.assertEqual(ended, 1)
+        self.assertIsNone(gone)
+        self.assertEqual(usage["run_id"], labeled)
+        self.assertEqual(usage["input_tokens"], 50)
+        self.assertEqual(kept["model"], "muse-spark-1.3")
+        self.assertEqual(kept["started_at"], now - 50)
+        self.assertEqual(kept["status"], "done")
+        self.assertEqual(len(buckets), 1)
+        self.assertEqual(buckets[0]["workstream"], "WS2")
+        self.assertEqual(buckets[0]["input_tokens"], 50)
+
     def test_muse_shadow_tokens_roll_onto_labeled_run(self):
         now = time.time()
         sid = "11111111-1111-4111-8111-111111111111"

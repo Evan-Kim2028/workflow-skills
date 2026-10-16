@@ -28,6 +28,7 @@ LOGFILE = STATE_DIR / "agent-dash.log"
 DBFILE = STATE_DIR / "dash.sqlite"
 HOST = "127.0.0.1"
 PORT = 8765
+RECONCILE_INTERVAL_S = 60
 URL = f"http://{HOST}:{PORT}/"
 
 USAGE = """agent-dash: local read-only execution dashboard
@@ -378,6 +379,18 @@ def is_dash(pid: int) -> bool:
     return "agent_dash.py" in text
 
 
+def reconcile_if_due(store, now: float, last: float | None, interval: float = RECONCILE_INTERVAL_S) -> float:
+    """Call ``reconcile_running`` when ``interval`` seconds have passed.
+
+    ``last is None`` runs it immediately, so a restart closes rows that were
+    left unknown. Returns the timestamp of the last reconcile.
+    """
+    if last is not None and now - last < interval:
+        return last
+    reconcile_running(store, now)
+    return now
+
+
 def _serve() -> None:
     cfg = load_cfg()
     store = Store(DBFILE)
@@ -397,9 +410,12 @@ def _serve() -> None:
     signal.signal(signal.SIGINT, on_stop)
 
     def loop():
+        last_reconcile = None
         while not stop.wait(0.25):
+            now = time.time()
             try:
-                registry.tick(store, cfg, time.time(), stop=stop)
+                registry.tick(store, cfg, now, stop=stop)
+                last_reconcile = reconcile_if_due(store, now, last_reconcile)
             except Exception:
                 logging.exception("collector tick failed")
         server.stop.set()

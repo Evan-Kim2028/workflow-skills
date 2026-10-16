@@ -1,0 +1,55 @@
+{
+  "default": "muse",
+  "auto_order": ["muse", "grok", "glm", "glm-flash"],
+  "cooldown_minutes": 30,
+  "workers": {
+    "muse": {
+      "enabled": true,
+      "kind": "muse",
+      "model": "muse-spark-1.3-contributor",
+      "extra_args": ["--trust-workspace", "--reasoning-effort", "xhigh", "--disable-reminders", "--user-input-auto-resolve"],
+      "cap": 25,
+      "pgrep": "[m]use-bin|[m]use exec",
+      "manifest": "muse-sessions.tsv",
+      "columns": ["label", "session_id", "epoch"],
+      "quota_patterns": ["rate limit", "quota", "429", "usage limit"],
+      "cost_rank": 1
+    },
+    "grok": {
+      "enabled": true,
+      "kind": "cursor",
+      "model": "grok-4.7[context=500k,reasoning_effort=xhigh,fast=false]",
+      "extra_args": [],
+      "cap": 25,
+      "pgrep": "[c]ursor-agent",
+      "manifest": "cursor-sessions.tsv",
+      "columns": ["label", "session_id", "epoch"],
+      "quota_patterns": ["rate limit", "quota", "429", "usage limit"],
+      "cost_rank": 4
+    },
+    "glm": {
+      "enabled": true,
+      "kind": "grok-build",
+      "model": "glm-5.3",
+      "extra_args": [],
+      "cap": 5,
+      "pgrep": "-m [g]lm-5.3($| )",
+      "manifest": "glm-sessions.tsv",
+      "columns": ["label", "session_id", "epoch", "model"],
+      "quota_patterns": ["rate limit", "quota", "429", "usage limit"],
+      "cost_rank": 3
+    },
+    "glm-flash": {
+      "enabled": true,
+      "kind": "grok-build",
+      "model": "glm-5.3-flash",
+      "extra_args": [],
+      "cap": 5,
+      "pgrep": "-m [g]lm-5.3-flash",
+      "manifest": "glm-sessions.tsv",
+      "columns": ["label", "session_id", "epoch", "model"],
+      "quota_patterns": ["rate limit", "quota", "429", "usage limit"],
+      "cost_rank": 2
+    }
+  }
+}

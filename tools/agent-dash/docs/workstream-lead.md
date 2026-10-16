@@ -1,6 +1,6 @@
 # Running a workstream end to end
 
-A workstream is planned once and executed in waves by cheap workers (muse by default, Grok optional), with one thin Claude lead session that decides, merges, and runs production steps. The dashboard shows the whole thing live.
+A workstream is planned once and executed in waves by workers from the registry (`default` is the usual tier, `auto` fails over), with one thin Claude lead session that decides, merges, and runs production steps. The dashboard shows the whole thing live.
 
 ## 1. Plan (once)
 
@@ -68,7 +68,7 @@ args: {
   "ws": "WS4", "repo": "<abs repo>", "runDir": "<abs scratch>/runs",
   "template": "<abs worker rules template>",
   "runner": "<abs>/agent-dash/scripts/run_worker.sh", "dash": "<abs>/agent-dash/agent_dash.py",
-  "maxFixRounds": 2, "defaultTier": "muse", "reviewTier": "muse",
+  "maxFixRounds": 2, "defaultTier": "default", "reviewTier": "default",
   "lanes": [ { "task": "WS4.3", "slug": "deal-route", "branch": "ws4/deal-route",
                "worktree": "<abs worktree path>", "brief": "<self-contained task>",
                "tests": "<explicit test command>", "review": true } ]
@@ -79,7 +79,7 @@ What the workflow does:
 
 - All lanes run in parallel.
 - Each lane goes build, then review, then fix and re-review until approved, or until it runs out of fix rounds.
-- Every step is a low-effort Haiku wrapper around `scripts/run_worker.sh`. The runner launches a muse (`muse-spark-1.3-contributor`, xhigh) or Grok worker once, waits for it, and logs the run for the dashboard. So the heavy work stays on the cheap workers.
+- Every step is a low-effort Haiku wrapper around `scripts/run_worker.sh`. The runner reads the worker registry (`workers.example.json`, or `workers.local.json` when that file is present) and launches the requested tier once. The tier is `default`, `auto`, or a worker name. `auto` skips a worker that is at its cap or cooling down after a quota error, and tries the next name in `auto_order`. The run is logged for the dashboard. The lane result's `tier` is the name the runner actually used.
 - On approval it runs `ws task WS4 WS4.3 pr`.
 - It returns `approved` branches, `needsLead` lanes (with the last review), and `built` lanes.
 - It never pushes, opens PRs, merges, or touches production.

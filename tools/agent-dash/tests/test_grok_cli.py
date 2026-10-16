@@ -328,6 +328,32 @@ class GrokCliTests(unittest.TestCase):
         )
         self.assertEqual(store.runs, {})
 
+    def test_encoded_cwd_root_attributes_glm_manifest(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            enc = os.path.join(tmp, "enc")
+            pad = os.path.join(enc, HUB, "scratchpad")
+            os.makedirs(pad)
+            with open(os.path.join(pad, "glm-sessions.tsv"), "w") as fh:
+                fh.write("glm-review\t%s\t1792153370\tglm-5.3\n" % SID)
+            sessions = os.path.join(tmp, "sessions")
+            os.makedirs(sessions)
+            cfg = {
+                "roots": {
+                    "grok_sessions": sessions,
+                    "grok_log": os.path.join(tmp, "missing.jsonl"),
+                    "scratchpads": enc,
+                },
+                "read_budgets": {"per_file": 1024 * 1024, "per_tick": 1024 * 1024},
+            }
+            store = Store()
+            self.poll(store, cfg, 1792154000)
+            run = store.runs["glm:%s:glm-review" % SID]
+            self.assertEqual(run["model"], "glm-5.3")
+            self.assertEqual(run["tier"], "glm")
+            self.assertEqual(run["label"], "glm-review")
+            self.assertEqual(run["parent_session_id"], HUB)
+            self.assertEqual(run["started_at"], 1792153370.0)
+
     @unittest.skipUnless(os.environ.get("AGENT_DASH_SMOKE") == "1", "set AGENT_DASH_SMOKE=1 to read a local glm usage file")
     def test_smoke_real_usage_json(self):
         sessions = os.environ.get("AGENT_DASH_SMOKE_GROK_SESSIONS")

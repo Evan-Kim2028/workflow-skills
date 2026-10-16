@@ -52,7 +52,7 @@ Regenerate the fixtures with `python3 fixtures/make_fixtures.py`. The script use
 
 Zero config runs. Scratch roots and the hub tracker default to empty, so those sources poll nothing. Claude, muse, grok, and cursor roots default under `$HOME` and are ignored when the directory is missing.
 
-Copy an example file to `*.local.json` when you want your own values. A local file replaces the example for maps, plans, and the task map. `config.local.json` deep-merges over `config.example.json` (a list you set replaces that list).
+Copy an example file to `*.local.json` when you want your own values. A local file replaces the example for maps, plans, the task map, and the worker registry. `config.local.json` deep-merges over `config.example.json` (a list you set replaces that list).
 
 | Example | What you set |
 |---|---|
@@ -60,6 +60,7 @@ Copy an example file to `*.local.json` when you want your own values. A local fi
 | `tools/agent-dash/map.example.json` | Label rules and session defaults |
 | `tools/agent-dash/plans.example.json` | Which workstreams have a plan file |
 | `tools/agent-dash/static/taskmap.example.json` | Label to plan-task overrides |
+| `tools/agent-dash/workers.example.json` | Worker registry: default, auto order, caps |
 
 `plans.example.json` points at `plans/ws1.json`, `plans/ws2.json`, and `plans/ws7.json`. Those are synthetic DAGs so the tabs render before you add your own.
 
@@ -75,6 +76,7 @@ Environment variables override the files:
 - `AGENT_DASH_STATE_DIR`
 - `AGENT_DASH_WORKSTREAMS` (plan bundles, default `~/.local/share/agent-dash/workstreams`)
 - `AGENT_DASH_MAP`, `AGENT_DASH_PLANS`, `AGENT_DASH_TASKMAP`, `AGENT_DASH_CONFIG`
+- `AGENT_DASH_WORKERS` (worker registry path; otherwise `workers.local.json`, else `workers.example.json`)
 
 The example scratch value is `$HOME/agent-scratch/*`. A glob that matches nothing is the same as an empty list.
 

@@ -1,7 +1,8 @@
 """Scratchpad manifest source.
 
-Scans ``<scratch-root>/<encoded-cwd>/<session>/scratchpad`` two
-levels deep. Manifest rows become runs. Stdout, stderr, and report files are
+Scans ``<scratch-root>/<encoded-cwd>/<session>/scratchpad``. A root that is
+already the encoded-cwd directory counts too: a uuid child with ``scratchpad/``
+is a session pad. Manifest rows become runs. Stdout, stderr, and report files are
 opened only by constructed name (``out-<label>.md``, ``err-<label>.log``,
 ``report-<label>.md``) inside ``muse/``, ``glm/``, ``grok/``, and ``cursor/``.
 ``exec/`` has no manifest; each ``out-`` / ``err-`` / ``report-`` file there
@@ -519,6 +520,25 @@ def _scratchpads(root, now, backfill, scan_s):
     if hit and now - hit[0] < scan_s:
         return hit[1]
     found = []
+    seen = set()
+
+    def consider(path, name):
+        if not _UUID.match(name):
+            return
+        if backfill and name != backfill:
+            return
+        scratch = os.path.join(path, "scratchpad")
+        if not _is_dir(scratch):
+            return
+        try:
+            real = os.path.realpath(scratch)
+        except OSError:
+            return
+        if real in seen:
+            return
+        seen.add(real)
+        found.append((name, scratch))
+
     try:
         encoded = list(os.scandir(root))
     except OSError:
@@ -528,6 +548,10 @@ def _scratchpads(root, now, backfill, scan_s):
         try:
             if not enc.is_dir(follow_symlinks=False):
                 continue
+        except OSError:
+            continue
+        consider(enc.path, enc.name)
+        try:
             sessions = list(os.scandir(enc.path))
         except OSError:
             continue
@@ -537,13 +561,7 @@ def _scratchpads(root, now, backfill, scan_s):
                     continue
             except OSError:
                 continue
-            if not _UUID.match(sess.name):
-                continue
-            if backfill and sess.name != backfill:
-                continue
-            scratch = os.path.join(sess.path, "scratchpad")
-            if _is_dir(scratch):
-                found.append((sess.name, scratch))
+            consider(sess.path, sess.name)
     _scan_cache[key] = (now, found)
     return found
 

@@ -437,6 +437,11 @@ def _marked(store, key):
 
 
 def _manifest_dirs(root, filename, only=None):
+    """Scratchpads that contain ``filename``.
+
+    Lists ``<root>/<encoded-cwd>/<session>/`` and, when ``root`` is already
+    the encoded-cwd directory, a uuid child that holds ``scratchpad/<filename>``.
+    """
     if not root or not os.path.isdir(root):
         return
     seen = set()
@@ -453,6 +458,15 @@ def _manifest_dirs(root, filename, only=None):
         parent = parent_name if _is_uuid(parent_name) else None
         return rp, parent
 
+    def emit_session(sess_dir, sess_name):
+        if not _is_uuid(sess_name) or (only is not None and sess_name != only):
+            return
+        tsv = os.path.join(sess_dir, "scratchpad", filename)
+        if os.path.isfile(tsv):
+            item = emit(os.path.dirname(tsv))
+            if item:
+                yield item
+
     direct = os.path.join(root, filename)
     if os.path.isfile(direct):
         item = emit(root)
@@ -467,6 +481,10 @@ def _manifest_dirs(root, filename, only=None):
             try:
                 if not enc.is_dir(follow_symlinks=False):
                     continue
+            except OSError:
+                continue
+            yield from emit_session(enc.path, enc.name)
+            try:
                 sessions = os.scandir(enc.path)
             except OSError:
                 continue
@@ -477,13 +495,7 @@ def _manifest_dirs(root, filename, only=None):
                             continue
                     except OSError:
                         continue
-                    if not _is_uuid(sess.name) or (only is not None and sess.name != only):
-                        continue
-                    tsv = os.path.join(sess.path, "scratchpad", filename)
-                    if os.path.isfile(tsv):
-                        item = emit(os.path.dirname(tsv))
-                        if item:
-                            yield item
+                    yield from emit_session(sess.path, sess.name)
 
 
 def _read_small(path, budget, per_file):

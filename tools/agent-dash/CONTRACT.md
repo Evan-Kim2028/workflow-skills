@@ -141,6 +141,36 @@ HTTP, still GET only, 127.0.0.1:
 
 Run labels for a task are `ws<N>-<task-id>-<slug>`. `SKILL-PLAN.md` is the short how-to. `fixtures/bundles/` is a synthetic OVERVIEW and one workstream for tests.
 
+## Worker registry
+
+`workers.example.json` is the shipped registry. `workers.local.json`, when present, replaces it. `AGENT_DASH_WORKERS` replaces both. Resolution is `dash/locate.py` `layered_path`. `scripts/run_worker.py` reads the file. `scripts/run_worker.sh` execs that script.
+
+```json
+{
+  "default": "<worker name>",
+  "auto_order": ["<worker name>", "..."],
+  "cooldown_minutes": 30,
+  "workers": {
+    "<name>": {
+      "enabled": true,
+      "kind": "muse | cursor | grok-build",
+      "model": "<model id>",
+      "extra_args": [],
+      "cap": 25,
+      "pgrep": "<bracket-guarded pattern>",
+      "manifest": "<name>-sessions.tsv",
+      "columns": ["label", "session_id", "epoch"],
+      "quota_patterns": ["rate limit", "quota", "429", "usage limit"],
+      "cost_rank": 1
+    }
+  }
+}
+```
+
+`kind` selects the launch, not the model string. `muse` runs `muse exec` with `--model`, `--workspace`, `--prompt-file`, `--session-id`, then `extra_args`. `cursor` runs `scripts/launch_grok.sh` so billed tokens are logged. `grok-build` runs `grok -p` with the prompt, a run rule appended, `-m`, `-s`, `--permission-mode bypassPermissions`, `--cwd`, and `--output-format plain`. `columns` is the manifest row. `glm-sessions.tsv` uses `label`, `session_id`, `epoch`, `model`. `manifests.py` and `grok_cli.py` read that shape. `cost_rank` is a lower-is-cheaper hint. `auto` follows `auto_order`, not `cost_rank`.
+
+`run_worker.py <tier|default|auto> <label> <workspace> <prompt-file> <run-dir> [max-wait]` prints `STATUS: running|done|failed out=... err=... tier=<name>`. It records the chosen worker in `<run-dir>/<label>.tier` and the pid in `<run-dir>/<label>.pid`. A later call for that label only waits. `default` uses the registry `default`. `auto` uses the first enabled worker in `auto_order` that is under `cap` (live count from `pgrep`) and not in cooldown. A failed run whose stderr or report matches `quota_patterns` cools that worker down for `cooldown_minutes`. Cooldowns live in `worker-cooldowns.json` in the agent-dash state dir. If the request was `auto` or `default`, the runner archives the report to `out-<label>.<tier>.md` and launches the next eligible worker.
+
 ## Checks
 
 Optional, on a machine that already has sessions. Compare one session's transcript totals to that machine's own usage ledger within 0.5%. Peak concurrency over the same window should land within 10% of a hand count. Collector CPU under 10% of one core averaged over 5 minutes. RSS under 300 MB. Real-session smokes stay skipped unless `AGENT_DASH_SMOKE=1`.

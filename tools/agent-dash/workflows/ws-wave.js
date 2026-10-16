@@ -1,28 +1,30 @@
 export const meta = {
   name: 'ws-wave',
-  description: 'Run one workstream wave: each lane is built, reviewed and fixed by muse (default) or Grok workers until approved, with Haiku wrappers only',
-  whenToUse: 'A workstream lead runs one wave of independent lanes (no shared files) and wants Grok/muse to do the work, not Claude subagents',
+  description: 'Run one workstream wave: each lane is built, reviewed and fixed by a registry worker until approved, with Haiku wrappers only',
+  whenToUse: 'A workstream lead runs one wave of independent lanes (no shared files) and wants registry workers to do the work, not Claude subagents',
   phases: [
-    { title: 'Build', detail: 'one Grok or muse worker per lane, in its own worktree', model: 'haiku' },
-    { title: 'Review', detail: 'adversarial Grok review; fix rounds until approved or out of rounds', model: 'haiku' },
+    { title: 'Build', detail: 'one registry worker per lane, in its own worktree', model: 'haiku' },
+    { title: 'Review', detail: 'adversarial review; fix rounds until approved or out of rounds', model: 'haiku' },
   ],
 }
 
 // args: {
-//   ws: "WS7", repo: "/abs/lake-of-rage", runDir: "/abs/<lead scratchpad>/runs",
+//   ws: "WS7", repo: "/abs/<repo>", runDir: "/abs/<lead scratchpad>/runs",
 //   template: "/abs/.claude/templates/worker-common.md",
 //   runner: "/abs/.claude/tools/agent-dash/scripts/run_worker.sh",
 //   dash: "/abs/.claude/tools/agent-dash/agent_dash.py",
-//   maxFixRounds: 2, defaultTier: "muse", reviewTier: "muse",   (both default to muse)
-//   lanes: [{ task: "WS7.K1", slug: "kind-checker", tier: "grok"|"muse", branch: "ws7/kind-checker",
-//             worktree: "/abs/lor-wt-ws7-kind", brief: "what to build, files, stop rules", tests: "pytest a.py b.py",
+//   maxFixRounds: 2, defaultTier: "default", reviewTier: "default",
+//   lanes: [{ task: "WS7.K1", slug: "kind-checker", tier: "default"|"auto", branch: "ws7/kind-checker",
+//             worktree: "/abs/<worktree>", brief: "what to build, files, stop rules", tests: "pytest a.py b.py",
 //             review: true }]
 // }
+// tier is a registry worker name, or "default", or "auto". defaultTier defaults to "default".
+// reviewTier defaults to defaultTier. The runner prints the tier it actually used.
 const A = args || {}
 const WS = A.ws
 const LOWER = String(WS || '').toLowerCase()
 const MAX_FIX = A.maxFixRounds == null ? 2 : A.maxFixRounds
-const DEFAULT_TIER = A.defaultTier || 'muse'
+const DEFAULT_TIER = A.defaultTier || 'default'
 const REVIEW_TIER = A.reviewTier || DEFAULT_TIER
 if (!WS || !A.repo || !A.runDir || !A.template || !A.runner || !A.dash || !Array.isArray(A.lanes) || !A.lanes.length) {
   throw new Error('ws-wave needs args {ws, repo, runDir, template, runner, dash, lanes[]}')
@@ -36,8 +38,9 @@ const RUN = {
     summary: { type: 'string', description: 'at most 1200 characters: what the worker did or found, in plain words' },
     findings: { type: 'string', description: 'for reviews: the numbered findings verbatim (at most 4000 characters); otherwise ""' },
     commits: { type: 'string', description: 'output of git log --oneline origin/main..HEAD in the worktree, or ""' },
+    tier: { type: 'string', description: 'tier= value from the last STATUS line of the runner' },
   },
-  required: ['status', 'verdict', 'summary', 'findings', 'commits'],
+  required: ['status', 'verdict', 'summary', 'findings', 'commits', 'tier'],
 }
 
 function wrapperPrompt(o) {
@@ -49,7 +52,7 @@ function wrapperPrompt(o) {
     `3. Read the report file named in out=... and the last 40 lines of the err= file if the status is failed.`,
     `4. Run: git -C ${o.workspace} log --oneline origin/main..HEAD (empty is fine).`,
     o.after ? `5. ${o.after}` : ``,
-    `Return the structured result. verdict is the report's first verdict word (PASS, PARTIAL, BLOCKED, APPROVE, APPROVE_WITH_NITS, APPROVE_WITH_CHANGES, REQUEST_CHANGES) or "none".`,
+    `Return the structured result. tier is the tier= value from the last STATUS line (the worker the runner actually used). verdict is the report's first verdict word (PASS, PARTIAL, BLOCKED, APPROVE, APPROVE_WITH_NITS, APPROVE_WITH_CHANGES, REQUEST_CHANGES) or "none".`,
     ``,
     `TASK block:`,
     `<<<TASK`,
@@ -105,7 +108,7 @@ const results = await pipeline(
     setup: `if [ ! -d ${lane.worktree} ]; then git -C ${A.repo} fetch -q origin main && (git -C ${A.repo} worktree add -b ${lane.branch} ${lane.worktree} origin/main || git -C ${A.repo} worktree add ${lane.worktree} ${lane.branch}); fi`,
   }),
   async (built, lane) => {
-    const out = { task: lane.task, label: base(lane), branch: lane.branch, worktree: lane.worktree, build: built, rounds: [], final: 'unreviewed' }
+    const out = { task: lane.task, label: base(lane), tier: built && built.tier, branch: lane.branch, worktree: lane.worktree, build: built, rounds: [], final: 'unreviewed' }
     if (!built || built.status !== 'done' || /BLOCKED/.test(built.verdict) || !built.commits) {
       out.final = 'build-failed'
       log(`${lane.task}: build ${built ? built.status + ' ' + built.verdict : 'died'}; escalating to the lead`)

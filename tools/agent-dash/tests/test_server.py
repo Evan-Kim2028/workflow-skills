@@ -14,7 +14,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from agent_dash import default_cfg, is_dash, load_cfg, main, run_backfill
+from agent_dash import default_cfg, is_dash, load_cfg, main, reconcile_if_due, run_backfill
 from dash.plans import PlanNotFound, load as load_plan, mapping as plan_mapping
 from dash.server import DashServer, PLACEHOLDER
 from dash.sources import Registry
@@ -235,6 +235,29 @@ class PlanAndBackfillTest(unittest.TestCase):
         self.assertEqual(cfg["host"], "127.0.0.1")
         self.assertEqual(cfg["port"], 8765)
         self.assertNotIn("caps", cfg)
+
+    def test_reconcile_runs_immediately_then_every_60s(self):
+        import agent_dash
+
+        calls = []
+        orig = agent_dash.reconcile_running
+
+        def fake(store, now, processes=None):
+            calls.append(now)
+            return 0
+
+        agent_dash.reconcile_running = fake
+        try:
+            last = reconcile_if_due(None, 1000.0, None)
+            self.assertEqual(last, 1000.0)
+            last = reconcile_if_due(None, 1059.0, last)
+            self.assertEqual(last, 1000.0)
+            self.assertEqual(calls, [1000.0])
+            last = reconcile_if_due(None, 1060.0, last)
+            self.assertEqual(calls, [1000.0, 1060.0])
+            self.assertEqual(last, 1060.0)
+        finally:
+            agent_dash.reconcile_running = orig
 
 
 if __name__ == "__main__":

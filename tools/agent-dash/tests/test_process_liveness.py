@@ -20,7 +20,7 @@ process = load("process")
 SID = "ce22eaff-a7d1-4b65-8e9d-0ff213fcc1f5"
 SID_UPPER = SID.upper()
 MUSE_ARGV = (
-    "28553 /Users/evandekim/.local/bin/muse-bin-1.4.9-R6297.1 exec "
+    "28553 /home/user/.local/bin/muse-bin-x exec "
     "--trust-workspace --prompt-file /tmp/pads/scratchpad/muse/ws2-x.md "
     "--session-id %s" % SID_UPPER
 )
@@ -55,7 +55,7 @@ class Store:
         return started_at
 
 
-def muse_row(pid=28553, comm="muse-bin-1.4.9-R6297.1", sid=SID_UPPER):
+def muse_row(pid=28553, comm="muse-bin-x", sid=SID_UPPER):
     return {
         "pid": pid,
         "comm": comm,
@@ -90,7 +90,7 @@ class SessionIdTests(unittest.TestCase):
 
 class CommTests(unittest.TestCase):
     def test_versioned_muse_bin_canonicalises(self):
-        self.assertEqual(process._canon_comm("muse-bin-1.4.9-R6297.1"), "muse-bin")
+        self.assertEqual(process._canon_comm("muse-bin-x"), "muse-bin")
 
     def test_plain_names_unchanged(self):
         for comm in ("muse-bin", "muse", "claude", "cursor-agent", "grok"):
@@ -98,14 +98,14 @@ class CommTests(unittest.TestCase):
 
     def test_parse_ps_normalises_pathed_versioned_comm(self):
         rows = process.parse_ps(
-            "28553     1 28553  50000 10:00 /Users/evandekim/.local/bin/muse-bin-1.4.9-R6297.1\n"
+            "28553     1 28553  50000 10:00 /home/user/.local/bin/muse-bin-x\n"
         )
         self.assertEqual(rows[0]["comm"], "muse-bin")
         self.assertEqual(rows[0]["pid"], 28553)
 
     def test_versioned_comm_is_a_wanted_source(self):
         wanted = set().union(*process.SOURCE_COMMS.values())
-        self.assertIn(process._canon_comm("muse-bin-1.4.9-R6297.1"), wanted)
+        self.assertIn(process._canon_comm("muse-bin-x"), wanted)
 
 
 class MatchAgentTests(unittest.TestCase):
@@ -320,6 +320,51 @@ class PromptFileTests(unittest.TestCase):
         self.assertEqual(row["status"], "running")
         self.assertEqual(row["pid"], 28553)
         self.assertIsNone(row["ended_at"])
+
+    def test_reconcile_closes_unknown_when_the_process_is_gone(self):
+        run_id = "muse:%s:ws2-x" % SID
+        store = Store(
+            {
+                run_id: {
+                    "run_id": run_id,
+                    "source": "muse",
+                    "session_id": SID,
+                    "label": "ws2-x",
+                    "status": "unknown",
+                    "pid": 999,
+                    "started_at": 100,
+                }
+            }
+        )
+        ended = process.reconcile_running(store, 200, [])
+        row = store.get_run(run_id)
+        self.assertEqual(ended, 1)
+        self.assertEqual(row["status"], "done")
+        self.assertEqual(row["ended_at"], 100)
+        self.assertIsNone(row["pid"])
+
+    def test_apply_liveness_closes_unknown_and_revives_a_live_one(self):
+        run_id = "muse:%s:ws2-x" % SID
+        store = Store(
+            {
+                run_id: {
+                    "run_id": run_id,
+                    "status": "unknown",
+                    "started_at": 50,
+                    "pid": 3,
+                    "session_id": SID,
+                }
+            }
+        )
+        dead = {"run_id": run_id, "label": "ws2-x", "pid": 3, "session_id": SID}
+        process.apply_liveness(store, dead, "muse", [])
+        self.assertEqual(dead["status"], "done")
+        self.assertEqual(dead["ended_at"], 50)
+        self.assertIsNone(dead["pid"])
+        live = {"run_id": run_id, "label": "ws2-x", "pid": None, "session_id": SID}
+        process.apply_liveness(store, live, "muse", [muse_row()])
+        self.assertEqual(live["status"], "running")
+        self.assertEqual(live["pid"], 28553)
 
     def test_reconcile_retires_live_shadow_onto_labeled_run(self):
         label = "ws2-x"

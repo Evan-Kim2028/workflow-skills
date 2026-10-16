@@ -369,10 +369,11 @@ class Store:
         return [dict(row) for row in rows]
 
     def unknown_tool_runs(self) -> list:
-        """Muse rows still marked unknown, so reconcile can adopt a live process."""
+        """Open muse rows still marked unknown, so reconcile can adopt or close them."""
         with self._lock:
             rows = self._conn.execute(
-                "SELECT * FROM runs WHERE status='unknown' AND source='muse'"
+                """SELECT * FROM runs
+                   WHERE status='unknown' AND source='muse' AND ended_at IS NULL"""
             ).fetchall()
         return [dict(row) for row in rows]
 
@@ -384,6 +385,71 @@ class Store:
                 (session_id,),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def reassign_run(self, src_id: str, dst_id: str) -> bool:
+        """Move usage from ``src_id`` onto ``dst_id``, fill empty fields, delete ``src_id``."""
+        if not src_id or not dst_id or src_id == dst_id:
+            return False
+        with self._lock:
+            src = self._one("SELECT * FROM runs WHERE run_id=?", (src_id,))
+            dst = self._one("SELECT * FROM runs WHERE run_id=?", (dst_id,))
+            if not src or not dst:
+                return False
+            merged = dict(dst)
+            for key in (
+                "model",
+                "started_at",
+                "clock_source",
+                "verdict",
+                "out_bytes",
+                "err_bytes",
+                "out_path",
+                "pid",
+            ):
+                if merged.get(key) in (None, "") and src.get(key) not in (None, ""):
+                    merged[key] = src[key]
+            workstream, confidence = attribute(
+                merged.get("label"),
+                merged.get("session_id"),
+                parent_session_id=merged.get("parent_session_id"),
+            )
+            merged["workstream"] = workstream
+            merged["ws_confidence"] = confidence
+            hours = self._hours_for_run(src_id) | self._hours_for_run(dst_id)
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                self._conn.execute(
+                    "UPDATE usage_events SET run_id=? WHERE run_id=?",
+                    (dst_id, src_id),
+                )
+                self._conn.execute(
+                    "UPDATE process_samples SET run_id=? WHERE run_id=?",
+                    (dst_id, src_id),
+                )
+                self._write_run(merged)
+                self._conn.execute("DELETE FROM runs WHERE run_id=?", (src_id,))
+                for hour in hours:
+                    self._rebuild_hour(hour)
+                self._conn.execute("COMMIT")
+            except Exception:
+                self._conn.execute("ROLLBACK")
+                raise
+            self._seq += 1
+            self._data_seq += 1
+        return True
+
+    def repair_muse_orphans(self) -> int:
+        """Move orphan muse usage onto the labeled run and delete the orphan."""
+        with self._lock:
+            rows = [
+                dict(row)
+                for row in self._conn.execute("SELECT * FROM runs WHERE source='muse'").fetchall()
+            ]
+        moved = 0
+        for src_id, dst_id in muse_orphan_pairs(rows):
+            if self.reassign_run(src_id, dst_id):
+                moved += 1
+        return moved
 
     def last_activity(self, run_id: str, started_at=None):
         with self._lock:
@@ -1138,6 +1204,53 @@ def _is_counted_agent(run: dict) -> bool:
     if source in ("claude-main", "shell", ""):
         return False
     return _tool_key(run) in TOOL_KEYS
+
+
+def muse_orphan_pairs(runs: list) -> list:
+    """Return ``(orphan_run_id, labeled_run_id)`` for muse sessions that have both.
+
+    An orphan is an unlabeled ``muse:<sid>:<sid>`` row. The labeled side is the
+    latest sibling that has a label.
+    """
+    groups: dict = {}
+    for row in runs:
+        source = row.get("source")
+        if source not in (None, "muse"):
+            rid = row.get("run_id")
+            if not (isinstance(rid, str) and rid.startswith("muse:")):
+                continue
+        sid = row.get("session_id")
+        if not isinstance(sid, str) or not sid:
+            continue
+        groups.setdefault(sid.lower(), []).append(row)
+    pairs = []
+    for group in groups.values():
+        labeled = [row for row in group if row.get("label")]
+        orphans = [row for row in group if _muse_orphan(row)]
+        if not labeled or not orphans:
+            continue
+        labeled.sort(key=lambda row: row.get("started_at") or 0, reverse=True)
+        dst = labeled[0].get("run_id")
+        if not dst:
+            continue
+        for src in orphans:
+            src_id = src.get("run_id")
+            if src_id and src_id != dst:
+                pairs.append((src_id, dst))
+    return pairs
+
+
+def _muse_orphan(row: dict) -> bool:
+    if row.get("label"):
+        return False
+    sid = row.get("session_id")
+    rid = row.get("run_id")
+    if not isinstance(sid, str) or not isinstance(rid, str):
+        return False
+    parts = rid.split(":")
+    if len(parts) != 3 or parts[0] != "muse":
+        return False
+    return parts[1].lower() == sid.lower() and parts[2].lower() == sid.lower()
 
 
 def _parent_map(runs: list) -> dict:
