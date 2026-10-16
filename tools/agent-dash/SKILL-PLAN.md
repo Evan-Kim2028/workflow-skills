@@ -60,4 +60,4 @@ python3 agent_dash.py ws approvals WS4
 
 `approvals.json` is optional. `ws validate` checks it when the file is there: `ws`, `decided_at`, `decided_by`, and `items` of `id`, `step`, `status` (`pending`, `approved`, `denied`), `reversible` (true or false), and `conditions`. The naming rule applies to that file too.
 
-The plan view lists the rows under Approvals, after the header and before Why, grouped Needs you, Approved, and Denied. Execution shows a Needs you card at the top of Overall and of each workstream tab. A pending row links to that Approvals section. When nothing is pending, the card is one line, for example `WS2: 5 approved, 0 pending`.
+The dashboard does not display approvals (owner decision). The lead reads them with `ws approvals <ID>` before any production step.
