@@ -7,7 +7,6 @@
   var sources = [];
   var cache = {};
   var showGen = 0;
-  var SERIES = {opus: "--s1", haiku: "--s2", sonnet: "--s3", grok: "--s4", muse: "--s5", glm: "--s6", fable: "--s7", other: "--other"};
 
   function el(tag, attrs, kids) {
     var node = document.createElement(tag);
@@ -34,11 +33,9 @@
     return AD.fmtDur(seconds);
   }
   function tierKey(run) {
-    var text = ((run && (run.tier || run.model)) || "").toLowerCase();
-    var key;
-    for (key in SERIES) if (text.indexOf(key) >= 0) return key;
-    return "other";
+    return ADM.info(run || {}).key;
   }
+
   function taskOf(run, ws) {
     var label = run.label || "";
     var table = (taskmapGet() || {})[ws] || {};
@@ -191,7 +188,7 @@
         if (runs.length) {
           groupLive += runs.length;
           var badge = el("span", {class: "ag", text: String(runs.length)});
-          badge.style.background = "var(" + SERIES[tierKey(runs[0])] + ")";
+          badge.style.background = ADM.colorOf(tierKey(runs[0]));
           chip.appendChild(badge);
         }
         chips.appendChild(chip);

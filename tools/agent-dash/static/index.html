@@ -39,6 +39,11 @@ button,select{font:inherit;color:var(--ink);background:var(--surface);border:1px
 .tile .x{font:12px var(--mono);color:var(--muted);margin-top:4px}
 .legend{display:flex;flex-wrap:wrap;gap:4px 14px;font-size:12px;color:var(--ink-2);margin:0 0 8px}
 .legend span{display:inline-flex;align-items:center;gap:6px}
+.mlegend{gap:6px 18px}
+.mlegend .mfam{display:inline-flex;align-items:center;gap:4px 10px;flex-wrap:wrap;padding:2px 8px 2px 0;border-right:1px solid var(--grid)}
+.mlegend .mfam:last-child{border-right:0}
+.mlegend .mfam b{font-weight:700;color:var(--ink);margin-right:2px}
+.tier .mfam-n{color:var(--muted);font-size:11px;margin-left:2px}
 .sw{width:10px;height:10px;border-radius:2px;display:inline-block}
 svg{display:block;overflow:visible}
 .ax text,.ax{fill:var(--muted);font:11px var(--font)}
@@ -293,6 +298,7 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
 <div class="tip" id="tip"></div>
 <aside class="drawer" id="drawer" aria-label="Run details"></aside>
 <script src="/static/format.js"></script>
+<script src="/static/models.js"></script>
 <script src="/static/vendor/mermaid.min.js"></script>
 <script src="/static/plan.js"></script>
 <script>
@@ -303,19 +309,31 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
   var execCache = {};
   var execGen = 0;
   var state = {view: "exec", ws: "all", hours: 12, snap: null, runs: [], usage: [], conc: [], wss: [], bundles: [], plan: null, seq: -1, groupBy: "model", approvals: []};
-  var SERIES = {opus: "--s1", haiku: "--s2", sonnet: "--s3", grok: "--s4", muse: "--s5", glm: "--s6", fable: "--s7", other: "--other"};
-  var MODELS = [["opus", "Opus"], ["fable", "Fable"], ["sonnet", "Sonnet"], ["haiku", "Haiku"], ["grok", "Grok 4.7"], ["muse", "muse"], ["glm", "GLM"], ["other", "Other"]];
-  function modelName(k) { for (var i = 0; i < MODELS.length; i++) if (MODELS[i][0] === k) return MODELS[i][1]; return k; }
+  /* Models: family = hue, model = shade of it (static/models.js). Keys look like grok-4.7, composer-2.5, glm-5.3-flash, haiku. */
+  function modelName(k) { return ADM.nameOf(k); }
+  function fullName(k) { var f = ADM.FAM[ADM.famOf(k)].name, n = ADM.nameOf(k); return n.indexOf(f + " ") === 0 ? n : f + " \u00B7 " + n; }
   var WSCOL = ["--s1", "--s2", "--s3", "--s4", "--s5", "--s6", "--s7"];
   var wsColor = {};
   function wsNum(w) { var m = /(\d+)/.exec(w.ws || ""); return m ? +m[1] : 999; }
   function shown(list) { return list.filter(function (w) { return w.plan; }).sort(function (x, y) { return wsNum(x) - wsNum(y); }); }
   function cssv(n) { return getComputedStyle(document.documentElement).getPropertyValue(n).trim(); }
-  function tierKey(r) { var t = (r.tier || r.model || "").toLowerCase(); for (var k in SERIES) if (t.indexOf(k) >= 0) return k; return "other"; }
-  function modelKey(m) { m = (m || "").toLowerCase(); for (var k in SERIES) if (m.indexOf(k) >= 0) return k; return "other"; }
+  function tierKey(r) { return ADM.info(r).key; }
+  function modelKey(m) { return ADM.keyOf(m)[1]; }
+  /* Legend grouped by family: "Cursor ■ Grok 4.7 ■ Composer 2.5". */
+  function modelLegend(keys, counts) {
+    var lg = el("div", {class: "legend mlegend"}), byF = {};
+    ADM.sortKeys(keys).forEach(function (k) { var f = ADM.famOf(k); (byF[f] = byF[f] || []).push(k); });
+    ADM.FAMS.forEach(function (f) {
+      if (!byF[f]) return;
+      var grp = el("span", {class: "mfam"}, [el("b", {text: ADM.FAM[f].name})]);
+      byF[f].forEach(function (k) { var sp = el("span"); var sw = el("i", {class: "sw"}); sw.style.background = ADM.colorOf(k); sp.appendChild(sw); sp.appendChild(document.createTextNode(ADM.nameOf(k) + (counts && counts[k] != null ? " " + counts[k] : ""))); grp.appendChild(sp); });
+      lg.appendChild(grp);
+    });
+    return lg;
+  }
   function colorOf(key, kind) {
     if (kind === "workstream") { if (!key || key === "null") return "var(--other)"; if (!wsColor[key]) wsColor[key] = WSCOL[Object.keys(wsColor).length % WSCOL.length]; return "var(" + wsColor[key] + ")"; }
-    return "var(" + (SERIES[key] || "--other") + ")";
+    return ADM.colorOf(key);
   }
   /* axes() and the compact formatters live in format.js and are shared with the plan view. */
   var fmtDate = AD.fmtDate, fmtN = AD.fmtN, fmtUsd = AD.fmtUsd, fmtDur = AD.fmtDur, fmtT = AD.fmtT, axes = AD.axes, timeTicks = AD.timeTicks;
@@ -488,16 +506,30 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
   function tiles(snap) {
     var run = snap.running || [], byTier = {};
     run.forEach(function (r) { var k = tierKey(r); byTier[k] = (byTier[k] || 0) + 1; });
-    var tk = snap.totals ? snap.totals.tokens : {};
-    var allTok = (tk.input || 0) + (tk.output || 0) + (tk.cache_read || 0) + (tk.cache_write || 0);
+    /* Tokens and cost come from the hourly usage buckets for this range, the same numbers as the tokens chart. */
+    var tk = {input: 0, output: 0, cache_read: 0, cache_write: 0}, cost = 0, unpriced = {}, anyCost = false, t0 = since();
+    (state.usage || []).forEach(function (b) {
+      if (b.t + 3600 <= t0) return;
+      ["input", "output", "cache_read", "cache_write"].forEach(function (f) { tk[f] += b[f] || 0; });
+      var used = (b.input || 0) + (b.output || 0) + (b.cache_read || 0) + (b.cache_write || 0);
+      var priced = b.priced_cost_usd != null ? b.priced_cost_usd : b.cost_usd;
+      if (priced != null) { cost += priced; anyCost = true; }
+      var gapTok = b.unpriced_tokens != null ? b.unpriced_tokens : (b.cost_usd == null ? used : 0);
+      if (gapTok) unpriced[b.key || "unattributed"] = (unpriced[b.key || "unattributed"] || 0) + gapTok;
+    });
+    var allTok = tokTotal(tk), unp = Object.keys(unpriced), unpTok = unp.reduce(function (a, k) { return a + unpriced[k]; }, 0);
+    var unpTxt = !unp.length ? "every model priced" : fmtN(unpTok) + " tokens unpriced" + (state.ws === "all" && state.groupBy !== "model" ? "" : " (" + ADM.sortKeys(unp).map(fullName).join(", ") + ")");
     var g = el("div", {class: "grid g-tiles", id: "exec-tiles", "data-nav": "Summary"});
     var cn = snap.counts || {}, lbt = cn.live_by_tool || {}, fv = cn.finished_by_verdict || {};
-    var liveSub = Object.keys(lbt).filter(function (k) { return lbt[k]; }).map(function (k) { return modelName(k === "claude" ? "opus" : k).replace("Opus", "Claude") + " " + fmtN(lbt[k]); }).join(" \u00B7 ") || "idle";
+    var lbm = cn.live_by_model || {}, byFam = {};
+    if (!Object.keys(lbm).length) run.forEach(function (r) { var k = tierKey(r); lbm[k] = (lbm[k] || 0) + 1; });
+    ADM.sortKeys(Object.keys(lbm).filter(function (k) { return lbm[k]; })).forEach(function (k) { var f = ADM.famOf(k); (byFam[f] = byFam[f] || []).push(k); });
+    var liveSub = ADM.FAMS.filter(function (f) { return byFam[f]; }).map(function (f) { var ks = byFam[f], n = ks.reduce(function (a, k) { return a + lbm[k]; }, 0); return ADM.FAM[f].name + " " + fmtN(n) + " (" + ks.map(function (k) { return ADM.nameOf(k) + " " + fmtN(lbm[k]); }).join(", ") + ")"; }).join(" \u00B7 ") || "idle";
     var bad = (fv.BLOCKED || 0) + (fv.REQUEST_CHANGES || 0), part = (fv.PARTIAL || 0) + (fv.APPROVE_WITH_CHANGES || 0);
     [["Agents live now", fmtN(cn.live_agents != null ? cn.live_agents : run.length), liveSub],
      ["Agents finished today", fmtN(cn.finished_today || 0), "\u2713 " + fmtN((fv.PASS || 0) + (fv.APPROVE || 0) + (fv.APPROVE_WITH_NITS || 0)) + " pass \u00B7 \u25D0 " + fmtN(part) + " partial \u00B7 \u2715 " + fmtN(bad) + " blocked (" + state.hours + " h)"],
-     ["Tokens", fmtN(allTok), cachedPct(tk) + "% cached \u00B7 out " + fmtN(tk.output)],
-     ["Est. cost (priced models)", fmtUsd(snap.totals && snap.totals.cost_usd), fmtN(snap.totals && snap.totals.unpriced_runs || 0) + " runs unpriced"],
+     ["Tokens (" + state.hours + " h)", fmtN(allTok), cachedPct(tk) + "% cached \u00B7 out " + fmtN(tk.output)],
+     ["Est. cost (" + state.hours + " h)", anyCost ? fmtUsd(cost) : "\u2013", unpTxt],
      ["Alerts", (snap.alerts || []).length, (snap.alerts || []).slice(0, 2).map(function (a) { return a.kind.replace("_", " "); }).join(" · ") || "none"]
     ].forEach(function (t) { g.appendChild(el("div", {class: "card tile"}, [el("div", {class: "v", text: String(t[1])}), el("div", {class: "l", text: t[0]}), el("div", {class: "x", text: t[2]})])); });
     return g;
@@ -515,7 +547,7 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
     runs.forEach(function (r) {
       var k = tierKey(r);
       var tr = el("tr", {class: "clk", onclick: function () { openRun(r); }});
-      var tier = el("span", {class: "tier"}); var sw = el("i", {class: "sw"}); sw.style.background = colorOf(k); tier.appendChild(sw); tier.appendChild(document.createTextNode(r.tier || k));
+      var tier = el("span", {class: "tier", title: r.model || ""}); var sw = el("i", {class: "sw"}); sw.style.background = colorOf(k); tier.appendChild(sw); tier.appendChild(el("span", {class: "mfam-n", text: ADM.FAM[ADM.famOf(k)].name})); tier.appendChild(document.createTextNode(" " + modelName(k)));
       tr.appendChild(el("td", null, [tier]));
       tr.appendChild(el("td", null, [el("span", {class: "lbl", text: r.label || r.run_id})]));
       tr.appendChild(el("td", null, [el("span", {class: "ws", text: r.workstream || "–"})]));
@@ -525,7 +557,7 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
       tr.appendChild(el("td", null, [statusEl(r), r.verdict ? el("span", {class: "vd", text: r.verdict}) : null]));
       tb.appendChild(tr);
     });
-    var t = el("table", null, [el("thead", null, [el("tr", null, ["Tool", "Label", "WS", "Elapsed", "Output", "Tokens", "Status"].map(function (h, i) { return el("th", {style: i >= 3 && i <= 5 ? "text-align:right" : ""}, [h]); }))]), tb]);
+    var t = el("table", null, [el("thead", null, [el("tr", null, ["Model", "Label", "WS", "Elapsed", "Output", "Tokens", "Status"].map(function (h, i) { return el("th", {style: i >= 3 && i <= 5 ? "text-align:right" : ""}, [h]); }))]), tb]);
     c.appendChild(el("div", {style: "overflow-x:auto"}, [t]));
     return c;
   }
@@ -549,13 +581,13 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
     c.appendChild(el("p", {class: "sub", text: "Input, output and cache tokens summed per hour, stacked by " + state.groupBy + ". Hover a bar for the split."}));
     var B = state.usage;
     if (!B.length) { c.appendChild(el("div", {class: "empty", text: "No usage in this window."})); return c; }
-    var keysOrder = state.groupBy === "model" ? ["opus", "fable", "sonnet", "haiku", "grok", "muse", "glm", "other"] : null;
+    var byModel = state.groupBy === "model";
     var hours = {}, keys = {};
     B.forEach(function (b) { var k = state.groupBy === "model" ? modelKey(b.key) : (b.key || "unattributed"); var tot = (b.input || 0) + (b.output || 0) + (b.cache_read || 0) + (b.cache_write || 0); hours[b.t] = hours[b.t] || {}; hours[b.t][k] = (hours[b.t][k] || 0) + tot; keys[k] = 1; });
-    var ks = keysOrder ? keysOrder.filter(function (k) { return keys[k]; }) : Object.keys(keys).sort();
+    var ks = byModel ? ADM.sortKeys(Object.keys(keys)) : Object.keys(keys).sort();
     var ts = Object.keys(hours).map(Number).sort(function (a, b) { return a - b; });
     var max = 0; ts.forEach(function (t) { var sum = 0; ks.forEach(function (k) { sum += hours[t][k] || 0; }); max = Math.max(max, sum); });
-    var lg = el("div", {class: "legend"}); ks.forEach(function (k) { var sp = el("span"); var sw = el("i", {class: "sw"}); sw.style.background = colorOf(k, state.groupBy); sp.appendChild(sw); sp.appendChild(document.createTextNode(state.groupBy === "model" ? modelName(k) : k)); lg.appendChild(sp); }); c.appendChild(lg);
+    var lg; if (byModel) lg = modelLegend(ks); else { lg = el("div", {class: "legend"}); ks.forEach(function (k) { var sp = el("span"); var sw = el("i", {class: "sw"}); sw.style.background = colorOf(k, state.groupBy); sp.appendChild(sw); sp.appendChild(document.createTextNode(k)); lg.appendChild(sp); }); } c.appendChild(lg);
     var W = CW(), H = 270, L = 64, R = 14, T = 28, Bm = 42, pw = W - L - R, ph = H - T - Bm, h0 = Math.floor(since() / 3600) * 3600, nH = Math.max(1, Math.ceil((Date.now() / 1000 - h0) / 3600)), slot = pw / nH, bw = Math.max(3, Math.min(28, slot - 4));
     var svg = s("svg", {viewBox: "0 0 " + W + " " + H, width: W, height: H, style: "display:block;max-width:100%", role: "img", "aria-label": "Tokens per hour stacked by " + state.groupBy});
     var nice = niceMax(max), xt = [];
@@ -563,7 +595,7 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
       var x = L + Math.max(0, Math.floor((t - h0) / 3600)) * slot + (slot - bw) / 2, y0 = T + ph;
       ks.forEach(function (k, ki) { var v = hours[t][k] || 0; if (!v) return; var h = ph * v / nice; var top = y0 - h; var r = s("rect", {x: x, y: top + (ki ? 1 : 0), width: bw, height: Math.max(0, h - (ki ? 1 : 0)), rx: 2, fill: colorOf(k, state.groupBy)}); svg.appendChild(r); y0 = top; });
       var hit = s("rect", {x: x - 1, y: T, width: bw + 2, height: ph, fill: "transparent"});
-      hit.addEventListener("mousemove", function (ev) { showTip(ev, new Date(t * 1000).toLocaleString([], {month: "short", day: "numeric", hour: "2-digit", minute: "2-digit"}), ks.filter(function (k) { return hours[t][k]; }).map(function (k) { return {k: state.groupBy === "model" ? modelName(k) : k, v: fmtN(hours[t][k]), c: colorOf(k, state.groupBy)}; })); });
+      hit.addEventListener("mousemove", function (ev) { showTip(ev, new Date(t * 1000).toLocaleString([], {month: "short", day: "numeric", hour: "2-digit", minute: "2-digit"}), ks.filter(function (k) { return hours[t][k]; }).map(function (k) { return {k: byModel ? fullName(k) : k, v: fmtN(hours[t][k]), c: colorOf(k, state.groupBy)}; })); });
       hit.addEventListener("mouseleave", hideTip); svg.appendChild(hit);
       
     });
@@ -605,29 +637,41 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
   }
   function niceMax(v) { if (v <= 0) return 1; var p = Math.pow(10, Math.floor(Math.log10(v))); var m = v / p; return (m <= 1 ? 1 : m <= 2 ? 2 : m <= 5 ? 5 : 10) * p; }
 
-  /* live agents over time: one strip per tool */
+  /* live agents over time: one strip per model family, its models stacked as shades of the family hue */
   function concChart(snap) {
-    var c = el("div", {class: "card", id: "exec-live", "data-nav": "Live agents over time"}, [el("h2", {text: "Live agents over time"}), el("p", {class: "sub", text: "Agents running at each moment, one strip per tool on its own scale (0 to that tool's peak), for this view's scope."})]);
+    var c = el("div", {class: "card", id: "exec-live", "data-nav": "Live agents over time"}, [el("h2", {text: "Live agents over time"}), el("p", {class: "sub", text: "Agents running at each moment, one strip per model family on its own scale (0 to that family's peak), for this view's scope. Shades inside a strip are the family's models, stacked. Hover for the split."})]);
     var P = state.conc; if (!P.length) { c.appendChild(el("div", {class: "empty", text: "No samples yet."})); return c; }
-    var tools = [["grok", "Grok 4.7"], ["muse", "muse"], ["glm", "GLM"], ["claude", "Claude"]];
     var t1 = Date.now() / 1000, t0 = t1 - state.hours * 3600; P = P.filter(function (p) { return p.t >= t0 - 60; }); if (!P.length) { c.appendChild(el("div", {class: "empty", text: "No samples in this window."})); return c; }
-    tools.forEach(function (tl) {
-      var mx = 1; P.forEach(function (p) { mx = Math.max(mx, p[tl[0]] || 0); }); mx = Math.max(2, Math.ceil(mx / 2) * 2);
-      var last = tl === tools[tools.length - 1], W = CW(), H = last ? 104 : 66, L = 120, R = 14, T = 10, Bm = last ? 42 : 8, pw = W - L - R, ph = H - T - Bm;
-      var svg = s("svg", {viewBox: "0 0 " + W + " " + H, width: W, height: H, style: "display:block;max-width:100%", role: "img", "aria-label": tl[1] + " live runs over time"});
-      var nm = s("text", {x: 0, y: T + ph / 2 + 4, class: "ax"}); nm.textContent = tl[1]; nm.setAttribute("style", "fill:var(--ink-2);font:600 12px var(--font)"); svg.appendChild(nm);
+    var TOOLFAM = {grok: "cursor", muse: "muse", glm: "glm", claude: "claude"};
+    function mods(p) { if (p.models) return p.models; var o = {}; Object.keys(TOOLFAM).forEach(function (t) { if (p[t]) o[TOOLFAM[t] + "-unknown"] = p[t]; }); return o; }
+    var seen = {}; P.forEach(function (p) { var m = mods(p); for (var k in m) if (m[k]) seen[k] = 1; });
+    var all = ADM.sortKeys(Object.keys(seen));
+    if (all.length) c.appendChild(modelLegend(all));
+    var fams = ["cursor", "muse", "glm", "claude"];
+    function famKeys(f) { return all.filter(function (k) { return ADM.famOf(k) === f; }); }
+    function tipRows(p) { var m = mods(p), rows = []; fams.forEach(function (f) { var ks = famKeys(f), tot = ks.reduce(function (a, k) { return a + (m[k] || 0); }, 0); rows.push({k: ADM.FAM[f].name, v: String(tot), c: ADM.famColor(f)}); ks.forEach(function (k) { if (m[k]) rows.push({k: "\u2003" + ADM.nameOf(k), v: String(m[k]), c: ADM.colorOf(k)}); }); }); return rows; }
+    fams.forEach(function (f, fi) {
+      var ks = famKeys(f), last = fi === fams.length - 1;
+      var mx = 1; P.forEach(function (p) { var m = mods(p), sum = 0; ks.forEach(function (k) { sum += m[k] || 0; }); mx = Math.max(mx, sum); }); mx = Math.max(2, Math.ceil(mx / 2) * 2);
+      var W = CW(), H = last ? 104 : 66, L = 120, R = 14, T = 10, Bm = last ? 42 : 8, pw = W - L - R, ph = H - T - Bm;
+      var svg = s("svg", {viewBox: "0 0 " + W + " " + H, width: W, height: H, style: "display:block;max-width:100%", role: "img", "aria-label": ADM.FAM[f].name + " live runs over time, by model"});
+      var nm = s("text", {x: 0, y: T + ph / 2 + 4, class: "ax"}); nm.textContent = ADM.FAM[f].name; nm.setAttribute("style", "fill:var(--ink-2);font:600 12px var(--font)"); svg.appendChild(nm);
+      if (ks.length > 1 || (ks.length === 1 && !/-unknown$/.test(ks[0]))) { var sub = s("text", {x: 0, y: T + ph / 2 + 17, class: "ax"}); sub.textContent = ks.map(function (k) { return ADM.nameOf(k); }).join(", ").slice(0, 22); svg.appendChild(sub); }
       var X = function (t) { return L + pw * (t - t0) / Math.max(1, t1 - t0); }, Y = function (v) { return T + ph - ph * v / mx; };
       var tt6 = timeTicks(t0, t1, X, 6); if (!last) tt6.forEach(function (k) { k.label = ""; });
       axes(svg, {L: L, T: T, pw: pw, ph: ph, yMax: mx, yTicks: 1, xTicks: tt6, xTitle: last ? "time" : null});
-      var d = "M" + X(P[0].t) + "," + Y(0);
-      P.forEach(function (p) { d += " L" + X(p.t) + "," + Y(p[tl[0]] || 0); });
-      d += " L" + X(t1) + "," + Y(0) + " Z";
-      var col = colorOf(tl[0] === "claude" ? "opus" : tl[0]);
-      svg.appendChild(s("path", {d: d, fill: col, "fill-opacity": ".22", stroke: "none"}));
-      var ln = "M" + P.map(function (p) { return X(p.t) + "," + Y(p[tl[0]] || 0); }).join(" L");
-      svg.appendChild(s("path", {d: ln, fill: "none", stroke: col, "stroke-width": 2}));
+      var base = P.map(function () { return 0; });
+      ks.forEach(function (k) {
+        var top = P.map(function (p, i) { return base[i] + (mods(p)[k] || 0); });
+        var d = "M" + P.map(function (p, i) { return X(p.t) + "," + Y(top[i]); }).join(" L");
+        for (var i = P.length - 1; i >= 0; i--) d += " L" + X(P[i].t) + "," + Y(base[i]);
+        svg.appendChild(s("path", {d: d + " Z", fill: ADM.colorOf(k), "fill-opacity": ".75", stroke: "none"}));
+        base = top;
+      });
+      var ln = "M" + P.map(function (p, i) { return X(p.t) + "," + Y(base[i]); }).join(" L");
+      svg.appendChild(s("path", {d: ln, fill: "none", stroke: ADM.famColor(f), "stroke-width": 1.6}));
       var hit = s("rect", {x: L, y: T, width: pw, height: ph, fill: "transparent"});
-      hit.addEventListener("mousemove", function (ev) { var bb = svg.getBoundingClientRect(); var tt = t0 + (t1 - t0) * ((ev.clientX - bb.left) * W / bb.width - L) / pw; var best = P[0]; P.forEach(function (p) { if (Math.abs(p.t - tt) < Math.abs(best.t - tt)) best = p; }); showTip(ev, fmtT(best.t), tools.map(function (q) { return {k: q[1], v: String(best[q[0]] || 0), c: colorOf(q[0] === "claude" ? "opus" : q[0])}; })); });
+      hit.addEventListener("mousemove", function (ev) { var bb = svg.getBoundingClientRect(); var tt = t0 + (t1 - t0) * ((ev.clientX - bb.left) * W / bb.width - L) / pw; var best = P[0]; P.forEach(function (p) { if (Math.abs(p.t - tt) < Math.abs(best.t - tt)) best = p; }); showTip(ev, fmtT(best.t), tipRows(best)); });
       hit.addEventListener("mouseleave", hideTip); svg.appendChild(hit);
       c.appendChild(svg);
     });
@@ -636,17 +680,21 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
 
   /* timeline: one activity strip per workstream, expandable into packed lanes */
   var expanded = {};
+  /* A run with no end time is drawn to now only while it is running; an ended run whose end was never seen gets a one-minute stub. */
+  /* Interactive lead sessions (claude-main) and shell rows show as bars but are not counted as agents, the same rule as the live counts. */
+  function isAgent(r) { return r.source !== "claude-main" && r.source !== "shell"; }
+  function runEnd(r, now) { return r.ended_at || (r.status === "running" ? now : (r.started_at || now) + 60); }
   function packRows(runs, gapS) {
     var rows = [];
     runs.slice().sort(function (x, y) { return x.started_at - y.started_at; }).forEach(function (r) {
-      var end = r.ended_at || Date.now() / 1000, placed = false;
+      var end = runEnd(r, Date.now() / 1000), placed = false;
       for (var i = 0; i < rows.length; i++) { if (rows[i].end + gapS <= r.started_at) { rows[i].runs.push(r); rows[i].end = end; placed = true; break; } }
       if (!placed) rows.push({end: end, runs: [r]});
     });
     return rows;
   }
   function outcomeOf(r) {
-    if (!r.ended_at) return "run";
+    if (!r.ended_at) return r.status === "running" ? "run" : "unk";
     if (r.status === "died_early" || r.status === "killed" || r.verdict === "BLOCKED" || r.verdict === "REQUEST_CHANGES") return "bad";
     if (r.verdict === "PARTIAL" || r.verdict === "APPROVE_WITH_CHANGES") return "part";
     if (r.status === "done") return "ok";
@@ -655,9 +703,9 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
   var OUTCOME = {run: ["var(--s1)", "\u25CF", "running"], ok: ["var(--good)", "\u2713", "finished"], part: ["var(--warning)", "\u25D0", "partial"], bad: ["var(--critical)", "\u2715", "died or blocked"], unk: ["var(--muted)", "?", "ended, outcome unknown"]};
   function outcomeColor(r) { var o = outcomeOf(r); return o === "run" || o === "unk" ? null : OUTCOME[o][0]; }
   function gantt() {
-    var c = el("div", {class: "card", id: "exec-timeline", "data-nav": "Run timeline"}, [el("h2", {text: "Run timeline"}), el("p", {class: "sub", text: "One lane per workstream; the strip is how many agents ran at each moment. Click a lane to open it: one row per model, each bar a run, coloured by how it ended. Hover a bar for the run, click it for details."})]);
+    var c = el("div", {class: "card", id: "exec-timeline", "data-nav": "Run timeline"}, [el("h2", {text: "Run timeline"}), el("p", {class: "sub", text: "One lane per workstream; the strip is how many worker agents ran at each moment (lead sessions are not counted). Click a lane to open it: one row per model, each bar a run, coloured by how it ended. Hover a bar for the run, click it for details."})]);
     var now = Date.now() / 1000, t0 = now - state.hours * 3600;
-    var R = state.runs.filter(function (r) { return r.started_at && (r.ended_at || now) >= t0; });
+    var R = state.runs.filter(function (r) { return r.started_at && runEnd(r, now) >= t0; });
     if (!R.length) { c.appendChild(el("div", {class: "empty", text: "No runs in this window."})); return c; }
     var lg = el("div", {class: "legend"}); ["run", "ok", "part", "bad"].forEach(function (k) { var o = OUTCOME[k], sp = el("span"); var sw = el("i", {class: "sw"}); sw.style.background = o[0]; sp.appendChild(sw); sp.appendChild(document.createTextNode(o[1] + " " + o[2])); lg.appendChild(sp); });
     c.appendChild(lg);
@@ -670,7 +718,7 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
     order.forEach(function (g) {
       var subs = [], hh = 0;
       if (expanded[g]) { var byM = {}; groups[g].forEach(function (r) { var k = tierKey(r); (byM[k] = byM[k] || []).push(r); });
-        MODELS.forEach(function (m) { if (!byM[m[0]]) return; var rows = packRows(byM[m[0]], 20); var h = Math.max(rows.length * (rowH + rowGap), 14) + 6; subs.push({k: m[0], name: m[1], runs: byM[m[0]], rows: rows, dy: hh, h: h}); hh += h; }); }
+        ADM.sortKeys(Object.keys(byM)).forEach(function (k) { var rows = packRows(byM[k], 20); var h = Math.max(rows.length * (rowH + rowGap), 14) + 6; subs.push({k: k, name: fullName(k), runs: byM[k], rows: rows, dy: hh, h: h}); hh += h; }); }
       blocks.push({g: g, runs: groups[g], subs: subs, y: H}); H += stripH + 24 + (subs.length ? hh + 10 : 0); });
     var plotB = H; H += 34;
     var svg = s("svg", {viewBox: "0 0 " + W + " " + H, width: W, height: H, style: "display:block;max-width:100%", role: "img", "aria-label": "Run activity per workstream over time"});
@@ -684,7 +732,7 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
       hitL.addEventListener("click", function () { expanded[bk.g] = !expanded[bk.g]; drawMain(); });
       svg.appendChild(lab); svg.appendChild(cnt); svg.appendChild(hitL);
       var pts = [], mx = 1;
-      for (var t = t0; t <= now; t += step) { var n = 0; bk.runs.forEach(function (r) { if (r.started_at <= t && (r.ended_at || now) >= t) n++; }); pts.push([t, n]); mx = Math.max(mx, n); }
+      for (var t = t0; t <= now; t += step) { var n = 0; bk.runs.forEach(function (r) { if (isAgent(r) && r.started_at <= t && runEnd(r, now) >= t) n++; }); pts.push([t, n]); mx = Math.max(mx, n); }
       var Y = function (v) { return y0 + stripH - (stripH - 4) * v / mx; };
       svg.appendChild(s("rect", {x: L, y: y0, width: pw, height: stripH, rx: 4, fill: "var(--surface-2)"}));
       var d = "M" + X(pts[0][0]) + "," + (y0 + stripH); pts.forEach(function (p) { d += " L" + X(p[0]) + "," + Y(p[1]); }); d += " L" + X(now) + "," + (y0 + stripH) + " Z";
@@ -696,11 +744,11 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
         var m = bad ? s("text", {x: X(r.ended_at), y: y0 + stripH + 14, "text-anchor": "middle"}) : s("circle", {cx: X(r.ended_at), cy: y0 + stripH + 10, r: 2.6, fill: oc});
         if (bad) { m.textContent = "✕"; m.setAttribute("style", "fill:var(--critical);font:700 10px var(--font)"); }
         m.style.cursor = "pointer"; m.addEventListener("click", function () { openRun(r); });
-        m.addEventListener("mousemove", function (ev) { showTip(ev, r.label || r.run_id, [{k: "outcome", v: r.verdict || r.status}, {k: "model", v: r.model || modelName(tierKey(r))}, {k: "ended", v: fmtT(r.ended_at)}]); }); m.addEventListener("mouseleave", hideTip);
+        m.addEventListener("mousemove", function (ev) { showTip(ev, r.label || r.run_id, [{k: "outcome", v: r.verdict || r.status}, {k: "model", v: fullName(tierKey(r))}, {k: "ended", v: fmtT(r.ended_at)}]); }); m.addEventListener("mouseleave", hideTip);
         svg.appendChild(m);
       });
       var hit = s("rect", {x: L, y: y0, width: pw, height: stripH, fill: "transparent"});
-      hit.addEventListener("mousemove", function (ev) { var bb = svg.getBoundingClientRect(); var tt = t0 + (now - t0) * ((ev.clientX - bb.left) * W / bb.width - L) / pw; var act = bk.runs.filter(function (r) { return r.started_at <= tt && (r.ended_at || now) >= tt; }); var byT = {}; act.forEach(function (r) { var k = tierKey(r); byT[k] = (byT[k] || 0) + 1; }); showTip(ev, bk.g + " at " + fmtT(tt), [{k: "running", v: String(act.length)}].concat(Object.keys(byT).map(function (k) { return {k: modelName(k), v: String(byT[k])}; }))); });
+      hit.addEventListener("mousemove", function (ev) { var bb = svg.getBoundingClientRect(); var tt = t0 + (now - t0) * ((ev.clientX - bb.left) * W / bb.width - L) / pw; var act = bk.runs.filter(function (r) { return isAgent(r) && r.started_at <= tt && runEnd(r, now) >= tt; }); var byT = {}; act.forEach(function (r) { var k = tierKey(r); byT[k] = (byT[k] || 0) + 1; }); showTip(ev, bk.g + " at " + fmtT(tt), [{k: "running", v: String(act.length)}].concat(ADM.sortKeys(Object.keys(byT)).map(function (k) { return {k: fullName(k), v: String(byT[k]), c: colorOf(k)}; }))); });
       hit.addEventListener("mouseleave", hideTip); hit.addEventListener("click", function () { expanded[bk.g] = !expanded[bk.g]; drawMain(); }); hit.style.cursor = "pointer";
       svg.appendChild(hit);
       var base = y0 + stripH + 26;
@@ -711,11 +759,11 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
         var ry = sy;
         sb.rows.forEach(function (row) {
           row.runs.forEach(function (r) {
-            var x1 = X(r.started_at), x2 = X(r.ended_at || now), o = OUTCOME[outcomeOf(r)];
+            var x1 = X(r.started_at), x2 = X(runEnd(r, now)), o = OUTCOME[outcomeOf(r)];
             var bar = s("rect", {x: x1, y: ry, width: Math.max(2.5, x2 - x1 - 1), height: rowH, rx: 2, fill: r.clock_source === "mtime" ? "url(#hatch)" : o[0], stroke: r.clock_source === "mtime" ? o[0] : "none"});
-            if (!r.ended_at) { bar.setAttribute("stroke", "var(--ink)"); bar.setAttribute("stroke-width", "1"); }
+            if (r.status === "running") { bar.setAttribute("stroke", "var(--ink)"); bar.setAttribute("stroke-width", "1"); }
             bar.style.cursor = "pointer";
-            bar.addEventListener("mousemove", function (ev) { showTip(ev, r.label || r.run_id, [{k: "model", v: r.model || sb.name}, {k: "outcome", v: o[1] + " " + (r.verdict || o[2]), c: o[0]}, {k: "elapsed", v: fmtDur((r.ended_at || now) - r.started_at)}, {k: "workstream", v: r.workstream || "unattributed"}]); });
+            bar.addEventListener("mousemove", function (ev) { showTip(ev, r.label || r.run_id, [{k: "model", v: sb.name}, {k: "outcome", v: o[1] + " " + (r.verdict || o[2]), c: o[0]}, {k: "elapsed", v: r.ended_at || r.status === "running" ? fmtDur((r.ended_at || now) - r.started_at) : "end not recorded"}, {k: "workstream", v: r.workstream || "unattributed"}]); });
             bar.addEventListener("mouseleave", hideTip); bar.addEventListener("click", function () { openRun(r); });
             svg.appendChild(bar);
           });
@@ -850,7 +898,7 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
       var wn = el("div", {class: "working-now"}, [el("b", {text: "\u25CF Working now (" + nLive + ")"})]);
       workingIds.forEach(function (tid) { live[tid].forEach(function (r) {
         var slug = String(r.label || "").replace(new RegExp("^" + plan.ws.toLowerCase() + "[-._]?", "i"), "").replace(tid, "").replace(/^[-._]+/, "");
-        var pill = el("button", {class: "wn-pill", title: (r.label || "") + " \u00B7 " + modelName(tierKey(r)) + " \u00B7 " + fmtDur(r.elapsed_s)}, [el("i"), el("span", {class: "wn-id", text: tid}), el("span", {class: "wn-slug", text: slug}), el("span", {class: "wn-tok", text: tokTotal(r.tokens) ? fmtN(tokTotal(r.tokens)) + " \u00B7 " + cachedPct(r.tokens) + "% cached" : (r.context_tokens ? "~" + fmtN(r.context_tokens) + " \u00B7 live" : "")})]);
+        var pill = el("button", {class: "wn-pill", title: (r.label || "") + " \u00B7 " + fullName(tierKey(r)) + " \u00B7 " + fmtDur(r.elapsed_s)}, [el("i"), el("span", {class: "wn-id", text: tid}), el("span", {class: "wn-slug", text: slug}), el("span", {class: "wn-tok", text: tokTotal(r.tokens) ? fmtN(tokTotal(r.tokens)) + " \u00B7 " + cachedPct(r.tokens) + "% cached" : (r.context_tokens ? "~" + fmtN(r.context_tokens) + " \u00B7 live" : "")})]);
         pill.firstChild.style.background = colorOf(tierKey(r));
         pill.addEventListener("click", function () { openRun(r); });
         wn.appendChild(pill);
@@ -960,7 +1008,7 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
       nodes[gid].addEventListener("mouseleave", function () { if (!pinned) { groupClear(); clearTask(); } });
     });
     /* Task focus: lines from the chips a task waits on (amber) and to the chips it unblocks (blue), across tiles. */
-    var pinned = null, tsvg = s("svg", {class: "tedges"}); dag.appendChild(tsvg);
+    var pinned = null, tsvg = s("svg", {class: "tedges", "data-diagram": "task-deps"}); dag.appendChild(tsvg);
     dag.addEventListener("click", function (ev) { if (pinned && !(ev.target.closest && ev.target.closest(".chip"))) { pinned = null; clearTask(); groupClear(); } });
     function clearTask() {
       dag.classList.remove("tfocus");
@@ -1001,7 +1049,7 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
     drawer.appendChild(el("p", {style: "margin:6px 0 14px"}, [statusEl(r), r.verdict ? el("span", {class: "vd", style: "margin-left:8px", text: r.verdict}) : null]));
     var tk = r.tokens || {};
     var kv = el("dl", {class: "kv"});
-    [["Model", r.model || modelName(tierKey(r))], ["Launched by", r.source], ["Workstream", (r.workstream || "–") + (r.ws_confidence ? " (" + r.ws_confidence + ")" : "")], ["Session", r.session_id], ["Parent", r.parent_session_id], ["Started", r.started_at ? fmtDate(r.started_at) : "–"], ["Ended", r.ended_at ? fmtDate(r.ended_at) : "running"], ["Elapsed", fmtDur(r.elapsed_s)], ["Clock", r.clock_source], ["Output", fmtN(r.out_bytes) + "B" + (r.out_growing ? " (growing)" : "")], ["Errors", fmtN(r.err_bytes) + "B"], ["PID", r.pid || "–"], ["Memory", r.rss_kb ? fmtN(r.rss_kb * 1024) + "B" : "–"], ["Tokens", fmtN(tokTotal(tk)) + " (" + cachedPct(tk) + "% cached)"], ["Input / output", fmtN(tk.input) + " / " + fmtN(tk.output)], ["Cache read / write", fmtN(tk.cache_read) + " / " + fmtN(tk.cache_write)], ["Est. cost", fmtUsd(r.cost_usd)]].forEach(function (p) { kv.appendChild(el("dt", {text: p[0]})); kv.appendChild(el("dd", {text: p[1] == null ? "–" : String(p[1])})); });
+    [["Model", fullName(tierKey(r)) + (r.model ? " (" + r.model + ")" : "")], ["Launched by", r.source], ["Workstream", (r.workstream || "–") + (r.ws_confidence ? " (" + r.ws_confidence + ")" : "")], ["Session", r.session_id], ["Parent", r.parent_session_id], ["Started", r.started_at ? fmtDate(r.started_at) : "–"], ["Ended", r.ended_at ? fmtDate(r.ended_at) : "running"], ["Elapsed", fmtDur(r.elapsed_s)], ["Clock", r.clock_source], ["Output", fmtN(r.out_bytes) + "B" + (r.out_growing ? " (growing)" : "")], ["Errors", fmtN(r.err_bytes) + "B"], ["PID", r.pid || "–"], ["Memory", r.rss_kb ? fmtN(r.rss_kb * 1024) + "B" : "–"], ["Tokens", fmtN(tokTotal(tk)) + " (" + cachedPct(tk) + "% cached)"], ["Input / output", fmtN(tk.input) + " / " + fmtN(tk.output)], ["Cache read / write", fmtN(tk.cache_read) + " / " + fmtN(tk.cache_write)], ["Est. cost", fmtUsd(r.cost_usd)]].forEach(function (p) { kv.appendChild(el("dt", {text: p[0]})); kv.appendChild(el("dd", {text: p[1] == null ? "–" : String(p[1])})); });
     drawer.appendChild(kv);
     drawer.classList.add("open");
   }
@@ -1059,7 +1107,7 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
     var specs = [];
     if (state.ws === "all" && state.wss.length) specs.push(["program", keyOf([state.wss.map(function (w) { return [w.ws, w.running, w.name]; }), planSum, planPrompt]), function () { return programPanel(); }, ""]);
     specs.push(
-      ["tiles", keyOf([snap.counts, snap.totals, (snap.alerts || []).length]), function () { return tiles(snap); }, state.ws === "all" ? "margin-top:14px" : ""],
+      ["tiles", keyOf([snap.counts, snap.totals, (snap.alerts || []).length, state.usage, state.hours]), function () { return tiles(snap); }, state.ws === "all" ? "margin-top:14px" : ""],
       ["running", keyOf((snap.running || []).map(runRow)), function () { return runsTable("Running now", "Click a row for details. Output \u25B2 means the out file grew since the last poll.", snap.running || [], "Nothing running."); }, "margin-top:14px"]
     );
     if (state.ws === "all" && state.wss.length && !Object.keys(planSum).length) loadPlanSums().then(function () { delete secCache.program; drawMain(); });
@@ -1103,7 +1151,7 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
       if (i >= list.length) { warming = false; return; }
       var ws = list[i], wsArg = ws === "all" ? {} : {ws: ws}, group = ws === "all" ? state.groupBy : "model";
       Promise.all([
-        api("/api/snapshot", {ws: ws}).catch(function () { return null; }),
+        api("/api/snapshot", {ws: ws, since: since()}).catch(function () { return null; }),
         api("/api/runs", Object.assign({since: since(), limit: 400}, wsArg)).then(function (j) { return j.runs || []; }).catch(function () { return []; }),
         api("/api/usage", Object.assign({group: group, bucket: "hour", since: since()}, wsArg)).then(function (j) { return j.buckets || []; }).catch(function () { return []; }),
         api("/api/concurrency", Object.assign({since: since(), step: 60}, wsArg)).then(function (j) { return j.points || []; }).catch(function () { return []; }),
@@ -1124,7 +1172,7 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
     var wsArg = ws === "all" ? {} : {ws: ws};
     var group = ws === "all" ? state.groupBy : "model";
     var jobs = [
-      api("/api/snapshot", {ws: ws}).catch(function () { return null; }),
+      api("/api/snapshot", {ws: ws, since: since()}).catch(function () { return null; }),
       api("/api/runs", Object.assign({since: since(), limit: 400}, wsArg)).then(function (j) { return j.runs || []; }).catch(function () { return []; }),
       api("/api/usage", Object.assign({group: group, bucket: "hour", since: since()}, wsArg)).then(function (j) { return j.buckets || []; }).catch(function () { return []; }),
       api("/api/concurrency", Object.assign({since: since(), step: 60}, wsArg)).then(function (j) { return j.points || []; }).catch(function () { return []; }),
@@ -1166,7 +1214,7 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
   }
   function refreshSnapshot() {
     var ws = state.ws;
-    api("/api/snapshot", {ws: ws}).then(function (j) {
+    api("/api/snapshot", {ws: ws, since: since()}).then(function (j) {
       if (state.ws !== ws) return;
       state.snap = j; state.seq = j.seq;
       if (execCache[ws]) execCache[ws].snap = j;

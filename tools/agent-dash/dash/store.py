@@ -12,6 +12,7 @@ from datetime import datetime
 from dash.attribution import attribute, clean_label
 from dash.pricing import cost as price_cost
 from dash.pricing import series_key
+from dash.models import model_key, run_model_key
 
 TOOL_KEYS = ("grok", "muse", "glm", "claude")
 FINISHED = ("done", "killed", "died_early")
@@ -557,7 +558,7 @@ class Store:
             rss = self._rss_maps(now)
             runs = [self._run_view(row, now, usage, rss, context) for row in raw]
             visible = [run for run in runs if _in_ws(run, ws)]
-            shown = [run for run in visible if run["run_id"] not in parents]
+            shown = _drop_launch_echoes([run for run in visible if run["run_id"] not in parents])
             running = [run for run in shown if run["status"] == "running"]
             running.sort(key=lambda run: run["started_at"] or 0, reverse=True)
             recent = [
@@ -604,7 +605,7 @@ class Store:
                 if until is not None and (view["started_at"] or 0) > until:
                     continue
                 rows.append(view)
-        rows = _collapse_workflows(rows, now)
+        rows = _collapse_workflows(_drop_launch_echoes(rows), now)
         rows.sort(key=lambda run: run["started_at"] or 0)
         return rows[:limit]
 
@@ -624,6 +625,8 @@ class Store:
             if ws and ws != "all" and (row["workstream"] or None) != ws:
                 continue
             if group == "model":
+                key = model_key(row["model"], row["tool"])[1]
+            elif group == "family":
                 key = series_key(row["model"])
             elif group == "workstream":
                 key = row["workstream"] or None
@@ -642,6 +645,7 @@ class Store:
                     "cost_usd": 0.0,
                     "priced": False,
                     "gap": False,
+                    "unpriced_tokens": 0,
                 },
             )
             cell["input"] += row["input_tokens"] or 0
@@ -651,6 +655,7 @@ class Store:
             present = any(row[name] for name in ("input_tokens", "output_tokens", "cache_read", "cache_write"))
             if row["missing"] or (row["cost_usd"] is None and present):
                 cell["gap"] = True
+                cell["unpriced_tokens"] += sum(row[name] or 0 for name in ("input_tokens", "output_tokens", "cache_read", "cache_write"))
             elif row["cost_usd"] is not None:
                 cell["cost_usd"] += row["cost_usd"]
                 cell["priced"] = True
@@ -666,6 +671,8 @@ class Store:
                     "cache_read": cell["cache_read"],
                     "cache_write": cell["cache_write"],
                     "cost_usd": cost,
+                    "priced_cost_usd": _money(cell["cost_usd"]) if cell["priced"] else None,
+                    "unpriced_tokens": cell["unpriced_tokens"],
                 }
             )
         out.sort(key=lambda item: (item["t"], item["key"] or ""))
@@ -679,7 +686,7 @@ class Store:
         with self._lock:
             runs = [dict(row) for row in self._all_runs()]
         parents = _parent_map(runs)
-        runs = [run for run in runs if run["run_id"] not in parents and _is_counted_agent(run)]
+        runs = _drop_launch_echoes([run for run in runs if run["run_id"] not in parents and _is_counted_agent(run)])
         if ws and ws != "all":
             runs = [run for run in runs if run["workstream"] == ws]
         points = []
@@ -688,11 +695,13 @@ class Store:
             t = since + index * step
             if t > now + 1e-6:
                 break
-            point = {"t": t, "grok": 0, "muse": 0, "glm": 0, "claude": 0}
+            point = {"t": t, "grok": 0, "muse": 0, "glm": 0, "claude": 0, "models": {}}
             for run in runs:
                 key = _tool_key(run)
                 if key and _active(run, t, now):
                     point[key] += 1
+                    model = run_model_key(run)
+                    point["models"][model] = point["models"].get(model, 0) + 1
             points.append(point)
         return points
 
@@ -1477,6 +1486,7 @@ def _agent_counts(runs: list, parents: dict, now: float, since, until) -> dict:
     range_until = float(now if until is None else until)
     today = _local_midnight(now)
     live_by = {key: 0 for key in TOOL_KEYS}
+    live_by_model: dict = {}
     seen = set()
     live_n = 0
     finished_today = 0
@@ -1492,6 +1502,8 @@ def _agent_counts(runs: list, parents: dict, now: float, since, until) -> dict:
                 continue
             seen.add(key)
             live_by[tool] += 1
+            model = run_model_key(run)
+            live_by_model[model] = live_by_model.get(model, 0) + 1
             live_n += 1
             continue
         if run.get("status") not in FINISHED or run.get("ended_at") is None:
@@ -1506,10 +1518,70 @@ def _agent_counts(runs: list, parents: dict, now: float, since, until) -> dict:
     return {
         "live_agents": live_n,
         "live_by_tool": live_by,
+        "live_by_model": live_by_model,
         "finished_today": finished_today,
         "finished_in_range": finished_range,
         "finished_by_verdict": by_verdict,
     }
+
+
+def _drop_launch_echoes(rows: list) -> list:
+    """Merge launch-manifest rows into the run they record.
+
+    A launcher writes a manifest row for every worker it starts, and the
+    worker's own transcript (Cursor chat, muse session) makes a second row for
+    the same run. A manifest row whose label matches a non-manifest run that
+    started within ten minutes is that same run: it is dropped, and its verdict
+    and output size fill any gap in the twin. A manifest row with no twin stays.
+    """
+    by_label: dict = {}
+    for row in rows:
+        by_label.setdefault(row.get("label"), []).append(row)
+    out = []
+    for row in rows:
+        start = row.get("started_at")
+        twin = None
+        if row.get("clock_source") == "manifest" and start is not None and row.get("label"):
+            for other in by_label.get(row.get("label"), []):
+                if (
+                    other is not row
+                    and other.get("clock_source") != "manifest"
+                    and other.get("source") not in ("shell", None)
+                    and other.get("started_at") is not None
+                    and abs(other["started_at"] - start) <= 600
+                ):
+                    twin = other
+                    break
+        if twin is None:
+            out.append(row)
+            continue
+        for key in ("verdict", "out_bytes", "workstream"):
+            if not twin.get(key) and row.get(key):
+                twin[key] = row[key]
+    return _one_run_per_process(out)
+
+
+def _one_run_per_process(rows: list) -> list:
+    """Keep one running row per (label, pid).
+
+    Two chats started in the same second can both be matched to one label, so
+    one live process shows twice. The row with a model id and the most output
+    is the real one.
+    """
+    best: dict = {}
+    for row in rows:
+        if row.get("status") != "running" or not row.get("pid"):
+            continue
+        key = (row.get("label"), row.get("pid"))
+        rank = (bool(row.get("model")), row.get("out_bytes") or 0)
+        if key not in best or rank > best[key][0]:
+            best[key] = (rank, id(row))
+    keep = {value[1] for value in best.values()}
+    return [
+        row
+        for row in rows
+        if row.get("status") != "running" or not row.get("pid") or id(row) in keep
+    ]
 
 
 def _active(run: dict, t: float, now: float) -> bool:

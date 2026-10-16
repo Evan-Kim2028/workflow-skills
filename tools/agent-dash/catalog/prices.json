@@ -188,6 +188,23 @@
    "confidence": "inferred"
   },
   {
+   "provider": "cursor",
+   "model": "composer-2.5",
+   "input": 0.5,
+   "output": 2.5,
+   "cache_read": 0.2,
+   "cache_write_5m": null,
+   "cache_write_1h": null,
+   "reasoning": null,
+   "long_context": null,
+   "input_includes_cache_read": false,
+   "billing_mode": "plan-included",
+   "price_scope": "Cursor row Composer 2.5, not Fast. Cache write is not listed.",
+   "source_url": "https://cursor.com/docs/models-and-pricing",
+   "retrieved_at": "2026-10-16",
+   "confidence": "published"
+  },
+  {
    "provider": "meta",
    "model": "muse-wonder-full-1.0",
    "input": null,
