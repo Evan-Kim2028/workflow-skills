@@ -135,7 +135,7 @@ Test-only variables. Smoke tests stay skipped unless `AGENT_DASH_SMOKE` is `1`. 
 | `AGENT_DASH_SMOKE_MANIFEST`, `AGENT_DASH_SMOKE_CURSOR_HOME` | Cursor home smoke. |
 | `AGENT_DASH_HUB_DIR` | Also a product variable. The hub smoke uses it when smoke is on. |
 
-Tier selection is the `defaultTier`, `reviewTier`, and lane `tier` fields on a wave. See [Concepts](concepts.md). No environment variable names a worker registry.
+Tier selection is `defaultTier`, `reviewTier`, `fixTier`, and the same fields on a lane, plus optional `model`, `reviewModel`, and `fixModel`. See [Concepts](concepts.md). `AGENT_DASH_WORKERS` names a registry file. `workers.local.json` replaces the example when that variable is unset.
 
 ## Commands
 
@@ -178,4 +178,4 @@ The new source should appear under `sources` with `last_error` set to null.
 
 ## Worker registry
 
-Workers come from a registry: [`../tools/agent-dash/workers.example.json`](../tools/agent-dash/workers.example.json), replaced on one machine by a gitignored `workers.local.json` (or `AGENT_DASH_WORKERS`). Each worker has a kind (muse, cursor-agent, or Grok Build CLI), a model, a concurrency cap and quota patterns. `scripts/run_worker.sh` and the `ws-wave` workflow take `default` (the registry's default worker), a worker name, or `auto`. `auto` starts the first worker in `auto_order` that is under its cap and not cooling down after a quota error, and relaunches a lane on the next one when it hits a limit.
+Workers come from a registry: [`../tools/agent-dash/workers.example.json`](../tools/agent-dash/workers.example.json), replaced on one machine by a gitignored `workers.local.json` (or `AGENT_DASH_WORKERS`). Shipped tiers are muse, cursor-agent Grok, cursor-agent Composer, and GLM via grok-build. Each worker has a kind, a model, a concurrency cap, and quota patterns. `scripts/run_worker.sh` and `ws-wave` take `default`, a worker name, or `auto`, and `ws-wave` can set tier and model per lane and per role. `auto` starts the first worker in `auto_order` that is under its cap and not cooling down after a quota error, and relaunches a lane on the next one when it hits a limit.

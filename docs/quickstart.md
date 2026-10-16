@@ -154,11 +154,11 @@ The page loads this file on refresh. No restart. The file is gitignored.
 
 ## 6. Run a first wave
 
-`ws-wave` is a Claude Code Workflow script, not a shell command. Each lane is built, then reviewed, then fixed until the review approves it or the fix rounds run out. Every step is a low-effort Haiku wrapper around `run_worker.sh`. The heavy work stays on muse or Grok.
+`ws-wave` is a Claude Code Workflow script, not a shell command. Each lane is built, then reviewed, then fixed until the review approves it or the fix rounds run out. Every step is a Claude wrapper around `run_worker.sh`. `wrapperModel` defaults to `haiku` and `wrapperEffort` defaults to `low`. The worker is a registry tier: muse, cursor-agent Grok, cursor-agent Composer, or GLM via grok-build.
 
-`defaultTier` and `reviewTier` both default to `muse`. A lane may set `tier` to `muse` or `grok`. `run_worker.sh` rejects any other tier and prints `reason=unknown-tier`.
+`defaultTier` defaults to `default`, which is muse in the shipped registry. A lane sets `tier`, `reviewTier`, and `fixTier` to a worker name, `default`, or `auto`. `model`, `reviewModel`, and `fixModel` override that worker's model for one role. `deps` and `base` order lanes inside the run. The mixed example, Grok build plus Composer review plus a stacked lane, is in `tools/agent-dash/docs/workstream-lead.md`.
 
-The lead skill names a `workers.local.json` registry, with a default tier, named tiers, and an `auto` tier that would fail over by availability. This repository does not ship that file, and no code reads one. Set the tier on the wave arguments.
+Workers come from `tools/agent-dash/workers.example.json`. A gitignored `workers.local.json`, or `AGENT_DASH_WORKERS`, replaces it on one machine. `auto` fails over to the next worker in `auto_order` when one is at its cap or cooling down after a quota error.
 
 Print the absolute tool paths:
 
@@ -218,7 +218,7 @@ To run the same worker once, without the Workflow tool, write a prompt file whos
 bash ~/.claude/tools/agent-dash/scripts/run_worker.sh muse ws4-WS4.1-notes-index /absolute/path/to/wt-notes-index /absolute/path/to/prompt.md "$HOME/agent-scratch/notes" 540
 ```
 
-The arguments are tier, label, workspace, prompt file, run directory, and max wait seconds. The default wait is 540. The command prints one line starting with `STATUS: running`, `STATUS: done`, or `STATUS: failed`. A second call while the pid file is live only waits. muse must be on `PATH` for tier `muse`. Tier `grok` calls `launch_grok.sh`, which needs `cursor-agent`.
+The arguments are tier, label, workspace, prompt file, run directory, max wait seconds, and an optional model override. The default wait is 540. The command prints one line starting with `STATUS: running`, `STATUS: done`, or `STATUS: failed`, including `tier=` and `model=`. A second call for that label only waits and repeats the stored tier and model. muse must be on `PATH` for tier `muse`. Tiers `grok` and `composer` call `launch_grok.sh`, which needs `cursor-agent`. Tiers `glm` and `glm-flash` need the `grok` CLI.
 
 ## 7. Watch it
 

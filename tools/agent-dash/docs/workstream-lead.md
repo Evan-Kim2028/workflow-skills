@@ -1,6 +1,6 @@
 # Running a workstream end to end
 
-A workstream is planned once and then executed in waves. muse is the default worker. Grok is the other tier the launcher accepts. One Claude lead session decides, merges, and runs production steps. The dashboard shows the work live.
+A workstream is planned once and then executed in waves. `ws-wave` runs any registry harness: muse, cursor-agent Grok, cursor-agent Composer, and GLM via grok-build. One Claude lead session decides, merges, and runs production steps. The dashboard shows the work live.
 
 The install path and the first wave are in the repository [quickstart](../../../docs/quickstart.md). Labels, tokens, and the task map are in [concepts](../../../docs/concepts.md).
 
@@ -73,12 +73,19 @@ args: {
   "template": "/absolute/path/to/worker-rules.md",
   "runner": "/absolute/path/to/run_worker.sh",
   "dash": "/absolute/path/to/agent_dash.py",
-  "maxFixRounds": 2, "defaultTier": "default", "reviewTier": "default",
-  "lanes": [ { "task": "WS4.1", "slug": "notes-index", "branch": "ws4/notes-index",
-               "worktree": "/absolute/path/to/wt-notes-index",
-               "brief": "Add a notes index. Write only in this worktree.",
-               "tests": "the explicit test command for the files this lane changes",
-               "review": true } ]
+  "maxFixRounds": 2, "defaultTier": "default", "wrapperModel": "haiku",
+  "lanes": [
+    { "task": "WS4.1", "slug": "notes-index", "tier": "grok",
+      "reviewTier": "composer", "reviewModel": "composer-2.5",
+      "branch": "ws4/notes-index", "worktree": "/absolute/path/to/wt-notes-index",
+      "brief": "Add a notes index. Write only in this worktree.",
+      "tests": "pytest tests/test_notes.py", "review": true },
+    { "task": "WS4.2", "slug": "notes-search", "deps": ["WS4.1"], "base": "dep:WS4.1",
+      "tier": "grok", "branch": "ws4/notes-search",
+      "worktree": "/absolute/path/to/wt-notes-search",
+      "brief": "Add search on the notes-index branch.",
+      "tests": "pytest tests/test_search.py", "review": true }
+  ]
 }
 ```
 
@@ -86,14 +93,15 @@ args: {
 
 What the workflow does:
 
-- All lanes run in parallel.
+- Independent lanes start at once. A lane with `deps` starts when every named task in this run finished `APPROVE*` or `built`. Any other dependency result skips that lane with final `skipped-dep` and names the dependency. `base: "dep:<task>"` cuts the worktree from that task's branch. Unknown task ids and cycles throw before any lane starts. The build setup marks the task `wip` before it creates the worktree.
 - Each lane goes build, then review, then fix and re-review until approved, or until it runs out of fix rounds.
-- Every step is a low-effort Haiku wrapper around `scripts/run_worker.sh`. The runner launches muse with model `muse-spark-1.3-contributor` and reasoning effort `xhigh`, or a Grok worker, then waits and logs the run.
+- Build tier is `lane.tier`, else `defaultTier`, else `default`. Review tier is `lane.reviewTier`, else `reviewTier`, else the build tier. Fix tier is `lane.fixTier`, else `fixTier`, else the build tier. `model`, `reviewModel`, and `fixModel` override the registry model for that role. The example above builds WS4.1 with Grok, reviews it with Composer, and stacks WS4.2 on WS4.1's branch.
+- Every step is a Claude wrapper around `scripts/run_worker.sh`. `wrapperModel` defaults to `haiku` and `wrapperEffort` defaults to `low`. The runner launches the registry worker and waits. The lane's `runs` list repeats the tier and model from each STATUS line.
 - On approval it runs `ws task WS4 WS4.1 pr`.
-- It returns `approved` branches, `needsLead` lanes with the last review, and `built` lanes.
+- It returns `approved` branches, `needsLead` lanes with the last review, `built` lanes, and `skipped` lanes.
 - It does not push, open a pull request, merge, or take a production step.
 
-Run labels are `ws4-WS4.1-notes-index`, then `-rev1` and `-fix1`. With a task-map entry for that label, the dashboard pins each attempt on the task chip, and `↻N` counts the attempts. `defaultTier` and `reviewTier` default to `muse`. `run_worker.sh` accepts `muse` or `grok`. The lead skill's `workers.local.json` registry is not loaded by this repository.
+Run labels are `ws4-WS4.1-notes-index`, then `-rev1` and `-fix1`. With a task-map entry for that label, the dashboard pins each attempt on the task chip, and `↻N` counts the attempts. `run_worker.sh` accepts `default`, `auto`, or any worker name in the registry.
 
 ## 5. The lead's loop
 
@@ -116,7 +124,7 @@ A workflow cannot receive messages from other sessions or wait out multi-day win
 
 ## Choosing workers
 
-Workers come from a registry: [`../workers.example.json`](../workers.example.json), replaced on one machine by a gitignored `workers.local.json` (or `AGENT_DASH_WORKERS`). Each worker has a kind (muse, cursor-agent, or Grok Build CLI), a model, a concurrency cap and quota patterns. `scripts/run_worker.sh` and the `ws-wave` workflow take `default` (the registry's default worker), a worker name, or `auto`. `auto` starts the first worker in `auto_order` that is under its cap and not cooling down after a quota error, and relaunches a lane on the next one when it hits a limit.
+Workers come from a registry: [`../workers.example.json`](../workers.example.json), replaced on one machine by a gitignored `workers.local.json` (or `AGENT_DASH_WORKERS`). Shipped tiers: `muse`, `grok` (cursor-agent, model `grok-4.7[context=500k,reasoning_effort=xhigh,fast=false]`), `composer` (cursor-agent, model `composer-2.5`), `glm` and `glm-flash` (grok-build). Each has a concurrency cap and quota patterns. A cursor cap counts only processes for that model. `auto` starts the first worker in `auto_order` that is under its cap and not cooling down after a quota error, and relaunches a lane on the next one when it hits a limit. `composer` is after `grok` in that list.
 
 ## Merging fast: trains and local CI
 

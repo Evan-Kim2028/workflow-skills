@@ -1,6 +1,6 @@
 ---
 name: workstream-lead
-description: Run a planned workstream end to end as its lead session. Read the bundle's kickoff brief, run each wave with the ws-wave workflow so cheap workers (muse, Grok, GLM) do the work, move task status so the dashboard tracks it, act only on approved production steps, coordinate with other leads, and hand off cleanly. Use when a session is told "you are the WS<n> lead", is given a START-PROMPT, or picks up a workstream mid-flight.
+description: Run a planned workstream end to end as its lead session. Read the bundle's kickoff brief, run each wave with the ws-wave workflow so registry workers (muse, cursor-agent Grok and Composer, GLM via grok-build) do the work, move task status so the dashboard tracks it, act only on approved production steps, coordinate with other leads, and hand off cleanly. Use when a session is told "you are the WS<n> lead", is given a START-PROMPT, or picks up a workstream mid-flight.
 ---
 
 # Workstream lead
@@ -21,10 +21,22 @@ The lead plans, decides, verifies and reports. Workers do everything else. Relat
 ## Each wave
 
 1. Build the lane list from the execution plan. Lanes in one wave share no file or test file. Use `reviewFocus` for lanes that need explicit checks, and `oneWay: true` for irreversible or production-adjacent lanes.
-2. Run the `ws-wave` workflow. Use the Workflow tool with `scriptPath: <abs>/agent-dash/workflows/ws-wave.js`; the args are in the brief. Tiers come from the worker registry: `default` (muse), a named tier, or `auto` for failover by availability.
+2. Run the `ws-wave` workflow. Use the Workflow tool with `scriptPath: <abs>/agent-dash/workflows/ws-wave.js`. The wrapper is `wrapperModel` (default `haiku`) and `wrapperEffort` (default `low`). Each lane can set `tier`, `reviewTier`, `fixTier`, `model`, `reviewModel`, and `fixModel`. Tiers are registry names: `default` (muse), `grok`, `composer`, `glm`, `glm-flash`, or `auto`. `deps` lists task ids in this run, the same name as in `plan.json`. The lane starts when each of those finished `APPROVE*` or `built`. Otherwise the result is `skipped-dep` and names the dependency. `base: "dep:<task>"` cuts the worktree from that task's branch. Independent lanes start together. Unknown ids and cycles throw.
+
+   One wave can mix a Grok build, a Composer review, and a stacked follow-on:
+
+   ```json
+   [
+     {"task": "WS4.1", "slug": "notes-index", "tier": "grok", "reviewTier": "composer", "reviewModel": "composer-2.5", "branch": "ws4/notes-index", "worktree": "/abs/wt-notes-index", "brief": "Add a notes index.", "tests": "pytest tests/test_notes.py", "review": true},
+     {"task": "WS4.2", "slug": "notes-search", "deps": ["WS4.1"], "base": "dep:WS4.1", "tier": "grok", "branch": "ws4/notes-search", "worktree": "/abs/wt-notes-search", "brief": "Add search on the notes-index branch.", "tests": "pytest tests/test_search.py", "review": true}
+   ]
+   ```
+
+   Read `runs` on each lane for the tier and model the runner actually used.
 3. Read the result:
    - `approved`: assemble trains and merge with the repo's merge tool.
    - `needsLead`: read the last review and decide. Fix, re-scope, or defer with `ws task <ID> <task> deferred --note ...`.
+   - `skipped`: a dependency ended short of `APPROVE*` or `built`. The row names that dependency.
 4. Move status with `python3 ~/.claude/tools/agent-dash/agent_dash.py ws task <ID> <task> <todo|pr|prog|done|deferred>`, as soon as each fact changes. The dashboard and the Plan page read it live.
 5. Start the next wave as soon as its start condition holds. Don't wait on lower wave numbers. A task is ready when every id in its `deps` is done or merged.
 6. When you re-plan (split, merge, move or add a task, or change a wave), update the task `deps` and `wave` in `plan.json` in the same step, then run `ws validate`.
