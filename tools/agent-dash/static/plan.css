@@ -621,3 +621,12 @@
 @media (prefers-reduced-motion: reduce) {
   .plan-view .plan-progress .pp-chip.live { animation:none; }
 }
+
+.pp-sum{display:grid;gap:8px;max-width:760px}
+.pp-bar{display:flex;height:10px;border-radius:5px;overflow:hidden;background:var(--grid, var(--line))}
+.pp-bar span{display:block;height:100%;transition:width .6s cubic-bezier(.2,.8,.2,1)}
+.pp-bar span+span{margin-left:2px}
+.pp-nums{font:12.5px var(--mono, ui-monospace, monospace);color:var(--muted, var(--fg3))}
+.pp-go{justify-self:start;font:600 13px inherit;padding:6px 12px;border-radius:999px;border:1px solid var(--s1, var(--accent));color:var(--s1, var(--accent));background:transparent;cursor:pointer}
+.pp-go:hover,.pp-go:focus-visible{background:color-mix(in srgb,var(--s1, var(--accent)) 12%,transparent)}
+@media (prefers-reduced-motion: reduce){.pp-bar span{transition:none}}

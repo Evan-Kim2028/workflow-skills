@@ -210,7 +210,7 @@ def build(ws: str, data: dict, fragments: dict, layout: dict) -> str:
         "Progress",
         f"Where {ws} is",
         progress_block(ws),
-        lead="The map reads the live plan. Green is done, magenta is waiting on a prod step, amber is an open PR, dashed is not started, and dotted is deferred.",
+        lead="A summary of the live plan. The full task map, with agents working on it now, is on the Execution view.",
     )
     body += sec(
         f"{prefix}-decided",
