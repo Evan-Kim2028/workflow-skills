@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""agent-dash CLI: run, stop, status, backfill."""
+"""agent-dash CLI: run, stop, status, backfill, reprice, reconcile, ws."""
 
 from __future__ import annotations
 
@@ -13,10 +13,13 @@ import threading
 import time
 from pathlib import Path
 
+from dash.bundles import cmd_ws
 from dash.locate import expand
+from dash.pricing import reprice as reprice_usage
 from dash.server import DashServer
 from dash.sources import Registry
-from dash.store import DEFAULT_CAPS, DEFAULT_LONG_RUNNING_S, Store
+from dash.sources.process import reconcile_running
+from dash.store import DEFAULT_LONG_RUNNING_S, Store
 
 ROOT = Path(__file__).resolve().parent
 STATE_DIR = Path.home() / ".local" / "share" / "agent-dash"
@@ -33,6 +36,13 @@ USAGE = """agent-dash: local read-only execution dashboard
   python3 agent_dash.py stop
   python3 agent_dash.py status
   python3 agent_dash.py backfill --session <id>
+  python3 agent_dash.py reprice
+  python3 agent_dash.py reconcile
+  python3 agent_dash.py ws list
+  python3 agent_dash.py ws new <ID> "<title>"
+  python3 agent_dash.py ws validate <ID>
+  python3 agent_dash.py ws render <ID>
+  python3 agent_dash.py ws task <ID> <task-id> <status> [--moved-to WSn] [--note "..."]
 """
 
 
@@ -46,7 +56,6 @@ def default_cfg() -> dict:
         "read_budget_per_file": per_file,
         "read_budget_per_tick": per_tick,
         "read_budget": {"per_file": per_file, "per_tick": per_tick},
-        "caps": dict(DEFAULT_CAPS),
         "long_running_s": dict(DEFAULT_LONG_RUNNING_S),
         "roots": {
             "claude_projects": os.path.join(home, ".claude", "projects"),
@@ -78,6 +87,7 @@ def load_cfg(path: Path | None = None) -> dict:
         _merge_file(cfg, ROOT / "config.local.json")
     _apply_env(cfg)
     _expand_cfg(cfg)
+    cfg.pop("caps", None)
     cfg["host"] = HOST
     cfg["port"] = PORT
     budget = cfg.get("read_budget") if isinstance(cfg.get("read_budget"), dict) else {}
@@ -179,12 +189,18 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_stop()
     if cmd == "status":
         return cmd_status()
+    if cmd == "ws":
+        return cmd_ws(args[1:])
     if cmd == "backfill":
         session = _session_arg(args[1:])
         if not session:
             print("backfill requires --session <id>", file=sys.stderr)
             return 2
         return cmd_backfill(session)
+    if cmd == "reprice":
+        return cmd_reprice()
+    if cmd == "reconcile":
+        return cmd_reconcile()
     print(USAGE, end="", file=sys.stderr)
     return 2
 
@@ -257,6 +273,47 @@ def cmd_backfill(session_id: str) -> int:
     finally:
         store.close()
     print(f"backfill session {session_id} passes {passes}")
+    return 0
+
+
+def cmd_reprice() -> int:
+    cfg = bind_state()
+    store = Store(DBFILE)
+    try:
+        summary = reprice_usage(store, _claude_projects(cfg))
+    finally:
+        store.close()
+    print(json.dumps(summary, indent=2))
+    return 0
+
+
+def _claude_projects(cfg: dict) -> str:
+    roots = cfg.get("roots") if isinstance(cfg.get("roots"), dict) else {}
+    for key in ("claude_projects", "projects"):
+        if roots.get(key):
+            return expand(str(roots[key]))
+        if cfg.get(key):
+            return expand(str(cfg[key]))
+    return str(Path.home() / ".claude" / "projects")
+
+
+def cmd_reconcile() -> int:
+    """Mark grok, muse, and glm rows whose process is gone.
+
+    ``AGENT_DASH_DB`` selects the database. The default is the configured state dir.
+    """
+    bind_state()
+    db = os.environ.get("AGENT_DASH_DB")
+    path = Path(expand(db)) if db else DBFILE
+    if not path.is_file():
+        print(f"no database {path}", file=sys.stderr)
+        return 2
+    store = Store(path)
+    try:
+        ended = reconcile_running(store, time.time())
+    finally:
+        store.close()
+    print(f"reconcile ended {ended}")
     return 0
 
 

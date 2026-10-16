@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Write synthetic API fixtures. Seeded RNG. Does not read the machine."""
 
+import datetime
 import json
 import random
 from pathlib import Path
@@ -340,7 +341,7 @@ def build_runs():
     return runs
 
 
-def _snapshot(runs, now, caps, ws):
+def _snapshot(runs, now, ws):
     chosen = [run for run in runs if ws is None or run["workstream"] == ws]
     running = []
     recent = []
@@ -389,7 +390,7 @@ def _snapshot(runs, now, caps, ws):
     return {
         "now": now,
         "seq": 4,
-        "caps": caps,
+        "counts": _counts(chosen, now),
         "running": running,
         "recent": recent,
         "alerts": alerts,
@@ -498,16 +499,55 @@ def _plans():
     return written
 
 
-def _caps(runs):
-    live = {"grok": 0, "muse": 0, "glm": 0, "claude": 0}
+def _counts(runs, now):
+    tools = ("grok", "muse", "glm", "claude")
+    live_by = {key: 0 for key in tools}
+    seen = set()
+    live_n = 0
+    finished_today = 0
+    finished_range = 0
+    by_verdict = {}
+    moment = datetime.datetime.fromtimestamp(now).astimezone()
+    today = moment.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+    range_since = now - 24 * 3600
     for run in runs:
+        source = run.get("source") or ""
+        if source in ("claude-main", "shell", ""):
+            continue
+        tier = (run.get("tier") or "").lower()
+        if source == "grok" or tier == "grok":
+            tool = "grok"
+        elif source == "muse" or tier == "muse":
+            tool = "muse"
+        elif source == "glm" or tier == "glm":
+            tool = "glm"
+        elif source.startswith("claude") or tier in ("opus", "sonnet", "haiku"):
+            tool = "claude"
+        else:
+            continue
         if run["status"] == "running":
-            live[_family(run["source"])] += 1
+            key = (tool, run.get("label") or run["run_id"])
+            if key in seen:
+                continue
+            seen.add(key)
+            live_by[tool] += 1
+            live_n += 1
+            continue
+        if run["status"] not in ("done", "killed", "died_early") or run.get("ended_at") is None:
+            continue
+        ended = float(run["ended_at"])
+        if today <= ended <= now:
+            finished_today += 1
+        if range_since <= ended <= now:
+            finished_range += 1
+            verdict = run.get("verdict") or "none"
+            by_verdict[verdict] = by_verdict.get(verdict, 0) + 1
     return {
-        "grok": {"live": live["grok"], "cap": 10},
-        "muse": {"live": live["muse"], "cap": 10},
-        "glm": {"live": live["glm"], "cap": 5},
-        "claude": {"live": live["claude"], "cap": None},
+        "live_agents": live_n,
+        "live_by_tool": live_by,
+        "finished_today": finished_today,
+        "finished_in_range": finished_range,
+        "finished_by_verdict": by_verdict,
     }
 
 
@@ -526,16 +566,15 @@ def _check(runs, conc):
 def main():
     runs = build_runs()
     plans = _plans()
-    caps = _caps(runs)
-    snap = _snapshot(runs, NOW, caps, None)
+    snap = _snapshot(runs, NOW, None)
     conc = _concurrency(runs, NOW)
     peak = _check(runs, conc)
     files = {
         "runs.json": {"runs": runs, "_note": NOTE},
         "snapshot.json": snap,
-        "snapshot-WS1.json": _snapshot(runs, NOW, caps, "WS1"),
-        "snapshot-WS2.json": _snapshot(runs, NOW, caps, "WS2"),
-        "snapshot-WS7.json": _snapshot(runs, NOW, caps, "WS7"),
+        "snapshot-WS1.json": _snapshot(runs, NOW, "WS1"),
+        "snapshot-WS2.json": _snapshot(runs, NOW, "WS2"),
+        "snapshot-WS7.json": _snapshot(runs, NOW, "WS7"),
         "usage-model-hour.json": _usage(runs, lambda run: run["tier"]),
         "usage-workstream-hour.json": _usage(runs, lambda run: run["workstream"] or "unattributed"),
         "concurrency.json": conc,

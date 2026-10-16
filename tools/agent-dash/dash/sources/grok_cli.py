@@ -29,6 +29,8 @@ import os
 import zlib
 from datetime import datetime
 
+from dash.sources.process import apply_liveness, live_agent_processes
+
 log = logging.getLogger("agent_dash.grok_cli")
 
 NAME = "grok_cli"
@@ -58,6 +60,7 @@ def _poll(store, cfg, now):
     sessions = _root(cfg, "grok_sessions", "glm_sessions", default=DEFAULT_SESSIONS)
     log_path = _root(cfg, "grok_log", "unified_log", "unified", default=DEFAULT_LOG)
     only = _only_session(cfg)
+    processes = _agent_processes()
 
     manifests = {}
     for scratch in _scratch_roots(cfg):
@@ -71,7 +74,7 @@ def _poll(store, cfg, now):
                 _keep_latest(manifests, row)
 
     for row in manifests.values():
-        _upsert_run(store, row, None, None)
+        _upsert_run(store, row, None, None, processes)
 
     index = _session_index(sessions)
     authoritative = set()
@@ -82,7 +85,7 @@ def _poll(store, cfg, now):
         usage_path = os.path.join(sdir, "usage.json")
         if not os.path.isfile(usage_path):
             continue
-        ok, budget = _apply_usage(store, usage_path, row, budget, per_file, now)
+        ok, budget = _apply_usage(store, usage_path, row, budget, per_file, now, processes)
         if ok:
             authoritative.add(sid)
 
@@ -95,10 +98,10 @@ def _poll(store, cfg, now):
         budget = _supersede(store, log_path, pending, manifests, budget, per_file, now)
 
     if os.path.isfile(log_path) and budget > 0 and manifests:
-        _tail_log(store, log_path, manifests, authoritative, budget, per_file, now)
+        _tail_log(store, log_path, manifests, authoritative, budget, per_file, now, processes)
 
 
-def _apply_usage(store, path, row, budget, per_file, now):
+def _apply_usage(store, path, row, budget, per_file, now, processes):
     """Return ``(authoritative, budget)``. Unchanged files are not re-emitted."""
     try:
         st = os.stat(path)
@@ -146,7 +149,7 @@ def _apply_usage(store, path, row, budget, per_file, now):
                 "reasoning": ev["reasoning"],
             },
         )
-    _upsert_run(store, row, model, None)
+    _upsert_run(store, row, model, None, processes)
     try:
         store.set_offset(key, st.st_ino, mtime_ns, st.st_size, st.st_mtime)
     except Exception:
@@ -230,7 +233,7 @@ def _supersede(store, log_path, pending, manifests, budget, per_file, now):
     return budget
 
 
-def _tail_log(store, log_path, manifests, authoritative, budget, per_file, now):
+def _tail_log(store, log_path, manifests, authoritative, budget, per_file, now, processes):
     try:
         raw, budget, _started = _read_chunk(store, log_path, log_path, budget, per_file)
     except Exception:
@@ -264,7 +267,7 @@ def _tail_log(store, log_path, manifests, authoritative, budget, per_file, now):
         except Exception:
             _fail("seen")
         if ev["pid"]:
-            _upsert_run(store, row, row.get("model") or None, ev["pid"])
+            _upsert_run(store, row, row.get("model") or None, ev["pid"], processes)
     return budget
 
 
@@ -313,7 +316,7 @@ def _add_usage(store, row):
         _fail("usage")
 
 
-def _upsert_run(store, row, model, pid):
+def _upsert_run(store, row, model, pid, processes=None):
     sid = row["session_id"]
     run = {
         "run_id": _run_id(row),
@@ -334,6 +337,7 @@ def _upsert_run(store, row, model, pid):
         run["clock_source"] = "manifest"
     if pid:
         run["pid"] = pid
+    apply_liveness(store, run, "glm", processes)
     try:
         store.upsert_run(run)
     except Exception:
@@ -350,6 +354,14 @@ def _upsert_run(store, row, model, pid):
         store.upsert_session(session)
     except Exception:
         _fail("session")
+
+
+def _agent_processes():
+    """One process listing per poll. None means the listing failed."""
+    try:
+        return live_agent_processes()
+    except Exception:
+        return None
 
 
 def _run_id(row):
@@ -569,11 +581,6 @@ def _scratch_roots(cfg):
     from dash.locate import scratch_roots
 
     return scratch_roots(cfg)
-
-
-def _scratch_root(cfg):
-    found = _scratch_roots(cfg)
-    return found[0] if found else ""
 
 
 def _only_session(cfg):

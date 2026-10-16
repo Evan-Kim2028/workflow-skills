@@ -7,25 +7,22 @@ import sqlite3
 import threading
 from pathlib import Path
 
+from datetime import datetime
+
 from dash.attribution import attribute, clean_label
 from dash.pricing import cost as price_cost
 from dash.pricing import series_key
 
-CAP_KEYS = ("grok", "muse", "glm", "claude")
-DEFAULT_CAPS = {"grok": 10, "muse": 10, "glm": 5, "claude": None}
+TOOL_KEYS = ("grok", "muse", "glm", "claude")
+FINISHED = ("done", "killed", "died_early")
+RANGE_S = 24 * 3600
+_ESTIMATE_TOOL = "grok-context"
 DEFAULT_LONG_RUNNING_S = {
     "haiku": 20 * 60,
     "sonnet": 45 * 60,
     "muse": 45 * 60,
     "grok": 45 * 60,
     "glm": 30 * 60,
-}
-COMM_TO_CAP = {
-    "cursor-agent": "grok",
-    "muse": "muse",
-    "muse-bin": "muse",
-    "grok": "glm",
-    "claude": "claude",
 }
 SAMPLE_FRESH_S = 20
 RECENT_S = 3600
@@ -221,10 +218,21 @@ class Store:
             raise ValueError("tool, session_id, and message_id required")
         tool, session_id, message_id = str(tool), str(session_id), str(message_id)
         values = {key: _opt_int(row, key) for key in TOKEN_FIELDS}
+        write_5m = _opt_int(row, "cache_write_5m")
+        write_1h = _opt_int(row, "cache_write_1h")
         model = row.get("model")
         ts = row.get("ts")
         run_id = row.get("run_id")
-        est = price_cost(model, values["input"], values["output"], values["cache_read"], values["cache_write"])
+        est = None if tool == _ESTIMATE_TOOL else price_cost(
+            model,
+            values["input"],
+            values["output"],
+            values["cache_read"],
+            values["cache_write"],
+            cache_write_5m=write_5m,
+            cache_write_1h=write_1h,
+            reasoning=values["reasoning"],
+        )
         with self._lock:
             previous = self._one(
                 """SELECT ts FROM usage_events
@@ -233,7 +241,7 @@ class Store:
             )
             current = self._one(
                 """SELECT ts, run_id, model, input_tokens, output_tokens, cache_read,
-                          cache_write, reasoning, est_cost_usd
+                          cache_write, cache_write_5m, cache_write_1h, reasoning, est_cost_usd
                    FROM usage_events WHERE tool=? AND session_id=? AND message_id=?""",
                 (tool, session_id, message_id),
             )
@@ -245,6 +253,8 @@ class Store:
                 "output_tokens": values["output"],
                 "cache_read": values["cache_read"],
                 "cache_write": values["cache_write"],
+                "cache_write_5m": write_5m,
+                "cache_write_1h": write_1h,
                 "reasoning": values["reasoning"],
                 "est_cost_usd": est,
             }
@@ -256,12 +266,13 @@ class Store:
                     """INSERT INTO usage_events(
                            tool, session_id, message_id, ts, run_id, model,
                            input_tokens, output_tokens, cache_read, cache_write,
-                           reasoning, est_cost_usd)
-                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+                           cache_write_5m, cache_write_1h, reasoning, est_cost_usd)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                        ON CONFLICT(tool, session_id, message_id) DO UPDATE SET
                          ts=excluded.ts, run_id=excluded.run_id, model=excluded.model,
                          input_tokens=excluded.input_tokens, output_tokens=excluded.output_tokens,
                          cache_read=excluded.cache_read, cache_write=excluded.cache_write,
+                         cache_write_5m=excluded.cache_write_5m, cache_write_1h=excluded.cache_write_1h,
                          reasoning=excluded.reasoning, est_cost_usd=excluded.est_cost_usd""",
                     (
                         tool,
@@ -274,6 +285,8 @@ class Store:
                         values["output"],
                         values["cache_read"],
                         values["cache_write"],
+                        write_5m,
+                        write_1h,
                         values["reasoning"],
                         est,
                     ),
@@ -344,6 +357,38 @@ class Store:
                 raise
             self._seq += 1
 
+    def get_run(self, run_id: str):
+        with self._lock:
+            return self._one("SELECT * FROM runs WHERE run_id=?", (run_id,))
+
+    def running_tool_runs(self) -> list:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM runs WHERE status='running' AND source IN ('grok','muse','glm')"
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def session_runs(self, session_id: str) -> list:
+        with self._lock:
+            rows = self._conn.execute(
+                """SELECT run_id, label, session_id, source, status, started_at
+                   FROM runs WHERE session_id=?""",
+                (session_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def last_activity(self, run_id: str, started_at=None):
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT MAX(ts) AS ts FROM usage_events WHERE run_id=?", (run_id,)
+            ).fetchone()
+        stamps = []
+        if row and row["ts"] is not None:
+            stamps.append(float(row["ts"]))
+        if started_at is not None:
+            stamps.append(float(started_at))
+        return max(stamps) if stamps else None
+
     def match_run(self, pid: int | None, label: str | None) -> str | None:
         with self._lock:
             if pid is not None:
@@ -361,36 +406,43 @@ class Store:
                     return rows[0]["run_id"]
         return None
 
-    def snapshot(self, now: float, ws: str = "all", caps: dict | None = None, long_running_s: dict | None = None) -> dict:
-        caps = _caps(caps)
+    def snapshot(
+        self,
+        now: float,
+        ws: str = "all",
+        long_running_s: dict | None = None,
+        since: float | None = None,
+        until: float | None = None,
+    ) -> dict:
         long_running_s = long_running_s or DEFAULT_LONG_RUNNING_S
         with self._lock:
-            usage = self._usage_by_run()
+            raw, usage, parents = self._scoped_usage()
             rss = self._rss_maps(now)
-            runs = [self._run_view(row, now, usage, rss) for row in self._all_runs()]
+            runs = [self._run_view(row, now, usage, rss) for row in raw]
             visible = [run for run in runs if _in_ws(run, ws)]
-            running = [run for run in visible if run["status"] == "running"]
+            shown = [run for run in visible if run["run_id"] not in parents]
+            running = [run for run in shown if run["status"] == "running"]
             running.sort(key=lambda run: run["started_at"] or 0, reverse=True)
             recent = [
                 run
-                for run in visible
+                for run in shown
                 if run["status"] != "running"
                 and run["ended_at"] is not None
                 and run["ended_at"] >= now - RECENT_S
             ]
             recent.sort(key=lambda run: run["ended_at"] or 0, reverse=True)
             recent = recent[:50]
-            alerts = self._alerts(visible, now, caps, long_running_s)
-            totals = _totals(visible)
+            alerts = self._alerts(shown, now, long_running_s)
+            totals = _totals(shown)
             totals["tokens"]["reasoning"] = sum(
-                (usage.get(run["run_id"], (_zeros(), 0.0, False))[0].get("reasoning") or 0) for run in visible
+                (usage.get(run["run_id"], (_zeros(), 0.0, False))[0].get("reasoning") or 0) for run in shown
             )
-            by_ws = _by_workstream(visible)
-            live = self._live_counts(now)
+            by_ws = _by_workstream(shown)
+            counts = _agent_counts(shown, parents, now, since, until)
             return {
                 "now": now,
                 "seq": self._seq,
-                "caps": {key: {"live": live.get(key, 0), "cap": caps.get(key)} for key in CAP_KEYS},
+                "counts": counts,
                 "running": running,
                 "recent": recent,
                 "alerts": alerts,
@@ -400,10 +452,12 @@ class Store:
 
     def query_runs(self, now: float, ws: str | None, since: float | None, until: float | None, limit: int) -> list:
         with self._lock:
-            usage = self._usage_by_run()
+            raw, usage, parents = self._scoped_usage()
             rss = self._rss_maps(now)
             rows = []
-            for row in self._all_runs():
+            for row in raw:
+                if row["run_id"] in parents:
+                    continue
                 view = self._run_view(row, now, usage, rss)
                 if not _in_ws(view, ws):
                     continue
@@ -419,7 +473,7 @@ class Store:
     def query_usage(self, group: str, bucket: str, ws: str | None, since: float | None) -> list:
         with self._lock:
             sql = """SELECT hour_ts, model, workstream, tool, input_tokens, output_tokens,
-                            cache_read, cache_write, missing FROM usage_buckets"""
+                            cache_read, cache_write, missing, cost_usd FROM usage_buckets"""
             args: list = []
             if since is not None:
                 sql += " WHERE hour_ts + 3600 > ?"
@@ -427,6 +481,8 @@ class Store:
             stored = self._conn.execute(sql, args).fetchall()
         cells: dict = {}
         for row in stored:
+            if "tool" in row.keys() and row["tool"] == _ESTIMATE_TOOL:
+                continue
             if ws and ws != "all" and (row["workstream"] or None) != ws:
                 continue
             if group == "model":
@@ -447,23 +503,22 @@ class Store:
                     "cache_write": 0,
                     "cost_usd": 0.0,
                     "priced": False,
+                    "gap": False,
                 },
             )
             cell["input"] += row["input_tokens"] or 0
             cell["output"] += row["output_tokens"] or 0
             cell["cache_read"] += row["cache_read"] or 0
             cell["cache_write"] += row["cache_write"] or 0
-            if row["missing"]:
-                continue
-            priced = price_cost(
-                row["model"], row["input_tokens"], row["output_tokens"], row["cache_read"], row["cache_write"]
-            )
-            if priced is not None:
-                cell["cost_usd"] += priced
+            present = any(row[name] for name in ("input_tokens", "output_tokens", "cache_read", "cache_write"))
+            if row["missing"] or (row["cost_usd"] is None and present):
+                cell["gap"] = True
+            elif row["cost_usd"] is not None:
+                cell["cost_usd"] += row["cost_usd"]
                 cell["priced"] = True
         out = []
         for cell in cells.values():
-            cost = _money(cell["cost_usd"]) if cell["priced"] else None
+            cost = None if cell["gap"] or not cell["priced"] else _money(cell["cost_usd"])
             out.append(
                 {
                     "t": cell["t"],
@@ -485,6 +540,8 @@ class Store:
             step = span / 5000
         with self._lock:
             runs = [dict(row) for row in self._all_runs()]
+        parents = _parent_map(runs)
+        runs = [run for run in runs if run["run_id"] not in parents and _is_counted_agent(run)]
         if ws and ws != "all":
             runs = [run for run in runs if run["workstream"] == ws]
         points = []
@@ -499,17 +556,12 @@ class Store:
                 if key and _active(run, t, now):
                     point[key] += 1
             points.append(point)
-        if points and (not ws or ws == "all"):
-            live = self.live_counts(now)
-            if any(live.values()):
-                for key in CAP_KEYS:
-                    points[-1][key] = live.get(key, 0)
         return points
 
     def query_sessions(self) -> list:
         with self._lock:
-            usage = self._usage_by_run()
-            runs = [dict(row) for row in self._all_runs()]
+            raw, usage, parents = self._scoped_usage()
+            runs = [row for row in raw if row["run_id"] not in parents]
             sessions = [dict(row) for row in self._conn.execute("SELECT * FROM sessions").fetchall()]
         by_session: dict = {}
         for run in runs:
@@ -549,8 +601,8 @@ class Store:
     def query_workstreams(self, plan_ws: set[str]) -> list:
         with self._lock:
             counts = [dict(row) for row in self._conn.execute("SELECT * FROM ws_counts").fetchall()]
-            runs = [dict(row) for row in self._all_runs()]
-            usage = self._usage_by_run()
+            raw, usage, parents = self._scoped_usage()
+            runs = [row for row in raw if row["run_id"] not in parents]
         by_ws = {row["ws"]: row for row in counts}
         for run in runs:
             if run["workstream"] and run["workstream"] not in by_ws:
@@ -588,9 +640,16 @@ class Store:
         out.sort(key=lambda item: _ws_sort(item["ws"]))
         return out
 
-    def live_counts(self, now: float) -> dict:
-        with self._lock:
-            return self._live_counts(now)
+    def _scoped_usage(self):
+        """Usage with child-chat tokens folded onto the parent run.
+
+        Caller holds the lock. Child rows stay in ``raw``; ``parents`` maps
+        a child run id to the run that should carry its tokens.
+        """
+        raw = [dict(row) for row in self._all_runs()]
+        parents = _parent_map(raw)
+        usage = _rollup_usage(self._usage_by_run(), parents)
+        return raw, usage, parents
 
     def _create(self) -> None:
         self._conn.executescript(
@@ -627,6 +686,8 @@ class Store:
               output_tokens INTEGER,
               cache_read INTEGER,
               cache_write INTEGER,
+              cache_write_5m INTEGER,
+              cache_write_1h INTEGER,
               reasoning INTEGER,
               est_cost_usd REAL,
               PRIMARY KEY (tool, session_id, message_id)
@@ -692,6 +753,74 @@ class Store:
             CREATE INDEX IF NOT EXISTS idx_samples_pid ON process_samples(pid);
             """
         )
+        self._migrate_usage_splits()
+
+    def _migrate_usage_splits(self) -> None:
+        cols = {row[1] for row in self._conn.execute("PRAGMA table_info(usage_events)")}
+        for name in ("cache_write_5m", "cache_write_1h"):
+            if name not in cols:
+                self._conn.execute(f"ALTER TABLE usage_events ADD COLUMN {name} INTEGER")
+
+    def usage_model_stats(self) -> list[dict]:
+        with self._lock:
+            rows = self._conn.execute(
+                """SELECT model AS model, COUNT(*) AS rows,
+                          SUM(input_tokens) AS input, SUM(output_tokens) AS output,
+                          SUM(cache_read) AS cache_read, SUM(cache_write) AS cache_write,
+                          SUM(reasoning) AS reasoning
+                   FROM usage_events GROUP BY model"""
+            ).fetchall()
+        stats = []
+        for row in rows:
+            stats.append(
+                {
+                    "model": row["model"],
+                    "rows": row["rows"],
+                    "input": row["input"] or 0,
+                    "output": row["output"] or 0,
+                    "cache_read": row["cache_read"] or 0,
+                    "cache_write": row["cache_write"] or 0,
+                    "reasoning": row["reasoning"] or 0,
+                }
+            )
+        return stats
+
+    def usage_events_for_cost(self) -> list[dict]:
+        with self._lock:
+            rows = self._conn.execute(
+                """SELECT tool, session_id, message_id, model,
+                          input_tokens, output_tokens, cache_read, cache_write,
+                          cache_write_5m, cache_write_1h, reasoning, est_cost_usd
+                   FROM usage_events"""
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def write_costs(self, updates: list) -> None:
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                self._conn.executemany(
+                    """UPDATE usage_events
+                       SET est_cost_usd=?,
+                           cache_write_5m=COALESCE(?, cache_write_5m),
+                           cache_write_1h=COALESCE(?, cache_write_1h)
+                       WHERE tool=? AND session_id=? AND message_id=?""",
+                    updates,
+                )
+                hours = {
+                    _hour(row["ts"])
+                    for row in self._conn.execute(
+                        "SELECT ts FROM usage_events WHERE ts IS NOT NULL"
+                    )
+                }
+                for hour in hours:
+                    self._rebuild_hour(hour)
+                self._conn.execute("COMMIT")
+            except Exception:
+                self._conn.execute("ROLLBACK")
+                raise
+            self._seq += 1
+            self._data_seq += 1
 
     def _one(self, sql: str, args: tuple):
         row = self._conn.execute(sql, args).fetchone()
@@ -732,10 +861,11 @@ class Store:
             """SELECT e.model AS model, e.tool AS tool, COALESCE(r.workstream, '') AS ws,
                       e.input_tokens AS input_tokens, e.output_tokens AS output_tokens,
                       e.cache_read AS cache_read, e.cache_write AS cache_write,
+                      e.cache_write_5m AS cache_write_5m, e.cache_write_1h AS cache_write_1h,
                       e.reasoning AS reasoning
                FROM usage_events e
                LEFT JOIN runs r ON r.run_id = e.run_id
-               WHERE e.ts >= ? AND e.ts < ?""",
+               WHERE e.ts >= ? AND e.ts < ? AND COALESCE(e.tool, '') != 'grok-context'""",
             (hour_ts, hour_ts + 3600),
         ).fetchall()
         groups: dict = {}
@@ -744,7 +874,7 @@ class Store:
             bucket = groups.setdefault(
                 key,
                 {name: 0 for name in ("input_tokens", "output_tokens", "cache_read", "cache_write", "reasoning")}
-                | {"missing": 0},
+                | {"missing": 0, "unpriced": 0, "cost": 0.0},
             )
             missing = any(row[name] is None for name in ("input_tokens", "output_tokens", "cache_read", "cache_write"))
             if missing:
@@ -752,11 +882,27 @@ class Store:
             for name in ("input_tokens", "output_tokens", "cache_read", "cache_write", "reasoning"):
                 if row[name] is not None:
                     bucket[name] += row[name]
+            if missing:
+                continue
+            priced = price_cost(
+                row["model"],
+                row["input_tokens"],
+                row["output_tokens"],
+                row["cache_read"],
+                row["cache_write"],
+                cache_write_5m=row["cache_write_5m"],
+                cache_write_1h=row["cache_write_1h"],
+                reasoning=row["reasoning"],
+            )
+            if priced is None:
+                bucket["unpriced"] = 1
+            else:
+                bucket["cost"] += priced
         payload = []
         for (model, workstream, tool), bucket in groups.items():
             est = None
-            if not bucket["missing"]:
-                est = price_cost(model, bucket["input_tokens"], bucket["output_tokens"], bucket["cache_read"], bucket["cache_write"])
+            if not bucket["missing"] and not bucket["unpriced"]:
+                est = bucket["cost"]
             payload.append(
                 (
                     hour_ts,
@@ -782,8 +928,9 @@ class Store:
 
     def _usage_by_run(self) -> dict:
         rows = self._conn.execute(
-            """SELECT run_id, model, input_tokens, output_tokens, cache_read, cache_write, reasoning
-               FROM usage_events WHERE run_id IS NOT NULL"""
+            """SELECT run_id, model, input_tokens, output_tokens, cache_read, cache_write,
+                      cache_write_5m, cache_write_1h, reasoning
+               FROM usage_events WHERE run_id IS NOT NULL AND COALESCE(tool, '') != 'grok-context'"""
         ).fetchall()
         grouped: dict = {}
         for row in rows:
@@ -807,23 +954,6 @@ class Store:
             if row["pid"] not in by_pid:
                 by_pid[row["pid"]] = row["rss_kb"]
         return by_run, by_pid
-
-    def _live_counts(self, now: float) -> dict:
-        rows = self._conn.execute(
-            "SELECT MAX(ts) AS ts FROM process_samples WHERE ts >= ?",
-            (now - SAMPLE_FRESH_S,),
-        ).fetchone()
-        counts = {key: 0 for key in CAP_KEYS}
-        if not rows or rows["ts"] is None:
-            return counts
-        samples = self._conn.execute(
-            "SELECT comm FROM process_samples WHERE ts=?", (rows["ts"],)
-        ).fetchall()
-        for sample in samples:
-            key = COMM_TO_CAP.get(sample["comm"] or "")
-            if key:
-                counts[key] += 1
-        return counts
 
     def _run_view(self, row, now: float, usage: dict, rss: tuple[dict, dict]) -> dict:
         data = dict(row)
@@ -864,7 +994,7 @@ class Store:
             "cost_usd": cost_usd,
         }
 
-    def _alerts(self, runs: list, now: float, caps: dict, long_running_s: dict) -> list:
+    def _alerts(self, runs: list, now: float, long_running_s: dict) -> list:
         alerts = []
         for run in runs:
             if run["status"] in ("died_early", "killed") and run["ended_at"] is not None and run["ended_at"] >= now - RECENT_S:
@@ -877,28 +1007,15 @@ class Store:
                         "ts": run["ended_at"],
                     }
                 )
-            cap = _long_cap(run.get("tier"), long_running_s)
+            limit = _long_cap(run.get("tier"), long_running_s)
             elapsed = run.get("elapsed_s")
-            if run["status"] == "running" and cap is not None and elapsed is not None and elapsed > cap:
+            if run["status"] == "running" and limit is not None and elapsed is not None and elapsed > limit:
                 alerts.append(
                     {
                         "kind": "long_running",
                         "run_id": run["run_id"],
                         "label": run["label"],
-                        "detail": f"elapsed {int(elapsed)}s exceeds {run.get('tier')} cap {cap}s",
-                        "ts": now,
-                    }
-                )
-        live = self._live_counts(now)
-        for key in CAP_KEYS:
-            cap = caps.get(key)
-            if cap is not None and live.get(key, 0) > cap:
-                alerts.append(
-                    {
-                        "kind": "over_cap",
-                        "run_id": f"cap:{key}",
-                        "label": key,
-                        "detail": f"{live[key]} live parents, cap {cap}",
+                        "detail": f"elapsed {int(elapsed)}s exceeds {run.get('tier')} limit {limit}s",
                         "ts": now,
                     }
                 )
@@ -950,15 +1067,18 @@ def _fold_events(events: list) -> tuple[dict, float | None, bool]:
             event["output_tokens"],
             event["cache_read"],
             event["cache_write"],
+            cache_write_5m=event["cache_write_5m"],
+            cache_write_1h=event["cache_write_1h"],
+            reasoning=event["reasoning"],
         )
         costs.append(priced)
         if priced is None and any(event[name] is not None for name in ("input_tokens", "output_tokens", "cache_read", "cache_write")):
             unpriced = True
     if not events:
         return folded, 0.0, False
-    if all(item is None for item in costs):
-        return folded, None if unpriced or events else 0.0, unpriced or bool(events)
-    return folded, sum(item for item in costs if item is not None), unpriced
+    if unpriced or all(item is None for item in costs):
+        return folded, None, True
+    return folded, sum(item for item in costs if item is not None), False
 
 
 def _money(value):
@@ -984,13 +1104,6 @@ def _in_ws(run: dict, ws: str | None) -> bool:
     return run.get("workstream") == ws
 
 
-def _caps(caps: dict | None) -> dict:
-    merged = dict(DEFAULT_CAPS)
-    if caps:
-        merged.update(caps)
-    return merged
-
-
 def _long_cap(tier: str | None, table: dict):
     if not tier:
         return None
@@ -1009,6 +1122,134 @@ def _tool_key(run: dict) -> str | None:
     if source.startswith("claude") or tier in ("opus", "sonnet", "haiku"):
         return "claude"
     return None
+
+
+def _is_counted_agent(run: dict) -> bool:
+    """Interactive Claude sessions and shell launch rows are not agents."""
+    source = run.get("source") or ""
+    if source in ("claude-main", "shell", ""):
+        return False
+    return _tool_key(run) in TOOL_KEYS
+
+
+def _parent_map(runs: list) -> dict:
+    """Child grok run id -> parent run id.
+
+    A child is a chat whose ``parent_session_id`` is another grok run (or
+    that run's chat id), or an unlabeled row for a chat that already has a
+    labeled run. Hub session ids are not grok chat ids, so a launched agent
+    keeps its own count.
+    """
+    by_id = {run["run_id"]: run for run in runs}
+    grok_by_session = {}
+    grok_by_sid = {}
+    for run in runs:
+        if run.get("source") != "grok" or not run.get("session_id"):
+            continue
+        grok_by_sid.setdefault(run["session_id"], []).append(run)
+        prev = grok_by_session.get(run["session_id"])
+        if prev is None or (not prev.get("label") and run.get("label")):
+            grok_by_session[run["session_id"]] = run
+    parents = {}
+    for run in runs:
+        if run.get("source") != "grok":
+            continue
+        parent = run.get("parent_session_id")
+        host = by_id.get(parent) if parent else None
+        if host and host["run_id"] != run["run_id"]:
+            parents[run["run_id"]] = host["run_id"]
+            continue
+        if parent:
+            host = grok_by_session.get(parent)
+            if host and host["run_id"] != run["run_id"]:
+                parents[run["run_id"]] = host["run_id"]
+                continue
+        if not run.get("label") and run.get("session_id"):
+            labeled = [
+                item
+                for item in grok_by_sid.get(run["session_id"], [])
+                if item.get("label") and item["run_id"] != run["run_id"]
+            ]
+            if labeled:
+                parents[run["run_id"]] = labeled[0]["run_id"]
+    return parents
+
+
+def _rollup_usage(usage: dict, parents: dict) -> dict:
+    for child, parent in parents.items():
+        if child == parent or child not in usage:
+            continue
+        usage[parent] = _merge_usage(usage.get(parent), usage[child])
+        usage[child] = (_zeros(), 0.0, False)
+    return usage
+
+
+def _merge_usage(left, right):
+    if left is None:
+        return right
+    if right is None:
+        return left
+    left_tokens, left_cost, left_unpriced = left
+    right_tokens, right_cost, right_unpriced = right
+    folded = {}
+    for key in TOKEN_FIELDS:
+        left_value = left_tokens.get(key)
+        right_value = right_tokens.get(key)
+        if left_value is None and right_value is None:
+            folded[key] = None
+        else:
+            folded[key] = (left_value or 0) + (right_value or 0)
+    if left_cost is None and right_cost is None:
+        cost = None
+    else:
+        cost = (left_cost or 0) + (right_cost or 0)
+    return folded, cost, bool(left_unpriced or right_unpriced)
+
+
+def _local_midnight(now: float) -> float:
+    moment = datetime.fromtimestamp(float(now)).astimezone()
+    start = moment.replace(hour=0, minute=0, second=0, microsecond=0)
+    return start.timestamp()
+
+
+def _agent_counts(runs: list, parents: dict, now: float, since, until) -> dict:
+    range_since = now - RANGE_S if since is None else float(since)
+    range_until = float(now if until is None else until)
+    today = _local_midnight(now)
+    live_by = {key: 0 for key in TOOL_KEYS}
+    seen = set()
+    live_n = 0
+    finished_today = 0
+    finished_range = 0
+    by_verdict = {}
+    for run in runs:
+        if run["run_id"] in parents or not _is_counted_agent(run):
+            continue
+        if run.get("status") == "running":
+            tool = _tool_key(run)
+            key = (tool, run.get("label") or run["run_id"])
+            if key in seen:
+                continue
+            seen.add(key)
+            live_by[tool] += 1
+            live_n += 1
+            continue
+        if run.get("status") not in FINISHED or run.get("ended_at") is None:
+            continue
+        ended = float(run["ended_at"])
+        if today <= ended <= now:
+            finished_today += 1
+        if range_since <= ended <= range_until:
+            finished_range += 1
+            verdict = run.get("verdict") or "none"
+            by_verdict[verdict] = by_verdict.get(verdict, 0) + 1
+    return {
+        "live_agents": live_n,
+        "live_by_tool": live_by,
+        "finished_today": finished_today,
+        "finished_in_range": finished_range,
+        "finished_by_verdict": by_verdict,
+    }
 
 
 def _active(run: dict, t: float, now: float) -> bool:

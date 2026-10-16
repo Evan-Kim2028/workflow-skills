@@ -5,7 +5,7 @@ description: Run, change and grow the local agent execution dashboard (agent-das
 
 # Workstream dashboard (agent-dash)
 
-A local, read-only page that shows what every agent is doing across sessions and tools, per workstream, with charts and a plan progress map.
+Two local pages in one tool. Execution (`/`) shows what every agent is doing across sessions and tools, per workstream, with charts and a live plan progress map. Plan (`/plan?ws=<ID>`) shows each workstream's strategy, decisions, and drawings. A Plan | Execution toggle keeps the same workstream.
 
 - Code: `tools/agent-dash/` in this repo. After `./install.sh`, that directory is `~/.claude/tools/agent-dash`. Contract: `CONTRACT.md`. Look: `DESIGN.md`. Read both before changing anything.
 - State: `~/.local/share/agent-dash/` (`dash.sqlite`, pidfile, log). Override with `AGENT_DASH_STATE_DIR` or `state_dir` in `config.local.json`.
@@ -29,8 +29,8 @@ With no `config.local.json`, scratch roots and the hub tracker are empty. Those 
 
 ## What it shows
 
-- Overall tab: stat tiles, running-now table, alerts, workstream cards, tokens per hour (by model or workstream), live agents over time (one strip per tool), run timeline grouped by workstream, recently finished runs.
-- One tab per workstream that has a plan file. Same views filtered to it, plus the plan progress map: task groups in columns, chips by status, arrows for "waits on". A chip with a running agent pulses and carries a badge (tool color, count). A chip whose run finished in the last 15 minutes gets a green outline. Running runs that map to no task are listed above the map.
+- Overall tab: stat tiles (agents live now, finished today, tokens, cost, alerts), running-now table, alerts, workstream cards, tokens per hour (by model or workstream), live agents over time (one strip per tool), run timeline grouped by workstream, recently finished runs. A Plans row links each workstream to its plan page.
+- One tab per workstream that has a plan file or a workstream bundle. Same views filtered to it, plus the plan progress map: task groups in columns, chips by status, arrows for "waits on". A chip with a running agent pulses and carries a badge (tool color, count). A chip whose run finished in the last 15 minutes gets a green outline. Running runs that map to no task are listed above the map. The map links to that workstream's plan page.
 - Click any run (table row, timeline bar, live chip) for the details drawer.
 
 ## Rules
@@ -38,7 +38,7 @@ With no `config.local.json`, scratch roots and the hub tracker are empty. Those 
 1. Read-only on every source. Never write to `~/.claude/projects`, `~/.cursor`, `~/.grok`, muse state, scratchpads or repos. Never signal agent processes.
 2. Never store or render prompt bodies, argv, secrets or env values. Labels only.
 3. Visual first. New information arrives as a chart or diagram that follows `DESIGN.md` (fixed palette and entity colors, one axis per chart, legend for 2+ series, hover on every mark). No new tile rows.
-4. Only workstreams with an entry in the plans map get a tab and a card. The example map lists WS1, WS2, and WS7. Others stay hidden, not deleted.
+4. A workstream tab appears when the plans map lists it, or when a bundle directory has `kind: workstream`. The example map lists WS1, WS2, and WS7. A program bundle such as OVERVIEW shows on the plan page and does not add an execution tab.
 5. One writer per file (`CONTRACT.md` ownership table). Claude owns `static/index.html`, `static/taskmap.json` and `DESIGN.md`. Backend modules are built by workers against the contract.
 6. Name things, not numbers. Plan and page text never cites a decision, task, PR, issue or ADR by its number alone; lead with a brief phrase, number optional in parentheses ("the read-path migration decision (D-12)"). Machine keys (task `id`, JSON keys) stay as they are.
 7. Charts follow the Charts section below (axes on every chart, compact numbers); `tests/test_page_rules.py` enforces it.
@@ -71,12 +71,17 @@ Environment variables override the merged config. See the repo README for the fu
 - `AGENT_DASH_SCRATCH_GLOBS`, `os.pathsep`-separated globs. Default empty. The example file shows `$HOME/agent-scratch/*`.
 - `AGENT_DASH_HUB_DIR`, a directory with `issues/*.md` and `workstreams.tsv`. Default empty.
 - `AGENT_DASH_MAP`, `AGENT_DASH_PLANS`, `AGENT_DASH_TASKMAP`, `AGENT_DASH_CONFIG`, `AGENT_DASH_STATE_DIR`.
+- `AGENT_DASH_WORKSTREAMS`, the plan-bundle root. Default `~/.local/share/agent-dash/workstreams`. The tool directory stays free of project text.
 
 Claude project and session roots default to `~/.claude/projects` and `~/.claude/sessions`. Muse defaults to `~/.local/share/muse/sessions`. Grok defaults to `~/.grok/sessions` and `~/.grok/logs/unified.jsonl`. Cursor defaults to `~/.cursor`.
 
 ## Common changes
 
-**Add a workstream tab.** Write a plan file in the decision-JSON shape (`dag` with `cols`, `groups[].tasks[{id,title,status}]`, `edges`; optional `narrative.phases`) and add `"WSn": "<path>"` to `plans.local.json` (copy `plans.example.json` first if you do not have one). The tab and card appear on the next refresh. Add task-id patterns for its run labels to `taskOf()` in `static/index.html` or overrides to `static/taskmap.local.json`.
+**Add a workstream tab from a plan file.** Write a plan file in the decision-JSON shape (`dag` with `cols`, `groups[].tasks[{id,title,status}]`, `edges`; optional `narrative.phases`) and add `"WSn": "<path>"` to `plans.local.json` (copy `plans.example.json` first if you do not have one). The tab and card appear on the next refresh. Add task-id patterns for its run labels to `taskOf()` in `static/index.html` or overrides to `static/taskmap.local.json`.
+
+**Add a workstream bundle.** Read `tools/agent-dash/SKILL-PLAN.md`. Short form: `python3 agent_dash.py ws new WS4 "Read path"`, fill `plan.json`, put drawings in `visuals.html`, list them in `layout.json`, then `ws render WS4` and `ws validate WS4`. Bundles live under `AGENT_DASH_WORKSTREAMS` (default `~/.local/share/agent-dash/workstreams/<ID>/`). They are private and stay out of the repo. A `kind: workstream` bundle appears as a Plan tab and an execution tab with no edit to the plans map. Synthetic examples for tests live in `tools/agent-dash/fixtures/bundles/` (OVERVIEW plus one workstream).
+
+**Log progress.** Label every worker run `ws<N>-<task-id>-<slug>` so the map pins the agent to its task. Move a task with `python3 agent_dash.py ws task <ID> <task-id> <todo|pr|prog|done|deferred> [--moved-to WSn] [--note "..."]`. The write is a temp file plus replace. Do not hand-edit `plan.json` while a session is running. Status edits do not need `ws render`. The page reads `plan.json` live.
 
 **Refresh a plan map from an HTML artifact.** When task state lives in a saved artifact page:
 
@@ -96,6 +101,6 @@ Backend work goes to workers, each prompt starting with a `[label: dash-<name>]`
 
 ## Known gaps (update as they close)
 
-- cursor-agent token counts depend on decoding blobs under the configured cursor home (`chats/<md5(cwd)>/<uuid>/store.db` by default under `~/.cursor`).
-- Plan status is whatever the plan file says. It is not live unless something rewrites that file.
+- Cursor billed tokens come from the stop hook (`scripts/cursor_usage_hook.py`), which appends one JSON line per turn to `cursor-usage.jsonl` under the state dir. Checkpoint context-window estimates are stored as tool `grok-context` and left out of cost and token charts. Headless `--print` does not run the hook. Blob counts under `~/.cursor/chats/` are still recorded when a blob already has input and output fields.
+- Plan status is whatever `plan.json` or the plans-map file says. `ws task` is the writer for a bundle.
 - No launchd agent yet. Start it by hand.

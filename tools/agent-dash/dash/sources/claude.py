@@ -172,6 +172,43 @@ def transcript_status(
     return "done"
 
 
+def subagent_status(final: bool, fresh: bool) -> str:
+    """Running only when the last event is not a result and the transcript
+    was written inside ``running_mtime_s``.
+
+    That window is ``RUNNING_MTIME_S`` (15 minutes): the source already
+    treats a transcript as still being written for that long. A result
+    event ends the run even if the file was just touched. A quiet file
+    is done, not left running.
+    """
+    if final or not fresh:
+        return "done"
+    return "running"
+
+
+def _tail_is_result(path) -> bool:
+    """True when the last transcript line is a result event.
+
+    Only the type field on that line is inspected. The line is not stored.
+    """
+    st = _stat(path)
+    if st is None or st.st_size <= 0:
+        return False
+    n = min(st.st_size, 8192)
+    try:
+        with open(path, "rb") as fh:
+            if st.st_size > n:
+                fh.seek(st.st_size - n)
+            data = fh.read(n)
+    except OSError:
+        return False
+    lines = [line for line in data.split(b"\n") if line.strip()]
+    if not lines:
+        return False
+    head = lines[-1][:96]
+    return b'"type":"result"' in head or b'"type": "result"' in head
+
+
 def poll(store, cfg, now: float) -> None:
     try:
         if not isinstance(cfg, dict):
@@ -633,6 +670,8 @@ def _emit_usage(store, target, rows, now) -> None:
                     "output": row["output"],
                     "cache_read": row["cache_read"],
                     "cache_write": row["cache_write"],
+                    "cache_write_5m": row.get("cache_write_5m"),
+                    "cache_write_1h": row.get("cache_write_1h"),
                     "reasoning": row["reasoning"],
                 }
             )
@@ -649,12 +688,15 @@ def _emit_transcript_run(store, target, st, fresh, caught_up) -> None:
         meta_label, meta_model = _read_meta(_meta_path(target.path))
     applied = _apply_label(run_id, meta_label, "meta")
     finished = (target.session_id, target.agent_id) in _finished
-    status = transcript_status(
-        caught_up=caught_up,
-        fresh=fresh,
-        registry_busy=target.kind == "main" and target.session_id in _busy,
-        finished=finished,
-    )
+    if target.kind == "subagent":
+        status = subagent_status(_tail_is_result(target.path), fresh)
+    else:
+        status = transcript_status(
+            caught_up=caught_up,
+            fresh=fresh,
+            registry_busy=target.kind == "main" and target.session_id in _busy,
+            finished=finished,
+        )
     model = None
     last_rows_model = _last_model.get(run_id)
     if last_rows_model:
@@ -895,6 +937,13 @@ def _usage_row(rec) -> dict | None:
         return None
     details = usage.get("output_tokens_details")
     thinking = details.get("thinking_tokens") if isinstance(details, dict) else None
+    cache_creation = usage.get("cache_creation")
+    write_5m = write_1h = None
+    if isinstance(cache_creation, dict):
+        if "ephemeral_5m_input_tokens" in cache_creation:
+            write_5m = _as_int(cache_creation.get("ephemeral_5m_input_tokens"))
+        if "ephemeral_1h_input_tokens" in cache_creation:
+            write_1h = _as_int(cache_creation.get("ephemeral_1h_input_tokens"))
     model = msg.get("model") or rec.get("requestedModel") or ""
     if not isinstance(model, str):
         model = ""
@@ -908,10 +957,69 @@ def _usage_row(rec) -> dict | None:
         "output": _as_int(usage.get("output_tokens")),
         "cache_read": _as_int(usage.get("cache_read_input_tokens")),
         "cache_write": _as_int(usage.get("cache_creation_input_tokens")),
+        "cache_write_5m": write_5m,
+        "cache_write_1h": write_1h,
         "reasoning": _as_int(thinking),
         "ts": epoch_from_iso(rec.get("timestamp")),
         "cwd": cwd,
     }
+
+
+def read_cache_splits(projects_root: str, wanted: dict) -> dict:
+    """Return (session_id, message_id) -> (5m, 1h) from assistant usage only."""
+    pending = {sid: set(ids) for sid, ids in wanted.items() if ids}
+    if not pending or not projects_root:
+        return {}
+    files = _jsonl_for_sessions(projects_root, set(pending))
+    found = {}
+    for sid, paths in files.items():
+        need = pending.get(sid)
+        if not need:
+            continue
+        for path in paths:
+            try:
+                with open(path, "rb") as fh:
+                    for line in fh:
+                        if not _is_assistant_line(line) or b"cache_creation" not in line:
+                            continue
+                        try:
+                            rec = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        row = _usage_row(rec)
+                        if row is None or row["message_id"] not in need:
+                            continue
+                        found[(sid, row["message_id"])] = (
+                            row.get("cache_write_5m"),
+                            row.get("cache_write_1h"),
+                        )
+            except OSError:
+                continue
+    return found
+
+
+def _jsonl_for_sessions(root: str, session_ids: set) -> dict:
+    found = {sid: [] for sid in session_ids}
+    try:
+        walker = os.walk(root, followlinks=False)
+    except OSError:
+        return found
+    for dirpath, _dirnames, filenames in walker:
+        parts = set(dirpath.split(os.sep))
+        owners = parts.intersection(session_ids)
+        for name in filenames:
+            if not name.endswith(".jsonl"):
+                continue
+            stem = name[: -len(".jsonl")]
+            path = os.path.join(dirpath, name)
+            targets = set(owners)
+            if stem in session_ids:
+                targets.add(stem)
+            for sid in targets:
+                found[sid].append(path)
+    for sid, paths in found.items():
+        found[sid] = sorted(set(paths))
+    return found
 
 
 def _dedupe(rows: list[dict]) -> list[dict]:

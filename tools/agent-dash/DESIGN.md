@@ -4,9 +4,9 @@ The dashboard is read by a visual thinker. Every view answers its question with 
 
 ## Layout
 
-- One page, `static/index.html`, vanilla JS, inline SVG. No framework, no CDN, no build step.
-- Header: title, live dot, range control (6 h, 24 h, 3 d), theme toggle.
-- Tabs: `Overall`, then one tab per workstream that has a plan in the plans map, in WS number order. Nothing else.
+- Execution is `static/index.html`. Plan is `static/plan.html`, served at `/plan`. Vanilla JS, inline SVG. No framework, no CDN, no build step. Mermaid is the vendored file under `static/vendor/`.
+- Header: title, live dot, range control (6 h, 24 h, 3 d), theme toggle. A Plans row links each workstream to its plan page.
+- Tabs: `Overall`, then one tab per workstream that has a plan in the plans map or a workstream bundle, in WS number order.
 - Overall, top to bottom: stat tiles (one row), running-now table beside alerts, workstream cards, tokens per hour beside live agents over time, run timeline, finished in the last hour.
 - Workstream tab: the same views filtered to that workstream, plus the plan progress map directly under the tiles.
 - Run details open in the right-hand drawer; Escape closes it.

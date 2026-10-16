@@ -1,53 +1,335 @@
+import json
+import sqlite3
 import sys
+import tempfile
 import unittest
+from decimal import Decimal
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from dash.pricing import cost, family, load
+from dash.pricing import cost, family, health_block, load, reprice, status
+from dash.store import Store
+
+GROK = "grok-4.7[context=500k,reasoning_effort=high,fast=false]"
+DEMO = [
+    {
+        "model": "demo",
+        "input": 2,
+        "output": 3,
+        "cache_read": Decimal("0.5"),
+        "cache_write_5m": 4,
+        "cache_write_1h": 8,
+        "reasoning": None,
+        "input_includes_cache_read": False,
+        "long_context": {
+            "threshold": 100,
+            "comparison": "gt",
+            "counts": ["input", "cache_read", "cache_write"],
+            "input": 9,
+            "output": 10,
+            "cache_read": 1,
+            "cache_write_5m": 11,
+            "cache_write_1h": 12,
+        },
+        "billing_mode": "api",
+        "confidence": "published",
+        "provider": "demo",
+    }
+]
 
 
-class PricingTest(unittest.TestCase):
-    def test_contract_rates(self):
-        table = load()
-        self.assertEqual(table["opus"], {"input": 15, "output": 75, "cache_read": 1.5, "cache_write": 18.75})
-        self.assertEqual(table["sonnet"], {"input": 3, "output": 15, "cache_read": 0.3, "cache_write": 3.75})
-        self.assertEqual(table["haiku"], {"input": 1, "output": 5, "cache_read": 0.1, "cache_write": 1.25})
+class CostMathTest(unittest.TestCase):
+    def test_token_classes_sum(self):
+        row = dict(DEMO[0])
+        row["long_context"] = None
+        priced = cost(
+            "demo",
+            1_000_000,
+            1_000_000,
+            1_000_000,
+            2_000_000,
+            table=[row],
+            cache_write_5m=1_000_000,
+            cache_write_1h=1_000_000,
+        )
+        self.assertAlmostEqual(priced, 2 + 3 + 0.5 + 4 + 8)
 
-    def test_family_substring(self):
+    def test_cache_split_and_missing_split(self):
+        split = cost(
+            "demo",
+            0,
+            0,
+            0,
+            10,
+            table=DEMO,
+            cache_write_5m=4,
+            cache_write_1h=6,
+        )
+        self.assertAlmostEqual(split, (4 * 4 + 6 * 8) / 1_000_000)
+        self.assertIsNone(cost("demo", 0, 0, 0, 10, table=DEMO))
+        self.assertIsNone(
+            cost("demo", 0, 0, 0, 10, table=DEMO, cache_write_5m=4, cache_write_1h=5)
+        )
+        self.assertEqual(cost("demo", 0, 0, 0, 0, table=DEMO), 0.0)
+
+    def test_equal_write_rates_price_the_total(self):
+        row = dict(DEMO[0])
+        row["cache_write_5m"] = 4
+        row["cache_write_1h"] = 4
+        row["long_context"] = None
+        priced = cost("demo", 0, 0, 0, 1_000_000, table=[row])
+        self.assertAlmostEqual(priced, 4)
+
+    def test_long_context_threshold_is_per_request(self):
+        under = cost("demo", 50, 0, 50, 0, table=DEMO)
+        over = cost("demo", 50, 0, 51, 0, table=DEMO)
+        self.assertAlmostEqual(under, float((50 * 2 + 50 * Decimal("0.5")) / 1_000_000))
+        self.assertAlmostEqual(over, (50 * 9 + 51 * 1) / 1_000_000)
+        self.assertAlmostEqual(cost("demo", 100, 0, 0, 0, table=DEMO), 200 / 1_000_000)
+        self.assertAlmostEqual(cost("demo", 101, 0, 0, 0, table=DEMO), 909 / 1_000_000)
+
+    def test_input_that_already_includes_cache_read(self):
+        row = dict(DEMO[0])
+        row["long_context"] = None
+        row["input_includes_cache_read"] = True
+        row["input"] = 10
+        row["cache_read"] = 1
+        row["cache_write_5m"] = 0
+        row["cache_write_1h"] = 0
+        priced = cost("demo", 1000, 0, 400, 0, table=[row])
+        self.assertAlmostEqual(priced, (600 * 10 + 400 * 1) / 1_000_000)
+        self.assertIsNone(cost("demo", 100, 0, 400, 0, table=[row]))
+
+    def test_reasoning_only_when_billed_separately(self):
+        self.assertEqual(cost("demo", 0, 0, 0, 0, table=DEMO, reasoning=50), 0.0)
+        row = dict(DEMO[0])
+        row["reasoning"] = 7
+        row["long_context"] = None
+        self.assertAlmostEqual(
+            cost("demo", 0, 0, 0, 0, table=[row], reasoning=1_000_000),
+            7,
+        )
+        self.assertIsNone(cost("demo", 0, 0, 0, 0, table=[row], reasoning=None))
+
+    def test_unknown_is_null_not_zero(self):
+        self.assertIsNone(cost("muse-wonder-full-1.0", 0, 0, 0, 0))
+        self.assertIsNone(cost("<synthetic>", 10, 10, 10, 10))
+        self.assertIsNone(cost("demo", None, 0, 0, 0, table=DEMO))
+        self.assertIsNone(cost("", 1, 1, 1, 1, table=DEMO))
+        self.assertIsNone(cost(None, 1, 1, 1, 1, table=DEMO))
+
+
+class CatalogTest(unittest.TestCase):
+    def test_published_rates(self):
+        rows = {row["model"]: row for row in load()}
+        opus = rows["claude-opus-5-5"]
+        self.assertEqual(opus["input"], 4)
+        self.assertEqual(opus["output"], 20)
+        self.assertEqual(opus["cache_read"], Decimal("0.2"))
+        self.assertEqual(opus["cache_write_5m"], 5)
+        self.assertEqual(opus["cache_write_1h"], 8)
+        self.assertIsNone(opus["reasoning"])
+        self.assertEqual(opus["billing_mode"], "api")
+        self.assertEqual(opus["confidence"], "published")
+        self.assertIsNone(opus["long_context"])
+
+        haiku = rows["claude-haiku-5-5"]
+        self.assertEqual(haiku["input"], Decimal("0.1"))
+        self.assertEqual(haiku["long_context"]["threshold"], 100000)
+        self.assertEqual(haiku["long_context"]["comparison"], "gt")
+        self.assertEqual(haiku["long_context"]["input"], Decimal("0.5"))
+        self.assertEqual(haiku["long_context"]["cache_write_5m"], Decimal("0.625"))
+
+        flash = rows["glm-5.3-flash"]
+        self.assertEqual(flash["input"], Decimal("0.15"))
+        self.assertEqual(flash["cache_read"], Decimal("0.03"))
+        self.assertEqual(flash["output"], Decimal("0.5"))
+        self.assertEqual(flash["cache_write_5m"], 0)
+        self.assertTrue(flash["input_includes_cache_read"])
+
+        grok = rows[GROK]
+        self.assertEqual(grok["input"], 4)
+        self.assertEqual(grok["output"], 12)
+        self.assertEqual(grok["cache_read"], 1)
+        self.assertIsNone(grok["cache_write_5m"])
+        self.assertEqual(grok["billing_mode"], "plan-included")
+        self.assertEqual(grok["confidence"], "inferred")
+        xhigh = rows["grok-4.7[context=500k,reasoning_effort=xhigh,fast=false]"]
+        self.assertEqual(xhigh["input"], grok["input"])
+        self.assertEqual(xhigh["output"], grok["output"])
+        self.assertEqual(xhigh["cache_read"], grok["cache_read"])
+        self.assertEqual(xhigh["confidence"], "inferred")
+
+        spark = rows["muse-spark-1.3-contributor"]
+        self.assertEqual((float(spark["input"]), float(spark["output"]), float(spark["cache_read"])), (0.10, 0.20, 0.002))
+        self.assertTrue(spark["input_includes_cache_read"])
+        self.assertEqual(spark["confidence"], "published")
+        self.assertEqual(rows["muse-wonder-1.0-contributor"]["confidence"], "inferred")
+
+        for model in (
+            "muse-wonder-full-1.0",
+            "grok-4.7-high",
+            "grok-4.7-xhigh",
+            "<synthetic>",
+        ):
+            self.assertIsNone(rows[model]["input"])
+            self.assertEqual(rows[model]["confidence"], "unknown")
+            self.assertFalse(status(model)["priced"])
+
+    def test_family_is_unchanged(self):
         self.assertEqual(family("claude-opus-5-5"), "opus")
-        self.assertEqual(family("claude-sonnet-4-5"), "sonnet")
-        self.assertEqual(family("claude-haiku-4-5"), "haiku")
+        self.assertEqual(family("claude-sonnet-5-5"), "sonnet")
+        self.assertEqual(family("claude-haiku-5-5"), "haiku")
         self.assertIsNone(family("glm-5.3"))
-        self.assertIsNone(family("muse-1"))
-        self.assertIsNone(family("grok-4.7"))
+        self.assertIsNone(family("muse-wonder-full-1.0"))
+        self.assertIsNone(family(GROK))
         self.assertIsNone(family(None))
 
-    def test_opus_mix(self):
-        priced = cost("claude-opus-4", 1000, 2000, 4000, 8000)
-        self.assertEqual(round(priced, 3), 0.321)
+    def test_live_models_from_the_catalog(self):
+        self.assertAlmostEqual(cost("claude-haiku-5-5", 100_000, 0, 0, 0), 0.01)
+        self.assertAlmostEqual(
+            cost("claude-haiku-5-5", 100_001, 0, 0, 0),
+            float(Decimal(100_001) * Decimal("0.5") / Decimal(1_000_000)),
+        )
+        self.assertIsNone(cost("claude-opus-5-5", 1, 1, 0, 10))
+        opus = cost(
+            "claude-opus-5-5",
+            2,
+            4,
+            0,
+            10,
+            cache_write_5m=3,
+            cache_write_1h=7,
+        )
+        self.assertAlmostEqual(opus, (2 * 4 + 4 * 20 + 3 * 5 + 7 * 8) / 1_000_000)
+        flash = cost("glm-5.3-flash", 1000, 10, 400, 0)
+        self.assertAlmostEqual(
+            flash,
+            float((600 * Decimal("0.15") + 400 * Decimal("0.03") + 10 * Decimal("0.5")) / 1_000_000),
+        )
+        self.assertAlmostEqual(cost(GROK, 1_000_000, 1_000_000, 1_000_000, 0), 17)
+        self.assertIsNone(cost(GROK, 1, 1, 0, 5))
+        info = status("claude-fable-5-1")
+        self.assertTrue(info["priced"])
+        self.assertEqual(info["billing_mode"], "api")
+        self.assertEqual(info["confidence"], "published")
 
-    def test_custom_table_changes_the_number(self):
-        tracker = {
-            "opus": {"input": 4.0, "output": 20.0, "cache_read": 0.2, "cache_write": 8.0},
-        }
-        priced = cost("claude-opus-4", 1000, 2000, 4000, 8000, table=tracker)
-        self.assertEqual(round(priced, 4), 0.1088)
+    def test_health_block(self):
+        block = health_block(
+            [
+                {
+                    "model": "claude-opus-5-5",
+                    "rows": 2,
+                    "input": 5,
+                    "output": 6,
+                    "cache_read": 7,
+                    "cache_write": 8,
+                    "reasoning": 1,
+                }
+            ]
+        )
+        by_model = {row["model"]: row for row in block["models"]}
+        self.assertEqual(by_model["claude-opus-5-5"]["rows"], 2)
+        self.assertEqual(by_model["claude-opus-5-5"]["tokens"]["cache_read"], 7)
+        self.assertTrue(by_model["claude-opus-5-5"]["priced"])
+        self.assertEqual(by_model["claude-opus-5-5"]["confidence"], "published")
+        self.assertEqual(by_model[GROK]["rows"], 0)
+        self.assertEqual(by_model[GROK]["billing_mode"], "plan-included")
+        self.assertFalse(by_model["muse-wonder-full-1.0"]["priced"])
+        self.assertEqual(by_model["muse-wonder-full-1.0"]["confidence"], "unknown")
 
-    def test_unit_rates(self):
-        million = (1_000_000, 1_000_000, 1_000_000, 1_000_000)
-        self.assertAlmostEqual(cost("opus", *million), 15 + 75 + 1.5 + 18.75)
-        self.assertAlmostEqual(cost("sonnet", *million), 3 + 15 + 0.3 + 3.75)
-        self.assertAlmostEqual(cost("haiku", *million), 1 + 5 + 0.1 + 1.25)
-        self.assertEqual(cost("haiku", 0, 0, 0, 0), 0.0)
 
-    def test_unpriced_and_missing(self):
-        self.assertIsNone(cost("glm-5.3", 10, 10, 10, 10))
-        self.assertIsNone(cost("muse-1", 10, 1, 1, 1))
-        self.assertIsNone(cost("grok-4", 10, 1, 0, 0))
-        self.assertIsNone(cost("claude-opus-5-5", None, 1, 1, 1))
-        self.assertIsNone(cost("claude-opus-5-5", 1, 1, None, 1))
-        self.assertIsNone(cost("", 1, 1, 1, 1))
+class RepriceTest(unittest.TestCase):
+    def test_migrate_adds_split_columns(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "dash.sqlite"
+            con = sqlite3.connect(path)
+            con.execute(
+                """CREATE TABLE usage_events (
+                       tool TEXT NOT NULL, session_id TEXT NOT NULL, message_id TEXT NOT NULL,
+                       ts REAL, run_id TEXT, model TEXT,
+                       input_tokens INTEGER, output_tokens INTEGER, cache_read INTEGER,
+                       cache_write INTEGER, reasoning INTEGER, est_cost_usd REAL,
+                       PRIMARY KEY (tool, session_id, message_id))"""
+            )
+            con.execute(
+                "INSERT INTO usage_events(tool, session_id, message_id, cache_write) VALUES('claude','s','m',3)"
+            )
+            con.commit()
+            con.close()
+            store = Store(path)
+            try:
+                cols = [row[1] for row in store._conn.execute("PRAGMA table_info(usage_events)")]
+                self.assertIn("cache_write_5m", cols)
+                self.assertIn("cache_write_1h", cols)
+                kept = store._conn.execute("SELECT cache_write FROM usage_events").fetchone()[0]
+                self.assertEqual(kept, 3)
+            finally:
+                store.close()
+
+    def test_reprice_fills_split_from_usage_only(self):
+        sid = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+        prompt = "PROMPT_BODY_DO_NOT_STORE"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "projects" / "proj"
+            root.mkdir(parents=True)
+            rec = {
+                "type": "assistant",
+                "timestamp": "2026-10-16T00:00:00.000Z",
+                "message": {
+                    "id": "m1",
+                    "model": "claude-opus-5-5",
+                    "content": [{"type": "text", "text": prompt}],
+                    "usage": {
+                        "input_tokens": 2,
+                        "output_tokens": 4,
+                        "cache_read_input_tokens": 0,
+                        "cache_creation_input_tokens": 10,
+                        "cache_creation": {
+                            "ephemeral_5m_input_tokens": 3,
+                            "ephemeral_1h_input_tokens": 7,
+                        },
+                    },
+                },
+            }
+            (root / f"{sid}.jsonl").write_bytes(json.dumps(rec).encode() + b"\n")
+            store = Store(Path(tmp) / "dash.sqlite")
+            try:
+                store.add_usage(
+                    {
+                        "ts": 10,
+                        "session_id": sid,
+                        "run_id": "claude-main:%s:main" % sid,
+                        "model": "claude-opus-5-5",
+                        "tool": "claude",
+                        "message_id": "m1",
+                        "input": 2,
+                        "output": 4,
+                        "cache_read": 0,
+                        "cache_write": 10,
+                        "reasoning": 0,
+                    }
+                )
+                before = store._conn.execute(
+                    "SELECT est_cost_usd FROM usage_events WHERE message_id='m1'"
+                ).fetchone()["est_cost_usd"]
+                self.assertIsNone(before)
+                summary = reprice(store, str(Path(tmp) / "projects"))
+                row = store._conn.execute(
+                    "SELECT cache_write_5m, cache_write_1h, est_cost_usd FROM usage_events WHERE message_id='m1'"
+                ).fetchone()
+                self.assertEqual(row["cache_write_5m"], 3)
+                self.assertEqual(row["cache_write_1h"], 7)
+                self.assertAlmostEqual(row["est_cost_usd"], (2 * 4 + 4 * 20 + 3 * 5 + 7 * 8) / 1_000_000)
+                self.assertEqual(summary["splits_filled"], 1)
+                self.assertNotIn(prompt, json.dumps(summary))
+                dumped = json.dumps(
+                    [dict(item) for item in store._conn.execute("SELECT * FROM usage_events")]
+                )
+                self.assertNotIn(prompt, dumped)
+            finally:
+                store.close()
 
 
 if __name__ == "__main__":

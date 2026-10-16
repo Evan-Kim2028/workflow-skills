@@ -2,3 +2,4 @@
 __pycache__/
 *.sqlite*
 .DS_Store
+tools/agent-dash/static/plans/

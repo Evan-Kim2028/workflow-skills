@@ -30,6 +30,9 @@ cd ~/.claude/tools/agent-dash
 python3 agent_dash.py run
 python3 agent_dash.py status
 python3 agent_dash.py stop
+python3 agent_dash.py reprice
+python3 agent_dash.py reconcile
+python3 agent_dash.py ws list
 ```
 
 Open http://127.0.0.1:8765/ . `stop` signals only the pid in the pidfile.
@@ -70,6 +73,7 @@ Environment variables override the files:
 - `AGENT_DASH_HUB_DIR` (optional directory with `issues/` and `workstreams.tsv`)
 - `AGENT_DASH_ISSUES_DIR`, `AGENT_DASH_WORKSTREAMS_TSV` (override the two hub paths)
 - `AGENT_DASH_STATE_DIR`
+- `AGENT_DASH_WORKSTREAMS` (plan bundles, default `~/.local/share/agent-dash/workstreams`)
 - `AGENT_DASH_MAP`, `AGENT_DASH_PLANS`, `AGENT_DASH_TASKMAP`, `AGENT_DASH_CONFIG`
 
 The example scratch value is `$HOME/agent-scratch/*`. A glob that matches nothing is the same as an empty list.

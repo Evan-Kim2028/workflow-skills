@@ -52,6 +52,12 @@ svg{display:block;overflow:visible}
 .ax text,.ax{fill:var(--muted);font:11px var(--font)}
 .gl{stroke:var(--grid);stroke-width:1}
 .bl{stroke:var(--axis);stroke-width:1}
+.plinks{display:flex;flex-wrap:wrap;align-items:center;gap:6px;margin:4px 0 10px}
+.plinks b{font:600 11.5px var(--mono);color:var(--muted);text-transform:uppercase;letter-spacing:.05em;margin-right:4px}
+.plinks a{font:600 13px var(--font);color:var(--ink);text-decoration:none;padding:5px 11px;border-radius:999px;border:1px solid var(--grid);background:var(--surface)}
+.plinks a:hover,.plinks a:focus-visible{border-color:var(--s1);color:var(--s1)}
+.plinks a.cur{border-color:var(--s1);box-shadow:inset 0 0 0 1px var(--s1)}
+.planbtn{margin-left:auto;font:600 13px var(--font);color:var(--s1);text-decoration:none;border:1px solid var(--s1);border-radius:999px;padding:4px 11px;white-space:nowrap}
 .axt{fill:var(--ink-2);font:600 11px var(--font)}
 .tip{position:fixed;pointer-events:none;background:var(--surface);border:1px solid var(--ring);border-radius:8px;padding:8px 10px;font-size:12px;box-shadow:0 6px 20px rgba(0,0,0,.18);z-index:20;min-width:140px;display:none}
 .tip b{display:block;margin-bottom:4px}
@@ -143,6 +149,7 @@ tr.clk{cursor:pointer}tr.clk:hover td{background:var(--surface-2)}
 <span class="seg-ctl" id="range"><button data-h="6" aria-pressed="false">6 h</button><button data-h="24" aria-pressed="true">24 h</button><button data-h="72" aria-pressed="false">3 d</button></span>
 <button id="theme" title="Toggle light or dark">Theme</button>
 </header>
+<nav class="plinks" id="plinks" aria-label="Plans"></nav>
 <nav class="tabs" id="tabs" role="tablist"></nav>
 <main id="main"></main>
 <p class="foot" id="foot"></p>
@@ -223,13 +230,17 @@ tr.clk{cursor:pointer}tr.clk:hover td{background:var(--surface-2)}
   /* tabs */
   function renderTabs() {
     var t = document.getElementById("tabs"); t.innerHTML = "";
-    var list = [{ws: "all", name: "Overall"}].concat(shown(state.wss).map(function (w) { return {ws: w.ws, name: w.ws + (w.name ? " " + w.name : ""), running: w.running}; }));
+    var seen = {}, uniq = shown(state.wss).filter(function (w) { var k = String(w.ws).toUpperCase(); if (seen[k]) return false; seen[k] = 1; return true; });
+    var pl = document.getElementById("plinks"); pl.innerHTML = ""; pl.appendChild(el("b", {text: "Plans"}));
+    [{ws: "overview", name: "Overview"}].concat(uniq).forEach(function (w) { pl.appendChild(el("a", {href: planUrl(w.ws), target: "_blank", rel: "noopener", class: String(w.ws) === state.ws ? "cur" : "", text: (w.ws === "overview" ? "" : w.ws + " ") + (w.name || "") + " \u2197"})); });
+    var list = [{ws: "all", name: "Overall"}].concat(uniq.map(function (w) { return {ws: w.ws, name: w.ws + (w.name ? " " + w.name : ""), running: w.running}; }));
     list.forEach(function (w) {
       var b = el("button", {class: "tab", role: "tab", "aria-selected": String(state.ws === w.ws), onclick: function () { go(w.ws); }}, [w.name]);
       if (w.running) b.appendChild(el("span", {class: "c", text: w.running + " live"}));
       t.appendChild(b);
     });
   }
+  function planUrl(ws) { return "/plan?ws=" + (String(ws).toLowerCase() === "overview" ? "OVERVIEW" : String(ws).toUpperCase()); }
   function go(ws) { state.ws = ws; var u = new URL(location.href); if (ws === "all") u.searchParams.delete("ws"); else u.searchParams.set("ws", ws); history.replaceState(null, "", u); renderTabs(); refreshAll(); }
 
   /* components */
@@ -239,28 +250,16 @@ tr.clk{cursor:pointer}tr.clk:hover td{background:var(--surface-2)}
     var tk = snap.totals ? snap.totals.tokens : {};
     var allTok = (tk.input || 0) + (tk.output || 0) + (tk.cache_read || 0) + (tk.cache_write || 0);
     var g = el("div", {class: "grid g-tiles"});
-    [["Running now", run.length, Object.keys(byTier).map(function (k) { return k + " " + byTier[k]; }).join(" · ") || "idle"],
-     ["Finished, last hour", (snap.recent || []).length, (snap.recent || []).filter(function (r) { return r.status === "died_early" || r.status === "killed"; }).length + " died or killed"],
+    var cn = snap.counts || {}, lbt = cn.live_by_tool || {}, fv = cn.finished_by_verdict || {};
+    var liveSub = Object.keys(lbt).filter(function (k) { return lbt[k]; }).map(function (k) { return modelName(k === "claude" ? "opus" : k).replace("Opus", "Claude") + " " + fmtN(lbt[k]); }).join(" \u00B7 ") || "idle";
+    var bad = (fv.BLOCKED || 0) + (fv.REQUEST_CHANGES || 0), part = (fv.PARTIAL || 0) + (fv.APPROVE_WITH_CHANGES || 0);
+    [["Agents live now", fmtN(cn.live_agents != null ? cn.live_agents : run.length), liveSub],
+     ["Agents finished today", fmtN(cn.finished_today || 0), "\u2713 " + fmtN((fv.PASS || 0) + (fv.APPROVE || 0) + (fv.APPROVE_WITH_NITS || 0)) + " pass \u00B7 \u25D0 " + fmtN(part) + " partial \u00B7 \u2715 " + fmtN(bad) + " blocked (" + state.hours + " h)"],
      ["Tokens", fmtN(allTok), "out " + fmtN(tk.output) + " · cache read " + fmtN(tk.cache_read)],
-     ["Est. cost (priced models)", fmtUsd(snap.totals && snap.totals.cost_usd), (snap.totals && snap.totals.unpriced_runs || 0) + " runs unpriced (GLM, Grok, muse)"],
+     ["Est. cost (priced models)", fmtUsd(snap.totals && snap.totals.cost_usd), fmtN(snap.totals && snap.totals.unpriced_runs || 0) + " runs unpriced"],
      ["Alerts", (snap.alerts || []).length, (snap.alerts || []).slice(0, 2).map(function (a) { return a.kind.replace("_", " "); }).join(" · ") || "none"]
     ].forEach(function (t) { g.appendChild(el("div", {class: "card tile"}, [el("div", {class: "v", text: String(t[1])}), el("div", {class: "l", text: t[0]}), el("div", {class: "x", text: t[2]})])); });
     return g;
-  }
-
-  function capMeters(snap) {
-    var c = el("div", {class: "card"}, [el("h2", {text: "Concurrency vs caps"}), el("p", {class: "sub", text: "Live parent processes per tool. The dashed line is the cap."})]);
-    var caps = snap.caps || {};
-    [["grok", "Grok 4.7"], ["muse", "muse"], ["glm", "GLM"], ["claude", "Claude"]].forEach(function (p) {
-      var v = caps[p[0]] || {live: 0, cap: null}, cap = v.cap || Math.max(10, v.live), max = Math.max(cap, v.live, 1) * 1.15;
-      var m = el("div", {class: "meter"}), trk = el("div", {class: "trk"}), f = el("div", {class: "fill"});
-      f.style.width = (100 * v.live / max) + "%"; f.style.background = v.cap && v.live > v.cap ? "var(--critical)" : colorOf(p[0] === "claude" ? "opus" : p[0]);
-      trk.appendChild(f);
-      if (v.cap) { var cl = el("div", {class: "cap"}); cl.style.left = (100 * v.cap / max) + "%"; trk.appendChild(cl); }
-      m.appendChild(el("span", {text: p[1]})); m.appendChild(trk); m.appendChild(el("span", {class: "n", text: v.live + (v.cap ? " / " + v.cap : "")}));
-      c.appendChild(m);
-    });
-    return c;
   }
 
   function statusEl(r) { var st = r.status || "unknown"; return el("span", {class: "st " + st}, [el("i"), st === "died_early" ? "died early" : st]); }
@@ -288,7 +287,7 @@ tr.clk{cursor:pointer}tr.clk:hover td{background:var(--surface-2)}
   }
 
   function alertsCard(snap) {
-    var c = el("div", {class: "card"}, [el("h2", {text: "Alerts"}), el("p", {class: "sub", text: "Runs that died early or were killed, ran past their tier cap, or pushed a tool over its concurrency cap."})]);
+    var c = el("div", {class: "card"}, [el("h2", {text: "Alerts"}), el("p", {class: "sub", text: "Runs that died early, were killed, or ran past their tier limit."})]);
     var a = snap.alerts || [];
     if (!a.length) c.appendChild(el("div", {class: "empty", text: "Nothing needs attention."}));
     a.slice(0, 12).forEach(function (x) { c.appendChild(el("div", {class: "alert"}, [el("span", {class: "ic " + x.kind, text: x.kind.replace("_", " ")}), el("div", null, [el("span", {class: "lbl", text: x.label || x.run_id}), el("div", {style: "color:var(--ink-2);font-size:12.5px", text: x.detail || ""})])])); });
@@ -333,10 +332,10 @@ tr.clk{cursor:pointer}tr.clk:hover td{background:var(--surface-2)}
   function concChart(snap) {
     var c = el("div", {class: "card"}, [el("h2", {text: "Live agents over time"}), el("p", {class: "sub", text: "One strip per tool on its own count, for this view's scope."})]);
     var P = state.conc; if (!P.length) { c.appendChild(el("div", {class: "empty", text: "No samples yet."})); return c; }
-    var caps = snap.caps || {}, tools = [["grok", "Grok 4.7"], ["muse", "muse"], ["glm", "GLM"], ["claude", "Claude"]];
+    var tools = [["grok", "Grok 4.7"], ["muse", "muse"], ["glm", "GLM"], ["claude", "Claude"]];
     var t0 = P[0].t, t1 = P[P.length - 1].t;
     tools.forEach(function (tl) {
-      var cap = null; var mx = Math.max(cap || 0, 1); P.forEach(function (p) { mx = Math.max(mx, p[tl[0]] || 0); }); mx = Math.max(2, Math.ceil(mx / 2) * 2);
+      var mx = 1; P.forEach(function (p) { mx = Math.max(mx, p[tl[0]] || 0); }); mx = Math.max(2, Math.ceil(mx / 2) * 2);
       var last = tl === tools[tools.length - 1], W = 900, H = last ? 98 : 74, L = 110, R = 8, T = 14, Bm = last ? 34 : 6, pw = W - L - R, ph = H - T - Bm;
       var svg = s("svg", {viewBox: "0 0 " + W + " " + H, width: "100%", role: "img", "aria-label": tl[1] + " live runs over time"});
       var nm = s("text", {x: 0, y: T + ph / 2 + 4, class: "ax"}); nm.textContent = tl[1]; nm.setAttribute("style", "fill:var(--ink-2);font:600 12px var(--font)"); svg.appendChild(nm);
@@ -350,7 +349,6 @@ tr.clk{cursor:pointer}tr.clk:hover td{background:var(--surface-2)}
       svg.appendChild(s("path", {d: d, fill: col, "fill-opacity": ".22", stroke: "none"}));
       var ln = "M" + P.map(function (p) { return X(p.t) + "," + Y(p[tl[0]] || 0); }).join(" L");
       svg.appendChild(s("path", {d: ln, fill: "none", stroke: col, "stroke-width": 2}));
-      if (cap) { svg.appendChild(s("line", {x1: L, x2: W - R, y1: Y(cap), y2: Y(cap), stroke: "currentColor", "stroke-dasharray": "4 3", "stroke-width": 1.2, style: "color:var(--ink-2)"})); var ct = s("text", {x: W - R, y: Y(cap) - 3, "text-anchor": "end", class: "ax"}); ct.textContent = "cap " + cap; svg.appendChild(ct); }
       var hit = s("rect", {x: L, y: T, width: pw, height: ph, fill: "transparent"});
       hit.addEventListener("mousemove", function (ev) { var bb = svg.getBoundingClientRect(); var tt = t0 + (t1 - t0) * ((ev.clientX - bb.left) * W / bb.width - L) / pw; var best = P[0]; P.forEach(function (p) { if (Math.abs(p.t - tt) < Math.abs(best.t - tt)) best = p; }); showTip(ev, fmtT(best.t), tools.map(function (q) { return {k: q[1], v: String(best[q[0]] || 0), c: colorOf(q[0] === "claude" ? "opus" : q[0])}; })); });
       hit.addEventListener("mouseleave", hideTip); svg.appendChild(hit);
@@ -491,7 +489,7 @@ tr.clk{cursor:pointer}tr.clk:hover td{background:var(--surface-2)}
     ((snap && snap.running) || []).forEach(function (r) { if (r.workstream && r.workstream !== plan.ws) return; var t = taskOf(r, plan.ws); if (t) (live[t] = live[t] || []).push(r); else if (r.workstream === plan.ws) unassigned.push(r); });
     ((snap && snap.recent) || []).forEach(function (r) { if (r.ended_at && now - r.ended_at < 900) { var t = taskOf(r, plan.ws); if (t) just[t] = r; } });
     var nLive = Object.keys(live).reduce(function (a, k) { return a + live[k].length; }, 0);
-    var c = el("div", {class: "card"}, [el("h2", {text: plan.ws + " plan progress" + (nLive ? " · " + nLive + " agent" + (nLive > 1 ? "s" : "") + " working" : "")}), el("p", {class: "sub", text: "Every task by group, coloured by state (legend below). The badge on a working chip is the agent tool and count. Arrows show what each group waits on."})]);
+    var c = el("div", {class: "card"}, [el("div", {style: "display:flex;align-items:baseline;gap:10px;flex-wrap:wrap"}, [el("h2", {text: plan.ws + " plan progress" + (nLive ? " · " + nLive + " agent" + (nLive > 1 ? "s" : "") + " working" : "")}), el("a", {class: "planbtn", href: planUrl(plan.ws), target: "_blank", rel: "noopener", text: "Open the " + plan.ws + " plan \u2197"})]), el("p", {class: "sub", text: "Every task by group, coloured by state (legend below). The badge on a working chip is the agent tool and count. Arrows show what each group waits on."})]);
     if (unassigned.length) { var ua = el("div", {class: "unassigned"}, [el("b", {style: "font-size:12px;color:var(--ink-2)", text: "Running, not mapped to a task:"})]); unassigned.forEach(function (r) { var sp = el("span", {title: (r.tier || "") + " · " + fmtDur(r.elapsed_s), text: r.label || r.run_id}); sp.style.borderColor = colorOf(tierKey(r)); ua.appendChild(sp); }); c.appendChild(ua); }
     var tot = {done: 0, prog: 0, pr: 0, todo: 0, deferred: 0};
     var wrap = el("div", {class: "dag-scroll"}), dag = el("div", {class: "dag"}), svg = s("svg", {class: "dedges"}); dag.appendChild(svg); wrap.appendChild(dag);

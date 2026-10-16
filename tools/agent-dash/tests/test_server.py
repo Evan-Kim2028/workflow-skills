@@ -66,8 +66,8 @@ class ServerTest(unittest.TestCase):
         self.assertIn("application/json", content_type)
         payload = json.loads(body)
         self.assertEqual(payload["running"], [])
-        self.assertEqual(payload["caps"]["grok"]["cap"], 10)
-        self.assertIsNone(payload["caps"]["claude"]["cap"])
+        self.assertNotIn("caps", payload)
+        self.assertEqual(payload["counts"]["live_agents"], 0)
         status, _, body = get(self.port, "/api/health")
         health = json.loads(body)
         self.assertEqual(status, 200)
@@ -226,12 +226,11 @@ class PlanAndBackfillTest(unittest.TestCase):
         self.assertFalse(is_dash(os.getpid()))
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "config.json"
-            path.write_text(json.dumps({"host": "0.0.0.0", "caps": {"grok": 3}}), encoding="utf-8")
+            path.write_text(json.dumps({"host": "bad-host", "caps": {"grok": 3}}), encoding="utf-8")
             cfg = load_cfg(path)
         self.assertEqual(cfg["host"], "127.0.0.1")
         self.assertEqual(cfg["port"], 8765)
-        self.assertEqual(cfg["caps"]["grok"], 3)
-        self.assertEqual(cfg["caps"]["muse"], 10)
+        self.assertNotIn("caps", cfg)
 
 
 if __name__ == "__main__":

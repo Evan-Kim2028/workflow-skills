@@ -1,0 +1,67 @@
+{
+  "workstream": "WS1",
+  "decisions": [
+    {
+      "id": "D1",
+      "question": "Which read path do clients keep?",
+      "decision": "Keep one route and retire the other two.",
+      "alternatives": [
+        {"option": "Leave all three readers", "why_not": "They drift."}
+      ],
+      "evidence": ["the route list in the repo"],
+      "why": "One contract is easier to test.",
+      "risk": "A client still calls an old route.",
+      "reversible": true,
+      "review_needed": "The sample set still loads."
+    }
+  ],
+  "motivation": {
+    "today": [{"pain": "Three readers answer the same question.", "measure": "3 readers"}],
+    "after": [{"gain": "Clients call one route.", "measure": "1 route"}],
+    "costs": [{"cost": "A short migration.", "measure": "1 release"}],
+    "not_better": ["Write latency is unchanged."],
+    "verdict": "WORTH_IT",
+    "verdict_reason": "The read-path migration decision (D-12) removes two of the three readers.",
+    "conditions": ["The sample set loads."]
+  },
+  "agent_friendly": {
+    "litmus": "One command proves the route.",
+    "litmus_check": "run the sample set",
+    "requirements": [
+      {
+        "n": 1,
+        "title": "First requirement",
+        "mechanism": "The sample loader.",
+        "verify": "run the sample set"
+      }
+    ],
+    "new_tasks": [
+      {"id": "WS1.1", "title": "First task", "phase": "Shape", "size": "S"}
+    ]
+  },
+  "dag": {
+    "cols": ["Shape", "Build", "Prove"],
+    "groups": [
+      {
+        "id": "start",
+        "col": 0,
+        "title": "First group",
+        "tasks": [
+          {"id": "WS1.1", "title": "Agree the contract", "status": "todo"}
+        ]
+      }
+    ],
+    "edges": []
+  },
+  "narrative": {
+    "thesis": "One read path replaces three readers.",
+    "end_state": "Clients read one route.",
+    "phases": [
+      {
+        "name": "Shape",
+        "goal": "The contract is written down.",
+        "gate": "The sample set loads."
+      }
+    ]
+  }
+}

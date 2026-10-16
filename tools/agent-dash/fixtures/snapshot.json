@@ -1,22 +1,24 @@
 {
   "now": 1761999960,
   "seq": 4,
-  "caps": {
-    "grok": {
-      "live": 2,
-      "cap": 10
+  "counts": {
+    "live_agents": 7,
+    "live_by_tool": {
+      "grok": 2,
+      "muse": 3,
+      "glm": 1,
+      "claude": 1
     },
-    "muse": {
-      "live": 3,
-      "cap": 10
-    },
-    "glm": {
-      "live": 1,
-      "cap": 5
-    },
-    "claude": {
-      "live": 2,
-      "cap": null
+    "finished_today": 109,
+    "finished_in_range": 109,
+    "finished_by_verdict": {
+      "BLOCKED": 23,
+      "APPROVE": 13,
+      "APPROVE_WITH_CHANGES": 22,
+      "REQUEST_CHANGES": 14,
+      "PASS": 21,
+      "PARTIAL": 12,
+      "none": 4
     }
   },
   "running": [

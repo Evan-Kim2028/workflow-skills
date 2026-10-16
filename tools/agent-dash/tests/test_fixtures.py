@@ -125,14 +125,15 @@ class FixtureShapeTests(unittest.TestCase):
         for doc in (self.snap, self.ws7):
             self.assertTrue(num(doc["now"]))
             self.assertIsInstance(doc["seq"], int)
-            self.assertEqual(set(doc["caps"]), {"grok", "muse", "glm", "claude"})
-            self.assertEqual(doc["caps"]["grok"]["cap"], 10)
-            self.assertEqual(doc["caps"]["muse"]["cap"], 10)
-            self.assertEqual(doc["caps"]["glm"]["cap"], 5)
-            self.assertIsNone(doc["caps"]["claude"]["cap"])
-            for tool, row in doc["caps"].items():
-                self.assertIsInstance(row["live"], int)
-                self.assertGreaterEqual(row["live"], 0)
+            self.assertNotIn("caps", doc)
+            counts = doc["counts"]
+            self.assertEqual(
+                set(counts),
+                {"live_agents", "live_by_tool", "finished_today", "finished_in_range", "finished_by_verdict"},
+            )
+            self.assertEqual(set(counts["live_by_tool"]), {"grok", "muse", "glm", "claude"})
+            self.assertEqual(sum(counts["live_by_tool"].values()), counts["live_agents"])
+            self.assertIsInstance(counts["finished_by_verdict"], dict)
             self.assertLessEqual(len(doc["recent"]), 50)
             self.assert_totals(doc["totals"])
             for run in doc["running"]:
@@ -153,11 +154,12 @@ class FixtureShapeTests(unittest.TestCase):
                 )
                 self.assertIn(
                     alert["kind"],
-                    {"died_early", "killed", "long_running", "over_cap"},
+                    {"died_early", "killed", "long_running"},
                 )
                 self.assertTrue(num(alert["ts"]))
         self.assertEqual(self.snap["now"], self.ws7["now"])
-        self.assertEqual(self.snap["caps"], self.ws7["caps"])
+        self.assertIn("counts", self.snap)
+        self.assertIn("counts", self.ws7)
         for run in self.ws7["running"] + self.ws7["recent"]:
             self.assertEqual(run["workstream"], "WS7")
         for row in self.ws7["by_workstream"]:

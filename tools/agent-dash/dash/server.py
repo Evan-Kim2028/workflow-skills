@@ -10,8 +10,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from dash.plans import PlanError, PlanNotFound, configured, load as load_plan
-from dash.store import DEFAULT_CAPS, DEFAULT_LONG_RUNNING_S
+from dash.bundles import bundle_plan_view, list_bundles, load_bundle_api, read_page, workstream_plan_ids
+from dash.plans import PlanError, PlanNotFound, load as load_plan
+from dash.pricing import health_block
+from dash.store import DEFAULT_LONG_RUNNING_S
 
 ROOT = Path(__file__).resolve().parents[1]
 INDEX_PATH = ROOT / "static" / "index.html"
@@ -56,11 +58,21 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/api/sessions":
                 self._json(200, {"sessions": self.server.store.query_sessions()})
             elif path == "/api/workstreams":
-                self._json(200, {"workstreams": self.server.store.query_workstreams(configured())})
+                self._json(200, {"workstreams": self.server.store.query_workstreams(workstream_plan_ids())})
             elif path == "/api/plan":
                 self._plan(query)
+            elif path == "/plan":
+                self._plan_page()
+            elif path == "/api/bundles":
+                self._bundles()
+            elif path == "/api/bundle":
+                self._bundle(query)
+            elif path.startswith("/bundle/"):
+                self._bundle_page(path)
             elif path == "/api/health":
-                self._json(200, self.server.registry.health(time.time()))
+                body = self.server.registry.health(time.time())
+                body["pricing"] = health_block(self.server.store.usage_model_stats())
+                self._json(200, body)
             elif path.startswith("/static/"):
                 self._static(path[len("/static/"):])
             else:
@@ -81,14 +93,15 @@ class Handler(BaseHTTPRequestHandler):
         return
 
     def _static(self, name):
-        """Serve a flat file from static/ (json, js, css, svg); no subdirectories, no traversal."""
+        """Serve a file from static/ or one subdirectory (json, js, css, svg, html). No dotfiles, no traversal."""
         if name == "taskmap.json":
             self._taskmap()
             return
         types = {".json": "application/json", ".js": "text/javascript", ".css": "text/css", ".svg": "image/svg+xml", ".html": "text/html; charset=utf-8"}
-        base = self.server.index_path.parent
-        target = base / name
-        if "/" in name or name.startswith(".") or target.suffix not in types or not target.is_file():
+        base = self.server.index_path.parent.resolve()
+        target = (base / name).resolve()
+        parts = name.split("/")
+        if any(p == "" or p.startswith(".") for p in parts) or base not in target.parents or target.suffix not in types or not target.is_file():
             self._json(404, {"error": "not found"})
             return
         body = target.read_bytes()
@@ -122,7 +135,9 @@ class Handler(BaseHTTPRequestHandler):
     def _snapshot(self, query):
         ws = _ws(query, default="all")
         now = time.time()
-        self._json(200, self.server.store.snapshot(now, ws, _caps(self.server), _long(self.server)))
+        since = _float(query, "since")
+        until = _float(query, "until")
+        self._json(200, self.server.store.snapshot(now, ws, _long(self.server), since, until))
 
     def _runs(self, query):
         now = time.time()
@@ -157,12 +172,50 @@ class Handler(BaseHTTPRequestHandler):
         try:
             body = load_plan(ws)
         except PlanNotFound:
-            self._json(404, {"error": "plan not found", "ws": ws})
-            return
+            body = bundle_plan_view(ws)
+            if body is None:
+                self._json(404, {"error": "plan not found", "ws": ws})
+                return
         except PlanError:
             self._json(500, {"error": "plan unreadable", "ws": ws})
             return
         self._json(200, body)
+
+    def _plan_page(self):
+        path = self.server.index_path.parent / "plan.html"
+        if not path.is_file():
+            self._json(404, {"error": "not found"})
+            return
+        self._bytes(200, path.read_bytes(), "text/html; charset=utf-8")
+
+    def _bundles(self):
+        self._json(200, {"bundles": list_bundles()})
+
+    def _bundle(self, query):
+        ws = _one(query, "ws")
+        if not ws:
+            raise ValueError("ws required")
+        if ws in (".", "..") or not _WS.match(ws):
+            raise ValueError("bad ws")
+        body = load_bundle_api(ws)
+        if body is None:
+            self._json(404, {"error": "bundle not found", "ws": ws})
+            return
+        self._json(200, body)
+
+    def _bundle_page(self, path):
+        parts = [part for part in path.split("/") if part]
+        if len(parts) != 3 or parts[0] != "bundle" or parts[2] != "page.html":
+            self._json(404, {"error": "not found"})
+            return
+        if parts[1] in (".", "..") or not _WS.match(parts[1]):
+            self._json(404, {"error": "not found"})
+            return
+        body = read_page(parts[1])
+        if body is None:
+            self._json(404, {"error": "not found"})
+            return
+        self._bytes(200, body, "text/html; charset=utf-8")
 
     def _stream(self):
         self.send_response(200)
@@ -172,7 +225,7 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         interval = self.server.stream_interval
         while not self.server.stop.is_set():
-            payload = self.server.store.snapshot(time.time(), "all", _caps(self.server), _long(self.server))
+            payload = self.server.store.snapshot(time.time(), "all", _long(self.server))
             data = {"seq": payload["seq"], "running": payload["running"], "alerts_count": len(payload["alerts"])}
             blob = ("event: tick\ndata: " + json.dumps(data, separators=(",", ":"), allow_nan=False) + "\n\n").encode()
             try:
@@ -194,6 +247,17 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(body)
+
+
+def _static_rel(name: str) -> bool:
+    if not name or name.startswith(("/", "\\")) or "\\" in name:
+        return False
+    parts = name.split("/")
+    if any(part in ("", ".", "..") or part.startswith(".") for part in parts):
+        return False
+    if len(parts) == 1:
+        return True
+    return len(parts) == 2 and parts[0] == "vendor"
 
 
 def _one(query: dict, name: str):
@@ -240,14 +304,6 @@ def _choice(query: dict, name: str, default: str, allowed: set[str]) -> str:
     if value not in allowed:
         raise ValueError(f"bad {name}")
     return value
-
-
-def _caps(server) -> dict:
-    caps = dict(DEFAULT_CAPS)
-    custom = (server.cfg or {}).get("caps")
-    if isinstance(custom, dict):
-        caps.update(custom)
-    return caps
 
 
 def _long(server) -> dict:

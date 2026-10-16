@@ -1,0 +1,148 @@
+import json
+import os
+import sys
+import tempfile
+import threading
+import time
+import unittest
+import http.client
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from agent_dash import default_cfg
+from dash.server import DashServer
+from dash.sources import Registry
+from dash.store import Store
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def start(store, index):
+    server = DashServer(store, Registry([]), "127.0.0.1", 0, index_path=index, stream_interval=30, cfg=default_cfg())
+    thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True)
+    thread.start()
+    return server, thread
+
+
+def stop(server, thread):
+    server.stop.set()
+    server.shutdown()
+    thread.join(3)
+    server.server_close()
+
+
+def get(port, path):
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=3)
+    try:
+        conn.request("GET", path)
+        response = conn.getresponse()
+        return response.status, response.getheader("Content-Type"), response.read()
+    finally:
+        conn.close()
+
+
+class BundlesApiTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.old = os.environ.get("AGENT_DASH_WORKSTREAMS")
+        os.environ["AGENT_DASH_WORKSTREAMS"] = self.tmp.name
+        root = Path(self.tmp.name)
+        overview = root / "OVERVIEW"
+        overview.mkdir()
+        (overview / "bundle.json").write_text(
+            json.dumps({"id": "OVERVIEW", "title": "Overview", "short": "Program", "order": 9, "kind": "program"}),
+            encoding="utf-8",
+        )
+        (overview / "plan.json").write_text(
+            json.dumps({"narrative": {"thesis": "One program.", "end_state": "One API.", "phases": []}}),
+            encoding="utf-8",
+        )
+        (overview / "page.html").write_text("<p>OVERVIEW-PAGE</p>", encoding="utf-8")
+        ws = root / "WS9"
+        ws.mkdir()
+        (ws / "bundle.json").write_text(
+            json.dumps({"id": "WS9", "title": "Example", "short": "Ex", "order": 1, "kind": "workstream"}),
+            encoding="utf-8",
+        )
+        (ws / "plan.json").write_text(
+            json.dumps(
+                {
+                    "dag": {
+                        "cols": ["Shape"],
+                        "groups": [{"id": "g", "col": 0, "title": "Group", "tasks": [{"id": "WS9.1", "title": "First task", "status": "todo"}]}],
+                        "edges": [],
+                    },
+                    "narrative": {"phases": []},
+                }
+            ),
+            encoding="utf-8",
+        )
+        (ws / "page.html").write_text("<p>WS9-PAGE</p>", encoding="utf-8")
+        self.store = Store(Path(self.tmp.name) / "dash.sqlite")
+        self.store.upsert_run(
+            {
+                "run_id": "muse:s:ws9-probe",
+                "source": "muse",
+                "tier": "muse",
+                "label": "ws9-probe",
+                "status": "running",
+                "started_at": time.time(),
+            }
+        )
+        self.server, self.thread = start(self.store, ROOT / "static" / "index.html")
+        self.port = self.server.server_address[1]
+
+    def tearDown(self):
+        stop(self.server, self.thread)
+        self.store.close()
+        if self.old is None:
+            os.environ.pop("AGENT_DASH_WORKSTREAMS", None)
+        else:
+            os.environ["AGENT_DASH_WORKSTREAMS"] = self.old
+        self.tmp.cleanup()
+
+    def test_bundle_routes_and_traversal(self):
+        status, content_type, body = get(self.port, "/api/bundles")
+        self.assertEqual(status, 200)
+        payload = json.loads(body)
+        self.assertEqual([item["id"] for item in payload["bundles"]], ["OVERVIEW", "WS9"])
+        status, _, body = get(self.port, "/api/bundle?ws=WS9")
+        self.assertEqual(status, 200)
+        bundle = json.loads(body)
+        self.assertEqual(bundle["bundle"]["title"], "Example")
+        self.assertEqual(bundle["plan"]["dag"]["groups"][0]["tasks"][0]["id"], "WS9.1")
+        status, content_type, body = get(self.port, "/bundle/WS9/page.html")
+        self.assertEqual(status, 200)
+        self.assertIn("text/html", content_type)
+        self.assertIn(b"WS9-PAGE", body)
+        status, _, _ = get(self.port, "/bundle/WS9/plan.json")
+        self.assertEqual(status, 404)
+        status, _, _ = get(self.port, "/bundle/../page.html")
+        self.assertEqual(status, 404)
+        status, _, _ = get(self.port, "/bundle/WS9/../../agent_dash.py")
+        self.assertEqual(status, 404)
+        status, _, body = get(self.port, "/static/../agent_dash.py")
+        self.assertEqual(status, 404)
+        status, _, body = get(self.port, "/api/plan?ws=WS9")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)["cols"], ["Shape"])
+        self.assertEqual(json.loads(body)["groups"][0]["tasks"][0]["title"], "First task")
+        status, _, body = get(self.port, "/api/plan?ws=NOPE")
+        self.assertEqual(status, 404)
+        status, _, body = get(self.port, "/api/bundle?ws=..")
+        self.assertEqual(status, 400)
+        status, content_type, body = get(self.port, "/plan")
+        self.assertEqual(status, 200)
+        self.assertIn(b"Execution", body)
+        self.assertIn(b"/static/plan.css", body)
+        status, _, body = get(self.port, "/api/workstreams")
+        rows = {item["ws"]: item for item in json.loads(body)["workstreams"]}
+        self.assertTrue(rows["WS9"]["plan"])
+        status, content_type, body = get(self.port, "/api/plan?ws=WS7")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)["ws"], "WS7")
+
+
+if __name__ == "__main__":
+    unittest.main()

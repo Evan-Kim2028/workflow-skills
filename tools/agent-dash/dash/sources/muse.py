@@ -25,6 +25,8 @@ import logging
 import os
 from datetime import datetime, timedelta, timezone
 
+from dash.sources.process import apply_liveness, live_agent_processes
+
 log = logging.getLogger("agent_dash.muse")
 
 NAME = "muse"
@@ -57,6 +59,7 @@ def _poll(store, cfg, now):
     only = _only_session(cfg)
     if only:
         fresh_hours = 0
+    processes = _agent_processes()
 
     manifests = {}
     for scratch in _scratch_roots(cfg):
@@ -70,7 +73,7 @@ def _poll(store, cfg, now):
                 _keep_latest(manifests, row)
 
     for sid in manifests:
-        _upsert_run(store, sid, manifests, None, None, False, None)
+        _upsert_run(store, sid, manifests, None, None, False, None, processes)
 
     files = _candidate_files(store, sessions, manifests, now, fresh_hours, scan_s)
     if not files or budget <= 0:
@@ -84,7 +87,7 @@ def _poll(store, cfg, now):
     while scanned < n and budget > 0:
         path, sid, muse_parent = files[idx]
         budget = _tail_file(
-            store, path, sid, manifests, muse_parent, budget, per_file, now
+            store, path, sid, manifests, muse_parent, budget, per_file, now, processes
         )
         idx = (idx + 1) % n
         scanned += 1
@@ -125,7 +128,7 @@ def _candidate_files(store, root, manifests, now, fresh_hours, scan_s):
     return expanded
 
 
-def _tail_file(store, path, sid, manifests, muse_parent, budget, per_file, now):
+def _tail_file(store, path, sid, manifests, muse_parent, budget, per_file, now, processes):
     try:
         raw, budget, started_at_zero = _read_chunk(store, path, path, budget, per_file)
     except Exception:
@@ -180,6 +183,7 @@ def _tail_file(store, path, sid, manifests, muse_parent, budget, per_file, now):
             model,
             started_at_zero and first_ts is not None,
             first_ts,
+            processes,
         )
     return budget
 
@@ -223,7 +227,7 @@ def _parse_line(line, fallback_sid):
     }
 
 
-def _upsert_run(store, sid, manifests, muse_parent, model, have_log_start, log_ts):
+def _upsert_run(store, sid, manifests, muse_parent, model, have_log_start, log_ts, processes=None):
     row = manifests.get(sid)
     label = _label(sid, row)
     parent = muse_parent or (row or {}).get("parent_session_id")
@@ -245,6 +249,7 @@ def _upsert_run(store, sid, manifests, muse_parent, model, have_log_start, log_t
     elif have_log_start and log_ts is not None:
         run["started_at"] = log_ts
         run["clock_source"] = "muse_log"
+    apply_liveness(store, run, "muse", processes)
     try:
         store.upsert_run(run)
     except Exception:
@@ -261,6 +266,14 @@ def _upsert_run(store, sid, manifests, muse_parent, model, have_log_start, log_t
         store.upsert_session(session)
     except Exception:
         _fail("session")
+
+
+def _agent_processes():
+    """One process listing per poll. None means the listing failed."""
+    try:
+        return live_agent_processes()
+    except Exception:
+        return None
 
 
 def _run_id(sid, manifests):
@@ -549,11 +562,6 @@ def _scratch_roots(cfg):
     from dash.locate import scratch_roots
 
     return scratch_roots(cfg)
-
-
-def _scratch_root(cfg):
-    found = _scratch_roots(cfg)
-    return found[0] if found else ""
 
 
 def _only_session(cfg):

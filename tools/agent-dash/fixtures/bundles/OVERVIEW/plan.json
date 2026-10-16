@@ -1,0 +1,13 @@
+{
+  "narrative": {
+    "thesis": "One program, one read path.",
+    "end_state": "Every client reads the same route.",
+    "phases": [
+      {
+        "name": "Shape",
+        "goal": "Agree the contract.",
+        "gate": "The sample set loads."
+      }
+    ]
+  }
+}

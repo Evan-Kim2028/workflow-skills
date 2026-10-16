@@ -1,8 +1,11 @@
-"""Cursor-agent source tests. Synthetic chats plus a read-only smoke on three real ones."""
+"""Cursor-agent source tests. Synthetic chats plus a read-only smoke on a local home."""
 
+import importlib.util
 import json
 import os
 import sqlite3
+import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -69,6 +72,10 @@ class Mem:
         current.update(row)
         self.runs[row["run_id"]] = current
 
+    def get_run(self, run_id):
+        row = self.runs.get(run_id)
+        return dict(row) if row else None
+
     def upsert_session(self, row):
         current = dict(self.sessions.get(row["session_id"]) or {})
         current.update(row)
@@ -129,7 +136,41 @@ def write_db(path, meta_obj, blobs, keep_open=False):
     return None
 
 
-def add_chat(home, uuid, cwd, created_ms, updated_ms, label, blobs, transcript=True, encoded=None):
+def pb_varint(n):
+    out = bytearray()
+    while True:
+        piece = n & 0x7F
+        n >>= 7
+        if n:
+            out.append(piece | 0x80)
+        else:
+            out.append(piece)
+            return bytes(out)
+
+
+def pb_var(field_no, n):
+    return pb_varint((field_no << 3) | 0) + pb_varint(n)
+
+
+def pb_bytes(field_no, payload):
+    return pb_varint((field_no << 3) | 2) + pb_varint(len(payload)) + payload
+
+
+def context_root(used, maximum):
+    details = pb_var(1, used) + pb_var(2, maximum)
+    secret = b"SECRET_PATH_DO_NOT_STORE"
+    return pb_bytes(1, b"x" * 32) + pb_bytes(5, details) + pb_bytes(9, secret)
+
+
+def hook_script():
+    path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "scripts", "cursor_usage_hook.py")
+    spec = importlib.util.spec_from_file_location("cursor_usage_hook", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module, path
+
+
+def add_chat(home, uuid, cwd, created_ms, updated_ms, label, blobs, transcript=True, encoded=None, root_data=None, parent_agent=None):
     chat_dir = os.path.join(home, "chats", "bucket", uuid)
     os.makedirs(chat_dir, exist_ok=True)
     with open(os.path.join(chat_dir, "meta.json"), "w", encoding="utf-8") as fh:
@@ -153,7 +194,9 @@ def add_chat(home, uuid, cwd, created_ms, updated_ms, label, blobs, transcript=T
         "name": "New Agent",
         "blobEncryptionKey": SECRET,
     }
-    body = [(root, b"\n\x02"), (user, ('{"role":"user","text":"%s"}' % SENTINEL).encode())]
+    if parent_agent:
+        meta_obj["parentAgentId"] = parent_agent
+    body = [(root, b"\n\x02" if root_data is None else root_data), (user, ('{"role":"user","text":"%s"}' % SENTINEL).encode())]
     body.extend(blobs or [(asst, assistant("grok-4.7-xhigh"))])
     db = os.path.join(chat_dir, "store.db")
     write_db(db, meta_obj, body)
@@ -220,6 +263,7 @@ class CursorTests(unittest.TestCase):
         write_manifest(self.scratch, [("alpha", NOW - 100)])
         store = Mem()
         before = snap(os.path.join(self.home, "chats", "bucket", A))
+        mod.live_label_pids = lambda: {"alpha": 7}
         mod.poll(store, self.cfg(), NOW)
         self.assertEqual(snap(os.path.join(self.home, "chats", "bucket", A)), before)
         self.assertIsNone(mod.last_error)
@@ -522,6 +566,157 @@ class CursorTests(unittest.TestCase):
         self.assertEqual(usage["cache_read"], 3)
         self.assertEqual(usage["cache_write"], 2)
         self.assertIsNone(mod.last_error)
+
+    def test_fresh_update_without_process_is_not_running(self):
+        updated = int(NOW * 1000)
+        add_chat(self.home, A, "/work/alpha", updated, updated, "alpha", None)
+        store = Mem()
+        mod.poll(store, self.cfg(), NOW)
+        run = store.runs["grok:%s:alpha" % A]
+        self.assertEqual(run["status"], "done")
+        self.assertIsNone(run["pid"])
+
+    def test_child_chat_links_to_parent_and_is_not_running(self):
+        updated = int(NOW * 1000)
+        add_chat(self.home, A, "/work/alpha", updated - 5000, updated - 5000, "alpha", None)
+        add_chat(self.home, B, "/work/alpha", updated, updated, None, None, transcript=False, parent_agent=A)
+        mod.live_label_pids = lambda: {"alpha": 42}
+        store = Mem()
+        mod.poll(store, self.cfg(), NOW)
+        parent = store.runs["grok:%s:alpha" % A]
+        child = store.runs["grok:%s:%s" % (B, B)]
+        self.assertEqual(parent["status"], "running")
+        self.assertEqual(parent["pid"], 42)
+        self.assertEqual(child["status"], "done")
+        self.assertEqual(child["parent_session_id"], A)
+        self.assertIsNone(child.get("pid"))
+
+    def test_unlabeled_shadow_links_to_labeled_run(self):
+        updated = int((NOW - 4000) * 1000)
+        add_chat(self.home, A, "/work/alpha", updated, updated, "alpha", None)
+        store = Mem()
+        shadow = "grok:%s:%s" % (A, A)
+        store.runs[shadow] = {
+            "run_id": shadow,
+            "session_id": A,
+            "status": "running",
+            "started_at": updated / 1000.0,
+        }
+        mod.poll(store, self.cfg(), NOW)
+        self.assertEqual(store.runs[shadow]["status"], "unknown")
+        self.assertEqual(store.runs[shadow]["parent_session_id"], "grok:%s:alpha" % A)
+        self.assertEqual(store.runs["grok:%s:alpha" % A]["status"], "done")
+
+    def test_hook_log_joins_chat_and_ignores_prompt_text(self):
+        created = int((NOW - 4000) * 1000)
+        add_chat(self.home, A, "/work/alpha", created, created, "alpha", None)
+        log = os.path.join(self.tmp.name, "cursor-usage.jsonl")
+        hook, _path = hook_script()
+        payload = {
+            "hook_event_name": "stop",
+            "conversation_id": A,
+            "generation_id": "gen-1",
+            "model": "grok-4.7",
+            "workspace_roots": ["/work/alpha"],
+            "text": SENTINEL,
+            "user_email": SECRET,
+            "transcript_path": "/tmp/%s" % SENTINEL,
+            "input_tokens": 11,
+            "output_tokens": 7,
+            "cache_read_tokens": 3,
+            "cache_write_tokens": 2,
+        }
+        row = hook.build_row(payload)
+        self.assertNotIn(SENTINEL, json.dumps(row))
+        self.assertNotIn(SECRET, json.dumps(row))
+        self.assertIsNone(row["reasoning_tokens"])
+        hook.append_row(row, log)
+        partial = b'{"chat_id":"%s","input_tokens":1}' % A.encode()
+        with open(log, "ab") as fh:
+            fh.write(partial)
+        store = Mem()
+        mod.poll(store, self.cfg(cursor_usage=log), NOW)
+        usage = [item for item in store.usage if item["tool"] == "cursor"]
+        self.assertEqual(len(usage), 1)
+        self.assertEqual(usage[0]["input"], 6)
+        self.assertEqual(usage[0]["output"], 7)
+        self.assertNotIn(SENTINEL, dumped(store))
+        self.assertNotIn(SECRET, dumped(store))
+        mod.poll(store, self.cfg(cursor_usage=log), NOW)
+        self.assertEqual(len([item for item in store.usage if item["tool"] == "cursor"]), 1)
+        with open(log, "ab") as fh:
+            fh.write(b"\n")
+        mod.poll(store, self.cfg(cursor_usage=log), NOW)
+        nums = [item["input"] for item in store.usage if item["tool"] == "cursor"]
+        self.assertEqual(nums, [6, 1])
+
+    def test_hook_script_exits_zero_and_drops_other_events(self):
+        hook, path = hook_script()
+        self.assertIsNone(hook.build_row({"hook_event_name": "afterAgentResponse", "conversation_id": A, "text": SENTINEL, "input_tokens": 4}))
+        log = os.path.join(self.tmp.name, "from-stdin.jsonl")
+        env = dict(os.environ)
+        env["AGENT_DASH_CURSOR_USAGE"] = log
+        proc = subprocess.run(
+            [sys.executable, path],
+            input=json.dumps(
+                {
+                    "hook_event_name": "stop",
+                    "conversation_id": A,
+                    "model": "grok-4.7",
+                    "workspace_roots": ["/work/alpha"],
+                    "user_email": SECRET,
+                    "text": SENTINEL,
+                    "input_tokens": 9,
+                    "output_tokens": 1,
+                    "cache_read_tokens": 0,
+                    "cache_write_tokens": 0,
+                    "reasoning_tokens": 4,
+                }
+            ).encode(),
+            capture_output=True,
+            env=env,
+            check=False,
+        )
+        self.assertEqual(proc.returncode, 0)
+        self.assertEqual(proc.stdout, b"")
+        line = Path(log).read_text(encoding="utf-8")
+        self.assertNotIn(SENTINEL, line)
+        self.assertNotIn(SECRET, line)
+        saved = json.loads(line)
+        self.assertEqual(saved["chat_id"], A)
+        self.assertEqual(saved["reasoning_tokens"], 4)
+        self.assertEqual(saved["cwd"], "/work/alpha")
+        bad = subprocess.run([sys.executable, path], input=b"not-json", capture_output=True, env=env, check=False)
+        self.assertEqual(bad.returncode, 0)
+        self.assertEqual(Path(log).read_text(encoding="utf-8").count("\n"), 1)
+
+    def test_context_window_is_a_separate_event(self):
+        created = int((NOW - 4000) * 1000)
+        add_chat(
+            self.home,
+            A,
+            "/work/alpha",
+            created,
+            created,
+            "alpha",
+            [(blob_id("22"), billed("grok-4.7-xhigh"))],
+            root_data=context_root(114442, 500000),
+        )
+        store = Mem()
+        mod.poll(store, self.cfg(), NOW)
+        kinds = {}
+        for item in store.usage:
+            kinds.setdefault(item["tool"], []).append(item)
+        self.assertEqual(len(kinds["cursor"]), 1)
+        self.assertEqual(kinds["cursor"][0]["input"], 11)
+        ctx = kinds["grok-context"][0]
+        self.assertEqual(ctx["input"], 114442)
+        self.assertEqual(ctx["output"], 500000)
+        self.assertEqual(ctx["reasoning"], 0)
+        self.assertEqual(ctx["run_id"], "grok:%s:alpha" % A)
+        text = dumped(store)
+        self.assertNotIn("SECRET_PATH_DO_NOT_STORE", text)
+        self.assertNotIn(SENTINEL, text)
 
     def test_registry_discovers_cursor(self):
         from dash.sources import discover

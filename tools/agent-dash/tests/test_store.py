@@ -1,13 +1,15 @@
 import os
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from dash.pricing import cost
 from dash.sources.hub import poll as hub_poll
-from dash.sources.process import label_from_args, parse_etime, parse_ps, poll as process_poll
+from dash.sources.process import label_from_args, parse_etime, parse_ps, poll as process_poll, reconcile_running
 from dash.store import Store
 
 HUB = "00000000-0000-0000-0000-000000000001"
@@ -159,7 +161,7 @@ class StoreTest(unittest.TestCase):
         stored = self.store._conn.execute(
             "SELECT est_cost_usd FROM usage_events WHERE message_id='m1'"
         ).fetchone()["est_cost_usd"]
-        self.assertAlmostEqual(stored, (2000 * 15 + 20 * 75) / 1_000_000)
+        self.assertAlmostEqual(stored, cost("claude-opus-5-5", 2000, 20, 0, 0))
         hours = self.store.query_usage("model", "hour", None, None)
         self.assertEqual([(row["t"], row["key"], row["input"]) for row in hours], [(0, "opus", 2000), (3600, "opus", 1)])
         days = self.store.query_usage("model", "day", "WS1", None)
@@ -191,7 +193,7 @@ class StoreTest(unittest.TestCase):
                 "run_id": "glm:s:rev",
                 "source": "glm",
                 "tier": "glm",
-                "model": "glm-5.3",
+                "model": "glm-unlisted",
                 "label": "glm-review",
                 "status": "done",
                 "started_at": 1,
@@ -203,7 +205,7 @@ class StoreTest(unittest.TestCase):
                 "ts": 1,
                 "session_id": "s",
                 "run_id": "glm:s:rev",
-                "model": "glm-5.3",
+                "model": "glm-unlisted",
                 "tool": "glm",
                 "message_id": "m",
                 "input": 50,
@@ -315,12 +317,9 @@ class StoreTest(unittest.TestCase):
         self.assertNotIn(("long_running", "o"), kinds)
         self.assertIn(("died_early", "dead"), kinds)
         self.assertNotIn(("killed", "old"), kinds)
-        self.assertIn(("over_cap", "cap:grok"), kinds)
-        self.assertNotIn(("over_cap", "cap:claude"), kinds)
-        self.assertEqual(snap["caps"]["grok"], {"live": 11, "cap": 10})
-        self.assertEqual(snap["caps"]["claude"], {"live": 10, "cap": None})
-        self.assertEqual(snap["caps"]["muse"]["cap"], 10)
-        self.assertEqual(snap["caps"]["glm"]["cap"], 5)
+        self.assertNotIn("caps", snap)
+        self.assertTrue(all(alert["kind"] != "over_cap" for alert in snap["alerts"]))
+        self.assertEqual(snap["counts"]["live_agents"], 0)
         recent_ids = [run["run_id"] for run in snap["recent"]]
         self.assertEqual(recent_ids, ["dead"])
         self.assertNotIn("old", recent_ids)
@@ -503,6 +502,113 @@ class StoreTest(unittest.TestCase):
         self.assertEqual([run["run_id"] for run in snap["running"]], ["a"])
         self.assertEqual([row["ws"] for row in snap["by_workstream"]], ["WS7"])
 
+    def test_scoped_counts_exclude_children_and_main_sessions(self):
+        now = time.time()
+        self.store.upsert_run(
+            {
+                "run_id": "grok:parent:ws1-parent",
+                "source": "grok",
+                "tier": "grok",
+                "label": "ws1-parent",
+                "session_id": "parent-chat",
+                "status": "running",
+                "started_at": now - 100,
+            }
+        )
+        self.store.upsert_run(
+            {
+                "run_id": "grok:child:child",
+                "source": "grok",
+                "tier": "grok",
+                "session_id": "child-chat",
+                "parent_session_id": "parent-chat",
+                "status": "running",
+                "started_at": now - 90,
+            }
+        )
+        self.store.upsert_run(
+            {
+                "run_id": "grok:parent:parent",
+                "source": "grok",
+                "tier": "grok",
+                "session_id": "parent-chat",
+                "status": "running",
+                "started_at": now - 100,
+            }
+        )
+        self.store.add_usage(
+            {
+                "ts": now - 80,
+                "session_id": "child-chat",
+                "run_id": "grok:child:child",
+                "model": "grok-4",
+                "tool": "cursor",
+                "message_id": "m1",
+                "input": 5,
+                "output": 1,
+                "cache_read": 0,
+                "cache_write": 0,
+            }
+        )
+        self.store.upsert_run(
+            {
+                "run_id": "claude-main:s:main",
+                "source": "claude-main",
+                "tier": "opus",
+                "label": "ws1-schema",
+                "session_id": "s",
+                "status": "running",
+                "started_at": now - 50,
+            }
+        )
+        self.store.upsert_run(
+            {
+                "run_id": "muse:m:ws7-plan",
+                "source": "muse",
+                "tier": "muse",
+                "label": "ws7-plan",
+                "status": "done",
+                "verdict": "PASS",
+                "started_at": now - 200,
+                "ended_at": now - 30,
+            }
+        )
+        self.store.upsert_run(
+            {
+                "run_id": "grok:old:ws2-old",
+                "source": "grok",
+                "tier": "grok",
+                "label": "ws2-old",
+                "status": "done",
+                "verdict": "PARTIAL",
+                "started_at": now - 3 * 86400,
+                "ended_at": now - 2 * 86400,
+            }
+        )
+        snap = self.store.snapshot(now, "all")
+        self.assertNotIn("caps", snap)
+        counts = snap["counts"]
+        self.assertEqual(counts["live_agents"], 1)
+        self.assertEqual(counts["live_by_tool"], {"grok": 1, "muse": 0, "glm": 0, "claude": 0})
+        self.assertEqual(counts["finished_today"], 1)
+        self.assertEqual(counts["finished_in_range"], 1)
+        self.assertEqual(counts["finished_by_verdict"], {"PASS": 1})
+        running = [run["run_id"] for run in snap["running"]]
+        self.assertIn("grok:parent:ws1-parent", running)
+        self.assertIn("claude-main:s:main", running)
+        self.assertNotIn("grok:child:child", running)
+        self.assertNotIn("grok:parent:parent", running)
+        parent = next(run for run in snap["running"] if run["run_id"] == "grok:parent:ws1-parent")
+        self.assertEqual(parent["tokens"]["input"], 5)
+        ws1 = self.store.snapshot(now, "WS1")
+        self.assertEqual(ws1["counts"]["live_agents"], 1)
+        self.assertEqual(ws1["counts"]["finished_today"], 0)
+        ws7 = self.store.snapshot(now, "WS7")
+        self.assertEqual(ws7["counts"]["live_agents"], 0)
+        self.assertEqual(ws7["counts"]["finished_today"], 1)
+        ranged = self.store.snapshot(now, "all", since=now - 10)
+        self.assertEqual(ranged["counts"]["finished_in_range"], 0)
+
 
 class ProcessParseTest(unittest.TestCase):
     def test_etime_and_label_and_ps_line(self):
@@ -516,6 +622,55 @@ class ProcessParseTest(unittest.TestCase):
         self.assertEqual(rows[0]["comm"], "claude")
         self.assertEqual(rows[0]["ppid"], 1)
         self.assertEqual(rows[1]["comm"], "node")
+
+    def test_reconcile_ends_ghosts_and_links_shadow(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "dash.sqlite")
+            try:
+                store.upsert_run(
+                    {
+                        "run_id": "grok:chat:chat",
+                        "source": "grok",
+                        "session_id": "chat",
+                        "status": "running",
+                        "started_at": 100,
+                    }
+                )
+                store.upsert_run(
+                    {
+                        "run_id": "grok:chat:dash-a",
+                        "source": "grok",
+                        "label": "dash-a",
+                        "session_id": "chat",
+                        "status": "running",
+                        "pid": 9,
+                        "started_at": 100,
+                    }
+                )
+                store.upsert_run(
+                    {
+                        "run_id": "muse:s:ws7-plan",
+                        "source": "muse",
+                        "label": "ws7-plan",
+                        "status": "running",
+                        "pid": 3,
+                        "started_at": 50,
+                    }
+                )
+                processes = [{"pid": 9, "comm": "cursor-agent", "started_at": 90, "label": "dash-a"}]
+                ended = reconcile_running(store, 200, processes)
+                shadow = store.get_run("grok:chat:chat")
+                labeled = store.get_run("grok:chat:dash-a")
+                muse = store.get_run("muse:s:ws7-plan")
+            finally:
+                store.close()
+        self.assertEqual(ended, 2)
+        self.assertEqual(shadow["status"], "unknown")
+        self.assertEqual(shadow["parent_session_id"], "grok:chat:dash-a")
+        self.assertEqual(shadow["ended_at"], 100)
+        self.assertEqual(labeled["status"], "running")
+        self.assertEqual(muse["status"], "done")
+        self.assertEqual(muse["ended_at"], 50)
 
     def test_live_poll_stores_no_argv(self):
         with tempfile.TemporaryDirectory() as tmp:
