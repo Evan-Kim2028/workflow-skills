@@ -451,16 +451,10 @@ def ensure_worktree(spec, lane, ref, hooks):
         return True
     repo = str(spec["repo"])
     branch = str(lane["branch"])
-    if base_dep_id(lane):
-        rc = git_call(hooks, ["git", "-C", repo, "worktree", "add", "-b", branch, worktree, ref])
-        if rc != 0:
-            rc = git_call(hooks, ["git", "-C", repo, "worktree", "add", worktree, branch])
-        return rc == 0
-    if git_call(hooks, ["git", "-C", repo, "fetch", "-q", "origin", "main"]) != 0:
-        return False
-    rc = git_call(
-        hooks, ["git", "-C", repo, "worktree", "add", "-b", branch, worktree, "origin/main"]
-    )
+    if ref == "origin/main":
+        if git_call(hooks, ["git", "-C", repo, "fetch", "-q", "origin", "main"]) != 0:
+            return False
+    rc = git_call(hooks, ["git", "-C", repo, "worktree", "add", "-b", branch, worktree, ref])
     if rc != 0:
         rc = git_call(hooks, ["git", "-C", repo, "worktree", "add", worktree, branch])
     return rc == 0

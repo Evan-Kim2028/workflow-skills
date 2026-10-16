@@ -471,6 +471,21 @@ class DriveLanesTest(unittest.TestCase):
             self.assertIn(sentence, blob, sentence)
         self.assertIn("the index lists every note", blob)
 
+    def test_custom_base_cuts_the_worktree_from_that_ref(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fake = Fake(lambda label: "VERDICT: APPROVE\n" if "-rev" in label else "PASS\nbuilt\n")
+            spec = make_spec(tmp, [lane(tmp, base="release/ws7")])
+            summary, code = mod.drive(spec, hooks=fake.hooks())
+            self.assertEqual(code, 0)
+            self.assertEqual(summary["lanes"][0]["final"], "APPROVE")
+            build = Path(fake.calls[0][4]).read_text(encoding="utf-8")
+            review = Path(fake.calls[1][4]).read_text(encoding="utf-8")
+            self.assertIn("The diff base is release/ws7.", build)
+            self.assertIn("against release/ws7", review)
+            joined = [" ".join(cmd) for cmd in fake.git_calls]
+            self.assertTrue(any("worktree add -b ws7/a" in cmd and cmd.endswith("release/ws7") for cmd in joined))
+            self.assertFalse(any("origin/main" in cmd or "fetch" in cmd for cmd in joined))
+
     def test_cli_rejects_resume_without_only(self):
         self.assertEqual(mod.main(["missing.json", "--start", "rev"]), 2)
         self.assertEqual(mod.main(["missing.json", "--only", "A", "--start", "fix"]), 2)
