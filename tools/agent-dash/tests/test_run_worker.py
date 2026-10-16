@@ -81,14 +81,17 @@ class RunWorkerTests(unittest.TestCase):
                 os.environ[key] = value
         self.tmp.cleanup()
 
-    def go(self, tier, launch, label="lane-1", max_wait="0"):
+    def go(self, tier, launch, label="lane-1", max_wait="0", model=None):
         from io import StringIO
         import contextlib
 
+        argv = [tier, label, str(self.ws), str(self.prompt), str(self.run_dir), max_wait]
+        if model is not None:
+            argv.append(model)
         buf = StringIO()
         with contextlib.redirect_stdout(buf):
             code = runner.run(
-                [tier, label, str(self.ws), str(self.prompt), str(self.run_dir), max_wait],
+                argv,
                 spawn=launch.spawn,
                 pgrep=self.pgrep,
                 sleep=lambda _s: None,
@@ -101,19 +104,31 @@ class RunWorkerTests(unittest.TestCase):
     def pgrep(self, pattern):
         return self.counts.get(pattern, 0)
 
-    def test_example_lists_the_four_workers(self):
+    def test_example_lists_the_workers(self):
         data = registry()
         self.assertEqual(data["default"], "muse")
-        self.assertEqual(data["auto_order"], ["muse", "grok", "glm", "glm-flash"])
-        self.assertEqual(set(data["workers"]), {"muse", "grok", "glm", "glm-flash"})
+        self.assertEqual(data["auto_order"], ["muse", "grok", "composer", "glm", "glm-flash"])
+        self.assertEqual(set(data["workers"]), {"muse", "grok", "composer", "glm", "glm-flash"})
+        self.assertEqual(data["auto_order"].index("composer"), data["auto_order"].index("grok") + 1)
         kinds = {name: row["kind"] for name, row in data["workers"].items()}
         self.assertEqual(kinds["muse"], "muse")
         self.assertEqual(kinds["grok"], "cursor")
+        self.assertEqual(kinds["composer"], "cursor")
         self.assertEqual(kinds["glm"], "grok-build")
         self.assertEqual(kinds["glm-flash"], "grok-build")
+        composer = data["workers"]["composer"]
+        self.assertEqual(composer["model"], "composer-2.5")
+        self.assertEqual(composer["cap"], 25)
+        self.assertEqual(composer["manifest"], "cursor-sessions.tsv")
+        self.assertLess(composer["cost_rank"], data["workers"]["grok"]["cost_rank"])
+        self.assertEqual(data["workers"]["grok"]["model"], "grok-4.7[context=500k,reasoning_effort=xhigh,fast=false]")
+        for name in ("grok", "composer"):
+            row = data["workers"][name]
+            self.assertEqual(row["pgrep"], runner.cursor_pgrep(row["model"]))
         for row in data["workers"].values():
             self.assertIn("[", row["pgrep"])
             self.assertTrue(row["enabled"])
+            self.assertIn("model", row["columns"])
 
     def test_default_launches_muse_and_writes_the_manifest(self):
         self.counts = {}
@@ -130,8 +145,9 @@ class RunWorkerTests(unittest.TestCase):
         self.assertIn(str(self.prompt), cmd)
         self.assertIn("muse-spark-1.3-contributor", cmd)
         row = (self.run_dir / "muse-sessions.tsv").read_text(encoding="utf-8").strip()
-        self.assertEqual(row, "lane-1\t%s\t1700000000" % SID)
-        self.assertEqual((self.run_dir / "lane-1.tier").read_text(encoding="utf-8").strip(), "muse")
+        self.assertEqual(row, "lane-1\t%s\t1700000000\tmuse-spark-1.3-contributor" % SID)
+        self.assertEqual((self.run_dir / "lane-1.tier").read_text(encoding="utf-8").splitlines(), ["muse", "muse-spark-1.3-contributor"])
+        self.assertIn("model=muse-spark-1.3-contributor", line)
 
     def test_auto_skips_a_worker_at_its_cap(self):
         self.counts = {"[m]use-bin|[m]use exec": 25}
@@ -142,7 +158,7 @@ class RunWorkerTests(unittest.TestCase):
         self.assertTrue(launch.cmds[0][0].endswith("launch_grok.sh"))
         self.assertEqual(launch.cmds[0][4], registry()["workers"]["grok"]["model"])
         text = (self.run_dir / "cursor-sessions.tsv").read_text(encoding="utf-8").strip()
-        self.assertEqual(text, "lane-1\t-\t1700000000")
+        self.assertEqual(text, "lane-1\t-\t1700000000\t" + registry()["workers"]["grok"]["model"])
 
     def test_auto_skips_a_worker_in_cooldown(self):
         self.counts = {}
@@ -209,9 +225,11 @@ class RunWorkerTests(unittest.TestCase):
         self.assertEqual(len(launch.cmds), 1)
 
     def test_none_available_when_every_worker_is_at_cap(self):
+        data = registry()
         self.counts = {
             "[m]use-bin|[m]use exec": 25,
-            "[c]ursor-agent": 25,
+            runner.cursor_pgrep(data["workers"]["grok"]["model"]): 25,
+            runner.cursor_pgrep(data["workers"]["composer"]["model"]): 25,
             "-m [g]lm-5.3($| )": 5,
             "-m [g]lm-5.3-flash": 5,
         }
@@ -220,6 +238,133 @@ class RunWorkerTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("reason=none-available", line)
         self.assertEqual(launch.cmds, [])
+
+    def test_cursor_pgrep_matches_only_that_model(self):
+        import re
+
+        data = registry()
+        grok_model = data["workers"]["grok"]["model"]
+        comp_model = data["workers"]["composer"]["model"]
+        grok_pat = runner.cursor_pgrep(grok_model)
+        comp_pat = runner.cursor_pgrep(comp_model)
+        grok_cmd = "cursor-agent -p --model %s --force --trust" % grok_model
+        comp_cmd = "cursor-agent -p --model %s --force --trust" % comp_model
+        bare = "cursor-agent -p --force --trust"
+        self.assertRegex(grok_cmd, grok_pat)
+        self.assertNotRegex(comp_cmd, grok_pat)
+        self.assertNotRegex(bare, grok_pat)
+        self.assertRegex(comp_cmd, comp_pat)
+        self.assertNotRegex(grok_cmd, comp_pat)
+        self.assertIsNone(re.search(grok_pat, "pgrep -f " + grok_pat))
+        self.assertIsNone(re.search(comp_pat, "pgrep -f " + comp_pat))
+
+    def test_cursor_cap_ignores_other_cursor_agents(self):
+        self.counts = {
+            "[m]use-bin|[m]use exec": 25,
+            "[c]ursor-agent": 60,
+        }
+        launch = Launch()
+        code, line = self.go("auto", launch)
+        self.assertEqual(code, 0)
+        self.assertIn("tier=grok", line)
+        self.assertTrue(launch.cmds[0][0].endswith("launch_grok.sh"))
+        self.assertEqual(launch.cmds[0][4], registry()["workers"]["grok"]["model"])
+
+    def test_cursor_cap_is_per_model(self):
+        data = registry()
+        self.counts = {
+            "[m]use-bin|[m]use exec": 25,
+            runner.cursor_pgrep(data["workers"]["grok"]["model"]): 25,
+        }
+        launch = Launch()
+        code, line = self.go("auto", launch)
+        self.assertEqual(code, 0)
+        self.assertIn("tier=composer", line)
+        self.assertEqual(launch.cmds[0][4], "composer-2.5")
+
+    def test_model_override_per_kind(self):
+        self.counts = {}
+        grok_model = registry()["workers"]["grok"]["model"]
+
+        launch = Launch()
+        code, line = self.go("muse", launch, model="custom-muse-9")
+        self.assertEqual(code, 0)
+        self.assertIn("model=custom-muse-9", line)
+        cmd = launch.cmds[0]
+        self.assertEqual(cmd[cmd.index("--model") + 1], "custom-muse-9")
+        row = (self.run_dir / "muse-sessions.tsv").read_text(encoding="utf-8").strip().split("\t")
+        self.assertEqual(row[-1], "custom-muse-9")
+
+        launch = Launch()
+        code, line = self.go("grok", launch, label="lane-g", model="composer-2.5")
+        self.assertEqual(code, 0)
+        self.assertIn("model=composer-2.5", line)
+        self.assertEqual(launch.cmds[0][4], "composer-2.5")
+        row = (self.run_dir / "cursor-sessions.tsv").read_text(encoding="utf-8").strip().split("\t")
+        self.assertEqual(row, ["lane-g", "-", "1700000000", "composer-2.5"])
+
+        launch = Launch()
+        code, line = self.go("glm", launch, label="lane-m", model="glm-custom-1")
+        self.assertEqual(code, 0)
+        cmd = launch.cmds[0]
+        self.assertEqual(cmd[cmd.index("-m") + 1], "glm-custom-1")
+        self.assertIn("model=glm-custom-1", line)
+        row = (self.run_dir / "glm-sessions.tsv").read_text(encoding="utf-8").strip().split("\t")
+        self.assertEqual(row, ["lane-m", SID, "1700000000", "glm-custom-1"])
+
+        launch = Launch()
+        code, line = self.go("composer", launch, label="lane-c", model=grok_model)
+        self.assertEqual(code, 0)
+        self.assertEqual(launch.cmds[0][4], grok_model)
+        self.assertIn("model=" + grok_model, line)
+
+    def test_invalid_model_rejected(self):
+        self.counts = {}
+        for bad in ("has space", "semi;colon", "$(sub)", "quote'x", "pipe|x", "star*", "slash/x", "a\nb"):
+            launch = Launch()
+            code, line = self.go("muse", launch, model=bad)
+            self.assertEqual(code, 2, bad)
+            self.assertIn("reason=bad-model", line)
+            self.assertEqual(launch.cmds, [], bad)
+
+    def test_empty_model_keeps_the_registry_model(self):
+        self.counts = {}
+        launch = Launch()
+        code, line = self.go("glm", launch, model="")
+        self.assertEqual(code, 0)
+        cmd = launch.cmds[0]
+        self.assertEqual(cmd[cmd.index("-m") + 1], "glm-5.3")
+        self.assertIn("model=glm-5.3", line)
+
+    def test_recall_observes_stored_model(self):
+        self.counts = {}
+        launch = Launch(alive=True)
+        code, line = self.go("muse", launch, model="custom-muse-9", max_wait="0")
+        self.assertEqual(code, 0)
+        self.assertIn("STATUS: running", line)
+        self.assertIn("model=custom-muse-9", line)
+        code, line = self.go("glm", launch, model="other-model", max_wait="0")
+        self.assertIn("STATUS: running", line)
+        self.assertIn("tier=muse", line)
+        self.assertIn("model=custom-muse-9", line)
+        self.assertNotIn("other-model", line)
+        self.assertEqual(len(launch.cmds), 1)
+        stored = (self.run_dir / "lane-1.tier").read_text(encoding="utf-8").splitlines()
+        self.assertEqual(stored, ["muse", "custom-muse-9"])
+
+    def test_old_tier_file_without_model_still_waits(self):
+        self.counts = {}
+        self.run_dir.mkdir()
+        (self.run_dir / "lane-1.tier").write_text("muse\n", encoding="utf-8")
+        (self.run_dir / "out-lane-1.md").write_text("PASS\n", encoding="utf-8")
+        launch = Launch()
+        code, line = self.go("glm", launch, model="composer-2.5")
+        self.assertEqual(code, 0)
+        self.assertIn("STATUS: done", line)
+        self.assertIn("tier=muse", line)
+        self.assertIn("model=muse-spark-1.3-contributor", line)
+        self.assertEqual(launch.cmds, [])
+        self.assertEqual((self.run_dir / "lane-1.tier").read_text(encoding="utf-8").splitlines(), ["muse"])
 
 
 if __name__ == "__main__":
