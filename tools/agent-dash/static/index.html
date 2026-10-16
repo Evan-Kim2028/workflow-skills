@@ -235,6 +235,17 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
 .topbar header{position:static;margin:0;padding:0;background:none;-webkit-backdrop-filter:none;backdrop-filter:none}
 .topbar .tabs{margin:8px 0 0;border-bottom:0}
 [data-nav], [data-sec], .lay, #plan-body h2, #plan-body h3, #plan-body section { scroll-margin-top: 120px; }
+
+/* plan map focus-on-hover */
+.dag.focus .dnode{opacity:.32;transition:opacity .2s ease}
+.dag.focus .dnode.f-self,.dag.focus .dnode.f-up,.dag.focus .dnode.f-down{opacity:1}
+.dag.focus .dnode.f-self{box-shadow:0 0 0 3px color-mix(in srgb,var(--s1) 40%,transparent)}
+.dag.focus .dnode.f-up{border-color:var(--warning)}
+.dag.focus .dnode.f-down{border-color:var(--s1);border-style:dashed}
+.dag.focus .dedges path{opacity:.12}
+.dag.focus .dedges path.e-up{opacity:1;stroke:var(--warning);stroke-width:2;stroke-dasharray:6 6;animation:flow 1s linear infinite reverse}
+.dag.focus .dedges path.e-down{opacity:1;stroke:var(--s1);stroke-width:2;stroke-dasharray:6 6;animation:flow 1s linear infinite}
+@media (prefers-reduced-motion: reduce){.dag.focus .dedges path{animation:none}}
 </style>
 </head>
 <body>
@@ -816,7 +827,7 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
     });
     function attText(a) { return a.runs + " run" + (a.runs > 1 ? "s" : "") + ": " + (a.runs - a.reviews) + " build, " + a.reviews + " review" + (a.reviews === 1 ? "" : "s") + (a.sentBack ? ", " + a.sentBack + " sent back (changes, partial or blocked)" : ""); }
     var nLive = Object.keys(live).reduce(function (a, k) { return a + live[k].length; }, 0);
-    var c = el("div", {class: "card", id: "exec-progress", "data-nav": "Plan progress"}, [el("div", {style: "display:flex;align-items:baseline;gap:10px;flex-wrap:wrap"}, [el("h2", {text: plan.ws + " plan progress" + (nLive ? " · " + nLive + " agent" + (nLive > 1 ? "s" : "") + " working" : "")}), (plan.start_prompt ? copyBtn(plan.start_prompt) : null), el("a", {class: "planbtn", href: planUrl(plan.ws), onclick: function (ev) { ev.preventDefault(); openPlan(plan.ws); }, text: "Open the " + plan.ws + " plan"})]), el("p", {class: "sub", text: "Every task by group, coloured by state (legend below). The badge on a working chip is the agent tool and count; \u21BBN is how many agent runs worked the task in this range (amber edge: sent back twice or more; hover for builds vs reviews). Arrows show what each group waits on."})]);
+    var c = el("div", {class: "card", id: "exec-progress", "data-nav": "Plan progress"}, [el("div", {style: "display:flex;align-items:baseline;gap:10px;flex-wrap:wrap"}, [el("h2", {text: plan.ws + " plan progress" + (nLive ? " · " + nLive + " agent" + (nLive > 1 ? "s" : "") + " working" : "")}), (plan.start_prompt ? copyBtn(plan.start_prompt) : null), el("a", {class: "planbtn", href: planUrl(plan.ws), onclick: function (ev) { ev.preventDefault(); openPlan(plan.ws); }, text: "Open the " + plan.ws + " plan"})]), el("p", {class: "sub", text: "Every task by group, coloured by state (legend below). The badge on a working chip is the agent tool and count; \u21BBN is how many agent runs worked the task in this range (amber edge: sent back twice or more; hover for builds vs reviews). Arrows show what each group waits on; hover a group to light up its chain (amber: what it waits on, blue: what waits on it)."})]);
     var workingIds = Object.keys(live);
     if (workingIds.length) {
       var wn = el("div", {class: "working-now"}, [el("b", {text: "\u25CF Working now (" + nLive + ")"})]);
@@ -891,10 +902,32 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
         if (Math.abs(a.left - b.left) < 4) { var x1 = a.left + a.width * .85 - box.left, y1 = a.bottom - box.top, x2 = b.left + b.width * .85 - box.left, y2 = b.top - box.top; d = "M" + x1 + "," + y1 + " C" + (x1 + 14) + "," + (y1 + 10) + " " + (x2 + 14) + "," + (y2 - 10) + " " + x2 + "," + y2; }
         else { var X1 = a.right - box.left, Y1 = a.top + Math.min(26, a.height / 2) - box.top, X2 = b.left - box.left - 2, Y2 = b.top + Math.min(26, b.height / 2) - box.top, mx = (X1 + X2) / 2; d = "M" + X1 + "," + Y1 + " C" + mx + "," + Y1 + " " + mx + "," + Y2 + " " + X2 + "," + Y2; }
         var to = gs[e[1]], fr = gs[e[0]];
-        svg.appendChild(s("path", {d: d, class: to && to.active && !to.done ? "flow" : fr && fr.done ? "done" : ""}));
+        svg.appendChild(s("path", {d: d, class: to && to.active && !to.done ? "flow" : fr && fr.done ? "done" : "", "data-a": e[0], "data-b": e[1]}));
       });
     }
     requestAnimationFrame(function () { requestAnimationFrame(draw); }); window.__adPlanDraw = draw;
+    /* Focus on hover: a group's upstream and downstream light up and animate; everything else dims. */
+    var up = {}, down = {};
+    (plan.edges || []).forEach(function (e) { (down[e[0]] = down[e[0]] || []).push(e[1]); (up[e[1]] = up[e[1]] || []).push(e[0]); });
+    function reach(start, map) { var seen = {}, stack = [start]; while (stack.length) { var x = stack.pop(); (map[x] || []).forEach(function (y) { if (!seen[y]) { seen[y] = 1; stack.push(y); } }); } return seen; }
+    Object.keys(nodes).forEach(function (gid) {
+      var n = nodes[gid];
+      n.addEventListener("mouseenter", function () {
+        var ups = reach(gid, up), downs = reach(gid, down);
+        dag.classList.add("focus");
+        Object.keys(nodes).forEach(function (k) { nodes[k].classList.toggle("f-self", k === gid); nodes[k].classList.toggle("f-up", !!ups[k]); nodes[k].classList.toggle("f-down", !!downs[k]); });
+        [].forEach.call(svg.querySelectorAll("path"), function (pth) {
+          var a = pth.getAttribute("data-a"), b = pth.getAttribute("data-b");
+          var on = (b === gid || ups[b]) && (a === gid || ups[a]) ? "e-up" : (a === gid || downs[a]) && (b === gid || downs[b]) ? "e-down" : "";
+          pth.classList.remove("e-up", "e-down"); if (on) pth.classList.add(on);
+        });
+      });
+      n.addEventListener("mouseleave", function () {
+        dag.classList.remove("focus");
+        Object.keys(nodes).forEach(function (k) { nodes[k].classList.remove("f-self", "f-up", "f-down"); });
+        [].forEach.call(svg.querySelectorAll("path"), function (pth) { pth.classList.remove("e-up", "e-down"); });
+      });
+    });
     if (plan.phases && plan.phases.length) { var ph = el("div", {class: "phases"}); plan.phases.forEach(function (p) { ph.appendChild(el("div", {class: "phase"}, [el("b", {text: p.name}), p.goal, el("br"), el("small", {text: "Gate: " + (p.gate || "")})])); }); c.appendChild(ph); }
     return c;
   }
