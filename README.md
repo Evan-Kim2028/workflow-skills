@@ -4,14 +4,14 @@ A local dashboard and a small kit for running many coding agents at once. You pl
 
 ## Screenshots
 
-The pictures below are placeholders. After you open the [sample data](docs/quickstart.md), save the shots at these paths.
+All captured from the bundled sample data (no real runs).
 
-| | | |
-|---|---|---|
-| ![Overall tab in the dark theme](docs/screenshots/overview-dark.png) | ![Workstream progress map](docs/screenshots/workstream-map.png) | ![Run timeline grouped by workstream](docs/screenshots/timeline.png) |
-| The Overall tab in the dark theme, with live agents, estimated cost, and the run timeline. | Task groups in columns. A running agent pulses on its chip. | Each run as a bar, grouped by workstream, across the selected time range. |
-| ![Plan view for one workstream](docs/screenshots/plan-view.png) | ![Workstream navigation in the shell](docs/screenshots/sidenav.png) | ![Approvals grouped for the owner](docs/screenshots/approvals.png) |
-| The plan for one workstream, with approvals above the strategy. | Workstream navigation in the shell. | Pending owner decisions, each marked reversible or one-way. |
+| | |
+|---|---|
+| ![Execution overview, dark theme](docs/screenshots/overview-dark.png) | ![A workstream's live plan map](docs/screenshots/workstream-map.png) |
+| **Execution overview.** Live agents, finished runs, tokens and cost, workstream progress, and every run. | **Live plan map.** Overall progress, the groups being worked on now (glowing), ready-next groups, flowing dependency arrows, and agents pinned to their task chips with attempt counts. |
+| ![Plan view](docs/screenshots/plan-view.png) | ![Light theme with owner approvals](docs/screenshots/overview-light.png) |
+| **Plan view.** The workstream's decisions, motivation, end state and phases, and owner approvals. One toggle switches to Execution without a reload. | **Light theme.** The Needs you card lists pending owner approvals across workstreams. |
 
 ## What you get
 

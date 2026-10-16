@@ -403,4 +403,5 @@
 
   sync();
   schedule();
+  try { if (new URLSearchParams(location.search).get("nav") === "open") setTimeout(function () { openNav(false); }, 700); } catch (e) {}
 })();

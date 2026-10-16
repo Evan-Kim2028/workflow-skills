@@ -361,13 +361,13 @@
       captureMermaid(main);
       runMermaid();
       var host = main.querySelector("[data-plan-progress]");
-      if (host && hit.bundle) drawSummary(host, dagOf(hit.bundle, id), hit.snap || {running: [], recent: []}, id);
+      if (host && hit.bundle) drawSummary(host, dagOf(hit.bundle, id), hit.snap || {running: [], recent: []}, id, hit.bundle && hit.bundle.start_prompt);
     }
     stampSectionIds(main);
   }
 
   /* The live progress map lives on Execution only; the Plan page shows a compact summary and a jump there. */
-  function drawSummary(host, dag, snap, id) {
+  function drawSummary(host, dag, snap, id, startPrompt) {
     var c = {done: 0, prog: 0, pr: 0, todo: 0, deferred: 0};
     ((dag && dag.groups) || []).forEach(function (g) { (g.tasks || []).forEach(function (t) { var k = t.status || "todo"; c[k] = (c[k] || 0) + 1; }); });
     var tot = c.done + c.prog + c.pr + c.todo, live = ((snap && snap.running) || []).length;
@@ -380,7 +380,9 @@
     wrap.appendChild(el("div", {class: "pp-nums", text: pct + "% done \u00B7 " + c.done + " of " + tot + " tasks \u00B7 " + c.prog + " waiting on prod \u00B7 " + c.pr + " waiting to merge \u00B7 " + c.todo + " not started" + (c.deferred ? " \u00B7 " + c.deferred + " deferred" : "") + (live ? " \u00B7 " + live + " running now" : "")}));
     var btn = el("button", {class: "pp-go", text: "Open live progress \u2192"});
     btn.addEventListener("click", function () { if (window.DashNav) window.DashNav.openExec(id); });
-    wrap.appendChild(btn);
+    var row = el("div", {class: "pp-actions"}); row.appendChild(btn);
+    if (startPrompt && window.DashCopyBtn) row.appendChild(window.DashCopyBtn(startPrompt));
+    wrap.appendChild(row);
     host.appendChild(wrap);
   }
 
@@ -397,7 +399,7 @@
       if (!main) return;
       renderApprovals(main, id, parts[0]);
       var host = main.querySelector("[data-plan-progress]");
-      if (host && parts[1]) drawSummary(host, dagOf(parts[1], id), parts[2] || {running: [], recent: []}, id);
+      if (host && parts[1]) drawSummary(host, dagOf(parts[1], id), parts[2] || {running: [], recent: []}, id, parts[1] && parts[1].start_prompt);
       stampSectionIds(main);
     }).catch(function () {});
   }

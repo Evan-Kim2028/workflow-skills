@@ -198,6 +198,14 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
 .skel{height:14px;border-radius:7px;background:linear-gradient(90deg,var(--grid) 0%,var(--surface-2) 50%,var(--grid) 100%);background-size:200% 100%;animation:skel 1.2s linear infinite;margin:8px 0}
 @keyframes skel{to{background-position:-200% 0}}
 @media (prefers-reduced-motion: reduce){*,*::before,*::after{animation-duration:.001ms!important;animation-iteration-count:1!important;transition-duration:.001ms!important}}
+
+.ctx-est{color:var(--muted);font-style:italic}
+.cached{color:var(--muted);font-size:11px}
+.copybtn{margin-left:auto;font:600 12.5px var(--font);border-radius:999px;padding:4px 11px}
+.copybtn+.planbtn{margin-left:8px}
+.copybtn.ok{border-color:var(--good);color:var(--good-ink, var(--good))}
+.copy-modal{position:fixed;inset:20% 20% auto;z-index:60;background:var(--surface);border:1px solid var(--ring);border-radius:12px;padding:16px;box-shadow:0 20px 60px rgba(0,0,0,.4);display:grid;gap:10px}
+.copy-modal textarea{width:100%;min-height:200px;font:12px var(--mono);background:var(--surface-2);color:var(--ink);border:1px solid var(--ring);border-radius:8px;padding:8px}
 </style>
 </head>
 <body>
@@ -454,7 +462,7 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
       tr.appendChild(el("td", null, [el("span", {class: "ws", text: r.workstream || "–"})]));
       tr.appendChild(el("td", {class: "n", text: fmtDur(r.elapsed_s)}));
       var ob = el("td", {class: "n", text: fmtN(r.out_bytes) + "B"}); if (r.out_growing) ob.appendChild(el("span", {class: "grow", text: "▲"})); tr.appendChild(ob);
-      tr.appendChild(el("td", {class: "n", text: fmtN(r.tokens ? (r.tokens.input || 0) + (r.tokens.output || 0) : 0)}));
+      tr.appendChild(tokCell(r));
       tr.appendChild(el("td", null, [statusEl(r), r.verdict ? el("span", {class: "vd", text: r.verdict}) : null]));
       tb.appendChild(tr);
     });
@@ -505,6 +513,30 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
     return c;
   }
   function CW() { var m = document.getElementById("main"); var w = m && m.clientWidth ? m.clientWidth : 1100; return Math.max(560, Math.floor(w - 36)); }
+  /* Tokens cell: billed input + output, cached reads in muted ink, and for a live Grok run with no billed usage yet the context-window estimate (never counted in totals). */
+  function tokCell(r) {
+    var t = r.tokens || {}, io = (t.input || 0) + (t.output || 0), cr = t.cache_read || 0;
+    var td = el("td", {class: "n", title: "input " + fmtN(t.input) + " \u00B7 output " + fmtN(t.output) + " \u00B7 cache read " + fmtN(cr) + " \u00B7 cache write " + fmtN(t.cache_write)});
+    if (!io && !cr && r.context_tokens && !r.ended_at) {
+      td.appendChild(el("span", {class: "ctx-est", text: "\u2248" + fmtN(r.context_tokens) + " ctx"}));
+      td.title = "Context window now. Billed tokens arrive when the run ends.";
+      return td;
+    }
+    td.appendChild(document.createTextNode(fmtN(io)));
+    if (cr) td.appendChild(el("span", {class: "cached", text: " +" + fmtN(cr) + " cached"}));
+    return td;
+  }
+  function copyBtn(text) {
+    var b = el("button", {class: "copybtn", title: "Copy the paste-ready prompt that starts this workstream's lead in a fresh Claude Code session", text: "Copy start prompt"});
+    b.addEventListener("click", function (ev) {
+      ev.stopPropagation();
+      var done = function () { b.textContent = "Copied \u2713"; b.classList.add("ok"); setTimeout(function () { b.textContent = "Copy start prompt"; b.classList.remove("ok"); }, 2000); };
+      var fallback = function () { var d = el("div", {class: "copy-modal"}), ta = el("textarea", {readonly: "readonly"}); ta.value = text; var close = el("button", {text: "Close"}); close.addEventListener("click", function () { d.remove(); }); d.appendChild(el("p", {text: "Copy this prompt (Cmd+C):"})); d.appendChild(ta); d.appendChild(close); document.body.appendChild(d); ta.focus(); ta.select(); };
+      if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(text).then(done, fallback); else fallback();
+    });
+    return b;
+  }
+  window.DashCopyBtn = copyBtn;
   function countUp(node, from, to) {
     if (window.matchMedia && matchMedia("(prefers-reduced-motion: reduce)").matches || from === to) { node.textContent = to + "%"; return; }
     var i = 0, n = 28, h = setInterval(function () { i++; var k = i / n, e = 1 - Math.pow(1 - k, 3); node.textContent = Math.round(from + (to - from) * e) + "%"; if (i >= n) clearInterval(h); }, 25);
@@ -714,7 +746,7 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
     });
     function attText(a) { return a.runs + " run" + (a.runs > 1 ? "s" : "") + ": " + (a.runs - a.reviews) + " build, " + a.reviews + " review" + (a.reviews === 1 ? "" : "s") + (a.sentBack ? ", " + a.sentBack + " sent back (changes, partial or blocked)" : ""); }
     var nLive = Object.keys(live).reduce(function (a, k) { return a + live[k].length; }, 0);
-    var c = el("div", {class: "card", id: "exec-progress", "data-nav": "Plan progress"}, [el("div", {style: "display:flex;align-items:baseline;gap:10px;flex-wrap:wrap"}, [el("h2", {text: plan.ws + " plan progress" + (nLive ? " · " + nLive + " agent" + (nLive > 1 ? "s" : "") + " working" : "")}), el("a", {class: "planbtn", href: planUrl(plan.ws), onclick: function (ev) { ev.preventDefault(); openPlan(plan.ws); }, text: "Open the " + plan.ws + " plan"})]), el("p", {class: "sub", text: "Every task by group, coloured by state (legend below). The badge on a working chip is the agent tool and count; \u21BBN is how many agent runs worked the task in this range (amber edge: sent back twice or more; hover for builds vs reviews). Arrows show what each group waits on."})]);
+    var c = el("div", {class: "card", id: "exec-progress", "data-nav": "Plan progress"}, [el("div", {style: "display:flex;align-items:baseline;gap:10px;flex-wrap:wrap"}, [el("h2", {text: plan.ws + " plan progress" + (nLive ? " · " + nLive + " agent" + (nLive > 1 ? "s" : "") + " working" : "")}), (plan.start_prompt ? copyBtn(plan.start_prompt) : null), el("a", {class: "planbtn", href: planUrl(plan.ws), onclick: function (ev) { ev.preventDefault(); openPlan(plan.ws); }, text: "Open the " + plan.ws + " plan"})]), el("p", {class: "sub", text: "Every task by group, coloured by state (legend below). The badge on a working chip is the agent tool and count; \u21BBN is how many agent runs worked the task in this range (amber edge: sent back twice or more; hover for builds vs reviews). Arrows show what each group waits on."})]);
     if (unassigned.length) { var ua = el("div", {class: "unassigned"}, [el("b", {style: "font-size:12px;color:var(--ink-2)", text: "Running, not mapped to a task:"})]); unassigned.forEach(function (r) { var sp = el("span", {title: (r.tier || "") + " · " + fmtDur(r.elapsed_s), text: r.label || r.run_id}); sp.style.borderColor = colorOf(tierKey(r)); ua.appendChild(sp); }); c.appendChild(ua); }
     var tot = {done: 0, prog: 0, pr: 0, todo: 0, deferred: 0}, gs = {}, colStat = {};
     var prevSt = (window.__adPrevStatus = window.__adPrevStatus || {});

@@ -630,3 +630,6 @@
 .pp-go{justify-self:start;font:600 13px inherit;padding:6px 12px;border-radius:999px;border:1px solid var(--s1, var(--accent));color:var(--s1, var(--accent));background:transparent;cursor:pointer}
 .pp-go:hover,.pp-go:focus-visible{background:color-mix(in srgb,var(--s1, var(--accent)) 12%,transparent)}
 @media (prefers-reduced-motion: reduce){.pp-bar span{transition:none}}
+
+.pp-actions{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.pp-actions .copybtn{margin-left:0}
