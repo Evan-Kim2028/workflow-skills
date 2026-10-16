@@ -40,7 +40,7 @@ class PlanRenderTest(unittest.TestCase):
                         "end_state": "Clients read one route.",
                         "phases": [{"name": "Land", "goal": "Ship the route.", "gate": "The route is on main."}],
                     },
-                    "dag": {"cols": ["Now"], "groups": [], "edges": []},
+                    "dag": {"cols": ["Now"], "groups": [{"id": "g1", "col": 0, "title": "Land", "tasks": [{"id": "WS9.1", "title": "Ship the route", "status": "todo"}]}], "edges": []},
                 }
             ),
         )
@@ -75,7 +75,8 @@ class PlanRenderTest(unittest.TestCase):
         self.assertNotIn('data-plan-approvals', page)
         self.assertNotIn("wsp-figs", page)
         self.assertNotIn("<script", page)
-        order = [page.index(f'id="ws9-{anchor}"') for anchor in ("why", "end", "plan", "progress", "decided", "agent", "ref")]
+        order = [page.index(f'id="ws9-{anchor}"') for anchor in ("why", "end", "plan", "progress", "decided", "agent")]
+        self.assertNotIn('id="ws9-ref"', page)
         self.assertEqual(order, sorted(order))
         self.assertLess(page.index("Why"), page.index("End state"))
         self.assertLess(page.index("End state"), page.index("Progress"))

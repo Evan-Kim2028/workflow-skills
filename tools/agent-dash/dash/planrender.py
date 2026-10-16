@@ -31,7 +31,15 @@ def sections(path: Path) -> dict:
     return out
 
 
+def _empty(html_text: str) -> bool:
+    """True when a fragment has no visible text (tags and whitespace only)."""
+    return not re.sub(r"<[^>]+>|&nbsp;|\\s", "", html_text or "").strip()
+
+
 def sec(anchor: str, eyebrow: str, title: str, body: str, lead: str | None = None) -> str:
+    """One page section; an empty section (no lead and no visible body) renders nothing."""
+    if not lead and _empty(body) and "data-plan-progress" not in (body or ""):
+        return ""
     lead_html = f'<p class="lead2">{lead}</p>' if lead else ""
     return (
         f'<section id="{anchor}" class="pl-sec lay"><h2><span class="eb">{esc(eyebrow)}</span>{esc(title)}</h2>'
@@ -178,7 +186,6 @@ def build(ws: str, data: dict, fragments: dict, layout: dict) -> str:
         if isinstance(title, str)
     )
     body = header
-    body += jump
     body += sec(
         f"{prefix}-why",
         "Why",
@@ -198,13 +205,15 @@ def build(ws: str, data: dict, fragments: dict, layout: dict) -> str:
         layout.get("plan_title") or "Plan",
         phases_block(narrative.get("phases")) + _piece(layout.get("plan_extra"), fragments),
     )
-    body += sec(
-        f"{prefix}-progress",
-        "Progress",
-        f"Where {ws} is",
-        progress_block(ws),
-        lead="A summary of the live plan. The full task map, with agents working on it now, is on the Execution view.",
-    )
+    has_tasks = any((g.get("tasks") or []) for g in ((data.get("dag") or {}).get("groups") or []) if isinstance(g, dict))
+    if has_tasks:
+        body += sec(
+            f"{prefix}-progress",
+            "Progress",
+            f"Where {ws} is",
+            progress_block(ws),
+            lead="A summary of the live plan. The full task map, with agents working on it now, is on the Execution view.",
+        )
     body += sec(
         f"{prefix}-decided",
         "Decided",

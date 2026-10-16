@@ -222,7 +222,7 @@
     }
     if (nextTabs !== tabSig) {
       tabSig = nextTabs;
-      fillFoot();
+      if (false) fillFoot();
     }
     mark();
   }

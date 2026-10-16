@@ -290,3 +290,5 @@ body { padding-left: 188px; }
 .sidenav-foot, .sidenav-kicker { font-size: 12px; }
 [data-nav], [data-sec], .lay, #plan-body h2, #plan-body h3, #plan-body section { scroll-margin-top: 84px; }
 @media (max-width: 900px) { body { padding-left: 0; } .sidenav { width: 0; } .sidenav.is-open { width: 220px; } }
+
+.sidenav-foot { display: none; }

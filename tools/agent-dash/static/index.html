@@ -191,7 +191,6 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
 @keyframes tipin{from{opacity:0;transform:translateY(3px)}to{opacity:1;transform:none}}
 .drawer{transition:transform .3s cubic-bezier(.2,.8,.2,1)}
 .tile .v,.pbig-pct{font-variant-numeric:tabular-nums}
-#main.fresh{animation:viewin .26s ease-out}
 @keyframes viewin{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}
 .empty{display:flex;align-items:center;gap:8px;padding:14px 4px;color:var(--muted)}
 .empty::before{content:"";width:8px;height:8px;border-radius:50%;background:var(--grid);flex:none}
@@ -233,7 +232,7 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
 <body>
 <div class="wrap">
 <header class="shell">
-<h1 id="title">Agent execution</h1>
+<h1 id="title">Agent dashboard</h1>
 <span class="live"><span class="dot" id="live-dot"></span><span id="live-txt">connecting</span></span>
 <nav class="view-toggle" aria-label="View">
 <button type="button" id="view-plan" aria-pressed="false">Plan</button>
@@ -363,8 +362,8 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
     document.getElementById("view-plan").setAttribute("aria-pressed", plan ? "true" : "false");
     document.getElementById("view-exec").setAttribute("aria-pressed", plan ? "false" : "true");
     document.getElementById("range").hidden = plan;
-    document.getElementById("title").textContent = plan ? "Plan" : "Agent execution";
-    document.title = plan ? "Plan" : "Agent execution";
+    document.getElementById("title").textContent = "Agent dashboard";
+    document.title = (plan ? "Plan" : "Execution") + " \u00B7 Agent dashboard";
   }
   function scrollHash() {
     if (!location.hash) return;
@@ -453,7 +452,7 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
     run.forEach(function (r) { var k = tierKey(r); byTier[k] = (byTier[k] || 0) + 1; });
     var tk = snap.totals ? snap.totals.tokens : {};
     var allTok = (tk.input || 0) + (tk.output || 0) + (tk.cache_read || 0) + (tk.cache_write || 0);
-    var g = el("div", {class: "grid g-tiles", id: "exec-tiles", "data-nav": "Tiles"});
+    var g = el("div", {class: "grid g-tiles", id: "exec-tiles", "data-nav": "Summary"});
     var cn = snap.counts || {}, lbt = cn.live_by_tool || {}, fv = cn.finished_by_verdict || {};
     var liveSub = Object.keys(lbt).filter(function (k) { return lbt[k]; }).map(function (k) { return modelName(k === "claude" ? "opus" : k).replace("Opus", "Claude") + " " + fmtN(lbt[k]); }).join(" \u00B7 ") || "idle";
     var bad = (fv.BLOCKED || 0) + (fv.REQUEST_CHANGES || 0), part = (fv.PARTIAL || 0) + (fv.APPROVE_WITH_CHANGES || 0);
@@ -471,7 +470,7 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
   function runsTable(title, sub, runs, empty) {
     var attrs = {class: "card", "data-nav": title};
     if (title === "Running now") attrs.id = "exec-running";
-    else if (title === "Finished in the last hour") attrs.id = "exec-finished";
+    else if (title === "Finished in the last hour") { attrs.id = "exec-finished"; attrs["data-nav"] = "Finished (last hour)"; }
     var c = el("div", attrs, [el("h2", {text: title}), el("p", {class: "sub", text: sub})]);
     if (!runs.length) { c.appendChild(el("div", {class: "empty", text: empty})); return c; }
     var tb = el("tbody");
