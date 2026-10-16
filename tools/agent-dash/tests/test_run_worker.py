@@ -1,8 +1,10 @@
-"""Registry worker launcher. Fake processes only. No real agents."""
+"""Registry worker launcher. Fake workers, plus one real short-lived child. No real agents."""
 import importlib.util
 import json
 import os
+import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -365,6 +367,64 @@ class RunWorkerTests(unittest.TestCase):
         self.assertIn("model=muse-spark-1.3-contributor", line)
         self.assertEqual(launch.cmds, [])
         self.assertEqual((self.run_dir / "lane-1.tier").read_text(encoding="utf-8").splitlines(), ["muse"])
+
+    def test_reaps_a_finished_child_before_max_wait(self):
+        from io import StringIO
+        import contextlib
+
+        self.run_dir.mkdir()
+        label = "reap"
+        out = self.run_dir / ("out-%s.md" % label)
+        err = self.run_dir / ("err-%s.log" % label)
+        pid = runner.default_spawn(["/bin/sh", "-c", "exit 0"], out, err)
+        try:
+            state = wait_until_settled(pid)
+            self.assertTrue(state.startswith("Z"), "expected an unreaped child, got %r" % state)
+            os.kill(pid, 0)
+            (self.run_dir / ("%s.pid" % label)).write_text("%s\n" % pid, encoding="utf-8")
+            (self.run_dir / ("%s.tier" % label)).write_text("muse\n", encoding="utf-8")
+            argv = ["muse", label, str(self.ws), str(self.prompt), str(self.run_dir), "30"]
+            buf = StringIO()
+            started = time.monotonic()
+            with contextlib.redirect_stdout(buf):
+                code = runner.run(argv)
+            elapsed = time.monotonic() - started
+            line = buf.getvalue().strip()
+            self.assertEqual(code, 0)
+            self.assertNotIn("STATUS: running", line)
+            self.assertRegex(line, r"STATUS: (done|failed)")
+            self.assertLess(elapsed, 5)
+            with self.assertRaises(ProcessLookupError):
+                os.kill(pid, 0)
+        finally:
+            reap_test_child(pid)
+
+
+def wait_until_settled(pid, timeout=5):
+    deadline = time.monotonic() + timeout
+    state = ""
+    while True:
+        proc = subprocess.run(
+            ["ps", "-o", "state=", "-p", str(pid)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        state = proc.stdout.strip()
+        if state.startswith("Z") or state == "" or time.monotonic() >= deadline:
+            return state
+        time.sleep(0.02)
+
+
+def reap_test_child(pid):
+    try:
+        os.waitpid(pid, os.WNOHANG)
+    except (ChildProcessError, OSError):
+        pass
+    proc = runner._children.pop(pid, None)
+    if proc is not None and proc.poll() is None:
+        proc.kill()
+        proc.wait(timeout=2)
 
 
 if __name__ == "__main__":

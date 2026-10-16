@@ -437,7 +437,53 @@ def read_tail(path) -> str:
     return data.decode("utf-8", "replace")
 
 
+# Children default_spawn started. Dropping the Popen leaves a zombie that
+# os.kill(pid, 0) still reports as alive until this process exits.
+_children = {}
+
+
 def pid_alive(pid) -> bool:
+    """True while pid is running.
+
+    Reap our own child first. os.kill(pid, 0) succeeds on a zombie, so a
+    finished worker would stay "running" until max-wait. ChildProcessError
+    means this pid is not our child; fall back to os.kill.
+    """
+    try:
+        number = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if number > 0:
+        try:
+            got, status = os.waitpid(number, os.WNOHANG)
+        except ChildProcessError:
+            _release_child(number)
+            return _kill_alive(number)
+        except InterruptedError:
+            return _kill_alive(number)
+        except OSError:
+            return False
+        if got == 0:
+            return True
+        _release_child(number, status)
+        return False
+    return _kill_alive(number)
+
+
+def _release_child(pid, status=None) -> None:
+    proc = _children.pop(pid, None)
+    if proc is None or proc.returncode is not None:
+        return
+    if status is None:
+        proc.poll()
+        return
+    try:
+        proc.returncode = os.waitstatus_to_exitcode(status)
+    except ValueError:
+        proc.returncode = 1
+
+
+def _kill_alive(pid) -> bool:
     try:
         os.kill(int(pid), 0)
     except ProcessLookupError:
@@ -477,6 +523,7 @@ def default_spawn(cmd, out_path, err_path):
             stderr=err,
             start_new_session=True,
         )
+    _children[proc.pid] = proc
     return proc.pid
 
 
