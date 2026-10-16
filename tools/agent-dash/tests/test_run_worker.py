@@ -3,6 +3,7 @@ import importlib.util
 import json
 import os
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -207,6 +208,18 @@ class RunWorkerTests(unittest.TestCase):
         self.assertIn("STATUS: running", line)
         self.assertIn("tier=muse", line)
         self.assertEqual(len(launch.cmds), 1)
+
+    def test_an_exited_child_is_not_alive(self):
+        out = self.run_dir / "out-child.md"
+        err = self.run_dir / "err-child.log"
+        pid = runner.default_spawn(["/bin/sh", "-c", "echo PASS"], out, err)
+        deadline = time.monotonic() + 5
+        while runner.pid_alive(pid) and time.monotonic() < deadline:
+            time.sleep(0.02)
+        self.assertFalse(runner.pid_alive(pid))
+        with self.assertRaises(ChildProcessError):
+            os.waitpid(pid, os.WNOHANG)
+        self.assertEqual(out.read_text(encoding="utf-8"), "PASS\n")
 
     def test_none_available_when_every_worker_is_at_cap(self):
         self.counts = {
