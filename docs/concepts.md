@@ -61,7 +61,7 @@ The shipped map sends a label that starts with `ws` and digits to `WS` plus thos
 
 The task map is a second step. It runs only after the workstream is known. A key is an exact label, or a regex wrapped in slashes, such as `"/^ws4-ws4\\.1/"`. The page compiles that pattern with case insensitive matching. The value is the task id in `plan.json`, which must match exactly, including the `WS4.1` form.
 
-`run_worker.sh` appends a TSV row: label, session id, started epoch. muse rows go to `muse-sessions.tsv`. Grok rows go to `cursor-sessions.tsv` with a dash in the session column, because the chat id shows up later from the transcript. GLM rows, when some other launcher writes them, use `glm-sessions.tsv` with a model in the fourth column. This repository's launcher does not write that GLM file.
+`run_worker.sh` appends a TSV row: label, session id, started epoch, and model when the worker's columns include it. muse rows go to `muse-sessions.tsv`. Grok and Composer rows go to `cursor-sessions.tsv` with a dash in the session column, because the chat id shows up later from the transcript. GLM rows go to `glm-sessions.tsv` with the model in the fourth column.
 
 Collectors find those TSV files under a scratch root: either the file sitting directly on the root, or `<scratch-root>/<encoded-cwd>/<session-uuid>/scratchpad/<file>`. The shipped scratch glob is `$HOME/agent-scratch/*`. A run directory at `$HOME/agent-scratch/notes` matches that glob. `$HOME/agent-scratch/notes/runs` does not, because the glob is one directory deep. Put the TSV on a scratch root, or add the deeper path to `roots.scratchpads`.
 
@@ -71,35 +71,30 @@ An approval is a production step the owner has to answer before the lead acts. T
 
 Each item has an id, a step sentence, a status, a reversible flag, and conditions. `reversible no` is one-way. The dashboard does not show approvals; the lead reads them with `ws approvals <ID>` before any production step.
 
-`oneWay` in an execution-plan lane is the planner's flag for a lane that is irreversible or next to production. It is not a field `ws-wave` reads. The workflow never takes the production step. The lead does, and only from an `approved` item.
+`oneWay` on a lane requires a non-empty `reviewFocus`. The workflow still reviews that lane when `review` is false. The workflow never takes the production step. The lead does, and only from an `approved` item.
 
 ## The worker registry
 
-Workers come from a registry: `tools/agent-dash/workers.example.json`, replaced on one machine by a gitignored `workers.local.json` (or `AGENT_DASH_WORKERS`). Each worker has a kind (muse, cursor-agent or Grok Build CLI), a model, a concurrency cap and quota patterns. A lane asks for `default` (the registry default), a worker name, or `auto`. `auto` takes the first worker in `auto_order` that is under its cap and not cooling down; when a run fails on a quota error, that worker cools down and an `auto` or `default` lane relaunches on the next one.
+Workers come from a registry: `tools/agent-dash/workers.example.json`, replaced on one machine by a gitignored `workers.local.json` (or `AGENT_DASH_WORKERS`). Each worker has a kind (`muse`, `cursor`, or `grok-build`), a model, a concurrency cap, and quota patterns. Shipped tiers are `muse`, `grok`, `composer` (`composer-2.5`), `glm`, and `glm-flash`. A lane asks for `default` (the registry default), a worker name, or `auto`. `auto` takes the first worker in `auto_order` that is under its cap and not cooling down. When a run fails on a quota error, that worker cools down and an `auto` or `default` lane relaunches on the next one. A cursor cap counts `cursor-agent` processes for that model only.
 
-`ws-wave` reads `defaultTier` and `reviewTier`. Both default to `muse`. `reviewTier` falls back to `defaultTier` when you omit it. A lane's own `tier` overrides the build tier. The review tier stays `reviewTier`.
-
-`run_worker.sh` accepts `muse` or `grok`.
+`ws-wave` reads tier and model per role. Build tier is `lane.tier`, else `defaultTier`, else `default`. Review tier is `lane.reviewTier`, else `args.reviewTier`, else the build tier. Fix tier follows the same pattern with `fixTier`. `model`, `reviewModel`, and `fixModel` are optional overrides passed to `run_worker.sh`.
 
 - `muse` runs `muse exec` with model `muse-spark-1.3-contributor` and reasoning effort `xhigh`. It records a session id in `muse-sessions.tsv`.
-- `grok` runs `launch_grok.sh`, which runs `cursor-agent` and appends one billed usage line. The default model string is `grok-4.7[context=500k,reasoning_effort=xhigh,fast=false]`.
-
-Any other tier, including `glm` and `auto`, fails immediately with `unknown-tier`. GLM still appears on the dashboard when a `glm-sessions.tsv` row and a Grok CLI session exist. The kit does not launch that worker.
-
-Set `muse` or `grok` on the lane.
+- `grok` and `composer` run `launch_grok.sh`, which runs `cursor-agent` and appends one billed usage line. Grok's model string is `grok-4.7[context=500k,reasoning_effort=xhigh,fast=false]`. Composer's model is `composer-2.5`.
+- `glm` and `glm-flash` run the Grok Build CLI (`grok -p`) with the registry model.
 
 ## A wave
 
-One wave is a set of lanes that do not share a file or a test file. `ws-wave` runs those lanes in parallel.
+One wave is a set of lanes that do not share a file or a test file. Independent lanes start at once. A lane with `deps` waits until each named task in this run has finished `APPROVE*` or `built`. Any other dependency result returns `skipped-dep` and names the dependency. `base` is `origin/main`, `dep:<task>`, or any other existing branch or ref. `dep:<task>` cuts the worktree from that task's branch. Any other ref cuts the worktree from that ref. Unknown ids and cycles throw before any lane starts.
 
-For each lane the sequence is:
+For each lane that starts, the sequence is:
 
-1. Create the git worktree if it is missing, on the lane branch, from `origin/main`.
+1. Mark the task `wip`, then create the git worktree if it is missing, on the lane branch, from `origin/main`, from the dependency branch when `base` is `dep:<task>`, or from the other ref named in `base`.
 2. Build. The wrapper writes the prompt, runs `run_worker.sh`, and waits. A build that is blocked, dies, or has no commits stops the lane as `build-failed`.
-3. Review, unless the lane sets `"review": false`. A passing review, verdict starting with `APPROVE`, moves the task to `pr` and stops the loop. The lane is `approved`.
+3. Review, unless the lane sets `"review": false` and is not `oneWay`. A passing review, verdict starting with `APPROVE`, moves the task to `pr` and stops the loop. The lane is `approved`.
 4. Fix, then review again. `maxFixRounds` defaults to 2. When the last extra review still asks for changes, the lane is `needsLead`.
 
-The wrapper model is Haiku at low effort. That is the Workflow tool's model for the wrapper, not the worker. The worker tier is muse or Grok.
+`wrapperModel` defaults to Haiku and `wrapperEffort` defaults to `low`. That is the Workflow tool's model for the wrapper. The worker is whichever registry tier the lane named. Each lane's `runs` list repeats the tier and model from the runner's STATUS line. A full lane example is in `tools/agent-dash/docs/workstream-lead.md`.
 
 The lead merges `approved` branches, reads `needsLead`, and starts the next wave when its start condition holds. The workflow cannot wait out a multi-day window or receive a message from another session. Those stay with the lead.
 

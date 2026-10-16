@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 """Launch one registry worker and wait. A second call for the same label only waits.
 
-Usage: run_worker.py <tier|default|auto> <label> <workspace> <prompt-file> <run-dir> [max-wait]
+Usage: run_worker.py <tier|default|auto> <label> <workspace> <prompt-file> <run-dir> [max-wait] [model]
 
 Prints one line:
-STATUS: running|done|failed out=<report> err=<stderr> tier=<name> [reason=...]
+STATUS: running|done|failed out=<report> err=<stderr> tier=<name> model=<model> [reason=...]
+
+An empty model argument keeps the registry model. Any other model replaces it
+for this run. The chosen tier is the first line of <label>.tier and the model
+actually used is the second line. A later call for that label only waits.
 """
 
 from __future__ import annotations
@@ -28,8 +32,32 @@ RUN_RULE = (
     "A run that ends without the report is a failed run."
 )
 LABEL_OK = re.compile(r"^[\w.+-]{1,80}$")
+MODEL_OK = re.compile(r"^[A-Za-z0-9\[\],=._:-]+$")
 KINDS = ("muse", "cursor", "grok-build")
 READ_LIMIT = 262144
+_PGREP_META = re.compile(r"([.^$*+?(){}[\]|\\])")
+
+
+def cursor_pgrep(model: str) -> str:
+    text = str(model or "")
+    if not text:
+        return "[c]ursor-agent"
+    first = text[0]
+    rest = _PGREP_META.sub(r"\\\1", text[1:])
+    return "[c]ursor-agent.*--model [" + first + "]" + rest
+
+
+def effective_model(ctx, worker) -> str:
+    override = ctx.get("model_override") or ""
+    if override:
+        return str(override)
+    return str((worker or {}).get("model") or "")
+
+
+def cap_pattern(worker, model: str) -> str:
+    if (worker or {}).get("kind") == "cursor":
+        return cursor_pgrep(model)
+    return str((worker or {}).get("pgrep") or "")
 
 
 def run(argv, spawn=None, pgrep=None, sleep=None, now=None, alive=None, new_uuid=None) -> int:
@@ -43,15 +71,16 @@ def run(argv, spawn=None, pgrep=None, sleep=None, now=None, alive=None, new_uuid
     }
     if len(argv) < 5:
         print(
-            "usage: run_worker.py <tier|default|auto> <label> <workspace> <prompt-file> <run-dir> [max-wait]",
+            "usage: run_worker.py <tier|default|auto> <label> <workspace> <prompt-file> <run-dir> [max-wait] [model]",
             file=sys.stderr,
         )
         return 2
     requested, label, workspace, prompt_file, run_dir = argv[:5]
+    model_override = argv[6] if len(argv) >= 7 else ""
     try:
         max_wait = 540 if len(argv) < 6 or argv[5] == "" else int(argv[5])
     except ValueError:
-        print("usage: run_worker.py ... [max-wait-seconds]", file=sys.stderr)
+        print("usage: run_worker.py ... [max-wait-seconds] [model]", file=sys.stderr)
         return 2
     if not LABEL_OK.fullmatch(label):
         emit("failed", "", "", requested, "bad-label")
@@ -85,10 +114,20 @@ def run(argv, spawn=None, pgrep=None, sleep=None, now=None, alive=None, new_uuid
         "hooks": hooks,
         "cooldowns": read_cooldowns(cooldown_path()),
         "minutes": _minutes(registry),
+        "model_override": model_override,
+        "active_model": "",
     }
     if tier_path.is_file():
-        stored = tier_path.read_text(encoding="utf-8").strip() or requested
-        return observe(ctx, stored, set())
+        stored_name, stored_model = read_tier_file(tier_path)
+        stored_name = stored_name or requested
+        if not stored_model:
+            worker = (registry.get("workers") or {}).get(stored_name) or {}
+            stored_model = str(worker.get("model") or "")
+        ctx["active_model"] = stored_model
+        return observe(ctx, stored_name, set())
+    if model_override and not MODEL_OK.fullmatch(model_override):
+        emit("failed", out, err, requested, "bad-model")
+        return 2
     name, reason = pick_initial(ctx)
     if not name:
         code = 0 if reason == "none-available" else 2
@@ -115,15 +154,17 @@ def pick_initial(ctx):
 
 def launch(ctx, name, tried) -> int:
     worker = (ctx["registry"].get("workers") or {}).get(name) or {}
+    model = effective_model(ctx, worker)
     session_id = "-" if worker.get("kind") == "cursor" else ctx["hooks"]["uuid"]()
-    ctx["tier_path"].write_text(name + "\n", encoding="utf-8")
-    append_manifest(worker, ctx["run_dir"], ctx["label"], session_id, ctx["hooks"]["now"](), worker.get("model") or "")
-    cmd = command(worker, ctx["label"], ctx["workspace"], ctx["prompt"], session_id)
+    ctx["active_model"] = model
+    ctx["tier_path"].write_text(name + "\n" + model + "\n", encoding="utf-8")
+    append_manifest(worker, ctx["run_dir"], ctx["label"], session_id, ctx["hooks"]["now"](), model)
+    cmd = command(worker, ctx["label"], ctx["workspace"], ctx["prompt"], session_id, model)
     try:
         pid = ctx["hooks"]["spawn"](cmd, ctx["out"], ctx["err"])
     except OSError:
         ctx["tier_path"].unlink(missing_ok=True)
-        emit("failed", ctx["out"], ctx["err"], name, "spawn")
+        emit("failed", ctx["out"], ctx["err"], name, "spawn", model)
         return 2
     ctx["pid_path"].write_text(str(int(pid)) + "\n", encoding="utf-8")
     return observe(ctx, name, tried)
@@ -131,25 +172,26 @@ def launch(ctx, name, tried) -> int:
 
 def observe(ctx, name, tried) -> int:
     worker = (ctx["registry"].get("workers") or {}).get(name) or {}
+    model = ctx.get("active_model") or ""
     pid = read_pid(ctx["pid_path"])
     if pid and still_running(pid, ctx["max_wait"], ctx["hooks"]):
-        emit("running", ctx["out"], ctx["err"], name)
+        emit("running", ctx["out"], ctx["err"], name, model=model)
         return 0
     result = outcome(worker, ctx["out"], ctx["err"])
     if result != "quota":
         if result == "done":
-            emit("done", ctx["out"], ctx["err"], name)
+            emit("done", ctx["out"], ctx["err"], name, model=model)
         else:
-            emit("failed", ctx["out"], ctx["err"], name, "empty-report")
+            emit("failed", ctx["out"], ctx["err"], name, "empty-report", model)
         return 0
     note_quota(ctx, name)
     if ctx["requested"] not in ("auto", "default"):
-        emit("failed", ctx["out"], ctx["err"], name, "quota")
+        emit("failed", ctx["out"], ctx["err"], name, "quota", model)
         return 0
     tried.add(name)
     nxt = eligible(ctx, tried)
     if not nxt:
-        emit("failed", ctx["out"], ctx["err"], name, "quota")
+        emit("failed", ctx["out"], ctx["err"], name, "quota", model)
         return 0
     archive(ctx["run_dir"], ctx["label"], name)
     return launch(ctx, nxt, tried)
@@ -173,7 +215,8 @@ def eligible(ctx, skip):
             cap = int(worker.get("cap"))
         except (TypeError, ValueError):
             continue
-        pattern = worker.get("pgrep") or ""
+        model = effective_model(ctx, worker)
+        pattern = cap_pattern(worker, model)
         count = ctx["hooks"]["pgrep"](pattern) if pattern else 0
         if count >= cap:
             continue
@@ -213,9 +256,9 @@ def quota_hit(worker, out_path, err_path) -> bool:
     return False
 
 
-def command(worker, label, workspace, prompt_file, session_id):
+def command(worker, label, workspace, prompt_file, session_id, model):
     kind = worker.get("kind")
-    model = str(worker.get("model") or "")
+    model = str(model or "")
     extra = [str(arg) for arg in (worker.get("extra_args") or [])]
     if kind == "muse":
         return [
@@ -295,11 +338,23 @@ def still_running(pid, max_wait, hooks) -> bool:
     return bool(hooks["alive"](pid))
 
 
-def emit(state, out, err, tier, reason=None):
+def emit(state, out, err, tier, reason=None, model=None):
     line = f"STATUS: {state} out={out} err={err} tier={tier}"
+    if model:
+        line += f" model={model}"
     if reason:
         line += f" reason={reason}"
     print(line)
+
+
+def read_tier_file(path: Path):
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return "", ""
+    name = lines[0].strip() if lines else ""
+    model = lines[1].strip() if len(lines) > 1 else ""
+    return name, model
 
 
 def load_registry():
@@ -382,7 +437,53 @@ def read_tail(path) -> str:
     return data.decode("utf-8", "replace")
 
 
+# Children default_spawn started. Dropping the Popen leaves a zombie that
+# os.kill(pid, 0) still reports as alive until this process exits.
+_children = {}
+
+
 def pid_alive(pid) -> bool:
+    """True while pid is running.
+
+    Reap our own child first. os.kill(pid, 0) succeeds on a zombie, so a
+    finished worker would stay "running" until max-wait. ChildProcessError
+    means this pid is not our child; fall back to os.kill.
+    """
+    try:
+        number = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if number > 0:
+        try:
+            got, status = os.waitpid(number, os.WNOHANG)
+        except ChildProcessError:
+            _release_child(number)
+            return _kill_alive(number)
+        except InterruptedError:
+            return _kill_alive(number)
+        except OSError:
+            return False
+        if got == 0:
+            return True
+        _release_child(number, status)
+        return False
+    return _kill_alive(number)
+
+
+def _release_child(pid, status=None) -> None:
+    proc = _children.pop(pid, None)
+    if proc is None or proc.returncode is not None:
+        return
+    if status is None:
+        proc.poll()
+        return
+    try:
+        proc.returncode = os.waitstatus_to_exitcode(status)
+    except ValueError:
+        proc.returncode = 1
+
+
+def _kill_alive(pid) -> bool:
     try:
         os.kill(int(pid), 0)
     except ProcessLookupError:
@@ -422,6 +523,7 @@ def default_spawn(cmd, out_path, err_path):
             stderr=err,
             start_new_session=True,
         )
+    _children[proc.pid] = proc
     return proc.pid
 
 
