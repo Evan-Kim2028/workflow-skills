@@ -417,5 +417,43 @@ class MuseTests(unittest.TestCase):
         return sessions, scratch, path
 
 
+class ManifestDirsTests(unittest.TestCase):
+    def setUp(self):
+        muse._FRESH.clear()
+        muse._LOCATE.clear()
+
+    def _pad(self, root, enc, hub, label="ws2-x", sid=SID):
+        pad = os.path.join(root, enc, hub, "scratchpad")
+        os.makedirs(pad)
+        with open(os.path.join(pad, "muse-sessions.tsv"), "w") as fh:
+            fh.write("%s\t%s\t1792152010\n" % (label, sid))
+        return os.path.realpath(pad)
+
+    def test_parent_root_lists_enc_session_pads(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            want = self._pad(tmp, "enc", HUB)
+            pads = dict(muse._manifest_dirs(tmp, "muse-sessions.tsv", None))
+            self.assertEqual(pads, {want: HUB})
+
+    def test_encoded_cwd_root_lists_session_pads_directly(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            want = self._pad(tmp, "enc", HUB)
+            pads = dict(muse._manifest_dirs(os.path.join(tmp, "enc"), "muse-sessions.tsv", None))
+            self.assertEqual(pads, {want: HUB})
+
+    def test_only_filters_hub_session(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._pad(tmp, "enc", HUB)
+            enc = os.path.join(tmp, "enc")
+            self.assertEqual(list(muse._manifest_dirs(enc, "muse-sessions.tsv", "other")), [])
+            self.assertEqual(len(list(muse._manifest_dirs(enc, "muse-sessions.tsv", HUB))), 1)
+
+    def test_non_uuid_children_ignored(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            enc = os.path.join(tmp, "enc")
+            os.makedirs(os.path.join(enc, "not-a-session", "scratchpad"))
+            self.assertEqual(list(muse._manifest_dirs(enc, "muse-sessions.tsv", None)), [])
+
+
 if __name__ == "__main__":
     unittest.main()

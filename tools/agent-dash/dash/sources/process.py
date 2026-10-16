@@ -2,7 +2,11 @@
 
 Liveness for grok, muse, and glm reads pid, start time, and the label
 token only. A run is running when that pid is still that tool's process,
-or when a live process of that tool carries ``[label: <label>]``.
+or when a live process of that tool carries ``[label: <label>]``. Muse
+runs carry no label token (the label lives in the prompt file, not argv),
+so muse liveness also matches ``--session-id <uuid>`` from argv against
+the run's session uuid. Versioned ``muse-bin-<ver>`` comms count as
+``muse-bin``.
 """
 
 from __future__ import annotations
@@ -24,6 +28,9 @@ SOURCE_COMMS = {
 _LABEL = re.compile(r"\[label:\s*([^\]]+?)\]")
 _LINE = re.compile(r"^\s*(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\S+)\s+(\S+)\s*$")
 _LABEL_OK = re.compile(r"^[\w.+-]{1,80}$")
+_UUID = r"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}"
+_SESSION = re.compile(r"--session-id(?:=|\s+)(" + _UUID + r")")
+_UUID_OK = re.compile(r"^" + _UUID + r"$")
 
 
 def poll(store, cfg, now: float) -> None:
@@ -51,41 +58,58 @@ def poll(store, cfg, now: float) -> None:
 def live_agent_processes(now: float | None = None) -> list[dict]:
     """Live grok, muse, and glm processes.
 
-    Each row is ``pid``, ``comm``, ``started_at``, and ``label``. The
-    command line is read only to extract the label token and is not returned.
+    Each row is ``pid``, ``comm``, ``started_at``, ``label``, and (for
+    muse processes) ``session_id``. The command line is read only to
+    extract the label token and the muse ``--session-id`` and is not
+    returned.
     """
     now = time.time() if now is None else float(now)
-    labels = _labels_by_pid()
+    tokens = _tokens_by_pid()
     rows = []
     wanted = set().union(*SOURCE_COMMS.values())
     for row in _ps():
         if row["comm"] not in wanted:
             continue
+        token = tokens.get(row["pid"], {})
+        session_id = token.get("session_id")
         rows.append(
             {
                 "pid": row["pid"],
                 "comm": row["comm"],
                 "started_at": now - float(row["elapsed_s"]),
-                "label": labels.get(row["pid"]),
+                "label": token.get("label"),
+                "session_id": session_id if row["comm"] in SOURCE_COMMS["muse"] else None,
             }
         )
     return rows
 
 
-def match_agent(source: str, pid, label, processes: list[dict]):
-    """The live process for this run, by pid or by ``[label: ...]``."""
+def match_agent(source: str, pid, label, processes: list[dict], session_id=None):
+    """The live process for this run: by pid, by ``[label: ...]``, or (for
+    muse, which carries no label token) by session uuid."""
     comms = SOURCE_COMMS.get(source)
     if not comms:
         return None
     number = _pid(pid)
     if number is not None:
         for row in processes:
-            if row["pid"] == number and row["comm"] in comms:
+            if row["pid"] == number and _canon_comm(row.get("comm")) in comms:
                 return row
     text = label if isinstance(label, str) and label else None
     if text:
         for row in processes:
-            if row["comm"] in comms and row.get("label") == text:
+            if _canon_comm(row.get("comm")) in comms and row.get("label") == text:
+                return row
+    sid = session_id if isinstance(session_id, str) and _UUID_OK.match(session_id) else None
+    if sid:
+        want = sid.lower()
+        for row in processes:
+            got = row.get("session_id")
+            if (
+                _canon_comm(row.get("comm")) in comms
+                and isinstance(got, str)
+                and got.lower() == want
+            ):
                 return row
     return None
 
@@ -105,7 +129,7 @@ def apply_liveness(store, run: dict, source: str, processes) -> None:
     if pid is None and existing:
         pid = existing.get("pid")
     label = run.get("label") or (existing or {}).get("label")
-    proc = match_agent(source, pid, label, processes)
+    proc = match_agent(source, pid, label, processes, _run_session(run, existing))
     if proc:
         run["status"] = "running"
         run["pid"] = proc["pid"]
@@ -132,7 +156,7 @@ def reconcile_running(store, now: float, processes=None) -> int:
         source = row.get("source")
         if source not in SOURCE_COMMS:
             continue
-        proc = match_agent(source, row.get("pid"), row.get("label"), processes)
+        proc = match_agent(source, row.get("pid"), row.get("label"), processes, _run_session(row, None))
         if proc:
             if row.get("pid") != proc["pid"]:
                 store.upsert_run(
@@ -158,8 +182,42 @@ def reconcile_running(store, now: float, processes=None) -> int:
     return ended
 
 
+def _canon_comm(comm) -> str:
+    """Map versioned ``muse-bin-<ver>`` names to ``muse-bin``."""
+    if isinstance(comm, str) and (comm == "muse-bin" or comm.startswith("muse-bin-")):
+        return "muse-bin"
+    return comm
+
+
+def _run_session(run: dict, existing) -> str | None:
+    """Session uuid for matching: the run's, the stored row's, or the uuid
+    in a ``muse:<uuid>:<label>`` run id."""
+    sid = (run or {}).get("session_id") or (existing or {}).get("session_id")
+    if isinstance(sid, str) and _UUID_OK.match(sid):
+        return sid
+    return _uuid_from_run_id((run or {}).get("run_id"))
+
+
+def _uuid_from_run_id(run_id) -> str | None:
+    if not isinstance(run_id, str):
+        return None
+    parts = run_id.split(":", 2)
+    if len(parts) == 3 and parts[0] == "muse" and _UUID_OK.match(parts[1]):
+        return parts[1]
+    return None
+
+
 def _labels_by_pid() -> dict:
     """Pid -> label token. The rest of the command line is discarded."""
+    return {pid: token["label"] for pid, token in _tokens_by_pid().items() if token.get("label")}
+
+
+def _tokens_by_pid() -> dict:
+    """Pid -> ``{"label": ..., "session_id": ...}`` tokens.
+
+    The command line is read only to extract the label token and the muse
+    ``--session-id``; the rest is discarded and never returned.
+    """
     try:
         proc = subprocess.run(
             ["ps", "-axww", "-o", "pid=,command="],
@@ -175,11 +233,12 @@ def _labels_by_pid() -> dict:
     found = {}
     for line in proc.stdout.splitlines():
         label = label_from_args(line)
-        if not label:
+        session_id = session_id_from_args(line)
+        if not label and not session_id:
             continue
         pid = _pid(line.strip().split(None, 1)[0] if line.strip() else None)
         if pid is not None:
-            found[pid] = label
+            found[pid] = {"label": label, "session_id": session_id}
     return found
 
 
@@ -245,6 +304,17 @@ def label_from_args(text: str) -> str | None:
     return label
 
 
+def session_id_from_args(text: str) -> str | None:
+    """The muse ``--session-id <uuid>`` (or ``--session-id=<uuid>``) token.
+
+    Returns only the uuid; the rest of the command line is discarded.
+    """
+    match = _SESSION.search(text or "")
+    if not match:
+        return None
+    return match.group(1)
+
+
 def label_from_pid(pid: int) -> str | None:
     try:
         proc = subprocess.run(
@@ -288,6 +358,7 @@ def parse_ps(text: str) -> list[dict]:
         comm = match.group(6)
         if "/" in comm:
             comm = comm.rsplit("/", 1)[-1]
+        comm = _canon_comm(comm)
         try:
             elapsed = parse_etime(match.group(5))
         except ValueError:

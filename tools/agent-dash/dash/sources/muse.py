@@ -411,7 +411,10 @@ def _manifest_dirs(root, filename, only=None):
     """Scratchpads that contain ``filename``.
 
     Lists ``<root>/<encoded-cwd>/<session>/`` only. Never lists the inside of
-    a scratchpad (those trees hold worktrees and database files).
+    a scratchpad (those trees hold worktrees and database files). A root
+    that is itself an ``<encoded-cwd>`` dir (e.g. from a glob-expanded
+    scratchpads root) is also accepted: a uuid child holding
+    ``scratchpad/<filename>`` is a session pad directly.
     """
     if not root or not os.path.isdir(root):
         return
@@ -430,6 +433,15 @@ def _manifest_dirs(root, filename, only=None):
         yield_pad = (rp, parent)
         return yield_pad
 
+    def emit_session(sess_dir, sess_name):
+        if not _is_uuid(sess_name) or (only is not None and sess_name != only):
+            return
+        tsv = os.path.join(sess_dir, "scratchpad", filename)
+        if os.path.isfile(tsv):
+            item = emit(os.path.dirname(tsv))
+            if item:
+                yield item
+
     direct = os.path.join(root, filename)
     if os.path.isfile(direct):
         item = emit(root)
@@ -444,6 +456,10 @@ def _manifest_dirs(root, filename, only=None):
             try:
                 if not enc.is_dir(follow_symlinks=False):
                     continue
+            except OSError:
+                continue
+            yield from emit_session(enc.path, enc.name)
+            try:
                 sessions = os.scandir(enc.path)
             except OSError:
                 continue
@@ -454,13 +470,7 @@ def _manifest_dirs(root, filename, only=None):
                             continue
                     except OSError:
                         continue
-                    if not _is_uuid(sess.name) or (only is not None and sess.name != only):
-                        continue
-                    tsv = os.path.join(sess.path, "scratchpad", filename)
-                    if os.path.isfile(tsv):
-                        item = emit(os.path.dirname(tsv))
-                        if item:
-                            yield item
+                    yield from emit_session(sess.path, sess.name)
 
 
 def _read_small(path, budget, per_file):
