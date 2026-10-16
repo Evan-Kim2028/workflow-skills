@@ -222,6 +222,12 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
 .prog-acts{display:flex;gap:6px;justify-content:flex-end}.prog-acts button{font-size:12.5px;padding:4px 10px;border-radius:999px}.prog-acts .copybtn{margin-left:0}
 .prog-row.s-done{opacity:.85}
 @media (max-width:1000px){.prog-row{grid-template-columns:1fr auto;}.prog-bar,.prog-meta,.prog-acts{grid-column:1/-1}}
+
+.working-now{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin:6px 0 10px}
+.working-now>b{font:700 12px var(--mono);color:var(--s1);margin-right:4px}
+.wn-pill{display:inline-flex;align-items:center;gap:6px;font:12px var(--mono);padding:3px 10px 3px 6px;border-radius:999px;border:1px solid color-mix(in srgb,var(--s1) 45%,var(--ring));background:color-mix(in srgb,var(--s1) 10%,var(--surface))}
+.wn-pill i{width:8px;height:8px;border-radius:50%;animation:livering 1.8s ease-out infinite}
+.wn-pill .wn-id{font-weight:700;color:var(--ink)}.wn-pill .wn-slug{color:var(--ink-2)}
 </style>
 </head>
 <body>
@@ -799,6 +805,18 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
     function attText(a) { return a.runs + " run" + (a.runs > 1 ? "s" : "") + ": " + (a.runs - a.reviews) + " build, " + a.reviews + " review" + (a.reviews === 1 ? "" : "s") + (a.sentBack ? ", " + a.sentBack + " sent back (changes, partial or blocked)" : ""); }
     var nLive = Object.keys(live).reduce(function (a, k) { return a + live[k].length; }, 0);
     var c = el("div", {class: "card", id: "exec-progress", "data-nav": "Plan progress"}, [el("div", {style: "display:flex;align-items:baseline;gap:10px;flex-wrap:wrap"}, [el("h2", {text: plan.ws + " plan progress" + (nLive ? " · " + nLive + " agent" + (nLive > 1 ? "s" : "") + " working" : "")}), (plan.start_prompt ? copyBtn(plan.start_prompt) : null), el("a", {class: "planbtn", href: planUrl(plan.ws), onclick: function (ev) { ev.preventDefault(); openPlan(plan.ws); }, text: "Open the " + plan.ws + " plan"})]), el("p", {class: "sub", text: "Every task by group, coloured by state (legend below). The badge on a working chip is the agent tool and count; \u21BBN is how many agent runs worked the task in this range (amber edge: sent back twice or more; hover for builds vs reviews). Arrows show what each group waits on."})]);
+    var workingIds = Object.keys(live);
+    if (workingIds.length) {
+      var wn = el("div", {class: "working-now"}, [el("b", {text: "\u25CF Working now (" + nLive + ")"})]);
+      workingIds.forEach(function (tid) { live[tid].forEach(function (r) {
+        var slug = String(r.label || "").replace(new RegExp("^" + plan.ws.toLowerCase() + "[-._]?", "i"), "").replace(tid, "").replace(/^[-._]+/, "");
+        var pill = el("button", {class: "wn-pill", title: (r.label || "") + " \u00B7 " + modelName(tierKey(r)) + " \u00B7 " + fmtDur(r.elapsed_s)}, [el("i"), el("span", {class: "wn-id", text: tid}), el("span", {class: "wn-slug", text: slug})]);
+        pill.firstChild.style.background = colorOf(tierKey(r));
+        pill.addEventListener("click", function () { openRun(r); });
+        wn.appendChild(pill);
+      }); });
+      c.appendChild(wn);
+    }
     if (unassigned.length) { var ua = el("div", {class: "unassigned"}, [el("b", {style: "font-size:12px;color:var(--ink-2)", text: "Running, not mapped to a task:"})]); unassigned.forEach(function (r) { var sp = el("span", {title: (r.tier || "") + " · " + fmtDur(r.elapsed_s), text: r.label || r.run_id}); sp.style.borderColor = colorOf(tierKey(r)); ua.appendChild(sp); }); c.appendChild(ua); }
     var tot = {done: 0, prog: 0, pr: 0, todo: 0, deferred: 0}, gs = {}, colStat = {};
     var prevSt = (window.__adPrevStatus = window.__adPrevStatus || {});
