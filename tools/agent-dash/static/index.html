@@ -162,7 +162,7 @@ tr.clk{cursor:pointer}tr.clk:hover td{background:var(--surface-2)}
 <button type="button" id="view-exec" aria-pressed="true">Execution</button>
 </nav>
 <span class="sp"></span>
-<span class="seg-ctl" id="range"><button data-h="6" aria-pressed="false">6 h</button><button data-h="24" aria-pressed="true">24 h</button><button data-h="72" aria-pressed="false">3 d</button></span>
+<span class="seg-ctl" id="range"><button data-h="6" aria-pressed="false">6 h</button><button data-h="12" aria-pressed="true">12 h</button><button data-h="24" aria-pressed="false">24 h</button><button data-h="72" aria-pressed="false">3 d</button></span>
 <button id="theme" title="Toggle light or dark">Theme</button>
 </header>
 <nav class="tabs" id="tabs" role="tablist" aria-label="Workstreams"></nav>
@@ -186,7 +186,7 @@ tr.clk{cursor:pointer}tr.clk:hover td{background:var(--surface-2)}
   var FIX = Q.has("fixtures");
   var execCache = {};
   var execGen = 0;
-  var state = {view: "exec", ws: "all", hours: 24, snap: null, runs: [], usage: [], conc: [], wss: [], bundles: [], plan: null, seq: -1, groupBy: "model", approvals: []};
+  var state = {view: "exec", ws: "all", hours: 12, snap: null, runs: [], usage: [], conc: [], wss: [], bundles: [], plan: null, seq: -1, groupBy: "model", approvals: []};
   var SERIES = {opus: "--s1", haiku: "--s2", sonnet: "--s3", grok: "--s4", muse: "--s5", glm: "--s6", fable: "--s7", other: "--other"};
   var MODELS = [["opus", "Opus"], ["fable", "Fable"], ["sonnet", "Sonnet"], ["haiku", "Haiku"], ["grok", "Grok 4.7"], ["muse", "muse"], ["glm", "GLM"], ["other", "Other"]];
   function modelName(k) { for (var i = 0; i < MODELS.length; i++) if (MODELS[i][0] === k) return MODELS[i][1]; return k; }
@@ -448,7 +448,7 @@ tr.clk{cursor:pointer}tr.clk:hover td{background:var(--surface-2)}
       hit.addEventListener("mouseleave", hideTip); svg.appendChild(hit);
       
     });
-    var every = Math.max(1, Math.ceil(nH / Math.max(2, Math.floor(pw / 90)))); for (var hi = 0; hi <= nH; hi += every) xt.push({x: L + hi * slot, label: fmtT(h0 + hi * 3600), anchor: hi === 0 ? "start" : "middle"});
+    xt = timeTicks(h0, Date.now() / 1000, function (t) { return L + (t - h0) / 3600 * slot; }, Math.max(2, Math.floor(pw / 90)));
     var axg = axes(svg, {L: L, T: T, pw: pw, ph: ph, yMax: nice, xTicks: xt, yTitle: "tokens", xTitle: "hour"}); svg.insertBefore(axg, svg.firstChild); c.appendChild(svg);
     return c;
   }
@@ -460,7 +460,7 @@ tr.clk{cursor:pointer}tr.clk:hover td{background:var(--surface-2)}
     var c = el("div", {class: "card"}, [el("h2", {text: "Live agents over time"}), el("p", {class: "sub", text: "Agents running at each moment, one strip per tool on its own scale (0 to that tool's peak), for this view's scope."})]);
     var P = state.conc; if (!P.length) { c.appendChild(el("div", {class: "empty", text: "No samples yet."})); return c; }
     var tools = [["grok", "Grok 4.7"], ["muse", "muse"], ["glm", "GLM"], ["claude", "Claude"]];
-    var t0 = P[0].t, t1 = P[P.length - 1].t;
+    var t1 = Date.now() / 1000, t0 = t1 - state.hours * 3600; P = P.filter(function (p) { return p.t >= t0 - 60; }); if (!P.length) { c.appendChild(el("div", {class: "empty", text: "No samples in this window."})); return c; }
     tools.forEach(function (tl) {
       var mx = 1; P.forEach(function (p) { mx = Math.max(mx, p[tl[0]] || 0); }); mx = Math.max(2, Math.ceil(mx / 2) * 2);
       var last = tl === tools[tools.length - 1], W = CW(), H = last ? 104 : 66, L = 120, R = 14, T = 10, Bm = last ? 42 : 8, pw = W - L - R, ph = H - T - Bm;
@@ -581,21 +581,34 @@ tr.clk{cursor:pointer}tr.clk:hover td{background:var(--surface-2)}
   }
 
   /* workstream cards */
+  var planSum = {};
+  function loadPlanSums() {
+    return Promise.all(shown(state.wss).map(function (w) {
+      return api("/api/plan", {ws: w.ws}).then(function (p) {
+        var c = {done: 0, prog: 0, pr: 0, todo: 0, deferred: 0};
+        (p && p.groups || []).forEach(function (g) { g.tasks.forEach(function (t) { var k = t.status || "todo"; c[k] = (c[k] || 0) + 1; }); });
+        planSum[w.ws] = c;
+      }).catch(function () {});
+    }));
+  }
   function wsCards() {
     var c = el("div", {class: "grid g-tiles"});
     shown(state.wss).forEach(function (w) {
-      var tk = w.tk || {}, tot = ["backlog", "todo", "doing", "review", "done", "cancelled"].reduce(function (a, k) { return a + (tk[k] || 0); }, 0);
+      var pc = planSum[w.ws] || {done: 0, prog: 0, pr: 0, todo: 0, deferred: 0};
+      var tot = pc.done + pc.prog + pc.pr + pc.todo;
       var card = el("div", {class: "card wsc", onclick: function () { go(w.ws); }});
       var top = el("div", {class: "top"}, [el("span", {class: "id", text: w.ws}), el("span", {class: "st " + (w.running ? "running" : "done")}, [el("i"), w.running ? w.running + " running" : "idle"])]);
       card.appendChild(top); card.appendChild(el("div", {style: "font-size:13px;color:var(--ink-2)", text: w.name || ""}));
-      var bar = el("div", {class: "bar", role: "img", "aria-label": (tk.done || 0) + " of " + tot + " tracker issues done"});
-      [["done", "var(--good)"], ["review", "var(--s1)"], ["doing", "var(--s1)"]].forEach(function (p) { if (!tk[p[0]] || !tot) return; var sp = el("span"); sp.style.width = (100 * tk[p[0]] / tot) + "%"; sp.style.background = p[1]; bar.appendChild(sp); });
+      var bar = el("div", {class: "bar", role: "img", "aria-label": pc.done + " of " + tot + " plan tasks done"});
+      [["done", "var(--good)"], ["prog", "var(--s5)"], ["pr", "var(--warning)"]].forEach(function (p) { if (!pc[p[0]] || !tot) return; var sp = el("span"); sp.style.width = (100 * pc[p[0]] / tot) + "%"; sp.style.background = p[1]; bar.appendChild(sp); });
       card.appendChild(bar);
-      card.appendChild(el("div", {style: "font:12px var(--mono);color:var(--muted)", text: (tk.done || 0) + "/" + tot + " issues · " + fmtN(w.tokens) + " tok · " + fmtUsd(w.cost_usd)}));
+      var pct = tot ? Math.round(100 * pc.done / tot) : 0;
+      card.appendChild(el("div", {style: "font:12px var(--mono);color:var(--muted)", title: "From the workstream plan (plan.json): " + pc.done + " done, " + pc.prog + " merged waiting on prod, " + pc.pr + " waiting to merge, " + pc.todo + " not started" + (pc.deferred ? ", " + pc.deferred + " deferred (not counted)" : ""), text: pc.done + "/" + tot + " tasks (" + pct + "%) \u00B7 " + fmtN(w.tokens) + " tok \u00B7 " + fmtUsd(w.cost_usd)}));
       c.appendChild(card);
     });
     return c;
   }
+
 
 
   var TASKMAP = {};
@@ -733,11 +746,10 @@ tr.clk{cursor:pointer}tr.clk:hover td{background:var(--surface-2)}
     var snap = state.snap || {running: [], recent: [], alerts: [], caps: {}, totals: {tokens: {}}};
     m.appendChild(needsCard());
     m.appendChild(tiles(snap));
-    var g1 = el("div", {class: "grid g-2", style: "margin-top:14px"});
+    var g1 = el("div", {style: "margin-top:14px"});
     g1.appendChild(runsTable("Running now", "Click a row for details. Output ▲ means the out file grew since the last poll.", snap.running || [], "Nothing running."));
-    var right = el("div", {class: "grid"}); right.appendChild(alertsCard(snap)); g1.appendChild(right);
     m.appendChild(g1);
-    if (state.ws === "all" && state.wss.length) { m.appendChild(el("h2", {style: "font-size:14px;margin:20px 0 8px", text: "Workstreams"})); m.appendChild(wsCards()); }
+    if (state.ws === "all" && state.wss.length) { m.appendChild(el("h2", {style: "font-size:14px;margin:20px 0 8px", text: "Workstreams"})); var wc = wsCards(); m.appendChild(wc); if (!Object.keys(planSum).length) loadPlanSums().then(function () { var n = wsCards(); wc.replaceWith(n); }); else loadPlanSums(); }
     if (state.plan) { var pw = el("div", {style: "margin-top:14px"}); pw.appendChild(planCard(state.plan, snap)); m.appendChild(pw); }
     var g2 = el("div", {class: "grid", style: "margin-top:14px;gap:14px"}); g2.appendChild(tokenChart()); g2.appendChild(concChart(snap)); m.appendChild(g2);
     var g3 = el("div", {style: "margin-top:14px"}); g3.appendChild(gantt()); m.appendChild(g3);

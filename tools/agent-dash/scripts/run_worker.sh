@@ -14,16 +14,16 @@ if ! alive && [ ! -s "$OUT" ]; then
   [ -d "$WS" ] && [ -f "$PF" ] || { echo "STATUS: failed out=$OUT err=$ERR reason=missing-workspace-or-prompt"; exit 2; }
   case "$TIER" in
     grok)
+      printf "%s\t-\t%s\n" "$L" "$(date +%s)" >> "$RD/cursor-sessions.tsv"
       nohup "$HERE/launch_grok.sh" "$L" "$WS" "$PF" < /dev/null > "$OUT" 2> "$ERR" &
-      echo $! > "$PIDF"
-      printf "%s\t-\t%s\n" "$L" "$(date +%s)" >> "$RD/cursor-sessions.tsv" ;;
+      echo $! > "$PIDF" ;;
     muse)
       SID=$(uuidgen | tr 'A-Z' 'a-z')
+      printf "%s\t%s\t%s\n" "$L" "$SID" "$(date +%s)" >> "$RD/muse-sessions.tsv"
       nohup muse exec --trust-workspace --model muse-spark-1.3-contributor --reasoning-effort xhigh \
         --workspace "$WS" --prompt-file "$PF" --disable-reminders --user-input-auto-resolve \
         --session-id "$SID" < /dev/null > "$OUT" 2> "$ERR" &
-      echo $! > "$PIDF"
-      printf "%s\t%s\t%s\n" "$L" "$SID" "$(date +%s)" >> "$RD/muse-sessions.tsv" ;;
+      echo $! > "$PIDF" ;;
     *) echo "STATUS: failed out=$OUT err=$ERR reason=unknown-tier"; exit 2 ;;
   esac
   sleep 5

@@ -49,15 +49,28 @@
     svg.appendChild(g); return g;
   }
 
+  function fmtHour(t) {
+    var d = new Date(t * 1000);
+    if (d.getHours() === 0 && d.getMinutes() === 0) return d.toLocaleDateString([], {month: "short", day: "numeric"});
+    return d.toLocaleTimeString([], {hour: "numeric"});
+  }
+
+  /* Ticks on whole local hours (step 1, 2, 3, 6, 12 or 24 h, the smallest that fits n labels), plus a "now" tick at t1. */
   function timeTicks(t0, t1, X, n) {
-    var out = [];
     n = n || 6;
-    for (var i = 0; i <= n; i++) {
-      var t = t0 + (t1 - t0) * i / n;
-      out.push({x: X(t), label: i === n && Math.abs(t1 - Date.now() / 1000) < 120 ? "now" : fmtT(t), anchor: i === 0 ? "start" : i === n ? "end" : "middle"});
+    var span = Math.max(1, t1 - t0), steps = [1, 2, 3, 6, 12, 24], step = 24;
+    for (var i = 0; i < steps.length; i++) { if (span / (steps[i] * 3600) <= n) { step = steps[i]; break; } }
+    var d = new Date(t0 * 1000); d.setMinutes(0, 0, 0);
+    var t = d.getTime() / 1000, out = [];
+    while (t < t0) t += 3600;
+    while (t <= t1 - 1800) {
+      var hr = new Date(t * 1000).getHours();
+      if (hr % step === 0) out.push({x: X(t), label: fmtHour(t), anchor: "middle"});
+      t += 3600;
     }
+    out.push({x: X(t1), label: Math.abs(t1 - Date.now() / 1000) < 300 ? "now" : fmtT(t1), anchor: "end"});
     return out;
   }
 
-  global.AD = {fmtN: fmtN, fmtUsd: fmtUsd, fmtDur: fmtDur, fmtDate: fmtDate, fmtT: fmtT, axes: axes, timeTicks: timeTicks};
+  global.AD = {fmtHour: fmtHour, fmtN: fmtN, fmtUsd: fmtUsd, fmtDur: fmtDur, fmtDate: fmtDate, fmtT: fmtT, axes: axes, timeTicks: timeTicks};
 })(window);
