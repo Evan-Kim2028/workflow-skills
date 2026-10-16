@@ -111,6 +111,8 @@ tr.clk{cursor:pointer}tr.clk:hover td{background:var(--surface-2)}
 .chip.pr::before{content:"\29D7"}
 .chip.prog{border-style:solid;border-color:var(--s5);color:var(--ink);background:color-mix(in srgb,var(--s5) 20%,transparent)}
 .chip.prog::before{content:"\21E1"}
+.chip.wip{border-style:solid;border-color:var(--s1);color:var(--ink);background:transparent}
+.chip.wip::before{content:"\25D4"}
 .chip.deferred{border-style:dotted;opacity:.6}
 .chip.deferred::before{content:"\21B7"}
 .chip .att{font:600 9.5px var(--mono);color:var(--muted);margin-left:3px;padding:0 3px;border-radius:4px;border:1px solid var(--grid)}
@@ -705,7 +707,7 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
   function loadPlanSums() {
     return Promise.all(shown(state.wss).map(function (w) {
       return api("/api/plan", {ws: w.ws}).then(function (p) {
-        var c = {done: 0, prog: 0, pr: 0, todo: 0, deferred: 0};
+        var c = {done: 0, wip: 0, prog: 0, pr: 0, todo: 0, deferred: 0};
         (p && p.groups || []).forEach(function (g) { g.tasks.forEach(function (t) { var k = t.status || "todo"; c[k] = (c[k] || 0) + 1; }); });
         planSum[w.ws] = c; planPrompt[w.ws] = p && p.start_prompt;
       }).catch(function () {});
@@ -718,9 +720,9 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
     var all = {done: 0, tot: 0};
     shown(state.wss).forEach(function (w) {
       var pc = planSum[w.ws]; if (!pc) return;
-      var tot = pc.done + pc.prog + pc.pr + pc.todo, pct = tot ? Math.round(100 * pc.done / tot) : 0;
+      var tot = pc.done + (pc.wip || 0) + pc.prog + pc.pr + pc.todo, pct = tot ? Math.round(100 * pc.done / tot) : 0;
       all.done += pc.done; all.tot += tot;
-      var st = tot && pc.done === tot ? ["done", "Done \u2713"] : (pc.done + pc.prog + pc.pr || w.running) ? ["active", "In progress"] : ["todo", "Not started"];
+      var st = tot && pc.done === tot ? ["done", "Done \u2713"] : (pc.done + (pc.wip || 0) + pc.prog + pc.pr || w.running) ? ["active", "In progress"] : ["todo", "Not started"];
       var row = el("div", {class: "prog-row s-" + st[0]});
       row.appendChild(el("div", {class: "prog-name"}, [el("b", {text: w.ws}), el("span", {text: w.name || ""})]));
       row.appendChild(el("span", {class: "prog-pill " + st[0], text: st[1]}));
@@ -728,7 +730,7 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
       [["done", "var(--good)"], ["prog", "var(--s5)"], ["pr", "var(--warning)"]].forEach(function (p) { if (!pc[p[0]] || !tot) return; var sp = el("span"); sp.style.width = (100 * pc[p[0]] / tot) + "%"; sp.style.background = p[1]; bar.appendChild(sp); });
       row.appendChild(bar);
       row.appendChild(el("b", {class: "prog-pct", text: pct + "%"}));
-      row.appendChild(el("span", {class: "prog-meta", text: pc.done + "/" + tot + " tasks" + (pc.prog ? " \u00B7 " + pc.prog + " on prod" : "") + (pc.pr ? " \u00B7 " + pc.pr + " to merge" : "") + (w.running ? " \u00B7 \u25CF " + w.running + " live" : "")}));
+      row.appendChild(el("span", {class: "prog-meta", text: pc.done + "/" + tot + " tasks" + (pc.wip ? " \u00B7 " + pc.wip + " in progress" : "") + (pc.prog ? " \u00B7 " + pc.prog + " on prod" : "") + (pc.pr ? " \u00B7 " + pc.pr + " to merge" : "") + (w.running ? " \u00B7 \u25CF " + w.running + " live" : "")}));
       var acts = el("div", {class: "prog-acts"});
       var bp = el("button", {text: "Plan"}); bp.addEventListener("click", function () { openPlan(w.ws); }); acts.appendChild(bp);
       var bl = el("button", {text: "Live"}); bl.addEventListener("click", function () { if (window.DashNav) window.DashNav.openExec(w.ws); }); acts.appendChild(bl);
@@ -828,19 +830,19 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
       c.appendChild(wn);
     }
     if (unassigned.length) { var ua = el("div", {class: "unassigned"}, [el("b", {style: "font-size:12px;color:var(--ink-2)", text: "Running, not mapped to a task:"})]); unassigned.forEach(function (r) { var sp = el("span", {title: (r.tier || "") + " · " + fmtDur(r.elapsed_s), text: r.label || r.run_id}); sp.style.borderColor = colorOf(tierKey(r)); ua.appendChild(sp); }); c.appendChild(ua); }
-    var tot = {done: 0, prog: 0, pr: 0, todo: 0, deferred: 0}, gs = {}, colStat = {};
+    var tot = {done: 0, wip: 0, prog: 0, pr: 0, todo: 0, deferred: 0}, gs = {}, colStat = {};
     var prevSt = (window.__adPrevStatus = window.__adPrevStatus || {});
     var wrap = el("div", {class: "dag-scroll"}), dag = el("div", {class: "dag"}), svg = s("svg", {class: "dedges"}); dag.appendChild(svg); wrap.appendChild(dag);
     dag.style.gridTemplateColumns = "repeat(" + plan.cols.length + ",1fr)";
     var cols = plan.cols.map(function (n) { var d = el("div", {class: "dcol"}, [el("div", {class: "dcolh", text: n})]); dag.appendChild(d); return d; });
     var nodes = {};
     plan.groups.forEach(function (g) {
-      var cnt = {done: 0, prog: 0, pr: 0, todo: 0, moved: 0, deferred: 0}; g.tasks.forEach(function (t) { cnt[t.status || "todo"] = (cnt[t.status || "todo"] || 0) + 1; });
+      var cnt = {done: 0, wip: 0, prog: 0, pr: 0, todo: 0, moved: 0, deferred: 0}; g.tasks.forEach(function (t) { cnt[t.status || "todo"] = (cnt[t.status || "todo"] || 0) + 1; });
       var live = g.tasks.length - (cnt.moved || 0) - (cnt.deferred || 0);
       var n = el("div", {class: "dnode " + (live && cnt.done === live ? "s-done" : (cnt.done + cnt.prog + cnt.pr ? "s-prog" : ""))});
       n.appendChild(el("h4", {text: g.title}));
       var gr = 0, gv = 0; g.tasks.forEach(function (t) { var a = att[t.id]; if (a) { gr += a.runs; gv += a.reviews; } });
-      n.appendChild(el("div", {class: "m", text: cnt.done + " done · " + cnt.pr + " waiting to merge · " + cnt.prog + " waiting on prod · " + cnt.todo + " not started" + (cnt.deferred ? " · " + cnt.deferred + " deferred" : "") + (gr ? " · " + fmtN(gr) + " runs, " + fmtN(gv) + " reviews" : "")}));
+      n.appendChild(el("div", {class: "m", text: cnt.done + " done · " + (cnt.wip ? cnt.wip + " in progress · " : "") + cnt.pr + " waiting to merge · " + cnt.prog + " waiting on prod · " + cnt.todo + " not started" + (cnt.deferred ? " · " + cnt.deferred + " deferred" : "") + (gr ? " · " + fmtN(gr) + " runs, " + fmtN(gv) + " reviews" : "")}));
       var mini = el("div", {class: "mini"}); [["done", "var(--good)"], ["pr", "var(--warning)"], ["prog", "var(--s5)"]].forEach(function (p) { var sp = el("span"); sp.style.width = (live ? 100 * cnt[p[0]] / live : 0) + "%"; sp.style.background = p[1]; sp.style.display = "block"; mini.appendChild(sp); }); n.appendChild(mini);
       var gLive = 0;
       var ch = el("div", {class: "chips"}); g.tasks.forEach(function (t) {
@@ -852,8 +854,8 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
         ch.appendChild(cp); }); 
       if (gLive) { n.insertBefore(el("div", {class: "live-n", text: "\u25CF " + gLive + " agent" + (gLive > 1 ? "s" : "") + " working"}), n.children[1]); n.classList.add("s-live"); }
       n.appendChild(ch);
-      cols[g.col].appendChild(n); nodes[g.id] = n; ["done", "prog", "pr", "todo", "deferred"].forEach(function (k) { tot[k] += cnt[k] || 0; });
-      gs[g.id] = {done: live > 0 && cnt.done === live, started: cnt.done + cnt.prog + cnt.pr > 0, active: gLive > 0 || cnt.prog + cnt.pr > 0, col: g.col};
+      cols[g.col].appendChild(n); nodes[g.id] = n; ["done", "wip", "prog", "pr", "todo", "deferred"].forEach(function (k) { tot[k] += cnt[k] || 0; });
+      gs[g.id] = {done: live > 0 && cnt.done === live, started: cnt.done + cnt.wip + cnt.prog + cnt.pr > 0, active: gLive > 0 || cnt.wip + cnt.prog + cnt.pr > 0, col: g.col};
       colStat[g.col] = colStat[g.col] || {done: 0, tot: 0, now: false}; colStat[g.col].done += cnt.done; colStat[g.col].tot += live;
     });
     var deps = {}; (plan.edges || []).forEach(function (e) { (deps[e[1]] = deps[e[1]] || []).push(e[0]); });
@@ -866,16 +868,16 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
       if (tag) n.insertBefore(el("span", {class: "gtag " + (tag === "now" ? "now" : "ready"), text: tag === "now" ? "\u25B6 now" : "ready next"}), n.firstChild);
     });
     cols.forEach(function (d, i) { var cs = colStat[i]; if (!cs) return; var mb = el("div", {class: "colbar", title: cs.done + " of " + cs.tot + " done in this phase"}); var f = el("i"); f.style.width = (cs.tot ? 100 * cs.done / cs.tot : 0) + "%"; mb.appendChild(f); d.insertBefore(mb, d.children[1]); if (cs.now) d.classList.add("c-now"); });
-    var all = tot.done + tot.prog + tot.pr + tot.todo;
+    var all = tot.done + tot.wip + tot.prog + tot.pr + tot.todo;
     var lg = el("div", {class: "plegend"});
-    [["live", "agent working now"], ["pr", "waiting to merge (open PR)"], ["prog", "merged, waiting on a prod step"], ["done", "done"], ["just", "finished in the last 15 min"], ["todo", "not started"], ["deferred", "deferred or moved to another workstream"]].forEach(function (p) { var ch2 = el("span", {class: "chip " + (p[0] === "just" ? "done just" : p[0])}, [p[0] === "live" ? "\u25CF" : p[0] === "todo" ? "\u00B7" : "\u2009"]); lg.appendChild(el("span", {style: "display:inline-flex;align-items:center;gap:6px"}, [ch2, p[1]])); });
+    [["live", "agent working now"], ["wip", "in progress (branch, not merged)"], ["pr", "waiting to merge (approved or PR open)"], ["prog", "merged, waiting on a prod step"], ["done", "done"], ["just", "finished in the last 15 min"], ["todo", "not started"], ["deferred", "deferred or moved to another workstream"]].forEach(function (p) { var ch2 = el("span", {class: "chip " + (p[0] === "just" ? "done just" : p[0])}, [p[0] === "live" ? "\u25CF" : p[0] === "todo" ? "\u00B7" : "\u2009"]); lg.appendChild(el("span", {style: "display:inline-flex;align-items:center;gap:6px"}, [ch2, p[1]])); });
     c.appendChild(lg);
     var pct = all ? Math.round(100 * tot.done / all) : 0;
     var ob = el("div", {class: "pbig"}), obBar = el("div", {class: "pbig-bar", role: "img", "aria-label": tot.done + " of " + all + " tasks done"});
     [["done", "var(--good)"], ["prog", "var(--s5)"], ["pr", "var(--warning)"]].forEach(function (p) { var sp = el("span"); sp.style.background = p[1]; var pw0 = ((window.__adPrevBar || {})[plan.ws] || {})[p[0]]; sp.style.width = (pw0 == null ? 0 : pw0) + "%"; sp.dataset.w = all ? (100 * tot[p[0]] / all) : 0; sp.dataset.k = p[0]; obBar.appendChild(sp); });
     var obPct = el("b", {class: "pbig-pct", text: "0%"});
     ob.appendChild(obPct); ob.appendChild(obBar);
-    ob.appendChild(el("div", {class: "pbig-txt", text: tot.done + " of " + all + " done \u00B7 " + tot.prog + " waiting on prod \u00B7 " + tot.pr + " waiting to merge \u00B7 " + tot.todo + " not started" + (tot.deferred ? " \u00B7 " + tot.deferred + " deferred" : "")}));
+    ob.appendChild(el("div", {class: "pbig-txt", text: tot.done + " of " + all + " done \u00B7 " + (tot.wip ? tot.wip + " in progress \u00B7 " : "") + tot.prog + " waiting on prod \u00B7 " + tot.pr + " waiting to merge \u00B7 " + tot.todo + " not started" + (tot.deferred ? " \u00B7 " + tot.deferred + " deferred" : "")}));
     c.appendChild(ob);
     setTimeout(function () { var pb = (window.__adPrevBar = window.__adPrevBar || {})[plan.ws] = {}; [].forEach.call(obBar.children, function (sp) { sp.style.width = sp.dataset.w + "%"; pb[sp.dataset.k] = sp.dataset.w; }); countUp(obPct, (window.__adPrevPct || {})[plan.ws] || 0, pct); (window.__adPrevPct = window.__adPrevPct || {})[plan.ws] = pct; }, 40);
     c.appendChild(wrap);

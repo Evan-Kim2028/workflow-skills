@@ -335,16 +335,16 @@
 
   /* The live progress map lives on Execution only; the Plan page shows a compact summary and a jump there. */
   function drawSummary(host, dag, snap, id, startPrompt) {
-    var c = {done: 0, prog: 0, pr: 0, todo: 0, deferred: 0};
+    var c = {done: 0, wip: 0, prog: 0, pr: 0, todo: 0, deferred: 0};
     ((dag && dag.groups) || []).forEach(function (g) { (g.tasks || []).forEach(function (t) { var k = t.status || "todo"; c[k] = (c[k] || 0) + 1; }); });
-    var tot = c.done + c.prog + c.pr + c.todo, live = ((snap && snap.running) || []).length;
+    var tot = c.done + c.wip + c.prog + c.pr + c.todo, live = ((snap && snap.running) || []).length;
     host.innerHTML = "";
     var wrap = el("div", {class: "pp-sum"});
     var bar = el("div", {class: "pp-bar", role: "img", "aria-label": c.done + " of " + tot + " tasks done"});
     [["done", "var(--good)"], ["prog", "var(--s5)"], ["pr", "var(--warning)"]].forEach(function (p) { if (!c[p[0]] || !tot) return; var sp = el("span"); sp.style.width = (100 * c[p[0]] / tot) + "%"; sp.style.background = p[1]; bar.appendChild(sp); });
     wrap.appendChild(bar);
     var pct = tot ? Math.round(100 * c.done / tot) : 0;
-    wrap.appendChild(el("div", {class: "pp-nums", text: pct + "% done \u00B7 " + c.done + " of " + tot + " tasks \u00B7 " + c.prog + " waiting on prod \u00B7 " + c.pr + " waiting to merge \u00B7 " + c.todo + " not started" + (c.deferred ? " \u00B7 " + c.deferred + " deferred" : "") + (live ? " \u00B7 " + live + " running now" : "")}));
+    wrap.appendChild(el("div", {class: "pp-nums", text: pct + "% done \u00B7 " + c.done + " of " + tot + " tasks \u00B7 " + (c.wip ? c.wip + " in progress \u00B7 " : "") + c.prog + " waiting on prod \u00B7 " + c.pr + " waiting to merge \u00B7 " + c.todo + " not started" + (c.deferred ? " \u00B7 " + c.deferred + " deferred" : "") + (live ? " \u00B7 " + live + " running now" : "")}));
     var btn = el("button", {class: "pp-go", text: "Open live progress \u2192"});
     btn.addEventListener("click", function () { if (window.DashNav) window.DashNav.openExec(id); });
     var row = el("div", {class: "pp-actions"}); row.appendChild(btn);

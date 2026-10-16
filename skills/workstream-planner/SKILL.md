@@ -39,7 +39,7 @@ Tool: `~/.claude/tools/agent-dash/` (`agent_dash.py`). Bundles live in `~/.local
    - a file-overlap matrix from the code;
    - waves of lanes that share no file or test file;
    - per lane: worker tier, branch, worktree, brief, explicit test command, and review checks (`reviewFocus`), with `oneWay` lanes flagged;
-   - merge trains under the repo's rules;
+   - merge trains (a change ships alone only when small, migration-free and sharing no test file; otherwise it joins a train of at most 8), with each train's local scoped test list;
    - the critical path;
    - coordination points with other workstreams;
    - the remaining production steps, with load, pool and reversibility.

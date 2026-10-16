@@ -117,3 +117,26 @@ A workflow cannot receive messages from other sessions or wait out multi-day win
 ## Choosing workers
 
 Workers come from a registry: [`../workers.example.json`](../workers.example.json), replaced on one machine by a gitignored `workers.local.json` (or `AGENT_DASH_WORKERS`). Each worker has a kind (muse, cursor-agent, or Grok Build CLI), a model, a concurrency cap and quota patterns. `scripts/run_worker.sh` and the `ws-wave` workflow take `default` (the registry's default worker), a worker name, or `auto`. `auto` starts the first worker in `auto_order` that is under its cap and not cooling down after a quota error, and relaunches a lane on the next one when it hits a limit.
+
+## Merging fast: trains and local CI
+
+Production updates go out fastest when every merge is small in CI time, not in scope.
+
+- **Batch into merge trains.** Related approved branches ship as one train branch (`train/<area>-<slug>`) and one PR, so CI and the deploy run once per set.
+  - A change ships alone only if it is small (5 files or fewer), has no migrations, and shares no test file with another open branch.
+  - Everything else joins a train of at most 8 members.
+  - Push a train once, when it is ready; avoid repeated pushes.
+- **The merge gate is local, scoped CI.**
+  - Each member runs only the explicit test files for the code it changed.
+  - A train re-runs only the tests for files that two members both touched, plus one load of shared registries.
+  - Never run a whole suite, a bare test-runner invocation, or every pre-commit hook for a partial change.
+  - If the scoped selection widens past a few suites, stop and test the file that widened it directly.
+- **Never wait on remote CI runners.** Don't trigger, re-run, or poll them to prove a change. Merge with the repo's merge tool once local tests pass, using its flag to skip the remote wait if it has one, and let the deploy workflow verify the cutover.
+- **Pre-existing failures.** Prove a failure is pre-existing by re-running that one test on a clean checkout of main. Name it in the PR and move on.
+- **Move status as facts change:**
+  - `wip` while a branch is being built;
+  - `pr` once it is approved or its PR is open;
+  - `prog` only after it is merged and a production step remains;
+  - `done` when it is merged and live.
+
+  `prog` never means "in progress".

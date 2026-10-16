@@ -39,6 +39,29 @@ The lead plans, decides, verifies and reports. Workers do everything else. Relat
 - Run labels are `<id lowercase>-<task-id>-<slug>`, plus `-rev<n>` and `-fix<n>` for reviews and fixes. The dashboard pins each run onto its task chip and counts attempts.
 - Launch workers only through the tool's launchers (`scripts/run_worker.sh`, or `ws-wave`), which log billed tokens and session manifests. Never launch Grok with `--output-format text`.
 
+## Merging fast: trains and local CI
+
+Production updates go out fastest when every merge is small in CI time, not in scope.
+
+- **Batch into merge trains.** Related approved branches ship as one train branch (`train/<area>-<slug>`) and one PR, so CI and the deploy run once per set.
+  - A change ships alone only if it is small (5 files or fewer), has no migrations, and shares no test file with another open branch.
+  - Everything else joins a train of at most 8 members.
+  - Push a train once, when it is ready; avoid repeated pushes.
+- **The merge gate is local, scoped CI.**
+  - Each member runs only the explicit test files for the code it changed.
+  - A train re-runs only the tests for files that two members both touched, plus one load of shared registries.
+  - Never run a whole suite, a bare test-runner invocation, or every pre-commit hook for a partial change.
+  - If the scoped selection widens past a few suites, stop and test the file that widened it directly.
+- **Never wait on remote CI runners.** Don't trigger, re-run, or poll them to prove a change. Merge with the repo's merge tool once local tests pass, using its flag to skip the remote wait if it has one, and let the deploy workflow verify the cutover.
+- **Pre-existing failures.** Prove a failure is pre-existing by re-running that one test on a clean checkout of main. Name it in the PR and move on.
+- **Move status as facts change:**
+  - `wip` while a branch is being built;
+  - `pr` once it is approved or its PR is open;
+  - `prog` only after it is merged and a production step remains;
+  - `done` when it is merged and live.
+
+  `prog` never means "in progress".
+
 ## Hand-off
 
 At about 250K context, or at a milestone, write `state.md`: done, in flight (labels and PIDs), next wave, blockers and messages owed. Then end. A fresh lead resumes from the brief plus `state.md`.

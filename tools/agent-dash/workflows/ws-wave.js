@@ -142,7 +142,7 @@ const status = (lane, s) => `python3 ${A.dash} ws task ${WS} ${lane.task} ${s}`
 const results = await pipeline(
   A.lanes,
   (lane) => run(lane, 'build', 0, buildTask(lane), {
-    setup: `if [ ! -d ${lane.worktree} ]; then git -C ${A.repo} fetch -q origin main && (git -C ${A.repo} worktree add -b ${lane.branch} ${lane.worktree} origin/main || git -C ${A.repo} worktree add ${lane.worktree} ${lane.branch}); fi`,
+    setup: `python3 ${A.dash} ws task ${WS} ${lane.task} wip; if [ ! -d ${lane.worktree} ]; then git -C ${A.repo} fetch -q origin main && (git -C ${A.repo} worktree add -b ${lane.branch} ${lane.worktree} origin/main || git -C ${A.repo} worktree add ${lane.worktree} ${lane.branch}); fi`,
   }),
   async (built, lane) => {
     const out = { task: lane.task, label: base(lane), tier: built && built.tier, branch: lane.branch, worktree: lane.worktree, build: built, rounds: [], final: 'unreviewed' }

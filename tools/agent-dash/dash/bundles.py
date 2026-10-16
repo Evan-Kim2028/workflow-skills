@@ -14,7 +14,15 @@ from pathlib import Path
 
 from dash.plans import configured
 
-STATUSES = ("todo", "pr", "prog", "done", "deferred")
+STATUSES = ("todo", "wip", "pr", "prog", "done", "deferred")
+STATUS_MEANING = {
+    "todo": "not started",
+    "wip": "in progress: being built on a branch, not merged",
+    "pr": "waiting to merge: built and approved, or a PR is open",
+    "prog": "MERGED to main and waiting on a production step (not 'in progress')",
+    "done": "merged and live, nothing left",
+    "deferred": "deferred or moved to another workstream (needs --moved-to or --note)",
+}
 APPROVAL_STATUSES = ("pending", "approved", "denied")
 VERDICTS = ("WORTH_IT", "WORTH_IT_IF", "NOT_WORTH_IT")
 SIZES = ("S", "M", "L")
@@ -837,8 +845,12 @@ def validate_bundle(ws: str, root: Path | None = None) -> list[str]:
 
 def set_task(ws: str, task_id: str, status: str, moved_to: str | None, note: str | None, root: Path | None = None) -> int:
     if status not in STATUSES:
-        print(f"bad status {status}", flush=True)
+        print(f"bad status {status}. Use one of:", flush=True)
+        for key in STATUSES:
+            print(f"  {key:9} {STATUS_MEANING[key]}", flush=True)
         return 2
+    if status == "prog":
+        print("note: prog means merged to main and waiting on a production step. For work still on a branch use wip; for approved or open-PR work use pr.", flush=True)
     if moved_to is not None and not _MOVED.match(moved_to):
         print(f"bad moved-to {moved_to}", flush=True)
         return 2
