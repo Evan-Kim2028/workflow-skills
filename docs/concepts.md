@@ -69,7 +69,7 @@ Collectors find those TSV files under a scratch root: either the file sitting di
 
 An approval is a production step the owner has to answer before the lead acts. The lead adds it as `pending`. The owner sets `approved` or `denied`. The lead reads `ws approvals` before the step.
 
-Each item has an id, a step sentence, a status, a reversible flag, and conditions. `reversible no` is one-way. The Plan view groups rows into Needs you, Approved, and Denied, after the header and before Why. The Execution view puts the same pending rows in a Needs you card at the top of Overall and of each workstream tab. A pending row links to that workstream's Approvals section. When nothing is pending, the card is one line, such as `WS4: 1 approved, 0 pending`.
+Each item has an id, a step sentence, a status, a reversible flag, and conditions. `reversible no` is one-way. The dashboard does not show approvals; the lead reads them with `ws approvals <ID>` before any production step.
 
 `oneWay` in an execution-plan lane is the planner's flag for a lane that is irreversible or next to production. It is not a field `ws-wave` reads. The workflow never takes the production step. The lead does, and only from an `approved` item.
 

@@ -111,7 +111,7 @@ python3 ~/.claude/tools/agent-dash/agent_dash.py ws list
 
 `render` prints `wrote` and a path ending in `page.html`. `validate` prints `OK WS4`. `list` includes a line `WS4`, then `workstream`, then the title `Notes index`.
 
-Record one owner decision so the Needs you card has a row:
+Record one owner decision (the lead reads these before any production step):
 
 ```bash
 python3 ~/.claude/tools/agent-dash/agent_dash.py ws approve WS4 notes-cutover pending --step "Publish the notes index" --reversible no --conditions "The index file is on disk."
@@ -227,7 +227,7 @@ Open the live dashboard, not the fixture server:
 - http://127.0.0.1:8765/?view=exec&ws=WS4
 - http://127.0.0.1:8765/?view=plan&ws=WS4
 
-The Execution view shows the Needs you card, then the WS4 progress map. A running agent whose label matches the task map pulses on the `WS4.1` chip. A run the map cannot place is listed as `Running, not mapped to a task`. The live dot reads `live`.
+The Execution view shows the WS4 progress map. A running agent whose label matches the task map pulses on the `WS4.1` chip. A run the map cannot place is listed as `Running, not mapped to a task`. The live dot reads `live`.
 
 Move the task when the fact changes:
 

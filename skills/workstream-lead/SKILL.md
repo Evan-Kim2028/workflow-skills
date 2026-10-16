@@ -31,7 +31,7 @@ The lead plans, decides, verifies and reports. Workers do everything else. Relat
 ## Production steps
 
 - Act only on items marked `approved` in `approvals.json`, and follow their conditions. Run one production step at a time across all workstreams that share the slot.
-- For a new production step, record it as pending: `ws approve <ID> <id> pending --step ... --reversible ... --conditions ...`. Tell the owner it appears under "Needs you", and wait.
+- For a new production step, record it as pending: `ws approve <ID> <id> pending --step ... --reversible ... --conditions ...`. Ask the owner in your session, record their answer with `ws approve`, and only then act.
 - Waits (deploys, soaks, shadow windows) go to a background watcher or a cheap worker that returns one verdict. Never sleep in the lead thread.
 
 ## Labels, logging, tokens

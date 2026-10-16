@@ -11,7 +11,7 @@ All captured from the bundled sample data (no real runs).
 | ![Execution overview, dark theme](docs/screenshots/overview-dark.png) | ![A workstream's live plan map](docs/screenshots/workstream-map.png) |
 | **Execution overview.** Live agents, finished runs, tokens and cost, workstream progress, and every run. | **Live plan map.** Overall progress, the groups being worked on now (glowing), ready-next groups, flowing dependency arrows, and agents pinned to their task chips with attempt counts. |
 | ![Plan view](docs/screenshots/plan-view.png) | ![Light theme with owner approvals](docs/screenshots/overview-light.png) |
-| **Plan view.** The workstream's decisions, motivation, end state and phases, and owner approvals. One toggle switches to Execution without a reload. | **Light theme.** The Needs you card lists pending owner approvals across workstreams. |
+| **Plan view.** The workstream's decisions, motivation, end state and phases. One toggle switches to Execution without a reload. | **Light theme.** The same views in light mode. |
 
 ## What you get
 
