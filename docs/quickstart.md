@@ -210,7 +210,7 @@ Required fields are `ws`, `repo`, `runDir`, `template`, `runner`, `dash`, and a 
 
 The build label is `ws4-WS4.1-notes-index`. Reviews use the suffix `-rev1`, `-rev2`, and so on. Fixes use `-fix1`, `-fix2`, and so on. On approval the workflow runs `ws task WS4 WS4.1 pr`. It does not push, open a pull request, merge, or take a production step.
 
-The result object has `approved`, `needsLead`, and `built`. `built` is a lane with `"review": false` whose build finished with commits.
+The result object has `approved`, `needsLead`, `built`, and `skipped`. `built` is a lane with `"review": false` whose build finished with commits. `skipped` names the dependency that did not finish with an APPROVE verdict or as `built`. Each lane has `deps` and `base`. `deps` lists task ids in this run. `base` is `origin/main`, `dep:<task>`, or any other existing branch or ref.
 
 To run the same worker once, without the Workflow tool, write a prompt file whose first line is `[label: ws4-WS4.1-notes-index]` and then:
 
