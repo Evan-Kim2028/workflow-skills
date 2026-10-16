@@ -72,8 +72,9 @@ def _poll(store, cfg, now):
                 row["parent_session_id"] = parent
                 _keep_latest(manifests, row)
 
-    for sid in manifests:
-        _upsert_run(store, sid, manifests, None, None, False, None, processes)
+    for row in manifests.values():
+        _upsert_run(store, row["session_id"], manifests, None, None, False, None, processes)
+    _adopt_live_labels(store, manifests, processes)
 
     files = _candidate_files(store, sessions, manifests, now, fresh_hours, scan_s)
     if not files or budget <= 0:
@@ -111,8 +112,12 @@ def _candidate_files(store, root, manifests, now, fresh_hours, scan_s):
         seen.add(path)
         ordered.append((path, sid, muse_parent))
 
-    for sid in manifests:
-        add(_locate(root, sid), sid, None)
+    for row in manifests.values():
+        sid = row.get("session_id")
+        path = _locate(root, sid)
+        if not path and isinstance(sid, str):
+            path = _locate(root, sid.lower())
+        add(path, sid, None)
     for sid, path in _fresh(store, root, now, fresh_hours, scan_s):
         add(path, sid, None)
 
@@ -228,14 +233,15 @@ def _parse_line(line, fallback_sid):
 
 
 def _upsert_run(store, sid, manifests, muse_parent, model, have_log_start, log_ts, processes=None):
-    row = manifests.get(sid)
-    label = _label(sid, row)
+    row = _manifest_row(manifests, sid)
+    ident = row["session_id"] if row and row.get("session_id") else sid
+    label = _label(ident, row)
     parent = muse_parent or (row or {}).get("parent_session_id")
     run = {
-        "run_id": "muse:%s:%s" % (sid, label),
+        "run_id": "muse:%s:%s" % (ident, label),
         "source": "muse",
         "tier": "muse",
-        "session_id": sid,
+        "session_id": ident,
     }
     if row and row.get("label"):
         run["label"] = row["label"]
@@ -255,7 +261,9 @@ def _upsert_run(store, sid, manifests, muse_parent, model, have_log_start, log_t
     except Exception:
         _fail("run")
         return
-    session = {"session_id": sid, "tool": "muse"}
+    if run.get("label") and run["label"] != ident:
+        _retire_shadow(store, ident, run["label"])
+    session = {"session_id": ident, "tool": "muse"}
     if run.get("started_at") is not None:
         session["started_at"] = run["started_at"]
     if parent:
@@ -268,6 +276,29 @@ def _upsert_run(store, sid, manifests, muse_parent, model, have_log_start, log_t
         _fail("session")
 
 
+def _adopt_live_labels(store, manifests, processes):
+    """Label a live muse process from its prompt file when the tsv has no row yet.
+
+    The workstream comes from that label. The unlabeled session row is retired
+    onto ``muse:<session>:<label>`` the same way a manifest row would.
+    """
+    if not processes:
+        return
+    from dash.sources.process import SOURCE_COMMS
+
+    for proc in processes:
+        if proc.get("comm") not in SOURCE_COMMS["muse"]:
+            continue
+        label = proc.get("prompt_label")
+        sid = proc.get("session_id")
+        if not isinstance(label, str) or not isinstance(sid, str):
+            continue
+        if _manifest_row(manifests, sid):
+            continue
+        _keep_latest(manifests, {"label": label, "session_id": sid, "started_at": None})
+        _upsert_run(store, sid, manifests, None, None, False, None, processes)
+
+
 def _agent_processes():
     """One process listing per poll. None means the listing failed."""
     try:
@@ -276,8 +307,64 @@ def _agent_processes():
         return None
 
 
+def _retire_shadow(store, sid, label):
+    """Close the unlabeled ``muse:<sid>:<sid>`` row once this session has a label.
+
+    ``parent_session_id`` is the labeled run, so the shadow is not a second
+    agent and tokens stored on it roll up to that run. The session uuid is
+    matched in either case: muse logs and ``--session-id`` do not agree on case.
+    """
+    if not label or not isinstance(sid, str) or label == sid:
+        return
+    labeled = "muse:%s:%s" % (sid, label)
+    forms = []
+    for form in (sid, sid.lower()):
+        shadow = "muse:%s:%s" % (form, form)
+        if shadow != labeled and shadow not in forms:
+            forms.append(shadow)
+    getter = getattr(store, "get_run", None)
+    if not callable(getter):
+        return
+    for shadow in forms:
+        try:
+            existing = getter(shadow)
+        except Exception:
+            return
+        if not existing:
+            continue
+        ended = existing.get("ended_at")
+        if ended is None:
+            ended = existing.get("started_at")
+        try:
+            store.upsert_run(
+                {
+                    "run_id": shadow,
+                    "source": "muse",
+                    "tier": "muse",
+                    "session_id": existing.get("session_id") or sid,
+                    "status": "unknown",
+                    "ended_at": ended,
+                    "parent_session_id": labeled,
+                    "pid": None,
+                }
+            )
+        except Exception:
+            _fail("shadow")
+
+
+def _manifest_row(manifests, sid):
+    if not isinstance(sid, str):
+        return None
+    row = manifests.get(sid)
+    if row:
+        return row
+    return manifests.get(sid.lower())
+
+
 def _run_id(sid, manifests):
-    return "muse:%s:%s" % (sid, _label(sid, manifests.get(sid)))
+    row = _manifest_row(manifests, sid)
+    ident = row["session_id"] if row and row.get("session_id") else sid
+    return "muse:%s:%s" % (ident, _label(ident, row))
 
 
 def _label(sid, row):
@@ -312,9 +399,10 @@ def _parse_manifest(text):
 
 
 def _keep_latest(manifests, row):
-    prev = manifests.get(row["session_id"])
+    key = row["session_id"].lower() if isinstance(row.get("session_id"), str) else row.get("session_id")
+    prev = manifests.get(key)
     if prev is None or (row.get("started_at") or -1) >= (prev.get("started_at") or -1):
-        manifests[row["session_id"]] = row
+        manifests[key] = row
 
 
 def _fresh(store, root, now, hours, scan_s):

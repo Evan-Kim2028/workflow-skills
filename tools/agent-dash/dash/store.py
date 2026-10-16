@@ -368,11 +368,19 @@ class Store:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def unknown_tool_runs(self) -> list:
+        """Muse rows still marked unknown, so reconcile can adopt a live process."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM runs WHERE status='unknown' AND source='muse'"
+            ).fetchall()
+        return [dict(row) for row in rows]
+
     def session_runs(self, session_id: str) -> list:
         with self._lock:
             rows = self._conn.execute(
                 """SELECT run_id, label, session_id, source, status, started_at
-                   FROM runs WHERE session_id=?""",
+                   FROM runs WHERE session_id = ? COLLATE NOCASE""",
                 (session_id,),
             ).fetchall()
         return [dict(row) for row in rows]
@@ -1133,12 +1141,16 @@ def _is_counted_agent(run: dict) -> bool:
 
 
 def _parent_map(runs: list) -> dict:
-    """Child grok run id -> parent run id.
+    """Child run id -> the run that should carry its tokens.
 
-    A child is a chat whose ``parent_session_id`` is another grok run (or
-    that run's chat id), or an unlabeled row for a chat that already has a
-    labeled run. Hub session ids are not grok chat ids, so a launched agent
+    A grok child is a chat whose ``parent_session_id`` is another grok run
+    (or that run's chat id), or an unlabeled row for a chat that already has
+    a labeled run. Hub session ids are not grok chat ids, so a launched agent
     keeps its own count.
+
+    A muse shadow is the unlabeled ``muse:<uuid>:<uuid>`` row for a session
+    that also has a labeled run. Its tokens roll onto that labeled run.
+    A labeled muse run whose parent is a hub session id stays its own row.
     """
     by_id = {run["run_id"]: run for run in runs}
     grok_by_session = {}
@@ -1172,6 +1184,32 @@ def _parent_map(runs: list) -> dict:
             ]
             if labeled:
                 parents[run["run_id"]] = labeled[0]["run_id"]
+    muse_by_sid = {}
+    for run in runs:
+        if run.get("source") != "muse" or not run.get("session_id"):
+            continue
+        key = run["session_id"].lower() if isinstance(run["session_id"], str) else run["session_id"]
+        muse_by_sid.setdefault(key, []).append(run)
+    for run in runs:
+        if run.get("source") != "muse":
+            continue
+        parent = run.get("parent_session_id")
+        host = by_id.get(parent) if isinstance(parent, str) else None
+        if host and host.get("source") == "muse" and host["run_id"] != run["run_id"]:
+            parents[run["run_id"]] = host["run_id"]
+            continue
+        if run.get("label") or not run.get("session_id"):
+            continue
+        key = run["session_id"].lower() if isinstance(run["session_id"], str) else run["session_id"]
+        labeled = [
+            item
+            for item in muse_by_sid.get(key, [])
+            if item.get("label") and item["run_id"] != run["run_id"]
+        ]
+        if not labeled:
+            continue
+        labeled.sort(key=lambda item: item.get("started_at") or 0, reverse=True)
+        parents[run["run_id"]] = labeled[0]["run_id"]
     return parents
 
 

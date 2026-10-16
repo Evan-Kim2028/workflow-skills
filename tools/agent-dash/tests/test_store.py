@@ -676,6 +676,78 @@ class ProcessParseTest(unittest.TestCase):
         self.assertEqual(muse["status"], "done")
         self.assertEqual(muse["ended_at"], 50)
 
+    def test_muse_shadow_tokens_roll_onto_labeled_run(self):
+        now = time.time()
+        sid = "11111111-1111-4111-8111-111111111111"
+        labeled = "muse:%s:ws2-WS2.14-cards-list" % sid
+        shadow = "muse:%s:%s" % (sid, sid)
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "dash.sqlite")
+            try:
+                store.upsert_run(
+                    {
+                        "run_id": labeled,
+                        "source": "muse",
+                        "tier": "muse",
+                        "label": "ws2-WS2.14-cards-list",
+                        "session_id": sid,
+                        "parent_session_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                        "status": "running",
+                        "pid": 42,
+                        "started_at": now - 100,
+                    }
+                )
+                store.upsert_run(
+                    {
+                        "run_id": shadow,
+                        "source": "muse",
+                        "tier": "muse",
+                        "session_id": sid,
+                        "status": "unknown",
+                        "parent_session_id": labeled,
+                        "started_at": now - 100,
+                        "ended_at": now - 90,
+                    }
+                )
+                store.add_usage(
+                    {
+                        "ts": now - 80,
+                        "session_id": sid,
+                        "run_id": shadow,
+                        "model": "muse-spark-1.3",
+                        "tool": "muse",
+                        "message_id": "shadow",
+                        "input": 50,
+                        "output": 4,
+                        "cache_read": 7,
+                        "cache_write": 0,
+                    }
+                )
+                store.add_usage(
+                    {
+                        "ts": now - 70,
+                        "session_id": sid,
+                        "run_id": labeled,
+                        "model": "muse-spark-1.3",
+                        "tool": "muse",
+                        "message_id": "labeled",
+                        "input": 5,
+                        "output": 1,
+                        "cache_read": 0,
+                        "cache_write": 0,
+                    }
+                )
+                snap = store.snapshot(now, "WS2")
+            finally:
+                store.close()
+        running = snap["running"]
+        self.assertEqual([run["run_id"] for run in running], [labeled])
+        self.assertEqual(running[0]["workstream"], "WS2")
+        self.assertEqual(running[0]["tokens"]["input"], 55)
+        self.assertEqual(running[0]["tokens"]["output"], 5)
+        self.assertEqual(running[0]["tokens"]["cache_read"], 7)
+        self.assertEqual(snap["counts"]["live_by_tool"]["muse"], 1)
+
     def test_live_poll_stores_no_argv(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "dash.sqlite")

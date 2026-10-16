@@ -50,8 +50,7 @@ class Store:
     def upsert_run(self, row):
         cur = dict(self.runs.get(row["run_id"], {}))
         for key, value in row.items():
-            if value is not None:
-                cur[key] = value
+            cur[key] = value
         self.runs[row["run_id"]] = cur
 
     def add_usage(self, row):
@@ -65,6 +64,9 @@ class Store:
             if value is not None:
                 cur[key] = value
         self.sessions[row["session_id"]] = cur
+
+    def get_run(self, run_id):
+        return self.runs.get(run_id)
 
 
 def mc(sid, rec_id, **fields):
@@ -110,6 +112,11 @@ class MuseTests(unittest.TestCase):
         muse._FRESH.clear()
         muse._LOCATE.clear()
         muse.last_error = None
+        self._live = muse.live_agent_processes
+        muse.live_agent_processes = lambda now=None: []
+
+    def tearDown(self):
+        muse.live_agent_processes = self._live
 
     def poll(self, store, cfg, now, quiet=True):
         buf = io.StringIO()
@@ -378,6 +385,148 @@ class MuseTests(unittest.TestCase):
             self.assertEqual(summed(store)["input"], 2)
             self.assertIn(("muse", SID, "b"), store.usage)
             self.assertNotIn(("muse", SID, "a"), store.usage)
+
+    def test_manifest_retires_unlabeled_session_row(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            scratch = os.path.join(tmp, "scratch")
+            os.makedirs(scratch)
+            with open(os.path.join(scratch, "muse-sessions.tsv"), "w") as fh:
+                fh.write("ws2-WS2.14-cards-list\t%s\t1792152010\n" % SID)
+            store = Store()
+            shadow = "muse:%s:%s" % (SID, SID)
+            labeled = "muse:%s:ws2-WS2.14-cards-list" % SID
+            store.runs[shadow] = {
+                "run_id": shadow,
+                "source": "muse",
+                "tier": "muse",
+                "session_id": SID,
+                "status": "running",
+                "pid": 99,
+                "started_at": 1792152000.0,
+            }
+            store.usage[("muse", SID, "old")] = {
+                "tool": "muse",
+                "session_id": SID,
+                "message_id": "old",
+                "run_id": shadow,
+                "input": 10,
+                "output": 1,
+                "cache_read": 0,
+                "cache_write": 0,
+                "reasoning": 0,
+            }
+            cfg = self.cfg(os.path.join(tmp, "missing-sessions"), scratch)
+            cfg["roots"] = {"muse_sessions": cfg["roots"]["muse_sessions"], "scratch": scratch}
+            cfg["read_budgets"] = cfg.pop("read_budget")
+            original = muse.live_agent_processes
+            muse.live_agent_processes = lambda now=None: [
+                {
+                    "pid": 42,
+                    "comm": "muse-bin",
+                    "started_at": 1792152010.0,
+                    "label": "ws2-WS2.14-cards-list",
+                    "prompt_label": "ws2-WS2.14-cards-list",
+                    "session_id": SID,
+                }
+            ]
+            try:
+                self.poll(store, cfg, 1792153000)
+            finally:
+                muse.live_agent_processes = original
+            run = store.runs[labeled]
+            self.assertEqual(run["label"], "ws2-WS2.14-cards-list")
+            self.assertEqual(run["status"], "running")
+            self.assertEqual(run["pid"], 42)
+            retired = store.runs[shadow]
+            self.assertEqual(retired["status"], "unknown")
+            self.assertEqual(retired["parent_session_id"], labeled)
+            self.assertIsNone(retired.get("pid"))
+            self.assertEqual(store.usage[("muse", SID, "old")]["run_id"], shadow)
+
+    def test_shadow_retires_when_session_uuid_case_differs(self):
+        upper = "abcdefab-cdef-4abc-8def-abcdefabcdef"
+        lower = upper.lower()
+        with tempfile.TemporaryDirectory() as tmp:
+            scratch = os.path.join(tmp, "scratch")
+            os.makedirs(scratch)
+            with open(os.path.join(scratch, "muse-sessions.tsv"), "w") as fh:
+                fh.write("jax-kernel\t%s\t1792152010\n" % upper)
+            store = Store()
+            shadow = "muse:%s:%s" % (lower, lower)
+            labeled = "muse:%s:jax-kernel" % upper
+            store.runs[shadow] = {
+                "run_id": shadow,
+                "source": "muse",
+                "tier": "muse",
+                "session_id": lower,
+                "status": "running",
+                "pid": 77,
+                "started_at": 1792152000.0,
+            }
+            cfg = self.cfg(os.path.join(tmp, "missing-sessions"), scratch)
+            cfg["roots"] = {"muse_sessions": cfg["roots"]["muse_sessions"], "scratch": scratch}
+            cfg["read_budgets"] = cfg.pop("read_budget")
+            original = muse.live_agent_processes
+            muse.live_agent_processes = lambda now=None: [
+                {
+                    "pid": 77,
+                    "comm": "muse-bin",
+                    "started_at": 1792152010.0,
+                    "label": "jax-kernel",
+                    "prompt_label": "jax-kernel",
+                    "session_id": upper,
+                }
+            ]
+            try:
+                self.poll(store, cfg, 1792153000)
+            finally:
+                muse.live_agent_processes = original
+            self.assertEqual(store.runs[labeled]["status"], "running")
+            self.assertEqual(store.runs[labeled]["pid"], 77)
+            self.assertEqual(store.runs[shadow]["status"], "unknown")
+            self.assertEqual(store.runs[shadow]["parent_session_id"], labeled)
+            self.assertIsNone(store.runs[shadow].get("pid"))
+
+    def test_live_prompt_file_labels_a_run_before_the_tsv_row(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sessions = os.path.join(tmp, "sessions")
+            scratch = os.path.join(tmp, "scratch")
+            os.makedirs(sessions)
+            os.makedirs(scratch)
+            store = Store()
+            shadow = "muse:%s:%s" % (SID, SID)
+            labeled = "muse:%s:ws2-WS2.14-prod-columns" % SID
+            store.runs[shadow] = {
+                "run_id": shadow,
+                "source": "muse",
+                "tier": "muse",
+                "session_id": SID,
+                "status": "running",
+                "pid": 50,
+                "started_at": 1792152000.0,
+            }
+            original = muse.live_agent_processes
+            muse.live_agent_processes = lambda now=None: [
+                {
+                    "pid": 50,
+                    "comm": "muse-bin",
+                    "started_at": 1792152010.0,
+                    "label": "ws2-WS2.14-prod-columns",
+                    "prompt_label": "ws2-WS2.14-prod-columns",
+                    "session_id": SID,
+                }
+            ]
+            try:
+                self.poll(store, self.cfg(sessions, scratch), 1792153000)
+            finally:
+                muse.live_agent_processes = original
+            run = store.runs[labeled]
+            self.assertEqual(run["label"], "ws2-WS2.14-prod-columns")
+            self.assertEqual(run["status"], "running")
+            self.assertEqual(run["pid"], 50)
+            self.assertEqual(store.runs[shadow]["status"], "unknown")
+            self.assertEqual(store.runs[shadow]["parent_session_id"], labeled)
+            self.assertIsNone(store.runs[shadow].get("pid"))
 
     def test_missing_root(self):
         store = Store()
