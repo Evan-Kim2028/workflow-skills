@@ -326,6 +326,7 @@
       runMermaid();
       var host = main.querySelector("[data-plan-progress]");
       if (host && hit.bundle) drawSummary(host, dagOf(hit.bundle, id), hit.snap || {running: [], recent: []}, id, hit.bundle && hit.bundle.start_prompt);
+      drawTrains(main, id, hit.bundle);
     }
     stampSectionIds(main);
   }
@@ -363,8 +364,89 @@
       if (!main) return;
       var host = main.querySelector("[data-plan-progress]");
       if (host && parts[1]) drawSummary(host, dagOf(parts[1], id), parts[2] || {running: [], recent: []}, id, parts[1] && parts[1].start_prompt);
+      drawTrains(main, id, parts[1]);
       stampSectionIds(main);
     }).catch(function () {});
+  }
+
+  var TRAIN_SYM = {planned: "\u25CB", assembling: "\u25D0", gate: "\u25D1", pr: "\u29D7", merged: "\u2713", dropped: "\u2715"};
+
+  function trainsOf(bundle) {
+    var plan = (bundle && bundle.plan) || {};
+    if (!plan.trains || !plan.trains.length) return [];
+    return plan.trains.filter(function (t) { return t && typeof t === "object"; });
+  }
+
+  function dagTasks(dag) {
+    var out = [];
+    ((dag && dag.groups) || []).forEach(function (g) {
+      (g.tasks || []).forEach(function (t) { if (t && t.id != null) out.push(t); });
+    });
+    return out;
+  }
+
+  function buildTrains(id, bundle) {
+    var dag = dagOf(bundle, id);
+    var trains = trainsOf(bundle);
+    var tasks = {};
+    dagTasks(dag).forEach(function (t) { tasks[t.id] = t; });
+    var sec = el("section", {id: String(id).toLowerCase() + "-trains", class: "pl-sec lay"});
+    sec.appendChild(el("h2", {}, [el("span", {class: "eb", text: "Merge trains"}), document.createTextNode("How the work ships")]));
+    if (!trains.length) {
+      sec.appendChild(el("p", {class: "sub", text: "No trains planned yet. The lead adds them with ws train."}));
+      return sec;
+    }
+    var inTrain = {};
+    trains.forEach(function (t) {
+      var row = el("div", {class: "tr-row"});
+      var head = el("div", {class: "tr-head"});
+      head.appendChild(el("span", {class: "tr-title", text: t.title || t.id || "Untitled train"}));
+      if (t.id) head.appendChild(el("span", {class: "mono tr-id", text: "(" + t.id + ")"}));
+      if (t.branch) head.appendChild(el("span", {class: "mono tr-branch", text: t.branch}));
+      var status = t.status || "planned";
+      var sym = TRAIN_SYM[status] || "";
+      head.appendChild(el("span", {class: "tr-status tr-s-" + status, text: (sym ? sym + " " : "") + status}));
+      if (t.pr != null) head.appendChild(el("span", {class: "tr-pr", text: "PR " + t.pr}));
+      row.appendChild(head);
+      var chips = el("div", {class: "tr-chips"});
+      (t.members || []).forEach(function (mid) {
+        inTrain[mid] = 1;
+        var task = tasks[mid] || {};
+        var st = task.status || "todo";
+        var label = mid + " \u00B7 " + (task.title || "") + " \u00B7 " + st;
+        chips.appendChild(el("span", {class: "tr-chip " + st, title: label, "aria-label": label}, [document.createTextNode(mid)]));
+      });
+      row.appendChild(chips);
+      var files = t.shared_files || [];
+      var shared = el("span", {class: "tr-shared", title: files.length ? files.join(", ") : "no shared files yet"});
+      shared.textContent = files.length + " shared file" + (files.length === 1 ? "" : "s");
+      var meta = el("div", {class: "tr-meta"}, [shared]);
+      row.appendChild(meta);
+      if (t.gate) {
+        var gate = el("div", {class: "tr-gate"});
+        gate.appendChild(document.createTextNode("Gate: "));
+        gate.appendChild(el("span", {class: "mono", text: t.gate}));
+        row.appendChild(gate);
+      }
+      sec.appendChild(row);
+    });
+    var alone = dagTasks(dag).filter(function (t) {
+      var st = t.status || "todo";
+      return !inTrain[t.id] && (st === "pr" || st === "wip" || st === "done");
+    }).map(function (t) { return t.id; });
+    if (alone.length) sec.appendChild(el("p", {class: "sub tr-alone", text: "Ships alone: " + alone.join(", ")}));
+    return sec;
+  }
+
+  function drawTrains(main, id, bundle) {
+    var old = document.getElementById(String(id).toLowerCase() + "-trains");
+    if (old && old.parentNode) old.parentNode.removeChild(old);
+    if (!main || !bundle) return;
+    var sec = buildTrains(id, bundle);
+    var host = main.querySelector("[data-plan-progress]");
+    var anchor = host && host.closest ? host.closest("section") : null;
+    if (anchor && anchor.parentNode) anchor.parentNode.insertBefore(sec, anchor.nextSibling);
+    else main.appendChild(sec);
   }
 
   function show(id) {

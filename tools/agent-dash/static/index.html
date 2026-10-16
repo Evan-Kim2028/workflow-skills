@@ -285,6 +285,11 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
 .dag.tfocus .chip.t-down{box-shadow:0 0 0 2px var(--s1)}
 .dag.tfocus .chip.t-near{font-weight:700}
 @media (prefers-reduced-motion: reduce){.tedges path.tl{animation:none}}
+/* merge trains on the progress map: a tag and a colored left edge per member chip, plus a legend under the map */
+.chip.intrain{padding-left:5px}
+.trtag{font:700 9.5px var(--mono);color:var(--ink-2);border:1px solid var(--grid);border-radius:4px;padding:0 3px;margin-left:2px;white-space:nowrap}
+.trlegend{display:flex;flex-wrap:wrap;gap:6px 14px;margin:10px 0 0;font-size:12px;color:var(--ink-2)}
+.trlegend span{display:inline-flex;align-items:center;gap:6px}
 </style>
 </head>
 <body>
@@ -933,6 +938,9 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
     }
     if (unassigned.length) { var ua = el("div", {class: "unassigned"}, [el("b", {style: "font-size:12px;color:var(--ink-2)", text: "Running, not mapped to a task:"})]); unassigned.forEach(function (r) { var sp = el("span", {title: (r.tier || "") + " · " + fmtDur(r.elapsed_s), text: r.label || r.run_id}); sp.style.borderColor = colorOf(tierKey(r)); ua.appendChild(sp); }); c.appendChild(ua); }
     var tot = {done: 0, wip: 0, prog: 0, pr: 0, todo: 0, deferred: 0}, gs = {}, colStat = {};
+    var trains = (plan.trains || []).filter(function (t) { return t && typeof t === "object"; });
+    var trainOf = {};
+    trains.forEach(function (t, i) { ((t.members) || []).forEach(function (m) { trainOf[m] = {train: t, slot: (i % 8) + 1}; }); });
     var prevSt = (window.__adPrevStatus = window.__adPrevStatus || {});
     var wrap = el("div", {class: "dag-scroll"}), dag = el("div", {class: "dag"}), svg = s("svg", {class: "dedges"}); dag.appendChild(svg); wrap.appendChild(dag);
     dag.style.gridTemplateColumns = "repeat(" + plan.cols.length + ",1fr)";
@@ -959,6 +967,13 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
         var cp = el("span", {class: "chip " + st + (rs.length ? " live" : "") + (jr && !rs.length ? " just" : ""), title: t.id + " · " + (t.title || "") + " · " + st + (t.moved_to ? " to " + t.moved_to : "") + (t.note ? " (" + t.note + ")" : "") + (rs.length ? " · working: " + rs.map(function (r) { return (r.label || r.run_id) + " (" + (r.tier || "") + ", " + fmtDur(r.elapsed_s) + ")"; }).join(", ") : "") + (jr && !rs.length ? " · just finished: " + (jr.label || "") + (jr.verdict ? " " + jr.verdict : "") : "")}, [t.id]);
         var sk = plan.ws + ":" + t.id; if (prevSt[sk] && prevSt[sk] !== st) cp.classList.add("changed"); prevSt[sk] = st;
         var at = att[t.id]; if (at) { cp.title += " · " + attText(at); if (at.runs > 1) cp.appendChild(el("span", {class: "att" + (at.sentBack >= 2 ? " hot" : ""), text: "\u21BB" + fmtN(at.runs)})); }
+        var tr = trainOf[t.id];
+        if (tr) {
+          cp.classList.add("intrain");
+          cp.style.borderLeft = "3px solid var(--s" + tr.slot + ")";
+          cp.title += "\nTrain: " + (tr.train.title || tr.train.id) + (tr.train.id ? " (" + tr.train.id + ")" : "") + " · " + (tr.train.status || "planned");
+          cp.appendChild(el("span", {class: "trtag", text: tr.train.id || "T?", title: (tr.train.title || "") + " · " + (tr.train.status || "planned")}));
+        }
         if (t.wave) cp.title += "\nWave: " + t.wave;
         if (tUp[t.id]) cp.title += "\nWaits on: " + tList(tUp[t.id]);
         if (tDown[t.id]) cp.title += "\nUnblocks: " + tList(tDown[t.id]);
@@ -1011,6 +1026,18 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
     c.appendChild(ob);
     setTimeout(function () { var pb = (window.__adPrevBar = window.__adPrevBar || {})[plan.ws] = {}; [].forEach.call(obBar.children, function (sp) { sp.style.width = sp.dataset.w + "%"; pb[sp.dataset.k] = sp.dataset.w; }); countUp(obPct, (window.__adPrevPct || {})[plan.ws] || 0, pct); (window.__adPrevPct = window.__adPrevPct || {})[plan.ws] = pct; }, 40);
     c.appendChild(wrap);
+    if (trains.length) {
+      var trl = el("div", {class: "trlegend"});
+      trains.forEach(function (t, i) {
+        var sw = el("i", {class: "sw"});
+        sw.style.background = "var(--s" + ((i % 8) + 1) + ")";
+        var label = (t.title || t.id) + (t.id ? " (" + t.id + ")" : "") + " · " + (t.status || "planned");
+        var tip = (t.title || t.id) + (t.id ? " (" + t.id + ")" : "") + (t.status ? " · " + t.status : "") + (t.branch ? " · " + t.branch : "") + (t.pr != null ? " · PR " + t.pr : "");
+        var item = el("span", {title: tip}, [sw, document.createTextNode(label)]);
+        trl.appendChild(item);
+      });
+      c.appendChild(trl);
+    }
     function draw() {
       while (svg.firstChild) svg.removeChild(svg.firstChild);
       var box = dag.getBoundingClientRect(); if (!box.width) return;

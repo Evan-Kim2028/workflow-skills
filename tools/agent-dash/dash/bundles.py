@@ -23,10 +23,21 @@ STATUS_MEANING = {
     "done": "merged and live, nothing left",
     "deferred": "deferred or moved to another workstream (needs --moved-to or --note)",
 }
+TRAIN_STATUSES = ("planned", "assembling", "gate", "pr", "merged", "dropped")
+TRAIN_STATUS_MEANING = {
+    "planned": "proposed at planning, members may change",
+    "assembling": "member branches being merged into the train branch",
+    "gate": "train-level integration checks running",
+    "pr": "train PR open",
+    "merged": "on main",
+    "dropped": "train dissolved, members reassigned",
+}
+TRAIN_MEMBER_LIMIT = 8
 APPROVAL_STATUSES = ("pending", "approved", "denied")
 VERDICTS = ("WORTH_IT", "WORTH_IT_IF", "NOT_WORTH_IT")
 SIZES = ("S", "M", "L")
 _ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$")
+_TRAIN_ID = re.compile(r"^[A-Za-z0-9._-]{1,40}$")
 _SAFE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 _MOVED = re.compile(r"^WS\d+$")
 _ITEM = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
@@ -43,10 +54,13 @@ WS_USAGE = """agent-dash workstream bundles
   python3 agent_dash.py ws validate <ID>
   python3 agent_dash.py ws render <ID>
   python3 agent_dash.py ws task <ID> <task-id> <status> [--moved-to WSn] [--note "..."]
+  python3 agent_dash.py ws train <ID> <train-id> [--title T] [--branch B] [--status S] [--add id,id] [--remove id,id] [--pr N] [--shared f1,f2] [--gate "..."] [--note "..."]
+  python3 agent_dash.py ws trains <ID>
   python3 agent_dash.py ws approve <ID> <item-id> <approved|denied|pending> [--note "..."] [--step "..."] [--reversible yes|no] [--conditions "..."]
   python3 agent_dash.py ws approvals [<ID>]
 
 Status is todo, pr, prog, done, or deferred. deferred may set --moved-to and --note.
+Train status is planned, assembling, gate, pr, merged, or dropped. A task belongs to at most one train.
 A new approval is `ws approve <ID> <item-id> pending --step "..." --reversible yes|no --conditions "..."`.
 Bundles are directories under AGENT_DASH_WORKSTREAMS.
 """
@@ -170,6 +184,37 @@ def _read_json(path: Path, limit: int = _MAX_BYTES):
         return None
 
 
+def _str_list(value) -> list:
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, str)]
+
+
+def sanitized_trains(value) -> list:
+    """Plan-view shape for the optional top-level trains list. Unknown keys are dropped."""
+    if not isinstance(value, list):
+        return []
+    out = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        pr = item.get("pr")
+        out.append(
+            {
+                "id": item.get("id") if isinstance(item.get("id"), str) else None,
+                "title": item.get("title") if isinstance(item.get("title"), str) else None,
+                "branch": item.get("branch") if isinstance(item.get("branch"), str) else None,
+                "members": _str_list(item.get("members")),
+                "status": item.get("status") if isinstance(item.get("status"), str) else None,
+                "pr": pr if isinstance(pr, int) and not isinstance(pr, bool) else None,
+                "shared_files": _str_list(item.get("shared_files")),
+                "gate": item.get("gate") if isinstance(item.get("gate"), str) else None,
+                "note": item.get("note") if isinstance(item.get("note"), str) else None,
+            }
+        )
+    return out
+
+
 def load_bundle_api(ws: str) -> dict | None:
     path = bundle_dir(ws)
     if path is None:
@@ -178,6 +223,8 @@ def load_bundle_api(ws: str) -> dict | None:
     plan = _read_json(path / "plan.json")
     if not isinstance(meta, dict) or not isinstance(plan, dict):
         return None
+    plan = dict(plan)
+    plan["trains"] = sanitized_trains(plan.get("trains"))
     approvals = approvals_for(ws)
     return {
         "bundle": meta,
@@ -238,6 +285,7 @@ def bundle_plan_view(ws: str) -> dict | None:
         "groups": _view_groups(dag.get("groups")),
         "edges": edges,
         "phases": phases,
+        "trains": sanitized_trains(data.get("trains")),
         "start_prompt": start_prompt_text(ws),
     }
 
@@ -329,6 +377,7 @@ def _template_plan(ws: str) -> dict:
                 }
             ],
         },
+        "trains": [],
     }
 
 
@@ -357,6 +406,7 @@ def _template_start_prompt(ws: str, title: str) -> str:
         "\n"
         f"Label each worker run `{lower}-<task-id>-<slug>`.\n"
         f"Move a task with `python3 agent_dash.py ws task {ws} <task-id> <status>`.\n"
+        f"Keep the planned merge trains current with `python3 agent_dash.py ws train {ws} <train-id> --title ...`.\n"
         f"Read `ws approvals {ws}` before any production step. Run one production step at a time.\n"
         "\n"
         f"The plan view for {ws} is on the local dashboard.\n"
@@ -798,6 +848,77 @@ def _parse_yes_no(value: str) -> bool | None:
     return None
 
 
+def _dag_task_ids(plan: dict) -> set[str]:
+    ids = set()
+    dag = plan.get("dag")
+    if not isinstance(dag, dict):
+        return ids
+    for group in dag.get("groups") or []:
+        if not isinstance(group, dict):
+            continue
+        for task in group.get("tasks") or []:
+            if isinstance(task, dict) and isinstance(task.get("id"), str):
+                ids.add(task["id"])
+    return ids
+
+
+def _validate_trains(issues: list[str], plan: dict) -> None:
+    trains = plan.get("trains")
+    if trains is None:
+        return
+    if not isinstance(trains, list):
+        issues.append("plan.json: trains must be a list")
+        return
+    known = _dag_task_ids(plan)
+    seen: set[str] = set()
+    owner: dict[str, str] = {}
+    for item in trains:
+        if not isinstance(item, dict):
+            issues.append("plan.json: each train must be an object")
+            continue
+        tid = item.get("id")
+        if not isinstance(tid, str) or not _TRAIN_ID.match(tid):
+            issues.append(f"plan.json: bad train id {tid!r}")
+            continue
+        if tid in seen:
+            issues.append(f"plan.json: duplicate train id {tid}")
+        seen.add(tid)
+        _require_str(issues, "plan.json", item.get("title"), f"train {tid} title")
+        branch = item.get("branch")
+        if branch is not None and (not isinstance(branch, str) or not branch.startswith("train/")):
+            issues.append(f'plan.json: train {tid} branch must start with "train/"')
+        status = item.get("status")
+        if status not in TRAIN_STATUSES:
+            issues.append(f"plan.json: train {tid} status {status!r} is not {', '.join(TRAIN_STATUSES)}")
+        members = item.get("members")
+        if not isinstance(members, list):
+            issues.append(f"plan.json: train {tid} members must be a list")
+        else:
+            for member in members:
+                if member not in known:
+                    issues.append(f"plan.json: train {tid} has unknown task {member}")
+                elif member in owner:
+                    issues.append(f"plan.json: task {member} is in two trains ({owner[member]} and {tid})")
+                else:
+                    owner[member] = tid
+            if len(members) > TRAIN_MEMBER_LIMIT:
+                issues.append(f"train {tid} has {len(members)} members; split it (limit {TRAIN_MEMBER_LIMIT})")
+        pr = item.get("pr")
+        if pr is not None and (not isinstance(pr, int) or isinstance(pr, bool)):
+            issues.append(f"plan.json: train {tid} pr must be an integer")
+        shared = item.get("shared_files")
+        if shared is not None and (not isinstance(shared, list) or not all(isinstance(entry, str) for entry in shared)):
+            issues.append(f"plan.json: train {tid} shared_files must be a list of strings")
+        for key in ("gate", "note"):
+            if key in item and item.get(key) is not None and not isinstance(item.get(key), str):
+                issues.append(f"plan.json: train {tid} {key} must be a string")
+        for key in ("title", "note"):
+            text = item.get(key)
+            if isinstance(text, str):
+                for hit in naming_issues(text):
+                    issues.append(f"plan.json: train {tid} {key}: bare citation {hit.token}")
+
+
 def validate_bundle(ws: str, root: Path | None = None) -> list[str]:
     path = bundle_dir(ws, root)
     if path is None:
@@ -840,6 +961,7 @@ def validate_bundle(ws: str, root: Path | None = None) -> list[str]:
                 _validate_motivation(issues, plan.get("motivation"))
             if "agent_friendly" in plan:
                 _validate_agent(issues, plan.get("agent_friendly"))
+        _validate_trains(issues, plan)
     approvals_path = path / "approvals.json"
     if approvals_path.is_file():
         raw = _read_json(approvals_path)
@@ -912,6 +1034,147 @@ def set_task(ws: str, task_id: str, status: str, moved_to: str | None, note: str
     return 0
 
 
+def _split_csv(value: str) -> list[str]:
+    return [part.strip() for part in str(value).split(",") if part.strip()]
+
+
+def set_train(
+    ws: str,
+    train_id: str,
+    title: str | None = None,
+    branch: str | None = None,
+    status: str | None = None,
+    add: list[str] | None = None,
+    remove: list[str] | None = None,
+    pr: int | None = None,
+    shared: list[str] | None = None,
+    gate: str | None = None,
+    note: str | None = None,
+    root: Path | None = None,
+) -> int:
+    if not isinstance(train_id, str) or not _TRAIN_ID.match(train_id):
+        print(f"bad train id {train_id}", flush=True)
+        return 2
+    if status is not None and status not in TRAIN_STATUSES:
+        print(f"bad status {status}. Use one of: {', '.join(TRAIN_STATUSES)}", flush=True)
+        return 2
+    if branch is not None and not branch.startswith("train/"):
+        print(f'bad branch {branch}: must start with "train/"', flush=True)
+        return 2
+    if title is not None and not title.strip():
+        print("title required", flush=True)
+        return 2
+    path = bundle_dir(ws, root)
+    if path is None:
+        print(f"bundle not found: {ws}", flush=True)
+        return 2
+    plan_path = path / "plan.json"
+    data = _read_json(plan_path)
+    if not isinstance(data, dict):
+        print("plan.json unreadable", flush=True)
+        return 2
+    known = _dag_task_ids(data)
+    trains = data.get("trains")
+    if trains is None:
+        trains = []
+        data["trains"] = trains
+    if not isinstance(trains, list):
+        print("plan.json trains is not a list", flush=True)
+        return 2
+    found = None
+    for item in trains:
+        if isinstance(item, dict) and item.get("id") == train_id:
+            found = item
+            break
+    if found is None:
+        if title is None:
+            print("title required for a new train", flush=True)
+            return 2
+        found = {"id": train_id, "title": title.strip(), "members": [], "status": "planned"}
+        trains.append(found)
+    elif title is not None:
+        found["title"] = title.strip()
+    members = found.get("members")
+    if not isinstance(members, list):
+        members = []
+        found["members"] = members
+    for task_id in remove or []:
+        if task_id in members:
+            members.remove(task_id)
+    for task_id in add or []:
+        if task_id not in known:
+            print(f"task not found: {task_id}", flush=True)
+            return 2
+        for other in trains:
+            if other is not found and isinstance(other, dict) and task_id in (other.get("members") or []):
+                other["members"].remove(task_id)
+                print(f"moved {task_id} from {other.get('id')} to {train_id}", flush=True)
+        if task_id not in members:
+            members.append(task_id)
+    if add and len(members) > TRAIN_MEMBER_LIMIT:
+        print(f"train {train_id} has {len(members)} members; split it (limit {TRAIN_MEMBER_LIMIT})", flush=True)
+        return 2
+    if branch is not None:
+        found["branch"] = branch
+    if status is not None:
+        found["status"] = status
+    if pr is not None:
+        found["pr"] = pr
+    if shared is not None:
+        found["shared_files"] = shared
+    if gate is not None:
+        found["gate"] = gate
+    if note is not None:
+        found["note"] = note
+    _atomic_write(plan_path, json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+    print(f"{ws} train {train_id} {found.get('status')}")
+    return 0
+
+
+def print_trains(ws: str, root: Path | None = None) -> int:
+    path = bundle_dir(ws, root)
+    if path is None:
+        print(f"bundle not found: {ws}", flush=True)
+        return 2
+    data = _read_json(path / "plan.json")
+    if not isinstance(data, dict):
+        print("plan.json unreadable", flush=True)
+        return 2
+    trains = data.get("trains") or []
+    if not isinstance(trains, list) or not trains:
+        print("(no trains)")
+        return 0
+    dag_status: dict[str, str] = {}
+    dag = data.get("dag")
+    if isinstance(dag, dict):
+        for group in dag.get("groups") or []:
+            if not isinstance(group, dict):
+                continue
+            for task in group.get("tasks") or []:
+                if isinstance(task, dict) and isinstance(task.get("id"), str):
+                    dag_status[task["id"]] = task.get("status") or "todo"
+    print("TRAIN\tSTATUS\tBRANCH\tPR\tMEMBERS\tSHARED")
+    for item in trains:
+        if not isinstance(item, dict):
+            continue
+        members = item.get("members") if isinstance(item.get("members"), list) else []
+        member_text = ",".join(f"{member}({dag_status.get(member, '?')})" for member in members) or "-"
+        shared = item.get("shared_files") if isinstance(item.get("shared_files"), list) else []
+        print(
+            "\t".join(
+                [
+                    _cell(item.get("id")),
+                    _cell(item.get("status")),
+                    _cell(item.get("branch") or "-"),
+                    _cell(item.get("pr") if item.get("pr") is not None else "-"),
+                    _cell(member_text),
+                    str(len(shared)),
+                ]
+            )
+        )
+    return 0
+
+
 def cmd_ws(argv: list[str]) -> int:
     if not argv or argv[0] in ("-h", "--help"):
         print(WS_USAGE, end="")
@@ -979,6 +1242,52 @@ def cmd_ws(argv: list[str]) -> int:
                 print(WS_USAGE, end="", flush=True)
                 return 2
         return set_task(rest[0], rest[1], rest[2], moved, note)
+    if cmd == "train":
+        if len(rest) < 2:
+            print(WS_USAGE, end="", flush=True)
+            return 2
+        title = branch = status = gate = note = None
+        add = remove = shared = None
+        pr = None
+        flags = rest[2:]
+        index = 0
+        valued = ("--title", "--branch", "--status", "--add", "--remove", "--pr", "--shared", "--gate", "--note")
+        while index < len(flags):
+            flag = flags[index]
+            if flag in valued and index + 1 < len(flags):
+                value = flags[index + 1]
+                if flag == "--title":
+                    title = value
+                elif flag == "--branch":
+                    branch = value
+                elif flag == "--status":
+                    status = value
+                elif flag == "--add":
+                    add = _split_csv(value)
+                elif flag == "--remove":
+                    remove = _split_csv(value)
+                elif flag == "--pr":
+                    try:
+                        pr = int(value)
+                    except ValueError:
+                        print(f"bad pr {value}: must be an integer", flush=True)
+                        return 2
+                elif flag == "--shared":
+                    shared = _split_csv(value)
+                elif flag == "--gate":
+                    gate = value
+                else:
+                    note = value
+                index += 2
+            else:
+                print(WS_USAGE, end="", flush=True)
+                return 2
+        return set_train(rest[0], rest[1], title, branch, status, add, remove, pr, shared, gate, note)
+    if cmd == "trains":
+        if len(rest) != 1:
+            print(WS_USAGE, end="", flush=True)
+            return 2
+        return print_trains(rest[0])
     if cmd == "approve":
         if len(rest) < 3:
             print(WS_USAGE, end="", flush=True)

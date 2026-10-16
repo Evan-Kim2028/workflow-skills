@@ -140,3 +140,18 @@ Production updates go out fastest when every merge is small in CI time, not in s
   - `done` when it is merged and live.
 
   `prog` never means "in progress".
+
+### Merge trains on the dashboard
+
+The plan's `trains` list is the only source of truth. It is provisional at planning time; the lead re-cuts it as member diffs land. The schema is one object per train: `id` (machine key, unique), `title` (plain phrase, leads), optional `branch` (starts with `train/`), `members` (task ids, at most 8, each in one train at most), `status`, optional `pr`, `shared_files`, `gate`, and `note`.
+
+```
+python3 ~/.claude/tools/agent-dash/agent_dash.py ws train WS4 T1 --title "read-path cutover" --add WS4.3,WS4.12
+python3 ~/.claude/tools/agent-dash/agent_dash.py ws train WS4 T1 --branch train/api-read-path --status assembling
+python3 ~/.claude/tools/agent-dash/agent_dash.py ws train WS4 T1 --status pr --pr 5357
+python3 ~/.claude/tools/agent-dash/agent_dash.py ws trains WS4
+```
+
+Train status flows `planned` (members may change) → `assembling` → `gate` → `pr` → `merged`, or `dropped` when the train dissolves and its members are reassigned.
+
+Re-cut when each member branch lands: diff it with `git diff --name-only origin/main...<branch>`, intersect the member lists into `shared_files`, set the `gate` to the tests for those files, and move the train status with `ws train`. Set `pr` when the train PR opens and `merged` after it lands. `ws trains` lists every train with its members' task statuses. The Plan page shows the trains; the Execution progress map tags each member chip and adds a legend.

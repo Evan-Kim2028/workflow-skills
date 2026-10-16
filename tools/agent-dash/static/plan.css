@@ -633,3 +633,35 @@
 
 .pp-actions{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
 .pp-actions .copybtn{margin-left:0}
+
+/* merge trains: one row per train, right after the progress map */
+.plan-view .tr-row{border:1px solid var(--line);border-radius:6px;background:var(--surface);padding:10px 12px;margin-top:10px;min-width:0}
+.plan-view .tr-head{display:flex;flex-wrap:wrap;gap:4px 10px;align-items:baseline;font-size:14px;min-width:0}
+.plan-view .tr-title{font-weight:650}
+.plan-view .tr-id{color:var(--fg3)}
+.plan-view .tr-branch{font-family:var(--f-mono);font-size:12.5px;background:var(--surface-2);border:1px solid var(--line);border-radius:4px;padding:2px 6px;overflow-wrap:anywhere}
+.plan-view .tr-status{display:inline-block;font:600 11px/1 var(--f-mono);padding:4px 8px;border-radius:999px;border:1px solid var(--line);white-space:nowrap}
+.plan-view .tr-s-planned{background:transparent;color:var(--fg2);border-style:dashed}
+.plan-view .tr-s-assembling{background:var(--accent-soft);color:var(--accent)}
+.plan-view .tr-s-gate{background:var(--warn-soft);color:var(--warn)}
+.plan-view .tr-s-pr{background:var(--warn-soft);color:var(--warn);border-style:solid}
+.plan-view .tr-s-merged{background:var(--ok-soft);color:var(--ok)}
+.plan-view .tr-s-dropped{background:var(--mute-soft);color:var(--fg3)}
+.plan-view .tr-pr{font:600 12px var(--f-mono);color:var(--fg2);white-space:nowrap}
+.plan-view .tr-chips{display:flex;flex-wrap:wrap;gap:4px;margin-top:8px}
+.plan-view .tr-chip{font:11px var(--f-mono);padding:2px 6px;border-radius:5px;border:1.5px dashed var(--line);color:var(--fg3);display:inline-flex;align-items:center;gap:3px;background:transparent}
+.plan-view .tr-chip::before{font-size:10px;line-height:1}
+.plan-view .tr-chip.done{border-style:solid;border-color:var(--good);color:var(--good-ink);background:color-mix(in srgb, var(--good) 14%, transparent)}
+.plan-view .tr-chip.done::before{content:"\2713"}
+.plan-view .tr-chip.pr{border-style:solid;border-color:var(--warning);color:var(--fg);background:color-mix(in srgb, var(--warning) 22%, transparent)}
+.plan-view .tr-chip.pr::before{content:"\29D7"}
+.plan-view .tr-chip.prog{border-style:solid;border-color:var(--s5);color:var(--fg);background:color-mix(in srgb, var(--s5) 20%, transparent)}
+.plan-view .tr-chip.prog::before{content:"\21E1"}
+.plan-view .tr-chip.wip{border-style:solid;border-color:var(--s1);color:var(--fg)}
+.plan-view .tr-chip.wip::before{content:"\25D4"}
+.plan-view .tr-chip.deferred{border-style:dotted;opacity:.6}
+.plan-view .tr-chip.deferred::before{content:"\21B7"}
+.plan-view .tr-meta{margin-top:8px;font-size:12.5px;color:var(--fg2)}
+.plan-view .tr-shared{cursor:help;border-bottom:1px dotted var(--fg3)}
+.plan-view .tr-gate{font-size:13px;color:var(--fg2);margin-top:6px;overflow-wrap:anywhere}
+.plan-view .tr-alone{margin-top:12px}

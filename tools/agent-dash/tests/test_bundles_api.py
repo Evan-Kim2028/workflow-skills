@@ -203,5 +203,142 @@ class BundlesApiTest(unittest.TestCase):
         self.assertIn(b"Needs you", plan)
 
 
+class TrainsApiTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.old = os.environ.get("AGENT_DASH_WORKSTREAMS")
+        os.environ["AGENT_DASH_WORKSTREAMS"] = self.tmp.name
+        root = Path(self.tmp.name)
+        ws = root / "WS9"
+        ws.mkdir()
+        (ws / "bundle.json").write_text(
+            json.dumps({"id": "WS9", "title": "Example", "short": "Ex", "order": 1, "kind": "workstream"}),
+            encoding="utf-8",
+        )
+        (ws / "plan.json").write_text(
+            json.dumps(
+                {
+                    "dag": {
+                        "cols": ["Shape"],
+                        "groups": [{"id": "g", "col": 0, "title": "Group", "tasks": [
+                            {"id": "WS9.1", "title": "First task", "status": "todo"},
+                            {"id": "WS9.2", "title": "Second task", "status": "pr"},
+                        ]}],
+                        "edges": [],
+                    },
+                    "narrative": {"phases": []},
+                    "trains": [
+                        {
+                            "id": "T1",
+                            "title": "read-path cutover",
+                            "members": ["WS9.1"],
+                            "status": "planned",
+                            "junk": "dropped",
+                        },
+                        {
+                            "id": "T2",
+                            "title": "second cutover",
+                            "branch": "train/second",
+                            "members": ["WS9.2"],
+                            "status": "pr",
+                            "pr": 5357,
+                            "shared_files": ["api/x.py"],
+                            "gate": "pytest api/tests/test_x.py",
+                            "note": "(parsed)",
+                        },
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        self.store = Store(Path(self.tmp.name) / "dash.sqlite")
+        self.server, self.thread = start(self.store, ROOT / "static" / "index.html")
+        self.port = self.server.server_address[1]
+
+    def tearDown(self):
+        stop(self.server, self.thread)
+        self.store.close()
+        if self.old is None:
+            os.environ.pop("AGENT_DASH_WORKSTREAMS", None)
+        else:
+            os.environ["AGENT_DASH_WORKSTREAMS"] = self.old
+        self.tmp.cleanup()
+
+    def test_trains_pass_through(self):
+        from dash.bundles import validate_bundle
+
+        self.assertEqual(validate_bundle("WS9"), [])
+        status, _, body = get(self.port, "/api/bundle?ws=WS9")
+        self.assertEqual(status, 200)
+        trains = json.loads(body)["plan"]["trains"]
+        self.assertEqual(len(trains), 2)
+        first, second = trains
+        self.assertEqual(first["id"], "T1")
+        self.assertEqual(first["title"], "read-path cutover")
+        self.assertEqual(first["members"], ["WS9.1"])
+        self.assertEqual(first["status"], "planned")
+        self.assertNotIn("junk", first)
+        self.assertEqual(second["branch"], "train/second")
+        self.assertEqual(second["pr"], 5357)
+        self.assertEqual(second["shared_files"], ["api/x.py"])
+        self.assertEqual(second["gate"], "pytest api/tests/test_x.py")
+        status, _, body = get(self.port, "/api/plan?ws=WS9")
+        self.assertEqual(status, 200)
+        trains = json.loads(body)["trains"]
+        self.assertEqual([row["id"] for row in trains], ["T1", "T2"])
+        self.assertEqual(trains[1]["members"], ["WS9.2"])
+        self.assertNotIn("junk", trains[0])
+
+    def test_trains_validation_issues(self):
+        from dash.bundles import validate_bundle
+
+        plan_path = Path(self.tmp.name) / "WS9" / "plan.json"
+        plan = json.loads(plan_path.read_text(encoding="utf-8"))
+        plan["trains"] = [
+            {"id": "T1", "title": "first", "members": ["WS9.1", "WS9.2"], "status": "planned"},
+            {"id": "T2", "title": "second", "members": ["WS9.2"], "status": "bogus"},
+        ]
+        plan_path.write_text(json.dumps(plan), encoding="utf-8")
+        issues = validate_bundle("WS9")
+        self.assertTrue(any("task WS9.2 is in two trains" in item for item in issues))
+        self.assertTrue(any("status 'bogus'" in item for item in issues))
+
+    def test_plans_map_trains(self):
+        from dash.plans import load as load_plan
+
+        tmp = Path(self.tmp.name) / "maps"
+        tmp.mkdir()
+        (tmp / "ws9.json").write_text(
+            json.dumps(
+                {
+                    "dag": {
+                        "cols": ["Shape"],
+                        "groups": [{"id": "g", "col": 0, "title": "Group", "tasks": [
+                            {"id": "WS9.1", "title": "First task", "status": "todo"},
+                        ]}],
+                        "edges": [],
+                    },
+                    "narrative": {"phases": [{"name": "Shape", "goal": "Ship.", "gate": "Done."}]},
+                    "trains": [
+                        {"id": "T1", "title": "cutover", "members": ["WS9.1"], "status": "planned", "junk": 1},
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        (tmp / "plans.json").write_text(json.dumps({"WS9": "ws9.json"}), encoding="utf-8")
+        plan = load_plan("WS9", tmp / "plans.json")
+        self.assertEqual([row["id"] for row in plan["trains"]], ["T1"])
+        self.assertEqual(plan["trains"][0]["members"], ["WS9.1"])
+        self.assertNotIn("junk", plan["trains"][0])
+        bare = load_plan("WS9", tmp / "plans.json")
+        plan_path = tmp / "ws9.json"
+        data = json.loads(plan_path.read_text(encoding="utf-8"))
+        del data["trains"]
+        plan_path.write_text(json.dumps(data), encoding="utf-8")
+        self.assertEqual(load_plan("WS9", tmp / "plans.json")["trains"], [])
+        self.assertEqual(bare["ws"], "WS9")
+
+
 if __name__ == "__main__":
     unittest.main()

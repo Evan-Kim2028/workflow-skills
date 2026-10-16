@@ -14,6 +14,20 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from dash.bundles import cmd_ws, naming_issues, set_task, validate_bundle
 
 
+def _add_tasks(root: Path, ws: str, ids: list) -> None:
+    plan_path = root / ws / "plan.json"
+    plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    tasks = plan["dag"]["groups"][0]["tasks"]
+    for tid in ids:
+        if tid not in [task["id"] for task in tasks]:
+            tasks.append({"id": tid, "title": f"Task {tid}", "status": "todo"})
+    plan_path.write_text(json.dumps(plan), encoding="utf-8")
+
+
+def _plan(root: Path, ws: str) -> dict:
+    return json.loads((root / ws / "plan.json").read_text(encoding="utf-8"))
+
+
 class WsCliTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -183,6 +197,168 @@ class WsCliTest(unittest.TestCase):
         issues = validate_bundle("WS9")
         self.assertTrue(any("ADR 0099" in item for item in issues))
         self.assertEqual(cmd_ws(["approvals", "NOPE"]), 2)
+
+
+class WsTrainCliTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.old = os.environ.get("AGENT_DASH_WORKSTREAMS")
+        os.environ["AGENT_DASH_WORKSTREAMS"] = self.tmp.name
+        self.root = Path(self.tmp.name)
+
+    def tearDown(self):
+        if self.old is None:
+            os.environ.pop("AGENT_DASH_WORKSTREAMS", None)
+        else:
+            os.environ["AGENT_DASH_WORKSTREAMS"] = self.old
+        self.tmp.cleanup()
+
+    def test_template_has_empty_trains(self):
+        self.assertEqual(cmd_ws(["new", "WS4", "Sample"]), 0)
+        plan = _plan(self.root, "WS4")
+        self.assertEqual(plan["trains"], [])
+        prompt = (self.root / "WS4" / "START-PROMPT.md").read_text(encoding="utf-8")
+        self.assertIn("ws train", prompt)
+        self.assertEqual(validate_bundle("WS4"), [])
+
+    def test_create_needs_title(self):
+        self.assertEqual(cmd_ws(["new", "WS4", "Sample"]), 0)
+        self.assertEqual(cmd_ws(["train", "WS4", "T1"]), 2)
+        self.assertEqual(_plan(self.root, "WS4")["trains"], [])
+        self.assertEqual(cmd_ws(["train", "WS4", "T1", "--title", "read-path cutover"]), 0)
+        trains = _plan(self.root, "WS4")["trains"]
+        self.assertEqual(len(trains), 1)
+        self.assertEqual(trains[0]["id"], "T1")
+        self.assertEqual(trains[0]["title"], "read-path cutover")
+        self.assertEqual(trains[0]["status"], "planned")
+        self.assertEqual(trains[0]["members"], [])
+        self.assertFalse((self.root / "WS4" / "plan.json.tmp").exists())
+        self.assertEqual(validate_bundle("WS4"), [])
+
+    def test_add_move_remove(self):
+        from io import StringIO
+        from contextlib import redirect_stdout
+
+        self.assertEqual(cmd_ws(["new", "WS4", "Sample"]), 0)
+        self.assertEqual(cmd_ws(["train", "WS4", "T1", "--title", "first train", "--add", "WS4.1"]), 0)
+        self.assertEqual(_plan(self.root, "WS4")["trains"][0]["members"], ["WS4.1"])
+        buf = StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(cmd_ws(["train", "WS4", "T2", "--title", "second train", "--add", "WS4.1"]), 0)
+        self.assertIn("moved WS4.1 from T1 to T2", buf.getvalue())
+        trains = {row["id"]: row for row in _plan(self.root, "WS4")["trains"]}
+        self.assertEqual(trains["T1"]["members"], [])
+        self.assertEqual(trains["T2"]["members"], ["WS4.1"])
+        self.assertEqual(cmd_ws(["train", "WS4", "T2", "--remove", "WS4.1"]), 0)
+        trains = {row["id"]: row for row in _plan(self.root, "WS4")["trains"]}
+        self.assertEqual(trains["T2"]["members"], [])
+        self.assertEqual(validate_bundle("WS4"), [])
+
+    def test_fields(self):
+        self.assertEqual(cmd_ws(["new", "WS4", "Sample"]), 0)
+        self.assertEqual(
+            cmd_ws([
+                "train", "WS4", "T1", "--title", "read-path cutover",
+                "--branch", "train/read-path", "--status", "assembling",
+                "--add", "WS4.1", "--pr", "5357",
+                "--shared", "api/x.py,api/y.py", "--gate", "pytest api/tests/test_x.py",
+                "--note", "cut at planning time",
+            ]),
+            0,
+        )
+        train = _plan(self.root, "WS4")["trains"][0]
+        self.assertEqual(train["branch"], "train/read-path")
+        self.assertEqual(train["status"], "assembling")
+        self.assertEqual(train["pr"], 5357)
+        self.assertEqual(train["shared_files"], ["api/x.py", "api/y.py"])
+        self.assertEqual(train["gate"], "pytest api/tests/test_x.py")
+        self.assertEqual(train["note"], "cut at planning time")
+        self.assertEqual(validate_bundle("WS4"), [])
+        self.assertEqual(cmd_ws(["train", "WS4", "T1", "--status", "pr"]), 0)
+        self.assertEqual(_plan(self.root, "WS4")["trains"][0]["status"], "pr")
+
+    def test_trains_table(self):
+        from io import StringIO
+        from contextlib import redirect_stdout
+
+        self.assertEqual(cmd_ws(["new", "WS4", "Sample"]), 0)
+        buf = StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(cmd_ws(["trains", "WS4"]), 0)
+        self.assertIn("(no trains)", buf.getvalue())
+        self.assertEqual(cmd_ws(["task", "WS4", "WS4.1", "pr"]), 0)
+        self.assertEqual(
+            cmd_ws(["train", "WS4", "T1", "--title", "read-path cutover", "--add", "WS4.1", "--shared", "api/x.py"]),
+            0,
+        )
+        buf = StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(cmd_ws(["trains", "WS4"]), 0)
+        text = buf.getvalue()
+        self.assertIn("TRAIN", text)
+        self.assertIn("T1", text)
+        self.assertIn("WS4.1(pr)", text)
+        self.assertEqual(cmd_ws(["trains", "NOPE"]), 2)
+
+    def test_rejects_bad_values(self):
+        self.assertEqual(cmd_ws(["new", "WS4", "Sample"]), 0)
+        self.assertEqual(cmd_ws(["train", "WS4", "T1", "--title", "cutover", "--status", "open"]), 2)
+        self.assertEqual(cmd_ws(["train", "WS4", "T1", "--title", "cutover", "--branch", "main"]), 2)
+        self.assertEqual(cmd_ws(["train", "WS4", "T 1", "--title", "cutover"]), 2)
+        self.assertEqual(cmd_ws(["train", "WS4", "T1", "--title", "cutover", "--pr", "many"]), 2)
+        self.assertEqual(cmd_ws(["train", "WS4", "T1", "--title", "cutover", "--add", "WS4.missing"]), 2)
+        self.assertEqual(cmd_ws(["train", "NOPE", "T1", "--title", "cutover"]), 2)
+        self.assertEqual(cmd_ws(["train", "WS4"]), 2)
+        self.assertEqual(_plan(self.root, "WS4")["trains"], [])
+
+    def test_rejects_ninth_member(self):
+        self.assertEqual(cmd_ws(["new", "WS4", "Sample"]), 0)
+        ids = [f"WS4.{n}" for n in range(1, 10)]
+        _add_tasks(self.root, "WS4", ids)
+        self.assertEqual(
+            cmd_ws(["train", "WS4", "T1", "--title", "big train", "--add", ",".join(ids)]),
+            2,
+        )
+        self.assertEqual(_plan(self.root, "WS4")["trains"], [])
+        self.assertEqual(
+            cmd_ws(["train", "WS4", "T1", "--title", "big train", "--add", ",".join(ids[:8])]),
+            0,
+        )
+        self.assertEqual(cmd_ws(["train", "WS4", "T1", "--add", ids[8]]), 2)
+        self.assertEqual(len(_plan(self.root, "WS4")["trains"][0]["members"]), 8)
+
+    def test_validation_issues(self):
+        self.assertEqual(cmd_ws(["new", "WS4", "Sample"]), 0)
+        plan_path = self.root / "WS4" / "plan.json"
+        plan = json.loads(plan_path.read_text(encoding="utf-8"))
+        plan["trains"] = [
+            {"id": "T1", "title": "first train", "members": ["WS4.1"], "status": "planned"},
+            {"id": "T1", "title": "duplicate key", "members": [], "status": "planned"},
+            {"id": "T2", "title": "second train", "members": ["WS4.1"], "status": "flying"},
+            {"id": "T3", "title": "third train", "members": ["WS4.missing"], "status": "planned", "branch": "main"},
+        ]
+        plan_path.write_text(json.dumps(plan), encoding="utf-8")
+        issues = validate_bundle("WS4")
+        self.assertTrue(any("duplicate train id T1" in item for item in issues))
+        self.assertTrue(any("task WS4.1 is in two trains" in item for item in issues))
+        self.assertTrue(any("status 'flying'" in item for item in issues))
+        self.assertTrue(any("unknown task WS4.missing" in item for item in issues))
+        self.assertTrue(any('branch must start with "train/"' in item for item in issues))
+        plan["trains"] = [
+            {"id": "T9", "title": "the read-path decision (ADR 0123) is done", "members": [], "status": "planned"},
+        ]
+        plan_path.write_text(json.dumps(plan), encoding="utf-8")
+        self.assertFalse(any("ADR 0123" in item for item in validate_bundle("WS4")))
+        plan["trains"] = [{"id": "T9", "title": "ADR 0123 scopes the log", "members": [], "status": "planned"}]
+        plan_path.write_text(json.dumps(plan), encoding="utf-8")
+        self.assertTrue(any("ADR 0123" in item for item in validate_bundle("WS4")))
+        _add_tasks(self.root, "WS4", [f"WS4.{n}" for n in range(2, 10)])
+        plan = json.loads(plan_path.read_text(encoding="utf-8"))
+        plan["trains"] = [
+            {"id": "T1", "title": "big train", "members": [f"WS4.{n}" for n in range(1, 10)], "status": "planned"}
+        ]
+        plan_path.write_text(json.dumps(plan), encoding="utf-8")
+        self.assertIn("train T1 has 9 members; split it (limit 8)", validate_bundle("WS4"))
 
 
 if __name__ == "__main__":

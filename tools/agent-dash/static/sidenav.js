@@ -58,7 +58,7 @@
     var l = String(label || "").toLowerCase();
     if (l === "where we are" || l === "workstreams") return "Where we are";
     if (l === "why") return "Why";
-    if (l === "end state" || l === "end outcome" || l === "plan" || l === "progress") return "Plan";
+    if (l === "end state" || l === "end outcome" || l === "plan" || l === "progress" || l === "merge trains") return "Plan";
     if (l === "decided" || l === "decisions" || l === "agent-friendly") return "Decisions";
     return "Reference";
   }

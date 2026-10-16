@@ -84,6 +84,8 @@ Claude project and session roots default to `~/.claude/projects` and `~/.claude/
 
 **Log progress.** Label every worker run `ws<N>-<task-id>-<slug>` so the map pins the agent to its task. Move a task with `python3 agent_dash.py ws task <ID> <task-id> <todo|pr|prog|done|deferred> [--moved-to WSn] [--note "..."]`. The write is a temp file plus replace. Do not hand-edit `plan.json` while a session is running. Status edits do not need `ws render`. The page reads `plan.json` live.
 
+**Record a merge train.** Ship related tasks as one branch and one PR: `python3 agent_dash.py ws train <ID> <train-id> --title "..." --add <task>,<task>` (creates the train when missing; `--title` is required then). Move its status with `--status planned|assembling|gate|pr|merged|dropped`, and set `--branch train/<area>-<slug>`, `--pr N`, `--shared f1,f2`, `--gate "..."`, `--note "..."`. `--add` moves a task out of any other train. List trains with `ws trains <ID>`. Trains render as a "Merge trains" section on the Plan page and as tags plus a legend on the Execution progress map. Schema and status flow: `tools/agent-dash/SKILL-PLAN.md`.
+
 **Record an approval.** The lead adds a pending item, the owner sets `approved` or `denied`, and the lead reads `ws approvals <ID>` before any production step. `python3 agent_dash.py ws approve <ID> <item-id> pending --step "..." --reversible yes|no --conditions "..."`. Approvals are not shown on the dashboard (owner decision); they are a file the lead reads. See `SKILL-PLAN.md`.
 
 **Refresh a plan map from an HTML artifact.** When task state lives in a saved artifact page:

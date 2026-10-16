@@ -56,6 +56,7 @@ def load(ws: str, path: Path | None = None) -> dict:
         "groups": _groups(dag.get("groups")),
         "edges": _edges(dag.get("edges")),
         "phases": _phases(narrative.get("phases")),
+        "trains": _trains(data.get("trains")),
     }
 
 
@@ -140,3 +141,32 @@ def _phases(value) -> list:
             continue
         phases.append({"name": item.get("name"), "goal": item.get("goal"), "gate": item.get("gate")})
     return phases
+
+
+def _trains(value) -> list:
+    """Optional top-level merge trains. Unknown keys are dropped, like other fields."""
+    if not isinstance(value, list):
+        return []
+    out = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        pr = item.get("pr")
+        out.append(
+            {
+                "id": item.get("id") if isinstance(item.get("id"), str) else None,
+                "title": item.get("title") if isinstance(item.get("title"), str) else None,
+                "branch": item.get("branch") if isinstance(item.get("branch"), str) else None,
+                "members": [entry for entry in item.get("members") or [] if isinstance(entry, str)]
+                if isinstance(item.get("members"), list)
+                else [],
+                "status": item.get("status") if isinstance(item.get("status"), str) else None,
+                "pr": pr if isinstance(pr, int) and not isinstance(pr, bool) else None,
+                "shared_files": [entry for entry in item.get("shared_files") or [] if isinstance(entry, str)]
+                if isinstance(item.get("shared_files"), list)
+                else [],
+                "gate": item.get("gate") if isinstance(item.get("gate"), str) else None,
+                "note": item.get("note") if isinstance(item.get("note"), str) else None,
+            }
+        )
+    return out

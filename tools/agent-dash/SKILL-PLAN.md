@@ -46,6 +46,44 @@ python3 agent_dash.py ws task WS4 WS4.1 deferred --moved-to WS6 --note "waits on
 
 Run `ws render` again only when the prose or the drawings change. Status edits do not need a render. The page reads `plan.json` live.
 
+## Merge trains
+
+Related branches ship as one train branch (`train/<area>-<slug>`) and one PR, so CI runs once per set. The plan carries a provisional layout that the lead edits as diffs land. `ws new` writes an empty `"trains": []` for it.
+
+`plan.json` holds an optional top-level `trains` list, the only source of truth. There is no per-task train field; task-to-train is derived from this list. Tasks in no train ship alone. A missing `trains` key is valid.
+
+```json
+{"id": "T1", "title": "read-path cutover", "branch": "train/api-read-path",
+ "members": ["WS4.3", "WS4.12"], "status": "planned", "pr": 5357,
+ "shared_files": ["api/x.py"], "gate": "pytest api/tests/test_x.py", "note": "..."}
+```
+
+- `id` is a machine key (`^[A-Za-z0-9._-]{1,40}$`), unique across the plan. `title` is a plain phrase and leads everywhere the train is named.
+- `branch` is optional until assembling and must start with `train/`.
+- `members` are task ids from `dag.groups[].tasks`. A task belongs to at most one train. At most 8 members per train.
+- `shared_files` are files two or more members touch; they drive the train-level integration gate. `gate` is the one-line check for them.
+- `status` moves like this:
+
+| Status | Meaning |
+|---|---|
+| planned | proposed at planning, members may change |
+| assembling | member branches being merged into the train branch |
+| gate | train-level integration checks running |
+| pr | train PR open |
+| merged | on main |
+| dropped | train dissolved, members reassigned |
+
+```
+python3 agent_dash.py ws train WS4 T1 --title "read-path cutover" --add WS4.3,WS4.12
+python3 agent_dash.py ws train WS4 T1 --branch train/api-read-path --status assembling
+python3 agent_dash.py ws train WS4 T1 --status pr --pr 5357
+python3 agent_dash.py ws trains WS4
+```
+
+`ws train` creates the train when it is missing (`--title` is required then). `--add` moves a task out of any other train and says so. The write is a temp file plus replace, like `ws task`. `ws trains` prints a table: train, status, branch, PR, members with each member's task status, and the shared-files count.
+
+Re-cut the trains as member diffs land: per member `git diff --name-only origin/main...<branch>`, intersect the lists into `shared_files`, set the `gate` to the tests for those files, and move the train status with `ws train`. Set `pr` when the train PR opens and `merged` after it lands. `ws validate` checks the schema, the member cap, and the naming rule on train titles and notes.
+
 ## Approvals
 
 The lead records a pending decision before asking the owner to take it. The owner sets the status. The lead reads that status before any production step.

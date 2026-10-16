@@ -87,5 +87,6 @@
       "gate": "The check task is done."
     }
   ],
+  "trains": [],
   "_note": "Seeded example plan for the fixture preview."
 }

@@ -48,6 +48,7 @@ Production updates go out fastest when every merge is small in CI time, not in s
   - A change ships alone only if it is small (5 files or fewer), has no migrations, and shares no test file with another open branch.
   - Everything else joins a train of at most 8 members.
   - Push a train once, when it is ready; avoid repeated pushes.
+- **Re-cut the plan's trains as member diffs land.** Per member `git diff --name-only origin/main...<branch>`, intersect the lists into the train's `shared_files`, and set its `gate` to the tests for those files. Move the train status with `ws train <ID> <train> --status ...` (`planned | assembling | gate | pr | merged | dropped`), set `--pr` when the train PR opens and `merged` after it lands. `--add` moves a task out of any other train. `ws trains <ID>` lists them.
 - **The merge gate is local, scoped CI.**
   - Each member runs only the explicit test files for the code it changed.
   - A train re-runs only the tests for files that two members both touched, plus one load of shared registries.

@@ -47,12 +47,34 @@
         "col": 0,
         "title": "First group",
         "tasks": [
-          {"id": "WS1.1", "title": "Agree the contract", "status": "todo"}
+          {"id": "WS1.1", "title": "Agree the contract", "status": "todo"},
+          {"id": "WS1.2", "title": "Land the read route", "status": "pr"},
+          {"id": "WS1.3", "title": "Retire the old readers", "status": "wip"},
+          {"id": "WS1.4", "title": "Freeze the old contract", "status": "done"}
         ]
       }
     ],
     "edges": []
   },
+  "trains": [
+    {
+      "id": "T1",
+      "title": "read-path cutover",
+      "members": ["WS1.1"],
+      "status": "planned",
+      "note": "First guess at planning time; the branch is cut when assembly starts."
+    },
+    {
+      "id": "T2",
+      "title": "reader retirement",
+      "branch": "train/reader-retirement",
+      "members": ["WS1.2", "WS1.3"],
+      "status": "pr",
+      "pr": 5357,
+      "shared_files": ["api/read.py"],
+      "gate": "pytest api/tests/test_read.py"
+    }
+  ],
   "narrative": {
     "thesis": "One read path replaces three readers.",
     "end_state": "Clients read one route.",

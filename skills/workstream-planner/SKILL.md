@@ -28,6 +28,7 @@ Tool: `~/.claude/tools/agent-dash/` (`agent_dash.py`). Bundles live in `~/.local
    - Task ids are stable machine keys, e.g. `WS4.3`.
    - Statuses are `todo | wip | pr | prog | done | deferred`. A deferred task carries `moved_to` and `note`.
    - `ws validate` fails on a dep that names an unknown task or the task itself.
+   - **Propose merge trains.** Group tasks expected to touch the same files or tests, or that carry migrations, into trains of at most 8; tasks with a small, isolated diff ship alone. Record the groups in `plan.json` `trains` (`id`, `title`, `members`) with status `planned`. This is a first guess: the lead re-cuts it as member diffs land.
 4. **Visuals first.** The owner reads pictures before text. Put these in `visuals.html`:
    - a before and after diagram;
    - a chart of the main benefit;

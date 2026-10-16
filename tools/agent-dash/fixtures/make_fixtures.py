@@ -70,6 +70,14 @@ RAW_PLANS = {
             {"name": "Shape", "goal": "Types and the store agree.", "gate": "The sample set loads."},
             {"name": "Cut over", "goal": "One source reads the new store.", "gate": "The gate task is done."},
         ],
+        "trains": [
+            {"id": "T1", "title": "store migration", "members": ["12", "13"], "status": "planned",
+             "shared_files": ["store/schema.sql"], "gate": "pytest store/tests/test_schema.py",
+             "note": "First guess at planning time."},
+            {"id": "T2", "title": "matcher cutover", "branch": "train/matcher-cutover",
+             "members": ["20", "21"], "status": "pr", "pr": 5361,
+             "shared_files": ["match/rules.py"], "gate": "pytest match/tests/test_rules.py"},
+        ],
     },
     "WS2": {
         "cols": ["Contract", "Routes", "Clients", "Remove"],
@@ -494,6 +502,7 @@ def _plans():
             "groups": body["groups"],
             "edges": body["edges"],
             "phases": body["phases"],
+            "trains": body.get("trains", []),
             "_note": "Seeded example plan for the fixture preview.",
         }
     return written
