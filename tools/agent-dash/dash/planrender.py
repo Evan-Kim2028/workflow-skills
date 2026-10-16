@@ -1,6 +1,6 @@
 """Render a plan bundle's page.html from plan.json, visuals.html, and layout.json.
 
-Section order is fixed: Approvals, Why, End state, Plan, Progress, Decided, Agent-friendly, Reference.
+Section order is fixed: Why, End state, Plan, Progress, Decided, Agent-friendly, Reference.
 The Progress section is a placeholder. The plan page fills it from the live plan.
 """
 
@@ -153,7 +153,6 @@ def _piece(value, fragments: dict) -> str:
 def build(ws: str, data: dict, fragments: dict, layout: dict) -> str:
     narrative = data.get("narrative") if isinstance(data.get("narrative"), dict) else {}
     anchors = [
-        ("approvals", "Approvals"),
         ("why", "Why"),
         ("end", "End state"),
         ("plan", "Plan"),
@@ -179,12 +178,6 @@ def build(ws: str, data: dict, fragments: dict, layout: dict) -> str:
         if isinstance(title, str)
     )
     body = header
-    body += sec(
-        f"{prefix}-approvals",
-        "Approvals",
-        "Owner decisions",
-        f'<div data-plan-approvals data-ws="{esc(ws)}"></div>',
-    )
     body += jump
     body += sec(
         f"{prefix}-why",

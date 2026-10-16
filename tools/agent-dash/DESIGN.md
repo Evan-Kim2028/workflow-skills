@@ -9,9 +9,9 @@ The dashboard is read by a visual thinker. Every view answers its question with 
 - Header: title, live dot, Plan | Execution toggle, range control (6 h, 24 h, 3 d, Execution only), theme toggle.
 - Tabs: `Overall` on Execution and `Overview` on Plan, then one tab per workstream that has a plan in the plans map or a workstream bundle, in WS number order.
 - Colors, type, and shared controls (card, tab, pill, chip, legend, tooltip, section heading, details) come from `static/tokens.css`. Plan fragments keep their class names. `--accent`, `--fg2`, `--line`, `--ok`, `--warn`, `--crit`, `--surface`, and `--surface-2` are aliases of the reference palette.
-- Execution, top to bottom (Overall): a "Where we are" panel (each workstream's status, % done from its plan, live agents, Plan / Live / Copy start prompt), then a Needs you card (pending approvals, or a compact approved/pending line), stat tiles (one row), running-now table (full width; the alerts card was removed at the owner's request), workstream cards, tokens per hour beside live agents over time, run timeline, finished in the last hour.
+- Execution, top to bottom (Overall): a "Where we are" panel (each workstream's status, % done from its plan, live agents, Plan / Live / Copy start prompt), then or a compact approved/pending line), stat tiles (one row), running-now table (full width; the alerts card was removed at the owner's request), workstream cards, tokens per hour beside live agents over time, run timeline, finished in the last hour.
 - Workstream tab: the same views filtered to that workstream, plus the plan progress map directly under the tiles.
-- Plan view: each workstream opens with an Approvals section after the header and before Why. Rows are grouped Needs you, Approved, and Denied.
+- Plan view: no approvals section. Approvals stay a file the lead reads (`approvals.json`, `ws approvals`); the owner wants nothing on the page that "needs" them.
 - Run details open in the right-hand drawer; Escape closes it.
 
 ## Color (reference palette, validated; do not invent hues)

@@ -524,7 +524,7 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
       hit.addEventListener("mouseleave", hideTip); svg.appendChild(hit);
       
     });
-    xt = timeTicks(h0, Date.now() / 1000, function (t) { return L + (t - h0) / 3600 * slot; }, Math.max(2, Math.floor(pw / 90)));
+    xt = timeTicks(h0, Date.now() / 1000, function (t) { return L + Math.floor((t - h0) / 3600) * slot + slot / 2; }, Math.max(2, Math.floor(pw / 90)));
     var axg = axes(svg, {L: L, T: T, pw: pw, ph: ph, yMax: nice, xTicks: xt, yTitle: "tokens", xTitle: "hour"}); svg.insertBefore(axg, svg.firstChild); c.appendChild(svg);
     return c;
   }
@@ -935,8 +935,7 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
     var specs = [];
     if (state.ws === "all" && state.wss.length) specs.push(["program", keyOf([state.wss.map(function (w) { return [w.ws, w.running, w.name]; }), planSum, planPrompt]), function () { return programPanel(); }, ""]);
     specs.push(
-      ["needs", keyOf(state.approvals), function () { return needsCard(); }, state.ws === "all" ? "margin-top:14px" : ""],
-      ["tiles", keyOf([snap.counts, snap.totals, (snap.alerts || []).length]), function () { return tiles(snap); }, ""],
+      ["tiles", keyOf([snap.counts, snap.totals, (snap.alerts || []).length]), function () { return tiles(snap); }, state.ws === "all" ? "margin-top:14px" : ""],
       ["running", keyOf((snap.running || []).map(runRow)), function () { return runsTable("Running now", "Click a row for details. Output \u25B2 means the out file grew since the last poll.", snap.running || [], "Nothing running."); }, "margin-top:14px"]
     );
     if (state.ws === "all" && state.wss.length && !Object.keys(planSum).length) loadPlanSums().then(function () { delete secCache.program; drawMain(); });

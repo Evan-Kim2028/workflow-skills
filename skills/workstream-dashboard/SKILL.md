@@ -29,10 +29,9 @@ With no `config.local.json`, scratch roots and the hub tracker are empty. Those 
 
 ## What it shows
 
-- Overall tab: a Needs you card first (pending approvals, each linking to that workstream's Approvals section; when nothing is pending, a compact line such as "WS2: 5 approved, 0 pending"), then stat tiles (agents live now, finished today, tokens, cost, alerts), running-now table, alerts, workstream cards, tokens per hour (by model or workstream), live agents over time (one strip per tool), run timeline grouped by workstream, recently finished runs.
-- The same Needs you card sits at the top of each workstream tab.
+- Overall tab: a "Where we are" panel first (each workstream's status, % done from its plan, live agents, Plan / Live / Copy start prompt), then stat tiles (agents live now, finished today, tokens, cost, alerts), running-now table, tokens per hour (by model or workstream), live agents over time (one strip per tool), run timeline grouped by workstream, recently finished runs.
 - One tab per workstream that has a plan file or a workstream bundle. Same views filtered to it, plus the plan progress map: task groups in columns, chips by status, arrows for "waits on". A chip with a running agent pulses and carries a badge (tool color, count). A chip whose run finished in the last 15 minutes gets a green outline. Running runs that map to no task are listed above the map. The map opens that workstream's plan view in place.
-- Plan view: an Approvals section after the header and before Why. Rows group into Needs you (pending), Approved, and Denied. Each row shows the step, a reversible or one-way badge (one-way uses the critical status color and the word), and the conditions.
+- Plan view: no approvals section (owner decision). A left section rail with names jumps to any section.
 - Click any run (table row, timeline bar, live chip) for the details drawer.
 
 ## Rules
@@ -85,7 +84,7 @@ Claude project and session roots default to `~/.claude/projects` and `~/.claude/
 
 **Log progress.** Label every worker run `ws<N>-<task-id>-<slug>` so the map pins the agent to its task. Move a task with `python3 agent_dash.py ws task <ID> <task-id> <todo|pr|prog|done|deferred> [--moved-to WSn] [--note "..."]`. The write is a temp file plus replace. Do not hand-edit `plan.json` while a session is running. Status edits do not need `ws render`. The page reads `plan.json` live.
 
-**Record an approval.** The lead adds a pending item, the owner sets `approved` or `denied`, and the lead reads `ws approvals <ID>` before any production step. `python3 agent_dash.py ws approve <ID> <item-id> pending --step "..." --reversible yes|no --conditions "..."`. The plan view and the Needs you card read that file. See `SKILL-PLAN.md`.
+**Record an approval.** The lead adds a pending item, the owner sets `approved` or `denied`, and the lead reads `ws approvals <ID>` before any production step. `python3 agent_dash.py ws approve <ID> <item-id> pending --step "..." --reversible yes|no --conditions "..."`. Approvals are not shown on the dashboard (owner decision); they are a file the lead reads. See `SKILL-PLAN.md`.
 
 **Refresh a plan map from an HTML artifact.** When task state lives in a saved artifact page:
 

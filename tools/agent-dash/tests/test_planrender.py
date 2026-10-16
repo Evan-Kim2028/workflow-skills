@@ -72,8 +72,7 @@ class PlanRenderTest(unittest.TestCase):
         self.assertNotIn(">old thesis<", page)
         self.assertNotIn('class="figs"', page)
         self.assertIn('data-plan-progress', page)
-        self.assertIn('data-plan-approvals', page)
-        self.assertLess(page.index('id="ws9-approvals"'), page.index('id="ws9-why"'))
+        self.assertNotIn('data-plan-approvals', page)
         self.assertNotIn("wsp-figs", page)
         self.assertNotIn("<script", page)
         order = [page.index(f'id="ws9-{anchor}"') for anchor in ("why", "end", "plan", "progress", "decided", "agent", "ref")]

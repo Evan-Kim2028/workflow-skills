@@ -356,7 +356,6 @@
     if (!main || current !== id) return;
     if (hit.html) main.innerHTML = hit.html;
     else main.innerHTML = '<p class="sub">This bundle has no page yet.</p>';
-    renderApprovals(main, id, hit.approvals || {items: []});
     if (String(id).toUpperCase() === "OVERVIEW" && window.DashProgram) {
       var top = document.createElement("div"); top.className = "program-host"; top.style.margin = "4px 0 18px";
       main.insertBefore(top, main.firstChild); window.DashProgram.mount(top);
@@ -401,7 +400,6 @@
       if (window.DashCache) window.DashCache.snap[id] = parts[2];
       var main = document.getElementById("plan-body");
       if (!main) return;
-      renderApprovals(main, id, parts[0]);
       var host = main.querySelector("[data-plan-progress]");
       if (host && parts[1]) drawSummary(host, dagOf(parts[1], id), parts[2] || {running: [], recent: []}, id, parts[1] && parts[1].start_prompt);
       stampSectionIds(main);
