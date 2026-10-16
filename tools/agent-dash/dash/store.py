@@ -892,6 +892,23 @@ class Store:
             """
         )
         self._migrate_usage_splits()
+        self._migrate_uncached_input()
+
+    def _migrate_uncached_input(self) -> None:
+        """Once: muse and GLM logged input with cached tokens inside it; store uncached input like every other source, then rebuild the hourly buckets."""
+        self._conn.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)")
+        done = self._conn.execute("SELECT value FROM meta WHERE key='uncached_input_v1'").fetchone()
+        if done:
+            return
+        self._conn.execute(
+            """UPDATE usage_events SET input_tokens = MAX(COALESCE(input_tokens, 0) - COALESCE(cache_read, 0), 0)
+               WHERE tool IN ('muse', 'glm') AND input_tokens IS NOT NULL"""
+        )
+        hours = [row[0] for row in self._conn.execute("SELECT DISTINCT CAST(ts / 3600 AS INTEGER) * 3600 FROM usage_events WHERE tool IN ('muse', 'glm') AND ts IS NOT NULL")]
+        for hour in hours:
+            self._rebuild_hour(int(hour))
+        self._conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('uncached_input_v1', '1')")
+        self._conn.commit()
 
     def _migrate_usage_splits(self) -> None:
         cols = {row[1] for row in self._conn.execute("PRAGMA table_info(usage_events)")}

@@ -150,7 +150,7 @@ class CatalogTest(unittest.TestCase):
         self.assertEqual(flash["cache_read"], Decimal("0.03"))
         self.assertEqual(flash["output"], Decimal("0.5"))
         self.assertEqual(flash["cache_write_5m"], 0)
-        self.assertTrue(flash["input_includes_cache_read"])
+        self.assertFalse(flash["input_includes_cache_read"])
 
         grok = rows[GROK]
         self.assertEqual(grok["input"], 4)
@@ -167,7 +167,7 @@ class CatalogTest(unittest.TestCase):
 
         spark = rows["muse-spark-1.3-contributor"]
         self.assertEqual((float(spark["input"]), float(spark["output"]), float(spark["cache_read"])), (0.10, 0.20, 0.002))
-        self.assertTrue(spark["input_includes_cache_read"])
+        self.assertFalse(spark["input_includes_cache_read"])
         self.assertEqual(spark["confidence"], "published")
         self.assertEqual(rows["muse-wonder-1.0-contributor"]["confidence"], "inferred")
 
@@ -207,7 +207,7 @@ class CatalogTest(unittest.TestCase):
             cache_write_1h=7,
         )
         self.assertAlmostEqual(opus, (2 * 4 + 4 * 20 + 3 * 5 + 7 * 8) / 1_000_000)
-        flash = cost("glm-5.3-flash", 1000, 10, 400, 0)
+        flash = cost("glm-5.3-flash", 600, 10, 400, 0)
         self.assertAlmostEqual(
             flash,
             float((600 * Decimal("0.15") + 400 * Decimal("0.03") + 10 * Decimal("0.5")) / 1_000_000),

@@ -93,12 +93,13 @@
    "cache_write_1h": 0,
    "reasoning": null,
    "long_context": null,
-   "input_includes_cache_read": true,
+   "input_includes_cache_read": false,
    "billing_mode": "api",
    "price_scope": "API list; cached-input storage is limited-time free",
    "source_url": "https://docs.z.ai/guides/overview/pricing",
    "retrieved_at": "2026-10-16",
-   "confidence": "published"
+   "confidence": "published",
+   "input_note": "input is stored uncached at ingest (muse and Grok Build report cache inside input)"
   },
   {
    "provider": "z.ai",
@@ -110,12 +111,13 @@
    "cache_write_1h": 0,
    "reasoning": null,
    "long_context": null,
-   "input_includes_cache_read": true,
+   "input_includes_cache_read": false,
    "billing_mode": "api",
    "price_scope": "API list; cached-input storage is limited-time free",
    "source_url": "https://docs.z.ai/guides/overview/pricing",
    "retrieved_at": "2026-10-16",
-   "confidence": "published"
+   "confidence": "published",
+   "input_note": "input is stored uncached at ingest (muse and Grok Build report cache inside input)"
   },
   {
    "provider": "cursor",
@@ -229,12 +231,13 @@
    "cache_write_1h": null,
    "reasoning": null,
    "long_context": null,
-   "input_includes_cache_read": true,
+   "input_includes_cache_read": false,
    "billing_mode": "api",
    "price_scope": "Model API Contributor mode; Muse Code subscriptions default to Contributor mode. No long-context premium.",
    "source_url": "https://dev.meta.ai/docs/pricing-rate-limits",
    "retrieved_at": "2026-10-16",
-   "confidence": "published"
+   "confidence": "published",
+   "input_note": "input is stored uncached at ingest (muse and Grok Build report cache inside input)"
   },
   {
    "provider": "meta",
@@ -246,12 +249,13 @@
    "cache_write_1h": null,
    "reasoning": null,
    "long_context": null,
-   "input_includes_cache_read": true,
+   "input_includes_cache_read": false,
    "billing_mode": "api",
    "price_scope": "Model API Contributor mode. No long-context premium.",
    "source_url": "https://dev.meta.ai/docs/pricing-rate-limits",
    "retrieved_at": "2026-10-16",
-   "confidence": "published"
+   "confidence": "published",
+   "input_note": "input is stored uncached at ingest (muse and Grok Build report cache inside input)"
   },
   {
    "provider": "meta",
@@ -263,12 +267,13 @@
    "cache_write_1h": null,
    "reasoning": null,
    "long_context": null,
-   "input_includes_cache_read": true,
+   "input_includes_cache_read": false,
    "billing_mode": "api",
    "price_scope": "Model API Standard mode. No long-context premium.",
    "source_url": "https://dev.meta.ai/docs/pricing-rate-limits",
    "retrieved_at": "2026-10-16",
-   "confidence": "published"
+   "confidence": "published",
+   "input_note": "input is stored uncached at ingest (muse and Grok Build report cache inside input)"
   },
   {
    "provider": "meta",
@@ -280,12 +285,13 @@
    "cache_write_1h": null,
    "reasoning": null,
    "long_context": null,
-   "input_includes_cache_read": true,
+   "input_includes_cache_read": false,
    "billing_mode": "api",
    "price_scope": "Model API Standard mode.",
    "source_url": "https://dev.meta.ai/docs/pricing-rate-limits",
    "retrieved_at": "2026-10-16",
-   "confidence": "published"
+   "confidence": "published",
+   "input_note": "input is stored uncached at ingest (muse and Grok Build report cache inside input)"
   },
   {
    "provider": "meta",
@@ -297,12 +303,13 @@
    "cache_write_1h": null,
    "reasoning": null,
    "long_context": null,
-   "input_includes_cache_read": true,
+   "input_includes_cache_read": false,
    "billing_mode": "api",
    "price_scope": "Model API Standard mode (Wonder has no Contributor mode on Model API).",
    "source_url": "https://dev.meta.ai/docs/pricing-rate-limits",
    "retrieved_at": "2026-10-16",
-   "confidence": "published"
+   "confidence": "published",
+   "input_note": "input is stored uncached at ingest (muse and Grok Build report cache inside input)"
   },
   {
    "provider": "meta",
@@ -314,12 +321,13 @@
    "cache_write_1h": null,
    "reasoning": null,
    "long_context": null,
-   "input_includes_cache_read": true,
+   "input_includes_cache_read": false,
    "billing_mode": "subscription",
    "price_scope": "No published Contributor rate; Meta says Contributor mode is not available for Wonder on Model API. Priced at the Standard Wonder rate as an upper bound.",
    "source_url": "https://dev.meta.ai/docs/pricing-rate-limits",
    "retrieved_at": "2026-10-16",
-   "confidence": "inferred"
+   "confidence": "inferred",
+   "input_note": "input is stored uncached at ingest (muse and Grok Build report cache inside input)"
   }
  ]
 }

@@ -219,7 +219,7 @@ class MuseTests(unittest.TestCase):
             self.assertEqual(store.sessions[SID]["tool"], "muse")
             self.assertEqual(store.sessions[SID]["label"], "ws7-notes")
             total = summed(store, SID)
-            self.assertEqual(total["input"], 108)
+            self.assertEqual(total["input"], 91)
             self.assertEqual(total["cache_read"], 18)
             self.assertEqual(total["cache_write"], 5)
             self.assertEqual(total["reasoning"], 7)

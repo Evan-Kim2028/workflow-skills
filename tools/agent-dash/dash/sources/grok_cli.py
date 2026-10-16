@@ -180,7 +180,7 @@ def _usage_events(data):
                 "message_id": mid,
                 "ts": ts,
                 "model": model,
-                "input": _num(turn.get("inputTokens")),
+                "input": _uncached(_num(turn.get("inputTokens")), _num(turn.get("cachedReadTokens"))),
                 "output": _num(turn.get("outputTokens")),
                 "cache_read": _num(turn.get("cachedReadTokens")),
                 "cache_write": _num(turn.get("cacheCreationTokens")),
@@ -300,7 +300,7 @@ def _inference_event(obj):
         "session_id": sid,
         "message_id": "inference:%s:%s" % (ts_text, "" if loop is None else loop),
         "ts": _epoch_any(obj.get("ts")),
-        "input": _num(ctx.get("prompt_tokens")),
+        "input": _uncached(_num(ctx.get("prompt_tokens")), _num(ctx.get("cached_prompt_tokens"))),
         "output": _num(ctx.get("completion_tokens")),
         "cache_read": _num(ctx.get("cached_prompt_tokens")),
         "cache_write": _num(ctx.get("cache_creation_tokens")),
@@ -651,3 +651,10 @@ def _fail(where):
     global last_error
     last_error = where
     log.warning("%s failed", where)
+
+
+def _uncached(total, cached):
+    """The Grok Build CLI counts cached tokens inside its input; store the uncached part like every other source."""
+    if total is None:
+        return None
+    return max(total - (cached or 0), 0)

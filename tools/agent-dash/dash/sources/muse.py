@@ -294,7 +294,7 @@ def _parse_line(line, fallback_sid):
         "message_id": mid,
         "ts": _epoch_num(obj.get("recorded_at")),
         "model": model,
-        "input": _num(usage.get("input_tokens")),
+        "input": _uncached(_num(usage.get("input_tokens")), cached if cached >= cache_read else cache_read),
         "output": _num(usage.get("output_tokens")),
         "cache_read": cached if cached >= cache_read else cache_read,
         "cache_write": _num(usage.get("cache_write_tokens")),
@@ -890,3 +890,10 @@ def _fail(where):
     global last_error
     last_error = where
     log.warning("%s failed", where)
+
+
+def _uncached(total, cached):
+    """muse counts cached tokens inside input_tokens; store the uncached part like every other source."""
+    if total is None:
+        return None
+    return max(total - (cached or 0), 0)

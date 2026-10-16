@@ -178,7 +178,7 @@ class GrokCliTests(unittest.TestCase):
             self.assertEqual(store.sessions[SID]["tool"], "glm")
             self.assertEqual(store.usage, {})
 
-    def test_usage_json_stores_raw_input_and_cache(self):
+    def test_usage_json_stores_uncached_input(self):
         with tempfile.TemporaryDirectory() as tmp:
             doc = {
                 "updatedAt": "2026-10-16T12:27:11+00:00",
@@ -199,12 +199,12 @@ class GrokCliTests(unittest.TestCase):
             store = Store()
             self.poll(store, cfg, 1792154000)
             total = summed(store, SID)
-            self.assertEqual(total["input"], 100)
+            self.assertEqual(total["input"], 60)
             self.assertEqual(total["cache_read"], 40)
             self.assertEqual(total["output"], 7)
             self.assertEqual(total["cache_write"], 2)
             self.assertEqual(total["reasoning"], 3)
-            self.assertNotEqual(total["input"], 100 - 40)
+            self.assertEqual(total["input"], 100 - 40)
             self.assertNotEqual(total["input"], 200)
             row = next(iter(store.usage.values()))
             self.assertEqual(row["message_id"], "turn:1")
@@ -239,7 +239,7 @@ class GrokCliTests(unittest.TestCase):
             store = Store()
             self.poll(store, cfg, 1792154000)
             total = summed(store, SID)
-            self.assertEqual(total["input"], 35)
+            self.assertEqual(total["input"], 30)
             self.assertEqual(total["cache_read"], 5)
             self.assertEqual(total["output"], 7)
             self.assertEqual(total["cache_write"], 9)
@@ -247,7 +247,7 @@ class GrokCliTests(unittest.TestCase):
             ids = {row["message_id"] for row in store.usage.values()}
             self.assertEqual(ids, {"turn:1", "turn:2"})
 
-    def test_unified_fallback_keeps_prompt_and_cache_raw(self):
+    def test_unified_fallback_stores_uncached_input(self):
         with tempfile.TemporaryDirectory() as tmp:
             log = inference(SID, 0, 10, 4, 2, 1, "2026-10-16T12:00:00Z", pid=4242)
             log += inference(SID, 1, 30, 5, 3, 2, "2026-10-16T12:00:01Z", pid=4242)
@@ -258,11 +258,11 @@ class GrokCliTests(unittest.TestCase):
             store = Store()
             self.poll(store, cfg, 1792154000)
             total = summed(store, SID)
-            self.assertEqual(total["input"], 40)
+            self.assertEqual(total["input"], 31)
             self.assertEqual(total["cache_read"], 9)
             self.assertEqual(total["output"], 5)
             self.assertEqual(total["reasoning"], 3)
-            self.assertNotEqual(total["input"], 40 - 9)
+            self.assertEqual(total["input"], 40 - 9)
             self.assertEqual(store.runs["glm:%s:glm-review" % SID]["pid"], 4242)
             calls = store.usage_n
             self.poll(store, cfg, 1792154002)
@@ -270,7 +270,7 @@ class GrokCliTests(unittest.TestCase):
             with open(log_path, "ab") as fh:
                 fh.write(inference(SID, 2, 1, 0, 1, 0, "2026-10-16T12:00:02Z"))
             self.poll(store, cfg, 1792154004)
-            self.assertEqual(summed(store, SID)["input"], 41)
+            self.assertEqual(summed(store, SID)["input"], 32)
 
     def test_usage_json_present_first_ignores_the_log(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -281,7 +281,7 @@ class GrokCliTests(unittest.TestCase):
             )
             store = Store()
             self.poll(store, cfg, 1792154000)
-            self.assertEqual(summed(store, SID)["input"], 7)
+            self.assertEqual(summed(store, SID)["input"], 6)
             ids = {row["message_id"] for row in store.usage.values()}
             self.assertEqual(ids, {"turn:1"})
             self.assertNotIn("grok_cli:seen:" + SID, store.offsets)
@@ -295,12 +295,12 @@ class GrokCliTests(unittest.TestCase):
             )
             store = Store()
             self.poll(store, cfg, 1792154000)
-            self.assertEqual(summed(store, SID)["input"], 40)
+            self.assertEqual(summed(store, SID)["input"], 31)
             doc = {"session": {"inputTokens": 999}, "turns": [turn(1, 7, 1, 1, 0, 0)]}
             with open(usage_path, "w") as fh:
                 json.dump(doc, fh)
             self.poll(store, cfg, 1792154002)
-            self.assertEqual(summed(store, SID)["input"], 7)
+            self.assertEqual(summed(store, SID)["input"], 6)
             self.assertEqual(summed(store, SID)["cache_read"], 1)
             inference_rows = [
                 row for row in store.usage.values() if row["message_id"].startswith("inference:")
@@ -311,7 +311,7 @@ class GrokCliTests(unittest.TestCase):
             calls = store.usage_n
             self.poll(store, cfg, 1792154004)
             self.assertEqual(store.usage_n, calls)
-            self.assertEqual(summed(store, SID)["input"], 7)
+            self.assertEqual(summed(store, SID)["input"], 6)
 
     def test_missing_root(self):
         store = Store()

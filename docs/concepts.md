@@ -123,6 +123,8 @@ When a catalog row includes `long_context`, a prompt longer than its threshold u
 
 `python3 agent_dash.py reprice` prints a JSON summary of the recompute. It does not change the catalog.
 
+Every source stores **uncached** input. Claude and cursor-agent already report it that way. muse and the Grok Build CLI (GLM) count cached tokens inside their input, so agent-dash subtracts the cached part at ingest, and a one-time migration (`uncached_input_v1`) fixes older rows. Totals are input + output + cache read + cache write with no double counting, and the price catalog prices each part once.
+
 ## Live counts
 
 The live tile counts running agents.
