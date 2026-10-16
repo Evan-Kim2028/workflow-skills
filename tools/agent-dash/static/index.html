@@ -138,6 +138,8 @@ tr.clk{cursor:pointer}tr.clk:hover td{background:var(--surface-2)}
 .phase{border-left:3px solid var(--s1);padding:2px 0 2px 10px;font-size:12.5px}
 .phase b{display:block;font-size:13px}
 .phase small{color:var(--muted)}
+.phase{cursor:default}
+.phase small.gate{display:block;margin-top:4px;cursor:help}
 .foot{margin-top:22px;font-size:12px;color:var(--muted)}
 [hidden]{display:none !important}
 .view-toggle{display:inline-flex;border:1px solid var(--ring);border-radius:6px;overflow:hidden}
@@ -176,6 +178,18 @@ tr.clk{cursor:pointer}tr.clk:hover td{background:var(--surface-2)}
 .gtag{float:right;font:700 10px var(--mono);letter-spacing:.03em;padding:2px 6px;border-radius:999px;margin-left:6px}
 .gtag.now{background:var(--s1);color:#fff}
 .gtag.ready{border:1px dashed var(--ink-2);color:var(--ink-2)}
+.gtag.done{background:color-mix(in srgb,var(--good) 18%,transparent);color:var(--good-ink)}
+.gtag.merge{background:color-mix(in srgb,var(--warning) 28%,transparent);color:var(--ink)}
+.gtag.prod{background:color-mix(in srgb,var(--s5) 26%,transparent);color:var(--ink)}
+.gtag.wait{color:var(--muted);border:1px solid var(--grid)}
+.gtag{cursor:help}
+.dnode .m b{color:var(--ink);font-weight:700}
+.pbig-txt b{color:var(--ink)}
+.legend-tip{position:relative;font:600 12px var(--font);color:var(--ink-2);border:1px solid var(--grid);border-radius:999px;padding:3px 10px;cursor:help;outline:none}
+.legend-tip .pop{display:none;position:absolute;right:0;top:calc(100% + 6px);z-index:20;width:min(560px,86vw);background:var(--surface);border:1px solid var(--ring);border-radius:10px;padding:12px 14px;box-shadow:0 10px 30px -12px rgba(0,0,0,.35);font-weight:400;cursor:default}
+.legend-tip:hover .pop,.legend-tip:focus-within .pop{display:block}
+.legend-tip .pop b{display:block;margin-bottom:8px;color:var(--ink)}
+.legend-tip .pop p{margin:8px 0 0;font-size:12px;line-height:1.45;color:var(--ink-2)}
 @keyframes glow{50%{box-shadow:0 0 0 5px color-mix(in srgb,var(--s1) 14%,transparent),0 6px 22px -8px color-mix(in srgb,var(--s1) 70%,transparent)}}
 .dedges path.done{stroke:var(--good);opacity:.75}
 .dedges path.flow{stroke:var(--s1);opacity:.95;stroke-width:1.8;stroke-dasharray:6 6;animation:flow 1.2s linear infinite}
@@ -893,7 +907,10 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
     });
     function attText(a) { return a.runs + " run" + (a.runs > 1 ? "s" : "") + ": " + (a.runs - a.reviews) + " build, " + a.reviews + " review" + (a.reviews === 1 ? "" : "s") + (a.sentBack ? ", " + a.sentBack + " sent back (changes, partial or blocked)" : ""); }
     var nLive = Object.keys(live).reduce(function (a, k) { return a + live[k].length; }, 0);
-    var c = el("div", {class: "card", id: "exec-progress", "data-nav": "Plan progress"}, [el("div", {style: "display:flex;align-items:baseline;gap:10px;flex-wrap:wrap"}, [el("h2", {text: plan.ws + " plan progress" + (nLive ? " · " + nLive + " agent" + (nLive > 1 ? "s" : "") + " working" : "")}), (plan.start_prompt ? copyBtn(plan.start_prompt) : null), el("a", {class: "planbtn", href: planUrl(plan.ws), onclick: function (ev) { ev.preventDefault(); openPlan(plan.ws); }, text: "Open the " + plan.ws + " plan"})]), el("p", {class: "sub", text: "Every task by group, coloured by state (legend below). The badge on a working chip is the agent tool and count; \u21BBN is how many agent runs worked the task in this range (amber edge: sent back twice or more; hover for builds vs reviews). Arrows show what each group waits on; hover a group to light up its chain. Hover a task chip to see the tasks it waits on (amber) and the tasks it unblocks (blue), inside its tile and across tiles; the whole chain is outlined. Click a chip to pin it and draw every link in its chain. Chips in a tile run left to right in the order they can start."})]);
+    var c = el("div", {class: "card", id: "exec-progress", "data-nav": "Plan progress"}, [el("div", {style: "display:flex;align-items:baseline;gap:10px;flex-wrap:wrap"}, [el("h2", {text: plan.ws + " plan progress" + (nLive ? " · " + nLive + " agent" + (nLive > 1 ? "s" : "") + " working" : "")}), (plan.start_prompt ? copyBtn(plan.start_prompt) : null), el("a", {class: "planbtn", href: planUrl(plan.ws), onclick: function (ev) { ev.preventDefault(); openPlan(plan.ws); }, text: "Open the " + plan.ws + " plan"})]), el("p", {class: "sub", text: "Each tile is a stage of the plan, left to right. The pill says where it stands; hover a tile's progress line for the exact counts, or a chip for what it waits on and unblocks."})]);
+    var legendPop = el("div", {class: "pop"}, [el("b", {text: "What the chips mean"})]);
+    var legendBtn = el("span", {class: "legend-tip", tabindex: "0", "aria-label": "Legend"}, ["Legend \u24D8", legendPop]);
+    c.firstChild.appendChild(legendBtn);
     var workingIds = Object.keys(live);
     if (workingIds.length) {
       var wn = el("div", {class: "working-now"}, [el("b", {text: "\u25CF Working now (" + nLive + ")"})]);
@@ -924,7 +941,8 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
       var n = el("div", {class: "dnode " + (live && cnt.done === live ? "s-done" : (cnt.done + cnt.prog + cnt.pr ? "s-prog" : ""))});
       n.appendChild(el("h4", {text: g.title}));
       var gr = 0, gv = 0; g.tasks.forEach(function (t) { var a = att[t.id]; if (a) { gr += a.runs; gv += a.reviews; } });
-      n.appendChild(el("div", {class: "m", text: cnt.done + " done · " + (cnt.wip ? cnt.wip + " in progress · " : "") + cnt.pr + " waiting to merge · " + cnt.prog + " waiting on prod · " + cnt.todo + " not started" + (cnt.deferred ? " · " + cnt.deferred + " deferred" : "") + (gr ? " · " + fmtN(gr) + " runs, " + fmtN(gv) + " reviews" : "")}));
+      var left = live - cnt.done;
+      n.appendChild(el("div", {class: "m", title: cnt.done + " done, " + cnt.wip + " in progress, " + cnt.pr + " waiting to merge, " + cnt.prog + " merged and waiting on a prod step, " + cnt.todo + " not started" + (cnt.deferred ? ", " + cnt.deferred + " deferred" : "") + (gr ? "\n" + fmtN(gr) + " agent runs, " + fmtN(gv) + " of them reviews" : "")}, [el("b", {text: cnt.done + " of " + live}), " done" + (left ? " \u00B7 " + left + " to go" : "")]));
       var mini = el("div", {class: "mini"}); [["done", "var(--good)"], ["pr", "var(--warning)"], ["prog", "var(--s5)"]].forEach(function (p) { var sp = el("span"); sp.style.width = (live ? 100 * cnt[p[0]] / live : 0) + "%"; sp.style.background = p[1]; sp.style.display = "block"; mini.appendChild(sp); }); n.appendChild(mini);
       var gLive = 0;
       var ordered = hasTaskDeps ? g.tasks.map(function (t, i) { return [depthOf(t.id), i, t]; }).sort(function (a, b) { return a[0] - b[0] || a[1] - b[1]; }).map(function (x) { return x[2]; }) : g.tasks;
@@ -941,32 +959,47 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
         if (hasTaskDeps) { cp.addEventListener("mouseenter", function () { focusTask(t.id); }); cp.addEventListener("mouseleave", function () { if (pinned) focusTask(pinned); else { clearTask(); groupEnter(g.id); } }); }
         chipEl[t.id] = cp;
         ch.appendChild(cp); }); 
-      if (gLive) { n.insertBefore(el("div", {class: "live-n", text: "\u25CF " + gLive + " agent" + (gLive > 1 ? "s" : "") + " working"}), n.children[1]); n.classList.add("s-live"); }
+      if (gLive) { n.insertBefore(el("div", {class: "live-n", text: "\u25CF " + gLive + " agent" + (gLive > 1 ? "s" : "") + " working"}), n.children[2]); n.classList.add("s-live"); }
       n.appendChild(ch);
       cols[g.col].appendChild(n); nodes[g.id] = n; ["done", "wip", "prog", "pr", "todo", "deferred"].forEach(function (k) { tot[k] += cnt[k] || 0; });
-      gs[g.id] = {done: live > 0 && cnt.done === live, started: cnt.done + cnt.wip + cnt.prog + cnt.pr > 0, active: gLive > 0 || cnt.wip + cnt.prog + cnt.pr > 0, col: g.col};
+      gs[g.id] = {done: live > 0 && cnt.done === live, started: cnt.done + cnt.wip + cnt.prog + cnt.pr > 0, active: gLive > 0 || cnt.wip + cnt.prog + cnt.pr > 0, col: g.col, cnt: cnt, live: gLive, title: g.title};
       colStat[g.col] = colStat[g.col] || {done: 0, tot: 0, now: false}; colStat[g.col].done += cnt.done; colStat[g.col].tot += live;
     });
     var deps = {}; (plan.edges || []).forEach(function (e) { (deps[e[1]] = deps[e[1]] || []).push(e[0]); });
     plan.groups.forEach(function (g) {
       var st = gs[g.id], n = nodes[g.id]; if (!st || !n) return;
-      var tag = null;
-      if (st.done) { n.classList.add("g-done"); }
-      else if (st.active) { n.classList.add("g-now"); tag = "now"; colStat[g.col].now = true; }
-      else if (!st.started && (deps[g.id] || []).every(function (d) { return gs[d] && gs[d].done; })) { n.classList.add("g-ready"); tag = "ready next"; }
-      if (tag) n.insertBefore(el("span", {class: "gtag " + (tag === "now" ? "now" : "ready"), text: tag === "now" ? "\u25B6 now" : "ready next"}), n.firstChild);
+      var k = st.cnt, stage, cls, why;
+      var waitOn = (deps[g.id] || []).filter(function (d) { return !(gs[d] && gs[d].done); });
+      if (st.done) { n.classList.add("g-done"); stage = "\u2713 Done"; cls = "done"; why = "Every task is merged and live."; }
+      else if (st.active) {
+        n.classList.add("g-now"); colStat[g.col].now = true;
+        if (st.live || k.wip) { stage = "\u25B6 Building"; cls = "now"; why = "Agents are building tasks in this stage."; }
+        else if (k.pr) { stage = "Merging"; cls = "merge"; why = "Work is built and approved; it is waiting to merge."; }
+        else { stage = "Rolling out"; cls = "prod"; why = "Merged; waiting on a production step."; }
+      }
+      else if (!waitOn.length) { n.classList.add("g-ready"); stage = st.started ? "Partly done" : "Ready to start"; cls = "ready"; why = st.started ? "Some tasks are done and nothing is running now." : "Everything it waits on is done."; }
+      else { stage = "Waiting"; cls = "wait"; why = "Waits on " + waitOn.map(function (d) { return gs[d] ? gs[d].title : d; }).join(", ") + "."; }
+      n.insertBefore(el("span", {class: "gtag " + cls, title: why, text: stage}), n.firstChild);
     });
     cols.forEach(function (d, i) { var cs = colStat[i]; if (!cs) return; var mb = el("div", {class: "colbar", title: cs.done + " of " + cs.tot + " done in this phase"}); var f = el("i"); f.style.width = (cs.tot ? 100 * cs.done / cs.tot : 0) + "%"; mb.appendChild(f); d.insertBefore(mb, d.children[1]); if (cs.now) d.classList.add("c-now"); });
     var all = tot.done + tot.wip + tot.prog + tot.pr + tot.todo;
     var lg = el("div", {class: "plegend"});
     [["live", "agent working now"], ["wip", "in progress (branch, not merged)"], ["pr", "waiting to merge (approved or PR open)"], ["prog", "merged, waiting on a prod step"], ["done", "done"], ["just", "finished in the last 15 min"], ["todo", "not started"], ["deferred", "deferred or moved to another workstream"]].forEach(function (p) { var ch2 = el("span", {class: "chip " + (p[0] === "just" ? "done just" : p[0])}, [p[0] === "live" ? "\u25CF" : p[0] === "todo" ? "\u00B7" : "\u2009"]); lg.appendChild(el("span", {style: "display:inline-flex;align-items:center;gap:6px"}, [ch2, p[1]])); });
-    c.appendChild(lg);
+    legendPop.appendChild(lg);
+    legendPop.appendChild(el("p", {text: "The badge on a working chip is the model family and how many agents are on it. \u21BBN counts the agent runs on a task in this range (an amber edge means it was sent back twice or more). Arrows between tiles show which stage waits on which; hover a tile to light up its chain. Hover a chip to see the tasks it waits on (amber) and unblocks (blue); click to pin the whole chain. Chips in a tile run left to right in the order they can start."}));
     var pct = all ? Math.round(100 * tot.done / all) : 0;
     var ob = el("div", {class: "pbig"}), obBar = el("div", {class: "pbig-bar", role: "img", "aria-label": tot.done + " of " + all + " tasks done"});
     [["done", "var(--good)"], ["prog", "var(--s5)"], ["pr", "var(--warning)"]].forEach(function (p) { var sp = el("span"); sp.style.background = p[1]; var pw0 = ((window.__adPrevBar || {})[plan.ws] || {})[p[0]]; sp.style.width = (pw0 == null ? 0 : pw0) + "%"; sp.dataset.w = all ? (100 * tot[p[0]] / all) : 0; sp.dataset.k = p[0]; obBar.appendChild(sp); });
     var obPct = el("b", {class: "pbig-pct", text: "0%"});
     ob.appendChild(obPct); ob.appendChild(obBar);
-    ob.appendChild(el("div", {class: "pbig-txt", text: tot.done + " of " + all + " done \u00B7 " + (tot.wip ? tot.wip + " in progress \u00B7 " : "") + tot.prog + " waiting on prod \u00B7 " + tot.pr + " waiting to merge \u00B7 " + tot.todo + " not started" + (tot.deferred ? " \u00B7 " + tot.deferred + " deferred" : "")}));
+    var nowCols = Object.keys(colStat).map(Number).filter(function (i) { return colStat[i].now; }).sort(function (a, b) { return a - b; });
+    var openCols = Object.keys(colStat).map(Number).filter(function (i) { return colStat[i].done < colStat[i].tot; }).sort(function (a, b) { return a - b; });
+    var nP = plan.cols.length, phaseTxt;
+    if (!openCols.length) phaseTxt = "every phase done";
+    else if (nowCols.length === 1) phaseTxt = "now in " + plan.cols[nowCols[0]] + " (phase " + (nowCols[0] + 1) + " of " + nP + ")";
+    else if (nowCols.length > 1) phaseTxt = "active in " + nowCols.length + " of " + nP + " phases, " + plan.cols[nowCols[0]] + " to " + plan.cols[nowCols[nowCols.length - 1]];
+    else phaseTxt = "next up: " + plan.cols[openCols[0]] + " (phase " + (openCols[0] + 1) + " of " + nP + ")";
+    ob.appendChild(el("div", {class: "pbig-txt", title: tot.done + " done, " + tot.wip + " in progress, " + tot.pr + " waiting to merge, " + tot.prog + " merged and waiting on a prod step, " + tot.todo + " not started" + (tot.deferred ? ", " + tot.deferred + " deferred" : "")}, [el("b", {text: tot.done + " of " + all + " tasks done"}), " \u00B7 " + (all - tot.done) + " to go \u00B7 " + phaseTxt + (nLive ? " \u00B7 " + nLive + " agent" + (nLive > 1 ? "s" : "") + " working" : "")]));
     c.appendChild(ob);
     setTimeout(function () { var pb = (window.__adPrevBar = window.__adPrevBar || {})[plan.ws] = {}; [].forEach.call(obBar.children, function (sp) { sp.style.width = sp.dataset.w + "%"; pb[sp.dataset.k] = sp.dataset.w; }); countUp(obPct, (window.__adPrevPct || {})[plan.ws] || 0, pct); (window.__adPrevPct = window.__adPrevPct || {})[plan.ws] = pct; }, 40);
     c.appendChild(wrap);
@@ -1067,7 +1100,7 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
         tsvg.appendChild(s("path", {d: d, class: "tl " + k.cls + (k.near ? " near" : ""), "marker-end": "url(#tm-" + plan.ws + "-" + k.cls + ")"}));
       });
     }
-    if (plan.phases && plan.phases.length) { var ph = el("div", {class: "phases"}); plan.phases.forEach(function (p) { ph.appendChild(el("div", {class: "phase"}, [el("b", {text: p.name}), p.goal, el("br"), el("small", {text: "Gate: " + (p.gate || "")})])); }); c.appendChild(ph); }
+    if (plan.phases && plan.phases.length) { var ph = el("div", {class: "phases"}); plan.phases.forEach(function (p) { ph.appendChild(el("div", {class: "phase", title: p.gate ? "Done when: " + p.gate : ""}, [el("b", {text: p.name}), p.goal, p.gate ? el("small", {class: "gate", text: "Done when \u24D8"}) : null])); }); c.appendChild(ph); }
     return c;
   }
 
