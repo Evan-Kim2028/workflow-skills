@@ -1082,6 +1082,15 @@ class Store:
         )
 
     def _usage_by_run(self) -> dict:
+        """Folded billed usage per run, cached until the data sequence moves (any write bumps it). Returns a shallow copy, because the rollup reassigns entries."""
+        cached = getattr(self, "_usage_cache", None)
+        if cached is not None and cached[0] == self._data_seq:
+            return dict(cached[1])
+        out = self._usage_by_run_uncached()
+        self._usage_cache = (self._data_seq, out)
+        return dict(out)
+
+    def _usage_by_run_uncached(self) -> dict:
         rows = self._conn.execute(
             """SELECT run_id, model, input_tokens, output_tokens, cache_read, cache_write,
                       cache_write_5m, cache_write_1h, reasoning

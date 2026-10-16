@@ -868,6 +868,7 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
     });
     return c;
   }
+  setInterval(function () { if (state.view === "exec") drawMain(); }, 60000);
   var resizeT = null;
   window.addEventListener("resize", function () { clearTimeout(resizeT); resizeT = setTimeout(function () { if (state.view === "exec") drawMain(); else if (window.__adPlanDraw) window.__adPlanDraw(); }, 150); });
   /* Keyed sections: a section is rebuilt only when its data key changes, and unchanged nodes are never moved, so animations and hover state survive live updates. */
@@ -889,9 +890,9 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
       specs.push(["ws", keyOf([state.wss.map(function (w) { return [w.ws, w.running, w.tokens, w.cost_usd]; }), planSum]), function () { var d = el("div"); d.appendChild(el("h2", {id: "exec-workstreams", "data-nav": "Workstreams", style: "font-size:14px;margin:20px 0 8px", text: "Workstreams"})); d.appendChild(wsCards()); return d; }, ""]);
     }
     if (state.plan) specs.push(["plan", keyOf([state.plan, (snap.running || []).map(function (r) { return [r.label, r.workstream, r.run_id]; }), (snap.recent || []).map(function (r) { return [r.label, r.ended_at, r.verdict]; }), (state.runs || []).length]), function () { return planCard(state.plan, snap); }, "margin-top:14px"]);
-    specs.push(["tokens", keyOf([state.usage, state.groupBy]), function () { return tokenChart(); }, "margin-top:14px"]);
-    specs.push(["conc", keyOf([state.conc, Math.floor(Date.now() / 60000)]), function () { return concChart(snap); }, "margin-top:14px"]);
-    specs.push(["gantt", keyOf([(state.runs || []).map(runRow), expanded, Math.floor(Date.now() / 60000)]), function () { return gantt(); }, "margin-top:14px"]);
+    specs.push(["tokens", keyOf([state.usage, state.groupBy, state.hours, Math.floor(Date.now() / 60000)]), function () { return tokenChart(); }, "margin-top:14px"]);
+    specs.push(["conc", keyOf([state.conc, state.hours, Math.floor(Date.now() / 60000)]), function () { return concChart(snap); }, "margin-top:14px"]);
+    specs.push(["gantt", keyOf([(state.runs || []).map(runRow), expanded, state.hours, Math.floor(Date.now() / 60000)]), function () { return gantt(); }, "margin-top:14px"]);
     specs.push(["finished", keyOf((snap.recent || []).map(runRow)), function () { return runsTable("Finished in the last hour", "Newest first.", snap.recent || [], "Nothing finished in the last hour."); }, "margin-top:14px"]);
     var want = [];
     specs.forEach(function (sp) {
@@ -917,6 +918,31 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
     var wsP = api("/api/workstreams").then(function (j) { state.wss = j.workstreams || []; }).catch(function () {});
     return Promise.all([bundlesP, wsP]).then(function () { renderTabs(); });
   }
+  /* Warm every other tab's Execution data in the background, one tab at a time, so a first switch draws from cache instantly. */
+  var warming = false;
+  function warmTabs() {
+    if (warming || FIX) return;
+    var list = ["all"].concat(shown(state.wss).map(function (w) { return w.ws; })).filter(function (ws) { return ws !== state.ws; });
+    if (!list.length) return;
+    warming = true;
+    var step = function (i) {
+      if (i >= list.length) { warming = false; return; }
+      var ws = list[i], wsArg = ws === "all" ? {} : {ws: ws}, group = ws === "all" ? state.groupBy : "model";
+      Promise.all([
+        api("/api/snapshot", {ws: ws}).catch(function () { return null; }),
+        api("/api/runs", Object.assign({since: since(), limit: 400}, wsArg)).then(function (j) { return j.runs || []; }).catch(function () { return []; }),
+        api("/api/usage", Object.assign({group: group, bucket: "hour", since: since()}, wsArg)).then(function (j) { return j.buckets || []; }).catch(function () { return []; }),
+        api("/api/concurrency", Object.assign({since: since(), step: 60}, wsArg)).then(function (j) { return j.points || []; }).catch(function () { return []; }),
+        ws !== "all" ? api("/api/plan", {ws: ws}).then(function (j) { return j && j.groups ? j : null; }).catch(function () { return null; }) : Promise.resolve(null),
+        api("/api/approvals", {ws: ws === "all" ? "all" : ws}).then(approvalList).catch(function () { return []; })
+      ]).then(function (p) {
+        if (p[0] && ws !== state.ws) execCache[ws] = {snap: p[0], runs: p[1], usage: p[2], conc: p[3], plan: p[4], seq: p[0].seq, approvals: p[5]};
+      }).then(function () { setTimeout(function () { step(i + 1); }, 150); });
+    };
+    step(0);
+  }
+  setTimeout(warmTabs, 1500);
+  setInterval(warmTabs, 45000);
   function refreshAll() {
     var ws = state.ws;
     var gen = ++execGen;

@@ -252,3 +252,39 @@
 @media (prefers-reduced-motion: reduce) {
   .sidenav { transition: none; }
 }
+
+/* Section rail: always visible and compact (one dot per section, current in blue); expands with labels on hover or when opened. */
+body { padding-left: 46px; }
+.sidenav-hot { display: none; }
+.sidenav {
+  transform: none;
+  pointer-events: auto;
+  width: 46px;
+  overflow: hidden;
+  transition: width .2s cubic-bezier(.2, .8, .2, 1), box-shadow .2s ease;
+}
+.sidenav:hover, .sidenav.is-open, .sidenav:focus-within {
+  width: min(260px, calc(100vw - 24px));
+  box-shadow: 8px 0 28px rgba(0, 0, 0, .18);
+}
+.sidenav .sidenav-list { padding: 56px 6px 10px; }
+.sidenav a { position: relative; padding-left: 26px; transition: color .15s ease, background-color .15s ease; }
+.sidenav a::before {
+  content: "";
+  position: absolute;
+  left: 11px;
+  top: 50%;
+  width: 8px;
+  height: 8px;
+  margin-top: -4px;
+  border-radius: 50%;
+  background: var(--grid);
+  transition: background-color .2s ease, transform .2s ease;
+}
+.sidenav a.is-sub::before { width: 5px; height: 5px; margin-top: -2.5px; left: 12.5px; }
+.sidenav a[aria-current="location"]::before { background: var(--s1); transform: scale(1.35); box-shadow: 0 0 0 3px color-mix(in srgb, var(--s1) 25%, transparent); }
+.sidenav:not(:hover):not(.is-open):not(:focus-within) a { color: transparent; background: none; box-shadow: none; }
+.sidenav:not(:hover):not(.is-open):not(:focus-within) .sidenav-foot,
+.sidenav:not(:hover):not(.is-open):not(:focus-within) .sidenav-kicker { opacity: 0; pointer-events: none; }
+.sidenav-foot, .sidenav-kicker { transition: opacity .15s ease; }
+@media (max-width: 700px) { body { padding-left: 0; } .sidenav:not(:hover):not(.is-open) { width: 0; } }
