@@ -39,6 +39,8 @@ button,select{font:inherit;color:var(--ink);background:var(--surface);border:1px
 .tile .x{font:12px var(--mono);color:var(--muted);margin-top:4px}
 .legend{display:flex;flex-wrap:wrap;gap:4px 14px;font-size:12px;color:var(--ink-2);margin:0 0 8px}
 .legend span{display:inline-flex;align-items:center;gap:6px}
+.legend .ltotal{color:var(--ink);padding-right:10px;border-right:1px solid var(--grid);font-variant-numeric:tabular-nums}
+.legend .ltotal b{font-weight:700}
 .mlegend{gap:6px 18px}
 .mlegend .mfam{display:inline-flex;align-items:center;gap:4px 10px;flex-wrap:wrap;padding:2px 8px 2px 0;border-right:1px solid var(--grid)}
 .mlegend .mfam:last-child{border-right:0}
@@ -347,7 +349,7 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
     return lg;
   }
   function colorOf(key, kind) {
-    if (kind === "workstream") { if (!key || key === "null") return "var(--other)"; if (!wsColor[key]) wsColor[key] = WSCOL[Object.keys(wsColor).length % WSCOL.length]; return "var(" + wsColor[key] + ")"; }
+    if (kind === "workstream") { if (!key || key === "null" || key === "unattributed") return "var(--other)"; if (!wsColor[key]) wsColor[key] = WSCOL[Object.keys(wsColor).length % WSCOL.length]; return "var(" + wsColor[key] + ")"; }
     return ADM.colorOf(key);
   }
   /* axes() and the compact formatters live in format.js and are shared with the plan view. */
@@ -602,7 +604,11 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
     var ks = byModel ? ADM.sortKeys(Object.keys(keys)) : Object.keys(keys).sort();
     var ts = Object.keys(hours).map(Number).sort(function (a, b) { return a - b; });
     var max = 0; ts.forEach(function (t) { var sum = 0; ks.forEach(function (k) { sum += hours[t][k] || 0; }); max = Math.max(max, sum); });
-    var lg; if (byModel) lg = modelLegend(ks); else { lg = el("div", {class: "legend"}); ks.forEach(function (k) { var sp = el("span"); var sw = el("i", {class: "sw"}); sw.style.background = colorOf(k, state.groupBy); sp.appendChild(sw); sp.appendChild(document.createTextNode(k)); lg.appendChild(sp); }); } c.appendChild(lg);
+    var keyTot = {}, grand = 0; ts.forEach(function (t) { ks.forEach(function (k) { var v = hours[t][k] || 0; keyTot[k] = (keyTot[k] || 0) + v; grand += v; }); });
+    var keyLbl = {}; ks.forEach(function (k) { keyLbl[k] = fmtN(keyTot[k]); });
+    var lg; if (byModel) lg = modelLegend(ks, keyLbl); else { lg = el("div", {class: "legend"}); ks.forEach(function (k) { var sp = el("span"); var sw = el("i", {class: "sw"}); sw.style.background = colorOf(k, state.groupBy); sp.appendChild(sw); sp.appendChild(document.createTextNode(k + " " + keyLbl[k])); lg.appendChild(sp); }); }
+    lg.insertBefore(el("span", {class: "ltotal", title: "All tokens in this window, input + output + cache read + cache write. The legend values add up to it."}, [el("b", {text: "Total " + fmtN(grand)}), document.createTextNode(" · " + fmtN(ts.length ? grand / ts.length : 0) + "/h avg · peak " + fmtN(max) + "/h")]), lg.firstChild);
+    c.appendChild(lg);
     var W = CW(), H = 270, L = 64, R = 14, T = 28, Bm = 42, pw = W - L - R, ph = H - T - Bm, h0 = Math.floor(since() / 3600) * 3600, nH = Math.max(1, Math.ceil((Date.now() / 1000 - h0) / 3600)), slot = pw / nH, bw = Math.max(3, Math.min(28, slot - 4));
     var svg = s("svg", {viewBox: "0 0 " + W + " " + H, width: W, height: H, style: "display:block;max-width:100%", role: "img", "aria-label": "Tokens per hour stacked by " + state.groupBy});
     var nice = niceMax(max), xt = [];
@@ -610,7 +616,7 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
       var x = L + Math.max(0, Math.floor((t - h0) / 3600)) * slot + (slot - bw) / 2, y0 = T + ph;
       ks.forEach(function (k, ki) { var v = hours[t][k] || 0; if (!v) return; var h = ph * v / nice; var top = y0 - h; var r = s("rect", {x: x, y: top + (ki ? 1 : 0), width: bw, height: Math.max(0, h - (ki ? 1 : 0)), rx: 2, fill: colorOf(k, state.groupBy)}); svg.appendChild(r); y0 = top; });
       var hit = s("rect", {x: x - 1, y: T, width: bw + 2, height: ph, fill: "transparent"});
-      hit.addEventListener("mousemove", function (ev) { showTip(ev, new Date(t * 1000).toLocaleString([], {month: "short", day: "numeric", hour: "2-digit", minute: "2-digit"}), ks.filter(function (k) { return hours[t][k]; }).map(function (k) { return {k: byModel ? fullName(k) : k, v: fmtN(hours[t][k]), c: colorOf(k, state.groupBy)}; })); });
+      hit.addEventListener("mousemove", function (ev) { var hourTot = 0; ks.forEach(function (k) { hourTot += hours[t][k] || 0; }); showTip(ev, new Date(t * 1000).toLocaleString([], {month: "short", day: "numeric", hour: "2-digit", minute: "2-digit"}), [{k: "Total", v: fmtN(hourTot), c: "var(--ink)"}].concat(ks.filter(function (k) { return hours[t][k]; }).map(function (k) { return {k: byModel ? fullName(k) : k, v: fmtN(hours[t][k]), c: colorOf(k, state.groupBy)}; }))); });
       hit.addEventListener("mouseleave", hideTip); svg.appendChild(hit);
       
     });
