@@ -24,11 +24,16 @@ class ModelKeyTest(unittest.TestCase):
             "claude-opus-5-5": ("claude", "opus"),
             "claude-haiku-5-5": ("claude", "haiku"),
             "<synthetic>": ("other", "other"),
+            "dagster:catalog_load_job": ("dagster", "dagster:catalog_load_job"),
         }
         for model, want in cases.items():
             self.assertEqual(model_key(model), want, model)
 
     def test_unrecorded_model_uses_the_tier(self):
+        self.assertEqual(
+            model_key("identity_tcgjp_refresh_job", "LIGHT dagster"),
+            ("dagster", "dagster:identity_tcgjp_refresh_job"),
+        )
         self.assertEqual(run_model_key({"model": None, "tier": "grok", "source": "grok"}), "cursor-unknown")
         self.assertEqual(run_model_key({"model": "", "tier": "muse"}), "muse-unknown")
         self.assertEqual(run_model_key({"model": None, "tier": "haiku"}), "haiku")

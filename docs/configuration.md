@@ -25,10 +25,15 @@ Roots, the optional hub, and the state directory. `config.local.json` deep-merge
 | `issues_dir` | empty |
 | `workstreams_tsv` | empty |
 | `state_dir` | `$HOME/.local/share/agent-dash` |
+| `dagster.ssh_host` | empty |
+| `dagster.graphql_url` | `http://127.0.0.1:3000/graphql` |
+| `dagster.enabled` | `true` |
 
 `$HOME` and `~` expand when the file is loaded. A scratch glob that matches no directory becomes an empty list, so those collectors poll nothing. A missing Claude, muse, Grok, or Cursor directory is skipped. An empty `hub_dir` skips the hub collector. A `hub_dir` that points at a missing directory logs a warning and stays healthy.
 
 The hub collector, when configured, expects `issues/*.md` with frontmatter fields `workstream` and `status`, plus `workstreams.tsv`. The TSV header is skipped. Each later row is a workstream code and a name, separated by a tab. Status values it counts are `backlog`, `todo`, `doing`, `review`, `done`, and `cancelled`. `issues_dir` and `workstreams_tsv` override those two paths inside the hub directory.
+
+The Dagster collector is off until `dagster.ssh_host` is set. Each minute it runs one `ssh <host> curl` against `graphql_url` on that host and reads queued, running and recently finished runs (the last 2 h). It keeps the job name, status, times and four allowlisted tags (partition, ops wave, slot class, claim size), and drops every other tag. Dagster jobs show on the timeline and in the running table as prod jobs. They never count as agents and carry no tokens or cost. A failed call shows as that source's `last_error` and leaves stored rows alone.
 
 Code defaults that the example file can override, if you put them in `config.local.json`:
 

@@ -11,5 +11,10 @@
   "hub_dir": "",
   "issues_dir": "",
   "workstreams_tsv": "",
-  "state_dir": "$HOME/.local/share/agent-dash"
+  "state_dir": "$HOME/.local/share/agent-dash",
+  "dagster": {
+    "ssh_host": "",
+    "graphql_url": "http://127.0.0.1:3000/graphql",
+    "enabled": true
+  }
 }

@@ -1,8 +1,9 @@
 """Model families and model keys.
 
 The same rules live in ``static/models.js``. A run maps to a family (claude,
-cursor, muse, glm) and a model key such as ``grok-4.7`` or ``composer-2.5``.
-A run whose model id was never recorded gets ``<family>-unknown``.
+cursor, muse, glm, dagster) and a model key such as ``grok-4.7`` or
+``composer-2.5``. A run whose model id was never recorded gets
+``<family>-unknown``. A Dagster job keeps the job name after ``dagster:``.
 """
 
 from __future__ import annotations
@@ -21,6 +22,9 @@ def model_key(model: str | None, hint: str | None = None) -> tuple[str, str]:
     """Return ``(family, model_key)`` for a model id, using ``hint`` (tier or source) when the id is empty."""
     m = (model or "").lower()
     h = (hint or "").lower()
+    if "dagster" in h or m.startswith("dagster:"):
+        job = m[len("dagster:") :] if m.startswith("dagster:") else m
+        return "dagster", "dagster:" + (job or "job")
     if "composer" in m:
         return "cursor", "composer" + _ver(r"composer[-_ ]?(\d+(?:\.\d+)?)", m)
     if "grok" in m:

@@ -71,7 +71,7 @@ tr.clk{cursor:pointer}tr.clk:hover td{background:var(--surface-2)}
 .st{display:inline-flex;align-items:center;gap:5px;font-size:12px;white-space:nowrap}
 .st i{width:8px;height:8px;border-radius:50%}
 .st.running i{background:var(--s1);animation:pulse 1.4s infinite}
-.st.done i{background:var(--good)}.st.killed i,.st.died_early i{background:var(--critical)}.st.unknown i{background:var(--muted)}
+.st.done i{background:var(--good)}.st.killed i,.st.died_early i{background:var(--critical)}.st.queued i{background:var(--warning)}.st.finished i,.st.unknown i{background:var(--muted)}
 @keyframes pulse{50%{opacity:.35}}
 @media (prefers-reduced-motion:reduce){.st.running i{animation:none}}
 .vd{font:600 11px var(--mono);padding:2px 6px;border-radius:4px;background:var(--surface-2);color:var(--ink-2)}
@@ -539,11 +539,12 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
     var g = el("div", {class: "grid g-tiles", id: "exec-tiles", "data-nav": "Summary"});
     var cn = snap.counts || {}, lbt = cn.live_by_tool || {}, fv = cn.finished_by_verdict || {};
     var lbm = cn.live_by_model || {}, byFam = {};
-    if (!Object.keys(lbm).length) run.forEach(function (r) { var k = tierKey(r); lbm[k] = (lbm[k] || 0) + 1; });
+    if (!Object.keys(lbm).length) run.forEach(function (r) { if (!isAgent(r)) return; var k = tierKey(r); lbm[k] = (lbm[k] || 0) + 1; });
     ADM.sortKeys(Object.keys(lbm).filter(function (k) { return lbm[k]; })).forEach(function (k) { var f = ADM.famOf(k); (byFam[f] = byFam[f] || []).push(k); });
     var liveSub = ADM.FAMS.filter(function (f) { return byFam[f]; }).map(function (f) { var ks = byFam[f], n = ks.reduce(function (a, k) { return a + lbm[k]; }, 0); return ADM.FAM[f].name + " " + fmtN(n) + " (" + ks.map(function (k) { return ADM.nameOf(k) + " " + fmtN(lbm[k]); }).join(", ") + ")"; }).join(" \u00B7 ") || "idle";
+    if (cn.prod_jobs) { var jobTxt = fmtN(cn.prod_jobs) + " prod jobs"; liveSub = liveSub === "idle" ? jobTxt : liveSub + " \u00B7 " + jobTxt; }
     var bad = (fv.BLOCKED || 0) + (fv.REQUEST_CHANGES || 0), part = (fv.PARTIAL || 0) + (fv.APPROVE_WITH_CHANGES || 0);
-    [["Agents live now", fmtN(cn.live_agents != null ? cn.live_agents : run.length), liveSub],
+    [["Agents live now", fmtN(cn.live_agents != null ? cn.live_agents : run.filter(isAgent).length), liveSub],
      ["Agents finished today", fmtN(cn.finished_today || 0), "\u2713 " + fmtN((fv.PASS || 0) + (fv.APPROVE || 0) + (fv.APPROVE_WITH_NITS || 0)) + " pass \u00B7 \u25D0 " + fmtN(part) + " partial \u00B7 \u2715 " + fmtN(bad) + " blocked (" + state.hours + " h)"],
      ["Tokens (" + state.hours + " h)", fmtN(allTok), cachedPct(tk) + "% cached \u00B7 out " + fmtN(tk.output)],
      ["Est. cost (" + state.hours + " h)", anyCost ? fmtUsd(cost) : "\u2013", unpTxt],
@@ -702,8 +703,8 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
   /* timeline: one activity strip per workstream, expandable into packed lanes */
   var expanded = {};
   /* A run with no end time is drawn to now only while it is running; an ended run whose end was never seen gets a one-minute stub. */
-  /* Interactive lead sessions (claude-main) and shell rows show as bars but are not counted as agents, the same rule as the live counts. */
-  function isAgent(r) { return r.source !== "claude-main" && r.source !== "shell"; }
+  /* Lead sessions, shell rows, and Dagster jobs show as bars but are not counted as agents. */
+  function isAgent(r) { return r.source !== "claude-main" && r.source !== "shell" && r.source !== "dagster"; }
   function runEnd(r, now) { return r.ended_at || (r.status === "running" ? now : (r.started_at || now) + 60); }
   function packRows(runs, gapS) {
     var rows = [];
@@ -716,9 +717,9 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
   }
   function outcomeOf(r) {
     if (!r.ended_at) return r.status === "running" ? "run" : "unk";
-    if (r.status === "died_early" || r.status === "killed" || r.verdict === "BLOCKED" || r.verdict === "REQUEST_CHANGES") return "bad";
+    if (r.status === "died_early" || r.status === "killed" || r.verdict === "BLOCKED" || r.verdict === "REQUEST_CHANGES" || r.verdict === "FAILURE" || r.verdict === "CANCELED") return "bad";
     if (r.verdict === "PARTIAL" || r.verdict === "APPROVE_WITH_CHANGES") return "part";
-    if (r.status === "done") return "ok";
+    if (r.status === "done" || r.verdict === "SUCCESS") return "ok";
     return "unk";
   }
   var OUTCOME = {run: ["var(--s1)", "\u25CF", "running"], ok: ["var(--good)", "\u2713", "finished"], part: ["var(--warning)", "\u25D0", "partial"], bad: ["var(--critical)", "\u2715", "died or blocked"], unk: ["var(--muted)", "?", "ended, outcome unknown"]};
@@ -900,10 +901,11 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
   /* plan DAG for a workstream */
   function planCard(plan, snap) {
     var live = {}, just = {}, unassigned = [], now = Date.now() / 1000;
-    ((snap && snap.running) || []).forEach(function (r) { if (r.workstream && r.workstream !== plan.ws) return; var t = taskOf(r, plan.ws); if (t) (live[t] = live[t] || []).push(r); else if (r.workstream === plan.ws) unassigned.push(r); });
-    ((snap && snap.recent) || []).forEach(function (r) { if (r.ended_at && now - r.ended_at < 900) { var t = taskOf(r, plan.ws); if (t) just[t] = r; } });
+    ((snap && snap.running) || []).forEach(function (r) { if (r.workstream && r.workstream !== plan.ws) return; if (r.source === "dagster") { if (r.workstream === plan.ws) unassigned.push(r); return; } var t = taskOf(r, plan.ws); if (t) (live[t] = live[t] || []).push(r); else if (r.workstream === plan.ws) unassigned.push(r); });
+    ((snap && snap.recent) || []).forEach(function (r) { if (r.source === "dagster") return; if (r.ended_at && now - r.ended_at < 900) { var t = taskOf(r, plan.ws); if (t) just[t] = r; } });
     var att = {}, seenRun = {};
     (state.runs || []).concat((snap && snap.running) || [], (snap && snap.recent) || []).forEach(function (r) {
+      if (r.source === "dagster") return;
       var id = r.run_id || r.label; if (!id || seenRun[id]) return; seenRun[id] = 1;
       if (r.workstream && r.workstream !== plan.ws) return; var t = taskOf(r, plan.ws); if (!t) return;
       var a = att[t] = att[t] || {runs: 0, reviews: 0, sentBack: 0}; a.runs++;

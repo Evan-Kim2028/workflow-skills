@@ -44,7 +44,7 @@ class Registry:
                 state["last_error"] = _short(exc)
                 log.warning("source %s: %s", source.NAME, state["last_error"])
             else:
-                state["last_error"] = None
+                state["last_error"] = _surfaced(source)
             state["last_poll"] = now
 
     def health(self, now: float) -> dict:
@@ -103,3 +103,17 @@ class _Broken:
 def _short(exc: Exception) -> str:
     text = f"{type(exc).__name__}: {exc}"
     return text[:200]
+
+
+def _surfaced(source) -> str | None:
+    """A source may record a whole-poll failure without raising.
+
+    Partial failures in other sources stay on their own ``last_error`` and
+    do not mark the source unhealthy. ``SURFACE_ERROR`` opts in.
+    """
+    if not getattr(source, "SURFACE_ERROR", False):
+        return None
+    value = getattr(source, "last_error", None)
+    if isinstance(value, str) and value.strip():
+        return value.strip()[:200]
+    return None

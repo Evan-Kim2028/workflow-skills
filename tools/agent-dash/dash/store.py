@@ -1304,6 +1304,8 @@ def _long_cap(tier: str | None, table: dict):
 
 def _tool_key(run: dict) -> str | None:
     source = run.get("source") or ""
+    if source == "dagster":
+        return None
     tier = (run.get("tier") or "").lower()
     if source == "grok" or tier == "grok":
         return "grok"
@@ -1319,7 +1321,7 @@ def _tool_key(run: dict) -> str | None:
 def _is_counted_agent(run: dict) -> bool:
     """Interactive Claude sessions and shell launch rows are not agents."""
     source = run.get("source") or ""
-    if source in ("claude-main", "shell", ""):
+    if source in ("claude-main", "shell", "dagster", ""):
         return False
     return _tool_key(run) in TOOL_KEYS
 
@@ -1489,11 +1491,16 @@ def _agent_counts(runs: list, parents: dict, now: float, since, until) -> dict:
     live_by_model: dict = {}
     seen = set()
     live_n = 0
+    prod_jobs = 0
     finished_today = 0
     finished_range = 0
     by_verdict = {}
     for run in runs:
-        if run["run_id"] in parents or not _is_counted_agent(run):
+        if run["run_id"] in parents:
+            continue
+        if run.get("source") == "dagster" and run.get("status") in ("running", "queued"):
+            prod_jobs += 1
+        if not _is_counted_agent(run):
             continue
         if run.get("status") == "running":
             tool = _tool_key(run)
@@ -1519,6 +1526,7 @@ def _agent_counts(runs: list, parents: dict, now: float, since, until) -> dict:
         "live_agents": live_n,
         "live_by_tool": live_by,
         "live_by_model": live_by_model,
+        "prod_jobs": prod_jobs,
         "finished_today": finished_today,
         "finished_in_range": finished_range,
         "finished_by_verdict": by_verdict,
@@ -1603,6 +1611,8 @@ def _totals(runs: list) -> dict:
     any_cost = False
     unpriced = 0
     for run in runs:
+        if run.get("source") == "dagster":
+            continue
         for key in BILLED_FIELDS:
             tokens[key] += (run.get("tokens") or {}).get(key) or 0
         if run.get("cost_usd") is None:
