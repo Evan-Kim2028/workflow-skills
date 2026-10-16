@@ -293,6 +293,28 @@
     }).catch(function () { return {running: [], recent: []}; });
   }
 
+  function sectionSlug(text) {
+    var slug = String(text || "part").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 40).replace(/-+$/g, "");
+    return slug || "part";
+  }
+
+  function stampSectionIds(root) {
+    if (!root || !root.querySelectorAll) return;
+    root.querySelectorAll("section[id] h3").forEach(function (h3) {
+      if (h3.id) return;
+      var section = h3.closest ? h3.closest("section") : null;
+      var base = section && section.id ? section.id : "plan";
+      var slug = sectionSlug(h3.textContent);
+      var id = base + "-" + slug;
+      var n = 2;
+      while (document.getElementById(id)) {
+        id = base + "-" + slug + "-" + n;
+        n += 1;
+      }
+      h3.id = id;
+    });
+  }
+
   function renderApprovals(root, ws, data) {
     var host = root.querySelector("[data-plan-approvals]");
     if (!host) {
@@ -315,7 +337,7 @@
     [["pending", "Needs you"], ["approved", "Approved"], ["denied", "Denied"]].forEach(function (pair) {
       var rows = items.filter(function (item) { return item.status === pair[0]; });
       var group = el("div", {class: "ap-group"});
-      group.appendChild(el("h3", {text: pair[1]}));
+      group.appendChild(el("h3", {id: String(ws).toLowerCase() + "-approvals-" + pair[0], text: pair[1]}));
       if (!rows.length) group.appendChild(el("p", {class: "sub", text: "None."}));
       rows.forEach(function (item) {
         var way = item.reversible ? "reversible" : "one-way";
@@ -335,11 +357,13 @@
     if (hit.html) main.innerHTML = hit.html;
     else main.innerHTML = '<p class="sub">This bundle has no page yet.</p>';
     renderApprovals(main, id, hit.approvals || {items: []});
-    if (!hit.html) return;
-    captureMermaid(main);
-    runMermaid();
-    var host = main.querySelector("[data-plan-progress]");
-    if (host && hit.bundle) drawSummary(host, dagOf(hit.bundle, id), hit.snap || {running: [], recent: []}, id);
+    if (hit.html) {
+      captureMermaid(main);
+      runMermaid();
+      var host = main.querySelector("[data-plan-progress]");
+      if (host && hit.bundle) drawSummary(host, dagOf(hit.bundle, id), hit.snap || {running: [], recent: []}, id);
+    }
+    stampSectionIds(main);
   }
 
   /* The live progress map lives on Execution only; the Plan page shows a compact summary and a jump there. */
@@ -374,6 +398,7 @@
       renderApprovals(main, id, parts[0]);
       var host = main.querySelector("[data-plan-progress]");
       if (host && parts[1]) drawSummary(host, dagOf(parts[1], id), parts[2] || {running: [], recent: []}, id);
+      stampSectionIds(main);
     }).catch(function () {});
   }
 
