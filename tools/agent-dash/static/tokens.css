@@ -1,0 +1,106 @@
+/* Reference palette from DESIGN.md. One :root, two dark scopes. Plan fragments alias these names. */
+
+:root {
+  color-scheme: light;
+  --page: #f9f9f7;
+  --surface: #fcfcfb;
+  --surface-2: #f0efec;
+  --ink: #0b0b0b;
+  --ink-2: #52514e;
+  --muted: #898781;
+  --grid: #e1e0d9;
+  --axis: #c3c2b7;
+  --ring: rgba(11, 11, 11, .10);
+  --s1: #2a78d6;
+  --s2: #eb6834;
+  --s3: #1baf7a;
+  --s4: #eda100;
+  --s5: #e87ba4;
+  --s6: #008300;
+  --s7: #6250d6;
+  --s8: #e34948;
+  --good: #0ca30c;
+  --warning: #fab219;
+  --serious: #ec835a;
+  --critical: #d03b3b;
+  --good-ink: #006300;
+  --other: #a8a69e;
+  --font: system-ui, -apple-system, "Segoe UI", sans-serif;
+  --mono: ui-monospace, Menlo, Consolas, monospace;
+  --bg: var(--page);
+  --fg: var(--ink);
+  --fg2: var(--ink-2);
+  --fg3: var(--muted);
+  --line: var(--grid);
+  --accent: var(--s1);
+  --accent-ink: #fff;
+  --accent-soft: color-mix(in srgb, var(--s1) 16%, var(--surface));
+  --ok: var(--good);
+  --ok-soft: color-mix(in srgb, var(--good) 16%, var(--surface));
+  --warn: var(--warning);
+  --warn-soft: color-mix(in srgb, var(--warning) 24%, var(--surface));
+  --crit: var(--critical);
+  --crit-soft: color-mix(in srgb, var(--critical) 16%, var(--surface));
+  --mute: var(--muted);
+  --mute-soft: var(--surface-2);
+  --port: var(--s1);
+  --pass: var(--axis);
+  --unk: var(--grid);
+  --m-print: var(--s1);
+  --m-veto: var(--s6);
+  --m-cat: var(--s4);
+  --m-inst: var(--s7);
+  --m-replay: var(--s3);
+  --m-none: var(--other);
+  --f-display: var(--font);
+  --f-body: var(--font);
+  --f-mono: var(--mono);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:where(:not([data-theme="light"])) {
+    color-scheme: dark;
+    --page: #0d0d0d;
+    --surface: #1a1a19;
+    --surface-2: #242422;
+    --ink: #f0efec;
+    --ink-2: #c3c2b7;
+    --muted: #898781;
+    --grid: #2c2c2a;
+    --axis: #383835;
+    --ring: rgba(255, 255, 255, .10);
+    --s1: #3987e5;
+    --s2: #d95926;
+    --s3: #199e70;
+    --s4: #c98500;
+    --s5: #d55181;
+    --s6: #008300;
+    --s7: #9085e9;
+    --s8: #e66767;
+    --good-ink: #0ca30c;
+    --other: #5f5e59;
+  }
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --page: #0d0d0d;
+  --surface: #1a1a19;
+  --surface-2: #242422;
+  --ink: #f0efec;
+  --ink-2: #c3c2b7;
+  --muted: #898781;
+  --grid: #2c2c2a;
+  --axis: #383835;
+  --ring: rgba(255, 255, 255, .10);
+  --s1: #3987e5;
+  --s2: #d95926;
+  --s3: #199e70;
+  --s4: #c98500;
+  --s5: #d55181;
+  --s6: #008300;
+  --s7: #9085e9;
+  --s8: #e66767;
+  --good-ink: #0ca30c;
+  --other: #5f5e59;
+}

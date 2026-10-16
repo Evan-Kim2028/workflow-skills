@@ -44,7 +44,7 @@ cd tools/agent-dash
 python3 -m http.server 8766 --bind 127.0.0.1
 ```
 
-Then open http://127.0.0.1:8766/static/index.html?fixtures . Stop that server by its PID when you are done.
+Then open http://127.0.0.1:8766/static/index.html?fixtures . Plan is the same page with `&view=plan&ws=WS1`. Stop that server by its PID when you are done.
 
 Regenerate the fixtures with `python3 fixtures/make_fixtures.py`. The script uses a seeded RNG and does not read your sessions.
 

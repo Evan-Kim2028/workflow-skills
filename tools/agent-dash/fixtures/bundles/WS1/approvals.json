@@ -1,0 +1,21 @@
+{
+  "ws": "WS1",
+  "decided_at": "2026-04-02T15:00:00Z",
+  "decided_by": "owner",
+  "items": [
+    {
+      "id": "sample-load",
+      "step": "Load the sample set before cutover",
+      "status": "pending",
+      "reversible": false,
+      "conditions": "The sample set is on disk."
+    },
+    {
+      "id": "route-name",
+      "step": "Keep the public route name",
+      "status": "approved",
+      "reversible": true,
+      "conditions": "Clients already call this route."
+    }
+  ]
+}

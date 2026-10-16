@@ -5,11 +5,11 @@ description: Run, change and grow the local agent execution dashboard (agent-das
 
 # Workstream dashboard (agent-dash)
 
-Two local pages in one tool. Execution (`/`) shows what every agent is doing across sessions and tools, per workstream, with charts and a live plan progress map. Plan (`/plan?ws=<ID>`) shows each workstream's strategy, decisions, and drawings. A Plan | Execution toggle keeps the same workstream.
+One local shell, two views. Execution (`/?view=exec`) shows what every agent is doing across sessions and tools, per workstream, with charts and a live plan progress map. Plan (`/?view=plan&ws=<ID>`, also `/plan?ws=<ID>`) shows each workstream's strategy, decisions, drawings, and owner approvals. The header and workstream tabs render once. Plan | Execution swaps the main view in place and keeps the same workstream.
 
 - Code: `tools/agent-dash/` in this repo. After `./install.sh`, that directory is `~/.claude/tools/agent-dash`. Contract: `CONTRACT.md`. Look: `DESIGN.md`. Read both before changing anything.
 - State: `~/.local/share/agent-dash/` (`dash.sqlite`, pidfile, log). Override with `AGENT_DASH_STATE_DIR` or `state_dir` in `config.local.json`.
-- Live page: http://127.0.0.1:8765/ . Offline design preview with fixture data: `cd tools/agent-dash && python3 -m http.server 8766 --bind 127.0.0.1`, then http://127.0.0.1:8766/static/index.html?fixtures (stop it by PID when done).
+- Live page: http://127.0.0.1:8765/ . Offline design preview with fixture data: `cd tools/agent-dash && python3 -m http.server 8766 --bind 127.0.0.1`, then http://127.0.0.1:8766/static/index.html?fixtures . Plan is the same page with `&view=plan&ws=WS1`. Stop the server by PID when done.
 
 ## Run
 
@@ -29,8 +29,10 @@ With no `config.local.json`, scratch roots and the hub tracker are empty. Those 
 
 ## What it shows
 
-- Overall tab: stat tiles (agents live now, finished today, tokens, cost, alerts), running-now table, alerts, workstream cards, tokens per hour (by model or workstream), live agents over time (one strip per tool), run timeline grouped by workstream, recently finished runs. A Plans row links each workstream to its plan page.
-- One tab per workstream that has a plan file or a workstream bundle. Same views filtered to it, plus the plan progress map: task groups in columns, chips by status, arrows for "waits on". A chip with a running agent pulses and carries a badge (tool color, count). A chip whose run finished in the last 15 minutes gets a green outline. Running runs that map to no task are listed above the map. The map links to that workstream's plan page.
+- Overall tab: a Needs you card first (pending approvals, each linking to that workstream's Approvals section; when nothing is pending, a compact line such as "WS2: 5 approved, 0 pending"), then stat tiles (agents live now, finished today, tokens, cost, alerts), running-now table, alerts, workstream cards, tokens per hour (by model or workstream), live agents over time (one strip per tool), run timeline grouped by workstream, recently finished runs.
+- The same Needs you card sits at the top of each workstream tab.
+- One tab per workstream that has a plan file or a workstream bundle. Same views filtered to it, plus the plan progress map: task groups in columns, chips by status, arrows for "waits on". A chip with a running agent pulses and carries a badge (tool color, count). A chip whose run finished in the last 15 minutes gets a green outline. Running runs that map to no task are listed above the map. The map opens that workstream's plan view in place.
+- Plan view: an Approvals section after the header and before Why. Rows group into Needs you (pending), Approved, and Denied. Each row shows the step, a reversible or one-way badge (one-way uses the critical status color and the word), and the conditions.
 - Click any run (table row, timeline bar, live chip) for the details drawer.
 
 ## Rules
@@ -44,10 +46,10 @@ With no `config.local.json`, scratch roots and the hub tracker are empty. Those 
 7. Charts follow the Charts section below (axes on every chart, compact numbers); `tests/test_page_rules.py` enforces it.
 8. Local CI only: run the test files for what changed, `python3 -m unittest discover -s tests -p 'test_<module>*.py'`. Do not run the whole suite for a one-module change. Real-session smoke tests stay skipped unless `AGENT_DASH_SMOKE=1`.
 
-## Charts (every chart on every page: `static/index.html`, `static/plan.html`)
+## Charts (every chart in the shell: `static/index.html`, helpers in `static/format.js`)
 
 - **Axes on every chart.** A visible x axis and y axis: axis line, ticks with labels, and a short title or unit ("tokens", "agents", "time", "hour"). A categorical axis labels each category; lane and row names are its tick labels. Small multiples each carry a y axis; the shared x axis labels sit under the last strip.
-- **One helper.** Draw axes only with `axes(svg, {L, T, pw, ph, yMax, yTicks, yFmt, xTicks, xTitle, yTitle})`; use `timeTicks(t0, t1, X, n)` for time axes. Never hand-draw tick labels.
+- **One helper.** Draw axes only with `axes(svg, {L, T, pw, ph, yMax, yTicks, yFmt, xTicks, xTitle, yTitle})` from `static/format.js`; use `timeTicks(t0, t1, X, n)` for time axes. Both views call those helpers. Never hand-draw tick labels.
 - **Compact numbers everywhere.** Use `fmtN` for counts and tokens (Intl compact: 950, 1.2K, 3.4M, 1.5B), `fmtUsd` for money ($0.42, $12, $1.2K), `fmtDur` for durations (45s, 3m 10s, 2h 5m), and `fmtDate` for timestamps. Never put raw `toFixed` or `toLocaleString` on a number outside those helpers. This applies to axes, tooltips, tiles, tables and the drawer.
 - **One y axis per chart.** Different scales get separate charts or small multiples.
 - **Colour follows the entity**, from the fixed palette in `DESIGN.md`. Status colours mean state only, and always ship with a symbol or word.
@@ -82,6 +84,8 @@ Claude project and session roots default to `~/.claude/projects` and `~/.claude/
 **Add a workstream bundle.** Read `tools/agent-dash/SKILL-PLAN.md`. Short form: `python3 agent_dash.py ws new WS4 "Read path"`, fill `plan.json`, put drawings in `visuals.html`, list them in `layout.json`, then `ws render WS4` and `ws validate WS4`. Bundles live under `AGENT_DASH_WORKSTREAMS` (default `~/.local/share/agent-dash/workstreams/<ID>/`). They are private and stay out of the repo. A `kind: workstream` bundle appears as a Plan tab and an execution tab with no edit to the plans map. Synthetic examples for tests live in `tools/agent-dash/fixtures/bundles/` (OVERVIEW plus one workstream).
 
 **Log progress.** Label every worker run `ws<N>-<task-id>-<slug>` so the map pins the agent to its task. Move a task with `python3 agent_dash.py ws task <ID> <task-id> <todo|pr|prog|done|deferred> [--moved-to WSn] [--note "..."]`. The write is a temp file plus replace. Do not hand-edit `plan.json` while a session is running. Status edits do not need `ws render`. The page reads `plan.json` live.
+
+**Record an approval.** The lead adds a pending item, the owner sets `approved` or `denied`, and the lead reads `ws approvals <ID>` before any production step. `python3 agent_dash.py ws approve <ID> <item-id> pending --step "..." --reversible yes|no --conditions "..."`. The plan view and the Needs you card read that file. See `SKILL-PLAN.md`.
 
 **Refresh a plan map from an HTML artifact.** When task state lives in a saved artifact page:
 

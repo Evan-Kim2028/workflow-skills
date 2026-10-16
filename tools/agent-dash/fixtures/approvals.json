@@ -1,0 +1,47 @@
+{
+  "approvals": [
+    {
+      "ws": "WS1",
+      "decided_at": "2026-04-02T15:00:00Z",
+      "decided_by": "owner",
+      "items": [
+        {
+          "id": "sample-load",
+          "step": "Load the sample set before cutover",
+          "status": "pending",
+          "reversible": false,
+          "conditions": "The sample set is on disk."
+        },
+        {
+          "id": "route-name",
+          "step": "Keep the public route name",
+          "status": "approved",
+          "reversible": true,
+          "conditions": "Clients already call this route."
+        }
+      ]
+    },
+    {
+      "ws": "WS2",
+      "decided_at": "2026-04-02T15:04:00Z",
+      "decided_by": "owner",
+      "items": [
+        {"id": "route-list", "step": "Publish the route list", "status": "approved", "reversible": true, "conditions": "The contract is frozen."},
+        {"id": "client-contract", "step": "Freeze the client contract", "status": "approved", "reversible": true, "conditions": "Callers can read the new shape."},
+        {"id": "error-shape", "step": "Keep the old error shape", "status": "approved", "reversible": false, "conditions": "Existing clients parse this body."},
+        {"id": "read-route", "step": "Ship the read route", "status": "approved", "reversible": true, "conditions": "The sample set loads."},
+        {"id": "old-client", "step": "Retire the duplicate client", "status": "approved", "reversible": false, "conditions": "No caller still imports it."}
+      ]
+    },
+    {
+      "ws": "WS7",
+      "decided_at": "2026-04-02T15:10:00Z",
+      "decided_by": "owner",
+      "items": [
+        {"id": "checklist", "step": "Publish the launch checklist", "status": "approved", "reversible": true, "conditions": "The gate task is written down."},
+        {"id": "rollback", "step": "Keep the rollback note", "status": "approved", "reversible": true, "conditions": "The note names the previous route."},
+        {"id": "hold-note", "step": "Hold the launch note", "status": "denied", "reversible": false, "conditions": "The gate task is still open."}
+      ]
+    }
+  ]
+}

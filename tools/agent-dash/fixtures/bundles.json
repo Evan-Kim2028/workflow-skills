@@ -1,0 +1,6 @@
+{
+  "bundles": [
+    {"id": "OVERVIEW", "title": "Overview", "short": "Program", "order": 0, "kind": "program"},
+    {"id": "WS1", "title": "Read path", "short": "Read path", "order": 10, "kind": "workstream"}
+  ]
+}

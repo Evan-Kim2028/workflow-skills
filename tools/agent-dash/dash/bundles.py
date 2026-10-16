@@ -9,16 +9,19 @@ from __future__ import annotations
 import json
 import os
 import re
+from datetime import datetime, timezone
 from pathlib import Path
 
 from dash.plans import configured
 
 STATUSES = ("todo", "pr", "prog", "done", "deferred")
+APPROVAL_STATUSES = ("pending", "approved", "denied")
 VERDICTS = ("WORTH_IT", "WORTH_IT_IF", "NOT_WORTH_IT")
 SIZES = ("S", "M", "L")
 _ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$")
 _SAFE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 _MOVED = re.compile(r"^WS\d+$")
+_ITEM = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 _ID_WORD = re.compile(r"^(?:TU-\d+[a-z]?|ADR|WS\d+[a-z]?|PR)$", re.I)
 _CITE = re.compile(
     r"(?P<tok>(?:ADR\s+\d{3,4})|(?:TU-\d+[a-z]?)|(?:#\d{3,5}))(?![A-Za-z0-9])"
@@ -32,8 +35,11 @@ WS_USAGE = """agent-dash workstream bundles
   python3 agent_dash.py ws validate <ID>
   python3 agent_dash.py ws render <ID>
   python3 agent_dash.py ws task <ID> <task-id> <status> [--moved-to WSn] [--note "..."]
+  python3 agent_dash.py ws approve <ID> <item-id> <approved|denied|pending> [--note "..."] [--step "..."] [--reversible yes|no] [--conditions "..."]
+  python3 agent_dash.py ws approvals [<ID>]
 
 Status is todo, pr, prog, done, or deferred. deferred may set --moved-to and --note.
+A new approval is `ws approve <ID> <item-id> pending --step "..." --reversible yes|no --conditions "..."`.
 Bundles are directories under AGENT_DASH_WORKSTREAMS.
 """
 
@@ -164,7 +170,8 @@ def load_bundle_api(ws: str) -> dict | None:
     plan = _read_json(path / "plan.json")
     if not isinstance(meta, dict) or not isinstance(plan, dict):
         return None
-    return {"bundle": meta, "plan": plan}
+    approvals = approvals_for(ws)
+    return {"bundle": meta, "plan": plan, "approvals": approvals if approvals is not None else empty_approvals(ws)}
 
 
 def _view_groups(value) -> list:
@@ -510,6 +517,215 @@ def _validate_narrative(issues: list[str], narrative, require: bool) -> None:
             _require_str(issues, "plan.json", phase.get(key), f"phase {key}")
 
 
+def empty_approvals(ws: str) -> dict:
+    return {"ws": ws, "decided_at": None, "decided_by": None, "items": []}
+
+
+def _public_approvals(data: dict, ws: str) -> dict:
+    items = [item for item in (data.get("items") or []) if isinstance(item, dict)]
+    decided_at = data.get("decided_at")
+    decided_by = data.get("decided_by")
+    return {
+        "ws": data.get("ws") if isinstance(data.get("ws"), str) else ws,
+        "decided_at": decided_at if isinstance(decided_at, str) else None,
+        "decided_by": decided_by if isinstance(decided_by, str) else None,
+        "items": items,
+    }
+
+
+def approvals_for(ws: str, root: Path | None = None) -> dict | None:
+    """None when the bundle directory is missing. An empty record when the file is absent."""
+    path = bundle_dir(ws, root)
+    if path is None:
+        return None
+    file = path / "approvals.json"
+    if not file.is_file():
+        return empty_approvals(ws)
+    data = _read_json(file)
+    if not isinstance(data, dict):
+        return empty_approvals(ws)
+    return _public_approvals(data, ws)
+
+
+def approvals_all(root: Path | None = None) -> list[dict]:
+    rows = []
+    for bundle in list_bundles(root):
+        record = approvals_for(bundle["id"], root)
+        if record is not None:
+            rows.append(record)
+    return rows
+
+
+def _validate_approvals(issues: list[str], ws: str, data) -> None:
+    if not isinstance(data, dict):
+        issues.append("approvals.json: must be an object")
+        return
+    if data.get("ws") != ws:
+        issues.append(f"approvals.json: ws {data.get('ws')!r} does not match directory {ws}")
+    if "decided_at" not in data:
+        issues.append("approvals.json: decided_at is required")
+    elif data.get("decided_at") is not None and not isinstance(data.get("decided_at"), str):
+        issues.append("approvals.json: decided_at must be a string or null")
+    if "decided_by" not in data:
+        issues.append("approvals.json: decided_by is required")
+    elif data.get("decided_by") is not None and not isinstance(data.get("decided_by"), str):
+        issues.append("approvals.json: decided_by must be a string or null")
+    items = data.get("items")
+    if not isinstance(items, list):
+        issues.append("approvals.json: items must be a list")
+        return
+    seen = set()
+    for item in items:
+        if not isinstance(item, dict):
+            issues.append("approvals.json: each item must be an object")
+            continue
+        item_id = item.get("id")
+        if not isinstance(item_id, str) or not _ITEM.match(item_id):
+            issues.append(f"approvals.json: bad item id {item_id!r}")
+        elif item_id in seen:
+            issues.append(f"approvals.json: duplicate item id {item_id}")
+        else:
+            seen.add(item_id)
+        _require_str(issues, "approvals.json", item.get("step"), f"item {item_id} step")
+        if item.get("status") not in APPROVAL_STATUSES:
+            issues.append(f"approvals.json: item {item_id} status must be pending, approved, or denied")
+        if not isinstance(item.get("reversible"), bool):
+            issues.append(f"approvals.json: item {item_id} reversible must be true or false")
+        if not isinstance(item.get("conditions"), str):
+            issues.append(f"approvals.json: item {item_id} conditions must be a string")
+        if "note" in item and not isinstance(item.get("note"), str):
+            issues.append(f"approvals.json: item {item_id} note must be a string")
+
+
+def _cell(value) -> str:
+    return str(value or "").replace("\t", " ").replace("\n", " ").replace("\r", " ")
+
+
+def set_approval(
+    ws: str,
+    item_id: str,
+    status: str,
+    step: str | None,
+    reversible: bool | None,
+    conditions: str | None,
+    note: str | None,
+    root: Path | None = None,
+) -> int:
+    if not _ITEM.match(item_id):
+        print(f"bad id {item_id}", flush=True)
+        return 2
+    if status not in APPROVAL_STATUSES:
+        print(f"bad status {status}", flush=True)
+        return 2
+    path = bundle_dir(ws, root)
+    if path is None:
+        print(f"bundle not found: {ws}", flush=True)
+        return 2
+    file = path / "approvals.json"
+    if file.is_file():
+        data = _read_json(file)
+        if not isinstance(data, dict):
+            print("approvals.json unreadable", flush=True)
+            return 2
+    else:
+        data = empty_approvals(ws)
+    items = data.get("items")
+    if not isinstance(items, list):
+        items = []
+    found = None
+    for item in items:
+        if isinstance(item, dict) and item.get("id") == item_id:
+            found = item
+            break
+    if found is None:
+        if step is None or not str(step).strip():
+            print("step required", flush=True)
+            return 2
+        if reversible is None:
+            print("reversible required", flush=True)
+            return 2
+        found = {
+            "id": item_id,
+            "step": str(step).strip(),
+            "status": status,
+            "reversible": reversible,
+            "conditions": conditions or "",
+        }
+        if note is not None:
+            found["note"] = note
+        items.append(found)
+    else:
+        found["status"] = status
+        if step is not None:
+            found["step"] = step
+        if reversible is not None:
+            found["reversible"] = reversible
+        if conditions is not None:
+            found["conditions"] = conditions
+        if note is not None:
+            found["note"] = note
+    if status in ("approved", "denied"):
+        data["decided_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        data["decided_by"] = "owner"
+    else:
+        data.setdefault("decided_at", None)
+        data.setdefault("decided_by", None)
+    payload = {
+        "ws": ws,
+        "decided_at": data.get("decided_at"),
+        "decided_by": data.get("decided_by"),
+        "items": items,
+    }
+    _atomic_write(file, json.dumps(payload, indent=2, ensure_ascii=False) + "\n")
+    print(f"{ws} {item_id} {status}")
+    return 0
+
+
+def print_approvals(ws: str | None = None, root: Path | None = None) -> int:
+    if ws:
+        if bundle_dir(ws, root) is None:
+            print(f"bundle not found: {ws}", flush=True)
+            return 2
+        records = [approvals_for(ws, root)]
+    else:
+        records = approvals_all(root)
+    lines = []
+    for record in records:
+        if not record:
+            continue
+        for item in record.get("items") or []:
+            if not isinstance(item, dict):
+                continue
+            way = "reversible" if item.get("reversible") else "one-way"
+            lines.append(
+                "\t".join(
+                    [
+                        _cell(record.get("ws")),
+                        _cell(item.get("id")),
+                        _cell(item.get("status")),
+                        way,
+                        _cell(item.get("step")),
+                        _cell(item.get("conditions")),
+                    ]
+                )
+            )
+    if not lines:
+        print("(no approvals)")
+        return 0
+    print("WS\tID\tSTATUS\tWAY\tSTEP\tCONDITIONS")
+    for line in lines:
+        print(line)
+    return 0
+
+
+def _parse_yes_no(value: str) -> bool | None:
+    if value == "yes":
+        return True
+    if value == "no":
+        return False
+    return None
+
+
 def validate_bundle(ws: str, root: Path | None = None) -> list[str]:
     path = bundle_dir(ws, root)
     if path is None:
@@ -552,7 +768,14 @@ def validate_bundle(ws: str, root: Path | None = None) -> list[str]:
                 _validate_motivation(issues, plan.get("motivation"))
             if "agent_friendly" in plan:
                 _validate_agent(issues, plan.get("agent_friendly"))
-    for name in ("bundle.json", "plan.json", "layout.json", "page.html", "visuals.html"):
+    approvals_path = path / "approvals.json"
+    if approvals_path.is_file():
+        raw = _read_json(approvals_path)
+        if raw is None:
+            issues.append("approvals.json: unreadable")
+        else:
+            _validate_approvals(issues, path.name, raw)
+    for name in ("bundle.json", "plan.json", "layout.json", "page.html", "visuals.html", "approvals.json"):
         file = path / name
         if not file.is_file():
             continue
@@ -680,5 +903,40 @@ def cmd_ws(argv: list[str]) -> int:
                 print(WS_USAGE, end="", flush=True)
                 return 2
         return set_task(rest[0], rest[1], rest[2], moved, note)
+    if cmd == "approve":
+        if len(rest) < 3:
+            print(WS_USAGE, end="", flush=True)
+            return 2
+        step = None
+        reversible = None
+        conditions = None
+        note = None
+        flags = rest[3:]
+        index = 0
+        while index < len(flags):
+            flag = flags[index]
+            if flag in ("--step", "--reversible", "--conditions", "--note") and index + 1 < len(flags):
+                value = flags[index + 1]
+                if flag == "--step":
+                    step = value
+                elif flag == "--reversible":
+                    reversible = _parse_yes_no(value)
+                    if reversible is None:
+                        print("reversible must be yes or no", flush=True)
+                        return 2
+                elif flag == "--conditions":
+                    conditions = value
+                else:
+                    note = value
+                index += 2
+            else:
+                print(WS_USAGE, end="", flush=True)
+                return 2
+        return set_approval(rest[0], rest[1], rest[2], step, reversible, conditions, note)
+    if cmd == "approvals":
+        if len(rest) > 1:
+            print(WS_USAGE, end="", flush=True)
+            return 2
+        return print_approvals(rest[0] if rest else None)
     print(WS_USAGE, end="", flush=True)
     return 2

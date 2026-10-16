@@ -102,7 +102,7 @@ started_at, ended_at, elapsed_s, clock_source, out_bytes, out_growing, err_bytes
 
 ## Plan bundles
 
-Plan pages are local. Execution stays on `static/index.html`. Project text stays out of the tool directory, under `AGENT_DASH_WORKSTREAMS` (default `~/.local/share/agent-dash/workstreams`). One directory per bundle id. The plans map still feeds `GET /api/plan`. A directory with `bundle.json` shows up on the plan page and, for `kind: workstream`, on `GET /api/plan` when that id is not already in the plans map.
+Plan and Execution are one shell, `static/index.html`. `GET /` and `GET /plan` both serve that file. The page swaps the view in place (`?view=plan|exec&ws=<ID>`). `/static/index.html?ws=<ID>` still opens Execution. Project text stays out of the tool directory, under `AGENT_DASH_WORKSTREAMS` (default `~/.local/share/agent-dash/workstreams`). One directory per bundle id. The plans map still feeds `GET /api/plan`. A directory with `bundle.json` shows up on the plan view and, for `kind: workstream`, on `GET /api/plan` when that id is not already in the plans map.
 
 Each bundle:
 
@@ -111,10 +111,11 @@ Each bundle:
 | `bundle.json` | `{id, title, short, order, kind}`. `kind` is `program` or `workstream`. The id matches the directory name. |
 | `plan.json` | Decision record: `dag`, `decisions`, `motivation`, `agent_friendly`, `narrative`. Task status is `todo`, `pr`, `prog`, `done`, or `deferred`. `deferred` may set `moved_to` and `note`. A `program` bundle may hold only `narrative`. |
 | `page.html` | Plan-view fragment. Generated for bundles that have `visuals.html` and `layout.json`. |
+| `approvals.json` | Optional. `{ws, decided_at, decided_by, items: [{id, step, status, reversible, conditions}]}`. `status` is `pending`, `approved`, or `denied`. `reversible` is a boolean. `decided_at` is an ISO-8601 UTC string or null. |
 | `visuals.html` | Hand-made sections keyed by h2 title. |
 | `layout.json` | Which visual sections land in Why, End state, Plan, Agent-friendly, and Reference. |
 
-`dash/planrender.py` `render(bundle_dir)` writes `page.html` in this order: Why, End state, Plan, Progress, Decided, Agent-friendly, Reference. Progress is an empty `data-plan-progress` node. The page fills it from the live plan. Deferred tasks stay on the map and leave the counts.
+`dash/planrender.py` `render(bundle_dir)` writes `page.html` in this order: Approvals, Why, End state, Plan, Progress, Decided, Agent-friendly, Reference. Approvals is an empty `data-plan-approvals` node. Progress is an empty `data-plan-progress` node. The page fills both from the live bundle. Deferred tasks stay on the map and leave the counts.
 
 ```
 python3 agent_dash.py ws list
@@ -122,15 +123,18 @@ python3 agent_dash.py ws new <ID> "<title>"
 python3 agent_dash.py ws validate <ID>
 python3 agent_dash.py ws render <ID>
 python3 agent_dash.py ws task <ID> <task-id> <status> [--moved-to WSn] [--note "..."]
+python3 agent_dash.py ws approve <ID> <item-id> <approved|denied|pending> [--note "..."] [--step "..."] [--reversible yes|no] [--conditions "..."]
+python3 agent_dash.py ws approvals [<ID>]
 ```
 
-`ws new` writes a valid template. `ws task` writes `plan.json` through a temp file and `os.replace`. `ws validate` checks the schema and the naming rule: a TU-style id, a 3-to-5-digit issue number, or an ADR number with no phrase earlier on the same line is a failure.
+`ws new` writes a valid template. `ws task` writes `plan.json` through a temp file and `os.replace`. `ws approve` writes `approvals.json` the same way. A new pending item needs `--step`, `--reversible yes|no`, and `--conditions`. `approved` or `denied` sets `decided_at` and `decided_by` to `owner`. `ws approvals` prints a table. `ws validate` checks the schema, including `approvals.json` when that file exists, and the naming rule: a TU-style id, a 3-to-5-digit issue number, or an ADR number with no phrase earlier on the same line is a failure.
 
 HTTP, still GET only, 127.0.0.1:
 
-- `GET /plan` serves `static/plan.html`.
+- `GET /plan` serves the same shell as `GET /`.
 - `GET /api/bundles` returns `{bundles: [{id, title, short, order, kind}]}`, program first, then `order`.
-- `GET /api/bundle?ws=<ID>` returns `{bundle, plan}` from that directory.
+- `GET /api/bundle?ws=<ID>` returns `{bundle, plan, approvals}` from that directory. Missing `approvals.json` is an empty item list.
+- `GET /api/approvals?ws=<ID|all>` returns one record, or `{approvals: [...]}` for `all`.
 - `GET /bundle/<ID>/page.html` returns that file only. The resolved path has to stay inside the bundle directory.
 
 `static/vendor/mermaid.min.js` is mermaid 11.16.1. The plan page runs it on `pre.mermaid`. No CDN.

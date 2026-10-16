@@ -143,6 +143,54 @@ class BundlesApiTest(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(json.loads(body)["ws"], "WS7")
 
+    def test_approvals_routes_and_shell(self):
+        ws = Path(self.tmp.name) / "WS9"
+        (ws / "approvals.json").write_text(
+            json.dumps(
+                {
+                    "ws": "WS9",
+                    "decided_at": None,
+                    "decided_by": None,
+                    "items": [
+                        {
+                            "id": "sample-load",
+                            "step": "Load the sample set before cutover",
+                            "status": "pending",
+                            "reversible": False,
+                            "conditions": "The sample set is on disk.",
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        status, _, body = get(self.port, "/api/bundle?ws=WS9")
+        self.assertEqual(status, 200)
+        payload = json.loads(body)
+        self.assertEqual(payload["approvals"]["items"][0]["status"], "pending")
+        self.assertIs(payload["approvals"]["items"][0]["reversible"], False)
+        status, _, body = get(self.port, "/api/approvals?ws=WS9")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)["items"][0]["id"], "sample-load")
+        status, _, body = get(self.port, "/api/approvals?ws=all")
+        self.assertEqual(status, 200)
+        rows = {item["ws"]: item for item in json.loads(body)["approvals"]}
+        self.assertIn("WS9", rows)
+        self.assertIn("OVERVIEW", rows)
+        self.assertEqual(rows["OVERVIEW"]["items"], [])
+        status, _, _ = get(self.port, "/api/approvals?ws=..")
+        self.assertEqual(status, 400)
+        status, _, body = get(self.port, "/api/approvals?ws=NOPE")
+        self.assertEqual(status, 404)
+        status, _, home = get(self.port, "/")
+        status, _, plan = get(self.port, "/plan")
+        self.assertEqual(home, plan)
+        self.assertIn(b"Execution", plan)
+        self.assertIn(b"/static/plan.css", plan)
+        self.assertIn(b"/static/tokens.css", plan)
+        self.assertIn(b"pushState", plan)
+        self.assertIn(b"Needs you", plan)
+
 
 if __name__ == "__main__":
     unittest.main()

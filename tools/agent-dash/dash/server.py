@@ -10,7 +10,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from dash.bundles import bundle_plan_view, list_bundles, load_bundle_api, read_page, workstream_plan_ids
+from dash.bundles import approvals_all, approvals_for, bundle_plan_view, list_bundles, load_bundle_api, read_page, workstream_plan_ids
 from dash.plans import PlanError, PlanNotFound, load as load_plan
 from dash.pricing import health_block
 from dash.store import DEFAULT_LONG_RUNNING_S
@@ -67,6 +67,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._bundles()
             elif path == "/api/bundle":
                 self._bundle(query)
+            elif path == "/api/approvals":
+                self._approvals(query)
             elif path.startswith("/bundle/"):
                 self._bundle_page(path)
             elif path == "/api/health":
@@ -182,11 +184,27 @@ class Handler(BaseHTTPRequestHandler):
         self._json(200, body)
 
     def _plan_page(self):
-        path = self.server.index_path.parent / "plan.html"
+        """Same shell as `/`. The page reads `/plan` and opens the plan view."""
+        path = self.server.index_path
         if not path.is_file():
             self._json(404, {"error": "not found"})
             return
         self._bytes(200, path.read_bytes(), "text/html; charset=utf-8")
+
+    def _approvals(self, query):
+        ws = _one(query, "ws")
+        if not ws:
+            raise ValueError("ws required")
+        if ws == "all":
+            self._json(200, {"approvals": approvals_all()})
+            return
+        if ws in (".", "..") or not _WS.match(ws):
+            raise ValueError("bad ws")
+        body = approvals_for(ws)
+        if body is None:
+            self._json(404, {"error": "bundle not found", "ws": ws})
+            return
+        self._json(200, body)
 
     def _bundles(self):
         self._json(200, {"bundles": list_bundles()})

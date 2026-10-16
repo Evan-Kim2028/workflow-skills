@@ -1,10 +1,12 @@
 (function () {
   "use strict";
-  var Q = new URLSearchParams(location.search);
-  var current = Q.get("ws") || "";
-  var bundles = [];
+  var current = "";
   var taskmap = {};
+  var taskmapGet = function () { return taskmap; };
+  var FIX = false;
   var sources = [];
+  var cache = {};
+  var showGen = 0;
   var SERIES = {opus: "--s1", haiku: "--s2", sonnet: "--s3", grok: "--s4", muse: "--s5", glm: "--s6", fable: "--s7", other: "--other"};
 
   function el(tag, attrs, kids) {
@@ -29,10 +31,7 @@
     return window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches;
   }
   function fmtDur(seconds) {
-    seconds = Math.max(0, +seconds || 0);
-    if (seconds < 60) return Math.round(seconds) + "s";
-    if (seconds < 3600) return Math.floor(seconds / 60) + "m";
-    return Math.floor(seconds / 3600) + "h " + Math.round((seconds % 3600) / 60) + "m";
+    return AD.fmtDur(seconds);
   }
   function tierKey(run) {
     var text = ((run && (run.tier || run.model)) || "").toLowerCase();
@@ -42,7 +41,7 @@
   }
   function taskOf(run, ws) {
     var label = run.label || "";
-    var table = taskmap[ws] || {};
+    var table = (taskmapGet() || {})[ws] || {};
     var match;
     if (table[label]) return table[label];
     Object.keys(table).forEach(function (key) {
@@ -65,50 +64,6 @@
       if (match) return "WS7." + match[1].toUpperCase();
     }
     return null;
-  }
-
-  function renderTabs() {
-    var nav = document.getElementById("tabs");
-    nav.innerHTML = "";
-    bundles.forEach(function (bundle) {
-      var button = el("button", {type: "button", class: "plan-tab", role: "tab", "aria-selected": String(bundle.id === current)});
-      button.textContent = bundle.kind === "program" ? bundle.title : bundle.id + " " + bundle.title;
-      button.addEventListener("click", function () { select(bundle.id); });
-      nav.appendChild(button);
-    });
-  }
-
-  function execHref(id) {
-    var bundle = bundles.filter(function (item) { return item.id === id; })[0];
-    var ws = !bundle || bundle.kind === "program" ? "all" : id;
-    return "/static/index.html?ws=" + encodeURIComponent(ws);
-  }
-
-  function select(id) {
-    current = id;
-    var plan = document.getElementById("plan-link");
-    plan.href = "/plan?ws=" + encodeURIComponent(id);
-    document.getElementById("exec-link").href = execHref(id);
-    if (history.replaceState) history.replaceState(null, "", plan.href);
-    renderTabs();
-    loadPage(id);
-  }
-
-  function loadPage(id) {
-    var main = document.getElementById("body");
-    main.textContent = "Loading.";
-    fetch("/bundle/" + encodeURIComponent(id) + "/page.html", {cache: "no-store"}).then(function (response) {
-      if (!response.ok) throw new Error("missing page");
-      return response.text();
-    }).then(function (html) {
-      if (current !== id) return;
-      main.innerHTML = html;
-      captureMermaid(main);
-      runMermaid();
-      return refreshProgress(id);
-    }).catch(function () {
-      if (current === id) main.textContent = "This bundle has no page yet.";
-    });
   }
 
   function captureMermaid(root) {
@@ -289,40 +244,151 @@
     window.addEventListener("resize", draw);
   }
 
+  function fetchPage(id) {
+    var url = FIX ? "../fixtures/bundles/" + encodeURIComponent(id) + "/page.html" : "/bundle/" + encodeURIComponent(id) + "/page.html";
+    return fetch(url, {cache: "no-store"}).then(function (response) {
+      if (!response.ok) return null;
+      return response.text();
+    }).catch(function () { return null; });
+  }
+
+  function fetchApprovals(id) {
+    var url = FIX ? "../fixtures/approvals.json" : "/api/approvals?ws=" + encodeURIComponent(id);
+    return fetch(url, {cache: "no-store"}).then(function (response) {
+      if (!response.ok) return {ws: id, decided_at: null, decided_by: null, items: []};
+      return response.json();
+    }).then(function (payload) {
+      if (payload && payload.approvals) {
+        var hit = payload.approvals.filter(function (row) { return row.ws === id; })[0];
+        return hit || {ws: id, decided_at: null, decided_by: null, items: []};
+      }
+      if (payload && payload.items) return payload;
+      return {ws: id, decided_at: null, decided_by: null, items: []};
+    }).catch(function () { return {ws: id, decided_at: null, decided_by: null, items: []}; });
+  }
+
+  function fetchBundle(id) {
+    if (FIX) {
+      return fetch("../fixtures/bundles/" + encodeURIComponent(id) + "/plan.json", {cache: "no-store"}).then(function (response) {
+        if (!response.ok) return null;
+        return response.json().then(function (plan) { return {plan: plan}; });
+      }).catch(function () { return null; });
+    }
+    return fetch("/api/bundle?ws=" + encodeURIComponent(id), {cache: "no-store"}).then(function (response) {
+      return response.ok ? response.json() : null;
+    }).catch(function () { return null; });
+  }
+
+  function fetchSnap(id) {
+    if (!FIX) {
+      return fetch("/api/snapshot?ws=" + encodeURIComponent(id), {cache: "no-store"}).then(function (response) {
+        return response.ok ? response.json() : {running: [], recent: []};
+      }).catch(function () { return {running: [], recent: []}; });
+    }
+    return fetch("../fixtures/snapshot-" + encodeURIComponent(id) + ".json", {cache: "no-store"}).then(function (response) {
+      if (response.ok) return response.json();
+      return fetch("../fixtures/snapshot.json", {cache: "no-store"}).then(function (fallback) {
+        return fallback.ok ? fallback.json() : {running: [], recent: []};
+      });
+    }).catch(function () { return {running: [], recent: []}; });
+  }
+
+  function renderApprovals(root, ws, data) {
+    var host = root.querySelector("[data-plan-approvals]");
+    if (!host) {
+      var section = el("section", {id: String(ws).toLowerCase() + "-approvals", class: "pl-sec lay"});
+      section.appendChild(el("h2", {}, [el("span", {class: "eb", text: "Approvals"}), document.createTextNode("Owner decisions")]));
+      host = el("div", {"data-plan-approvals": "true"});
+      section.appendChild(host);
+      var header = root.querySelector("header");
+      if (header && header.parentNode) header.parentNode.insertBefore(section, header.nextSibling);
+      else root.insertBefore(section, root.firstChild);
+    }
+    var sectionEl = host.closest ? host.closest("section") : null;
+    if (sectionEl) sectionEl.id = String(ws).toLowerCase() + "-approvals";
+    host.innerHTML = "";
+    var items = (data && data.items) || [];
+    if (!items.length) {
+      host.appendChild(el("p", {class: "sub", text: "No approvals yet."}));
+      return;
+    }
+    [["pending", "Needs you"], ["approved", "Approved"], ["denied", "Denied"]].forEach(function (pair) {
+      var rows = items.filter(function (item) { return item.status === pair[0]; });
+      var group = el("div", {class: "ap-group"});
+      group.appendChild(el("h3", {text: pair[1]}));
+      if (!rows.length) group.appendChild(el("p", {class: "sub", text: "None."}));
+      rows.forEach(function (item) {
+        var way = item.reversible ? "reversible" : "one-way";
+        var row = el("div", {class: "ap-row"});
+        row.appendChild(el("div", {class: "ap-step", text: item.step || item.id}));
+        row.appendChild(el("span", {class: "ap-badge " + (item.reversible ? "rev" : "oneway"), text: way}));
+        row.appendChild(el("div", {class: "ap-cond", text: item.conditions || ""}));
+        group.appendChild(row);
+      });
+      host.appendChild(group);
+    });
+  }
+
+  function paint(id, hit) {
+    var main = document.getElementById("plan-body");
+    if (!main || current !== id) return;
+    if (hit.html) main.innerHTML = hit.html;
+    else main.innerHTML = '<p class="sub">This bundle has no page yet.</p>';
+    renderApprovals(main, id, hit.approvals || {items: []});
+    if (!hit.html) return;
+    captureMermaid(main);
+    runMermaid();
+    var host = main.querySelector("[data-plan-progress]");
+    if (host && hit.bundle) drawProgress(host, dagOf(hit.bundle, id), hit.snap || {running: [], recent: []});
+  }
+
   function refreshProgress(id) {
-    var host = document.querySelector("[data-plan-progress]");
-    if (!host || current !== id) return Promise.resolve();
-    return Promise.all([
-      fetch("/api/bundle?ws=" + encodeURIComponent(id), {cache: "no-store"}).then(function (response) { return response.ok ? response.json() : null; }),
-      fetch("/api/snapshot?ws=" + encodeURIComponent(id), {cache: "no-store"}).then(function (response) { return response.ok ? response.json() : {running: [], recent: []}; }).catch(function () { return {running: [], recent: []}; })
-    ]).then(function (pair) {
+    return Promise.all([fetchApprovals(id), fetchBundle(id), fetchSnap(id)]).then(function (parts) {
       if (current !== id) return;
-      var again = document.querySelector("[data-plan-progress]");
-      if (!again || !pair[0]) return;
-      drawProgress(again, dagOf(pair[0], id), pair[1]);
+      var hit = cache[id] || {html: null};
+      hit.approvals = parts[0];
+      hit.bundle = parts[1];
+      hit.snap = parts[2];
+      cache[id] = hit;
+      if (window.DashCache) window.DashCache.snap[id] = parts[2];
+      var main = document.getElementById("plan-body");
+      if (!main) return;
+      renderApprovals(main, id, parts[0]);
+      var host = main.querySelector("[data-plan-progress]");
+      if (host && parts[1]) drawProgress(host, dagOf(parts[1], id), parts[2] || {running: [], recent: []});
     }).catch(function () {});
   }
 
-  document.getElementById("theme").addEventListener("click", function () {
-    var root = document.documentElement;
-    var next = darkNow() ? "light" : "dark";
-    root.setAttribute("data-theme", next);
-    try { localStorage.setItem("agent-dash-theme", next); } catch (e) {}
-    runMermaid();
-    if (current) refreshProgress(current);
-  });
+  function show(id) {
+    current = id;
+    var gen = ++showGen;
+    var hit = cache[id] || (window.DashCache && window.DashCache.bundle && window.DashCache.bundle[id]);
+    var main = document.getElementById("plan-body");
+    if (hit && hit.html !== undefined) paint(id, hit);
+    else if (main) main.textContent = "Loading.";
+    return Promise.all([fetchPage(id), fetchApprovals(id), fetchBundle(id), fetchSnap(id)]).then(function (parts) {
+      if (current !== id || gen !== showGen) return true;
+      var next = {html: parts[0], approvals: parts[1], bundle: parts[2], snap: parts[3]};
+      cache[id] = next;
+      if (window.DashCache) {
+        window.DashCache.snap[id] = parts[3];
+        window.DashCache.bundle[id] = next;
+      }
+      paint(id, next);
+      return true;
+    }).catch(function () { return false; });
+  }
 
-  fetch("/static/taskmap.json", {cache: "no-store"}).then(function (response) { return response.ok ? response.json() : {}; }).then(function (json) { taskmap = json || {}; }).catch(function () {});
-  fetch("/api/bundles", {cache: "no-store"}).then(function (response) { return response.json(); }).then(function (payload) {
-    bundles = payload.bundles || [];
-    if (!bundles.length) {
-      document.getElementById("body").textContent = "No plan bundles yet. ws new creates one.";
-      return;
+  window.PlanView = {
+    configure: function (opts) {
+      FIX = !!(opts && opts.fixtures);
+      if (opts && opts.taskmapGet) taskmapGet = opts.taskmapGet;
+    },
+    show: show,
+    refresh: function () { return current ? refreshProgress(current) : Promise.resolve(); },
+    restyle: function () {
+      runMermaid();
+      if (current) return refreshProgress(current);
     }
-    if (!bundles.some(function (bundle) { return bundle.id === current; })) current = bundles[0].id;
-    select(current);
-  }).catch(function () {
-    document.getElementById("body").textContent = "The bundle list did not load.";
-  });
-  setInterval(function () { if (current) refreshProgress(current); }, 30000);
+  };
 })();

@@ -4,11 +4,14 @@ The dashboard is read by a visual thinker. Every view answers its question with 
 
 ## Layout
 
-- Execution is `static/index.html`. Plan is `static/plan.html`, served at `/plan`. Vanilla JS, inline SVG. No framework, no CDN, no build step. Mermaid is the vendored file under `static/vendor/`.
-- Header: title, live dot, range control (6 h, 24 h, 3 d), theme toggle. A Plans row links each workstream to its plan page.
-- Tabs: `Overall`, then one tab per workstream that has a plan in the plans map or a workstream bundle, in WS number order.
-- Overall, top to bottom: stat tiles (one row), running-now table beside alerts, workstream cards, tokens per hour beside live agents over time, run timeline, finished in the last hour.
+- One shell, `static/index.html`, served at `/` and at `/plan`. Vanilla JS, inline SVG. No framework, no CDN, no build step. Mermaid is the vendored file under `static/vendor/`.
+- The header and the workstream tabs render once. Plan | Execution, and tab changes, swap the main view in place. The URL is `?view=plan|exec&ws=<ID>`. Back and forward restore that view. `/plan?ws=<ID>` and `/static/index.html?ws=<ID>` still open the right view. The selected workstream stays when the view changes.
+- Header: title, live dot, Plan | Execution toggle, range control (6 h, 24 h, 3 d, Execution only), theme toggle.
+- Tabs: `Overall` on Execution and `Overview` on Plan, then one tab per workstream that has a plan in the plans map or a workstream bundle, in WS number order.
+- Colors, type, and shared controls (card, tab, pill, chip, legend, tooltip, section heading, details) come from `static/tokens.css`. Plan fragments keep their class names. `--accent`, `--fg2`, `--line`, `--ok`, `--warn`, `--crit`, `--surface`, and `--surface-2` are aliases of the reference palette.
+- Execution, top to bottom: a Needs you card (pending approvals, or a compact approved/pending line), stat tiles (one row), running-now table beside alerts, workstream cards, tokens per hour beside live agents over time, run timeline, finished in the last hour.
 - Workstream tab: the same views filtered to that workstream, plus the plan progress map directly under the tiles.
+- Plan view: each workstream opens with an Approvals section after the header and before Why. Rows are grouped Needs you, Approved, and Denied.
 - Run details open in the right-hand drawer; Escape closes it.
 
 ## Color (reference palette, validated; do not invent hues)
@@ -21,7 +24,7 @@ The dashboard is read by a visual thinker. Every view answers its question with 
 
 ## Charts
 
-- Every chart has a visible x axis and y axis: an axis line, ticks with labels, and a short title or unit ("tokens", "agents", "time"). A categorical axis labels each category (lane or row names are its tick labels). Build axes only with the shared `axes()` helper in `static/index.html` (and its twin in `static/plan.js`); `tests/test_page_rules.py` fails a chart without it.
+- Every chart has a visible x axis and y axis: an axis line, ticks with labels, and a short title or unit ("tokens", "agents", "time"). A categorical axis labels each category (lane or row names are its tick labels). Build axes only with the shared `axes()` helper in `static/format.js`. Both views call that helper. `tests/test_page_rules.py` fails a chart without it.
 - Numbers are compact everywhere: counts and tokens through `fmtN` (Intl compact: 950, 1.2K, 3.4M, 1.5B), money through `fmtUsd` ($0.42, $12, $1.2K), durations through `fmtDur` (45s, 3m 10s, 2h 5m). No raw `toFixed` or `toLocaleString` on numbers outside those helpers.
 - One y-axis per chart. Different scales get separate charts or small multiples (live agents over time is one strip per tool). There are no concurrency caps or meters: the owner removed them as unclear. Counts are always scoped to the current view.
 - Bars and areas: 2 px surface gap between stacked segments, rounded ends, recessive grid and axes.

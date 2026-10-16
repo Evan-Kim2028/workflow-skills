@@ -25,7 +25,7 @@ python3 agent_dash.py ws validate WS4
 
 `ws render` rewrites `page.html`. `ws validate` checks the schema and the naming rule. Do not cite a decision, task, pull request, ADR, or issue by number alone. Write a short phrase first. The number can sit in parentheses after it. `the read-path migration decision (D-12)` is the shape. The checker flags a TU-style id, an issue number of 3 to 5 digits, or an ADR number when no phrase sits earlier on the same line. It looks after the last tag, so a class name earlier in the tag does not count as the phrase.
 
-Open `http://127.0.0.1:8765/plan?ws=WS4`. Overview is first, then bundles in order. Plan | Execution keeps the same workstream. Execution is the dashboard.
+Open `http://127.0.0.1:8765/plan?ws=WS4`. Overview is first, then bundles in order. Plan | Execution keeps the same workstream and does not reload the page. Execution is the dashboard view in the same shell.
 
 `fixtures/bundles/` in this repo is a tiny OVERVIEW plus one workstream, for tests. Point `AGENT_DASH_WORKSTREAMS` at that directory when you want the plan page to render with no private data.
 
@@ -43,3 +43,19 @@ python3 agent_dash.py ws task WS4 WS4.1 deferred --moved-to WS6 --note "waits on
 `pr` is an open pull request. `prog` is merged and waiting on a prod step. `done` is finished. `todo` is not started. Deferred tasks stay on the map and drop out of the counts. The write is a temp file plus replace, so a crash does not leave a half-written plan.
 
 Run `ws render` again only when the prose or the drawings change. Status edits do not need a render. The page reads `plan.json` live.
+
+## Approvals
+
+The lead records a pending decision before asking the owner to take it. The owner sets the status. The lead reads that status before any production step.
+
+```
+python3 agent_dash.py ws approve WS4 cutover pending --step "Ship the read path" --reversible no --conditions "The sample set loads."
+python3 agent_dash.py ws approve WS4 cutover approved --note "Owner signed off."
+python3 agent_dash.py ws approvals WS4
+```
+
+`pending` adds or reopens an item. `approved` and `denied` are the owner's answer. `reversible` is `yes` or `no`. `no` is one-way. The write is a temp file plus replace.
+
+`approvals.json` is optional. `ws validate` checks it when the file is there: `ws`, `decided_at`, `decided_by`, and `items` of `id`, `step`, `status` (`pending`, `approved`, `denied`), `reversible` (true or false), and `conditions`. The naming rule applies to that file too.
+
+The plan view lists the rows under Approvals, after the header and before Why, grouped Needs you, Approved, and Denied. Execution shows a Needs you card at the top of Overall and of each workstream tab. A pending row links to that Approvals section. When nothing is pending, the card is one line, for example `WS2: 5 approved, 0 pending`.

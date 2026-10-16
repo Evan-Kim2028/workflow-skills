@@ -6,27 +6,13 @@
 <title>Plan</title>
 <link rel="stylesheet" href="/static/plan.css">
 <script>
-try {
-  var theme = localStorage.getItem("agent-dash-theme");
-  if (theme) document.documentElement.setAttribute("data-theme", theme);
-} catch (e) {}
+var q = new URLSearchParams(location.search);
+q.set("view", "plan");
+var base = location.pathname.indexOf("/static/") >= 0 ? "index.html" : "/";
+location.replace(base + "?" + q.toString() + location.hash);
 </script>
 </head>
 <body>
-<div class="wrap">
-<header class="plan-head">
-  <h1>Plan</h1>
-  <nav class="view-toggle" aria-label="View">
-    <a href="/plan" id="plan-link" aria-current="page">Plan</a>
-    <a href="/static/index.html" id="exec-link">Execution</a>
-  </nav>
-  <span class="sp"></span>
-  <button type="button" id="theme">Theme</button>
-</header>
-<nav class="plan-tabs" id="tabs" aria-label="Workstreams"></nav>
-<main class="plan-main" id="body"></main>
-</div>
-<script src="/static/vendor/mermaid.min.js"></script>
-<script src="/static/plan.js"></script>
+<p><a href="/">Execution</a></p>
 </body>
 </html>

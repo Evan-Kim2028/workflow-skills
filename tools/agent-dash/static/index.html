@@ -4,29 +4,21 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Agent execution</title>
+<link rel="stylesheet" href="/static/tokens.css">
+<link rel="stylesheet" href="/static/plan.css">
+<script>
+try {
+  var q = new URLSearchParams(location.search);
+  var theme = q.get("theme") || localStorage.getItem("agent-dash-theme");
+  if (theme === "dark" || theme === "light") document.documentElement.setAttribute("data-theme", theme);
+} catch (e) {}
+</script>
 <style>
-:root{
-  color-scheme:light;
-  --page:#f9f9f7;--surface:#fcfcfb;--surface-2:#f0efec;--ink:#0b0b0b;--ink-2:#52514e;--muted:#898781;
-  --grid:#e1e0d9;--axis:#c3c2b7;--ring:rgba(11,11,11,.10);
-  --s1:#2a78d6;--s2:#eb6834;--s3:#1baf7a;--s4:#eda100;--s5:#e87ba4;--s6:#008300;--s7:#6250d6;--s8:#e34948;
-  --good:#0ca30c;--warning:#fab219;--serious:#ec835a;--critical:#d03b3b;--good-ink:#006300;
-  --other:#a8a69e;
-  --font:system-ui,-apple-system,"Segoe UI",sans-serif;--mono:ui-monospace,Menlo,Consolas,monospace;
-}
-@media (prefers-color-scheme:dark){:root:where(:not([data-theme="light"])){
-  color-scheme:dark;--page:#0d0d0d;--surface:#1a1a19;--surface-2:#242422;--ink:#f0efec;--ink-2:#c3c2b7;--muted:#898781;
-  --grid:#2c2c2a;--axis:#383835;--ring:rgba(255,255,255,.10);
-  --s1:#3987e5;--s2:#d95926;--s3:#199e70;--s4:#c98500;--s5:#d55181;--s6:#008300;--s7:#9085e9;--s8:#e66767;--good-ink:#0ca30c;--other:#5f5e59}}
-:root[data-theme="dark"]{
-  color-scheme:dark;--page:#0d0d0d;--surface:#1a1a19;--surface-2:#242422;--ink:#f0efec;--ink-2:#c3c2b7;--muted:#898781;
-  --grid:#2c2c2a;--axis:#383835;--ring:rgba(255,255,255,.10);
-  --s1:#3987e5;--s2:#d95926;--s3:#199e70;--s4:#c98500;--s5:#d55181;--s6:#008300;--s7:#9085e9;--s8:#e66767;--good-ink:#0ca30c;--other:#5f5e59}
 *{box-sizing:border-box}
 body{margin:0;background:var(--page);color:var(--ink);font:14px/1.45 var(--font)}
 .wrap{max-width:1400px;margin:0 auto;padding:18px 20px 40px}
 header{display:flex;align-items:center;gap:14px;flex-wrap:wrap}
-h1{font-size:20px;margin:0;font-weight:650}
+header h1{font-size:20px;margin:0;font-weight:650}
 .live{display:inline-flex;align-items:center;gap:6px;font-size:12.5px;color:var(--ink-2)}
 .dot{width:8px;height:8px;border-radius:50%;background:var(--muted)}
 .dot.on{background:var(--good);box-shadow:0 0 0 3px color-mix(in srgb,var(--good) 25%,transparent)}
@@ -138,30 +130,61 @@ tr.clk{cursor:pointer}tr.clk:hover td{background:var(--surface-2)}
 .phase b{display:block;font-size:13px}
 .phase small{color:var(--muted)}
 .foot{margin-top:22px;font-size:12px;color:var(--muted)}
+[hidden]{display:none !important}
+.view-toggle{display:inline-flex;border:1px solid var(--ring);border-radius:6px;overflow:hidden}
+.view-toggle button{border:0;border-radius:0;background:transparent;color:var(--ink-2);font-weight:600;padding:6px 12px}
+.view-toggle button[aria-pressed="true"]{background:var(--surface-2);color:var(--ink)}
+.needs-you{margin-bottom:14px}
+.needs-line{margin:4px 0;font-size:13px;color:var(--ink-2)}
+.needs-row{display:flex;flex-wrap:wrap;gap:8px 12px;align-items:baseline;padding:6px 0;border-bottom:1px solid var(--grid);font-size:13.5px}
+.needs-row a{color:var(--ink);font-weight:650;text-decoration:none}
+.needs-row a:hover,.needs-row a:focus-visible{color:var(--s1)}
+.ap-badge{display:inline-block;font:600 11px var(--mono);padding:2px 7px;border-radius:999px;border:1px solid var(--grid);white-space:nowrap}
+.ap-badge.oneway{color:var(--critical);border-color:var(--critical);background:color-mix(in srgb,var(--critical) 12%,transparent)}
+.ap-badge.rev{color:var(--good-ink);border-color:var(--good);background:color-mix(in srgb,var(--good) 12%,transparent)}
+.ap-group{margin-top:12px}
+.ap-group h3{font-size:13px;margin:0 0 4px}
+.ap-row{display:grid;grid-template-columns:minmax(0,1.4fr) auto minmax(0,1fr);gap:10px;align-items:baseline;padding:7px 0;border-bottom:1px solid var(--grid);font-size:14px}
+.ap-cond{color:var(--ink-2);font-size:13px}
+.ap-step{min-width:0}
+@media (max-width:640px){.ap-row{grid-template-columns:minmax(0,1fr)}}
 </style>
 </head>
 <body>
 <div class="wrap">
-<header>
-<h1>Agent execution</h1>
+<header class="shell">
+<h1 id="title">Agent execution</h1>
 <span class="live"><span class="dot" id="live-dot"></span><span id="live-txt">connecting</span></span>
+<nav class="view-toggle" aria-label="View">
+<button type="button" id="view-plan" aria-pressed="false">Plan</button>
+<button type="button" id="view-exec" aria-pressed="true">Execution</button>
+</nav>
 <span class="sp"></span>
 <span class="seg-ctl" id="range"><button data-h="6" aria-pressed="false">6 h</button><button data-h="24" aria-pressed="true">24 h</button><button data-h="72" aria-pressed="false">3 d</button></span>
 <button id="theme" title="Toggle light or dark">Theme</button>
 </header>
-<nav class="plinks" id="plinks" aria-label="Plans"></nav>
-<nav class="tabs" id="tabs" role="tablist"></nav>
+<nav class="tabs" id="tabs" role="tablist" aria-label="Workstreams"></nav>
+<div id="exec-view">
 <main id="main"></main>
 <p class="foot" id="foot"></p>
 </div>
+<div id="plan-view" class="plan-view" hidden>
+<main class="plan-main" id="plan-body"></main>
+</div>
+</div>
 <div class="tip" id="tip"></div>
 <aside class="drawer" id="drawer" aria-label="Run details"></aside>
+<script src="/static/format.js"></script>
+<script src="/static/vendor/mermaid.min.js"></script>
+<script src="/static/plan.js"></script>
 <script>
 (function () {
   "use strict";
   var Q = new URLSearchParams(location.search);
   var FIX = Q.has("fixtures");
-  var state = {ws: Q.get("ws") || "all", hours: 24, snap: null, runs: [], usage: [], conc: [], wss: [], plan: null, seq: -1, groupBy: "model"};
+  var execCache = {};
+  var execGen = 0;
+  var state = {view: "exec", ws: "all", hours: 24, snap: null, runs: [], usage: [], conc: [], wss: [], bundles: [], plan: null, seq: -1, groupBy: "model", approvals: []};
   var SERIES = {opus: "--s1", haiku: "--s2", sonnet: "--s3", grok: "--s4", muse: "--s5", glm: "--s6", fable: "--s7", other: "--other"};
   var MODELS = [["opus", "Opus"], ["fable", "Fable"], ["sonnet", "Sonnet"], ["haiku", "Haiku"], ["grok", "Grok 4.7"], ["muse", "muse"], ["glm", "GLM"], ["other", "Other"]];
   function modelName(k) { for (var i = 0; i < MODELS.length; i++) if (MODELS[i][0] === k) return MODELS[i][1]; return k; }
@@ -176,28 +199,8 @@ tr.clk{cursor:pointer}tr.clk:hover td{background:var(--surface-2)}
     if (kind === "workstream") { if (!key || key === "null") return "var(--other)"; if (!wsColor[key]) wsColor[key] = WSCOL[Object.keys(wsColor).length % WSCOL.length]; return "var(" + wsColor[key] + ")"; }
     return "var(" + (SERIES[key] || "--other") + ")";
   }
-  var NF = new Intl.NumberFormat("en", {notation: "compact", maximumFractionDigits: 1});
-  var UF = new Intl.NumberFormat("en", {style: "currency", currency: "USD", notation: "compact", maximumFractionDigits: 1});
-  function fmtDate(t) { return new Date(t * 1000).toLocaleString([], {month: "short", day: "numeric", hour: "2-digit", minute: "2-digit"}); }
-  function fmtN(n) { return NF.format(+n || 0); }
-  function fmtUsd(n) { return n == null ? "\u2013" : (Math.abs(n) < 1 ? "$" + (+n).toFixed(2) : UF.format(n)); }
-  /* axes: every chart gets an x axis and a y axis with compact tick labels and short titles (DESIGN.md) */
-  function axes(svg, o) {
-    var g = s("g", {class: "ax"}), x0 = o.L, x1 = o.L + o.pw, yb = o.T + o.ph;
-    if (o.yMax != null) {
-      var n = o.yTicks || 4;
-      for (var i = 0; i <= n; i++) { var v = o.yMax * i / n, y = yb - o.ph * i / n; if (i && o.grid !== false) g.appendChild(s("line", {x1: x0, x2: x1, y1: y, y2: y, class: "gl"})); g.appendChild(s("line", {x1: x0 - 4, x2: x0, y1: y, y2: y, class: "bl"})); var tx = s("text", {x: x0 - 7, y: y + 3.5, "text-anchor": "end"}); tx.textContent = (o.yFmt || fmtN)(v); g.appendChild(tx); }
-    }
-    g.appendChild(s("line", {x1: x0, x2: x0, y1: o.T, y2: yb, class: "bl"}));
-    g.appendChild(s("line", {x1: x0, x2: x1, y1: yb, y2: yb, class: "bl"}));
-    (o.xTicks || []).forEach(function (tk) { g.appendChild(s("line", {x1: tk.x, x2: tk.x, y1: yb, y2: yb + 4, class: "bl"})); if (tk.label) { var lt = s("text", {x: tk.x, y: yb + 15, "text-anchor": tk.anchor || "middle"}); lt.textContent = tk.label; g.appendChild(lt); } });
-    if (o.yTitle) { var yt = s("text", {x: x0 - 7, y: o.T - 2, "text-anchor": "end", class: "axt"}); yt.textContent = o.yTitle; g.appendChild(yt); }
-    if (o.xTitle) { var xt = s("text", {x: x1, y: yb + 28, "text-anchor": "end", class: "axt"}); xt.textContent = o.xTitle; g.appendChild(xt); }
-    svg.appendChild(g); return g;
-  }
-  function timeTicks(t0, t1, X, n) { var out = []; n = n || 6; for (var i = 0; i <= n; i++) { var t = t0 + (t1 - t0) * i / n; out.push({x: X(t), label: i === n && Math.abs(t1 - Date.now() / 1000) < 120 ? "now" : fmtT(t), anchor: i === 0 ? "start" : i === n ? "end" : "middle"}); } return out; }
-  function fmtDur(s) { s = Math.max(0, +s || 0); if (s < 60) return Math.round(s) + "s"; if (s < 3600) return Math.floor(s / 60) + "m " + Math.round(s % 60) + "s"; return Math.floor(s / 3600) + "h " + Math.round((s % 3600) / 60) + "m"; }
-  function fmtT(t) { var d = new Date(t * 1000); return d.toLocaleTimeString([], {hour: "2-digit", minute: "2-digit"}); }
+  /* axes() and the compact formatters live in format.js and are shared with the plan view. */
+  var fmtDate = AD.fmtDate, fmtN = AD.fmtN, fmtUsd = AD.fmtUsd, fmtDur = AD.fmtDur, fmtT = AD.fmtT, axes = AD.axes, timeTicks = AD.timeTicks;
   function el(tag, attrs, kids) { var e = document.createElement(tag); if (attrs) for (var k in attrs) { if (k === "text") e.textContent = attrs[k]; else if (k === "html") e.innerHTML = attrs[k]; else if (k.slice(0, 2) === "on") e.addEventListener(k.slice(2), attrs[k]); else e.setAttribute(k, attrs[k]); } (kids || []).forEach(function (c) { if (c) e.appendChild(typeof c === "string" ? document.createTextNode(c) : c); }); return e; }
   var NS = "http://www.w3.org/2000/svg";
   function s(tag, attrs) { var e = document.createElementNS(NS, tag); for (var k in attrs) e.setAttribute(k, attrs[k]); return e; }
@@ -206,6 +209,16 @@ tr.clk{cursor:pointer}tr.clk:hover td{background:var(--surface-2)}
   function api(path, params) {
     var qs = new URLSearchParams(params || {}).toString();
     if (FIX) {
+      if (path === "/api/approvals") {
+        return fetch("../fixtures/approvals.json").then(function (r) { if (!r.ok) throw new Error(r.status); return r.json(); }).then(function (j) {
+          var wanted = params && params.ws;
+          if (wanted && wanted !== "all") {
+            var hit = (j.approvals || []).filter(function (row) { return row.ws === wanted; })[0];
+            return hit || {ws: wanted, decided_at: null, decided_by: null, items: []};
+          }
+          return j;
+        });
+      }
       var base = FIXMAP[path] || path.replace("/api/", "");
       if (path === "/api/usage" && params && params.group === "workstream") base = "usage-workstream-hour";
       if (path === "/api/plan") base = "plan-" + params.ws;
@@ -227,21 +240,131 @@ tr.clk{cursor:pointer}tr.clk:hover td{background:var(--surface-2)}
   }
   function hideTip() { tip.style.display = "none"; }
 
-  /* tabs */
+  function canonWs(ws) {
+    if (!ws || String(ws).toLowerCase() === "all" || String(ws).toLowerCase() === "overview") return "all";
+    if (/^ws\d+$/i.test(ws)) return String(ws).toUpperCase();
+    return String(ws);
+  }
+  function readRoute() {
+    var q = new URLSearchParams(location.search);
+    var view = q.get("view");
+    var path = location.pathname;
+    if (view !== "plan" && view !== "exec") view = (path === "/plan" || /plan\.html$/.test(path)) ? "plan" : "exec";
+    return {view: view, ws: canonWs(q.get("ws") || "")};
+  }
+  function planIdFor(ws) {
+    if (ws && ws !== "all") return ws;
+    var program = null;
+    (state.bundles || []).forEach(function (b) { if (!program && (b.kind === "program" || b.id === "OVERVIEW")) program = b; });
+    if (program) return program.id;
+    return (state.bundles && state.bundles.length) ? state.bundles[0].id : "OVERVIEW";
+  }
+  function queryWs() {
+    if (state.view === "plan") return planIdFor(state.ws);
+    return state.ws === "all" ? "all" : state.ws;
+  }
+  function pushRoute(hash) {
+    var u = new URL(location.href);
+    var path = location.pathname;
+    if (path === "/plan" || /\/plan\.html$/.test(path)) u.pathname = /plan\.html$/.test(path) ? path.replace(/plan\.html$/, "index.html") : "/";
+    u.searchParams.set("view", state.view);
+    u.searchParams.set("ws", queryWs());
+    if (FIX) u.searchParams.set("fixtures", "");
+    u.hash = hash || "";
+    var next = u.pathname + u.search + u.hash;
+    if (next === location.pathname + location.search + location.hash) return;
+    history.pushState({view: state.view, ws: state.ws}, "", u);
+  }
+  function applyChrome() {
+    var plan = state.view === "plan";
+    document.getElementById("exec-view").hidden = plan;
+    document.getElementById("plan-view").hidden = !plan;
+    document.getElementById("view-plan").setAttribute("aria-pressed", plan ? "true" : "false");
+    document.getElementById("view-exec").setAttribute("aria-pressed", plan ? "false" : "true");
+    document.getElementById("range").hidden = plan;
+    document.getElementById("title").textContent = plan ? "Plan" : "Agent execution";
+    document.title = plan ? "Plan" : "Agent execution";
+  }
+  function scrollHash() {
+    if (!location.hash) return;
+    var node = document.querySelector(location.hash);
+    if (node && node.scrollIntoView) node.scrollIntoView();
+  }
+  function showCurrent() {
+    applyChrome();
+    renderTabs();
+    if (state.view === "exec") {
+      var hit = execCache[state.ws];
+      if (hit) {
+        state.snap = hit.snap; state.runs = hit.runs; state.usage = hit.usage; state.conc = hit.conc; state.plan = hit.plan; state.seq = hit.seq; state.approvals = hit.approvals || [];
+        drawMain();
+      }
+      refreshAll();
+      return;
+    }
+    var id = planIdFor(state.ws);
+    var job = window.PlanView ? PlanView.show(id) : null;
+    if (job && job.then) job.then(function (ok) { setLive(ok !== false); scrollHash(); });
+  }
+  function selectTab(ws) {
+    ws = canonWs(ws);
+    if (ws === state.ws) return;
+    state.ws = ws;
+    pushRoute();
+    showCurrent();
+  }
+  function selectView(view) {
+    if (state.view === view) return;
+    state.view = view;
+    pushRoute();
+    showCurrent();
+  }
+  function openPlan(ws) {
+    state.ws = canonWs(ws);
+    state.view = "plan";
+    pushRoute("");
+    showCurrent();
+  }
+  function openApprovals(ws) {
+    state.ws = canonWs(ws);
+    state.view = "plan";
+    pushRoute(String(planIdFor(state.ws)).toLowerCase() + "-approvals");
+    showCurrent();
+  }
+  function tabRows() {
+    var seen = {}, rows = [];
+    shown(state.wss || []).forEach(function (w) {
+      var key = String(w.ws).toUpperCase();
+      if (seen[key]) return;
+      seen[key] = 1;
+      rows.push({ws: w.ws, name: w.ws + (w.name ? " " + w.name : ""), running: w.running});
+    });
+    (state.bundles || []).forEach(function (b) {
+      if (!b || b.kind === "program" || b.id === "OVERVIEW") return;
+      var key = String(b.id).toUpperCase();
+      if (seen[key]) return;
+      seen[key] = 1;
+      rows.push({ws: b.id, name: b.id + (b.title ? " " + b.title : ""), running: 0});
+    });
+    rows.sort(function (a, b) { return wsNum(a) - wsNum(b); });
+    return [{ws: "all", name: state.view === "plan" ? "Overview" : "Overall"}].concat(rows);
+  }
   function renderTabs() {
     var t = document.getElementById("tabs"); t.innerHTML = "";
-    var seen = {}, uniq = shown(state.wss).filter(function (w) { var k = String(w.ws).toUpperCase(); if (seen[k]) return false; seen[k] = 1; return true; });
-    var pl = document.getElementById("plinks"); pl.innerHTML = ""; pl.appendChild(el("b", {text: "Plans"}));
-    [{ws: "overview", name: "Overview"}].concat(uniq).forEach(function (w) { pl.appendChild(el("a", {href: planUrl(w.ws), target: "_blank", rel: "noopener", class: String(w.ws) === state.ws ? "cur" : "", text: (w.ws === "overview" ? "" : w.ws + " ") + (w.name || "") + " \u2197"})); });
-    var list = [{ws: "all", name: "Overall"}].concat(uniq.map(function (w) { return {ws: w.ws, name: w.ws + (w.name ? " " + w.name : ""), running: w.running}; }));
-    list.forEach(function (w) {
-      var b = el("button", {class: "tab", role: "tab", "aria-selected": String(state.ws === w.ws), onclick: function () { go(w.ws); }}, [w.name]);
+    tabRows().forEach(function (w) {
+      var b = el("button", {class: "tab", role: "tab", "aria-selected": String(state.ws === w.ws), onclick: function () { selectTab(w.ws); }}, [w.name]);
       if (w.running) b.appendChild(el("span", {class: "c", text: w.running + " live"}));
       t.appendChild(b);
     });
   }
-  function planUrl(ws) { return "/plan?ws=" + (String(ws).toLowerCase() === "overview" ? "OVERVIEW" : String(ws).toUpperCase()); }
-  function go(ws) { state.ws = ws; var u = new URL(location.href); if (ws === "all") u.searchParams.delete("ws"); else u.searchParams.set("ws", ws); history.replaceState(null, "", u); renderTabs(); refreshAll(); }
+  function planUrl(ws) {
+    var id = canonWs(ws);
+    var q = new URLSearchParams(location.search);
+    q.set("view", "plan");
+    q.set("ws", id === "all" ? "OVERVIEW" : id);
+    return "?" + q.toString();
+  }
+  function go(ws) { selectTab(ws); }
 
   /* components */
   function tiles(snap) {
@@ -489,7 +612,7 @@ tr.clk{cursor:pointer}tr.clk:hover td{background:var(--surface-2)}
     ((snap && snap.running) || []).forEach(function (r) { if (r.workstream && r.workstream !== plan.ws) return; var t = taskOf(r, plan.ws); if (t) (live[t] = live[t] || []).push(r); else if (r.workstream === plan.ws) unassigned.push(r); });
     ((snap && snap.recent) || []).forEach(function (r) { if (r.ended_at && now - r.ended_at < 900) { var t = taskOf(r, plan.ws); if (t) just[t] = r; } });
     var nLive = Object.keys(live).reduce(function (a, k) { return a + live[k].length; }, 0);
-    var c = el("div", {class: "card"}, [el("div", {style: "display:flex;align-items:baseline;gap:10px;flex-wrap:wrap"}, [el("h2", {text: plan.ws + " plan progress" + (nLive ? " · " + nLive + " agent" + (nLive > 1 ? "s" : "") + " working" : "")}), el("a", {class: "planbtn", href: planUrl(plan.ws), target: "_blank", rel: "noopener", text: "Open the " + plan.ws + " plan \u2197"})]), el("p", {class: "sub", text: "Every task by group, coloured by state (legend below). The badge on a working chip is the agent tool and count. Arrows show what each group waits on."})]);
+    var c = el("div", {class: "card"}, [el("div", {style: "display:flex;align-items:baseline;gap:10px;flex-wrap:wrap"}, [el("h2", {text: plan.ws + " plan progress" + (nLive ? " · " + nLive + " agent" + (nLive > 1 ? "s" : "") + " working" : "")}), el("a", {class: "planbtn", href: planUrl(plan.ws), onclick: function (ev) { ev.preventDefault(); openPlan(plan.ws); }, text: "Open the " + plan.ws + " plan"})]), el("p", {class: "sub", text: "Every task by group, coloured by state (legend below). The badge on a working chip is the agent tool and count. Arrows show what each group waits on."})]);
     if (unassigned.length) { var ua = el("div", {class: "unassigned"}, [el("b", {style: "font-size:12px;color:var(--ink-2)", text: "Running, not mapped to a task:"})]); unassigned.forEach(function (r) { var sp = el("span", {title: (r.tier || "") + " · " + fmtDur(r.elapsed_s), text: r.label || r.run_id}); sp.style.borderColor = colorOf(tierKey(r)); ua.appendChild(sp); }); c.appendChild(ua); }
     var tot = {done: 0, prog: 0, pr: 0, todo: 0, deferred: 0};
     var wrap = el("div", {class: "dag-scroll"}), dag = el("div", {class: "dag"}), svg = s("svg", {class: "dedges"}); dag.appendChild(svg); wrap.appendChild(dag);
@@ -551,9 +674,46 @@ tr.clk{cursor:pointer}tr.clk:hover td{background:var(--surface-2)}
   document.addEventListener("keydown", function (e) { if (e.key === "Escape") drawer.classList.remove("open"); });
 
   /* layout */
+  function approvalList(j) {
+    if (!j) return [];
+    if (j.approvals) return j.approvals;
+    if (j.items) return [j];
+    return [];
+  }
+  function needsCard() {
+    var list = state.approvals || [];
+    var c = el("div", {class: "card needs-you"}, [el("h2", {text: "Needs you"}), el("p", {class: "sub", text: "Pending decisions for this view."})]);
+    if (!list.length) { c.appendChild(el("p", {class: "needs-line", text: "No approvals recorded."})); return c; }
+    list.forEach(function (block) {
+      var items = block.items || [];
+      var pending = items.filter(function (item) { return item.status === "pending"; });
+      var approved = items.filter(function (item) { return item.status === "approved"; }).length;
+      var denied = items.filter(function (item) { return item.status === "denied"; }).length;
+      if (!pending.length) {
+        var line = block.ws + ": " + fmtN(approved) + " approved";
+        if (denied) line += ", " + fmtN(denied) + " denied";
+        line += ", " + fmtN(0) + " pending";
+        c.appendChild(el("p", {class: "needs-line", text: line}));
+        return;
+      }
+      pending.forEach(function (item) {
+        var row = el("div", {class: "needs-row"});
+        var href = "?view=plan&ws=" + encodeURIComponent(block.ws) + "#" + String(block.ws).toLowerCase() + "-approvals";
+        var label = (state.ws === "all" ? block.ws + " · " : "") + (item.step || item.id);
+        var link = el("a", {href: href, text: label});
+        link.addEventListener("click", function (ev) { ev.preventDefault(); openApprovals(block.ws); });
+        row.appendChild(link);
+        row.appendChild(el("span", {class: "ap-badge " + (item.reversible ? "rev" : "oneway"), text: item.reversible ? "reversible" : "one-way"}));
+        if (item.conditions) row.appendChild(el("span", {class: "ap-cond", text: item.conditions}));
+        c.appendChild(row);
+      });
+    });
+    return c;
+  }
   function drawMain() {
     var m = document.getElementById("main"); m.innerHTML = "";
     var snap = state.snap || {running: [], recent: [], alerts: [], caps: {}, totals: {tokens: {}}};
+    m.appendChild(needsCard());
     m.appendChild(tiles(snap));
     var g1 = el("div", {class: "grid g-2", style: "margin-top:14px"});
     g1.appendChild(runsTable("Running now", "Click a row for details. Output ▲ means the out file grew since the last poll.", snap.running || [], "Nothing running."));
@@ -568,18 +728,49 @@ tr.clk{cursor:pointer}tr.clk:hover td{background:var(--surface-2)}
 
   function since() { return Math.floor(Date.now() / 1000 - state.hours * 3600); }
   function wsParam() { return state.ws === "all" ? {} : {ws: state.ws}; }
-  function loadUsage() { var p = Object.assign({group: state.ws === "all" ? state.groupBy : "model", bucket: "hour", since: since()}, wsParam()); return api("/api/usage", p).then(function (j) { state.usage = j.buckets || []; }).catch(function () { state.usage = []; }); }
+  function loadUsage() { var p = Object.assign({group: state.ws === "all" ? state.groupBy : "model", bucket: "hour", since: since()}, wsParam()); return api("/api/usage", p).then(function (j) { state.usage = j.buckets || []; if (execCache[state.ws]) execCache[state.ws].usage = state.usage; }).catch(function () { state.usage = []; }); }
+  function loadNav() {
+    var bundlesP = fetch(FIX ? "../fixtures/bundles.json" : "/api/bundles", {cache: "no-store"}).then(function (r) { return r.ok ? r.json() : {bundles: []}; }).then(function (j) { state.bundles = j.bundles || []; }).catch(function () {});
+    var wsP = api("/api/workstreams").then(function (j) { state.wss = j.workstreams || []; }).catch(function () {});
+    return Promise.all([bundlesP, wsP]).then(function () { renderTabs(); });
+  }
   function refreshAll() {
-    var ws = wsParam();
+    var ws = state.ws;
+    var gen = ++execGen;
+    var wsArg = ws === "all" ? {} : {ws: ws};
+    var group = ws === "all" ? state.groupBy : "model";
     var jobs = [
-      api("/api/snapshot", Object.assign({ws: state.ws}, {})).then(function (j) { state.snap = j; state.seq = j.seq; }),
-      api("/api/runs", Object.assign({since: since(), limit: 400}, ws)).then(function (j) { state.runs = j.runs || []; }).catch(function () { state.runs = []; }),
-      loadUsage(),
-      api("/api/concurrency", Object.assign({since: since(), step: 60}, ws)).then(function (j) { state.conc = j.points || []; }).catch(function () { state.conc = []; }),
-      api("/api/workstreams").then(function (j) { state.wss = j.workstreams || []; renderTabs(); }).catch(function () {}),
-      state.ws !== "all" ? api("/api/plan", {ws: state.ws}).then(function (j) { state.plan = j && j.groups ? j : null; }).catch(function () { state.plan = null; }) : Promise.resolve(state.plan = null)
+      api("/api/snapshot", {ws: ws}).catch(function () { return null; }),
+      api("/api/runs", Object.assign({since: since(), limit: 400}, wsArg)).then(function (j) { return j.runs || []; }).catch(function () { return []; }),
+      api("/api/usage", Object.assign({group: group, bucket: "hour", since: since()}, wsArg)).then(function (j) { return j.buckets || []; }).catch(function () { return []; }),
+      api("/api/concurrency", Object.assign({since: since(), step: 60}, wsArg)).then(function (j) { return j.points || []; }).catch(function () { return []; }),
+      loadNav(),
+      ws !== "all" ? api("/api/plan", {ws: ws}).then(function (j) { return j && j.groups ? j : null; }).catch(function () { return null; }) : Promise.resolve(null),
+      api("/api/approvals", {ws: ws === "all" ? "all" : ws}).then(approvalList).catch(function () { return []; })
     ];
-    return Promise.all(jobs.map(function (p) { return p.catch(function () {}); })).then(function () { drawMain(); setLive(true); document.getElementById("foot").textContent = "Updated " + new Date().toLocaleTimeString() + (FIX ? " · fixture data" : "") + " · read-only, 127.0.0.1"; }).catch(function () { setLive(false); });
+    return Promise.all(jobs).then(function (parts) {
+      if (gen !== execGen) return;
+      if (!parts[0]) {
+        if (!execCache[ws] && state.view === "exec" && state.ws === ws) { drawMain(); setLive(false); }
+        return;
+      }
+      state.snap = parts[0];
+      state.seq = parts[0].seq;
+      state.runs = parts[1];
+      state.usage = parts[2];
+      state.conc = parts[3];
+      state.plan = parts[5];
+      state.approvals = parts[6];
+      execCache[ws] = {snap: state.snap, runs: state.runs, usage: state.usage, conc: state.conc, plan: state.plan, seq: state.seq, approvals: state.approvals};
+      if (state.snap && window.DashCache) window.DashCache.snap[ws] = state.snap;
+      renderTabs();
+      if (state.view === "exec" && state.ws === ws) {
+        drawMain();
+        setLive(true);
+        var foot = document.getElementById("foot");
+        if (foot) foot.textContent = "Updated " + new Date().toLocaleTimeString() + (FIX ? " · fixture data" : "") + " · read-only, 127.0.0.1";
+      }
+    }).catch(function () { if (gen === execGen) setLive(false); });
   }
   function setLive(ok) { document.getElementById("live-dot").className = "dot" + (ok ? " on" : ""); document.getElementById("live-txt").textContent = ok ? "live" : "offline"; }
 
@@ -589,14 +780,50 @@ tr.clk{cursor:pointer}tr.clk:hover td{background:var(--surface-2)}
     es.addEventListener("tick", function (ev) { try { var d = JSON.parse(ev.data); if (d.seq !== state.seq) refreshSnapshot(); } catch (e) {} setLive(true); });
     es.onerror = function () { setLive(false); };
   }
-  function refreshSnapshot() { api("/api/snapshot", {ws: state.ws}).then(function (j) { state.snap = j; state.seq = j.seq; drawMain(); }).catch(function () {}); }
+  function refreshSnapshot() {
+    var ws = state.ws;
+    api("/api/snapshot", {ws: ws}).then(function (j) {
+      if (state.ws !== ws) return;
+      state.snap = j; state.seq = j.seq;
+      if (execCache[ws]) execCache[ws].snap = j;
+      if (window.DashCache) window.DashCache.snap[ws] = j;
+      if (state.view === "exec") drawMain();
+    }).catch(function () {});
+  }
 
   document.getElementById("range").addEventListener("click", function (e) { var b = e.target.closest("button"); if (!b) return; state.hours = +b.dataset.h; [].forEach.call(this.children, function (x) { x.setAttribute("aria-pressed", String(x === b)); }); refreshAll(); });
-  document.getElementById("theme").addEventListener("click", function () { var r = document.documentElement, cur = r.getAttribute("data-theme"), dark = cur ? cur === "dark" : matchMedia("(prefers-color-scheme: dark)").matches; r.setAttribute("data-theme", dark ? "light" : "dark"); try { localStorage.setItem("agent-dash-theme", dark ? "light" : "dark"); } catch (e) {} drawMain(); });
-  try { var th = localStorage.getItem("agent-dash-theme"); if (th) document.documentElement.setAttribute("data-theme", th); } catch (e) {}
+  document.getElementById("theme").addEventListener("click", function () {
+    var r = document.documentElement, cur = r.getAttribute("data-theme"), dark = cur ? cur === "dark" : matchMedia("(prefers-color-scheme: dark)").matches;
+    var next = dark ? "light" : "dark";
+    r.setAttribute("data-theme", next);
+    try { localStorage.setItem("agent-dash-theme", next); } catch (e) {}
+    if (state.view === "exec" && state.snap) drawMain();
+    else if (window.PlanView) PlanView.restyle();
+  });
+  document.getElementById("view-plan").addEventListener("click", function () { selectView("plan"); });
+  document.getElementById("view-exec").addEventListener("click", function () { selectView("exec"); });
+  window.addEventListener("popstate", function () {
+    var next = readRoute();
+    state.view = next.view;
+    state.ws = next.ws;
+    showCurrent();
+  });
 
-  renderTabs(); loadTaskmap().then(refreshAll); stream();
-  setInterval(function () { loadTaskmap().then(refreshAll); }, 30000);
+  window.DashCache = {snap: {}, bundle: {}};
+  var start = readRoute();
+  state.view = start.view;
+  state.ws = start.ws;
+  if (window.PlanView) PlanView.configure({fixtures: FIX, taskmapGet: function () { return TASKMAP; }});
+  applyChrome();
+  renderTabs();
+  loadTaskmap().then(loadNav).then(function () { showCurrent(); });
+  stream();
+  setInterval(function () {
+    loadTaskmap().then(function () {
+      if (state.view === "exec") refreshAll();
+      else { loadNav(); if (window.PlanView) PlanView.refresh(); }
+    });
+  }, 30000);
 })();
 </script>
 </body>

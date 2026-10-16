@@ -95,6 +95,70 @@ class WsCliTest(unittest.TestCase):
         self.assertEqual(set_task("WS3", "missing", "done", None, None), 2)
         self.assertEqual(cmd_ws(["task", "WS3", "WS3.1", "nope"]), 2)
 
+    def test_approvals_schema_cli_and_naming(self):
+        from io import StringIO
+        from contextlib import redirect_stdout
+
+        self.assertEqual(cmd_ws(["new", "WS9", "Example workstream"]), 0)
+        self.assertEqual(cmd_ws(["approve", "WS9", "sample-load", "pending"]), 2)
+        root = Path(self.tmp.name) / "WS9"
+        self.assertFalse((root / "approvals.json").exists())
+        self.assertEqual(
+            cmd_ws(["approve", "WS9", "sample-load", "pending", "--step", "Load the sample set before cutover", "--reversible", "no", "--conditions", "The sample set is on disk."]),
+            0,
+        )
+        self.assertFalse((root / "approvals.json.tmp").exists())
+        data = json.loads((root / "approvals.json").read_text(encoding="utf-8"))
+        self.assertEqual(data["ws"], "WS9")
+        self.assertIsNone(data["decided_at"])
+        self.assertIsNone(data["decided_by"])
+        self.assertEqual(data["items"][0]["status"], "pending")
+        self.assertIs(data["items"][0]["reversible"], False)
+        self.assertEqual(validate_bundle("WS9"), [])
+        self.assertEqual(cmd_ws(["approve", "WS9", "sample-load", "approved", "--note", "Owner signed off."]), 0)
+        data = json.loads((root / "approvals.json").read_text(encoding="utf-8"))
+        self.assertEqual(data["items"][0]["status"], "approved")
+        self.assertEqual(data["items"][0]["note"], "Owner signed off.")
+        self.assertEqual(data["decided_by"], "owner")
+        self.assertTrue(data["decided_at"])
+        self.assertFalse((root / "approvals.json.tmp").exists())
+        buf = StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(cmd_ws(["approvals", "WS9"]), 0)
+        text = buf.getvalue()
+        self.assertIn("STATUS", text)
+        self.assertIn("sample-load", text)
+        self.assertIn("one-way", text)
+        self.assertEqual(cmd_ws(["approve", "WS9", "route-name", "denied", "--step", "Keep the public route name", "--reversible", "yes", "--conditions", "Clients already call this route."]), 0)
+        broken = json.loads((root / "approvals.json").read_text(encoding="utf-8"))
+        broken["items"][0]["status"] = "maybe"
+        broken["items"][0]["reversible"] = "no"
+        (root / "approvals.json").write_text(json.dumps(broken), encoding="utf-8")
+        issues = validate_bundle("WS9")
+        self.assertTrue(any("status" in item for item in issues))
+        self.assertTrue(any("reversible" in item for item in issues))
+        (root / "approvals.json").write_text(
+            "\n".join([
+                "{",
+                '  "ws": "WS9",',
+                '  "decided_at": null,',
+                '  "decided_by": null,',
+                '  "items": [{',
+                '    "id": "bare",',
+                '    "step": "ADR 0099 scopes the log",',
+                '    "status": "pending",',
+                '    "reversible": true,',
+                '    "conditions": "None."',
+                "  }]",
+                "}",
+                "",
+            ]),
+            encoding="utf-8",
+        )
+        issues = validate_bundle("WS9")
+        self.assertTrue(any("ADR 0099" in item for item in issues))
+        self.assertEqual(cmd_ws(["approvals", "NOPE"]), 2)
+
 
 if __name__ == "__main__":
     unittest.main()
