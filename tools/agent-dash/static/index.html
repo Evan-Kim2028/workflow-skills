@@ -994,6 +994,7 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
   }
   setTimeout(warmTabs, 1500);
   setInterval(warmTabs, 45000);
+  setInterval(function () { if (!state.wss.length) return; loadPlanSums().then(function () { if (state.view === "exec" && state.ws === "all") drawMain(); }); }, 30000);
   function refreshAll() {
     var ws = state.ws;
     var gen = ++execGen;
