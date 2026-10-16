@@ -5,6 +5,8 @@ Custom skills and small tools for running multi-agent workflows with Claude Code
 | Skill | What it does |
 |---|---|
 | [`workstream-dashboard`](skills/workstream-dashboard/SKILL.md) | Local dashboard for agent runs: live agents per workstream, token use and cost, a run timeline, and a plan map per workstream. Tool: [`tools/agent-dash`](tools/agent-dash/README.md). |
+| `ws-wave` workflow | Runs one workstream wave in Claude Code's Workflow tool: each lane is built, reviewed and fixed by muse (default) or Grok workers until approved, with Haiku wrappers only. [`tools/agent-dash/workflows/ws-wave.js`](tools/agent-dash/workflows/ws-wave.js), guide: [`docs/workstream-lead.md`](tools/agent-dash/docs/workstream-lead.md). |
+| Worker launchers | [`run_worker.sh`](tools/agent-dash/scripts/run_worker.sh) starts a muse or Grok worker once and waits for it; [`launch_grok.sh`](tools/agent-dash/scripts/launch_grok.sh) runs headless Grok and logs its billed tokens for the dashboard. |
 
 ## Install
 

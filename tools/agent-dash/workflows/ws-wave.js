@@ -1,6 +1,6 @@
 export const meta = {
   name: 'ws-wave',
-  description: 'Run one workstream wave: each lane is built, reviewed and fixed by Grok or muse workers until approved, with Haiku wrappers only',
+  description: 'Run one workstream wave: each lane is built, reviewed and fixed by muse (default) or Grok workers until approved, with Haiku wrappers only',
   whenToUse: 'A workstream lead runs one wave of independent lanes (no shared files) and wants Grok/muse to do the work, not Claude subagents',
   phases: [
     { title: 'Build', detail: 'one Grok or muse worker per lane, in its own worktree', model: 'haiku' },
@@ -13,7 +13,7 @@ export const meta = {
 //   template: "/abs/.claude/templates/worker-common.md",
 //   runner: "/abs/.claude/tools/agent-dash/scripts/run_worker.sh",
 //   dash: "/abs/.claude/tools/agent-dash/agent_dash.py",
-//   maxFixRounds: 2, reviewTier: "grok",
+//   maxFixRounds: 2, defaultTier: "muse", reviewTier: "muse",   (both default to muse)
 //   lanes: [{ task: "WS7.K1", slug: "kind-checker", tier: "grok"|"muse", branch: "ws7/kind-checker",
 //             worktree: "/abs/lor-wt-ws7-kind", brief: "what to build, files, stop rules", tests: "pytest a.py b.py",
 //             review: true }]
@@ -22,7 +22,8 @@ const A = args || {}
 const WS = A.ws
 const LOWER = String(WS || '').toLowerCase()
 const MAX_FIX = A.maxFixRounds == null ? 2 : A.maxFixRounds
-const REVIEW_TIER = A.reviewTier || 'grok'
+const DEFAULT_TIER = A.defaultTier || 'muse'
+const REVIEW_TIER = A.reviewTier || DEFAULT_TIER
 if (!WS || !A.repo || !A.runDir || !A.template || !A.runner || !A.dash || !Array.isArray(A.lanes) || !A.lanes.length) {
   throw new Error('ws-wave needs args {ws, repo, runDir, template, runner, dash, lanes[]}')
 }
@@ -88,7 +89,7 @@ function base(lane) { return `${LOWER}-${lane.task}-${lane.slug}` }
 
 function run(lane, kind, round, task, extra) {
   const label = kind === 'build' ? base(lane) : `${base(lane)}-${kind}${round}`
-  const tier = kind === 'rev' ? REVIEW_TIER : lane.tier
+  const tier = kind === 'rev' ? REVIEW_TIER : (lane.tier || DEFAULT_TIER)
   return agent(wrapperPrompt({
     label, tier, task, workspace: lane.worktree,
     promptFile: `${A.runDir}/${label}.md`,
