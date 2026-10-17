@@ -23,7 +23,7 @@ python3 agent_dash.py backfill --session <claude-session-uuid>
 
 Do not run it with `python3 -I` (the package imports from its own directory). Restart after changing any Python module. `static/` files are read on every request.
 
-Health check after any change: `curl -s http://127.0.0.1:8765/api/health` (every source `last_error: null`), `curl -s 'http://127.0.0.1:8765/api/snapshot?ws=all'`, `/api/plan?ws=WS1` when that workstream has a plan, and `python3 agent_dash.py check` (exits 0 when every number reconciles).
+Health check after any change: `curl -s http://127.0.0.1:8765/api/health` (every source `last_error: null`), `curl -s 'http://127.0.0.1:8765/api/snapshot?ws=all'`, `/api/plan?ws=WS1` when that workstream has a plan, `python3 agent_dash.py check` (exits 0 when every number reconciles), and `python3 agent_dash.py check --page` (drives the live page in headless Chrome and compares every rendered tile and chart legend against the API; skips with a clear message when Chrome is missing).
 
 With no `config.local.json`, scratch roots and the hub tracker are empty. Those sources poll nothing and stay healthy. Claude, muse, grok, and cursor roots still default under `$HOME` and are skipped when the directory is missing.
 

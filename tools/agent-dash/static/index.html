@@ -331,6 +331,7 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
 <div class="tip" id="tip"></div>
 <aside class="drawer" id="drawer" aria-label="Run details"></aside>
 <script src="/static/format.js"></script>
+<script src="/static/tokencache.js"></script>
 <script src="/static/models.js"></script>
 <script src="/static/vendor/mermaid.min.js"></script>
 <script src="/static/plan.js"></script>
@@ -459,14 +460,37 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
     var node = document.querySelector(location.hash);
     if (node && node.scrollIntoView) node.scrollIntoView();
   }
+  /* One source per number: the exec cache is keyed by tab, range and usage
+     grouping, and an entry older than one refresh interval never draws. A tab
+     switch draws cached data only when its key matches, otherwise a loading
+     state, never another tab's numbers. */
+  function groupFor() { return state.ws === "all" ? state.groupBy : "model"; }
+  function reqKey() { return ADC.currentKey(state); }
+  function getCache() {
+    var hit = execCache[reqKey()];
+    if (hit && ADC.fresh(hit, Date.now(), ADC.TTL_MS)) return hit;
+    return null;
+  }
+  function setCache(key, body) { body.at = Date.now(); body.key = key; execCache[key] = body; }
+  function applyHit(hit) {
+    state.snap = hit.snap; state.runs = hit.runs; state.usage = hit.usage; state.conc = hit.conc; state.plan = hit.plan; state.seq = hit.seq; state.approvals = hit.approvals || [];
+  }
+  function showLoading() {
+    state.snap = null; state.runs = []; state.usage = []; state.conc = []; state.plan = null; state.approvals = [];
+    var m = document.getElementById("main");
+    m.innerHTML = "";
+    m.appendChild(el("div", {class: "card", id: "exec-loading"}, [el("h2", {text: "Loading " + (state.ws === "all" ? "overview" : state.ws) + " · last " + state.hours + " h"}), el("div", {class: "skel"}), el("div", {class: "skel"}), el("div", {class: "skel"})]));
+  }
   function showCurrent() {
     applyChrome();
     renderTabs();
     if (state.view === "exec") {
-      var hit = execCache[state.ws];
+      var hit = getCache();
       if (hit) {
-        state.snap = hit.snap; state.runs = hit.runs; state.usage = hit.usage; state.conc = hit.conc; state.plan = hit.plan; state.seq = hit.seq; state.approvals = hit.approvals || [];
+        applyHit(hit);
         drawMain();
+      } else {
+        showLoading();
       }
       refreshAll();
       return;
@@ -521,7 +545,7 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
   function renderTabs() {
     var t = document.getElementById("tabs"); t.innerHTML = "";
     tabRows().forEach(function (w) {
-      var b = el("button", {class: "tab", role: "tab", "aria-selected": String(state.ws === w.ws), onclick: function () { selectTab(w.ws); }}, [w.name]);
+      var b = el("button", {class: "tab", role: "tab", "data-ws": w.ws, "aria-selected": String(state.ws === w.ws), onclick: function () { selectTab(w.ws); }}, [w.name]);
       if (w.running) b.appendChild(el("span", {class: "c", text: w.running + " live"}));
       t.appendChild(b);
     });
@@ -536,22 +560,25 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
   function go(ws) { selectTab(ws); }
 
   /* components */
+  /* Token and cost tiles read the server snapshot totals for this scope and
+     range (windowed and reconciled server-side). They never re-sum usage
+     buckets on the client, so the tile and the chart legend cannot drift. */
   function tiles(snap) {
+    snap = snap || {};
     var run = snap.running || [], byTier = {};
     run.forEach(function (r) { var k = tierKey(r); byTier[k] = (byTier[k] || 0) + 1; });
-    /* Tokens and cost come from the hourly usage buckets for this range, the same numbers as the tokens chart. */
-    var tk = {input: 0, output: 0, cache_read: 0, cache_write: 0}, cost = 0, unpriced = {}, anyCost = false, t0 = since();
-    (state.usage || []).forEach(function (b) {
-      if (b.t + 3600 <= t0) return;
-      ["input", "output", "cache_read", "cache_write"].forEach(function (f) { tk[f] += b[f] || 0; });
-      var used = (b.input || 0) + (b.output || 0) + (b.cache_read || 0) + (b.cache_write || 0);
-      var priced = b.priced_cost_usd != null ? b.priced_cost_usd : b.cost_usd;
-      if (priced != null) { cost += priced; anyCost = true; }
-      var gapTok = b.unpriced_tokens != null ? b.unpriced_tokens : (b.cost_usd == null ? used : 0);
-      if (gapTok) unpriced[b.key || "unattributed"] = (unpriced[b.key || "unattributed"] || 0) + gapTok;
-    });
-    var allTok = tokTotal(tk), unp = Object.keys(unpriced), unpTok = unp.reduce(function (a, k) { return a + unpriced[k]; }, 0);
-    var unpTxt = !unp.length ? "every model priced" : fmtN(unpTok) + " tokens unpriced" + (state.ws === "all" && state.groupBy !== "model" ? "" : " (" + ADM.sortKeys(unp).map(fullName).join(", ") + ")");
+    var tk = ((snap.totals || {}).tokens) || {};
+    var allTok = ADC.billed(tk);
+    var cost = (snap.totals && snap.totals.cost_usd) || 0;
+    var unp = (snap.totals && snap.totals.unpriced_runs) || 0;
+    var at = ((snap.totals_all_time || {}).tokens) || {};
+    var allTimeTok = ADC.billed(at);
+    var allTimeCost = (snap.totals_all_time && snap.totals_all_time.cost_usd) || 0;
+    var agoTxt = ADC.ago(Date.now() / 1000, snap.last_activity);
+    var tokVal = allTok ? fmtN(allTok) : "0 in " + state.hours + " h";
+    var tokSub = allTok ? cachedPct(tk) + "% cached \u00B7 out " + fmtN(tk.output || 0)
+      : (agoTxt ? "last run " + agoTxt + " \u00B7 " + fmtN(allTimeTok) + " all time" : "no runs yet");
+    var costSub = (unp ? fmtN(unp) + " run" + (unp === 1 ? "" : "s") + " unpriced \u00B7 " : "every model priced \u00B7 ") + fmtUsd(allTimeCost) + " all time";
     var g = el("div", {class: "grid g-tiles", id: "exec-tiles", "data-nav": "Summary"});
     var cn = snap.counts || {}, lbt = cn.live_by_tool || {}, fv = cn.finished_by_verdict || {};
     var lbm = cn.live_by_model || {}, byFam = {};
@@ -560,11 +587,15 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
     var liveSub = ADM.FAMS.filter(function (f) { return byFam[f]; }).map(function (f) { var ks = byFam[f], n = ks.reduce(function (a, k) { return a + lbm[k]; }, 0); return ADM.FAM[f].name + " " + fmtN(n) + " (" + ks.map(function (k) { return ADM.nameOf(k) + " " + fmtN(lbm[k]); }).join(", ") + ")"; }).join(" \u00B7 ") || "idle";
     if (cn.prod_jobs) { var jobTxt = fmtN(cn.prod_jobs) + " prod jobs"; liveSub = liveSub === "idle" ? jobTxt : liveSub + " \u00B7 " + jobTxt; }
     var bad = (fv.BLOCKED || 0) + (fv.REQUEST_CHANGES || 0), part = (fv.PARTIAL || 0) + (fv.APPROVE_WITH_CHANGES || 0);
-    [["Agents live now", fmtN(cn.live_agents != null ? cn.live_agents : run.filter(isAgent).length), liveSub],
-     ["Agents finished today", fmtN(cn.finished_today || 0), "\u2713 " + fmtN((fv.PASS || 0) + (fv.APPROVE || 0) + (fv.APPROVE_WITH_NITS || 0)) + " pass \u00B7 \u25D0 " + fmtN(part) + " partial \u00B7 \u2715 " + fmtN(bad) + " blocked (" + state.hours + " h)"],
-     ["Tokens (" + state.hours + " h)", fmtN(allTok), cachedPct(tk) + "% cached \u00B7 out " + fmtN(tk.output)],
-     ["Est. cost (" + state.hours + " h)", anyCost ? fmtUsd(cost) : "\u2013", unpTxt]
-    ].forEach(function (t) { g.appendChild(el("div", {class: "card tile"}, [el("div", {class: "v", text: String(t[1])}), el("div", {class: "l", text: t[0]}), el("div", {class: "x", text: t[2]})])); });
+    [["Agents live now", fmtN(cn.live_agents != null ? cn.live_agents : run.filter(isAgent).length), liveSub, null],
+     ["Agents finished today", fmtN(cn.finished_today || 0), "\u2713 " + fmtN((fv.PASS || 0) + (fv.APPROVE || 0) + (fv.APPROVE_WITH_NITS || 0)) + " pass \u00B7 \u25D0 " + fmtN(part) + " partial \u00B7 \u2715 " + fmtN(bad) + " blocked (" + state.hours + " h)", null],
+     ["Tokens (" + state.hours + " h)", tokVal, tokSub, {"data-tile": "tokens", "data-ws": state.ws, "data-hours": String(state.hours), "data-tokens": String(allTok), "data-tokens-all-time": String(allTimeTok)}],
+     ["Est. cost (" + state.hours + " h)", fmtUsd(cost), costSub, {"data-tile": "cost", "data-ws": state.ws, "data-hours": String(state.hours), "data-cost-usd": String(cost), "data-cost-all-time": String(allTimeCost)}]
+    ].forEach(function (t) {
+      var attrs = {class: "card tile"};
+      if (t[3]) for (var a in t[3]) attrs[a] = t[3][a];
+      g.appendChild(el("div", attrs, [el("div", {class: "v", text: String(t[1])}), el("div", {class: "l", text: t[0]}), el("div", {class: "x", text: t[2]})]));
+    });
     return g;
   }
 
@@ -614,9 +645,20 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
     var max = 0; ts.forEach(function (t) { var sum = 0; ks.forEach(function (k) { sum += hours[t][k] || 0; }); max = Math.max(max, sum); });
     var keyTot = {}, grand = 0; ts.forEach(function (t) { ks.forEach(function (k) { var v = hours[t][k] || 0; keyTot[k] = (keyTot[k] || 0) + v; grand += v; }); });
     var keyLbl = {}; ks.forEach(function (k) { keyLbl[k] = fmtN(keyTot[k]); });
+    /* The legend Total is the server snapshot total for this scope and range,
+       the same number the tile shows. The chart sums its own buckets; when the
+       two ever differ the page says so instead of hiding it. */
+    var snapTok = (state.snap && state.snap.totals) ? ADC.billed(state.snap.totals.tokens) : null;
+    var showTotal = snapTok == null ? grand : snapTok;
     var lg; if (byModel) lg = modelLegend(ks, keyLbl); else { lg = el("div", {class: "legend"}); ks.forEach(function (k) { var sp = el("span"); var sw = el("i", {class: "sw"}); sw.style.background = colorOf(k, state.groupBy); sp.appendChild(sw); sp.appendChild(document.createTextNode(k + " " + keyLbl[k])); lg.appendChild(sp); }); }
-    lg.insertBefore(el("span", {class: "ltotal", title: "All tokens in this window, input + output + cache read + cache write. The legend values add up to it."}, [el("b", {text: "Total " + fmtN(grand)}), document.createTextNode(" · " + fmtN(ts.length ? grand / ts.length : 0) + "/h avg · peak " + fmtN(max) + "/h")]), lg.firstChild);
+    var ltotal = el("span", {class: "ltotal", title: "All tokens in this window, input + output + cache read + cache write. The legend values add up to it.", "data-legend-total": String(showTotal), "data-chart-sum": String(grand)}, [el("b", {text: "Total " + fmtN(showTotal)}), document.createTextNode(" · " + fmtN(ts.length ? showTotal / ts.length : 0) + "/h avg · peak " + fmtN(max) + "/h")]);
+    lg.insertBefore(ltotal, lg.firstChild);
     c.appendChild(lg);
+    if (snapTok != null && grand !== snapTok) {
+      var xline = el("p", {class: "xline", "data-warn": "token-total", title: "The tile reads the server total; the chart sums its own buckets. They should agree.", text: "\u26A0 tile " + fmtN(snapTok) + " \u00B7 chart " + fmtN(grand)});
+      xline.setAttribute("style", "margin:0 0 8px;font-size:12px;color:var(--warning)");
+      c.appendChild(xline);
+    }
     var W = CW(), H = 270, L = 64, R = 14, T = 28, Bm = 42, pw = W - L - R, ph = H - T - Bm, h0 = Math.floor(since() / 3600) * 3600, nH = Math.max(1, Math.ceil((Date.now() / 1000 - h0) / 3600)), slot = pw / nH, bw = Math.max(3, Math.min(28, slot - 4));
     var svg = s("svg", {viewBox: "0 0 " + W + " " + H, width: W, height: H, style: "display:block;max-width:100%", role: "img", "aria-label": "Tokens per hour stacked by " + state.groupBy});
     var nice = niceMax(max), xt = [];
@@ -861,7 +903,7 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
   }};
   function wsCard(id, name, live, tokens, cost, pr, clickable) {
     var pc = (pr && pr.counts) || {}, tot = (pr && pr.total) || 0, pct = (pr && pr.pct) || 0, done = (pr && pr.done) || 0;
-    var attrs = {class: "card wsc"};
+    var attrs = {class: "card wsc", "data-wsc": id, "data-ws": "all", "data-hours": String(state.hours), "data-tokens": String(tokens || 0), "data-cost-usd": String(cost || 0)};
     if (clickable) attrs.onclick = function () { go(id); };
     var card = el("div", attrs);
     var top = el("div", {class: "top"}, [el("span", {class: "id", text: id}), el("span", {class: "st " + (live ? "running" : "done")}, [el("i"), live ? live + " running" : "idle"])]);
@@ -872,14 +914,22 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
     card.appendChild(el("div", {style: "font:12px var(--mono);color:var(--muted)", title: "From the workstream plan: " + done + " done, " + (pc.prog || 0) + " merged waiting on prod, " + (pc.pr || 0) + " waiting to merge, " + (pc.todo || 0) + " not started" + (pc.deferred ? ", " + pc.deferred + " deferred (not counted)" : ""), text: done + "/" + tot + " tasks (" + pct + "%) \u00B7 " + fmtN(tokens) + " tok \u00B7 " + fmtUsd(cost)}));
     return card;
   }
+  /* Overview per-workstream figures come from the same snapshot the tiles read,
+     so each card shows exactly what that workstream's own tab shows. */
   function wsCards() {
     var c = el("div", {class: "grid g-tiles"});
+    var byWs = {};
+    ((state.snap && state.snap.by_workstream) || []).forEach(function (r) { byWs[r.ws] = r; });
     shown(state.wss).forEach(function (w) {
-      c.appendChild(wsCard(w.ws, w.name, w.live_agents, w.tokens, w.cost_usd, planSum[w.ws], true));
+      var hit = byWs[w.ws];
+      c.appendChild(wsCard(w.ws, w.name, w.live_agents, hit ? hit.tokens : w.tokens, hit ? hit.cost_usd : w.cost_usd, planSum[w.ws], true));
     });
     /* Runs with no workstream: the overview total visibly equals the sum. */
     (state.wss || []).forEach(function (w) {
-      if (w.ws === "unassigned") c.appendChild(wsCard("Unassigned", "runs with no workstream", w.live_agents, w.tokens, w.cost_usd, null, false));
+      if (w.ws === "unassigned") {
+        var hit2 = byWs[w.ws];
+        c.appendChild(wsCard("Unassigned", "runs with no workstream", w.live_agents, hit2 ? hit2.tokens : w.tokens, hit2 ? hit2.cost_usd : w.cost_usd, null, false));
+      }
     });
     return c;
   }
@@ -1294,9 +1344,12 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
     var specs = [];
     if (state.ws === "all" && state.wss.length) specs.push(["program", keyOf([state.wss.map(function (w) { return [w.ws, w.running, w.name]; }), planSum, planPrompt]), function () { return programPanel(); }, ""]);
     specs.push(
-      ["tiles", keyOf([snap.counts, snap.totals, state.usage, state.hours]), function () { return tiles(snap); }, state.ws === "all" ? "margin-top:14px" : ""],
+      ["tiles", keyOf([snap.counts, snap.totals, snap.totals_all_time, snap.last_activity, state.hours, state.ws]), function () { return tiles(snap); }, state.ws === "all" ? "margin-top:14px" : ""],
       ["running", keyOf((snap.running || []).map(runRow)), function () { return runsTable("Running now", "Click a row for details. Output \u25B2 means the out file grew since the last poll.", snap.running || [], "Nothing running."); }, "margin-top:14px"]
     );
+    /* Workstream cards on the overview read the same snapshot rows the tiles
+       read, so each card matches its workstream tab for the same range. */
+    if (state.ws === "all") specs.push(["cards", keyOf([(snap.by_workstream || []), planSum, state.hours]), function () { return wsCards(); }, "margin-top:14px"]);
     if (state.ws === "all" && state.wss.length && !Object.keys(planSum).length) loadPlanSums().then(function () { delete secCache.program; drawMain(); });
     if (state.plan) specs.push(["plan", keyOf([state.plan, (snap.running || []).map(function (r) { return [r.label, r.workstream, r.run_id]; }), (snap.recent || []).map(function (r) { return [r.label, r.ended_at, r.verdict]; }), (state.runs || []).length]), function () { return planCard(state.plan, snap); }, "margin-top:14px"]);
     specs.push(["tokens", keyOf([state.usage, state.groupBy, state.hours, Math.floor(Date.now() / 60000)]), function () { return tokenChart(); }, "margin-top:14px"]);
@@ -1321,7 +1374,18 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
 
   function since() { return Math.floor(Date.now() / 1000 - state.hours * 3600); }
   function wsParam() { return state.ws === "all" ? {} : {ws: state.ws}; }
-  function loadUsage() { var p = Object.assign({group: state.ws === "all" ? state.groupBy : "model", bucket: "hour", since: since()}, wsParam()); return api("/api/usage", p).then(function (j) { state.usage = j.buckets || []; if (execCache[state.ws]) execCache[state.ws].usage = state.usage; }).catch(function () { state.usage = []; }); }
+  /* Every async response applies only when it still matches the current tab,
+     range and grouping; a late arrival from another scope is dropped. */
+  function loadUsage() {
+    var key = reqKey();
+    var p = Object.assign({group: groupFor(), bucket: "hour", since: since()}, wsParam());
+    return api("/api/usage", p).then(function (j) {
+      if (!ADC.applies(key, state)) return;
+      state.usage = j.buckets || [];
+      var hit = execCache[key];
+      if (hit) hit.usage = state.usage;
+    }).catch(function () { if (ADC.applies(key, state)) state.usage = []; });
+  }
   function loadNav() {
     var bundlesP = fetch(FIX ? "../fixtures/bundles.json" : "/api/bundles", {cache: "no-store"}).then(function (r) { return r.ok ? r.json() : {bundles: []}; }).then(function (j) { state.bundles = j.bundles || []; }).catch(function () {});
     var wsP = api("/api/workstreams", {since: since()}).then(function (j) { state.wss = j.workstreams || []; }).catch(function () {});
@@ -1342,25 +1406,28 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
       foot.appendChild(mark);
     }).catch(function () {});
   }
-  /* Warm every other tab's Execution data in the background, one tab at a time, so a first switch draws from cache instantly. */
+  /* Warm every other tab's Execution data in the background, one tab at a time, so a first switch draws from cache instantly. Entries are keyed by tab and range with the range captured up front, and fresh entries are not refetched. */
   var warming = false;
   function warmTabs() {
     if (warming || FIX) return;
+    var hours = state.hours, group = state.groupBy, reqSince = Math.floor(Date.now() / 1000 - hours * 3600);
     var list = ["all"].concat(shown(state.wss).map(function (w) { return w.ws; })).filter(function (ws) { return ws !== state.ws; });
     if (!list.length) return;
     warming = true;
     var step = function (i) {
       if (i >= list.length) { warming = false; return; }
-      var ws = list[i], wsArg = ws === "all" ? {} : {ws: ws}, group = ws === "all" ? state.groupBy : "model";
+      var ws = list[i], wsArg = ws === "all" ? {} : {ws: ws}, wsGroup = ws === "all" ? group : "model";
+      var key = ADC.key(ws, hours, wsGroup);
+      if (execCache[key] && ADC.fresh(execCache[key], Date.now(), ADC.TTL_MS)) { setTimeout(function () { step(i + 1); }, 150); return; }
       Promise.all([
-        api("/api/snapshot", {ws: ws, since: since()}).catch(function () { return null; }),
-        api("/api/runs", Object.assign({since: since(), limit: 400}, wsArg)).then(function (j) { return j.runs || []; }).catch(function () { return []; }),
-        api("/api/usage", Object.assign({group: group, bucket: "hour", since: since()}, wsArg)).then(function (j) { return j.buckets || []; }).catch(function () { return []; }),
-        api("/api/concurrency", Object.assign({since: since(), step: 60}, wsArg)).then(function (j) { return j.points || []; }).catch(function () { return []; }),
+        api("/api/snapshot", {ws: ws, since: reqSince}).catch(function () { return null; }),
+        api("/api/runs", Object.assign({since: reqSince, limit: 400}, wsArg)).then(function (j) { return j.runs || []; }).catch(function () { return []; }),
+        api("/api/usage", Object.assign({group: wsGroup, bucket: "hour", since: reqSince}, wsArg)).then(function (j) { return j.buckets || []; }).catch(function () { return []; }),
+        api("/api/concurrency", Object.assign({since: reqSince, step: 60}, wsArg)).then(function (j) { return j.points || []; }).catch(function () { return []; }),
         ws !== "all" ? api("/api/plan", {ws: ws}).then(function (j) { return j && j.groups ? j : null; }).catch(function () { return null; }) : Promise.resolve(null),
         api("/api/approvals", {ws: ws === "all" ? "all" : ws}).then(approvalList).catch(function () { return []; })
       ]).then(function (p) {
-        if (p[0] && ws !== state.ws) execCache[ws] = {snap: p[0], runs: p[1], usage: p[2], conc: p[3], plan: p[4], seq: p[0].seq, approvals: p[5]};
+        if (p[0]) setCache(key, {snap: p[0], runs: p[1], usage: p[2], conc: p[3], plan: p[4], seq: p[0].seq, approvals: p[5]});
       }).then(function () { setTimeout(function () { step(i + 1); }, 150); });
     };
     step(0);
@@ -1370,22 +1437,24 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
   setInterval(function () { if (!state.wss.length) return; loadPlanSums().then(function () { if (state.view === "exec" && state.ws === "all") drawMain(); }); }, 30000);
   function refreshAll() {
     var ws = state.ws;
+    var key = reqKey();
     var gen = ++execGen;
     var wsArg = ws === "all" ? {} : {ws: ws};
-    var group = ws === "all" ? state.groupBy : "model";
+    var group = groupFor();
+    var reqSince = since();
     var jobs = [
-      api("/api/snapshot", {ws: ws, since: since()}).catch(function () { return null; }),
-      api("/api/runs", Object.assign({since: since(), limit: 400}, wsArg)).then(function (j) { return j.runs || []; }).catch(function () { return []; }),
-      api("/api/usage", Object.assign({group: group, bucket: "hour", since: since()}, wsArg)).then(function (j) { return j.buckets || []; }).catch(function () { return []; }),
-      api("/api/concurrency", Object.assign({since: since(), step: 60}, wsArg)).then(function (j) { return j.points || []; }).catch(function () { return []; }),
+      api("/api/snapshot", {ws: ws, since: reqSince}).catch(function () { return null; }),
+      api("/api/runs", Object.assign({since: reqSince, limit: 400}, wsArg)).then(function (j) { return j.runs || []; }).catch(function () { return []; }),
+      api("/api/usage", Object.assign({group: group, bucket: "hour", since: reqSince}, wsArg)).then(function (j) { return j.buckets || []; }).catch(function () { return []; }),
+      api("/api/concurrency", Object.assign({since: reqSince, step: 60}, wsArg)).then(function (j) { return j.points || []; }).catch(function () { return []; }),
       loadNav(),
       ws !== "all" ? api("/api/plan", {ws: ws}).then(function (j) { return j && j.groups ? j : null; }).catch(function () { return null; }) : Promise.resolve(null),
       api("/api/approvals", {ws: ws === "all" ? "all" : ws}).then(approvalList).catch(function () { return []; })
     ];
     return Promise.all(jobs).then(function (parts) {
-      if (gen !== execGen) return;
+      if (gen !== execGen || !ADC.applies(key, state)) return;
       if (!parts[0]) {
-        if (!execCache[ws] && state.view === "exec" && state.ws === ws) { drawMain(); setLive(false); }
+        if (!getCache() && state.view === "exec") { drawMain(); setLive(false); }
         return;
       }
       state.snap = parts[0];
@@ -1395,16 +1464,17 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
       state.conc = parts[3];
       state.plan = parts[5];
       state.approvals = parts[6];
-      execCache[ws] = {snap: state.snap, runs: state.runs, usage: state.usage, conc: state.conc, plan: state.plan, seq: state.seq, approvals: state.approvals};
+      setCache(key, {snap: state.snap, runs: state.runs, usage: state.usage, conc: state.conc, plan: state.plan, seq: state.seq, approvals: state.approvals});
       if (state.snap && window.DashCache) window.DashCache.snap[ws] = state.snap;
       renderTabs();
-      if (state.view === "exec" && state.ws === ws) {
+      if (state.view === "exec") {
         drawMain();
+        window.__adSettled = state.ws + "|" + state.hours + "|" + state.seq;
         setLive(true);
         if (state.ws === "all") refreshFoot();
         else { var foot = document.getElementById("foot"); if (foot) foot.textContent = "Updated " + new Date().toLocaleTimeString() + (FIX ? " · fixture data" : "") + " · read-only, 127.0.0.1"; }
       }
-    }).catch(function () { if (gen === execGen) setLive(false); });
+    }).catch(function () { if (gen === execGen && ADC.applies(key, state)) setLive(false); });
   }
   function setLive(ok) { document.getElementById("live-dot").className = "dot" + (ok ? " on" : ""); document.getElementById("live-txt").textContent = ok ? "live" : "offline"; }
 
@@ -1415,11 +1485,12 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
     es.onerror = function () { setLive(false); };
   }
   function refreshSnapshot() {
-    var ws = state.ws;
+    var ws = state.ws, key = reqKey();
     api("/api/snapshot", {ws: ws, since: since()}).then(function (j) {
-      if (state.ws !== ws) return;
+      if (!ADC.applies(key, state)) return;
       state.snap = j; state.seq = j.seq;
-      if (execCache[ws]) execCache[ws].snap = j;
+      var hit = execCache[key];
+      if (hit) hit.snap = j;
       if (window.DashCache) window.DashCache.snap[ws] = j;
       if (state.view === "exec") drawMain();
     }).catch(function () {});

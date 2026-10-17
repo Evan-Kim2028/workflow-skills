@@ -134,7 +134,7 @@ class FixtureShapeTests(unittest.TestCase):
             self.assertIsInstance(doc["seq"], int)
             self.assertEqual(
                 set(doc) - {"_note"},
-                {"now", "seq", "counts", "running", "recent", "totals", "by_workstream"},
+                {"now", "seq", "counts", "running", "recent", "totals", "totals_all_time", "last_activity", "by_workstream"},
             )
             counts = doc["counts"]
             self.assertEqual(
@@ -161,10 +161,12 @@ class FixtureShapeTests(unittest.TestCase):
             for row in doc["by_workstream"]:
                 self.assertEqual(
                     set(row),
-                    {"ws", "live_agents", "finished_in_range", "finished_today", "tokens", "cost_usd", "last_activity"},
+                    {"ws", "live_agents", "finished_in_range", "finished_today", "tokens", "cost_usd", "tokens_all_time", "cost_usd_all_time", "last_activity"},
                 )
                 self.assertIsInstance(row["tokens"], int)
                 self.assertTrue(num(row["cost_usd"]))
+                self.assertIsInstance(row["tokens_all_time"], int)
+                self.assertTrue(num(row["cost_usd_all_time"]))
         self.assertEqual(self.snap["now"], self.ws7["now"])
         self.assertIn("counts", self.snap)
         self.assertIn("counts", self.ws7)
@@ -341,13 +343,20 @@ class FixtureShapeTests(unittest.TestCase):
 
     def test_reconcile_fixture(self):
         doc = self.docs["reconcile.json"]
-        self.assertEqual(set(doc), {"now", "since", "until", "all", "rows", "unassigned", "mismatches", "_note"})
+        self.assertEqual(set(doc), {"now", "since", "until", "all", "all_time", "rows", "unassigned", "mismatches", "_note"})
         self.assertEqual(doc["mismatches"], [])
         self.assertEqual(set(doc["all"]), {"live_agents", "finished_in_range", "finished_today", "tokens", "cost_usd"})
+        self.assertEqual(set(doc["all_time"]), {"tokens", "cost_usd"})
         everything = list(doc["rows"]) + [doc["unassigned"]]
         for metric in ("live_agents", "finished_in_range", "finished_today", "tokens"):
             self.assertEqual(sum(row[metric] for row in everything), doc["all"][metric])
         self.assertAlmostEqual(sum(row["cost_usd"] for row in everything), doc["all"]["cost_usd"], delta=0.05)
+        self.assertEqual(
+            sum(row["tokens_all_time"] for row in everything), doc["all_time"]["tokens"]
+        )
+        self.assertAlmostEqual(
+            sum(row["cost_usd_all_time"] for row in everything), doc["all_time"]["cost_usd"], delta=0.05
+        )
         self.assertEqual(sum(row["live_agents"] for row in everything), self.snap["counts"]["live_agents"])
         self.assertEqual(doc["all"]["tokens"], sum(self.snap["totals"]["tokens"][k] for k in TOKEN_KEYS))
         health = self.docs["health.json"]

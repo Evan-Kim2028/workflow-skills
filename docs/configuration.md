@@ -172,6 +172,16 @@ python3 agent_dash.py ws approvals <ID>
 per workstream plus the unassigned row, and exits 1 on any mismatch. `--url`
 defaults to `http://127.0.0.1:8765` and `--hours` defaults to 12.
 
+`check --page` is the browser regression check. It drives the live page in
+headless Chrome over the DevTools protocol (`tools/agent-dash/scripts/page_check.mjs`,
+Node stdlib only, no npm installs) through the overview and every workstream
+tab at each range (6 h, 12 h, 24 h, 3 d), waits for each view to settle, and
+compares the rendered token and cost tiles plus the chart legend totals against
+`/api/snapshot` and `/api/usage` for the same scope and range. It exits 1 with
+a table on any mismatch and skips with a clear message when Chrome is missing.
+`node tools/agent-dash/scripts/page_check.mjs --url URL [--ws WS2] [--hours 12]`
+runs the same harness directly, limited to one tab or range when given.
+
 ## Add a data source
 
 A collector is a module in `tools/agent-dash/dash/sources/`. The registry imports every module in that package that is not named with a leading underscore. A module is a source when it defines `NAME`, `INTERVAL_S`, and `poll(store, cfg, now)`. An import error is recorded on `/api/health` and that module is skipped. An exception inside `poll` is caught, stored as `last_error`, and the other sources keep polling.

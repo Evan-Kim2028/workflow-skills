@@ -1138,6 +1138,17 @@
     "cost_usd": 3.0178,
     "unpriced_runs": 70
   },
+  "totals_all_time": {
+    "tokens": {
+      "input": 287325,
+      "output": 145236,
+      "cache_read": 598930,
+      "cache_write": 113568,
+      "reasoning": 0
+    },
+    "cost_usd": 3.0178
+  },
+  "last_activity": 1761999840,
   "by_workstream": [
     {
       "ws": "PLANNING",
@@ -1146,7 +1157,9 @@
       "finished_today": 1,
       "tokens": 19339,
       "cost_usd": 0.0985,
-      "last_activity": 1761980960
+      "last_activity": 1761980960,
+      "tokens_all_time": 19339,
+      "cost_usd_all_time": 0.0985
     },
     {
       "ws": "TOOLS",
@@ -1155,7 +1168,9 @@
       "finished_today": 1,
       "tokens": 10207,
       "cost_usd": 0.0,
-      "last_activity": 1761998760
+      "last_activity": 1761998760,
+      "tokens_all_time": 10207,
+      "cost_usd_all_time": 0.0
     },
     {
       "ws": "WS1",
@@ -1164,7 +1179,9 @@
       "finished_today": 36,
       "tokens": 436889,
       "cost_usd": 2.0176,
-      "last_activity": 1761999840
+      "last_activity": 1761999840,
+      "tokens_all_time": 436889,
+      "cost_usd_all_time": 2.0176
     },
     {
       "ws": "WS2",
@@ -1173,7 +1190,9 @@
       "finished_today": 38,
       "tokens": 360883,
       "cost_usd": 0.4083,
-      "last_activity": 1761999840
+      "last_activity": 1761999840,
+      "tokens_all_time": 360883,
+      "cost_usd_all_time": 0.4083
     },
     {
       "ws": "WS7",
@@ -1182,7 +1201,9 @@
       "finished_today": 33,
       "tokens": 317741,
       "cost_usd": 0.4934,
-      "last_activity": 1761999840
+      "last_activity": 1761999840,
+      "tokens_all_time": 317741,
+      "cost_usd_all_time": 0.4934
     }
   ],
   "_note": "Seeded synthetic data for the offline preview. Seed 1. No local sessions are read."

@@ -73,8 +73,14 @@ Workstream attribution happens in core (`attribution.py`), not in sources: label
  "counts": {"live_agents": 0, "live_by_tool": {"grok": 0, "muse": 0, "glm": 0, "claude": 0}, "finished_today": 0, "finished_in_range": 0, "finished_by_verdict": {}},
  "running": [Run], "recent": [Run],
  "totals": {"tokens": {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0, "reasoning": 0}, "cost_usd": 0.0, "unpriced_runs": 0},
- "by_workstream": [{"ws": "WS7", "live_agents": 0, "finished_in_range": 0, "finished_today": 0, "tokens": 0, "cost_usd": 0.0, "last_activity": 0}]}
+ "totals_all_time": {"tokens": {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0, "reasoning": 0}, "cost_usd": 0.0},
+ "last_activity": 0,
+ "by_workstream": [{"ws": "WS7", "live_agents": 0, "finished_in_range": 0, "finished_today": 0, "tokens": 0, "cost_usd": 0.0, "tokens_all_time": 0, "cost_usd_all_time": 0.0, "last_activity": 0}]}
 ```
+`totals` is the windowed scope total; `totals_all_time` is the same scope with
+no window, summed by the same helper. `last_activity` is the scope's newest
+run stamp, or null when the scope has no runs. The page tiles read these
+fields directly and never re-sum buckets on the client.
 One function (`Store._summarize_locked`) computes the all-scope counts and totals,
 every workstream row, and the `unassigned` row from the same run list, the same
 agent rule, and the same window. The `by_workstream` row for a workstream equals
@@ -96,15 +102,22 @@ started_at, ended_at, elapsed_s, clock_source, out_bytes, out_growing, err_bytes
 
 `GET /api/sessions` -> `{"sessions": [{session_id, tool, cwd, label, workstream, started_at, status, runs: n, tokens, cost_usd}]}`
 
-`GET /api/workstreams?since=&until=` -> `{"workstreams": [{ws, name, tk: {backlog, todo, doing, review, done, cancelled}, live_agents, finished_in_range, finished_today, tokens, cost_usd, last_activity, plan: bool}]}`.
+`GET /api/workstreams?since=&until=` -> `{"workstreams": [{ws, name, tk: {backlog, todo, doing, review, done, cancelled}, live_agents, finished_in_range, finished_today, tokens, cost_usd, tokens_all_time, cost_usd_all_time, last_activity, plan: bool}]}`.
 Rows come from the same rollup as the snapshot, so they match the tabs for the
 same window. `tk` is the hub issue board (issue counts, never plan progress).
 An `unassigned` row appears when runs have no workstream.
 
-`GET /api/reconcile?hours=&since=&until=` -> `{"now": 0, "since": 0, "until": 0, "all": {live_agents, finished_in_range, finished_today, tokens, cost_usd}, "rows": [per-workstream rows], "unassigned": {...}, "mismatches": []}`.
-Computed in one store pass under the lock. `mismatches` lists every violated
-invariant and is empty when consistent. `python3 agent_dash.py check [--url URL] [--hours N]`
-prints the rows as a table and exits 1 on any mismatch.
+`GET /api/reconcile?hours=&since=&until=` -> `{"now": 0, "since": 0, "until": 0, "all": {live_agents, finished_in_range, finished_today, tokens, cost_usd}, "all_time": {tokens, cost_usd}, "rows": [per-workstream rows], "unassigned": {...}, "mismatches": []}`.
+Computed in one store pass under the lock. Rows carry `tokens_all_time` and
+`cost_usd_all_time` next to the windowed numbers. `mismatches` lists every violated
+invariant, windowed and all-time (rows plus unassigned equal the all-scope
+numbers, and each row equals its workstream tab), and is empty when consistent.
+`python3 agent_dash.py check [--url URL] [--hours N]` prints the rows as a
+table and exits 1 on any mismatch. `python3 agent_dash.py check --page [--url URL]`
+drives the live page in headless Chrome over the DevTools protocol
+(`scripts/page_check.mjs`, stdlib only) and compares every rendered tile and
+chart legend against the API for the overview and every workstream tab at each
+range; it skips with a clear message when Chrome is missing.
 
 `GET /api/plan?ws=WS7` -> that workstream's plan with a `progress` object:
 `{"ws": "WS7", "cols": [..], "groups": [{id, col, title, tasks: [{id, title, status, deps, kind, dep_notes}]}], "edges": [[a, b]], "phases": [{name, goal, gate}], "progress": {"done": 0, "total": 0, "counts": {todo, wip, pr, prog, done, deferred}, "pct": 0}}`.
@@ -136,11 +149,20 @@ with an end time inside the window. The default window is the last 24 hours;
 
 Token and cost sums come from the hourly usage buckets, counting a bucket when
 its hour overlaps the window (`hour_ts + 3600 > since` and `hour_ts < until`).
-The tokens tile, the tokens-per-hour chart legend, the snapshot totals, and the
-per-workstream rows all sum the same `/api/usage` cells, so they agree exactly
-for the same scope and window. Runs with no workstream land in the
-`unassigned` row, which the Overview tab shows, so the overview total visibly
-equals the sum of the parts.
+One function sums those cells for the window and, with no window, for all time.
+The tokens tile and the chart legend Total read the server snapshot totals for
+their scope and range; the tiles never re-sum buckets on the client. The chart
+keeps reading `/api/usage`, and when its bucket sum ever differs from the tile
+the page shows a muted cross line naming both numbers instead of hiding it.
+The overview workstream cards read the same snapshot rows the tabs read, so
+each card shows exactly what its workstream tab shows for the same range. Runs
+with no workstream land in the `unassigned` row, which the Overview tab shows,
+so the overview total visibly equals the sum of the parts. Every async page
+response applies only when it still matches the current tab and range, and the
+background tab cache is keyed by tab and range and expires after one refresh
+interval, so no tab ever shows another tab's or another range's numbers. A
+scope with no tokens in range reads "0 in N h" with its last run and all-time
+total underneath.
 
 Each bundle:
 

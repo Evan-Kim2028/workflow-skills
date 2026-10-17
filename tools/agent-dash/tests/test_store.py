@@ -276,7 +276,10 @@ class StoreTest(unittest.TestCase):
             }
         )
         snap = self.store.snapshot(now)
-        self.assertEqual(set(snap), {"now", "seq", "counts", "running", "recent", "totals", "by_workstream"})
+        self.assertEqual(
+            set(snap),
+            {"now", "seq", "counts", "running", "recent", "totals", "totals_all_time", "last_activity", "by_workstream"},
+        )
         self.assertEqual(snap["counts"]["live_agents"], 0)
         recent_ids = [run["run_id"] for run in snap["recent"]]
         self.assertEqual(recent_ids, ["dead"])
@@ -828,6 +831,55 @@ class ReconcileTest(unittest.TestCase):
         self.assertEqual(report["mismatches"], [])
         self.assertEqual(report["all"]["live_agents"], 4)
         self.assertEqual({row["ws"] for row in report["rows"]}, {"WS1", "WS2", "WS3"})
+
+    def test_all_time_covers_tokens_outside_the_window(self):
+        self.seed()
+        narrow = self.since
+        snap = self.store.snapshot(self.now, "all", narrow, self.until)
+        windowed = sum(snap["totals"]["tokens"][key] for key in ("input", "output", "cache_read", "cache_write"))
+        timeless = sum(snap["totals_all_time"]["tokens"][key] for key in ("input", "output", "cache_read", "cache_write"))
+        # The old WS1 run (700 tokens in, half out) sits outside the 12 h window.
+        self.assertEqual(windowed, 150 + 300 + 450 + 600)
+        self.assertEqual(timeless, windowed + 1050)
+        self.assertEqual(
+            set(snap["totals_all_time"]["tokens"]),
+            {"input", "output", "cache_read", "cache_write", "reasoning"},
+        )
+
+    def test_all_time_rows_plus_unassigned_equal_all(self):
+        self.seed()
+        report = self.store.reconcile_numbers(self.now, self.since, self.until)
+        self.assertEqual(report["mismatches"], [])
+        everything = list(report["rows"]) + [report["unassigned"]]
+        self.assertEqual(
+            sum(row["tokens_all_time"] for row in everything),
+            report["all_time"]["tokens"],
+        )
+        self.assertAlmostEqual(
+            sum(row["cost_usd_all_time"] for row in everything),
+            report["all_time"]["cost_usd"],
+            places=6,
+        )
+        by_ws = {row["ws"]: row for row in everything}
+        # Old tokens outside the window still count all time.
+        self.assertEqual(by_ws["WS1"]["tokens_all_time"], by_ws["WS1"]["tokens"] + 1050)
+        for row in everything:
+            tab = self.store.snapshot(self.now, row["ws"], self.since, self.until)
+            tab_time = sum(tab["totals_all_time"]["tokens"][key] for key in ("input", "output", "cache_read", "cache_write"))
+            self.assertEqual(row["tokens_all_time"], tab_time, row["ws"])
+            self.assertAlmostEqual(
+                row["cost_usd_all_time"], tab["totals_all_time"]["cost_usd"], places=6, msg=row["ws"]
+            )
+
+    def test_zero_window_still_names_last_run_and_all_time(self):
+        self.seed()
+        snap = self.store.snapshot(self.now, "WS3", self.now - 60, self.now)
+        windowed = sum(snap["totals"]["tokens"][key] for key in ("input", "output", "cache_read", "cache_write"))
+        self.assertEqual(windowed, 0)
+        timeless = sum(snap["totals_all_time"]["tokens"][key] for key in ("input", "output", "cache_read", "cache_write"))
+        self.assertEqual(timeless, 450)
+        self.assertEqual(snap["last_activity"], self.now - 6000)
+        self.assertEqual(snap["by_workstream"][0]["tokens_all_time"], 450)
 
     def test_no_unassigned_row_when_everything_is_attributed(self):
         self._run("muse:a:ws1-a", "muse", "muse", "ws1-a", "running", self.now - 100, None)

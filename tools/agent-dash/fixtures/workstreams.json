@@ -16,6 +16,8 @@
       "finished_today": 0,
       "tokens": 0,
       "cost_usd": 0,
+      "tokens_all_time": 0,
+      "cost_usd_all_time": 0,
       "last_activity": null,
       "plan": false
     },
@@ -35,6 +37,8 @@
       "finished_today": 36,
       "tokens": 436889,
       "cost_usd": 2.0176,
+      "tokens_all_time": 436889,
+      "cost_usd_all_time": 2.0176,
       "last_activity": 1761999840,
       "plan": true
     },
@@ -54,6 +58,8 @@
       "finished_today": 38,
       "tokens": 360883,
       "cost_usd": 0.4083,
+      "tokens_all_time": 360883,
+      "cost_usd_all_time": 0.4083,
       "last_activity": 1761999840,
       "plan": true
     },
@@ -73,6 +79,8 @@
       "finished_today": 0,
       "tokens": 0,
       "cost_usd": 0,
+      "tokens_all_time": 0,
+      "cost_usd_all_time": 0,
       "last_activity": null,
       "plan": false
     },
@@ -92,6 +100,8 @@
       "finished_today": 0,
       "tokens": 0,
       "cost_usd": 0,
+      "tokens_all_time": 0,
+      "cost_usd_all_time": 0,
       "last_activity": null,
       "plan": false
     },
@@ -111,6 +121,8 @@
       "finished_today": 0,
       "tokens": 0,
       "cost_usd": 0,
+      "tokens_all_time": 0,
+      "cost_usd_all_time": 0,
       "last_activity": null,
       "plan": false
     },
@@ -130,6 +142,8 @@
       "finished_today": 0,
       "tokens": 0,
       "cost_usd": 0,
+      "tokens_all_time": 0,
+      "cost_usd_all_time": 0,
       "last_activity": null,
       "plan": false
     },
@@ -149,6 +163,8 @@
       "finished_today": 33,
       "tokens": 317741,
       "cost_usd": 0.4934,
+      "tokens_all_time": 317741,
+      "cost_usd_all_time": 0.4934,
       "last_activity": 1761999840,
       "plan": true
     }

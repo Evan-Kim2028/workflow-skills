@@ -63,6 +63,62 @@ class PageRules(unittest.TestCase):
             self.assertEqual(hits, [], f"{name} computes % done itself: {hits[:2]}")
             self.assertIn(".progress", src, f"{name} never reads the server progress object")
 
+    def test_tiles_read_server_totals(self):
+        """Token and cost tiles read the server snapshot totals for the tab's
+        scope and range. They never re-sum usage buckets on the client."""
+        script = inline_scripts()
+        bodies = dict(functions(script))
+        self.assertIn("tiles", bodies)
+        body = bodies["tiles"]
+        self.assertNotIn("state.usage", body, "tiles() re-sums client buckets; read snap.totals")
+        self.assertIn("snap.totals", body)
+        self.assertIn("totals_all_time", body)
+        self.assertIn("data-tokens", body)
+
+    def test_legend_total_matches_the_tile(self):
+        """The chart legend Total is the snapshot total, with data attributes
+        for the browser check and a visible cross line when the chart drifts."""
+        script = inline_scripts()
+        bodies = dict(functions(script))
+        self.assertIn("tokenChart", bodies)
+        body = bodies["tokenChart"]
+        self.assertIn("snap.totals", body)
+        self.assertIn("data-legend-total", body)
+        self.assertIn("data-chart-sum", body)
+        self.assertIn("xline", body)
+        self.assertIn("--warning", body)
+
+    def test_cache_key_and_stale_guard(self):
+        script = (
+            "const fs=require('fs');"
+            "eval(fs.readFileSync(process.argv[1],'utf8'));"
+            "const A=globalThis.ADC;"
+            "const assert=require('assert');"
+            "assert.strictEqual(A.key('WS2',6,'model'),'WS2|6|model');"
+            "assert.strictEqual(A.key('all',12,'workstream'),'all|12|workstream');"
+            "assert.notStrictEqual(A.key('WS2',6,'model'),A.key('WS2',12,'model'));"
+            "assert.notStrictEqual(A.key('WS2',6,'model'),A.key('WS1',6,'model'));"
+            "assert.notStrictEqual(A.key('all',12,'model'),A.key('all',12,'workstream'));"
+            "assert.strictEqual(A.fresh({at:1000},31000),true);"
+            "assert.strictEqual(A.fresh({at:1000},31001),false);"
+            "assert.strictEqual(A.fresh(null,1000),false);"
+            "assert.strictEqual(A.applies('WS2|6|model',{ws:'WS2',hours:6,groupBy:'model'}),true);"
+            "assert.strictEqual(A.applies('WS2|12|model',{ws:'WS2',hours:6,groupBy:'model'}),false);"
+            "assert.strictEqual(A.applies('all|6|model',{ws:'all',hours:6,groupBy:'workstream'}),false);"
+            "assert.strictEqual(A.billed({input:1,output:2,cache_read:3,cache_write:4,reasoning:50}),10);"
+            "assert.strictEqual(A.ago(1000,990),'just now');"
+            "assert.strictEqual(A.ago(10000,9000),'17 m ago');"
+            "assert.strictEqual(A.ago(100000,90000),'3 h ago');"
+            "assert.strictEqual(A.ago(1000000,800000),'2 d ago');"
+            "assert.strictEqual(A.ago(1000,null),null);"
+        )
+        proc = subprocess.run(
+            ["node", "-e", script, str(STATIC / "tokencache.js")],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr or proc.stdout)
+
     def test_unknown_duration_is_a_dash(self):
         script = (
             "const fs=require('fs');"

@@ -40,6 +40,7 @@ USAGE = """agent-dash: local read-only execution dashboard
   python3 agent_dash.py reprice
   python3 agent_dash.py reconcile
   python3 agent_dash.py check [--url URL] [--hours N]
+  python3 agent_dash.py check --page [--url URL]
   python3 agent_dash.py ws list
   python3 agent_dash.py ws new <ID> "<title>"
   python3 agent_dash.py ws validate <ID>
@@ -330,6 +331,7 @@ def cmd_check(argv: list[str]) -> int:
 
     url = URL
     hours = 12.0
+    page = False
     rest = list(argv)
     while rest:
         flag = rest.pop(0)
@@ -344,9 +346,13 @@ def cmd_check(argv: list[str]) -> int:
             if hours <= 0:
                 print("check requires --hours N", file=sys.stderr)
                 return 2
+        elif flag == "--page":
+            page = True
         else:
             print(USAGE, end="", file=sys.stderr)
             return 2
+    if page:
+        return cmd_page_check(url)
     try:
         with urllib.request.urlopen(f"{url}/api/reconcile?hours={hours:g}", timeout=15) as response:
             payload = json.loads(response.read().decode("utf-8"))
@@ -357,7 +363,7 @@ def cmd_check(argv: list[str]) -> int:
     unassigned = payload.get("unassigned") or {}
     everything = list(rows) + ([unassigned] if unassigned else [])
     width = max([len(str(row.get("ws", ""))) for row in everything] + [10])
-    head = f"{'workstream':<{width}} {'live':>6} {'fin':>6} {'tokens':>14} {'cost_usd':>12}"
+    head = f"{'workstream':<{width}} {'live':>6} {'fin':>6} {'tokens':>14} {'cost_usd':>12} {'all_time':>14}"
     print(f"reconcile {hours:g}h window (since {int(payload.get('since', 0))} until {int(payload.get('until', 0))})")
     print(head)
     for row in everything:
@@ -367,10 +373,17 @@ def cmd_check(argv: list[str]) -> int:
             f"{int(row.get('live_agents', 0)):>6} "
             f"{int(row.get('finished_in_range', 0)):>6} "
             f"{int(row.get('tokens', 0)):>14} "
-            f"{float(row.get('cost_usd', 0.0)):>12.2f}"
+            f"{float(row.get('cost_usd', 0.0)):>12.2f} "
+            f"{int(row.get('tokens_all_time', 0)):>14}"
         )
     everything_total = sum(int(row.get("tokens", 0)) for row in everything)
     print(f"rows sum tokens {everything_total}")
+    all_time = payload.get("all_time") or {}
+    if all_time:
+        print(
+            f"all-time tokens {int(all_time.get('tokens', 0))} "
+            f"cost_usd {float(all_time.get('cost_usd', 0.0)):.2f}"
+        )
     mismatches = payload.get("mismatches", [])
     if mismatches:
         print("MISMATCHES:")
@@ -379,6 +392,42 @@ def cmd_check(argv: list[str]) -> int:
         return 1
     print(f"ok: {len(rows)} workstreams reconcile, no mismatches")
     return 0
+
+
+def cmd_page_check(url: str) -> int:
+    """Drive the live page in Chrome over the DevTools protocol and compare
+    every rendered tile and chart legend against the API. Skips cleanly
+    when Chrome or Node is missing."""
+    import shutil
+    import subprocess
+
+    node = shutil.which("node")
+    if node is None:
+        print("page check skipped: node is not on PATH")
+        return 0
+    script = ROOT / "scripts" / "page_check.mjs"
+    if not script.is_file():
+        print(f"page check skipped: {script} is missing", file=sys.stderr)
+        return 2
+    try:
+        proc = subprocess.run(
+            [node, str(script), "--url", url],
+            capture_output=True,
+            text=True,
+            timeout=600,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        print(f"page check failed: {exc}", file=sys.stderr)
+        return 2
+    if proc.stdout:
+        print(proc.stdout, end="")
+    if proc.returncode == 2:
+        print(proc.stderr, end="", file=sys.stderr)
+        print("page check skipped: Chrome is not available")
+        return 0
+    if proc.stderr:
+        print(proc.stderr, end="", file=sys.stderr)
+    return 0 if proc.returncode == 0 else 1
 
 
 def run_backfill(store, registry, cfg: dict, session_id: str, max_passes: int = 80) -> int:

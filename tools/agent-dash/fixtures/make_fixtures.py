@@ -408,6 +408,10 @@ def _snapshot(runs, now, ws):
         stamp = run["ended_at"] if run["ended_at"] is not None else run["started_at"]
         row["last_activity"] = max(row["last_activity"], stamp)
     by_ws = [buckets[key] for key in sorted(buckets)]
+    for row in by_ws:
+        row["tokens_all_time"] = row["tokens"]
+        row["cost_usd_all_time"] = row["cost_usd"]
+    stamps = [run["ended_at"] if run["ended_at"] is not None else run["started_at"] for run in chosen]
     return {
         "now": now,
         "seq": 4,
@@ -415,6 +419,8 @@ def _snapshot(runs, now, ws):
         "running": running,
         "recent": recent,
         "totals": {"tokens": tokens, "cost_usd": round(cost, 4), "unpriced_runs": unpriced},
+        "totals_all_time": {"tokens": dict(tokens), "cost_usd": round(cost, 4)},
+        "last_activity": max(stamps) if stamps else None,
         "by_workstream": by_ws,
         "_note": NOTE,
     }
@@ -425,7 +431,7 @@ def _reconcile(runs, now):
     totals = snap["totals"]["tokens"]
     rows = [row for row in snap["by_workstream"] if row["ws"] != "unassigned"]
     unassigned = [row for row in snap["by_workstream"] if row["ws"] == "unassigned"]
-    empty = {"ws": "unassigned", "live_agents": 0, "finished_in_range": 0, "finished_today": 0, "tokens": 0, "cost_usd": 0.0, "last_activity": None}
+    empty = {"ws": "unassigned", "live_agents": 0, "finished_in_range": 0, "finished_today": 0, "tokens": 0, "cost_usd": 0.0, "tokens_all_time": 0, "cost_usd_all_time": 0.0, "last_activity": None}
     return {
         "now": now,
         "since": now - 12 * 3600,
@@ -434,6 +440,10 @@ def _reconcile(runs, now):
             "live_agents": snap["counts"]["live_agents"],
             "finished_in_range": snap["counts"]["finished_in_range"],
             "finished_today": snap["counts"]["finished_today"],
+            "tokens": sum(totals[key] for key in TOKEN_KEYS),
+            "cost_usd": snap["totals"]["cost_usd"],
+        },
+        "all_time": {
             "tokens": sum(totals[key] for key in TOKEN_KEYS),
             "cost_usd": snap["totals"]["cost_usd"],
         },
@@ -526,6 +536,8 @@ def _workstreams(runs, now):
             "finished_today": sum(1 for run in mine if _is_agent(run) and run["status"] in ("done", "killed", "died_early") and run.get("ended_at") is not None and today <= run["ended_at"] <= now),
             "tokens": tokens,
             "cost_usd": cost,
+            "tokens_all_time": tokens,
+            "cost_usd_all_time": cost,
             "last_activity": max([run["ended_at"] if run["ended_at"] is not None else run["started_at"] for run in mine] or [0]) or None,
             "plan": code in PLAN_WS,
         })

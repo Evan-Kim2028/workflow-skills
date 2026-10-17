@@ -382,6 +382,17 @@
     "cost_usd": 0.4083,
     "unpriced_runs": 23
   },
+  "totals_all_time": {
+    "tokens": {
+      "input": 82038,
+      "output": 42478,
+      "cache_read": 203647,
+      "cache_write": 32720,
+      "reasoning": 0
+    },
+    "cost_usd": 0.4083
+  },
+  "last_activity": 1761999840,
   "by_workstream": [
     {
       "ws": "WS2",
@@ -390,7 +401,9 @@
       "finished_today": 38,
       "tokens": 360883,
       "cost_usd": 0.4083,
-      "last_activity": 1761999840
+      "last_activity": 1761999840,
+      "tokens_all_time": 360883,
+      "cost_usd_all_time": 0.4083
     }
   ],
   "_note": "Seeded synthetic data for the offline preview. Seed 1. No local sessions are read."

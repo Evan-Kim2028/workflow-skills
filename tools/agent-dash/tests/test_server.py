@@ -327,6 +327,13 @@ class ReconcileEndpointTest(unittest.TestCase):
         self.assertEqual(main(["check", "--url", "http://127.0.0.1:1", "--hours", "12"]), 2)
         self.assertEqual(main(["check", "--hours", "nope"]), 2)
 
+    def test_check_page_skips_without_node(self):
+        from unittest import mock
+
+        with mock.patch("shutil.which", return_value=None):
+            self.assertEqual(main(["check", "--page", "--url", f"http://127.0.0.1:{self.port}"]), 0)
+        self.assertEqual(main(["check", "--page", "--hours", "nope"]), 2)
+
     def test_check_command_fails_on_mismatch(self):
         from http.server import BaseHTTPRequestHandler, HTTPServer
 

@@ -560,8 +560,10 @@ class Store:
             recent = recent[:50]
             roll = self._summarize_locked(shown_all, parents, now, since, until)
             if ws is None or ws == "all":
-                counts = roll["all"]["counts"]
-                totals = roll["all"]["totals"]
+                key = "all"
+                scope = roll["all"]
+                counts = scope["counts"]
+                totals = scope["totals"]
                 by_ws = list(roll["rows"])
                 if roll["has_unassigned"]:
                     by_ws.append(roll["unassigned"])
@@ -579,6 +581,10 @@ class Store:
                 "running": running,
                 "recent": recent,
                 "totals": totals,
+                "totals_all_time": roll["all_time"][key]
+                if key in roll["all_time"]
+                else {"tokens": {field: 0 for field in TOKEN_FIELDS}, "cost_usd": 0.0},
+                "last_activity": _last_activity(scope["runs"]),
                 "by_workstream": by_ws,
             }
 
@@ -634,6 +640,36 @@ class Store:
                         f"{row['ws']} cost_usd: overview row shows {row['cost_usd']:.6f}, "
                         f"tab shows {tab['totals']['cost_usd']:.6f}"
                     )
+                if row["tokens_all_time"] != _billed_total(tab["totals_all_time"]["tokens"]):
+                    mismatches.append(
+                        f"{row['ws']} tokens_all_time: overview row shows {row['tokens_all_time']}, "
+                        f"tab shows {_billed_total(tab['totals_all_time']['tokens'])}"
+                    )
+                if abs(row["cost_usd_all_time"] - tab["totals_all_time"]["cost_usd"]) > 1e-6:
+                    mismatches.append(
+                        f"{row['ws']} cost_usd_all_time: overview row shows {row['cost_usd_all_time']:.6f}, "
+                        f"tab shows {tab['totals_all_time']['cost_usd']:.6f}"
+                    )
+            all_time = roll["all_time"]
+            all_time_total = _billed_total(all_time["all"]["tokens"])
+            if sum(row["tokens_all_time"] for row in everything) != all_time_total:
+                mismatches.append(
+                    "tokens_all_time: workstream rows sum to "
+                    f"{sum(row['tokens_all_time'] for row in everything)}, "
+                    f"overview shows {all_time_total}"
+                )
+            if (
+                abs(
+                    sum(row["cost_usd_all_time"] for row in everything)
+                    - all_time["all"]["cost_usd"]
+                )
+                > 1e-6
+            ):
+                mismatches.append(
+                    "cost_usd_all_time: workstream rows sum to "
+                    f"{sum(row['cost_usd_all_time'] for row in everything):.6f}, "
+                    f"overview shows {all_time['all']['cost_usd']:.6f}"
+                )
             return {
                 "now": now,
                 "since": roll["since"],
@@ -644,6 +680,10 @@ class Store:
                     "finished_today": all_counts["finished_today"],
                     "tokens": _billed_total(all_totals["tokens"]),
                     "cost_usd": all_totals["cost_usd"],
+                },
+                "all_time": {
+                    "tokens": all_time_total,
+                    "cost_usd": all_time["all"]["cost_usd"],
                 },
                 "rows": roll["rows"],
                 "unassigned": roll["unassigned"],
@@ -687,8 +727,18 @@ class Store:
                 members, parents, self._usage_by_run(), now, since, until, range_since, range_until,
                 buckets.get(ws, []),
             )
-        rows = [_ws_row(ws, scopes[ws]) for ws in workstreams if ws != UNASSIGNED]
-        unassigned = _ws_row(UNASSIGNED, scopes[UNASSIGNED])
+        # All-time tokens and cost per scope from the same bucket cells with no
+        # window, summed by the same helper as the windowed numbers.
+        everything = self.query_usage("workstream", "hour", None, None, None)
+        timeless: dict[str, list] = {}
+        for cell in everything:
+            timeless.setdefault(cell["key"] or UNASSIGNED, []).append(cell)
+        all_time: dict[str, dict] = {}
+        all_time["all"] = _sum_cells(everything)
+        for ws in workstreams:
+            all_time[ws] = _sum_cells(timeless.get(ws, []))
+        rows = [_ws_row(ws, scopes[ws], all_time[ws]) for ws in workstreams if ws != UNASSIGNED]
+        unassigned = _ws_row(UNASSIGNED, scopes[UNASSIGNED], all_time[UNASSIGNED])
         return {
             "since": range_since,
             "until": range_until,
@@ -697,6 +747,7 @@ class Store:
             "rows": rows,
             "unassigned": unassigned,
             "has_unassigned": bool(scopes[UNASSIGNED]["runs"]),
+            "all_time": all_time,
         }
 
     def query_runs(self, now: float, ws: str | None, since: float | None, until: float | None, limit: int) -> list:
@@ -905,6 +956,8 @@ class Store:
                     "finished_today": row["finished_today"],
                     "tokens": row["tokens"],
                     "cost_usd": row["cost_usd"],
+                    "tokens_all_time": row["tokens_all_time"],
+                    "cost_usd_all_time": row["cost_usd_all_time"],
                     "last_activity": row["last_activity"],
                     "plan": row["ws"] in plan_ws,
                 }
@@ -921,6 +974,8 @@ class Store:
                     "finished_today": 0,
                     "tokens": 0,
                     "cost_usd": 0.0,
+                    "tokens_all_time": 0,
+                    "cost_usd_all_time": 0.0,
                     "last_activity": None,
                     "plan": ws in plan_ws,
                 }
@@ -937,6 +992,8 @@ class Store:
                     "finished_today": row["finished_today"],
                     "tokens": row["tokens"],
                     "cost_usd": row["cost_usd"],
+                    "tokens_all_time": row["tokens_all_time"],
+                    "cost_usd_all_time": row["cost_usd_all_time"],
                     "last_activity": row["last_activity"],
                     "plan": False,
                 }
@@ -1455,15 +1512,7 @@ def _scope_numbers(
     same window, so the snapshot, the tiles, and the chart legend agree.
     """
     counts = _agent_counts(runs, parents, now, since, until)
-    tokens = {key: 0 for key in TOKEN_FIELDS}
-    for cell in cells:
-        for key in TOKEN_FIELDS:
-            tokens[key] += cell.get(key) or 0
-    priced = [
-        cell["priced_cost_usd"] if cell["priced_cost_usd"] is not None else cell["cost_usd"]
-        for cell in cells
-    ]
-    priced = [value for value in priced if value is not None]
+    summed = _sum_cells(cells)
     unpriced_runs = sum(
         1
         for run in runs
@@ -1474,32 +1523,58 @@ def _scope_numbers(
         "runs": runs,
         "counts": counts,
         "totals": {
-            "tokens": tokens,
-            "cost_usd": _money(sum(priced)) if priced else 0.0,
+            "tokens": summed["tokens"],
+            "cost_usd": summed["cost_usd"],
             "unpriced_runs": unpriced_runs,
         },
     }
+
+
+def _sum_cells(cells: list) -> dict:
+    """Token and cost sums over ``/api/usage`` cells, windowed or not.
+
+    Both the windowed snapshot totals and the all-time totals go through
+    this one helper, so they reconcile by construction.
+    """
+    tokens = {key: 0 for key in TOKEN_FIELDS}
+    for cell in cells:
+        for key in TOKEN_FIELDS:
+            tokens[key] += cell.get(key) or 0
+    priced = [
+        cell["priced_cost_usd"] if cell["priced_cost_usd"] is not None else cell["cost_usd"]
+        for cell in cells
+    ]
+    priced = [value for value in priced if value is not None]
+    return {"tokens": tokens, "cost_usd": _money(sum(priced)) if priced else 0.0}
 
 
 def _usage_unpriced(entry) -> bool:
     return bool(entry) and bool(entry[2])
 
 
-def _ws_row(ws: str, scope: dict) -> dict:
+def _last_activity(runs: list):
     last = 0
-    for run in scope["runs"]:
+    for run in runs:
         for stamp in (run.get("ended_at"), run.get("started_at")):
             if stamp and stamp > last:
                 last = stamp
-    return {
+    return last or None
+
+
+def _ws_row(ws: str, scope: dict, all_time: dict | None = None) -> dict:
+    row = {
         "ws": ws,
         "live_agents": scope["counts"]["live_agents"],
         "finished_in_range": scope["counts"]["finished_in_range"],
         "finished_today": scope["counts"]["finished_today"],
         "tokens": _billed_total(scope["totals"]["tokens"]),
         "cost_usd": scope["totals"]["cost_usd"],
-        "last_activity": last or None,
+        "last_activity": _last_activity(scope["runs"]),
     }
+    if all_time is not None:
+        row["tokens_all_time"] = _billed_total(all_time["tokens"])
+        row["cost_usd_all_time"] = all_time["cost_usd"]
+    return row
 
 
 def _empty_scope() -> dict:
