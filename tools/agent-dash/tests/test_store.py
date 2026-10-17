@@ -3,6 +3,7 @@ import os
 os.environ["AGENT_DASH_IGNORE_LOCAL"] = "1"
 os.environ.setdefault("AGENT_DASH_WORKSTREAMS", os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "fixtures", "bundles"))
 import os
+import sqlite3
 import sys
 import tempfile
 import time
@@ -2144,21 +2145,9 @@ class MergeGrokManifestsTest(unittest.TestCase):
         self.tmp.cleanup()
 
     def add_pair(self, chat_model="composer-2.5", manifest_model=None, chat_out="/tmp/t.jsonl"):
-        self.store.upsert_run(
-            {
-                "run_id": self.CHAT,
-                "source": "grok",
-                "tier": "grok",
-                "label": self.LABEL,
-                "session_id": self.CHAT_UUID,
-                "status": "done",
-                "model": chat_model,
-                "started_at": 1792246364.332,
-                "ended_at": 1792246390.0,
-                "clock_source": "transcript",
-                "out_path": chat_out,
-            }
-        )
+        # Production order: the launcher writes the TSV row first, the chat
+        # row is discovered after. (A manifest row upserted while its twin
+        # is already stored folds at ingest instead of inserting.)
         row = {
             "run_id": self.MANIFEST,
             "source": "grok",
@@ -2174,6 +2163,21 @@ class MergeGrokManifestsTest(unittest.TestCase):
         if manifest_model is not None:
             row["model"] = manifest_model
         self.store.upsert_run(row)
+        self.store.upsert_run(
+            {
+                "run_id": self.CHAT,
+                "source": "grok",
+                "tier": "grok",
+                "label": self.LABEL,
+                "session_id": self.CHAT_UUID,
+                "status": "done",
+                "model": chat_model,
+                "started_at": 1792246364.332,
+                "ended_at": 1792246390.0,
+                "clock_source": "transcript",
+                "out_path": chat_out,
+            }
+        )
 
     def test_manifest_folds_into_chat(self):
         self.add_pair()
@@ -2273,7 +2277,6 @@ class DuplicateMismatchTest(unittest.TestCase):
         return [item for item in report["mismatches"] if "duplicate run" in item]
 
     def test_merged_pair_is_silent(self):
-        self.add("grok:chat:ws6-dup", "grok", "ws6-dup", 1792000000.0, 1792000100.0)
         self.add(
             "grok:parent:cursor/ws6-dup@1792000001",
             "grok",
@@ -2282,6 +2285,7 @@ class DuplicateMismatchTest(unittest.TestCase):
             1792000100.0,
             clock="manifest",
         )
+        self.add("grok:chat:ws6-dup", "grok", "ws6-dup", 1792000000.0, 1792000100.0)
         self.assertEqual(self.store.merge_grok_manifests(), 1)
         self.assertEqual(self.duplicates(), [])
 
@@ -2314,6 +2318,242 @@ class DuplicateMismatchTest(unittest.TestCase):
             parent="grok:chat:ws6-shadow",
         )
         self.assertEqual(self.duplicates(), [])
+
+
+class RunAliasTest(unittest.TestCase):
+    LABEL = "ws6-c11-alias"
+    CHAT_UUID = "c11c11c1-1c11-4c11-8c11-c11c11c11c11"
+    PAD_UUID = "d22d22d2-2d22-4d22-8d22-d22d22d22d22"
+    CHAT = "grok:%s:ws6-c11-alias" % CHAT_UUID
+    MANIFEST = "grok:%s:cursor/ws6-c11-alias@1792246363" % PAD_UUID
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.store = memory(Path(self.tmp.name))
+
+    def tearDown(self):
+        self.store.close()
+        self.tmp.cleanup()
+
+    def add_chat(self, status="done", model="composer-2.5", out=None, start=1792246364.332):
+        self.store.upsert_run(
+            {
+                "run_id": self.CHAT,
+                "source": "grok",
+                "tier": "grok",
+                "label": self.LABEL,
+                "session_id": self.CHAT_UUID,
+                "status": status,
+                "model": model,
+                "started_at": start,
+                "ended_at": 1792246390.0 if status != "running" else None,
+                "clock_source": "transcript",
+                "out_path": out,
+            }
+        )
+
+    def add_manifest(self):
+        self.store.upsert_run(
+            {
+                "run_id": self.MANIFEST,
+                "source": "grok",
+                "tier": "grok",
+                "label": self.LABEL,
+                "session_id": self.PAD_UUID,
+                "status": "unknown",
+                "started_at": 1792246363.0,
+                "clock_source": "manifest",
+                "verdict": "PASS",
+                "out_path": "/tmp/cursor/out-ws6-c11-alias.md",
+            }
+        )
+
+    def alias_row(self):
+        return self.store._conn.execute(
+            "SELECT alias_run_id, target_run_id, merged_at FROM run_aliases WHERE alias_run_id=?",
+            (self.MANIFEST,),
+        ).fetchone()
+
+    def test_merge_writes_alias_with_delete(self):
+        self.add_manifest()
+        self.add_chat()
+        self.assertEqual(self.store.merge_grok_manifests(), 1)
+        self.assertIsNone(self.store.get_run(self.MANIFEST))
+        hit = self.alias_row()
+        self.assertIsNotNone(hit)
+        self.assertEqual(hit["target_run_id"], self.CHAT)
+        self.assertGreater(hit["merged_at"], 0)
+
+    def test_reupsert_of_alias_gap_fills_target_without_resurrecting(self):
+        self.add_manifest()
+        self.add_chat(model=None, out=None)
+        self.assertEqual(self.store.merge_grok_manifests(), 1)
+        self.store.upsert_run(
+            {
+                "run_id": self.MANIFEST,
+                "source": "grok",
+                "tier": "grok",
+                "label": self.LABEL,
+                "session_id": self.PAD_UUID,
+                "status": "done",
+                "started_at": 1792246363.0,
+                "ended_at": 1792246395.0,
+                "clock_source": "manifest",
+                "model": "grok-4.7-high",
+                "verdict": "PASS",
+                "out_path": "/tmp/cursor/out-ws6-c11-alias.md",
+            }
+        )
+        self.assertIsNone(self.store.get_run(self.MANIFEST))
+        chat = self.store.get_run(self.CHAT)
+        self.assertEqual(chat["model"], "grok-4.7-high")
+        self.assertEqual(chat["verdict"], "PASS")
+        self.assertEqual(chat["out_path"], "/tmp/cursor/out-ws6-c11-alias.md")
+        self.assertEqual(chat["started_at"], 1792246363.0)
+        self.assertEqual(chat["status"], "done")
+        self.assertEqual(chat["session_id"], self.CHAT_UUID)
+
+    def test_reupsert_never_reopens_a_running_target(self):
+        self.add_manifest()
+        self.add_chat(status="running", model=None, out=None)
+        self.assertEqual(self.store.merge_grok_manifests(), 1)
+        self.store.upsert_run(
+            {
+                "run_id": self.MANIFEST,
+                "source": "grok",
+                "label": self.LABEL,
+                "status": "done",
+                "started_at": 1792246363.0,
+                "ended_at": 1792246395.0,
+                "clock_source": "manifest",
+            }
+        )
+        chat = self.store.get_run(self.CHAT)
+        self.assertEqual(chat["status"], "running")
+        self.assertIsNone(chat["ended_at"])
+
+    def test_ingest_folds_when_twin_already_stored(self):
+        # Restart re-ingest: the chat row survived, the TSV row did not.
+        self.add_chat(model=None, out=None)
+        self.add_manifest()
+        self.assertIsNone(self.store.get_run(self.MANIFEST))
+        self.assertEqual(self.store.merge_grok_manifests(), 0)
+        hit = self.alias_row()
+        self.assertIsNotNone(hit)
+        self.assertEqual(hit["target_run_id"], self.CHAT)
+        chat = self.store.get_run(self.CHAT)
+        self.assertEqual(chat["out_path"], "/tmp/cursor/out-ws6-c11-alias.md")
+        self.assertEqual(chat["verdict"], "PASS")
+
+    def test_usage_and_samples_for_alias_land_on_target(self):
+        self.add_manifest()
+        self.add_chat()
+        self.assertEqual(self.store.merge_grok_manifests(), 1)
+        self.store.add_usage(
+            {
+                "ts": 1792246370.0,
+                "session_id": self.PAD_UUID,
+                "run_id": self.MANIFEST,
+                "model": "composer-2.5",
+                "tool": "cursor",
+                "message_id": "m-alias",
+                "input": 3,
+                "output": 1,
+            }
+        )
+        self.store.add_process_sample(
+            {
+                "ts": 1792246371.0,
+                "pid": 4242,
+                "comm": "cursor-agent",
+                "label": self.LABEL,
+                "run_id": self.MANIFEST,
+            }
+        )
+        usage = self.store._conn.execute(
+            "SELECT run_id FROM usage_events WHERE message_id='m-alias'"
+        ).fetchone()
+        self.assertEqual(usage["run_id"], self.CHAT)
+        sample = self.store._conn.execute(
+            "SELECT run_id FROM process_samples WHERE pid=4242"
+        ).fetchone()
+        self.assertEqual(sample["run_id"], self.CHAT)
+
+    def test_offsets_for_alias_share_the_target_slot(self):
+        self.add_manifest()
+        self.add_chat()
+        self.assertEqual(self.store.merge_grok_manifests(), 1)
+        self.store.set_offset(self.MANIFEST, 7, 10, 10, 1.0)
+        self.assertEqual(self.store.get_offset(self.CHAT), (7, 10))
+        self.assertEqual(self.store.get_offset(self.MANIFEST), (7, 10))
+        self.store.set_offset(self.CHAT, 7, 20, 20, 2.0)
+        self.assertEqual(self.store.get_offset(self.MANIFEST), (7, 20))
+
+    def test_resolve_run_id(self):
+        self.assertEqual(self.store.resolve_run_id("muse:s:plain"), "muse:s:plain")
+        self.assertEqual(self.store.resolve_run_id(self.MANIFEST), self.MANIFEST)
+        self.add_manifest()
+        self.add_chat()
+        self.assertEqual(self.store.merge_grok_manifests(), 1)
+        self.assertEqual(self.store.resolve_run_id(self.MANIFEST), self.CHAT)
+        self.assertEqual(self.store.resolve_run_id(self.CHAT), self.CHAT)
+
+    def test_dangling_alias_falls_through_and_recovers(self):
+        self.add_manifest()
+        self.add_chat()
+        self.assertEqual(self.store.merge_grok_manifests(), 1)
+        self.store._conn.execute("DELETE FROM runs WHERE run_id=?", (self.CHAT,))
+        self.store._conn.commit()
+        self.add_manifest()
+        self.assertIsNotNone(self.store.get_run(self.MANIFEST))
+        self.assertIsNone(self.alias_row())
+
+    def test_migration_creates_alias_table_on_old_schema(self):
+        self.store.close()
+        path = Path(self.tmp.name) / "dash.sqlite"
+        con = sqlite3.connect(path)
+        con.execute("DROP TABLE run_aliases")
+        con.commit()
+        con.close()
+        self.store = memory(Path(self.tmp.name))
+        names = {
+            row[0]
+            for row in self.store._conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        self.assertIn("run_aliases", names)
+        self.add_manifest()
+        self.add_chat()
+        self.assertEqual(self.store.merge_grok_manifests(), 1)
+        self.assertIsNotNone(self.alias_row())
+
+    def test_mergeable_pair_is_silent_before_the_merge_runs(self):
+        self.add_manifest()
+        self.add_chat()
+        report = self.store.reconcile_numbers(1792246400.0, 1792242800.0, 1792246400.0)
+        dups = [item for item in report["mismatches"] if "duplicate run" in item]
+        self.assertEqual(dups, [])
+
+    def test_unmergeable_overlap_still_mismatches(self):
+        self.add_manifest()
+        self.store.upsert_run(
+            {
+                "run_id": self.CHAT,
+                "source": "grok",
+                "tier": "grok",
+                "label": self.LABEL,
+                "session_id": self.CHAT_UUID,
+                "status": "done",
+                "started_at": 1792246363.0 + 3600,
+                "ended_at": 1792246363.0 + 3700,
+                "clock_source": "transcript",
+            }
+        )
+        self.assertEqual(self.store.merge_grok_manifests(), 0)
+        report = self.store.reconcile_numbers(1792246400.0 + 3700, 1792246400.0, 1792246400.0 + 3700)
+        dups = [item for item in report["mismatches"] if "duplicate run" in item]
+        self.assertEqual(len(dups), 1)
 
 
 class MatchRunNewestTest(unittest.TestCase):

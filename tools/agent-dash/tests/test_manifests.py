@@ -19,6 +19,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from dash.sources import manifests  # noqa: E402
+from dash.store import Store  # noqa: E402
 
 PARENT = "cccccccc-cccc-cccc-cccc-cccccccccccc"
 OTHER = "dddddddd-dddd-dddd-dddd-dddddddddddd"
@@ -576,6 +577,104 @@ class ManifestPollTests(unittest.TestCase):
         run = store.runs[f"glm:{GLM}:ws9c-build"]
         self.assertEqual(run["status"], "running")
         self.assertIsNone(run.get("ended_at"))
+
+
+class ManifestAliasRestartTests(unittest.TestCase):
+    """A merged cursor row stays merged when the TSV is re-read after a restart."""
+
+    LABEL = "ws6-c11-restart"
+    CHAT_UUID = "e33e33e3-3e33-4e33-8e33-e33e33e33e33"
+    START = 1700000001
+    MANIFEST = f"grok:{PARENT}:cursor/{LABEL}@{START}"
+    CHAT = f"grok:{CHAT_UUID}:{LABEL}"
+
+    def setUp(self):
+        manifests.reset_state()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = self.tmp.name
+        self.scratch = os.path.join(self.root, "enc", PARENT, "scratchpad")
+        self.store = Store(os.path.join(self.root, "dash.sqlite"))
+        _write(
+            os.path.join(self.scratch, "cursor-sessions.tsv"),
+            f"{self.LABEL}\t-\t{self.START}\n",
+            NOW,
+        )
+        _write(
+            os.path.join(self.scratch, "cursor", f"out-{self.LABEL}.md"),
+            "PASS\n",
+            NOW,
+        )
+
+    def tearDown(self):
+        self.store.close()
+        self.tmp.cleanup()
+        manifests.reset_state()
+
+    def _cfg(self):
+        return {
+            "scratch_root": self.root,
+            # Isolate from the machine's registered run folders (see above).
+            "state_dir": os.path.join(self.root, "state"),
+            "dir_scan_s": 0,
+            "live_window_s": 36 * 3600,
+            "read_budgets": {"per_file": 1024 * 1024, "per_tick": 1024 * 1024},
+        }
+
+    def _add_chat(self):
+        self.store.upsert_run(
+            {
+                "run_id": self.CHAT,
+                "source": "grok",
+                "tier": "grok",
+                "label": self.LABEL,
+                "session_id": self.CHAT_UUID,
+                "status": "done",
+                "started_at": float(self.START + 2),
+                "ended_at": float(self.START + 100),
+                "clock_source": "transcript",
+            }
+        )
+
+    def _manifest_rows(self):
+        return [
+            row[0]
+            for row in self.store._conn.execute(
+                "SELECT run_id FROM runs WHERE run_id LIKE 'grok:%:cursor/%'"
+            ).fetchall()
+        ]
+
+    def _duplicates(self):
+        report = self.store.reconcile_numbers(float(NOW + 10), None, None)
+        return [item for item in report["mismatches"] if "duplicate run" in item]
+
+    def test_merged_row_survives_a_restart_reread(self):
+        manifests.poll(self.store, self._cfg(), NOW)
+        self.assertEqual(self._manifest_rows(), [self.MANIFEST])
+        self._add_chat()
+        self.assertEqual(self.store.merge_grok_manifests(), 1)
+        self.assertEqual(self._manifest_rows(), [])
+        # Simulated restart: in-memory source state is gone, the TSV is not.
+        manifests.reset_state()
+        manifests.poll(self.store, self._cfg(), NOW + 1)
+        self.assertEqual(self._manifest_rows(), [])
+        chat = self.store.get_run(self.CHAT)
+        self.assertEqual(
+            chat["out_path"],
+            os.path.join(self.scratch, "cursor", f"out-{self.LABEL}.md"),
+        )
+        self.assertEqual(self.store.resolve_run_id(self.MANIFEST), self.CHAT)
+        self.assertEqual(self._duplicates(), [])
+
+    def test_reread_with_stored_twin_creates_no_row(self):
+        self._add_chat()
+        manifests.poll(self.store, self._cfg(), NOW)
+        self.assertEqual(self._manifest_rows(), [])
+        self.assertEqual(self.store.merge_grok_manifests(), 0)
+        self.assertEqual(self.store.resolve_run_id(self.MANIFEST), self.CHAT)
+        manifests.reset_state()
+        manifests.poll(self.store, self._cfg(), NOW + 1)
+        self.assertEqual(self._manifest_rows(), [])
+        self.assertEqual(self._duplicates(), [])
 
 
 class ManifestSmokeTests(unittest.TestCase):

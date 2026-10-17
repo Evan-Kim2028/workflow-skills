@@ -27,6 +27,10 @@ TOOL_KEYS = ("grok", "muse", "glm", "claude")
 FINISHED = ("done", "killed", "died_early")
 RANGE_S = 24 * 3600
 _ESTIMATE_TOOL = "grok-context"
+#: Start-time window (seconds) inside which a launcher manifest row and the
+#: chat row with the same label are one run. The merge, the ingest-path
+#: backfill, and the duplicate-run rule all use this one value.
+MERGE_WINDOW_S = 900.0
 UNASSIGNED = "unassigned"
 SAMPLE_FRESH_S = 20
 RECENT_S = 24 * 3600
@@ -156,12 +160,20 @@ class Store:
             row = self._conn.execute(
                 "SELECT inode, offset FROM file_offsets WHERE path=?", (path,)
             ).fetchone()
+            if row is None and isinstance(path, str) and ":cursor/" in path:
+                target = self._resolve_alias_locked(path)
+                if target != path:
+                    row = self._conn.execute(
+                        "SELECT inode, offset FROM file_offsets WHERE path=?", (target,)
+                    ).fetchone()
         if row is None:
             return None
         return (row["inode"], row["offset"])
 
     def set_offset(self, path: str, inode: int, offset: int, size: int, mtime: float) -> None:
         with self._lock:
+            if isinstance(path, str) and ":cursor/" in path:
+                path = self._resolve_alias_locked(path)
             previous = self.get_offset(path)
             self._conn.execute("BEGIN IMMEDIATE")
             try:
@@ -265,6 +277,10 @@ class Store:
         if not run_id:
             raise ValueError("run_id required")
         with self._lock:
+            if isinstance(run_id, str) and ":cursor/" in run_id:
+                target = self._resolve_alias_locked(run_id)
+                if target != run_id and self._upsert_aliased_locked(run_id, target, row):
+                    return
             existing = self._one("SELECT * FROM runs WHERE run_id=?", (run_id,))
             merged = dict(existing or {})
             merged["run_id"] = run_id
@@ -298,6 +314,13 @@ class Store:
             changed_ws = not existing or existing.get("workstream") != merged.get("workstream")
             if existing and _same(existing, merged, RUN_COLS):
                 return
+            if _is_manifest_twin(merged):
+                twin_id = self._find_merge_target_locked(merged)
+                if twin_id is not None:
+                    dst = self._one("SELECT * FROM runs WHERE run_id=?", (twin_id,))
+                    if dst is not None:
+                        self._fold_locked(run_id, twin_id, merged, dict(dst))
+                        return
             self._write_run(merged)
             if changed_ws:
                 for hour in self._hours_for_run(run_id):
@@ -330,6 +353,8 @@ class Store:
             reasoning=values["reasoning"],
         )
         with self._lock:
+            if isinstance(run_id, str) and ":cursor/" in run_id:
+                run_id = self._resolve_alias_locked(run_id)
             previous = self._one(
                 """SELECT ts FROM usage_events
                    WHERE tool=? AND session_id=? AND message_id=?""",
@@ -405,6 +430,9 @@ class Store:
     def add_process_sample(self, row: dict) -> None:
         ts = float(row["ts"])
         with self._lock:
+            run_id = row.get("run_id")
+            if isinstance(run_id, str) and ":cursor/" in run_id:
+                run_id = self._resolve_alias_locked(run_id)
             self._conn.execute("BEGIN IMMEDIATE")
             try:
                 self._conn.execute(
@@ -417,7 +445,7 @@ class Store:
                         _opt_int(row, "rss_kb"),
                         row.get("elapsed_s"),
                         clean_label(row.get("label")),
-                        row.get("run_id"),
+                        run_id,
                         row.get("model"),
                     ),
                 )
@@ -857,13 +885,15 @@ class Store:
             self._note_data_write()
         return True
 
-    def repair_grok_runs(self, now: float, window_s: float = 900.0) -> tuple[int, int]:
+    def repair_grok_runs(self, now: float, window_s: float = MERGE_WINDOW_S) -> tuple[int, int]:
         """Fill NULL grok models from usage and fold manifest twins into chat rows.
 
         The cursor source calls this every poll. The manifest merge runs
         every time (it is one indexed scan and converges to no work); the
-        usage backfill runs at most once a minute. Returns
-        ``(models_filled, merged)``.
+        usage backfill runs at most once a minute. Every fold records a
+        durable alias, so the first poll after a restart backfills aliases
+        for whatever the manifest re-read resurrected and later restarts
+        resolve instead of re-inserting. Returns ``(models_filled, merged)``.
         """
         merged = self.merge_grok_manifests(window_s)
         filled = self.backfill_grok_models(now)
@@ -914,7 +944,7 @@ class Store:
             )
         return filled
 
-    def merge_grok_manifests(self, window_s: float = 900.0) -> int:
+    def merge_grok_manifests(self, window_s: float = MERGE_WINDOW_S) -> int:
         """Fold launcher manifest rows into the chat row they record.
 
         A ``cursor-sessions.tsv`` row becomes ``grok:<id>:cursor/<label>``
@@ -923,9 +953,12 @@ class Store:
         started within ``window_s`` (default 15 minutes, wider than the ten
         minutes views use) is that same run: the merged row keeps the
         earliest start, the chat row's status, the model, and the
-        manifest's out path; usage and samples move over and the manifest
-        row is deleted. A manifest row with no twin stays. Returns how
-        many rows merged.
+        manifest's out path; usage and samples move over, the manifest
+        row is deleted, and a durable alias (manifest id to chat id) is
+        recorded in the same transaction so a restart re-ingest of the TSV
+        row gap-fills the chat row instead of resurrecting the manifest
+        row. A manifest row with no twin stays. Returns how many rows
+        merged.
         """
         with self._lock:
             manifests = [
@@ -959,6 +992,78 @@ class Store:
                 merged += 1
         return merged
 
+    def resolve_run_id(self, run_id: str) -> str:
+        """Live run id for ``run_id``, following merge aliases.
+
+        A manifest row folded into its chat row keeps its id as an alias,
+        so a restart re-ingest of the same TSV row resolves to the chat row
+        instead of resurrecting a deleted row. Unknown ids return unchanged.
+        """
+        if not isinstance(run_id, str) or ":cursor/" not in run_id:
+            return run_id
+        with self._lock:
+            return self._resolve_alias_locked(run_id)
+
+    def _resolve_alias_locked(self, run_id: str) -> str:
+        """Follow ``run_aliases`` to the live row. Caller holds the lock."""
+        current = run_id
+        seen = set()
+        while isinstance(current, str) and current not in seen:
+            seen.add(current)
+            hit = self._conn.execute(
+                "SELECT target_run_id FROM run_aliases WHERE alias_run_id=?",
+                (current,),
+            ).fetchone()
+            if not hit or not hit["target_run_id"]:
+                break
+            current = hit["target_run_id"]
+        return current
+
+    def _find_merge_target_locked(self, manifest: dict):
+        """Chat row the merge would fold ``manifest`` into, or None.
+
+        Same rule as ``merge_grok_manifests``: the nearest non-manifest
+        same-label grok row starting within ``MERGE_WINDOW_S``. Caller
+        holds the lock.
+        """
+        label = manifest.get("label")
+        run_id = manifest.get("run_id")
+        if not label or not run_id:
+            return None
+        twins = [
+            dict(item)
+            for item in self._conn.execute(
+                "SELECT * FROM runs WHERE source='grok' AND label=? AND run_id != ?",
+                (label, run_id),
+            ).fetchall()
+            if not _is_manifest_twin(dict(item))
+        ]
+        best = _nearest_twin(manifest, twins, MERGE_WINDOW_S)
+        return best["run_id"] if best is not None else None
+
+    def _upsert_aliased_locked(self, alias_id: str, target_id: str, row: dict) -> bool:
+        """Gap-fill the merge target for a write to an aliased run id.
+
+        Returns True when the target exists and absorbed the write (no row
+        is created for the alias). Returns False when the target is gone:
+        the dangling alias is dropped and the caller falls through to the
+        normal upsert. Caller holds the lock.
+        """
+        dst = self._one("SELECT * FROM runs WHERE run_id=?", (target_id,))
+        if dst is None:
+            self._conn.execute(
+                "DELETE FROM run_aliases WHERE alias_run_id=?", (alias_id,)
+            )
+            return False
+        src_row = self._one("SELECT * FROM runs WHERE run_id=?", (alias_id,))
+        base = dict(src_row) if src_row else {}
+        for key, value in row.items():
+            if value is not None:
+                base[key] = value
+        base["run_id"] = alias_id
+        self._fold_locked(alias_id, target_id, base, dict(dst))
+        return True
+
     def _merge_run_into(self, src_id: str, dst_id: str) -> bool:
         """Fold manifest row ``src_id`` into chat row ``dst_id`` and delete it."""
         if not src_id or not dst_id or src_id == dst_id:
@@ -968,53 +1073,56 @@ class Store:
             dst = self._one("SELECT * FROM runs WHERE run_id=?", (dst_id,))
             if not src or not dst:
                 return False
-            merged = dict(dst)
-            src_start = _epoch(src.get("started_at"))
-            dst_start = _epoch(dst.get("started_at"))
-            if src_start is not None and (dst_start is None or src_start < dst_start):
-                merged["started_at"] = src_start
-                if src.get("clock_source"):
-                    merged["clock_source"] = src["clock_source"]
-            for key in ("model", "verdict", "out_path", "out_bytes", "err_bytes"):
-                if merged.get(key) in (None, "", 0) and src.get(key) not in (None, "", 0):
-                    merged[key] = src[key]
-            src_end = _epoch(src.get("ended_at"))
-            dst_end = _epoch(dst.get("ended_at"))
-            if (
-                merged.get("status") != "running"
-                and src_end is not None
-                and (dst_end is None or src_end > dst_end)
-            ):
-                merged["ended_at"] = src_end
-            workstream, confidence = attribute(
-                merged.get("label"),
-                merged.get("session_id"),
-                parent_session_id=merged.get("parent_session_id"),
-            )
-            merged["workstream"] = workstream
-            merged["ws_confidence"] = confidence
-            hours = self._hours_for_run(src_id) | self._hours_for_run(dst_id)
-            self._conn.execute("BEGIN IMMEDIATE")
-            try:
-                self._conn.execute(
-                    "UPDATE usage_events SET run_id=? WHERE run_id=?",
-                    (dst_id, src_id),
-                )
-                self._conn.execute(
-                    "UPDATE process_samples SET run_id=? WHERE run_id=?",
-                    (dst_id, src_id),
-                )
-                self._write_run(merged)
-                self._conn.execute("DELETE FROM runs WHERE run_id=?", (src_id,))
-                for hour in hours:
-                    self._rebuild_hour(hour)
-                self._conn.execute("COMMIT")
-            except Exception:
-                self._conn.execute("ROLLBACK")
-                raise
-            self._seq += 1
-            self._data_seq += 1
+            self._fold_locked(src_id, dst_id, src, dst)
         return True
+
+    def _fold_locked(self, alias_id: str, target_id: str, src: dict, dst: dict) -> None:
+        """Fold manifest data into its chat row and record the alias.
+
+        The alias row is written in the same transaction that moves the
+        usage and samples and deletes the manifest row, so a restart can
+        never see the row without the alias. ``src`` may be a stored row
+        (merge pass) or a fresh re-ingest patch overlaid on it (restart
+        re-read); when no stored row exists the usage moves are no-ops.
+        Caller holds the lock.
+        """
+        merged = _fold_manifest_patch(dst, src)
+        workstream, confidence = attribute(
+            merged.get("label"),
+            merged.get("session_id"),
+            parent_session_id=merged.get("parent_session_id"),
+        )
+        merged["workstream"] = workstream
+        merged["ws_confidence"] = confidence
+        hours = self._hours_for_run(alias_id) | self._hours_for_run(target_id)
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            self._conn.execute(
+                "UPDATE usage_events SET run_id=? WHERE run_id=?",
+                (target_id, alias_id),
+            )
+            self._conn.execute(
+                "UPDATE process_samples SET run_id=? WHERE run_id=?",
+                (target_id, alias_id),
+            )
+            self._write_run(merged)
+            self._conn.execute("DELETE FROM runs WHERE run_id=?", (alias_id,))
+            self._conn.execute(
+                """INSERT INTO run_aliases(alias_run_id, target_run_id, merged_at)
+                   VALUES(?,?,?)
+                   ON CONFLICT(alias_run_id) DO UPDATE SET
+                     target_run_id=excluded.target_run_id,
+                     merged_at=excluded.merged_at""",
+                (alias_id, target_id, _time.time()),
+            )
+            for hour in hours:
+                self._rebuild_hour(hour)
+            self._conn.execute("COMMIT")
+        except Exception:
+            self._conn.execute("ROLLBACK")
+            raise
+        self._seq += 1
+        self._data_seq += 1
 
     def repair_muse_orphans(self) -> int:
         """Move orphan muse usage onto the labeled run and delete the orphan."""
@@ -2020,6 +2128,11 @@ class Store:
               run_id TEXT PRIMARY KEY,
               last_seen REAL
             );
+            CREATE TABLE IF NOT EXISTS run_aliases (
+              alias_run_id TEXT PRIMARY KEY,
+              target_run_id TEXT NOT NULL,
+              merged_at REAL NOT NULL
+            );
             CREATE INDEX IF NOT EXISTS idx_runs_status ON runs(status);
             CREATE INDEX IF NOT EXISTS idx_runs_ended ON runs(ended_at);
             CREATE INDEX IF NOT EXISTS idx_runs_ws ON runs(workstream);
@@ -2031,10 +2144,12 @@ class Store:
             CREATE INDEX IF NOT EXISTS idx_samples_ts ON process_samples(ts);
             CREATE INDEX IF NOT EXISTS idx_samples_pid ON process_samples(pid);
             CREATE INDEX IF NOT EXISTS idx_samples_run ON process_samples(run_id);
+            CREATE INDEX IF NOT EXISTS idx_aliases_target ON run_aliases(target_run_id);
             """
         )
         self._migrate_usage_splits()
         self._migrate_uncached_input()
+        self._migrate_run_aliases()
 
     def _migrate_uncached_input(self) -> None:
         """Once: muse and GLM logged input with cached tokens inside it; store uncached input like every other source, then rebuild the hourly buckets."""
@@ -2051,6 +2166,25 @@ class Store:
             self._rebuild_hour(int(hour))
         self._conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('uncached_input_v1', '1')")
         self._conn.commit()
+
+    def _migrate_run_aliases(self) -> None:
+        """Once: durable merge aliases so merged manifest rows stay merged.
+
+        Existing databases opened after the upgrade gain ``run_aliases``;
+        the merge pass (first cursor poll) and the ingest path then
+        backfill one alias per folded pair, so restart re-ingests resolve
+        to the chat row instead of resurrecting deleted manifest rows.
+        """
+        self._conn.execute(
+            """CREATE TABLE IF NOT EXISTS run_aliases (
+                 alias_run_id TEXT PRIMARY KEY,
+                 target_run_id TEXT NOT NULL,
+                 merged_at REAL NOT NULL
+               )"""
+        )
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_aliases_target ON run_aliases(target_run_id)"
+        )
 
     def _migrate_usage_splits(self) -> None:
         cols = {row[1] for row in self._conn.execute("PRAGMA table_info(usage_events)")}
@@ -2408,7 +2542,7 @@ def _epoch(value):
     return float(value)
 
 
-def _duplicate_run_mismatches(runs: list) -> list:
+def _duplicate_run_mismatches(runs: list, window_s: float = MERGE_WINDOW_S) -> list:
     """One mismatch per launcher-manifest row with an unmerged twin.
 
     Two rows with the same label overlapping in time from the same source
@@ -2416,9 +2550,12 @@ def _duplicate_run_mismatches(runs: list) -> list:
     the worker's own row. The merge (``merge_grok_manifests``) folds them;
     whatever it leaves behind is reported here so it gets fixed instead of
     double-counted. Non-manifest siblings that share a label (a relaunch,
-    a probe, workflow children) are legitimate and never flagged: only a
-    surviving manifest row with a same-source, same-label, overlapping
-    non-manifest twin that is not shadow-linked to it is a mismatch.
+    a probe, workflow children) are legitimate and never flagged. The rule:
+    a manifest row the merge would fold (a same-label non-manifest twin
+    starting within ``window_s``) is skipped, because the next merge pass
+    folds it; only a surviving manifest row with an overlapping
+    same-source twin the merge would NOT fold, and not shadow-linked to
+    it, is a mismatch.
     """
     by_key: dict = {}
     for row in runs:
@@ -2436,6 +2573,8 @@ def _duplicate_run_mismatches(runs: list) -> list:
         if not others:
             continue
         for manifest in manifests:
+            if _nearest_twin(manifest, others, window_s) is not None:
+                continue
             for twin in others:
                 if twin.get("run_id") == manifest.get("run_id"):
                     continue
@@ -2476,6 +2615,38 @@ def _is_manifest_twin(row: dict) -> bool:
         and ":cursor/" in run_id
         and row.get("clock_source") == "manifest"
     )
+
+
+def _fold_manifest_patch(target: dict, incoming: dict) -> dict:
+    """Gap-fill ``target`` (chat row) with ``incoming`` (manifest data).
+
+    The merged row keeps the earliest start (taking the manifest clock with
+    it), the chat row's status, and fills an empty model, verdict, out
+    path, and byte counts from the manifest; a finished row extends its end
+    to a later manifest end. Session, pid, label, and status are never
+    touched, so a restart re-ingest of a merged row cannot reopen, restamp,
+    or relabel the live row. Shared by the merge pass and the aliased
+    re-ingest path so both fold identically.
+    """
+    merged = dict(target)
+    src_start = _epoch(incoming.get("started_at"))
+    dst_start = _epoch(target.get("started_at"))
+    if src_start is not None and (dst_start is None or src_start < dst_start):
+        merged["started_at"] = src_start
+        if incoming.get("clock_source"):
+            merged["clock_source"] = incoming["clock_source"]
+    for key in ("model", "verdict", "out_path", "out_bytes", "err_bytes"):
+        if merged.get(key) in (None, "", 0) and incoming.get(key) not in (None, "", 0):
+            merged[key] = incoming[key]
+    src_end = _epoch(incoming.get("ended_at"))
+    dst_end = _epoch(target.get("ended_at"))
+    if (
+        merged.get("status") != "running"
+        and src_end is not None
+        and (dst_end is None or src_end > dst_end)
+    ):
+        merged["ended_at"] = src_end
+    return merged
 
 
 def _nearest_twin(manifest: dict, twins: list, window_s: float):
