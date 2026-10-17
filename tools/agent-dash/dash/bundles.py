@@ -65,6 +65,11 @@ WS_USAGE = """agent-dash workstream bundles
   python3 agent_dash.py ws approve <ID> <item-id> <approved|denied|pending> [--note "..."] [--step "..."] [--reversible yes|no] [--conditions "..."]
   python3 agent_dash.py ws approvals [<ID>] [--json]
   python3 agent_dash.py ws validate <ID> [--json]
+  python3 agent_dash.py ws next <ID> [--limit N] [--json]
+  python3 agent_dash.py ws waves <ID> [--json]
+  python3 agent_dash.py ws overlap <ID> [--all] [--cross] [--json]
+  python3 agent_dash.py ws gates <ID> [--json]
+  python3 agent_dash.py ws deferred [<ID>] [--json]
 
 Status is todo, wip, pr, prog, done, or deferred. deferred may set --moved-to and --note.
 `ws plan` lists the bundle's tasks (ids, titles, status, deps). `--json` prints
@@ -286,6 +291,18 @@ def _view_groups(value) -> list:
                 row["dep_notes"] = {key: value for key, value in notes.items() if isinstance(key, str) and isinstance(value, str)}
             if isinstance(task.get("wave"), str):
                 row["wave"] = task.get("wave")
+            files = task.get("files")
+            if isinstance(files, list):
+                row["files"] = [item for item in files if isinstance(item, str)]
+            if isinstance(task.get("signal"), str):
+                row["signal"] = task.get("signal")
+            if isinstance(task.get("confirmed_at"), str):
+                row["confirmed_at"] = task.get("confirmed_at")
+            fresh = task.get("fresh_hours")
+            if isinstance(fresh, (int, float)) and not isinstance(fresh, bool):
+                row["fresh_hours"] = fresh
+            if isinstance(task.get("received_as"), str):
+                row["received_as"] = task.get("received_as")
             tasks.append(row)
         groups.append({"id": item.get("id"), "col": item.get("col"), "title": item.get("title"), "tasks": tasks})
     return groups
@@ -578,6 +595,23 @@ def _validate_dag(issues: list[str], dag) -> None:
                     issues.append(f"plan.json: task {tid} moved_to must look like WS2")
                 if "note" in task and not isinstance(task.get("note"), str):
                     issues.append(f"plan.json: task {tid} note must be a string")
+            if "files" in task:
+                files = task.get("files")
+                if not isinstance(files, list) or not files or not all(isinstance(item, str) and item.strip() for item in files):
+                    issues.append(f"plan.json: task {tid} files must be a non-empty list of glob strings")
+            if "signal" in task and (not isinstance(task.get("signal"), str) or not task.get("signal").strip()):
+                issues.append(f"plan.json: task {tid} signal must be a non-empty string")
+            if "confirmed_at" in task:
+                from dash.orchestrate import _parse_when
+
+                if not isinstance(task.get("confirmed_at"), str) or _parse_when(task.get("confirmed_at")) is None:
+                    issues.append(f"plan.json: task {tid} confirmed_at must be an ISO-8601 UTC string")
+            if "fresh_hours" in task:
+                fresh = task.get("fresh_hours")
+                if isinstance(fresh, bool) or not isinstance(fresh, (int, float)) or not float(fresh) > 0:
+                    issues.append(f"plan.json: task {tid} fresh_hours must be a number greater than 0")
+            if "received_as" in task and (not isinstance(task.get("received_as"), str) or not task.get("received_as").strip()):
+                issues.append(f"plan.json: task {tid} received_as must be a non-empty string")
     for group in groups:
         for task in (group.get("tasks") if isinstance(group, dict) and isinstance(group.get("tasks"), list) else []):
             if not isinstance(task, dict):
@@ -1403,6 +1437,333 @@ def print_plan(ws: str, json_mode: bool = False) -> int:
     return 0
 
 
+def _dash_url() -> str:
+    """Dashboard base URL (``AGENT_DASH_URL`` wins, for tests and mirrors)."""
+    import os as _os
+
+    return _os.environ.get("AGENT_DASH_URL") or "http://127.0.0.1:8765"
+
+
+def _resolve_body(ws: str):
+    """(body, None, 0) or (None, message, code) for orchestration commands."""
+    from dash.plans import PlanError
+
+    if bundle_dir(ws) is None:
+        try:
+            _source, body = resolve_plan(ws)
+        except PlanError:
+            return None, errors.plan_unreadable(ws), errors.INVALID_DATA
+        if not isinstance(body, dict):
+            return None, errors.bundle_not_found(ws), errors.NOT_FOUND
+        return body, None, 0
+    try:
+        _source, body = resolve_plan(ws)
+    except PlanError:
+        return None, errors.plan_unreadable(ws), errors.INVALID_DATA
+    if not isinstance(body, dict):
+        return None, errors.plan_unreadable(ws), errors.INVALID_DATA
+    return body, None, 0
+
+
+def _history_starts_dones(ws: str) -> tuple[dict, dict]:
+    """(starts, dones) from history.jsonl: first touch and done moment."""
+    from dash.replay import read_history
+
+    starts: dict[str, float] = {}
+    dones: dict[str, float] = {}
+    for row in read_history(ws):
+        task = row.get("task")
+        ts = row.get("ts")
+        if not isinstance(task, str) or not isinstance(ts, (int, float)):
+            continue
+        if task not in starts or ts < starts[task]:
+            starts[task] = float(ts)
+        if row.get("to") == "done" and (task not in dones or ts > dones[task]):
+            dones[task] = float(ts)
+    return starts, dones
+
+
+def print_next(ws: str, limit: int | None = None, json_mode: bool = False) -> int:
+    """Ready tasks ranked by critical-path impact, plus stalled/dep-jump warnings."""
+    from dash import orchestrate
+
+    body, message, code = _resolve_body(ws)
+    if body is None:
+        _say(message, json_mode)
+        return code
+    _by_id, _deps, order = orchestrate.plan_tasks(body)
+    runs = orchestrate.dashboard_runs(_dash_url(), ws)
+    live_source = "api" if runs is not None else "unreachable"
+    live = orchestrate.live_by_task(runs or [], ws, order)
+    ready = orchestrate.ready_queue(body, live)
+    if limit is not None:
+        ready = ready[:limit]
+    stalled = orchestrate.stalled_tasks(body, live)
+    starts, dones = _history_starts_dones(ws)
+    replay = orchestrate.dashboard_replay(_dash_url(), ws)
+    if replay:
+        replay_starts, replay_dones = orchestrate.replay_starts_dones(replay)
+        for tid, ts in replay_starts.items():
+            if tid not in starts or ts < starts[tid]:
+                starts[tid] = ts
+        for tid, ts in replay_dones.items():
+            if tid not in dones:
+                dones[tid] = ts
+    jumps = orchestrate.dep_jumps(body, starts, dones)
+    if json_mode:
+        errors.emit_json({"ws": ws, "ready": ready, "stalled": stalled, "dep_jumps": jumps, "live": live_source})
+        return 0
+    print(f"ready in {ws} ({len(ready)}):")
+    for row in ready:
+        unblocks = ",".join(row["unblocks"]) or "-"
+        train = row["train"] or "-"
+        live_label = row["live_run"] or "none"
+        print(f"  {row['id']} chain={row['chain']} dependents={row['dependents']} unblocks={unblocks} train={train} live={live_label} {row['title']}")
+    if not ready:
+        print("  (none: every todo task still waits on a dep)")
+    if stalled:
+        print(f"stalled ({len(stalled)} started with no live run):")
+        for row in stalled:
+            print(f"  {row['id']} [{row['status']}] {row['title']}")
+    if jumps:
+        print(f"dep-jump ({len(jumps)} started before a dep finished):")
+        for row in jumps:
+            print(f"  {row['task']} started before {row['dep']} finished")
+    if live_source == "unreachable":
+        print(f"(live run data unavailable: dashboard unreachable at {_dash_url()})")
+    return 0
+
+
+def print_waves(ws: str, json_mode: bool = False) -> int:
+    """Max-parallel waves, critical path, best span vs actual, max parallelism."""
+    from dash import orchestrate
+
+    body, message, code = _resolve_body(ws)
+    if body is None:
+        _say(message, json_mode)
+        return code
+    wave_ids = orchestrate.waves(body)
+    path = orchestrate.critical_path(body)
+    replay = orchestrate.dashboard_replay(_dash_url(), ws)
+    durations = orchestrate.replay_durations(replay)
+    dur_path = orchestrate.critical_path(body, durations) if durations else list(path)
+    dur_total = sum(durations.get(tid, 0.0) for tid in dur_path) if durations else None
+    span = replay.get("span") if isinstance(replay, dict) else None
+    actual_span = None
+    if isinstance(span, dict):
+        try:
+            actual_span = float(span["end"]) - float(span["start"])
+        except (KeyError, TypeError, ValueError):
+            actual_span = None
+    width = max((len(wave) for wave in wave_ids), default=0)
+    payload = {
+        "ws": ws,
+        "waves": wave_ids,
+        "sizes": [len(wave) for wave in wave_ids],
+        "critical_path": path,
+        "critical_path_duration": dur_path,
+        "critical_path_seconds": dur_total,
+        "best_span_tasks": len(path),
+        "actual_span_seconds": actual_span,
+        "max_parallel": width,
+        "durations": "observed" if durations else "unavailable",
+    }
+    if json_mode:
+        errors.emit_json(payload)
+        return 0
+    print(f"waves in {ws} ({len(wave_ids)} waves, max parallel {width}):")
+    for index, wave in enumerate(wave_ids):
+        print(f"  wave {index} ({len(wave)}): {', '.join(wave)}")
+    print(f"critical path ({len(path)} tasks): {' -> '.join(path) if path else '-'}")
+    if durations:
+        print(f"critical path by observed duration ({dur_total:.0f}s): {' -> '.join(dur_path)}")
+    else:
+        print("(no observed durations: dashboard unreachable or no mapped runs yet)")
+    if actual_span is not None:
+        print(f"best span {len(path)} tasks vs actual {actual_span:.0f}s wall clock")
+    else:
+        print(f"best span {len(path)} tasks vs actual unknown")
+    return 0
+
+
+def _next_wave_ids(body) -> list[str]:
+    """Ids in the first wave holding an unfinished, non-deferred task."""
+    from dash import orchestrate
+
+    by_id, _deps, _order = orchestrate.plan_tasks(body)
+    for wave in orchestrate.waves(body):
+        if any(by_id[tid].get("status") not in ("done", "deferred") for tid in wave if tid in by_id):
+            return list(wave)
+    return []
+
+
+def _cross_declared() -> list[dict]:
+    """Declared-file overlap pairs across different workstreams (wip/pr only)."""
+    from dash import orchestrate
+
+    per_ws: dict[str, dict[str, list[str]]] = {}
+    for bundle in list_bundles():
+        if bundle.get("kind") != "workstream":
+            continue
+        _source, body = resolve_plan(bundle["id"])
+        if not isinstance(body, dict):
+            continue
+        by_id, _deps, order = orchestrate.plan_tasks(body)
+        footprints = {}
+        for tid in order:
+            if by_id[tid].get("status") not in ("wip", "pr"):
+                continue
+            files = orchestrate.task_files(by_id[tid])
+            if files:
+                footprints[tid] = files
+        if footprints:
+            per_ws[bundle["id"]] = footprints
+    rows = []
+    names = sorted(per_ws)
+    for pos, left_ws in enumerate(names):
+        for right_ws in names[pos + 1:]:
+            for left_tid, mine in per_ws[left_ws].items():
+                for right_tid, theirs in per_ws[right_ws].items():
+                    shared = orchestrate.files_overlap(mine, theirs)
+                    if shared:
+                        rows.append(
+                            {
+                                "ws_a": left_ws,
+                                "a": left_tid,
+                                "ws_b": right_ws,
+                                "b": right_tid,
+                                "files": shared,
+                                "source": "declared",
+                            }
+                        )
+    return rows
+
+
+def print_overlap(ws: str | None, all_waves: bool = False, cross: bool = False, json_mode: bool = False) -> int:
+    """File-overlap warnings: declared footprints, plus inferred branch diffs."""
+    from dash import orchestrate
+
+    if cross:
+        pairs = _cross_declared()
+        if json_mode:
+            errors.emit_json({"cross": True, "pairs": pairs})
+            return 0
+        if not pairs:
+            print("(no cross-workstream file overlaps among wip/pr tasks)")
+            return 0
+        print(f"cross-workstream overlaps ({len(pairs)}):")
+        for row in pairs:
+            print(f"  {row['ws_a']}:{row['a']} <> {row['ws_b']}:{row['b']} [{row['source']}]")
+            for shared in row["files"]:
+                print(f"    {shared}")
+        return 0
+    if ws is None:
+        _say("overlap needs a workstream id (or --cross). Run: python3 agent_dash.py ws overlap <ID>", json_mode)
+        return errors.USAGE
+    body, message, code = _resolve_body(ws)
+    if body is None:
+        _say(message, json_mode)
+        return code
+    by_id, _deps, _order = orchestrate.plan_tasks(body)
+    if all_waves:
+        scope = _next_wave_ids(body)
+        scope_name = "next wave"
+    else:
+        scope = [tid for tid in by_id if by_id[tid].get("status") in ("wip", "pr")]
+        scope_name = "wip/pr"
+    pairs = orchestrate.overlaps(body, scope)
+    runs = orchestrate.dashboard_runs(_dash_url(), ws)
+    if runs:
+        pairs.extend(orchestrate.inferred_overlaps(body, runs, scope, orchestrate.run_out_paths()))
+    if json_mode:
+        errors.emit_json({"ws": ws, "scope": scope_name, "pairs": pairs})
+        return 0
+    if not pairs:
+        print(f"(no file overlaps in {ws} {scope_name})")
+        return 0
+    print(f"overlaps in {ws} {scope_name} ({len(pairs)}):")
+    for row in pairs:
+        print(f"  {row['a']} <> {row['b']} [{row['source']}]")
+        for shared in row["files"]:
+            print(f"    {shared}")
+    return 0
+
+
+def print_gates(ws: str, json_mode: bool = False) -> int:
+    """Every gate with its signal, freshness, and blocked dependents."""
+    import time as _time
+
+    from dash import orchestrate
+
+    body, message, code = _resolve_body(ws)
+    if body is None:
+        _say(message, json_mode)
+        return code
+    gates = orchestrate.stale_gates(body, _time.time())
+    if json_mode:
+        errors.emit_json({"ws": ws, "gates": gates})
+        return 0
+    if not gates:
+        print(f"(no gates in {ws})")
+        return 0
+    print(f"gates in {ws} ({len(gates)}):")
+    for row in gates:
+        state = "STALE" if row["stale"] else "fresh"
+        blocked = ",".join(row["blocked"]) or "-"
+        print(f"  {row['id']} [{row['status']}] {state} signal={row['signal'] or '-'} confirmed={row['confirmed_at'] or '-'} blocks={blocked}")
+    return 0
+
+
+def print_deferred(ws: str | None, json_mode: bool = False) -> int:
+    """Deferred tasks with receiving workstream and pickup state."""
+    from dash import orchestrate
+
+    if ws is not None:
+        body, message, code = _resolve_body(ws)
+        if body is None:
+            _say(message, json_mode)
+            return code
+        bodies = {ws: body}
+        from dash.plans import PlanError
+
+        by_id, _deps, _order = orchestrate.plan_tasks(body)
+        for task in by_id.values():
+            if isinstance(task, dict) and task.get("status") == "deferred":
+                moved = task.get("moved_to")
+                if isinstance(moved, str) and moved not in bodies:
+                    try:
+                        _source, target = resolve_plan(moved)
+                    except PlanError:
+                        continue
+                    if isinstance(target, dict):
+                        bodies[moved] = target
+    else:
+        bodies = {}
+        for bundle in list_bundles():
+            if bundle.get("kind") != "workstream":
+                continue
+            _source, body = resolve_plan(bundle["id"])
+            if isinstance(body, dict):
+                bodies[bundle["id"]] = body
+    rows = orchestrate.deferred_ledger(bodies)
+    if json_mode:
+        errors.emit_json({"ws": ws or "all", "deferred": rows})
+        return 0
+    if not rows:
+        print(f"(no deferred tasks in {ws or 'any workstream'})")
+        return 0
+    print(f"deferred ({len(rows)}):")
+    for row in rows:
+        if row["received"]:
+            state = f"picked up as {row['received']}"
+        elif row["moved_to"]:
+            state = "ORPHAN: nobody picked it up"
+        else:
+            state = "ORPHAN: no receiving workstream"
+        print(f"  {row['ws']}:{row['id']} -> {row['moved_to'] or '-'} {state} {row['title']}")
+    return 0
+
+
 def cmd_ws(argv: list[str]) -> int:
     if not argv or argv[0] in ("-h", "--help"):
         print(WS_USAGE, end="")
@@ -1575,5 +1936,59 @@ def cmd_ws(argv: list[str]) -> int:
             print(WS_USAGE, end="", flush=True)
             return errors.USAGE
         return print_approvals(rest[0] if rest else None, json_mode=json_mode)
+    if cmd == "next":
+        ws = None
+        limit = None
+        flags = list(rest)
+        while flags:
+            flag = flags.pop(0)
+            if flag == "--limit" and flags:
+                try:
+                    limit = int(flags.pop(0))
+                except ValueError:
+                    print(f"bad --limit value: use an integer, e.g. python3 agent_dash.py ws next {ws or '<ID>'} --limit 5", flush=True)
+                    return errors.USAGE
+                if limit <= 0:
+                    print(f"bad --limit {limit}: use a positive integer, e.g. python3 agent_dash.py ws next {ws or '<ID>'} --limit 5", flush=True)
+                    return errors.USAGE
+            elif ws is None and not flag.startswith("-"):
+                ws = flag
+            else:
+                print(WS_USAGE, end="", flush=True)
+                return errors.USAGE
+        if ws is None:
+            print(WS_USAGE, end="", flush=True)
+            return errors.USAGE
+        return print_next(ws, limit=limit, json_mode=json_mode)
+    if cmd == "waves":
+        if len(rest) != 1:
+            print(WS_USAGE, end="", flush=True)
+            return errors.USAGE
+        return print_waves(rest[0], json_mode=json_mode)
+    if cmd == "overlap":
+        ws = None
+        all_waves = False
+        cross = False
+        for flag in rest:
+            if flag == "--all":
+                all_waves = True
+            elif flag == "--cross":
+                cross = True
+            elif ws is None and not flag.startswith("-"):
+                ws = flag
+            else:
+                print(WS_USAGE, end="", flush=True)
+                return errors.USAGE
+        return print_overlap(ws, all_waves=all_waves, cross=cross, json_mode=json_mode)
+    if cmd == "gates":
+        if len(rest) != 1:
+            print(WS_USAGE, end="", flush=True)
+            return errors.USAGE
+        return print_gates(rest[0], json_mode=json_mode)
+    if cmd == "deferred":
+        if len(rest) > 1:
+            print(WS_USAGE, end="", flush=True)
+            return errors.USAGE
+        return print_deferred(rest[0] if rest else None, json_mode=json_mode)
     print(WS_USAGE, end="", flush=True)
     return errors.USAGE

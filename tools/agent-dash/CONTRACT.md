@@ -146,8 +146,9 @@ one fixed 24 h window; it skips with a clear message when Chrome is missing.
 plan still serves 200 with its issues named, and the progress map shows a
 muted "plan needs attention: <first issue>" line instead of drawing the bad
 states as if they were fine):
-`{"ws": "WS7", "cols": [..], "groups": [{id, col, title, tasks: [{id, title, status, deps, kind, dep_notes}]}], "edges": [[a, b]], "phases": [{name, goal, gate}], "progress": {"done": 0, "total": 0, "counts": {todo, wip, pr, prog, done, deferred}, "pct": 0}}`.
-A task's `kind` is `task` or `gate` (an outside signal or condition, drawn as a diamond); absent means `task`. `dep_notes` maps one of the task's dep ids to the short condition on that edge. Both pass through every plan API sanitized like other fields. `/api/bundle` carries the same task shape inside `plan.dag.groups`.
+`{"ws": "WS7", "cols": [..], "groups": [{id, col, title, tasks: [{id, title, status, deps, kind, dep_notes}]}], "edges": [[a, b]], "phases": [{name, goal, gate}], "progress": {"done": 0, "total": 0, "counts": {todo, wip, pr, prog, done, deferred}, "pct": 0}, "ready": ["WS7.2"], "critical_path": ["WS7.1", "WS7.2"], "max_parallel": 3}`.
+`ready` is the todo-with-satisfied-deps task ids ranked by critical-path impact, `critical_path` is the longest dep chain, and `max_parallel` is the widest dependency wave; all three come from `dash/orchestrate.py` with no store reads, cached by `plan.json` mtime.
+A task's `kind` is `task` or `gate` (an outside signal or condition, drawn as a diamond); absent means `task`. `dep_notes` maps one of the task's dep ids to the short condition on that edge. A task may also carry `files` (declared file footprints, a non-empty list of glob strings), and a gate may carry `signal` (what it waits on), `confirmed_at` (ISO-8601 UTC of the last check), and `fresh_hours` (recheck bound; older or missing confirmations read STALE). A deferred task may carry `received_as` (the task id in the receiving workstream that picked it up). All pass through every plan API sanitized like other fields. `/api/bundle` carries the same task shape inside `plan.dag.groups`.
 `plans.local.json` replaces `plans.example.json`. Each value is a path. Relative paths resolve next to the plans file. The loader reads `dag` and `narrative.phases`.
 One resolver (`dash.bundles.resolve_plan`) picks the plan file: a bundle's
 `plan.json` wins over the plans-map file. `/api/plan`, `/api/bundle`, and the
@@ -322,7 +323,7 @@ Each bundle:
 | File | Role |
 |---|---|
 | `bundle.json` | `{id, title, short, order, kind}`. `kind` is `program` or `workstream`. The id matches the directory name. |
-| `plan.json` | Decision record: `dag`, `decisions`, `motivation`, `agent_friendly`, `narrative`. Task status is `todo`, `pr`, `prog`, `done`, or `deferred`. `deferred` may set `moved_to` and `note`. A task may carry `deps`, `dep_notes` (conditions keyed by dep id), and `kind` (`task` or `gate`; see SKILL-PLAN.md). `ws validate` rejects a bad `kind` and a `dep_notes` key that is not one of the task's `deps`. A `program` bundle may hold only `narrative`. |
+| `plan.json` | Decision record: `dag`, `decisions`, `motivation`, `agent_friendly`, `narrative`. Task status is `todo`, `pr`, `prog`, `done`, or `deferred`. `deferred` may set `moved_to`, `note`, and `received_as`. A task may carry `deps`, `dep_notes` (conditions keyed by dep id), `kind` (`task` or `gate`; see SKILL-PLAN.md), and `files` (declared footprints); a gate may carry `signal`, `confirmed_at`, and `fresh_hours`. `ws validate` rejects a bad `kind`, a `dep_notes` key that is not one of the task's `deps`, a bad `files`/`signal`/`confirmed_at`/`fresh_hours`/`received_as`, and a bare number citation. A `program` bundle may hold only `narrative`. |
 | `page.html` | Plan-view fragment. Generated for bundles that have `visuals.html` and `layout.json`. |
 | `approvals.json` | Optional. `{ws, decided_at, decided_by, items: [{id, step, status, reversible, conditions}]}`. `status` is `pending`, `approved`, or `denied`. `reversible` is a boolean. `decided_at` is an ISO-8601 UTC string or null. |
 | `visuals.html` | Hand-made sections keyed by h2 title. |

@@ -502,5 +502,100 @@ class GatesApiTest(unittest.TestCase):
         self.assertEqual(rows["WS9.1"]["dep_notes"], {"WS9.0": "start only after the signal"})
 
 
+class OrchestrateApiTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.old = os.environ.get("AGENT_DASH_WORKSTREAMS")
+        os.environ["AGENT_DASH_WORKSTREAMS"] = self.tmp.name
+        root = Path(self.tmp.name)
+        ws = root / "WS9"
+        ws.mkdir()
+        (ws / "bundle.json").write_text(
+            json.dumps({"id": "WS9", "title": "Example", "short": "Ex", "order": 1, "kind": "workstream"}),
+            encoding="utf-8",
+        )
+        (ws / "plan.json").write_text(
+            json.dumps(
+                {
+                    "dag": {
+                        "cols": ["Shape"],
+                        "groups": [{"id": "g", "col": 0, "title": "Group", "tasks": [
+                            {"id": "WS9.0", "title": "Upstream signal is in", "status": "done", "kind": "gate",
+                             "signal": "the freeze lifts", "confirmed_at": "2026-10-01T12:00:00Z", "fresh_hours": 720},
+                            {"id": "WS9.1", "title": "First task", "status": "todo", "deps": ["WS9.0"],
+                             "files": ["api/x.py"]},
+                            {"id": "WS9.2", "title": "Second task", "status": "todo", "deps": ["WS9.1"]},
+                            {"id": "WS9.3", "title": "Moved task", "status": "deferred",
+                             "moved_to": "WS8", "note": "waits on the freeze", "received_as": "WS8.1"},
+                        ]}],
+                        "edges": [],
+                    },
+                    "narrative": {"phases": []},
+                }
+            ),
+            encoding="utf-8",
+        )
+        self.store = Store(Path(self.tmp.name) / "dash.sqlite")
+        self.server, self.thread = start(self.store, ROOT / "static" / "index.html")
+        self.port = self.server.server_address[1]
+
+    def tearDown(self):
+        stop(self.server, self.thread)
+        self.store.close()
+        if self.old is None:
+            os.environ.pop("AGENT_DASH_WORKSTREAMS", None)
+        else:
+            os.environ["AGENT_DASH_WORKSTREAMS"] = self.old
+        self.tmp.cleanup()
+
+    def test_plan_carries_orchestration_fields(self):
+        status, _, body = get(self.port, "/api/plan?ws=WS9")
+        self.assertEqual(status, 200)
+        payload = json.loads(body)
+        self.assertEqual(payload["ready"], ["WS9.1"])
+        self.assertEqual(payload["critical_path"], ["WS9.0", "WS9.1", "WS9.2"])
+        self.assertEqual(payload["max_parallel"], 2)
+
+    def test_new_task_fields_pass_through(self):
+        status, _, body = get(self.port, "/api/plan?ws=WS9")
+        rows = {task["id"]: task for task in json.loads(body)["groups"][0]["tasks"]}
+        self.assertEqual(rows["WS9.1"]["files"], ["api/x.py"])
+        self.assertEqual(rows["WS9.0"]["signal"], "the freeze lifts")
+        self.assertEqual(rows["WS9.0"]["confirmed_at"], "2026-10-01T12:00:00Z")
+        self.assertEqual(rows["WS9.0"]["fresh_hours"], 720)
+        self.assertEqual(rows["WS9.3"]["received_as"], "WS8.1")
+        status, _, bundle = get(self.port, "/api/bundle?ws=WS9")
+        self.assertEqual(status, 200)
+        dag_rows = {task["id"]: task for task in json.loads(bundle)["plan"]["dag"]["groups"][0]["tasks"]}
+        self.assertEqual(dag_rows["WS9.1"]["files"], ["api/x.py"])
+        self.assertEqual(dag_rows["WS9.0"]["signal"], "the freeze lifts")
+
+    def test_orchestration_fields_follow_plan_mtime(self):
+        from dash.bundles import validate_bundle
+
+        self.assertEqual(validate_bundle("WS9"), [])
+        status, _, first = get(self.port, "/api/plan?ws=WS9")
+        self.assertEqual(json.loads(first)["ready"], ["WS9.1"])
+        plan_path = Path(self.tmp.name) / "WS9" / "plan.json"
+        plan = json.loads(plan_path.read_text(encoding="utf-8"))
+        tasks = plan["dag"]["groups"][0]["tasks"]
+        tasks[1]["status"] = "done"
+        plan_path.write_text(json.dumps(plan), encoding="utf-8")
+        stat = plan_path.stat()
+        os.utime(plan_path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 5_000_000_000))
+        status, _, second = get(self.port, "/api/plan?ws=WS9")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(second)["ready"], ["WS9.2"])
+
+    def test_bad_files_rejected(self):
+        from dash.bundles import validate_bundle
+
+        plan_path = Path(self.tmp.name) / "WS9" / "plan.json"
+        plan = json.loads(plan_path.read_text(encoding="utf-8"))
+        plan["dag"]["groups"][0]["tasks"][1]["files"] = "api/x.py"
+        plan_path.write_text(json.dumps(plan), encoding="utf-8")
+        self.assertTrue(any("files" in issue for issue in validate_bundle("WS9")))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -218,6 +218,19 @@ python3 tools/agent-dash/agent_dash.py ws approvals WS4
 
 The lead records `pending`; the owner answers `approved` or `denied`. The lead reads `ws approvals` before the step and runs one production step at a time.
 
+Orchestrate from the plan instead of re-reading it. Each takes `--json` (machine JSON on stdout, human text on stderr) and exits 0 ok, 2 usage, 3 not found, or 4 invalid data:
+
+```bash
+python3 tools/agent-dash/agent_dash.py ws next WS4 --limit 3
+python3 tools/agent-dash/agent_dash.py ws waves WS4
+python3 tools/agent-dash/agent_dash.py ws overlap WS4
+python3 tools/agent-dash/agent_dash.py ws gates WS4
+python3 tools/agent-dash/agent_dash.py ws deferred WS4
+python3 tools/agent-dash/agent_dash.py lead-profile --ws WS4
+```
+
+`ws next` lists ready tasks (all deps done, gates included) ranked by critical-path impact, each with what it unblocks, its train, and its live run; it also warns on started tasks with no live run (stalled) and tasks started before a dep finished (dep-jump). `ws waves` prints max-parallel waves (split on declared `files` footprints), the critical path by task count and by observed duration, best span vs actual, and max parallelism. `ws overlap` warns on colliding footprints among open tasks (`--all` checks the next wave instead; `--cross` scans across workstreams; branch diffs join in when the dashboard is reachable). `ws gates` reports every gate's signal, last confirmation, STALE state, and blocked dependents. `ws deferred` tracks moved tasks to their receiving workstream and flags orphans nobody picked up. `lead-profile` counts every worker a lead launched (workflow wrappers and manifest rows included), with concurrency, idle-ready share, tails, and LOW-DELEGATION / IDLE-READY / LONG-TAIL / CONTEXT>250k flags.
+
 Every `ws task` move is also appended to the bundle's `history.jsonl`; the progress map's Replay button plays that history (plus agent runs) back, and `scripts/render_replay.mjs` records it to MP4 and GIF (docs/configuration.md).
 
 Who writes what (one writer per file): the lead owns the bundle (`plan.json` via `ws task`/`ws train`, `approvals.json` via `ws approve`); workers own their branches and their report lines; the dashboard never writes sources. Read-only on every source; labels only, never prompts or secrets.

@@ -23,6 +23,34 @@ PLACEHOLDER = b"agent-dash\n"
 _WS = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 
 
+#: /api/plan orchestration fields keyed by workstream: (plan mtime, payload).
+#: Map-backed plans have no single file, so their mtime is None and they
+#: recompute every request (still cheap: one DAG pass, no store reads).
+_PLAN_EXTRA_CACHE: dict = {}
+
+
+def _plan_extra_cached(ws: str, body: dict) -> dict:
+    """``{"ready", "critical_path", "max_parallel"}`` cached by plan mtime."""
+    from dash import orchestrate
+    from dash.bundles import bundle_dir
+
+    mtime = None
+    try:
+        path = bundle_dir(ws)
+        if path is not None:
+            mtime = (path / "plan.json").stat().st_mtime_ns
+    except OSError:
+        mtime = None
+    if mtime is not None:
+        hit = _PLAN_EXTRA_CACHE.get(ws)
+        if hit is not None and hit[0] == mtime:
+            return hit[1]
+    payload = orchestrate.plan_extra(body)
+    if mtime is not None:
+        _PLAN_EXTRA_CACHE[ws] = (mtime, payload)
+    return payload
+
+
 class DashServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
@@ -270,6 +298,9 @@ class Handler(BaseHTTPRequestHandler):
             body["start_prompt"] = start_prompt_text(ws)
         if isinstance(body, dict) and "issues" not in body:
             body["issues"] = []
+        if isinstance(body, dict):
+            for key, value in _plan_extra_cached(ws, body).items():
+                body.setdefault(key, value)
         self._json(200, body)
 
     def _replay(self, query):

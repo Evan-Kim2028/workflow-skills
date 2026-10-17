@@ -16,6 +16,12 @@ Fill `plan.json` before you render. The shape is the decision record: `dag`, `de
 
 `dag.cols` is the column titles, left to right. Each group has `id`, `col`, `title`, and `tasks`. Each task has `id`, `title`, and `status`. A task may carry `deps` (task ids it waits on) and `dep_notes` (a map from one of its dep ids to the short condition on that edge, e.g. "run only after the export"). A task that is an outside signal or condition rather than work in this workstream carries `"kind": "gate"` (default `"task"`); the map draws it as a diamond. Edges are pairs of group ids and mean "this group waits on that one".
 
+A task may declare `"files": ["api/x.py", "api/*.py"]`, the file footprints it touches. `ws waves` splits a dependency level so no two tasks in one wave share a file, and `ws overlap` warns while colliding tasks are still open. Keep the globs tight: a literal path beats a wildcard.
+
+A gate may carry `"signal"` (what it waits on, e.g. "the freeze lifts"), `"confirmed_at"` (ISO-8601 UTC of the last check, e.g. `"2026-10-01T12:00:00Z"`), and `"fresh_hours"` (recheck bound, e.g. `24`). `ws gates` reports STALE when `confirmed_at` is missing or older than `fresh_hours`; treat a stale gate as unready before launching its dependents.
+
+A deferred task may carry `"received_as"` (the task id in the receiving workstream that picked it up, e.g. `"WS6.3"`). `ws deferred` matches by `received_as` first, then by title similarity, and flags deferrals nobody picked up as orphans.
+
 `narrative.thesis` is one sentence. `narrative.end_state` is what is true when the workstream is done. `narrative.phases` is `name`, `goal`, and `gate`.
 
 Hand-made drawings go in `visuals.html` as `<section class="pl-sec lay"><h2>Exact title</h2>...</section>`. `layout.json` lists those h2 titles under `why_visual`, `end_body`, `plan_extra`, `agent_visual`, and `ref_sections`. A string that starts with `<` is inserted as HTML. A title is looked up in `visuals.html`.

@@ -466,5 +466,167 @@ class WsTrainCliTest(unittest.TestCase):
         self.assertIn("train T1 has 9 members; split it (limit 8)", validate_bundle("WS4"))
 
 
+class OrchestrateCliTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.old = os.environ.get("AGENT_DASH_WORKSTREAMS")
+        os.environ["AGENT_DASH_WORKSTREAMS"] = self.tmp.name
+        self.old_url = os.environ.get("AGENT_DASH_URL")
+        os.environ["AGENT_DASH_URL"] = "http://127.0.0.1:1"
+        self.root = Path(self.tmp.name)
+        self.assertEqual(cmd_ws(["new", "WS9", "Sample"]), 0)
+        plan_path = self.root / "WS9" / "plan.json"
+        plan = json.loads(plan_path.read_text(encoding="utf-8"))
+        plan["dag"]["groups"] = [
+            {
+                "id": "g",
+                "col": 0,
+                "title": "Group",
+                "tasks": [
+                    {"id": "WS9.0", "title": "Freeze signal is in", "status": "todo", "kind": "gate",
+                     "signal": "the freeze lifts", "confirmed_at": "2020-01-01T00:00:00Z", "fresh_hours": 24},
+                    {"id": "WS9.1", "title": "First task", "status": "done"},
+                    {"id": "WS9.2", "title": "Second task", "status": "todo", "deps": ["WS9.1"], "files": ["api/x.py"]},
+                    {"id": "WS9.3", "title": "Third task", "status": "todo", "deps": ["WS9.2"], "files": ["api/x.py"]},
+                    {"id": "WS9.4", "title": "Fourth task", "status": "wip", "deps": ["WS9.1"], "files": ["web/y.py"]},
+                    {"id": "WS9.5", "title": "Fifth task", "status": "pr", "deps": ["WS9.1"], "files": ["web/y.py"]},
+                    {"id": "WS9.6", "title": "Handle the freeze signal", "status": "deferred",
+                     "moved_to": "WS8", "note": "waits on the freeze", "received_as": "WS8.1"},
+                    {"id": "WS9.7", "title": "Abandoned probe", "status": "deferred"},
+                ],
+            }
+        ]
+        plan_path.write_text(json.dumps(plan), encoding="utf-8")
+        other = self.root / "WS8"
+        other.mkdir()
+        (other / "bundle.json").write_text(
+            json.dumps({"id": "WS8", "title": "Other", "short": "Other", "order": 8, "kind": "workstream"}),
+            encoding="utf-8",
+        )
+        (other / "plan.json").write_text(
+            json.dumps(
+                {
+                    "dag": {"cols": ["Build"], "groups": [{"id": "g", "col": 0, "title": "Group", "tasks": [
+                        {"id": "WS8.1", "title": "Handle the freeze signal", "status": "todo"},
+                    ]}], "edges": []},
+                    "narrative": {"thesis": "One.", "end_state": "Done.", "phases": []},
+                }
+            ),
+            encoding="utf-8",
+        )
+        self.assertEqual(validate_bundle("WS9"), [])
+
+    def tearDown(self):
+        if self.old is None:
+            os.environ.pop("AGENT_DASH_WORKSTREAMS", None)
+        else:
+            os.environ["AGENT_DASH_WORKSTREAMS"] = self.old
+        if self.old_url is None:
+            os.environ.pop("AGENT_DASH_URL", None)
+        else:
+            os.environ["AGENT_DASH_URL"] = self.old_url
+        self.tmp.cleanup()
+
+    def _json(self, argv):
+        import contextlib
+        import io
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            code = cmd_ws(argv)
+        self.assertEqual(code, 0)
+        return json.loads(buf.getvalue())
+
+    def test_next_lists_ranked_ready_and_warnings(self):
+        payload = self._json(["next", "WS9", "--json"])
+        self.assertEqual(payload["ws"], "WS9")
+        self.assertEqual([row["id"] for row in payload["ready"]], ["WS9.2", "WS9.0"])
+        row = payload["ready"][0]
+        self.assertEqual(row["unblocks"], ["WS9.3"])
+        self.assertIsNone(row["live_run"])
+        self.assertEqual(payload["live"], "unreachable")
+        self.assertEqual({row["id"] for row in payload["stalled"]}, {"WS9.4", "WS9.5"})
+        self.assertEqual(cmd_ws(["next", "WS9", "--limit", "1"]), 0)
+        limited = self._json(["next", "WS9", "--limit", "1", "--json"])
+        self.assertEqual(len(limited["ready"]), 1)
+
+    def test_next_exit_codes(self):
+        self.assertEqual(cmd_ws(["next", "NOPE"]), 3)
+        self.assertEqual(cmd_ws(["next"]), 2)
+        self.assertEqual(cmd_ws(["next", "WS9", "--limit", "0"]), 2)
+        self.assertEqual(cmd_ws(["next", "WS9", "--limit", "x"]), 2)
+
+    def test_waves_reports_levels_and_path(self):
+        payload = self._json(["waves", "WS9", "--json"])
+        self.assertEqual(payload["ws"], "WS9")
+        self.assertEqual(payload["sizes"], [4, 2, 1, 1])
+        self.assertEqual(payload["critical_path"], ["WS9.1", "WS9.2", "WS9.3"])
+        self.assertEqual(payload["max_parallel"], 4)
+        self.assertEqual(payload["best_span_tasks"], 3)
+        self.assertEqual(cmd_ws(["waves", "WS9"]), 0)
+        self.assertEqual(cmd_ws(["waves"]), 2)
+        self.assertEqual(cmd_ws(["waves", "NOPE"]), 3)
+
+    def test_overlap_declared_all_and_cross(self):
+        payload = self._json(["overlap", "WS9", "--json"])
+        self.assertEqual(payload["scope"], "wip/pr")
+        self.assertEqual(len(payload["pairs"]), 1)
+        self.assertEqual(payload["pairs"][0]["source"], "declared")
+        scoped = self._json(["overlap", "WS9", "--all", "--json"])
+        self.assertEqual(scoped["scope"], "next wave")
+        crossed = self._json(["overlap", "--cross", "--json"])
+        self.assertTrue(crossed["cross"])
+        self.assertEqual(cmd_ws(["overlap", "WS9"]), 0)
+        self.assertEqual(cmd_ws(["overlap"]), 2)
+        self.assertEqual(cmd_ws(["overlap", "NOPE"]), 3)
+
+    def test_gates_flags_stale(self):
+        payload = self._json(["gates", "WS9", "--json"])
+        (gate,) = payload["gates"]
+        self.assertEqual(gate["id"], "WS9.0")
+        self.assertTrue(gate["stale"])
+        self.assertEqual(gate["signal"], "the freeze lifts")
+        self.assertEqual(cmd_ws(["gates", "WS9"]), 0)
+        self.assertEqual(cmd_ws(["gates"]), 2)
+        self.assertEqual(cmd_ws(["gates", "NOPE"]), 3)
+
+    def test_deferred_tracks_receiving_end(self):
+        payload = self._json(["deferred", "WS9", "--json"])
+        rows = {row["id"]: row for row in payload["deferred"]}
+        self.assertEqual(rows["WS9.6"]["received"], "WS8.1")
+        self.assertFalse(rows["WS9.6"]["orphan"])
+        self.assertTrue(rows["WS9.7"]["orphan"])
+        rolled = self._json(["deferred", "--json"])
+        self.assertTrue(any(row["id"] == "WS9.6" for row in rolled["deferred"]))
+        self.assertEqual(cmd_ws(["deferred", "WS9"]), 0)
+        self.assertEqual(cmd_ws(["deferred"]), 0)
+        self.assertEqual(cmd_ws(["deferred", "NOPE"]), 3)
+
+    def test_invalid_plan_is_invalid_data(self):
+        (self.root / "WS9" / "plan.json").write_text("{nope", encoding="utf-8")
+        self.assertEqual(cmd_ws(["waves", "WS9"]), 4)
+        self.assertEqual(cmd_ws(["next", "WS9"]), 4)
+
+    def test_new_task_fields_validate(self):
+        plan_path = self.root / "WS9" / "plan.json"
+        plan = json.loads(plan_path.read_text(encoding="utf-8"))
+        tasks = plan["dag"]["groups"][0]["tasks"]
+        tasks[1]["files"] = "api/x.py"
+        plan_path.write_text(json.dumps(plan), encoding="utf-8")
+        self.assertTrue(any("files" in issue for issue in validate_bundle("WS9")))
+        tasks[1].pop("files")
+        tasks[0]["confirmed_at"] = "not a date"
+        plan_path.write_text(json.dumps(plan), encoding="utf-8")
+        self.assertTrue(any("confirmed_at" in issue for issue in validate_bundle("WS9")))
+        tasks[0]["confirmed_at"] = "2020-01-01T00:00:00Z"
+        tasks[0]["fresh_hours"] = -1
+        plan_path.write_text(json.dumps(plan), encoding="utf-8")
+        self.assertTrue(any("fresh_hours" in issue for issue in validate_bundle("WS9")))
+        tasks[0]["fresh_hours"] = 24
+        tasks[6]["received_as"] = ""
+        plan_path.write_text(json.dumps(plan), encoding="utf-8")
+        self.assertTrue(any("received_as" in issue for issue in validate_bundle("WS9")))
+
+
 if __name__ == "__main__":
     unittest.main()

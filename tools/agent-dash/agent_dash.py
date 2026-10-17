@@ -62,6 +62,7 @@ USAGE = """agent-dash: local read-only execution dashboard
   python3 agent_dash.py ws task <ID> <task-id> <status> [--moved-to WSn] [--note "..."] [--force]
   python3 agent_dash.py ws train <ID> <train-id> [--title T] [--branch B] [--status S] [--add id,id] [--remove id,id] [--pr N] [--shared f1,f2] [--gate "..."] [--note "..."]
   python3 agent_dash.py ws trains <ID> [--json]
+  python3 agent_dash.py lead-profile <session-id|--ws ID> [--json]
 
 Exit codes: 0 ok, 1 check failed (mismatches found, or doctor found
 problems), 2 usage error, 3 not found, 4 invalid data, 5 dashboard
@@ -236,6 +237,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_check(args[1:])
     if cmd == "report":
         return cmd_report(args[1:])
+    if cmd == "lead-profile":
+        return cmd_lead_profile(args[1:])
     print(USAGE, end="", file=sys.stderr)
     return 2
 
@@ -567,6 +570,61 @@ def cmd_reconcile() -> int:
     finally:
         store.close()
     print(f"reconcile ended {ended}")
+    return 0
+
+
+def cmd_lead_profile(argv: list[str]) -> int:
+    """A lead session's delegation profile: every worker it launched. Read-only."""
+    from dash.orchestrate import lead_profile
+
+    session_id = None
+    ws = None
+    json_mode = False
+    rest = list(argv)
+    while rest:
+        flag = rest.pop(0)
+        if flag == "--ws" and rest:
+            ws = rest.pop(0)
+        elif flag == "--json":
+            json_mode = True
+        elif session_id is None and ws is None and not flag.startswith("-"):
+            session_id = flag
+        else:
+            print(USAGE, end="", file=sys.stderr)
+            return 2
+    if (session_id is None) == (ws is None):
+        print("lead-profile needs one session id or --ws <ID>. Run: python3 agent_dash.py lead-profile --ws WS4", file=sys.stderr)
+        return 2
+    bind_state()
+    db = os.environ.get("AGENT_DASH_DB")
+    path = Path(expand(db)) if db else DBFILE
+    if not path.is_file():
+        print(f"no database {path}", file=sys.stderr)
+        return 2
+    store = Store(path)
+    try:
+        profile = lead_profile(store, session_id=session_id, ws=ws)
+    finally:
+        store.close()
+    if profile is None:
+        message = f"unknown session {session_id}. Run: python3 agent_dash.py ws list" if session_id else f"no lead sessions for {ws}. Run: python3 agent_dash.py ws list"
+        if json_mode:
+            errors.emit_json({"error": message, "code": "not_found", "hint": "Run: python3 agent_dash.py ws list"})
+        else:
+            print(message, file=sys.stderr)
+        return 3
+    if json_mode:
+        errors.emit_json(profile)
+        return 0
+    print(f"lead {profile.get('session_id')} ({profile.get('tool')}, {profile.get('label')}) ws={profile.get('ws')}")
+    print(f"workers launched: {profile.get('workers_launched')} {profile.get('by_source')}")
+    print(f"own tool calls: {profile.get('own_tool_calls')} context tokens: {profile.get('context_tokens')}")
+    print(f"worker concurrency: mean {profile.get('mean_concurrency')} peak {profile.get('peak_concurrency')}")
+    print(f"idle-ready share: {profile.get('idle_ready_share')} waves: {profile.get('wave_sizes')}")
+    for tail in profile.get("tails") or []:
+        print(f"  tail {tail.get('label')}: {tail.get('seconds')}s")
+    flags = profile.get("flags") or []
+    print(f"flags: {', '.join(flags) if flags else '-'}")
     return 0
 
 
