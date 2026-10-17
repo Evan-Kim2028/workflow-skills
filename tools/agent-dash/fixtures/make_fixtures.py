@@ -5,6 +5,7 @@ import datetime
 import json
 import math
 import random
+import sys
 from pathlib import Path
 
 SEED = 1
@@ -41,6 +42,9 @@ NOTE = "Seeded synthetic data for the offline preview. Seed 1. No local sessions
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
 RNG = random.Random(SEED)
+
+sys.path.insert(0, str(ROOT))
+from dash import taskmatch  # noqa: E402  (the shared run-to-task rule)
 
 RAW_PLANS = {
     "WS1": {
@@ -622,6 +626,85 @@ def _plans():
     return written
 
 
+def _replay_doc(runs, ws, groups):
+    """Offline replay fixture: same shape as GET /api/replay, mapped with
+    the shared rule (no task map in fixtures, plan ids from the fixture
+    plan view, so the offline page's chips and replay agree)."""
+    by_id = {}
+    for group in groups:
+        for task in group.get("tasks", []):
+            by_id[task["id"]] = task
+    ids = list(by_id)
+    per = {tid: [] for tid in by_id}
+    for run in runs:
+        if run.get("source") == "dagster":
+            continue
+        owner = run.get("workstream")
+        if owner and owner != ws:
+            continue
+        tid = taskmatch.task_of(run.get("label"), ws, {}, ids)
+        if tid is None or tid not in per:
+            continue
+        per[tid].append({
+            "start": run["started_at"],
+            "end": run["ended_at"],
+            "family": taskmatch.run_family(run),
+            "label": run["label"],
+        })
+    first_active = {}
+    done_at = {}
+    observed = set()
+    for tid, items in per.items():
+        starts = [item["start"] for item in items if item["start"] is not None]
+        first_active[tid] = min(starts) if starts else None
+        done_at[tid] = None
+        if by_id[tid].get("status") == "done":
+            ends = [item["end"] for item in items if item["end"] is not None]
+            if ends:
+                done_at[tid] = max(ends)
+                observed.add(tid)
+    seen = [first_active[tid] for tid in by_id if first_active[tid] is not None]
+    seen += [done_at[tid] for tid in observed if done_at[tid] is not None]
+    earliest = min(seen) if seen else None
+    inferred = set()
+    for tid in by_id:
+        if by_id[tid].get("status") == "done" and tid not in observed:
+            done_at[tid] = earliest
+            inferred.add(tid)
+    events = []
+    for tid, items in per.items():
+        for item in items:
+            if item["start"] is None:
+                continue
+            events.append({
+                "t": item["start"], "kind": "active", "task": tid,
+                "label": item["label"], "family": item["family"], "end": item["end"],
+            })
+    for tid in by_id:
+        if done_at[tid] is not None:
+            events.append({"t": done_at[tid], "kind": "done", "task": tid, "inferred": tid in inferred})
+    events.sort(key=lambda row: (row["t"], 0 if row["kind"] == "active" else 1))
+    tasks = {
+        tid: {
+            "status": by_id[tid].get("status"),
+            "first_active": first_active[tid],
+            "done_at": done_at[tid],
+            "inferred": tid in inferred,
+            "runs": sorted(per[tid], key=lambda item: item["start"] or 0),
+        }
+        for tid in by_id
+    }
+    return {
+        "ws": ws,
+        "span": {"start": events[0]["t"], "end": events[-1]["t"]} if events else None,
+        "tasks": tasks,
+        "events": events,
+        "observed": sum(1 for tid in by_id if done_at[tid] is not None and tid not in inferred),
+        "inferred": len(inferred),
+        "_note": NOTE,
+    }
+
+
 def _counts(runs, now):
     tools = ("grok", "muse", "glm", "claude")
     live_by = {key: 0 for key in tools}
@@ -715,6 +798,8 @@ def main():
     }
     for ws, plan in plans.items():
         files[f"plan-{ws}.json"] = plan
+    for ws, plan in plans.items():
+        files[f"replay-{ws}.json"] = _replay_doc(runs, ws, plan["groups"])
     for name, doc in files.items():
         (HERE / name).write_text(json.dumps(doc, indent=2) + "\n", encoding="utf-8")
     print(f"wrote {len(runs)} runs, peak {peak}, {len(files)} files")

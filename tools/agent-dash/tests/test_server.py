@@ -492,5 +492,166 @@ class SnapshotUsageEndpointTest(unittest.TestCase):
         self.assertEqual(status, 400)
 
 
+def _replay_bundle(root: Path) -> None:
+    ws = root / "WS9"
+    ws.mkdir()
+    (ws / "bundle.json").write_text(
+        json.dumps({"id": "WS9", "title": "Example", "short": "Ex", "order": 1, "kind": "workstream"}),
+        encoding="utf-8",
+    )
+    (ws / "plan.json").write_text(
+        json.dumps(
+            {
+                "dag": {
+                    "cols": ["Shape", "Build"],
+                    "groups": [
+                        {
+                            "id": "g",
+                            "col": 0,
+                            "title": "Group",
+                            "tasks": [
+                                {"id": "1", "title": "First task", "status": "done", "deps": []},
+                                {"id": "2", "title": "Second task", "status": "done", "deps": ["1"]},
+                                {"id": "3", "title": "Third task", "status": "done", "deps": ["2"]},
+                                {"id": "4", "title": "Later task", "status": "todo", "deps": ["3"]},
+                            ],
+                        }
+                    ],
+                    "edges": [],
+                },
+                "narrative": {"phases": []},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+class ReplayTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.old = os.environ.get("AGENT_DASH_WORKSTREAMS")
+        os.environ["AGENT_DASH_WORKSTREAMS"] = self.tmp.name
+        _replay_bundle(Path(self.tmp.name))
+        self.store = Store(Path(self.tmp.name) / "dash.sqlite")
+        self.store.upsert_run(
+            {
+                "run_id": "muse:s1:ws9-1-first",
+                "source": "muse",
+                "tier": "muse",
+                "label": "ws9-1-first",
+                "status": "done",
+                "started_at": 1000.0,
+                "ended_at": 1100.0,
+            }
+        )
+        self.store.upsert_run(
+            {
+                "run_id": "muse:s2:ws9-1-second",
+                "source": "muse",
+                "tier": "muse",
+                "label": "ws9-1-second",
+                "status": "done",
+                "started_at": 1200.0,
+                "ended_at": 1300.0,
+            }
+        )
+        self.store.upsert_run(
+            {
+                "run_id": "grok:s3:ws9-2-x",
+                "source": "grok",
+                "tier": "grok",
+                "label": "ws9-2-x",
+                "status": "done",
+                "started_at": 1400.0,
+                "ended_at": 1500.0,
+            }
+        )
+        self.store.upsert_run(
+            {
+                "run_id": "muse:s4:ws8-1-x",
+                "source": "muse",
+                "tier": "muse",
+                "label": "ws8-1-x",
+                "status": "done",
+                "started_at": 900.0,
+                "ended_at": 950.0,
+            }
+        )
+        self.server, self.thread = start(self.store)
+        self.port = self.server.server_address[1]
+
+    def tearDown(self):
+        stop(self.server, self.thread)
+        self.store.close()
+        if self.old is None:
+            os.environ.pop("AGENT_DASH_WORKSTREAMS", None)
+        else:
+            os.environ["AGENT_DASH_WORKSTREAMS"] = self.old
+        self.tmp.cleanup()
+
+    def replay(self):
+        status, _, body = get(self.port, "/api/replay?ws=WS9")
+        self.assertEqual(status, 200)
+        return json.loads(body)
+
+    def test_observed_times_come_from_runs(self):
+        payload = self.replay()
+        one = payload["tasks"]["1"]
+        self.assertEqual(one["first_active"], 1000.0)
+        self.assertEqual(one["done_at"], 1300.0)
+        self.assertFalse(one["inferred"])
+        self.assertEqual([run["label"] for run in one["runs"]], ["ws9-1-first", "ws9-1-second"])
+        self.assertEqual({run["family"] for run in one["runs"]}, {"muse"})
+        for run in one["runs"]:
+            self.assertEqual(set(run), {"start", "end", "family", "label"})
+        two = payload["tasks"]["2"]
+        self.assertEqual((two["first_active"], two["done_at"], two["inferred"]), (1400.0, 1500.0, False))
+
+    def test_other_workstream_runs_do_not_leak_in(self):
+        payload = self.replay()
+        labels = [event["label"] for event in payload["events"] if event["kind"] == "active"]
+        self.assertNotIn("ws8-1-x", labels)
+
+    def test_inferred_done_uses_the_deps(self):
+        payload = self.replay()
+        three = payload["tasks"]["3"]
+        self.assertEqual(three["runs"], [])
+        self.assertIsNone(three["first_active"])
+        self.assertEqual(three["done_at"], 1500.0)
+        self.assertTrue(three["inferred"])
+        four = payload["tasks"]["4"]
+        self.assertIsNone(four["done_at"])
+        self.assertFalse(four["inferred"])
+
+    def test_events_sorted_and_counts(self):
+        payload = self.replay()
+        stamps = [(event["t"], event["kind"]) for event in payload["events"]]
+        self.assertEqual(stamps, sorted(stamps, key=lambda row: (row[0], 0 if row[1] == "active" else 1)))
+        self.assertEqual(payload["span"], {"start": 1000.0, "end": 1500.0})
+        self.assertEqual(payload["observed"], 2)
+        self.assertEqual(payload["inferred"], 1)
+
+    def test_recorded_history_wins(self):
+        (Path(self.tmp.name) / "WS9" / "history.jsonl").write_text(
+            json.dumps({"ts": 9999.0, "task": "3", "from": "todo", "to": "done"}) + "\n", encoding="utf-8"
+        )
+        payload = self.replay()
+        three = payload["tasks"]["3"]
+        self.assertEqual(three["done_at"], 9999.0)
+        self.assertFalse(three["inferred"])
+        self.assertEqual(payload["span"]["end"], 9999.0)
+        self.assertEqual(payload["observed"], 3)
+        self.assertEqual(payload["inferred"], 0)
+
+    def test_replay_errors(self):
+        status, _, body = get(self.port, "/api/replay")
+        self.assertEqual(status, 400)
+        status, _, _ = get(self.port, "/api/replay?ws=..")
+        self.assertEqual(status, 400)
+        status, _, body = get(self.port, "/api/replay?ws=WS404")
+        self.assertEqual(status, 404)
+        self.assertEqual(json.loads(body)["error"], "plan not found")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -139,6 +139,25 @@ deferred, `pct` rounds half up. Unknown task statuses are ignored. The page
 never computes % done itself; it reads `progress.pct`, `progress.done`, and
 `progress.total`.
 
+`GET /api/replay?ws=<ID>` -> one timeline for a sped-up playback of the
+workstream's history:
+`{"ws": "WS1", "span": {"start": 0, "end": 0}, "tasks": {"<id>": {"status": "done", "first_active": 0, "done_at": 0, "inferred": false, "runs": [{"start": 0, "end": 0, "family": "muse", "label": "..."}]}}, "events": [{"t": 0, "kind": "active|done", "task": "<id>"}], "observed": 0, "inferred": 0}`.
+`events` is sorted by time (active before done on ties); `active` events
+carry the run's label and model family, `done` events carry `inferred`.
+Run entries carry labels only, never prompts. A missing `ws` is a 400, a
+bad id is a 400, and a workstream with no plan is a 404.
+The run-to-task mapping is the one shared rule (`dash/taskmatch.py`): the
+resolved task map (exact, then `/regex/` case-insensitive), the WS1/WS2/WS7
+built-ins, then plan task-id substring. The page uses the same rule, and a
+test pins them on sample labels. The timeline is built from one store pass
+plus the plan: per task `first_active` is the first mapped run start and
+`done_at` for a done task is the end of its last mapped run. A done task
+with no mapped run is inferred: the latest done moment of its deps, else
+the plan's earliest observed moment, marked `"inferred": true`. Recorded
+history (`history.jsonl` in the bundle) wins over both when present.
+`observed` counts tasks with an observed done moment, `inferred` counts
+tasks with an inferred one.
+
 `GET /api/health` -> `{"ok": true, "sources": [{name, last_poll, last_error, lag_s}], "pricing": {...}}`
 
 `GET /static/<file>` serves a file from `static/` or one subdirectory (`vendor/`). `/static/taskmap.json` is the resolved task map (`taskmap.local.json`, else `taskmap.example.json`). Context-window rows use tool `grok-context` and are left out of cost.

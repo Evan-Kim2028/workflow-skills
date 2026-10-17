@@ -182,6 +182,20 @@ a table on any mismatch and skips with a clear message when Chrome is missing.
 `node tools/agent-dash/scripts/page_check.mjs --url URL [--ws WS2] [--hours 12]`
 runs the same harness directly, limited to one tab or range when given.
 
+`render_replay.mjs` records a workstream's history replay to video. It opens
+the execution tab with the replay running (`?view=exec&ws=<ID>&replay=1&autoplay=1`),
+captures frames with `Page.startScreencast`, and writes an H.264 MP4 plus a
+palette GIF about 1000 px wide, with three still PNGs (start, middle, end).
+Light theme by default, dark with `--dark`. It needs Chrome and ffmpeg.
+
+```bash
+node tools/agent-dash/scripts/render_replay.mjs --url http://127.0.0.1:8765 --ws WS1 --out <dir> [--dark] [--seconds 15|30] [--fps 15] [--width 1000]
+```
+
+The GIF target is under about 15 MB; the script retries smaller when the
+first pass overshoots. The page's `Replay` button plays the same timeline
+live; `?fixtures&ws=WS1` replays offline from `fixtures/replay-WS1.json`.
+
 ## Add a data source
 
 A collector is a module in `tools/agent-dash/dash/sources/`. The registry imports every module in that package that is not named with a leading underscore. A module is a source when it defines `NAME`, `INTERVAL_S`, and `poll(store, cfg, now)`. An import error is recorded on `/api/health` and that module is skipped. An exception inside `poll` is caught, stored as `last_error`, and the other sources keep polling.

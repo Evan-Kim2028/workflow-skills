@@ -1,0 +1,832 @@
+{
+  "ws": "WS1",
+  "span": {
+    "start": 1761978360,
+    "end": 1761999840
+  },
+  "tasks": {
+    "0": {
+      "status": "done",
+      "first_active": null,
+      "done_at": 1761978360,
+      "inferred": true,
+      "runs": []
+    },
+    "1": {
+      "status": "todo",
+      "first_active": null,
+      "done_at": null,
+      "inferred": false,
+      "runs": []
+    },
+    "2": {
+      "status": "pr",
+      "first_active": null,
+      "done_at": null,
+      "inferred": false,
+      "runs": []
+    },
+    "3": {
+      "status": "wip",
+      "first_active": null,
+      "done_at": null,
+      "inferred": false,
+      "runs": []
+    },
+    "4": {
+      "status": "done",
+      "first_active": 1761978360,
+      "done_at": 1761998760,
+      "inferred": false,
+      "runs": [
+        {
+          "start": 1761978360,
+          "end": 1761978440,
+          "family": "opus",
+          "label": "ws1-4"
+        },
+        {
+          "start": 1761978460,
+          "end": 1761978540,
+          "family": "muse",
+          "label": "ws1-4"
+        },
+        {
+          "start": 1761978660,
+          "end": 1761978740,
+          "family": "haiku",
+          "label": "ws1-4"
+        },
+        {
+          "start": 1761978760,
+          "end": 1761978840,
+          "family": "opus",
+          "label": "ws1-4"
+        },
+        {
+          "start": 1761978760,
+          "end": 1761978840,
+          "family": "haiku",
+          "label": "ws1-4"
+        },
+        {
+          "start": 1761978960,
+          "end": 1761979040,
+          "family": "glm",
+          "label": "ws1-4"
+        },
+        {
+          "start": 1761979060,
+          "end": 1761979140,
+          "family": "sonnet",
+          "label": "ws1-4"
+        },
+        {
+          "start": 1761979160,
+          "end": 1761979240,
+          "family": "opus",
+          "label": "ws1-4"
+        },
+        {
+          "start": 1761979260,
+          "end": 1761979340,
+          "family": "sonnet",
+          "label": "ws1-4"
+        },
+        {
+          "start": 1761979360,
+          "end": 1761979440,
+          "family": "grok",
+          "label": "ws1-4"
+        },
+        {
+          "start": 1761979560,
+          "end": 1761979640,
+          "family": "opus",
+          "label": "ws1-4"
+        },
+        {
+          "start": 1761979660,
+          "end": 1761979740,
+          "family": "muse",
+          "label": "ws1-4"
+        },
+        {
+          "start": 1761979860,
+          "end": 1761979940,
+          "family": "haiku",
+          "label": "ws1-4"
+        },
+        {
+          "start": 1761979960,
+          "end": 1761980040,
+          "family": "opus",
+          "label": "ws1-4"
+        },
+        {
+          "start": 1761979960,
+          "end": 1761980040,
+          "family": "haiku",
+          "label": "ws1-4"
+        },
+        {
+          "start": 1761980160,
+          "end": 1761980240,
+          "family": "glm",
+          "label": "ws1-4"
+        },
+        {
+          "start": 1761980260,
+          "end": 1761980340,
+          "family": "sonnet",
+          "label": "ws1-4"
+        },
+        {
+          "start": 1761980360,
+          "end": 1761980440,
+          "family": "opus",
+          "label": "ws1-4"
+        },
+        {
+          "start": 1761980460,
+          "end": 1761980540,
+          "family": "sonnet",
+          "label": "ws1-4"
+        },
+        {
+          "start": 1761980560,
+          "end": 1761980640,
+          "family": "grok",
+          "label": "ws1-4"
+        },
+        {
+          "start": 1761980760,
+          "end": 1761980840,
+          "family": "opus",
+          "label": "ws1-4"
+        },
+        {
+          "start": 1761980860,
+          "end": 1761980940,
+          "family": "muse",
+          "label": "ws1-4"
+        },
+        {
+          "start": 1761981060,
+          "end": 1761981140,
+          "family": "haiku",
+          "label": "ws1-4"
+        },
+        {
+          "start": 1761981160,
+          "end": 1761981240,
+          "family": "opus",
+          "label": "ws1-4"
+        },
+        {
+          "start": 1761981160,
+          "end": 1761981240,
+          "family": "haiku",
+          "label": "ws1-4"
+        },
+        {
+          "start": 1761981360,
+          "end": 1761981440,
+          "family": "glm",
+          "label": "ws1-4"
+        },
+        {
+          "start": 1761981460,
+          "end": 1761981540,
+          "family": "sonnet",
+          "label": "ws1-4"
+        },
+        {
+          "start": 1761981560,
+          "end": 1761981640,
+          "family": "opus",
+          "label": "ws1-4"
+        },
+        {
+          "start": 1761981660,
+          "end": 1761981740,
+          "family": "sonnet",
+          "label": "ws1-4"
+        },
+        {
+          "start": 1761981760,
+          "end": 1761981840,
+          "family": "grok",
+          "label": "ws1-4"
+        },
+        {
+          "start": 1761981960,
+          "end": 1761982040,
+          "family": "opus",
+          "label": "ws1-4"
+        },
+        {
+          "start": 1761982060,
+          "end": 1761982140,
+          "family": "muse",
+          "label": "ws1-4"
+        },
+        {
+          "start": 1761982260,
+          "end": 1761982340,
+          "family": "haiku",
+          "label": "ws1-4"
+        },
+        {
+          "start": 1761982360,
+          "end": 1761982440,
+          "family": "opus",
+          "label": "ws1-4"
+        },
+        {
+          "start": 1761982360,
+          "end": 1761982440,
+          "family": "haiku",
+          "label": "ws1-4"
+        },
+        {
+          "start": 1761982560,
+          "end": 1761982640,
+          "family": "glm",
+          "label": "ws1-4"
+        },
+        {
+          "start": 1761982660,
+          "end": 1761982740,
+          "family": "sonnet",
+          "label": "ws1-4"
+        },
+        {
+          "start": 1761982760,
+          "end": 1761982840,
+          "family": "opus",
+          "label": "ws1-4"
+        },
+        {
+          "start": 1761982860,
+          "end": 1761982940,
+          "family": "sonnet",
+          "label": "ws1-4"
+        },
+        {
+          "start": 1761982960,
+          "end": 1761983040,
+          "family": "grok",
+          "label": "ws1-4"
+        },
+        {
+          "start": 1761983160,
+          "end": 1761983240,
+          "family": "opus",
+          "label": "ws1-4"
+        },
+        {
+          "start": 1761983260,
+          "end": 1761983340,
+          "family": "muse",
+          "label": "ws1-4"
+        },
+        {
+          "start": 1761983460,
+          "end": 1761983540,
+          "family": "haiku",
+          "label": "ws1-4"
+        },
+        {
+          "start": 1761983560,
+          "end": 1761983640,
+          "family": "opus",
+          "label": "ws1-4"
+        },
+        {
+          "start": 1761983560,
+          "end": 1761983640,
+          "family": "haiku",
+          "label": "ws1-4"
+        },
+        {
+          "start": 1761996460,
+          "end": 1761996560,
+          "family": "glm",
+          "label": "ws1-4"
+        },
+        {
+          "start": 1761998160,
+          "end": 1761998760,
+          "family": "grok",
+          "label": "ws1-4"
+        },
+        {
+          "start": 1761998160,
+          "end": 1761998760,
+          "family": "grok",
+          "label": "ws1-4"
+        },
+        {
+          "start": 1761998160,
+          "end": 1761998760,
+          "family": "muse",
+          "label": "ws1-4"
+        },
+        {
+          "start": 1761998160,
+          "end": 1761998760,
+          "family": "glm",
+          "label": "ws1-4"
+        },
+        {
+          "start": 1761998160,
+          "end": 1761998760,
+          "family": "glm",
+          "label": "ws1-4"
+        },
+        {
+          "start": 1761998160,
+          "end": 1761998760,
+          "family": "haiku",
+          "label": "ws1-4"
+        },
+        {
+          "start": 1761998160,
+          "end": 1761998760,
+          "family": "haiku",
+          "label": "ws1-4"
+        },
+        {
+          "start": 1761999840,
+          "end": null,
+          "family": "opus",
+          "label": "ws1-4"
+        },
+        {
+          "start": 1761999840,
+          "end": null,
+          "family": "haiku",
+          "label": "ws1-4"
+        }
+      ]
+    }
+  },
+  "events": [
+    {
+      "t": 1761978360,
+      "kind": "active",
+      "task": "4",
+      "label": "ws1-4",
+      "family": "opus",
+      "end": 1761978440
+    },
+    {
+      "t": 1761978360,
+      "kind": "done",
+      "task": "0",
+      "inferred": true
+    },
+    {
+      "t": 1761978460,
+      "kind": "active",
+      "task": "4",
+      "label": "ws1-4",
+      "family": "muse",
+      "end": 1761978540
+    },
+    {
+      "t": 1761978660,
+      "kind": "active",
+      "task": "4",
+      "label": "ws1-4",
+      "family": "haiku",
+      "end": 1761978740
+    },
+    {
+      "t": 1761978760,
+      "kind": "active",
+      "task": "4",
+      "label": "ws1-4",
+      "family": "opus",
+      "end": 1761978840
+    },
+    {
+      "t": 1761978760,
+      "kind": "active",
+      "task": "4",
+      "label": "ws1-4",
+      "family": "haiku",
+      "end": 1761978840
+    },
+    {
+      "t": 1761978960,
+      "kind": "active",
+      "task": "4",
+      "label": "ws1-4",
+      "family": "glm",
+      "end": 1761979040
+    },
+    {
+      "t": 1761979060,
+      "kind": "active",
+      "task": "4",
+      "label": "ws1-4",
+      "family": "sonnet",
+      "end": 1761979140
+    },
+    {
+      "t": 1761979160,
+      "kind": "active",
+      "task": "4",
+      "label": "ws1-4",
+      "family": "opus",
+      "end": 1761979240
+    },
+    {
+      "t": 1761979260,
+      "kind": "active",
+      "task": "4",
+      "label": "ws1-4",
+      "family": "sonnet",
+      "end": 1761979340
+    },
+    {
+      "t": 1761979360,
+      "kind": "active",
+      "task": "4",
+      "label": "ws1-4",
+      "family": "grok",
+      "end": 1761979440
+    },
+    {
+      "t": 1761979560,
+      "kind": "active",
+      "task": "4",
+      "label": "ws1-4",
+      "family": "opus",
+      "end": 1761979640
+    },
+    {
+      "t": 1761979660,
+      "kind": "active",
+      "task": "4",
+      "label": "ws1-4",
+      "family": "muse",
+      "end": 1761979740
+    },
+    {
+      "t": 1761979860,
+      "kind": "active",
+      "task": "4",
+      "label": "ws1-4",
+      "family": "haiku",
+      "end": 1761979940
+    },
+    {
+      "t": 1761979960,
+      "kind": "active",
+      "task": "4",
+      "label": "ws1-4",
+      "family": "opus",
+      "end": 1761980040
+    },
+    {
+      "t": 1761979960,
+      "kind": "active",
+      "task": "4",
+      "label": "ws1-4",
+      "family": "haiku",
+      "end": 1761980040
+    },
+    {
+      "t": 1761980160,
+      "kind": "active",
+      "task": "4",
+      "label": "ws1-4",
+      "family": "glm",
+      "end": 1761980240
+    },
+    {
+      "t": 1761980260,
+      "kind": "active",
+      "task": "4",
+      "label": "ws1-4",
+      "family": "sonnet",
+      "end": 1761980340
+    },
+    {
+      "t": 1761980360,
+      "kind": "active",
+      "task": "4",
+      "label": "ws1-4",
+      "family": "opus",
+      "end": 1761980440
+    },
+    {
+      "t": 1761980460,
+      "kind": "active",
+      "task": "4",
+      "label": "ws1-4",
+      "family": "sonnet",
+      "end": 1761980540
+    },
+    {
+      "t": 1761980560,
+      "kind": "active",
+      "task": "4",
+      "label": "ws1-4",
+      "family": "grok",
+      "end": 1761980640
+    },
+    {
+      "t": 1761980760,
+      "kind": "active",
+      "task": "4",
+      "label": "ws1-4",
+      "family": "opus",
+      "end": 1761980840
+    },
+    {
+      "t": 1761980860,
+      "kind": "active",
+      "task": "4",
+      "label": "ws1-4",
+      "family": "muse",
+      "end": 1761980940
+    },
+    {
+      "t": 1761981060,
+      "kind": "active",
+      "task": "4",
+      "label": "ws1-4",
+      "family": "haiku",
+      "end": 1761981140
+    },
+    {
+      "t": 1761981160,
+      "kind": "active",
+      "task": "4",
+      "label": "ws1-4",
+      "family": "opus",
+      "end": 1761981240
+    },
+    {
+      "t": 1761981160,
+      "kind": "active",
+      "task": "4",
+      "label": "ws1-4",
+      "family": "haiku",
+      "end": 1761981240
+    },
+    {
+      "t": 1761981360,
+      "kind": "active",
+      "task": "4",
+      "label": "ws1-4",
+      "family": "glm",
+      "end": 1761981440
+    },
+    {
+      "t": 1761981460,
+      "kind": "active",
+      "task": "4",
+      "label": "ws1-4",
+      "family": "sonnet",
+      "end": 1761981540
+    },
+    {
+      "t": 1761981560,
+      "kind": "active",
+      "task": "4",
+      "label": "ws1-4",
+      "family": "opus",
+      "end": 1761981640
+    },
+    {
+      "t": 1761981660,
+      "kind": "active",
+      "task": "4",
+      "label": "ws1-4",
+      "family": "sonnet",
+      "end": 1761981740
+    },
+    {
+      "t": 1761981760,
+      "kind": "active",
+      "task": "4",
+      "label": "ws1-4",
+      "family": "grok",
+      "end": 1761981840
+    },
+    {
+      "t": 1761981960,
+      "kind": "active",
+      "task": "4",
+      "label": "ws1-4",
+      "family": "opus",
+      "end": 1761982040
+    },
+    {
+      "t": 1761982060,
+      "kind": "active",
+      "task": "4",
+      "label": "ws1-4",
+      "family": "muse",
+      "end": 1761982140
+    },
+    {
+      "t": 1761982260,
+      "kind": "active",
+      "task": "4",
+      "label": "ws1-4",
+      "family": "haiku",
+      "end": 1761982340
+    },
+    {
+      "t": 1761982360,
+      "kind": "active",
+      "task": "4",
+      "label": "ws1-4",
+      "family": "opus",
+      "end": 1761982440
+    },
+    {
+      "t": 1761982360,
+      "kind": "active",
+      "task": "4",
+      "label": "ws1-4",
+      "family": "haiku",
+      "end": 1761982440
+    },
+    {
+      "t": 1761982560,
+      "kind": "active",
+      "task": "4",
+      "label": "ws1-4",
+      "family": "glm",
+      "end": 1761982640
+    },
+    {
+      "t": 1761982660,
+      "kind": "active",
+      "task": "4",
+      "label": "ws1-4",
+      "family": "sonnet",
+      "end": 1761982740
+    },
+    {
+      "t": 1761982760,
+      "kind": "active",
+      "task": "4",
+      "label": "ws1-4",
+      "family": "opus",
+      "end": 1761982840
+    },
+    {
+      "t": 1761982860,
+      "kind": "active",
+      "task": "4",
+      "label": "ws1-4",
+      "family": "sonnet",
+      "end": 1761982940
+    },
+    {
+      "t": 1761982960,
+      "kind": "active",
+      "task": "4",
+      "label": "ws1-4",
+      "family": "grok",
+      "end": 1761983040
+    },
+    {
+      "t": 1761983160,
+      "kind": "active",
+      "task": "4",
+      "label": "ws1-4",
+      "family": "opus",
+      "end": 1761983240
+    },
+    {
+      "t": 1761983260,
+      "kind": "active",
+      "task": "4",
+      "label": "ws1-4",
+      "family": "muse",
+      "end": 1761983340
+    },
+    {
+      "t": 1761983460,
+      "kind": "active",
+      "task": "4",
+      "label": "ws1-4",
+      "family": "haiku",
+      "end": 1761983540
+    },
+    {
+      "t": 1761983560,
+      "kind": "active",
+      "task": "4",
+      "label": "ws1-4",
+      "family": "opus",
+      "end": 1761983640
+    },
+    {
+      "t": 1761983560,
+      "kind": "active",
+      "task": "4",
+      "label": "ws1-4",
+      "family": "haiku",
+      "end": 1761983640
+    },
+    {
+      "t": 1761996460,
+      "kind": "active",
+      "task": "4",
+      "label": "ws1-4",
+      "family": "glm",
+      "end": 1761996560
+    },
+    {
+      "t": 1761998160,
+      "kind": "active",
+      "task": "4",
+      "label": "ws1-4",
+      "family": "grok",
+      "end": 1761998760
+    },
+    {
+      "t": 1761998160,
+      "kind": "active",
+      "task": "4",
+      "label": "ws1-4",
+      "family": "grok",
+      "end": 1761998760
+    },
+    {
+      "t": 1761998160,
+      "kind": "active",
+      "task": "4",
+      "label": "ws1-4",
+      "family": "muse",
+      "end": 1761998760
+    },
+    {
+      "t": 1761998160,
+      "kind": "active",
+      "task": "4",
+      "label": "ws1-4",
+      "family": "glm",
+      "end": 1761998760
+    },
+    {
+      "t": 1761998160,
+      "kind": "active",
+      "task": "4",
+      "label": "ws1-4",
+      "family": "glm",
+      "end": 1761998760
+    },
+    {
+      "t": 1761998160,
+      "kind": "active",
+      "task": "4",
+      "label": "ws1-4",
+      "family": "haiku",
+      "end": 1761998760
+    },
+    {
+      "t": 1761998160,
+      "kind": "active",
+      "task": "4",
+      "label": "ws1-4",
+      "family": "haiku",
+      "end": 1761998760
+    },
+    {
+      "t": 1761998760,
+      "kind": "done",
+      "task": "4",
+      "inferred": false
+    },
+    {
+      "t": 1761999840,
+      "kind": "active",
+      "task": "4",
+      "label": "ws1-4",
+      "family": "opus",
+      "end": null
+    },
+    {
+      "t": 1761999840,
+      "kind": "active",
+      "task": "4",
+      "label": "ws1-4",
+      "family": "haiku",
+      "end": null
+    }
+  ],
+  "observed": 1,
+  "inferred": 1,
+  "_note": "Seeded synthetic data for the offline preview. Seed 1. No local sessions are read."
+}

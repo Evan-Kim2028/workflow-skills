@@ -1,0 +1,645 @@
+{
+  "ws": "WS7",
+  "span": {
+    "start": 1761978460,
+    "end": 1761999840
+  },
+  "tasks": {
+    "WS7.FRAME": {
+      "status": "done",
+      "first_active": null,
+      "done_at": 1761978460,
+      "inferred": true,
+      "runs": []
+    },
+    "WS7.LANDING": {
+      "status": "prog",
+      "first_active": 1761995960,
+      "done_at": null,
+      "inferred": false,
+      "runs": [
+        {
+          "start": 1761995960,
+          "end": null,
+          "family": "muse",
+          "label": "ws7-landing"
+        },
+        {
+          "start": 1761998160,
+          "end": 1761998760,
+          "family": "muse",
+          "label": "ws7-landing"
+        }
+      ]
+    },
+    "WS7.NOTES": {
+      "status": "todo",
+      "first_active": 1761978460,
+      "done_at": null,
+      "inferred": false,
+      "runs": [
+        {
+          "start": 1761978460,
+          "end": 1761978540,
+          "family": "sonnet",
+          "label": "ws7-notes"
+        },
+        {
+          "start": 1761978560,
+          "end": 1761978640,
+          "family": "grok",
+          "label": "ws7-notes"
+        },
+        {
+          "start": 1761978860,
+          "end": 1761978940,
+          "family": "muse",
+          "label": "ws7-notes"
+        },
+        {
+          "start": 1761978960,
+          "end": 1761979960,
+          "family": "opus",
+          "label": "ws7-notes"
+        },
+        {
+          "start": 1761979060,
+          "end": 1761979140,
+          "family": "haiku",
+          "label": "ws7-notes"
+        },
+        {
+          "start": 1761979160,
+          "end": 1761979240,
+          "family": "haiku",
+          "label": "ws7-notes"
+        },
+        {
+          "start": 1761979360,
+          "end": 1761979440,
+          "family": "glm",
+          "label": "ws7-notes"
+        },
+        {
+          "start": 1761979460,
+          "end": 1761979540,
+          "family": "sonnet",
+          "label": "ws7-notes"
+        },
+        {
+          "start": 1761979660,
+          "end": 1761979740,
+          "family": "sonnet",
+          "label": "ws7-notes"
+        },
+        {
+          "start": 1761979760,
+          "end": 1761979840,
+          "family": "grok",
+          "label": "ws7-notes"
+        },
+        {
+          "start": 1761980060,
+          "end": 1761980140,
+          "family": "muse",
+          "label": "ws7-notes"
+        },
+        {
+          "start": 1761980260,
+          "end": 1761980340,
+          "family": "haiku",
+          "label": "ws7-notes"
+        },
+        {
+          "start": 1761980360,
+          "end": 1761980440,
+          "family": "haiku",
+          "label": "ws7-notes"
+        },
+        {
+          "start": 1761980560,
+          "end": 1761980640,
+          "family": "glm",
+          "label": "ws7-notes"
+        },
+        {
+          "start": 1761980660,
+          "end": 1761980740,
+          "family": "sonnet",
+          "label": "ws7-notes"
+        },
+        {
+          "start": 1761980860,
+          "end": 1761980940,
+          "family": "sonnet",
+          "label": "ws7-notes"
+        },
+        {
+          "start": 1761980960,
+          "end": 1761981040,
+          "family": "grok",
+          "label": "ws7-notes"
+        },
+        {
+          "start": 1761981260,
+          "end": 1761981340,
+          "family": "muse",
+          "label": "ws7-notes"
+        },
+        {
+          "start": 1761981460,
+          "end": 1761981540,
+          "family": "haiku",
+          "label": "ws7-notes"
+        },
+        {
+          "start": 1761981560,
+          "end": 1761981640,
+          "family": "haiku",
+          "label": "ws7-notes"
+        },
+        {
+          "start": 1761981760,
+          "end": 1761981840,
+          "family": "glm",
+          "label": "ws7-notes"
+        },
+        {
+          "start": 1761981860,
+          "end": 1761981940,
+          "family": "sonnet",
+          "label": "ws7-notes"
+        },
+        {
+          "start": 1761982060,
+          "end": 1761982140,
+          "family": "sonnet",
+          "label": "ws7-notes"
+        },
+        {
+          "start": 1761982160,
+          "end": 1761982240,
+          "family": "grok",
+          "label": "ws7-notes"
+        },
+        {
+          "start": 1761982460,
+          "end": 1761982540,
+          "family": "muse",
+          "label": "ws7-notes"
+        },
+        {
+          "start": 1761982660,
+          "end": 1761982740,
+          "family": "haiku",
+          "label": "ws7-notes"
+        },
+        {
+          "start": 1761982760,
+          "end": 1761982840,
+          "family": "haiku",
+          "label": "ws7-notes"
+        },
+        {
+          "start": 1761982960,
+          "end": 1761983040,
+          "family": "glm",
+          "label": "ws7-notes"
+        },
+        {
+          "start": 1761983060,
+          "end": 1761983140,
+          "family": "sonnet",
+          "label": "ws7-notes"
+        },
+        {
+          "start": 1761983260,
+          "end": 1761983340,
+          "family": "sonnet",
+          "label": "ws7-notes"
+        },
+        {
+          "start": 1761983360,
+          "end": 1761983440,
+          "family": "grok",
+          "label": "ws7-notes"
+        },
+        {
+          "start": 1761996460,
+          "end": 1761996560,
+          "family": "muse",
+          "label": "ws7-notes"
+        },
+        {
+          "start": 1761996460,
+          "end": 1761996560,
+          "family": "grok",
+          "label": "ws7-notes"
+        },
+        {
+          "start": 1761998160,
+          "end": 1761998760,
+          "family": "grok",
+          "label": "ws7-notes"
+        },
+        {
+          "start": 1761998160,
+          "end": 1761998760,
+          "family": "grok",
+          "label": "ws7-notes"
+        },
+        {
+          "start": 1761998160,
+          "end": 1761998760,
+          "family": "muse",
+          "label": "ws7-notes"
+        },
+        {
+          "start": 1761998160,
+          "end": 1761998760,
+          "family": "glm",
+          "label": "ws7-notes"
+        },
+        {
+          "start": 1761998160,
+          "end": 1761998760,
+          "family": "haiku",
+          "label": "ws7-notes"
+        },
+        {
+          "start": 1761999840,
+          "end": null,
+          "family": "glm",
+          "label": "ws7-notes"
+        },
+        {
+          "start": 1761999840,
+          "end": null,
+          "family": "grok",
+          "label": "ws7-notes"
+        }
+      ]
+    },
+    "WS7.FEED": {
+      "status": "pr",
+      "first_active": null,
+      "done_at": null,
+      "inferred": false,
+      "runs": []
+    },
+    "WS7.CHECK": {
+      "status": "todo",
+      "first_active": null,
+      "done_at": null,
+      "inferred": false,
+      "runs": []
+    }
+  },
+  "events": [
+    {
+      "t": 1761978460,
+      "kind": "active",
+      "task": "WS7.NOTES",
+      "label": "ws7-notes",
+      "family": "sonnet",
+      "end": 1761978540
+    },
+    {
+      "t": 1761978460,
+      "kind": "done",
+      "task": "WS7.FRAME",
+      "inferred": true
+    },
+    {
+      "t": 1761978560,
+      "kind": "active",
+      "task": "WS7.NOTES",
+      "label": "ws7-notes",
+      "family": "grok",
+      "end": 1761978640
+    },
+    {
+      "t": 1761978860,
+      "kind": "active",
+      "task": "WS7.NOTES",
+      "label": "ws7-notes",
+      "family": "muse",
+      "end": 1761978940
+    },
+    {
+      "t": 1761978960,
+      "kind": "active",
+      "task": "WS7.NOTES",
+      "label": "ws7-notes",
+      "family": "opus",
+      "end": 1761979960
+    },
+    {
+      "t": 1761979060,
+      "kind": "active",
+      "task": "WS7.NOTES",
+      "label": "ws7-notes",
+      "family": "haiku",
+      "end": 1761979140
+    },
+    {
+      "t": 1761979160,
+      "kind": "active",
+      "task": "WS7.NOTES",
+      "label": "ws7-notes",
+      "family": "haiku",
+      "end": 1761979240
+    },
+    {
+      "t": 1761979360,
+      "kind": "active",
+      "task": "WS7.NOTES",
+      "label": "ws7-notes",
+      "family": "glm",
+      "end": 1761979440
+    },
+    {
+      "t": 1761979460,
+      "kind": "active",
+      "task": "WS7.NOTES",
+      "label": "ws7-notes",
+      "family": "sonnet",
+      "end": 1761979540
+    },
+    {
+      "t": 1761979660,
+      "kind": "active",
+      "task": "WS7.NOTES",
+      "label": "ws7-notes",
+      "family": "sonnet",
+      "end": 1761979740
+    },
+    {
+      "t": 1761979760,
+      "kind": "active",
+      "task": "WS7.NOTES",
+      "label": "ws7-notes",
+      "family": "grok",
+      "end": 1761979840
+    },
+    {
+      "t": 1761980060,
+      "kind": "active",
+      "task": "WS7.NOTES",
+      "label": "ws7-notes",
+      "family": "muse",
+      "end": 1761980140
+    },
+    {
+      "t": 1761980260,
+      "kind": "active",
+      "task": "WS7.NOTES",
+      "label": "ws7-notes",
+      "family": "haiku",
+      "end": 1761980340
+    },
+    {
+      "t": 1761980360,
+      "kind": "active",
+      "task": "WS7.NOTES",
+      "label": "ws7-notes",
+      "family": "haiku",
+      "end": 1761980440
+    },
+    {
+      "t": 1761980560,
+      "kind": "active",
+      "task": "WS7.NOTES",
+      "label": "ws7-notes",
+      "family": "glm",
+      "end": 1761980640
+    },
+    {
+      "t": 1761980660,
+      "kind": "active",
+      "task": "WS7.NOTES",
+      "label": "ws7-notes",
+      "family": "sonnet",
+      "end": 1761980740
+    },
+    {
+      "t": 1761980860,
+      "kind": "active",
+      "task": "WS7.NOTES",
+      "label": "ws7-notes",
+      "family": "sonnet",
+      "end": 1761980940
+    },
+    {
+      "t": 1761980960,
+      "kind": "active",
+      "task": "WS7.NOTES",
+      "label": "ws7-notes",
+      "family": "grok",
+      "end": 1761981040
+    },
+    {
+      "t": 1761981260,
+      "kind": "active",
+      "task": "WS7.NOTES",
+      "label": "ws7-notes",
+      "family": "muse",
+      "end": 1761981340
+    },
+    {
+      "t": 1761981460,
+      "kind": "active",
+      "task": "WS7.NOTES",
+      "label": "ws7-notes",
+      "family": "haiku",
+      "end": 1761981540
+    },
+    {
+      "t": 1761981560,
+      "kind": "active",
+      "task": "WS7.NOTES",
+      "label": "ws7-notes",
+      "family": "haiku",
+      "end": 1761981640
+    },
+    {
+      "t": 1761981760,
+      "kind": "active",
+      "task": "WS7.NOTES",
+      "label": "ws7-notes",
+      "family": "glm",
+      "end": 1761981840
+    },
+    {
+      "t": 1761981860,
+      "kind": "active",
+      "task": "WS7.NOTES",
+      "label": "ws7-notes",
+      "family": "sonnet",
+      "end": 1761981940
+    },
+    {
+      "t": 1761982060,
+      "kind": "active",
+      "task": "WS7.NOTES",
+      "label": "ws7-notes",
+      "family": "sonnet",
+      "end": 1761982140
+    },
+    {
+      "t": 1761982160,
+      "kind": "active",
+      "task": "WS7.NOTES",
+      "label": "ws7-notes",
+      "family": "grok",
+      "end": 1761982240
+    },
+    {
+      "t": 1761982460,
+      "kind": "active",
+      "task": "WS7.NOTES",
+      "label": "ws7-notes",
+      "family": "muse",
+      "end": 1761982540
+    },
+    {
+      "t": 1761982660,
+      "kind": "active",
+      "task": "WS7.NOTES",
+      "label": "ws7-notes",
+      "family": "haiku",
+      "end": 1761982740
+    },
+    {
+      "t": 1761982760,
+      "kind": "active",
+      "task": "WS7.NOTES",
+      "label": "ws7-notes",
+      "family": "haiku",
+      "end": 1761982840
+    },
+    {
+      "t": 1761982960,
+      "kind": "active",
+      "task": "WS7.NOTES",
+      "label": "ws7-notes",
+      "family": "glm",
+      "end": 1761983040
+    },
+    {
+      "t": 1761983060,
+      "kind": "active",
+      "task": "WS7.NOTES",
+      "label": "ws7-notes",
+      "family": "sonnet",
+      "end": 1761983140
+    },
+    {
+      "t": 1761983260,
+      "kind": "active",
+      "task": "WS7.NOTES",
+      "label": "ws7-notes",
+      "family": "sonnet",
+      "end": 1761983340
+    },
+    {
+      "t": 1761983360,
+      "kind": "active",
+      "task": "WS7.NOTES",
+      "label": "ws7-notes",
+      "family": "grok",
+      "end": 1761983440
+    },
+    {
+      "t": 1761995960,
+      "kind": "active",
+      "task": "WS7.LANDING",
+      "label": "ws7-landing",
+      "family": "muse",
+      "end": null
+    },
+    {
+      "t": 1761996460,
+      "kind": "active",
+      "task": "WS7.NOTES",
+      "label": "ws7-notes",
+      "family": "muse",
+      "end": 1761996560
+    },
+    {
+      "t": 1761996460,
+      "kind": "active",
+      "task": "WS7.NOTES",
+      "label": "ws7-notes",
+      "family": "grok",
+      "end": 1761996560
+    },
+    {
+      "t": 1761998160,
+      "kind": "active",
+      "task": "WS7.LANDING",
+      "label": "ws7-landing",
+      "family": "muse",
+      "end": 1761998760
+    },
+    {
+      "t": 1761998160,
+      "kind": "active",
+      "task": "WS7.NOTES",
+      "label": "ws7-notes",
+      "family": "grok",
+      "end": 1761998760
+    },
+    {
+      "t": 1761998160,
+      "kind": "active",
+      "task": "WS7.NOTES",
+      "label": "ws7-notes",
+      "family": "grok",
+      "end": 1761998760
+    },
+    {
+      "t": 1761998160,
+      "kind": "active",
+      "task": "WS7.NOTES",
+      "label": "ws7-notes",
+      "family": "muse",
+      "end": 1761998760
+    },
+    {
+      "t": 1761998160,
+      "kind": "active",
+      "task": "WS7.NOTES",
+      "label": "ws7-notes",
+      "family": "glm",
+      "end": 1761998760
+    },
+    {
+      "t": 1761998160,
+      "kind": "active",
+      "task": "WS7.NOTES",
+      "label": "ws7-notes",
+      "family": "haiku",
+      "end": 1761998760
+    },
+    {
+      "t": 1761999840,
+      "kind": "active",
+      "task": "WS7.NOTES",
+      "label": "ws7-notes",
+      "family": "glm",
+      "end": null
+    },
+    {
+      "t": 1761999840,
+      "kind": "active",
+      "task": "WS7.NOTES",
+      "label": "ws7-notes",
+      "family": "grok",
+      "end": null
+    }
+  ],
+  "observed": 0,
+  "inferred": 1,
+  "_note": "Seeded synthetic data for the offline preview. Seed 1. No local sessions are read."
+}

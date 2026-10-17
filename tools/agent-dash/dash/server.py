@@ -62,6 +62,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._reconcile(query)
             elif path == "/api/plan":
                 self._plan(query)
+            elif path == "/api/replay":
+                self._replay(query)
             elif path == "/plan":
                 self._plan_page()
             elif path == "/api/bundles":
@@ -203,6 +205,21 @@ class Handler(BaseHTTPRequestHandler):
             return
         if isinstance(body, dict) and "start_prompt" not in body:
             body["start_prompt"] = start_prompt_text(ws)
+        self._json(200, body)
+
+    def _replay(self, query):
+        from dash.replay import ReplayNotFound, build_replay
+
+        ws = _one(query, "ws")
+        if not ws:
+            raise ValueError("ws required")
+        if ws in (".", "..") or not _WS.match(ws):
+            raise ValueError("bad ws")
+        try:
+            body = build_replay(self.server.store, ws)
+        except ReplayNotFound:
+            self._json(404, {"error": "plan not found", "ws": ws})
+            return
         self._json(200, body)
 
     def _plan_page(self):

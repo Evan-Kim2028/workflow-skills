@@ -36,7 +36,9 @@
     return ADM.info(run || {}).key;
   }
 
-  function taskOf(run, ws) {
+  /* Same rule as the execution map and dash/taskmatch.py: exact label,
+     /regex/ keys, WS1/WS2/WS7 built-ins, then plan task-id substring. */
+  function taskOf(run, ws, ids) {
     var label = run.label || "";
     var table = (taskmapGet() || {})[ws] || {};
     var match;
@@ -51,16 +53,32 @@
       if (match) return match[1].toLowerCase();
     }
     if (ws === "WS2") {
-      match = /ws2[-._]([0-9]+[a-z0-9]*)/i.exec(label);
-      if (match) return "WS2." + match[1];
+      match = /WS2\.([0-9]+[a-z0-9]*|[A-Z][0-9]*)/i.exec(label) || /ws2[-._]([0-9]+[a-z0-9]*)/i.exec(label);
+      if (match) return "WS2." + (/^[a-z]/i.test(match[1]) ? match[1].toUpperCase() : match[1]);
     }
     if (ws === "WS7") {
       match = /\b([PS]0-\d+)\b/i.exec(label);
       if (match) return match[1].toUpperCase();
-      match = /ws7[-._]([0-9a-z]+)/i.exec(label);
+      match = /WS7\.([0-9a-z]+)/i.exec(label) || /ws7[-._]([0-9a-z]+)/i.exec(label);
       if (match) return "WS7." + match[1].toUpperCase();
     }
+    var list = ids || [];
+    if (list.length) {
+      var lower = label.toLowerCase(), best = null;
+      list.forEach(function (id) {
+        var i = lower.indexOf(String(id).toLowerCase());
+        if (i < 0) return;
+        var before = i === 0 ? "" : lower.charAt(i - 1), after = lower.charAt(i + id.length);
+        if ((before === "" || /[^a-z0-9]/.test(before)) && (after === "" || /[^a-z0-9]/.test(after)) && (!best || id.length > best.length)) best = id;
+      });
+      if (best) return best;
+    }
     return null;
+  }
+  function dagTaskIds(dag) {
+    var out = [];
+    (dag.groups || []).forEach(function (g) { (g.tasks || []).forEach(function (t) { if (t.id != null && String(t.id).length > 0) out.push(String(t.id)); }); });
+    return out;
   }
 
   function captureMermaid(root) {
@@ -110,15 +128,16 @@
     var just = {};
     var unassigned = [];
     var now = Date.now() / 1000;
+    var ids = dagTaskIds(dag);
     ((snap && snap.running) || []).forEach(function (run) {
       if (run.workstream && run.workstream !== dag.ws) return;
-      var task = taskOf(run, dag.ws);
+      var task = taskOf(run, dag.ws, ids);
       if (task) (live[task] = live[task] || []).push(run);
       else if (run.workstream === dag.ws) unassigned.push(run);
     });
     ((snap && snap.recent) || []).forEach(function (run) {
       if (run.ended_at && now - run.ended_at < 900) {
-        var task = taskOf(run, dag.ws);
+        var task = taskOf(run, dag.ws, ids);
         if (task) just[task] = run;
       }
     });

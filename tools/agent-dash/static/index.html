@@ -307,6 +307,11 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
 .trlegend span{display:inline-flex;align-items:center;gap:6px}
 .alegend{display:flex;flex-wrap:wrap;gap:6px 14px;margin:10px 0 0;font-size:12px;color:var(--ink-2)}
 .alegend span{display:inline-flex;align-items:center;gap:6px}
+.rp-bar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:8px 0 4px;padding:8px 10px;border:1px solid var(--ring);border-radius:8px;background:var(--surface-2)}
+.rp-bar .rp-date{font:12px var(--mono);color:var(--ink-2);min-width:170px}
+.rp-bar input[type="range"]{flex:1;min-width:140px;accent-color:var(--s1)}
+.rp-tag{font:700 10.5px var(--mono);color:var(--s1);border:1px solid var(--s1);border-radius:4px;padding:1px 6px;margin-left:8px;vertical-align:middle}
+.chip.rp-unblock{box-shadow:0 0 0 2px var(--s1);position:relative;z-index:4}
 .alegend svg{overflow:visible}
 .arrows-toggle{display:inline-flex;align-items:center;gap:6px;font:600 12px var(--font);color:var(--ink-2);margin-left:8px}
 .gchip{font:11px var(--mono);padding:2px 6px;border-radius:5px;border:1.5px dashed var(--muted);color:var(--ink-2)}
@@ -416,6 +421,7 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
       var base = FIXMAP[path] || path.replace("/api/", "");
       if (path === "/api/usage" && params && params.group === "workstream") base = "usage-workstream-hour";
       if (path === "/api/plan") base = "plan-" + params.ws;
+      if (path === "/api/replay") base = "replay-" + params.ws;
       return fetch("../fixtures/" + base + ".json").then(function (r) { if (!r.ok) throw new Error(r.status); return r.json(); });
     }
     return fetch(path + (qs ? "?" + qs : "")).then(function (r) { if (!r.ok) throw new Error(r.status); return r.json(); });
@@ -505,6 +511,8 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
     m.appendChild(el("div", {class: "card", id: "exec-loading"}, [el("h2", {text: "Loading " + (state.ws === "all" ? "overview" : state.ws) + " · last " + state.hours + " h"}), el("div", {class: "skel"}), el("div", {class: "skel"}), el("div", {class: "skel"})]));
   }
   function showCurrent() {
+    if (window.__adReplayOn && window.__adReplayExit) window.__adReplayExit(true);
+    window.__adReplayOn = false;
     applyChrome();
     renderTabs();
     if (state.view === "exec") {
@@ -1400,6 +1408,225 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
       drawTaskLinks(links);
     }
     if (plan.phases && plan.phases.length) { var ph = el("div", {class: "phases"}); plan.phases.forEach(function (p) { ph.appendChild(el("div", {class: "phase", title: p.gate ? "Done when: " + p.gate : ""}, [el("b", {text: p.name}), p.goal, p.gate ? el("small", {class: "gate", text: "Done when \u24D8"}) : null])); }); c.appendChild(ph); }
+    /* Replay: play this workstream's history as a sped-up animation on the map.
+       Chips start gray, pulse in their tool color while a mapped run is
+       active, and turn done at their done moment; unblocking a dependent
+       flashes its arrows for about 600 ms. Live refresh stays frozen while
+       the replay owns the card; Esc or Live rebuilds the live map. */
+    var RP_FAM = {opus: "var(--s1)", haiku: "var(--s2)", sonnet: "var(--s3)", grok: "var(--s4)", muse: "var(--s5)", glm: "var(--s6)", other: "var(--other)"};
+    var RP_REDUCED = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    var RP = {on: false, playing: false, loading: false, tasks: {}, prevDone: {}, savedCss: {}, elapsed: 0, duration: 15, raf: null};
+    var replayBtn = el("button", {class: "planbtn", title: "Play this workstream's history as a sped-up animation", text: "Replay"});
+    replayBtn.addEventListener("click", function () { startReplay(true); });
+    c.firstChild.appendChild(replayBtn);
+    function rpTotal() { return (plan.progress && plan.progress.total) || 0; }
+    function rpDoneAt(T) {
+      var ids = Object.keys(RP.tasks), n = 0;
+      ids.forEach(function (id) { var t = RP.tasks[id]; if (t && t.status !== "deferred" && t.done_at != null && t.done_at <= T) n++; });
+      return n;
+    }
+    function rpCursor(frac) { return RP.span.start + frac * (RP.span.end - RP.span.start); }
+    function rpPaint(frac, fire) {
+      var T = rpCursor(frac), now = {};
+      Object.keys(RP.tasks).forEach(function (tid) {
+        var t = RP.tasks[tid];
+        if (t && t.status !== "deferred" && t.done_at != null && t.done_at <= T) now[tid] = 1;
+      });
+      if (fire) {
+        Object.keys(now).forEach(function (tid) {
+          if (!RP.prevDone[tid]) rpUnblock(tid, T);
+        });
+      }
+      RP.prevDone = now;
+      Object.keys(chipEl).forEach(function (tid) {
+        var cp = chipEl[tid], t = RP.tasks[tid];
+        if (!cp || !t || t.status === "deferred") return;
+        var done = !!now[tid], gate = tKind[tid] === "gate";
+        var active = null;
+        if (!done && !RP_REDUCED) {
+          for (var i = 0; i < t.runs.length; i++) {
+            var r = t.runs[i];
+            if (r.start == null || r.start > T) continue;
+            var e = r.end == null ? r.start + RP.spanLen * 0.01 : r.end;
+            if (T <= e) { active = r; break; }
+          }
+        }
+        if (done) {
+          cp.className = "chip done" + (gate ? " gate" : "");
+          cp.style.cssText = RP.savedCss[tid] || "";
+        } else if (active) {
+          var col = RP_FAM[active.family] || RP_FAM.other;
+          cp.className = "chip live";
+          cp.style.cssText = RP.savedCss[tid] || "";
+          cp.style.background = col;
+          cp.style.borderColor = col;
+          cp.style.color = "#fff";
+        } else {
+          cp.className = "chip" + (gate ? " gate" : "");
+          cp.style.cssText = RP.savedCss[tid] || "";
+        }
+      });
+      var total = rpTotal(), n = rpDoneAt(T), pct = total ? Math.round(100 * n / total) : 0;
+      [].forEach.call(obBar.children, function (sp) {
+        sp.style.transition = "none";
+        sp.style.width = (sp.dataset.k === "done" && total ? (100 * n / total) : 0) + "%";
+      });
+      obPct.textContent = pct + "%";
+      RP.txt.innerHTML = "";
+      RP.txt.appendChild(el("b", {text: n + " of " + total + " tasks done"}));
+      RP.txt.appendChild(document.createTextNode(" · " + (total - n) + " to go · "));
+      RP.txt.appendChild(el("span", {class: "rp-tag", text: "replay"}));
+      RP.date.textContent = fmtDate(T);
+      RP.scrub.value = String(Math.round(frac * 1000));
+    }
+    /* Flash the arrows from a just-finished task to the dependents whose
+       deps are all done now, plus a short outline on those chips. */
+    function rpUnblock(tid, T) {
+      var fresh = (tDown[tid] || []).filter(function (dep) {
+        return (tUp[dep] || []).every(function (d) {
+          var t = RP.tasks[d];
+          return t && t.done_at != null && t.done_at <= T;
+        });
+      });
+      if (!fresh.length) return;
+      fresh.forEach(function (dep) { if (chipEl[dep]) chipEl[dep].classList.add("rp-unblock"); });
+      var before = tsvg.childNodes.length;
+      try {
+        drawTaskLinks(fresh.map(function (dep) { return {a: tid, b: dep, cls: "t-down near"}; }));
+      } catch (e) { return; }
+      var added = Array.prototype.slice.call(tsvg.childNodes, before);
+      setTimeout(function () {
+        added.forEach(function (node) { if (node.parentNode === tsvg) tsvg.removeChild(node); });
+        fresh.forEach(function (dep) { if (chipEl[dep]) chipEl[dep].classList.remove("rp-unblock"); });
+      }, 600);
+    }
+    function rpTick(ts) {
+      if (!RP.on || !RP.playing) return;
+      var dt = ts - RP.last;
+      RP.last = ts;
+      RP.elapsed += dt / 1000;
+      if (RP.elapsed >= RP.duration) {
+        RP.elapsed = RP.duration;
+        rpPaint(1, true);
+        rpSetPlaying(false);
+        window.__adReplay.done = true;
+        return;
+      }
+      rpPaint(RP.elapsed / RP.duration, true);
+      RP.raf = requestAnimationFrame(rpTick);
+    }
+    function rpSetPlaying(playing) {
+      RP.playing = playing;
+      RP.playBtn.textContent = playing ? "Pause" : (RP.elapsed >= RP.duration ? "Play again" : "Play");
+      if (playing) {
+        if (RP.elapsed >= RP.duration) { RP.elapsed = 0; RP.prevDone = {}; }
+        RP.last = performance.now();
+        RP.raf = requestAnimationFrame(rpTick);
+      } else if (RP.raf) {
+        cancelAnimationFrame(RP.raf);
+        RP.raf = null;
+      }
+    }
+    function startReplay(autoplay) {
+      if (window.__adReplayOn || RP.loading) return;
+      RP.loading = true;
+      replayBtn.textContent = "Loading…";
+      api("/api/replay", {ws: plan.ws}).then(function (data) {
+        RP.loading = false;
+        replayBtn.textContent = "Replay";
+        enterReplay(data, autoplay);
+      }).catch(function () {
+        RP.loading = false;
+        replayBtn.textContent = "Replay";
+      });
+    }
+    function enterReplay(data, autoplay) {
+      if (!data || !data.tasks || !data.span) {
+        window.__adReplay = {ready: true, done: true, empty: true, ws: plan.ws};
+        return;
+      }
+      RP.on = true;
+      RP.data = data;
+      RP.tasks = data.tasks;
+      RP.span = data.span;
+      RP.spanLen = Math.max(1, data.span.end - data.span.start);
+      RP.duration = 15;
+      RP.elapsed = 0;
+      RP.prevDone = {};
+      RP.savedCss = {};
+      window.__adReplayOn = true;
+      window.__adReplay = {ready: true, done: false, ws: plan.ws};
+      Object.keys(chipEl).forEach(function (tid) {
+        var extra = chipEl[tid].querySelectorAll(".ag");
+        Array.prototype.forEach.call(extra, function (node) { node.parentNode.removeChild(node); });
+        RP.savedCss[tid] = chipEl[tid].style.cssText;
+        chipEl[tid].classList.remove("live", "just", "changed");
+      });
+      try { clearTask(true); } catch (e) {}
+      if (arrowMode === "all") { try { drawAllTaskEdges(); } catch (e) {} }
+      var bar = el("div", {class: "rp-bar", role: "group", "aria-label": "Replay controls"});
+      RP.playBtn = el("button", {text: "Pause", title: "Play or pause the replay"});
+      RP.playBtn.addEventListener("click", function () { rpSetPlaying(!RP.playing); });
+      var restart = el("button", {text: "Restart", title: "Restart the replay"});
+      restart.addEventListener("click", function () { RP.elapsed = 0; RP.prevDone = {}; rpPaint(0, false); rpSetPlaying(true); });
+      var seg = el("span", {class: "seg-ctl", title: "Replay length"});
+      var b15 = el("button", {text: "15 s", title: "Play the whole history in about 15 seconds"});
+      var b30 = el("button", {text: "30 s", title: "Play the whole history in about 30 seconds"});
+      function paintSpeed() {
+        b15.setAttribute("aria-pressed", String(RP.duration === 15));
+        b30.setAttribute("aria-pressed", String(RP.duration === 30));
+      }
+      b15.addEventListener("click", function () { var f = RP.elapsed / RP.duration; RP.duration = 15; RP.elapsed = f * 15; paintSpeed(); });
+      b30.addEventListener("click", function () { var f = RP.elapsed / RP.duration; RP.duration = 30; RP.elapsed = f * 30; paintSpeed(); });
+      paintSpeed();
+      seg.appendChild(b15); seg.appendChild(b30);
+      RP.scrub = document.createElement("input");
+      RP.scrub.type = "range"; RP.scrub.min = "0"; RP.scrub.max = "1000"; RP.scrub.value = "0";
+      RP.scrub.setAttribute("aria-label", "Replay position");
+      RP.scrub.addEventListener("input", function () {
+        RP.elapsed = (Number(RP.scrub.value) / 1000) * RP.duration;
+        rpPaint(Number(RP.scrub.value) / 1000, false);
+        var T = rpCursor(Number(RP.scrub.value) / 1000), cur = {};
+        Object.keys(RP.tasks).forEach(function (tid) {
+          var t = RP.tasks[tid];
+          if (t && t.status !== "deferred" && t.done_at != null && t.done_at <= T) cur[tid] = 1;
+        });
+        RP.prevDone = cur;
+        if (RP.elapsed < RP.duration) window.__adReplay.done = false;
+      });
+      RP.date = el("span", {class: "rp-date", text: ""});
+      var live = el("button", {text: "Live", title: "Return to the live map"});
+      live.addEventListener("click", function () { exitReplay(false); });
+      bar.appendChild(RP.playBtn); bar.appendChild(restart); bar.appendChild(seg);
+      bar.appendChild(RP.scrub); bar.appendChild(RP.date); bar.appendChild(live);
+      RP.bar = bar;
+      c.insertBefore(bar, c.children[1]);
+      RP.txt = ob.parentNode.querySelector(".pbig-txt");
+      rpPaint(0, false);
+      rpSetPlaying(autoplay !== false);
+      window.__adReplayExit = function (silent) { exitReplay(!!silent); };
+    }
+    function exitReplay(silent) {
+      if (!RP.on && !window.__adReplayOn) return;
+      RP.on = false;
+      RP.playing = false;
+      if (RP.raf) { cancelAnimationFrame(RP.raf); RP.raf = null; }
+      window.__adReplayOn = false;
+      window.__adReplayExit = null;
+      delete secCache.plan;
+      if (!silent) {
+        drawMain();
+        refreshAll();
+      }
+    }
+    window.__adReplayExit = null;
+    if (!window.__adReplayTried && Q.has("replay")) {
+      var wantWs = canonWs(Q.get("ws") || "");
+      if (!Q.get("ws") || wantWs === plan.ws) {
+        window.__adReplayTried = true;
+        setTimeout(function () { startReplay(Q.has("autoplay")); }, 600);
+      }
+    }
     return c;
   }
 
@@ -1415,7 +1642,7 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
     drawer.appendChild(kv);
     drawer.classList.add("open");
   }
-  document.addEventListener("keydown", function (e) { if (e.key === "Escape") drawer.classList.remove("open"); });
+  document.addEventListener("keydown", function (e) { if (e.key === "Escape") { drawer.classList.remove("open"); if (window.__adReplayOn && window.__adReplayExit) window.__adReplayExit(false); } });
 
   /* layout */
   function approvalList(j) {
@@ -1454,7 +1681,7 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
     });
     return c;
   }
-  setInterval(function () { if (state.view === "exec") drawMain(); }, 60000);
+  setInterval(function () { if (state.view === "exec" && !window.__adReplayOn) drawMain(); }, 60000);
   var resizeT = null;
   window.addEventListener("resize", function () { clearTimeout(resizeT); resizeT = setTimeout(function () { if (state.view === "exec") drawMain(); else if (window.__adPlanDraw) window.__adPlanDraw(); }, 150); });
   /* Keyed sections: a section is rebuilt only when its data key changes, and unchanged nodes are never moved, so animations and hover state survive live updates. */
@@ -1552,6 +1779,7 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
   /* Tiles and chart come from one snapshot response: totals and usage buckets
      are applied together or not at all, so they can never disagree. */
   function refreshAll() {
+    if (window.__adReplayOn) return Promise.resolve();
     var ws = state.ws;
     var key = reqKey();
     var gen = ++execGen;
@@ -1602,6 +1830,7 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
   /* Stream ticks refresh through the same one-response path: the snapshot
      carries the usage buckets, and totals plus buckets apply together. */
   function refreshSnapshot() {
+    if (window.__adReplayOn) return;
     var ws = state.ws, key = reqKey();
     api("/api/snapshot", {ws: ws, since: since(), usage_group: groupFor()}).then(function (j) {
       if (!ADC.applies(key, state)) return;

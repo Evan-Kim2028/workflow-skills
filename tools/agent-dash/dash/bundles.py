@@ -1062,11 +1062,13 @@ def set_task(ws: str, task_id: str, status: str, moved_to: str | None, note: str
         print("plan.json has no dag", flush=True)
         return 2
     found = False
+    old_status: str | None = None
     for group in dag["groups"]:
         if not isinstance(group, dict):
             continue
         for task in group.get("tasks") or []:
             if isinstance(task, dict) and task.get("id") == task_id:
+                old_status = task.get("status") if isinstance(task.get("status"), str) else None
                 task["status"] = status
                 if status == "deferred":
                     if moved_to is not None:
@@ -1081,8 +1083,45 @@ def set_task(ws: str, task_id: str, status: str, moved_to: str | None, note: str
         print(f"task not found: {task_id}", flush=True)
         return 2
     _atomic_write(plan_path, json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+    if old_status != status:
+        append_history(ws, task_id, old_status, status, root=root)
     print(f"{ws} {task_id} {status}")
     return 0
+
+
+def append_history(
+    ws: str,
+    task_id: str,
+    from_status: str | None,
+    to_status: str,
+    root: Path | None = None,
+    now: float | None = None,
+) -> None:
+    """Append one ``{ts, task, from, to}`` line to the bundle's history file.
+
+    The plan write above stays temp-file-plus-replace; a history line is a
+    single append, flushed and fsynced so one line is atomic. A failed
+    append warns but keeps the plan write (the plan is the source of truth).
+    """
+    import time as _time
+
+    path = bundle_dir(ws, root)
+    if path is None:
+        print(f"history not recorded: bundle not found: {ws}", flush=True)
+        return
+    row: dict = {"ts": _time.time() if now is None else now, "task": task_id, "to": to_status}
+    if isinstance(from_status, str) and from_status:
+        row["from"] = from_status
+    try:
+        with open(path / "history.jsonl", "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+            handle.flush()
+            try:
+                os.fsync(handle.fileno())
+            except OSError:
+                pass
+    except OSError as exc:
+        print(f"history not recorded for {ws} {task_id}: {exc}", flush=True)
 
 
 def _split_csv(value: str) -> list[str]:

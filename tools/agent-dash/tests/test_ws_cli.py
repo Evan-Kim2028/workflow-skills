@@ -164,6 +164,31 @@ class WsCliTest(unittest.TestCase):
         self.assertEqual(set_task("WS3", "missing", "done", None, None), 2)
         self.assertEqual(cmd_ws(["task", "WS3", "WS3.1", "nope"]), 2)
 
+    def test_task_appends_history(self):
+        from dash.bundles import append_history
+
+        self.assertEqual(cmd_ws(["new", "WS3", "Third"]), 0)
+        hist = Path(self.tmp.name) / "WS3" / "history.jsonl"
+        self.assertEqual(set_task("WS3", "WS3.1", "pr", None, None), 0)
+        lines = hist.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(len(lines), 1)
+        first = json.loads(lines[0])
+        self.assertEqual(first["task"], "WS3.1")
+        self.assertEqual(first["from"], "todo")
+        self.assertEqual(first["to"], "pr")
+        self.assertIsInstance(first["ts"], float)
+        self.assertEqual(set_task("WS3", "WS3.1", "pr", None, None), 0)
+        self.assertEqual(len(hist.read_text(encoding="utf-8").splitlines()), 1)
+        self.assertEqual(set_task("WS3", "WS3.1", "done", None, None), 0)
+        lines = hist.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(len(lines), 2)
+        second = json.loads(lines[1])
+        self.assertEqual((second["from"], second["to"]), ("pr", "done"))
+        self.assertGreaterEqual(second["ts"], first["ts"])
+        append_history("WS3", "WS3.1", "done", "done", root=Path(self.tmp.name), now=1234.0)
+        rows = [json.loads(line) for line in hist.read_text(encoding="utf-8").splitlines()]
+        self.assertEqual(rows[-1]["ts"], 1234.0)
+
     def test_approvals_schema_cli_and_naming(self):
         from io import StringIO
         from contextlib import redirect_stdout

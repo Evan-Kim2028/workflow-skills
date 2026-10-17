@@ -36,6 +36,23 @@ def inline_scripts():
     return "\n".join(re.findall(r"<script>(.*?)</script>", text, re.S))
 
 
+def _extract_taskof(path, name):
+    """The page's taskOf source with its name swapped, so node can run it
+    against the same samples as dash/taskmatch.py."""
+    text = Path(path).read_text()
+    start = text.index("function taskOf(")
+    brace = text.index("{", start)
+    depth = 0
+    for pos in range(brace, len(text)):
+        if text[pos] == "{":
+            depth += 1
+        elif text[pos] == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start:pos + 1].replace("function taskOf(", f"function {name}(", 1)
+    raise AssertionError(f"taskOf body never closes in {path}")
+
+
 class PageRules(unittest.TestCase):
     def test_every_chart_has_axes(self):
         for path, src in pages():
@@ -215,6 +232,71 @@ class PageRules(unittest.TestCase):
             text=True,
         )
         self.assertEqual(proc.returncode, 0, proc.stderr or proc.stdout)
+
+    def test_run_to_task_rule_agrees_with_the_server(self):
+        """The page's two taskOf copies and dash/taskmatch.py share one rule:
+        exact label, /regex/ keys, WS1/WS2/WS7 built-ins, plan-id substring."""
+        import json as _json
+        import sys as _sys
+
+        _sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+        from dash import taskmatch
+
+        taskmap = {
+            "WS1": {"ws1-schema": "12", "/^ws1-migrate/": "13"},
+            "WS2": {"ws2-routes": "WS2.3"},
+            "WS7": {"ws7-landing": "WS7.LANDING", "/^ws7-notes/": "WS7.NOTES"},
+        }
+        ids = {
+            "WS1": ["12", "13", "84", "7"],
+            "WS2": ["WS2.3", "WS2.4", "WS2.12b"],
+            "WS7": ["WS7.LANDING", "WS7.NOTES", "WS7.CHECK"],
+            "WS9": ["W1", "W10"],
+        }
+        samples = [
+            ("WS1", "ws1-schema", "12"),
+            ("WS1", "ws1-migrate-9", "13"),
+            ("WS1", "impl WS1.84", "84"),
+            ("WS1", "WS1.7", "7"),
+            ("WS1", "review WS1.13", "13"),
+            ("WS1", "nothing here", None),
+            ("WS2", "ws2-routes", "WS2.3"),
+            ("WS2", "fix WS2.4 soon", "WS2.4"),
+            ("WS2", "ship WS2.12b", "WS2.12b"),
+            ("WS2", "ws2-9-x", "WS2.9"),
+            ("WS7", "ws7-landing", "WS7.LANDING"),
+            ("WS7", "ws7-notes-2", "WS7.NOTES"),
+            ("WS7", "gate P0-12 open", "P0-12"),
+            ("WS7", "WS7.check-x", "WS7.CHECK"),
+            ("WS9", "ws9-W10-fix", "W10"),
+            ("WS9", "ws9-W1-x", "W1"),
+            ("WS9", "unrelated", None),
+        ]
+        for ws, label, expected in samples:
+            self.assertEqual(
+                taskmatch.task_of(label, ws, taskmap, ids.get(ws, [])),
+                expected,
+                f"server rule drifts on {label!r}",
+            )
+        harness = (
+            "var TASKMAP=" + _json.dumps(taskmap) + ";"
+            "var IDS=" + _json.dumps(ids) + ";"
+            "function planTaskIds(ws){return IDS[ws]||[];}"
+            "function taskmapGet(){return TASKMAP;}"
+            + _extract_taskof(STATIC / "index.html", "taskOfExec")
+            + _extract_taskof(STATIC / "plan.js", "taskOfPlan")
+            + "var SAMPLES=" + _json.dumps([[ws, label] for ws, label, _ in samples]) + ";"
+            "var OUT=SAMPLES.map(function(s){"
+            "return [taskOfExec({label:s[1]},s[0]),taskOfPlan({label:s[1]},s[0],IDS[s[0]]||[])];});"
+            "console.log(JSON.stringify(OUT));"
+        )
+        proc = subprocess.run(["node", "-e", harness], capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 0, proc.stderr or proc.stdout)
+        rows = _json.loads(proc.stdout)
+        self.assertEqual(len(rows), len(samples))
+        for (ws, label, expected), (exec_hit, plan_hit) in zip(samples, rows):
+            self.assertEqual(exec_hit, expected, f"index.html taskOf drifts on {label!r}")
+            self.assertEqual(plan_hit, expected, f"plan.js taskOf drifts on {label!r}")
 
     def test_unknown_duration_is_a_dash(self):
         script = (

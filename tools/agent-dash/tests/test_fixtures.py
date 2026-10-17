@@ -50,6 +50,9 @@ FILES = (
     "plan-WS1.json",
     "plan-WS2.json",
     "plan-WS7.json",
+    "replay-WS1.json",
+    "replay-WS2.json",
+    "replay-WS7.json",
     "health.json",
 )
 
@@ -352,6 +355,29 @@ class FixtureShapeTests(unittest.TestCase):
         noted = [task for task in tasks if task.get("dep_notes")]
         self.assertEqual(len(noted), 1)
         self.assertTrue(set(noted[0]["dep_notes"]) <= set(noted[0].get("deps", [])))
+
+    def test_replay_fixtures(self):
+        for ws in ("WS1", "WS2", "WS7"):
+            replay = self.docs[f"replay-{ws}.json"]
+            plan = self.docs[f"plan-{ws}.json"]
+            self.assertEqual(replay["ws"], ws)
+            known = {task["id"] for group in plan["groups"] for task in group["tasks"]}
+            self.assertEqual(set(replay["tasks"]), known)
+            stamps = [event["t"] for event in replay["events"]]
+            self.assertEqual(stamps, sorted(stamps))
+            self.assertTrue(replay["events"])
+            self.assertEqual(replay["span"], {"start": min(stamps), "end": max(stamps)})
+            inferred = [tid for tid, task in replay["tasks"].items() if task["inferred"]]
+            self.assertEqual(replay["inferred"], len(inferred))
+            self.assertEqual(
+                replay["observed"],
+                sum(1 for task in replay["tasks"].values() if task["done_at"] is not None and not task["inferred"]),
+            )
+            for tid, task in replay["tasks"].items():
+                self.assertEqual(set(task), {"status", "first_active", "done_at", "inferred", "runs"})
+                for run in task["runs"]:
+                    self.assertEqual(set(run), {"start", "end", "family", "label"})
+                    self.assertIn(run["family"], {"opus", "sonnet", "haiku", "muse", "glm", "grok", "other"})
 
     def test_reconcile_fixture(self):
         doc = self.docs["reconcile.json"]
