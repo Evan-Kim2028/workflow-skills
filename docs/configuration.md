@@ -100,6 +100,7 @@ State files in the state directory:
 | `agent-dash.pid` | The dashboard pid. |
 | `agent-dash.log` | The forked process log. |
 | `cursor-usage.jsonl` | Billed Grok usage lines. |
+| `generic.jsonl` | Harness-neutral run and usage lines. Any agent writes it; `report` appends one line. |
 | `tmp/` | Scratch copies of read-only databases. |
 
 ## Environment variables
@@ -140,7 +141,7 @@ Test-only variables. Smoke tests stay skipped unless `AGENT_DASH_SMOKE` is `1`. 
 | `AGENT_DASH_SMOKE_MANIFEST`, `AGENT_DASH_SMOKE_CURSOR_HOME` | Cursor home smoke. |
 | `AGENT_DASH_HUB_DIR` | Also a product variable. The hub smoke uses it when smoke is on. |
 
-Tier selection is the `defaultTier`, `reviewTier`, and lane `tier` fields on a wave. See [Concepts](concepts.md). No environment variable names a worker registry.
+Tier selection is the `defaultTier`, `reviewTier`, and lane `tier` fields on a wave: a registry worker name, `default`, or `auto`. See [Concepts](concepts.md). The registry file is `workers.example.json`, replaced by `workers.local.json` or the `AGENT_DASH_WORKERS` path.
 
 ## Commands
 
@@ -154,17 +155,23 @@ python3 agent_dash.py backfill --session <id>
 python3 agent_dash.py reprice
 python3 agent_dash.py reconcile
 python3 agent_dash.py check [--url URL] [--hours N]
+python3 agent_dash.py check --page [--url URL]
+python3 agent_dash.py report start --label <label> [--model M] [--session S]
+python3 agent_dash.py report finish --label <label> --verdict PASS
+python3 agent_dash.py report usage --label <label> --input N --output N [--model M]
 python3 agent_dash.py ws list
 python3 agent_dash.py ws new <ID> "<title>"
 python3 agent_dash.py ws validate <ID>
 python3 agent_dash.py ws render <ID>
 python3 agent_dash.py ws task <ID> <task-id> <status>
+python3 agent_dash.py ws train <ID> <train-id> [--title T] [--status S] [--add id,id]
+python3 agent_dash.py ws trains <ID>
 python3 agent_dash.py ws approve <ID> <item-id> pending --step "<step>" --reversible yes --conditions "<conditions>"
 python3 agent_dash.py ws approvals
 python3 agent_dash.py ws approvals <ID>
 ```
 
-`ws task` accepts `--moved-to WSn` and `--note "..."` only with status `deferred`. `ws approve` status is `pending`, `approved`, or `denied`. `--reversible` is `yes` or `no`. `backfill` requires `--session`. With no subcommand, `agent_dash.py` starts the server, the same as `run`.
+`ws task` status is `todo`, `wip`, `pr`, `prog`, `done`, or `deferred`. It accepts `--moved-to WSn` and `--note "..."` only with status `deferred`. `ws approve` status is `pending`, `approved`, or `denied`. `--reversible` is `yes` or `no`. `backfill` requires `--session`. With no subcommand, `agent_dash.py` starts the server, the same as `run`.
 
 `reconcile` marks grok, muse, and glm rows whose process is gone. It prints `reconcile ended <count>`.
 

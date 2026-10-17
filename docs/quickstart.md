@@ -82,7 +82,7 @@ Run that from `tools/agent-dash`. The script uses a fixed seed and does not read
 python3 ~/.claude/tools/agent-dash/agent_dash.py ws new WS4 "Notes index"
 ```
 
-You should see `created` and a path ending in `workstreams/WS4`. The directory is under `~/.local/share/agent-dash/workstreams/`. The command writes `bundle.json`, `plan.json`, `layout.json`, and `visuals.html`. The fresh plan already validates.
+You should see `created` and a path ending in `workstreams/WS4`. The directory is under `~/.local/share/agent-dash/workstreams/`. The command writes `bundle.json`, `plan.json`, `layout.json`, `visuals.html`, and `START-PROMPT.md`. The fresh plan already validates.
 
 Set the thesis and the first task title:
 
@@ -124,7 +124,7 @@ Reload http://127.0.0.1:8765/?view=plan&ws=WS4 . The plan page reads `plan.json`
 
 ## 5. Map the run label onto the task
 
-The dashboard attributes a label such as `ws4-WS4.1-notes-index` to workstream WS4 with the shipped regex. Pinning that run to task `WS4.1` needs a task map. Built-in task matchers exist only for WS1, WS2, and WS7.
+The dashboard attributes a label such as `ws4-WS4.1-notes-index` to workstream WS4 with the shipped regex. That label already pins to task `WS4.1`, because the page matches a label that holds the task id. WS1, WS2, and WS7 have extra built-in matchers. The task map below is the exact override for labels that do not hold the id.
 
 `taskmap.local.json` replaces `taskmap.example.json` entirely. This file keeps the shipped examples and adds WS4. From the clone root:
 
@@ -154,11 +154,9 @@ The page loads this file on refresh. No restart. The file is gitignored.
 
 ## 6. Run a first wave
 
-`ws-wave` is a Claude Code Workflow script, not a shell command. Each lane is built, then reviewed, then fixed until the review approves it or the fix rounds run out. Every step is a low-effort Haiku wrapper around `run_worker.sh`. The heavy work stays on muse or Grok.
+`ws-wave` is a Workflow script, not a shell command. Each lane is built, then reviewed, then fixed until the review approves it or the fix rounds run out. On Claude Code each step is a low-effort Haiku wrapper around `run_worker.sh`; on another harness, run one lane per sub-agent and review it the same way. The heavy work stays on the registry workers.
 
-`defaultTier` and `reviewTier` both default to `muse`. A lane may set `tier` to `muse` or `grok`. `run_worker.sh` rejects any other tier and prints `reason=unknown-tier`.
-
-The lead skill names a `workers.local.json` registry, with a default tier, named tiers, and an `auto` tier that would fail over by availability. This repository does not ship that file, and no code reads one. Set the tier on the wave arguments.
+`defaultTier` and `reviewTier` both default to `default`, the registry default worker. A lane may set `tier` to a worker name, `default`, or `auto`. `run_worker.sh` runs `run_worker.py`, which reads `workers.example.json`, replaced on a machine by `workers.local.json` or the `AGENT_DASH_WORKERS` path. An unknown tier prints `reason=unknown-tier`. `auto` picks the first available worker in `auto_order` and moves to the next one after a quota error.
 
 Print the absolute tool paths:
 
@@ -189,13 +187,13 @@ Call the Workflow tool with `scriptPath` set to the absolute path of `ws-wave.js
   "runner": "/absolute/path/to/run_worker.sh",
   "dash": "/absolute/path/to/agent_dash.py",
   "maxFixRounds": 2,
-  "defaultTier": "muse",
-  "reviewTier": "muse",
+  "defaultTier": "default",
+  "reviewTier": "default",
   "lanes": [
     {
       "task": "WS4.1",
       "slug": "notes-index",
-      "tier": "muse",
+      "tier": "default",
       "branch": "ws4/notes-index",
       "worktree": "/absolute/path/to/wt-notes-index",
       "brief": "Add a notes index. Write only in this worktree. Stop when the index lists the notes.",
@@ -235,7 +233,7 @@ Move the task when the fact changes:
 python3 ~/.claude/tools/agent-dash/agent_dash.py ws task WS4 WS4.1 pr
 ```
 
-The command prints `WS4 WS4.1 pr`. Status values are `todo`, `pr`, `prog`, `done`, and `deferred`. `--moved-to` and `--note` belong only on `deferred`.
+The command prints `WS4 WS4.1 pr`. Status values are `todo`, `wip`, `pr`, `prog`, `done`, and `deferred`. `--moved-to` and `--note` belong only on `deferred`.
 
 ```bash
 python3 ~/.claude/tools/agent-dash/agent_dash.py stop

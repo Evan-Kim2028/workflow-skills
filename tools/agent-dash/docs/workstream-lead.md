@@ -1,6 +1,6 @@
 # Running a workstream end to end
 
-A workstream is planned once and then executed in waves. muse is the default worker. Grok is the other tier the launcher accepts. One Claude lead session decides, merges, and runs production steps. The dashboard shows the work live.
+A workstream is planned once and then executed in waves. Workers come from the registry; the shipped default is muse, with Grok and GLM beside it. One lead session decides, merges, and runs production steps. The dashboard shows the work live.
 
 The install path and the first wave are in the repository [quickstart](../../../docs/quickstart.md). Labels, tokens, and the task map are in [concepts](../../../docs/concepts.md).
 
@@ -63,7 +63,7 @@ Pending items show in the dashboard's "Needs you" card and in the Plan page's Ap
 
 ## 4. Execute each wave with the `ws-wave` workflow
 
-In the lead session, call Claude Code's Workflow tool with:
+In the lead session, run one wave. On Claude Code, call the Workflow tool with:
 
 ```text
 scriptPath: the absolute path of ~/.claude/tools/agent-dash/workflows/ws-wave.js
@@ -88,12 +88,12 @@ What the workflow does:
 
 - All lanes run in parallel.
 - Each lane goes build, then review, then fix and re-review until approved, or until it runs out of fix rounds.
-- Every step is a low-effort Haiku wrapper around `scripts/run_worker.sh`. The runner launches muse with model `muse-spark-1.3-contributor` and reasoning effort `xhigh`, or a Grok worker, then waits and logs the run.
+- On Claude Code, every step is a low-effort Haiku wrapper around `scripts/run_worker.sh`. On another harness, run one lane per sub-agent with the same build, review, and fix prompts. The runner launches the lane's registry worker, then waits and logs the run.
 - On approval it runs `ws task WS4 WS4.1 pr`.
 - It returns `approved` branches, `needsLead` lanes with the last review, and `built` lanes.
 - It does not push, open a pull request, merge, or take a production step.
 
-Run labels are `ws4-WS4.1-notes-index`, then `-rev1` and `-fix1`. With a task-map entry for that label, the dashboard pins each attempt on the task chip, and `↻N` counts the attempts. `defaultTier` and `reviewTier` default to `muse`. `run_worker.sh` accepts `muse` or `grok`. The lead skill's `workers.local.json` registry is not loaded by this repository.
+Run labels are `ws4-WS4.1-notes-index`, then `-rev1` and `-fix1`. A label that holds the task id pins each attempt on the task chip, and `↻N` counts the attempts; the task map is the override for other labels. `defaultTier` and `reviewTier` default to `default`. Tiers are registry worker names, `default`, or `auto`, read from `workers.example.json`, `workers.local.json`, or `AGENT_DASH_WORKERS`.
 
 ## 5. The lead's loop
 

@@ -18,6 +18,9 @@ from dash.locate import expand, ignore_local
 from dash.pricing import reprice as reprice_usage
 from dash.server import DashServer
 from dash.sources import Registry
+from dash.sources.generic import FILE_NAME as GENERIC_FILE
+from dash.sources.generic import default_run_id as generic_run_id
+from dash.sources.generic import tier_of as generic_tier_of
 from dash.sources.process import reconcile_running
 from dash.store import Store
 
@@ -41,6 +44,9 @@ USAGE = """agent-dash: local read-only execution dashboard
   python3 agent_dash.py reconcile
   python3 agent_dash.py check [--url URL] [--hours N]
   python3 agent_dash.py check --page [--url URL]
+  python3 agent_dash.py report start --label <label> [--model M] [--session S] [--run-id R] [--tier T]
+  python3 agent_dash.py report finish --label <label> --verdict PASS [--session S] [--run-id R] [--status done]
+  python3 agent_dash.py report usage --label <label> --input N --output N [--model M] [--session S] [--run-id R]
   python3 agent_dash.py ws list
   python3 agent_dash.py ws new <ID> "<title>"
   python3 agent_dash.py ws validate <ID>
@@ -208,6 +214,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_reconcile()
     if cmd == "check":
         return cmd_check(args[1:])
+    if cmd == "report":
+        return cmd_report(args[1:])
     print(USAGE, end="", file=sys.stderr)
     return 2
 
@@ -428,6 +436,120 @@ def cmd_page_check(url: str) -> int:
     if proc.stderr:
         print(proc.stderr, end="", file=sys.stderr)
     return 0 if proc.returncode == 0 else 1
+
+
+def cmd_report(argv: list[str]) -> int:
+    """Append one generic.jsonl line so any harness can report a run.
+
+    start appends a running run line, finish a terminal run line with a
+    verdict, usage a token line. The collector picks the file up on its
+    next poll. Never stores prompts or secrets: the schema has no field
+    for them.
+    """
+    if not argv or argv[0] not in ("start", "finish", "usage"):
+        print("usage: python3 agent_dash.py report start|finish|usage --label <label> ...", file=sys.stderr)
+        return 2
+    action = argv[0]
+    flags = _report_flags(argv[1:])
+    label = flags.get("label")
+    if not label or len(label) > 200 or "/" in label or "\\" in label or label.startswith("."):
+        print("report requires --label <label>", file=sys.stderr)
+        return 2
+    session = flags.get("session")
+    run_id = generic_run_id(label, session, flags.get("run-id"))
+    model = flags.get("model")
+    tier = flags.get("tier")
+    if tier is None and model is not None:
+        tier = generic_tier_of(model)
+    now = time.time()
+    if action == "start":
+        line = {
+            "type": "run",
+            "label": label,
+            "run_id": run_id,
+            "model": model,
+            "tier": tier,
+            "session_id": session,
+            "status": "running",
+            "started_at": now,
+        }
+    elif action == "finish":
+        verdict = flags.get("verdict")
+        if not verdict:
+            print("report finish requires --verdict PASS|PARTIAL|BLOCKED|APPROVE|...", file=sys.stderr)
+            return 2
+        status = flags.get("status") or "done"
+        if status not in ("done", "killed", "died_early"):
+            print("report finish --status is done, killed, or died_early", file=sys.stderr)
+            return 2
+        line = {
+            "type": "run",
+            "label": label,
+            "run_id": run_id,
+            "model": model,
+            "tier": tier,
+            "session_id": session,
+            "status": status,
+            "verdict": verdict,
+            "ended_at": now,
+        }
+    else:
+        try:
+            tokens_in = int(flags.get("input", ""))
+            tokens_out = int(flags.get("output", ""))
+        except ValueError:
+            print("report usage requires --input N --output N", file=sys.stderr)
+            return 2
+        if tokens_in < 0 or tokens_out < 0:
+            print("report usage requires --input N --output N", file=sys.stderr)
+            return 2
+        line = {
+            "type": "usage",
+            "session_id": session or run_id,
+            "run_id": run_id,
+            "model": model,
+            "tool": flags.get("tool") or "generic",
+            "message_id": flags.get("message-id") or ("usage-%d" % int(now * 1000)),
+            "ts": now,
+            "input": tokens_in,
+            "output": tokens_out,
+            "cache_read": _report_int(flags.get("cache-read"), 0),
+            "cache_write": _report_int(flags.get("cache-write"), 0),
+            "reasoning": _report_int(flags.get("reasoning"), 0),
+        }
+    cfg = bind_state()
+    state = Path(expand(str(cfg.get("state_dir") or STATE_DIR)))
+    state.mkdir(parents=True, exist_ok=True)
+    dest = state / GENERIC_FILE
+    try:
+        with dest.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(line, separators=(",", ":"), ensure_ascii=True) + "\n")
+    except OSError as exc:
+        print(f"report failed: {exc}", file=sys.stderr)
+        return 1
+    print(f"reported {action} {run_id}")
+    return 0
+
+
+def _report_flags(argv: list[str]) -> dict:
+    flags: dict[str, str] = {}
+    index = 0
+    while index < len(argv):
+        token = argv[index]
+        if token.startswith("--") and index + 1 < len(argv) and not argv[index + 1].startswith("--"):
+            flags[token[2:]] = argv[index + 1]
+            index += 2
+        else:
+            index += 1
+    return flags
+
+
+def _report_int(value, default: int) -> int:
+    try:
+        number = int(value) if value is not None else default
+    except (TypeError, ValueError):
+        return default
+    return number if number >= 0 else default
 
 
 def run_backfill(store, registry, cfg: dict, session_id: str, max_passes: int = 80) -> int:

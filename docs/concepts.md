@@ -38,6 +38,7 @@ A task status is one of five words.
 | Status | Meaning on the map |
 |---|---|
 | `todo` | Not started. |
+| `wip` | Being built on a branch, not merged. |
 | `pr` | Waiting to merge. An open pull request. |
 | `prog` | Merged, waiting on a production step. |
 | `done` | Finished. |
@@ -47,7 +48,7 @@ Deferred tasks stay on the map and drop out of the done-of-total count. `ws task
 
 The map is one board of columns. Each group is a card of chips. A chip with a running agent uses a solid pulse and a badge with the tool color and the count. A chip whose run finished in the last 15 minutes gets a green outline, unless an agent is still running on it. A `↻` count appears when more than one run in the current range mapped to that task. The edge of that count turns amber when two or more of those runs were sent back. Sending back means a verdict of `REQUEST_CHANGES`, `APPROVE_WITH_CHANGES`, `PARTIAL`, or `BLOCKED`.
 
-Runs that are running on this workstream and match no task are listed above the map. For WS4 that list is the signal that the task map does not cover the label. WS1, WS2, and WS7 also have matchers built into the page. Every other workstream depends on `taskmap.local.json`.
+Runs that are running on this workstream and match no task are listed above the map. WS1, WS2, and WS7 have extra matchers built into the page. Every workstream also matches a label that holds its task id (for example `ws4-WS4.1-slug` pins to `WS4.1`). `taskmap.local.json` is the exact override when the label does not hold the id.
 
 Hover a chip for the task id, title, and status. The id alone is not the label. The title is.
 
@@ -67,9 +68,9 @@ Collectors find those TSV files under a scratch root: either the file sitting di
 
 ## Approvals
 
-An approval is a production step the owner has to answer before the lead acts. The lead adds it as `pending`. The owner sets `approved` or `denied`. The lead reads `ws approvals` before the step.
+An approval is a production step the owner has to answer before the lead acts. The lead adds it as `pending`. The owner sets `approved` or `denied`. The lead reads `ws approvals` before the step. The Execution view lists pending items in a Needs-you card; the lead still acts only on the file.
 
-Each item has an id, a step sentence, a status, a reversible flag, and conditions. `reversible no` is one-way. The dashboard does not show approvals; the lead reads them with `ws approvals <ID>` before any production step.
+Each item has an id, a step sentence, a status, a reversible flag, and conditions. `reversible no` is one-way. The lead reads them with `ws approvals <ID>` before any production step.
 
 `oneWay` in an execution-plan lane is the planner's flag for a lane that is irreversible or next to production. It is not a field `ws-wave` reads. The workflow never takes the production step. The lead does, and only from an `approved` item.
 
@@ -77,16 +78,17 @@ Each item has an id, a step sentence, a status, a reversible flag, and condition
 
 Workers come from a registry: `tools/agent-dash/workers.example.json`, replaced on one machine by a gitignored `workers.local.json` (or `AGENT_DASH_WORKERS`). Each worker has a kind (muse, cursor-agent or Grok Build CLI), a model, a concurrency cap and quota patterns. A lane asks for `default` (the registry default), a worker name, or `auto`. `auto` takes the first worker in `auto_order` that is under its cap and not cooling down; when a run fails on a quota error, that worker cools down and an `auto` or `default` lane relaunches on the next one.
 
-`ws-wave` reads `defaultTier` and `reviewTier`. Both default to `muse`. `reviewTier` falls back to `defaultTier` when you omit it. A lane's own `tier` overrides the build tier. The review tier stays `reviewTier`.
+`ws-wave` reads `defaultTier` and `reviewTier`. Both default to `default`, the registry default worker. `reviewTier` falls back to `defaultTier` when you omit it. A lane's own `tier` overrides the build tier. The review tier stays `reviewTier`. A tier is a registry worker name, `default`, or `auto`.
 
-`run_worker.sh` accepts `muse` or `grok`.
+`run_worker.sh` runs `run_worker.py`, which reads the worker registry (`workers.example.json`, replaced by `workers.local.json` or `AGENT_DASH_WORKERS`).
 
-- `muse` runs `muse exec` with model `muse-spark-1.3-contributor` and reasoning effort `xhigh`. It records a session id in `muse-sessions.tsv`.
-- `grok` runs `launch_grok.sh`, which runs `cursor-agent` and appends one billed usage line. The default model string is `grok-4.7[context=500k,reasoning_effort=xhigh,fast=false]`.
+- A `muse` worker runs `muse exec` with its model and records a session id in `muse-sessions.tsv`.
+- A `cursor` worker runs `launch_grok.sh`, which runs `cursor-agent` and appends one billed usage line.
+- A `grok-build` worker runs the Grok CLI with the prompt plus the run rule.
 
-Any other tier, including `glm` and `auto`, fails immediately with `unknown-tier`. GLM still appears on the dashboard when a `glm-sessions.tsv` row and a Grok CLI session exist. The kit does not launch that worker.
+An unknown tier fails with `unknown-tier`. A disabled worker fails with `disabled`.
 
-Set `muse` or `grok` on the lane.
+Set a registry worker name, `default`, or `auto` on the lane.
 
 ## A wave
 

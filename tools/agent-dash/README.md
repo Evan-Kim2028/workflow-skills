@@ -2,11 +2,11 @@
 
 The local page for this kit. It reads transcripts, manifests, and process samples on your machine and shows runs, token use, and a plan map per workstream.
 
-The product overview, the ten-minute path, and the configuration reference are in the repository root: [README](../../README.md), [quickstart](../../docs/quickstart.md), [concepts](../../docs/concepts.md), [configuration](../../docs/configuration.md).
+Start with [Plug in any agent](docs/integrate.md): install and run in three commands, one reporting path per harness, labels, verdicts, pricing, and troubleshooting. The contract is [CONTRACT.md](CONTRACT.md). The repository root holds the [landing page](../../README.md), [quickstart](../../docs/quickstart.md), [concepts](../../docs/concepts.md), and [configuration](../../docs/configuration.md).
 
 ![Overall tab in the dark theme](../../docs/screenshots/overview-dark.png)
 
-The Overall tab in the dark theme. The image file is a placeholder until a screenshot is saved there.
+The Overall tab in the dark theme, rendered from the bundled sample data.
 
 The page binds to 127.0.0.1 port 8765. That address is fixed. The store keeps labels, timings, and token counts. Prompt bodies, argv, secrets, and environment values stay unread.
 

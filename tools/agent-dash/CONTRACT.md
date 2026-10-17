@@ -8,7 +8,7 @@ Never writes to any source, never signals agent processes, never stores prompt b
 
 | Path | Owner |
 |---|---|
-| `agent_dash.py` (CLI: `run`, `stop`, `status`, `backfill --session <id>`, `reprice`, `reconcile`, `check`, `ws`) | core |
+| `agent_dash.py` (CLI: `run`, `stop`, `status`, `backfill --session <id>`, `reprice`, `reconcile`, `check`, `ws`, `report`) | core |
 | `dash/store.py` (schema, offsets, upserts, buckets, counts) | core |
 | `dash/server.py` (HTTP + SSE, routes below) | core |
 | `dash/attribution.py`, `map.example.json` (`map.local.json` replaces it) | core |
@@ -18,7 +18,7 @@ Never writes to any source, never signals agent processes, never stores prompt b
 | `scripts/cursor_usage_hook.py` | src-cursor |
 | `dash/sources/__init__.py` (registry, scheduler) | core |
 | `dash/sources/process.py`, `dash/sources/hub.py` | core |
-| `dash/sources/claude.py`, `dash/sources/manifests.py` | src-ai |
+| `dash/sources/claude.py`, `dash/sources/manifests.py`, `dash/sources/generic.py` | src-ai |
 | `dash/sources/muse.py`, `dash/sources/grok_cli.py` | src-tools |
 | `dash/sources/cursor.py` | src-cursor |
 | `static/index.html` (all UI, vanilla JS, inline SVG/canvas charts) | Claude (parent) |
@@ -52,9 +52,9 @@ store.set_ws_counts(list)     # rows: ws, name, backlog, todo, doing, review, do
 `cfg` is the merged config (roots, intervals, read budgets: 4 MB per file, 8 MB per tick). There is no concurrency cap.
 Sources must be incremental (byte offsets), budget-bounded, and exception-safe (log, never crash the loop).
 
-Enums. `source`: claude-main, claude-subagent, claude-workflow, muse, glm, grok (cursor-agent), shell.
-`tier`: opus, sonnet, haiku, muse, glm, grok. `status`: running, done, killed, died_early, unknown.
-`verdict`: PASS, PARTIAL, BLOCKED, APPROVE, APPROVE_WITH_CHANGES, REQUEST_CHANGES, or null.
+Enums. `source`: claude-main, claude-subagent, claude-workflow, muse, glm, grok (cursor-agent), shell, generic.
+`tier`: opus, sonnet, haiku, muse, glm, grok. The generic source passes its tier through and defaults to `generic` (from the model name when it holds a known family). `status`: running, done, killed, died_early, unknown.
+`verdict`: PASS, PARTIAL, BLOCKED, APPROVE, APPROVE_WITH_NITS, APPROVE_WITH_CHANGES, REQUEST_CHANGES, or null.
 `clock_source`: transcript, muse_log, manifest, mtime. Times are epoch seconds (float), UTC.
 `run_id` is stable: `<source>:<session-or-uuid>:<label-or-agent-id>`.
 
@@ -210,6 +210,7 @@ last usage/sample), never left running.
 | `muse`, `glm` | Live only while a live process matches pid, `[label:]`, prompt-file label, or session uuid (`process.match_agent`). A new row with no match opens as `unknown`, never `running`. |
 | `grok` (cursor-agent) | Live only while a live `cursor-agent` process carries the run's pid or `[label:]`. A chat whose process is gone is `done` (or `unknown` without a timestamp). |
 | `shell` (exec) | Live only while the out file grew since the previous poll or a live label was sampled within `process_ttl_s` (30 s). Out growth and the live label are the evidence; rows carry no pid. |
+| `generic` (`generic.jsonl`, `agent_dash.py report`) | No pid. Live from `report start` until `report finish`; each `report usage` line is fresh evidence. A run with no line for longer than `STALE_IDLE_S` (6 h) is `stale running`: hidden from every view and reported by `check`. Long runs send `report usage` as a heartbeat. |
 | `manifests` (muse/glm/grok rows) | Same as the tool rows above: `running` only on out growth or a live label; otherwise `done`/`unknown`. |
 
 One filtered running set backs every view: the snapshot `running` list,
@@ -290,6 +291,53 @@ Run labels for a task are `ws<N>-<task-id>-<slug>`. `SKILL-PLAN.md` is the short
 `kind` selects the launch, not the model string. `muse` runs `muse exec` with `--model`, `--workspace`, `--prompt-file`, `--session-id`, then `extra_args`. `cursor` runs `scripts/launch_grok.sh` so billed tokens are logged. `grok-build` runs `grok -p` with the prompt, a run rule appended, `-m`, `-s`, `--permission-mode bypassPermissions`, `--cwd`, and `--output-format plain`. `columns` is the manifest row. `glm-sessions.tsv` uses `label`, `session_id`, `epoch`, `model`. `manifests.py` and `grok_cli.py` read that shape. `cost_rank` is a lower-is-cheaper hint. `auto` follows `auto_order`, not `cost_rank`.
 
 `run_worker.py <tier|default|auto> <label> <workspace> <prompt-file> <run-dir> [max-wait]` prints `STATUS: running|done|failed out=... err=... tier=<name>`. It records the chosen worker in `<run-dir>/<label>.tier` and the pid in `<run-dir>/<label>.pid`. A later call for that label only waits. `default` uses the registry `default`. `auto` uses the first enabled worker in `auto_order` that is under `cap` (live count from `pgrep`) and not in cooldown. A failed run whose stderr or report matches `quota_patterns` cools that worker down for `cooldown_minutes`. Cooldowns live in `worker-cooldowns.json` in the agent-dash state dir. If the request was `auto` or `default`, the runner archives the report to `out-<label>.<tier>.md` and launches the next eligible worker.
+
+## Generic reporting (any harness)
+
+`generic.jsonl` in the state directory is the harness-neutral drop file.
+Each line is one JSON object with `type` `run` or `usage`. The generic
+source tails it with byte offsets like every other source. Labels only:
+the schema has no field for prompts, argv, secrets, or environment.
+
+Run line. `label` is required. `run_id` defaults to
+`generic:<session_id>:<label>`, or `generic:<label>` with no session.
+`status` defaults to `running`. `tier` defaults from the model family,
+else `generic`. `started_at`/`ended_at` are epoch seconds; a terminal
+status without `ended_at` stamps now. Workstream attribution reads the
+label through the map file, the same as every source.
+
+```json
+{"type": "run", "label": "ws4-WS4.1-notes-index", "status": "running",
+ "model": "my-model", "session_id": "abc", "started_at": 1700000000.0}
+{"type": "run", "label": "ws4-WS4.1-notes-index", "status": "done",
+ "verdict": "PASS", "session_id": "abc", "ended_at": 1700000060.0}
+```
+
+Usage line. `session_id`, `tool`, and `message_id` are required by the
+store (upsert on that triple, last wins). `run_id` should match the run
+so tokens join its workstream. `model` names the price row; a model with
+no input and output rate stays unpriced, never zero.
+
+```json
+{"type": "usage", "session_id": "abc", "run_id": "generic:abc:ws4-WS4.1-notes-index",
+ "tool": "generic", "message_id": "turn-1", "model": "my-model",
+ "input": 100, "output": 50, "cache_read": 0, "cache_write": 0, "reasoning": 0}
+```
+
+Helper. `python3 agent_dash.py report` appends one valid line:
+
+```
+python3 agent_dash.py report start --label <label> [--model M] [--session S] [--run-id R] [--tier T]
+python3 agent_dash.py report finish --label <label> --verdict PASS [--session S] [--run-id R] [--status done]
+python3 agent_dash.py report usage --label <label> --input N --output N [--model M] [--session S] [--run-id R]
+```
+
+`finish --status` is `done`, `killed`, or `died_early`. `finish` without
+`--model` keeps the model from `start`. Verdicts are `PASS`, `PARTIAL`,
+`BLOCKED`, `APPROVE`, `APPROVE_WITH_CHANGES`, `APPROVE_WITH_NITS`, or
+`REQUEST_CHANGES`. The live-agents tile counts the `grok`, `muse`,
+`glm`, and `claude` buckets; a generic run shows in the running table,
+on its task chip, and in tokens and cost either way.
 
 ## Checks
 

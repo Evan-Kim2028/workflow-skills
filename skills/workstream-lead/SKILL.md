@@ -1,33 +1,35 @@
 ---
 name: workstream-lead
-description: Run a planned workstream end to end as its lead session. Read the bundle's kickoff brief, run each wave with the ws-wave workflow so cheap workers (muse, Grok, GLM) do the work, move task status so the dashboard tracks it, act only on approved production steps, coordinate with other leads, and hand off cleanly. Use when a session is told "you are the WS<n> lead", is given a START-PROMPT, or picks up a workstream mid-flight.
+description: Run a planned workstream end to end as its lead session on any agent harness. Read the bundle's kickoff brief, run each wave of parallel sub-agents to done, move task status so the dashboard tracks it, act only on approved production steps, coordinate with other leads, and hand off cleanly. Use when a session is told "you are the WS<n> lead", is given a START-PROMPT, or picks up a workstream mid-flight.
 ---
 
 # Workstream lead
 
-The lead plans, decides, verifies and reports. Workers do everything else. Related skills: `workstream-planner` builds the bundle; `workstream-dashboard` maintains the tool.
+The lead plans, decides, verifies, and reports. Workers do everything else. Related skills: `workstream-planner` builds the bundle; `workstream-dashboard` maintains the tool. Reporting, labels, verdicts, and pricing: [Plug in any agent](../../tools/agent-dash/docs/integrate.md).
 
 ## Start (or resume)
 
-1. Read `~/.local/share/agent-dash/workstreams/<ID>/KICKOFF.md`, including any addendum, then `approvals.json` and `docs/`.
+1. Read `~/.local/share/agent-dash/workstreams/<ID>/KICKOFF.md` (or `AGENT_DASH_WORKSTREAMS`), including any addendum, then `approvals.json` and `docs/`.
 2. Check reality before acting:
    - `plan.json` statuses;
    - open PRs and `git log origin/main`;
-   - live workers on the dashboard (`/static/index.html?ws=<ID>`).
-
-   A resumed workstream may already be partly done.
+   - live workers on the dashboard.
 3. Message the other leads named in the brief for shared files and the production slot. Messages that change production load need the owner's approval, unless `approvals.json` already grants direct coordination.
 
 ## Each wave
 
-1. Build the lane list from the execution plan. Lanes in one wave share no file or test file. Use `reviewFocus` for lanes that need explicit checks, and `oneWay: true` for irreversible or production-adjacent lanes.
-2. Run the `ws-wave` workflow. Use the Workflow tool with `scriptPath: <abs>/agent-dash/workflows/ws-wave.js`; the args are in the brief. Tiers come from the worker registry: `default` (muse), a named tier, or `auto` for failover by availability.
+1. Build the lane list from the execution plan. Lanes in one wave share no file or test file. Use explicit review checks for lanes that need them, and flag irreversible or production-adjacent lanes.
+2. Run one lane per sub-agent, in parallel. Each lane goes build, then review, then fix and re-review until approved or out of fix rounds.
 3. Read the result:
    - `approved`: assemble trains and merge with the repo's merge tool.
    - `needsLead`: read the last review and decide. Fix, re-scope, or defer with `ws task <ID> <task> deferred --note ...`.
-4. Move status with `python3 ~/.claude/tools/agent-dash/agent_dash.py ws task <ID> <task> <todo|pr|prog|done|deferred>`, as soon as each fact changes. The dashboard and the Plan page read it live.
+4. Move status with `python3 tools/agent-dash/agent_dash.py ws task <ID> <task> <todo|wip|pr|prog|done|deferred>`, as soon as each fact changes. The dashboard and the Plan page read it live.
 5. Start the next wave as soon as its start condition holds. Don't wait on lower wave numbers. A task is ready when every id in its `deps` is done or merged.
-6. When you re-plan (split, merge, move or add a task, or change a wave), update the task `deps` and `wave` in `plan.json` in the same step, then run `ws validate`. Model an outside signal or condition as a `"kind": "gate"` task, and put the condition text in the dependent's `dep_notes` (keyed by the gate's task id).
+6. When you re-plan (split, merge, move or add a task, or change a wave), update the task `deps` and `wave` in `plan.json` in the same step, then run `ws validate`. Model an outside signal as a `"kind": "gate"` task, with the condition in the dependent's `dep_notes`.
+
+### If you are on Claude Code
+
+Run the wave with the `ws-wave` Workflow tool: `scriptPath` is `tools/agent-dash/workflows/ws-wave.js` and the args are in the brief. Tiers come from the worker registry: `default`, a named tier, or `auto` for failover by availability. Each step is a low-effort Haiku wrapper around `scripts/run_worker.sh`. A lane may set `reviewFocus` (checks with evidence) and `oneWay: true` (irreversible lanes, still reviewed). Approved lanes move to `pr` via `ws task`.
 
 ## Production steps
 
@@ -38,7 +40,7 @@ The lead plans, decides, verifies and reports. Workers do everything else. Relat
 ## Labels, logging, tokens
 
 - Run labels are `<id lowercase>-<task-id>-<slug>`, plus `-rev<n>` and `-fix<n>` for reviews and fixes. The dashboard pins each run onto its task chip and counts attempts.
-- Launch workers only through the tool's launchers (`scripts/run_worker.sh`, or `ws-wave`), which log billed tokens and session manifests. Never launch Grok with `--output-format text`.
+- Report every run: `report start`, `report usage`, `report finish --verdict PASS|PARTIAL|BLOCKED`. First line of a worker report is `PASS`, `PARTIAL`, or `BLOCKED`; reviews start with `VERDICT: APPROVE` (or `APPROVE_WITH_NITS`, `APPROVE_WITH_CHANGES`, `REQUEST_CHANGES`).
 
 ## Merging fast: trains and local CI
 
