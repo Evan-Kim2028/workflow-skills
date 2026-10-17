@@ -199,6 +199,17 @@ Light theme by default, dark with `--dark`. It needs Chrome and ffmpeg.
 node tools/agent-dash/scripts/render_replay.mjs --url http://127.0.0.1:8765 --ws WS1 --out <dir> [--dark] [--seconds 15|30] [--fps 15] [--width 1000]
 ```
 
+With `--clip` it records the promo clip composition instead (`&clip=1` on
+the page: title card, caption strip, counters, closing card, map and run
+timeline playing from one playhead): deterministic 30 fps stepping at
+1920x1080 (`--ar 4x5` for the 1080x1350 vertical variant), an H.264 MP4 and
+a 1280 px palette GIF, plus stills across the clip. Both media stay under
+about 20 MB.
+
+```bash
+node tools/agent-dash/scripts/render_replay.mjs --url http://127.0.0.1:8765 --ws WS1 --out <dir> --clip [--ar 16x9|4x5] [--dark] [--seconds 15|30] [--fps 30]
+```
+
 The GIF target is under about 15 MB; the script retries smaller when the
 first pass overshoots. The page's `Replay` button plays the same timeline
 live; `?fixtures&ws=WS1` replays offline from `fixtures/replay-WS1.json`.

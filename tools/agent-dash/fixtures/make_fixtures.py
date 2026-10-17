@@ -45,6 +45,7 @@ RNG = random.Random(SEED)
 
 sys.path.insert(0, str(ROOT))
 from dash import taskmatch  # noqa: E402  (the shared run-to-task rule)
+from dash import replay as replay_mod  # noqa: E402  (shared replay run entries and done moments)
 
 RAW_PLANS = {
     "WS1": {
@@ -645,12 +646,7 @@ def _replay_doc(runs, ws, groups):
         tid = taskmatch.task_of(run.get("label"), ws, {}, ids)
         if tid is None or tid not in per:
             continue
-        per[tid].append({
-            "start": run["started_at"],
-            "end": run["ended_at"],
-            "family": taskmatch.run_family(run),
-            "label": run["label"],
-        })
+        per[tid].append(replay_mod.replay_run_item(run, run["started_at"], run["ended_at"]))
     first_active = {}
     done_at = {}
     observed = set()
@@ -659,9 +655,9 @@ def _replay_doc(runs, ws, groups):
         first_active[tid] = min(starts) if starts else None
         done_at[tid] = None
         if by_id[tid].get("status") == "done":
-            ends = [item["end"] for item in items if item["end"] is not None]
-            if ends:
-                done_at[tid] = max(ends)
+            moment = replay_mod.done_moment(items)
+            if moment is not None:
+                done_at[tid] = moment
                 observed.add(tid)
     seen = [first_active[tid] for tid in by_id if first_active[tid] is not None]
     seen += [done_at[tid] for tid in observed if done_at[tid] is not None]

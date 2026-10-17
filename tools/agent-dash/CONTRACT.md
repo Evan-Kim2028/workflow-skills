@@ -141,7 +141,7 @@ never computes % done itself; it reads `progress.pct`, `progress.done`, and
 
 `GET /api/replay?ws=<ID>` -> one timeline for a sped-up playback of the
 workstream's history:
-`{"ws": "WS1", "span": {"start": 0, "end": 0}, "tasks": {"<id>": {"status": "done", "first_active": 0, "done_at": 0, "inferred": false, "runs": [{"start": 0, "end": 0, "family": "muse", "label": "..."}]}}, "events": [{"t": 0, "kind": "active|done", "task": "<id>"}], "observed": 0, "inferred": 0}`.
+`{"ws": "WS1", "span": {"start": 0, "end": 0}, "tasks": {"<id>": {"status": "done", "first_active": 0, "done_at": 0, "inferred": false, "runs": [{"start": 0, "end": 0, "family": "muse", "label": "...", "verdict": "PASS", "source": "muse", "status": "done", "tokens": 0, "clock": "manifest"}]}}, "events": [{"t": 0, "kind": "active|done", "task": "<id>"}], "observed": 0, "inferred": 0}`.
 `events` is sorted by time (active before done on ties); `active` events
 carry the run's label and model family, `done` events carry `inferred`.
 Run entries carry labels only, never prompts. A missing `ws` is a 400, a
@@ -151,12 +151,22 @@ resolved task map (exact, then `/regex/` case-insensitive), the WS1/WS2/WS7
 built-ins, then plan task-id substring. The page uses the same rule, and a
 test pins them on sample labels. The timeline is built from one store pass
 plus the plan: per task `first_active` is the first mapped run start and
-`done_at` for a done task is the end of its last mapped run. A done task
+`done_at` for a done task is the end of the first passing run (PASS,
+APPROVE, APPROVE_WITH_NITS) after which no implementation run follows,
+else the end of its last mapped run. A done task
 with no mapped run is inferred: the latest done moment of its deps, else
 the plan's earliest observed moment, marked `"inferred": true`. Recorded
 history (`history.jsonl` in the bundle) wins over both when present.
 `observed` counts tasks with an observed done moment, `inferred` counts
 tasks with an inferred one.
+In replay mode the page draws the run timeline card directly under the
+plan progress map from this same span: both cards paint from the one
+`rpCursorTime` playhead (a test pins that), so scrubbing either moves both.
+`&clip=1` frames the two cards as one promo composition (title card,
+caption strip, counters, closing card); `&clip=4x5` is the vertical
+variant. Clip playback compresses idle stretches by cumulative event count
+blended with real time; plain replay stays on real time with an optional
+"Compress idle" toggle.
 
 `GET /api/health` -> `{"ok": true, "sources": [{name, last_poll, last_error, lag_s}], "pricing": {...}}`
 

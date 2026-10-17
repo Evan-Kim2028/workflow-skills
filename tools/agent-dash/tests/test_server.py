@@ -540,6 +540,7 @@ class ReplayTest(unittest.TestCase):
                 "tier": "muse",
                 "label": "ws9-1-first",
                 "status": "done",
+                "verdict": "PASS",
                 "started_at": 1000.0,
                 "ended_at": 1100.0,
             }
@@ -562,6 +563,7 @@ class ReplayTest(unittest.TestCase):
                 "tier": "grok",
                 "label": "ws9-2-x",
                 "status": "done",
+                "verdict": "PASS",
                 "started_at": 1400.0,
                 "ended_at": 1500.0,
             }
@@ -603,7 +605,14 @@ class ReplayTest(unittest.TestCase):
         self.assertEqual([run["label"] for run in one["runs"]], ["ws9-1-first", "ws9-1-second"])
         self.assertEqual({run["family"] for run in one["runs"]}, {"muse"})
         for run in one["runs"]:
-            self.assertEqual(set(run), {"start", "end", "family", "label"})
+            self.assertEqual(
+                set(run),
+                {"start", "end", "family", "label", "verdict", "source", "status", "tokens", "clock"},
+            )
+        self.assertEqual(one["runs"][0]["verdict"], "PASS")
+        self.assertEqual(one["runs"][0]["source"], "muse")
+        self.assertEqual(one["runs"][0]["status"], "done")
+        self.assertIsInstance(one["runs"][0]["tokens"], int)
         two = payload["tasks"]["2"]
         self.assertEqual((two["first_active"], two["done_at"], two["inferred"]), (1400.0, 1500.0, False))
 
@@ -642,6 +651,29 @@ class ReplayTest(unittest.TestCase):
         self.assertEqual(payload["span"]["end"], 9999.0)
         self.assertEqual(payload["observed"], 3)
         self.assertEqual(payload["inferred"], 0)
+
+    def test_done_prefers_first_pass_before_review_only(self):
+        """A passing run followed only by review runs ends the task: the
+        done moment is the PASS end, not the later review end. Task 1 keeps
+        the last end because an implementation run follows its PASS."""
+        self.store.upsert_run(
+            {
+                "run_id": "grok:s5:ws9-2-review",
+                "source": "grok",
+                "tier": "grok",
+                "label": "ws9-2-review round",
+                "status": "done",
+                "verdict": "APPROVE",
+                "started_at": 1550.0,
+                "ended_at": 1600.0,
+            }
+        )
+        payload = self.replay()
+        one = payload["tasks"]["1"]
+        self.assertEqual(one["done_at"], 1300.0)
+        two = payload["tasks"]["2"]
+        self.assertEqual(two["done_at"], 1500.0)
+        self.assertFalse(two["inferred"])
 
     def test_replay_errors(self):
         status, _, body = get(self.port, "/api/replay")

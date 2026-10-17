@@ -13,303 +13,528 @@
       "runs": []
     },
     "WS2.3": {
-      "status": "prog",
+      "status": "done",
       "first_active": 1761996460,
-      "done_at": null,
+      "done_at": 1761998760,
       "inferred": false,
       "runs": [
         {
           "start": 1761996460,
           "end": 1761996560,
           "family": "muse",
-          "label": "ws2-3"
+          "label": "ws2-3",
+          "verdict": null,
+          "source": "muse",
+          "status": "died_early",
+          "tokens": 10525,
+          "clock": "muse_log"
         },
         {
           "start": 1761998160,
           "end": 1761998760,
           "family": "muse",
-          "label": "ws2-3"
+          "label": "ws2-3",
+          "verdict": "REQUEST_CHANGES",
+          "source": "muse",
+          "status": "done",
+          "tokens": 11740,
+          "clock": "muse_log"
         },
         {
           "start": 1761999840,
           "end": null,
           "family": "grok",
-          "label": "ws2-3"
+          "label": "ws2-3",
+          "verdict": null,
+          "source": "grok",
+          "status": "running",
+          "tokens": 6836,
+          "clock": "manifest"
         }
       ]
     },
     "WS2.4": {
-      "status": "todo",
+      "status": "done",
       "first_active": 1761978360,
-      "done_at": null,
+      "done_at": 1761998760,
       "inferred": false,
       "runs": [
         {
           "start": 1761978360,
           "end": 1761978440,
           "family": "haiku",
-          "label": "ws2-4"
+          "label": "ws2-4",
+          "verdict": "BLOCKED",
+          "source": "claude-subagent",
+          "status": "done",
+          "tokens": 10108,
+          "clock": "transcript"
         },
         {
           "start": 1761978560,
           "end": 1761978640,
           "family": "glm",
-          "label": "ws2-4"
+          "label": "ws2-4",
+          "verdict": "REQUEST_CHANGES",
+          "source": "glm",
+          "status": "done",
+          "tokens": 7295,
+          "clock": "manifest"
         },
         {
           "start": 1761978660,
           "end": 1761978740,
           "family": "sonnet",
-          "label": "ws2-4"
+          "label": "ws2-4",
+          "verdict": "BLOCKED",
+          "source": "claude-workflow",
+          "status": "done",
+          "tokens": 11479,
+          "clock": "transcript"
         },
         {
           "start": 1761978860,
           "end": 1761978940,
           "family": "sonnet",
-          "label": "ws2-4"
+          "label": "ws2-4",
+          "verdict": "REQUEST_CHANGES",
+          "source": "claude-subagent",
+          "status": "done",
+          "tokens": 8666,
+          "clock": "transcript"
         },
         {
           "start": 1761978960,
           "end": 1761979960,
           "family": "opus",
-          "label": "ws2-4"
+          "label": "ws2-4",
+          "verdict": "REQUEST_CHANGES",
+          "source": "claude-main",
+          "status": "done",
+          "tokens": 9637,
+          "clock": "transcript"
         },
         {
           "start": 1761978960,
           "end": 1761979040,
           "family": "grok",
-          "label": "ws2-4"
+          "label": "ws2-4",
+          "verdict": "BLOCKED",
+          "source": "grok",
+          "status": "done",
+          "tokens": 4211,
+          "clock": "manifest"
         },
         {
           "start": 1761979260,
           "end": 1761979340,
           "family": "muse",
-          "label": "ws2-4"
+          "label": "ws2-4",
+          "verdict": "BLOCKED",
+          "source": "muse",
+          "status": "done",
+          "tokens": 4881,
+          "clock": "muse_log"
         },
         {
           "start": 1761979460,
           "end": 1761979540,
           "family": "haiku",
-          "label": "ws2-4"
+          "label": "ws2-4",
+          "verdict": "REQUEST_CHANGES",
+          "source": "shell",
+          "status": "done",
+          "tokens": 4542,
+          "clock": "mtime"
         },
         {
           "start": 1761979560,
           "end": 1761979640,
           "family": "haiku",
-          "label": "ws2-4"
+          "label": "ws2-4",
+          "verdict": "BLOCKED",
+          "source": "claude-subagent",
+          "status": "done",
+          "tokens": 10160,
+          "clock": "transcript"
         },
         {
           "start": 1761979760,
           "end": 1761979840,
           "family": "glm",
-          "label": "ws2-4"
+          "label": "ws2-4",
+          "verdict": "REQUEST_CHANGES",
+          "source": "glm",
+          "status": "done",
+          "tokens": 7670,
+          "clock": "manifest"
         },
         {
           "start": 1761979860,
           "end": 1761979940,
           "family": "sonnet",
-          "label": "ws2-4"
+          "label": "ws2-4",
+          "verdict": "BLOCKED",
+          "source": "claude-workflow",
+          "status": "done",
+          "tokens": 4360,
+          "clock": "transcript"
         },
         {
           "start": 1761980060,
           "end": 1761980140,
           "family": "sonnet",
-          "label": "ws2-4"
+          "label": "ws2-4",
+          "verdict": "REQUEST_CHANGES",
+          "source": "claude-subagent",
+          "status": "done",
+          "tokens": 7965,
+          "clock": "transcript"
         },
         {
           "start": 1761980160,
           "end": 1761980240,
           "family": "grok",
-          "label": "ws2-4"
+          "label": "ws2-4",
+          "verdict": "BLOCKED",
+          "source": "grok",
+          "status": "done",
+          "tokens": 12880,
+          "clock": "manifest"
         },
         {
           "start": 1761980460,
           "end": 1761980540,
           "family": "muse",
-          "label": "ws2-4"
+          "label": "ws2-4",
+          "verdict": "BLOCKED",
+          "source": "muse",
+          "status": "done",
+          "tokens": 9035,
+          "clock": "muse_log"
         },
         {
           "start": 1761980660,
           "end": 1761980740,
           "family": "haiku",
-          "label": "ws2-4"
+          "label": "ws2-4",
+          "verdict": "REQUEST_CHANGES",
+          "source": "shell",
+          "status": "done",
+          "tokens": 2741,
+          "clock": "mtime"
         },
         {
           "start": 1761980760,
           "end": 1761980840,
           "family": "haiku",
-          "label": "ws2-4"
+          "label": "ws2-4",
+          "verdict": "BLOCKED",
+          "source": "claude-subagent",
+          "status": "done",
+          "tokens": 10627,
+          "clock": "transcript"
         },
         {
           "start": 1761980960,
           "end": 1761981040,
           "family": "glm",
-          "label": "ws2-4"
+          "label": "ws2-4",
+          "verdict": "REQUEST_CHANGES",
+          "source": "glm",
+          "status": "done",
+          "tokens": 7149,
+          "clock": "manifest"
         },
         {
           "start": 1761981060,
           "end": 1761981140,
           "family": "sonnet",
-          "label": "ws2-4"
+          "label": "ws2-4",
+          "verdict": "BLOCKED",
+          "source": "claude-workflow",
+          "status": "done",
+          "tokens": 9771,
+          "clock": "transcript"
         },
         {
           "start": 1761981260,
           "end": 1761981340,
           "family": "sonnet",
-          "label": "ws2-4"
+          "label": "ws2-4",
+          "verdict": "REQUEST_CHANGES",
+          "source": "claude-subagent",
+          "status": "done",
+          "tokens": 11926,
+          "clock": "transcript"
         },
         {
           "start": 1761981360,
           "end": 1761981440,
           "family": "grok",
-          "label": "ws2-4"
+          "label": "ws2-4",
+          "verdict": "BLOCKED",
+          "source": "grok",
+          "status": "done",
+          "tokens": 2399,
+          "clock": "manifest"
         },
         {
           "start": 1761981660,
           "end": 1761981740,
           "family": "muse",
-          "label": "ws2-4"
+          "label": "ws2-4",
+          "verdict": "BLOCKED",
+          "source": "muse",
+          "status": "done",
+          "tokens": 10000,
+          "clock": "muse_log"
         },
         {
           "start": 1761981860,
           "end": 1761981940,
           "family": "haiku",
-          "label": "ws2-4"
+          "label": "ws2-4",
+          "verdict": "REQUEST_CHANGES",
+          "source": "shell",
+          "status": "done",
+          "tokens": 6857,
+          "clock": "mtime"
         },
         {
           "start": 1761981960,
           "end": 1761982040,
           "family": "haiku",
-          "label": "ws2-4"
+          "label": "ws2-4",
+          "verdict": "BLOCKED",
+          "source": "claude-subagent",
+          "status": "done",
+          "tokens": 3954,
+          "clock": "transcript"
         },
         {
           "start": 1761982160,
           "end": 1761982240,
           "family": "glm",
-          "label": "ws2-4"
+          "label": "ws2-4",
+          "verdict": "REQUEST_CHANGES",
+          "source": "glm",
+          "status": "done",
+          "tokens": 9944,
+          "clock": "manifest"
         },
         {
           "start": 1761982260,
           "end": 1761982340,
           "family": "sonnet",
-          "label": "ws2-4"
+          "label": "ws2-4",
+          "verdict": "BLOCKED",
+          "source": "claude-workflow",
+          "status": "done",
+          "tokens": 6856,
+          "clock": "transcript"
         },
         {
           "start": 1761982460,
           "end": 1761982540,
           "family": "sonnet",
-          "label": "ws2-4"
+          "label": "ws2-4",
+          "verdict": "REQUEST_CHANGES",
+          "source": "claude-subagent",
+          "status": "done",
+          "tokens": 5665,
+          "clock": "transcript"
         },
         {
           "start": 1761982560,
           "end": 1761982640,
           "family": "grok",
-          "label": "ws2-4"
+          "label": "ws2-4",
+          "verdict": "BLOCKED",
+          "source": "grok",
+          "status": "done",
+          "tokens": 8690,
+          "clock": "manifest"
         },
         {
           "start": 1761982860,
           "end": 1761982940,
           "family": "muse",
-          "label": "ws2-4"
+          "label": "ws2-4",
+          "verdict": "BLOCKED",
+          "source": "muse",
+          "status": "done",
+          "tokens": 9841,
+          "clock": "muse_log"
         },
         {
           "start": 1761983060,
           "end": 1761983140,
           "family": "haiku",
-          "label": "ws2-4"
+          "label": "ws2-4",
+          "verdict": "REQUEST_CHANGES",
+          "source": "shell",
+          "status": "done",
+          "tokens": 10374,
+          "clock": "mtime"
         },
         {
           "start": 1761983160,
           "end": 1761983240,
           "family": "haiku",
-          "label": "ws2-4"
+          "label": "ws2-4",
+          "verdict": "BLOCKED",
+          "source": "claude-subagent",
+          "status": "done",
+          "tokens": 2752,
+          "clock": "transcript"
         },
         {
           "start": 1761983360,
           "end": 1761983440,
           "family": "glm",
-          "label": "ws2-4"
+          "label": "ws2-4",
+          "verdict": "REQUEST_CHANGES",
+          "source": "glm",
+          "status": "done",
+          "tokens": 4646,
+          "clock": "manifest"
         },
         {
           "start": 1761983460,
           "end": 1761983540,
           "family": "sonnet",
-          "label": "ws2-4"
+          "label": "ws2-4",
+          "verdict": "BLOCKED",
+          "source": "claude-workflow",
+          "status": "done",
+          "tokens": 8511,
+          "clock": "transcript"
         },
         {
           "start": 1761983660,
           "end": 1761983740,
           "family": "sonnet",
-          "label": "ws2-4"
+          "label": "ws2-4",
+          "verdict": "REQUEST_CHANGES",
+          "source": "claude-subagent",
+          "status": "done",
+          "tokens": 10035,
+          "clock": "transcript"
         },
         {
           "start": 1761996460,
           "end": 1761996560,
           "family": "grok",
-          "label": "ws2-4"
+          "label": "ws2-4",
+          "verdict": null,
+          "source": "grok",
+          "status": "killed",
+          "tokens": 5650,
+          "clock": "manifest"
         },
         {
           "start": 1761998160,
           "end": 1761998760,
           "family": "grok",
-          "label": "ws2-4"
+          "label": "ws2-4",
+          "verdict": "REQUEST_CHANGES",
+          "source": "grok",
+          "status": "done",
+          "tokens": 3940,
+          "clock": "manifest"
         },
         {
           "start": 1761998160,
           "end": 1761998760,
           "family": "grok",
-          "label": "ws2-4"
+          "label": "ws2-4",
+          "verdict": "BLOCKED",
+          "source": "grok",
+          "status": "done",
+          "tokens": 12480,
+          "clock": "manifest"
         },
         {
           "start": 1761998160,
           "end": 1761998760,
           "family": "muse",
-          "label": "ws2-4"
+          "label": "ws2-4",
+          "verdict": "BLOCKED",
+          "source": "muse",
+          "status": "done",
+          "tokens": 12636,
+          "clock": "muse_log"
         },
         {
           "start": 1761998160,
           "end": 1761998760,
           "family": "glm",
-          "label": "ws2-4"
+          "label": "ws2-4",
+          "verdict": "REQUEST_CHANGES",
+          "source": "glm",
+          "status": "done",
+          "tokens": 9907,
+          "clock": "manifest"
         },
         {
           "start": 1761998160,
           "end": 1761998760,
           "family": "glm",
-          "label": "ws2-4"
+          "label": "ws2-4",
+          "verdict": "BLOCKED",
+          "source": "glm",
+          "status": "done",
+          "tokens": 11224,
+          "clock": "manifest"
         },
         {
           "start": 1761998160,
           "end": 1761998760,
           "family": "haiku",
-          "label": "ws2-4"
+          "label": "ws2-4",
+          "verdict": "APPROVE_WITH_CHANGES",
+          "source": "claude-subagent",
+          "status": "done",
+          "tokens": 5008,
+          "clock": "transcript"
         },
         {
           "start": 1761998160,
           "end": 1761998760,
           "family": "haiku",
-          "label": "ws2-4"
+          "label": "ws2-4",
+          "verdict": "PARTIAL",
+          "source": "claude-subagent",
+          "status": "done",
+          "tokens": 7860,
+          "clock": "transcript"
         },
         {
           "start": 1761999840,
           "end": null,
           "family": "muse",
-          "label": "ws2-4"
+          "label": "ws2-4",
+          "verdict": null,
+          "source": "muse",
+          "status": "running",
+          "tokens": 7450,
+          "clock": "muse_log"
         }
       ]
     },
     "WS2.8": {
-      "status": "pr",
+      "status": "done",
       "first_active": null,
-      "done_at": null,
-      "inferred": false,
+      "done_at": 1761978360,
+      "inferred": true,
       "runs": []
     },
     "WS2.9": {
-      "status": "todo",
+      "status": "done",
       "first_active": null,
-      "done_at": null,
-      "inferred": false,
+      "done_at": 1761978360,
+      "inferred": true,
       "runs": []
     }
   },
@@ -326,6 +551,18 @@
       "t": 1761978360,
       "kind": "done",
       "task": "WS2.1",
+      "inferred": true
+    },
+    {
+      "t": 1761978360,
+      "kind": "done",
+      "task": "WS2.8",
+      "inferred": true
+    },
+    {
+      "t": 1761978360,
+      "kind": "done",
+      "task": "WS2.9",
       "inferred": true
     },
     {
@@ -665,6 +902,18 @@
       "end": 1761998760
     },
     {
+      "t": 1761998760,
+      "kind": "done",
+      "task": "WS2.3",
+      "inferred": false
+    },
+    {
+      "t": 1761998760,
+      "kind": "done",
+      "task": "WS2.4",
+      "inferred": false
+    },
+    {
       "t": 1761999840,
       "kind": "active",
       "task": "WS2.3",
@@ -681,7 +930,7 @@
       "end": null
     }
   ],
-  "observed": 0,
-  "inferred": 1,
+  "observed": 2,
+  "inferred": 3,
   "_note": "Seeded synthetic data for the offline preview. Seed 1. No local sessions are read."
 }

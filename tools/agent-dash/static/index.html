@@ -312,6 +312,27 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
 .rp-bar input[type="range"]{flex:1;min-width:140px;accent-color:var(--s1)}
 .rp-tag{font:700 10.5px var(--mono);color:var(--s1);border:1px solid var(--s1);border-radius:4px;padding:1px 6px;margin-left:8px;vertical-align:middle}
 .chip.rp-unblock{box-shadow:0 0 0 2px var(--s1);position:relative;z-index:4}
+.chip.rp-hi{outline:2.5px solid var(--s1);outline-offset:2px}
+.rp-tl-bar{cursor:default}
+.rp-tl-bar.rp-hi{stroke:var(--ink);stroke-width:1.5}
+.rp-cap{display:flex;align-items:baseline;gap:14px;flex-wrap:wrap;margin:0 0 10px;padding:10px 14px;border:1px solid var(--ring);border-radius:10px;background:var(--surface-2)}
+.rp-cap .cap-stage{font-size:15px;color:var(--ink)}
+.rp-cap .cap-n{font-size:12.5px;color:var(--ink-2);font-family:var(--mono);margin-left:auto;text-align:right}
+.clip-title{position:fixed;inset:0;z-index:60;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;background:var(--surface);transition:opacity .3s ease;pointer-events:none;text-align:center;padding:0 8vw}
+.clip-title h1{margin:0;font-size:64px;letter-spacing:-.5px;color:var(--ink)}
+.clip-title p{margin:0;font-size:22px;color:var(--ink-2);max-width:60ch}
+.clip-close{position:fixed;inset:0;z-index:60;display:flex;align-items:center;justify-content:center;transition:opacity .3s ease;pointer-events:none;padding:0 6vw}
+.clip-close .panel{background:var(--surface);border:1px solid var(--ring);border-radius:16px;padding:34px 48px;text-align:center;box-shadow:0 12px 48px rgba(0,0,0,.25)}
+.clip-close .big{margin:0 0 10px;font-size:40px;color:var(--ink)}
+.clip-close .fine{margin:0;font-size:14px;color:var(--muted)}
+body.clip .topbar,body.clip .foot,body.clip .rp-bar,body.clip .drawer,body.clip #sidenav,body.clip #sidenav-hot,body.clip .tip{display:none!important}
+body.clip .wrap{max-width:1880px;padding:10px 20px 8px}
+body.clip-v .wrap{max-width:1060px}
+body.clip .sec{margin-top:8px!important}
+body.clip .card{padding:12px 14px}
+body.clip #exec-progress>.sub,body.clip #exec-progress .alegend,body.clip #exec-progress .trlegend,body.clip #exec-progress .phases,body.clip #exec-timeline>.sub{display:none}
+body.clip #exec-progress .planbtn,body.clip #exec-progress .copybtn,body.clip #exec-progress .arrows-toggle{display:none}
+body.clip #main{zoom:.92}
 .alegend svg{overflow:visible}
 .arrows-toggle{display:inline-flex;align-items:center;gap:6px;font:600 12px var(--font);color:var(--ink-2);margin-left:8px}
 .gchip{font:11px var(--mono);padding:2px 6px;border-radius:5px;border:1.5px dashed var(--muted);color:var(--ink-2)}
@@ -355,6 +376,10 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
   "use strict";
   var Q = new URLSearchParams(location.search);
   var FIX = Q.has("fixtures");
+  /* Clip mode frames the plan progress map and the run timeline as one promo
+     composition: page chrome hides and overlays carry the story. */
+  function isClipMode() { return Q.has("clip"); }
+  function isClipVertical() { var v = (Q.get("clip") || "").toLowerCase(); return v === "4x5" || v === "v" || v === "vertical"; }
   var execCache = {};
   var execGen = 0;
   var state = {view: "exec", ws: "all", hours: 12, snap: null, runs: [], usage: [], conc: [], wss: [], bundles: [], plan: null, seq: -1, groupBy: "model", approvals: []};
@@ -838,6 +863,7 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
   function countUp(node, from, to) {
     if (window.matchMedia && matchMedia("(prefers-reduced-motion: reduce)").matches || from === to) { node.textContent = to + "%"; return; }
     var i = 0, n = 28, h = setInterval(function () { i++; var k = i / n, e = 1 - Math.pow(1 - k, 3); node.textContent = Math.round(from + (to - from) * e) + "%"; if (i >= n) clearInterval(h); }, 25);
+    (window.__adCountUp = window.__adCountUp || []).push(h);
   }
   function niceMax(v) { if (v <= 0) return 1; var p = Math.pow(10, Math.floor(Math.log10(v))); var m = v / p; return (m <= 1 ? 1 : m <= 2 ? 2 : m <= 5 ? 5 : 10) * p; }
 
@@ -1415,7 +1441,7 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
        the replay owns the card; Esc or Live rebuilds the live map. */
     var RP_FAM = {opus: "var(--s1)", haiku: "var(--s2)", sonnet: "var(--s3)", grok: "var(--s4)", muse: "var(--s5)", glm: "var(--s6)", other: "var(--other)"};
     var RP_REDUCED = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
-    var RP = {on: false, playing: false, loading: false, tasks: {}, prevDone: {}, savedCss: {}, elapsed: 0, duration: 15, raf: null};
+    var RP = {on: false, playing: false, loading: false, tasks: {}, prevDone: {}, savedCss: {}, elapsed: 0, duration: 15, raf: null, compress: false, warp: null, tlRuns: [], tl: null, groups: {}, clip: false};
     var replayBtn = el("button", {class: "planbtn", title: "Play this workstream's history as a sped-up animation", text: "Replay"});
     replayBtn.addEventListener("click", function () { startReplay(true); });
     c.firstChild.appendChild(replayBtn);
@@ -1425,32 +1451,70 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
       ids.forEach(function (id) { var t = RP.tasks[id]; if (t && t.status !== "deferred" && t.done_at != null && t.done_at <= T) n++; });
       return n;
     }
-    function rpCursor(frac) { return RP.span.start + frac * (RP.span.end - RP.span.start); }
+    /* ONE playhead time source for the map and the run timeline: both paint
+       from rpCursorTime, so scrubbing either one moves both. In clip mode
+       (and with "Compress idle" on) idle stretches of the real span are
+       warped by cumulative event count blended with real time; the date
+       label still shows the real date at the playhead. */
+    function rpClamp01(frac) { return Math.min(1, Math.max(0, +frac || 0)); }
+    function rpBuildWarp(events, span) {
+      var seen = {}, ts = [];
+      (events || []).forEach(function (e) { if (e.t != null && !seen[e.t]) { seen[e.t] = 1; ts.push(e.t); } });
+      ts.sort(function (a, b) { return a - b; });
+      if (ts.length < 2) return null;
+      var len = Math.max(1, span.end - span.start), blend = 0.75, pts = [];
+      ts.forEach(function (t, i) {
+        pts.push({w: blend * i / (ts.length - 1) + (1 - blend) * (t - span.start) / len, t: t});
+      });
+      return pts;
+    }
+    function rpWarpT(frac) {
+      var pts = RP.warp;
+      if (!pts || !pts.length) return RP.span.start + frac * (RP.span.end - RP.span.start);
+      if (frac <= 0) return pts[0].t;
+      if (frac >= 1) return pts[pts.length - 1].t;
+      var lo = 0, hi = pts.length - 1;
+      while (hi - lo > 1) { var mid = (lo + hi) >> 1; if (pts[mid].w <= frac) lo = mid; else hi = mid; }
+      var a = pts[lo], b = pts[hi], span = Math.max(1e-9, b.w - a.w), k = (frac - a.w) / span;
+      return a.t + k * (b.t - a.t);
+    }
+    function rpCursorTime(frac) {
+      frac = rpClamp01(frac);
+      if (RP.compress && RP.warp) return rpWarpT(frac);
+      return RP.span.start + frac * (RP.span.end - RP.span.start);
+    }
+    /* Runs of one replay task active at T (same stub rule as the live map:
+       a run with no end time counts briefly after its start). */
+    function rpActiveRuns(rt, T) {
+      var out = [];
+      if (!rt || !rt.runs) return out;
+      for (var i = 0; i < rt.runs.length; i++) {
+        var r = rt.runs[i];
+        if (r.start == null || r.start > T) continue;
+        var e = r.end == null ? r.start + RP.spanLen * 0.01 : r.end;
+        if (T <= e) out.push(r);
+      }
+      return out;
+    }
+    function rpIsAgentRun(r) { var src = r.source; return src !== "claude-main" && src !== "shell" && src !== "dagster"; }
     function rpPaint(frac, fire) {
-      var T = rpCursor(frac), now = {};
+      var T = rpCursorTime(frac), now = {};
       Object.keys(RP.tasks).forEach(function (tid) {
         var t = RP.tasks[tid];
         if (t && t.status !== "deferred" && t.done_at != null && t.done_at <= T) now[tid] = 1;
       });
       if (fire) {
-        Object.keys(now).forEach(function (tid) {
-          if (!RP.prevDone[tid]) rpUnblock(tid, T);
-        });
+        var freshIds = Object.keys(now).filter(function (tid) { return !RP.prevDone[tid]; });
+        if (freshIds.length) rpFlash(freshIds, T);
       }
       RP.prevDone = now;
+      rpFlashSweep();
       Object.keys(chipEl).forEach(function (tid) {
         var cp = chipEl[tid], t = RP.tasks[tid];
         if (!cp || !t || t.status === "deferred") return;
         var done = !!now[tid], gate = tKind[tid] === "gate";
-        var active = null;
-        if (!done && !RP_REDUCED) {
-          for (var i = 0; i < t.runs.length; i++) {
-            var r = t.runs[i];
-            if (r.start == null || r.start > T) continue;
-            var e = r.end == null ? r.start + RP.spanLen * 0.01 : r.end;
-            if (T <= e) { active = r; break; }
-          }
-        }
+        var actives = (!done && !RP_REDUCED) ? rpActiveRuns(t, T) : [];
+        var active = actives.length ? actives[0] : null;
         if (done) {
           cp.className = "chip done" + (gate ? " gate" : "");
           cp.style.cssText = RP.savedCss[tid] || "";
@@ -1478,27 +1542,324 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
       RP.txt.appendChild(el("span", {class: "rp-tag", text: "replay"}));
       RP.date.textContent = fmtDate(T);
       RP.scrub.value = String(Math.round(frac * 1000));
+      rpPaintGroups(T);
+      rpPaintTimeline(T);
+      if (RP.clip) rpPaintClip(frac, T);
     }
-    /* Flash the arrows from a just-finished task to the dependents whose
-       deps are all done now, plus a short outline on those chips. */
-    function rpUnblock(tid, T) {
-      var fresh = (tDown[tid] || []).filter(function (dep) {
+    /* Group tiles in replay come from replay state at the playhead, never
+       live state: each tile's pill, count, bar and done/active styling. */
+    function rpGroupEls(gid) {
+      var hit = RP.groups[gid];
+      if (hit) return hit;
+      var node = nodes[gid];
+      if (!node) return null;
+      var minis = node.querySelectorAll(".mini > span");
+      hit = RP.groups[gid] = {
+        node: node,
+        tag: node.querySelector(".gtag"),
+        count: node.querySelector(".m"),
+        mini: [minis[0], minis[1], minis[2]],
+        badge: node.querySelector(".live-n"),
+      };
+      return hit;
+    }
+    function rpPaintGroups(T) {
+      var gDone = {};
+      plan.groups.forEach(function (g) {
+        var tot = 0, n = 0;
+        g.tasks.forEach(function (t) {
+          if (t.status === "deferred" || t.status === "moved") return;
+          var rt = RP.tasks[t.id];
+          if (!rt) return;
+          tot++;
+          if (rt.status !== "deferred" && rt.done_at != null && rt.done_at <= T) n++;
+        });
+        gDone[g.id] = tot > 0 && n === tot;
+      });
+      var colDone = {}, colTot = {}, colNow = {};
+      plan.groups.forEach(function (g) {
+        var els = rpGroupEls(g.id);
+        if (!els) return;
+        var tot = 0, n = 0, wip = 0, liveN = 0, lastAct = -1, started = false;
+        g.tasks.forEach(function (t) {
+          if (t.status === "deferred" || t.status === "moved") return;
+          var rt = RP.tasks[t.id];
+          if (!rt) return;
+          tot++;
+          if (rt.status !== "deferred" && rt.done_at != null && rt.done_at <= T) { n++; started = true; }
+          else {
+            if (rt.first_active != null && rt.first_active <= T) {
+              started = true;
+              if (rt.first_active > lastAct) lastAct = rt.first_active;
+            }
+            var act = RP_REDUCED ? [] : rpActiveRuns(rt, T);
+            if (act.length) { wip++; liveN += act.length; }
+          }
+        });
+        colDone[g.col] = (colDone[g.col] || 0) + n;
+        colTot[g.col] = (colTot[g.col] || 0) + tot;
+        if (liveN > 0 || wip > 0) colNow[g.col] = true;
+        var waitOn = (deps[g.id] || []).filter(function (d) { return !gDone[d]; });
+        var stage, cls, why;
+        if (tot > 0 && n === tot) { stage = "✓ Done"; cls = "done"; why = "Every task is merged and live."; }
+        else if (liveN > 0 || wip > 0) { stage = "▶ Building"; cls = "now"; why = "Agents are building tasks in this stage."; }
+        else if (!waitOn.length) { stage = started ? "Partly done" : "Ready to start"; cls = "ready"; why = started ? "Some tasks are done and nothing is running now." : "Everything it waits on is done."; }
+        else { stage = "Waiting"; cls = "wait"; why = "Waits on " + waitOn.map(function (d) { return (gs[d] && gs[d].title) || d; }).join(", ") + "."; }
+        els.node.classList.remove("s-done", "s-prog", "s-live", "g-done", "g-now", "g-ready");
+        if (tot > 0 && n === tot) els.node.classList.add("s-done", "g-done");
+        else if (liveN > 0 || wip > 0) els.node.classList.add("s-prog", "g-now");
+        else if (n > 0) els.node.classList.add("s-prog");
+        else if (!waitOn.length) els.node.classList.add("g-ready");
+        if (els.tag) { els.tag.className = "gtag " + cls; els.tag.textContent = stage; els.tag.title = why; }
+        if (els.count) {
+          els.count.innerHTML = "";
+          els.count.appendChild(el("b", {text: n + " of " + tot}));
+          els.count.appendChild(document.createTextNode(" done" + (tot - n ? " · " + (tot - n) + " to go" : "")));
+          els.count.title = n + " done, " + wip + " in progress, " + (tot - n - wip) + " not started";
+        }
+        if (els.mini[0]) els.mini[0].style.width = (tot ? 100 * n / tot : 0) + "%";
+        if (els.mini[1]) els.mini[1].style.width = "0%";
+        if (els.mini[2]) els.mini[2].style.width = "0%";
+        if (liveN > 0) {
+          if (!els.badge) {
+            els.badge = el("div", {class: "live-n", text: ""});
+            els.node.insertBefore(els.badge, els.count ? els.count.nextSibling : null);
+            RP.groups[g.id] = els;
+          }
+          els.badge.style.display = "";
+          els.badge.textContent = "● " + liveN + " agent" + (liveN > 1 ? "s" : "") + " working";
+        } else if (els.badge) els.badge.style.display = "none";
+        RP.groupState = RP.groupState || {};
+        RP.groupState[g.id] = {done: tot > 0 && n === tot, started: started, lastAct: lastAct, stage: stage, title: g.title};
+      });
+      (plan.cols || []).forEach(function (name, i) {
+        var dcol = cols[i];
+        if (!dcol) return;
+        var bar = dcol.querySelector(".colbar > i");
+        if (bar) bar.style.width = (colTot[i] ? 100 * (colDone[i] || 0) / colTot[i] : 0) + "%";
+        dcol.classList.toggle("c-now", !!colNow[i]);
+      });
+    }
+    /* The run timeline in replay: one strip of agents at once plus one lane
+       per model family, drawn from the same /api/replay span as the map and
+       painted from the same rpCursorTime playhead. Bars appear as their run
+       starts and grow until it ends; a vertical cursor sweeps the shared
+       time axis. Clicking or dragging the plot scrubs both cards. */
+    function rpOutcomeOf(run) {
+      if (!run.end) return run.status === "running" ? "run" : "unk";
+      if (run.status === "died_early" || run.status === "killed" || run.verdict === "BLOCKED" || run.verdict === "REQUEST_CHANGES" || run.verdict === "FAILURE" || run.verdict === "CANCELED") return "bad";
+      if (run.verdict === "PARTIAL" || run.verdict === "APPROVE_WITH_CHANGES") return "part";
+      if (run.status === "done" || run.verdict === "SUCCESS") return "ok";
+      return "unk";
+    }
+    function rpPackRuns(runs, gapS) {
+      var rows = [];
+      runs.slice().sort(function (x, y) { return x.start - y.start; }).forEach(function (r) {
+        var end = r.end == null ? r.start + 60 : r.end, placed = false;
+        for (var i = 0; i < rows.length; i++) {
+          if (rows[i].end + gapS <= r.start) { rows[i].runs.push(r); rows[i].end = end; placed = true; break; }
+        }
+        if (!placed) rows.push({end: end, runs: [r]});
+      });
+      return rows;
+    }
+    function rpTimelineCard() {
+      var c = el("div", {class: "card", id: "exec-timeline", "data-nav": "Run timeline"}, [el("h2", {text: "Run timeline"}), el("p", {class: "sub", text: "The same playhead as the plan progress map above: bars appear as their run starts and grow until it ends. The strip is how many worker agents ran at each moment. Click or drag to scrub both; hover a bar for the run."})]);
+      var lg = el("div", {class: "legend"});
+      ["run", "ok", "part", "bad"].forEach(function (k) {
+        var o = OUTCOME[k], sp = el("span");
+        var sw = el("i", {class: "sw"}); sw.style.background = o[0]; sp.appendChild(sw);
+        sp.appendChild(document.createTextNode(o[1] + " " + o[2])); lg.appendChild(sp);
+      });
+      c.appendChild(lg);
+      var W = CW(), L = 150, Rm = 14, pw = W - L - Rm, stripH = 28, rowH = 6, rowGap = 2;
+      var t0 = RP.span.start, t1 = RP.span.end;
+      var X = function (t) { return L + pw * (t - t0) / Math.max(1, t1 - t0); };
+      var fams = {};
+      RP.tlRuns.forEach(function (r) { fams[r.family || "other"] = true; });
+      var order = Object.keys(fams).sort();
+      var lanes = order.map(function (f) {
+        var rows = rpPackRuns(RP.tlRuns.filter(function (r) { return (r.family || "other") === f; }), 20);
+        return {fam: f, name: f.charAt(0).toUpperCase() + f.slice(1), rows: rows, h: Math.max(rows.length * (rowH + rowGap), 12) + 4};
+      });
+      var lanesH = lanes.reduce(function (a, l) { return a + l.h; }, 0);
+      var plotB = 12 + stripH + 8 + lanesH, H = plotB + 30;
+      var svg = s("svg", {viewBox: "0 0 " + W + " " + H, width: W, height: H, style: "display:block;max-width:100%", role: "img", "aria-label": "Agent runs over the replay span, one lane per model family"});
+      var defs = s("defs", {}), pat = s("pattern", {id: "rp-hatch", width: 6, height: 6, patternUnits: "userSpaceOnUse", patternTransform: "rotate(45)"});
+      pat.appendChild(s("rect", {width: 6, height: 6, fill: "var(--surface-2)"}));
+      pat.appendChild(s("line", {x1: 0, y1: 0, x2: 0, y2: 6, stroke: "var(--muted)", "stroke-width": 2}));
+      defs.appendChild(pat); svg.appendChild(defs);
+      var ticks = timeTicks(t0, t1, X, 6);
+      ticks.forEach(function (k) { svg.appendChild(s("line", {x1: k.x, x2: k.x, y1: 4, y2: plotB, class: "gl"})); });
+      var step = Math.max(60, Math.round((t1 - t0) / 300)), pts = [], mx = 1, y0 = 12;
+      for (var t = t0; t <= t1; t += step) {
+        var n = 0;
+        RP.tlRuns.forEach(function (r) {
+          if (!rpIsAgentRun(r) || r.start > t) return;
+          var e = r.end == null ? r.start + 60 : r.end;
+          if (e >= t) n++;
+        });
+        pts.push([t, n]); mx = Math.max(mx, n);
+      }
+      var Y = function (v) { return y0 + stripH - (stripH - 4) * v / mx; };
+      svg.appendChild(s("rect", {x: L, y: y0, width: pw, height: stripH, rx: 4, fill: "var(--surface-2)"}));
+      var d = "M" + X(pts[0][0]) + "," + (y0 + stripH);
+      pts.forEach(function (p) { d += " L" + X(p[0]) + "," + Y(p[1]); });
+      d += " L" + X(t1) + "," + (y0 + stripH) + " Z";
+      svg.appendChild(s("path", {d: d, fill: "var(--s1)", "fill-opacity": ".55", stroke: "var(--s1)", "stroke-width": 1.2}));
+      var lab = s("text", {x: 0, y: y0 + stripH / 2 + 4}); lab.textContent = "agents at once"; lab.setAttribute("style", "fill:var(--ink);font:700 12px var(--font)"); svg.appendChild(lab);
+      var cnt = s("text", {x: 0, y: y0 + stripH / 2 + 17, class: "ax"}); cnt.textContent = RP.tlRuns.length + " runs"; svg.appendChild(cnt);
+      [[0, y0 + stripH], [mx, y0 + 4]].forEach(function (p) {
+        svg.appendChild(s("line", {x1: L - 4, x2: L, y1: p[1], y2: p[1], class: "bl"}));
+        var tk = s("text", {x: L - 7, y: p[1] + 3.5, "text-anchor": "end", class: "ax"}); tk.textContent = fmtN(p[0]); svg.appendChild(tk);
+      });
+      var veil = s("rect", {x: L, y: y0, width: pw, height: stripH, fill: "var(--surface)", opacity: ".72"});
+      svg.appendChild(veil);
+      var bars = [], by = y0 + stripH + 8;
+      lanes.forEach(function (lane) {
+        var ml = s("text", {x: 10, y: by + 9}); ml.textContent = lane.name + " · " + lane.rows.reduce(function (a, row) { return a + row.runs.length; }, 0); ml.setAttribute("style", "fill:var(--ink-2);font:600 11.5px var(--font)"); svg.appendChild(ml);
+        var ry = by;
+        lane.rows.forEach(function (row) {
+          row.runs.forEach(function (r) {
+            var bar = s("rect", {y: ry, height: rowH, rx: 2, fill: "var(--s1)", class: "rp-tl-bar"});
+            bar.setAttribute("data-task", r.task);
+            bar.addEventListener("mousemove", function (ev) {
+              var o = OUTCOME[rpOutcomeOf({end: r.end, status: r.status, verdict: r.verdict})] || OUTCOME.run;
+              showTip(ev, r.label || r.task, [{k: "outcome", v: o[1] + " " + (r.verdict || o[2]), c: o[0]}, {k: "model", v: r.family || "other"}, {k: "elapsed", v: r.end ? fmtDur(r.end - r.start) : "end not recorded"}, {k: "task", v: r.task}]);
+              if (chipEl[r.task]) chipEl[r.task].classList.add("rp-hi");
+            });
+            bar.addEventListener("mouseleave", function () { hideTip(); if (chipEl[r.task]) chipEl[r.task].classList.remove("rp-hi"); });
+            svg.appendChild(bar);
+            bars.push({el: bar, run: r});
+          });
+          ry += rowH + rowGap;
+        });
+        by += lane.h;
+      });
+      axes(svg, {L: L, T: 4, pw: pw, ph: plotB - 4, yMax: mx, yTicks: 1, xTicks: ticks, xTitle: "time", yTitle: null});
+      var cursor = s("line", {x1: L, x2: L, y1: 4, y2: plotB, stroke: "var(--s1)", "stroke-width": 1.5});
+      svg.appendChild(cursor);
+      var scrub = s("rect", {x: L, y: 4, width: pw, height: plotB - 4, fill: "transparent"});
+      scrub.style.cursor = "ew-resize";
+      var dragging = false;
+      var toFrac = function (ev) {
+        var bb = svg.getBoundingClientRect(), vb = svg.viewBox.baseVal;
+        var px = (ev.clientX - bb.left) * vb.width / bb.width;
+        return rpClamp01((px - L) / pw);
+      };
+      scrub.addEventListener("mousedown", function (ev) { dragging = true; rpSeek(toFrac(ev)); });
+      scrub.addEventListener("mousemove", function (ev) { if (dragging) rpSeek(toFrac(ev)); });
+      scrub.addEventListener("mouseup", function () { dragging = false; });
+      scrub.addEventListener("mouseleave", function () { dragging = false; });
+      svg.appendChild(scrub);
+      c.appendChild(svg);
+      RP.tl = {card: c, svg: svg, X: X, L: L, pw: pw, cursor: cursor, veil: veil, bars: bars, plotB: plotB};
+      return c;
+    }
+    /* One seek path for the map scrub, the timeline scrub and the render
+       driver: sets the shared playhead and repaints both cards. */
+    function rpSyncPrev(T) {
+      var cur = {};
+      Object.keys(RP.tasks).forEach(function (tid) {
+        var t = RP.tasks[tid];
+        if (t && t.status !== "deferred" && t.done_at != null && t.done_at <= T) cur[tid] = 1;
+      });
+      RP.prevDone = cur;
+    }
+    function rpSeek(frac) {
+      frac = rpClamp01(frac);
+      RP.elapsed = frac * RP.duration;
+      var T = rpCursorTime(frac);
+      rpSyncPrev(T);
+      rpPaint(frac, false);
+      if (RP.elapsed < RP.duration) window.__adReplay.done = false;
+      else window.__adReplay.done = true;
+    }
+    /* Timeline paint reads the same rpCursorTime as the map: bars appear at
+       their run start and grow to the playhead, the veil lifts, the cursor
+       sweeps the shared axis. */
+    function rpPaintTimeline(T) {
+      var tl = RP.tl;
+      if (!tl || !RP.span) return;
+      var x = tl.X(T);
+      tl.cursor.setAttribute("x1", x);
+      tl.cursor.setAttribute("x2", x);
+      tl.veil.setAttribute("x", Math.min(x, tl.L + tl.pw));
+      tl.veil.setAttribute("width", Math.max(0, tl.L + tl.pw - x));
+      tl.bars.forEach(function (b) {
+        var r = b.run;
+        if (r.start == null || r.start > T) { b.el.style.display = "none"; return; }
+        b.el.style.display = "";
+        var end = r.end == null || r.end > T ? T : r.end;
+        var x1 = tl.X(r.start), x2 = tl.X(Math.max(end, r.start));
+        b.el.setAttribute("x", x1);
+        b.el.setAttribute("width", Math.max(2.5, x2 - x1 - 1));
+        var live = r.end == null || r.end > T;
+        var fill = live ? "var(--s1)" : (function () {
+          var o = OUTCOME[rpOutcomeOf(r)];
+          return o ? o[0] : "var(--muted)";
+        })();
+        if (r.clock === "mtime") { b.el.setAttribute("fill", "url(#rp-hatch)"); b.el.setAttribute("stroke", fill); }
+        else { b.el.setAttribute("fill", fill); b.el.setAttribute("stroke", "none"); }
+      });
+    }
+    /* Hovering a map chip highlights its timeline bars; hovering a timeline
+       bar highlights its chip (see the bar listeners above). */
+    function rpLinkHover() {
+      Object.keys(chipEl).forEach(function (tid) {
+        var cp = chipEl[tid];
+        if (!cp) return;
+        cp.addEventListener("mouseenter", function () {
+          if (!RP.tl) return;
+          RP.tl.bars.forEach(function (b) { if (b.run.task === tid) b.el.classList.add("rp-hi"); });
+        });
+        cp.addEventListener("mouseleave", function () {
+          if (!RP.tl) return;
+          RP.tl.bars.forEach(function (b) { if (b.run.task === tid) b.el.classList.remove("rp-hi"); });
+        });
+      });
+    }
+    /* Flash the arrows from just-finished tasks to the dependents whose
+       deps are all done now, plus a short outline on those chips. One
+       capped layer, redrawn per frame and swept when it expires, so dense
+       finishes read as a beat instead of a hairball. */
+    function rpFreshLinks(tid, T) {
+      return (tDown[tid] || []).filter(function (dep) {
         return (tUp[dep] || []).every(function (d) {
           var t = RP.tasks[d];
           return t && t.done_at != null && t.done_at <= T;
         });
+      }).map(function (dep) { return {a: tid, b: dep}; });
+    }
+    function rpFlashClear() {
+      (RP.flashNodes || []).forEach(function (node) { if (node.parentNode === tsvg) tsvg.removeChild(node); });
+      (RP.flashChips || []).forEach(function (tid) { if (chipEl[tid]) chipEl[tid].classList.remove("rp-unblock"); });
+      RP.flashNodes = [];
+      RP.flashChips = [];
+    }
+    function rpFlash(ids, T) {
+      var seen = {}, links = [];
+      ids.reduce(function (all, tid) { return all.concat(rpFreshLinks(tid, T)); }, []).concat(RP.flashLinks || []).forEach(function (link) {
+        var key = link.a + "|" + link.b;
+        if (!seen[key]) { seen[key] = 1; links.push(link); }
       });
-      if (!fresh.length) return;
-      fresh.forEach(function (dep) { if (chipEl[dep]) chipEl[dep].classList.add("rp-unblock"); });
+      RP.flashLinks = links.slice(0, 12);
+      rpFlashClear();
+      var chips = {};
+      RP.flashLinks.forEach(function (link) { chips[link.b] = 1; });
+      RP.flashChips = Object.keys(chips);
+      RP.flashChips.forEach(function (tid) { if (chipEl[tid]) chipEl[tid].classList.add("rp-unblock"); });
+      if (!RP.flashLinks.length) return;
       var before = tsvg.childNodes.length;
       try {
-        drawTaskLinks(fresh.map(function (dep) { return {a: tid, b: dep, cls: "t-down near"}; }));
+        drawTaskLinks(RP.flashLinks.map(function (link) { return {a: link.a, b: link.b, cls: "t-down near"}; }));
       } catch (e) { return; }
-      var added = Array.prototype.slice.call(tsvg.childNodes, before);
-      setTimeout(function () {
-        added.forEach(function (node) { if (node.parentNode === tsvg) tsvg.removeChild(node); });
-        fresh.forEach(function (dep) { if (chipEl[dep]) chipEl[dep].classList.remove("rp-unblock"); });
-      }, 600);
+      RP.flashNodes = Array.prototype.slice.call(tsvg.childNodes, before);
+      /* Clip speed needs a longer beat so the unblock stays readable. */
+      RP.flashUntil = performance.now() + (RP.clip ? 1400 : 600);
+    }
+    function rpFlashSweep() {
+      if ((RP.flashNodes || []).length && performance.now() > (RP.flashUntil || 0)) rpFlashClear();
     }
     function rpTick(ts) {
       if (!RP.on || !RP.playing) return;
@@ -1540,6 +1901,92 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
         replayBtn.textContent = "Replay";
       });
     }
+    /* Title, caption, counters and closing for clip mode: labels and
+       counts only, never prompts, argv or secrets. */
+    function rpWsName() {
+      var hit = null;
+      (state.wss || []).forEach(function (w) { if (w.ws === plan.ws) hit = w; });
+      return (hit && hit.name) || "";
+    }
+    function rpShipLine() {
+      var n = 0;
+      plan.groups.forEach(function (g) {
+        g.tasks.forEach(function (t) { if (t.status !== "deferred" && t.status !== "moved") n++; });
+      });
+      var first = (plan.cols || [])[0] || "", last = (plan.cols || [])[(plan.cols || []).length - 1] || "";
+      var line = n + " tasks across " + plan.groups.length + " stages";
+      if (first && last && first !== last) line += " · " + first + " to " + last;
+      return line;
+    }
+    function rpBuildClip() {
+      var name = rpWsName();
+      var title = el("div", {class: "clip-title"}, [el("h1", {text: plan.ws + (name ? " · " + name : "")}), el("p", {text: rpShipLine()})]);
+      document.body.appendChild(title);
+      RP.clipTitle = title;
+      var capStage = el("span", {class: "cap-stage", text: ""});
+      var capN = el("span", {class: "cap-n", text: ""});
+      var cap = el("div", {class: "rp-cap"}, [capStage, capN]);
+      var capSec = el("section", {class: "sec", "data-sec": "rp-cap"}, [cap]);
+      var sec = c.parentNode;
+      sec.parentNode.insertBefore(capSec, sec);
+      RP.capStage = capStage; RP.capN = capN;
+      var tot = rpTotal(), toks = 0;
+      RP.tlRuns.forEach(function (r) { toks += r.tokens || 0; });
+      var close = el("div", {class: "clip-close", style: "opacity:0;visibility:hidden"}, [
+        el("div", {class: "panel"}, [
+          el("p", {class: "big", text: tot + " tasks · " + fmtN(RP.tlRuns.length) + " agent runs · " + fmtN(toks) + " tokens · " + fmtN(RP.spanLen / 86400) + " days"}),
+          el("p", {class: "fine", text: "timeline reconstructed from agent runs"}),
+        ]),
+      ]);
+      document.body.appendChild(close);
+      RP.clipClose = close;
+      if (!name) {
+        api("/api/workstreams").then(function (j) {
+          (j.workstreams || []).forEach(function (w) {
+            if (w.ws === plan.ws && w.name) title.firstChild.textContent = plan.ws + " · " + w.name;
+          });
+        }).catch(function () {}).then(function () { window.__adReplay.clipReady = true; });
+      } else window.__adReplay.clipReady = true;
+    }
+    function rpPaintClip(frac, T) {
+      if (RP.clipTitle) {
+        var showTitle = frac < 0.1;
+        RP.clipTitle.style.opacity = showTitle ? "1" : "0";
+        RP.clipTitle.style.visibility = showTitle ? "visible" : "hidden";
+      }
+      if (RP.clipClose) {
+        var closingSecs = Math.max(2, RP.duration * 0.13);
+        var showClose = RP.elapsed > RP.duration - closingSecs;
+        RP.clipClose.style.opacity = showClose ? "1" : "0";
+        RP.clipClose.style.visibility = showClose ? "visible" : "hidden";
+      }
+      if (RP.capStage) {
+        var best = null, fallback = null;
+        plan.groups.forEach(function (g) {
+          var st = (RP.groupState || {})[g.id];
+          if (!st) return;
+          if (st.stage === "▶ Building" && (!best || st.lastAct > best.lastAct)) best = {title: g.title, lastAct: st.lastAct, kind: "build"};
+          if (!st.done && st.started && (!fallback || st.lastAct > fallback.lastAct)) fallback = {title: g.title, lastAct: st.lastAct, stage: st.stage};
+        });
+        var label;
+        if (best) label = "Now building · " + best.title;
+        else if (fallback) label = (fallback.stage === "Partly done" ? "Still open · " : fallback.stage === "Ready to start" ? "Ready to start · " : "In progress · ") + fallback.title;
+        else if (rpDoneAt(T) >= rpTotal()) label = "Complete · every stage done";
+        else label = "Starting · " + (((plan.groups || [])[0] || {}).title || "");
+        RP.capStage.textContent = label;
+      }
+      if (RP.capN) {
+        var n = rpDoneAt(T), total = rpTotal(), agents = 0, runs = 0, toks = 0;
+        RP.tlRuns.forEach(function (r) {
+          if (r.start == null || r.start > T) return;
+          runs++;
+          toks += r.tokens || 0;
+          var e = r.end == null ? T : r.end;
+          if (T <= e && rpIsAgentRun(r)) agents++;
+        });
+        RP.capN.textContent = n + " of " + total + " tasks · " + agents + " working · " + fmtN(runs) + " run" + (runs === 1 ? "" : "s") + " · " + fmtN(toks) + " tokens · day " + fmtN((T - RP.span.start) / 86400) + " of " + fmtN(RP.spanLen / 86400);
+      }
+    }
     function enterReplay(data, autoplay) {
       if (!data || !data.tasks || !data.span) {
         window.__adReplay = {ready: true, done: true, empty: true, ws: plan.ws};
@@ -1550,25 +1997,44 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
       RP.tasks = data.tasks;
       RP.span = data.span;
       RP.spanLen = Math.max(1, data.span.end - data.span.start);
+      RP.clip = isClipMode();
+      RP.compress = RP.clip;
+      RP.warp = rpBuildWarp(data.events, data.span);
+      RP.tlRuns = [];
+      Object.keys(data.tasks).forEach(function (tid) {
+        var t = data.tasks[tid];
+        (t.runs || []).forEach(function (r) {
+          if (r.start == null) return;
+          RP.tlRuns.push({task: tid, start: r.start, end: r.end, verdict: r.verdict || null, status: r.status || null, source: r.source || null, label: r.label, family: r.family, tokens: r.tokens || 0, clock: r.clock || null});
+        });
+      });
+      RP.tlRuns.sort(function (a, b) { return a.start - b.start; });
       RP.duration = 15;
       RP.elapsed = 0;
       RP.prevDone = {};
       RP.savedCss = {};
+      RP.groups = {};
+      RP.groupState = {};
+      RP.tl = null;
       window.__adReplayOn = true;
-      window.__adReplay = {ready: true, done: false, ws: plan.ws};
+      window.__adReplay = {ready: true, done: false, ws: plan.ws, clip: RP.clip, clipReady: !RP.clip};
       Object.keys(chipEl).forEach(function (tid) {
         var extra = chipEl[tid].querySelectorAll(".ag");
         Array.prototype.forEach.call(extra, function (node) { node.parentNode.removeChild(node); });
         RP.savedCss[tid] = chipEl[tid].style.cssText;
         chipEl[tid].classList.remove("live", "just", "changed");
       });
+      /* Live snapshot rows would lie during a historical playback. */
+      Array.prototype.forEach.call(c.querySelectorAll(".working-now,.unassigned"), function (node) { node.style.display = "none"; });
+      /* The live count-up animation would fight the replay percent. */
+      (window.__adCountUp || []).forEach(function (h) { clearInterval(h); });
       try { clearTask(true); } catch (e) {}
       if (arrowMode === "all") { try { drawAllTaskEdges(); } catch (e) {} }
       var bar = el("div", {class: "rp-bar", role: "group", "aria-label": "Replay controls"});
       RP.playBtn = el("button", {text: "Pause", title: "Play or pause the replay"});
       RP.playBtn.addEventListener("click", function () { rpSetPlaying(!RP.playing); });
       var restart = el("button", {text: "Restart", title: "Restart the replay"});
-      restart.addEventListener("click", function () { RP.elapsed = 0; RP.prevDone = {}; rpPaint(0, false); rpSetPlaying(true); });
+      restart.addEventListener("click", function () { rpSeek(0); rpSetPlaying(true); });
       var seg = el("span", {class: "seg-ctl", title: "Replay length"});
       var b15 = el("button", {text: "15 s", title: "Play the whole history in about 15 seconds"});
       var b30 = el("button", {text: "30 s", title: "Play the whole history in about 30 seconds"});
@@ -1580,31 +2046,62 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
       b30.addEventListener("click", function () { var f = RP.elapsed / RP.duration; RP.duration = 30; RP.elapsed = f * 30; paintSpeed(); });
       paintSpeed();
       seg.appendChild(b15); seg.appendChild(b30);
+      var cmp = el("button", {text: "Compress idle", title: "Compress idle stretches so motion stays steady"});
+      function paintCmp() { cmp.setAttribute("aria-pressed", String(RP.compress)); }
+      cmp.addEventListener("click", function () { RP.compress = !RP.compress; paintCmp(); rpSeek(RP.elapsed / RP.duration); });
+      paintCmp();
+      var clipBtn = el("button", {text: "Clip view", title: "Open the promo clip composition"});
+      clipBtn.addEventListener("click", function () {
+        var u = new URL(location.href);
+        u.searchParams.set("view", "exec");
+        u.searchParams.set("ws", plan.ws);
+        u.searchParams.set("replay", "1");
+        u.searchParams.set("autoplay", "1");
+        u.searchParams.set("clip", "1");
+        location.href = u.pathname + u.search + u.hash;
+      });
       RP.scrub = document.createElement("input");
       RP.scrub.type = "range"; RP.scrub.min = "0"; RP.scrub.max = "1000"; RP.scrub.value = "0";
       RP.scrub.setAttribute("aria-label", "Replay position");
-      RP.scrub.addEventListener("input", function () {
-        RP.elapsed = (Number(RP.scrub.value) / 1000) * RP.duration;
-        rpPaint(Number(RP.scrub.value) / 1000, false);
-        var T = rpCursor(Number(RP.scrub.value) / 1000), cur = {};
-        Object.keys(RP.tasks).forEach(function (tid) {
-          var t = RP.tasks[tid];
-          if (t && t.status !== "deferred" && t.done_at != null && t.done_at <= T) cur[tid] = 1;
-        });
-        RP.prevDone = cur;
-        if (RP.elapsed < RP.duration) window.__adReplay.done = false;
-      });
+      RP.scrub.addEventListener("input", function () { rpSeek(Number(RP.scrub.value) / 1000); });
       RP.date = el("span", {class: "rp-date", text: ""});
       var live = el("button", {text: "Live", title: "Return to the live map"});
       live.addEventListener("click", function () { exitReplay(false); });
-      bar.appendChild(RP.playBtn); bar.appendChild(restart); bar.appendChild(seg);
+      bar.appendChild(RP.playBtn); bar.appendChild(restart); bar.appendChild(seg); bar.appendChild(cmp); bar.appendChild(clipBtn);
       bar.appendChild(RP.scrub); bar.appendChild(RP.date); bar.appendChild(live);
       RP.bar = bar;
       c.insertBefore(bar, c.children[1]);
+      var sec = c.parentNode;
+      var tlSec = el("section", {class: "sec", "data-sec": "rp-timeline", id: "x-rp-timeline", style: "margin-top:14px"}, [rpTimelineCard()]);
+      sec.parentNode.insertBefore(tlSec, sec.nextSibling);
+      RP.tlSec = tlSec;
+      rpLinkHover();
+      if (RP.clip) rpBuildClip();
       RP.txt = ob.parentNode.querySelector(".pbig-txt");
       rpPaint(0, false);
       rpSetPlaying(autoplay !== false);
       window.__adReplayExit = function (silent) { exitReplay(!!silent); };
+      window.__adReplay.seek = function (frac) { rpSeek(frac); return rpClamp01(frac); };
+      /* The render driver steps through this: like a live playback, newly
+         finished tasks flash their unblock arrows (they clear on their own). */
+      window.__adReplay.seekFire = function (frac) {
+        frac = rpClamp01(frac);
+        rpSetPlaying(false);
+        RP.elapsed = frac * RP.duration;
+        rpPaint(frac, true);
+        if (RP.elapsed < RP.duration) window.__adReplay.done = false;
+        else window.__adReplay.done = true;
+        return frac;
+      };
+      window.__adReplay.setDuration = function (s) {
+        var f = rpClamp01(RP.elapsed / RP.duration);
+        RP.duration = s === 30 ? 30 : 15;
+        RP.elapsed = f * RP.duration;
+        paintSpeed();
+        rpPaint(f, false);
+        return RP.duration;
+      };
+      window.__adReplay.frac = function () { return rpClamp01(RP.elapsed / RP.duration); };
     }
     function exitReplay(silent) {
       if (!RP.on && !window.__adReplayOn) return;
@@ -1613,6 +2110,12 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
       if (RP.raf) { cancelAnimationFrame(RP.raf); RP.raf = null; }
       window.__adReplayOn = false;
       window.__adReplayExit = null;
+      RP.tl = null;
+      RP.clip = false;
+      if (RP.clipTitle && RP.clipTitle.parentNode) RP.clipTitle.parentNode.removeChild(RP.clipTitle);
+      if (RP.clipClose && RP.clipClose.parentNode) RP.clipClose.parentNode.removeChild(RP.clipClose);
+      RP.clipTitle = null; RP.clipClose = null; RP.capStage = null; RP.capN = null;
+      document.body.classList.remove("clip", "clip-v");
       delete secCache.plan;
       if (!silent) {
         drawMain();
@@ -1683,7 +2186,7 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
   }
   setInterval(function () { if (state.view === "exec" && !window.__adReplayOn) drawMain(); }, 60000);
   var resizeT = null;
-  window.addEventListener("resize", function () { clearTimeout(resizeT); resizeT = setTimeout(function () { if (state.view === "exec") drawMain(); else if (window.__adPlanDraw) window.__adPlanDraw(); }, 150); });
+  window.addEventListener("resize", function () { clearTimeout(resizeT); resizeT = setTimeout(function () { if (window.__adReplayOn) return; if (state.view === "exec") drawMain(); else if (window.__adPlanDraw) window.__adPlanDraw(); }, 150); });
   /* Keyed sections: a section is rebuilt only when its data key changes, and unchanged nodes are never moved, so animations and hover state survive live updates. */
   var secCache = {};
   function keyOf(v) { try { return JSON.stringify(v); } catch (e) { return String(Math.random()); } }
@@ -1708,6 +2211,13 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
     specs.push(["conc", keyOf([state.conc, state.hours, Math.floor(Date.now() / 60000)]), function () { return concChart(snap); }, "margin-top:14px"]);
     specs.push(["gantt", keyOf([(state.runs || []).map(runRow), expanded, state.hours, Math.floor(Date.now() / 60000)]), function () { return gantt(); }, "margin-top:14px"]);
     specs.push(["finished", keyOf((snap.recent || []).map(runRow)), function () { return runsTable("Finished in the last hour", "Newest first.", snap.recent || [], "Nothing finished in the last hour."); }, "margin-top:14px"]);
+    /* Clip mode shows only the plan progress map; the replay adds the run
+       timeline card under it, plus caption and counter strips. */
+    if (isClipMode()) {
+      document.body.classList.add("clip");
+      if (isClipVertical()) document.body.classList.add("clip-v");
+      specs = specs.filter(function (sp) { return sp[0] === "plan"; });
+    }
     var want = [];
     specs.forEach(function (sp) {
       var hit = secCache[sp[0]];

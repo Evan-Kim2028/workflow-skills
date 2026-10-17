@@ -298,6 +298,37 @@ class PageRules(unittest.TestCase):
             self.assertEqual(exec_hit, expected, f"index.html taskOf drifts on {label!r}")
             self.assertEqual(plan_hit, expected, f"plan.js taskOf drifts on {label!r}")
 
+    def test_replay_and_timeline_share_one_playhead(self):
+        """The plan progress map and the run timeline play back together:
+        both paint from the one rpCursorTime playhead, and the one rpSeek
+        path moves them both."""
+        script = inline_scripts()
+
+        def body(name):
+            start = script.index(f"function {name}(")
+            brace = script.index("{", start)
+            depth = 0
+            for pos in range(brace, len(script)):
+                if script[pos] == "{":
+                    depth += 1
+                elif script[pos] == "}":
+                    depth -= 1
+                    if depth == 0:
+                        return script[start : pos + 1]
+            raise AssertionError(f"{name} body never closes")
+
+        self.assertEqual(
+            len(re.findall(r"function rpCursorTime\(", script)),
+            1,
+            "the playhead time source must be defined exactly once",
+        )
+        paint, seek, card = body("rpPaint"), body("rpSeek"), body("rpTimelineCard")
+        self.assertIn("rpCursorTime(", paint, "the map no longer reads the shared playhead")
+        self.assertIn("rpCursorTime(", seek, "seek no longer reads the shared playhead")
+        self.assertIn("rpPaint(", seek, "seek no longer repaints both cards")
+        self.assertIn("rpPaintTimeline(", paint, "the map paint no longer advances the timeline")
+        self.assertIn("rpSeek(", card, "the timeline scrub no longer moves the shared playhead")
+
     def test_unknown_duration_is_a_dash(self):
         script = (
             "const fs=require('fs');"

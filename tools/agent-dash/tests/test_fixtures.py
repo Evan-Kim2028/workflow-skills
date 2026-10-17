@@ -376,7 +376,10 @@ class FixtureShapeTests(unittest.TestCase):
             for tid, task in replay["tasks"].items():
                 self.assertEqual(set(task), {"status", "first_active", "done_at", "inferred", "runs"})
                 for run in task["runs"]:
-                    self.assertEqual(set(run), {"start", "end", "family", "label"})
+                    self.assertEqual(
+                        set(run),
+                        {"start", "end", "family", "label", "verdict", "source", "status", "tokens", "clock"},
+                    )
                     self.assertIn(run["family"], {"opus", "sonnet", "haiku", "muse", "glm", "grok", "other"})
 
     def test_reconcile_fixture(self):

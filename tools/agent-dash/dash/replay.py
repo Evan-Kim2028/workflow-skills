@@ -7,7 +7,9 @@ come from three sources, best first:
 
 1. recorded history (``history.jsonl`` in the bundle, written by
    ``ws task`` from now on),
-2. observed runs mapped by the shared rule in ``dash.taskmatch``,
+2. observed runs mapped by the shared rule in ``dash.taskmatch``: the
+   end of the first passing run (PASS, APPROVE, APPROVE_WITH_NITS)
+   after which no implementation run follows, else the last run end,
 3. inference for done tasks with no mapped run: the latest done moment
    of their dependencies, else the plan's earliest observed moment.
 
@@ -17,12 +19,86 @@ A task whose done moment was not observed carries ``"inferred": true``.
 from __future__ import annotations
 
 import json
+import re
 import time
 
 from dash import taskmatch
 from dash.bundles import bundle_dir, resolve_plan
 
 REPLAY_LIMIT = 5000
+
+#: A run with one of these verdicts built or approved the task (mirrors the
+#: page, which treats the same verdicts as a finished review or build).
+PASSING_VERDICTS = frozenset({"PASS", "APPROVE", "APPROVE_WITH_NITS"})
+
+_REVIEW_LABEL = re.compile(r"(^|[-_ ])(rev|review)", re.IGNORECASE)
+_REVIEW_VERDICT = re.compile(r"^(APPROVE|REQUEST_CHANGES)")
+
+_TOKEN_FIELDS = ("input", "output", "cache_read", "cache_write", "reasoning")
+
+
+def is_review_run(label: str | None, verdict: str | None) -> bool:
+    """A review run, not an implementation run: the label says rev/review
+    or the verdict opens a review round. Mirrors the page's attribution."""
+    if label and _REVIEW_LABEL.search(label):
+        return True
+    return bool(verdict) and bool(_REVIEW_VERDICT.match(verdict))
+
+
+def tokens_total(tokens) -> int:
+    """Compact token count for one run's token dict (mirrors tokTotal plus
+    reasoning, the same sum the cache guard bills)."""
+    if not isinstance(tokens, dict):
+        return 0
+    total = 0
+    for key in _TOKEN_FIELDS:
+        try:
+            total += int(tokens.get(key) or 0)
+        except (TypeError, ValueError):
+            continue
+    return max(0, total)
+
+
+def replay_run_item(run: dict, start: float | None, end: float | None) -> dict:
+    """The labels-only run entry the replay timeline draws: times, model
+    family, label, outcome, source, status, token count and clock. Never
+    prompts, argv or env."""
+    tokens = run.get("tokens")
+    return {
+        "start": start,
+        "end": end,
+        "family": taskmatch.run_family(run),
+        "label": run.get("label") or run.get("run_id"),
+        "verdict": run.get("verdict"),
+        "source": run.get("source"),
+        "status": run.get("status"),
+        "tokens": tokens_total(tokens),
+        "clock": run.get("clock_source"),
+    }
+
+
+def done_moment(items: list[dict]) -> float | None:
+    """When a done task finished: the end of the first run with a passing
+    verdict (PASS, APPROVE, APPROVE_WITH_NITS) after which no implementation
+    run follows, so late review or fix rounds do not push the moment out.
+    Falls back to the end of the last mapped run."""
+    ends = [item["end"] for item in items if item["end"] is not None]
+    if not ends:
+        return None
+    ordered = sorted(
+        (item for item in items if item["end"] is not None),
+        key=lambda item: item["end"],
+    )
+    for pos, item in enumerate(ordered):
+        if item.get("verdict") not in PASSING_VERDICTS:
+            continue
+        later = ordered[pos + 1 :]
+        if not any(
+            not is_review_run(next_item.get("label"), next_item.get("verdict"))
+            for next_item in later
+        ):
+            return item["end"]
+    return max(ends)
 
 
 class ReplayNotFound(Exception):
@@ -143,14 +219,7 @@ def build_replay(store, ws: str, now: float | None = None) -> dict:
             end = None if end is None else float(end)
         except (TypeError, ValueError):
             end = None
-        per_task[tid].append(
-            {
-                "start": start,
-                "end": end,
-                "family": taskmatch.run_family(run),
-                "label": run.get("label") or run.get("run_id"),
-            }
-        )
+        per_task[tid].append(replay_run_item(run, start, end))
 
     first_active: dict[str, float | None] = {}
     done_at: dict[str, float | None] = {}
@@ -160,9 +229,9 @@ def build_replay(store, ws: str, now: float | None = None) -> dict:
         first_active[tid] = min(starts) if starts else None
         done_at[tid] = None
         if by_id[tid].get("status") == "done":
-            ends = [item["end"] for item in items if item["end"] is not None]
-            if ends:
-                done_at[tid] = max(ends)
+            moment_done = done_moment(items)
+            if moment_done is not None:
+                done_at[tid] = moment_done
                 observed_done.add(tid)
 
     history = read_history(ws)

@@ -22,13 +22,23 @@
           "start": 1761995960,
           "end": null,
           "family": "muse",
-          "label": "ws7-landing"
+          "label": "ws7-landing",
+          "verdict": null,
+          "source": "muse",
+          "status": "running",
+          "tokens": 8816,
+          "clock": "muse_log"
         },
         {
           "start": 1761998160,
           "end": 1761998760,
           "family": "muse",
-          "label": "ws7-landing"
+          "label": "ws7-landing",
+          "verdict": "APPROVE",
+          "source": "muse",
+          "status": "done",
+          "tokens": 4958,
+          "clock": "muse_log"
         }
       ]
     },
@@ -42,241 +52,441 @@
           "start": 1761978460,
           "end": 1761978540,
           "family": "sonnet",
-          "label": "ws7-notes"
+          "label": "ws7-notes",
+          "verdict": "APPROVE",
+          "source": "claude-subagent",
+          "status": "done",
+          "tokens": 3549,
+          "clock": "transcript"
         },
         {
           "start": 1761978560,
           "end": 1761978640,
           "family": "grok",
-          "label": "ws7-notes"
+          "label": "ws7-notes",
+          "verdict": "PASS",
+          "source": "grok",
+          "status": "done",
+          "tokens": 9361,
+          "clock": "manifest"
         },
         {
           "start": 1761978860,
           "end": 1761978940,
           "family": "muse",
-          "label": "ws7-notes"
+          "label": "ws7-notes",
+          "verdict": "PASS",
+          "source": "muse",
+          "status": "done",
+          "tokens": 3777,
+          "clock": "muse_log"
         },
         {
           "start": 1761978960,
           "end": 1761979960,
           "family": "opus",
-          "label": "ws7-notes"
+          "label": "ws7-notes",
+          "verdict": "PASS",
+          "source": "claude-main",
+          "status": "done",
+          "tokens": 7935,
+          "clock": "transcript"
         },
         {
           "start": 1761979060,
           "end": 1761979140,
           "family": "haiku",
-          "label": "ws7-notes"
+          "label": "ws7-notes",
+          "verdict": "APPROVE",
+          "source": "shell",
+          "status": "done",
+          "tokens": 10210,
+          "clock": "mtime"
         },
         {
           "start": 1761979160,
           "end": 1761979240,
           "family": "haiku",
-          "label": "ws7-notes"
+          "label": "ws7-notes",
+          "verdict": "PASS",
+          "source": "claude-subagent",
+          "status": "done",
+          "tokens": 3891,
+          "clock": "transcript"
         },
         {
           "start": 1761979360,
           "end": 1761979440,
           "family": "glm",
-          "label": "ws7-notes"
+          "label": "ws7-notes",
+          "verdict": "APPROVE",
+          "source": "glm",
+          "status": "done",
+          "tokens": 11696,
+          "clock": "manifest"
         },
         {
           "start": 1761979460,
           "end": 1761979540,
           "family": "sonnet",
-          "label": "ws7-notes"
+          "label": "ws7-notes",
+          "verdict": "PASS",
+          "source": "claude-workflow",
+          "status": "done",
+          "tokens": 9837,
+          "clock": "transcript"
         },
         {
           "start": 1761979660,
           "end": 1761979740,
           "family": "sonnet",
-          "label": "ws7-notes"
+          "label": "ws7-notes",
+          "verdict": "APPROVE",
+          "source": "claude-subagent",
+          "status": "done",
+          "tokens": 10996,
+          "clock": "transcript"
         },
         {
           "start": 1761979760,
           "end": 1761979840,
           "family": "grok",
-          "label": "ws7-notes"
+          "label": "ws7-notes",
+          "verdict": "PASS",
+          "source": "grok",
+          "status": "done",
+          "tokens": 10674,
+          "clock": "manifest"
         },
         {
           "start": 1761980060,
           "end": 1761980140,
           "family": "muse",
-          "label": "ws7-notes"
+          "label": "ws7-notes",
+          "verdict": "PASS",
+          "source": "muse",
+          "status": "done",
+          "tokens": 2547,
+          "clock": "muse_log"
         },
         {
           "start": 1761980260,
           "end": 1761980340,
           "family": "haiku",
-          "label": "ws7-notes"
+          "label": "ws7-notes",
+          "verdict": "APPROVE",
+          "source": "shell",
+          "status": "done",
+          "tokens": 10491,
+          "clock": "mtime"
         },
         {
           "start": 1761980360,
           "end": 1761980440,
           "family": "haiku",
-          "label": "ws7-notes"
+          "label": "ws7-notes",
+          "verdict": "PASS",
+          "source": "claude-subagent",
+          "status": "done",
+          "tokens": 11988,
+          "clock": "transcript"
         },
         {
           "start": 1761980560,
           "end": 1761980640,
           "family": "glm",
-          "label": "ws7-notes"
+          "label": "ws7-notes",
+          "verdict": "APPROVE",
+          "source": "glm",
+          "status": "done",
+          "tokens": 3923,
+          "clock": "manifest"
         },
         {
           "start": 1761980660,
           "end": 1761980740,
           "family": "sonnet",
-          "label": "ws7-notes"
+          "label": "ws7-notes",
+          "verdict": "PASS",
+          "source": "claude-workflow",
+          "status": "done",
+          "tokens": 11192,
+          "clock": "transcript"
         },
         {
           "start": 1761980860,
           "end": 1761980940,
           "family": "sonnet",
-          "label": "ws7-notes"
+          "label": "ws7-notes",
+          "verdict": "APPROVE",
+          "source": "claude-subagent",
+          "status": "done",
+          "tokens": 9192,
+          "clock": "transcript"
         },
         {
           "start": 1761980960,
           "end": 1761981040,
           "family": "grok",
-          "label": "ws7-notes"
+          "label": "ws7-notes",
+          "verdict": "PASS",
+          "source": "grok",
+          "status": "done",
+          "tokens": 2379,
+          "clock": "manifest"
         },
         {
           "start": 1761981260,
           "end": 1761981340,
           "family": "muse",
-          "label": "ws7-notes"
+          "label": "ws7-notes",
+          "verdict": "PASS",
+          "source": "muse",
+          "status": "done",
+          "tokens": 6960,
+          "clock": "muse_log"
         },
         {
           "start": 1761981460,
           "end": 1761981540,
           "family": "haiku",
-          "label": "ws7-notes"
+          "label": "ws7-notes",
+          "verdict": "APPROVE",
+          "source": "shell",
+          "status": "done",
+          "tokens": 6653,
+          "clock": "mtime"
         },
         {
           "start": 1761981560,
           "end": 1761981640,
           "family": "haiku",
-          "label": "ws7-notes"
+          "label": "ws7-notes",
+          "verdict": "PASS",
+          "source": "claude-subagent",
+          "status": "done",
+          "tokens": 6484,
+          "clock": "transcript"
         },
         {
           "start": 1761981760,
           "end": 1761981840,
           "family": "glm",
-          "label": "ws7-notes"
+          "label": "ws7-notes",
+          "verdict": "APPROVE",
+          "source": "glm",
+          "status": "done",
+          "tokens": 8370,
+          "clock": "manifest"
         },
         {
           "start": 1761981860,
           "end": 1761981940,
           "family": "sonnet",
-          "label": "ws7-notes"
+          "label": "ws7-notes",
+          "verdict": "PASS",
+          "source": "claude-workflow",
+          "status": "done",
+          "tokens": 2274,
+          "clock": "transcript"
         },
         {
           "start": 1761982060,
           "end": 1761982140,
           "family": "sonnet",
-          "label": "ws7-notes"
+          "label": "ws7-notes",
+          "verdict": "APPROVE",
+          "source": "claude-subagent",
+          "status": "done",
+          "tokens": 4411,
+          "clock": "transcript"
         },
         {
           "start": 1761982160,
           "end": 1761982240,
           "family": "grok",
-          "label": "ws7-notes"
+          "label": "ws7-notes",
+          "verdict": "PASS",
+          "source": "grok",
+          "status": "done",
+          "tokens": 8963,
+          "clock": "manifest"
         },
         {
           "start": 1761982460,
           "end": 1761982540,
           "family": "muse",
-          "label": "ws7-notes"
+          "label": "ws7-notes",
+          "verdict": "PASS",
+          "source": "muse",
+          "status": "done",
+          "tokens": 5992,
+          "clock": "muse_log"
         },
         {
           "start": 1761982660,
           "end": 1761982740,
           "family": "haiku",
-          "label": "ws7-notes"
+          "label": "ws7-notes",
+          "verdict": "APPROVE",
+          "source": "shell",
+          "status": "done",
+          "tokens": 10188,
+          "clock": "mtime"
         },
         {
           "start": 1761982760,
           "end": 1761982840,
           "family": "haiku",
-          "label": "ws7-notes"
+          "label": "ws7-notes",
+          "verdict": "PASS",
+          "source": "claude-subagent",
+          "status": "done",
+          "tokens": 8964,
+          "clock": "transcript"
         },
         {
           "start": 1761982960,
           "end": 1761983040,
           "family": "glm",
-          "label": "ws7-notes"
+          "label": "ws7-notes",
+          "verdict": "APPROVE",
+          "source": "glm",
+          "status": "done",
+          "tokens": 8174,
+          "clock": "manifest"
         },
         {
           "start": 1761983060,
           "end": 1761983140,
           "family": "sonnet",
-          "label": "ws7-notes"
+          "label": "ws7-notes",
+          "verdict": "PASS",
+          "source": "claude-workflow",
+          "status": "done",
+          "tokens": 3660,
+          "clock": "transcript"
         },
         {
           "start": 1761983260,
           "end": 1761983340,
           "family": "sonnet",
-          "label": "ws7-notes"
+          "label": "ws7-notes",
+          "verdict": "APPROVE",
+          "source": "claude-subagent",
+          "status": "done",
+          "tokens": 7278,
+          "clock": "transcript"
         },
         {
           "start": 1761983360,
           "end": 1761983440,
           "family": "grok",
-          "label": "ws7-notes"
+          "label": "ws7-notes",
+          "verdict": "PASS",
+          "source": "grok",
+          "status": "done",
+          "tokens": 7549,
+          "clock": "manifest"
         },
         {
           "start": 1761996460,
           "end": 1761996560,
           "family": "muse",
-          "label": "ws7-notes"
+          "label": "ws7-notes",
+          "verdict": null,
+          "source": "muse",
+          "status": "killed",
+          "tokens": 8192,
+          "clock": "muse_log"
         },
         {
           "start": 1761996460,
           "end": 1761996560,
           "family": "grok",
-          "label": "ws7-notes"
+          "label": "ws7-notes",
+          "verdict": null,
+          "source": "grok",
+          "status": "unknown",
+          "tokens": 10420,
+          "clock": "manifest"
         },
         {
           "start": 1761998160,
           "end": 1761998760,
           "family": "grok",
-          "label": "ws7-notes"
+          "label": "ws7-notes",
+          "verdict": "PASS",
+          "source": "grok",
+          "status": "done",
+          "tokens": 9897,
+          "clock": "manifest"
         },
         {
           "start": 1761998160,
           "end": 1761998760,
           "family": "grok",
-          "label": "ws7-notes"
+          "label": "ws7-notes",
+          "verdict": "APPROVE",
+          "source": "grok",
+          "status": "done",
+          "tokens": 8416,
+          "clock": "manifest"
         },
         {
           "start": 1761998160,
           "end": 1761998760,
           "family": "muse",
-          "label": "ws7-notes"
+          "label": "ws7-notes",
+          "verdict": "PASS",
+          "source": "muse",
+          "status": "done",
+          "tokens": 6248,
+          "clock": "muse_log"
         },
         {
           "start": 1761998160,
           "end": 1761998760,
           "family": "glm",
-          "label": "ws7-notes"
+          "label": "ws7-notes",
+          "verdict": "PASS",
+          "source": "glm",
+          "status": "done",
+          "tokens": 9413,
+          "clock": "manifest"
         },
         {
           "start": 1761998160,
           "end": 1761998760,
           "family": "haiku",
-          "label": "ws7-notes"
+          "label": "ws7-notes",
+          "verdict": "REQUEST_CHANGES",
+          "source": "claude-subagent",
+          "status": "done",
+          "tokens": 7862,
+          "clock": "transcript"
         },
         {
           "start": 1761999840,
           "end": null,
           "family": "glm",
-          "label": "ws7-notes"
+          "label": "ws7-notes",
+          "verdict": null,
+          "source": "glm",
+          "status": "running",
+          "tokens": 9294,
+          "clock": "manifest"
         },
         {
           "start": 1761999840,
           "end": null,
           "family": "grok",
-          "label": "ws7-notes"
+          "label": "ws7-notes",
+          "verdict": null,
+          "source": "grok",
+          "status": "running",
+          "tokens": 4667,
+          "clock": "manifest"
         }
       ]
     },

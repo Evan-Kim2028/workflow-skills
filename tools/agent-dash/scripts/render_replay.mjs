@@ -9,9 +9,20 @@
  * a palette GIF about 1000 px wide. Light theme by default, dark with
  * --dark. Also saves three still PNGs (start, middle, end).
  *
+ * With --clip it records the promo clip composition instead (&clip=1 on
+ * the page): title card, caption strip, counters, closing card, and the
+ * map plus run timeline playing from one playhead. Frames are stepped
+ * deterministically through window.__adReplay.seek at --fps (default 30),
+ * so the capture is jitter-free. Viewport is 1920x1080, or 1080x1350
+ * with --ar 4x5. Writes an H.264 MP4 plus (16x9 light only) a 1280 px
+ * palette GIF, and stills at 0, 1.5, 5 and 10 s plus the last frame.
+ *
  * usage: node scripts/render_replay.mjs --url http://127.0.0.1:8765 \
  *   --ws WS1 --out <dir> [--dark] [--seconds 15|30] [--fps 15] \
  *   [--width 1000] [--chrome PATH] [--ffmpeg PATH]
+ * usage (clip): node scripts/render_replay.mjs --url URL --ws WS1 \
+ *   --out <dir> --clip [--ar 16x9|4x5] [--dark] [--seconds 15|30] \
+ *   [--fps 30] [--chrome PATH] [--ffmpeg PATH]
  */
 import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
@@ -24,8 +35,8 @@ const READY_TIMEOUT_MS = 45000;
 function args(argv) {
   const out = {
     url: "http://127.0.0.1:8765", ws: "WS1", out: null, dark: false,
-    seconds: 15, fps: 15, width: 1000, chrome: null,
-    ffmpeg: "/opt/homebrew/bin/ffmpeg",
+    seconds: 15, fps: null, width: 1000, chrome: null,
+    ffmpeg: "/opt/homebrew/bin/ffmpeg", clip: false, ar: "16x9",
   };
   for (let i = 0; i < argv.length; i++) {
     const flag = argv[i];
@@ -33,6 +44,8 @@ function args(argv) {
     else if (flag === "--ws" && argv[i + 1]) out.ws = argv[++i];
     else if (flag === "--out" && argv[i + 1]) out.out = argv[++i];
     else if (flag === "--dark") out.dark = true;
+    else if (flag === "--clip") out.clip = true;
+    else if (flag === "--ar" && argv[i + 1]) out.ar = argv[++i];
     else if (flag === "--seconds" && argv[i + 1]) out.seconds = Number(argv[++i]);
     else if (flag === "--fps" && argv[i + 1]) out.fps = Number(argv[++i]);
     else if (flag === "--width" && argv[i + 1]) out.width = Number(argv[++i]);
@@ -40,6 +53,7 @@ function args(argv) {
     else if (flag === "--ffmpeg" && argv[i + 1]) out.ffmpeg = argv[++i];
     else if (flag === "-h" || flag === "--help") {
       console.log("usage: render_replay.mjs --url URL --ws WS --out DIR [--dark] [--seconds 15|30] [--fps N] [--width PX] [--chrome PATH] [--ffmpeg PATH]");
+      console.log("       render_replay.mjs --url URL --ws WS --out DIR --clip [--ar 16x9|4x5] [--dark] [--seconds 15|30] [--fps N] [--chrome PATH] [--ffmpeg PATH]");
       process.exit(0);
     } else {
       console.error(`unknown flag ${flag}`);
@@ -54,6 +68,11 @@ function args(argv) {
     console.error("render_replay: --seconds must be 15 or 30");
     process.exit(1);
   }
+  if (out.clip && out.ar !== "16x9" && out.ar !== "4x5") {
+    console.error("render_replay: --ar must be 16x9 or 4x5");
+    process.exit(1);
+  }
+  if (out.fps == null) out.fps = out.clip ? 30 : 15;
   return out;
 }
 
@@ -192,9 +211,149 @@ function ffmpegRun(ffmpeg, argv) {
   if (proc.status !== 0) throw new Error(`ffmpeg failed: ${(proc.stderr || "").slice(-2000)}`);
 }
 
+/* Clip render: deterministic stepping through the promo composition.
+ *
+ * Opens view=exec with replay+autoplay+clip, sets the playback length,
+ * then seeks frame by frame (firing unblock highlights like a live
+ * playback) and screenshots each step at exactly --fps. Encodes an H.264
+ * MP4 (crf 18, yuv420p) and, for the 16x9 light clip, a 1280 px palette
+ * GIF at a lower frame rate. Copies stills at 0, 1.5, 5 and 10 s plus
+ * the last frame.
+ */
+async function renderClip(opts, chrome) {
+  const vertical = opts.ar === "4x5";
+  const vw = vertical ? 1080 : 1920, vh = vertical ? 1350 : 1080;
+  const framesDir = fs.mkdtempSync(path.join(os.tmpdir(), "dash-clip-frames-"));
+  const port = await freePort();
+  const profile = fs.mkdtempSync(path.join(os.tmpdir(), "dash-clip-profile-"));
+  const base = opts.ws.toLowerCase().replace(/[^a-z0-9]+/g, "-")
+    + "-clip-" + (vertical ? "4x5" : "16x9") + (opts.dark ? "-dark" : "");
+  const mp4Path = path.join(opts.out, `${base}.mp4`);
+  const gifPath = path.join(opts.out, `${base}.gif`);
+  const wantGif = !vertical && !opts.dark;
+
+  const child = spawn(chrome, [
+    "--headless", "--no-sandbox", "--disable-gpu", "--no-first-run",
+    "--disable-extensions", "--hide-scrollbars",
+    `--user-data-dir=${profile}`, `--remote-debugging-port=${port}`, "about:blank",
+  ], { stdio: ["ignore", "ignore", "pipe"] });
+
+  let cdp = null;
+  const finish = (code) => {
+    try { if (cdp) cdp.close(); } catch { /* ignore */ }
+    try { child.kill(); } catch { /* ignore */ }
+    try { fs.rmSync(profile, { recursive: true, force: true }); } catch { /* ignore */ }
+    process.exit(code);
+  };
+  process.on("SIGINT", () => finish(1));
+
+  try {
+    await waitForJson(`http://127.0.0.1:${port}/json/version`, 20000);
+    const created = await (await fetch(`http://127.0.0.1:${port}/json/new?about:blank`, { method: "PUT" })).json();
+    cdp = await connectDebugger(created.webSocketDebuggerUrl);
+    await cdp.send("Page.enable");
+    await cdp.send("Runtime.enable");
+    await cdp.send("Emulation.setDeviceMetricsOverride", {
+      width: vw, height: vh, deviceScaleFactor: 1, mobile: false,
+    });
+
+    const clipFlag = vertical ? "4x5" : "1";
+    const pageUrl = `${opts.url}/?view=exec&ws=${encodeURIComponent(opts.ws)}&replay=1&autoplay=1&clip=${clipFlag}${opts.dark ? "&theme=dark" : "&theme=light"}`;
+    await cdp.send("Page.navigate", { url: pageUrl });
+    await waitFor(cdp, "!!(window.__adReplay && window.__adReplay.ready && window.__adReplay.clipReady)", READY_TIMEOUT_MS, "clip replay data");
+    await evaluate(cdp, `window.__adReplay.setDuration(${opts.seconds})`);
+
+    const total = opts.fps * opts.seconds;
+    for (let i = 0; i < total; i++) {
+      const frac = total === 1 ? 1 : i / (total - 1);
+      await evaluate(cdp, `window.__adReplay.seekFire(${frac})`);
+      await new Promise((r) => setTimeout(r, 60));
+      const shot = await cdp.send("Page.captureScreenshot", { format: "png" });
+      fs.writeFileSync(path.join(framesDir, `frame-${String(i).padStart(4, "0")}.png`), Buffer.from(shot.data, "base64"));
+      if ((i + 1) % 90 === 0) console.log(`render_replay: clip frame ${i + 1}/${total}`);
+    }
+
+    for (const [at, name] of [[0, "t0"], [1.5, "t1-5"], [5, "t5"], [10, "t10"], [opts.seconds - 1 / opts.fps, "tend"]]) {
+      const idx = Math.min(total - 1, Math.max(0, Math.round(at * opts.fps)));
+      fs.copyFileSync(
+        path.join(framesDir, `frame-${String(idx).padStart(4, "0")}.png`),
+        path.join(opts.out, `${base}-still-${name}.png`),
+      );
+    }
+
+    ffmpegRun(opts.ffmpeg, [
+      "-y", "-framerate", String(opts.fps), "-i", path.join(framesDir, "frame-%04d.png"),
+      "-c:v", "libx264", "-preset", "slow", "-crf", "18", "-pix_fmt", "yuv420p",
+      "-movflags", "+faststart", mp4Path,
+    ]);
+
+    let gifBytes = 0;
+    if (wantGif) {
+      const gifFps = opts.fps > 15 ? 10 : opts.fps;
+      const step = Math.max(1, Math.round(opts.fps / gifFps));
+      const gifDir = fs.mkdtempSync(path.join(os.tmpdir(), "dash-clip-gif-"));
+      try {
+        let g = 0;
+        for (let i = 0; i < total; i += step) {
+          fs.copyFileSync(
+            path.join(framesDir, `frame-${String(i).padStart(4, "0")}.png`),
+            path.join(gifDir, `g-${String(g++).padStart(4, "0")}.png`),
+          );
+        }
+        const gifScale = `fps=${gifFps},scale=1280:-1:flags=lanczos,split[s0][s1];[s0]palettegen=max_colors=256[p];[s1][p]paletteuse`;
+        ffmpegRun(opts.ffmpeg, [
+          "-y", "-framerate", String(gifFps), "-i", path.join(gifDir, "g-%04d.png"),
+          "-vf", gifScale, gifPath,
+        ]);
+        gifBytes = fs.statSync(gifPath).size;
+        if (gifBytes > 20 * 1024 * 1024) {
+          ffmpegRun(opts.ffmpeg, [
+            "-y", "-framerate", String(gifFps), "-i", path.join(gifDir, "g-%04d.png"),
+            "-vf", `fps=8,scale=960:-1:flags=lanczos,split[s0][s1];[s0]palettegen=max_colors=256[p];[s1][p]paletteuse`,
+            gifPath,
+          ]);
+          gifBytes = fs.statSync(gifPath).size;
+        }
+      } finally {
+        try { fs.rmSync(gifDir, { recursive: true, force: true }); } catch { /* keep the out dir */ }
+      }
+    }
+
+    const mp4Bytes = fs.statSync(mp4Path).size;
+    console.log(JSON.stringify({
+      ws: opts.ws, clip: true, ar: opts.ar, dark: opts.dark, frames: total, fps: opts.fps,
+      seconds: opts.seconds, viewport: `${vw}x${vh}`,
+      mp4: mp4Path, mp4_bytes: mp4Bytes,
+      gif: wantGif ? gifPath : null, gif_bytes: gifBytes,
+      stills: [0, 1.5, 5, 10, "end"].map((_, i) => path.join(opts.out, `${base}-still-${["t0", "t1-5", "t5", "t10", "tend"][i]}.png`)),
+    }, null, 2));
+    if (mp4Bytes > 20 * 1024 * 1024) {
+      console.error(`render_replay: warning: mp4 is ${(mp4Bytes / 1048576).toFixed(1)} MB, over the ~20 MB target`);
+    }
+    if (wantGif && gifBytes > 20 * 1024 * 1024) {
+      console.error(`render_replay: warning: gif is ${(gifBytes / 1048576).toFixed(1)} MB, over the ~20 MB target`);
+    }
+    finish(0);
+  } catch (err) {
+    console.error(`render_replay: ${err && err.message ? err.message : err}`);
+    finish(1);
+  } finally {
+    try { fs.rmSync(framesDir, { recursive: true, force: true }); } catch { /* keep the out dir */ }
+  }
+}
+
 async function main() {
   const opts = args(process.argv.slice(2));
   const chrome = findChrome(opts.chrome);
+  if (opts.clip) {
+    if (!fs.existsSync(opts.ffmpeg)) {
+      console.error(`render_replay: ffmpeg not found at ${opts.ffmpeg} (pass --ffmpeg PATH)`);
+      process.exit(1);
+    }
+    fs.mkdirSync(opts.out, { recursive: true });
+    await renderClip(opts, chrome);
+    return;
+  }
   if (!fs.existsSync(opts.ffmpeg)) {
     console.error(`render_replay: ffmpeg not found at ${opts.ffmpeg} (pass --ffmpeg PATH)`);
     process.exit(1);
