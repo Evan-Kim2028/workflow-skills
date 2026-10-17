@@ -1495,6 +1495,56 @@ class StaleRunningTest(unittest.TestCase):
         report = self.store.reconcile_numbers(now, now - 3600, now)
         self.assertTrue(any(run_id in item for item in report["mismatches"]))
 
+    def test_idle_lead_alive_pid_is_not_a_mismatch(self):
+        """An alive-but-idle lead is intended state: hidden, not a mismatch."""
+        now = self.now
+        run_id = "claude-main:lead:main"
+        self.store.upsert_run(
+            {
+                "run_id": run_id,
+                "source": "claude-main",
+                "tier": "opus",
+                "label": "ws1-lead",
+                "session_id": "lead",
+                "status": "running",
+                "pid": os.getpid(),
+                "started_at": now - 7 * 3600,
+            }
+        )
+        alive = lambda pid: True  # noqa: E731
+        self.assertEqual(self.store.stale_running(now, pid_alive_fn=alive), [])
+        snap = self.store.snapshot(now, "all")
+        self.assertEqual(snap["running"], [])
+        self.assertEqual(snap["counts"]["live_agents"], 0)
+        report = self.store.reconcile_numbers(now, now - 3600, now)
+        self.assertFalse(any(run_id in item for item in report["mismatches"]))
+        dead = self.store.stale_running(now, pid_alive_fn=lambda pid: False)
+        self.assertEqual([run["run_id"] for run, _reason in dead], [run_id])
+        self.assertIn("dead pid", dead[0][1])
+        reconcile_running(self.store, now, processes=[])
+        self.assertEqual(self.store.get_run(run_id)["status"], "running")
+        self.store.add_usage(
+            {
+                "ts": now,
+                "session_id": "lead",
+                "run_id": run_id,
+                "model": "claude-opus-5-5",
+                "tool": "claude",
+                "message_id": "m-again",
+                "input": 10,
+                "output": 5,
+                "cache_read": 0,
+                "cache_write": 0,
+                "reasoning": 0,
+            }
+        )
+        self.assertEqual(self.store.stale_running(now, pid_alive_fn=alive), [])
+        snap = self.store.snapshot(now, "all")
+        self.assertEqual([run["run_id"] for run in snap["running"]], [run_id])
+        self.assertEqual(snap["counts"]["live_agents"], 0)
+        report = self.store.reconcile_numbers(now, now - 3600, now)
+        self.assertFalse(any(run_id in item for item in report["mismatches"]))
+
 
 if __name__ == "__main__":
     unittest.main()

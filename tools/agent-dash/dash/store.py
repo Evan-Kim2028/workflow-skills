@@ -450,7 +450,10 @@ class Store:
         active set; or no source evidence (usage, process sample, start) for
         longer than STALE_IDLE_S. Dagster rows are stale only when the active
         set is fresh and not a full page; a failed or full-page poll reports
-        nothing. Returns a list of ``(run, reason)``.
+        nothing. An alive-but-idle lead session (``claude-main`` with a live
+        pid, quiet for longer than STALE_IDLE_S) is an intended state, not
+        stale: it is hidden from views but never reported here and never
+        closed. Returns a list of ``(run, reason)``.
         """
         with self._lock:
             rows = [
@@ -486,6 +489,8 @@ class Store:
         sample_max = self._sample_max_locked(open_rows)
         stale = []
         for row in open_rows:
+            if _is_idle_lead(row, now, usage_max, sample_max, check):
+                continue
             reason = self._stale_reason_locked(
                 row, now, dag_ids, dag_fresh, usage_max, sample_max, check
             )
@@ -493,22 +498,51 @@ class Store:
                 stale.append((dict(row), reason))
         return stale
 
+    def _idle_locked(self, now: float, rows: list, pid_alive_fn=None) -> list:
+        """Alive-but-idle lead sessions. Caller holds the lock.
+
+        A ``claude-main`` row with a live pid and no source evidence for
+        longer than STALE_IDLE_S is an intended interactive state: the lead
+        is still attached but has written nothing. It stays out of every
+        view like a stale row, but it is never a mismatch and it is never
+        closed, so a later transcript write returns it to Running now.
+        """
+        now = float(now)
+        check = pid_alive_fn or _pid_alive
+        open_rows = [
+            row for row in rows if (row.get("status") in ("running", "queued"))
+        ]
+        if not open_rows:
+            return []
+        usage_max = self._usage_max_locked([row["run_id"] for row in open_rows])
+        sample_max = self._sample_max_locked(open_rows)
+        return [
+            dict(row)
+            for row in open_rows
+            if _is_idle_lead(row, now, usage_max, sample_max, check)
+        ]
+
     def _live_open_ids_locked(self, now: float, rows: list, pid_alive_fn=None) -> set:
         """Run ids of open rows with liveness evidence. Caller holds the lock.
 
         This is the one filtered running set every view uses: the snapshot
         running list, ``counts.live_agents``, ``/api/workstreams``
         ``live_agents``, and the timeline's open bars all derive from it, so
-        no view can show a run another hides.
+        no view can show a run another hides. Idle leads are excluded here
+        too, so they stay out of Running now exactly as before.
         """
         stale_ids = {
             run["run_id"] for run, _reason in self._stale_locked(now, rows, pid_alive_fn)
+        }
+        idle_ids = {
+            row["run_id"] for row in self._idle_locked(now, rows, pid_alive_fn)
         }
         return {
             row["run_id"]
             for row in rows
             if row.get("status") in ("running", "queued")
             and row.get("run_id") not in stale_ids
+            and row.get("run_id") not in idle_ids
         }
 
     def _stale_reason_locked(
@@ -1799,6 +1833,49 @@ def _run_overlaps_window(run: dict, since: float, until: float, now: float) -> b
     if (run.get("ended_at") if run.get("ended_at") is not None else now) < since:
         return False
     return (run.get("started_at") or 0) <= until
+
+
+def _is_idle_lead(run: dict, now: float, usage_max: dict, sample_max: dict, check) -> bool:
+    """True for an alive-but-idle interactive lead session.
+
+    A ``claude-main`` row whose pid is still alive but whose newest source
+    evidence (start, usage, process sample) is older than STALE_IDLE_S is
+    an intended state: the lead is attached but has written nothing. It is
+    hidden from views like a stale row, but it is never a mismatch and it
+    is never closed. A dead pid is not idle (it stays a stale ``dead pid``
+    mismatch); a row with no pid or no evidence at all is not idle either,
+    so both are still reported exactly as before.
+    """
+    if (run.get("source") or "") != "claude-main":
+        return False
+    if run.get("status") not in ("running", "queued"):
+        return False
+    pid = run.get("pid")
+    if pid is None:
+        return False
+    try:
+        alive = bool(check(pid))
+    except Exception:
+        alive = False
+    if not alive:
+        return False
+    run_id = run.get("run_id")
+    stamps = []
+    started = run.get("started_at")
+    if isinstance(started, (int, float)) and not isinstance(started, bool):
+        stamps.append(float(started))
+    hit = usage_max.get(run_id)
+    if hit is not None:
+        stamps.append(float(hit))
+    hit = sample_max.get(run_id)
+    if hit is not None:
+        stamps.append(float(hit))
+    hit = sample_max.get(f"pid:{pid}")
+    if hit is not None:
+        stamps.append(float(hit))
+    if not stamps:
+        return False
+    return now - max(stamps) > STALE_IDLE_S
 
 
 def _scope_numbers(
