@@ -400,5 +400,73 @@ class PromptFileTests(unittest.TestCase):
         self.assertEqual(store.get_run(labeled)["pid"], 28553)
 
 
+class RunWorkerLabelTests(unittest.TestCase):
+    def test_argv_label_is_extracted(self):
+        self.assertEqual(
+            process.run_worker_label_from_args(
+                "4321 python3 /opt/tools/agent-dash/scripts/run_worker.py default ws8-WS8.1-budget /ws /tmp/x.md /runs 540"
+            ),
+            "ws8-WS8.1-budget",
+        )
+
+    def test_first_token_is_the_tier_not_the_label(self):
+        self.assertEqual(
+            process.run_worker_label_from_args("4321 run_worker.py auto my-label"),
+            "my-label",
+        )
+
+    def test_no_run_worker_in_argv_is_none(self):
+        self.assertIsNone(process.run_worker_label_from_args("4321 grok -p hello -m glm-5.3"))
+        self.assertIsNone(process.run_worker_label_from_args("4321 vim run_worker.py"))
+        self.assertIsNone(process.run_worker_label_from_args(""))
+
+    def test_bad_labels_are_rejected(self):
+        self.assertIsNone(process.run_worker_label_from_args("1 run_worker.py default ../evil"))
+        self.assertIsNone(process.run_worker_label_from_args("1 run_worker.py default"))
+        self.assertIsNone(
+            process.run_worker_label_from_args("1 /x/run_worker.py.bak default lbl")
+        )
+
+    def test_worker_listing_covers_bracket_labels_on_any_comm(self):
+        saved = (
+            process.live_agent_processes,
+            process._ps,
+            process._tokens_by_pid,
+            process._run_worker_labels,
+        )
+        process.live_agent_processes = lambda now=None: [
+            {"pid": 11, "comm": "grok", "started_at": 1.0, "label": "ws9-a",
+             "prompt_label": None, "session_id": None}
+        ]
+        process._ps = lambda: [
+            {"pid": 11, "comm": "grok", "elapsed_s": 5.0},
+            {"pid": 22, "comm": "sleep", "elapsed_s": 5.0},
+            {"pid": 33, "comm": "python3", "elapsed_s": 5.0},
+        ]
+        process._tokens_by_pid = lambda: {
+            22: {"label": "dash-proof-worker", "session_id": None, "prompt_label": None},
+        }
+        process._run_worker_labels = lambda: {33: "ws9-runner"}
+        try:
+            rows = process.live_worker_processes(1000.0)
+        finally:
+            (
+                process.live_agent_processes,
+                process._ps,
+                process._tokens_by_pid,
+                process._run_worker_labels,
+            ) = saved
+        by_pid = {row["pid"]: row for row in rows}
+        self.assertEqual(by_pid[11]["label"], "ws9-a")
+        self.assertEqual(by_pid[22]["label"], "dash-proof-worker")
+        self.assertEqual(by_pid[22]["comm"], "sleep")
+        self.assertEqual(by_pid[33]["label"], "ws9-runner")
+        for row in rows:
+            self.assertEqual(
+                set(row),
+                {"pid", "comm", "started_at", "label", "prompt_label", "session_id"},
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

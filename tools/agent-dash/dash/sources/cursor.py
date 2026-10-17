@@ -1298,6 +1298,8 @@ def _manifest_dirs(root, filename, only):
 
     Lists ``<root>/<encoded-cwd>/<session>/`` and, when ``root`` is already
     the encoded-cwd directory, a uuid child that holds ``scratchpad/<filename>``.
+    A manifest nested one level under the scratchpad (a lead child folder
+    such as ``runs/<tsv>``) is listed too, with the session as its parent.
     """
     if not root or not os.path.isdir(root):
         return
@@ -1318,11 +1320,28 @@ def _manifest_dirs(root, filename, only):
     def emit_session(sess_dir, sess_name):
         if not _is_uuid(sess_name) or (only is not None and sess_name != only):
             return
-        tsv = os.path.join(sess_dir, "scratchpad", filename)
+        pad_dir = os.path.join(sess_dir, "scratchpad")
+        tsv = os.path.join(pad_dir, filename)
         if os.path.isfile(tsv):
             item = emit(os.path.dirname(tsv))
             if item:
                 yield item
+        try:
+            children = os.scandir(pad_dir)
+        except OSError:
+            return
+        with children:
+            for child in children:
+                try:
+                    if not child.is_dir(follow_symlinks=False):
+                        continue
+                except OSError:
+                    continue
+                nested = os.path.join(child.path, filename)
+                if os.path.isfile(nested):
+                    item = emit(child.path)
+                    if item:
+                        yield (item[0], sess_name)
 
     direct = os.path.join(root, filename)
     if os.path.isfile(direct):
@@ -1461,9 +1480,9 @@ def _home(cfg):
 
 
 def _scratch_roots(cfg):
-    from dash.locate import scratch_roots
+    from dash.rundirs import scan_roots
 
-    return scratch_roots(cfg)
+    return scan_roots(cfg)
 
 
 def _tmp_root(cfg):

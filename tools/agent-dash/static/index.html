@@ -912,7 +912,7 @@ body.clip #main{zoom:.92}
   var expanded = {};
   /* A run with no end time is drawn to now only while it is running; an ended run whose end was never seen gets a one-minute stub. */
   /* Lead sessions, shell rows, and Dagster jobs show as bars but are not counted as agents. */
-  function isAgent(r) { return r.source !== "claude-main" && r.source !== "shell" && r.source !== "dagster"; }
+  function isAgent(r) { return r.source !== "claude-main" && r.source !== "shell" && r.source !== "dagster" && !r.lane_shadow; }
   function runEnd(r, now) { return r.ended_at || (r.status === "running" ? now : (r.started_at || now) + 60); }
   function packRows(runs, gapS) {
     var rows = [];

@@ -32,6 +32,15 @@ class StoreTest(unittest.TestCase):
         self.store.close()
         self.tmp.cleanup()
 
+    def test_sample_run_index_exists(self):
+        names = {
+            row[0]
+            for row in self.store._conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='index'"
+            ).fetchall()
+        }
+        self.assertIn("idx_samples_run", names)
+
     def test_wal_and_offsets(self):
         mode = self.store._conn.execute("PRAGMA journal_mode").fetchone()[0]
         self.assertEqual(str(mode).lower(), "wal")
@@ -1560,6 +1569,160 @@ class StaleRunningTest(unittest.TestCase):
         self.assertEqual(snap["counts"]["live_agents"], 0)
         report = self.store.reconcile_numbers(now, now - 3600, now)
         self.assertFalse(any(run_id in item for item in report["mismatches"]))
+
+
+class LaneAndUnseenTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.store = memory(Path(self.tmp.name))
+
+    def tearDown(self):
+        self.store.close()
+        self.tmp.cleanup()
+
+    def _lane(self, now, worker=True):
+        self.store.upsert_run(
+            {
+                "run_id": "claude-workflow:lead:wf_1/build",
+                "source": "claude-workflow",
+                "tier": "haiku",
+                "label": "ws9-WS9.1-build",
+                "session_id": "lead",
+                "status": "running",
+                "started_at": now - 100,
+            }
+        )
+        if worker:
+            self.store.upsert_run(
+                {
+                    "run_id": "glm:sid1:ws9-WS9.1-build",
+                    "source": "glm",
+                    "tier": "glm",
+                    "model": "glm-5.3",
+                    "label": "ws9-WS9.1-build",
+                    "session_id": "sid1",
+                    "status": "running",
+                    "started_at": now - 90,
+                }
+            )
+
+    def test_wrapper_and_live_worker_count_once(self):
+        now = time.time()
+        self._lane(now)
+        snap = self.store.snapshot(now, "all")
+        self.assertEqual(snap["counts"]["live_agents"], 1)
+        self.assertEqual(snap["counts"]["live_by_tool"]["glm"], 1)
+        self.assertEqual(snap["counts"]["live_by_tool"]["claude"], 0)
+        running = snap["running"]
+        self.assertEqual(len(running), 1)
+        self.assertEqual(running[0]["run_id"], "glm:sid1:ws9-WS9.1-build")
+        # The worker names its wrapper as its parent: via the workflow step.
+        self.assertEqual(
+            running[0]["parent_session_id"], "claude-workflow:lead:wf_1/build"
+        )
+        rows = self.store.query_workstreams({"WS1", "WS9"}, None, None)
+        ws9 = [row for row in rows if row["ws"] == "WS9"]
+        self.assertEqual(len(ws9), 1)
+        self.assertEqual(ws9[0]["live_agents"], 1)
+        report = self.store.reconcile_numbers(now, None, None, processes=[])
+        self.assertEqual(report["all"]["live_agents"], 1)
+        self.assertEqual(report["mismatches"], [])
+
+    def test_wrapper_without_worker_counts_itself(self):
+        now = time.time()
+        self._lane(now, worker=False)
+        snap = self.store.snapshot(now, "all")
+        self.assertEqual(snap["counts"]["live_agents"], 1)
+        self.assertEqual(
+            [run["run_id"] for run in snap["running"]],
+            ["claude-workflow:lead:wf_1/build"],
+        )
+
+    def test_wrapper_stays_visible_in_runs(self):
+        now = time.time()
+        self._lane(now)
+        runs = self.store.query_runs(now, None, None, None, 100)
+        ids = {run["run_id"] for run in runs}
+        self.assertIn("glm:sid1:ws9-WS9.1-build", ids)
+        self.assertIn("claude-workflow:lead:wf_1/build", ids)
+        wrapper = [run for run in runs if run["source"] == "claude-workflow"][0]
+        self.assertTrue(wrapper.get("lane_shadow"))
+
+    def test_unseen_worker_mismatch(self):
+        now = time.time()
+        self._lane(now)
+        procs = [
+            {
+                "pid": 4242,
+                "comm": "grok",
+                "started_at": now - 10,
+                "label": "ws9-WS9.9-ghost",
+                "prompt_label": None,
+                "session_id": None,
+            }
+        ]
+        report = self.store.reconcile_numbers(now, None, None, processes=procs)
+        self.assertIn(
+            "unseen worker: ws9-WS9.9-ghost (grok pid 4242)", report["mismatches"]
+        )
+        # A live worker with a running row is seen: no mismatch for it.
+        seen = [
+            {
+                "pid": 4243,
+                "comm": "cursor-agent",
+                "started_at": now - 10,
+                "label": "ws9-WS9.1-build",
+                "prompt_label": None,
+                "session_id": None,
+            }
+        ]
+        report = self.store.reconcile_numbers(now, None, None, processes=seen)
+        self.assertNotIn("unseen worker", "\n".join(report["mismatches"]))
+        # One mismatch per label even when launcher and child share it.
+        both = seen + [
+            {
+                "pid": 4244,
+                "comm": "python3",
+                "started_at": now - 9,
+                "label": "ws9-WS9.9-ghost",
+                "prompt_label": None,
+                "session_id": None,
+            },
+            procs[0],
+        ]
+        report = self.store.reconcile_numbers(now, None, None, processes=both)
+        ghost = [item for item in report["mismatches"] if "ws9-WS9.9-ghost" in item]
+        self.assertEqual(len(ghost), 1)
+
+    def test_ended_at_is_last_seen_alive_not_start(self):
+        now = 1_792_000_000.0
+        self.store.upsert_run(
+            {
+                "run_id": "glm:sid9:ws9-WS9.2-plan",
+                "source": "glm",
+                "tier": "glm",
+                "label": "ws9-WS9.2-plan",
+                "session_id": "sid9",
+                "status": "running",
+                "started_at": 1_792_000_100.0,
+            }
+        )
+        self.store.add_process_sample(
+            {
+                "ts": 1_792_000_400.0,
+                "pid": 4242,
+                "comm": "grok",
+                "rss_kb": 10,
+                "elapsed_s": 300.0,
+                "label": "ws9-WS9.2-plan",
+                "run_id": "glm:sid9:ws9-WS9.2-plan",
+            }
+        )
+        ended = reconcile_running(self.store, now, processes=[])
+        self.assertEqual(ended, 1)
+        row = self.store.get_run("glm:sid9:ws9-WS9.2-plan")
+        self.assertEqual(row["status"], "done")
+        self.assertEqual(row["ended_at"], 1_792_000_400.0)
 
 
 if __name__ == "__main__":

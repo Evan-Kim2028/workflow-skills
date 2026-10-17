@@ -234,6 +234,43 @@ class RunWorkerTests(unittest.TestCase):
         self.assertIn("reason=none-available", line)
         self.assertEqual(launch.cmds, [])
 
+    def test_launch_registers_the_run_dir_once(self):
+        from dash.rundirs import registered_run_dirs
+
+        self.counts = {}
+        launch = Launch()
+        code, _line = self.go("default", launch)
+        self.assertEqual(code, 0)
+        listed = (self.state / "run-dirs.txt").read_text(encoding="utf-8").splitlines()
+        self.assertEqual(listed, [str(self.run_dir)])
+        # A second call for the same label only waits; registration dedupes.
+        code, _line = self.go("default", launch)
+        self.assertEqual(code, 0)
+        listed = (self.state / "run-dirs.txt").read_text(encoding="utf-8").splitlines()
+        self.assertEqual(listed, [str(self.run_dir)])
+        self.assertEqual(registered_run_dirs(self.state), [str(self.run_dir)])
+
+    def test_registration_skips_missing_dirs_and_prunes_stale_ones(self):
+        import time as _time
+
+        from dash.rundirs import MAX_ENTRIES, register_run_dir, registered_run_dirs
+
+        self.run_dir.mkdir(exist_ok=True)
+        gone = self.root / "gone"
+        gone.mkdir()
+        old = self.root / "old"
+        old.mkdir()
+        self.assertTrue(register_run_dir(self.state, gone))
+        self.assertTrue(register_run_dir(self.state, self.run_dir))
+        self.assertTrue(register_run_dir(self.state, old))
+        gone.rmdir()
+        ancient = _time.time() - 15 * 86400
+        os.utime(old, (ancient, ancient))
+        self.assertEqual(registered_run_dirs(self.state), [str(self.run_dir)])
+        kept = (self.state / "run-dirs.txt").read_text(encoding="utf-8").splitlines()
+        self.assertEqual(kept, [str(self.run_dir)])
+        self.assertLessEqual(len(kept), MAX_ENTRIES)
+
 
 if __name__ == "__main__":
     unittest.main()

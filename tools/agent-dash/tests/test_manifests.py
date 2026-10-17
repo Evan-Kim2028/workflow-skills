@@ -474,6 +474,92 @@ class ManifestPollTests(unittest.TestCase):
         manifests.poll(self.store, self._cfg(backfill_session=PARENT), NOW)
         self.assertEqual(self.store.runs, {})
 
+    def test_poll_reads_a_registered_flat_run_dir(self):
+        rundir = os.path.join(self.root, "runs", "ws9")
+        _write(
+            os.path.join(rundir, "glm-sessions.tsv"),
+            f"ws9-WS9.1-build\t{GLM}\t1700000002\tglm-5.3\n",
+            NOW,
+        )
+        _write(
+            os.path.join(rundir, "out-ws9-WS9.1-build.md"),
+            f"PASS\n{SECRET}\n",
+            NOW,
+        )
+        _write(
+            os.path.join(rundir, "err-ws9-WS9.1-build.log"),
+            "",
+            NOW,
+        )
+        state = os.path.join(self.root, "state")
+        os.makedirs(state)
+        with open(os.path.join(state, "run-dirs.txt"), "w") as fh:
+            fh.write(rundir + "\n")
+            fh.write(os.path.join(self.root, "gone") + "\n")
+        manifests.poll(self.store, self._cfg(state_dir=state), NOW)
+        glm = self.store.runs[f"glm:{GLM}:ws9-WS9.1-build"]
+        self.assertEqual(glm["source"], "glm")
+        self.assertEqual(glm["tier"], "glm")
+        self.assertEqual(glm["label"], "ws9-WS9.1-build")
+        self.assertEqual(glm["status"], "done")
+        self.assertEqual(glm["verdict"], "PASS")
+        self.assertEqual(glm["ended_at"], NOW)
+        self.assertNotIn(SECRET, _dump(self.store))
+
+    def test_poll_prefers_last_seen_alive_over_file_mtime(self):
+        rundir = os.path.join(self.root, "runs", "ws9b")
+        _write(
+            os.path.join(rundir, "glm-sessions.tsv"),
+            f"ws9b-build\t{GLM}\t1700000002\tglm-5.3\n",
+            NOW,
+        )
+        _write(
+            os.path.join(rundir, "out-ws9b-build.md"),
+            "notes only\n",
+            NOW - 900,
+        )
+        state = os.path.join(self.root, "state")
+        os.makedirs(state)
+        with open(os.path.join(state, "run-dirs.txt"), "w") as fh:
+            fh.write(rundir + "\n")
+
+        class Seen(MemStore):
+            def last_activity(self, run_id, started_at=None):
+                return NOW - 100
+
+        store = Seen()
+        manifests.poll(store, self._cfg(state_dir=state), NOW)
+        run = store.runs[f"glm:{GLM}:ws9b-build"]
+        self.assertEqual(run["status"], "done")
+        self.assertEqual(run["ended_at"], NOW - 100)
+
+    def test_poll_stays_running_on_a_fresh_sighting(self):
+        rundir = os.path.join(self.root, "runs", "ws9c")
+        _write(
+            os.path.join(rundir, "glm-sessions.tsv"),
+            f"ws9c-build\t{GLM}\t1700000002\tglm-5.3\n",
+            NOW,
+        )
+        _write(
+            os.path.join(rundir, "out-ws9c-build.md"),
+            "notes only\n",
+            NOW - 900,
+        )
+        state = os.path.join(self.root, "state")
+        os.makedirs(state)
+        with open(os.path.join(state, "run-dirs.txt"), "w") as fh:
+            fh.write(rundir + "\n")
+
+        class Seen(MemStore):
+            def last_activity(self, run_id, started_at=None):
+                return NOW
+
+        store = Seen()
+        manifests.poll(store, self._cfg(state_dir=state), NOW)
+        run = store.runs[f"glm:{GLM}:ws9c-build"]
+        self.assertEqual(run["status"], "running")
+        self.assertIsNone(run.get("ended_at"))
+
 
 class ManifestSmokeTests(unittest.TestCase):
     @unittest.skipUnless(os.environ.get("AGENT_DASH_SMOKE") == "1", "set AGENT_DASH_SMOKE=1 to read a local scratchpad")

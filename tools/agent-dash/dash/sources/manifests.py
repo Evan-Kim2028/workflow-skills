@@ -173,8 +173,20 @@ def poll(store, cfg, now: float) -> None:
         pads = []
         for root in _scratch_roots(cfg):
             pads.extend(_scratchpads(root, now, backfill, scan_s))
+        flat_pads = _flat_run_dirs(cfg, now, [scratch for _, scratch in pads])
+        pads.extend(flat_pads)
+        flat = set()
+        for _, scratch in flat_pads:
+            try:
+                flat.add(os.path.realpath(scratch))
+            except OSError:
+                flat.add(scratch)
         pending = []
         for parent, scratch in pads:
+            try:
+                is_flat = os.path.realpath(scratch) in flat
+            except OSError:
+                is_flat = scratch in flat
             for filename, source, directory, default_tier in _MANIFESTS:
                 path = os.path.join(scratch, filename)
                 if not _is_file(path):
@@ -185,9 +197,9 @@ def poll(store, cfg, now: float) -> None:
                     _log.warning("manifests tsv %s: %s", filename, type(exc).__name__)
                     continue
                 for row in rows:
-                    pending.append((parent, scratch, source, directory, default_tier, row))
+                    pending.append((parent, scratch, source, directory, default_tier, row, is_flat))
         pending.sort(key=lambda item: -_out_mtime(item[1], item[3], item[5]["label"]))
-        for parent, scratch, source, directory, default_tier, row in pending:
+        for parent, scratch, source, directory, default_tier, row, is_flat in pending:
             try:
                 left = _emit_manifest(
                     store,
@@ -201,13 +213,15 @@ def poll(store, cfg, now: float) -> None:
                     left,
                     per_file,
                     live,
+                    flat=is_flat,
+                    ttl=ttl,
                 )
             except Exception as exc:
                 _log.warning("manifests row: %s", type(exc).__name__)
         for parent, scratch in pads:
             try:
                 left = _emit_exec(
-                    store, parent, scratch, now, window, backfill, left, per_file, live
+                    store, parent, scratch, now, window, backfill, left, per_file, live, ttl
                 )
             except Exception as exc:
                 _log.warning("manifests exec: %s", type(exc).__name__)
@@ -216,10 +230,12 @@ def poll(store, cfg, now: float) -> None:
 
 
 def _emit_manifest(
-    store, parent, scratch, source, directory, default_tier, row, now, left, per_file, live
+    store, parent, scratch, source, directory, default_tier, row, now, left, per_file, live,
+    flat: bool = False,
+    ttl: float = PROCESS_TTL_S,
 ) -> int:
     label = row["label"]
-    base = os.path.join(scratch, directory)
+    base = scratch if flat else os.path.join(scratch, directory)
     out_path = os.path.join(base, f"out-{label}.md")
     err_path = os.path.join(base, f"err-{label}.log")
     report_path = os.path.join(base, f"report-{label}.md")
@@ -243,11 +259,13 @@ def _emit_manifest(
         left=left,
         per_file=per_file,
         live=live,
+        now=now,
+        ttl=ttl,
     )
     return left
 
 
-def _emit_exec(store, parent, scratch, now, window, backfill, left, per_file, live) -> int:
+def _emit_exec(store, parent, scratch, now, window, backfill, left, per_file, live, ttl=PROCESS_TTL_S) -> int:
     exec_dir = os.path.join(scratch, "exec")
     try:
         entries = list(os.scandir(exec_dir))
@@ -292,6 +310,8 @@ def _emit_exec(store, parent, scratch, now, window, backfill, left, per_file, li
                 left=left,
                 per_file=per_file,
                 live=live,
+                now=now,
+                ttl=ttl,
             )
         except Exception as exc:
             _log.warning("manifests exec %s: %s", label, type(exc).__name__)
@@ -316,6 +336,8 @@ def _emit_files(
     left,
     per_file,
     live,
+    now,
+    ttl,
 ) -> int:
     out_st = _stat(out_path) if out_path else None
     err_st = _stat(err_path) if err_path else None
@@ -341,7 +363,14 @@ def _emit_files(
         err_sig, err_nonempty, err_known, left = _cached_err(err_path, err_st, left, per_file)
 
     if live is None:
+        # No process-label listing (the real store has no label reader):
+        # fall back to the last time this run was seen alive. A quiet
+        # output file must not flip a live worker to done while the tool
+        # sources still match its process.
         alive = None
+        seen_at = _last_seen(store, run_id)
+        if seen_at is not None and now - seen_at <= ttl:
+            alive = True
     else:
         alive = label in live
     status = classify_status(
@@ -357,6 +386,9 @@ def _emit_files(
         mtimes = [st.st_mtime for st in (out_st, err_st, report_st) if st is not None]
         if mtimes:
             ended = max(mtimes)
+        seen = _last_seen(store, run_id)
+        if seen is not None and (ended is None or seen > ended):
+            ended = seen
     patch = {
         "run_id": run_id,
         "source": source,
@@ -676,11 +708,70 @@ def _safe_label(value) -> str | None:
 
 
 def _out_mtime(scratch, directory, label) -> float:
-    path = os.path.join(scratch, directory, f"out-{label}.md")
-    st = _stat(path)
-    if st is None:
-        return 0.0
-    return st.st_mtime
+    latest = 0.0
+    for base in (os.path.join(scratch, directory), scratch):
+        path = os.path.join(base, f"out-{label}.md")
+        st = _stat(path)
+        if st is not None and st.st_mtime > latest:
+            latest = st.st_mtime
+    return latest
+
+
+def _flat_run_dirs(cfg, now, covered) -> list:
+    """Registered run folders that hold a manifest TSV directly.
+
+    A ``run_worker.py`` run folder is flat: the TSV and the
+    ``out-``/``err-``/``report-`` files sit in the folder itself, not in a
+    ``<session>/scratchpad/<tool>/`` tree, so ``_scratchpads`` never lists
+    it. Returned pads carry ``parent`` None; ``_emit_manifest`` reads the
+    flat layout for them. Folders already covered by ``covered`` scratch
+    pads are skipped.
+    """
+    from dash.rundirs import registered_run_dirs, state_dir_of
+
+    try:
+        rundirs = registered_run_dirs(state_dir_of(cfg), now=now)
+    except (OSError, ValueError):
+        return []
+    have = set()
+    for scratch in covered or []:
+        try:
+            have.add(os.path.realpath(scratch))
+        except OSError:
+            have.add(scratch)
+    found = []
+    for rundir in rundirs:
+        try:
+            real = os.path.realpath(rundir)
+        except OSError:
+            continue
+        if real in have:
+            continue
+        tsv_here = False
+        for filename, _source, _directory, _tier in _MANIFESTS:
+            if _is_file(os.path.join(rundir, filename)):
+                tsv_here = True
+                break
+        if not tsv_here:
+            continue
+        have.add(real)
+        found.append((None, rundir))
+    return found
+
+
+def _last_seen(store, run_id):
+    """Last time the run was seen alive (usage event or process sample).
+
+    Missing on old fake stores; then there is no extra evidence.
+    """
+    fn = getattr(store, "last_activity", None)
+    if not callable(fn):
+        return None
+    try:
+        found = fn(run_id, None)
+    except Exception:
+        return None
+    return found
 
 
 def _prev_size(store, path, st):
@@ -753,9 +844,9 @@ def _backfill(cfg):
 
 
 def _scratch_roots(cfg) -> list:
-    from dash.locate import scratch_roots
+    from dash.rundirs import scan_roots
 
-    return scratch_roots(cfg)
+    return scan_roots(cfg)
 
 
 def _scratch_root(cfg) -> str:

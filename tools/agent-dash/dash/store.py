@@ -529,7 +529,21 @@ class Store:
         running list, ``counts.live_agents``, ``/api/workstreams``
         ``live_agents``, and the timeline's open bars all derive from it, so
         no view can show a run another hides. Idle leads are excluded here
-        too, so they stay out of Running now exactly as before.
+        too, so they stay out of Running now exactly as before. A
+        ``claude-workflow`` wrapper shadowed by a live worker row on the
+        same label (one lane, one agent) is excluded here as well; the
+        worker carries the lane.
+        """
+        live, _shadows = self._live_open_with_shadows_locked(now, rows, pid_alive_fn)
+        return live
+
+    def _live_open_with_shadows_locked(self, now: float, rows: list, pid_alive_fn=None):
+        """The one running set plus the lane-shadow map. Caller holds the lock.
+
+        ``shadows`` maps a shadowed wrapper run id to its live worker run
+        id. It is computed against the pre-subtraction open set, so pass
+        that open set (``live | set(shadows)``) — not the subtracted set —
+        to ``_lane_shadows``/``_annotate_lanes``.
         """
         stale_ids = {
             run["run_id"] for run, _reason in self._stale_locked(now, rows, pid_alive_fn)
@@ -537,13 +551,15 @@ class Store:
         idle_ids = {
             row["run_id"] for row in self._idle_locked(now, rows, pid_alive_fn)
         }
-        return {
+        open_ids = {
             row["run_id"]
             for row in rows
             if row.get("status") in ("running", "queued")
             and row.get("run_id") not in stale_ids
             and row.get("run_id") not in idle_ids
         }
+        shadows = _lane_shadows(rows, open_ids)
+        return open_ids - set(shadows), shadows
 
     def _stale_reason_locked(
         self, run: dict, now: float, dag_ids, dag_fresh: bool,
@@ -784,13 +800,25 @@ class Store:
         return changed
 
     def last_activity(self, run_id: str, started_at=None):
+        """Latest evidence for a run: usage event, process sample, or start.
+
+        A manifest worker whose process was seen alive (a process sample
+        matched it by pid or label) ends at that last sighting — or the
+        out/err file mtime, whichever the caller finds later — never at
+        the start time.
+        """
         with self._lock:
             row = self._conn.execute(
                 "SELECT MAX(ts) AS ts FROM usage_events WHERE run_id=?", (run_id,)
             ).fetchone()
+            sample = self._conn.execute(
+                "SELECT MAX(ts) AS ts FROM process_samples WHERE run_id=?", (run_id,)
+            ).fetchone()
         stamps = []
         if row and row["ts"] is not None:
             stamps.append(float(row["ts"]))
+        if sample and sample["ts"] is not None:
+            stamps.append(float(sample["ts"]))
         if started_at is not None:
             stamps.append(float(started_at))
         return max(stamps) if stamps else None
@@ -832,7 +860,8 @@ class Store:
             raise ValueError("bad usage_group")
         with self._lock:
             shown_all, parents = self._shown_locked(now)
-            live_open = self._live_open_ids_locked(now, shown_all)
+            live_open, shadows = self._live_open_with_shadows_locked(now, shown_all)
+            shown_all = _annotate_lanes(shown_all, live_open | set(shadows))
             scoped = [run for run in shown_all if _in_ws(run, ws)]
             running = [
                 run
@@ -901,8 +930,20 @@ class Store:
             live_open = self._live_open_ids_locked(now, shown_all)
             return self._summarize_locked(shown_all, parents, now, since, until, live_open)
 
-    def reconcile_numbers(self, now: float, since: float | None = None, until: float | None = None) -> dict:
-        """Cross-check every number once, under one lock. ``mismatches`` is empty when consistent."""
+    def reconcile_numbers(
+        self,
+        now: float,
+        since: float | None = None,
+        until: float | None = None,
+        processes=None,
+    ) -> dict:
+        """Cross-check every number once, under one lock. ``mismatches`` is empty when consistent.
+
+        ``processes`` is the live worker listing for the ``unseen worker``
+        check. The store never samples processes itself, so unit tests stay
+        hermetic: pass an explicit list (``[]`` for none). The HTTP layer
+        (``dash/server.py``) supplies the live listing per request.
+        """
         with self._lock:
             shown_all, parents = self._shown_locked(now)
             live_open = self._live_open_ids_locked(now, shown_all)
@@ -975,6 +1016,7 @@ class Store:
                 )
             for run, reason in self._stale_locked(now, shown_all):
                 mismatches.append(f"stale running: {run.get('run_id')} ({reason})")
+            mismatches.extend(_unseen_workers(shown_all, processes or []))
             return {
                 "now": now,
                 "since": roll["since"],
@@ -1067,15 +1109,18 @@ class Store:
             raw, usage, parents = self._scoped_usage()
             context = self._context_by_run()
             rss = self._rss_maps(now)
-            live_open = self._live_open_ids_locked(
-                now, [dict(row) for row in raw]
-            )
+            bare = [dict(row) for row in raw]
+            live_open, shadows = self._live_open_with_shadows_locked(now, bare)
             rows = []
             for row in raw:
                 if row["run_id"] in parents:
                     continue
                 view = self._run_view(row, now, usage, rss, context)
-                if view.get("status") in ("running", "queued") and view["run_id"] not in live_open:
+                if (
+                    view.get("status") in ("running", "queued")
+                    and view["run_id"] not in live_open
+                    and view["run_id"] not in shadows
+                ):
                     continue
                 if not _in_ws(view, ws):
                     continue
@@ -1084,6 +1129,7 @@ class Store:
                 if until is not None and (view["started_at"] or 0) > until:
                     continue
                 rows.append(view)
+            rows = _annotate_lanes(rows, live_open | set(shadows))
         rows = _collapse_workflows(_drop_launch_echoes(rows), now)
         rows.sort(key=lambda run: run["started_at"] or 0)
         return rows[-limit:]
@@ -1192,13 +1238,13 @@ class Store:
             step = span / 5000
         with self._lock:
             runs = [dict(row) for row in self._all_runs()]
+            live_open = self._live_open_ids_locked(now, runs)
         parents = _parent_map(runs)
         runs = _drop_launch_echoes([run for run in runs if run["run_id"] not in parents and _is_counted_agent(run)])
-        stale_ids = {run["run_id"] for run, _reason in self.stale_running(now)}
         runs = [
             run
             for run in runs
-            if not (run.get("status") in ("running", "queued") and run["run_id"] in stale_ids)
+            if not (run.get("status") in ("running", "queued") and run["run_id"] not in live_open)
         ]
         if ws and ws != "all":
             runs = [run for run in runs if run["workstream"] == ws]
@@ -1455,6 +1501,7 @@ class Store:
             CREATE INDEX IF NOT EXISTS idx_usage_ts ON usage_events(ts);
             CREATE INDEX IF NOT EXISTS idx_samples_ts ON process_samples(ts);
             CREATE INDEX IF NOT EXISTS idx_samples_pid ON process_samples(pid);
+            CREATE INDEX IF NOT EXISTS idx_samples_run ON process_samples(run_id);
             """
         )
         self._migrate_usage_splits()
@@ -2007,6 +2054,99 @@ def _is_counted_agent(run: dict) -> bool:
     if source in ("claude-main", "shell", "dagster", ""):
         return False
     return _tool_key(run) in TOOL_KEYS
+
+
+WORKER_SOURCES = frozenset({"muse", "glm", "grok"})
+WRAPPER_SOURCES = frozenset({"claude-workflow"})
+
+
+def _lane_shadows(rows: list, live_ids: set) -> dict:
+    """Wrapper run id -> worker run id for lanes with a live worker.
+
+    A ``claude-workflow`` wrapper (the Haiku step a ws-wave lane runs in)
+    and a ``muse``/``glm``/``grok`` worker row share the lane label. When
+    the worker row is live, the lane counts once — the worker — and the
+    wrapper id is shadowed out of the one running set. With no live
+    worker row for the wrapper's label (still launching, or the worker
+    died), the wrapper is not shadowed and counts as the lane itself.
+    """
+    live_worker: dict = {}
+    for run in rows:
+        if (
+            run.get("run_id") in live_ids
+            and run.get("source") in WORKER_SOURCES
+            and run.get("label")
+        ):
+            live_worker.setdefault(run["label"], run["run_id"])
+    shadows = {}
+    for run in rows:
+        if (
+            run.get("run_id") in live_ids
+            and run.get("source") in WRAPPER_SOURCES
+            and run.get("label")
+            and run["label"] in live_worker
+        ):
+            shadows[run["run_id"]] = live_worker[run["label"]]
+    return shadows
+
+
+def _annotate_lanes(views: list, live_open: set) -> list:
+    """Mark lane shadows on run views (view-only; stored rows are untouched).
+
+    A shadowed wrapper view carries ``lane_shadow: True`` so the timeline
+    strip counts the lane once while the bar stays clickable. A live
+    worker view with no parent names its wrapper run id as
+    ``parent_session_id``, so Running now shows the worker via its
+    workflow step.
+    """
+    shadows = _lane_shadows(views, live_open)
+    if not shadows:
+        return views
+    worker_to_wrapper: dict = {}
+    for wrapper_id, worker_id in shadows.items():
+        worker_to_wrapper.setdefault(worker_id, wrapper_id)
+    for view in views:
+        run_id = view.get("run_id")
+        if run_id in shadows:
+            view["lane_shadow"] = True
+        elif run_id in worker_to_wrapper and not view.get("parent_session_id"):
+            view["parent_session_id"] = worker_to_wrapper[run_id]
+    return views
+
+
+def _unseen_workers(shown_all: list, processes) -> list:
+    """``unseen worker`` mismatches: live worker, no running worker row.
+
+    A live worker process (``[label:]``, a muse prompt-file label, or a
+    ``run_worker.py`` argv label) with no ``running``/``queued`` worker
+    row (``muse``/``glm``/``grok``) on that label is invisible on the
+    dashboard: one mismatch per label. Only the label is reported; argv
+    beyond it is never stored or printed.
+    """
+    have = set()
+    for run in shown_all:
+        if (
+            run.get("status") in ("running", "queued")
+            and run.get("source") in WORKER_SOURCES
+            and run.get("label")
+        ):
+            have.add(run["label"])
+    pending: dict = {}
+    for proc in processes or []:
+        if not isinstance(proc, dict):
+            continue
+        label = proc.get("label")
+        if not label or label in have or label in pending:
+            continue
+        pending[label] = proc
+    out = []
+    for label in sorted(pending):
+        proc = pending[label]
+        comm = proc.get("comm") or "worker"
+        pid = proc.get("pid")
+        detail = f"{comm} pid {pid}" if pid is not None else str(comm)
+        out.append(f"unseen worker: {label} ({detail})")
+    return out
 
 
 def muse_orphan_pairs(runs: list) -> list:

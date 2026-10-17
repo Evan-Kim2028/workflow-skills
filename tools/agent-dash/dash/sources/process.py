@@ -26,6 +26,7 @@ SOURCE_COMMS = {
     "glm": frozenset({"grok"}),
 }
 _LABEL = re.compile(r"\[label:\s*([^\]]+?)\]")
+_RUN_WORKER = re.compile(r"(?:^|\s)\S*run_worker\.py(\s.*)?$")
 _LINE = re.compile(r"^\s*(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\S+)\s+(\S+)\s*$")
 _LABEL_OK = re.compile(r"^[\w.+-]{1,80}$")
 _UUID = r"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}"
@@ -89,6 +90,98 @@ def live_agent_processes(now: float | None = None) -> list[dict]:
             }
         )
     return rows
+
+
+def live_worker_processes(now: float | None = None) -> list[dict]:
+    """Live worker agents, however they were launched.
+
+    Starts from ``live_agent_processes`` (grok, muse, glm by comm and
+    ``[label:]``/prompt-file/session tokens), then adds any other live
+    process whose command line carries a worker label: a ``run_worker.py``
+    launch (labeled by its argv label), or any ``[label: ...]`` token in
+    argv (a synthetic prober, a wrapper script, a bare launcher). Each
+    row is ``pid``, ``comm``, ``started_at``, and ``label``; the rest of
+    argv is discarded and never returned. A failed listing keeps whatever
+    the agent listing found. Sources keep using ``live_agent_processes``
+    for liveness; this wider listing is for the ``unseen worker``
+    reconcile check only.
+    """
+    import time as _time
+
+    now = _time.time() if now is None else float(now)
+    try:
+        rows = live_agent_processes(now)
+    except Exception:
+        rows = []
+    seen = {row.get("pid") for row in rows}
+    try:
+        table = {row["pid"]: row for row in _ps()}
+    except Exception:
+        return rows
+    try:
+        tokens = _tokens_by_pid()
+    except Exception:
+        tokens = {}
+    try:
+        extra = _run_worker_labels()
+    except Exception:
+        extra = {}
+    for pid, token in tokens.items():
+        if pid in seen:
+            continue
+        label = token.get("label") or token.get("prompt_label")
+        if not label:
+            continue
+        info = table.get(pid)
+        if info is None:
+            continue
+        seen.add(pid)
+        rows.append(
+            {
+                "pid": pid,
+                "comm": info["comm"],
+                "started_at": now - float(info["elapsed_s"]),
+                "label": label,
+                "prompt_label": None,
+                "session_id": None,
+            }
+        )
+    for pid, label in extra.items():
+        if pid in seen:
+            continue
+        info = table.get(pid)
+        if info is None:
+            continue
+        seen.add(pid)
+        rows.append(
+            {
+                "pid": pid,
+                "comm": info["comm"],
+                "started_at": now - float(info["elapsed_s"]),
+                "label": label,
+                "prompt_label": None,
+                "session_id": None,
+            }
+        )
+    return rows
+
+
+def run_worker_label_from_args(text: str) -> str | None:
+    """Label from a ``run_worker.py <tier> <label> ...`` command line.
+
+    Returns only the label. The workspace, prompt file, run folder, and
+    the rest of argv are discarded.
+    """
+    match = _RUN_WORKER.search(text or "")
+    if not match:
+        return None
+    rest = (match.group(1) or "").split()
+    if len(rest) < 2:
+        return None
+    label = rest[1].strip("'\"")
+    if not _LABEL_OK.fullmatch(label):
+        return None
+    return label
 
 
 def match_agent(source: str, pid, label, processes: list[dict], session_id=None):
@@ -349,6 +442,35 @@ def _uuid_from_run_id(run_id) -> str | None:
 def _labels_by_pid() -> dict:
     """Pid -> label token. The rest of the command line is discarded."""
     return {pid: token["label"] for pid, token in _tokens_by_pid().items() if token.get("label")}
+
+
+def _run_worker_labels() -> dict:
+    """Pid -> argv label for live ``run_worker.py`` launches.
+
+    Only the label is kept. Workspaces, prompt files, run folders, and
+    the rest of argv are discarded and never returned.
+    """
+    try:
+        proc = subprocess.run(
+            ["ps", "-axww", "-o", "pid=,command="],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return {}
+    if proc.returncode != 0:
+        return {}
+    found = {}
+    for line in proc.stdout.splitlines():
+        label = run_worker_label_from_args(line)
+        if not label:
+            continue
+        pid = _pid(line.strip().split(None, 1)[0] if line.strip() else None)
+        if pid is not None:
+            found[pid] = label
+    return found
 
 
 def _tokens_by_pid() -> dict:

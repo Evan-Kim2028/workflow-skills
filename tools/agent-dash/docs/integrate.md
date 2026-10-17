@@ -58,7 +58,7 @@ Raw JSONL works the same when the CLI is out of reach. Append to `<state-dir>/ge
 
 The collector tails the file and picks lines up within a poll. Bad lines are skipped. There is no field for prompts or secrets; never invent one.
 
-The file path alternative is the scratchpad manifest. The dashboard scans each scratch root for `muse-sessions.tsv`, `glm-sessions.tsv`, `grok-sessions.tsv`, and `cursor-sessions.tsv`, then reads `out-<label>.md`, `err-<label>.log`, and `report-<label>.md` from the `muse/`, `glm/`, `grok/`, `cursor/`, or `exec/` folder beside the TSV. Columns are `label`, `session_id`, start epoch, optional `model`, tab-separated; a header row is skipped:
+The file path alternative is the scratchpad manifest. The dashboard scans each scratch root for `muse-sessions.tsv`, `glm-sessions.tsv`, `grok-sessions.tsv`, and `cursor-sessions.tsv` — including a manifest nested one level under a scratchpad (a lead child folder) — then reads `out-<label>.md`, `err-<label>.log`, and `report-<label>.md` from the `muse/`, `glm/`, `grok/`, `cursor/`, or `exec/` folder beside the TSV. Columns are `label`, `session_id`, start epoch, optional `model`, tab-separated; a header row is skipped. A run folder registers itself: `run_worker.py` records its run folder in `<state-dir>/run-dirs.txt` before launching, and the manifest sources scan every registered folder in addition to the configured scratch roots, wherever the lead put it. A flat run folder (TSV plus `out-`/`err-` files directly inside, no `muse/`/`glm/` subfolders) reads the same way. A harness that writes manifests elsewhere registers its folder with one line in `run-dirs.txt`, or with `report --run-dir <dir>`:
 
 ```text
 ws4-WS4.1-notes-index	550e8400-e29b-41d4-a716-446655440000	1700000000	demo-model
@@ -187,6 +187,8 @@ Who writes what (one writer per file): the lead owns the bundle (`plan.json` via
 | Symptom | Likely cause | Command |
 |---|---|---|
 | Run missing | Label has a `/`, `\`, leading dot, or newline; or the collector has not polled yet | Fix the label; wait one poll; check `/api/health` `last_error` |
+| Worker invisible, wrapper shows alone | Run folder outside `roots.scratchpads` and not registered | Check `/api/health` `scratch_roots`, `run_dirs`, `warnings`; register the folder (`run-dirs.txt` line or `report --run-dir`); `check` reports live-but-invisible workers as `unseen worker` |
+| Lane counts twice | Wrapper and worker share a label but the worker row is missing | Same as above: the lane counts once the worker row is live |
 | Wrong workstream | Label regex missed; session fallback claimed it | Check `/api/runs` `ws_confidence`; add a `map.local.json` exact entry |
 | Run not on its chip | Label does not hold the task id and no task-map entry covers it | Add the entry; reload; `taskmap.json` serves resolved |
 | Unpriced run | Model string differs from the catalog, or a rate is null | Match the string exactly; add the row; cost counts unpriced, never `$0` |

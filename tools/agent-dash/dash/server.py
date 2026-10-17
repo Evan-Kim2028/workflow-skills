@@ -75,7 +75,7 @@ class Handler(BaseHTTPRequestHandler):
             elif path.startswith("/bundle/"):
                 self._bundle_page(path)
             elif path == "/api/health":
-                body = self.server.registry.health(time.time())
+                body = self.server.registry.health(time.time(), self.server.cfg)
                 body["pricing"] = health_block(self.server.store.usage_model_stats())
                 self._json(200, body)
             elif path.startswith("/static/"):
@@ -162,7 +162,9 @@ class Handler(BaseHTTPRequestHandler):
             if hours <= 0:
                 raise ValueError("bad hours")
             since = now - hours * 3600
-        self._json(200, self.server.store.reconcile_numbers(now, since, until))
+        self._json(
+            200, self.server.store.reconcile_numbers(now, since, until, processes=_live_workers())
+        )
 
     def _runs(self, query):
         now = time.time()
@@ -304,6 +306,21 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(body)
+
+
+def _live_workers() -> list:
+    """Live worker processes for the ``unseen worker`` reconcile check.
+
+    Labels only; argv beyond the label is never stored. A failed listing
+    yields no unseen-worker mismatches rather than failing the endpoint.
+    Tests stub this function to isolate from machine-global ps state.
+    """
+    try:
+        from dash.sources.process import live_worker_processes
+
+        return live_worker_processes() or []
+    except Exception:
+        return []
 
 
 def _static_rel(name: str) -> bool:

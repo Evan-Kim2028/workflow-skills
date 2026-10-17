@@ -354,6 +354,58 @@ class GrokCliTests(unittest.TestCase):
             self.assertEqual(run["parent_session_id"], HUB)
             self.assertEqual(run["started_at"], 1792153370.0)
 
+    def test_registered_run_dir_is_scanned_without_scratch_roots(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            rundir = os.path.join(tmp, "ws8")
+            os.makedirs(rundir)
+            with open(os.path.join(rundir, "glm-sessions.tsv"), "w") as fh:
+                fh.write("ws8-build\t%s\t1792153370\tglm-5.3\n" % SID)
+            state = os.path.join(tmp, "state")
+            os.makedirs(state)
+            with open(os.path.join(state, "run-dirs.txt"), "w") as fh:
+                fh.write(rundir + "\n")
+            sessions = os.path.join(tmp, "sessions")
+            os.makedirs(sessions)
+            cfg = {
+                "roots": {
+                    "grok_sessions": sessions,
+                    "grok_log": os.path.join(tmp, "missing.jsonl"),
+                    "scratchpads": [],
+                },
+                "state_dir": state,
+                "read_budgets": {"per_file": 1024 * 1024, "per_tick": 1024 * 1024},
+            }
+            store = Store()
+            self.poll(store, cfg, 1792154000)
+            run = store.runs["glm:%s:ws8-build" % SID]
+            self.assertEqual(run["label"], "ws8-build")
+            self.assertEqual(run["source"], "glm")
+
+    def test_nested_child_folder_manifest_is_listed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            enc = os.path.join(tmp, "enc")
+            nested = os.path.join(enc, HUB, "scratchpad", "runs")
+            os.makedirs(nested)
+            with open(os.path.join(nested, "glm-sessions.tsv"), "w") as fh:
+                fh.write("ws8-nested\t%s\t1792153370\tglm-5.3\n" % SID)
+            pads = list(grok._manifest_dirs(enc, "glm-sessions.tsv", None))
+            self.assertEqual(len(pads), 1)
+            self.assertEqual(pads[0], (os.path.realpath(nested), HUB))
+            sessions = os.path.join(tmp, "sessions")
+            os.makedirs(sessions)
+            cfg = {
+                "roots": {
+                    "grok_sessions": sessions,
+                    "grok_log": os.path.join(tmp, "missing.jsonl"),
+                    "scratchpads": enc,
+                },
+                "read_budgets": {"per_file": 1024 * 1024, "per_tick": 1024 * 1024},
+            }
+            store = Store()
+            self.poll(store, cfg, 1792154000)
+            run = store.runs["glm:%s:ws8-nested" % SID]
+            self.assertEqual(run["parent_session_id"], HUB)
+
     @unittest.skipUnless(os.environ.get("AGENT_DASH_SMOKE") == "1", "set AGENT_DASH_SMOKE=1 to read a local glm usage file")
     def test_smoke_real_usage_json(self):
         sessions = os.environ.get("AGENT_DASH_SMOKE_GROK_SESSIONS")

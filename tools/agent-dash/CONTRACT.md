@@ -17,6 +17,7 @@ Never writes to any source, never signals agent processes, never stores prompt b
 | `dash/bundles.py`, `dash/planrender.py`, `SKILL-PLAN.md` | core |
 | `scripts/cursor_usage_hook.py` | src-cursor |
 | `dash/sources/__init__.py` (registry, scheduler) | core |
+| `dash/rundirs.py` (run-folder registration, `run-dirs.txt`) | core |
 | `dash/sources/process.py`, `dash/sources/hub.py` | core |
 | `dash/sources/claude.py`, `dash/sources/manifests.py`, `dash/sources/generic.py` | src-ai |
 | `dash/sources/muse.py`, `dash/sources/grok_cli.py` | src-tools |
@@ -121,8 +122,12 @@ Computed in one store pass under the lock. Rows carry `tokens_all_time` and
 invariant, windowed and all-time (rows plus unassigned equal the all-scope
 numbers, and each row equals its workstream tab), and is empty when consistent.
 `python3 agent_dash.py check [--url URL] [--hours N]` prints the rows as a
-table and exits 1 on any mismatch (`--hours` defaults to 24, kept as an
-optional override for API compatibility). `python3 agent_dash.py check --page [--url URL]`
+table and exits 1 on any mismatch, including one `unseen worker: <label>`
+mismatch per live worker process (a `[label:]`, muse prompt-file label, or
+`run_worker.py` argv label with no running worker row) the dashboard
+cannot see. Only the label is reported; argv beyond it is never stored or
+printed. `--hours` defaults to 24, kept as an optional override for API
+compatibility. `python3 agent_dash.py check --page [--url URL]`
 drives the live page in headless Chrome over the DevTools protocol
 (`scripts/page_check.mjs`, stdlib only) and compares every rendered tile and
 chart legend against the API for the overview and every workstream tab at the
@@ -169,7 +174,8 @@ variant. Clip playback compresses idle stretches by cumulative event count
 blended with real time; plain replay stays on real time with an optional
 "Compress idle" toggle.
 
-`GET /api/health` -> `{"ok": true, "sources": [{name, last_poll, last_error, lag_s}], "pricing": {...}}`
+`GET /api/health` -> `{"ok": true, "sources": [{name, last_poll, last_error, lag_s}], "pricing": {...}, "scratch_roots": [...], "run_dirs": [...], "warnings": [...]}`.
+`scratch_roots` is the configured, resolved `roots.scratchpads` list (a local config that narrows it shows up here); `run_dirs` is the registered run folders. `warnings` names each registered folder outside the configured roots that holds a manifest for a currently live worker, so a run folder the config does not cover is loud instead of silently invisible.
 
 `GET /static/<file>` serves a file from `static/` or one subdirectory (`vendor/`). `/static/taskmap.json` is the resolved task map (`taskmap.local.json`, else `taskmap.example.json`). Context-window rows use tool `grok-context` and are left out of cost.
 
@@ -227,12 +233,21 @@ last usage/sample), never left running.
 | `grok` (cursor-agent) | Live only while a live `cursor-agent` process carries the run's pid or `[label:]`. A chat whose process is gone is `done` (or `unknown` without a timestamp). |
 | `shell` (exec) | Live only while the out file grew since the previous poll or a live label was sampled within `process_ttl_s` (30 s). Out growth and the live label are the evidence; rows carry no pid. |
 | `generic` (`generic.jsonl`, `agent_dash.py report`) | No pid. Live from `report start` until `report finish`; each `report usage` line is fresh evidence. A run with no line for longer than `STALE_IDLE_S` (6 h) is `stale running`: hidden from every view and reported by `check`. Long runs send `report usage` as a heartbeat. |
-| `manifests` (muse/glm/grok rows) | Same as the tool rows above: `running` only on out growth or a live label; otherwise `done`/`unknown`. |
+| `manifests` (muse/glm/grok rows) | Same as the tool rows above: `running` only on out growth or a live label; otherwise `done`/`unknown`. A terminal row ends at the last time it was seen alive (usage event or process sample) or the out/err/report file mtime, whichever is later — never the start time. |
 
 One filtered running set backs every view: the snapshot `running` list,
 `counts.live_agents`, `/api/workstreams` `live_agents`, and the timeline's
 open bars (`/api/runs`, `/api/concurrency`) all derive from
 `Store._live_open_ids_locked`, so no view can show a run another hides.
+One lane, one agent: when a `claude-workflow` wrapper row and a worker row
+(`muse`/`glm`/`grok`) share a label and the worker row is live, the lane
+counts once — the worker. The wrapper id leaves the running set (the
+worker carries it); Running now shows the worker with the wrapper run id
+as its parent (via the workflow step, a Haiku wrapper), while the wrapper
+row stays visible in the drawer and on the timeline (marked
+`lane_shadow`, so the strip counts the lane once). With no live worker
+row for the wrapper's label (still launching, or the worker died), the
+wrapper counts as the lane itself.
 `/api/reconcile` (and `agent_dash.py check`) reports every running row with
 no liveness evidence as a `stale running` mismatch: a dead pid, a Dagster
 run missing from the fresh active set, or no source evidence (usage,
@@ -308,7 +323,7 @@ Run labels for a task are `ws<N>-<task-id>-<slug>`. `SKILL-PLAN.md` is the short
 
 `kind` selects the launch, not the model string. `muse` runs `muse exec` with `--model`, `--workspace`, `--prompt-file`, `--session-id`, then `extra_args`. `cursor` runs `scripts/launch_grok.sh` so billed tokens are logged. `grok-build` runs `grok -p` with the prompt, a run rule appended, `-m`, `-s`, `--permission-mode bypassPermissions`, `--cwd`, and `--output-format plain`. `columns` is the manifest row. `glm-sessions.tsv` uses `label`, `session_id`, `epoch`, `model`. `manifests.py` and `grok_cli.py` read that shape. `cost_rank` is a lower-is-cheaper hint. `auto` follows `auto_order`, not `cost_rank`.
 
-`run_worker.py <tier|default|auto> <label> <workspace> <prompt-file> <run-dir> [max-wait]` prints `STATUS: running|done|failed out=... err=... tier=<name>`. It records the chosen worker in `<run-dir>/<label>.tier` and the pid in `<run-dir>/<label>.pid`. A later call for that label only waits. `default` uses the registry `default`. `auto` uses the first enabled worker in `auto_order` that is under `cap` (live count from `pgrep`) and not in cooldown. A failed run whose stderr or report matches `quota_patterns` cools that worker down for `cooldown_minutes`. Cooldowns live in `worker-cooldowns.json` in the agent-dash state dir. If the request was `auto` or `default`, the runner archives the report to `out-<label>.<tier>.md` and launches the next eligible worker.
+`run_worker.py <tier|default|auto> <label> <workspace> <prompt-file> <run-dir> [max-wait]` prints `STATUS: running|done|failed out=... err=... tier=<name>`. It records the chosen worker in `<run-dir>/<label>.tier` and the pid in `<run-dir>/<label>.pid`. A later call for that label only waits. Before launching, it records `<run-dir>` in `<state-dir>/run-dirs.txt` (one absolute path per line, deduped, atomic; honours `AGENT_DASH_STATE_DIR`), so the manifest sources scan that folder wherever the lead put it. `default` uses the registry `default`. `auto` uses the first enabled worker in `auto_order` that is under `cap` (live count from `pgrep`) and not in cooldown. A failed run whose stderr or report matches `quota_patterns` cools that worker down for `cooldown_minutes`. Cooldowns live in `worker-cooldowns.json` in the agent-dash state dir. If the request was `auto` or `default`, the runner archives the report to `out-<label>.<tier>.md` and launches the next eligible worker. Registered folders that no longer exist are skipped; folders untouched for 14 days are dropped from the file (capped at 256 entries). A harness that writes manifests elsewhere registers its folder with one line in `run-dirs.txt`, or with `agent_dash.py report --run-dir <dir>`.
 
 ## Generic reporting (any harness)
 
@@ -345,10 +360,12 @@ no input and output rate stays unpriced, never zero.
 Helper. `python3 agent_dash.py report` appends one valid line:
 
 ```
-python3 agent_dash.py report start --label <label> [--model M] [--session S] [--run-id R] [--tier T]
+python3 agent_dash.py report start --label <label> [--model M] [--session S] [--run-id R] [--tier T] [--run-dir <dir>]
 python3 agent_dash.py report finish --label <label> --verdict PASS [--session S] [--run-id R] [--status done]
 python3 agent_dash.py report usage --label <label> --input N --output N [--model M] [--session S] [--run-id R]
 ```
+
+`--run-dir` registers a manifest folder the harness writes elsewhere, so the manifest sources scan it (same as one line in `run-dirs.txt`).
 
 `finish --status` is `done`, `killed`, or `died_early`. `finish` without
 `--model` keeps the model from `start`. Verdicts are `PASS`, `PARTIAL`,

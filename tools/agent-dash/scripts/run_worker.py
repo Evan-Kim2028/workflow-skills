@@ -68,6 +68,7 @@ def run(argv, spawn=None, pgrep=None, sleep=None, now=None, alive=None, new_uuid
         emit("failed", out, err, requested, "bad-registry")
         return 2
     run_path.mkdir(parents=True, exist_ok=True)
+    _register_run_dir(run_path)
     tier_path = run_path / f"{label}.tier"
     pid_path = run_path / f"{label}.pid"
     ctx = {
@@ -312,6 +313,19 @@ def load_registry():
     if not isinstance(data, dict) or not isinstance(data.get("workers"), dict):
         raise ValueError("workers registry")
     return data
+
+
+def _register_run_dir(run_path: Path) -> None:
+    """Record the run folder so the dashboard scans it wherever it lives.
+
+    Best effort: registration must never break a launch.
+    """
+    try:
+        from dash.rundirs import register_run_dir
+
+        register_run_dir(state_dir(), run_path)
+    except Exception:
+        pass
 
 
 def state_dir() -> Path:

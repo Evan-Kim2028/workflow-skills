@@ -837,9 +837,9 @@ def _budgets(cfg):
 
 
 def _scratch_roots(cfg):
-    from dash.locate import scratch_roots
+    from dash.rundirs import scan_roots
 
-    return scratch_roots(cfg)
+    return scan_roots(cfg)
 
 
 def _only_session(cfg):

@@ -278,6 +278,13 @@ class PlanAndBackfillTest(unittest.TestCase):
 
 class ReconcileEndpointTest(unittest.TestCase):
     def setUp(self):
+        from unittest import mock
+
+        # Isolate from machine-global ps state: the live listing is empty
+        # here unless a test stubs it otherwise.
+        self._live_patch = mock.patch("dash.server._live_workers", return_value=[])
+        self._live_patch.start()
+        self.addCleanup(self._live_patch.stop)
         self.tmp = tempfile.TemporaryDirectory()
         self.store = Store(Path(self.tmp.name) / "dash.sqlite")
         now = time.time()
@@ -344,6 +351,62 @@ class ReconcileEndpointTest(unittest.TestCase):
         self.assertEqual(main(["check", "--url", f"http://127.0.0.1:{self.port}", "--hours", "12"]), 0)
         self.assertEqual(main(["check", "--url", "http://127.0.0.1:1", "--hours", "12"]), 2)
         self.assertEqual(main(["check", "--hours", "nope"]), 2)
+
+    def test_reconcile_reports_unseen_worker(self):
+        from unittest import mock
+
+        ghosts = [
+            {
+                "pid": 4242,
+                "comm": "cursor-agent",
+                "started_at": time.time() - 10,
+                "label": "ws1-ghost",
+                "prompt_label": None,
+                "session_id": None,
+            }
+        ]
+        with mock.patch("dash.server._live_workers", return_value=ghosts):
+            status, _, body = get(self.port, "/api/reconcile?hours=12")
+        self.assertEqual(status, 200)
+        payload = json.loads(body)
+        self.assertTrue(
+            any(
+                item == "unseen worker: ws1-ghost (cursor-agent pid 4242)"
+                for item in payload["mismatches"]
+            ),
+            payload["mismatches"],
+        )
+        with mock.patch("dash.server._live_workers", return_value=ghosts):
+            self.assertEqual(
+                main(["check", "--url", f"http://127.0.0.1:{self.port}", "--hours", "12"]), 1
+            )
+
+    def test_health_reports_scratch_roots_and_run_dirs(self):
+        from dash.sources import Registry
+
+        rundir = Path(self.tmp.name) / "runs" / "ws1"
+        rundir.mkdir(parents=True)
+        (rundir / "glm-sessions.tsv").write_text(
+            "ws1-ghost\t11111111-1111-4111-8111-111111111111\t1700000000\tglm-5.3\n",
+            encoding="utf-8",
+        )
+        state = Path(self.tmp.name) / "state"
+        state.mkdir()
+        (state / "run-dirs.txt").write_text(str(rundir) + "\n", encoding="utf-8")
+        cfg = default_cfg()
+        cfg["roots"]["scratchpads"] = []
+        cfg["state_dir"] = str(state)
+        ghosts = [{"pid": 4242, "comm": "grok", "started_at": 1.0, "label": "ws1-ghost"}]
+        body = Registry([]).health(time.time(), cfg, processes=ghosts)
+        self.assertEqual(body["scratch_roots"], [])
+        self.assertEqual(body["run_dirs"], [str(rundir)])
+        self.assertEqual(len(body["warnings"]), 1)
+        self.assertIn("ws1-ghost", body["warnings"][0])
+        self.assertIn(str(rundir), body["warnings"][0])
+        # A configured root covering the run folder silences the warning.
+        cfg["roots"]["scratchpads"] = [str(rundir)]
+        body = Registry([]).health(time.time(), cfg, processes=ghosts)
+        self.assertEqual(body["warnings"], [])
 
     def test_reconcile_reports_stale_running(self):
         self.store.upsert_run(

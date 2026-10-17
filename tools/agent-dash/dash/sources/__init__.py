@@ -47,7 +47,7 @@ class Registry:
                 state["last_error"] = _surfaced(source)
             state["last_poll"] = now
 
-    def health(self, now: float) -> dict:
+    def health(self, now: float, cfg=None, processes="auto") -> dict:
         sources = []
         ok = True
         for source in self.sources:
@@ -64,7 +64,15 @@ class Registry:
                     "lag_s": None if last is None else max(0.0, now - last),
                 }
             )
-        return {"ok": ok, "sources": sources}
+        body: dict = {"ok": ok, "sources": sources}
+        if cfg is not None:
+            try:
+                from dash.rundirs import describe_roots
+
+                body.update(describe_roots(cfg, now=now, processes=processes))
+            except Exception as exc:
+                log.warning("health roots: %s", type(exc).__name__)
+        return body
 
 
 def discover(state: dict | None = None) -> list:

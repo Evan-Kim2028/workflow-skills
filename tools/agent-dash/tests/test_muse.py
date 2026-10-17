@@ -782,6 +782,43 @@ class ManifestDirsTests(unittest.TestCase):
             os.makedirs(os.path.join(enc, "not-a-session", "scratchpad"))
             self.assertEqual(list(muse._manifest_dirs(enc, "muse-sessions.tsv", None)), [])
 
+    def test_nested_child_folder_manifest_is_listed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pad = os.path.join(tmp, "enc", HUB, "scratchpad")
+            nested = os.path.join(pad, "runs")
+            os.makedirs(nested)
+            with open(os.path.join(nested, "muse-sessions.tsv"), "w") as fh:
+                fh.write("ws2-nested\t%s\t1792152010\n" % SID)
+            pads = dict(muse._manifest_dirs(os.path.join(tmp, "enc"), "muse-sessions.tsv", None))
+            self.assertEqual(pads, {os.path.realpath(nested): HUB})
+
+    def test_registered_run_dir_is_scanned_without_scratch_roots(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sessions = os.path.join(tmp, "sessions")
+            os.makedirs(sessions)
+            rundir = os.path.join(tmp, "ws2")
+            os.makedirs(rundir)
+            with open(os.path.join(rundir, "muse-sessions.tsv"), "w") as fh:
+                fh.write("ws2-build\t%s\t1792152010\n" % SID)
+            state = os.path.join(tmp, "state")
+            os.makedirs(state)
+            with open(os.path.join(state, "run-dirs.txt"), "w") as fh:
+                fh.write(rundir + "\n")
+            cfg = {
+                "roots": {"muse_sessions": sessions, "scratchpads": []},
+                "state_dir": state,
+                "fresh_hours": 0,
+                "read_budget": {"per_file": 1024 * 1024, "per_tick": 4 * 1024 * 1024},
+            }
+            store = Store()
+            buf = io.StringIO()
+            with contextlib.redirect_stderr(buf):
+                muse.poll(store, cfg, 1792152100.0)
+            self.assertEqual(buf.getvalue(), "")
+            run = store.runs["muse:%s:ws2-build" % SID]
+            self.assertEqual(run["label"], "ws2-build")
+            self.assertEqual(run["source"], "muse")
+
 
 if __name__ == "__main__":
     unittest.main()

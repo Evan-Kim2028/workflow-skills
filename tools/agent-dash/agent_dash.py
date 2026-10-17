@@ -520,6 +520,8 @@ def cmd_report(argv: list[str]) -> int:
     cfg = bind_state()
     state = Path(expand(str(cfg.get("state_dir") or STATE_DIR)))
     state.mkdir(parents=True, exist_ok=True)
+    if flags.get("run-dir"):
+        _register_report_dir(state, flags["run-dir"])
     dest = state / GENERIC_FILE
     try:
         with dest.open("a", encoding="utf-8") as fh:
@@ -529,6 +531,16 @@ def cmd_report(argv: list[str]) -> int:
         return 1
     print(f"reported {action} {run_id}")
     return 0
+
+
+def _register_report_dir(state: Path, run_dir: str) -> None:
+    """Register a harness run folder from ``report --run-dir``. Never raises."""
+    try:
+        from dash.rundirs import register_run_dir
+
+        register_run_dir(state, run_dir)
+    except Exception:
+        pass
 
 
 def _report_flags(argv: list[str]) -> dict:
