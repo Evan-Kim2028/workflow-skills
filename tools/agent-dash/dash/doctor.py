@@ -115,6 +115,20 @@ def slug(text: str) -> str:
     return hashlib.sha1(str(text).encode("utf-8")).hexdigest()[:12]
 
 
+_LABEL_TITLE_MAX = 60
+
+
+def _item_label(title, ident) -> str:
+    """'Title (id)' for a plan task, train or approval; the bare id when it has no real title."""
+    ident = str(ident or "")
+    text = " ".join(str(title or "").split())
+    if not text or text == ident:
+        return ident or "item"
+    if len(text) > _LABEL_TITLE_MAX:
+        text = text[: _LABEL_TITLE_MAX - 3].rstrip() + "..."
+    return f"{text} ({ident})" if ident else text
+
+
 def make_problem(
     code: str,
     severity: str,
@@ -1101,10 +1115,11 @@ def _collect_workstream(ctx, ws: str, taskmap: dict, runs: list, live_ids: set, 
             last = max(stamps) if stamps else 0
             if last and ctx.now - last > stuck_hours * 3600:
                 hours = (ctx.now - last) / 3600
+                label = _item_label(info["title"], tid)
                 _add(
                     ctx, "stuck-task", "warn", f"ws:{ws}", ws,
-                    f"Task {tid} is stuck in {status} with no live agent",
-                    f"task {tid} ({info['title']}) in {ws} has status {status} with no live agent "
+                    f"{label} is stuck in {status} with no live agent",
+                    f"{label} in {ws} has status {status} with no live agent "
                     f"mapped to it and no run for {hours:.1f} h (limit {stuck_hours:g} h)",
                     f"python3 agent_dash.py ws plan {ws}",
                     key=tid,
@@ -1113,10 +1128,12 @@ def _collect_workstream(ctx, ws: str, taskmap: dict, runs: list, live_ids: set, 
         if status == "done":
             for dep in info["deps"]:
                 if dep in status_of and status_of[dep] != "done":
+                    label = _item_label(info["title"], tid)
+                    dep_label = _item_label(tasks[dep]["title"], dep)
                     _add(
                         ctx, "done-before-deps", "warn", f"ws:{ws}", ws,
-                        f"Task {tid} is done before its dependency {dep}",
-                        f"task {tid} in {ws} is done while dependency {dep} is "
+                        f"{label} is done before {dep_label} it depends on",
+                        f"{label} in {ws} is done while {dep_label} is "
                         f"{status_of[dep]} (not done)",
                         f"python3 agent_dash.py ws plan {ws}",
                         key=tid,
@@ -1129,11 +1146,14 @@ def _collect_workstream(ctx, ws: str, taskmap: dict, runs: list, live_ids: set, 
                 if tid in other_info["deps"] and other_info["status"] in ("wip", "pr")
             )
             if building:
-                names = ", ".join(building[:3]) + (f" (+{len(building) - 3} more)" if len(building) > 3 else "")
+                names = ", ".join(
+                    _item_label(tasks[other]["title"], other) for other in building[:3]
+                ) + (f" (+{len(building) - 3} more)" if len(building) > 3 else "")
+                label = _item_label(info["title"], tid)
                 _add(
                     ctx, "gate-blocking", "warn", f"ws:{ws}", ws,
-                    f"Gate {tid} is unmet while dependents are already building",
-                    f"gate {tid} in {ws} is {status} (unmet) with dependents already in "
+                    f"{label} is unmet while dependents are already building",
+                    f"{label} in {ws} is {status} (unmet) with dependents already in "
                     f"wip/pr: {names}",
                     f"python3 agent_dash.py ws plan {ws}",
                     key=tid,
@@ -1144,7 +1164,8 @@ def _collect_workstream(ctx, ws: str, taskmap: dict, runs: list, live_ids: set, 
         _add(
             ctx, "dep-cycle", "warn", f"ws:{ws}", ws,
             f"Dependency cycle in the {ws} plan",
-            f"plan for {ws} has a dependency cycle: {' -> '.join(cycle)}",
+            f"plan for {ws} has a dependency cycle: "
+            f"{' -> '.join(_item_label(tasks[tid]['title'], tid) for tid in cycle)}",
             f"python3 agent_dash.py ws validate {ws}",
         )
         count += 1
@@ -1181,10 +1202,11 @@ def _collect_approvals(ctx, approvals_for, bundles) -> int:
         days = (ctx.now - mtime) / 86400
         for entry in pending:
             item_id = str(entry.get("id") or "")
+            label = _item_label(entry.get("step"), item_id)
             _add(
                 ctx, "approval-stale", "warn", f"ws:{ws}", ws,
-                f"Approval {item_id} has waited too long",
-                f"approval {item_id} in {ws} ({entry.get('step') or 'no step'}) has been "
+                f"{label} approval has waited too long",
+                f"{label} approval in {ws} has been "
                 f"pending for {days:.1f} days (limit {ctx.dcfg['approval_days']:g} days)",
                 f"python3 agent_dash.py ws approvals {ws}",
                 key=item_id or slug(str(entry.get("step"))),
@@ -1225,11 +1247,12 @@ def _collect_trains(ctx, bundles) -> int:
             if status in TERMINAL_TRAIN or status is None:
                 continue
             tid = str(train.get("id") or "")
+            label = _item_label(train.get("title"), tid)
             members = train.get("members") if isinstance(train.get("members"), list) else []
             _add(
                 ctx, "train-stuck", "warn", f"ws:{ws}", ws,
-                f"Train {tid} is stuck waiting",
-                f"train {tid} in {ws} has status {status} for {hours:.1f} h "
+                f"{label} is stuck waiting",
+                f"{label} in {ws} has status {status} for {hours:.1f} h "
                 f"(limit {ctx.dcfg['train_hours']:g} h, {len(members)} members)",
                 f"python3 agent_dash.py ws trains {ws}",
                 key=tid or slug(str(train.get("title"))),

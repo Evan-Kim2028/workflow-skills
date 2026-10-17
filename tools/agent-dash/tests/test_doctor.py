@@ -500,6 +500,8 @@ class WorkstreamHygieneTest(unittest.TestCase):
         found = [item for item in result["problems"] if item["code"] == "done-before-deps"]
         self.assertEqual(len(found), 1)
         self.assertEqual(found[0]["id"], "done-before-deps:ws:WS9:WS9.2")
+        self.assertIn("Second (WS9.2)", found[0]["title"])
+        self.assertIn("First (WS9.1)", found[0]["title"])
         self.assertIn("WS9.1", found[0]["detail"])
 
     def test_gate_blocking(self):
