@@ -612,6 +612,22 @@ class StoreTest(unittest.TestCase):
         self.assertIsNone(runs[0]["elapsed_s"])
         self.assertIsNone(runs[0]["context_tokens"])
 
+    def test_query_runs_limit_keeps_the_newest(self):
+        for i in range(5):
+            self.store.upsert_run(
+                {
+                    "run_id": f"muse:s:run{i}",
+                    "source": "muse",
+                    "tier": "muse",
+                    "label": f"run{i}",
+                    "status": "done",
+                    "started_at": 1000.0 + i,
+                    "ended_at": 1000.5 + i,
+                }
+            )
+        runs = self.store.query_runs(2000.0, None, None, None, 3)
+        self.assertEqual([run["label"] for run in runs], ["run2", "run3", "run4"])
+
     def test_context_tokens_are_latest_and_excluded_from_totals(self):
         now = 1_700_000_000.0
         run_id = "grok:chat:ws1-47-extract-rebase"

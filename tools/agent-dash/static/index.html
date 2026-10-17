@@ -2274,7 +2274,7 @@ body.clip #main{zoom:.92}
       if (execCache[key] && ADC.fresh(execCache[key], Date.now(), ADC.TTL_MS)) { setTimeout(function () { step(i + 1); }, 150); return; }
       Promise.all([
         api("/api/snapshot", {ws: ws, since: reqSince, usage_group: wsGroup}).catch(function () { return null; }),
-        api("/api/runs", Object.assign({since: reqSince, limit: 400}, wsArg)).then(function (j) { return j.runs || []; }).catch(function () { return []; }),
+        api("/api/runs", Object.assign({since: reqSince, limit: 5000}, wsArg)).then(function (j) { return j.runs || []; }).catch(function () { return []; }),
         api("/api/concurrency", Object.assign({since: reqSince, step: 60}, wsArg)).then(function (j) { return j.points || []; }).catch(function () { return []; }),
         ws !== "all" ? api("/api/plan", {ws: ws}).then(function (j) { return j && j.groups ? j : null; }).catch(function () { return null; }) : Promise.resolve(null),
         api("/api/approvals", {ws: ws === "all" ? "all" : ws}).then(approvalList).catch(function () { return []; })
@@ -2299,7 +2299,7 @@ body.clip #main{zoom:.92}
     var reqSince = since();
     var jobs = [
       api("/api/snapshot", {ws: ws, since: reqSince, usage_group: group}).catch(function () { return null; }),
-      api("/api/runs", Object.assign({since: reqSince, limit: 400}, wsArg)).then(function (j) { return j.runs || []; }).catch(function () { return []; }),
+      api("/api/runs", Object.assign({since: reqSince, limit: 5000}, wsArg)).then(function (j) { return j.runs || []; }).catch(function () { return []; }),
       api("/api/concurrency", Object.assign({since: reqSince, step: 60}, wsArg)).then(function (j) { return j.points || []; }).catch(function () { return []; }),
       loadNav(),
       ws !== "all" ? api("/api/plan", {ws: ws}).then(function (j) { return j && j.groups ? j : null; }).catch(function () { return null; }) : Promise.resolve(null),

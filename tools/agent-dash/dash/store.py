@@ -1086,7 +1086,7 @@ class Store:
                 rows.append(view)
         rows = _collapse_workflows(_drop_launch_echoes(rows), now)
         rows.sort(key=lambda run: run["started_at"] or 0)
-        return rows[:limit]
+        return rows[-limit:]
 
     def query_usage(
         self,
