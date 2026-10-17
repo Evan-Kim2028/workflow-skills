@@ -14,11 +14,21 @@ python3 tools/agent-dash/agent_dash.py state    # the whole dashboard in one cal
 `state` reads `GET /api/state`: version, window, health per source,
 workstreams with progress and tokens, the unassigned row, the running
 count by source, the reconcile verdict, and a `problems` list where
-every entry names the exact next command. `doctor` checks the
-dashboard, the sources, scratch roots, manifest coverage, pricing,
-reconcile, page-check prerequisites, config files, bundles, the
-checkout, and the Python runner, then prints a fix per problem.
-`doctor` is read-only and exits 0 when clean, 1 when problems found.
+every entry names the exact next command. The server runs the doctor
+checks in a background thread every `doctor.interval_s` seconds
+(default 300) and persists them; `GET /api/doctor` serves the latest
+run (never inline; `?refresh=1` queues one), with `?ws=<ID>` and
+`?severity=critical|warn|info` filters. `doctor` reads that endpoint
+when the server is up and otherwise runs the same checks locally.
+`doctor` exits 0 when clean, 1 when problems found. `doctor --fix` is a
+dry run of the safe automatic fixes; `doctor --fix --yes` applies only
+safe, local, reversible ones (register a run dir, add a missing scratch
+root to `config.local.json` with a backup, prune, restart a stalled
+dashboard, reprice and backfill models). `doctor report --since 24h
+[--md]` digests history (new, regressed, resolved, open by severity
+and workstream) for hub reports. Every problem code has a page under
+`docs/problems/` (for example `docs/problems/stuck-task.md`) with what
+it means, the exact fix commands, and how to verify.
 
 These commands take `--json` for machine output on stdout only (human
 text moves to stderr when `--json` is set): `check`, `check --page`
@@ -248,6 +258,8 @@ Who writes what (one writer per file): the lead owns the bundle (`plan.json` via
 | Run not on its chip | Label does not hold the task id and no task-map entry covers it | Add the entry; reload; `taskmap.json` serves resolved |
 | Unpriced run | Model string differs from the catalog, or a rate is null | Match the string exactly; add the row; cost counts unpriced, never `$0` |
 | Stale running run | Process died without a finish line, or the source stopped reporting it | Send `report finish` (a generic run with no `report` line for 6 h counts as stale, so long runs send `report usage` as a heartbeat); the collector closes rows whose process is gone or that the source (Dagster) no longer lists, and `check` reports any `stale running` row it finds (CONTRACT.md, Liveness) |
+| Critical problem before a wave | Dashboard blind, numbers wrong, or model unpriced | Run `doctor --json --severity critical`; the `ws-wave` workflow does this once before the wave and stops on any critical problem (pass `skipDoctor: true` to skip) |
+| Worker will not launch | Preflight blocks the launch | `run_worker.py` runs a doctor preflight (dashboard reachable, run dir visible, tier model priced and policy-compliant) and exits 1 with the problem and fix unless `--no-preflight` is passed |
 | Numbers disagree | Tile, chart, and rows read one snapshot; a custom sum re-sums buckets | Run `check`; it exits 1 with the mismatch table |
 | Page blank | Dashboard down, or fixture URL on the live port | `status`; open `http://127.0.0.1:8765/`; fixtures need the `http.server` preview URL |
 

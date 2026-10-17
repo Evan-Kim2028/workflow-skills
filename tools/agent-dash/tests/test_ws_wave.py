@@ -25,3 +25,11 @@ class WsWaveTest(unittest.TestCase):
         self.assertIn("is oneWay and needs reviewFocus", text)
         self.assertIn("lane.review === false && !lane.oneWay", text)
         self.assertIn("checks", text)
+
+    def test_doctor_gate_runs_before_the_wave(self):
+        text = SCRIPT.read_text(encoding="utf-8")
+        self.assertIn("doctor --json --severity critical", text)
+        self.assertIn("skipDoctor", text)
+        self.assertIn("DOCTOR_GATE", text)
+        self.assertIn("doctor-gate", text)
+        self.assertIn("stopping the wave", text)

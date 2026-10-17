@@ -82,14 +82,17 @@ class RunWorkerTests(unittest.TestCase):
                 os.environ[key] = value
         self.tmp.cleanup()
 
-    def go(self, tier, launch, label="lane-1", max_wait="0"):
+    def go(self, tier, launch, label="lane-1", max_wait="0", no_preflight=True):
         from io import StringIO
         import contextlib
 
+        argv = [tier, label, str(self.ws), str(self.prompt), str(self.run_dir), max_wait]
+        if no_preflight:
+            argv.append("--no-preflight")
         buf = StringIO()
         with contextlib.redirect_stdout(buf):
             code = runner.run(
-                [tier, label, str(self.ws), str(self.prompt), str(self.run_dir), max_wait],
+                argv,
                 spawn=launch.spawn,
                 pgrep=self.pgrep,
                 sleep=lambda _s: None,
@@ -272,6 +275,152 @@ class RunWorkerTests(unittest.TestCase):
         kept = (self.state / "run-dirs.txt").read_text(encoding="utf-8").splitlines()
         self.assertEqual(kept, [str(self.run_dir)])
         self.assertLessEqual(len(kept), MAX_ENTRIES)
+
+
+class PreflightTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.state = self.root / "state"
+        self.state.mkdir()
+        self.ws = self.root / "ws"
+        self.ws.mkdir()
+        self.prompt = self.root / "prompt.md"
+        self.prompt.write_text("do the task\n", encoding="utf-8")
+        self.run_dir = self.root / "runs"
+        self.reg = self.root / "workers.json"
+        self.reg.write_text(json.dumps(registry()), encoding="utf-8")
+        self.env = {
+            "AGENT_DASH_WORKERS": os.environ.get("AGENT_DASH_WORKERS"),
+            "AGENT_DASH_STATE_DIR": os.environ.get("AGENT_DASH_STATE_DIR"),
+        }
+        os.environ["AGENT_DASH_WORKERS"] = str(self.reg)
+        os.environ["AGENT_DASH_STATE_DIR"] = str(self.state)
+        self.counts = {}
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+
+        run_dir = str(self.run_dir)
+
+        class Stub(BaseHTTPRequestHandler):
+            def do_GET(self):
+                if self.path != "/api/health":
+                    body = b"{}"
+                    self.send_response(404)
+                else:
+                    body = json.dumps(
+                        {
+                            "ok": True,
+                            "sources": [],
+                            "scratch_roots": [run_dir],
+                            "run_dirs": [],
+                            "warnings": [],
+                        }
+                    ).encode()
+                    self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):
+                return
+
+        self.stub = HTTPServer(("127.0.0.1", 0), Stub)
+        import threading
+
+        self.stub_thread = threading.Thread(
+            target=self.stub.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True
+        )
+        self.stub_thread.start()
+        self.keep_url = os.environ.get("AGENT_DASH_URL")
+        os.environ["AGENT_DASH_URL"] = f"http://127.0.0.1:{self.stub.server_address[1]}"
+
+    def tearDown(self):
+        self.stub.shutdown()
+        self.stub_thread.join(3)
+        self.stub.server_close()
+        if self.keep_url is None:
+            os.environ.pop("AGENT_DASH_URL", None)
+        else:
+            os.environ["AGENT_DASH_URL"] = self.keep_url
+        for key, value in self.env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        self.tmp.cleanup()
+
+    def pgrep(self, pattern):
+        return self.counts.get(pattern, 0)
+
+    def launch(self, tier, label="lane-1", no_preflight=False):
+        from io import StringIO
+        import contextlib
+
+        out, err = StringIO(), StringIO()
+        launch = Launch()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = runner.run(
+                [tier, label, str(self.ws), str(self.prompt), str(self.run_dir), "0"]
+                + ([] if not no_preflight else ["--no-preflight"]),
+                spawn=launch.spawn,
+                pgrep=self.pgrep,
+                sleep=lambda _s: None,
+                now=lambda: NOW,
+                alive=launch.is_alive,
+                new_uuid=lambda: SID,
+            )
+        return code, out.getvalue().strip(), err.getvalue().strip(), launch
+
+    def _write_registry(self, workers):
+        data = registry()
+        data["workers"] = workers
+        self.reg.write_text(json.dumps(data), encoding="utf-8")
+
+    def test_preflight_blocks_when_dashboard_down(self):
+        os.environ["AGENT_DASH_URL"] = "http://127.0.0.1:1"
+        self.counts = {}
+        code, _out, err, launch = self.launch("default")
+        self.assertEqual(code, 1)
+        self.assertEqual(launch.cmds, [])
+        self.assertIn("preflight (dashboard-down)", err)
+        self.assertIn("python3 agent_dash.py run", err)
+
+    def test_no_preflight_skips_the_gate(self):
+        os.environ["AGENT_DASH_URL"] = "http://127.0.0.1:1"
+        self.counts = {}
+        code, out, _err, launch = self.launch("default", no_preflight=True)
+        self.assertEqual(code, 0)
+        self.assertIn("STATUS: done", out)
+        self.assertEqual(len(launch.cmds), 1)
+
+    def test_preflight_passes_and_launches(self):
+        self.counts = {}
+        code, out, _err, launch = self.launch("default")
+        self.assertEqual(code, 0)
+        self.assertIn("STATUS: done", out)
+        self.assertIn("tier=muse", out)
+        self.assertEqual(len(launch.cmds), 1)
+
+    def test_preflight_blocks_unpriced_model(self):
+        workers = registry()["workers"]
+        workers["muse"] = dict(workers["muse"], model="no-such-model-xyz")
+        self._write_registry(workers)
+        self.counts = {}
+        code, _out, err, launch = self.launch("muse")
+        self.assertEqual(code, 1)
+        self.assertEqual(launch.cmds, [])
+        self.assertIn("preflight (unpriced-model)", err)
+
+    def test_preflight_blocks_policy_breach(self):
+        workers = registry()["workers"]
+        workers["muse"] = dict(workers["muse"], extra_args=["--trust-workspace"])
+        self._write_registry(workers)
+        self.counts = {}
+        code, _out, err, launch = self.launch("muse")
+        self.assertEqual(code, 1)
+        self.assertEqual(launch.cmds, [])
+        self.assertIn("preflight (model-policy)", err)
 
 
 if __name__ == "__main__":

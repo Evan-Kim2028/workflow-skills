@@ -37,6 +37,8 @@ _SESSION = re.compile(r"--session-id(?:=|\s+)(" + _UUID + r")")
 _PROMPT = re.compile(r"--prompt-file(?:=|\s+)(\S+)")
 _MODEL = re.compile(r"--model(?:=|\s+)(\S+)")
 _MODEL_OK = re.compile(r"^[^\s'\";|&<>]{1,200}$")
+_REASONING_EFFORT = re.compile(r"--reasoning-effort(?:=|\s+)(\S+)")
+_EFFORT_OK = re.compile(r"^[A-Za-z0-9_.-]{1,32}$")
 _UUID_OK = re.compile(r"^" + _UUID + r"$")
 
 
@@ -94,6 +96,7 @@ def live_agent_processes(now: float | None = None) -> list[dict]:
                 "started_at": now - float(row["elapsed_s"]),
                 "label": label,
                 "model": token.get("model"),
+                "reasoning_effort": token.get("reasoning_effort"),
                 "prompt_label": prompt_label,
                 "session_id": token.get("session_id") if muse else None,
             }
@@ -584,7 +587,8 @@ def _tokens_by_pid() -> dict:
         session_id = session_id_from_args(line)
         prompt_label = prompt_label_from_args(line)
         model = model_from_args(line)
-        if not label and not session_id and not prompt_label and not model:
+        effort = reasoning_effort_from_args(line)
+        if not label and not session_id and not prompt_label and not model and not effort:
             continue
         pid = _pid(line.strip().split(None, 1)[0] if line.strip() else None)
         if pid is not None:
@@ -593,6 +597,7 @@ def _tokens_by_pid() -> dict:
                 "session_id": session_id,
                 "prompt_label": prompt_label,
                 "model": model,
+                "reasoning_effort": effort,
             }
     return found
 
@@ -686,6 +691,35 @@ def model_from_args(text: str) -> str | None:
     if not _MODEL_OK.match(value):
         return None
     return value
+
+
+def reasoning_effort_from_args(text: str) -> str | None:
+    """The muse ``--reasoning-effort <level>`` (or ``--reasoning-effort=<level>``) token.
+
+    Returns only that one value; every other argument is discarded. This
+    feeds the model-policy doctor check, which reports the worker label
+    and never the rest of argv.
+    """
+    match = _REASONING_EFFORT.search(text or "")
+    if not match:
+        return None
+    value = match.group(1).strip("'\"")
+    if not _EFFORT_OK.match(value):
+        return None
+    return value
+
+
+def ppid_map() -> dict:
+    """Pid -> parent pid for every live process. Empty when ps fails.
+
+    The orphan-worker doctor check joins this against the labelled worker
+    listing; a worker reparented to pid 1 with no live run row is reported,
+    never signaled.
+    """
+    try:
+        return {row["pid"]: row["ppid"] for row in _ps()}
+    except Exception:
+        return {}
 
 
 def prompt_label_from_args(text: str) -> str | None:

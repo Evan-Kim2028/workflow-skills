@@ -59,6 +59,7 @@ class DashServer(ThreadingHTTPServer):
         self.store = store
         self.registry = registry
         self.cfg = cfg or {}
+        self.doctor = None
         self.index_path = Path(index_path) if index_path is not None else INDEX_PATH
         self.stream_interval = stream_interval
         self.stop = threading.Event()
@@ -140,7 +141,12 @@ class Handler(BaseHTTPRequestHandler):
                 if unpriced:
                     body["ok"] = False
                     body["unpriced_models"] = unpriced
+                body["doctor"] = self._doctor_block(now)
+                if int((body["doctor"].get("summary") or {}).get("critical", 0)) > 0:
+                    body["ok"] = False
                 self._json(200, body)
+            elif path == "/api/doctor":
+                self._doctor(query)
             elif path == "/api/state":
                 self._state()
             elif path.startswith("/static/"):
@@ -174,6 +180,44 @@ class Handler(BaseHTTPRequestHandler):
                 processes=_live_workers(),
             ),
         )
+
+    def _doctor_block(self, now: float) -> dict:
+        """The ``doctor`` block for ``/api/health``: summary plus generation time."""
+        try:
+            payload = self.server.store.doctor_latest(now)
+        except Exception:
+            return {"summary": {"critical": 0, "warn": 0, "info": 0, "regressed": 0}, "generated_at": None}
+        return {
+            "summary": payload.get("summary") or {"critical": 0, "warn": 0, "info": 0, "regressed": 0},
+            "generated_at": payload.get("generated_at"),
+        }
+
+    def _doctor(self, query):
+        """``GET /api/doctor``: the latest persisted run. Never runs checks inline."""
+        ws = _one(query, "ws")
+        if ws == "all":
+            ws = None
+        elif ws is not None and (ws in (".", "..") or not _WS.match(ws)):
+            raise ValueError("bad ws")
+        severity = _one(query, "severity")
+        if severity is not None and severity not in ("critical", "warn", "info"):
+            raise ValueError("bad severity")
+        refresh = _one(query, "refresh")
+        scheduler = getattr(self.server, "doctor", None)
+        if refresh == "1" and scheduler is not None:
+            try:
+                scheduler.queue_refresh()
+            except Exception:
+                pass
+        now = time.time()
+        if scheduler is not None:
+            try:
+                body = scheduler.latest(now, ws, severity)
+            except Exception:
+                body = self.server.store.doctor_latest(now, ws, severity)
+        else:
+            body = self.server.store.doctor_latest(now, ws, severity)
+        self._json(200, body)
 
     def _static(self, name):
         """Serve a file from static/ or one subdirectory (json, js, css, svg, html). No dotfiles, no traversal."""

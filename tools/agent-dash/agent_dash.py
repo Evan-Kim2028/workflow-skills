@@ -50,7 +50,9 @@ USAGE = """agent-dash: local read-only execution dashboard
   python3 agent_dash.py check --page [--url URL] [--json]
   python3 agent_dash.py state [--url URL] [--json]
   python3 agent_dash.py status [--json]
-  python3 agent_dash.py doctor [--url URL] [--json]
+  python3 agent_dash.py doctor [--url URL] [--json] [--ws ID] [--severity S]
+  python3 agent_dash.py doctor --fix [--yes]
+  python3 agent_dash.py doctor report [--since 24h] [--md]
   python3 agent_dash.py report start --label <label> [--model M] [--session S] [--run-id R] [--tier T]
   python3 agent_dash.py report finish --label <label> --verdict PASS [--session S] [--run-id R] [--status done]
   python3 agent_dash.py report usage --label <label> --input N --output N [--model M] [--session S] [--run-id R]
@@ -97,6 +99,16 @@ def default_cfg() -> dict:
         "poll_budget_s": 25.0,
         "backfill": False,
         "backfill_session": None,
+        "doctor": {
+            "interval_s": 300,
+            "stuck_hours": 6,
+            "approval_days": 3,
+            "train_hours": 24,
+            "model_policy": {
+                "muse_reasoning_effort": "xhigh",
+                "grok_require_bracketed_500k": True,
+            },
+        },
     }
 
 
@@ -493,28 +505,197 @@ def _print_state(payload: dict) -> None:
 
 
 def cmd_doctor(argv: list[str]) -> int:
-    """Diagnose setup problems and print the fix. Read-only. Exit 0 clean, 1 problems."""
-    from dash.doctor import format_human, run_doctor
+    """Diagnose setup problems and print the fix. Exit 0 clean, 1 problems.
+
+    Reads ``GET /api/doctor`` when the server is up and falls back to a
+    local run (persisted like a server run). ``--ws`` keeps one
+    workstream's problems plus global ones; ``--severity`` is the minimum
+    level shown. ``--fix`` lists the safe automatic fixes without applying
+    them; ``--fix --yes`` applies them. ``doctor report`` digests history.
+    """
+    from dash.doctor import (
+        apply_safe_fixes,
+        collect_problems,
+        format_doctor_human,
+        format_report,
+        parse_since,
+        safe_fixes,
+    )
 
     url = URL
     json_mode = False
+    ws = None
+    severity = None
+    fix = False
+    yes = False
     rest = list(argv)
+    if rest[:1] == ["report"]:
+        return cmd_doctor_report(rest[1:])
     while rest:
         flag = rest.pop(0)
         if flag == "--url" and rest:
             url = rest.pop(0).rstrip("/")
         elif flag == "--json":
             json_mode = True
+        elif flag == "--ws" and rest:
+            ws = rest.pop(0)
+        elif flag == "--severity" and rest:
+            severity = rest.pop(0)
+        elif flag == "--fix":
+            fix = True
+        elif flag == "--yes":
+            yes = True
         else:
             print(USAGE, end="", file=sys.stderr)
             return 2
+    if severity is not None and severity not in ("critical", "warn", "info"):
+        print(
+            f"doctor needs --severity critical|warn|info (got {severity!r}). "
+            "Run: python3 agent_dash.py doctor --severity warn",
+            file=sys.stderr,
+        )
+        return 2
+    if yes and not fix:
+        print("doctor --yes needs --fix. Run: python3 agent_dash.py doctor --fix --yes", file=sys.stderr)
+        return 2
     cfg = bind_state()
-    result = run_doctor(cfg, url)
-    if json_mode:
-        errors.emit_json(result)
+    payload, store = _doctor_payload(cfg, url, ws, severity)
+    try:
+        if fix:
+            return cmd_doctor_fix(store, cfg, payload, yes, json_mode)
+        if json_mode:
+            errors.emit_json(_doctor_cli_json(payload))
+        else:
+            print(format_doctor_human(payload))
+        return _doctor_exit(payload)
+    finally:
+        if store is not None:
+            try:
+                store.close()
+            except Exception:
+                pass
+
+
+def _doctor_payload(cfg: dict, url: str, ws, severity):
+    """``(payload, store-or-None)`` from the server, else a local run.
+
+    The local fallback collects and snapshots with the background
+    scheduler's settings, so history stays continuous while the server
+    is down. The caller closes the returned store.
+    """
+    from dash.doctor import collect_problems, doctor_cfg
+
+    params = ""
+    if ws not in (None, "all"):
+        params += f"&ws={ws}" if params else f"?ws={ws}"
+    if severity is not None:
+        params += f"&severity={severity}" if params else f"?severity={severity}"
+    payload, _error = _fetch(url, f"/api/doctor{params}")
+    if payload is not None:
+        return payload, None
+    from dash.sources.process import live_worker_processes
+
+    try:
+        processes = live_worker_processes() or []
+    except Exception:
+        processes = []
+    store = Store(DBFILE)
+    now = time.time()
+    result = collect_problems(store, cfg, now, url=url, health=None, processes=processes)
+    payload = store.doctor_snapshot(result["problems"], now, doctor_cfg(cfg)["interval_s"])
+    if ws not in (None, "all") or severity is not None:
+        payload = store.doctor_latest(now, ws, severity)
+    return payload, store
+
+
+def _doctor_cli_json(payload: dict) -> dict:
+    """Machine payload: the API body plus the exit verdict over shown problems."""
+    shown = [item for item in payload.get("problems") or [] if item.get("severity") in ("critical", "warn")]
+    return {**payload, "ok": not shown}
+
+
+def _doctor_exit(payload: dict) -> int:
+    """Exit 1 when a shown problem is critical or a warning, else 0."""
+    for item in payload.get("problems") or []:
+        if item.get("severity") in ("critical", "warn"):
+            return 1
+    return 0
+
+
+def cmd_doctor_fix(store, cfg: dict, payload: dict, yes: bool, json_mode: bool) -> int:
+    """List (``--fix``) or apply (``--fix --yes``) the safe automatic fixes."""
+    from dash.doctor import _fix_command, apply_safe_fixes, safe_fixes
+
+    problems = payload.get("problems") or []
+    fixes = safe_fixes(problems)
+    if not yes:
+        lines = [f"doctor --fix dry run: {len(fixes)} safe fix(es), nothing applied"]
+        for item in fixes:
+            lines.append(f"  would apply [{item.get('code')}] {_fix_command(item)}")
+        lines.append("  would also: prune dead offset rows; backfill run models")
+        lines.append("re-run with --fix --yes to apply")
+        text = "\n".join(lines)
+        if json_mode:
+            errors.emit_human(text, True)
+            errors.emit_json({"dry_run": True, "fixes": [_fix_command(item) for item in fixes]})
+        else:
+            print(text)
+        return 0
+    if store is None:
+        store = Store(DBFILE)
+        close = True
     else:
-        print(format_human(result))
-    return 0 if result.get("ok") else 1
+        close = False
+    try:
+        messages = apply_safe_fixes(store, cfg, problems)
+    finally:
+        if close:
+            try:
+                store.close()
+            except Exception:
+                pass
+    text = "\n".join(["doctor --fix applied:"] + [f"  {line}" for line in messages])
+    if json_mode:
+        errors.emit_human(text, True)
+        errors.emit_json({"applied": messages})
+    else:
+        print(text)
+    return 0
+
+
+def cmd_doctor_report(argv: list[str]) -> int:
+    """Digest history for hub reports: new, regressed, resolved, open by severity and workstream."""
+    from dash.doctor import format_report, parse_since
+
+    since_raw = None
+    md = False
+    rest = list(argv)
+    while rest:
+        flag = rest.pop(0)
+        if flag == "--since" and rest:
+            since_raw = rest.pop(0)
+        elif flag == "--md":
+            md = True
+        else:
+            print(USAGE, end="", file=sys.stderr)
+            return 2
+    bind_state()
+    now = time.time()
+    try:
+        since = parse_since(since_raw, now)
+    except ValueError as exc:
+        print(f"{exc}. Run: python3 agent_dash.py doctor report --since 24h", file=sys.stderr)
+        return 2
+    store = Store(DBFILE)
+    try:
+        report = store.doctor_report(since, now)
+    finally:
+        try:
+            store.close()
+        except Exception:
+            pass
+    print(format_report(report, md), end="")
+    return 0
 
 
 def cmd_backfill(session_id: str) -> int:
@@ -1013,10 +1194,14 @@ def prune_if_due(store, state_dir, now: float, last: float | None, interval: flo
 
 
 def _serve() -> None:
+    from dash.doctor import DoctorScheduler
+
     cfg = load_cfg()
     store = Store(DBFILE)
     registry = Registry()
     server = DashServer(store, registry, HOST, PORT, cfg=cfg)
+    server.doctor = DoctorScheduler(store, registry, cfg)
+    server.doctor.start()
     tmp = PIDFILE.with_suffix(".tmp")
     tmp.write_text(str(os.getpid()) + "\n", encoding="utf-8")
     os.replace(tmp, PIDFILE)
@@ -1051,6 +1236,10 @@ def _serve() -> None:
     finally:
         stop.set()
         server.stop.set()
+        try:
+            server.doctor.stop()
+        except Exception:
+            pass
         server.server_close()
         store.close()
         PIDFILE.unlink(missing_ok=True)

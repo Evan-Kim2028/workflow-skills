@@ -1,25 +1,48 @@
-"""`agent_dash.py doctor`: diagnose setup problems and print the fix.
+"""Always-on doctor: scheduled checks with persisted history.
 
-Read-only: doctor never changes anything. It only reads the dashboard
-HTTP API, the state directory, config files, scratch roots, bundles,
-and the local toolchain. Exit 0 when clean, 1 when problems found.
-Warnings (a dirty checkout) are listed but do not fail.
+The server runs :func:`collect_problems` in a background thread every
+``doctor.interval_s`` seconds (default 300) and persists the result in
+the ``doctor_problems`` store table. ``GET /api/doctor`` serves the
+latest persisted run; it never runs checks inline (``?refresh=1`` only
+queues a run). ``doctor --fix`` applies only safe, local, reversible
+fixes and otherwise just lists them; ``doctor report`` digests history
+for hub reports. ``scripts/run_worker.py`` runs a fast local preflight
+before launching unless ``--no-preflight`` is passed.
+
+The doctor never signals a process and never writes to any source:
+orphan detection only reports. Only the worker label (and the already
+stored ``--model`` flag value) ever leaves a process listing.
 """
 
 from __future__ import annotations
 
 import glob
+import hashlib
 import json
+import logging
 import os
 import shutil
 import sqlite3
 import subprocess
 import sys
+import threading
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
+from types import SimpleNamespace
 
 TOOL_ROOT = Path(__file__).resolve().parents[1]
+log = logging.getLogger("agent_dash.doctor")
+
+SEVERITIES = ("critical", "warn", "info")
+SEV_RANK = {"critical": 0, "warn": 1, "info": 2}
+TERMINAL_RUN = ("done", "killed", "died_early")
+TERMINAL_TRAIN = ("merged", "dropped")
+ORPHAN_MIN_AGE_S = 600.0
+FIRST_RUN_DELAY_S = 30.0
+FULL_POLL_WAIT_S = 120.0
+RESOLVED_KEEP_S = 14 * 86400
 
 KNOWN_TOP_KEYS = {
     "host",
@@ -36,6 +59,7 @@ KNOWN_TOP_KEYS = {
     "backfill_session",
     "dagster",
     "caps",
+    "doctor",
 }
 KNOWN_ROOT_KEYS = {
     "claude_projects",
@@ -62,106 +86,306 @@ SOURCE_STALE_S = 900.0
 MIN_PYTHON = (3, 9)
 
 
-def run_doctor(cfg: dict, url: str, now: float | None = None) -> dict:
-    """Run every check. Returns ``{"ok", "problems", "checks"}``."""
-    import time as _time
+def doctor_cfg(cfg: dict | None) -> dict:
+    """Effective doctor settings: interval, thresholds, model policy."""
+    raw = (cfg or {}).get("doctor") if isinstance((cfg or {}).get("doctor"), dict) else {}
+    policy = raw.get("model_policy") if isinstance(raw.get("model_policy"), dict) else {}
+    out = {
+        "interval_s": 300.0,
+        "stuck_hours": 6.0,
+        "approval_days": 3.0,
+        "train_hours": 24.0,
+        "model_policy": {
+            "muse_reasoning_effort": policy.get("muse_reasoning_effort", "xhigh"),
+            "grok_require_bracketed_500k": policy.get("grok_require_bracketed_500k", True),
+        },
+    }
+    for key in ("interval_s", "stuck_hours", "approval_days", "train_hours"):
+        try:
+            value = float(raw.get(key, out[key]))
+        except (TypeError, ValueError):
+            continue
+        if value > 0:
+            out[key] = value
+    return out
 
-    now = float(now if now is not None else _time.time())
-    state_dir = Path(str(cfg.get("state_dir") or "")) if cfg.get("state_dir") else None
-    checks: list[dict] = []
-    problems: list[dict] = []
 
-    def problem(code: str, message: str, command: str, warning: bool = False):
-        problems.append({"code": code, "message": message, "command": command, **({"warning": True} if warning else {})})
+def slug(text: str) -> str:
+    """Stable 12-hex id key for a free-form message."""
+    return hashlib.sha1(str(text).encode("utf-8")).hexdigest()[:12]
 
-    def check(name: str, ok: bool, detail: str):
-        checks.append({"name": name, "ok": ok, "detail": detail})
-        return ok
 
-    health = _get(url, "/api/health", timeout=10)
+def make_problem(
+    code: str,
+    severity: str,
+    scope: str,
+    ws: str | None,
+    title: str,
+    detail: str,
+    command: str,
+    safe_auto: bool = False,
+    key: str | None = None,
+) -> dict:
+    """One fresh (unpersisted) problem. The store fills history on snapshot."""
+    pid = f"{code}:{scope}" + (f":{key}" if key else "")
+    return {
+        "id": pid,
+        "code": code,
+        "severity": severity if severity in SEV_RANK else "warn",
+        "scope": scope,
+        "ws": ws,
+        "title": title,
+        "detail": detail,
+        "fix_command": command,
+        "safe_auto": bool(safe_auto),
+    }
+
+
+def collect_problems(
+    store,
+    cfg: dict | None,
+    now: float,
+    *,
+    url: str = "",
+    health: dict | None = None,
+    registry=None,
+    processes: list | None = None,
+    argv_tokens: dict | None = None,
+    pgrep_counts: dict | None = None,
+    workers_registry: dict | None = None,
+    ppids: dict | None = None,
+) -> dict:
+    """Run every check. Returns ``{"problems", "checks"}`` with fresh problems.
+
+    Nothing is persisted here; the caller snapshots via
+    ``store.doctor_snapshot``. ``store`` may be None (store-backed checks
+    are skipped). ``health`` is the dashboard health payload, or None when
+    the dashboard is down. ``processes`` is the live worker listing; when
+    None the fleet checks that need it are skipped. ``argv_tokens``,
+    ``pgrep_counts``, ``workers_registry``, and ``ppids`` override the
+    live reads (tests inject fakes).
+    """
+    cfg = cfg if isinstance(cfg, dict) else {}
+    ctx = SimpleNamespace(
+        store=store,
+        cfg=cfg,
+        dcfg=doctor_cfg(cfg),
+        now=float(now),
+        url=url,
+        health=health,
+        registry=registry,
+        processes=list(processes) if processes is not None else None,
+        argv_tokens=argv_tokens,
+        pgrep_counts=pgrep_counts,
+        workers_registry=workers_registry,
+        ppids=ppids,
+        problems=[],
+        checks=[],
+        emitted=set(),
+        _runs=None,
+        _runs_loaded=False,
+    )
+    _collect_dashboard(ctx)
+    _collect_roots(ctx)
+    _collect_pricing(ctx)
+    _collect_reconcile(ctx)
+    _collect_bundles(ctx)
+    _collect_fleet(ctx)
+    _collect_page(ctx)
+    _collect_config(ctx)
+    _collect_checkout(ctx)
+    _collect_python(ctx)
+    return {"problems": ctx.problems, "checks": ctx.checks}
+
+
+def _add(ctx, code, severity, scope, ws, title, detail, command, safe_auto=False, key=None):
+    item = make_problem(code, severity, scope, ws, title, detail, command, safe_auto, key)
+    if item["id"] in ctx.emitted:
+        return None
+    ctx.emitted.add(item["id"])
+    ctx.problems.append(item)
+    return item
+
+
+def _check(ctx, name: str, ok: bool, detail: str):
+    ctx.checks.append({"name": name, "ok": bool(ok), "detail": detail})
+    return ok
+
+
+def _collect_dashboard(ctx) -> None:
+    """Dashboard reachability and per-source health from the health payload."""
+    health = ctx.health
     if health is None:
-        check("dashboard", False, f"not reachable at {url}")
-        problem("dashboard-down", f"dashboard not reachable at {url}", "python3 agent_dash.py run")
+        _check(ctx, "dashboard", False, f"not reachable at {ctx.url}")
+        _add(
+            ctx, "dashboard-down", "critical", "global", None,
+            "Dashboard is down",
+            f"dashboard not reachable at {ctx.url}",
+            "python3 agent_dash.py run",
+        )
+        return
+    sources = health.get("sources") or []
+    bad = [s.get("name") for s in sources if s.get("last_error")]
+    stalled = [s.get("name") for s in sources if not s.get("last_error") and s.get("stalled")]
+    if health.get("ok") and not bad and not stalled:
+        _check(ctx, "dashboard", True, f"up at {ctx.url}, {len(sources)} sources healthy")
     else:
-        sources = health.get("sources") or []
-        bad = [s.get("name") for s in sources if s.get("last_error")]
-        if health.get("ok") and not bad:
-            check("dashboard", True, f"up at {url}, {len(sources)} sources healthy")
+        unpriced = [
+            str(item.get("model"))
+            for item in (health.get("unpriced_models") or [])
+            if isinstance(item, dict) and item.get("model")
+        ]
+        if bad:
+            cause = f"failing sources: {', '.join(str(name) for name in bad)}"
+        elif stalled:
+            cause = f"stalled sources: {', '.join(str(name) for name in stalled)}"
+        elif unpriced:
+            cause = f"unpriced models: {', '.join(unpriced)}"
         else:
-            unpriced = [
-                str(item.get("model"))
-                for item in (health.get("unpriced_models") or [])
-                if isinstance(item, dict) and item.get("model")
-            ]
-            stalled = [s.get("name") for s in sources if s.get("stalled")]
-            if bad:
-                cause = f"failing sources: {', '.join(bad)}"
-            elif stalled:
-                cause = f"stalled sources: {', '.join(stalled)}"
-            elif unpriced:
-                cause = f"unpriced models: {', '.join(unpriced)}"
-            else:
-                cause = "ok=false"
-            check("dashboard", False, f"unhealthy: {cause}")
-            problem(
-                "dashboard-unhealthy",
-                f"dashboard at {url} reports {cause}",
+            cause = "ok=false"
+        _check(ctx, "dashboard", False, f"unhealthy: {cause}")
+        if not bad and not stalled and not unpriced:
+            _add(
+                ctx, "dashboard-unhealthy", "warn", "global", None,
+                "Dashboard reports unhealthy",
+                f"dashboard at {ctx.url} reports {cause}",
                 "python3 agent_dash.py status",
             )
-        stale = [
-            s.get("name")
-            for s in sources
-            if not s.get("last_error")
-            and (s.get("last_poll") is None or (s.get("lag_s") or 0) > SOURCE_STALE_S)
-        ]
-        if not stale:
-            check("sources", True, f"{len(sources)} sources polled recently, no errors")
-        else:
-            check("sources", False, f"stale: {', '.join(stale)}")
-            for name in stale:
-                problem(
-                    "source-stale",
-                    f"source {name!r} has no recent poll",
-                    "python3 agent_dash.py status",
-                )
-        for source in sources:
-            if source.get("last_error"):
-                problem(
-                    "source-error",
-                    f"source {source.get('name')!r} last poll failed: {source.get('last_error')}",
-                    "python3 agent_dash.py status",
-                )
-
-    _check_health_roots(health, checks, problem)
-    _check_scratch(cfg, checks, problem)
-    _check_manifests(cfg, state_dir, checks, problem)
-    _check_pricing(cfg, checks, problem)
-    _check_reconcile(url, health is not None, checks, problem)
-    _check_page(checks, problem)
-    _check_config(cfg, checks, problem)
-    _check_bundles(checks, problem)
-    _check_checkout(checks, problem)
-    _check_python(checks, problem)
-
-    hard = [item for item in problems if not item.get("warning")]
-    return {"ok": not hard, "problems": problems, "checks": checks}
-
-
-def format_human(result: dict) -> str:
-    lines = []
-    for item in result.get("checks") or []:
-        mark = "ok" if item.get("ok") else "FAIL"
-        lines.append(f"[{mark}] {item.get('name')}: {item.get('detail')}")
-    problems = result.get("problems") or []
-    if problems:
-        lines.append("")
-        for item in problems:
-            tag = "warning" if item.get("warning") else "problem"
-            lines.append(f"{tag} ({item.get('code')}): {item.get('message')}")
-            lines.append(f"  fix: {item.get('command')}")
+    for source in sources:
+        name = source.get("name")
+        if source.get("last_error"):
+            _add(
+                ctx, "source-error", "critical", "global", None,
+                f"Source {name} is failing",
+                f"source {name!r} last poll failed: {source.get('last_error')}",
+                "python3 agent_dash.py status",
+                key=str(name),
+            )
+        elif source.get("stalled") or (
+            not source.get("last_error")
+            and (source.get("last_poll") is None or (source.get("lag_s") or 0) > SOURCE_STALE_S)
+        ):
+            _add(
+                ctx, "source-stalled", "critical", "global", None,
+                f"Source {name} is stalled",
+                f"source {name!r} has no recent poll (last_poll={source.get('last_poll')})",
+                "python3 agent_dash.py status",
+                key=str(name),
+            )
+    stale = [
+        str(s.get("name"))
+        for s in sources
+        if not s.get("last_error")
+        and (s.get("last_poll") is None or (s.get("lag_s") or 0) > SOURCE_STALE_S)
+    ]
+    if not stale:
+        _check(ctx, "sources", True, f"{len(sources)} sources polled recently, no errors")
     else:
-        lines.append("doctor: clean, no problems found")
-    return "\n".join(lines)
+        _check(ctx, "sources", False, f"stale: {', '.join(stale)}")
+    _check_health_roots(ctx)
+
+
+def _check_health_roots(ctx) -> None:
+    """Surface the dashboard's own run-dir visibility report."""
+    health = ctx.health
+    if health is None:
+        _check(ctx, "run-dirs", True, "skipped, dashboard is down")
+        return
+    roots = health.get("scratch_roots")
+    run_dirs = health.get("run_dirs")
+    warnings = health.get("warnings") or []
+    if roots is None and run_dirs is None and not warnings:
+        _check(ctx, "run-dirs", True, "dashboard reports no run-dir data")
+        return
+    detail = f"{len(run_dirs or [])} registered run dirs, {len(roots or [])} scratch roots"
+    if not warnings:
+        _check(ctx, "run-dirs", True, detail)
+        return
+    _check(ctx, "run-dirs", False, f"{detail}; {len(warnings)} outside roots")
+    for warning in warnings:
+        _add(
+            ctx, "run-dir-outside-roots", "info", "global", None,
+            "Run folder outside the configured roots",
+            str(warning),
+            "add the path to roots.scratchpads in config, then restart the dashboard",
+            safe_auto=True,
+            key=slug(warning),
+        )
+
+
+def _collect_reconcile(ctx) -> None:
+    if ctx.health is None:
+        _check(ctx, "reconcile", True, "skipped, dashboard is down")
+        return
+    if ctx.store is None:
+        _check(ctx, "reconcile", True, "skipped, no store")
+        return
+    if ctx.health is not None and ctx.url:
+        payload = _get(ctx.url, "/api/reconcile?hours=24", timeout=15)
+        server_mismatches = payload.get("mismatches") if isinstance(payload, dict) else None
+    else:
+        server_mismatches = None
+    if server_mismatches is None and (ctx.health is None or ctx.url):
+        _check(ctx, "reconcile", False, "reconcile endpoint unreadable")
+        _add(
+            ctx, "reconcile-unreadable", "warn", "global", None,
+            "Reconcile endpoint is unreadable",
+            "GET /api/reconcile failed",
+            "python3 agent_dash.py status",
+        )
+        return
+    try:
+        body = ctx.store.reconcile_numbers(ctx.now, None, None, ctx.processes or [])
+        local = body.get("mismatches") or []
+    except Exception:
+        local = []
+    seen: set[str] = set()
+    mismatches: list[str] = []
+    for item in list(server_mismatches or []) + list(local):
+        text = str(item)
+        if text not in seen:
+            seen.add(text)
+            mismatches.append(text)
+    if not mismatches:
+        _check(ctx, "reconcile", True, "workstreams reconcile, no mismatches")
+        return
+    _check(ctx, "reconcile", False, f"{len(mismatches)} mismatches")
+    for item in mismatches:
+        _reconcile_problem(ctx, item)
+
+
+def _reconcile_problem(ctx, item: str) -> None:
+    """Map one mismatch string to its problem code and severity."""
+    if item.startswith("unseen worker: "):
+        rest = item[len("unseen worker: "):]
+        label = rest.split(" (", 1)[0].strip()
+        _add(
+            ctx, "unseen-worker", "critical", "global", None,
+            "Worker is invisible on the dashboard",
+            item,
+            "python3 agent_dash.py check",
+            key=label or slug(item),
+        )
+        return
+    if item.startswith("unpriced model: "):
+        return
+    if item.startswith("source stalled: "):
+        name = item[len("source stalled: "):].split(" (", 1)[0].strip()
+        _add(
+            ctx, "source-stalled", "critical", "global", None,
+            f"Source {name} is stalled",
+            item,
+            "python3 agent_dash.py status",
+            key=name or slug(item),
+        )
+        return
+    _add(
+        ctx, "reconcile-mismatch", "critical", "global", None,
+        "Dashboard numbers disagree",
+        item,
+        "python3 agent_dash.py check",
+        key=slug(item),
+    )
 
 
 def _get(url: str, path: str, timeout: float = 10):
@@ -193,80 +417,83 @@ def _scratch_patterns(cfg: dict) -> list[str]:
     return []
 
 
-def _check_health_roots(health, checks: list, problem) -> None:
-    """Surface the dashboard's own run-dir visibility report.
-
-    ``/api/health`` carries ``scratch_roots`` (configured), ``run_dirs``
-    (registered), and ``warnings`` (a registered folder outside the
-    configured roots holding a live worker manifest). Each warning is a
-    problem with the same fix as the local manifest-coverage check.
-    """
-    if health is None:
-        checks.append({"name": "run-dirs", "ok": True, "detail": "skipped, dashboard is down"})
-        return
-    roots = health.get("scratch_roots")
-    run_dirs = health.get("run_dirs")
-    warnings = health.get("warnings") or []
-    if roots is None and run_dirs is None and not warnings:
-        checks.append({"name": "run-dirs", "ok": True, "detail": "dashboard reports no run-dir data"})
-        return
-    detail = f"{len(run_dirs or [])} registered run dirs, {len(roots or [])} scratch roots"
-    if not warnings:
-        checks.append({"name": "run-dirs", "ok": True, "detail": detail})
-        return
-    checks.append({"name": "run-dirs", "ok": False, "detail": f"{detail}; {len(warnings)} outside roots"})
-    for warning in warnings:
-        problem(
-            "run-dir-outside-roots",
-            str(warning),
-            "add the path to roots.scratchpads in config, then restart the dashboard",
-        )
-
-
-def _check_scratch(cfg: dict, checks: list, problem) -> None:
+def _collect_roots(ctx) -> None:
     from dash.locate import expand
 
-    patterns = _scratch_patterns(cfg)
+    patterns = _scratch_patterns(ctx.cfg)
     if not patterns:
-        checks.append({"name": "scratch-roots", "ok": True, "detail": "no scratchpads configured"})
+        _check(ctx, "scratch-roots", True, "no scratchpads configured")
+    else:
+        missing = []
+        unreadable = []
+        found = 0
+        for pattern in patterns:
+            text = expand(str(pattern)).strip()
+            matches = _expand(pattern)
+            if not matches:
+                missing.append(text or pattern)
+                continue
+            for match in matches:
+                found += 1
+                if not (os.access(match, os.R_OK) and os.access(match, os.X_OK)):
+                    unreadable.append(match)
+        if not missing and not unreadable:
+            _check(ctx, "scratch-roots", True, f"{found} roots readable")
+        else:
+            detail = "; ".join(
+                ([f"missing: {', '.join(missing)}"] if missing else [])
+                + ([f"unreadable: {', '.join(unreadable)}"] if unreadable else [])
+            )
+            _check(ctx, "scratch-roots", False, detail)
+            for path in missing:
+                _add(
+                    ctx, "scratch-root-missing", "warn", "global", None,
+                    "Configured scratch root matches nothing",
+                    f"scratch root {path!r} matches nothing",
+                    "create the directory, or fix roots.scratchpads in config, then restart the dashboard",
+                    key=slug(path),
+                )
+            for path in unreadable:
+                _add(
+                    ctx, "scratch-root-unreadable", "warn", "global", None,
+                    "Configured scratch root is not readable",
+                    f"scratch root {path!r} is not readable",
+                    f"fix permissions on {path}, then restart the dashboard",
+                    key=slug(path),
+                )
+    scanned = _scanned_dirs(ctx.cfg)
+    home_scratch = _home_scratch()
+    places = [home_scratch] + sorted(scanned) + _registry_dirs(_state_dir(ctx.cfg))
+    outside = [item for item in _manifest_dirs(places) if not _covered(item, scanned)]
+    if not outside:
+        _check(ctx, "manifest-coverage", True, f"{len(scanned)} run dirs scanned")
         return
-    missing = []
-    unreadable = []
-    found = 0
-    for pattern in patterns:
-        text = expand(str(pattern)).strip()
-        matches = _expand(pattern)
-        if not matches:
-            missing.append(text or pattern)
-            continue
-        for match in matches:
-            found += 1
-            if not (os.access(match, os.R_OK) and os.access(match, os.X_OK)):
-                unreadable.append(match)
-    if not missing and not unreadable:
-        checks.append({"name": "scratch-roots", "ok": True, "detail": f"{found} roots readable"})
-        return
-    detail = "; ".join(
-        ([f"missing: {', '.join(missing)}"] if missing else [])
-        + ([f"unreadable: {', '.join(unreadable)}"] if unreadable else [])
-    )
-    checks.append({"name": "scratch-roots", "ok": False, "detail": detail})
-    for path in missing:
-        problem(
-            "scratch-root-missing",
-            f"scratch root {path!r} matches nothing",
-            "create the directory, or fix roots.scratchpads in config, then restart the dashboard",
-        )
-    for path in unreadable:
-        problem(
-            "scratch-root-unreadable",
-            f"scratch root {path!r} is not readable",
-            f"fix permissions on {path}, then restart the dashboard",
+    _check(ctx, "manifest-coverage", False, f"manifests outside scanned roots: {'; '.join(outside)}")
+    for item in outside:
+        _add(
+            ctx, "manifest-outside-roots", "info", "global", None,
+            "Worker manifest outside the scanned roots",
+            f"live worker manifest at {item} is outside the scanned roots",
+            "add the path to roots.scratchpads in config, then restart the dashboard",
+            safe_auto=True,
+            key=slug(item),
         )
 
 
 def _home_scratch() -> str:
     return os.path.join(os.path.expanduser("~"), "agent-scratch")
+
+
+def _state_dir(cfg: dict):
+    from dash.locate import expand
+
+    raw = cfg.get("state_dir") if isinstance(cfg, dict) else None
+    if isinstance(raw, str) and raw.strip():
+        return Path(expand(raw))
+    env = os.environ.get("AGENT_DASH_STATE_DIR")
+    if env and env.strip():
+        return Path(expand(env.strip()))
+    return None
 
 
 def _scanned_dirs(cfg: dict) -> set[str]:
@@ -283,12 +510,7 @@ def _scanned_dirs(cfg: dict) -> set[str]:
 
 
 def _registry_dirs(state_dir: Path | None) -> list[str]:
-    """Extra known run dirs from the run-dirs registry file in the state dir, if any.
-
-    ``run-dirs.txt`` holds one absolute path per line (what
-    ``run_worker.py`` and ``report --run-dir`` write); the ``.json``
-    names keep working for older checkouts.
-    """
+    """Extra known run dirs from the run-dirs registry file in the state dir, if any."""
     if state_dir is None:
         return []
     found = []
@@ -349,23 +571,6 @@ def _covered(path: str, scanned: set[str]) -> bool:
     return base in scanned or os.path.dirname(base) in scanned
 
 
-def _check_manifests(cfg: dict, state_dir: Path | None, checks: list, problem) -> None:
-    scanned = _scanned_dirs(cfg)
-    home_scratch = _home_scratch()
-    places = [home_scratch] + sorted(scanned) + _registry_dirs(state_dir)
-    outside = [item for item in _manifest_dirs(places) if not _covered(item, scanned)]
-    if not outside:
-        checks.append({"name": "manifest-coverage", "ok": True, "detail": f"{len(scanned)} run dirs scanned"})
-        return
-    checks.append({"name": "manifest-coverage", "ok": False, "detail": f"manifests outside scanned roots: {'; '.join(outside)}"})
-    for item in outside:
-        problem(
-            "manifest-outside-roots",
-            f"live worker manifest at {item} is outside the scanned roots",
-            "add the path to roots.scratchpads in config, then restart the dashboard",
-        )
-
-
 def _nonempty(path: str) -> bool:
     try:
         return os.path.isfile(path) and os.path.getsize(path) > 0
@@ -373,86 +578,114 @@ def _nonempty(path: str) -> bool:
         return False
 
 
-def _db_path(cfg: dict) -> Path | None:
+def _db_path(cfg: dict):
     from dash.locate import expand
 
     override = os.environ.get("AGENT_DASH_DB")
     if override:
         return Path(expand(override))
-    state = cfg.get("state_dir")
+    state = cfg.get("state_dir") if isinstance(cfg, dict) else None
     if not state:
         return None
     return Path(expand(str(state))) / "dash.sqlite"
 
 
-def _recent_models(db: Path) -> list[dict]:
-    """Models with usage rows, read-only (URI mode=ro, never creates files)."""
+def _db_file(ctx) -> Path | None:
+    """SQLite file for read-only doctor queries: the live store wins."""
+    store = ctx.store
+    path = getattr(store, "path", None)
+    if path is not None and str(path) not in ("", ":memory:"):
+        return Path(str(path))
+    try:
+        file = _db_path(ctx.cfg)
+    except Exception:
+        return None
+    if file is not None and file.is_file():
+        return file
+    return None
+
+
+def _recent_models(db: Path, since: float | None = None) -> list[dict]:
+    """Models with usage rows (and their billed tokens), read-only."""
     try:
         conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
     except sqlite3.Error:
         return []
     try:
         conn.row_factory = sqlite3.Row
-        rows = conn.execute("SELECT model AS model, COUNT(*) AS rows FROM usage_events GROUP BY model").fetchall()
-        return [{"model": row["model"], "rows": row["rows"]} for row in rows]
+        if since is None:
+            rows = conn.execute(
+                """SELECT model AS model, COUNT(*) AS rows,
+                          SUM(COALESCE(input_tokens,0) + COALESCE(output_tokens,0)
+                              + COALESCE(cache_read,0) + COALESCE(cache_write,0)) AS tokens
+                   FROM usage_events GROUP BY model"""
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """SELECT model AS model, COUNT(*) AS rows,
+                          SUM(COALESCE(input_tokens,0) + COALESCE(output_tokens,0)
+                              + COALESCE(cache_read,0) + COALESCE(cache_write,0)) AS tokens
+                   FROM usage_events WHERE ts >= ? GROUP BY model""",
+                (float(since),),
+            ).fetchall()
+        return [
+            {"model": row["model"], "rows": row["rows"], "tokens": row["tokens"] or 0}
+            for row in rows
+        ]
     except sqlite3.Error:
         return []
     finally:
         conn.close()
 
 
-def _check_pricing(cfg: dict, checks: list, problem) -> None:
+def _collect_pricing(ctx) -> None:
     from dash.pricing import catalog as load_catalog
 
     try:
         rows = {row["model"]: row for row in load_catalog()}
     except Exception as exc:
-        checks.append({"name": "pricing", "ok": False, "detail": f"catalog unreadable: {exc}"})
-        problem(
-            "pricing-unreadable",
+        _check(ctx, "pricing", False, f"catalog unreadable: {exc}")
+        _add(
+            ctx, "pricing-unreadable", "warn", "global", None,
+            "Price catalog is unreadable",
             f"catalog/prices.json is unreadable: {exc}",
             "restore tools/agent-dash/catalog/prices.json, then run: python3 agent_dash.py reprice",
         )
         return
-    db = _db_path(cfg)
+    db = _db_file(ctx)
     models: list[dict] = []
     if db is not None and db.is_file():
-        models = _recent_models(db)
+        models = _recent_models(db, ctx.now - 86400)
+    if ctx.health is not None:
+        seen = {str(item.get("model")) for item in models if item.get("model")}
+        for item in ctx.health.get("unpriced_models") or []:
+            if isinstance(item, dict) and item.get("model") and str(item["model"]) not in seen:
+                seen.add(str(item["model"]))
+                models.append(
+                    {"model": item["model"], "rows": item.get("rows") or 0, "tokens": item.get("tokens") or 0}
+                )
     missing = [
-        item["model"]
+        item
         for item in models
         if item.get("model")
         and (item["model"] not in rows or rows[item["model"]].get("input") is None or rows[item["model"]].get("output") is None)
     ]
     if not missing:
-        checks.append({"name": "pricing", "ok": True, "detail": f"{len(rows)} price rows, {len(models)} models on record priced"})
+        _check(ctx, "pricing", True, f"{len(rows)} price rows, {len(models)} models on record priced")
         return
-    checks.append({"name": "pricing", "ok": False, "detail": f"unpriced models: {', '.join(missing)}"})
-    for model in missing:
-        problem(
-            "unpriced-model",
-            f"model {model!r} has usage rows with no price (cost counts unpriced runs, never $0)",
+    names = [str(item["model"]) for item in missing]
+    _check(ctx, "pricing", False, f"unpriced models: {', '.join(names)}")
+    for item in missing:
+        model = str(item["model"])
+        _add(
+            ctx, "unpriced-model", "critical", "global", None,
+            f"Model {model} has usage but no price",
+            f"model {model!r} has {item.get('rows') or 0} usage rows "
+            f"({item.get('tokens') or 0} tokens in 24 h) with no price (cost counts unpriced runs, never $0)",
             "add a row to tools/agent-dash/catalog/prices.json, then run: python3 agent_dash.py reprice",
+            safe_auto=True,
+            key=model,
         )
-
-
-def _check_reconcile(url: str, up: bool, checks: list, problem) -> None:
-    if not up:
-        checks.append({"name": "reconcile", "ok": True, "detail": "skipped, dashboard is down"})
-        return
-    payload = _get(url, "/api/reconcile?hours=24", timeout=15)
-    if payload is None:
-        checks.append({"name": "reconcile", "ok": False, "detail": "reconcile endpoint unreadable"})
-        problem("reconcile-unreadable", "GET /api/reconcile failed", "python3 agent_dash.py status")
-        return
-    mismatches = payload.get("mismatches") or []
-    if not mismatches:
-        rows = payload.get("rows") or []
-        checks.append({"name": "reconcile", "ok": True, "detail": f"{len(rows)} workstreams reconcile, no mismatches"})
-        return
-    checks.append({"name": "reconcile", "ok": False, "detail": f"{len(mismatches)} mismatches"})
-    for item in mismatches:
-        problem("reconcile-mismatch", str(item), "python3 agent_dash.py check")
 
 
 def _chrome_path() -> str | None:
@@ -469,23 +702,25 @@ def _chrome_path() -> str | None:
     return None
 
 
-def _check_page(checks: list, problem) -> None:
+def _collect_page(ctx) -> None:
     node = shutil.which("node")
     chrome = _chrome_path()
     if node and chrome:
-        checks.append({"name": "page-check", "ok": True, "detail": f"node {node}, chrome {chrome}"})
+        _check(ctx, "page-check", True, f"node {node}, chrome {chrome}")
         return
     missing = [name for name, found in (("node", node), ("chrome", chrome)) if not found]
-    checks.append({"name": "page-check", "ok": False, "detail": f"missing: {', '.join(missing)}"})
+    _check(ctx, "page-check", False, f"missing: {', '.join(missing)}")
     if not node:
-        problem(
-            "page-check-no-node",
+        _add(
+            ctx, "page-check-no-node", "info", "global", None,
+            "Node is missing, so check --page always skips",
             "node is not on PATH, so check --page always skips",
             "install Node 18+, then run: python3 agent_dash.py check --page",
         )
     if not chrome:
-        problem(
-            "page-check-no-chrome",
+        _add(
+            ctx, "page-check-no-chrome", "info", "global", None,
+            "No Chrome binary found, so check --page always skips",
             "no Chrome binary found (CHROME_PATH, the default install path, or PATH)",
             "set CHROME_PATH to a Chrome binary, then run: python3 agent_dash.py check --page",
         )
@@ -501,8 +736,7 @@ def _config_files() -> list[Path]:
     return files
 
 
-def _check_config(cfg: dict, checks: list, problem) -> None:
-    del cfg
+def _collect_config(ctx) -> None:
     bad = []
     unknown = []
     for file in _config_files():
@@ -525,50 +759,30 @@ def _check_config(cfg: dict, checks: list, problem) -> None:
                 if key not in KNOWN_ROOT_KEYS:
                     unknown.append(f"{file.name}: unknown roots key {key!r}")
     if bad:
-        checks.append({"name": "config", "ok": False, "detail": "; ".join(bad)})
+        _check(ctx, "config", False, "; ".join(bad))
         for item in bad:
-            problem("config-unparseable", item, "fix the JSON, then restart the dashboard")
+            _add(
+                ctx, "config-unparseable", "warn", "global", None,
+                "Config file does not parse",
+                item,
+                "fix the JSON, then restart the dashboard",
+                key=slug(item),
+            )
     for item in unknown:
-        problem("config-unknown-key", item, "remove the key, then restart the dashboard")
-    if unknown and not bad:
-        checks.append({"name": "config", "ok": False, "detail": "; ".join(unknown)})
-    if not bad and not unknown:
-        checks.append({"name": "config", "ok": True, "detail": "config files parse, no unknown keys"})
-
-
-def _check_bundles(checks: list, problem) -> None:
-    from dash.bundles import list_bundles, validate_bundle
-
-    try:
-        bundles = list_bundles()
-    except Exception as exc:
-        checks.append({"name": "bundles", "ok": False, "detail": f"bundle list failed: {exc}"})
-        problem("bundles-unreadable", f"bundle list failed: {exc}", "python3 agent_dash.py ws list")
-        return
-    failing = {}
-    for item in bundles:
-        try:
-            issues = validate_bundle(item["id"])
-        except Exception:
-            continue
-        if issues:
-            failing[item["id"]] = issues
-    if not failing:
-        checks.append({"name": "bundles", "ok": True, "detail": f"{len(bundles)} bundles validate"})
-        return
-    checks.append({"name": "bundles", "ok": False, "detail": f"failing: {', '.join(sorted(failing))}"})
-    for ws in sorted(failing):
-        issues = failing[ws]
-        first = issues[0]
-        extra = f" (+{len(issues) - 1} more)" if len(issues) > 1 else ""
-        problem(
-            "invalid-bundle",
-            f"bundle {ws} fails validation: {first}{extra}",
-            f"python3 agent_dash.py ws validate {ws}",
+        _add(
+            ctx, "config-unknown-key", "warn", "global", None,
+            "Config file has an unknown key",
+            item,
+            "remove the key, then restart the dashboard",
+            key=slug(item),
         )
+    if unknown and not bad:
+        _check(ctx, "config", False, "; ".join(unknown))
+    if not bad and not unknown:
+        _check(ctx, "config", True, "config files parse, no unknown keys")
 
 
-def _check_checkout(checks: list, problem) -> None:
+def _collect_checkout(ctx) -> None:
     try:
         proc = subprocess.run(
             ["git", "-C", str(TOOL_ROOT), "status", "--short"],
@@ -578,49 +792,1196 @@ def _check_checkout(checks: list, problem) -> None:
             timeout=10,
         )
     except (OSError, subprocess.TimeoutExpired):
-        checks.append({"name": "checkout", "ok": True, "detail": "not a git checkout, skipping"})
+        _check(ctx, "checkout", True, "not a git checkout, skipping")
         return
     if proc.returncode != 0:
-        checks.append({"name": "checkout", "ok": True, "detail": "not a git checkout, skipping"})
+        _check(ctx, "checkout", True, "not a git checkout, skipping")
         return
     dirty = [line for line in (proc.stdout or "").splitlines() if line.strip()]
     if not dirty:
-        checks.append({"name": "checkout", "ok": True, "detail": "clean"})
+        _check(ctx, "checkout", True, "clean")
         return
-    checks.append({"name": "checkout", "ok": True, "detail": f"{len(dirty)} dirty files (warning only)"})
-    problem(
-        "checkout-dirty",
+    _check(ctx, "checkout", True, f"{len(dirty)} dirty files (advisory only)")
+    _add(
+        ctx, "dashboard-dirty-checkout", "info", "global", None,
+        "Dashboard checkout has uncommitted changes",
         f"tool checkout has {len(dirty)} uncommitted changes",
         "review with: git status --short",
-        warning=True,
     )
 
 
-def _check_python(checks: list, problem) -> None:
+def _collect_python(ctx) -> None:
     current = sys.version_info[:3]
     runner = TOOL_ROOT / "scripts" / "run_worker.py"
     if tuple(current) >= MIN_PYTHON and runner.is_file():
-        checks.append(
-            {
-                "name": "python",
-                "ok": True,
-                "detail": f"python {'.'.join(str(n) for n in current)} runs scripts/run_worker.py",
-            }
+        _check(
+            ctx, "python", True,
+            f"python {'.'.join(str(n) for n in current)} runs scripts/run_worker.py",
         )
         return
     if not runner.is_file():
-        checks.append({"name": "python", "ok": False, "detail": "scripts/run_worker.py is missing"})
-        problem(
-            "worker-runner-missing",
+        _check(ctx, "python", False, "scripts/run_worker.py is missing")
+        _add(
+            ctx, "worker-runner-missing", "warn", "global", None,
+            "Worker runner script is missing",
             "scripts/run_worker.py is missing",
             "restore tools/agent-dash/scripts/run_worker.py from version control",
         )
         return
-    checks.append(
-        {"name": "python", "ok": False, "detail": f"python {'.'.join(str(n) for n in current)} is older than {'.'.join(str(n) for n in MIN_PYTHON)}"}
+    _check(
+        ctx, "python", False,
+        f"python {'.'.join(str(n) for n in current)} is older than {'.'.join(str(n) for n in MIN_PYTHON)}",
     )
-    problem(
-        "python-too-old",
+    _add(
+        ctx, "python-too-old", "warn", "global", None,
+        "Python is older than the worker runner needs",
         f"python {'.'.join(str(n) for n in current)} is older than scripts/run_worker.py needs",
         "run the dashboard with a newer python3, then run: python3 agent_dash.py status",
     )
+
+
+def _runs_ro(ctx) -> list[dict]:
+    """All run rows for task mapping, read-only. Cached per collect."""
+    if ctx._runs_loaded:
+        return ctx._runs or []
+    ctx._runs_loaded = True
+    ctx._runs = []
+    db = _db_file(ctx)
+    if db is None or not db.is_file():
+        return []
+    try:
+        conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    except sqlite3.Error:
+        return []
+    try:
+        conn.row_factory = sqlite3.Row
+        ctx._runs = [
+            {
+                "run_id": row["run_id"],
+                "source": row["source"],
+                "label": row["label"],
+                "status": row["status"],
+                "started_at": row["started_at"],
+                "ended_at": row["ended_at"],
+            }
+            for row in conn.execute(
+                "SELECT run_id, source, label, status, started_at, ended_at FROM runs"
+            ).fetchall()
+        ]
+    except sqlite3.Error:
+        ctx._runs = []
+    finally:
+        conn.close()
+    return ctx._runs
+
+
+def _live_run_ids(ctx) -> set[str]:
+    """Open run ids with liveness evidence: running rows minus stale ones."""
+    rows = _runs_ro(ctx)
+    open_ids = {
+        str(row["run_id"]) for row in rows if row.get("status") in ("running", "queued")
+    }
+    if not open_ids or ctx.store is None:
+        return open_ids
+    try:
+        stale = {str(run.get("run_id")) for run, _reason in ctx.store.stale_running(ctx.now)}
+    except Exception:
+        return open_ids
+    return open_ids - stale
+
+
+def _bundle_task_map(ws: str):
+    """(tasks, plan_ids, plan_mtime, history_ts, error). Never raises."""
+    from dash.bundles import bundle_dir, resolve_plan
+
+    tasks: dict[str, dict] = {}
+    try:
+        _source, body = resolve_plan(ws)
+    except Exception:
+        return None, [], None, {}, "unreadable"
+    groups = body.get("groups") if isinstance(body, dict) else None
+    if not isinstance(groups, list):
+        return None, [], None, {}, "unreadable"
+    for group in groups:
+        if not isinstance(group, dict):
+            continue
+        for task in group.get("tasks") or []:
+            if not isinstance(task, dict) or not isinstance(task.get("id"), str):
+                continue
+            deps = task.get("deps")
+            tasks[task["id"]] = {
+                "status": task.get("status") or "todo",
+                "deps": [item for item in deps] if isinstance(deps, list) else [],
+                "kind": task.get("kind") or "task",
+                "title": task.get("title") or task["id"],
+            }
+    try:
+        from dash.taskmatch import plan_task_ids
+
+        plan_ids = plan_task_ids(groups)
+    except Exception:
+        plan_ids = list(tasks)
+    path = bundle_dir(ws)
+    mtime = None
+    history: dict[str, float] = {}
+    if path is not None:
+        try:
+            mtime = (path / "plan.json").stat().st_mtime
+        except OSError:
+            mtime = None
+        try:
+            for line in (path / "history.jsonl").read_text(encoding="utf-8").splitlines():
+                try:
+                    row = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(row, dict) and isinstance(row.get("task"), str):
+                    try:
+                        history[str(row["task"])] = float(row.get("ts") or 0)
+                    except (TypeError, ValueError):
+                        continue
+        except OSError:
+            pass
+    return tasks, plan_ids, mtime, history, None
+
+
+def _dep_cycle(deps: dict[str, list[str]]) -> list[str] | None:
+    """One dependency cycle, or None. Unknown dep ids are validation's issue."""
+    order = sorted(deps)
+    seen: set[str] = set()
+    stack: list[str] = []
+    on_stack: set[str] = set()
+
+    def visit(node: str) -> list[str] | None:
+        seen.add(node)
+        stack.append(node)
+        on_stack.add(node)
+        for dep in deps.get(node) or []:
+            if dep not in deps:
+                continue
+            if dep not in seen:
+                hit = visit(dep)
+                if hit is not None:
+                    return hit
+            elif dep in on_stack:
+                return stack[stack.index(dep):] + [dep]
+        stack.pop()
+        on_stack.discard(node)
+        return None
+
+    for node in order:
+        if node not in seen:
+            hit = visit(node)
+            if hit is not None:
+                return hit
+    return None
+
+
+def _collect_bundles(ctx) -> None:
+    from dash.bundles import approvals_for, list_bundles, validate_bundle
+    from dash.taskmatch import load_taskmap, task_of
+
+    try:
+        bundles = list_bundles()
+    except Exception as exc:
+        _check(ctx, "bundles", False, f"bundle list failed: {exc}")
+        _add(
+            ctx, "bundles-unreadable", "warn", "global", None,
+            "Bundle list failed",
+            f"bundle list failed: {exc}",
+            "python3 agent_dash.py ws list",
+        )
+        for name in ("workstream", "approvals", "trains"):
+            _check(ctx, name, True, "skipped, bundle list failed")
+        return
+    failing: dict[str, list[str]] = {}
+    for item in bundles:
+        try:
+            issues = validate_bundle(item["id"])
+        except Exception:
+            continue
+        if issues:
+            failing[item["id"]] = issues
+    if not failing:
+        _check(ctx, "bundles", True, f"{len(bundles)} bundles validate")
+    else:
+        _check(ctx, "bundles", False, f"failing: {', '.join(sorted(failing))}")
+    for ws in sorted(failing):
+        issues = failing[ws]
+        bare = [issue for issue in issues if "bare citation" in issue]
+        rest = [issue for issue in issues if "bare citation" not in issue]
+        if bare:
+            first = bare[0]
+            extra = f" (+{len(bare) - 1} more)" if len(bare) > 1 else ""
+            _add(
+                ctx, "bare-citation", "warn", f"ws:{ws}", ws,
+                "Bundle text cites a number with no name",
+                f"bundle {ws} has bare citations: {first}{extra}",
+                f"python3 agent_dash.py ws validate {ws}",
+            )
+        if rest:
+            first = rest[0]
+            extra = f" (+{len(rest) - 1} more)" if len(rest) > 1 else ""
+            _add(
+                ctx, "invalid-bundle", "warn", f"ws:{ws}", ws,
+                f"Bundle {ws} fails validation",
+                f"bundle {ws} fails validation: {first}{extra}",
+                f"python3 agent_dash.py ws validate {ws}",
+            )
+    taskmap = load_taskmap()
+    live_ids = _live_run_ids(ctx)
+    runs = _runs_ro(ctx)
+    stuck_hours = ctx.dcfg["stuck_hours"]
+    hygiene = 0
+    for item in bundles:
+        hygiene += _collect_workstream(ctx, item["id"], taskmap, runs, live_ids, stuck_hours)
+    _check(
+        ctx, "workstream", hygiene == 0,
+        f"{len(bundles)} workstreams checked, {hygiene} stuck or inconsistent tasks" if hygiene
+        else f"{len(bundles)} workstreams, no stuck or inconsistent tasks",
+    )
+    stale = _collect_approvals(ctx, approvals_for, bundles)
+    _check(
+        ctx, "approvals", not stale,
+        f"{stale} pending approvals past their window" if stale else "no approval past its window",
+    )
+    stuck = _collect_trains(ctx, bundles)
+    _check(
+        ctx, "trains", not stuck,
+        f"{stuck} trains stuck in one status" if stuck else "no train stuck in one status",
+    )
+
+
+def _collect_workstream(ctx, ws: str, taskmap: dict, runs: list, live_ids: set, stuck_hours: float) -> int:
+    """Task hygiene for one bundle. Returns the problem count."""
+    from dash.taskmatch import task_of
+
+    tasks, plan_ids, mtime, history, error = _bundle_task_map(ws)
+    if error or tasks is None:
+        return 0
+    status_of = {tid: info["status"] for tid, info in tasks.items()}
+    by_task: dict[str, list[dict]] = {}
+    for run in runs:
+        label = run.get("label")
+        if not label:
+            continue
+        try:
+            task = task_of(label, ws, taskmap, plan_ids)
+        except Exception:
+            task = None
+        if task and task in tasks:
+            by_task.setdefault(task, []).append(run)
+    live_labels = set()
+    for proc in ctx.processes or []:
+        if isinstance(proc, dict) and proc.get("label"):
+            try:
+                task = task_of(proc["label"], ws, taskmap, plan_ids)
+            except Exception:
+                task = None
+            if task and task in tasks:
+                live_labels.add(task)
+    live_runs = set()
+    for task, rows in by_task.items():
+        for row in rows:
+            if str(row.get("run_id")) in live_ids:
+                live_runs.add(task)
+                break
+    count = 0
+    for tid, info in sorted(tasks.items()):
+        status = info["status"]
+        if status in ("wip", "pr") and tid not in live_labels and tid not in live_runs:
+            stamps = [history.get(tid) or 0]
+            for row in by_task.get(tid, []):
+                for key in ("started_at", "ended_at"):
+                    value = row.get(key)
+                    if isinstance(value, (int, float)) and not isinstance(value, bool):
+                        stamps.append(float(value))
+            if mtime is not None and not by_task.get(tid) and not history.get(tid):
+                stamps.append(float(mtime))
+            last = max(stamps) if stamps else 0
+            if last and ctx.now - last > stuck_hours * 3600:
+                hours = (ctx.now - last) / 3600
+                _add(
+                    ctx, "stuck-task", "warn", f"ws:{ws}", ws,
+                    f"Task {tid} is stuck in {status} with no live agent",
+                    f"task {tid} ({info['title']}) in {ws} has status {status} with no live agent "
+                    f"mapped to it and no run for {hours:.1f} h (limit {stuck_hours:g} h)",
+                    f"python3 agent_dash.py ws plan {ws}",
+                    key=tid,
+                )
+                count += 1
+        if status == "done":
+            for dep in info["deps"]:
+                if dep in status_of and status_of[dep] != "done":
+                    _add(
+                        ctx, "done-before-deps", "warn", f"ws:{ws}", ws,
+                        f"Task {tid} is done before its dependency {dep}",
+                        f"task {tid} in {ws} is done while dependency {dep} is "
+                        f"{status_of[dep]} (not done)",
+                        f"python3 agent_dash.py ws plan {ws}",
+                        key=tid,
+                    )
+                    count += 1
+                    break
+        if info["kind"] == "gate" and status != "done":
+            building = sorted(
+                other for other, other_info in tasks.items()
+                if tid in other_info["deps"] and other_info["status"] in ("wip", "pr")
+            )
+            if building:
+                names = ", ".join(building[:3]) + (f" (+{len(building) - 3} more)" if len(building) > 3 else "")
+                _add(
+                    ctx, "gate-blocking", "warn", f"ws:{ws}", ws,
+                    f"Gate {tid} is unmet while dependents are already building",
+                    f"gate {tid} in {ws} is {status} (unmet) with dependents already in "
+                    f"wip/pr: {names}",
+                    f"python3 agent_dash.py ws plan {ws}",
+                    key=tid,
+                )
+                count += 1
+    cycle = _dep_cycle({tid: [dep for dep in info["deps"]] for tid, info in tasks.items()})
+    if cycle:
+        _add(
+            ctx, "dep-cycle", "warn", f"ws:{ws}", ws,
+            f"Dependency cycle in the {ws} plan",
+            f"plan for {ws} has a dependency cycle: {' -> '.join(cycle)}",
+            f"python3 agent_dash.py ws validate {ws}",
+        )
+        count += 1
+    return count
+
+
+def _collect_approvals(ctx, approvals_for, bundles) -> int:
+    """Pending approvals older than the window. Returns the problem count."""
+    from dash.bundles import bundle_dir
+
+    limit_s = ctx.dcfg["approval_days"] * 86400
+    count = 0
+    for item in bundles:
+        ws = item["id"]
+        try:
+            record = approvals_for(ws)
+        except Exception:
+            continue
+        if not isinstance(record, dict):
+            continue
+        pending = [
+            entry for entry in (record.get("items") or [])
+            if isinstance(entry, dict) and entry.get("status") == "pending"
+        ]
+        if not pending:
+            continue
+        path = bundle_dir(ws)
+        try:
+            mtime = (path / "approvals.json").stat().st_mtime if path is not None else None
+        except OSError:
+            mtime = None
+        if mtime is None or ctx.now - mtime <= limit_s:
+            continue
+        days = (ctx.now - mtime) / 86400
+        for entry in pending:
+            item_id = str(entry.get("id") or "")
+            _add(
+                ctx, "approval-stale", "warn", f"ws:{ws}", ws,
+                f"Approval {item_id} has waited too long",
+                f"approval {item_id} in {ws} ({entry.get('step') or 'no step'}) has been "
+                f"pending for {days:.1f} days (limit {ctx.dcfg['approval_days']:g} days)",
+                f"python3 agent_dash.py ws approvals {ws}",
+                key=item_id or slug(str(entry.get("step"))),
+            )
+            count += 1
+    return count
+
+
+def _collect_trains(ctx, bundles) -> int:
+    """Trains stuck in one non-terminal status. Returns the problem count."""
+    from dash.bundles import bundle_dir
+
+    limit_s = ctx.dcfg["train_hours"] * 3600
+    count = 0
+    for item in bundles:
+        ws = item["id"]
+        path = bundle_dir(ws)
+        if path is None:
+            continue
+        try:
+            data = json.loads((path / "plan.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        trains = data.get("trains") if isinstance(data, dict) else None
+        if not isinstance(trains, list) or not trains:
+            continue
+        try:
+            mtime = (path / "plan.json").stat().st_mtime
+        except OSError:
+            continue
+        if ctx.now - mtime <= limit_s:
+            continue
+        hours = (ctx.now - mtime) / 3600
+        for train in trains:
+            if not isinstance(train, dict):
+                continue
+            status = train.get("status")
+            if status in TERMINAL_TRAIN or status is None:
+                continue
+            tid = str(train.get("id") or "")
+            members = train.get("members") if isinstance(train.get("members"), list) else []
+            _add(
+                ctx, "train-stuck", "warn", f"ws:{ws}", ws,
+                f"Train {tid} is stuck waiting",
+                f"train {tid} in {ws} has status {status} for {hours:.1f} h "
+                f"(limit {ctx.dcfg['train_hours']:g} h, {len(members)} members)",
+                f"python3 agent_dash.py ws trains {ws}",
+                key=tid or slug(str(train.get("title"))),
+            )
+            count += 1
+    return count
+
+
+def model_policy_reason(kind: str | None, model: str | None, reasoning_effort: str | None, policy: dict | None) -> str | None:
+    """Why a worker violates the model policy, or None when it complies.
+
+    Read-only and argv-blind: it judges already-extracted flag values and
+    reports the worker label, never the rest of argv. ``muse`` workers
+    require ``--reasoning-effort xhigh`` (or the configured level);
+    ``cursor`` workers running a ``grok-4.7`` model must use the bracketed
+    500k form, never a bare ``grok-4.7-high`` or a ``-fast`` id.
+    """
+    policy = policy if isinstance(policy, dict) else {}
+    if kind == "muse":
+        want = str(policy.get("muse_reasoning_effort", "xhigh") or "xhigh")
+        if (reasoning_effort or "") != want:
+            return (
+                f"muse worker needs --reasoning-effort {want} "
+                f"(got {reasoning_effort or 'none'})"
+            )
+        return None
+    if kind == "cursor" and model and "grok-4.7" in model:
+        if not policy.get("grok_require_bracketed_500k", True):
+            return None
+        import re as _re
+
+        if model == "grok-4.7-high" or "[" not in model or "500k" not in model:
+            return (
+                "cursor-agent model must be the bracketed 500k form "
+                f"(grok-4.7[context=500k,...]), never a bare grok-4.7-high (got {model})"
+            )
+        if _re.search(r"-fast([^\w]|$)", model):
+            return (
+                "cursor-agent model must be the bracketed 500k form with "
+                f"fast=false, never a -fast id (got {model})"
+            )
+    return None
+
+
+def _comm_kind(comm: str | None) -> str | None:
+    """Worker kind for a process comm: muse, cursor, grok-build, or None."""
+    if comm in ("muse", "muse-bin") or (isinstance(comm, str) and comm.startswith("muse-bin-")):
+        return "muse"
+    if comm == "cursor-agent":
+        return "cursor"
+    if comm == "grok":
+        return "grok-build"
+    return None
+
+
+def _live_argv_tokens(ctx) -> dict:
+    """Pid -> {model, reasoning_effort} from argv. Empty when ps fails."""
+    if ctx.argv_tokens is not None:
+        return ctx.argv_tokens
+    try:
+        from dash.sources.process import _tokens_by_pid
+
+        return _tokens_by_pid()
+    except Exception:
+        return {}
+
+
+def _live_ppids(ctx) -> dict:
+    if ctx.ppids is not None:
+        return ctx.ppids
+    try:
+        from dash.sources.process import ppid_map
+
+        return ppid_map()
+    except Exception:
+        return {}
+
+
+def _pgrep_count(pattern: str) -> int:
+    """Live processes matching a worker pgrep pattern. Read-only."""
+    if not pattern:
+        return 0
+    cmd = ["pgrep", "-f"]
+    if any(ch in pattern for ch in "|()"):
+        cmd.append("-E")
+    cmd.append(pattern)
+    try:
+        proc = subprocess.run(cmd, check=False, capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        return 0
+    if proc.returncode not in (0, 1):
+        return 0
+    return len([line for line in proc.stdout.splitlines() if line.strip()])
+
+
+def _workers_registry():
+    """The worker registry: local override wins, like the launcher."""
+    from dash.locate import layered_path
+
+    path = layered_path("workers", "AGENT_DASH_WORKERS")
+    if path is None or not path.is_file():
+        path = TOOL_ROOT / "workers.example.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None, None
+    if not isinstance(data, dict) or not isinstance(data.get("workers"), dict):
+        return None, None
+    return data, path
+
+
+def effort_from_extra_args(worker: dict) -> str | None:
+    """The ``--reasoning-effort`` value in a registry worker's extra_args."""
+    extra = worker.get("extra_args") if isinstance(worker, dict) else None
+    if not isinstance(extra, list):
+        return None
+    for index, arg in enumerate(extra):
+        if not isinstance(arg, str):
+            continue
+        if arg == "--reasoning-effort" and index + 1 < len(extra):
+            value = extra[index + 1]
+            return str(value) if isinstance(value, str) else None
+        if arg.startswith("--reasoning-effort="):
+            return arg.split("=", 1)[1] or None
+    return None
+
+
+def _collect_fleet(ctx) -> None:
+    if ctx.processes is None:
+        _check(ctx, "fleet", True, "skipped, no process listing")
+        return
+    policy = ctx.dcfg["model_policy"]
+    tokens = _live_argv_tokens(ctx)
+    ppids = _live_ppids(ctx)
+    runs = _runs_ro(ctx)
+    by_label: dict[str, list[dict]] = {}
+    for row in runs:
+        if row.get("label"):
+            by_label.setdefault(str(row["label"]), []).append(row)
+    count = 0
+    for proc in ctx.processes:
+        if not isinstance(proc, dict) or not proc.get("label"):
+            continue
+        label = str(proc["label"])
+        try:
+            age = ctx.now - float(proc.get("started_at"))
+        except (TypeError, ValueError):
+            age = None
+        kind = _comm_kind(proc.get("comm"))
+        token = tokens.get(proc.get("pid")) or {}
+        model = token.get("model") or proc.get("model")
+        effort = token.get("reasoning_effort")
+        if effort is None:
+            effort = proc.get("reasoning_effort")
+        reason = model_policy_reason(kind, model, effort, policy)
+        if reason is not None:
+            _add(
+                ctx, "model-policy", "warn", "global", None,
+                f"Worker {label} breaks the model policy",
+                f"worker {label!r} {reason}",
+                "fix the model or flags in workers.local.json, then relaunch the worker",
+                key=label,
+            )
+            count += 1
+        if age is not None and age >= ORPHAN_MIN_AGE_S:
+            ended = any(
+                row.get("status") in TERMINAL_RUN for row in by_label.get(label, [])
+            )
+            reparented = ppids.get(proc.get("pid")) == 1
+            if ended or reparented:
+                minutes = age / 60
+                why = "its run row ended" if ended else "its parent is pid 1"
+                _add(
+                    ctx, "orphan-worker", "warn", "global", None,
+                    f"Orphan worker {label} is still alive",
+                    f"labelled worker {label!r} ({proc.get('comm')} pid {proc.get('pid')}) "
+                    f"is still alive after {minutes:.0f} min though {why}; "
+                    "it is reported, never signaled",
+                    "python3 agent_dash.py check",
+                    key=label,
+                )
+                count += 1
+    registry = ctx.workers_registry
+    reg_path = None
+    if registry is None:
+        registry, reg_path = _workers_registry()
+    counts = ctx.pgrep_counts if ctx.pgrep_counts is not None else {}
+    if isinstance(registry, dict):
+        for name, worker in (registry.get("workers") or {}).items():
+            if not isinstance(worker, dict):
+                continue
+            try:
+                cap = int(worker.get("cap"))
+            except (TypeError, ValueError):
+                continue
+            pattern = worker.get("pgrep") or ""
+            if pattern in counts:
+                live = counts[pattern]
+            else:
+                live = _pgrep_count(pattern)
+                counts[pattern] = live
+            if live > cap:
+                where = f" in {reg_path}" if reg_path is not None else ""
+                _add(
+                    ctx, "over-cap", "warn", "global", None,
+                    f"Worker tier {name} is over its cap",
+                    f"tier {name}{where} has {live} live workers above cap {cap}",
+                    "wait for lanes to finish, or raise the cap in workers.local.json",
+                    key=str(name),
+                )
+                count += 1
+    _check(
+        ctx, "fleet", count == 0,
+        f"{len(ctx.processes)} live workers checked, {count} fleet problems" if count
+        else f"{len(ctx.processes)} live workers checked, fleet clean",
+    )
+
+
+class DoctorScheduler:
+    """Background doctor: collect, snapshot, sleep. Started by ``run``."""
+
+    def __init__(self, store, registry, cfg: dict | None = None):
+        self.store = store
+        self.registry = registry
+        self.cfg = cfg if isinstance(cfg, dict) else {}
+        self.interval_s = doctor_cfg(self.cfg)["interval_s"]
+        self._stop = threading.Event()
+        self._refresh = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._started_at: float | None = None
+        self._next_run_at: float | None = None
+
+    def start(self) -> "DoctorScheduler":
+        self._started_at = time.time()
+        self._next_run_at = self._started_at + FIRST_RUN_DELAY_S
+        self._thread = threading.Thread(target=self._loop, name="doctor", daemon=True)
+        self._thread.start()
+        return self
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._refresh.set()
+
+    def queue_refresh(self) -> None:
+        """``GET /api/doctor?refresh=1`` asks for a run; serving never blocks on it."""
+        self._refresh.set()
+
+    @property
+    def next_run_at(self) -> float | None:
+        return self._next_run_at
+
+    def run_once(self, now: float | None = None) -> dict:
+        now = float(now if now is not None else time.time())
+        try:
+            health = self.registry.health(now, self.cfg)
+        except Exception:
+            health = None
+        try:
+            from dash.sources.process import live_worker_processes
+
+            processes = live_worker_processes() or []
+        except Exception:
+            processes = []
+        result = collect_problems(
+            self.store, self.cfg, now, health=health, registry=self.registry,
+            processes=processes,
+        )
+        try:
+            payload = self.store.doctor_snapshot(result["problems"], now, self.interval_s)
+        except Exception:
+            log.exception("doctor snapshot failed")
+            payload = self.store.doctor_latest(now)
+        self._next_run_at = now + self.interval_s
+        return payload
+
+    def latest(self, now: float, ws: str | None = None, min_severity: str | None = None) -> dict:
+        payload = self.store.doctor_latest(now, ws, min_severity)
+        if self._next_run_at is not None:
+            payload["next_run_at"] = self._next_run_at
+        return payload
+
+    def _full_poll_done(self) -> bool:
+        try:
+            state = getattr(self.registry, "state", None) or {}
+        except Exception:
+            return True
+        return all(
+            isinstance(info, dict) and info.get("last_poll") is not None
+            for info in state.values()
+        )
+
+    def _loop(self) -> None:
+        assert self._started_at is not None
+        poll_deadline = self._started_at + FULL_POLL_WAIT_S
+        while not self._stop.is_set():
+            now = time.time()
+            due = self._next_run_at is not None and now >= self._next_run_at
+            polled = self._full_poll_done() or now >= poll_deadline
+            if (due and polled) or self._refresh.is_set():
+                self._refresh.clear()
+                try:
+                    self.run_once(now)
+                except Exception:
+                    log.exception("doctor run failed")
+                continue
+            self._stop.wait(1.0)
+
+
+def summarize(problems: list) -> dict:
+    """Severity counts over fresh or persisted problems (open only)."""
+    out = {"critical": 0, "warn": 0, "info": 0, "regressed": 0}
+    for item in problems or []:
+        if not isinstance(item, dict):
+            continue
+        if item.get("resolved_at") is not None:
+            continue
+        sev = item.get("severity")
+        if sev in out:
+            out[sev] += 1
+        if item.get("regressed"):
+            out["regressed"] += 1
+    return out
+
+
+def filter_problems(problems: list, ws: str | None = None, min_severity: str | None = None) -> list:
+    """Workstream plus minimum-severity filter for CLI output."""
+    out = []
+    for item in problems or []:
+        if not isinstance(item, dict):
+            continue
+        if ws not in (None, "", "all"):
+            scope = str(item.get("scope") or "global")
+            if scope != "global" and scope != f"ws:{ws}" and item.get("ws") != ws:
+                continue
+        if min_severity in SEV_RANK:
+            rank = SEV_RANK.get(str(item.get("severity")), 9)
+            if rank > SEV_RANK[min_severity]:
+                continue
+        out.append(item)
+    return out
+
+
+def format_doctor_human(payload: dict) -> str:
+    """Human rendering of a ``GET /api/doctor`` payload."""
+    summary = payload.get("summary") or {}
+    lines = [
+        "doctor: {c} critical, {w} warn, {i} info "
+        "(generated {g}, next run {n}, every {iv:g}s)".format(
+            c=summary.get("critical", 0),
+            w=summary.get("warn", 0),
+            i=summary.get("info", 0),
+            g=int(payload.get("generated_at") or 0),
+            n=int(payload.get("next_run_at") or 0),
+            iv=float(payload.get("interval_s") or 300),
+        )
+    ]
+    problems = payload.get("problems") or []
+    if not problems:
+        lines.append("doctor: clean, no problems found")
+    for item in problems:
+        fix = item.get("fix") or {}
+        lines.append(f"[{item.get('severity')}] {item.get('title')} ({item.get('id')})")
+        if item.get("detail"):
+            lines.append(f"  {item.get('detail')}")
+        if fix.get("command"):
+            auto = " [safe-auto]" if fix.get("safe_auto") else ""
+            lines.append(f"  fix: {fix.get('command')}{auto}")
+        if item.get("regressed"):
+            lines.append("  regressed since its last resolution")
+    resolved = payload.get("resolved_24h") or []
+    if resolved:
+        lines.append(f"resolved in the last 24 h ({len(resolved)}):")
+        for entry in resolved:
+            lines.append(f"  {entry.get('code')}: {entry.get('title')}")
+    return "\n".join(lines)
+
+
+def _open_store(cfg: dict):
+    """The state database, or None when it cannot be opened."""
+    try:
+        from dash.store import Store
+
+        path = _db_path(cfg)
+        if path is None:
+            state = _state_dir(cfg)
+            if state is None:
+                return None
+            path = state / "dash.sqlite"
+        return Store(path)
+    except Exception:
+        return None
+
+
+def run_doctor(cfg: dict, url: str, now: float | None = None) -> dict:
+    """Run every check. Returns ``{"ok", "problems", "checks"}`` (legacy shape).
+
+    Read-only: collection never persists. The server persists on its own
+    schedule; the CLI snapshots the fallback run itself.
+    """
+    now = float(now if now is not None else time.time())
+    cfg = cfg if isinstance(cfg, dict) else {}
+    health = _get(url, "/api/health", timeout=10)
+    store = _open_store(cfg)
+    try:
+        result = collect_problems(store, cfg, now, url=url, health=health)
+    finally:
+        if store is not None:
+            try:
+                store.close()
+            except Exception:
+                pass
+    problems = []
+    for item in result["problems"]:
+        problems.append(
+            {
+                "code": item["code"],
+                "message": f"{item['title']}: {item['detail']}",
+                "command": item["fix_command"],
+                **({"warning": True} if item["severity"] == "info" else {}),
+            }
+        )
+    hard = [item for item in problems if not item.get("warning")]
+    return {"ok": not hard, "problems": problems, "checks": result["checks"]}
+
+
+def safe_fixes(problems: list) -> list:
+    """Persisted or fresh problems whose fix may run unattended."""
+    out = []
+    for item in problems or []:
+        if not isinstance(item, dict):
+            continue
+        fix = item.get("fix") or {}
+        auto = fix.get("safe_auto")
+        if auto is None:
+            auto = item.get("safe_auto")
+        if auto:
+            out.append(item)
+    return out
+
+
+def _fix_command(item: dict) -> str:
+    fix = item.get("fix") or {}
+    return str(fix.get("command") or item.get("fix_command") or "")
+
+
+def _outside_root_path(detail: str) -> str | None:
+    """Run-dir path from a run-dir-outside-roots style detail, or None."""
+    text = str(detail or "")
+    if "live worker manifest at " in text:
+        path = text.split("live worker manifest at ", 1)[1].split(" is outside")[0]
+        return path.split(" (")[0].strip() or None
+    if "live worker manifest outside roots.scratchpads: " in text:
+        rest = text.split("live worker manifest outside roots.scratchpads: ", 1)[1]
+        label, _, path = rest.partition(" in ")
+        return (path.strip().split(" (")[0] if path else None) or None
+    if "worker manifests outside roots.scratchpads: " in text:
+        path = text.split("worker manifests outside roots.scratchpads: ", 1)[1]
+        return path.split(" (liveness")[0].strip() or None
+    return None
+
+
+def _local_config_path() -> Path:
+    return TOOL_ROOT / "config.local.json"
+
+
+def _add_scratch_root(path: str) -> str:
+    """Add ``path`` to config.local.json roots.scratchpads with a backup.
+
+    Only ever touches ``config.local.json`` (never the shipped example).
+    Keeps the newest 3 ``*.bak-*`` files. Returns a human message.
+    """
+    target = _local_config_path()
+    data: dict = {}
+    made_backup = False
+    if target.is_file():
+        try:
+            data = json.loads(target.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return f"config fix skipped: {target} does not parse; fix it by hand"
+        if not isinstance(data, dict):
+            return f"config fix skipped: {target} is not an object; fix it by hand"
+        stamp = int(time.time())
+        backup = target.with_name(f"{target.name}.bak-{stamp}")
+        try:
+            backup.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+        except OSError as exc:
+            return f"config fix skipped: cannot back up {target}: {exc}"
+        made_backup = True
+        for old in sorted(target.parent.glob(f"{target.name}.bak-*"))[:-3]:
+            try:
+                old.unlink()
+            except OSError:
+                pass
+    roots = data.setdefault("roots", {})
+    if not isinstance(roots, dict):
+        roots = {}
+        data["roots"] = roots
+    current = roots.get("scratchpads")
+    if isinstance(current, str):
+        current = [current]
+    if not isinstance(current, list):
+        current = []
+    if path in current:
+        return f"scratch root already in config.local.json: {path}"
+    current.append(path)
+    roots["scratchpads"] = current
+    try:
+        target.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    except OSError as exc:
+        return f"config fix failed: cannot write {target}: {exc}"
+    if made_backup:
+        return f"added scratch root to config.local.json (backup kept): {path}"
+    return f"added scratch root to a new config.local.json: {path}"
+
+
+def apply_safe_fixes(store, cfg: dict, problems: list, now: float | None = None) -> list[str]:
+    """Apply safe, local, reversible fixes. Returns one message per action.
+
+    Only ever: register a run dir, add a missing scratch root to
+    ``config.local.json`` (with a backup), run one offset prune batch,
+    restart a stalled dashboard, reprice and backfill run models. Never
+    anything touching sources, other sessions, or processes.
+    """
+    from dash.rundirs import register_run_dir, registered_run_dirs
+
+    now = float(now if now is not None else time.time())
+    cfg = cfg if isinstance(cfg, dict) else {}
+    state = _state_dir(cfg)
+    messages: list[str] = []
+    try:
+        from dash.locate import scratch_roots
+
+        roots = list(scratch_roots(cfg) or [])
+    except Exception:
+        roots = []
+    try:
+        registered = set(registered_run_dirs(state, cfg, now) if state is not None else [])
+    except Exception:
+        registered = set()
+    for item in safe_fixes(problems):
+        code = item.get("code")
+        detail = item.get("detail") or ""
+        if code in ("run-dir-outside-roots", "manifest-outside-roots"):
+            path = _outside_root_path(detail)
+            if not path:
+                messages.append(f"no path in {code} detail; fixed nothing")
+                continue
+            if not os.path.isdir(path):
+                messages.append(f"run dir is gone, fixed nothing: {path}")
+                continue
+            if path not in registered:
+                ok = register_run_dir(state, path) if state is not None else False
+                messages.append(
+                    f"registered run dir: {path}" if ok
+                    else f"could not register run dir: {path}"
+                )
+                continue
+            covered = any(
+                path == root or path.startswith(root.rstrip("/") + "/") for root in roots
+            )
+            if not covered:
+                messages.append(_add_scratch_root(path))
+            else:
+                messages.append(f"run dir already covered, fixed nothing: {path}")
+        elif code == "source-stalled":
+            try:
+                from agent_dash import cmd_restart
+
+                code_out = cmd_restart()
+            except Exception as exc:
+                messages.append(f"dashboard restart failed: {exc}")
+                continue
+            messages.append(
+                "restarted the stalled dashboard" if code_out == 0
+                else f"dashboard restart exited {code_out}"
+            )
+        elif code == "unpriced-model":
+            try:
+                from dash.pricing import reprice as reprice_usage
+
+                from agent_dash import _claude_projects  # noqa: private but same tool
+
+                summary = reprice_usage(store, _claude_projects(cfg))
+                filled = store.backfill_grok_models(now) if hasattr(store, "backfill_grok_models") else 0
+                models = len(summary.get("models") or [])
+                messages.append(f"repriced {models} models, backfilled {filled} run models")
+            except Exception as exc:
+                messages.append(f"reprice failed: {exc}")
+        else:
+            messages.append(f"no safe applier for {code}; fixed nothing")
+    try:
+        pruned = store.prune_offsets()
+    except Exception as exc:
+        messages.append(f"offset prune failed: {exc}")
+    else:
+        messages.append(f"pruned {pruned} dead offset rows" if pruned else "offset table already clean")
+    return messages
+
+
+def parse_since(raw: str | None, now: float) -> float:
+    """``--since 24h`` (s/m/h/d suffix, bare number means hours) to epoch."""
+    if raw is None or not str(raw).strip():
+        return float(now) - 86400
+    text = str(raw).strip().lower()
+    unit = 3600.0
+    if text[-1] in ("s", "m", "h", "d"):
+        unit = {"s": 1.0, "m": 60.0, "h": 3600.0, "d": 86400.0}[text[-1]]
+        text = text[:-1]
+    try:
+        amount = float(text)
+    except ValueError as exc:
+        raise ValueError(f"bad --since {raw!r}: use like 24h, 7d") from exc
+    if amount <= 0:
+        raise ValueError(f"bad --since {raw!r}: use like 24h, 7d")
+    return float(now) - amount * unit
+
+
+def format_report(report: dict, md: bool = False) -> str:
+    """Digest for hub reports: new, regressed, resolved, open by severity and workstream."""
+    open_by_sev = report.get("open_by_severity") or {}
+    open_by_ws = report.get("open_by_ws") or {}
+    new = report.get("new") or []
+    regressed = report.get("regressed") or []
+    resolved = report.get("resolved") or []
+    window_h = (report.get("now", 0) - report.get("since", 0)) / 3600
+    if md:
+        lines = [
+            f"## Doctor report (last {window_h:g} h)",
+            "",
+            f"Open: {open_by_sev.get('critical', 0)} critical, "
+            f"{open_by_sev.get('warn', 0)} warn, {open_by_sev.get('info', 0)} info.",
+            "",
+        ]
+        if open_by_ws:
+            lines.append("By workstream: " + ", ".join(f"{ws} {n}" for ws, n in open_by_ws.items()))
+            lines.append("")
+        for head, rows in (("New", new), ("Regressed", regressed)):
+            lines.append(f"### {head} ({len(rows)})")
+            for item in rows:
+                sev = item.get("severity", "?")
+                lines.append(f"- [{sev}] {item.get('title')} (`{item.get('id')}`)")
+            lines.append("")
+        lines.append(f"### Resolved ({len(resolved)})")
+        for entry in resolved:
+            lines.append(f"- {entry.get('code')}: {entry.get('title')}")
+        return "\n".join(lines).rstrip() + "\n"
+    lines = [
+        f"doctor report (last {window_h:g} h): "
+        f"{open_by_sev.get('critical', 0)} critical, {open_by_sev.get('warn', 0)} warn, "
+        f"{open_by_sev.get('info', 0)} info open",
+    ]
+    if open_by_ws:
+        lines.append("open by workstream: " + ", ".join(f"{ws}={n}" for ws, n in open_by_ws.items()))
+    lines.append(f"new: {len(new)}, regressed: {len(regressed)}, resolved: {len(resolved)}")
+    for item in list(new) + list(regressed):
+        lines.append(f"  [{item.get('severity')}] {item.get('title')} ({item.get('id')})")
+    for entry in resolved:
+        lines.append(f"  resolved {entry.get('code')}: {entry.get('title')}")
+    return "\n".join(lines)
+
+
+def preflight_for_launch(
+    worker_name: str,
+    worker: dict,
+    run_dir: str,
+    state_dir: str,
+    url: str = "http://127.0.0.1:8765",
+    timeout_s: float = 3.0,
+    policy: dict | None = None,
+) -> dict | None:
+    """Fast local preflight before a worker launch. Returns a problem or None.
+
+    Checks the dashboard answers, the run dir will be visible to it, and
+    the tier's model is priced and policy-compliant. Read-only (a state-dir
+    writability probe aside), label-free, and bounded to a few seconds.
+    """
+    health = _get(url, "/api/health", timeout=timeout_s)
+    if health is None:
+        return {
+            "code": "dashboard-down",
+            "title": "Dashboard is down",
+            "detail": f"dashboard not reachable at {url}",
+            "command": "python3 agent_dash.py run",
+        }
+    roots = health.get("scratch_roots") or []
+    run_dirs = health.get("run_dirs") or []
+    rundir = os.path.abspath(str(run_dir))
+    visible = rundir in run_dirs or any(
+        rundir == root or rundir.startswith(root.rstrip("/") + "/") for root in roots
+    )
+    if not visible:
+        try:
+            from dash.rundirs import registered_run_dirs
+
+            visible = rundir in (registered_run_dirs(state_dir) or [])
+        except Exception:
+            visible = False
+    if not visible:
+        probe = state_dir if os.path.isdir(state_dir) else os.path.dirname(state_dir)
+        if not os.access(probe or ".", os.W_OK | os.X_OK):
+            return {
+                "code": "run-dir-outside-roots",
+                "title": "Run folder would be invisible to the dashboard",
+                "detail": f"run dir {rundir} is outside the dashboard roots and cannot be registered",
+                "command": f"add {rundir} to roots.scratchpads in config, then restart the dashboard",
+            }
+    model = (worker or {}).get("model") or ""
+    kind = (worker or {}).get("kind")
+    if not model:
+        return {
+            "code": "unpriced-model",
+            "title": f"Tier {worker_name} has no model",
+            "detail": f"tier {worker_name} names no model, so its runs would be unpriced",
+            "command": "set a priced model for the tier in workers.local.json",
+        }
+    try:
+        from dash.pricing import status as price_status
+
+        priced = price_status(model)["priced"]
+    except Exception:
+        priced = False
+    if not priced:
+        return {
+            "code": "unpriced-model",
+            "title": f"Tier {worker_name} model has no price",
+            "detail": f"tier {worker_name} model {model!r} has no catalog rate",
+            "command": "add a row to tools/agent-dash/catalog/prices.json, then run: python3 agent_dash.py reprice",
+        }
+    effort = effort_from_extra_args(worker or {})
+    reason = model_policy_reason(kind, model, effort, policy)
+    if reason is not None:
+        return {
+            "code": "model-policy",
+            "title": f"Tier {worker_name} breaks the model policy",
+            "detail": f"tier {worker_name}: {reason}",
+            "command": "fix the model or flags in workers.local.json",
+        }
+    return None
+
+
+def format_human(result: dict) -> str:
+    lines = []
+    for item in result.get("checks") or []:
+        mark = "ok" if item.get("ok") else "FAIL"
+        lines.append(f"[{mark}] {item.get('name')}: {item.get('detail')}")
+    problems = result.get("problems") or []
+    if problems:
+        lines.append("")
+        for item in problems:
+            tag = "warning" if item.get("warning") else "problem"
+            lines.append(f"{tag} ({item.get('code')}): {item.get('message')}")
+            lines.append(f"  fix: {item.get('command')}")
+    else:
+        lines.append("doctor: clean, no problems found")
+    return "\n".join(lines)

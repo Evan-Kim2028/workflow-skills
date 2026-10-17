@@ -11,6 +11,7 @@ The lead plans, decides, verifies, and reports. Workers do everything else. Rela
 
 1. Read `~/.local/share/agent-dash/workstreams/<ID>/KICKOFF.md` (or `AGENT_DASH_WORKSTREAMS`), including any addendum, then `approvals.json` and `docs/`.
 2. Check reality before acting:
+   - `python3 tools/agent-dash/agent_dash.py doctor --ws <ID>` (fix or note what it lists);
    - `plan.json` statuses;
    - open PRs and `git log origin/main`;
    - live workers on the dashboard.
@@ -79,7 +80,7 @@ Production updates go out fastest when every merge is small in CI time, not in s
 
 ## Hand-off
 
-At about 250K context, or at a milestone, write `state.md`: done, in flight (labels and PIDs), next wave, blockers and messages owed. Then end. A fresh lead resumes from the brief plus `state.md`.
+At about 250K context, or at a milestone, run `doctor --ws <ID>` once more, then write `state.md`: done, in flight (labels and PIDs), next wave, blockers and messages owed. Then end. A fresh lead resumes from the brief plus `state.md`. Hub reports include `doctor report --md` output.
 
 ## Rules
 

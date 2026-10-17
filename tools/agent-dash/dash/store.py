@@ -92,6 +92,45 @@ WS_STATUSES = ("backlog", "todo", "doing", "review", "done", "cancelled")
 _WF = re.compile(r"(wf_[A-Za-z0-9-]+)")
 
 
+_SEV_ORDER = {"critical": 0, "warn": 1, "info": 2}
+
+
+def _doctor_api_row(row: dict) -> dict:
+    """One persisted problem in ``GET /api/doctor`` shape."""
+    code = str(row.get("code") or "")
+    return {
+        "id": str(row.get("id") or ""),
+        "code": code,
+        "severity": str(row.get("severity") or "warn"),
+        "scope": str(row.get("scope") or "global"),
+        "ws": row.get("ws"),
+        "title": str(row.get("title") or ""),
+        "detail": str(row.get("detail") or ""),
+        "fix": {
+            "command": str(row.get("fix_command") or ""),
+            "safe_auto": bool(row.get("safe_auto")),
+            "doc": f"docs/problems/{code}.md" if code else "",
+        },
+        "first_seen": row.get("first_seen"),
+        "last_seen": row.get("last_seen"),
+        "count": row.get("count") or 0,
+        "regressed": bool(row.get("regressed")),
+    }
+
+
+def _doctor_visible(row: dict, ws, min_severity) -> bool:
+    """Workstream and minimum-severity filters for ``GET /api/doctor``."""
+    if ws not in (None, "", "all"):
+        scope = str(row.get("scope") or "global")
+        if scope != "global" and scope != f"ws:{ws}" and row.get("ws") != ws:
+            return False
+    if min_severity in _SEV_ORDER:
+        rank = _SEV_ORDER.get(str(row.get("severity")), 9)
+        if rank > _SEV_ORDER[min_severity]:
+            return False
+    return True
+
+
 def _offset_path_gone(path) -> bool:
     """True when an offset row no longer refers to a live file.
 
@@ -2133,6 +2172,28 @@ class Store:
               target_run_id TEXT NOT NULL,
               merged_at REAL NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS doctor_problems (
+              id TEXT PRIMARY KEY,
+              code TEXT,
+              severity TEXT,
+              scope TEXT,
+              ws TEXT,
+              title TEXT,
+              detail TEXT,
+              fix_command TEXT,
+              safe_auto INTEGER DEFAULT 0,
+              first_seen REAL,
+              last_seen REAL,
+              count INTEGER DEFAULT 1,
+              resolved_at REAL,
+              regressed INTEGER DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS doctor_meta (
+              key TEXT PRIMARY KEY,
+              value TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_doctor_code ON doctor_problems(code);
+            CREATE INDEX IF NOT EXISTS idx_doctor_open ON doctor_problems(resolved_at);
             CREATE INDEX IF NOT EXISTS idx_runs_status ON runs(status);
             CREATE INDEX IF NOT EXISTS idx_runs_ended ON runs(ended_at);
             CREATE INDEX IF NOT EXISTS idx_runs_ws ON runs(workstream);
@@ -2310,6 +2371,233 @@ class Store:
             self._seq += 1
             self._data_seq += 1
             self._note_data_write()
+
+    def doctor_snapshot(self, problems: list, now: float, interval_s: float = 300) -> dict:
+        """Persist one doctor run and return the ``GET /api/doctor`` payload.
+
+        ``problems`` are fresh dicts with ``id, code, severity, scope, ws,
+        title, detail, fix_command, safe_auto``. A problem absent from this
+        run resolves (``resolved_at`` set); one that reappears after a
+        resolution is ``regressed`` (sticky). Resolved rows older than 14
+        days are deleted. Never raises for bad rows: they are skipped.
+        """
+        now = float(now)
+        try:
+            interval = float(interval_s)
+        except (TypeError, ValueError):
+            interval = 300.0
+        if interval <= 0:
+            interval = 300.0
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                seen: set[str] = set()
+                for item in problems or []:
+                    try:
+                        pid = str(item.get("id"))
+                    except (TypeError, ValueError):
+                        continue
+                    if not pid:
+                        continue
+                    seen.add(pid)
+                    row = self._conn.execute(
+                        "SELECT count, resolved_at, regressed FROM doctor_problems WHERE id=?",
+                        (pid,),
+                    ).fetchone()
+                    if row is None:
+                        self._conn.execute(
+                            """INSERT INTO doctor_problems(
+                                 id, code, severity, scope, ws, title, detail,
+                                 fix_command, safe_auto, first_seen, last_seen,
+                                 count, resolved_at, regressed)
+                               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                            (
+                                pid,
+                                str(item.get("code") or ""),
+                                str(item.get("severity") or "warn"),
+                                str(item.get("scope") or "global"),
+                                item.get("ws"),
+                                str(item.get("title") or ""),
+                                str(item.get("detail") or ""),
+                                str(item.get("fix_command") or ""),
+                                1 if item.get("safe_auto") else 0,
+                                now,
+                                now,
+                                1,
+                                None,
+                                0,
+                            ),
+                        )
+                    else:
+                        regressed = 1 if row["regressed"] else 0
+                        resolved_at = None
+                        if row["resolved_at"] is not None:
+                            regressed = 1
+                        self._conn.execute(
+                            """UPDATE doctor_problems SET
+                                 code=?, severity=?, scope=?, ws=?, title=?, detail=?,
+                                 fix_command=?, safe_auto=?, last_seen=?,
+                                 count=COALESCE(count, 0) + 1,
+                                 resolved_at=?, regressed=?
+                               WHERE id=?""",
+                            (
+                                str(item.get("code") or ""),
+                                str(item.get("severity") or "warn"),
+                                str(item.get("scope") or "global"),
+                                item.get("ws"),
+                                str(item.get("title") or ""),
+                                str(item.get("detail") or ""),
+                                str(item.get("fix_command") or ""),
+                                1 if item.get("safe_auto") else 0,
+                                now,
+                                resolved_at,
+                                regressed,
+                                pid,
+                            ),
+                        )
+                if seen:
+                    marks = ",".join("?" for _ in seen)
+                    self._conn.execute(
+                        f"""UPDATE doctor_problems SET resolved_at=?
+                            WHERE resolved_at IS NULL AND id NOT IN ({marks})""",
+                        (now, *sorted(seen)),
+                    )
+                else:
+                    self._conn.execute(
+                        "UPDATE doctor_problems SET resolved_at=? WHERE resolved_at IS NULL",
+                        (now,),
+                    )
+                self._conn.execute(
+                    "DELETE FROM doctor_problems WHERE resolved_at IS NOT NULL AND resolved_at < ?",
+                    (now - 14 * 86400,),
+                )
+                self._conn.execute(
+                    "INSERT OR REPLACE INTO doctor_meta (key, value) VALUES ('generated_at', ?)",
+                    (str(now),),
+                )
+                self._conn.execute(
+                    "INSERT OR REPLACE INTO doctor_meta (key, value) VALUES ('interval_s', ?)",
+                    (str(interval),),
+                )
+                self._conn.execute("COMMIT")
+            except Exception:
+                self._conn.execute("ROLLBACK")
+                raise
+            return self._doctor_latest_locked(now, None, None)
+
+    def doctor_latest(
+        self,
+        now: float,
+        ws: str | None = None,
+        min_severity: str | None = None,
+    ) -> dict:
+        """The ``GET /api/doctor`` payload from the latest persisted run.
+
+        Never runs checks: it only reads. ``ws`` keeps that workstream's
+        problems plus global ones. ``min_severity`` (critical|warn|info) is
+        the least severe level included. Unknown values yield no filtering.
+        """
+        with self._lock:
+            return self._doctor_latest_locked(float(now), ws, min_severity)
+
+    def _doctor_latest_locked(self, now: float, ws, min_severity) -> dict:
+        meta = {
+            row["key"]: row["value"]
+            for row in self._conn.execute("SELECT key, value FROM doctor_meta").fetchall()
+        }
+        try:
+            generated_at = float(meta["generated_at"]) if meta.get("generated_at") else None
+        except (TypeError, ValueError):
+            generated_at = None
+        try:
+            interval_s = float(meta.get("interval_s") or 300.0)
+        except (TypeError, ValueError):
+            interval_s = 300.0
+        if interval_s <= 0:
+            interval_s = 300.0
+        rows = [
+            dict(row)
+            for row in self._conn.execute(
+                """SELECT * FROM doctor_problems WHERE resolved_at IS NULL
+                   ORDER BY
+                     CASE severity WHEN 'critical' THEN 0 WHEN 'warn' THEN 1 ELSE 2 END,
+                     code, id"""
+            ).fetchall()
+        ]
+        summary = {"critical": 0, "warn": 0, "info": 0, "regressed": 0}
+        for row in rows:
+            if row.get("severity") in summary:
+                summary[row["severity"]] += 1
+            if row.get("regressed"):
+                summary["regressed"] += 1
+        resolved = [
+            {
+                "id": row["id"],
+                "code": row["code"],
+                "title": row["title"],
+                "resolved_at": row["resolved_at"],
+            }
+            for row in self._conn.execute(
+                """SELECT id, code, title, resolved_at FROM doctor_problems
+                   WHERE resolved_at IS NOT NULL AND resolved_at >= ?
+                   ORDER BY resolved_at DESC""",
+                (now - 86400,),
+            ).fetchall()
+        ]
+        problems = [
+            _doctor_api_row(row)
+            for row in rows
+            if _doctor_visible(row, ws, min_severity)
+        ]
+        next_run_at = (
+            generated_at + interval_s if generated_at is not None else now + interval_s
+        )
+        return {
+            "generated_at": generated_at,
+            "next_run_at": next_run_at,
+            "interval_s": interval_s,
+            "summary": summary,
+            "problems": problems,
+            "resolved_24h": resolved,
+        }
+
+    def doctor_report(self, since: float, now: float) -> dict:
+        """Digest for hub reports: new, regressed, resolved, open by severity and workstream."""
+        since = float(since)
+        now = float(now)
+        with self._lock:
+            rows = [
+                dict(row) for row in self._conn.execute("SELECT * FROM doctor_problems").fetchall()
+            ]
+        open_rows = [row for row in rows if row.get("resolved_at") is None]
+        by_severity: dict[str, int] = {"critical": 0, "warn": 0, "info": 0}
+        by_ws: dict[str, int] = {}
+        for row in open_rows:
+            if row.get("severity") in by_severity:
+                by_severity[row["severity"]] += 1
+            key = row.get("ws") or "global"
+            by_ws[key] = by_ws.get(key, 0) + 1
+        return {
+            "since": since,
+            "now": now,
+            "open": [_doctor_api_row(row) for row in sorted(
+                open_rows, key=lambda item: (_SEV_ORDER.get(item.get("severity"), 9), item.get("id") or "")
+            )],
+            "open_by_severity": by_severity,
+            "open_by_ws": dict(sorted(by_ws.items())),
+            "new": [_doctor_api_row(row) for row in rows if (row.get("first_seen") or 0) >= since],
+            "regressed": [_doctor_api_row(row) for row in open_rows if row.get("regressed")],
+            "resolved": [
+                {
+                    "id": row["id"],
+                    "code": row["code"],
+                    "title": row["title"],
+                    "resolved_at": row["resolved_at"],
+                }
+                for row in rows
+                if row.get("resolved_at") is not None and row["resolved_at"] >= since
+            ],
+        }
 
     def _one(self, sql: str, args: tuple):
         row = self._conn.execute(sql, args).fetchone()

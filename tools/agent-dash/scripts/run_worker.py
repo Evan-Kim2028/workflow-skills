@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 """Launch one registry worker and wait. A second call for the same label only waits.
 
-Usage: run_worker.py <tier|default|auto> <label> <workspace> <prompt-file> <run-dir> [max-wait]
+Usage: run_worker.py <tier|default|auto> <label> <workspace> <prompt-file> <run-dir> [max-wait] [--no-preflight]
+
+A fast doctor preflight (dashboard reachable, run dir visible, tier model
+priced and policy-compliant) runs before launching; a failure prints the
+problem and its fix and exits 1 without launching. --no-preflight skips it.
 
 Prints one line:
 STATUS: running|done|failed out=<report> err=<stderr> tier=<name> [reason=...]
@@ -30,6 +34,59 @@ RUN_RULE = (
 LABEL_OK = re.compile(r"^[\w.+-]{1,80}$")
 KINDS = ("muse", "cursor", "grok-build")
 READ_LIMIT = 262144
+PREFLIGHT_TIMEOUT_S = 3.0
+
+
+def dashboard_url() -> str:
+    """Dashboard base URL for the launch preflight. Env wins."""
+    return os.environ.get("AGENT_DASH_URL", "http://127.0.0.1:8765").rstrip("/") or "http://127.0.0.1:8765"
+
+
+def preflight_target(registry, requested: str, ctx):
+    """Worker name to preflight, or None when the normal path reports it.
+
+    Named tiers resolve directly; ``default`` follows the registry;
+    ``auto`` takes the first eligible worker. Unknown tiers and an empty
+    bench return None so the caller below emits its own reason.
+    """
+    workers = registry.get("workers") or {}
+    if requested == "default":
+        name = registry.get("default")
+    elif requested == "auto":
+        name = eligible(ctx, set())
+    else:
+        name = requested
+    worker = workers.get(name) if isinstance(name, str) else None
+    if not isinstance(worker, dict) or worker.get("kind") not in KINDS:
+        return None
+    return name
+
+
+def run_preflight(registry, requested: str, ctx) -> int | None:
+    """Fast local preflight before launching. None when clear, else exit 1.
+
+    Checks the dashboard answers, the run dir will be visible to it, and
+    the tier's model is priced and policy-compliant. A failure prints the
+    problem and its fix and stops before anything launches.
+    """
+    from dash.doctor import preflight_for_launch
+
+    target = preflight_target(registry, requested, ctx)
+    if target is None:
+        return None
+    worker = (registry.get("workers") or {}).get(target) or {}
+    problem = preflight_for_launch(
+        target, worker, str(ctx["run_dir"]), str(state_dir()),
+        url=dashboard_url(), timeout_s=PREFLIGHT_TIMEOUT_S,
+    )
+    if problem is None:
+        return None
+    print(
+        f"preflight ({problem['code']}): {problem['title']}. "
+        f"{problem['detail']}. Fix: {problem['command']}",
+        file=sys.stderr,
+    )
+    return 1
 
 
 def run(argv, spawn=None, pgrep=None, sleep=None, now=None, alive=None, new_uuid=None) -> int:
@@ -41,9 +98,12 @@ def run(argv, spawn=None, pgrep=None, sleep=None, now=None, alive=None, new_uuid
         "alive": alive or pid_alive,
         "uuid": new_uuid or (lambda: str(uuid.uuid4())),
     }
+    argv = list(argv)
+    no_preflight = "--no-preflight" in argv
+    argv = [token for token in argv if token != "--no-preflight"]
     if len(argv) < 5:
         print(
-            "usage: run_worker.py <tier|default|auto> <label> <workspace> <prompt-file> <run-dir> [max-wait]",
+            "usage: run_worker.py <tier|default|auto> <label> <workspace> <prompt-file> <run-dir> [max-wait] [--no-preflight]",
             file=sys.stderr,
         )
         return 2
@@ -90,6 +150,10 @@ def run(argv, spawn=None, pgrep=None, sleep=None, now=None, alive=None, new_uuid
     if tier_path.is_file():
         stored = tier_path.read_text(encoding="utf-8").strip() or requested
         return observe(ctx, stored, set())
+    if not no_preflight:
+        blocked = run_preflight(registry, requested, ctx)
+        if blocked is not None:
+            return blocked
     name, reason = pick_initial(ctx)
     if not name:
         code = 0 if reason == "none-available" else 2

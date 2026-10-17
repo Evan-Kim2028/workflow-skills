@@ -198,6 +198,19 @@ becomes zero: the cost tile reads `totals.unpriced_tokens` /
 in the last hour; they are counted, never traceback-logged.
 `ok` is false when any source has an error, is `stalled` (no poll for more than 3x its interval), or overran its poll budget. Each source poll runs in a watchdog thread (`poll_budget_s`, default 25 s) so one hung source cannot stall the others; `/api/reconcile` mismatches include `source stalled: <name> (last ok poll N s ago)` for the same condition.
 `scratch_roots` is the configured, resolved `roots.scratchpads` list (a local config that narrows it shows up here); `run_dirs` is the registered run folders. `warnings` names each registered folder outside the configured roots that holds a manifest for a currently live worker, so a run folder the config does not cover is loud instead of silently invisible.
+`doctor` is the always-on check summary: `{"summary": {"critical": 0, "warn": 0, "info": 0, "regressed": 0}, "generated_at": 0}` (`generated_at` is null until the first run, 30 s after start). `ok` is false when `summary.critical` is above 0.
+
+`GET /api/doctor` -> the latest persisted doctor run. The server runs the checks in a background thread every `doctor.interval_s` seconds (default 300; first run 30 s after start, after the first full poll) and persists them in the `doctor_problems` table. The endpoint never runs checks inline; `?refresh=1` only queues a run.
+```json
+{"generated_at": 0, "next_run_at": 0, "interval_s": 300,
+ "summary": {"critical": 0, "warn": 0, "info": 0, "regressed": 0},
+ "problems": [{"id": "stuck-task:ws:WS4:WS4.1", "code": "stuck-task", "severity": "warn",
+   "scope": "ws:WS4", "ws": "WS4", "title": "", "detail": "",
+   "fix": {"command": "", "safe_auto": false, "doc": "docs/problems/stuck-task.md"},
+   "first_seen": 0, "last_seen": 0, "count": 1, "regressed": false}],
+ "resolved_24h": [{"id": "", "code": "", "title": "", "resolved_at": 0}]}
+```
+`?ws=<ID>` keeps that workstream's problems plus global ones; `?severity=critical|warn|info` is the minimum level shown. A problem absent from a run resolves (`resolved_at` set, kept 14 days); one that reappears after resolution is `regressed`. Critical means the numbers are wrong or the dashboard is blind: source stalled, unseen workers, dashboard down, unpriced model with tokens, reconcile mismatch. Warn is workflow hygiene: stuck task, policy breach, orphan process, stale approval, invalid bundle, and friends. Info is advisory: dirty checkout, run folder outside roots. Every code has a page under `docs/problems/<code>.md`.
 
 `GET /api/state` -> the whole dashboard in one call, computed in one
 store pass (`Store.state_view`):
@@ -218,13 +231,10 @@ store pass (`Store.state_view`):
 outside git. The window is the one fixed 24 h. `progress` is the same
 object `/api/plan` carries, or null. `health` carries the same
 `scratch_roots`, `run_dirs`, and `warnings` as `/api/health`.
-`problems` codes are `source-error`, `source-stale`,
-`reconcile-mismatch` (including one `unseen worker: <label>` item per
-live worker process the dashboard cannot see, graced while younger than
-two poll intervals, and one `duplicate run` item per unmerged launcher
-twin), `stale-running`, `unpriced-model`, and `invalid-bundle`; each
-`command` is the exact next command to run. Fields are only added,
-never renamed.
+`problems` is the persisted doctor list: the same entries (same ids)
+as `GET /api/doctor`, each additionally carrying the legacy `message`
+(`title: detail`) and `command` keys. Fields are only added, never
+renamed.
 `python3 agent_dash.py state [--json]` prints the same payload.
 `doctor` additionally reports each health `warnings` entry as a
 `run-dir-outside-roots` problem.

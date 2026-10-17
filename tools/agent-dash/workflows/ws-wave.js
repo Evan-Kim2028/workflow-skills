@@ -17,6 +17,7 @@ export const meta = {
 //   lanes: [{ task: "WS7.K1", slug: "kind-checker", tier: "default"|"auto", branch: "ws7/kind-checker",
 //             worktree: "/abs/<worktree>", brief: "what to build, files, stop rules", tests: "pytest a.py b.py",
 //             review: true, oneWay: true, reviewFocus: "one check" | ["check A", "check B"] }]
+//   skipDoctor: true   // optional: skip the doctor gate below (default runs it)
 // }
 // tier is a registry worker name, or "default", or "auto". defaultTier defaults to "default".
 // reviewTier defaults to defaultTier. The runner prints the tier it actually used.
@@ -44,6 +45,32 @@ for (const lane of A.lanes) {
   if (lane && lane.oneWay && !focusOf(lane).length) {
     throw new Error(`ws-wave lane ${lane.task || '(unnamed)'} is oneWay and needs reviewFocus`)
   }
+}
+
+const DOCTOR_GATE = {
+  type: 'object',
+  properties: {
+    critical: { type: 'boolean', description: 'true when the doctor lists a critical problem' },
+    problems: { type: 'string', description: 'the critical problem list, or ""' },
+  },
+  required: ['critical', 'problems'],
+}
+
+// Doctor gate: one cheap check before the wave spends workers. It runs
+// `doctor --json --severity critical` once and stops the wave with the
+// problem list when anything critical exists. Pass skipDoctor: true to
+// skip it (for example when the dashboard is knowingly down).
+if (A.skipDoctor !== true) {
+  const gate = await agent(
+    `Run one shell command with the Bash tool and report what it says: python3 ${A.dash} doctor --json --severity critical (Bash timeout 60000). ` +
+    `If it exits nonzero or its problems list is non-empty, return {"critical": true, "problems": <the first 2000 characters of its output>}. ` +
+    `Otherwise return {"critical": false, "problems": ""}. Do nothing else.`,
+    { label: 'doctor-gate', phase: 'Gate', schema: DOCTOR_GATE, model: 'haiku', effort: 'low' }
+  )
+  if (gate && gate.critical) {
+    throw new Error(`doctor gate: critical problems, stopping the wave:\n${gate.problems || '(no detail)'}`)
+  }
+  log('doctor gate: no critical problems')
 }
 
 const RUN = {

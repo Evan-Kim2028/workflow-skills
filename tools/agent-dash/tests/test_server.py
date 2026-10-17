@@ -1025,5 +1025,132 @@ class ReplayTest(unittest.TestCase):
         self.assertEqual(json.loads(body)["error"], "plan not found")
 
 
+class DoctorApiTest(unittest.TestCase):
+    def setUp(self):
+        from unittest import mock
+
+        self._live_patch = mock.patch("dash.server._live_workers", return_value=[])
+        self._live_patch.start()
+        self.addCleanup(self._live_patch.stop)
+        self.tmp = tempfile.TemporaryDirectory()
+        self.store = Store(Path(self.tmp.name) / "dash.sqlite")
+        self.now = time.time()
+        self.store.doctor_snapshot(
+            [
+                {
+                    "id": "unpriced-model:global:mystery-9", "code": "unpriced-model",
+                    "severity": "critical", "scope": "global", "ws": None,
+                    "title": "Model mystery-9 has usage but no price",
+                    "detail": "model 'mystery-9' has 3 usage rows (900 tokens in 24 h) with no price",
+                    "fix_command": "add a row to tools/agent-dash/catalog/prices.json, then run: python3 agent_dash.py reprice",
+                    "safe_auto": True,
+                },
+                {
+                    "id": "stuck-task:ws:WS9:WS9.1", "code": "stuck-task",
+                    "severity": "warn", "scope": "ws:WS9", "ws": "WS9",
+                    "title": "Task WS9.1 is stuck in wip with no live agent",
+                    "detail": "task WS9.1 in WS9 has status wip with no live agent",
+                    "fix_command": "python3 agent_dash.py ws plan WS9",
+                    "safe_auto": False,
+                },
+            ],
+            self.now,
+        )
+        self.server, self.thread = start(self.store)
+        self.port = self.server.server_address[1]
+
+    def tearDown(self):
+        stop(self.server, self.thread)
+        self.store.close()
+        self.tmp.cleanup()
+
+    def test_doctor_shape_exact(self):
+        status, _, body = get(self.port, "/api/doctor")
+        self.assertEqual(status, 200)
+        payload = json.loads(body)
+        self.assertEqual(
+            set(payload),
+            {"generated_at", "next_run_at", "interval_s", "summary", "problems", "resolved_24h"},
+        )
+        self.assertEqual(
+            payload["summary"], {"critical": 1, "warn": 1, "info": 0, "regressed": 0}
+        )
+        self.assertEqual(payload["interval_s"], 300.0)
+        self.assertEqual(len(payload["problems"]), 2)
+        for item in payload["problems"]:
+            self.assertEqual(
+                set(item),
+                {"id", "code", "severity", "scope", "ws", "title", "detail",
+                 "fix", "first_seen", "last_seen", "count", "regressed"},
+            )
+            self.assertEqual(
+                set(item["fix"]), {"command", "safe_auto", "doc"}
+            )
+        by_id = {item["id"]: item for item in payload["problems"]}
+        self.assertTrue(by_id["unpriced-model:global:mystery-9"]["fix"]["safe_auto"])
+        self.assertEqual(
+            by_id["stuck-task:ws:WS9:WS9.1"]["fix"]["doc"], "docs/problems/stuck-task.md"
+        )
+
+    def test_doctor_filters(self):
+        status, _, body = get(self.port, "/api/doctor?ws=WS9")
+        ids = {item["id"] for item in json.loads(body)["problems"]}
+        self.assertEqual(ids, {"unpriced-model:global:mystery-9", "stuck-task:ws:WS9:WS9.1"})
+        status, _, body = get(self.port, "/api/doctor?ws=WS1")
+        ids = {item["id"] for item in json.loads(body)["problems"]}
+        self.assertEqual(ids, {"unpriced-model:global:mystery-9"})
+        status, _, body = get(self.port, "/api/doctor?severity=critical")
+        ids = {item["id"] for item in json.loads(body)["problems"]}
+        self.assertEqual(ids, {"unpriced-model:global:mystery-9"})
+        status, _, body = get(self.port, "/api/doctor?severity=bogus")
+        self.assertEqual(status, 400)
+        status, _, _ = get(self.port, "/api/doctor?ws=..")
+        self.assertEqual(status, 400)
+
+    def test_doctor_never_runs_inline(self):
+        status, _, before = get(self.port, "/api/doctor")
+        first = json.loads(before)["generated_at"]
+        status, _, _ = get(self.port, "/api/doctor?refresh=1")
+        self.assertEqual(status, 200)
+        status, _, after = get(self.port, "/api/doctor")
+        self.assertEqual(json.loads(after)["generated_at"], first)
+
+    def test_doctor_empty_before_first_run(self):
+        stop(self.server, self.thread)
+        fresh = Store(Path(self.tmp.name) / "empty.sqlite")
+        self.addCleanup(fresh.close)
+        self.server, self.thread = start(fresh)
+        self.port = self.server.server_address[1]
+        status, _, body = get(self.port, "/api/doctor")
+        self.assertEqual(status, 200)
+        payload = json.loads(body)
+        self.assertIsNone(payload["generated_at"])
+        self.assertEqual(payload["problems"], [])
+        self.assertEqual(
+            payload["summary"], {"critical": 0, "warn": 0, "info": 0, "regressed": 0}
+        )
+
+    def test_health_carries_doctor_and_fails_on_critical(self):
+        status, _, body = get(self.port, "/api/health")
+        health = json.loads(body)
+        self.assertIn("doctor", health)
+        self.assertEqual(health["doctor"]["summary"]["critical"], 1)
+        self.assertFalse(health["ok"])
+        self.store.doctor_snapshot([], time.time())
+        status, _, body = get(self.port, "/api/health")
+        health = json.loads(body)
+        self.assertEqual(health["doctor"]["summary"]["critical"], 0)
+
+    def test_state_problems_match_doctor_ids(self):
+        status, _, body = get(self.port, "/api/doctor")
+        doctor_ids = [item["id"] for item in json.loads(body)["problems"]]
+        status, _, body = get(self.port, "/api/state")
+        state_ids = [item["id"] for item in json.loads(body)["problems"]]
+        self.assertEqual(state_ids, doctor_ids)
+        for item in json.loads(body)["problems"]:
+            self.assertIn("message", item)
+            self.assertIn("command", item)
+
+
 if __name__ == "__main__":
     unittest.main()

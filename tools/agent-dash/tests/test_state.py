@@ -137,7 +137,7 @@ class StateShapeTest(unittest.TestCase):
         for key in ("scratch_roots", "run_dirs", "warnings"):
             self.assertIn(key, payload["health"])
 
-    def test_unseen_worker_in_reconcile_and_problems(self):
+    def test_unseen_worker_in_reconcile_but_not_in_problems_until_a_run(self):
         now = time.time()
         ghosts = [{"pid": 4242, "comm": "cursor-agent", "label": "ws1-ghost"}]
         payload = build_state(self.store, StubRegistry([]), {}, now=now, processes=ghosts)
@@ -147,15 +147,12 @@ class StateShapeTest(unittest.TestCase):
             any(item == "unseen worker: ws1-ghost (cursor-agent pid 4242)" for item in payload["reconcile"]["mismatches"]),
             payload["reconcile"]["mismatches"],
         )
-        problems = [item for item in payload["problems"] if item["code"] == "reconcile-mismatch"]
-        self.assertTrue(
-            any("unseen worker: ws1-ghost" in item["message"] for item in problems),
-            [item["message"] for item in problems],
-        )
-        self.assertTrue(all("python3 agent_dash.py check" in item["command"] for item in problems))
+        self.assertEqual(payload["problems"], [])
 
 
 class StateProblemsTest(unittest.TestCase):
+    """``/api/state`` problems are the persisted doctor list (same ids)."""
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.store = _store(self.tmp.name)
@@ -164,24 +161,53 @@ class StateProblemsTest(unittest.TestCase):
         self.store.close()
         self.tmp.cleanup()
 
-    def test_source_error_and_stale_source(self):
-        now = time.time()
-        registry = StubRegistry(
+    def _seed(self, now):
+        self.store.doctor_snapshot(
             [
-                {"name": "generic", "last_poll": now - 5, "last_error": None},
-                {"name": "muse", "last_poll": now - 5, "last_error": "boom"},
-                {"name": "quiet", "last_poll": None, "last_error": None},
-            ]
+                {
+                    "id": "source-error:global:muse", "code": "source-error",
+                    "severity": "critical", "scope": "global", "ws": None,
+                    "title": "Source muse is failing",
+                    "detail": "source 'muse' last poll failed: boom",
+                    "fix_command": "python3 agent_dash.py status",
+                    "safe_auto": False,
+                },
+                {
+                    "id": "unpriced-model:global:no-such-model-xyz", "code": "unpriced-model",
+                    "severity": "critical", "scope": "global", "ws": None,
+                    "title": "Model no-such-model-xyz has usage but no price",
+                    "detail": "model 'no-such-model-xyz' has 1 usage rows (15 tokens in 24 h)",
+                    "fix_command": "add a row to tools/agent-dash/catalog/prices.json, then run: python3 agent_dash.py reprice",
+                    "safe_auto": True,
+                },
+            ],
+            now,
         )
-        payload = build_state(self.store, registry, {}, now=now)
-        codes = [item["code"] for item in payload["problems"]]
-        self.assertIn("source-error", codes)
-        self.assertIn("source-stale", codes)
+
+    def test_problems_match_doctor_ids(self):
+        now = time.time()
+        self._seed(now)
+        payload = build_state(self.store, StubRegistry([]), {}, now=now)
+        expected = [item["id"] for item in self.store.doctor_latest(now)["problems"]]
+        self.assertEqual([item["id"] for item in payload["problems"]], expected)
+        for item in payload["problems"]:
+            self.assertIn("code", item)
+            self.assertIn("message", item)
+            self.assertIn("command", item)
+            self.assertIn("fix", item)
         failing = next(item for item in payload["problems"] if item["code"] == "source-error")
         self.assertIn("muse", failing["message"])
         self.assertIn("python3 agent_dash.py status", failing["command"])
+        unpriced = next(item for item in payload["problems"] if item["code"] == "unpriced-model")
+        self.assertIn("no-such-model-xyz", unpriced["message"])
+        self.assertIn("catalog/prices.json", unpriced["command"])
 
-    def test_stale_running_commands(self):
+    def test_no_run_means_no_problems(self):
+        now = time.time()
+        payload = build_state(self.store, StubRegistry([]), {}, now=now)
+        self.assertEqual(payload["problems"], [])
+
+    def test_reconcile_still_live_without_a_doctor_run(self):
         now = time.time()
         self.store.upsert_run(
             {
@@ -195,49 +221,9 @@ class StateProblemsTest(unittest.TestCase):
                 "started_at": now - 60,
             }
         )
-        self.store.upsert_run(
-            {
-                "run_id": "generic:old:g9",
-                "source": "generic",
-                "tier": "generic",
-                "label": "ws9-WS9.2-old",
-                "session_id": "s2",
-                "status": "running",
-                "started_at": now - 7 * 3600,
-            }
-        )
         payload = build_state(self.store, StubRegistry([]), {}, now=now)
-        stale = [item for item in payload["problems"] if item["code"] == "stale-running"]
-        self.assertEqual(len(stale), 2)
-        by_run = {item["message"]: item["command"] for item in stale}
-        muse_cmd = next(cmd for msg, cmd in by_run.items() if "muse:dead" in msg)
-        generic_cmd = next(cmd for msg, cmd in by_run.items() if "generic:old" in msg)
-        self.assertEqual(muse_cmd, "python3 agent_dash.py check")
-        self.assertIn("python3 agent_dash.py report finish --label ws9-WS9.2-old", generic_cmd)
-        self.assertFalse(any(item["code"] == "reconcile-mismatch" and "stale running" in item["message"] for item in payload["problems"]))
-
-    def test_unpriced_model(self):
-        now = time.time()
-        self.store.add_usage(
-            {
-                "ts": now,
-                "session_id": "s",
-                "run_id": "generic:s:ws9-WS9.1-x",
-                "model": "no-such-model-xyz",
-                "tool": "generic",
-                "message_id": "m1",
-                "input": 10,
-                "output": 5,
-                "cache_read": 0,
-                "cache_write": 0,
-                "reasoning": 0,
-            }
-        )
-        payload = build_state(self.store, StubRegistry([]), {}, now=now)
-        unpriced = [item for item in payload["problems"] if item["code"] == "unpriced-model"]
-        self.assertTrue(unpriced)
-        self.assertIn("no-such-model-xyz", unpriced[0]["message"])
-        self.assertIn("catalog/prices.json", unpriced[0]["command"])
+        self.assertFalse(payload["reconcile"]["ok"])
+        self.assertEqual(payload["problems"], [])
 
 
 if __name__ == "__main__":

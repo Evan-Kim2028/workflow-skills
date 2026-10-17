@@ -19,7 +19,6 @@ TOOL_ROOT = Path(__file__).resolve().parents[1]
 
 SCHEMA_VERSION = 1
 WINDOW_S = RANGE_S
-STALE_SOURCE_S = 900.0
 
 
 def tool_version(root: Path | None = None) -> str:
@@ -98,7 +97,7 @@ def build_state(store, registry, cfg=None, now: float | None = None, processes=N
     unassigned = roll["unassigned"]
     totals = roll["all"]["totals"]
 
-    problems = _problems(health, mismatches, view.get("stale") or [], store, bundles)
+    problems = _doctor_problems(store, now)
 
     by_source = dict(view.get("running_by_source") or {})
     return {
@@ -136,115 +135,27 @@ def _row_progress(resolve_plan, ws: str):
     return dict(progress) if isinstance(progress, dict) else None
 
 
-def _problems(health: dict, mismatches: list, stale: list, store, bundles: dict) -> list:
-    problems = []
-    for source in (health or {}).get("sources") or []:
-        name = source.get("name")
-        error = source.get("last_error")
-        if error:
-            problems.append(
-                {
-                    "code": "source-error",
-                    "message": f"source {name!r} last poll failed: {error}",
-                    "command": "python3 agent_dash.py status",
-                }
-            )
-            continue
-        last = source.get("last_poll")
-        lag = source.get("lag_s")
-        if last is None or (isinstance(lag, (int, float)) and lag > STALE_SOURCE_S):
-            problems.append(
-                {
-                    "code": "source-stale",
-                    "message": f"source {name!r} has no recent poll (last_poll={last})",
-                    "command": "python3 agent_dash.py status",
-                }
-            )
-    for item in mismatches:
-        if item.startswith("stale running: "):
-            continue
-        problems.append(
-            {
-                "code": "reconcile-mismatch",
-                "message": item,
-                "command": "python3 agent_dash.py check",
-            }
-        )
-    for row in stale:
-        label = row.get("label")
-        source = row.get("source")
-        if source == "generic" and label:
-            command = f"python3 agent_dash.py report finish --label {label} --verdict PASS --status done"
-        else:
-            command = "python3 agent_dash.py check"
-        problems.append(
-            {
-                "code": "stale-running",
-                "message": f"stale running: {row.get('run_id')} ({row.get('reason')})",
-                "command": command,
-            }
-        )
-    problems.extend(_price_problems(store))
-    problems.extend(_bundle_problems(bundles))
-    return problems
+def _doctor_problems(store, now: float) -> list:
+    """The persisted doctor run: the same list (same ids) as ``GET /api/doctor``.
 
-
-def _price_problems(store) -> list:
-    """Models with usage rows but no input/output rate stay unpriced."""
+    Never runs checks inline; the background doctor owns the data. Each
+    entry keeps the legacy ``message`` and ``command`` keys so older
+    readers keep working alongside the new ``id`` shape.
+    """
     try:
-        stats = store.usage_model_stats()
+        payload = store.doctor_latest(now)
     except Exception:
         return []
-    try:
-        from dash.pricing import catalog as load_catalog
-    except Exception:
-        return []
-    try:
-        rows = {row["model"]: row for row in load_catalog()}
-    except Exception:
-        return []
-    problems = []
-    for stat in stats:
-        model = stat.get("model")
-        if not model or not stat.get("rows"):
+    out = []
+    for item in payload.get("problems") or []:
+        if not isinstance(item, dict):
             continue
-        row = rows.get(model)
-        if row is None or row.get("input") is None or row.get("output") is None:
-            problems.append(
-                {
-                    "code": "unpriced-model",
-                    "message": (
-                        f"model {model!r} has {stat.get('rows')} usage rows with no price "
-                        "(cost counts unpriced runs, never $0)"
-                    ),
-                    "command": (
-                        "add a row to tools/agent-dash/catalog/prices.json, "
-                        "then run: python3 agent_dash.py reprice"
-                    ),
-                }
-            )
-    return problems
+        fix = item.get("fix") or {}
+        entry = dict(item)
+        entry["message"] = f"{item.get('title')}: {item.get('detail')}"
+        entry["command"] = fix.get("command") or ""
+        out.append(entry)
+    return out
 
 
-def _bundle_problems(bundles: dict) -> list:
-    try:
-        from dash.bundles import validate_bundle
-    except Exception:
-        return []
-    problems = []
-    for ws in bundles:
-        try:
-            issues = validate_bundle(ws)
-        except Exception:
-            continue
-        if issues:
-            first = issues[0]
-            extra = f" (+{len(issues) - 1} more)" if len(issues) > 1 else ""
-            problems.append(
-                {
-                    "code": "invalid-bundle",
-                    "message": f"bundle {ws} fails validation: {first}{extra}",
-                    "command": f"python3 agent_dash.py ws validate {ws}",
-                }
-            )
-    return problems
+
