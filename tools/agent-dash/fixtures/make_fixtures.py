@@ -544,10 +544,23 @@ def _progress(groups):
     return {"done": counts["done"], "total": total, "counts": counts, "pct": pct}
 
 
+def _clean_task(task):
+    row = {"id": task.get("id"), "title": task.get("title"), "status": task.get("status")}
+    deps = task.get("deps")
+    if isinstance(deps, list):
+        row["deps"] = [entry for entry in deps if isinstance(entry, str)]
+    if isinstance(task.get("kind"), str):
+        row["kind"] = task.get("kind")
+    notes = task.get("dep_notes")
+    if isinstance(notes, dict):
+        row["dep_notes"] = {key: value for key, value in notes.items() if isinstance(key, str) and isinstance(value, str)}
+    return row
+
+
 def _clean_groups(groups):
     return [
         {"id": group.get("id"), "col": group.get("col"), "title": group.get("title"),
-         "tasks": [{"id": task.get("id"), "title": task.get("title"), "status": task.get("status")} for task in group.get("tasks", [])]}
+         "tasks": [_clean_task(task) for task in group.get("tasks", [])]}
         for group in groups
     ]
 

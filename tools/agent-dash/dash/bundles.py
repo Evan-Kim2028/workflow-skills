@@ -270,6 +270,11 @@ def _view_groups(value) -> list:
             deps = task.get("deps")
             if isinstance(deps, list):
                 row["deps"] = [item for item in deps if isinstance(item, str)]
+            if isinstance(task.get("kind"), str):
+                row["kind"] = task.get("kind")
+            notes = task.get("dep_notes")
+            if isinstance(notes, dict):
+                row["dep_notes"] = {key: value for key, value in notes.items() if isinstance(key, str) and isinstance(value, str)}
             if isinstance(task.get("wave"), str):
                 row["wave"] = task.get("wave")
             tasks.append(row)
@@ -534,6 +539,9 @@ def _validate_dag(issues: list[str], dag) -> None:
             status = task.get("status")
             if status not in STATUSES:
                 issues.append(f"plan.json: task {tid} status {status!r} is not {', '.join(STATUSES)}")
+            kind = task.get("kind")
+            if kind is not None and kind not in ("task", "gate"):
+                issues.append(f'plan.json: task {tid} kind {kind!r} is not "task" or "gate"')
             if status == "deferred":
                 moved = task.get("moved_to")
                 if moved is not None and (not isinstance(moved, str) or not _MOVED.match(moved)):
@@ -542,7 +550,13 @@ def _validate_dag(issues: list[str], dag) -> None:
                     issues.append(f"plan.json: task {tid} note must be a string")
     for group in groups:
         for task in (group.get("tasks") if isinstance(group, dict) and isinstance(group.get("tasks"), list) else []):
-            if not isinstance(task, dict) or "deps" not in task:
+            if not isinstance(task, dict):
+                continue
+            tid = task.get("id")
+            notes = task.get("dep_notes")
+            if notes is not None:
+                _validate_dep_notes(issues, tid, task.get("deps"), notes)
+            if "deps" not in task:
                 continue
             deps = task.get("deps")
             if not isinstance(deps, list) or not all(isinstance(item, str) for item in deps):
@@ -563,6 +577,24 @@ def _validate_dag(issues: list[str], dag) -> None:
             continue
         if edge[0] not in ids or edge[1] not in ids:
             issues.append(f"plan.json: edge {edge[0]} -> {edge[1]} names an unknown group")
+
+
+def _validate_dep_notes(issues: list[str], tid, deps, notes) -> None:
+    """dep_notes keys must name one of the task's own deps; values are short prose."""
+    if not isinstance(notes, dict):
+        issues.append(f"plan.json: task {tid} dep_notes must be an object")
+        return
+    known = deps if isinstance(deps, list) and all(isinstance(item, str) for item in deps) else []
+    for key, value in notes.items():
+        if key not in known:
+            issues.append(f"plan.json: task {tid} dep_notes for {key} is not one of its deps")
+        if not isinstance(value, str) or not value.strip():
+            issues.append(f"plan.json: task {tid} dep_notes for {key} must be a non-empty string")
+        elif len(value) > 280:
+            issues.append(f"plan.json: task {tid} dep_notes for {key} must be a short string (280 chars or fewer)")
+        else:
+            for hit in naming_issues(value):
+                issues.append(f"plan.json: task {tid} dep_notes for {key}: bare citation {hit.token}")
 
 
 def _validate_decisions(issues: list[str], decisions) -> None:

@@ -47,9 +47,10 @@
         "col": 0,
         "title": "First group",
         "tasks": [
+          {"id": "WS1.0", "title": "Upstream freeze signal is in", "status": "done", "kind": "gate"},
           {"id": "WS1.1", "title": "Agree the contract", "status": "todo"},
-          {"id": "WS1.2", "title": "Land the read route", "status": "pr"},
-          {"id": "WS1.3", "title": "Retire the old readers", "status": "wip"},
+          {"id": "WS1.2", "title": "Land the read route", "status": "pr", "deps": ["WS1.1"]},
+          {"id": "WS1.3", "title": "Retire the old readers", "status": "wip", "deps": ["WS1.2", "WS1.0"], "dep_notes": {"WS1.0": "retire the readers only after the freeze signal"}},
           {"id": "WS1.4", "title": "Freeze the old contract", "status": "done"}
         ]
       }

@@ -132,9 +132,18 @@ def _groups(value) -> list:
         for task in item.get("tasks") or []:
             if not isinstance(task, dict):
                 continue
-            tasks.append(
-                {"id": task.get("id"), "title": task.get("title"), "status": task.get("status")}
-            )
+            row = {"id": task.get("id"), "title": task.get("title"), "status": task.get("status")}
+            deps = task.get("deps")
+            if isinstance(deps, list):
+                row["deps"] = [entry for entry in deps if isinstance(entry, str)]
+            if isinstance(task.get("kind"), str):
+                row["kind"] = task.get("kind")
+            notes = task.get("dep_notes")
+            if isinstance(notes, dict):
+                row["dep_notes"] = {
+                    key: value for key, value in notes.items() if isinstance(key, str) and isinstance(value, str)
+                }
+            tasks.append(row)
         groups.append(
             {
                 "id": item.get("id"),

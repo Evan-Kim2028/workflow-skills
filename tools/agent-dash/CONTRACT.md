@@ -107,7 +107,8 @@ invariant and is empty when consistent. `python3 agent_dash.py check [--url URL]
 prints the rows as a table and exits 1 on any mismatch.
 
 `GET /api/plan?ws=WS7` -> that workstream's plan with a `progress` object:
-`{"ws": "WS7", "cols": [..], "groups": [{id, col, title, tasks: [{id, title, status}]}], "edges": [[a, b]], "phases": [{name, goal, gate}], "progress": {"done": 0, "total": 0, "counts": {todo, wip, pr, prog, done, deferred}, "pct": 0}}`.
+`{"ws": "WS7", "cols": [..], "groups": [{id, col, title, tasks: [{id, title, status, deps, kind, dep_notes}]}], "edges": [[a, b]], "phases": [{name, goal, gate}], "progress": {"done": 0, "total": 0, "counts": {todo, wip, pr, prog, done, deferred}, "pct": 0}}`.
+A task's `kind` is `task` or `gate` (an outside signal or condition, drawn as a diamond); absent means `task`. `dep_notes` maps one of the task's dep ids to the short condition on that edge. Both pass through every plan API sanitized like other fields. `/api/bundle` carries the same task shape inside `plan.dag.groups`.
 `plans.local.json` replaces `plans.example.json`. Each value is a path. Relative paths resolve next to the plans file. The loader reads `dag` and `narrative.phases`.
 One resolver (`dash.bundles.resolve_plan`) picks the plan file: a bundle's
 `plan.json` wins over the plans-map file. `/api/plan`, `/api/bundle`, and the
@@ -146,7 +147,7 @@ Each bundle:
 | File | Role |
 |---|---|
 | `bundle.json` | `{id, title, short, order, kind}`. `kind` is `program` or `workstream`. The id matches the directory name. |
-| `plan.json` | Decision record: `dag`, `decisions`, `motivation`, `agent_friendly`, `narrative`. Task status is `todo`, `pr`, `prog`, `done`, or `deferred`. `deferred` may set `moved_to` and `note`. A `program` bundle may hold only `narrative`. |
+| `plan.json` | Decision record: `dag`, `decisions`, `motivation`, `agent_friendly`, `narrative`. Task status is `todo`, `pr`, `prog`, `done`, or `deferred`. `deferred` may set `moved_to` and `note`. A task may carry `deps`, `dep_notes` (conditions keyed by dep id), and `kind` (`task` or `gate`; see SKILL-PLAN.md). `ws validate` rejects a bad `kind` and a `dep_notes` key that is not one of the task's `deps`. A `program` bundle may hold only `narrative`. |
 | `page.html` | Plan-view fragment. Generated for bundles that have `visuals.html` and `layout.json`. |
 | `approvals.json` | Optional. `{ws, decided_at, decided_by, items: [{id, step, status, reversible, conditions}]}`. `status` is `pending`, `approved`, or `denied`. `reversible` is a boolean. `decided_at` is an ISO-8601 UTC string or null. |
 | `visuals.html` | Hand-made sections keyed by h2 title. |

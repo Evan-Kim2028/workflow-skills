@@ -111,6 +111,36 @@ class WsCliTest(unittest.TestCase):
         path.write_text(json.dumps(plan), encoding="utf-8")
         self.assertTrue(any("deps must be a list" in item for item in validate_bundle("WS5")))
 
+    def test_task_kind_and_dep_notes_validate(self):
+        self.assertEqual(cmd_ws(["new", "WS6", "Gates"]), 0)
+        _add_tasks(Path(self.tmp.name), "WS6", ["WS6.2"])
+        path = Path(self.tmp.name) / "WS6" / "plan.json"
+        plan = json.loads(path.read_text(encoding="utf-8"))
+        tasks = [task for group in plan["dag"]["groups"] for task in group["tasks"]]
+        first = tasks[0]["id"]
+        tasks[0]["kind"] = "gate"
+        tasks[-1]["deps"] = [first]
+        tasks[-1]["dep_notes"] = {first: "start only after the signal"}
+        path.write_text(json.dumps(plan), encoding="utf-8")
+        self.assertEqual(validate_bundle("WS6"), [])
+        tasks[0]["kind"] = "signal"
+        path.write_text(json.dumps(plan), encoding="utf-8")
+        self.assertTrue(any('kind \'signal\'' in item for item in validate_bundle("WS6")))
+        tasks[0]["kind"] = "gate"
+        tasks[-1]["dep_notes"] = {"WS6.missing": "start only after the signal"}
+        path.write_text(json.dumps(plan), encoding="utf-8")
+        issues = validate_bundle("WS6")
+        self.assertTrue(any("dep_notes for WS6.missing is not one of its deps" in item for item in issues))
+        tasks[-1]["dep_notes"] = "nope"
+        path.write_text(json.dumps(plan), encoding="utf-8")
+        self.assertTrue(any("dep_notes must be an object" in item for item in validate_bundle("WS6")))
+        tasks[-1]["dep_notes"] = {first: ""}
+        path.write_text(json.dumps(plan), encoding="utf-8")
+        self.assertTrue(any("must be a non-empty string" in item for item in validate_bundle("WS6")))
+        tasks[-1]["dep_notes"] = {first: "x" * 281}
+        path.write_text(json.dumps(plan), encoding="utf-8")
+        self.assertTrue(any("must be a short string" in item for item in validate_bundle("WS6")))
+
     def test_task_updates_atomically(self):
         self.assertEqual(cmd_ws(["new", "WS3", "Third"]), 0)
         self.assertEqual(set_task("WS3", "WS3.1", "done", None, None), 0)

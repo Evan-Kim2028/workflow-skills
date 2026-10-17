@@ -12,6 +12,12 @@
       "title": "First group",
       "tasks": [
         {
+          "id": "WS1.0",
+          "title": "Upstream freeze signal is in",
+          "status": "done",
+          "kind": "gate"
+        },
+        {
           "id": "WS1.1",
           "title": "Agree the contract",
           "status": "todo"
@@ -19,12 +25,22 @@
         {
           "id": "WS1.2",
           "title": "Land the read route",
-          "status": "pr"
+          "status": "pr",
+          "deps": [
+            "WS1.1"
+          ]
         },
         {
           "id": "WS1.3",
           "title": "Retire the old readers",
-          "status": "wip"
+          "status": "wip",
+          "deps": [
+            "WS1.2",
+            "WS1.0"
+          ],
+          "dep_notes": {
+            "WS1.0": "retire the readers only after the freeze signal"
+          }
         },
         {
           "id": "WS1.4",
@@ -69,17 +85,17 @@
     }
   ],
   "progress": {
-    "done": 1,
-    "total": 4,
+    "done": 2,
+    "total": 5,
     "counts": {
       "todo": 1,
       "wip": 1,
       "pr": 1,
       "prog": 0,
-      "done": 1,
+      "done": 2,
       "deferred": 0
     },
-    "pct": 25
+    "pct": 40
   },
   "_note": "Seeded example plan for the fixture preview."
 }

@@ -27,7 +27,7 @@ The lead plans, decides, verifies and reports. Workers do everything else. Relat
    - `needsLead`: read the last review and decide. Fix, re-scope, or defer with `ws task <ID> <task> deferred --note ...`.
 4. Move status with `python3 ~/.claude/tools/agent-dash/agent_dash.py ws task <ID> <task> <todo|pr|prog|done|deferred>`, as soon as each fact changes. The dashboard and the Plan page read it live.
 5. Start the next wave as soon as its start condition holds. Don't wait on lower wave numbers. A task is ready when every id in its `deps` is done or merged.
-6. When you re-plan (split, merge, move or add a task, or change a wave), update the task `deps` and `wave` in `plan.json` in the same step, then run `ws validate`.
+6. When you re-plan (split, merge, move or add a task, or change a wave), update the task `deps` and `wave` in `plan.json` in the same step, then run `ws validate`. Model an outside signal or condition as a `"kind": "gate"` task, and put the condition text in the dependent's `dep_notes` (keyed by the gate's task id).
 
 ## Production steps
 

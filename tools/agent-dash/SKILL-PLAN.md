@@ -14,7 +14,7 @@ That writes `bundle.json`, a template `plan.json`, `layout.json`, an empty `visu
 
 Fill `plan.json` before you render. The shape is the decision record: `dag`, `decisions`, `motivation`, `agent_friendly`, `narrative`. Task status is `todo`, `pr`, `prog`, `done`, or `deferred`. A deferred task can set `moved_to` to a workstream id and a `note`. Keep done tasks in the dag so the map shows progress.
 
-`dag.cols` is the column titles, left to right. Each group has `id`, `col`, `title`, and `tasks`. Each task has `id`, `title`, and `status`. Edges are pairs of group ids and mean "this group waits on that one".
+`dag.cols` is the column titles, left to right. Each group has `id`, `col`, `title`, and `tasks`. Each task has `id`, `title`, and `status`. A task may carry `deps` (task ids it waits on) and `dep_notes` (a map from one of its dep ids to the short condition on that edge, e.g. "run only after the export"). A task that is an outside signal or condition rather than work in this workstream carries `"kind": "gate"` (default `"task"`); the map draws it as a diamond. Edges are pairs of group ids and mean "this group waits on that one".
 
 `narrative.thesis` is one sentence. `narrative.end_state` is what is true when the workstream is done. `narrative.phases` is `name`, `goal`, and `gate`.
 

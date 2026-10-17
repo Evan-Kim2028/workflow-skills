@@ -331,7 +331,13 @@ class FixtureShapeTests(unittest.TestCase):
             self.assertEqual(progress["done"], sum(1 for task in tasks if task["status"] == "done"))
             self.assertEqual(progress["total"], sum(1 for task in tasks if task["status"] != "deferred"))
         ws1 = self.docs["plan-WS1.json"]["progress"]
-        self.assertEqual((ws1["done"], ws1["total"], ws1["pct"]), (1, 4, 25))
+        self.assertEqual((ws1["done"], ws1["total"], ws1["pct"]), (2, 5, 40))
+        tasks = [task for group in self.docs["plan-WS1.json"]["groups"] for task in group["tasks"]]
+        gates = [task for task in tasks if task.get("kind") == "gate"]
+        self.assertEqual(len(gates), 1)
+        noted = [task for task in tasks if task.get("dep_notes")]
+        self.assertEqual(len(noted), 1)
+        self.assertTrue(set(noted[0]["dep_notes"]) <= set(noted[0].get("deps", [])))
 
     def test_reconcile_fixture(self):
         doc = self.docs["reconcile.json"]
@@ -366,7 +372,7 @@ class FixtureShapeTests(unittest.TestCase):
             self.assertIsInstance(group["col"], int)
             ids.add(group["id"])
             for task in group["tasks"]:
-                self.assertEqual(set(task), {"id", "title", "status"})
+                self.assertEqual(set(task) - {"deps", "kind", "dep_notes"}, {"id", "title", "status"})
                 self.assertIsInstance(task["status"], str)
                 self.assertTrue(task["status"])
         for edge in plan["edges"]:

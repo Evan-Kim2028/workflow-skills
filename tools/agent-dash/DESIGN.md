@@ -31,7 +31,7 @@ The dashboard is read by a visual thinker. Every view answers its question with 
 - Bars and areas: 2 px surface gap between stacked segments, rounded ends, recessive grid and axes.
 - Every chart with two or more series has a legend; every mark has a hover tooltip; bars and timeline rows open details on click.
 - Timeline bars with file-time clocks (`clock_source = mtime`) are hatched, never solid.
-- Plan progress map: groups in columns, arrows mean "waits on". Same component on every workstream tab. Task states, each with its own color AND symbol (never color alone), legend on the map:
+- Plan progress map: groups in columns, arrows mean "waits on": group arrows between tiles, task arrows between chips (solid when the prerequisite is done, dashed while it waits, with the edge condition on hover). Same component on every workstream tab. Task states, each with its own color AND symbol (never color alone), legend on the map:
 
   | State | Color | Symbol |
   |---|---|---|
@@ -42,6 +42,7 @@ The dashboard is read by a visual thinker. Every view answers its question with 
   | finished in the last 15 min | green outline | (outline) |
   | not started | dashed gray | none |
   | deferred or moved to another workstream (`status: deferred`, optional `moved_to`, `note`) | dotted gray, faded | ↷ |
+  | gate: an outside signal or condition (`kind: gate`), met when done | dashed border, check when met, hollow diamond while unmet | ✓ / ◇ |
 
   Deferred tasks stay on the map where they were planned but leave every count and progress bar.
 

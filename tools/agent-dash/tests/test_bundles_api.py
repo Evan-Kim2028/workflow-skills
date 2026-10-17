@@ -384,5 +384,94 @@ class TrainsApiTest(unittest.TestCase):
         self.assertEqual(bare["ws"], "WS9")
 
 
+class GatesApiTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.old = os.environ.get("AGENT_DASH_WORKSTREAMS")
+        os.environ["AGENT_DASH_WORKSTREAMS"] = self.tmp.name
+        root = Path(self.tmp.name)
+        ws = root / "WS9"
+        ws.mkdir()
+        (ws / "bundle.json").write_text(
+            json.dumps({"id": "WS9", "title": "Example", "short": "Ex", "order": 1, "kind": "workstream"}),
+            encoding="utf-8",
+        )
+        (ws / "plan.json").write_text(
+            json.dumps(
+                {
+                    "dag": {
+                        "cols": ["Shape"],
+                        "groups": [{"id": "g", "col": 0, "title": "Group", "tasks": [
+                            {"id": "WS9.0", "title": "Upstream signal is in", "status": "done", "kind": "gate"},
+                            {"id": "WS9.1", "title": "First task", "status": "todo", "deps": ["WS9.0"],
+                             "dep_notes": {"WS9.0": "start only after the signal"}},
+                        ]}],
+                        "edges": [],
+                    },
+                    "narrative": {"phases": []},
+                }
+            ),
+            encoding="utf-8",
+        )
+        self.store = Store(Path(self.tmp.name) / "dash.sqlite")
+        self.server, self.thread = start(self.store, ROOT / "static" / "index.html")
+        self.port = self.server.server_address[1]
+
+    def tearDown(self):
+        stop(self.server, self.thread)
+        self.store.close()
+        if self.old is None:
+            os.environ.pop("AGENT_DASH_WORKSTREAMS", None)
+        else:
+            os.environ["AGENT_DASH_WORKSTREAMS"] = self.old
+        self.tmp.cleanup()
+
+    def test_gate_and_dep_notes_pass_through(self):
+        from dash.bundles import validate_bundle
+
+        self.assertEqual(validate_bundle("WS9"), [])
+        for route in ("/api/bundle?ws=WS9", "/api/plan?ws=WS9"):
+            status, _, body = get(self.port, route)
+            self.assertEqual(status, 200)
+            payload = json.loads(body)
+            if route.startswith("/api/bundle?"):
+                tasks = payload["plan"]["dag"]["groups"][0]["tasks"]
+            else:
+                tasks = payload["groups"][0]["tasks"]
+            rows = {task["id"]: task for task in tasks}
+            self.assertEqual(rows["WS9.0"]["kind"], "gate")
+            self.assertEqual(rows["WS9.1"]["deps"], ["WS9.0"])
+            self.assertEqual(rows["WS9.1"]["dep_notes"], {"WS9.0": "start only after the signal"})
+
+    def test_plans_map_gate_and_dep_notes(self):
+        from dash.plans import load as load_plan
+
+        tmp = Path(self.tmp.name) / "maps"
+        tmp.mkdir()
+        (tmp / "ws9.json").write_text(
+            json.dumps(
+                {
+                    "dag": {
+                        "cols": ["Shape"],
+                        "groups": [{"id": "g", "col": 0, "title": "Group", "tasks": [
+                            {"id": "WS9.0", "title": "Upstream signal is in", "status": "done", "kind": "gate", "junk": 1},
+                            {"id": "WS9.1", "title": "First task", "status": "todo", "deps": ["WS9.0"],
+                             "dep_notes": {"WS9.0": "start only after the signal"}},
+                        ]}],
+                        "edges": [],
+                    },
+                    "narrative": {"phases": []},
+                }
+            ),
+            encoding="utf-8",
+        )
+        (tmp / "plans.json").write_text(json.dumps({"WS9": "ws9.json"}), encoding="utf-8")
+        plan = load_plan("WS9", tmp / "plans.json")
+        rows = {task["id"]: task for task in plan["groups"][0]["tasks"]}
+        self.assertEqual(rows["WS9.0"]["kind"], "gate")
+        self.assertNotIn("junk", rows["WS9.0"])
+        self.assertEqual(rows["WS9.1"]["dep_notes"], {"WS9.0": "start only after the signal"})
+
+
 if __name__ == "__main__":
     unittest.main()

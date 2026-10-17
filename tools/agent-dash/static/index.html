@@ -119,6 +119,9 @@ tr.clk{cursor:pointer}tr.clk:hover td{background:var(--surface-2)}
 .chip.wip::before{content:"\25D4"}
 .chip.deferred{border-style:dotted;opacity:.6}
 .chip.deferred::before{content:"\21B7"}
+.chip.gate{border-style:dashed}
+.chip.gate::before{content:"\25C7"}
+.chip.gate.done::before{content:"\2713"}
 .chip .att{font:600 9.5px var(--mono);color:var(--muted);margin-left:3px;padding:0 3px;border-radius:4px;border:1px solid var(--grid)}
 .chip .att.hot{color:var(--ink);border-color:var(--warning)}
 .chip.live{border-style:solid;border-color:var(--s1);background:var(--s1);color:#fff;box-shadow:0 0 0 3px color-mix(in srgb,var(--s1) 30%,transparent);animation:pulse 1.6s infinite}
@@ -272,6 +275,12 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
 .tedges path.tl.t-down{stroke:var(--s1)}
 .tedges .tm.t-up{fill:var(--warning)}
 .tedges .tm.t-down{fill:var(--s1)}
+.tedges path.tl{pointer-events:none}
+.tedges path.tl.a-met{stroke:var(--good);stroke-width:1.2;stroke-dasharray:none;opacity:.5;animation:none}
+.tedges path.tl.a-un{stroke:var(--muted);stroke-width:1.2;stroke-dasharray:3 4;opacity:.45;animation:none}
+.tedges .tm.a-met{fill:var(--good)}
+.tedges .tm.a-un{fill:var(--muted)}
+.tedges path.thit{fill:none;stroke:rgba(0,0,0,0);stroke-width:12;pointer-events:stroke}
 .dag.tfocus .dedges path{opacity:.08}
 .dag.tfocus .dnode{opacity:.35;transition:opacity .2s ease}
 .dag.tfocus .dnode.t-lit{opacity:1}
@@ -287,6 +296,11 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
 .trtag{font:700 9.5px var(--mono);color:var(--ink-2);border:1px solid var(--grid);border-radius:4px;padding:0 3px;margin-left:2px;white-space:nowrap}
 .trlegend{display:flex;flex-wrap:wrap;gap:6px 14px;margin:10px 0 0;font-size:12px;color:var(--ink-2)}
 .trlegend span{display:inline-flex;align-items:center;gap:6px}
+.alegend{display:flex;flex-wrap:wrap;gap:6px 14px;margin:10px 0 0;font-size:12px;color:var(--ink-2)}
+.alegend span{display:inline-flex;align-items:center;gap:6px}
+.alegend svg{overflow:visible}
+.arrows-toggle{display:inline-flex;align-items:center;gap:6px;font:600 12px var(--font);color:var(--ink-2);margin-left:8px}
+.gchip{font:11px var(--mono);padding:2px 6px;border-radius:5px;border:1.5px dashed var(--muted);color:var(--ink-2)}
 </style>
 </head>
 <body>
@@ -946,11 +960,14 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
     dag.style.gridTemplateColumns = "repeat(" + plan.cols.length + ",1fr)";
     var cols = plan.cols.map(function (n) { var d = el("div", {class: "dcol"}, [el("div", {class: "dcolh", text: n})]); dag.appendChild(d); return d; });
     var nodes = {}, chipEl = {}, tGroup = {}, tTitle = {}, tUp = {}, tDown = {}, depth = {};
-    plan.groups.forEach(function (g) { g.tasks.forEach(function (t) { tGroup[t.id] = g.id; tTitle[t.id] = t.title || ""; }); });
+    var tKind = {}, tStatus = {}, tNotes = {};
+    plan.groups.forEach(function (g) { g.tasks.forEach(function (t) { tGroup[t.id] = g.id; tTitle[t.id] = t.title || ""; tStatus[t.id] = t.status || "todo"; if (t.kind === "gate") tKind[t.id] = "gate"; if (t.dep_notes && typeof t.dep_notes === "object") tNotes[t.id] = t.dep_notes; }); });
     plan.groups.forEach(function (g) { g.tasks.forEach(function (t) { (t.deps || []).forEach(function (d) { if (!tGroup[d] || d === t.id) return; (tUp[t.id] = tUp[t.id] || []).push(d); (tDown[d] = tDown[d] || []).push(t.id); }); }); });
     var hasTaskDeps = Object.keys(tUp).length > 0;
     function depthOf(id, seen) { if (depth[id] != null) return depth[id]; seen = seen || {}; if (seen[id]) return 0; seen[id] = 1; var d = 0; (tUp[id] || []).forEach(function (p) { d = Math.max(d, 1 + depthOf(p, seen)); }); return (depth[id] = d); }
-    function tList(ids) { return ids.map(function (d) { return d + " " + tTitle[d]; }).join("; "); }
+    function depMet(d) { return tStatus[d] === "done"; }
+    function fmtDep(b) { return function (d) { var s = d + " " + (tTitle[d] || "") + " (" + (depMet(d) ? "met" : "not met") + ")"; var note = (tNotes[b] || {})[d]; if (typeof note === "string" && note) s += ": " + note; return s; }; }
+    function edgeTitle(a, b) { var note = (tNotes[b] || {})[a]; if (typeof note === "string" && note) return b + " " + (tTitle[b] || "") + " waits on " + a + " " + (tTitle[a] || "") + ": " + note + " (" + (depMet(a) ? "met" : "not met") + ")"; return b + " waits on " + a; }
     plan.groups.forEach(function (g) {
       var cnt = {done: 0, wip: 0, prog: 0, pr: 0, todo: 0, moved: 0, deferred: 0}; g.tasks.forEach(function (t) { cnt[t.status || "todo"] = (cnt[t.status || "todo"] || 0) + 1; });
       var live = g.tasks.length - (cnt.moved || 0) - (cnt.deferred || 0);
@@ -963,8 +980,8 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
       var gLive = 0;
       var ordered = hasTaskDeps ? g.tasks.map(function (t, i) { return [depthOf(t.id), i, t]; }).sort(function (a, b) { return a[0] - b[0] || a[1] - b[1]; }).map(function (x) { return x[2]; }) : g.tasks;
       var ch = el("div", {class: "chips"}); ordered.forEach(function (t) {
-        var st = t.status || "todo", rs = live[t.id] || [], jr = just[t.id];
-        var cp = el("span", {class: "chip " + st + (rs.length ? " live" : "") + (jr && !rs.length ? " just" : ""), title: t.id + " · " + (t.title || "") + " · " + st + (t.moved_to ? " to " + t.moved_to : "") + (t.note ? " (" + t.note + ")" : "") + (rs.length ? " · working: " + rs.map(function (r) { return (r.label || r.run_id) + " (" + (r.tier || "") + ", " + fmtDur(r.elapsed_s) + ")"; }).join(", ") : "") + (jr && !rs.length ? " · just finished: " + (jr.label || "") + (jr.verdict ? " " + jr.verdict : "") : "")}, [t.id]);
+        var st = t.status || "todo", rs = live[t.id] || [], jr = just[t.id], gate = t.kind === "gate";
+        var cp = el("span", {class: "chip " + st + (rs.length ? " live" : "") + (jr && !rs.length ? " just" : "") + (gate ? " gate" : ""), title: t.id + " · " + (t.title || "") + (gate ? " · gate (" + (st === "done" ? "met" : "not met") + ")" : " · " + st) + (t.moved_to ? " to " + t.moved_to : "") + (t.note ? " (" + t.note + ")" : "") + (rs.length ? " · working: " + rs.map(function (r) { return (r.label || r.run_id) + " (" + (r.tier || "") + ", " + fmtDur(r.elapsed_s) + ")"; }).join(", ") : "") + (jr && !rs.length ? " · just finished: " + (jr.label || "") + (jr.verdict ? " " + jr.verdict : "") : "")}, [t.id]);
         var sk = plan.ws + ":" + t.id; if (prevSt[sk] && prevSt[sk] !== st) cp.classList.add("changed"); prevSt[sk] = st;
         var at = att[t.id]; if (at) { cp.title += " · " + attText(at); if (at.runs > 1) cp.appendChild(el("span", {class: "att" + (at.sentBack >= 2 ? " hot" : ""), text: "\u21BB" + fmtN(at.runs)})); }
         var tr = trainOf[t.id];
@@ -975,8 +992,8 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
           cp.appendChild(el("span", {class: "trtag", text: tr.train.id || "T?", title: (tr.train.title || "") + " · " + (tr.train.status || "planned")}));
         }
         if (t.wave) cp.title += "\nWave: " + t.wave;
-        if (tUp[t.id]) cp.title += "\nWaits on: " + tList(tUp[t.id]);
-        if (tDown[t.id]) cp.title += "\nUnblocks: " + tList(tDown[t.id]);
+        if (tUp[t.id]) cp.title += "\nWaits on: " + tUp[t.id].map(fmtDep(t.id)).join(", ");
+        if (tDown[t.id]) cp.title += "\nUnblocks: " + tDown[t.id].map(function (d) { return d + " " + (tTitle[d] || ""); }).join(", ");
         if (rs.length) { gLive += rs.length; var b = el("span", {class: "ag", text: String(rs.length)}); b.style.background = colorOf(tierKey(rs[0])); cp.appendChild(b); cp.style.cursor = "pointer"; cp.addEventListener("click", function () { openRun(rs[0]); }); }
         else if (hasTaskDeps) { cp.style.cursor = "pointer"; cp.addEventListener("click", function (ev) { ev.stopPropagation(); pinned = pinned === t.id ? null : t.id; if (pinned) focusTask(t.id); else { clearTask(); groupEnter(g.id); } }); }
         if (hasTaskDeps) { cp.addEventListener("mouseenter", function () { focusTask(t.id); }); cp.addEventListener("mouseleave", function () { if (pinned) focusTask(pinned); else { clearTask(); groupEnter(g.id); } }); }
@@ -1012,7 +1029,7 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
     var lg = el("div", {class: "plegend"});
     [["live", "agent working now"], ["wip", "in progress (branch, not merged)"], ["pr", "waiting to merge (approved or PR open)"], ["prog", "merged, waiting on a prod step"], ["done", "done"], ["just", "finished in the last 15 min"], ["todo", "not started"], ["deferred", "deferred or moved to another workstream"]].forEach(function (p) { var ch2 = el("span", {class: "chip " + (p[0] === "just" ? "done just" : p[0])}, [p[0] === "live" ? "\u25CF" : p[0] === "todo" ? "\u00B7" : "\u2009"]); lg.appendChild(el("span", {style: "display:inline-flex;align-items:center;gap:6px"}, [ch2, p[1]])); });
     legendPop.appendChild(lg);
-    legendPop.appendChild(el("p", {text: "The badge on a working chip is the model family and how many agents are on it. \u21BBN counts the agent runs on a task in this range (an amber edge means it was sent back twice or more). Arrows between tiles show which stage waits on which; hover a tile to light up its chain. Hover a chip to see the tasks it waits on (amber) and unblocks (blue); click to pin the whole chain. Chips in a tile run left to right in the order they can start."}));
+    legendPop.appendChild(el("p", {text: "The badge on a working chip is the model family and how many agents are on it. \u21BBN counts the agent runs on a task in this range (an amber edge means it was sent back twice or more). Arrows between tiles show which stage waits on which; hover a tile to light up its chain. Every task dependency is an arrow between chips: solid when the prerequisite is done, dashed while it waits; hover an arrow for its condition. Hover a chip to see the tasks it waits on (amber) and unblocks (blue); click to pin the whole chain. A \u25C7 chip is a gate, an outside signal: a check means met. The Arrows toggle switches between all arrows and on-focus only. Chips in a tile run left to right in the order they can start."}));
     var ob = el("div", {class: "pbig"}), obBar = el("div", {class: "pbig-bar", role: "img", "aria-label": tot.done + " of " + all + " tasks done"});
     [["done", "var(--good)"], ["prog", "var(--s5)"], ["pr", "var(--warning)"]].forEach(function (p) { var sp = el("span"); sp.style.background = p[1]; var pw0 = ((window.__adPrevBar || {})[plan.ws] || {})[p[0]]; sp.style.width = (pw0 == null ? 0 : pw0) + "%"; sp.dataset.w = all ? (100 * (tot[p[0]] || 0) / all) : 0; sp.dataset.k = p[0]; obBar.appendChild(sp); });
     var obPct = el("b", {class: "pbig-pct", text: "0%"});
@@ -1040,6 +1057,45 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
       });
       c.appendChild(trl);
     }
+    /* Always-on task arrows: every task dependency draws from the prerequisite chip to the dependent chip. */
+    var nTaskEdges = 0;
+    Object.keys(tUp).forEach(function (b) { nTaskEdges += (tUp[b] || []).length; });
+    var storedArrows = null;
+    try { storedArrows = localStorage.getItem("agent-dash-arrows"); } catch (e) {}
+    var arrowMode = storedArrows === "focus" ? "focus" : storedArrows === "all" ? "all" : (nTaskEdges > 150 ? "focus" : "all");
+    var arrowsTg = el("span", {class: "arrows-toggle", title: nTaskEdges + " task deps" + (nTaskEdges > 150 ? ": over 150, so the map defaults to on-focus arrows" : "")}, [document.createTextNode("Arrows: ")]);
+    var arrowsSeg = el("span", {class: "seg-ctl"});
+    var arrowsAll = el("button", {text: "all", title: "Draw every task dependency arrow"});
+    var arrowsFocus = el("button", {text: "on focus", title: "Draw task arrows only for the hovered or pinned chip"});
+    arrowsSeg.appendChild(arrowsAll); arrowsSeg.appendChild(arrowsFocus); arrowsTg.appendChild(arrowsSeg);
+    c.firstChild.appendChild(arrowsTg);
+    function paintArrowsToggle() { arrowsAll.setAttribute("aria-pressed", String(arrowMode === "all")); arrowsFocus.setAttribute("aria-pressed", String(arrowMode === "focus")); }
+    paintArrowsToggle();
+    arrowsAll.addEventListener("click", function () { setArrowMode("all"); });
+    arrowsFocus.addEventListener("click", function () { setArrowMode("focus"); });
+    function setArrowMode(m) {
+      arrowMode = m;
+      try { localStorage.setItem("agent-dash-arrows", m); } catch (e) {}
+      paintArrowsToggle();
+      if (pinned) focusTask(pinned);
+      else { clearTask(true); if (m === "all") drawAllTaskEdges(); }
+    }
+    function edgeSample(cls, tip) {
+      var g = s("svg", {width: "34", height: "10", title: tip, role: "img", "aria-label": tip});
+      var col = cls === "a-met" ? "var(--good)" : "var(--muted)";
+      var pl = s("path", {d: "M2,5 L26,5", fill: "none", stroke: col, "stroke-width": "1.4"});
+      if (cls !== "a-met") pl.setAttribute("stroke-dasharray", "3 4");
+      g.appendChild(pl);
+      g.appendChild(s("path", {d: "M26,2 L32,5 L26,8 z", fill: col}));
+      return g;
+    }
+    if (hasTaskDeps) {
+      var aleg = el("div", {class: "alegend"});
+      aleg.appendChild(el("span", {title: "Solid arrow: the prerequisite chip is done"}, [edgeSample("a-met", "Solid arrow: the prerequisite chip is done"), document.createTextNode("met prerequisite")]));
+      aleg.appendChild(el("span", {title: "Dashed arrow: the prerequisite chip is not done yet"}, [edgeSample("a-un", "Dashed arrow: the prerequisite chip is not done yet"), document.createTextNode("not met")]));
+      aleg.appendChild(el("span", {title: "Diamond chip: a gate, an outside signal or condition. A check means met, a hollow diamond means not met."}, [el("i", {class: "gchip", text: "\u25C7"}), document.createTextNode("gate")]));
+      c.appendChild(aleg);
+    }
     function draw() {
       while (svg.firstChild) svg.removeChild(svg.firstChild);
       var box = dag.getBoundingClientRect(); if (!box.width) return;
@@ -1052,6 +1108,7 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
         var to = gs[e[1]], fr = gs[e[0]];
         svg.appendChild(s("path", {d: d, class: to && to.active && !to.done ? "flow" : fr && fr.done ? "done" : "", "data-a": e[0], "data-b": e[1]}));
       });
+      if (arrowMode === "all" && !pinned) drawAllTaskEdges();
     }
     requestAnimationFrame(function () { requestAnimationFrame(draw); }); window.__adPlanDraw = draw;
     /* Focus on hover: a group's upstream and downstream light up and animate; everything else dims. */
@@ -1081,31 +1138,23 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
     /* Task focus: lines from the chips a task waits on (amber) and to the chips it unblocks (blue), across tiles. */
     var pinned = null, tsvg = s("svg", {class: "tedges", "data-diagram": "task-deps"}); dag.appendChild(tsvg);
     dag.addEventListener("click", function (ev) { if (pinned && !(ev.target.closest && ev.target.closest(".chip"))) { pinned = null; clearTask(); groupClear(); } });
-    function clearTask() {
+    function clearTask(silent) {
       dag.classList.remove("tfocus");
       Object.keys(chipEl).forEach(function (k) { chipEl[k].classList.remove("t-self", "t-up", "t-down", "t-near"); });
       Object.keys(nodes).forEach(function (k) { nodes[k].classList.remove("t-lit"); });
       while (tsvg.firstChild) tsvg.removeChild(tsvg.firstChild);
+      if (!silent && arrowMode === "all" && !pinned) drawAllTaskEdges();
     }
-    function focusTask(id) {
-      clearTask(); groupClear();
-      var ups = reach(id, tUp), downs = reach(id, tDown), box = dag.getBoundingClientRect();
-      dag.classList.add("tfocus");
+    function svgTitle(text) { var t = document.createElementNS("http://www.w3.org/2000/svg", "title"); t.textContent = text; return t; }
+    function ensureTaskMarkers() {
+      if (tsvg.querySelector("defs")) return;
+      var defs = s("defs"); ["t-up", "t-down", "a-met", "a-un"].forEach(function (cl) { var m = s("marker", {id: "tm-" + plan.ws + "-" + cl, viewBox: "0 0 10 10", refX: "9", refY: "5", markerWidth: "6", markerHeight: "6", orient: "auto-start-reverse"}); m.appendChild(s("path", {d: "M0,0 L10,5 L0,10 z", class: "tm " + cl})); defs.appendChild(m); }); tsvg.appendChild(defs);
+    }
+    /* Shared router: each link gets its own slot on the chip edge (sorted by where the far end is) and its own bend, so lines fan out instead of piling up. */
+    function drawTaskLinks(links) {
+      ensureTaskMarkers();
       tsvg.setAttribute("width", dag.scrollWidth); tsvg.setAttribute("height", dag.scrollHeight);
-      function lit(k, cls) { if (!chipEl[k]) return; chipEl[k].classList.add(cls); nodes[tGroup[k]].classList.add("t-lit"); }
-      lit(id, "t-self"); Object.keys(ups).forEach(function (k) { lit(k, "t-up"); }); Object.keys(downs).forEach(function (k) { lit(k, "t-down"); });
-      (tUp[id] || []).concat(tDown[id] || []).forEach(function (k) { if (chipEl[k]) chipEl[k].classList.add("t-near"); });
-      var defs = s("defs"); ["t-up", "t-down"].forEach(function (c) { var m = s("marker", {id: "tm-" + plan.ws + "-" + c, viewBox: "0 0 10 10", refX: "9", refY: "5", markerWidth: "6", markerHeight: "6", orient: "auto-start-reverse"}); m.appendChild(s("path", {d: "M0,0 L10,5 L0,10 z", class: "tm " + c})); defs.appendChild(m); }); tsvg.appendChild(defs);
-      /* Collect links, then give each one its own slot on the chip edge (sorted by where the far end is) and its own bend, so lines fan out instead of piling up. */
-      var links = [], full = pinned === id;
-      if (full) {
-        Object.keys(ups).concat([id]).forEach(function (x) { (tUp[x] || []).forEach(function (d) { if (ups[d]) links.push({a: d, b: x, cls: "t-up", near: x === id}); }); });
-        Object.keys(downs).forEach(function (y) { (tUp[y] || []).forEach(function (d) { if (d === id || downs[d]) links.push({a: d, b: y, cls: "t-down", near: d === id}); }); });
-      } else {
-        (tUp[id] || []).forEach(function (d) { links.push({a: d, b: id, cls: "t-up", near: true}); });
-        (tDown[id] || []).forEach(function (y) { links.push({a: id, b: y, cls: "t-down", near: true}); });
-      }
-      var L = box.left, T = box.top, R = {};
+      var box = dag.getBoundingClientRect(), L = box.left, T = box.top, R = {};
       function rect(k) { if (!R[k]) { var r = chipEl[k].getBoundingClientRect(); R[k] = {l: r.left - L, r: r.right - L, t: r.top - T, b: r.bottom - T, cx: (r.left + r.right) / 2 - L, cy: (r.top + r.bottom) / 2 - T, w: r.width, h: r.height}; } return R[k]; }
       var sides = {};
       links = links.filter(function (k) { return chipEl[k.a] && chipEl[k.b]; });
@@ -1128,14 +1177,52 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
         });
       });
       var gut = {};
-      links.forEach(function (k, i) {
+      links.forEach(function (k) {
         var a = k.pa, b = k.pb, d;
         var lane = (gut[k.kind + Math.round((a.x + b.x) / 40)] = (gut[k.kind + Math.round((a.x + b.x) / 40)] || 0) + 1) - 1, off = (lane % 2 ? 1 : -1) * Math.ceil(lane / 2) * 7;
         if (k.kind === "arc") { var lift = 12 + Math.min(36, Math.abs(b.x - a.x) * .22) + Math.abs(off) * .6; d = "M" + a.x + "," + a.y + " C" + a.x + "," + (a.y - lift) + " " + b.x + "," + (b.y - lift) + " " + b.x + "," + (b.y - 2); }
         else if (k.kind === "h") { var mx = (a.x + b.x) / 2 + off, x2 = b.x + (k.sb === "l" ? -2 : 2); d = "M" + a.x + "," + a.y + " C" + mx + "," + a.y + " " + mx + "," + b.y + " " + x2 + "," + b.y; }
         else { var my = (a.y + b.y) / 2 + off, y2 = b.y + (k.sb === "t" ? -2 : 2); d = "M" + a.x + "," + a.y + " C" + a.x + "," + my + " " + b.x + "," + my + " " + b.x + "," + y2; }
         tsvg.appendChild(s("path", {d: d, class: "tl " + k.cls + (k.near ? " near" : ""), "marker-end": "url(#tm-" + plan.ws + "-" + k.cls + ")"}));
+        /* Wide invisible hit path: hover shows the edge condition without blocking chip clicks. */
+        var hit = s("path", {d: d, class: "thit"});
+        hit.appendChild(svgTitle(edgeTitle(k.a, k.b)));
+        hit.addEventListener("click", function (ev) {
+          ev.stopPropagation();
+          hit.style.pointerEvents = "none";
+          var under = document.elementFromPoint(ev.clientX, ev.clientY);
+          hit.style.pointerEvents = "";
+          var chip = under && under.closest ? under.closest(".chip") : null;
+          if (chip) chip.click();
+          else if (pinned) { pinned = null; clearTask(); groupClear(); }
+        });
+        tsvg.appendChild(hit);
       });
+    }
+    /* Rest state: every task dependency as one arrow, styled by whether the prerequisite is done. */
+    function drawAllTaskEdges() {
+      if (!hasTaskDeps || !dag.getBoundingClientRect().width) return;
+      var links = [];
+      Object.keys(tUp).forEach(function (b) { (tUp[b] || []).forEach(function (a) { links.push({a: a, b: b, cls: depMet(a) ? "a-met" : "a-un", near: false}); }); });
+      drawTaskLinks(links);
+    }
+    function focusTask(id) {
+      clearTask(true); groupClear();
+      var ups = reach(id, tUp), downs = reach(id, tDown);
+      dag.classList.add("tfocus");
+      function lit(k, cls) { if (!chipEl[k]) return; chipEl[k].classList.add(cls); nodes[tGroup[k]].classList.add("t-lit"); }
+      lit(id, "t-self"); Object.keys(ups).forEach(function (k) { lit(k, "t-up"); }); Object.keys(downs).forEach(function (k) { lit(k, "t-down"); });
+      (tUp[id] || []).concat(tDown[id] || []).forEach(function (k) { if (chipEl[k]) chipEl[k].classList.add("t-near"); });
+      /* Collect links, then draw them through the shared router. */
+      var links = [], full = pinned === id;
+      if (full) {
+        Object.keys(ups).concat([id]).forEach(function (x) { (tUp[x] || []).forEach(function (d) { if (ups[d]) links.push({a: d, b: x, cls: "t-up", near: x === id}); }); });
+        Object.keys(downs).forEach(function (y) { (tUp[y] || []).forEach(function (d) { if (d === id || downs[d]) links.push({a: d, b: y, cls: "t-down", near: d === id}); }); });
+      } else {
+        (tUp[id] || []).forEach(function (d) { links.push({a: d, b: id, cls: "t-up", near: true}); });
+        (tDown[id] || []).forEach(function (y) { links.push({a: id, b: y, cls: "t-down", near: true}); });
+      }
+      drawTaskLinks(links);
     }
     if (plan.phases && plan.phases.length) { var ph = el("div", {class: "phases"}); plan.phases.forEach(function (p) { ph.appendChild(el("div", {class: "phase", title: p.gate ? "Done when: " + p.gate : ""}, [el("b", {text: p.name}), p.goal, p.gate ? el("small", {class: "gate", text: "Done when \u24D8"}) : null])); }); c.appendChild(ph); }
     return c;
