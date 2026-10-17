@@ -765,6 +765,75 @@ def _check(runs, conc):
     return peak
 
 
+def _doctor(ws=None):
+    """Fixture mirror of GET /api/doctor: the shared summary/problems/
+    resolved_24h shape. ``ws`` filters to that workstream plus globals,
+    like ?ws=. Covers every card state: a critical, a regressed warn
+    naming a WS1 plan task, an info, and one recent resolution."""
+    problems = [
+        {
+            "id": "source-stalled:global",
+            "code": "source-stalled",
+            "severity": "critical",
+            "scope": "global",
+            "ws": None,
+            "title": "Claude source stalled",
+            "detail": "No successful poll for 42 min, 21 times the 2 s interval; live counts may be out of date.",
+            "fix": {"command": "python3 agent_dash.py run", "safe_auto": False, "doc": "docs/problems/source-stalled.md"},
+            "first_seen": NOW - 3600,
+            "last_seen": NOW - 120,
+            "count": 18,
+            "regressed": False,
+        },
+        {
+            "id": "stuck-task:ws:WS1:3",
+            "code": "stuck-task",
+            "severity": "warn",
+            "scope": "ws:WS1",
+            "ws": "WS1",
+            "title": "Retiring the old readers is stuck",
+            "detail": "Task 3 (Retire the old readers) in WS1 Identity shows an agent working for 3 h with no output growth.",
+            "fix": {"command": "python3 agent_dash.py state --ws WS1", "safe_auto": False, "doc": "docs/problems/stuck-task.md"},
+            "first_seen": NOW - 3 * 3600,
+            "last_seen": NOW - 120,
+            "count": 5,
+            "regressed": True,
+        },
+        {
+            "id": "checkout-dirty:global",
+            "code": "checkout-dirty",
+            "severity": "info",
+            "scope": "global",
+            "ws": None,
+            "title": "Dashboard checkout is dirty",
+            "detail": "3 files differ from HEAD; the running page may not match the branch.",
+            "fix": {"command": "git status --short", "safe_auto": False, "doc": "docs/problems/checkout-dirty.md"},
+            "first_seen": NOW - 86400,
+            "last_seen": NOW - 120,
+            "count": 2,
+            "regressed": False,
+        },
+    ]
+    if ws is not None:
+        problems = [p for p in problems if p["scope"] == "global" or p["ws"] == ws]
+    summary = {"critical": 0, "warn": 0, "info": 0, "regressed": 0}
+    for p in problems:
+        summary[p["severity"]] += 1
+        if p["regressed"]:
+            summary["regressed"] += 1
+    return {
+        "generated_at": NOW - 120,
+        "next_run_at": NOW - 120 + 300,
+        "interval_s": 300,
+        "summary": summary,
+        "problems": problems,
+        "resolved_24h": [
+            {"id": "orphan-process:global", "code": "orphan-process", "title": "Orphan worker reaped", "resolved_at": NOW - 7200},
+        ],
+        "_note": NOTE + (" WS1 scope." if ws else ""),
+    }
+
+
 def main():
     runs = build_runs()
     plans = _plans()
@@ -783,6 +852,8 @@ def main():
         "sessions.json": _sessions(runs),
         "workstreams.json": _workstreams(runs, NOW, plans),
         "reconcile.json": _reconcile(runs, NOW),
+        "doctor.json": _doctor(),
+        "doctor-WS1.json": _doctor("WS1"),
         "health.json": {
             "ok": True,
             "sources": [

@@ -508,6 +508,100 @@ class PageRules(unittest.TestCase):
         self.assertIn("request failed", bodies["tiles"], "tiles() reads zero on a failed scope")
         self.assertIn("snapError", bodies["drawMain"], "drawMain never consults the failure flag")
 
+    def test_doctor_pill_never_healthy_on_failure(self):
+        """The header pill never reads healthy when the doctor fetch failed
+        or is still pending; failure reads "doctor unavailable"."""
+        script = (
+            "const fs=require('fs');"
+            "eval(fs.readFileSync(process.argv[1],'utf8'));"
+            "const DD=globalThis.DashDoctor;"
+            "const assert=require('assert');"
+            "const doc={generated_at:1000,summary:{critical:0,warn:0,info:0,regressed:0},problems:[],resolved_24h:[]};"
+            "for(const bad of [DD.pillFor(null,true),DD.pillFor(doc,true)]){"
+            "assert.ok(bad.text.indexOf('healthy')<0,'pill says healthy on a failed fetch: '+bad.text);"
+            "assert.ok(bad.text.indexOf('unavailable')>=0,'failed pill names no outage: '+bad.text);}"
+            "assert.ok(DD.pillFor(null,false).text.indexOf('healthy')<0,'pending pill says healthy');"
+            "assert.ok(DD.pillFor(doc,false).text.indexOf('healthy')>=0,'clean bill says nothing healthy');"
+            "const crit={generated_at:1000,problems:[{severity:'critical'}],resolved_24h:[]};"
+            "assert.ok(DD.pillFor(crit,false).text.indexOf('critical')>=0,'critical pill names no severity');"
+        )
+        proc = subprocess.run(
+            ["node", "-e", script, str(STATIC / "doctor.js")],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr or proc.stdout)
+
+    def test_doctor_card_uses_the_copy_helper(self):
+        """The Health card fix box copies through the shared clipboard helper
+        (navigator.clipboard with a textarea fallback), not inline code."""
+        src = (STATIC / "doctor.js").read_text()
+        self.assertIn("clipboard", src, "no clipboard copy path")
+        self.assertIn("writeText", src, "no clipboard write")
+        self.assertIn("textarea", src, "no textarea fallback for copy")
+        self.assertGreater(src.count("copyText("), 1, "the card never calls the copy helper")
+        self.assertIn("Copied", src, "no copied confirmation")
+
+    def test_doctor_numbers_are_compact(self):
+        """Doctor counts go through fmtN; no raw toFixed/toLocaleString."""
+        src = (STATIC / "doctor.js").read_text()
+        self.assertIn("fmtN", src, "doctor.js formats no number through fmtN")
+        for bad in (".toFixed(", "toLocaleString()"):
+            self.assertNotIn(bad, src, f"doctor.js formats a number with {bad}; use fmtN")
+
+    def test_doctor_status_is_symbol_plus_word(self):
+        """Every doctor status ships a symbol and a word: pill, group heads
+        and tooltip all name the severity in words."""
+        script = (
+            "const fs=require('fs');"
+            "eval(fs.readFileSync(process.argv[1],'utf8'));"
+            "const DD=globalThis.DashDoctor;"
+            "const assert=require('assert');"
+            "const mk=function(sev){return {generated_at:1000,problems:[{severity:sev}],resolved_24h:[]};};"
+            "assert.ok(/\\u2715.+critical/.test(DD.pillFor(mk('critical'),false).text));"
+            "assert.ok(/\\u26A0.+problems/.test(DD.pillFor(mk('warn'),false).text));"
+            "assert.ok(/\\u2713.+healthy/.test(DD.pillFor({generated_at:1000,problems:[],resolved_24h:[]},false).text));"
+            "var tip=DD.pillTitle(mk('warn'),false,1060);"
+            "assert.ok(tip.indexOf('Warn')>=0&&tip.indexOf('checked')>=0,'tooltip names no severity or check age: '+tip);"
+            "assert.ok(DD.pillTitle(null,true,0).indexOf('failed')>=0);"
+            "assert.strictEqual(DD.wsLabel('WS1',{WS1:'Identity'}),'WS1 Identity');"
+            "assert.strictEqual(DD.wsLabel(null,{}),'global');"
+            "var m=DD.taskProblemMap([{id:'stuck-task:ws:WS1:3'}],'WS1');"
+            "assert.ok(m['3'],'task scope id does not badge its chip');"
+            "assert.ok(!DD.taskProblemMap([{id:'stuck-task:ws:WS1:3'}],'WS2')['3'],'badge leaks to another workstream');"
+        )
+        proc = subprocess.run(
+            ["node", "-e", script, str(STATIC / "doctor.js")],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr or proc.stdout)
+
+    def test_doctor_wiring(self):
+        """The pill sits by the live indicator, FIXMAP maps /api/doctor, the
+        card mounts above Where we are and the plan map, chips badge, and the
+        fetch rides load/tab-switch/tick with no loop of its own."""
+        script = inline_scripts()
+        bodies = dict(functions(script))
+        page = (STATIC / "index.html").read_text()
+        self.assertIn('id="doctor-pill"', page, "no header pill element")
+        self.assertIn('"/api/doctor": "doctor"', script, "FIXMAP maps no /api/doctor")
+        self.assertIn("refreshDoctor", bodies["refreshAll"], "load and tab switches never fetch the doctor")
+        self.assertIn("refreshDoctor", bodies["stream"], "the tick never refetches on a new doctor generation")
+        self.assertIn("doctor_generated_at", bodies["stream"], "the tick ignores the doctor generation")
+        self.assertIn("exec-health", script, "no Health card mount")
+        self.assertIn("docwarn", bodies["planCard"], "no problem badge on the progress map chips")
+        self.assertIn("taskProblemMap", bodies["planCard"], "badges do not match the <code>:ws:<ID>:<task> id")
+        self.assertIsNone(
+            re.search(r"setInterval\([^)]*refreshDoctor", script),
+            "the doctor runs its own polling loop",
+        )
+        self.assertEqual(
+            script.count("refreshDoctor("),
+            3,
+            "the doctor fetches from anywhere but load/tab-switch (refreshAll) and the tick (stream)",
+        )
+
     def test_unknown_duration_is_a_dash(self):
         script = (
             "const fs=require('fs');"

@@ -54,6 +54,8 @@ FILES = (
     "replay-WS2.json",
     "replay-WS7.json",
     "health.json",
+    "doctor.json",
+    "doctor-WS1.json",
 )
 
 
@@ -427,6 +429,67 @@ class FixtureShapeTests(unittest.TestCase):
             names.append(source["name"])
         for required in ("claude", "manifests", "muse", "grok_cli", "cursor", "process", "hub"):
             self.assertIn(required, names)
+
+    def test_doctor_fixtures(self):
+        full = self.docs["doctor.json"]
+        scoped = self.docs["doctor-WS1.json"]
+        for name, doc in (("doctor.json", full), ("doctor-WS1.json", scoped)):
+            self.assertTrue(num(doc["generated_at"]), name)
+            self.assertTrue(num(doc["next_run_at"]), name)
+            self.assertEqual(doc["interval_s"], 300, name)
+            self.assertEqual(set(doc["summary"]), {"critical", "warn", "info", "regressed"}, name)
+            by_sev = {"critical": 0, "warn": 0, "info": 0}
+            regressed = 0
+            for problem in doc["problems"]:
+                self.assertEqual(
+                    set(problem),
+                    {"id", "code", "severity", "scope", "ws", "title", "detail",
+                     "fix", "first_seen", "last_seen", "count", "regressed"},
+                    name,
+                )
+                self.assertIn(problem["severity"], by_sev, name)
+                by_sev[problem["severity"]] += 1
+                regressed += bool(problem["regressed"])
+                scope = problem["scope"]
+                expect = problem["code"] + ":" + scope
+                rest = problem["id"][len(expect):]
+                self.assertTrue(
+                    problem["id"] == expect or (rest.startswith(":") and len(rest) > 1),
+                    f"{name}: id {problem['id']!r} is not <code>:<scope>[:<key>]",
+                )
+                self.assertTrue(
+                    scope == "global" or scope.startswith("ws:") or scope.startswith("run:"),
+                    f"{name}: scope {scope!r}",
+                )
+                if scope == "global":
+                    self.assertIsNone(problem["ws"], name)
+                self.assertIsInstance(problem["title"], str, name)
+                self.assertTrue(problem["title"].strip(), name)
+                self.assertIsInstance(problem["detail"], str, name)
+                self.assertEqual(set(problem["fix"]), {"command", "safe_auto", "doc"}, name)
+                self.assertIsInstance(problem["fix"]["command"], str, name)
+                self.assertTrue(problem["fix"]["doc"].startswith("docs/problems/"), name)
+                self.assertTrue(num(problem["first_seen"]), name)
+                self.assertTrue(num(problem["last_seen"]), name)
+                self.assertIsInstance(problem["count"], int, name)
+                self.assertIsInstance(problem["regressed"], bool, name)
+            for sev, want in by_sev.items():
+                self.assertEqual(doc["summary"][sev], want, f"{name}: summary.{sev}")
+            self.assertEqual(doc["summary"]["regressed"], regressed, name)
+            for row in doc["resolved_24h"]:
+                self.assertEqual(set(row), {"id", "code", "title", "resolved_at"}, name)
+                self.assertTrue(num(row["resolved_at"]), name)
+        for problem in scoped["problems"]:
+            self.assertTrue(
+                problem["scope"] == "global" or problem["ws"] == "WS1",
+                f"doctor-WS1.json leaks {problem['id']!r}",
+            )
+        codes = [problem["code"] for problem in full["problems"]]
+        self.assertIn("stuck-task", codes)
+        stuck = next(p for p in full["problems"] if p["code"] == "stuck-task")
+        self.assertTrue(stuck["regressed"])
+        self.assertEqual(stuck["id"], "stuck-task:ws:WS1:3")
+        self.assertTrue(full["resolved_24h"], "the preview needs a recent resolution for the collapsed line")
 
     def assert_plan(self, plan):
         self.assertIsInstance(plan["cols"], list)
