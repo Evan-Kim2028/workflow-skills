@@ -190,6 +190,8 @@ python3 tools/agent-dash/agent_dash.py ws validate WS4
 }
 ```
 
+Leading a workstream (or several)? Follow the [orchestration loop](../../../skills/workstream-orchestration/SKILL.md#the-loop): `ws next` lists startable tasks ranked by what they unblock, `ws waves` checks the plan's max parallelism, `ws overlap` flags file collisions before launch, `ws gates` shows gate freshness, and `ws deferred` tracks the receiving end of moved tasks. The rules behind them are [orchestration principles](orchestration.md).
+
 Move a task as the fact changes:
 
 ```bash
@@ -253,4 +255,4 @@ Plan `% done` comes from the server (`progress` on `/api/plan` and `/api/bundle`
 
 ## 8. Working on the dashboard itself
 
-Picking up dashboard work (not just feeding it runs)? Read [roadmap.md](roadmap.md) first: what landed with proof, and the open worker-sized tasks in value order. The visual future is the [proposed v2 design spec](design-v2.md) (owner approval pending) with its [tokens](design-v2-tokens.css). Ownership of every file is the table in [CONTRACT.md](../CONTRACT.md).
+Picking up dashboard work (not just feeding it runs)? Read [roadmap.md](roadmap.md) first: what landed with proof, and the open worker-sized tasks in value order. The visual future is the [proposed v2 design spec](design-v2.md) (owner approval pending) with its [tokens](design-v2-tokens.css). Ownership of every file is the table in [CONTRACT.md](../CONTRACT.md). Coordinating the work itself is the [workstream-orchestration skill](../../../skills/workstream-orchestration/SKILL.md) and its [principles](orchestration.md).

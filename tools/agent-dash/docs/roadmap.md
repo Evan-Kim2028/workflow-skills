@@ -39,7 +39,11 @@ Agent-friendly CLI items are done on main:
 - Exit-code norm 0/1/2/3/4/5 plus messages that name the mistake, the valid values, and the next command (`dash/errors.py:1-113`; table in `integrate.md` "For agents").
 
 In flight elsewhere — do not duplicate: run-identity aliases for
-resurrected manifest rows, and the replay-clip branch.
+resurrected manifest rows, and the replay-clip branch. Orchestration tooling
+lands on its own branch: `ws next` (rank ready tasks), `ws waves` (max-parallel
+waves), `ws overlap` (file collisions), `ws gates` (gate freshness), `ws deferred`
+(moved-task ledger), and `agent_dash.py lead-profile`; the rules they enforce are
+[orchestration principles](orchestration.md).
 
 ## Phase 1 — module split (lands before the visual pass)
 

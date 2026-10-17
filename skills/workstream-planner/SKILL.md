@@ -41,6 +41,20 @@ Tool: `tools/agent-dash/` in this repo (`~/.claude/tools/agent-dash/` after `./i
    - `KICKOFF.md` is self-contained: paths, waves, the wave call, run labels `ws4-<task>-<slug>`, `ws task` status moves, merge and test rules, coordination contacts, done criteria, and the naming rule.
    - `START-PROMPT.md` is the short paste-ready prompt that points a fresh session at the brief and the approvals.
 
+## Decompose for parallelism
+
+Size work so waves fan out. Detail and evidence: [orchestration principles](../../tools/agent-dash/docs/orchestration.md).
+
+- **Footprint-sized tasks.** S: ≤5 files, no migration, no shared test file, ships alone. M: 6–15 files or one migration, train candidate. L: more, or a generated file, split or single-writer. Write each task's file list down.
+- **A file-overlap table per wave.** One row per task naming its files; lanes in one wave share no source or test file; generated files have exactly one writer per wave.
+- **Interface-first tasks.** Every fan-out starts with a frozen interface (spec, shapes, manifest, route list) that dependents name in `deps`. A deploy gate is not an interface: everything behind it serializes.
+- **Deps that are real.** A dep is a task id that must be on main before the lane starts. Test one by asking: if the dep's branch vanished, would this lane rebuild on wrong ground? If no, cut the edge. Group edges never substitute — except a scope declared `mostly_landed` (already on main, small disjoint adds), which may skip task deps.
+- **Gates for outside signals.** Anything owned elsewhere is a `"kind": "gate"` task with the condition in the dependent's `dep_notes`; every gate carries a freshness bound, and an expired gate blocks starts.
+- **Trains grouped by shared files.** Batch tasks expected to touch the same files or carry migrations, at most 8 members; re-cut from member diffs as they land. Exception: one table, one migration number, or one drop ships alone as a single-member train.
+- **Definition of ready and done.** Ready: deps done or merged, wave start condition holds, no other lane owns its files, production step approved. Done: merged to main and live where the task says live (`wip` → `pr` → `prog` → `done`; `prog` only after merge with a production step left).
+- **Acceptance numeric, with tolerance.** Every task names metric, threshold plus tolerance, and probe command; the reviewer reports evidence and the lead closes on the number, not in chat.
+- **Check max parallelism before kickoff.** Run `ws waves`: if the plan's widest wave is 1 where lanes could be disjoint, re-split before anyone starts.
+
 ## Rules
 
 - **Plan at task level.** Strategy, re-plans, and wave changes always update task `deps`, not only group edges and prose.

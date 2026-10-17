@@ -18,14 +18,25 @@ The lead plans, decides, verifies, and reports. Workers do everything else. Rela
 
 ## Each wave
 
+Execution follows the [orchestration loop](../workstream-orchestration/SKILL.md#the-loop): `ws next`, launch every ready lane up to caps, one watcher per run, and on each finish read only that report, move status, and launch what it unblocked before anything else. The four rules below were the most violated in measured runs; treat them as hard stops, not advice.
+
 1. Build the lane list from the execution plan. Lanes in one wave share no file or test file. Use explicit review checks for lanes that need them, and flag irreversible or production-adjacent lanes.
 2. Run one lane per sub-agent, in parallel. Each lane goes build, then review, then fix and re-review until approved or out of fix rounds.
 3. Read the result:
    - `approved`: assemble trains and merge with the repo's merge tool.
    - `needsLead`: read the last review and decide. Fix, re-scope, or defer with `ws task <ID> <task> deferred --note ...`.
-4. Move status with `python3 tools/agent-dash/agent_dash.py ws task <ID> <task> <todo|wip|pr|prog|done|deferred>`, as soon as each fact changes. The dashboard and the Plan page read it live.
+4. Move status with `python3 tools/agent-dash/agent_dash.py ws task <ID> <task> <todo|wip|pr|prog|done|deferred>`, in the same step as the event. The dashboard and the Plan page read it live.
 5. Start the next wave as soon as its start condition holds. Don't wait on lower wave numbers. A task is ready when every id in its `deps` is done or merged.
 6. When you re-plan (split, merge, move or add a task, or change a wave), update the task `deps` and `wave` in `plan.json` in the same step, then run `ws validate`. Model an outside signal as a `"kind": "gate"` task, with the condition in the dependent's `dep_notes`.
+
+### Four hard rules
+
+- **Delegate every multi-step job.** The lead plans, decides, verifies, and reports; workers do everything else. Any read of more than one or two files, any run longer than a few minutes, any wait goes to a worker.
+- **Never foreground-wait.** Waits go to one background watcher per run or a cheap worker returning one verdict. Never sleep in the lead thread.
+- **Never kill to rescope.** A killed run leaves no report and its cost is lost. Let it finish, or launch a separate run; after 2 failed attempts at the same task, replan.
+- **Move status as events happen.** `wip` on launch, `pr` on open, `done` on merged-and-live — in the same step, not at end of day.
+
+At each milestone run `agent_dash.py lead-profile` on the lead session: a LOW-DELEGATION or over-limit flag gets a re-brief or a fresh successor, not a continuation.
 
 ### If you are on Claude Code
 

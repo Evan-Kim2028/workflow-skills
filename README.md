@@ -34,6 +34,7 @@ Look for `"ok": true`. Stop with `python3 tools/agent-dash/agent_dash.py stop`. 
 | workstream-dashboard | [skills/workstream-dashboard/SKILL.md](skills/workstream-dashboard/SKILL.md) | Runs and changes the local dashboard. |
 | workstream-planner | [skills/workstream-planner/SKILL.md](skills/workstream-planner/SKILL.md) | Turns a goal into a plan bundle, an execution plan, approvals, and a kickoff brief. |
 | workstream-lead | [skills/workstream-lead/SKILL.md](skills/workstream-lead/SKILL.md) | Runs that bundle wave by wave and moves task status as facts change. |
+| workstream-orchestration | [skills/workstream-orchestration/SKILL.md](skills/workstream-orchestration/SKILL.md) | Keeps parallel work moving: the steady-state loop and the twelve principles from measured runs. |
 | agent-dash | [tools/agent-dash](tools/agent-dash/README.md) | The page, the collectors, and the `ws` and `report` commands. State lives in `~/.local/share/agent-dash/`. |
 | ws-wave | [tools/agent-dash/workflows/ws-wave.js](tools/agent-dash/workflows/ws-wave.js) | One wave. Each lane is built, reviewed, and fixed until approved or out of rounds. |
 | Worker launchers | [run_worker.sh](tools/agent-dash/scripts/run_worker.sh) | Starts one registry worker and writes the row the dashboard reads. |

@@ -57,7 +57,7 @@ Labels pin runs to workstreams and task chips. Verdicts are `PASS`, `PARTIAL`, `
 
 ## Run a wave
 
-Lanes in one wave share no file or test file. Each lane goes build, then review, then fix and re-review until approved or out of fix rounds. Approved lanes move to `pr` via `ws task`. The lead keeps trains, merges, production steps, and starts one wave at a time.
+Lanes in one wave share no file or test file. Each lane goes build, then review, then fix and re-review until approved or out of fix rounds. Approved lanes move to `pr` via `ws task`. The lead keeps trains, merges, production steps, and starts one wave at a time. The steady-state loop and the rules behind it are the [workstream-orchestration skill](../workstream-orchestration/SKILL.md) with the full [orchestration principles](../../tools/agent-dash/docs/orchestration.md).
 
 ### If you are on Claude Code
 
