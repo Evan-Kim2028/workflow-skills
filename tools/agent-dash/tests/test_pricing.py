@@ -171,10 +171,15 @@ class CatalogTest(unittest.TestCase):
         self.assertEqual(spark["confidence"], "published")
         self.assertEqual(rows["muse-wonder-1.0-contributor"]["confidence"], "inferred")
 
+        for model in ("grok-4.7-high", "grok-4.7-xhigh"):
+            bare = rows[model]
+            self.assertEqual((bare["input"], bare["output"], bare["cache_read"]), (2, 6, Decimal("0.5")))
+            self.assertEqual(bare["billing_mode"], "plan-included")
+            self.assertEqual(bare["confidence"], "inferred")
+            self.assertTrue(status(model)["priced"])
+
         for model in (
             "muse-wonder-full-1.0",
-            "grok-4.7-high",
-            "grok-4.7-xhigh",
             "<synthetic>",
         ):
             self.assertIsNone(rows[model]["input"])
