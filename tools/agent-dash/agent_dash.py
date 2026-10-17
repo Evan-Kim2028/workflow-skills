@@ -338,7 +338,7 @@ def cmd_check(argv: list[str]) -> int:
     import urllib.request
 
     url = URL
-    hours = 12.0
+    hours = 24.0
     page = False
     rest = list(argv)
     while rest:

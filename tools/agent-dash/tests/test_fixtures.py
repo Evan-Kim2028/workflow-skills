@@ -157,7 +157,7 @@ class FixtureShapeTests(unittest.TestCase):
             for run in doc["recent"]:
                 self.assertNotIn("children", run)
                 self.assertIsNotNone(run["ended_at"])
-                self.assertGreaterEqual(run["ended_at"], doc["now"] - 3600)
+                self.assertGreaterEqual(run["ended_at"], doc["now"] - 24 * 3600)
                 self.assertLessEqual(run["ended_at"], doc["now"] + 5)
                 stamps.append(run["ended_at"])
             self.assertEqual(stamps, sorted(stamps, reverse=True))

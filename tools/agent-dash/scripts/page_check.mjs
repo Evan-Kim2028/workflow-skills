@@ -3,14 +3,14 @@
  *
  * Drives the live dashboard in headless Chrome over the DevTools protocol
  * (stdlib only: global fetch and WebSocket, child_process, no npm installs).
- * For the overview and every workstream tab at each range it first asserts
- * the page's internal invariant strictly from one DOM read (tile, legend
- * Total and chart sum agree, and the cost tile is present), since that is
- * what the owner sees. It then compares the DOM to the API with a
- * consistent read: /api/snapshot (with usage_group, so the response also
- * carries the chart buckets) is fetched right before and right after the
- * DOM read, and a DOM value between the two (or equal to either) is live
- * growth, not a mismatch. Each combination is retried up to 3 times.
+ * For the overview and every workstream tab at the one fixed 24 h window it
+ * first asserts the page's internal invariant strictly from one DOM read
+ * (tile, legend Total and chart sum agree, and the cost tile is present),
+ * since that is what the owner sees. It then compares the DOM to the API
+ * with a consistent read: /api/snapshot (with usage_group, so the response
+ * also carries the chart buckets) is fetched right before and right after
+ * the DOM read, and a DOM value between the two (or equal to either) is
+ * live growth, not a mismatch. Each tab is retried up to 3 times.
  *
  * Exit 0 when everything agrees, 1 with a table on any mismatch, 2 when
  * Chrome is missing (the agent_dash.py wrapper reports a skip then).
@@ -21,22 +21,21 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 
-const RANGES = [6, 12, 24, 72];
+const WINDOW_HOURS = 24;
 const SETTLE_POLL_MS = 700;
 const COMBO_TIMEOUT_MS = 30000;
 const MAX_ATTEMPTS = 3;
 const RETRY_MS = 1500;
 
 function args(argv) {
-  const out = { url: "http://127.0.0.1:8765", chrome: null, ws: null, hours: null };
+  const out = { url: "http://127.0.0.1:8765", chrome: null, ws: null };
   for (let i = 0; i < argv.length; i++) {
     const flag = argv[i];
     if (flag === "--url" && argv[i + 1]) out.url = argv[++i].replace(/\/+$/, "");
     else if (flag === "--chrome" && argv[i + 1]) out.chrome = argv[++i];
     else if (flag === "--ws" && argv[i + 1]) out.ws = argv[++i];
-    else if (flag === "--hours" && argv[i + 1]) out.hours = Number(argv[++i]);
     else if (flag === "-h" || flag === "--help") {
-      console.log("usage: page_check.mjs [--url URL] [--chrome PATH] [--ws WS] [--hours N]");
+      console.log("usage: page_check.mjs [--url URL] [--chrome PATH] [--ws WS]");
       process.exit(0);
     } else {
       console.error(`unknown flag ${flag}`);
@@ -168,24 +167,6 @@ async function evaluate(cdp, expression) {
   return result.result ? result.result.value : undefined;
 }
 
-/* The click runs on a fresh document right after navigate, so it must be
-   null-safe and retried: a throw here used to fail every first combo. */
-async function clickRange(cdp, hours) {
-  const expr = `(function(){var b=document.querySelector('#range button[data-h="${hours}"]');if(!b)return null;b.click();return 1;})()`;
-  const deadline = Date.now() + COMBO_TIMEOUT_MS;
-  for (;;) {
-    let clicked = null;
-    try {
-      clicked = await evaluate(cdp, expr);
-    } catch {
-      clicked = null;
-    }
-    if (clicked === 1) return;
-    if (Date.now() > deadline) throw new Error("range button never became clickable");
-    await new Promise((r) => setTimeout(r, 300));
-  }
-}
-
 async function waitForLoad(cdp) {
   const deadline = Date.now() + COMBO_TIMEOUT_MS;
   for (;;) {
@@ -201,11 +182,10 @@ async function waitForLoad(cdp) {
   }
 }
 
-/* Re-trigger the page fetch and wait until the tile shows numbers newer
- * than the stale read, then settle. Falls back to a plain settled read
- * when nothing moves (an idle server has nothing fresher to show). */
-async function readFresh(cdp, expr, ws, hours, staleTile) {
-  await clickRange(cdp, hours);
+/* Wait until the tile shows numbers newer than the stale read, then
+ * settle. Falls back to a plain settled read when nothing moves (an idle
+ * server has nothing fresher to show). */
+async function readFresh(cdp, expr, ws, staleTile) {
   const deadline = Date.now() + 8000;
   for (;;) {
     let cur = null;
@@ -218,13 +198,13 @@ async function readFresh(cdp, expr, ws, hours, staleTile) {
     if (Date.now() > deadline) break;
     await new Promise((r) => setTimeout(r, 500));
   }
-  return await readSettled(cdp, expr, ws, hours);
+  return await readSettled(cdp, expr, ws);
 }
 
 /* Wait until two consecutive DOM reads agree: the page has applied its
  * latest fetch. One evaluate call is atomic, so the returned object is a
  * single render (tile, legend, chart and cost from the same moment). */
-async function readSettled(cdp, expr, ws, hours) {
+async function readSettled(cdp, expr, ws) {
   const deadline = Date.now() + COMBO_TIMEOUT_MS;
   let stable = 0;
   let prev = "";
@@ -246,21 +226,22 @@ async function readSettled(cdp, expr, ws, hours) {
       }
     }
     if (Date.now() > deadline) {
-      throw new Error(`page never settled for ${ws} ${hours}h`);
+      throw new Error(`page never settled for ${ws} ${WINDOW_HOURS}h`);
     }
     await new Promise((r) => setTimeout(r, SETTLE_POLL_MS));
   }
 }
 
-function readDomExpression(ws, hours) {
+function readDomExpression(ws) {
+  const hours = WINDOW_HOURS;
   return `(function(){
     var s = window.__adSettled || "";
     var parts = String(s).split("|");
-    if (parts[0] !== ${JSON.stringify(ws)} || parts[1] !== ${JSON.stringify(String(hours))}) return null;
+    if (parts[0] !== ${JSON.stringify(ws)} || parts[1] !== ${JSON.stringify(String(WINDOW_HOURS))}) return null;
     var tile = document.querySelector('#exec-tiles [data-tile="tokens"]');
     if (!tile) return null;
     if (tile.getAttribute("data-ws") !== ${JSON.stringify(ws)}) return {bleed: tile.getAttribute("data-ws")};
-    if (tile.getAttribute("data-hours") !== ${JSON.stringify(String(hours))}) return null;
+    if (tile.getAttribute("data-hours") !== ${JSON.stringify(String(WINDOW_HOURS))}) return null;
     var cost = document.querySelector('#exec-tiles [data-tile="cost"]');
     var lg = document.querySelector('#exec-tokens .ltotal');
     var emptyChart = !lg && !!document.querySelector('#exec-tokens .empty');
@@ -445,12 +426,12 @@ async function main() {
     }
     if (opts.ws) tabs = tabs.filter((t) => t === opts.ws);
     if (!tabs.length) throw new Error("no tabs matched");
-    const ranges = opts.hours ? [opts.hours] : RANGES;
+    const hours = WINDOW_HOURS;
 
     for (const ws of tabs) {
       await cdp.send("Page.navigate", { url: `${opts.url}/?view=exec&ws=${encodeURIComponent(ws)}` });
       await waitForLoad(cdp);
-      for (const hours of ranges) {
+      {
         const row = { ws, hours, tile: null, snap: null, legend: null, chart: null, cost: null, allTime: null, live: "-", status: "OK", detail: "" };
         rows.push(row);
         const fail = (detail) => {
@@ -459,9 +440,8 @@ async function main() {
           failures++;
         };
         try {
-          await clickRange(cdp, hours);
-          const expr = readDomExpression(ws, hours);
-          const seen = await readSettled(cdp, expr, ws, hours);
+          const expr = readDomExpression(ws);
+          const seen = await readSettled(cdp, expr, ws);
           if (seen.bleed !== undefined && seen.tile === undefined) {
             fail(`cross-tab bleed: asked ${ws}, tile shows ${seen.bleed}`);
             continue;
@@ -478,7 +458,7 @@ async function main() {
           for (let attempt = 1; attempt <= MAX_ATTEMPTS && !passed; attempt++) {
             if (attempt > 1) {
               await new Promise((r) => setTimeout(r, RETRY_MS));
-              await readFresh(cdp, expr, ws, hours, staleTile);
+              await readFresh(cdp, expr, ws, staleTile);
             }
             const snapBefore = await apiJson(snapUrl(Math.floor(Date.now() / 1000 - hours * 3600)));
             const dom = await evaluate(cdp, expr);
@@ -518,7 +498,7 @@ async function main() {
             growthReads++;
           }
           if (tileTok === 0) {
-            // Zero with context: "0 in 6 h" plus the last run and all-time line.
+            // Zero with context: "0 in 24 h" plus the last run and all-time line.
             const text = (dom.tile.text || "").replace(/\s+/g, " ");
             const allTimeTok = billed(snapAfter.totals_all_time.tokens);
             if (!text.includes(`0 in ${hours} h`)) {
@@ -570,7 +550,7 @@ async function main() {
         }
       }
     }
-    if (!rows.length) throw new Error("no tab/range combinations ran");
+    if (!rows.length) throw new Error("no tab combinations ran");
   } catch (error) {
     console.error(`page_check failed: ${(error && error.message) || error}`);
     finish(1);
@@ -578,9 +558,9 @@ async function main() {
   }
 
   const width = Math.max(10, ...rows.map((r) => String(r.ws).length));
-  console.log(`page check ${opts.url} (${rows.length} tab/range combinations)`);
+  console.log(`page check ${opts.url} (${rows.length} tab combinations, 24 h window)`);
   console.log(
-    `${"workstream".padEnd(width)} ${"range".padStart(5)} ${"tile".padStart(12)} ${"snap".padStart(12)} ${"legend".padStart(12)} ${"chart".padStart(12)} ${"cost".padStart(10)} ${"live".padStart(11)} ${"status".padStart(8)}`,
+    `${"workstream".padEnd(width)} ${"window".padStart(6)} ${"tile".padStart(12)} ${"snap".padStart(12)} ${"legend".padStart(12)} ${"chart".padStart(12)} ${"cost".padStart(10)} ${"live".padStart(11)} ${"status".padStart(8)}`,
   );
   for (const row of rows) {
     console.log(

@@ -95,7 +95,7 @@ the all-scope numbers exactly (cost within 1e-6).
 `Run` = `{run_id, source, tier, model, label, workstream, ws_confidence, session_id, parent_session_id, status, verdict,
 started_at, ended_at, elapsed_s, clock_source, out_bytes, out_growing, err_bytes, pid, rss_kb, tokens: {input, output, cache_read, cache_write}, cost_usd, context_tokens}`.
 `context_tokens` is the latest `grok-context` input for that run, or null. It is a context-window estimate. It is not part of `tokens`, totals, buckets, or cost. `elapsed_s` is null when `started_at` is null.
-`recent` = runs ended in the last 60 minutes, newest first, max 50.
+`recent` = runs ended inside the window (one fixed 24 h by default, `since`/`until` narrow it), newest first, max 50. The page shows it as `Finished (24 h)`.
 
 `GET /api/stream` -> SSE. Event `tick` every 2 s: `{"seq": n, "running": [Run]}`; the page refetches snapshot when `seq` changes.
 
@@ -121,11 +121,12 @@ Computed in one store pass under the lock. Rows carry `tokens_all_time` and
 invariant, windowed and all-time (rows plus unassigned equal the all-scope
 numbers, and each row equals its workstream tab), and is empty when consistent.
 `python3 agent_dash.py check [--url URL] [--hours N]` prints the rows as a
-table and exits 1 on any mismatch. `python3 agent_dash.py check --page [--url URL]`
+table and exits 1 on any mismatch (`--hours` defaults to 24, kept as an
+optional override for API compatibility). `python3 agent_dash.py check --page [--url URL]`
 drives the live page in headless Chrome over the DevTools protocol
 (`scripts/page_check.mjs`, stdlib only) and compares every rendered tile and
-chart legend against the API for the overview and every workstream tab at each
-range; it skips with a clear message when Chrome is missing.
+chart legend against the API for the overview and every workstream tab at the
+one fixed 24 h window; it skips with a clear message when Chrome is missing.
 
 `GET /api/plan?ws=WS7` -> that workstream's plan with a `progress` object:
 `{"ws": "WS7", "cols": [..], "groups": [{id, col, title, tasks: [{id, title, status, deps, kind, dep_notes}]}], "edges": [[a, b]], "phases": [{name, goal, gate}], "progress": {"done": 0, "total": 0, "counts": {todo, wip, pr, prog, done, deferred}, "pct": 0}}`.
@@ -181,27 +182,32 @@ Plan and Execution are one shell, `static/index.html`. `GET /` and `GET /plan` b
 An agent is a running row whose source maps to a tool (grok, muse, glm, or
 claude). Interactive lead sessions (`claude-main`), shell rows, and Dagster
 jobs are not agents. Finished means status `done`, `killed`, or `died_early`
-with an end time inside the window. The default window is the last 24 hours;
-`since`/`until` (or the page range control) narrow it.
+with an end time inside the window. The window is one fixed rolling 24 hours
+(`since = now - 24 h` at each refresh); `since`/`until` stay for API
+compatibility and narrow it when given. The page tiles read
+`finished_in_range` (`Agents finished (24 h)`); `finished_today` (local
+midnight) stays in the API for compatibility and is not shown.
 
 Token and cost sums come from the hourly usage buckets, counting a bucket when
 its hour overlaps the window (`hour_ts + 3600 > since` and `hour_ts < until`).
 One function sums those cells for the window and, with no window, for all time.
 The tokens tile and the chart legend Total read the server snapshot totals for
-their scope and range; the tiles never re-sum buckets on the client. The chart
-draws the same response's `usage` buckets, so tile, legend and chart agree by
-construction; when the bucket sum ever differs from the tile the page still
-shows a muted cross line naming both numbers instead of hiding it.
+their scope and the fixed 24 h window; the tiles never re-sum buckets on the
+client. The chart draws the same response's `usage` buckets, so tile, legend
+and chart agree by construction; when the bucket sum ever differs from the tile
+the page still shows a muted cross line naming both numbers instead of hiding
+it.
 `/api/usage` stays for compatibility but the page no longer reads it.
 The overview workstream cards read the same snapshot rows the tabs read, so
-each card shows exactly what its workstream tab shows for the same range. Runs
-with no workstream land in the `unassigned` row, which the Overview tab shows,
-so the overview total visibly equals the sum of the parts. Every async page
-response applies only when it still matches the current tab and range, and the
-background tab cache is keyed by tab and range and expires after one refresh
-interval, so no tab ever shows another tab's or another range's numbers. A
-scope with no tokens in range reads "0 in N h" with its last run and all-time
-total underneath.
+each card shows exactly what its workstream tab shows for the same 24 h
+window. Runs with no workstream land in the `unassigned` row, which the
+Overview tab shows, so the overview total visibly equals the sum of the parts.
+Every async page response applies only when it still matches the current tab
+and grouping (one fixed window), and the background tab cache is keyed by tab
+and group and expires after one refresh interval, so no tab ever shows another
+tab's numbers. A scope with no tokens in the window reads "0 in 24 h" with its
+last run and all-time total underneath. `Running now` is live and unwindowed;
+all-time sublines are not windowed.
 
 ## Liveness
 

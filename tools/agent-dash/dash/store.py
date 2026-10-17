@@ -25,7 +25,7 @@ RANGE_S = 24 * 3600
 _ESTIMATE_TOOL = "grok-context"
 UNASSIGNED = "unassigned"
 SAMPLE_FRESH_S = 20
-RECENT_S = 3600
+RECENT_S = 24 * 3600
 SAMPLE_KEEP_S = 48 * 3600
 TOKEN_FIELDS = ("input", "output", "cache_read", "cache_write", "reasoning")
 BILLED_FIELDS = ("input", "output", "cache_read", "cache_write")
@@ -840,12 +840,14 @@ class Store:
                 if run["status"] == "running" and run["run_id"] in live_open
             ]
             running.sort(key=lambda run: run["started_at"] or 0, reverse=True)
+            range_since = now - RANGE_S if since is None else float(since)
+            range_until = float(now if until is None else until)
             recent = [
                 run
                 for run in scoped
                 if run["status"] != "running"
                 and run["ended_at"] is not None
-                and run["ended_at"] >= now - RECENT_S
+                and range_since <= float(run["ended_at"]) <= range_until
             ]
             recent.sort(key=lambda run: run["ended_at"] or 0, reverse=True)
             recent = recent[:50]

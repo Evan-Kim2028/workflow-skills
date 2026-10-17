@@ -82,7 +82,8 @@ class PageRules(unittest.TestCase):
 
     def test_tiles_read_server_totals(self):
         """Token and cost tiles read the server snapshot totals for the tab's
-        scope and range. They never re-sum usage buckets on the client."""
+        scope and the fixed 24 h window. They never re-sum usage buckets on
+        the client."""
         script = inline_scripts()
         bodies = dict(functions(script))
         self.assertIn("tiles", bodies)
@@ -122,15 +123,15 @@ class PageRules(unittest.TestCase):
 
     def test_refresh_snapshot_applies_totals_with_usage(self):
         """No path replaces snap.totals without snap.usage: refreshSnapshot
-        assigns state.snap and state.usage together under the tab+range+group
-        guard, and so does every other writer."""
+        assigns state.snap and state.usage together under the tab+group
+        guard (one fixed 24 h window), and so does every other writer."""
         script = inline_scripts()
         bodies = dict(functions(script))
         self.assertIn("refreshSnapshot", bodies)
         body = bodies["refreshSnapshot"]
         self.assertIn("state.snap =", body)
         self.assertIn("state.usage =", body)
-        self.assertIn("ADC.applies", body, "refreshSnapshot lost the tab+range+group guard")
+        self.assertIn("ADC.applies", body, "refreshSnapshot lost the tab+group guard")
         for name in ("refreshAll", "refreshSnapshot"):
             self.assertEqual(
                 bodies[name].count("state.snap ="),
@@ -160,17 +161,20 @@ class PageRules(unittest.TestCase):
             "eval(fs.readFileSync(process.argv[1],'utf8'));"
             "const A=globalThis.ADC;"
             "const assert=require('assert');"
-            "assert.strictEqual(A.key('WS2',6,'model'),'WS2|6|model');"
-            "assert.strictEqual(A.key('all',12,'workstream'),'all|12|workstream');"
-            "assert.notStrictEqual(A.key('WS2',6,'model'),A.key('WS2',12,'model'));"
-            "assert.notStrictEqual(A.key('WS2',6,'model'),A.key('WS1',6,'model'));"
-            "assert.notStrictEqual(A.key('all',12,'model'),A.key('all',12,'workstream'));"
+            "assert.strictEqual(A.WINDOW_HOURS,24);"
+            "assert.strictEqual(A.key('WS2','model'),'WS2|model');"
+            "assert.strictEqual(A.key('all','workstream'),'all|workstream');"
+            "assert.strictEqual(A.key('WS2','model'),A.key('WS2','model'));"
+            "assert.notStrictEqual(A.key('WS2','model'),A.key('WS1','model'));"
+            "assert.notStrictEqual(A.key('all','model'),A.key('all','workstream'));"
             "assert.strictEqual(A.fresh({at:1000},31000),true);"
             "assert.strictEqual(A.fresh({at:1000},31001),false);"
             "assert.strictEqual(A.fresh(null,1000),false);"
-            "assert.strictEqual(A.applies('WS2|6|model',{ws:'WS2',hours:6,groupBy:'model'}),true);"
-            "assert.strictEqual(A.applies('WS2|12|model',{ws:'WS2',hours:6,groupBy:'model'}),false);"
-            "assert.strictEqual(A.applies('all|6|model',{ws:'all',hours:6,groupBy:'workstream'}),false);"
+            "assert.strictEqual(A.applies('WS2|model',{ws:'WS2',groupBy:'model'}),true);"
+            "assert.strictEqual(A.applies('WS2|model',{ws:'WS2',groupBy:'workstream'}),true);"
+            "assert.strictEqual(A.applies('WS1|model',{ws:'WS2',groupBy:'model'}),false);"
+            "assert.strictEqual(A.applies('all|model',{ws:'all',groupBy:'workstream'}),false);"
+            "assert.strictEqual(A.applies('all|workstream',{ws:'all',groupBy:'workstream'}),true);"
             "assert.strictEqual(A.billed({input:1,output:2,cache_read:3,cache_write:4,reasoning:50}),10);"
             "assert.strictEqual(A.ago(1000,990),'just now');"
             "assert.strictEqual(A.ago(10000,9000),'17 m ago');"
@@ -184,6 +188,30 @@ class PageRules(unittest.TestCase):
             text=True,
         )
         self.assertEqual(proc.returncode, 0, proc.stderr or proc.stdout)
+
+    def test_fixed_24h_window(self):
+        """No range control remains and every windowed read uses one fixed
+        rolling 24 h window (since = now - 24 h at each refresh)."""
+        page = (STATIC / "index.html").read_text()
+        script = inline_scripts()
+        self.assertNotIn('id="range"', page, "the #range control remains")
+        self.assertNotIn("data-h=", script, "a range button remains")
+        self.assertNotIn("state.hours", script, "state.hours remains")
+        self.assertNotIn('getElementById("range")', script, "the range handler remains")
+        self.assertIn("WINDOW_HOURS = 24", script, "no single 24 h constant")
+        self.assertIn("function since()", script)
+        since_body = dict(functions(script))["since"]
+        self.assertIn("WINDOW_HOURS", since_body, "since() does not go through the 24 h window")
+        self.assertNotIn("state.hours", since_body)
+        for label in ("Agents finished (24 h)", "Tokens (24 h)", "Est. cost (24 h)", "Finished (24 h)", "0 in 24 h"):
+            self.assertIn(label, script, f"tile or table does not say {label!r}")
+        self.assertNotIn("finished today", script.lower(), "the calendar-day label remains")
+        self.assertNotIn("Finished in the last hour", script, "the 1 h finished table remains")
+        self.assertIn("finished_in_range", script, "tiles do not read the windowed finished count")
+        checker = (STATIC.parent / "scripts" / "page_check.mjs").read_text()
+        self.assertNotIn("clickRange", checker, "page_check still clicks a range")
+        self.assertNotIn("RANGES", checker, "page_check still loops ranges")
+        self.assertIn("WINDOW_HOURS = 24", checker, "page_check has no fixed 24 h window")
 
     def test_tab_filter_uses_the_shared_completed_rule(self):
         """The tab filter and the "Where we are" status share one completed

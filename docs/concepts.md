@@ -46,7 +46,7 @@ A task status is one of five words.
 
 Deferred tasks stay on the map and drop out of the done-of-total count. `ws task` is the writer. The write is a temp file plus replace. `--moved-to` and `--note` are accepted only when the status is `deferred`.
 
-The map is one board of columns. Each group is a card of chips. A chip with a running agent uses a solid pulse and a badge with the tool color and the count. A chip whose run finished in the last 15 minutes gets a green outline, unless an agent is still running on it. A `↻` count appears when more than one run in the current range mapped to that task. The edge of that count turns amber when two or more of those runs were sent back. Sending back means a verdict of `REQUEST_CHANGES`, `APPROVE_WITH_CHANGES`, `PARTIAL`, or `BLOCKED`.
+The map is one board of columns. Each group is a card of chips. A chip with a running agent uses a solid pulse and a badge with the tool color and the count. A chip whose run finished in the last 15 minutes gets a green outline, unless an agent is still running on it. A `↻` count appears when more than one run in the last 24 h mapped to that task. The edge of that count turns amber when two or more of those runs were sent back. Sending back means a verdict of `REQUEST_CHANGES`, `APPROVE_WITH_CHANGES`, `PARTIAL`, or `BLOCKED`.
 
 Runs that are running on this workstream and match no task are listed above the map. WS1, WS2, and WS7 have extra matchers built into the page. Every workstream also matches a label that holds its task id (for example `ws4-WS4.1-slug` pins to `WS4.1`). `taskmap.local.json` is the exact override when the label does not hold the id.
 
@@ -133,12 +133,12 @@ The live tile counts running agents.
 
 The tool buckets are `grok`, `muse`, `glm`, and `claude`. A running run counts once per tool and label. A child Grok chat rolls its tokens onto the parent and does not add a second agent. An unlabeled muse row for a session that already has a labeled run does the same. Counting both would show two workers for one launch. The agent count skips source `claude-main` and source `shell`.
 
-Finished today counts runs whose status is `done`, `killed`, or `died_early` and whose end time is after local midnight. The pass, partial, and blocked line on that tile uses the snapshot's verdict tally.
+Agents finished (24 h) counts runs whose status is `done`, `killed`, or `died_early` and whose end time is inside the fixed rolling 24-hour window. The pass, partial, and blocked line on that tile uses the snapshot's verdict tally. `finished_today` (local midnight) stays in the API for compatibility and is not shown.
 
 One rollup computes the all-scope numbers, every workstream row, and the unassigned row from the same run list, agent rule, and window: live agents, finished in range, tokens, cost, and last activity. Each workstream row equals that tab's numbers, and the rows plus unassigned equal the overview total. `GET /api/reconcile` proves it in one call, and `python3 agent_dash.py check` prints its table. Plan % done is computed once on the server (`progress` on `/api/plan` and `/api/bundle`); the page reads it and never recomputes it. Hub issue counts (`tk`) are issue counts, never progress.
 
 Collectors poll on their own intervals. The claude, muse, cursor, grok_cli, and manifests sources poll every 2 seconds. cursor is the Grok chat source. grok_cli is the GLM source. Process samples poll every 5 seconds. The optional hub poll is every 60 seconds. The page opens a stream that ticks every 2 seconds and refetches the snapshot when the sequence number changes. Runs, usage, the plan, and approvals refresh every 30 seconds.
 
-The range control on Execution is 6 hours, 12 hours, 24 hours, or 3 days. It filters the charts and the run list. It is hidden on the Plan view.
+Every windowed number and chart on Execution uses one fixed rolling 24-hour window; there is no range control. `Running now` is live and unwindowed; all-time sublines are not windowed.
 
 Click a row, a timeline bar, or a live chip for the details drawer. The drawer shows the label, model, workstream, confidence, timings, token classes, and estimated cost. Escape closes it.

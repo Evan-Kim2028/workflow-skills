@@ -184,7 +184,7 @@ class Handler(BaseHTTPRequestHandler):
         now = time.time()
         since = _float(query, "since")
         if since is None:
-            since = now - 6 * 3600
+            since = now - 24 * 3600
         step = _float(query, "step") or 60.0
         ws = _ws(query, default=None)
         self._json(200, {"points": self.server.store.query_concurrency(now, ws, since, step)})

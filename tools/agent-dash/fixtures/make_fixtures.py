@@ -379,7 +379,7 @@ def _snapshot(runs, now, ws):
             view = dict(run)
             view.pop("children", None)
             running.append(view)
-        elif run["ended_at"] is not None and now - 3600 <= run["ended_at"] <= now + 5:
+        elif run["ended_at"] is not None and now - 24 * 3600 <= run["ended_at"] <= now + 5:
             view = dict(run)
             view.pop("children", None)
             recent.append(view)
@@ -439,7 +439,7 @@ def _reconcile(runs, now):
     empty = {"ws": "unassigned", "live_agents": 0, "finished_in_range": 0, "finished_today": 0, "tokens": 0, "cost_usd": 0.0, "tokens_all_time": 0, "cost_usd_all_time": 0.0, "last_activity": None}
     return {
         "now": now,
-        "since": now - 12 * 3600,
+        "since": now - 24 * 3600,
         "until": now,
         "all": {
             "live_agents": snap["counts"]["live_agents"],

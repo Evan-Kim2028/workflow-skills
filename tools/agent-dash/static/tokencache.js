@@ -1,11 +1,13 @@
 /* Cache keys and stale-response guards for the execution view.
+   One fixed 24 h window: keys are tab + usage grouping only.
    No DOM and no fetch here: pure helpers shared by the page and its tests. */
 (function (global) {
   "use strict";
   var TTL_MS = 30000;
+  var WINDOW_HOURS = 24;
 
-  function key(ws, hours, groupBy) {
-    return String(ws == null ? "all" : ws) + "|" + String(hours || 0) + "|" + String(groupBy || "model");
+  function key(ws, groupBy) {
+    return String(ws == null ? "all" : ws) + "|" + String(groupBy || "model");
   }
 
   function fresh(entry, nowMs, ttlMs) {
@@ -16,7 +18,7 @@
 
   function currentKey(state) {
     var group = state.ws === "all" ? state.groupBy : "model";
-    return key(state.ws, state.hours, group);
+    return key(state.ws, group);
   }
 
   function applies(reqKey, state) {
@@ -40,6 +42,7 @@
 
   global.ADC = {
     TTL_MS: TTL_MS,
+    WINDOW_HOURS: WINDOW_HOURS,
     key: key,
     fresh: fresh,
     currentKey: currentKey,
