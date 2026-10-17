@@ -1,153 +1,85 @@
 {
   "ws": "WS1",
   "cols": [
-    "Foundations",
+    "Shape",
     "Build",
-    "Wire",
     "Prove"
   ],
   "groups": [
     {
-      "id": "scope",
+      "id": "start",
       "col": 0,
-      "title": "Scope",
+      "title": "First group",
       "tasks": [
         {
-          "id": "1",
-          "title": "Write the outline",
-          "status": "done"
-        },
-        {
-          "id": "4",
-          "title": "Freeze the types",
-          "status": "done"
-        }
-      ]
-    },
-    {
-      "id": "store",
-      "col": 0,
-      "title": "Store",
-      "tasks": [
-        {
-          "id": "12",
-          "title": "Schema migration",
-          "status": "prog"
-        },
-        {
-          "id": "13",
-          "title": "Backfill the empty tables",
+          "id": "WS1.1",
+          "title": "Agree the contract",
           "status": "todo"
-        }
-      ]
-    },
-    {
-      "id": "match",
-      "col": 1,
-      "title": "Match",
-      "tasks": [
-        {
-          "id": "20",
-          "title": "Matcher core",
-          "status": "done"
         },
         {
-          "id": "21",
-          "title": "Conflict rule",
+          "id": "WS1.2",
+          "title": "Land the read route",
           "status": "pr"
-        }
-      ]
-    },
-    {
-      "id": "cut",
-      "col": 2,
-      "title": "Cut over",
-      "tasks": [
-        {
-          "id": "30",
-          "title": "First source",
-          "status": "prog"
         },
         {
-          "id": "31",
-          "title": "Second source",
-          "status": "todo"
-        }
-      ]
-    },
-    {
-      "id": "prove",
-      "col": 3,
-      "title": "Prove",
-      "tasks": [
+          "id": "WS1.3",
+          "title": "Retire the old readers",
+          "status": "wip"
+        },
         {
-          "id": "40",
-          "title": "Gate the sample set",
-          "status": "todo"
+          "id": "WS1.4",
+          "title": "Freeze the old contract",
+          "status": "done"
         }
       ]
     }
   ],
-  "edges": [
-    [
-      "scope",
-      "store"
-    ],
-    [
-      "store",
-      "match"
-    ],
-    [
-      "match",
-      "cut"
-    ],
-    [
-      "cut",
-      "prove"
-    ]
-  ],
+  "edges": [],
   "phases": [
     {
       "name": "Shape",
-      "goal": "Types and the store agree.",
+      "goal": "The contract is written down.",
       "gate": "The sample set loads."
-    },
-    {
-      "name": "Cut over",
-      "goal": "One source reads the new store.",
-      "gate": "The gate task is done."
     }
   ],
   "trains": [
     {
       "id": "T1",
-      "title": "store migration",
+      "title": "read-path cutover",
       "members": [
-        "12",
-        "13"
+        "WS1.1"
       ],
       "status": "planned",
-      "shared_files": [
-        "store/schema.sql"
-      ],
-      "gate": "pytest store/tests/test_schema.py",
-      "note": "First guess at planning time."
+      "note": "First guess at planning time; the branch is cut when assembly starts."
     },
     {
       "id": "T2",
-      "title": "matcher cutover",
-      "branch": "train/matcher-cutover",
+      "title": "reader retirement",
+      "branch": "train/reader-retirement",
       "members": [
-        "20",
-        "21"
+        "WS1.2",
+        "WS1.3"
       ],
       "status": "pr",
-      "pr": 5361,
+      "pr": 5357,
       "shared_files": [
-        "match/rules.py"
+        "api/read.py"
       ],
-      "gate": "pytest match/tests/test_rules.py"
+      "gate": "pytest api/tests/test_read.py"
     }
   ],
+  "progress": {
+    "done": 1,
+    "total": 4,
+    "counts": {
+      "todo": 1,
+      "wip": 1,
+      "pr": 1,
+      "prog": 0,
+      "done": 1,
+      "deferred": 0
+    },
+    "pct": 25
+  },
   "_note": "Seeded example plan for the fixture preview."
 }

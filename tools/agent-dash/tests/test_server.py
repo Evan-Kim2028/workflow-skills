@@ -160,9 +160,7 @@ class ServerTest(unittest.TestCase):
             buf += chunk
         self.assertIn(b"event: tick\n", buf)
         data = json.loads(buf.split(b"data: ", 1)[1].split(b"\n", 1)[0])
-        self.assertIn("seq", data)
-        self.assertIn("running", data)
-        self.assertIn("alerts_count", data)
+        self.assertEqual(set(data), {"seq", "running"})
         conn.close()
 
 
@@ -258,6 +256,112 @@ class PlanAndBackfillTest(unittest.TestCase):
             self.assertEqual(last, 1060.0)
         finally:
             agent_dash.reconcile_running = orig
+
+
+class ReconcileEndpointTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.store = Store(Path(self.tmp.name) / "dash.sqlite")
+        now = time.time()
+        self.store.upsert_run(
+            {
+                "run_id": "muse:a:ws1-a",
+                "source": "muse",
+                "tier": "muse",
+                "model": "claude-sonnet-4-5",
+                "label": "ws1-a",
+                "status": "running",
+                "started_at": now - 100,
+            }
+        )
+        self.store.upsert_run(
+            {
+                "run_id": "muse:b:helper",
+                "source": "muse",
+                "tier": "muse",
+                "model": "claude-sonnet-4-5",
+                "label": "helper",
+                "session_id": "sess-b",
+                "status": "done",
+                "started_at": now - 3000,
+                "ended_at": now - 2000,
+            }
+        )
+        self.store.add_usage(
+            {
+                "ts": now - 2100,
+                "session_id": "sess-b",
+                "run_id": "muse:b:helper",
+                "model": "claude-sonnet-4-5",
+                "tool": "claude",
+                "message_id": "m1",
+                "input": 400,
+                "output": 20,
+                "cache_read": 0,
+                "cache_write": 0,
+            }
+        )
+        self.server, self.thread = start(self.store)
+        self.port = self.server.server_address[1]
+
+    def tearDown(self):
+        stop(self.server, self.thread)
+        self.store.close()
+        self.tmp.cleanup()
+
+    def test_reconcile_endpoint(self):
+        status, _, body = get(self.port, "/api/reconcile?hours=12")
+        self.assertEqual(status, 200)
+        payload = json.loads(body)
+        self.assertEqual(payload["mismatches"], [])
+        self.assertEqual(payload["all"]["live_agents"], 1)
+        self.assertEqual(payload["all"]["finished_in_range"], 1)
+        self.assertEqual(payload["unassigned"]["tokens"], 420)
+        self.assertEqual(payload["unassigned"]["finished_in_range"], 1)
+        self.assertEqual([row["ws"] for row in payload["rows"]], ["WS1"])
+        status, _, body = get(self.port, "/api/reconcile?hours=nope")
+        self.assertEqual(status, 400)
+
+    def test_check_command_passes(self):
+        self.assertEqual(main(["check", "--url", f"http://127.0.0.1:{self.port}", "--hours", "12"]), 0)
+        self.assertEqual(main(["check", "--url", "http://127.0.0.1:1", "--hours", "12"]), 2)
+        self.assertEqual(main(["check", "--hours", "nope"]), 2)
+
+    def test_check_command_fails_on_mismatch(self):
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+
+        doc = json.dumps(
+            {
+                "since": 1,
+                "until": 2,
+                "rows": [{"ws": "WS1", "live_agents": 1, "finished_in_range": 0, "tokens": 5, "cost_usd": 0.0}],
+                "unassigned": {"ws": "unassigned", "live_agents": 0, "finished_in_range": 0, "tokens": 0, "cost_usd": 0.0},
+                "mismatches": ["tokens: workstream rows sum to 5, overview shows 6"],
+            }
+        ).encode()
+
+        class Stub(BaseHTTPRequestHandler):
+            def do_GET(self):
+                body = doc
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):
+                return
+
+        server = HTTPServer(("127.0.0.1", 0), Stub)
+        thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True)
+        thread.start()
+        try:
+            port = server.server_address[1]
+            self.assertEqual(main(["check", "--url", f"http://127.0.0.1:{port}"]), 1)
+        finally:
+            server.shutdown()
+            thread.join(3)
+            server.server_close()
 
 
 if __name__ == "__main__":

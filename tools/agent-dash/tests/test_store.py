@@ -260,29 +260,10 @@ class StoreTest(unittest.TestCase):
         self.assertIsNone(run["tokens"]["input"])
         self.assertEqual(self.store.snapshot(5)["totals"]["unpriced_runs"], 1)
 
-    def test_alerts_and_caps(self):
+    def test_snapshot_keys_are_closed(self):
         now = 10_000.0
         self.store.upsert_run(
             {"run_id": "h", "tier": "haiku", "label": "ws1-12", "status": "running", "started_at": now - 21 * 60}
-        )
-        self.store.upsert_run(
-            {"run_id": "s", "tier": "sonnet", "label": "ws2-3", "status": "running", "started_at": now - 44 * 60}
-        )
-        self.store.upsert_run(
-            {"run_id": "s2", "tier": "sonnet", "label": "WS2.1", "status": "running", "started_at": now - 46 * 60}
-        )
-        self.store.upsert_run(
-            {"run_id": "g", "tier": "glm", "label": "glm-review", "status": "running", "started_at": now - 31 * 60}
-        )
-        self.store.upsert_run(
-            {
-                "run_id": "o",
-                "tier": "opus",
-                "label": "hub",
-                "session_id": HUB,
-                "status": "running",
-                "started_at": now - 3 * 3600,
-            }
         )
         self.store.upsert_run(
             {
@@ -294,39 +275,11 @@ class StoreTest(unittest.TestCase):
                 "ended_at": now - 600,
             }
         )
-        self.store.upsert_run(
-            {
-                "run_id": "old",
-                "tier": "haiku",
-                "label": "ws3-y",
-                "status": "killed",
-                "started_at": now - 8000,
-                "ended_at": now - 7000,
-            }
-        )
-        for pid in range(11):
-            self.store.add_process_sample(
-                {"ts": now, "pid": pid, "comm": "cursor-agent", "rss_kb": 10, "elapsed_s": 1, "label": None}
-            )
-        for pid in range(100, 110):
-            self.store.add_process_sample(
-                {"ts": now, "pid": pid, "comm": "claude", "rss_kb": 10, "elapsed_s": 1, "label": None}
-            )
         snap = self.store.snapshot(now)
-        kinds = {(alert["kind"], alert["run_id"]) for alert in snap["alerts"]}
-        self.assertIn(("long_running", "h"), kinds)
-        self.assertIn(("long_running", "s2"), kinds)
-        self.assertIn(("long_running", "g"), kinds)
-        self.assertNotIn(("long_running", "s"), kinds)
-        self.assertNotIn(("long_running", "o"), kinds)
-        self.assertIn(("died_early", "dead"), kinds)
-        self.assertNotIn(("killed", "old"), kinds)
-        self.assertNotIn("caps", snap)
-        self.assertTrue(all(alert["kind"] != "over_cap" for alert in snap["alerts"]))
+        self.assertEqual(set(snap), {"now", "seq", "counts", "running", "recent", "totals", "by_workstream"})
         self.assertEqual(snap["counts"]["live_agents"], 0)
         recent_ids = [run["run_id"] for run in snap["recent"]]
         self.assertEqual(recent_ids, ["dead"])
-        self.assertNotIn("old", recent_ids)
 
     def test_recent_cap(self):
         now = 5_000.0
@@ -440,8 +393,9 @@ class StoreTest(unittest.TestCase):
         self.assertEqual(by_t[150]["muse"], 0)
 
     def test_sessions_and_workstreams(self):
+        now = time.time()
         self.store.upsert_session(
-            {"session_id": HUB, "tool": "claude", "cwd": "/tmp/demo", "started_at": 5, "status": "busy"}
+            {"session_id": HUB, "tool": "claude", "cwd": "/tmp/demo", "started_at": now - 100, "status": "busy"}
         )
         self.store.upsert_run(
             {
@@ -451,12 +405,12 @@ class StoreTest(unittest.TestCase):
                 "model": "claude-opus-5-5",
                 "session_id": HUB,
                 "status": "running",
-                "started_at": 5,
+                "started_at": now - 100,
             }
         )
         self.store.add_usage(
             {
-                "ts": 6,
+                "ts": now - 50,
                 "session_id": HUB,
                 "run_id": "r",
                 "model": "claude-opus-5-5",
@@ -480,7 +434,9 @@ class StoreTest(unittest.TestCase):
         ws1 = next(row for row in boards if row["ws"] == "WS1")
         self.assertEqual(ws1["name"], "Identity")
         self.assertEqual(ws1["tk"]["backlog"], 14)
-        self.assertEqual(ws1["running"], 1)
+        self.assertEqual(ws1["live_agents"], 0)
+        self.assertEqual(ws1["finished_in_range"], 0)
+        self.assertEqual(ws1["tokens"], 100)
         self.assertFalse(ws1["plan"])
 
     def test_sample_retention(self):
@@ -744,6 +700,154 @@ class StoreTest(unittest.TestCase):
         self.assertIsNone(self.store.get_run(src))
         self.assertEqual(kept["started_at"], 1792167605.0)
         self.assertEqual(kept["ended_at"], 1792167848.6732)
+
+
+class ReconcileTest(unittest.TestCase):
+    """One source of truth: ws rows plus unassigned equal the all-scope numbers,
+    and each ws row equals that workstream tab's snapshot."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.store = memory(Path(self.tmp.name))
+        self.now = 1_761_999_960.0
+        self.since = self.now - 12 * 3600
+        self.until = self.now
+
+    def tearDown(self):
+        self.store.close()
+        self.tmp.cleanup()
+
+    def _run(self, run_id, source, tier, label, status, started, ended, session=None):
+        self.store.upsert_run(
+            {
+                "run_id": run_id,
+                "source": source,
+                "tier": tier,
+                "model": "claude-sonnet-4-5",
+                "label": label,
+                "session_id": session or run_id,
+                "status": status,
+                "started_at": started,
+                "ended_at": ended,
+            }
+        )
+
+    def _usage(self, ts, session, run_id, message, tokens):
+        self.store.add_usage(
+            {
+                "ts": ts,
+                "session_id": session,
+                "run_id": run_id,
+                "model": "claude-sonnet-4-5",
+                "tool": "claude",
+                "message_id": message,
+                "input": tokens,
+                "output": tokens // 2,
+                "cache_read": 0,
+                "cache_write": 0,
+            }
+        )
+
+    def seed(self):
+        now = self.now
+        self._run("grok:a:ws1-a", "grok", "grok", "ws1-a", "running", now - 100, None)
+        self._run("muse:b:ws1-b", "muse", "muse", "ws1-b", "running", now - 200, None)
+        self._run("muse:c:ws1-c", "muse", "muse", "ws1-c", "done", now - 5000, now - 4000, session="s-c")
+        self._usage(now - 4100, "s-c", "muse:c:ws1-c", "m1", 100)
+        self._run("muse:old:ws1-old", "muse", "muse", "ws1-old", "done", now - 3 * 86400 - 500, now - 3 * 86400, session="s-old")
+        self._usage(now - 3 * 86400, "s-old", "muse:old:ws1-old", "m1", 700)
+        self._run("claude-sub:d:ws2-d", "claude-subagent", "sonnet", "ws2-d", "running", now - 50, None)
+        self._run("grok:e:ws2-e", "grok", "grok", "ws2-e", "done", now - 9000, now - 8000, session="s-e")
+        self._usage(now - 8100, "s-e", "grok:e:ws2-e", "m1", 200)
+        self._run("glm:f:ws3-f", "glm", "glm", "ws3-f", "done", now - 7000, now - 6000, session="s-f")
+        self._usage(now - 6100, "s-f", "glm:f:ws3-f", "m1", 300)
+        self._run("muse:g:helper", "muse", "muse", "helper", "running", now - 70, None)
+        self._run("muse:h:cleanup", "muse", "muse", "cleanup", "done", now - 3000, now - 2000, session="s-h")
+        self._usage(now - 2100, "s-h", "muse:h:cleanup", "m1", 400)
+        self._run("claude-main:lead:main", "claude-main", "opus", "ws1-lead", "running", now - 900, None)
+        self._run("dagster:job:nightly", "dagster", "dagster", "nightly-job", "running", now - 800, None)
+
+    def test_rows_plus_unassigned_equal_all(self):
+        self.seed()
+        roll = self.store.ws_rollup(self.now, self.since, self.until)
+        everything = list(roll["rows"]) + [roll["unassigned"]]
+        self.assertEqual({row["ws"] for row in roll["rows"]}, {"WS1", "WS2", "WS3"})
+        self.assertEqual(roll["unassigned"]["ws"], "unassigned")
+        for metric in ("live_agents", "finished_in_range", "finished_today"):
+            self.assertEqual(sum(row[metric] for row in everything), roll["all"]["counts"][metric])
+        self.assertEqual(
+            sum(row["tokens"] for row in everything),
+            sum(roll["all"]["totals"]["tokens"][key] for key in ("input", "output", "cache_read", "cache_write")),
+        )
+        self.assertAlmostEqual(
+            sum(row["cost_usd"] for row in everything), roll["all"]["totals"]["cost_usd"], places=6
+        )
+        by_ws = {row["ws"]: row for row in everything}
+        self.assertEqual(by_ws["WS1"]["live_agents"], 2)
+        self.assertEqual(by_ws["WS2"]["live_agents"], 1)
+        self.assertEqual(by_ws["WS3"]["live_agents"], 0)
+        self.assertEqual(by_ws["unassigned"]["live_agents"], 1)
+        self.assertEqual(roll["all"]["counts"]["live_agents"], 4)
+        self.assertEqual(by_ws["WS1"]["finished_in_range"], 1)
+        self.assertEqual(roll["all"]["counts"]["finished_in_range"], 4)
+
+    def test_each_row_equals_its_tab(self):
+        self.seed()
+        roll = self.store.ws_rollup(self.now, self.since, self.until)
+        for row in list(roll["rows"]) + [roll["unassigned"]]:
+            tab = self.store.snapshot(self.now, row["ws"], self.since, self.until)
+            for metric in ("live_agents", "finished_in_range", "finished_today"):
+                self.assertEqual(row[metric], tab["counts"][metric], f"{row['ws']} {metric}")
+            tab_tokens = sum(tab["totals"]["tokens"][key] for key in ("input", "output", "cache_read", "cache_write"))
+            self.assertEqual(row["tokens"], tab_tokens, row["ws"])
+            self.assertAlmostEqual(row["cost_usd"], tab["totals"]["cost_usd"], places=6, msg=row["ws"])
+
+    def test_window_excludes_old_finished_and_old_tokens(self):
+        self.seed()
+        wide = self.store.snapshot(self.now, "all", self.since, self.until)
+        narrow = self.store.snapshot(self.now, "all", self.now - 3600, self.until)
+        self.assertGreater(wide["counts"]["finished_in_range"], narrow["counts"]["finished_in_range"])
+        wide_tokens = sum(wide["totals"]["tokens"][k] for k in ("input", "output", "cache_read", "cache_write"))
+        narrow_tokens = sum(narrow["totals"]["tokens"][k] for k in ("input", "output", "cache_read", "cache_write"))
+        self.assertGreater(wide_tokens, narrow_tokens)
+        self.assertEqual(narrow["counts"]["finished_in_range"], 1)
+
+    def test_snapshot_totals_equal_usage_cells(self):
+        self.seed()
+        snap = self.store.snapshot(self.now, "all", self.since, self.until)
+        cells = self.store.query_usage("workstream", "hour", None, self.since, self.until)
+        for key in ("input", "output", "cache_read", "cache_write", "reasoning"):
+            self.assertEqual(sum(cell[key] for cell in cells), snap["totals"]["tokens"][key])
+        priced = [cell["priced_cost_usd"] if cell["priced_cost_usd"] is not None else cell["cost_usd"] for cell in cells]
+        priced = [value for value in priced if value is not None]
+        self.assertAlmostEqual(sum(priced), snap["totals"]["cost_usd"], places=6)
+
+    def test_reconcile_has_no_mismatches(self):
+        self.seed()
+        report = self.store.reconcile_numbers(self.now, self.since, self.until)
+        self.assertEqual(report["mismatches"], [])
+        self.assertEqual(report["all"]["live_agents"], 4)
+        self.assertEqual({row["ws"] for row in report["rows"]}, {"WS1", "WS2", "WS3"})
+
+    def test_no_unassigned_row_when_everything_is_attributed(self):
+        self._run("muse:a:ws1-a", "muse", "muse", "ws1-a", "running", self.now - 100, None)
+        snap = self.store.snapshot(self.now, "all", self.since, self.until)
+        self.assertEqual([row["ws"] for row in snap["by_workstream"]], ["WS1"])
+        report = self.store.reconcile_numbers(self.now, self.since, self.until)
+        self.assertEqual(report["mismatches"], [])
+        self.assertEqual(report["unassigned"]["tokens"], 0)
+
+    def test_board_only_workstream_stays_visible(self):
+        self.seed()
+        self.store.set_ws_counts([{"ws": "WS9", "name": "Quiet", "backlog": 1, "todo": 0, "doing": 0, "review": 0, "done": 0, "cancelled": 0}])
+        boards = self.store.query_workstreams({"WS9"}, self.since, self.until, now=self.now)
+        quiet = next(row for row in boards if row["ws"] == "WS9")
+        self.assertEqual(quiet["live_agents"], 0)
+        self.assertEqual(quiet["tokens"], 0)
+        self.assertTrue(quiet["plan"])
+        mine = {row["ws"]: row for row in boards if row["ws"] in ("WS1", "unassigned")}
+        self.assertEqual(mine["WS1"]["live_agents"], 2)
+        self.assertEqual(mine["unassigned"]["live_agents"], 1)
 
 
 class ProcessParseTest(unittest.TestCase):

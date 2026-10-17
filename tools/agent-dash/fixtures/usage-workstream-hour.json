@@ -7,6 +7,7 @@
       "output": 1406,
       "cache_read": 9237,
       "cache_write": 2642,
+      "reasoning": 0,
       "cost_usd": 0.0985
     },
     {
@@ -16,6 +17,7 @@
       "output": 18640,
       "cache_read": 90891,
       "cache_write": 13902,
+      "reasoning": 0,
       "cost_usd": 0.8709
     },
     {
@@ -25,6 +27,7 @@
       "output": 9348,
       "cache_read": 64855,
       "cache_write": 8922,
+      "reasoning": 0,
       "cost_usd": 0.2048
     },
     {
@@ -34,6 +37,7 @@
       "output": 10219,
       "cache_read": 58098,
       "cache_write": 12651,
+      "reasoning": 0,
       "cost_usd": 0.3013
     },
     {
@@ -43,6 +47,7 @@
       "output": 27387,
       "cache_read": 92112,
       "cache_write": 18081,
+      "reasoning": 0,
       "cost_usd": 1.0157
     },
     {
@@ -52,6 +57,7 @@
       "output": 18771,
       "cache_read": 81386,
       "cache_write": 14440,
+      "reasoning": 0,
       "cost_usd": 0.1894
     },
     {
@@ -61,6 +67,7 @@
       "output": 17327,
       "cache_read": 50601,
       "cache_write": 13177,
+      "reasoning": 0,
       "cost_usd": 0.18
     },
     {
@@ -70,6 +77,7 @@
       "output": 1814,
       "cache_read": 3122,
       "cache_write": 1405,
+      "reasoning": 0,
       "cost_usd": 0.0
     },
     {
@@ -79,6 +87,7 @@
       "output": 13516,
       "cache_read": 35675,
       "cache_write": 9128,
+      "reasoning": 0,
       "cost_usd": 0.0276
     },
     {
@@ -88,6 +97,7 @@
       "output": 12093,
       "cache_read": 52116,
       "cache_write": 7452,
+      "reasoning": 0,
       "cost_usd": 0.0141
     },
     {
@@ -97,6 +107,7 @@
       "output": 8797,
       "cache_read": 39921,
       "cache_write": 7886,
+      "reasoning": 0,
       "cost_usd": 0.0121
     },
     {
@@ -106,6 +117,7 @@
       "output": 1738,
       "cache_read": 9132,
       "cache_write": 1927,
+      "reasoning": 0,
       "cost_usd": 0.1034
     },
     {
@@ -115,6 +127,7 @@
       "output": 2266,
       "cache_read": 5290,
       "cache_write": 1906,
+      "reasoning": 0,
       "cost_usd": 0.0
     },
     {
@@ -124,6 +137,7 @@
       "output": 1914,
       "cache_read": 6494,
       "cache_write": 49,
+      "reasoning": 0,
       "cost_usd": 0.0
     }
   ],

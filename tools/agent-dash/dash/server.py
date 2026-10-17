@@ -10,10 +10,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from dash.bundles import approvals_all, approvals_for, bundle_plan_view, list_bundles, load_bundle_api, read_page, start_prompt_text, workstream_plan_ids
-from dash.plans import PlanError, PlanNotFound, load as load_plan
+from dash.bundles import approvals_all, approvals_for, list_bundles, load_bundle_api, read_page, resolve_plan, start_prompt_text, workstream_plan_ids
+from dash.plans import PlanError
 from dash.pricing import health_block
-from dash.store import DEFAULT_LONG_RUNNING_S
 
 ROOT = Path(__file__).resolve().parents[1]
 INDEX_PATH = ROOT / "static" / "index.html"
@@ -58,7 +57,9 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/api/sessions":
                 self._json(200, {"sessions": self.server.store.query_sessions()})
             elif path == "/api/workstreams":
-                self._json(200, {"workstreams": self.server.store.query_workstreams(workstream_plan_ids())})
+                self._workstreams(query)
+            elif path == "/api/reconcile":
+                self._reconcile(query)
             elif path == "/api/plan":
                 self._plan(query)
             elif path == "/plan":
@@ -139,7 +140,26 @@ class Handler(BaseHTTPRequestHandler):
         now = time.time()
         since = _float(query, "since")
         until = _float(query, "until")
-        self._json(200, self.server.store.snapshot(now, ws, _long(self.server), since, until))
+        self._json(200, self.server.store.snapshot(now, ws, since, until))
+
+    def _workstreams(self, query):
+        since = _float(query, "since")
+        until = _float(query, "until")
+        self._json(
+            200,
+            {"workstreams": self.server.store.query_workstreams(workstream_plan_ids(), since, until)},
+        )
+
+    def _reconcile(self, query):
+        now = time.time()
+        hours = _float(query, "hours")
+        since = _float(query, "since")
+        until = _float(query, "until")
+        if since is None and hours is not None:
+            if hours <= 0:
+                raise ValueError("bad hours")
+            since = now - hours * 3600
+        self._json(200, self.server.store.reconcile_numbers(now, since, until))
 
     def _runs(self, query):
         now = time.time()
@@ -154,7 +174,8 @@ class Handler(BaseHTTPRequestHandler):
         bucket = _choice(query, "bucket", "hour", {"hour", "day"})
         ws = _ws(query, default=None)
         since = _float(query, "since")
-        self._json(200, {"buckets": self.server.store.query_usage(group, bucket, ws, since)})
+        until = _float(query, "until")
+        self._json(200, {"buckets": self.server.store.query_usage(group, bucket, ws, since, until)})
 
     def _concurrency(self, query):
         now = time.time()
@@ -171,16 +192,14 @@ class Handler(BaseHTTPRequestHandler):
             raise ValueError("ws required")
         if not _WS.match(ws):
             raise ValueError("bad ws")
-        body = bundle_plan_view(ws)
+        try:
+            _source, body = resolve_plan(ws)
+        except PlanError:
+            self._json(500, {"error": "plan unreadable", "ws": ws})
+            return
         if body is None:
-            try:
-                body = load_plan(ws)
-            except PlanNotFound:
-                self._json(404, {"error": "plan not found", "ws": ws})
-                return
-            except PlanError:
-                self._json(500, {"error": "plan unreadable", "ws": ws})
-                return
+            self._json(404, {"error": "plan not found", "ws": ws})
+            return
         if isinstance(body, dict) and "start_prompt" not in body:
             body["start_prompt"] = start_prompt_text(ws)
         self._json(200, body)
@@ -245,8 +264,8 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         interval = self.server.stream_interval
         while not self.server.stop.is_set():
-            payload = self.server.store.snapshot(time.time(), "all", _long(self.server))
-            data = {"seq": payload["seq"], "running": payload["running"], "alerts_count": len(payload["alerts"])}
+            payload = self.server.store.snapshot(time.time(), "all")
+            data = {"seq": payload["seq"], "running": payload["running"]}
             blob = ("event: tick\ndata: " + json.dumps(data, separators=(",", ":"), allow_nan=False) + "\n\n").encode()
             try:
                 self.wfile.write(blob)
@@ -326,9 +345,3 @@ def _choice(query: dict, name: str, default: str, allowed: set[str]) -> str:
     return value
 
 
-def _long(server) -> dict:
-    table = dict(DEFAULT_LONG_RUNNING_S)
-    custom = (server.cfg or {}).get("long_running_s")
-    if isinstance(custom, dict):
-        table.update(custom)
-    return table

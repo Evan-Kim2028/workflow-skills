@@ -153,6 +153,7 @@ python3 agent_dash.py status
 python3 agent_dash.py backfill --session <id>
 python3 agent_dash.py reprice
 python3 agent_dash.py reconcile
+python3 agent_dash.py check [--url URL] [--hours N]
 python3 agent_dash.py ws list
 python3 agent_dash.py ws new <ID> "<title>"
 python3 agent_dash.py ws validate <ID>
@@ -166,6 +167,10 @@ python3 agent_dash.py ws approvals <ID>
 `ws task` accepts `--moved-to WSn` and `--note "..."` only with status `deferred`. `ws approve` status is `pending`, `approved`, or `denied`. `--reversible` is `yes` or `no`. `backfill` requires `--session`. With no subcommand, `agent_dash.py` starts the server, the same as `run`.
 
 `reconcile` marks grok, muse, and glm rows whose process is gone. It prints `reconcile ended <count>`.
+
+`check` asks a running dashboard for `GET /api/reconcile`, prints one table row
+per workstream plus the unassigned row, and exits 1 on any mismatch. `--url`
+defaults to `http://127.0.0.1:8765` and `--hours` defaults to 12.
 
 ## Add a data source
 

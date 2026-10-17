@@ -12,7 +12,9 @@ import re
 from datetime import datetime, timezone
 from pathlib import Path
 
-from dash.plans import configured
+from dash.plans import PlanNotFound, configured
+from dash.plans import load as load_plan
+from dash.plans import plan_progress
 
 STATUSES = ("todo", "wip", "pr", "prog", "done", "deferred")
 STATUS_MEANING = {
@@ -215,6 +217,19 @@ def sanitized_trains(value) -> list:
     return out
 
 
+def resolve_plan(ws: str) -> tuple[str | None, dict | None]:
+    """The one plan resolver every endpoint uses: a bundle's plan.json wins over
+    the plans-map file. Returns ``(source, body)`` with source ``bundle`` or
+    ``map``, or ``(None, None)`` when neither has the workstream."""
+    body = bundle_plan_view(ws)
+    if body is not None:
+        return "bundle", body
+    try:
+        return "map", load_plan(ws)
+    except PlanNotFound:
+        return None, None
+
+
 def load_bundle_api(ws: str) -> dict | None:
     path = bundle_dir(ws)
     if path is None:
@@ -225,10 +240,12 @@ def load_bundle_api(ws: str) -> dict | None:
         return None
     plan = dict(plan)
     plan["trains"] = sanitized_trains(plan.get("trains"))
+    dag = plan.get("dag") if isinstance(plan.get("dag"), dict) else {}
     approvals = approvals_for(ws)
     return {
         "bundle": meta,
         "plan": plan,
+        "progress": plan_progress(dag.get("groups")),
         "approvals": approvals if approvals is not None else empty_approvals(ws),
         "start_prompt": start_prompt_text(ws),
     }
@@ -279,13 +296,15 @@ def bundle_plan_view(ws: str) -> dict | None:
     for item in narrative.get("phases") or []:
         if isinstance(item, dict):
             phases.append({"name": item.get("name"), "goal": item.get("goal"), "gate": item.get("gate")})
+    groups = _view_groups(dag.get("groups"))
     return {
         "ws": ws,
         "cols": cols,
-        "groups": _view_groups(dag.get("groups")),
+        "groups": groups,
         "edges": edges,
         "phases": phases,
         "trains": sanitized_trains(data.get("trains")),
+        "progress": plan_progress(groups),
         "start_prompt": start_prompt_text(ws),
     }
 

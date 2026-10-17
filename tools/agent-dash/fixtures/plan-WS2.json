@@ -88,5 +88,18 @@
     }
   ],
   "trains": [],
+  "progress": {
+    "done": 1,
+    "total": 5,
+    "counts": {
+      "todo": 2,
+      "wip": 0,
+      "pr": 1,
+      "prog": 1,
+      "done": 1,
+      "deferred": 0
+    },
+    "pct": 20
+  },
   "_note": "Seeded example plan for the fixture preview."
 }

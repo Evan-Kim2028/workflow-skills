@@ -133,7 +133,7 @@ The tool buckets are `grok`, `muse`, `glm`, and `claude`. A running run counts o
 
 Finished today counts runs whose status is `done`, `killed`, or `died_early` and whose end time is after local midnight. The pass, partial, and blocked line on that tile uses the snapshot's verdict tally.
 
-The Alerts tile counts runs that died early, were killed in the last hour, or are still running past a tier limit. The limits are haiku 20 minutes, sonnet 45 minutes, muse 45 minutes, grok 45 minutes, and glm 30 minutes. Opus has no entry in that table, so a long Opus run does not raise this alert.
+One rollup computes the all-scope numbers, every workstream row, and the unassigned row from the same run list, agent rule, and window: live agents, finished in range, tokens, cost, and last activity. Each workstream row equals that tab's numbers, and the rows plus unassigned equal the overview total. `GET /api/reconcile` proves it in one call, and `python3 agent_dash.py check` prints its table. Plan % done is computed once on the server (`progress` on `/api/plan` and `/api/bundle`); the page reads it and never recomputes it. Hub issue counts (`tk`) are issue counts, never progress.
 
 Collectors poll on their own intervals. The claude, muse, cursor, grok_cli, and manifests sources poll every 2 seconds. cursor is the Grok chat source. grok_cli is the GLM source. Process samples poll every 5 seconds. The optional hub poll is every 60 seconds. The page opens a stream that ticks every 2 seconds and refetches the snapshot when the sequence number changes. Runs, usage, the plan, and approvals refresh every 30 seconds.
 

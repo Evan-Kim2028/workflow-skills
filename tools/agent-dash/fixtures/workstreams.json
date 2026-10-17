@@ -11,9 +11,12 @@
         "done": 2,
         "cancelled": 0
       },
-      "running": 0,
+      "live_agents": 0,
+      "finished_in_range": 0,
+      "finished_today": 0,
       "tokens": 0,
       "cost_usd": 0,
+      "last_activity": null,
       "plan": false
     },
     {
@@ -27,9 +30,12 @@
         "done": 4,
         "cancelled": 0
       },
-      "running": 3,
+      "live_agents": 2,
+      "finished_in_range": 36,
+      "finished_today": 36,
       "tokens": 436889,
       "cost_usd": 2.0176,
+      "last_activity": 1761999840,
       "plan": true
     },
     {
@@ -43,9 +49,12 @@
         "done": 3,
         "cancelled": 0
       },
-      "running": 2,
+      "live_agents": 2,
+      "finished_in_range": 38,
+      "finished_today": 38,
       "tokens": 360883,
       "cost_usd": 0.4083,
+      "last_activity": 1761999840,
       "plan": true
     },
     {
@@ -59,9 +68,12 @@
         "done": 1,
         "cancelled": 0
       },
-      "running": 0,
+      "live_agents": 0,
+      "finished_in_range": 0,
+      "finished_today": 0,
       "tokens": 0,
       "cost_usd": 0,
+      "last_activity": null,
       "plan": false
     },
     {
@@ -75,9 +87,12 @@
         "done": 1,
         "cancelled": 0
       },
-      "running": 0,
+      "live_agents": 0,
+      "finished_in_range": 0,
+      "finished_today": 0,
       "tokens": 0,
       "cost_usd": 0,
+      "last_activity": null,
       "plan": false
     },
     {
@@ -91,9 +106,12 @@
         "done": 2,
         "cancelled": 0
       },
-      "running": 0,
+      "live_agents": 0,
+      "finished_in_range": 0,
+      "finished_today": 0,
       "tokens": 0,
       "cost_usd": 0,
+      "last_activity": null,
       "plan": false
     },
     {
@@ -107,9 +125,12 @@
         "done": 0,
         "cancelled": 1
       },
-      "running": 0,
+      "live_agents": 0,
+      "finished_in_range": 0,
+      "finished_today": 0,
       "tokens": 0,
       "cost_usd": 0,
+      "last_activity": null,
       "plan": false
     },
     {
@@ -123,9 +144,12 @@
         "done": 2,
         "cancelled": 0
       },
-      "running": 3,
+      "live_agents": 3,
+      "finished_in_range": 33,
+      "finished_today": 33,
       "tokens": 317741,
       "cost_usd": 0.4934,
+      "last_activity": 1761999840,
       "plan": true
     }
   ],

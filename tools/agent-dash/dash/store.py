@@ -18,13 +18,7 @@ TOOL_KEYS = ("grok", "muse", "glm", "claude")
 FINISHED = ("done", "killed", "died_early")
 RANGE_S = 24 * 3600
 _ESTIMATE_TOOL = "grok-context"
-DEFAULT_LONG_RUNNING_S = {
-    "haiku": 20 * 60,
-    "sonnet": 45 * 60,
-    "muse": 45 * 60,
-    "grok": 45 * 60,
-    "glm": 30 * 60,
-}
+UNASSIGNED = "unassigned"
 SAMPLE_FRESH_S = 20
 RECENT_S = 3600
 SAMPLE_KEEP_S = 48 * 3600
@@ -547,46 +541,163 @@ class Store:
         self,
         now: float,
         ws: str = "all",
-        long_running_s: dict | None = None,
         since: float | None = None,
         until: float | None = None,
     ) -> dict:
-        long_running_s = long_running_s or DEFAULT_LONG_RUNNING_S
         with self._lock:
-            raw, usage, parents = self._scoped_usage()
-            context = self._context_by_run()
-            rss = self._rss_maps(now)
-            runs = [self._run_view(row, now, usage, rss, context) for row in raw]
-            visible = [run for run in runs if _in_ws(run, ws)]
-            shown = _drop_launch_echoes([run for run in visible if run["run_id"] not in parents])
-            running = [run for run in shown if run["status"] == "running"]
+            shown_all, parents = self._shown_locked(now)
+            scoped = [run for run in shown_all if _in_ws(run, ws)]
+            running = [run for run in scoped if run["status"] == "running"]
             running.sort(key=lambda run: run["started_at"] or 0, reverse=True)
             recent = [
                 run
-                for run in shown
+                for run in scoped
                 if run["status"] != "running"
                 and run["ended_at"] is not None
                 and run["ended_at"] >= now - RECENT_S
             ]
             recent.sort(key=lambda run: run["ended_at"] or 0, reverse=True)
             recent = recent[:50]
-            alerts = self._alerts(shown, now, long_running_s)
-            totals = _totals(shown)
-            totals["tokens"]["reasoning"] = sum(
-                (usage.get(run["run_id"], (_zeros(), 0.0, False))[0].get("reasoning") or 0) for run in shown
-            )
-            by_ws = _by_workstream(shown)
-            counts = _agent_counts(shown, parents, now, since, until)
+            roll = self._summarize_locked(shown_all, parents, now, since, until)
+            if ws is None or ws == "all":
+                counts = roll["all"]["counts"]
+                totals = roll["all"]["totals"]
+                by_ws = list(roll["rows"])
+                if roll["has_unassigned"]:
+                    by_ws.append(roll["unassigned"])
+            else:
+                key = UNASSIGNED if ws == UNASSIGNED else ws
+                scope = roll["scopes"].get(key, _empty_scope())
+                counts = scope["counts"]
+                totals = scope["totals"]
+                wanted = [roll["unassigned"]] if key == UNASSIGNED and roll["has_unassigned"] else roll["rows"]
+                by_ws = [row for row in wanted if row["ws"] == key]
             return {
                 "now": now,
                 "seq": self._seq,
                 "counts": counts,
                 "running": running,
                 "recent": recent,
-                "alerts": alerts,
                 "totals": totals,
                 "by_workstream": by_ws,
             }
+
+    def ws_rollup(self, now: float, since: float | None = None, until: float | None = None) -> dict:
+        """One locked pass over the same run list: all-scope counts and totals,
+        one row per workstream, and the unassigned row.
+
+        Row ``ws`` equals ``snapshot(now, ws, since, until)`` counts and totals.
+        The rows plus unassigned sum to the all-scope numbers exactly.
+        """
+        with self._lock:
+            shown_all, parents = self._shown_locked(now)
+            return self._summarize_locked(shown_all, parents, now, since, until)
+
+    def reconcile_numbers(self, now: float, since: float | None = None, until: float | None = None) -> dict:
+        """Cross-check every number once, under one lock. ``mismatches`` is empty when consistent."""
+        with self._lock:
+            shown_all, parents = self._shown_locked(now)
+            roll = self._summarize_locked(shown_all, parents, now, since, until)
+            everything = list(roll["rows"]) + [roll["unassigned"]]
+            all_counts = roll["all"]["counts"]
+            all_totals = roll["all"]["totals"]
+            mismatches: list[str] = []
+            for metric in ("live_agents", "finished_in_range", "finished_today", "tokens"):
+                if metric == "tokens":
+                    expect: int = _billed_total(all_totals["tokens"])
+                else:
+                    expect = all_counts[metric]
+                total = sum(row[metric] for row in everything)
+                if total != expect:
+                    mismatches.append(f"{metric}: workstream rows sum to {total}, overview shows {expect}")
+            if abs(sum(row["cost_usd"] for row in everything) - all_totals["cost_usd"]) > 1e-6:
+                mismatches.append(
+                    "cost_usd: workstream rows sum to "
+                    f"{sum(row['cost_usd'] for row in everything):.6f}, "
+                    f"overview shows {all_totals['cost_usd']:.6f}"
+                )
+            for row in roll["rows"]:
+                tab = self.snapshot(now, row["ws"], since, until)
+                for metric in ("live_agents", "finished_in_range", "finished_today"):
+                    if row[metric] != tab["counts"][metric]:
+                        mismatches.append(
+                            f"{row['ws']} {metric}: overview row shows {row[metric]}, "
+                            f"tab shows {tab['counts'][metric]}"
+                        )
+                if row["tokens"] != _billed_total(tab["totals"]["tokens"]):
+                    mismatches.append(
+                        f"{row['ws']} tokens: overview row shows {row['tokens']}, "
+                        f"tab shows {_billed_total(tab['totals']['tokens'])}"
+                    )
+                if abs(row["cost_usd"] - tab["totals"]["cost_usd"]) > 1e-6:
+                    mismatches.append(
+                        f"{row['ws']} cost_usd: overview row shows {row['cost_usd']:.6f}, "
+                        f"tab shows {tab['totals']['cost_usd']:.6f}"
+                    )
+            return {
+                "now": now,
+                "since": roll["since"],
+                "until": roll["until"],
+                "all": {
+                    "live_agents": all_counts["live_agents"],
+                    "finished_in_range": all_counts["finished_in_range"],
+                    "finished_today": all_counts["finished_today"],
+                    "tokens": _billed_total(all_totals["tokens"]),
+                    "cost_usd": all_totals["cost_usd"],
+                },
+                "rows": roll["rows"],
+                "unassigned": roll["unassigned"],
+                "mismatches": mismatches,
+            }
+
+    def _shown_locked(self, now: float) -> tuple[list, dict]:
+        """All run views with child chats folded away and launch echoes dropped. Caller holds the lock."""
+        raw, usage, parents = self._scoped_usage()
+        context = self._context_by_run()
+        rss = self._rss_maps(now)
+        views = [self._run_view(row, now, usage, rss, context) for row in raw]
+        shown = _drop_launch_echoes([view for view in views if view["run_id"] not in parents])
+        return shown, parents
+
+    def _summarize_locked(self, shown_all: list, parents: dict, now: float, since, until) -> dict:
+        """Counts, totals, and per-workstream rows from one run list. Caller holds the lock.
+
+        Token and cost sums come from the same hourly usage buckets ``/api/usage``
+        reads, counting a bucket when its hour overlaps ``[since, until]``. The
+        tokens tile and the tokens-per-hour chart legend sum the same cells, so
+        all three agree exactly.
+        """
+        range_since = now - RANGE_S if since is None else float(since)
+        range_until = float(now if until is None else until)
+        cells = self.query_usage("workstream", "hour", None, range_since, range_until)
+        buckets: dict[str, list] = {}
+        for cell in cells:
+            buckets.setdefault(cell["key"], []).append(cell)
+        scopes: dict[str, dict] = {}
+        scopes["all"] = _scope_numbers(
+            shown_all, parents, self._usage_by_run(), now, since, until, range_since, range_until,
+            [cell for group in buckets.values() for cell in group],
+        )
+        workstreams = sorted({run.get("workstream") or UNASSIGNED for run in shown_all}, key=_ws_sort)
+        if UNASSIGNED not in workstreams:
+            workstreams.append(UNASSIGNED)
+        for ws in workstreams:
+            members = [run for run in shown_all if (run.get("workstream") or UNASSIGNED) == ws]
+            scopes[ws] = _scope_numbers(
+                members, parents, self._usage_by_run(), now, since, until, range_since, range_until,
+                buckets.get(ws, []),
+            )
+        rows = [_ws_row(ws, scopes[ws]) for ws in workstreams if ws != UNASSIGNED]
+        unassigned = _ws_row(UNASSIGNED, scopes[UNASSIGNED])
+        return {
+            "since": range_since,
+            "until": range_until,
+            "all": scopes["all"],
+            "scopes": scopes,
+            "rows": rows,
+            "unassigned": unassigned,
+            "has_unassigned": bool(scopes[UNASSIGNED]["runs"]),
+        }
 
     def query_runs(self, now: float, ws: str | None, since: float | None, until: float | None, limit: int) -> list:
         with self._lock:
@@ -609,27 +720,40 @@ class Store:
         rows.sort(key=lambda run: run["started_at"] or 0)
         return rows[:limit]
 
-    def query_usage(self, group: str, bucket: str, ws: str | None, since: float | None) -> list:
+    def query_usage(
+        self,
+        group: str,
+        bucket: str,
+        ws: str | None,
+        since: float | None,
+        until: float | None = None,
+    ) -> list:
         with self._lock:
             sql = """SELECT hour_ts, model, workstream, tool, input_tokens, output_tokens,
-                            cache_read, cache_write, missing, cost_usd FROM usage_buckets"""
+                            cache_read, cache_write, reasoning, missing, cost_usd FROM usage_buckets"""
             args: list = []
+            clauses: list = []
             if since is not None:
-                sql += " WHERE hour_ts + 3600 > ?"
+                clauses.append("hour_ts + 3600 > ?")
                 args.append(since)
+            if until is not None:
+                clauses.append("hour_ts < ?")
+                args.append(until)
+            if clauses:
+                sql += " WHERE " + " AND ".join(clauses)
             stored = self._conn.execute(sql, args).fetchall()
         cells: dict = {}
         for row in stored:
             if "tool" in row.keys() and row["tool"] == _ESTIMATE_TOOL:
                 continue
-            if ws and ws != "all" and (row["workstream"] or None) != ws:
+            if ws and ws != "all" and (row["workstream"] or UNASSIGNED) != ws:
                 continue
             if group == "model":
                 key = model_key(row["model"], row["tool"])[1]
             elif group == "family":
                 key = series_key(row["model"])
             elif group == "workstream":
-                key = row["workstream"] or None
+                key = row["workstream"] or UNASSIGNED
             else:
                 key = row["tool"] or None
             start = int(row["hour_ts"] // 86400) * 86400 if bucket == "day" else row["hour_ts"]
@@ -642,6 +766,7 @@ class Store:
                     "output": 0,
                     "cache_read": 0,
                     "cache_write": 0,
+                    "reasoning": 0,
                     "cost_usd": 0.0,
                     "priced": False,
                     "gap": False,
@@ -652,6 +777,7 @@ class Store:
             cell["output"] += row["output_tokens"] or 0
             cell["cache_read"] += row["cache_read"] or 0
             cell["cache_write"] += row["cache_write"] or 0
+            cell["reasoning"] += row["reasoning"] or 0
             present = any(row[name] for name in ("input_tokens", "output_tokens", "cache_read", "cache_write"))
             if row["missing"] or (row["cost_usd"] is None and present):
                 cell["gap"] = True
@@ -670,12 +796,13 @@ class Store:
                     "output": cell["output"],
                     "cache_read": cell["cache_read"],
                     "cache_write": cell["cache_write"],
+                    "reasoning": cell["reasoning"],
                     "cost_usd": cost,
                     "priced_cost_usd": _money(cell["cost_usd"]) if cell["priced"] else None,
                     "unpriced_tokens": cell["unpriced_tokens"],
                 }
             )
-        out.sort(key=lambda item: (item["t"], item["key"] or ""))
+        out.sort(key=lambda item: (item["t"], str(item["key"] or "")))
         return out
 
     def query_concurrency(self, now: float, ws: str | None, since: float, step: float) -> list:
@@ -745,43 +872,73 @@ class Store:
         out.sort(key=lambda item: item["started_at"] or 0, reverse=True)
         return out
 
-    def query_workstreams(self, plan_ws: set[str]) -> list:
+    def query_workstreams(
+        self,
+        plan_ws: set[str],
+        since: float | None = None,
+        until: float | None = None,
+        now: float | None = None,
+    ) -> list:
+        """One row per workstream from the shared rollup: same agent rule, window,
+        and bucket attribution as the snapshot. Hub issue counts (``tk``) ride along
+        as issue counts; they are never plan progress."""
+        import time as _time
+
+        now = float(now if now is not None else _time.time())
         with self._lock:
             counts = [dict(row) for row in self._conn.execute("SELECT * FROM ws_counts").fetchall()]
-            raw, usage, parents = self._scoped_usage()
-            runs = [row for row in raw if row["run_id"] not in parents]
-        by_ws = {row["ws"]: row for row in counts}
-        for run in runs:
-            if run["workstream"] and run["workstream"] not in by_ws:
-                by_ws[run["workstream"]] = {"ws": run["workstream"], "name": ""}
+            shown_all, parents = self._shown_locked(now)
+            roll = self._summarize_locked(shown_all, parents, now, since, until)
+        boards = {row["ws"]: row for row in counts}
+        seen = set()
         out = []
-        for ws, row in by_ws.items():
-            members = [run for run in runs if run["workstream"] == ws]
-            tokens = 0
-            costs = []
-            any_tokens = False
-            running = 0
-            for run in members:
-                if run["status"] == "running":
-                    running += 1
-                folded, cost, _unpriced = usage.get(run["run_id"], ({}, 0.0, False))
-                for key in BILLED_FIELDS:
-                    value = folded.get(key)
-                    if value:
-                        tokens += value
-                        any_tokens = True
-                costs.append(cost)
-            tk = {key: int(row.get(key) or 0) for key in WS_STATUSES}
-            cost_usd = _sum_costs(costs, any_tokens)
+        for row in roll["rows"]:
+            seen.add(row["ws"])
+            board = boards.get(row["ws"], {})
+            out.append(
+                {
+                    "ws": row["ws"],
+                    "name": board.get("name") or "",
+                    "tk": {key: int(board.get(key) or 0) for key in WS_STATUSES},
+                    "live_agents": row["live_agents"],
+                    "finished_in_range": row["finished_in_range"],
+                    "finished_today": row["finished_today"],
+                    "tokens": row["tokens"],
+                    "cost_usd": row["cost_usd"],
+                    "last_activity": row["last_activity"],
+                    "plan": row["ws"] in plan_ws,
+                }
+            )
+        for ws in sorted(set(boards) - seen, key=_ws_sort):
+            board = boards[ws]
             out.append(
                 {
                     "ws": ws,
-                    "name": row.get("name") or "",
-                    "tk": tk,
-                    "running": running,
-                    "tokens": tokens,
-                    "cost_usd": _money(cost_usd) if cost_usd is not None else None,
+                    "name": board.get("name") or "",
+                    "tk": {key: int(board.get(key) or 0) for key in WS_STATUSES},
+                    "live_agents": 0,
+                    "finished_in_range": 0,
+                    "finished_today": 0,
+                    "tokens": 0,
+                    "cost_usd": 0.0,
+                    "last_activity": None,
                     "plan": ws in plan_ws,
+                }
+            )
+        if roll["has_unassigned"]:
+            row = roll["unassigned"]
+            out.append(
+                {
+                    "ws": row["ws"],
+                    "name": "Unassigned",
+                    "tk": {key: 0 for key in WS_STATUSES},
+                    "live_agents": row["live_agents"],
+                    "finished_in_range": row["finished_in_range"],
+                    "finished_today": row["finished_today"],
+                    "tokens": row["tokens"],
+                    "cost_usd": row["cost_usd"],
+                    "last_activity": row["last_activity"],
+                    "plan": False,
                 }
             )
         out.sort(key=lambda item: _ws_sort(item["ws"]))
@@ -1186,35 +1343,6 @@ class Store:
             "context_tokens": None if not context or data["run_id"] not in context else context[data["run_id"]],
         }
 
-    def _alerts(self, runs: list, now: float, long_running_s: dict) -> list:
-        alerts = []
-        for run in runs:
-            if run["status"] in ("died_early", "killed") and run["ended_at"] is not None and run["ended_at"] >= now - RECENT_S:
-                alerts.append(
-                    {
-                        "kind": run["status"],
-                        "run_id": run["run_id"],
-                        "label": run["label"],
-                        "detail": "run died early" if run["status"] == "died_early" else "run was killed",
-                        "ts": run["ended_at"],
-                    }
-                )
-            limit = _long_cap(run.get("tier"), long_running_s)
-            elapsed = run.get("elapsed_s")
-            if run["status"] == "running" and limit is not None and elapsed is not None and elapsed > limit:
-                alerts.append(
-                    {
-                        "kind": "long_running",
-                        "run_id": run["run_id"],
-                        "label": run["label"],
-                        "detail": f"elapsed {int(elapsed)}s exceeds {run.get('tier')} limit {limit}s",
-                        "ts": now,
-                    }
-                )
-        alerts.sort(key=lambda item: item["ts"] or 0, reverse=True)
-        return alerts[:200]
-
-
 def _hour(ts: float) -> int:
     return int(ts // 3600) * 3600
 
@@ -1293,13 +1421,105 @@ def _elapsed(run: dict, now: float):
 def _in_ws(run: dict, ws: str | None) -> bool:
     if not ws or ws == "all":
         return True
+    if ws == UNASSIGNED:
+        return not run.get("workstream")
     return run.get("workstream") == ws
 
 
-def _long_cap(tier: str | None, table: dict):
-    if not tier:
-        return None
-    return table.get(str(tier).lower())
+def _billed_total(tokens: dict) -> int:
+    return sum((tokens or {}).get(key) or 0 for key in BILLED_FIELDS)
+
+
+def _run_overlaps_window(run: dict, since: float, until: float, now: float) -> bool:
+    """Same overlap rule as the run list: a run with no end time is still open."""
+    if (run.get("ended_at") if run.get("ended_at") is not None else now) < since:
+        return False
+    return (run.get("started_at") or 0) <= until
+
+
+def _scope_numbers(
+    runs: list,
+    parents: dict,
+    usage: dict,
+    now: float,
+    since,
+    until,
+    range_since: float,
+    range_until: float,
+    cells: list,
+) -> dict:
+    """Counts and totals for one scope (all, one workstream, or unassigned).
+
+    Counts use the agent rule (lead sessions and Dagster jobs are not agents)
+    and the window. Token and cost sums add up the ``/api/usage`` cells for the
+    same window, so the snapshot, the tiles, and the chart legend agree.
+    """
+    counts = _agent_counts(runs, parents, now, since, until)
+    tokens = {key: 0 for key in TOKEN_FIELDS}
+    for cell in cells:
+        for key in TOKEN_FIELDS:
+            tokens[key] += cell.get(key) or 0
+    priced = [
+        cell["priced_cost_usd"] if cell["priced_cost_usd"] is not None else cell["cost_usd"]
+        for cell in cells
+    ]
+    priced = [value for value in priced if value is not None]
+    unpriced_runs = sum(
+        1
+        for run in runs
+        if _run_overlaps_window(run, range_since, range_until, now)
+        and _usage_unpriced(usage.get(run["run_id"]))
+    )
+    return {
+        "runs": runs,
+        "counts": counts,
+        "totals": {
+            "tokens": tokens,
+            "cost_usd": _money(sum(priced)) if priced else 0.0,
+            "unpriced_runs": unpriced_runs,
+        },
+    }
+
+
+def _usage_unpriced(entry) -> bool:
+    return bool(entry) and bool(entry[2])
+
+
+def _ws_row(ws: str, scope: dict) -> dict:
+    last = 0
+    for run in scope["runs"]:
+        for stamp in (run.get("ended_at"), run.get("started_at")):
+            if stamp and stamp > last:
+                last = stamp
+    return {
+        "ws": ws,
+        "live_agents": scope["counts"]["live_agents"],
+        "finished_in_range": scope["counts"]["finished_in_range"],
+        "finished_today": scope["counts"]["finished_today"],
+        "tokens": _billed_total(scope["totals"]["tokens"]),
+        "cost_usd": scope["totals"]["cost_usd"],
+        "last_activity": last or None,
+    }
+
+
+def _empty_scope() -> dict:
+    return {
+        "runs": [],
+        "counts": {
+            "live_agents": 0,
+            "live_by_tool": {key: 0 for key in TOOL_KEYS},
+            "live_by_model": {},
+            "prod_jobs": 0,
+            "finished_today": 0,
+            "finished_in_range": 0,
+            "finished_by_verdict": {},
+        },
+        "totals": {
+            "tokens": {key: 0 for key in TOKEN_FIELDS},
+            "cost_usd": 0.0,
+            "unpriced_runs": 0,
+        },
+    }
 
 
 def _tool_key(run: dict) -> str | None:
@@ -1603,66 +1823,6 @@ def _active(run: dict, t: float, now: float) -> bool:
     if end is None:
         return False
     return t < end
-
-
-def _totals(runs: list) -> dict:
-    tokens = {key: 0 for key in TOKEN_FIELDS}
-    cost = 0.0
-    any_cost = False
-    unpriced = 0
-    for run in runs:
-        if run.get("source") == "dagster":
-            continue
-        for key in BILLED_FIELDS:
-            tokens[key] += (run.get("tokens") or {}).get(key) or 0
-        if run.get("cost_usd") is None:
-            unpriced += 1
-        else:
-            cost += run["cost_usd"] or 0
-            any_cost = True
-    return {
-        "tokens": {key: tokens[key] for key in ("input", "output", "cache_read", "cache_write", "reasoning")},
-        "cost_usd": _money(cost) if any_cost or not unpriced else 0.0,
-        "unpriced_runs": unpriced,
-    }
-
-
-def _by_workstream(runs: list) -> list:
-    groups: dict = {}
-    for run in runs:
-        ws = run.get("workstream")
-        if not ws:
-            continue
-        group = groups.setdefault(
-            ws,
-            {"ws": ws, "running": 0, "done": 0, "tokens": 0, "cost": 0.0, "priced": False, "last_activity": 0},
-        )
-        if run["status"] == "running":
-            group["running"] += 1
-        if run["status"] == "done":
-            group["done"] += 1
-        for key in BILLED_FIELDS:
-            group["tokens"] += (run.get("tokens") or {}).get(key) or 0
-        if run.get("cost_usd"):
-            group["cost"] += run["cost_usd"]
-            group["priced"] = True
-        for stamp in (run.get("ended_at"), run.get("started_at")):
-            if stamp and stamp > group["last_activity"]:
-                group["last_activity"] = stamp
-    out = []
-    for group in groups.values():
-        out.append(
-            {
-                "ws": group["ws"],
-                "running": group["running"],
-                "done": group["done"],
-                "tokens": group["tokens"],
-                "cost_usd": _money(group["cost"]) if group["priced"] else 0.0,
-                "last_activity": group["last_activity"] or None,
-            }
-        )
-    out.sort(key=lambda item: _ws_sort(item["ws"]))
-    return out
 
 
 def _sum_costs(costs: list, any_tokens: bool):

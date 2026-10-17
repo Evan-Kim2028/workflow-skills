@@ -19,7 +19,7 @@ from dash.pricing import reprice as reprice_usage
 from dash.server import DashServer
 from dash.sources import Registry
 from dash.sources.process import reconcile_running
-from dash.store import DEFAULT_LONG_RUNNING_S, Store
+from dash.store import Store
 
 ROOT = Path(__file__).resolve().parent
 STATE_DIR = Path.home() / ".local" / "share" / "agent-dash"
@@ -39,6 +39,7 @@ USAGE = """agent-dash: local read-only execution dashboard
   python3 agent_dash.py backfill --session <id>
   python3 agent_dash.py reprice
   python3 agent_dash.py reconcile
+  python3 agent_dash.py check [--url URL] [--hours N]
   python3 agent_dash.py ws list
   python3 agent_dash.py ws new <ID> "<title>"
   python3 agent_dash.py ws validate <ID>
@@ -59,7 +60,6 @@ def default_cfg() -> dict:
         "read_budget_per_file": per_file,
         "read_budget_per_tick": per_tick,
         "read_budget": {"per_file": per_file, "per_tick": per_tick},
-        "long_running_s": dict(DEFAULT_LONG_RUNNING_S),
         "roots": {
             "claude_projects": os.path.join(home, ".claude", "projects"),
             "claude_sessions": os.path.join(home, ".claude", "sessions"),
@@ -205,6 +205,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_reprice()
     if cmd == "reconcile":
         return cmd_reconcile()
+    if cmd == "check":
+        return cmd_check(args[1:])
     print(USAGE, end="", file=sys.stderr)
     return 2
 
@@ -318,6 +320,64 @@ def cmd_reconcile() -> int:
     finally:
         store.close()
     print(f"reconcile ended {ended}")
+    return 0
+
+
+def cmd_check(argv: list[str]) -> int:
+    """Ask a running dashboard for GET /api/reconcile, print the table, exit 1 on any mismatch."""
+    import urllib.error
+    import urllib.request
+
+    url = URL
+    hours = 12.0
+    rest = list(argv)
+    while rest:
+        flag = rest.pop(0)
+        if flag == "--url" and rest:
+            url = rest.pop(0).rstrip("/")
+        elif flag == "--hours" and rest:
+            try:
+                hours = float(rest.pop(0))
+            except ValueError:
+                print("check requires --hours N", file=sys.stderr)
+                return 2
+            if hours <= 0:
+                print("check requires --hours N", file=sys.stderr)
+                return 2
+        else:
+            print(USAGE, end="", file=sys.stderr)
+            return 2
+    try:
+        with urllib.request.urlopen(f"{url}/api/reconcile?hours={hours:g}", timeout=15) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        print(f"check failed: {exc}", file=sys.stderr)
+        return 2
+    rows = payload.get("rows", [])
+    unassigned = payload.get("unassigned") or {}
+    everything = list(rows) + ([unassigned] if unassigned else [])
+    width = max([len(str(row.get("ws", ""))) for row in everything] + [10])
+    head = f"{'workstream':<{width}} {'live':>6} {'fin':>6} {'tokens':>14} {'cost_usd':>12}"
+    print(f"reconcile {hours:g}h window (since {int(payload.get('since', 0))} until {int(payload.get('until', 0))})")
+    print(head)
+    for row in everything:
+        mark = "*" if row.get("ws") == "unassigned" else " "
+        print(
+            f"{mark}{str(row.get('ws', '')):<{width}} "
+            f"{int(row.get('live_agents', 0)):>6} "
+            f"{int(row.get('finished_in_range', 0)):>6} "
+            f"{int(row.get('tokens', 0)):>14} "
+            f"{float(row.get('cost_usd', 0.0)):>12.2f}"
+        )
+    everything_total = sum(int(row.get("tokens", 0)) for row in everything)
+    print(f"rows sum tokens {everything_total}")
+    mismatches = payload.get("mismatches", [])
+    if mismatches:
+        print("MISMATCHES:")
+        for item in mismatches:
+            print(f"  - {item}")
+        return 1
+    print(f"ok: {len(rows)} workstreams reconcile, no mismatches")
     return 0
 
 

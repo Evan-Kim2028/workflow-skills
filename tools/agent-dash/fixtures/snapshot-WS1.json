@@ -430,15 +430,6 @@
       "cost_usd": 0.0087
     }
   ],
-  "alerts": [
-    {
-      "kind": "died_early",
-      "run_id": "glm:00000000-0000-0000-0000-000000000334:ws1-4:34",
-      "label": "ws1-4",
-      "detail": "empty stdout and a non-empty stderr",
-      "ts": 1761996560
-    }
-  ],
   "totals": {
     "tokens": {
       "input": 104760,
@@ -453,8 +444,9 @@
   "by_workstream": [
     {
       "ws": "WS1",
-      "running": 3,
-      "done": 55,
+      "live_agents": 2,
+      "finished_in_range": 36,
+      "finished_today": 36,
       "tokens": 436889,
       "cost_usd": 2.0176,
       "last_activity": 1761999840

@@ -83,9 +83,6 @@ tr.clk{cursor:pointer}tr.clk:hover td{background:var(--surface-2)}
 .meter .fill{position:absolute;left:0;top:0;bottom:0;border-radius:3px}
 .meter .cap{position:absolute;top:-3px;bottom:-3px;border-left:2px dashed var(--ink)}
 .meter .n{text-align:right;font:12px var(--mono)}
-.alert{display:flex;gap:10px;align-items:flex-start;padding:7px 0;border-bottom:1px solid var(--grid);font-size:13px}
-.alert .ic{font:700 11px var(--mono);padding:2px 6px;border-radius:4px;color:#fff;flex:0 0 auto}
-.alert .ic.died_early,.alert .ic.killed{background:var(--critical)}.alert .ic.long_running{background:var(--serious)}.alert .ic.over_cap{background:var(--warning);color:#0b0b0b}
 .empty{color:var(--muted);font-size:13px;padding:8px 0}
 .wsc{cursor:pointer}.wsc:hover{border-color:var(--s1)}
 .wsc .top{display:flex;justify-content:space-between;align-items:baseline}
@@ -354,7 +351,7 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
     return lg;
   }
   function colorOf(key, kind) {
-    if (kind === "workstream") { if (!key || key === "null" || key === "unattributed") return "var(--other)"; if (!wsColor[key]) wsColor[key] = WSCOL[Object.keys(wsColor).length % WSCOL.length]; return "var(" + wsColor[key] + ")"; }
+    if (kind === "workstream") { if (!key || key === "null" || key === "unassigned") return "var(--other)"; if (!wsColor[key]) wsColor[key] = WSCOL[Object.keys(wsColor).length % WSCOL.length]; return "var(" + wsColor[key] + ")"; }
     return ADM.colorOf(key);
   }
   /* axes() and the compact formatters live in format.js and are shared with the plan view. */
@@ -363,7 +360,7 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
   var NS = "http://www.w3.org/2000/svg";
   function s(tag, attrs) { var e = document.createElementNS(NS, tag); for (var k in attrs) e.setAttribute(k, attrs[k]); return e; }
 
-  var FIXMAP = {"/api/snapshot": "snapshot", "/api/runs": "runs", "/api/usage": "usage-model-hour", "/api/concurrency": "concurrency", "/api/sessions": "sessions", "/api/workstreams": "workstreams", "/api/health": "health"};
+  var FIXMAP = {"/api/snapshot": "snapshot", "/api/runs": "runs", "/api/usage": "usage-model-hour", "/api/concurrency": "concurrency", "/api/sessions": "sessions", "/api/workstreams": "workstreams", "/api/health": "health", "/api/reconcile": "reconcile"};
   function api(path, params) {
     var qs = new URLSearchParams(params || {}).toString();
     if (FIX) {
@@ -495,7 +492,7 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
       var key = String(w.ws).toUpperCase();
       if (seen[key]) return;
       seen[key] = 1;
-      rows.push({ws: w.ws, name: w.ws + (w.name ? " " + w.name : ""), running: w.running});
+      rows.push({ws: w.ws, name: w.ws + (w.name ? " " + w.name : ""), running: w.live_agents});
     });
     (state.bundles || []).forEach(function (b) {
       if (!b || b.kind === "program" || b.id === "OVERVIEW") return;
@@ -552,8 +549,7 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
     [["Agents live now", fmtN(cn.live_agents != null ? cn.live_agents : run.filter(isAgent).length), liveSub],
      ["Agents finished today", fmtN(cn.finished_today || 0), "\u2713 " + fmtN((fv.PASS || 0) + (fv.APPROVE || 0) + (fv.APPROVE_WITH_NITS || 0)) + " pass \u00B7 \u25D0 " + fmtN(part) + " partial \u00B7 \u2715 " + fmtN(bad) + " blocked (" + state.hours + " h)"],
      ["Tokens (" + state.hours + " h)", fmtN(allTok), cachedPct(tk) + "% cached \u00B7 out " + fmtN(tk.output)],
-     ["Est. cost (" + state.hours + " h)", anyCost ? fmtUsd(cost) : "\u2013", unpTxt],
-     ["Alerts", (snap.alerts || []).length, (snap.alerts || []).slice(0, 2).map(function (a) { return a.kind.replace("_", " "); }).join(" · ") || "none"]
+     ["Est. cost (" + state.hours + " h)", anyCost ? fmtUsd(cost) : "\u2013", unpTxt]
     ].forEach(function (t) { g.appendChild(el("div", {class: "card tile"}, [el("div", {class: "v", text: String(t[1])}), el("div", {class: "l", text: t[0]}), el("div", {class: "x", text: t[2]})])); });
     return g;
   }
@@ -585,14 +581,6 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
     return c;
   }
 
-  function alertsCard(snap) {
-    var c = el("div", {class: "card"}, [el("h2", {text: "Alerts"}), el("p", {class: "sub", text: "Runs that died early, were killed, or ran past their tier limit."})]);
-    var a = snap.alerts || [];
-    if (!a.length) c.appendChild(el("div", {class: "empty", text: "Nothing needs attention."}));
-    a.slice(0, 12).forEach(function (x) { c.appendChild(el("div", {class: "alert"}, [el("span", {class: "ic " + x.kind, text: x.kind.replace("_", " ")}), el("div", null, [el("span", {class: "lbl", text: x.label || x.run_id}), el("div", {style: "color:var(--ink-2);font-size:12.5px", text: x.detail || ""})])])); });
-    return c;
-  }
-
   /* stacked bars: tokens per hour */
   function tokenChart() {
     var c = el("div", {class: "card", id: "exec-tokens", "data-nav": "Tokens per hour"});
@@ -606,7 +594,7 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
     if (!B.length) { c.appendChild(el("div", {class: "empty", text: "No usage in this window."})); return c; }
     var byModel = state.groupBy === "model";
     var hours = {}, keys = {};
-    B.forEach(function (b) { var k = state.groupBy === "model" ? modelKey(b.key) : (b.key || "unattributed"); var tot = (b.input || 0) + (b.output || 0) + (b.cache_read || 0) + (b.cache_write || 0); hours[b.t] = hours[b.t] || {}; hours[b.t][k] = (hours[b.t][k] || 0) + tot; keys[k] = 1; });
+    B.forEach(function (b) { var k = state.groupBy === "model" ? modelKey(b.key) : (b.key || "unassigned"); var tot = (b.input || 0) + (b.output || 0) + (b.cache_read || 0) + (b.cache_write || 0); hours[b.t] = hours[b.t] || {}; hours[b.t][k] = (hours[b.t][k] || 0) + tot; keys[k] = 1; });
     var ks = byModel ? ADM.sortKeys(Object.keys(keys)) : Object.keys(keys).sort();
     var ts = Object.keys(hours).map(Number).sort(function (a, b) { return a - b; });
     var max = 0; ts.forEach(function (t) { var sum = 0; ks.forEach(function (k) { sum += hours[t][k] || 0; }); max = Math.max(max, sum); });
@@ -807,25 +795,30 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
 
   /* workstream cards */
   var planSum = {}, planPrompt = {};
+  /* Plan progress is computed once on the server (/api/plan progress object);
+     the page only reads progress.pct, progress.done and progress.total. */
+  function planProg(w, p) {
+    var pr = (p && p.progress) || {done: 0, total: 0, counts: {}, pct: 0};
+    pr.counts = pr.counts || {};
+    return pr;
+  }
   function loadPlanSums() {
     return Promise.all(shown(state.wss).map(function (w) {
       return api("/api/plan", {ws: w.ws}).then(function (p) {
-        var c = {done: 0, wip: 0, prog: 0, pr: 0, todo: 0, deferred: 0};
-        (p && p.groups || []).forEach(function (g) { g.tasks.forEach(function (t) { var k = t.status || "todo"; c[k] = (c[k] || 0) + 1; }); });
-        planSum[w.ws] = c; planPrompt[w.ws] = p && p.start_prompt;
+        planSum[w.ws] = planProg(w, p); planPrompt[w.ws] = p && p.start_prompt;
       }).catch(function () {});
     }));
   }
-  /* "Where we are": one row per workstream with status, % done from plan.json, live agents and quick actions. Top of both Overview pages. */
+  /* "Where we are": one row per workstream with status, % done from its plan, live agents and quick actions. Top of both Overview pages. */
   function programPanel() {
     var c = el("div", {class: "card program", "data-nav": "Where we are"});
     c.appendChild(el("div", {class: "prog-h"}, [el("h2", {text: "Where we are"}), el("span", {class: "sub", text: "Every workstream's plan, live. % done counts merged tasks; deferred tasks are left out."})]));
     var all = {done: 0, tot: 0};
     shown(state.wss).forEach(function (w) {
-      var pc = planSum[w.ws]; if (!pc) return;
-      var tot = pc.done + (pc.wip || 0) + pc.prog + pc.pr + pc.todo, pct = tot ? Math.round(100 * pc.done / tot) : 0;
-      all.done += pc.done; all.tot += tot;
-      var st = tot && pc.done === tot ? ["done", "Done \u2713"] : (pc.done + (pc.wip || 0) + pc.prog + pc.pr || w.running) ? ["active", "In progress"] : ["todo", "Not started"];
+      var pr = planSum[w.ws]; if (!pr) return;
+      var pc = pr.counts, tot = pr.total, pct = pr.pct;
+      all.done += pr.done; all.tot += tot;
+      var st = tot && pr.done === tot ? ["done", "Done \u2713"] : (pr.done + (pc.wip || 0) + (pc.prog || 0) + (pc.pr || 0) || w.live_agents) ? ["active", "In progress"] : ["todo", "Not started"];
       var row = el("div", {class: "prog-row s-" + st[0]});
       row.appendChild(el("div", {class: "prog-name"}, [el("b", {text: w.ws}), el("span", {text: w.name || ""})]));
       row.appendChild(el("span", {class: "prog-pill " + st[0], text: st[1]}));
@@ -833,7 +826,7 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
       [["done", "var(--good)"], ["prog", "var(--s5)"], ["pr", "var(--warning)"]].forEach(function (p) { if (!pc[p[0]] || !tot) return; var sp = el("span"); sp.style.width = (100 * pc[p[0]] / tot) + "%"; sp.style.background = p[1]; bar.appendChild(sp); });
       row.appendChild(bar);
       row.appendChild(el("b", {class: "prog-pct", text: pct + "%"}));
-      row.appendChild(el("span", {class: "prog-meta", text: pc.done + "/" + tot + " tasks" + (pc.wip ? " \u00B7 " + pc.wip + " in progress" : "") + (pc.prog ? " \u00B7 " + pc.prog + " on prod" : "") + (pc.pr ? " \u00B7 " + pc.pr + " to merge" : "") + (w.running ? " \u00B7 \u25CF " + w.running + " live" : "")}));
+      row.appendChild(el("span", {class: "prog-meta", text: pr.done + "/" + tot + " tasks" + (pc.wip ? " \u00B7 " + pc.wip + " in progress" : "") + (pc.prog ? " \u00B7 " + pc.prog + " on prod" : "") + (pc.pr ? " \u00B7 " + pc.pr + " to merge" : "") + (w.live_agents ? " \u00B7 \u25CF " + w.live_agents + " live" : "")}));
       var acts = el("div", {class: "prog-acts"});
       var bp = el("button", {text: "Plan"}); bp.addEventListener("click", function () { openPlan(w.ws); }); acts.appendChild(bp);
       var bl = el("button", {text: "Live"}); bl.addEventListener("click", function () { if (window.DashNav) window.DashNav.openExec(w.ws); }); acts.appendChild(bl);
@@ -841,7 +834,7 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
       row.appendChild(acts);
       c.appendChild(row);
     });
-    if (all.tot) c.insertBefore(el("div", {class: "prog-total", text: "Overall: " + Math.round(100 * all.done / all.tot) + "% done \u00B7 " + all.done + " of " + all.tot + " tasks across " + Object.keys(planSum).length + " workstreams"}), c.children[1]);
+    if (all.tot) c.insertBefore(el("div", {class: "prog-total", text: "Overall: " + all.done + " of " + all.tot + " tasks done across " + Object.keys(planSum).length + " workstreams"}), c.children[1]);
     if (!Object.keys(planSum).length) c.appendChild(el("div", {class: "skel"}));
     return c;
   }
@@ -852,20 +845,27 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
     go2();
     clearInterval(window.__adProgT); window.__adProgT = setInterval(function () { if (document.body.contains(host)) go2(); else clearInterval(window.__adProgT); }, 30000);
   }};
+  function wsCard(id, name, live, tokens, cost, pr, clickable) {
+    var pc = (pr && pr.counts) || {}, tot = (pr && pr.total) || 0, pct = (pr && pr.pct) || 0, done = (pr && pr.done) || 0;
+    var attrs = {class: "card wsc"};
+    if (clickable) attrs.onclick = function () { go(id); };
+    var card = el("div", attrs);
+    var top = el("div", {class: "top"}, [el("span", {class: "id", text: id}), el("span", {class: "st " + (live ? "running" : "done")}, [el("i"), live ? live + " running" : "idle"])]);
+    card.appendChild(top); card.appendChild(el("div", {style: "font-size:13px;color:var(--ink-2)", text: name || ""}));
+    var bar = el("div", {class: "bar", role: "img", "aria-label": done + " of " + tot + " plan tasks done"});
+    [["done", "var(--good)"], ["prog", "var(--s5)"], ["pr", "var(--warning)"]].forEach(function (p) { if (!pc[p[0]] || !tot) return; var sp = el("span"); sp.style.width = (100 * pc[p[0]] / tot) + "%"; sp.style.background = p[1]; bar.appendChild(sp); });
+    card.appendChild(bar);
+    card.appendChild(el("div", {style: "font:12px var(--mono);color:var(--muted)", title: "From the workstream plan: " + done + " done, " + (pc.prog || 0) + " merged waiting on prod, " + (pc.pr || 0) + " waiting to merge, " + (pc.todo || 0) + " not started" + (pc.deferred ? ", " + pc.deferred + " deferred (not counted)" : ""), text: done + "/" + tot + " tasks (" + pct + "%) \u00B7 " + fmtN(tokens) + " tok \u00B7 " + fmtUsd(cost)}));
+    return card;
+  }
   function wsCards() {
     var c = el("div", {class: "grid g-tiles"});
     shown(state.wss).forEach(function (w) {
-      var pc = planSum[w.ws] || {done: 0, prog: 0, pr: 0, todo: 0, deferred: 0};
-      var tot = pc.done + pc.prog + pc.pr + pc.todo;
-      var card = el("div", {class: "card wsc", onclick: function () { go(w.ws); }});
-      var top = el("div", {class: "top"}, [el("span", {class: "id", text: w.ws}), el("span", {class: "st " + (w.running ? "running" : "done")}, [el("i"), w.running ? w.running + " running" : "idle"])]);
-      card.appendChild(top); card.appendChild(el("div", {style: "font-size:13px;color:var(--ink-2)", text: w.name || ""}));
-      var bar = el("div", {class: "bar", role: "img", "aria-label": pc.done + " of " + tot + " plan tasks done"});
-      [["done", "var(--good)"], ["prog", "var(--s5)"], ["pr", "var(--warning)"]].forEach(function (p) { if (!pc[p[0]] || !tot) return; var sp = el("span"); sp.style.width = (100 * pc[p[0]] / tot) + "%"; sp.style.background = p[1]; bar.appendChild(sp); });
-      card.appendChild(bar);
-      var pct = tot ? Math.round(100 * pc.done / tot) : 0;
-      card.appendChild(el("div", {style: "font:12px var(--mono);color:var(--muted)", title: "From the workstream plan (plan.json): " + pc.done + " done, " + pc.prog + " merged waiting on prod, " + pc.pr + " waiting to merge, " + pc.todo + " not started" + (pc.deferred ? ", " + pc.deferred + " deferred (not counted)" : ""), text: pc.done + "/" + tot + " tasks (" + pct + "%) \u00B7 " + fmtN(w.tokens) + " tok \u00B7 " + fmtUsd(w.cost_usd)}));
-      c.appendChild(card);
+      c.appendChild(wsCard(w.ws, w.name, w.live_agents, w.tokens, w.cost_usd, planSum[w.ws], true));
+    });
+    /* Runs with no workstream: the overview total visibly equals the sum. */
+    (state.wss || []).forEach(function (w) {
+      if (w.ws === "unassigned") c.appendChild(wsCard("Unassigned", "runs with no workstream", w.live_agents, w.tokens, w.cost_usd, null, false));
     });
     return c;
   }
@@ -937,7 +937,7 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
       c.appendChild(wn);
     }
     if (unassigned.length) { var ua = el("div", {class: "unassigned"}, [el("b", {style: "font-size:12px;color:var(--ink-2)", text: "Running, not mapped to a task:"})]); unassigned.forEach(function (r) { var sp = el("span", {title: (r.tier || "") + " · " + fmtDur(r.elapsed_s), text: r.label || r.run_id}); sp.style.borderColor = colorOf(tierKey(r)); ua.appendChild(sp); }); c.appendChild(ua); }
-    var tot = {done: 0, wip: 0, prog: 0, pr: 0, todo: 0, deferred: 0}, gs = {}, colStat = {};
+    var gs = {}, colStat = {};
     var trains = (plan.trains || []).filter(function (t) { return t && typeof t === "object"; });
     var trainOf = {};
     trains.forEach(function (t, i) { ((t.members) || []).forEach(function (m) { trainOf[m] = {train: t, slot: (i % 8) + 1}; }); });
@@ -984,7 +984,7 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
         ch.appendChild(cp); }); 
       if (gLive) { n.insertBefore(el("div", {class: "live-n", text: "\u25CF " + gLive + " agent" + (gLive > 1 ? "s" : "") + " working"}), n.children[2]); n.classList.add("s-live"); }
       n.appendChild(ch);
-      cols[g.col].appendChild(n); nodes[g.id] = n; ["done", "wip", "prog", "pr", "todo", "deferred"].forEach(function (k) { tot[k] += cnt[k] || 0; });
+      cols[g.col].appendChild(n); nodes[g.id] = n;
       gs[g.id] = {done: live > 0 && cnt.done === live, started: cnt.done + cnt.wip + cnt.prog + cnt.pr > 0, active: gLive > 0 || cnt.wip + cnt.prog + cnt.pr > 0, col: g.col, cnt: cnt, live: gLive, title: g.title};
       colStat[g.col] = colStat[g.col] || {done: 0, tot: 0, now: false}; colStat[g.col].done += cnt.done; colStat[g.col].tot += live;
     });
@@ -1005,14 +1005,16 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
       n.insertBefore(el("span", {class: "gtag " + cls, title: why, text: stage}), n.firstChild);
     });
     cols.forEach(function (d, i) { var cs = colStat[i]; if (!cs) return; var mb = el("div", {class: "colbar", title: cs.done + " of " + cs.tot + " done in this phase"}); var f = el("i"); f.style.width = (cs.tot ? 100 * cs.done / cs.tot : 0) + "%"; mb.appendChild(f); d.insertBefore(mb, d.children[1]); if (cs.now) d.classList.add("c-now"); });
-    var all = tot.done + tot.wip + tot.prog + tot.pr + tot.todo;
+    /* Overall progress comes from the server progress object, never recomputed here. */
+    var pprog = plan.progress || {done: 0, total: 0, counts: {}, pct: 0};
+    pprog.counts = pprog.counts || {};
+    var all = pprog.total, pct = pprog.pct, tot = pprog.counts;
     var lg = el("div", {class: "plegend"});
     [["live", "agent working now"], ["wip", "in progress (branch, not merged)"], ["pr", "waiting to merge (approved or PR open)"], ["prog", "merged, waiting on a prod step"], ["done", "done"], ["just", "finished in the last 15 min"], ["todo", "not started"], ["deferred", "deferred or moved to another workstream"]].forEach(function (p) { var ch2 = el("span", {class: "chip " + (p[0] === "just" ? "done just" : p[0])}, [p[0] === "live" ? "\u25CF" : p[0] === "todo" ? "\u00B7" : "\u2009"]); lg.appendChild(el("span", {style: "display:inline-flex;align-items:center;gap:6px"}, [ch2, p[1]])); });
     legendPop.appendChild(lg);
     legendPop.appendChild(el("p", {text: "The badge on a working chip is the model family and how many agents are on it. \u21BBN counts the agent runs on a task in this range (an amber edge means it was sent back twice or more). Arrows between tiles show which stage waits on which; hover a tile to light up its chain. Hover a chip to see the tasks it waits on (amber) and unblocks (blue); click to pin the whole chain. Chips in a tile run left to right in the order they can start."}));
-    var pct = all ? Math.round(100 * tot.done / all) : 0;
     var ob = el("div", {class: "pbig"}), obBar = el("div", {class: "pbig-bar", role: "img", "aria-label": tot.done + " of " + all + " tasks done"});
-    [["done", "var(--good)"], ["prog", "var(--s5)"], ["pr", "var(--warning)"]].forEach(function (p) { var sp = el("span"); sp.style.background = p[1]; var pw0 = ((window.__adPrevBar || {})[plan.ws] || {})[p[0]]; sp.style.width = (pw0 == null ? 0 : pw0) + "%"; sp.dataset.w = all ? (100 * tot[p[0]] / all) : 0; sp.dataset.k = p[0]; obBar.appendChild(sp); });
+    [["done", "var(--good)"], ["prog", "var(--s5)"], ["pr", "var(--warning)"]].forEach(function (p) { var sp = el("span"); sp.style.background = p[1]; var pw0 = ((window.__adPrevBar || {})[plan.ws] || {})[p[0]]; sp.style.width = (pw0 == null ? 0 : pw0) + "%"; sp.dataset.w = all ? (100 * (tot[p[0]] || 0) / all) : 0; sp.dataset.k = p[0]; obBar.appendChild(sp); });
     var obPct = el("b", {class: "pbig-pct", text: "0%"});
     ob.appendChild(obPct); ob.appendChild(obBar);
     var nowCols = Object.keys(colStat).map(Number).filter(function (i) { return colStat[i].now; }).sort(function (a, b) { return a - b; });
@@ -1198,14 +1200,14 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
   function keyOf(v) { try { return JSON.stringify(v); } catch (e) { return String(Math.random()); } }
   function drawMain() {
     var m = document.getElementById("main");
-    var snap = state.snap || {running: [], recent: [], alerts: [], caps: {}, totals: {tokens: {}}};
+    var snap = state.snap || {running: [], recent: [], totals: {tokens: {}}};
     var scope = state.ws + "|" + state.hours + "|" + (window.innerWidth >> 5);
     if (m.dataset.scope !== scope || !m.querySelector("[data-sec]")) { m.innerHTML = ""; secCache = {}; m.dataset.scope = scope; m.classList.remove("fresh"); void m.offsetWidth; m.classList.add("fresh"); }
     var runRow = function (r) { return [r.run_id, r.status, r.verdict, r.out_bytes, r.tokens, r.context_tokens, Math.floor((r.elapsed_s || 0) / 15)]; };
     var specs = [];
     if (state.ws === "all" && state.wss.length) specs.push(["program", keyOf([state.wss.map(function (w) { return [w.ws, w.running, w.name]; }), planSum, planPrompt]), function () { return programPanel(); }, ""]);
     specs.push(
-      ["tiles", keyOf([snap.counts, snap.totals, (snap.alerts || []).length, state.usage, state.hours]), function () { return tiles(snap); }, state.ws === "all" ? "margin-top:14px" : ""],
+      ["tiles", keyOf([snap.counts, snap.totals, state.usage, state.hours]), function () { return tiles(snap); }, state.ws === "all" ? "margin-top:14px" : ""],
       ["running", keyOf((snap.running || []).map(runRow)), function () { return runsTable("Running now", "Click a row for details. Output \u25B2 means the out file grew since the last poll.", snap.running || [], "Nothing running."); }, "margin-top:14px"]
     );
     if (state.ws === "all" && state.wss.length && !Object.keys(planSum).length) loadPlanSums().then(function () { delete secCache.program; drawMain(); });
@@ -1235,8 +1237,23 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
   function loadUsage() { var p = Object.assign({group: state.ws === "all" ? state.groupBy : "model", bucket: "hour", since: since()}, wsParam()); return api("/api/usage", p).then(function (j) { state.usage = j.buckets || []; if (execCache[state.ws]) execCache[state.ws].usage = state.usage; }).catch(function () { state.usage = []; }); }
   function loadNav() {
     var bundlesP = fetch(FIX ? "../fixtures/bundles.json" : "/api/bundles", {cache: "no-store"}).then(function (r) { return r.ok ? r.json() : {bundles: []}; }).then(function (j) { state.bundles = j.bundles || []; }).catch(function () {});
-    var wsP = api("/api/workstreams").then(function (j) { state.wss = j.workstreams || []; }).catch(function () {});
+    var wsP = api("/api/workstreams", {since: since()}).then(function (j) { state.wss = j.workstreams || []; }).catch(function () {});
     return Promise.all([bundlesP, wsP]).then(function () { renderTabs(); });
+  }
+  /* Muted footer line: the reconcile check for this window. Status color always ships with a word and symbol. */
+  function refreshFoot() {
+    var foot = document.getElementById("foot");
+    if (!foot || state.view !== "exec" || state.ws !== "all") return;
+    api("/api/reconcile", {hours: state.hours}).then(function (j) {
+      if (state.view !== "exec" || state.ws !== "all") return;
+      var bad = (j.mismatches || [])[0], n = (j.rows || []).length;
+      var base = "Updated " + new Date().toLocaleTimeString() + (FIX ? " · fixture data" : "") + " · read-only, 127.0.0.1";
+      foot.textContent = "";
+      foot.appendChild(document.createTextNode(base + " · "));
+      var mark = el("span", {text: bad ? "\u2717 " + bad : "\u2713 Numbers reconcile across " + n + " workstreams"});
+      mark.setAttribute("style", "color:" + (bad ? "var(--critical)" : "var(--good)"));
+      foot.appendChild(mark);
+    }).catch(function () {});
   }
   /* Warm every other tab's Execution data in the background, one tab at a time, so a first switch draws from cache instantly. */
   var warming = false;
@@ -1297,8 +1314,8 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
       if (state.view === "exec" && state.ws === ws) {
         drawMain();
         setLive(true);
-        var foot = document.getElementById("foot");
-        if (foot) foot.textContent = "Updated " + new Date().toLocaleTimeString() + (FIX ? " · fixture data" : "") + " · read-only, 127.0.0.1";
+        if (state.ws === "all") refreshFoot();
+        else { var foot = document.getElementById("foot"); if (foot) foot.textContent = "Updated " + new Date().toLocaleTimeString() + (FIX ? " · fixture data" : "") + " · read-only, 127.0.0.1"; }
       }
     }).catch(function () { if (gen === execGen) setLive(false); });
   }

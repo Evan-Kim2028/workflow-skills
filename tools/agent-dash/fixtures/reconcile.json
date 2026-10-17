@@ -1,0 +1,70 @@
+{
+  "now": 1761999960,
+  "since": 1761956760,
+  "until": 1761999960,
+  "all": {
+    "live_agents": 7,
+    "finished_in_range": 109,
+    "finished_today": 109,
+    "tokens": 1145059,
+    "cost_usd": 3.0178
+  },
+  "rows": [
+    {
+      "ws": "PLANNING",
+      "live_agents": 0,
+      "finished_in_range": 1,
+      "finished_today": 1,
+      "tokens": 19339,
+      "cost_usd": 0.0985,
+      "last_activity": 1761980960
+    },
+    {
+      "ws": "TOOLS",
+      "live_agents": 0,
+      "finished_in_range": 1,
+      "finished_today": 1,
+      "tokens": 10207,
+      "cost_usd": 0.0,
+      "last_activity": 1761998760
+    },
+    {
+      "ws": "WS1",
+      "live_agents": 2,
+      "finished_in_range": 36,
+      "finished_today": 36,
+      "tokens": 436889,
+      "cost_usd": 2.0176,
+      "last_activity": 1761999840
+    },
+    {
+      "ws": "WS2",
+      "live_agents": 2,
+      "finished_in_range": 38,
+      "finished_today": 38,
+      "tokens": 360883,
+      "cost_usd": 0.4083,
+      "last_activity": 1761999840
+    },
+    {
+      "ws": "WS7",
+      "live_agents": 3,
+      "finished_in_range": 33,
+      "finished_today": 33,
+      "tokens": 317741,
+      "cost_usd": 0.4934,
+      "last_activity": 1761999840
+    }
+  ],
+  "unassigned": {
+    "ws": "unassigned",
+    "live_agents": 0,
+    "finished_in_range": 0,
+    "finished_today": 0,
+    "tokens": 0,
+    "cost_usd": 0.0,
+    "last_activity": null
+  },
+  "mismatches": [],
+  "_note": "Seeded synthetic data for the offline preview. Seed 1. No local sessions are read."
+}

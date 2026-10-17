@@ -3,11 +3,33 @@
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_PATH = ROOT / "plans.json"
 MAX_BYTES = 2_000_000
+PROGRESS_STATUSES = ("todo", "wip", "pr", "prog", "done", "deferred")
+
+
+def plan_progress(groups) -> dict:
+    """The one plan-progress computation every endpoint and page spot reads.
+
+    ``done`` counts merged tasks, ``total`` counts every task except deferred,
+    ``counts`` tallies each known status (unknown statuses are ignored), and
+    ``pct`` rounds half up like the page used to.
+    """
+    counts = {key: 0 for key in PROGRESS_STATUSES}
+    for group in groups or []:
+        tasks = group.get("tasks") if isinstance(group, dict) else None
+        for task in tasks or []:
+            status = task.get("status") if isinstance(task, dict) else None
+            if status in counts:
+                counts[status] += 1
+    total = sum(counts[key] for key in ("todo", "wip", "pr", "prog", "done"))
+    done = counts["done"]
+    pct = int(math.floor(100 * done / total + 0.5)) if total else 0
+    return {"done": done, "total": total, "counts": counts, "pct": pct}
 
 
 class PlanNotFound(Exception):
@@ -50,13 +72,15 @@ def load(ws: str, path: Path | None = None) -> dict:
         raise PlanError("plan file unreadable")
     dag = data.get("dag") if isinstance(data.get("dag"), dict) else {}
     narrative = data.get("narrative") if isinstance(data.get("narrative"), dict) else {}
+    groups = _groups(dag.get("groups"))
     return {
         "ws": ws,
         "cols": _strings(dag.get("cols")),
-        "groups": _groups(dag.get("groups")),
+        "groups": groups,
         "edges": _edges(dag.get("edges")),
         "phases": _phases(narrative.get("phases")),
         "trains": _trains(data.get("trains")),
+        "progress": plan_progress(groups),
     }
 
 

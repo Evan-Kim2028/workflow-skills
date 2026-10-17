@@ -8,7 +8,7 @@ Never writes to any source, never signals agent processes, never stores prompt b
 
 | Path | Owner |
 |---|---|
-| `agent_dash.py` (CLI: `run`, `stop`, `status`, `backfill --session <id>`, `reprice`, `reconcile`, `ws`) | core |
+| `agent_dash.py` (CLI: `run`, `stop`, `status`, `backfill --session <id>`, `reprice`, `reconcile`, `check`, `ws`) | core |
 | `dash/store.py` (schema, offsets, upserts, buckets, counts) | core |
 | `dash/server.py` (HTTP + SSE, routes below) | core |
 | `dash/attribution.py`, `map.example.json` (`map.local.json` replaces it) | core |
@@ -67,35 +67,55 @@ Workstream attribution happens in core (`attribution.py`), not in sources: label
 
 `GET /` -> `static/index.html`.
 
-`GET /api/snapshot?ws=<WSn|all>`
+`GET /api/snapshot?ws=<WSn|all>&since=&until=`
 ```json
 {"now": 0, "seq": 0,
  "counts": {"live_agents": 0, "live_by_tool": {"grok": 0, "muse": 0, "glm": 0, "claude": 0}, "finished_today": 0, "finished_in_range": 0, "finished_by_verdict": {}},
  "running": [Run], "recent": [Run],
- "alerts": [{"kind": "died_early|killed|long_running", "run_id": "...", "label": "...", "detail": "...", "ts": 0}],
  "totals": {"tokens": {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0, "reasoning": 0}, "cost_usd": 0.0, "unpriced_runs": 0},
- "by_workstream": [{"ws": "WS7", "running": 0, "done": 0, "tokens": 0, "cost_usd": 0.0, "last_activity": 0}]}
+ "by_workstream": [{"ws": "WS7", "live_agents": 0, "finished_in_range": 0, "finished_today": 0, "tokens": 0, "cost_usd": 0.0, "last_activity": 0}]}
 ```
+One function (`Store._summarize_locked`) computes the all-scope counts and totals,
+every workstream row, and the `unassigned` row from the same run list, the same
+agent rule, and the same window. The `by_workstream` row for a workstream equals
+that workstream tab's `counts` and `totals`. `unassigned` carries runs with no
+workstream; it appears only when such runs exist. Row sums plus unassigned equal
+the all-scope numbers exactly (cost within 1e-6).
 `Run` = `{run_id, source, tier, model, label, workstream, ws_confidence, session_id, parent_session_id, status, verdict,
 started_at, ended_at, elapsed_s, clock_source, out_bytes, out_growing, err_bytes, pid, rss_kb, tokens: {input, output, cache_read, cache_write}, cost_usd, context_tokens}`.
 `context_tokens` is the latest `grok-context` input for that run, or null. It is a context-window estimate. It is not part of `tokens`, totals, buckets, or cost. `elapsed_s` is null when `started_at` is null.
 `recent` = runs ended in the last 60 minutes, newest first, max 50.
 
-`GET /api/stream` -> SSE. Event `tick` every 2 s: `{"seq": n, "running": [Run], "alerts_count": n}`; the page refetches snapshot when `seq` changes.
+`GET /api/stream` -> SSE. Event `tick` every 2 s: `{"seq": n, "running": [Run]}`; the page refetches snapshot when `seq` changes.
 
 `GET /api/runs?ws=&since=&until=&limit=` -> `{"runs": [Run]}` (Gantt input; workflow children collapsed into one row with `children: n`).
 
-`GET /api/usage?group=model|workstream|tool&bucket=hour|day&ws=&since=` -> `{"buckets": [{"t": 0, "key": "opus", "input": 0, "output": 0, "cache_read": 0, "cache_write": 0, "cost_usd": 0.0}]}`
+`GET /api/usage?group=model|workstream|tool&bucket=hour|day&ws=&since=&until=` -> `{"buckets": [{"t": 0, "key": "opus", "input": 0, "output": 0, "cache_read": 0, "cache_write": 0, "reasoning": 0, "cost_usd": 0.0}]}`
 
 `GET /api/concurrency?ws=&since=&step=60` -> `{"points": [{"t": 0, "grok": 0, "muse": 0, "glm": 0, "claude": 0}]}`
 
 `GET /api/sessions` -> `{"sessions": [{session_id, tool, cwd, label, workstream, started_at, status, runs: n, tokens, cost_usd}]}`
 
-`GET /api/workstreams` -> `{"workstreams": [{ws, name, tk: {backlog, todo, doing, review, done, cancelled}, running, tokens, cost_usd, plan: bool}]}`
+`GET /api/workstreams?since=&until=` -> `{"workstreams": [{ws, name, tk: {backlog, todo, doing, review, done, cancelled}, live_agents, finished_in_range, finished_today, tokens, cost_usd, last_activity, plan: bool}]}`.
+Rows come from the same rollup as the snapshot, so they match the tabs for the
+same window. `tk` is the hub issue board (issue counts, never plan progress).
+An `unassigned` row appears when runs have no workstream.
 
-`GET /api/plan?ws=WS7` -> the plan DAG file named in the plans map for that ws, passed through:
-`{"ws": "WS7", "cols": [..], "groups": [{id, col, title, tasks: [{id, title, status}]}], "edges": [[a, b]], "phases": [{name, goal, gate}]}`.
+`GET /api/reconcile?hours=&since=&until=` -> `{"now": 0, "since": 0, "until": 0, "all": {live_agents, finished_in_range, finished_today, tokens, cost_usd}, "rows": [per-workstream rows], "unassigned": {...}, "mismatches": []}`.
+Computed in one store pass under the lock. `mismatches` lists every violated
+invariant and is empty when consistent. `python3 agent_dash.py check [--url URL] [--hours N]`
+prints the rows as a table and exits 1 on any mismatch.
+
+`GET /api/plan?ws=WS7` -> that workstream's plan with a `progress` object:
+`{"ws": "WS7", "cols": [..], "groups": [{id, col, title, tasks: [{id, title, status}]}], "edges": [[a, b]], "phases": [{name, goal, gate}], "progress": {"done": 0, "total": 0, "counts": {todo, wip, pr, prog, done, deferred}, "pct": 0}}`.
 `plans.local.json` replaces `plans.example.json`. Each value is a path. Relative paths resolve next to the plans file. The loader reads `dag` and `narrative.phases`.
+One resolver (`dash.bundles.resolve_plan`) picks the plan file: a bundle's
+`plan.json` wins over the plans-map file. `/api/plan`, `/api/bundle`, and the
+page all read the same body, so the plan view and the execution map agree.
+`progress.done` counts done tasks, `progress.total` counts every task except
+deferred, `pct` rounds half up. Unknown task statuses are ignored. The page
+never computes % done itself; it reads `progress.pct`, `progress.done`, and
+`progress.total`.
 
 `GET /api/health` -> `{"ok": true, "sources": [{name, last_poll, last_error, lag_s}], "pricing": {...}}`
 
@@ -103,7 +123,23 @@ started_at, ended_at, elapsed_s, clock_source, out_bytes, out_growing, err_bytes
 
 ## Plan bundles
 
-Plan and Execution are one shell, `static/index.html`. `GET /` and `GET /plan` both serve that file. The page swaps the view in place (`?view=plan|exec&ws=<ID>`). `/static/index.html?ws=<ID>` still opens Execution. Project text stays out of the tool directory, under `AGENT_DASH_WORKSTREAMS` (default `~/.local/share/agent-dash/workstreams`). One directory per bundle id. The plans map still feeds `GET /api/plan`. A directory with `bundle.json` shows up on the plan view and, for `kind: workstream`, on `GET /api/plan` when that id is not already in the plans map.
+Plan and Execution are one shell, `static/index.html`. `GET /` and `GET /plan` both serve that file. The page swaps the view in place (`?view=plan|exec&ws=<ID>`). `/static/index.html?ws=<ID>` still opens Execution. Project text stays out of the tool directory, under `AGENT_DASH_WORKSTREAMS` (default `~/.local/share/agent-dash/workstreams`). One directory per bundle id. A directory with `bundle.json` shows up on the plan view and, for `kind: workstream`, on `GET /api/plan`. When both a bundle and the plans map name a workstream, the bundle's `plan.json` wins (`resolve_plan`).
+
+## One number, one truth
+
+An agent is a running row whose source maps to a tool (grok, muse, glm, or
+claude). Interactive lead sessions (`claude-main`), shell rows, and Dagster
+jobs are not agents. Finished means status `done`, `killed`, or `died_early`
+with an end time inside the window. The default window is the last 24 hours;
+`since`/`until` (or the page range control) narrow it.
+
+Token and cost sums come from the hourly usage buckets, counting a bucket when
+its hour overlaps the window (`hour_ts + 3600 > since` and `hour_ts < until`).
+The tokens tile, the tokens-per-hour chart legend, the snapshot totals, and the
+per-workstream rows all sum the same `/api/usage` cells, so they agree exactly
+for the same scope and window. Runs with no workstream land in the
+`unassigned` row, which the Overview tab shows, so the overview total visibly
+equals the sum of the parts.
 
 Each bundle:
 
@@ -135,7 +171,7 @@ HTTP, still GET only, 127.0.0.1:
 
 - `GET /plan` serves the same shell as `GET /`.
 - `GET /api/bundles` returns `{bundles: [{id, title, short, order, kind}]}`, program first, then `order`.
-- `GET /api/bundle?ws=<ID>` returns `{bundle, plan, approvals, start_prompt}` from that directory. Missing `approvals.json` is an empty item list. `start_prompt` is the text of `START-PROMPT.md`, or null.
+- `GET /api/bundle?ws=<ID>` returns `{bundle, plan, progress, approvals, start_prompt}` from that directory. `progress` is the same object `/api/plan` carries. Missing `approvals.json` is an empty item list. `start_prompt` is the text of `START-PROMPT.md`, or null.
 - `GET /api/plan?ws=<ID>` includes `start_prompt` the same way when that bundle has the file, and null otherwise.
 - `GET /api/approvals?ws=<ID|all>` returns one record, or `{approvals: [...]}` for `all`.
 - `GET /bundle/<ID>/page.html` returns that file only. The resolved path has to stay inside the bundle directory.

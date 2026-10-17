@@ -37,6 +37,8 @@ RUN_KEYS = {
 TOKEN_KEYS = ("input", "output", "cache_read", "cache_write")
 FILES = (
     "snapshot.json",
+    "snapshot-WS1.json",
+    "snapshot-WS2.json",
     "snapshot-WS7.json",
     "runs.json",
     "usage-model-hour.json",
@@ -44,6 +46,7 @@ FILES = (
     "concurrency.json",
     "sessions.json",
     "workstreams.json",
+    "reconcile.json",
     "plan-WS1.json",
     "plan-WS2.json",
     "plan-WS7.json",
@@ -129,7 +132,10 @@ class FixtureShapeTests(unittest.TestCase):
         for doc in (self.snap, self.ws7):
             self.assertTrue(num(doc["now"]))
             self.assertIsInstance(doc["seq"], int)
-            self.assertNotIn("caps", doc)
+            self.assertEqual(
+                set(doc) - {"_note"},
+                {"now", "seq", "counts", "running", "recent", "totals", "by_workstream"},
+            )
             counts = doc["counts"]
             self.assertEqual(
                 set(counts),
@@ -152,15 +158,13 @@ class FixtureShapeTests(unittest.TestCase):
                 self.assertLessEqual(run["ended_at"], doc["now"] + 5)
                 stamps.append(run["ended_at"])
             self.assertEqual(stamps, sorted(stamps, reverse=True))
-            for alert in doc["alerts"]:
+            for row in doc["by_workstream"]:
                 self.assertEqual(
-                    set(alert), {"kind", "run_id", "label", "detail", "ts"}
+                    set(row),
+                    {"ws", "live_agents", "finished_in_range", "finished_today", "tokens", "cost_usd", "last_activity"},
                 )
-                self.assertIn(
-                    alert["kind"],
-                    {"died_early", "killed", "long_running"},
-                )
-                self.assertTrue(num(alert["ts"]))
+                self.assertIsInstance(row["tokens"], int)
+                self.assertTrue(num(row["cost_usd"]))
         self.assertEqual(self.snap["now"], self.ws7["now"])
         self.assertIn("counts", self.snap)
         self.assertIn("counts", self.ws7)
@@ -210,6 +214,13 @@ class FixtureShapeTests(unittest.TestCase):
         self.assertAlmostEqual(doc["totals"]["cost_usd"], round(cost, 4), delta=0.001)
         rolled = sum(row["tokens"] for row in doc["by_workstream"])
         self.assertEqual(rolled, sum(tokens.values()))
+        self.assertEqual(
+            sum(row["live_agents"] for row in doc["by_workstream"]), doc["counts"]["live_agents"]
+        )
+        self.assertEqual(
+            sum(row["finished_in_range"] for row in doc["by_workstream"]),
+            doc["counts"]["finished_in_range"],
+        )
 
     def assert_totals(self, totals):
         self.assertEqual(
@@ -230,7 +241,7 @@ class FixtureShapeTests(unittest.TestCase):
             for row in rows:
                 self.assertEqual(
                     set(row),
-                    {"t", "key", "input", "output", "cache_read", "cache_write", "cost_usd"},
+                    {"t", "key", "input", "output", "cache_read", "cache_write", "reasoning", "cost_usd"},
                 )
                 self.assertEqual(row["t"] % 3600, 0)
                 self.assertIsInstance(row["key"], str)
@@ -293,10 +304,12 @@ class FixtureShapeTests(unittest.TestCase):
             for key in fx.TK_KEYS:
                 self.assertIsInstance(row["tk"][key], int)
             self.assertIsInstance(row["plan"], bool)
-            self.assertIsInstance(row["running"], int)
+            self.assertIsInstance(row["live_agents"], int)
+            self.assertIsInstance(row["finished_in_range"], int)
             self.assertIsInstance(row["tokens"], int)
             self.assertTrue(num(row["cost_usd"]))
             self.assertIsInstance(row["name"], str)
+            self.assertTrue(row["last_activity"] is None or num(row["last_activity"]))
             if row["ws"].startswith("WS"):
                 done += row["tk"]["done"]
                 backlog += row["tk"]["backlog"]
@@ -310,6 +323,27 @@ class FixtureShapeTests(unittest.TestCase):
             self.assertEqual(plan["ws"], ws)
             self.assert_plan(plan)
             self.assertNotIn("Synthesized", plan["_note"])
+            progress = plan["progress"]
+            self.assertEqual(set(progress), {"done", "total", "counts", "pct"})
+            self.assertEqual(set(progress["counts"]), {"todo", "wip", "pr", "prog", "done", "deferred"})
+            self.assertEqual(progress["total"], sum(progress["counts"][k] for k in ("todo", "wip", "pr", "prog", "done")))
+            tasks = [task for group in plan["groups"] for task in group["tasks"]]
+            self.assertEqual(progress["done"], sum(1 for task in tasks if task["status"] == "done"))
+            self.assertEqual(progress["total"], sum(1 for task in tasks if task["status"] != "deferred"))
+        ws1 = self.docs["plan-WS1.json"]["progress"]
+        self.assertEqual((ws1["done"], ws1["total"], ws1["pct"]), (1, 4, 25))
+
+    def test_reconcile_fixture(self):
+        doc = self.docs["reconcile.json"]
+        self.assertEqual(set(doc), {"now", "since", "until", "all", "rows", "unassigned", "mismatches", "_note"})
+        self.assertEqual(doc["mismatches"], [])
+        self.assertEqual(set(doc["all"]), {"live_agents", "finished_in_range", "finished_today", "tokens", "cost_usd"})
+        everything = list(doc["rows"]) + [doc["unassigned"]]
+        for metric in ("live_agents", "finished_in_range", "finished_today", "tokens"):
+            self.assertEqual(sum(row[metric] for row in everything), doc["all"][metric])
+        self.assertAlmostEqual(sum(row["cost_usd"] for row in everything), doc["all"]["cost_usd"], delta=0.05)
+        self.assertEqual(sum(row["live_agents"] for row in everything), self.snap["counts"]["live_agents"])
+        self.assertEqual(doc["all"]["tokens"], sum(self.snap["totals"]["tokens"][k] for k in TOKEN_KEYS))
         health = self.docs["health.json"]
         self.assertIs(health["ok"], True)
         names = []

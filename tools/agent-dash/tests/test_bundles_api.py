@@ -154,6 +154,50 @@ class BundlesApiTest(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(json.loads(body)["ws"], "WS7")
 
+    def test_two_plan_sources_resolve_to_one(self):
+        from dash.bundles import resolve_plan
+
+        maps = Path(self.tmp.name) / "maps"
+        maps.mkdir()
+        (maps / "ws9.json").write_text(
+            json.dumps(
+                {
+                    "dag": {
+                        "cols": ["Shape"],
+                        "groups": [
+                            {"id": "g", "col": 0, "title": "Group", "tasks": [
+                                {"id": "WS9.1", "title": "First task", "status": "done"},
+                                {"id": "WS9.2", "title": "Second task", "status": "done"},
+                            ]}
+                        ],
+                        "edges": [],
+                    },
+                    "narrative": {"phases": []},
+                }
+            ),
+            encoding="utf-8",
+        )
+        (maps / "plans.json").write_text(json.dumps({"WS9": "ws9.json"}), encoding="utf-8")
+        old = os.environ.get("AGENT_DASH_PLANS")
+        os.environ["AGENT_DASH_PLANS"] = str(maps / "plans.json")
+        try:
+            source, body = resolve_plan("WS9")
+            self.assertEqual(source, "bundle")
+            self.assertEqual(body["progress"], {"done": 0, "total": 1, "counts": {"todo": 1, "wip": 0, "pr": 0, "prog": 0, "done": 0, "deferred": 0}, "pct": 0})
+            status, _, payload = get(self.port, "/api/plan?ws=WS9")
+            self.assertEqual(status, 200)
+            plan = json.loads(payload)
+            self.assertEqual(plan["progress"]["total"], 1)
+            status, _, payload = get(self.port, "/api/bundle?ws=WS9")
+            bundle = json.loads(payload)
+            self.assertEqual(bundle["progress"], plan["progress"])
+            self.assertEqual(bundle["progress"]["total"], 1)
+        finally:
+            if old is None:
+                os.environ.pop("AGENT_DASH_PLANS", None)
+            else:
+                os.environ["AGENT_DASH_PLANS"] = old
+
     def test_approvals_routes_and_shell(self):
         ws = Path(self.tmp.name) / "WS9"
         (ws / "approvals.json").write_text(

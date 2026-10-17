@@ -30,6 +30,12 @@ def functions(src):
         yield m.group(1), src[m.start():end]
 
 
+def inline_scripts():
+    """The executable script of static/index.html (external src files excluded)."""
+    text = (STATIC / "index.html").read_text()
+    return "\n".join(re.findall(r"<script>(.*?)</script>", text, re.S))
+
+
 class PageRules(unittest.TestCase):
     def test_every_chart_has_axes(self):
         for path, src in pages():
@@ -46,6 +52,16 @@ class PageRules(unittest.TestCase):
                     continue
                 for bad in (".toFixed(", "toLocaleString()"):
                     self.assertNotIn(bad, body, f"{path.name}:{name} formats a number with {bad}; use fmtN/fmtUsd/fmtDur")
+
+    def test_progress_comes_from_the_server(self):
+        """Plan % done is computed once on the server. The pages read
+        progress.pct/.done/.total; they never compute it from task counts."""
+        script = inline_scripts()
+        plan_js = (STATIC / "plan.js").read_text()
+        for name, src in (("index.html", script), ("plan.js", plan_js)):
+            hits = re.findall(r"Math\.round\s*\(\s*100\s*\*[^;]*?done", src, re.I)
+            self.assertEqual(hits, [], f"{name} computes % done itself: {hits[:2]}")
+            self.assertIn(".progress", src, f"{name} never reads the server progress object")
 
     def test_unknown_duration_is_a_dash(self):
         script = (

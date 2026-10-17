@@ -3,6 +3,7 @@
 
 import datetime
 import json
+import math
 import random
 from pathlib import Path
 
@@ -349,6 +350,21 @@ def build_runs():
     return runs
 
 
+def _is_agent(run):
+    """Mirror of dash.store._is_counted_agent: lead sessions and shell rows are not agents."""
+    source = run.get("source") or ""
+    if source in ("claude-main", "shell", "dagster", ""):
+        return False
+    tier = (run.get("tier") or "").lower()
+    if source == "grok" or tier == "grok":
+        return True
+    if source == "muse" or tier == "muse":
+        return True
+    if source == "glm" or tier == "glm":
+        return True
+    return source.startswith("claude") or tier in ("opus", "sonnet", "haiku")
+
+
 def _snapshot(runs, now, ws):
     chosen = [run for run in runs if ws is None or run["workstream"] == ws]
     running = []
@@ -368,6 +384,8 @@ def _snapshot(runs, now, ws):
     tokens["reasoning"] = 0
     cost = 0.0
     unpriced = 0
+    moment = datetime.datetime.fromtimestamp(now).astimezone()
+    today = moment.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
     buckets = {}
     for run in chosen:
         for key in TOKEN_KEYS:
@@ -376,34 +394,52 @@ def _snapshot(runs, now, ws):
             unpriced += 1
         else:
             cost += run["cost_usd"]
-        key = run["workstream"] or "unattributed"
-        row = buckets.setdefault(key, {"ws": key, "running": 0, "done": 0, "tokens": 0, "cost_usd": 0.0, "last_activity": 0})
-        if run["status"] == "running":
-            row["running"] += 1
-        if run["status"] == "done":
-            row["done"] += 1
+        key = run["workstream"] or "unassigned"
+        row = buckets.setdefault(key, {"ws": key, "live_agents": 0, "finished_in_range": 0, "finished_today": 0, "tokens": 0, "cost_usd": 0.0, "last_activity": 0})
+        if run["status"] == "running" and _is_agent(run):
+            row["live_agents"] += 1
+        if _is_agent(run) and run["status"] in ("done", "killed", "died_early") and run.get("ended_at") is not None and now - 24 * 3600 <= run["ended_at"] <= now:
+            row["finished_in_range"] += 1
+            if today <= run["ended_at"] <= now:
+                row["finished_today"] += 1
         row["tokens"] += sum(run["tokens"][part] for part in TOKEN_KEYS)
         if run["cost_usd"] is not None:
             row["cost_usd"] = round(row["cost_usd"] + run["cost_usd"], 4)
         stamp = run["ended_at"] if run["ended_at"] is not None else run["started_at"]
         row["last_activity"] = max(row["last_activity"], stamp)
-    alerts = []
-    for run in chosen:
-        if run["status"] == "running" and now - run["started_at"] >= 3600:
-            alerts.append({"kind": "long_running", "run_id": run["run_id"], "label": run["label"], "detail": "running over an hour", "ts": now})
-        elif run["status"] == "killed":
-            alerts.append({"kind": "killed", "run_id": run["run_id"], "label": run["label"], "detail": "stderr records SIGTERM", "ts": run["ended_at"]})
-        elif run["status"] == "died_early":
-            alerts.append({"kind": "died_early", "run_id": run["run_id"], "label": run["label"], "detail": "empty stdout and a non-empty stderr", "ts": run["ended_at"]})
+    by_ws = [buckets[key] for key in sorted(buckets)]
     return {
         "now": now,
         "seq": 4,
         "counts": _counts(chosen, now),
         "running": running,
         "recent": recent,
-        "alerts": alerts,
         "totals": {"tokens": tokens, "cost_usd": round(cost, 4), "unpriced_runs": unpriced},
-        "by_workstream": [buckets[key] for key in sorted(buckets)],
+        "by_workstream": by_ws,
+        "_note": NOTE,
+    }
+
+
+def _reconcile(runs, now):
+    snap = _snapshot(runs, now, None)
+    totals = snap["totals"]["tokens"]
+    rows = [row for row in snap["by_workstream"] if row["ws"] != "unassigned"]
+    unassigned = [row for row in snap["by_workstream"] if row["ws"] == "unassigned"]
+    empty = {"ws": "unassigned", "live_agents": 0, "finished_in_range": 0, "finished_today": 0, "tokens": 0, "cost_usd": 0.0, "last_activity": None}
+    return {
+        "now": now,
+        "since": now - 12 * 3600,
+        "until": now,
+        "all": {
+            "live_agents": snap["counts"]["live_agents"],
+            "finished_in_range": snap["counts"]["finished_in_range"],
+            "finished_today": snap["counts"]["finished_today"],
+            "tokens": sum(totals[key] for key in TOKEN_KEYS),
+            "cost_usd": snap["totals"]["cost_usd"],
+        },
+        "rows": rows,
+        "unassigned": unassigned[0] if unassigned else empty,
+        "mismatches": [],
         "_note": NOTE,
     }
 
@@ -413,7 +449,7 @@ def _usage(runs, key_of):
     for run in runs:
         hour = int(run["started_at"] // 3600) * 3600
         key = key_of(run)
-        row = buckets.setdefault((hour, key), {"t": hour, "key": key, "input": 0, "output": 0, "cache_read": 0, "cache_write": 0, "cost_usd": 0.0})
+        row = buckets.setdefault((hour, key), {"t": hour, "key": key, "input": 0, "output": 0, "cache_read": 0, "cache_write": 0, "reasoning": 0, "cost_usd": 0.0})
         for part in TOKEN_KEYS:
             row[part] += run["tokens"][part]
         if run["cost_usd"] is not None:
@@ -470,39 +506,88 @@ def _sessions(runs):
     return {"sessions": rows, "_note": NOTE}
 
 
-def _workstreams(runs):
+def _workstreams(runs, now):
+    moment = datetime.datetime.fromtimestamp(now).astimezone()
+    today = moment.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
     rows = []
     for code, name, counts in BOARD:
         tk = dict(zip(TK_KEYS, counts))
         mine = [run for run in runs if run["workstream"] == code]
         tokens = sum(sum(run["tokens"][key] for key in TOKEN_KEYS) for run in mine)
         cost = round(sum(run["cost_usd"] or 0 for run in mine), 4)
+        live = sum(1 for run in mine if run["status"] == "running" and _is_agent(run))
+        fin = sum(1 for run in mine if _is_agent(run) and run["status"] in ("done", "killed", "died_early") and run.get("ended_at") is not None and now - 24 * 3600 <= run["ended_at"] <= now)
         rows.append({
             "ws": code,
             "name": name,
             "tk": tk,
-            "running": sum(1 for run in mine if run["status"] == "running"),
+            "live_agents": live,
+            "finished_in_range": fin,
+            "finished_today": sum(1 for run in mine if _is_agent(run) and run["status"] in ("done", "killed", "died_early") and run.get("ended_at") is not None and today <= run["ended_at"] <= now),
             "tokens": tokens,
             "cost_usd": cost,
+            "last_activity": max([run["ended_at"] if run["ended_at"] is not None else run["started_at"] for run in mine] or [0]) or None,
             "plan": code in PLAN_WS,
         })
     return {"workstreams": rows, "_note": NOTE}
 
 
+def _progress(groups):
+    """Mirror of dash.plans.plan_progress: done of total-excluding-deferred, half-up pct."""
+    counts = {key: 0 for key in ("todo", "wip", "pr", "prog", "done", "deferred")}
+    for group in groups:
+        for task in group.get("tasks", []):
+            if task.get("status") in counts:
+                counts[task["status"]] += 1
+    total = sum(counts[key] for key in ("todo", "wip", "pr", "prog", "done"))
+    pct = int(math.floor(100 * counts["done"] / total + 0.5)) if total else 0
+    return {"done": counts["done"], "total": total, "counts": counts, "pct": pct}
+
+
+def _clean_groups(groups):
+    return [
+        {"id": group.get("id"), "col": group.get("col"), "title": group.get("title"),
+         "tasks": [{"id": task.get("id"), "title": task.get("title"), "status": task.get("status")} for task in group.get("tasks", [])]}
+        for group in groups
+    ]
+
+
 def _plans():
+    """Fixture plan views. WS1 resolves from its bundle (bundle wins over the
+    plans map), so the plan view and the execution map agree on one source."""
     written = {}
     plan_dir = ROOT / "plans"
     plan_dir.mkdir(exist_ok=True)
+    bundle_plan = json.loads((HERE / "bundles" / "WS1" / "plan.json").read_text(encoding="utf-8"))
+    bundle_dag = bundle_plan.get("dag", {})
+    bundle_view = {
+        "cols": bundle_dag.get("cols", []),
+        "groups": _clean_groups(bundle_dag.get("groups", [])),
+        "edges": bundle_dag.get("edges", []),
+        "phases": (bundle_plan.get("narrative") or {}).get("phases", []),
+        "trains": bundle_plan.get("trains", []),
+    }
     for ws, body in RAW_PLANS.items():
         raw = {"ws": ws, "dag": {"cols": body["cols"], "groups": body["groups"], "edges": body["edges"]}, "narrative": {"phases": body["phases"]}}
         (plan_dir / f"{ws.lower()}.json").write_text(json.dumps(raw, indent=2) + "\n", encoding="utf-8")
+        if ws == "WS1":
+            view = bundle_view
+        else:
+            view = {
+                "cols": body["cols"],
+                "groups": body["groups"],
+                "edges": body["edges"],
+                "phases": body["phases"],
+                "trains": body.get("trains", []),
+            }
         written[ws] = {
             "ws": ws,
-            "cols": body["cols"],
-            "groups": body["groups"],
-            "edges": body["edges"],
-            "phases": body["phases"],
-            "trains": body.get("trains", []),
+            "cols": view["cols"],
+            "groups": view["groups"],
+            "edges": view["edges"],
+            "phases": view["phases"],
+            "trains": view["trains"],
+            "progress": _progress(view["groups"]),
             "_note": "Seeded example plan for the fixture preview.",
         }
     return written
@@ -521,7 +606,7 @@ def _counts(runs, now):
     range_since = now - 24 * 3600
     for run in runs:
         source = run.get("source") or ""
-        if source in ("claude-main", "shell", ""):
+        if source in ("claude-main", "shell", "dagster", ""):
             continue
         tier = (run.get("tier") or "").lower()
         if source == "grok" or tier == "grok":
@@ -585,10 +670,11 @@ def main():
         "snapshot-WS2.json": _snapshot(runs, NOW, "WS2"),
         "snapshot-WS7.json": _snapshot(runs, NOW, "WS7"),
         "usage-model-hour.json": _usage(runs, lambda run: run["tier"]),
-        "usage-workstream-hour.json": _usage(runs, lambda run: run["workstream"] or "unattributed"),
+        "usage-workstream-hour.json": _usage(runs, lambda run: run["workstream"] or "unassigned"),
         "concurrency.json": conc,
         "sessions.json": _sessions(runs),
-        "workstreams.json": _workstreams(runs),
+        "workstreams.json": _workstreams(runs, NOW),
+        "reconcile.json": _reconcile(runs, NOW),
         "health.json": {
             "ok": True,
             "sources": [

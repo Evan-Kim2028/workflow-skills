@@ -341,22 +341,6 @@
       "cost_usd": null
     }
   ],
-  "alerts": [
-    {
-      "kind": "long_running",
-      "run_id": "muse:00000000-0000-0000-0000-000000000010:ws7-landing:0",
-      "label": "ws7-landing",
-      "detail": "running over an hour",
-      "ts": 1761999960
-    },
-    {
-      "kind": "killed",
-      "run_id": "muse:00000000-0000-0000-0000-000000000332:ws7-notes:32",
-      "label": "ws7-notes",
-      "detail": "stderr records SIGTERM",
-      "ts": 1761996560
-    }
-  ],
   "totals": {
     "tokens": {
       "input": 90607,
@@ -371,8 +355,9 @@
   "by_workstream": [
     {
       "ws": "WS7",
-      "running": 3,
-      "done": 37,
+      "live_agents": 3,
+      "finished_in_range": 33,
+      "finished_today": 33,
       "tokens": 317741,
       "cost_usd": 0.4934,
       "last_activity": 1761999840

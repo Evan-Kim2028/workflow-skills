@@ -371,22 +371,6 @@
       "cost_usd": null
     }
   ],
-  "alerts": [
-    {
-      "kind": "killed",
-      "run_id": "grok:00000000-0000-0000-0000-000000000333:ws2-4:33",
-      "label": "ws2-4",
-      "detail": "stderr records SIGTERM",
-      "ts": 1761996560
-    },
-    {
-      "kind": "died_early",
-      "run_id": "muse:00000000-0000-0000-0000-000000000335:ws2-3:35",
-      "label": "ws2-3",
-      "detail": "empty stdout and a non-empty stderr",
-      "ts": 1761996560
-    }
-  ],
   "totals": {
     "tokens": {
       "input": 82038,
@@ -401,8 +385,9 @@
   "by_workstream": [
     {
       "ws": "WS2",
-      "running": 2,
-      "done": 41,
+      "live_agents": 2,
+      "finished_in_range": 38,
+      "finished_today": 38,
       "tokens": 360883,
       "cost_usd": 0.4083,
       "last_activity": 1761999840
