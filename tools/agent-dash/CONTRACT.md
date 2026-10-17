@@ -73,7 +73,7 @@ Workstream attribution happens in core (`attribution.py`), not in sources: label
 {"now": 0, "seq": 0,
  "counts": {"live_agents": 0, "live_by_tool": {"grok": 0, "muse": 0, "glm": 0, "claude": 0}, "finished_today": 0, "finished_in_range": 0, "finished_by_verdict": {}},
  "running": [Run], "recent": [Run],
- "totals": {"tokens": {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0, "reasoning": 0}, "cost_usd": 0.0, "unpriced_runs": 0},
+ "totals": {"tokens": {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0, "reasoning": 0}, "cost_usd": 0.0, "unpriced_runs": 0, "unpriced_tokens": 0, "unpriced_models": []},
  "totals_all_time": {"tokens": {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0, "reasoning": 0}, "cost_usd": 0.0},
  "last_activity": 0,
  "by_workstream": [{"ws": "WS7", "live_agents": 0, "finished_in_range": 0, "finished_today": 0, "tokens": 0, "cost_usd": 0.0, "tokens_all_time": 0, "cost_usd_all_time": 0.0, "last_activity": 0}],
@@ -178,7 +178,15 @@ variant. Clip playback compresses idle stretches by cumulative event count
 blended with real time; plain replay stays on real time with an optional
 "Compress idle" toggle.
 
-`GET /api/health` -> `{"ok": true, "sources": [{name, last_poll, last_error, lag_s}], "pricing": {...}, "scratch_roots": [...], "run_dirs": [...], "warnings": [...]}`.
+`GET /api/health` -> `{"ok": true, "sources": [{name, last_poll, last_error, lag_s}], "pricing": {...}, "disconnects_1h": 0, "unpriced_models": [{"model", "rows", "tokens"}], "scratch_roots": [...], "run_dirs": [...], "warnings": [...]}`.
+`ok` is false when any model with usage rows in the last 24 h has no
+catalog rate; those models are listed in `unpriced_models` (absent when
+empty) and each is also an `unpriced model: <id> (<tokens> tokens in 24 h)`
+mismatch in `/api/reconcile` (so `check` exits 1). A missing rate never
+becomes zero: the cost tile reads `totals.unpriced_tokens` /
+`totals.unpriced_models` and says `excl. N tokens unpriced (<models>)`.
+`disconnects_1h` counts client disconnects (BrokenPipe/ConnectionReset)
+in the last hour; they are counted, never traceback-logged.
 `scratch_roots` is the configured, resolved `roots.scratchpads` list (a local config that narrows it shows up here); `run_dirs` is the registered run folders. `warnings` names each registered folder outside the configured roots that holds a manifest for a currently live worker, so a run folder the config does not cover is loud instead of silently invisible.
 
 `GET /static/<file>` serves a file from `static/` or one subdirectory (`vendor/`). `/static/taskmap.json` is the resolved task map (`taskmap.local.json`, else `taskmap.example.json`). Context-window rows use tool `grok-context` and are left out of cost.

@@ -186,6 +186,36 @@ class CatalogTest(unittest.TestCase):
             self.assertEqual(rows[model]["confidence"], "unknown")
             self.assertFalse(status(model)["priced"])
 
+    def test_composer_fast_rate_is_published(self):
+        """Cursor publishes Composer 2.5 (Fast) per-million rates: 3/15/0.5,
+        no cache-write rate. The row prices token traffic, never zeroes it."""
+        rows = {row["model"]: row for row in load()}
+        fast = rows["composer-2.5-fast"]
+        self.assertEqual(fast["provider"], "cursor")
+        self.assertEqual((fast["input"], fast["output"], fast["cache_read"]), (3, 15, Decimal("0.5")))
+        self.assertIsNone(fast["cache_write_5m"])
+        self.assertIsNone(fast["cache_write_1h"])
+        self.assertEqual(fast["billing_mode"], "plan-included")
+        self.assertEqual(fast["confidence"], "published")
+        self.assertEqual(fast["source_url"], "https://cursor.com/docs/models-and-pricing")
+        self.assertTrue(status("composer-2.5-fast")["priced"])
+        self.assertAlmostEqual(
+            cost("composer-2.5-fast", 1_000_000, 1_000_000, 1_000_000, 0),
+            3 + 15 + 0.5,
+        )
+        self.assertIsNone(cost("composer-2.5-fast", 1, 1, 0, 5))
+
+    def test_unpublished_ids_stay_null(self):
+        """muse-wonder-full-1.0 and <synthetic> have no published rate
+        (Cursor lists Muse Wonder, not a Full variant, and no synthetic
+        model), so the rows stay null and traffic stays unpriced."""
+        rows = {row["model"]: row for row in load()}
+        for model in ("muse-wonder-full-1.0", "<synthetic>"):
+            self.assertIsNone(rows[model]["input"])
+            self.assertIsNone(rows[model]["output"])
+            self.assertFalse(status(model)["priced"])
+            self.assertIsNone(cost(model, 10, 10, 10, 0))
+
     def test_family_is_unchanged(self):
         self.assertEqual(family("claude-opus-5-5"), "opus")
         self.assertEqual(family("claude-sonnet-5-5"), "sonnet")

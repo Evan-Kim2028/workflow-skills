@@ -293,7 +293,7 @@ class ReconcileEndpointTest(unittest.TestCase):
                 "run_id": "muse:a:ws1-a",
                 "source": "muse",
                 "tier": "muse",
-                "model": "claude-sonnet-4-5",
+                "model": "claude-sonnet-5-5",
                 "label": "ws1-a",
                 "status": "running",
                 "started_at": now - 100,
@@ -304,7 +304,7 @@ class ReconcileEndpointTest(unittest.TestCase):
                 "run_id": "muse:b:helper",
                 "source": "muse",
                 "tier": "muse",
-                "model": "claude-sonnet-4-5",
+                "model": "claude-sonnet-5-5",
                 "label": "helper",
                 "session_id": "sess-b",
                 "status": "done",
@@ -317,7 +317,7 @@ class ReconcileEndpointTest(unittest.TestCase):
                 "ts": now - 2100,
                 "session_id": "sess-b",
                 "run_id": "muse:b:helper",
-                "model": "claude-sonnet-4-5",
+                "model": "claude-sonnet-5-5",
                 "tool": "claude",
                 "message_id": "m1",
                 "input": 400,
@@ -553,6 +553,162 @@ class SnapshotUsageEndpointTest(unittest.TestCase):
     def test_snapshot_bad_group_is_400(self):
         status, _, _ = get(self.port, "/api/snapshot?usage_group=nope")
         self.assertEqual(status, 400)
+
+
+class UnpricedAlertTest(unittest.TestCase):
+    """Item 7: a model with windowed usage and no rate fails health and
+    reconcile loudly, and the snapshot totals name the excluded tokens."""
+
+    MODEL = "unpriced-test-model"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.store = Store(Path(self.tmp.name) / "dash.sqlite")
+        self.now = time.time()
+        self.store.upsert_run(
+            {
+                "run_id": "muse:u:ws1-u",
+                "source": "muse",
+                "tier": "muse",
+                "model": self.MODEL,
+                "label": "ws1-u",
+                "session_id": "sess-u",
+                "status": "done",
+                "started_at": self.now - 5000,
+                "ended_at": self.now - 4000,
+            }
+        )
+        self.store.add_usage(
+            {
+                "ts": self.now - 4100,
+                "session_id": "sess-u",
+                "run_id": "muse:u:ws1-u",
+                "model": self.MODEL,
+                "tool": "muse",
+                "message_id": "m1",
+                "input": 100,
+                "output": 200,
+                "cache_read": 0,
+                "cache_write": 0,
+            }
+        )
+        self.server, self.thread = start(self.store)
+        self.port = self.server.server_address[1]
+
+    def tearDown(self):
+        stop(self.server, self.thread)
+        self.store.close()
+        self.tmp.cleanup()
+
+    def test_health_fails_on_unpriced_windowed_usage(self):
+        status, _, body = get(self.port, "/api/health")
+        self.assertEqual(status, 200)
+        health = json.loads(body)
+        self.assertFalse(health["ok"])
+        self.assertEqual(
+            health["unpriced_models"],
+            [{"model": self.MODEL, "rows": 1, "tokens": 300}],
+        )
+        self.assertIn("disconnects_1h", health)
+        self.assertEqual(health["disconnects_1h"], 0)
+
+    def test_health_passes_without_unpriced_usage(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "dash.sqlite")
+            try:
+                server, thread = start(store)
+                try:
+                    status, _, body = get(server.server_address[1], "/api/health")
+                finally:
+                    stop(server, thread)
+            finally:
+                store.close()
+        self.assertEqual(status, 200)
+        health = json.loads(body)
+        self.assertTrue(health["ok"])
+        self.assertNotIn("unpriced_models", health)
+
+    def test_reconcile_flags_unpriced_model(self):
+        status, _, body = get(self.port, "/api/reconcile?hours=24")
+        self.assertEqual(status, 200)
+        payload = json.loads(body)
+        self.assertIn(
+            f"unpriced model: {self.MODEL} (300 tokens in 24 h)",
+            payload["mismatches"],
+        )
+
+    def test_snapshot_totals_name_unpriced_tokens(self):
+        status, _, body = get(self.port, "/api/snapshot?ws=all")
+        self.assertEqual(status, 200)
+        totals = json.loads(body)["totals"]
+        self.assertEqual(totals["unpriced_tokens"], 300)
+        self.assertEqual(totals["unpriced_models"], [self.MODEL])
+
+
+class DisconnectSilenceTest(unittest.TestCase):
+    """Item 9: BrokenPipe/ConnectionReset are counted, not printed. Real
+    errors still log."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.store = Store(Path(self.tmp.name) / "dash.sqlite")
+        self.server, self.thread = start(self.store)
+        self.port = self.server.server_address[1]
+
+    def tearDown(self):
+        stop(self.server, self.thread)
+        self.store.close()
+        self.tmp.cleanup()
+
+    def _handler(self):
+        from dash.server import Handler
+
+        handler = Handler.__new__(Handler)
+        handler.server = self.server
+        handler.command = "GET"
+        handler.requestline = "GET /api/snapshot HTTP/1.0"
+        handler.request_version = "HTTP/1.0"
+        return handler
+
+    def test_bytes_swallows_broken_pipe_and_counts(self):
+        handler = self._handler()
+
+        class Dead:
+            def write(self, data):
+                raise BrokenPipeError(32, "Broken pipe")
+
+            def flush(self):
+                pass
+
+        handler.wfile = Dead()
+        handler._bytes(200, b"x", "text/plain")
+        self.assertEqual(self.server.disconnects_1h(), 1)
+
+    def test_handle_error_counts_reset_without_traceback(self):
+        import contextlib
+        import io
+
+        err = io.StringIO()
+        try:
+            raise ConnectionResetError(54, "Connection reset by peer")
+        except ConnectionResetError:
+            with contextlib.redirect_stderr(err):
+                self.server.handle_error(None, ("127.0.0.1", 1))
+        self.assertEqual(err.getvalue(), "")
+        self.assertEqual(self.server.disconnects_1h(), 1)
+
+    def test_handle_error_still_logs_real_errors(self):
+        import contextlib
+        import io
+
+        err = io.StringIO()
+        try:
+            raise ValueError("boom")
+        except ValueError:
+            with contextlib.redirect_stderr(err):
+                self.server.handle_error(None, ("127.0.0.1", 1))
+        self.assertIn("ValueError", err.getvalue())
+        self.assertEqual(self.server.disconnects_1h(), 0)
 
 
 def _replay_bundle(root: Path) -> None:

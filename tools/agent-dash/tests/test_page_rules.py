@@ -452,6 +452,18 @@ class PageRules(unittest.TestCase):
         )
         self.assertEqual(proc.returncode, 0, proc.stderr or proc.stdout)
 
+    def test_cost_tile_names_unpriced_tokens(self):
+        """The cost tile excludes unpriced models' tokens and says so,
+        naming the models; the priced state names nothing."""
+        script = inline_scripts()
+        bodies = dict(functions(script))
+        self.assertIn("tiles", bodies)
+        body = bodies["tiles"]
+        self.assertIn("unpriced_tokens", body, "tiles() lost the unpriced token count")
+        self.assertIn("unpriced_models", body, "tiles() lost the unpriced model names")
+        self.assertIn("tokens unpriced", body, "cost tile no longer says whose tokens it excludes")
+        self.assertIn("data-unpriced-tokens", body, "cost tile lost its unpriced data attribute")
+
     def test_unknown_duration_is_a_dash(self):
         script = (
             "const fs=require('fs');"

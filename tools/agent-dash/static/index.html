@@ -727,7 +727,8 @@ body.clip #main{zoom:.92}
     var tk = ((snap.totals || {}).tokens) || {};
     var allTok = ADC.billed(tk);
     var cost = (snap.totals && snap.totals.cost_usd) || 0;
-    var unp = (snap.totals && snap.totals.unpriced_runs) || 0;
+    var unpTok = (snap.totals && snap.totals.unpriced_tokens) || 0;
+    var unpModels = (snap.totals && snap.totals.unpriced_models) || [];
     var at = ((snap.totals_all_time || {}).tokens) || {};
     var allTimeTok = ADC.billed(at);
     var allTimeCost = (snap.totals_all_time && snap.totals_all_time.cost_usd) || 0;
@@ -735,7 +736,7 @@ body.clip #main{zoom:.92}
     var tokVal = allTok ? fmtN(allTok) : "0 in 24 h";
     var tokSub = allTok ? cachedPct(tk) + "% cached \u00B7 out " + fmtN(tk.output || 0)
       : (agoTxt ? "last run " + agoTxt + " \u00B7 " + fmtN(allTimeTok) + " all time" : "no runs yet");
-    var costSub = (unp ? fmtN(unp) + " run" + (unp === 1 ? "" : "s") + " unpriced \u00B7 " : "every model priced \u00B7 ") + fmtUsd(allTimeCost) + " all time";
+    var costSub = (unpTok ? "excl. " + fmtN(unpTok) + " tokens unpriced (" + unpModels.join(", ") + ") \u00B7 " : "every model priced \u00B7 ") + fmtUsd(allTimeCost) + " all time";
     var g = el("div", {class: "grid g-tiles", id: "exec-tiles", "data-nav": "Summary"});
     var cn = snap.counts || {}, lbt = cn.live_by_tool || {}, fv = cn.finished_by_verdict || {};
     var lbm = cn.live_by_model || {}, byFam = {};
@@ -747,7 +748,7 @@ body.clip #main{zoom:.92}
     [["Agents live now", fmtN(cn.live_agents != null ? cn.live_agents : run.filter(isAgent).length), liveSub, null],
      ["Agents finished (24 h)", fmtN(cn.finished_in_range || 0), "\u2713 " + fmtN((fv.PASS || 0) + (fv.APPROVE || 0) + (fv.APPROVE_WITH_NITS || 0)) + " pass \u00B7 \u25D0 " + fmtN(part) + " partial \u00B7 \u2715 " + fmtN(bad) + " blocked (24 h)", null],
      ["Tokens (24 h)", tokVal, tokSub, {"data-tile": "tokens", "data-ws": state.ws, "data-hours": "24", "data-tokens": String(allTok), "data-tokens-all-time": String(allTimeTok)}],
-     ["Est. cost (24 h)", fmtUsd(cost), costSub, {"data-tile": "cost", "data-ws": state.ws, "data-hours": "24", "data-cost-usd": String(cost), "data-cost-all-time": String(allTimeCost)}]
+     ["Est. cost (24 h)", fmtUsd(cost), costSub, {"data-tile": "cost", "data-ws": state.ws, "data-hours": "24", "data-cost-usd": String(cost), "data-cost-all-time": String(allTimeCost), "data-unpriced-tokens": String(unpTok)}]
     ].forEach(function (t) {
       var attrs = {class: "card tile"};
       if (t[3]) for (var a in t[3]) attrs[a] = t[3][a];

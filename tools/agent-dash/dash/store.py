@@ -17,6 +17,7 @@ from dash.liveness import (
 )
 from dash.pricing import cost as price_cost
 from dash.pricing import series_key
+from dash.pricing import status as price_status
 from dash.models import model_key, run_model_key
 
 TOOL_KEYS = ("grok", "muse", "glm", "claude")
@@ -896,6 +897,13 @@ class Store:
                 totals = scope["totals"]
                 wanted = [roll["unassigned"]] if key == UNASSIGNED and roll["has_unassigned"] else roll["rows"]
                 by_ws = [row for row in wanted if row["ws"] == key]
+            scope_ws = None if ws in (None, "all") else ws
+            unpriced = self._unpriced_models_locked(range_since, range_until, scope_ws)
+            totals = {
+                **totals,
+                "unpriced_tokens": sum(entry["tokens"] for entry in unpriced),
+                "unpriced_models": [entry["model"] for entry in unpriced],
+            }
             response = {
                 "now": now,
                 "seq": self._seq,
@@ -912,7 +920,6 @@ class Store:
             if usage_group is not None:
                 # Same scope and window as the totals above, same lock pass:
                 # no writer can land between the two reads.
-                scope_ws = None if ws in (None, "all") else ws
                 response["usage"] = self._query_usage_locked(
                     usage_group, "hour", scope_ws, roll["since"], roll["until"]
                 )
@@ -1013,6 +1020,11 @@ class Store:
                     "cost_usd_all_time: workstream rows sum to "
                     f"{sum(row['cost_usd_all_time'] for row in everything):.6f}, "
                     f"overview shows {all_time['all']['cost_usd']:.6f}"
+                )
+            hours = (roll["until"] - roll["since"]) / 3600 if roll["until"] > roll["since"] else 0
+            for entry in self._unpriced_models_locked(roll["since"], roll["until"], None):
+                mismatches.append(
+                    f"unpriced model: {entry['model']} ({entry['tokens']} tokens in {hours:g} h)"
                 )
             for run, reason in self._stale_locked(now, shown_all):
                 mismatches.append(f"stale running: {run.get('run_id')} ({reason})")
@@ -1552,6 +1564,60 @@ class Store:
                 }
             )
         return stats
+
+    def unpriced_models(
+        self,
+        now: float,
+        since: float | None = None,
+        until: float | None = None,
+        ws: str | None = None,
+    ) -> list[dict]:
+        """Models with usage rows in the window and no catalog rate.
+
+        One entry per model: ``{"model", "rows", "tokens"}``, sorted by
+        model. A missing rate never becomes zero: these tokens are left
+        out of cost, and health, reconcile, and the cost tile say so
+        loudly. Rows with no model id are skipped (data quality, not a
+        price gap).
+        """
+        range_since = now - RANGE_S if since is None else float(since)
+        range_until = float(now if until is None else until)
+        with self._lock:
+            return self._unpriced_models_locked(range_since, range_until, ws)
+
+    def _unpriced_models_locked(self, since: float, until: float, ws: str | None) -> list[dict]:
+        """Windowed unpriced models. Caller holds the lock."""
+        sql = """SELECT e.model AS model, COUNT(*) AS rows,
+                        SUM(COALESCE(e.input_tokens, 0) + COALESCE(e.output_tokens, 0)
+                            + COALESCE(e.cache_read, 0) + COALESCE(e.cache_write, 0)) AS tokens
+                 FROM usage_events e LEFT JOIN runs r ON r.run_id = e.run_id
+                 WHERE e.ts >= ? AND e.ts < ?"""
+        args: list = [since, until]
+        if ws is not None and ws != "all":
+            if ws == UNASSIGNED:
+                sql += " AND (r.workstream IS NULL OR r.workstream = '')"
+            else:
+                sql += " AND r.workstream = ?"
+                args.append(ws)
+        sql += " GROUP BY e.model"
+        out = []
+        for row in self._conn.execute(sql, args).fetchall():
+            model = row["model"]
+            if not model:
+                continue
+            if int(row["rows"] or 0) <= 0:
+                continue
+            if price_status(model)["priced"]:
+                continue
+            out.append(
+                {
+                    "model": model,
+                    "rows": int(row["rows"]),
+                    "tokens": int(row["tokens"] or 0),
+                }
+            )
+        out.sort(key=lambda entry: entry["model"])
+        return out
 
     def usage_events_for_cost(self) -> list[dict]:
         with self._lock:

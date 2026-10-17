@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import json
 import re
+import sys
 import threading
 import time
+from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -31,7 +33,33 @@ class DashServer(ThreadingHTTPServer):
         self.index_path = Path(index_path) if index_path is not None else INDEX_PATH
         self.stream_interval = stream_interval
         self.stop = threading.Event()
+        self._disconnects: deque = deque()
+        self._disconnects_lock = threading.Lock()
         super().__init__((host, port), Handler)
+
+    def note_disconnect(self) -> None:
+        """Record a client that went away mid-response. Never raises."""
+        now = time.time()
+        with self._disconnects_lock:
+            self._disconnects.append(now)
+            while self._disconnects and now - self._disconnects[0] > 3600:
+                self._disconnects.popleft()
+
+    def disconnects_1h(self) -> int:
+        """Client disconnects in the last hour (no traceback was logged)."""
+        now = time.time()
+        with self._disconnects_lock:
+            while self._disconnects and now - self._disconnects[0] > 3600:
+                self._disconnects.popleft()
+            return len(self._disconnects)
+
+    def handle_error(self, request, client_address):
+        """Client disconnects are counted, not printed. Real errors still log."""
+        exc_type = sys.exc_info()[0]
+        if exc_type is not None and issubclass(exc_type, (BrokenPipeError, ConnectionResetError)):
+            self.note_disconnect()
+            return
+        super().handle_error(request, client_address)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -75,8 +103,14 @@ class Handler(BaseHTTPRequestHandler):
             elif path.startswith("/bundle/"):
                 self._bundle_page(path)
             elif path == "/api/health":
-                body = self.server.registry.health(time.time(), self.server.cfg)
+                now = time.time()
+                body = self.server.registry.health(now, self.server.cfg)
                 body["pricing"] = health_block(self.server.store.usage_model_stats())
+                body["disconnects_1h"] = self.server.disconnects_1h()
+                unpriced = self.server.store.unpriced_models(now, now - 86400, now)
+                if unpriced:
+                    body["ok"] = False
+                    body["unpriced_models"] = unpriced
                 self._json(200, body)
             elif path.startswith("/static/"):
                 self._static(path[len("/static/"):])
@@ -110,12 +144,15 @@ class Handler(BaseHTTPRequestHandler):
             self._json(404, {"error": "not found"})
             return
         body = target.read_bytes()
-        self.send_response(200)
-        self.send_header("Content-Type", types[target.suffix])
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", types[target.suffix])
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            self.server.note_disconnect()
 
     def _taskmap(self):
         from dash.locate import layered_path
@@ -293,6 +330,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.write(blob)
                 self.wfile.flush()
             except (BrokenPipeError, ConnectionError, TimeoutError):
+                self.server.note_disconnect()
                 return
             if self.server.stop.wait(interval):
                 return
@@ -302,12 +340,15 @@ class Handler(BaseHTTPRequestHandler):
         self._bytes(status, raw, "application/json; charset=utf-8")
 
     def _bytes(self, status: int, body: bytes, content_type: str) -> None:
-        self.send_response(status)
-        self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            self.server.note_disconnect()
 
 
 def _live_workers() -> list:
