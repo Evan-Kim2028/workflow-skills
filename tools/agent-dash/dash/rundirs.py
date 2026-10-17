@@ -117,7 +117,7 @@ def scan_roots(cfg) -> list:
     except (OSError, ValueError):
         roots = []
     try:
-        extra = registered_run_dirs(cfg=cfg)
+        extra = registered_run_dirs(cfg=cfg) if _registry_configured(cfg) else []
     except (OSError, ValueError):
         extra = []
     seen = set()
@@ -137,6 +137,21 @@ def scan_roots(cfg) -> list:
         seen.add(real)
         out.append(path)
     return out
+
+
+def _registry_configured(cfg) -> bool:
+    """Read the run-folder registry only when a state dir is named.
+
+    The live config always carries ``state_dir`` and run_worker sets the
+    env; a bare test config names neither, so tests never read the
+    machine's real ``run-dirs.txt``.
+    """
+    if isinstance(cfg, dict):
+        raw = cfg.get("state_dir")
+        if isinstance(raw, str) and raw.strip():
+            return True
+    env = os.environ.get("AGENT_DASH_STATE_DIR")
+    return bool(env and env.strip())
 
 
 def describe_roots(cfg, now=None, processes="auto") -> dict:

@@ -727,8 +727,10 @@ def _flat_run_dirs(cfg, now, covered) -> list:
     flat layout for them. Folders already covered by ``covered`` scratch
     pads are skipped.
     """
-    from dash.rundirs import registered_run_dirs, state_dir_of
+    from dash.rundirs import _registry_configured, registered_run_dirs, state_dir_of
 
+    if not _registry_configured(cfg):
+        return []
     try:
         rundirs = registered_run_dirs(state_dir_of(cfg), now=now)
     except (OSError, ValueError):
