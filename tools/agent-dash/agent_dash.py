@@ -51,7 +51,7 @@ USAGE = """agent-dash: local read-only execution dashboard
   python3 agent_dash.py ws new <ID> "<title>"
   python3 agent_dash.py ws validate <ID>
   python3 agent_dash.py ws render <ID>
-  python3 agent_dash.py ws task <ID> <task-id> <status> [--moved-to WSn] [--note "..."]
+  python3 agent_dash.py ws task <ID> <task-id> <status> [--moved-to WSn] [--note "..."] [--force]
   python3 agent_dash.py ws train <ID> <train-id> [--title T] [--branch B] [--status S] [--add id,id] [--remove id,id] [--pr N] [--shared f1,f2] [--gate "..."] [--note "..."]
   python3 agent_dash.py ws trains <ID>
 """

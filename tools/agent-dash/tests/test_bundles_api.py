@@ -154,6 +154,35 @@ class BundlesApiTest(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(json.loads(body)["ws"], "WS7")
 
+    def test_valid_bundle_serves_empty_issues(self):
+        status, _, body = get(self.port, "/api/plan?ws=WS9")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)["issues"], [])
+        status, _, body = get(self.port, "/api/bundle?ws=WS9")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)["issues"], [])
+
+    def test_invalid_bundle_serves_with_issues(self):
+        plan_path = Path(self.tmp.name) / "WS9" / "plan.json"
+        plan = json.loads(plan_path.read_text(encoding="utf-8"))
+        tasks = plan["dag"]["groups"][0]["tasks"]
+        tasks[0]["kind"] = "fuzzy-kind"
+        tasks[0]["status"] = "bogus-status"
+        tasks[0]["deps"] = ["ZZ"]
+        tasks[0]["dep_notes"] = {"ZZ": "start only after the signal"}
+        plan_path.write_text(json.dumps(plan), encoding="utf-8")
+        status, _, body = get(self.port, "/api/plan?ws=WS9")
+        self.assertEqual(status, 200)
+        payload = json.loads(body)
+        self.assertTrue(payload["issues"])
+        self.assertTrue(any("fuzzy-kind" in issue for issue in payload["issues"]))
+        self.assertTrue(any("bogus-status" in issue for issue in payload["issues"]))
+        self.assertEqual(payload["groups"][0]["tasks"][0]["status"], "bogus-status")
+        status, _, body = get(self.port, "/api/bundle?ws=WS9")
+        self.assertEqual(status, 200)
+        bundle = json.loads(body)
+        self.assertEqual(bundle["issues"], payload["issues"])
+
     def test_two_plan_sources_resolve_to_one(self):
         from dash.bundles import resolve_plan
 

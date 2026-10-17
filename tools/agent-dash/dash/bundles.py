@@ -6,6 +6,8 @@ One directory per bundle. The tool directory stays free of project text.
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import json
 import os
 import re
@@ -55,7 +57,7 @@ WS_USAGE = """agent-dash workstream bundles
   python3 agent_dash.py ws new <ID> "<title>"
   python3 agent_dash.py ws validate <ID>
   python3 agent_dash.py ws render <ID>
-  python3 agent_dash.py ws task <ID> <task-id> <status> [--moved-to WSn] [--note "..."]
+  python3 agent_dash.py ws task <ID> <task-id> <status> [--moved-to WSn] [--note "..."] [--force]
   python3 agent_dash.py ws train <ID> <train-id> [--title T] [--branch B] [--status S] [--add id,id] [--remove id,id] [--pr N] [--shared f1,f2] [--gate "..."] [--note "..."]
   python3 agent_dash.py ws trains <ID>
   python3 agent_dash.py ws approve <ID> <item-id> <approved|denied|pending> [--note "..."] [--step "..."] [--reversible yes|no] [--conditions "..."]
@@ -248,6 +250,7 @@ def load_bundle_api(ws: str) -> dict | None:
         "progress": plan_progress(dag.get("groups")),
         "approvals": approvals if approvals is not None else empty_approvals(ws),
         "start_prompt": start_prompt_text(ws),
+        "issues": validate_bundle(ws),
     }
 
 
@@ -311,6 +314,7 @@ def bundle_plan_view(ws: str) -> dict | None:
         "trains": sanitized_trains(data.get("trains")),
         "progress": plan_progress(groups),
         "start_prompt": start_prompt_text(ws),
+        "issues": validate_bundle(ws),
     }
 
 
@@ -338,6 +342,26 @@ def _atomic_write(path: Path, text: str) -> None:
     tmp = path.with_name(path.name + ".tmp")
     tmp.write_text(text, encoding="utf-8")
     os.replace(tmp, path)
+
+
+@contextlib.contextmanager
+def _bundle_lock(path: Path):
+    """Cross-process exclusive lock for one bundle's read-modify-write cycles.
+
+    ``_atomic_write`` makes each write atomic, not the read-modify-write
+    cycle: two ``ws task`` writers in the same second would both read the
+    same ``plan.json`` and the last ``os.replace`` would silently drop the
+    other's change. Holding this lock across the read and the write keeps
+    every update. History appends stay outside the lock (one O_APPEND line
+    is already atomic).
+    """
+    path.mkdir(parents=True, exist_ok=True)
+    with open(path / ".lock", "a+b") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 def _template_plan(ws: str) -> dict:
@@ -795,61 +819,62 @@ def set_approval(
         print(f"bundle not found: {ws}", flush=True)
         return 2
     file = path / "approvals.json"
-    if file.is_file():
-        data = _read_json(file)
-        if not isinstance(data, dict):
-            print("approvals.json unreadable", flush=True)
-            return 2
-    else:
-        data = empty_approvals(ws)
-    items = data.get("items")
-    if not isinstance(items, list):
-        items = []
-    found = None
-    for item in items:
-        if isinstance(item, dict) and item.get("id") == item_id:
-            found = item
-            break
-    if found is None:
-        if step is None or not str(step).strip():
-            print("step required", flush=True)
-            return 2
-        if reversible is None:
-            print("reversible required", flush=True)
-            return 2
-        found = {
-            "id": item_id,
-            "step": str(step).strip(),
-            "status": status,
-            "reversible": reversible,
-            "conditions": conditions or "",
+    with _bundle_lock(path):
+        if file.is_file():
+            data = _read_json(file)
+            if not isinstance(data, dict):
+                print("approvals.json unreadable", flush=True)
+                return 2
+        else:
+            data = empty_approvals(ws)
+        items = data.get("items")
+        if not isinstance(items, list):
+            items = []
+        found = None
+        for item in items:
+            if isinstance(item, dict) and item.get("id") == item_id:
+                found = item
+                break
+        if found is None:
+            if step is None or not str(step).strip():
+                print("step required", flush=True)
+                return 2
+            if reversible is None:
+                print("reversible required", flush=True)
+                return 2
+            found = {
+                "id": item_id,
+                "step": str(step).strip(),
+                "status": status,
+                "reversible": reversible,
+                "conditions": conditions or "",
+            }
+            if note is not None:
+                found["note"] = note
+            items.append(found)
+        else:
+            found["status"] = status
+            if step is not None:
+                found["step"] = step
+            if reversible is not None:
+                found["reversible"] = reversible
+            if conditions is not None:
+                found["conditions"] = conditions
+            if note is not None:
+                found["note"] = note
+        if status in ("approved", "denied"):
+            data["decided_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            data["decided_by"] = "owner"
+        else:
+            data.setdefault("decided_at", None)
+            data.setdefault("decided_by", None)
+        payload = {
+            "ws": ws,
+            "decided_at": data.get("decided_at"),
+            "decided_by": data.get("decided_by"),
+            "items": items,
         }
-        if note is not None:
-            found["note"] = note
-        items.append(found)
-    else:
-        found["status"] = status
-        if step is not None:
-            found["step"] = step
-        if reversible is not None:
-            found["reversible"] = reversible
-        if conditions is not None:
-            found["conditions"] = conditions
-        if note is not None:
-            found["note"] = note
-    if status in ("approved", "denied"):
-        data["decided_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        data["decided_by"] = "owner"
-    else:
-        data.setdefault("decided_at", None)
-        data.setdefault("decided_by", None)
-    payload = {
-        "ws": ws,
-        "decided_at": data.get("decided_at"),
-        "decided_by": data.get("decided_by"),
-        "items": items,
-    }
-    _atomic_write(file, json.dumps(payload, indent=2, ensure_ascii=False) + "\n")
+        _atomic_write(file, json.dumps(payload, indent=2, ensure_ascii=False) + "\n")
     print(f"{ws} {item_id} {status}")
     return 0
 
@@ -1034,7 +1059,15 @@ def validate_bundle(ws: str, root: Path | None = None) -> list[str]:
     return issues
 
 
-def set_task(ws: str, task_id: str, status: str, moved_to: str | None, note: str | None, root: Path | None = None) -> int:
+def set_task(
+    ws: str,
+    task_id: str,
+    status: str,
+    moved_to: str | None,
+    note: str | None,
+    root: Path | None = None,
+    force: bool = False,
+) -> int:
     if status not in STATUSES:
         print(f"bad status {status}. Use one of:", flush=True)
         for key in STATUSES:
@@ -1053,36 +1086,40 @@ def set_task(ws: str, task_id: str, status: str, moved_to: str | None, note: str
         print(f"bundle not found: {ws}", flush=True)
         return 2
     plan_path = path / "plan.json"
-    data = _read_json(plan_path)
-    if not isinstance(data, dict):
-        print("plan.json unreadable", flush=True)
-        return 2
-    dag = data.get("dag")
-    if not isinstance(dag, dict) or not isinstance(dag.get("groups"), list):
-        print("plan.json has no dag", flush=True)
-        return 2
-    found = False
-    old_status: str | None = None
-    for group in dag["groups"]:
-        if not isinstance(group, dict):
-            continue
-        for task in group.get("tasks") or []:
-            if isinstance(task, dict) and task.get("id") == task_id:
-                old_status = task.get("status") if isinstance(task.get("status"), str) else None
-                task["status"] = status
-                if status == "deferred":
-                    if moved_to is not None:
-                        task["moved_to"] = moved_to
-                    if note is not None:
-                        task["note"] = note
-                else:
-                    task.pop("moved_to", None)
-                    task.pop("note", None)
-                found = True
-    if not found:
-        print(f"task not found: {task_id}", flush=True)
-        return 2
-    _atomic_write(plan_path, json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+    with _bundle_lock(path):
+        data = _read_json(plan_path)
+        if not isinstance(data, dict):
+            print("plan.json unreadable", flush=True)
+            return 2
+        dag = data.get("dag")
+        if not isinstance(dag, dict) or not isinstance(dag.get("groups"), list):
+            print("plan.json has no dag", flush=True)
+            return 2
+        found = False
+        old_status: str | None = None
+        for group in dag["groups"]:
+            if not isinstance(group, dict):
+                continue
+            for task in group.get("tasks") or []:
+                if isinstance(task, dict) and task.get("id") == task_id:
+                    old_status = task.get("status") if isinstance(task.get("status"), str) else None
+                    if not force and old_status in ("done", "deferred") and status in ("wip", "pr"):
+                        print(f"refusing to move {ws} {task_id} from {old_status} to {status} (use --force)", flush=True)
+                        return 2
+                    task["status"] = status
+                    if status == "deferred":
+                        if moved_to is not None:
+                            task["moved_to"] = moved_to
+                        if note is not None:
+                            task["note"] = note
+                    else:
+                        task.pop("moved_to", None)
+                        task.pop("note", None)
+                    found = True
+        if not found:
+            print(f"task not found: {task_id}", flush=True)
+            return 2
+        _atomic_write(plan_path, json.dumps(data, indent=2, ensure_ascii=False) + "\n")
     if old_status != status:
         append_history(ws, task_id, old_status, status, root=root)
     print(f"{ws} {task_id} {status}")
@@ -1159,64 +1196,65 @@ def set_train(
         print(f"bundle not found: {ws}", flush=True)
         return 2
     plan_path = path / "plan.json"
-    data = _read_json(plan_path)
-    if not isinstance(data, dict):
-        print("plan.json unreadable", flush=True)
-        return 2
-    known = _dag_task_ids(data)
-    trains = data.get("trains")
-    if trains is None:
-        trains = []
-        data["trains"] = trains
-    if not isinstance(trains, list):
-        print("plan.json trains is not a list", flush=True)
-        return 2
-    found = None
-    for item in trains:
-        if isinstance(item, dict) and item.get("id") == train_id:
-            found = item
-            break
-    if found is None:
-        if title is None:
-            print("title required for a new train", flush=True)
+    with _bundle_lock(path):
+        data = _read_json(plan_path)
+        if not isinstance(data, dict):
+            print("plan.json unreadable", flush=True)
             return 2
-        found = {"id": train_id, "title": title.strip(), "members": [], "status": "planned"}
-        trains.append(found)
-    elif title is not None:
-        found["title"] = title.strip()
-    members = found.get("members")
-    if not isinstance(members, list):
-        members = []
-        found["members"] = members
-    for task_id in remove or []:
-        if task_id in members:
-            members.remove(task_id)
-    for task_id in add or []:
-        if task_id not in known:
-            print(f"task not found: {task_id}", flush=True)
+        known = _dag_task_ids(data)
+        trains = data.get("trains")
+        if trains is None:
+            trains = []
+            data["trains"] = trains
+        if not isinstance(trains, list):
+            print("plan.json trains is not a list", flush=True)
             return 2
-        for other in trains:
-            if other is not found and isinstance(other, dict) and task_id in (other.get("members") or []):
-                other["members"].remove(task_id)
-                print(f"moved {task_id} from {other.get('id')} to {train_id}", flush=True)
-        if task_id not in members:
-            members.append(task_id)
-    if add and len(members) > TRAIN_MEMBER_LIMIT:
-        print(f"train {train_id} has {len(members)} members; split it (limit {TRAIN_MEMBER_LIMIT})", flush=True)
-        return 2
-    if branch is not None:
-        found["branch"] = branch
-    if status is not None:
-        found["status"] = status
-    if pr is not None:
-        found["pr"] = pr
-    if shared is not None:
-        found["shared_files"] = shared
-    if gate is not None:
-        found["gate"] = gate
-    if note is not None:
-        found["note"] = note
-    _atomic_write(plan_path, json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+        found = None
+        for item in trains:
+            if isinstance(item, dict) and item.get("id") == train_id:
+                found = item
+                break
+        if found is None:
+            if title is None:
+                print("title required for a new train", flush=True)
+                return 2
+            found = {"id": train_id, "title": title.strip(), "members": [], "status": "planned"}
+            trains.append(found)
+        elif title is not None:
+            found["title"] = title.strip()
+        members = found.get("members")
+        if not isinstance(members, list):
+            members = []
+            found["members"] = members
+        for task_id in remove or []:
+            if task_id in members:
+                members.remove(task_id)
+        for task_id in add or []:
+            if task_id not in known:
+                print(f"task not found: {task_id}", flush=True)
+                return 2
+            for other in trains:
+                if other is not found and isinstance(other, dict) and task_id in (other.get("members") or []):
+                    other["members"].remove(task_id)
+                    print(f"moved {task_id} from {other.get('id')} to {train_id}", flush=True)
+            if task_id not in members:
+                members.append(task_id)
+        if add and len(members) > TRAIN_MEMBER_LIMIT:
+            print(f"train {train_id} has {len(members)} members; split it (limit {TRAIN_MEMBER_LIMIT})", flush=True)
+            return 2
+        if branch is not None:
+            found["branch"] = branch
+        if status is not None:
+            found["status"] = status
+        if pr is not None:
+            found["pr"] = pr
+        if shared is not None:
+            found["shared_files"] = shared
+        if gate is not None:
+            found["gate"] = gate
+        if note is not None:
+            found["note"] = note
+        _atomic_write(plan_path, json.dumps(data, indent=2, ensure_ascii=False) + "\n")
     print(f"{ws} train {train_id} {found.get('status')}")
     return 0
 
@@ -1318,6 +1356,7 @@ def cmd_ws(argv: list[str]) -> int:
             return 2
         moved = None
         note = None
+        force = False
         flags = rest[3:]
         index = 0
         while index < len(flags):
@@ -1328,10 +1367,13 @@ def cmd_ws(argv: list[str]) -> int:
             elif flag == "--note" and index + 1 < len(flags):
                 note = flags[index + 1]
                 index += 2
+            elif flag == "--force":
+                force = True
+                index += 1
             else:
                 print(WS_USAGE, end="", flush=True)
                 return 2
-        return set_task(rest[0], rest[1], rest[2], moved, note)
+        return set_task(rest[0], rest[1], rest[2], moved, note, force=force)
     if cmd == "train":
         if len(rest) < 2:
             print(WS_USAGE, end="", flush=True)

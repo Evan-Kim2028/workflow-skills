@@ -164,6 +164,56 @@ class WsCliTest(unittest.TestCase):
         self.assertEqual(set_task("WS3", "missing", "done", None, None), 2)
         self.assertEqual(cmd_ws(["task", "WS3", "WS3.1", "nope"]), 2)
 
+    def test_done_and_deferred_need_force_to_reopen(self):
+        self.assertEqual(cmd_ws(["new", "WS8", "Guard"]), 0)
+        self.assertEqual(set_task("WS8", "WS8.1", "done", None, None), 0)
+        self.assertEqual(cmd_ws(["task", "WS8", "WS8.1", "wip"]), 2)
+        self.assertEqual(cmd_ws(["task", "WS8", "WS8.1", "pr"]), 2)
+        plan = _plan(Path(self.tmp.name), "WS8")
+        self.assertEqual(plan["dag"]["groups"][0]["tasks"][0]["status"], "done")
+        self.assertEqual(cmd_ws(["task", "WS8", "WS8.1", "wip", "--force"]), 0)
+        plan = _plan(Path(self.tmp.name), "WS8")
+        self.assertEqual(plan["dag"]["groups"][0]["tasks"][0]["status"], "wip")
+        self.assertEqual(set_task("WS8", "WS8.1", "deferred", "WS6", "waiting on the cutover"), 0)
+        self.assertEqual(cmd_ws(["task", "WS8", "WS8.1", "wip"]), 2)
+        self.assertEqual(cmd_ws(["task", "WS8", "WS8.1", "pr"]), 2)
+        self.assertEqual(cmd_ws(["task", "WS8", "WS8.1", "wip", "--force"]), 0)
+        plan = _plan(Path(self.tmp.name), "WS8")
+        self.assertEqual(plan["dag"]["groups"][0]["tasks"][0]["status"], "wip")
+        self.assertEqual(set_task("WS8", "WS8.1", "done", None, None), 0)
+        self.assertEqual(cmd_ws(["task", "WS8", "WS8.1", "todo"]), 0)
+
+    def test_concurrent_task_writes_keep_every_update(self):
+        import subprocess
+
+        self.assertEqual(cmd_ws(["new", "WS9", "Race"]), 0)
+        ids = [f"WS9.{n}" for n in range(1, 101)]
+        _add_tasks(Path(self.tmp.name), "WS9", ids)
+        root = str(Path(__file__).resolve().parents[1])
+        worker = (
+            "import sys; sys.path.insert(0, %r); "
+            "from dash.bundles import set_task; "
+            "[set_task('WS9', tid, 'done', None, None) for tid in %r]"
+        )
+        procs = [
+            subprocess.Popen(
+                [sys.executable, "-c", worker % (root, ids[:50])],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            ),
+            subprocess.Popen(
+                [sys.executable, "-c", worker % (root, ids[50:])],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            ),
+        ]
+        for proc in procs:
+            self.assertEqual(proc.wait(timeout=120), 0)
+        plan = _plan(Path(self.tmp.name), "WS9")
+        statuses = {task["id"]: task["status"] for group in plan["dag"]["groups"] for task in group["tasks"]}
+        missing = [tid for tid in ids if statuses.get(tid) != "done"]
+        self.assertEqual(missing, [])
+
     def test_task_appends_history(self):
         from dash.bundles import append_history
 

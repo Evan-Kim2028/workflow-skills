@@ -80,6 +80,17 @@ class PageRules(unittest.TestCase):
             self.assertEqual(hits, [], f"{name} computes % done itself: {hits[:2]}")
             self.assertIn(".progress", src, f"{name} never reads the server progress object")
 
+    def test_bad_plan_shows_attention_line(self):
+        """A bundle that fails validation still serves, and the progress
+        map says so: a muted 'plan needs attention' line naming the first
+        issue, instead of drawing bad states as if they were fine."""
+        script = inline_scripts()
+        bodies = dict(functions(script))
+        self.assertIn("planCard", bodies)
+        body = bodies["planCard"]
+        self.assertIn("plan needs attention", body, "the progress map names no attention line")
+        self.assertIn("plan.issues", body, "the attention line does not read the server issues list")
+
     def test_tiles_read_server_totals(self):
         """Token and cost tiles read the server snapshot totals for the tab's
         scope and the fixed 24 h window. They never re-sum usage buckets on

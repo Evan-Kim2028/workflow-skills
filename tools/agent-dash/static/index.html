@@ -1147,6 +1147,7 @@ body.clip #main{zoom:.92}
     var legendPop = el("div", {class: "pop"}, [el("b", {text: "What the chips mean"})]);
     var legendBtn = el("span", {class: "legend-tip", tabindex: "0", "aria-label": "Legend"}, ["Legend \u24D8", legendPop]);
     c.firstChild.appendChild(legendBtn);
+    if (plan.issues && plan.issues.length) { c.appendChild(el("p", {class: "sub", style: "color:var(--muted)", text: "plan needs attention: " + plan.issues[0]})); }
     var workingIds = Object.keys(live);
     if (workingIds.length) {
       var wn = el("div", {class: "working-now"}, [el("b", {text: "\u25CF Working now (" + nLive + ")"})]);

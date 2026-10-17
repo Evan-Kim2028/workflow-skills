@@ -133,7 +133,11 @@ drives the live page in headless Chrome over the DevTools protocol
 chart legend against the API for the overview and every workstream tab at the
 one fixed 24 h window; it skips with a clear message when Chrome is missing.
 
-`GET /api/plan?ws=WS7` -> that workstream's plan with a `progress` object:
+`GET /api/plan?ws=WS7` -> that workstream's plan with a `progress` object
+(plus an `issues` list, the `ws validate` findings, empty when clean; a bad
+plan still serves 200 with its issues named, and the progress map shows a
+muted "plan needs attention: <first issue>" line instead of drawing the bad
+states as if they were fine):
 `{"ws": "WS7", "cols": [..], "groups": [{id, col, title, tasks: [{id, title, status, deps, kind, dep_notes}]}], "edges": [[a, b]], "phases": [{name, goal, gate}], "progress": {"done": 0, "total": 0, "counts": {todo, wip, pr, prog, done, deferred}, "pct": 0}}`.
 A task's `kind` is `task` or `gate` (an outside signal or condition, drawn as a diamond); absent means `task`. `dep_notes` maps one of the task's dep ids to the short condition on that edge. Both pass through every plan API sanitized like other fields. `/api/bundle` carries the same task shape inside `plan.dag.groups`.
 `plans.local.json` replaces `plans.example.json`. Each value is a path. Relative paths resolve next to the plans file. The loader reads `dag` and `narrative.phases`.
@@ -275,18 +279,18 @@ python3 agent_dash.py ws list
 python3 agent_dash.py ws new <ID> "<title>"
 python3 agent_dash.py ws validate <ID>
 python3 agent_dash.py ws render <ID>
-python3 agent_dash.py ws task <ID> <task-id> <status> [--moved-to WSn] [--note "..."]
+python3 agent_dash.py ws task <ID> <task-id> <status> [--moved-to WSn] [--note "..."] [--force]
 python3 agent_dash.py ws approve <ID> <item-id> <approved|denied|pending> [--note "..."] [--step "..."] [--reversible yes|no] [--conditions "..."]
 python3 agent_dash.py ws approvals [<ID>]
 ```
 
-`ws new` writes a valid template. `ws task` writes `plan.json` through a temp file and `os.replace`. `ws approve` writes `approvals.json` the same way. A new pending item needs `--step`, `--reversible yes|no`, and `--conditions`. `approved` or `denied` sets `decided_at` and `decided_by` to `owner`. `ws approvals` prints a table. `ws validate` checks the schema, including `approvals.json` when that file exists, and the naming rule: a TU-style id, a 3-to-5-digit issue number, or an ADR number with no phrase earlier on the same line is a failure.
+`ws new` writes a valid template. `ws task` writes `plan.json` through a temp file and `os.replace`, holding a per-bundle `fcntl` lock across the read-modify-write so concurrent writers keep every update. `ws approve` writes `approvals.json` the same way. Moving a `done` or `deferred` task back to `wip` or `pr` needs `--force`. A new pending item needs `--step`, `--reversible yes|no`, and `--conditions`. `approved` or `denied` sets `decided_at` and `decided_by` to `owner`. `ws approvals` prints a table. `ws validate` checks the schema, including `approvals.json` when that file exists, and the naming rule: a TU-style id, a 3-to-5-digit issue number, or an ADR number with no phrase earlier on the same line is a failure.
 
 HTTP, still GET only, 127.0.0.1:
 
 - `GET /plan` serves the same shell as `GET /`.
 - `GET /api/bundles` returns `{bundles: [{id, title, short, order, kind}]}`, program first, then `order`.
-- `GET /api/bundle?ws=<ID>` returns `{bundle, plan, progress, approvals, start_prompt}` from that directory. `progress` is the same object `/api/plan` carries. Missing `approvals.json` is an empty item list. `start_prompt` is the text of `START-PROMPT.md`, or null.
+- `GET /api/bundle?ws=<ID>` returns `{bundle, plan, progress, approvals, start_prompt, issues}` from that directory. `progress` is the same object `/api/plan` carries. Missing `approvals.json` is an empty item list. `start_prompt` is the text of `START-PROMPT.md`, or null. `issues` is the same list `/api/plan` carries.
 - `GET /api/plan?ws=<ID>` includes `start_prompt` the same way when that bundle has the file, and null otherwise.
 - `GET /api/approvals?ws=<ID|all>` returns one record, or `{approvals: [...]}` for `all`.
 - `GET /bundle/<ID>/page.html` returns that file only. The resolved path has to stay inside the bundle directory.

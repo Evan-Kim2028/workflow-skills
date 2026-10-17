@@ -207,6 +207,8 @@ class Handler(BaseHTTPRequestHandler):
             return
         if isinstance(body, dict) and "start_prompt" not in body:
             body["start_prompt"] = start_prompt_text(ws)
+        if isinstance(body, dict) and "issues" not in body:
+            body["issues"] = []
         self._json(200, body)
 
     def _replay(self, query):
