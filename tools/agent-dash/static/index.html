@@ -345,7 +345,7 @@ body.clip #main{zoom:.92}
 <div class="topbar">
 <header class="shell">
 <h1 id="title">Agent dashboard</h1>
-<span class="live"><span class="dot" id="live-dot"></span><span id="live-txt">connecting</span><span id="stale-badge" hidden>stale</span></span><button type="button" id="doctor-pill" class="doc-pill" data-tone="muted" title="Checking health…">○ checking health</button>
+<span class="live"><span class="dot" id="live-dot"></span><span id="live-txt">connecting</span><span id="stale-badge" hidden>stale</span></span>
 <nav class="view-toggle" aria-label="View">
 <button type="button" id="view-plan" aria-pressed="false">Plan</button>
 <button type="button" id="view-exec" aria-pressed="true">Execution</button>
@@ -371,7 +371,6 @@ body.clip #main{zoom:.92}
 <script src="/static/tokencache.js"></script>
 <script src="/static/tabs.js"></script>
 <script src="/static/models.js"></script>
-<script src="/static/doctor.js"></script>
 <script src="/static/vendor/mermaid.min.js"></script>
 <script src="/static/plan.js"></script>
 <script>
@@ -386,7 +385,7 @@ body.clip #main{zoom:.92}
   var execCache = {};
   var execGen = 0;
   var WINDOW_HOURS = 24;
-  var state = {view: "exec", ws: "all", snap: null, runs: [], usage: [], conc: [], wss: [], bundles: [], plan: null, seq: -1, groupBy: "model", approvals: [], snapError: null, lastSeqChange: 0, lastPoll: null, lastDataTs: null, doctor: null, doctorFailed: false, doctorAt: 0};
+  var state = {view: "exec", ws: "all", snap: null, runs: [], usage: [], conc: [], wss: [], bundles: [], plan: null, seq: -1, groupBy: "model", approvals: [], snapError: null, lastSeqChange: 0, lastPoll: null, lastDataTs: null};
   /* Models: family = hue, model = shade of it (static/models.js). Keys look like grok-4.7, composer-2.5, glm-5.3-flash, haiku. */
   function modelName(k) { return ADM.nameOf(k); }
   function fullName(k) { var f = ADM.FAM[ADM.famOf(k)].name, n = ADM.nameOf(k); return n.indexOf(f + " ") === 0 ? n : f + " \u00B7 " + n; }
@@ -419,7 +418,7 @@ body.clip #main{zoom:.92}
   var NS = "http://www.w3.org/2000/svg";
   function s(tag, attrs) { var e = document.createElementNS(NS, tag); for (var k in attrs) e.setAttribute(k, attrs[k]); return e; }
 
-  var FIXMAP = {"/api/snapshot": "snapshot", "/api/runs": "runs", "/api/usage": "usage-model-hour", "/api/concurrency": "concurrency", "/api/sessions": "sessions", "/api/workstreams": "workstreams", "/api/health": "health", "/api/reconcile": "reconcile", "/api/doctor": "doctor"};
+  var FIXMAP = {"/api/snapshot": "snapshot", "/api/runs": "runs", "/api/usage": "usage-model-hour", "/api/concurrency": "concurrency", "/api/sessions": "sessions", "/api/workstreams": "workstreams", "/api/health": "health", "/api/reconcile": "reconcile"};
   function api(path, params) {
     var qs = new URLSearchParams(params || {}).toString();
     if (FIX) {
@@ -446,11 +445,6 @@ body.clip #main{zoom:.92}
           }
           return snap;
         });
-      }
-      if (path === "/api/doctor") {
-        var dbase = "doctor";
-        if (params && params.ws && params.ws !== "all") dbase = "doctor-" + params.ws;
-        return fetch("../fixtures/" + dbase + ".json").then(function (r) { if (!r.ok) throw new Error(r.status); return r.json(); });
       }
       var base = FIXMAP[path] || path.replace("/api/", "");
       if (path === "/api/usage" && params && params.group === "workstream") base = "usage-workstream-hour";
@@ -724,33 +718,6 @@ body.clip #main{zoom:.92}
     return "?" + q.toString();
   }
   function go(ws) { selectTab(ws); }
-  /* Workstream display names for the Health card scope chips (name things, not numbers). */
-  function wsNames() { var m = {}; (state.wss || []).forEach(function (w) { m[w.ws] = w.name; }); return m; }
-  /* Doctor health rides no loop of its own: load and tab switches fetch
-     through refreshAll, and stream ticks refetch when the tick's
-     health/doctor generated_at moves. */
-  function refreshDoctor() {
-    if (window.__adReplayOn || !window.DashDoctor) return;
-    var ws = state.ws, key = reqKey();
-    window.DashDoctor.fetchDoctor(ws === "all" ? null : ws).then(function (doc) {
-      if (!ADC.applies(key, state)) return;
-      state.doctor = doc || null;
-      state.doctorFailed = false;
-      if (doc && doc.generated_at != null) state.doctorAt = doc.generated_at;
-      updateDoctorPill();
-      if (state.view === "exec") drawMain();
-    }).catch(function () {
-      if (!ADC.applies(key, state)) return;
-      state.doctorFailed = true;
-      updateDoctorPill();
-      if (state.view === "exec") drawMain();
-    });
-  }
-  function updateDoctorPill() {
-    if (!window.DashDoctor) return;
-    window.DashDoctor.updatePill(document.getElementById("doctor-pill"), state.doctor, state.doctorFailed);
-  }
-
   /* components */
   /* Token and cost tiles read the server snapshot totals for this scope and
      the one fixed 24 h window (windowed and reconciled server-side). They
@@ -1196,13 +1163,10 @@ body.clip #main{zoom:.92}
     });
     function attText(a) { return a.runs + " run" + (a.runs > 1 ? "s" : "") + ": " + (a.runs - a.reviews) + " build, " + a.reviews + " review" + (a.reviews === 1 ? "" : "s") + (a.sentBack ? ", " + a.sentBack + " sent back (changes, partial or blocked)" : ""); }
     var nLive = Object.keys(live).reduce(function (a, k) { return a + live[k].length; }, 0);
-    /* Doctor problems naming a plan task (id "<code>:ws:<ID>:<task>") badge that chip. */
-    var docProbs = (window.DashDoctor && state.doctor && state.doctor.problems) ? window.DashDoctor.taskProblemMap(state.doctor.problems, plan.ws) : {};
     var c = el("div", {class: "card", id: "exec-progress", "data-nav": "Plan progress"}, [el("div", {style: "display:flex;align-items:baseline;gap:10px;flex-wrap:wrap"}, [el("h2", {text: plan.ws + " plan progress" + (nLive ? " · " + nLive + " agent" + (nLive > 1 ? "s" : "") + " working" : "")}), (plan.start_prompt ? copyBtn(plan.start_prompt) : null), el("a", {class: "planbtn", href: planUrl(plan.ws), onclick: function (ev) { ev.preventDefault(); openPlan(plan.ws); }, text: "Open the " + plan.ws + " plan"})]), el("p", {class: "sub", text: "Each tile is a stage of the plan, left to right. The pill says where it stands; hover a tile's progress line for the exact counts, or a chip for what it waits on and unblocks."})]);
     var legendPop = el("div", {class: "pop"}, [el("b", {text: "What the chips mean"})]);
     var legendBtn = el("span", {class: "legend-tip", tabindex: "0", "aria-label": "Legend"}, ["Legend \u24D8", legendPop]);
     c.firstChild.appendChild(legendBtn);
-    if (plan.issues && plan.issues.length) { c.appendChild(el("p", {class: "sub", style: "color:var(--muted)", text: "plan needs attention: " + plan.issues[0]})); }
     var workingIds = Object.keys(live);
     if (workingIds.length) {
       var wn = el("div", {class: "working-now"}, [el("b", {text: "\u25CF Working now (" + nLive + ")"})]);
@@ -1262,7 +1226,6 @@ body.clip #main{zoom:.92}
         if (rs.length) { gLive += rs.length; var b = el("span", {class: "ag", text: String(rs.length)}); b.style.background = colorOf(tierKey(rs[0])); cp.appendChild(b); cp.style.cursor = "pointer"; cp.addEventListener("click", function () { openRun(rs[0]); }); }
         else if (hasTaskDeps) { cp.style.cursor = "pointer"; cp.addEventListener("click", function (ev) { ev.stopPropagation(); pinned = pinned === t.id ? null : t.id; if (pinned) focusTask(t.id); else { clearTask(); groupEnter(g.id); } }); }
         if (hasTaskDeps) { cp.addEventListener("mouseenter", function () { focusTask(t.id); }); cp.addEventListener("mouseleave", function () { if (pinned) focusTask(pinned); else { clearTask(); groupEnter(g.id); } }); }
-        if (docProbs[t.id]) cp.appendChild(el("span", {class: "docwarn", title: docProbs[t.id].title || "Health problem", text: "\u26A0"}));
         chipEl[t.id] = cp;
         ch.appendChild(cp); });
       if (gLive) { n.insertBefore(el("div", {class: "live-n", text: "\u25CF " + gLive + " agent" + (gLive > 1 ? "s" : "") + " working"}), n.children[2]); n.classList.add("s-live"); }
@@ -2308,7 +2271,7 @@ body.clip #main{zoom:.92}
     });
     return c;
   }
-  setInterval(function () { if (state.view === "exec" && !window.__adReplayOn) { updateDoctorPill(); drawMain(); } }, 60000);
+  setInterval(function () { if (state.view === "exec" && !window.__adReplayOn) { drawMain(); } }, 60000);
   var resizeT = null;
   window.addEventListener("resize", function () { clearTimeout(resizeT); resizeT = setTimeout(function () { if (window.__adReplayOn) return; if (state.view === "exec") drawMain(); else if (window.__adPlanDraw) window.__adPlanDraw(); }, 150); });
   /* Keyed sections: a section is rebuilt only when its data key changes, and unchanged nodes are never moved, so animations and hover state survive live updates. */
@@ -2333,9 +2296,6 @@ body.clip #main{zoom:.92}
     if (m.dataset.scope !== scope || !m.querySelector("[data-sec]")) { m.innerHTML = ""; secCache = {}; m.dataset.scope = scope; m.classList.remove("fresh"); void m.offsetWidth; m.classList.add("fresh"); }
     var runRow = function (r) { return [r.run_id, r.status, r.verdict, r.out_bytes, r.tokens, r.context_tokens, Math.floor((r.elapsed_s || 0) / 15)]; };
     var specs = [];
-    /* Health card: top of the Overview (above Where we are), shown only
-       with problems, a recent resolution, or a pending/failed check. */
-    if (state.ws === "all" && window.DashDoctor && window.DashDoctor.showCard(state.doctor, state.doctorFailed)) specs.push(["doctor", keyOf([state.doctor, state.doctorFailed, state.wss.map(function (w) { return [w.ws, w.name]; }), Math.floor(Date.now() / 60000)]), function () { return window.DashDoctor.healthCard(state.doctor, {wsNames: wsNames(), failed: state.doctorFailed}); }, ""]);
     if (state.ws === "all" && state.wss.length) specs.push(["program", keyOf([state.wss.map(function (w) { return [w.ws, w.running, w.name]; }), planSum, planPrompt]), function () { return programPanel(); }, ""]);
     specs.push(
       ["tiles", keyOf([snap.counts, snap.totals, snap.totals_all_time, snap.last_activity, state.ws, state.snapError]), function () { return tiles(snap); }, state.ws === "all" ? "margin-top:14px" : ""],
@@ -2345,9 +2305,7 @@ body.clip #main{zoom:.92}
        read, so each card matches its workstream tab for the fixed 24 h window. */
     if (state.ws === "all") specs.push(["cards", keyOf([(snap.by_workstream || []), planSum]), function () { return wsCards(); }, "margin-top:14px"]);
     if (state.ws === "all" && state.wss.length && !Object.keys(planSum).length) loadPlanSums().then(function () { delete secCache.program; drawMain(); });
-    /* Workstream tab: the same Health card, filtered to this workstream, above the plan progress map. */
-    if (state.ws !== "all" && window.DashDoctor && window.DashDoctor.showCard(state.doctor, state.doctorFailed)) specs.push(["doctor", keyOf([state.doctor, state.doctorFailed, state.ws, Math.floor(Date.now() / 60000)]), function () { return window.DashDoctor.healthCard(state.doctor, {wsNames: wsNames(), failed: state.doctorFailed}); }, "margin-top:14px"]);
-    if (state.plan) specs.push(["plan", keyOf([state.plan, (snap.running || []).map(function (r) { return [r.label, r.workstream, r.run_id]; }), (snap.recent || []).map(function (r) { return [r.label, r.ended_at, r.verdict]; }), (state.runs || []).length, state.doctor, state.doctorFailed]), function () { return planCard(state.plan, snap); }, "margin-top:14px"]);
+    if (state.plan) specs.push(["plan", keyOf([state.plan, (snap.running || []).map(function (r) { return [r.label, r.workstream, r.run_id]; }), (snap.recent || []).map(function (r) { return [r.label, r.ended_at, r.verdict]; }), (state.runs || []).length]), function () { return planCard(state.plan, snap); }, "margin-top:14px"]);
     specs.push(["tokens", keyOf([state.usage, state.groupBy, Math.floor(Date.now() / 60000)]), function () { return tokenChart(); }, "margin-top:14px"]);
     specs.push(["conc", keyOf([state.conc, Math.floor(Date.now() / 60000)]), function () { return concChart(snap); }, "margin-top:14px"]);
     specs.push(["gantt", keyOf([(state.runs || []).map(runRow), expanded, Math.floor(Date.now() / 60000)]), function () { return gantt(); }, "margin-top:14px"]);
@@ -2488,7 +2446,6 @@ body.clip #main{zoom:.92}
       ws !== "all" ? api("/api/plan", {ws: ws}).then(function (j) { return j && j.groups ? j : null; }).catch(function () { return null; }) : Promise.resolve(null),
       api("/api/approvals", {ws: ws === "all" ? "all" : ws}).then(approvalList).catch(function () { return []; })
     ];
-    refreshDoctor();
     return Promise.all(jobs).then(function (parts) {
       if (gen !== execGen || !ADC.applies(key, state)) return;
       if (!parts[0]) {
@@ -2538,8 +2495,6 @@ body.clip #main{zoom:.92}
         if (state.lastSeqChange === 0) state.lastSeqChange = nowS;
         if (d.seq !== state.seq) { state.lastSeqChange = nowS; refreshSnapshot(); }
         else updateStale(nowS);
-        var dg = d.doctor_generated_at != null ? d.doctor_generated_at : (d.health && d.health.doctor && d.health.doctor.generated_at);
-        if (dg != null && dg !== state.doctorAt) { state.doctorAt = dg; refreshDoctor(); }
       } catch (e) {}
       setLive(true);
       updateStale();
@@ -2574,7 +2529,6 @@ body.clip #main{zoom:.92}
     if (state.view === "exec" && state.snap) drawMain();
     else if (window.PlanView) PlanView.restyle();
   });
-  document.getElementById("doctor-pill").addEventListener("click", function () { var n = document.getElementById("exec-health"); if (n && n.scrollIntoView) n.scrollIntoView(); });
   document.getElementById("view-plan").addEventListener("click", function () { selectView("plan"); });
   document.getElementById("view-exec").addEventListener("click", function () { selectView("exec"); });
   window.addEventListener("popstate", function () {

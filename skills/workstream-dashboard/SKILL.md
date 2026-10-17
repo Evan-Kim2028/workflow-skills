@@ -35,9 +35,10 @@ python3 agent_dash.py check --page
 
 The doctor is always on: the server re-runs its checks every
 `doctor.interval_s` seconds, persists them, and serves the latest run
-at `GET /api/doctor` (with `?ws=` and `?severity=` filters). Start from
-the doctor before any other health signal; use `doctor report --md` for
-the hub digest.
+at `GET /api/doctor` (with `?ws=` and `?severity=` filters). The page
+shows no doctor output, so read the problem list with `agent_dash.py doctor`
+or `GET /api/doctor`. Start from the doctor before any other health signal;
+use `doctor report --md` for the hub digest.
 
 `doctor` is read-only and exits 0 when clean, 1 when problems are found; fix what it lists, then run `check`. `check` exits 0 when every number reconciles. `check --page` drives the live page in headless Chrome and skips with a clear message when Chrome is missing. `state --json` dumps the whole dashboard (health, workstreams, reconcile, problems) in one call.
 
