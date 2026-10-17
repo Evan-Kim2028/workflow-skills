@@ -287,7 +287,7 @@ class StoreTest(unittest.TestCase):
         snap = self.store.snapshot(now)
         self.assertEqual(
             set(snap),
-            {"now", "seq", "counts", "running", "recent", "totals", "totals_all_time", "last_activity", "by_workstream"},
+            {"now", "seq", "data_seq", "last_data_ts", "counts", "running", "recent", "recent_shown", "recent_total", "totals", "totals_all_time", "last_activity", "by_workstream"},
         )
         self.assertEqual(snap["counts"]["live_agents"], 0)
         recent_ids = [run["run_id"] for run in snap["recent"]]
@@ -308,6 +308,201 @@ class StoreTest(unittest.TestCase):
         recent = self.store.snapshot(now)["recent"]
         self.assertEqual(len(recent), 50)
         self.assertEqual(recent[0]["run_id"], "r0")
+
+    def test_recent_truncation_counts(self):
+        now = 5_000.0
+        for index in range(60):
+            self.store.upsert_run(
+                {
+                    "run_id": f"t{index}",
+                    "label": "ws1-12",
+                    "status": "done",
+                    "started_at": now - 100 - index,
+                    "ended_at": now - index,
+                }
+            )
+        snap = self.store.snapshot(now)
+        self.assertEqual(snap["recent_shown"], 50)
+        self.assertEqual(snap["recent_total"], 60)
+        self.assertEqual(len(snap["recent"]), 50)
+
+    def test_snapshot_uses_one_usage_scan(self):
+        now = 9_000.0
+        for index in range(8):
+            self.store.upsert_run(
+                {
+                    "run_id": f"u{index}",
+                    "source": "muse",
+                    "tier": "muse",
+                    "label": f"ws{(index % 4) + 1}-task",
+                    "session_id": f"sess-{index}",
+                    "status": "done",
+                    "started_at": now - 200,
+                    "ended_at": now - 100,
+                }
+            )
+            self.store.add_usage(
+                {
+                    "ts": now - 150,
+                    "session_id": f"sess-{index}",
+                    "run_id": f"u{index}",
+                    "model": "claude-sonnet-4-5",
+                    "tool": "muse",
+                    "message_id": f"m{index}",
+                    "input": 100,
+                    "output": 50,
+                    "cache_read": 0,
+                    "cache_write": 0,
+                }
+            )
+        self.store._usage_cache = None
+        calls = []
+        orig = self.store._usage_by_run_uncached
+
+        def counting():
+            calls.append(1)
+            return orig()
+
+        self.store._usage_by_run_uncached = counting
+        try:
+            before = self.store.snapshot(now, "all")
+            self.assertLessEqual(len(calls), 1, f"snapshot scanned usage {len(calls)}x")
+            report = self.store.reconcile_numbers(now, now - 86400, now, processes=[])
+            self.assertLessEqual(len(calls), 2, f"snapshot+reconcile scanned usage {len(calls)}x")
+        finally:
+            self.store._usage_by_run_uncached = orig
+        after = self.store.snapshot(now, "all")
+        self.assertEqual(before["counts"], after["counts"])
+        self.assertEqual(before["totals"], after["totals"])
+        self.assertEqual(
+            [run["run_id"] for run in before["recent"]],
+            [run["run_id"] for run in after["recent"]],
+        )
+
+    def test_reconcile_needs_no_per_workstream_snapshot(self):
+        now = 11_000.0
+        for index in range(4):
+            self.store.upsert_run(
+                {
+                    "run_id": f"w{index}",
+                    "source": "muse",
+                    "tier": "muse",
+                    "label": f"ws{index + 1}-task",
+                    "status": "done",
+                    "started_at": now - 200,
+                    "ended_at": now - 100,
+                }
+            )
+        orig = self.store.snapshot
+        self.store.snapshot = lambda *a, **k: (_ for _ in ()).throw(AssertionError("reconcile re-ran snapshot per workstream"))
+        try:
+            report = self.store.reconcile_numbers(now, now - 86400, now, processes=[])
+        finally:
+            self.store.snapshot = orig
+        self.assertEqual(report["mismatches"], [])
+
+    def test_reconcile_flags_recent_truncation(self):
+        now = 13_000.0
+        for index in range(55):
+            self.store.upsert_run(
+                {
+                    "run_id": f"g{index}",
+                    "source": "muse",
+                    "tier": "muse",
+                    "label": "ws1-task",
+                    "status": "done",
+                    "started_at": now - 300,
+                    "ended_at": now - 100,
+                }
+            )
+        report = self.store.reconcile_numbers(now, now - 86400, now, processes=[])
+        self.assertFalse(
+            any("recent shows 50 of" in item for item in report["mismatches"]),
+            report["mismatches"],
+        )
+        self.assertEqual(report["recent_shown"], 50)
+        self.assertEqual(report["recent_total"], 55)
+
+    def test_snapshot_cache_between_writes(self):
+        now = 15_000.0
+        self.store.upsert_run(
+            {
+                "run_id": "c1",
+                "source": "muse",
+                "tier": "muse",
+                "label": "ws1-task",
+                "status": "done",
+                "started_at": now - 200,
+                "ended_at": now - 100,
+            }
+        )
+        first = self.store.snapshot_cached(now, "all")
+        seq = self.store._seq
+        second = self.store.snapshot_cached(now + 2, "all")
+        self.assertEqual(first["seq"], seq)
+        self.assertEqual(second["seq"], seq)
+        self.assertEqual(
+            [run["run_id"] for run in first["recent"]],
+            [run["run_id"] for run in second["recent"]],
+        )
+        self.assertEqual(first["counts"], second["counts"])
+        self.store.upsert_run(
+            {
+                "run_id": "c2",
+                "source": "muse",
+                "tier": "muse",
+                "label": "ws2-task",
+                "status": "done",
+                "started_at": now - 200,
+                "ended_at": now - 50,
+            }
+        )
+        third = self.store.snapshot_cached(now + 4, "all")
+        self.assertGreater(third["seq"], seq)
+        self.assertEqual(third["recent_total"], first["recent_total"] + 1)
+
+    def test_snapshot_benchmark(self):
+        import time as _t
+
+        now = 17_000.0
+        for index in range(2000):
+            self.store.upsert_run(
+                {
+                    "run_id": f"b{index}",
+                    "source": "muse",
+                    "tier": "muse",
+                    "label": f"ws{(index % 8) + 1}-bench",
+                    "session_id": f"bsess-{index % 500}",
+                    "status": "done",
+                    "started_at": now - 300,
+                    "ended_at": now - 100,
+                }
+            )
+        for index in range(2000):
+            self.store.add_usage(
+                {
+                    "ts": now - 150,
+                    "session_id": f"bsess-{index % 500}",
+                    "run_id": f"b{index}",
+                    "model": "claude-sonnet-4-5",
+                    "tool": "muse",
+                    "message_id": f"bm{index}",
+                    "input": 100,
+                    "output": 50,
+                    "cache_read": 0,
+                    "cache_write": 0,
+                }
+            )
+        self.store._usage_cache = None
+        start = _t.time()
+        snap = self.store.snapshot(now, "all", usage_group="model")
+        snap_dt = _t.time() - start
+        start = _t.time()
+        report = self.store.reconcile_numbers(now, now - 86400, now, processes=[])
+        rec_dt = _t.time() - start
+        self.assertLess(snap_dt, 2.0, f"snapshot {snap_dt:.2f}s over 2s for 2k runs")
+        self.assertLess(rec_dt, 2.0, f"reconcile {rec_dt:.2f}s over 2s for 2k runs")
+        self.assertIn("recent_shown", snap)
 
     def test_workflow_collapse(self):
         now = 100.0

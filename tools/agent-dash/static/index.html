@@ -336,6 +336,8 @@ body.clip #main{zoom:.92}
 .alegend svg{overflow:visible}
 .arrows-toggle{display:inline-flex;align-items:center;gap:6px;font:600 12px var(--font);color:var(--ink-2);margin-left:8px}
 .gchip{font:11px var(--mono);padding:2px 6px;border-radius:5px;border:1.5px dashed var(--muted);color:var(--ink-2)}
+#stale-badge{font:700 11px var(--mono);color:var(--warning);border:1px solid var(--warning);border-radius:4px;padding:1px 6px;margin-left:8px}
+#err-banner{margin:10px 0;padding:10px 14px;border:1px solid var(--critical);border-radius:8px;background:var(--surface-2);color:var(--critical);font-size:13px}
 </style>
 </head>
 <body>
@@ -343,7 +345,7 @@ body.clip #main{zoom:.92}
 <div class="topbar">
 <header class="shell">
 <h1 id="title">Agent dashboard</h1>
-<span class="live"><span class="dot" id="live-dot"></span><span id="live-txt">connecting</span></span>
+<span class="live"><span class="dot" id="live-dot"></span><span id="live-txt">connecting</span><span id="stale-badge" hidden>stale</span></span>
 <nav class="view-toggle" aria-label="View">
 <button type="button" id="view-plan" aria-pressed="false">Plan</button>
 <button type="button" id="view-exec" aria-pressed="true">Execution</button>
@@ -355,6 +357,7 @@ body.clip #main{zoom:.92}
 <nav class="tabs" id="tabs" role="tablist" aria-label="Workstreams"></nav>
 </div>
 <div id="exec-view">
+<div id="err-banner" role="alert" hidden></div>
 <main id="main"></main>
 <p class="foot" id="foot"></p>
 </div>
@@ -382,7 +385,7 @@ body.clip #main{zoom:.92}
   var execCache = {};
   var execGen = 0;
   var WINDOW_HOURS = 24;
-  var state = {view: "exec", ws: "all", snap: null, runs: [], usage: [], conc: [], wss: [], bundles: [], plan: null, seq: -1, groupBy: "model", approvals: []};
+  var state = {view: "exec", ws: "all", snap: null, runs: [], usage: [], conc: [], wss: [], bundles: [], plan: null, seq: -1, groupBy: "model", approvals: [], snapError: null, lastSeqChange: 0, lastPoll: null, lastDataTs: null};
   /* Models: family = hue, model = shade of it (static/models.js). Keys look like grok-4.7, composer-2.5, glm-5.3-flash, haiku. */
   function modelName(k) { return ADM.nameOf(k); }
   function fullName(k) { var f = ADM.FAM[ADM.famOf(k)].name, n = ADM.nameOf(k); return n.indexOf(f + " ") === 0 ? n : f + " \u00B7 " + n; }
@@ -720,8 +723,24 @@ body.clip #main{zoom:.92}
      the one fixed 24 h window (windowed and reconciled server-side). They
      never re-sum usage buckets on the client, so the tile and the chart
      legend cannot drift. */
+  /* A failed scope never reads as zero: when the snapshot fetch failed and
+     no cached response exists, the tiles say "request failed" instead of
+     "0 in 24 h", so an error is loud instead of silently empty. */
   function tiles(snap) {
     snap = snap || {};
+    if (state.snapError && !snap.counts) {
+      var failed = el("div", {class: "grid g-tiles", id: "exec-tiles", "data-nav": "Summary", "data-failed-scope": state.ws});
+      [["Agents live now", "request failed", state.snapError, null],
+       ["Agents finished (24 h)", "request failed", state.snapError, null],
+       ["Tokens (24 h)", "request failed", state.snapError, {"data-tile": "tokens", "data-ws": state.ws, "data-hours": "24", "data-failed-scope": state.ws}],
+       ["Est. cost (24 h)", "request failed", state.snapError, {"data-tile": "cost", "data-ws": state.ws, "data-hours": "24", "data-failed-scope": state.ws}]
+      ].forEach(function (t) {
+        var attrs = {class: "card tile"};
+        if (t[3]) for (var a in t[3]) attrs[a] = t[3][a];
+        failed.appendChild(el("div", attrs, [el("div", {class: "v", text: String(t[1])}), el("div", {class: "l", text: t[0]}), el("div", {class: "x", text: t[2]})]));
+      });
+      return failed;
+    }
     var run = snap.running || [], byTier = {};
     run.forEach(function (r) { var k = tierKey(r); byTier[k] = (byTier[k] || 0) + 1; });
     var tk = ((snap.totals || {}).tokens) || {};
@@ -2259,7 +2278,19 @@ body.clip #main{zoom:.92}
   /* Keyed sections: a section is rebuilt only when its data key changes, and unchanged nodes are never moved, so animations and hover state survive live updates. */
   var secCache = {};
   function keyOf(v) { try { return JSON.stringify(v); } catch (e) { return String(Math.random()); } }
+  /* Finished subtitle names the truncation: "Newest 50 of 1,452" when the
+     window holds more finished runs than the table shows, so the hidden gap
+     is visible instead of silently omitted. */
+  function finishedSub(snap) {
+    var shown = (snap.recent || []).length;
+    var total = (snap.counts && snap.counts.finished_in_range != null)
+      ? snap.counts.finished_in_range
+      : (snap.recent_total != null ? snap.recent_total : shown);
+    if (total > shown) return "Newest " + shown + " of " + total + " \u00B7 Newest first, ended in the last 24 h.";
+    return "Newest first, ended in the last 24 h.";
+  }
   function drawMain() {
+    renderErrBanner();
     var m = document.getElementById("main");
     var snap = state.snap || {running: [], recent: [], totals: {tokens: {}}};
     var scope = state.ws + "|24|" + (window.innerWidth >> 5);
@@ -2268,8 +2299,8 @@ body.clip #main{zoom:.92}
     var specs = [];
     if (state.ws === "all" && state.wss.length) specs.push(["program", keyOf([state.wss.map(function (w) { return [w.ws, w.running, w.name]; }), planSum, planPrompt]), function () { return programPanel(); }, ""]);
     specs.push(
-      ["tiles", keyOf([snap.counts, snap.totals, snap.totals_all_time, snap.last_activity, state.ws]), function () { return tiles(snap); }, state.ws === "all" ? "margin-top:14px" : ""],
-      ["running", keyOf((snap.running || []).map(runRow)), function () { return runsTable("Running now", "Click a row for details. Output \u25B2 means the out file grew since the last poll.", snap.running || [], "Nothing running."); }, "margin-top:14px"]
+      ["tiles", keyOf([snap.counts, snap.totals, snap.totals_all_time, snap.last_activity, state.ws, state.snapError]), function () { return tiles(snap); }, state.ws === "all" ? "margin-top:14px" : ""],
+      ["running", keyOf((snap.running || []).map(runRow)), function () { return runsTable("Running now", "Click a row for details. Output \u25B2 means the out file grew since the last poll.", snap.running || [], state.snapError ? "request failed" : "Nothing running."); }, "margin-top:14px"]
     );
     /* Workstream cards on the overview read the same snapshot rows the tiles
        read, so each card matches its workstream tab for the fixed 24 h window. */
@@ -2279,7 +2310,7 @@ body.clip #main{zoom:.92}
     specs.push(["tokens", keyOf([state.usage, state.groupBy, Math.floor(Date.now() / 60000)]), function () { return tokenChart(); }, "margin-top:14px"]);
     specs.push(["conc", keyOf([state.conc, Math.floor(Date.now() / 60000)]), function () { return concChart(snap); }, "margin-top:14px"]);
     specs.push(["gantt", keyOf([(state.runs || []).map(runRow), expanded, Math.floor(Date.now() / 60000)]), function () { return gantt(); }, "margin-top:14px"]);
-    specs.push(["finished", keyOf((snap.recent || []).map(runRow)), function () { return runsTable("Finished (24 h)", "Newest first, ended in the last 24 h.", snap.recent || [], "Nothing finished in the last 24 h."); }, "margin-top:14px"]);
+    specs.push(["finished", keyOf([(snap.recent || []).map(runRow), snap.recent_shown, snap.recent_total, snap.counts && snap.counts.finished_in_range]), function () { return runsTable("Finished (24 h)", finishedSub(snap), snap.recent || [], state.snapError ? "request failed" : "Nothing finished in the last 24 h."); }, "margin-top:14px"]);
     /* Clip mode shows only the plan progress map; the replay adds the run
        timeline card under it, plus caption and counter strips. */
     if (isClipMode()) {
@@ -2356,6 +2387,48 @@ body.clip #main{zoom:.92}
   setTimeout(warmTabs, 1500);
   setInterval(warmTabs, 45000);
   setInterval(function () { if (!state.wss.length) return; loadPlanSums().then(function () { if (state.view === "exec" && state.ws === "all") drawMain(); }); }, 30000);
+  /* A failed fetch is never a silent zero: the banner names the scope and
+     the tiles carry data-failed-scope, so "request failed" reads differently
+     from "0 in 24 h". A cached scope keeps its last numbers under the banner. */
+  function showSnapError(ws) {
+    state.snapError = "request failed for " + ws + " \u2014 showing last known data";
+    renderErrBanner();
+  }
+  function clearSnapError() {
+    state.snapError = null;
+    renderErrBanner();
+  }
+  function renderErrBanner() {
+    var b = document.getElementById("err-banner");
+    if (!b) return;
+    if (state.snapError) {
+      b.hidden = false;
+      if (b.textContent !== state.snapError) b.textContent = state.snapError;
+      b.setAttribute("data-failed-scope", state.ws);
+    } else {
+      b.hidden = true;
+      if (b.textContent !== "") b.textContent = "";
+      b.removeAttribute("data-failed-scope");
+    }
+  }
+  /* Freshness: the tick carries seq + last_poll. The seq drives refetches;
+     when it stays frozen for 3 poll intervals with an open SSE stream the
+     page badges "stale" instead of reading "live" on old data. A fresh poll
+     with an unchanged seq (healthy idle) stays live. */
+  var STALE_AFTER_S = 6;
+  function updateStale(nowS) {
+    var badge = document.getElementById("stale-badge");
+    var txt = document.getElementById("live-txt");
+    if (!badge || !txt) return;
+    if (!state.lastSeqChange) { badge.hidden = true; return; }
+    nowS = nowS || Date.now() / 1000;
+    var seqAge = nowS - state.lastSeqChange;
+    var pollAge = state.lastPoll == null ? 0 : nowS - state.lastPoll;
+    var stale = seqAge > STALE_AFTER_S && (state.lastPoll == null || pollAge > STALE_AFTER_S);
+    badge.hidden = !stale;
+    if (stale) txt.textContent = "stale";
+    else if (txt.textContent === "stale") txt.textContent = "live";
+  }
   /* Tiles and chart come from one snapshot response: totals and usage buckets
      are applied together or not at all, so they can never disagree. */
   function refreshAll() {
@@ -2377,9 +2450,13 @@ body.clip #main{zoom:.92}
     return Promise.all(jobs).then(function (parts) {
       if (gen !== execGen || !ADC.applies(key, state)) return;
       if (!parts[0]) {
-        if (!getCache() && state.view === "exec") { drawMain(); setLive(false); }
+        showSnapError(ws);
+        if (state.view === "exec") { drawMain(); setLive(false); }
         return;
       }
+      clearSnapError();
+      if (parts[0].seq !== state.seq) state.lastSeqChange = Date.now() / 1000;
+      if (parts[0].last_data_ts != null) state.lastDataTs = parts[0].last_data_ts;
       state.snap = parts[0];
       state.seq = parts[0].seq;
       state.runs = parts[1];
@@ -2394,17 +2471,35 @@ body.clip #main{zoom:.92}
         drawMain();
         window.__adSettled = state.ws + "|24|" + state.seq;
         setLive(true);
+        updateStale();
         if (state.ws === "all") refreshFoot();
         else { var foot = document.getElementById("foot"); if (foot) foot.textContent = "Updated " + new Date().toLocaleTimeString() + (FIX ? " · fixture data" : "") + " · read-only, 127.0.0.1"; }
       }
-    }).catch(function () { if (gen === execGen && ADC.applies(key, state)) setLive(false); });
+    }).catch(function () { if (gen === execGen && ADC.applies(key, state)) { showSnapError(ws); setLive(false); } });
   }
-  function setLive(ok) { document.getElementById("live-dot").className = "dot" + (ok ? " on" : ""); document.getElementById("live-txt").textContent = ok ? "live" : "offline"; }
+  function setLive(ok) {
+    document.getElementById("live-dot").className = "dot" + (ok ? " on" : "");
+    document.getElementById("live-txt").textContent = ok ? "live" : "offline";
+    if (!ok) { var badge = document.getElementById("stale-badge"); if (badge) badge.hidden = true; }
+    else updateStale();
+  }
 
   function stream() {
     if (FIX || !window.EventSource) return;
     var es = new EventSource("/api/stream");
-    es.addEventListener("tick", function (ev) { try { var d = JSON.parse(ev.data); if (d.seq !== state.seq) refreshSnapshot(); } catch (e) {} setLive(true); });
+    es.addEventListener("tick", function (ev) {
+      try {
+        var d = JSON.parse(ev.data);
+        var nowS = d.now || Date.now() / 1000;
+        if (d.last_poll != null) state.lastPoll = d.last_poll;
+        if (d.last_data_ts != null) state.lastDataTs = d.last_data_ts;
+        if (state.lastSeqChange === 0) state.lastSeqChange = nowS;
+        if (d.seq !== state.seq) { state.lastSeqChange = nowS; refreshSnapshot(); }
+        else updateStale(nowS);
+      } catch (e) {}
+      setLive(true);
+      updateStale();
+    });
     es.onerror = function () { setLive(false); };
   }
   /* Stream ticks refresh through the same one-response path: the snapshot
@@ -2414,13 +2509,17 @@ body.clip #main{zoom:.92}
     var ws = state.ws, key = reqKey();
     api("/api/snapshot", {ws: ws, since: since(), usage_group: groupFor()}).then(function (j) {
       if (!ADC.applies(key, state)) return;
+      clearSnapError();
+      if (j.seq !== state.seq) state.lastSeqChange = Date.now() / 1000;
+      if (j.last_data_ts != null) state.lastDataTs = j.last_data_ts;
       state.snap = j; state.seq = j.seq;
       state.usage = Array.isArray(j.usage) ? j.usage : [];
       var hit = execCache[key];
       if (hit) { hit.snap = j; hit.usage = state.usage; }
       if (window.DashCache) window.DashCache.snap[ws] = j;
       if (state.view === "exec") drawMain();
-    }).catch(function () {});
+      updateStale();
+    }).catch(function () { showSnapError(ws); if (state.view === "exec") drawMain(); });
   }
 
   document.getElementById("theme").addEventListener("click", function () {

@@ -180,7 +180,10 @@ class Handler(BaseHTTPRequestHandler):
         since = _float(query, "since")
         until = _float(query, "until")
         usage_group = _one(query, "usage_group")
-        self._json(200, self.server.store.snapshot(now, ws, since, until, usage_group=usage_group))
+        self._json(
+            200,
+            self.server.store.snapshot_cached(now, ws, since, until, usage_group=usage_group),
+        )
 
     def _workstreams(self, query):
         since = _float(query, "since")
@@ -323,8 +326,16 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         interval = self.server.stream_interval
         while not self.server.stop.is_set():
-            payload = self.server.store.snapshot(time.time(), "all")
-            data = {"seq": payload["seq"], "running": payload["running"]}
+            now = time.time()
+            payload = self.server.store.snapshot_cached(now, "all")
+            data = {
+                "seq": payload["seq"],
+                "running": payload["running"],
+                "now": now,
+                "data_seq": payload.get("data_seq"),
+                "last_data_ts": payload.get("last_data_ts"),
+                "last_poll": _last_poll(self.server.registry),
+            }
             blob = ("event: tick\ndata: " + json.dumps(data, separators=(",", ":"), allow_nan=False) + "\n\n").encode()
             try:
                 self.wfile.write(blob)
@@ -364,6 +375,25 @@ def _live_workers() -> list:
         return live_worker_processes() or []
     except Exception:
         return []
+
+
+def _last_poll(registry) -> float | None:
+    """Newest successful source poll time, or None before the first tick.
+
+    The tick carries it so the page can tell a stalled collector (old
+    poll, open SSE) from a healthy idle one (fresh poll, unchanged seq).
+    Never raises: a missing registry yields None rather than breaking SSE.
+    """
+    try:
+        state = getattr(registry, "state", None) or {}
+        stamps = [
+            info.get("last_poll")
+            for info in state.values()
+            if isinstance(info, dict) and info.get("last_poll") is not None
+        ]
+        return max(stamps) if stamps else None
+    except Exception:
+        return None
 
 
 def _static_rel(name: str) -> bool:

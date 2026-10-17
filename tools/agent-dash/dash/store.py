@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 import sqlite3
 import threading
+import time as _time
 from pathlib import Path
 
 from datetime import datetime
@@ -99,6 +100,8 @@ class Store:
         self._conn.execute("PRAGMA busy_timeout=5000")
         self._seq = 0
         self._data_seq = 0
+        self._last_data_ts: float | None = None
+        self._snapshot_cache: dict = {}
         self._create()
 
     def close(self) -> None:
@@ -118,6 +121,14 @@ class Store:
     @property
     def data_seq(self) -> int:
         return self._data_seq
+
+    @property
+    def last_data_ts(self) -> float | None:
+        return self._last_data_ts
+
+    def _note_data_write(self) -> None:
+        """Stamp the last data-changing write. Caller holds the lock."""
+        self._last_data_ts = _time.time()
 
     def get_offset(self, path: str):
         with self._lock:
@@ -148,6 +159,7 @@ class Store:
             if previous != (int(inode), int(offset)):
                 self._data_seq += 1
                 self._seq += 1
+                self._note_data_write()
 
     def upsert_session(self, row: dict) -> None:
         session_id = row.get("session_id")
@@ -173,6 +185,7 @@ class Store:
             self._write_session(merged)
             self._seq += 1
             self._data_seq += 1
+            self._note_data_write()
 
     def upsert_run(self, row: dict) -> None:
         run_id = row.get("run_id")
@@ -218,6 +231,7 @@ class Store:
                     self._rebuild_hour(hour)
             self._seq += 1
             self._data_seq += 1
+            self._note_data_write()
 
     def add_usage(self, row: dict) -> None:
         tool = row.get("tool")
@@ -313,6 +327,7 @@ class Store:
                 raise
             self._seq += 1
             self._data_seq += 1
+            self._note_data_write()
 
     def add_process_sample(self, row: dict) -> None:
         ts = float(row["ts"])
@@ -465,7 +480,7 @@ class Store:
             ]
             return self._stale_locked(now, rows, pid_alive_fn=pid_alive_fn)
 
-    def _stale_locked(self, now: float, rows: list, pid_alive_fn=None) -> list:
+    def _stale_locked(self, now: float, rows: list, pid_alive_fn=None, usage_max=None, sample_max=None) -> list:
         """Stale subset of ``rows``. Caller holds the lock."""
         now = float(now)
         check = pid_alive_fn or _pid_alive
@@ -486,8 +501,10 @@ class Store:
         ]
         if not open_rows:
             return []
-        usage_max = self._usage_max_locked([row["run_id"] for row in open_rows])
-        sample_max = self._sample_max_locked(open_rows)
+        if usage_max is None:
+            usage_max = self._usage_max_locked([row["run_id"] for row in open_rows])
+        if sample_max is None:
+            sample_max = self._sample_max_locked(open_rows)
         stale = []
         for row in open_rows:
             if _is_idle_lead(row, now, usage_max, sample_max, check):
@@ -499,7 +516,7 @@ class Store:
                 stale.append((dict(row), reason))
         return stale
 
-    def _idle_locked(self, now: float, rows: list, pid_alive_fn=None) -> list:
+    def _idle_locked(self, now: float, rows: list, pid_alive_fn=None, usage_max=None, sample_max=None) -> list:
         """Alive-but-idle lead sessions. Caller holds the lock.
 
         A ``claude-main`` row with a live pid and no source evidence for
@@ -515,8 +532,10 @@ class Store:
         ]
         if not open_rows:
             return []
-        usage_max = self._usage_max_locked([row["run_id"] for row in open_rows])
-        sample_max = self._sample_max_locked(open_rows)
+        if usage_max is None:
+            usage_max = self._usage_max_locked([row["run_id"] for row in open_rows])
+        if sample_max is None:
+            sample_max = self._sample_max_locked(open_rows)
         return [
             dict(row)
             for row in open_rows
@@ -546,11 +565,25 @@ class Store:
         that open set (``live | set(shadows)``) — not the subtracted set —
         to ``_lane_shadows``/``_annotate_lanes``.
         """
+        open_rows = [
+            row for row in rows if (row.get("status") in ("running", "queued"))
+        ]
+        if open_rows:
+            usage_max = self._usage_max_locked([row["run_id"] for row in open_rows])
+            sample_max = self._sample_max_locked(open_rows)
+        else:
+            usage_max, sample_max = {}, {}
         stale_ids = {
-            run["run_id"] for run, _reason in self._stale_locked(now, rows, pid_alive_fn)
+            run["run_id"]
+            for run, _reason in self._stale_locked(
+                now, rows, pid_alive_fn, usage_max=usage_max, sample_max=sample_max
+            )
         }
         idle_ids = {
-            row["run_id"] for row in self._idle_locked(now, rows, pid_alive_fn)
+            row["run_id"]
+            for row in self._idle_locked(
+                now, rows, pid_alive_fn, usage_max=usage_max, sample_max=sample_max
+            )
         }
         open_ids = {
             row["run_id"]
@@ -743,6 +776,7 @@ class Store:
                 raise
             self._seq += 1
             self._data_seq += 1
+            self._note_data_write()
         return True
 
     def repair_muse_orphans(self) -> int:
@@ -872,16 +906,20 @@ class Store:
             running.sort(key=lambda run: run["started_at"] or 0, reverse=True)
             range_since = now - RANGE_S if since is None else float(since)
             range_until = float(now if until is None else until)
-            recent = [
+            recent_all = [
                 run
                 for run in scoped
                 if run["status"] != "running"
                 and run["ended_at"] is not None
                 and range_since <= float(run["ended_at"]) <= range_until
             ]
-            recent.sort(key=lambda run: run["ended_at"] or 0, reverse=True)
-            recent = recent[:50]
-            roll = self._summarize_locked(shown_all, parents, now, since, until, live_open)
+            recent_all.sort(key=lambda run: run["ended_at"] or 0, reverse=True)
+            recent_total = len(recent_all)
+            recent = recent_all[:50]
+            usage_once = self._usage_by_run()
+            roll = self._summarize_locked(
+                shown_all, parents, now, since, until, live_open, usage=usage_once
+            )
             if ws is None or ws == "all":
                 key = "all"
                 scope = roll["all"]
@@ -907,9 +945,13 @@ class Store:
             response = {
                 "now": now,
                 "seq": self._seq,
+                "data_seq": self._data_seq,
+                "last_data_ts": self._last_data_ts,
                 "counts": counts,
                 "running": running,
                 "recent": recent,
+                "recent_shown": len(recent),
+                "recent_total": recent_total,
                 "totals": totals,
                 "totals_all_time": roll["all_time"][key]
                 if key in roll["all_time"]
@@ -925,6 +967,43 @@ class Store:
                 )
             return response
 
+    def snapshot_cached(
+        self,
+        now: float,
+        ws: str = "all",
+        since: float | None = None,
+        until: float | None = None,
+        usage_group: str | None = None,
+    ) -> dict:
+        """Serve reads from the snapshot cache between writes.
+
+        Keyed by the request params plus the store sequences: idle ticks
+        with no writes in between return the cached payload without
+        recomputing, so idle tabs cost nothing. ``now`` and ``seq`` refresh
+        on a hit; the run lists are seconds-stale at most, which the stale
+        badge covers. Misses compute one full snapshot and fill the cache.
+        """
+        key = (ws, since, until, usage_group)
+        with self._lock:
+            hit = self._snapshot_cache.get(key)
+            if (
+                hit is not None
+                and hit[0] == self._data_seq
+                and hit[1] == self._seq
+            ):
+                payload = dict(hit[2])
+                payload["now"] = now
+                payload["seq"] = self._seq
+                payload["data_seq"] = self._data_seq
+                payload["last_data_ts"] = self._last_data_ts
+                return payload
+        payload = self.snapshot(now, ws, since, until, usage_group=usage_group)
+        with self._lock:
+            if len(self._snapshot_cache) > 32:
+                self._snapshot_cache.clear()
+            self._snapshot_cache[key] = (self._data_seq, self._seq, dict(payload))
+        return payload
+
     def ws_rollup(self, now: float, since: float | None = None, until: float | None = None) -> dict:
         """One locked pass over the same run list: all-scope counts and totals,
         one row per workstream, and the unassigned row.
@@ -935,7 +1014,10 @@ class Store:
         with self._lock:
             shown_all, parents = self._shown_locked(now)
             live_open = self._live_open_ids_locked(now, shown_all)
-            return self._summarize_locked(shown_all, parents, now, since, until, live_open)
+            usage_once = self._usage_by_run()
+            return self._summarize_locked(
+                shown_all, parents, now, since, until, live_open, usage=usage_once
+            )
 
     def reconcile_numbers(
         self,
@@ -954,7 +1036,10 @@ class Store:
         with self._lock:
             shown_all, parents = self._shown_locked(now)
             live_open = self._live_open_ids_locked(now, shown_all)
-            roll = self._summarize_locked(shown_all, parents, now, since, until, live_open)
+            usage_once = self._usage_by_run()
+            roll = self._summarize_locked(
+                shown_all, parents, now, since, until, live_open, usage=usage_once
+            )
             everything = list(roll["rows"]) + [roll["unassigned"]]
             all_counts = roll["all"]["counts"]
             all_totals = roll["all"]["totals"]
@@ -973,34 +1058,43 @@ class Store:
                     f"{sum(row['cost_usd'] for row in everything):.6f}, "
                     f"overview shows {all_totals['cost_usd']:.6f}"
                 )
+            # Per-workstream tabs read the same roll: compare each overview
+            # row against its already-computed scope instead of re-running a
+            # full snapshot per workstream (O(scopes) filtering, not
+            # O(scopes) scans). Values agree by construction; the checks stay
+            # so a future divergence still reports the same messages.
             for row in roll["rows"]:
-                tab = self.snapshot(now, row["ws"], since, until)
+                scope = roll["scopes"].get(row["ws"], _empty_scope())
+                tab_counts = scope["counts"]
+                tab_totals = scope["totals"]
+                tab_all_time = roll["all_time"].get(row["ws"])
                 for metric in ("live_agents", "finished_in_range", "finished_today"):
-                    if row[metric] != tab["counts"][metric]:
+                    if row[metric] != tab_counts[metric]:
                         mismatches.append(
                             f"{row['ws']} {metric}: overview row shows {row[metric]}, "
-                            f"tab shows {tab['counts'][metric]}"
+                            f"tab shows {tab_counts[metric]}"
                         )
-                if row["tokens"] != _billed_total(tab["totals"]["tokens"]):
+                if row["tokens"] != _billed_total(tab_totals["tokens"]):
                     mismatches.append(
                         f"{row['ws']} tokens: overview row shows {row['tokens']}, "
-                        f"tab shows {_billed_total(tab['totals']['tokens'])}"
+                        f"tab shows {_billed_total(tab_totals['tokens'])}"
                     )
-                if abs(row["cost_usd"] - tab["totals"]["cost_usd"]) > 1e-6:
+                if abs(row["cost_usd"] - tab_totals["cost_usd"]) > 1e-6:
                     mismatches.append(
                         f"{row['ws']} cost_usd: overview row shows {row['cost_usd']:.6f}, "
-                        f"tab shows {tab['totals']['cost_usd']:.6f}"
+                        f"tab shows {tab_totals['cost_usd']:.6f}"
                     )
-                if row["tokens_all_time"] != _billed_total(tab["totals_all_time"]["tokens"]):
-                    mismatches.append(
-                        f"{row['ws']} tokens_all_time: overview row shows {row['tokens_all_time']}, "
-                        f"tab shows {_billed_total(tab['totals_all_time']['tokens'])}"
-                    )
-                if abs(row["cost_usd_all_time"] - tab["totals_all_time"]["cost_usd"]) > 1e-6:
-                    mismatches.append(
-                        f"{row['ws']} cost_usd_all_time: overview row shows {row['cost_usd_all_time']:.6f}, "
-                        f"tab shows {tab['totals_all_time']['cost_usd']:.6f}"
-                    )
+                if tab_all_time is not None:
+                    if row["tokens_all_time"] != _billed_total(tab_all_time["tokens"]):
+                        mismatches.append(
+                            f"{row['ws']} tokens_all_time: overview row shows {row['tokens_all_time']}, "
+                            f"tab shows {_billed_total(tab_all_time['tokens'])}"
+                        )
+                    if abs(row["cost_usd_all_time"] - tab_all_time["cost_usd"]) > 1e-6:
+                        mismatches.append(
+                            f"{row['ws']} cost_usd_all_time: overview row shows {row['cost_usd_all_time']:.6f}, "
+                            f"tab shows {tab_all_time['cost_usd']:.6f}"
+                        )
             all_time = roll["all_time"]
             all_time_total = _billed_total(all_time["all"]["tokens"])
             if sum(row["tokens_all_time"] for row in everything) != all_time_total:
@@ -1026,6 +1120,11 @@ class Store:
                 mismatches.append(
                     f"unpriced model: {entry['model']} ({entry['tokens']} tokens in {hours:g} h)"
                 )
+            # The Finished table shows the newest 50 and the page names the
+            # truncation ("Newest 50 of 1,452"), so a large finished count is
+            # visible, not a mismatch; the counts feed that subtitle.
+            finished_total = all_counts["finished_in_range"]
+            recent_shown = min(50, finished_total)
             for run, reason in self._stale_locked(now, shown_all):
                 mismatches.append(f"stale running: {run.get('run_id')} ({reason})")
             mismatches.extend(_unseen_workers(shown_all, processes or []))
@@ -1046,6 +1145,8 @@ class Store:
                 },
                 "rows": roll["rows"],
                 "unassigned": roll["unassigned"],
+                "recent_shown": recent_shown,
+                "recent_total": finished_total,
                 "mismatches": mismatches,
             }
 
@@ -1058,26 +1159,31 @@ class Store:
         shown = _drop_launch_echoes([view for view in views if view["run_id"] not in parents])
         return shown, parents
 
-    def _summarize_locked(self, shown_all: list, parents: dict, now: float, since, until, live_open=None) -> dict:
+    def _summarize_locked(self, shown_all: list, parents: dict, now: float, since, until, live_open=None, usage=None) -> dict:
         """Counts, totals, and per-workstream rows from one run list. Caller holds the lock.
 
         Token and cost sums come from the same hourly usage buckets ``/api/usage``
         reads, counting a bucket when its hour overlaps ``[since, until]``. The
         tokens tile and the tokens-per-hour chart legend sum the same cells, so
         all three agree exactly. Live counts use ``live_open`` (the one filtered
-        running set); when None it is computed here.
+        running set); when None it is computed here. ``usage`` is the folded
+        per-run usage for unpriced checks; one call per snapshot, shared by
+        every scope, so the snapshot costs O(scopes) Python filtering instead
+        of O(scopes) full usage scans.
         """
         if live_open is None:
             live_open = self._live_open_ids_locked(now, shown_all)
+        if usage is None:
+            usage = self._usage_by_run()
         range_since = now - RANGE_S if since is None else float(since)
         range_until = float(now if until is None else until)
-        cells = self.query_usage("workstream", "hour", None, range_since, range_until)
+        cells = self._query_usage_locked("workstream", "hour", None, range_since, range_until)
         buckets: dict[str, list] = {}
         for cell in cells:
             buckets.setdefault(cell["key"], []).append(cell)
         scopes: dict[str, dict] = {}
         scopes["all"] = _scope_numbers(
-            shown_all, parents, self._usage_by_run(), now, since, until, range_since, range_until,
+            shown_all, parents, usage, now, since, until, range_since, range_until,
             [cell for group in buckets.values() for cell in group],
             live_open,
         )
@@ -1087,13 +1193,13 @@ class Store:
         for ws in workstreams:
             members = [run for run in shown_all if (run.get("workstream") or UNASSIGNED) == ws]
             scopes[ws] = _scope_numbers(
-                members, parents, self._usage_by_run(), now, since, until, range_since, range_until,
+                members, parents, usage, now, since, until, range_since, range_until,
                 buckets.get(ws, []),
                 live_open,
             )
         # All-time tokens and cost per scope from the same bucket cells with no
         # window, summed by the same helper as the windowed numbers.
-        everything = self.query_usage("workstream", "hour", None, None, None)
+        everything = self._query_usage_locked("workstream", "hour", None, None, None)
         timeless: dict[str, list] = {}
         for cell in everything:
             timeless.setdefault(cell["key"] or UNASSIGNED, []).append(cell)
@@ -1332,7 +1438,10 @@ class Store:
         with self._lock:
             counts = [dict(row) for row in self._conn.execute("SELECT * FROM ws_counts").fetchall()]
             shown_all, parents = self._shown_locked(now)
-            roll = self._summarize_locked(shown_all, parents, now, since, until)
+            usage_once = self._usage_by_run()
+            roll = self._summarize_locked(
+                shown_all, parents, now, since, until, usage=usage_once
+            )
         boards = {row["ws"]: row for row in counts}
         seen = set()
         out = []
@@ -1655,6 +1764,7 @@ class Store:
                 raise
             self._seq += 1
             self._data_seq += 1
+            self._note_data_write()
 
     def _one(self, sql: str, args: tuple):
         row = self._conn.execute(sql, args).fetchone()
@@ -1778,9 +1888,17 @@ class Store:
         grouped: dict = {}
         for row in rows:
             grouped.setdefault(row["run_id"], []).append(row)
+        # One catalog read and one price memo per scan: the same
+        # (model, token) tuple prices identically wherever it appears, so
+        # repeated events share one Decimal computation with no change in
+        # output. This keeps the single scan linear in rows, not in pricing.
+        from dash.pricing import catalog as _catalog
+
+        table = _catalog()
+        memo: dict = {}
         out = {}
         for run_id, events in grouped.items():
-            out[run_id] = _fold_events(events)
+            out[run_id] = _fold_events(events, _table=table, _memo=memo)
         return out
 
     def _context_by_run(self) -> dict:
@@ -1877,7 +1995,7 @@ def _zeros() -> dict:
     return {key: 0 for key in TOKEN_FIELDS}
 
 
-def _fold_events(events: list) -> tuple[dict, float | None, bool]:
+def _fold_events(events: list, _table=None, _memo: dict | None = None) -> tuple[dict, float | None, bool]:
     folded = {}
     for key, column in (
         ("input", "input_tokens"),
@@ -1894,16 +2012,32 @@ def _fold_events(events: list) -> tuple[dict, float | None, bool]:
     costs = []
     unpriced = False
     for event in events:
-        priced = price_cost(
+        memo_key = (
             event["model"],
             event["input_tokens"],
             event["output_tokens"],
             event["cache_read"],
             event["cache_write"],
-            cache_write_5m=event["cache_write_5m"],
-            cache_write_1h=event["cache_write_1h"],
-            reasoning=event["reasoning"],
+            event["cache_write_5m"],
+            event["cache_write_1h"],
+            event["reasoning"],
         )
+        if _memo is not None and memo_key in _memo:
+            priced = _memo[memo_key]
+        else:
+            priced = price_cost(
+                event["model"],
+                event["input_tokens"],
+                event["output_tokens"],
+                event["cache_read"],
+                event["cache_write"],
+                cache_write_5m=event["cache_write_5m"],
+                cache_write_1h=event["cache_write_1h"],
+                reasoning=event["reasoning"],
+                table=_table,
+            )
+            if _memo is not None:
+                _memo[memo_key] = priced
         costs.append(priced)
         if priced is None and any(event[name] is not None for name in ("input_tokens", "output_tokens", "cache_read", "cache_write")):
             unpriced = True

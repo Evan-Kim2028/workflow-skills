@@ -135,10 +135,15 @@ class FixtureShapeTests(unittest.TestCase):
         for doc in (self.snap, self.ws7):
             self.assertTrue(num(doc["now"]))
             self.assertIsInstance(doc["seq"], int)
-            self.assertEqual(
-                set(doc) - {"_note"},
-                {"now", "seq", "counts", "running", "recent", "totals", "totals_all_time", "last_activity", "by_workstream"},
+            self.assertTrue(
+                {"now", "seq", "counts", "running", "recent", "totals", "totals_all_time", "last_activity", "by_workstream"}
+                <= set(doc) - {"_note"},
+                f"snapshot misses required keys: {sorted(set(doc))}",
             )
+            if "recent_shown" in doc:
+                self.assertEqual(doc["recent_shown"], len(doc["recent"]))
+            if "recent_total" in doc:
+                self.assertGreaterEqual(doc["recent_total"], len(doc["recent"]))
             counts = doc["counts"]
             self.assertEqual(
                 set(counts),
@@ -384,7 +389,11 @@ class FixtureShapeTests(unittest.TestCase):
 
     def test_reconcile_fixture(self):
         doc = self.docs["reconcile.json"]
-        self.assertEqual(set(doc), {"now", "since", "until", "all", "all_time", "rows", "unassigned", "mismatches", "_note"})
+        self.assertTrue(
+            {"now", "since", "until", "all", "all_time", "rows", "unassigned", "mismatches"}
+            <= set(doc) - {"_note"},
+            f"reconcile misses required keys: {sorted(set(doc))}",
+        )
         self.assertEqual(doc["mismatches"], [])
         self.assertEqual(set(doc["all"]), {"live_agents", "finished_in_range", "finished_today", "tokens", "cost_usd"})
         self.assertEqual(set(doc["all_time"]), {"tokens", "cost_usd"})

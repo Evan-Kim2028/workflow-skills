@@ -121,6 +121,28 @@ class ServerTest(unittest.TestCase):
         runs = json.loads(body)["runs"]
         self.assertEqual(runs[0]["run_id"], "muse:s:ws7-landing")
 
+    def test_snapshot_carries_truncation_and_freshness(self):
+        status, _, body = get(self.port, "/api/snapshot?ws=all")
+        self.assertEqual(status, 200)
+        payload = json.loads(body)
+        for key in ("recent_shown", "recent_total", "data_seq", "last_data_ts"):
+            self.assertIn(key, payload, f"snapshot misses {key}")
+        self.assertEqual(payload["recent_shown"], len(payload["recent"]))
+        self.assertGreaterEqual(payload["recent_total"], len(payload["recent"]))
+        first = dict(payload)
+        status, _, body = get(self.port, "/api/snapshot?ws=all")
+        second = json.loads(body)
+        self.assertEqual(first["seq"], second["seq"])
+        self.assertEqual(first["counts"], second["counts"])
+
+    def test_reconcile_carries_recent_counts(self):
+        status, _, body = get(self.port, "/api/reconcile?hours=12")
+        self.assertEqual(status, 200)
+        payload = json.loads(body)
+        self.assertIn("recent_shown", payload)
+        self.assertIn("recent_total", payload)
+        self.assertLessEqual(payload["recent_shown"], 50)
+
     def test_plan_smoke(self):
         mapping = plan_mapping()
         status, _, body = get(self.port, "/api/plan?ws=WS7")
@@ -178,7 +200,9 @@ class ServerTest(unittest.TestCase):
             buf += chunk
         self.assertIn(b"event: tick\n", buf)
         data = json.loads(buf.split(b"data: ", 1)[1].split(b"\n", 1)[0])
-        self.assertEqual(set(data), {"seq", "running"})
+        self.assertTrue({"seq", "running"} <= set(data), data.keys())
+        for key in ("now", "data_seq", "last_data_ts", "last_poll"):
+            self.assertIn(key, data, f"tick payload misses freshness field {key}")
         conn.close()
 
 

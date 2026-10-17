@@ -464,6 +464,50 @@ class PageRules(unittest.TestCase):
         self.assertIn("tokens unpriced", body, "cost tile no longer says whose tokens it excludes")
         self.assertIn("data-unpriced-tokens", body, "cost tile lost its unpriced data attribute")
 
+    def test_stale_badge_reads_tick_freshness(self):
+        """The tick carries seq + freshness; the page badges stale when the
+        seq stays frozen for 3 poll intervals with an open SSE stream."""
+        script = inline_scripts()
+        bodies = dict(functions(script))
+        page = (STATIC / "index.html").read_text()
+        self.assertIn('id="stale-badge"', page, "no stale badge element")
+        self.assertIn("updateStale", script, "no staleness check")
+        self.assertIn("STALE_AFTER_S", script)
+        self.assertIn("lastSeqChange", script, "the page never tracks seq age")
+        self.assertIn("last_poll", script, "the tick freshness never reaches the page")
+        self.assertIn("stream", bodies)
+        self.assertIn("d.seq", bodies["stream"], "the tick handler ignores the seq")
+        self.assertIn("refreshSnapshot", bodies["stream"], "a changed seq never refetches")
+
+    def test_finished_truncation_is_visible(self):
+        """The Finished table names its truncation ("Newest 50 of N") from
+        the snapshot counts instead of silently showing 50 rows."""
+        script = inline_scripts()
+        bodies = dict(functions(script))
+        self.assertIn("finishedSub", script, "no truncation subtitle helper")
+        self.assertIn("recent_shown", script)
+        self.assertIn("recent_total", script)
+        self.assertIn("finished_in_range", script)
+        self.assertIn("Newest ", bodies["finishedSub"], "subtitle never says Newest N")
+        self.assertIn(" of ", bodies["finishedSub"], "subtitle never says N of M")
+        self.assertIn("finishedSub(", bodies["drawMain"], "the Finished table ignores the subtitle")
+
+    def test_fetch_failures_are_loud(self):
+        """A failed snapshot fetch shows an error banner and a failed-scope
+        state, never a silent zero."""
+        script = inline_scripts()
+        bodies = dict(functions(script))
+        page = (STATIC / "index.html").read_text()
+        self.assertIn('id="err-banner"', page, "no error banner element")
+        self.assertIn("request failed", script, "no failure text on the page")
+        self.assertIn("data-failed-scope", script, "no failed-scope state")
+        self.assertIn("showSnapError", script)
+        self.assertIn("renderErrBanner", script)
+        for name in ("refreshAll", "refreshSnapshot"):
+            self.assertIn("showSnapError", bodies[name], f"{name} swallows a fetch failure")
+        self.assertIn("request failed", bodies["tiles"], "tiles() reads zero on a failed scope")
+        self.assertIn("snapError", bodies["drawMain"], "drawMain never consults the failure flag")
+
     def test_unknown_duration_is_a_dash(self):
         script = (
             "const fs=require('fs');"
