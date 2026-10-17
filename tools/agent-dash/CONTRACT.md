@@ -9,7 +9,8 @@ The one argv value ever kept is the worker's `--model` flag value, recorded on p
 
 | Path | Owner |
 |---|---|
-| `agent_dash.py` (CLI: `run`, `stop`, `restart`, `status`, `backfill --session <id>`, `reprice`, `reconcile`, `check`, `ws`, `report`) | core |
+| `agent_dash.py` (CLI: `run`, `stop`, `restart`, `status`, `state`, `doctor`, `backfill --session <id>`, `reprice`, `reconcile`, `check`, `ws`, `report`) | core |
+| `dash/state.py` (`GET /api/state`), `dash/doctor.py` (`doctor`), `dash/errors.py` (exit codes, messages) | cli |
 | `dash/store.py` (schema, offsets, upserts, buckets, counts) | core |
 | `dash/server.py` (HTTP + SSE, routes below) | core |
 | `dash/attribution.py`, `map.example.json` (`map.local.json` replaces it) | core |
@@ -66,6 +67,11 @@ Workstream attribution happens in core (`attribution.py`), not in sources: label
 (`label`, `regex`, `session-default`).
 
 ## HTTP API (all GET, JSON, 127.0.0.1 only)
+
+API errors are JSON `{error, code, hint}`; `hint` names the next
+command to run. CLI errors follow the same rule, with exit codes 0
+ok, 1 check failed, 2 usage, 3 not found, 4 invalid data, 5
+unreachable (docs/integrate.md, For agents).
 
 `GET /` -> `static/index.html`.
 
@@ -191,6 +197,36 @@ in the last hour; they are counted, never traceback-logged.
 `ok` is false when any source has an error, is `stalled` (no poll for more than 3x its interval), or overran its poll budget. Each source poll runs in a watchdog thread (`poll_budget_s`, default 25 s) so one hung source cannot stall the others; `/api/reconcile` mismatches include `source stalled: <name> (last ok poll N s ago)` for the same condition.
 `scratch_roots` is the configured, resolved `roots.scratchpads` list (a local config that narrows it shows up here); `run_dirs` is the registered run folders. `warnings` names each registered folder outside the configured roots that holds a manifest for a currently live worker, so a run folder the config does not cover is loud instead of silently invisible.
 
+`GET /api/state` -> the whole dashboard in one call, computed in one
+store pass (`Store.state_view`):
+```json
+{"schema": 1, "version": {"tool": "<git-sha|unknown>", "schema": 1},
+ "now": 0, "window": {"since": 0, "until": 0, "hours": 24},
+ "health": {"ok": true, "sources": [{name, last_poll, last_error, lag_s}], "scratch_roots": [], "run_dirs": [], "warnings": []},
+ "workstreams": [{"id": "WS7", "title": "", "plan": true, "progress": {"done": 0, "total": 0, "counts": {}, "pct": 0},
+   "live_agents": 0, "tokens": 0, "cost_usd": 0.0, "tokens_all_time": 0, "cost_usd_all_time": 0.0, "last_activity": 0}],
+ "unassigned": {"live_agents": 0, "tokens": 0, "cost_usd": 0.0, "tokens_all_time": 0, "cost_usd_all_time": 0.0, "last_activity": 0},
+ "running": {"count": 0, "by_source": {"muse": 0}},
+ "totals": {"tokens": {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0, "reasoning": 0}, "cost_usd": 0.0, "unpriced_runs": 0},
+ "totals_all_time": {"tokens": {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0, "reasoning": 0}, "cost_usd": 0.0},
+ "reconcile": {"ok": true, "mismatches": []},
+ "problems": [{"code": "stale-running", "message": "", "command": "python3 agent_dash.py check"}]}
+```
+`version.tool` is the git short sha of the tool directory, `"unknown"`
+outside git. The window is the one fixed 24 h. `progress` is the same
+object `/api/plan` carries, or null. `health` carries the same
+`scratch_roots`, `run_dirs`, and `warnings` as `/api/health`.
+`problems` codes are `source-error`, `source-stale`,
+`reconcile-mismatch` (including one `unseen worker: <label>` item per
+live worker process the dashboard cannot see, graced while younger than
+two poll intervals, and one `duplicate run` item per unmerged launcher
+twin), `stale-running`, `unpriced-model`, and `invalid-bundle`; each
+`command` is the exact next command to run. Fields are only added,
+never renamed.
+`python3 agent_dash.py state [--json]` prints the same payload.
+`doctor` additionally reports each health `warnings` entry as a
+`run-dir-outside-roots` problem.
+
 `GET /static/<file>` serves a file from `static/` or one subdirectory (`vendor/`). `/static/taskmap.json` is the resolved task map (`taskmap.local.json`, else `taskmap.example.json`). Context-window rows use tool `grok-context` and are left out of cost.
 
 ## Plan bundles
@@ -299,10 +335,15 @@ python3 agent_dash.py ws list
 python3 agent_dash.py ws new <ID> "<title>"
 python3 agent_dash.py ws validate <ID>
 python3 agent_dash.py ws render <ID>
+python3 agent_dash.py ws plan <ID>
 python3 agent_dash.py ws task <ID> <task-id> <status> [--moved-to WSn] [--note "..."] [--force]
 python3 agent_dash.py ws approve <ID> <item-id> <approved|denied|pending> [--note "..."] [--step "..."] [--reversible yes|no] [--conditions "..."]
 python3 agent_dash.py ws approvals [<ID>]
 ```
+
+`ws plan` lists the bundle's task ids, titles, statuses, and deps.
+Exit codes are 0 ok, 1 check failed, 2 usage error, 3 not found, 4
+invalid data, 5 dashboard unreachable (docs/integrate.md, For agents).
 
 `ws new` writes a valid template. `ws task` writes `plan.json` through a temp file and `os.replace`, holding a per-bundle `fcntl` lock across the read-modify-write so concurrent writers keep every update. `ws approve` writes `approvals.json` the same way. Moving a `done` or `deferred` task back to `wip` or `pr` needs `--force`. A new pending item needs `--step`, `--reversible yes|no`, and `--conditions`. `approved` or `denied` sets `decided_at` and `decided_by` to `owner`. `ws approvals` prints a table. `ws validate` checks the schema, including `approvals.json` when that file exists, and the naming rule: a TU-style id, a 3-to-5-digit issue number, or an ADR number with no phrase earlier on the same line is a failure.
 

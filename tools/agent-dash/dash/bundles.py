@@ -14,6 +14,7 @@ import re
 from datetime import datetime, timezone
 from pathlib import Path
 
+from dash import errors
 from dash.plans import PlanNotFound, configured
 from dash.plans import load as load_plan
 from dash.plans import plan_progress
@@ -59,11 +60,16 @@ WS_USAGE = """agent-dash workstream bundles
   python3 agent_dash.py ws render <ID>
   python3 agent_dash.py ws task <ID> <task-id> <status> [--moved-to WSn] [--note "..."] [--force]
   python3 agent_dash.py ws train <ID> <train-id> [--title T] [--branch B] [--status S] [--add id,id] [--remove id,id] [--pr N] [--shared f1,f2] [--gate "..."] [--note "..."]
-  python3 agent_dash.py ws trains <ID>
+  python3 agent_dash.py ws trains <ID> [--json]
+  python3 agent_dash.py ws plan <ID> [--json]
   python3 agent_dash.py ws approve <ID> <item-id> <approved|denied|pending> [--note "..."] [--step "..."] [--reversible yes|no] [--conditions "..."]
-  python3 agent_dash.py ws approvals [<ID>]
+  python3 agent_dash.py ws approvals [<ID>] [--json]
+  python3 agent_dash.py ws validate <ID> [--json]
 
-Status is todo, pr, prog, done, or deferred. deferred may set --moved-to and --note.
+Status is todo, wip, pr, prog, done, or deferred. deferred may set --moved-to and --note.
+`ws plan` lists the bundle's tasks (ids, titles, status, deps). `--json` prints
+machine JSON to stdout; with it, human text goes to stderr.
+Exit codes: 0 ok, 1 check failed, 2 usage error, 3 not found, 4 invalid data.
 Train status is planned, assembling, gate, pr, merged, or dropped. A task belongs to at most one train.
 A new approval is `ws approve <ID> <item-id> pending --step "..." --reversible yes|no --conditions "..."`.
 Bundles are directories under AGENT_DASH_WORKSTREAMS.
@@ -480,16 +486,16 @@ def start_prompt_text(ws: str, root: Path | None = None) -> str | None:
 
 def cmd_new(ws: str, title: str, root: Path | None = None) -> int:
     if not _ID.match(ws):
-        print(f"bad id {ws}", flush=True)
-        return 2
+        print(f"bad bundle id {ws!r}: use 1-32 chars, letters, digits, _ or -", flush=True)
+        return errors.USAGE
     if not title or not title.strip():
-        print("title required", flush=True)
-        return 2
+        print("title required: pass a quoted title, e.g. python3 agent_dash.py ws new WS4 \"Notes index\"", flush=True)
+        return errors.USAGE
     base = Path(root) if root is not None else workstreams_root()
     dest = base / ws
     if dest.exists():
-        print(f"bundle exists: {dest}", flush=True)
-        return 2
+        print(f"bundle {ws} already exists at {dest}. Run: python3 agent_dash.py ws validate {ws}", flush=True)
+        return errors.USAGE
     orders = [item["order"] for item in list_bundles(base)]
     order = (max(orders) if orders else 0) + 10
     dest.mkdir(parents=True)
@@ -809,22 +815,22 @@ def set_approval(
     root: Path | None = None,
 ) -> int:
     if not _ITEM.match(item_id):
-        print(f"bad id {item_id}", flush=True)
-        return 2
+        print(f"bad approval id {item_id!r}: use letters, digits, _, ., - (max 64 chars)", flush=True)
+        return errors.USAGE
     if status not in APPROVAL_STATUSES:
-        print(f"bad status {status}", flush=True)
-        return 2
+        print(f"unknown approval status {status!r}. Use one of: {', '.join(APPROVAL_STATUSES)}", flush=True)
+        return errors.USAGE
     path = bundle_dir(ws, root)
     if path is None:
-        print(f"bundle not found: {ws}", flush=True)
-        return 2
+        print(errors.bundle_not_found(ws), flush=True)
+        return errors.NOT_FOUND
     file = path / "approvals.json"
     with _bundle_lock(path):
         if file.is_file():
             data = _read_json(file)
             if not isinstance(data, dict):
-                print("approvals.json unreadable", flush=True)
-                return 2
+                print(errors.approvals_unreadable(ws), flush=True)
+                return errors.INVALID_DATA
         else:
             data = empty_approvals(ws)
         items = data.get("items")
@@ -837,11 +843,11 @@ def set_approval(
                 break
         if found is None:
             if step is None or not str(step).strip():
-                print("step required", flush=True)
-                return 2
+                print(f"step required for a new approval. Run: python3 agent_dash.py ws approve {ws} {item_id} pending --step \"...\" --reversible yes|no --conditions \"...\"", flush=True)
+                return errors.USAGE
             if reversible is None:
-                print("reversible required", flush=True)
-                return 2
+                print(f"reversible required for a new approval. Run: python3 agent_dash.py ws approve {ws} {item_id} pending --step \"...\" --reversible yes|no --conditions \"...\"", flush=True)
+                return errors.USAGE
             found = {
                 "id": item_id,
                 "step": str(step).strip(),
@@ -879,18 +885,30 @@ def set_approval(
     return 0
 
 
-def print_approvals(ws: str | None = None, root: Path | None = None) -> int:
+def _say(text: str, json_mode: bool = False) -> None:
+    """Human text: stdout normally, stderr when ``--json`` is set."""
+    import sys as _sys
+
+    print(text, file=_sys.stderr if json_mode else _sys.stdout, flush=True)
+
+
+def print_approvals(ws: str | None = None, root: Path | None = None, json_mode: bool = False) -> int:
     if ws:
         if bundle_dir(ws, root) is None:
-            print(f"bundle not found: {ws}", flush=True)
-            return 2
+            _say(errors.bundle_not_found(ws), json_mode)
+            return errors.NOT_FOUND
         records = [approvals_for(ws, root)]
     else:
         records = approvals_all(root)
+    records = [record for record in records if record]
+    if json_mode:
+        payload: dict = {"approvals": records}
+        if ws:
+            payload["ws"] = ws
+        errors.emit_json(payload)
+        return 0
     lines = []
     for record in records:
-        if not record:
-            continue
         for item in record.get("items") or []:
             if not isinstance(item, dict):
                 continue
@@ -1069,43 +1087,48 @@ def set_task(
     force: bool = False,
 ) -> int:
     if status not in STATUSES:
-        print(f"bad status {status}. Use one of:", flush=True)
+        print(f"unknown status {status!r}. Use one of: {', '.join(STATUSES)}", flush=True)
         for key in STATUSES:
             print(f"  {key:9} {STATUS_MEANING[key]}", flush=True)
-        return 2
+        print(f"Run: python3 agent_dash.py ws plan {ws} to see the tasks first", flush=True)
+        return errors.USAGE
     if status == "prog":
         print("note: prog means merged to main and waiting on a production step. For work still on a branch use wip; for approved or open-PR work use pr.", flush=True)
     if moved_to is not None and not _MOVED.match(moved_to):
-        print(f"bad moved-to {moved_to}", flush=True)
-        return 2
+        print(f"bad moved-to {moved_to!r}: use WSn, e.g. WS6", flush=True)
+        return errors.USAGE
     if status != "deferred" and (moved_to or note):
-        print("moved-to and note belong on deferred", flush=True)
-        return 2
+        print(f"moved-to and note belong on deferred. Run: python3 agent_dash.py ws task {ws} {task_id} deferred --moved-to WS<n> --note ...", flush=True)
+        return errors.USAGE
     path = bundle_dir(ws, root)
     if path is None:
-        print(f"bundle not found: {ws}", flush=True)
-        return 2
+        print(errors.bundle_not_found(ws), flush=True)
+        return errors.NOT_FOUND
     plan_path = path / "plan.json"
     with _bundle_lock(path):
         data = _read_json(plan_path)
         if not isinstance(data, dict):
-            print("plan.json unreadable", flush=True)
-            return 2
+            print(errors.plan_unreadable(ws), flush=True)
+            return errors.INVALID_DATA
         dag = data.get("dag")
         if not isinstance(dag, dict) or not isinstance(dag.get("groups"), list):
-            print("plan.json has no dag", flush=True)
-            return 2
+            print(f"plan.json for {ws} has no dag. Run: python3 agent_dash.py ws validate {ws}", flush=True)
+            return errors.INVALID_DATA
         found = False
         old_status: str | None = None
+        known = 0
         for group in dag["groups"]:
             if not isinstance(group, dict):
                 continue
             for task in group.get("tasks") or []:
-                if isinstance(task, dict) and task.get("id") == task_id:
+                if not isinstance(task, dict):
+                    continue
+                known += 1
+                if task.get("id") == task_id:
                     old_status = task.get("status") if isinstance(task.get("status"), str) else None
                     if not force and old_status in ("done", "deferred") and status in ("wip", "pr"):
                         print(f"refusing to move {ws} {task_id} from {old_status} to {status} (use --force)", flush=True)
-                        return 2
+                        return errors.USAGE
                     task["status"] = status
                     if status == "deferred":
                         if moved_to is not None:
@@ -1117,8 +1140,8 @@ def set_task(
                         task.pop("note", None)
                     found = True
         if not found:
-            print(f"task not found: {task_id}", flush=True)
-            return 2
+            print(errors.task_not_found(ws, task_id, known), flush=True)
+            return errors.NOT_FOUND
         _atomic_write(plan_path, json.dumps(data, indent=2, ensure_ascii=False) + "\n")
     if old_status != status:
         append_history(ws, task_id, old_status, status, root=root)
@@ -1180,35 +1203,35 @@ def set_train(
     root: Path | None = None,
 ) -> int:
     if not isinstance(train_id, str) or not _TRAIN_ID.match(train_id):
-        print(f"bad train id {train_id}", flush=True)
-        return 2
+        print(f"bad train id {train_id!r}: use letters, digits, ., _, - (max 40 chars)", flush=True)
+        return errors.USAGE
     if status is not None and status not in TRAIN_STATUSES:
-        print(f"bad status {status}. Use one of: {', '.join(TRAIN_STATUSES)}", flush=True)
-        return 2
+        print(errors.unknown_train_status(status), flush=True)
+        return errors.USAGE
     if branch is not None and not branch.startswith("train/"):
-        print(f'bad branch {branch}: must start with "train/"', flush=True)
-        return 2
+        print(f'bad branch {branch!r}: must start with "train/", e.g. train/notes-cutover', flush=True)
+        return errors.USAGE
     if title is not None and not title.strip():
-        print("title required", flush=True)
-        return 2
+        print("title required: pass --title \"...\"", flush=True)
+        return errors.USAGE
     path = bundle_dir(ws, root)
     if path is None:
-        print(f"bundle not found: {ws}", flush=True)
-        return 2
+        print(errors.bundle_not_found(ws), flush=True)
+        return errors.NOT_FOUND
     plan_path = path / "plan.json"
     with _bundle_lock(path):
         data = _read_json(plan_path)
         if not isinstance(data, dict):
-            print("plan.json unreadable", flush=True)
-            return 2
+            print(errors.plan_unreadable(ws), flush=True)
+            return errors.INVALID_DATA
         known = _dag_task_ids(data)
         trains = data.get("trains")
         if trains is None:
             trains = []
             data["trains"] = trains
         if not isinstance(trains, list):
-            print("plan.json trains is not a list", flush=True)
-            return 2
+            print(f"plan.json trains for {ws} is not a list. Run: python3 agent_dash.py ws validate {ws}", flush=True)
+            return errors.INVALID_DATA
         found = None
         for item in trains:
             if isinstance(item, dict) and item.get("id") == train_id:
@@ -1216,8 +1239,8 @@ def set_train(
                 break
         if found is None:
             if title is None:
-                print("title required for a new train", flush=True)
-                return 2
+                print(f"title required for a new train. Run: python3 agent_dash.py ws train {ws} {train_id} --title \"...\"", flush=True)
+                return errors.USAGE
             found = {"id": train_id, "title": title.strip(), "members": [], "status": "planned"}
             trains.append(found)
         elif title is not None:
@@ -1231,8 +1254,8 @@ def set_train(
                 members.remove(task_id)
         for task_id in add or []:
             if task_id not in known:
-                print(f"task not found: {task_id}", flush=True)
-                return 2
+                print(errors.task_not_found(ws, task_id, len(known)), flush=True)
+                return errors.NOT_FOUND
             for other in trains:
                 if other is not found and isinstance(other, dict) and task_id in (other.get("members") or []):
                     other["members"].remove(task_id)
@@ -1240,8 +1263,8 @@ def set_train(
             if task_id not in members:
                 members.append(task_id)
         if add and len(members) > TRAIN_MEMBER_LIMIT:
-            print(f"train {train_id} has {len(members)} members; split it (limit {TRAIN_MEMBER_LIMIT})", flush=True)
-            return 2
+            print(f"train {train_id} has {len(members)} members; split it (limit {TRAIN_MEMBER_LIMIT}). Run: python3 agent_dash.py ws trains {ws}", flush=True)
+            return errors.USAGE
         if branch is not None:
             found["branch"] = branch
         if status is not None:
@@ -1259,19 +1282,14 @@ def set_train(
     return 0
 
 
-def print_trains(ws: str, root: Path | None = None) -> int:
+def _train_rows(ws: str, root: Path | None = None) -> tuple[list | None, dict]:
+    """Structured trains for one bundle, plus the dag task statuses."""
     path = bundle_dir(ws, root)
     if path is None:
-        print(f"bundle not found: {ws}", flush=True)
-        return 2
+        return None, {}
     data = _read_json(path / "plan.json")
     if not isinstance(data, dict):
-        print("plan.json unreadable", flush=True)
-        return 2
-    trains = data.get("trains") or []
-    if not isinstance(trains, list) or not trains:
-        print("(no trains)")
-        return 0
+        return False, {}
     dag_status: dict[str, str] = {}
     dag = data.get("dag")
     if isinstance(dag, dict):
@@ -1281,13 +1299,50 @@ def print_trains(ws: str, root: Path | None = None) -> int:
             for task in group.get("tasks") or []:
                 if isinstance(task, dict) and isinstance(task.get("id"), str):
                     dag_status[task["id"]] = task.get("status") or "todo"
-    print("TRAIN\tSTATUS\tBRANCH\tPR\tMEMBERS\tSHARED")
+    trains = data.get("trains") or []
+    if not isinstance(trains, list):
+        return False, {}
+    rows = []
     for item in trains:
         if not isinstance(item, dict):
             continue
         members = item.get("members") if isinstance(item.get("members"), list) else []
+        rows.append(
+            {
+                "id": item.get("id"),
+                "title": item.get("title"),
+                "status": item.get("status"),
+                "branch": item.get("branch"),
+                "pr": item.get("pr"),
+                "members": members,
+                "member_status": {member: dag_status.get(member, "?") for member in members},
+                "shared_files": item.get("shared_files") if isinstance(item.get("shared_files"), list) else [],
+                "gate": item.get("gate"),
+                "note": item.get("note"),
+            }
+        )
+    return rows, dag_status
+
+
+def print_trains(ws: str, root: Path | None = None, json_mode: bool = False) -> int:
+    rows, dag_status = _train_rows(ws, root)
+    if rows is None:
+        _say(errors.bundle_not_found(ws), json_mode)
+        return errors.NOT_FOUND
+    if rows is False:
+        _say(errors.plan_unreadable(ws), json_mode)
+        return errors.INVALID_DATA
+    if json_mode:
+        errors.emit_json({"ws": ws, "trains": rows})
+        return 0
+    if not rows:
+        print("(no trains)")
+        return 0
+    print("TRAIN\tSTATUS\tBRANCH\tPR\tMEMBERS\tSHARED")
+    for item in rows:
+        members = item.get("members") or []
         member_text = ",".join(f"{member}({dag_status.get(member, '?')})" for member in members) or "-"
-        shared = item.get("shared_files") if isinstance(item.get("shared_files"), list) else []
+        shared = item.get("shared_files") or []
         print(
             "\t".join(
                 [
@@ -1303,12 +1358,64 @@ def print_trains(ws: str, root: Path | None = None) -> int:
     return 0
 
 
+def print_plan(ws: str, json_mode: bool = False) -> int:
+    """List one bundle's tasks: ids, titles, status, deps."""
+    from dash.plans import PlanError
+
+    try:
+        _source, body = resolve_plan(ws)
+    except PlanError:
+        _say(errors.plan_unreadable(ws), json_mode)
+        return errors.INVALID_DATA
+    if not isinstance(body, dict):
+        _say(f"plan not found for {ws}. Run: python3 agent_dash.py ws list", json_mode)
+        return errors.NOT_FOUND
+    groups = []
+    for group in body.get("groups") or []:
+        if not isinstance(group, dict):
+            continue
+        tasks = []
+        for task in group.get("tasks") or []:
+            if not isinstance(task, dict):
+                continue
+            deps = task.get("deps")
+            tasks.append(
+                {
+                    "id": task.get("id"),
+                    "title": task.get("title"),
+                    "status": task.get("status"),
+                    "deps": [item for item in deps if isinstance(item, str)] if isinstance(deps, list) else [],
+                }
+            )
+        groups.append({"id": group.get("id"), "title": group.get("title"), "tasks": tasks})
+    if json_mode:
+        errors.emit_json({"ws": ws, "groups": groups})
+        return 0
+    if not groups:
+        print(f"(no plan for {ws})")
+        return 0
+    print(f"plan {ws}: {sum(len(group['tasks']) for group in groups)} tasks")
+    for group in groups:
+        print(f"group {group.get('id')}: {group.get('title')}")
+        for task in group["tasks"]:
+            deps = f" (deps: {', '.join(task['deps'])})" if task["deps"] else ""
+            print(f"  {task.get('id')} [{task.get('status')}] {task.get('title')}{deps}")
+    return 0
+
+
 def cmd_ws(argv: list[str]) -> int:
     if not argv or argv[0] in ("-h", "--help"):
         print(WS_USAGE, end="")
-        return 0 if argv and argv[0] in ("-h", "--help") else 2
+        return 0 if argv and argv[0] in ("-h", "--help") else errors.USAGE
     cmd = argv[0]
     rest = argv[1:]
+    json_mode = False
+    if rest[:1] == ["--json"]:
+        json_mode = True
+        rest = rest[1:]
+    elif rest[-1:] == ["--json"]:
+        json_mode = True
+        rest = rest[:-1]
     if cmd == "list":
         rows = list_bundles()
         if not rows:
@@ -1325,29 +1432,42 @@ def cmd_ws(argv: list[str]) -> int:
     if cmd == "validate":
         if len(rest) != 1:
             print(WS_USAGE, end="", flush=True)
-            return 2
-        issues = validate_bundle(rest[0])
+            return errors.USAGE
+        ws = rest[0]
+        if bundle_dir(ws) is None:
+            _say(errors.bundle_not_found(ws), json_mode)
+            return errors.NOT_FOUND
+        issues = validate_bundle(ws)
+        if json_mode:
+            errors.emit_json({"ws": ws, "ok": not issues, "issues": issues})
+            return errors.INVALID_DATA if issues else errors.OK
         if issues:
             for issue in issues:
                 print(issue)
-            return 1
-        print(f"OK {rest[0]}")
+            print(f"validate failed for {ws}: {len(issues)} issues. Fix the files above, then re-run: python3 agent_dash.py ws validate {ws}")
+            return errors.INVALID_DATA
+        print(f"OK {ws}")
         return 0
+    if cmd == "plan":
+        if len(rest) != 1:
+            print(WS_USAGE, end="", flush=True)
+            return errors.USAGE
+        return print_plan(rest[0], json_mode=json_mode)
     if cmd == "render":
         if len(rest) != 1:
             print(WS_USAGE, end="", flush=True)
-            return 2
+            return errors.USAGE
         path = bundle_dir(rest[0])
         if path is None:
-            print(f"bundle not found: {rest[0]}", flush=True)
-            return 2
+            _say(errors.bundle_not_found(rest[0]), json_mode)
+            return errors.NOT_FOUND
         from dash.planrender import RenderError, render
 
         try:
             render(path)
         except RenderError as exc:
-            print(str(exc), flush=True)
-            return 1
+            _say(f"render failed for {rest[0]}: {exc}. Run: python3 agent_dash.py ws validate {rest[0]}", json_mode)
+            return errors.INVALID_DATA
         print(f"wrote {path / 'page.html'}")
         return 0
     if cmd == "task":
@@ -1402,8 +1522,8 @@ def cmd_ws(argv: list[str]) -> int:
                     try:
                         pr = int(value)
                     except ValueError:
-                        print(f"bad pr {value}: must be an integer", flush=True)
-                        return 2
+                        print(f"bad pr {value!r}: must be an integer, e.g. --pr 100", flush=True)
+                        return errors.USAGE
                 elif flag == "--shared":
                     shared = _split_csv(value)
                 elif flag == "--gate":
@@ -1418,8 +1538,8 @@ def cmd_ws(argv: list[str]) -> int:
     if cmd == "trains":
         if len(rest) != 1:
             print(WS_USAGE, end="", flush=True)
-            return 2
-        return print_trains(rest[0])
+            return errors.USAGE
+        return print_trains(rest[0], json_mode=json_mode)
     if cmd == "approve":
         if len(rest) < 3:
             print(WS_USAGE, end="", flush=True)
@@ -1439,8 +1559,8 @@ def cmd_ws(argv: list[str]) -> int:
                 elif flag == "--reversible":
                     reversible = _parse_yes_no(value)
                     if reversible is None:
-                        print("reversible must be yes or no", flush=True)
-                        return 2
+                        print(f"unknown reversible {value!r}. Use yes or no, e.g. --reversible no", flush=True)
+                        return errors.USAGE
                 elif flag == "--conditions":
                     conditions = value
                 else:
@@ -1453,7 +1573,7 @@ def cmd_ws(argv: list[str]) -> int:
     if cmd == "approvals":
         if len(rest) > 1:
             print(WS_USAGE, end="", flush=True)
-            return 2
-        return print_approvals(rest[0] if rest else None)
+            return errors.USAGE
+        return print_approvals(rest[0] if rest else None, json_mode=json_mode)
     print(WS_USAGE, end="", flush=True)
-    return 2
+    return errors.USAGE

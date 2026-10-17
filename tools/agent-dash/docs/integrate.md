@@ -2,6 +2,46 @@
 
 The dashboard shows agent runs, tokens, cost, and plan progress. Any harness can feed it. The two paths are the `report` command (three lines per run) and the manifest files (one TSV row plus report files). Detail lives in [CONTRACT.md](../CONTRACT.md).
 
+## For agents
+
+Two commands tell you everything. Run them first, in this order:
+
+```bash
+python3 tools/agent-dash/agent_dash.py doctor   # what's broken, and the fix for each
+python3 tools/agent-dash/agent_dash.py state    # the whole dashboard in one call
+```
+
+`state` reads `GET /api/state`: version, window, health per source,
+workstreams with progress and tokens, the unassigned row, the running
+count by source, the reconcile verdict, and a `problems` list where
+every entry names the exact next command. `doctor` checks the
+dashboard, the sources, scratch roots, manifest coverage, pricing,
+reconcile, page-check prerequisites, config files, bundles, the
+checkout, and the Python runner, then prints a fix per problem.
+`doctor` is read-only and exits 0 when clean, 1 when problems found.
+
+These commands take `--json` for machine output on stdout only (human
+text moves to stderr when `--json` is set): `check`, `check --page`
+(summary), `state`, `status`, `doctor`, `ws validate`, `ws approvals`,
+`ws trains`, `ws plan <ID>`. The schema only gains fields, never
+renames them.
+
+Exit codes are the same in `agent_dash.py` and every `ws` subcommand:
+
+| Code | Meaning | Example next step |
+|---|---|---|
+| 0 | ok | — |
+| 1 | check failed (mismatches found, or doctor found problems) | `python3 agent_dash.py check` |
+| 2 | usage error (bad flags or values) | re-run with a listed value |
+| 3 | not found (workstream, task, train member, approval, bundle) | `python3 agent_dash.py ws list` |
+| 4 | invalid data (validation failed) | `python3 agent_dash.py ws validate <ID>` |
+| 5 | dashboard unreachable | `python3 agent_dash.py run` |
+
+Every error message says what was wrong, the valid choices when the
+set is small, and the next command. `stop`/`status` keep their older
+contract: they print `stopped` (plus the `run` command) and exit 1
+when no live dashboard answers.
+
 ## 1. Install and run
 
 Three commands, from any checkout of this repo:

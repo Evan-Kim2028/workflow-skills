@@ -1314,96 +1314,22 @@ class Store:
                 shown_all, parents, now, since, until, live_open, usage=usage_once
             )
             everything = list(roll["rows"]) + [roll["unassigned"]]
+            mismatches = self._mismatches_locked(
+                roll,
+                shown_all,
+                now,
+                lambda ws: _scope_tab(roll, ws),
+                processes,
+            )
             all_counts = roll["all"]["counts"]
             all_totals = roll["all"]["totals"]
-            mismatches: list[str] = []
-            for metric in ("live_agents", "finished_in_range", "finished_today", "tokens"):
-                if metric == "tokens":
-                    expect: int = _billed_total(all_totals["tokens"])
-                else:
-                    expect = all_counts[metric]
-                total = sum(row[metric] for row in everything)
-                if total != expect:
-                    mismatches.append(f"{metric}: workstream rows sum to {total}, overview shows {expect}")
-            if abs(sum(row["cost_usd"] for row in everything) - all_totals["cost_usd"]) > 1e-6:
-                mismatches.append(
-                    "cost_usd: workstream rows sum to "
-                    f"{sum(row['cost_usd'] for row in everything):.6f}, "
-                    f"overview shows {all_totals['cost_usd']:.6f}"
-                )
-            # Per-workstream tabs read the same roll: compare each overview
-            # row against its already-computed scope instead of re-running a
-            # full snapshot per workstream (O(scopes) filtering, not
-            # O(scopes) scans). Values agree by construction; the checks stay
-            # so a future divergence still reports the same messages.
-            for row in roll["rows"]:
-                scope = roll["scopes"].get(row["ws"], _empty_scope())
-                tab_counts = scope["counts"]
-                tab_totals = scope["totals"]
-                tab_all_time = roll["all_time"].get(row["ws"])
-                for metric in ("live_agents", "finished_in_range", "finished_today"):
-                    if row[metric] != tab_counts[metric]:
-                        mismatches.append(
-                            f"{row['ws']} {metric}: overview row shows {row[metric]}, "
-                            f"tab shows {tab_counts[metric]}"
-                        )
-                if row["tokens"] != _billed_total(tab_totals["tokens"]):
-                    mismatches.append(
-                        f"{row['ws']} tokens: overview row shows {row['tokens']}, "
-                        f"tab shows {_billed_total(tab_totals['tokens'])}"
-                    )
-                if abs(row["cost_usd"] - tab_totals["cost_usd"]) > 1e-6:
-                    mismatches.append(
-                        f"{row['ws']} cost_usd: overview row shows {row['cost_usd']:.6f}, "
-                        f"tab shows {tab_totals['cost_usd']:.6f}"
-                    )
-                if tab_all_time is not None:
-                    if row["tokens_all_time"] != _billed_total(tab_all_time["tokens"]):
-                        mismatches.append(
-                            f"{row['ws']} tokens_all_time: overview row shows {row['tokens_all_time']}, "
-                            f"tab shows {_billed_total(tab_all_time['tokens'])}"
-                        )
-                    if abs(row["cost_usd_all_time"] - tab_all_time["cost_usd"]) > 1e-6:
-                        mismatches.append(
-                            f"{row['ws']} cost_usd_all_time: overview row shows {row['cost_usd_all_time']:.6f}, "
-                            f"tab shows {tab_all_time['cost_usd']:.6f}"
-                        )
             all_time = roll["all_time"]
             all_time_total = _billed_total(all_time["all"]["tokens"])
-            if sum(row["tokens_all_time"] for row in everything) != all_time_total:
-                mismatches.append(
-                    "tokens_all_time: workstream rows sum to "
-                    f"{sum(row['tokens_all_time'] for row in everything)}, "
-                    f"overview shows {all_time_total}"
-                )
-            if (
-                abs(
-                    sum(row["cost_usd_all_time"] for row in everything)
-                    - all_time["all"]["cost_usd"]
-                )
-                > 1e-6
-            ):
-                mismatches.append(
-                    "cost_usd_all_time: workstream rows sum to "
-                    f"{sum(row['cost_usd_all_time'] for row in everything):.6f}, "
-                    f"overview shows {all_time['all']['cost_usd']:.6f}"
-                )
-            hours = (roll["until"] - roll["since"]) / 3600 if roll["until"] > roll["since"] else 0
-            for entry in self._unpriced_models_locked(roll["since"], roll["until"], None):
-                mismatches.append(
-                    f"unpriced model: {entry['model']} ({entry['tokens']} tokens in {hours:g} h)"
-                )
             # The Finished table shows the newest 50 and the page names the
             # truncation ("Newest 50 of 1,452"), so a large finished count is
             # visible, not a mismatch; the counts feed that subtitle.
             finished_total = all_counts["finished_in_range"]
             recent_shown = min(50, finished_total)
-            for run, reason in self._stale_locked(now, shown_all):
-                mismatches.append(f"stale running: {run.get('run_id')} ({reason})")
-            mismatches.extend(self._unseen_workers_locked(now, shown_all, processes or []))
-            mismatches.extend(
-                _duplicate_run_mismatches([dict(row) for row in self._all_runs()])
-            )
             return {
                 "now": now,
                 "since": roll["since"],
@@ -1493,6 +1419,141 @@ class Store:
             for row in rows
             if row["first_ts"] is not None
         }
+
+    def _mismatches_locked(self, roll: dict, shown_all: list, now: float, tab_of, processes=None) -> list:
+        """Every violated invariant for one rollup. Caller holds the lock.
+
+        ``tab_of(ws)`` returns ``(counts, totals, all_time)`` from the same
+        roll's already-computed scopes (``all_time`` is None when the roll
+        holds no all-time scope for ``ws``); both callers pass
+        ``_scope_tab`` over their own roll, so both agree with each other
+        and emit ``/api/reconcile`` order: row sums, per-row tabs, all-time
+        sums, unpriced models, stale running, unseen workers, then
+        duplicate runs. ``processes`` is the live worker listing for the
+        ``unseen worker`` check (``[]`` for none).
+        """
+        everything = list(roll["rows"]) + [roll["unassigned"]]
+        all_counts = roll["all"]["counts"]
+        all_totals = roll["all"]["totals"]
+        mismatches: list[str] = []
+        for metric in ("live_agents", "finished_in_range", "finished_today", "tokens"):
+            if metric == "tokens":
+                expect: int = _billed_total(all_totals["tokens"])
+            else:
+                expect = all_counts[metric]
+            total = sum(row[metric] for row in everything)
+            if total != expect:
+                mismatches.append(f"{metric}: workstream rows sum to {total}, overview shows {expect}")
+        if abs(sum(row["cost_usd"] for row in everything) - all_totals["cost_usd"]) > 1e-6:
+            mismatches.append(
+                "cost_usd: workstream rows sum to "
+                f"{sum(row['cost_usd'] for row in everything):.6f}, "
+                f"overview shows {all_totals['cost_usd']:.6f}"
+            )
+        for row in roll["rows"]:
+            tab_counts, tab_totals, tab_all_time = tab_of(row["ws"])
+            for metric in ("live_agents", "finished_in_range", "finished_today"):
+                if row[metric] != tab_counts[metric]:
+                    mismatches.append(
+                        f"{row['ws']} {metric}: overview row shows {row[metric]}, "
+                        f"tab shows {tab_counts[metric]}"
+                    )
+            if row["tokens"] != _billed_total(tab_totals["tokens"]):
+                mismatches.append(
+                    f"{row['ws']} tokens: overview row shows {row['tokens']}, "
+                    f"tab shows {_billed_total(tab_totals['tokens'])}"
+                )
+            if abs(row["cost_usd"] - tab_totals["cost_usd"]) > 1e-6:
+                mismatches.append(
+                    f"{row['ws']} cost_usd: overview row shows {row['cost_usd']:.6f}, "
+                    f"tab shows {tab_totals['cost_usd']:.6f}"
+                )
+            if tab_all_time is not None:
+                if row["tokens_all_time"] != _billed_total(tab_all_time["tokens"]):
+                    mismatches.append(
+                        f"{row['ws']} tokens_all_time: overview row shows {row['tokens_all_time']}, "
+                        f"tab shows {_billed_total(tab_all_time['tokens'])}"
+                    )
+                if abs(row["cost_usd_all_time"] - tab_all_time["cost_usd"]) > 1e-6:
+                    mismatches.append(
+                        f"{row['ws']} cost_usd_all_time: overview row shows {row['cost_usd_all_time']:.6f}, "
+                        f"tab shows {tab_all_time['cost_usd']:.6f}"
+                    )
+        all_time = roll["all_time"]
+        all_time_total = _billed_total(all_time["all"]["tokens"])
+        if sum(row["tokens_all_time"] for row in everything) != all_time_total:
+            mismatches.append(
+                "tokens_all_time: workstream rows sum to "
+                f"{sum(row['tokens_all_time'] for row in everything)}, "
+                f"overview shows {all_time_total}"
+            )
+        if (
+            abs(
+                sum(row["cost_usd_all_time"] for row in everything)
+                - all_time["all"]["cost_usd"]
+            )
+            > 1e-6
+        ):
+            mismatches.append(
+                "cost_usd_all_time: workstream rows sum to "
+                f"{sum(row['cost_usd_all_time'] for row in everything):.6f}, "
+                f"overview shows {all_time['all']['cost_usd']:.6f}"
+            )
+        hours = (roll["until"] - roll["since"]) / 3600 if roll["until"] > roll["since"] else 0
+        for entry in self._unpriced_models_locked(roll["since"], roll["until"], None):
+            mismatches.append(
+                f"unpriced model: {entry['model']} ({entry['tokens']} tokens in {hours:g} h)"
+            )
+        for run, reason in self._stale_locked(now, shown_all):
+            mismatches.append(f"stale running: {run.get('run_id')} ({reason})")
+        mismatches.extend(self._unseen_workers_locked(now, shown_all, processes or []))
+        mismatches.extend(
+            _duplicate_run_mismatches([dict(row) for row in self._all_runs()])
+        )
+        return mismatches
+
+    def state_view(
+        self,
+        now: float,
+        since: float | None = None,
+        until: float | None = None,
+        processes=None,
+    ) -> dict:
+        """One locked pass for ``GET /api/state``: the rollup rows, the
+        reconcile mismatches, the live running count by source, the board
+        names, and the stale running rows. No nested snapshot calls."""
+        with self._lock:
+            shown_all, parents = self._shown_locked(now)
+            live_open = self._live_open_ids_locked(now, shown_all)
+            roll = self._summarize_locked(shown_all, parents, now, since, until, live_open)
+            mismatches = self._mismatches_locked(
+                roll, shown_all, now, lambda ws: _scope_tab(roll, ws), processes
+            )
+            by_source: dict[str, int] = {}
+            for run in shown_all:
+                if run.get("status") == "running" and run.get("run_id") in live_open:
+                    key = run.get("source") or "unknown"
+                    by_source[key] = by_source.get(key, 0) + 1
+            boards = {
+                row["ws"]: row["name"] or ""
+                for row in self._conn.execute("SELECT ws, name FROM ws_counts").fetchall()
+            }
+            stale = [
+                {
+                    "run_id": run.get("run_id"),
+                    "source": run.get("source"),
+                    "label": run.get("label"),
+                    "reason": reason,
+                }
+                for run, reason in self._stale_locked(now, shown_all)
+            ]
+            return {
+                "roll": roll,
+                "mismatches": mismatches,
+                "running_by_source": by_source,
+                "boards": boards,
+                "stale": stale,
+            }
 
     def _shown_locked(self, now: float) -> tuple[list, dict]:
         """All run views with child chats folded away and launch echoes dropped. Caller holds the lock."""
@@ -2648,6 +2709,18 @@ def _last_activity(runs: list):
             if stamp and stamp > last:
                 last = stamp
     return last or None
+
+
+def _scope_tab(roll: dict, ws: str):
+    """``(counts, totals, all_time)`` for one workstream from its own roll.
+
+    Reads the already-computed scopes, exactly as ``reconcile_numbers``
+    did before the ``_mismatches_locked`` refactor; ``all_time`` is None
+    when the roll holds no all-time scope for ``ws`` (the check skips
+    those rows, it never compares against zeros).
+    """
+    scope = roll["scopes"].get(ws, _empty_scope())
+    return scope["counts"], scope["totals"], roll["all_time"].get(ws)
 
 
 def _ws_row(ws: str, scope: dict, all_time: dict | None = None) -> dict:

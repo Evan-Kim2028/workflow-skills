@@ -13,6 +13,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from dash.bundles import approvals_all, approvals_for, list_bundles, load_bundle_api, read_page, resolve_plan, start_prompt_text, workstream_plan_ids
+from dash.errors import api_error
 from dash.plans import PlanError
 from dash.pricing import health_block
 
@@ -112,24 +113,39 @@ class Handler(BaseHTTPRequestHandler):
                     body["ok"] = False
                     body["unpriced_models"] = unpriced
                 self._json(200, body)
+            elif path == "/api/state":
+                self._state()
             elif path.startswith("/static/"):
                 self._static(path[len("/static/"):])
             else:
-                self._json(404, {"error": "not found"})
+                self._json(404, api_error("not found", "not_found", "Try GET /api/state for the whole dashboard state."))
         except ValueError as exc:
-            self._json(400, {"error": str(exc)})
+            self._json(400, api_error(str(exc) or "bad request", "bad_request", _hint_for(str(exc))))
 
     def do_POST(self):
-        self._json(405, {"error": "method not allowed"})
+        self._json(405, api_error("method not allowed", "method_not_allowed", "The API is GET only; change state with the CLI, e.g. python3 agent_dash.py ws task <ID> <task> <status>"))
 
     def do_PUT(self):
-        self._json(405, {"error": "method not allowed"})
+        self._json(405, api_error("method not allowed", "method_not_allowed", "The API is GET only; change state with the CLI, e.g. python3 agent_dash.py ws task <ID> <task> <status>"))
 
     def do_DELETE(self):
-        self._json(405, {"error": "method not allowed"})
+        self._json(405, api_error("method not allowed", "method_not_allowed", "The API is GET only; change state with the CLI, e.g. python3 agent_dash.py ws task <ID> <task> <status>"))
 
     def log_message(self, fmt, *args):
         return
+
+    def _state(self):
+        from dash.state import build_state
+
+        self._json(
+            200,
+            build_state(
+                self.server.store,
+                self.server.registry,
+                self.server.cfg,
+                processes=_live_workers(),
+            ),
+        )
 
     def _static(self, name):
         """Serve a file from static/ or one subdirectory (json, js, css, svg, html). No dotfiles, no traversal."""
@@ -141,7 +157,7 @@ class Handler(BaseHTTPRequestHandler):
         target = (base / name).resolve()
         parts = name.split("/")
         if any(p == "" or p.startswith(".") for p in parts) or base not in target.parents or target.suffix not in types or not target.is_file():
-            self._json(404, {"error": "not found"})
+            self._json(404, api_error("not found", "not_found", "Try GET /api/state for the whole dashboard state."))
             return
         body = target.read_bytes()
         try:
@@ -245,10 +261,10 @@ class Handler(BaseHTTPRequestHandler):
         try:
             _source, body = resolve_plan(ws)
         except PlanError:
-            self._json(500, {"error": "plan unreadable", "ws": ws})
+            self._json(500, {**api_error("plan unreadable", "invalid_data", f"Run: python3 agent_dash.py ws validate {ws}"), "ws": ws})
             return
         if body is None:
-            self._json(404, {"error": "plan not found", "ws": ws})
+            self._json(404, {**api_error("plan not found", "plan_not_found", f"Run: python3 agent_dash.py ws new {ws} \"Title\", or pick an id from GET /api/bundles"), "ws": ws})
             return
         if isinstance(body, dict) and "start_prompt" not in body:
             body["start_prompt"] = start_prompt_text(ws)
@@ -267,7 +283,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             body = build_replay(self.server.store, ws)
         except ReplayNotFound:
-            self._json(404, {"error": "plan not found", "ws": ws})
+            self._json(404, {**api_error("plan not found", "plan_not_found", f"Run: python3 agent_dash.py ws new {ws} \"Title\", or pick an id from GET /api/bundles"), "ws": ws})
             return
         self._json(200, body)
 
@@ -275,7 +291,7 @@ class Handler(BaseHTTPRequestHandler):
         """Same shell as `/`. The page reads `/plan` and opens the plan view."""
         path = self.server.index_path
         if not path.is_file():
-            self._json(404, {"error": "not found"})
+            self._json(404, api_error("not found", "not_found", "Try GET /api/state for the whole dashboard state."))
             return
         self._bytes(200, path.read_bytes(), "text/html; charset=utf-8")
 
@@ -290,7 +306,7 @@ class Handler(BaseHTTPRequestHandler):
             raise ValueError("bad ws")
         body = approvals_for(ws)
         if body is None:
-            self._json(404, {"error": "bundle not found", "ws": ws})
+            self._json(404, {**api_error("bundle not found", "bundle_not_found", "Run: python3 agent_dash.py ws list"), "ws": ws})
             return
         self._json(200, body)
 
@@ -305,21 +321,21 @@ class Handler(BaseHTTPRequestHandler):
             raise ValueError("bad ws")
         body = load_bundle_api(ws)
         if body is None:
-            self._json(404, {"error": "bundle not found", "ws": ws})
+            self._json(404, {**api_error("bundle not found", "bundle_not_found", "Run: python3 agent_dash.py ws list"), "ws": ws})
             return
         self._json(200, body)
 
     def _bundle_page(self, path):
         parts = [part for part in path.split("/") if part]
         if len(parts) != 3 or parts[0] != "bundle" or parts[2] != "page.html":
-            self._json(404, {"error": "not found"})
+            self._json(404, api_error("not found", "not_found", "Use /bundle/<ID>/page.html with an id from GET /api/bundles."))
             return
         if parts[1] in (".", "..") or not _WS.match(parts[1]):
-            self._json(404, {"error": "not found"})
+            self._json(404, api_error("not found", "not_found", "Use /bundle/<ID>/page.html with an id from GET /api/bundles."))
             return
         body = read_page(parts[1])
         if body is None:
-            self._json(404, {"error": "not found"})
+            self._json(404, api_error("not found", "not_found", "Run: python3 agent_dash.py ws list"))
             return
         self._bytes(200, body, "text/html; charset=utf-8")
 
@@ -478,5 +494,20 @@ def _choice(query: dict, name: str, default: str, allowed: set[str]) -> str:
     if value not in allowed:
         raise ValueError(f"bad {name}")
     return value
+
+
+def _hint_for(error: str) -> str:
+    """Next step for a 400: name the valid values or the example call."""
+    if error == "ws required":
+        return "Add ?ws=<ID>, e.g. /api/plan?ws=WS7; use ws=all where the endpoint allows it."
+    if error == "bad ws":
+        return "Use a workstream id like WS7 (see GET /api/bundles for the ids)."
+    if error in ("bad hours", "bad since", "bad until"):
+        return "Pass epoch seconds, e.g. /api/reconcile?hours=24."
+    if error == "bad limit":
+        return "Pass an integer 1-5000, e.g. /api/runs?limit=50."
+    if error in ("bad usage_group", "bad group", "bad bucket"):
+        return "Use group=model|workstream|tool and bucket=hour|day."
+    return "Check the query parameters against CONTRACT.md, or run the matching CLI command."
 
 

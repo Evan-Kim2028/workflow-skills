@@ -161,7 +161,7 @@ class WsCliTest(unittest.TestCase):
         self.assertEqual(task["status"], "todo")
         self.assertNotIn("moved_to", task)
         self.assertNotIn("note", task)
-        self.assertEqual(set_task("WS3", "missing", "done", None, None), 2)
+        self.assertEqual(set_task("WS3", "missing", "done", None, None), 3)
         self.assertEqual(cmd_ws(["task", "WS3", "WS3.1", "nope"]), 2)
 
     def test_done_and_deferred_need_force_to_reopen(self):
@@ -301,7 +301,7 @@ class WsCliTest(unittest.TestCase):
         )
         issues = validate_bundle("WS9")
         self.assertTrue(any("ADR 0099" in item for item in issues))
-        self.assertEqual(cmd_ws(["approvals", "NOPE"]), 2)
+        self.assertEqual(cmd_ws(["approvals", "NOPE"]), 3)
 
 
 class WsTrainCliTest(unittest.TestCase):
@@ -403,7 +403,7 @@ class WsTrainCliTest(unittest.TestCase):
         self.assertIn("TRAIN", text)
         self.assertIn("T1", text)
         self.assertIn("WS4.1(pr)", text)
-        self.assertEqual(cmd_ws(["trains", "NOPE"]), 2)
+        self.assertEqual(cmd_ws(["trains", "NOPE"]), 3)
 
     def test_rejects_bad_values(self):
         self.assertEqual(cmd_ws(["new", "WS4", "Sample"]), 0)
@@ -411,8 +411,8 @@ class WsTrainCliTest(unittest.TestCase):
         self.assertEqual(cmd_ws(["train", "WS4", "T1", "--title", "cutover", "--branch", "main"]), 2)
         self.assertEqual(cmd_ws(["train", "WS4", "T 1", "--title", "cutover"]), 2)
         self.assertEqual(cmd_ws(["train", "WS4", "T1", "--title", "cutover", "--pr", "many"]), 2)
-        self.assertEqual(cmd_ws(["train", "WS4", "T1", "--title", "cutover", "--add", "WS4.missing"]), 2)
-        self.assertEqual(cmd_ws(["train", "NOPE", "T1", "--title", "cutover"]), 2)
+        self.assertEqual(cmd_ws(["train", "WS4", "T1", "--title", "cutover", "--add", "WS4.missing"]), 3)
+        self.assertEqual(cmd_ws(["train", "NOPE", "T1", "--title", "cutover"]), 3)
         self.assertEqual(cmd_ws(["train", "WS4"]), 2)
         self.assertEqual(_plan(self.root, "WS4")["trains"], [])
 

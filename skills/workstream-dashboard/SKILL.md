@@ -28,12 +28,12 @@ Do not run it with `python3 -I` (the package imports from its own directory). Re
 Verify after any change:
 
 ```bash
-curl -s http://127.0.0.1:8765/api/health
+python3 agent_dash.py doctor   # first: what's broken, and the fix for each
 python3 agent_dash.py check
 python3 agent_dash.py check --page
 ```
 
-Health wants every source `last_error: null`. `check` exits 0 when every number reconciles. `check --page` drives the live page in headless Chrome and skips with a clear message when Chrome is missing.
+`doctor` is read-only and exits 0 when clean, 1 when problems are found; fix what it lists, then run `check`. `check` exits 0 when every number reconciles. `check --page` drives the live page in headless Chrome and skips with a clear message when Chrome is missing. `state --json` dumps the whole dashboard (health, workstreams, reconcile, problems) in one call.
 
 ## Report a run (any harness)
 

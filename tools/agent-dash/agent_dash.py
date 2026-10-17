@@ -13,6 +13,7 @@ import threading
 import time
 from pathlib import Path
 
+from dash import errors
 from dash.bundles import cmd_ws
 from dash.locate import expand, ignore_local
 from dash.pricing import reprice as reprice_usage
@@ -45,18 +46,27 @@ USAGE = """agent-dash: local read-only execution dashboard
   python3 agent_dash.py backfill --session <id>
   python3 agent_dash.py reprice
   python3 agent_dash.py reconcile
-  python3 agent_dash.py check [--url URL] [--hours N]
-  python3 agent_dash.py check --page [--url URL]
+  python3 agent_dash.py check [--url URL] [--hours N] [--json]
+  python3 agent_dash.py check --page [--url URL] [--json]
+  python3 agent_dash.py state [--url URL] [--json]
+  python3 agent_dash.py status [--json]
+  python3 agent_dash.py doctor [--url URL] [--json]
   python3 agent_dash.py report start --label <label> [--model M] [--session S] [--run-id R] [--tier T]
   python3 agent_dash.py report finish --label <label> --verdict PASS [--session S] [--run-id R] [--status done]
   python3 agent_dash.py report usage --label <label> --input N --output N [--model M] [--session S] [--run-id R]
   python3 agent_dash.py ws list
   python3 agent_dash.py ws new <ID> "<title>"
-  python3 agent_dash.py ws validate <ID>
+  python3 agent_dash.py ws validate <ID> [--json]
   python3 agent_dash.py ws render <ID>
+  python3 agent_dash.py ws plan <ID> [--json]
   python3 agent_dash.py ws task <ID> <task-id> <status> [--moved-to WSn] [--note "..."] [--force]
   python3 agent_dash.py ws train <ID> <train-id> [--title T] [--branch B] [--status S] [--add id,id] [--remove id,id] [--pr N] [--shared f1,f2] [--gate "..."] [--note "..."]
-  python3 agent_dash.py ws trains <ID>
+  python3 agent_dash.py ws trains <ID> [--json]
+
+Exit codes: 0 ok, 1 check failed (mismatches found, or doctor found
+problems), 2 usage error, 3 not found, 4 invalid data, 5 dashboard
+unreachable. `--json` prints machine JSON to stdout; human text goes
+to stderr when `--json` is set.
 """
 
 
@@ -205,13 +215,17 @@ def main(argv: list[str] | None = None) -> int:
     if cmd == "restart":
         return cmd_restart()
     if cmd == "status":
-        return cmd_status()
+        return cmd_status(args[1:])
+    if cmd == "state":
+        return cmd_state(args[1:])
+    if cmd == "doctor":
+        return cmd_doctor(args[1:])
     if cmd == "ws":
         return cmd_ws(args[1:])
     if cmd == "backfill":
         session = _session_arg(args[1:])
         if not session:
-            print("backfill requires --session <id>", file=sys.stderr)
+            print("backfill requires --session <id>. Run: python3 agent_dash.py backfill --session <id>", file=sys.stderr)
             return 2
         return cmd_backfill(session)
     if cmd == "reprice":
@@ -366,14 +380,138 @@ def _health_ok() -> bool:
     return bool(payload.get("ok"))
 
 
-def cmd_status() -> int:
+def cmd_status(argv: list[str] | None = None) -> int:
+    args = list(argv or [])
+    json_mode = "--json" in args
+    rest = [item for item in args if item != "--json"]
+    if rest:
+        print(USAGE, end="", file=sys.stderr)
+        return 2
     bind_state()
     pid = live_pid()
     if not pid:
-        print("stopped")
+        if json_mode:
+            errors.emit_json({"running": False, "hint": "Run: python3 agent_dash.py run"})
+        else:
+            print("stopped. Run: python3 agent_dash.py run")
         return 1
-    _print_running(pid)
+    if json_mode:
+        errors.emit_json({"running": True, "pid": pid, "url": URL})
+    else:
+        _print_running(pid)
     return 0
+
+
+def _fetch(url: str, path: str, timeout: float = 15):
+    """GET ``url + path`` as JSON. Returns ``(payload, None)`` or ``(None, error)``."""
+    import urllib.error
+    import urllib.request
+
+    try:
+        with urllib.request.urlopen(url.rstrip("/") + path, timeout=timeout) as response:
+            return json.loads(response.read().decode("utf-8")), None
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        return None, str(exc)
+
+
+def _unreachable(url: str, json_mode: bool) -> int:
+    message = errors.dashboard_unreachable(url)
+    if json_mode:
+        errors.emit_json({"error": message, "code": "unreachable", "hint": "Run: python3 agent_dash.py run (or restart)"})
+    else:
+        print(message, file=sys.stderr)
+    return errors.UNREACHABLE
+
+
+def cmd_state(argv: list[str]) -> int:
+    """One call that tells an agent everything: GET /api/state, human or JSON."""
+    url = URL
+    json_mode = False
+    rest = list(argv)
+    while rest:
+        flag = rest.pop(0)
+        if flag == "--url" and rest:
+            url = rest.pop(0).rstrip("/")
+        elif flag == "--json":
+            json_mode = True
+        else:
+            print(USAGE, end="", file=sys.stderr)
+            return 2
+    payload, _error = _fetch(url, "/api/state")
+    if payload is None:
+        return _unreachable(url, json_mode)
+    if json_mode:
+        errors.emit_json(payload)
+        return 0
+    _print_state(payload)
+    return 0
+
+
+def _print_state(payload: dict) -> None:
+    version = payload.get("version") or {}
+    print(f"state {version.get('tool')} schema {version.get('schema')} (24 h window ending {int(payload.get('now', 0))})")
+    health = payload.get("health") or {}
+    sources = health.get("sources") or []
+    bad = [item.get("name") for item in sources if item.get("last_error")]
+    if bad:
+        print(f"health: UNHEALTHY ({', '.join(str(name) for name in bad)})")
+    else:
+        print(f"health: ok ({len(sources)} sources)")
+    running = payload.get("running") or {}
+    by_source = running.get("by_source") or {}
+    breakdown = ", ".join(f"{name}: {count}" for name, count in sorted(by_source.items())) or "-"
+    print(f"running: {running.get('count', 0)} ({breakdown})")
+    totals = payload.get("totals") or {}
+    tokens = totals.get("tokens") or {}
+    print(f"tokens 24 h: {sum(int(tokens.get(key) or 0) for key in ('input', 'output', 'cache_read', 'cache_write'))} cost_usd {float(totals.get('cost_usd') or 0.0):.2f}")
+    print("workstreams:")
+    for row in payload.get("workstreams") or []:
+        progress = row.get("progress") or {}
+        prog = f" {progress.get('pct', 0)}% ({progress.get('done', 0)}/{progress.get('total', 0)})" if progress else " no plan"
+        print(
+            f"  {row.get('id')} {row.get('title')} live={row.get('live_agents')} "
+            f"tokens={row.get('tokens')} cost={float(row.get('cost_usd') or 0.0):.2f}{prog}"
+        )
+    unassigned = payload.get("unassigned") or {}
+    if unassigned.get("tokens") or unassigned.get("live_agents"):
+        print(f"unassigned: live={unassigned.get('live_agents')} tokens={unassigned.get('tokens')}")
+    reconcile = payload.get("reconcile") or {}
+    mismatches = reconcile.get("mismatches") or []
+    if mismatches:
+        print(f"reconcile: {len(mismatches)} MISMATCHES (run: python3 agent_dash.py check)")
+    else:
+        print("reconcile: ok")
+    problems = payload.get("problems") or []
+    if problems:
+        print(f"problems ({len(problems)}):")
+        for item in problems:
+            print(f"  [{item.get('code')}] {item.get('message')}")
+            print(f"    run: {item.get('command')}")
+
+
+def cmd_doctor(argv: list[str]) -> int:
+    """Diagnose setup problems and print the fix. Read-only. Exit 0 clean, 1 problems."""
+    from dash.doctor import format_human, run_doctor
+
+    url = URL
+    json_mode = False
+    rest = list(argv)
+    while rest:
+        flag = rest.pop(0)
+        if flag == "--url" and rest:
+            url = rest.pop(0).rstrip("/")
+        elif flag == "--json":
+            json_mode = True
+        else:
+            print(USAGE, end="", file=sys.stderr)
+            return 2
+    cfg = bind_state()
+    result = run_doctor(cfg, url)
+    if json_mode:
+        errors.emit_json(result)
+    else:
+        print(format_human(result))
+    return 0 if result.get("ok") else 1
 
 
 def cmd_backfill(session_id: str) -> int:
@@ -434,39 +572,40 @@ def cmd_reconcile() -> int:
 
 def cmd_check(argv: list[str]) -> int:
     """Ask a running dashboard for GET /api/reconcile, print the table, exit 1 on any mismatch."""
-    import urllib.error
-    import urllib.request
-
     url = URL
     hours = 24.0
     page = False
+    json_mode = False
     rest = list(argv)
     while rest:
         flag = rest.pop(0)
         if flag == "--url" and rest:
             url = rest.pop(0).rstrip("/")
         elif flag == "--hours" and rest:
+            raw = rest.pop(0)
             try:
-                hours = float(rest.pop(0))
+                hours = float(raw)
             except ValueError:
-                print("check requires --hours N", file=sys.stderr)
+                print(f"check needs --hours N with N > 0 (got {raw!r}). Run: python3 agent_dash.py check --hours 24", file=sys.stderr)
                 return 2
             if hours <= 0:
-                print("check requires --hours N", file=sys.stderr)
+                print(f"check needs --hours N with N > 0 (got {raw!r}). Run: python3 agent_dash.py check --hours 24", file=sys.stderr)
                 return 2
         elif flag == "--page":
             page = True
+        elif flag == "--json":
+            json_mode = True
         else:
             print(USAGE, end="", file=sys.stderr)
             return 2
     if page:
-        return cmd_page_check(url)
-    try:
-        with urllib.request.urlopen(f"{url}/api/reconcile?hours={hours:g}", timeout=15) as response:
-            payload = json.loads(response.read().decode("utf-8"))
-    except (urllib.error.URLError, OSError, ValueError) as exc:
-        print(f"check failed: {exc}", file=sys.stderr)
-        return 2
+        return cmd_page_check(url, json_mode)
+    payload, _error = _fetch(url, f"/api/reconcile?hours={hours:g}")
+    if payload is None:
+        return _unreachable(url, json_mode)
+    if json_mode:
+        errors.emit_json(payload)
+        return 1 if payload.get("mismatches") else 0
     rows = payload.get("rows", [])
     unassigned = payload.get("unassigned") or {}
     everything = list(rows) + ([unassigned] if unassigned else [])
@@ -502,7 +641,7 @@ def cmd_check(argv: list[str]) -> int:
     return 0
 
 
-def cmd_page_check(url: str) -> int:
+def cmd_page_check(url: str, json_mode: bool = False) -> int:
     """Drive the live page in Chrome over the DevTools protocol and compare
     every rendered tile and chart legend against the API. Skips cleanly
     when Chrome or Node is missing."""
@@ -511,11 +650,19 @@ def cmd_page_check(url: str) -> int:
 
     node = shutil.which("node")
     if node is None:
-        print("page check skipped: node is not on PATH")
+        message = "page check skipped: node is not on PATH. Install Node 18+, then run: python3 agent_dash.py check --page"
+        errors.emit_human(message, json_mode)
+        if json_mode:
+            errors.emit_json({"page_check": {"ok": True, "skipped": "node is not on PATH"}})
         return 0
     script = ROOT / "scripts" / "page_check.mjs"
     if not script.is_file():
-        print(f"page check skipped: {script} is missing", file=sys.stderr)
+        message = f"page check skipped: {script} is missing. Restore scripts/page_check.mjs from version control."
+        if json_mode:
+            errors.emit_human(message, True)
+            errors.emit_json({"page_check": {"ok": False, "error": message}})
+        else:
+            print(message, file=sys.stderr)
         return 2
     try:
         proc = subprocess.run(
@@ -525,16 +672,26 @@ def cmd_page_check(url: str) -> int:
             timeout=600,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
-        print(f"page check failed: {exc}", file=sys.stderr)
+        message = f"page check failed: {exc}"
+        if json_mode:
+            errors.emit_human(message, True)
+            errors.emit_json({"page_check": {"ok": False, "error": message}})
+        else:
+            print(message, file=sys.stderr)
         return 2
     if proc.stdout:
-        print(proc.stdout, end="")
+        errors.emit_human(proc.stdout.rstrip("\n"), json_mode)
     if proc.returncode == 2:
-        print(proc.stderr, end="", file=sys.stderr)
-        print("page check skipped: Chrome is not available")
+        if proc.stderr:
+            errors.emit_human(proc.stderr.rstrip("\n"), json_mode)
+        errors.emit_human("page check skipped: Chrome is not available. Set CHROME_PATH, then run: python3 agent_dash.py check --page", json_mode)
+        if json_mode:
+            errors.emit_json({"page_check": {"ok": True, "skipped": "Chrome is not available"}})
         return 0
     if proc.stderr:
-        print(proc.stderr, end="", file=sys.stderr)
+        errors.emit_human(proc.stderr.rstrip("\n"), json_mode)
+    if json_mode:
+        errors.emit_json({"page_check": {"ok": proc.returncode == 0}})
     return 0 if proc.returncode == 0 else 1
 
 
@@ -547,13 +704,13 @@ def cmd_report(argv: list[str]) -> int:
     for them.
     """
     if not argv or argv[0] not in ("start", "finish", "usage"):
-        print("usage: python3 agent_dash.py report start|finish|usage --label <label> ...", file=sys.stderr)
+        print("usage: python3 agent_dash.py report start|finish|usage --label <label> ... Run: python3 agent_dash.py report start --label ws4-WS4.1-slug --model <model> --session <id>", file=sys.stderr)
         return 2
     action = argv[0]
     flags = _report_flags(argv[1:])
     label = flags.get("label")
     if not label or len(label) > 200 or "/" in label or "\\" in label or label.startswith("."):
-        print("report requires --label <label>", file=sys.stderr)
+        print("report requires --label <label>, e.g. --label ws4-WS4.1-slug (no /, \\, or leading dot; max 200 chars)", file=sys.stderr)
         return 2
     session = flags.get("session")
     run_id = generic_run_id(label, session, flags.get("run-id"))
@@ -576,11 +733,11 @@ def cmd_report(argv: list[str]) -> int:
     elif action == "finish":
         verdict = flags.get("verdict")
         if not verdict:
-            print("report finish requires --verdict PASS|PARTIAL|BLOCKED|APPROVE|...", file=sys.stderr)
+            print(f"report finish requires --verdict <VERDICT>. Use one of: {', '.join(errors.VERDICTS)}", file=sys.stderr)
             return 2
         status = flags.get("status") or "done"
         if status not in ("done", "killed", "died_early"):
-            print("report finish --status is done, killed, or died_early", file=sys.stderr)
+            print(errors.unknown_finish_status(status), file=sys.stderr)
             return 2
         line = {
             "type": "run",
@@ -598,10 +755,10 @@ def cmd_report(argv: list[str]) -> int:
             tokens_in = int(flags.get("input", ""))
             tokens_out = int(flags.get("output", ""))
         except ValueError:
-            print("report usage requires --input N --output N", file=sys.stderr)
+            print("report usage requires --input N --output N with N >= 0, e.g. --input 100 --output 50", file=sys.stderr)
             return 2
         if tokens_in < 0 or tokens_out < 0:
-            print("report usage requires --input N --output N", file=sys.stderr)
+            print("report usage requires --input N --output N with N >= 0, e.g. --input 100 --output 50", file=sys.stderr)
             return 2
         line = {
             "type": "usage",

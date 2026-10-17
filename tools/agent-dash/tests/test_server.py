@@ -374,7 +374,7 @@ class ReconcileEndpointTest(unittest.TestCase):
 
     def test_check_command_passes(self):
         self.assertEqual(main(["check", "--url", f"http://127.0.0.1:{self.port}", "--hours", "12"]), 0)
-        self.assertEqual(main(["check", "--url", "http://127.0.0.1:1", "--hours", "12"]), 2)
+        self.assertEqual(main(["check", "--url", "http://127.0.0.1:1", "--hours", "12"]), 5)
         self.assertEqual(main(["check", "--hours", "nope"]), 2)
 
     def test_reconcile_reports_unseen_worker(self):
