@@ -410,7 +410,7 @@ body.clip #main{zoom:.92}
     return ADM.colorOf(key);
   }
   /* axes() and the compact formatters live in format.js and are shared with the plan view. */
-  var fmtDate = AD.fmtDate, fmtN = AD.fmtN, fmtUsd = AD.fmtUsd, fmtDur = AD.fmtDur, fmtT = AD.fmtT, axes = AD.axes, timeTicks = AD.timeTicks;
+  var fmtDate = AD.fmtDate, fmtN = AD.fmtN, fmtUsd = AD.fmtUsd, fmtDur = AD.fmtDur, fmtT = AD.fmtT, axes = AD.axes, timeTicks = AD.timeTicks, warpTime = AD.warpTime, warpPos = AD.warpPos;
   function el(tag, attrs, kids) { var e = document.createElement(tag); if (attrs) for (var k in attrs) { if (k === "text") e.textContent = attrs[k]; else if (k === "html") e.innerHTML = attrs[k]; else if (k.slice(0, 2) === "on") e.addEventListener(k.slice(2), attrs[k]); else e.setAttribute(k, attrs[k]); } (kids || []).forEach(function (c) { if (c) e.appendChild(typeof c === "string" ? document.createTextNode(c) : c); }); return e; }
   var NS = "http://www.w3.org/2000/svg";
   function s(tag, attrs) { var e = document.createElementNS(NS, tag); for (var k in attrs) e.setAttribute(k, attrs[k]); return e; }
@@ -1468,20 +1468,45 @@ body.clip #main{zoom:.92}
       });
       return pts;
     }
+    /* The playhead (position -> time) and the timeline axis (time ->
+       position) are one shared mapping: rpWarpT inverts rpWarpX through
+       the same warp points (AD.warpTime/AD.warpPos), so the map date,
+       cursor, bars, strip and ticks agree at every moment. */
     function rpWarpT(frac) {
-      var pts = RP.warp;
-      if (!pts || !pts.length) return RP.span.start + frac * (RP.span.end - RP.span.start);
-      if (frac <= 0) return pts[0].t;
-      if (frac >= 1) return pts[pts.length - 1].t;
-      var lo = 0, hi = pts.length - 1;
-      while (hi - lo > 1) { var mid = (lo + hi) >> 1; if (pts[mid].w <= frac) lo = mid; else hi = mid; }
-      var a = pts[lo], b = pts[hi], span = Math.max(1e-9, b.w - a.w), k = (frac - a.w) / span;
-      return a.t + k * (b.t - a.t);
+      return warpTime(RP.warp, frac, RP.span.start, RP.span.end);
+    }
+    function rpWarpX(t) {
+      return warpPos(RP.warp, t, RP.span.start, RP.span.end);
+    }
+    function rpTimeToFrac(t) {
+      if (RP.compress && RP.warp) return rpWarpX(t);
+      return (t - RP.span.start) / RP.spanLen;
     }
     function rpCursorTime(frac) {
       frac = rpClamp01(frac);
       if (RP.compress && RP.warp) return rpWarpT(frac);
       return RP.span.start + frac * (RP.span.end - RP.span.start);
+    }
+    /* Plain-words label for a quiet stretch, e.g. "2 days quiet". */
+    function rpQuietLabel(seconds) {
+      var s = Math.max(0, Math.round(seconds));
+      if (s >= 129600) { var d = Math.round(s / 86400); return d + (d === 1 ? " day quiet" : " days quiet"); }
+      if (s >= 7200) { var h = Math.round(s / 3600); return h + " hours quiet"; }
+      if (s >= 120) { var m = Math.round(s / 60); return m + " min quiet"; }
+      return s + "s quiet";
+    }
+    /* Quiet stretches squeezed by the warp: consecutive warp points at
+       least RP_BREAK_S apart in real time. Drawn as one dashed guide plus
+       a plain-text label each when the axis is warped. */
+    var RP_BREAK_S = 6 * 3600;
+    function rpWarpBreaks() {
+      if (!RP.compress || !RP.warp || RP.warp.length < 2) return [];
+      var out = [];
+      for (var i = 1; i < RP.warp.length; i++) {
+        var a = RP.warp[i - 1], b = RP.warp[i], dur = b.t - a.t;
+        if (dur >= RP_BREAK_S) out.push({a: a.t, b: b.t, label: rpQuietLabel(dur)});
+      }
+      return out.slice(0, 6);
     }
     /* Runs of one replay task active at T (same stub rule as the live map:
        a run with no end time counts briefly after its start). */
@@ -1652,14 +1677,18 @@ body.clip #main{zoom:.92}
       if (run.status === "done" || run.verdict === "SUCCESS") return "ok";
       return "unk";
     }
-    function rpPackRuns(runs, gapS) {
+    /* Pack runs into rows in axis space (rpTimeToFrac), not wall-clock
+       seconds, so rows follow the same warp as the axis: runs across a
+       squeezed quiet stretch share rows instead of leaving tall empty
+       bands. gapF is a fraction of the axis width. */
+    function rpPackRuns(runs, gapF) {
       var rows = [];
       runs.slice().sort(function (x, y) { return x.start - y.start; }).forEach(function (r) {
-        var end = r.end == null ? r.start + 60 : r.end, placed = false;
+        var x0 = rpTimeToFrac(r.start), x1 = rpTimeToFrac(r.end == null ? r.start + 60 : r.end), placed = false;
         for (var i = 0; i < rows.length; i++) {
-          if (rows[i].end + gapS <= r.start) { rows[i].runs.push(r); rows[i].end = end; placed = true; break; }
+          if (rows[i].end + gapF <= x0) { rows[i].runs.push(r); rows[i].end = x1; placed = true; break; }
         }
-        if (!placed) rows.push({end: end, runs: [r]});
+        if (!placed) rows.push({end: x1, runs: [r]});
       });
       return rows;
     }
@@ -1674,13 +1703,18 @@ body.clip #main{zoom:.92}
       c.appendChild(lg);
       var W = CW(), L = 150, Rm = 14, pw = W - L - Rm, stripH = 28, rowH = 6, rowGap = 2;
       var t0 = RP.span.start, t1 = RP.span.end;
-      var X = function (t) { return L + pw * (t - t0) / Math.max(1, t1 - t0); };
+      /* The shared warp mapping: the axis, ticks, strip, bars, veil and
+         cursor all position through rpTimeToFrac, the inverse of the
+         rpCursorTime playhead, so everything lines up with the map. */
+      var X = function (t) { return L + pw * rpTimeToFrac(t); };
+      var breaks = rpWarpBreaks();
+      var breakX = breaks.map(function (br) { return (X(br.a) + X(br.b)) / 2; });
       var fams = {};
       RP.tlRuns.forEach(function (r) { fams[r.family || "other"] = true; });
       var order = Object.keys(fams).sort();
       var lanes = order.map(function (f) {
-        var rows = rpPackRuns(RP.tlRuns.filter(function (r) { return (r.family || "other") === f; }), 20);
-        return {fam: f, name: f.charAt(0).toUpperCase() + f.slice(1), rows: rows, h: Math.max(rows.length * (rowH + rowGap), 12) + 4};
+        var rows = rpPackRuns(RP.tlRuns.filter(function (r) { return (r.family || "other") === f; }), 6 / pw);
+        return {fam: f, name: f.charAt(0).toUpperCase() + f.slice(1), rows: rows, h: Math.max(rows.length * (rowH + rowGap), 10) + 2};
       });
       var lanesH = lanes.reduce(function (a, l) { return a + l.h; }, 0);
       var plotB = 12 + stripH + 8 + lanesH, H = plotB + 30;
@@ -1689,8 +1723,30 @@ body.clip #main{zoom:.92}
       pat.appendChild(s("rect", {width: 6, height: 6, fill: "var(--surface-2)"}));
       pat.appendChild(s("line", {x1: 0, y1: 0, x2: 0, y2: 6, stroke: "var(--muted)", "stroke-width": 2}));
       defs.appendChild(pat); svg.appendChild(defs);
-      var ticks = timeTicks(t0, t1, X, 6);
+      /* Real date/time tick labels placed through the shared helper on the
+         warped axis; crowded ticks and ticks near a break marker are
+         thinned, never relabeled. */
+      var tickGap = Math.max(36, pw / 28);
+      var ticks = timeTicks(t0, t1, X, 6, {minGap: tickGap, avoid: breakX});
       ticks.forEach(function (k) { svg.appendChild(s("line", {x1: k.x, x2: k.x, y1: 4, y2: plotB, class: "gl"})); });
+      /* One dashed guide plus a plain-words label per squeezed idle
+         stretch, so the compressed axis reads honestly. */
+      var labeledX = -1e9;
+      breaks.forEach(function (br, i) {
+        var bx = breakX[i];
+        svg.appendChild(s("line", {x1: bx, x2: bx, y1: 4, y2: plotB, class: "gl", "stroke-dasharray": "3 3"}));
+        svg.appendChild(s("line", {x1: bx - 6, x2: bx - 1, y1: plotB + 5, y2: plotB - 5, class: "bl"}));
+        svg.appendChild(s("line", {x1: bx + 1, x2: bx + 6, y1: plotB + 5, y2: plotB - 5, class: "bl"}));
+        /* Labels must fit on the axis: clear of each other, the edges
+           and (via the ticks' avoid list) the date/time ticks. The guide
+           and slashes still mark a squeeze whose label would not fit. */
+        if (bx - labeledX >= tickGap && bx - L >= tickGap && L + pw - bx >= tickGap) {
+          var bt = s("text", {x: bx, y: plotB + 15, "text-anchor": "middle", class: "ax"});
+          bt.textContent = br.label;
+          svg.appendChild(bt);
+          labeledX = bx;
+        }
+      });
       var step = Math.max(60, Math.round((t1 - t0) / 300)), pts = [], mx = 1, y0 = 12;
       for (var t = t0; t <= t1; t += step) {
         var n = 0;
@@ -1793,7 +1849,7 @@ body.clip #main{zoom:.92}
         var end = r.end == null || r.end > T ? T : r.end;
         var x1 = tl.X(r.start), x2 = tl.X(Math.max(end, r.start));
         b.el.setAttribute("x", x1);
-        b.el.setAttribute("width", Math.max(2.5, x2 - x1 - 1));
+        b.el.setAttribute("width", Math.max(3, x2 - x1 - 1));
         var live = r.end == null || r.end > T;
         var fill = live ? "var(--s1)" : (function () {
           var o = OUTCOME[rpOutcomeOf(r)];
@@ -1805,7 +1861,17 @@ body.clip #main{zoom:.92}
     }
     /* Hovering a map chip highlights its timeline bars; hovering a timeline
        bar highlights its chip (see the bar listeners above). */
+    /* The timeline card is rebuilt when the warp toggles (grid, ticks and
+       breaks follow the axis), while chip listeners stay linked once: they
+       read the current RP.tl at fire time. */
+    function rpRebuildTimeline() {
+      if (!RP.tlSec) return;
+      RP.tlSec.innerHTML = "";
+      RP.tlSec.appendChild(rpTimelineCard());
+    }
     function rpLinkHover() {
+      if (RP.hoverLinked) return;
+      RP.hoverLinked = true;
       Object.keys(chipEl).forEach(function (tid) {
         var cp = chipEl[tid];
         if (!cp) return;
@@ -2015,6 +2081,7 @@ body.clip #main{zoom:.92}
       RP.savedCss = {};
       RP.groups = {};
       RP.groupState = {};
+      RP.hoverLinked = false;
       RP.tl = null;
       window.__adReplayOn = true;
       window.__adReplay = {ready: true, done: false, ws: plan.ws, clip: RP.clip, clipReady: !RP.clip};
@@ -2048,7 +2115,7 @@ body.clip #main{zoom:.92}
       seg.appendChild(b15); seg.appendChild(b30);
       var cmp = el("button", {text: "Compress idle", title: "Compress idle stretches so motion stays steady"});
       function paintCmp() { cmp.setAttribute("aria-pressed", String(RP.compress)); }
-      cmp.addEventListener("click", function () { RP.compress = !RP.compress; paintCmp(); rpSeek(RP.elapsed / RP.duration); });
+      cmp.addEventListener("click", function () { RP.compress = !RP.compress; paintCmp(); rpRebuildTimeline(); rpSeek(RP.elapsed / RP.duration); });
       paintCmp();
       var clipBtn = el("button", {text: "Clip view", title: "Open the promo clip composition"});
       clipBtn.addEventListener("click", function () {

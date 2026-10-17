@@ -357,6 +357,90 @@ class PageRules(unittest.TestCase):
         self.assertIn("rpPaintTimeline(", paint, "the map paint no longer advances the timeline")
         self.assertIn("rpSeek(", card, "the timeline scrub no longer moves the shared playhead")
 
+    def test_timeline_axis_uses_the_warp_mapping(self):
+        """The timeline x axis is the same warp as the playhead: one
+        time->position mapping (rpTimeToFrac over the warp points) positions
+        the axis, ticks, strip, bars and cursor, inverting the rpCursorTime
+        playhead. No second linear axis may sneak back into the card."""
+        script = inline_scripts()
+
+        def body(name):
+            start = script.index(f"function {name}(")
+            brace = script.index("{", start)
+            depth = 0
+            for pos in range(brace, len(script)):
+                if script[pos] == "{":
+                    depth += 1
+                elif script[pos] == "}":
+                    depth -= 1
+                    if depth == 0:
+                        return script[start : pos + 1]
+            raise AssertionError(f"{name} body never closes")
+
+        for name in ("rpCursorTime", "rpWarpT", "rpWarpX", "rpTimeToFrac", "rpWarpBreaks", "rpRebuildTimeline"):
+            self.assertEqual(
+                len(re.findall(rf"function {name}\(", script)),
+                1,
+                f"{name} must be defined exactly once: one shared warp mapping",
+            )
+        cursor, to_frac = body("rpCursorTime"), body("rpTimeToFrac")
+        self.assertIn("rpWarpT(", cursor, "the playhead no longer reads the warp")
+        self.assertIn("RP.compress", cursor)
+        self.assertIn("rpWarpX(", to_frac, "the axis no longer inverts the playhead warp")
+        self.assertIn("RP.compress", to_frac)
+        self.assertIn("RP.warp", to_frac)
+        card = body("rpTimelineCard")
+        self.assertIn("pw * rpTimeToFrac(t)", card, "the timeline axis is not the shared warp mapping")
+        self.assertNotIn("(t - t0)", card, "a linear wall-clock axis sneaked back into the timeline card")
+        self.assertIn("timeTicks(t0, t1, X", card, "ticks no longer sit on the shared axis")
+        self.assertIn("minGap", card, "ticks lost their warp-aware thinning option")
+        self.assertIn("rpWarpBreaks()", card, "squeezed idle stretches lost their break markers")
+        self.assertIn("br.label", card, "break markers lost their plain-words labels")
+        self.assertEqual(script.count("rpRebuildTimeline("), 2, "the warp toggle must rebuild the timeline card")
+        self.assertIn("rpPackRuns(", card)
+        pack = body("rpPackRuns")
+        self.assertIn("rpTimeToFrac(", pack, "rows are no longer packed in warped axis space")
+
+    def test_warp_helpers_round_trip(self):
+        """AD.warpTime and AD.warpPos invert each other, and timeTicks
+        thins crowded labels while keeping real dates and the end tick."""
+        script = (
+            "const fs=require('fs');"
+            "const src=fs.readFileSync(process.argv[1],'utf8').replace('})(window);','})(global);');"
+            "eval(src);"
+            "const assert=require('assert');"
+            "const pts=[{w:0,t:1000},{w:0.25,t:2000},{w:0.5,t:3000},{w:0.75,t:50000},{w:1,t:100000}];"
+            "assert.strictEqual(AD.warpTime(pts,0,1000,100000),1000);"
+            "assert.strictEqual(AD.warpTime(pts,1,1000,100000),100000);"
+            "for(const f of [0.05,0.2,0.37,0.6,0.83,0.97]){"
+            "const t=AD.warpTime(pts,f,1000,100000);"
+            "assert.ok(Math.abs(AD.warpPos(pts,t,1000,100000)-f)<1e-9,'round trip at '+f);}"
+            "for(const t of [1000,1500,2000,30000,99999,100000]){"
+            "const f=AD.warpPos(pts,t,1000,100000);"
+            "assert.ok(Math.abs(AD.warpTime(pts,f,1000,100000)-t)<1,'inverse at '+t);}"
+            "assert.strictEqual(AD.warpTime(null,0.5,10,20),15);"
+            "assert.strictEqual(AD.warpPos(null,15,10,20),0.5);"
+            "var d=new Date();d.setHours(0,0,0,0);"
+            "var t0=d.getTime()/1000,t1=t0+2*86400;"
+            "var X=function(t){return (t-t0)/(t1-t0)*1000;};"
+            "var full=AD.timeTicks(t0,t1,X,6);"
+            "assert.strictEqual(full.length,5);"
+            "var thin=AD.timeTicks(t0,t1,X,6,{minGap:1e9});"
+            "assert.strictEqual(thin.length,2);"
+            "assert.strictEqual(thin[thin.length-1].anchor,'end');"
+            "var avoided=AD.timeTicks(t0,t1,X,6,{minGap:1e9,avoid:[full[0].x]});"
+            "assert.strictEqual(avoided.length,1);"
+            "var squeezed=AD.timeTicks(t0,t1,function(){return 500;},6,{minGap:10});"
+            "assert.ok(squeezed.length>=1&&squeezed.length<=2);"
+            "assert.ok(full.every(function(k){return typeof k.label==='string'&&k.label.length>0;}));"
+        )
+        proc = subprocess.run(
+            ["node", "-e", script, str(STATIC / "format.js")],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr or proc.stdout)
+
     def test_unknown_duration_is_a_dash(self):
         script = (
             "const fs=require('fs');"
