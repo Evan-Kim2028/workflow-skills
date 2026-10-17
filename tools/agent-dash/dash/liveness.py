@@ -29,6 +29,31 @@ DAGSTER_ACTIVE_FRESH_S = 300
 # plus the idle bound above.
 PID_SOURCES = ("claude-main", "muse", "grok", "glm", "shell")
 
+# Poll cadence per source (seconds). The stale check ignores a dead-pid row
+# whose last evidence is within two poll intervals of its source: the source
+# closes the row on its next poll, so flagging it in between is noise. For
+# the 2 s tool sources that grace is 4 s.
+SOURCE_INTERVAL_S = {
+    "grok": 2.0,
+    "muse": 2.0,
+    "glm": 2.0,
+    "generic": 2.0,
+    "claude-main": 2.0,
+    "claude-subagent": 2.0,
+    "claude-workflow": 2.0,
+    "shell": 2.0,
+    "dagster": 60.0,
+}
+
+
+def stale_grace_s(source) -> float:
+    """Dead-pid grace for ``source``: two of its poll intervals."""
+    try:
+        interval = float(SOURCE_INTERVAL_S.get(source or "", 2.0))
+    except (TypeError, ValueError):
+        interval = 2.0
+    return 2.0 * interval
+
 
 def pid_alive(pid) -> bool:
     """True while the process runs. Reaps our own exited child first."""

@@ -6,6 +6,9 @@ or when a live process of that tool carries ``[label: <label>]``. A muse
 run is also live when a live muse process has ``--prompt-file`` ending in
 ``/<label>.md``, or ``--session-id`` equal to the run's session uuid.
 The command line is read only to extract those tokens; argv is not stored.
+The one exception is the worker's ``--model`` flag value, which is recorded
+as the sample and live-row ``model`` so a source can fill a run whose model
+is otherwise unknown. Nothing else from argv is kept.
 Versioned ``muse-bin-<ver>`` comms count as ``muse-bin``.
 """
 
@@ -32,6 +35,8 @@ _LABEL_OK = re.compile(r"^[\w.+-]{1,80}$")
 _UUID = r"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}"
 _SESSION = re.compile(r"--session-id(?:=|\s+)(" + _UUID + r")")
 _PROMPT = re.compile(r"--prompt-file(?:=|\s+)(\S+)")
+_MODEL = re.compile(r"--model(?:=|\s+)(\S+)")
+_MODEL_OK = re.compile(r"^[^\s'\";|&<>]{1,200}$")
 _UUID_OK = re.compile(r"^" + _UUID + r"$")
 
 
@@ -42,6 +47,7 @@ def poll(store, cfg, now: float) -> None:
     matched_pids = {row["pid"] for row in matched}
     parents = [row for row in matched if row["ppid"] not in matched_pids]
     kids, rss = _children(table)
+    tokens = _tokens_by_pid()
     for parent in parents:
         label = label_from_pid(parent["pid"])
         store.add_process_sample(
@@ -53,6 +59,7 @@ def poll(store, cfg, now: float) -> None:
                 "elapsed_s": parent["elapsed_s"],
                 "label": label,
                 "run_id": store.match_run(parent["pid"], label),
+                "model": tokens.get(parent["pid"], {}).get("model"),
             }
         )
 
@@ -60,10 +67,11 @@ def poll(store, cfg, now: float) -> None:
 def live_agent_processes(now: float | None = None) -> list[dict]:
     """Live grok, muse, and glm processes.
 
-    Each row is ``pid``, ``comm``, ``started_at``, ``label``, and (for
-    muse processes) ``prompt_label`` and ``session_id``. The command line
-    is read only to extract the bracket label, the ``--prompt-file`` label,
-    and ``--session-id``. The path and the rest of argv are not returned.
+    Each row is ``pid``, ``comm``, ``started_at``, ``label``, ``model``,
+    and (for muse processes) ``prompt_label`` and ``session_id``. The
+    command line is read only to extract the bracket label, the
+    ``--prompt-file`` label, ``--session-id``, and the ``--model`` flag
+    value. The path and the rest of argv are not returned.
     """
     now = time.time() if now is None else float(now)
     tokens = _tokens_by_pid()
@@ -85,6 +93,7 @@ def live_agent_processes(now: float | None = None) -> list[dict]:
                 "comm": row["comm"],
                 "started_at": now - float(row["elapsed_s"]),
                 "label": label,
+                "model": token.get("model"),
                 "prompt_label": prompt_label,
                 "session_id": token.get("session_id") if muse else None,
             }
@@ -187,8 +196,10 @@ def run_worker_label_from_args(text: str) -> str | None:
 def match_agent(source: str, pid, label, processes: list[dict], session_id=None):
     """The live process for this run.
 
-    Match by pid, by ``[label: ...]``, by a muse ``--prompt-file`` whose
-    path ends in ``/<label>.md``, or by a muse ``--session-id`` uuid.
+    Match by pid first, then by a muse ``--session-id`` uuid, then by
+    ``[label: ...]`` or by a muse ``--prompt-file`` whose path ends in
+    ``/<label>.md``. The label leg is weak: callers give a newer row with
+    the same label the process (see ``_vetoed``).
     """
     comms = SOURCE_COMMS.get(source)
     if not comms:
@@ -197,15 +208,6 @@ def match_agent(source: str, pid, label, processes: list[dict], session_id=None)
     if number is not None:
         for row in processes:
             if row["pid"] == number and _canon_comm(row.get("comm")) in comms:
-                return row
-    text = label if isinstance(label, str) and label else None
-    if text:
-        for row in processes:
-            if _canon_comm(row.get("comm")) not in comms:
-                continue
-            if row.get("label") == text:
-                return row
-            if source == "muse" and row.get("prompt_label") == text:
                 return row
     sid = session_id if isinstance(session_id, str) and _UUID_OK.match(session_id) else None
     if sid and source == "muse":
@@ -218,7 +220,76 @@ def match_agent(source: str, pid, label, processes: list[dict], session_id=None)
                 and got.lower() == want
             ):
                 return row
+    text = label if isinstance(label, str) and label else None
+    if text:
+        for row in processes:
+            if _canon_comm(row.get("comm")) not in comms:
+                continue
+            if row.get("label") == text:
+                return row
+            if source == "muse" and row.get("prompt_label") == text:
+                return row
     return None
+
+
+def _match_leg(source: str, run_pid, run_session, proc: dict) -> str:
+    """How ``proc`` matched: ``pid``, ``session``, or ``label``.
+
+    Only a session id names one run exactly: a relaunch reuses the prompt
+    file and label under a new session id, so the label leg loses to a
+    newer row with the same label (see ``_vetoed``).
+    """
+    try:
+        if run_pid is not None and proc.get("pid") is not None and int(run_pid) == int(proc["pid"]):
+            return "pid"
+    except (TypeError, ValueError):
+        pass
+    if source == "muse":
+        want = run_session if isinstance(run_session, str) and _UUID_OK.match(run_session) else None
+        got = proc.get("session_id")
+        if want and isinstance(got, str) and got.lower() == want.lower():
+            return "session"
+    return "label"
+
+
+def _vetoed(store, source: str, run_id, label, started_at, run_session, proc, leg: str) -> bool:
+    """Whether a newer row with the same label owns ``proc`` instead.
+
+    A session match is exact and never vetoed. A label (or prompt-file)
+    match is used only when no newer open row with that label exists. A
+    pid match is vetoed only when the newer twin owns that same process:
+    it matches by session id, or it already carries that pid (a restamp
+    from before this rule existed must not keep the dead row alive).
+    Unknown stores (no ``newer_open_label_row``) keep the old behavior.
+    """
+    if leg == "session" or not label:
+        return False
+    finder = getattr(store, "newer_open_label_row", None)
+    if not callable(finder):
+        return False
+    try:
+        twin = finder(label, source, started_at, run_id)
+    except Exception:
+        return False
+    if not twin:
+        return False
+    if leg == "label":
+        return True
+    twin_session = twin.get("session_id")
+    proc_session = proc.get("session_id")
+    if (
+        isinstance(twin_session, str)
+        and isinstance(proc_session, str)
+        and _UUID_OK.match(twin_session)
+        and twin_session.lower() == proc_session.lower()
+    ):
+        return True
+    try:
+        if twin.get("pid") is not None and int(twin["pid"]) == int(proc["pid"]):
+            return True
+    except (TypeError, ValueError):
+        pass
+    return False
 
 
 def apply_liveness(store, run: dict, source: str, processes) -> None:
@@ -239,7 +310,15 @@ def apply_liveness(store, run: dict, source: str, processes) -> None:
     if pid is None and existing:
         pid = existing.get("pid")
     label = run.get("label") or (existing or {}).get("label")
-    proc = match_agent(source, pid, label, processes, _run_session(run, existing))
+    session = _run_session(run, existing)
+    proc = match_agent(source, pid, label, processes, session)
+    if proc is not None:
+        started = run.get("started_at")
+        if started is None and existing:
+            started = existing.get("started_at")
+        leg = _match_leg(source, pid, session, proc)
+        if _vetoed(store, source, run["run_id"], label, started, session, proc, leg):
+            proc = None
     if proc:
         run["status"] = "running"
         run["pid"] = proc["pid"]
@@ -298,7 +377,15 @@ def reconcile_running(store, now: float, processes=None) -> int:
         source = row.get("source")
         if source not in SOURCE_COMMS:
             continue
-        proc = match_agent(source, row.get("pid"), row.get("label"), processes, _run_session(row, None))
+        session = _run_session(row, None)
+        proc = match_agent(source, row.get("pid"), row.get("label"), processes, session)
+        if proc is not None:
+            leg = _match_leg(source, row.get("pid"), session, proc)
+            if _vetoed(
+                store, source, row["run_id"], row.get("label"),
+                row.get("started_at"), session, proc, leg,
+            ):
+                proc = None
         labeled = _shadow_parent(store, row)
         if proc and labeled:
             _link_shadow(store, row, labeled, now)
@@ -474,7 +561,7 @@ def _run_worker_labels() -> dict:
 
 
 def _tokens_by_pid() -> dict:
-    """Pid -> label, prompt-file label, and session uuid.
+    """Pid -> label, prompt-file label, session uuid, and ``--model`` value.
 
     The command line is read only to extract those tokens. The prompt path
     and the rest of argv are discarded and never returned.
@@ -496,7 +583,8 @@ def _tokens_by_pid() -> dict:
         label = label_from_args(line)
         session_id = session_id_from_args(line)
         prompt_label = prompt_label_from_args(line)
-        if not label and not session_id and not prompt_label:
+        model = model_from_args(line)
+        if not label and not session_id and not prompt_label and not model:
             continue
         pid = _pid(line.strip().split(None, 1)[0] if line.strip() else None)
         if pid is not None:
@@ -504,6 +592,7 @@ def _tokens_by_pid() -> dict:
                 "label": label,
                 "session_id": session_id,
                 "prompt_label": prompt_label,
+                "model": model,
             }
     return found
 
@@ -581,6 +670,22 @@ def session_id_from_args(text: str) -> str | None:
     if not match:
         return None
     return match.group(1)
+
+
+def model_from_args(text: str) -> str | None:
+    """The worker's ``--model <id>`` (or ``--model=<id>``) flag value.
+
+    Returns only that one value; every other argument is discarded. A
+    missing flag, an empty value, or a value with shell metacharacters or
+    whitespace is None.
+    """
+    match = _MODEL.search(text or "")
+    if not match:
+        return None
+    value = match.group(1).strip("'\"")
+    if not _MODEL_OK.match(value):
+        return None
+    return value
 
 
 def prompt_label_from_args(text: str) -> str | None:

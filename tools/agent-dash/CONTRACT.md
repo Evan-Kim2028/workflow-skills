@@ -3,12 +3,13 @@
 Local, read-only execution dashboard. One Python 3 process (stdlib only), binds 127.0.0.1:8765.
 Code is this directory. `install.sh` links it to `~/.claude/tools/agent-dash`. State: `~/.local/share/agent-dash/` (dash.sqlite WAL, pidfile, log).
 Never writes to any source, never signals agent processes, never stores prompt bodies or argv.
+The one argv value ever kept is the worker's `--model` flag value, recorded on process samples and live-process rows so a run whose model is otherwise unknown can be named. Model ids, labels, and token counts are the only worker-derived strings in the store.
 
 ## Layout and file ownership (one writer per file)
 
 | Path | Owner |
 |---|---|
-| `agent_dash.py` (CLI: `run`, `stop`, `status`, `backfill --session <id>`, `reprice`, `reconcile`, `check`, `ws`, `report`) | core |
+| `agent_dash.py` (CLI: `run`, `stop`, `restart`, `status`, `backfill --session <id>`, `reprice`, `reconcile`, `check`, `ws`, `report`) | core |
 | `dash/store.py` (schema, offsets, upserts, buckets, counts) | core |
 | `dash/server.py` (HTTP + SSE, routes below) | core |
 | `dash/attribution.py`, `map.example.json` (`map.local.json` replaces it) | core |
@@ -46,7 +47,7 @@ store.upsert_run(dict)        # keys: run_id, source, tier, model, label, sessio
                               #       status, verdict, started_at, ended_at, clock_source, out_bytes, err_bytes, pid, out_path
 store.add_usage(dict)         # keys: ts, session_id, run_id, model, tool, message_id,
                               #       input, output, cache_read, cache_write, reasoning   (upsert on tool+session_id+message_id, last wins)
-store.add_process_sample(dict)# keys: ts, pid, comm, rss_kb, elapsed_s, label, run_id
+store.add_process_sample(dict)# keys: ts, pid, comm, rss_kb, elapsed_s, label, run_id, model (the `--model` flag value only)
 store.set_ws_counts(list)     # rows: ws, name, backlog, todo, doing, review, done, cancelled
 ```
 
@@ -246,6 +247,16 @@ last usage/sample), never left running.
 | `shell` (exec) | Live only while the out file grew since the previous poll or a live label was sampled within `process_ttl_s` (30 s). Out growth and the live label are the evidence; rows carry no pid. |
 | `generic` (`generic.jsonl`, `agent_dash.py report`) | No pid. Live from `report start` until `report finish`; each `report usage` line is fresh evidence. A run with no line for longer than `STALE_IDLE_S` (6 h) is `stale running`: hidden from every view and reported by `check`. Long runs send `report usage` as a heartbeat. |
 | `manifests` (muse/glm/grok rows) | Same as the tool rows above: `running` only on out growth or a live label; otherwise `done`/`unknown`. A terminal row ends at the last time it was seen alive (usage event or process sample) or the out/err/report file mtime, whichever is later — never the start time. |
+
+Model on every run. A usage-line model always wins. Until one arrives, a run takes the launcher manifest's model column (`cursor-sessions.tsv` carries it fourth, like `glm-sessions.tsv`), then the live worker's `--model` flag value. Ended runs with no usage model keep `model not recorded`.
+
+One row per cursor run. A launcher manifest row (`grok:<id>:cursor/<label>`) and the Cursor chat row (`grok:<chat-uuid>:<label>`) with the same label starting within 15 minutes are one run: the store folds the manifest row into the chat row (earliest start, model, manifest out path) and deletes it, on the next cursor poll. Views already drop the manifest twin (ten-minute window). A surviving manifest row with an overlapping same-source twin is a `duplicate run` reconcile mismatch.
+
+Exact process matching. A live process matches a run by pid first, then by session id, then by prompt-file or label. The label leg goes to the newest open row with that label only: a relaunched run reuses the prompt file under a new session id, and the dead older row is closed instead of staying running.
+
+Dead-pid grace. The stale check ignores a dead-pid row whose last evidence (start, usage, or sample) is within two poll intervals of its source — 4 s for the 2 s tool sources — because the source closes the row on its next poll. Rows dead longer than that still fail the check.
+
+Unseen-worker grace. The unseen-worker check ignores a live labelled worker younger than two poll intervals of its source — 4 s for the 2 s tool sources — by process age, or first sampled by this dashboard within that window (a fresh dashboard has only just met it, e.g. ramp-up transients). Older, longer-seen workers with no running row still fail the check.
 
 One filtered running set backs every view: the snapshot `running` list,
 `counts.live_agents`, `/api/workstreams` `live_agents`, and the timeline's

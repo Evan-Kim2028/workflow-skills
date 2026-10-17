@@ -25,13 +25,13 @@ The script symlinks this directory to `~/.claude/tools/agent-dash` and symlinks 
 ```bash
 python3 ~/.claude/tools/agent-dash/agent_dash.py run
 python3 ~/.claude/tools/agent-dash/agent_dash.py status
-python3 ~/.claude/tools/agent-dash/agent_dash.py stop
+python3 ~/.claude/tools/agent-dash/agent_dash.py restart
 python3 ~/.claude/tools/agent-dash/agent_dash.py reprice
 python3 ~/.claude/tools/agent-dash/agent_dash.py reconcile
 python3 ~/.claude/tools/agent-dash/agent_dash.py ws list
 ```
 
-`run` prints `running`, a pid, and `url http://127.0.0.1:8765/`. `stop` signals only the pid in the pidfile.
+`run` prints `running`, a pid, and `url http://127.0.0.1:8765/`. `restart` stops (waiting up to 10 s, SIGKILL only for the pidfile pid), starts again in the background, and returns 0 once `/api/health` answers. Prefer it over separate `stop` and `run` calls: one command, and it waits for health before returning.
 
 Fixture preview, with no live sessions. From the repository root:
 

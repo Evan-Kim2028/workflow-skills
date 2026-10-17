@@ -318,6 +318,10 @@ def _upsert_run(store, sid, manifests, muse_parent, model, have_log_start, log_t
         run["label"] = row["label"]
     if model:
         run["model"] = model
+    elif processes:
+        live_model = _live_model(processes, ident)
+        if live_model:
+            run["model"] = live_model
     if parent:
         run["parent_session_id"] = parent
     start, clock = _start_clock(store, run_id, row, have_log_start, log_ts, log_path)
@@ -374,6 +378,28 @@ def _agent_processes():
         return live_agent_processes()
     except Exception:
         return None
+
+
+def _live_model(processes, sid):
+    """The ``--model`` flag value on this session's live process, if any.
+
+    Session ids name one run exactly, so this fills a run whose log has
+    not named a model yet without touching a run that already has one.
+    """
+    if not isinstance(sid, str) or not processes:
+        return None
+    from dash.sources.process import SOURCE_COMMS
+
+    want = sid.lower()
+    for proc in processes:
+        if not isinstance(proc, dict):
+            continue
+        if proc.get("comm") not in SOURCE_COMMS["muse"]:
+            continue
+        got = proc.get("session_id")
+        if isinstance(got, str) and got.lower() == want and proc.get("model"):
+            return proc["model"]
+    return None
 
 
 def _retire_shadow(store, sid, label):

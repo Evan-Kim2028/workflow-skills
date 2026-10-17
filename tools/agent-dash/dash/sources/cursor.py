@@ -3,10 +3,11 @@
 Chats live in ``~/.cursor/chats/<md5(cwd)>/<uuid>/``. The run label is the
 first ``[label: ...]`` in that chat's transcript under
 ``~/.cursor/projects/<encoded cwd>/agent-transcripts/``. A
-``cursor-sessions.tsv`` row (``label``, ``-``, started epoch) supplies a
-label only when the transcript has none, the start is unique within 5
-seconds, and the cwd is a workspace that transcript-labeled rows from the
-same manifest already use.
+``cursor-sessions.tsv`` row (``label``, ``-``, started epoch, optional
+model) supplies a label only when the transcript has none, the start is
+unique within 5 seconds, and the cwd is a workspace that
+transcript-labeled rows from the same manifest already use. Its model
+fills the run when no usage line has named one yet.
 
 Run id is ``grok:<chat-uuid>:<label>``. Source and tier are ``grok``.
 Status is ``running`` only while a live ``cursor-agent`` process matches
@@ -117,6 +118,28 @@ def live_label_pids():
     return found
 
 
+def live_label_models():
+    """Map a ``[label: ...]`` on a live cursor-agent process to its model.
+
+    The model is the worker's ``--model`` flag value only; the rest of
+    argv is discarded by the process source. Used to fill a run whose
+    model is otherwise unknown while it is live.
+    """
+    from dash.sources.process import live_agent_processes
+
+    found = {}
+    try:
+        rows = live_agent_processes()
+    except Exception:
+        return {}
+    for row in rows:
+        if row.get("comm") != "cursor-agent" or not row.get("label"):
+            continue
+        if row.get("model"):
+            found[row["label"]] = row["model"]
+    return found
+
+
 def live_cursor_pids():
     """Pids of live cursor-agent processes, labeled or not.
 
@@ -212,6 +235,7 @@ def _poll(store, cfg, now):
         manifest_labels = {row["label"] for row in rows}
         allow = manifest_labels if allow is None else allow & manifest_labels
 
+    _repair_grok_runs(store, now)
     chats, budget = _discover(home, budget, per_file)
     if not chats:
         return
@@ -219,7 +243,7 @@ def _poll(store, cfg, now):
     _assign(chats, rows)
     global _LIVE_PIDS
     live = live_label_pids()
-    _attach_pids(chats, live)
+    _attach_pids(chats, live, live_label_models())
     _LIVE_PIDS = _pid_set(live)
     hooked = set()
     if allow is None:
@@ -240,6 +264,25 @@ def _poll(store, cfg, now):
         _restore_parent_pids(store, chats, now)
     finally:
         _LIVE_PIDS = None
+
+
+def _repair_grok_runs(store, now):
+    """Fold launcher manifest rows into their chat row; backfill NULL models.
+
+    The manifests source records every launched run as
+    ``grok:<id>:cursor/<label>`` while the chat itself is
+    ``grok:<chat-uuid>:<label>``. The store merges the twin (earliest
+    start, model, out path) and deletes the manifest row, and fills runs
+    whose model is still NULL from their usage events. Unknown stores
+    keep the old behavior.
+    """
+    repair = getattr(store, "repair_grok_runs", None)
+    if not callable(repair):
+        return
+    try:
+        repair(now)
+    except Exception:
+        _fail("grok-repair")
 
 
 def _worth_tracking(chat, now):
@@ -961,6 +1004,8 @@ def _assign(chats, rows):
         if best is not None:
             chat["parent"] = best.get("parent")
             chat["manifest_epoch"] = best["epoch"]
+            if best.get("model"):
+                chat["manifest_model"] = best["model"]
 
     labeled = {chat["label"] for chat in chats if chat.get("label")}
     unused = [row for row in rows if row["label"] not in labeled]
@@ -1004,10 +1049,12 @@ def _assign(chats, rows):
         chat["label_from"] = "manifest"
         chat["parent"] = row.get("parent")
         chat["manifest_epoch"] = row["epoch"]
+        if row.get("model"):
+            chat["manifest_model"] = row["model"]
         used.add(id(chat))
 
 
-def _attach_pids(chats, live):
+def _attach_pids(chats, live, models=None):
     groups = {}
     for chat in chats:
         label = chat.get("label")
@@ -1015,13 +1062,15 @@ def _attach_pids(chats, live):
             groups.setdefault(label, []).append(chat)
     for label, group in groups.items():
         pid = live.get(label) if isinstance(live, dict) else None
-        if not pid:
-            continue
-        group.sort(key=lambda chat: chat.get("updated_ms") or 0, reverse=True)
-        try:
-            group[0]["pid"] = int(pid)
-        except (TypeError, ValueError):
-            continue
+        if pid:
+            group.sort(key=lambda chat: chat.get("updated_ms") or 0, reverse=True)
+            try:
+                group[0]["pid"] = int(pid)
+            except (TypeError, ValueError):
+                pass
+        if isinstance(models, dict) and models.get(label):
+            for chat in group:
+                chat.setdefault("live_model", models[label])
 
 
 def _upsert(store, chat, now, model):
@@ -1041,6 +1090,12 @@ def _upsert(store, chat, now, model):
         run["label"] = chat["label"]
     if model:
         run["model"] = model
+    elif chat.get("hook_model"):
+        run["model"] = chat["hook_model"]
+    elif chat.get("manifest_model"):
+        run["model"] = chat["manifest_model"]
+    elif chat.get("live_model"):
+        run["model"] = chat["live_model"]
     if chat.get("child_of"):
         run["parent_session_id"] = chat["child_of"]
     elif chat.get("parent"):
@@ -1390,7 +1445,8 @@ def _parse_manifest(text):
             epoch = float(parts[2].strip())
         except ValueError:
             continue
-        rows.append({"label": label, "epoch": epoch})
+        model = parts[3].strip() if len(parts) > 3 else ""
+        rows.append({"label": label, "epoch": epoch, "model": model or None})
     return rows
 
 

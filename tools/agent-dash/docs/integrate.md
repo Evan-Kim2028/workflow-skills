@@ -22,7 +22,7 @@ python3 tools/agent-dash/agent_dash.py check --hours 1
 python3 tools/agent-dash/agent_dash.py check --page
 ```
 
-Health prints `"ok": true` with one entry per source, each `last_error: null`. `check` prints one table row per workstream and exits 1 on any mismatch. `check --page` drives the live page in headless Chrome and compares every tile against the API; it skips with a clear message when Chrome is missing. Stop with `python3 tools/agent-dash/agent_dash.py stop`, which signals only the pidfile pid.
+Health prints `"ok": true` with one entry per source, each `last_error: null`. `check` prints one table row per workstream and exits 1 on any mismatch. `check --page` drives the live page in headless Chrome and compares every tile against the API; it skips with a clear message when Chrome is missing. Restart with `python3 tools/agent-dash/agent_dash.py restart`: it stops (SIGTERM, up to 10 s of polling, SIGKILL only for the pidfile pid), starts again in the background, and returns 0 once `/api/health` answers. `stop` alone waits the same way and returns 0 only once the port is free, so an immediate `run` can bind.
 
 State lives in `~/.local/share/agent-dash/` (`dash.sqlite`, pidfile, log, `generic.jsonl`). Point `AGENT_DASH_STATE_DIR` at an empty directory to trial the dashboard without touching live state. Point `AGENT_DASH_WORKSTREAMS` at another directory to trial bundles.
 
@@ -32,7 +32,7 @@ State lives in `~/.local/share/agent-dash/` (`dash.sqlite`, pidfile, log, `gener
 |---|---|---|---|
 | Claude Code | Transcripts under `~/.claude/projects`, registry under `~/.claude/sessions` | Nothing; label each run | First prompt line `[label: ws4-WS4.1-slug]` |
 | muse | Sessions under `~/.local/share/muse/sessions`, `muse-sessions.tsv` on a scratch root | One TSV row per run | `label`, session uuid, start epoch |
-| cursor-agent / Grok | Chats under `~/.cursor`, `cursor-sessions.tsv` on a scratch root, `cursor-usage.jsonl` in state dir | TSV row plus usage lines | Same TSV row; hook appends usage |
+| cursor-agent / Grok | Chats under `~/.cursor`, `cursor-sessions.tsv` on a scratch root, `cursor-usage.jsonl` in state dir | TSV row plus usage lines | Same TSV row with the model fourth; hook appends usage |
 | Codex or any other CLI | `generic.jsonl` in the state dir | Three `report` lines per run | Label, verdict, input/output counts |
 | Custom Python or shell | Same `generic.jsonl`, or a TSV row plus `out-<label>.md` on a scratch root | Same as above | Same as above |
 | Remote or cloud agent | Same `generic.jsonl`, written by a forwarder on this machine | Same three lines, sent home first | Same as above |
@@ -58,7 +58,7 @@ Raw JSONL works the same when the CLI is out of reach. Append to `<state-dir>/ge
 
 The collector tails the file and picks lines up within a poll. Bad lines are skipped. There is no field for prompts or secrets; never invent one.
 
-The file path alternative is the scratchpad manifest. The dashboard scans each scratch root for `muse-sessions.tsv`, `glm-sessions.tsv`, `grok-sessions.tsv`, and `cursor-sessions.tsv` — including a manifest nested one level under a scratchpad (a lead child folder) — then reads `out-<label>.md`, `err-<label>.log`, and `report-<label>.md` from the `muse/`, `glm/`, `grok/`, `cursor/`, or `exec/` folder beside the TSV. Columns are `label`, `session_id`, start epoch, optional `model`, tab-separated; a header row is skipped. A run folder registers itself: `run_worker.py` records its run folder in `<state-dir>/run-dirs.txt` before launching, and the manifest sources scan every registered folder in addition to the configured scratch roots, wherever the lead put it. A flat run folder (TSV plus `out-`/`err-` files directly inside, no `muse/`/`glm/` subfolders) reads the same way. A harness that writes manifests elsewhere registers its folder with one line in `run-dirs.txt`, or with `report --run-dir <dir>`:
+The file path alternative is the scratchpad manifest. The dashboard scans each scratch root for `muse-sessions.tsv`, `glm-sessions.tsv`, `grok-sessions.tsv`, and `cursor-sessions.tsv` — including a manifest nested one level under a scratchpad (a lead child folder) — then reads `out-<label>.md`, `err-<label>.log`, and `report-<label>.md` from the `muse/`, `glm/`, `grok/`, `cursor/`, or `exec/` folder beside the TSV. Columns are `label`, `session_id`, start epoch, optional `model`, tab-separated; a header row is skipped. A run folder registers itself: `run_worker.py` records its run folder in `<state-dir>/run-dirs.txt` before launching, and the manifest sources scan every registered folder in addition to the configured scratch roots, wherever the lead put it. A flat run folder (TSV plus `out-`/`err-` files directly inside, no `muse/`/`glm/` subfolders) reads the same way. A harness that writes manifests elsewhere registers its folder with one line in `run-dirs.txt`, or with `report --run-dir <dir>`. The cursor launcher writes the model fourth (`label`, `-`, epoch, `model`); a run takes that model until a usage line names one:
 
 ```text
 ws4-WS4.1-notes-index	550e8400-e29b-41d4-a716-446655440000	1700000000	demo-model

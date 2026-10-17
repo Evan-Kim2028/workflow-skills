@@ -159,6 +159,11 @@ class MuseTests(unittest.TestCase):
             "roots": {"muse_sessions": sessions, "scratchpads": scratch},
             "fresh_hours": 0,
             "read_budget": {"per_file": 1024 * 1024, "per_tick": 4 * 1024 * 1024},
+            # Isolate from the machine's registered run folders: without this,
+            # scan_roots picks up live run-dirs.txt entries. Never created.
+            "state_dir": os.path.join(
+                os.path.dirname(os.path.abspath(scratch)), "dash-state"
+            ),
         }
         box.update(extra)
         return box
@@ -252,6 +257,61 @@ class MuseTests(unittest.TestCase):
             self.assertEqual(run["clock_source"], "manifest")
             self.assertEqual(run["started_at"], 1792152010.0)
             self.assertEqual(store.usage, {})
+
+    def test_live_model_fills_run_without_log_model(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            scratch = os.path.join(tmp, "scratch")
+            os.makedirs(scratch)
+            with open(os.path.join(scratch, "muse-sessions.tsv"), "w") as fh:
+                fh.write("ws7-notes\t%s\t1792152010\n" % SID)
+            store = Store()
+            cfg = self.cfg(os.path.join(tmp, "missing-sessions"), scratch)
+            cfg["roots"] = {"muse_sessions": cfg["roots"]["muse_sessions"], "scratch": scratch}
+            cfg["read_budgets"] = cfg.pop("read_budget")
+            original = muse.live_agent_processes
+            muse.live_agent_processes = lambda now=None: [
+                {
+                    "pid": 42,
+                    "comm": "muse",
+                    "started_at": 1792152010.0,
+                    "label": None,
+                    "prompt_label": None,
+                    "session_id": SID,
+                    "model": "muse-spark-live",
+                }
+            ]
+            try:
+                self.poll(store, cfg, 1792153000)
+            finally:
+                muse.live_agent_processes = original
+            run = store.runs["muse:%s:ws7-notes" % SID]
+            self.assertEqual(run["model"], "muse-spark-live")
+            self.assertEqual(run["status"], "running")
+
+    def test_log_model_beats_live_model(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sessions, scratch, path = self._one_session(tmp, SID)
+            with open(path, "wb") as fh:
+                fh.write(mc(SID, "a", input=3, output=1, model="muse-from-log"))
+            store = Store()
+            original = muse.live_agent_processes
+            muse.live_agent_processes = lambda now=None: [
+                {
+                    "pid": 42,
+                    "comm": "muse",
+                    "started_at": 1792152010.0,
+                    "label": None,
+                    "prompt_label": None,
+                    "session_id": SID,
+                    "model": "muse-spark-live",
+                }
+            ]
+            try:
+                self.poll(store, self.cfg(sessions, scratch), 1792153000)
+            finally:
+                muse.live_agent_processes = original
+            run = store.runs["muse:%s:ws7-notes" % SID]
+            self.assertEqual(run["model"], "muse-from-log")
 
     def test_incremental_tail(self):
         with tempfile.TemporaryDirectory() as tmp:

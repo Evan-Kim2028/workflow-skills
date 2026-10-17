@@ -149,6 +149,188 @@ class MatchAgentTests(unittest.TestCase):
         run_procs = [muse_row()]
         self.assertIsNone(process.match_agent("muse", None, None, run_procs, "chat"))
 
+    def test_session_match_beats_label_match(self):
+        by_label = {"pid": 11, "comm": "muse", "started_at": 1, "label": "ws2-x"}
+        by_session = dict(muse_row(), label="other-label")
+        got = process.match_agent("muse", None, "ws2-x", [by_label, by_session], SID_UPPER)
+        self.assertEqual(got["pid"], 28553)
+
+    def test_pid_match_beats_session_match(self):
+        by_pid = dict(muse_row(), session_id="00000000-0000-4000-8000-000000000000")
+        by_session = {"pid": 44, "comm": "muse", "started_at": 1, "session_id": SID_UPPER}
+        got = process.match_agent("muse", 28553, None, [by_pid, by_session], SID_UPPER)
+        self.assertEqual(got["pid"], 28553)
+
+
+class ModelFromArgsTests(unittest.TestCase):
+    def test_space_and_equals_forms(self):
+        self.assertEqual(
+            process.model_from_args("cursor-agent -p --model grok-4.7-high --force"),
+            "grok-4.7-high",
+        )
+        self.assertEqual(
+            process.model_from_args("muse exec --model=muse-spark-1.3-contributor"),
+            "muse-spark-1.3-contributor",
+        )
+        self.assertEqual(
+            process.model_from_args(
+                "cursor-agent -p --model grok-4.7[context=500k,reasoning_effort=xhigh,fast=false]"
+            ),
+            "grok-4.7[context=500k,reasoning_effort=xhigh,fast=false]",
+        )
+
+    def test_missing_flag_is_none(self):
+        self.assertIsNone(process.model_from_args("cursor-agent -p --force"))
+        self.assertIsNone(process.model_from_args(""))
+
+    def test_returns_only_the_flag_value(self):
+        text = (
+            "999 cursor-agent -p --model grok-4.7-high --force --trust "
+            "--workspace /work/tree --output-format stream-json "
+            "[label: ws7-x]\nthe prompt body stays out"
+        )
+        got = process.model_from_args(text)
+        self.assertEqual(got, "grok-4.7-high")
+        self.assertNotIn("workspace", got)
+        self.assertNotIn("label", got)
+        self.assertNotIn("prompt", got)
+
+    def test_short_flag_is_not_read(self):
+        self.assertIsNone(process.model_from_args("grok -p text -m glm-5.3"))
+
+    def test_live_row_carries_only_the_model(self):
+        keep_ps, keep_tokens = process._ps, process._tokens_by_pid
+        process._ps = lambda: [
+            {"pid": 7, "ppid": 1, "pgid": 7, "rss_kb": 10, "elapsed_s": 5.0, "comm": "cursor-agent"}
+        ]
+        process._tokens_by_pid = lambda: {
+            7: {"label": "ws7-x", "session_id": None, "prompt_label": None, "model": "grok-4.7-high"}
+        }
+        try:
+            rows = process.live_agent_processes(now=100.0)
+        finally:
+            process._ps, process._tokens_by_pid = keep_ps, keep_tokens
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["model"], "grok-4.7-high")
+        import json
+
+        self.assertNotIn("/work/tree", json.dumps(rows[0]))
+        self.assertNotIn("[label:", json.dumps(rows[0]))
+
+
+class VetoTests(unittest.TestCase):
+    LABEL = "ws3-WS3.15-smoke-rev1"
+    OLD_SID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    NEW_SID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+
+    def vstore(self, runs):
+        base = Store({key: dict(value) for key, value in runs.items()})
+
+        def newer_open_label_row(label, source, started_at, exclude_run_id):
+            best = None
+            base_ts = started_at or 0
+            for row in base.saved.values():
+                if row.get("run_id") == exclude_run_id:
+                    continue
+                if row.get("label") != label or row.get("source") != source:
+                    continue
+                if row.get("status") != "running":
+                    continue
+                if (row.get("started_at") or 0) > base_ts and (
+                    best is None or row["started_at"] > best["started_at"]
+                ):
+                    best = row
+            return dict(best) if best else None
+
+        base.newer_open_label_row = newer_open_label_row
+        return base
+
+    def old_row(self, **over):
+        row = {
+            "run_id": "muse:%s:%s" % (self.OLD_SID, self.LABEL),
+            "source": "muse",
+            "session_id": self.OLD_SID,
+            "label": self.LABEL,
+            "status": "running",
+            "pid": 100,
+            "started_at": 1000,
+        }
+        row.update(over)
+        return row
+
+    def new_row(self, **over):
+        row = {
+            "run_id": "muse:%s:%s" % (self.NEW_SID, self.LABEL),
+            "source": "muse",
+            "session_id": self.NEW_SID,
+            "label": self.LABEL,
+            "status": "running",
+            "pid": 200,
+            "started_at": 2000,
+        }
+        row.update(over)
+        return row
+
+    def live_proc(self):
+        return {
+            "pid": 200,
+            "comm": "muse",
+            "started_at": 1990,
+            "label": None,
+            "prompt_label": self.LABEL,
+            "session_id": self.NEW_SID,
+        }
+
+    def test_label_match_loses_to_newer_row_and_old_row_closes(self):
+        old = self.old_row()
+        new = self.new_row()
+        store = self.vstore({old["run_id"]: old, new["run_id"]: new})
+        run = {"run_id": old["run_id"], "label": self.LABEL, "session_id": self.OLD_SID}
+        process.apply_liveness(store, run, "muse", [self.live_proc()])
+        self.assertNotEqual(run.get("status"), "running")
+        self.assertIsNone(run.get("pid"))
+        self.assertEqual(run.get("ended_at"), 1000)
+
+    def test_session_match_is_never_vetoed(self):
+        old = self.old_row()
+        new = self.new_row()
+        store = self.vstore({old["run_id"]: old, new["run_id"]: new})
+        proc = dict(self.live_proc(), session_id=self.OLD_SID)
+        run = {"run_id": old["run_id"], "label": self.LABEL, "session_id": self.OLD_SID}
+        process.apply_liveness(store, run, "muse", [proc])
+        self.assertEqual(run.get("status"), "running")
+        self.assertEqual(run.get("pid"), 200)
+
+    def test_pid_match_with_own_live_pid_is_kept(self):
+        old = self.old_row(pid=100)
+        new = self.new_row(pid=300)
+        store = self.vstore({old["run_id"]: old, new["run_id"]: new})
+        proc = {"pid": 100, "comm": "muse", "started_at": 990, "label": self.LABEL}
+        run = {"run_id": old["run_id"], "label": self.LABEL, "session_id": self.OLD_SID}
+        process.apply_liveness(store, run, "muse", [proc])
+        self.assertEqual(run.get("status"), "running")
+        self.assertEqual(run.get("pid"), 100)
+
+    def test_pid_match_vetoed_when_twin_owns_that_pid(self):
+        old = self.old_row(pid=200)
+        new = self.new_row(pid=200)
+        store = self.vstore({old["run_id"]: old, new["run_id"]: new})
+        run = {"run_id": old["run_id"], "label": self.LABEL, "session_id": self.OLD_SID}
+        process.apply_liveness(store, run, "muse", [self.live_proc()])
+        self.assertNotEqual(run.get("status"), "running")
+        self.assertIsNone(run.get("pid"))
+
+    def test_reconcile_closes_vetoed_row_and_keeps_newer(self):
+        old = self.old_row()
+        new = self.new_row()
+        store = self.vstore({old["run_id"]: old, new["run_id"]: new})
+        ended = process.reconcile_running(store, 3000, [self.live_proc()])
+        self.assertEqual(store.get_run(new["run_id"])["status"], "running")
+        self.assertEqual(store.get_run(new["run_id"])["pid"], 200)
+        self.assertEqual(store.get_run(old["run_id"])["status"], "done")
+        self.assertIsNone(store.get_run(old["run_id"])["pid"])
+        self.assertEqual(ended, 1)
+
 
 class RunSessionTests(unittest.TestCase):
     def test_uuid_from_muse_run_id(self):

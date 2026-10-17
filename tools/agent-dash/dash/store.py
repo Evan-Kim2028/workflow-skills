@@ -15,6 +15,7 @@ from dash.liveness import (
     DAGSTER_ACTIVE_FRESH_S,
     STALE_IDLE_S,
     pid_alive as _pid_alive,
+    stale_grace_s,
 )
 from dash.pricing import cost as price_cost
 from dash.pricing import series_key
@@ -335,8 +336,8 @@ class Store:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
                 self._conn.execute(
-                    """INSERT INTO process_samples(ts, pid, comm, rss_kb, elapsed_s, label, run_id)
-                       VALUES(?,?,?,?,?,?,?)""",
+                    """INSERT INTO process_samples(ts, pid, comm, rss_kb, elapsed_s, label, run_id, model)
+                       VALUES(?,?,?,?,?,?,?,?)""",
                     (
                         ts,
                         int(row["pid"]),
@@ -345,6 +346,7 @@ class Store:
                         row.get("elapsed_s"),
                         clean_label(row.get("label")),
                         row.get("run_id"),
+                        row.get("model"),
                     ),
                 )
                 self._conn.execute(
@@ -614,13 +616,13 @@ class Store:
                 return "dagster run missing from the latest successful active set"
             return None
         pid = run.get("pid")
+        dead_pid = False
         if pid is not None:
             try:
                 alive = bool(check(pid))
             except Exception:
                 alive = False
-            if not alive:
-                return f"dead pid {pid}"
+            dead_pid = not alive
         stamps = []
         started = run.get("started_at")
         if isinstance(started, (int, float)) and not isinstance(started, bool):
@@ -636,6 +638,10 @@ class Store:
             if hit is not None:
                 stamps.append(float(hit))
         last = max(stamps) if stamps else None
+        if dead_pid:
+            if last is not None and now - last <= stale_grace_s(source):
+                return None
+            return f"dead pid {pid}"
         if last is None:
             return None
         if now - last > STALE_IDLE_S:
@@ -779,6 +785,165 @@ class Store:
             self._note_data_write()
         return True
 
+    def repair_grok_runs(self, now: float, window_s: float = 900.0) -> tuple[int, int]:
+        """Fill NULL grok models from usage and fold manifest twins into chat rows.
+
+        The cursor source calls this every poll. The manifest merge runs
+        every time (it is one indexed scan and converges to no work); the
+        usage backfill runs at most once a minute. Returns
+        ``(models_filled, merged)``.
+        """
+        merged = self.merge_grok_manifests(window_s)
+        filled = self.backfill_grok_models(now)
+        return filled, merged
+
+    def backfill_grok_models(self, now: float) -> int:
+        """Fill a NULL-model grok run from its latest usage event model.
+
+        Usage-line models win everywhere else, so a run that learned its
+        model at the end keeps it here too. Runs with no usage model stay
+        NULL ("model not recorded"). Returns how many rows changed.
+        """
+        now = float(now)
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT value FROM meta WHERE key='grok_models_ts'"
+            ).fetchone()
+            if row and row["value"]:
+                try:
+                    if now - float(row["value"]) < 60.0:
+                        return 0
+                except (TypeError, ValueError):
+                    pass
+            pending = [
+                dict(item)
+                for item in self._conn.execute(
+                    "SELECT run_id FROM runs WHERE source='grok' AND (model IS NULL OR model='')"
+                ).fetchall()
+            ]
+        filled = 0
+        for item in pending:
+            with self._lock:
+                hit = self._conn.execute(
+                    """SELECT model FROM usage_events
+                       WHERE run_id=? AND model IS NOT NULL AND model != ''
+                       ORDER BY ts IS NULL, ts DESC LIMIT 1""",
+                    (item["run_id"],),
+                ).fetchone()
+            if not hit:
+                continue
+            self.upsert_run({"run_id": item["run_id"], "model": hit["model"]})
+            filled += 1
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO meta(key, value) VALUES('grok_models_ts', ?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (str(now),),
+            )
+        return filled
+
+    def merge_grok_manifests(self, window_s: float = 900.0) -> int:
+        """Fold launcher manifest rows into the chat row they record.
+
+        A ``cursor-sessions.tsv`` row becomes ``grok:<id>:cursor/<label>``
+        while the Cursor chat itself is ``grok:<chat-uuid>:<label>``. A
+        manifest row whose label matches a non-manifest grok row that
+        started within ``window_s`` (default 15 minutes, wider than the ten
+        minutes views use) is that same run: the merged row keeps the
+        earliest start, the chat row's status, the model, and the
+        manifest's out path; usage and samples move over and the manifest
+        row is deleted. A manifest row with no twin stays. Returns how
+        many rows merged.
+        """
+        with self._lock:
+            manifests = [
+                row
+                for row in (
+                    dict(item)
+                    for item in self._conn.execute(
+                        "SELECT * FROM runs WHERE source='grok'"
+                    ).fetchall()
+                )
+                if _is_manifest_twin(row)
+            ]
+        merged = 0
+        for manifest in manifests:
+            with self._lock:
+                twins = [
+                    row
+                    for row in (
+                        dict(item)
+                        for item in self._conn.execute(
+                            "SELECT * FROM runs WHERE source='grok' AND label=? AND run_id != ?",
+                            (manifest.get("label"), manifest["run_id"]),
+                        ).fetchall()
+                    )
+                    if not _is_manifest_twin(row)
+                ]
+            twin = _nearest_twin(manifest, twins, window_s)
+            if twin is None:
+                continue
+            if self._merge_run_into(manifest["run_id"], twin["run_id"]):
+                merged += 1
+        return merged
+
+    def _merge_run_into(self, src_id: str, dst_id: str) -> bool:
+        """Fold manifest row ``src_id`` into chat row ``dst_id`` and delete it."""
+        if not src_id or not dst_id or src_id == dst_id:
+            return False
+        with self._lock:
+            src = self._one("SELECT * FROM runs WHERE run_id=?", (src_id,))
+            dst = self._one("SELECT * FROM runs WHERE run_id=?", (dst_id,))
+            if not src or not dst:
+                return False
+            merged = dict(dst)
+            src_start = _epoch(src.get("started_at"))
+            dst_start = _epoch(dst.get("started_at"))
+            if src_start is not None and (dst_start is None or src_start < dst_start):
+                merged["started_at"] = src_start
+                if src.get("clock_source"):
+                    merged["clock_source"] = src["clock_source"]
+            for key in ("model", "verdict", "out_path", "out_bytes", "err_bytes"):
+                if merged.get(key) in (None, "", 0) and src.get(key) not in (None, "", 0):
+                    merged[key] = src[key]
+            src_end = _epoch(src.get("ended_at"))
+            dst_end = _epoch(dst.get("ended_at"))
+            if (
+                merged.get("status") != "running"
+                and src_end is not None
+                and (dst_end is None or src_end > dst_end)
+            ):
+                merged["ended_at"] = src_end
+            workstream, confidence = attribute(
+                merged.get("label"),
+                merged.get("session_id"),
+                parent_session_id=merged.get("parent_session_id"),
+            )
+            merged["workstream"] = workstream
+            merged["ws_confidence"] = confidence
+            hours = self._hours_for_run(src_id) | self._hours_for_run(dst_id)
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                self._conn.execute(
+                    "UPDATE usage_events SET run_id=? WHERE run_id=?",
+                    (dst_id, src_id),
+                )
+                self._conn.execute(
+                    "UPDATE process_samples SET run_id=? WHERE run_id=?",
+                    (dst_id, src_id),
+                )
+                self._write_run(merged)
+                self._conn.execute("DELETE FROM runs WHERE run_id=?", (src_id,))
+                for hour in hours:
+                    self._rebuild_hour(hour)
+                self._conn.execute("COMMIT")
+            except Exception:
+                self._conn.execute("ROLLBACK")
+                raise
+            self._seq += 1
+            self._data_seq += 1
+        return True
+
     def repair_muse_orphans(self) -> int:
         """Move orphan muse usage onto the labeled run and delete the orphan."""
         with self._lock:
@@ -869,11 +1034,44 @@ class Store:
             text = clean_label(label)
             if text:
                 rows = self._conn.execute(
-                    "SELECT run_id FROM runs WHERE label=? AND status='running'", (text,)
+                    """SELECT run_id FROM runs WHERE label=? AND status='running'
+                       ORDER BY started_at IS NULL, started_at DESC, rowid DESC LIMIT 1""",
+                    (text,),
                 ).fetchall()
-                if len(rows) == 1:
+                if rows:
                     return rows[0]["run_id"]
         return None
+
+    def newer_open_label_row(self, label, source, started_at, exclude_run_id):
+        """Newest open row with the same label and source, or None.
+
+        Open means ``running``, or ``unknown`` with no ``ended_at``. Newer
+        means a strictly greater ``started_at`` (missing counts as 0). The
+        process matcher uses this so a prompt-file or label match goes to
+        the newest row: a relaunched run reuses the label under a new
+        session id, and the dead older row must not claim its process.
+        """
+        text = clean_label(label)
+        if not text or not source or not exclude_run_id:
+            return None
+        base = started_at if isinstance(started_at, (int, float)) and not isinstance(started_at, bool) else 0.0
+        with self._lock:
+            rows = self._conn.execute(
+                """SELECT * FROM runs
+                   WHERE label=? AND source=? AND run_id != ?
+                   AND (status='running' OR (status='unknown' AND ended_at IS NULL))""",
+                (text, source, exclude_run_id),
+            ).fetchall()
+        best = None
+        best_start = base
+        for row in rows:
+            candidate = dict(row)
+            start = candidate.get("started_at")
+            start = float(start) if isinstance(start, (int, float)) and not isinstance(start, bool) else 0.0
+            if start > best_start:
+                best = candidate
+                best_start = start
+        return best
 
     def snapshot(
         self,
@@ -1031,7 +1229,10 @@ class Store:
         ``processes`` is the live worker listing for the ``unseen worker``
         check. The store never samples processes itself, so unit tests stay
         hermetic: pass an explicit list (``[]`` for none). The HTTP layer
-        (``dash/server.py``) supplies the live listing per request.
+        (``dash/server.py``) supplies the live listing per request. A
+        worker younger than two poll intervals of its source — by process
+        age, or first sampled here within that window — is not yet a
+        mismatch.
         """
         with self._lock:
             shown_all, parents = self._shown_locked(now)
@@ -1127,7 +1328,10 @@ class Store:
             recent_shown = min(50, finished_total)
             for run, reason in self._stale_locked(now, shown_all):
                 mismatches.append(f"stale running: {run.get('run_id')} ({reason})")
-            mismatches.extend(_unseen_workers(shown_all, processes or []))
+            mismatches.extend(self._unseen_workers_locked(now, shown_all, processes or []))
+            mismatches.extend(
+                _duplicate_run_mismatches([dict(row) for row in self._all_runs()])
+            )
             return {
                 "now": now,
                 "since": roll["since"],
@@ -1149,6 +1353,74 @@ class Store:
                 "recent_total": finished_total,
                 "mismatches": mismatches,
             }
+
+    def _unseen_workers_locked(self, now: float, shown_all: list, processes) -> list:
+        """``unseen worker`` mismatches: live worker, no running worker row.
+
+        A live worker process (``[label:]``, a muse prompt-file label, or a
+        ``run_worker.py`` argv label) with no ``running``/``queued`` worker
+        row (``muse``/``glm``/``grok``) on that label is invisible on the
+        dashboard: one mismatch per label. Only the label is reported; argv
+        beyond it is never stored or printed. Caller holds the lock.
+
+        Grace, like the stale check: a worker younger than two poll
+        intervals of its source is not yet a mismatch — by process age, or
+        when this dashboard first sampled it within that window (a fresh
+        dashboard has only just met it, e.g. ramp-up transients). Older,
+        longer-seen workers with no running row still fail the check.
+        """
+        have = set()
+        for run in shown_all:
+            if (
+                run.get("status") in ("running", "queued")
+                and run.get("source") in WORKER_SOURCES
+                and run.get("label")
+            ):
+                have.add(run["label"])
+        pending: dict = {}
+        for proc in processes or []:
+            if not isinstance(proc, dict):
+                continue
+            label = proc.get("label")
+            if not label or label in have or label in pending:
+                continue
+            pending[label] = proc
+        first_seen = self._first_sample_ts_locked(set(pending)) if pending else {}
+        out = []
+        for label in sorted(pending):
+            proc = pending[label]
+            grace = stale_grace_s(_unseen_source(proc))
+            try:
+                age = now - float(proc.get("started_at"))
+            except (TypeError, ValueError):
+                age = None
+            if age is not None and age < grace:
+                continue
+            seen_at = first_seen.get(label)
+            if seen_at is not None and now - seen_at < grace:
+                continue
+            comm = proc.get("comm") or "worker"
+            pid = proc.get("pid")
+            detail = f"{comm} pid {pid}" if pid is not None else str(comm)
+            out.append(f"unseen worker: {label} ({detail})")
+        return out
+
+    def _first_sample_ts_locked(self, labels: set) -> dict:
+        """First process-sample time per label. Caller holds the lock."""
+        wanted = [label for label in labels if isinstance(label, str) and label]
+        if not wanted:
+            return {}
+        marks = ",".join("?" for _ in wanted)
+        rows = self._conn.execute(
+            "SELECT label, MIN(ts) AS first_ts FROM process_samples "
+            f"WHERE label IN ({marks}) GROUP BY label",
+            tuple(wanted),
+        ).fetchall()
+        return {
+            row["label"]: float(row["first_ts"])
+            for row in rows
+            if row["first_ts"] is not None
+        }
 
     def _shown_locked(self, now: float) -> tuple[list, dict]:
         """All run views with child chats folded away and launch echoes dropped. Caller holds the lock."""
@@ -1576,7 +1848,8 @@ class Store:
               rss_kb INTEGER,
               elapsed_s REAL,
               label TEXT,
-              run_id TEXT
+              run_id TEXT,
+              model TEXT
             );
             CREATE TABLE IF NOT EXISTS sessions (
               session_id TEXT PRIMARY KEY,
@@ -1618,6 +1891,8 @@ class Store:
             CREATE INDEX IF NOT EXISTS idx_runs_ended ON runs(ended_at);
             CREATE INDEX IF NOT EXISTS idx_runs_ws ON runs(workstream);
             CREATE INDEX IF NOT EXISTS idx_runs_pid ON runs(pid);
+            CREATE INDEX IF NOT EXISTS idx_runs_source ON runs(source);
+            CREATE INDEX IF NOT EXISTS idx_runs_label ON runs(label);
             CREATE INDEX IF NOT EXISTS idx_usage_run ON usage_events(run_id);
             CREATE INDEX IF NOT EXISTS idx_usage_ts ON usage_events(ts);
             CREATE INDEX IF NOT EXISTS idx_samples_ts ON process_samples(ts);
@@ -1649,6 +1924,9 @@ class Store:
         for name in ("cache_write_5m", "cache_write_1h"):
             if name not in cols:
                 self._conn.execute(f"ALTER TABLE usage_events ADD COLUMN {name} INTEGER")
+        sample_cols = {row[1] for row in self._conn.execute("PRAGMA table_info(process_samples)")}
+        if "model" not in sample_cols:
+            self._conn.execute("ALTER TABLE process_samples ADD COLUMN model TEXT")
 
     def usage_model_stats(self) -> list[dict]:
         with self._lock:
@@ -1991,6 +2269,110 @@ def _same(existing: dict, merged: dict, cols) -> bool:
     return True
 
 
+def _epoch(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
+
+
+def _duplicate_run_mismatches(runs: list) -> list:
+    """One mismatch per launcher-manifest row with an unmerged twin.
+
+    Two rows with the same label overlapping in time from the same source
+    are one run recorded twice: the manifest row the launcher wrote plus
+    the worker's own row. The merge (``merge_grok_manifests``) folds them;
+    whatever it leaves behind is reported here so it gets fixed instead of
+    double-counted. Non-manifest siblings that share a label (a relaunch,
+    a probe, workflow children) are legitimate and never flagged: only a
+    surviving manifest row with a same-source, same-label, overlapping
+    non-manifest twin that is not shadow-linked to it is a mismatch.
+    """
+    by_key: dict = {}
+    for row in runs:
+        label = row.get("label")
+        source = row.get("source")
+        if not label or not source:
+            continue
+        by_key.setdefault((source, label), []).append(row)
+    found = []
+    for rows in by_key.values():
+        manifests = [row for row in rows if _is_manifest_twin(row)]
+        if not manifests:
+            continue
+        others = [row for row in rows if not _is_manifest_twin(row)]
+        if not others:
+            continue
+        for manifest in manifests:
+            for twin in others:
+                if twin.get("run_id") == manifest.get("run_id"):
+                    continue
+                if twin.get("parent_session_id") == manifest.get("run_id"):
+                    continue
+                if manifest.get("parent_session_id") == twin.get("run_id"):
+                    continue
+                if _overlap(manifest, twin):
+                    found.append(
+                        "duplicate run: %s overlaps %s (same label %r)"
+                        % (manifest.get("run_id"), twin.get("run_id"), manifest.get("label"))
+                    )
+                    break
+    return found
+
+
+def _overlap(first: dict, second: dict) -> bool:
+    start = _epoch(first.get("started_at"))
+    end = _epoch(first.get("ended_at"))
+    other_start = _epoch(second.get("started_at"))
+    other_end = _epoch(second.get("ended_at"))
+    low = float("-inf") if start is None else start
+    high = float("inf") if end is None else end
+    other_low = float("-inf") if other_start is None else other_start
+    other_high = float("inf") if other_end is None else other_end
+    return low <= other_high and other_low <= high
+
+
+def _is_manifest_twin(row: dict) -> bool:
+    """A launcher-manifest grok row (``grok:<id>:cursor/<label>``).
+
+    Chat run ids are ``grok:<chat-uuid>:<label>`` and labels never produce
+    a ``:cursor/`` segment, so the marker names manifest rows exactly.
+    """
+    run_id = row.get("run_id")
+    return (
+        isinstance(run_id, str)
+        and ":cursor/" in run_id
+        and row.get("clock_source") == "manifest"
+    )
+
+
+def _nearest_twin(manifest: dict, twins: list, window_s: float):
+    """Closest non-manifest twin by start time within ``window_s``.
+
+    Both starts must be known. Shadow links (one row's parent pointing at
+    the other run) are not twins.
+    """
+    base = _epoch(manifest.get("started_at"))
+    if base is None or not manifest.get("label"):
+        return None
+    best = None
+    best_delta = None
+    for twin in twins:
+        if twin.get("run_id") == manifest.get("run_id"):
+            continue
+        if twin.get("parent_session_id") == manifest.get("run_id"):
+            continue
+        if manifest.get("parent_session_id") == twin.get("run_id"):
+            continue
+        start = _epoch(twin.get("started_at"))
+        if start is None:
+            continue
+        delta = abs(start - base)
+        if delta <= window_s and (best is None or delta < best_delta):
+            best = twin
+            best_delta = delta
+    return best
+
+
 def _zeros() -> dict:
     return {key: 0 for key in TOKEN_FIELDS}
 
@@ -2314,39 +2696,26 @@ def _annotate_lanes(views: list, live_open: set) -> list:
     return views
 
 
-def _unseen_workers(shown_all: list, processes) -> list:
-    """``unseen worker`` mismatches: live worker, no running worker row.
+def _unseen_source(proc: dict) -> str | None:
+    """Worker source for a live-worker row, for the grace interval.
 
-    A live worker process (``[label:]``, a muse prompt-file label, or a
-    ``run_worker.py`` argv label) with no ``running``/``queued`` worker
-    row (``muse``/``glm``/``grok``) on that label is invisible on the
-    dashboard: one mismatch per label. Only the label is reported; argv
-    beyond it is never stored or printed.
+    Inverts the process listing's comm map; an unknown comm (a
+    ``run_worker.py`` launcher, a bare ``[label:]`` token) takes the
+    default interval. Every worker source polls at 2 s today, so this is
+    4 s either way; the lookup keeps it honest if one diverges.
     """
-    have = set()
-    for run in shown_all:
-        if (
-            run.get("status") in ("running", "queued")
-            and run.get("source") in WORKER_SOURCES
-            and run.get("label")
-        ):
-            have.add(run["label"])
-    pending: dict = {}
-    for proc in processes or []:
-        if not isinstance(proc, dict):
+    try:
+        from dash.sources.process import SOURCE_COMMS
+    except Exception:
+        SOURCE_COMMS = {}
+    comm = proc.get("comm") if isinstance(proc, dict) else None
+    for source, comms in (SOURCE_COMMS or {}).items():
+        try:
+            if comm in comms:
+                return source
+        except TypeError:
             continue
-        label = proc.get("label")
-        if not label or label in have or label in pending:
-            continue
-        pending[label] = proc
-    out = []
-    for label in sorted(pending):
-        proc = pending[label]
-        comm = proc.get("comm") or "worker"
-        pid = proc.get("pid")
-        detail = f"{comm} pid {pid}" if pid is not None else str(comm)
-        out.append(f"unseen worker: {label} ({detail})")
-    return out
+    return None
 
 
 def muse_orphan_pairs(runs: list) -> list:

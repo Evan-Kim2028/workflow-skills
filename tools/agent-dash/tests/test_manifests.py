@@ -75,6 +75,19 @@ class ManifestUnitTests(unittest.TestCase):
         self.assertEqual(rows[1]["model"], "glm-5.3")
         self.assertEqual(rows[1]["session_uuid"], "22222222-2222-2222-2222-222222222222")
 
+    def test_cursor_model_column_parses(self):
+        text = "\n".join(
+            [
+                "ws8-WS8.1-budget\t-\t1792243358\tgrok-4.7-high",
+                "ws8-WS8.21-reserve\t-\t1792243361",
+            ]
+        )
+        rows = manifests.parse_manifest_text(text)
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]["model"], "grok-4.7-high")
+        self.assertIsNone(rows[0]["session_uuid"])
+        self.assertIsNone(rows[1]["model"])
+
     def test_verdict_regex(self):
         self.assertEqual(manifests.verdict_of("PASS\n"), "PASS")
         self.assertEqual(manifests.verdict_of("PASS. more text\n"), "PASS")
@@ -208,6 +221,10 @@ class ManifestPollTests(unittest.TestCase):
     def _cfg(self, **extra):
         cfg = {
             "scratch_root": self.root,
+            # Isolate from the machine's registered run folders: without this,
+            # scan_roots picks up live run-dirs.txt entries and leaks foreign
+            # rows (and read budget) into these hermetic tests.
+            "state_dir": os.path.join(self.root, "state"),
             "dir_scan_s": 0,
             "live_window_s": 36 * 3600,
             "read_budgets": {"per_file": 1024 * 1024, "per_tick": 1024 * 1024},

@@ -1889,6 +1889,81 @@ class LaneAndUnseenTest(unittest.TestCase):
         ghost = [item for item in report["mismatches"] if "ws9-WS9.9-ghost" in item]
         self.assertEqual(len(ghost), 1)
 
+    def test_unseen_worker_grace_for_young_process(self):
+        now = time.time()
+        self._lane(now)
+        young = [
+            {
+                "pid": 4245,
+                "comm": "cursor-agent",
+                "started_at": now - 1,
+                "label": "ws9-WS9.9-new",
+                "prompt_label": None,
+                "session_id": None,
+            }
+        ]
+        report = self.store.reconcile_numbers(now, None, None, processes=young)
+        self.assertNotIn("unseen worker", "\n".join(report["mismatches"]))
+        # No age and no sighting: still a mismatch, as before.
+        ageless = [dict(young[0], started_at=None)]
+        report = self.store.reconcile_numbers(now, None, None, processes=ageless)
+        self.assertIn(
+            "unseen worker: ws9-WS9.9-new (cursor-agent pid 4245)",
+            report["mismatches"],
+        )
+
+    def test_unseen_worker_grace_for_first_sighting(self):
+        now = time.time()
+        self._lane(now)
+        label = "ws9-WS9.9-ramp"
+        # A 13-second-old worker this dashboard only just sampled (ramp-up)
+        # is not yet a mismatch.
+        self.store.add_process_sample(
+            {
+                "ts": now - 1,
+                "pid": 4250,
+                "comm": "cursor-agent",
+                "rss_kb": 1024,
+                "elapsed_s": 13.0,
+                "label": label,
+                "run_id": None,
+                "model": None,
+            }
+        )
+        ramp = [
+            {
+                "pid": 4250,
+                "comm": "cursor-agent",
+                "started_at": now - 13,
+                "label": label,
+                "prompt_label": None,
+                "session_id": None,
+            }
+        ]
+        report = self.store.reconcile_numbers(now, None, None, processes=ramp)
+        self.assertNotIn("unseen worker", "\n".join(report["mismatches"]))
+        # Sampled long ago and still no row: a real mismatch.
+        old = "ws9-WS9.9-stale"
+        for ts in (now - 60, now - 30):
+            self.store.add_process_sample(
+                {
+                    "ts": ts,
+                    "pid": 4251,
+                    "comm": "cursor-agent",
+                    "rss_kb": 1024,
+                    "elapsed_s": 60.0,
+                    "label": old,
+                    "run_id": None,
+                    "model": None,
+                }
+            )
+        stale = [dict(ramp[0], pid=4251, started_at=now - 60, label=old)]
+        report = self.store.reconcile_numbers(now, None, None, processes=stale)
+        self.assertIn(
+            "unseen worker: ws9-WS9.9-stale (cursor-agent pid 4251)",
+            report["mismatches"],
+        )
+
     def test_ended_at_is_last_seen_alive_not_start(self):
         now = 1_792_000_000.0
         self.store.upsert_run(
@@ -1918,6 +1993,417 @@ class LaneAndUnseenTest(unittest.TestCase):
         row = self.store.get_run("glm:sid9:ws9-WS9.2-plan")
         self.assertEqual(row["status"], "done")
         self.assertEqual(row["ended_at"], 1_792_000_400.0)
+class GracePeriodTest(unittest.TestCase):
+    """A dead-pid row within two poll intervals of its source is not stale."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.store = memory(Path(self.tmp.name))
+        self.now = time.time()
+
+    def tearDown(self):
+        self.store.close()
+        self.tmp.cleanup()
+
+    def dead_row(self, run_id, started_ago, usage_ago=None):
+        self.store.upsert_run(
+            {
+                "run_id": run_id,
+                "source": "muse",
+                "tier": "muse",
+                "label": "ws9-grace",
+                "session_id": "grace-session",
+                "status": "running",
+                "pid": 999999,
+                "started_at": self.now - started_ago,
+            }
+        )
+        if usage_ago is not None:
+            self.store.add_usage(
+                {
+                    "ts": self.now - usage_ago,
+                    "session_id": "grace-session",
+                    "run_id": run_id,
+                    "model": "muse-spark-1.3-contributor",
+                    "tool": "muse",
+                    "message_id": "m1",
+                    "input": 10,
+                    "output": 5,
+                    "cache_read": 0,
+                    "cache_write": 0,
+                    "reasoning": 0,
+                }
+            )
+
+    def test_fresh_dead_pid_is_not_stale(self):
+        self.dead_row("muse:grace:fresh", 2)
+        stale = self.store.stale_running(self.now, pid_alive_fn=lambda pid: False)
+        self.assertEqual(stale, [])
+        snap = self.store.snapshot(self.now, "all")
+        self.assertEqual([run["run_id"] for run in snap["running"]], ["muse:grace:fresh"])
+        report = self.store.reconcile_numbers(self.now, self.now - 3600, self.now)
+        self.assertFalse(any("muse:grace:fresh" in item for item in report["mismatches"]))
+
+    def test_recent_usage_is_not_stale(self):
+        self.dead_row("muse:grace:usage", 100, usage_ago=1)
+        stale = self.store.stale_running(self.now, pid_alive_fn=lambda pid: False)
+        self.assertEqual(stale, [])
+
+    def test_old_dead_pid_still_fails(self):
+        self.dead_row("muse:grace:old", 10)
+        stale = self.store.stale_running(self.now, pid_alive_fn=lambda pid: False)
+        self.assertEqual([run["run_id"] for run, _reason in stale], ["muse:grace:old"])
+        self.assertIn("dead pid", stale[0][1])
+        report = self.store.reconcile_numbers(self.now, self.now - 3600, self.now)
+        self.assertTrue(any("muse:grace:old" in item for item in report["mismatches"]))
+
+
+class BackfillGrokModelsTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.store = memory(Path(self.tmp.name))
+        self.now = time.time()
+
+    def tearDown(self):
+        self.store.close()
+        self.tmp.cleanup()
+
+    def add_run(self, run_id, model=None):
+        row = {
+            "run_id": run_id,
+            "source": "grok",
+            "tier": "grok",
+            "label": "ws6-backfill",
+            "session_id": "chat",
+            "status": "done",
+            "started_at": self.now - 100,
+            "ended_at": self.now - 50,
+        }
+        if model is not None:
+            row["model"] = model
+        self.store.upsert_run(row)
+
+    def add_usage(self, run_id, model, ago, message="m1"):
+        self.store.add_usage(
+            {
+                "ts": self.now - ago,
+                "session_id": "chat",
+                "run_id": run_id,
+                "model": model,
+                "tool": "cursor",
+                "message_id": message,
+                "input": 10,
+                "output": 5,
+                "cache_read": 0,
+                "cache_write": 0,
+                "reasoning": 0,
+            }
+        )
+
+    def test_latest_usage_model_fills_null(self):
+        self.add_run("grok:chat:ws6-backfill")
+        self.add_usage("grok:chat:ws6-backfill", "grok-old", 90, "m1")
+        self.add_usage("grok:chat:ws6-backfill", "grok-4.7-high", 80, "m2")
+        self.assertEqual(self.store.backfill_grok_models(self.now), 1)
+        self.assertEqual(self.store.get_run("grok:chat:ws6-backfill")["model"], "grok-4.7-high")
+
+    def test_no_usage_stays_null(self):
+        self.add_run("grok:chat:ws6-backfill")
+        self.assertEqual(self.store.backfill_grok_models(self.now), 0)
+        self.assertIsNone(self.store.get_run("grok:chat:ws6-backfill")["model"])
+
+    def test_known_model_is_untouched(self):
+        self.add_run("grok:chat:ws6-backfill", model="composer-2.5")
+        self.add_usage("grok:chat:ws6-backfill", "grok-4.7-high", 80)
+        self.assertEqual(self.store.backfill_grok_models(self.now), 0)
+        self.assertEqual(self.store.get_run("grok:chat:ws6-backfill")["model"], "composer-2.5")
+
+    def test_backfill_is_throttled(self):
+        self.add_run("grok:chat:ws6-backfill")
+        self.add_usage("grok:chat:ws6-backfill", "grok-4.7-high", 80)
+        self.assertEqual(self.store.backfill_grok_models(self.now), 1)
+        self.add_run("grok:other:ws6-backfill")
+        self.add_usage("grok:other:ws6-backfill", "grok-4.7-high", 80)
+        self.assertEqual(self.store.backfill_grok_models(self.now), 0)
+
+
+class MergeGrokManifestsTest(unittest.TestCase):
+    LABEL = "ws6-c11-coverage"
+    CHAT_UUID = "c11c11c1-1c11-4c11-8c11-c11c11c11c11"
+    PAD_UUID = "d22d22d2-2d22-4d22-8d22-d22d22d22d22"
+    CHAT = "grok:%s:ws6-c11-coverage" % CHAT_UUID
+    MANIFEST = "grok:%s:cursor/ws6-c11-coverage@1792246363" % PAD_UUID
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.store = memory(Path(self.tmp.name))
+        self.now = 1792246400.0
+
+    def tearDown(self):
+        self.store.close()
+        self.tmp.cleanup()
+
+    def add_pair(self, chat_model="composer-2.5", manifest_model=None, chat_out="/tmp/t.jsonl"):
+        self.store.upsert_run(
+            {
+                "run_id": self.CHAT,
+                "source": "grok",
+                "tier": "grok",
+                "label": self.LABEL,
+                "session_id": self.CHAT_UUID,
+                "status": "done",
+                "model": chat_model,
+                "started_at": 1792246364.332,
+                "ended_at": 1792246390.0,
+                "clock_source": "transcript",
+                "out_path": chat_out,
+            }
+        )
+        row = {
+            "run_id": self.MANIFEST,
+            "source": "grok",
+            "tier": "grok",
+            "label": self.LABEL,
+            "session_id": self.PAD_UUID,
+            "status": "unknown",
+            "started_at": 1792246363.0,
+            "clock_source": "manifest",
+            "verdict": "PASS",
+            "out_path": "/tmp/cursor/out-ws6-c11-coverage.md",
+        }
+        if manifest_model is not None:
+            row["model"] = manifest_model
+        self.store.upsert_run(row)
+
+    def test_manifest_folds_into_chat(self):
+        self.add_pair()
+        self.store.add_usage(
+            {
+                "ts": 1792246370.0,
+                "session_id": self.PAD_UUID,
+                "run_id": self.MANIFEST,
+                "model": "composer-2.5",
+                "tool": "cursor",
+                "message_id": "m1",
+                "input": 10,
+                "output": 5,
+                "cache_read": 0,
+                "cache_write": 0,
+                "reasoning": 0,
+            }
+        )
+        self.assertEqual(self.store.merge_grok_manifests(), 1)
+        self.assertIsNone(self.store.get_run(self.MANIFEST))
+        chat = self.store.get_run(self.CHAT)
+        self.assertEqual(chat["started_at"], 1792246363.0)
+        self.assertEqual(chat["clock_source"], "manifest")
+        self.assertEqual(chat["model"], "composer-2.5")
+        self.assertEqual(chat["verdict"], "PASS")
+        self.assertEqual(chat["out_path"], "/tmp/t.jsonl")
+        self.assertEqual(chat["status"], "done")
+        moved = self.store._conn.execute(
+            "SELECT run_id FROM usage_events WHERE message_id='m1'"
+        ).fetchone()
+        self.assertEqual(moved["run_id"], self.CHAT)
+
+    def test_manifest_out_path_fills_a_gap(self):
+        self.add_pair(chat_out=None)
+        self.assertEqual(self.store.merge_grok_manifests(), 1)
+        chat = self.store.get_run(self.CHAT)
+        self.assertEqual(chat["out_path"], "/tmp/cursor/out-ws6-c11-coverage.md")
+
+    def test_manifest_model_fills_a_gap(self):
+        self.add_pair(chat_model=None, manifest_model="grok-4.7-high")
+        self.assertEqual(self.store.merge_grok_manifests(), 1)
+        self.assertEqual(self.store.get_run(self.CHAT)["model"], "grok-4.7-high")
+
+    def test_row_without_twin_stays(self):
+        self.store.upsert_run(
+            {
+                "run_id": self.MANIFEST,
+                "source": "grok",
+                "tier": "grok",
+                "label": self.LABEL,
+                "status": "unknown",
+                "started_at": 1792246363.0,
+                "clock_source": "manifest",
+            }
+        )
+        self.assertEqual(self.store.merge_grok_manifests(), 0)
+        self.assertIsNotNone(self.store.get_run(self.MANIFEST))
+
+    def test_twin_outside_the_window_stays(self):
+        self.add_pair()
+        self.store.upsert_run({"run_id": self.CHAT, "started_at": 1792246364.332 + 3600})
+        self.assertEqual(self.store.merge_grok_manifests(), 0)
+        self.assertIsNotNone(self.store.get_run(self.MANIFEST))
+        report = self.store.reconcile_numbers(self.now, self.now - 3600, self.now)
+        self.assertTrue(
+            any("duplicate run" in item for item in report["mismatches"]),
+            report["mismatches"],
+        )
+
+
+class DuplicateMismatchTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.store = memory(Path(self.tmp.name))
+        self.now = 1792246400.0
+
+    def tearDown(self):
+        self.store.close()
+        self.tmp.cleanup()
+
+    def add(self, run_id, source, label, start, end, clock="transcript", parent=None):
+        row = {
+            "run_id": run_id,
+            "source": source,
+            "label": label,
+            "status": "done",
+            "started_at": start,
+            "ended_at": end,
+            "clock_source": clock,
+        }
+        if parent is not None:
+            row["parent_session_id"] = parent
+        self.store.upsert_run(row)
+
+    def duplicates(self):
+        report = self.store.reconcile_numbers(self.now, self.now - 3600, self.now)
+        return [item for item in report["mismatches"] if "duplicate run" in item]
+
+    def test_merged_pair_is_silent(self):
+        self.add("grok:chat:ws6-dup", "grok", "ws6-dup", 1792000000.0, 1792000100.0)
+        self.add(
+            "grok:parent:cursor/ws6-dup@1792000001",
+            "grok",
+            "ws6-dup",
+            1792000001.0,
+            1792000100.0,
+            clock="manifest",
+        )
+        self.assertEqual(self.store.merge_grok_manifests(), 1)
+        self.assertEqual(self.duplicates(), [])
+
+    def test_two_chat_rows_are_not_a_duplicate(self):
+        self.add("grok:aaa:ws6-probe", "grok", "ws6-probe", 1792000000.0, 1792000900.0)
+        self.add("grok:bbb:ws6-probe", "grok", "ws6-probe", 1792000500.0, 1792000600.0)
+        self.assertEqual(self.duplicates(), [])
+
+    def test_non_overlapping_twins_are_silent(self):
+        self.add("grok:chat:ws6-seq", "grok", "ws6-seq", 1792000000.0, 1792000100.0)
+        self.add(
+            "grok:parent:cursor/ws6-seq@1792005000",
+            "grok",
+            "ws6-seq",
+            1792005000.0,
+            1792005100.0,
+            clock="manifest",
+        )
+        self.assertEqual(self.duplicates(), [])
+
+    def test_shadow_link_is_silent(self):
+        self.add("grok:chat:ws6-shadow", "grok", "ws6-shadow", 1792000000.0, 1792000100.0)
+        self.add(
+            "grok:parent:cursor/ws6-shadow@1792000001",
+            "grok",
+            "ws6-shadow",
+            1792000001.0,
+            1792000100.0,
+            clock="manifest",
+            parent="grok:chat:ws6-shadow",
+        )
+        self.assertEqual(self.duplicates(), [])
+
+
+class MatchRunNewestTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.store = memory(Path(self.tmp.name))
+        self.now = time.time()
+
+    def tearDown(self):
+        self.store.close()
+        self.tmp.cleanup()
+
+    def test_label_match_returns_the_newest(self):
+        self.store.upsert_run(
+            {
+                "run_id": "muse:old:ws1-x",
+                "source": "muse",
+                "label": "ws1-x",
+                "status": "running",
+                "started_at": self.now - 100,
+            }
+        )
+        self.store.upsert_run(
+            {
+                "run_id": "muse:new:ws1-x",
+                "source": "muse",
+                "label": "ws1-x",
+                "status": "running",
+                "started_at": self.now - 10,
+            }
+        )
+        self.assertEqual(self.store.match_run(None, "ws1-x"), "muse:new:ws1-x")
+
+    def test_single_match_still_works(self):
+        self.store.upsert_run(
+            {
+                "run_id": "muse:only:ws1-y",
+                "source": "muse",
+                "label": "ws1-y",
+                "status": "running",
+                "started_at": self.now - 10,
+            }
+        )
+        self.assertEqual(self.store.match_run(None, "ws1-y"), "muse:only:ws1-y")
+        self.assertIsNone(self.store.match_run(None, "ws1-missing"))
+
+
+class NewerOpenLabelRowTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.store = memory(Path(self.tmp.name))
+        self.now = time.time()
+
+    def tearDown(self):
+        self.store.close()
+        self.tmp.cleanup()
+
+    def add(self, run_id, status, started, ended=None):
+        row = {
+            "run_id": run_id,
+            "source": "muse",
+            "label": "ws1-z",
+            "status": status,
+            "started_at": started,
+        }
+        if ended is not None:
+            row["ended_at"] = ended
+        self.store.upsert_run(row)
+
+    def test_newer_running_twin_found(self):
+        self.add("muse:old:ws1-z", "running", self.now - 100)
+        self.add("muse:new:ws1-z", "running", self.now - 10)
+        twin = self.store.newer_open_label_row("ws1-z", "muse", self.now - 100, "muse:old:ws1-z")
+        self.assertEqual(twin["run_id"], "muse:new:ws1-z")
+        self.assertIsNone(
+            self.store.newer_open_label_row("ws1-z", "muse", self.now - 10, "muse:new:ws1-z")
+        )
+
+    def test_closed_twin_is_ignored(self):
+        self.add("muse:old:ws1-z", "done", self.now - 100, self.now - 90)
+        self.add("muse:new:ws1-z", "done", self.now - 10, self.now - 5)
+        self.assertIsNone(
+            self.store.newer_open_label_row("ws1-z", "muse", self.now - 100, "muse:old:ws1-z")
+        )
+
+    def test_unknown_open_twin_counts(self):
+        self.add("muse:old:ws1-z", "running", self.now - 100)
+        self.add("muse:new:ws1-z", "unknown", self.now - 10)
+        twin = self.store.newer_open_label_row("ws1-z", "muse", self.now - 100, "muse:old:ws1-z")
+        self.assertEqual(twin["run_id"], "muse:new:ws1-z")
 
 
 if __name__ == "__main__":

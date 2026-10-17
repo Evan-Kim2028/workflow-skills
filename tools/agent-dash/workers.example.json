@@ -23,7 +23,7 @@
       "cap": 25,
       "pgrep": "[c]ursor-agent",
       "manifest": "cursor-sessions.tsv",
-      "columns": ["label", "session_id", "epoch"],
+      "columns": ["label", "session_id", "epoch", "model"],
       "quota_patterns": ["rate limit", "quota", "429", "usage limit"],
       "cost_rank": 4
     },

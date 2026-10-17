@@ -115,8 +115,13 @@ def write_manifest(scratch, rows, session=None):
     os.makedirs(pad, exist_ok=True)
     path = os.path.join(pad, "cursor-sessions.tsv")
     with open(path, "w", encoding="utf-8") as fh:
-        for label, epoch in rows:
-            fh.write("%s\t-\t%s\n" % (label, epoch))
+        for entry in rows:
+            label, epoch = entry[0], entry[1]
+            model = entry[2] if len(entry) > 2 else None
+            if model:
+                fh.write("%s\t-\t%s\t%s\n" % (label, epoch, model))
+            else:
+                fh.write("%s\t-\t%s\n" % (label, epoch))
     return path
 
 
@@ -238,6 +243,8 @@ class CursorTests(unittest.TestCase):
         os.makedirs(self.scratch)
         self._live = mod.live_label_pids
         mod.live_label_pids = lambda: {}
+        self._models = mod.live_label_models
+        mod.live_label_models = lambda: {}
         mod._LABEL_CACHE.clear()
         mod._TRANSCRIPTS.clear()
         mod._MODEL_COUNTS.clear()
@@ -245,6 +252,7 @@ class CursorTests(unittest.TestCase):
 
     def tearDown(self):
         mod.live_label_pids = self._live
+        mod.live_label_models = self._models
         self.tmp.cleanup()
 
     def cfg(self, **extra):
@@ -737,6 +745,56 @@ class CursorTests(unittest.TestCase):
 
         names = [source.NAME for source in discover()]
         self.assertIn("cursor", names)
+
+    def test_manifest_model_column_parses(self):
+        rows = mod._parse_manifest("alpha\t-\t1700000001\tgrok-4.7-high\nbeta\t-\t1700000002\n")
+        self.assertEqual(rows[0]["model"], "grok-4.7-high")
+        self.assertIsNone(rows[1]["model"])
+
+    def test_manifest_model_fills_run_without_usage(self):
+        created = int((NOW - 100) * 1000)
+        user_blob = (blob_id("44"), b'{"role":"user","text":"hi"}')
+        add_chat(self.home, A, "/work/alpha", created, created, "alpha", [user_blob])
+        write_manifest(self.scratch, [("alpha", NOW - 100, "grok-4.7-manifest")])
+        store = Mem()
+        mod.poll(store, self.cfg(), NOW)
+        run = store.runs["grok:%s:alpha" % A]
+        self.assertEqual(run["model"], "grok-4.7-manifest")
+
+    def test_usage_model_beats_manifest_model(self):
+        created = int((NOW - 4000) * 1000)
+        user_blob = (blob_id("44"), b'{"role":"user","text":"hi"}')
+        add_chat(self.home, A, "/work/alpha", created, created, "alpha", [user_blob])
+        write_manifest(self.scratch, [("alpha", NOW - 4000, "grok-4.7-manifest")])
+        log = os.path.join(self.tmp.name, "cursor-usage.jsonl")
+        with open(log, "w", encoding="utf-8") as fh:
+            fh.write(
+                json.dumps(
+                    {"chat_id": A, "model": "grok-4.7-hook", "input_tokens": 5, "output_tokens": 1}
+                )
+                + "\n"
+            )
+        store = Mem()
+        mod.poll(store, self.cfg(cursor_usage=log), NOW)
+        run = store.runs["grok:%s:alpha" % A]
+        self.assertEqual(run["model"], "grok-4.7-hook")
+
+    def test_live_model_fills_unknown(self):
+        store = Mem()
+        mod._upsert(store, {"uuid": A, "label": "alpha", "live_model": "m-live"}, NOW, None)
+        self.assertEqual(store.runs["grok:%s:alpha" % A]["model"], "m-live")
+
+    def test_manifest_model_beats_live_model(self):
+        store = Mem()
+        chat = {"uuid": A, "label": "alpha", "manifest_model": "m-man", "live_model": "m-live"}
+        mod._upsert(store, chat, NOW, None)
+        self.assertEqual(store.runs["grok:%s:alpha" % A]["model"], "m-man")
+
+    def test_hook_model_beats_manifest_and_live(self):
+        store = Mem()
+        chat = {"uuid": A, "label": "alpha", "manifest_model": "m-man", "live_model": "m-live"}
+        mod._upsert(store, chat, NOW, "m-hook")
+        self.assertEqual(store.runs["grok:%s:alpha" % A]["model"], "m-hook")
 
 
 class SmokeTests(unittest.TestCase):

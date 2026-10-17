@@ -90,7 +90,7 @@ A JSON object merges key by key. A list or a string replaces that key. Setting `
 
 `AGENT_DASH_CONFIG` points at one JSON file. That file merges onto the code defaults. The example and `config.local.json` are not read. Environment variables still apply afterward. Map, plans, and task map are unchanged by this variable. They have their own path variables.
 
-Restart the dashboard after a config change. `run` while a pid is live will not reload. `stop`, then `run`. Task status, `plan.json`, and the task map are read per request and do not need a restart.
+Restart the dashboard after a config change: `python3 agent_dash.py restart`. `run` while a pid is live will not reload. Task status, `plan.json`, and the task map are read per request and do not need a restart.
 
 State files in the state directory:
 
@@ -149,7 +149,7 @@ From `~/.claude/tools/agent-dash`, or with that path on the command:
 
 ```bash
 python3 agent_dash.py run
-python3 agent_dash.py stop
+python3 agent_dash.py restart
 python3 agent_dash.py status
 python3 agent_dash.py backfill --session <id>
 python3 agent_dash.py reprice

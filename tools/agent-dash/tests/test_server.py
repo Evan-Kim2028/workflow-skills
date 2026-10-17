@@ -14,6 +14,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+import agent_dash
 from agent_dash import default_cfg, is_dash, load_cfg, main, reconcile_if_due, run_backfill
 from dash.plans import PlanNotFound, load as load_plan, mapping as plan_mapping
 from dash.server import DashServer, PLACEHOLDER
@@ -498,6 +499,102 @@ class ReconcileEndpointTest(unittest.TestCase):
             server.shutdown()
             thread.join(3)
             server.server_close()
+
+
+def free_port():
+    import socket
+
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
+    sock.close()
+    return port
+
+
+class StopRestartTest(unittest.TestCase):
+    """`stop` waits for the exit and the free port; `restart` is stop then
+    run plus a health wait. Never touches the live :8765 port."""
+
+    def setUp(self):
+        import subprocess
+
+        self.subprocess = subprocess
+        self.tmp = tempfile.TemporaryDirectory()
+        self.keep_state = os.environ.get("AGENT_DASH_STATE_DIR")
+        os.environ["AGENT_DASH_STATE_DIR"] = self.tmp.name
+        self.keep = (
+            agent_dash.STATE_DIR,
+            agent_dash.PIDFILE,
+            agent_dash.LOGFILE,
+            agent_dash.DBFILE,
+            agent_dash.PORT,
+            agent_dash.is_dash,
+        )
+        agent_dash.PORT = free_port()
+        self.addCleanup(self.restore)
+        self.procs = []
+
+    def restore(self):
+        for proc in self.procs:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+        (
+            agent_dash.STATE_DIR,
+            agent_dash.PIDFILE,
+            agent_dash.LOGFILE,
+            agent_dash.DBFILE,
+            agent_dash.PORT,
+            agent_dash.is_dash,
+        ) = self.keep
+        if self.keep_state is None:
+            os.environ.pop("AGENT_DASH_STATE_DIR", None)
+        else:
+            os.environ["AGENT_DASH_STATE_DIR"] = self.keep_state
+        self.tmp.cleanup()
+
+    def sleeper(self):
+        proc = self.subprocess.Popen(
+            ["bash", "-c", "exec -a agent_dash.py sleep 30"],
+            stdin=self.subprocess.DEVNULL,
+            stdout=self.subprocess.DEVNULL,
+            stderr=self.subprocess.DEVNULL,
+        )
+        self.procs.append(proc)
+        return proc
+
+    def test_stop_waits_for_exit(self):
+        proc = self.sleeper()
+        self.assertTrue(is_dash(proc.pid))
+        agent_dash.bind_state()
+        agent_dash.PIDFILE.write_text(str(proc.pid) + "\n", encoding="utf-8")
+        self.assertEqual(main(["stop"]), 0)
+        with self.assertRaises(ProcessLookupError):
+            os.kill(proc.pid, 0)
+        self.assertFalse(agent_dash.PIDFILE.exists())
+
+    def test_stop_returns_1_while_the_port_is_bound(self):
+        import socket
+
+        blocker = socket.socket()
+        blocker.bind(("127.0.0.1", agent_dash.PORT))
+        blocker.listen(1)
+        try:
+            proc = self.sleeper()
+            agent_dash.bind_state()
+            agent_dash.PIDFILE.write_text(str(proc.pid) + "\n", encoding="utf-8")
+            self.assertEqual(main(["stop"]), 1)
+            self.assertFalse(agent_dash.PIDFILE.exists())
+        finally:
+            blocker.close()
+
+    def test_restart_starts_and_passes_health(self):
+        agent_dash.is_dash = lambda pid: True
+        self.assertEqual(main(["restart"]), 0)
+        self.assertTrue(agent_dash._health_ok())
+        self.assertEqual(main(["stop"]), 0)
+        self.assertTrue(agent_dash._port_free())
 
 
 class SnapshotUsageEndpointTest(unittest.TestCase):

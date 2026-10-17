@@ -38,6 +38,7 @@ USAGE = """agent-dash: local read-only execution dashboard
 
   python3 agent_dash.py run
   python3 agent_dash.py stop
+  python3 agent_dash.py restart
   python3 agent_dash.py status
   python3 agent_dash.py backfill --session <id>
   python3 agent_dash.py reprice
@@ -198,6 +199,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_run()
     if cmd == "stop":
         return cmd_stop()
+    if cmd == "restart":
+        return cmd_restart()
     if cmd == "status":
         return cmd_status()
     if cmd == "ws":
@@ -249,21 +252,115 @@ def cmd_run() -> int:
 
 
 def cmd_stop() -> int:
+    """Stop the dashboard and return 0 only once it is really down.
+
+    SIGTERM first, then up to 10 s of polling for the exit. A process
+    that is still alive after that gets SIGKILL, but only when it is still
+    the pidfile pid and still the dashboard (a reused pid is never
+    signaled). The pidfile is removed and 0 is returned only once the
+    port is free, so an immediate ``run`` can bind.
+    """
     bind_state()
     pid = read_pid()
-    if not pid or not pid_exists(pid) or not is_dash(pid):
+    if not pid or _gone(pid) or not is_dash(pid):
         PIDFILE.unlink(missing_ok=True)
         print("stopped")
         return 1
-    os.kill(pid, signal.SIGTERM)
-    for _ in range(30):
-        if not pid_exists(pid):
-            PIDFILE.unlink(missing_ok=True)
-            print("stopped")
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except OSError:
+        pass
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        if _gone(pid):
+            break
+        time.sleep(0.2)
+    if not _gone(pid) and is_dash(pid):
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+        deadline = time.time() + 2
+        while time.time() < deadline:
+            if _gone(pid):
+                break
+            time.sleep(0.1)
+    if not _gone(pid) and is_dash(pid):
+        print("stop signal sent; process still running")
+        return 1
+    PIDFILE.unlink(missing_ok=True)
+    if not _port_free():
+        print("stopped (port still bound)")
+        return 1
+    print("stopped")
+    return 0
+
+
+def _gone(pid: int) -> bool:
+    """True when the pid has exited, reaping our own child first.
+
+    An exited child that has not been waited on still answers ``kill``
+    (a zombie); ``waitpid`` with ``WNOHANG`` reaps it so the stop poll
+    sees the exit. Non-children fall through to the ``kill`` probe.
+    """
+    try:
+        if os.waitpid(pid, os.WNOHANG)[0] == pid:
+            return True
+    except (ChildProcessError, InterruptedError, OSError):
+        pass
+    return not pid_exists(pid)
+
+
+def _port_free() -> bool:
+    """True when nothing listens on the dashboard address anymore."""
+    import socket
+
+    sock = socket.socket()
+    sock.settimeout(1)
+    try:
+        sock.connect((HOST, PORT))
+    except OSError:
+        return True
+    finally:
+        sock.close()
+    return False
+
+
+def cmd_restart() -> int:
+    """Stop, then run again, and wait for /api/health to answer.
+
+    The restarted server backgrounds itself and writes the pidfile like
+    ``run`` does. Returns 0 only once health answers ``ok``.
+    """
+    cmd_stop()
+    if live_pid():
+        print("restart failed: old server still running", file=sys.stderr)
+        return 1
+    if cmd_run() != 0:
+        return 1
+    deadline = time.time() + 20
+    while time.time() < deadline:
+        if _health_ok():
+            print("restarted")
             return 0
-        time.sleep(0.1)
-    print("stop signal sent; process still running")
+        time.sleep(0.25)
+    print("restarted but health check failed", file=sys.stderr)
     return 1
+
+
+def _health_ok() -> bool:
+    """True when GET /api/health answers ``{"ok": true}``."""
+    import urllib.error
+    import urllib.request
+
+    try:
+        with urllib.request.urlopen(
+            f"http://{HOST}:{PORT}/api/health", timeout=5
+        ) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except (urllib.error.URLError, OSError, ValueError):
+        return False
+    return bool(payload.get("ok"))
 
 
 def cmd_status() -> int:

@@ -143,7 +143,9 @@ class RunWorkerTests(unittest.TestCase):
         self.assertTrue(launch.cmds[0][0].endswith("launch_grok.sh"))
         self.assertEqual(launch.cmds[0][4], registry()["workers"]["grok"]["model"])
         text = (self.run_dir / "cursor-sessions.tsv").read_text(encoding="utf-8").strip()
-        self.assertEqual(text, "lane-1\t-\t1700000000")
+        self.assertEqual(
+            text, "lane-1\t-\t1700000000\t%s" % registry()["workers"]["grok"]["model"]
+        )
 
     def test_auto_skips_a_worker_in_cooldown(self):
         self.counts = {}

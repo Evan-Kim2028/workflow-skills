@@ -19,7 +19,7 @@ New here? Read [Plug in any agent](../../tools/agent-dash/docs/integrate.md) fir
 cd tools/agent-dash
 python3 agent_dash.py run      # binds 127.0.0.1:8765
 python3 agent_dash.py status
-python3 agent_dash.py stop     # signals only the pid in the pidfile
+python3 agent_dash.py restart  # stop, then run; waits for /api/health
 python3 agent_dash.py backfill --session <session-uuid>
 ```
 

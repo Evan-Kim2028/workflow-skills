@@ -315,17 +315,20 @@ class GrokCliTests(unittest.TestCase):
 
     def test_missing_root(self):
         store = Store()
-        self.poll(
-            store,
-            {
-                "roots": {
-                    "grok_sessions": "/no/such/grok-sessions",
-                    "grok_log": "/no/such/unified.jsonl",
-                    "scratchpads": "/no/such/scratch",
-                }
-            },
-            1792154000,
-        )
+        with tempfile.TemporaryDirectory() as tmp:
+            self.poll(
+                store,
+                {
+                    "roots": {
+                        "grok_sessions": "/no/such/grok-sessions",
+                        "grok_log": "/no/such/unified.jsonl",
+                        "scratchpads": "/no/such/scratch",
+                    },
+                    # Isolate from the machine's registered run folders.
+                    "state_dir": os.path.join(tmp, "state"),
+                },
+                1792154000,
+            )
         self.assertEqual(store.runs, {})
 
     def test_encoded_cwd_root_attributes_glm_manifest(self):
