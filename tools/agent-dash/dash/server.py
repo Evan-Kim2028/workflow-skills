@@ -202,9 +202,14 @@ class Handler(BaseHTTPRequestHandler):
             if hours <= 0:
                 raise ValueError("bad hours")
             since = now - hours * 3600
-        self._json(
-            200, self.server.store.reconcile_numbers(now, since, until, processes=_live_workers())
-        )
+        body = self.server.store.reconcile_numbers(now, since, until, processes=_live_workers())
+        try:
+            stalled = self.server.registry.stalled_messages(now)
+        except Exception:
+            stalled = []
+        if stalled:
+            body["mismatches"] = list(body.get("mismatches", [])) + stalled
+        self._json(200, body)
 
     def _runs(self, query):
         now = time.time()
@@ -328,6 +333,10 @@ class Handler(BaseHTTPRequestHandler):
         while not self.server.stop.is_set():
             now = time.time()
             payload = self.server.store.snapshot_cached(now, "all")
+            try:
+                sources = self.server.registry.source_states(now)
+            except Exception:
+                sources = []
             data = {
                 "seq": payload["seq"],
                 "running": payload["running"],
@@ -335,6 +344,7 @@ class Handler(BaseHTTPRequestHandler):
                 "data_seq": payload.get("data_seq"),
                 "last_data_ts": payload.get("last_data_ts"),
                 "last_poll": _last_poll(self.server.registry),
+                "sources": sources,
             }
             blob = ("event: tick\ndata: " + json.dumps(data, separators=(",", ":"), allow_nan=False) + "\n\n").encode()
             try:

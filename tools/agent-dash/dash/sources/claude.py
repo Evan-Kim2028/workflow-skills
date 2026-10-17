@@ -39,6 +39,8 @@ FILE_BUDGET = 4 * 1024 * 1024
 TICK_BUDGET = 8 * 1024 * 1024
 LIVE_WINDOW_S = 36 * 3600
 DIR_SCAN_S = 15
+DIR_LIST_CAP = 500
+SETTLED_CAP = 100000
 RUNNING_MTIME_S = 15 * 60
 MAX_LABEL = 200
 META_MAX = 64 * 1024
@@ -82,6 +84,8 @@ _cwd: dict = {}
 _saw_bof: dict = {}
 _meta_cache: dict = {}
 _journal_seen: dict = {}
+_dir_cache: dict = {}
+_settled: dict = {}
 
 
 def reset_state() -> None:
@@ -104,6 +108,8 @@ def reset_state() -> None:
     _saw_bof.clear()
     _meta_cache.clear()
     _journal_seen.clear()
+    _dir_cache.clear()
+    _settled.clear()
 
 
 def tier_of(model: str | None) -> str | None:
@@ -390,7 +396,11 @@ def _poll_transcripts(store, cfg, now, left, per_file) -> None:
     scan_s = float(cfg.get("dir_scan_s", DIR_SCAN_S))
     fresh_s = float(cfg.get("running_mtime_s", RUNNING_MTIME_S))
     backfill = _backfill(cfg)
-    targets = _hot_targets(root, now, window, backfill, scan_s)
+    try:
+        list_cap = int(cfg.get("dir_list_cap", DIR_LIST_CAP))
+    except (TypeError, ValueError):
+        list_cap = DIR_LIST_CAP
+    targets = _hot_targets(root, now, window, backfill, scan_s, list_cap)
     for target in targets:
         if left <= 0 and target.kind != "journal":
             # Journals are tiny and carry labels. Still skip once the tick
@@ -409,128 +419,116 @@ def _poll_transcripts(store, cfg, now, left, per_file) -> None:
             )
 
 
-def _hot_targets(root, now, window, backfill, scan_s):
+def _hot_targets(root, now, window, backfill, scan_s, list_cap=None):
     key = (str(root), backfill or "")
     hit = _scan_cache.get(key)
     if hit and now - hit[0] < scan_s:
         return hit[1]
-    targets = _discover(root, now, window, backfill)
+    targets = _discover(root, now, window, backfill, list_cap=list_cap)
     targets.sort(key=lambda t: (0 if t.kind == "journal" else 1, -t.mtime))
     _scan_cache[key] = (now, targets)
     return targets
 
 
-def _discover(root, now, window, backfill):
+def _discover(root, now, window, backfill, list_cap=None):
+    """List transcript candidates with cached directory listings.
+
+    Unchanged directories cost one stat and no listing; new files always
+    bump the parent mtime, so skipping unchanged subtrees misses nothing.
+    ``list_cap`` bounds fresh listings per pass (None counts nothing);
+    a deferred directory keeps its old mtime stamp and is retried next pass.
+    """
     targets = []
-    try:
-        projects = list(os.scandir(root))
-    except OSError:
-        return targets
-    for proj in projects:
-        try:
-            if not proj.is_dir(follow_symlinks=False):
-                continue
-        except OSError:
+    cap = [DIR_LIST_CAP if list_cap is None else list_cap]
+    projects, _listed = _list_dir(root, None)
+    for name, proj_path, _is_file, is_dir in projects:
+        if not is_dir:
             continue
-        try:
-            children = list(os.scandir(proj.path))
-        except OSError:
+        children, _listed = _list_dir(proj_path, cap)
+        if children is None:
             continue
-        for ent in children:
-            name = ent.name
-            try:
-                is_file = ent.is_file(follow_symlinks=False)
-                is_dir = ent.is_dir(follow_symlinks=False)
-            except OSError:
-                continue
+        for name, ent_path, is_file, is_dir in children:
             if is_file and name.endswith(".jsonl"):
                 sid = name[: -len(".jsonl")]
                 if not _UUID.match(sid):
                     continue
                 if backfill and sid != backfill:
                     continue
-                st = _stat(ent.path)
+                st = _stat(ent_path)
                 if st is None:
                     continue
                 if backfill or st.st_mtime >= now - window:
                     targets.append(
-                        Target(st.st_mtime, "main", ent.path, sid, "main", None)
+                        Target(st.st_mtime, "main", ent_path, sid, "main", None)
                     )
             elif is_dir and _UUID.match(name):
                 if backfill and name != backfill:
                     continue
-                _discover_session(ent.path, name, now, window, backfill, targets)
+                _discover_session(ent_path, name, now, window, backfill, targets, cap)
     return targets
 
 
-def _discover_session(session_dir, sid, now, window, backfill, targets):
+def _list_dir(path, cap):
+    from dash.sources import list_dir_cached
+
+    entries, listed = list_dir_cached(path, _dir_cache, cap=cap)
+    if entries is None:
+        return None, listed
+    return entries, listed
+
+
+def _discover_session(session_dir, sid, now, window, backfill, targets, cap):
     sub = os.path.join(session_dir, "subagents")
-    try:
-        entries = list(os.scandir(sub))
-    except OSError:
-        return
-    for ent in entries:
-        try:
-            is_file = ent.is_file(follow_symlinks=False)
-            is_dir = ent.is_dir(follow_symlinks=False)
-        except OSError:
-            continue
+    entries, _listed = _list_dir(sub, cap)
+    for name, ent_path, is_file, is_dir in entries or []:
         if is_file:
-            match = _AGENT.match(ent.name)
+            match = _AGENT.match(name)
             if not match:
                 continue
-            st = _stat(ent.path)
+            st = _stat(ent_path)
             if st is None:
                 continue
             if backfill or st.st_mtime >= now - window:
                 targets.append(
-                    Target(st.st_mtime, "subagent", ent.path, sid, match.group(1), None)
+                    Target(st.st_mtime, "subagent", ent_path, sid, match.group(1), None)
                 )
-        elif is_dir and ent.name == "workflows":
-            _discover_workflows(ent.path, sid, now, window, backfill, targets)
+        elif is_dir and name == "workflows":
+            _discover_workflows(ent_path, sid, now, window, backfill, targets, cap)
 
 
-def _discover_workflows(wf_root, sid, now, window, backfill, targets):
-    try:
-        workflows = list(os.scandir(wf_root))
-    except OSError:
+def _discover_workflows(wf_root, sid, now, window, backfill, targets, cap):
+    workflows, _listed = _list_dir(wf_root, cap)
+    if workflows is None:
         return
-    for wf in workflows:
-        try:
-            if not wf.is_dir(follow_symlinks=False) or not wf.name.startswith("wf_"):
-                continue
-        except OSError:
+    for name, wf_path, _is_file, is_dir in workflows:
+        if not is_dir or not name.startswith("wf_"):
             continue
-        try:
-            agents = list(os.scandir(wf.path))
-        except OSError:
+        agents, _listed = _list_dir(wf_path, cap)
+        if agents is None:
             continue
-        for ent in agents:
-            try:
-                if not ent.is_file(follow_symlinks=False):
-                    continue
-            except OSError:
+        for ent_name, ent_path, is_file, _is_dir in agents:
+            if not is_file:
                 continue
-            st = _stat(ent.path)
+            st = _stat(ent_path)
             if st is None:
                 continue
             if not backfill and st.st_mtime < now - window:
                 continue
-            if ent.name == "journal.jsonl":
+            if ent_name == "journal.jsonl":
                 targets.append(
-                    Target(st.st_mtime, "journal", ent.path, sid, None, wf.name)
+                    Target(st.st_mtime, "journal", ent_path, sid, None, name)
                 )
                 continue
-            match = _AGENT.match(ent.name)
+            match = _AGENT.match(ent_name)
             if match:
                 targets.append(
                     Target(
                         st.st_mtime,
                         "workflow",
-                        ent.path,
+                        ent_path,
                         sid,
                         match.group(1),
-                        wf.name,
+                        name,
                     )
                 )
 
@@ -596,6 +594,7 @@ def _ingest_journal(store, target, now, fresh_s, left) -> int:
 def _ingest_jsonl(store, target, now, fresh_s, left, per_file, backfill, window) -> int:
     st = _stat(target.path)
     if st is None:
+        _settled.pop(target.path, None)
         return left
     if not backfill and st.st_mtime < now - window:
         return left
@@ -624,7 +623,11 @@ def _ingest_jsonl(store, target, now, fresh_s, left, per_file, backfill, window)
         return left
 
     if offset >= st.st_size and target.path not in _discard:
+        key = _settled_key(target, st, fresh)
+        if _settled.get(target.path) == key:
+            return left
         _emit_transcript_run(store, target, st, fresh, caught_up=True)
+        _remember_settled(target.path, key)
         return left
     if left <= 0 or per_file <= 0:
         _emit_transcript_run(store, target, st, fresh, caught_up=False)
@@ -666,6 +669,40 @@ def _ingest_jsonl(store, target, now, fresh_s, left, per_file, backfill, window)
     _set_offset(store, target.path, st, new_offset)
     _emit_transcript_run(store, target, st, fresh, caught_up=caught_up)
     return left
+
+
+def _settled_key(target, st, fresh):
+    """Fingerprint covering every input of the caught-up emit.
+
+    A file with the same key would emit the identical status, label, and
+    timestamps, so a repeat poll can skip it without opening it. ``fresh``
+    flips once as the file ages out of the running window; the registry
+    busy bit and journal ``done`` flags can flip without a file write, so
+    they are part of the key too. The main-kind pid check reads the
+    registry pid map: a dead pid closes the row even when the transcript
+    is untouched.
+    """
+    if target.kind == "main":
+        busy = target.session_id in _busy
+        pid = _pids.get(target.session_id)
+        pid_alive = None if pid is None else bool(_pid_alive(pid))
+        extra = (busy, pid_alive)
+    else:
+        extra = (target.session_id, target.agent_id) in _finished
+    return (st.st_ino, st.st_size, st.st_mtime_ns, bool(fresh), extra)
+
+
+def _remember_settled(path, key) -> None:
+    """Record a caught-up file, bounding the cache.
+
+    Eviction only costs the evicted files one re-emit on a later tick;
+    entries for deleted files are dropped when the ingest sees them gone.
+    """
+    _settled[path] = key
+    if len(_settled) > SETTLED_CAP:
+        drop = len(_settled) - SETTLED_CAP // 2
+        for old in list(_settled)[:drop]:
+            del _settled[old]
 
 
 def _discard_chunk(store, path, st, offset, left, per_file) -> int:

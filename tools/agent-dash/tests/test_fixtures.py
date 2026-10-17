@@ -413,11 +413,17 @@ class FixtureShapeTests(unittest.TestCase):
         self.assertIs(health["ok"], True)
         names = []
         for source in health["sources"]:
-            self.assertEqual(set(source), {"name", "last_poll", "last_error", "lag_s"})
+            self.assertEqual(
+                set(source),
+                {"name", "last_poll", "last_error", "lag_s", "last_duration_s", "interval_s", "stalled"},
+            )
             self.assertIsInstance(source["name"], str)
             self.assertTrue(num(source["last_poll"]))
             self.assertTrue(num(source["lag_s"]))
             self.assertTrue(source["last_error"] is None or isinstance(source["last_error"], str))
+            self.assertTrue(num(source["last_duration_s"]))
+            self.assertTrue(num(source["interval_s"]))
+            self.assertIs(source["stalled"], False)
             names.append(source["name"])
         for required in ("claude", "manifests", "muse", "grok_cli", "cursor", "process", "hub"):
             self.assertIn(required, names)

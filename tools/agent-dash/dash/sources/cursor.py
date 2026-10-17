@@ -81,8 +81,14 @@ SECRET_MARKERS = ("encrypt", "secret", "password", "token", "apikey", "api_key")
 _LABEL_CACHE = {}
 _TRANSCRIPTS = {}
 _MODEL_COUNTS = {}
+_META_CACHE = {}
+_DB_FP = {}
+_dir_cache: dict = {}
+META_CACHE_CAP = 20000
+DIR_LIST_CAP = 500
 _LIVE_PIDS = None
 last_error = None
+last_skipped_by_budget = 0
 # Store meta keys that point at a parent chat. Message bodies are not read.
 _PARENT_KEYS = ("parentAgentId", "parentComposerId", "parentChatId", "parentId")
 
@@ -297,6 +303,7 @@ def _worth_tracking(chat, now):
 
 
 def _drain(store, pending, budget, per_file, tick_budget, now, tmp_root):
+    global last_skipped_by_budget
     hot = []
     cold = []
     for chat in pending:
@@ -306,21 +313,27 @@ def _drain(store, pending, budget, per_file, tick_budget, now, tmp_root):
             cold.append(chat)
     hot.sort(key=lambda chat: chat["uuid"])
     cold.sort(key=lambda chat: chat["uuid"])
-    budget = _drain_queue(store, hot, "cursor:rotate-hot", budget, per_file, tick_budget, now, tmp_root)
+    budget, skipped = _drain_queue(store, hot, "cursor:rotate-hot", budget, per_file, tick_budget, now, tmp_root)
     if budget >= MIN_OPEN:
-        _drain_queue(store, cold, "cursor:rotate-cold", budget, per_file, tick_budget, now, tmp_root)
+        budget, more = _drain_queue(store, cold, "cursor:rotate-cold", budget, per_file, tick_budget, now, tmp_root)
+        skipped += more
+    else:
+        skipped += len(cold)
+    last_skipped_by_budget = skipped
+    if skipped:
+        log.info("cursor skipped-by-budget %d", skipped)
 
 
 def _drain_queue(store, chats, key, budget, per_file, tick_budget, now, tmp_root):
     if not chats or budget < MIN_OPEN:
-        return budget
+        return budget, len(chats)
     n = len(chats)
     rec = _offset(store, key)
     start = int(rec[1]) % n if rec else 0
     for step in range(n):
         if budget < MIN_OPEN:
             _stamp(store, key, (start + step) % n, n, now)
-            return budget
+            return budget, n - step
         chat = chats[(start + step) % n]
         status, budget, model = _ingest_db(
             store, chat, budget, per_file, tick_budget, tmp_root, now
@@ -330,12 +343,34 @@ def _drain_queue(store, chats, key, budget, per_file, tick_budget, now, tmp_root
             _retire_shadow(store, chat)
         if status == "need-budget":
             _stamp(store, key, (start + step) % n, n, now)
-            return budget
+            return budget, n - step - 1
         if budget < MIN_OPEN:
             _stamp(store, key, (start + step + 1) % n, n, now)
-            return budget
+            return budget, n - step - 1
     _stamp(store, key, (start + n) % n, n, now)
-    return budget
+    return budget, 0
+
+
+def _db_fingerprint(path, st):
+    """(inode, size, mtime, wal size, wal mtime) for a chat database.
+
+    Blob offsets only change when these bytes do, so an identical
+    fingerprint means the last ingest already handled every blob.
+    """
+    wal_size, wal_mtime = 0, 0
+    try:
+        wst = os.stat(path + "-wal")
+    except OSError:
+        wst = None
+    if wst is not None:
+        wal_size, wal_mtime = int(wst.st_size), int(getattr(wst, "st_mtime_ns", 0))
+    return (
+        int(st.st_ino),
+        int(st.st_size),
+        int(getattr(st, "st_mtime_ns", 0)),
+        wal_size,
+        wal_mtime,
+    )
 
 
 def _ingest_db(store, chat, budget, per_file, tick_budget, tmp_root, now):
@@ -346,7 +381,12 @@ def _ingest_db(store, chat, budget, per_file, tick_budget, tmp_root, now):
         st = os.stat(path)
     except OSError:
         return "error", budget, None
+    store_key = _abs(path)
+    fingerprint = _db_fingerprint(path, st)
+    if _DB_FP.get(store_key) == fingerprint:
+        return "fresh", budget, _top_model(store_key)
     if _db_fresh(store, chat):
+        _DB_FP[store_key] = fingerprint
         return "fresh", budget, None
     inode = int(st.st_ino)
     store_key = _abs(path)
@@ -411,6 +451,7 @@ def _ingest_db(store, chat, budget, per_file, tick_budget, tmp_root, now):
             _mark_blob(store, store_key, blob_id)
         if not deferred:
             _stamp_store(store, path, st, _cursor_of(chat, st))
+            _DB_FP[store_key] = fingerprint
             return "ok", budget, _top_model(store_key)
         return "partial", budget, _top_model(store_key)
     except sqlite3.Error:
@@ -901,7 +942,20 @@ def _discover(home, budget, per_file):
                             "pid": None,
                         }
                     )
+    if budget > 0:
+        _drop_gone(found)
     return found, budget
+
+
+def _drop_gone(found) -> None:
+    """Forget cached fingerprints for chats that no longer exist."""
+    try:
+        live = {_abs(chat["store_path"]) for chat in found}
+    except Exception:
+        return
+    for key in list(_DB_FP):
+        if key not in live:
+            _DB_FP.pop(key, None)
 
 
 def _attach_labels(home, chats, budget, per_file, allow):
@@ -1348,6 +1402,14 @@ def _close_store(con, cleanup):
         shutil.rmtree(cleanup, ignore_errors=True)
 
 
+def _children_dirs(path, cap):
+    """Cached directory listing, or None when deferred by ``cap``."""
+    from dash.sources import list_dir_cached
+
+    entries, _listed = list_dir_cached(path, _dir_cache, cap=cap)
+    return entries
+
+
 def _manifest_dirs(root, filename, only):
     """Scratchpads that contain ``filename``.
 
@@ -1355,10 +1417,14 @@ def _manifest_dirs(root, filename, only):
     the encoded-cwd directory, a uuid child that holds ``scratchpad/<filename>``.
     A manifest nested one level under the scratchpad (a lead child folder
     such as ``runs/<tsv>``) is listed too, with the session as its parent.
+
+    Directory listings are cached by (inode, mtime): a quiet tree costs
+    one stat per directory per tick instead of a full walk.
     """
     if not root or not os.path.isdir(root):
         return
     seen = set()
+    cap = [DIR_LIST_CAP]
 
     def emit(pad):
         try:
@@ -1381,52 +1447,37 @@ def _manifest_dirs(root, filename, only):
             item = emit(os.path.dirname(tsv))
             if item:
                 yield item
-        try:
-            children = os.scandir(pad_dir)
-        except OSError:
+        children = _children_dirs(pad_dir, cap)
+        if not children:
             return
-        with children:
-            for child in children:
-                try:
-                    if not child.is_dir(follow_symlinks=False):
-                        continue
-                except OSError:
-                    continue
-                nested = os.path.join(child.path, filename)
-                if os.path.isfile(nested):
-                    item = emit(child.path)
-                    if item:
-                        yield (item[0], sess_name)
+        for _name, child_path, _is_file, is_dir in children:
+            if not is_dir:
+                continue
+            nested = os.path.join(child_path, filename)
+            if os.path.isfile(nested):
+                item = emit(child_path)
+                if item:
+                    yield (item[0], sess_name)
 
     direct = os.path.join(root, filename)
     if os.path.isfile(direct):
         item = emit(root)
         if item and (only is None or item[1] == only):
             yield item
-    try:
-        encoded = os.scandir(root)
-    except OSError:
+    encoded = _children_dirs(root, cap)
+    if not encoded:
         return
-    with encoded:
-        for enc in encoded:
-            try:
-                if not enc.is_dir(follow_symlinks=False):
-                    continue
-            except OSError:
+    for _ename, enc_path, _efile, is_dir in encoded:
+        if not is_dir:
+            continue
+        yield from emit_session(enc_path, os.path.basename(enc_path))
+        sessions = _children_dirs(enc_path, cap)
+        if not sessions:
+            continue
+        for _sname, sess_path, _sfile, sess_dir in sessions:
+            if not sess_dir:
                 continue
-            yield from emit_session(enc.path, enc.name)
-            try:
-                sessions = os.scandir(enc.path)
-            except OSError:
-                continue
-            with sessions:
-                for sess in sessions:
-                    try:
-                        if not sess.is_dir(follow_symlinks=False):
-                            continue
-                    except OSError:
-                        continue
-                    yield from emit_session(sess.path, sess.name)
+            yield from emit_session(sess_path, os.path.basename(sess_path))
 
 
 def _parse_manifest(text):
@@ -1473,6 +1524,10 @@ def _read_json(path, budget, per_file, limit=65536):
         return None, budget
     if st.st_size <= 0 or st.st_size > limit or st.st_size > per_file or st.st_size > budget:
         return None, budget
+    stamp = (int(getattr(st, "st_mtime_ns", 0)), int(st.st_size))
+    hit = _META_CACHE.get(path)
+    if hit is not None and hit[0] == stamp:
+        return hit[1], budget
     try:
         with open(path, "rb") as fh:
             raw = fh.read(st.st_size)
@@ -1485,6 +1540,11 @@ def _read_json(path, budget, per_file, limit=65536):
         return None, budget
     if not isinstance(obj, dict):
         return None, budget
+    _META_CACHE[path] = (stamp, obj)
+    if len(_META_CACHE) > META_CACHE_CAP:
+        drop = len(_META_CACHE) - META_CACHE_CAP // 2
+        for old in list(_META_CACHE)[:drop]:
+            _META_CACHE.pop(old, None)
     return obj, budget
 
 

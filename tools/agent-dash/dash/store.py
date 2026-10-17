@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 import sqlite3
 import threading
@@ -32,6 +33,7 @@ RECENT_S = 24 * 3600
 SAMPLE_KEEP_S = 48 * 3600
 TOKEN_FIELDS = ("input", "output", "cache_read", "cache_write", "reasoning")
 BILLED_FIELDS = ("input", "output", "cache_read", "cache_write")
+PRUNE_BATCH = 2000
 
 RUN_COLS = (
     "run_id",
@@ -86,6 +88,21 @@ WS_STATUSES = ("backlog", "todo", "doing", "review", "done", "cancelled")
 _WF = re.compile(r"(wf_[A-Za-z0-9-]+)")
 
 
+def _offset_path_gone(path) -> bool:
+    """True when an offset row no longer refers to a live file.
+
+    Relative keys are rotation cursors and scan stamps, never files, so
+    they are always kept. Per-blob markers carry the database path before
+    ``#b#`` and are pruned only when that database is gone.
+    """
+    if not isinstance(path, str) or not path:
+        return False
+    if "#b#" in path:
+        head = path.split("#b#", 1)[0]
+        return os.path.isabs(head) and not os.path.exists(head)
+    return os.path.isabs(path) and not os.path.exists(path)
+
+
 class Store:
     def __init__(self, path: str | Path):
         self.path = Path(path)
@@ -103,6 +120,9 @@ class Store:
         self._data_seq = 0
         self._last_data_ts: float | None = None
         self._snapshot_cache: dict = {}
+        self._prune_after = 0
+        self._pruned_since_vacuum = 0
+        self._prune_cycles = 0
         self._create()
 
     def close(self) -> None:
@@ -161,6 +181,58 @@ class Store:
                 self._data_seq += 1
                 self._seq += 1
                 self._note_data_write()
+
+    def prune_offsets(self, batch: int = PRUNE_BATCH) -> int:
+        """Delete up to ``batch`` offset rows whose path no longer exists.
+
+        Only absolute file paths are candidates: rotation cursors and scan
+        stamps (``muse:fresh-scan``, ``cursor:rotate-hot``, ...) are
+        relative and always kept, and per-blob markers (``<db>#b#<id>``)
+        are judged by their database path. One call is one tick's worth
+        of work: it scans forward from where the last call stopped
+        (keyset on rowid, wrapping at the end), so repeated calls at the
+        reconcile cadence drain the table without a long pause. Returns
+        the number of rows deleted. When a full pass completes and rows
+        were deleted along the way, one VACUUM reclaims the space.
+        A return of 0 means this batch was clean, not that the table is
+        drained; ``prune_cycles`` counts completed passes.
+        """
+        try:
+            limit = int(batch)
+        except (TypeError, ValueError):
+            limit = PRUNE_BATCH
+        if limit <= 0:
+            limit = PRUNE_BATCH
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT rowid, path FROM file_offsets WHERE rowid > ? ORDER BY rowid LIMIT ?",
+                (self._prune_after, limit),
+            ).fetchall()
+            if not rows:
+                self._prune_after = 0
+                self._prune_cycles += 1
+                if self._pruned_since_vacuum > 0:
+                    self._conn.execute("VACUUM")
+                    self._conn.commit()
+                    self._pruned_since_vacuum = 0
+                return 0
+            self._prune_after = rows[-1][0]
+            gone = [row[1] for row in rows if _offset_path_gone(row[1])]
+            if gone:
+                self._conn.execute("BEGIN IMMEDIATE")
+                try:
+                    self._conn.executemany(
+                        "DELETE FROM file_offsets WHERE path=?",
+                        [(path,) for path in gone],
+                    )
+                    self._conn.execute("COMMIT")
+                except Exception:
+                    self._conn.execute("ROLLBACK")
+                    raise
+                self._pruned_since_vacuum += len(gone)
+                self._data_seq += 1
+                self._seq += 1
+            return len(gone)
 
     def upsert_session(self, row: dict) -> None:
         session_id = row.get("session_id")

@@ -51,8 +51,8 @@ store.add_process_sample(dict)# keys: ts, pid, comm, rss_kb, elapsed_s, label, r
 store.set_ws_counts(list)     # rows: ws, name, backlog, todo, doing, review, done, cancelled
 ```
 
-`cfg` is the merged config (roots, intervals, read budgets: 4 MB per file, 8 MB per tick). There is no concurrency cap.
-Sources must be incremental (byte offsets), budget-bounded, and exception-safe (log, never crash the loop).
+`cfg` is the merged config (roots, intervals, read budgets: 4 MB per file, 8 MB per tick; poll budget `poll_budget_s`, default 25 s). There is no concurrency cap.
+Sources must be incremental (byte offsets), budget-bounded, and exception-safe (log, never crash the loop). Directory listings are cached by (inode, mtime) with a per-pass cap on fresh listings, so repeat polls over a quiet tree cost stats, not walks. Dead offset rows (absolute paths that no longer exist) are pruned a batch per reconcile tick with one VACUUM per pass; only the newest 3 `*.bak-*` stay in the state dir.
 
 Enums. `source`: claude-main, claude-subagent, claude-workflow, muse, glm, grok (cursor-agent), shell, generic.
 `tier`: opus, sonnet, haiku, muse, glm, grok. The generic source passes its tier through and defaults to `generic` (from the model name when it holds a known family). `status`: running, done, killed, died_early, unknown.
@@ -99,7 +99,7 @@ started_at, ended_at, elapsed_s, clock_source, out_bytes, out_growing, err_bytes
 `context_tokens` is the latest `grok-context` input for that run, or null. It is a context-window estimate. It is not part of `tokens`, totals, buckets, or cost. `elapsed_s` is null when `started_at` is null.
 `recent` = runs ended inside the window (one fixed 24 h by default, `since`/`until` narrow it), newest first, max 50. The page shows it as `Finished (24 h)`.
 
-`GET /api/stream` -> SSE. Event `tick` every 2 s: `{"seq": n, "running": [Run]}`; the page refetches snapshot when `seq` changes.
+`GET /api/stream` -> SSE. Event `tick` every 2 s: `{"seq": n, "running": [Run], "sources": [{name, last_poll, lag_s}]}`; the page refetches snapshot when `seq` changes. `sources` mirrors the registry freshness so the page can show staleness per source.
 
 `GET /api/runs?ws=&since=&until=&limit=` -> `{"runs": [Run]}` (Gantt input; workflow children collapsed into one row with `children: n`).
 
@@ -179,7 +179,7 @@ variant. Clip playback compresses idle stretches by cumulative event count
 blended with real time; plain replay stays on real time with an optional
 "Compress idle" toggle.
 
-`GET /api/health` -> `{"ok": true, "sources": [{name, last_poll, last_error, lag_s}], "pricing": {...}, "disconnects_1h": 0, "unpriced_models": [{"model", "rows", "tokens"}], "scratch_roots": [...], "run_dirs": [...], "warnings": [...]}`.
+`GET /api/health` -> `{"ok": true, "sources": [{name, last_poll, last_error, lag_s, last_duration_s, interval_s, stalled}], "pricing": {...}, "disconnects_1h": 0, "unpriced_models": [{"model", "rows", "tokens"}], "scratch_roots": [...], "run_dirs": [...], "warnings": [...]}`.
 `ok` is false when any model with usage rows in the last 24 h has no
 catalog rate; those models are listed in `unpriced_models` (absent when
 empty) and each is also an `unpriced model: <id> (<tokens> tokens in 24 h)`
@@ -188,6 +188,7 @@ becomes zero: the cost tile reads `totals.unpriced_tokens` /
 `totals.unpriced_models` and says `excl. N tokens unpriced (<models>)`.
 `disconnects_1h` counts client disconnects (BrokenPipe/ConnectionReset)
 in the last hour; they are counted, never traceback-logged.
+`ok` is false when any source has an error, is `stalled` (no poll for more than 3x its interval), or overran its poll budget. Each source poll runs in a watchdog thread (`poll_budget_s`, default 25 s) so one hung source cannot stall the others; `/api/reconcile` mismatches include `source stalled: <name> (last ok poll N s ago)` for the same condition.
 `scratch_roots` is the configured, resolved `roots.scratchpads` list (a local config that narrows it shows up here); `run_dirs` is the registered run folders. `warnings` names each registered folder outside the configured roots that holds a manifest for a currently live worker, so a run folder the config does not cover is loud instead of silently invisible.
 
 `GET /static/<file>` serves a file from `static/` or one subdirectory (`vendor/`). `/static/taskmap.json` is the resolved task map (`taskmap.local.json`, else `taskmap.example.json`). Context-window rows use tool `grok-context` and are left out of cost.

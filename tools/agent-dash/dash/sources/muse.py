@@ -32,6 +32,7 @@ import glob
 import json
 import logging
 import os
+import time
 from datetime import datetime, timedelta, timezone
 
 from dash.sources.process import apply_liveness, live_agent_processes
@@ -48,7 +49,19 @@ RECENT_S = 15 * 60
 
 _FRESH = {}
 _LOCATE = {}
+_LOCATE_MISS = {}
+_LOCATE_MISS_TTL = 60.0
+_dir_cache: dict = {}
+DIR_LIST_CAP = 500
 last_error = None
+
+
+def reset_state() -> None:
+    """Drop process-local caches. Tests use this between cases."""
+    _FRESH.clear()
+    _LOCATE.clear()
+    _LOCATE_MISS.clear()
+    _dir_cache.clear()
 
 
 def poll(store, cfg, now):
@@ -646,13 +659,18 @@ def _recent_days(root, now):
     return days
 
 
-def _locate(root, sid):
+def _locate(root, sid, now=None):
     if not root or not sid:
         return None
     key = (root, sid)
     hit = _LOCATE.get(key)
     if hit and os.path.isfile(hit):
         return hit
+    if now is None:
+        now = time.time()
+    miss = _LOCATE_MISS.get(key)
+    if miss is not None and now - miss < _LOCATE_MISS_TTL:
+        return None
     pattern = os.path.join(root, "*", "*", "*", sid, "session.jsonl")
     try:
         hits = glob.glob(pattern)
@@ -660,7 +678,9 @@ def _locate(root, sid):
         return None
     if not hits:
         _LOCATE.pop(key, None)
+        _LOCATE_MISS[key] = now
         return None
+    _LOCATE_MISS.pop(key, None)
     hits.sort(key=lambda p: os.path.getmtime(p) if os.path.isfile(p) else 0, reverse=True)
     _LOCATE[key] = hits[0]
     return hits[0]
@@ -682,6 +702,18 @@ def _children(session_dir, root):
         alt = _locate(root, cid)
         if alt:
             yield alt, cid
+
+
+def _children_dirs(path, cap):
+    """Cached directory listing, or None when deferred by ``cap``.
+
+    Unchanged directories cost one stat. A deferred directory keeps its
+    old stamp, so a later pass retries it.
+    """
+    from dash.sources import list_dir_cached
+
+    entries, _listed = list_dir_cached(path, _dir_cache, cap=cap)
+    return entries
 
 
 def _manifest_dirs(root, filename, only=None):
@@ -719,52 +751,38 @@ def _manifest_dirs(root, filename, only=None):
             item = emit(os.path.dirname(tsv))
             if item:
                 yield item
-        try:
-            children = os.scandir(pad_dir)
-        except OSError:
+        children = _children_dirs(pad_dir, cap)
+        if not children:
             return
-        with children:
-            for child in children:
-                try:
-                    if not child.is_dir(follow_symlinks=False):
-                        continue
-                except OSError:
-                    continue
-                nested = os.path.join(child.path, filename)
-                if os.path.isfile(nested):
-                    item = emit(child.path)
-                    if item:
-                        yield (item[0], sess_name)
+        for _name, child_path, _is_file, is_dir in children:
+            if not is_dir:
+                continue
+            nested = os.path.join(child_path, filename)
+            if os.path.isfile(nested):
+                item = emit(child_path)
+                if item:
+                    yield (item[0], sess_name)
 
+    cap = [DIR_LIST_CAP]
     direct = os.path.join(root, filename)
     if os.path.isfile(direct):
         item = emit(root)
         if item and (only is None or item[1] == only):
             yield item
-    try:
-        encoded = os.scandir(root)
-    except OSError:
+    encoded = _children_dirs(root, cap)
+    if not encoded:
         return
-    with encoded:
-        for enc in encoded:
-            try:
-                if not enc.is_dir(follow_symlinks=False):
-                    continue
-            except OSError:
+    for _name, enc_path, _is_file, is_dir in encoded:
+        if not is_dir:
+            continue
+        yield from emit_session(enc_path, os.path.basename(enc_path))
+        sessions = _children_dirs(enc_path, cap)
+        if not sessions:
+            continue
+        for _sname, sess_path, _sfile, sess_dir in sessions:
+            if not sess_dir:
                 continue
-            yield from emit_session(enc.path, enc.name)
-            try:
-                sessions = os.scandir(enc.path)
-            except OSError:
-                continue
-            with sessions:
-                for sess in sessions:
-                    try:
-                        if not sess.is_dir(follow_symlinks=False):
-                            continue
-                    except OSError:
-                        continue
-                    yield from emit_session(sess.path, sess.name)
+            yield from emit_session(sess_path, os.path.basename(sess_path))
 
 
 def _read_small(path, budget, per_file):

@@ -66,6 +66,8 @@ _tsv_cache: dict = {}
 _text_cache: dict = {}
 _runs: dict = {}
 _emit_sig: dict = {}
+_dir_cache: dict = {}
+DIR_LIST_CAP = 500
 
 
 def reset_state() -> None:
@@ -74,6 +76,15 @@ def reset_state() -> None:
     _text_cache.clear()
     _runs.clear()
     _emit_sig.clear()
+    _dir_cache.clear()
+
+
+def _children_dirs(path, cap):
+    """Cached directory listing, or None when deferred by ``cap``."""
+    from dash.sources import list_dir_cached
+
+    entries, _listed = list_dir_cached(path, _dir_cache, cap=cap)
+    return entries
 
 
 def tier_of(model: str | None) -> str | None:
@@ -169,6 +180,7 @@ def poll(store, cfg, now: float) -> None:
         ttl = float(cfg.get("process_ttl_s", PROCESS_TTL_S))
         backfill = _backfill(cfg)
         left = per_tick
+        list_cap = [DIR_LIST_CAP]
         live = _live_labels(store, now, ttl)
         pads = []
         for root in _scratch_roots(cfg):
@@ -221,7 +233,8 @@ def poll(store, cfg, now: float) -> None:
         for parent, scratch in pads:
             try:
                 left = _emit_exec(
-                    store, parent, scratch, now, window, backfill, left, per_file, live, ttl
+                    store, parent, scratch, now, window, backfill, left, per_file, live, ttl,
+                    cap=list_cap,
                 )
             except Exception as exc:
                 _log.warning("manifests exec: %s", type(exc).__name__)
@@ -265,25 +278,26 @@ def _emit_manifest(
     return left
 
 
-def _emit_exec(store, parent, scratch, now, window, backfill, left, per_file, live, ttl=PROCESS_TTL_S) -> int:
+def _emit_exec(store, parent, scratch, now, window, backfill, left, per_file, live, ttl=PROCESS_TTL_S, cap=None) -> int:
     exec_dir = os.path.join(scratch, "exec")
-    try:
-        entries = list(os.scandir(exec_dir))
-    except OSError:
+    if cap is None:
+        cap = [DIR_LIST_CAP]
+    entries = _children_dirs(exec_dir, cap)
+    if not entries:
         return left
     grouped: dict = {}
-    for ent in entries:
+    for name, ent_path, is_file, _is_dir in entries:
+        if not is_file:
+            continue
         try:
-            if not ent.is_file(follow_symlinks=False):
-                continue
-            st = ent.stat(follow_symlinks=False)
+            st = os.stat(ent_path, follow_symlinks=False)
         except OSError:
             continue
-        kind, label = _exec_name(ent.name)
+        kind, label = _exec_name(name)
         if not kind or not label:
             continue
         bucket = grouped.setdefault(label, {})
-        bucket[kind] = ent.path
+        bucket[kind] = ent_path
         bucket.setdefault("mtimes", []).append(st.st_mtime)
     for label, bucket in grouped.items():
         if not backfill:
@@ -553,6 +567,7 @@ def _scratchpads(root, now, backfill, scan_s):
         return hit[1]
     found = []
     seen = set()
+    cap = [DIR_LIST_CAP]
 
     def consider(path, name):
         if not _UUID.match(name):
@@ -571,29 +586,21 @@ def _scratchpads(root, now, backfill, scan_s):
         seen.add(real)
         found.append((name, scratch))
 
-    try:
-        encoded = list(os.scandir(root))
-    except OSError:
+    encoded = _children_dirs(root, cap)
+    if encoded is None:
         _scan_cache[key] = (now, found)
         return found
-    for enc in encoded:
-        try:
-            if not enc.is_dir(follow_symlinks=False):
-                continue
-        except OSError:
+    for _ename, enc_path, _efile, is_dir in encoded:
+        if not is_dir:
             continue
-        consider(enc.path, enc.name)
-        try:
-            sessions = list(os.scandir(enc.path))
-        except OSError:
+        consider(enc_path, os.path.basename(enc_path))
+        sessions = _children_dirs(enc_path, cap)
+        if not sessions:
             continue
-        for sess in sessions:
-            try:
-                if not sess.is_dir(follow_symlinks=False):
-                    continue
-            except OSError:
+        for _sname, sess_path, _sfile, sess_dir in sessions:
+            if not sess_dir:
                 continue
-            consider(sess.path, sess.name)
+            consider(sess_path, os.path.basename(sess_path))
     _scan_cache[key] = (now, found)
     return found
 

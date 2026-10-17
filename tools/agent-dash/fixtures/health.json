@@ -5,43 +5,64 @@
       "name": "claude",
       "last_poll": 1761999959,
       "last_error": null,
-      "lag_s": 1
+      "lag_s": 1,
+      "last_duration_s": 0.1,
+      "interval_s": 2,
+      "stalled": false
     },
     {
       "name": "manifests",
       "last_poll": 1761999959,
       "last_error": null,
-      "lag_s": 1
+      "lag_s": 1,
+      "last_duration_s": 0.1,
+      "interval_s": 2,
+      "stalled": false
     },
     {
       "name": "muse",
       "last_poll": 1761999959,
       "last_error": null,
-      "lag_s": 1
+      "lag_s": 1,
+      "last_duration_s": 0.1,
+      "interval_s": 2,
+      "stalled": false
     },
     {
       "name": "grok_cli",
       "last_poll": 1761999959,
       "last_error": null,
-      "lag_s": 1
+      "lag_s": 1,
+      "last_duration_s": 0.1,
+      "interval_s": 2,
+      "stalled": false
     },
     {
       "name": "cursor",
       "last_poll": 1761999959,
       "last_error": null,
-      "lag_s": 1
+      "lag_s": 1,
+      "last_duration_s": 0.1,
+      "interval_s": 2,
+      "stalled": false
     },
     {
       "name": "process",
       "last_poll": 1761999959,
       "last_error": null,
-      "lag_s": 1
+      "lag_s": 1,
+      "last_duration_s": 0.1,
+      "interval_s": 5,
+      "stalled": false
     },
     {
       "name": "hub",
       "last_poll": 1761999959,
       "last_error": null,
-      "lag_s": 1
+      "lag_s": 1,
+      "last_duration_s": 0.1,
+      "interval_s": 60,
+      "stalled": false
     }
   ],
   "_note": "Seeded synthetic data for the offline preview. Seed 1. No local sessions are read."

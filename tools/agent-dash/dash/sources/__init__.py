@@ -4,6 +4,14 @@ Each module in this package that defines NAME, INTERVAL_S, and poll(store, cfg, 
 is polled on its interval. A failing poll is recorded for /api/health and does not
 stop the loop.
 
+Every source runs in its own watchdog thread with a join timeout
+(``POLL_BUDGET_S``, 25 s by default, ``poll_budget_s`` in cfg): a hung
+transcript scan or ssh call can no longer stall the other sources behind
+it. When a poll overruns, the tick moves on, the source is flagged
+(``timed_out``, ``last_error``), and its ``last_poll`` is left alone so
+``lag_s`` keeps growing until it finishes. A source whose previous poll
+is still running is skipped, never stacked.
+
 cfg keys other sources can read: read_budget_per_file (4 MiB), read_budget_per_tick
 (8 MiB), backfill (bool), backfill_session (str or None). Tail files with
 store.get_offset and store.set_offset.
@@ -13,55 +21,151 @@ from __future__ import annotations
 
 import importlib
 import logging
+import os
 import pkgutil
+import threading
 import time
 
 log = logging.getLogger("agent_dash.sources")
+
+POLL_BUDGET_S = 25.0
+STALL_FACTOR = 3.0
+
+
+def _budget(cfg) -> float:
+    try:
+        value = float((cfg or {}).get("poll_budget_s", POLL_BUDGET_S))
+    except (TypeError, ValueError):
+        return POLL_BUDGET_S
+    return value if value > 0 else POLL_BUDGET_S
+
+
+def _new_state() -> dict:
+    return {
+        "last_poll": None,
+        "last_ok": None,
+        "last_error": None,
+        "last_duration_s": None,
+        "timed_out": False,
+        "skip": False,
+        "thread": None,
+        "poll_start": None,
+    }
 
 
 class Registry:
     def __init__(self, sources=None):
         self.state = {}
+        self._born = time.time()
+        self._lock = threading.Lock()
         if sources is None:
             sources = discover(self.state)
         else:
             for source in sources:
-                self.state[source.NAME] = {"last_poll": None, "last_error": None, "skip": False}
+                self.state[source.NAME] = _new_state()
         self.sources = sources
 
     def tick(self, store, cfg, now: float, force: bool = False, stop=None) -> None:
+        budget = _budget(cfg)
         for source in self.sources:
             if stop is not None and stop.is_set():
                 return
-            state = self.state.setdefault(source.NAME, {"last_poll": None, "last_error": None, "skip": False})
-            if state.get("skip"):
-                continue
-            if not force and state["last_poll"] is not None and now - state["last_poll"] < source.INTERVAL_S:
-                continue
-            try:
-                source.poll(store, cfg, now)
-            except Exception as exc:
-                state["last_error"] = _short(exc)
-                log.warning("source %s: %s", source.NAME, state["last_error"])
+            with self._lock:
+                state = self.state.setdefault(source.NAME, _new_state())
+                thread = state.get("thread")
+                if thread is not None and thread.is_alive():
+                    continue
+                state["thread"] = None
+                if state.get("skip"):
+                    continue
+                last = state["last_poll"]
+                if not force and last is not None and now - last < source.INTERVAL_S:
+                    continue
+                worker = threading.Thread(
+                    target=_run_poll,
+                    args=(self, source, store, cfg, now, budget),
+                    name=f"poll-{source.NAME}",
+                    daemon=True,
+                )
+                state["thread"] = worker
+                state["poll_start"] = now
+            worker.start()
+            if force:
+                worker.join()
+                overran = False
             else:
-                state["last_error"] = _surfaced(source)
-            state["last_poll"] = now
+                deadline = time.monotonic() + budget
+                while worker.is_alive() and time.monotonic() < deadline:
+                    if stop is not None and stop.is_set():
+                        break
+                    worker.join(min(0.25, max(0.0, deadline - time.monotonic())))
+                overran = worker.is_alive() and not (
+                    stop is not None and stop.is_set()
+                )
+            if not overran:
+                continue
+            with self._lock:
+                state["timed_out"] = True
+                state["last_error"] = (
+                    f"TimeoutError: poll exceeded {budget:g}s budget"
+                )
+                log.warning("source %s exceeded %gs budget", source.NAME, budget)
+
+    def source_states(self, now: float) -> list:
+        """Per-source freshness for the SSE tick and /api/health."""
+        rows = []
+        with self._lock:
+            items = [(source, dict(self.state.get(source.NAME) or {})) for source in self.sources]
+        for source, state in items:
+            last = state.get("last_poll")
+            rows.append(
+                {
+                    "name": source.NAME,
+                    "last_poll": last,
+                    "lag_s": None if last is None else max(0.0, now - last),
+                }
+            )
+        return rows
+
+    def stalled_messages(self, now: float) -> list:
+        """One ``source stalled: <name> (last ok poll N s ago)`` per lagging source."""
+        found = []
+        with self._lock:
+            items = [(source, dict(self.state.get(source.NAME) or {})) for source in self.sources]
+            born = self._born
+        for source, state in items:
+            if not _is_stalled(source, state, now, born):
+                continue
+            ref = state.get("last_ok")
+            if ref is None:
+                ref = state.get("last_poll")
+            if ref is None:
+                ref = born
+            ago = int(max(0.0, now - ref))
+            found.append(f"source stalled: {source.NAME} (last ok poll {ago} s ago)")
+        return found
 
     def health(self, now: float, cfg=None, processes="auto") -> dict:
         sources = []
         ok = True
-        for source in self.sources:
-            state = self.state.get(source.NAME) or {}
+        with self._lock:
+            items = [(source, dict(self.state.get(source.NAME) or {})) for source in self.sources]
+            born = self._born
+        for source, state in items:
             error = state.get("last_error")
-            if error:
-                ok = False
             last = state.get("last_poll")
+            stalled = _is_stalled(source, state, now, born)
+            if error or stalled or state.get("timed_out"):
+                ok = False
             sources.append(
                 {
                     "name": source.NAME,
                     "last_poll": last,
                     "last_error": error,
                     "lag_s": None if last is None else max(0.0, now - last),
+                    "last_duration_s": state.get("last_duration_s"),
+                    "interval_s": source.INTERVAL_S,
+                    "stalled": stalled,
                 }
             )
         body: dict = {"ok": ok, "sources": sources}
@@ -73,6 +177,91 @@ class Registry:
             except Exception as exc:
                 log.warning("health roots: %s", type(exc).__name__)
         return body
+
+
+def _run_poll(registry: Registry, source, store, cfg, now: float, budget: float) -> None:
+    """Poll one source and record the outcome. Always runs in a worker thread."""
+    start = time.monotonic()
+    try:
+        source.poll(store, cfg, now)
+    except Exception as exc:
+        duration = time.monotonic() - start
+        with registry._lock:
+            state = registry.state.setdefault(source.NAME, _new_state())
+            state["last_poll"] = now
+            state["last_error"] = _short(exc)
+            state["last_duration_s"] = duration
+            if duration <= budget:
+                state["timed_out"] = False
+        log.warning("source %s: %s", source.NAME, state["last_error"])
+    else:
+        duration = time.monotonic() - start
+        with registry._lock:
+            state = registry.state.setdefault(source.NAME, _new_state())
+            state["last_poll"] = now
+            state["last_ok"] = now
+            state["last_error"] = _surfaced(source)
+            state["last_duration_s"] = duration
+            state["timed_out"] = duration > budget
+            if state["timed_out"]:
+                state["last_error"] = (
+                    f"TimeoutError: poll took {duration:.1f}s, over {budget:g}s budget"
+                )
+                log.warning("source %s: %s", source.NAME, state["last_error"])
+
+
+def _is_stalled(source, state: dict, now: float, born: float) -> bool:
+    limit = STALL_FACTOR * float(getattr(source, "INTERVAL_S", 0) or 0)
+    last = state.get("last_poll")
+    if last is None:
+        return now - born > limit
+    return now - last > limit
+
+
+def list_dir_cached(path: str, cache: dict, cap=None):
+    """Scandir entries cached by (inode, mtime_ns).
+
+    ``cache`` is owned by the caller: ``path -> (ino, mtime_ns, entries)``
+    where each entry is ``(name, full_path, is_file, is_dir)`` resolved with
+    ``follow_symlinks=False``. An unchanged directory costs one stat and no
+    listing, so repeated polls over a quiet tree stay cheap while new files
+    (which always bump the parent mtime) are still found.
+
+    ``cap`` is an optional mutable ``[remaining]`` counter bounding fresh
+    listings per pass. When it is exhausted and there is no cache hit, this
+    returns None: the caller must skip the directory this pass (its mtime
+    still differs, so a later pass retries it).
+
+    Returns ``(entries, listed)`` where ``listed`` is True when a fresh
+    listing happened. ``entries`` is None only when deferred by ``cap``.
+    """
+    try:
+        st = os.stat(path, follow_symlinks=False)
+    except OSError:
+        return [], False
+    key = (st.st_ino, st.st_mtime_ns)
+    hit = cache.get(path)
+    if hit is not None and hit[0] == key:
+        return hit[1], False
+    if cap is not None and cap[0] <= 0:
+        return None, False
+    try:
+        with os.scandir(path) as scanner:
+            entries = []
+            for ent in scanner:
+                try:
+                    is_file = ent.is_file(follow_symlinks=False)
+                    is_dir = ent.is_dir(follow_symlinks=False)
+                except OSError:
+                    continue
+                entries.append((ent.name, ent.path, is_file, is_dir))
+    except OSError:
+        return [], False
+    entries.sort(key=lambda item: item[0])
+    cache[path] = (key, entries)
+    if cap is not None:
+        cap[0] -= 1
+    return entries, True
 
 
 def discover(state: dict | None = None) -> list:
@@ -87,13 +276,16 @@ def discover(state: dict | None = None) -> list:
         except Exception as exc:
             found.append(_Broken(info.name, exc))
             if state is not None:
-                state[info.name] = {"last_poll": None, "last_error": _short(exc), "skip": True}
+                bad = _new_state()
+                bad["last_error"] = _short(exc)
+                bad["skip"] = True
+                state[info.name] = bad
             continue
         if not all(hasattr(module, attr) for attr in ("NAME", "INTERVAL_S", "poll")):
             continue
         found.append(module)
         if state is not None:
-            state[module.NAME] = {"last_poll": None, "last_error": None, "skip": False}
+            state[module.NAME] = _new_state()
     found.sort(key=lambda source: source.NAME)
     return found
 

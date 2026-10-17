@@ -786,8 +786,24 @@ def main():
         "health.json": {
             "ok": True,
             "sources": [
-                {"name": name, "last_poll": NOW - 1, "last_error": None, "lag_s": 1}
-                for name in ("claude", "manifests", "muse", "grok_cli", "cursor", "process", "hub")
+                {
+                    "name": name,
+                    "last_poll": NOW - 1,
+                    "last_error": None,
+                    "lag_s": 1,
+                    "last_duration_s": 0.1,
+                    "interval_s": interval,
+                    "stalled": False,
+                }
+                for name, interval in (
+                    ("claude", 2),
+                    ("manifests", 2),
+                    ("muse", 2),
+                    ("grok_cli", 2),
+                    ("cursor", 2),
+                    ("process", 5),
+                    ("hub", 60),
+                )
             ],
             "_note": NOTE,
         },

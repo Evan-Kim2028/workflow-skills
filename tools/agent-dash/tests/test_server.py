@@ -202,7 +202,7 @@ class ServerTest(unittest.TestCase):
         self.assertIn(b"event: tick\n", buf)
         data = json.loads(buf.split(b"data: ", 1)[1].split(b"\n", 1)[0])
         self.assertTrue({"seq", "running"} <= set(data), data.keys())
-        for key in ("now", "data_seq", "last_data_ts", "last_poll"):
+        for key in ("now", "data_seq", "last_data_ts", "last_poll", "sources"):
             self.assertIn(key, data, f"tick payload misses freshness field {key}")
         conn.close()
 

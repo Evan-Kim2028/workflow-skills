@@ -32,6 +32,8 @@ DBFILE = STATE_DIR / "dash.sqlite"
 HOST = "127.0.0.1"
 PORT = 8765
 RECONCILE_INTERVAL_S = 60
+PRUNE_INTERVAL_S = 60
+BACKUP_KEEP = 3
 URL = f"http://{HOST}:{PORT}/"
 
 USAGE = """agent-dash: local read-only execution dashboard
@@ -81,6 +83,7 @@ def default_cfg() -> dict:
         "issues_dir": "",
         "workstreams_tsv": "",
         "state_dir": str(STATE_DIR),
+        "poll_budget_s": 25.0,
         "backfill": False,
         "backfill_session": None,
     }
@@ -733,6 +736,67 @@ def reconcile_if_due(store, now: float, last: float | None, interval: float = RE
     return now
 
 
+def rotate_backups(state_dir, keep: int = BACKUP_KEEP, dest=None) -> list:
+    """Move ``*.bak-*`` files beyond the newest ``keep`` out of the state dir.
+
+    ``dest`` defaults to a ``<state-dir>-retired`` sibling. Returns the
+    moved paths as strings. Never raises: failures are logged and skipped.
+    """
+    log = logging.getLogger("agent_dash.prune")
+    try:
+        root = Path(state_dir)
+        cands = [path for path in root.glob("*.bak-*") if path.is_file()]
+    except OSError as exc:
+        log.warning("backup rotation: %s", type(exc).__name__)
+        return []
+    if len(cands) <= keep:
+        return []
+    try:
+        order = sorted(cands, key=lambda path: path.stat().st_mtime)
+    except OSError as exc:
+        log.warning("backup rotation: %s", type(exc).__name__)
+        return []
+    if dest is None:
+        dest = root.parent / (root.name + "-retired")
+    try:
+        Path(dest).mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        log.warning("backup rotation: %s", type(exc).__name__)
+        return []
+    moved = []
+    for path in order[: len(order) - keep]:
+        try:
+            target = Path(dest) / path.name
+            os.replace(path, target)
+        except OSError as exc:
+            log.warning("backup rotation %s: %s", path.name, type(exc).__name__)
+            continue
+        moved.append(str(target))
+    if moved:
+        log.info("backup rotation moved %d file(s) to %s", len(moved), dest)
+    return moved
+
+
+def prune_if_due(store, state_dir, now: float, last: float | None, interval: float = PRUNE_INTERVAL_S) -> float:
+    """Prune one batch of dead offset rows and rotate backups when due.
+
+    ``last is None`` runs immediately so a restart starts draining on the
+    first tick. Returns the timestamp of the last prune.
+    """
+    if last is not None and now - last < interval:
+        return last
+    log = logging.getLogger("agent_dash.prune")
+    try:
+        deleted = store.prune_offsets()
+    except Exception:
+        log.exception("offset prune failed")
+    else:
+        if deleted:
+            log.info("offset prune deleted %d row(s)", deleted)
+    rotate_backups(state_dir)
+    return now
+
+
 def _serve() -> None:
     cfg = load_cfg()
     store = Store(DBFILE)
@@ -753,11 +817,13 @@ def _serve() -> None:
 
     def loop():
         last_reconcile = None
+        last_prune = None
         while not stop.wait(0.25):
             now = time.time()
             try:
                 registry.tick(store, cfg, now, stop=stop)
                 last_reconcile = reconcile_if_due(store, now, last_reconcile)
+                last_prune = prune_if_due(store, STATE_DIR, now, last_prune)
             except Exception:
                 logging.exception("collector tick failed")
         server.stop.set()

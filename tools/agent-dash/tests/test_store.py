@@ -2406,5 +2406,57 @@ class NewerOpenLabelRowTest(unittest.TestCase):
         self.assertEqual(twin["run_id"], "muse:new:ws1-z")
 
 
+class PruneOffsetsTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.store = memory(Path(self.tmp.name))
+
+    def tearDown(self):
+        self.store.close()
+        self.tmp.cleanup()
+
+    def test_prune_deletes_only_gone_files_in_batches(self):
+        live = os.path.join(self.tmp.name, "live.jsonl")
+        with open(live, "w", encoding="utf-8") as fh:
+            fh.write("{}\n")
+        gone = [os.path.join(self.tmp.name, f"gone-{i}.jsonl") for i in range(4)]
+        self.store.set_offset(live, 1, 0, 3, 1.0)
+        for index, path in enumerate(gone):
+            self.store.set_offset(path, 1, 0, 3, 1.0 + index)
+        self.store.set_offset("muse:fresh-scan", 0, 5, 3, 2.0)
+        self.store.set_offset(os.path.join(self.tmp.name, "gone#b#blob"), 1, 1, 0, 0.0)
+        self.assertEqual(self.store.prune_offsets(batch=2), 1)
+        self.assertEqual(self.store.prune_offsets(batch=2), 2)
+        self.assertEqual(self.store.prune_offsets(batch=2), 1)
+        self.assertEqual(self.store.prune_offsets(batch=2), 1)
+        self.assertEqual(self.store.prune_offsets(batch=2), 0)
+        paths = {
+            row[0]
+            for row in self.store._conn.execute("SELECT path FROM file_offsets").fetchall()
+        }
+        self.assertEqual(paths, {live, "muse:fresh-scan"})
+
+    def test_prune_vacuums_once_per_pass(self):
+        live = os.path.join(self.tmp.name, "live.jsonl")
+        with open(live, "w", encoding="utf-8") as fh:
+            fh.write("{}\n")
+        for index in range(10):
+            self.store.set_offset(os.path.join(self.tmp.name, f"old-{index}.jsonl"), 1, 0, 3, 1.0)
+        self.store.set_offset(live, 1, 0, 3, 1.0)
+        total = 0
+        for _ in range(20):
+            deleted = self.store.prune_offsets(batch=3)
+            total += deleted
+            if deleted == 0:
+                break
+        self.assertEqual(total, 10)
+        self.assertEqual(self.store._pruned_since_vacuum, 0)
+        remaining = {
+            row[0]
+            for row in self.store._conn.execute("SELECT path FROM file_offsets").fetchall()
+        }
+        self.assertEqual(remaining, {live})
+
+
 if __name__ == "__main__":
     unittest.main()
