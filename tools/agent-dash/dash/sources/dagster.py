@@ -28,10 +28,12 @@ _TIER = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,31}$")
 
 ACTIVE = {"QUEUED", "STARTING", "STARTED", "CANCELING"}
 TERMINAL = {"SUCCESS": "SUCCESS", "FAILURE": "FAILURE", "CANCELED": "CANCELED"}
+ACTIVE_LIMIT = 200
+BY_ID_BATCH = 50
 
 QUERY = """
 query DagsterRuns($since: Float!) {
-  active: runsOrError(limit: 60, filter: {statuses: [QUEUED, STARTING, STARTED, CANCELING]}) {
+  active: runsOrError(limit: 200, filter: {statuses: [QUEUED, STARTING, STARTED, CANCELING]}) {
     __typename
     ...RunSet
   }
@@ -58,6 +60,27 @@ fragment RunSet on RunsOrError {
   }
   ... on PythonError { message }
   ... on InvalidPipelineRunsFilterError { message }
+}
+"""
+
+QUERY_BY_ID = """
+query DagsterRunsById($ids: [String!]) {
+  byId: runsOrError(limit: 200, filter: {runIds: $ids}) {
+    __typename
+    ... on Runs {
+      results {
+        runId
+        jobName
+        status
+        startTime
+        endTime
+        creationTime
+        tags { key value }
+      }
+    }
+    ... on PythonError { message }
+    ... on InvalidPipelineRunsFilterError { message }
+  }
 }
 """
 
@@ -128,16 +151,28 @@ def _poll(store, cfg: dict, now: float) -> None:
         return
     try:
         payload = json.loads(text or "")
-        raw_runs = _collect(payload, now)
+        active_raw, recent_raw = _split(payload, now)
     except (json.JSONDecodeError, ValueError) as exc:
         last_error = _clip(f"{type(exc).__name__}: {exc}")
         log.warning("dagster: %s", last_error)
         return
-    for raw in raw_runs:
+    found = {}
+    for raw in list(active_raw) + list(recent_raw):
+        if isinstance(raw, dict) and isinstance(raw.get("runId"), str):
+            found[raw["runId"]] = raw
+    for raw in found.values():
         row = _map(raw, now)
         if row is not None:
             store.upsert_run(row)
+    active_ids = [rid for rid in found if rid in {r.get("runId") for r in active_raw}]
+    active_ids = sorted({rid for rid in active_ids if isinstance(rid, str)})
+    full_page = len(active_raw) >= ACTIVE_LIMIT
+    _remember_active(store, active_ids, now, full_page)
     last_error = None
+    if full_page:
+        log.warning("dagster: active page full (%d); skipping close-out", len(active_raw))
+        return
+    _close_absent(store, host, url, active_ids, now)
 
 
 def _settings(cfg: dict):
@@ -178,31 +213,168 @@ def _ssh(host: str, url: str, body: bytes):
 
 
 def _collect(payload: dict, now: float) -> list:
+    active_raw, recent_raw = _split(payload, now)
+    found = {}
+    for raw in list(active_raw) + list(recent_raw):
+        if isinstance(raw, dict) and isinstance(raw.get("runId"), str):
+            found[raw["runId"]] = raw
+    return list(found.values())
+
+
+def _split(payload: dict, now: float) -> tuple[list, list]:
     if not isinstance(payload, dict):
         raise ValueError("bad response")
     data = payload.get("data")
     if not isinstance(data, dict):
         raise ValueError("graphql error")
+    active_raw = _results(data, "active")
+    recent_raw = [raw for raw in _results(data, "recent") if _ended_in_window(raw, now)]
+    return active_raw, recent_raw
+
+
+def _results(data: dict, key: str) -> list:
+    block = data.get(key)
+    if not isinstance(block, dict) or block.get("__typename") != "Runs":
+        detail = ""
+        if isinstance(block, dict):
+            detail = str(block.get("message") or block.get("__typename") or "")
+        raise ValueError(_clip(f"{key}: {detail or 'missing'}"))
+    results = block.get("results")
+    if not isinstance(results, list):
+        raise ValueError(f"{key}: no results")
+    return [raw for raw in results if isinstance(raw, dict)]
+
+
+def _remember_active(store, active_ids: list, now: float, full_page: bool) -> None:
+    if not callable(getattr(store, "set_dagster_active", None)):
+        return
+    if not callable(getattr(store, "note_dagster_seen", None)):
+        return
+    try:
+        store.set_dagster_active(active_ids, now, full_page)
+        full = [
+            rid if rid.startswith("dagster:") else "dagster:" + rid
+            for rid in active_ids
+        ]
+        store.note_dagster_seen(full, now)
+    except Exception as exc:
+        log.warning("dagster state: %s", type(exc).__name__)
+
+
+def _close_absent(store, host: str, url: str, active_ids: list, now: float) -> None:
+    getter = getattr(store, "dagster_open_runs", None)
+    if not callable(getter):
+        return
+    try:
+        stored = getter()
+    except Exception:
+        return
+    active = set(active_ids)
+    missing = []
+    for row in stored:
+        run_id = row.get("run_id") or ""
+        short = run_id[len("dagster:"):] if run_id.startswith("dagster:") else run_id
+        if short not in active and run_id not in active:
+            missing.append(row)
+    if not missing:
+        return
+    by_id = {}
+    fetched = set()
+    for index in range(0, len(missing), BY_ID_BATCH):
+        chunk = missing[index:index + BY_ID_BATCH]
+        ids = []
+        for row in chunk:
+            run_id = row.get("run_id") or ""
+            short = run_id[len("dagster:"):] if run_id.startswith("dagster:") else run_id
+            if short:
+                ids.append(short)
+        try:
+            found = _fetch_by_id(host, url, ids)
+        except Exception as exc:
+            log.warning("dagster by-id: %s", type(exc).__name__)
+            continue
+        fetched.update(ids)
+        by_id.update(found)
+    for row in missing:
+        run_id = row.get("run_id") or ""
+        short = run_id[len("dagster:"):] if run_id.startswith("dagster:") else run_id
+        if short not in fetched:
+            continue
+        raw = by_id.get(short)
+        if raw is not None:
+            mapped = _map_close(raw, now)
+            if mapped is not None:
+                try:
+                    store.upsert_run(mapped)
+                except Exception:
+                    log.warning("dagster close: %s", type(Exception).__name__)
+            continue
+        _close_unknown(store, row, now)
+
+
+def _fetch_by_id(host: str, url: str, ids: list) -> dict:
+    """Read-only fetch of runs by id. Returns runId -> raw run."""
+    if not ids:
+        return {}
+    body = json.dumps({"query": QUERY_BY_ID, "variables": {"ids": list(ids)}}).encode("utf-8")
+    text, err = _ssh(host, url, body)
+    if err:
+        raise ValueError(_clip(err))
+    try:
+        payload = json.loads(text or "")
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{type(exc).__name__}: {exc}") from exc
+    data = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(data, dict):
+        raise ValueError("graphql error")
+    block = data.get("byId")
+    if not isinstance(block, dict) or block.get("__typename") != "Runs":
+        detail = ""
+        if isinstance(block, dict):
+            detail = str(block.get("message") or block.get("__typename") or "")
+        raise ValueError(_clip(f"byId: {detail or 'missing'}"))
+    results = block.get("results")
+    if not isinstance(results, list):
+        raise ValueError("byId: no results")
     found = {}
-    for key in ("recent", "active"):
-        block = data.get(key)
-        if not isinstance(block, dict) or block.get("__typename") != "Runs":
-            detail = ""
-            if isinstance(block, dict):
-                detail = str(block.get("message") or block.get("__typename") or "")
-            raise ValueError(_clip(f"{key}: {detail or 'missing'}"))
-        results = block.get("results")
-        if not isinstance(results, list):
-            raise ValueError(f"{key}: no results")
-        for raw in results:
-            if not isinstance(raw, dict):
-                continue
-            if key == "recent" and not _ended_in_window(raw, now):
-                continue
-            run_id = raw.get("runId")
-            if isinstance(run_id, str):
-                found[run_id] = raw
-    return list(found.values())
+    for raw in results:
+        if isinstance(raw, dict) and isinstance(raw.get("runId"), str):
+            found[raw["runId"]] = raw
+    return found
+
+
+def _close_unknown(store, row: dict, now: float) -> None:
+    """Dagster no longer knows this run: close it as finished/UNKNOWN."""
+    run_id = row.get("run_id")
+    if not run_id:
+        return
+    last_seen = None
+    getter = getattr(store, "dagster_last_seen", None)
+    if callable(getter):
+        try:
+            last_seen = getter(run_id)
+        except Exception:
+            last_seen = None
+        if last_seen is None and run_id.startswith("dagster:"):
+            try:
+                last_seen = getter(run_id[len("dagster:"):])
+            except Exception:
+                last_seen = None
+    ended = last_seen or row.get("started_at") or float(now)
+    log.warning("dagster: closing unknown run %s as finished/UNKNOWN", run_id)
+    try:
+        store.upsert_run(
+            {
+                "run_id": run_id,
+                "source": "dagster",
+                "status": "finished",
+                "verdict": "UNKNOWN",
+                "ended_at": ended,
+                "pid": None,
+            }
+        )
+    except Exception:
+        log.warning("dagster close: %s", type(Exception).__name__)
 
 
 def _ended_in_window(raw: dict, now: float) -> bool:
@@ -223,6 +395,42 @@ def _map(raw: dict, now: float):
     if status_name not in ACTIVE and status_name not in TERMINAL:
         return None
     if status_name in TERMINAL and not _ended_in_window(raw, now):
+        return None
+    tags = select_tags(raw.get("tags"))
+    status, verdict = _status(status_name)
+    if status is None:
+        return None
+    started = _epoch(raw.get("startTime")) or _epoch(raw.get("creationTime"))
+    ended = _epoch(raw.get("endTime")) if status == "finished" else None
+    tier = tags.get("lor/slot_class")
+    if tier is not None and not _TIER.match(tier):
+        tier = None
+    return {
+        "run_id": "dagster:" + run_id,
+        "source": "dagster",
+        "tier": tier,
+        "model": job,
+        "label": _label(job, tags),
+        "status": status,
+        "verdict": verdict,
+        "started_at": started,
+        "ended_at": ended,
+        "clock_source": "dagster",
+    }
+
+
+def _map_close(raw: dict, now: float):
+    """Map a by-id close-out result. Unlike `_map`, a terminal run is stored
+    no matter how long ago it ended: it finished during a gap the recent
+    window never saw, and dropping it would leave it running forever."""
+    run_id = raw.get("runId")
+    job = raw.get("jobName")
+    if not isinstance(run_id, str) or not _RUN_ID.match(run_id):
+        return None
+    if not isinstance(job, str) or not _JOB.match(job):
+        return None
+    status_name = str(raw.get("status") or "").upper()
+    if status_name not in ACTIVE and status_name not in TERMINAL:
         return None
     tags = select_tags(raw.get("tags"))
     status, verdict = _status(status_name)

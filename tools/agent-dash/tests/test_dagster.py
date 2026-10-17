@@ -140,7 +140,7 @@ class DagsterTests(unittest.TestCase):
         self.assertEqual(seen["calls"], 1)
         self.assertEqual(seen["host"], "dagster-host")
         self.assertEqual(seen["url"], "http://127.0.0.1:3000/graphql")
-        self.assertIn("runsOrError(limit: 60", seen["payload"]["query"])
+        self.assertIn("runsOrError(limit: 200", seen["payload"]["query"])
         self.assertIn("QUEUED, STARTING, STARTED", seen["payload"]["query"])
         self.assertAlmostEqual(seen["payload"]["variables"]["since"], NOW - 7200)
         self.assertIsNone(dagster.last_error)
@@ -328,6 +328,154 @@ class DagsterTests(unittest.TestCase):
         health = registry.health(NOW)
         self.assertTrue(health["ok"])
         self.assertIsNone(health["sources"][0]["last_error"])
+
+    def _feed_with_by_id(self, active, recent, by_id_map, now=NOW):
+        calls = []
+
+        def fake(host, url, payload):
+            body = json.loads(payload)
+            calls.append(body["query"])
+            if "DagsterRunsById" in body["query"]:
+                ids = body["variables"]["ids"]
+                results = [by_id_map[i] for i in ids if i in by_id_map]
+                return json.dumps({"data": {"byId": {"__typename": "Runs", "results": results}}}), None
+            return _payload(active, recent), None
+
+        dagster._ssh = fake
+        dagster.poll(self.store, CFG, now)
+        return calls
+
+    def test_close_out_by_id(self):
+        live_id = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+        gone_id = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+        self.store.upsert_run(
+            {
+                "run_id": "dagster:" + live_id,
+                "source": "dagster",
+                "model": "test_job_alpha",
+                "label": "test_job_alpha",
+                "status": "running",
+                "started_at": NOW - 5000,
+                "clock_source": "dagster",
+            }
+        )
+        self.store.upsert_run(
+            {
+                "run_id": "dagster:" + gone_id,
+                "source": "dagster",
+                "model": "test_job_beta",
+                "label": "test_job_beta",
+                "status": "running",
+                "started_at": NOW - 4000,
+                "clock_source": "dagster",
+            }
+        )
+        active = [_run(live_id, "test_job_alpha", "STARTED")]
+        done_raw = _run(gone_id, "test_job_beta", "SUCCESS", endTime=NOW - 60)
+        calls = self._feed_with_by_id(active, [], {gone_id: done_raw})
+        self.assertEqual(len(calls), 2)
+        self.assertIn("runIds", calls[1])
+        live = self.store.get_run("dagster:" + live_id)
+        self.assertEqual(live["status"], "running")
+        closed = self.store.get_run("dagster:" + gone_id)
+        self.assertEqual(closed["status"], "finished")
+        self.assertEqual(closed["verdict"], "SUCCESS")
+        self.assertEqual(closed["ended_at"], NOW - 60)
+        self.assertIsNone(dagster.last_error)
+        snap = self.store.snapshot(NOW, "all")
+        self.assertNotIn(
+            "dagster:" + gone_id, [row["run_id"] for row in snap["running"]]
+        )
+
+    def test_close_out_old_terminal(self):
+        gone_id = "ffffffff-ffff-ffff-ffff-ffffffffffff"
+        self.store.upsert_run(
+            {
+                "run_id": "dagster:" + gone_id,
+                "source": "dagster",
+                "model": "test_job_old",
+                "label": "test_job_old",
+                "status": "running",
+                "started_at": NOW - 13 * 3600,
+                "clock_source": "dagster",
+            }
+        )
+        old_raw = _run(gone_id, "test_job_old", "FAILURE", endTime=NOW - 13 * 3600)
+        self._feed_with_by_id([], [], {gone_id: old_raw})
+        closed = self.store.get_run("dagster:" + gone_id)
+        self.assertEqual(closed["status"], "finished")
+        self.assertEqual(closed["verdict"], "FAILURE")
+        self.assertEqual(closed["ended_at"], NOW - 13 * 3600)
+
+    def test_full_page_guard_closes_nothing(self):
+        gone_id = "cccccccc-cccc-cccc-cccc-cccccccccccc"
+        self.store.upsert_run(
+            {
+                "run_id": "dagster:" + gone_id,
+                "source": "dagster",
+                "model": "test_job_gamma",
+                "label": "test_job_gamma",
+                "status": "running",
+                "started_at": NOW - 3000,
+                "clock_source": "dagster",
+            }
+        )
+        active = [
+            _run("%08x-0000-4000-8000-%012x" % (i, i), "test_job_bulk", "STARTED")
+            for i in range(200)
+        ]
+        calls = self._feed_with_by_id(active, [], {})
+        self.assertEqual(len(calls), 1)
+        kept = self.store.get_run("dagster:" + gone_id)
+        self.assertEqual(kept["status"], "running")
+
+    def test_failed_by_id_closes_nothing(self):
+        gone_id = "dddddddd-dddd-dddd-dddd-dddddddddddd"
+        self.store.upsert_run(
+            {
+                "run_id": "dagster:" + gone_id,
+                "source": "dagster",
+                "model": "test_job_delta",
+                "label": "test_job_delta",
+                "status": "running",
+                "started_at": NOW - 2000,
+                "clock_source": "dagster",
+            }
+        )
+
+        def fake(host, url, payload):
+            body = json.loads(payload)
+            if "DagsterRunsById" in body["query"]:
+                return None, "Connection refused"
+            return _payload([], []), None
+
+        dagster._ssh = fake
+        dagster.poll(self.store, CFG, NOW)
+        kept = self.store.get_run("dagster:" + gone_id)
+        self.assertEqual(kept["status"], "running")
+
+    def test_unknown_run_closes_as_finished_unknown(self):
+        gone_id = "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee"
+        seen_at = NOW - 3600
+        self.store.upsert_run(
+            {
+                "run_id": "dagster:" + gone_id,
+                "source": "dagster",
+                "model": "test_job_epsilon",
+                "label": "test_job_epsilon",
+                "status": "running",
+                "started_at": seen_at - 100,
+                "clock_source": "dagster",
+            }
+        )
+        self.store.note_dagster_seen(["dagster:" + gone_id], seen_at)
+        self.store.set_dagster_active([], NOW - 7200, False)
+        calls = self._feed_with_by_id([], [], {})
+        self.assertEqual(len(calls), 2)
+        closed = self.store.get_run("dagster:" + gone_id)
+        self.assertEqual(closed["status"], "finished")
+        self.assertEqual(closed["verdict"], "UNKNOWN")
+        self.assertEqual(closed["ended_at"], seen_at)
 
 
 if __name__ == "__main__":

@@ -383,23 +383,10 @@ def read_tail(path) -> str:
 
 
 def pid_alive(pid) -> bool:
-    """True while the worker runs. Reaps our own exited child first: a zombie still answers kill(0)."""
-    try:
-        if os.waitpid(int(pid), os.WNOHANG)[0] != 0:
-            return False
-    except ChildProcessError:
-        pass
-    except (OSError, TypeError, ValueError):
-        return False
-    try:
-        os.kill(int(pid), 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    except (OSError, TypeError, ValueError):
-        return False
-    return True
+    """True while the worker runs. One shared helper lives in dash.liveness."""
+    from dash.liveness import pid_alive as _alive
+
+    return _alive(pid)
 
 
 def pgrep_count(pattern: str) -> int:

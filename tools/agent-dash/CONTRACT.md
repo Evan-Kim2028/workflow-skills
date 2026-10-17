@@ -174,6 +174,35 @@ interval, so no tab ever shows another tab's or another range's numbers. A
 scope with no tokens in range reads "0 in N h" with its last run and all-time
 total underneath.
 
+## Liveness
+
+A running row is a claim that its source still sees it. Every source may
+only emit `running` while it holds fresh liveness evidence, and one shared
+helper (`dash/liveness.py` `pid_alive`, reap-safe like the worker runner)
+decides whether a stored pid is still alive. A running row whose pid is
+dead is closed with `ended_at` at the last evidence (transcript mtime or
+last usage/sample), never left running.
+
+| Source | Running rule |
+|---|---|
+| `dagster` | Live only while in the latest successful active set (`QUEUED`, `STARTING`, `STARTED`, `CANCELING`, limit 200). Each successful poll reconciles: stored `running`/`queued` rows absent from the active set are fetched by id (read-only `runIds` filter, batched) and stored with their real terminal status, verdict, and `endTime`. A full active page skips close-out; a failed poll closes nothing. A run Dagster no longer knows closes as `finished`/`UNKNOWN` with `ended_at` at the last seen time. |
+| `claude-main` | Live only while the registry says `busy` AND the pid is alive AND the transcript was written within `running_mtime_s` (15 min). A dead pid closes the row at the last transcript/registry evidence. An idle-but-alive interactive session (no transcript write for longer than the window) is not running: it stays out of Running now until it writes again. Lead sessions are never agents; `live_agents` is unchanged. |
+| `claude-subagent`, `claude-workflow` | Live only while the transcript was written within `running_mtime_s` and the last event is not a result. A quiet file is `done`, never left running. |
+| `muse`, `glm` | Live only while a live process matches pid, `[label:]`, prompt-file label, or session uuid (`process.match_agent`). A new row with no match opens as `unknown`, never `running`. |
+| `grok` (cursor-agent) | Live only while a live `cursor-agent` process carries the run's pid or `[label:]`. A chat whose process is gone is `done` (or `unknown` without a timestamp). |
+| `shell` (exec) | Live only while the out file grew since the previous poll or a live label was sampled within `process_ttl_s` (30 s). Out growth and the live label are the evidence; rows carry no pid. |
+| `manifests` (muse/glm/grok rows) | Same as the tool rows above: `running` only on out growth or a live label; otherwise `done`/`unknown`. |
+
+One filtered running set backs every view: the snapshot `running` list,
+`counts.live_agents`, `/api/workstreams` `live_agents`, and the timeline's
+open bars (`/api/runs`, `/api/concurrency`) all derive from
+`Store._live_open_ids_locked`, so no view can show a run another hides.
+`/api/reconcile` (and `agent_dash.py check`) reports every running row with
+no liveness evidence as a `stale running` mismatch: a dead pid, a Dagster
+run missing from the fresh active set, or no source evidence (usage,
+process sample, start) for longer than 6 h (`STALE_IDLE_S`). A stale row is
+excluded from all four views at once.
+
 Each bundle:
 
 | File | Role |

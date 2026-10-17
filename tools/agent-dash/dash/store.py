@@ -10,6 +10,11 @@ from pathlib import Path
 from datetime import datetime
 
 from dash.attribution import attribute, clean_label
+from dash.liveness import (
+    DAGSTER_ACTIVE_FRESH_S,
+    STALE_IDLE_S,
+    pid_alive as _pid_alive,
+)
 from dash.pricing import cost as price_cost
 from dash.pricing import series_key
 from dash.models import model_key, run_model_key
@@ -380,6 +385,242 @@ class Store:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def set_dagster_active(self, run_ids, now: float, full_page: bool = False) -> None:
+        """Remember the latest successful Dagster active set for stale checks."""
+        import json as _json
+
+        payload = _json.dumps(
+            {"ids": sorted(set(run_ids)), "now": float(now), "full_page": bool(full_page)}
+        )
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO meta(key, value) VALUES('dagster_active', ?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (payload,),
+            )
+
+    def get_dagster_active(self):
+        """Latest successful active set, or None when no poll has succeeded."""
+        import json as _json
+
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT value FROM meta WHERE key='dagster_active'"
+            ).fetchone()
+        if not row or not row["value"]:
+            return None
+        try:
+            data = _json.loads(row["value"])
+        except (TypeError, ValueError):
+            return None
+        if not isinstance(data, dict):
+            return None
+        return data
+
+    def note_dagster_seen(self, run_ids, now: float) -> None:
+        """Record when each active Dagster run was last seen (for close-out)."""
+        if not run_ids:
+            return
+        with self._lock:
+            self._conn.executemany(
+                "INSERT INTO dagster_seen(run_id, last_seen) VALUES(?, ?) "
+                "ON CONFLICT(run_id) DO UPDATE SET last_seen=excluded.last_seen",
+                [(rid, float(now)) for rid in set(run_ids)],
+            )
+
+    def dagster_last_seen(self, run_id: str):
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT last_seen FROM dagster_seen WHERE run_id=?", (run_id,)
+            ).fetchone()
+        return float(row["last_seen"]) if row and row["last_seen"] is not None else None
+
+    def dagster_open_runs(self) -> list:
+        """Stored Dagster rows still marked running or queued."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM runs WHERE source='dagster' AND status IN ('running','queued')"
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def stale_running(self, now: float, pid_alive_fn=None) -> list:
+        """Running rows with no liveness evidence, each with a reason.
+
+        Reasons: a dead pid; a Dagster run absent from the latest successful
+        active set; or no source evidence (usage, process sample, start) for
+        longer than STALE_IDLE_S. Dagster rows are stale only when the active
+        set is fresh and not a full page; a failed or full-page poll reports
+        nothing. Returns a list of ``(run, reason)``.
+        """
+        with self._lock:
+            rows = [
+                dict(row)
+                for row in self._conn.execute(
+                    "SELECT * FROM runs WHERE status IN ('running','queued')"
+                ).fetchall()
+            ]
+            return self._stale_locked(now, rows, pid_alive_fn=pid_alive_fn)
+
+    def _stale_locked(self, now: float, rows: list, pid_alive_fn=None) -> list:
+        """Stale subset of ``rows``. Caller holds the lock."""
+        now = float(now)
+        check = pid_alive_fn or _pid_alive
+        dagster_active = self._dagster_active_locked()
+        dag_ids = None
+        dag_fresh = False
+        if dagster_active is not None:
+            try:
+                poll_time = float(dagster_active.get("now") or 0)
+            except (TypeError, ValueError):
+                poll_time = 0
+            full = bool(dagster_active.get("full_page"))
+            if not full and now - poll_time <= DAGSTER_ACTIVE_FRESH_S:
+                dag_fresh = True
+                dag_ids = set(dagster_active.get("ids") or [])
+        open_rows = [
+            row for row in rows if (row.get("status") in ("running", "queued"))
+        ]
+        if not open_rows:
+            return []
+        usage_max = self._usage_max_locked([row["run_id"] for row in open_rows])
+        sample_max = self._sample_max_locked(open_rows)
+        stale = []
+        for row in open_rows:
+            reason = self._stale_reason_locked(
+                row, now, dag_ids, dag_fresh, usage_max, sample_max, check
+            )
+            if reason:
+                stale.append((dict(row), reason))
+        return stale
+
+    def _live_open_ids_locked(self, now: float, rows: list, pid_alive_fn=None) -> set:
+        """Run ids of open rows with liveness evidence. Caller holds the lock.
+
+        This is the one filtered running set every view uses: the snapshot
+        running list, ``counts.live_agents``, ``/api/workstreams``
+        ``live_agents``, and the timeline's open bars all derive from it, so
+        no view can show a run another hides.
+        """
+        stale_ids = {
+            run["run_id"] for run, _reason in self._stale_locked(now, rows, pid_alive_fn)
+        }
+        return {
+            row["run_id"]
+            for row in rows
+            if row.get("status") in ("running", "queued")
+            and row.get("run_id") not in stale_ids
+        }
+
+    def _stale_reason_locked(
+        self, run: dict, now: float, dag_ids, dag_fresh: bool,
+        usage_max: dict, sample_max: dict, check,
+    ):
+        source = run.get("source") or ""
+        status = run.get("status")
+        run_id = run.get("run_id")
+        if status not in ("running", "queued"):
+            return None
+        if source == "dagster":
+            if status not in ("running", "queued"):
+                return None
+            if dag_ids is None or not dag_fresh:
+                return None
+            short = run_id[len("dagster:"):] if run_id.startswith("dagster:") else run_id
+            if short not in dag_ids and run_id not in dag_ids:
+                return "dagster run missing from the latest successful active set"
+            return None
+        pid = run.get("pid")
+        if pid is not None:
+            try:
+                alive = bool(check(pid))
+            except Exception:
+                alive = False
+            if not alive:
+                return f"dead pid {pid}"
+        stamps = []
+        started = run.get("started_at")
+        if isinstance(started, (int, float)) and not isinstance(started, bool):
+            stamps.append(float(started))
+        hit = usage_max.get(run_id)
+        if hit is not None:
+            stamps.append(float(hit))
+        hit = sample_max.get(run_id)
+        if hit is not None:
+            stamps.append(float(hit))
+        if pid is not None:
+            hit = sample_max.get(f"pid:{pid}")
+            if hit is not None:
+                stamps.append(float(hit))
+        last = max(stamps) if stamps else None
+        if last is None:
+            return None
+        if now - last > STALE_IDLE_S:
+            return f"no source evidence for longer than {int(STALE_IDLE_S // 3600)}h"
+        return None
+
+    def _dagster_active_locked(self):
+        import json as _json
+
+        row = self._conn.execute(
+            "SELECT value FROM meta WHERE key='dagster_active'"
+        ).fetchone()
+        if not row or not row["value"]:
+            return None
+        try:
+            data = _json.loads(row["value"])
+        except (TypeError, ValueError):
+            return None
+        return data if isinstance(data, dict) else None
+
+    def _usage_max_locked(self, run_ids: list) -> dict:
+        if not run_ids:
+            return {}
+        found = {}
+        step = 500
+        for index in range(0, len(run_ids), step):
+            chunk = run_ids[index:index + step]
+            marks = ",".join("?" for _ in chunk)
+            for row in self._conn.execute(
+                f"SELECT run_id, MAX(ts) AS ts FROM usage_events "
+                f"WHERE run_id IN ({marks}) GROUP BY run_id",
+                chunk,
+            ).fetchall():
+                if row["ts"] is not None:
+                    found[row["run_id"]] = float(row["ts"])
+        return found
+
+    def _sample_max_locked(self, rows: list) -> dict:
+        """Latest process-sample ts by run id and by pid."""
+        run_ids = [row.get("run_id") for row in rows if row.get("run_id")]
+        pids = [row.get("pid") for row in rows if row.get("pid") is not None]
+        found = {}
+        if run_ids:
+            step = 500
+            for index in range(0, len(run_ids), step):
+                chunk = run_ids[index:index + step]
+                marks = ",".join("?" for _ in chunk)
+                for row in self._conn.execute(
+                    f"SELECT run_id, MAX(ts) AS ts FROM process_samples "
+                    f"WHERE run_id IN ({marks}) GROUP BY run_id",
+                    chunk,
+                ).fetchall():
+                    if row["run_id"] and row["ts"] is not None:
+                        found[row["run_id"]] = float(row["ts"])
+        if pids:
+            uniq = sorted({int(pid) for pid in pids})
+            step = 500
+            for index in range(0, len(uniq), step):
+                chunk = uniq[index:index + step]
+                marks = ",".join("?" for _ in chunk)
+                for row in self._conn.execute(
+                    f"SELECT pid, MAX(ts) AS ts FROM process_samples "
+                    f"WHERE pid IN ({marks}) GROUP BY pid",
+                    chunk,
+                ).fetchall():
+                    if row["ts"] is not None:
+                        found[f"pid:{int(row['pid'])}"] = float(row["ts"])
+        return found
+
     def session_runs(self, session_id: str) -> list:
         with self._lock:
             rows = self._conn.execute(
@@ -557,8 +798,13 @@ class Store:
             raise ValueError("bad usage_group")
         with self._lock:
             shown_all, parents = self._shown_locked(now)
+            live_open = self._live_open_ids_locked(now, shown_all)
             scoped = [run for run in shown_all if _in_ws(run, ws)]
-            running = [run for run in scoped if run["status"] == "running"]
+            running = [
+                run
+                for run in scoped
+                if run["status"] == "running" and run["run_id"] in live_open
+            ]
             running.sort(key=lambda run: run["started_at"] or 0, reverse=True)
             recent = [
                 run
@@ -569,7 +815,7 @@ class Store:
             ]
             recent.sort(key=lambda run: run["ended_at"] or 0, reverse=True)
             recent = recent[:50]
-            roll = self._summarize_locked(shown_all, parents, now, since, until)
+            roll = self._summarize_locked(shown_all, parents, now, since, until, live_open)
             if ws is None or ws == "all":
                 key = "all"
                 scope = roll["all"]
@@ -616,13 +862,15 @@ class Store:
         """
         with self._lock:
             shown_all, parents = self._shown_locked(now)
-            return self._summarize_locked(shown_all, parents, now, since, until)
+            live_open = self._live_open_ids_locked(now, shown_all)
+            return self._summarize_locked(shown_all, parents, now, since, until, live_open)
 
     def reconcile_numbers(self, now: float, since: float | None = None, until: float | None = None) -> dict:
         """Cross-check every number once, under one lock. ``mismatches`` is empty when consistent."""
         with self._lock:
             shown_all, parents = self._shown_locked(now)
-            roll = self._summarize_locked(shown_all, parents, now, since, until)
+            live_open = self._live_open_ids_locked(now, shown_all)
+            roll = self._summarize_locked(shown_all, parents, now, since, until, live_open)
             everything = list(roll["rows"]) + [roll["unassigned"]]
             all_counts = roll["all"]["counts"]
             all_totals = roll["all"]["totals"]
@@ -689,6 +937,8 @@ class Store:
                     f"{sum(row['cost_usd_all_time'] for row in everything):.6f}, "
                     f"overview shows {all_time['all']['cost_usd']:.6f}"
                 )
+            for run, reason in self._stale_locked(now, shown_all):
+                mismatches.append(f"stale running: {run.get('run_id')} ({reason})")
             return {
                 "now": now,
                 "since": roll["since"],
@@ -718,14 +968,17 @@ class Store:
         shown = _drop_launch_echoes([view for view in views if view["run_id"] not in parents])
         return shown, parents
 
-    def _summarize_locked(self, shown_all: list, parents: dict, now: float, since, until) -> dict:
+    def _summarize_locked(self, shown_all: list, parents: dict, now: float, since, until, live_open=None) -> dict:
         """Counts, totals, and per-workstream rows from one run list. Caller holds the lock.
 
         Token and cost sums come from the same hourly usage buckets ``/api/usage``
         reads, counting a bucket when its hour overlaps ``[since, until]``. The
         tokens tile and the tokens-per-hour chart legend sum the same cells, so
-        all three agree exactly.
+        all three agree exactly. Live counts use ``live_open`` (the one filtered
+        running set); when None it is computed here.
         """
+        if live_open is None:
+            live_open = self._live_open_ids_locked(now, shown_all)
         range_since = now - RANGE_S if since is None else float(since)
         range_until = float(now if until is None else until)
         cells = self.query_usage("workstream", "hour", None, range_since, range_until)
@@ -736,6 +989,7 @@ class Store:
         scopes["all"] = _scope_numbers(
             shown_all, parents, self._usage_by_run(), now, since, until, range_since, range_until,
             [cell for group in buckets.values() for cell in group],
+            live_open,
         )
         workstreams = sorted({run.get("workstream") or UNASSIGNED for run in shown_all}, key=_ws_sort)
         if UNASSIGNED not in workstreams:
@@ -745,6 +999,7 @@ class Store:
             scopes[ws] = _scope_numbers(
                 members, parents, self._usage_by_run(), now, since, until, range_since, range_until,
                 buckets.get(ws, []),
+                live_open,
             )
         # All-time tokens and cost per scope from the same bucket cells with no
         # window, summed by the same helper as the windowed numbers.
@@ -770,15 +1025,22 @@ class Store:
         }
 
     def query_runs(self, now: float, ws: str | None, since: float | None, until: float | None, limit: int) -> list:
+        """Gantt input. Open bars come from the one filtered running set, so a
+        stale row the snapshot hides never shows as an open bar here."""
         with self._lock:
             raw, usage, parents = self._scoped_usage()
             context = self._context_by_run()
             rss = self._rss_maps(now)
+            live_open = self._live_open_ids_locked(
+                now, [dict(row) for row in raw]
+            )
             rows = []
             for row in raw:
                 if row["run_id"] in parents:
                     continue
                 view = self._run_view(row, now, usage, rss, context)
+                if view.get("status") in ("running", "queued") and view["run_id"] not in live_open:
+                    continue
                 if not _in_ws(view, ws):
                     continue
                 if since is not None and (view["ended_at"] or now) < since:
@@ -896,6 +1158,12 @@ class Store:
             runs = [dict(row) for row in self._all_runs()]
         parents = _parent_map(runs)
         runs = _drop_launch_echoes([run for run in runs if run["run_id"] not in parents and _is_counted_agent(run)])
+        stale_ids = {run["run_id"] for run, _reason in self.stale_running(now)}
+        runs = [
+            run
+            for run in runs
+            if not (run.get("status") in ("running", "queued") and run["run_id"] in stale_ids)
+        ]
         if ws and ws != "all":
             runs = [run for run in runs if run["workstream"] == ws]
         points = []
@@ -1134,6 +1402,14 @@ class Store:
               offset INTEGER NOT NULL,
               size INTEGER,
               mtime REAL
+            );
+            CREATE TABLE IF NOT EXISTS meta (
+              key TEXT PRIMARY KEY,
+              value TEXT
+            );
+            CREATE TABLE IF NOT EXISTS dagster_seen (
+              run_id TEXT PRIMARY KEY,
+              last_seen REAL
             );
             CREATE INDEX IF NOT EXISTS idx_runs_status ON runs(status);
             CREATE INDEX IF NOT EXISTS idx_runs_ended ON runs(ended_at);
@@ -1535,14 +1811,16 @@ def _scope_numbers(
     range_since: float,
     range_until: float,
     cells: list,
+    live_open=None,
 ) -> dict:
     """Counts and totals for one scope (all, one workstream, or unassigned).
 
     Counts use the agent rule (lead sessions and Dagster jobs are not agents)
     and the window. Token and cost sums add up the ``/api/usage`` cells for the
     same window, so the snapshot, the tiles, and the chart legend agree.
+    Live counts use ``live_open`` (the one filtered running set).
     """
-    counts = _agent_counts(runs, parents, now, since, until)
+    counts = _agent_counts(runs, parents, now, since, until, live_open)
     summed = _sum_cells(cells)
     unpriced_runs = sum(
         1
@@ -1809,7 +2087,7 @@ def _local_midnight(now: float) -> float:
     return start.timestamp()
 
 
-def _agent_counts(runs: list, parents: dict, now: float, since, until) -> dict:
+def _agent_counts(runs: list, parents: dict, now: float, since, until, live_open=None) -> dict:
     range_since = now - RANGE_S if since is None else float(since)
     range_until = float(now if until is None else until)
     today = _local_midnight(now)
@@ -1825,10 +2103,13 @@ def _agent_counts(runs: list, parents: dict, now: float, since, until) -> dict:
         if run["run_id"] in parents:
             continue
         if run.get("source") == "dagster" and run.get("status") in ("running", "queued"):
-            prod_jobs += 1
+            if live_open is None or run["run_id"] in live_open:
+                prod_jobs += 1
         if not _is_counted_agent(run):
             continue
         if run.get("status") == "running":
+            if live_open is not None and run["run_id"] not in live_open:
+                continue
             tool = _tool_key(run)
             key = (tool, run.get("label") or run["run_id"])
             if key in seen:

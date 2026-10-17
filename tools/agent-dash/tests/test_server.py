@@ -345,6 +345,30 @@ class ReconcileEndpointTest(unittest.TestCase):
         self.assertEqual(main(["check", "--url", "http://127.0.0.1:1", "--hours", "12"]), 2)
         self.assertEqual(main(["check", "--hours", "nope"]), 2)
 
+    def test_reconcile_reports_stale_running(self):
+        self.store.upsert_run(
+            {
+                "run_id": "muse:stale:ws1-stale",
+                "source": "muse",
+                "tier": "muse",
+                "label": "ws1-stale",
+                "session_id": "stale-session",
+                "status": "running",
+                "pid": 999999,
+                "started_at": time.time() - 60,
+            }
+        )
+        status, _, body = get(self.port, "/api/reconcile?hours=12")
+        self.assertEqual(status, 200)
+        payload = json.loads(body)
+        self.assertTrue(
+            any("stale running" in item for item in payload["mismatches"]),
+            payload["mismatches"],
+        )
+        self.assertEqual(
+            main(["check", "--url", f"http://127.0.0.1:{self.port}", "--hours", "12"]), 1
+        )
+
     def test_check_page_skips_without_node(self):
         from unittest import mock
 

@@ -30,6 +30,8 @@ import re
 from collections import namedtuple
 from datetime import datetime, timezone
 
+from dash.liveness import pid_alive as _pid_alive
+
 NAME = "claude"
 INTERVAL_S = 2
 
@@ -273,16 +275,58 @@ def _poll_registry(store, cfg, left) -> int:
         status = rec.get("status")
         if not isinstance(status, str):
             status = None
-        if status == "busy":
-            busy.add(sid)
         pid = rec.get("pid")
         if isinstance(pid, int) and not isinstance(pid, bool) and pid > 0:
             pids[sid] = pid
+        else:
+            pid = None
         cwd = rec.get("cwd") if isinstance(rec.get("cwd"), str) else None
         if cwd and len(cwd) > 1024:
             cwd = cwd[:1024]
         label = _clean_label(rec.get("name")) if isinstance(rec.get("name"), str) else None
         started = _epoch_number(rec.get("startedAt"))
+        run_id = f"claude-main:{sid}:main"
+        if status == "busy" and pid is not None and not _pid_alive(pid):
+            # Dead pid: the registry still says busy but the process is gone.
+            # Close the row at the last evidence (transcript usage or the
+            # registry file mtime) instead of leaving it running.
+            ended = _last_ts.get(run_id) or st.st_mtime
+            try:
+                ended = max(float(ended), float(st.st_mtime))
+            except (TypeError, ValueError):
+                ended = float(st.st_mtime)
+            _sessions.pop(sid, None)
+            _merge_session(
+                store,
+                {
+                    "session_id": sid,
+                    "tool": "claude",
+                    "cwd": cwd,
+                    "started_at": started,
+                    "status": "done",
+                    "parent_session_id": None,
+                    "label": label,
+                },
+            )
+            _emit_run(
+                store,
+                {
+                    "run_id": run_id,
+                    "source": "claude-main",
+                    "session_id": sid,
+                    "parent_session_id": None,
+                    "status": "done",
+                    "label": label,
+                    "pid": None,
+                    "started_at": started,
+                    "ended_at": ended,
+                    "clock_source": "mtime",
+                },
+                force_status="done",
+            )
+            continue
+        if status == "busy":
+            busy.add(sid)
         _merge_session(
             store,
             {
@@ -299,7 +343,7 @@ def _poll_registry(store, cfg, left) -> int:
             _emit_run(
                 store,
                 {
-                    "run_id": f"claude-main:{sid}:main",
+                    "run_id": run_id,
                     "source": "claude-main",
                     "session_id": sid,
                     "parent_session_id": None,
@@ -697,6 +741,18 @@ def _emit_transcript_run(store, target, st, fresh, caught_up) -> None:
             registry_busy=target.kind == "main" and target.session_id in _busy,
             finished=finished,
         )
+        if target.kind == "main" and status == "running":
+            pid = _pids.get(target.session_id)
+            if pid is not None and not _pid_alive(pid):
+                status = "done"
+            elif not fresh:
+                # Busy registry or an unread tail is not liveness on its own:
+                # a stale transcript means the session is idle, not running.
+                status = "done"
+        elif target.kind == "workflow" and finished:
+            status = "done"
+        elif target.kind == "workflow" and status == "running" and not fresh:
+            status = "done"
     model = None
     last_rows_model = _last_model.get(run_id)
     if last_rows_model:
@@ -723,6 +779,9 @@ def _emit_transcript_run(store, target, st, fresh, caught_up) -> None:
                 "parent_session_id": None,
             },
         )
+    pid = _pids.get(target.session_id) if target.kind == "main" else None
+    if pid is not None and not _pid_alive(pid):
+        pid = None
     patch = {
         "run_id": run_id,
         "source": _SOURCE[target.kind],
@@ -733,7 +792,7 @@ def _emit_transcript_run(store, target, st, fresh, caught_up) -> None:
         "status": status,
         "started_at": _first_ts.get(run_id),
         "clock_source": "transcript" if run_id in _first_ts or run_id in _last_ts else "mtime",
-        "pid": _pids.get(target.session_id) if target.kind == "main" else None,
+        "pid": pid,
     }
     if applied:
         patch["label"] = applied

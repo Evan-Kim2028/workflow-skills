@@ -1050,7 +1050,7 @@ class ProcessParseTest(unittest.TestCase):
                         "session_id": sid,
                         "parent_session_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
                         "status": "running",
-                        "pid": 42,
+                        "pid": os.getpid(),
                         "started_at": now - 100,
                     }
                 )
@@ -1372,6 +1372,128 @@ class SnapshotUsageTest(unittest.TestCase):
         self.seed()
         with self.assertRaises(ValueError):
             self.store.snapshot(self.now, "all", self.since, self.until, usage_group="day")
+
+
+class StaleRunningTest(unittest.TestCase):
+    """One stale row is excluded from every view at once."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.store = memory(Path(self.tmp.name))
+        self.now = time.time()
+
+    def tearDown(self):
+        self.store.close()
+        self.tmp.cleanup()
+
+    def test_stale_dead_pid_excluded_everywhere(self):
+        now = self.now
+        live_id = "muse:live:ws1-live"
+        stale_id = "muse:stale:ws1-stale"
+        self.store.upsert_run(
+            {
+                "run_id": live_id,
+                "source": "muse",
+                "tier": "muse",
+                "label": "ws1-live",
+                "session_id": "live-session",
+                "status": "running",
+                "pid": os.getpid(),
+                "started_at": now - 60,
+            }
+        )
+        self.store.upsert_run(
+            {
+                "run_id": stale_id,
+                "source": "muse",
+                "tier": "muse",
+                "label": "ws1-stale",
+                "session_id": "stale-session",
+                "status": "running",
+                "pid": 999999,
+                "started_at": now - 60,
+            }
+        )
+        stale = self.store.stale_running(now)
+        self.assertEqual([run["run_id"] for run, _reason in stale], [stale_id])
+        self.assertIn("dead pid", stale[0][1])
+        snap = self.store.snapshot(now, "all")
+        self.assertEqual([run["run_id"] for run in snap["running"]], [live_id])
+        self.assertEqual(snap["counts"]["live_agents"], 1)
+        boards = self.store.query_workstreams(set(), now - 3600, now, now=now)
+        ws1 = next(row for row in boards if row["ws"] == "WS1")
+        self.assertEqual(ws1["live_agents"], 1)
+        runs = self.store.query_runs(now, None, None, None, 100)
+        self.assertEqual([run["run_id"] for run in runs], [live_id])
+        points = self.store.query_concurrency(now, None, now - 60, 60)
+        self.assertEqual(points[-1]["muse"], 1)
+        report = self.store.reconcile_numbers(now, now - 3600, now)
+        self.assertTrue(
+            any(stale_id in item for item in report["mismatches"]),
+            report["mismatches"],
+        )
+
+    def test_stale_dagster_absent_excluded(self):
+        now = self.now
+        live_short = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+        stale_short = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+        self.store.upsert_run(
+            {
+                "run_id": "dagster:" + live_short,
+                "source": "dagster",
+                "model": "test_job_alpha",
+                "label": "test_job_alpha",
+                "status": "running",
+                "started_at": now - 100,
+                "clock_source": "dagster",
+            }
+        )
+        self.store.upsert_run(
+            {
+                "run_id": "dagster:" + stale_short,
+                "source": "dagster",
+                "model": "test_job_beta",
+                "label": "test_job_beta",
+                "status": "running",
+                "started_at": now - 100,
+                "clock_source": "dagster",
+            }
+        )
+        self.store.set_dagster_active([live_short], now, False)
+        stale = self.store.stale_running(now)
+        self.assertEqual(
+            [run["run_id"] for run, _reason in stale], ["dagster:" + stale_short]
+        )
+        snap = self.store.snapshot(now, "all")
+        self.assertEqual(
+            [run["run_id"] for run in snap["running"]], ["dagster:" + live_short]
+        )
+        self.assertEqual(snap["counts"]["prod_jobs"], 1)
+        report = self.store.reconcile_numbers(now, now - 3600, now)
+        self.assertTrue(
+            any("dagster:" + stale_short in item for item in report["mismatches"])
+        )
+
+    def test_stale_idle_claude_main_excluded(self):
+        now = self.now
+        run_id = "claude-main:sess:main"
+        self.store.upsert_run(
+            {
+                "run_id": run_id,
+                "source": "claude-main",
+                "tier": "opus",
+                "label": "ws1-idle",
+                "session_id": "sess",
+                "status": "running",
+                "started_at": now - 7 * 3600,
+            }
+        )
+        stale = self.store.stale_running(now)
+        self.assertEqual([run["run_id"] for run, _reason in stale], [run_id])
+        snap = self.store.snapshot(now, "all")
+        self.assertEqual(snap["running"], [])
+        report = self.store.reconcile_numbers(now, now - 3600, now)
+        self.assertTrue(any(run_id in item for item in report["mismatches"]))
 
 
 if __name__ == "__main__":

@@ -233,8 +233,50 @@ def reconcile_running(store, now: float, processes=None) -> int:
             patch["parent_session_id"] = labeled
         store.upsert_run(patch)
         ended += 1
+    ended += _close_stale_claude_shell(store, now)
     if callable(clocks):
         clocks()
+    return ended
+
+
+def _close_stale_claude_shell(store, now: float) -> int:
+    """Close lead-session and shell rows the sources no longer see.
+
+    Transcripts that aged out of the live window and deleted scratch dirs
+    never get re-emitted, so a dead pid or an idle bound would linger
+    forever. The store's stale check (dead pid via the shared helper, or no
+    source evidence over the bound) names them; this closes them in the DB
+    with ``ended_at`` at the last DB evidence. Dagster rows are left to the
+    Dagster poll's by-id close-out.
+    """
+    stale_fn = getattr(store, "stale_running", None)
+    if not callable(stale_fn):
+        return 0
+    try:
+        stale = stale_fn(now)
+    except Exception:
+        return 0
+    ended = 0
+    for run, _reason in stale:
+        if (run.get("source") or "") not in (
+            "claude-main",
+            "claude-subagent",
+            "claude-workflow",
+            "shell",
+        ):
+            continue
+        if run.get("status") != "running":
+            continue
+        store.upsert_run(
+            {
+                "run_id": run["run_id"],
+                "status": "done" if run.get("label") or run.get("verdict") else "unknown",
+                "ended_at": _last_activity(store, run["run_id"], run.get("started_at"))
+                or float(now),
+                "pid": None,
+            }
+        )
+        ended += 1
     return ended
 
 

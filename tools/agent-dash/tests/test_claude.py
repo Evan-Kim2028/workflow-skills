@@ -340,19 +340,20 @@ class ClaudePollTests(unittest.TestCase):
         self.assertNotIn(PROMPT, _dump(self.store))
         self.assertNotEqual(run["label"], "review")
 
-    def test_registry_busy_overrides_stale_transcript(self):
+    def test_registry_busy_with_live_pid_and_fresh_transcript_runs(self):
         cfg, projects, sessions = _cfg(self.tmp.name, running_mtime_s=60)
         _write(
             os.path.join(projects, "enc", f"{SID}.jsonl"),
             _line("m1", 1),
-            NOW - 3600,
+            NOW,
         )
         started_ms = 1_700_000_000_000
+        live_pid = os.getpid()
         _write(
             os.path.join(sessions, "42.json"),
             json.dumps(
                 {
-                    "pid": 42,
+                    "pid": live_pid,
                     "sessionId": SID,
                     "cwd": "/tmp/example",
                     "startedAt": started_ms,
@@ -371,7 +372,59 @@ class ClaudePollTests(unittest.TestCase):
         self.assertNotIn("sock", _dump(self.store))
         run = self.store.runs[f"claude-main:{SID}:main"]
         self.assertEqual(run["status"], "running")
-        self.assertEqual(run["pid"], 42)
+        self.assertEqual(run["pid"], live_pid)
+
+    def test_registry_busy_with_dead_pid_closes(self):
+        cfg, projects, sessions = _cfg(self.tmp.name, running_mtime_s=60)
+        _write(
+            os.path.join(projects, "enc", f"{SID}.jsonl"),
+            _line("m1", 1),
+            NOW,
+        )
+        _write(
+            os.path.join(sessions, "43.json"),
+            json.dumps(
+                {
+                    "pid": 999999,
+                    "sessionId": SID,
+                    "cwd": "/tmp/example",
+                    "startedAt": 1_700_000_000_000,
+                    "status": "busy",
+                    "name": "example-session",
+                }
+            ),
+            NOW,
+        )
+        claude.poll(self.store, cfg, NOW)
+        run = self.store.runs[f"claude-main:{SID}:main"]
+        self.assertEqual(run["status"], "done")
+        self.assertIsNone(run.get("pid"))
+        self.assertIsNotNone(run.get("ended_at"))
+
+    def test_registry_busy_with_stale_transcript_is_not_running(self):
+        cfg, projects, sessions = _cfg(self.tmp.name, running_mtime_s=60)
+        _write(
+            os.path.join(projects, "enc", f"{SID}.jsonl"),
+            _line("m1", 1),
+            NOW - 3600,
+        )
+        _write(
+            os.path.join(sessions, "44.json"),
+            json.dumps(
+                {
+                    "pid": os.getpid(),
+                    "sessionId": SID,
+                    "cwd": "/tmp/example",
+                    "startedAt": 1_700_000_000_000,
+                    "status": "busy",
+                    "name": "example-session",
+                }
+            ),
+            NOW,
+        )
+        claude.poll(self.store, cfg, NOW)
+        run = self.store.runs[f"claude-main:{SID}:main"]
+        self.assertEqual(run["status"], "done")
 
     def test_bad_json_and_offset_error_do_not_stop_the_tick(self):
         cfg, projects, _sessions = _cfg(self.tmp.name)
