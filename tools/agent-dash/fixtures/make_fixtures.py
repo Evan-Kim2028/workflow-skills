@@ -87,14 +87,14 @@ RAW_PLANS = {
                 {"id": "WS2.1", "title": "Publish the route list", "status": "done"},
             ]},
             {"id": "routes", "col": 1, "title": "Routes", "tasks": [
-                {"id": "WS2.3", "title": "Read route", "status": "prog"},
-                {"id": "WS2.4", "title": "List route", "status": "todo"},
+                {"id": "WS2.3", "title": "Read route", "status": "done"},
+                {"id": "WS2.4", "title": "List route", "status": "done"},
             ]},
             {"id": "clients", "col": 2, "title": "Clients", "tasks": [
-                {"id": "WS2.8", "title": "Point the client at the new route", "status": "pr"},
+                {"id": "WS2.8", "title": "Point the client at the new route", "status": "done"},
             ]},
             {"id": "remove", "col": 3, "title": "Remove", "tasks": [
-                {"id": "WS2.9", "title": "Delete the old handler", "status": "todo"},
+                {"id": "WS2.9", "title": "Delete the old handler", "status": "done"},
             ]},
         ],
         "edges": [["contract", "routes"], ["routes", "clients"], ["routes", "remove"]],
@@ -516,7 +516,9 @@ def _sessions(runs):
     return {"sessions": rows, "_note": NOTE}
 
 
-def _workstreams(runs, now):
+def _workstreams(runs, now, plans):
+    """Fixture mirror of GET /api/workstreams: the same rollup row plus the
+    plan progress object (null when the workstream has no plan)."""
     moment = datetime.datetime.fromtimestamp(now).astimezone()
     today = moment.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
     rows = []
@@ -527,10 +529,12 @@ def _workstreams(runs, now):
         cost = round(sum(run["cost_usd"] or 0 for run in mine), 4)
         live = sum(1 for run in mine if run["status"] == "running" and _is_agent(run))
         fin = sum(1 for run in mine if _is_agent(run) and run["status"] in ("done", "killed", "died_early") and run.get("ended_at") is not None and now - 24 * 3600 <= run["ended_at"] <= now)
+        plan = plans.get(code)
         rows.append({
             "ws": code,
             "name": name,
             "tk": tk,
+            "progress": dict(plan["progress"]) if plan and isinstance(plan.get("progress"), dict) else None,
             "live_agents": live,
             "finished_in_range": fin,
             "finished_today": sum(1 for run in mine if _is_agent(run) and run["status"] in ("done", "killed", "died_early") and run.get("ended_at") is not None and today <= run["ended_at"] <= now),
@@ -698,7 +702,7 @@ def main():
         "usage-workstream-hour.json": _usage(runs, lambda run: run["workstream"] or "unassigned"),
         "concurrency.json": conc,
         "sessions.json": _sessions(runs),
-        "workstreams.json": _workstreams(runs, NOW),
+        "workstreams.json": _workstreams(runs, NOW, plans),
         "reconcile.json": _reconcile(runs, NOW),
         "health.json": {
             "ok": True,

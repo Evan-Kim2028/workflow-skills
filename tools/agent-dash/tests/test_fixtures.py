@@ -318,6 +318,18 @@ class FixtureShapeTests(unittest.TestCase):
             self.assertEqual(row["plan"], row["ws"] in fx.PLAN_WS)
         self.assertEqual(done, fx.DONE_TOTAL)
         self.assertEqual(backlog, fx.BACKLOG_TOTAL)
+        for row in board:
+            if row["ws"] in fx.PLAN_WS:
+                self.assertEqual(set(row["progress"]), {"done", "total", "counts", "pct"})
+                self.assertEqual(row["progress"], self.docs[f"plan-{row['ws']}.json"]["progress"])
+            else:
+                self.assertIsNone(row["progress"])
+        completed = [
+            row
+            for row in board
+            if row["progress"] and row["progress"]["total"] > 0 and row["progress"]["done"] == row["progress"]["total"]
+        ]
+        self.assertTrue(completed, "the fixture preview needs a completed workstream for the tab filter")
 
     def test_plans_and_health(self):
         for name, ws in (("plan-WS1.json", "WS1"), ("plan-WS2.json", "WS2"), ("plan-WS7.json", "WS7")):

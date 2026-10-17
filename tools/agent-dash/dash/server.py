@@ -146,10 +146,10 @@ class Handler(BaseHTTPRequestHandler):
     def _workstreams(self, query):
         since = _float(query, "since")
         until = _float(query, "until")
-        self._json(
-            200,
-            {"workstreams": self.server.store.query_workstreams(workstream_plan_ids(), since, until)},
-        )
+        rows = self.server.store.query_workstreams(workstream_plan_ids(), since, until)
+        for row in rows:
+            row["progress"] = _row_progress(row.get("ws"))
+        self._json(200, {"workstreams": rows})
 
     def _reconcile(self, query):
         now = time.time()
@@ -298,6 +298,23 @@ def _static_rel(name: str) -> bool:
     if len(parts) == 1:
         return True
     return len(parts) == 2 and parts[0] == "vendor"
+
+
+def _row_progress(ws):
+    """Plan progress for one workstream row, via the one plan resolver.
+
+    Returns the same ``progress`` object ``/api/plan`` carries, or None when
+    the workstream has no plan. Never raises: an unreadable plan leaves the
+    row without progress instead of breaking the endpoint.
+    """
+    try:
+        _source, body = resolve_plan(ws)
+    except Exception:
+        return None
+    if not isinstance(body, dict):
+        return None
+    progress = body.get("progress")
+    return dict(progress) if isinstance(progress, dict) else None
 
 
 def _one(query: dict, name: str):

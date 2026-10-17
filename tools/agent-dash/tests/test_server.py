@@ -143,6 +143,24 @@ class ServerTest(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(ws2["cols"], raw2["dag"]["cols"])
 
+    def test_workstreams_carry_plan_progress(self):
+        from dash.bundles import resolve_plan
+
+        self.store.set_ws_counts(
+            [
+                {"ws": "WS1", "name": "Read path", "backlog": 0, "todo": 0, "doing": 0, "review": 0, "done": 0, "cancelled": 0},
+                {"ws": "WS9", "name": "No plan", "backlog": 0, "todo": 0, "doing": 0, "review": 0, "done": 0, "cancelled": 0},
+            ]
+        )
+        status, _, body = get(self.port, "/api/workstreams")
+        self.assertEqual(status, 200)
+        rows = {row["ws"]: row for row in json.loads(body)["workstreams"]}
+        _source, expected = resolve_plan("WS1")
+        self.assertIsNotNone(expected)
+        self.assertEqual(rows["WS1"]["progress"], expected["progress"])
+        self.assertEqual(set(rows["WS1"]["progress"]), {"done", "total", "counts", "pct"})
+        self.assertIsNone(rows["WS9"]["progress"])
+
     def test_stream_tick(self):
         stop(self.server, self.thread)
         self.server, self.thread = start(self.store, interval=30)

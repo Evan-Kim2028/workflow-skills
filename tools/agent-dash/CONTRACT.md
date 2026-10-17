@@ -107,10 +107,13 @@ started_at, ended_at, elapsed_s, clock_source, out_bytes, out_growing, err_bytes
 
 `GET /api/sessions` -> `{"sessions": [{session_id, tool, cwd, label, workstream, started_at, status, runs: n, tokens, cost_usd}]}`
 
-`GET /api/workstreams?since=&until=` -> `{"workstreams": [{ws, name, tk: {backlog, todo, doing, review, done, cancelled}, live_agents, finished_in_range, finished_today, tokens, cost_usd, tokens_all_time, cost_usd_all_time, last_activity, plan: bool}]}`.
+`GET /api/workstreams?since=&until=` -> `{"workstreams": [{ws, name, tk: {backlog, todo, doing, review, done, cancelled}, live_agents, finished_in_range, finished_today, tokens, cost_usd, tokens_all_time, cost_usd_all_time, last_activity, plan: bool, progress: {done, total, counts, pct} | null}]}`.
 Rows come from the same rollup as the snapshot, so they match the tabs for the
 same window. `tk` is the hub issue board (issue counts, never plan progress).
-An `unassigned` row appears when runs have no workstream.
+`progress` is the same object `/api/plan` carries for that workstream, resolved
+through the one plan resolver (`dash.bundles.resolve_plan`), so one request
+gives the tab bar its completed state; it is null when the workstream has no
+plan. An `unassigned` row appears when runs have no workstream.
 
 `GET /api/reconcile?hours=&since=&until=` -> `{"now": 0, "since": 0, "until": 0, "all": {live_agents, finished_in_range, finished_today, tokens, cost_usd}, "all_time": {tokens, cost_usd}, "rows": [per-workstream rows], "unassigned": {...}, "mismatches": []}`.
 Computed in one store pass under the lock. Rows carry `tokens_all_time` and

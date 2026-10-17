@@ -11,6 +11,7 @@
         "done": 2,
         "cancelled": 0
       },
+      "progress": null,
       "live_agents": 0,
       "finished_in_range": 0,
       "finished_today": 0,
@@ -31,6 +32,19 @@
         "review": 0,
         "done": 4,
         "cancelled": 0
+      },
+      "progress": {
+        "done": 2,
+        "total": 5,
+        "counts": {
+          "todo": 1,
+          "wip": 1,
+          "pr": 1,
+          "prog": 0,
+          "done": 2,
+          "deferred": 0
+        },
+        "pct": 40
       },
       "live_agents": 2,
       "finished_in_range": 36,
@@ -53,6 +67,19 @@
         "done": 3,
         "cancelled": 0
       },
+      "progress": {
+        "done": 5,
+        "total": 5,
+        "counts": {
+          "todo": 0,
+          "wip": 0,
+          "pr": 0,
+          "prog": 0,
+          "done": 5,
+          "deferred": 0
+        },
+        "pct": 100
+      },
       "live_agents": 2,
       "finished_in_range": 38,
       "finished_today": 38,
@@ -74,6 +101,7 @@
         "done": 1,
         "cancelled": 0
       },
+      "progress": null,
       "live_agents": 0,
       "finished_in_range": 0,
       "finished_today": 0,
@@ -95,6 +123,7 @@
         "done": 1,
         "cancelled": 0
       },
+      "progress": null,
       "live_agents": 0,
       "finished_in_range": 0,
       "finished_today": 0,
@@ -116,6 +145,7 @@
         "done": 2,
         "cancelled": 0
       },
+      "progress": null,
       "live_agents": 0,
       "finished_in_range": 0,
       "finished_today": 0,
@@ -137,6 +167,7 @@
         "done": 0,
         "cancelled": 1
       },
+      "progress": null,
       "live_agents": 0,
       "finished_in_range": 0,
       "finished_today": 0,
@@ -157,6 +188,19 @@
         "review": 0,
         "done": 2,
         "cancelled": 0
+      },
+      "progress": {
+        "done": 1,
+        "total": 5,
+        "counts": {
+          "todo": 2,
+          "wip": 0,
+          "pr": 1,
+          "prog": 1,
+          "done": 1,
+          "deferred": 0
+        },
+        "pct": 20
       },
       "live_agents": 3,
       "finished_in_range": 33,

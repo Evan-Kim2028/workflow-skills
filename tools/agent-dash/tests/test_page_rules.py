@@ -168,6 +168,54 @@ class PageRules(unittest.TestCase):
         )
         self.assertEqual(proc.returncode, 0, proc.stderr or proc.stdout)
 
+    def test_tab_filter_uses_the_shared_completed_rule(self):
+        """The tab filter and the "Where we are" status share one completed
+        rule over the server progress object: both call ADT.isCompleted, and
+        neither computes % done from task counts itself."""
+        script = inline_scripts()
+        bodies = dict(functions(script))
+        for name in ("programPanel", "renderTabs"):
+            self.assertIn(name, bodies, f"{name} is gone from the page")
+            self.assertIn("isCompleted(", bodies[name], f"{name} no longer uses the shared completed rule")
+        self.assertGreaterEqual(script.count("isCompleted("), 2)
+        self.assertIn("ADT.isCompleted", script)
+        self.assertIn(".progress", script)
+
+    def test_tabs_helpers(self):
+        script = (
+            "const fs=require('fs');"
+            "eval(fs.readFileSync(process.argv[1],'utf8'));"
+            "const T=globalThis.ADT;"
+            "const assert=require('assert');"
+            "assert.strictEqual(T.isCompleted({done:77,total:77}),true);"
+            "assert.strictEqual(T.isCompleted({done:1,total:41}),false);"
+            "assert.strictEqual(T.isCompleted({done:0,total:0}),false);"
+            "assert.strictEqual(T.isCompleted(null),false);"
+            "assert.strictEqual(T.isCompleted({done:0,total:17}),false);"
+            "const rows=[{ws:'all',name:'Overall'},{ws:'WS1',progress:{done:77,total:77}},{ws:'WS2',progress:{done:1,total:41}},{ws:'WS9',progress:null}];"
+            "assert.deepStrictEqual(T.applyOrder(rows,['WS2','WS1']).map(r=>r.ws),['all','WS2','WS1','WS9']);"
+            "assert.deepStrictEqual(T.applyOrder(rows,['WS8','WS1']).map(r=>r.ws),['all','WS1','WS2','WS9']);"
+            "assert.deepStrictEqual(T.applyOrder(rows,null).map(r=>r.ws),['all','WS1','WS2','WS9']);"
+            "assert.deepStrictEqual(T.countByMode(rows),{all:3,active:2,completed:1});"
+            "assert.deepStrictEqual(T.filterByMode(rows,'completed','all').map(r=>r.ws),['all','WS1']);"
+            "assert.deepStrictEqual(T.filterByMode(rows,'active','all').map(r=>r.ws),['all','WS2','WS9']);"
+            "const kept=T.filterByMode(rows,'completed','WS2');"
+            "assert.deepStrictEqual(kept.map(r=>r.ws),['all','WS1','WS2']);"
+            "assert.strictEqual(kept.filter(r=>r.ws==='WS2')[0].muted,true);"
+            "assert.strictEqual(kept.filter(r=>r.ws==='all')[0].muted,false);"
+            "assert.deepStrictEqual(T.move(['WS1','WS2','WS7'],'WS7',-1),['WS1','WS7','WS2']);"
+            "assert.deepStrictEqual(T.move(['WS1','WS2','WS7'],'WS1',-1),['WS1','WS2','WS7']);"
+            "assert.deepStrictEqual(T.move(['WS1','WS2'],'WS9',1),['WS1','WS2']);"
+            "assert.strictEqual(T.completeTitle({done:77,total:77}),'complete: 77 of 77 tasks done');"
+            "assert.strictEqual(T.normMode('bogus'),'all');"
+        )
+        proc = subprocess.run(
+            ["node", "-e", script, str(STATIC / "tabs.js")],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr or proc.stdout)
+
     def test_unknown_duration_is_a_dash(self):
         script = (
             "const fs=require('fs');"

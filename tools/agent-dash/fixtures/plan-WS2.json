@@ -27,12 +27,12 @@
         {
           "id": "WS2.3",
           "title": "Read route",
-          "status": "prog"
+          "status": "done"
         },
         {
           "id": "WS2.4",
           "title": "List route",
-          "status": "todo"
+          "status": "done"
         }
       ]
     },
@@ -44,7 +44,7 @@
         {
           "id": "WS2.8",
           "title": "Point the client at the new route",
-          "status": "pr"
+          "status": "done"
         }
       ]
     },
@@ -56,7 +56,7 @@
         {
           "id": "WS2.9",
           "title": "Delete the old handler",
-          "status": "todo"
+          "status": "done"
         }
       ]
     }
@@ -89,17 +89,17 @@
   ],
   "trains": [],
   "progress": {
-    "done": 1,
+    "done": 5,
     "total": 5,
     "counts": {
-      "todo": 2,
+      "todo": 0,
       "wip": 0,
-      "pr": 1,
-      "prog": 1,
-      "done": 1,
+      "pr": 0,
+      "prog": 0,
+      "done": 5,
       "deferred": 0
     },
-    "pct": 20
+    "pct": 100
   },
   "_note": "Seeded example plan for the fixture preview."
 }

@@ -28,12 +28,12 @@
           {
             "id": "WS2.3",
             "title": "Read route",
-            "status": "prog"
+            "status": "done"
           },
           {
             "id": "WS2.4",
             "title": "List route",
-            "status": "todo"
+            "status": "done"
           }
         ]
       },
@@ -45,7 +45,7 @@
           {
             "id": "WS2.8",
             "title": "Point the client at the new route",
-            "status": "pr"
+            "status": "done"
           }
         ]
       },
@@ -57,7 +57,7 @@
           {
             "id": "WS2.9",
             "title": "Delete the old handler",
-            "status": "todo"
+            "status": "done"
           }
         ]
       }
