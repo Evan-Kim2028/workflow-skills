@@ -371,5 +371,84 @@ class ReconcileEndpointTest(unittest.TestCase):
             server.server_close()
 
 
+class SnapshotUsageEndpointTest(unittest.TestCase):
+    """GET /api/snapshot?usage_group= carries the hourly chart buckets for
+    the same scope and window in the same response; they sum to the totals."""
+
+    TOKEN_KEYS = ("input", "output", "cache_read", "cache_write", "reasoning")
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.store = Store(Path(self.tmp.name) / "dash.sqlite")
+        self.now = time.time()
+        self.since = int(self.now - 12 * 3600)
+        self.store.upsert_run(
+            {
+                "run_id": "muse:a:ws1-a",
+                "source": "muse",
+                "tier": "muse",
+                "model": "claude-sonnet-4-5",
+                "label": "ws1-a",
+                "session_id": "sess-a",
+                "status": "done",
+                "started_at": self.now - 5000,
+                "ended_at": self.now - 4000,
+            }
+        )
+        self.store.add_usage(
+            {
+                "ts": self.now - 4100,
+                "session_id": "sess-a",
+                "run_id": "muse:a:ws1-a",
+                "model": "claude-sonnet-4-5",
+                "tool": "muse",
+                "message_id": "m1",
+                "input": 100,
+                "output": 50,
+                "cache_read": 10,
+                "cache_write": 5,
+            }
+        )
+        self.server, self.thread = start(self.store)
+        self.port = self.server.server_address[1]
+
+    def tearDown(self):
+        stop(self.server, self.thread)
+        self.store.close()
+        self.tmp.cleanup()
+
+    def fetch(self, path):
+        status, _, body = get(self.port, path)
+        self.assertEqual(status, 200, path)
+        return json.loads(body)
+
+    def assert_buckets_match_totals(self, payload, scope):
+        self.assertIn("usage", payload)
+        self.assertTrue(payload["usage"], scope)
+        for key in self.TOKEN_KEYS:
+            self.assertEqual(
+                sum(cell[key] for cell in payload["usage"]),
+                payload["totals"]["tokens"][key],
+                f"{scope} {key}",
+            )
+
+    def test_snapshot_usage_sums_for_model_and_workstream(self):
+        for group in ("model", "workstream"):
+            payload = self.fetch(f"/api/snapshot?ws=all&since={self.since}&usage_group={group}")
+            self.assert_buckets_match_totals(payload, f"{group}/all")
+        scoped = self.fetch(f"/api/snapshot?ws=WS1&since={self.since}&usage_group=model")
+        self.assert_buckets_match_totals(scoped, "model/WS1")
+        tab = self.fetch(f"/api/snapshot?ws=WS1&since={self.since}")
+        self.assertEqual(scoped["totals"], tab["totals"])
+
+    def test_snapshot_without_group_omits_usage(self):
+        payload = self.fetch(f"/api/snapshot?ws=all&since={self.since}")
+        self.assertNotIn("usage", payload)
+
+    def test_snapshot_bad_group_is_400(self):
+        status, _, _ = get(self.port, "/api/snapshot?usage_group=nope")
+        self.assertEqual(status, 400)
+
+
 if __name__ == "__main__":
     unittest.main()

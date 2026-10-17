@@ -543,7 +543,18 @@ class Store:
         ws: str = "all",
         since: float | None = None,
         until: float | None = None,
+        usage_group: str | None = None,
     ) -> dict:
+        """Scope snapshot with counts, totals, and (optionally) usage buckets.
+
+        When ``usage_group`` (``model`` | ``workstream`` | ``tool``) is given,
+        the hourly usage buckets for the same scope and window ride along as
+        ``usage``, read under the same lock pass as the totals, so the bucket
+        token sum equals ``totals`` by construction. Without it the key is
+        absent and the payload is the historic shape.
+        """
+        if usage_group is not None and usage_group not in ("model", "workstream", "tool"):
+            raise ValueError("bad usage_group")
         with self._lock:
             shown_all, parents = self._shown_locked(now)
             scoped = [run for run in shown_all if _in_ws(run, ws)]
@@ -574,7 +585,7 @@ class Store:
                 totals = scope["totals"]
                 wanted = [roll["unassigned"]] if key == UNASSIGNED and roll["has_unassigned"] else roll["rows"]
                 by_ws = [row for row in wanted if row["ws"] == key]
-            return {
+            response = {
                 "now": now,
                 "seq": self._seq,
                 "counts": counts,
@@ -587,6 +598,14 @@ class Store:
                 "last_activity": _last_activity(scope["runs"]),
                 "by_workstream": by_ws,
             }
+            if usage_group is not None:
+                # Same scope and window as the totals above, same lock pass:
+                # no writer can land between the two reads.
+                scope_ws = None if ws in (None, "all") else ws
+                response["usage"] = self._query_usage_locked(
+                    usage_group, "hour", scope_ws, roll["since"], roll["until"]
+                )
+            return response
 
     def ws_rollup(self, now: float, since: float | None = None, until: float | None = None) -> dict:
         """One locked pass over the same run list: all-scope counts and totals,
@@ -780,19 +799,31 @@ class Store:
         until: float | None = None,
     ) -> list:
         with self._lock:
-            sql = """SELECT hour_ts, model, workstream, tool, input_tokens, output_tokens,
-                            cache_read, cache_write, reasoning, missing, cost_usd FROM usage_buckets"""
-            args: list = []
-            clauses: list = []
-            if since is not None:
-                clauses.append("hour_ts + 3600 > ?")
-                args.append(since)
-            if until is not None:
-                clauses.append("hour_ts < ?")
-                args.append(until)
-            if clauses:
-                sql += " WHERE " + " AND ".join(clauses)
-            stored = self._conn.execute(sql, args).fetchall()
+            return self._query_usage_locked(group, bucket, ws, since, until)
+
+    def _query_usage_locked(
+        self,
+        group: str,
+        bucket: str,
+        ws: str | None,
+        since: float | None,
+        until: float | None = None,
+    ) -> list:
+        """Bucket cells for a scope and window. Caller holds the lock, so
+        ``snapshot`` can read these in the same pass as its totals."""
+        sql = """SELECT hour_ts, model, workstream, tool, input_tokens, output_tokens,
+                        cache_read, cache_write, reasoning, missing, cost_usd FROM usage_buckets"""
+        args: list = []
+        clauses: list = []
+        if since is not None:
+            clauses.append("hour_ts + 3600 > ?")
+            args.append(since)
+        if until is not None:
+            clauses.append("hour_ts < ?")
+            args.append(until)
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        stored = self._conn.execute(sql, args).fetchall()
         cells: dict = {}
         for row in stored:
             if "tool" in row.keys() and row["tool"] == _ESTIMATE_TOOL:

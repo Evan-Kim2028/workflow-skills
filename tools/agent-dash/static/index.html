@@ -389,10 +389,23 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
           return j;
         });
       }
+      if (path === "/api/snapshot") {
+        var sbase = "snapshot";
+        if (params && params.ws && params.ws !== "all") sbase = "snapshot-" + params.ws;
+        return fetch("../fixtures/" + sbase + ".json").then(function (r) { if (!r.ok) throw new Error(r.status); return r.json(); }).then(function (snap) {
+          if (params && params.usage_group && !Array.isArray(snap.usage)) {
+            var ubase = params.usage_group === "workstream" ? "usage-workstream-hour" : "usage-model-hour";
+            return fetch("../fixtures/" + ubase + ".json").then(function (r) { if (!r.ok) throw new Error(r.status); return r.json(); }).then(function (u) {
+              snap.usage = u.buckets || [];
+              return snap;
+            });
+          }
+          return snap;
+        });
+      }
       var base = FIXMAP[path] || path.replace("/api/", "");
       if (path === "/api/usage" && params && params.group === "workstream") base = "usage-workstream-hour";
       if (path === "/api/plan") base = "plan-" + params.ws;
-      if (path === "/api/snapshot" && params && params.ws && params.ws !== "all") base = "snapshot-" + params.ws;
       return fetch("../fixtures/" + base + ".json").then(function (r) { if (!r.ok) throw new Error(r.status); return r.json(); });
     }
     return fetch(path + (qs ? "?" + qs : "")).then(function (r) { if (!r.ok) throw new Error(r.status); return r.json(); });
@@ -631,7 +644,7 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
     var c = el("div", {class: "card", id: "exec-tokens", "data-nav": "Tokens per hour"});
     var hdr = el("div", {style: "display:flex;align-items:baseline;gap:10px;flex-wrap:wrap"}, [el("h2", {text: "Tokens per hour"})]);
     var seg = el("span", {class: "seg-ctl", style: "margin-left:auto"});
-    [["model", "By model"], ["workstream", "By workstream"]].forEach(function (g) { seg.appendChild(el("button", {"aria-pressed": String(state.groupBy === g[0]), onclick: function () { state.groupBy = g[0]; loadUsage().then(drawMain); }}, [g[1]])); });
+    [["model", "By model"], ["workstream", "By workstream"]].forEach(function (g) { seg.appendChild(el("button", {"aria-pressed": String(state.groupBy === g[0]), onclick: function () { state.groupBy = g[0]; refreshSnapshot(); }}, [g[1]])); });
     if (state.ws === "all") hdr.appendChild(seg);
     c.appendChild(hdr);
     c.appendChild(el("p", {class: "sub", text: "Input, output and cache tokens summed per hour, stacked by " + state.groupBy + ". Hover a bar for the split."}));
@@ -646,8 +659,9 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
     var keyTot = {}, grand = 0; ts.forEach(function (t) { ks.forEach(function (k) { var v = hours[t][k] || 0; keyTot[k] = (keyTot[k] || 0) + v; grand += v; }); });
     var keyLbl = {}; ks.forEach(function (k) { keyLbl[k] = fmtN(keyTot[k]); });
     /* The legend Total is the server snapshot total for this scope and range,
-       the same number the tile shows. The chart sums its own buckets; when the
-       two ever differ the page says so instead of hiding it. */
+       the same number the tile shows. The chart draws the same response's
+       usage buckets, so the two agree by construction; when they ever differ
+       the page still says so instead of hiding it. */
     var snapTok = (state.snap && state.snap.totals) ? ADC.billed(state.snap.totals.tokens) : null;
     var showTotal = snapTok == null ? grand : snapTok;
     var lg; if (byModel) lg = modelLegend(ks, keyLbl); else { lg = el("div", {class: "legend"}); ks.forEach(function (k) { var sp = el("span"); var sw = el("i", {class: "sw"}); sw.style.background = colorOf(k, state.groupBy); sp.appendChild(sw); sp.appendChild(document.createTextNode(k + " " + keyLbl[k])); lg.appendChild(sp); }); }
@@ -1376,16 +1390,6 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
   function wsParam() { return state.ws === "all" ? {} : {ws: state.ws}; }
   /* Every async response applies only when it still matches the current tab,
      range and grouping; a late arrival from another scope is dropped. */
-  function loadUsage() {
-    var key = reqKey();
-    var p = Object.assign({group: groupFor(), bucket: "hour", since: since()}, wsParam());
-    return api("/api/usage", p).then(function (j) {
-      if (!ADC.applies(key, state)) return;
-      state.usage = j.buckets || [];
-      var hit = execCache[key];
-      if (hit) hit.usage = state.usage;
-    }).catch(function () { if (ADC.applies(key, state)) state.usage = []; });
-  }
   function loadNav() {
     var bundlesP = fetch(FIX ? "../fixtures/bundles.json" : "/api/bundles", {cache: "no-store"}).then(function (r) { return r.ok ? r.json() : {bundles: []}; }).then(function (j) { state.bundles = j.bundles || []; }).catch(function () {});
     var wsP = api("/api/workstreams", {since: since()}).then(function (j) { state.wss = j.workstreams || []; }).catch(function () {});
@@ -1420,14 +1424,13 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
       var key = ADC.key(ws, hours, wsGroup);
       if (execCache[key] && ADC.fresh(execCache[key], Date.now(), ADC.TTL_MS)) { setTimeout(function () { step(i + 1); }, 150); return; }
       Promise.all([
-        api("/api/snapshot", {ws: ws, since: reqSince}).catch(function () { return null; }),
+        api("/api/snapshot", {ws: ws, since: reqSince, usage_group: wsGroup}).catch(function () { return null; }),
         api("/api/runs", Object.assign({since: reqSince, limit: 400}, wsArg)).then(function (j) { return j.runs || []; }).catch(function () { return []; }),
-        api("/api/usage", Object.assign({group: wsGroup, bucket: "hour", since: reqSince}, wsArg)).then(function (j) { return j.buckets || []; }).catch(function () { return []; }),
         api("/api/concurrency", Object.assign({since: reqSince, step: 60}, wsArg)).then(function (j) { return j.points || []; }).catch(function () { return []; }),
         ws !== "all" ? api("/api/plan", {ws: ws}).then(function (j) { return j && j.groups ? j : null; }).catch(function () { return null; }) : Promise.resolve(null),
         api("/api/approvals", {ws: ws === "all" ? "all" : ws}).then(approvalList).catch(function () { return []; })
       ]).then(function (p) {
-        if (p[0]) setCache(key, {snap: p[0], runs: p[1], usage: p[2], conc: p[3], plan: p[4], seq: p[0].seq, approvals: p[5]});
+        if (p[0]) setCache(key, {snap: p[0], runs: p[1], usage: Array.isArray(p[0].usage) ? p[0].usage : [], conc: p[2], plan: p[3], seq: p[0].seq, approvals: p[4]});
       }).then(function () { setTimeout(function () { step(i + 1); }, 150); });
     };
     step(0);
@@ -1435,6 +1438,8 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
   setTimeout(warmTabs, 1500);
   setInterval(warmTabs, 45000);
   setInterval(function () { if (!state.wss.length) return; loadPlanSums().then(function () { if (state.view === "exec" && state.ws === "all") drawMain(); }); }, 30000);
+  /* Tiles and chart come from one snapshot response: totals and usage buckets
+     are applied together or not at all, so they can never disagree. */
   function refreshAll() {
     var ws = state.ws;
     var key = reqKey();
@@ -1443,9 +1448,8 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
     var group = groupFor();
     var reqSince = since();
     var jobs = [
-      api("/api/snapshot", {ws: ws, since: reqSince}).catch(function () { return null; }),
+      api("/api/snapshot", {ws: ws, since: reqSince, usage_group: group}).catch(function () { return null; }),
       api("/api/runs", Object.assign({since: reqSince, limit: 400}, wsArg)).then(function (j) { return j.runs || []; }).catch(function () { return []; }),
-      api("/api/usage", Object.assign({group: group, bucket: "hour", since: reqSince}, wsArg)).then(function (j) { return j.buckets || []; }).catch(function () { return []; }),
       api("/api/concurrency", Object.assign({since: reqSince, step: 60}, wsArg)).then(function (j) { return j.points || []; }).catch(function () { return []; }),
       loadNav(),
       ws !== "all" ? api("/api/plan", {ws: ws}).then(function (j) { return j && j.groups ? j : null; }).catch(function () { return null; }) : Promise.resolve(null),
@@ -1460,10 +1464,10 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
       state.snap = parts[0];
       state.seq = parts[0].seq;
       state.runs = parts[1];
-      state.usage = parts[2];
-      state.conc = parts[3];
-      state.plan = parts[5];
-      state.approvals = parts[6];
+      state.usage = Array.isArray(parts[0].usage) ? parts[0].usage : [];
+      state.conc = parts[2];
+      state.plan = parts[4];
+      state.approvals = parts[5];
       setCache(key, {snap: state.snap, runs: state.runs, usage: state.usage, conc: state.conc, plan: state.plan, seq: state.seq, approvals: state.approvals});
       if (state.snap && window.DashCache) window.DashCache.snap[ws] = state.snap;
       renderTabs();
@@ -1484,13 +1488,16 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible{out
     es.addEventListener("tick", function (ev) { try { var d = JSON.parse(ev.data); if (d.seq !== state.seq) refreshSnapshot(); } catch (e) {} setLive(true); });
     es.onerror = function () { setLive(false); };
   }
+  /* Stream ticks refresh through the same one-response path: the snapshot
+     carries the usage buckets, and totals plus buckets apply together. */
   function refreshSnapshot() {
     var ws = state.ws, key = reqKey();
-    api("/api/snapshot", {ws: ws, since: since()}).then(function (j) {
+    api("/api/snapshot", {ws: ws, since: since(), usage_group: groupFor()}).then(function (j) {
       if (!ADC.applies(key, state)) return;
       state.snap = j; state.seq = j.seq;
+      state.usage = Array.isArray(j.usage) ? j.usage : [];
       var hit = execCache[key];
-      if (hit) hit.snap = j;
+      if (hit) { hit.snap = j; hit.usage = state.usage; }
       if (window.DashCache) window.DashCache.snap[ws] = j;
       if (state.view === "exec") drawMain();
     }).catch(function () {});

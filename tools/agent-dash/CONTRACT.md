@@ -67,7 +67,7 @@ Workstream attribution happens in core (`attribution.py`), not in sources: label
 
 `GET /` -> `static/index.html`.
 
-`GET /api/snapshot?ws=<WSn|all>&since=&until=`
+`GET /api/snapshot?ws=<WSn|all>&since=&until=&usage_group=<model|workstream|tool>`
 ```json
 {"now": 0, "seq": 0,
  "counts": {"live_agents": 0, "live_by_tool": {"grok": 0, "muse": 0, "glm": 0, "claude": 0}, "finished_today": 0, "finished_in_range": 0, "finished_by_verdict": {}},
@@ -75,8 +75,13 @@ Workstream attribution happens in core (`attribution.py`), not in sources: label
  "totals": {"tokens": {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0, "reasoning": 0}, "cost_usd": 0.0, "unpriced_runs": 0},
  "totals_all_time": {"tokens": {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0, "reasoning": 0}, "cost_usd": 0.0},
  "last_activity": 0,
- "by_workstream": [{"ws": "WS7", "live_agents": 0, "finished_in_range": 0, "finished_today": 0, "tokens": 0, "cost_usd": 0.0, "tokens_all_time": 0, "cost_usd_all_time": 0.0, "last_activity": 0}]}
+ "by_workstream": [{"ws": "WS7", "live_agents": 0, "finished_in_range": 0, "finished_today": 0, "tokens": 0, "cost_usd": 0.0, "tokens_all_time": 0, "cost_usd_all_time": 0.0, "last_activity": 0}],
+ "usage": [{"t": 0, "key": "opus", "input": 0, "output": 0, "cache_read": 0, "cache_write": 0, "reasoning": 0, "cost_usd": 0.0}]}
 ```
+`usage` is present only when `usage_group` is given: the hourly usage
+buckets for the same scope and window, computed under the same lock pass
+as `totals`, so the bucket token sum equals `totals` by construction. A
+bad `usage_group` is a 400.
 `totals` is the windowed scope total; `totals_all_time` is the same scope with
 no window, summed by the same helper. `last_activity` is the scope's newest
 run stamp, or null when the scope has no runs. The page tiles read these
@@ -152,8 +157,10 @@ its hour overlaps the window (`hour_ts + 3600 > since` and `hour_ts < until`).
 One function sums those cells for the window and, with no window, for all time.
 The tokens tile and the chart legend Total read the server snapshot totals for
 their scope and range; the tiles never re-sum buckets on the client. The chart
-keeps reading `/api/usage`, and when its bucket sum ever differs from the tile
-the page shows a muted cross line naming both numbers instead of hiding it.
+draws the same response's `usage` buckets, so tile, legend and chart agree by
+construction; when the bucket sum ever differs from the tile the page still
+shows a muted cross line naming both numbers instead of hiding it.
+`/api/usage` stays for compatibility but the page no longer reads it.
 The overview workstream cards read the same snapshot rows the tabs read, so
 each card shows exactly what its workstream tab shows for the same range. Runs
 with no workstream land in the `unassigned` row, which the Overview tab shows,

@@ -1252,5 +1252,127 @@ class HubTest(unittest.TestCase):
         self.assertTrue(rows)
 
 
+class SnapshotUsageTest(unittest.TestCase):
+    """snapshot(usage_group=...) carries the chart buckets in the same
+    response, read under the same lock pass as the totals, so the bucket
+    token sum equals the totals by construction."""
+
+    TOKEN_KEYS = ("input", "output", "cache_read", "cache_write", "reasoning")
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.store = memory(Path(self.tmp.name))
+        self.now = 1_761_999_960.0
+        self.since = self.now - 12 * 3600
+        self.until = self.now
+
+    def tearDown(self):
+        self.store.close()
+        self.tmp.cleanup()
+
+    def seed(self):
+        now = self.now
+        self.store.upsert_run(
+            {
+                "run_id": "muse:a:ws1-a",
+                "source": "muse",
+                "tier": "muse",
+                "model": "claude-sonnet-4-5",
+                "label": "ws1-a",
+                "session_id": "sess-a",
+                "status": "done",
+                "started_at": now - 5000,
+                "ended_at": now - 4000,
+            }
+        )
+        self.store.add_usage(
+            {
+                "ts": now - 4100,
+                "session_id": "sess-a",
+                "run_id": "muse:a:ws1-a",
+                "model": "claude-sonnet-4-5",
+                "tool": "muse",
+                "message_id": "m1",
+                "input": 100,
+                "output": 50,
+                "cache_read": 10,
+                "cache_write": 5,
+            }
+        )
+        self.store.upsert_run(
+            {
+                "run_id": "grok:b:ws2-b",
+                "source": "grok",
+                "tier": "grok",
+                "model": "grok-4-7",
+                "label": "ws2-b",
+                "session_id": "sess-b",
+                "status": "done",
+                "started_at": now - 9000,
+                "ended_at": now - 8000,
+            }
+        )
+        self.store.add_usage(
+            {
+                "ts": now - 8100,
+                "session_id": "sess-b",
+                "run_id": "grok:b:ws2-b",
+                "model": "grok-4-7",
+                "tool": "grok",
+                "message_id": "m1",
+                "input": 200,
+                "output": 100,
+                "cache_read": 0,
+                "cache_write": 0,
+            }
+        )
+
+    def assert_buckets_match_totals(self, snap, scope):
+        self.assertIn("usage", snap)
+        self.assertTrue(snap["usage"], scope)
+        for key in self.TOKEN_KEYS:
+            self.assertEqual(
+                sum(cell[key] for cell in snap["usage"]),
+                snap["totals"]["tokens"][key],
+                f"{scope} {key}",
+            )
+        priced = [
+            cell["priced_cost_usd"] if cell["priced_cost_usd"] is not None else cell["cost_usd"]
+            for cell in snap["usage"]
+        ]
+        priced = [value for value in priced if value is not None]
+        self.assertAlmostEqual(sum(priced), snap["totals"]["cost_usd"], places=6, msg=scope)
+
+    def test_model_buckets_sum_to_totals(self):
+        self.seed()
+        for ws in ("all", "WS1"):
+            snap = self.store.snapshot(self.now, ws, self.since, self.until, usage_group="model")
+            self.assert_buckets_match_totals(snap, f"model/{ws}")
+        scoped = self.store.snapshot(self.now, "WS1", self.since, self.until, usage_group="model")
+        self.assertEqual({cell["key"] for cell in scoped["usage"]}, {"sonnet"})
+
+    def test_workstream_buckets_sum_to_totals(self):
+        self.seed()
+        snap = self.store.snapshot(self.now, "all", self.since, self.until, usage_group="workstream")
+        self.assert_buckets_match_totals(snap, "workstream/all")
+        self.assertEqual({cell["key"] for cell in snap["usage"]}, {"WS1", "WS2"})
+
+    def test_tool_buckets_sum_to_totals(self):
+        self.seed()
+        snap = self.store.snapshot(self.now, "all", self.since, self.until, usage_group="tool")
+        self.assert_buckets_match_totals(snap, "tool/all")
+        self.assertEqual({cell["key"] for cell in snap["usage"]}, {"muse", "grok"})
+
+    def test_no_group_means_no_usage_key(self):
+        self.seed()
+        snap = self.store.snapshot(self.now, "all", self.since, self.until)
+        self.assertNotIn("usage", snap)
+
+    def test_bad_group_raises(self):
+        self.seed()
+        with self.assertRaises(ValueError):
+            self.store.snapshot(self.now, "all", self.since, self.until, usage_group="day")
+
+
 if __name__ == "__main__":
     unittest.main()

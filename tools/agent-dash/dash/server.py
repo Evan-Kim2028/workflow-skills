@@ -140,7 +140,8 @@ class Handler(BaseHTTPRequestHandler):
         now = time.time()
         since = _float(query, "since")
         until = _float(query, "until")
-        self._json(200, self.server.store.snapshot(now, ws, since, until))
+        usage_group = _one(query, "usage_group")
+        self._json(200, self.server.store.snapshot(now, ws, since, until, usage_group=usage_group))
 
     def _workstreams(self, query):
         since = _float(query, "since")

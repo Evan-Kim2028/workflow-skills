@@ -88,6 +88,55 @@ class PageRules(unittest.TestCase):
         self.assertIn("xline", body)
         self.assertIn("--warning", body)
 
+    def test_refresh_paths_read_one_snapshot_response(self):
+        """Tiles and chart come from one snapshot response: refreshAll,
+        refreshSnapshot (stream ticks) and warmTabs request usage_group with
+        the snapshot and never fetch /api/usage on their own."""
+        script = inline_scripts()
+        bodies = dict(functions(script))
+        for name in ("refreshAll", "refreshSnapshot", "warmTabs"):
+            self.assertIn(name, bodies, f"{name} is gone from the page")
+            self.assertIn("/api/snapshot", bodies[name], f"{name} no longer reads the snapshot")
+            self.assertIn(
+                "usage_group", bodies[name], f"{name} fetches the snapshot without its usage buckets"
+            )
+            self.assertNotIn("/api/usage", bodies[name], f"{name} still races a second usage fetch")
+        self.assertNotIn("loadUsage", script, "loadUsage is gone; the groupBy toggle refetches the snapshot")
+
+    def test_refresh_snapshot_applies_totals_with_usage(self):
+        """No path replaces snap.totals without snap.usage: refreshSnapshot
+        assigns state.snap and state.usage together under the tab+range+group
+        guard, and so does every other writer."""
+        script = inline_scripts()
+        bodies = dict(functions(script))
+        self.assertIn("refreshSnapshot", bodies)
+        body = bodies["refreshSnapshot"]
+        self.assertIn("state.snap =", body)
+        self.assertIn("state.usage =", body)
+        self.assertIn("ADC.applies", body, "refreshSnapshot lost the tab+range+group guard")
+        for name in ("refreshAll", "refreshSnapshot"):
+            self.assertEqual(
+                bodies[name].count("state.snap ="),
+                bodies[name].count("state.usage ="),
+                f"{name} assigns snap and usage different numbers of times",
+            )
+            self.assertGreater(bodies[name].count("state.snap ="), 0, name)
+        self.assertEqual(
+            script.count("state.snap ="),
+            script.count("state.usage ="),
+            "some writer replaces snap.totals without snap.usage",
+        )
+
+    def test_groupby_toggle_refetches_the_snapshot(self):
+        """The By model/workstream toggle refetches the snapshot with the new
+        group instead of racing a lone usage fetch."""
+        script = inline_scripts()
+        bodies = dict(functions(script))
+        self.assertIn("tokenChart", bodies)
+        body = bodies["tokenChart"]
+        self.assertIn("state.groupBy =", body)
+        self.assertIn("refreshSnapshot", body)
+
     def test_cache_key_and_stale_guard(self):
         script = (
             "const fs=require('fs');"

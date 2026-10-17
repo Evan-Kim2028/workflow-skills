@@ -3,10 +3,14 @@
  *
  * Drives the live dashboard in headless Chrome over the DevTools protocol
  * (stdlib only: global fetch and WebSocket, child_process, no npm installs).
- * For the overview and every workstream tab at each range it waits for the
- * page to settle, reads the rendered tile and chart legend numbers from the
- * DOM data attributes, and compares them to /api/snapshot and /api/usage
- * for the same scope and range.
+ * For the overview and every workstream tab at each range it first asserts
+ * the page's internal invariant strictly from one DOM read (tile, legend
+ * Total and chart sum agree, and the cost tile is present), since that is
+ * what the owner sees. It then compares the DOM to the API with a
+ * consistent read: /api/snapshot (with usage_group, so the response also
+ * carries the chart buckets) is fetched right before and right after the
+ * DOM read, and a DOM value between the two (or equal to either) is live
+ * growth, not a mismatch. Each combination is retried up to 3 times.
  *
  * Exit 0 when everything agrees, 1 with a table on any mismatch, 2 when
  * Chrome is missing (the agent_dash.py wrapper reports a skip then).
@@ -20,6 +24,8 @@ import path from "node:path";
 const RANGES = [6, 12, 24, 72];
 const SETTLE_POLL_MS = 700;
 const COMBO_TIMEOUT_MS = 30000;
+const MAX_ATTEMPTS = 3;
+const RETRY_MS = 1500;
 
 function args(argv) {
   const out = { url: "http://127.0.0.1:8765", chrome: null, ws: null, hours: null };
@@ -195,6 +201,57 @@ async function waitForLoad(cdp) {
   }
 }
 
+/* Re-trigger the page fetch and wait until the tile shows numbers newer
+ * than the stale read, then settle. Falls back to a plain settled read
+ * when nothing moves (an idle server has nothing fresher to show). */
+async function readFresh(cdp, expr, ws, hours, staleTile) {
+  await clickRange(cdp, hours);
+  const deadline = Date.now() + 8000;
+  for (;;) {
+    let cur = null;
+    try {
+      cur = await evaluate(cdp, expr);
+    } catch {
+      cur = null;
+    }
+    if (cur && cur.tile && Number(cur.tile.tokens) !== staleTile) break;
+    if (Date.now() > deadline) break;
+    await new Promise((r) => setTimeout(r, 500));
+  }
+  return await readSettled(cdp, expr, ws, hours);
+}
+
+/* Wait until two consecutive DOM reads agree: the page has applied its
+ * latest fetch. One evaluate call is atomic, so the returned object is a
+ * single render (tile, legend, chart and cost from the same moment). */
+async function readSettled(cdp, expr, ws, hours) {
+  const deadline = Date.now() + COMBO_TIMEOUT_MS;
+  let stable = 0;
+  let prev = "";
+  for (;;) {
+    let cur = null;
+    try {
+      cur = await evaluate(cdp, expr);
+    } catch {
+      cur = null;
+    }
+    if (cur && cur.settled) {
+      const fingerprint = JSON.stringify([cur.settled, cur.tile, cur.legend, cur.cost]);
+      if (fingerprint === prev) {
+        stable++;
+        if (stable >= 1) return cur;
+      } else {
+        stable = 0;
+        prev = fingerprint;
+      }
+    }
+    if (Date.now() > deadline) {
+      throw new Error(`page never settled for ${ws} ${hours}h`);
+    }
+    await new Promise((r) => setTimeout(r, SETTLE_POLL_MS));
+  }
+}
+
 function readDomExpression(ws, hours) {
   return `(function(){
     var s = window.__adSettled || "";
@@ -228,6 +285,78 @@ function billed(tokens) {
   return (tokens.input || 0) + (tokens.output || 0) + (tokens.cache_read || 0) + (tokens.cache_write || 0);
 }
 
+function bucketSum(buckets) {
+  return (buckets || []).reduce(
+    (acc, b) => acc + (b.input || 0) + (b.output || 0) + (b.cache_read || 0) + (b.cache_write || 0),
+    0,
+  );
+}
+
+function inBracket(value, a, b) {
+  return value >= Math.min(a, b) && value <= Math.max(a, b);
+}
+
+function inCostBracket(value, a, b) {
+  return value >= Math.min(a, b) - 1e-6 && value <= Math.max(a, b) + 1e-6;
+}
+
+/* The page's internal invariant, from a single DOM read: the tile, the
+ * legend Total and the chart sum are one render, so they must agree
+ * exactly; the cost tile must be present. Returns a detail string, or null. */
+function internalDetail(dom) {
+  const tileTok = Number(dom.tile.tokens);
+  const legendTot = Number(dom.legend.total);
+  const chartSum = Number(dom.legend.chartSum);
+  if (!Number.isInteger(tileTok) || !Number.isInteger(legendTot) || !Number.isInteger(chartSum)) {
+    return `one render has non-integer numbers: tile ${dom.tile.tokens} legend ${dom.legend.total} chart ${dom.legend.chartSum}`;
+  }
+  if (tileTok !== legendTot || tileTok !== chartSum) {
+    return `one render disagrees with itself: tile ${tileTok} legend ${legendTot} chart ${chartSum}`;
+  }
+  if (dom.xline) {
+    return `stale cross line while tile and chart agree at ${tileTok}`;
+  }
+  if (!dom.cost || !Number.isFinite(Number(dom.cost.usd))) {
+    return `cost tile missing in the same render (tile ${tileTok})`;
+  }
+  return null;
+}
+
+/* Same-response server invariant: the usage buckets riding along in a
+ * snapshot sum to that snapshot's totals. No time skew is involved, so
+ * this is strict. Returns a detail string, or null. */
+function snapUsageDetail(snap, tag) {
+  if (!Array.isArray(snap.usage)) return null;
+  const sum = bucketSum(snap.usage);
+  const tot = billed(snap.totals.tokens);
+  if (sum !== tot) return `snapshot ${tag} usage buckets sum to ${sum} but totals say ${tot}`;
+  return null;
+}
+
+/* DOM against the bracketing snapshots: a value between the two (or equal
+ * to either) is live growth. Returns a detail string, or null. */
+function bracketDetail(dom, snapBefore, snapAfter) {
+  const tileTok = Number(dom.tile.tokens);
+  const beforeTok = billed(snapBefore.totals.tokens);
+  const afterTok = billed(snapAfter.totals.tokens);
+  if (!inBracket(tileTok, beforeTok, afterTok)) {
+    return `tile ${tileTok} outside snapshot bracket [${beforeTok}, ${afterTok}]`;
+  }
+  const domCost = Number(dom.cost.usd);
+  const beforeCost = snapBefore.totals.cost_usd || 0;
+  const afterCost = snapAfter.totals.cost_usd || 0;
+  if (!inCostBracket(domCost, beforeCost, afterCost)) {
+    return `cost tile ${dom.cost.usd} outside snapshot bracket [${beforeCost}, ${afterCost}]`;
+  }
+  const domAll = Number(dom.tile.allTime);
+  const beforeAll = billed(snapBefore.totals_all_time.tokens);
+  const afterAll = billed(snapAfter.totals_all_time.tokens);
+  if (!inBracket(domAll, beforeAll, afterAll)) {
+    return `tile all-time ${domAll} outside snapshot bracket [${beforeAll}, ${afterAll}]`;
+  }
+  return null;
+}
+
 async function apiJson(url) {
   const response = await fetch(url);
   if (!response.ok) throw new Error(`GET ${url} -> ${response.status}`);
@@ -256,6 +385,8 @@ async function main() {
   let cdp = null;
   const rows = [];
   let failures = 0;
+  let growthReads = 0;
+  let preAtomic = false;
   const finish = (code) => {
     try {
       if (cdp) cdp.close();
@@ -289,16 +420,25 @@ async function main() {
     await waitForLoad(cdp);
     let tabs = [];
     {
+      // Wait for the tab set to settle, not just appear: the first render
+      // has only the overview tab while the workstream list still loads.
       const deadline = Date.now() + COMBO_TIMEOUT_MS;
+      let prev = "";
       for (;;) {
+        let cur = [];
         try {
-          tabs = ((await evaluate(cdp, tabsExpression)) || []).filter(Boolean);
+          cur = ((await evaluate(cdp, tabsExpression)) || []).filter(Boolean);
         } catch {
-          tabs = [];
+          cur = [];
         }
-        if (tabs.length) break;
+        const fp = JSON.stringify(cur);
+        if (cur.length && fp === prev) {
+          tabs = cur;
+          break;
+        }
+        prev = fp;
         if (Date.now() > deadline) {
-          throw new Error("tabs never rendered with data-ws (is the page reachable from Chrome, and is the server running the token-coherence page?)");
+          throw new Error("tabs never settled with data-ws (is the page reachable from Chrome, and is the server running the token-coherence page?)");
         }
         await new Promise((r) => setTimeout(r, 500));
       }
@@ -311,7 +451,7 @@ async function main() {
       await cdp.send("Page.navigate", { url: `${opts.url}/?view=exec&ws=${encodeURIComponent(ws)}` });
       await waitForLoad(cdp);
       for (const hours of ranges) {
-        const row = { ws, hours, tile: null, snap: null, legend: null, chart: null, cost: null, allTime: null, status: "OK", detail: "" };
+        const row = { ws, hours, tile: null, snap: null, legend: null, chart: null, cost: null, allTime: null, live: "-", status: "OK", detail: "" };
         rows.push(row);
         const fail = (detail) => {
           row.status = "MISMATCH";
@@ -321,90 +461,66 @@ async function main() {
         try {
           await clickRange(cdp, hours);
           const expr = readDomExpression(ws, hours);
-          let seen = null;
-          {
-            const deadline = Date.now() + COMBO_TIMEOUT_MS;
-            let stable = 0;
-            let prev = "";
-            for (;;) {
-              let cur = null;
-              try {
-                cur = await evaluate(cdp, expr);
-              } catch {
-                cur = null;
-              }
-              if (cur && cur.settled) {
-                const fingerprint = JSON.stringify([cur.settled, cur.tile, cur.legend]);
-                if (fingerprint === prev) {
-                  stable++;
-                  if (stable >= 1) {
-                    seen = cur;
-                    break;
-                  }
-                } else {
-                  stable = 0;
-                  prev = fingerprint;
-                }
-              }
-              if (Date.now() > deadline) {
-                throw new Error(`page never settled for ${ws} ${hours}h`);
-              }
-              await new Promise((r) => setTimeout(r, SETTLE_POLL_MS));
-            }
-          }
+          const seen = await readSettled(cdp, expr, ws, hours);
           if (seen.bleed !== undefined && seen.tile === undefined) {
             fail(`cross-tab bleed: asked ${ws}, tile shows ${seen.bleed}`);
             continue;
           }
-          const usageUrl = (sinceValue) =>
-            `${opts.url}/api/usage?group=model&bucket=hour&since=${sinceValue}${ws === "all" ? "" : `&ws=${encodeURIComponent(ws)}`}`;
           const snapUrl = (sinceValue) =>
-            `${opts.url}/api/snapshot?ws=${encodeURIComponent(ws === "all" ? "all" : ws)}&since=${sinceValue}`;
-          const since = Math.floor(Date.now() / 1000 - hours * 3600);
-          const [snap, usage] = await Promise.all([apiJson(snapUrl(since)), apiJson(usageUrl(since))]);
-          const snapTok = billed(snap.totals.tokens);
-          const tileTok = Number(seen.tile.tokens);
-          const legendTot = Number(seen.legend.total);
-          const chartSum = Number(seen.legend.chartSum);
-          const usageSum = usage.buckets.reduce(
-            (acc, b) => acc + (b.input || 0) + (b.output || 0) + (b.cache_read || 0) + (b.cache_write || 0),
-            0,
-          );
-          row.tile = tileTok;
-          row.snap = snapTok;
-          row.legend = legendTot;
-          row.chart = chartSum;
-          row.cost = Number(seen.cost ? seen.cost.usd : NaN);
-          row.allTime = Number(seen.tile.allTime);
-          if (tileTok !== snapTok) {
-            // One retry: the collector may have written between the page fetch and ours.
-            await new Promise((r) => setTimeout(r, 2500));
-            const again = await evaluate(cdp, expr);
-            const retrySince = Math.floor(Date.now() / 1000 - hours * 3600);
-            const snap2 = await apiJson(snapUrl(retrySince));
-            if (!again || !again.tile || Number(again.tile.tokens) !== billed(snap2.totals.tokens)) {
-              fail(`tile ${tileTok} != snapshot ${snapTok} (retry: ${again && again.tile ? again.tile.tokens : "no tile"} vs ${billed(snap2.totals.tokens)})`);
+            `${opts.url}/api/snapshot?ws=${encodeURIComponent(ws === "all" ? "all" : ws)}&since=${sinceValue}&usage_group=model`;
+          // Consistent read: bracket the DOM read with two snapshots. A DOM
+          // value between the two (or equal to either) is live growth.
+          // A retry re-triggers the page fetch first, so a DOM left behind
+          // by growth is re-read fresh instead of failing the same way.
+          let attemptDetail = "";
+          let passed = null;
+          let staleTile = null;
+          for (let attempt = 1; attempt <= MAX_ATTEMPTS && !passed; attempt++) {
+            if (attempt > 1) {
+              await new Promise((r) => setTimeout(r, RETRY_MS));
+              await readFresh(cdp, expr, ws, hours, staleTile);
+            }
+            const snapBefore = await apiJson(snapUrl(Math.floor(Date.now() / 1000 - hours * 3600)));
+            const dom = await evaluate(cdp, expr);
+            const snapAfter = await apiJson(snapUrl(Math.floor(Date.now() / 1000 - hours * 3600)));
+            if (!dom || !dom.tile) {
+              attemptDetail = `dom read failed on attempt ${attempt}`;
               continue;
             }
-            row.tile = Number(again.tile.tokens);
-            row.snap = billed(snap2.totals.tokens);
+            staleTile = Number(dom.tile.tokens);
+            if (!Array.isArray(snapBefore.usage) || !Array.isArray(snapAfter.usage)) preAtomic = true;
+            attemptDetail =
+              internalDetail(dom) ||
+              snapUsageDetail(snapBefore, "before") ||
+              snapUsageDetail(snapAfter, "after") ||
+              bracketDetail(dom, snapBefore, snapAfter) ||
+              "";
+            if (!attemptDetail) passed = { dom, snapBefore, snapAfter };
           }
-          if (Math.abs(Number(seen.cost ? seen.cost.usd : 0) - (snap.totals.cost_usd || 0)) > 1e-6) {
-            fail(`cost tile ${seen.cost.usd} != snapshot ${snap.totals.cost_usd}`);
+          if (!passed) {
+            fail(`after ${MAX_ATTEMPTS} tries: ${attemptDetail}`);
             continue;
           }
-          if (row.allTime !== billed(snap.totals_all_time.tokens)) {
-            fail(`tile all-time ${row.allTime} != snapshot ${billed(snap.totals_all_time.tokens)}`);
-            continue;
-          }
-          if (legendTot !== tileTok) {
-            fail(`legend ${legendTot} != tile ${tileTok} in the same render`);
-            continue;
+          const { dom, snapBefore, snapAfter } = passed;
+          const tileTok = Number(dom.tile.tokens);
+          row.tile = tileTok;
+          row.snap = billed(snapAfter.totals.tokens);
+          row.legend = Number(dom.legend.total);
+          row.chart = Number(dom.legend.chartSum);
+          row.cost = Number(dom.cost.usd);
+          row.allTime = Number(dom.tile.allTime);
+          if (
+            billed(snapBefore.totals.tokens) !== billed(snapAfter.totals.tokens) ||
+            (snapBefore.totals.cost_usd || 0) !== (snapAfter.totals.cost_usd || 0) ||
+            billed(snapBefore.totals_all_time.tokens) !== billed(snapAfter.totals_all_time.tokens)
+          ) {
+            row.live = "live growth";
+            growthReads++;
           }
           if (tileTok === 0) {
             // Zero with context: "0 in 6 h" plus the last run and all-time line.
-            const text = (seen.tile.text || "").replace(/\s+/g, " ");
-            const allTimeTok = billed(snap.totals_all_time.tokens);
+            const text = (dom.tile.text || "").replace(/\s+/g, " ");
+            const allTimeTok = billed(snapAfter.totals_all_time.tokens);
             if (!text.includes(`0 in ${hours} h`)) {
               fail(`zero tile does not say "0 in ${hours} h": ${text.slice(0, 120)}`);
               continue;
@@ -413,48 +529,35 @@ async function main() {
               fail(`zero tile names no last run or all-time total: ${text.slice(0, 160)}`);
               continue;
             }
-            if (allTimeTok === 0 && snap.last_activity !== null && snap.last_activity !== undefined) {
+            if (allTimeTok === 0 && snapAfter.last_activity !== null && snapAfter.last_activity !== undefined) {
               fail(`tile shows no all-time tokens but the scope has activity`);
               continue;
             }
           }
-          if (tileTok !== chartSum && !seen.xline) {
-            fail(`tile ${tileTok} != chart ${chartSum} with no cross line shown`);
-            continue;
-          }
-          if (tileTok === chartSum && seen.xline) {
-            fail(`stale cross line while tile and chart agree at ${tileTok}`);
-            continue;
-          }
-          if (chartSum !== usageSum) {
-            // One retry: the usage fetch and the page render raced the collector.
-            await new Promise((r) => setTimeout(r, 2500));
-            const seenAgain = await evaluate(cdp, expr);
-            const usageSince = Math.floor(Date.now() / 1000 - hours * 3600);
-            const usage2 = await apiJson(usageUrl(usageSince));
-            const chart2 = seenAgain && seenAgain.legend ? Number(seenAgain.legend.chartSum) : NaN;
-            const usageSum2 = usage2.buckets.reduce(
-              (acc, b) => acc + (b.input || 0) + (b.output || 0) + (b.cache_read || 0) + (b.cache_write || 0),
-              0,
-            );
-            if (chart2 !== usageSum2) {
-              fail(`rendered chart sum ${chartSum} != usage API sum ${usageSum} (retry: ${chart2} vs ${usageSum2})`);
-              continue;
-            }
-            row.chart = chart2;
-          }
-          if (ws === "all" && seen.cards && seen.cards.length) {
-            const byWs = {};
-            for (const r of snap.by_workstream) byWs[r.ws] = r;
-            for (const card of seen.cards) {
+          if (ws === "all" && dom.cards && dom.cards.length) {
+            const byBefore = {};
+            for (const r of snapBefore.by_workstream) byBefore[r.ws] = r;
+            const byAfter = {};
+            for (const r of snapAfter.by_workstream) byAfter[r.ws] = r;
+            for (const card of dom.cards) {
               if (card.hours !== String(hours)) {
                 fail(`overview card ${card.id} shows ${card.hours}h, asked ${hours}h`);
                 break;
               }
-              const hit = byWs[card.id] || (card.id === "Unassigned" ? byWs.unassigned : undefined);
-              if (!hit) continue;
-              if (Number(card.tokens) !== hit.tokens) {
-                fail(`overview card ${card.id} ${card.tokens} != tab row ${hit.tokens}`);
+              const key = card.id === "Unassigned" ? "unassigned" : card.id;
+              const before = byBefore[key];
+              const after = byAfter[key];
+              if (!before && !after) continue;
+              const tokLo = before ? before.tokens : after.tokens;
+              const tokHi = after ? after.tokens : before.tokens;
+              if (!inBracket(Number(card.tokens), tokLo, tokHi)) {
+                fail(`overview card ${card.id} ${card.tokens} outside tab-row bracket [${tokLo}, ${tokHi}]`);
+                break;
+              }
+              const costLo = before ? before.cost_usd : after.cost_usd;
+              const costHi = after ? after.cost_usd : before.cost_usd;
+              if (!inCostBracket(Number(card.cost), costLo, costHi)) {
+                fail(`overview card ${card.id} cost ${card.cost} outside tab-row bracket [${costLo}, ${costHi}]`);
                 break;
               }
             }
@@ -477,20 +580,27 @@ async function main() {
   const width = Math.max(10, ...rows.map((r) => String(r.ws).length));
   console.log(`page check ${opts.url} (${rows.length} tab/range combinations)`);
   console.log(
-    `${"workstream".padEnd(width)} ${"range".padStart(5)} ${"tile".padStart(12)} ${"snap".padStart(12)} ${"legend".padStart(12)} ${"chart".padStart(12)} ${"cost".padStart(10)} ${"status".padStart(8)}`,
+    `${"workstream".padEnd(width)} ${"range".padStart(5)} ${"tile".padStart(12)} ${"snap".padStart(12)} ${"legend".padStart(12)} ${"chart".padStart(12)} ${"cost".padStart(10)} ${"live".padStart(11)} ${"status".padStart(8)}`,
   );
   for (const row of rows) {
     console.log(
-      `${String(row.ws).padEnd(width)} ${(`${row.hours}h`).padStart(5)} ${String(row.tile ?? "-").padStart(12)} ${String(row.snap ?? "-").padStart(12)} ${String(row.legend ?? "-").padStart(12)} ${String(row.chart ?? "-").padStart(12)} ${String(row.cost ?? "-").padStart(10)} ${row.status.padStart(8)}`,
+      `${String(row.ws).padEnd(width)} ${(`${row.hours}h`).padStart(5)} ${String(row.tile ?? "-").padStart(12)} ${String(row.snap ?? "-").padStart(12)} ${String(row.legend ?? "-").padStart(12)} ${String(row.chart ?? "-").padStart(12)} ${String(row.cost ?? "-").padStart(10)} ${String(row.live ?? "-").padStart(11)} ${row.status.padStart(8)}`,
     );
     if (row.detail) console.log(`  - ${row.detail}`);
+  }
+  if (preAtomic) {
+    console.log(
+      "note: the server never sent snap.usage (pre-atomic build); internal mismatches above come from the old page code it still serves, not from this harness",
+    );
   }
   if (failures) {
     console.log(`${failures} mismatch(es)`);
     finish(1);
     return;
   }
-  console.log(`ok: every rendered tile and legend matches the API`);
+  console.log(
+    `ok: every rendered tile and legend matches the API${growthReads ? ` (${growthReads} read(s) during live growth)` : ""}`,
+  );
   finish(0);
 }
 
