@@ -13,8 +13,12 @@ python3 tools/agent-dash/agent_dash.py state    # the whole dashboard in one cal
 
 `state` reads `GET /api/state`: version, window, health per source,
 workstreams with progress and tokens, the unassigned row, the running
-count by source, the reconcile verdict, and a `problems` list where
-every entry names the exact next command. The server runs the doctor
+count by source (plus the compact `prod_jobs` / `prod_jobs_finished`
+numbers), the reconcile verdict, and a `problems` list where
+every entry names the exact next command. Production jobs (source
+`dagster`) are never in agent lists: `/api/snapshot` running/recent and
+`/api/runs` hold no dagster rows, and `?include=jobs` adds them back on
+`/api/runs` when a tool needs them. The server runs the doctor
 checks in a background thread every `doctor.interval_s` seconds
 (default 300) and persists them; `GET /api/doctor` serves the latest
 run (never inline; `?refresh=1` queues one), with `?ws=<ID>` and

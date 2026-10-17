@@ -1686,13 +1686,48 @@ class StaleRunningTest(unittest.TestCase):
             [run["run_id"] for run, _reason in stale], ["dagster:" + stale_short]
         )
         snap = self.store.snapshot(now, "all")
-        self.assertEqual(
-            [run["run_id"] for run in snap["running"]], ["dagster:" + live_short]
-        )
+        self.assertEqual([run["run_id"] for run in snap["running"]], [])
         self.assertEqual(snap["counts"]["prod_jobs"], 1)
         report = self.store.reconcile_numbers(now, now - 3600, now)
         self.assertTrue(
             any("dagster:" + stale_short in item for item in report["mismatches"])
+        )
+
+    def test_finished_prod_jobs_are_a_count_not_a_list(self):
+        now = self.now
+        self.store.upsert_run(
+            {
+                "run_id": "dagster:job:done",
+                "source": "dagster",
+                "model": "nightly",
+                "label": "ws7-backfill",
+                "status": "finished",
+                "started_at": now - 200,
+                "ended_at": now - 100,
+                "clock_source": "dagster",
+            }
+        )
+        self.store.upsert_run(
+            {
+                "run_id": "muse:s:ws7-x",
+                "source": "muse",
+                "tier": "muse",
+                "label": "ws7-x",
+                "status": "done",
+                "started_at": now - 200,
+                "ended_at": now - 100,
+            }
+        )
+        snap = self.store.snapshot(now, "WS7")
+        self.assertEqual([run["run_id"] for run in snap["recent"]], ["muse:s:ws7-x"])
+        self.assertEqual(snap["recent_total"], 1)
+        self.assertEqual(snap["counts"]["finished_in_range"], 1)
+        self.assertEqual(snap["counts"]["prod_jobs_finished"], 1)
+        runs = self.store.query_runs(now, "WS7", None, None, 50)
+        self.assertEqual([run["run_id"] for run in runs], ["muse:s:ws7-x"])
+        with_jobs = self.store.query_runs(now, "WS7", None, None, 50, include_jobs=True)
+        self.assertEqual(
+            {run["run_id"] for run in with_jobs}, {"muse:s:ws7-x", "dagster:job:done"}
         )
 
     def test_stale_idle_claude_main_excluded(self):

@@ -79,7 +79,7 @@ unreachable (docs/integrate.md, For agents).
 `GET /api/snapshot?ws=<WSn|all>&since=&until=&usage_group=<model|workstream|tool>`
 ```json
 {"now": 0, "seq": 0,
- "counts": {"live_agents": 0, "live_by_tool": {"grok": 0, "muse": 0, "glm": 0, "claude": 0}, "finished_today": 0, "finished_in_range": 0, "finished_by_verdict": {}},
+ "counts": {"live_agents": 0, "live_by_tool": {"grok": 0, "muse": 0, "glm": 0, "claude": 0}, "prod_jobs": 0, "prod_jobs_finished": 0, "finished_today": 0, "finished_in_range": 0, "finished_by_verdict": {}},
  "running": [Run], "recent": [Run],
  "totals": {"tokens": {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0, "reasoning": 0}, "cost_usd": 0.0, "unpriced_runs": 0, "unpriced_tokens": 0, "unpriced_models": []},
  "totals_all_time": {"tokens": {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0, "reasoning": 0}, "cost_usd": 0.0},
@@ -104,11 +104,11 @@ the all-scope numbers exactly (cost within 1e-6).
 `Run` = `{run_id, source, tier, model, label, workstream, ws_confidence, session_id, parent_session_id, status, verdict,
 started_at, ended_at, elapsed_s, clock_source, out_bytes, out_growing, err_bytes, pid, rss_kb, tokens: {input, output, cache_read, cache_write}, cost_usd, context_tokens}`.
 `context_tokens` is the latest `grok-context` input for that run, or null. It is a context-window estimate. It is not part of `tokens`, totals, buckets, or cost. `elapsed_s` is null when `started_at` is null.
-`recent` = runs ended inside the window (one fixed 24 h by default, `since`/`until` narrow it), newest first, max 50. The page shows it as `Finished (24 h)`.
+`recent` = runs ended inside the window (one fixed 24 h by default, `since`/`until` narrow it), newest first, max 50. Production jobs (source `dagster`) are never in `recent`; they are the `counts.prod_jobs_finished` count. The page shows it as `Finished (24 h)`.
 
 `GET /api/stream` -> SSE. Event `tick` every 2 s: `{"seq": n, "running": [Run], "sources": [{name, last_poll, lag_s}]}`; the page refetches snapshot when `seq` changes. `sources` mirrors the registry freshness so the page can show staleness per source.
 
-`GET /api/runs?ws=&since=&until=&limit=` -> `{"runs": [Run]}` (Gantt input; workflow children collapsed into one row with `children: n`).
+`GET /api/runs?ws=&since=&until=&limit=&include=` -> `{"runs": [Run]}` (Gantt input; workflow children collapsed into one row with `children: n`). Production (dagster) rows are left out by default; `?include=jobs` adds them back for tools that need them (anything else is a 400).
 
 `GET /api/usage?group=model|workstream|tool&bucket=hour|day&ws=&since=&until=` -> `{"buckets": [{"t": 0, "key": "opus", "input": 0, "output": 0, "cache_read": 0, "cache_write": 0, "reasoning": 0, "cost_usd": 0.0}]}`
 
@@ -221,8 +221,8 @@ store pass (`Store.state_view`):
  "workstreams": [{"id": "WS7", "title": "", "plan": true, "progress": {"done": 0, "total": 0, "counts": {}, "pct": 0},
    "live_agents": 0, "tokens": 0, "cost_usd": 0.0, "tokens_all_time": 0, "cost_usd_all_time": 0.0, "last_activity": 0}],
  "unassigned": {"live_agents": 0, "tokens": 0, "cost_usd": 0.0, "tokens_all_time": 0, "cost_usd_all_time": 0.0, "last_activity": 0},
- "running": {"count": 0, "by_source": {"muse": 0}},
- "totals": {"tokens": {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0, "reasoning": 0}, "cost_usd": 0.0, "unpriced_runs": 0},
+ "running": {"count": 0, "by_source": {"muse": 0}, "prod_jobs": 0, "prod_jobs_finished": 0},
+ "totals": {"tokens": {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0, "reasoning": 0}, "cost_usd": 0.0, "unpriced_runs": 0, "prod_jobs": 0, "prod_jobs_finished": 0},
  "totals_all_time": {"tokens": {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0, "reasoning": 0}, "cost_usd": 0.0},
  "reconcile": {"ok": true, "mismatches": []},
  "problems": [{"code": "stale-running", "message": "", "command": "python3 agent_dash.py check"}]}
@@ -246,6 +246,15 @@ renamed.
 Plan and Execution are one shell, `static/index.html`. `GET /` and `GET /plan` both serve that file. The page swaps the view in place (`?view=plan|exec&ws=<ID>`). `/static/index.html?ws=<ID>` still opens Execution. Project text stays out of the tool directory, under `AGENT_DASH_WORKSTREAMS` (default `~/.local/share/agent-dash/workstreams`). One directory per bundle id. A directory with `bundle.json` shows up on the plan view and, for `kind: workstream`, on `GET /api/plan`. When both a bundle and the plans map name a workstream, the bundle's `plan.json` wins (`resolve_plan`).
 
 ## One number, one truth
+
+Production jobs (source `dagster`) are never in agent lists; they are a
+count. Snapshot `running` and `recent`, `/api/runs` by default, and the timeline
+never hold a dagster row (`Store.is_prod_job_run`). `counts.prod_jobs` (running
+now) and `counts.prod_jobs_finished` (finished in the window) ride on every
+snapshot scope, and the live tile reads them (`N prod jobs`, `N prod jobs ran`).
+`?include=jobs` on `/api/runs` adds the dagster rows back for tools that need
+them. Lead sessions (`claude-main`) and shell rows keep their existing places in
+the lists and are never counted as agents.
 
 An agent is a running row whose source maps to a tool (grok, muse, glm, or
 claude). Interactive lead sessions (`claude-main`), shell rows, and Dagster
@@ -311,6 +320,7 @@ One filtered running set backs every view: the snapshot `running` list,
 `counts.live_agents`, `/api/workstreams` `live_agents`, and the timeline's
 open bars (`/api/runs`, `/api/concurrency`) all derive from
 `Store._live_open_ids_locked`, so no view can show a run another hides.
+Production jobs are the one source kept out of every agent list (see One number, one truth).
 One lane, one agent: when a `claude-workflow` wrapper row and a worker row
 (`muse`/`glm`/`grok`) share a label and the worker row is live, the lane
 counts once — the worker. The wrapper id leaves the running set (the

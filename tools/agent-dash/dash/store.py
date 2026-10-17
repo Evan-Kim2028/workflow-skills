@@ -1318,7 +1318,9 @@ class Store:
             running = [
                 run
                 for run in scoped
-                if run["status"] == "running" and run["run_id"] in live_open
+                if run["status"] == "running"
+                and run["run_id"] in live_open
+                and not is_prod_job_run(run)
             ]
             running.sort(key=lambda run: run["started_at"] or 0, reverse=True)
             range_since = now - RANGE_S if since is None else float(since)
@@ -1326,7 +1328,8 @@ class Store:
             recent_all = [
                 run
                 for run in scoped
-                if run["status"] != "running"
+                if not is_prod_job_run(run)
+                and run["status"] != "running"
                 and run["ended_at"] is not None
                 and range_since <= float(run["ended_at"]) <= range_until
             ]
@@ -1681,6 +1684,21 @@ class Store:
                 if run.get("status") == "running" and run.get("run_id") in live_open:
                     key = run.get("source") or "unknown"
                     by_source[key] = by_source.get(key, 0) + 1
+            range_since = now - RANGE_S if since is None else float(since)
+            range_until = float(now if until is None else until)
+            prod_jobs = 0
+            prod_jobs_finished = 0
+            for run in shown_all:
+                if run.get("source") != "dagster":
+                    continue
+                if run.get("status") in ("running", "queued") and run.get("run_id") in live_open:
+                    prod_jobs += 1
+                if (
+                    run.get("status") != "running"
+                    and run.get("ended_at") is not None
+                    and range_since <= float(run["ended_at"]) <= range_until
+                ):
+                    prod_jobs_finished += 1
             boards = {
                 row["ws"]: row["name"] or ""
                 for row in self._conn.execute("SELECT ws, name FROM ws_counts").fetchall()
@@ -1698,6 +1716,8 @@ class Store:
                 "roll": roll,
                 "mismatches": mismatches,
                 "running_by_source": by_source,
+                "prod_jobs": prod_jobs,
+                "prod_jobs_finished": prod_jobs_finished,
                 "boards": boards,
                 "stale": stale,
             }
@@ -1772,9 +1792,11 @@ class Store:
             "all_time": all_time,
         }
 
-    def query_runs(self, now: float, ws: str | None, since: float | None, until: float | None, limit: int) -> list:
+    def query_runs(self, now: float, ws: str | None, since: float | None, until: float | None, limit: int, include_jobs: bool = False) -> list:
         """Gantt input. Open bars come from the one filtered running set, so a
-        stale row the snapshot hides never shows as an open bar here."""
+        stale row the snapshot hides never shows as an open bar here. Production
+        (dagster) rows are left out unless ``include_jobs`` is set; lead and
+        shell rows stay in."""
         with self._lock:
             raw, usage, parents = self._scoped_usage()
             context = self._context_by_run()
@@ -1786,6 +1808,8 @@ class Store:
                 if row["run_id"] in parents:
                     continue
                 view = self._run_view(row, now, usage, rss, context)
+                if not include_jobs and is_prod_job_run(view):
+                    continue
                 if (
                     view.get("status") in ("running", "queued")
                     and view["run_id"] not in live_open
@@ -3206,6 +3230,7 @@ def _empty_scope() -> dict:
             "live_by_tool": {key: 0 for key in TOOL_KEYS},
             "live_by_model": {},
             "prod_jobs": 0,
+            "prod_jobs_finished": 0,
             "finished_today": 0,
             "finished_in_range": 0,
             "finished_by_verdict": {},
@@ -3232,6 +3257,14 @@ def _tool_key(run: dict) -> str | None:
     if source.startswith("claude") or tier in ("opus", "sonnet", "haiku"):
         return "claude"
     return None
+
+
+def is_prod_job_run(run: dict) -> bool:
+    """True for a production (Dagster) job row. Production jobs are never in
+    an agent list (snapshot running/recent, ``/api/runs`` by default, the
+    timeline); they reach the page only as the ``prod_jobs`` and
+    ``prod_jobs_finished`` counts."""
+    return (run.get("source") or "") == "dagster"
 
 
 def _is_counted_agent(run: dict) -> bool:
@@ -3488,6 +3521,7 @@ def _agent_counts(runs: list, parents: dict, now: float, since, until, live_open
     seen = set()
     live_n = 0
     prod_jobs = 0
+    prod_jobs_finished = 0
     finished_today = 0
     finished_range = 0
     by_verdict = {}
@@ -3497,6 +3531,17 @@ def _agent_counts(runs: list, parents: dict, now: float, since, until, live_open
         if run.get("source") == "dagster" and run.get("status") in ("running", "queued"):
             if live_open is None or run["run_id"] in live_open:
                 prod_jobs += 1
+        # Dagster terminal rows carry status "finished" (verdict SUCCESS /
+        # FAILURE / CANCELED), outside the agent FINISHED tuple, so the
+        # finished-jobs count uses its own predicate: any closed job row
+        # with an end time inside the window.
+        if (
+            run.get("source") == "dagster"
+            and run.get("status") != "running"
+            and run.get("ended_at") is not None
+            and range_since <= float(run["ended_at"]) <= range_until
+        ):
+            prod_jobs_finished += 1
         if not _is_counted_agent(run):
             continue
         if run.get("status") == "running":
@@ -3526,6 +3571,7 @@ def _agent_counts(runs: list, parents: dict, now: float, since, until, live_open
         "live_by_tool": live_by,
         "live_by_model": live_by_model,
         "prod_jobs": prod_jobs,
+        "prod_jobs_finished": prod_jobs_finished,
         "finished_today": finished_today,
         "finished_in_range": finished_range,
         "finished_by_verdict": by_verdict,

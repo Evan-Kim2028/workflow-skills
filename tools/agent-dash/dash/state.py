@@ -100,6 +100,8 @@ def build_state(store, registry, cfg=None, now: float | None = None, processes=N
     problems = _doctor_problems(store, now)
 
     by_source = dict(view.get("running_by_source") or {})
+    prod_jobs = int(view.get("prod_jobs") or 0)
+    prod_jobs_finished = int(view.get("prod_jobs_finished") or 0)
     return {
         "schema": SCHEMA_VERSION,
         "version": {"tool": tool_version(), "schema": SCHEMA_VERSION},
@@ -115,8 +117,8 @@ def build_state(store, registry, cfg=None, now: float | None = None, processes=N
             "cost_usd_all_time": unassigned["cost_usd_all_time"],
             "last_activity": unassigned["last_activity"],
         },
-        "running": {"count": sum(by_source.values()), "by_source": by_source},
-        "totals": totals,
+        "running": {"count": sum(by_source.values()), "by_source": by_source, "prod_jobs": prod_jobs, "prod_jobs_finished": prod_jobs_finished},
+        "totals": {**totals, "prod_jobs": prod_jobs, "prod_jobs_finished": prod_jobs_finished},
         "totals_all_time": roll["all_time"]["all"],
         "reconcile": {"ok": not mismatches, "mismatches": mismatches},
         "problems": problems,

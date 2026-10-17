@@ -189,20 +189,19 @@ class DagsterTests(unittest.TestCase):
 
         snap = self.store.snapshot(NOW, "WS1")
         running = [row["label"] for row in snap["running"]]
-        self.assertIn("ws1-109-tcgjp-2026-10-16:2026-10-16", running)
-        self.assertNotIn("catalog_load_job", running)
+        self.assertEqual(running, [])
         self.assertEqual(snap["counts"]["live_agents"], 0)
         self.assertEqual(snap["counts"]["prod_jobs"], 1)
+        self.assertEqual(snap["counts"]["prod_jobs_finished"], 1)
         self.assertEqual(snap["counts"]["live_by_tool"], {"grok": 0, "muse": 0, "glm": 0, "claude": 0})
         self.assertEqual(snap["totals"]["tokens"], {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0, "reasoning": 0})
         self.assertEqual(snap["totals"]["cost_usd"], 0.0)
         self.assertEqual(self.store._conn.execute("SELECT COUNT(*) FROM usage_events").fetchone()[0], 0)
-        shown = snap["running"][0]
-        self.assertAlmostEqual(shown["elapsed_s"], 100, delta=0.01)
-        recent = {row["verdict"] for row in snap["recent"]}
-        self.assertIn("SUCCESS", recent)
+        recent = [row["label"] for row in snap["recent"]]
+        self.assertEqual(recent, [])
         all_snap = self.store.snapshot(NOW, "all")
         self.assertEqual(all_snap["counts"]["prod_jobs"], 3)
+        self.assertEqual(all_snap["counts"]["prod_jobs_finished"], 3)
 
     def test_allowlisted_tags_only(self):
         tags = [

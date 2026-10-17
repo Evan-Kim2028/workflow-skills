@@ -69,7 +69,12 @@ class StateShapeTest(unittest.TestCase):
         self.assertIn("problems", payload)
         self.assertEqual(payload["reconcile"], {"ok": True, "mismatches": []})
         self.assertEqual(payload["problems"], [])
-        self.assertEqual(payload["running"], {"count": 0, "by_source": {}})
+        self.assertEqual(payload["running"]["count"], 0)
+        self.assertEqual(payload["running"]["by_source"], {})
+        self.assertEqual(payload["running"]["prod_jobs"], 0)
+        self.assertEqual(payload["running"]["prod_jobs_finished"], 0)
+        self.assertEqual(payload["totals"]["prod_jobs"], 0)
+        self.assertEqual(payload["totals"]["prod_jobs_finished"], 0)
 
     def test_workstream_rows_carry_progress_and_window_numbers(self):
         now = time.time()

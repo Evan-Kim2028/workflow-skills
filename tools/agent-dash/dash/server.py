@@ -325,7 +325,10 @@ class Handler(BaseHTTPRequestHandler):
         until = _float(query, "until")
         limit = _limit(query)
         ws = _ws(query, default=None)
-        self._json(200, {"runs": self.server.store.query_runs(now, ws, since, until, limit)})
+        include = _one(query, "include")
+        if include is not None and include != "jobs":
+            raise ValueError("bad include")
+        self._json(200, {"runs": self.server.store.query_runs(now, ws, since, until, limit, include_jobs=include == "jobs")})
 
     def _usage(self, query):
         group = _choice(query, "group", "model", {"model", "workstream", "tool"})

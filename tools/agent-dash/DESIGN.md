@@ -52,5 +52,6 @@ The dashboard is read by a visual thinker. Every view answers its question with 
 
 - Read-only on every source. Never shows prompt bodies, argv, secrets or env values. Labels only.
 - Refresh: SSE `tick` every 2 s triggers a snapshot refetch; everything else refetches every 30 s.
+- Production jobs (source `dagster`) are never in agent lists; they are a count: the live tile shows `N prod jobs` / `N prod jobs ran`.
 - `?fixtures` loads `../fixtures/*.json` for offline design work.
 - No health or warning cards on the page; doctor is CLI and API only. Read the problem list with `agent_dash.py doctor` or `GET /api/doctor`.

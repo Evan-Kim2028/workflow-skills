@@ -133,6 +133,56 @@ class ServerTest(unittest.TestCase):
         runs = json.loads(body)["runs"]
         self.assertEqual(runs[0]["run_id"], "muse:s:ws7-landing")
 
+    def test_agent_areas_hold_no_prod_jobs(self):
+        """Production jobs are a count, never a list: the snapshot running
+        and recent lists and /api/runs (default) hold no dagster row, while
+        counts.prod_jobs_finished names the finished jobs and
+        ?include=jobs brings their rows back for tools that need them."""
+        now = time.time()
+        self.store.upsert_run(
+            {
+                "run_id": "muse:s:ws7-x",
+                "source": "muse",
+                "tier": "muse",
+                "label": "ws7-x",
+                "status": "done",
+                "started_at": now - 200,
+                "ended_at": now - 100,
+            }
+        )
+        self.store.upsert_run(
+            {
+                "run_id": "dagster:job:backfill",
+                "source": "dagster",
+                "model": "backfill",
+                "label": "ws7-backfill",
+                "status": "finished",
+                "started_at": now - 200,
+                "ended_at": now - 100,
+                "clock_source": "dagster",
+            }
+        )
+        status, _, body = get(self.port, "/api/snapshot?ws=WS7")
+        self.assertEqual(status, 200)
+        payload = json.loads(body)
+        for row in payload["running"] + payload["recent"]:
+            self.assertNotEqual(row["source"], "dagster", row["run_id"])
+        self.assertEqual(payload["counts"]["finished_in_range"], 1)
+        self.assertEqual(payload["recent_total"], 1)
+        self.assertEqual(payload["counts"]["prod_jobs_finished"], 1)
+        status, _, body = get(self.port, "/api/runs?ws=WS7&limit=50")
+        self.assertEqual(status, 200)
+        runs = json.loads(body)["runs"]
+        self.assertEqual([row["run_id"] for row in runs], ["muse:s:ws7-x"])
+        status, _, body = get(self.port, "/api/runs?ws=WS7&limit=50&include=jobs")
+        self.assertEqual(status, 200)
+        with_jobs = json.loads(body)["runs"]
+        self.assertEqual(
+            {row["run_id"] for row in with_jobs}, {"muse:s:ws7-x", "dagster:job:backfill"}
+        )
+        status, _, _ = get(self.port, "/api/runs?include=nope")
+        self.assertEqual(status, 400)
+
     def test_snapshot_carries_truncation_and_freshness(self):
         status, _, body = get(self.port, "/api/snapshot?ws=all")
         self.assertEqual(status, 200)

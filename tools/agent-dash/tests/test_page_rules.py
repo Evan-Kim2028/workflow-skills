@@ -497,6 +497,31 @@ class PageRules(unittest.TestCase):
         self.assertIn("request failed", bodies["tiles"], "tiles() reads zero on a failed scope")
         self.assertIn("snapError", bodies["drawMain"], "drawMain never consults the failure flag")
 
+    def test_agent_areas_never_branch_on_prod_jobs(self):
+        """Agent areas draw server-provided agent rows: no execution-view
+        code branches on source "dagster". The one compact job number lives
+        in the tiles ("N prod jobs", "N prod jobs ran"), and the replay
+        guard (rp* functions, owned by another worker) is exempt."""
+        script = inline_scripts()
+        lines = script.splitlines()
+        bad = []
+        for number, line in enumerate(lines, 1):
+            if '"dagster"' not in line and "'dagster'" not in line:
+                continue
+            owner = None
+            for back in range(number, max(0, number - 400), -1):
+                match = re.search(r"function (\w+)\s*\(", lines[back - 1])
+                if match:
+                    owner = match.group(1)
+                    break
+            if owner == "tiles" or (owner or "").startswith("rp"):
+                continue
+            bad.append(f"line {number} in {owner}: {line.strip()[:100]}")
+        self.assertEqual(bad, [], "execution view still branches on prod-job source")
+        bodies = dict(functions(script))
+        self.assertIn("prod jobs", bodies["tiles"], "live tile lost the prod-jobs number")
+        self.assertIn("prod jobs ran", bodies["tiles"], "live tile lost the finished-jobs number")
+
     def test_page_has_no_doctor_ui(self):
         """The dashboard page shows no doctor output: no health pill, Health
         card, problem badge or plan-attention line. Doctor output is for the

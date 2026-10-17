@@ -763,6 +763,7 @@ body.clip #main{zoom:.92}
     ADM.sortKeys(Object.keys(lbm).filter(function (k) { return lbm[k]; })).forEach(function (k) { var f = ADM.famOf(k); (byFam[f] = byFam[f] || []).push(k); });
     var liveSub = ADM.FAMS.filter(function (f) { return byFam[f]; }).map(function (f) { var ks = byFam[f], n = ks.reduce(function (a, k) { return a + lbm[k]; }, 0); return ADM.FAM[f].name + " " + fmtN(n) + " (" + ks.map(function (k) { return ADM.nameOf(k) + " " + fmtN(lbm[k]); }).join(", ") + ")"; }).join(" \u00B7 ") || "idle";
     if (cn.prod_jobs) { var jobTxt = fmtN(cn.prod_jobs) + " prod jobs"; liveSub = liveSub === "idle" ? jobTxt : liveSub + " \u00B7 " + jobTxt; }
+    if (cn.prod_jobs_finished) { var finTxt = fmtN(cn.prod_jobs_finished) + " prod jobs ran"; liveSub = liveSub === "idle" ? finTxt : liveSub + " \u00B7 " + finTxt; }
     var bad = (fv.BLOCKED || 0) + (fv.REQUEST_CHANGES || 0), part = (fv.PARTIAL || 0) + (fv.APPROVE_WITH_CHANGES || 0);
     [["Agents live now", fmtN(cn.live_agents != null ? cn.live_agents : run.filter(isAgent).length), liveSub, null],
      ["Agents finished (24 h)", fmtN(cn.finished_in_range || 0), "\u2713 " + fmtN((fv.PASS || 0) + (fv.APPROVE || 0) + (fv.APPROVE_WITH_NITS || 0)) + " pass \u00B7 \u25D0 " + fmtN(part) + " partial \u00B7 \u2715 " + fmtN(bad) + " blocked (24 h)", null],
@@ -931,8 +932,9 @@ body.clip #main{zoom:.92}
   /* timeline: one activity strip per workstream, expandable into packed lanes */
   var expanded = {};
   /* A run with no end time is drawn to now only while it is running; an ended run whose end was never seen gets a one-minute stub. */
-  /* Lead sessions, shell rows, and Dagster jobs show as bars but are not counted as agents. */
-  function isAgent(r) { return r.source !== "claude-main" && r.source !== "shell" && r.source !== "dagster" && !r.lane_shadow; }
+  /* Lead sessions and shell rows are drawn but not counted as agents. The server
+     never sends production (dagster) jobs in these lists; the page has no dagster branch. */
+  function isAgent(r) { return r.source !== "claude-main" && r.source !== "shell" && !r.lane_shadow; }
   function runEnd(r, now) { return r.ended_at || (r.status === "running" ? now : (r.started_at || now) + 60); }
   function packRows(runs, gapS) {
     var rows = [];
@@ -1149,11 +1151,10 @@ body.clip #main{zoom:.92}
   /* plan DAG for a workstream */
   function planCard(plan, snap) {
     var live = {}, just = {}, unassigned = [], now = Date.now() / 1000;
-    ((snap && snap.running) || []).forEach(function (r) { if (r.workstream && r.workstream !== plan.ws) return; if (r.source === "dagster") { if (r.workstream === plan.ws) unassigned.push(r); return; } var t = taskOf(r, plan.ws); if (t) (live[t] = live[t] || []).push(r); else if (r.workstream === plan.ws) unassigned.push(r); });
-    ((snap && snap.recent) || []).forEach(function (r) { if (r.source === "dagster") return; if (r.ended_at && now - r.ended_at < 900) { var t = taskOf(r, plan.ws); if (t) just[t] = r; } });
+    ((snap && snap.running) || []).forEach(function (r) { if (r.workstream && r.workstream !== plan.ws) return; var t = taskOf(r, plan.ws); if (t) (live[t] = live[t] || []).push(r); else if (r.workstream === plan.ws) unassigned.push(r); });
+    ((snap && snap.recent) || []).forEach(function (r) { if (r.ended_at && now - r.ended_at < 900) { var t = taskOf(r, plan.ws); if (t) just[t] = r; } });
     var att = {}, seenRun = {};
     (state.runs || []).concat((snap && snap.running) || [], (snap && snap.recent) || []).forEach(function (r) {
-      if (r.source === "dagster") return;
       var id = r.run_id || r.label; if (!id || seenRun[id]) return; seenRun[id] = 1;
       if (r.workstream && r.workstream !== plan.ws) return; var t = taskOf(r, plan.ws); if (!t) return;
       var a = att[t] = att[t] || {runs: 0, reviews: 0, sentBack: 0}; a.runs++;
