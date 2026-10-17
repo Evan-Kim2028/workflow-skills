@@ -237,3 +237,7 @@ Who writes what (one writer per file): the lead owns the bundle (`plan.json` via
 | Page blank | Dashboard down, or fixture URL on the live port | `status`; open `http://127.0.0.1:8765/`; fixtures need the `http.server` preview URL |
 
 Plan `% done` comes from the server (`progress` on `/api/plan` and `/api/bundle`); the page never computes it. Hub issue counts are issue counts, never progress.
+
+## 8. Working on the dashboard itself
+
+Picking up dashboard work (not just feeding it runs)? Read [roadmap.md](roadmap.md) first: what landed with proof, and the open worker-sized tasks in value order. The visual future is the [proposed v2 design spec](design-v2.md) (owner approval pending) with its [tokens](design-v2-tokens.css). Ownership of every file is the table in [CONTRACT.md](../CONTRACT.md).

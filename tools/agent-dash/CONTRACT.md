@@ -27,6 +27,7 @@ The one argv value ever kept is the worker's `--model` flag value, recorded on p
 | `static/index.html` (all UI, vanilla JS, inline SVG/canvas charts) | Claude (parent) |
 | `fixtures/*.json` (seeded synthetic API responses from `fixtures/make_fixtures.py`) | fixture |
 | `tests/test_*.py` (unittest, stdlib) | each owner for its files |
+| `docs/roadmap.md` (open work plan) + `docs/design-v2.md` + `docs/design-v2-tokens.css` (proposed v2 spec) | core (docs only; spec builds only on owner approval) |
 
 ## Source interface
 

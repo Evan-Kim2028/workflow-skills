@@ -7,7 +7,7 @@ description: Run, change, and grow the local agent execution dashboard (agent-da
 
 One local shell, two views. Execution shows what every agent is doing, per workstream, with charts and a live plan progress map. Plan shows each workstream's strategy and decisions. The header and tabs render once. Plan | Execution swaps the main view in place.
 
-New here? Read [Plug in any agent](../../tools/agent-dash/docs/integrate.md) first. Contract: `tools/agent-dash/CONTRACT.md`. Look: `tools/agent-dash/DESIGN.md`. Read both before changing anything.
+New here? Read [Plug in any agent](../../tools/agent-dash/docs/integrate.md) first. Contract: `tools/agent-dash/CONTRACT.md`. Look: `tools/agent-dash/DESIGN.md`. Read both before changing anything. Changing the dashboard itself? Read `tools/agent-dash/docs/roadmap.md` first and pick up a task from there.
 
 - Code: `tools/agent-dash/` in this repo (`~/.claude/tools/agent-dash` after `./install.sh`).
 - State: `~/.local/share/agent-dash/` (`dash.sqlite`, pidfile, log, `generic.jsonl`). Override with `AGENT_DASH_STATE_DIR`.
