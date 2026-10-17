@@ -17,7 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import agent_dash
 from agent_dash import default_cfg, is_dash, load_cfg, main, reconcile_if_due, run_backfill
 from dash.plans import PlanNotFound, load as load_plan, mapping as plan_mapping
-from dash.server import DashServer, PLACEHOLDER
+from dash.server import DashServer, PLACEHOLDER, ROOT
 from dash.sources import Registry
 from dash.store import Store
 
@@ -91,6 +91,17 @@ class ServerTest(unittest.TestCase):
             response.read()
         finally:
             conn.close()
+
+    def test_problem_docs_serve_text_and_refuse_traversal(self):
+        status, content_type, body = get(self.port, "/docs/problems/dep-cycle.md")
+        self.assertEqual(status, 200)
+        self.assertEqual(content_type, "text/plain; charset=utf-8")
+        self.assertEqual(body, (ROOT / "docs" / "problems" / "dep-cycle.md").read_bytes())
+        for path in ("/docs/problems/../CONTRACT.md", "/docs/problems/nope.md"):
+            status, content_type, body = get(self.port, path)
+            self.assertEqual(status, 404, path)
+            self.assertIn("application/json", content_type)
+            self.assertEqual(json.loads(body)["error"], "not found")
 
     def test_placeholder_when_index_missing(self):
         stop(self.server, self.thread)

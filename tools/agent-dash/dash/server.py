@@ -21,6 +21,7 @@ ROOT = Path(__file__).resolve().parents[1]
 INDEX_PATH = ROOT / "static" / "index.html"
 PLACEHOLDER = b"agent-dash\n"
 _WS = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
+_PROBLEM_DOC = re.compile(r"^[a-z0-9][a-z0-9-]*\.md$")
 
 
 #: /api/plan orchestration fields keyed by workstream: (plan mtime, payload).
@@ -151,6 +152,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._state()
             elif path.startswith("/static/"):
                 self._static(path[len("/static/"):])
+            elif path.startswith("/docs/problems/"):
+                self._problem_doc(path[len("/docs/problems/"):])
             else:
                 self._json(404, api_error("not found", "not_found", "Try GET /api/state for the whole dashboard state."))
         except ValueError as exc:
@@ -235,6 +238,23 @@ class Handler(BaseHTTPRequestHandler):
         try:
             self.send_response(200)
             self.send_header("Content-Type", types[target.suffix])
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            self.server.note_disconnect()
+
+    def _problem_doc(self, name):
+        """Serve one runbook from docs/problems/ as text. Only bare ``<slug>.md`` names; anything else is a 404."""
+        target = ROOT / "docs" / "problems" / name
+        if not _PROBLEM_DOC.fullmatch(name) or not target.is_file():
+            self._json(404, api_error("not found", "not_found", "Try GET /api/state for the whole dashboard state."))
+            return
+        body = target.read_bytes()
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
             self.end_headers()
