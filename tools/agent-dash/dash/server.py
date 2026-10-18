@@ -196,6 +196,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._decisions()
             elif path == "/api/risks":
                 self._risks()
+            elif path == "/api/project/feed":
+                self._feed(query)
             elif path.startswith("/bundle/"):
                 self._bundle_page(path)
             elif path == "/api/health":
@@ -536,14 +538,37 @@ class Handler(BaseHTTPRequestHandler):
     def _decisions(self):
         """``GET /api/decisions``: hub decisions, newest first, read-only."""
         from dash.decisions import decisions_payload, resolve_hub_dir
-
         self._json(200, decisions_payload(resolve_hub_dir(self.server.cfg)))
-
     def _risks(self):
         """``GET /api/risks``: computed risks first, then hub file rows."""
         from dash.decisions import risks_payload
-
         self._json(200, risks_payload(self.server.store, self.server.cfg, time.time()))
+    def _feed(self, query):
+        """``GET /api/project/feed``: newest-first what-changed events.
+        Query ``limit`` caps the returned lines (default 50, max 200); a
+        bad value is a 400. The body is names and numbers only (workstream
+        names and ids, task ids, counts, stamps) built by
+        ``dash.projectfeed`` from bundle history files, approvals records,
+        and finished agent runs. Lines without a recorded time are
+        omitted, never interpolated; ``earliest_ts`` is the oldest
+        consumed stamp (null when nothing was recorded).
+        """
+        from dash import projectfeed
+        raw = _one(query, "limit")
+        if raw is None:
+            limit = projectfeed.DEFAULT_LIMIT
+        else:
+            try:
+                limit = int(raw)
+            except ValueError as exc:
+                raise ValueError("bad limit") from exc
+            if limit < 1:
+                raise ValueError("bad limit")
+            limit = min(limit, projectfeed.MAX_LIMIT)
+        self._json(
+            200,
+            projectfeed.collect_feed(None, self.server.store, time.time(), limit),
+        )
 
     def _bundles(self):
         self._json(200, {"bundles": list_bundles()})

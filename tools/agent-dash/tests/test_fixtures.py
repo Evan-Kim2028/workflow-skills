@@ -51,6 +51,8 @@ FILES = (
     "archive.json",
     "reconcile.json",
     "project.json",
+    "decisions.json",
+    "project/feed.json",
     "plan-WS1.json",
     "plan-WS2.json",
     "plan-WS7.json",
@@ -397,6 +399,35 @@ class FixtureShapeTests(unittest.TestCase):
             self.assertIn(layout["density"], ("comfortable", "compact"), name)
             self.assertIn(layout["arrows"]["mode"], ("all", "on-focus"), name)
             self.assertTrue(layout["phases_line"], name)
+
+    def test_decisions_fixture(self):
+        doc = self.docs["decisions.json"]
+        self.assertTrue(doc["source"]["present"])
+        rows = doc["decisions"]
+        self.assertTrue(rows)
+        for row in rows:
+            for key in ("id", "title", "status", "owner", "date", "workstream", "area"):
+                self.assertIn(key, row, row.get("id"))
+        counts = {}
+        for row in rows:
+            counts[row["status"]] = counts.get(row["status"], 0) + 1
+        self.assertEqual(doc["counts"], counts)
+        dated = [row["date"] for row in rows if row["date"]]
+        self.assertEqual(dated, sorted(dated, reverse=True))
+
+    def test_feed_fixture(self):
+        doc = self.docs["project/feed.json"]
+        items = doc["feed"]
+        self.assertTrue(items)
+        self.assertEqual(doc["total"], len(items))
+        self.assertLessEqual(len(items), doc["limit"])
+        stamps = [item["ts"] for item in items]
+        self.assertEqual(stamps, sorted(stamps, reverse=True))
+        self.assertEqual(doc["earliest_ts"], min(stamps))
+        for item in items:
+            for key in ("ts", "day", "ws", "name", "kind", "text", "target"):
+                self.assertIn(key, item, key)
+            self.assertNotIn(item["kind"], ("doctor", "health"))
 
     def test_replay_fixtures(self):
         for ws in ("WS1", "WS2", "WS7"):

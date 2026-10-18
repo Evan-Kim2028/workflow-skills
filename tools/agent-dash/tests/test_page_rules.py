@@ -1249,5 +1249,134 @@ setTimeout(function () {
         self.assertEqual(proc.returncode, 0, proc.stderr or proc.stdout)
 
 
+    def test_feed_and_decisions_have_no_doctor_words(self):
+        """Neither new card names doctor output: no health/doctor words in
+        either file or stylesheet, no motion in the stylesheets, and no
+        raw fetch or non-GET method (both cards load through api())."""
+        for name in ("feed.js", "feed.css", "decisions.js", "decisions.css"):
+            text = (STATIC / "cards" / name).read_text()
+            for word in ("doctor", "health"):
+                self.assertNotIn(word, text.lower(), f"{name} carries a {word!r} word")
+        for name in ("feed.css", "decisions.css"):
+            text = (STATIC / "cards" / name).read_text()
+            for prop in ("animation", "transition"):
+                self.assertNotIn(prop, text, f"{name} animates; reduced motion stays still")
+        for name in ("feed.js", "decisions.js"):
+            text = (STATIC / "cards" / name).read_text()
+            self.assertNotIn("fetch(", text, f"{name} fetches; project cards read api()/state only")
+            self.assertNotIn("XMLHttpRequest", text, f"{name} fetches; project cards read api()/state only")
+            hits = re.findall(r"method\s*:\s*[\"'](POST|PUT|DELETE|PATCH)[\"']", text, re.I)
+            self.assertEqual(hits, [], f"{name} writes with a non-GET method: {hits[:2]}")
+        reg = (STATIC / "cards" / "registry.js").read_text()
+        self.assertIn('scope: "project"', reg, "no project registry scope")
+        self.assertIn('"feed"', reg, "feed.js is not registered")
+        self.assertIn('"decisions"', reg, "decisions.js is not registered")
+        self.assertIn("exec-feed", reg, "feed entry names no home slot")
+        page = (STATIC / "index.html").read_text()
+        for tag in (
+            '<script src="/static/cards/feed.js">',
+            '<script src="/static/cards/decisions.js">',
+            '<link rel="stylesheet" href="/static/cards/feed.css">',
+            '<link rel="stylesheet" href="/static/cards/decisions.css">',
+        ):
+            self.assertIn(tag, page, f"index.html lost {tag}")
+
+    def test_feed_and_decisions_cards_on_fixtures(self):
+        """The feed groups fixture lines by day with chips and an honest
+        gap footer; the decisions card pills, filters, and link rules hold;
+        and the decisions spec hides when its source is absent."""
+        import json as _json
+
+        fx = Path(__file__).resolve().parent.parent / "fixtures"
+        feed = _json.loads((fx / "project" / "feed.json").read_text())
+        decisions = _json.loads((fx / "decisions.json").read_text())
+        harness = (
+            "const fs=require('fs');"
+            "globalThis.window=globalThis;"
+            "globalThis.location={search:'',pathname:'/'};"
+            "function fakeNode(tag){"
+            " var n={tag:tag,attrs:{},kids:[],textContent:'',_on:{},"
+            "  setAttribute:function(k,v){this.attrs[k]=v;},"
+            "  appendChild:function(c){this.kids.push(c);return c;},"
+            "  addEventListener:function(t,f){this._on[t]=f;}};"
+            " return n;}"
+            "globalThis.document={createElement:fakeNode,getElementById:function(){return null;}};"
+            "eval(fs.readFileSync(process.argv[1],'utf8'));"
+            "eval(fs.readFileSync(process.argv[2],'utf8'));"
+            "eval(fs.readFileSync(process.argv[3],'utf8'));"
+            "eval(fs.readFileSync(process.argv[4],'utf8'));"
+            "const assert=require('assert');"
+            "var opened=[];"
+            "globalThis.openPlan=function(ws){opened.push(ws);};"
+            "var draws=0;"
+            "globalThis.drawMain=function(){draws++;};"
+            "globalThis.secCache={};"
+            "globalThis.keyOf=function(v){return JSON.stringify(v);};"
+            "globalThis.api=function(){return {then:function(){return {catch:function(){}};}}};"
+            "var state={view:'project',ws:'all',seq:7,feed:null,feedError:null,feedSeq:-1,"
+            " decisions:null,wss:[{ws:'WS9',name:'Relay'}],wssAll:[{ws:'WS9',name:'Relay'},{ws:'WS7',name:'Launch'}]};"
+            "function byClass(node,token,out){out=out||[];"
+            " (node.kids||[]).forEach(function(k){"
+            "  if(k&&k.attrs&&(' '+k.attrs.class+' ').indexOf(' '+token+' ')>=0)out.push(k);"
+            "  byClass(k,token,out);});return out;}"
+            "function texts(nodes){return nodes.map(function(n){return n.textContent;});}"
+            "assert.strictEqual(dayLabel('2026-10-17'),'Oct 17');"
+            "assert.strictEqual(dayLabel('nope'),'nope');"
+            "assert.strictEqual(decisionPill('approved').text,'\\u2713 Approved');"
+            "assert.strictEqual(decisionPill('denied').text,'\\u2717 Denied');"
+            "assert.strictEqual(decisionPill('pending').text,'\\u25CB Pending');"
+            "assert.ok(decisionPill('mystery').text.indexOf('mystery')>=0);"
+            "var DEC=" + _json.dumps(decisions) + ";"
+            "var sorted=sortDecisions(DEC.decisions);"
+            "assert.strictEqual(sorted[0].id,'start-relay');"
+            "assert.strictEqual(sorted[sorted.length-1].id,'retire-dup-client');"
+            "assert.strictEqual(decisionsSpec(state,{}),null);"
+            "state.decisions={decisions:[],counts:{},source:{present:false}};"
+            "assert.strictEqual(decisionsSpec(state,{}),null);"
+            "state.decisions={decisions:[],counts:{},source:{present:true}};"
+            "assert.strictEqual(decisionsSpec(state,{}),null);"
+            "var fspec=feedSpec(state,{});"
+            "assert.ok(Array.isArray(fspec)&&typeof fspec[2]==='function');"
+            "state.feed=" + _json.dumps(feed) + ";state.feedSeq=7;"
+            "var card=feedCard();"
+            "assert.strictEqual(byClass(card,'fd-day').length,2);"
+            "assert.strictEqual(byClass(card,'fd-line').length,7);"
+            "var chips=byClass(card,'fd-ws');"
+            "assert.ok(chips.length>0);"
+            "assert.ok(chips.every(function(c){return c.tag==='button';}));"
+            "chips[0]._on.click();"
+            "assert.strictEqual(opened[0],chips[0].textContent);"
+            "assert.ok(card.kids.some(function(k){return (k.textContent||'').indexOf('No history before')>=0;}),'gap footer missing');"
+            "state.decisions=" + _json.dumps(decisions) + ";"
+            "var dspec=decisionsSpec(state,{});"
+            "assert.ok(Array.isArray(dspec)&&typeof dspec[2]==='function');"
+            "var dcard=decisionsCard();"
+            "assert.strictEqual(byClass(dcard,'dc-row').length,4);"
+            "var pills=texts(byClass(dcard,'dc-pill'));"
+            "assert.ok(pills.some(function(t){return t.indexOf('\\u2713')===0;}),'approved pill missing glyph');"
+            "assert.ok(pills.some(function(t){return t.indexOf('\\u2717')===0;}),'denied pill missing glyph');"
+            "assert.ok(pills.some(function(t){return t.indexOf('\\u25CB')===0;}),'pending pill missing glyph');"
+            "assert.strictEqual(byClass(dcard,'dc-filter').length,4);"
+            "var links=byClass(dcard,'dc-link');"
+            "assert.strictEqual(links.length,1);"
+            "assert.strictEqual(links[0].tag,'a');"
+            "assert.strictEqual(byClass(dcard,'dc-linktext').length,1);"
+            "assert.strictEqual(byClass(dcard,'dc-more').length,0);"
+            "var many=[];for(var i=0;i<13;i++)many.push({id:'d'+i,title:'Row '+i,status:'approved',owner:'o',date:'2026-04-02',workstream:'WS9',area:'a'});"
+            "state.decisions={decisions:many,counts:{approved:13},source:{present:true}};"
+            "var big=decisionsCard();"
+            "assert.strictEqual(byClass(big,'dc-row').length,12);"
+            "assert.strictEqual(byClass(big,'dc-more').length,1);"
+        )
+        proc = subprocess.run(
+            ["node", "-e", harness,
+             str(STATIC / "format.js"), str(STATIC / "core" / "el.js"),
+             str(STATIC / "cards" / "feed.js"), str(STATIC / "cards" / "decisions.js")],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr or proc.stdout)
+
+
 if __name__ == "__main__":
     unittest.main()

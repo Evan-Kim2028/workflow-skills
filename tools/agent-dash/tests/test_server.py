@@ -1769,11 +1769,9 @@ class WorkstreamStatesApiTest(unittest.TestCase):
 
 class DecisionsRisksApiTest(unittest.TestCase):
     """Decisions and risks endpoints over a synthetic hub dir, read-only.
-
     WS41 is active with a stale plan gate; WS42 is planned waiting on
     WS41; the hub holds two decisions and one filed risk.
     """
-
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.now = time.time()
@@ -1832,12 +1830,10 @@ class DecisionsRisksApiTest(unittest.TestCase):
         thread.start()
         self.server, self.thread = server, thread
         self.port = self.server.server_address[1]
-
     def tearDown(self):
         stop(self.server, self.thread)
         self.store.close()
         self.tmp.cleanup()
-
     def test_decisions_newest_first_with_counts(self):
         status, _, body = get(self.port, "/api/decisions")
         self.assertEqual(status, 200)
@@ -1846,7 +1842,6 @@ class DecisionsRisksApiTest(unittest.TestCase):
         self.assertEqual(payload["decisions"][0]["title"], "new choice")
         self.assertEqual(payload["counts"], {"proposed": 1, "accepted": 1})
         self.assertEqual(payload["source"], {"present": True})
-
     def test_risks_computed_then_filed(self):
         status, _, body = get(self.port, "/api/risks")
         self.assertEqual(status, 200)
@@ -1860,7 +1855,6 @@ class DecisionsRisksApiTest(unittest.TestCase):
                 self.assertIn(key, risk, risk.get("id"))
             if risk["source"] != "file":
                 self.assertTrue(risk["title"].startswith(risk["ws"]), risk["title"])
-
     def test_state_carries_decisions_and_risks(self):
         status, _, body = get(self.port, "/api/state")
         self.assertEqual(status, 200)
@@ -1871,6 +1865,138 @@ class DecisionsRisksApiTest(unittest.TestCase):
             sum(payload["risks"]["by_severity"].values()),
             payload["risks"]["total"],
         )
+class FeedEndpointTest(unittest.TestCase):
+    """GET /api/project/feed over synthetic bundles: history moves,
+    decided approvals, archive lines, run summaries, and limit rules."""
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.now = time.time()
+        self.wsroot = os.path.join(self.tmp.name, "ws")
+        minute = int((self.now - 600) // 60) * 60
+        histories = {
+            "WS51": [
+                {"ts": minute + 1, "task": "WS51.1", "from": "wip", "to": "done"},
+                {"ts": minute + 2, "task": "WS51.2", "from": "wip", "to": "done"},
+                {"ts": self.now - 9000},
+                {"task": "WS51.9", "to": "done"},
+                {"kind": "state", "ts": self.now - 100, "ws": "WS51",
+                 "from": "planned", "to": "active"},
+            ],
+            "WS52": [
+                {"ts": minute + 3, "task": "WS52.1", "from": "pr", "to": "done"},
+                {"kind": "state", "ts": self.now - 50, "ws": "WS52",
+                 "from": "done", "to": "archived"},
+            ],
+        }
+        for ws, rows in histories.items():
+            dest = os.path.join(self.wsroot, ws)
+            os.makedirs(dest)
+            with open(os.path.join(dest, "bundle.json"), "w") as fh:
+                json.dump(
+                    {"id": ws, "title": "Probe %s" % ws, "short": ws,
+                     "order": 51, "kind": "workstream", "state": "active"},
+                    fh,
+                )
+            with open(os.path.join(dest, "history.jsonl"), "w") as fh:
+                for row in rows:
+                    fh.write(json.dumps(row) + "\n")
+        with open(os.path.join(self.wsroot, "WS51", "approvals.json"), "w") as fh:
+            json.dump(
+                {"ws": "WS51", "decided_at": "2026-04-02T15:10:00Z",
+                 "decided_by": "owner",
+                 "items": [{"id": "go", "step": "Ship the probe",
+                            "status": "approved", "reversible": True,
+                            "conditions": "Seeded."}]},
+                fh,
+            )
+        self._env = mock.patch.dict(os.environ, {"AGENT_DASH_WORKSTREAMS": self.wsroot})
+        self._env.start()
+        self.addCleanup(self._env.stop)
+        self.store = Store(Path(self.tmp.name) / "dash.sqlite")
+        self.store.upsert_run(
+            {
+                "run_id": "muse:s:ws52-probe",
+                "source": "muse",
+                "tier": "muse",
+                "label": "ws52-WS52.1-probe",
+                "status": "done",
+                "verdict": "PASS",
+                "started_at": self.now - 400,
+                "ended_at": self.now - 300,
+            }
+        )
+        self.server, self.thread = start(self.store)
+        self.port = self.server.server_address[1]
+    def tearDown(self):
+        stop(self.server, self.thread)
+        self.store.close()
+        self.tmp.cleanup()
+    def fetch(self, path):
+        status, content_type, body = get(self.port, path)
+        return status, content_type, json.loads(body)
+    def test_feed_shape_order_and_collapse(self):
+        status, content_type, payload = self.fetch("/api/project/feed")
+        self.assertEqual(status, 200)
+        self.assertIn("application/json", content_type)
+        self.assertEqual(payload["limit"], 50)
+        kinds = [line["kind"] for line in payload["feed"]]
+        self.assertIn("tasks", kinds)
+        self.assertIn("approval", kinds)
+        self.assertIn("archive", kinds)
+        self.assertIn("run", kinds)
+        stamps = [line["ts"] for line in payload["feed"]]
+        self.assertEqual(stamps, sorted(stamps, reverse=True))
+        self.assertEqual(payload["total"], len(payload["feed"]))
+        bulk = [line for line in payload["feed"] if line["kind"] == "tasks"][0]
+        self.assertEqual(
+            bulk["text"],
+            "3 tasks moved to done across Probe WS51 (WS51) (2), Probe WS52 (WS52) (1)",
+        )
+        for line in payload["feed"]:
+            for key in ("ts", "day", "ws", "name", "kind", "text", "target"):
+                self.assertIn(key, line, key)
+            self.assertNotIn(line["kind"], ("doctor", "health"))
+            self.assertNotIn("doctor", line["text"].lower())
+            self.assertNotIn("health", line["text"].lower())
+        self.assertIsNotNone(payload["earliest_ts"])
+    def test_feed_limit_rules(self):
+        _, _, payload = self.fetch("/api/project/feed?limit=2")
+        self.assertEqual(payload["limit"], 2)
+        self.assertEqual(len(payload["feed"]), 2)
+        _, _, payload = self.fetch("/api/project/feed?limit=500")
+        self.assertEqual(payload["limit"], 200)
+        status, _, body = get(self.port, "/api/project/feed?limit=0")
+        self.assertEqual(status, 400)
+        self.assertEqual(json.loads(body)["code"], "bad_request")
+        status, _, _ = get(self.port, "/api/project/feed?limit=nope")
+        self.assertEqual(status, 400)
+    def test_feed_empty_root(self):
+        with tempfile.TemporaryDirectory() as empty:
+            with mock.patch.dict(os.environ, {"AGENT_DASH_WORKSTREAMS": empty}):
+                status, _, payload = self.fetch("/api/project/feed")
+        self.assertEqual(status, 200)
+        kinds = [line["kind"] for line in payload["feed"]]
+        self.assertNotIn("task", kinds)
+        self.assertNotIn("tasks", kinds)
+        self.assertNotIn("state", kinds)
+        self.assertNotIn("approval", kinds)
+        self.assertIn("run", kinds)
+        self.assertIn("first-run", kinds)
+    def test_feed_empty_root_and_store(self):
+        store = Store(Path(self.tmp.name) / "empty.sqlite")
+        server, thread = start(store)
+        try:
+            with tempfile.TemporaryDirectory() as empty:
+                with mock.patch.dict(os.environ, {"AGENT_DASH_WORKSTREAMS": empty}):
+                    status, _, body = get(server.server_address[1], "/api/project/feed")
+        finally:
+            stop(server, thread)
+            store.close()
+        self.assertEqual(status, 200)
+        payload = json.loads(body)
+        self.assertEqual(payload["feed"], [])
+        self.assertEqual(payload["total"], 0)
+        self.assertIsNone(payload["earliest_ts"])
 
 
 if __name__ == "__main__":

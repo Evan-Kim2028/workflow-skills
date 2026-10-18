@@ -1,0 +1,52 @@
+{
+  "decisions": [
+    {
+      "id": "start-relay",
+      "title": "Start the relay once the cleanup batch lands",
+      "status": "pending",
+      "owner": "lead",
+      "date": "2026-04-03",
+      "workstream": "WS9",
+      "area": "Schedule",
+      "link": null
+    },
+    {
+      "id": "freeze-relay-scope",
+      "title": "Freeze the relay scope",
+      "status": "approved",
+      "owner": "owner",
+      "date": "2026-04-02",
+      "workstream": "WS9",
+      "area": "Scope",
+      "link": "https://example.com/notes/relay-scope"
+    },
+    {
+      "id": "hold-launch-note",
+      "title": "Hold the launch note",
+      "status": "denied",
+      "owner": "owner",
+      "date": "2026-04-01",
+      "workstream": "WS7",
+      "area": "Launch",
+      "link": "plan:WS7"
+    },
+    {
+      "id": "retire-dup-client",
+      "title": "Retire the duplicate client",
+      "status": "approved",
+      "owner": "owner",
+      "date": null,
+      "workstream": "WS2",
+      "area": "Cleanup"
+    }
+  ],
+  "counts": {
+    "pending": 1,
+    "approved": 2,
+    "denied": 1
+  },
+  "source": {
+    "present": true
+  },
+  "_note": "Seeded synthetic data for the offline preview. Seed 1. No local sessions are read."
+}

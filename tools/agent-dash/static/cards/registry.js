@@ -63,6 +63,12 @@
        "project"), where it renders beside Recently done. */
     {id: "needs", order: 45, scope: "project", spec: function (state, snap) {
       return ["needs", keyOf([state.approvals, state.ws, state.view]), function () { return needsCard(); }, ""];
+    }},
+    {id: "feed", order: 50, scope: "project", slot: "exec-feed", spec: function (state, snap) {
+      return feedSpec(state, snap);
+    }},
+    {id: "decisions", order: 58, scope: "project", spec: function (state, snap) {
+      return decisionsSpec(state, snap);
     }}
   ];
 })(window);

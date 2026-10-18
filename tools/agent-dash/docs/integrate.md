@@ -430,6 +430,10 @@ One file plus one registry line. Put the renderer in a new IIFE file under `stat
 
 `spec` returns one `applySections` spec `[name, key, render, style]`, or null when the card does not apply. Keep the two-space `function name(` indent: `tests/test_page_rules.py` splits the logical script (core + cards in tag order + inline) on it. The `needs.js` card is the worked example for the project scope: registered once (`scope: "project"`), rendered beside Recently done. New views obey `DESIGN.md`: status as colour plus symbol plus word, numbers through the `fmt` helpers only, hover tooltips, axes on charts (the shared `axes()` helper).
 
+### Server-fed project cards (feed, decisions)
+
+A project card that needs its own endpoint keeps the endpoint beside the card: a pure builder module under `dash/` (see `dash/projectfeed.py`: plain data in, JSON out, no I/O in `build_feed`) plus a small `GET` hook in `dash/server.py` that parses params and serves it. The card file stays read-only: it loads through the shared `api()` helper (never raw `fetch`, never a non-GET method), so fixture mode (`?fixtures`) keeps working via `fixtures/<name>.json`. Because the load resolves after the first paint, the loader deletes its own `secCache` section and calls `drawMain()` once, guarded by an in-flight flag and the current `state.seq`, so a slow endpoint never flashes and never refetches per tick. A card whose source is optional (the decisions card over `GET /api/decisions`) returns null from its spec while loading and whenever the endpoint is absent or reports `source.present` as false: the section stays an empty node, never a "nothing here" placeholder. Neither card carries doctor output: no status counts, no problem words anywhere in the card or its stylesheet.
+
 ### Before you push
 
 Run the scoped gate from `tools/agent-dash`. It maps your changed files to test files (`scripts/gate_map.json`), runs each selected test file on its own (never a bare suite), checks changed scripts, and runs the repo privacy audit:

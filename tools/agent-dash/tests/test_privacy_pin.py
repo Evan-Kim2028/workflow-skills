@@ -167,6 +167,8 @@ PATHS = [
     "/api/approvals?ws=all",
     "/api/decisions",
     "/api/risks",
+    "/api/project/feed",
+    "/api/project/feed?limit=3",
     "/api/health",
     "/api/doctor",
     "/api/state",

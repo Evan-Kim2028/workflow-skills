@@ -1,0 +1,72 @@
+{
+  "feed": [
+    {
+      "ts": 1761999660,
+      "day": "2025-11-01",
+      "ws": "WS7",
+      "name": "Launch",
+      "kind": "run",
+      "text": "4 agents finished in Launch (WS7); 3 pass, 1 partial",
+      "target": "WS7"
+    },
+    {
+      "ts": 1761999600,
+      "day": "2025-11-01",
+      "ws": null,
+      "name": "",
+      "kind": "tasks",
+      "text": "3 tasks moved to done across Identity (WS1) (2), Launch (WS7) (1)",
+      "target": null
+    },
+    {
+      "ts": 1761996360,
+      "day": "2025-11-01",
+      "ws": "WS9",
+      "name": "Relay",
+      "kind": "state",
+      "text": "Relay (WS9) moved from planned to active",
+      "target": "WS9"
+    },
+    {
+      "ts": 1761996330,
+      "day": "2025-11-01",
+      "ws": "WS7",
+      "name": "Launch",
+      "kind": "approval",
+      "text": "Launch (WS7): Hold the launch note denied",
+      "target": "WS7"
+    },
+    {
+      "ts": 1761913460,
+      "day": "2025-10-31",
+      "ws": "WS1",
+      "name": "Identity",
+      "kind": "task",
+      "text": "Identity (WS1): task WS1.21 moved to pr",
+      "target": "WS1"
+    },
+    {
+      "ts": 1761913415,
+      "day": "2025-10-31",
+      "ws": "WS11",
+      "name": "Export",
+      "kind": "archive",
+      "text": "Export (WS11) was archived",
+      "target": "WS11"
+    },
+    {
+      "ts": 1761906360,
+      "day": "2025-10-31",
+      "ws": "WS1",
+      "name": "Identity",
+      "kind": "first-run",
+      "text": "first agent run in Identity (WS1)",
+      "target": "WS1"
+    }
+  ],
+  "total": 7,
+  "limit": 50,
+  "earliest_ts": 1761906360,
+  "now": 1761999960,
+  "_note": "Seeded synthetic data for the offline preview. Seed 1. No local sessions are read."
+}

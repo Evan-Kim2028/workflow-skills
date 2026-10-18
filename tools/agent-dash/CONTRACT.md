@@ -22,6 +22,7 @@ The one argv value ever kept is the worker's `--model` flag value, recorded on p
 | `dash/store/queries.py` (state, workstream, concurrency, session reads) | core |
 | `dash/workstates.py` (bundle lifecycle states, `?state=` scopes, archive cards) | core |
 | `dash/decisions.py` (hub decisions/risks parser, computed risks; read-only, cached by file mtime) | core |
+| `dash/projectfeed.py` (what-changed feed builder behind `GET /api/project/feed`; pure `build_feed` over histories, approvals, and runs) | feed |
 | `dash/store/util.py` (shared constants, pure helpers) | core |
 | `dash/buildinfo.py` (build id + process start time) | core |
 | `dash/deploy.py` (clean-release deploy, rollback, `releases/`) | core |
@@ -50,6 +51,8 @@ The one argv value ever kept is the worker's `--model` flag value, recorded on p
 | `static/cards/project-home.js` + `project-home.css` (Project home `?view=project`: phases, tiles, Current, Planned shelf, Recently done, needs-you, chart slots) | Claude (parent) |
 | `static/cards/planned.js` + `planned.css` (Planned view `?view=planned`: start-readiness table, gated-but-live, roadmap slots) | Claude (parent) |
 | `static/cards/archive.js` + `archive.css` (Archive shelf `?view=archive`: frozen summary cards, lifetime totals, read-only plan banner style) | Claude (parent) |
+| `static/cards/feed.js` + `feed.css` (What changed on the Project home, scope `project`, slot `exec-feed`: day-grouped newest-first lines from `GET /api/project/feed`) | feed |
+| `static/cards/decisions.js` + `decisions.css` (read-only decisions mirror on the Project home, scope `project`, unslotted: reads `GET /api/decisions`, hides entirely when the endpoint is absent or `source.present` is false) | feed |
 | `static/core/el.js` (DOM helpers, text/format glue, tooltip, copy button) | Claude (parent) |
 | `static/core/state.js` (page state, route read/write, tab filter/order plumbing) | Claude (parent) |
 | `static/core/api.js` (fetch and fixtures, SSE stream, refresh orchestration) | Claude (parent) |
@@ -559,6 +562,8 @@ HTTP, still GET only, 127.0.0.1:
 - `GET /api/approvals?ws=<ID|all>` returns one record, or `{approvals: [...]}` for `all`.
 - `GET /api/decisions` returns `{"decisions": [{id, title, status, owner, date, workstream, area, link, ...short extras}], "counts": {status: n}, "source": {"present": bool}}`, newest first, read from `<hub_dir>/decisions.tsv` (missing file means `[]`, `present: false`). Header-driven and tolerant: unknown columns survive as short extras; any cell over 400 chars and any local-file-path cell never reach the payload.
 - `GET /api/risks` returns `{"risks": [{id, title, severity, source, ws, since}]}`: computed risks first (stale plan gates, pending approvals past the doctor `approval_days` window, critical/warn doctor groups on `active` workstreams, `planned` workstreams blocked by an unfinished dependency; severities `warn`/`info`, every title names the workstream before any task id), then the hub `risks.tsv`/`risks.json` rows (`source: "file"`). Archived and dropped workstreams emit no computed risk.
+- `GET /api/project/feed?limit=<n>` returns `{"feed": [{ts, day, ws, name, kind, text, target}], "total": n, "limit": n, "earliest_ts": t|null}`: newest-first what-changed lines from bundle `history.jsonl` files (task moves to done/pr/prog and reopenings, state moves), decided `approvals.json` items that carry a date, archive/restore moves, first agent runs, and per-workstream-per-hour run-finish summaries. Bulk task moves inside one minute collapse into one `kind: tasks` line (`N tasks moved to done across <Name> (<WS>) (<count>), ...`). Default 50 lines, max 200; a bad limit is a 400. Lines without a recorded time are omitted, never interpolated; `earliest_ts` is the oldest consumed stamp so the page can say `no history before <date>`. Names and numbers only — no report prose, no prompts, no argv. Never carries doctor output.
+- `GET /api/decisions` returns `{decisions: [{id, title, status, owner, date, workstream, area, link}], counts: {<status>: n}, source: {present: bool}}`: the read-only decisions mirror the decisions card reads. When the endpoint is absent or `source.present` is false the card hides entirely; links render as anchors only for `http(s)` URLs, else plain text.
 - `GET /bundle/<ID>/page.html` returns that file only. The resolved path has to stay inside the bundle directory.
 
 `static/vendor/mermaid.min.js` is mermaid 11.16.1. The plan page runs it on `pre.mermaid`. No CDN.

@@ -1,0 +1,22 @@
+/* Decisions mirror styles (?view=project, own section). Token-first,
+   dark-first: status pills pair colour with a glyph plus a word, never
+   colour alone; workstream chips stay muted text. No motion. */
+.dc-filters{display:flex;gap:8px;flex-wrap:wrap;margin:2px 0 12px}
+.dc-filter{border:1px solid var(--ring);background:var(--surface);border-radius:var(--r-pill);padding:4px 12px;font-size:12.5px;font-weight:650;color:var(--ink-2)}
+.dc-filter.on{color:var(--accent-ink);background:var(--accent-fill,var(--accent));border-color:transparent}
+.dc-list{list-style:none;margin:0;padding:0}
+.dc-row{padding:10px 0;border-bottom:1px solid var(--grid)}
+.dc-row:last-child{border-bottom:0}
+.dc-top{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap}
+.dc-title{font-size:13.5px}
+.dc-pill{display:inline-flex;align-items:center;gap:6px;font-size:12px;font-weight:700;border:1px solid var(--ring);border-radius:var(--r-pill);padding:3px 11px;white-space:nowrap}
+.dc-pill.ok{color:var(--good-ink,var(--good));border-color:var(--good);background:var(--good-soft)}
+.dc-pill.no{color:var(--critical-ink,var(--critical));border-color:var(--critical);background:var(--critical-soft,var(--raised))}
+.dc-pill.wait{color:var(--warning-ink,var(--warning));border-color:var(--warning);background:var(--warning-soft)}
+.dc-pill.other{color:var(--ink-2);border-color:var(--ring-strong);background:var(--raised)}
+.dc-meta{font-size:12.5px;color:var(--muted);margin-top:4px}
+.dc-ws{display:inline-block;font:700 12px var(--mono);color:var(--ink-2);background:var(--surface-2);border-radius:var(--r-pill);padding:2px 10px;margin-top:6px}
+.dc-link{font-size:13px;overflow-wrap:anywhere}
+.dc-linktext{font-size:13px;color:var(--ink-2);overflow-wrap:anywhere}
+.dc-acts{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}
+.dc-more{font-weight:650}

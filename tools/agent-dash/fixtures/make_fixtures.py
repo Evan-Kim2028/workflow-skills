@@ -754,6 +754,67 @@ def _approvals():
     }
 
 
+def _decisions():
+    """Fixture mirror of GET /api/decisions: newest-first rows with status
+    pills, one http(s) link (renders as an anchor), one plain-text link,
+    one absent link, and one undated row that sinks to the end."""
+    rows = [
+        {"id": "start-relay", "title": "Start the relay once the cleanup batch lands",
+         "status": "pending", "owner": "lead", "date": "2026-04-03",
+         "workstream": "WS9", "area": "Schedule", "link": None},
+        {"id": "freeze-relay-scope", "title": "Freeze the relay scope",
+         "status": "approved", "owner": "owner", "date": "2026-04-02",
+         "workstream": "WS9", "area": "Scope", "link": "https://example.com/notes/relay-scope"},
+        {"id": "hold-launch-note", "title": "Hold the launch note",
+         "status": "denied", "owner": "owner", "date": "2026-04-01",
+         "workstream": "WS7", "area": "Launch", "link": "plan:WS7"},
+        {"id": "retire-dup-client", "title": "Retire the duplicate client",
+         "status": "approved", "owner": "owner", "date": None,
+         "workstream": "WS2", "area": "Cleanup"},
+    ]
+    counts = {}
+    for row in rows:
+        counts[row["status"]] = counts.get(row["status"], 0) + 1
+    return {"decisions": rows, "counts": counts, "source": {"present": True}, "_note": NOTE}
+
+
+def _feed(now):
+    """Fixture mirror of GET /api/project/feed: day-grouped newest-first
+    lines across two days, one collapsed bulk minute, one archive move,
+    one decided approval, one finish summary, and an earliest stamp for
+    the honest-gap footer."""
+    day = 86400
+    t0 = now - 300
+    t1 = now - 3600
+    t2 = now - day - 100
+    t3 = now - day - 7200
+    items = [
+        {"ts": t0, "day": "2025-11-01", "ws": "WS7", "name": "Launch", "kind": "run",
+         "text": "4 agents finished in Launch (WS7); 3 pass, 1 partial", "target": "WS7"},
+        {"ts": t0 - 60, "day": "2025-11-01", "ws": None, "name": "", "kind": "tasks",
+         "text": "3 tasks moved to done across Identity (WS1) (2), Launch (WS7) (1)", "target": None},
+        {"ts": t1, "day": "2025-11-01", "ws": "WS9", "name": "Relay", "kind": "state",
+         "text": "Relay (WS9) moved from planned to active", "target": "WS9"},
+        {"ts": t1 - 30, "day": "2025-11-01", "ws": "WS7", "name": "Launch", "kind": "approval",
+         "text": "Launch (WS7): Hold the launch note denied", "target": "WS7"},
+        {"ts": t2, "day": "2025-10-31", "ws": "WS1", "name": "Identity", "kind": "task",
+         "text": "Identity (WS1): task WS1.21 moved to pr", "target": "WS1"},
+        {"ts": t2 - 45, "day": "2025-10-31", "ws": "WS11", "name": "Export", "kind": "archive",
+         "text": "Export (WS11) was archived", "target": "WS11"},
+        {"ts": t3, "day": "2025-10-31", "ws": "WS1", "name": "Identity", "kind": "first-run",
+         "text": "first agent run in Identity (WS1)", "target": "WS1"},
+    ]
+    items.sort(key=lambda item: item["ts"], reverse=True)
+    return {
+        "feed": items,
+        "total": len(items),
+        "limit": 50,
+        "earliest_ts": min(item["ts"] for item in items),
+        "now": now,
+        "_note": NOTE,
+    }
+
+
 def _progress(groups):
     """Mirror of dash.plans.plan_progress: done of total-excluding-deferred, half-up pct."""
     counts = {key: 0 for key in ("todo", "wip", "pr", "prog", "done", "deferred")}
@@ -1004,6 +1065,8 @@ def main():
         "project.json": _project(runs, NOW, plans),
         "archive.json": _archive(NOW, plans),
         "approvals.json": _approvals(),
+        "decisions.json": _decisions(),
+        "project/feed.json": _feed(NOW),
         "reconcile.json": _reconcile(runs, NOW),
         "health.json": {
             "ok": True,
@@ -1035,7 +1098,9 @@ def main():
     for ws, plan in plans.items():
         files[f"replay-{ws}.json"] = _replay_doc(runs, ws, plan["groups"])
     for name, doc in files.items():
-        (HERE / name).write_text(json.dumps(doc, indent=2) + "\n", encoding="utf-8")
+        path = HERE / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(doc, indent=2) + "\n", encoding="utf-8")
     print(f"wrote {len(runs)} runs, peak {peak}, {len(files)} files")
 
 
