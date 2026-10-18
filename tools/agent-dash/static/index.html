@@ -356,11 +356,18 @@ html{scroll-padding-top:calc(var(--pinned-h) + 10px)}
      plan branch keeps its own nav for tabs and chrome. */
   loadTaskmap().then(function () { showCurrent(); });
   stream();
+  /* The slow refresh never stacks on a running one: when the server is
+     slow the previous burst is still in flight, and another full burst
+     only deepens its queue. The next turn retries. On project views it
+     is quiet, like the ticks: it redraws only when something
+     render-relevant changed (boot and the archive action still draw
+     unconditionally). */
   setInterval(function () {
     if (document.hidden) return;
+    if (window.AdPage && AdPage.refreshBusy && AdPage.refreshBusy()) return;
     loadTaskmap().then(function () {
       if (state.view === "exec") refreshAll();
-      else if (isProjectView()) refreshProject();
+      else if (isProjectView()) refreshProject(true);
       else { loadNav(); if (window.PlanView) PlanView.refresh(); }
     });
   }, 30000);

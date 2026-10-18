@@ -159,27 +159,28 @@ class SummarizeMixin:
         ) -> dict:
             """Serve reads from the snapshot cache between writes.
 
-            Keyed by the request params plus the store sequences: idle ticks
-            with no writes in between return the cached payload without
-            recomputing, so idle tabs cost nothing. ``now`` and ``seq`` refresh
-            on a hit; the run lists are seconds-stale at most, which the stale
-            badge covers. Misses compute one full snapshot and fill the cache.
-            ``prev_24h`` rides the same entry and the same invalidation as
-            every other number: no extra key, same staleness bound.
+            Keyed by the request params plus the data sequence: reads with
+            no data writes in between return the cached payload without
+            recomputing, so idle ticks cost nothing. ``now``, ``seq``,
+            ``data_seq`` and ``last_data_ts`` refresh on a hit; run and
+            liveness lists are as fresh as the last data write, which the
+            stale badge covers. (``seq`` alone is not a gate: polling
+            bumps it every cycle via process samples and counts while no
+            served byte changes, so gating on it would miss on every tick
+            of a live server.) Misses compute one full snapshot and fill
+            the cache. ``prev_24h`` rides the same entry and the same
+            invalidation as every other number: no extra key, same
+            staleness bound.
             The window edges quantize to a 30 s grid for the key only (the
-            compute still uses the exact edges): the page's ``since`` slides
-            every second, and without this every tick would miss on the key
-            alone. A 24 h window moving by seconds is invisible in the sums.
-            See :meth:`snapshot_key` for the shared key computation.
+            compute still uses the exact edges): the page's ``since`` moves
+            in the same grid, and without this every tick would miss on the
+            key alone. A 24 h window moving by seconds is invisible in the
+            sums. See :meth:`snapshot_key` for the shared key computation.
             """
             key = self.snapshot_key(ws, since, until, usage_group)
             with self._lock:
                 hit = self._snapshot_cache.get(key)
-                if (
-                    hit is not None
-                    and hit[0] == self._data_seq
-                    and hit[1] == self._seq
-                ):
+                if hit is not None and hit[0] == self._data_seq:
                     payload = dict(hit[2])
                     payload["now"] = now
                     payload["seq"] = self._seq

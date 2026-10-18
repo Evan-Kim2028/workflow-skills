@@ -35,15 +35,19 @@ const IDLE_MAX_RENDERS = 4;
 const POLL_MS = 250;
 
 function args(argv) {
-  const out = { url: "http://127.0.0.1:8765", chrome: null, ws: "all", project: true };
+  const out = { url: "http://127.0.0.1:8765", chrome: null, ws: ["all"], project: true };
   for (let i = 0; i < argv.length; i++) {
     const flag = argv[i];
     if (flag === "--url" && argv[i + 1]) out.url = argv[++i].replace(/\/+$/, "");
     else if (flag === "--chrome" && argv[i + 1]) out.chrome = argv[++i];
-    else if (flag === "--ws" && argv[i + 1]) out.ws = argv[++i];
-    else if (flag === "--no-project") out.project = false;
+    else if (flag === "--ws" && argv[i + 1]) {
+      out.ws = argv[++i].split(",").map((s) => s.trim()).filter(Boolean);
+      if (!out.ws.length) out.ws = ["all"];
+    } else if (flag === "--no-project") out.project = false;
     else if (flag === "-h" || flag === "--help") {
-      console.log("usage: page_settle_check.mjs [--url URL] [--chrome PATH] [--ws WS] [--no-project]");
+      console.log("usage: page_settle_check.mjs [--url URL] [--chrome PATH] [--ws WS[,WS...]] [--no-project]");
+      console.log("  --ws takes one workstream tab or a comma-separated list: pass a tab with");
+      console.log("  a plan and a done tab together to cover both render shapes in one run.");
       process.exit(0);
     } else {
       console.error(`unknown flag ${flag}`);
@@ -311,7 +315,10 @@ async function main() {
     await cdp.send("Page.enable");
     await cdp.send("Runtime.enable");
 
-    const targets = [{ url: `${opts.url}/?view=exec&ws=${encodeURIComponent(opts.ws)}`, label: `exec&ws=${opts.ws}` }];
+    const targets = opts.ws.map((ws) => ({
+      url: `${opts.url}/?view=exec&ws=${encodeURIComponent(ws)}`,
+      label: `exec&ws=${ws}`,
+    }));
     if (opts.project) targets.push({ url: `${opts.url}/?view=project`, label: "project" });
     const rows = [];
     let failures = 0;

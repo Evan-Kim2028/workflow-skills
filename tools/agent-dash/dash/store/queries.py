@@ -457,12 +457,14 @@ class QueriesMixin:
         ) -> tuple | None:
             """Identity of a workstream-rows request for caches and ETags.
 
-            Store sequences (every write bumps them), the quantized window
+            The data sequence (real writes bump it), the quantized window
             and a 60 s ``now`` quantum (liveness moves with time; anything
             finer-grained recomputes every tick), the plan set, the scope,
             a digest of the caller's metadata map, and the plan-file stamps
-            behind row progress. None when an input is unhashable: the
-            caller then recomputes without caching.
+            behind row progress. ``_seq`` stays out: polling bumps it on
+            every cycle (process samples, counts) without moving any row,
+            so tagging it would 200 every tick. None when an input is
+            unhashable: the caller then recomputes without caching.
             """
             import hashlib as _hashlib
 
@@ -488,7 +490,6 @@ class QueriesMixin:
             try:
                 return (
                     self._data_seq,
-                    self._seq,
                     None if since is None else int(float(since) // 30),
                     None if until is None else int(float(until) // 30),
                     int(float(now) // 60),

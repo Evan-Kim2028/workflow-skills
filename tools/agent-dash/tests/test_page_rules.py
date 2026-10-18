@@ -1553,6 +1553,205 @@ console.log("applySections proof ok");
             "the observer no longer skips a header that already shows the name",
         )
 
+    def _extract_braced(self, text, start_marker):
+        """Source of one `function name(...) {...}` starting at start_marker."""
+        start = text.index(start_marker)
+        brace = text.index("{", start)
+        depth = 0
+        for pos in range(brace, len(text)):
+            if text[pos] == "{":
+                depth += 1
+            elif text[pos] == "}":
+                depth -= 1
+                if depth == 0:
+                    return text[start : pos + 1]
+        raise AssertionError(f"{start_marker} body never closes")
+
+    def test_snapshot_signature_ignores_store_clocks(self):
+        """A stream tick that only moves the store clocks (seq, data_seq,
+        last_data_ts, now) renders identically: snapSig is equal, so the
+        tick skips drawMain and the render counter plateaus instead of
+        climbing on every 2 s tick. Any real change (counts, totals,
+        usage, run lists) still changes the signature and draws."""
+        api_src = (STATIC / "core" / "api.js").read_text()
+        clocks_start = api_src.index("var SNAP_CLOCKS =")
+        clocks_src = api_src[clocks_start : api_src.index("};", clocks_start) + 2]
+        for clock in ("now", "seq", "data_seq", "last_data_ts"):
+            self.assertIn(clock, clocks_src, f"snapSig no longer strips the {clock} clock")
+        run_start = api_src.index("var RUN_CLOCKS =")
+        run_src = api_src[run_start : api_src.index("};", run_start) + 2]
+        for tele in ("rss_kb", "elapsed_s", "out_bytes", "err_bytes", "out_growing"):
+            self.assertIn(tele, run_src, f"project ticks no longer strip sample telemetry {tele}")
+        sig_src = self._extract_braced(api_src, "function snapSig(j, extra)")
+        harness = (
+            "const assert = require('assert');\n"
+            + clocks_src
+            + "\n"
+            + sig_src
+            + "\n"
+            "var base = {now: 100, seq: 5, data_seq: 7, last_data_ts: 90,"
+            " counts: {finished_in_range: 3}, totals: {tokens: {input: 1, output: 2}, cost_usd: 0.5},"
+            " usage: [{input: 1, output: 2}], running: [], recent: []};\n"
+            "var clocksOnly = {now: 200, seq: 99, data_seq: 100, last_data_ts: 95,"
+            " counts: {finished_in_range: 3}, totals: {tokens: {input: 1, output: 2}, cost_usd: 0.5},"
+            " usage: [{input: 1, output: 2}], running: [], recent: []};\n"
+            "var changed = {now: 200, seq: 99, data_seq: 100, last_data_ts: 95,"
+            " counts: {finished_in_range: 4}, totals: {tokens: {input: 1, output: 2}, cost_usd: 0.5},"
+            " usage: [{input: 1, output: 2}], running: [], recent: []};\n"
+            "assert.strictEqual(snapSig(clocksOnly), snapSig(base),"
+            " 'a tick that only moved the store clocks changed the render signature: ticks redraw forever');\n"
+            "assert.notStrictEqual(snapSig(changed), snapSig(base), 'a real change lost its redraw');\n"
+            "var telemetry = {now: 200, seq: 99, data_seq: 100, last_data_ts: 95,"
+            " counts: {finished_in_range: 3}, totals: {tokens: {input: 1, output: 2}, cost_usd: 0.5},"
+            " usage: [{input: 1, output: 2}],"
+            " running: [{run_id: 'r1', status: 'running', rss_kb: 371408, elapsed_s: 61,"
+            " out_bytes: 100, err_bytes: 0, out_growing: false}], recent: []};\n"
+            "var telemetryMoved = {now: 201, seq: 100, data_seq: 100, last_data_ts: 95,"
+            " counts: {finished_in_range: 3}, totals: {tokens: {input: 1, output: 2}, cost_usd: 0.5},"
+            " usage: [{input: 1, output: 2}],"
+            " running: [{run_id: 'r1', status: 'running', rss_kb: 371999, elapsed_s: 63,"
+            " out_bytes: 140, err_bytes: 0, out_growing: true}], recent: []};\n"
+            "assert.notStrictEqual(snapSig(telemetryMoved), snapSig(telemetry),"
+            " 'the exec path lost its live run telemetry');\n"
+            "var STRIP = {rss_kb: 1, elapsed_s: 1, out_bytes: 1, err_bytes: 1, out_growing: 1};\n"
+            "assert.strictEqual(snapSig(telemetryMoved, STRIP), snapSig(telemetry, STRIP),"
+            " 'project ticks redraw on sample telemetry: the home view never idles');\n"
+            "assert.strictEqual(snapSig(null), null);\n"
+            "assert.strictEqual(snapSig(42), null);\n"
+            "console.log('snapSig proof ok');\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            harness_path = Path(tmp) / "snapsig_clocks.js"
+            harness_path.write_text(harness, encoding="utf-8")
+            proc = subprocess.run(
+                ["node", "-e", harness_path.read_text(encoding="utf-8")],
+                capture_output=True,
+                text=True,
+            )
+        self.assertEqual(proc.returncode, 0, proc.stderr or proc.stdout)
+        self.assertIn("snapSig proof ok", proc.stdout)
+
+    def test_since_is_quantized_to_the_server_grid(self):
+        """The page's window start moves on the same 30 s grid the server
+        keys (and tags) on. A per-second since makes every tick and sweep
+        URL novel, so the conditional layer never matches: no If-None-Match
+        is ever sent and every request refetches and recomputes."""
+        state_src = (STATIC / "core" / "state.js").read_text()
+        start = state_src.index("function since()")
+        since_src = state_src[start : state_src.index("\n", start)]
+        self.assertIn("WINDOW_HOURS", since_src, "since() no longer goes through the 24 h window")
+        self.assertIn("30000", since_src, "since() lost its 30 s quantum: every tick URL is novel again")
+        harness = (
+            "const assert = require('assert');\n"
+            "var WINDOW_HOURS = 24;\n" + since_src + "\n"
+            "var realNow = Date.now;\n"
+            "var t = 1792248001000;\n"
+            "Date.now = function () { return t; };\n"
+            "var a = since();\n"
+            "assert.strictEqual(a % 30, 0, 'since() is not on the 30 s grid: ' + a);\n"
+            "t += 15000;\n"
+            "var b = since();\n"
+            "assert.strictEqual(b, a, 'since() moved inside one 30 s bucket: the URL churns every tick');\n"
+            "t += 20000;\n"
+            "var c = since();\n"
+            "assert.strictEqual(c, a + 30, 'since() did not advance to the next bucket');\n"
+            "Date.now = realNow;\n"
+            "console.log('since proof ok');\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            harness_path = Path(tmp) / "since_grid.js"
+            harness_path.write_text(harness, encoding="utf-8")
+            proc = subprocess.run(
+                ["node", "-e", harness_path.read_text(encoding="utf-8")],
+                capture_output=True,
+                text=True,
+            )
+        self.assertEqual(proc.returncode, 0, proc.stderr or proc.stdout)
+        self.assertIn("since proof ok", proc.stdout)
+
+    def test_refresh_timers_do_not_stack(self):
+        """Poll timers never stack another burst on a running one: ticks
+        take one snapshot fetch at a time and yield to a full refresh,
+        warmups yield to it at every step, and the slow interval skips
+        while one is in flight. Otherwise a slow server queues a fetch
+        per tick behind the stuck burst and the stall feeds itself."""
+        script = inline_scripts()
+        bodies = dict(functions(script))
+        for name in ("refreshAll", "refreshProject"):
+            self.assertIn(name, bodies, f"{name} is gone from the page")
+            self.assertIn("refreshActive++", bodies[name], f"{name} never marks its burst in flight")
+            self.assertIn("finished", bodies[name], f"{name} never settles its in-flight mark exactly once")
+        snap = bodies["refreshSnapshot"]
+        self.assertIn("snapInflight", snap, "ticks no longer take one snapshot fetch at a time")
+        self.assertIn("refreshBusy()", snap, "a tick still piles onto a running full refresh")
+        self.assertIn("refreshBusy()", bodies["stream"], "stream ticks ignore a running refresh")
+        self.assertIn("refreshBusy()", bodies["warmTabs"], "warmups still compete with the foreground burst")
+        proj = bodies["refreshProject"]
+        self.assertIn("projSig", proj, "project ticks lost their skip-when-unchanged gate")
+        self.assertIn("quiet", proj, "tick-driven project refreshes no longer pass quiet")
+        page = (STATIC / "index.html").read_text()
+        self.assertIn("refreshBusy()", page, "the slow interval still stacks on a running refresh")
+
+    def test_conditional_identity_ignores_the_poll_clock(self):
+        """Server identity tags (and the snapshot result cache) key on the
+        data version, never the poll clock: store.seq advances on every
+        poll (process samples, counts) while no served byte changes, so
+        tagging it answers 200 to every tick and the conditional layer
+        (and the result cache) can never engage on a live server."""
+        dash = STATIC.parent / "dash"
+
+        def ident_of(path, method, marker):
+            text = path.read_text()
+            head = re.search(rf"^(\s*)def {method}\(", text, re.M)
+            self.assertIsNotNone(head, f"{method} is gone from {path.name}")
+            indent = head.group(1)
+            start = head.start()
+            try:
+                tail = text.index(f"\n{indent}def ", start + 1)
+            except ValueError:
+                tail = len(text)
+            body = text[start:tail]
+            hit = body.index(marker)
+            depth = 0
+            for pos in range(body.index("(", hit), len(body)):
+                if body[pos] == "(":
+                    depth += 1
+                elif body[pos] == ")":
+                    depth -= 1
+                    if depth == 0:
+                        return body[hit : pos + 1]
+            raise AssertionError(f"{method} ident never closes")
+
+        server_src = dash / "server.py"
+        for method in ("_snapshot", "_runs", "_concurrency"):
+            ident = ident_of(server_src, method, "ident = (").replace(
+                "store.data_seq", "STORE_DATA_SEQ"
+            )
+            self.assertNotIn(
+                "store.seq",
+                ident,
+                f"{method} tags the poll clock: every tick 200s and no 304 ever fires",
+            )
+        key_src = ident_of(
+            dash / "store" / "queries.py", "workstreams_key", "return ("
+        ).replace("self._data_seq", "SELF_DATA_SEQ")
+        self.assertNotIn(
+            "self._seq",
+            key_src,
+            "workstreams_key tags the poll clock: every tick recomputes and no 304 ever fires",
+        )
+        summarize = (dash / "store" / "summarize.py").read_text()
+        self.assertNotIn(
+            "hit[1] == self._seq",
+            summarize,
+            "snapshot_cached gates on the poll clock: the result cache never hits on a live server",
+        )
+        self.assertIn(
+            "hit[0] == self._data_seq",
+            summarize,
+            "snapshot_cached lost its data-version gate",
+        )
+
 
     def test_decisions_has_no_doctor_words(self):
         """The decisions card names no doctor output: no health/doctor
@@ -2275,6 +2474,7 @@ class FinalPolishTests(unittest.TestCase):
         api_src = (STATIC / "core" / "api.js").read_text()
         self.assertIn("state.actionsArchive = !!", api_src, "loadNav lost the actions flag")
         self.assertIn("state.actionsArchive = false", api_src)
+
 
 
 if __name__ == "__main__":

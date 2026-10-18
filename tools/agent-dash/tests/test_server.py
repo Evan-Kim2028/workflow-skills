@@ -2575,6 +2575,44 @@ class ConditionalGetTest(unittest.TestCase):
             self.assertEqual(status, 304, f"{path} should 304 when unchanged")
             self.assertEqual(empty, b"")
 
+    def test_snapshot_304_after_poll_clock_bump(self):
+        """A poll cycle that writes no data (process samples, counts bump
+        only the poll clock) must not retag the snapshot: the client's
+        If-None-Match still names the entry, so idle ticks 304. A real
+        data write still retags to 200."""
+        since = int(self.now - 12 * 3600)
+        path = f"/api/snapshot?ws=all&since={since}&usage_group=model"
+        status, heads, _ = self.fetch(path)
+        self.assertEqual(status, 200)
+        tag = heads.get("etag")
+        self.assertTrue(tag, "snapshot has no ETag")
+        seq_before = self.store.seq
+        data_before = self.store.data_seq
+        self.store.set_ws_counts([{"ws": "WS9", "name": "counted"}])
+        self.assertEqual(
+            self.store.data_seq, data_before, "the fixture bump must not move the data version"
+        )
+        self.assertGreater(self.store.seq, seq_before, "the fixture bump moved no clock at all")
+        status, _, empty = self.fetch(path, tag)
+        self.assertEqual(status, 304, "a poll-clock bump retagged the snapshot: ticks can never 304")
+        self.assertEqual(empty, b"")
+        self.store.upsert_run(
+            {
+                "run_id": "muse:cond:ws1-clock",
+                "source": "muse",
+                "tier": "muse",
+                "model": "claude-sonnet-4-5",
+                "label": "ws1-clock",
+                "session_id": "sess-cond",
+                "status": "done",
+                "started_at": self.now - 50,
+                "ended_at": self.now - 10,
+            }
+        )
+        status, heads, _ = self.fetch(path, tag)
+        self.assertEqual(status, 200, "a data write did not retag the snapshot")
+        self.assertTrue(heads.get("etag") and heads.get("etag") != tag)
+
 
 if __name__ == "__main__":
     unittest.main()

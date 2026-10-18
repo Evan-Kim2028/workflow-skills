@@ -478,7 +478,7 @@ Prove it with the settle probe (stdlib only, headless Chrome):
 ```bash
 node tools/agent-dash/scripts/page_settle_check.mjs --url http://127.0.0.1:8815
 ```
-It checks the exec overview and the project home: after a 2 s grace a 3 s sample of the render count must look quiescent (a tight loop raises it in nearly every 250 ms poll; a healthy live page only re-renders on server ticks, seconds apart), and the following 10 idle seconds must stay within a small render bound. `python3 tools/agent-dash/agent_dash.py check --page` runs the same sampled gate inside `scripts/page_check.mjs` before its tab loop. `tests/test_page_rules.py` pins the root cause statically (one-shot plan load, empty-settling `loadPlanSums`, volatile-free keys, `applySections` idempotency, the render counter).
+It checks the exec overview and the project home by default; `--ws` takes one tab or a comma-separated list, so one run can cover a tab with a plan and a done tab together (both render shapes): after a 2 s grace a 3 s sample of the render count must look quiescent (a tight loop raises it in nearly every 250 ms poll; a healthy live page only re-renders on server ticks, seconds apart), and the following 10 idle seconds must stay within a small render bound. `python3 tools/agent-dash/agent_dash.py check --page` runs the same sampled gate inside `scripts/page_check.mjs` before its tab loop. `tests/test_page_rules.py` pins the root cause statically (one-shot plan load, empty-settling `loadPlanSums`, volatile-free keys, `applySections` idempotency, the render counter, the clock-free render signature, the quantized window start, non-stacking poll timers, poll-clock-free conditional identities).
 
 ### Before you push
 

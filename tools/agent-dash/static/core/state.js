@@ -299,7 +299,11 @@
     return "?" + q.toString();
   }
   function go(ws) { selectTab(ws); }
-  function since() { return Math.floor(Date.now() / 1000 - WINDOW_HOURS * 3600); }
+  /* Window start on the same 30 s grid the server keys (and tags) on: a
+     per-second since makes every tick and sweep URL novel, so the
+     conditional layer never matches and every request refetches and
+     recomputes. A 24 h window moving by seconds is invisible in the sums. */
+  function since() { return Math.floor(Date.now() / 30000) * 30 - WINDOW_HOURS * 3600; }
   function wsParam() { return state.ws === "all" ? {} : {ws: state.ws}; }
   var AdPage = (global.AdPage = global.AdPage || {});
   AdPage.WINDOW_HOURS = WINDOW_HOURS;

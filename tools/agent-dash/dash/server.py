@@ -440,12 +440,16 @@ class Handler(BaseHTTPRequestHandler):
         until = _float(query, "until")
         usage_group = _one(query, "usage_group")
         store = self.server.store
+        # Identity names the result-cache entry, not the poll clock:
+        # store.seq advances on every poll (process samples, counts) while
+        # no served byte changes, so tagging it would 200 every tick and
+        # the conditional layer could never engage. data_seq is the true
+        # data version: it moves only when a write lands.
         try:
             ident = (
                 "snapshot",
                 store.snapshot_key(ws, since, until, usage_group),
                 store.data_seq,
-                store.seq,
             )
         except Exception:
             ident = None
@@ -741,17 +745,18 @@ class Handler(BaseHTTPRequestHandler):
         include = _one(query, "include")
         if include is not None and include != "jobs":
             raise ValueError("bad include")
-        # Identity tag names the entry (seqs, quantized window, minute):
-        # per-request fields like elapsed_s make content hashes useless,
-        # but the rows only move on store writes, so a match skips the
-        # whole query and the megabytes of transfer.
+        # Identity tag names the entry (data version, quantized window,
+        # minute): per-request fields like elapsed_s make content hashes
+        # useless, but the rows only move on store writes, so a match
+        # skips the whole query and the megabytes of transfer. store.seq
+        # stays out: it advances on every poll without moving any row.
         store = self.server.store
         try:
             ident = (
                 "runs", ws,
                 None if since is None else int(float(since) // 30),
                 None if until is None else int(float(until) // 30),
-                limit, include, int(now // 60), store.data_seq, store.seq,
+                limit, include, int(now // 60), store.data_seq,
             )
         except Exception:
             ident = None
@@ -776,10 +781,11 @@ class Handler(BaseHTTPRequestHandler):
         step = _float(query, "step") or 60.0
         ws = _ws(query, default=None)
         # Same identity-tag rationale as /api/runs: the point grid slides
-        # with the request clock, but the lanes only move on store writes.
+        # with the request clock, but the lanes only move on store writes
+        # (store.seq still stays out: it moves on every poll regardless).
         store = self.server.store
         try:
-            ident = ("concurrency", ws, int(float(since) // 30), float(step), int(now // 60), store.data_seq, store.seq)
+            ident = ("concurrency", ws, int(float(since) // 30), float(step), int(now // 60), store.data_seq)
         except Exception:
             ident = None
         etag = _identity_etag(*ident) if ident is not None else None
