@@ -339,7 +339,7 @@ class StoreTest(unittest.TestCase):
         snap = self.store.snapshot(now)
         self.assertEqual(
             set(snap),
-            {"now", "seq", "data_seq", "last_data_ts", "counts", "running", "recent", "recent_shown", "recent_total", "totals", "prev_24h", "totals_all_time", "last_activity", "by_workstream"},
+            {"now", "seq", "data_seq", "last_data_ts", "counts", "running", "recent", "recent_shown", "recent_total", "recent_limit", "recent_offset", "totals", "prev_24h", "totals_all_time", "last_activity", "by_workstream"},
         )
         self.assertEqual(snap["counts"]["live_agents"], 0)
         recent_ids = [run["run_id"] for run in snap["recent"]]
