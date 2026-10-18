@@ -21,6 +21,17 @@ those log rows are rewritten to zero so the turn totals are the only ledger.
 ``grok_cli:usage:<path>`` is ``st_mtime_ns``, not a byte cursor. Other
 synthetic offset keys (``grok_cli:seen:*``, ``grok_cli:auth:*``,
 ``grok_cli:sup:*``) are bookkeeping, not files.
+
+DeepSeek V4.1 Flash (model id ``deepseek-flash``, run through the same CLI)
+shares the ``usage.json`` shape: ``inputTokens`` includes
+``cachedReadTokens`` (``totalTokens`` equals ``inputTokens`` plus
+``outputTokens``), so the reader stores the uncached miss in ``input`` and
+the hit in ``cache_read`` exactly like GLM. Note the CLI's ``-p
+--output-format json`` final object uses the other convention: its
+``input_tokens`` is already the miss and its ``total_tokens`` equals miss
+plus ``cache_read_input_tokens`` plus ``output_tokens``. ``reasoningTokens``
+rides along separately; the catalog bills it at no separate rate because the
+``chat_completions`` output count already includes reasoning.
 """
 
 import json

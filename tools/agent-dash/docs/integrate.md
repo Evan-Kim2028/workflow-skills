@@ -293,6 +293,19 @@ Add a model by appending a row:
 
 A model with no input rate or no output rate stays unpriced: the cost tile counts unpriced runs instead of showing `$0`. Zero tokens cost zero even with no rate for that class. A `reasoning` rate requires reasoning counts, else the run stays unpriced. `billing_mode` (`api`, `plan-included`, `subscription`, `unknown`) is a note; the numeric rates still apply. A `long_context` block prices prompts past its threshold at the higher rates.
 
+### DeepSeek V4.1 Flash (time-aware standard API prices)
+
+Workers run with `grok --model deepseek-flash` (DeepSeek-V4.1-Flash-1017 via DeepSeek's `chat_completions` API). The catalog prices four ids: `deepseek-flash`, the legacy aliases `deepseek-v4-flash` and `deepseek-v4-flash-vision-exp` (same rates), and `deepseek-v4-pro`. USD per 1M tokens, source https://api-docs.deepseek.com/quick_start/pricing retrieved 2026-10-18:
+
+| model | cache hit peak / off-peak | cache miss peak / off-peak | output peak / off-peak |
+|---|---|---|---|
+| `deepseek-flash` | 0.006 / 0.003 | 0.30 / 0.15 | 1.20 / 0.60 |
+| `deepseek-v4-pro` | 0.044 / 0.022 | 1.32 / 0.66 | 3.96 / 1.98 |
+
+Off-peak is half of peak; there are no context tiers. Peak is 01:00-04:00 and 06:00-10:00 UTC Monday through Friday, excluding mainland China public holidays (best-effort dated list in `dash/pricing.py` as `CHINA_HOLIDAYS_2026`: New Year's Day, the Spring Festival week, the observed Qingming day, the Labour Day week, Dragon Boat Festival, Mid-Autumn Festival, the National Day week); every other hour is off-peak, and any day missing from that list follows the normal weekday rule. Each usage record prices from its own timestamp (per-turn `endedAt` where the log has per-turn rows); a session-level record with no turn timestamps prices at its own timestamp as an approximation, and a record with no timestamp at all prices at the peak band (conservative). Stored `input` is the cache miss and `cache_read` the hit: the Grok Build `usage.json` reports `inputTokens` *including* `cachedReadTokens` (`totalTokens` = `inputTokens` + `outputTokens`), while the CLI's `-p --output-format json` final object reports `input_tokens` as the miss (`total_tokens` = miss + `cache_read_input_tokens` + `output_tokens`). The reader stores miss/hit separately and the catalog bills miss at the miss rate, hit at the hit rate. `reasoningTokens` is stored but billed at no separate rate: the `chat_completions` output count already includes reasoning, so billing `output` covers it with no double count.
+
+To update: re-check the pricing page, edit the four rows' peak rates and `offpeak` block in `tools/agent-dash/catalog/prices.json` (keep `retrieved_at` current), adjust `CHINA_HOLIDAYS_2026` in `dash/pricing.py` if the holiday list changed, then run `python3 agent_dash.py reprice` and the DeepSeek tests (`python3 -m unittest discover -s tests -p 'test_deepseek*.py'`).
+
 ## 6. Drive a workstream
 
 Create the bundle, fill the plan, render, validate:

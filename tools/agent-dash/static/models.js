@@ -2,16 +2,17 @@
    dash/models.py holds the same rules for the server-side counts. */
 (function (global) {
   "use strict";
-  var FAMS = ["claude", "cursor", "muse", "glm", "dagster", "other"];
+  var FAMS = ["claude", "cursor", "muse", "glm", "deepseek", "dagster", "other"];
   var FAM = {
     claude: {name: "Claude", hue: "--s1", order: ["opus", "fable", "sonnet", "haiku"]},
     cursor: {name: "Cursor", hue: "--s4", order: ["grok-4.7", "composer-2.5"]},
     muse: {name: "muse", hue: "--s5", order: ["muse-spark-1.3", "muse-wonder-1.0"]},
     glm: {name: "GLM", hue: "--s6", order: ["glm-5.3", "glm-5.3-flash"]},
+    deepseek: {name: "DeepSeek", hue: "--s8", order: ["deepseek-flash", "deepseek-v4-pro"]},
     dagster: {name: "Dagster", hue: "--s7", order: []},
     other: {name: "Other", hue: "--other", order: ["other"]}
   };
-  var WORD = {grok: "Grok", composer: "Composer", glm: "GLM", flash: "Flash", spark: "Spark", wonder: "Wonder", muse: "muse", opus: "Opus", fable: "Fable", sonnet: "Sonnet", haiku: "Haiku", other: "Other"};
+  var WORD = {grok: "Grok", composer: "Composer", glm: "GLM", flash: "Flash", spark: "Spark", wonder: "Wonder", muse: "muse", opus: "Opus", fable: "Fable", sonnet: "Sonnet", haiku: "Haiku", other: "Other", deepseek: "DeepSeek", pro: "Pro"};
 
   function keyOf(model, hint) {
     var m = String(model || "").toLowerCase(), h = String(hint || "").toLowerCase(), v;
@@ -24,6 +25,7 @@
     if (/composer/.test(m)) { v = /composer[-_ ]?(\d+(?:\.\d+)?)/.exec(m); return ["cursor", "composer" + (v ? "-" + v[1] : "")]; }
     if (/grok/.test(m)) { v = /grok[-_ ]?(\d+(?:\.\d+)?)/.exec(m); return ["cursor", "grok" + (v ? "-" + v[1] : "")]; }
     if (/glm/.test(m)) { v = /glm[-_ ]?(\d+(?:\.\d+)?)/.exec(m); return ["glm", "glm" + (v ? "-" + v[1] : "") + (/flash/.test(m) ? "-flash" : "")]; }
+    if (/deepseek/.test(m)) { return ["deepseek", /pro/.test(m) ? "deepseek-v4-pro" : "deepseek-flash"]; }
     if (/muse/.test(m)) { v = /muse-(spark|wonder)(?:-full)?-(\d+(?:\.\d+)?)/.exec(m); return ["muse", v ? "muse-" + v[1] + "-" + v[2] : "muse-unknown"]; }
     v = /(opus|fable|sonnet|haiku)/.exec(m) || /(opus|fable|sonnet|haiku)/.exec(h);
     if (v) return ["claude", v[1]];
@@ -36,6 +38,8 @@
   function nameOf(key) {
     if (/^dagster:/.test(key)) return key.slice(8) || "job";
     if (/-unknown$/.test(key)) return "model not recorded";
+    if (key === "deepseek-flash") return "DeepSeek V4.1 Flash";
+    if (key === "deepseek-v4-pro") return "DeepSeek V4 Pro";
     return key.split("-").map(function (w) { return WORD[w] || w; }).join(" ");
   }
   function famOf(key) { return keyOf(key)[0]; }

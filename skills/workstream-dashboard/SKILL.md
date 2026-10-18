@@ -64,6 +64,7 @@ Labels pin runs to workstreams and task chips. Verdicts are `PASS`, `PARTIAL`, `
 - **Record a train or approval.** `ws train` / `ws trains`, `ws approve` / `ws approvals`. The lead reads approvals before any production step.
 - **Map a label to a task.** Exact label or `/regex/` to task id under the workstream in `static/taskmap.local.json`. No restart.
 - **Add a data source.** New module `dash/sources/<name>.py` with `NAME`, `INTERVAL_S`, `poll(store, cfg, now)`. Incremental by byte offset. Bounded per tick. Exceptions isolated. Add `tests/test_<name>.py`. Restart and check `/api/health`.
+- **Price DeepSeek runs.** `grok --model deepseek-flash` usage prices from the catalog with peak/off-peak bands; see the integration guide pricing section.
 - **Change the look.** Edit `DESIGN.md` first, then the page. Check JS syntax, view both themes and the fixture preview, run the page-rules tests.
 
 ## Run a wave

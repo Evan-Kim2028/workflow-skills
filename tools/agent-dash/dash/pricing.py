@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import threading
+from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 
@@ -23,6 +24,47 @@ _MILLION = Decimal(1_000_000)
 _lock = threading.Lock()
 _cache: dict = {}
 
+# Mainland China public holidays 2026 (UTC dates). Best-effort: the days
+# below are the certain ones (New Year's Day, the Spring Festival week
+# around Chinese New Year on Feb 17, the observed Qingming day, the Labour
+# Day week, Dragon Boat Festival on Jun 19, Mid-Autumn Festival on Sep 25,
+# and the National Day week). Adjusted working weekends are NOT listed.
+# DeepSeek bills these whole days off-peak; any day not listed here follows
+# the normal weekday rule (an unlisted day is treated as a normal weekday,
+# i.e. peak hours apply).
+CHINA_HOLIDAYS_2026 = frozenset(
+    [
+        "2026-01-01",
+        "2026-02-16",
+        "2026-02-17",
+        "2026-02-18",
+        "2026-02-19",
+        "2026-02-20",
+        "2026-02-21",
+        "2026-02-22",
+        "2026-04-06",
+        "2026-05-01",
+        "2026-05-02",
+        "2026-05-03",
+        "2026-05-04",
+        "2026-05-05",
+        "2026-06-19",
+        "2026-09-25",
+        "2026-10-01",
+        "2026-10-02",
+        "2026-10-03",
+        "2026-10-04",
+        "2026-10-05",
+        "2026-10-06",
+        "2026-10-07",
+    ]
+)
+
+# DeepSeek's weekday peak windows in UTC (start inclusive, end exclusive):
+# 01:00-04:00 and 06:00-10:00 Monday through Friday.
+DEEPSEEK_PEAK_WEEKDAYS = (0, 1, 2, 3, 4)
+DEEPSEEK_PEAK_WINDOWS = ((1, 4), (6, 10))
+
 
 def family(model: str | None, table: dict | None = None) -> str | None:
     """Chart family. This is not the price lookup."""
@@ -41,7 +83,7 @@ def series_key(model: str | None) -> str:
     if fam:
         return fam
     text = (model or "").lower()
-    for name in ("grok", "muse", "glm"):
+    for name in ("grok", "muse", "glm", "deepseek"):
         if name in text:
             return name
     return "other"
@@ -94,6 +136,38 @@ def status(model: str | None, table=None) -> dict:
     }
 
 
+def band_for(model: str | None, ts, table=None) -> str | None:
+    """``"peak"`` or ``"offpeak"`` for a time-banded row, else None.
+
+    ``ts`` is epoch seconds (UTC). A missing ``ts`` falls back to the
+    row's ``unknown_ts`` band (``"peak"`` unless the row says otherwise),
+    so an undated record prices conservatively instead of silently
+    picking the cheaper band.
+    """
+    row = _lookup(model, catalog() if table is None else table)
+    if row is None:
+        return None
+    spec = row.get("time_bands")
+    if not isinstance(spec, dict):
+        return None
+    if ts is None:
+        fallback = spec.get("unknown_ts") or "peak"
+        return fallback if fallback in ("peak", "offpeak") else "peak"
+    try:
+        moment = datetime.fromtimestamp(float(ts), tz=timezone.utc)
+    except (TypeError, ValueError, OverflowError, OSError):
+        return "peak"
+    if moment.strftime("%Y-%m-%d") in CHINA_HOLIDAYS_2026:
+        return "offpeak"
+    if moment.weekday() not in DEEPSEEK_PEAK_WEEKDAYS:
+        return "offpeak"
+    hour = moment.hour + moment.minute / 60.0 + moment.second / 3600.0
+    for start, end in DEEPSEEK_PEAK_WINDOWS:
+        if start <= hour < end:
+            return "peak"
+    return "offpeak"
+
+
 def cost(
     model: str | None,
     input_tokens,
@@ -105,8 +179,14 @@ def cost(
     cache_write_5m=None,
     cache_write_1h=None,
     reasoning=None,
+    ts=None,
 ) -> float | None:
-    """USD for one request. None when a billed class has no rate."""
+    """USD for one request. None when a billed class has no rate.
+
+    ``ts`` is the usage record's own epoch timestamp (UTC). Rows with a
+    ``time_bands`` block (DeepSeek) pick the peak or off-peak rate set
+    from it; rows without one ignore ``ts`` entirely.
+    """
     row = _lookup(model, catalog() if table is None else table)
     if row is None or row.get("input") is None or row.get("output") is None:
         return None
@@ -114,6 +194,8 @@ def cost(
         return None
     prompt = _prompt_len(row, input_tokens, cache_read, cache_write)
     rates = _apply_tier(row, prompt)
+    band = band_for(model, ts, table) if isinstance(row.get("time_bands"), dict) else None
+    rates = _apply_time_band(rates, band)
     bill_input = int(input_tokens)
     if row.get("input_includes_cache_read"):
         if int(cache_read) > bill_input:
@@ -195,6 +277,7 @@ def reprice(store, projects_root: str | None) -> dict:
             cache_write_5m=five,
             cache_write_1h=one,
             reasoning=event["reasoning"],
+            ts=event.get("ts"),
         )
         updates.append(
             (est, five, one, event["tool"], event["session_id"], event["message_id"])
@@ -235,6 +318,26 @@ def _prompt_len(row, input_tokens, cache_read, cache_write) -> int:
             continue
         total += values.get(name, 0)
     return total
+
+
+def _apply_time_band(rates: dict, band: str | None) -> dict:
+    """Swap in the off-peak rate set. Peak (or no band) keeps base rates.
+
+    Copies before merging, so catalog rows are never mutated. Only the
+    input/output/cache_read classes have banded rates; reasoning and
+    cache-write rates ride through unchanged.
+    """
+    if band != "offpeak":
+        return rates
+    spec = rates.get("time_bands") if isinstance(rates, dict) else None
+    off = spec.get("offpeak") if isinstance(spec, dict) else None
+    if not isinstance(off, dict):
+        return rates
+    merged = dict(rates)
+    for key in ("input", "output", "cache_read"):
+        if off.get(key) is not None:
+            merged[key] = off[key]
+    return merged
 
 
 def _apply_tier(row, prompt: int) -> dict:

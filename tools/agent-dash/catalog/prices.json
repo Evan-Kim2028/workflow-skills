@@ -362,6 +362,98 @@
    "retrieved_at": "2026-10-16",
    "confidence": "inferred",
    "input_note": "input is stored uncached at ingest (muse and Grok Build report cache inside input)"
+  },
+  {
+   "provider": "deepseek",
+   "model": "deepseek-flash",
+   "input": 0.30,
+   "output": 1.20,
+   "cache_read": 0.006,
+   "cache_write_5m": null,
+   "cache_write_1h": null,
+   "reasoning": null,
+   "long_context": null,
+   "input_includes_cache_read": false,
+   "billing_mode": "api",
+   "price_scope": "standard API, no context tiers; peak input/output/cache-read rates, off-peak is half; peak is 01:00-04:00 and 06:00-10:00 UTC Monday-Friday excluding mainland China public holidays (see time_bands and dash/pricing.py)",
+   "source_url": "https://api-docs.deepseek.com/quick_start/pricing",
+   "retrieved_at": "2026-10-18",
+   "confidence": "published",
+   "input_note": "input is stored uncached at ingest (the Grok Build usage.json inputTokens includes cachedReadTokens; the CLI final object reports input_tokens as the miss)",
+   "reasoning_note": "reasoningTokens rides along separately but bills at no separate rate: the chat_completions output count already includes reasoning, so billing output covers it with no double count",
+   "time_bands": {
+    "unknown_ts": "peak",
+    "offpeak": {"input": 0.15, "output": 0.60, "cache_read": 0.003}
+   }
+  },
+  {
+   "provider": "deepseek",
+   "model": "deepseek-v4-flash",
+   "input": 0.30,
+   "output": 1.20,
+   "cache_read": 0.006,
+   "cache_write_5m": null,
+   "cache_write_1h": null,
+   "reasoning": null,
+   "long_context": null,
+   "input_includes_cache_read": false,
+   "billing_mode": "api",
+   "price_scope": "legacy alias, bills as deepseek-flash (same peak/off-peak bands)",
+   "source_url": "https://api-docs.deepseek.com/quick_start/pricing",
+   "retrieved_at": "2026-10-18",
+   "confidence": "published",
+   "input_note": "input is stored uncached at ingest (the Grok Build usage.json inputTokens includes cachedReadTokens; the CLI final object reports input_tokens as the miss)",
+   "reasoning_note": "reasoningTokens rides along separately but bills at no separate rate: the chat_completions output count already includes reasoning, so billing output covers it with no double count",
+   "time_bands": {
+    "unknown_ts": "peak",
+    "offpeak": {"input": 0.15, "output": 0.60, "cache_read": 0.003}
+   }
+  },
+  {
+   "provider": "deepseek",
+   "model": "deepseek-v4-flash-vision-exp",
+   "input": 0.30,
+   "output": 1.20,
+   "cache_read": 0.006,
+   "cache_write_5m": null,
+   "cache_write_1h": null,
+   "reasoning": null,
+   "long_context": null,
+   "input_includes_cache_read": false,
+   "billing_mode": "api",
+   "price_scope": "legacy alias, bills as deepseek-flash (same peak/off-peak bands)",
+   "source_url": "https://api-docs.deepseek.com/quick_start/pricing",
+   "retrieved_at": "2026-10-18",
+   "confidence": "published",
+   "input_note": "input is stored uncached at ingest (the Grok Build usage.json inputTokens includes cachedReadTokens; the CLI final object reports input_tokens as the miss)",
+   "reasoning_note": "reasoningTokens rides along separately but bills at no separate rate: the chat_completions output count already includes reasoning, so billing output covers it with no double count",
+   "time_bands": {
+    "unknown_ts": "peak",
+    "offpeak": {"input": 0.15, "output": 0.60, "cache_read": 0.003}
+   }
+  },
+  {
+   "provider": "deepseek",
+   "model": "deepseek-v4-pro",
+   "input": 1.32,
+   "output": 3.96,
+   "cache_read": 0.044,
+   "cache_write_5m": null,
+   "cache_write_1h": null,
+   "reasoning": null,
+   "long_context": null,
+   "input_includes_cache_read": false,
+   "billing_mode": "api",
+   "price_scope": "standard API, no context tiers; peak input/output/cache-read rates, off-peak is half; peak is 01:00-04:00 and 06:00-10:00 UTC Monday-Friday excluding mainland China public holidays (see time_bands and dash/pricing.py)",
+   "source_url": "https://api-docs.deepseek.com/quick_start/pricing",
+   "retrieved_at": "2026-10-18",
+   "confidence": "published",
+   "input_note": "input is stored uncached at ingest (the Grok Build usage.json inputTokens includes cachedReadTokens; the CLI final object reports input_tokens as the miss)",
+   "reasoning_note": "reasoningTokens rides along separately but bills at no separate rate: the chat_completions output count already includes reasoning, so billing output covers it with no double count",
+   "time_bands": {
+    "unknown_ts": "peak",
+    "offpeak": {"input": 0.66, "output": 1.98, "cache_read": 0.022}
+   }
   }
  ]
 }

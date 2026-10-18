@@ -42,6 +42,7 @@ class UsageMixin:
                 cache_write_5m=write_5m,
                 cache_write_1h=write_1h,
                 reasoning=values["reasoning"],
+                ts=ts,
             )
             with self._lock:
                 if isinstance(run_id, str) and _manifest_family(run_id) is not None:
@@ -364,7 +365,7 @@ class UsageMixin:
                 rows = self._conn.execute(
                     """SELECT tool, session_id, message_id, model,
                               input_tokens, output_tokens, cache_read, cache_write,
-                              cache_write_5m, cache_write_1h, reasoning, est_cost_usd
+                              cache_write_5m, cache_write_1h, reasoning, est_cost_usd, ts
                        FROM usage_events"""
                 ).fetchall()
             return [dict(row) for row in rows]
@@ -407,7 +408,7 @@ class UsageMixin:
                           e.input_tokens AS input_tokens, e.output_tokens AS output_tokens,
                           e.cache_read AS cache_read, e.cache_write AS cache_write,
                           e.cache_write_5m AS cache_write_5m, e.cache_write_1h AS cache_write_1h,
-                          e.reasoning AS reasoning
+                          e.reasoning AS reasoning, e.ts AS ts
                    FROM usage_events e
                    LEFT JOIN runs r ON r.run_id = e.run_id
                    WHERE e.ts >= ? AND e.ts < ? AND COALESCE(e.tool, '') != 'grok-context'""",
@@ -438,6 +439,7 @@ class UsageMixin:
                     cache_write_5m=row["cache_write_5m"],
                     cache_write_1h=row["cache_write_1h"],
                     reasoning=row["reasoning"],
+                    ts=row["ts"],
                 )
                 if priced is None:
                     bucket["unpriced"] = 1
@@ -481,7 +483,7 @@ class UsageMixin:
         def _usage_by_run_uncached(self) -> dict:
             rows = self._conn.execute(
                 """SELECT run_id, model, input_tokens, output_tokens, cache_read, cache_write,
-                          cache_write_5m, cache_write_1h, reasoning
+                          cache_write_5m, cache_write_1h, reasoning, ts
                    FROM usage_events WHERE run_id IS NOT NULL AND COALESCE(tool, '') != 'grok-context'"""
             ).fetchall()
             grouped: dict = {}
@@ -535,6 +537,10 @@ def _fold_events(events: list, _table=None, _memo: dict | None = None) -> tuple[
     costs = []
     unpriced = False
     for event in events:
+        ts = event["ts"] if "ts" in event.keys() else None
+        # Time-banded rates (DeepSeek peak/off-peak) change only on hour
+        # boundaries, so the hour bucket keeps the memo exact.
+        bucket = int(ts // 3600) if ts is not None else None
         memo_key = (
             event["model"],
             event["input_tokens"],
@@ -544,6 +550,7 @@ def _fold_events(events: list, _table=None, _memo: dict | None = None) -> tuple[
             event["cache_write_5m"],
             event["cache_write_1h"],
             event["reasoning"],
+            bucket,
         )
         if _memo is not None and memo_key in _memo:
             priced = _memo[memo_key]
@@ -558,6 +565,7 @@ def _fold_events(events: list, _table=None, _memo: dict | None = None) -> tuple[
                 cache_write_1h=event["cache_write_1h"],
                 reasoning=event["reasoning"],
                 table=_table,
+                ts=ts,
             )
             if _memo is not None:
                 _memo[memo_key] = priced

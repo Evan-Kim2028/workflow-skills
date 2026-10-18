@@ -22,7 +22,7 @@ The dashboard is read by a visual thinker. Every view answers its question with 
 ## Color (reference palette, validated; do not invent hues)
 
 - Categorical slots in fixed order: `--s1` blue, `--s2` orange, `--s3` aqua, `--s4` yellow, `--s5` magenta, `--s6` green, `--s7` violet, `--s8` red. Light and dark values are defined once in `:root` and the two dark scopes.
-- Entity to color is fixed and never depends on rank: opus `--s1`, haiku `--s2`, sonnet `--s3`, grok `--s4`, muse `--s5`, glm `--s6`, other `--other`. Workstreams take slots in first-seen order from `WSCOL`.
+- Entity to color is fixed and never depends on rank: opus `--s1`, haiku `--s2`, sonnet `--s3`, grok `--s4`, muse `--s5`, glm `--s6`, deepseek `--s8`, other `--other`. Workstreams take slots in first-seen order from `WSCOL`.
 - Status colors are reserved for state and never used as a series: good `--good`, warning `--warning`, serious `--serious`, critical `--critical`. A status color always ships with a word or icon.
 - Text names things, not numbers: a decision, task, PR, issue or ADR is cited by a brief phrase, with its number optional in parentheses after it. Chips show a task id only beside its title or in its tooltip.
 - Text uses ink tokens (`--ink`, `--ink-2`, `--muted`), never a series color.
