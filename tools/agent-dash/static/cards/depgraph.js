@@ -218,6 +218,11 @@
     return "no plan";
   }
 
+  /* Pure hover-text builder for the chart's own takeaway line. */
+  function depAriaTip(n, met, waiting, stale) {
+    return "Cross-workstream dependency graph: " + fmtN(n) + " workstreams, " + fmtN(met) + " dependencies met, " + fmtN(waiting) + " waiting, " + fmtN(stale) + " stale";
+  }
+
   function depTipRows(node, upCount, downCount) {
     var pr = node.progress || {};
     var mark = depStateMark(node.state);
@@ -435,7 +440,7 @@
     var layout = depLayout(graph, {width: Math.min(w, 1400), showArch: depShowArch});
     var body = el("div", {class: "dep-body"});
     var svg = s("svg", {viewBox: "0 0 " + layout.width + " " + layout.height, class: "dep-svg",
-      role: "img", "aria-label": "Cross-workstream dependency graph: " + (graph.nodes || []).length + " workstreams, " + counts.met + " dependencies met, " + counts.waiting + " waiting, " + counts.stale + " stale", "data-diagram": "depgraph"});
+      role: "img", "aria-label": depAriaTip((graph.nodes || []).length, counts.met, counts.waiting, counts.stale), "data-diagram": "depgraph"});
     svg.style.width = "100%";
     svg.style.height = "auto";
     /* A nearly empty graph (a new dashboard with one workstream) keeps its
@@ -480,4 +485,10 @@
   global.depStateMark = depStateMark;
   global.depEdgeMark = depEdgeMark;
   global.depShort = depShort;
+  global.depTaskLine = depTaskLine;
+  global.depTipRows = depTipRows;
+  global.depAriaTip = depAriaTip;
+  AdPage.cards.depTaskLine = depTaskLine;
+  AdPage.cards.depTipRows = depTipRows;
+  AdPage.cards.depAriaTip = depAriaTip;
 })(window);

@@ -123,8 +123,19 @@
     }
     var d = cur - prev;
     if (d === 0) return tileChip("flat", "◆", "flat", word, title);
-    return tileChip(d > 0 ? "up" : "down", d > 0 ? "▲" : "▼", (d > 0 ? "+" : "") + String(d), word, title);
+    return tileChip(d > 0 ? "up" : "down", d > 0 ? "▲" : "▼", (d > 0 ? "+" : "") + fmtN(d), word, title);
   }
+
+  /* Pure hover-text builders for the delta chips and tile tooltips:
+     compact numbers only (fmtN/fmtUsd). */
+  function tileTokensTitle(allTok, prev) { return "Change vs the previous rolling 24 h (exact API totals): this window " + fmtN(allTok) + ", prior " + fmtN(prev); }
+  function tileTokensApproxTitle(cur12, old12) { return "Approx. change from this window's hour buckets (approx.): recent 12 h " + fmtN(cur12) + " vs earlier 12 h " + fmtN(old12) + " — the exact rolling delta arrives with snap.prev_24h"; }
+  function tileCostTitle(cost, prev) { return "Change vs the previous rolling 24 h (exact API totals): this window " + fmtUsd(cost) + ", prior " + fmtUsd(prev); }
+  function tileCostApproxTitle(cur12, old12) { return "Approx. change from this window's hour buckets (approx.): recent 12 h " + fmtUsd(cur12) + " vs earlier 12 h " + fmtUsd(old12) + " — the exact rolling delta arrives with snap.prev_24h"; }
+  function tileFinTitle(now, prev) { return "Change vs the previous rolling 24 h (exact API count): this window " + fmtN(now) + ", prior " + fmtN(prev); }
+  function tileFinApproxTitle(cur12, old12) { return "Approx. change from runs ended per hour (approx.): recent 12 h " + fmtN(cur12) + " vs earlier 12 h " + fmtN(old12) + " — the exact rolling delta arrives with snap.prev_24h"; }
+  function tileLiveTitle(now, prev) { return "Live agents vs 24 h ago (exact API count): now " + fmtN(now) + ", then " + fmtN(prev); }
+  function tileLiveApproxTitle(now, ago) { return "Approx. vs the earliest sampled hour in this window (approx.): now " + fmtN(now) + ", then ~" + fmtN(ago); }
 
   /* One tile card: label, headline value, delta chip, sparkline, and one or
      two tertiary lines. dataAttrs carry the server-total attributes the
@@ -243,46 +254,46 @@
     var tokDelta, tokWord, tokTitle, tokPrevTxt;
     if (p24 && tileIsNum(p24.tokens)) {
       tokWord = "vs prior 24 h";
-      tokTitle = "Change vs the previous rolling 24 h (exact API totals): this window " + String(allTok) + ", prior " + String(p24.tokens);
+      tokTitle = tileTokensTitle(allTok, p24.tokens);
       tokDelta = tilePctChip(allTok, p24.tokens, tokWord, tokTitle);
-      tokPrevTxt = String(p24.tokens);
+      tokPrevTxt = fmtN(p24.tokens);
     } else {
       tokWord = "vs earlier 12 h";
-      tokTitle = "Approx. change from this window's hour buckets (approx.): recent 12 h " + String(tokCur12) + " vs earlier 12 h " + String(tokOld12) + " — the exact rolling delta arrives with snap.prev_24h";
+      tokTitle = tileTokensApproxTitle(tokCur12, tokOld12);
       tokDelta = tilePctChip(tokCur12, tokOld12, tokWord, tokTitle);
-      tokPrevTxt = String(tokOld12) + " (approx.)";
+      tokPrevTxt = fmtN(tokOld12) + " (approx.)";
     }
     var costDelta, costWord, costTitle, costPrevTxt;
-    function costStr(x) { return "$" + String(Math.round(x * 100) / 100); }
+    function costStr(x) { return fmtUsd(x); }
     if (p24 && tileIsNum(p24.cost_usd)) {
       costWord = "vs prior 24 h";
-      costTitle = "Change vs the previous rolling 24 h (exact API totals): this window " + costStr(cost) + ", prior " + costStr(p24.cost_usd);
+      costTitle = tileCostTitle(cost, p24.cost_usd);
       costDelta = tilePctChip(cost, p24.cost_usd, costWord, costTitle);
       costPrevTxt = costStr(p24.cost_usd);
     } else {
       costWord = "vs earlier 12 h";
-      costTitle = "Approx. change from this window's hour buckets (approx.): recent 12 h " + costStr(costCur12) + " vs earlier 12 h " + costStr(costOld12) + " — the exact rolling delta arrives with snap.prev_24h";
+      costTitle = tileCostApproxTitle(costCur12, costOld12);
       costDelta = tilePctChip(costCur12, costOld12, costWord, costTitle);
       costPrevTxt = costStr(costOld12) + " (approx.)";
     }
     var finDelta, finWord, finTitle, finPrevTxt;
     if (p24 && tileIsNum(p24.finished)) {
       finWord = "vs prior 24 h";
-      finTitle = "Change vs the previous rolling 24 h (exact API count): this window " + String(finNow) + ", prior " + String(p24.finished);
+      finTitle = tileFinTitle(finNow, p24.finished);
       finDelta = tilePctChip(finNow, p24.finished, finWord, finTitle);
-      finPrevTxt = String(p24.finished);
+      finPrevTxt = fmtN(p24.finished);
     } else {
       finWord = "vs earlier 12 h";
-      finTitle = "Approx. change from runs ended per hour (approx.): recent 12 h " + String(finCur12) + " vs earlier 12 h " + String(finOld12) + " — the exact rolling delta arrives with snap.prev_24h";
+      finTitle = tileFinApproxTitle(finCur12, finOld12);
       finDelta = tilePctChip(finCur12, finOld12, finWord, finTitle);
-      finPrevTxt = String(finOld12) + " (approx.)";
+      finPrevTxt = fmtN(finOld12) + " (approx.)";
     }
     var liveDelta, liveTitle;
     if (p24 && tileIsNum(p24.live_agents)) {
-      liveTitle = "Live agents vs 24 h ago (exact API count): now " + String(liveNow) + ", then " + String(p24.live_agents);
+      liveTitle = tileLiveTitle(liveNow, p24.live_agents);
       liveDelta = tileCountChip(liveNow, p24.live_agents, "vs 24 h ago", liveTitle);
     } else {
-      liveTitle = liveAgo == null ? "" : "Approx. vs the earliest sampled hour in this window (approx.): now " + String(liveNow) + ", then ~" + String(liveAgo);
+      liveTitle = liveAgo == null ? "" : tileLiveApproxTitle(liveNow, liveAgo);
       liveDelta = tileCountChip(liveNow, liveAgo, "vs 24 h ago", liveTitle);
     }
     function chipState(chip) {
@@ -320,14 +331,14 @@
     var livePeak = liveSeries.reduce(function (a, b) { return Math.max(a, b); }, 0);
     g.appendChild(tileCard("Agents live now", fmtN(liveNow), liveDelta, chipState(liveDelta),
       tileSpark(liveSeries, "var(--s1)", "tls-live"), liveLines, null,
-      [{k: "Live now", v: String(liveNow)}, {k: "24 h ago", v: liveAgo == null ? "n/a" : String(liveAgo)}, {k: "Peak hourly mean", v: String(Math.round(livePeak * 10) / 10)}]));
+      [{k: "Live now", v: fmtN(liveNow)}, {k: "24 h ago", v: liveAgo == null ? "n/a" : fmtN(liveAgo)}, {k: "Peak hourly mean", v: fmtN(livePeak)}]));
     g.appendChild(tileCard("Agents finished (24 h)", fmtN(finNow), finDelta, chipState(finDelta),
       tileSpark(finSeries, "var(--good)", "tls-fin"), finLines, null,
-      [{k: "This 24 h (hour buckets)", v: String(sumHalf(finSeries, 0, 24))}, {k: "Prior 24 h", v: finPrevTxt}, {k: "Rolling 24 h (API)", v: String(finNow)}]));
+      [{k: "This 24 h (hour buckets)", v: fmtN(sumHalf(finSeries, 0, 24))}, {k: "Prior 24 h", v: finPrevTxt}, {k: "Rolling 24 h (API)", v: fmtN(finNow)}]));
     g.appendChild(tileCard("Tokens (24 h)", tokVal, tokDelta, chipState(tokDelta),
       tileSpark(tokSeries, "var(--s4)", "tls-tok"), tokLines,
       {"data-tile": "tokens", "data-ws": state.ws, "data-hours": "24", "data-tokens": String(allTok), "data-tokens-all-time": String(allTimeTok)},
-      [{k: "This 24 h (hour buckets)", v: String(sumHalf(tokSeries, 0, 24))}, {k: "Prior 24 h", v: tokPrevTxt}, {k: "Rolling 24 h (API)", v: String(allTok)}]));
+      [{k: "This 24 h (hour buckets)", v: fmtN(sumHalf(tokSeries, 0, 24))}, {k: "Prior 24 h", v: tokPrevTxt}, {k: "Rolling 24 h (API)", v: fmtN(allTok)}]));
     g.appendChild(tileCard("Est. cost (24 h)", fmtUsd(cost), costDelta, chipState(costDelta),
       tileSpark(costSeries, "var(--s5)", "tls-cost"), costLines,
       {"data-tile": "cost", "data-ws": state.ws, "data-hours": "24", "data-cost-usd": String(cost), "data-cost-all-time": String(allTimeCost), "data-unpriced-tokens": String(unpTok)},
@@ -348,4 +359,20 @@
   global.tileSpark = tileSpark;
   global.tilePctChip = tilePctChip;
   global.tileCountChip = tileCountChip;
+  AdPage.cards.tileTokensTitle = tileTokensTitle;
+  AdPage.cards.tileTokensApproxTitle = tileTokensApproxTitle;
+  AdPage.cards.tileCostTitle = tileCostTitle;
+  AdPage.cards.tileCostApproxTitle = tileCostApproxTitle;
+  AdPage.cards.tileFinTitle = tileFinTitle;
+  AdPage.cards.tileFinApproxTitle = tileFinApproxTitle;
+  AdPage.cards.tileLiveTitle = tileLiveTitle;
+  AdPage.cards.tileLiveApproxTitle = tileLiveApproxTitle;
+  global.tileTokensTitle = tileTokensTitle;
+  global.tileTokensApproxTitle = tileTokensApproxTitle;
+  global.tileCostTitle = tileCostTitle;
+  global.tileCostApproxTitle = tileCostApproxTitle;
+  global.tileFinTitle = tileFinTitle;
+  global.tileFinApproxTitle = tileFinApproxTitle;
+  global.tileLiveTitle = tileLiveTitle;
+  global.tileLiveApproxTitle = tileLiveApproxTitle;
 })(window);

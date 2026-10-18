@@ -70,6 +70,13 @@
     return s;
   }
 
+  /* Pure hover-text builders: compact numbers only (fmt), with the exact
+     value left to data-v/data-t attributes for tests and agents. */
+  function burnupLegendTip(ws, v, unit, fmt, off) { return ws + " " + fmt(v) + " " + unit + " — activate to " + (off ? "show" : "hide"); }
+  function burnupTasksAria(doneNow, planTotal) { return "Tasks done cumulative per day with plan total: " + fmtN(doneNow) + " of " + fmtN(planTotal) + " recorded"; }
+  function burnupDoneRows(v, planTotal) { return [{k: "Recorded done", v: fmtN(v) + " tasks", c: "var(--s1)"}, {k: "Plan total", v: fmtN(planTotal) + " tasks", c: "var(--muted)"}]; }
+  function burnupWsRow(last, color) { return [{k: "Recorded done", v: fmtN(last) + " tasks", c: color}]; }
+
   function burnupTabs(host) {
     var seg = el("div", {class: "seg-ctl burnup-tabs", role: "group", "aria-label": "Burn-up panels"});
     [["tasks", "Tasks"], ["cost", "Cost burn"], ["tokens", "Token burn"]].forEach(function (t) {
@@ -91,7 +98,7 @@
       var v = totalOf(ws);
       if (!v) return;
       var off = !!burnupHidden[ws];
-      var sp = el("span", {class: "lentry" + (off ? " off" : ""), "data-key": ws, "data-v": String(v), role: "button", tabindex: "0", "aria-pressed": String(!off), title: ws + " " + v + " " + unit + " — activate to " + (off ? "show" : "hide")});
+      var sp = el("span", {class: "lentry" + (off ? " off" : ""), "data-key": ws, "data-v": String(v), role: "button", tabindex: "0", "aria-pressed": String(!off), title: burnupLegendTip(ws, v, unit, fmt, off)});
       var flip = function () { if (burnupHidden[ws]) delete burnupHidden[ws]; else burnupHidden[ws] = 1; burnupRedraw(); };
       sp.addEventListener("click", flip);
       sp.addEventListener("keydown", function (ev) { if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); flip(); } });
@@ -155,7 +162,7 @@
     var nice = niceMax(peak);
     var f = burnupFrame(days);
     var doneNow = proj.length ? proj[proj.length - 1] : 0;
-    var svg = burnupSvg(f.W, f.H, "Tasks done cumulative per day with plan total: " + doneNow + " of " + planTotal + " recorded");
+    var svg = burnupSvg(f.W, f.H, burnupTasksAria(doneNow, planTotal));
     var Y = function (v) { return f.T + f.ph - v / nice * f.ph; };
     /* Gap band: the UTC days before the first recorded move. Undated
        work is named under the chart, never drawn as data. */
@@ -179,7 +186,7 @@
       var cx = f.X(days[i]) + f.slot / 2;
       var dot = s("circle", {cx: cx, cy: Y(v), r: "3.5", fill: "var(--s1)", "data-t": String(days[i]), "data-v": String(v)});
       dot.addEventListener("mousemove", function (ev) {
-        showTip(ev, burnupDay(days[i]), [{k: "Recorded done", v: String(v) + " tasks", c: "var(--s1)"}, {k: "Plan total", v: String(planTotal) + " tasks", c: "var(--muted)"}]);
+        showTip(ev, burnupDay(days[i]), burnupDoneRows(v, planTotal));
       });
       dot.addEventListener("mouseleave", hideTip);
       svg.appendChild(dot);
@@ -196,7 +203,7 @@
       var ex = f.X(days[days.length - 1]) + f.slot / 2;
       var end = s("circle", {cx: ex, cy: Y(last), r: "3", fill: colorOf(ws, "workstream"), "data-key": ws, "data-v": String(last)});
       end.addEventListener("mousemove", function (ev) {
-        showTip(ev, ws, [{k: "Recorded done", v: String(last) + " tasks", c: colorOf(ws, "workstream")}]);
+        showTip(ev, ws, burnupWsRow(last, colorOf(ws, "workstream")));
       });
       end.addEventListener("mouseleave", hideTip);
       svg.appendChild(end);
@@ -356,6 +363,14 @@
   var AdPage = (global.AdPage = global.AdPage || {});
   AdPage.cards = AdPage.cards || {};
   AdPage.cards.burnup = burnupCard;
+  AdPage.cards.burnupLegendTip = burnupLegendTip;
+  AdPage.cards.burnupTasksAria = burnupTasksAria;
+  AdPage.cards.burnupDoneRows = burnupDoneRows;
+  AdPage.cards.burnupWsRow = burnupWsRow;
+  global.burnupLegendTip = burnupLegendTip;
+  global.burnupTasksAria = burnupTasksAria;
+  global.burnupDoneRows = burnupDoneRows;
+  global.burnupWsRow = burnupWsRow;
   global.burnupSpec = burnupSpec;
   global.burnupCard = burnupCard;
   global.burnupTabIs = burnupTabIs;

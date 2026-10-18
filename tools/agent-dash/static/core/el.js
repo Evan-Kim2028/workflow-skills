@@ -40,7 +40,7 @@
     return ADM.colorOf(key);
   }
   /* axes() and the compact formatters live in format.js and are shared with the plan view. */
-  var fmtDate = AD.fmtDate, fmtN = AD.fmtN, fmtUsd = AD.fmtUsd, fmtDur = AD.fmtDur, fmtT = AD.fmtT, axes = AD.axes, timeTicks = AD.timeTicks, warpTime = AD.warpTime, warpPos = AD.warpPos;
+  var fmtDate = AD.fmtDate, fmtN = AD.fmtN, fmtUsd = AD.fmtUsd, fmtDur = AD.fmtDur, fmtT = AD.fmtT, fmtPct = AD.fmtPct, fmtBytes = AD.fmtBytes, axes = AD.axes, timeTicks = AD.timeTicks, warpTime = AD.warpTime, warpPos = AD.warpPos;
   function el(tag, attrs, kids) { var e = document.createElement(tag); if (attrs) for (var k in attrs) { if (k === "text") e.textContent = attrs[k]; else if (k === "html") e.innerHTML = attrs[k]; else if (k.slice(0, 2) === "on") e.addEventListener(k.slice(2), attrs[k]); else e.setAttribute(k, attrs[k]); } (kids || []).forEach(function (c) { if (c) e.appendChild(typeof c === "string" ? document.createTextNode(c) : c); }); return e; }
   var NS = "http://www.w3.org/2000/svg";
   function s(tag, attrs) { var e = document.createElementNS(NS, tag); for (var k in attrs) e.setAttribute(k, attrs[k]); return e; }
@@ -88,6 +88,8 @@
   AdPage.fmtUsd = fmtUsd;
   AdPage.fmtDur = fmtDur;
   AdPage.fmtT = fmtT;
+  AdPage.fmtPct = fmtPct;
+  AdPage.fmtBytes = fmtBytes;
   AdPage.axes = axes;
   AdPage.timeTicks = timeTicks;
   AdPage.warpTime = warpTime;
@@ -116,6 +118,8 @@
   global.fmtUsd = fmtUsd;
   global.fmtDur = fmtDur;
   global.fmtT = fmtT;
+  global.fmtPct = fmtPct;
+  global.fmtBytes = fmtBytes;
   global.axes = axes;
   global.timeTicks = timeTicks;
   global.warpTime = warpTime;

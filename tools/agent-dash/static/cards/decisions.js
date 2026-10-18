@@ -115,7 +115,7 @@
       top.appendChild(title);
     }
     var pill = decisionPill(row && row.status);
-    top.appendChild(el("span", {class: pill.cls, text: pill.text, title: String((row && row.status) || "unknown")}));
+    top.appendChild(el("span", {class: pill.cls, text: pill.text, title: String((row && row.status) || "unknown")})); // page-rule-allow: decision status is a word, not a number
     line.appendChild(top);
     var meta = [];
     if (row && row.owner) meta.push(row.owner);

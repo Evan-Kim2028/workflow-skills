@@ -93,6 +93,8 @@
     if (sub) h.appendChild(el("p", {class: "sub", text: sub}));
     return h;
   }
+  /* Pure hover-text builder: compact counts only (fmtN). */
+  function plProgAria(ws, done, total) { return ws + " " + fmtN(done) + " of " + fmtN(total) + " tasks done"; }
 
   function plannedShelfRows() {
     var seen = {}, out = [];
@@ -205,7 +207,7 @@
       name.appendChild(idline);
       name.appendChild(el("span", {class: "prog-pill active", text: "\u25CF Gated"}));
       row.appendChild(name);
-      var bar = el("div", {class: "prog-bar", role: "img", "aria-label": h.ws + " " + (pr.done || 0) + " of " + (pr.total || 0) + " tasks done"});
+      var bar = el("div", {class: "prog-bar", role: "img", "aria-label": plProgAria(h.ws, pr.done || 0, pr.total || 0)});
       if (pr.total) {
         var fill = el("span");
         fill.style.width = (100 * (pr.done || 0) / pr.total) + "%";
@@ -281,6 +283,8 @@
   AdPage.cards.planned = plannedSpecs;
   AdPage.PLANNED_SLOTS = PLANNED_SLOTS;
   global.plannedSpecs = plannedSpecs;
+  global.plProgAria = plProgAria;
+  AdPage.cards.plProgAria = plProgAria;
   global.readinessOf = readinessOf;
   global.gateStale = gateStale;
   global.gatedLive = gatedLive;

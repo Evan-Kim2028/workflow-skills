@@ -94,6 +94,212 @@ class PageRules(unittest.TestCase):
                 for bad in (".toFixed(", "toLocaleString()"):
                     self.assertNotIn(bad, body, f"{path.name}:{name} formats a number with {bad}; use fmtN/fmtUsd/fmtDur")
 
+    def _hover_value(self, src, start):
+        """One hover-text value expression starting at offset start: stops
+        at the first top-level comma, closing bracket or semicolon, so
+        neighbouring data-v/data-t attributes (exact, for tests) never
+        count as hover text. Strings and nested brackets are honoured."""
+        depth = 0
+        j = start
+        quote = None
+        escaped = False
+        while j < len(src):
+            ch = src[j]
+            if quote:
+                if escaped:
+                    escaped = False
+                elif ch == "\\":
+                    escaped = True
+                elif ch == quote:
+                    quote = None
+            elif ch in ("'", '"', "`"):
+                quote = ch
+            elif ch in "([{":
+                depth += 1
+            elif ch in ")]}":
+                if depth == 0:
+                    break
+                depth -= 1
+            elif ch == "," and depth == 0:
+                break
+            elif ch == ";" and depth == 0:
+                break
+            j += 1
+        return src[start:j]
+
+    def test_hover_text_has_no_raw_numbers(self):
+        """Hover text is compact-only: no title/tooltip/aria-label value
+        formats a raw number (String(, Math.round(, toLocaleString,
+        toFixed) outside format.js. The exact value stays in data-v/data-t
+        attributes and the details drawer. Word-valued titles (a verdict, a
+        status, an id, slider epochs announced via valuetext) carry a
+        page-rule-allow comment naming why they are not numbers."""
+        roots = [STATIC / "cards", STATIC / "core"]
+        paths = sorted(p for root in roots for p in root.glob("*.js"))
+        paths += [STATIC / name for name in ("models.js", "tabs.js", "sidenav.js", "plan.js", "tokencache.js")]
+        inline = "\n".join(re.findall(r"<script>(.*?)</script>", (STATIC / "index.html").read_text(), re.S))
+        pats = [
+            re.compile(r"(?<![\w$])title\s*:"),
+            re.compile(r"\.title\s*="),
+            re.compile(r'setAttribute\(\s*"title"\s*,'),
+            re.compile(r'"aria-label"\s*:'),
+            re.compile(r"data-tip\s*="),
+            re.compile(r"<title[\s>]"),
+        ]
+        bad = []
+        for path in paths:
+            src = path.read_text()
+            lines = src.splitlines()
+            for lineno, line in enumerate(lines, 1):
+                if "page-rule-allow" in line:
+                    continue
+                for pat in pats:
+                    m = pat.search(line)
+                    if not m:
+                        continue
+                    off = sum(len(item) + 1 for item in lines[: lineno - 1]) + m.end()
+                    val = self._hover_value(src, off)
+                    for raw in ("String(", "Math.round(", "toLocaleString", ".toFixed("):
+                        if raw in val:
+                            bad.append(f"{path.name}:{lineno} formats a raw number into hover text: {line.strip()[:140]}")
+                            break
+                if 'showTip(' in line and "page-rule-allow" not in line:
+                    tail = line[line.index('showTip('):]
+                    for raw in ("String(", "Math.round(", "toLocaleString", ".toFixed("):
+                        if raw in tail:
+                            bad.append(f"{path.name}:{lineno} formats a raw number into a tooltip: {line.strip()[:140]}")
+                            break
+        self.assertEqual(bad, [], "raw numbers in hover text:\n" + "\n".join(bad[:20]))
+        inline_bad = [m for m in ("String(", "toLocaleString", ".toFixed(") if m in inline]
+        self.assertEqual(inline_bad, [], f"index.html inline script formats raw hover numbers: {inline_bad}")
+
+    def test_hover_builders_stay_exported(self):
+        """Every card and core hover path routes through a named compact
+        builder, so a later edit cannot drift back to raw concatenation
+        without deleting the builder this pins."""
+        expected = {
+            "format.js": ["function fmtPct(", "function fmtBytes("],
+            "cards/activity.js": ["function actLegendTip(", "function actTimelineAria(", "function actConcAria("],
+            "cards/burnup.js": ["function burnupLegendTip(", "function burnupTasksAria(", "function burnupDoneRows(", "function burnupWsRow("],
+            "cards/depgraph.js": ["function depAriaTip(", "function depTaskLine(", "function depTipRows("],
+            "cards/phases.js": ["function phaseSegTip(", "function phaseFmt(", "function phaseStackTip("],
+            "cards/plan-progress.js": ["function planAttText(", "function planSecTip(", "function planColbarTip(", "function planBigAria(", "function planBigTip("],
+            "cards/tables.js": ["function tipRows("],
+            "cards/tiles.js": ["function tileTokensTitle(", "function tileTokensApproxTitle(", "function tileCostTitle(", "function tileCostApproxTitle(", "function tileFinTitle(", "function tileFinApproxTitle(", "function tileLiveTitle(", "function tileLiveApproxTitle("],
+            "cards/ws-cards.js": ["function wsProgAria(", "function wsProgTitle(", "function wsPlanTitle("],
+            "cards/project-home.js": ["function phProgAria("],
+            "cards/planned.js": ["function plProgAria("],
+            "core/manage.js": ["function mgProgAria("],
+            "core/switcher.js": ["function swCountAria("],
+        }
+        missing = []
+        for name, markers in expected.items():
+            text = (STATIC / name).read_text()
+            for marker in markers:
+                if marker not in text:
+                    missing.append(f"{name} lost {marker}")
+        self.assertEqual(missing, [], "tooltip builders went missing:\n" + "\n".join(missing))
+
+    def test_hover_builders_are_compact(self):
+        """Every tooltip text builder renders big numbers compact: 123456789
+        tokens, 1234567.891 USD and 98765 seconds leave no 5+ digit run and
+        no comma-separated thousands in any hover string."""
+        harness = r'''
+const fs = require("fs");
+const assert = require("assert");
+var BYNAME = {};
+process.argv.slice(1).forEach(function (p) { BYNAME[p.split("/").pop()] = p; });
+function load(n) { eval(fs.readFileSync(BYNAME[n], "utf8")); }
+var window = {};
+function stubEl(tag, attrs, kids) {
+  var n = {tag: tag, attrs: attrs || {}, kids: [], style: {}};
+  n.appendChild = function (c) { if (c) n.kids.push(c); return c; };
+  n.setAttribute = function (k, v) { n.attrs[k] = String(v); };
+  (kids || []).forEach(function (c) { if (c) n.kids.push(c); });
+  return n;
+}
+var el = stubEl;
+var document = {createTextNode: function (t) { return {text: String(t)}; }, addEventListener: function () {}, getElementById: function () { return null; }, body: {}};
+function tierKey(r) { return "muse:claude-opus"; }
+function fullName(k) { return "Muse"; }
+function tokTotal(t) { t = t || {}; return (t.input || 0) + (t.output || 0) + (t.cache_read || 0) + (t.cache_write || 0); }
+load("format.js");
+var AD = window.AD;
+var fmtN = AD.fmtN, fmtUsd = AD.fmtUsd, fmtDur = AD.fmtDur, fmtPct = AD.fmtPct, fmtBytes = AD.fmtBytes;
+["activity.js", "burnup.js", "depgraph.js", "phases.js", "plan-progress.js", "tables.js", "tiles.js", "ws-cards.js", "project-home.js", "planned.js", "manage.js", "switcher.js"].forEach(load);
+var W = window;
+var seen = [];
+function hover(s) { seen.push(String(s)); return s; }
+assert.strictEqual(fmtN(123456789), "123.5M");
+assert.strictEqual(fmtN(null), "-");
+assert.strictEqual(fmtUsd(1234567.891), "$1.2M");
+assert.strictEqual(fmtDur(98765), "27h 26m");
+assert.strictEqual(fmtPct(0.6233), "62%");
+assert.strictEqual(fmtPct(0.043), "4.3%");
+assert.strictEqual(fmtBytes(950), "950 B");
+assert.strictEqual(fmtBytes(1234567), "1.2 MB");
+assert.strictEqual(W.actLegendTip("Claude", 123456789), "Claude 123.5M tokens");
+assert.strictEqual(W.planColbarTip(123456, 789012), "123.5K of 789K done in this section");
+assert.strictEqual(W.swCountAria(123456), "Switch workstream, 123.5K open workstreams. Shortcut: slash.");
+hover(W.actLegendTip("Claude", 123456789));
+hover(W.actTimelineAria(123456, 120000, 3000, 400, 56));
+hover(W.actConcAria("Claude", 98765));
+hover(W.burnupLegendTip("WS9", 123456789, "tokens", fmtN, false));
+hover(W.burnupTasksAria(123456, 789012));
+W.burnupDoneRows(123456, 789012).forEach(function (r) { hover(r.v); });
+W.burnupWsRow(123456, "c").forEach(function (r) { hover(r.v); });
+hover(W.depTaskLine({done: 123456, total: 789012, pct: 16}));
+W.depTipRows({state: "active", progress: {done: 123456, total: 789012, pct: 16}, live_agents: 123456789}, 12345, 6789).forEach(function (r) { hover(r.v); });
+hover(W.depAriaTip(12345, 1234567, 234567, 34567));
+W.phaseSegTip("Planning", "cost", 1234567.891, 9876543.21, "var(--x)").forEach(function (r) { hover(r.v); });
+W.phaseSegTip("Execution", "tokens", 123456789, 234567890, "var(--y)").forEach(function (r) { hover(r.v); });
+hover(W.phaseFmt("cost", 1234567.891));
+W.phaseStackDays({days: [1700000000], series: {planning: {tokens: [123456789]}, execution: {tokens: [23456789]}}}, "tokens").stacks.forEach(function (col) { W.phaseStackTip("tokens", col.segs, col.total).forEach(function (r) { hover(r.v); hover(r.k); }); });
+W.phaseStackDays({days: [1700000000], series: {planning: {cost: [1234567.891]}, execution: {cost: [234567.891]}}}, "cost").stacks.forEach(function (col) { W.phaseStackTip("cost", col.segs, col.total).forEach(function (r) { hover(r.v); hover(r.k); }); });
+var bar = W.phaseBar({planning: {tokens: 123456789}, execution: {tokens: 23456789}});
+hover(bar.title);
+hover(bar.attrs["aria-label"]);
+hover(W.planAttText({runs: 123456, reviews: 7890, sentBack: 1234}));
+hover(W.planSecTip({done: 123456, wip: 23456, pr: 3456, prog: 456, todo: 78901, deferred: 1234}, 54321, 4321));
+hover(W.planColbarTip(123456, 789012));
+hover(W.planBigAria(123456, 789012));
+hover(W.planBigTip({done: 123456, wip: 23456, pr: 3456, prog: 456, todo: 78901, deferred: 1234}));
+W.tipRows({tokens: {input: 90000000, output: 20000000, cache_read: 10000000, cache_write: 3456789}, elapsed_s: 98765, status: "done", verdict: "PASS"}).forEach(function (r) { hover(r.v); });
+hover(W.tileTokensTitle(123456789, 98765432));
+hover(W.tileTokensApproxTitle(123456789, 98765432));
+hover(W.tileCostTitle(1234567.891, 234567.891));
+hover(W.tileCostApproxTitle(1234567.891, 234567.891));
+hover(W.tileFinTitle(123456, 23456));
+hover(W.tileFinApproxTitle(123456, 23456));
+hover(W.tileLiveTitle(123456, 23456));
+hover(W.tileLiveApproxTitle(123456, 23456));
+hover(JSON.stringify(W.tileCountChip(123456789, 100, "vs 24 h ago", W.tileLiveTitle(123456789, 100))));
+hover(JSON.stringify(W.tilePctChip(123456789, 100000000, "vs prior 24 h", W.tileTokensTitle(123456789, 100000000))));
+hover(W.wsProgAria("WS9", 123456, 789012, 16));
+hover(W.wsProgTitle(123456, {pr: 23456, prog: 3456, wip: 456, todo: 78901, deferred: 1234}, 789012));
+hover(W.wsPlanTitle(123456, {pr: 23456, prog: 3456, wip: 456, todo: 78901, deferred: 1234}, 789012));
+hover(W.phProgAria("WS9", 123456, 789012));
+hover(W.plProgAria("WS9", 123456, 789012));
+hover(W.mgProgAria("WS9", 123456, 789012, 16));
+hover(W.swCountAria(123456));
+assert.ok(seen.length >= 40, "only " + seen.length + " hover strings reached the check");
+var bad = seen.filter(function (s) { return /\d{5,}/.test(s) || /\d,\d{3}/.test(s); });
+assert.deepStrictEqual(bad, [], "raw numbers survived in hover text: " + JSON.stringify(bad.slice(0, 5)));
+console.log("hover builders proof ok: " + seen.length + " strings compact");
+'''
+        files = (
+            [STATIC / "format.js"]
+            + [STATIC / "cards" / name for name in ("activity.js", "burnup.js", "depgraph.js", "phases.js", "plan-progress.js", "tables.js", "tiles.js", "ws-cards.js", "project-home.js", "planned.js")]
+            + [STATIC / "core" / name for name in ("manage.js", "switcher.js")]
+        )
+        proc = subprocess.run(
+            ["node", "-e", harness] + [str(p) for p in files],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr or proc.stdout)
+        self.assertIn("hover builders proof ok", proc.stdout)
+
     def test_progress_comes_from_the_server(self):
         """Plan % done is computed once on the server. The pages read
         progress.pct/.done/.total; they never compute it from task counts."""
@@ -2573,7 +2779,8 @@ class FinalPolishTests(unittest.TestCase):
         self.assertIn('role: "img"', act)
         self.assertIn("in the selected range", act)
         self.assertIn("total", act)
-        self.assertIn('"aria-label": "Agent runs in the selected range', act)
+        self.assertIn('"aria-label": actTimelineAria(', act)
+        self.assertIn("Agent runs in the selected range", act)
         self.assertIn("died or blocked, ", act)
         burn = (STATIC / "cards" / "burnup.js").read_text()
         self.assertIn('"aria-label": label', burn)

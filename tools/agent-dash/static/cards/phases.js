@@ -17,8 +17,9 @@
    state.phaseUsageAt, state.view, state.ws, state.wss/wssAll.
    Exports (on window.AdPage.cards, also kept as plain globals):
    phaseUsageSpec, phaseUsageCard, phaseUsageAllSpec, phaseUsageWsSpec,
-   phaseUsageWsCard, phaseBar, phaseShares, cumSum, phaseStackDays.
-   Needs: el, s, CW, axes, niceMax, fmtN, fmtUsd, showTip, hideTip,
+   phaseUsageWsCard, phaseBar, phaseShares, cumSum, phaseStackDays,
+   phaseSegTip, phaseFmt, phaseStackTip.
+   Needs: el, s, CW, axes, niceMax, fmtN, fmtUsd, fmtPct, showTip, hideTip,
    keyOf, drawMain, api, go, secCache, state (plain globals). */
 (function (global) {
   "use strict";
@@ -108,33 +109,29 @@
 
   var phaseWsView = "bars";
 
-  /* Exact integers with thousand separators and exact dollars, without
-     locale formatting (page rule: compact fmt helpers for axes, exact
-     text only inside tooltips and titles). */
-  function phaseExact(n) {
-    var s = String(Math.round(+n || 0)), out = "", i;
-    var neg = s.charAt(0) === "-";
-    if (neg) s = s.slice(1);
-    for (i = 0; i < s.length; i++) {
-      if (i && (s.length - i) % 3 === 0) out += ",";
-      out += s.charAt(i);
-    }
-    return (neg ? "-" : "") + out;
-  }
-
-  function phaseExactUsd(n) {
-    var cents = Math.round((+n || 0) * 100), neg = cents < 0;
-    if (neg) cents = -cents;
-    var body = phaseExact(Math.floor(cents / 100)) + "." + (cents % 100 < 10 ? "0" : "") + String(cents % 100);
-    return (neg ? "-$" : "$") + body;
-  }
-
-  /* Every painted number routes through the shared compact formatters. */
+  /* Every number the user sees — painted or on hover — routes through the
+     shared compact formatters. Exact values stay in data-v attributes. */
   function phaseFmtN(n) { return fmtN(n); }
   function phaseFmtUsd(n) { return fmtUsd(n); }
   function phaseFmt(metric, n) { return metric === "cost" ? phaseFmtUsd(n) : phaseFmtN(n); }
+  function phaseUnit(metric) { return metric === "cost" ? "" : " tokens"; }
 
-  function phaseExactFmt(metric, n) { return metric === "cost" ? phaseExactUsd(n) : phaseExact(n) + " tokens"; }
+  /* Pure hover-text builders: one segment line plus the row total. */
+  function phaseSegTip(word, metric, value, total, color) {
+    return [{k: word, v: phaseFmt(metric, value) + phaseUnit(metric), c: color}, {k: "Total", v: phaseFmt(metric, total) + phaseUnit(metric), c: "var(--ink)"}];
+  }
+
+  /* Pure hover-text builder for one per-day stacked column: one line per
+     kind of work with its compact value and fmtPct share, plus the total.
+     segs are phaseStackDays segments ({phase, value, share}). */
+  function phaseStackTip(metric, segs, total) {
+    var rows = (segs || []).filter(function (sg) { return sg.value > 0; }).map(function (sg) {
+      return {k: PHASE_GLYPH[sg.phase] + " " + PHASE_WORD[sg.phase] + " " + fmtPct(sg.share),
+        v: phaseFmt(metric, sg.value) + phaseUnit(metric), c: PHASE_COLOR[sg.phase]};
+    });
+    rows.push({k: "Total", v: phaseFmt(metric, total) + phaseUnit(metric), c: "var(--ink)"});
+    return rows;
+  }
 
   function wsLabel(ws, name) {
     if (!name || String(name).toUpperCase() === String(ws).toUpperCase()) return String(name || ws);
@@ -211,7 +208,7 @@
     phaseShares(cells).forEach(function (c) {
       if (!c.value) return;
       var sp = el("span", {class: "lentry", "data-key": c.phase, "data-v": String(c.value),
-        title: PHASE_WORD[c.phase] + " " + phaseExactFmt(metric, c.value)});
+        title: PHASE_WORD[c.phase] + " " + phaseFmt(metric, c.value) + phaseUnit(metric)});
       var sw = el("i", {class: "sw"});
       sw.style.background = PHASE_COLOR[c.phase];
       sp.appendChild(sw);
@@ -244,12 +241,11 @@
     phaseShares(cells).forEach(function (c) {
       if (!(c.value > 0) || !(c.share > 0)) return;
       var seg = el("div", {class: "ph-seg", "data-key": c.phase, "data-v": String(c.value),
-        title: label + " \u00B7 " + PHASE_WORD[c.phase] + " " + phaseExactFmt(metric, c.value)});
+        title: label + " \u00B7 " + PHASE_WORD[c.phase] + " " + phaseFmt(metric, c.value) + phaseUnit(metric)});
       seg.style.width = (c.share * 100) + "%";
       seg.style.background = PHASE_COLOR[c.phase];
       seg.addEventListener("mousemove", function (ev) {
-        showTip(ev, label, [{k: PHASE_GLYPH[c.phase] + " " + PHASE_WORD[c.phase], v: phaseExactFmt(metric, c.value), c: PHASE_COLOR[c.phase]},
-          {k: "Total", v: phaseExactFmt(metric, total), c: "var(--ink)"}]);
+        showTip(ev, label, phaseSegTip(PHASE_GLYPH[c.phase] + " " + PHASE_WORD[c.phase], metric, c.value, total, PHASE_COLOR[c.phase]));
       });
       seg.addEventListener("mouseleave", hideTip);
       bar.appendChild(seg);
@@ -325,8 +321,7 @@
       return acc + phaseValue(((w.by_phase || {}).unclassified), phaseMetric);
     }, 0);
     if (grand > 0) {
-      var pct = Math.round(unc / grand * 1000) / 10;
-      foot.appendChild(el("span", {class: "ph-other", text: " \u00B7 " + pct + "% reads Unclassified"}));
+      foot.appendChild(el("span", {class: "ph-other", text: " \u00B7 " + fmtPct(unc / grand) + " reads Unclassified"}));
     }
     c.appendChild(foot);
     var take = phaseTakeaway(data.workstreams, phaseMetric);
@@ -358,10 +353,10 @@
     var shares = phaseShares(cells);
     var bar = el("div", {class: "mg-phase", role: "img"});
     var tip = shares.filter(function (c) { return c.value > 0; }).map(function (c) {
-      return PHASE_WORD[c.phase] + " " + phaseExact(c.value);
+      return PHASE_WORD[c.phase] + " " + phaseFmtN(c.value);
     }).join(" \u00B7 ");
     bar.setAttribute("aria-label", "Lifetime tokens by kind of work: " + tip);
-    bar.title = "Lifetime tokens by kind of work \u2014 " + tip + " \u00B7 " + phaseExact(total) + " total";
+    bar.title = "Lifetime tokens by kind of work \u2014 " + tip + " \u00B7 " + phaseFmtN(total) + " total";
     ["planning", "execution"].forEach(function (ph) {
       var cell = null;
       shares.forEach(function (c) { if (c.phase === ph) cell = c; });
@@ -410,7 +405,6 @@
     });
     var nice = niceMax(peak);
     var yFmt = m === "cost" ? fmtUsd : fmtN;
-    var exact = m === "cost" ? phaseExactUsd : function (v) { return phaseExact(v) + " tokens"; };
     var W = CW(), H = 240, L = 64, R = 14, T = 24, Bm = 44;
     var pw = W - L - R, ph = H - T - Bm;
     var n = Math.max(1, days.length);
@@ -425,7 +419,7 @@
       var last = cum.length ? cum[cum.length - 1] : 0;
       var dot = s("circle", {cx: X(days[days.length - 1]), cy: Y(last), r: "3.5", fill: PHASE_COLOR[phase], "data-key": phase, "data-v": String(last)});
       dot.addEventListener("mousemove", function (ev) {
-        showTip(ev, PHASE_GLYPH[phase] + " " + PHASE_WORD[phase], [{k: "Cumulative", v: exact(last), c: PHASE_COLOR[phase]}]);
+        showTip(ev, PHASE_GLYPH[phase] + " " + PHASE_WORD[phase], [{k: "Cumulative", v: phaseFmt(m, last) + phaseUnit(m), c: PHASE_COLOR[phase]}]);
       });
       dot.addEventListener("mouseleave", hideTip);
       svg.appendChild(dot);
@@ -447,7 +441,8 @@
   /* Per-day stacked columns for one workstream: one column per UTC day,
      one rect segment per kind of work from the by-day series. The shared
      axes() helper draws both axes; compact formatters label them while
-     tooltips carry exact values. Totals label the last few bars. */
+     tooltips carry compact values (exact figures stay in data-v
+     attributes). Totals label the last few bars. */
   function phaseStackedBars(host, item, metric, range) {
     var m = metric === "tokens" ? "tokens" : "cost";
     var stacked = phaseStackDays(item, m, range);
@@ -479,12 +474,7 @@
           "data-key": sg.phase, "data-v": String(sg.value), "data-t": String(col.day)});
         svg.appendChild(r); y0 = top;
       });
-      var pct = function (sg) { return col.total > 0 ? Math.round(sg.value / col.total * 1000) / 10 : 0; };
-      var tipRows = col.segs.filter(function (sg) { return sg.value > 0; }).map(function (sg) {
-        return {k: PHASE_GLYPH[sg.phase] + " " + PHASE_WORD[sg.phase] + " " + pct(sg) + "%",
-          v: phaseExactFmt(m, sg.value), c: PHASE_COLOR[sg.phase]};
-      });
-      tipRows.push({k: "Total", v: phaseExactFmt(m, col.total), c: "var(--ink)"});
+      var tipRows = phaseStackTip(m, col.segs, col.total);
       var hit = s("rect", {x: x - 1, y: T, width: bw + 2, height: ph, fill: "transparent",
         "data-t": String(col.day), "data-v": String(col.total)});
       hit.addEventListener("mousemove", function (ev) {
@@ -624,5 +614,11 @@
   global.phaseShares = phaseShares;
   global.cumSum = cumSum;
   global.phaseStackDays = phaseStackDays;
+  global.phaseSegTip = phaseSegTip;
+  global.phaseFmt = phaseFmt;
+  global.phaseStackTip = phaseStackTip;
+  AdPage.cards.phaseSegTip = phaseSegTip;
+  AdPage.cards.phaseFmt = phaseFmt;
+  AdPage.cards.phaseStackTip = phaseStackTip;
 })(window);
 

@@ -16,7 +16,25 @@
   }
 
   function fmtN(n) {
-    return NF.format(+n || 0);
+    if (n == null || !isFinite(+n)) return "-";
+    return NF.format(+n);
+  }
+
+  /* Shares as percents: one decimal only below 10 percent ("62%", "4.3%"). */
+  function fmtPct(share) {
+    if (share == null || !isFinite(+share)) return "–";
+    var pct = (+share) * 100;
+    if (Math.abs(pct) >= 10) return Math.round(pct) + "%";
+    return (Math.round(pct * 10) / 10) + "%";
+  }
+
+  /* Byte counts, compact like fmtN ("950 B", "1.2 KB", "3.4 MB"). */
+  function fmtBytes(n) {
+    if (n == null || !isFinite(+n)) return "–";
+    var v = Math.max(0, +n), units = ["B", "KB", "MB", "GB", "TB"], u = 0;
+    while (v >= 1000 && u < units.length - 1) { v /= 1000; u++; }
+    if (!u) return Math.round(v) + " B";
+    return (Math.round(v * 10) / 10) + " " + units[u];
   }
 
   function fmtUsd(n) {
@@ -162,5 +180,5 @@
     return a.w + k * (b.w - a.w);
   }
 
-  global.AD = {fmtHour: fmtHour, fmtN: fmtN, fmtUsd: fmtUsd, fmtDur: fmtDur, fmtDate: fmtDate, fmtT: fmtT, axes: axes, timeTicks: timeTicks, warpTime: warpTime, warpPos: warpPos};
+  global.AD = {fmtHour: fmtHour, fmtN: fmtN, fmtUsd: fmtUsd, fmtDur: fmtDur, fmtDate: fmtDate, fmtT: fmtT, fmtPct: fmtPct, fmtBytes: fmtBytes, axes: axes, timeTicks: timeTicks, warpTime: warpTime, warpPos: warpPos};
 })(window);

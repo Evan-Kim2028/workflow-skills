@@ -72,6 +72,14 @@
   /* One-decimal pixel rounding for path data (compact-formatter rule:
      no toFixed outside the shared helpers). */
   function actR1(x) { return Math.round(x * 10) / 10; }
+
+  /* Pure hover-text builders: every number the user sees on hover is
+     compact (fmtN), with the exact value left to data-v/data-t attrs. */
+  function actLegendTip(name, total) { return name + " " + fmtN(total) + " tokens"; }
+  function actTimelineAria(n, ok, part, bad, run) {
+    return "Agent runs in the selected range, one lane per model family: " + fmtN(n) + " runs, " + fmtN(ok) + " finished, " + fmtN(part) + " partial, " + fmtN(bad) + " died or blocked, " + fmtN(run) + " running";
+  }
+  function actConcAria(name, peak) { return name + " live runs in the selected range, peak " + fmtN(peak); }
   /* Pixel<->time on one shared axis: time t in [from, to] sits at pixel
      x in [L, L+pw]. Clamped, so a bar edge past the window lands on it. */
   function actTimeToX(t, from, to, L, pw) {
@@ -457,7 +465,7 @@
     function mkHandle(edge) {
       var vis = s("rect", {y: trackY - 5, width: 8, height: trackH + 10, rx: 4, fill: "var(--s1)", class: "act-handle"});
       var edgeT = edge === "from" ? range0.from : range0.to;
-      var hit = s("rect", {y: 4, height: H - 8, width: 26, fill: "transparent", class: edge === "from" ? "act-hit act-handle-from" : "act-hit act-handle-to", tabindex: "0", role: "slider", "aria-label": edge === "from" ? "Selection start" : "Selection end", "aria-valuemin": String(Math.round(loaded.t0)), "aria-valuemax": String(Math.round(loaded.t1)), "aria-valuenow": String(Math.round(edgeT)), "aria-valuetext": fmtDate(edgeT)});
+      var hit = s("rect", {y: 4, height: H - 8, width: 26, fill: "transparent", class: edge === "from" ? "act-hit act-handle-from" : "act-hit act-handle-to", tabindex: "0", role: "slider", "aria-label": edge === "from" ? "Selection start" : "Selection end", "aria-valuemin": String(Math.round(loaded.t0)), "aria-valuemax": String(Math.round(loaded.t1)), "aria-valuenow": String(Math.round(edgeT)), "aria-valuetext": fmtDate(edgeT)}); // page-rule-allow: slider bounds stay epoch seconds; the announced value is the fmtDate valuetext
       hit.style.cursor = "ew-resize";
       hit.addEventListener("pointerdown", function (ev) { startDrag(ev, edge); });
       hit.addEventListener("keydown", function (ev) { keyEdge(ev, edge); });
@@ -586,7 +594,7 @@
       ks.forEach(function (k) { var f = ADM.famOf(k); famTot[f] = (famTot[f] || 0) + (keyTot[k] || 0); });
       ADM.FAMS.forEach(function (f) {
         if (!famTot[f]) return;
-        var sp = el("span", {class: "lentry", "data-key": f, "data-v": String(famTot[f]), title: ADM.FAM[f].name + " " + famTot[f] + " tokens"});
+        var sp = el("span", {class: "lentry", "data-key": f, "data-v": String(famTot[f]), title: actLegendTip(ADM.FAM[f].name, famTot[f])});
         var sw = el("i", {class: "sw"}); sw.style.background = ADM.famColor(f); sp.appendChild(sw);
         sp.appendChild(el("span", {class: "lname", text: ADM.FAM[f].name}));
         sp.appendChild(el("span", {class: "lv", text: fmtN(famTot[f])}));
@@ -595,7 +603,7 @@
     } else {
       ks.forEach(function (k) {
         if (!keyTot[k]) return;
-        var sp = el("span", {class: "lentry", "data-key": k, "data-v": String(keyTot[k]), title: k + " " + keyTot[k] + " tokens"});
+        var sp = el("span", {class: "lentry", "data-key": k, "data-v": String(keyTot[k]), title: actLegendTip(k, keyTot[k])});
         var sw = el("i", {class: "sw"}); sw.style.background = colorOf(k, state.groupBy); sp.appendChild(sw);
         sp.appendChild(el("span", {class: "lname", text: k}));
         sp.appendChild(el("span", {class: "lv", text: fmtN(keyTot[k])}));
@@ -737,7 +745,7 @@
     var plotB = yy - 10, H = Math.ceil(plotB + 32);
     var ocCount = {run: 0, ok: 0, part: 0, bad: 0, unk: 0};
     R.forEach(function (r) { ocCount[outcomeOf(r)]++; });
-    var svg = s("svg", {viewBox: "0 0 " + W + " " + H, width: W, height: H, style: "display:block;max-width:100%", role: "img", "data-strip": "timeline", "data-x-from": String(Math.round(from)), "data-x-to": String(Math.round(to)), "aria-label": "Agent runs in the selected range, one lane per model family: " + R.length + " runs, " + ocCount.ok + " finished, " + ocCount.part + " partial, " + ocCount.bad + " died or blocked, " + ocCount.run + " running"});
+    var svg = s("svg", {viewBox: "0 0 " + W + " " + H, width: W, height: H, style: "display:block;max-width:100%", role: "img", "data-strip": "timeline", "data-x-from": String(Math.round(from)), "data-x-to": String(Math.round(to)), "aria-label": actTimelineAria(R.length, ocCount.ok, ocCount.part, ocCount.bad, ocCount.run)});
     var defs = s("defs", {}); var pat = s("pattern", {id: "act-hatch", width: 6, height: 6, patternUnits: "userSpaceOnUse", patternTransform: "rotate(45)"}); pat.appendChild(s("rect", {width: 6, height: 6, fill: "var(--surface-2)"})); pat.appendChild(s("line", {x1: 0, y1: 0, x2: 0, y2: 6, stroke: "var(--muted)", "stroke-width": 2})); defs.appendChild(pat); svg.appendChild(defs);
     /* Gridlines on the shared ticks in every lane; labels only bottom. */
     var gTicks = withX ? st.ticks : [];
@@ -758,7 +766,7 @@
       var act = R.filter(function (r) { return isAgent(r) && r.started_at <= tt && runEnd(r, now) >= tt; });
       var byF = {};
       act.forEach(function (r) { var f = actFamOfRun(r); byF[f] = (byF[f] || 0) + 1; });
-      showTip(ev, "agents at " + fmtT(tt), [{k: "running", v: String(act.length)}].concat(order.filter(function (f) { return byF[f]; }).map(function (f) { return {k: actFamName(f), v: String(byF[f]), c: actFamHue(f)}; })));
+      showTip(ev, "agents at " + fmtT(tt), [{k: "running", v: fmtN(act.length)}].concat(order.filter(function (f) { return byF[f]; }).map(function (f) { return {k: actFamName(f), v: fmtN(byF[f]), c: actFamHue(f)}; })));
       var root = svg.parentNode && svg.parentNode.parentNode;
       if (root && root.actCrossMove) root.actCrossMove(tt);
     });
@@ -898,7 +906,7 @@
     head.appendChild(el("span", {class: "conc-pk", text: "pk " + peak}));
     wrap.appendChild(head);
     var W = g.W, L = g.L, R = g.R, H = withX ? 112 : 72, T = 20, Bm = withX ? 36 : 10, pw = g.pw, ph = H - T - Bm;
-    var svg = s("svg", {viewBox: "0 0 " + W + " " + H, width: W, height: H, style: "display:block;max-width:100%", role: "img", "data-strip": "conc", "data-fam": fam, "data-peak": String(peak), "data-x-from": String(Math.round(from)), "data-x-to": String(Math.round(to)), "aria-label": ADM.FAM[fam].name + " live runs in the selected range, peak " + peak});
+    var svg = s("svg", {viewBox: "0 0 " + W + " " + H, width: W, height: H, style: "display:block;max-width:100%", role: "img", "data-strip": "conc", "data-fam": fam, "data-peak": String(peak), "data-x-from": String(Math.round(from)), "data-x-to": String(Math.round(to)), "aria-label": actConcAria(ADM.FAM[fam].name, peak)});
     var st = actSharedTicks(range, g), X = st.X, Y = function (v) { return T + ph - ph * v / mx; };
     /* Gridlines on the shared ticks in every strip; labels only bottom. */
     actXGrid(svg, st.ticks, T, T + ph);
@@ -930,8 +938,8 @@
       actConcFams(all).forEach(function (f) {
         var fks = all.filter(function (k) { return ADM.famOf(k) === f; });
         var tot = fks.reduce(function (a, k) { return a + (m[k] || 0); }, 0);
-        rows.push({k: ADM.FAM[f].name, v: String(tot), c: ADM.famColor(f)});
-        fks.forEach(function (k) { if (m[k]) rows.push({k: "\u2003" + ADM.nameOf(k), v: String(m[k]), c: ADM.colorOf(k)}); });
+        rows.push({k: ADM.FAM[f].name, v: fmtN(tot), c: ADM.famColor(f)});
+        fks.forEach(function (k) { if (m[k]) rows.push({k: "\u2003" + ADM.nameOf(k), v: fmtN(m[k]), c: ADM.colorOf(k)}); });
       });
       showTip(ev, fmtT(best.t), rows);
       var root = svg.parentNode && svg.parentNode.parentNode;
@@ -971,6 +979,9 @@
   AdPage.actTickStep = actTickStep;
   AdPage.actRangeKey = actRangeKey;
   AdPage.actRangeLabel = actRangeLabel;
+  AdPage.actLegendTip = actLegendTip;
+  AdPage.actTimelineAria = actTimelineAria;
+  AdPage.actConcAria = actConcAria;
   global.activityCard = activityCard;
   global.actTokenStrip = actTokenStrip;
   global.actTimelineStrip = actTimelineStrip;
@@ -987,5 +998,8 @@
   global.actTickStep = actTickStep;
   global.actRangeKey = actRangeKey;
   global.actRangeLabel = actRangeLabel;
+  global.actLegendTip = actLegendTip;
+  global.actTimelineAria = actTimelineAria;
+  global.actConcAria = actConcAria;
 })(window);
 

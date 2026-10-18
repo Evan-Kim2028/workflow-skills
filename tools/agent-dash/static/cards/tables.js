@@ -27,7 +27,7 @@
    runningToggleLabel, groupRuns, visibleGroups (plus the sessionStorage
    scope helpers on cards).
    Needs: el, tierKey, modelName, fullName, colorOf, tokCell, tokTotal,
-   openRun, showTip, hideTip, fmtN, fmtDur (plain globals). */
+   openRun, showTip, hideTip, fmtN, fmtDur, fmtBytes (plain globals). */
 (function (global) {
   "use strict";
   /* Status is colour plus symbol plus word, never colour alone: the dot
@@ -56,17 +56,17 @@
   }
   function verdictEl(v) {
     var p = verdictPill(v);
-    return el("span", {class: "vpill " + p[0], title: v == null ? "no verdict recorded" : String(v), text: p[1]});
+    return el("span", {class: "vpill " + p[0], title: v == null ? "no verdict recorded" : String(v), text: p[1]}); // page-rule-allow: verdict ids are words, not numbers
   }
 
-  /* Exact-value tooltip rows for a run row: full token digits plus the
-     compact cell text's inputs. */
+  /* Tooltip rows for a run row: compact numbers only (fmtDur/fmtN),
+     with the exact token value left to the row's data attributes. */
   function tipRows(r) {
     var t = r.tokens || {};
     return [
       {k: "Model", v: fullName(tierKey(r))},
       {k: "Elapsed", v: fmtDur(r.elapsed_s)},
-      {k: "Tokens", v: String(tokTotal(t))},
+      {k: "Tokens", v: fmtN(tokTotal(t))},
       {k: "Status", v: (r.status || "unknown") + (r.verdict ? " \u00B7 " + r.verdict : "")}
     ];
   }
@@ -313,7 +313,7 @@
     tr.appendChild(el("td", null, [tier]));
     if (showWs) tr.appendChild(el("td", null, [el("span", {class: "ws", text: r.workstream || "–"})]));
     tr.appendChild(el("td", {class: "n hidephone", text: fmtDur(r.elapsed_s)}));
-    var ob = el("td", {class: "n hidephone", text: fmtN(r.out_bytes) + "B"}); if (r.out_growing) ob.appendChild(el("span", {class: "grow", text: "▲"})); tr.appendChild(ob);
+    var ob = el("td", {class: "n hidephone", text: fmtBytes(r.out_bytes)}); if (r.out_growing) ob.appendChild(el("span", {class: "grow", text: "▲"})); tr.appendChild(ob);
     tr.appendChild(tokCell(r));
     tr.appendChild(el("td", null, [statusEl(r), r.verdict ? verdictEl(r.verdict) : null]));
     return tr;
@@ -339,7 +339,7 @@
     tr.appendChild(el("td", null, [el("span", {class: "ws", text: r.workstream || "–"})]));
     tr.appendChild(sectionCell(r, scope));
     tr.appendChild(el("td", {class: "n hidephone", text: fmtDur(r.elapsed_s)}));
-    var ob = el("td", {class: "n hidephone", text: fmtN(r.out_bytes) + "B"}); if (r.out_growing) ob.appendChild(el("span", {class: "grow", text: "▲"})); tr.appendChild(ob);
+    var ob = el("td", {class: "n hidephone", text: fmtBytes(r.out_bytes)}); if (r.out_growing) ob.appendChild(el("span", {class: "grow", text: "▲"})); tr.appendChild(ob);
     tr.appendChild(tokCell(r));
     tr.appendChild(el("td", null, [statusEl(r), r.verdict ? verdictEl(r.verdict) : null]));
     return tr;
@@ -533,6 +533,8 @@
   global.runsTable = runsTable;
   global.statusEl = statusEl;
   global.verdictPill = verdictPill;
+  global.tipRows = tipRows;
+  AdPage.cards.tipRows = tipRows;
   global.runRow = runRow;
   global.finishedSub = finishedSub;
   global.RUNNING_TOP_N = RUNNING_TOP_N;

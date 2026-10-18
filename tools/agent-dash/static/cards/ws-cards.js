@@ -140,10 +140,10 @@
       }
       if (readyToArchive(w, pr)) name.appendChild(el("span", {class: "prog-pill ready", text: "\u2713 Ready to archive", title: "Plan is 100% — archive after the closing report"}));
       row.appendChild(name);
-      var bar = el("div", {class: "prog-bar", role: "img", "aria-label": tot ? (w.ws + " " + done + " of " + tot + " tasks done (" + pct + "%)") : (w.ws + " has no plan")});
+      var bar = el("div", {class: "prog-bar", role: "img", "aria-label": wsProgAria(w.ws, done, tot, pct)});
       if (tot) {
         progSegs(bar, pc, tot);
-        bar.title = "Done " + done + " \u00B7 to merge " + (pc.pr || 0) + " \u00B7 on prod " + (pc.prog || 0) + " \u00B7 working " + (pc.wip || 0) + " \u00B7 not started " + (pc.todo || 0) + " of " + tot + " tasks";
+        bar.title = wsProgTitle(done, pc, tot);
       }
       row.appendChild(bar);
       row.appendChild(el("span", {class: "prog-pct", text: tot ? pct + "%" : "\u2014"}));
@@ -231,6 +231,12 @@
     go2();
     clearInterval(window.__adProgT); window.__adProgT = setInterval(function () { if (document.body.contains(host)) go2(); else clearInterval(window.__adProgT); }, 30000);
   }};
+  /* Pure hover-text builders: compact counts only (fmtN). */
+  function wsProgAria(ws, done, tot, pct) { return tot ? (ws + " " + fmtN(done) + " of " + fmtN(tot) + " tasks done (" + pct + "%)") : (ws + " has no plan"); }
+  function wsProgTitle(done, pc, tot) { return "Done " + fmtN(done) + " \u00B7 to merge " + fmtN(pc.pr || 0) + " \u00B7 on prod " + fmtN(pc.prog || 0) + " \u00B7 working " + fmtN(pc.wip || 0) + " \u00B7 not started " + fmtN(pc.todo || 0) + " of " + fmtN(tot) + " tasks"; }
+  function wsPlanTitle(done, pc, tot) {
+    return "From the workstream plan: " + fmtN(done) + " done, " + fmtN(pc.prog || 0) + " merged waiting on prod, " + fmtN(pc.pr || 0) + " waiting to merge, " + fmtN(pc.todo || 0) + " not started" + (pc.deferred ? ", " + fmtN(pc.deferred) + " deferred (not counted)" : "");
+  }
   function wsCard(id, name, live, tokens, cost, pr, clickable) {
     var pc = (pr && pr.counts) || {}, tot = (pr && pr.total) || 0, pct = (pr && pr.pct) || 0, done = (pr && pr.done) || 0;
     var attrs = {class: "card wsc", "data-wsc": id, "data-ws": "all", "data-hours": "24", "data-tokens": String(tokens || 0), "data-cost-usd": String(cost || 0)};
@@ -246,14 +252,14 @@
     var card = el("div", attrs);
     var top = el("div", {class: "top"}, [el("span", {class: "id", text: id}), el("span", {class: "st " + (live ? "running" : "done")}, [el("i"), live ? live + " running" : "idle"])]);
     card.appendChild(top); card.appendChild(el("div", {class: "wsc-name", text: name || ""}));
-    var bar = el("div", {class: "bar", role: "img", "aria-label": done + " of " + tot + " plan tasks done"});
+    var bar = el("div", {class: "bar", role: "img", "aria-label": fmtN(done) + " of " + fmtN(tot) + " plan tasks done"});
     if (tot) {
       progSegs(bar, pc, tot);
-      bar.title = "Done " + done + " \u00B7 to merge " + (pc.pr || 0) + " \u00B7 on prod " + (pc.prog || 0) + " \u00B7 working " + (pc.wip || 0) + " of " + tot + " tasks";
+      bar.title = wsProgTitle(done, pc, tot);
     }
     card.appendChild(bar);
     var meta = el("div", {class: "wsc-meta"});
-    meta.appendChild(el("div", {class: "wsc-plan", title: tot ? ("From the workstream plan: " + done + " done, " + (pc.prog || 0) + " merged waiting on prod, " + (pc.pr || 0) + " waiting to merge, " + (pc.todo || 0) + " not started" + (pc.deferred ? ", " + pc.deferred + " deferred (not counted)" : "")) : "No plan for this workstream", text: tot ? (done + "/" + tot + " tasks (" + pct + "%)") : "No plan"}));
+    meta.appendChild(el("div", {class: "wsc-plan", title: tot ? wsPlanTitle(done, pc, tot) : "No plan for this workstream", text: tot ? (done + "/" + tot + " tasks (" + pct + "%)") : "No plan"}));
     meta.appendChild(el("div", {class: "wsc-use", text: fmtN(tokens) + " tokens \u00B7 " + fmtUsd(cost)}));
     card.appendChild(meta);
     return card;
@@ -288,6 +294,12 @@
   global.programPanel = programPanel;
   global.wsCard = wsCard;
   global.wsCards = wsCards;
+  global.wsProgAria = wsProgAria;
+  global.wsProgTitle = wsProgTitle;
+  global.wsPlanTitle = wsPlanTitle;
+  AdPage.cards.wsProgAria = wsProgAria;
+  AdPage.cards.wsProgTitle = wsProgTitle;
+  AdPage.cards.wsPlanTitle = wsPlanTitle;
   Object.defineProperty(global, "planSum", {
     configurable: true,
     get: function () { return planSum; },

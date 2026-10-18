@@ -487,13 +487,15 @@
     return host;
   }
 
+  /* Pure hover-text builder: compact counts only (fmtN). */
+  function mgProgAria(ws, done, tot, pct) { return tot ? (ws + " " + fmtN(done) + " of " + fmtN(tot) + " tasks done (" + pct + "%)") : (ws + " has no plan"); }
   function progressCell(row) {
     var pr = row.progress || {};
     var pct = typeof pr.pct === "number" ? pr.pct : null;
     var done = pr.done || 0, tot = pr.total || 0;
     var wrap = el("span", {class: "mg-prog"});
     var bar = el("span", {class: "prog-bar", role: "img",
-      "aria-label": tot ? (row.ws + " " + done + " of " + tot + " tasks done (" + pct + "%)") : (row.ws + " has no plan")});
+      "aria-label": mgProgAria(row.ws, done, tot, pct)});
     if (tot && pct != null) {
       var fill = el("span");
       fill.style.width = pct + "%";
@@ -549,7 +551,7 @@
       var doneRows = tableRowsUnfiltered().filter(function (w) { return ADT.wsStateOf(w) === "done" && has(w.allowed_actions, "archive"); });
       arch.disabled = !doneRows.length;
       arch.textContent = "Archive done (" + fmtN(doneRows.length) + ")";
-      arch.setAttribute("aria-label", "Archive every done workstream, " + doneRows.length + ", after one confirm");
+      arch.setAttribute("aria-label", "Archive every done workstream, " + fmtN(doneRows.length) + ", after one confirm");
     }
   }
 
@@ -926,4 +928,6 @@
   global.openConfirm = openConfirm;
   global.manageEnabled = manageEnabled;
   global.reverseOf = reverseOf;
+  global.mgProgAria = mgProgAria;
+  AdM.manage.mgProgAria = mgProgAria;
 })(window);

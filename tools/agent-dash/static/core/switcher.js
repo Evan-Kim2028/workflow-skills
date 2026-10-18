@@ -111,6 +111,8 @@
   function rowLabel(r) {
     return r.ws + (r.name ? " " + r.name : "");
   }
+  /* Pure hover-text builder: compact counts only (fmtN). */
+  function swCountAria(n) { return "Switch workstream, " + fmtN(n) + " open workstreams. Shortcut: slash."; }
   /* Run-attributed rows carry no board name; the bundle title is the
      honest fallback so every row names its workstream. */
   function titleOf(ws, name) {
@@ -179,7 +181,7 @@
     if (sw) {
       var n = openCount();
       sw.textContent = "Workstreams (" + fmtN(n) + ")";
-      sw.setAttribute("aria-label", "Switch workstream, " + n + " open workstreams. Shortcut: slash.");
+      sw.setAttribute("aria-label", swCountAria(n));
     }
     renderPins();
   }
@@ -350,7 +352,7 @@
       tools.appendChild(q);
     }
     var star = el("button", {type: "button", class: "ws-pin" + (pins.indexOf(String(r.ws).toUpperCase()) >= 0 ? " on" : ""),
-      text: "\u2605", title: pins.indexOf(String(r.ws).toUpperCase()) >= 0 ? "Unpin " + r.ws : "Pin " + r.ws + " (up to three)"});
+      text: "\u2605", title: pins.indexOf(String(r.ws).toUpperCase()) >= 0 ? "Unpin " + r.ws : "Pin " + r.ws + " (up to three)"}); // page-rule-allow: workstream ids are names, not numbers
     var pinned = pins.indexOf(String(r.ws).toUpperCase()) >= 0;
     star.setAttribute("aria-label", (pinned ? "Unpin " : "Pin ") + rowLabel(r));
     star.setAttribute("aria-pressed", pinned ? "true" : "false");
@@ -433,4 +435,6 @@
   global.pickWs = pickWs;
   global.switcherRows = switcherRows;
   global.stateGlyph = stateGlyph;
+  global.swCountAria = swCountAria;
+  AdSw.switcher.swCountAria = swCountAria;
 })(window);

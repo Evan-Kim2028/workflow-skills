@@ -178,6 +178,8 @@
     var pr = row.progress || {done: 0, total: 0};
     return {done: pr.done || 0, total: pr.total || 0};
   }
+  /* Pure hover-text builder: compact counts only (fmtN). */
+  function phProgAria(ws, done, total) { return ws + " " + fmtN(done) + " of " + fmtN(total) + " tasks done"; }
 
   /* Planned shelf: one card per planned workstream with its waits-on and
      its ready/not-yet pill (glyph plus word). Readiness comes from the
@@ -193,7 +195,7 @@
       var card = el("div", {class: "card pj-planned"});
       card.appendChild(el("div", {class: "pj-wn", text: w.ws}));
       card.appendChild(el("div", {class: "pj-wt", text: w.name || ""}));
-      var bar = el("div", {class: "prog-bar", role: "img", "aria-label": w.ws + " " + tc.done + " of " + tc.total + " tasks done"});
+      var bar = el("div", {class: "prog-bar", role: "img", "aria-label": phProgAria(w.ws, tc.done, tc.total)});
       if (tc.total) {
         var fill = el("span");
         fill.style.width = (100 * tc.done / tc.total) + "%";
@@ -276,7 +278,7 @@
       name.appendChild(el("span", {class: "prog-pill done", text: "\u2713 Done"}));
       name.appendChild(el("span", {class: "prog-pill ready", text: "\u2713 Ready to archive", title: "Plan is 100% — archive after the closing report"}));
       row.appendChild(name);
-      var bar = el("div", {class: "prog-bar", role: "img", "aria-label": w.ws + " " + tc.done + " of " + tc.total + " tasks done"});
+      var bar = el("div", {class: "prog-bar", role: "img", "aria-label": phProgAria(w.ws, tc.done, tc.total)});
       if (tc.total) {
         var fill = el("span");
         fill.style.width = "100%";
@@ -404,6 +406,8 @@
   AdPage.cards.projectHome = projectHomeSpecs;
   AdPage.PROJECT_SLOTS = PROJECT_SLOTS;
   global.projectHomeSpecs = projectHomeSpecs;
+  global.phProgAria = phProgAria;
+  AdPage.cards.phProgAria = phProgAria;
   global.reportFor = reportFor;
   global.showToast = showToast;
   global.copyCmd = copyCmd;
