@@ -35,12 +35,19 @@
     pr.counts = pr.counts || {};
     return pr;
   }
+  /* One in-flight plan-sum load at a time: concurrent drawMain calls share
+     it instead of stacking fetches, and an empty result (a new dashboard
+     with no plans yet) still settles the promise so callers never retry
+     in a tight loop. */
+  var planSumInflight = null;
   function loadPlanSums() {
-    return Promise.all(shown(state.wss).map(function (w) {
+    if (planSumInflight) return planSumInflight;
+    planSumInflight = Promise.all(shown(state.wss).map(function (w) {
       return api("/api/plan", {ws: w.ws}).then(function (p) {
         planSum[w.ws] = planProg(w, p); planPrompt[w.ws] = p && p.start_prompt;
       }).catch(function () {});
-    })).then(function () { renderTabs(); });
+    })).then(function () { renderTabs(); }).then(function () { planSumInflight = null; }, function () { planSumInflight = null; });
+    return planSumInflight;
   }
   /* Bar segments, in paint order: done green, to-merge amber,
      merged-waiting-on-prod magenta, working-now blue. */

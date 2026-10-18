@@ -1248,6 +1248,260 @@ setTimeout(function () {
         )
         self.assertEqual(proc.returncode, 0, proc.stderr or proc.stdout)
 
+    def _keyof_args(self, text):
+        """Yield each keyOf(...) argument, honouring nesting and strings."""
+        out = []
+        for m in re.finditer(r"keyOf\(", text):
+            i = m.end()
+            depth = 1
+            quote = None
+            escaped = False
+            while i < len(text) and depth:
+                ch = text[i]
+                if quote:
+                    if escaped:
+                        escaped = False
+                    elif ch == "\\":
+                        escaped = True
+                    elif ch == quote:
+                        quote = None
+                elif ch in ("'", '"', "`"):
+                    quote = ch
+                elif ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth -= 1
+                i += 1
+            self.assertEqual(depth, 0, f"keyOf( at offset {m.start()} never closes")
+            out.append(text[m.end():i - 1])
+        return out
+
+    def test_overview_plan_load_terminates(self):
+        """The overview settles on tiny and brand-new dashboards: drawMain
+        loads the plan sums once per workstream set (a done-marker keyed by
+        the set), and the follow-up redraw happens only when the load
+        actually added plan data. An empty planSum (no plans yet) never
+        re-arms another load, so the promise chain terminates."""
+        page = (STATIC / "index.html").read_text()
+        script = inline_scripts()
+        bodies = dict(functions(script))
+        self.assertIn("drawMain", bodies)
+        draw = bodies["drawMain"]
+        self.assertNotIn(
+            "!Object.keys(planSum).length) loadPlanSums",
+            page,
+            "drawMain re-arms the plan load while planSum is empty: "
+            "a plan-less bundle set re-renders forever",
+        )
+        for marker in ("__adPlanSumsKey", "planBefore", "loadPlanSums"):
+            self.assertIn(marker, draw, f"drawMain lost its one-shot plan-load guard: {marker}")
+        self.assertIn("delete secCache.program", draw)
+        self.assertLess(
+            draw.index("planBefore"),
+            draw.index("delete secCache.program"),
+            "the section-cache delete is not gated on the load adding plan data",
+        )
+        cards = (STATIC / "cards" / "ws-cards.js").read_text()
+        load = dict(functions(cards))["loadPlanSums"]
+        self.assertIn(
+            "planSumInflight", load, "concurrent plan loads stack fetches instead of sharing one"
+        )
+        self.assertGreaterEqual(
+            load.count("planSumInflight = null"),
+            2,
+            "an empty/failed plan load never settles its guard",
+        )
+
+    def test_plan_load_settles_empty(self):
+        """loadPlanSums resolves with an empty planSum (no plans yet) and
+        shares one fetch across concurrent calls, so the overview's
+        one-shot guard can rely on it settling instead of looping."""
+        harness = r'''
+const fs = require("fs");
+const assert = require("assert");
+global.window = globalThis;
+global.state = {wss: []};
+global.shown = function (list) { return (list || []).filter(function (w) { return w.plan; }); };
+var apiCalls = 0, failNext = false;
+global.api = function () {
+  apiCalls++;
+  if (failNext) return Promise.reject(new Error("404"));
+  return Promise.resolve(null);
+};
+global.renderTabs = function () {};
+eval(fs.readFileSync(process.argv[2], "utf8"));
+assert.strictEqual(typeof loadPlanSums, "function");
+loadPlanSums().then(function () {
+  assert.deepStrictEqual(Object.keys(planSum), [], "an empty bundle set must keep planSum empty");
+  state.wss = [{ws: "WS1", plan: true}, {ws: "WS2", plan: true}];
+  apiCalls = 0;
+  return Promise.all([loadPlanSums(), loadPlanSums()]);
+}).then(function () {
+  assert.strictEqual(apiCalls, 2, "concurrent loads fetched " + apiCalls + " plans, want one shared load of 2");
+  assert.strictEqual(Object.keys(planSum).length, 2);
+  failNext = true;
+  state.wss = [{ws: "WS9", plan: true}];
+  delete planSum.WS1; delete planSum.WS2;
+  return loadPlanSums();
+}).then(function () {
+  assert.deepStrictEqual(Object.keys(planSum), [], "failed plan fetches must still settle empty");
+  console.log("plan load proof ok");
+}).catch(function (e) { console.error("ASSERT: " + ((e && e.stack) || e)); process.exit(1); });
+'''
+        with tempfile.TemporaryDirectory() as tmp:
+            harness_path = Path(tmp) / "plan_load_settles.js"
+            harness_path.write_text(harness, encoding="utf-8")
+            proc = subprocess.run(
+                ["node", str(harness_path), str(STATIC / "cards" / "ws-cards.js")],
+                capture_output=True,
+                text=True,
+            )
+        self.assertEqual(proc.returncode, 0, proc.stderr or proc.stdout)
+        self.assertIn("plan load proof ok", proc.stdout)
+
+    def test_section_keys_have_no_volatile_values(self):
+        """Section keys decide rebuilds: a key holding an unbucketed clock
+        read, Math.random() or new Date() changes on every render and the
+        page never settles. The one allowed clock read is the minute bucket
+        behind the live charts."""
+        checked = 0
+        for name in (
+            "cards/registry.js",
+            "cards/project-home.js",
+            "cards/planned.js",
+            "cards/archive.js",
+        ):
+            text = (STATIC / name).read_text()
+            for arg in self._keyof_args(text):
+                checked += 1
+                self.assertNotIn(
+                    "Math.random(",
+                    arg,
+                    f"{name} keys on randomness; the section rebuilds every render",
+                )
+                self.assertNotIn(
+                    "new Date(",
+                    arg,
+                    f"{name} keys on a fresh date; the section rebuilds every render",
+                )
+                for m in re.finditer(r"Date\.now\(\)", arg):
+                    before = arg[max(0, m.start() - 11):m.start()]
+                    self.assertTrue(
+                        before.endswith("Math.floor("),
+                        f"{name} keys on an unbucketed clock read; bucket it like the live charts",
+                    )
+        self.assertGreaterEqual(checked, 10, "the key scan found no keyOf( calls to pin")
+
+    def test_applysections_is_idempotent(self):
+        """applySections rebuilds only sections whose key changed: a repeat
+        render with identical keys calls no render fn, a changed key rebuilds
+        only its section, and reorder/removal moves or drops nodes without
+        re-rendering."""
+        harness = r'''
+const fs = require("fs");
+const assert = require("assert");
+global.window = globalThis;
+global.state = {ws: "all", groupBy: "model"};
+global.ADC = {currentKey: function () { return "k"; }, fresh: function () { return true; }, TTL_MS: 30000};
+function mockNode(tag) {
+  return {tag: tag, attrs: {}, kids: [], parentNode: null, style: {},
+    setAttribute: function (k, v) { this.attrs[k] = String(v); },
+    appendChild: function (c) { c.parentNode = this; this.kids.push(c); return c; }};
+}
+global.el = function (tag, attrs, kids) {
+  var n = mockNode(tag);
+  n.attrs = attrs || {};
+  (kids || []).forEach(function (c) { if (c) n.appendChild(c); });
+  return n;
+};
+global.document = {getElementById: function () { return null; }};
+eval(fs.readFileSync(process.argv[2], "utf8"));
+assert.strictEqual(typeof applySections, "function");
+assert.strictEqual(typeof keyOf, "function");
+assert.strictEqual(keyOf({a: 1, b: [1, 2]}), keyOf({a: 1, b: [1, 2]}), "keyOf is not stable");
+assert.notStrictEqual(keyOf([1, 2]), keyOf([1, 3]), "keyOf misses changes");
+function mockMain() {
+  var m = {children: [],
+    insertBefore: function (node, ref) {
+      if (node.parentNode === this) this.children = this.children.filter(function (c) { return c !== node; });
+      var at = ref ? this.children.indexOf(ref) : -1;
+      if (at < 0) this.children.push(node); else this.children.splice(at, 0, node);
+      node.parentNode = this; return node;
+    },
+    replaceChild: function (node, old) {
+      var at = this.children.indexOf(old);
+      assert.ok(at >= 0, "replaceChild of a missing node");
+      this.children[at] = node; node.parentNode = this; old.parentNode = null; return old;
+    },
+    removeChild: function (node) {
+      var at = this.children.indexOf(node);
+      assert.ok(at >= 0, "removeChild of a missing node");
+      this.children.splice(at, 1); node.parentNode = null; return node;
+    }};
+  Object.defineProperty(m, "lastChild", {configurable: true, get: function () { return this.children[this.children.length - 1] || null; }});
+  return m;
+}
+var calls = {};
+function spec(name, key) {
+  return [name, key, function () {
+    calls[name] = (calls[name] || 0) + 1;
+    return mockNode("inner-" + name);
+  }, ""];
+}
+var m = mockMain();
+applySections(m, [spec("a", "k1"), spec("b", "k2")]);
+assert.deepStrictEqual(calls, {a: 1, b: 1});
+assert.strictEqual(m.children.length, 2);
+var aNode = m.children[0], bNode = m.children[1];
+applySections(m, [spec("a", "k1"), spec("b", "k2")]);
+assert.deepStrictEqual(calls, {a: 1, b: 1}, "identical keys re-rendered");
+assert.strictEqual(m.children[0], aNode);
+assert.strictEqual(m.children[1], bNode);
+applySections(m, [spec("a", "k1"), spec("b", "k3")]);
+assert.deepStrictEqual(calls, {a: 1, b: 2}, "a changed key must rebuild only its section");
+assert.strictEqual(m.children[0], aNode);
+assert.notStrictEqual(m.children[1], bNode);
+bNode = m.children[1];
+applySections(m, [spec("b", "k3"), spec("a", "k1")]);
+assert.deepStrictEqual(calls, {a: 1, b: 2}, "reorder must not re-render");
+assert.strictEqual(m.children[0], bNode);
+assert.strictEqual(m.children[1], aNode);
+applySections(m, [spec("b", "k3")]);
+assert.deepStrictEqual(calls, {a: 1, b: 2}, "removal must not re-render");
+assert.strictEqual(m.children.length, 1);
+assert.strictEqual(m.children[0], bNode);
+console.log("applySections proof ok");
+'''
+        with tempfile.TemporaryDirectory() as tmp:
+            harness_path = Path(tmp) / "applysections_idempotent.js"
+            harness_path.write_text(harness, encoding="utf-8")
+            proc = subprocess.run(
+                ["node", str(harness_path), str(STATIC / "core" / "cache.js")],
+                capture_output=True,
+                text=True,
+            )
+        self.assertEqual(proc.returncode, 0, proc.stderr or proc.stdout)
+        self.assertIn("applySections proof ok", proc.stdout)
+
+    def test_render_counter_and_title_guard(self):
+        """The settle check reads window.__adRenders (one increment per
+        drawMain), and the project title observer converges instead of
+        re-applying its own writes."""
+        page = (STATIC / "index.html").read_text()
+        bodies = dict(functions(inline_scripts()))
+        self.assertIn("window.__adRenders", page)
+        self.assertIn(
+            "__adRenders++", bodies["drawMain"], "drawMain never counts renders; the settle check is blind"
+        )
+        core = (STATIC / "core" / "project.js").read_text()
+        self.assertIn("MutationObserver", core)
+        self.assertIn("busy", core, "the title observer lost its re-entrancy guard")
+        self.assertIn(
+            ".proj-name",
+            core,
+            "the observer no longer skips a header that already shows the name",
+        )
+
 
     def test_feed_and_decisions_have_no_doctor_words(self):
         """Neither new card names doctor output: no health/doctor words in

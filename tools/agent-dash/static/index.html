@@ -274,7 +274,20 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible,[ta
     return archiveSpecs(state, snap);
   }
 
+  /* Render counter for the page settle check (scripts/page_settle_check.mjs):
+     drawMain is the one exec/project render entry, so one increment per
+     call bounds idle re-renders. */
+  window.__adRenders = window.__adRenders || 0;
+  /* One plan-sum load per workstream set. A tiny or brand-new dashboard
+     keeps planSum empty (no plans yet), so re-arming the load on every
+     drawMain while planSum is empty re-renders forever: each load settles
+     empty, deletes the program section and draws again, which re-arms the
+     next load. The key below marks the set done even when nothing came
+     back; only a changed set, or a load that actually added plan data,
+     draws again. */
+  window.__adPlanSumsKey = window.__adPlanSumsKey || null;
   function drawMain() {
+    window.__adRenders++;
     renderErrBanner();
     var m = document.getElementById("main");
     var snap = state.snap || {running: [], recent: [], totals: {tokens: {}}};
@@ -296,7 +309,16 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible,[ta
       var sp = card.spec(state, snap);
       if (sp) specs.push(sp);
     });
-    if (state.ws === "all" && state.wss.length && !Object.keys(planSum).length) loadPlanSums().then(function () { delete secCache.program; drawMain(); });
+    if (state.ws === "all" && state.wss.length) {
+      var planSetKey = state.wss.map(function (w) { return w.ws; }).sort().join(",");
+      if (window.__adPlanSumsKey !== planSetKey) {
+        window.__adPlanSumsKey = planSetKey;
+        var planBefore = Object.keys(planSum).length;
+        loadPlanSums().then(function () {
+          if (Object.keys(planSum).length !== planBefore) { delete secCache.program; delete secCache.cards; drawMain(); }
+        });
+      }
+    }
     /* Clip mode shows only the plan progress map; the replay adds the run
        timeline card under it, plus caption and counter strips. */
     if (isClipMode()) {

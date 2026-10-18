@@ -41,6 +41,7 @@
     "scripts/cursor_usage_hook.py": ["test_cursor"],
     "scripts/grok_stream_filter.py": ["test_grok_cli"],
     "scripts/page_check.mjs": ["test_page_rules"],
+    "scripts/page_settle_check.mjs": ["test_page_rules"],
     "scripts/gate.sh": ["test_gate"],
     "scripts/gate_map.json": ["test_gate"],
     "scripts/install_hooks.sh": ["test_gate"],

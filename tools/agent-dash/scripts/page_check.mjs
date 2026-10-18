@@ -12,6 +12,11 @@
  * the DOM read, and a DOM value between the two (or equal to either) is
  * live growth, not a mismatch. Each tab is retried up to 3 times.
  *
+ * Before the tab loop it asserts the page settles: a 3 s sample of the
+ * render counter (window.__adRenders, one per drawMain) must look
+ * quiescent, so a perpetual re-render fails fast instead of wedging the
+ * tab reads.
+ *
  * Exit 0 when everything agrees, 1 with a table on any mismatch, 2 when
  * Chrome is missing (the agent_dash.py wrapper reports a skip then).
  */
@@ -399,6 +404,35 @@ async function main() {
     const tabsExpression = `Array.prototype.map.call(document.querySelectorAll('#tabs .tab'), function (e) { return e.getAttribute("data-ws"); })`;
     await cdp.send("Page.navigate", { url: `${opts.url}/?view=exec&ws=all` });
     await waitForLoad(cdp);
+    {
+      // Settle gate: sample the render count (window.__adRenders, one per
+      // drawMain) until a 3 s window looks quiescent. A perpetual
+      // re-render (a tiny bundle set with no plans kept re-arming the plan
+      // load) raises the count in nearly every poll; a healthy live page
+      // only re-renders on server ticks, seconds apart. Unknown on older
+      // page builds, so a missing counter passes.
+      const deadline = Date.now() + COMBO_TIMEOUT_MS;
+      for (;;) {
+        const samples = [];
+        for (let i = 0; i < 12; i++) {
+          await new Promise((r) => setTimeout(r, 250));
+          try {
+            samples.push(await evaluate(cdp, "window.__adRenders || 0"));
+          } catch {
+            samples.push(samples.length ? samples[samples.length - 1] : 0);
+          }
+        }
+        let hot = 0;
+        for (let i = 1; i < samples.length; i++) if (samples[i] > samples[i - 1]) hot++;
+        const delta = samples[samples.length - 1] - samples[0];
+        if (hot < 4 && delta <= 4) break;
+        if (Date.now() > deadline) {
+          throw new Error(
+            `page never settled: the render count kept climbing (${samples[0]} -> ${samples[samples.length - 1]} with ${hot} rising polls per 3 s window; suspect a re-render loop)`,
+          );
+        }
+      }
+    }
     let tabs = [];
     {
       // Wait for the tab set to settle, not just appear: the first render

@@ -467,6 +467,13 @@ endpoint is absent. It registers one line per scope over the same spec
 `?fixtures` preview. Cards never write: the dashboard stays read-only.
 ### Project burn-up
 The worked example for a project card with its own endpoint is `static/cards/burnup.js` (slot `exec-burnup`, `scope: "project"`), fed by `GET /api/project/burnup` (`dash/projectburn.py`, pure builder plus a small hook in `dash/server.py`). The card fetches its endpoint itself with a loading state and a distinct `request failed` state (project refresh paths stay on the one snapshot response), and reads `../fixtures/burnup.json` under `?fixtures` (built by `fixtures/make_fixtures.py`). History that was never recorded is a labelled gap (`no history before <date>: N done tasks not dated`), never interpolated dates; days are UTC calendar days. New endpoints get tests in `tests/test_server.py` plus a privacy-pin path entry (names and numbers only, never file bodies or paths).
+### Page settle on tiny dashboards
+A brand-new project (no bundles, or a couple of bundles with no plans yet) must load exactly like a big one. The rule for every re-render path is: idempotent and terminating. The overview loads the workstream plan sums once per workstream set (a done-marker keyed by the set, in the `drawMain` wiring in `static/index.html`); an empty result still marks the set done, and the follow-up redraw happens only when the load actually added plan data. Section keys (`keyOf(...)` in `static/cards/registry.js` and the project views) hold no per-render volatile values — the one allowed clock read is the minute bucket behind the live charts. `drawMain` counts renders on `window.__adRenders` (one increment per call) so automation can see a loop.
+Prove it with the settle probe (stdlib only, headless Chrome):
+```bash
+node tools/agent-dash/scripts/page_settle_check.mjs --url http://127.0.0.1:8815
+```
+It checks the exec overview and the project home: after a 2 s grace a 3 s sample of the render count must look quiescent (a tight loop raises it in nearly every 250 ms poll; a healthy live page only re-renders on server ticks, seconds apart), and the following 10 idle seconds must stay within a small render bound. `python3 tools/agent-dash/agent_dash.py check --page` runs the same sampled gate inside `scripts/page_check.mjs` before its tab loop. `tests/test_page_rules.py` pins the root cause statically (one-shot plan load, empty-settling `loadPlanSums`, volatile-free keys, `applySections` idempotency, the render counter).
 
 ### Before you push
 
