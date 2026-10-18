@@ -409,7 +409,9 @@ async function main() {
     await cdp.send("Page.enable");
     await cdp.send("Runtime.enable");
 
-    const tabsExpression = `Array.prototype.map.call(document.querySelectorAll('#tabs .tab'), function (e) { return e.getAttribute("data-ws"); })`;
+    // No tab strip anymore: discover workstreams from the page state the
+    // switcher itself reads (Overall first, then plan rows in tab states).
+    const tabsExpression = `["all"].concat((((window.state && window.state.wss) || []).filter(function (w) { var st = (window.ADT && window.ADT.wsStateOf(w)) || w.state || "active"; return w.plan && (st === "active" || st === "paused" || st === "done"); })).map(function (w) { return w.ws; }))`;
     await cdp.send("Page.navigate", { url: `${opts.url}/?view=exec&ws=all` });
     await waitForLoad(cdp);
     {

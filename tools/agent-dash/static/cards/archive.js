@@ -137,7 +137,7 @@
       rules.appendChild(el("h3", {text: "How archive works"}));
       var table = el("table", {class: "pj-kv", "aria-label": "Archive rules"});
       var body = el("tbody");
-      body.appendChild(kvRow("Hidden from", "tab bar, Current and Planned views, default snapshot scope"));
+      body.appendChild(kvRow("Hidden from", "switcher, Current and Planned views, default snapshot scope"));
       body.appendChild(kvRow("Kept in", "bundles, run rows, lifetime totals, plan pages (read-only, with a banner)"));
       body.appendChild(kvRow("Archive needs", "plan 100% (or --force with a note) and a closing report in the bundle"));
       body.appendChild(kvRow("Restore", "ws restore <ID> — the frozen card stays as previously archived"));

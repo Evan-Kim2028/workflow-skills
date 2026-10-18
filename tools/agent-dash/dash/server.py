@@ -300,8 +300,12 @@ class Handler(BaseHTTPRequestHandler):
                 self._workstream_action("archive")
             elif path == "/api/workstreams/restore":
                 self._workstream_action("restore")
+            elif path == "/api/workstreams/state":
+                self._workstream_state()
+            elif path == "/api/workstreams/bulk":
+                self._workstream_bulk()
             else:
-                self._json(405, api_error("method not allowed", "method_not_allowed", "The API is read-only except POST /api/workstreams/archive and /api/workstreams/restore; change other state with the CLI, e.g. python3 agent_dash.py ws task <ID> <task> <status>"))
+                self._json(405, api_error("method not allowed", "method_not_allowed", "The API is read-only except POST /api/workstreams/archive, /api/workstreams/restore, /api/workstreams/state and /api/workstreams/bulk; change other state with the CLI, e.g. python3 agent_dash.py ws task <ID> <task> <status>"))
         except ValueError as exc:
             self._json(400, api_error(str(exc) or "bad request", "bad_request", _hint_for(str(exc))))
 
@@ -480,9 +484,26 @@ class Handler(BaseHTTPRequestHandler):
             extra["progress"] = _row_progress(extra.get("ws"))
             rows.append(extra)
         rows = filter_rows(rows, allowed, meta)
+        from dash import actions as actions_mod
+        from dash.bundles import list_bundles as _list_bundles
+
+        try:
+            kinds = {item.get("id"): item.get("kind") for item in (_list_bundles() or []) if isinstance(item, dict)}
+        except Exception:
+            kinds = {}
         for row in rows:
             if "progress" not in row:
                 row["progress"] = _row_progress(row.get("ws"))
+            # The page never offers an invalid button: every row names
+            # the actions its state allows (none for program bundles,
+            # OVERVIEW, and the unassigned row).
+            ws = row.get("ws")
+            if ws == "unassigned" or not ws:
+                row["allowed_actions"] = []
+            else:
+                row["allowed_actions"] = actions_mod.allowed_actions_for(
+                    ws, row.get("state") or meta.get(ws, {}).get("state", "active"), kinds.get(ws)
+                )
         self._json(200, {"workstreams": rows}, etag=etag)
 
     def _archive(self, _query):
@@ -520,7 +541,7 @@ class Handler(BaseHTTPRequestHandler):
         )
 
     def _workstream_action(self, action: str):
-        """``POST /api/workstreams/archive|restore``: the one write action.
+        """``POST /api/workstreams/archive|restore``: the page write actions.
 
         Guarded local-only (Host, Origin, ``X-AgentDash-Action: 1``) and
         refused with 403 ``read_only`` when ``AGENT_DASH_READONLY=1`` or
@@ -573,6 +594,55 @@ class Handler(BaseHTTPRequestHandler):
             )
             return
         self._json(status, body)
+
+    def _workstream_state(self):
+        """``POST /api/workstreams/state``: one lifecycle transition.
+
+        Body ``{"ws", "state"}`` (plus an optional ``note`` for
+        reopens). Same guards, transition table, writes, and error
+        shape as ``ws state`` (see ``dash/actions.py``): unknown 404,
+        invalid transition 409 with a hint listing the allowed next
+        states, bad body 400. Answers ``{ok, ws, state, prev_state,
+        state_changed_at}`` so the page can Undo via the reverse.
+        """
+        from dash import actions as actions_mod
+
+        refused = actions_mod.guard(self, self.server.cfg or {})
+        if refused is not None:
+            status, body = refused
+            self._json(status, body)
+            return
+        try:
+            ws, target, note = actions_mod.read_state_body(self)
+        except ValueError as exc:
+            self._json(400, api_error(str(exc) or "bad request", "bad_request", _hint_for(str(exc))))
+            return
+        status, body = actions_mod.perform_state(self.server, ws, target, note)
+        self._json(status, body)
+
+    def _workstream_bulk(self):
+        """``POST /api/workstreams/bulk``: one batch, per-id results.
+
+        Body ``{"action", "ws": [...], "state"?}``. Same guards as the
+        single actions. Each id runs alone through its single-operation
+        path (atomic per-bundle writes); one failure never aborts the
+        rest. Always answers 200 with ``{ok, action, results,
+        changed}``; successes carry ``prev_state`` so one page Undo
+        restores all that changed.
+        """
+        from dash import actions as actions_mod
+
+        refused = actions_mod.guard(self, self.server.cfg or {})
+        if refused is not None:
+            status, body = refused
+            self._json(status, body)
+            return
+        try:
+            action, target, ids, note = actions_mod.read_bulk_body(self)
+        except ValueError as exc:
+            self._json(400, api_error(str(exc) or "bad request", "bad_request", _hint_for(str(exc))))
+            return
+        self._json(200, actions_mod.perform_bulk(self.server, action, ids, target, note))
 
     def _project_graph(self, _query):
         """``GET /api/project/graph``: the cross-workstream dependency graph.

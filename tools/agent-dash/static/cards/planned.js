@@ -126,7 +126,7 @@
     var nowS = Date.now() / 1000;
     var table = el("table", {class: "pj-table", "aria-label": "Start readiness"});
     var head = el("tr");
-    ["WS", "Depends on", "Gates", "Approvals", "Tasks", "Ready?"].forEach(function (t, i) {
+    ["WS", "Depends on", "Gates", "Approvals", "Tasks", "Ready?", "Action"].forEach(function (t, i) {
       head.appendChild(el("th", {class: i === 4 ? "n" : "", text: t}));
     });
     table.appendChild(el("thead", {}, [head]));
@@ -146,6 +146,35 @@
       readyCell.appendChild(el("span", {class: "pj-pill " + (r.ready ? "ok" : "wait"), text: r.ready ? "\u2713 Ready" : "\u25CB Not yet", title: r.reason}));
       readyCell.appendChild(document.createTextNode(" " + r.reason));
       tr.appendChild(readyCell);
+      /* Start lives beside readiness: the same primary the management
+         table offers for planned rows. Guarded: no cell content when
+         the manage module is absent. */
+      var actCell = el("td");
+      if (typeof primaryFor === "function" && typeof runDescriptor === "function") {
+        (function (cell, rowW) {
+          var full = null;
+          ((state.wssAll || []).concat(state.wss || [])).forEach(function (x) {
+            if (String(x.ws).toUpperCase() === String(rowW.ws).toUpperCase()) full = x;
+          });
+          var prow = {ws: rowW.ws, name: rowW.name || "", state: (full && ADT.wsStateOf(full)) || "planned",
+            progress: (full && full.progress) || rowW.progress || null, allowed_actions: (full && full.allowed_actions) || []};
+          var desc = null;
+          try { desc = primaryFor(prow); } catch (e) { desc = null; }
+          if (desc) {
+            var tag = rowW.ws + (rowW.name ? " (" + rowW.name + ")" : "");
+            var sb = el("button", {type: "button", class: "arch-btn", text: desc.label});
+            sb.setAttribute("aria-label", desc.label + " " + tag);
+            sb.title = desc.title;
+            sb.addEventListener("click", function (ev) { ev.stopPropagation(); runDescriptor(desc, rowW.ws, tag, cell, function () {}); });
+            cell.appendChild(sb);
+          } else {
+            cell.appendChild(document.createTextNode("\u2014"));
+          }
+        })(actCell, w);
+      } else {
+        actCell.appendChild(document.createTextNode("\u2014"));
+      }
+      tr.appendChild(actCell);
       body.appendChild(tr);
     });
     table.appendChild(body);

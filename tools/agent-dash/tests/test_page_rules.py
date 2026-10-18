@@ -2022,13 +2022,15 @@ class FinalPolishTests(unittest.TestCase):
         self.assertIn("--accent-fill", css)
         self.assertNotIn("background:var(--s1);color:#fff", css)
 
-    def test_tab_strip_stays_in_its_lane(self):
-        page = (STATIC / "index.html").read_text()
-        self.assertIn(".tab .tab-name", page)
-        self.assertIn("text-overflow:ellipsis", page)
-        state = (STATIC / "core" / "state.js").read_text()
-        self.assertIn("tab-name", state)
-        self.assertIn("scrollLeft", state)
+    def test_switcher_rows_stay_in_their_lane(self):
+        # The tab strip retired into the switcher: rows keep one line
+        # with an ellipsis and the hot row scrolls into view.
+        css = (STATIC / "cards" / "manage.css").read_text()
+        self.assertIn(".ws-row-name", css)
+        self.assertIn("text-overflow:ellipsis", css)
+        switcher = (STATIC / "core" / "switcher.js").read_text()
+        self.assertIn("ws-row-name", switcher)
+        self.assertIn("scrollIntoView", switcher)
 
     def test_phone_hides_the_dock_rail(self):
         css = (STATIC / "tokens.css").read_text()
@@ -2100,8 +2102,13 @@ class FinalPolishTests(unittest.TestCase):
         topbar = re.search(r'<div class="topbar">(.*?)</div>\s*<div id="exec-view"', page, re.S)
         self.assertIsNotNone(topbar, "the .topbar shell is gone")
         slim = topbar.group(1)
-        for keep in ('id="title"', 'id="tabs"'):
+        # The tab strip retired into the switcher: the slim row keeps the
+        # title, Overall, the selected chip, the one switcher button, and
+        # the pins. Theme stays in the scrolling header, never pinned.
+        for keep in ('id="title"', 'id="overall-btn"', 'id="selected-chip"',
+                      'id="ws-switcher"', 'id="ws-pins"'):
             self.assertIn(keep, slim, f"the slim row lost {keep}")
+        self.assertNotIn('id="tabs"', slim, "the tab strip is back in the slim row")
         for gone in ('id="view-nav"', "view-toggle", 'class="live"', 'id="theme"', "nav-sections"):
             self.assertNotIn(gone, slim, f"a secondary header control stays pinned: {gone}")
         self.assertIn('class="topscroll"', page, "the scrolling full header is gone")
@@ -2113,8 +2120,8 @@ class FinalPolishTests(unittest.TestCase):
 
     def test_project_name_is_never_truncated(self):
         """The project name keeps its natural width: .topbar h1 has no
-        max-width and no ellipsis (desktop or phone); the tab strip
-        flexes and scrolls to give way instead."""
+        max-width and no ellipsis (desktop or phone); the switcher-side
+        chips shrink to give way instead (the tab strip is gone)."""
         page = (STATIC / "index.html").read_text()
         style = "\n".join(re.findall(r"<style>(.*?)</style>", page, re.S))
         desk = re.search(r"\.topbar h1\{(.*?)\}", style)
@@ -2127,9 +2134,11 @@ class FinalPolishTests(unittest.TestCase):
         self.assertIsNotNone(phone, "the phone title rule is gone")
         self.assertNotIn("max-width", phone.group(1), "the phone project name is width-capped")
         self.assertNotIn("ellipsis", phone.group(1), "the phone project name ellipsizes")
-        tabs = re.search(r"\.topbar \.tabs\{(.*?)\}", style)
-        self.assertIsNotNone(tabs, ".topbar .tabs rule is gone")
-        self.assertIn("flex:1", tabs.group(1).replace(" ", ""), "the tab strip no longer flexes to give way")
+        chips = (STATIC / "cards" / "manage.css").read_text()
+        sel = re.search(r"#selected-chip\{(.*?)\}", chips)
+        self.assertIsNotNone(sel, "#selected-chip rule is gone")
+        self.assertIn("min-width:0", sel.group(1).replace(" ", ""), "the selected chip no longer shrinks to give way")
+        self.assertIn("overflow:hidden", sel.group(1).replace(" ", ""), "the selected chip no longer clips to give way")
 
     def test_theme_toggle_sits_top_right_alone(self):
         """Exactly one Theme control: a real button with an aria-label in
@@ -2161,7 +2170,9 @@ class FinalPolishTests(unittest.TestCase):
                 self.assertNotIn("nav-sections", src.read_text(), f"{src.name} still references the Sections button")
         for src in (STATIC / "core").glob("*.js"):
             self.assertNotIn("nav-sections", src.read_text(), f"{src.name} still references the Sections button")
-        self.assertNotIn("keyshortcuts", page.lower(), "a Sections shortcut hint is left in the page")
+        # The switcher's own "/" shortcut hint stays; only the Sections
+        # "[" hint is banned.
+        self.assertNotIn('keyshortcuts="["', page, "a Sections shortcut hint is left in the page")
         self.assertNotIn('key !== "["', nav, "the [ shortcut outlived the Sections button")
         self.assertIn("Escape", nav, "the rail lost its Escape-to-close")
         self.assertIn("sidenav-hot", nav, "the hover rail itself is gone")

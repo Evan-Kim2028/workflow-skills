@@ -19,6 +19,7 @@
 <link rel="stylesheet" href="/static/cards/decisions.css">
 <link rel="stylesheet" href="/static/cards/depgraph.css">
 <link rel="stylesheet" href="/static/cards/burnup.css">
+<link rel="stylesheet" href="/static/cards/manage.css">
 <script src="/static/core/theme.js"></script>
 <style>
 *{box-sizing:border-box}
@@ -58,28 +59,11 @@ button,select{font:inherit;color:var(--ink);background:var(--surface);border:1px
 #theme{border-radius:var(--r-pill);padding:6px 13px;font-weight:600}
 #theme:hover{border-color:var(--ring-strong)}
 /* The one Theme control lives in the scrolling top row, far right, out of
-   the pinned tab strip (owner feedback). */
+   the pinned bar (owner feedback). */
 header.shell #theme{margin-left:auto;flex:none}
-.tabs{display:flex;align-items:flex-end;gap:4px;margin:14px 0 16px;border-bottom:1px solid var(--grid);overflow-x:auto;scrollbar-width:none}
-.tab{display:inline-flex;align-items:center;gap:7px;border:0;border-bottom:2px solid transparent;border-radius:0;background:none;padding:9px 12px 11px;color:var(--ink-2);font-weight:650;font-size:13.5px;white-space:nowrap;cursor:grab;position:relative;max-width:280px;overflow:hidden;text-overflow:ellipsis;flex:none}
-@media (max-width:700px){.tab{max-width:200px}}
-.tab:hover{color:var(--ink)}
-.tab[aria-selected="true"]{color:var(--ink);border-bottom-color:var(--accent)}
-.tab[aria-selected="true"]::after{content:"";position:absolute;left:10px;right:10px;bottom:-2px;height:2px;border-radius:2px;background:var(--accent);box-shadow:0 0 12px var(--accent-glow)}
-.tab[draggable="true"]::before{content:"\22EE\22EE";color:var(--muted);font-size:11px;letter-spacing:1px}
-.tab .tab-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
-.tab .c{font:600 11px var(--mono);color:var(--muted);background:var(--surface-2);border-radius:var(--r-pill);padding:1px 7px;margin-left:6px;flex:none}
-.tab .tick{flex:none}
-.tab .tick{color:var(--good);font-weight:800;margin-left:6px}
-.tab.muted{opacity:.55}
-.tab.dragging{opacity:.4}
-.tab.drop-before{box-shadow:inset 2px 0 0 var(--accent)}
-.tab.drop-after{box-shadow:inset -2px 0 0 var(--accent)}
-.tabfilter{margin-left:auto;display:inline-flex;align-items:center;gap:4px;padding:0 0 6px 12px;align-self:flex-end;flex:none;position:sticky;right:0;background:color-mix(in srgb,var(--page) 88%,transparent)}
-.tabfilter button{border:1px solid var(--ring);background:var(--surface);border-radius:var(--r-pill);padding:4px 11px;font-size:12px;font-weight:600;color:var(--ink-2);white-space:nowrap}
-.tabfilter button[aria-pressed="true"]{color:var(--accent-ink);background:var(--accent-fill,var(--accent));border-color:transparent}
-.tabfilter button.tabreset{border-color:transparent;color:var(--muted);font-weight:500}
-.tabs-empty{align-self:center;color:var(--muted);font-size:12.5px;padding:8px 12px;white-space:nowrap}
+/* The tab strip is gone: the pinned bar holds Overall, the selected
+   chip, one Workstreams switcher button, and up to three pin chips
+   (static/core/switcher.js, static/cards/manage.css). */
 .grid{display:grid;gap:14px}
 .g-tiles{grid-template-columns:repeat(auto-fit,minmax(170px,1fr))}
 .g-2{grid-template-columns:repeat(auto-fit,minmax(min(100%,560px),1fr))}
@@ -147,7 +131,7 @@ svg{display:block;overflow:visible}
 div.topbar{margin:0 calc(-1 * var(--gutter-phone));padding:0 var(--gutter-phone);gap:8px}
 .topbar h1#title{font-size:13px;flex:0 1 auto;min-width:0;white-space:normal;line-height:1.3;max-height:2.6em;overflow:hidden}
 .topbar .proj-sub{display:none}
-.topbar .tab{padding:5px 9px 7px;font-size:12.5px}
+.topbar #overall-btn,.topbar #ws-switcher{padding:4px 9px;font-size:12px}
 .g-tiles{grid-template-columns:1fr 1fr}
 .g-2{grid-template-columns:minmax(0,1fr)}
 .card{padding:14px}
@@ -158,10 +142,9 @@ div.topbar{margin:0 calc(-1 * var(--gutter-phone));padding:0 var(--gutter-phone)
 
 /* polish: motion and feel (all switched off under prefers-reduced-motion) */
 .topscroll header{position:static;margin:0;padding:12px 0 6px;background:none;-webkit-backdrop-filter:none;backdrop-filter:none}
-button,select,.tab,.seg-ctl button,.card,.chip,tr.clk td{transition:background-color .16s ease,border-color .16s ease,color .16s ease,box-shadow .2s ease}
+button,select,#overall-btn,#ws-switcher,.seg-ctl button,.card,.chip,tr.clk td{transition:background-color .16s ease,border-color .16s ease,color .16s ease,box-shadow .2s ease}
 button:hover{border-color:var(--ink-2)}
-button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible,[tabindex]:focus-visible{outline:2px solid var(--accent);outline-offset:2px;box-shadow:0 0 0 4px var(--accent-soft)}
-.tab:hover{color:var(--ink)}
+button:focus-visible,#overall-btn:focus-visible,#ws-switcher:focus-visible,a:focus-visible,tr.clk:focus-visible,[tabindex]:focus-visible{outline:2px solid var(--accent);outline-offset:2px;box-shadow:0 0 0 4px var(--accent-soft)}
 .tip{animation:tipin .14s ease-out}
 @keyframes tipin{from{opacity:0;transform:translateY(3px)}to{opacity:1;transform:none}}
 .drawer{transition:transform .3s cubic-bezier(.2,.8,.2,1)}
@@ -183,16 +166,15 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible,[ta
 /* working-now pills: moved to static/cards/plan-progress.css */
 
 /* Slim pinned row: the only chrome that stays on screen while scrolling
-   (project name, workstream tab strip). The .topscroll block above it
-   (live pill, Plan | Execution, Project | Current | Planned | Archive,
-   Theme) scrolls away with the page, so nothing resizes on scroll. The
-   project name is never truncated: it keeps its natural width and the
-   tab strip flexes and scrolls internally to give way. */
+   (project name, Overall, selected chip, Workstreams switcher, pins).
+   The .topscroll block above it (live pill, Plan | Execution, Project |
+   Current | Planned | Archive, Theme) scrolls away with the page, so
+   nothing resizes on scroll. The project name is never truncated: it
+   keeps its natural width and the chips shrink to give way
+   (static/cards/manage.css). */
 .topbar{position:sticky;top:0;z-index:35;display:flex;align-items:center;gap:10px;height:var(--pinned-h);margin:0 calc(-1 * var(--gutter)) 14px;padding:0 var(--gutter);background:color-mix(in srgb,var(--page) 82%,transparent);-webkit-backdrop-filter:blur(14px);backdrop-filter:blur(14px);border-bottom:1px solid var(--grid)}
 .topbar h1{font-size:15px;margin:0;font-weight:750;letter-spacing:-.01em;flex:none;white-space:nowrap}
-.topbar .tabs{flex:1 1 auto;min-width:0;margin:0;border-bottom:0}
-.topbar .tab{padding:6px 10px 8px;font-size:13px}
-.topbar .tabfilter{position:static;background:none;align-self:center;padding:0 0 0 8px}
+.topbar #ws-switcher{flex:none}
 html{scroll-padding-top:calc(var(--pinned-h) + 10px)}
 [data-nav], [data-sec], .lay, #plan-body h2, #plan-body h3, #plan-body section { scroll-margin-top: calc(var(--pinned-h) + 12px); }
 #main [data-nav], #main [data-sec], #plan-body .lay { scroll-margin-top: calc(var(--pinned-h) + 12px); }
@@ -217,7 +199,10 @@ html{scroll-padding-top:calc(var(--pinned-h) + 10px)}
 </div>
 <div class="topbar">
 <h1 id="title">Agent dashboard</h1>
-<nav class="tabs" id="tabs" role="tablist" aria-label="Workstreams"></nav>
+<button type="button" id="overall-btn" title="Overall execution (Current)">Overall</button>
+<span id="selected-chip" hidden></span>
+<button type="button" id="ws-switcher" aria-expanded="false" aria-controls="ws-switcher-pop" aria-keyshortcuts="/" title="Switch workstream ( / )">Workstreams</button>
+<span id="ws-pins" hidden></span>
 </div>
 <div id="exec-view">
 <div id="err-banner" role="alert" hidden></div>
@@ -242,6 +227,8 @@ html{scroll-padding-top:calc(var(--pinned-h) + 10px)}
 <script src="/static/core/charts.js"></script>
 <script src="/static/core/drawer.js"></script>
 <script src="/static/core/project.js"></script>
+<script src="/static/core/switcher.js"></script>
+<script src="/static/core/manage.js"></script>
 <script src="/static/plan.js"></script>
 <script src="/static/cards/tiles.js"></script>
 <script src="/static/cards/token-chart.js"></script>
@@ -346,6 +333,8 @@ html{scroll-padding-top:calc(var(--pinned-h) + 10px)}
   });
   document.getElementById("view-plan").addEventListener("click", function () { selectView("plan"); });
   document.getElementById("view-exec").addEventListener("click", function () { selectView("exec"); });
+  document.getElementById("overall-btn").addEventListener("click", function () { selectView("exec"); selectTab("all"); });
+  document.getElementById("ws-switcher").addEventListener("click", function () { toggleSwitcher(); });
   window.addEventListener("popstate", function () {
     var next = readRoute();
     state.view = next.view;

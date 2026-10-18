@@ -186,7 +186,9 @@
   var tabFilter = ADT.loadMode();
   var tabDrag = null, tabDragPending = false, tabClickGuard = 0;
   function currentOrder() {
-    var t = document.getElementById("tabs"), ids = [];
+    var t = document.getElementById("tabs");
+    if (!t) return [];
+    var ids = [];
     [].forEach.call(t.querySelectorAll("button.tab[data-ws]"), function (b) {
       var id = String(b.getAttribute("data-ws")).toUpperCase();
       if (id !== "ALL" && ids.indexOf(id) < 0) ids.push(id);
@@ -244,52 +246,20 @@
     wrap.appendChild(el("button", {type: "button", class: "tabreset", title: "Restore the default tab order", onclick: function () { ADT.saveOrder([]); renderTabs(); }}, ["Reset order"]));
     return wrap;
   }
+  /* The pinned bar chrome entry every refresh path calls. The tab
+     strip is gone: renderBar (static/core/switcher.js) paints Overall,
+     the selected chip, the switcher button, and the pins. The completed
+     count below still reads the shared completed rule, so the filter
+     and the Where-we-are status cannot drift from the bar. */
   function renderTabs() {
-    if (tabDrag) { tabDragPending = true; return; }
-    var t = document.getElementById("tabs"); if (!t) return;
-    t.innerHTML = "";
-    var rows = ADT.applyOrder(tabRows(), ADT.loadOrder());
-    var counts = ADT.countByMode(rows);
-    var vis = ADT.filterByMode(rows, tabFilter, state.ws);
-    var nWs = 0;
-    vis.forEach(function (w) {
-      var overview = w.ws === "all";
-      if (!overview) nWs++;
-      var titles = [];
-      if (w.muted) titles.push("Shown although the filter hides it: this tab is selected.");
-      if (!overview && ADT.isCompleted(w.progress)) titles.push(ADT.completeTitle(w.progress));
-      if (!overview && (w.state || "active") === "paused") titles.push("\u23F8 Paused: " + w.name);
-      var attrs = {class: "tab" + (w.muted ? " muted" : ""), role: "tab", "data-ws": w.ws, "aria-selected": String(state.ws === w.ws), title: w.name, onclick: function () { if (Date.now() < tabClickGuard) return; selectTab(w.ws); }};
-      if (titles.length) attrs.title = w.name + " — " + titles.join(" ");
-      var b = el("button", attrs, [el("span", {class: "tab-name", text: w.name})]);
-      if (w.running) b.appendChild(el("span", {class: "c", text: w.running + " live"}));
-      if (!overview && ADT.isCompleted(w.progress)) b.appendChild(el("span", {class: "tick", text: "\u2713"}));
-      if (!overview && (w.state || "active") === "paused") b.appendChild(el("span", {class: "tick pause", text: "\u23F8", title: "\u23F8 Paused"}));
-      if (!overview) {
-        b.setAttribute("draggable", "true");
-        b.addEventListener("dragstart", function (ev) { onTabDragStart(ev, w.ws); });
-        b.addEventListener("dragover", function (ev) { onTabDragOver(ev, b); });
-        b.addEventListener("dragleave", function () { b.classList.remove("drop-before", "drop-after"); });
-        b.addEventListener("drop", function (ev) { ev.preventDefault(); finishTabDrag(w.ws, tabDrag ? tabDrag.after : false); });
-        b.addEventListener("dragend", onTabDragEnd);
-        b.addEventListener("keydown", function (ev) { onTabKey(ev, w.ws); });
-      }
-      t.appendChild(b);
+    if (typeof renderBar === "function") renderBar();
+    var done = 0;
+    tabRows().forEach(function (w) {
+      if (w.ws !== "all" && ADT.isCompleted(w.progress)) done++;
     });
-    if (!nWs) t.appendChild(el("span", {class: "tabs-empty", text: tabFilter === "completed" ? "No completed workstreams" : tabFilter === "active" ? "No active workstreams" : "No workstreams"}));
-    t.appendChild(filterCtl(counts));
+    var sw = document.getElementById("ws-switcher");
+    if (sw) sw.setAttribute("data-completed", String(done));
     updateViewNav();
-    /* Keep the selected tab in view: the strip scrolls internally, so
-       without this a narrow viewport can strand the active tab offscreen.
-       Moves the strip only, never the page. */
-    try {
-      var active = t.querySelector(".tab[aria-selected=\"true\"]");
-      if (active) {
-        var r = active.getBoundingClientRect(), tr = t.getBoundingClientRect();
-        if (r.left < tr.left) t.scrollLeft -= (tr.left - r.left);
-        else if (r.right > tr.right) t.scrollLeft += (r.right - tr.right);
-      }
-    } catch (e) {}
   }
   /* Header nav pills (Project | Current | Planned | Archive) beside the
      Plan | Execution switch. Planned and Archive carry their counts from

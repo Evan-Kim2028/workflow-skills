@@ -351,7 +351,7 @@ python3 tools/agent-dash/agent_dash.py ws restore WS4   # archived -> done, keep
 python3 tools/agent-dash/agent_dash.py ws list --state all
 ```
 
-`ws archive` freezes `summary.json` (final stats, lifetime tokens/cost when the dashboard is reachable) and never deletes anything. The archive card's Report link names `docs/closing-report.md` (basename only, body never served), so write the report there rather than only under `reports/`. The full state rules are in [SKILL-PLAN.md](../SKILL-PLAN.md#workstream-lifecycle). The dashboard page can archive and restore directly: `POST /api/workstreams/archive` and `POST /api/workstreams/restore` with body `{"ws": "<ID>"}` run the same lifecycle functions behind local-only guards (`Host`/`Origin` plus `X-AgentDash-Action: 1`) and a read-only switch (`AGENT_DASH_READONLY=1`, config `readonly: true`); the page shows an inline confirm and an Undo toast, and falls back to copy-command buttons when writes are off. It is the only write action; see CONTRACT.md.
+`ws archive` freezes `summary.json` (final stats, lifetime tokens/cost when the dashboard is reachable) and never deletes anything. The archive card's Report link names `docs/closing-report.md` (basename only, body never served), so write the report there rather than only under `reports/`. The full state rules are in [SKILL-PLAN.md](../SKILL-PLAN.md#workstream-lifecycle). The dashboard page is a lifecycle control surface: `POST /api/workstreams/state` with body `{"ws": "<ID>", "state": "<planned|active|paused|done|dropped>"}` moves one workstream through the same transition table (reopening `done` to `active` needs a `"note"`), and `POST /api/workstreams/bulk` with body `{"action": "archive"|"restore"|"state", "state": "<target>", "ws": ["<ID>", ...]}` runs up to 50 ids with per-id results that never abort midway; both answer the previous state so the page can Undo, and `GET /api/state` exposes `allowed_actions` per workstream so the page never offers an invalid button (program bundles like OVERVIEW expose none). All four endpoints run the same lifecycle functions behind local-only guards (`Host`/`Origin` plus `X-AgentDash-Action: 1`) and a read-only switch (`AGENT_DASH_READONLY=1`, config `readonly: true`); the page confirms archive, drop, and bulk inline with an Undo toast, and falls back to copy-command buttons when writes are off. They are the only write actions; see CONTRACT.md.
 
 Status is `todo`, `wip`, `pr`, `prog`, `done`, or `deferred`. `wip` is work on a branch; `pr` is approved or open; `prog` is merged with a production step left; `done` is merged and live. `--moved-to` and `--note` belong only on `deferred`. Status edits read live; `render` is only for prose and drawings. `ws validate` fails on a dep that names an unknown task or the task itself, a `dep_notes` key outside the task's `deps`, and a bare number citation (name things first: `the notes cutover (WS4.3)`).
 
@@ -464,9 +464,12 @@ per 30 s, renders from its cache, and falls back gracefully when the
 endpoint is absent. It registers one line per scope over the same spec
 (`scope: "project"` and `scope: "planned"`, both `slot: "exec-depgraph"`).
 `fixtures/graph.json` (from `fixtures/make_fixtures.py`) feeds the
-`?fixtures` preview. Cards never write, except the archive/restore controls
-(`static/core/actions.js` over `apiPost`): the one write action, behind the
-server guards, with copy-command fallback when writes are off.
+`?fixtures` preview. Cards never write, except the lifecycle controls
+(`static/core/actions.js`, `static/core/manage.js` over `apiPost`): the page
+write actions, behind the server guards, with copy-command fallback when
+writes are off. The pinned bar holds no tab strip: one `Workstreams (N)`
+switcher button (`static/core/switcher.js`) opens the state-grouped popover,
+and Current leads with the management table (`static/core/manage.js`).
 ### Project burn-up
 The worked example for a project card with its own endpoint is `static/cards/burnup.js` (slot `exec-burnup`, `scope: "project"`), fed by `GET /api/project/burnup` (`dash/projectburn.py`, pure builder plus a small hook in `dash/server.py`). The card fetches its endpoint itself with a loading state and a distinct `request failed` state (project refresh paths stay on the one snapshot response), and reads `../fixtures/burnup.json` under `?fixtures` (built by `fixtures/make_fixtures.py`). History that was never recorded is a labelled gap (`no history before <date>: N done tasks not dated`), never interpolated dates; days are UTC calendar days. New endpoints get tests in `tests/test_server.py` plus a privacy-pin path entry (names and numbers only, never file bodies or paths).
 ### Page settle on tiny dashboards

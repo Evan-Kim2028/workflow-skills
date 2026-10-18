@@ -223,17 +223,19 @@
     });
     foot.appendChild(views);
 
-    var kicker = document.createElement("div");
-    kicker.className = "sidenav-kicker";
-    kicker.textContent = "Workstreams";
-    foot.appendChild(kicker);
-
-    var tabs = document.createElement("div");
-    tabs.className = "sidenav-tabs";
-    tabs.setAttribute("role", "group");
-    tabs.setAttribute("aria-label", "Workstreams");
     var srcTabs = document.getElementById("tabs");
-    if (srcTabs) {
+    /* No tab strip anymore: the workstream switcher owns jumping, so the
+       dock skips its Workstreams group instead of rendering it empty. */
+    if (srcTabs && srcTabs.querySelectorAll("button").length) {
+      var kicker = document.createElement("div");
+      kicker.className = "sidenav-kicker";
+      kicker.textContent = "Workstreams";
+      foot.appendChild(kicker);
+
+      var tabs = document.createElement("div");
+      tabs.className = "sidenav-tabs";
+      tabs.setAttribute("role", "group");
+      tabs.setAttribute("aria-label", "Workstreams");
       [].forEach.call(srcTabs.querySelectorAll("button"), function (src, index) {
         var b = document.createElement("button");
         b.type = "button";
@@ -247,8 +249,8 @@
         });
         tabs.appendChild(b);
       });
+      foot.appendChild(tabs);
     }
-    foot.appendChild(tabs);
   }
 
   function rebuild() {

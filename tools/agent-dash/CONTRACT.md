@@ -3,7 +3,7 @@
 Local execution dashboard, read-only except the page archive action. One Python 3 process (stdlib only), binds 127.0.0.1:8765.
 Code is this directory. `install.sh` links it to `~/.claude/tools/agent-dash`. State: `~/.local/share/agent-dash/` (dash.sqlite WAL, pidfile, log).
 Never writes to any source, never signals agent processes, never stores prompt bodies or argv.
-Archive and restore from the page (`POST /api/workstreams/archive`, `POST /api/workstreams/restore`) is the only write action the dashboard performs, and it exists so a done workstream can leave the Current view without a terminal round-trip: it writes only bundle lifecycle fields (`state`, `archived_at`, the frozen `summary.json`) through the same `dash/lifecycle.py` functions the CLI uses, never sources, plan content, or approvals, and it stays local-only (Host/Origin plus `X-AgentDash-Action: 1`) with a read-only switch (`AGENT_DASH_READONLY=1`, config `readonly: true`).
+Lifecycle controls from the page (`POST /api/workstreams/archive`, `POST /api/workstreams/restore`, `POST /api/workstreams/state`, `POST /api/workstreams/bulk`) are the only writes the dashboard performs, and they exist so a workstream can move through its lifecycle without a terminal round-trip: they write only bundle lifecycle fields (`state`, `state_changed_at`, `archived_at`, the frozen `summary.json`) through the same `dash/lifecycle.py` functions the CLI uses, never sources, plan content, or approvals, and they stay local-only (Host/Origin plus `X-AgentDash-Action: 1`) with a read-only switch (`AGENT_DASH_READONLY=1`, config `readonly: true`).
 The one argv value ever kept is the worker's `--model` flag value, recorded on process samples and live-process rows so a run whose model is otherwise unknown can be named. Model ids, labels, token counts, and the session `ws_hint` (a workstream id derived from a bundle tool-use path, never served by any endpoint) are the only worker-derived strings in the store.
 
 ## Layout and file ownership (one writer per file)
@@ -29,7 +29,7 @@ The one argv value ever kept is the worker's `--model` flag value, recorded on p
 | `dash/buildinfo.py` (build id + process start time) | core |
 | `dash/deploy.py` (clean-release deploy, rollback, `releases/`) | core |
 | `dash/server.py` (HTTP + SSE, routes below) | core |
-| `dash/actions.py` (the one write action: guarded `POST /api/workstreams/archive|restore` through the CLI lifecycle functions, local-only, read-only switch) | core |
+| `dash/actions.py` (the page write actions: guarded `POST /api/workstreams/archive|restore|state|bulk` through the CLI lifecycle functions, local-only, read-only switch; `allowed_actions_for` names each row's legal buttons) | core |
 | `dash/attribution.py`, `map.example.json` (`map.local.json` replaces it) | core |
 | `dash/pricing.py`, `catalog/prices.json` | core |
 | `dash/plans.py`, `plans.example.json` (`plans.local.json` replaces it) | core |
@@ -64,8 +64,11 @@ The one argv value ever kept is the worker's `--model` flag value, recorded on p
 | `static/cards/burnup.js` + `burnup.css` (Project burn-up `?view=project` slot `exec-burnup`: tasks area with plan line and gap band, stacked cost/token bars, togglable lanes) | dash-c3 |
 | `static/core/el.js` (DOM helpers, text/format glue, tooltip, copy button) | Claude (parent) |
 | `static/core/state.js` (page state, route read/write, tab filter/order plumbing) | Claude (parent) |
-| `static/core/api.js` (fetch and fixtures, SSE stream, refresh orchestration; `apiPost` for the one write action with the action header) | Claude (parent) |
+| `static/core/api.js` (fetch and fixtures, SSE stream, refresh orchestration; `apiPost` for the page write actions with the action header) | Claude (parent) |
 | `static/core/actions.js` (archive/restore controls: inline confirm popover, undo toast, real buttons with workstream aria-labels, copy-command fallback) | Claude (parent) |
+| `static/core/switcher.js` (the calm pinned bar: Overall, the selected chip, one `Workstreams (N)` switcher button with a searchable state-grouped popover, up to three viewer-local pins, Sections, Theme) | Claude (parent) |
+| `static/core/manage.js` (the Current management table, the tab heading cluster, confirms, undo toasts, Keys popover; every write through `apiPost`) | Claude (parent) |
+| `static/cards/manage.css` (switcher popover, management table, heading cluster, phone sheet) | Claude (parent) |
 | `static/core/cache.js` (exec/section keyed caches, keyed-section renderer) | Claude (parent) |
 | `static/core/charts.js` (shared chart/axis and token-cell helpers) | Claude (parent) |
 | `static/core/drawer.js` (run details drawer) | Claude (parent) |
@@ -236,11 +239,43 @@ Guards, all fail-closed: `Host` must be `127.0.0.1:<port>` or
 call must carry `X-AgentDash-Action: 1` (blocks cross-site form posts and
 simple fetches). Disabled with 403 `read_only` when `AGENT_DASH_READONLY=1`
 or the config carries `readonly: true`; then `GET /api/project` and
-`GET /api/state` report `{"actions": {"archive": false}}` and the page
-falls back to copy-command buttons. Each action is logged to the dashboard
-log with the workstream id only, and invalidates the bundle-state caches
-(store sequences plus snapshot cache, the server per-plan caches), so the
-next poll lists the workstream in its new state.
+`GET /api/state` report `{"actions": {"archive": false}}` and every page
+action button falls back to a copy-command button. Each action is logged
+to the dashboard log with the workstream id only, and invalidates the
+bundle-state caches (store sequences plus snapshot cache, the server
+per-plan caches), so the next poll lists the workstream in its new state.
+
+`POST /api/workstreams/state` (JSON body `{"ws": "<ID>", "state":
+"<target>"}` plus an optional `"note"`) moves one workstream between
+`planned`, `active`, `paused`, `done`, and `dropped` through the same
+`set_state` the CLI uses: the transition table decides, reopening `done`
+to `active` needs a note (the page sends one from Undo), `state_changed_at`
+and one history line are recorded under the per-bundle lock, and
+`archived` is refused here (archiving freezes a summary, so it stays on
+the archive endpoint). It answers `{"ok": true, "ws": "<ID>", "state":
+"<new>", "prev_state": "<old>", "state_changed_at": 0}` so the page can
+Undo by posting the reverse transition. Errors keep the house shape:
+unknown workstream 404 `not_found`, program/`OVERVIEW` kinds 409
+`not_eligible`, illegal move 409 `invalid_transition` with a hint listing
+the allowed next states (and an `allowed` list), bad body 400
+`bad_request`.
+
+`POST /api/workstreams/bulk` (JSON body `{"action":
+"archive"|"restore"|"state", "state": "<target>" for state moves,
+"ws": ["<ID>", ...]}` up to 50 ids, plus an optional `"note"`) runs one
+batch through the single-operation paths above: each id is atomic on its
+own, one failure never aborts the rest, and the answer is always 200 with
+`{"ok": <all ok>, "action": ..., "results": [{ws, ok, state, prev_state |
+error, code, hint}], "changed": [<ids>]}`. Successes carry `prev_state`
+so one page Undo restores all that changed. The same guards and the
+read-only switch apply.
+
+`GET /api/state` exposes `allowed_actions` per workstream row (the page
+vocabulary: `start`, `pause`, `resume`, `mark_done`, `reopen`, `archive`,
+`restore`, `drop`; `GET /api/workstreams` rows carry the same list), so
+the page never offers an invalid button. Program bundles like OVERVIEW
+expose no actions anywhere: their rows carry none and every endpoint
+refuses them with 409 `not_eligible`.
 
 `GET /api/reconcile?hours=&since=&until=` -> `{"now": 0, "since": 0, "until": 0, "all": {live_agents, finished_in_range, finished_today, tokens, cost_usd, prev_24h: {tokens, cost_usd, finished, live_agents}}, "all_time": {tokens, cost_usd}, "rows": [per-workstream rows], "unassigned": {...}, "archived": {tokens, cost_usd, tokens_all_time, cost_usd_all_time, workstreams: []}, "mismatches": []}`.
 `archived` sums the rows in a default-hidden lifecycle state
@@ -485,9 +520,11 @@ Plan and Execution are one shell, `static/index.html`. `GET /` and `GET /plan` b
 
 Top-level views beside Plan | Execution: `?view=project` (Project home, the default landing when `GET /api/project` names the project or any workstream left the `active` state, else today's Overview), `?view=current` (alias of the `exec` view: today's execution), `?view=planned` (start-readiness), `?view=archive` (frozen summary cards). `?view=exec&ws=<ID>` and `?view=plan&ws=<ID>` are unchanged, including for archived ids (archived plan pages render read-only with an "Archived \<date\>" banner). The header nav pills (Project | Current | Planned | Archive, with counts on Planned and Archive) mark the active view; the Plan | Execution switch stays for a selected workstream.
 
-Tabs list workstreams in `active`, `paused`, or `done` state (absent reads as `active`); planned bundles appear in the Planned view, never as tabs; archived and dropped live on the Archive shelf. A paused tab carries a pause glyph plus word in its title. The All | Active | Completed filter keeps its identical completed rule over these tabs.
+The pinned bar stays calm no matter how many workstreams exist: project name, `Overall`, the selected workstream as a chip (only with a selection), one `Workstreams (N)` button, up to three pinned chips. The button opens a searchable switcher popover (type to filter by name or id, arrow keys and Enter to pick, Escape closes, `/` opens it from anywhere) listing workstreams grouped by state (Active, Paused, Planned, Done, then a collapsed Archived group) with a state glyph plus word, progress percent, live-agent dot, and per-row quick actions on hover and focus. Pins are viewer-local (`localStorage` behind try/catch, none by default, starring past three is refused). On phones the switcher becomes a full-width sheet. There is no horizontal tab strip and no drag-reorder: the old viewer-local tab order retired with the strip. `?view=exec&ws=<ID>` still opens a workstream tab, and the switcher routes planned rows to the Planned view and archived rows to the Archive view.
 
-The dashboard stays read-only: Archive/Restore buttons copy the exact CLI command (`python3 agent_dash.py ws archive <ID>`, `python3 agent_dash.py ws restore <ID>`) to the clipboard with a confirmation toast; they never write. Closing reports are basename-only on every payload; Report links open the plan view.
+Current is the management table: one row per non-archived, non-dropped workstream with a state pill (glyph plus word), progress bar with percent, live agents, last activity, depends-on chips, and a row action cluster. Above it a toolbar filters by state chips with counts, searches by name or id, and runs bulk actions: `Archive done` archives every done workstream after one confirm that lists them, while `Pause`, `Resume`, and `Mark done` run on checked rows after one confirm each. Rows that are complete but not done carry a `Mark done` primary button; done rows an `Archive` primary; planned rows a `Start`. The same primary appears on the Project home row cards, on the Planned readiness rows, and on the workstream tab heading (a state pill plus the primary as a split button with the remaining actions in its menu); Archive view rows carry `Restore`. Dropping is terminal and says so: its confirm is the stronger one and its toast carries no Undo, as does the Start toast (active has no way back to planned). Every action toasts with Undo kept 10 s, confirms inline (never `window.confirm`), moves focus in and back, names the workstream in every aria-label, disables its buttons while the request is in flight, and documents `/`, arrow keys, and `g` then `p|c|l|a` in a small Keys popover.
+
+The dashboard stays read-only under the switch: every action button becomes a copy-command button (`python3 agent_dash.py ws state <ID> <state>`, `ws archive`, `ws restore`) with a confirmation toast; they never write. Closing reports are basename-only on every payload; Report links open the plan view.
 
 Card registry scopes are `overview`, `workstream`, `both` (the exec tabs), plus `project` (Project home slots `exec-burnup`, `exec-health`, `exec-depgraph`) and `planned` (Planned slot `exec-depgraph`). A slotted entry mounts inside its named slot; an unslotted entry renders as its own section after the slots in registry order. A chart needed on both views adds one registry line per scope over the same spec function: still one file plus registry lines, no routing edits. The live example is the dependency graph: `depgraph.js` registers `depgraph` (scope `project`) and `depgraph-plan` (scope `planned`), both slotted `exec-depgraph` over the one `depGraphSpec`, fed by `GET /api/project/graph`.
 
@@ -521,14 +558,14 @@ and chart agree by construction; when the bucket sum ever differs from the tile
 the page still shows a muted cross line naming both numbers instead of hiding
 it.
 `/api/usage` stays for compatibility but the page no longer reads it.
-The overview workstream cards read the same snapshot rows the tabs read, so
-each card shows exactly what its workstream tab shows for the same 24 h
-window. Runs with no workstream land in the `unassigned` row, which the
-Overview tab shows, so the overview total visibly equals the sum of the parts.
-Every async page response applies only when it still matches the current tab
-and grouping (one fixed window), and the background tab cache is keyed by tab
-and group and expires after one refresh interval, so no tab ever shows another
-tab's numbers. A scope with no tokens in the window reads "0 in 24 h" with its
+The overview workstream cards read the same snapshot rows the switcher and
+the management table read, so each card shows exactly what its workstream
+tab shows for the same 24 h window. Runs with no workstream land in the
+`unassigned` row, which the Overview shows, so the overview total visibly
+equals the sum of the parts. Every async page response applies only when
+it still matches the current workstream and grouping (one fixed window),
+and the background cache is keyed by workstream and group and expires
+after one refresh interval, so no scope ever shows another scope's numbers. A scope with no tokens in the window reads "0 in 24 h" with its
 last run and all-time total underneath. `Running now` is live and unwindowed;
 all-time sublines are not windowed.
 

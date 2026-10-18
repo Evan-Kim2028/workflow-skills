@@ -211,6 +211,28 @@
       var bp = el("button", {type: "button", text: "Plan"});
       bp.addEventListener("click", function () { openPlan(w.ws); });
       acts.appendChild(bp);
+      /* Start beside Plan: the same primary the management table
+         offers for planned rows. Guarded: Plan stays alone when the
+         manage module is absent. */
+      if (typeof primaryFor === "function" && typeof runDescriptor === "function") {
+        (function (host, rowW) {
+          var full = null;
+          ((state.wssAll || []).concat(state.wss || [])).forEach(function (x) {
+            if (String(x.ws).toUpperCase() === String(rowW.ws).toUpperCase()) full = x;
+          });
+          var prow = {ws: rowW.ws, name: rowW.name || "", state: (full && ADT.wsStateOf(full)) || "planned",
+            progress: (full && full.progress) || rowW.progress || null, allowed_actions: (full && full.allowed_actions) || []};
+          var desc = null;
+          try { desc = primaryFor(prow); } catch (e) { desc = null; }
+          if (!desc) return;
+          var tag = rowW.ws + (rowW.name ? " (" + rowW.name + ")" : "");
+          var sb = el("button", {type: "button", class: "arch-btn", text: desc.label});
+          sb.setAttribute("aria-label", desc.label + " " + tag);
+          sb.title = desc.title;
+          sb.addEventListener("click", function (ev) { ev.stopPropagation(); runDescriptor(desc, rowW.ws, tag, host, function () {}); });
+          host.appendChild(sb);
+        })(acts, w);
+      }
       card.appendChild(acts);
       c.appendChild(card);
     });

@@ -27,6 +27,18 @@
   if (typeof window === "undefined") global.registryFor = registryFor;
   else window.registryFor = registryFor;
   AdPage.cardRegistry = [
+    /* The Current management table leads the overview: one row per open
+       workstream with its lifecycle controls (static/core/manage.js). */
+    {id: "manage", order: 5, scope: "overview", spec: function (state, snap) {
+      if (typeof manageSpec !== "function") return null;
+      return manageSpec();
+    }},
+    /* The workstream tab heading cluster: state pill plus the primary
+       action as a split button with the rest in its menu. */
+    {id: "wshead", order: 5, scope: "workstream", spec: function (state, snap) {
+      if (typeof wsHeaderSpec !== "function") return null;
+      return wsHeaderSpec();
+    }},
     {id: "program", order: 10, scope: "overview", spec: function (state, snap) {
       if (!state.wss.length) return null;
       return ["program", keyOf([state.wss.map(function (w) { return [w.ws, w.running, w.name, w.state]; }), planSum, planPrompt]), function () { return programPanel(["active", "paused", "done"]); }, ""];

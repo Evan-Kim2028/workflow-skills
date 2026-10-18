@@ -160,6 +160,24 @@
       var acts = el("div", {class: "prog-acts"});
       var bp = el("button", {text: "Plan"}); bp.addEventListener("click", function () { openPlan(w.ws); }); acts.appendChild(bp);
       var bl = el("button", {text: "Live"}); bl.addEventListener("click", function () { if (window.DashNav) window.DashNav.openExec(w.ws); }); acts.appendChild(bl);
+      /* The management-table primary (Mark done, Start, Resume path;
+         Archive already renders beside it via archiveControl, so that
+         one is skipped here). Guarded: nothing changes when the manage
+         module is absent. */
+      if (typeof primaryFor === "function" && typeof runDescriptor === "function" && typeof manageEnabled === "function") {
+        (function (row, rowPr) {
+          var prow = {ws: row.ws, name: row.name, state: ADT.wsStateOf(row), progress: rowPr, allowed_actions: row.allowed_actions || []};
+          var desc = null;
+          try { desc = primaryFor(prow); } catch (e) { desc = null; }
+          if (!desc || desc.action === "archive") return;
+          var tag = row.ws + (row.name ? " (" + row.name + ")" : "");
+          var prim = el("button", {type: "button", class: "arch-btn", text: desc.label});
+          prim.setAttribute("aria-label", desc.label + " " + tag);
+          prim.title = desc.title;
+          prim.addEventListener("click", function (ev) { ev.stopPropagation(); runDescriptor(desc, row.ws, tag, acts, function () {}); });
+          acts.appendChild(prim);
+        })(w, pr);
+      }
       if (readyToArchive(w, pr)) {
         /* Real archive button when the server allows writes, else the
            copy-command button. The control names the workstream in its

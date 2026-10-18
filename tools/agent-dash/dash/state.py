@@ -304,15 +304,29 @@ def _build_state_body(store, cfg, now: float, processes, doctor, build) -> dict:
         except Exception:
             meta = {}
 
+    try:
+        from dash.actions import allowed_actions_for as _allowed_actions
+    except Exception:
+        _allowed_actions = None
+
+    def _allowed(ws: str, st: str) -> list:
+        if _allowed_actions is None:
+            return []
+        item = bundles.get(ws)
+        kind = item.get("kind") if isinstance(item, dict) else None
+        return _allowed_actions(ws, st, kind)
+
     workstreams = []
     for row in roll["rows"]:
         ws = row["ws"]
         progress = _row_progress(resolve_plan, ws) if resolve_plan is not None else None
+        st = state_of(ws, meta) if state_of is not None else "active"
         workstreams.append(
             {
                 "id": ws,
                 "title": titles.get(ws) or bundles.get(ws, {}).get("title", "") or "",
-                "state": state_of(ws, meta) if state_of is not None else "active",
+                "state": st,
+                "allowed_actions": _allowed(ws, st),
                 "plan": ws in plan_ids,
                 "progress": progress,
                 "live_agents": row["live_agents"],
@@ -331,11 +345,13 @@ def _build_state_body(store, cfg, now: float, processes, doctor, build) -> dict:
             for extra in bundle_fallback_rows(have, plan_ids=plan_ids) or []:
                 ws = extra.get("ws")
                 progress = _row_progress(resolve_plan, ws) if resolve_plan is not None else None
+                st = extra.get("state", "active")
                 workstreams.append(
                     {
                         "id": ws,
                         "title": titles.get(ws) or bundles.get(ws, {}).get("title", "") or extra.get("name", "") or "",
-                        "state": extra.get("state", "active"),
+                        "state": st,
+                        "allowed_actions": _allowed(ws, st),
                         "plan": ws in plan_ids,
                         "progress": progress,
                         "live_agents": 0,
@@ -386,8 +402,9 @@ def _build_state_body(store, cfg, now: float, processes, doctor, build) -> dict:
         # /api/project) fills this block from project.json. Reads use
         # payload.get("project", {}).get("name") so both shapes work.
         "project": {"name": None},
-        # The one write action the page may offer. False in read-only
-        # mode, when the Archive buttons fall back to copy-command.
+        # Whether the page may offer its write actions (archive plus
+        # the lifecycle controls). False in read-only mode, when every
+        # action button falls back to a copy-command button.
         "actions": {"archive": bool(actions_enabled is not None and actions_enabled(cfg))},
         "decisions": decisions,
         "risks": risks,
