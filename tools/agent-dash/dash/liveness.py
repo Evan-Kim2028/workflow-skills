@@ -10,6 +10,7 @@ and the store use the same reap-safe check. A zombie still answers
 from __future__ import annotations
 
 import os
+import re
 
 # A running row with no fresher evidence than this is stale in views and
 # in reconcile, even when its pid is alive or it carries no pid. Six hours
@@ -60,6 +61,89 @@ def stale_grace_s(source) -> float:
     except (TypeError, ValueError):
         interval = 2.0
     return 2.0 * interval
+
+
+# Quota-failure patterns for grok-build (`grok -p`) run logs. Mirrors the
+# worker registry (`workers.local.json` quota_patterns): a run whose stderr
+# or report tail matches one of these ended on a rate/quota limit, not on a
+# finished turn. Sources use this to close the row as done/BLOCKED instead
+# of leaving it running (or letting a shared out file read PASS).
+QUOTA_PATTERNS = (
+    r"rate limit",
+    r"quota",
+    r"(HTTP|status|error|code)[ :=]*429\b|429 Too Many",
+    r"usage limit",
+)
+
+# How much of an err/out tail to scan for a quota hit. Small and bounded:
+# quota errors print within the last lines, and sources already budget the
+# full file reads separately.
+QUOTA_TAIL_BYTES = 8 * 1024
+
+
+def text_shows_quota(text, patterns=QUOTA_PATTERNS) -> bool:
+    """True when ``text`` matches any quota pattern (case-insensitive)."""
+    if not text or not isinstance(text, str):
+        return False
+    for pattern in patterns or ():
+        if not isinstance(pattern, str) or not pattern:
+            continue
+        try:
+            if re.search(pattern, text, re.IGNORECASE):
+                return True
+        except re.error:
+            continue
+    return False
+
+
+def file_shows_quota(path, max_bytes=QUOTA_TAIL_BYTES) -> bool:
+    """True when the tail of ``path`` matches a quota pattern.
+
+    Reads only the last ``max_bytes``. Missing or unreadable files read
+    as False, never an exception: sources stay exception-safe and a
+    failed read simply skips the quota close-out.
+    """
+    if not path or not isinstance(path, str):
+        return False
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return False
+    if size <= 0:
+        return False
+    try:
+        with open(path, "rb") as fh:
+            if size <= max_bytes:
+                data = fh.read(size)
+            else:
+                fh.seek(max(0, size - max_bytes))
+                data = fh.read(max_bytes)
+    except OSError:
+        return False
+    try:
+        text = data.decode("utf-8", "replace")
+    except (UnicodeError, ValueError):
+        return False
+    return text_shows_quota(text)
+
+
+def read_pid_file(path):
+    """Pid from a ``run_worker.py`` ``<label>.pid`` file, or None.
+
+    One integer per file; anything else (missing, blank, non-numeric)
+    reads as None so callers fall back to their other evidence.
+    """
+    if not path or not isinstance(path, str):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            text = fh.read(64).strip().split()[0]
+    except (OSError, IndexError, ValueError):
+        return None
+    try:
+        return int(text)
+    except (TypeError, ValueError):
+        return None
 
 
 def pid_alive(pid) -> bool:

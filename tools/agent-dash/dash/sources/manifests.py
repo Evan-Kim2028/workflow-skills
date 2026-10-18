@@ -31,6 +31,8 @@ import os
 import re
 import stat
 
+from dash.liveness import file_shows_quota, read_pid_file
+
 NAME = "manifests"
 INTERVAL_S = 2
 
@@ -242,6 +244,70 @@ def poll(store, cfg, now: float) -> None:
         _log.warning("manifests poll: %s", type(exc).__name__)
 
 
+def _pid_file_for(scratch, base, label):
+    """Authoritative pid for ``label`` from its ``run_worker.py`` pid file.
+
+    ``run_worker.py`` writes ``<run-dir>/<label>.pid`` beside the manifest
+    TSV. A flat run folder holds it next to the TSV (``scratch``); a
+    session pad holds it next to the tool out files (``base``). The first
+    hit wins; a missing or unreadable file reads as None.
+    """
+    for directory in (scratch, base):
+        if not directory:
+            continue
+        try:
+            candidate = os.path.join(directory, f"{label}.pid")
+        except (TypeError, ValueError):
+            continue
+        pid = read_pid_file(candidate)
+        if pid is not None:
+            return pid
+    return None
+
+
+def _quota_hit_for(source, err_path, out_path) -> bool:
+    """True when a grok-build run's logs show a quota/rate-limit failure.
+
+    Only grok-build rows (sources ``glm``/``grok``) are scanned: other
+    families never print these patterns, and the scan stays bounded to one
+    small tail read per log. Errors read as False, never an exception.
+    """
+    if source not in ("glm", "grok"):
+        return False
+    try:
+        if err_path and file_shows_quota(err_path):
+            return True
+    except Exception:
+        pass
+    try:
+        if out_path and file_shows_quota(out_path):
+            return True
+    except Exception:
+        return False
+    return False
+
+
+def _superseded(store, source, run_id, label, started_at) -> bool:
+    """True when a newer open row owns this label now.
+
+    Retries reuse the label under a new session id while the TSV keeps
+    every attempt: the shared out file keeps growing and the live label
+    stays lit for the newest attempt. Without this, every older attempt
+    with the same label re-reads ``running`` off the newer's evidence.
+    A session match is exact and never superseded here; only the label
+    leg loses to a newer open row (mirrors ``process._vetoed``).
+    """
+    if not label or not source or not run_id:
+        return False
+    finder = getattr(store, "newer_open_label_row", None)
+    if not callable(finder):
+        return False
+    try:
+        return finder(label, source, started_at, run_id) is not None
+    except Exception:
+        return False
+
+
 def _emit_manifest(
     store, parent, scratch, source, directory, default_tier, row, now, left, per_file, live,
     flat: bool = False,
@@ -255,6 +321,9 @@ def _emit_manifest(
     run_id = _run_id(source, directory, row["session_uuid"], parent, label, row["started_at"])
     model = row["model"]
     tier = tier_of(model) or default_tier
+    pid_file = _pid_file_for(scratch, base, label)
+    quota_hit = _quota_hit_for(source, err_path, out_path)
+    superseded = _superseded(store, source, run_id, label, row["started_at"])
     left = _emit_files(
         store,
         run_id=run_id,
@@ -274,6 +343,9 @@ def _emit_manifest(
         live=live,
         now=now,
         ttl=ttl,
+        pid_file=pid_file,
+        quota_hit=quota_hit,
+        superseded=superseded,
     )
     return left
 
@@ -352,6 +424,9 @@ def _emit_files(
     live,
     now,
     ttl,
+    pid_file=None,
+    quota_hit=False,
+    superseded=False,
 ) -> int:
     out_st = _stat(out_path) if out_path else None
     err_st = _stat(err_path) if err_path else None
@@ -395,6 +470,16 @@ def _emit_files(
         label_alive=alive,
         err_known=err_known,
     )
+    if quota_hit and not superseded:
+        # A quota/rate-limit failure ends the run even while the label is
+        # still lit by a relaunch or the out file is still growing: the
+        # log names the failure, and BLOCKED keeps it out of PASS counts.
+        status = "done"
+        verdict = "BLOCKED"
+    elif superseded and status in ("running", "unknown"):
+        # An older attempt sharing the label/out file with a newer open
+        # row: the growth and the live label belong to the newer attempt.
+        status = "done"
     ended = None
     if status in ("done", "killed", "died_early"):
         mtimes = [st.st_mtime for st in (out_st, err_st, report_st) if st is not None]
@@ -403,6 +488,11 @@ def _emit_files(
         seen = _last_seen(store, run_id)
         if seen is not None and (ended is None or seen > ended):
             ended = seen
+    # The run_worker's pid file names the label's latest process. Adopt it
+    # only on the newest attempt: older attempts sharing the label must
+    # not claim the newer's pid, and a dead pid on the row lets the stale
+    # check close it on the fast dead-pid path instead of the 6 h idle one.
+    pid = pid_file if (pid_file is not None and not superseded) else None
     patch = {
         "run_id": run_id,
         "source": source,
@@ -417,7 +507,7 @@ def _emit_files(
         "clock_source": clock,
         "out_bytes": out_bytes,
         "err_bytes": err_bytes,
-        "pid": None,
+        "pid": pid,
         "out_path": out_path if out_st is not None else None,
     }
     clear = ()

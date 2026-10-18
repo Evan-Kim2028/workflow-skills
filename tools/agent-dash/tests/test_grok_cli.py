@@ -409,6 +409,107 @@ class GrokCliTests(unittest.TestCase):
             run = store.runs["glm:%s:ws8-nested" % SID]
             self.assertEqual(run["parent_session_id"], HUB)
 
+class GrokRunDirEvidenceTests(unittest.TestCase):
+    def setUp(self):
+        grok.last_error = None
+
+    def poll(self, store, cfg, now):
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            grok.poll(store, cfg, now)
+        self.assertEqual(buf.getvalue(), "")
+        return buf.getvalue()
+
+    def tree(self, tmp, manifest, extra_files=None, sid=SID):
+        sessions = os.path.join(tmp, "sessions")
+        os.makedirs(os.path.join(sessions, "cwd", sid))
+        pads = os.path.join(tmp, "pads")
+        scratch = os.path.join(pads, "encoded", HUB, "scratchpad")
+        os.makedirs(scratch)
+        with open(os.path.join(scratch, "glm-sessions.tsv"), "w") as fh:
+            fh.write(manifest)
+        for name, data in (extra_files or {}).items():
+            with open(os.path.join(scratch, name), "w") as fh:
+                fh.write(data)
+        cfg = {
+            "roots": {
+                "grok_sessions": sessions,
+                "grok_log": os.path.join(tmp, "missing.jsonl"),
+                "scratchpads": pads,
+            },
+            "read_budget": {"per_file": 1024 * 1024, "per_tick": 4 * 1024 * 1024},
+        }
+        return cfg, scratch
+
+    def test_latest_per_label_picks_newest_session(self):
+        manifests = {
+            "old-sid": {"label": "ws9-x", "started_at": 100.0},
+            "new-sid": {"label": "ws9-x", "started_at": 200.0},
+            "other-sid": {"label": "ws9-y", "started_at": 50.0},
+        }
+        self.assertEqual(grok._latest_per_label(manifests), {"new-sid", "other-sid"})
+
+    def test_quota_err_closes_newest_attempt_as_blocked(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg, _scratch = self.tree(
+                tmp,
+                "quota-run\t%s\t1792153370\tglm-5.3\n" % SID,
+                {"err-quota-run.log": "grok failed\nUsage limit reached for 5 hour\n"},
+            )
+            store = Store()
+            self.poll(store, cfg, 1792154000)
+            run = store.runs["glm:%s:quota-run" % SID]
+            self.assertEqual(run["status"], "done")
+            self.assertEqual(run["verdict"], "BLOCKED")
+            self.assertNotIn("pid", run)
+
+    def test_quota_closeout_wins_over_a_live_label_match(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pad = os.path.join(tmp, "rundir")
+            os.makedirs(pad)
+            with open(os.path.join(pad, "err-quota-run.log"), "w") as fh:
+                fh.write("Usage limit reached for 5 hour\n")
+            store = Store()
+            row = {"label": "quota-run", "session_id": SID, "started_at": 1792153370.0}
+            procs = [{"pid": 99999, "comm": "grok", "label": "quota-run", "model": None,
+                      "reasoning_effort": None, "prompt_label": None, "session_id": None,
+                      "started_at": 1792153990.0}]
+            grok._upsert_run(store, row, None, None, procs, pad, True, 1792154000)
+            run = store.runs["glm:%s:quota-run" % SID]
+            self.assertEqual(run["status"], "done")
+            self.assertEqual(run["verdict"], "BLOCKED")
+            self.assertNotIn("pid", run)
+
+    def test_pid_file_is_adopted_without_forcing_status(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg, _scratch = self.tree(
+                tmp,
+                "pid-run\t%s\t1792153370\tglm-5.3\n" % SID,
+                {"pid-run.pid": "12345\n"},
+            )
+            store = Store()
+            self.poll(store, cfg, 1792154000)
+            run = store.runs["glm:%s:pid-run" % SID]
+            self.assertEqual(run["pid"], 12345)
+            self.assertNotIn("status", run)
+
+    def test_older_attempt_ignores_newer_quota_evidence(self):
+        old = "11111111-1111-4111-8111-111111111111"
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg, _scratch = self.tree(
+                tmp,
+                "same-label\t%s\t1792153300\tglm-5.3\n"
+                "same-label\t%s\t1792153370\tglm-5.3\n" % (old, SID),
+                {"err-same-label.log": "Usage limit reached for 5 hour\n"},
+            )
+            store = Store()
+            self.poll(store, cfg, 1792154000)
+            new = store.runs["glm:%s:same-label" % SID]
+            self.assertEqual((new["status"], new["verdict"]), ("done", "BLOCKED"))
+            prev = store.runs["glm:%s:same-label" % old]
+            self.assertNotIn("status", prev)
+            self.assertNotIn("verdict", prev)
+
     @unittest.skipUnless(os.environ.get("AGENT_DASH_SMOKE") == "1", "set AGENT_DASH_SMOKE=1 to read a local glm usage file")
     def test_smoke_real_usage_json(self):
         sessions = os.environ.get("AGENT_DASH_SMOKE_GROK_SESSIONS")

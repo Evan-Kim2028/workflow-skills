@@ -677,6 +677,141 @@ class ManifestAliasRestartTests(unittest.TestCase):
         self.assertEqual(self._duplicates(), [])
 
 
+class ManifestQuotaAndSupersedeTests(unittest.TestCase):
+    def setUp(self):
+        manifests.reset_state()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.store = MemStore()
+        self.root = self.tmp.name
+        self.scratch = os.path.join(self.root, "enc", PARENT, "scratchpad")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+        manifests.reset_state()
+
+    def _emit(self, label, session_id, started, files, live, **kwargs):
+        base = os.path.join(self.scratch, "glm")
+        params = {"out_path": None, "err_path": None, "report_path": None}
+        for kind, name in (("out", f"out-{label}.md"), ("err", f"err-{label}.log")):
+            if name in files:
+                path = os.path.join(base, name)
+                _write(path, files[name], NOW)
+                params["out_path" if kind == "out" else "err_path"] = path
+        run_id = f"glm:{session_id}:{label}"
+        left = manifests._emit_files(
+            self.store,
+            run_id=run_id,
+            source="glm",
+            tier="glm",
+            model="glm-5.3",
+            label=label,
+            session_id=session_id,
+            parent=PARENT,
+            started_at=started,
+            clock="manifest",
+            out_path=params["out_path"],
+            err_path=params["err_path"],
+            report_path=params["report_path"],
+            left=1024 * 1024,
+            per_file=1024 * 1024,
+            live=live,
+            now=NOW,
+            ttl=30,
+            **kwargs,
+        )
+        self.assertGreaterEqual(left, 0)
+        return self.store.runs[run_id]
+
+    def test_quota_err_closes_running_row_as_blocked(self):
+        row = self._emit(
+            "quota-lane",
+            GLM,
+            1700000002,
+            {"out-quota-lane.md": "working\n", "err-quota-lane.log": "Usage limit reached for 5 hour\n"},
+            live={"quota-lane"},
+            pid_file=4242,
+            quota_hit=True,
+            superseded=False,
+        )
+        self.assertEqual(row["status"], "done")
+        self.assertEqual(row["verdict"], "BLOCKED")
+        self.assertEqual(row["pid"], 4242)
+        self.assertIsNotNone(row.get("ended_at"))
+
+    def test_quota_applies_to_newest_attempt_only(self):
+        row = self._emit(
+            "quota-lane",
+            GLM,
+            1700000002,
+            {"out-quota-lane.md": "working\n", "err-quota-lane.log": "Usage limit reached for 5 hour\n"},
+            live={"quota-lane"},
+            pid_file=4242,
+            quota_hit=True,
+            superseded=True,
+        )
+        # The superseded row still closes (its growth belongs to the newer
+        # attempt) but the quota verdict and pid stay with the newest row.
+        self.assertEqual(row["status"], "done")
+        self.assertIsNone(row.get("verdict"))
+        self.assertIsNone(row.get("pid"))
+
+    def test_superseded_running_row_closes_without_quota(self):
+        row = self._emit(
+            "old-lane",
+            GLM,
+            1700000002,
+            {"out-old-lane.md": "working\n"},
+            live={"old-lane"},
+            pid_file=4242,
+            quota_hit=False,
+            superseded=True,
+        )
+        self.assertEqual(row["status"], "done")
+        self.assertIsNone(row.get("pid"))
+        self.assertIsNotNone(row.get("ended_at"))
+
+    def test_pid_file_adopted_on_newest_attempt_only(self):
+        fresh = self._emit(
+            "pid-lane", GLM, 1700000002, {"out-pid-lane.md": "working\n"},
+            live=set(), pid_file=4242, quota_hit=False, superseded=False,
+        )
+        self.assertEqual(fresh["pid"], 4242)
+        stale = self._emit(
+            "pid-lane", OTHER, 1700000001, {"out-pid-lane.md": "working\n"},
+            live=set(), pid_file=4242, quota_hit=False, superseded=True,
+        )
+        self.assertIsNone(stale.get("pid"))
+
+    def test_poll_quota_err_marks_glm_row_blocked(self):
+        _write(
+            os.path.join(self.scratch, "glm-sessions.tsv"),
+            f"quota-poll\t{GLM}\t1700000002\tglm-5.3\n",
+            NOW,
+        )
+        _write(
+            os.path.join(self.scratch, "glm", "out-quota-poll.md"),
+            "working\n",
+            NOW,
+        )
+        _write(
+            os.path.join(self.scratch, "glm", "err-quota-poll.log"),
+            "Usage limit reached for 5 hour\n",
+            NOW,
+        )
+        cfg = {
+            "scratch_root": self.root,
+            # Isolate from the machine's registered run folders (see above).
+            "state_dir": os.path.join(self.root, "state"),
+            "dir_scan_s": 0,
+            "live_window_s": 36 * 3600,
+            "read_budgets": {"per_file": 1024 * 1024, "per_tick": 1024 * 1024},
+        }
+        manifests.poll(self.store, cfg, NOW)
+        row = self.store.runs[f"glm:{GLM}:quota-poll"]
+        self.assertEqual(row["status"], "done")
+        self.assertEqual(row["verdict"], "BLOCKED")
+
+
 class ManifestSmokeTests(unittest.TestCase):
     @unittest.skipUnless(os.environ.get("AGENT_DASH_SMOKE") == "1", "set AGENT_DASH_SMOKE=1 to read a local scratchpad")
     def test_manifest_parses(self):
