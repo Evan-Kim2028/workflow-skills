@@ -5,6 +5,7 @@ import subprocess
 os.environ["AGENT_DASH_IGNORE_LOCAL"] = "1"
 os.environ.setdefault("AGENT_DASH_WORKSTREAMS", os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "fixtures", "bundles"))
 import re
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -733,6 +734,184 @@ class PageRules(unittest.TestCase):
             capture_output=True,
             text=True,
         )
+        self.assertEqual(proc.returncode, 0, proc.stderr or proc.stdout)
+
+
+    def test_timeline_source_contract(self):
+        """The timeline card keeps its integration points: the axis comes
+        from the shared helpers, every bar carries its run id and outcome,
+        and numbers stay compact."""
+        src = (STATIC / "cards" / "timeline.js").read_text()
+        for token in ("axes(", "timeTicks(", "data-run-id", "data-outcome"):
+            self.assertIn(token, src, f"timeline.js lost {token}")
+        for bad in (".toFixed(", "toLocaleString()", '"dagster"', "'dagster'"):
+            self.assertNotIn(bad, src, f"timeline.js must not contain {bad}")
+
+    def test_timeline_draws_every_run(self):
+        """The run timeline draws every run in the window, never a sample:
+        the real gantt() renders one bar per run (data-run-id) of a
+        generated 640-run payload, every bar carries a data-outcome, the
+        lane labels add up to the payload, and a >400-row lane becomes a
+        labelled dense strip that still expands to every bar."""
+        harness = r'''
+const fs = require("fs");
+const assert = require("assert");
+const files = process.argv.slice(2);
+global.window = globalThis;
+global.location = {search: ""};
+function mkEl(tag) {
+  return {tag: tag, attrs: {}, children: [], style: {}, dataset: {},
+    textContent: "", __handlers: {},
+    setAttribute: function (k, v) { this.attrs[k] = String(v); },
+    getAttribute: function (k) { return this.attrs[k]; },
+    appendChild: function (c) { this.children.push(c); return c; },
+    insertBefore: function (c) { this.children.unshift(c); return c; },
+    addEventListener: function (t, f) { (this.__handlers[t] = this.__handlers[t] || []).push(f); },
+    getBoundingClientRect: function () { return {left: 0, width: 100, top: 0, height: 100}; }};
+}
+global.document = {
+  createElement: mkEl,
+  createElementNS: function (ns, t) { return mkEl(t); },
+  createTextNode: function (t) { return {text: String(t)}; },
+  getElementById: function (id) {
+    if (id === "main") return {clientWidth: 1100};
+    return mkEl("div");
+  }
+};
+global.getComputedStyle = function () { return {getPropertyValue: function () { return ""; }}; };
+global.innerWidth = 1440;
+global.innerHeight = 900;
+global.WINDOW_HOURS = 24;
+global.openRun = function () {};
+global.drawMain = function () {};
+global.state = {runs: [], ws: "all"};
+files.forEach(function (p) { eval(fs.readFileSync(p, "utf8")); });
+["gantt", "isAgent", "runEnd", "packRows", "outcomeOf", "outcomeColor"].forEach(function (n) {
+  assert.strictEqual(typeof global[n], "function", n + " is not exported");
+});
+assert.strictEqual(typeof global.expanded, "object", "expanded lane state is not exported");
+assert.deepStrictEqual(Object.keys(OUTCOME).sort(), ["bad", "ok", "part", "run", "unk"]);
+function walk(node, out) {
+  out.push(node);
+  (node.children || []).forEach(function (c) { if (c && c.children) walk(c, out); });
+}
+function render() {
+  var nodes = [];
+  walk(gantt(), nodes);
+  return nodes;
+}
+function barsOf(nodes) {
+  return nodes.filter(function (n) { return n.tag === "rect" && n.attrs["data-run-id"] !== undefined; });
+}
+function textsOf(nodes, cls) {
+  return nodes.filter(function (n) { return n.tag === "text" && n.attrs.class === cls; }).map(function (n) { return n.textContent; });
+}
+var NOW = Math.floor(Date.now() / 1000), T0 = NOW - 24 * 3600;
+var SPECS = [
+  {source: "claude-subagent", tier: "haiku", model: "claude-haiku-4"},
+  {source: "grok", tier: "grok", model: "grok-4"},
+  {source: "muse", tier: "muse", model: "muse-1"},
+  {source: "glm", tier: "glm", model: "glm-4"}
+];
+var VERDICTS = ["PASS", "PARTIAL", "BLOCKED", "APPROVE", "APPROVE_WITH_CHANGES", "REQUEST_CHANGES", null];
+function mkRun(i, spec, start, end, status, verdict) {
+  return {run_id: "test:" + i, source: spec.source, tier: spec.tier, model: spec.model,
+    label: "tl-" + i, workstream: "WS1", status: status, verdict: verdict,
+    started_at: start, ended_at: end,
+    elapsed_s: Math.max(0, (end == null ? NOW : end) - start), clock_source: "transcript"};
+}
+/* Scenario A: 640 runs across four families with moderate overlap. */
+var runs = [];
+for (var i = 0; i < 640; i++) {
+  var spec = SPECS[i % 4], slot = Math.floor(i / 4) % 40;
+  var start = T0 + 4000 + slot * 2000 + (i % 7), end = start + 1500;
+  var status = "done", verdict = VERDICTS[i % VERDICTS.length];
+  if (i % 40 === 7) { status = "running"; verdict = null; end = null; }
+  else if (i % 40 === 13) { status = "killed"; verdict = null; }
+  else if (i % 40 === 29) { status = "died_early"; verdict = null; }
+  else if (i % 40 === 33) { status = "unknown"; verdict = null; }
+  runs.push(mkRun(i, spec, start, end, status, verdict));
+}
+state.runs = runs;
+state.ws = "all";
+var nodes = render(), bars = barsOf(nodes);
+assert.strictEqual(bars.length, runs.length, "bars " + bars.length + " != runs " + runs.length);
+var labels = textsOf(nodes, "tl-lane-label").filter(function (t) { return t.indexOf("runs") >= 0; });
+assert.ok(!labels.some(function (t) { return t.indexOf("(dense)") >= 0; }), "moderate overlap must not go dense");
+var laneTotal = labels.reduce(function (a, t) { return a + Number(/(\d+) runs/.exec(t)[1]); }, 0);
+assert.strictEqual(laneTotal, runs.length, "lane labels sum to " + laneTotal + ", payload has " + runs.length);
+var outcomes = {};
+bars.forEach(function (b) { outcomes[b.attrs["data-outcome"]] = true; });
+["run", "ok", "part", "bad", "unk"].forEach(function (o) {
+  assert.ok(outcomes[o], "no bar with outcome " + o);
+});
+bars.forEach(function (b) {
+  assert.ok(b.__handlers.click && b.__handlers.click.length, "bar without click: " + b.attrs["data-run-id"]);
+  assert.ok(b.__handlers.mousemove && b.__handlers.mousemove.length, "bar without hover: " + b.attrs["data-run-id"]);
+  assert.ok(Number(b.attrs.width) >= 2, "bar narrower than 2px: " + b.attrs["data-run-id"]);
+  assert.ok(Number(b.attrs.height) >= 2, "bar shorter than 2px: " + b.attrs["data-run-id"]);
+});
+var legend = nodes.filter(function (n) { return n.attrs.class === "legend"; })[0];
+var legendText = JSON.stringify(legend);
+["\u25CF running", "\u2713 finished", "\u25D0 partial", "\u2715 died or blocked", "? ended, outcome unknown"].forEach(function (want) {
+  assert.ok(legendText.indexOf(want) >= 0, "legend never says " + want);
+});
+/* Scenario B: one lane with 500 overlapping runs goes dense but keeps its count and its expand. */
+runs = [];
+for (var j = 0; j < 500; j++) runs.push(mkRun(j, SPECS[0], NOW - 3600, NOW - 600, "done", "PASS"));
+for (var k = 500; k < 505; k++) runs.push(mkRun(k, SPECS[1], NOW - 3600 + (k - 500) * 100, NOW - 600, "done", "PASS"));
+state.runs = runs;
+Object.keys(expanded).forEach(function (key) { delete expanded[key]; });
+nodes = render();
+bars = barsOf(nodes);
+assert.strictEqual(bars.length, 5, "dense lane must aggregate; other lane bars = 5, got " + bars.length);
+labels = textsOf(nodes, "tl-lane-label").filter(function (t) { return t.indexOf("runs") >= 0; });
+assert.ok(labels.some(function (t) { return t.indexOf("500 runs (dense)") >= 0; }), "dense label lost the true count: " + JSON.stringify(labels));
+var heats = nodes.filter(function (n) { return n.attrs.class === "tl-heat"; });
+assert.ok(heats.length > 0, "dense lane drew no heat cells");
+var peak = Math.max.apply(null, heats.map(function (h) { return Number(h.attrs["data-dense-count"]); }));
+assert.strictEqual(peak, 500, "dense peak " + peak + " != 500");
+var denseFam = ADM.famOf(tierKey(runs[0]));
+var hits = nodes.filter(function (n) { return n.attrs.class === "tl-lane-hit" && n.attrs["data-lane"] === denseFam; });
+assert.strictEqual(hits.length, 1, "dense lane lost its expand hit area");
+hits[0].__handlers.click.forEach(function (f) { f(); });
+assert.strictEqual(expanded[denseFam], true, "dense lane click did not expand");
+nodes = render();
+bars = barsOf(nodes);
+assert.strictEqual(bars.length, 505, "expanded dense lane bars " + bars.length + " != 505 runs");
+bars.forEach(function (b) {
+  assert.ok(Number(b.attrs.width) >= 2 && Number(b.attrs.height) >= 2, "expanded bar below 2px: " + b.attrs["data-run-id"]);
+});
+/* Scenario C: a workstream tab auto-opens one lane and still draws every run. */
+Object.keys(expanded).forEach(function (key) { delete expanded[key]; });
+runs = [];
+for (var m = 0; m < 640; m++) {
+  var sp2 = SPECS[m % 4], sl = Math.floor(m / 4) % 40;
+  runs.push(mkRun(m, sp2, T0 + 4000 + sl * 2000 + (m % 7), T0 + 4000 + sl * 2000 + (m % 7) + 1500, "done", VERDICTS[m % VERDICTS.length]));
+}
+state.runs = runs;
+state.ws = "WS1";
+nodes = render();
+bars = barsOf(nodes);
+assert.strictEqual(bars.length, 640, "ws-tab bars " + bars.length + " != 640 runs");
+assert.ok(textsOf(nodes, "tl-model-label").length > 0, "ws tab opened no per-model lane");
+console.log("timeline every-run proof ok: 640 + 505 + 640 bars");
+'''
+        files = [
+            STATIC / "models.js",
+            STATIC / "format.js",
+            STATIC / "core" / "el.js",
+            STATIC / "core" / "charts.js",
+            STATIC / "cards" / "timeline.js",
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            harness_path = Path(tmp) / "tl_every_run.js"
+            harness_path.write_text(harness, encoding="utf-8")
+            proc = subprocess.run(
+                ["node", str(harness_path)] + [str(p) for p in files],
+                capture_output=True,
+                text=True,
+            )
         self.assertEqual(proc.returncode, 0, proc.stderr or proc.stdout)
 
 

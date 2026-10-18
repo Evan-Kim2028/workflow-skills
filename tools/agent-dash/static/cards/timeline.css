@@ -1,0 +1,16 @@
+/* Run timeline card (static/cards/timeline.js). Outcome and entity colours
+   come from the shared tokens; everything here is timeline-local. */
+#exec-timeline .tl-lane-label{fill:var(--ink);font:700 12px var(--mono)}
+#exec-timeline .tl-strip-sub{fill:var(--muted);font:11px var(--font)}
+#exec-timeline .tl-model-label{fill:var(--ink-2);font:600 11.5px var(--font)}
+#exec-timeline .tl-bar{cursor:pointer}
+#exec-timeline .tl-bar:hover{filter:brightness(1.3)}
+#exec-timeline .tl-lane-hit{cursor:pointer}
+#exec-timeline .tl-dense-hit{cursor:pointer}
+#exec-timeline svg{max-width:100%;height:auto}
+#exec-timeline .tl-now{stroke:var(--s1);stroke-width:1.5;animation:tlnow 2s ease-in-out infinite}
+@keyframes tlnow{50%{opacity:.45}}
+@media (prefers-reduced-motion:reduce){
+#exec-timeline .tl-now{animation:none}
+#exec-timeline .tl-bar:hover{filter:none}
+}
