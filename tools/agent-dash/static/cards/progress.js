@@ -1,7 +1,7 @@
 /* Page card: Progress over time (workstream Execution tab, below the
    planning-versus-execution card).
    Chart A (main): % of non-deferred tasks done over time as a step area,
-   with the recorded prog (merged, awaiting deploy) count as a lighter
+   with the recorded prog (merged, waiting on prod) count as a lighter
    band on the same % axis and labelled dots where completion first
    crossed 20/40/60/80/100%. Chart B (small, directly under A): agent
    runs started per hour as bars on the same time axis. Separate charts
@@ -32,7 +32,7 @@
   }
   function progStepRows(done, totalAll, prog) {
     return [{k: "Done", v: fmtN(done) + " of " + fmtN(totalAll) + " tasks", c: "var(--s1)"},
-      {k: "Awaiting deploy", v: fmtN(prog) + " tasks", c: "var(--s5)"}];
+      {k: "Merged, waiting on prod", v: fmtN(prog) + " tasks", c: "var(--s5)"}];
   }
   function progBarRows(n) { return [{k: "Runs started", v: fmtN(n), c: "var(--s2)"}]; }
   function progAria(ws, done, total, best, bestElapsed) {
@@ -96,14 +96,14 @@
     return d;
   }
 
-  /* Legend: Done plus Awaiting deploy (two series, so a legend), each a
+  /* Legend: Done plus Merged, waiting on prod (two series, so a legend), each a
      swatch plus glyph plus word, never color alone. */
   function progLegend(host, p) {
     var lg = el("div", {class: "legend prog-legend"});
     var doneNow = p.done || 0, progNow = 0;
     if (p.points && p.points.length) progNow = p.points[p.points.length - 1].prog || 0;
     lg.appendChild(el("span", {class: "ltotal", "data-legend-total": String(doneNow), "data-chart-sum": String(doneNow), title: "Tasks done now in this workstream"}, [el("b", {text: "Done " + fmtN(doneNow)})]));
-    [["done", "✓ Done", "var(--s1)", doneNow], ["prog", "⇡ Awaiting deploy", "var(--s5)", progNow]].forEach(function (row) {
+    [["done", "✓ Done", "var(--s1)", doneNow], ["prog", "⇡ Merged, waiting on prod", "var(--s5)", progNow]].forEach(function (row) {
       lg.appendChild(el("span", {class: "lentry", "data-key": row[0], "data-v": String(row[3]), title: progLegendTip(row[1], row[3] / Math.max(1, p.total || 0))}, [
         (function () { var sw = el("i", {class: "sw"}); sw.style.background = row[2]; return sw; })(),
         el("span", {class: "lname", text: row[1]}),

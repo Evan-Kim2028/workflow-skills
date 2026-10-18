@@ -5,7 +5,7 @@ tab's "Progress over time" card paints:
 
 - Chart A: % of non-deferred tasks done over time (a step line from each
   task's resolved done moment, plus the recorded ``prog``
-  = merged-awaiting-deploy count as a lighter band on the same % axis),
+  = merged-waiting-on-prod count as a lighter band on the same % axis),
   with the first-cross times of 20/40/60/80/100%;
 - Chart B: agent runs started per hour on the same time axis (a separate
   chart: runs are a different unit, one y axis per chart).
