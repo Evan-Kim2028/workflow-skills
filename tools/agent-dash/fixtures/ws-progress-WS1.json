@@ -1,0 +1,97 @@
+{
+  "wsprogress": {
+    "ws": "WS1",
+    "total": 5,
+    "done": 2,
+    "pct": 40,
+    "counts": {
+      "todo": 1,
+      "wip": 1,
+      "pr": 1,
+      "prog": 0,
+      "done": 2,
+      "deferred": 0
+    },
+    "start": 1761996360,
+    "end": 1761999960.0,
+    "now": 1761999960,
+    "points": [
+      {
+        "t": 1761998160.0,
+        "done": 1,
+        "prog": 0,
+        "pct": 20.0
+      },
+      {
+        "t": 1761999960.0,
+        "done": 2,
+        "prog": 0,
+        "pct": 40.0
+      }
+    ],
+    "milestones": [
+      {
+        "pct": 20,
+        "t": 1761998160.0,
+        "done": 1,
+        "elapsed": 1800.0,
+        "reached": true
+      },
+      {
+        "pct": 40,
+        "t": 1761999960.0,
+        "done": 2,
+        "elapsed": 3600.0,
+        "reached": true
+      },
+      {
+        "pct": 60,
+        "t": null,
+        "done": 3,
+        "elapsed": null,
+        "reached": false
+      },
+      {
+        "pct": 80,
+        "t": null,
+        "done": 4,
+        "elapsed": null,
+        "reached": false
+      },
+      {
+        "pct": 100,
+        "t": null,
+        "done": 5,
+        "elapsed": null,
+        "reached": false
+      }
+    ],
+    "runs_per_hour": [
+      {
+        "t": 1761976800,
+        "n": 19
+      },
+      {
+        "t": 1761980400,
+        "n": 27
+      },
+      {
+        "t": 1761994800,
+        "n": 11
+      },
+      {
+        "t": 1761998400,
+        "n": 3
+      }
+    ],
+    "runs_total": 60,
+    "undated_runs": 0,
+    "observed": 2,
+    "inferred": 0,
+    "dated": 2,
+    "undated": 0,
+    "gap": null,
+    "backfilled": []
+  },
+  "_note": "Seeded synthetic data for the offline preview. Seed 1. No local sessions are read."
+}

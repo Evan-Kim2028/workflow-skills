@@ -108,6 +108,7 @@
       if (path === "/api/workstreams" && params && params.state) base = "workstreams-all";
       if (path === "/api/plan") base = "plan-" + params.ws;
       if (path === "/api/replay") base = "replay-" + params.ws;
+      if (path === "/api/ws/progress") base = "ws-progress-" + params.ws;
       return fetch("../fixtures/" + base + ".json").then(function (r) { if (!r.ok) throw new Error(r.status); return r.json(); });
     }
     return condFetch(url, condTag[url]).then(function (r) {

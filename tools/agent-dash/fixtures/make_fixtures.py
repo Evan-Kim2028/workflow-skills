@@ -1190,6 +1190,82 @@ def _burnup(runs, now, plans):
     }
 
 
+def _wsprogress(runs, now, plans):
+    """Fixture mirror of GET /api/ws/progress: done-% steps with the
+    recorded prog band, milestone first-cross times, and runs started
+    per hour. Done moments spread over the last day so the steps, the
+    milestone dots, and the hourly bars all render; a workstream with no
+    done tasks keeps empty points (the card reads "No recorded task
+    moves yet")."""
+    docs = {}
+    for ws, plan in plans.items():
+        prog = plan.get("progress") or {}
+        total = prog.get("total") or 0
+        done = prog.get("done") or 0
+        prog_now = (prog.get("counts") or {}).get("prog") or 0
+        span = min(30 * 3600, max(3600, done * 1800))
+        start = now - span
+        dones = [start + (i + 1) * span / max(1, done) for i in range(done)]
+        points = [
+            {
+                "t": moment,
+                "done": pos + 1,
+                "prog": round(prog_now * (pos + 1) / max(1, done)),
+                "pct": round((pos + 1) / total * 1000) / 10 if total else 0.0,
+            }
+            for pos, moment in enumerate(dones)
+        ]
+        milestones = []
+        for mark in (20, 40, 60, 80, 100):
+            need = math.ceil(total * mark / 100) if total else 0
+            if total and need <= len(dones):
+                moment = dones[need - 1]
+                milestones.append(
+                    {"pct": mark, "t": moment, "done": need,
+                     "elapsed": moment - start, "reached": True}
+                )
+            else:
+                milestones.append(
+                    {"pct": mark, "t": None, "done": need,
+                     "elapsed": None, "reached": False}
+                )
+        per = {}
+        for run in runs:
+            if (run.get("workstream") or None) != ws:
+                continue
+            moment = run.get("started_at")
+            if moment is None:
+                continue
+            hour = int(moment // 3600) * 3600
+            per[hour] = per.get(hour, 0) + 1
+        end = max(dones) if dones else start
+        docs[ws] = {
+            "wsprogress": {
+                "ws": ws,
+                "total": total,
+                "done": done,
+                "pct": prog.get("pct"),
+                "counts": prog.get("counts") or {},
+                "start": start,
+                "end": end,
+                "now": now,
+                "points": points,
+                "milestones": milestones,
+                "runs_per_hour": [{"t": hour, "n": per[hour]} for hour in sorted(per)],
+                "runs_total": sum(per.values()),
+                "undated_runs": 0,
+                "observed": done,
+                "inferred": 0,
+                "dated": done,
+                "undated": 0,
+                "gap": None,
+                "backfilled": [],
+            },
+            "_note": NOTE,
+        }
+    return docs
+
+
 def _counts(runs, now):
     tools = ("grok", "muse", "glm", "claude")
     live_by = {key: 0 for key in tools}
@@ -1429,6 +1505,8 @@ def main():
         files[f"plan-{ws}.json"] = plan
     for ws, plan in plans.items():
         files[f"replay-{ws}.json"] = _replay_doc(runs, ws, plan["groups"])
+    for ws, doc in _wsprogress(runs, NOW, plans).items():
+        files[f"ws-progress-{ws}.json"] = doc
     for name, doc in files.items():
         path = HERE / name
         path.parent.mkdir(parents=True, exist_ok=True)

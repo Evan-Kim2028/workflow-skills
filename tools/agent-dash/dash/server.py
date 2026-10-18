@@ -264,6 +264,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._plan(query)
             elif path == "/api/replay":
                 self._replay(query)
+            elif path == "/api/ws/progress":
+                self._ws_progress(query)
             elif path == "/plan":
                 self._plan_page()
             elif path == "/api/bundles":
@@ -927,6 +929,36 @@ class Handler(BaseHTTPRequestHandler):
             self._json(404, {**api_error("plan not found", "plan_not_found", f"Run: python3 agent_dash.py ws new {ws} \"Title\", or pick an id from GET /api/bundles"), "ws": ws})
             return
         self._json(200, body)
+
+    def _ws_progress(self, query):
+        """``GET /api/ws/progress?ws=<ID>``: progress over time for one
+        workstream (see ``dash/wsprogress.py``): the done-% step series
+        with the recorded prog band, milestone first-cross times, and
+        runs started per hour. A missing ``ws`` is a 400, a bad id is a
+        400, and a workstream with no plan is a 404.
+        """
+        from dash.replay import ReplayNotFound
+        from dash import wsprogress
+
+        ws = _one(query, "ws")
+        if not ws:
+            raise ValueError("ws required")
+        if ws in (".", "..") or not _WS.match(ws):
+            raise ValueError("bad ws")
+        store = self.server.store
+        try:
+            key = wsprogress.cache_key(store, ws)
+        except Exception:
+            key = None
+        etag = _identity_etag("ws-progress", ws, key) if key is not None else None
+        if self._not_modified(etag):
+            return
+        try:
+            payload = wsprogress.build_wsprogress(store, ws)
+        except ReplayNotFound:
+            self._json(404, {**api_error("plan not found", "plan_not_found", f"Run: python3 agent_dash.py ws new {ws} \"Title\", or pick an id from GET /api/bundles"), "ws": ws})
+            return
+        self._json(200, {"wsprogress": payload}, etag=etag)
 
     def _plan_page(self):
         """Same shell as `/`. The page reads `/plan` and opens the plan view."""
