@@ -143,9 +143,8 @@ one fixed 24 h window; it skips with a clear message when Chrome is missing.
 
 `GET /api/plan?ws=WS7` -> that workstream's plan with a `progress` object
 (plus an `issues` list, the `ws validate` findings, empty when clean; a bad
-plan still serves 200 with its issues named, and the progress map shows a
-muted "plan needs attention: <first issue>" line instead of drawing the bad
-states as if they were fine):
+plan still serves 200 with its issues named, so bad states are never drawn
+as tasks; the page does not show the issues, which `ws validate` and this field carry):
 `{"ws": "WS7", "cols": [..], "groups": [{id, col, title, tasks: [{id, title, status, deps, kind, dep_notes}]}], "edges": [[a, b]], "phases": [{name, goal, gate}], "progress": {"done": 0, "total": 0, "counts": {todo, wip, pr, prog, done, deferred}, "pct": 0}, "ready": ["WS7.2"], "critical_path": ["WS7.1", "WS7.2"], "max_parallel": 3}`.
 `ready` is the todo-with-satisfied-deps task ids ranked by critical-path impact, `critical_path` is the longest dep chain, and `max_parallel` is the widest dependency wave; all three come from `dash/orchestrate.py` with no store reads, cached by `plan.json` mtime.
 A task's `kind` is `task` or `gate` (an outside signal or condition, drawn as a diamond); absent means `task`. `dep_notes` maps one of the task's dep ids to the short condition on that edge. A task may also carry `files` (declared file footprints, a non-empty list of glob strings), and a gate may carry `signal` (what it waits on), `confirmed_at` (ISO-8601 UTC of the last check), and `fresh_hours` (recheck bound; older or missing confirmations read STALE). A deferred task may carry `received_as` (the task id in the receiving workstream that picked it up). All pass through every plan API sanitized like other fields. `/api/bundle` carries the same task shape inside `plan.dag.groups`.
