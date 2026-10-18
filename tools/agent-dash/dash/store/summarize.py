@@ -892,7 +892,13 @@ def _agent_counts(runs: list, parents: dict, now: float, since, until, live_open
             finished_today += 1
         if range_since <= ended <= range_until:
             finished_range += 1
-            verdict = run.get("verdict") or "none"
+            # A run that never finished reads as died whatever its verdict
+            # field holds, so the dashboard can colour died apart from
+            # blocked (review verdicts) instead of lumping both together.
+            if run.get("status") in ("killed", "died_early"):
+                verdict = "died"
+            else:
+                verdict = run.get("verdict") or "none"
             by_verdict[verdict] = by_verdict.get(verdict, 0) + 1
     return {
         "live_agents": live_n,

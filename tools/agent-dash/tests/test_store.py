@@ -828,6 +828,39 @@ class StoreTest(unittest.TestCase):
         ranged = self.store.snapshot(now, "all", since=now - 10)
         self.assertEqual(ranged["counts"]["finished_in_range"], 0)
 
+    def test_killed_runs_count_as_died_not_none(self):
+        """Runs that never finish (killed / died_early) land in the
+        finished_by_verdict "died" bucket even when they carry a verdict,
+        so the dashboard colours died apart from blocked."""
+        now = time.time()
+        self.store.upsert_run(
+            {
+                "run_id": "grok:k:ws1-doomed",
+                "source": "grok",
+                "tier": "grok",
+                "label": "ws1-doomed",
+                "status": "killed",
+                "verdict": "BLOCKED",
+                "started_at": now - 200,
+                "ended_at": now - 30,
+            }
+        )
+        self.store.upsert_run(
+            {
+                "run_id": "claude:d:ws1-gone",
+                "source": "claude-subagent",
+                "tier": "haiku",
+                "label": "ws1-gone",
+                "status": "died_early",
+                "started_at": now - 200,
+                "ended_at": now - 30,
+            }
+        )
+        snap = self.store.snapshot(now, "all")
+        counts = snap["counts"]
+        self.assertEqual(counts["finished_in_range"], 2)
+        self.assertEqual(counts["finished_by_verdict"], {"died": 2})
+
     def test_null_started_at_is_not_written_over_a_known_start(self):
         self.store.upsert_run(
             {

@@ -112,11 +112,12 @@
     });
     var all = {done: 0, tot: 0, live: 0};
     rows.forEach(function (w) { all.live += w.live_agents || 0; });
-    var cap = 10, expanded = programPanel._expanded || {};
-    var capKey = (bare ? "bare-" : "full-") + (only || []).join(",");
-    var showAll = !!expanded[capKey];
-    var visible = (rows.length > cap && !showAll) ? rows.slice(0, cap) : rows;
-    visible.forEach(function (w) {
+    /* Top 5 by default through the shared disclosure helper (one state
+       per full/bare panel and filter, default collapsed). */
+    var capKey = "whereweare:" + (bare ? "bare" : "full") + ":" + (only || []).join(",");
+    var info = discloseRows(rows, capKey, "workstreams");
+    c.setAttribute("id", "prog-rows");
+    info.rows.forEach(function (w) {
       var pr = planSum[w.ws] || w.progress || null;
       var pc = pr ? pr.counts : {}, tot = pr ? pr.total : 0, pct = pr ? pr.pct : 0, done = pr ? pr.done : 0;
       if (pr) { all.done += done; all.tot += tot; }
@@ -200,11 +201,17 @@
       row.appendChild(acts);
       c.appendChild(row);
     });
-    if (rows.length > cap) {
-      var toggle = el("button", {type: "button", class: "prog-more", text: showAll ? "Show less" : "Show " + (rows.length - cap) + " more", title: showAll ? "Collapse the list" : "Show the full list"});
-      toggle.addEventListener("click", function () { expanded[capKey] = !showAll; programPanel._expanded = expanded; drawMain(); });
-      c.appendChild(toggle);
-    }
+    /* The shared disclosure control rebuilds the panel in place (no
+       drawMain), so ticks and re-renders never collapse it. */
+    var more = discloseButton(info, "prog-rows", function () {
+      var fresh = programPanel(only, bare);
+      if (c.parentNode) c.parentNode.replaceChild(fresh, c);
+      else {
+        while (c.firstChild) c.removeChild(c.firstChild);
+        while (fresh.firstChild) c.appendChild(fresh.firstChild);
+      }
+    });
+    if (more) c.appendChild(more);
     /* Overall hero: summed server counts plus live agents. No % here: plan %
        is computed once on the server and the page never derives one from
        task counts itself. */

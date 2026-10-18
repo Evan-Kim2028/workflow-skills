@@ -10,7 +10,8 @@
    Exports (on window.AdPage.cards, also kept as plain globals):
    projectHomeSpecs, reportFor, showToast, copyCmd, PROJECT_SLOTS.
    Needs: el, fmtN, fmtUsd, fmtDur, tiles, programPanel, readinessOf,
-   openPlan, keyOf, ADT (plain globals). */
+   openPlan, keyOf, ADT, discloseRows, discloseButton, discloseRedraw,
+   readDisclosed (plain globals). */
 (function (global) {
   "use strict";
   /* Slot mount points for chart cards. A registry entry with scope
@@ -185,11 +186,13 @@
      its ready/not-yet pill (glyph plus word). Readiness comes from the
      shared planned helper, never recomputed here. */
   function plannedShelf() {
-    var c = el("div", {class: "pj-shelf", "data-nav": "Planned"});
+    var c = el("div", {class: "pj-shelf", "data-nav": "Planned", id: "home-planned-list"});
     var rows = shelfRows("planned");
     var states = statesById();
     var nowS = Date.now() / 1000;
-    rows.forEach(function (w) {
+    /* Top 5 by default through the shared disclosure helper. */
+    var info = discloseRows(rows, "home:planned", "planned workstreams");
+    info.rows.forEach(function (w) {
       var r = readinessOf(w, state.plans[w.ws], state.approvals, states, nowS);
       var tc = taskCounts(w);
       var card = el("div", {class: "card pj-planned"});
@@ -241,6 +244,8 @@
       c.appendChild(card);
     });
     if (!rows.length) c.appendChild(el("p", {class: "pj-note", text: "No planned workstreams: every bundle has a tab."}));
+    var more = discloseButton(info, "home-planned-list", discloseRedraw("project-planned", "home-planned-list"));
+    if (more) c.appendChild(more);
     return c;
   }
 
@@ -315,7 +320,11 @@
     if (!rows.length) return null;
     var c = el("div", {class: "card pj-unplanned", "data-nav": "Unplanned activity"});
     c.appendChild(secHead("Unplanned activity", "To-do: each id below has runs but no plan bundle yet."));
-    rows.forEach(function (w) {
+    /* Top 5 by default through the shared disclosure helper. */
+    var info = discloseRows(rows, "home:unplanned", "unplanned workstreams");
+    var list = el("div", {id: "home-unplanned-list"});
+    c.appendChild(list);
+    info.rows.forEach(function (w) {
       var n = (w.finished_in_range || 0) + (w.live_agents || 0);
       var label = "Active without a plan: " + (w.name ? w.ws + " " + w.name : w.ws);
       var line = el("div", {class: "prog-row s-unplanned"});
@@ -327,8 +336,10 @@
       var acts = el("div", {class: "prog-acts"});
       acts.appendChild(copyBtn("python3 agent_dash.py ws new " + w.ws + " \"" + suggestTitle(w.ws) + "\"", "Copy ws new"));
       line.appendChild(acts);
-      c.appendChild(line);
+      list.appendChild(line);
     });
+    var more = discloseButton(info, "home-unplanned-list", discloseRedraw("project-planned", "home-unplanned-list"));
+    if (more) c.appendChild(more);
     return c;
   }
 
@@ -379,7 +390,7 @@
       c.appendChild(programPanel(["active", "paused"], true));
       return c;
     }, ""]);
-    specs.push(["project-planned", keyOf([(state.wss || []).map(function (w) { return [w.ws, w.progress, w.depends_on]; }), state.bundles, state.plans, state.approvals]), function () {
+    specs.push(["project-planned", keyOf([(state.wss || []).map(function (w) { return [w.ws, w.progress, w.depends_on]; }), state.bundles, state.plans, state.approvals, readDisclosed("home:planned"), readDisclosed("home:unplanned")]), function () {
       var wrap = el("div", {class: "pj-planned-wrap"});
       wrap.appendChild(secHead("Planned", "No tab yet — each names what it waits on."));
       wrap.appendChild(plannedShelf());

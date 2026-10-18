@@ -353,8 +353,8 @@ class PageShelfRulesTest(unittest.TestCase):
 
     def test_current_caps_with_show_more(self):
         cards = self._text("cards", "ws-cards.js")
-        self.assertIn("Show ", cards)
-        self.assertIn("more", cards)
+        self.assertIn("discloseRows(rows, capKey,", cards)
+        self.assertIn("discloseButton(info,", cards)
 
 
 if __name__ == "__main__":

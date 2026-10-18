@@ -20,7 +20,8 @@
    phaseUsageWsCard, phaseBar, phaseShares, cumSum, phaseStackDays,
    phaseSegTip, phaseFmt, phaseStackTip.
    Needs: el, s, CW, axes, niceMax, fmtN, fmtUsd, fmtPct, showTip, hideTip,
-   keyOf, drawMain, api, go, secCache, state (plain globals). */
+   keyOf, drawMain, api, go, secCache, state, discloseRows,
+   discloseButton, readDisclosed (plain globals). */
 (function (global) {
   "use strict";
   var PHASES = ["planning", "execution", "review", "coordination", "unclassified"];
@@ -300,14 +301,19 @@
       return {phase: ph, value: sum};
     });
     phaseLegend(c, grandCells, phaseMetric);
-    var list = el("div", {class: "ph-list"});
+    /* Top 5 workstreams by default through the shared disclosure helper;
+       the legend, totals and takeaway below still cover every row. */
+    var info = discloseRows(items, "phase-usage", "workstreams");
+    var list = el("div", {class: "ph-list", id: "phase-usage-list"});
     var shown = 0;
-    items.forEach(function (item) { if (phaseRow(list, item, phaseMetric)) shown++; });
+    info.rows.forEach(function (item) { if (phaseRow(list, item, phaseMetric)) shown++; });
     if (!shown) {
       c.appendChild(el("div", {class: "empty", text: "No usage recorded in this window."}));
       return c;
     }
     c.appendChild(list);
+    var more = discloseButton(info, "phase-usage-list", phaseRedraw);
+    if (more) c.appendChild(more);
     var grand = 0;
     grandCells.forEach(function (cell) { grand += cell.value; });
     var foot = el("p", {class: "ph-foot"});
@@ -331,14 +337,14 @@
 
   /* Registry spec for the Project home slot exec-phases. */
   function phaseUsageSpec(passedState, snap) {
-    return ["phases", keyOf([state.phaseUsage, state.phaseUsageError, state.seq, phaseScope, phaseMetric]), function () { return phaseUsageCard(); }, ""];
+    return ["phases", keyOf([state.phaseUsage, state.phaseUsageError, state.seq, phaseScope, phaseMetric, readDisclosed("phase-usage")]), function () { return phaseUsageCard(); }, ""];
   }
 
   /* Registry spec for the overall Execution view (all workstreams): the
      same stacked bars as the Project home card, as its own bottom
      section below Finished. */
   function phaseUsageAllSpec(passedState, snap) {
-    return ["phases-all", keyOf([state.phaseUsage, state.phaseUsageError, state.seq, phaseScope, phaseMetric]), function () { return phaseUsageCard(); }, "margin-top:14px"];
+    return ["phases-all", keyOf([state.phaseUsage, state.phaseUsageError, state.seq, phaseScope, phaseMetric, readDisclosed("phase-usage")]), function () { return phaseUsageCard(); }, "margin-top:14px"];
   }
 
   /* Thin two-segment bar for a management table row: planning versus

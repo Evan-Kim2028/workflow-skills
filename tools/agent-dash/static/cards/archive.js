@@ -12,7 +12,8 @@
    Reads: state.archive, state.snap.
    Exports (on window.AdPage.cards, also kept as plain globals):
    archiveSpecs, sortArchive, durStr.
-   Needs: el, fmtN, fmtUsd, fmtDur, openPlan, copyCmd, reportFor, keyOf
+   Needs: el, fmtN, fmtUsd, fmtDur, openPlan, copyCmd, reportFor, keyOf,
+   discloseRows, discloseButton, discloseRedraw, readDisclosed
    (plain globals). */
 (function (global) {
   "use strict";
@@ -118,7 +119,7 @@
   function archiveSpecs(passedState, snap) {
     var payload = state.archive || {archive: [], totals: {workstreams: 0, tokens: 0, cost_usd: 0.0, runs: 0}};
     var cards = sortArchive(payload.archive);
-    return [["archive-shelf", keyOf([cards, payload.totals, snap && snap.totals_all_time]), function () {
+    return [["archive-shelf", keyOf([cards, payload.totals, snap && snap.totals_all_time, readDisclosed("archive:shelf")]), function () {
       var wrap = el("div", {class: "pj-arch-wrap"});
       wrap.appendChild(secHead("Archive shelf", "Frozen summary cards — dates, duration, tasks, tokens, cost, report and plan links."));
       wrap.appendChild(el("p", {class: "pj-note", text: lifetimeLine(snap, payload)}));
@@ -130,9 +131,13 @@
         wrap.appendChild(empty);
         return wrap;
       }
-      var shelf = el("div", {class: "pj-shelf"});
-      cards.forEach(function (card) { shelf.appendChild(archiveCard(card)); });
+      var shelf = el("div", {class: "pj-shelf", id: "archive-shelf-list"});
+      /* Top 5 by default through the shared disclosure helper. */
+      var info = discloseRows(cards, "archive:shelf", "archived workstreams");
+      info.rows.forEach(function (card) { shelf.appendChild(archiveCard(card)); });
       wrap.appendChild(shelf);
+      var more = discloseButton(info, "archive-shelf-list", discloseRedraw("archive-shelf", "archive-shelf-list"));
+      if (more) wrap.appendChild(more);
       var rules = el("div", {class: "card pj-rules"});
       rules.appendChild(el("h3", {text: "How archive works"}));
       var table = el("table", {class: "pj-kv dt dt-kv", "aria-label": "Archive rules"});

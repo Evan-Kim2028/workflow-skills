@@ -10,6 +10,12 @@
    Start. The workstream tab heading carries the same primary action as a
    split button with the remaining actions in its menu, and Project home
    and Planned rows reuse the primary through primaryFor.
+   The table shows the first 5 matching rows by default with the shared
+   disclosure control below it ("Show all N workstreams" / "Show top 5
+   workstreams", per-filter state in sessionStorage, default collapsed);
+   checkboxes exist only on visible rows, while Select all and the bulk
+   bar cover every row in the filter and say how many. Hidden checked
+   rows keep their selection.
    Every action posts through apiPost with X-AgentDash-Action: 1, asks
    first for archive, drop, and bulk (inline confirm popover, never
    window.confirm), toasts success with an Undo button kept 10 s (undo
@@ -732,18 +738,33 @@
     var rows = tableRows();
     var all = rows.length > 0 && rows.every(function (w) { return mg.checked[String(w.ws).toUpperCase()]; });
     head.checked = all;
+    /* Select all covers every row in the filter, not just the visible
+       five, and says how many. */
+    head.setAttribute("aria-label", "Select all " + rows.length + " workstreams in this filter");
   }
 
+  /* The visible slice: the first 5 filter rows collapsed, every filter
+     row expanded, through the shared disclosure helper. */
   function paintRows() {
     if (!mgSection) return;
     var body = mgSection.querySelector("[data-mg-rows]");
     if (!body) return;
     body.innerHTML = "";
-    var rows = tableRows();
-    rows.forEach(function (w) { body.appendChild(rowEl(w)); });
+    var info = discloseRows(tableRows(), "manage:current", "workstreams");
+    info.rows.forEach(function (w) { body.appendChild(rowEl(w)); });
     var empty = mgSection.querySelector("[data-mg-empty]");
-    if (empty) empty.hidden = rows.length > 0;
+    if (empty) empty.hidden = info.total > 0;
     paintHeadCheck();
+    paintDisclosure(info);
+  }
+
+  function paintDisclosure(info) {
+    if (!mgSection) return;
+    var host = mgSection.querySelector("[data-mg-more]");
+    if (!host) return;
+    host.innerHTML = "";
+    var btn = discloseButton(info, "mg-rows", function () { paintManage(); });
+    if (btn) host.appendChild(btn);
   }
 
   /* The Current management table: the first section of Execution on
@@ -806,13 +827,14 @@
       });
       head.appendChild(hr);
       table.appendChild(head);
-      var body = el("tbody", {"data-mg-rows": "1"});
+      var body = el("tbody", {"data-mg-rows": "1", id: "mg-rows"});
       table.appendChild(body);
       scroll.appendChild(table);
       var empty = el("p", {class: "pj-note", "data-mg-empty": "1", text: "No workstreams in this state."});
       empty.hidden = true;
       scroll.appendChild(empty);
       wrap.appendChild(scroll);
+      wrap.appendChild(el("div", {"data-mg-more": "1"}));
       mgSection = wrap;
       paintToolbarCounts();
       paintRows();

@@ -5,7 +5,10 @@
    ended run with no recorded end as a one-minute stub; packRows
    greedy-packs a lane so every run is drawn, never a sample; outcomeOf,
    OUTCOME and outcomeColor colour bars by outcome (the replay inside
-   plan-progress.js reads OUTCOME at call time).
+   plan-progress.js reads OUTCOME at call time). Blocked and died are
+   distinct outcomes: blocked is serious orange with ⊘ (needs rework or a
+   decision), died is critical red with ✕ (the run never finished). Every
+   outcome ships colour plus glyph plus word, never colour alone.
    Exports (on window.AdPage, also kept as plain globals): expanded,
    isAgent, runEnd, packRows, outcomeOf, OUTCOME, outcomeColor.
    Needs: ADM, tierKey (plain globals). */
@@ -28,14 +31,18 @@
     });
     return rows;
   }
+  /* Died first: a run that never finished reads died whatever its
+     verdict field holds. Blocked covers the review verdicts that send
+     work back (BLOCKED, REQUEST_CHANGES). */
   function outcomeOf(r) {
     if (!r.ended_at) return r.status === "running" ? "run" : "unk";
-    if (r.status === "died_early" || r.status === "killed" || r.verdict === "BLOCKED" || r.verdict === "REQUEST_CHANGES" || r.verdict === "FAILURE" || r.verdict === "CANCELED") return "bad";
+    if (r.status === "died_early" || r.status === "killed" || r.verdict === "FAILURE" || r.verdict === "CANCELED") return "died";
+    if (r.verdict === "BLOCKED" || r.verdict === "REQUEST_CHANGES") return "blocked";
     if (r.verdict === "PARTIAL" || r.verdict === "APPROVE_WITH_CHANGES") return "part";
     if (r.status === "done" || r.verdict === "SUCCESS") return "ok";
     return "unk";
   }
-  var OUTCOME = {run: ["var(--s1)", "\u25CF", "running"], ok: ["var(--good)", "\u2713", "finished"], part: ["var(--warning)", "\u25D0", "partial"], bad: ["var(--critical)", "\u2715", "died or blocked"], unk: ["var(--muted)", "?", "ended, outcome unknown"]};
+  var OUTCOME = {run: ["var(--s1)", "\u25CF", "running"], ok: ["var(--good)", "\u2713", "finished"], part: ["var(--warning)", "\u25D0", "partial"], blocked: ["var(--serious)", "\u2298", "blocked"], died: ["var(--critical)", "\u2715", "died"], unk: ["var(--muted)", "?", "ended, outcome unknown"]};
   function outcomeColor(r) { var o = outcomeOf(r); return o === "run" || o === "unk" ? null : OUTCOME[o][0]; }
   function famOfRun(r) { return ADM.famOf(tierKey(r)); }
   function famName(f) { return (ADM.FAM[f] || ADM.FAM.other).name; }

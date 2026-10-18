@@ -18,7 +18,10 @@
    scope in sessionStorage behind try/catch; None renders a flat table.
    Toggle, disclosure and chevron clicks rebuild the card in place (no
    drawMain), and every render reads the persisted state, so ticks and
-   re-renders never collapse anything and nothing below reflows.
+   re-renders never collapse anything and nothing below reflows. The
+   expanded flag and the flat top-5 slice come from the shared
+   disclosure helper (static/core/disclosure.js); the grouped render
+   keeps its own group-aware cap (visibleGroups) on top.
    Reads: nothing at load; rows are passed in (state.ws for the scope key,
    state.plan / state.plans for section order and progress).
    Exports (on window.AdPage.cards, also kept as plain globals):
@@ -46,12 +49,15 @@
   }
 
   /* Verdict pills: colour plus glyph plus word. The raw verdict stays in
-     the title so nothing exact is lost. */
+     the title so nothing exact is lost. Blocked and sent-back verdicts
+     share the serious-orange blocked pill but keep their own glyph and
+     word (⊘ blocked vs ↻ changes asked); died is never a verdict pill —
+     it is the run status (✕ killed / died early in critical red). */
   function verdictPill(v) {
     if (v === "PASS" || v === "APPROVE" || v === "APPROVE_WITH_NITS") return ["pass", "\u2713 pass"];
-    if (v === "PARTIAL") return ["part", "\u25D0 partial"];
-    if (v === "REQUEST_CHANGES") return ["rev", "\u2715 changes asked"];
-    if (v === "BLOCKED") return ["rev", "\u2715 blocked"];
+    if (v === "PARTIAL" || v === "APPROVE_WITH_CHANGES") return ["part", "\u25D0 partial"];
+    if (v === "REQUEST_CHANGES") return ["blocked", "\u21BB changes asked"];
+    if (v === "BLOCKED") return ["blocked", "\u2298 blocked"];
     return ["none", "\u2014 no verdict"];
   }
   function verdictEl(v) {
@@ -99,19 +105,15 @@
       : "Show all " + total + " running agents";
   }
   /* Expanded state persists for the session, per scope (all vs one
-     workstream), default collapsed. sessionStorage may throw (private
-     mode), so every touch is guarded. */
-  function runningScopeKey(scope) { return "agent-dash-running:" + (scope || "all"); }
+     workstream), default collapsed, through the shared disclosure helper.
+     Its key carries the v2 namespace, so an expanded flag stored under the
+     pre-top-5 key never reopens the list. */
+  function runningScopeKey(scope) { return discloseKey("running:" + (scope || "all")); }
   function readRunningExpanded(scope) {
-    try {
-      return window.sessionStorage.getItem(runningScopeKey(scope)) === "all";
-    } catch (e) { return false; }
+    return readDisclosed("running:" + (scope || "all"));
   }
   function writeRunningExpanded(scope, showAll) {
-    try {
-      if (showAll) window.sessionStorage.setItem(runningScopeKey(scope), "all");
-      else window.sessionStorage.removeItem(runningScopeKey(scope));
-    } catch (e) {}
+    writeDisclosed("running:" + (scope || "all"), showAll);
   }
 
   /* Group-by toggle state (Section | None), per list and scope, default
@@ -549,6 +551,8 @@
   global.runsTable = runsTable;
   global.statusEl = statusEl;
   global.verdictPill = verdictPill;
+  global.verdictEl = verdictEl;
+  AdPage.cards.verdictEl = verdictEl;
   global.tipRows = tipRows;
   AdPage.cards.tipRows = tipRows;
   global.runRow = runRow;

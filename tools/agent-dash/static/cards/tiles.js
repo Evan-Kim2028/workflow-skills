@@ -314,10 +314,15 @@
     if (cn.prod_jobs) jobBits.push(fmtN(cn.prod_jobs) + " prod jobs");
     if (cn.prod_jobs_finished) jobBits.push(fmtN(cn.prod_jobs_finished) + " prod jobs ran");
     if (jobBits.length) liveLines.push(jobBits.join(" · "));
-    var bad = (fv.BLOCKED || 0) + (fv.REQUEST_CHANGES || 0), part = (fv.PARTIAL || 0) + (fv.APPROVE_WITH_CHANGES || 0);
+    /* Blocked (review verdicts that send work back) and died (runs that
+       never finished, counted server-side under "died") keep their own
+       colour plus glyph plus word: blocked is ⊘ serious orange, died is
+       ✕ critical red, partial stays ◐ amber, pass ✓ green. */
+    var blockedN = (fv.BLOCKED || 0) + (fv.REQUEST_CHANGES || 0), part = (fv.PARTIAL || 0) + (fv.APPROVE_WITH_CHANGES || 0);
     var passN = (fv.PASS || 0) + (fv.APPROVE || 0) + (fv.APPROVE_WITH_NITS || 0);
-    /* No verdicts recorded means no verdict line, not a row of zeros. */
-    var finLines = (passN + part + bad) ? ["✓ " + fmtN(passN) + " pass · ◐ " + fmtN(part) + " partial · ✕ " + fmtN(bad) + " blocked (24 h)"] : [];
+    var diedN = fv.died || 0;
+    /* No outcomes recorded means no outcome line, not a row of zeros. */
+    var finLines = (passN + part + blockedN + diedN) ? ["✓ " + fmtN(passN) + " pass · ◐ " + fmtN(part) + " partial · ⊘ " + fmtN(blockedN) + " blocked · ✕ " + fmtN(diedN) + " died (24 h)"] : [];
     var tokVal = allTok ? fmtN(allTok) : "0 in 24 h";
     var tokLines = allTok
       ? [cachedPct(tk) + "% cached · out " + fmtN(tk.output || 0), fmtN(allTimeTok) + " all time"]

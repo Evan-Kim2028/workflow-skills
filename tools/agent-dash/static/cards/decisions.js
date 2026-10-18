@@ -1,7 +1,8 @@
 /* Page card: Decisions (read-only mirror).
    Newest-first rows from GET /api/decisions with status pills (glyph plus
-   word), a status filter, workstream chips, and a 12-row page with "show
-   more". Registered once (scope "project", no slot) so it renders as its
+   word), a status filter, workstream chips, and the shared top-5
+   disclosure ("Show all N decisions" / "Show top 5 decisions").
+   Registered once (scope "project", no slot) so it renders as its
    own section after the home slots. The source is optional: while loading,
    when the endpoint is absent, when it reports source.present as false,
    or when it holds no rows, the spec returns null and the section stays
@@ -10,15 +11,14 @@
    Reads: state.decisions, state.wss, state.wssAll, state.seq, state.view.
    Exports (on window.AdPage.cards, also kept as plain globals):
    decisionsSpec, decisionsCard, sortDecisions, decisionPill.
-   Needs: el, api, keyOf, drawMain, secCache, state (plain globals). */
+   Needs: el, api, keyOf, drawMain, secCache, state, discloseRows,
+   discloseButton, discloseRedraw, readDisclosed (plain globals). */
 (function (global) {
   "use strict";
   var DEC_URL = "/api/decisions";
   var DEC_SEC = "decisions";
-  var PAGE = 12;
   var decLoading = false;
   var decFilter = "all";
-  var decExpanded = false;
 
   /* Pure: status pill (glyph plus word, never colour alone). Unknown
      statuses read as plain words with a neutral dot. */
@@ -166,13 +166,13 @@
       c.appendChild(el("p", {class: "pj-note", text: "No " + decFilter + " decisions."}));
       return c;
     }
-    var capped = decExpanded ? shown : shown.slice(0, PAGE);
-    var list = el("ol", {class: "dc-list"});
-    capped.forEach(function (row) { list.appendChild(decRow(row)); });
+    /* Top 5 by default through the shared disclosure helper. */
+    var info = discloseRows(shown, "decisions", "decisions");
+    var list = el("ol", {class: "dc-list", id: "dec-list"});
+    info.rows.forEach(function (row) { list.appendChild(decRow(row)); });
     c.appendChild(list);
-    if (shown.length > PAGE) {
-      var more = el("button", {type: "button", class: "dc-more", text: decExpanded ? "Show less" : "Show more (" + (shown.length - PAGE) + " more)"});
-      more.addEventListener("click", function () { decExpanded = !decExpanded; redrawDecisions(); });
+    var more = discloseButton(info, "dec-list", discloseRedraw(DEC_SEC, "dec-list"));
+    if (more) {
       var acts = el("div", {class: "dc-acts"});
       acts.appendChild(more);
       c.appendChild(acts);
@@ -189,7 +189,7 @@
       });
       if (!any) decFilter = "all";
     }
-    return ["decisions", keyOf([state.decisions, decFilter, decExpanded, state.seq, state.view]), decisionsCard, "margin-top:14px"];
+    return ["decisions", keyOf([state.decisions, decFilter, readDisclosed("decisions"), state.seq, state.view]), decisionsCard, "margin-top:14px"];
   }
 
   var AdPage = (global.AdPage = global.AdPage || {});

@@ -76,8 +76,8 @@
   /* Pure hover-text builders: every number the user sees on hover is
      compact (fmtN), with the exact value left to data-v/data-t attrs. */
   function actLegendTip(name, total) { return name + " " + fmtN(total) + " tokens"; }
-  function actTimelineAria(n, ok, part, bad, run) {
-    return "Agent runs in the selected range, one lane per model family: " + fmtN(n) + " runs, " + fmtN(ok) + " finished, " + fmtN(part) + " partial, " + fmtN(bad) + " died or blocked, " + fmtN(run) + " running";
+  function actTimelineAria(n, ok, part, blocked, died, run) {
+    return "Agent runs in the selected range, one lane per model family: " + fmtN(n) + " runs, " + fmtN(ok) + " finished, " + fmtN(part) + " partial, " + fmtN(blocked) + " blocked, " + fmtN(died) + " died, " + fmtN(run) + " running";
   }
   function actConcAria(name, peak) { return name + " live runs in the selected range, peak " + fmtN(peak); }
   /* Pixel<->time on one shared axis: time t in [from, to] sits at pixel
@@ -713,7 +713,7 @@
     var R = (loaded.runs || []).filter(function (r) { return r.started_at && runEnd(r, now) >= from && r.started_at <= to; });
     if (!R.length) { wrap.appendChild(el("div", {class: "empty", text: "No runs in this window."})); return {node: wrap, hasData: false}; }
     var lg = el("div", {class: "legend"});
-    ["run", "ok", "part", "bad", "unk"].forEach(function (k) { var o = OUTCOME[k], sp = el("span"); var sw = el("i", {class: "sw"}); sw.style.background = o[0]; sp.appendChild(sw); sp.appendChild(document.createTextNode(o[1] + " " + o[2])); lg.appendChild(sp); });
+    ["run", "ok", "part", "blocked", "died", "unk"].forEach(function (k) { var o = OUTCOME[k], sp = el("span"); var sw = el("i", {class: "sw"}); sw.style.background = o[0]; sp.appendChild(sw); sp.appendChild(document.createTextNode(o[1] + " " + o[2])); lg.appendChild(sp); });
     wrap.appendChild(lg);
     var W = g.W, L = g.L, Rm = g.R, pw = g.pw, T = 8, stripH = 30;
     var st = actSharedTicks(range, g), X = st.X;
@@ -743,9 +743,9 @@
     var stripY = 12, yy = stripY + stripH + 14;
     lanes.forEach(function (lane) { lane.y = yy; yy += 22 + lane.h + 10; });
     var plotB = yy - 10, H = Math.ceil(plotB + 32);
-    var ocCount = {run: 0, ok: 0, part: 0, bad: 0, unk: 0};
+    var ocCount = {run: 0, ok: 0, part: 0, blocked: 0, died: 0, unk: 0};
     R.forEach(function (r) { ocCount[outcomeOf(r)]++; });
-    var svg = s("svg", {viewBox: "0 0 " + W + " " + H, width: W, height: H, style: "display:block;max-width:100%", role: "img", "data-strip": "timeline", "data-x-from": String(Math.round(from)), "data-x-to": String(Math.round(to)), "aria-label": actTimelineAria(R.length, ocCount.ok, ocCount.part, ocCount.bad, ocCount.run)});
+    var svg = s("svg", {viewBox: "0 0 " + W + " " + H, width: W, height: H, style: "display:block;max-width:100%", role: "img", "data-strip": "timeline", "data-x-from": String(Math.round(from)), "data-x-to": String(Math.round(to)), "aria-label": actTimelineAria(R.length, ocCount.ok, ocCount.part, ocCount.blocked, ocCount.died, ocCount.run)});
     var defs = s("defs", {}); var pat = s("pattern", {id: "act-hatch", width: 6, height: 6, patternUnits: "userSpaceOnUse", patternTransform: "rotate(45)"}); pat.appendChild(s("rect", {width: 6, height: 6, fill: "var(--surface-2)"})); pat.appendChild(s("line", {x1: 0, y1: 0, x2: 0, y2: 6, stroke: "var(--muted)", "stroke-width": 2})); defs.appendChild(pat); svg.appendChild(defs);
     /* Gridlines on the shared ticks in every lane; labels only bottom. */
     var gTicks = withX ? st.ticks : [];

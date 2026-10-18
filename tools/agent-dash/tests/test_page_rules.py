@@ -242,7 +242,7 @@ assert.strictEqual(W.actLegendTip("Claude", 123456789), "Claude 123.5M tokens");
 assert.strictEqual(W.planColbarTip(123456, 789012), "123.5K of 789K done in this section");
 assert.strictEqual(W.swCountAria(123456), "Switch workstream, 123.5K open workstreams. Shortcut: slash.");
 hover(W.actLegendTip("Claude", 123456789));
-hover(W.actTimelineAria(123456, 120000, 3000, 400, 56));
+hover(W.actTimelineAria(123456, 120000, 3000, 400, 56, 7));
 hover(W.actConcAria("Claude", 98765));
 hover(W.burnupLegendTip("WS9", 123456789, "tokens", fmtN, false));
 hover(W.burnupTasksAria(123456, 789012));
@@ -1243,7 +1243,7 @@ files.forEach(function (p) { eval(fs.readFileSync(p, "utf8")); });
   assert.strictEqual(typeof global[n], "function", n + " is not exported");
 });
 assert.strictEqual(typeof global.expanded, "object", "expanded lane state is not exported");
-assert.deepStrictEqual(Object.keys(OUTCOME).sort(), ["bad", "ok", "part", "run", "unk"]);
+assert.deepStrictEqual(Object.keys(OUTCOME).sort(), ["blocked", "died", "ok", "part", "run", "unk"]);
 function walk(node, out) {
   out.push(node);
   (node.children || []).forEach(function (c) { if (c && c.children) walk(c, out); });
@@ -1298,7 +1298,7 @@ var laneTotal = labels.reduce(function (a, t) { return a + Number(/(\d+) runs/.e
 assert.strictEqual(laneTotal, runs.length, "lane labels sum to " + laneTotal + ", payload has " + runs.length);
 var outcomes = {};
 bars.forEach(function (b) { outcomes[b.attrs["data-outcome"]] = true; });
-["run", "ok", "part", "bad", "unk"].forEach(function (o) {
+["run", "ok", "part", "blocked", "died", "unk"].forEach(function (o) {
   assert.ok(outcomes[o], "no bar with outcome " + o);
 });
 bars.forEach(function (b) {
@@ -1309,7 +1309,7 @@ bars.forEach(function (b) {
 });
 var legend = nodes.filter(function (n) { return n.attrs.class === "legend"; })[0];
 var legendText = JSON.stringify(legend);
-["\u25CF running", "\u2713 finished", "\u25D0 partial", "\u2715 died or blocked", "? ended, outcome unknown"].forEach(function (want) {
+["\u25CF running", "\u2713 finished", "\u25D0 partial", "\u2298 blocked", "\u2715 died", "? ended, outcome unknown"].forEach(function (want) {
   assert.ok(legendText.indexOf(want) >= 0, "legend never says " + want);
 });
 /* Scenario B: one lane with 500 overlapping runs goes dense but keeps its count and its expand. */
@@ -2225,10 +2225,11 @@ console.log("applySections proof ok");
             "  appendChild:function(c){this.kids.push(c);return c;},"
             "  addEventListener:function(t,f){this._on[t]=f;}};"
             " return n;}"
-            "globalThis.document={createElement:fakeNode,getElementById:function(){return null;}};"
+            "globalThis.document={createElement:fakeNode,getElementById:function(){return null;},querySelector:function(){return null;}};"
             "eval(fs.readFileSync(process.argv[1],'utf8'));"
             "eval(fs.readFileSync(process.argv[2],'utf8'));"
             "eval(fs.readFileSync(process.argv[3],'utf8'));"
+            "eval(fs.readFileSync(process.argv[4],'utf8'));"
             "const assert=require('assert');"
             "globalThis.drawMain=function(){};"
             "globalThis.secCache={};"
@@ -2268,16 +2269,21 @@ console.log("applySections proof ok");
             "assert.strictEqual(links.length,1);"
             "assert.strictEqual(links[0].tag,'a');"
             "assert.strictEqual(byClass(dcard,'dc-linktext').length,1);"
-            "assert.strictEqual(byClass(dcard,'dc-more').length,0);"
+            "assert.strictEqual(byClass(dcard,'disclose-btn').length,0);"
             "var many=[];for(var i=0;i<13;i++)many.push({id:'d'+i,title:'Row '+i,status:'approved',owner:'o',date:'2026-04-02',workstream:'WS9',area:'a'});"
             "state.decisions={decisions:many,counts:{approved:13},source:{present:true}};"
             "var big=decisionsCard();"
-            "assert.strictEqual(byClass(big,'dc-row').length,12);"
-            "assert.strictEqual(byClass(big,'dc-more').length,1);"
+            "assert.strictEqual(byClass(big,'dc-row').length,5);"
+            "var dbtn=byClass(big,'disclose-btn');"
+            "assert.strictEqual(dbtn.length,1);"
+            "assert.strictEqual(dbtn[0].textContent,'Show all 13 decisions');"
+            "assert.strictEqual(dbtn[0].attrs['aria-expanded'],'false');"
+            "assert.strictEqual(dbtn[0].attrs['aria-controls'],'dec-list');"
         )
         proc = subprocess.run(
             ["node", "-e", harness,
              str(STATIC / "format.js"), str(STATIC / "core" / "el.js"),
+             str(STATIC / "core" / "disclosure.js"),
              str(STATIC / "cards" / "decisions.js")],
             capture_output=True,
             text=True,
@@ -2781,7 +2787,9 @@ class FinalPolishTests(unittest.TestCase):
         self.assertIn("total", act)
         self.assertIn('"aria-label": actTimelineAria(', act)
         self.assertIn("Agent runs in the selected range", act)
-        self.assertIn("died or blocked, ", act)
+        self.assertIn("blocked, ", act)
+        self.assertIn("died, ", act)
+        self.assertNotIn("died or blocked", act)
         burn = (STATIC / "cards" / "burnup.js").read_text()
         self.assertIn('"aria-label": label', burn)
         self.assertIn("recorded", burn)
@@ -2843,7 +2851,9 @@ class FinalPolishTests(unittest.TestCase):
         live = (STATIC / "cards" / "activity.js").read_text()
         self.assertIn("No live agents in this window.", live)
         tiles = (STATIC / "cards" / "tiles.js").read_text()
-        self.assertIn("(passN + part + bad)", tiles)
+        self.assertIn("(passN + part + blockedN + diedN)", tiles)
+        self.assertIn("blocked ·", tiles)
+        self.assertIn("died (24 h)", tiles)
 
     def test_planned_cards_state_the_wait_once(self):
         home = (STATIC / "cards" / "project-home.js").read_text()
@@ -3395,13 +3405,18 @@ console.log("activity tick spans ok");
         self.assertIn('"WS", "Section"', tables, "the Finished table lost its Section column")
         bodies = dict(functions(tables))
         self.assertIn("agents", bodies["runningToggleLabel"], "the toggle label must name agents")
-        for name in ("readRunningExpanded", "writeRunningExpanded", "readGroupMode", "writeGroupMode",
+        for name in ("readGroupMode", "writeGroupMode",
                      "readWsCollapsed", "writeWsCollapsed"):
             self.assertIn(name, bodies, f"{name} is gone from tables.js")
             self.assertIn("try", bodies[name], f"{name} touches storage unguarded")
             self.assertIn("catch", bodies[name], f"{name} touches storage unguarded")
             self.assertIn("sessionStorage", bodies[name], f"{name} no longer uses sessionStorage")
-        self.assertIn("agent-dash-running:", tables, "the storage key lost its per-scope prefix")
+        for name in ("readRunningExpanded", "writeRunningExpanded"):
+            self.assertIn(name, bodies, f"{name} is gone from tables.js")
+        self.assertIn("readDisclosed", bodies["readRunningExpanded"], "expanded reads bypass the shared helper")
+        self.assertIn("writeDisclosed", bodies["writeRunningExpanded"], "expanded writes bypass the shared helper")
+        self.assertIn("discloseKey", bodies["runningScopeKey"], "the scope key bypasses the shared helper")
+        self.assertNotIn('"agent-dash-running:"', tables, "the pre-top-5 key is back: old expanded state would apply")
         self.assertIn("agent-dash-group:", tables, "the group-by key lost its per-scope prefix")
 
     def test_running_visible_helpers(self):
@@ -3410,8 +3425,9 @@ console.log("activity tick spans ok");
         top 5 collapsed, all rows expanded, agent-naming labels."""
         script = (
             "const fs=require('fs');"
-            "var window={};"
+            "globalThis.window=globalThis;"
             "eval(fs.readFileSync(process.argv[1],'utf8'));"
+            "eval(fs.readFileSync(process.argv[2],'utf8'));"
             "const C=window.AdPage.cards;"
             "const assert=require('assert');"
             "assert.strictEqual(C.RUNNING_TOP_N,5);"
@@ -3428,13 +3444,192 @@ console.log("activity tick spans ok");
             "assert.strictEqual(C.runningToggleLabel(12,false),'Show all 12 running agents');"
             "assert.strictEqual(C.runningToggleLabel(12,true),'Show top 5 agents');"
             "assert.ok(C.runningScopeKey('WS1')!==C.runningScopeKey('all'));"
+            "assert.ok(C.runningScopeKey('all').indexOf('v2')>=0,'scope key lost its version');"
+            "assert.strictEqual(C.readRunningExpanded('all'),false,'no stored state must read collapsed');"
         )
         proc = subprocess.run(
-            ["node", "-e", script, str(STATIC / "cards" / "tables.js")],
+            ["node", "-e", script, str(STATIC / "core" / "disclosure.js"), str(STATIC / "cards" / "tables.js")],
             capture_output=True,
             text=True,
         )
         self.assertEqual(proc.returncode, 0, proc.stderr or proc.stdout)
+
+    def test_disclosure_helper(self):
+        """The one shared top-5 helper (static/core/disclosure.js on
+        window.AdPage): discloseRows(rows, key, noun, limit=5) slices to
+        the first 5 collapsed and everything expanded, default COLLAPSED
+        even with an old-key expanded flag stored, per-list v2 keys in
+        sessionStorage behind try/catch, and a render helper returning a
+        real Show-all/Show-top-5 button (aria-expanded, aria-controls)
+        or null at 5 or fewer."""
+        script = (
+            "const fs=require('fs');"
+            "var store={};"
+            "globalThis.window=globalThis;"
+            "window.sessionStorage={"
+            " getItem:function(k){return Object.prototype.hasOwnProperty.call(store,k)?store[k]:null;},"
+            " setItem:function(k,v){store[k]=String(v);},"
+            " removeItem:function(k){delete store[k];}};"
+            "function mkEl(tag,attrs){var e={tag:tag,attrs:{},kids:[],textContent:'',"
+            " setAttribute:function(k,v){this.attrs[k]=v;},"
+            " appendChild:function(c){this.kids.push(c);return c;},"
+            " addEventListener:function(t,f){this._on=(this._on||{});this._on[t]=f;}};"
+            " if(attrs)for(var k in attrs){if(k==='text')e.textContent=attrs[k];else e.setAttribute(k,attrs[k]);}"
+            " return e;}"
+            "var el=mkEl;"
+            "eval(fs.readFileSync(process.argv[1],'utf8'));"
+            "const assert=require('assert');"
+            "assert.strictEqual(AdPage.discloseTOP_N,5);"
+            "assert.ok(discloseKey('x').indexOf('v2')>=0,'key lost its version');"
+            "var rows=[1,2,3,4,5,6,7];"
+            "var collapsed=discloseRows(rows,'t5a','agents');"
+            "assert.deepStrictEqual(collapsed.rows,[1,2,3,4,5]);"
+            "assert.strictEqual(collapsed.total,7);"
+            "assert.strictEqual(collapsed.showAll,false);"
+            "assert.strictEqual(discloseSlice(rows,false).length,5);"
+            "assert.strictEqual(discloseSlice(rows,true).length,7);"
+            "assert.strictEqual(discloseSlice([1,2],false).length,2);"
+            "assert.strictEqual(discloseLabel(7,false,'agents',5),'Show all 7 agents');"
+            "assert.strictEqual(discloseLabel(7,true,'agents',5),'Show top 5 agents');"
+            "assert.strictEqual(discloseButton(discloseRows([1,2],'t5b','agents'),'t',function(){}),null);"
+            "var btn=discloseButton(collapsed,'rows-id',function(){});"
+            "assert.strictEqual(btn.tag,'button');"
+            "assert.strictEqual(btn.textContent,'Show all 7 agents');"
+            "assert.strictEqual(btn.attrs['aria-expanded'],'false');"
+            "assert.strictEqual(btn.attrs['aria-controls'],'rows-id');"
+            "btn._on.click();"
+            "var expanded=discloseRows(rows,'t5a','agents');"
+            "assert.strictEqual(expanded.showAll,true);"
+            "assert.strictEqual(expanded.rows.length,7);"
+            "var btn2=discloseButton(expanded,'rows-id',function(){});"
+            "assert.strictEqual(btn2.textContent,'Show top 5 agents');"
+            "assert.strictEqual(btn2.attrs['aria-expanded'],'true');"
+            "btn2._on.click();"
+            "assert.strictEqual(discloseRows(rows,'t5a','agents').showAll,false);"
+            "store['agent-dash-running:all']='all';"
+            "assert.strictEqual(readDisclosed('running:all'),false,'the pre-top-5 expanded flag applies');"
+            "writeDisclosed('running:all',true);"
+            "assert.strictEqual(readDisclosed('running:all'),true);"
+        )
+        proc = subprocess.run(
+            ["node", "-e", script, str(STATIC / "core" / "disclosure.js")],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr or proc.stdout)
+        src = (STATIC / "core" / "disclosure.js").read_text()
+        for marker in ("try", "catch", "sessionStorage"):
+            self.assertIn(marker, src, f"the helper touches storage without {marker}")
+        page = (STATIC / "index.html").read_text()
+        self.assertIn('<script src="/static/core/disclosure.js"></script>', page, "index.html never loads the helper")
+        self.assertIn('<link rel="stylesheet" href="/static/core/disclosure.css">', page, "index.html never loads the helper CSS")
+
+    def test_outcome_tokens_split_blocked_and_died(self):
+        """Blocked and died resolve to different outcome tokens, glyphs
+        and words everywhere outcomes are coloured (timeline.js
+        outcomeOf/OUTCOME, mirrored by the replay): blocked is serious
+        orange with ⊘, died is critical red with ✕, both colour-blind
+        safe next to partial amber and pass green."""
+        script = (
+            "const fs=require('fs');"
+            "globalThis.window=globalThis;"
+            "eval(fs.readFileSync(process.argv[1],'utf8'));"
+            "const assert=require('assert');"
+            "assert.ok(OUTCOME.blocked[0]!==OUTCOME.died[0],'blocked and died share one colour');"
+            "assert.strictEqual(OUTCOME.blocked[0],'var(--serious)');"
+            "assert.strictEqual(OUTCOME.died[0],'var(--critical)');"
+            "assert.ok(OUTCOME.blocked[1]!==OUTCOME.died[1],'blocked and died share one glyph');"
+            "assert.strictEqual(OUTCOME.blocked[1],'\\u2298');"
+            "assert.strictEqual(OUTCOME.died[1],'\\u2715');"
+            "assert.ok(OUTCOME.blocked[2]!==OUTCOME.died[2],'blocked and died share one word');"
+            "assert.strictEqual(OUTCOME.part[0],'var(--warning)');"
+            "assert.strictEqual(OUTCOME.ok[0],'var(--good)');"
+            "function run(o){return Object.assign({ended_at:1700000100,status:'done',verdict:null},o||{});}"
+            "assert.strictEqual(outcomeOf(run({status:'killed'})),'died');"
+            "assert.strictEqual(outcomeOf(run({status:'died_early'})),'died');"
+            "assert.strictEqual(outcomeOf(run({verdict:'FAILURE'})),'died');"
+            "assert.strictEqual(outcomeOf(run({verdict:'CANCELED'})),'died');"
+            "assert.strictEqual(outcomeOf(run({status:'killed',verdict:'BLOCKED'})),'died');"
+            "assert.strictEqual(outcomeOf(run({verdict:'BLOCKED'})),'blocked');"
+            "assert.strictEqual(outcomeOf(run({verdict:'REQUEST_CHANGES'})),'blocked');"
+            "assert.strictEqual(outcomeOf(run({verdict:'PARTIAL'})),'part');"
+            "assert.strictEqual(outcomeOf(run({verdict:'APPROVE_WITH_CHANGES'})),'part');"
+            "assert.strictEqual(outcomeOf(run({verdict:'PASS'})),'ok');"
+            "assert.strictEqual(outcomeOf({status:'running'}) ,'run');"
+            "assert.strictEqual(outcomeColor(run({verdict:'BLOCKED'})),'var(--serious)');"
+            "assert.strictEqual(outcomeColor(run({status:'killed'})),'var(--critical)');"
+        )
+        proc = subprocess.run(
+            ["node", "-e", script, str(STATIC / "cards" / "timeline.js")],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr or proc.stdout)
+
+    def test_verdict_pills_split_blocked_and_died(self):
+        """The run-row verdict pills never paint blocked like died:
+        BLOCKED reads ⊘ blocked and REQUEST_CHANGES ↻ changes asked on
+        the serious-orange blocked pill; died stays the run status."""
+        script = (
+            "const fs=require('fs');"
+            "globalThis.window=globalThis;"
+            "eval(fs.readFileSync(process.argv[1],'utf8'));"
+            "eval(fs.readFileSync(process.argv[2],'utf8'));"
+            "const assert=require('assert');"
+            "assert.deepStrictEqual(verdictPill('BLOCKED'),['blocked','\\u2298 blocked']);"
+            "assert.deepStrictEqual(verdictPill('REQUEST_CHANGES'),['blocked','\\u21BB changes asked']);"
+            "assert.deepStrictEqual(verdictPill('PARTIAL'),['part','\\u25D0 partial']);"
+            "assert.deepStrictEqual(verdictPill('APPROVE_WITH_CHANGES'),['part','\\u25D0 partial']);"
+            "assert.deepStrictEqual(verdictPill('PASS'),['pass','\\u2713 pass']);"
+            "assert.strictEqual(typeof verdictEl,'function','the drawer pill helper is not exported');"
+        )
+        proc = subprocess.run(
+            ["node", "-e", script, str(STATIC / "core" / "disclosure.js"), str(STATIC / "cards" / "tables.js")],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr or proc.stdout)
+        css = (STATIC / "cards" / "tables.css").read_text()
+        self.assertIn(".vpill.blocked", css, "the blocked pill has no style")
+        self.assertIn("serious", css, "the blocked pill does not use the serious token")
+        self.assertNotIn(".vpill.rev", css, "the dead rev pill style is back")
+
+    def test_top5_caps_across_lists(self):
+        """Every capped list renders through the shared disclosure
+        helper; the Finished pager stays at 10; the unmapped-running
+        strip is gone everywhere."""
+        manage = (STATIC / "core" / "manage.js").read_text()
+        self.assertIn('discloseRows(tableRows(), "manage:current", "workstreams")', manage)
+        self.assertIn('id: "mg-rows"', manage)
+        self.assertIn('"data-mg-more"', manage)
+        self.assertIn('"Select all " + rows.length + " workstreams in this filter"', manage)
+        planned = (STATIC / "cards" / "planned.js").read_text()
+        self.assertIn('discloseRows(rows, "planned:readiness", "workstreams")', planned)
+        self.assertIn('discloseRows(held, "planned:gated", "workstreams")', planned)
+        archive = (STATIC / "cards" / "archive.js").read_text()
+        self.assertIn('discloseRows(cards, "archive:shelf", "archived workstreams")', archive)
+        home = (STATIC / "cards" / "project-home.js").read_text()
+        self.assertIn('discloseRows(rows, "home:planned", "planned workstreams")', home)
+        self.assertIn('discloseRows(rows, "home:unplanned", "unplanned workstreams")', home)
+        wscards = (STATIC / "cards" / "ws-cards.js").read_text()
+        self.assertIn('discloseRows(rows, capKey, "workstreams")', wscards)
+        self.assertNotIn("prog-more", wscards, "the old Where-we-are toggle is back")
+        decisions = (STATIC / "cards" / "decisions.js").read_text()
+        self.assertIn('discloseRows(shown, "decisions", "decisions")', decisions)
+        self.assertNotIn("decExpanded", decisions, "the old decisions expander is back")
+        phases = (STATIC / "cards" / "phases.js").read_text()
+        self.assertIn('discloseRows(items, "phase-usage", "workstreams")', phases)
+        for path in ("cards/tables.js", "core/manage.js", "cards/planned.js",
+                     "cards/archive.js", "cards/project-home.js",
+                     "cards/ws-cards.js", "cards/decisions.js",
+                     "cards/phases.js", "core/drawer.js", "plan.js"):
+            self.assertNotIn("not mapped to a task", (STATIC / path).read_text(), f"{path} still names the strip")
+        for path in ("cards/plan-progress.css", "cards/ws-cards.css",
+                     "cards/project-home.css", "cards/decisions.css"):
+            self.assertNotIn(".unassigned", (STATIC / path).read_text(), f"{path} keeps dead strip CSS")
+            self.assertNotIn("prog-more", (STATIC / path).read_text(), f"{path} keeps dead toggle CSS")
+        self.assertNotIn(".dc-more", (STATIC / "cards" / "decisions.css").read_text(), "dead dc-more CSS is back")
+        self.assertNotIn(".vd {", (STATIC / "cards" / "tables.css").read_text(), "the dead drawer verdict style is back")
 
     def test_finished_lists_share_one_pager(self):
         """Every finished agents/runs list pages through the one shared

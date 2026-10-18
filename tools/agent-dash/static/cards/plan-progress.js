@@ -40,10 +40,11 @@
     return null;
   }
   /* Phantom-task guard, mirroring dash/taskmatch.task_of_verified: a mapped
-     id that names no task in this workstream's plan stays unmapped (it lands
-     in the "running, mapped to no task" list instead of claiming a chip
-     that does not exist, e.g. WS7.OPS). With no plan ids to check against,
-     verification is impossible and the raw mapping stands. */
+     id that names no task in this workstream's plan stays unmapped (it
+     claims no chip that does not exist, e.g. WS7.OPS, and simply does not
+     appear in the map — unmapped running agents still show in Running
+     now). With no plan ids to check against, verification is impossible
+     and the raw mapping stands. */
   function taskOfVerified(r, ws) {
     var t = taskOf(r, ws);
     if (t == null) return null;
@@ -131,8 +132,10 @@
 
   /* plan DAG for a workstream */
   function planCard(plan, snap) {
-    var live = {}, just = {}, unassigned = [], now = Date.now() / 1000;
-    ((snap && snap.running) || []).forEach(function (r) { if (r.workstream && r.workstream !== plan.ws) return; var t = taskOfVerified(r, plan.ws); if (t) (live[t] = live[t] || []).push(r); else if (r.workstream === plan.ws) unassigned.push(r); });
+    /* Running agents that map to no task simply do not appear in the map
+       (they still appear in Running now): there is no unmapped strip. */
+    var live = {}, just = {}, now = Date.now() / 1000;
+    ((snap && snap.running) || []).forEach(function (r) { if (r.workstream && r.workstream !== plan.ws) return; var t = taskOfVerified(r, plan.ws); if (t) (live[t] = live[t] || []).push(r); });
     ((snap && snap.recent) || []).forEach(function (r) { if (r.ended_at && now - r.ended_at < 900) { var t = taskOfVerified(r, plan.ws); if (t) just[t] = r; } });
     var att = {}, seenRun = {};
     (state.runs || []).concat((snap && snap.running) || [], (snap && snap.recent) || []).forEach(function (r) {
@@ -149,8 +152,8 @@
     var legendPop = el("div", {class: "pop"}, [el("b", {text: "What the chips mean"})]);
     var legendBtn = el("span", {class: "legend-tip", tabindex: "0", "aria-label": "Legend"}, ["Legend \u24D8", legendPop]);
     c.firstChild.appendChild(legendBtn);
-    /* Always-visible legend, right under the intro line (above the map and
-       above the "Running, not mapped to a task" row). The old compact row
+    /* Always-visible legend, right under the intro line (above the map).
+       The old compact row
        lived below the progress bar and the chip rows, and only with a
        server layout, so it never answered "what is pink vs blue"; it moves
        here and grows to every colour the card uses. The "Legend" popover
@@ -159,7 +162,6 @@
     var famSeen = {};
     function runFam(r) { var A = (typeof ADM !== "undefined") ? ADM : null; if (!A) return "other"; try { return A.famOf(tierKey(r)); } catch (e) { return "other"; } }
     Object.keys(live).forEach(function (tid) { (live[tid] || []).forEach(function (r) { famSeen[runFam(r)] = 1; }); });
-    unassigned.forEach(function (r) { famSeen[runFam(r)] = 1; });
     var legData = planLegend(Object.keys(famSeen));
     var mleg = el("div", {class: "map-legend", role: "list", "aria-label": "Plan map legend: task status colours, agent family colours, and dependency edges"});
     function legGroup(label, items) {
@@ -206,7 +208,7 @@
       }); });
       c.appendChild(wn);
     }
-    if (unassigned.length) { var ua = el("div", {class: "unassigned"}, [el("b", {style: "font-size:12px;color:var(--ink-2)", text: "Running, not mapped to a task:"})]); unassigned.forEach(function (r) { var sp = el("span", {title: (r.tier || "") + " · " + fmtDur(r.elapsed_s), text: r.label || r.run_id}); sp.style.borderColor = colorOf(tierKey(r)); ua.appendChild(sp); }); c.appendChild(ua); }
+    /* No unmapped strip: running agents with no task stay out of the map. */
     var gs = {}, colStat = {};
     /* Server-computed map layout (dash/maplayout.py, carried on /api/plan):
        density, per-section collapse state, slim columns, chip labels, arrows
@@ -944,9 +946,12 @@
        painted from the same rpCursorTime playhead. Bars appear as their run
        starts and grow until it ends; a vertical cursor sweeps the shared
        time axis. Clicking or dragging the plot scrubs both cards. */
+    /* Mirrors outcomeOf (static/cards/timeline.js): died and blocked are
+       distinct outcomes with their own colours and glyphs. */
     function rpOutcomeOf(run) {
       if (!run.end) return run.status === "running" ? "run" : "unk";
-      if (run.status === "died_early" || run.status === "killed" || run.verdict === "BLOCKED" || run.verdict === "REQUEST_CHANGES" || run.verdict === "FAILURE" || run.verdict === "CANCELED") return "bad";
+      if (run.status === "died_early" || run.status === "killed" || run.verdict === "FAILURE" || run.verdict === "CANCELED") return "died";
+      if (run.verdict === "BLOCKED" || run.verdict === "REQUEST_CHANGES") return "blocked";
       if (run.verdict === "PARTIAL" || run.verdict === "APPROVE_WITH_CHANGES") return "part";
       if (run.status === "done" || run.verdict === "SUCCESS") return "ok";
       return "unk";
@@ -969,7 +974,7 @@
     function rpTimelineCard() {
       var c = el("div", {class: "card", id: "exec-timeline", "data-nav": "Run timeline"}, [el("h2", {text: "Run timeline"}), el("p", {class: "sub", text: "The same playhead as the plan progress map above: bars appear as their run starts and grow until it ends. The strip is how many worker agents ran at each moment. Click or drag to scrub both; hover a bar for the run."})]);
       var lg = el("div", {class: "legend"});
-      ["run", "ok", "part", "bad"].forEach(function (k) {
+      ["run", "ok", "part", "blocked", "died"].forEach(function (k) {
         var o = OUTCOME[k], sp = el("span");
         var sw = el("i", {class: "sw"}); sw.style.background = o[0]; sp.appendChild(sw);
         sp.appendChild(document.createTextNode(o[1] + " " + o[2])); lg.appendChild(sp);
@@ -1366,7 +1371,7 @@
         chipEl[tid].classList.remove("live", "just", "changed");
       });
       /* Live snapshot rows would lie during a historical playback. */
-      Array.prototype.forEach.call(c.querySelectorAll(".working-now,.unassigned"), function (node) { node.style.display = "none"; });
+      Array.prototype.forEach.call(c.querySelectorAll(".working-now"), function (node) { node.style.display = "none"; });
       /* The live count-up animation would fight the replay percent. */
       (window.__adCountUp || []).forEach(function (h) { clearInterval(h); });
       try { clearTask(true); } catch (e) {}

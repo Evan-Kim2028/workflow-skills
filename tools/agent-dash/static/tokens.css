@@ -47,7 +47,9 @@
   --warning:     #f5b81e;  /* on --card 10.15:1 */
   --warning-ink: #ffcf4d;
   --warning-soft: rgba(245, 184, 30, .16);
-  --serious: #f08a5c;  /* merged-waiting-prod is --s5, not this; serious = dying */
+  --serious: #f08a5c;  /* merged-waiting-prod is --s5, not this; serious = blocked/dying. on --card 7.33:1 */
+  --serious-ink: #f08a5c;  /* small "blocked" text on --card 7.33:1 */
+  --serious-soft: rgba(240, 138, 92, .14);
   --critical:     #f26d6d;  /* on --card 6.20:1 */
   --critical-ink: #ff8a8a;
   --critical-soft: rgba(242, 109, 109, .14);
@@ -187,7 +189,9 @@
   --warning: #b97a00;  /* darkened amber so words on card pass AA */
   --warning-ink: #7a5200;
   --warning-soft: rgba(185, 122, 0, .14);
-  --serious: #d06028;
+  --serious: #d06028;  /* marks on --card 3.90:1 (graphics pass, text uses -ink) */
+  --serious-ink: #a03d00;  /* small "blocked" text on --card 6.64:1 */
+  --serious-soft: rgba(208, 96, 40, .12);
   --critical: #c93a3a; --critical-ink: #a82a2a;
   --critical-soft: rgba(201, 58, 58, .10);
 

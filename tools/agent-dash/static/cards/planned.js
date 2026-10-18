@@ -10,7 +10,8 @@
    Reads: state.wss, state.wssAll, state.plans, state.approvals.
    Exports (on window.AdPage.cards, also kept as plain globals):
    plannedSpecs, readinessOf, gateStale, gatedLive, PLANNED_SLOTS.
-   Needs: el, fmtN, openPlan, keyOf, registryFor (plain globals). */
+   Needs: el, fmtN, openPlan, keyOf, registryFor, discloseRows,
+   discloseButton, discloseRedraw, readDisclosed (plain globals). */
 (function (global) {
   "use strict";
   /* Slot mount points for the dependency chart (shared with the
@@ -122,6 +123,8 @@
       c.appendChild(el("p", {class: "pj-note", text: "No planned workstreams: every bundle has a tab."}));
       return c;
     }
+    /* Top 5 by default through the shared disclosure helper. */
+    var info = discloseRows(rows, "planned:readiness", "workstreams");
     var states = {};
     (state.wssAll && state.wssAll.length ? state.wssAll : state.wss || []).forEach(function (w) { states[String(w.ws).toUpperCase()] = ADT.wsStateOf(w); });
     (state.bundles || []).forEach(function (b) { if (b && b.id && !states[String(b.id).toUpperCase()]) states[String(b.id).toUpperCase()] = b.state || "active"; });
@@ -136,8 +139,8 @@
       head.appendChild(el("th", {scope: "col", class: pair[1], text: pair[0]}));
     });
     table.appendChild(el("thead", {}, [head]));
-    var body = el("tbody");
-    rows.forEach(function (w) {
+    var body = el("tbody", {id: "planned-ready-rows"});
+    info.rows.forEach(function (w) {
       var r = readinessOf(w, state.plans[w.ws], state.approvals, states, nowS);
       var tr = el("tr");
       var wsCell = el("td", {class: "c-label", title: w.ws + (w.name ? " " + w.name : "")});
@@ -189,6 +192,8 @@
     /* Wide readiness rows scroll inside their own container on phones
        (the shared .twrap well); desktops fit the card and never scroll. */
     c.appendChild(el("div", {class: "twrap"}, [table]));
+    var more = discloseButton(info, "planned-ready-rows", discloseRedraw("planned-ready", "planned-ready-rows"));
+    if (more) c.appendChild(more);
     var acts = el("div", {class: "prog-acts"});
     rows.forEach(function (w) {
       var bp = el("button", {type: "button", text: "Plan " + w.ws, title: "Open the " + w.ws + " plan page"});
@@ -205,7 +210,11 @@
     if (!held.length) return null;
     var c = el("div", {class: "card pj-gated", "data-nav": "Gated but live"});
     c.appendChild(secHead("Gated but live", "Active with an unmet owner or sign-off gate — the gate holds the work."));
-    held.forEach(function (h) {
+    /* Top 5 by default through the shared disclosure helper. */
+    var info = discloseRows(held, "planned:gated", "workstreams");
+    var list = el("div", {id: "planned-gated-list"});
+    c.appendChild(list);
+    info.rows.forEach(function (h) {
       var pr = h.progress || {done: 0, total: 0, pct: 0};
       var row = el("div", {class: "prog-row s-active"});
       var name = el("div", {class: "prog-name"});
@@ -233,8 +242,10 @@
       bp.addEventListener("click", function () { openPlan(h.ws); });
       acts.appendChild(bp);
       row.appendChild(acts);
-      c.appendChild(row);
+      list.appendChild(row);
     });
+    var more = discloseButton(info, "planned-gated-list", discloseRedraw("planned-gated", "planned-gated-list"));
+    if (more) c.appendChild(more);
     return c;
   }
 
@@ -270,8 +281,8 @@
     var bySlot = {};
     entries.forEach(function (e) { if (e.slot) bySlot[e.slot] = e; });
     specs.push(slotSection("exec-depgraph", bySlot["exec-depgraph"] || null));
-    specs.push(["planned-ready", keyOf([(state.wss || []).map(function (w) { return [w.ws, w.progress, w.depends_on]; }), state.bundles, state.plans, state.approvals]), function () { return readinessTable(); }, ""]);
-    specs.push(["planned-gated", keyOf([(state.wss || []).map(function (w) { return [w.ws, w.progress]; }), state.plans]), function () {
+    specs.push(["planned-ready", keyOf([(state.wss || []).map(function (w) { return [w.ws, w.progress, w.depends_on]; }), state.bundles, state.plans, state.approvals, readDisclosed("planned:readiness")]), function () { return readinessTable(); }, ""]);
+    specs.push(["planned-gated", keyOf([(state.wss || []).map(function (w) { return [w.ws, w.progress]; }), state.plans, readDisclosed("planned:gated")]), function () {
       var node = gatedLiveSection();
       return node || el("div", {class: "pj-empty-gated"});
     }, ""]);

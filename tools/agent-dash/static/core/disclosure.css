@@ -1,0 +1,15 @@
+/* Shared progressive-disclosure control (static/core/disclosure.js):
+   one real button below every capped list, in both themes, on phones too.
+   Lists that fit carry no button (the helper returns null), so this style
+   never paints a dead control. */
+.disclose-btn {
+  display: inline-flex;
+  margin: 10px 4px 2px;
+}
+.disclose-btn:hover {
+  border-color: var(--ring-strong);
+}
+.disclose-btn:focus-visible {
+  outline: 2px solid var(--accent, var(--s1));
+  outline-offset: 2px;
+}

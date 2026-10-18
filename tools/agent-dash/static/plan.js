@@ -156,16 +156,16 @@
       host.appendChild(el("p", {class: "sub", text: "This plan has no sections yet."}));
       return;
     }
+    /* Running agents that map to no task simply do not appear in the map
+       (they still appear in Running now): there is no unmapped strip. */
     var live = {};
     var just = {};
-    var unassigned = [];
     var now = Date.now() / 1000;
     var ids = dagTaskIds(dag);
     ((snap && snap.running) || []).forEach(function (run) {
       if (run.workstream && run.workstream !== dag.ws) return;
       var task = taskOfVerified(run, dag.ws, ids);
       if (task) (live[task] = live[task] || []).push(run);
-      else if (run.workstream === dag.ws) unassigned.push(run);
     });
     ((snap && snap.recent) || []).forEach(function (run) {
       if (run.ended_at && now - run.ended_at < 900) {
@@ -173,10 +173,6 @@
         if (task) just[task] = run;
       }
     });
-    if (unassigned.length) {
-      var line = el("p", {class: "sub", text: "Running, not mapped to a task: " + unassigned.map(function (run) { return run.label || run.run_id; }).join(", ")});
-      host.appendChild(line);
-    }
     var legend = el("div", {class: "pp-legend"});
     [
       ["live", "agent working now"],

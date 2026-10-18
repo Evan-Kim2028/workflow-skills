@@ -275,7 +275,7 @@ The page pins a run to the task chip when the label holds the task id. That cove
 }
 ```
 
-The server serves the resolved file at `/static/taskmap.json`. A run that maps to a workstream but no task is listed above the map as not mapped; that list is the signal to add an entry.
+The server serves the resolved file at `/static/taskmap.json`. A run that maps to a workstream but no task stays out of the map (it still appears in Running now); when a lane should claim a chip, add an entry.
 
 ### Labelling for planning versus execution
 
