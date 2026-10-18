@@ -41,6 +41,20 @@ def _run(run_id, job, status, **extra):
     return row
 
 
+def _reset_backoff():
+    dagster._fail_streak = 0
+    dagster._backoff_s = 0.0
+    dagster._next_attempt = None
+
+
+def _failing_ssh(calls):
+    def fake(host, url, payload):
+        calls.append(1)
+        return None, "ssh timed out"
+
+    return fake
+
+
 def _payload(active, recent=None):
     def block(rows):
         return {"__typename": "Runs", "results": rows}
@@ -51,7 +65,11 @@ def _payload(active, recent=None):
 class DagsterTests(unittest.TestCase):
     def setUp(self):
         self._ssh = dagster._ssh
+        self._clock = dagster._clock
         dagster._ssh = self._blocked
+        self.clock = [NOW]
+        dagster._clock = lambda: self.clock[0]
+        _reset_backoff()
         dagster.last_error = None
         dagster.skipped_closeouts = 0
         self.tmp = tempfile.TemporaryDirectory()
@@ -59,6 +77,8 @@ class DagsterTests(unittest.TestCase):
 
     def tearDown(self):
         dagster._ssh = self._ssh
+        dagster._clock = self._clock
+        _reset_backoff()
         dagster.last_error = None
         dagster.skipped_closeouts = 0
         self.store.close()
@@ -463,12 +483,12 @@ class DagsterTests(unittest.TestCase):
         self._feed(active, [])
         self.assertEqual(dagster.skipped_closeouts, 1)
         body = Registry([dagster]).health(NOW)
-        self.assertEqual(body["dagster"], {"skipped_closeouts": 1})
+        self.assertEqual(body["dagster"]["skipped_closeouts"], 1)
         self.assertTrue(body["ok"])
         self._feed(active, [])
         self.assertEqual(dagster.skipped_closeouts, 2)
         body = Registry([dagster]).health(NOW)
-        self.assertEqual(body["dagster"], {"skipped_closeouts": 2})
+        self.assertEqual(body["dagster"]["skipped_closeouts"], 2)
 
     def test_slow_poll_is_slow_not_error(self):
         import time as time_mod
@@ -517,6 +537,90 @@ class DagsterTests(unittest.TestCase):
         skipped = [item for item in result["problems"] if item["code"] == "dagster-closeout-skipped"]
         self.assertEqual(len(skipped), 1)
         self.assertEqual(skipped[0]["severity"], "warn")
+
+    def _advance_to_next_attempt(self):
+        self.clock[0] = dagster._next_attempt
+
+    def test_consecutive_failures_double_the_delay_and_cap(self):
+        calls = []
+        dagster._ssh = _failing_ssh(calls)
+        seen = []
+        for _ in range(5):
+            dagster.poll(self.store, CFG, NOW)
+            seen.append(dagster._backoff_s)
+            self._advance_to_next_attempt()
+        self.assertEqual(seen, [60.0, 120.0, 240.0, 300.0, 300.0])
+        self.assertEqual(len(calls), 5)
+        self.assertEqual(dagster.last_error, "ssh timed out")
+
+    def test_max_backoff_is_configurable(self):
+        calls = []
+        dagster._ssh = _failing_ssh(calls)
+        cfg = {"dagster": dict(CFG["dagster"], max_backoff_s=90)}
+        seen = []
+        for _ in range(3):
+            dagster.poll(self.store, cfg, NOW)
+            seen.append(dagster._backoff_s)
+            self._advance_to_next_attempt()
+        self.assertEqual(seen, [60.0, 90.0, 90.0])
+
+    def test_skipped_polls_do_not_call_ssh_and_keep_last_error(self):
+        calls = []
+        dagster._ssh = _failing_ssh(calls)
+        dagster.poll(self.store, CFG, NOW)
+        self.assertEqual(len(calls), 1)
+        self.clock[0] = NOW + 30
+        dagster.poll(self.store, CFG, NOW + 30)
+        dagster.poll(self.store, CFG, NOW + 45)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(dagster.last_error, "ssh timed out")
+        self.clock[0] = NOW + 60
+        dagster.poll(self.store, CFG, NOW + 60)
+        self.assertEqual(len(calls), 2)
+
+    def test_success_resets_the_backoff(self):
+        calls = []
+        dagster._ssh = _failing_ssh(calls)
+        dagster.poll(self.store, CFG, NOW)
+        self._advance_to_next_attempt()
+        dagster.poll(self.store, CFG, NOW)
+        self.assertEqual(dagster._backoff_s, 120.0)
+        self._advance_to_next_attempt()
+        self._feed([])
+        self.assertIsNone(dagster.last_error)
+        self.assertEqual(dagster._backoff_s, 0.0)
+        self.assertIsNone(dagster._next_attempt)
+        dagster._ssh = _failing_ssh(calls)
+        dagster.poll(self.store, CFG, NOW)
+        self.assertEqual(dagster._backoff_s, 60.0)
+
+    def test_backoff_fields_in_health(self):
+        calls = []
+        dagster._ssh = _failing_ssh(calls)
+        registry = Registry([dagster])
+        registry.tick(self.store, CFG, NOW, force=True)
+        self.clock[0] = NOW + 20
+        registry.tick(self.store, CFG, NOW + 20, force=True)
+        self.assertEqual(len(calls), 1)
+        body = registry.health(NOW + 20)
+        self.assertFalse(body["ok"])
+        entry = body["sources"][0]
+        self.assertEqual(entry["state"], "error")
+        self.assertEqual(entry["last_error"], "ssh timed out")
+        self.assertEqual(body["dagster"]["backoff_s"], 60.0)
+        self.assertEqual(body["dagster"]["next_poll_in_s"], 40.0)
+        self.assertIn("skipped_closeouts", body["dagster"])
+        self.clock[0] = NOW + 60
+        registry.tick(self.store, CFG, NOW + 60, force=True)
+        self.assertEqual(len(calls), 2)
+        body = registry.health(NOW + 60)
+        self.assertEqual(body["dagster"]["backoff_s"], 120.0)
+        self.assertEqual(body["dagster"]["next_poll_in_s"], 120.0)
+        self._advance_to_next_attempt()
+        self._feed([])
+        body = Registry([dagster]).health(NOW)
+        self.assertEqual(body["dagster"]["backoff_s"], 0.0)
+        self.assertEqual(body["dagster"]["next_poll_in_s"], 0.0)
 
     def test_unknown_run_closes_as_finished_unknown(self):
         gone_id = "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee"

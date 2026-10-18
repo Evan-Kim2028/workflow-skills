@@ -11,12 +11,14 @@ import json
 import logging
 import re
 import subprocess
+import time
 
 NAME = "dagster"
 INTERVAL_S = 60
 SURFACE_ERROR = True
 
 DEFAULT_URL = "http://127.0.0.1:3000/graphql"
+DEFAULT_MAX_BACKOFF_S = 300.0
 WINDOW_S = 2 * 3600
 TAG_KEYS = ("dagster/partition", "lor/ops_wave", "lor/slot_class", "lor/claim_gib")
 
@@ -89,11 +91,57 @@ last_error = None
 # Close-outs skipped because the active page was full (ACTIVE_LIMIT).
 # Surfaced on /api/health as ``dagster.skipped_closeouts``.
 skipped_closeouts = 0
+# Back-off after ssh failures (timeouts, ssh errors). The first failure keeps
+# the normal interval; each further consecutive failure doubles the delay up to
+# dagster.max_backoff_s. A poll inside the window returns without ssh.
+# ``_clock`` is the monotonic clock the window is measured on (tests patch it).
+_clock = time.monotonic
+_fail_streak = 0
+_backoff_s = 0.0
+_next_attempt = None
 
 
 def health_extra() -> dict:
-    """Extra health payload merged by the registry under ``dagster``."""
-    return {"skipped_closeouts": skipped_closeouts}
+    """Extra health payload merged by the registry under ``dagster``.
+
+    ``backoff_s`` is the current delay after failures (0 when healthy) and
+    ``next_poll_in_s`` the seconds until the next ssh attempt (0 when none is
+    pending).
+    """
+    remaining = 0.0
+    if _next_attempt is not None:
+        remaining = max(0.0, _next_attempt - _clock())
+    return {
+        "skipped_closeouts": skipped_closeouts,
+        "backoff_s": _backoff_s,
+        "next_poll_in_s": round(remaining, 1),
+    }
+
+
+def _max_backoff(cfg: dict) -> float:
+    block = cfg.get("dagster") if isinstance(cfg.get("dagster"), dict) else {}
+    try:
+        value = float(block.get("max_backoff_s", DEFAULT_MAX_BACKOFF_S))
+    except (TypeError, ValueError):
+        return DEFAULT_MAX_BACKOFF_S
+    return value if value > 0 else DEFAULT_MAX_BACKOFF_S
+
+
+def _record_success() -> None:
+    global _fail_streak, _backoff_s, _next_attempt
+    _fail_streak = 0
+    _backoff_s = 0.0
+    _next_attempt = None
+
+
+def _record_failure(cfg: dict) -> None:
+    """Count one ssh failure and schedule the next attempt after the back-off delay."""
+    global _fail_streak, _backoff_s, _next_attempt
+    _fail_streak += 1
+    delay = INTERVAL_S * (2 ** min(_fail_streak - 1, 30))
+    _backoff_s = float(min(delay, _max_backoff(cfg)))
+    _next_attempt = _clock() + _backoff_s
+    log.warning("dagster: backing off %gs after %d failed poll(s)", _backoff_s, _fail_streak)
 
 
 def poll(store, cfg, now: float) -> None:
@@ -149,14 +197,20 @@ def _poll(store, cfg: dict, now: float) -> None:
     settings = _settings(cfg)
     if settings is None:
         last_error = None
+        _record_success()
         return
     host, url = settings
+    if _next_attempt is not None and _clock() < _next_attempt:
+        # Inside the back-off window: no ssh. last_error stays as the last failure.
+        return
     body = json.dumps({"query": QUERY, "variables": {"since": now - WINDOW_S}}).encode("utf-8")
     text, err = _ssh(host, url, body)
     if err:
         last_error = _clip(err)
         log.warning("dagster: %s", last_error)
+        _record_failure(cfg)
         return
+    _record_success()
     try:
         payload = json.loads(text or "")
         active_raw, recent_raw = _split(payload, now)
