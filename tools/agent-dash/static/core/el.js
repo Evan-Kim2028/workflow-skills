@@ -21,10 +21,14 @@
   function cssv(n) { return getComputedStyle(document.documentElement).getPropertyValue(n).trim(); }
   function tierKey(r) { return ADM.info(r).key; }
   function modelKey(m) { return ADM.keyOf(m)[1]; }
-  /* Legend grouped by family: "Cursor ■ Grok 4.7 ■ Composer 2.5". */
-  function modelLegend(keys, counts) {
+  /* Legend grouped by family: "Cursor ■ Grok 4.7 ■ Composer 2.5".
+     Runs without a recorded model stay out by default (lists simply
+     omit them); pass the page scope to scope the shared toggle, or
+     nothing to list every key. */
+  function modelLegend(keys, counts, ws) {
+    var showU = ws == null || typeof AdUnatt === "undefined" || AdUnatt.shown(ws);
     var lg = el("div", {class: "legend mlegend"}), byF = {};
-    ADM.sortKeys(keys).forEach(function (k) { var f = ADM.famOf(k); (byF[f] = byF[f] || []).push(k); });
+    ADM.sortKeys(keys).filter(function (k) { return showU || !AdUnatt.isUnattributed(k); }).forEach(function (k) { var f = ADM.famOf(k); (byF[f] = byF[f] || []).push(k); });
     ADM.FAMS.forEach(function (f) {
       if (!byF[f]) return;
       var grp = el("span", {class: "mfam"}, [el("b", {text: ADM.FAM[f].name})]);

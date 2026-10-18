@@ -312,7 +312,10 @@
        "model not recorded". */
     var lbm = cn.live_by_model || {}, lbt = cn.live_by_tool || {}, byFam = {};
     if (!Object.keys(lbm).length) run.forEach(function (r) { if (!isAgent(r)) return; if (!r.model && !r.verdict && !ADC.billed(r.tokens || {})) return; var k = tierKey(r); lbm[k] = (lbm[k] || 0) + 1; });
-    ADM.sortKeys(Object.keys(lbm).filter(function (k) { return lbm[k]; })).forEach(function (k) { var f = ADM.famOf(k); (byFam[f] = byFam[f] || []).push(k); });
+    /* The live caption lists known models only by default; the family
+       totals above still include every live agent, hidden or not. */
+    var showU = AdUnatt.shown(state.ws);
+    ADM.sortKeys(Object.keys(lbm).filter(function (k) { return lbm[k]; })).filter(function (k) { return showU || !AdUnatt.isUnattributed(k); }).forEach(function (k) { var f = ADM.famOf(k); (byFam[f] = byFam[f] || []).push(k); });
     var toolFam = {grok: "cursor", muse: "muse", glm: "glm", claude: "claude", deepseek: "deepseek", other: "other"};
     Object.keys(lbt || {}).forEach(function (t) { if (lbt[t] && toolFam[t] && !byFam[toolFam[t]]) byFam[toolFam[t]] = []; });
     var liveLines = [ADM.FAMS.filter(function (f) { return byFam[f]; }).map(function (f) { var ks = byFam[f], n = ks.reduce(function (a, k) { return a + lbm[k]; }, 0); var toolN = 0; Object.keys(lbt || {}).forEach(function (t) { if (toolFam[t] === f) toolN += lbt[t]; }); var bits = ks.map(function (k) { return ADM.nameOf(k) + " " + fmtN(lbm[k]); }); if (toolN > n) bits.push("starting " + fmtN(toolN - n)); return ADM.FAM[f].name + " " + fmtN(Math.max(n, toolN)) + " (" + bits.join(", ") + ")"; }).join(" · ") || "idle"];
@@ -359,6 +362,21 @@
       tileSpark(costSeries, "var(--s5)", "tls-cost"), costLines,
       {"data-tile": "cost", "data-ws": state.ws, "data-hours": "24", "data-cost-usd": String(cost), "data-cost-all-time": String(allTimeCost), "data-unpriced-tokens": String(unpTok)},
       [{k: "This 24 h (hour buckets)", v: costStr(sumHalf(costSeries, 0, 24))}, {k: "Prior 24 h", v: costPrevTxt}, {k: "Rolling 24 h (API)", v: costStr(cost)}]));
+    /* The usage/tiles-area control: the muted one-line note (server
+       counts, never re-summed client buckets) while entries stay
+       hidden, the real button always. Headline totals never change. */
+    var unatt = cn.unattributed || null;
+    var hidRuns = unatt && unatt.runs != null ? unatt.runs : Object.keys(lbm).reduce(function (a, k) { return a + (AdUnatt.isUnattributed(k) ? (lbm[k] || 0) : 0); }, 0);
+    var hidTok = unatt && unatt.tokens != null ? unatt.tokens : null;
+    if (showU || hidRuns > 0 || (hidTok || 0) > 0) {
+      var trow = el("div", {class: "tiles-unatt", style: "grid-column:1/-1;display:flex;gap:10px;align-items:center;flex-wrap:wrap"});
+      if (!showU && (hidRuns > 0 || (hidTok || 0) > 0)) {
+        var tnote = AdUnatt.noteText(hidRuns, hidTok, fmtN);
+        trow.appendChild(el("span", {class: "unatt-note", style: "color:var(--muted);font-size:12px", text: tnote, title: tnote, "data-unatt-runs": String(hidRuns), "data-unatt-tokens": hidTok == null ? "n/a" : String(hidTok)}));
+      }
+      trow.appendChild(AdUnatt.toggleButton(state.ws));
+      g.appendChild(trow);
+    }
     return g;
   }
   var AdPage = (global.AdPage = global.AdPage || {});

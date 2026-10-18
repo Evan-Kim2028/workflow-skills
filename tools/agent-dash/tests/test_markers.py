@@ -385,6 +385,7 @@ eval(fs.readFileSync(process.argv[3], "utf8"));
 eval(fs.readFileSync(process.argv[4], "utf8"));
 eval(fs.readFileSync(process.argv[5], "utf8"));
 eval(fs.readFileSync(process.argv[6], "utf8"));
+eval(fs.readFileSync(process.argv[7], "utf8"));
 global.state = {ws: "all", snapError: null, runs: [], conc: [], usage: []};
 global.isAgent = function (r) { return r.source !== "claude-main" && r.source !== "shell" && !r.lane_shadow; };
 global.cachedPct = function () { return 0; };
@@ -425,6 +426,7 @@ console.log("tile starting caption proof ok");
                     str(STATIC / "tokencache.js"),
                     str(STATIC / "core" / "el.js"),
                     str(STATIC / "cards" / "tiles.js"),
+                    str(STATIC / "core" / "unattributed.js"),
                 ],
                 capture_output=True,
                 text=True,

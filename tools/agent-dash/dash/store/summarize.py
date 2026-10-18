@@ -53,6 +53,13 @@ class SummarizeMixin:
             earlier window, and ``live_agents`` the point-in-time count of
             agents overlapping the window start (``now - 24h`` by default),
             not a peak. Pruned data reads as whatever the database holds.
+
+            ``counts["unattributed"]`` (``{"runs", "tokens", "cost_usd"}``)
+            is additive only: counted agents (live now plus finished in the
+            window) whose model key ends ``-unknown`` — the same rule the
+            page labels "model not recorded" — with their windowed billed
+            tokens and priced cost. Totals still include them; the page
+            only folds their listed entries behind its default-off toggle.
             """
             if usage_group is not None and usage_group not in ("model", "workstream", "tool"):
                 raise ValueError("bad usage_group")
@@ -111,6 +118,12 @@ class SummarizeMixin:
                     wanted = [roll["unassigned"]] if key == UNASSIGNED and roll["has_unassigned"] else roll["rows"]
                     by_ws = [row for row in wanted if row["ws"] == key]
                 scope_ws = None if ws in (None, "all") else ws
+                # Own dict for the additive field below: the snapshot cache
+                # keeps this payload, so it must not alias the roll.
+                counts = dict(counts)
+                counts["unattributed"] = self._unattributed_locked(
+                    counts, recent_all, parents, scope_ws, roll["since"], roll["until"]
+                )
                 unpriced = self._unpriced_models_locked(range_since, range_until, scope_ws)
                 totals = {
                     **totals,
@@ -144,6 +157,48 @@ class SummarizeMixin:
                         usage_group, "hour", scope_ws, roll["since"], roll["until"]
                     )
                 return response
+        def _unattributed_locked(self, counts, recent_all, parents, scope_ws, range_since, range_until) -> dict:
+            """Runs with tokens or verdicts whose model was never recorded.
+
+            The one place that builds the additive ``counts["unattributed"]``
+            field (``{"runs", "tokens", "cost_usd"}``). ``runs`` counts
+            counted agents — live now (straight from ``live_by_model``, so
+            the same dedup the tile caption hides) plus finished in the
+            window (the same agent rule, status set, and parent-skip the
+            finished count uses) — whose model key ends ``-unknown``, the
+            same rule ``static/models.js`` labels "model not recorded".
+            ``tokens`` and ``cost_usd`` sum the model-grouped usage cells
+            with such keys over the same window, through the same
+            ``_sum_cells`` helper as the totals, so the hidden share
+            reconciles with the tile and the chart legend. Caller holds
+            the lock. Cached with the snapshot payload, so the
+            conditional-GET identity (key plus data sequence) covers it.
+            """
+            live = sum(
+                num
+                for key, num in (counts.get("live_by_model") or {}).items()
+                if key.endswith("-unknown")
+            )
+            finished = 0
+            for run in recent_all:
+                if run["run_id"] in parents:
+                    continue
+                if not _is_counted_agent(run):
+                    continue
+                if run.get("status") not in FINISHED:
+                    continue
+                if run_model_key(run).endswith("-unknown"):
+                    finished += 1
+            cells = self._query_usage_locked("model", "hour", scope_ws, range_since, range_until)
+            summed = _sum_cells(
+                [cell for cell in cells if (cell.get("key") or "").endswith("-unknown")]
+            )
+            return {
+                "runs": live + finished,
+                "tokens": _billed_total(summed["tokens"]),
+                "cost_usd": summed["cost_usd"],
+            }
+
         def snapshot_key(
             self,
             ws: str = "all",

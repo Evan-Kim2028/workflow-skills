@@ -308,6 +308,42 @@
     return {W: W, L: L, R: R, pw: Math.max(200, W - L - R)};
   }
 
+  /* Hidden runs and tokens in the selected range: unknown-model runs
+     (the per-model timeline rows the toggle folds away) and their
+     usage-bucket share under the current grouping, for the muted
+     one-line note beside the Show button. Pure reads, no DOM. */
+  function actHidden(range, loaded) {
+    var runs = 0, tokens = 0;
+    var now = Date.now() / 1000;
+    (loaded.runs || []).forEach(function (x) {
+      if (!x.started_at) return;
+      if (runEnd(x, now) < range.from || x.started_at > range.to) return;
+      if (AdUnatt.isUnattributed(tierKey(x))) runs++;
+    });
+    (loaded.usage || []).forEach(function (b) {
+      if (!(b.t + 3600 > range.from && b.t < range.to)) return;
+      var k = state.groupBy === "model" ? modelKey(b.key) : null;
+      if (k && AdUnatt.isUnattributed(k))
+        tokens += (b.input || 0) + (b.output || 0) + (b.cache_read || 0) + (b.cache_write || 0);
+    });
+    return {runs: runs, tokens: tokens};
+  }
+  /* The Show/Hide unattributed control for the Activity header: the
+     muted one-line note while hidden entries exist, the real button
+     always (so the toggle is discoverable both ways). Null when there
+     is nothing hidden and nothing to hide. */
+  function actUnattControl(ws, range, loaded) {
+    var showU = AdUnatt.shown(ws);
+    var hid = actHidden(range, loaded);
+    if (!showU && !hid.runs && !hid.tokens) return null;
+    var row = el("div", {class: "act-unatt", style: "display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:2px 0 8px"});
+    if (!showU && (hid.runs || hid.tokens)) {
+      var note = AdUnatt.noteText(hid.runs, hid.tokens, fmtN);
+      row.appendChild(el("span", {class: "unatt-note", style: "color:var(--muted);font-size:12px", text: note, title: note, "data-unatt-runs": String(hid.runs), "data-unatt-tokens": String(hid.tokens)}));
+    }
+    row.appendChild(AdUnatt.toggleButton(ws));
+    return row;
+  }
   function activityCard() {
     var ws = actScope();
     var loaded = actLoaded();
@@ -317,6 +353,8 @@
     var c = el("div", {class: "card", id: "exec-activity", "data-nav": "Activity over time"});
     c.appendChild(el("h2", {text: "Activity over time"}));
     c.appendChild(el("p", {class: "sub", text: "Tokens, runs, completion and live agents on one shared time axis. Brush the range bar to zoom all four at once; the Last hour preset follows now, a brush stays put."}));
+    var unattCtl = actUnattControl(ws, r, loaded);
+    if (unattCtl) c.appendChild(unattCtl);
     var bar = el("div", {class: "act-controls", role: "group", "aria-label": "Time range"});
     ACT_PRESETS.forEach(function (p) {
       var active = r.live ? r.preset === p[0] : p[0] === "all" && r.preset === "all";
@@ -594,20 +632,32 @@
       return {node: wrap, hasData: false};
     }
     var byModel = state.groupBy === "model";
+    var showU = AdUnatt.shown(actScope());
     var hours = {}, keys = {};
     B.forEach(function (b) { var k = state.groupBy === "model" ? modelKey(b.key) : (b.key || "unassigned"); var tot = (b.input || 0) + (b.output || 0) + (b.cache_read || 0) + (b.cache_write || 0); hours[b.t] = hours[b.t] || {}; hours[b.t][k] = (hours[b.t][k] || 0) + tot; keys[k] = 1; });
-    var ks = byModel ? ADM.sortKeys(Object.keys(keys)) : Object.keys(keys).sort();
+    var allKs = byModel ? ADM.sortKeys(Object.keys(keys)) : Object.keys(keys).sort();
+    /* Runs without a recorded model stay out of the model lists by
+       default; the stacked total keeps them as one muted Unattributed
+       segment, so the bars still sum to the legend Total. */
+    var hideU = byModel && !showU && allKs.some(function (k) { return AdUnatt.isUnattributed(k); });
+    var ks = hideU ? AdUnatt.filterKnown(allKs) : allKs;
+    function hourHidden(t) {
+      var n = 0;
+      if (!hideU) return 0;
+      allKs.forEach(function (k) { if (AdUnatt.isUnattributed(k)) n += hours[t][k] || 0; });
+      return n;
+    }
     var ts = Object.keys(hours).map(Number).sort(function (a, b) { return a - b; });
     var tots = {}, max = 0;
-    ts.forEach(function (t) { var sum = 0; ks.forEach(function (k) { sum += hours[t][k] || 0; }); tots[t] = sum; max = Math.max(max, sum); });
-    var keyTot = {}, grand = 0;
-    ts.forEach(function (t) { ks.forEach(function (k) { var v = hours[t][k] || 0; keyTot[k] = (keyTot[k] || 0) + v; grand += v; }); });
+    ts.forEach(function (t) { var sum = 0; allKs.forEach(function (k) { sum += hours[t][k] || 0; }); tots[t] = sum; max = Math.max(max, sum); });
+    var keyTot = {}, grand = 0, hiddenTotal = 0;
+    ts.forEach(function (t) { allKs.forEach(function (k) { var v = hours[t][k] || 0; keyTot[k] = (keyTot[k] || 0) + v; grand += v; if (AdUnatt.isUnattributed(k)) hiddenTotal += v; }); });
     var lg = el("div", {class: "legend tok-legend"});
     var ltotal = el("span", {class: "ltotal", title: "Tokens in the selected range, input + output + cache read + cache write.", "data-legend-total": String(grand), "data-chart-sum": String(grand)}, [el("b", {text: "Total " + fmtN(grand)}), document.createTextNode(" \u00B7 " + fmtN(ts.length ? grand / ts.length : 0) + "/h avg \u00B7 peak " + fmtN(max) + "/h")]);
     lg.appendChild(ltotal);
     if (byModel) {
       var famTot = {};
-      ks.forEach(function (k) { var f = ADM.famOf(k); famTot[f] = (famTot[f] || 0) + (keyTot[k] || 0); });
+      allKs.forEach(function (k) { var f = ADM.famOf(k); famTot[f] = (famTot[f] || 0) + (keyTot[k] || 0); });
       ADM.FAMS.forEach(function (f) {
         if (!famTot[f]) return;
         var sp = el("span", {class: "lentry", "data-key": f, "data-v": String(famTot[f]), title: actLegendTip(ADM.FAM[f].name, famTot[f])});
@@ -616,6 +666,13 @@
         sp.appendChild(el("span", {class: "lv", text: fmtN(famTot[f])}));
         lg.appendChild(sp);
       });
+      if (hideU && hiddenTotal > 0) {
+        var usp = el("span", {class: "lentry unatt", "data-key": "unattributed", "data-v": String(hiddenTotal), title: actLegendTip("Unattributed", hiddenTotal)});
+        var usw = el("i", {class: "sw"}); usw.style.background = "var(--muted)"; usp.appendChild(usw);
+        usp.appendChild(el("span", {class: "lname", text: "Unattributed"}));
+        usp.appendChild(el("span", {class: "lv", text: fmtN(hiddenTotal)}));
+        lg.appendChild(usp);
+      }
     } else {
       ks.forEach(function (k) {
         if (!keyTot[k]) return;
@@ -641,17 +698,31 @@
       var bx1 = X(Math.max(t, from)) + 2, bx2 = X(Math.min(t + 3600, to)) - 2;
       if (bx2 - bx1 > 32) { var midx = (bx1 + bx2) / 2; bx1 = midx - 14; bx2 = midx + 14; }
       var bw = Math.max(2, bx2 - bx1), x = bx1, y0 = T + ph;
+      /* The hidden share rides one muted segment, so the stack still
+         sums to the legend Total while no unknown model is listed. */
+      var dks = ks.slice();
+      if (hideU && hourHidden(t) > 0) dks.push("unattributed");
+      function segVal(k) { return k === "unattributed" ? hourHidden(t) : (hours[t][k] || 0); }
+      function segFill(k) { return k === "unattributed" ? "var(--muted)" : colorOf(k, state.groupBy); }
       var order = [];
-      ks.forEach(function (k, ki) { if (hours[t][k]) order.push(ki); });
+      dks.forEach(function (k, ki) { if (segVal(k)) order.push(ki); });
       var topKi = order.length ? order[order.length - 1] : -1;
-      ks.forEach(function (k, ki) {
-        var v = hours[t][k] || 0; if (!v) return;
+      dks.forEach(function (k, ki) {
+        var v = segVal(k); if (!v) return;
         var h = ph * v / nice, top = y0 - h;
         var gap = ki !== order[0] ? GAP : 0;
         var y = top + gap, hh = h - gap;
         if (hh < 0) { hh = 0; y = y0; }
         var ry = ki === topKi ? Math.min(RAD, bw / 2, Math.max(hh / 2, 1)) : 1.5;
-        svg.appendChild(s("rect", {x: x, y: y, width: bw, height: Math.max(hh, 0.4), rx: ry, fill: colorOf(k, state.groupBy), "data-key": k, "data-v": String(v)}));
+        var attrs = {x: x, y: y, width: bw, height: Math.max(hh, 0.4), rx: ry, fill: segFill(k), "data-key": k, "data-v": String(v)};
+        /* Shown unknown models keep the honest entry with a dashed
+           outline, so they read as recorded-but-unattributed. */
+        if (k !== "unattributed" && showU && AdUnatt.isUnattributed(k)) {
+          attrs.stroke = "var(--muted)";
+          attrs["stroke-width"] = 1;
+          attrs["stroke-dasharray"] = "4 3";
+        }
+        svg.appendChild(s("rect", attrs));
         y0 = top;
       });
       var stackTop = T + ph - ph * tots[t] / nice, cx = x + bw / 2;
@@ -663,7 +734,7 @@
       var hourTot = tots[t];
       var hit = s("rect", {x: x - 1, y: T, width: bw + 2, height: ph, fill: "transparent", "data-t": String(t), "data-v": String(hourTot)});
       hit.addEventListener("mousemove", function (ev) {
-        showTip(ev, fmtDate(t), [{k: "Total", v: fmtN(hourTot), c: "var(--ink)"}].concat(ks.filter(function (k) { return hours[t][k]; }).map(function (k) { return {k: byModel ? fullName(k) : k, v: fmtN(hours[t][k]), c: colorOf(k, state.groupBy)}; })));
+        showTip(ev, fmtDate(t), [{k: "Total", v: fmtN(hourTot), c: "var(--ink)"}].concat(dks.filter(function (k) { return segVal(k); }).map(function (k) { return {k: k === "unattributed" ? "Unattributed" : (byModel ? fullName(k) : k), v: fmtN(segVal(k)), c: segFill(k)}; })));
         var root = svg.parentNode && svg.parentNode.parentNode;
         if (root && root.actCrossMove) root.actCrossMove(t + 1800);
       });
@@ -718,6 +789,13 @@
     var oc = outcomeOf(r), o = OUTCOME[oc];
     var bar = s("rect", {x: x1, y: y, width: Math.max(2, x2 - x1 - 1), height: h, rx: Math.min(2, h / 2), fill: r.clock_source === "mtime" ? "url(#act-hatch)" : o[0], stroke: r.clock_source === "mtime" ? o[0] : "none", class: "tl-bar"});
     if (r.status === "running") { bar.setAttribute("stroke", "var(--ink)"); bar.setAttribute("stroke-width", "1"); }
+    /* Shown runs without a recorded model keep the honest entry with a
+       dashed outline; the running outline always wins when live. */
+    else if (AdUnatt.shown(actScope()) && AdUnatt.isUnattributed(tierKey(r))) {
+      bar.setAttribute("stroke", "var(--muted)");
+      bar.setAttribute("stroke-width", "1");
+      bar.setAttribute("stroke-dasharray", "4 3");
+    }
     bar.setAttribute("data-run-id", r.run_id || r.label || "");
     bar.setAttribute("data-outcome", oc);
     if (clipped) bar.setAttribute("data-clipped", clipped);
@@ -759,7 +837,11 @@
       if (expanded[f]) {
         var byM = {}, y = 0;
         runs.forEach(function (r) { var k = tierKey(r); (byM[k] = byM[k] || []).push(r); });
-        ADM.sortKeys(Object.keys(byM)).forEach(function (k) {
+        /* One row per model: rows without a recorded model stay undrawn
+           by default, while the lane count above still includes them. */
+        var mks = ADM.sortKeys(Object.keys(byM));
+        if (!AdUnatt.shown(actScope())) mks = AdUnatt.filterKnown(mks);
+        mks.forEach(function (k) {
           var mrows = packRows(byM[k], 20), dd = actLaneDims(mrows.length);
           lane.subs.push({name: fullName(k), runs: byM[k], rows: mrows, dims: dd, y: y});
           y += 16 + dd.h + 6;
@@ -1119,7 +1201,12 @@
     var head = el("div", {class: "conc-head"});
     var dot = el("i", {class: "sw"}); dot.style.background = ADM.famColor(fam); head.appendChild(dot);
     head.appendChild(el("span", {class: "conc-fam", text: ADM.FAM[fam].name}));
-    head.appendChild(el("span", {class: "conc-models", text: ks.length ? ks.map(function (k) { return ADM.nameOf(k); }).join(", ") : "no models seen"}));
+    /* The model list omits runs without a recorded model by default; the
+       curve above still includes them, so a fully unattributed strip
+       counts them instead of reading empty. */
+    var dispKs = AdUnatt.shown(actScope()) ? ks : AdUnatt.filterKnown(ks);
+    var hidKs = ks.length - dispKs.length;
+    head.appendChild(el("span", {class: "conc-models", text: dispKs.length ? dispKs.map(function (k) { return ADM.nameOf(k); }).join(", ") + (hidKs ? " · +" + fmtN(hidKs) + " unattributed" : "") : (ks.length ? "+" + fmtN(ks.length) + " unattributed" : "no models seen")}));
     head.appendChild(el("span", {class: "conc-pk", text: "pk " + peak}));
     wrap.appendChild(head);
     var W = g.W, L = g.L, R = g.R, H = withX ? 112 : 72, T = 20, Bm = withX ? 36 : 10, pw = g.pw, ph = H - T - Bm;
@@ -1152,11 +1239,18 @@
       var best = P[0];
       P.forEach(function (p) { if (Math.abs(p.t - tt) < Math.abs(best.t - tt)) best = p; });
       var m = actMods(best), rows = [];
+      var showCU = AdUnatt.shown(actScope());
       actConcFams(all).forEach(function (f) {
         var fks = all.filter(function (k) { return ADM.famOf(k) === f; });
         var tot = fks.reduce(function (a, k) { return a + (m[k] || 0); }, 0);
         rows.push({k: ADM.FAM[f].name, v: fmtN(tot), c: ADM.famColor(f)});
-        fks.forEach(function (k) { if (m[k]) rows.push({k: "\u2003" + ADM.nameOf(k), v: fmtN(m[k]), c: ADM.colorOf(k)}); });
+        var hid = 0;
+        fks.forEach(function (k) {
+          if (!m[k]) return;
+          if (!showCU && AdUnatt.isUnattributed(k)) { hid += m[k]; return; }
+          rows.push({k: "\u2003" + ADM.nameOf(k), v: fmtN(m[k]), c: ADM.colorOf(k)});
+        });
+        if (hid) rows.push({k: "\u2003Unattributed", v: fmtN(hid), c: "var(--muted)"});
       });
       showTip(ev, fmtT(best.t), rows);
       var root = svg.parentNode && svg.parentNode.parentNode;

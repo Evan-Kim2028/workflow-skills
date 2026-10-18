@@ -1387,6 +1387,7 @@ console.log("timeline every-run proof ok: 640 + 505 + 640 bars, brush clips");
             STATIC / "models.js",
             STATIC / "format.js",
             STATIC / "core" / "el.js",
+            STATIC / "core" / "unattributed.js",
             STATIC / "core" / "charts.js",
             STATIC / "cards" / "timeline.js",
             STATIC / "cards" / "activity.js",
