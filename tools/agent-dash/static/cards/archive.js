@@ -53,8 +53,8 @@
 
   function kvRow(k, v, title) {
     var tr = el("tr");
-    tr.appendChild(el("td", {text: k}));
-    var cell = el("td", {class: "n"});
+    tr.appendChild(el("td", {class: "c-key", text: k}));
+    var cell = el("td", {class: "n c-num"});
     cell.appendChild(typeof v === "string" ? document.createTextNode(v) : v);
     if (title) cell.setAttribute("title", title);
     tr.appendChild(cell);
@@ -73,7 +73,7 @@
     var usage = card.usage || {};
     var trains = card.trains || {total: 0, by_status: {}};
     var appr = card.approvals || {pending: 0, approved: 0, denied: 0, total: 0};
-    var table = el("table", {class: "pj-kv", "aria-label": "Archive summary for " + id});
+    var table = el("table", {class: "pj-kv dt dt-kv", "aria-label": "Archive summary for " + id});
     var body = el("tbody");
     body.appendChild(kvRow("Archived", dayStr(card.archived_at)));
     body.appendChild(kvRow("Duration", durStr(card.duration_s), "First run to archive"));
@@ -135,7 +135,7 @@
       wrap.appendChild(shelf);
       var rules = el("div", {class: "card pj-rules"});
       rules.appendChild(el("h3", {text: "How archive works"}));
-      var table = el("table", {class: "pj-kv", "aria-label": "Archive rules"});
+      var table = el("table", {class: "pj-kv dt dt-kv", "aria-label": "Archive rules"});
       var body = el("tbody");
       body.appendChild(kvRow("Hidden from", "switcher, Current and Planned views, default snapshot scope"));
       body.appendChild(kvRow("Kept in", "bundles, run rows, lifetime totals, plan pages (read-only, with a banner)"));

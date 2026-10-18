@@ -1,18 +1,18 @@
 /* Planned view card styles (?view=planned). Start-readiness table,
    gated-but-live rows, and the roadmap/dependency slot mounts. */
-.pj-table{width:100%;border-collapse:collapse;font-size:13px}
-.pj-table th{font:600 11.5px var(--mono);color:var(--muted);text-transform:uppercase;letter-spacing:.05em;text-align:left;padding:6px 10px;border-bottom:1px solid var(--grid)}
-.pj-table td{padding:8px 10px;border-bottom:1px solid var(--grid);vertical-align:baseline}
-.pj-table tr:last-child td{border-bottom:0}
-.pj-table td.n,.pj-table th.n{text-align:right;font-variant-numeric:tabular-nums}
+/* Base look comes from the shared table.dt rules (static/tokens.css);
+   this file keeps only Planned-view specifics (row hover, the phone
+   stacking that hides the second column). */
+.pj-table{font-size:13px}
 .pj-table tbody tr:hover{background:var(--raised)}
 .pj-ready .prog-acts{margin-top:12px;display:flex;gap:8px;flex-wrap:wrap}
 .pj-gated{margin-top:14px}
 .pj-empty-gated{display:none}
-.pj-kv{width:100%;border-collapse:collapse;font-size:13px}
+/* Key/value tables share the table.dt-kv rules (static/tokens.css):
+   narrow muted key, wrapping value. No fixed pixel widths. */
+.pj-kv{font-size:13px}
 .pj-kv td{padding:6px 10px 6px 0;vertical-align:top}
-.pj-kv td:first-child{color:var(--muted);white-space:nowrap;width:110px}
-.pj-kv td.n{font-variant-numeric:tabular-nums}
+.pj-kv td.n,.pj-kv td.c-num{font-variant-numeric:tabular-nums}
 @media (max-width:700px){
 .pj-table th:nth-child(2),.pj-table td:nth-child(2){display:none}
 .pj-planned .prog-acts,.pj-gated .prog-acts,.pj-ready .prog-acts{display:flex;flex-wrap:wrap}

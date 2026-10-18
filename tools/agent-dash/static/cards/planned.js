@@ -126,32 +126,38 @@
     (state.wssAll && state.wssAll.length ? state.wssAll : state.wss || []).forEach(function (w) { states[String(w.ws).toUpperCase()] = ADT.wsStateOf(w); });
     (state.bundles || []).forEach(function (b) { if (b && b.id && !states[String(b.id).toUpperCase()]) states[String(b.id).toUpperCase()] = b.state || "active"; });
     var nowS = Date.now() / 1000;
-    var table = el("table", {class: "pj-table", "aria-label": "Start readiness"});
+    var table = el("table", {class: "pj-table dt", "aria-label": "Start readiness"});
+    table.appendChild(el("colgroup", null, [el("col"), el("col"), el("col"), el("col"),
+      el("col", {class: "cw-tasks"}), el("col"), el("col", {class: "cw-actions"})]));
     var head = el("tr");
-    ["WS", "Depends on", "Gates", "Approvals", "Tasks", "Ready?", "Action"].forEach(function (t, i) {
-      head.appendChild(el("th", {class: i === 4 ? "n" : "", text: t}));
+    /* Header cells carry the same .c-* class as their column's cells. */
+    [["WS", "c-label"], ["Depends on", "c-text"], ["Gates", "c-text"], ["Approvals", "c-text"],
+      ["Tasks", "c-num"], ["Ready?", "c-text"], ["Action", "c-actions"]].forEach(function (pair) {
+      head.appendChild(el("th", {scope: "col", class: pair[1], text: pair[0]}));
     });
     table.appendChild(el("thead", {}, [head]));
     var body = el("tbody");
     rows.forEach(function (w) {
       var r = readinessOf(w, state.plans[w.ws], state.approvals, states, nowS);
       var tr = el("tr");
-      var wsCell = el("td");
-      wsCell.appendChild(el("b", {text: w.ws}));
-      if (w.name) wsCell.appendChild(document.createTextNode(" " + w.name));
+      var wsCell = el("td", {class: "c-label", title: w.ws + (w.name ? " " + w.name : "")});
+      var wsWrap = el("span", {class: "clamp2"});
+      wsWrap.appendChild(el("b", {text: w.ws}));
+      if (w.name) wsWrap.appendChild(document.createTextNode(" " + w.name));
+      wsCell.appendChild(wsWrap);
       tr.appendChild(wsCell);
-      tr.appendChild(el("td", {text: r.depText}));
-      tr.appendChild(el("td", {text: r.gateText, title: r.gateTitle || r.gateText}));
-      tr.appendChild(el("td", {text: r.pending ? r.pending + " pending" : "none"}));
-      tr.appendChild(el("td", {class: "n", text: r.done + "/" + r.total}));
-      var readyCell = el("td");
+      tr.appendChild(el("td", {class: "c-text", text: r.depText, title: r.depText}));
+      tr.appendChild(el("td", {class: "c-text", text: r.gateText, title: r.gateTitle || r.gateText}));
+      tr.appendChild(el("td", {class: "c-text", text: r.pending ? r.pending + " pending" : "none"}));
+      tr.appendChild(el("td", {class: "c-num", text: r.done + "/" + r.total}));
+      var readyCell = el("td", {class: "c-text"});
       readyCell.appendChild(el("span", {class: "pj-pill " + (r.ready ? "ok" : "wait"), text: r.ready ? "\u2713 Ready" : "\u25CB Not yet", title: r.reason}));
       readyCell.appendChild(document.createTextNode(" " + r.reason));
       tr.appendChild(readyCell);
       /* Start lives beside readiness: the same primary the management
          table offers for planned rows. Guarded: no cell content when
          the manage module is absent. */
-      var actCell = el("td");
+      var actCell = el("td", {class: "c-actions"});
       if (typeof primaryFor === "function" && typeof runDescriptor === "function") {
         (function (cell, rowW) {
           var full = null;
@@ -180,7 +186,9 @@
       body.appendChild(tr);
     });
     table.appendChild(body);
-    c.appendChild(table);
+    /* Wide readiness rows scroll inside their own container on phones
+       (the shared .twrap well); desktops fit the card and never scroll. */
+    c.appendChild(el("div", {class: "twrap"}, [table]));
     var acts = el("div", {class: "prog-acts"});
     rows.forEach(function (w) {
       var bp = el("button", {type: "button", text: "Plan " + w.ws, title: "Open the " + w.ws + " plan page"});

@@ -408,6 +408,206 @@ body { padding-left: 188px; }
 
 .sidenav-foot { display: none; }
 
+/* ===== Shared data-table base (.dt): every table on the page shares one
+   compact column style (owner ask). Text columns left-aligned, number
+   columns right-aligned with tabular numerals, status/pill columns tight;
+   columns size to their content (table-layout:auto plus explicit <col>
+   widths where content is predictable); long text wraps within its column
+   (overflow-wrap:anywhere, 2-line clamp) instead of stretching the table.
+   Header cells carry the same .c-* class as their column's cells so th
+   aligns with td. Zebra off. Tables never exceed their card: wide tables
+   live in their own horizontal scroll container (.twrap, .mg-scroll). */
+table.dt {
+  width: 100%;
+  max-width: 100%;
+  border-collapse: collapse;
+  table-layout: auto;
+  font-size: 13px;
+}
+table.dt > thead > tr > th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: var(--card, var(--surface));
+  box-shadow: 0 1px 0 var(--grid);
+  font-size: 11px;
+  color: var(--muted);
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  text-align: left;
+  vertical-align: bottom;
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--grid);
+  white-space: nowrap;
+}
+table.dt > tbody > tr > td {
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--grid);
+  vertical-align: middle;
+  min-width: 0;
+}
+table.dt > tbody > tr:last-child > td {
+  border-bottom: 0;
+}
+/* Column modifiers: same class on th and td. */
+table.dt th.c-text, table.dt td.c-text {
+  text-align: left;
+  overflow-wrap: anywhere;
+  min-width: 12ch;
+  max-width: 38ch;
+}
+/* The label column sizes to its content and wraps long text instead of
+   widening (no width:100%: that hogged the leftover space and starved
+   the other columns). The 36ch cap keeps it near the old truncation
+   width; longer names wrap to two lines with the full text in the
+   title tooltip. */
+table.dt th.c-label, table.dt td.c-label {
+  text-align: left;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+table.dt td.c-label {
+  max-width: 36ch;
+}
+table.dt th.c-num, table.dt td.c-num,
+table.dt td.n, table.dt th.n {
+  text-align: right;
+  font-variant-numeric: var(--tnum, tabular-nums);
+  font-family: var(--mono);
+  font-size: 12px;
+  white-space: nowrap;
+  width: 1%;
+}
+table.dt th.c-status, table.dt td.c-status {
+  text-align: left;
+  white-space: nowrap;
+  width: 1%;
+}
+table.dt th.c-time, table.dt td.c-time {
+  text-align: right;
+  font-variant-numeric: var(--tnum, tabular-nums);
+  white-space: nowrap;
+  width: 1%;
+}
+table.dt th.c-actions, table.dt td.c-actions {
+  text-align: right;
+  white-space: nowrap;
+  width: 1%;
+}
+table.dt th.c-check, table.dt td.c-check {
+  width: 1%;
+  white-space: nowrap;
+}
+/* Key/value variant (archive cards, rules): narrow key, wrapping value.
+   Fixed layout: automatic layout ignores td max-width when sharing out
+   the table width, so the key column absorbed half the card. */
+table.dt-kv {
+  table-layout: fixed;
+}
+table.dt-kv > tbody > tr > td.c-key {
+  color: var(--muted);
+  white-space: nowrap;
+  width: 16ch;
+  padding-right: 12px;
+  vertical-align: top;
+}
+table.dt-kv > tbody > tr > td:not(.c-key) {
+  /* Key/value values take the leftover width and wrap left (the shared
+     .c-num nowrap/width never apply here: once they scrolled the Archive
+     phone view 659px wide, once they crushed this column to one word). */
+  width: auto;
+  white-space: normal;
+  text-align: left;
+  overflow-wrap: anywhere;
+  min-width: 0;
+}
+/* Predictable content widths for <col>: elapsed 7ch, output 8ch,
+   tokens 9ch, status 13ch, actions 11ch, tasks 8ch, state 10ch, live 9ch. */
+table.dt > colgroup > col.cw-check { width: 3ch; }
+table.dt > colgroup > col.cw-elapsed { width: 7ch; }
+table.dt > colgroup > col.cw-output { width: 8ch; }
+table.dt > colgroup > col.cw-tokens { width: 9ch; }
+table.dt > colgroup > col.cw-status { width: 13ch; }
+table.dt > colgroup > col.cw-actions { width: 11ch; }
+table.dt > colgroup > col.cw-tasks { width: 8ch; }
+table.dt > colgroup > col.cw-state { width: 10ch; }
+table.dt > colgroup > col.cw-live { width: 9ch; }
+/* Long labels wrap to two lines, never stretch the column. Run rows keep
+   the exact label in the hover tooltip, so nothing exact is lost. */
+table.dt .lbl {
+  font-family: var(--mono);
+  font-size: 12px;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+  overflow: hidden;
+  max-height: 2.6em;
+  overflow-wrap: anywhere;
+  vertical-align: bottom;
+}
+table.dt .sec {
+  overflow-wrap: anywhere;
+}
+/* Generic two-line clamp for long table text (workstream names, section
+   names, depends-on lists): wraps instead of widening, full text in the
+   cell's title tooltip. */
+table.dt .clamp2 {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+  overflow: hidden;
+  max-height: 2.6em;
+  overflow-wrap: anywhere;
+}
+@media (max-width: 700px) {
+  table.dt > thead > tr > th,
+  table.dt > tbody > tr > td {
+    padding: 5px 6px;
+  }
+  /* Phones: text columns accept narrower minimums so a 6-column table
+     (e.g. Start readiness) fits 330px without sideways page scroll. */
+  table.dt th.c-text, table.dt td.c-text {
+    min-width: 8ch;
+    max-width: 24ch;
+  }
+  table.dt td.c-label {
+    max-width: 24ch;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  table.dt > thead > tr > th { position: static; }
+}
+
+/* ===== Non-table row names wrap like table labels (owner ask): the
+   Where-we-are id line and the overview workstream-card name clamp to two
+   lines with the full text in the title tooltip, instead of truncating
+   after one line. div-qualified to win over the one-line ellipsis rules. */
+div.prog-idline {
+  white-space: normal;
+  overflow: hidden;
+  text-overflow: clip;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+  max-height: 2.6em;
+  overflow-wrap: anywhere;
+}
+div.wsc-name {
+  white-space: normal;
+  overflow: hidden;
+  text-overflow: clip;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+  max-height: 2.7em;
+  overflow-wrap: anywhere;
+}
+
 .sidenav a.is-group { padding-left: 22px; font: 650 13px/1.35 var(--font); color: var(--ink-2); margin-top: 2px; }
 .sidenav a.is-group.is-active-group { color: var(--ink); }
 .sidenav a.is-group.is-active-group::before { background: var(--s1); }

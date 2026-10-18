@@ -673,7 +673,7 @@
   function rowEl(w) {
     var label = displayName(w.ws, w.name);
     var tr = el("tr", {"data-ws": w.ws});
-    var sel = el("td", {class: "mg-c-check"});
+    var sel = el("td", {class: "mg-c-check c-check"});
     var box = el("input", {type: "checkbox", "aria-label": "Select " + label});
     box.checked = !!mg.checked[String(w.ws).toUpperCase()];
     box.addEventListener("change", function () {
@@ -684,7 +684,7 @@
     });
     sel.appendChild(box);
     tr.appendChild(sel);
-    var name = el("td", {class: "mg-c-name"});
+    var name = el("td", {class: "mg-c-name c-label"});
     var open = el("button", {type: "button", class: "mg-name", text: w.ws});
     open.setAttribute("aria-label", "Open the " + label + " execution tab");
     open.title = w.name || w.ws;
@@ -693,7 +693,7 @@
       else if (typeof go === "function") go(w.ws);
     });
     name.appendChild(open);
-    if (w.name) name.appendChild(el("span", {class: "mg-title", text: w.name}));
+    if (w.name) name.appendChild(el("span", {class: "mg-title", text: w.name, title: w.name}));
     /* Lifetime planning-vs-execution bar under the name; the tooltip
        names every kind of work with exact values. Absent on rows with
        no split (older payloads, zero spend). */
@@ -704,22 +704,22 @@
       } catch (e) {}
     }
     tr.appendChild(name);
-    var st = el("td", {class: "mg-c-state"});
+    var st = el("td", {class: "mg-c-state c-status"});
     st.appendChild(statePill(ADT.wsStateOf(w)));
     tr.appendChild(st);
-    var pr = el("td", {class: "mg-c-prog"});
+    var pr = el("td", {class: "mg-c-prog c-text"});
     pr.appendChild(progressCell(w));
     tr.appendChild(pr);
-    var live = el("td", {class: "mg-c-live"});
+    var live = el("td", {class: "mg-c-live c-num"});
     live.appendChild(el("span", {class: w.live_agents ? "ws-live" : "mg-none", text: w.live_agents ? "\u25CF " + w.live_agents + " live" : "\u2014"}));
     tr.appendChild(live);
-    var act = el("td", {class: "mg-c-act"});
+    var act = el("td", {class: "mg-c-act c-time"});
     act.appendChild(el("span", {text: lastActive(w.last_activity), title: w.last_activity ? "Last activity" : "No recorded activity"}));
     tr.appendChild(act);
-    var dep = el("td", {class: "mg-c-dep"});
+    var dep = el("td", {class: "mg-c-dep c-text"});
     dep.appendChild(dependsCell(w));
     tr.appendChild(dep);
-    var ctl = el("td", {class: "mg-c-ctl"});
+    var ctl = el("td", {class: "mg-c-ctl c-actions"});
     ctl.appendChild(rowCluster(w));
     tr.appendChild(ctl);
     return tr;
@@ -782,10 +782,13 @@
       bulk.hidden = true;
       wrap.appendChild(bulk);
       var scroll = el("div", {class: "mg-scroll"});
-      var table = el("table", {class: "mg-table", "aria-label": "Workstream lifecycle controls"});
+      var table = el("table", {class: "mg-table dt", "aria-label": "Workstream lifecycle controls"});
+      table.appendChild(el("colgroup", null, [el("col", {class: "cw-check"}), el("col"),
+        el("col", {class: "cw-state"}), el("col"), el("col", {class: "cw-live"}),
+        el("col"), el("col"), el("col", {class: "cw-actions"})]));
       var head = el("thead");
       var hr = el("tr");
-      var checkTh = el("th", {class: "mg-c-check"});
+      var checkTh = el("th", {class: "mg-c-check c-check", scope: "col"});
       var checkAll = el("input", {type: "checkbox", "data-mg-checkall": "1", "aria-label": "Select every listed workstream"});
       checkAll.addEventListener("change", function () {
         var rows2 = tableRows();
@@ -796,8 +799,10 @@
       });
       checkTh.appendChild(checkAll);
       hr.appendChild(checkTh);
-      ["Workstream", "State", "Progress", "Live", "Last activity", "Waits on", "Actions"].forEach(function (t) {
-        hr.appendChild(el("th", {text: t}));
+      /* Header cells carry the same .c-* class as their column's cells. */
+      [["Workstream", "c-label"], ["State", "c-status"], ["Progress", "c-text"], ["Live", "c-num"],
+        ["Last activity", "c-time"], ["Waits on", "c-text"], ["Actions", "c-actions"]].forEach(function (pair) {
+        hr.appendChild(el("th", {scope: "col", class: pair[1], text: pair[0]}));
       });
       head.appendChild(hr);
       table.appendChild(head);

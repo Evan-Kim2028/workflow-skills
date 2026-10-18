@@ -129,7 +129,7 @@
       var tok = use ? use.tokens : w.tokens, cost = use ? use.cost_usd : w.cost_usd;
       var row = el("div", {class: "prog-row s-" + st[0]});
       var name = el("div", {class: "prog-name"});
-      var idline = el("div", {class: "prog-idline"});
+      var idline = el("div", {class: "prog-idline", title: w.ws + (w.name ? " " + w.name : "")});
       idline.appendChild(el("b", {text: w.ws}));
       idline.appendChild(el("span", {text: w.name || ""}));
       name.appendChild(idline);
@@ -251,7 +251,7 @@
     }
     var card = el("div", attrs);
     var top = el("div", {class: "top"}, [el("span", {class: "id", text: id}), el("span", {class: "st " + (live ? "running" : "done")}, [el("i"), live ? live + " running" : "idle"])]);
-    card.appendChild(top); card.appendChild(el("div", {class: "wsc-name", text: name || ""}));
+    card.appendChild(top); card.appendChild(el("div", {class: "wsc-name", text: name || "", title: name || ""}));
     var bar = el("div", {class: "bar", role: "img", "aria-label": fmtN(done) + " of " + fmtN(tot) + " plan tasks done"});
     if (tot) {
       progSegs(bar, pc, tot);

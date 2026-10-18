@@ -62,13 +62,16 @@
 .mg-bulk[hidden]{display:none}
 .mg-sel{font:650 12.5px var(--font);color:var(--ink-2)}
 .mg-scroll{overflow-x:auto;margin:6px -4px 0;padding:0 4px}
-.mg-table{width:100%;border-collapse:collapse;font-size:12.5px;min-width:860px}
-.mg-table th{font:700 11px var(--mono);text-transform:uppercase;letter-spacing:.05em;color:var(--muted);text-align:left;padding:8px 10px;border-bottom:1px solid var(--grid);white-space:nowrap}
-.mg-table td{padding:8px 10px;border-bottom:1px solid var(--grid);vertical-align:middle}
+/* Base look comes from the shared table.dt rules (static/tokens.css):
+   this file keeps only management-table specifics (the horizontal scroll
+   floor, row hover, name/progress/depends cells). */
+.mg-table{font-size:12.5px;min-width:860px}
 .mg-table tbody tr:hover td{background:var(--surface-2)}
 .mg-name{font:700 12.5px var(--mono);background:none;border:0;padding:0;color:var(--ink);cursor:pointer;text-align:left}
 .mg-name:hover{color:var(--s1);text-decoration:underline}
-.mg-title{display:block;color:var(--ink-2);font-size:12px;max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+/* Long workstream names wrap to two lines in the label column (the full
+   name stays in the title tooltip); the column takes the leftover width. */
+.mg-title{display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:2;line-clamp:2;overflow:hidden;max-height:2.6em;color:var(--ink-2);font-size:12px;overflow-wrap:anywhere}
 .mg-prog{display:inline-flex;align-items:center;gap:8px}
 .mg-prog .prog-bar{width:110px}
 .mg-pct{font:600 12px var(--mono);color:var(--ink-2)}

@@ -11,43 +11,9 @@
   margin: 0 -4px;
   padding: 0 4px;
 }
-table {
-  border-collapse: collapse;
-  width: 100%;
-  font-size: 13px;
-}
-thead th {
-  position: sticky;
-  top: 0;
-  z-index: 1;
-  background: var(--card, var(--surface));
-  box-shadow: 0 1px 0 var(--grid);
-  font-size: 11px;
-  color: var(--muted);
-  font-weight: 700;
-  text-transform: uppercase;
-  letter-spacing: 0.05em;
-  text-align: left;
-  padding: 8px 10px;
-  border-bottom: 1px solid var(--grid);
-  white-space: nowrap;
-}
-tbody td {
-  padding: 8px 10px;
-  border-bottom: 1px solid var(--grid);
-  vertical-align: middle;
-}
-tbody tr:last-child td {
-  border-bottom: 0;
-}
-td.n,
-th.n {
-  text-align: right;
-  font-variant-numeric: var(--tnum, tabular-nums);
-  font-family: var(--mono);
-  font-size: 12px;
-  white-space: nowrap;
-}
+/* Base table look lives in the shared .dt rules (static/tokens.css);
+   this file keeps only run-table specifics: row hover plus keyboard
+   focus, model/status/verdict cells, and the grouped header rows. */
 tr.clk {
   cursor: pointer;
 }
@@ -158,14 +124,13 @@ tr.clk:focus-visible {
   font-size: 11px;
   margin-left: 4px;
 }
+/* .lbl wraps to two lines through the shared table.dt .lbl rule
+   (static/tokens.css): the label column takes the leftover width and the
+   exact label stays in the row hover tooltip. */
 .lbl {
   font-family: var(--mono);
   font-size: 12px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  max-width: 340px;
-  display: inline-block;
+  overflow-wrap: anywhere;
   vertical-align: bottom;
 }
 .ws {
@@ -209,7 +174,7 @@ tr.ws-h td {
 td .sec {
   font: 600 11.5px var(--mono);
   color: var(--ink-2);
-  white-space: nowrap;
+  overflow-wrap: anywhere;
 }
 .grp-toggle {
   display: flex;
@@ -249,8 +214,11 @@ td .sec {
   .hidephone {
     display: none !important;
   }
-  .lbl {
-    max-width: 150px;
+  /* Phones: the model cell wraps instead of forcing a wide Model column;
+     tables keep scrolling inside their own container as today. */
+  table.dt .tier {
+    flex-wrap: wrap;
+    row-gap: 2px;
   }
 }
 @media (prefers-reduced-motion: reduce) {

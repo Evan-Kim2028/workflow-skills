@@ -3659,5 +3659,100 @@ console.log("activity tick spans ok");
             self.assertIn(kept, design, f"DESIGN.md no longer states the sections term ({kept})")
 
 
+TABLE_FILES = [
+    STATIC / "cards" / "tables.js",
+    STATIC / "core" / "manage.js",
+    STATIC / "cards" / "planned.js",
+    STATIC / "cards" / "archive.js",
+]
+TABLE_CSS = [
+    STATIC / "tokens.css",
+    STATIC / "cards" / "tables.css",
+    STATIC / "cards" / "manage.css",
+    STATIC / "cards" / "planned.css",
+]
+COLUMN_MODIFIERS = ("c-text", "c-label", "c-num", "c-status", "c-time", "c-actions", "c-check", "c-key")
+
+
+class TableColumnTests(unittest.TestCase):
+    def test_tables_share_one_compact_style(self):
+        """Every data table uses the shared .dt base class, and tokens.css
+        defines the base plus every column modifier once."""
+        tokens = (STATIC / "tokens.css").read_text()
+        self.assertIn("table.dt {", tokens, "the shared .dt base is gone from tokens.css")
+        for mod in COLUMN_MODIFIERS:
+            self.assertIn("." + mod, tokens, f"tokens.css never defines .{mod}")
+        for path in TABLE_FILES:
+            src = path.read_text()
+            creations = re.findall(r'el\("table",\s*\{([^}]*)\}', src)
+            self.assertGreater(creations, [], f"{path.name} builds no tables")
+            for attrs in creations:
+                m = re.search(r'class:\s*"([^"]*)"', attrs)
+                self.assertIsNotNone(m, f"{path.name} builds a table with no class: {attrs[:80]}")
+                self.assertIn("dt", m.group(1).split(),
+                              f"{path.name} builds a table outside the shared .dt style: {attrs[:80]}")
+
+    def test_number_cells_use_c_num(self):
+        """Number cells carry .c-num (tokCell's legacy td.n class is styled
+        through the shared .dt td.n alias, never a bare number style)."""
+        for path in TABLE_FILES:
+            for lineno, line in enumerate(path.read_text().splitlines(), 1):
+                for attrs in re.findall(r'el\("td",\s*\{([^}]*)\}', line):
+                    m = re.search(r'class:\s*"([^"]*)"', attrs)
+                    if m and re.search(r"(?:^|\s)n(?:\s|$)", m.group(1)):
+                        self.assertIn("c-num", m.group(1).split(),
+                                      f"{path.name}:{lineno} numbers a cell without .c-num")
+        tokens = (STATIC / "tokens.css").read_text()
+        self.assertIn("table.dt td.n", tokens, "the tokCell td.n alias is gone from the shared style")
+
+    def test_label_columns_have_no_fixed_pixel_widths(self):
+        """No per-table fixed pixel width on label/text columns: labels wrap
+        (2-line clamp) instead of truncating at a pixel width."""
+        labelish = re.compile(r"lbl|mg-title|c-label|c-text|dt-kv|c-key")
+        for path in TABLE_CSS:
+            for chunk in path.read_text().split("}"):
+                if "{" not in chunk:
+                    continue
+                selector, _, body = chunk.rpartition("{")
+                if not labelish.search(selector):
+                    continue
+                hits = re.findall(r"(?:max-|min-)?width:\s*\d+px", body)
+                self.assertEqual(hits, [],
+                                 f"{path.name} pins a label column to pixels: {selector.strip()[:80]}")
+
+    def test_header_and_cell_alignment_classes_match(self):
+        """Every th and td in the table builders carries a .c-* column
+        class, so headers align with their column's content; the run-table
+        header map names every header the tables render."""
+        for path in TABLE_FILES:
+            src = path.read_text()
+            bare_td = [m for m in re.finditer(r'el\("td",\s*(null|\{text)', src)]
+            self.assertEqual([m.group(0) for m in bare_td], [],
+                             f"{path.name} renders class-less td cells")
+            for m in re.finditer(r'el\("th",\s*\{([^}]*)\}', src):
+                attrs = m.group(1)
+                cm = re.search(r'class:\s*"([^"]*)"', attrs)
+                if cm is None:
+                    # The header row takes its class from a map (tables.js
+                    # HEAD_CLASS) or an inline [name, class] pair list
+                    # (manage.js, planned.js); the pair lists are checked
+                    # for .c-* classes below.
+                    self.assertTrue("HEAD_CLASS" in attrs or "pair[1]" in attrs,
+                                    f"{path.name} renders a class-less th: {attrs[:80]}")
+                    continue
+                self.assertTrue(any(c in COLUMN_MODIFIERS or c == "hidephone" or c.startswith("mg-c-")
+                                    for c in cm.group(1).split()),
+                                f"{path.name} th misses its column class: {attrs[:80]}")
+        tables = (STATIC / "cards" / "tables.js").read_text()
+        for header in ("Label", "Model", "WS", "Section", "Elapsed", "Output", "Tokens", "Status"):
+            self.assertIn(f"{header}:", tables.split("var HEAD_CLASS")[1].split("};")[0],
+                          f"HEAD_CLASS never maps the {header} header to its column class")
+        # The inline [name, class] pair lists name a .c-* class per header.
+        for path in TABLE_FILES:
+            for m in re.finditer(r'\[\s*"([A-Za-z? ]+)",\s*"(c-[a-z]+)"\s*\]', path.read_text()):
+                self.assertIn(m.group(2), COLUMN_MODIFIERS,
+                              f"{path.name} pairs a header with a non-column class: {m.group(0)[:80]}")
+
+
 if __name__ == "__main__":
     unittest.main()

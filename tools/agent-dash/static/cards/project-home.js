@@ -271,7 +271,7 @@
       var tc = taskCounts(w);
       var row = el("div", {class: "prog-row s-done"});
       var name = el("div", {class: "prog-name"});
-      var idline = el("div", {class: "prog-idline"});
+      var idline = el("div", {class: "prog-idline", title: w.ws + (w.name ? " " + w.name : "")});
       idline.appendChild(el("b", {text: w.ws}));
       idline.appendChild(el("span", {text: w.name || ""}));
       name.appendChild(idline);

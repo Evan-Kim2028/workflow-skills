@@ -308,14 +308,14 @@
       onkeydown: function (ev) { if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); openRun(r); } },
       onmousemove: function (ev) { showTip(ev, r.label || r.run_id, tipRows(r)); },
       onmouseleave: function () { hideTip(); }});
-    tr.appendChild(el("td", null, [el("span", {class: "lbl", text: r.label || r.run_id})]));
+    tr.appendChild(el("td", {class: "c-label"}, [el("span", {class: "lbl", text: r.label || r.run_id})]));
     var tier = el("span", {class: "tier", title: r.model || ""}); var sw = el("i", {class: "sw"}); sw.style.background = colorOf(k); tier.appendChild(sw); tier.appendChild(el("span", {class: "mfam-n", text: ADM.FAM[ADM.famOf(k)].name})); tier.appendChild(el("span", {class: "mmod-n", text: modelName(k)}));
-    tr.appendChild(el("td", null, [tier]));
-    if (showWs) tr.appendChild(el("td", null, [el("span", {class: "ws", text: r.workstream || "–"})]));
-    tr.appendChild(el("td", {class: "n hidephone", text: fmtDur(r.elapsed_s)}));
-    var ob = el("td", {class: "n hidephone", text: fmtBytes(r.out_bytes)}); if (r.out_growing) ob.appendChild(el("span", {class: "grow", text: "▲"})); tr.appendChild(ob);
+    tr.appendChild(el("td", {class: "c-text"}, [tier]));
+    if (showWs) tr.appendChild(el("td", {class: "c-text"}, [el("span", {class: "ws", text: r.workstream || "–"})]));
+    tr.appendChild(el("td", {class: "c-num hidephone", text: fmtDur(r.elapsed_s)}));
+    var ob = el("td", {class: "c-num hidephone", text: fmtBytes(r.out_bytes)}); if (r.out_growing) ob.appendChild(el("span", {class: "grow", text: "▲"})); tr.appendChild(ob);
     tr.appendChild(tokCell(r));
-    tr.appendChild(el("td", null, [statusEl(r), r.verdict ? verdictEl(r.verdict) : null]));
+    tr.appendChild(el("td", {class: "c-status"}, [statusEl(r), r.verdict ? verdictEl(r.verdict) : null]));
     return tr;
   }
   /* A finished row keeps the historic Model-first columns plus the new
@@ -324,7 +324,7 @@
   function sectionCell(r, scope) {
     var sec = (r && typeof r.section === "string" && r.section) ? r.section : "Unsectioned";
     var text = (scope === "all") ? ((r.workstream || "–") + " / " + sec) : sec;
-    return el("td", null, [el("span", {class: "sec", text: text})]);
+    return el("td", {class: "c-text", title: text}, [el("span", {class: "sec", text: text})]);
   }
   function finishedRowEl(r, scope) {
     var k = tierKey(r);
@@ -334,14 +334,14 @@
       onmousemove: function (ev) { showTip(ev, r.label || r.run_id, tipRows(r)); },
       onmouseleave: function () { hideTip(); }});
     var tier = el("span", {class: "tier", title: r.model || ""}); var sw = el("i", {class: "sw"}); sw.style.background = colorOf(k); tier.appendChild(sw); tier.appendChild(el("span", {class: "mfam-n", text: ADM.FAM[ADM.famOf(k)].name})); tier.appendChild(el("span", {class: "mmod-n", text: modelName(k)}));
-    tr.appendChild(el("td", null, [tier]));
-    tr.appendChild(el("td", null, [el("span", {class: "lbl", text: r.label || r.run_id})]));
-    tr.appendChild(el("td", null, [el("span", {class: "ws", text: r.workstream || "–"})]));
+    tr.appendChild(el("td", {class: "c-text"}, [tier]));
+    tr.appendChild(el("td", {class: "c-label"}, [el("span", {class: "lbl", text: r.label || r.run_id})]));
+    tr.appendChild(el("td", {class: "c-text"}, [el("span", {class: "ws", text: r.workstream || "–"})]));
     tr.appendChild(sectionCell(r, scope));
-    tr.appendChild(el("td", {class: "n hidephone", text: fmtDur(r.elapsed_s)}));
-    var ob = el("td", {class: "n hidephone", text: fmtBytes(r.out_bytes)}); if (r.out_growing) ob.appendChild(el("span", {class: "grow", text: "▲"})); tr.appendChild(ob);
+    tr.appendChild(el("td", {class: "c-num hidephone", text: fmtDur(r.elapsed_s)}));
+    var ob = el("td", {class: "c-num hidephone", text: fmtBytes(r.out_bytes)}); if (r.out_growing) ob.appendChild(el("span", {class: "grow", text: "▲"})); tr.appendChild(ob);
     tr.appendChild(tokCell(r));
-    tr.appendChild(el("td", null, [statusEl(r), r.verdict ? verdictEl(r.verdict) : null]));
+    tr.appendChild(el("td", {class: "c-status"}, [statusEl(r), r.verdict ? verdictEl(r.verdict) : null]));
     return tr;
   }
   /* The small Group by toggle above a table: two real buttons with
@@ -395,14 +395,30 @@
     else buildFinished(c, title, sub, runs || [], empty, pager, scope);
     return c;
   }
+  /* Header cells carry the same .c-* class as their column's cells, so
+     th aligns with td under the shared .dt rules. */
+  var HEAD_CLASS = {Label: "c-label", Model: "c-text", WS: "c-text", Section: "c-text",
+    Elapsed: "c-num hidephone", Output: "c-num hidephone", Tokens: "c-num hidephone", Status: "c-status"};
+  function headRow(cols) {
+    return el("thead", null, [el("tr", null, cols.map(function (h) {
+      return el("th", {scope: "col", class: HEAD_CLASS[h] || "c-text"}, [h]);
+    }))]);
+  }
+  /* Predictable content widths ride a <colgroup> (elapsed 7ch, output 8ch,
+     tokens 9ch, status 13ch); the label column sizes to its content and
+     wraps instead of widening. */
+  function runCols(showWs) {
+    var cols = [el("col"), el("col")];
+    if (showWs) cols.push(el("col"));
+    cols.push(el("col", {class: "cw-elapsed"}), el("col", {class: "cw-output"}),
+      el("col", {class: "cw-tokens"}), el("col", {class: "cw-status"}));
+    return el("colgroup", null, cols);
+  }
   function runningHead(showWs) {
     var cols = ["Label", "Model"];
     if (showWs) cols.push("WS");
     cols.push("Elapsed", "Output", "Tokens", "Status");
-    return el("thead", null, [el("tr", null, cols.map(function (h, i) {
-      var right = h === "Elapsed" || h === "Output" || h === "Tokens";
-      return el("th", {scope: "col", class: right ? "hidephone" : "", style: right ? "text-align:right" : ""}, [h]);
-    }))]);
+    return headRow(cols);
   }
   /* Running now, grouped workstream -> section -> label. The card rebuilds
      itself in place on every toggle (disclosure, group-by, chevron), and
@@ -425,7 +441,7 @@
       var flat = mode === "none";
       var showWs = flat && scope === "all";
       var span = showWs ? 7 : 6;
-      var t = el("table", {"aria-label": title}, [runningHead(showWs)]);
+      var t = el("table", {class: "dt", "aria-label": title}, [runCols(showWs), runningHead(showWs)]);
       var tb = el("tbody", {id: "exec-running-rows"});
       vis.forEach(function (g) {
         var gCount = g.sections.reduce(function (a, s) { return a + s.count; }, 0);
@@ -475,10 +491,10 @@
       c.appendChild(groupToggle("finished", scope, mode, build));
       var groups = groupRuns(newestFirst(rows), planSectionsFor(scope), mode);
       var flat = mode === "none";
-      var t = el("table", {"aria-label": title}, [el("thead", null, [el("tr", null, ["Model", "Label", "WS", "Section", "Elapsed", "Output", "Tokens", "Status"].map(function (h) {
-        var right = h === "Elapsed" || h === "Output" || h === "Tokens";
-        return el("th", {scope: "col", class: right ? "hidephone" : "", style: right ? "text-align:right" : ""}, [h]);
-      }))])]);
+      var t = el("table", {class: "dt", "aria-label": title}, [el("colgroup", null,
+        [el("col"), el("col"), el("col"), el("col"), el("col", {class: "cw-elapsed"}),
+          el("col", {class: "cw-output"}), el("col", {class: "cw-tokens"}), el("col", {class: "cw-status"})]),
+        headRow(["Model", "Label", "WS", "Section", "Elapsed", "Output", "Tokens", "Status"])]);
       var tb = el("tbody");
       groups.forEach(function (g) {
         if (scope === "all" && groups.length > 1) {
