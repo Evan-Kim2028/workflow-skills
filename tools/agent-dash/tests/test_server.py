@@ -1432,5 +1432,195 @@ class DoctorApiTest(unittest.TestCase):
             self.assertIn("command", item)
 
 
+class WorkstreamStatesApiTest(unittest.TestCase):
+    """Lifecycle states on the API: scoped workstream rows plus /api/archive.
+
+    Synthetic bundles cover every state (WS41 planned, WS42 active, WS43
+    paused, WS44 done, WS45+WS47 archived, WS46 dropped), each with one
+    priced run in the store.
+    """
+
+    MODEL = "claude-sonnet-5-5"
+    BUNDLES = {
+        "WS41": {"state": "planned", "depends_on": ["WS42"], "milestone": "Part 2"},
+        "WS42": {"state": "active"},
+        "WS43": {"state": "paused"},
+        "WS44": {"state": "done"},
+        "WS45": {"state": "archived", "archived_at": "old"},
+        "WS46": {"state": "dropped", "archived_at": "old"},
+        "WS47": {"state": "archived", "archived_at": "new"},
+    }
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.now = time.time()
+        self.wsroot = os.path.join(self.tmp.name, "ws")
+        os.makedirs(self.wsroot)
+        for ws, fields in self.BUNDLES.items():
+            bundle = {"id": ws, "title": "Probe %s" % ws, "short": ws,
+                      "order": int(ws[2:]), "kind": "workstream"}
+            if fields["state"] != "active":
+                bundle["state"] = fields["state"]
+            bundle["state_changed_at"] = int(self.now) - 50
+            if "archived_at" in fields:
+                bundle["archived_at"] = int(self.now) - (1000 if fields["archived_at"] == "old" else 100)
+            if "depends_on" in fields:
+                bundle["depends_on"] = fields["depends_on"]
+            if "milestone" in fields:
+                bundle["milestone"] = fields["milestone"]
+            dest = os.path.join(self.wsroot, ws)
+            os.makedirs(dest)
+            with open(os.path.join(dest, "bundle.json"), "w") as fh:
+                json.dump(bundle, fh)
+        for ws in ("WS45", "WS47"):
+            summary = {"tasks_done": 5, "tasks_total": 5, "runs": 9,
+                       "tokens": 1500, "cost_usd": 0.01, "trains_merged": 1}
+            if ws == "WS45":
+                summary["report"] = "reports/2026-10-18-closing.md"
+            with open(os.path.join(self.wsroot, ws, "summary.json"), "w") as fh:
+                json.dump(summary, fh)
+        reports = os.path.join(self.wsroot, "WS47", "reports")
+        os.makedirs(reports)
+        with open(os.path.join(reports, "2026-10-17-closing.md"), "w") as fh:
+            fh.write("# closing notes for probe WS47\n")
+        self._env = mock.patch.dict(os.environ, {"AGENT_DASH_WORKSTREAMS": self.wsroot})
+        self._env.start()
+        self.addCleanup(self._env.stop)
+        self._live = mock.patch("dash.server._live_workers", return_value=[])
+        self._live.start()
+        self.addCleanup(self._live.stop)
+        self.store = Store(Path(self.tmp.name) / "dash.sqlite")
+        for ws in sorted(self.BUNDLES):
+            num = ws[2:]
+            self.store.upsert_run(
+                {
+                    "run_id": "muse:s%d:ws%s-probe" % (int(num), num),
+                    "source": "muse",
+                    "tier": "muse",
+                    "model": self.MODEL,
+                    "label": "ws%s-WS%s.1-probe" % (num, num),
+                    "session_id": "sess-%s" % num,
+                    "status": "done",
+                    "started_at": self.now - 7200,
+                    "ended_at": self.now - 3600,
+                }
+            )
+            self.store.add_usage(
+                {
+                    "ts": self.now - 3500,
+                    "session_id": "sess-%s" % num,
+                    "run_id": "muse:s%d:ws%s-probe" % (int(num), num),
+                    "model": self.MODEL,
+                    "tool": "muse",
+                    "message_id": "m-%s" % num,
+                    "input": 1000,
+                    "output": 500,
+                    "cache_read": 0,
+                    "cache_write": 0,
+                }
+            )
+        self.server, self.thread = start(self.store)
+        self.port = self.server.server_address[1]
+
+    def tearDown(self):
+        stop(self.server, self.thread)
+        self.store.close()
+        self.tmp.cleanup()
+
+    def _rows(self, path):
+        status, _, body = get(self.port, path)
+        self.assertEqual(status, 200, path)
+        return json.loads(body)["workstreams"]
+
+    def test_default_scope_drops_archived_and_dropped(self):
+        rows = {row["ws"]: row for row in self._rows("/api/workstreams")}
+        self.assertEqual(
+            sorted(rows),
+            ["WS41", "WS42", "WS43", "WS44"],
+        )
+        self.assertEqual(rows["WS41"]["state"], "planned")
+        self.assertEqual(rows["WS41"]["depends_on"], ["WS42"])
+        self.assertEqual(rows["WS41"]["milestone"], "Part 2")
+        self.assertEqual(rows["WS42"]["state"], "active")
+        self.assertEqual(rows["WS43"]["state"], "paused")
+        self.assertEqual(rows["WS44"]["state"], "done")
+        for row in rows.values():
+            for key in ("state_changed_at", "archived_at", "depends_on", "milestone",
+                        "live_agents", "tokens", "cost_usd", "tokens_all_time",
+                        "cost_usd_all_time", "last_activity", "progress", "ws_confidence"):
+                self.assertIn(key, row, key)
+            self.assertEqual(row["tokens"], 1500)
+        self.assertIsNone(rows["WS42"]["archived_at"])
+        self.assertIsNotNone(rows["WS41"]["state_changed_at"])
+
+    def test_state_param_overrides_scope(self):
+        rows = {row["ws"]: row for row in self._rows("/api/workstreams?state=all")}
+        self.assertEqual(
+            sorted(rows),
+            ["WS41", "WS42", "WS43", "WS44", "WS45", "WS46", "WS47"],
+        )
+        self.assertEqual(rows["WS45"]["state"], "archived")
+        self.assertEqual(rows["WS46"]["state"], "dropped")
+        self.assertIsNotNone(rows["WS45"]["archived_at"])
+        only = {row["ws"] for row in self._rows("/api/workstreams?state=archived")}
+        self.assertEqual(only, {"WS45", "WS47"})
+        subset = {row["ws"] for row in self._rows("/api/workstreams?state=done,planned")}
+        self.assertEqual(subset, {"WS41", "WS44"})
+
+    def test_bad_state_is_400(self):
+        status, _, body = get(self.port, "/api/workstreams?state=sleeping")
+        self.assertEqual(status, 400)
+        self.assertIn("state", json.loads(body)["hint"])
+
+    def test_archive_cards_newest_first_with_totals(self):
+        status, _, body = get(self.port, "/api/archive")
+        self.assertEqual(status, 200)
+        payload = json.loads(body)
+        self.assertEqual([card["id"] for card in payload["archive"]], ["WS47", "WS45"])
+        older = payload["archive"][1]
+        self.assertEqual(older["tasks_done"], 5)
+        self.assertEqual(older["report"], "2026-10-18-closing.md")
+        self.assertEqual(older["title"], "Probe WS45")
+        self.assertIsNotNone(older["archived_at"])
+        newer = payload["archive"][0]
+        self.assertEqual(newer["report"], "2026-10-17-closing.md")
+        totals = payload["totals"]
+        self.assertEqual(totals["workstreams"], 2)
+        self.assertEqual(totals["tokens"], 3000)
+        self.assertEqual(totals["runs"], 2)
+        self.assertGreater(totals["cost_usd"], 0)
+
+    def test_reconcile_carries_archived_aggregate(self):
+        status, _, body = get(self.port, "/api/reconcile?hours=24")
+        self.assertEqual(status, 200)
+        payload = json.loads(body)
+        archived = payload["archived"]
+        self.assertEqual(sorted(archived["workstreams"]), ["WS45", "WS46", "WS47"])
+        self.assertEqual(archived["tokens"], 4500)
+        self.assertEqual(archived["tokens_all_time"], 4500)
+        visible = [row for row in payload["rows"] if row["ws"] not in set(archived["workstreams"])]
+        self.assertEqual(
+            sum(row["tokens"] for row in visible) + archived["tokens"],
+            payload["all"]["tokens"],
+        )
+        self.assertFalse(
+            [item for item in payload["mismatches"] if item.startswith("archived")],
+            payload["mismatches"],
+        )
+
+    def test_state_rows_carry_lifecycle_and_project_placeholder(self):
+        status, _, body = get(self.port, "/api/state")
+        self.assertEqual(status, 200)
+        payload = json.loads(body)
+        self.assertEqual(payload["project"], {"name": None})
+        by_id = {row["id"]: row for row in payload["workstreams"]}
+        self.assertEqual(by_id["WS45"]["state"], "archived")
+        self.assertEqual(by_id["WS42"]["state"], "active")
+        self.assertEqual(
+            sorted(payload["totals"]["archived"]["workstreams"]),
+            ["WS45", "WS46", "WS47"],
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

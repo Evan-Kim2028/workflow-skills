@@ -18,6 +18,7 @@ The one argv value ever kept is the worker's `--model` flag value, recorded on p
 | `dash/store/running.py` (running set, liveness, stale/idle/unseen logic) | core |
 | `dash/store/summarize.py` (snapshots, rollups, reconcile, mismatches) | core |
 | `dash/store/queries.py` (state, workstream, concurrency, session reads) | core |
+| `dash/workstates.py` (bundle lifecycle states, `?state=` scopes, archive cards) | core |
 | `dash/store/util.py` (shared constants, pure helpers) | core |
 | `dash/buildinfo.py` (build id + process start time) | core |
 | `dash/deploy.py` (clean-release deploy, rollback, `releases/`) | core |
@@ -176,15 +177,29 @@ started_at, ended_at, elapsed_s, clock_source, out_bytes, out_growing, err_bytes
 
 `GET /api/sessions` -> `{"sessions": [{session_id, tool, cwd, label, workstream, started_at, status, runs: n, tokens, cost_usd}]}`
 
-`GET /api/workstreams?since=&until=` -> `{"workstreams": [{ws, name, tk: {backlog, todo, doing, review, done, cancelled}, live_agents, finished_in_range, finished_today, tokens, cost_usd, tokens_all_time, cost_usd_all_time, last_activity, plan: bool, ws_confidence: [..], progress: {done, total, counts, pct} | null}]}`.
+`GET /api/workstreams?since=&until=&state=` -> `{"workstreams": [{ws, name, tk: {backlog, todo, doing, review, done, cancelled}, state, state_changed_at, archived_at, depends_on, milestone, live_agents, finished_in_range, finished_today, tokens, cost_usd, tokens_all_time, cost_usd_all_time, last_activity, plan: bool, ws_confidence: [..], progress: {done, total, counts, pct} | null}]}`.
 Rows come from the same rollup as the snapshot, so they match the tabs for the
 same window. `tk` is the hub issue board (issue counts, never plan progress).
 `progress` is the same object `/api/plan` carries for that workstream, resolved
 through the one plan resolver (`dash.bundles.resolve_plan`), so one request
 gives the tab bar its completed state; it is null when the workstream has no
 plan. An `unassigned` row appears when runs have no workstream.
+`state` is the bundle lifecycle state (`planned|active|paused|done|archived|dropped`,
+default `active` when the bundle carries none), with `state_changed_at`,
+`archived_at`, `depends_on`, and `milestone` beside it. The default scope drops
+`archived` and `dropped` rows; `?state=all` keeps every state and
+`?state=archived,done` (any comma list of state names) keeps exactly those. A
+bad state name is a 400. The existing live/progress fields stay on every row
+returned, and the `unassigned` row stays in every scope with null lifecycle
+fields (it is not a workstream).
 
-`GET /api/reconcile?hours=&since=&until=` -> `{"now": 0, "since": 0, "until": 0, "all": {live_agents, finished_in_range, finished_today, tokens, cost_usd, prev_24h: {tokens, cost_usd, finished, live_agents}}, "all_time": {tokens, cost_usd}, "rows": [per-workstream rows], "unassigned": {...}, "mismatches": []}`.
+`GET /api/reconcile?hours=&since=&until=` -> `{"now": 0, "since": 0, "until": 0, "all": {live_agents, finished_in_range, finished_today, tokens, cost_usd, prev_24h: {tokens, cost_usd, finished, live_agents}}, "all_time": {tokens, cost_usd}, "rows": [per-workstream rows], "unassigned": {...}, "archived": {tokens, cost_usd, tokens_all_time, cost_usd_all_time, workstreams: []}, "mismatches": []}`.
+`archived` sums the rows in a default-hidden lifecycle state
+(`archived`/`dropped`), windowed plus lifetime, so project totals keep
+including archived work. One more identity holds and is checked: visible
+rows (`active`+`paused`+`done`+`planned`) plus `archived` plus `unassigned`
+equal the all-scope numbers (windowed and all-time), with an `archived
+...` mismatch line when broken.
 Computed in one store pass under the lock. Rows carry `tokens_all_time` and
 `cost_usd_all_time` next to the windowed numbers. `mismatches` lists every violated
 invariant, windowed and all-time (rows plus unassigned equal the all-scope
@@ -291,11 +306,12 @@ store pass (`Store.state_view`):
 {"schema": 1, "version": {"tool": "<git-sha|unknown>", "build_id": "<sha[-dirty]|unknown>", "started_at": 0, "schema": 1},
  "now": 0, "window": {"since": 0, "until": 0, "hours": 24},
  "health": {"ok": true, "sources": [{name, last_poll, last_error, lag_s}], "scratch_roots": [], "run_dirs": [], "warnings": []},
- "workstreams": [{"id": "WS7", "title": "", "plan": true, "progress": {"done": 0, "total": 0, "counts": {}, "pct": 0},
+ "project": {"name": null},
+ "workstreams": [{"id": "WS7", "title": "", "state": "active", "plan": true, "progress": {"done": 0, "total": 0, "counts": {}, "pct": 0},
    "live_agents": 0, "tokens": 0, "cost_usd": 0.0, "tokens_all_time": 0, "cost_usd_all_time": 0.0, "last_activity": 0}],
  "unassigned": {"live_agents": 0, "tokens": 0, "cost_usd": 0.0, "tokens_all_time": 0, "cost_usd_all_time": 0.0, "last_activity": 0},
  "running": {"count": 0, "by_source": {"muse": 0}, "prod_jobs": 0, "prod_jobs_finished": 0},
- "totals": {"tokens": {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0, "reasoning": 0}, "cost_usd": 0.0, "unpriced_runs": 0, "prev_24h": {"tokens": 0, "cost_usd": 0.0, "finished": 0, "live_agents": 0}, "prod_jobs": 0, "prod_jobs_finished": 0},
+ "totals": {"tokens": {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0, "reasoning": 0}, "cost_usd": 0.0, "unpriced_runs": 0, "prev_24h": {"tokens": 0, "cost_usd": 0.0, "finished": 0, "live_agents": 0}, "archived": {"tokens": 0, "cost_usd": 0.0, "tokens_all_time": 0, "cost_usd_all_time": 0.0, "workstreams": []}, "prod_jobs": 0, "prod_jobs_finished": 0},
  "totals_all_time": {"tokens": {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0, "reasoning": 0}, "cost_usd": 0.0},
  "reconcile": {"ok": true, "mismatches": []},
  "problems": [{"code": "stale-running", "message": "", "command": "python3 agent_dash.py check"}]}
@@ -303,7 +319,11 @@ store pass (`Store.state_view`):
 `version.tool` is the git short sha of the tool directory, `"unknown"`
 outside git. `version.build_id` adds the `-dirty` flag for a checkout
 with uncommitted changes at start; `version.started_at` is the process
-start epoch. The window is the one fixed 24 h. `totals.prev_24h` and each
+start epoch. `project` is the project-identity placeholder (`GET
+/api/project` owns it): today `{"name": null}`, filled from
+`project.json` by the project worker. Every workstream row carries its
+bundle lifecycle `state` (default `active`), and `totals.archived` is the
+same archived aggregate `/api/reconcile` carries. The window is the one fixed 24 h. `totals.prev_24h` and each
 workstream row's (and `unassigned`'s) `prev_24h` are the snapshot
 `prev_24h` for those scopes: the 24 h before the window, same functions
 and attribution, `live_agents` point-in-time at the window start.
@@ -474,6 +494,7 @@ HTTP, still GET only, 127.0.0.1:
 - `GET /plan` serves the same shell as `GET /`.
 - `GET /api/bundles` returns `{bundles: [{id, title, short, order, kind}]}`, program first, then `order`.
 - `GET /api/bundle?ws=<ID>` returns `{bundle, plan, progress, approvals, start_prompt, issues}` from that directory. `progress` is the same object `/api/plan` carries. Missing `approvals.json` is an empty item list. `start_prompt` is the text of `START-PROMPT.md`, or null. `issues` is the same list `/api/plan` carries.
+- `GET /api/archive` returns `{"archive": [{<summary.json contents>, id, title, archived_at, report}], "totals": {workstreams, tokens, cost_usd, runs}}`: one frozen summary card per `archived` workstream, newest first (bundles without `summary.json` still list with their metadata). `report` is the closing-report file's basename only, never a path and never its body — no report prose reaches any endpoint. `totals` is the archived workstreams' lifetime share from the store (same summary functions as every other total: all-time tokens and cost plus the run-row count), so project lifetime numbers keep including archived work.
 - `GET /api/plan?ws=<ID>` includes `start_prompt` the same way when that bundle has the file, and null otherwise.
 - `GET /api/approvals?ws=<ID|all>` returns one record, or `{approvals: [...]}` for `all`.
 - `GET /bundle/<ID>/page.html` returns that file only. The resolved path has to stay inside the bundle directory.

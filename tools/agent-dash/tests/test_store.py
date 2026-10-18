@@ -3457,5 +3457,150 @@ class StoreInheritanceTest(unittest.TestCase):
         self.assertEqual(rows["WS7"]["ws_confidence"], ["regex"])
 
 
+class WorkstreamScopeStoreTest(unittest.TestCase):
+    """Lifecycle scope defaults and the archived aggregate, at the store layer.
+
+    WS41 is active, WS42 archived, WS43 dropped (bundle metadata passed
+    straight in, no bundle files needed); each holds one priced run.
+    """
+
+    MODEL = "claude-sonnet-5-5"
+    META = {
+        "WS41": {"state": "active", "state_changed_at": 100,
+                 "archived_at": None, "depends_on": [], "milestone": None},
+        "WS42": {"state": "archived", "state_changed_at": 200,
+                 "archived_at": 300, "depends_on": ["WS41"], "milestone": "Part 2"},
+        "WS43": {"state": "dropped", "state_changed_at": 200,
+                 "archived_at": 300, "depends_on": [], "milestone": None},
+    }
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.store = memory(Path(self.tmp.name))
+        self.now = time.time()
+        for num, ws in ((41, "WS41"), (42, "WS42"), (43, "WS43")):
+            self.store.upsert_run(
+                {
+                    "run_id": "muse:s%d:ws%d-probe" % (num, num),
+                    "source": "muse",
+                    "tier": "muse",
+                    "model": self.MODEL,
+                    "label": "ws%d-%s.1-probe" % (num, ws),
+                    "session_id": "sess-%d" % num,
+                    "status": "done",
+                    "started_at": self.now - 7200,
+                    "ended_at": self.now - 3600,
+                }
+            )
+            self.store.add_usage(
+                {
+                    "ts": self.now - 3500,
+                    "session_id": "sess-%d" % num,
+                    "run_id": "muse:s%d:ws%d-probe" % (num, num),
+                    "model": self.MODEL,
+                    "tool": "muse",
+                    "message_id": "m-%d" % num,
+                    "input": 1000,
+                    "output": 500,
+                    "cache_read": 0,
+                    "cache_write": 0,
+                }
+            )
+
+    def tearDown(self):
+        self.store.close()
+        self.tmp.cleanup()
+
+    def test_rows_carry_lifecycle_fields(self):
+        rows = {row["ws"]: row for row in self.store.query_workstreams(
+            set(), bundle_meta=self.META, allowed_states={"active", "archived", "dropped", "planned", "paused", "done"})}
+        self.assertEqual(rows["WS42"]["state"], "archived")
+        self.assertEqual(rows["WS42"]["archived_at"], 300)
+        self.assertEqual(rows["WS42"]["depends_on"], ["WS41"])
+        self.assertEqual(rows["WS42"]["milestone"], "Part 2")
+        self.assertEqual(rows["WS41"]["state"], "active")
+        self.assertEqual(rows["WS41"]["depends_on"], [])
+        self.assertIsNone(rows["WS41"]["milestone"])
+        for row in rows.values():
+            self.assertEqual(row["tokens"], 1500)
+
+    def test_default_scope_drops_archived_and_dropped(self):
+        rows = {row["ws"]: row for row in self.store.query_workstreams(set(), bundle_meta=self.META)}
+        self.assertEqual(sorted(rows), ["WS41"])
+        rows = {row["ws"]: row for row in self.store.query_workstreams(
+            set(), bundle_meta=self.META, allowed_states={"archived"})}
+        self.assertEqual(sorted(rows), ["WS42"])
+
+    def test_no_meta_means_everything_active(self):
+        rows = {row["ws"] for row in self.store.query_workstreams(set())}
+        self.assertEqual(rows, {"WS41", "WS42", "WS43"})
+
+    def test_unassigned_row_has_null_lifecycle_and_survives_scopes(self):
+        self.store.upsert_run(
+            {
+                "run_id": "muse:lonely:helper",
+                "source": "muse",
+                "tier": "muse",
+                "model": self.MODEL,
+                "label": "lonely-helper",
+                "session_id": "sess-lonely",
+                "status": "done",
+                "started_at": self.now - 7200,
+                "ended_at": self.now - 3600,
+            }
+        )
+        for allowed in (None, {"archived"}, {"active", "planned"}):
+            rows = {row["ws"]: row for row in self.store.query_workstreams(
+                set(), bundle_meta=self.META, allowed_states=allowed)}
+            unassigned = rows["unassigned"]
+            self.assertIsNone(unassigned["state"])
+            self.assertIsNone(unassigned["archived_at"])
+            self.assertEqual(unassigned["depends_on"], [])
+
+    def test_reconcile_archived_aggregate_and_identity(self):
+        body = self.store.reconcile_numbers(self.now, processes=[], archived_ws={"WS42", "WS43"})
+        self.assertEqual(sorted(body["archived"]["workstreams"]), ["WS42", "WS43"])
+        self.assertEqual(body["archived"]["tokens"], 3000)
+        self.assertEqual(body["archived"]["tokens_all_time"], 3000)
+        visible = [row for row in body["rows"] if row["ws"] not in {"WS42", "WS43"}]
+        self.assertEqual(
+            sum(row["tokens"] for row in visible) + body["archived"]["tokens"],
+            body["all"]["tokens"],
+        )
+        self.assertEqual(
+            sum(row["tokens_all_time"] for row in visible) + body["archived"]["tokens_all_time"],
+            body["all_time"]["tokens"],
+        )
+        self.assertFalse(
+            [item for item in body["mismatches"] if item.startswith("archived")],
+            body["mismatches"],
+        )
+
+    def test_reconcile_without_archived_set_keeps_historic_shape(self):
+        body = self.store.reconcile_numbers(self.now, processes=[])
+        self.assertNotIn("archived", body)
+
+    def test_archived_identity_checker_fires_on_tampered_sums(self):
+        from dash.workstates import archived_aggregate, check_archived_identity
+
+        body = self.store.reconcile_numbers(self.now, processes=[], archived_ws={"WS42"})
+        good = archived_aggregate(body["rows"], {"WS42"})
+        ok = check_archived_identity(
+            body["rows"], body["unassigned"], good,
+            body["all"]["tokens"], body["all"]["cost_usd"],
+            body["all_time"]["tokens"], body["all_time"]["cost_usd"],
+        )
+        self.assertEqual(ok, [])
+        broken = dict(good, tokens=good["tokens"] + 1,
+                      tokens_all_time=good["tokens_all_time"] + 1)
+        bad = check_archived_identity(
+            body["rows"], body["unassigned"], broken,
+            body["all"]["tokens"], body["all"]["cost_usd"],
+            body["all_time"]["tokens"], body["all_time"]["cost_usd"],
+        )
+        self.assertTrue(any(item.startswith("archived tokens:") for item in bad), bad)
+        self.assertTrue(any("tokens_all_time" in item for item in bad), bad)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -156,6 +156,8 @@ PATHS = [
     "/api/concurrency",
     "/api/sessions",
     "/api/workstreams",
+    "/api/workstreams?state=all",
+    "/api/archive",
     "/api/reconcile?hours=24",
     "/api/plan?ws=WS1",
     "/api/replay?ws=WS1",
@@ -378,6 +380,56 @@ class PrivacyPinEndpointTest(unittest.TestCase):
         self.assertIn(MODEL_OK, text)
         for sentinel in SENTINELS:
             self.assertNotIn(sentinel, text)
+
+
+class ArchivePrivacyTest(unittest.TestCase):
+    """Closing-report bodies never reach the API: only basenames do."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.now = time.time()
+        self.wsroot = os.path.join(self.tmp.name, "ws")
+        dest = os.path.join(self.wsroot, "WS41")
+        os.makedirs(os.path.join(dest, "reports"))
+        with open(os.path.join(dest, "bundle.json"), "w") as fh:
+            json.dump(
+                {"id": "WS41", "title": "Probe WS41", "short": "WS41",
+                 "order": 41, "kind": "workstream", "state": "archived",
+                 "state_changed_at": int(self.now) - 50,
+                 "archived_at": int(self.now) - 5},
+                fh,
+            )
+        with open(os.path.join(dest, "summary.json"), "w") as fh:
+            json.dump({"tasks_done": 1, "tasks_total": 1, "report": "reports/2026-10-18-closing.md"}, fh)
+        with open(os.path.join(dest, "reports", "2026-10-18-closing.md"), "w") as fh:
+            fh.write("closing body with %s and %s and %s and %s\n" % SENTINELS)
+        self._env = mock.patch.dict(os.environ, {"AGENT_DASH_WORKSTREAMS": self.wsroot})
+        self._env.start()
+        self.addCleanup(self._env.stop)
+        self._live = mock.patch("dash.server._live_workers", return_value=[])
+        self._live.start()
+        self.addCleanup(self._live.stop)
+        self.store = Store(Path(self.tmp.name) / "dash.sqlite")
+        self.server, self.thread = _start(self.store)
+        self.port = self.server.server_address[1]
+
+    def tearDown(self):
+        _stop(self.server, self.thread)
+        self.store.close()
+        self.tmp.cleanup()
+
+    def test_archive_serves_basename_but_no_body(self):
+        status, body = _get(self.port, "/api/archive")
+        self.assertEqual(status, 200)
+        text = body.decode("utf-8", "replace")
+        payload = json.loads(text)
+        self.assertEqual(payload["archive"][0]["report"], "2026-10-18-closing.md")
+        for sentinel in SENTINELS:
+            self.assertNotIn(sentinel, text)
+        status, body = _get(self.port, "/api/workstreams?state=all")
+        self.assertEqual(status, 200)
+        for sentinel in SENTINELS:
+            self.assertNotIn(sentinel, body.decode("utf-8", "replace"))
 
 
 class SourceWriteTest(unittest.TestCase):

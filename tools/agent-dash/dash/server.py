@@ -176,6 +176,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(200, {"sessions": self.server.store.query_sessions()})
             elif path == "/api/workstreams":
                 self._workstreams(query)
+            elif path == "/api/archive":
+                self._archive(query)
             elif path == "/api/reconcile":
                 self._reconcile(query)
             elif path == "/api/plan":
@@ -359,14 +361,57 @@ class Handler(BaseHTTPRequestHandler):
         )
 
     def _workstreams(self, query):
+        from dash.workstates import all_bundle_meta, parse_state_param
+
         since = _float(query, "since")
         until = _float(query, "until")
-        rows = self.server.store.query_workstreams(workstream_plan_ids(), since, until)
+        allowed = parse_state_param(_one(query, "state"))
+        meta = all_bundle_meta()
+        rows = self.server.store.query_workstreams(
+            workstream_plan_ids(), since, until,
+            bundle_meta=meta, allowed_states=allowed,
+        )
         for row in rows:
             row["progress"] = _row_progress(row.get("ws"))
         self._json(200, {"workstreams": rows})
 
+    def _archive(self, _query):
+        """``GET /api/archive``: frozen summary cards for archived workstreams.
+
+        Cards are the ``summary.json`` contents plus id, title,
+        archived_at, and the closing-report basename — never report
+        bodies. ``totals`` is the archived workstreams' lifetime share
+        from the store (same summary functions as every other total),
+        so project lifetime numbers keep including archived work.
+        """
+        from dash.workstates import all_bundle_meta, archive_cards, archived_aggregate
+
+        now = time.time()
+        meta = all_bundle_meta()
+        cards = archive_cards(meta)
+        card_ids = {card["id"] for card in cards}
+        roll = self.server.store.ws_rollup(now)
+        agg = archived_aggregate(roll["rows"], card_ids)
+        runs = sum(
+            len(roll["scopes"].get(ws, {}).get("runs", []))
+            for ws in card_ids if ws in roll["scopes"]
+        )
+        self._json(
+            200,
+            {
+                "archive": cards,
+                "totals": {
+                    "workstreams": len(cards),
+                    "tokens": agg["tokens_all_time"],
+                    "cost_usd": agg["cost_usd_all_time"],
+                    "runs": runs,
+                },
+            },
+        )
+
     def _reconcile(self, query):
+        from dash.workstates import hidden_ids
+
         now = time.time()
         hours = _float(query, "hours")
         since = _float(query, "since")
@@ -375,7 +420,9 @@ class Handler(BaseHTTPRequestHandler):
             if hours <= 0:
                 raise ValueError("bad hours")
             since = now - hours * 3600
-        body = self.server.store.reconcile_numbers(now, since, until, processes=_live_workers())
+        body = self.server.store.reconcile_numbers(
+            now, since, until, processes=_live_workers(), archived_ws=hidden_ids()
+        )
         try:
             stalled = self.server.registry.stalled_messages(now)
         except Exception:
@@ -673,6 +720,8 @@ def _hint_for(error: str) -> str:
         return "Pass an integer 1-5000, e.g. /api/runs?limit=50."
     if error in ("bad usage_group", "bad group", "bad bucket"):
         return "Use group=model|workstream|tool and bucket=hour|day."
+    if error == "bad state":
+        return "Use ?state=all or a comma list of planned|active|paused|done|archived|dropped."
     return "Check the query parameters against CONTRACT.md, or run the matching CLI command."
 
 

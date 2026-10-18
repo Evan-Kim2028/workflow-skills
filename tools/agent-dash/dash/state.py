@@ -79,6 +79,20 @@ def build_state(store, registry, cfg=None, now: float | None = None, processes=N
         except Exception:
             plan_ids = set()
 
+    try:
+        from dash.workstates import all_bundle_meta, archived_aggregate, hidden_ids, state_of
+    except Exception:
+        all_bundle_meta = None
+        archived_aggregate = None
+        hidden_ids = None
+        state_of = None
+    meta = {}
+    if all_bundle_meta is not None:
+        try:
+            meta = all_bundle_meta() or {}
+        except Exception:
+            meta = {}
+
     workstreams = []
     for row in roll["rows"]:
         ws = row["ws"]
@@ -87,6 +101,7 @@ def build_state(store, registry, cfg=None, now: float | None = None, processes=N
             {
                 "id": ws,
                 "title": titles.get(ws) or bundles.get(ws, {}).get("title", "") or "",
+                "state": state_of(ws, meta) if state_of is not None else "active",
                 "plan": ws in plan_ids,
                 "progress": progress,
                 "live_agents": row["live_agents"],
@@ -108,6 +123,11 @@ def build_state(store, registry, cfg=None, now: float | None = None, processes=N
     prod_jobs = int(view.get("prod_jobs") or 0)
     prod_jobs_finished = int(view.get("prod_jobs_finished") or 0)
     info = dict(build) if isinstance(build, dict) else build_info()
+    archived = (
+        archived_aggregate(roll["rows"], hidden_ids(meta))
+        if archived_aggregate is not None and hidden_ids is not None
+        else {"tokens": 0, "cost_usd": 0.0, "tokens_all_time": 0, "cost_usd_all_time": 0.0, "workstreams": []}
+    )
     return {
         "schema": SCHEMA_VERSION,
         "version": {
@@ -119,6 +139,10 @@ def build_state(store, registry, cfg=None, now: float | None = None, processes=N
         "now": now,
         "window": {"since": now - WINDOW_S, "until": now, "hours": WINDOW_S / 3600},
         "health": health,
+        # Project identity placeholder: the project worker (GET
+        # /api/project) fills this block from project.json. Reads use
+        # payload.get("project", {}).get("name") so both shapes work.
+        "project": {"name": None},
         "workstreams": workstreams,
         "unassigned": {
             "live_agents": unassigned["live_agents"],
@@ -130,7 +154,7 @@ def build_state(store, registry, cfg=None, now: float | None = None, processes=N
             "last_activity": unassigned["last_activity"],
         },
         "running": {"count": sum(by_source.values()), "by_source": by_source, "prod_jobs": prod_jobs, "prod_jobs_finished": prod_jobs_finished},
-        "totals": {**totals, "prev_24h": totals_prev, "prod_jobs": prod_jobs, "prod_jobs_finished": prod_jobs_finished},
+        "totals": {**totals, "prev_24h": totals_prev, "prod_jobs": prod_jobs, "prod_jobs_finished": prod_jobs_finished, "archived": archived},
         "totals_all_time": roll["all_time"]["all"],
         "reconcile": {"ok": not mismatches, "mismatches": mismatches},
         "problems": problems,

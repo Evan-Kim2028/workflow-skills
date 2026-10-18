@@ -284,11 +284,24 @@ class QueriesMixin:
             since: float | None = None,
             until: float | None = None,
             now: float | None = None,
+            bundle_meta: dict | None = None,
+            allowed_states: set[str] | None = None,
         ) -> list:
             """One row per workstream from the shared rollup: same agent rule, window,
             and bucket attribution as the snapshot. Hub issue counts (``tk``) ride along
-            as issue counts; they are never plan progress."""
+            as issue counts; they are never plan progress.
+
+            Rows carry the bundle lifecycle fields (``state``,
+            ``state_changed_at``, ``archived_at``, ``depends_on``,
+            ``milestone``), defaulting to ``active`` when the bundle has
+            none. ``allowed_states`` scopes the rows: None keeps the
+            default scope (drops ``archived``/``dropped``); a set from
+            ``dash.workstates.parse_state_param`` overrides it. The
+            ``unassigned`` row always stays."""
             import time as _time
+
+            from dash.workstates import filter_rows as _filter_rows
+            from dash.workstates import state_of as _state_of
 
             now = float(now if now is not None else _time.time())
             with self._lock:
@@ -300,6 +313,19 @@ class QueriesMixin:
                 )
             boards = {row["ws"]: row for row in counts}
             seen = set()
+
+            def _lifecycle(ws: str) -> dict:
+                item = bundle_meta.get(ws) if isinstance(bundle_meta, dict) else None
+                if not isinstance(item, dict):
+                    item = {}
+                return {
+                    "state": _state_of(ws, bundle_meta),
+                    "state_changed_at": item.get("state_changed_at"),
+                    "archived_at": item.get("archived_at"),
+                    "depends_on": list(item.get("depends_on") or []),
+                    "milestone": item.get("milestone"),
+                }
+
             out = []
             for row in roll["rows"]:
                 seen.add(row["ws"])
@@ -309,6 +335,7 @@ class QueriesMixin:
                         "ws": row["ws"],
                         "name": board.get("name") or "",
                         "tk": {key: int(board.get(key) or 0) for key in WS_STATUSES},
+                        **_lifecycle(row["ws"]),
                         "live_agents": row["live_agents"],
                         "finished_in_range": row["finished_in_range"],
                         "finished_today": row["finished_today"],
@@ -328,6 +355,7 @@ class QueriesMixin:
                         "ws": ws,
                         "name": board.get("name") or "",
                         "tk": {key: int(board.get(key) or 0) for key in WS_STATUSES},
+                        **_lifecycle(ws),
                         "live_agents": 0,
                         "finished_in_range": 0,
                         "finished_today": 0,
@@ -347,6 +375,11 @@ class QueriesMixin:
                         "ws": row["ws"],
                         "name": "Unassigned",
                         "tk": {key: 0 for key in WS_STATUSES},
+                        "state": None,
+                        "state_changed_at": None,
+                        "archived_at": None,
+                        "depends_on": [],
+                        "milestone": None,
                         "live_agents": row["live_agents"],
                         "finished_in_range": row["finished_in_range"],
                         "finished_today": row["finished_today"],
@@ -359,5 +392,6 @@ class QueriesMixin:
                         "ws_confidence": list(row.get("ws_confidence") or []),
                     }
                 )
+            out = _filter_rows(out, allowed_states, bundle_meta)
             out.sort(key=lambda item: _ws_sort(item["ws"]))
             return out

@@ -1,3 +1,4 @@
+import json
 import os
 
 os.environ["AGENT_DASH_IGNORE_LOCAL"] = "1"
@@ -7,6 +8,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -324,6 +326,95 @@ class StateProblemsTest(unittest.TestCase):
         payload = build_state(self.store, StubRegistry([]), {}, now=now)
         self.assertFalse(payload["reconcile"]["ok"])
         self.assertEqual(payload["problems"], [])
+
+
+class StateLifecycleTest(unittest.TestCase):
+    """`/api/state` carries the lifecycle state, the archived aggregate,
+    and the project placeholder."""
+
+    MODEL = "claude-sonnet-5-5"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.store = _store(self.tmp.name)
+        self.wsroot = os.path.join(self.tmp.name, "ws")
+        os.makedirs(self.wsroot)
+        self._env = mock.patch.dict(os.environ, {"AGENT_DASH_WORKSTREAMS": self.wsroot})
+        self._env.start()
+        self.addCleanup(self._env.stop)
+
+    def tearDown(self):
+        self.store.close()
+        self.tmp.cleanup()
+
+    def _bundle(self, ws, **fields):
+        bundle = {"id": ws, "title": "Probe %s" % ws, "short": ws,
+                  "order": 41, "kind": "workstream"}
+        bundle.update(fields)
+        dest = os.path.join(self.wsroot, ws)
+        os.makedirs(dest, exist_ok=True)
+        with open(os.path.join(dest, "bundle.json"), "w") as fh:
+            json.dump(bundle, fh)
+
+    def _run(self, now, ws, num):
+        self.store.upsert_run(
+            {
+                "run_id": "muse:s%d:ws%d-probe" % (num, num),
+                "source": "muse",
+                "tier": "muse",
+                "model": self.MODEL,
+                "label": "ws%d-%s.1-probe" % (num, ws),
+                "session_id": "sess-%d" % num,
+                "status": "done",
+                "started_at": now - 7200,
+                "ended_at": now - 3600,
+            }
+        )
+        self.store.add_usage(
+            {
+                "ts": now - 3500,
+                "session_id": "sess-%d" % num,
+                "run_id": "muse:s%d:ws%d-probe" % (num, num),
+                "model": self.MODEL,
+                "tool": "muse",
+                "message_id": "m-%d" % num,
+                "input": 1000,
+                "output": 500,
+                "cache_read": 0,
+                "cache_write": 0,
+            }
+        )
+
+    def test_project_placeholder_and_empty_archived(self):
+        now = time.time()
+        payload = build_state(self.store, StubRegistry([]), {}, now=now)
+        self.assertEqual(payload["project"], {"name": None})
+        self.assertEqual(
+            payload["totals"]["archived"],
+            {"tokens": 0, "cost_usd": 0.0, "tokens_all_time": 0,
+             "cost_usd_all_time": 0.0, "workstreams": []},
+        )
+
+    def test_rows_carry_state_and_archived_holds_archived_work(self):
+        now = time.time()
+        self._bundle("WS41", state="active")
+        self._bundle("WS42", state="archived", state_changed_at=int(now) - 10,
+                     archived_at=int(now) - 5)
+        self._run(now, "WS41", 41)
+        self._run(now, "WS42", 42)
+        payload = build_state(self.store, StubRegistry([]), {}, now=now)
+        by_id = {row["id"]: row for row in payload["workstreams"]}
+        self.assertEqual(by_id["WS41"]["state"], "active")
+        self.assertEqual(by_id["WS42"]["state"], "archived")
+        archived = payload["totals"]["archived"]
+        self.assertEqual(archived["workstreams"], ["WS42"])
+        self.assertEqual(archived["tokens"], 1500)
+        self.assertEqual(archived["tokens_all_time"], 1500)
+        visible = [row for row in payload["workstreams"] if row["id"] != "WS42"]
+        self.assertEqual(
+            sum(row["tokens"] for row in visible) + archived["tokens"],
+            sum(row["tokens"] for row in payload["workstreams"]),
+        )
 
 
 if __name__ == "__main__":

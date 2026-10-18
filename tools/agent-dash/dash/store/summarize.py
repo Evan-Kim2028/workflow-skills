@@ -188,6 +188,7 @@ class SummarizeMixin:
             since: float | None = None,
             until: float | None = None,
             processes=None,
+            archived_ws: set[str] | None = None,
         ) -> dict:
             """Cross-check every number once, under one lock. ``mismatches`` is empty when consistent.
 
@@ -198,7 +199,18 @@ class SummarizeMixin:
             worker younger than two poll intervals of its source — by process
             age, or first sampled here within that window — is not yet a
             mismatch.
+
+            ``archived_ws`` is the set of workstream ids in a
+            default-hidden lifecycle state (``archived``/``dropped``; the
+            HTTP layer reads it from the bundles). When given, the payload
+            gains ``archived`` (those rows summed, windowed plus
+            lifetime) and the identity visible rows + archived +
+            unassigned = all is checked like every other invariant. When
+            None the payload keeps its historic shape.
             """
+            from dash.workstates import archived_aggregate as _archived_aggregate
+            from dash.workstates import check_archived_identity as _check_archived
+
             with self._lock:
                 shown_all, parents = self._shown_locked(now)
                 live_open = self._live_open_ids_locked(now, shown_all)
@@ -223,7 +235,7 @@ class SummarizeMixin:
                 # visible, not a mismatch; the counts feed that subtitle.
                 finished_total = all_counts["finished_in_range"]
                 recent_shown = min(50, finished_total)
-                return {
+                payload = {
                     "now": now,
                     "since": roll["since"],
                     "until": roll["until"],
@@ -247,6 +259,21 @@ class SummarizeMixin:
                     "recent_total": finished_total,
                     "mismatches": mismatches,
                 }
+                if archived_ws is not None:
+                    archived = _archived_aggregate(roll["rows"], set(archived_ws))
+                    payload["archived"] = archived
+                    mismatches.extend(
+                        _check_archived(
+                            roll["rows"],
+                            roll["unassigned"],
+                            archived,
+                            _billed_total(all_totals["tokens"]),
+                            all_totals["cost_usd"],
+                            all_time_total,
+                            all_time["all"]["cost_usd"],
+                        )
+                    )
+                return payload
         def _mismatches_locked(self, roll: dict, shown_all: list, now: float, tab_of, processes=None) -> list:
             """Every violated invariant for one rollup. Caller holds the lock.
 
