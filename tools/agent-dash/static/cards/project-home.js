@@ -201,7 +201,8 @@
       }
       card.appendChild(bar);
       card.appendChild(el("div", {class: "pj-meta", text: tc.done + "/" + tc.total + " tasks"}));
-      card.appendChild(el("div", {class: "pj-wait", text: r.waitText}));
+      /* The pill-line reason below already names the wait (or its absence);
+         a second waits line would repeat it. */
       var pill = el("span", {class: "pj-pill " + (r.ready ? "ok" : "wait"), text: r.ready ? "\u2713 Ready" : "\u25CB Not yet", title: r.reason});
       var line = el("div", {class: "pj-pill-line"});
       line.appendChild(pill);
@@ -283,7 +284,7 @@
       var name = el("div", {class: "prog-name"});
       name.appendChild(el("span", {text: label}));
       var sub = w.live_agents ? w.live_agents + " live" : n ? n + " runs" : fmtN(w.tokens || 0) + " tokens";
-      name.appendChild(el("span", {class: "prog-meta", text: sub}));
+      name.appendChild(el("span", {class: "prog-meta", text: " · " + sub}));
       line.appendChild(name);
       var acts = el("div", {class: "prog-acts"});
       acts.appendChild(copyBtn("python3 agent_dash.py ws new " + w.ws + " \"" + suggestTitle(w.ws) + "\"", "Copy ws new"));
@@ -297,8 +298,19 @@
      registry line (scope "project", slot naming one of PROJECT_SLOTS);
      the slot renders their card, and stays an empty container until one
      registers. */
+  /* The slot key folds in the entry's own spec key (which carries its
+     load state: loading, failed, or generated_at). Without it a card whose
+     data lands after the slot mounts — the dependency graph fetched one —
+     never rebuilds its slot on its own completion redraw. */
   function slotSection(id, entry) {
-    return [id, keyOf([id, entry ? entry.id : null, state.seq]), function () {
+    function innerKey() {
+      if (!entry) return null;
+      try {
+        var sp = entry.spec(state, state.snap || {});
+        return (sp && sp[1] !== undefined) ? sp[1] : null;
+      } catch (e) { return null; }
+    }
+    return [id, keyOf([id, entry ? entry.id : null, state.seq, innerKey()]), function () {
       var host = el("div", {class: "pj-slot", id: id, "data-slot": id});
       if (entry) {
         var sp = entry.spec(state, state.snap || {});

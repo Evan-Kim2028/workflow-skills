@@ -171,6 +171,11 @@
             if (next < 0) next = items.length - 1;
             if (next >= items.length) next = 0;
             if (items[next] && items[next].focus) items[next].focus();
+          } else if ((key === "Enter" || key === " ") && typeof copy !== "undefined" && copy && copy.focus) {
+            /* A stopped row's action is its copy button: move focus there
+               so Enter/Space reach it without a pointer. */
+            if (e.preventDefault) e.preventDefault();
+            copy.focus();
           }
         };
       })(index);

@@ -32,9 +32,13 @@
 .chip.gate.done::before{content:"\2713"}
 .chip .att{font:600 9.5px var(--mono);color:var(--muted);margin-left:3px;padding:0 3px;border-radius:4px;border:1px solid var(--grid)}
 .chip .att.hot{color:var(--ink);border-color:var(--warning)}
-.chip.live{border-style:solid;border-color:var(--s1);background:var(--s1);color:#fff;box-shadow:0 0 0 3px color-mix(in srgb,var(--s1) 30%,transparent);animation:pulse 1.6s infinite}
+.chip.live{border-style:solid;border-color:var(--s1);background:var(--accent,var(--s1));color:var(--accent-ink,#fff);box-shadow:0 0 0 3px color-mix(in srgb,var(--s1) 30%,transparent);animation:pulse 1.6s infinite}
+:root[data-theme="light"] .chip.live{color:#fff;background:var(--accent-fill,var(--accent,var(--s1)))}
 .chip.live::before{content:"\25CF"}
-.chip .ag{display:inline-block;min-width:14px;height:14px;line-height:14px;text-align:center;border-radius:7px;font:700 10px var(--mono);color:#fff;margin-left:2px;padding:0 3px;box-shadow:0 0 0 1.5px #fff}
+/* Count badge: ink on a neutral pill with a tier-colored ring. White (or
+   dark) text directly on the tier fill fails contrast on several tiers, and
+   the tier varies per chip, so the fill cannot carry text. */
+.chip .ag{display:inline-block;min-width:14px;height:14px;line-height:14px;text-align:center;border-radius:7px;font:700 10px var(--mono);color:var(--ink);background:var(--surface-2);border:1px solid var(--grid);margin-left:2px;padding:0 3px}
 .chip.just{outline:2.5px solid var(--good);outline-offset:1px}
 .dnode .live-n{font:600 11.5px var(--mono);color:var(--s1);margin-bottom:4px}
 .unassigned{display:flex;flex-wrap:wrap;gap:6px;margin:8px 0}
@@ -67,7 +71,8 @@
 .dnode.g-now{border-color:var(--s1);box-shadow:0 0 0 3px color-mix(in srgb,var(--s1) 22%,transparent),0 6px 18px -8px color-mix(in srgb,var(--s1) 60%,transparent);animation:glow 2.4s ease-in-out infinite}
 .dnode.g-ready{border-style:dashed;border-color:var(--ink-2)}
 .gtag{float:right;font:700 10px var(--mono);letter-spacing:.03em;padding:2px 6px;border-radius:999px;margin-left:6px}
-.gtag.now{background:var(--s1);color:#fff}
+.gtag.now{background:var(--accent,var(--s1));color:var(--accent-ink,#fff)}
+:root[data-theme="light"] .gtag.now{color:#fff;background:var(--accent-fill,var(--accent,var(--s1)))}
 .gtag.ready{border:1px dashed var(--ink-2);color:var(--ink-2)}
 .gtag.done{background:color-mix(in srgb,var(--good) 18%,transparent);color:var(--good-ink)}
 .gtag.merge{background:color-mix(in srgb,var(--warning) 28%,transparent);color:var(--ink)}

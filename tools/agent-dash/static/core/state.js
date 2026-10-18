@@ -257,9 +257,9 @@
       if (w.muted) titles.push("Shown although the filter hides it: this tab is selected.");
       if (!overview && ADT.isCompleted(w.progress)) titles.push(ADT.completeTitle(w.progress));
       if (!overview && (w.state || "active") === "paused") titles.push("\u23F8 Paused: " + w.name);
-      var attrs = {class: "tab" + (w.muted ? " muted" : ""), role: "tab", "data-ws": w.ws, "aria-selected": String(state.ws === w.ws), onclick: function () { if (Date.now() < tabClickGuard) return; selectTab(w.ws); }};
-      if (titles.length) attrs.title = titles.join(" ");
-      var b = el("button", attrs, [w.name]);
+      var attrs = {class: "tab" + (w.muted ? " muted" : ""), role: "tab", "data-ws": w.ws, "aria-selected": String(state.ws === w.ws), title: w.name, onclick: function () { if (Date.now() < tabClickGuard) return; selectTab(w.ws); }};
+      if (titles.length) attrs.title = w.name + " — " + titles.join(" ");
+      var b = el("button", attrs, [el("span", {class: "tab-name", text: w.name})]);
       if (w.running) b.appendChild(el("span", {class: "c", text: w.running + " live"}));
       if (!overview && ADT.isCompleted(w.progress)) b.appendChild(el("span", {class: "tick", text: "\u2713"}));
       if (!overview && (w.state || "active") === "paused") b.appendChild(el("span", {class: "tick pause", text: "\u23F8", title: "\u23F8 Paused"}));
@@ -277,6 +277,17 @@
     if (!nWs) t.appendChild(el("span", {class: "tabs-empty", text: tabFilter === "completed" ? "No completed workstreams" : tabFilter === "active" ? "No active workstreams" : "No workstreams"}));
     t.appendChild(filterCtl(counts));
     updateViewNav();
+    /* Keep the selected tab in view: the strip scrolls internally, so
+       without this a narrow viewport can strand the active tab offscreen.
+       Moves the strip only, never the page. */
+    try {
+      var active = t.querySelector(".tab[aria-selected=\"true\"]");
+      if (active) {
+        var r = active.getBoundingClientRect(), tr = t.getBoundingClientRect();
+        if (r.left < tr.left) t.scrollLeft -= (tr.left - r.left);
+        else if (r.right > tr.right) t.scrollLeft += (r.right - tr.right);
+      }
+    } catch (e) {}
   }
   /* Header nav pills (Project | Current | Planned | Archive) beside the
      Plan | Execution switch. Planned and Archive carry their counts from

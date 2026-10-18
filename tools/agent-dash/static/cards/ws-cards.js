@@ -210,7 +210,15 @@
   function wsCard(id, name, live, tokens, cost, pr, clickable) {
     var pc = (pr && pr.counts) || {}, tot = (pr && pr.total) || 0, pct = (pr && pr.pct) || 0, done = (pr && pr.done) || 0;
     var attrs = {class: "card wsc", "data-wsc": id, "data-ws": "all", "data-hours": "24", "data-tokens": String(tokens || 0), "data-cost-usd": String(cost || 0)};
-    if (clickable) attrs.onclick = function () { go(id); };
+    if (clickable) {
+      attrs.role = "button";
+      attrs.tabindex = "0";
+      attrs["aria-label"] = "Open the " + id + " execution tab";
+      attrs.onclick = function () { go(id); };
+      attrs.onkeydown = function (ev) {
+        if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); go(id); }
+      };
+    }
     var card = el("div", attrs);
     var top = el("div", {class: "top"}, [el("span", {class: "id", text: id}), el("span", {class: "st " + (live ? "running" : "done")}, [el("i"), live ? live + " running" : "idle"])]);
     card.appendChild(top); card.appendChild(el("div", {class: "wsc-name", text: name || ""}));

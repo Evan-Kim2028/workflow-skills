@@ -1991,5 +1991,177 @@ setTimeout(function () {
         self.assertIn("project switcher proof ok", proc.stdout)
 
 
+def _lum(hex6):
+    h = hex6.lstrip("#")
+    r, g, b = (int(h[i:i + 2], 16) / 255 for i in (0, 2, 4))
+
+    def f(c):
+        return c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4
+
+    return 0.2126 * f(r) + 0.7152 * f(g) + 0.0722 * f(b)
+
+
+def _ratio(a, b):
+    x, y = _lum(a), _lum(b)
+    return (max(x, y) + 0.05) / (min(x, y) + 0.05)
+
+
+class FinalPolishTests(unittest.TestCase):
+    """Live-review polish: no page warnings, keyboard-operable cards,
+    takeaway chart labels, phone containment, AA muted contrast."""
+
+    def test_footer_carries_no_reconcile_or_warning(self):
+        api = (STATIC / "core" / "api.js").read_text()
+        self.assertNotIn('api("/api/reconcile"', api)
+        self.assertNotIn("Numbers reconcile", api)
+        self.assertNotIn("mismatches", api)
+        self.assertIn("read-only, 127.0.0.1", api)
+
+    def test_slot_key_folds_in_the_entry_key(self):
+        for name in ("cards/project-home.js", "cards/planned.js"):
+            text = (STATIC / name).read_text()
+            self.assertIn("innerKey", text, f"{name} slotSection lost its inner key")
+
+    def test_clickable_cards_are_keyboard_buttons(self):
+        wsc = (STATIC / "cards" / "ws-cards.js").read_text()
+        for needle in ('attrs.role = "button"', 'attrs.tabindex = "0"', 'attrs["aria-label"]', "attrs.onkeydown"):
+            self.assertIn(needle, wsc, f"ws-cards.js lost {needle}")
+        prog = (STATIC / "cards" / "plan-progress.js").read_text()
+        for needle in ('"role", "button"', '"tabindex", "0"', '"aria-label"', '"keydown"', "chipActivate"):
+            self.assertIn(needle, prog, f"plan-progress.js lost {needle}")
+        road = (STATIC / "cards" / "roadmap.js").read_text()
+        for needle in ('role: "button"', 'tabindex: "0"', '"aria-label"', '"keydown"'):
+            self.assertIn(needle, road, f"roadmap.js lost {needle}")
+        tl = (STATIC / "cards" / "timeline.js").read_text()
+        for needle in ('role: "button"', 'tabindex: "0"', '"aria-label"', '"keydown"'):
+            self.assertIn(needle, tl, f"timeline.js lost {needle}")
+
+    def test_switcher_row_enter_reaches_copy(self):
+        core = (STATIC / "core" / "project.js").read_text()
+        self.assertIn("copy.focus()", core)
+
+    def test_reduced_motion_and_visible_focus(self):
+        page = (STATIC / "index.html").read_text()
+        self.assertIn("prefers-reduced-motion", page)
+        self.assertIn(":focus-visible", page)
+        core = "\n".join(_core_scripts()) + "\n" + (STATIC / "cards" / "plan-progress.js").read_text()
+        self.assertIn("matchMedia", core)
+        self.assertIn("RP_REDUCED", core)
+
+    def test_svg_charts_name_the_takeaway(self):
+        tok = (STATIC / "cards" / "token-chart.js").read_text()
+        self.assertIn('role: "img"', tok)
+        self.assertIn("total, peak", tok)
+        burn = (STATIC / "cards" / "burnup.js").read_text()
+        self.assertIn('"aria-label": label', burn)
+        self.assertIn("recorded", burn)
+        self.assertIn("total, peak", burn)
+        road = (STATIC / "cards" / "roadmap.js").read_text()
+        self.assertIn("lanes,", road)
+        tl = (STATIC / "cards" / "timeline.js").read_text()
+        self.assertIn('"aria-label": "Agent runs over the last 24 hours', tl)
+        self.assertIn("died or blocked, ", tl)
+        dep = (STATIC / "cards" / "depgraph.js").read_text()
+        self.assertIn("workstreams, ", dep)
+
+    def test_dep_graph_does_not_upscale_single_node(self):
+        dep = (STATIC / "cards" / "depgraph.js").read_text()
+        self.assertIn("maxWidth", dep)
+
+    def test_muted_contrast_meets_aa(self):
+        css = (STATIC / "tokens.css").read_text()
+
+        def var(block, name):
+            m = re.search(block + r"\s*\{([^}]*)\}", css, re.S)
+            self.assertIsNotNone(m, f"tokens.css lost {block}")
+            m2 = re.search(re.escape(name) + r":\s*(#[0-9a-fA-F]{6})", m.group(1))
+            self.assertIsNotNone(m2, f"tokens.css lost {name} in {block}")
+            return m2.group(1)
+
+        dark = _ratio(var(r":root", "--muted"), var(r":root", "--card"))
+        light = _ratio(var(r':root\[data-theme="light"\]', "--muted"), var(r':root\[data-theme="light"\]', "--card"))
+        self.assertGreaterEqual(dark, 4.5, f"dark muted contrast {dark:.2f}")
+        self.assertGreaterEqual(light, 4.5, f"light muted contrast {light:.2f}")
+
+    def test_accent_text_never_sits_on_accent_fill(self):
+        css = (STATIC / "cards" / "plan-progress.css").read_text()
+        self.assertIn("--accent-ink", css)
+        self.assertIn("--accent-fill", css)
+        self.assertNotIn("background:var(--s1);color:#fff", css)
+
+    def test_tab_strip_stays_in_its_lane(self):
+        page = (STATIC / "index.html").read_text()
+        self.assertIn(".tab .tab-name", page)
+        self.assertIn("text-overflow:ellipsis", page)
+        state = (STATIC / "core" / "state.js").read_text()
+        self.assertIn("tab-name", state)
+        self.assertIn("scrollLeft", state)
+
+    def test_phone_hides_the_dock_rail(self):
+        css = (STATIC / "tokens.css").read_text()
+        self.assertIn("@media (max-width: 700px)", css)
+        self.assertIn(".sidenav:not(.is-open)", css)
+        self.assertIn(".sidenav.is-open", css)
+
+    def test_phone_tiles_keep_their_words(self):
+        css = (STATIC / "cards" / "tiles.css").read_text()
+        self.assertIn(".tile .delta .w{white-space:nowrap}", css)
+        self.assertIn(".tile .xline{-webkit-line-clamp:3}", css)
+
+    def test_burnup_legend_skips_zero_series(self):
+        burn = (STATIC / "cards" / "burnup.js").read_text()
+        self.assertIn("if (!v) return;", burn)
+
+    def test_quiet_tabs_state_idleness_plainly(self):
+        live = (STATIC / "cards" / "live-chart.js").read_text()
+        self.assertIn("No live agents in this window.", live)
+        tiles = (STATIC / "cards" / "tiles.js").read_text()
+        self.assertIn("(passN + part + bad)", tiles)
+
+    def test_roadmap_badge_names_blockers(self):
+        road = (STATIC / "cards" / "roadmap.js").read_text()
+        self.assertIn("blockers.join", road)
+        self.assertIn('"waits on " + blockers', road)
+
+    def test_planned_cards_state_the_wait_once(self):
+        home = (STATIC / "cards" / "project-home.js").read_text()
+        self.assertNotIn("pj-wait", home)
+
+    def test_untitled_decisions_show_no_dash(self):
+        dec = (STATIC / "cards" / "decisions.js").read_text()
+        self.assertIn('titleText !== "-"', dec)
+
+    def test_unplanned_lines_separate_name_and_count(self):
+        home = (STATIC / "cards" / "project-home.js").read_text()
+        self.assertIn('" · " + sub', home)
+
+    def test_plan_mono_wraps(self):
+        css = (STATIC / "plan.css").read_text()
+        self.assertIn(".plan-view .mono", css)
+        self.assertIn("overflow-wrap: anywhere", css)
+
+    def test_fmt_durations_never_print_sixty(self):
+        harness = (
+            "const fs = require('fs');\n"
+            "const assert = require('assert');\n"
+            "var window = {};\n"
+            "eval(fs.readFileSync(process.argv[2], 'utf8'));\n"
+            "assert.strictEqual(window.AD.fmtDur(90), '1m 30s');\n"
+            "assert.strictEqual(window.AD.fmtDur(579599), '160h 59m');\n"
+            "assert.strictEqual(window.AD.fmtDur(359.6), '5m 59s');\n"
+            "console.log('fmtDur proof ok');\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            harness_path = Path(tmp) / "fmtdur.js"
+            harness_path.write_text(harness, encoding="utf-8")
+            proc = subprocess.run(
+                ["node", str(harness_path), str(STATIC / "format.js")],
+                capture_output=True,
+                text=True,
+            )
+        self.assertEqual(proc.returncode, 0, proc.stderr or proc.stdout)
+        self.assertIn("fmtDur proof ok", proc.stdout)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -435,9 +435,12 @@
     var layout = depLayout(graph, {width: Math.min(w, 1400), showArch: depShowArch});
     var body = el("div", {class: "dep-body"});
     var svg = s("svg", {viewBox: "0 0 " + layout.width + " " + layout.height, class: "dep-svg",
-      role: "img", "aria-label": "Cross-workstream dependency graph", "data-diagram": "depgraph"});
+      role: "img", "aria-label": "Cross-workstream dependency graph: " + (graph.nodes || []).length + " workstreams, " + counts.met + " dependencies met, " + counts.waiting + " waiting, " + counts.stale + " stale", "data-diagram": "depgraph"});
     svg.style.width = "100%";
     svg.style.height = "auto";
+    /* A nearly empty graph (a new dashboard with one workstream) keeps its
+       natural node size instead of scaling one node to the full width. */
+    svg.style.maxWidth = layout.width + "px";
     var panel = el("aside", {class: "dep-panel", "aria-live": "polite"});
     depDrawEdges(svg, layout, depTitles());
     depDrawNodes(svg, layout, panel);

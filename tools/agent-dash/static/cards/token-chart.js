@@ -75,6 +75,8 @@
     var peakT = -1;
     ts.forEach(function (t) { if (tots[t] > (tots[peakT] || 0)) peakT = t; });
     var top3 = ts.slice().sort(function (a, b) { return tots[b] - tots[a]; }).slice(0, 3);
+    /* Name the takeaway for screen readers: window total and peak hour. */
+    if (peakT >= 0) svg.setAttribute("aria-label", "Tokens per hour stacked by " + state.groupBy + ": " + fmtN(showTotal) + " total, peak " + fmtN(tots[peakT]) + " at " + fmtT(peakT));
     ts.forEach(function (t) {
       var x = L + Math.max(0, Math.floor((t - h0) / 3600)) * slot + (slot - bw) / 2, y0 = T + ph;
       var order = [];

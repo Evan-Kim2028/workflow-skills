@@ -21,6 +21,9 @@
     var fams = ["claude", "cursor", "muse", "glm"];
     function famKeys(f) { return all.filter(function (k) { return ADM.famOf(k) === f; }); }
     function tipRows(p) { var m = mods(p), rows = []; fams.forEach(function (f) { var ks = famKeys(f), tot = ks.reduce(function (a, k) { return a + (m[k] || 0); }, 0); rows.push({k: ADM.FAM[f].name, v: String(tot), c: ADM.famColor(f)}); ks.forEach(function (k) { if (m[k]) rows.push({k: "\u2003" + ADM.nameOf(k), v: String(m[k]), c: ADM.colorOf(k)}); }); }); return rows; }
+    /* Four flat strips say nothing; one honest line does. */
+    var anyPeak = fams.some(function (f) { var ks = famKeys(f); return P.some(function (p) { var m = mods(p); return ks.some(function (k) { return m[k]; }); }); });
+    if (!anyPeak) { c.appendChild(el("div", {class: "empty", text: "No live agents in this window."})); return c; }
     fams.forEach(function (f, fi) {
       var ks = famKeys(f), last = fi === fams.length - 1;
       var series = P.map(function (p) { var m = mods(p), sum = 0; ks.forEach(function (k) { sum += m[k] || 0; }); return sum; });

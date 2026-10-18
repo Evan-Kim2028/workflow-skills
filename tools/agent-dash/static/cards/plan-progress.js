@@ -201,9 +201,24 @@
         if (tUp[t.id]) cp.title += "\nWaits on: " + tUp[t.id].map(fmtDep(t.id)).join(", ");
         if (tDown[t.id]) cp.title += "\nUnblocks: " + tDown[t.id].map(function (d) { return d + " " + (tTitle[d] || ""); }).join(", ");
       }
-      if (rs.length) { var b = el("span", {class: "ag", text: String(rs.length)}); b.style.background = colorOf(tierKey(rs[0])); cp.appendChild(b); cp.style.cursor = "pointer"; cp.addEventListener("click", function () { openRun(rs[0]); }); }
-      else if (hasTaskDeps) { cp.style.cursor = "pointer"; cp.addEventListener("click", function (ev) { ev.stopPropagation(); pinned = pinned === t.id ? null : t.id; if (pinned) focusTask(t.id); else { clearTask(); groupEnter(g.id); } }); }
-      if (hasTaskDeps) { cp.addEventListener("mouseenter", function () { focusTask(t.id); }); cp.addEventListener("mouseleave", function () { if (pinned) focusTask(pinned); else { clearTask(); groupEnter(g.id); } }); }
+      /* Clickable chips are keyboard-operable buttons with the tooltip as
+         their accessible name; focus traces edges exactly like hover. */
+      function chipActivate(ev) {
+        if (rs.length) { openRun(rs[0]); return; }
+        if (ev) ev.stopPropagation();
+        pinned = pinned === t.id ? null : t.id;
+        if (pinned) focusTask(t.id); else { clearTask(); groupEnter(g.id); }
+      }
+      if (rs.length) { var b = el("span", {class: "ag", text: String(rs.length)}); b.style.borderColor = colorOf(tierKey(rs[0])); cp.appendChild(b); }
+      if (rs.length || hasTaskDeps) {
+        cp.setAttribute("role", "button");
+        cp.setAttribute("tabindex", "0");
+        cp.setAttribute("aria-label", tip);
+        cp.style.cursor = "pointer";
+        cp.addEventListener("click", function (ev) { chipActivate(ev); });
+        cp.addEventListener("keydown", function (ev) { if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); chipActivate(ev); } });
+      }
+      if (hasTaskDeps) { cp.addEventListener("mouseenter", function () { focusTask(t.id); }); cp.addEventListener("mouseleave", function () { if (pinned) focusTask(pinned); else { clearTask(); groupEnter(g.id); } }); cp.addEventListener("focus", function () { focusTask(t.id); }); cp.addEventListener("blur", function () { if (pinned) focusTask(pinned); else { clearTask(); groupEnter(g.id); } }); }
       return cp;
     }
     /* In-place expander for folded chips ("+N done", "↷N deferred"): the

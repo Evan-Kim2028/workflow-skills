@@ -145,20 +145,12 @@
       });
     }).catch(function () { if (gen === execGen && isProjectView()) { showSnapError("all"); setLive(false); } });
   }
-  /* Muted footer line: the reconcile check for the fixed 24 h window. Status color always ships with a word and symbol. */
+  /* Muted footer line: the refresh time only. Reconcile and doctor output
+     stay in the CLI and the API by owner decision, never on the page. */
   function refreshFoot() {
     var foot = document.getElementById("foot");
     if (!foot || state.view !== "exec" || state.ws !== "all") return;
-    api("/api/reconcile", {hours: WINDOW_HOURS}).then(function (j) {
-      if (state.view !== "exec" || state.ws !== "all") return;
-      var bad = (j.mismatches || [])[0], n = (j.rows || []).length;
-      var base = "Updated " + new Date().toLocaleTimeString() + (FIX ? " · fixture data" : "") + " · read-only, 127.0.0.1";
-      foot.textContent = "";
-      foot.appendChild(document.createTextNode(base + " · "));
-      var mark = el("span", {text: bad ? "\u2717 " + bad : "\u2713 Numbers reconcile across " + n + " workstreams"});
-      mark.setAttribute("style", "color:" + (bad ? "var(--critical)" : "var(--good)"));
-      foot.appendChild(mark);
-    }).catch(function () {});
+    foot.textContent = "Updated " + new Date().toLocaleTimeString() + (FIX ? " · fixture data" : "") + " · read-only, 127.0.0.1";
   }
   /* Warm every other tab's Execution data in the background, one tab at a time, so a first switch draws from cache instantly. Entries are keyed by tab and group (one fixed 24 h window) with the window captured up front, and fresh entries are not refetched. */
   var warming = false;

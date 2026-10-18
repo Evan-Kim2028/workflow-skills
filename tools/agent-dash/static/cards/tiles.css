@@ -15,6 +15,11 @@
 @media (max-width:700px){
   .tile .v{font-size:26px}
   .tile .delta{white-space:normal}
+  /* Break between the value and the qualifier only, never mid-phrase. */
+  .tile .delta .w{white-space:nowrap}
+  /* Narrow tiles stack tertiary lines; keep the third line instead of
+     cutting the blocked count. */
+  .tile .xline{-webkit-line-clamp:3}
 }
 @media (prefers-reduced-motion:reduce){
   .tile .delta{transition:none}

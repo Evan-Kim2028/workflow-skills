@@ -85,8 +85,11 @@
     var grand = 0;
     keys.forEach(function (ws) { grand += totalOf(ws); });
     lg.appendChild(el("span", {class: "ltotal", "data-legend-total": String(grand), "data-chart-sum": String(grand), title: "Project total for this panel in " + unit}, [el("b", {text: "Total " + fmt(grand)})]));
+    /* Flat-zero series are not listed: they draw nothing, and with many
+       workstreams they bury the series that moved. The Total covers them. */
     keys.forEach(function (ws) {
       var v = totalOf(ws);
+      if (!v) return;
       var off = !!burnupHidden[ws];
       var sp = el("span", {class: "lentry" + (off ? " off" : ""), "data-key": ws, "data-v": String(v), role: "button", tabindex: "0", "aria-pressed": String(!off), title: ws + " " + v + " " + unit + " — activate to " + (off ? "show" : "hide")});
       var flip = function () { if (burnupHidden[ws]) delete burnupHidden[ws]; else burnupHidden[ws] = 1; burnupRedraw(); };
@@ -151,7 +154,8 @@
     proj.forEach(function (v) { if (v > peak) peak = v; });
     var nice = niceMax(peak);
     var f = burnupFrame(days);
-    var svg = burnupSvg(f.W, f.H, "Tasks done cumulative per day with plan total");
+    var doneNow = proj.length ? proj[proj.length - 1] : 0;
+    var svg = burnupSvg(f.W, f.H, "Tasks done cumulative per day with plan total: " + doneNow + " of " + planTotal + " recorded");
     var Y = function (v) { return f.T + f.ph - v / nice * f.ph; };
     /* Gap band: the UTC days before the first recorded move. Undated
        work is named under the chart, never drawn as data. */
@@ -256,6 +260,8 @@
     var nice = niceMax(max);
     var f = burnupFrame(days);
     var svg = burnupSvg(f.W, f.H, (kind === "cost" ? "Cost" : "Tokens") + " burned per day stacked by workstream");
+    var grandStack = 0; days.forEach(function (t) { grandStack += tots[t] || 0; });
+    svg.setAttribute("aria-label", (kind === "cost" ? "Cost" : "Tokens") + " burned per day stacked by workstream: " + fmt(grandStack) + " total, peak " + fmt(max) + " in a day");
     var Y = function (v) { return f.T + f.ph - v / nice * f.ph; };
     var GAP = 2, RAD = 5;
     var bw = Math.max(3, Math.min(28, f.slot - 4));

@@ -286,7 +286,8 @@
       yy += laneH;
     });
     var plotB = yy - 6, H = Math.ceil(plotB + 34);
-    var svg = s("svg", {viewBox: "0 0 " + W + " " + H, width: W, height: H, style: "display:block;max-width:100%", role: "img", "aria-label": "Project roadmap: one lane per workstream over time"});
+    var nBlocked = order.filter(function (id) { return (byId[id].blocked_by || []).length; }).length;
+    var svg = s("svg", {viewBox: "0 0 " + W + " " + H, width: W, height: H, style: "display:block;max-width:100%", role: "img", "aria-label": "Project roadmap: one lane per workstream over time: " + order.length + " lanes, " + nBlocked + " waiting on dependencies"});
     svg.setAttribute("data-road-lanes", String(order.length));
     var gap = narrow ? 44 : 64;
     var ticks = timeTicks(t0, t1, X, 6, {minGap: gap});
@@ -315,15 +316,30 @@
       slab.textContent = st.mark + " " + st.word;
       svg.appendChild(slab);
       if (lane.state === "planned" && (lane.blocked_by || []).length) {
-        var badge = s("text", {x: 0, y: ly + 26, class: "road-waits", dx: String((st.mark + " " + st.word).length * 6.4 + 8)});
-        badge.textContent = "waits on " + lane.blocked_by.length;
+        /* Name the blockers in the label (up to two, then a counted
+           remainder) instead of a bare count; the full list rides along in
+           the tooltip and the accessible name. */
+        var blockers = lane.blocked_by || [];
+        var badgeText = blockers.length <= 2 ? "waits on " + blockers.join(", ")
+          : "waits on " + blockers.slice(0, 2).join(", ") + " +" + (blockers.length - 2) + " more";
+        var badge = s("text", {x: 0, y: ly + 26, class: "road-waits", dx: String((st.mark + " " + st.word).length * 6.4 + 8), tabindex: "0", role: "button", "aria-label": "Trace " + laneTitle(lane) + " dependencies, waiting on " + blockers.join(", ")});
+        badge.textContent = badgeText;
         badge.style.cursor = "pointer";
         badge.addEventListener("mousemove", function (ev) { showTip(ev, laneTitle(lane), laneTip(lane)); });
         badge.addEventListener("mouseleave", hideTip);
+        badge.addEventListener("focus", function () { focusLane(lane.id); });
+        badge.addEventListener("blur", function () { if (roadPinned !== lane.id) clearLane(); });
         badge.addEventListener("click", function (ev) {
           ev.stopPropagation();
           if (roadPinned === lane.id) { roadPinned = null; clearLane(); }
           else { roadPinned = lane.id; focusLane(lane.id); }
+        });
+        badge.addEventListener("keydown", function (ev) {
+          if (ev.key === "Enter" || ev.key === " ") {
+            ev.preventDefault(); ev.stopPropagation();
+            if (roadPinned === lane.id) { roadPinned = null; clearLane(); }
+            else { roadPinned = lane.id; focusLane(lane.id); }
+          }
         });
         svg.appendChild(badge);
       }

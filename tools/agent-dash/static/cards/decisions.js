@@ -106,9 +106,14 @@
   function decRow(row) {
     var line = el("li", {class: "dc-row"});
     var top = el("div", {class: "dc-top"});
-    var title = el("b", {class: "dc-title", text: (row && row.title) || (row && row.id) || "Decision"});
-    title.title = (row && row.id) || "";
-    top.appendChild(title);
+    /* An untitled decision (the hub records id "-") shows no title at
+       all: a bare dash reads as broken, and the pill plus date carry it. */
+    var titleText = (row && row.title) || ("" + ((row && row.id) || ""));
+    if (titleText && titleText !== "-") {
+      var title = el("b", {class: "dc-title", text: titleText});
+      title.title = (row && row.id) || "";
+      top.appendChild(title);
+    }
     var pill = decisionPill(row && row.status);
     top.appendChild(el("span", {class: pill.cls, text: pill.text, title: String((row && row.status) || "unknown")}));
     line.appendChild(top);

@@ -304,7 +304,9 @@
     if (cn.prod_jobs_finished) jobBits.push(fmtN(cn.prod_jobs_finished) + " prod jobs ran");
     if (jobBits.length) liveLines.push(jobBits.join(" · "));
     var bad = (fv.BLOCKED || 0) + (fv.REQUEST_CHANGES || 0), part = (fv.PARTIAL || 0) + (fv.APPROVE_WITH_CHANGES || 0);
-    var finLines = ["✓ " + fmtN((fv.PASS || 0) + (fv.APPROVE || 0) + (fv.APPROVE_WITH_NITS || 0)) + " pass · ◐ " + fmtN(part) + " partial · ✕ " + fmtN(bad) + " blocked (24 h)"];
+    var passN = (fv.PASS || 0) + (fv.APPROVE || 0) + (fv.APPROVE_WITH_NITS || 0);
+    /* No verdicts recorded means no verdict line, not a row of zeros. */
+    var finLines = (passN + part + bad) ? ["✓ " + fmtN(passN) + " pass · ◐ " + fmtN(part) + " partial · ✕ " + fmtN(bad) + " blocked (24 h)"] : [];
     var tokVal = allTok ? fmtN(allTok) : "0 in 24 h";
     var tokLines = allTok
       ? [cachedPct(tk) + "% cached · out " + fmtN(tk.output || 0), fmtN(allTimeTok) + " all time"]

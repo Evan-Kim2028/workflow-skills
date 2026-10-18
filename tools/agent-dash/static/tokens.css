@@ -431,3 +431,24 @@ html.dock-hidden .dock-mode { width: 18px; height: 56px; margin: 0; border: 0; b
 @media (prefers-reduced-motion: reduce) { .sidenav, .sidenav a::before { transition: none; } }
 html.dock-compact .sidenav:not(:hover):not(:focus-within) a { box-shadow: none; }
 html.dock-compact .sidenav:not(:hover):not(:focus-within) a.is-sub { display: none; }
+/* Phone: the floating rail would cover content, so the dock stays shut
+   until the Sections button opens it as an overlay. */
+@media (max-width: 700px) {
+  html.dock-compact .sidenav:not(.is-open),
+  html.dock-pinned .sidenav:not(.is-open),
+  html.dock-hidden .sidenav:not(.is-open),
+  html #dock-hot { display: none; }
+  html.dock-compact .sidenav.is-open,
+  html.dock-pinned .sidenav.is-open,
+  html.dock-hidden .sidenav.is-open {
+    display: flex; position: fixed; left: 0; top: 0; bottom: 0; z-index: 55;
+    width: min(280px, calc(100vw - 24px)); max-height: none; margin: 0;
+    border-radius: 0 12px 12px 0; transform: none;
+  }
+  html.dock-compact .sidenav.is-open a { color: var(--ink-2); }
+  html.dock-compact .sidenav.is-open a.is-sub { display: flex; }
+  html.dock-compact .sidenav.is-open .sidenav-list,
+  html.dock-compact .sidenav.is-open .sidenav-current,
+  html.dock-hidden .sidenav.is-open .sidenav-list { display: block; }
+  html.dock-hidden .sidenav.is-open .dock-mode { width: 30px; height: 26px; margin: 4px auto 8px; border: 1px solid var(--ring); border-radius: 9px; background: var(--surface-2); font-size: 13px; }
+}

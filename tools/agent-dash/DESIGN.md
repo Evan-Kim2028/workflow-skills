@@ -55,3 +55,12 @@ The dashboard is read by a visual thinker. Every view answers its question with 
 - Production jobs (source `dagster`) are never in agent lists; they are a count: the live tile shows `N prod jobs` / `N prod jobs ran`.
 - `?fixtures` loads `../fixtures/*.json` for offline design work.
 - No health or warning cards on the page; doctor is CLI and API only. Read the problem list with `agent_dash.py doctor` or `GET /api/doctor`.
+
+## Accessibility and phone
+
+- Every interactive element is a real button or link with an accessible name. Clickable cards use role button with tabindex 0 and Enter/Space handling; no clickable div without role and tabindex (`tests/test_page_rules.py` pins this).
+- Keyboard focus is visible and tab order follows the page. The project switcher and copy-command buttons work with Enter and Space.
+- Charts carry a text takeaway: an aria-label on the svg plus a sentence naming the main takeaway; tooltips open on focus as well as hover.
+- State is never color alone: every status ships a glyph plus a word (✓ Done, ⧗ waits, ⇡ on prod, ◇ gate unmet).
+- Muted body text meets 4.5:1 on both themes (a computed-contrast test over `tokens.css` pins this). `prefers-reduced-motion` disables pulses and blinking.
+- At 390 px no view scrolls the page sideways in either theme: the topbar wraps, the tab strip scrolls internally and keeps the selected tab in view, tables scroll inside their own container.

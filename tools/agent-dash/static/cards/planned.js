@@ -199,8 +199,18 @@
     return c;
   }
 
+  /* The slot key folds in the entry's own spec key (loading, failed, or
+     data state); otherwise a card whose data lands after the slot mounts
+     never rebuilds on its own completion redraw. Mirrors project-home. */
   function slotSection(id, entry) {
-    return [id, keyOf([id, entry ? entry.id : null, state.seq]), function () {
+    function innerKey() {
+      if (!entry) return null;
+      try {
+        var sp = entry.spec(state, state.snap || {});
+        return (sp && sp[1] !== undefined) ? sp[1] : null;
+      } catch (e) { return null; }
+    }
+    return [id, keyOf([id, entry ? entry.id : null, state.seq, innerKey()]), function () {
       var host = el("div", {class: "pj-slot", id: id, "data-slot": id});
       if (entry) {
         var sp = entry.spec(state, state.snap || {});

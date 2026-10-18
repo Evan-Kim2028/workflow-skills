@@ -92,11 +92,14 @@
       svg.appendChild(cell);
     });
     var label = famName(lane.fam) + " \u00B7 " + lane.runs.length + " runs (dense)";
-    var hit = s("rect", {x: L, y: y, width: pw, height: h, fill: "transparent", class: "tl-dense-hit", "data-lane": lane.fam});
+    var hit = s("rect", {x: L, y: y, width: pw, height: h, fill: "transparent", class: "tl-dense-hit", "data-lane": lane.fam, tabindex: "0", role: "button", "aria-label": label + ". Activate to open one row per model."});
     hit.style.cursor = "pointer";
     hit.addEventListener("mousemove", function (ev) { showTip(ev, label, [{k: "peak slice", v: fmtN(mx) + " overlapping"}, {k: "hint", v: "click the lane to open one row per model"}]); });
     hit.addEventListener("mouseleave", hideTip);
+    hit.addEventListener("focus", function () { var r = hit.getBoundingClientRect(); showTip({clientX: r.left + 16, clientY: r.top}, label, [{k: "peak slice", v: fmtN(mx) + " overlapping"}, {k: "hint", v: "activate the lane to open one row per model"}]); });
+    hit.addEventListener("blur", hideTip);
     hit.addEventListener("click", function () { expanded[lane.fam] = !expanded[lane.fam]; drawMain(); });
+    hit.addEventListener("keydown", function (ev) { if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); expanded[lane.fam] = !expanded[lane.fam]; drawMain(); } });
     svg.appendChild(hit);
   }
   function gantt() {
@@ -137,7 +140,9 @@
     var stripY = 12, yy = stripY + stripH + 14;
     lanes.forEach(function (lane) { lane.y = yy; yy += 22 + lane.h + 10; });
     var plotB = yy - 10, H = Math.ceil(plotB + 32);
-    var svg = s("svg", {viewBox: "0 0 " + W + " " + H, width: W, height: H, style: "display:block;max-width:100%", role: "img", "aria-label": "Agent runs over the last 24 hours, one lane per model family"});
+    var ocCount = {run: 0, ok: 0, part: 0, bad: 0, unk: 0};
+    R.forEach(function (r) { ocCount[outcomeOf(r)]++; });
+    var svg = s("svg", {viewBox: "0 0 " + W + " " + H, width: W, height: H, style: "display:block;max-width:100%", role: "img", "aria-label": "Agent runs over the last 24 hours, one lane per model family: " + R.length + " runs, " + ocCount.ok + " finished, " + ocCount.part + " partial, " + ocCount.bad + " died or blocked, " + ocCount.run + " running"});
     var defs = s("defs", {}); var pat = s("pattern", {id: "hatch", width: 6, height: 6, patternUnits: "userSpaceOnUse", patternTransform: "rotate(45)"}); pat.appendChild(s("rect", {width: 6, height: 6, fill: "var(--surface-2)"})); pat.appendChild(s("line", {x1: 0, y1: 0, x2: 0, y2: 6, stroke: "var(--muted)", "stroke-width": 2})); defs.appendChild(pat); svg.appendChild(defs);
     var gTicks = timeTicks(t0, now, X, 6); gTicks.forEach(function (k) { svg.appendChild(s("line", {x1: k.x, x2: k.x, y1: T, y2: plotB, class: "gl"})); });
     /* Agents-at-once strip on top. */
@@ -167,9 +172,11 @@
       var lab = s("text", {x: 0, y: ly + 14, class: "tl-lane-label"});
       lab.textContent = (expanded[lane.fam] ? "\u25BE " : "\u25B8 ") + famName(lane.fam) + " \u00B7 " + lane.runs.length + " runs" + (lane.dense && !expanded[lane.fam] ? " (dense)" : "");
       svg.appendChild(lab);
-      var hitL = s("rect", {x: 0, y: ly, width: L - 6, height: 20, fill: "transparent", class: "tl-lane-hit", "data-lane": lane.fam});
+      var laneLabel = famName(lane.fam) + ", " + lane.runs.length + " runs, " + (expanded[lane.fam] ? "expanded" : "collapsed");
+      var hitL = s("rect", {x: 0, y: ly, width: L - 6, height: 20, fill: "transparent", class: "tl-lane-hit", "data-lane": lane.fam, tabindex: "0", role: "button", "aria-label": laneLabel + ". Activate to expand or collapse."});
       hitL.style.cursor = "pointer";
       hitL.addEventListener("click", (function (f) { return function () { expanded[f] = !expanded[f]; drawMain(); }; })(lane.fam));
+      hitL.addEventListener("keydown", (function (f) { return function (ev) { if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); expanded[f] = !expanded[f]; drawMain(); } }; })(lane.fam));
       svg.appendChild(hitL);
       if (expanded[lane.fam]) {
         lane.subs.forEach(function (sb) {
