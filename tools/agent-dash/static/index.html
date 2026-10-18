@@ -13,19 +13,7 @@
 <link rel="stylesheet" href="/static/cards/live-chart.css">
 <link rel="stylesheet" href="/static/cards/ws-cards.css">
 <link rel="stylesheet" href="/static/cards/tables.css">
-<script>
-/* Dark is the default: with no ?theme= and no saved viewer choice the page
-   sets data-theme="dark" before first paint, so there is no light flash.
-   The toggle and ?theme= keep working as before. */
-try {
-  var q = new URLSearchParams(location.search);
-  var theme = q.get("theme") || localStorage.getItem("agent-dash-theme");
-  if (theme !== "dark" && theme !== "light") theme = "dark";
-  document.documentElement.setAttribute("data-theme", theme);
-} catch (e) {
-  document.documentElement.setAttribute("data-theme", "dark");
-}
-</script>
+<script src="/static/core/theme.js"></script>
 <style>
 *{box-sizing:border-box}
 html{scroll-behavior:smooth}

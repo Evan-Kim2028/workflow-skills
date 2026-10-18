@@ -488,6 +488,7 @@ class DagsterTests(unittest.TestCase):
         self._feed([], [])
         with mock.patch("dash.sources.time.monotonic", side_effect=fake_clock):
             registry = Registry([dagster])
+            registry._born = NOW - 3600
             registry.tick(self.store, CFG, NOW, force=True)
             body = registry.health(NOW)
         entry = body["sources"][0]

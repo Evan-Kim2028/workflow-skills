@@ -634,8 +634,12 @@ def unseen_startup_ready(registry=None, health=None, now: float | None = None) -
     No unseen-worker problem is emitted for a worker unless the
     dashboard process is older than ``max(3x the slowest source
     interval, 90 s)`` AND every source has completed at least one poll
-    since start (the registry's :func:`has_completed_poll
-    <dash.sources.has_completed_poll>` / ``starting`` state). The
+    since start. This is the one shared startup definition,
+    :func:`startup_complete <dash.sources.startup_complete>` (built on
+    the registry's :func:`has_completed_poll
+    <dash.sources.has_completed_poll>`, :func:`startup_threshold_s
+    <dash.sources.startup_threshold_s>`, and ``START_GRACE_S``), also
+    used for the registry's ``starting`` state. The
     per-worker half (alive longer than 2 poll intervals) already lives
     in the store's unseen check; this is the dashboard-startup half.
     ``registry`` wins when present (server path); otherwise ``health``
@@ -645,13 +649,13 @@ def unseen_startup_ready(registry=None, health=None, now: float | None = None) -
     import time as _time
 
     now = float(now if now is not None else _time.time())
+    try:
+        from dash.sources import startup_complete
+    except Exception:
+        return False
     if registry is not None:
         try:
             sources = list(getattr(registry, "sources", None) or [])
-            slowest = max(
-                [float(getattr(item, "INTERVAL_S", 0) or 0) for item in sources]
-                or [0.0]
-            )
             born = float(getattr(registry, "_born", now))
             raw = getattr(registry, "state", None) or {}
             states = [item for item in raw.values() if isinstance(item, dict)]
@@ -662,15 +666,9 @@ def unseen_startup_ready(registry=None, health=None, now: float | None = None) -
         if not sources:
             return True
         try:
-            from dash.sources import has_completed_poll
+            return startup_complete(sources, states, born, now)
         except Exception:
             return False
-        try:
-            if any(not has_completed_poll(state) for state in states):
-                return False
-        except Exception:
-            return False
-        return (now - born) > max(3.0 * slowest, 90.0)
     if isinstance(health, dict):
         sources = health.get("sources")
         if not isinstance(sources, list):
@@ -678,12 +676,12 @@ def unseen_startup_ready(registry=None, health=None, now: float | None = None) -
         if not sources:
             return True
         try:
-            slowest = max(
-                [float(item.get("interval_s") or 0) for item in sources
-                 if isinstance(item, dict)] or [0.0]
-            )
+            intervals = [
+                float(item.get("interval_s") or 0) for item in sources
+                if isinstance(item, dict)
+            ]
         except (TypeError, ValueError):
-            slowest = 0.0
+            intervals = []
         stamps = [
             item.get("started_at") for item in sources
             if isinstance(item, dict) and item.get("started_at") is not None
@@ -694,12 +692,15 @@ def unseen_startup_ready(registry=None, health=None, now: float | None = None) -
             born = None
         if born is None:
             return False
-        for item in sources:
-            if not isinstance(item, dict):
-                continue
-            if item.get("last_poll") is None:
-                return False
-        return (now - born) > max(3.0 * slowest, 90.0)
+        try:
+            return startup_complete(
+                intervals,
+                [item for item in sources if isinstance(item, dict)],
+                born,
+                now,
+            )
+        except Exception:
+            return False
     return False
 
 
@@ -721,6 +722,10 @@ def _reconcile_problem(ctx, item: str) -> None:
     if item.startswith("unpriced model: "):
         return
     if item.startswith("source stalled: "):
+        # Same startup gate as unseen workers: a stall line from before the
+        # first full scan is the restart false positive, not a real stall.
+        if not unseen_startup_ready(ctx.registry, ctx.health, ctx.now):
+            return
         name = item[len("source stalled: "):].split(" (", 1)[0].strip()
         _add(
             ctx, "source-stalled", "critical", "global", None,

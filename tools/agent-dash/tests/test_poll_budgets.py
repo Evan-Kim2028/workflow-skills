@@ -102,6 +102,8 @@ class WatchdogTests(unittest.TestCase):
         store = MemStore()
         fast = _Fast()
         registry = Registry([fast])
+        # A mature dashboard (past the startup window): lag judges at once.
+        registry._born = NOW - 3600
         registry.tick(store, {}, NOW, force=True)
         self.assertEqual(registry.health(NOW + 1)["ok"], True)
         body = registry.health(NOW + 7)
@@ -196,7 +198,10 @@ class RestartGraceTests(unittest.TestCase):
             source.release.set()
             worker.join(10)
         self.assertFalse(worker.is_alive())
-        body = registry.health(born + 3)
+        # The first poll alone does not end startup (the process is still
+        # young): a second poll past max(3x interval, 90 s) reads ok.
+        registry.tick(store, {}, born + 95, force=True)
+        body = registry.health(born + 96)
         self.assertTrue(body["ok"])
         self.assertEqual(body["sources"][0]["state"], "ok")
 
@@ -245,12 +250,68 @@ class RestartGraceTests(unittest.TestCase):
         store = MemStore()
         fast = _Fast()
         registry = Registry([fast])
+        # Past the startup window so the slow state itself is visible.
+        registry._born = NOW - 3600
         registry.tick(store, {}, NOW, force=True)
         registry.state["fast"]["last_duration_s"] = 16.0
         body = registry.health(NOW + 1)
         self.assertTrue(body["ok"])
         self.assertEqual(body["sources"][0]["state"], "slow")
         self.assertEqual(body["slow_sources"], 1)
+
+
+class StartupFalsePositiveTests(unittest.TestCase):
+    """Restart false positive: a source that finishes its first scan early
+    must read "starting", not "stalled", while a slower source is still on
+    its first scan (the registry polls sequentially and lag counts from the
+    first completed poll)."""
+
+    class _SlowFirst:
+        NAME = "slow-first"
+        INTERVAL_S = 30
+
+    def _registry(self):
+        registry = Registry([_Fast(), self._SlowFirst()])
+        registry._born = NOW
+        return registry
+
+    def test_fast_source_is_starting_while_slow_scans(self):
+        registry = self._registry()
+        # Fast source polled at NOW + 1; the slow source never completed one.
+        registry.state["fast"].update(last_poll=NOW + 1, last_ok=NOW + 1)
+        # Lag (7 s) is past 3x the fast interval: without the startup gate
+        # this would already read stalled.
+        body = registry.health(NOW + 8)
+        self.assertTrue(body["ok"])
+        by_name = {entry["name"]: entry for entry in body["sources"]}
+        self.assertEqual(by_name["fast"]["state"], "starting")
+        self.assertFalse(by_name["fast"]["stalled"])
+        self.assertEqual(by_name["slow-first"]["state"], "starting")
+        self.assertFalse(by_name["slow-first"]["stalled"])
+        self.assertEqual(registry.stalled_messages(NOW + 8), [])
+
+    def test_ok_once_startup_is_complete(self):
+        registry = self._registry()
+        # Startup completes only past max(3x slowest interval, 90 s) with
+        # every source polled (90 s here): both poll again at NOW + 91.
+        registry.state["fast"].update(last_poll=NOW + 91, last_ok=NOW + 91)
+        registry.state["slow-first"].update(last_poll=NOW + 91, last_ok=NOW + 91)
+        body = registry.health(NOW + 92)
+        self.assertTrue(body["ok"])
+        by_name = {entry["name"]: entry for entry in body["sources"]}
+        self.assertEqual(by_name["fast"]["state"], "ok")
+        self.assertEqual(by_name["slow-first"]["state"], "ok")
+        self.assertEqual(registry.stalled_messages(NOW + 92), [])
+
+    def test_error_during_startup_is_error_not_starting(self):
+        registry = self._registry()
+        registry.state["fast"].update(last_poll=NOW + 1, last_ok=NOW + 1)
+        registry.state["slow-first"]["last_error"] = "RuntimeError: boom"
+        body = registry.health(NOW + 2)
+        self.assertFalse(body["ok"])
+        by_name = {entry["name"]: entry for entry in body["sources"]}
+        self.assertEqual(by_name["slow-first"]["state"], "error")
+        self.assertEqual(by_name["fast"]["state"], "starting")
 
 
 def _count_fresh_listings():

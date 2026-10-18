@@ -25,9 +25,12 @@
     return node;
   }
   function darkNow() {
+    /* Same rule as the shell (static/core/theme.js): an explicit choice wins,
+       otherwise dark. No prefers-color-scheme fallback. */
+    if (window.AdTheme && window.AdTheme.isDark) return window.AdTheme.isDark();
     var set = document.documentElement.getAttribute("data-theme");
     if (set) return set === "dark";
-    return window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches;
+    return true;
   }
   function fmtDur(seconds) {
     return AD.fmtDur(seconds);

@@ -136,13 +136,25 @@ class Registry:
         return rows
 
     def stalled_messages(self, now: float) -> list:
-        """One ``source stalled: <name> (last ok poll N s ago)`` per lagging source."""
+        """One ``source stalled: <name> (last ok poll N s ago)`` per lagging source.
+
+        Uses the same state as /api/health (:func:`source_state` with the
+        shared :func:`startup_complete` gate): no line while the source
+        reads ``starting``, so neither /api/reconcile nor the doctor sees
+        phantom stall lines after a restart.
+        """
         found = []
         with self._lock:
             items = [(source, dict(self.state.get(source.NAME) or {})) for source in self.sources]
             born = self._born
+        startup = not startup_complete(
+            [source for source, _ in items],
+            [state for _, state in items],
+            born,
+            now,
+        )
         for source, state in items:
-            if not _is_stalled(source, state, now, born):
+            if source_state(source, state, now, born, startup=startup) != "stalled":
                 continue
             ref = state.get("last_ok")
             if ref is None:
@@ -161,10 +173,16 @@ class Registry:
         with self._lock:
             items = [(source, dict(self.state.get(source.NAME) or {})) for source in self.sources]
             born = self._born
+        startup = not startup_complete(
+            [source for source, _ in items],
+            [state for _, state in items],
+            born,
+            now,
+        )
         for source, state in items:
             error = state.get("last_error")
             last = state.get("last_poll")
-            name = source_state(source, state, now, born)
+            name = source_state(source, state, now, born, startup=startup)
             stalled = name == "stalled"
             if name in ("error", "stalled"):
                 ok = False
@@ -248,11 +266,68 @@ def start_grace_s(source) -> float:
     return max(STALL_FACTOR * float(getattr(source, "INTERVAL_S", 0) or 0), START_GRACE_S)
 
 
-def source_state(source, state: dict, now: float, born: float) -> str:
+def _interval_s(source) -> float:
+    """A source's poll interval in seconds; plain numbers pass through so
+    health-dict callers (interval_s floats) can share this module's math."""
+    if isinstance(source, (int, float)):
+        try:
+            return float(source or 0)
+        except (TypeError, ValueError):
+            return 0.0
+    try:
+        return float(getattr(source, "INTERVAL_S", 0) or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def startup_threshold_s(sources) -> float:
+    """Seconds after process start before the first scan may be judged.
+
+    One shared definition (registry and doctor): ``max(3x the slowest
+    source interval, START_GRACE_S)``. Takes source modules or plain
+    interval seconds.
+    """
+    slowest = max(([_interval_s(source) for source in sources] or [0.0]))
+    return max(STALL_FACTOR * slowest, START_GRACE_S)
+
+
+def startup_complete(sources, states, born: float, now: float) -> bool:
+    """True once the process is past its first-scan window.
+
+    The one shared startup definition (registry ``health`` /
+    ``stalled_messages`` and the doctor's :func:`unseen_startup_ready
+    <dash.doctor.unseen_startup_ready>`): complete only when the process
+    has been up for :func:`startup_threshold_s` (max(3x the slowest
+    source interval, ``START_GRACE_S``)) AND every source completed one
+    poll (:func:`has_completed_poll`). Until then a source that finished
+    its first scan early reads ``starting``, not ``stalled``, while
+    slower sources are still on theirs — the registry polls sequentially
+    and lag counts from the first completed poll, so judging it stalled
+    would be a restart false positive. A source that never polled keeps
+    its own per-source grace (:func:`start_grace_s`) past the window, so
+    a hung first scan still ends up ``stalled``, never pinning the
+    dashboard in ``starting`` forever.
+    """
+    try:
+        polled = all(
+            has_completed_poll(state) if isinstance(state, dict) else False
+            for state in states
+        )
+    except Exception:
+        return False
+    if not polled:
+        return False
+    return now - born > startup_threshold_s(sources)
+
+
+def source_state(source, state: dict, now: float, born: float, *, startup: bool | None = None) -> str:
     """One of ``starting``, ``error``, ``stalled``, ``slow``, ``ok``.
 
     A source that never completed a poll — and has no failure recorded —
-    is ``starting`` (not stalled) inside its grace window. Positive
+    is ``starting`` (not stalled) inside its own grace window. When the
+    registry passes its shared first-scan gate (``startup=True``, i.e.
+    :func:`startup_complete` is not yet true), a source that already
+    polled reads ``starting`` too instead of ``stalled``-by-lag. Positive
     failure evidence (an error or a budget overrun) still reports
     ``error`` immediately, even on the first poll. A poll that returned
     but took longer than ``SLOW_AFTER_S`` is ``slow``: surfaced, but
@@ -260,7 +335,10 @@ def source_state(source, state: dict, now: float, born: float) -> str:
     """
     if state.get("last_error") or state.get("timed_out"):
         return "error"
-    if not has_completed_poll(state) and now - born <= start_grace_s(source):
+    if not has_completed_poll(state):
+        if now - born <= start_grace_s(source):
+            return "starting"
+    elif startup:
         return "starting"
     if _is_stalled(source, state, now, born):
         return "stalled"
