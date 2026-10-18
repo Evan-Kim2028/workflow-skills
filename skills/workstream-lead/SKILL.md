@@ -10,12 +10,13 @@ The lead plans, decides, verifies, and reports. Workers do everything else. Rela
 ## Start (or resume)
 
 1. Read `~/.local/share/agent-dash/workstreams/<ID>/KICKOFF.md` (or `AGENT_DASH_WORKSTREAMS`), including any addendum, then `approvals.json` and `docs/`.
-2. Check reality before acting:
+2. Activate the workstream at kickoff: `python3 tools/agent-dash/agent_dash.py ws state <ID> active`. A `planned` bundle has no tab; it appears on the dashboard once active.
+3. Check reality before acting:
    - `python3 tools/agent-dash/agent_dash.py doctor --ws <ID>` (fix or note what it lists);
    - `plan.json` statuses;
    - open PRs and `git log origin/main`;
    - live workers on the dashboard.
-3. Message the other leads named in the brief for shared files and the production slot. Messages that change production load need the owner's approval, unless `approvals.json` already grants direct coordination.
+4. Message the other leads named in the brief for shared files and the production slot. Messages that change production load need the owner's approval, unless `approvals.json` already grants direct coordination.
 
 ## Each wave
 
@@ -81,6 +82,21 @@ Production updates go out fastest when every merge is small in CI time, not in s
 ## Hand-off
 
 At about 250K context, or at a milestone, run `doctor --ws <ID>` once more, then write `state.md`: done, in flight (labels and PIDs), next wave, blockers and messages owed. Then end. A fresh lead resumes from the brief plus `state.md`. Hub reports include `doctor report --md` output.
+
+## Completion: closing report, then archive
+
+When the plan is done, write `docs/closing-report.md` in the bundle and, after owner review, run `ws archive` (archiving is manual; nothing auto-archives). The report is short:
+
+- What shipped (the lanes and trains that landed, with links to the plan view and the merged PRs).
+- Decisions (the decision ids from `plan.json` that still bind, each with its one-line why).
+- Residuals (deferred tasks and where they moved, open follow-ups and who owns them).
+- Links (kickoff brief, state reports, the dashboard plan view).
+
+```bash
+python3 tools/agent-dash/agent_dash.py ws archive <ID>
+```
+
+`ws archive` refuses unless the plan is 100% done of non-deferred tasks and the closing report exists (or `--force --note "..."` for a reviewed early archive). It freezes `summary.json` — started/finished dates, duration, task counts by status, trains, approvals counts, lifetime tokens/cost — and flips state to `archived` without deleting anything. `ws restore <ID>` reopens to `done` and keeps the summary.
 
 ## Rules
 

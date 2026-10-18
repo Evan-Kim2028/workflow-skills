@@ -154,6 +154,32 @@ class BundlesApiTest(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(json.loads(body)["ws"], "WS7")
 
+    def test_bundle_api_carries_lifecycle_fields(self):
+        status, _, body = get(self.port, "/api/bundles")
+        self.assertEqual(status, 200)
+        rows = {item["id"]: item for item in json.loads(body)["bundles"]}
+        self.assertEqual(rows["WS9"]["state"], "active")
+        self.assertEqual(rows["WS9"]["depends_on"], [])
+        self.assertIsNone(rows["WS9"]["milestone"])
+        meta_path = Path(self.tmp.name) / "WS9" / "bundle.json"
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        meta["state"] = "paused"
+        meta["state_changed_at"] = 1700000000.0
+        meta["milestone"] = "Part 2"
+        meta["depends_on"] = []
+        meta_path.write_text(json.dumps(meta), encoding="utf-8")
+        status, _, body = get(self.port, "/api/bundles")
+        rows = {item["id"]: item for item in json.loads(body)["bundles"]}
+        self.assertEqual(rows["WS9"]["state"], "paused")
+        self.assertEqual(rows["WS9"]["state_changed_at"], 1700000000.0)
+        self.assertEqual(rows["WS9"]["milestone"], "Part 2")
+        status, _, body = get(self.port, "/api/bundle?ws=WS9")
+        self.assertEqual(status, 200)
+        bundle = json.loads(body)["bundle"]
+        self.assertEqual(bundle["state"], "paused")
+        self.assertEqual(bundle["milestone"], "Part 2")
+        self.assertEqual(bundle["depends_on"], [])
+
     def test_valid_bundle_serves_empty_issues(self):
         status, _, body = get(self.port, "/api/plan?ws=WS9")
         self.assertEqual(status, 200)

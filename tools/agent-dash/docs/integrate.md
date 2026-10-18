@@ -286,6 +286,19 @@ python3 tools/agent-dash/agent_dash.py ws task WS4 WS4.1 pr
 python3 tools/agent-dash/agent_dash.py ws task WS4 WS4.1 deferred --moved-to WS6 --note "waits on the freeze"
 ```
 
+Move the workstream itself the same way (`planned -> active -> done -> archived`, plus `paused` and `dropped`; reopening `done` to `active` needs `--force --note`):
+
+```bash
+python3 tools/agent-dash/agent_dash.py ws new WS4 "Notes index" --state planned
+python3 tools/agent-dash/agent_dash.py ws state WS4 active
+python3 tools/agent-dash/agent_dash.py ws state WS4 done
+python3 tools/agent-dash/agent_dash.py ws archive WS4   # needs docs/closing-report.md in the bundle and a 100% plan (or --force --note)
+python3 tools/agent-dash/agent_dash.py ws restore WS4   # archived -> done, keeps summary.json
+python3 tools/agent-dash/agent_dash.py ws list --state all
+```
+
+`ws archive` freezes `summary.json` (final stats, lifetime tokens/cost when the dashboard is reachable) and never deletes anything. The full state rules are in [SKILL-PLAN.md](../SKILL-PLAN.md#workstream-lifecycle).
+
 Status is `todo`, `wip`, `pr`, `prog`, `done`, or `deferred`. `wip` is work on a branch; `pr` is approved or open; `prog` is merged with a production step left; `done` is merged and live. `--moved-to` and `--note` belong only on `deferred`. Status edits read live; `render` is only for prose and drawings. `ws validate` fails on a dep that names an unknown task or the task itself, a `dep_notes` key outside the task's `deps`, and a bare number citation (name things first: `the notes cutover (WS4.3)`).
 
 Gates model outside signals. A task with `"kind": "gate"` draws as a diamond; the dependent names the condition in `dep_notes`, keyed by the gate id, 280 chars or fewer. Trains ship related tasks as one branch and one PR:

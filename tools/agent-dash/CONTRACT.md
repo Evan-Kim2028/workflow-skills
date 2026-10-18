@@ -445,7 +445,7 @@ Each bundle:
 
 | File | Role |
 |---|---|
-| `bundle.json` | `{id, title, short, order, kind}`. `kind` is `program` or `workstream`. The id matches the directory name. |
+| `bundle.json` | `{id, title, short, order, kind}`. `kind` is `program` or `workstream`. The id matches the directory name. Lifecycle fields are additive: `state` (`planned`, `active`, `paused`, `done`, `archived`, `dropped`; default `active` when absent), `state_changed_at` (epoch or null), `archived_at` (epoch or null), `summary` (object frozen by `ws archive`, or null), `depends_on` (workstream ids that must exist; never `OVERVIEW`), `milestone` (phase-name string or null). `ws validate` rejects a bad value (exit 4) with the next command. |
 | `plan.json` | Decision record: `dag`, `decisions`, `motivation`, `agent_friendly`, `narrative`. Task status is `todo`, `pr`, `prog`, `done`, or `deferred`. `deferred` may set `moved_to`, `note`, and `received_as`. A task may carry `deps`, `dep_notes` (conditions keyed by dep id), `kind` (`task` or `gate`; see SKILL-PLAN.md), and `files` (declared footprints); a gate may carry `signal`, `confirmed_at`, and `fresh_hours`. `ws validate` rejects a bad `kind`, a `dep_notes` key that is not one of the task's `deps`, a bad `files`/`signal`/`confirmed_at`/`fresh_hours`/`received_as`, and a bare number citation. A `program` bundle may hold only `narrative`. |
 | `page.html` | Plan-view fragment. Generated for bundles that have `visuals.html` and `layout.json`. |
 | `approvals.json` | Optional. `{ws, decided_at, decided_by, items: [{id, step, status, reversible, conditions}]}`. `status` is `pending`, `approved`, or `denied`. `reversible` is a boolean. `decided_at` is an ISO-8601 UTC string or null. |
@@ -456,8 +456,11 @@ Each bundle:
 `dash/planrender.py` `render(bundle_dir)` writes `page.html` in this order: Approvals, Why, End state, Plan, Progress, Decided, Agent-friendly, Reference. Approvals is an empty `data-plan-approvals` node. Progress is an empty `data-plan-progress` node. The page fills both from the live bundle. Deferred tasks stay on the map and leave the counts.
 
 ```
-python3 agent_dash.py ws list
-python3 agent_dash.py ws new <ID> "<title>"
+python3 agent_dash.py ws list [--state S[,S...]|all] [--json]
+python3 agent_dash.py ws new <ID> "<title>" [--state planned|active]
+python3 agent_dash.py ws state <ID> <state> [--force] [--note "..."]
+python3 agent_dash.py ws archive <ID> [--force] [--note "..."]
+python3 agent_dash.py ws restore <ID>
 python3 agent_dash.py ws validate <ID>
 python3 agent_dash.py ws render <ID>
 python3 agent_dash.py ws plan <ID>
@@ -471,7 +474,7 @@ python3 agent_dash.py ws approvals [<ID>]
 Exit codes are 0 ok, 1 check failed, 2 usage error, 3 not found, 4
 invalid data, 5 dashboard unreachable (docs/integrate.md, For agents).
 
-`ws new` writes a valid template. `ws task` writes `plan.json` through a temp file and `os.replace`, holding a per-bundle `fcntl` lock across the read-modify-write so concurrent writers keep every update. `ws approve` writes `approvals.json` the same way. Moving a `done` or `deferred` task back to `wip` or `pr` needs `--force`. A new pending item needs `--step`, `--reversible yes|no`, and `--conditions`. `approved` or `denied` sets `decided_at` and `decided_by` to `owner`. `ws approvals` prints a table. `ws validate` checks the schema, including `approvals.json` when that file exists, and the naming rule: a TU-style id, a #-prefixed issue number, or an ADR number with no phrase earlier on the same line is a failure.
+`ws new` writes a valid template (`--state` sets the lifecycle state, default `active`). `ws task` writes `plan.json` through a temp file and `os.replace`, holding a per-bundle `fcntl` lock across the read-modify-write so concurrent writers keep every update. `ws approve` writes `approvals.json` the same way. `ws state`, `ws archive`, and `ws restore` write `bundle.json` under the same lock and append one `{kind: "state"}` line to `history.jsonl`; `ws archive` also freezes `summary.json` and never deletes anything. Moving a `done` or `deferred` task back to `wip` or `pr` needs `--force`. A new pending item needs `--step`, `--reversible yes|no`, and `--conditions`. `approved` or `denied` sets `decided_at` and `decided_by` to `owner`. `ws approvals` prints a table. `ws validate` checks the schema, including `approvals.json` when that file exists, and the naming rule: a TU-style id, a #-prefixed issue number, or an ADR number with no phrase earlier on the same line is a failure.
 
 Map warnings (MAP101–MAP111) are the plan-shape lint from `dash/maplayout.py`: warnings, never errors. `ws validate` prints them after errors under a `warnings:` heading and lists them in `--json` under `warnings`; the exit code follows the schema errors alone. `ws layout <ID> [--json]` prints the computed layout (density, columns, group states, label shortening count, arrows policy) plus the same warnings with fix hints. Run it before kickoff and aim for zero MAP warnings. The codes:
 
@@ -492,8 +495,8 @@ Map warnings (MAP101–MAP111) are the plan-shape lint from `dash/maplayout.py`:
 HTTP, still GET only, 127.0.0.1:
 
 - `GET /plan` serves the same shell as `GET /`.
-- `GET /api/bundles` returns `{bundles: [{id, title, short, order, kind}]}`, program first, then `order`.
-- `GET /api/bundle?ws=<ID>` returns `{bundle, plan, progress, approvals, start_prompt, issues}` from that directory. `progress` is the same object `/api/plan` carries. Missing `approvals.json` is an empty item list. `start_prompt` is the text of `START-PROMPT.md`, or null. `issues` is the same list `/api/plan` carries.
+- `GET /api/bundles` returns `{bundles: [{id, title, short, order, kind, state, state_changed_at, archived_at, depends_on, milestone, summary}]}`, program first, then `order`. Lifecycle fields are additive; bundles written before them read as `state: active`.
+- `GET /api/bundle?ws=<ID>` returns `{bundle, plan, progress, approvals, start_prompt, issues}` from that directory. `bundle` is the raw `bundle.json`, so it carries the lifecycle fields too. `progress` is the same object `/api/plan` carries. Missing `approvals.json` is an empty item list. `start_prompt` is the text of `START-PROMPT.md`, or null. `issues` is the same list `/api/plan` carries.
 - `GET /api/archive` returns `{"archive": [{<summary.json contents>, id, title, archived_at, report}], "totals": {workstreams, tokens, cost_usd, runs}}`: one frozen summary card per `archived` workstream, newest first (bundles without `summary.json` still list with their metadata). `report` is the closing-report file's basename only, never a path and never its body — no report prose reaches any endpoint. `totals` is the archived workstreams' lifetime share from the store (same summary functions as every other total: all-time tokens and cost plus the run-row count), so project lifetime numbers keep including archived work.
 - `GET /api/plan?ws=<ID>` includes `start_prompt` the same way when that bundle has the file, and null otherwise.
 - `GET /api/approvals?ws=<ID|all>` returns one record, or `{approvals: [...]}` for `all`.

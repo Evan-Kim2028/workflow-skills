@@ -65,6 +65,15 @@ class WsCliTest(unittest.TestCase):
         listed = cmd_ws(["list"])
         self.assertEqual(listed, 0)
 
+    def test_new_state_flag_writes_field(self):
+        self.assertEqual(cmd_ws(["new", "WS4", "Sample", "--state", "planned"]), 0)
+        meta = json.loads((Path(self.tmp.name) / "WS4" / "bundle.json").read_text(encoding="utf-8"))
+        self.assertEqual(meta["state"], "planned")
+        self.assertIsInstance(meta["state_changed_at"], float)
+        self.assertEqual(validate_bundle("WS4"), [])
+        self.assertEqual(cmd_ws(["new", "WS5", "Other", "--state", "bogus"]), 2)
+        self.assertFalse((Path(self.tmp.name) / "WS5").exists())
+
     def test_naming_rule(self):
         task = "TU-" + "12"
         self.assertTrue(naming_issues("ADR 0119 picks the id"))

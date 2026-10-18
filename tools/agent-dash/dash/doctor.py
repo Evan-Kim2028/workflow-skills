@@ -2438,6 +2438,7 @@ def _lifecycle_target(entry: dict) -> tuple[float | None, str]:
 def _lifecycle_done_nag(ctx, ws: str, meta: dict) -> int:
     """A done (or 100% active) workstream waiting past the archive nag (warn)."""
     tasks, mtime = _lifecycle_plan(ws)
+    hist_any, hist_done = _lifecycle_history(ws)
     if meta["state"] == "active":
         if not tasks:
             return 0
@@ -2445,8 +2446,11 @@ def _lifecycle_done_nag(ctx, ws: str, meta: dict) -> int:
         done = sum(1 for info in tasks.values() if info.get("status") == "done")
         if total <= 0 or done != total:
             return 0
-    hist_any, _hist_done = _lifecycle_history(ws)
-    base = meta.get("state_changed_at") or hist_any or mtime
+        # An active bundle's state_changed_at is when it started, not when it
+        # reached 100%, so the nag clock is the completion moment instead.
+        base = hist_done or hist_any or mtime
+    else:
+        base = meta.get("state_changed_at") or hist_any or mtime
     if base is None:
         return 0
     nag_s = float(ctx.dcfg["archive_nag_days"]) * 86400

@@ -1027,6 +1027,13 @@ class LifecycleDoctorTest(unittest.TestCase):
         from dash.bundles import cmd_ws
 
         self.assertEqual(cmd_ws(["new", "WS41", "North Meadow"]), 0)
+        # `ws new` now stamps state and state_changed_at; strip them so the
+        # bundle matches a pre-lifecycle one with no explicit lifecycle keys.
+        path = self.wsroot / "WS41" / "bundle.json"
+        meta = json.loads(path.read_text(encoding="utf-8"))
+        for key in ("state", "state_changed_at"):
+            meta.pop(key, None)
+        path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
         result = self._collect()
         for code in self.codes:
             self.assertFalse(

@@ -68,6 +68,26 @@ Every status change also appends one `{ts, task, from, to}` line to `history.jso
 
 Run `ws render` again only when the prose or the drawings change. Status edits do not need a render. The page reads `plan.json` live.
 
+## Workstream lifecycle
+
+A bundle has a lifecycle state in `bundle.json`: `planned`, `active`, `paused`, `done`, `archived`, or `dropped` (default `active`, so every existing bundle keeps working). The state moves with the per-bundle lock, and every move appends one `{kind: "state"}` line to `history.jsonl` next to the task lines, so replay and the feed see lifecycle moves without breaking on them.
+
+```
+python3 agent_dash.py ws new WS4 "Read path" --state planned
+python3 agent_dash.py ws state WS4 active
+python3 agent_dash.py ws state WS4 paused
+python3 agent_dash.py ws state WS4 done
+python3 agent_dash.py ws archive WS4
+python3 agent_dash.py ws restore WS4
+python3 agent_dash.py ws list --state all
+```
+
+Legal moves: `planned -> active`; `active -> paused|done|dropped`; `paused -> active|dropped`; `done -> archived|active` (reopening to `active` needs `--force --note`); only `ws restore` leaves `archived` (back to `done`); `dropped` is terminal. An illegal move exits 2 naming the legal moves. A planned bundle has no tab yet and waits on its `depends_on` workstreams; the lead activates it at kickoff with `ws state <ID> active`.
+
+Archiving is manual: a human or the lead runs `ws archive` after the closing report. It refuses unless the plan is 100% done of non-deferred tasks (or `--force --note "..."`) and unless the bundle holds `docs/closing-report.md` (or `--force`). It freezes `summary.json` in the bundle — started/finished dates, duration, task counts by status, trains, approvals counts, and lifetime run/token/cost totals from the dashboard API when reachable (nulls with a note when not) — then sets state `archived`. Nothing is deleted; `ws restore` reopens to `done` and keeps `summary.json` as the previously-archived record. `ws list` hides archived and dropped bundles by default; `--state` filters (`planned,active,paused,done,archived,dropped`, comma-separated, or `all`), `--json` prints the rows.
+
+`bundle.json` may also carry `depends_on` (workstream ids that must exist; never `OVERVIEW`), `milestone` (a phase name), `state_changed_at`, and `archived_at`. `ws validate` rejects a bad value with exit 4 and names the next command.
+
 ## Merge trains
 
 Related branches ship as one train branch (`train/<area>-<slug>`) and one PR, so CI runs once per set. The plan carries a provisional layout that the lead edits as diffs land. `ws new` writes an empty `"trains": []` for it.

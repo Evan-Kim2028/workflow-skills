@@ -85,8 +85,11 @@ USAGE = """agent-dash: local read-only execution dashboard
   python3 agent_dash.py report start --label <label> [--model M] [--session S] [--run-id R] [--tier T]
   python3 agent_dash.py report finish --label <label> --verdict PASS [--session S] [--run-id R] [--status done]
   python3 agent_dash.py report usage --label <label> --input N --output N [--model M] [--session S] [--run-id R]
-  python3 agent_dash.py ws list
-  python3 agent_dash.py ws new <ID> "<title>"
+  python3 agent_dash.py ws list [--state S[,S...]|all] [--json]
+  python3 agent_dash.py ws new <ID> "<title>" [--state planned|active]
+  python3 agent_dash.py ws state <ID> <state> [--force] [--note "..."]
+  python3 agent_dash.py ws archive <ID> [--force] [--note "..."]
+  python3 agent_dash.py ws restore <ID>
   python3 agent_dash.py ws validate <ID> [--json]
   python3 agent_dash.py ws render <ID>
   python3 agent_dash.py ws plan <ID> [--json]

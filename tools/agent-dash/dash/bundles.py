@@ -55,8 +55,11 @@ _MAX_BYTES = 2_000_000
 
 WS_USAGE = """agent-dash workstream bundles
 
-  python3 agent_dash.py ws list
-  python3 agent_dash.py ws new <ID> "<title>"
+  python3 agent_dash.py ws list [--state S[,S...]|all]
+  python3 agent_dash.py ws new <ID> "<title>" [--state planned|active|paused|done|archived|dropped]
+  python3 agent_dash.py ws state <ID> <state> [--force] [--note "..."]
+  python3 agent_dash.py ws archive <ID> [--force] [--note "..."]
+  python3 agent_dash.py ws restore <ID>
   python3 agent_dash.py ws validate <ID>
   python3 agent_dash.py ws render <ID>
   python3 agent_dash.py ws task <ID> <task-id> <status> [--moved-to WSn] [--note "..."] [--force]
@@ -74,6 +77,7 @@ WS_USAGE = """agent-dash workstream bundles
   python3 agent_dash.py ws layout <ID> [--json]
 
 Status is todo, wip, pr, prog, done, or deferred. deferred may set --moved-to and --note.
+Workstream state is planned, active, paused, done, archived, or dropped (default active).
 `ws plan` lists the bundle's tasks (ids, titles, status, deps). `--json` prints
 machine JSON to stdout; with it, human text goes to stderr.
 Exit codes: 0 ok, 1 check failed, 2 usage error, 3 not found, 4 invalid data.
@@ -143,6 +147,8 @@ def naming_issues(text: str) -> list[Citation]:
 
 
 def list_bundles(root: Path | None = None) -> list[dict]:
+    from dash.lifecycle import DEFAULT_STATE, STATES
+
     root = Path(root) if root is not None else workstreams_root()
     if not root.is_dir():
         return []
@@ -165,7 +171,37 @@ def list_bundles(root: Path | None = None) -> list[dict]:
         order = meta.get("order") if isinstance(meta.get("order"), int) else 0
         title = meta.get("title") if isinstance(meta.get("title"), str) and meta.get("title") else child.name
         short = meta.get("short") if isinstance(meta.get("short"), str) and meta.get("short") else title
-        found.append({"id": child.name, "title": title, "short": short, "order": order, "kind": kind})
+        state = meta.get("state") if meta.get("state") in STATES else DEFAULT_STATE
+        changed = meta.get("state_changed_at")
+        if isinstance(changed, bool) or not isinstance(changed, (int, float)):
+            changed = None
+        archived = meta.get("archived_at")
+        if isinstance(archived, bool) or not isinstance(archived, (int, float)):
+            archived = None
+        depends = meta.get("depends_on")
+        if not isinstance(depends, list) or not all(isinstance(item, str) for item in depends):
+            depends = []
+        milestone = meta.get("milestone")
+        if not isinstance(milestone, str):
+            milestone = None
+        summary = meta.get("summary")
+        if not isinstance(summary, dict):
+            summary = None
+        found.append(
+            {
+                "id": child.name,
+                "title": title,
+                "short": short,
+                "order": order,
+                "kind": kind,
+                "state": state,
+                "state_changed_at": changed,
+                "archived_at": archived,
+                "depends_on": depends,
+                "milestone": milestone,
+                "summary": summary,
+            }
+        )
     found.sort(key=lambda item: (0 if item["kind"] == "program" or item["id"] == "OVERVIEW" else 1, item["order"], item["id"]))
     return found
 
@@ -506,12 +542,19 @@ def start_prompt_text(ws: str, root: Path | None = None) -> str | None:
     return text
 
 
-def cmd_new(ws: str, title: str, root: Path | None = None) -> int:
+def cmd_new(ws: str, title: str, root: Path | None = None, state: str = "active") -> int:
+    import time as _time
+
+    from dash.lifecycle import STATES
+
     if not _ID.match(ws):
         print(f"bad bundle id {ws!r}: use 1-32 chars, letters, digits, _ or -", flush=True)
         return errors.USAGE
     if not title or not title.strip():
         print("title required: pass a quoted title, e.g. python3 agent_dash.py ws new WS4 \"Notes index\"", flush=True)
+        return errors.USAGE
+    if state not in STATES:
+        print(f"unknown state {state!r}. Use one of: {', '.join(STATES)}", flush=True)
         return errors.USAGE
     base = Path(root) if root is not None else workstreams_root()
     dest = base / ws
@@ -524,7 +567,15 @@ def cmd_new(ws: str, title: str, root: Path | None = None) -> int:
     _atomic_write(
         dest / "bundle.json",
         json.dumps(
-            {"id": ws, "title": title.strip(), "short": title.strip(), "order": order, "kind": "workstream"},
+            {
+                "id": ws,
+                "title": title.strip(),
+                "short": title.strip(),
+                "order": order,
+                "kind": "workstream",
+                "state": state,
+                "state_changed_at": _time.time(),
+            },
             indent=2,
         )
         + "\n",
@@ -1052,6 +1103,53 @@ def _validate_trains(issues: list[str], plan: dict) -> None:
                     issues.append(f"plan.json: train {tid} {key}: bare citation {hit.token}")
 
 
+def _validate_lifecycle(issues: list[str], ws: str, meta: dict, root: Path | None = None) -> None:
+    """Additive bundle.json lifecycle fields: state, stamps, summary, deps, milestone."""
+    from dash.lifecycle import STATES
+
+    if "state" in meta and meta.get("state") not in STATES:
+        issues.append(
+            f"bundle.json: state {meta.get('state')!r} is not {', '.join(STATES)}. "
+            f"Run: python3 agent_dash.py ws state {ws} <one of: {', '.join(STATES)}>"
+        )
+    for key in ("state_changed_at", "archived_at"):
+        if key in meta and meta.get(key) is not None and (
+            isinstance(meta.get(key), bool) or not isinstance(meta.get(key), (int, float))
+        ):
+            issues.append(
+                f"bundle.json: {key} must be an epoch number or null. "
+                f"Run: python3 agent_dash.py ws state {ws} <state> to reset it"
+            )
+    if "summary" in meta and meta.get("summary") is not None and not isinstance(meta.get("summary"), dict):
+        issues.append(
+            f"bundle.json: summary must be an object or null. Run: python3 agent_dash.py ws validate {ws}"
+        )
+    if "depends_on" in meta:
+        depends = meta.get("depends_on")
+        if not isinstance(depends, list) or not all(isinstance(item, str) for item in depends):
+            issues.append(
+                f"bundle.json: depends_on must be a list of workstream ids. "
+                f"Run: python3 agent_dash.py ws list --state all"
+            )
+        else:
+            known = {item["id"] for item in list_bundles(root)}
+            for dep in depends:
+                if dep == "OVERVIEW":
+                    issues.append(
+                        "bundle.json: depends_on must not name OVERVIEW (a program bundle, not a workstream). "
+                        f"Run: python3 agent_dash.py ws list --state all"
+                    )
+                elif dep not in known:
+                    issues.append(
+                        f"bundle.json: depends_on names unknown workstream {dep}. "
+                        f"Run: python3 agent_dash.py ws list --state all"
+                    )
+    if "milestone" in meta and meta.get("milestone") is not None and not isinstance(meta.get("milestone"), str):
+        issues.append(
+            f"bundle.json: milestone must be a string or null. Run: python3 agent_dash.py ws validate {ws}"
+        )
+
+
 def validate_bundle(ws: str, root: Path | None = None) -> list[str]:
     path = bundle_dir(ws, root)
     if path is None:
@@ -1071,6 +1169,7 @@ def validate_bundle(ws: str, root: Path | None = None) -> list[str]:
             issues.append("bundle.json: order must be an integer")
         if meta.get("kind") not in ("program", "workstream"):
             issues.append("bundle.json: kind must be program or workstream")
+        _validate_lifecycle(issues, ws, meta, root)
     if not isinstance(plan, dict):
         issues.append("plan.json: unreadable")
     else:
@@ -1896,18 +1995,40 @@ def cmd_ws(argv: list[str]) -> int:
         json_mode = True
         rest = rest[:-1]
     if cmd == "list":
-        rows = list_bundles()
-        if not rows:
-            print("(no bundles)")
-            return 0
-        for item in rows:
-            print(f"{item['id']}\t{item['kind']}\t{item['order']}\t{item['title']}")
-        return 0
+        from dash import lifecycle as _lifecycle
+
+        return _lifecycle.cmd_list(rest, json_mode=json_mode)
     if cmd == "new":
-        if len(rest) != 2:
+        from dash import lifecycle as _lifecycle
+
+        state = "active"
+        args = list(rest)
+        if "--state" in args:
+            pos = args.index("--state")
+            if pos < 2 or pos + 1 >= len(args):
+                print(WS_USAGE, end="", flush=True)
+                return 2
+            state = args[pos + 1]
+            del args[pos:pos + 2]
+        if len(args) != 2:
             print(WS_USAGE, end="", flush=True)
             return 2
-        return cmd_new(rest[0], rest[1])
+        if state not in _lifecycle.STATES:
+            print(f"unknown state {state!r}. Use one of: {', '.join(_lifecycle.STATES)}", flush=True)
+            return 2
+        return cmd_new(args[0], args[1], state=state)
+    if cmd == "state":
+        from dash import lifecycle as _lifecycle
+
+        return _lifecycle.cmd_state(rest, json_mode=json_mode)
+    if cmd == "archive":
+        from dash import lifecycle as _lifecycle
+
+        return _lifecycle.cmd_archive(rest, json_mode=json_mode)
+    if cmd == "restore":
+        from dash import lifecycle as _lifecycle
+
+        return _lifecycle.cmd_restore(rest, json_mode=json_mode)
     if cmd == "validate":
         if len(rest) != 1:
             print(WS_USAGE, end="", flush=True)

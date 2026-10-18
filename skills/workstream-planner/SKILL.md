@@ -13,9 +13,9 @@ Tool: `tools/agent-dash/` in this repo (`~/.claude/tools/agent-dash/` after `./i
 
 1. **Scaffold.**
    ```bash
-   python3 tools/agent-dash/agent_dash.py ws new WS4 "<title>"
+   python3 tools/agent-dash/agent_dash.py ws new WS4 "<title>" --state planned
    ```
-   For a whole new project with several workstreams, also make a program bundle (`OVERVIEW`) for the cross-workstream story.
+   A new workstream starts as `planned` (no tab yet) and names what it waits on in `bundle.json` `depends_on` (workstream ids that must exist; never `OVERVIEW`). For a whole new project with several workstreams, also make a program bundle (`OVERVIEW`) for the cross-workstream story.
 2. **Research, then decide.** Collect evidence first, from the code, the docs, and production facts.
    - Then write `plan.json` as a decision record. Each decision gets alternatives with why-not, evidence (file:line), risk, and reversibility.
    - Add a motivation section: today, after, costs, and an honest "where it is not better".
