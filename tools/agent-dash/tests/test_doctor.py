@@ -286,6 +286,57 @@ class DoctorFilesTest(unittest.TestCase):
         self.assertIn("no-such-model-xyz", unpriced[0]["message"])
         self.assertIn("python3 agent_dash.py reprice", unpriced[0]["command"])
 
+    def _add_fake_usage(self, model, tokens):
+        store = Store(self.root / "state" / "dash.sqlite")
+        try:
+            store.add_usage(
+                {
+                    "ts": time.time(),
+                    "session_id": "s",
+                    "run_id": f"generic:s:{model}",
+                    "model": model,
+                    "tool": "generic",
+                    "message_id": f"m-{model}",
+                    "input": tokens,
+                    "output": 0,
+                    "cache_read": 0,
+                    "cache_write": 0,
+                    "reasoning": 0,
+                }
+            )
+        finally:
+            store.close()
+
+    def test_zero_token_rateless_model_is_not_unpriced(self):
+        cfg = self._cfg()
+        self._add_fake_usage("<synthetic>", 0)
+        with mock.patch("dash.doctor._home_scratch", return_value=str(self.home / "agent-scratch")):
+            result = run_doctor(cfg, "http://127.0.0.1:1")
+        self.assertFalse([item for item in result["problems"] if item["code"] == "unpriced-model"])
+        pricing = next(item for item in result["checks"] if item["name"] == "pricing")
+        self.assertTrue(pricing["ok"])
+
+    def test_billed_rateless_model_is_critical(self):
+        cfg = self._cfg()
+        self._add_fake_usage("no-such-model-xyz", 10)
+        with mock.patch("dash.doctor._home_scratch", return_value=str(self.home / "agent-scratch")):
+            result = run_doctor(cfg, "http://127.0.0.1:1")
+        unpriced = [item for item in result["problems"] if item["code"] == "unpriced-model"]
+        self.assertEqual(len(unpriced), 1)
+        self.assertNotIn("warning", unpriced[0])
+        self.assertFalse(result["ok"])
+        pricing = next(item for item in result["checks"] if item["name"] == "pricing")
+        self.assertFalse(pricing["ok"])
+
+    def test_priced_model_never_alerts(self):
+        cfg = self._cfg()
+        self._add_fake_usage("claude-fable-5-1", 10)
+        with mock.patch("dash.doctor._home_scratch", return_value=str(self.home / "agent-scratch")):
+            result = run_doctor(cfg, "http://127.0.0.1:1")
+        self.assertFalse([item for item in result["problems"] if item["code"] == "unpriced-model"])
+        pricing = next(item for item in result["checks"] if item["name"] == "pricing")
+        self.assertTrue(pricing["ok"])
+
     def test_config_parses_and_flags_unknown_keys(self):
         cfg = self._cfg()
         bad = self.root / "bad.json"

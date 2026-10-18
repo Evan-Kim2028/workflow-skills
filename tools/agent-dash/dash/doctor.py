@@ -1024,6 +1024,7 @@ def _collect_pricing(ctx) -> None:
         item
         for item in models
         if item.get("model")
+        and int(item.get("tokens") or 0) > 0
         and (item["model"] not in rows or rows[item["model"]].get("input") is None or rows[item["model"]].get("output") is None)
     ]
     if not missing:
