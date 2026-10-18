@@ -8,7 +8,8 @@
  * Current table. Every title attribute, aria-label and dispatched hover
  * tooltip must be compact: no 5+ digit run and no comma-separated
  * thousands. Exact figures stay in data-* attributes and the details
- * drawer, which this check never reads.
+ * drawer, which this check never reads. Session uuids and commit shas
+ * are identifiers, not quantities, and never flag.
  *
  * Temp server layout (all under one mkdtemp dir, removed afterwards):
  *   - ~/.local/share/agent-dash/dash.sqlite* copied to AGENT_DASH_STATE_DIR
@@ -44,6 +45,14 @@ const HOVER_SELECTORS = [
   "circle", ".more-btn", ".slim-tile", ".fanin", ".att",
 ];
 const RAW_NUMBER = /(\d{5,}|\d,\d{3})/;
+/* Identifiers are not quantities: a session uuid or commit sha in a hover
+   title (the label || run_id fallback for unlabeled runs) carries digit
+   runs but must not read as an unformatted count. Strip uuids and long
+   hex ids before the check; pure-digit runs still flag. */
+const IDENTIFIER = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|\b(?=[0-9a-f]*[a-f])[0-9a-f]{7,}\b/gi;
+function hasRawNumber(text) {
+  return RAW_NUMBER.test(String(text).replace(IDENTIFIER, ""));
+}
 
 function args(argv) {
   const out = { repo: null, url: null, serve: true, chrome: null };
@@ -250,7 +259,7 @@ async function runCheck(base, chrome) {
       for (const [kind, text] of strings) {
         if (!text) continue;
         checked++;
-        if (RAW_NUMBER.test(text)) offenders.push({ view: name, kind, text: text.slice(0, 160) });
+        if (hasRawNumber(text)) offenders.push({ view: name, kind, text: text.slice(0, 160) });
       }
     }
     cdp.close();
