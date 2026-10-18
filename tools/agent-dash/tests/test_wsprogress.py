@@ -69,11 +69,14 @@ class ProgressCase(unittest.TestCase):
     def tearDown(self):
         wsprogress.clear_cache()
 
-    def make_bundle(self, ws, tasks, history=None):
+    def make_bundle(self, ws, tasks, history=None, state=None):
         dest = os.path.join(self.wsroot, ws)
         os.makedirs(dest, exist_ok=True)
+        meta = {"id": ws, "title": "Probe %s" % ws, "kind": "workstream"}
+        if state is not None:
+            meta["state"] = state
         with open(os.path.join(dest, "bundle.json"), "w") as fh:
-            json.dump({"id": ws, "title": "Probe %s" % ws, "kind": "workstream"}, fh)
+            json.dump(meta, fh)
         groups = [{"id": "g", "col": 0, "title": "Build", "tasks": tasks}]
         with open(os.path.join(dest, "plan.json"), "w") as fh:
             json.dump(
@@ -294,11 +297,14 @@ class EndpointTests(ProgressCase):
 
 class FixtureTests(unittest.TestCase):
     def test_ws_progress_fixture_mirrors_endpoint_shape(self):
-        for name in ("ws-progress-WS9.json", "ws-progress-WS1.json"):
+        for name in ("ws-progress-WS9.json", "ws-progress-WS1.json", "ws-progress-all.json"):
             doc = json.loads((ROOT / "fixtures" / name).read_text(encoding="utf-8"))
             self.assertTrue(doc["_note"].strip())
             body = doc["wsprogress"]
             self.assertEqual(body["ws"], name[len("ws-progress-"):-len(".json")])
+            if body["ws"] == "all":
+                self.assertEqual(body["workstreams"], sorted(body["workstreams"]))
+                self.assertTrue(body["workstreams"])
             points = body["points"]
             self.assertEqual([pt["t"] for pt in points], sorted(pt["t"] for pt in points))
             for pt in points:
@@ -320,38 +326,151 @@ class FixtureTests(unittest.TestCase):
             self.assertEqual(body["dated"] + body["undated"], body["done"])
 
 
+class ProjectTotalTests(ProgressCase):
+    """The project total (?ws=all): one series pair over all
+    non-archived workstreams weighted by task count."""
+
+    def _two(self):
+        self.make_bundle(
+            "BX1",
+            [{"id": "BX1.%d" % i, "title": "Task %d" % i,
+              "status": "done" if i == 1 else "todo"} for i in range(1, 3)],
+            [{"ts": self.now - 3600, "task": "BX1.1", "from": "todo", "to": "done"}],
+        )
+        self.make_bundle(
+            "BX2",
+            [{"id": "BX2.%d" % i, "title": "Task %d" % i, "status": "done"} for i in range(1, 3)],
+            [{"ts": self.now - 7200, "task": "BX2.1", "from": "todo", "to": "done"},
+             {"ts": self.now - 1800, "task": "BX2.2", "from": "todo", "to": "done"}],
+        )
+
+    def test_project_total_weights_by_task_count(self):
+        self._two()
+        payload = wsprogress.build_project_progress(self.store, self.now)
+        self.assertEqual(payload["ws"], "all")
+        self.assertEqual(payload["workstreams"], ["BX1", "BX2"])
+        self.assertEqual(payload["total"], 4)
+        self.assertEqual(payload["done"], 3)
+        self.assertAlmostEqual(payload["pct"], 75.0)
+        ticks = [pt["t"] for pt in payload["points"]]
+        self.assertEqual(ticks, sorted(ticks))
+        self.assertEqual(
+            [pt["done"] for pt in payload["points"]],
+            sorted(pt["done"] for pt in payload["points"]),
+        )
+        self.assertEqual(payload["points"][-1]["done"], 3)
+        self.assertEqual(payload["points"][-1]["pct"], 75.0)
+        by_pct = {mark["pct"]: mark for mark in payload["milestones"]}
+        self.assertEqual(len(payload["milestones"]), 5)
+        # 3 of 4 done: the 20/40/60% marks are crossed, 80/100% are not.
+        self.assertTrue(by_pct[20]["reached"])
+        self.assertTrue(by_pct[40]["reached"])
+        self.assertTrue(by_pct[60]["reached"])
+        self.assertFalse(by_pct[80]["reached"])
+        self.assertIsNone(by_pct[80]["t"])
+        self.assertFalse(by_pct[100]["reached"])
+        self.assertEqual(by_pct[20]["done"], 1)
+        self.assertEqual(by_pct[60]["done"], 3)
+        self.assertIsNone(payload["gap"])
+        self.assertEqual(payload["dated"] + payload["undated"], payload["done"])
+
+    def test_project_total_skips_archived_and_planless(self):
+        self._two()
+        self.make_bundle(
+            "BX9",
+            [{"id": "BX9.1", "title": "Old", "status": "done"}],
+            [{"ts": self.now - 3600, "task": "BX9.1", "from": "todo", "to": "done"}],
+            state="archived",
+        )
+        os.makedirs(os.path.join(self.wsroot, "BX404"), exist_ok=True)
+        with open(os.path.join(self.wsroot, "BX404", "bundle.json"), "w") as fh:
+            json.dump({"id": "BX404", "title": "No plan", "kind": "workstream"}, fh)
+        payload = wsprogress.build_project_progress(self.store, self.now)
+        self.assertEqual(payload["workstreams"], ["BX1", "BX2"])
+        self.assertEqual(payload["total"], 4)
+
+    def test_project_total_needs_plan_data(self):
+        with self.assertRaises(ReplayNotFound):
+            wsprogress.build_project_progress(self.store, self.now)
+
+    def test_project_total_is_cached_by_key(self):
+        self._two()
+        first = wsprogress.build_project_progress(self.store, self.now)
+        second = wsprogress.build_project_progress(self.store, self.now)
+        self.assertEqual(first, second)
+        self.assertEqual(wsprogress.project_cache_key(self.store),
+                         wsprogress.project_cache_key(self.store))
+
+    def test_project_total_endpoint(self):
+        self._two()
+        self.add_run("probe-task-a", "BX1", self.now - 3700)
+        port = EndpointTests._serve(self)
+        status, body = EndpointTests._get(self, port, "/api/ws/progress?ws=all")
+        self.assertEqual(status, 200)
+        payload = json.loads(body)["wsprogress"]
+        self.assertEqual(payload["ws"], "all")
+        self.assertEqual(payload["total"], 4)
+        self.assertEqual(payload["done"], 3)
+        self.assertTrue(payload["points"])
+        self.assertEqual(len(payload["milestones"]), 5)
+        self.assertEqual(payload["runs_total"],
+                         sum(row["n"] for row in payload["runs_per_hour"]))
+
+    def test_project_total_endpoint_without_plans_is_404(self):
+        port = EndpointTests._serve(self)
+        status, body = EndpointTests._get(self, port, "/api/ws/progress?ws=all")
+        self.assertEqual(status, 404)
+        self.assertIn("plan_not_found", body.decode("utf-8"))
+
+
 class CardWiringTests(unittest.TestCase):
     def _card(self):
         return (ROOT / "static" / "cards" / "progress.js").read_text(encoding="utf-8")
 
-    def test_registry_scope_and_order(self):
+    def _stack(self):
+        return (ROOT / "static" / "cards" / "activity.js").read_text(encoding="utf-8")
+
+    def test_no_standalone_progress_section(self):
         registry = (ROOT / "static" / "cards" / "registry.js").read_text(encoding="utf-8")
-        self.assertIn('"progress"', registry)
-        self.assertIn('scope: "workstream"', registry)
-        self.assertIn("progressSpec", registry)
-        # Below the planning-versus-execution card on the workstream tab.
-        self.assertLess(registry.index('"phases-ws"'), registry.index('"progress"'))
+        self.assertNotIn('{id: "progress"', registry)
+        self.assertNotIn("progressSpec", registry)
+        # The progress strip key joins the activity section key instead.
+        self.assertIn("actProgKey(", registry)
 
     def test_page_tags(self):
         page = (ROOT / "static" / "index.html").read_text(encoding="utf-8")
-        self.assertIn('<link rel="stylesheet" href="/static/cards/progress.css">', page)
+        self.assertNotIn("/static/cards/progress.css", page)
+        # progress.js stays as the strip's pure helpers, loaded before the registry.
         self.assertIn('<script src="/static/cards/progress.js"></script>', page)
         self.assertLess(
             page.index("/static/cards/progress.js"), page.index("/static/cards/registry.js")
         )
 
     def test_chart_rules(self):
-        src = self._card()
+        strip = self._stack()
         for token in ("axes(", "timeTicks(", "fmtN", "fmtPct", "fmtDur", "fmtDate",
                       "data-key", "data-v", "data-t", "data-milestone",
-                      "request failed", "data-failed-scope", "tabindex",
-                      "role: \"img\"", "aria-label"):
-            self.assertIn(token, src, "progress.js lost %r" % token)
+                      "tabindex", "role: \"img\"", "aria-label",
+                      "actProgStrip", "actProgClip", "actProgHas", "actProgY",
+                      "actProgKey", "actProgEnsure", "actCrossOf",
+                      "data-strip\": \"progress\"", "\"exec-prog\"",
+                      "progStep(", "progStepRows", "progMileRows",
+                      "progTakeaway(", "progBest(", "progPctFmt",
+                      "var(--s1)", "var(--s5)", "yTicks: 4", "% of tasks",
+                      "Earlier history before"):
+            self.assertIn(token, strip, "activity.js lost %r" % token)
+        for bad in (".toFixed(", "toLocaleString(", "doctor", "health", "warn"):
+            self.assertNotIn(bad, strip, "activity.js must not contain %r" % bad)
+        src = self._card()
+        for fn in ("progLegendTip", "progMileRows", "progStepRows", "progBarRows",
+                   "progTakeaway", "progBest", "progBestElapsed",
+                   "progStep", "progPctFmt"):
+            self.assertIn("function %s(" % fn, src, "progress.js lost %r" % fn)
+        for gone in ("progress-ws", "progressSpec", "progressCard", "progChartA",
+                     "progChartB", "progFetch", "axes("):
+            self.assertNotIn(gone, src, "progress.js must not contain %r" % gone)
         for bad in (".toFixed(", "toLocaleString(", "doctor", "health", "warn"):
             self.assertNotIn(bad, src, "progress.js must not contain %r" % bad)
-        for fn in ("progressSpec", "progressCard", "progChartA", "progChartB",
-                   "progLegendTip", "progMileRows", "progStepRows", "progBarRows"):
-            self.assertIn("function %s(" % fn, src)
 
 
 if __name__ == "__main__":

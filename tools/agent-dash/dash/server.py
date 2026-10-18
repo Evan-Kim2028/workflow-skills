@@ -934,8 +934,9 @@ class Handler(BaseHTTPRequestHandler):
         """``GET /api/ws/progress?ws=<ID>``: progress over time for one
         workstream (see ``dash/wsprogress.py``): the done-% step series
         with the recorded prog band, milestone first-cross times, and
-        runs started per hour. A missing ``ws`` is a 400, a bad id is a
-        400, and a workstream with no plan is a 404.
+        runs started per hour. ``?ws=all`` is the project total over
+        all non-archived workstreams. A missing ``ws`` is a 400, a bad
+        id is a 400, and a workstream with no plan is a 404.
         """
         from dash.replay import ReplayNotFound
         from dash import wsprogress
@@ -947,14 +948,17 @@ class Handler(BaseHTTPRequestHandler):
             raise ValueError("bad ws")
         store = self.server.store
         try:
-            key = wsprogress.cache_key(store, ws)
+            key = wsprogress.project_cache_key(store) if ws == "all" else wsprogress.cache_key(store, ws)
         except Exception:
             key = None
         etag = _identity_etag("ws-progress", ws, key) if key is not None else None
         if self._not_modified(etag):
             return
         try:
-            payload = wsprogress.build_wsprogress(store, ws)
+            if ws == "all":
+                payload = wsprogress.build_project_progress(store)
+            else:
+                payload = wsprogress.build_wsprogress(store, ws)
         except ReplayNotFound:
             self._json(404, {**api_error("plan not found", "plan_not_found", f"Run: python3 agent_dash.py ws new {ws} \"Title\", or pick an id from GET /api/bundles"), "ws": ws})
             return

@@ -47,6 +47,11 @@
 #exec-activity .tok-legend .lv{font-variant-numeric:tabular-nums;text-align:right;min-width:3.4em;font-weight:700;color:var(--ink)}
 #exec-activity .peaklab{font:700 11px var(--mono);fill:var(--ink);font-variant-numeric:tabular-nums}
 #exec-activity .vallab{font:600 10.5px var(--mono);fill:var(--muted);font-variant-numeric:tabular-nums}
+#exec-activity .prog-head{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+#exec-activity .prog-head h3{margin:10px 0 2px}
+#exec-activity .prog-legend{margin:0}
+#exec-activity .plab{fill:var(--ink-2);font:600 11px var(--font)}
+#exec-activity .prog-note{margin:6px 0 0;color:var(--muted);font-size:12.5px}
 #exec-activity .conc-strip{margin:6px 0 2px}
 #exec-activity .conc-head{display:flex;align-items:baseline;gap:8px;margin-bottom:2px}
 #exec-activity .conc-head .sw{flex:none}

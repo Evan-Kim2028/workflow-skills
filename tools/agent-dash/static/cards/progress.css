@@ -1,7 +1,0 @@
-/* Progress over time (workstream Execution tab): the completion step area
-   with its prog band and milestone dots, plus the runs-per-hour bars. */
-.ws-progress .plab{fill:var(--ink-2);font:600 11px var(--font)}
-.ws-progress .prog-legend{margin:0 0 10px}
-.ws-progress .prog-takeaway{margin:10px 0 0;color:var(--ink-2);font-size:13px}
-.ws-progress .prog-gap{margin:6px 0 0;color:var(--ink-2);font-size:12.5px}
-.ws-progress .prog-note{margin:6px 0 0;color:var(--muted);font-size:12.5px}

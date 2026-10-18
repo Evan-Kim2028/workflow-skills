@@ -3,13 +3,18 @@
  *
  * Boots a TEMP dashboard server (temp state dir, synthetic workstreams,
  * port 8911, never the live :8765 or the real data root) seeded with
- * synthetic runs spread over 24 h plus hourly usage buckets, then drives
- * the Execution view over the DevTools protocol (stdlib only: global
- * fetch and WebSocket, child_process, no npm installs) and asserts:
+ * synthetic runs spread over 24 h plus hourly usage buckets and a WS1
+ * plan with recorded task moves (so the progress strip has data), then
+ * drives the Execution view over the DevTools protocol (stdlib only:
+ * global fetch and WebSocket, child_process, no npm installs) and
+ * asserts:
  *   - one #exec-activity card (data-nav "Activity over time") sits where
- *     the tokens/gantt/conc sections were, directly before finished;
- *   - the three strips share the same x domain before and after a brush;
- *   - dragging the from-handle by 2 h shrinks all three strips together,
+ *     the tokens/gantt/conc sections were, directly before finished,
+ *     with no standalone progress card anywhere;
+ *   - the four strips (tokens, run timeline, progress over time, live
+ *     agents, in that DOM order) share the same x domain before and
+ *     after a brush;
+ *   - dragging the from-handle by 2 h shrinks all four strips together,
  *     the URL carries ?from=&to= and sessionStorage persists the range;
  *   - the Last hour preset follows now with a live chip;
  *   - keyboard ArrowLeft moves the focused handle by 5 minutes;
@@ -209,9 +214,11 @@ async function waitFor(cdp, expression, what) {
 /* 120 runs spread over 24 h across four model families (a few still
    running, one verdict mix per family) plus one usage event per run so
    the tokens strip and the brush sparkline have shape. Run ids double
-   as the usage run ids so workstream-scoped buckets resolve. */
-const SEED_PY = `import sys, time
-root, state = sys.argv[1], sys.argv[2]
+   as the usage run ids so workstream-scoped buckets resolve. WS1 also
+   gets a plan (10 tasks, 6 done) with recorded done moves over the last
+   20 h, so the progress strip paints on both scopes. */
+const SEED_PY = `import json, sys, time
+root, state, wsdir = sys.argv[1], sys.argv[2], sys.argv[3]
 sys.path.insert(0, root)
 from pathlib import Path
 from dash.store import Store
@@ -263,7 +270,14 @@ for i in range(120):
         "cache_write": 0,
     })
 store.close()
-print("seeded 120 runs + usage")
+tasks = [{"id": "WS1.%d" % i, "title": "Stack task %d" % i, "status": "done" if i <= 6 else "todo"} for i in range(1, 11)]
+plan = {"dag": {"cols": ["Build"], "groups": [{"id": "g", "col": 0, "title": "Build", "tasks": tasks}], "edges": []}, "narrative": {"phases": []}}
+ws1dir = Path(wsdir) / "WS1"
+ws1dir.mkdir(parents=True, exist_ok=True)
+(ws1dir / "plan.json").write_text(json.dumps(plan))
+hist = [{"ts": now - 20 * 3600 + i * 3 * 3600, "task": "WS1.%d" % i, "from": "todo", "to": "done"} for i in range(1, 7)]
+(ws1dir / "history.jsonl").write_text("\\n".join(json.dumps(r) for r in hist) + "\\n")
+print("seeded 120 runs + usage + WS1 plan")
 `;
 
 const DOMAINS = `JSON.stringify(Array.prototype.map.call(
@@ -271,6 +285,10 @@ const DOMAINS = `JSON.stringify(Array.prototype.map.call(
   function (s) { return [s.getAttribute("data-strip"), s.getAttribute("data-fam") || "",
     s.getAttribute("data-x-from"), s.getAttribute("data-x-to")]; }))`;
 const STACK_READY = `!!document.querySelector('#exec-activity svg[data-strip="tokens"]')`;
+const PROGRESS_READY = `!!document.querySelector('#exec-activity svg[data-strip="progress"]')`;
+const STRIP_ORDER = `JSON.stringify(Array.prototype.map.call(
+  document.querySelectorAll('#exec-activity .act-strips svg[data-strip]'),
+  function(s){ return s.getAttribute('data-strip'); }))`;
 const ORDER = `Array.prototype.map.call(
   document.querySelectorAll('#main [data-sec]'), function(s){ return s.getAttribute('data-sec'); })`;
 
@@ -313,7 +331,7 @@ async function main() {
   };
   cli("ws", "new", "WS1", "Stack One");
   const seedPath = path.join(tmp, "seed_stack.py");
-  fs.writeFileSync(seedPath, SEED_PY.replace("sys.argv[1], sys.argv[2]", `${JSON.stringify(DASH_ROOT)}, ${JSON.stringify(stateDir)}`));
+  fs.writeFileSync(seedPath, SEED_PY.replace("sys.argv[1], sys.argv[2], sys.argv[3]", `${JSON.stringify(DASH_ROOT)}, ${JSON.stringify(stateDir)}, ${JSON.stringify(wsDir)}`));
   const seed = spawnSync("python3", [seedPath], { cwd: DASH_ROOT, env, encoding: "utf8" });
   if (seed.status !== 0) throw new Error(`seed failed\n${seed.stdout}\n${seed.stderr}`);
 
@@ -366,23 +384,59 @@ async function main() {
       return JSON.parse(raw);
     }
     function assertShared(rows, what) {
-      if (rows.length < 3) fail(`${what}: only ${rows.length} strips drew (want tokens, timeline, conc)`);
+      /* Every strip that drew shares one x domain. The timeline and
+         progress strips always draw on the seeded server (dense runs, a
+         WS1 plan); tokens and live-agents strips legitimately hide when
+         their window holds no data (e.g. no usage in the last hour). */
+      const kinds = rows.map((r) => r[0]);
+      for (const want of ["timeline", "progress"]) {
+        if (kinds.indexOf(want) < 0) fail(`${what}: no ${want} strip drew (got ${kinds.join(",")})`);
+      }
+      if (rows.length < 2) fail(`${what}: only ${rows.length} strip(s) drew`);
       const spans = new Set(rows.map((r) => r[2] + ">" + r[3]));
       if (spans.size !== 1) fail(`${what}: strips disagree on the x domain: ${JSON.stringify(rows)}`);
       return { from: Number(rows[0][2]), to: Number(rows[0][3]) };
+    }
+    function assertStripOrder(what) {
+      return evaluate(cdp, STRIP_ORDER).then((raw) => {
+        const order = JSON.parse(raw);
+        /* Tokens, timeline and progress keep relative order whenever
+           they draw (tokens hides in quiet windows); every live-agents
+           strip sits after progress. */
+        const seq = ["tokens", "timeline", "progress"].filter((s) => order.indexOf(s) >= 0);
+        if (seq.indexOf("timeline") < 0 || seq.indexOf("progress") < 0) {
+          fail(`${what}: timeline or progress strip missing (got ${order.join(",")})`);
+        }
+        for (let i = 1; i < seq.length; i++) {
+          if (order.indexOf(seq[i]) <= order.indexOf(seq[i - 1])) {
+            fail(`${what}: strip order is ${order.join(",")} (want tokens, timeline, progress in order)`);
+          }
+        }
+        const progIdx = order.indexOf("progress");
+        order.forEach((k, i) => {
+          if (k !== "tokens" && k !== "timeline" && k !== "progress" && k !== "conc") {
+            fail(`${what}: unknown strip ${k} (got ${order.join(",")})`);
+          }
+          if (k === "conc" && i < progIdx) fail(`${what}: a live-agents strip sits above progress (${order.join(",")})`);
+        });
+      });
     }
 
     check("overview: one stack card before finished", async () => {
       await cdp.send("Page.navigate", { url: `${URL}/?view=exec&ws=all` });
       await waitForLoad(cdp);
       await waitFor(cdp, STACK_READY, "activity stack with a tokens strip");
+      await waitFor(cdp, PROGRESS_READY, "activity stack with a progress strip");
       const order = await evaluate(cdp, ORDER);
       const i = order.indexOf("activity");
       eq(JSON.stringify(order.slice(i, i + 2)), JSON.stringify(["activity", "finished"]),
         `section order around activity (full: ${order.join(",")})`);
-      for (const gone of ["tokens", "gantt", "conc"]) {
+      for (const gone of ["tokens", "gantt", "conc", "progress"]) {
         if (order.indexOf(gone) >= 0) fail(`old section ${gone} still renders`);
       }
+      const stray = await evaluate(cdp, `!!document.querySelector('.ws-progress')`);
+      eq(stray, false, "a standalone progress card still renders");
+      await assertStripOrder("default range");
       const nav = await evaluate(cdp, `document.querySelector('#exec-activity').getAttribute('data-nav')`);
       eq(nav, "Activity over time", "stack data-nav label");
       const rows = domainsOf(await evaluate(cdp, DOMAINS));
@@ -439,7 +493,7 @@ async function main() {
       await new Promise((r) => setTimeout(r, 600));
     }
 
-    check("handle drag: 2 h brush shrinks all three strips together", async () => {
+    check("handle drag: 2 h brush shrinks all four strips together", async () => {
       const before = assertShared(domainsOf(await evaluate(cdp, DOMAINS)), "pre-brush");
       const geo = await evaluate(cdp, `(function(){
         var svg = document.querySelector('#exec-activity .act-svg');
@@ -607,8 +661,10 @@ async function main() {
       await cdp.send("Page.navigate", { url: `${URL}/?view=exec&ws=WS1` });
       await waitForLoad(cdp);
       await waitFor(cdp, STACK_READY, "WS1 activity stack");
+      await waitFor(cdp, PROGRESS_READY, "WS1 progress strip");
       const rows = domainsOf(await evaluate(cdp, DOMAINS));
       assertShared(rows, "WS1 range");
+      await assertStripOrder("WS1 range");
     });
 
     let failed = 0;

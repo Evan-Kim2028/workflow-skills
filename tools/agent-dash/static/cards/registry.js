@@ -58,11 +58,13 @@
       if (!state.plan) return null;
       return ["plan", keyOf([state.plan, (snap.running || []).map(function (r) { return [r.label, r.workstream, r.run_id, r.section]; }), (snap.recent || []).map(function (r) { return [r.label, r.ended_at, r.verdict]; }), (state.runs || []).length]), function () { return planCard(state.plan, snap); }, "margin-top:14px"];
     }},
-    /* Activity over time (owner ask): tokens per hour, the run timeline
-       and live agents over time stacked in that order inside one card
-       (exec-activity) on one shared x axis with one time filter. */
+    /* Activity over time (owner ask): tokens per hour, the run timeline,
+       progress over time and live agents over time stacked in that order
+       inside one card (exec-activity) on one shared x axis with one time
+       filter. The progress strip reads its own payload (see
+       static/cards/activity.js actProgKey), so the key carries it. */
     {id: "activity", order: 60, scope: "both", spec: function (state, snap) {
-      return ["activity", keyOf([state.usage, state.groupBy, (state.runs || []).map(runRow), expanded, state.conc, AdPage.actRangeKey(state.ws), Math.floor(Date.now() / 60000)]), function () { return activityCard(); }, "margin-top:14px"];
+      return ["activity", keyOf([state.usage, state.groupBy, (state.runs || []).map(runRow), expanded, state.conc, AdPage.actRangeKey(state.ws), AdPage.actProgKey(), Math.floor(Date.now() / 60000)]), function () { return activityCard(); }, "margin-top:14px"];
     }},
     {id: "finished", order: 90, scope: "both", spec: function (state, snap) {
       /* Ten finished agents per page through the shared pager: the key
@@ -101,12 +103,6 @@
     {id: "phases-ws", order: 100, scope: "workstream", spec: function (state, snap) {
       if (typeof phaseUsageWsSpec !== "function") return null;
       return phaseUsageWsSpec(state, snap);
-    }},
-    /* Progress over time: completion plus runs per hour, below the
-       planning-versus-execution card on the workstream Execution tab. */
-    {id: "progress", order: 110, scope: "workstream", spec: function (state, snap) {
-      if (typeof progressSpec !== "function") return null;
-      return progressSpec(state, snap);
     }},
     {id: "phases-all", order: 100, scope: "overview", spec: function (state, snap) {
       if (typeof phaseUsageAllSpec !== "function") return null;

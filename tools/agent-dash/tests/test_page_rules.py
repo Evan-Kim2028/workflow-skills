@@ -3114,13 +3114,13 @@ class FinalPolishTests(unittest.TestCase):
         self.assertIn("state.actionsArchive = false", api_src)
 
     def test_exec_section_order_activity_stack(self):
-        """One Activity over time card replaces the three separate chart
+        """One Activity over time card replaces the separate chart
         sections: on both exec scopes the registry order is ... plan,
         activity, finished, the planning-versus-execution stacked bars
-        follow, and the progress-over-time charts sit last on the
-        workstream scope (the overall scope still ends with its usage
-        card). The sidenav derives its order from the DOM, so no pin
-        there; the page comment and DESIGN.md name the same order."""
+        follow, and progress over time is the third strip inside the
+        stack (no standalone progress section anywhere). The sidenav
+        derives its order from the DOM, so no pin there; the page
+        comment and DESIGN.md name the same order."""
         registry = (STATIC / "cards" / "registry.js").read_text()
         entries = re.findall(
             r'\{id:\s*"([^"]+)",\s*order:\s*(\d+),\s*scope:\s*"([^"]+)"', registry
@@ -3134,32 +3134,40 @@ class FinalPolishTests(unittest.TestCase):
             ["tiles", "running", "plan", "activity", "finished"],
             "exec order drifted: want the activity stack between plan and finished",
         )
-        for gone in ('"tokens"', '"gantt"', '"conc"'):
+        for gone in ('"tokens"', '"gantt"', '"conc"', '"progress"'):
             self.assertNotIn(
                 gone.replace('"', 'id: "'), registry, f"the registry still registers {gone}"
             )
+        self.assertNotIn("progressSpec", registry, "the registry still calls the old progress spec")
         by_scope = {}
         for ident, order, scope in entries:
             by_scope.setdefault(scope, []).append((int(order), ident))
         ws = [ident for _, ident in sorted(by_scope.get("workstream", []))]
-        self.assertEqual(ws[-1], "progress", "the progress charts are not the last workstream section")
-        self.assertEqual(ws[-2], "phases-ws", "the workstream usage card is not above the progress charts")
+        self.assertEqual(ws[-1], "phases-ws", "the workstream usage card is not the last workstream section")
         ov = [ident for _, ident in sorted(by_scope.get("overview", []))]
         self.assertEqual(ov[-1], "phases-all", "the overall usage card is not the last section")
         orders = {ident: int(order) for ident, order, _scope in entries}
         self.assertGreater(orders["phases-ws"], orders["finished"], "the workstream usage card sits before Finished")
-        self.assertGreater(orders["progress"], orders["phases-ws"], "the progress charts sit before the usage card")
+        stack = (STATIC / "cards" / "activity.js").read_text()
+        for token in ("actProgStrip", 'data-strip": "progress"', '"exec-prog"',
+                      "actProgKey", "yTicks: 4", "progStep(", "% of tasks"):
+            self.assertIn(token, stack, f"activity.js lost the progress strip: {token}")
+        self.assertNotIn('"exec-progress"', stack, "the strip reuses the plan map card id")
+        self.assertIn("actProgKey(", registry, "the activity section key lost the progress payload")
         page = (STATIC / "index.html").read_text()
         self.assertIn("plan, activity, finished", page)
         self.assertIn("progress-over-time", page)
-        self.assertIn("charts last on workstream tabs", page)
+        self.assertNotIn("charts last on workstream tabs", page)
         self.assertIn('<script src="/static/cards/activity.js"></script>', page)
+        self.assertIn('<script src="/static/cards/progress.js"></script>', page)
+        self.assertNotIn("/static/cards/progress.css", page, "index.html still loads the old progress CSS")
         self.assertNotIn("token-chart.js", page, "index.html still loads the old token chart")
         self.assertNotIn("live-chart.js", page, "index.html still loads the old live chart")
         design = (STATIC.parent / "DESIGN.md").read_text()
-        self.assertIn("Activity over time (the tokens, run-timeline and live-agents stack)", design)
+        self.assertIn("Activity over time (the tokens, run-timeline, progress-over-time and live-agents stack)", design)
+        self.assertNotIn("Progress over time charts last", design)
         self.assertLess(
-            design.index("Activity over time (the tokens, run-timeline and live-agents stack)"),
+            design.index("Activity over time (the tokens, run-timeline, progress-over-time and live-agents stack)"),
             design.index("Finished (24 h)"),
             "DESIGN.md no longer lists the stack before Finished",
         )
@@ -3168,16 +3176,28 @@ class FinalPolishTests(unittest.TestCase):
             design.index("usage-by-phase per-day stacked columns below Finished"),
             "DESIGN.md no longer lists the usage bars after Finished",
         )
-        self.assertLess(
-            design.index("usage-by-phase per-day stacked columns below Finished"),
-            design.index("Progress over time charts last"),
-            "DESIGN.md no longer lists the progress charts last on the workstream tab",
-        )
         sidenav = (STATIC / "sidenav.js").read_text()
         self.assertNotIn('"activity"', sidenav, "the sidenav hard-codes a section order")
         self.assertNotIn('"gantt"', sidenav, "the sidenav hard-codes a section order")
         self.assertNotIn('"conc"', sidenav, "the sidenav hard-codes a section order")
         self.assertNotIn('"phases', sidenav, "the sidenav hard-codes a section order")
+
+    def test_progress_section_id_is_gone(self):
+        """The old standalone progress section is fully removed: its
+        section id, card and spec are gone from progress.js and the
+        registry, while the pure data helpers stay exported."""
+        card = (STATIC / "cards" / "progress.js").read_text()
+        for gone in ("progress-ws", "progressSpec", "progressCard", "progChartA",
+                     "progChartB", "progFetch", "progFrame", "progSvg",
+                     "progress.css", ".toFixed(",
+                     "toLocaleString(", "doctor", "health", "warn"):
+            self.assertNotIn(gone, card, f"progress.js still contains {gone!r}")
+        for kept in ("function progLegendTip(", "function progMileRows(",
+                     "function progStepRows(", "function progBarRows(",
+                     "function progTakeaway(", "function progBest(",
+                     "function progStep(", "function progPctFmt("):
+            self.assertIn(kept, card, f"progress.js lost the pure helper {kept}")
+        self.assertNotIn("axes(", card, "progress.js draws no chart of its own anymore")
 
     def test_activity_range_math_runs_in_node(self):
         """The stack's range helpers are pure functions on window.AdPage:
@@ -3233,6 +3253,60 @@ console.log("activity range math ok");
 '''
         with tempfile.TemporaryDirectory() as tmp:
             harness_path = Path(tmp) / "act_range_math.js"
+            harness_path.write_text(harness, encoding="utf-8")
+            proc = subprocess.run(
+                ["node", str(harness_path), str(STATIC / "cards" / "activity.js")],
+                capture_output=True,
+                text=True,
+            )
+        self.assertEqual(proc.returncode, 0, proc.stderr or proc.stdout)
+
+    def test_progress_strip_scaling_runs_in_node(self):
+        """The progress strip's pure math runs node-driven with no DOM:
+        percent maps linearly onto the 0-100% y axis (clamped), zoom
+        clipping keeps the in-range vertices and carries the last
+        earlier one in at the edge (marked, so no dot draws on it), and
+        the hidden-when-empty predicate hides missing, zero-total and
+        move-less payloads."""
+        harness = r'''
+const fs = require("fs");
+const assert = require("assert");
+var window = {};
+eval(fs.readFileSync(process.argv[2], "utf8"));
+const A = window.AdPage;
+["actProgY", "actProgClip", "actProgHas", "actProgStrip", "actProgKey"].forEach(function (n) {
+  assert.strictEqual(typeof A[n], "function", "AdPage." + n + " is not exported");
+  assert.strictEqual(typeof window[n], "function", n + " is not a plain global");
+});
+/* percent to y: 0% sits on the axis, 100% on top, linear, clamped. */
+assert.strictEqual(A.actProgY(0, 8, 144), 152);
+assert.strictEqual(A.actProgY(100, 8, 144), 8);
+assert.strictEqual(A.actProgY(50, 8, 144), 80);
+assert.strictEqual(A.actProgY(25, 8, 144), 116);
+assert.strictEqual(A.actProgY(-5, 8, 144), 152);
+assert.strictEqual(A.actProgY(150, 8, 144), 8);
+/* zoom clipping: in-range vertices pass through untouched. */
+var pts = [{t: 10, done: 1, prog: 0}, {t: 20, done: 2, prog: 1}, {t: 30, done: 3, prog: 0}];
+assert.deepStrictEqual(A.actProgClip(pts, 0, 100), pts);
+assert.deepStrictEqual(A.actProgClip(pts, 10, 20), [{t: 10, done: 1, prog: 0}, {t: 20, done: 2, prog: 1}]);
+/* a zoomed window carries the last earlier vertex in at the edge. */
+assert.deepStrictEqual(A.actProgClip(pts, 15, 25),
+  [{t: 15, done: 1, prog: 0, edge: true}, {t: 20, done: 2, prog: 1}]);
+assert.deepStrictEqual(A.actProgClip(pts, 35, 45),
+  [{t: 35, done: 3, prog: 0, edge: true}]);
+assert.deepStrictEqual(A.actProgClip(pts, 0, 5), []);
+assert.deepStrictEqual(A.actProgClip([], 0, 100), []);
+assert.deepStrictEqual(A.actProgClip(null, 0, 100), []);
+/* hidden when empty: no payload, no total, or no recorded moves. */
+assert.strictEqual(A.actProgHas(null), false);
+assert.strictEqual(A.actProgHas({}), false);
+assert.strictEqual(A.actProgHas({total: 0, points: [{t: 1, done: 0}]}), false);
+assert.strictEqual(A.actProgHas({total: 5, points: []}), false);
+assert.strictEqual(A.actProgHas({total: 5, points: [{t: 1, done: 1}]}), true);
+console.log("progress strip scaling ok");
+'''
+        with tempfile.TemporaryDirectory() as tmp:
+            harness_path = Path(tmp) / "act_prog_scaling.js"
             harness_path.write_text(harness, encoding="utf-8")
             proc = subprocess.run(
                 ["node", str(harness_path), str(STATIC / "cards" / "activity.js")],
@@ -3336,7 +3410,7 @@ console.log("activity tick spans ok");
         self.assertIn("timeTicks(", shared, "the shared ticks never reach the axis helper")
         self.assertIn("range.from", shared, "the shared ticks ignore the zoomed start")
         self.assertIn("range.to", shared, "the shared ticks ignore the zoomed end")
-        for name in ("actTokenStrip", "actTimelineStrip", "actConcStrip"):
+        for name in ("actTokenStrip", "actTimelineStrip", "actProgStrip", "actConcStrip"):
             self.assertIn(name, bodies, f"{name} is gone from the page")
             self.assertIn("actSharedTicks(", bodies[name], f"{name} no longer shares the zoomed ticks")
             self.assertIn("actXGrid(", bodies[name], f"{name} lost its tick gridlines")
@@ -3384,26 +3458,29 @@ console.log("activity tick spans ok");
 
     def test_activity_shares_one_axis(self):
         """One card, one x axis, one filter: exec-activity carries the
-        Activity over time nav label with the brush bar on top, the three
-        strips stack in tokens/runs/agents order on the same domain, only
-        the bottom strip draws x labels, and one crosshair spans them."""
+        Activity over time nav label with the brush bar on top, the four
+        strips stack in tokens/runs/progress/agents order on the same
+        domain, only the bottom strip draws x labels, and one crosshair
+        spans them."""
         src = (STATIC / "cards" / "activity.js").read_text()
         self.assertIn('"data-nav": "Activity over time"', src)
         self.assertIn('id: "exec-activity"', src.replace("id:", "id:", 1))
         self.assertEqual(src.count('"data-strip": "tokens"'), 1, "tokens strip lost its domain tag")
         self.assertEqual(src.count('"data-strip": "timeline"'), 1, "timeline strip lost its domain tag")
+        self.assertEqual(src.count('"data-strip": "progress"'), 1, "progress strip lost its domain tag")
         self.assertIn('"data-strip": "conc"', src, "conc strips lost their domain tag")
-        self.assertEqual(src.count('"data-x-from"'), 3, "every strip must tag its shared x domain")
+        self.assertEqual(src.count('"data-x-from"'), 4, "every strip must tag its shared x domain")
         self.assertIn("conc[conc.length - 1].fam, true", src, "x labels no longer draw once at the bottom")
         self.assertIn("actWireCross", src, "no shared crosshair")
-        self.assertEqual(src.count("    actCrossOf(svg"), 3, "a strip lost its crosshair line")
+        self.assertEqual(src.count("    actCrossOf(svg"), 4, "a strip lost its crosshair line")
         bodies = dict(functions(inline_scripts()))
         self.assertIn("actPaintStrips", bodies)
         paint = bodies["actPaintStrips"]
-        for strip in ("actTokenStrip", "actTimelineStrip", "actConcStrips"):
+        for strip in ("actTokenStrip", "actTimelineStrip", "actProgStrip", "actConcStrips"):
             self.assertIn(strip, paint, f"the stack no longer renders {strip}")
         self.assertLess(paint.index("actTokenStrip"), paint.index("actTimelineStrip"), "tokens must stack first")
-        self.assertLess(paint.index("actTimelineStrip"), paint.index("actConcStrips"), "runs must stack before agents")
+        self.assertLess(paint.index("actTimelineStrip"), paint.index("actProgStrip"), "runs must stack before progress")
+        self.assertLess(paint.index("actProgStrip"), paint.index("actConcStrips"), "progress must stack before agents")
 
     def test_phases_card_is_not_before_running(self):
         """The usage card never leads an Execution view: on the

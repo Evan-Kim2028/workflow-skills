@@ -1266,6 +1266,89 @@ def _wsprogress(runs, now, plans):
     return docs
 
 
+def _wsprogress_all(docs, now):
+    """Fixture mirror of GET /api/ws/progress?ws=all: the project total
+    over the per-workstream docs (same merge rule as the server: summed
+    step values at the union of event moments over the summed total)."""
+    bodies = [doc["wsprogress"] for doc in docs.values()]
+    bodies = [b for b in bodies if (b.get("total") or 0) > 0]
+    total = sum(b["total"] for b in bodies)
+    done = sum(b["done"] for b in bodies)
+    counts = {}
+    for body in bodies:
+        for name, value in (body.get("counts") or {}).items():
+            counts[name] = counts.get(name, 0) + value
+    ticks = sorted({pt["t"] for body in bodies for pt in body["points"]})
+
+    def _at(points, moment):
+        value = (0, 0)
+        for pt in points:
+            if pt["t"] <= moment:
+                value = (pt["done"], pt["prog"])
+            else:
+                break
+        return value
+
+    points = []
+    for tick in ticks:
+        part_done = sum(_at(b["points"], tick)[0] for b in bodies)
+        part_prog = sum(_at(b["points"], tick)[1] for b in bodies)
+        points.append(
+            {
+                "t": tick,
+                "done": part_done,
+                "prog": part_prog,
+                "pct": round(part_done / total * 1000) / 10 if total else 0.0,
+            }
+        )
+    milestones = []
+    for mark in (20, 40, 60, 80, 100):
+        need = math.ceil(total * mark / 100) if total else 0
+        crossed = next((pt["t"] for pt in points if pt["done"] >= need), None)
+        if total and crossed is not None:
+            milestones.append(
+                {"pct": mark, "t": crossed, "done": need,
+                 "elapsed": crossed - points[0]["t"] if points else 0.0,
+                 "reached": True}
+            )
+        else:
+            milestones.append(
+                {"pct": mark, "t": None, "done": need,
+                 "elapsed": None, "reached": False}
+            )
+    per = {}
+    for body in bodies:
+        for row in body["runs_per_hour"]:
+            per[row["t"]] = per.get(row["t"], 0) + row["n"]
+    undated = sum(b.get("undated") or 0 for b in bodies)
+    tasks_word = "task" if undated == 1 else "tasks"
+    merged = {
+        "ws": "all",
+        "workstreams": sorted(b["ws"] for b in bodies),
+        "total": total,
+        "done": done,
+        "pct": round(done / total * 1000) / 10 if total else 0.0,
+        "counts": counts,
+        "start": min(b["start"] for b in bodies),
+        "end": max(b["end"] for b in bodies),
+        "now": now,
+        "points": points,
+        "milestones": milestones,
+        "runs_per_hour": [{"t": hour, "n": per[hour]} for hour in sorted(per)],
+        "runs_total": sum(b.get("runs_total") or 0 for b in bodies),
+        "undated_runs": sum(b.get("undated_runs") or 0 for b in bodies),
+        "observed": sum(b.get("observed") or 0 for b in bodies),
+        "inferred": sum(b.get("inferred") or 0 for b in bodies),
+        "dated": sum(b.get("dated") or 0 for b in bodies),
+        "undated": undated,
+        "gap": ("no recorded task moves: %d done %s not dated" % (undated, tasks_word))
+        if undated
+        else None,
+        "backfilled": [task for b in bodies for task in (b.get("backfilled") or [])],
+    }
+    return {"wsprogress": merged, "_note": NOTE}
+
+
 def _counts(runs, now):
     tools = ("grok", "muse", "glm", "claude")
     live_by = {key: 0 for key in tools}
@@ -1505,8 +1588,10 @@ def main():
         files[f"plan-{ws}.json"] = plan
     for ws, plan in plans.items():
         files[f"replay-{ws}.json"] = _replay_doc(runs, ws, plan["groups"])
-    for ws, doc in _wsprogress(runs, NOW, plans).items():
+    prog_docs = _wsprogress(runs, NOW, plans)
+    for ws, doc in prog_docs.items():
         files[f"ws-progress-{ws}.json"] = doc
+    files["ws-progress-all.json"] = _wsprogress_all(prog_docs, NOW)
     for name, doc in files.items():
         path = HERE / name
         path.parent.mkdir(parents=True, exist_ok=True)

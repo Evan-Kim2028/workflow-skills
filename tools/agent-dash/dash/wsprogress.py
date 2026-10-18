@@ -1,7 +1,9 @@
 """Per-workstream progress over time: completion plus runs per hour.
 
 ``GET /api/ws/progress?ws=<ID>`` answers what the workstream Execution
-tab's "Progress over time" card paints:
+tab's "Progress over time" strip paints; ``?ws=all`` answers the
+project total for the overall Execution view (all non-archived
+workstreams weighted by task count, one series pair):
 
 - Chart A: % of non-deferred tasks done over time (a step line from each
   task's resolved done moment, plus the recorded ``prog``
@@ -74,6 +76,168 @@ def cache_key(store, ws: str) -> tuple:
 def clear_cache() -> None:
     """Drop the cached payload (tests only; production invalidates by key)."""
     _CACHE.clear()
+
+
+def project_ids() -> list[str]:
+    """Bundle ids with a plan, minus archived/dropped ones.
+
+    Never raises: an unreadable bundle root reads as no workstreams.
+    """
+    try:
+        from dash.bundles import list_bundles
+    except Exception:
+        return []
+    try:
+        items = list_bundles()
+    except Exception:
+        return []
+    try:
+        from dash.workstates import hidden_ids
+
+        hidden = hidden_ids()
+    except Exception:
+        hidden = set()
+    return sorted(
+        [item["id"] for item in items if isinstance(item, dict) and item.get("id") not in hidden]
+    )
+
+
+def project_cache_key(store) -> tuple:
+    """Cache key for the project total: one entry per non-hidden bundle id."""
+    return ("all", tuple((ws, cache_key(store, ws)) for ws in project_ids()))
+
+
+def _step_at(points: list, moment: float) -> tuple:
+    """(done, prog) at one moment from sorted step points; (0, 0) before the first."""
+    done, prog = 0, 0
+    for pt in points or []:
+        if pt["t"] <= moment:
+            done, prog = pt["done"], pt["prog"]
+        else:
+            break
+    return done, prog
+
+
+def build_project_progress(store, now: float | None = None) -> dict:
+    """Progress-over-time payload for the project total (``ws=all``).
+
+    One series pair for all non-archived workstreams weighted by task
+    count: at every per-workstream event moment the merged done/prog
+    counts are the sums of the per-workstream step values there, over
+    the summed plan total. Milestones are the first-cross times of
+    20/40/60/80/100% on that merged series; runs started per hour are
+    summed per hour. Workstreams with no plan read as no data and leave
+    the total (never interpolated). Raises ``ReplayNotFound`` when no
+    non-archived workstream has plan data, so the strip hides instead
+    of drawing an empty frame.
+    """
+    from dash.replay import ReplayNotFound
+
+    moment = float(now if now is not None else time.time())
+
+    key = project_cache_key(store)
+    if _CACHE.get("project-key") == key and "project-payload" in _CACHE:
+        return _CACHE["project-payload"]
+
+    parts = []
+    for ws in project_ids():
+        try:
+            part = build_wsprogress(store, ws, moment)
+        except ReplayNotFound:
+            continue
+        if (part.get("total") or 0) > 0:
+            parts.append(part)
+    if not parts:
+        raise ReplayNotFound("all")
+
+    total = sum(int(part["total"]) for part in parts)
+    done_now = sum(int(part["done"]) for part in parts)
+    counts: dict = {}
+    for part in parts:
+        for name, value in (part.get("counts") or {}).items():
+            try:
+                counts[name] = counts.get(name, 0) + int(value)
+            except (TypeError, ValueError):
+                continue
+
+    ticks = sorted({pt["t"] for part in parts for pt in (part.get("points") or [])})
+    points = []
+    for tick in ticks:
+        done = prog = 0
+        for part in parts:
+            part_done, part_prog = _step_at(part.get("points"), tick)
+            done += part_done
+            prog += part_prog
+        points.append({"t": tick, "done": done, "prog": prog, "pct": _pct(done, total)})
+
+    milestones = []
+    for pct_mark in MILESTONES:
+        need = int(math.ceil(total * pct_mark / 100.0)) if total > 0 else 0
+        crossed = next((pt["t"] for pt in points if pt["done"] >= need), None)
+        if total > 0 and crossed is not None:
+            milestones.append(
+                {
+                    "pct": pct_mark,
+                    "t": crossed,
+                    "done": need,
+                    "elapsed": max(0.0, crossed - points[0]["t"]) if points else 0.0,
+                    "reached": True,
+                }
+            )
+        else:
+            milestones.append(
+                {"pct": pct_mark, "t": None, "done": need, "elapsed": None, "reached": False}
+            )
+
+    per_hour: dict[int, int] = {}
+    for part in parts:
+        for row in part.get("runs_per_hour") or []:
+            try:
+                hour = int(row["t"])
+                per_hour[hour] = per_hour.get(hour, 0) + int(row["n"])
+            except (TypeError, ValueError, KeyError):
+                continue
+    runs_per_hour = [{"t": hour, "n": per_hour[hour]} for hour in sorted(per_hour)]
+
+    def _sum(name: str) -> int:
+        subtotal = 0
+        for part in parts:
+            try:
+                subtotal += int(part.get(name) or 0)
+            except (TypeError, ValueError):
+                continue
+        return subtotal
+
+    undated = _sum("undated")
+    tasks_word = "task" if undated == 1 else "tasks"
+    payload = {
+        "ws": "all",
+        "workstreams": sorted(part["ws"] for part in parts),
+        "total": total,
+        "done": done_now,
+        "pct": _pct(done_now, total),
+        "counts": counts,
+        "start": min(part["start"] for part in parts),
+        "end": max(part["end"] for part in parts),
+        "now": moment,
+        "points": points,
+        "milestones": milestones,
+        "runs_per_hour": runs_per_hour,
+        "runs_total": _sum("runs_total"),
+        "undated_runs": _sum("undated_runs"),
+        "observed": _sum("observed"),
+        "inferred": _sum("inferred"),
+        "dated": _sum("dated"),
+        "undated": undated,
+        "gap": ("no recorded task moves: %d done %s not dated" % (undated, tasks_word))
+        if undated
+        else None,
+        "backfilled": [task for part in parts for task in (part.get("backfilled") or [])],
+    }
+
+    _CACHE["project-key"] = key
+    _CACHE["project-payload"] = payload
+    return payload
 
 
 def _backfilled_tasks(ws: str) -> list[str]:

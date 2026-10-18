@@ -1,0 +1,123 @@
+{
+  "wsprogress": {
+    "ws": "all",
+    "workstreams": [
+      "WS1",
+      "WS10",
+      "WS11",
+      "WS2",
+      "WS7",
+      "WS9"
+    ],
+    "total": 24,
+    "done": 11,
+    "pct": 45.8,
+    "counts": {
+      "todo": 9,
+      "wip": 1,
+      "pr": 2,
+      "prog": 1,
+      "done": 11,
+      "deferred": 0
+    },
+    "start": 1761990960,
+    "end": 1761999960.0,
+    "now": 1761999960,
+    "points": [
+      {
+        "t": 1761992760.0,
+        "done": 1,
+        "prog": 0,
+        "pct": 4.2
+      },
+      {
+        "t": 1761994560.0,
+        "done": 2,
+        "prog": 0,
+        "pct": 8.3
+      },
+      {
+        "t": 1761996360.0,
+        "done": 4,
+        "prog": 0,
+        "pct": 16.7
+      },
+      {
+        "t": 1761998160.0,
+        "done": 7,
+        "prog": 0,
+        "pct": 29.2
+      },
+      {
+        "t": 1761999960.0,
+        "done": 11,
+        "prog": 1,
+        "pct": 45.8
+      }
+    ],
+    "milestones": [
+      {
+        "pct": 20,
+        "t": 1761998160.0,
+        "done": 5,
+        "elapsed": 5400.0,
+        "reached": true
+      },
+      {
+        "pct": 40,
+        "t": 1761999960.0,
+        "done": 10,
+        "elapsed": 7200.0,
+        "reached": true
+      },
+      {
+        "pct": 60,
+        "t": null,
+        "done": 15,
+        "elapsed": null,
+        "reached": false
+      },
+      {
+        "pct": 80,
+        "t": null,
+        "done": 20,
+        "elapsed": null,
+        "reached": false
+      },
+      {
+        "pct": 100,
+        "t": null,
+        "done": 24,
+        "elapsed": null,
+        "reached": false
+      }
+    ],
+    "runs_per_hour": [
+      {
+        "t": 1761976800,
+        "n": 45
+      },
+      {
+        "t": 1761980400,
+        "n": 65
+      },
+      {
+        "t": 1761994800,
+        "n": 30
+      },
+      {
+        "t": 1761998400,
+        "n": 7
+      }
+    ],
+    "runs_total": 147,
+    "undated_runs": 0,
+    "observed": 11,
+    "inferred": 0,
+    "dated": 11,
+    "undated": 0,
+    "gap": null,
+    "backfilled": []
+  },
+  "_note": "Seeded synthetic data for the offline preview. Seed 1. No local sessions are read."
+}

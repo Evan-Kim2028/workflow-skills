@@ -1,28 +1,36 @@
-/* Page card: Activity over time, one tile for tokens, runs and live agents.
-   Replaces the three separate sections (Tokens per hour, Run timeline,
-   Live agents over time) with a single card that stacks the three strips
-   vertically in that order on ONE shared x axis (time) with ONE time
-   filter. The filter sits on top of the tile as a horizontal range bar on
-   the time axis: a track covering the loaded window with two draggable
-   handles and a draggable middle, quick presets (Last hour, 6 h, 24 h,
-   All), a Reset button, the selected range label, and a tokens-per-hour
-   sparkline inside the bar showing where to brush. A brush zooms all
-   three strips to the same domain at once; x labels draw once at the
-   bottom of the stack (plus the brush bar's own labels at the top) while
-   each strip keeps its own y axis and title. The timeline strip keeps the
-   timeline row model (one lane per model family, packed rows, outcome
-   colours, click-to-drawer); the token strip keeps the grouping toggle
-   and legend; the live strips keep one strip per family on its own scale.
+/* Page card: Activity over time, one tile for tokens, runs, completion
+   and live agents. Replaces the separate sections (Tokens per hour, Run
+   timeline, Live agents over time, Progress over time) with a single
+   card that stacks the four strips vertically in that order on ONE
+   shared x axis (time) with ONE time filter. The filter sits on top of
+   the tile as a horizontal range bar on the time axis: a track covering
+   the loaded window with two draggable handles and a draggable middle,
+   quick presets (Last hour, 6 h, 24 h, All), a Reset button, the
+   selected range label, and a tokens-per-hour sparkline inside the bar
+   showing where to brush. A brush zooms all four strips to the same
+   domain at once; x labels draw once at the bottom of the stack (plus
+   the brush bar's own labels at the top) while each strip keeps its own
+   y axis and title. The timeline strip keeps the timeline row model
+   (one lane per model family, packed rows, outcome colours,
+   click-to-drawer); the token strip keeps the grouping toggle and
+   legend; the progress strip keeps the Done / Merged-waiting-on-prod
+   step series on a 0-100% axis; the live strips keep one strip per
+   family on its own scale.
    Reads: state.usage, state.runs, state.conc (plus the older-than-24 h
-   top-up in state.actWide); Date.now for the rolling window.
+   top-up in state.actWide), state.actProg (the progress payload cache);
+   Date.now for the rolling window.
    Exports (on window.AdPage, also kept as plain globals): activityCard
    plus the pure range helpers actClampRange, actPresetRange, actTimeToX,
-   actXToTime, actDragHandle, actDragMove and actTickStep (node-tested) and
-   the pure strip-family helper actConcFams (node-tested).
-   Needs: el, s, CW, axes, timeTicks, fmtN, fmtDur, fmtT, fmtDate,
+   actXToTime, actDragHandle, actDragMove and actTickStep (node-tested),
+   the pure strip-family helper actConcFams (node-tested), and the pure
+   progress-strip helpers actProgY, actProgClip and actProgHas
+   (node-tested).
+   Needs: el, s, CW, axes, timeTicks, fmtN, fmtPct, fmtDur, fmtT, fmtDate,
    showTip, hideTip, openRun, drawMain, api, colorOf, fullName, tierKey,
    modelKey, state, since, groupFor, expanded, isAgent, runEnd, packRows,
-   outcomeOf, OUTCOME (plain globals). */
+   outcomeOf, OUTCOME, FIX, secCache, progressFor, shown, progStep,
+   progPctFmt, progLegendTip, progStepRows, progMileRows, progTakeaway,
+   progBest, progBestElapsed (plain globals). */
 (function (global) {
   "use strict";
 
@@ -308,7 +316,7 @@
     var g = actGeo();
     var c = el("div", {class: "card", id: "exec-activity", "data-nav": "Activity over time"});
     c.appendChild(el("h2", {text: "Activity over time"}));
-    c.appendChild(el("p", {class: "sub", text: "Tokens, runs and live agents on one shared time axis. Brush the range bar to zoom all three at once; the Last hour preset follows now, a brush stays put."}));
+    c.appendChild(el("p", {class: "sub", text: "Tokens, runs, completion and live agents on one shared time axis. Brush the range bar to zoom all four at once; the Last hour preset follows now, a brush stays put."}));
     var bar = el("div", {class: "act-controls", role: "group", "aria-label": "Time range"});
     ACT_PRESETS.forEach(function (p) {
       var active = r.live ? r.preset === p[0] : p[0] === "all" && r.preset === "all";
@@ -326,7 +334,7 @@
     var brushWrap = el("div", {class: "act-brush"});
     var strips = el("div", {class: "act-strips"});
     /* Live redraw while dragging: the brush selection and range label
-       repaint on every move (cheap); the three strips repaint from
+       repaint on every move (cheap); the four strips repaint from
        loaded data at most every 400 ms and at most once per animation
        frame, so a fast drag never queues seconds of strip rebuilds
        behind the release and never flickers mid-frame. The commit on
@@ -367,17 +375,21 @@
     strips.textContent = "";
     var tok = actTokenStrip(range, loaded, g);
     var tml = actTimelineStrip(range, loaded, now, g, false);
+    var prog = actProgStrip(range, loaded, g, false);
     var conc = actConcStrips(range, loaded, g, false);
-    if (!tok.hasData && !tml.hasData && !conc.length) {
+    if (!tok.hasData && !tml.hasData && !prog.hasData && !conc.length) {
       strips.appendChild(el("div", {class: "empty", text: "No activity in this window."}));
       return;
     }
     /* The x axis labels draw once at the bottom of the stack: only the
-       last strip that actually drew gets ticks. */
+       last strip that actually drew gets ticks. Order is tokens, run
+       timeline, progress over time, then live agents. */
     if (conc.length) conc[conc.length - 1] = actConcStrip(range, loaded, g, conc[conc.length - 1].fam, true, null, null, true);
+    else if (prog.hasData) prog = actProgStrip(range, loaded, g, true);
     else tml = actTimelineStrip(range, loaded, now, g, true);
     strips.appendChild(tok.node);
     strips.appendChild(tml.node);
+    if (prog.hasData) strips.appendChild(prog.node);
     conc.forEach(function (p) { strips.appendChild(p.node); });
     if (!conc.length) {
       if (state.snapError) strips.appendChild(el("div", {class: "empty err", "data-failed-scope": state.ws, text: "request failed \u2014 " + state.snapError}));
@@ -421,7 +433,7 @@
     var W = g.W, L = g.L, pw = g.pw;
     var H = 66, trackY = 28, trackH = 18;
     var XB = function (t) { return actTimeToX(t, loaded.t0, loaded.t1, L, pw); };
-    var svg = s("svg", {viewBox: "0 0 " + W + " " + H, width: W, height: H, style: "display:block;max-width:100%", class: "act-svg", role: "group", "aria-label": "Time filter: brush a range to zoom the three charts below"});
+    var svg = s("svg", {viewBox: "0 0 " + W + " " + H, width: W, height: H, style: "display:block;max-width:100%", class: "act-svg", role: "group", "aria-label": "Time filter: brush a range to zoom the four strips below"});
     var ref = svg._act = {XB: XB, range: {from: range0.from, to: range0.to}};
     svg.appendChild(s("rect", {x: L, y: trackY, width: pw, height: trackH, rx: 5, fill: "var(--surface-2)", class: "act-track"}));
     /* Sparkline: the activity shape (tokens per hour) behind the brush. */
@@ -874,6 +886,191 @@
     return {node: wrap, hasData: true};
   }
 
+  /* Progress-over-time strip: the Done plus Merged-waiting-on-prod step
+     series as % of tasks on the shared x, with its own 0-100% y axis.
+     On a workstream tab it shows that workstream's series; on the
+     overall view it shows the project total (all non-archived
+     workstreams weighted by task count) as one series pair. The payload
+     loads once per scope and refetches only when the plan stamp moves;
+     the fetch URL carries no time params, so the conditional-GET layer
+     answers 304 while nothing changed, and a brush never fetches (the
+     loaded series clips locally on release). No plan data means no
+     strip at all: the stack skips it with no empty frame. */
+  var actProgInflight = null;
+  function actProgStamp(scope) {
+    function one(id) {
+      try { return (typeof progressFor === "function") ? progressFor(id) : null; }
+      catch (e) { return null; }
+    }
+    if (scope === "all") {
+      var rows = state.wss || [];
+      try { if (typeof shown === "function") rows = shown(state.wss || []); } catch (e) {}
+      return rows.map(function (w) {
+        var pr = one(w.ws);
+        return w.ws + ":" + (pr ? pr.done + "/" + pr.total : "-");
+      }).join(",");
+    }
+    var single = one(scope);
+    return single ? single.done + "/" + single.total : "none";
+  }
+  /* Section-key fragment for the committed progress payload: the scope,
+     the plan stamp behind it, and whether data is in hand (loading and
+     loaded key apart, so the arrival redraws the stack once). */
+  function actProgKey() {
+    var scope = actScope();
+    var c = state.actProg;
+    var loaded = (c && c.scope === scope && c.data) ? "1" : "0";
+    return scope + "|" + actProgStamp(scope) + "|" + loaded;
+  }
+  function actProgEnsure(scope, stamp) {
+    var c = state.actProg;
+    if (c && c.scope === scope && c.stamp === stamp) return;
+    if (actProgInflight === scope + "|" + stamp) return;
+    actProgInflight = scope + "|" + stamp;
+    api("/api/ws/progress", {ws: scope}).then(function (j) {
+      actProgInflight = null;
+      if (actScope() !== scope || state.view !== "exec") return;
+      state.actProg = {scope: scope, stamp: stamp, data: (j && j.wsprogress) || null};
+      try { delete secCache.activity; } catch (e) {}
+      drawMain();
+    }, function () {
+      actProgInflight = null;
+      if (actScope() !== scope || state.view !== "exec") return;
+      /* A failed fetch (including the 404 for no plan data) leaves no
+         strip: the progress series is supplementary, and snapshot
+         failures already surface loudly elsewhere. */
+      state.actProg = {scope: scope, stamp: stamp, data: null};
+      try { delete secCache.activity; } catch (e2) {}
+      drawMain();
+    });
+  }
+  /* Percent of tasks to a y pixel on a 0-100% strip of top T and height
+     ph. Pure: no DOM, no state. */
+  function actProgY(pct, T, ph) {
+    var v = Math.max(0, Math.min(100, +pct || 0));
+    return T + ph - v / 100 * ph;
+  }
+  /* Zoom clipping for step points: the vertices inside [from, to], with
+     the last vertex before from carried in clamped to from (marked
+     edge, so no dot draws on a synthetic point) so the step-after line
+     starts at the right level. Pure: no DOM, no state. */
+  function actProgClip(pts, from, to) {
+    var out = [], prior = null;
+    (pts || []).forEach(function (pt) {
+      if (pt.t < from) prior = pt;
+      else if (pt.t <= to) out.push(pt);
+    });
+    if (prior && (!out.length || out[0].t > from))
+      out.unshift({t: from, done: prior.done, prog: prior.prog || 0, edge: true});
+    return out;
+  }
+  /* Hidden-when-empty predicate: no plan data (or no total, or no
+     recorded moves) means no strip, never an empty frame. Pure. */
+  function actProgHas(p) {
+    return !!(p && (p.total || 0) > 0 && (p.points || []).length);
+  }
+  function actProgStrip(range, loaded, g, withX) {
+    var scope = actScope();
+    var stamp = actProgStamp(scope);
+    var c = state.actProg;
+    if (!c || c.scope !== scope || c.stamp !== stamp) {
+      actProgEnsure(scope, stamp);
+      return {node: null, hasData: false};
+    }
+    var p = c.data;
+    if (!actProgHas(p)) return {node: null, hasData: false};
+    var from = range.from, to = range.to;
+    /* Strip id exec-prog: the plan progress map card already owns the
+       longer id (static/cards/plan-progress.js), and ids stay unique. */
+    var wrap = el("div", {class: "act-strip", id: "exec-prog"});
+    var head = el("div", {class: "prog-head"});
+    head.appendChild(el("h3", {text: scope === "all" ? "Progress over time · project total" : "Progress over time"}));
+    var total = Math.max(1, p.total || 0);
+    var pts = p.points || [];
+    var progNow = pts.length ? (pts[pts.length - 1].prog || 0) : 0;
+    var lg = el("div", {class: "legend tok-legend prog-legend"});
+    lg.appendChild(el("span", {class: "ltotal", "data-legend-total": String(p.done || 0), "data-chart-sum": String(p.done || 0), title: "Tasks done now in this scope"}, [el("b", {text: "Done " + fmtN(p.done || 0)})]));
+    [["done", "✓ Done", "var(--s1)", p.done || 0], ["prog", "⇡ Merged, waiting on prod", "var(--s5)", progNow]].forEach(function (row) {
+      lg.appendChild(el("span", {class: "lentry", "data-key": row[0], "data-v": String(row[3]), title: progLegendTip(row[1], row[3] / total)}, [
+        (function () { var sw = el("i", {class: "sw"}); sw.style.background = row[2]; return sw; })(),
+        el("span", {class: "lname", text: row[1]}),
+        el("span", {class: "lv", text: fmtN(row[3])})
+      ]));
+    });
+    head.appendChild(lg);
+    wrap.appendChild(head);
+    var W = g.W, L = g.L, pw = g.pw, H = withX ? 196 : 160, T = 8, Bm = withX ? 36 : 10, ph = H - T - Bm;
+    var st = actSharedTicks(range, g), X = st.X;
+    var Y = function (pct) { return actProgY(pct, T, ph); };
+    var clipped = actProgClip(pts, from, to);
+    var doneOf = function (pt) { return pt.done / total * 100; };
+    var withProg = function (pt) { return (pt.done + (pt.prog || 0)) / total * 100; };
+    var aria = (scope === "all" ? "Project total progress over time" : "Progress over time for " + scope) +
+      ": " + progTakeaway(p.done, p.total, p.pct || 0, progBest(p), progBestElapsed(p), p.runs_total || 0);
+    var svg = s("svg", {viewBox: "0 0 " + W + " " + H, width: W, height: H, style: "display:block;max-width:100%", role: "img", "data-strip": "progress", "data-x-from": String(Math.round(from)), "data-x-to": String(Math.round(to)), "aria-label": aria});
+    actXGrid(svg, st.ticks, T, T + ph);
+    /* Prog band between the done line and done+prog, then the done area
+       and both step lines (progStep draws step-after through the
+       shared X, same as the old standalone chart). */
+    var focal = {L: L};
+    if (clipped.length) {
+      var top = progStep(focal, X, Y, clipped, withProg);
+      var line = progStep(focal, X, Y, clipped, doneOf);
+      var first = clipped[0], last = clipped[clipped.length - 1];
+      svg.appendChild(s("path", {d: top + " L" + actR1(X(last.t)) + "," + actR1(Y(doneOf(last))) + " L" + actR1(X(first.t)) + "," + actR1(Y(doneOf(first))) + " Z", fill: "var(--s5)", opacity: ".12"}));
+      svg.appendChild(s("path", {d: line + " L" + actR1(X(last.t)) + "," + actR1(T + ph) + " L" + actR1(X(first.t)) + "," + actR1(T + ph) + " Z", fill: "var(--s1)", opacity: ".16"}));
+      svg.appendChild(s("path", {d: line, fill: "none", stroke: "var(--s1)", "stroke-width": "2.5"}));
+      svg.appendChild(s("path", {d: top, fill: "none", stroke: "var(--s5)", "stroke-width": "1.6", "stroke-dasharray": "5 4"}));
+    }
+    clipped.forEach(function (pt) {
+      if (pt.edge) return;
+      var dot = s("circle", {cx: actR1(X(pt.t)), cy: actR1(Y(doneOf(pt))), r: "2.6", fill: "var(--s1)", "data-t": String(pt.t), "data-v": String(pt.done)});
+      dot.addEventListener("mousemove", function (ev) {
+        showTip(ev, fmtDate(pt.t), progStepRows(pt.done, total, pt.prog || 0));
+        var root = svg.parentNode && svg.parentNode.parentNode;
+        if (root && root.actCrossMove) root.actCrossMove(pt.t);
+      });
+      dot.addEventListener("mouseleave", function () {
+        hideTip();
+        var root = svg.parentNode && svg.parentNode.parentNode;
+        if (root && root.actCrossHide) root.actCrossHide();
+      });
+      dot.addEventListener("focus", function (ev) {
+        showTip(ev, fmtDate(pt.t), progStepRows(pt.done, total, pt.prog || 0));
+      });
+      dot.addEventListener("blur", hideTip);
+      dot.setAttribute("tabindex", "0");
+      svg.appendChild(dot);
+    });
+    /* Milestone dots with % labels for reached marks inside the range. */
+    (p.milestones || []).forEach(function (m) {
+      if (!m.reached || m.t == null || m.t < from || m.t > to) return;
+      var dot = s("circle", {cx: actR1(X(m.t)), cy: actR1(Y(m.pct)), r: "4.5", fill: "var(--s1)", stroke: "var(--surface)", "stroke-width": "1.5", "data-milestone": String(m.pct), "data-t": String(m.t), "data-v": String(m.done)});
+      dot.addEventListener("mousemove", function (ev) {
+        showTip(ev, fmtDate(m.t) + " — " + m.pct + "% first reached", progMileRows(m.done, total, m.elapsed));
+      });
+      dot.addEventListener("mouseleave", hideTip);
+      dot.addEventListener("focus", function (ev) {
+        showTip(ev, fmtDate(m.t) + " — " + m.pct + "% first reached", progMileRows(m.done, total, m.elapsed));
+      });
+      dot.addEventListener("blur", hideTip);
+      dot.setAttribute("tabindex", "0");
+      svg.appendChild(dot);
+      var lab = s("text", {x: Math.min(actR1(X(m.t)) + 8, L + pw - 4), y: actR1(Y(m.pct)) + 4, class: "plab"});
+      lab.textContent = m.pct + "%";
+      svg.appendChild(lab);
+    });
+    axes(svg, {L: L, T: T, pw: pw, ph: ph, yMax: 100, yTicks: 4, yFmt: progPctFmt, xTicks: withX ? st.ticks : [], yTitle: "% of tasks", xTitle: withX ? "time" : null});
+    actCrossOf(svg, T, T + ph);
+    wrap.appendChild(svg);
+    /* Capped history: the series starts before the loaded window, so
+       the strip clips and names the cut instead of implying full
+       history. Only when such data exists. */
+    if (p.start < loaded.t0)
+      wrap.appendChild(el("p", {class: "prog-note", text: "Earlier history before " + fmtDate(loaded.t0)}));
+    return {node: wrap, hasData: true};
+  }
+
   /* Live-agents strips: one gradient strip per model family on its own
      scale and the shared x, with peak dot and pk annotation. Only the
      bottom strip of the stack carries x labels. */
@@ -997,6 +1194,13 @@
   AdPage.actDragHandle = actDragHandle;
   AdPage.actDragMove = actDragMove;
   AdPage.actTickStep = actTickStep;
+  AdPage.cards.actProgStrip = actProgStrip;
+  AdPage.actProgStrip = actProgStrip;
+  AdPage.actProgKey = actProgKey;
+  AdPage.actProgStamp = actProgStamp;
+  AdPage.actProgY = actProgY;
+  AdPage.actProgClip = actProgClip;
+  AdPage.actProgHas = actProgHas;
   AdPage.actRangeKey = actRangeKey;
   AdPage.actRangeLabel = actRangeLabel;
   AdPage.actLegendTip = actLegendTip;
@@ -1016,6 +1220,12 @@
   global.actDragHandle = actDragHandle;
   global.actDragMove = actDragMove;
   global.actTickStep = actTickStep;
+  global.actProgStrip = actProgStrip;
+  global.actProgKey = actProgKey;
+  global.actProgStamp = actProgStamp;
+  global.actProgY = actProgY;
+  global.actProgClip = actProgClip;
+  global.actProgHas = actProgHas;
   global.actRangeKey = actRangeKey;
   global.actRangeLabel = actRangeLabel;
   global.actLegendTip = actLegendTip;
