@@ -21,6 +21,7 @@ The one argv value ever kept is the worker's `--model` flag value, recorded on p
 | `dash/store/summarize.py` (snapshots, rollups, reconcile, mismatches) | core |
 | `dash/store/queries.py` (state, workstream, concurrency, session reads) | core |
 | `dash/workstates.py` (bundle lifecycle states, `?state=` scopes, archive cards) | core |
+| `dash/decisions.py` (hub decisions/risks parser, computed risks; read-only, cached by file mtime) | core |
 | `dash/store/util.py` (shared constants, pure helpers) | core |
 | `dash/buildinfo.py` (build id + process start time) | core |
 | `dash/deploy.py` (clean-release deploy, rollback, `releases/`) | core |
@@ -315,6 +316,8 @@ store pass (`Store.state_view`):
  "now": 0, "window": {"since": 0, "until": 0, "hours": 24},
  "health": {"ok": true, "sources": [{name, last_poll, last_error, lag_s}], "scratch_roots": [], "run_dirs": [], "warnings": []},
  "project": {"name": null},
+ "decisions": {"total": 0, "open": 0},
+ "risks": {"total": 0, "by_severity": {"warn": 0}},
  "workstreams": [{"id": "WS7", "title": "", "state": "active", "plan": true, "progress": {"done": 0, "total": 0, "counts": {}, "pct": 0},
    "live_agents": 0, "tokens": 0, "cost_usd": 0.0, "tokens_all_time": 0, "cost_usd_all_time": 0.0, "last_activity": 0}],
  "unassigned": {"live_agents": 0, "tokens": 0, "cost_usd": 0.0, "tokens_all_time": 0, "cost_usd_all_time": 0.0, "last_activity": 0},
@@ -324,6 +327,10 @@ store pass (`Store.state_view`):
  "reconcile": {"ok": true, "mismatches": []},
  "problems": [{"code": "stale-running", "message": "", "command": "python3 agent_dash.py check"}]}
 ```
+`decisions` is the hub decisions summary (`total` rows, `open` rows whose
+status is not a closing one such as `accepted`); `risks` is the
+`/api/risks` summary (`total` rows, `by_severity` counts). Both read the
+same hub files as their endpoints, so the strip and the roll-up agree.
 `version.tool` is the git short sha of the tool directory, `"unknown"`
 outside git. `version.build_id` adds the `-dirty` flag for a checkout
 with uncommitted changes at start; `version.started_at` is the process
@@ -550,6 +557,8 @@ HTTP, still GET only, 127.0.0.1:
 - `GET /api/archive` returns `{"archive": [{<summary.json contents>, id, title, archived_at, report}], "totals": {workstreams, tokens, cost_usd, runs}}`: one frozen summary card per `archived` workstream, newest first (bundles without `summary.json` still list with their metadata). `report` is the closing-report file's basename only, never a path and never its body — no report prose reaches any endpoint. `ws archive` freezes `closing_report_name` (the basename, `closing-report.md`) and the boolean `closing_report` into `summary.json`; the card resolves `report` in this order: the frozen `closing_report_name` when that file still exists in the bundle's `docs/`, then `docs/closing-report.md`, then the legacy summary report keys, then the newest `reports/*closing*.md`. `totals` is the archived workstreams' lifetime share from the store (same summary functions as every other total: all-time tokens and cost plus the run-row count), so project lifetime numbers keep including archived work.
 - `GET /api/plan?ws=<ID>` includes `start_prompt` the same way when that bundle has the file, and null otherwise.
 - `GET /api/approvals?ws=<ID|all>` returns one record, or `{approvals: [...]}` for `all`.
+- `GET /api/decisions` returns `{"decisions": [{id, title, status, owner, date, workstream, area, link, ...short extras}], "counts": {status: n}, "source": {"present": bool}}`, newest first, read from `<hub_dir>/decisions.tsv` (missing file means `[]`, `present: false`). Header-driven and tolerant: unknown columns survive as short extras; any cell over 400 chars and any local-file-path cell never reach the payload.
+- `GET /api/risks` returns `{"risks": [{id, title, severity, source, ws, since}]}`: computed risks first (stale plan gates, pending approvals past the doctor `approval_days` window, critical/warn doctor groups on `active` workstreams, `planned` workstreams blocked by an unfinished dependency; severities `warn`/`info`, every title names the workstream before any task id), then the hub `risks.tsv`/`risks.json` rows (`source: "file"`). Archived and dropped workstreams emit no computed risk.
 - `GET /bundle/<ID>/page.html` returns that file only. The resolved path has to stay inside the bundle directory.
 
 `static/vendor/mermaid.min.js` is mermaid 11.16.1. The plan page runs it on `pre.mermaid`. No CDN.

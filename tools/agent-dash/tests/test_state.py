@@ -171,6 +171,32 @@ class StateShapeTest(unittest.TestCase):
             {"tokens": 0, "cost_usd": 0.0, "finished": 0, "live_agents": 0},
         )
 
+    def test_decisions_and_risks_blocks(self):
+        now = time.time()
+        hub = os.path.join(self.tmp.name, "hub")
+        os.makedirs(hub)
+        with open(os.path.join(hub, "decisions.tsv"), "w") as fh:
+            fh.write(
+                "date\tid\tdecision\tstatus\n"
+                "2026-10-14\tD-1\told choice\taccepted\n"
+                "2026-10-16\tD-2\tnew choice\tproposed\n"
+            )
+        with mock.patch.dict(os.environ, {"AGENT_DASH_WORKSTREAMS": os.path.join(self.tmp.name, "ws")}):
+            os.makedirs(os.path.join(self.tmp.name, "ws"), exist_ok=True)
+            payload = build_state(
+                self.store, StubRegistry([]), {"hub_dir": hub}, now=now
+            )
+        self.assertEqual(payload["decisions"], {"total": 2, "open": 1})
+        self.assertEqual(payload["risks"], {"total": 0, "by_severity": {}})
+
+    def test_no_hub_means_empty_decisions_and_risks(self):
+        empty_ws = os.path.join(self.tmp.name, "empty-ws")
+        os.makedirs(empty_ws, exist_ok=True)
+        with mock.patch.dict(os.environ, {"AGENT_DASH_WORKSTREAMS": empty_ws}):
+            payload = build_state(self.store, StubRegistry([]), {}, now=time.time())
+        self.assertEqual(payload["decisions"], {"total": 0, "open": 0})
+        self.assertEqual(payload["risks"], {"total": 0, "by_severity": {}})
+
     def test_one_store_pass(self):
         calls = []
         real = Store._summarize_locked

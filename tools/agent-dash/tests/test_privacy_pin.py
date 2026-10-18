@@ -165,6 +165,8 @@ PATHS = [
     "/api/bundles",
     "/api/bundle?ws=WS1",
     "/api/approvals?ws=all",
+    "/api/decisions",
+    "/api/risks",
     "/api/health",
     "/api/doctor",
     "/api/state",
@@ -202,7 +204,12 @@ class PrivacyPinEndpointTest(unittest.TestCase):
         self.addCleanup(self._dataroot_patch.stop)
         self.store = Store(Path(self.root) / "dash.sqlite")
         self._seed()
-        self.server, self.thread = _start(self.store)
+        self.hub = os.path.join(self.root, "hub")
+        os.makedirs(self.hub, exist_ok=True)
+        self._seed_hub()
+        cfg = default_cfg()
+        cfg["hub_dir"] = self.hub
+        self.server, self.thread = _start(self.store, cfg)
         self.port = self.server.server_address[1]
 
     def tearDown(self):
@@ -346,6 +353,43 @@ class PrivacyPinEndpointTest(unittest.TestCase):
         with open(os.path.join(self.state_dir, "generic.jsonl"), "w") as fh:
             fh.write("\n".join(lines) + "\n")
         generic.poll(self.store, {"state_dir": self.state_dir}, now)
+
+    def _seed_hub(self):
+        # Hub decisions/risks with sentinels only in cells the parser
+        # must drop: an over-long free-text column and a path-like
+        # column. Short exposed cells carry no sentinel.
+        long_decision = ("rationale %s token %s " % (PROMPT_SENTINEL, ARGV_SENTINEL)) * 12
+        with open(os.path.join(self.hub, "decisions.tsv"), "w") as fh:
+            fh.write("date\tid\tdecision\twhy\tstatus\tlink\n")
+            fh.write(
+                "2026-10-18\tD-99\tShort probe title\t%s\tproposed\treports/%s.md\n"
+                % (long_decision, ENV_SENTINEL)
+            )
+        long_risk = ("background %s key %s " % (PROMPT_SENTINEL, APIKEY_SENTINEL)) * 12
+        with open(os.path.join(self.hub, "risks.tsv"), "w") as fh:
+            fh.write("id\ttitle\tnotes\tlink\n")
+            fh.write(
+                "R-99\tShort probe risk\t%s\tnotes/%s\n" % (long_risk, ENV_SENTINEL)
+            )
+
+    def test_hub_rows_expose_short_cells_only(self):
+        status, body = _get(self.port, "/api/decisions")
+        self.assertEqual(status, 200)
+        payload = json.loads(body.decode("utf-8", "replace"))
+        self.assertEqual(payload["source"], {"present": True})
+        (row,) = payload["decisions"]
+        self.assertEqual(row["title"], "Short probe title")
+        self.assertNotIn("why", row)
+        self.assertNotIn("link", row)
+        status, body = _get(self.port, "/api/risks")
+        self.assertEqual(status, 200)
+        risks = json.loads(body.decode("utf-8", "replace"))["risks"]
+        filed = [risk for risk in risks if risk["id"] == "R-99"]
+        self.assertEqual(len(filed), 1)
+        risk = filed[0]
+        self.assertEqual(risk["title"], "Short probe risk")
+        self.assertNotIn("notes", risk)
+        self.assertNotIn("link", risk)
 
     def test_seed_parsed_through_real_paths(self):
         # The sweep below is only meaningful when the sentinels really

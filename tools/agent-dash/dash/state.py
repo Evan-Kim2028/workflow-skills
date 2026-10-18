@@ -119,6 +119,16 @@ def build_state(store, registry, cfg=None, now: float | None = None, processes=N
 
     problems = _doctor_problems(store, now)
 
+    decisions = {"total": 0, "open": 0}
+    risks = {"total": 0, "by_severity": {}}
+    try:
+        from dash.decisions import decisions_summary, resolve_hub_dir, risks_summary
+
+        decisions = decisions_summary(resolve_hub_dir(cfg))
+        risks = risks_summary(store, cfg, now)
+    except Exception:
+        pass
+
     by_source = dict(view.get("running_by_source") or {})
     prod_jobs = int(view.get("prod_jobs") or 0)
     prod_jobs_finished = int(view.get("prod_jobs_finished") or 0)
@@ -143,6 +153,8 @@ def build_state(store, registry, cfg=None, now: float | None = None, processes=N
         # /api/project) fills this block from project.json. Reads use
         # payload.get("project", {}).get("name") so both shapes work.
         "project": {"name": None},
+        "decisions": decisions,
+        "risks": risks,
         "workstreams": workstreams,
         "unassigned": {
             "live_agents": unassigned["live_agents"],

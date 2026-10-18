@@ -125,7 +125,6 @@ The default state dir (no `AGENT_DASH_STATE_DIR`) is the live one, so a test or 
 State lives in `~/.local/share/agent-dash/` (`dash.sqlite`, pidfile, log, `generic.jsonl`). Point `AGENT_DASH_STATE_DIR` at an empty directory to trial the dashboard without touching live state. Point `AGENT_DASH_WORKSTREAMS` at another directory to trial bundles. Point `AGENT_DASH_PORT` at a free port (such as 8815) to trial beside a live dashboard: every command (`run`, `status`, `stop`, `check`, `state`, `doctor`, and the `ws` live reads) follows it. Set `AGENT_DASH_URL` explicitly only to point the `ws` live reads at yet another dashboard. Config-file `host`/`port` stay ignored.
 
 ### Data root and project name
-
 One directory owns every data path (`dash/dataroot.py` resolves all of
 them, precedence environment, then config, then the default): the project
 descriptor (`project.json`), the bundles (`workstreams/`), the sqlite
@@ -139,15 +138,12 @@ directly from the data-root `hub` directory when it exists (no sync
 command, no mirror). Real cloud clients are future work; the seam is the
 tiny `Storage` protocol in `dash/dataroot.py` (local filesystem only).
 No project data is ever committed to the dashboard repo.
-
 Name the project once; the page header and `<title>` follow it:
-
 ```bash
 python3 tools/agent-dash/agent_dash.py project init "Demo project"
 python3 tools/agent-dash/agent_dash.py project show
 python3 tools/agent-dash/agent_dash.py project set description "What ships."
 ```
-
 `project.json` holds `name`, `short`, `description`, `goals`, `started`,
 `target`, `phases` (each with `id`, `title`, `summary`, and a `gate` of
 member workstream ids or gate text), `links`, and `owner_notes`.
@@ -156,6 +152,18 @@ member workstream ids or gate text), `links`, and `owner_notes`.
 `totals_all_time`, `counts` by workstream state, and `data_root_hash`
 (the digest, never the path). A missing file is fine: the name reads
 null and the header falls back to "Agent dashboard".
+### Data root and hub
+All project data is local. The dashboard repo is app code only: bundles live under `AGENT_DASH_WORKSTREAMS`, and the project decisions log lives in the hub directory (`AGENT_DASH_HUB_DIR`, the same knob the hub issue source reads). The dashboard reads two files there and never writes them:
+- `decisions.tsv` — the decision store. `GET /api/decisions` serves it newest first with counts by status.
+- `risks.tsv` or `risks.json` (optional) — lead-written risks, appended after the computed ones on `GET /api/risks`.
+Both parse header-driven and tolerant: column names may vary (`decision`/`title`/`text`, `ws`/`workstream`, `state`/`status`), unknown columns survive as short extras, and a missing file means an empty list. Only short fields are served: any cell over 400 chars and any local-file-path cell never reach a payload (only basenames would be safe, so paths are dropped outright). A computed risk needs no file: stale plan gates, pending approvals past the doctor `approval_days` window, critical/warn doctor groups on active workstreams, and planned workstreams blocked by an unfinished dependency. `/api/state` carries the roll-up (`decisions: {total, open}`, `risks: {total, by_severity}`).
+```text
+date	id	decision	status	owner
+2026-10-14	D-101	one public id for cards	accepted	ann
+2026-10-15	D-102	freeze the route list	accepted	ben
+2026-10-16	D-103	retire the old deal routes	proposed	ann
+2026-10-17	D-104	single metering point	proposed	ben
+```
 
 ### Safe deploy (run the live dashboard from a clean release)
 

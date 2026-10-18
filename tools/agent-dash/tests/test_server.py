@@ -1767,5 +1767,111 @@ class WorkstreamStatesApiTest(unittest.TestCase):
         )
 
 
+class DecisionsRisksApiTest(unittest.TestCase):
+    """Decisions and risks endpoints over a synthetic hub dir, read-only.
+
+    WS41 is active with a stale plan gate; WS42 is planned waiting on
+    WS41; the hub holds two decisions and one filed risk.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.now = time.time()
+        self.wsroot = os.path.join(self.tmp.name, "ws")
+        os.makedirs(self.wsroot)
+        for ws, state in (("WS41", "active"), ("WS42", "planned")):
+            dest = os.path.join(self.wsroot, ws)
+            os.makedirs(dest)
+            bundle = {"id": ws, "title": "Probe %s" % ws, "short": ws,
+                      "order": int(ws[2:]), "kind": "workstream",
+                      "state_changed_at": int(self.now) - 50}
+            if state != "active":
+                bundle["state"] = state
+            if ws == "WS42":
+                bundle["depends_on"] = ["WS41"]
+            with open(os.path.join(dest, "bundle.json"), "w") as fh:
+                json.dump(bundle, fh)
+        plan = {
+            "dag": {
+                "cols": ["Build"],
+                "groups": [
+                    {"id": "build", "col": 0, "title": "Build", "tasks": [
+                        {"id": "WS41.1", "title": "Wait for the freeze",
+                         "status": "todo", "deps": [], "kind": "gate",
+                         "signal": "freeze lifts", "fresh_hours": 1}
+                    ]},
+                ],
+                "edges": [],
+            },
+            "narrative": {"thesis": "t", "end_state": "e", "phases": []},
+        }
+        with open(os.path.join(self.wsroot, "WS41", "plan.json"), "w") as fh:
+            json.dump(plan, fh)
+        self.hub = os.path.join(self.tmp.name, "hub")
+        os.makedirs(self.hub)
+        with open(os.path.join(self.hub, "decisions.tsv"), "w") as fh:
+            fh.write("date\tid\tdecision\tstatus\n"
+                     "2026-10-14\tD-1\told choice\taccepted\n"
+                     "2026-10-16\tD-2\tnew choice\tproposed\n")
+        with open(os.path.join(self.hub, "risks.tsv"), "w") as fh:
+            fh.write("id\ttitle\tseverity\nR-1\tfiled risk\tinfo\n")
+        self._env = mock.patch.dict(os.environ, {"AGENT_DASH_WORKSTREAMS": self.wsroot})
+        self._env.start()
+        self.addCleanup(self._env.stop)
+        self._live = mock.patch("dash.server._live_workers", return_value=[])
+        self._live.start()
+        self.addCleanup(self._live.stop)
+        self.store = Store(Path(self.tmp.name) / "dash.sqlite")
+        cfg = default_cfg()
+        cfg["hub_dir"] = self.hub
+        registry = Registry([])
+        server = DashServer(self.store, registry, "127.0.0.1", 0, cfg=cfg)
+        thread = threading.Thread(
+            target=server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True
+        )
+        thread.start()
+        self.server, self.thread = server, thread
+        self.port = self.server.server_address[1]
+
+    def tearDown(self):
+        stop(self.server, self.thread)
+        self.store.close()
+        self.tmp.cleanup()
+
+    def test_decisions_newest_first_with_counts(self):
+        status, _, body = get(self.port, "/api/decisions")
+        self.assertEqual(status, 200)
+        payload = json.loads(body)
+        self.assertEqual([row["id"] for row in payload["decisions"]], ["D-2", "D-1"])
+        self.assertEqual(payload["decisions"][0]["title"], "new choice")
+        self.assertEqual(payload["counts"], {"proposed": 1, "accepted": 1})
+        self.assertEqual(payload["source"], {"present": True})
+
+    def test_risks_computed_then_filed(self):
+        status, _, body = get(self.port, "/api/risks")
+        self.assertEqual(status, 200)
+        risks = json.loads(body)["risks"]
+        by_id = {risk["id"]: risk for risk in risks}
+        self.assertIn("gates:WS41:WS41.1", by_id)
+        self.assertIn("dependency:WS42", by_id)
+        self.assertEqual(risks[-1]["id"], "R-1")
+        for risk in risks:
+            for key in ("id", "title", "severity", "source", "ws", "since"):
+                self.assertIn(key, risk, risk.get("id"))
+            if risk["source"] != "file":
+                self.assertTrue(risk["title"].startswith(risk["ws"]), risk["title"])
+
+    def test_state_carries_decisions_and_risks(self):
+        status, _, body = get(self.port, "/api/state")
+        self.assertEqual(status, 200)
+        payload = json.loads(body)
+        self.assertEqual(payload["decisions"], {"total": 2, "open": 1})
+        self.assertEqual(payload["risks"]["total"], 3)
+        self.assertEqual(
+            sum(payload["risks"]["by_severity"].values()),
+            payload["risks"]["total"],
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

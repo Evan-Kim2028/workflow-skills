@@ -192,6 +192,10 @@ class Handler(BaseHTTPRequestHandler):
                 self._bundle(query)
             elif path == "/api/approvals":
                 self._approvals(query)
+            elif path == "/api/decisions":
+                self._decisions()
+            elif path == "/api/risks":
+                self._risks()
             elif path.startswith("/bundle/"):
                 self._bundle_page(path)
             elif path == "/api/health":
@@ -528,6 +532,18 @@ class Handler(BaseHTTPRequestHandler):
             self._json(404, {**api_error("bundle not found", "bundle_not_found", "Run: python3 agent_dash.py ws list"), "ws": ws})
             return
         self._json(200, body)
+
+    def _decisions(self):
+        """``GET /api/decisions``: hub decisions, newest first, read-only."""
+        from dash.decisions import decisions_payload, resolve_hub_dir
+
+        self._json(200, decisions_payload(resolve_hub_dir(self.server.cfg)))
+
+    def _risks(self):
+        """``GET /api/risks``: computed risks first, then hub file rows."""
+        from dash.decisions import risks_payload
+
+        self._json(200, risks_payload(self.server.store, self.server.cfg, time.time()))
 
     def _bundles(self):
         self._json(200, {"bundles": list_bundles()})
