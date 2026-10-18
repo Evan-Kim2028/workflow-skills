@@ -202,7 +202,11 @@ tr.ws-h td {
   color: var(--muted);
   font-size: 12px;
 }
-.sec {
+/* Scoped to table cells: the page wraps every card in section.sec, so a
+   bare .sec selector would force whole cards (including the plan map) to
+   nowrap and push the page sideways. The span.sec lives in run-table
+   cells only (static/cards/tables.js). */
+td .sec {
   font: 600 11.5px var(--mono);
   color: var(--ink-2);
   white-space: nowrap;

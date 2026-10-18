@@ -582,6 +582,51 @@ class PageRules(unittest.TestCase):
             self.assertIn(marker, css, f"plan-progress.css lost the legend rule: {marker}")
         self.assertIn("Legend", card, "the long Legend popover is gone")
 
+    def test_plan_map_fits_the_page(self):
+        """The plan progress card never pushes the page sideways: tiles wrap
+        or scroll inside their own well, the legend row and the strips wrap
+        inside the card, and no resize loop can grow the map. Regression pin
+        for the sections-commit overflow, where a bare .sec nowrap rule
+        (meant for the run-table section label) leaked into the section.sec
+        card wrappers and, with the dag well set to visible overflow, sized
+        the grid to thousands of pixels."""
+        tables = (STATIC / "cards" / "tables.css").read_text()
+        self.assertNotRegex(
+            tables, r"(?m)^\.sec\s*\{",
+            "tables.css has a bare .sec rule again: it matches the section.sec "
+            "card wrappers and forces whole cards to nowrap",
+        )
+        self.assertIn("td .sec", tables, "the run-table section label lost its cell scope")
+        css = (STATIC / "cards" / "plan-progress.css").read_text()
+        self.assertIn(
+            ".dag-scroll.fitted{overflow-x:auto",
+            css,
+            "the fitted dag well must scroll internally, not overflow visibly",
+        )
+        self.assertNotIn(
+            ".dag-scroll.fitted{overflow-x:visible",
+            css,
+            "visible overflow on the dag well pushes the page sideways",
+        )
+        for marker in (
+            "#exec-progress>*",
+            "max-width:100%",
+            ".dcol",
+            "min-width:0",
+            "overflow-wrap:anywhere",
+        ):
+            self.assertIn(marker, css, f"plan-progress.css lost the fit rule: {marker}")
+        self.assertRegex(
+            css, r"\.map-legend\{[^}]*flex-wrap:\s*wrap",
+            "the always-visible legend must wrap inside the card",
+        )
+        card = (STATIC / "cards" / "plan-progress.js").read_text()
+        self.assertNotIn(
+            "ResizeObserver", card,
+            "no ResizeObserver may size the map: an observer writing sizes "
+            "it reads back is a feedback loop that grows with content",
+        )
+
     def test_plan_legend_and_headline_helpers(self):
         """Node-driven pure test of the extracted builders: planHeadline
         formats counts with no phase wording, and planLegend covers every

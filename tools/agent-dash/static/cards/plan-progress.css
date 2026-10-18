@@ -178,7 +178,7 @@ body.clip #main{zoom:.92}
 /* Fitted grid: the layout's columns share the card width, so every section is
    visible without horizontal scroll at 1440 px. Slim all-done sections run at
    about half width in their original position. */
-.dag-scroll.fitted{overflow-x:visible;background:var(--inset, var(--surface-2))}
+.dag-scroll.fitted{overflow-x:auto;background:var(--inset, var(--surface-2))}
 .dag.fitted{min-width:0;gap:14px;background:var(--inset, var(--surface-2))}
 .dag.fitted .dcol{background:var(--card, var(--surface));border:1px solid var(--grid);border-radius:10px;padding:10px}
 .dag.fitted .dcolh{display:flex;align-items:center;gap:6px}
@@ -242,3 +242,17 @@ body.clip #main{zoom:.92}
   .dag,.dag.fitted{grid-template-columns:1fr !important;min-width:0}
   .phases-line{white-space:normal}
 }
+/* ---- fit rules: the card never pushes the page wider ----
+   The legend row and the strips wrap inside the card; every direct child
+   of the card caps at the card width; tiles and columns shrink instead of
+   forcing the grid wider (long tokens may break anywhere rather than
+   overflow). The dag-scroll well keeps its own horizontal scroll, so at
+   widths where the columns cannot shrink further the map scrolls inside
+   the card and the page never scrolls sideways. */
+#exec-progress{min-width:0;white-space:normal}
+#exec-progress>*{max-width:100%;min-width:0}
+#exec-progress .dag-scroll{min-width:0;max-width:100%}
+#exec-progress .dcol,#exec-progress .dnode{min-width:0}
+#exec-progress .chips{min-width:0}
+#exec-progress .tile-waits,#exec-progress .dnode h4,#exec-progress .dnode .m{overflow-wrap:anywhere}
+#exec-progress .map-legend,#exec-progress .mleg-group{min-width:0;max-width:100%}
