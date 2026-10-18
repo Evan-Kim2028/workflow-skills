@@ -3771,6 +3771,21 @@ console.log("activity tick spans ok");
                      "cards/project-home.css", "cards/decisions.css"):
             self.assertNotIn(".unassigned", (STATIC / path).read_text(), f"{path} keeps dead strip CSS")
             self.assertNotIn("prog-more", (STATIC / path).read_text(), f"{path} keeps dead toggle CSS")
+
+    def test_where_we_are_headline_sums_every_row(self):
+        """The Where-we-are hero ("N of M tasks done across W workstreams")
+        sums every panel row, never the capped visible slice: collapsing to
+        the top 5 must not move the headline."""
+        wscards = (STATIC / "cards" / "ws-cards.js").read_text()
+        panel = wscards[wscards.index("function programPanel"):]
+        panel = panel[:panel.index("window.DashProgram")]
+        cap_at = panel.index('discloseRows(rows, capKey, "workstreams")')
+        total_at = panel.index("all.done +=")
+        self.assertLess(total_at, cap_at, "the hero sums the capped slice, not every row")
+        shown_loop = panel[panel.index("info.rows.forEach"):]
+        shown_loop = shown_loop[:shown_loop.index("var more = discloseButton")]
+        self.assertNotIn("all.done", shown_loop, "the visible-slice loop still feeds the hero")
+        self.assertNotIn("all.tot", shown_loop, "the visible-slice loop still feeds the hero")
         self.assertNotIn(".dc-more", (STATIC / "cards" / "decisions.css").read_text(), "dead dc-more CSS is back")
         self.assertNotIn(".vd {", (STATIC / "cards" / "tables.css").read_text(), "the dead drawer verdict style is back")
 

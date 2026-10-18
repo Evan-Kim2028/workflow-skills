@@ -110,8 +110,14 @@
       if (st === "planned" && only.indexOf("active") >= 0 && hasActivity(w)) return true;
       return false;
     });
+    /* The overall hero sums every row in the panel, never the capped
+       visible slice: collapsing to the top 5 must not move the headline. */
     var all = {done: 0, tot: 0, live: 0};
-    rows.forEach(function (w) { all.live += w.live_agents || 0; });
+    rows.forEach(function (w) {
+      all.live += w.live_agents || 0;
+      var pr0 = planSum[w.ws] || w.progress || null;
+      if (pr0) { all.done += pr0.done || 0; all.tot += pr0.total || 0; }
+    });
     /* Top 5 by default through the shared disclosure helper (one state
        per full/bare panel and filter, default collapsed). */
     var capKey = "whereweare:" + (bare ? "bare" : "full") + ":" + (only || []).join(",");
@@ -120,7 +126,6 @@
     info.rows.forEach(function (w) {
       var pr = planSum[w.ws] || w.progress || null;
       var pc = pr ? pr.counts : {}, tot = pr ? pr.total : 0, pct = pr ? pr.pct : 0, done = pr ? pr.done : 0;
-      if (pr) { all.done += done; all.tot += tot; }
       /* Status is colour plus symbol plus word, never colour alone. The
          shared completed rule (server progress object) decides Done; a
          paused workstream keeps its muted pill with glyph plus word even
