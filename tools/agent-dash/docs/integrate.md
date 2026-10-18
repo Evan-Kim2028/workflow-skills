@@ -272,3 +272,19 @@ Plan `% done` comes from the server (`progress` on `/api/plan` and `/api/bundle`
 ## 8. Working on the dashboard itself
 
 Picking up dashboard work (not just feeding it runs)? Read [roadmap.md](roadmap.md) first: what landed with proof, and the open worker-sized tasks in value order. The visual future is the [proposed v2 design spec](design-v2.md) (owner approval pending) with its [tokens](design-v2-tokens.css). Ownership of every file is the table in [CONTRACT.md](../CONTRACT.md). Coordinating the work itself is the [workstream-orchestration skill](../../../skills/workstream-orchestration/SKILL.md) and its [principles](orchestration.md).
+
+### Before you push
+
+Run the scoped gate from `tools/agent-dash`. It maps your changed files to test files (`scripts/gate_map.json`), runs each selected test file on its own (never a bare suite), checks changed scripts, and runs the repo privacy audit:
+
+```bash
+cd tools/agent-dash
+sh scripts/gate.sh --list   # what it would run, without running it
+sh scripts/gate.sh          # one verdict per file, then GATE PASS/FAIL
+```
+
+`test_privacy_pin` and `test_page_rules` always run: the first asserts no prompt, argv, env, or secret material reaches any endpoint payload (only the worker's `--model` flag value is ever kept), the second pins the page rules. To gate every push in a checkout, opt in once (never installed automatically):
+
+```bash
+sh tools/agent-dash/scripts/install_hooks.sh   # idempotent pre-push hook; refuses foreign hooks
+```
