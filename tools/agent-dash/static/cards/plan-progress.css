@@ -162,7 +162,7 @@
 .clip-close .panel{background:var(--surface);border:1px solid var(--ring);border-radius:16px;padding:34px 48px;text-align:center;box-shadow:0 12px 48px rgba(0,0,0,.25)}
 .clip-close .big{margin:0 0 10px;font-size:40px;color:var(--ink)}
 .clip-close .fine{margin:0;font-size:14px;color:var(--muted)}
-body.clip .topbar,body.clip .foot,body.clip .rp-bar,body.clip .drawer,body.clip #sidenav,body.clip #sidenav-hot,body.clip .tip{display:none!important}
+body.clip .topbar,body.clip .topscroll,body.clip .foot,body.clip .rp-bar,body.clip .drawer,body.clip #sidenav,body.clip #sidenav-hot,body.clip .tip{display:none!important}
 body.clip .wrap{max-width:1880px;padding:10px 20px 8px}
 body.clip-v .wrap{max-width:1060px}
 body.clip .sec{margin-top:8px!important}

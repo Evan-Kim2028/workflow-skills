@@ -154,7 +154,11 @@ svg{display:block;overflow:visible}
    tiles, and offers .hidephone for non-essential columns. */
 @media (max-width:700px){
 .wrap{padding:0 var(--gutter-phone) 40px}
-.topbar{margin:0 calc(-1 * var(--gutter-phone));padding:10px var(--gutter-phone) 0}
+.topbar{margin:0 calc(-1 * var(--gutter-phone));padding:0 var(--gutter-phone);gap:8px}
+.topbar h1#title{font-size:14px;flex:none;max-width:26vw}
+.topbar .proj-sub{display:none}
+.topbar .tab{padding:5px 9px 7px;font-size:12.5px}
+.topbar #theme,.topbar #nav-sections{padding:4px 9px;font-size:12px}
 .g-tiles{grid-template-columns:1fr 1fr}
 .g-2{grid-template-columns:minmax(0,1fr)}
 .card{padding:14px}
@@ -164,7 +168,7 @@ svg{display:block;overflow:visible}
 /* plan map header and tiles: moved to static/cards/plan-progress.css */
 
 /* polish: motion and feel (all switched off under prefers-reduced-motion) */
-header{position:sticky;top:0;z-index:30;padding:10px 0;margin:-10px 0 0;background:color-mix(in srgb,var(--bg, var(--surface)) 84%,transparent);-webkit-backdrop-filter:blur(10px);backdrop-filter:blur(10px)}
+.topscroll header{position:static;margin:0;padding:12px 0 6px;background:none;-webkit-backdrop-filter:none;backdrop-filter:none}
 button,select,.tab,.seg-ctl button,.card,.chip,tr.clk td{transition:background-color .16s ease,border-color .16s ease,color .16s ease,box-shadow .2s ease}
 button:hover{border-color:var(--ink-2)}
 button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible,[tabindex]:focus-visible{outline:2px solid var(--accent);outline-offset:2px;box-shadow:0 0 0 4px var(--accent-soft)}
@@ -189,11 +193,19 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible,[ta
 
 /* working-now pills: moved to static/cards/plan-progress.css */
 
-/* floating top bar: title, view toggle, theme and the workstream tabs stay visible while scrolling */
-.topbar{position:sticky;top:0;z-index:35;margin:-18px calc(-1 * var(--gutter)) 14px;padding:12px var(--gutter) 0;background:color-mix(in srgb,var(--page) 82%,transparent);-webkit-backdrop-filter:blur(14px);backdrop-filter:blur(14px);border-bottom:1px solid var(--grid)}
-.topbar header{position:static;margin:0;padding:0;background:none;-webkit-backdrop-filter:none;backdrop-filter:none}
-.topbar .tabs{margin:8px 0 0;border-bottom:0}
-[data-nav], [data-sec], .lay, #plan-body h2, #plan-body h3, #plan-body section { scroll-margin-top: 120px; }
+/* Slim pinned row: the only chrome that stays on screen while scrolling
+   (project name, workstream tab strip, theme toggle). The .topscroll block
+   above it (live pill, Plan | Execution, Project | Current | Planned |
+   Archive) scrolls away with the page, so nothing resizes on scroll. */
+.topbar{position:sticky;top:0;z-index:35;display:flex;align-items:center;gap:10px;height:var(--pinned-h);margin:-18px calc(-1 * var(--gutter)) 14px;padding:0 var(--gutter);background:color-mix(in srgb,var(--page) 82%,transparent);-webkit-backdrop-filter:blur(14px);backdrop-filter:blur(14px);border-bottom:1px solid var(--grid)}
+.topbar h1{font-size:15px;margin:0;font-weight:750;letter-spacing:-.01em;flex:0 1 auto;min-width:0;max-width:34vw;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.topbar .tabs{flex:1 1 auto;min-width:0;margin:0;border-bottom:0}
+.topbar .tab{padding:6px 10px 8px;font-size:13px}
+.topbar .tabfilter{position:static;background:none;align-self:center;padding:0 0 0 8px}
+.topbar #theme,.topbar #nav-sections{flex:none;border-radius:var(--r-pill);padding:4px 11px;font-size:12.5px;font-weight:600}
+html{scroll-padding-top:calc(var(--pinned-h) + 10px)}
+[data-nav], [data-sec], .lay, #plan-body h2, #plan-body h3, #plan-body section { scroll-margin-top: calc(var(--pinned-h) + 12px); }
+#main [data-nav], #main [data-sec], #plan-body .lay { scroll-margin-top: calc(var(--pinned-h) + 12px); }
 
 /* plan map focus, trains, replay and clip: moved to static/cards/plan-progress.css */
 #stale-badge{font:700 11px var(--mono);color:var(--warning-ink);border:1px solid color-mix(in srgb,var(--warning) 55%,transparent);background:var(--warning-soft);border-radius:var(--r-pill);padding:2px 9px;margin-left:2px;white-space:nowrap}
@@ -202,20 +214,21 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible,[ta
 </head>
 <body>
 <div class="wrap">
-<div class="topbar">
+<div class="topscroll">
 <header class="shell">
-<h1 id="title">Agent dashboard</h1>
 <span class="live"><span class="dot" id="live-dot"></span><span id="live-txt">connecting</span><span id="stale-badge" hidden>stale</span></span>
 <nav class="view-toggle" aria-label="View">
 <button type="button" id="view-plan" aria-pressed="false">Plan</button>
 <button type="button" id="view-exec" aria-pressed="true">Execution</button>
 </nav>
 <nav class="view-nav" id="view-nav" aria-label="Views"></nav>
-<button type="button" id="nav-sections" aria-expanded="false" aria-controls="sidenav" aria-keyshortcuts="[" title="Section list">Sections</button>
-<span class="sp"></span>
-<button id="theme" title="Toggle light or dark">Theme</button>
 </header>
+</div>
+<div class="topbar">
+<h1 id="title">Agent dashboard</h1>
 <nav class="tabs" id="tabs" role="tablist" aria-label="Workstreams"></nav>
+<button type="button" id="nav-sections" aria-expanded="false" aria-controls="sidenav" aria-keyshortcuts="[" title="Section list">Sections</button>
+<button id="theme" title="Toggle light or dark">Theme</button>
 </div>
 <div id="exec-view">
 <div id="err-banner" role="alert" hidden></div>

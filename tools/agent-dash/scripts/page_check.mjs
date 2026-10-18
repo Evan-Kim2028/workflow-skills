@@ -17,6 +17,10 @@
  * quiescent, so a perpetual re-render fails fast instead of wedging the
  * tab reads.
  *
+ * After the tab loop it asserts the pinned-chrome budget: scrolled
+ * 1200 px, only one slim row may stay pinned (48 px at 1440x900,
+ * 44 px at 390x844 with no sideways scrolling).
+ *
  * Exit 0 when everything agrees, 1 with a table on any mismatch, 2 when
  * Chrome is missing (the agent_dash.py wrapper reports a skip then).
  */
@@ -585,6 +589,52 @@ async function main() {
       }
     }
     if (!rows.length) throw new Error("no tab combinations ran");
+    // Pinned-chrome gate: while scrolled only one slim row may stay
+    // pinned (48 px desktop, 44 px phone), and the phone viewport must
+    // not scroll sideways. Same block-height definition everywhere:
+    // the lowest bottom among wide sticky/fixed elements at the top.
+    const pinnedExpr = `(function(){
+      var bottoms = [];
+      var els = document.querySelectorAll("body *");
+      for (var i = 0; i < els.length; i++) {
+        var e = els[i];
+        var cs = getComputedStyle(e);
+        if (cs.position !== "sticky" && cs.position !== "fixed") continue;
+        if (cs.display === "none") continue;
+        var r = e.getBoundingClientRect();
+        if (r.width < 300 || r.left > 100) continue;
+        if (r.top <= 1 && r.bottom > 0) bottoms.push(r.bottom);
+      }
+      return {pinned: bottoms.length ? Math.max.apply(null, bottoms) : 0,
+        overflowX: document.documentElement.scrollWidth > window.innerWidth + 1};
+    })()`;
+    const headerPaths = ["/?view=exec&ws=all", "/?view=project"];
+    for (const size of [{ w: 1440, h: 900, mobile: false, limit: 48 }, { w: 390, h: 844, mobile: true, limit: 44 }]) {
+      await cdp.send("Emulation.setDeviceMetricsOverride", {
+        width: size.w, height: size.h, deviceScaleFactor: 1, mobile: size.mobile,
+      });
+      for (const headerPath of headerPaths) {
+        await cdp.send("Page.navigate", { url: `${opts.url}${headerPath}` });
+        await waitForLoad(cdp);
+        await new Promise((r) => setTimeout(r, 1200));
+        await evaluate(cdp, "window.scrollTo(0, 1200)");
+        await new Promise((r) => setTimeout(r, 600));
+        const m = await evaluate(cdp, pinnedExpr);
+        const tag = `pinned ${size.w}x${size.h}${size.mobile ? " phone" : ""} ${headerPath}`;
+        const overLimit = size.limit === 48 ? m.pinned > 48 : m.pinned > 44;
+        if (overLimit) {
+          console.log(`${tag}: pinned chrome ${Math.round(m.pinned)}px over the <= ${size.limit}px budget`);
+          failures++;
+        } else {
+          console.log(`${tag}: pinned chrome ${Math.round(m.pinned)}px within <= ${size.limit}px`);
+        }
+        if (size.mobile && m.overflowX) {
+          console.log(`${tag}: page scrolls sideways at 390px`);
+          failures++;
+        }
+      }
+    }
+    await cdp.send("Emulation.clearDeviceMetricsOverride");
   } catch (error) {
     console.error(`page_check failed: ${(error && error.message) || error}`);
     finish(1);

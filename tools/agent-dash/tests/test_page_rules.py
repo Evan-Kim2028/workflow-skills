@@ -2140,6 +2140,41 @@ class FinalPolishTests(unittest.TestCase):
         self.assertIn(".plan-view .mono", css)
         self.assertIn("overflow-wrap: anywhere", css)
 
+    def test_pinned_chrome_is_one_slim_row(self):
+        """While scrolled only one slim row stays pinned: .topbar at
+        --pinned-h (48 px desktop, 44 px phone). The full header
+        (.topscroll: live pill, Plan | Execution, Project | Current |
+        Planned | Archive) scrolls away, and no other top-anchored
+        sticky may sneak back in. Anchors land below the slim row
+        through scroll-padding-top tied to the same token."""
+        tokens = (STATIC / "tokens.css").read_text()
+        desk = re.search(r"--pinned-h:\s*(\d+)px", tokens)
+        self.assertIsNotNone(desk, "tokens.css lost --pinned-h")
+        self.assertLessEqual(int(desk.group(1)), 48, "the slim pinned row is taller than 48 px")
+        phone = re.search(r"@media\s*\(max-width:\s*700px\)\s*\{[^}]*--pinned-h:\s*(\d+)px", tokens, re.S)
+        self.assertIsNotNone(phone, "tokens.css lost the phone --pinned-h")
+        self.assertLessEqual(int(phone.group(1)), 44, "the slim pinned row is taller than 44 px on phones")
+        page = (STATIC / "index.html").read_text()
+        style = "\n".join(re.findall(r"<style>(.*?)</style>", page, re.S))
+        for sel, body in re.findall(r"([^{}]+)\{([^{}]*)\}", style):
+            if "position:sticky" in body and re.search(r"(?<![-\w])top\s*:\s*0", body):
+                self.assertIn(".topbar", sel, f"top-anchored sticky outside the slim row: {sel.strip()}")
+        flat = style.replace(" ", "")
+        self.assertIn("height:var(--pinned-h)", flat, "the slim row is not sized by --pinned-h")
+        topbar = re.search(r'<div class="topbar">(.*?)</div>\s*<div id="exec-view"', page, re.S)
+        self.assertIsNotNone(topbar, "the .topbar shell is gone")
+        slim = topbar.group(1)
+        for keep in ('id="title"', 'id="tabs"', 'id="theme"'):
+            self.assertIn(keep, slim, f"the slim row lost {keep}")
+        for gone in ('id="view-nav"', "view-toggle", 'class="live"'):
+            self.assertNotIn(gone, slim, f"a secondary header row stays pinned: {gone}")
+        self.assertIn('class="topscroll"', page, "the scrolling full header is gone")
+        self.assertIn("scroll-padding-top", style, "no scroll-padding-top for the pinned row")
+        self.assertIn("var(--pinned-h)", style, "the scroll offset is not tied to --pinned-h")
+        checker = (STATIC.parent / "scripts" / "page_check.mjs").read_text()
+        for marker in ("pinned", "Emulation.setDeviceMetricsOverride", "scrollTo", "m.pinned > 48", "m.pinned > 44"):
+            self.assertIn(marker, checker, f"page_check.mjs lost the pinned-chrome gate: {marker}")
+
     def test_fmt_durations_never_print_sixty(self):
         harness = (
             "const fs = require('fs');\n"

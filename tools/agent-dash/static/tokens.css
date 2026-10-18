@@ -93,6 +93,7 @@
   --sp-5: 24px; --sp-6: 32px;
   --gutter: 20px;        /* desktop page gutter */
   --gutter-phone: 16px;  /* 390px phone gutter; no horizontal scroll */
+  --pinned-h: 48px;      /* slim pinned header row while scrolled (44px on phones below) */
 
   /* ---- Motion (all off under prefers-reduced-motion) ---- */
   --dur-instant: 120ms;  /* hovers, tab underline */
@@ -136,6 +137,11 @@
 /* An explicit data-theme="dark" is the same as the default. */
 :root[data-theme="dark"] {
   color-scheme: dark;
+}
+
+/* Phone: the slim pinned row shrinks with the viewport. */
+@media (max-width: 700px) {
+  :root { --pinned-h: 44px; }
 }
 
 /* ================= LIGHT (toggle only; same names) ================= */
