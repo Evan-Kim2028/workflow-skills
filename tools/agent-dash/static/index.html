@@ -11,6 +11,8 @@
 <link rel="stylesheet" href="/static/cards/timeline.css">
 <link rel="stylesheet" href="/static/cards/token-chart.css">
 <link rel="stylesheet" href="/static/cards/live-chart.css">
+<link rel="stylesheet" href="/static/cards/ws-cards.css">
+<link rel="stylesheet" href="/static/cards/tables.css">
 <script>
 /* Dark is the default: with no ?theme= and no saved viewer choice the page
    sets data-theme="dark" before first paint, so there is no light flash.
@@ -81,7 +83,6 @@ button,select{font:inherit;color:var(--ink);background:var(--surface);border:1px
 .mlegend .mfam{display:inline-flex;align-items:center;gap:4px 10px;flex-wrap:wrap;padding:2px 8px 2px 0;border-right:1px solid var(--grid)}
 .mlegend .mfam:last-child{border-right:0}
 .mlegend .mfam b{font-weight:700;color:var(--ink);margin-right:2px}
-.tier .mfam-n{color:var(--muted);font-size:11px;margin-left:2px}
 .sw{width:10px;height:10px;border-radius:2px;display:inline-block}
 svg{display:block;overflow:visible}
 .ax text,.ax{fill:var(--muted);font:11px var(--font)}
@@ -98,23 +99,7 @@ svg{display:block;overflow:visible}
 .tip b{display:block;margin-bottom:4px}
 .tip .r{display:flex;justify-content:space-between;gap:14px;font-variant-numeric:tabular-nums}
 .tip .r i{display:inline-block;width:8px;height:8px;border-radius:2px;margin-right:6px}
-table{border-collapse:collapse;width:100%;font-size:13px}
-th{font-size:11px;color:var(--muted);font-weight:700;text-transform:uppercase;letter-spacing:.05em;text-align:left;padding:8px 10px;border-bottom:1px solid var(--grid);white-space:nowrap}
-td{padding:8px 10px;border-bottom:1px solid var(--grid);vertical-align:middle}
-tbody tr:last-child td{border-bottom:0}
-td.n,th.n{text-align:right;font-variant-numeric:var(--tnum);font-family:var(--mono);font-size:12px;white-space:nowrap}
-tr.clk{cursor:pointer}tr.clk:hover td{background:var(--surface-2)}
-.tier{display:inline-flex;align-items:center;gap:6px;font:600 11.5px var(--mono)}
-.st{display:inline-flex;align-items:center;gap:5px;font-size:12px;white-space:nowrap}
-.st i{width:8px;height:8px;border-radius:50%}
-.st.running i{background:var(--s1);animation:pulse 1.4s infinite}
-.st.done i{background:var(--good)}.st.killed i,.st.died_early i{background:var(--critical)}.st.queued i{background:var(--warning)}.st.finished i,.st.unknown i{background:var(--muted)}
 @keyframes pulse{50%{opacity:.35}}
-@media (prefers-reduced-motion:reduce){.st.running i{animation:none}}
-.vd{font:600 11px var(--mono);padding:2px 6px;border-radius:4px;background:var(--surface-2);color:var(--ink-2)}
-.grow{color:var(--good-ink);font-size:11px;margin-left:4px}
-.lbl{font-family:var(--mono);font-size:12.5px}
-.ws{font:600 11.5px var(--mono);color:var(--ink-2)}
 .meter{display:grid;grid-template-columns:70px minmax(0,1fr) 54px;gap:10px;align-items:center;margin:7px 0;font-size:12.5px}
 .meter .trk{position:relative;height:14px;background:var(--surface-2);border-radius:3px}
 .meter .fill{position:absolute;left:0;top:0;bottom:0;border-radius:3px}
@@ -122,11 +107,6 @@ tr.clk{cursor:pointer}tr.clk:hover td{background:var(--surface-2)}
 .meter .n{text-align:right;font:12px var(--mono)}
 .empty{display:flex;align-items:center;justify-content:center;gap:8px;border:1px dashed var(--ring-strong);border-radius:var(--r-card);padding:24px;text-align:center;color:var(--ink-2);font-size:13.5px}
 .empty::before{content:"";width:8px;height:8px;border-radius:50%;background:var(--grid);flex:none}
-.wsc{cursor:pointer}.wsc:hover{border-color:var(--s1)}
-.wsc .top{display:flex;justify-content:space-between;align-items:baseline}
-.wsc .id{font:700 15px var(--mono)}
-.wsc .bar{display:flex;height:8px;border-radius:4px;overflow:hidden;background:var(--surface-2);margin:8px 0 4px;gap:2px}
-.wsc .bar span{display:block;height:100%}
 .kv{display:grid;grid-template-columns:auto 1fr;gap:4px 12px;font-size:13px}
 .kv dt{color:var(--muted)}.kv dd{margin:0;font-family:var(--mono);font-size:12.5px;overflow-wrap:anywhere}
 .drawer{position:fixed;top:0;right:0;bottom:0;width:min(440px,100%);background:var(--surface);border-left:1px solid var(--ring);box-shadow:-8px 0 30px rgba(0,0,0,.15);padding:18px;transform:translateX(105%);transition:transform .18s;z-index:30;overflow:auto}
@@ -190,21 +170,6 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible,[ta
 .copy-modal{position:fixed;inset:20% 20% auto;z-index:60;background:var(--surface);border:1px solid var(--ring);border-radius:12px;padding:16px;box-shadow:0 20px 60px rgba(0,0,0,.4);display:grid;gap:10px}
 .copy-modal textarea{width:100%;min-height:200px;font:12px var(--mono);background:var(--surface-2);color:var(--ink);border:1px solid var(--ring);border-radius:8px;padding:8px}
 
-.program{border-color:color-mix(in srgb,var(--s1) 35%,var(--ring))}
-.prog-h{display:flex;align-items:baseline;gap:12px;flex-wrap:wrap}.prog-h h2{margin:0}.prog-h .sub{margin:0}
-.prog-total{font:600 13px var(--mono);color:var(--ink-2);margin:6px 0 10px}
-.prog-row{display:grid;grid-template-columns:minmax(150px,220px) 108px minmax(160px,1fr) 52px minmax(150px,auto) auto;gap:12px;align-items:center;padding:10px 0;border-top:1px solid var(--grid)}
-.prog-name b{font:700 14px var(--mono);margin-right:8px}.prog-name span{color:var(--ink-2);font-size:13px}
-.prog-pill{justify-self:start;font:700 11px var(--mono);padding:3px 9px;border-radius:999px;border:1px solid var(--grid);color:var(--ink-2)}
-.prog-pill.done{background:color-mix(in srgb,var(--good) 18%,transparent);border-color:var(--good);color:var(--good-ink, var(--good))}
-.prog-pill.active{background:color-mix(in srgb,var(--s1) 16%,transparent);border-color:var(--s1);color:var(--ink)}
-.prog-bar{display:flex;gap:2px;height:12px;border-radius:6px;overflow:hidden;background:var(--grid)}
-.prog-bar span{display:block;height:100%;transition:width .9s cubic-bezier(.2,.8,.2,1)}
-.prog-pct{font:700 18px var(--font);font-variant-numeric:tabular-nums;text-align:right}
-.prog-meta{font:12px var(--mono);color:var(--muted)}
-.prog-acts{display:flex;gap:6px;justify-content:flex-end}.prog-acts button{font-size:12.5px;padding:4px 10px;border-radius:999px}.prog-acts .copybtn{margin-left:0}
-.prog-row.s-done{opacity:.85}
-@media (max-width:1000px){.prog-row{grid-template-columns:1fr auto;}.prog-bar,.prog-meta,.prog-acts{grid-column:1/-1}}
 
 /* working-now pills: moved to static/cards/plan-progress.css */
 

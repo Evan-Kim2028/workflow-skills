@@ -1,14 +1,16 @@
 /* Page card: Where we are, workstream cards, Overview footer data.
-   Renders the program panel (one row per workstream with server plan
-   progress), the per-workstream cards on the overview, and owns the
-   planSum/planPrompt caches plus the progressFor fallback the tab bar
-   reads. window.DashProgram mounts the panel for embedding.
+   Renders the program panel (one two-line row per workstream with the
+   server plan progress, a segmented done/to-merge/on-prod/working bar, an
+   always-visible key, and tokens/cost/live in the secondary line), the
+   per-workstream cards on the overview, and owns the planSum/planPrompt
+   caches plus the progressFor fallback the tab bar reads.
+   window.DashProgram mounts the panel for embedding.
    Reads: state.wss, state.snap, state.plan; window.ADT.
    Exports (on window.AdPage.cards, also kept as plain globals):
    programPanel, wsCards, wsCard, planProg, loadPlanSums, progressFor;
    planSum and planPrompt are shared by accessor (reassigned on load).
-   Needs: el, api, shown, go, openPlan, copyBtn, renderTabs, fmtN, fmtUsd,
-   ADT (plain globals). */
+   Needs: el, api, shown, wsNum, go, openPlan, copyBtn, renderTabs, fmtN,
+   fmtUsd, ADT (plain globals). */
 (function (global) {
   "use strict";
   /* Tab progress comes from the /api/workstreams row (the same progress
@@ -37,24 +39,73 @@
       }).catch(function () {});
     })).then(function () { renderTabs(); });
   }
-  /* "Where we are": one row per workstream with status, % done from its plan, live agents and quick actions. Top of both Overview pages. */
+  /* Bar segments, in paint order: done green, to-merge amber,
+     merged-waiting-on-prod magenta, working-now blue. */
+  function progSegs(bar, pc, tot) {
+    [["done", "var(--good)"], ["pr", "var(--warning)"], ["prog", "var(--s5)"], ["wip", "var(--s1)"]].forEach(function (seg) {
+      if (!pc[seg[0]] || !tot) return;
+      var sp = el("span");
+      sp.style.width = (100 * pc[seg[0]] / tot) + "%";
+      sp.style.background = seg[1];
+      bar.appendChild(sp);
+    });
+  }
+  /* Tokens/cost for a row come from the same snapshot the tiles read, so a
+     row shows exactly what that workstream's own tab shows. */
+  function wsUsage(id) {
+    var hit = null;
+    ((state.snap && state.snap.by_workstream) || []).forEach(function (r) { if (r.ws === id) hit = r; });
+    return hit;
+  }
+  /* "Where we are": one two-line row per workstream. First line: id, name
+     and the right-aligned %; the status pill sits under the name. The
+     segmented bar carries the done-of-total value in its accessible label;
+     the secondary line names tokens, cost and live agents. */
   function programPanel() {
     var c = el("div", {class: "card program", "data-nav": "Where we are"});
-    c.appendChild(el("div", {class: "prog-h"}, [el("h2", {text: "Where we are"}), el("span", {class: "sub", text: "Every workstream's plan, live. % done counts merged tasks; deferred tasks are left out."})]));
-    var all = {done: 0, tot: 0};
-    shown(state.wss).forEach(function (w) {
-      var pr = planSum[w.ws]; if (!pr) return;
-      var pc = pr.counts, tot = pr.total, pct = pr.pct;
-      all.done += pr.done; all.tot += tot;
-      var st = ADT.isCompleted(pr) ? ["done", "Done \u2713"] : (pr.done + (pc.wip || 0) + (pc.prog || 0) + (pc.pr || 0) || w.live_agents) ? ["active", "In progress"] : ["todo", "Not started"];
+    c.appendChild(el("div", {class: "prog-h"}, [el("h2", {text: "Where we are"}), el("span", {class: "sub", text: "Plan progress per workstream \u00B7 deferred tasks leave every count"})]));
+    var key = el("div", {class: "prog-legend", role: "note", "aria-label": "Progress bar key"});
+    [["sw-done", "Done"], ["sw-pr", "To merge"], ["sw-prog", "On prod"], ["sw-wip", "Working"]].forEach(function (k) {
+      key.appendChild(el("span", {class: "prog-key"}, [el("i", {class: "sw " + k[0]}), document.createTextNode(k[1])]));
+    });
+    c.appendChild(key);
+    var rows = (state.wss || []).slice().sort(function (x, y) { return wsNum(x) - wsNum(y); });
+    var all = {done: 0, tot: 0, live: 0};
+    rows.forEach(function (w) { all.live += w.live_agents || 0; });
+    rows.forEach(function (w) {
+      var pr = planSum[w.ws] || null;
+      var pc = pr ? pr.counts : {}, tot = pr ? pr.total : 0, pct = pr ? pr.pct : 0, done = pr ? pr.done : 0;
+      if (pr) { all.done += done; all.tot += tot; }
+      /* Status is colour plus symbol plus word, never colour alone. The
+         shared completed rule (server progress object) decides Done. */
+      var st = !pr ? ["none", "No plan"] : ADT.isCompleted(pr) ? ["done", "\u2713 Done"] : (done + (pc.wip || 0) + (pc.prog || 0) + (pc.pr || 0) || w.live_agents) ? ["active", "\u25CF In progress"] : ["todo", "\u25CB Not started"];
+      var use = wsUsage(w.ws);
+      var tok = use ? use.tokens : w.tokens, cost = use ? use.cost_usd : w.cost_usd;
       var row = el("div", {class: "prog-row s-" + st[0]});
-      row.appendChild(el("div", {class: "prog-name"}, [el("b", {text: w.ws}), el("span", {text: w.name || ""})]));
-      row.appendChild(el("span", {class: "prog-pill " + st[0], text: st[1]}));
-      var bar = el("div", {class: "prog-bar", role: "img", "aria-label": w.ws + " " + pct + "% done"});
-      [["done", "var(--good)"], ["prog", "var(--s5)"], ["pr", "var(--warning)"]].forEach(function (p) { if (!pc[p[0]] || !tot) return; var sp = el("span"); sp.style.width = (100 * pc[p[0]] / tot) + "%"; sp.style.background = p[1]; bar.appendChild(sp); });
+      var name = el("div", {class: "prog-name"});
+      var idline = el("div", {class: "prog-idline"});
+      idline.appendChild(el("b", {text: w.ws}));
+      idline.appendChild(el("span", {text: w.name || ""}));
+      name.appendChild(idline);
+      name.appendChild(el("span", {class: "prog-pill " + st[0], text: st[1]}));
+      row.appendChild(name);
+      var bar = el("div", {class: "prog-bar", role: "img", "aria-label": tot ? (w.ws + " " + done + " of " + tot + " tasks done (" + pct + "%)") : (w.ws + " has no plan")});
+      if (tot) {
+        progSegs(bar, pc, tot);
+        bar.title = "Done " + done + " \u00B7 to merge " + (pc.pr || 0) + " \u00B7 on prod " + (pc.prog || 0) + " \u00B7 working " + (pc.wip || 0) + " \u00B7 not started " + (pc.todo || 0) + " of " + tot + " tasks";
+      }
       row.appendChild(bar);
-      row.appendChild(el("b", {class: "prog-pct", text: pct + "%"}));
-      row.appendChild(el("span", {class: "prog-meta", text: pr.done + "/" + tot + " tasks" + (pc.wip ? " \u00B7 " + pc.wip + " in progress" : "") + (pc.prog ? " \u00B7 " + pc.prog + " on prod" : "") + (pc.pr ? " \u00B7 " + pc.pr + " to merge" : "") + (w.live_agents ? " \u00B7 \u25CF " + w.live_agents + " live" : "")}));
+      row.appendChild(el("span", {class: "prog-pct", text: tot ? pct + "%" : "\u2014"}));
+      /* The done-of-total value reads bold first, like the mockup; the
+         rest of the secondary line stays muted mono. */
+      var meta = el("span", {class: "prog-meta"});
+      if (tot) {
+        meta.appendChild(el("b", {text: done + "/" + tot}));
+        meta.appendChild(document.createTextNode(" tasks \u00B7 " + (pc.pr || 0) + " to merge \u00B7 \u25CF " + (w.live_agents || 0) + " live \u00B7 " + fmtN(tok) + " \u00B7 " + fmtUsd(cost)));
+      } else {
+        meta.textContent = "\u25CF " + (w.live_agents || 0) + " live \u00B7 " + fmtN(tok) + " tokens \u00B7 " + fmtUsd(cost);
+      }
+      row.appendChild(meta);
       var acts = el("div", {class: "prog-acts"});
       var bp = el("button", {text: "Plan"}); bp.addEventListener("click", function () { openPlan(w.ws); }); acts.appendChild(bp);
       var bl = el("button", {text: "Live"}); bl.addEventListener("click", function () { if (window.DashNav) window.DashNav.openExec(w.ws); }); acts.appendChild(bl);
@@ -62,7 +113,22 @@
       row.appendChild(acts);
       c.appendChild(row);
     });
-    if (all.tot) c.insertBefore(el("div", {class: "prog-total", text: "Overall: " + all.done + " of " + all.tot + " tasks done across " + Object.keys(planSum).length + " workstreams"}), c.children[1]);
+    /* Overall hero: summed server counts plus live agents. No % here: plan %
+       is computed once on the server and the page never derives one from
+       task counts itself. */
+    var overall = el("div", {class: "prog-total prog-overall"});
+    if (all.tot) {
+      overall.appendChild(el("span", {class: "pct", text: all.done + " of " + all.tot}));
+      var txt = el("span", {class: "txt"});
+      txt.appendChild(el("b", {text: "tasks done"}));
+      txt.appendChild(document.createTextNode(" across " + Object.keys(planSum).length + " workstreams \u00B7 "));
+      txt.appendChild(el("b", {text: all.live + " agents live"}));
+      overall.appendChild(txt);
+    } else {
+      overall.appendChild(el("span", {class: "txt", text: "Loading workstream plans\u2026"}));
+      c.setAttribute("aria-busy", "true");
+    }
+    c.insertBefore(overall, key.nextSibling);
     if (!Object.keys(planSum).length) c.appendChild(el("div", {class: "skel"}));
     return c;
   }
@@ -79,11 +145,17 @@
     if (clickable) attrs.onclick = function () { go(id); };
     var card = el("div", attrs);
     var top = el("div", {class: "top"}, [el("span", {class: "id", text: id}), el("span", {class: "st " + (live ? "running" : "done")}, [el("i"), live ? live + " running" : "idle"])]);
-    card.appendChild(top); card.appendChild(el("div", {style: "font-size:13px;color:var(--ink-2)", text: name || ""}));
+    card.appendChild(top); card.appendChild(el("div", {class: "wsc-name", text: name || ""}));
     var bar = el("div", {class: "bar", role: "img", "aria-label": done + " of " + tot + " plan tasks done"});
-    [["done", "var(--good)"], ["prog", "var(--s5)"], ["pr", "var(--warning)"]].forEach(function (p) { if (!pc[p[0]] || !tot) return; var sp = el("span"); sp.style.width = (100 * pc[p[0]] / tot) + "%"; sp.style.background = p[1]; bar.appendChild(sp); });
+    if (tot) {
+      progSegs(bar, pc, tot);
+      bar.title = "Done " + done + " \u00B7 to merge " + (pc.pr || 0) + " \u00B7 on prod " + (pc.prog || 0) + " \u00B7 working " + (pc.wip || 0) + " of " + tot + " tasks";
+    }
     card.appendChild(bar);
-    card.appendChild(el("div", {style: "font:12px var(--mono);color:var(--muted)", title: "From the workstream plan: " + done + " done, " + (pc.prog || 0) + " merged waiting on prod, " + (pc.pr || 0) + " waiting to merge, " + (pc.todo || 0) + " not started" + (pc.deferred ? ", " + pc.deferred + " deferred (not counted)" : ""), text: done + "/" + tot + " tasks (" + pct + "%) \u00B7 " + fmtN(tokens) + " tok \u00B7 " + fmtUsd(cost)}));
+    var meta = el("div", {class: "wsc-meta"});
+    meta.appendChild(el("div", {class: "wsc-plan", title: tot ? ("From the workstream plan: " + done + " done, " + (pc.prog || 0) + " merged waiting on prod, " + (pc.pr || 0) + " waiting to merge, " + (pc.todo || 0) + " not started" + (pc.deferred ? ", " + pc.deferred + " deferred (not counted)" : "")) : "No plan for this workstream", text: tot ? (done + "/" + tot + " tasks (" + pct + "%)") : "No plan"}));
+    meta.appendChild(el("div", {class: "wsc-use", text: fmtN(tokens) + " tokens \u00B7 " + fmtUsd(cost)}));
+    card.appendChild(meta);
     return card;
   }
   /* Overview per-workstream figures come from the same snapshot the tiles read,

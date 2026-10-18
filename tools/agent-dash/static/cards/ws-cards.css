@@ -1,0 +1,262 @@
+/* Where-we-are rows and workstream cards (v2: bold, dark-first).
+   Two-line workstream rows (id plus name over a status pill, segmented
+   plan bar, tabular % right-aligned, tokens/cost/live secondary line,
+   quiet Plan/Live actions), an always-visible bar key, the overall hero
+   line, and the overview workstream cards with split meta lines. Status
+   is always colour plus symbol plus word. Dark-first tokens with light
+   fallbacks: every v2 var carries the old-token value to fall back to. */
+
+.program {
+  border-color: color-mix(in srgb, var(--s1) 35%, var(--ring));
+}
+.prog-h {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.prog-h h2 {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 750;
+  letter-spacing: -0.01em;
+}
+.prog-h .sub {
+  margin: 0;
+  min-width: 0;
+}
+.prog-name,
+.prog-meta,
+.prog-overall .txt {
+  min-width: 0;
+}
+.prog-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 14px;
+  margin: 8px 0 4px;
+  font-size: 12px;
+  color: var(--ink-2);
+}
+.prog-key {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-variant-numeric: var(--tnum, tabular-nums);
+}
+.prog-key .sw {
+  width: 10px;
+  height: 10px;
+  border-radius: 3px;
+}
+.sw-done { background: var(--good); }
+.sw-pr { background: var(--warning); }
+.sw-prog { background: var(--s5); }
+.sw-wip { background: var(--s1); }
+.prog-overall {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin: 8px 0 6px;
+}
+.prog-overall .pct {
+  font-size: 30px;
+  font-weight: 750;
+  letter-spacing: -0.02em;
+  font-variant-numeric: var(--tnum, tabular-nums);
+}
+.prog-overall .txt {
+  font: 12.5px var(--mono);
+  color: var(--ink-2);
+}
+.prog-overall .txt b {
+  color: var(--ink);
+  font-weight: 700;
+}
+.prog-row {
+  display: grid;
+  grid-template-columns: minmax(170px, 240px) minmax(0, 1fr) 64px minmax(0, auto) auto;
+  gap: 14px;
+  align-items: center;
+  padding: 11px 0;
+  border-top: 1px solid var(--grid);
+}
+.prog-idline {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-size: 13.5px;
+}
+.prog-idline b {
+  font: 700 12.5px var(--mono);
+  margin-right: 8px;
+}
+.prog-idline span {
+  color: var(--ink-2);
+  font-weight: 650;
+}
+.prog-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  margin-top: 5px;
+  font: 700 11.5px var(--font);
+  padding: 3px 10px;
+  border-radius: var(--r-pill, 999px);
+  border: 1px solid var(--grid);
+  color: var(--ink-2);
+  white-space: nowrap;
+}
+.prog-pill.done {
+  color: var(--good-ink, var(--good));
+  border-color: color-mix(in srgb, var(--good) 55%, transparent);
+  background: var(--good-soft, color-mix(in srgb, var(--good) 18%, transparent));
+}
+.prog-pill.active {
+  color: var(--accent-ink, #fff);
+  background: var(--accent, var(--s1));
+  border-color: transparent;
+}
+:root[data-theme="light"] .prog-pill.active {
+  color: #fff;
+  background: var(--accent-fill, var(--accent, var(--s1)));
+}
+.prog-pill.todo {
+  color: var(--muted);
+  border-style: dashed;
+}
+.prog-pill.none {
+  color: var(--muted);
+  background: var(--surface-2);
+}
+.prog-bar {
+  display: flex;
+  gap: 2px;
+  height: 14px;
+  border-radius: 7px;
+  overflow: hidden;
+  background: var(--raised, var(--surface-2));
+  min-width: 80px;
+}
+.prog-bar span {
+  display: block;
+  height: 100%;
+  border-radius: 2px;
+  transition: width 0.45s cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+.prog-bar span:first-child { border-radius: 7px 2px 2px 7px; }
+.prog-bar span:last-child { border-radius: 2px 7px 7px 2px; }
+.prog-pct {
+  font-size: 22px;
+  font-weight: 750;
+  letter-spacing: -0.01em;
+  font-variant-numeric: var(--tnum, tabular-nums);
+  text-align: right;
+  min-width: 64px;
+}
+.prog-meta {
+  font: 12px var(--mono);
+  color: var(--muted);
+  font-variant-numeric: var(--tnum, tabular-nums);
+  white-space: nowrap;
+}
+.prog-meta b {
+  color: var(--ink-2);
+}
+.prog-acts {
+  display: flex;
+  gap: 6px;
+  justify-content: flex-end;
+}
+.prog-acts button {
+  font-size: 12.5px;
+  font-weight: 600;
+  padding: 5px 13px;
+  border-radius: var(--r-pill, 999px);
+}
+.prog-acts .copybtn {
+  margin-left: 0;
+}
+
+/* Overview workstream cards: name, plan bar, split meta lines. */
+.wsc {
+  cursor: pointer;
+}
+.wsc:hover {
+  border-color: var(--accent, var(--s1));
+}
+.wsc .top {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 8px;
+}
+.wsc .id {
+  font: 700 15px var(--mono);
+}
+.wsc-name {
+  font-size: 13px;
+  color: var(--ink-2);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.wsc .bar {
+  display: flex;
+  height: 8px;
+  border-radius: 4px;
+  overflow: hidden;
+  background: var(--raised, var(--surface-2));
+  margin: 8px 0 6px;
+  gap: 2px;
+}
+.wsc .bar span {
+  display: block;
+  height: 100%;
+}
+.wsc-meta {
+  display: grid;
+  gap: 1px;
+}
+.wsc-plan {
+  font: 600 12px var(--mono);
+  color: var(--ink-2);
+  font-variant-numeric: var(--tnum, tabular-nums);
+}
+.wsc-use {
+  font: 12px var(--mono);
+  color: var(--muted);
+  font-variant-numeric: var(--tnum, tabular-nums);
+}
+
+@media (max-width: 1000px) {
+  .prog-row {
+    grid-template-columns: 1fr auto;
+    row-gap: 6px;
+  }
+  .prog-bar,
+  .prog-meta,
+  .prog-acts {
+    grid-column: 1 / -1;
+  }
+}
+@media (max-width: 700px) {
+  .prog-overall .pct {
+    font-size: 24px;
+  }
+  .prog-pct {
+    font-size: 19px;
+  }
+  .prog-meta {
+    white-space: normal;
+  }
+  .prog-acts {
+    display: none;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .prog-bar span {
+    transition: none;
+  }
+}
