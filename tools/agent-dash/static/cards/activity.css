@@ -1,0 +1,76 @@
+/* Activity-over-time stack (static/cards/activity.js). One card holding the
+   time filter bar plus the tokens, run-timeline and live-agents strips on
+   a single shared x axis. Strip internals reuse the token/timeline/live
+   card styles via their ids and classes; everything here is stack-local. */
+
+#exec-activity .act-controls{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:0 0 6px}
+#exec-activity .act-controls button{border-radius:999px;padding:5px 13px;font-size:12.5px;font-weight:600}
+#exec-activity .act-controls button[aria-pressed="true"]{background:var(--accent-fill,var(--accent));color:var(--accent-ink);border-color:transparent}
+#exec-activity .act-reset{margin-left:2px}
+#exec-activity .act-live{font:700 11px var(--mono);color:var(--good-ink,var(--good));border:1px solid var(--good);border-radius:999px;padding:2px 9px;white-space:nowrap}
+#exec-activity .act-range{margin-left:auto;font:600 12.5px var(--mono);color:var(--ink-2);font-variant-numeric:tabular-nums;white-space:nowrap}
+
+/* Range bar: full width above the strips, drawn by actBrush. Labels ride
+   the top, the track holds the tokens sparkline and the selection. */
+#exec-activity .act-brush{margin:2px 0 4px}
+#exec-activity .act-brush svg{touch-action:none;user-select:none;-webkit-user-select:none}
+#exec-activity .act-blab{fill:var(--muted);font:11px var(--font);pointer-events:none}
+#exec-activity .act-dim{pointer-events:none}
+#exec-activity .act-track{cursor:crosshair}
+#exec-activity .act-handle{pointer-events:none}
+#exec-activity .act-hit{pointer-events:all}
+#exec-activity .act-hit:focus-visible{outline:none}
+/* Focus ring on the visible knob: the transparent hit rect takes focus
+   and toggles .focused on its visible knob sibling. */
+#exec-activity .act-handle.focused{stroke:var(--accent);stroke-width:2}
+
+/* Strips share one left margin and plot width (see actGeo), so strip
+   titles sit above each svg and the x labels draw once at the bottom. */
+#exec-activity .act-strips{display:grid;gap:6px}
+#exec-activity .act-strip h3{font-size:13px;font-weight:700;margin:10px 0 2px;color:var(--ink)}
+#exec-activity .act-strip svg{height:auto;max-width:100%}
+#exec-activity .act-cross{stroke:var(--ink-2);stroke-width:1;stroke-dasharray:3 3;pointer-events:none}
+#exec-activity .tl-clip{pointer-events:none}
+
+/* Reuse the token legend/toggle and conc strip headings inside the stack
+   (same classes the old cards used, now scoped under #exec-activity). */
+#exec-activity .tok-head{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+#exec-activity .tok-head h3{margin:10px 0 2px}
+#exec-activity .seg-ctl{border-radius:999px;padding:3px;gap:2px;background:var(--surface)}
+#exec-activity .seg-ctl button{border:0;background:transparent;color:var(--ink-2);font-weight:650;font-size:12.5px;padding:5px 14px;border-radius:999px;cursor:pointer}
+#exec-activity .seg-ctl button:hover{color:var(--ink)}
+#exec-activity .seg-ctl button[aria-pressed="true"]{background:var(--accent-fill,var(--accent));color:var(--accent-ink)}
+#exec-activity .seg-ctl button:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+#exec-activity .tok-legend{align-items:baseline}
+#exec-activity .tok-legend .lentry{display:inline-flex;align-items:center;gap:6px}
+#exec-activity .tok-legend .lname{color:var(--ink-2)}
+#exec-activity .tok-legend .lv{font-variant-numeric:tabular-nums;text-align:right;min-width:3.4em;font-weight:700;color:var(--ink)}
+#exec-activity .peaklab{font:700 11px var(--mono);fill:var(--ink);font-variant-numeric:tabular-nums}
+#exec-activity .vallab{font:600 10.5px var(--mono);fill:var(--muted);font-variant-numeric:tabular-nums}
+#exec-activity .conc-strip{margin:6px 0 2px}
+#exec-activity .conc-head{display:flex;align-items:baseline;gap:8px;margin-bottom:2px}
+#exec-activity .conc-head .sw{flex:none}
+#exec-activity .conc-fam{font-weight:700;font-size:12.5px;color:var(--ink)}
+#exec-activity .conc-models{font-size:11.5px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0}
+#exec-activity .conc-pk{margin-left:auto;font:600 11.5px var(--mono);color:var(--ink-2);font-variant-numeric:tabular-nums;white-space:nowrap}
+#exec-activity .conc-pk-lab{font:600 11px var(--mono);fill:var(--muted);font-variant-numeric:tabular-nums}
+#exec-activity .tl-lane-label{fill:var(--ink);font:700 12px var(--mono)}
+#exec-activity .tl-strip-sub{fill:var(--muted);font:11px var(--font)}
+#exec-activity .tl-model-label{fill:var(--ink-2);font:600 11.5px var(--font)}
+#exec-activity .tl-bar{cursor:pointer}
+#exec-activity .tl-bar:hover{filter:brightness(1.3)}
+#exec-activity .tl-lane-hit{cursor:pointer}
+#exec-activity .tl-dense-hit{cursor:pointer}
+#exec-activity .tl-now{stroke:var(--s1);stroke-width:1.5;animation:tlnow 2s ease-in-out infinite}
+@keyframes tlnow{50%{opacity:.45}}
+#exec-activity .empty.err{color:var(--critical)}
+
+@media (max-width:700px){
+  #exec-activity .act-range{margin-left:0;width:100%}
+  #exec-activity .act-controls{gap:6px}
+}
+
+@media (prefers-reduced-motion:reduce){
+  #exec-activity .tl-now{animation:none}
+  #exec-activity .tl-bar:hover{filter:none}
+}

@@ -6,8 +6,9 @@
  * seeded with 12 synthetic live agents, then drives the Execution view
  * over the DevTools protocol (stdlib only: global fetch and WebSocket,
  * child_process, no npm installs) and asserts:
- *   - the Run timeline section (gantt) directly follows Tokens per hour
- *     in DOM order, then Live agents over time (conc), then finished;
+ *   - the Activity over time section (activity) directly follows the plan
+ *     card in DOM order, then finished (the stack replaced the separate
+ *     Tokens per hour, Run timeline and Live agents sections);
  *   - collapsed Running now shows exactly 5 agent rows grouped under
  *     section headers with a real <button> reading "Show all 12 running
  *     agents" (aria-expanded, aria-controls);
@@ -359,14 +360,16 @@ async function main() {
     const sectionOrder = `Array.prototype.map.call(
       document.querySelectorAll('#main [data-sec]'), function(s){ return s.getAttribute('data-sec'); })`;
 
-    check("overview order: tokens, gantt, conc, finished", async () => {
+    check("overview order: activity stack, then finished", async () => {
       await cdp.send("Page.navigate", { url: `${URL}/?view=exec&ws=all` });
       await waitForLoad(cdp);
       await waitFor(cdp, `(${runningState}) && ${runningState}.h2.indexOf('· 12') >= 0`, "running card with 12 agents");
       const order = await evaluate(cdp, sectionOrder);
-      const i = order.indexOf("tokens");
-      eq(JSON.stringify(order.slice(i, i + 4)), JSON.stringify(["tokens", "gantt", "conc", "finished"]),
-        `section order around tokens (full: ${order.join(",")})`);
+      const i = order.indexOf("activity");
+      eq(JSON.stringify(order.slice(i, i + 2)), JSON.stringify(["activity", "finished"]),
+        `section order around activity (full: ${order.join(",")})`);
+      const nav = await evaluate(cdp, `document.querySelector('#exec-activity') ? document.querySelector('#exec-activity').getAttribute('data-nav') : null`);
+      eq(nav, "Activity over time", "stack data-nav label");
     });
 
     check("overview collapsed: 5 rows, show-all button", async () => {

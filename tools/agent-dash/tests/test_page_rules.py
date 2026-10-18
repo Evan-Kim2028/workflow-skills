@@ -117,18 +117,20 @@ class PageRules(unittest.TestCase):
         self.assertIn("totals_all_time", body)
         self.assertIn("data-tokens", body)
 
-    def test_legend_total_matches_the_tile(self):
-        """The chart legend Total is the snapshot total, with data attributes
-        for the browser check and a visible cross line when the chart drifts."""
+    def test_legend_total_is_the_selected_range(self):
+        """The stack's token legend Total covers the selected range (the
+        tile keeps the 24 h snapshot total), with data attributes for the
+        browser check. No tile/chart cross line: a zoomed range legitimately
+        differs from the tile."""
         script = inline_scripts()
         bodies = dict(functions(script))
-        self.assertIn("tokenChart", bodies)
-        body = bodies["tokenChart"]
-        self.assertIn("snap.totals", body)
+        self.assertIn("actTokenStrip", bodies)
+        body = bodies["actTokenStrip"]
         self.assertIn("data-legend-total", body)
         self.assertIn("data-chart-sum", body)
-        self.assertIn("xline", body)
-        self.assertIn("--warning", body)
+        self.assertIn("in the selected range", body)
+        self.assertNotIn("snap.totals", body, "the range-scoped legend must not read the tile total")
+        self.assertNotIn("xline", body, "a zoomed range must not trip the tile cross-check")
 
     def test_polling_pauses_when_hidden(self):
         """Background work no-ops while the tab is hidden: stream ticks,
@@ -200,8 +202,8 @@ class PageRules(unittest.TestCase):
         group instead of racing a lone usage fetch."""
         script = inline_scripts()
         bodies = dict(functions(script))
-        self.assertIn("tokenChart", bodies)
-        body = bodies["tokenChart"]
+        self.assertIn("actTokenStrip", bodies)
+        body = bodies["actTokenStrip"]
         self.assertIn("state.groupBy =", body)
         self.assertIn("refreshSnapshot", body)
 
@@ -848,21 +850,26 @@ class PageRules(unittest.TestCase):
         self.assertFalse((STATIC / "doctor.js").exists(), "static/doctor.js is back")
 
     def test_chart_cards_expose_agent_data(self):
-        """The v2 charts carry raw values for agents: the token legend
+        """The stack strips carry raw values for agents: the token legend
         entries have data-key/data-v, the bar samples data-t/data-v, the
         peak bar a direct label; every live strip has its own y axis, a
-        gradient fill and a pk annotation, and an empty window reads
-        "No samples in this window", never a silent zero or a failure."""
+        gradient fill and a pk annotation, and an empty window names what
+        is missing ("No usage/runs/live agents in this window"), never a
+        silent zero or a failure."""
         script = inline_scripts()
         bodies = dict(functions(script))
-        self.assertIn("tokenChart", bodies)
-        tok = bodies["tokenChart"]
+        self.assertIn("actTokenStrip", bodies)
+        tok = bodies["actTokenStrip"]
         for needle in ("data-key", "data-v", "data-t", "peaklab", "data-legend-total"):
-            self.assertIn(needle, tok, f"tokenChart lost {needle!r}")
-        self.assertIn("concChart", bodies)
-        conc = bodies["concChart"]
-        for needle in ("data-fam", "data-peak", "pk ", "linearGradient", "No samples in this window", "data-failed-scope", "request failed"):
-            self.assertIn(needle, conc, f"concChart lost {needle!r}")
+            self.assertIn(needle, tok, f"actTokenStrip lost {needle!r}")
+        self.assertIn("actConcStrip", bodies)
+        conc = bodies["actConcStrip"]
+        for needle in ("data-fam", "data-peak", "pk ", "linearGradient"):
+            self.assertIn(needle, conc, f"actConcStrip lost {needle!r}")
+        self.assertIn("actConcStrips", bodies)
+        paint = bodies["actPaintStrips"]
+        for needle in ("No live agents in this window", "data-failed-scope", "request failed"):
+            self.assertIn(needle, paint, f"the stack hides an empty live strip: {needle!r}")
 
     def test_unknown_duration_is_a_dash(self):
         script = (
@@ -884,21 +891,23 @@ class PageRules(unittest.TestCase):
 
 
     def test_timeline_source_contract(self):
-        """The timeline card keeps its integration points: the axis comes
+        """The timeline strip keeps its integration points: the axis comes
         from the shared helpers, every bar carries its run id and outcome,
-        and numbers stay compact."""
-        src = (STATIC / "cards" / "timeline.js").read_text()
-        for token in ("axes(", "timeTicks(", "data-run-id", "data-outcome"):
-            self.assertIn(token, src, f"timeline.js lost {token}")
+        clipped bars carry a visible cap, and numbers stay compact."""
+        src = (STATIC / "cards" / "activity.js").read_text()
+        for token in ("axes(", "timeTicks(", "data-run-id", "data-outcome", "data-clipped", "tl-clip"):
+            self.assertIn(token, src, f"activity.js lost {token}")
         for bad in (".toFixed(", "toLocaleString()", '"dagster"', "'dagster'"):
-            self.assertNotIn(bad, src, f"timeline.js must not contain {bad}")
+            self.assertNotIn(bad, src, f"activity.js must not contain {bad}")
 
     def test_timeline_draws_every_run(self):
-        """The run timeline draws every run in the window, never a sample:
-        the real gantt() renders one bar per run (data-run-id) of a
-        generated 640-run payload, every bar carries a data-outcome, the
-        lane labels add up to the payload, and a >400-row lane becomes a
-        labelled dense strip that still expands to every bar."""
+        """The timeline strip draws every run in the selected range, never
+        a sample: the real actTimelineStrip() renders one bar per run
+        (data-run-id) of a generated 640-run payload, every bar carries
+        a data-outcome, the lane labels add up to the payload, a >400-row
+        lane becomes a labelled dense strip that still expands to every
+        bar, and a 2 h brush draws only the runs it covers with clipped
+        bars carrying a visible edge cap."""
         harness = r'''
 const fs = require("fs");
 const assert = require("assert");
@@ -932,7 +941,7 @@ global.openRun = function () {};
 global.drawMain = function () {};
 global.state = {runs: [], ws: "all"};
 files.forEach(function (p) { eval(fs.readFileSync(p, "utf8")); });
-["gantt", "isAgent", "runEnd", "packRows", "outcomeOf", "outcomeColor"].forEach(function (n) {
+["actTimelineStrip", "isAgent", "runEnd", "packRows", "outcomeOf", "outcomeColor"].forEach(function (n) {
   assert.strictEqual(typeof global[n], "function", n + " is not exported");
 });
 assert.strictEqual(typeof global.expanded, "object", "expanded lane state is not exported");
@@ -941,13 +950,16 @@ function walk(node, out) {
   out.push(node);
   (node.children || []).forEach(function (c) { if (c && c.children) walk(c, out); });
 }
+var GEO = {W: 1100, L: 150, R: 14, pw: 936};
+var SEL = null;
 function render() {
+  if (!SEL) SEL = {from: T0, to: NOW};
   var nodes = [];
-  walk(gantt(), nodes);
+  walk(actTimelineStrip(SEL, {runs: state.runs}, NOW, GEO, false).node, nodes);
   return nodes;
 }
 function barsOf(nodes) {
-  return nodes.filter(function (n) { return n.tag === "rect" && n.attrs["data-run-id"] !== undefined; });
+  return nodes.filter(function (n) { return n.tag === "rect" && n.attrs.class === "tl-bar"; });
 }
 function textsOf(nodes, cls) {
   return nodes.filter(function (n) { return n.tag === "text" && n.attrs.class === cls; }).map(function (n) { return n.textContent; });
@@ -1041,7 +1053,25 @@ nodes = render();
 bars = barsOf(nodes);
 assert.strictEqual(bars.length, 640, "ws-tab bars " + bars.length + " != 640 runs");
 assert.ok(textsOf(nodes, "tl-model-label").length > 0, "ws tab opened no per-model lane");
-console.log("timeline every-run proof ok: 640 + 505 + 640 bars");
+/* Scenario D: a 2 h brush draws only the runs it covers, on the same
+   x domain the other strips share, with clipped bars capped. */
+Object.keys(expanded).forEach(function (key) { delete expanded[key]; });
+var B0 = NOW - 4 * 3600, B1 = NOW - 2 * 3600;
+SEL = {from: B0, to: B1};
+nodes = render();
+bars = barsOf(nodes);
+var want = runs.filter(function (r) { return runEnd(r, NOW) >= B0 && r.started_at <= B1; });
+assert.strictEqual(bars.length, want.length, "brushed bars " + bars.length + " != covered runs " + want.length);
+assert.ok(bars.length > 0 && bars.length < 640, "2 h brush must shrink the strip, got " + bars.length);
+var svgs = nodes.filter(function (n) { return n.tag === "svg" && n.attrs["data-strip"] === "timeline"; });
+assert.strictEqual(svgs.length, 1, "one timeline svg, got " + svgs.length);
+assert.strictEqual(Number(svgs[0].attrs["data-x-from"]), B0, "strip x domain does not match the brush");
+assert.strictEqual(Number(svgs[0].attrs["data-x-to"]), B1, "strip x domain does not match the brush");
+var clipped = bars.filter(function (b) { return b.attrs["data-clipped"] !== undefined; });
+assert.ok(clipped.length > 0, "no clipped bar in a brushed window");
+var caps = nodes.filter(function (n) { return n.tag === "rect" && n.attrs.class === "tl-clip"; });
+assert.ok(caps.length >= clipped.length, "clipped bars without a visible edge cap");
+console.log("timeline every-run proof ok: 640 + 505 + 640 bars, brush clips");
 '''
         files = [
             STATIC / "models.js",
@@ -1049,6 +1079,7 @@ console.log("timeline every-run proof ok: 640 + 505 + 640 bars");
             STATIC / "core" / "el.js",
             STATIC / "core" / "charts.js",
             STATIC / "cards" / "timeline.js",
+            STATIC / "cards" / "activity.js",
         ]
         with tempfile.TemporaryDirectory() as tmp:
             harness_path = Path(tmp) / "tl_every_run.js"
@@ -2386,9 +2417,9 @@ class FinalPolishTests(unittest.TestCase):
         prog = (STATIC / "cards" / "plan-progress.js").read_text()
         for needle in ('"role", "button"', '"tabindex", "0"', '"aria-label"', '"keydown"', "chipActivate"):
             self.assertIn(needle, prog, f"plan-progress.js lost {needle}")
-        tl = (STATIC / "cards" / "timeline.js").read_text()
+        tl = (STATIC / "cards" / "activity.js").read_text()
         for needle in ('role: "button"', 'tabindex: "0"', '"aria-label"', '"keydown"'):
-            self.assertIn(needle, tl, f"timeline.js lost {needle}")
+            self.assertIn(needle, tl, f"activity.js lost {needle}")
 
     def test_switcher_row_enter_reaches_copy(self):
         core = (STATIC / "core" / "project.js").read_text()
@@ -2403,16 +2434,16 @@ class FinalPolishTests(unittest.TestCase):
         self.assertIn("RP_REDUCED", core)
 
     def test_svg_charts_name_the_takeaway(self):
-        tok = (STATIC / "cards" / "token-chart.js").read_text()
-        self.assertIn('role: "img"', tok)
-        self.assertIn("total, peak", tok)
+        act = (STATIC / "cards" / "activity.js").read_text()
+        self.assertIn('role: "img"', act)
+        self.assertIn("in the selected range", act)
+        self.assertIn("total", act)
+        self.assertIn('"aria-label": "Agent runs in the selected range', act)
+        self.assertIn("died or blocked, ", act)
         burn = (STATIC / "cards" / "burnup.js").read_text()
         self.assertIn('"aria-label": label', burn)
         self.assertIn("recorded", burn)
         self.assertIn("total, peak", burn)
-        tl = (STATIC / "cards" / "timeline.js").read_text()
-        self.assertIn('"aria-label": "Agent runs over the last 24 hours', tl)
-        self.assertIn("died or blocked, ", tl)
         dep = (STATIC / "cards" / "depgraph.js").read_text()
         self.assertIn("workstreams, ", dep)
 
@@ -2467,7 +2498,7 @@ class FinalPolishTests(unittest.TestCase):
         self.assertIn("if (!v) return;", burn)
 
     def test_quiet_tabs_state_idleness_plainly(self):
-        live = (STATIC / "cards" / "live-chart.js").read_text()
+        live = (STATIC / "cards" / "activity.js").read_text()
         self.assertIn("No live agents in this window.", live)
         tiles = (STATIC / "cards" / "tiles.js").read_text()
         self.assertIn("(passN + part + bad)", tiles)
@@ -2695,12 +2726,11 @@ class FinalPolishTests(unittest.TestCase):
         self.assertIn("state.actionsArchive = !!", api_src, "loadNav lost the actions flag")
         self.assertIn("state.actionsArchive = false", api_src)
 
-    def test_exec_section_order_tokens_then_timeline(self):
-        """The run timeline sits directly below Tokens per hour: on both
-        exec scopes the registry order is ... tokens, gantt, conc,
-        finished, with every other section unchanged relative to the
-        rest. The sidenav derives its order from the DOM, so no pin
-        there; the page comment and DESIGN.md name the same order."""
+    def test_exec_section_order_activity_stack(self):
+        """One Activity over time card replaces the three separate chart
+        sections: on both exec scopes the registry order is ... plan,
+        activity, finished. The sidenav derives its order from the DOM, so
+        no pin there; the page comment and DESIGN.md name the same order."""
         registry = (STATIC / "cards" / "registry.js").read_text()
         entries = re.findall(
             r'\{id:\s*"([^"]+)",\s*order:\s*(\d+),\s*scope:\s*"([^"]+)"', registry
@@ -2711,21 +2741,141 @@ class FinalPolishTests(unittest.TestCase):
         )
         self.assertEqual(
             [ident for _, ident in both],
-            ["tiles", "running", "plan", "tokens", "gantt", "conc", "finished"],
-            "exec order drifted: want tokens, then gantt, then conc, then finished",
+            ["tiles", "running", "plan", "activity", "finished"],
+            "exec order drifted: want the activity stack between plan and finished",
         )
+        for gone in ('"tokens"', '"gantt"', '"conc"'):
+            self.assertNotIn(
+                gone.replace('"', 'id: "'), registry, f"the registry still registers {gone}"
+            )
         page = (STATIC / "index.html").read_text()
-        self.assertIn("tokens, gantt, conc, finished", page)
+        self.assertIn("plan, activity, finished", page)
+        self.assertIn('<script src="/static/cards/activity.js"></script>', page)
+        self.assertNotIn("token-chart.js", page, "index.html still loads the old token chart")
+        self.assertNotIn("live-chart.js", page, "index.html still loads the old live chart")
         design = (STATIC.parent / "DESIGN.md").read_text()
-        self.assertIn("run timeline directly below it", design)
+        self.assertIn("Activity over time (the tokens, run-timeline and live-agents stack)", design)
         self.assertLess(
-            design.index("run timeline directly below it"),
+            design.index("Activity over time (the tokens, run-timeline and live-agents stack)"),
             design.index("Finished (24 h)"),
-            "DESIGN.md no longer lists the timeline before Finished",
+            "DESIGN.md no longer lists the stack before Finished",
         )
         sidenav = (STATIC / "sidenav.js").read_text()
-        self.assertNotIn('"gantt"', sidenav, "the sidenav hard-codes a section order")
-        self.assertNotIn('"conc"', sidenav, "the sidenav hard-codes a section order")
+        self.assertNotIn('"activity"', sidenav, "the sidenav hard-codes a section order")
+
+    def test_activity_range_math_runs_in_node(self):
+        """The stack's range helpers are pure functions on window.AdPage:
+        range clamp, preset to range, pixel<->time mapping, brush drag
+        math and tick selection, all node-driven with no DOM."""
+        harness = r'''
+const fs = require("fs");
+const assert = require("assert");
+var window = {};
+eval(fs.readFileSync(process.argv[2], "utf8"));
+const A = window.AdPage;
+["actClampRange", "actPresetRange", "actTimeToX", "actXToTime",
+ "actDragHandle", "actDragMove", "actTickStep"].forEach(function (n) {
+  assert.strictEqual(typeof A[n], "function", "AdPage." + n + " is not exported");
+  assert.strictEqual(typeof window[n], "function", n + " is not a plain global");
+});
+/* clamp: swapped edges order, the minimum span holds, bounds win. */
+assert.deepStrictEqual(A.actClampRange(1000, 1100, 0, 10000), {from: 900, to: 1200});
+assert.deepStrictEqual(A.actClampRange(-100, 50000, 0, 3600), {from: 0, to: 3600});
+assert.deepStrictEqual(A.actClampRange(10, 5, 0, 10000), {from: 0, to: 300});
+/* presets: hour presets follow now (live), All covers the loaded window. */
+assert.deepStrictEqual(A.actPresetRange("hour", 100000, 0), {from: 96400, to: 100000, live: true, preset: "hour"});
+assert.deepStrictEqual(A.actPresetRange("6h", 100000, 0), {from: 78400, to: 100000, live: true, preset: "6h"});
+assert.deepStrictEqual(A.actPresetRange("all", 100000, 20000), {from: 20000, to: 100000, live: false, preset: "all"});
+/* pixel<->time: linear, clamped, round-trips. */
+assert.strictEqual(A.actTimeToX(50, 0, 100, 150, 800), 550);
+assert.strictEqual(A.actTimeToX(500, 0, 100, 150, 800), 950);
+assert.strictEqual(A.actXToTime(550, 0, 100, 150, 800), 50);
+assert.strictEqual(A.actXToTime(0, 0, 100, 150, 800), 0);
+assert.strictEqual(A.actXToTime(A.actTimeToX(37.5, 0, 100, 150, 800), 0, 100, 150, 800), 37.5);
+/* brush drag: an edge never crosses the other, the middle stops at the window. */
+assert.deepStrictEqual(A.actDragHandle({from: 1000, to: 2000}, "from", 1500, 0, 10000), {from: 1500, to: 2000});
+assert.deepStrictEqual(A.actDragHandle({from: 1000, to: 2000}, "from", 1900, 0, 10000), {from: 1700, to: 2000});
+assert.deepStrictEqual(A.actDragHandle({from: 1000, to: 2000}, "to", -500, 0, 10000), {from: 1000, to: 1300});
+assert.deepStrictEqual(A.actDragMove({from: 1000, to: 2000}, 500, 0, 10000), {from: 1500, to: 2500});
+assert.deepStrictEqual(A.actDragMove({from: 9000, to: 9500}, 2000, 0, 10000), {from: 9500, to: 10000});
+assert.deepStrictEqual(A.actDragMove({from: 1000, to: 2000}, -5000, 0, 10000), {from: 0, to: 1000});
+/* tick selection: the smallest whole-hour step fitting the label budget. */
+assert.strictEqual(A.actTickStep(86400, 6), 21600);
+assert.strictEqual(A.actTickStep(7200, 6), 3600);
+assert.strictEqual(A.actTickStep(3600, 6), 3600);
+assert.strictEqual(A.actTickStep(7 * 86400, 6), 86400);
+console.log("activity range math ok");
+'''
+        with tempfile.TemporaryDirectory() as tmp:
+            harness_path = Path(tmp) / "act_range_math.js"
+            harness_path.write_text(harness, encoding="utf-8")
+            proc = subprocess.run(
+                ["node", str(harness_path), str(STATIC / "cards" / "activity.js")],
+                capture_output=True,
+                text=True,
+            )
+        self.assertEqual(proc.returncode, 0, proc.stderr or proc.stdout)
+
+    def test_activity_brush_rules(self):
+        """The time filter bar is a keyboard- and pointer-operable range
+        control: two focusable role=slider handles with arrow/Shift/Home/
+        End/Escape handling, pointer drags plus double-click reset, the
+        range persisted per scope in guarded sessionStorage and in the
+        URL query, and no fetch fires per pixel of drag."""
+        src = (STATIC / "cards" / "activity.js").read_text()
+        script = inline_scripts()
+        bodies = dict(functions(script))
+        self.assertIn("actBrush", bodies)
+        brush = bodies["actBrush"]
+        self.assertIn('role: "slider"', brush, "handles are not role=slider")
+        self.assertIn("act-handle-from", brush, "no from handle")
+        self.assertIn("act-handle-to", brush, "no to handle")
+        self.assertIn('tabindex: "0"', brush, "handles are not focusable")
+        for key in ("ArrowLeft", "ArrowRight", "shiftKey", '"Home"', '"End"', '"Escape"'):
+            self.assertIn(key, brush, f"handle ignores {key}")
+        for ev in ("pointerdown", "pointermove", "pointerup", "setPointerCapture", "dblclick"):
+            self.assertIn(ev, brush, f"brush ignores {ev}")
+        self.assertIn("aria-valuetext", brush, "handles never announce their time")
+        self.assertIn("aria-valuemin", brush)
+        self.assertIn("aria-valuenow", brush)
+        self.assertNotIn("api(", brush, "a drag pixel fetches")
+        self.assertNotIn("actEnsureWide", brush, "a drag pixel tops up the window")
+        self.assertNotIn("fetch(", src, "activity.js fetches outside api()")
+        for name in ("actReadStored", "actWriteStored"):
+            self.assertIn(name, bodies, f"{name} is gone from the page")
+            for needle in ("try", "catch", "sessionStorage"):
+                self.assertIn(needle, bodies[name], f"{name} touches storage unguarded")
+        self.assertIn("agent-dash-activity:", src, "the storage key lost its per-scope prefix")
+        for name in ("actReadUrl", "actWriteUrl"):
+            self.assertIn(name, bodies, f"{name} is gone from the page")
+        self.assertIn("searchParams", src, "the range never reaches the URL")
+        self.assertIn('"from"', src, "the URL carries no from")
+        self.assertIn('"to"', src, "the URL carries no to")
+        self.assertIn("act-live", src, "no live chip for following presets")
+        self.assertIn("Reset", src, "no Reset button")
+
+    def test_activity_shares_one_axis(self):
+        """One card, one x axis, one filter: exec-activity carries the
+        Activity over time nav label with the brush bar on top, the three
+        strips stack in tokens/runs/agents order on the same domain, only
+        the bottom strip draws x labels, and one crosshair spans them."""
+        src = (STATIC / "cards" / "activity.js").read_text()
+        self.assertIn('"data-nav": "Activity over time"', src)
+        self.assertIn('id: "exec-activity"', src.replace("id:", "id:", 1))
+        self.assertEqual(src.count('"data-strip": "tokens"'), 1, "tokens strip lost its domain tag")
+        self.assertEqual(src.count('"data-strip": "timeline"'), 1, "timeline strip lost its domain tag")
+        self.assertIn('"data-strip": "conc"', src, "conc strips lost their domain tag")
+        self.assertEqual(src.count('"data-x-from"'), 3, "every strip must tag its shared x domain")
+        self.assertIn("conc[conc.length - 1].fam, true", src, "x labels no longer draw once at the bottom")
+        self.assertIn("actWireCross", src, "no shared crosshair")
+        self.assertEqual(src.count("    actCrossOf(svg"), 3, "a strip lost its crosshair line")
+        bodies = dict(functions(inline_scripts()))
+        self.assertIn("actPaintStrips", bodies)
+        paint = bodies["actPaintStrips"]
+        for strip in ("actTokenStrip", "actTimelineStrip", "actConcStrips"):
+            self.assertIn(strip, paint, f"the stack no longer renders {strip}")
+        self.assertLess(paint.index("actTokenStrip"), paint.index("actTimelineStrip"), "tokens must stack first")
+        self.assertLess(paint.index("actTimelineStrip"), paint.index("actConcStrips"), "runs must stack before agents")
 
     def test_running_now_disclosure(self):
         """Running now shows the top agents with a progressive disclosure

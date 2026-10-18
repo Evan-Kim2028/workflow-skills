@@ -256,10 +256,10 @@ function readDomExpression(ws) {
     if (tile.getAttribute("data-ws") !== ${JSON.stringify(ws)}) return {bleed: tile.getAttribute("data-ws")};
     if (tile.getAttribute("data-hours") !== ${JSON.stringify(String(WINDOW_HOURS))}) return null;
     var cost = document.querySelector('#exec-tiles [data-tile="cost"]');
-    var lg = document.querySelector('#exec-tokens .ltotal');
-    var emptyChart = !lg && !!document.querySelector('#exec-tokens .empty');
+    var lg = document.querySelector('#exec-activity .ltotal');
+    var emptyChart = !lg && !!document.querySelector('#exec-activity .empty');
     if (!lg && !emptyChart) return null;
-    var xl = document.querySelector('#exec-tokens .xline');
+    var xl = document.querySelector('#exec-activity .xline');
     var cards = [];
     if (${JSON.stringify(ws)} === "all") {
       cards = Array.prototype.map.call(document.querySelectorAll('[data-wsc]'), function (c) {

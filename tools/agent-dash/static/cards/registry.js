@@ -58,16 +58,11 @@
       if (!state.plan) return null;
       return ["plan", keyOf([state.plan, (snap.running || []).map(function (r) { return [r.label, r.workstream, r.run_id, r.section]; }), (snap.recent || []).map(function (r) { return [r.label, r.ended_at, r.verdict]; }), (state.runs || []).length]), function () { return planCard(state.plan, snap); }, "margin-top:14px"];
     }},
-    {id: "tokens", order: 60, scope: "both", spec: function (state, snap) {
-      return ["tokens", keyOf([state.usage, state.groupBy, Math.floor(Date.now() / 60000)]), function () { return tokenChart(); }, "margin-top:14px"];
-    }},
-    {id: "conc", order: 70, scope: "both", spec: function (state, snap) {
-      return ["conc", keyOf([state.conc, Math.floor(Date.now() / 60000)]), function () { return concChart(snap); }, "margin-top:14px"];
-    }},
-    /* The run timeline sits directly under Tokens per hour (owner ask):
-       tokens, then gantt, then Live agents over time, then finished. */
-    {id: "gantt", order: 65, scope: "both", spec: function (state, snap) {
-      return ["gantt", keyOf([(state.runs || []).map(runRow), expanded, Math.floor(Date.now() / 60000)]), function () { return gantt(); }, "margin-top:14px"];
+    /* Activity over time (owner ask): tokens per hour, the run timeline
+       and live agents over time stacked in that order inside one card
+       (exec-activity) on one shared x axis with one time filter. */
+    {id: "activity", order: 60, scope: "both", spec: function (state, snap) {
+      return ["activity", keyOf([state.usage, state.groupBy, (state.runs || []).map(runRow), expanded, state.conc, AdPage.actRangeKey(state.ws), Math.floor(Date.now() / 60000)]), function () { return activityCard(); }, "margin-top:14px"];
     }},
     {id: "finished", order: 90, scope: "both", spec: function (state, snap) {
       /* Ten finished agents per page through the shared pager: the key

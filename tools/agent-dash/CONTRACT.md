@@ -43,9 +43,8 @@ The one argv value ever kept is the worker's `--model` flag value, recorded on p
 | `dash/sources/cursor.py` | src-cursor |
 | `static/index.html` (page shell, markup, CSS, script tags, wiring, boot, drawMain registry loop) | Claude (parent) |
 | `static/cards/tiles.js` (headline stat tiles) | Claude (parent) |
-| `static/cards/token-chart.js` (tokens-per-hour stacked bars) | Claude (parent) |
-| `static/cards/live-chart.js` (live-agents-over-time strips) | Claude (parent) |
-| `static/cards/timeline.js` (run timeline gantt + shared run-classify helpers) | Claude (parent) |
+| `static/cards/activity.js` + `activity.css` (Activity over time stack: one time filter bar over tokens, run-timeline and live-agents strips on a shared x axis) | Claude (parent) |
+| `static/cards/timeline.js` (shared timeline row model + run-classify helpers) | Claude (parent) |
 | `static/cards/tables.js` (running and finished run tables) | Claude (parent) |
 | `static/cards/ws-cards.js` (Where we are, workstream cards, planSum cache) | Claude (parent) |
 | `static/cards/plan-progress.js` (plan progress map, task map, replay) | Claude (parent) |
