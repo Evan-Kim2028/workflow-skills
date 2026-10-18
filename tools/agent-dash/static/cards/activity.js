@@ -101,17 +101,31 @@
     return actClampRange(from, from + span, lo, hi);
   }
 
-  /* Tick selection for a shared domain: the smallest whole-hour step
-     (1, 2, 3, 6, 12 or 24 h, the same steps timeTicks uses) that fits at
-     most maxLabels labels across the span. */
+  /* Tick selection for a shared domain: the smallest grid step (one
+     minute to one week, the same steps timeTicks uses) that fits at most
+     maxLabels labels across the span, so a 2 h zoom reads minutes and a
+     day reads hours, not one bare end tick. */
   function actTickStep(spanS, maxLabels) {
-    var steps = [3600, 2 * 3600, 3 * 3600, 6 * 3600, 12 * 3600, 24 * 3600];
+    var steps = [60, 120, 300, 900, 1800, 3600, 3 * 3600, 4 * 3600, 6 * 3600, 12 * 3600, 24 * 3600, 2 * 24 * 3600, 7 * 24 * 3600];
     maxLabels = Math.max(1, +maxLabels || 6);
     spanS = Math.max(1, +spanS || 1);
     for (var i = 0; i < steps.length; i++) {
       if (spanS / steps[i] <= maxLabels) return steps[i];
     }
-    return 24 * 3600;
+    return 7 * 24 * 3600;
+  }
+
+  /* One shared tick list for a zoomed range: every strip draws its
+     gridlines on these positions while only the bottom strip labels
+     them, so strips never disagree after a range change. The label
+     budget follows the plot width, so narrow cards thin to fewer,
+     never overlapping, ticks. */
+  function actSharedTicks(range, g) {
+    var X = function (t) { return actTimeToX(t, range.from, range.to, g.L, g.pw); };
+    return {X: X, ticks: timeTicks(range.from, range.to, X, Math.max(2, Math.floor(g.pw / 150)))};
+  }
+  function actXGrid(svg, ticks, y1, y2) {
+    ticks.forEach(function (k) { svg.appendChild(s("line", {x1: k.x, x2: k.x, y1: y1, y2: y2, class: "gl"})); });
   }
 
   /* The selection per scope: a live preset ({live, preset}) or an
@@ -301,18 +315,34 @@
     var strips = el("div", {class: "act-strips"});
     /* Live redraw while dragging: the brush selection and range label
        repaint on every move (cheap); the three strips repaint from
-       loaded data at most every 400 ms so a fast drag never queues
-       seconds of strip rebuilds behind the release. The commit on
+       loaded data at most every 400 ms and at most once per animation
+       frame, so a fast drag never queues seconds of strip rebuilds
+       behind the release and never flickers mid-frame. The commit on
        release persists, syncs the URL and rebuilds the section, so the
-       strips always settle on the committed range. */
-    var paintT = 0;
+       strips always settle on the committed range with a fresh clock. */
+    var paintT = 0, paintRaf = 0, paintPending = null;
+    var paintFrame = typeof requestAnimationFrame === "function" ? requestAnimationFrame : function (f) { return setTimeout(f, 16); };
+    function paintStripsNow(range) {
+      paintT = Date.now();
+      paintPending = null;
+      actPaintStrips(strips, range, loaded, Date.now() / 1000, g);
+    }
     function paint(range) {
       rangeLab.textContent = actRangeLabel(range);
       actPaintBrush(brushSvg, range, loaded, g);
-      var soon = Date.now();
-      if (soon - paintT < 400) return;
-      paintT = soon;
-      actPaintStrips(strips, range, loaded, now, g);
+      if (Date.now() - paintT < 400) {
+        paintPending = range;
+        if (!paintRaf) paintRaf = paintFrame(function () {
+          paintRaf = 0;
+          if (!paintPending) return;
+          var wait = 400 - (Date.now() - paintT), next = paintPending;
+          if (wait > 0) setTimeout(function () { if (paintPending === next) paintStripsNow(next); }, wait);
+          else paintStripsNow(next);
+        });
+        return;
+      }
+      if (paintRaf) paintPending = null;
+      paintStripsNow(range);
     }
     var brushSvg = actBrush(ws, r, loaded, g, paint, function () { actCommit(); });
     brushWrap.appendChild(brushSvg);
@@ -408,13 +438,14 @@
     mid.style.cursor = "grab";
     svg.appendChild(mid);
     /* Brush labels ride the top; on narrow screens ticks squeeze
-       together, so keep at least ~48 px between neighbours (rightmost
-       first, so the "now" edge label always survives). */
+       together, so keep at least ~72 px between neighbours (rightmost
+       first, so the "now" edge label always survives), room enough for
+       a date-stamped label on multi-day windows. */
     var blabs = timeTicks(loaded.t0, loaded.t1, XB, Math.max(2, Math.floor(pw / 110)));
     var kept = [];
     for (var bi = blabs.length - 1; bi >= 0; bi--) {
       if (!blabs[bi].label) continue;
-      if (kept.length && kept[kept.length - 1].x - blabs[bi].x < 48) continue;
+      if (kept.length && kept[kept.length - 1].x - blabs[bi].x < 72) continue;
       kept.push(blabs[bi]);
     }
     kept.reverse().forEach(function (tk) {
@@ -573,8 +604,10 @@
     }
     wrap.appendChild(lg);
     var W = g.W, L = g.L, pw = g.pw, H = 270, T = 30, Bm = 42, ph = H - T - Bm;
-    var X = function (t) { return actTimeToX(t, from, to, L, pw); };
+    var st = actSharedTicks(range, g), X = st.X;
     var svg = s("svg", {viewBox: "0 0 " + W + " " + H, width: W, height: H, style: "display:block;max-width:100%", role: "img", "data-strip": "tokens", "data-x-from": String(Math.round(from)), "data-x-to": String(Math.round(to)), "aria-label": "Tokens per hour in the selected range: " + fmtN(grand) + " total"});
+    /* Gridlines on the shared ticks; labels stay off mid-stack. */
+    actXGrid(svg, st.ticks, T, T + ph);
     var nice = niceMax(max);
     var GAP = 2, RAD = 5;
     var peakT = -1;
@@ -675,7 +708,7 @@
     ["run", "ok", "part", "bad", "unk"].forEach(function (k) { var o = OUTCOME[k], sp = el("span"); var sw = el("i", {class: "sw"}); sw.style.background = o[0]; sp.appendChild(sw); sp.appendChild(document.createTextNode(o[1] + " " + o[2])); lg.appendChild(sp); });
     wrap.appendChild(lg);
     var W = g.W, L = g.L, Rm = g.R, pw = g.pw, T = 8, stripH = 30;
-    var X = function (t) { return actTimeToX(t, from, to, L, pw); };
+    var st = actSharedTicks(range, g), X = st.X;
     var byFam = {};
     R.forEach(function (r) { var f = actFamOfRun(r); (byFam[f] = byFam[f] || []).push(r); });
     var order = ADM.FAMS.filter(function (f) { return byFam[f]; });
@@ -706,8 +739,9 @@
     R.forEach(function (r) { ocCount[outcomeOf(r)]++; });
     var svg = s("svg", {viewBox: "0 0 " + W + " " + H, width: W, height: H, style: "display:block;max-width:100%", role: "img", "data-strip": "timeline", "data-x-from": String(Math.round(from)), "data-x-to": String(Math.round(to)), "aria-label": "Agent runs in the selected range, one lane per model family: " + R.length + " runs, " + ocCount.ok + " finished, " + ocCount.part + " partial, " + ocCount.bad + " died or blocked, " + ocCount.run + " running"});
     var defs = s("defs", {}); var pat = s("pattern", {id: "act-hatch", width: 6, height: 6, patternUnits: "userSpaceOnUse", patternTransform: "rotate(45)"}); pat.appendChild(s("rect", {width: 6, height: 6, fill: "var(--surface-2)"})); pat.appendChild(s("line", {x1: 0, y1: 0, x2: 0, y2: 6, stroke: "var(--muted)", "stroke-width": 2})); defs.appendChild(pat); svg.appendChild(defs);
-    var gTicks = withX ? timeTicks(from, to, X, 6) : [];
-    gTicks.forEach(function (k) { svg.appendChild(s("line", {x1: k.x, x2: k.x, y1: T, y2: plotB, class: "gl"})); });
+    /* Gridlines on the shared ticks in every lane; labels only bottom. */
+    var gTicks = withX ? st.ticks : [];
+    actXGrid(svg, st.ticks, T, plotB);
     var slab = s("text", {x: 0, y: stripY + stripH / 2, class: "tl-lane-label"}); slab.textContent = "agents at once"; svg.appendChild(slab);
     var scnt = s("text", {x: 0, y: stripY + stripH / 2 + 14, class: "tl-strip-sub"}); scnt.textContent = R.length + " runs"; svg.appendChild(scnt);
     var step = Math.max(60, Math.round((to - from) / 300)), pts = [], mx = 1, t;
@@ -865,7 +899,9 @@
     wrap.appendChild(head);
     var W = g.W, L = g.L, R = g.R, H = withX ? 112 : 72, T = 20, Bm = withX ? 36 : 10, pw = g.pw, ph = H - T - Bm;
     var svg = s("svg", {viewBox: "0 0 " + W + " " + H, width: W, height: H, style: "display:block;max-width:100%", role: "img", "data-strip": "conc", "data-fam": fam, "data-peak": String(peak), "data-x-from": String(Math.round(from)), "data-x-to": String(Math.round(to)), "aria-label": ADM.FAM[fam].name + " live runs in the selected range, peak " + peak});
-    var X = function (t) { return actTimeToX(t, from, to, L, pw); }, Y = function (v) { return T + ph - ph * v / mx; };
+    var st = actSharedTicks(range, g), X = st.X, Y = function (v) { return T + ph - ph * v / mx; };
+    /* Gridlines on the shared ticks in every strip; labels only bottom. */
+    actXGrid(svg, st.ticks, T, T + ph);
     var gid = "ad-act-" + fam;
     var defs = s("defs");
     var grad = s("linearGradient", {id: gid, x1: "0", y1: "0", x2: "0", y2: "1"});
@@ -883,8 +919,7 @@
     if (px > L + pw - 46) { pl.setAttribute("x", Math.round(px) - 8); pl.setAttribute("text-anchor", "end"); }
     else { pl.setAttribute("x", Math.round(px) + 8); pl.setAttribute("text-anchor", "start"); }
     pl.textContent = "pk " + peak; svg.appendChild(pl);
-    var xt = withX ? timeTicks(from, to, X, Math.max(2, Math.floor(pw / 90))) : [];
-    axes(svg, {L: L, T: T, pw: pw, ph: ph, yMax: mx, yTicks: 2, xTicks: xt, yTitle: "agents", xTitle: withX ? "time" : null});
+    axes(svg, {L: L, T: T, pw: pw, ph: ph, yMax: mx, yTicks: 2, xTicks: withX ? st.ticks : [], yTitle: "agents", xTitle: withX ? "time" : null});
     var hit = s("rect", {x: L, y: T, width: pw, height: ph, fill: "transparent"});
     hit.addEventListener("mousemove", function (ev) {
       var bb = svg.getBoundingClientRect();

@@ -2954,11 +2954,20 @@ assert.deepStrictEqual(A.actDragHandle({from: 1000, to: 2000}, "to", -500, 0, 10
 assert.deepStrictEqual(A.actDragMove({from: 1000, to: 2000}, 500, 0, 10000), {from: 1500, to: 2500});
 assert.deepStrictEqual(A.actDragMove({from: 9000, to: 9500}, 2000, 0, 10000), {from: 9500, to: 10000});
 assert.deepStrictEqual(A.actDragMove({from: 1000, to: 2000}, -5000, 0, 10000), {from: 0, to: 1000});
-/* tick selection: the smallest whole-hour step fitting the label budget. */
-assert.strictEqual(A.actTickStep(86400, 6), 21600);
-assert.strictEqual(A.actTickStep(7200, 6), 3600);
-assert.strictEqual(A.actTickStep(3600, 6), 3600);
-assert.strictEqual(A.actTickStep(7 * 86400, 6), 86400);
+/* tick selection: the smallest grid step (one minute to one week, the
+   same ladder timeTicks uses) fitting the label budget, so small zooms
+   read minutes instead of collapsing to one end tick. */
+assert.strictEqual(A.actTickStep(86400, 6), 14400);
+assert.strictEqual(A.actTickStep(7200, 6), 1800);
+assert.strictEqual(A.actTickStep(3600, 6), 900);
+assert.strictEqual(A.actTickStep(7 * 86400, 6), 172800);
+assert.strictEqual(A.actTickStep(600, 8), 120);
+assert.strictEqual(A.actTickStep(1800, 8), 300);
+assert.strictEqual(A.actTickStep(7200, 8), 900);
+assert.strictEqual(A.actTickStep(21600, 8), 3600);
+assert.strictEqual(A.actTickStep(86400, 8), 10800);
+assert.strictEqual(A.actTickStep(3 * 86400, 8), 43200);
+assert.strictEqual(A.actTickStep(14 * 86400, 8), 172800);
 console.log("activity range math ok");
 '''
         with tempfile.TemporaryDirectory() as tmp:
@@ -2970,6 +2979,109 @@ console.log("activity range math ok");
                 text=True,
             )
         self.assertEqual(proc.returncode, 0, proc.stderr or proc.stdout)
+
+    def test_activity_tick_spans_run_in_node(self):
+        """The shared timeTicks keep readable x labels on every zoom: at
+        spans from 10 minutes to 14 days the zoomed domain yields a
+        non-empty list of 3 to 9 ticks, strictly increasing and inside
+        the domain, with unique labels formatted for the span (minutes
+        under 2 h, hours across 6 to 24 h, dates past a day, plus a date
+        line when the range crosses midnight), and a narrow card thins
+        to fewer ticks that never overlap."""
+        harness = r'''
+const fs = require("fs");
+const assert = require("assert");
+const src = fs.readFileSync(process.argv[2], "utf8").replace("})(window);", "})(global);");
+eval(src);
+const T = global.AD.timeTicks;
+assert.strictEqual(typeof T, "function", "AD.timeTicks is not exported");
+var d = new Date(); d.setHours(0, 0, 0, 0);
+var t0 = d.getTime() / 1000 + 3780;
+function at(span, n, px) {
+  var t1 = t0 + span;
+  var X = function (t) { return (t - t0) / span * px; };
+  return {t0: t0, t1: t1, ticks: T(t0, t1, X, n)};
+}
+function checkSpan(span, fmt) {
+  var r = at(span, 8, 1000), ks = r.ticks;
+  assert.ok(ks.length >= 3 && ks.length <= 9, span + "s: " + ks.length + " ticks, want 3-9");
+  for (var i = 0; i < ks.length; i++) {
+    assert.strictEqual(typeof ks[i].label, "string", span + "s tick " + i + " has no label");
+    assert.ok(ks[i].label.length > 0, span + "s tick " + i + " label is empty");
+    assert.ok(ks[i].x >= 0 && ks[i].x <= 1000, span + "s tick " + i + " outside the domain");
+    if (i) assert.ok(ks[i].x > ks[i - 1].x, span + "s ticks are not increasing");
+  }
+  var labels = ks.map(function (k) { return k.label; });
+  assert.strictEqual(new Set(labels).size, labels.length, span + "s labels repeat: " + labels.join(","));
+  fmt(labels, span);
+  return ks;
+}
+/* 10 and 30 minutes read minutes. */
+checkSpan(600, function (labels) {
+  assert.ok(labels.filter(function (l) { return l.indexOf(":") >= 0; }).length >= 3, "10 min zoom lost its minute ticks");
+});
+checkSpan(1800, function (labels) {
+  assert.ok(labels.filter(function (l) { return l.indexOf(":") >= 0; }).length >= 3, "30 min zoom lost its minute ticks");
+});
+/* A 2 h zoom reads quarter hours like 02:00, 02:15, 02:30. */
+checkSpan(7200, function (labels) {
+  assert.ok(labels.filter(function (l) { return l.indexOf(":") >= 0; }).length >= 3, "2 h zoom lost its minute ticks");
+});
+/* 6 and 24 h read whole hours, and the day crossing midnight keeps a date line
+   (the last label is the end tick, which always reads the exact end time). */
+checkSpan(21600, function (labels) {
+  assert.ok(!labels.slice(0, -1).some(function (l) { return l.indexOf(":") >= 0; }), "6 h zoom mixes minutes into hour ticks");
+});
+checkSpan(86400, function (labels) {
+  assert.ok(!labels.slice(0, -1).some(function (l) { return l.indexOf(":") >= 0; }), "24 h zoom mixes minutes into hour ticks");
+  assert.ok(labels.some(function (l) { return /^[A-Z][a-z]{2} \d{1,2}$/.test(l); }), "24 h range crossing midnight keeps no date line");
+});
+/* Multi-day ranges read dates. */
+checkSpan(3 * 86400, function (labels) {
+  labels.slice(0, -1).forEach(function (l) { assert.ok(/^[A-Z][a-z]{2} \d{1,2}/.test(l), "3 d tick is not a date: " + l); });
+});
+checkSpan(14 * 86400, function (labels) {
+  labels.slice(0, -1).forEach(function (l) { assert.ok(/^[A-Z][a-z]{2} \d{1,2}/.test(l), "14 d tick is not a date: " + l); });
+});
+/* A narrow card thins the same 2 h zoom to fewer ticks that never overlap. */
+var wide = at(7200, 8, 1000), narrow = at(7200, 3, 300);
+assert.ok(narrow.ticks.length < wide.ticks.length, "narrow card never thins: " + narrow.ticks.length);
+assert.ok(narrow.ticks.length >= 2, "narrow card thins to nothing");
+for (var j = 1; j < narrow.ticks.length; j++) {
+  assert.ok(narrow.ticks[j].x - narrow.ticks[j - 1].x >= 40, "narrow ticks overlap");
+}
+console.log("activity tick spans ok");
+'''
+        with tempfile.TemporaryDirectory() as tmp:
+            harness_path = Path(tmp) / "act_tick_spans.js"
+            harness_path.write_text(harness, encoding="utf-8")
+            proc = subprocess.run(
+                ["node", str(harness_path), str(STATIC / "format.js")],
+                capture_output=True,
+                text=True,
+            )
+        self.assertEqual(proc.returncode, 0, proc.stderr or proc.stdout)
+
+    def test_activity_zoom_redraws_axis(self):
+        """Every zoom path repaints the shared x axis from the zoomed
+        domain: each strip builds one shared tick list from its zoomed
+        range (actSharedTicks over range.from/range.to), draws its
+        gridlines on those ticks, and the bottom strip labels them; the
+        tick ladder reaches minute steps so small zooms keep labels."""
+        src = (STATIC / "cards" / "activity.js").read_text()
+        bodies = dict(functions(inline_scripts()))
+        self.assertIn("actSharedTicks", bodies)
+        shared = bodies["actSharedTicks"]
+        self.assertIn("timeTicks(", shared, "the shared ticks never reach the axis helper")
+        self.assertIn("range.from", shared, "the shared ticks ignore the zoomed start")
+        self.assertIn("range.to", shared, "the shared ticks ignore the zoomed end")
+        for name in ("actTokenStrip", "actTimelineStrip", "actConcStrip"):
+            self.assertIn(name, bodies, f"{name} is gone from the page")
+            self.assertIn("actSharedTicks(", bodies[name], f"{name} no longer shares the zoomed ticks")
+            self.assertIn("actXGrid(", bodies[name], f"{name} lost its tick gridlines")
+        self.assertIn("actXGrid", bodies)
+        fmt = (STATIC / "format.js").read_text()
+        self.assertIn("120, 300, 900", fmt, "the tick ladder lost its minute steps")
 
     def test_activity_brush_rules(self):
         """The time filter bar is a keyboard- and pointer-operable range

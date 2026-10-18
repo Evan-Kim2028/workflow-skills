@@ -56,33 +56,79 @@
     return d.toLocaleTimeString([], {hour: "numeric"});
   }
 
-  /* Ticks on whole local hours (step 1, 2, 3, 6, 12 or 24 h, the smallest that fits n labels), plus a "now" tick at t1.
+  /* Label for one grid time at the chosen step: minute steps read HH:MM,
+     hour steps read the hour, day steps read the date, and a tick at
+     midnight always reads the date (the date line when a range crosses
+     midnight). Once the grid covers more than a day plus one step, an
+     hour of the day must repeat, so sub-day ticks carry their date and
+     stay unique. */
+  function fmtTick(t, step, span) {
+    var d = new Date(t * 1000);
+    if (step >= 86400 || (d.getHours() === 0 && d.getMinutes() === 0))
+      return d.toLocaleDateString([], {month: "short", day: "numeric"});
+    if (span >= 86400 + step)
+      return d.toLocaleDateString([], {month: "short", day: "numeric"}) + ", " + fmtHour(t);
+    if (step >= 3600) return fmtHour(t);
+    return fmtT(t);
+  }
+
+  /* Ticks on whole grid steps from one minute to one week (the smallest
+     step that fits n labels: 15 minutes across 2 h, hours across 6 h,
+     every few hours across a day, dates past that), plus a "now" tick
+     at t1. Small zooms keep minute-level labels instead of collapsing
+     to the end tick; grid ticks stop a label half-width short of it so
+     one never doubles the end label.
      Tick labels are always real dates and times; X maps them to pixels, so a
      warped X (see warpPos) places real-time labels on a compressed axis.
-     opts.minGap drops hour ticks closer than that many pixels to the
+     opts.minGap drops grid ticks closer than that many pixels to the
      previous kept tick (compressed stretches would pile labels up);
      opts.avoid lists pixel positions (e.g. idle-break markers) that ticks
-     keep their distance from. The "now" tick at t1 is always kept. */
+     keep their distance from. The end tick at t1 is always kept. */
   function timeTicks(t0, t1, X, n, opts) {
     n = n || 6;
     opts = opts || {};
-    var span = Math.max(1, t1 - t0), steps = [1, 2, 3, 6, 12, 24], step = 24;
-    for (var i = 0; i < steps.length; i++) { if (span / (steps[i] * 3600) <= n) { step = steps[i]; break; } }
-    var d = new Date(t0 * 1000); d.setMinutes(0, 0, 0);
+    var span = Math.max(1, t1 - t0);
+    var steps = [60, 120, 300, 900, 1800, 3600, 10800, 14400, 21600, 43200, 86400, 172800, 604800];
+    var step = 604800;
+    for (var i = 0; i < steps.length; i++) { if (span / steps[i] <= n) { step = steps[i]; break; } }
+    var d = new Date(t0 * 1000);
+    if (step >= 86400) d.setHours(0, 0, 0, 0);
+    else if (step >= 3600) d.setMinutes(0, 0, 0);
+    else { d.setSeconds(0, 0); d.setMinutes(Math.floor(d.getMinutes() / (step / 60)) * (step / 60)); }
     var t = d.getTime() / 1000, out = [], gap = opts.minGap || 0, avoid = opts.avoid || [];
+    var x1 = X(t1);
     function clearOf(x) {
       if (out.length && x - out[out.length - 1].x < gap) return false;
       for (var j = 0; j < avoid.length; j++) { if (Math.abs(x - avoid[j]) < gap) return false; }
       return true;
     }
-    while (t < t0) t += 3600;
-    while (t <= t1 - 1800) {
-      var hr = new Date(t * 1000).getHours();
-      if (hr % step === 0) {
-        var x = X(t);
-        if (clearOf(x)) out.push({x: x, label: fmtHour(t), anchor: "middle"});
+    /* Grid ticks stop a label half-width short of the end tick (pixels,
+       so warped axes thin the same way); the end tick always draws. */
+    function clearOfEnd(x) { return x1 - x >= 34; }
+    if (step >= 86400) {
+      while (t < t0) t += step;
+      while (t < t1) {
+        var xd = X(t);
+        if (clearOfEnd(xd) && clearOf(xd)) out.push({x: xd, label: fmtTick(t, step, span), anchor: "middle"});
+        t += step;
       }
-      t += 3600;
+    } else if (step >= 3600) {
+      var need = step / 3600;
+      while (t < t0) t += 3600;
+      while (t < t1) {
+        if (new Date(t * 1000).getHours() % need === 0) {
+          var x = X(t);
+          if (clearOfEnd(x) && clearOf(x)) out.push({x: x, label: fmtTick(t, step, span), anchor: "middle"});
+        }
+        t += 3600;
+      }
+    } else {
+      while (t < t0) t += step;
+      while (t < t1) {
+        var xm = X(t);
+        if (clearOfEnd(xm) && clearOf(xm)) out.push({x: xm, label: fmtTick(t, step, span), anchor: "middle"});
+        t += step;
+      }
     }
     out.push({x: X(t1), label: Math.abs(t1 - Date.now() / 1000) < 300 ? "now" : fmtT(t1), anchor: "end"});
     return out;

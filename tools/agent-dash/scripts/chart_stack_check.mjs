@@ -14,6 +14,9 @@
  *   - the Last hour preset follows now with a live chip;
  *   - keyboard ArrowLeft moves the focused handle by 5 minutes;
  *   - Reset restores the full window;
+ *   - the bottom x axis redraws on every range change (preset, 2 h
+ *     brush, keyboard, Reset, URL from/to): tick labels exist, sit
+ *     inside the card, never overlap, and change with the domain;
  *   - a tick (refreshSnapshot + drawMain, the stream-tick path) does not
  *     reset an absolute brush;
  *   - the workstream tab renders the same stack on its own scope;
@@ -508,6 +511,96 @@ async function main() {
       closeTo(d.to, Date.now() / 1000, 300, "Last hour ends at now");
       const live = await evaluate(cdp, `!!document.querySelector('#exec-activity .act-live')`);
       eq(live, true, "a following preset must show the live chip");
+    });
+
+    /* Bottom-strip x axis labels: the tick row of the last stack svg
+       (non-title axis texts sharing the lowest row), with boxes. */
+    const AXIS = `(function(){
+      var card = document.querySelector('#exec-activity');
+      if (!card) return null;
+      var svgs = Array.prototype.slice.call(card.querySelectorAll('.act-strips svg'));
+      var svg = svgs[svgs.length - 1];
+      if (!svg) return null;
+      var cb = card.getBoundingClientRect();
+      var texts = Array.prototype.map.call(
+        svg.querySelectorAll('g.ax text:not(.axt)'), function (t) {
+          var b = t.getBoundingClientRect();
+          return {text: t.textContent, x: b.left, y: b.top, w: b.width, h: b.height};
+        });
+      return JSON.stringify({card: {x: cb.left, y: cb.top, w: cb.width, h: cb.height}, texts: texts});
+    })()`;
+    function xLabelsOf(raw, what) {
+      if (!raw) fail(`${what}: activity card or stack svg missing`);
+      const d = JSON.parse(raw);
+      if (!d.texts.length) fail(`${what}: no axis texts at all`);
+      const top = Math.max.apply(null, d.texts.map((t) => t.y));
+      const xs = d.texts.filter((t) => t.y >= top - 8);
+      if (xs.length < 2) fail(`${what}: only ${xs.length} x axis labels (want the tick row redrawn)`);
+      for (const t of xs) {
+        if (t.x < d.card.x - 3 || t.y < d.card.y - 3 ||
+            t.x + t.w > d.card.x + d.card.w + 3 || t.y + t.h > d.card.y + d.card.h + 3) {
+          fail(`${what}: label ${JSON.stringify(t.text)} outside the card box`);
+        }
+      }
+      for (let i = 0; i < xs.length; i++) {
+        for (let j = i + 1; j < xs.length; j++) {
+          const a = xs[i], b = xs[j];
+          const ox = Math.min(a.x + a.w, b.x + b.w) - Math.max(a.x, b.x);
+          const oy = Math.min(a.y + a.h, b.y + b.h) - Math.max(a.y, b.y);
+          if (ox > 1 && oy > 1) fail(`${what}: labels overlap: ${JSON.stringify(a.text)} vs ${JSON.stringify(b.text)}`);
+        }
+      }
+      return xs.map((t) => t.text).join("|");
+    }
+    async function clickCtl(name) {
+      await evaluate(cdp, `(function(){
+        var btns = document.querySelectorAll('#exec-activity .act-controls button');
+        for (var i = 0; i < btns.length; i++) if (btns[i].textContent === ${JSON.stringify(name)}) btns[i].click();
+      })()`);
+      await new Promise((r) => setTimeout(r, 900));
+    }
+
+    check("x axis follows the zoom on every range change", async () => {
+      await clickCtl("Reset");
+      const labels24 = xLabelsOf(await evaluate(cdp, AXIS), "reset 24 h");
+      await clickCtl("Last hour");
+      const labelsHour = xLabelsOf(await evaluate(cdp, AXIS), "last-hour preset");
+      if (labelsHour === labels24) fail("last-hour preset left the 24 h labels in place");
+      await clickCtl("Reset");
+      const back = assertShared(domainsOf(await evaluate(cdp, DOMAINS)), "post-reset");
+      closeTo(back.to - back.from, 86400, 300, "reset did not restore ~24 h");
+      const labelsBack = xLabelsOf(await evaluate(cdp, AXIS), "reset axis");
+      eq(labelsBack, labels24, "reset did not restore the 24 h labels");
+      const geo = await evaluate(cdp, `(function(){
+        var svg = document.querySelector('#exec-activity .act-svg');
+        return {W: Number(svg.getAttribute("width")), pw: Number(svg.getAttribute("width")) - 164};
+      })()`);
+      await dragFromHandleBy(geo.pw * (back.to - back.from - 7200) / (back.to - back.from));
+      const zoomed = assertShared(domainsOf(await evaluate(cdp, DOMAINS)), "2 h brush");
+      closeTo(zoomed.to - zoomed.from, 7200, 600, "brush did not land a ~2 h window");
+      const labels2h = xLabelsOf(await evaluate(cdp, AXIS), "2 h brush");
+      if (labels2h === labels24) fail("2 h brush left the 24 h labels in place");
+      await brushIntoView();
+      await evaluate(cdp, `document.querySelector('#exec-activity .act-handle-from').focus()`);
+      await new Promise((r) => setTimeout(r, 300));
+      await cdp.send("Input.dispatchKeyEvent", { type: "rawKeyDown", key: "ArrowLeft", code: "ArrowLeft", windowsVirtualKeyCode: 37 });
+      await new Promise((r) => setTimeout(r, 150));
+      await cdp.send("Input.dispatchKeyEvent", { type: "keyUp", key: "ArrowLeft", code: "ArrowLeft", windowsVirtualKeyCode: 37 });
+      await new Promise((r) => setTimeout(r, 900));
+      const keyed = assertShared(domainsOf(await evaluate(cdp, DOMAINS)), "post-key");
+      closeTo(zoomed.from - keyed.from, 300, 5, "ArrowLeft moved the start back 5 minutes");
+      xLabelsOf(await evaluate(cdp, AXIS), "keyboard-moved brush");
+      await clickCtl("Reset");
+      xLabelsOf(await evaluate(cdp, AXIS), "second reset");
+      const nowMs = Date.now();
+      await cdp.send("Page.navigate", { url: `${URL}/?view=exec&ws=all&from=${nowMs - 2 * 3600 * 1000}&to=${nowMs}` });
+      await waitForLoad(cdp);
+      await waitFor(cdp, STACK_READY, "URL-zoomed activity stack");
+      await new Promise((r) => setTimeout(r, 1500));
+      const urlD = assertShared(domainsOf(await evaluate(cdp, DOMAINS)), "url range");
+      closeTo(urlD.to - urlD.from, 7200, 60, "URL range is not ~2 h");
+      const labelsUrl = xLabelsOf(await evaluate(cdp, AXIS), "url 2 h range");
+      if (labelsUrl === labels24) fail("URL 2 h range left the 24 h labels in place");
     });
 
     check("workstream tab renders the same stack on its own scope", async () => {
