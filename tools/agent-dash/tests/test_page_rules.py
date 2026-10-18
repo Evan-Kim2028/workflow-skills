@@ -519,6 +519,100 @@ class PageRules(unittest.TestCase):
         page = (STATIC / "index.html").read_text()
         self.assertIn("/static/cards/plan-progress.css", page, "index.html never loads the card CSS")
 
+    def test_plan_headline_has_no_phase_wording(self):
+        """The plan progress headline is counts only ("N of M tasks done ·
+        K to go · J agents working"): groups run in parallel, so no
+        phase-sequence wording ("now in X (phase i of n)", "active in n of
+        m phases", "next up", "every phase done")."""
+        card = (STATIC / "cards" / "plan-progress.js").read_text()
+        for gone in (
+            "phaseTxt",
+            "every phase done",
+            "(phase ",
+            "next up: ",
+            "active in ",
+            "now in ",
+            "done in this phase",
+            "Each tile is a stage of the plan, left to right",
+        ):
+            self.assertNotIn(gone, card, f"plan-progress.js still says {gone!r}")
+        for kept in (
+            "planHeadline",
+            "tasks done",
+            " to go",
+            " working",
+            "done in this group",
+            "groups run in parallel",
+            "Work groups",
+        ):
+            self.assertIn(kept, card, f"plan-progress.js lost {kept!r}")
+
+    def test_plan_legend_is_always_visible(self):
+        """The map legend is an always-visible list under the intro line,
+        not a hover-only popover: labelled Task status / Agent family /
+        Edges groups, family colours from the model palette, and the long
+        Legend popover kept for the details."""
+        card = (STATIC / "cards" / "plan-progress.js").read_text()
+        for kept in (
+            "planLegend",
+            "legData = planLegend(",
+            'role: "list"',
+            "Plan map legend",
+            "Task status",
+            "Agent family",
+            '"Edges"',
+            "famColor",
+            "arrows-why",
+            "map-legend",
+            "mleg-group",
+        ):
+            self.assertIn(kept, card, f"plan-progress.js lost the visible legend: {kept}")
+        css = (STATIC / "cards" / "plan-progress.css").read_text()
+        for marker in (".map-legend", ".mleg-group", ".mleg-item", ".fam-dot", ".phases-cap"):
+            self.assertIn(marker, css, f"plan-progress.css lost the legend rule: {marker}")
+        self.assertIn("Legend", card, "the long Legend popover is gone")
+
+    def test_plan_legend_and_headline_helpers(self):
+        """Node-driven pure test of the extracted builders: planHeadline
+        formats counts with no phase wording, and planLegend covers every
+        status plus the model-palette family colours in palette order."""
+        script = (
+            "const fs=require('fs');"
+            "var window={};"
+            "eval(fs.readFileSync(process.argv[1],'utf8'));"
+            "var ADM=window.ADM;"
+            "eval(fs.readFileSync(process.argv[2],'utf8'));"
+            "const assert=require('assert');"
+            "const H=window.AdPage.cards.planHeadline,L=window.AdPage.cards.planLegend;"
+            "assert.strictEqual(typeof H,'function');"
+            "assert.strictEqual(typeof L,'function');"
+            "assert.strictEqual(H(74,100,3),'74 of 100 tasks done \\u00B7 26 to go \\u00B7 3 agents working');"
+            "assert.strictEqual(H(2,5,1),'2 of 5 tasks done \\u00B7 3 to go \\u00B7 1 agent working');"
+            "assert.strictEqual(H(5,5,0),'5 of 5 tasks done \\u00B7 0 to go');"
+            "['phase','stage','now in','next up','every'].forEach(function(w){"
+            "assert.ok(H(1,4,2).toLowerCase().indexOf(w)===-1,'headline says '+w);});"
+            "var d=L(['muse','claude','glm']);"
+            "assert.deepStrictEqual(d.families.map(function(f){return f.fam;}),['claude','muse','glm']);"
+            "assert.deepStrictEqual(d.families.map(function(f){return f.color;}),['var(--s1)','var(--s5)','var(--s6)']);"
+            "assert.deepStrictEqual(d.families.map(function(f){return f.name;}),['Claude','muse','GLM']);"
+            "['todo','wip','pr','prog','done','deferred'].forEach(function(k){"
+            "assert.ok(d.status.some(function(s){return s.key===k&&s.glyph&&s.word&&s.cls;}),'status '+k+' missing');});"
+            "assert.ok(d.status.some(function(s){return s.key==='just';}));"
+            "assert.ok(d.status.some(function(s){return s.key==='sentback';}));"
+            "assert.ok(d.edges.some(function(e){return e.style==='solid'&&e.color==='var(--good)';}));"
+            "assert.ok(d.edges.some(function(e){return e.style==='dashed'&&e.color==='var(--muted)';}));"
+            "assert.ok(d.edges.some(function(e){return e.glyph==='\\u25C7';}));"
+            "assert.deepStrictEqual(L([]).families,[]);"
+            "assert.deepStrictEqual(L(null).families,[]);"
+            "assert.strictEqual(L(['zzz']).families[0].color,'var(--other)');"
+        )
+        proc = subprocess.run(
+            ["node", "-e", script, str(STATIC / "models.js"), str(STATIC / "cards" / "plan-progress.js")],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr or proc.stdout)
+
     def test_replay_and_timeline_share_one_playhead(self):
         """The plan progress map and the run timeline play back together:
         both paint from the one rpCursorTime playhead, and the one rpSeek

@@ -50,6 +50,10 @@ The dashboard is read by a visual thinker. Every view answers its question with 
 
   Deferred tasks stay on the map where they were planned but leave every count and progress bar.
 
+  Columns are parallel work groups, not sequential phases: the headline reads "N of M tasks done · K to go · J agents working" and never names phases; tooltips and labels say "group", never "phase" or "stage"; the narrative strip keeps its data under a "Work groups" label (full prose stays on the plan view).
+
+  An always-visible legend sits right under the card's intro line, above the map and above the "Running, not mapped to a task" row, in labelled mini-groups — Task status (the table above plus the amber ↻ edge for "sent back twice or more"), Agent family (only families present on the card; chip borders, badges and pills in a family hue are that family's agents: Claude blue, Cursor yellow, muse magenta, GLM green, and the rest of the entity palette), Edges (solid arrow = prerequisite done, dashed = waiting, ◇ = gate). Colour is never the only carrier: every entry is swatch plus glyph plus word, a list with an aria-label, wrapping on phones. The "Legend ⓘ" popover keeps the long text. (The earlier compact row lived below the progress bar and the chip rows, showed only five states, and never explained the family border colours — that is why it read as missing.)
+
   Blue is reserved for "working now"; do not reuse it for any stored state. Violet is not used here (too close to blue side by side). Validated: CVD ΔE 14.7 light, 9.9 dark; amber is the reserved warning status color, relieved by the symbol and the task id.
 
 ## Behavior

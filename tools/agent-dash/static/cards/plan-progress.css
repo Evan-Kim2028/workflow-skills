@@ -1,5 +1,5 @@
-/* Plan progress map card (static/cards/plan-progress.js): stage tiles in
-   phase columns, task chips, group and task arrows, legend, replay and clip.
+/* Plan progress map card (static/cards/plan-progress.js): group tiles in
+   group columns, task chips, group and task arrows, legend, replay and clip.
    Moved verbatim from static/index.html; the v2 bold-dark refinements and
    the map-standard layout rules are appended after the "layout standard"
    marker. New rules use v2 token names with current-token fallbacks, so the
@@ -209,12 +209,25 @@ body.clip #main{zoom:.92}
 .fanin{font:700 9.5px var(--mono);color:var(--ink-2);border:1px solid var(--grid);border-radius:4px;padding:0 3px;margin-left:2px}
 /* Solo-train caption: single-member trains render no tag. */
 .trcap{font:11.5px var(--mono);color:var(--muted)}
-/* Compact always-visible legend row: colour plus symbol plus word, then why. */
-.map-legend{display:flex;flex-wrap:wrap;gap:6px 10px;align-items:center;margin:0 0 12px;font-size:12px;color:var(--ink-2)}
+/* Always-visible legend row right under the intro line: labelled mini-groups
+   (Task status, Agent family, Edges), colour plus symbol plus word. Wraps on
+   phones; tokens only, so both themes follow. */
+.map-legend{display:flex;flex-wrap:wrap;gap:8px 16px;align-items:center;margin:8px 0 12px;font-size:12px;color:var(--ink-2)}
 .map-legend .cap{font:600 11px var(--font);color:var(--muted);text-transform:uppercase;letter-spacing:.05em;margin-right:2px}
 .map-legend>span{display:inline-flex;align-items:center;gap:6px}
 .map-legend .chip.sample{pointer-events:none}
 .map-legend .arrows-why{font:11.5px var(--mono);color:var(--muted)}
+.mleg-group{display:inline-flex;flex-wrap:wrap;gap:6px 8px;align-items:center}
+.mleg-cap{font:600 11px var(--font);color:var(--muted);text-transform:uppercase;letter-spacing:.05em;margin-right:2px}
+.mleg-item{display:inline-flex;align-items:center;gap:5px;white-space:nowrap}
+.mleg-item .fam-dot{width:10px;height:10px;border-radius:50%;display:inline-block;border:1px solid var(--ring-strong);flex:none}
+.mleg-item svg{overflow:visible}
+.mleg-item .att.hot{font:600 9.5px var(--mono);color:var(--ink);margin-left:2px;padding:0 3px;border-radius:4px;border:1px solid var(--warning)}
+/* Narrative strip keeps its data under a "Work groups" label. */
+.phases-wrap{margin-top:12px}
+.phases-cap{font:600 11px var(--font);color:var(--muted);text-transform:uppercase;letter-spacing:.05em;margin-bottom:6px}
+.phases-wrap .phases{margin-top:0}
+.phases-line b{color:var(--ink-2)}
 /* Group-edge microcopy on non-done tiles with upstream stages. */
 .tile-waits{font:11px var(--mono);color:var(--muted);margin:2px 0 6px}
 /* Balance caption under the lightest stage header. */
