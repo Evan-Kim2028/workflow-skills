@@ -215,6 +215,11 @@ class UnplannedDoctorTest(unittest.TestCase):
             state.mkdir()
             old = os.environ.get("AGENT_DASH_WORKSTREAMS")
             os.environ["AGENT_DASH_WORKSTREAMS"] = str(wsroot)
+            # Hermetic data root: no project.json here, so the ignore list
+            # reads empty and the ids under test keep firing even when a
+            # live project.json carries its own list.
+            old_root = os.environ.get("AGENT_DASH_DATA_ROOT")
+            os.environ["AGENT_DASH_DATA_ROOT"] = str(Path(tmp))
             try:
                 self.assertEqual(cmd_ws(["new", "WS1", "Real work"]), 0)
                 store = Store(state / "dash.sqlite")
@@ -258,6 +263,10 @@ class UnplannedDoctorTest(unittest.TestCase):
                     os.environ.pop("AGENT_DASH_WORKSTREAMS", None)
                 else:
                     os.environ["AGENT_DASH_WORKSTREAMS"] = old
+                if old_root is None:
+                    os.environ.pop("AGENT_DASH_DATA_ROOT", None)
+                else:
+                    os.environ["AGENT_DASH_DATA_ROOT"] = old_root
 
 
 class DoneNagActiveHundredTest(unittest.TestCase):

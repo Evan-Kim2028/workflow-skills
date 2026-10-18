@@ -489,6 +489,27 @@ class StateLifecycleTest(unittest.TestCase):
             sum(row["tokens"] for row in payload["workstreams"]),
         )
 
+    def test_ignored_ids_leave_the_list_but_keep_their_totals(self):
+        now = time.time()
+        self._run(now, "WS9", 9)
+        self._run(now, "WS345", 345)
+        before = build_state(self.store, StubRegistry([]), {}, now=now)
+        self.assertIn("WS345", [row["id"] for row in before["workstreams"]])
+        totals_before = before["totals_all_time"]
+        (Path(self.tmp.name) / "project.json").write_text(
+            json.dumps({"name": "Probe project", "ignore_workstreams": ["WS345"]}),
+            encoding="utf-8",
+        )
+        with mock.patch.dict(os.environ, {"AGENT_DASH_DATA_ROOT": self.tmp.name}):
+            after = build_state(self.store, StubRegistry([]), {}, now=now)
+        ids = [row["id"] for row in after["workstreams"]]
+        self.assertIn("WS9", ids)
+        self.assertNotIn("WS345", ids)
+        # The all-scope totals still count the ignored runs.
+        self.assertEqual(after["totals_all_time"], totals_before)
+        billed = after["totals_all_time"]["tokens"]
+        self.assertEqual(billed["input"] + billed["output"], 3000)
+
 
 if __name__ == "__main__":
     unittest.main()

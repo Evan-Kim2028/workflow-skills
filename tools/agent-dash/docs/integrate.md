@@ -146,7 +146,15 @@ python3 tools/agent-dash/agent_dash.py project set description "What ships."
 ```
 `project.json` holds `name`, `short`, `description`, `goals`, `started`,
 `target`, `phases` (each with `id`, `title`, `summary`, and a `gate` of
-member workstream ids or gate text), `links`, and `owner_notes`.
+member workstream ids or gate text), `links`, `owner_notes`, and
+`ignore_workstreams` (miscellaneous ids such as `PLANNING` or `TOOLS`
+that never raise a doctor finding and never appear in a workstream
+list or lane; matched case-insensitively, with a trailing `*` as a
+prefix):
+```bash
+python3 tools/agent-dash/agent_dash.py project ignore add TOOLS WS345
+python3 tools/agent-dash/agent_dash.py project ignore list
+```
 `GET /api/project` serves the file plus the computed roll-up: per-phase
 `state` (from the member workstreams, never stored), lifetime
 `totals_all_time`, `counts` by workstream state, and `data_root_hash`

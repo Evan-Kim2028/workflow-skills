@@ -263,5 +263,114 @@ class ProjectPayloadTests(unittest.TestCase):
         self.assertNotIn(self.tmp.name, blob)
 
 
+class IgnoreMatcherTests(unittest.TestCase):
+    def test_exact_match_is_case_insensitive(self):
+        entries = ["PLANNING", "TOOLS", "WS0", "WS345"]
+        for probe in ("planning", "Planning", "PLANNING", "tools", "ws0", "Ws345"):
+            self.assertTrue(project.is_ignored(probe, entries), probe)
+        self.assertFalse(project.is_ignored("WS346", entries))
+        self.assertFalse(project.is_ignored("WS", entries))
+        self.assertFalse(project.is_ignored("", entries))
+        self.assertFalse(project.is_ignored(None, entries))
+
+    def test_trailing_star_is_a_prefix(self):
+        entries = ["SCRATCH*"]
+        self.assertTrue(project.is_ignored("scratch-1", entries))
+        self.assertTrue(project.is_ignored("SCRATCHPAD", entries))
+        self.assertFalse(project.is_ignored("WS1", entries))
+        self.assertFalse(project.is_ignored("scratch", ["SCRATCHPAD*"]))
+
+    def test_malformed_values_never_match(self):
+        self.assertFalse(project.is_ignored("WS1", ["WS1*extra*"]))
+        self.assertFalse(project.is_ignored("WS1", [None, 42, "", "   "]))
+        self.assertEqual(project.normalize_ignore_list([" WS1 ", None, 7, "", "TOOLS*"]), ["WS1", "TOOLS*"])
+        self.assertEqual(project.normalize_ignore_list("WS1"), [])
+        self.assertEqual(project.normalize_ignore_list(None), [])
+
+
+class IgnoreCliTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = os.path.join(self.tmp.name, "dataroot")
+        self._env = _clean_env(self.root)
+        self.addCleanup(self._env.stop)
+        self.addCleanup(self.tmp.cleanup)
+
+    def _read(self):
+        return json.loads((Path(self.root) / "project.json").read_text(encoding="utf-8"))
+
+    def test_add_list_remove_roundtrip(self):
+        self.assertEqual(project.cmd_project(["init", "Demo project", "--data-root", self.root]), errors.OK)
+        self.assertEqual(
+            project.cmd_project(["ignore", "add", "PLANNING", "TOOLS", "WS0", "WS345", "--data-root", self.root]),
+            errors.OK,
+        )
+        self.assertEqual(self._read()["ignore_workstreams"], ["PLANNING", "TOOLS", "WS0", "WS345"])
+        # Idempotent: re-adding (any case) changes nothing but still exits 0.
+        self.assertEqual(
+            project.cmd_project(["ignore", "add", "tools", "ws345", "--data-root", self.root]),
+            errors.OK,
+        )
+        self.assertEqual(self._read()["ignore_workstreams"], ["PLANNING", "TOOLS", "WS0", "WS345"])
+        self.assertEqual(project.cmd_project(["ignore", "list", "--data-root", self.root]), errors.OK)
+        # Case-insensitive remove; removing an absent id still exits 0.
+        self.assertEqual(
+            project.cmd_project(["ignore", "remove", "ws0", "MISSING", "--data-root", self.root]),
+            errors.OK,
+        )
+        self.assertEqual(self._read()["ignore_workstreams"], ["PLANNING", "TOOLS", "WS345"])
+        self.assertTrue(project.is_ignored("planning"))
+        self.assertFalse(project.is_ignored("WS0"))
+
+    def test_prefix_entry_roundtrip(self):
+        self.assertEqual(project.cmd_project(["init", "Demo project", "--data-root", self.root]), errors.OK)
+        self.assertEqual(
+            project.cmd_project(["ignore", "add", "SCRATCH*", "--data-root", self.root]),
+            errors.OK,
+        )
+        self.assertEqual(self._read()["ignore_workstreams"], ["SCRATCH*"])
+        self.assertTrue(project.is_ignored("scratch-9"))
+        self.assertFalse(project.is_ignored("WS9"))
+
+    def test_bad_id_is_usage_error(self):
+        self.assertEqual(project.cmd_project(["init", "Demo project", "--data-root", self.root]), errors.OK)
+        self.assertEqual(
+            project.cmd_project(["ignore", "add", "a/b", "--data-root", self.root]),
+            errors.USAGE,
+        )
+        self.assertEqual(project.cmd_project(["ignore", "add", "--data-root", self.root]), errors.USAGE)
+        self.assertEqual(project.cmd_project(["ignore", "--data-root", self.root]), errors.USAGE)
+        self.assertNotIn("ignore_workstreams", self._read())
+
+    def test_missing_file_is_not_found(self):
+        self.assertEqual(project.cmd_project(["ignore", "list", "--data-root", self.root]), errors.NOT_FOUND)
+        self.assertEqual(
+            project.cmd_project(["ignore", "add", "WS0", "--data-root", self.root]),
+            errors.NOT_FOUND,
+        )
+
+    def test_non_list_field_is_a_validation_issue_but_reads_empty(self):
+        self.assertEqual(project.cmd_project(["init", "Demo project", "--data-root", self.root]), errors.OK)
+        data = self._read()
+        data["ignore_workstreams"] = "WS0"
+        (Path(self.root) / "project.json").write_text(json.dumps(data), encoding="utf-8")
+        issues = project.validate_project(data)
+        self.assertTrue(any('"ignore_workstreams"' in issue for issue in issues), issues)
+        self.assertEqual(project.read_ignore_list({"data_root": self.root}, self.root), [])
+        self.assertFalse(project.is_ignored("WS0", project.read_ignore_list({"data_root": self.root}, self.root)))
+
+    def test_malformed_items_are_tolerated(self):
+        self.assertEqual(project.cmd_project(["init", "Demo project", "--data-root", self.root]), errors.OK)
+        data = self._read()
+        data["ignore_workstreams"] = ["WS0", None, 42, "  ", "tools"]
+        (Path(self.root) / "project.json").write_text(json.dumps(data), encoding="utf-8")
+        self.assertEqual(project.validate_project(data), [])
+        entries = project.read_ignore_list({"data_root": self.root}, self.root)
+        self.assertEqual(entries, ["WS0", "tools"])
+        payload = project.build_payload(None, {"data_root": self.root}, self.root)
+        self.assertEqual(payload["ignore_workstreams"], ["WS0", "tools"])
+        self.assertEqual(payload["issues"], [])
+
+
 if __name__ == "__main__":
     unittest.main()

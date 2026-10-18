@@ -233,6 +233,12 @@ def collect_problems(
     the git-backed checks read (tests point it at a temp repo).
     """
     cfg = cfg if isinstance(cfg, dict) else {}
+    try:
+        from dash.project import read_ignore_list
+
+        _ignored_entries = read_ignore_list(cfg)
+    except Exception:
+        _ignored_entries = []
     ctx = SimpleNamespace(
         store=store,
         cfg=cfg,
@@ -251,12 +257,14 @@ def collect_problems(
         checks=[],
         emitted=set(),
         groups={},
+        _ignored=None,
         _runs=None,
         _runs_loaded=False,
         _bundles=None,
         _taskmap=None,
         _live_ids=None,
     )
+    ctx._ignored = list(_ignored_entries or [])
     _collect_dashboard(ctx)
     _collect_roots(ctx)
     _collect_pricing(ctx)
@@ -274,7 +282,30 @@ def collect_problems(
     return {"problems": ctx.problems, "checks": ctx.checks}
 
 
+def _ignored_ws(ctx, ws) -> bool:
+    """True when a workstream id sits on the project's ignore list.
+
+    The list (``project.json`` ``ignore_workstreams``) is read once per
+    :func:`collect_problems` run; matching is case-insensitive with
+    trailing-``*`` prefixes (see ``dash.project.is_ignored``). A
+    missing list never matches.
+    """
+    if not isinstance(ws, str) or not ws.strip():
+        return False
+    entries = getattr(ctx, "_ignored", None)
+    if not entries:
+        return False
+    try:
+        from dash.project import is_ignored
+
+        return bool(is_ignored(ws, entries))
+    except Exception:
+        return False
+
+
 def _add(ctx, code, severity, scope, ws, title, detail, command, safe_auto=False, key=None, items=None):
+    if isinstance(ws, str) and ws and _ignored_ws(ctx, ws):
+        return None
     item = make_problem(code, severity, scope, ws, title, detail, command, safe_auto, key, items)
     if item["id"] in ctx.emitted:
         return None
@@ -291,6 +322,8 @@ def _group_add(ctx, code, severity, scope, ws, member_title, member_id, since, m
     the workstream and the count, a detail with the worst 3, and the one
     list-all fix command.
     """
+    if isinstance(ws, str) and ws and _ignored_ws(ctx, ws):
+        return None
     bucket = ctx.groups.setdefault(
         (str(code), str(scope), ws), {"severity": "info", "members": []}
     )
@@ -2639,12 +2672,15 @@ def _lifecycle_planned_live(ctx, ws: str, meta: dict, runs: list) -> int:
 def _collect_unplanned(ctx, bundles, runs) -> int:
     """Runs attributed to an id with no plan bundle (one finding per id).
 
+    Ids on the project's ``ignore_workstreams`` list never fire here
+    (or anywhere else workstream-scoped): existing rows for them
+    resolve on the next snapshot because they are absent from the run.
     Shared lanes (an id without a workstream number, such as a tool or
     planning lane) get the same ``ws new`` command with a lane-style
     suggested title; the detail says to keep it as a workstream bundle
     or, when it is truly shared, to record it as a program bundle by
-    setting ``kind`` to ``program`` in ``bundle.json`` after creation.
-    No ignore list exists, so none is named.
+    setting ``kind`` to ``program`` in ``bundle.json`` after creation,
+    or to ignore the id instead.
     """
     have = set()
     for item in bundles or []:
@@ -2663,6 +2699,8 @@ def _collect_unplanned(ctx, bundles, runs) -> int:
         by_ws.setdefault(ws, []).append(run)
     count = 0
     for ws in sorted(by_ws):
+        if _ignored_ws(ctx, ws):
+            continue
         rows = by_ws[ws]
         first: float | None = None
         for run in rows:
@@ -2678,7 +2716,8 @@ def _collect_unplanned(ctx, bundles, runs) -> int:
             f"Active without a plan: {ws} has {len(rows)} "
             f"{_plural(len(rows), 'run', 'runs')} recorded (first {when}) "
             f"but no plan bundle. Create it with: "
-            f"python3 agent_dash.py ws new {ws} \"{title}\""
+            f"python3 agent_dash.py ws new {ws} \"{title}\" "
+            f"or ignore it: python3 agent_dash.py project ignore add {ws}"
         )
         if _looks_shared_lane(ws):
             detail += (

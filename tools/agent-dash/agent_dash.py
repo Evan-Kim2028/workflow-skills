@@ -344,7 +344,12 @@ def main(argv: list[str] | None = None) -> int:
     args, proj, proj_err = _extract_project_flag(args)
     if proj_err is not None:
         return proj_err
-    if proj is not None and (not args or args[0] != "project"):
+    # The multi-project flag also reaches the descriptor subcommands
+    # (show, set, ignore, init), which read one project's project.json;
+    # the registry subcommands (add, list, launch, stop, open, remove)
+    # keep their own scope and never take it.
+    _descriptor = len(args) > 1 and args[0] == "project" and args[1] in ("show", "set", "ignore", "init")
+    if proj is not None and (not args or args[0] != "project" or _descriptor):
         from dash.projects import apply_project_env
 
         _entry, _error = apply_project_env(proj)

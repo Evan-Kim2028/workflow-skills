@@ -993,6 +993,105 @@ class SnapshotUsageEndpointTest(unittest.TestCase):
         self.assertEqual(status, 400)
 
 
+class IgnoreWorkstreamsServerTest(unittest.TestCase):
+    """Ignored ids leave the workstream list and the per-workstream
+    breakdown, fold into Other where charts sum, and keep the totals."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.store = Store(Path(self.tmp.name) / "dash.sqlite")
+        self.now = time.time()
+        self.since = int(self.now - 12 * 3600)
+        for label, ws, inp, out in (("ws9-a", "WS9", 100, 50), ("ws345-a", "WS345", 200, 100)):
+            run_id = "muse:a:%s" % label
+            self.store.upsert_run(
+                {
+                    "run_id": run_id,
+                    "source": "muse",
+                    "tier": "muse",
+                    "model": "claude-sonnet-4-5",
+                    "label": label,
+                    "session_id": "sess-%s" % label,
+                    "status": "done",
+                    "started_at": self.now - 5000,
+                    "ended_at": self.now - 4000,
+                }
+            )
+            with self.store._lock:
+                self.store._conn.execute(
+                    "UPDATE runs SET workstream=? WHERE run_id=?", (ws, run_id)
+                )
+                self.store._conn.commit()
+            self.store.add_usage(
+                {
+                    "ts": self.now - 4100,
+                    "session_id": "sess-%s" % label,
+                    "run_id": run_id,
+                    "model": "claude-sonnet-4-5",
+                    "tool": "muse",
+                    "message_id": "m-%s" % label,
+                    "input": inp,
+                    "output": out,
+                    "cache_read": 10,
+                    "cache_write": 5,
+                }
+            )
+        (Path(self.tmp.name) / "project.json").write_text(
+            json.dumps({"name": "Probe project", "ignore_workstreams": ["WS345"]}),
+            encoding="utf-8",
+        )
+        self._env = mock.patch.dict(os.environ, {"AGENT_DASH_DATA_ROOT": self.tmp.name})
+        self._env.start()
+        self.addCleanup(self._env.stop)
+        self.server, self.thread = start(self.store)
+        self.port = self.server.server_address[1]
+
+    def tearDown(self):
+        stop(self.server, self.thread)
+        self.store.close()
+        self.tmp.cleanup()
+
+    def fetch(self, path):
+        status, _, body = get(self.port, path)
+        self.assertEqual(status, 200, path)
+        return json.loads(body)
+
+    def test_workstreams_endpoint_drops_ignored(self):
+        body = self.fetch("/api/workstreams")
+        ids = [row["ws"] for row in body["workstreams"]]
+        self.assertIn("WS9", ids)
+        self.assertNotIn("WS345", ids)
+
+    def test_snapshot_drops_breakdown_folds_other_keeps_totals(self):
+        payload = self.fetch(f"/api/snapshot?ws=all&since={self.since}&usage_group=workstream")
+        self.assertNotIn("WS345", [row["ws"] for row in payload["by_workstream"]])
+        self.assertIn("WS9", [row["ws"] for row in payload["by_workstream"]])
+        keys = [cell["key"] for cell in payload["usage"]]
+        self.assertNotIn("WS345", keys)
+        self.assertIn("Other", keys)
+        other = sum(
+            (cell["input"] or 0) + (cell["output"] or 0)
+            + (cell["cache_read"] or 0) + (cell["cache_write"] or 0)
+            for cell in payload["usage"] if cell["key"] == "Other"
+        )
+        self.assertEqual(other, 200 + 100 + 10 + 5)
+        billed = payload["totals"]["tokens"]
+        total = billed["input"] + billed["output"] + billed["cache_read"] + billed["cache_write"]
+        self.assertEqual(total, (100 + 50 + 10 + 5) + (200 + 100 + 10 + 5))
+        buckets = sum(
+            (cell["input"] or 0) + (cell["output"] or 0)
+            + (cell["cache_read"] or 0) + (cell["cache_write"] or 0)
+            for cell in payload["usage"]
+        )
+        self.assertEqual(buckets, total)
+
+    def test_usage_endpoint_folds_ignored(self):
+        body = self.fetch("/api/usage?group=workstream")
+        keys = [cell["key"] for cell in body["buckets"]]
+        self.assertNotIn("WS345", keys)
+        self.assertIn("Other", keys)
+
+
 class UnpricedAlertTest(unittest.TestCase):
     """Item 7: a model with windowed usage and no rate fails health and
     reconcile loudly, and the snapshot totals name the excluded tokens."""

@@ -21,8 +21,12 @@ python3 agent_dash.py ws new WS345 "Work for WS345"
 An id without a workstream number (a shared tool or planning lane)
 reads the same way: create it with `ws new`, then, when it is truly
 shared rather than one workstream, set `"kind"` to `"program"` in
-`bundle.json` after creation. There is no ignore list: every active id
-either gains a bundle or stays listed here.
+`bundle.json` after creation — or ignore it: python3 agent_dash.py project ignore add <ID>.
+Ignored ids (project-level `ignore_workstreams` in `project.json`,
+matched case-insensitively, with trailing-`*` prefixes) never raise
+this finding: existing rows for them resolve on the next doctor run,
+and they leave the Project home strip, the workstream list, the
+switcher, and every per-workstream lane.
 
 ## How to verify
 

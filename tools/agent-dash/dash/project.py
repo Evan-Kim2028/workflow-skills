@@ -23,6 +23,20 @@ any member is ``active``/``paused``, ``planned`` before that, ``dropped``
 when every member is ``dropped``. Member states come from ``bundle.json``
 ``state`` when present, else ``active``. A missing ``project.json`` is
 fine: the name reads null and the header falls back to "Agent dashboard".
+
+``ignore_workstreams`` is the project-level ignore list for
+miscellaneous workstream ids (planning and tool lanes such as
+``PLANNING`` or ``TOOLS``)::
+
+    {"ignore_workstreams": ["PLANNING", "TOOLS", "WS0", "WS345"]}
+
+Ids match case-insensitively against a run's mapped workstream id; an
+entry ending with ``*`` (for example ``"SCRATCH*"``) is a prefix match.
+Ignored ids never produce a doctor finding, never appear in the
+"Active without a plan" strip, the workstream list, the switcher, or
+any per-workstream lane, but their runs still count in the all-scope
+totals. Charts that must sum to the total fold them into one muted
+``"Other"`` bucket (see :data:`OTHER_WS`).
 """
 
 from __future__ import annotations
@@ -42,6 +56,9 @@ PROJECT_USAGE = """agent-dash project descriptor
   python3 agent_dash.py project init <name> [--data-root DIR]
   python3 agent_dash.py project show [--json] [--data-root DIR]
   python3 agent_dash.py project set <field> <value> [--data-root DIR]
+  python3 agent_dash.py project ignore add <ID...> [--data-root DIR]
+  python3 agent_dash.py project ignore remove <ID...> [--data-root DIR]
+  python3 agent_dash.py project ignore list [--json] [--data-root DIR]
   python3 agent_dash.py project add <id> --data-root DIR [--name NAME] [--port N] [--init] [--json]
   python3 agent_dash.py project list [--json]
   python3 agent_dash.py project launch <id> [--json]
@@ -59,13 +76,133 @@ add/list/launch/stop/open/remove manage the multi-project registry
 dashboard instance per project, each with its own data root, state,
 port, and name. Agents working on a project pass --project <id> (or
 set the env) for state, check, doctor, ws ..., status.
+ignore add/remove/list edit only project.json's "ignore_workstreams"
+(atomically and idempotently): ignored ids never raise a doctor
+finding and never appear in a workstream list or lane, while their
+runs still count in the all-scope totals. Ids match case-insensitively;
+a trailing "*" is a prefix ("SCRATCH*").
 Exit codes: 0 ok, 1 check failed, 2 usage error, 3 not found, 4 invalid data.
 """
 
 LIFECYCLE_STATES = ("planned", "active", "paused", "done", "archived", "dropped")
 SETTABLE_FIELDS = ("name", "short", "description", "target")
+IGNORE_FIELD = "ignore_workstreams"
+#: The single muted bucket that charts summing to the all-scope total
+#: fold ignored workstream ids into. The page paints it neutral
+#: (``var(--other)``, the same tone as unassigned), never an entity colour.
+OTHER_WS = "Other"
 _WS_ID = re.compile(r"^WS\d+$")
 _SAFE_ID = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
+_IGNORE_ENTRY = re.compile(r"^[A-Za-z0-9_.-]{1,64}\*?$")
+
+
+def normalize_ignore_list(raw) -> list[str]:
+    """Cleaned ignore entries: stripped non-empty strings, order kept.
+
+    Unknown or malformed values (non-strings, blanks) are tolerated by
+    dropping them, so one bad entry never silences the whole list.
+    """
+    if not isinstance(raw, list):
+        return []
+    out: list[str] = []
+    for item in raw:
+        if not isinstance(item, str):
+            continue
+        text = item.strip()
+        if text:
+            out.append(text)
+    return out
+
+
+def is_ignored(ws, entries=None) -> bool:
+    """True when a workstream id matches the ignore list.
+
+    Matching is case-insensitive; an entry ending with ``*`` matches
+    every id with that prefix (``"SCRATCH*"`` covers ``scratch-1``).
+    ``entries`` defaults to the live file (see :func:`read_ignore_list`).
+    Anything malformed never matches.
+    """
+    if not isinstance(ws, str) or not ws.strip():
+        return False
+    if entries is None:
+        entries = read_ignore_list()
+    upper = ws.strip().upper()
+    for entry in entries:
+        if not isinstance(entry, str):
+            continue
+        text = entry.strip().upper()
+        if not text:
+            continue
+        if text.endswith("*"):
+            if upper.startswith(text[:-1]):
+                return True
+        elif upper == text:
+            return True
+    return False
+
+
+def ignore_cache_key(entries=None) -> tuple:
+    """Hashable identity of the ignore list for ETags and cache keys."""
+    if entries is None:
+        try:
+            entries = read_ignore_list()
+        except Exception:
+            return ()
+    try:
+        return tuple(sorted({str(item).strip().upper() for item in entries if isinstance(item, str) and item.strip()}))
+    except Exception:
+        return ()
+
+
+def read_ignore_list(cfg: dict | None = None, root=None) -> list[str]:
+    """The project's ``ignore_workstreams`` entries, cleaned. Never raises.
+
+    The canonical ``project.json`` in the data root decides; only when
+    it is missing or unreadable does a copy beside the bundles apply.
+    A missing file (or a missing field) reads as an empty list.
+    """
+    try:
+        data, _path, _issues = read_project(cfg, root)
+    except Exception:
+        data = None
+    if isinstance(data, dict):
+        if IGNORE_FIELD in data:
+            return normalize_ignore_list(data.get(IGNORE_FIELD))
+        return []
+    try:
+        ws_root = _ws_root(cfg, root)
+        text = (ws_root / dataroot.PROJECT_FILENAME).read_text(encoding="utf-8")
+        fallback = json.loads(text)
+    except (OSError, ValueError):
+        return []
+    if isinstance(fallback, dict) and IGNORE_FIELD in fallback:
+        return normalize_ignore_list(fallback.get(IGNORE_FIELD))
+    return []
+
+
+def fold_other_keys(cells: list[dict], entries=None, key: str = "key") -> list[dict]:
+    """Usage cells with ignored workstream keys renamed to :data:`OTHER_WS`.
+
+    Returns a new list (renamed cells are copies); cells are not merged,
+    because every consumer already aggregates by key. Unignored cells
+    pass through untouched. Never raises.
+    """
+    if not isinstance(cells, list):
+        return cells
+    if entries is None:
+        try:
+            entries = read_ignore_list()
+        except Exception:
+            return list(cells)
+    if not entries:
+        return list(cells)
+    out: list[dict] = []
+    for cell in cells:
+        if isinstance(cell, dict) and is_ignored(cell.get(key), entries):
+            cell = dict(cell)
+            cell[key] = OTHER_WS
+        out.append(cell)
+    return out
 
 
 def _ws_root(cfg: dict | None = None, root=None) -> Path:
@@ -142,6 +279,9 @@ def validate_project(data, source: str = "project.json") -> list[str]:
             seen: set[str] = set()
             for phase in phases:
                 issues.extend(_validate_phase(phase, seen, hint))
+    ignored = data.get(IGNORE_FIELD)
+    if ignored is not None and not isinstance(ignored, list):
+        issues.append(f'project "{IGNORE_FIELD}" must be a list of ids (got {ignored!r}). {hint}')
     return issues
 
 
@@ -302,6 +442,7 @@ def build_payload(store=None, cfg: dict | None = None, root=None, now: float | N
         "target": data.get("target") if isinstance(data.get("target"), str) else None,
         "phases": phases,
         "links": list(data.get("links")) if isinstance(data.get("links"), list) else [],
+        "ignore_workstreams": normalize_ignore_list(data.get(IGNORE_FIELD)),
         "owner_notes": data.get("owner_notes") if isinstance(data.get("owner_notes"), str) else "",
         "data_root_hash": dataroot.data_root_hash(cfg, root),
         "totals_all_time": totals,
@@ -360,7 +501,7 @@ def cmd_project(argv: list[str]) -> int:
 
             root = Path(expand(rest[index + 1]))
             index += 2
-        elif token == "--json" and cmd == "show":
+        elif token == "--json" and cmd in ("show", "ignore"):
             json_mode = True
             index += 1
         elif token.startswith("-"):
@@ -391,8 +532,114 @@ def cmd_project(argv: list[str]) -> int:
             )
             return errors.USAGE
         return cmd_set(positional[0], positional[1], root)
+    if cmd == "ignore":
+        return cmd_ignore(positional, root, json_mode)
     print(PROJECT_USAGE, end="", file=sys.stderr)
     return errors.USAGE
+
+
+def _check_ignore_id(raw: str) -> str | None:
+    """Trimmed CLI ignore id, or None when it is not shaped like one.
+
+    Plain ids hold safe id characters; a single trailing ``*`` turns
+    the entry into a prefix match (``SCRATCH*``). Anything else is a
+    usage error, never stored.
+    """
+    text = raw.strip()
+    if text and _IGNORE_ENTRY.match(text):
+        return text
+    return None
+
+
+def cmd_ignore(positional: list[str], root=None, json_mode: bool = False) -> int:
+    """Project ignore list: add, remove, list. Writes only project.json.
+
+    Reads and writes are atomic (temp file plus rename) and idempotent:
+    adding a present id (any case) or removing an absent one still
+    exits 0. Without a ``project.json`` every action names ``project
+    init`` (exit 3), like ``project set``.
+    """
+    args = list(positional or [])
+    if not args or args[0] not in ("add", "remove", "list"):
+        print(
+            "project ignore needs add, remove, or list, "
+            "e.g. python3 agent_dash.py project ignore add WS0. "
+            "Run: python3 agent_dash.py project --help",
+            file=sys.stderr,
+        )
+        return errors.USAGE
+    action = args[0]
+    wanted = args[1:]
+    if action in ("add", "remove") and not wanted:
+        print(
+            f"project ignore {action} needs at least one id, "
+            "e.g. python3 agent_dash.py project ignore add WS0. "
+            "Run: python3 agent_dash.py project --help",
+            file=sys.stderr,
+        )
+        return errors.USAGE
+    if action == "list" and wanted:
+        print(PROJECT_USAGE, end="", file=sys.stderr)
+        return errors.USAGE
+    cleaned: list[str] = []
+    for raw in wanted:
+        checked = _check_ignore_id(raw)
+        if checked is None:
+            print(
+                f"project ignore {action} got a bad id {raw!r}: use letters, digits, "
+                '"._-", or one trailing "*" for a prefix (e.g. SCRATCH*). '
+                "Run: python3 agent_dash.py project --help",
+                file=sys.stderr,
+            )
+            return errors.USAGE
+        cleaned.append(checked)
+    cfg = {"data_root": str(root)} if root is not None else None
+    data, path, _issues = read_project(cfg, root)
+    if data is None or not isinstance(data, dict):
+        print(
+            f"no project.json at {path}. "
+            'Run: python3 agent_dash.py project init "Demo project"',
+            file=sys.stderr,
+        )
+        return errors.NOT_FOUND
+    current = normalize_ignore_list(data.get(IGNORE_FIELD))
+    if action == "list":
+        if json_mode:
+            errors.emit_json({"ignore_workstreams": current})
+        elif current:
+            for entry in current:
+                print(entry)
+        else:
+            print(f"no ignored workstreams in {path}")
+        return errors.OK
+    if action == "add":
+        have = {entry.upper() for entry in current}
+        added = 0
+        for entry in cleaned:
+            if entry.upper() not in have:
+                current.append(entry)
+                have.add(entry.upper())
+                added += 1
+        data[IGNORE_FIELD] = current
+        try:
+            _atomic_write(path, json.dumps(data, indent=2) + "\n")
+        except OSError as exc:
+            print(f"project ignore add failed for {path}: {exc}. Run: python3 agent_dash.py project show", file=sys.stderr)
+            return errors.INVALID_DATA
+        print(f"ignoring {added} of {len(cleaned)} id(s) in {path} (list holds {len(current)})")
+        return errors.OK
+    removed = 0
+    drop = {entry.upper() for entry in cleaned}
+    kept = [entry for entry in current if entry.upper() not in drop]
+    removed = len(current) - len(kept)
+    data[IGNORE_FIELD] = kept
+    try:
+        _atomic_write(path, json.dumps(data, indent=2) + "\n")
+    except OSError as exc:
+        print(f"project ignore remove failed for {path}: {exc}. Run: python3 agent_dash.py project show", file=sys.stderr)
+        return errors.INVALID_DATA
+    print(f"unignored {removed} of {len(cleaned)} id(s) in {path} (list holds {len(kept)})")
+    return errors.OK
 
 
 def cmd_init(name: str, root=None) -> int:

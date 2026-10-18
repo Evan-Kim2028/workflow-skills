@@ -34,7 +34,9 @@
     return lg;
   }
   function colorOf(key, kind) {
-    if (kind === "workstream") { if (!key || key === "null" || key === "unassigned") return "var(--other)"; if (!wsColor[key]) wsColor[key] = WSCOL[Object.keys(wsColor).length % WSCOL.length]; return "var(" + wsColor[key] + ")"; }
+    /* The ignored-activity bucket is muted like unassigned, never an
+       entity colour: it is a sum of hidden lanes, not a workstream. */
+    if (kind === "workstream") { if (!key || key === "null" || key === "unassigned" || key === "Other") return "var(--other)"; if (!wsColor[key]) wsColor[key] = WSCOL[Object.keys(wsColor).length % WSCOL.length]; return "var(" + wsColor[key] + ")"; }
     return ADM.colorOf(key);
   }
   /* axes() and the compact formatters live in format.js and are shared with the plan view. */

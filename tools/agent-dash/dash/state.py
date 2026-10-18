@@ -194,6 +194,12 @@ def _state_key(store, processes, cfg, now: float, doctor_generated) -> tuple | N
         data_seq = store.data_seq
     except Exception:
         return None
+    try:
+        from dash.project import ignore_cache_key, read_ignore_list
+
+        ignore_key = ignore_cache_key(read_ignore_list(cfg))
+    except Exception:
+        ignore_key = ()
     return (
         path,
         seq,
@@ -202,6 +208,7 @@ def _state_key(store, processes, cfg, now: float, doctor_generated) -> tuple | N
         _files_fingerprint(cfg),
         _actions_flag(cfg),
         doctor_generated,
+        ignore_key,
         int(now // STATE_CACHE_TTL_S),
     )
 
@@ -365,6 +372,17 @@ def _build_state_body(store, cfg, now: float, processes, doctor, build) -> dict:
                 )
         except Exception:
             pass
+    try:
+        from dash.project import is_ignored, read_ignore_list
+
+        _ignored = read_ignore_list(cfg)
+    except Exception:
+        _ignored = []
+    if _ignored:
+        workstreams = [
+            row for row in workstreams
+            if not (isinstance(row.get("id"), str) and is_ignored(row["id"], _ignored))
+        ]
     unassigned = roll["unassigned"]
     totals = roll["all"]["totals"]
     totals_prev = dict(roll["all"].get("prev_24h") or {"tokens": 0, "cost_usd": 0.0, "finished": 0, "live_agents": 0})

@@ -442,6 +442,13 @@ class Handler(BaseHTTPRequestHandler):
         recent_limit = _recent_limit(query)
         recent_offset = _offset(query, "recent_offset")
         store = self.server.store
+        ignored = _ignored_entries()
+        try:
+            from dash.project import ignore_cache_key
+
+            ignore_key = ignore_cache_key(ignored)
+        except Exception:
+            ignore_key = ()
         # Identity names the result-cache entry, not the poll clock:
         # store.seq advances on every poll (process samples, counts) while
         # no served byte changes, so tagging it would 200 every tick and
@@ -454,17 +461,30 @@ class Handler(BaseHTTPRequestHandler):
                 "snapshot",
                 store.snapshot_key(ws, since, until, usage_group, recent_limit, recent_offset),
                 store.data_seq,
+                ignore_key,
             )
         except Exception:
             ident = None
         etag = _identity_etag(*ident) if ident is not None else None
         if self._not_modified(etag):
             return
-        self._json(
-            200,
-            store.snapshot_cached(now, ws, since, until, usage_group=usage_group, recent_limit=recent_limit, recent_offset=recent_offset),
-            etag=etag,
-        )
+        body = store.snapshot_cached(now, ws, since, until, usage_group=usage_group, recent_limit=recent_limit, recent_offset=recent_offset)
+        if ignored and ws == "all" and isinstance(body, dict):
+            # Copy-on-write: the store cache owns this dict, so the
+            # filtered lists replace (never mutate) its entries. Totals
+            # stay all-scope; only the per-workstream breakdown shrinks,
+            # and usage buckets fold the ignored share into "Other" so a
+            # stacked chart still sums to the legend Total.
+            body = dict(body)
+            body["by_workstream"] = _drop_ignored_rows(body.get("by_workstream"), entries=ignored)
+            if usage_group == "workstream" and isinstance(body.get("usage"), list):
+                try:
+                    from dash.project import fold_other_keys
+
+                    body["usage"] = fold_other_keys(body["usage"], ignored)
+                except Exception:
+                    pass
+        self._json(200, body, etag=etag)
 
     def _workstreams(self, query):
         from dash.workstates import all_bundle_meta, bundle_fallback_rows, filter_rows, parse_state_param
@@ -476,11 +496,18 @@ class Handler(BaseHTTPRequestHandler):
         meta = all_bundle_meta()
         plan_ids = workstream_plan_ids()
         store = self.server.store
+        ignored = _ignored_entries()
+        try:
+            from dash.project import ignore_cache_key
+
+            ignore_key = ignore_cache_key(ignored)
+        except Exception:
+            ignore_key = ()
         try:
             wkey = store.workstreams_key(plan_ids, since, until, now, meta, allowed)
         except Exception:
             wkey = None
-        etag = _identity_etag("workstreams", wkey) if wkey is not None else None
+        etag = _identity_etag("workstreams", wkey, ignore_key) if wkey is not None else None
         if self._not_modified(etag):
             return
         rows = store.query_workstreams(
@@ -512,6 +539,8 @@ class Handler(BaseHTTPRequestHandler):
                 row["allowed_actions"] = actions_mod.allowed_actions_for(
                     ws, row.get("state") or meta.get(ws, {}).get("state", "active"), kinds.get(ws)
                 )
+        if ignored:
+            rows = _drop_ignored_rows(rows, entries=ignored)
         self._json(200, {"workstreams": rows}, etag=etag)
 
     def _archive(self, _query):
@@ -775,7 +804,10 @@ class Handler(BaseHTTPRequestHandler):
         ws = _ws(query, default=None)
         since = _float(query, "since")
         until = _float(query, "until")
-        self._json(200, {"buckets": self.server.store.query_usage(group, bucket, ws, since, until)})
+        buckets = self.server.store.query_usage(group, bucket, ws, since, until)
+        if group == "workstream":
+            buckets = _fold_other(buckets)
+        self._json(200, {"buckets": buckets})
 
     def _concurrency(self, query):
         now = time.time()
@@ -1253,6 +1285,51 @@ def _choice(query: dict, name: str, default: str, allowed: set[str]) -> str:
     if value not in allowed:
         raise ValueError(f"bad {name}")
     return value
+
+
+def _ignored_entries():
+    """The project's ignore list, or [] when unreadable. Never raises."""
+    try:
+        from dash.project import read_ignore_list
+
+        return read_ignore_list()
+    except Exception:
+        return []
+
+
+def _drop_ignored_rows(rows: list, field: str = "ws", entries=None):
+    """Workstream rows minus ignored ids. Returns a new list. Never raises."""
+    if entries is None:
+        entries = _ignored_entries()
+    if not entries or not isinstance(rows, list):
+        return list(rows) if isinstance(rows, list) else rows
+    try:
+        from dash.project import is_ignored
+
+        return [
+            row for row in rows
+            if not (isinstance(row, dict) and isinstance(row.get(field), str) and is_ignored(row[field], entries))
+        ]
+    except Exception:
+        return list(rows)
+
+
+def _fold_other(cells: list):
+    """Usage buckets with ignored workstream keys folded to "Other".
+
+    A new list (the page stacks these to the all-scope total, so the
+    fold keeps the legend honest). Returns the input untouched when no
+    ignore list is configured. Never raises.
+    """
+    entries = _ignored_entries()
+    if not entries:
+        return cells
+    try:
+        from dash.project import fold_other_keys
+
+        return fold_other_keys(cells, entries)
+    except Exception:
+        return cells
 
 
 def _hint_for(error: str) -> str:

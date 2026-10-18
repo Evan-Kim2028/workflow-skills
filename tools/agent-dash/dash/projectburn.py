@@ -14,6 +14,10 @@ Honesty rule: workstreams or task counts with no history are shown as a
 labelled gap (``no history before <date>: N done tasks not dated``) and
 are never interpolated. The project burn-up line is the sum of recorded
 moves over time; the plan total line is the sum of plan totals.
+Workstream ids on the project's ``ignore_workstreams`` list leave the
+task lanes entirely; their cost and token cells fold into one
+``"Other"`` series so the per-workstream burn still sums to the
+project line.
 
 Windows are calendar days in UTC; the payload says so (``"day": "UTC"``).
 Only ids, counts, money, and dates cross this boundary — never a prompt,
@@ -74,14 +78,32 @@ def _history_mtimes(root: Path, ids: list[str]) -> list[tuple]:
     return sorted(out)
 
 
-def _cache_key(store, root: Path, ids: list[str]):
+def _ignored_now() -> list[str]:
+    """The project's ignore list, or [] when unreadable. Never raises."""
+    try:
+        from dash.project import read_ignore_list
+
+        return read_ignore_list()
+    except Exception:
+        return []
+
+
+def _cache_key(store, root: Path, ids: list[str], ignored=None):
     seq = getattr(store, "seq", None)
     if seq is None:
         seq = getattr(store, "_seq", 0)
     data_seq = getattr(store, "data_seq", None)
     if data_seq is None:
         data_seq = getattr(store, "_data_seq", 0)
-    return (str(root), tuple(_history_mtimes(root, ids)), seq, data_seq)
+    if ignored is None:
+        ignored = _ignored_now()
+    try:
+        from dash.project import ignore_cache_key
+
+        ignore_key = ignore_cache_key(ignored)
+    except Exception:
+        ignore_key = ()
+    return (str(root), tuple(_history_mtimes(root, ids)), seq, data_seq, ignore_key)
 
 
 def _bundle_ids() -> tuple[Path, list[str]]:
@@ -158,15 +180,22 @@ def _recorded_moves(ids: list[str]) -> dict:
     return deltas, first, recorded
 
 
-def _usage_by_day(store) -> tuple[dict, dict, dict]:
+def _usage_by_day(store, ignored=None) -> tuple[dict, dict, dict]:
     """(cost, tokens, unpriced) per (ws, UTC day) from day usage buckets.
 
     The same cells ``/api/usage?group=workstream&bucket=day`` serves, so
     the per-day sums equal the all-scope totals for the same days. Tokens
     are billed tokens (input + output + cache read + cache write); a cell
     with no priced cost contributes its tokens to ``unpriced`` instead.
+    Ignored workstream ids fold into the single ``"Other"`` bucket, so
+    the per-workstream series still sum to the project line.
     """
     cells = store.query_usage("workstream", "day", None, None, None)
+    try:
+        from dash.project import OTHER_WS, is_ignored
+    except Exception:
+        OTHER_WS, is_ignored = "Other", None
+    ignored = list(ignored or [])
     cost: dict = {}
     tokens: dict = {}
     unpriced: dict = {}
@@ -174,6 +203,8 @@ def _usage_by_day(store) -> tuple[dict, dict, dict]:
         if not isinstance(cell, dict):
             continue
         ws = cell.get("key") or "unassigned"
+        if ignored and is_ignored is not None and is_ignored(ws, ignored):
+            ws = OTHER_WS
         try:
             day = int(cell.get("t") or 0)
         except (TypeError, ValueError):
@@ -207,16 +238,24 @@ def build_burnup(store, now: float | None = None) -> dict:
     """
     import time as _time
 
+    try:
+        from dash.project import OTHER_WS, is_ignored as _is_ignored
+    except Exception:
+        OTHER_WS, _is_ignored = "Other", None
+
     moment = float(now if now is not None else _time.time())
     root, ids = _bundle_ids()
-    key = _cache_key(store, root, ids)
+    ignored = _ignored_now()
+    if ignored and _is_ignored is not None:
+        ids = [ws for ws in ids if not _is_ignored(ws, ignored)]
+    key = _cache_key(store, root, ids, ignored)
     hit = _CACHE.get("key")
     if hit is not None and hit == key and "payload" in _CACHE:
         return _CACHE["payload"]
 
     plans = _plan_totals(ids)
     deltas, first, recorded = _recorded_moves(ids)
-    cost_cells, token_cells, unpriced_cells = _usage_by_day(store)
+    cost_cells, token_cells, unpriced_cells = _usage_by_day(store, ignored)
 
     usage_ws = {ws for (ws, _day) in list(cost_cells) + list(token_cells)}
     order = sorted(set(ids) | set(recorded) | set(usage_ws), key=_ws_sort_key)
@@ -239,6 +278,11 @@ def build_burnup(store, now: float | None = None) -> dict:
     project: list[int] = [0] * len(days)
     plan_total = 0
     for ws in order:
+        if ws == OTHER_WS:
+            # The Other bucket carries usage only (ignored ids have no
+            # bundles, hence no task history); it must not gain a
+            # flat-zero tasks line. Cost and token series pick it up below.
+            continue
         cumulative = []
         running = 0
         for pos, day in enumerate(days):

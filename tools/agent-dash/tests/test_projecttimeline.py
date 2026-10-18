@@ -256,5 +256,56 @@ class ReadHelpersTest(unittest.TestCase):
         self.assertIsNone(timeline.read_project(self.root))
 
 
+class CollectIgnoreTest(unittest.TestCase):
+    def test_run_only_ids_gain_no_lane(self):
+        """Lanes come from bundles only: an ignored run-only id with real
+        runs behind it still draws no lane (verify-only, no code path
+        includes bundle-less ids)."""
+        from pathlib import Path
+        from unittest import mock
+
+        from dash.store import Store
+
+        with tempfile.TemporaryDirectory() as tmp:
+            wsroot = os.path.join(tmp, "ws")
+            dest = os.path.join(wsroot, "WS42")
+            os.makedirs(dest)
+            with open(os.path.join(dest, "bundle.json"), "w") as fh:
+                json.dump(dict(bundle("WS42")), fh)
+            with open(os.path.join(dest, "plan.json"), "w") as fh:
+                json.dump(
+                    {"dag": {"cols": ["Build"], "groups": [
+                        {"id": "g", "col": 0, "title": "Build", "tasks": [
+                            {"id": "WS42.1", "title": "First", "status": "todo", "deps": []}]}]},
+                     "narrative": {"phases": []}},
+                    fh,
+                )
+            store = Store(Path(tmp) / "dash.sqlite")
+            try:
+                store.upsert_run(
+                    {
+                        "run_id": "muse:probe:ws345",
+                        "source": "muse",
+                        "tier": "muse",
+                        "label": "ws345-probe",
+                        "session_id": "s-ws345",
+                        "status": "done",
+                        "started_at": NOW - 900,
+                        "ended_at": NOW - 100,
+                    }
+                )
+                with store._lock:
+                    store._conn.execute(
+                        "UPDATE runs SET workstream=? WHERE run_id=?", ("WS345", "muse:probe:ws345")
+                    )
+                    store._conn.commit()
+                with mock.patch.dict(os.environ, {"AGENT_DASH_WORKSTREAMS": wsroot}):
+                    payload = timeline.collect(store, NOW, wsroot)
+                self.assertEqual([lane["id"] for lane in payload["lanes"]], ["WS42"])
+                self.assertEqual(payload["order"], ["WS42"])
+            finally:
+                store.close()
+
+
 if __name__ == "__main__":
     unittest.main()

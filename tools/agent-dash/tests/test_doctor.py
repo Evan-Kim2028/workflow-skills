@@ -2539,5 +2539,152 @@ class BuildChecksTest(unittest.TestCase):
             )
 
 
+class IgnoreListDoctorTest(unittest.TestCase):
+    """Synthetic runs for ids with no bundle, behind a temp ignore list."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.wsroot = self.root / "ws"
+        self.wsroot.mkdir()
+        self.state = self.root / "state"
+        self.state.mkdir()
+        self.old_ws = os.environ.get("AGENT_DASH_WORKSTREAMS")
+        self.old_root = os.environ.get("AGENT_DASH_DATA_ROOT")
+        os.environ["AGENT_DASH_WORKSTREAMS"] = str(self.wsroot)
+        os.environ["AGENT_DASH_DATA_ROOT"] = str(self.root)
+        self.store = Store(self.state / "dash.sqlite")
+        self.now = 1_700_000_000.0
+
+    def tearDown(self):
+        self.store.close()
+        if self.old_ws is None:
+            os.environ.pop("AGENT_DASH_WORKSTREAMS", None)
+        else:
+            os.environ["AGENT_DASH_WORKSTREAMS"] = self.old_ws
+        if self.old_root is None:
+            os.environ.pop("AGENT_DASH_DATA_ROOT", None)
+        else:
+            os.environ["AGENT_DASH_DATA_ROOT"] = self.old_root
+        self.tmp.cleanup()
+
+    def _cfg(self):
+        cfg = _cfg(state_dir=str(self.state))
+        cfg["roots"]["scratchpads"] = []
+        return cfg
+
+    def _ignore(self, entries):
+        (self.root / "project.json").write_text(
+            json.dumps({"name": "Probe project", "ignore_workstreams": entries}),
+            encoding="utf-8",
+        )
+
+    def _run(self, ws):
+        stamp = self.now - 3600
+        run_id = "muse:probe:%s" % ws.lower()
+        self.store.upsert_run(
+            {
+                "run_id": run_id,
+                "source": "muse",
+                "tier": "muse",
+                "label": "%s-probe" % ws.lower(),
+                "session_id": "s-%s" % ws.lower(),
+                "status": "done",
+                "started_at": stamp - 60,
+                "ended_at": stamp,
+            }
+        )
+        # Pin the attribution directly: label rules only map ws<number>
+        # lanes, so lane ids like TOOLS or PLANNING need the explicit row.
+        with self.store._lock:
+            self.store._conn.execute(
+                "UPDATE runs SET workstream=? WHERE run_id=?", (ws, run_id)
+            )
+            self.store._conn.commit()
+
+    def _collect(self):
+        from dash.doctor import collect_problems
+
+        with mock.patch("dash.doctor._home_scratch", return_value=str(self.root / "noscratch")):
+            return collect_problems(
+                self.store, self._cfg(), self.now,
+                health={"ok": True, "sources": []}, processes=[],
+            )
+
+    def _problems(self, result, code):
+        return [item for item in result["problems"] if item["code"] == code]
+
+    def test_ignored_ids_skip_unplanned(self):
+        self._run("WS345")
+        self._run("WS9")
+        self._ignore(["PLANNING", "TOOLS", "WS0", "WS345"])
+        result = self._collect()
+        hits = {item["ws"]: item for item in self._problems(result, "unplanned-activity")}
+        self.assertEqual(sorted(hits), ["WS9"])
+        check = next(item for item in result["checks"] if item["name"] == "unplanned-activity")
+        self.assertFalse(check["ok"])
+        self.assertIn("1 open", check["detail"])
+
+    def test_prefix_and_case_insensitive(self):
+        self._run("WS345")
+        self._run("planning")
+        self._ignore(["ws*", "Planning"])
+        result = self._collect()
+        self.assertEqual(self._problems(result, "unplanned-activity"), [])
+        check = next(item for item in result["checks"] if item["name"] == "unplanned-activity")
+        self.assertTrue(check["ok"])
+
+    def test_unplanned_detail_names_ignore_as_second_option(self):
+        self._run("WS9")
+        result = self._collect()
+        hits = self._problems(result, "unplanned-activity")
+        self.assertEqual(len(hits), 1)
+        item = hits[0]
+        self.assertIn("python3 agent_dash.py ws new WS9", item["detail"])
+        self.assertIn("or ignore it: python3 agent_dash.py project ignore add WS9", item["detail"])
+
+    def test_bundled_ignored_id_raises_no_workstream_finding(self):
+        from dash.bundles import cmd_ws
+
+        self.assertEqual(cmd_ws(["new", "WS41", "North Meadow"]), 0)
+        meta = json.loads((self.wsroot / "WS41" / "bundle.json").read_text(encoding="utf-8"))
+        meta["state"] = "done"
+        meta["state_changed_at"] = self.now - 8 * 86400
+        (self.wsroot / "WS41" / "bundle.json").write_text(json.dumps(meta), encoding="utf-8")
+        (self.wsroot / "WS41" / "plan.json").write_text(
+            json.dumps({"dag": {"cols": ["Build"], "groups": []}, "narrative": {"phases": []}}),
+            encoding="utf-8",
+        )
+        before = self._problems(self._collect(), "done-not-archived")
+        self.assertEqual(len(before), 1)
+        self._ignore(["WS41"])
+        after = self._collect()
+        self.assertFalse([item for item in after["problems"] if item.get("ws") == "WS41"])
+
+    def test_existing_finding_auto_resolves(self):
+        self._run("WS345")
+        first = self._collect()
+        self.assertEqual(len(self._problems(first, "unplanned-activity")), 1)
+        self.store.doctor_snapshot(first["problems"], self.now)
+        with self.store._lock:
+            row = self.store._conn.execute(
+                "SELECT resolved_at FROM doctor_problems WHERE id=?",
+                ("unplanned-activity:ws:WS345",),
+            ).fetchone()
+        self.assertIsNotNone(row)
+        self.assertIsNone(row["resolved_at"])
+        self._ignore(["WS345"])
+        second = self._collect()
+        self.assertEqual(self._problems(second, "unplanned-activity"), [])
+        self.store.doctor_snapshot(second["problems"], self.now + 60)
+        with self.store._lock:
+            row = self.store._conn.execute(
+                "SELECT resolved_at FROM doctor_problems WHERE id=?",
+                ("unplanned-activity:ws:WS345",),
+            ).fetchone()
+        self.assertIsNotNone(row)
+        self.assertIsNotNone(row["resolved_at"])
+
+
 if __name__ == "__main__":
     unittest.main()

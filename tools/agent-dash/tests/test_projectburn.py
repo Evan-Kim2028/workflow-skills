@@ -364,5 +364,82 @@ class CardWiringTests(unittest.TestCase):
             self.assertIn("function %s(" % fn, src)
 
 
+class IgnoreTests(BurnupCase):
+    def add_attributed_run(self, ws_label, ws, ts, inp=100, out=50):
+        """Like add_run, but pins the run row to ``ws`` directly.
+
+        Label rules only map ws<number> lanes, so bundle ids like BX1
+        and lane ids like WS345 need the explicit row for usage tests.
+        The usage lands after the pin, so the hour rebuild keeps it.
+        """
+        run_id = "muse:seed:%s:%d" % (ws_label, int(ts))
+        self.store.upsert_run(
+            {
+                "run_id": run_id,
+                "source": "muse",
+                "tier": "muse",
+                "model": MODEL,
+                "label": ws_label,
+                "session_id": "seed-%s" % ws_label,
+                "status": "done",
+                "started_at": ts - 60,
+                "ended_at": ts,
+            }
+        )
+        with self.store._lock:
+            self.store._conn.execute(
+                "UPDATE runs SET workstream=? WHERE run_id=?", (ws, run_id)
+            )
+            self.store._conn.commit()
+        self.store.add_usage(
+            {
+                "ts": ts,
+                "session_id": "seed-%s" % ws_label,
+                "run_id": run_id,
+                "model": MODEL,
+                "tool": "muse",
+                "message_id": "m-%s" % ws_label,
+                "input": inp,
+                "output": out,
+                "cache_read": 10,
+                "cache_write": 5,
+            }
+        )
+
+    def test_ignored_usage_folds_into_other(self):
+        self.make_bundle(
+            "BX1",
+            [{"id": "BX1.1", "title": "First", "status": "done"}],
+            [{"ts": _day_ago(self.now, 1) + 60, "task": "BX1.1", "from": "todo", "to": "done"}],
+        )
+        day_ts = _day_ago(self.now, 1) + 3600
+        self.add_attributed_run("bx1-BX1.1-x", "BX1", day_ts)
+        self.add_attributed_run("ws345-probe", "WS345", day_ts, inp=200, out=100)
+        (Path(self.tmp.name) / "project.json").write_text(
+            json.dumps({"name": "Probe project", "ignore_workstreams": ["WS345"]}),
+            encoding="utf-8",
+        )
+        with mock.patch.dict(os.environ, {"AGENT_DASH_DATA_ROOT": self.tmp.name}):
+            payload = projectburn.build_burnup(self.store, self.now)
+        # The ignored id leaves every lane and order list ...
+        self.assertNotIn("WS345", payload["workstreams"])
+        self.assertNotIn("WS345", payload["tasks"]["by_workstream"])
+        self.assertNotIn("WS345", payload["cost"]["by_workstream"])
+        self.assertNotIn("WS345", payload["tokens"]["by_workstream"])
+        self.assertNotIn("Other", payload["tasks"]["by_workstream"])
+        # ... while its usage folds into one Other series that sums.
+        token_ws = payload["tokens"]["by_workstream"]
+        self.assertIn("Other", token_ws)
+        self.assertEqual(sum(token_ws["Other"]), 200 + 100 + 10 + 5)
+        self.assertIn("Other", payload["cost"]["by_workstream"])
+        project_total = sum(payload["tokens"]["project"])
+        split_total = sum(sum(series) for series in token_ws.values())
+        self.assertEqual(split_total, project_total)
+        self.assertEqual(project_total, (100 + 50 + 10 + 5) + (200 + 100 + 10 + 5))
+        # The task lane only ever knew the bundled workstream.
+        self.assertEqual(sorted(payload["tasks"]["by_workstream"]), ["BX1"])
+        self.assertEqual(payload["tasks"]["by_workstream"]["BX1"]["recorded"], 1)
+
+
 if __name__ == "__main__":
     unittest.main()

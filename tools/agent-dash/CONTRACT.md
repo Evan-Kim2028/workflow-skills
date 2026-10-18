@@ -161,7 +161,10 @@ unreachable (docs/integrate.md, For agents).
 `usage` is present only when `usage_group` is given: the hourly usage
 buckets for the same scope and window, computed under the same lock pass
 as `totals`, so the bucket token sum equals `totals` by construction. A
-bad `usage_group` is a 400.
+bad `usage_group` is a 400. With `usage_group=workstream` the all-scope
+response folds ignored ids into one `"Other"` key, so the stacked chart
+still sums to the legend Total; the page paints it neutral
+(`var(--other)`), never an entity colour.
 `totals` is the windowed scope total; `totals_all_time` is the same scope with
 no window, summed by the same helper. `last_activity` is the scope's newest
 run stamp, or null when the scope has no runs. The page tiles read these
@@ -195,7 +198,11 @@ started_at, ended_at, elapsed_s, clock_source, out_bytes, out_growing, err_bytes
 
 `GET /api/runs?ws=&since=&until=&limit=&include=` -> `{"runs": [Run]}` (Gantt input; workflow children collapsed into one row with `children: n`). Production (dagster) rows are left out by default; `?include=jobs` adds them back for tools that need them (anything else is a 400).
 
-`GET /api/usage?group=model|workstream|tool&bucket=hour|day&ws=&since=&until=` -> `{"buckets": [{"t": 0, "key": "opus", "input": 0, "output": 0, "cache_read": 0, "cache_write": 0, "reasoning": 0, "cost_usd": 0.0}]}`
+`GET /api/usage?group=model|workstream|tool&bucket=hour|day&ws=&since=&until=` -> `{"buckets": [{"t": 0, "key": "opus", "input": 0, "output": 0, "cache_read": 0, "cache_write": 0, "reasoning": 0, "cost_usd": 0.0}]}`.
+With `group=workstream`, buckets for ids on the project's
+`ignore_workstreams` list fold into one `"Other"` key (cells are
+renamed, not merged; consumers already aggregate by key), so the
+per-workstream split still sums to the all-scope total.
 
 `GET /api/concurrency?ws=&since=&step=60` -> `{"points": [{"t": 0, "grok": 0, "muse": 0, "glm": 0, "claude": 0}]}`
 
@@ -217,7 +224,11 @@ default `active` when the bundle carries none), with `state_changed_at`,
 `?state=archived,done` (any comma list of state names) keeps exactly those. A
 bad state name is a 400. The existing live/progress fields stay on every row
 returned, and the `unassigned` row stays in every scope with null lifecycle
-fields (it is not a workstream).
+fields (it is not a workstream). Rows for ids on the project's
+`ignore_workstreams` list never appear here (nor in the all-scope
+snapshot `by_workstream`, the Project home "Active without a plan"
+strip, the "Where we are" list, the switcher, or any lane); their runs
+still count in the all-scope totals.
 
 `POST /api/workstreams/archive` and `POST /api/workstreams/restore` (JSON
 body `{"ws": "<ID>"}` and nothing else) are the only writes the server
@@ -390,7 +401,7 @@ Each problem keeps every existing field and gains `items` (up to 20 compact `{ti
 `?ws=<ID>` keeps that workstream's problems plus global ones; `?severity=critical|warn|info` is the minimum level shown. A problem absent from a run resolves (`resolved_at` set, kept 14 days); one that reappears after resolution is `regressed`. Critical means the numbers are wrong or the dashboard is blind: source stalled, unseen workers, dashboard down, unpriced model with tokens, reconcile mismatch. Warn is workflow hygiene: stuck task, policy breach, orphan process, stale approval, invalid bundle, a slow-but-returning source poll (`source-slow`), skipped Dagster close-outs (`dagster-closeout-skipped`), and friends. Info is advisory: dirty checkout, run folder outside roots. Every code has a page under `docs/problems/<code>.md`.
 `?ws=<ID>` keeps that workstream's problems plus global ones; `?severity=critical|warn|info` is the minimum level shown. A problem absent from a run resolves (`resolved_at` set, kept 14 days); one that reappears after resolution is `regressed`. Critical means the numbers are wrong or the dashboard is blind: source stalled, unseen workers, dashboard down, unpriced model with tokens, reconcile mismatch. Warn is workflow hygiene: stuck task, policy breach, orphan process, stale approval, invalid bundle, and friends, plus the orchestration flags (idle-ready work, dep jumps, stale gates, review spirals, undelegated leads) and a dirty running build (`build-dirty`). Info is advisory: dirty checkout, run folder outside roots, a running build behind `origin/main` (`build-behind`), plus the orchestration advisories (deferred orphans, wave tails, ghost runs). Every code has a page under `docs/problems/<code>.md`.
 Orchestration thresholds live under `doctor.*` in config: `idle_ready_minutes` (default 30: a ready queue with fewer than 2 live agents fires once the plan sits unchanged that long), `long_tail_minutes` (default 60: a wave finished except one still-running lane), `fix_rounds_cap` (default 2: distinct `-fixN`/`-revN` rounds on an open task), `recent_hours` (default 24: the recent/old cut for dep jumps and deferred orphans, the ghost-run window, and the no-activity gate — a workstream with no plan, or with no run or plan activity inside it, never fires an orchestration problem; a dep-jump group is `warn` only when it holds a jump started inside the window, else `info`), `ghost_share` (default 0.2: the unmapped-run share that fires ghost-runs).
-Lifecycle thresholds live under the same `doctor.*` key: `archive_nag_days` (default 7: a `done` workstream, or an `active` one at 100% of non-deferred tasks, nags past this age without being archived), `active_idle_days` (default 3: an `active` workstream with open tasks and no runs or history moves this long fires), `phase_slip_days` (default 7: a finished phase whose successor has not started this long fires). The lifecycle checks (`done-not-archived`, `active-idle`, `planned-blocked`, `planned-ready`, `planned-live`, `unplanned-activity`) emit one problem per (code, workstream) with the `<code>:ws:<ID>` id and no member rows; `phase-slipping` emits one per phase at global scope (`<code>:global:<kind>:<phase>`). All but `unplanned-activity` are silent for projects without lifecycle data (no lifecycle keys in any `bundle.json` and no `project.json`); absent `state` reads as `active`. `planned-live` fires when a `planned` workstream already has runs (the page shows it under Current with a first-agent hint; the fix is `ws state <ID> active`); `unplanned-activity` fires when runs attribute to an id with no bundle (the fix is `ws new <ID> "<title>"`).
+Lifecycle thresholds live under the same `doctor.*` key: `archive_nag_days` (default 7: a `done` workstream, or an `active` one at 100% of non-deferred tasks, nags past this age without being archived), `active_idle_days` (default 3: an `active` workstream with open tasks and no runs or history moves this long fires), `phase_slip_days` (default 7: a finished phase whose successor has not started this long fires). The lifecycle checks (`done-not-archived`, `active-idle`, `planned-blocked`, `planned-ready`, `planned-live`, `unplanned-activity`) emit one problem per (code, workstream) with the `<code>:ws:<ID>` id and no member rows; `phase-slipping` emits one per phase at global scope (`<code>:global:<kind>:<phase>`). All but `unplanned-activity` are silent for projects without lifecycle data (no lifecycle keys in any `bundle.json` and no `project.json`); absent `state` reads as `active`. `planned-live` fires when a `planned` workstream already has runs (the page shows it under Current with a first-agent hint; the fix is `ws state <ID> active`); `unplanned-activity` fires when runs attribute to an id with no bundle (the fix is `ws new <ID> "<title>"`, or `project ignore add <ID>` for miscellaneous activity). Ids on the project's `ignore_workstreams` list never fire any workstream-scoped finding; rows already stored for them resolve on the next snapshot because they are absent from the run.
 
 `GET /api/state` -> the whole dashboard in one call, computed in one
 store pass (`Store.state_view`):
@@ -469,6 +480,25 @@ python3 agent_dash.py project set description "What ships."
 `init` writes a starter template and refuses to overwrite (exit 2);
 `set` takes `name`, `short`, `description`, or `target` (exit 2 on a bad
 field, 3 when no `project.json` exists, 4 on invalid data).
+`ignore_workstreams` is the project-level ignore list for miscellaneous
+workstream ids (`["PLANNING", "TOOLS", "WS0", "WS345"]`); ids match
+case-insensitively and a trailing `*` is a prefix (`"SCRATCH*"`).
+```bash
+python3 agent_dash.py project ignore add <ID...> [--data-root DIR]
+python3 agent_dash.py project ignore remove <ID...> [--data-root DIR]
+python3 agent_dash.py project ignore list [--json] [--data-root DIR]
+```
+`ignore` writes only `project.json` (atomic temp-file-plus-rename,
+idempotent: adding a present id or removing an absent one still exits
+0; 3 when no `project.json` exists). Reads tolerate malformed values:
+non-strings and blanks are dropped, a non-list field reads as empty
+(validation still flags a non-list field so `project show` reports it).
+Ignored ids never produce a
+workstream-scoped doctor finding and never appear in a workstream
+list, the switcher, or any lane, while their runs still count in the
+all-scope totals; charts that must sum to the total fold them into one
+muted `"Other"` bucket. `GET /api/project` carries the cleaned list as
+`ignore_workstreams`.
 `GET /api/project` also carries the instance's project `id` (from
 `AGENT_DASH_PROJECT_ID` when launched via `project launch`, else null);
 `/api/health` carries the same id as `project_id` (id only, never paths).
@@ -695,7 +725,7 @@ HTTP, still GET only, 127.0.0.1:
 - `GET /api/decisions` returns `{decisions: [{id, title, status, owner, date, workstream, area, link}], counts: {<status>: n}, source: {present: bool}}`: the read-only decisions mirror the decisions card reads. When the endpoint is absent or `source.present` is false the card hides entirely; links render as anchors only for `http(s)` URLs, else plain text.
 - `GET /api/project/graph` returns `{nodes: [{id, title, state, progress, live_agents, milestone, depth}], edges: [{from, to, kind, status, condition}], cycles: [[id]], generated_at}`: the cross-workstream dependency graph, read-only over local bundles. `kind` is `dependency` (`depends_on`), `gate` (a gate task whose signal, title, or `dep_notes` text names another workstream), or `moved` (a deferred task's `moved_to`); `status` is `met`, `waiting`, or `stale` (stale per the `stale_gates` rule, met when the source is done/archived, the gate is done-like, or the gate is fresh and confirmed). Cycles are reported, never an error. Only ids, titles, states, counts, and plan condition texts cross the boundary — never paths or bodies.
 ||||||| parent of 245220a (feat(dash): project burn-up with an honest history gap, and cost and token burn by workstream)
-- `GET /api/project/burnup` returns `{"burnup": {days, day, first_recorded, workstreams, tasks, cost, tokens}}`: recorded tasks-done cumulative per workstream per UTC day from `history.jsonl` task moves (reverse moves decrement), plan totals from the one plan resolver (deferred tasks excluded), and cost/token burn per UTC day from the same day buckets `/api/usage?group=workstream&bucket=day` serves, so per-day sums equal the all-scope totals for the same days. Done work with no history is a labelled gap (`no history before <date>: N done tasks not dated`), never interpolated. Cached by history/plan file mtimes plus the store sequence. Only ids, counts, money, and dates cross this boundary.
+- `GET /api/project/burnup` returns `{"burnup": {days, day, first_recorded, workstreams, tasks, cost, tokens}}`: recorded tasks-done cumulative per workstream per UTC day from `history.jsonl` task moves (reverse moves decrement), plan totals from the one plan resolver (deferred tasks excluded), and cost/token burn per UTC day from the same day buckets `/api/usage?group=workstream&bucket=day` serves, so per-day sums equal the all-scope totals for the same days. Done work with no history is a labelled gap (`no history before <date>: N done tasks not dated`), never interpolated. Cached by history/plan file mtimes plus the store sequence. Only ids, counts, money, and dates cross this boundary. Ids on the project's `ignore_workstreams` list leave the task lanes (and the `workstreams` order) entirely; their cost/token cells fold into one `"Other"` series so the per-workstream burn still sums to the project line, and the ignore list joins the cache key.
 - `GET /bundle/<ID>/page.html` returns that file only. The resolved path has to stay inside the bundle directory.
 
 `static/vendor/mermaid.min.js` is mermaid 11.16.1. The plan page runs it on `pre.mermaid`. No CDN.
