@@ -24,6 +24,28 @@
       "cost_usd": 0,
       "tokens_all_time": 0,
       "cost_usd_all_time": 0,
+      "by_phase": {
+        "planning": {
+          "tokens": 0,
+          "cost_usd": 0.0
+        },
+        "execution": {
+          "tokens": 0,
+          "cost_usd": 0.0
+        },
+        "review": {
+          "tokens": 0,
+          "cost_usd": 0.0
+        },
+        "coordination": {
+          "tokens": 0,
+          "cost_usd": 0.0
+        },
+        "unclassified": {
+          "tokens": 0,
+          "cost_usd": 0.0
+        }
+      },
       "last_activity": null,
       "plan": false
     },
@@ -63,6 +85,28 @@
       "cost_usd": 2.0176,
       "tokens_all_time": 436889,
       "cost_usd_all_time": 2.0176,
+      "by_phase": {
+        "planning": {
+          "tokens": 8306,
+          "cost_usd": 0.0896
+        },
+        "execution": {
+          "tokens": 409608,
+          "cost_usd": 1.9193
+        },
+        "review": {
+          "tokens": 5917,
+          "cost_usd": 0.0
+        },
+        "coordination": {
+          "tokens": 0,
+          "cost_usd": 0.0
+        },
+        "unclassified": {
+          "tokens": 13058,
+          "cost_usd": 0.0087
+        }
+      },
       "last_activity": 1761999840,
       "plan": true
     },
@@ -102,6 +146,28 @@
       "cost_usd": 0.4083,
       "tokens_all_time": 360883,
       "cost_usd_all_time": 0.4083,
+      "by_phase": {
+        "planning": {
+          "tokens": 0,
+          "cost_usd": 0.0
+        },
+        "execution": {
+          "tokens": 360883,
+          "cost_usd": 0.4083
+        },
+        "review": {
+          "tokens": 0,
+          "cost_usd": 0.0
+        },
+        "coordination": {
+          "tokens": 0,
+          "cost_usd": 0.0
+        },
+        "unclassified": {
+          "tokens": 0,
+          "cost_usd": 0.0
+        }
+      },
       "last_activity": 1761999840,
       "plan": true
     },
@@ -129,6 +195,28 @@
       "cost_usd": 0,
       "tokens_all_time": 0,
       "cost_usd_all_time": 0,
+      "by_phase": {
+        "planning": {
+          "tokens": 0,
+          "cost_usd": 0.0
+        },
+        "execution": {
+          "tokens": 0,
+          "cost_usd": 0.0
+        },
+        "review": {
+          "tokens": 0,
+          "cost_usd": 0.0
+        },
+        "coordination": {
+          "tokens": 0,
+          "cost_usd": 0.0
+        },
+        "unclassified": {
+          "tokens": 0,
+          "cost_usd": 0.0
+        }
+      },
       "last_activity": null,
       "plan": false
     },
@@ -156,6 +244,28 @@
       "cost_usd": 0,
       "tokens_all_time": 0,
       "cost_usd_all_time": 0,
+      "by_phase": {
+        "planning": {
+          "tokens": 0,
+          "cost_usd": 0.0
+        },
+        "execution": {
+          "tokens": 0,
+          "cost_usd": 0.0
+        },
+        "review": {
+          "tokens": 0,
+          "cost_usd": 0.0
+        },
+        "coordination": {
+          "tokens": 0,
+          "cost_usd": 0.0
+        },
+        "unclassified": {
+          "tokens": 0,
+          "cost_usd": 0.0
+        }
+      },
       "last_activity": null,
       "plan": false
     },
@@ -183,6 +293,28 @@
       "cost_usd": 0,
       "tokens_all_time": 0,
       "cost_usd_all_time": 0,
+      "by_phase": {
+        "planning": {
+          "tokens": 0,
+          "cost_usd": 0.0
+        },
+        "execution": {
+          "tokens": 0,
+          "cost_usd": 0.0
+        },
+        "review": {
+          "tokens": 0,
+          "cost_usd": 0.0
+        },
+        "coordination": {
+          "tokens": 0,
+          "cost_usd": 0.0
+        },
+        "unclassified": {
+          "tokens": 0,
+          "cost_usd": 0.0
+        }
+      },
       "last_activity": null,
       "plan": false
     },
@@ -210,6 +342,28 @@
       "cost_usd": 0,
       "tokens_all_time": 0,
       "cost_usd_all_time": 0,
+      "by_phase": {
+        "planning": {
+          "tokens": 0,
+          "cost_usd": 0.0
+        },
+        "execution": {
+          "tokens": 0,
+          "cost_usd": 0.0
+        },
+        "review": {
+          "tokens": 0,
+          "cost_usd": 0.0
+        },
+        "coordination": {
+          "tokens": 0,
+          "cost_usd": 0.0
+        },
+        "unclassified": {
+          "tokens": 0,
+          "cost_usd": 0.0
+        }
+      },
       "last_activity": null,
       "plan": false
     },
@@ -249,6 +403,28 @@
       "cost_usd": 0.4934,
       "tokens_all_time": 317741,
       "cost_usd_all_time": 0.4934,
+      "by_phase": {
+        "planning": {
+          "tokens": 7935,
+          "cost_usd": 0.1905
+        },
+        "execution": {
+          "tokens": 13774,
+          "cost_usd": 0.0
+        },
+        "review": {
+          "tokens": 0,
+          "cost_usd": 0.0
+        },
+        "coordination": {
+          "tokens": 0,
+          "cost_usd": 0.0
+        },
+        "unclassified": {
+          "tokens": 296032,
+          "cost_usd": 0.3029
+        }
+      },
       "last_activity": 1761999840,
       "plan": true
     },
@@ -290,6 +466,28 @@
       "cost_usd": 0,
       "tokens_all_time": 0,
       "cost_usd_all_time": 0,
+      "by_phase": {
+        "planning": {
+          "tokens": 0,
+          "cost_usd": 0.0
+        },
+        "execution": {
+          "tokens": 0,
+          "cost_usd": 0.0
+        },
+        "review": {
+          "tokens": 0,
+          "cost_usd": 0.0
+        },
+        "coordination": {
+          "tokens": 0,
+          "cost_usd": 0.0
+        },
+        "unclassified": {
+          "tokens": 0,
+          "cost_usd": 0.0
+        }
+      },
       "last_activity": null,
       "plan": true
     },
@@ -332,6 +530,28 @@
       "cost_usd": 0,
       "tokens_all_time": 0,
       "cost_usd_all_time": 0,
+      "by_phase": {
+        "planning": {
+          "tokens": 0,
+          "cost_usd": 0.0
+        },
+        "execution": {
+          "tokens": 0,
+          "cost_usd": 0.0
+        },
+        "review": {
+          "tokens": 0,
+          "cost_usd": 0.0
+        },
+        "coordination": {
+          "tokens": 0,
+          "cost_usd": 0.0
+        },
+        "unclassified": {
+          "tokens": 0,
+          "cost_usd": 0.0
+        }
+      },
       "last_activity": null,
       "plan": true
     },
@@ -371,6 +591,28 @@
       "cost_usd": 0,
       "tokens_all_time": 0,
       "cost_usd_all_time": 0,
+      "by_phase": {
+        "planning": {
+          "tokens": 0,
+          "cost_usd": 0.0
+        },
+        "execution": {
+          "tokens": 0,
+          "cost_usd": 0.0
+        },
+        "review": {
+          "tokens": 0,
+          "cost_usd": 0.0
+        },
+        "coordination": {
+          "tokens": 0,
+          "cost_usd": 0.0
+        },
+        "unclassified": {
+          "tokens": 0,
+          "cost_usd": 0.0
+        }
+      },
       "last_activity": null,
       "plan": true
     },
@@ -398,6 +640,28 @@
       "cost_usd": 0,
       "tokens_all_time": 0,
       "cost_usd_all_time": 0,
+      "by_phase": {
+        "planning": {
+          "tokens": 0,
+          "cost_usd": 0.0
+        },
+        "execution": {
+          "tokens": 0,
+          "cost_usd": 0.0
+        },
+        "review": {
+          "tokens": 0,
+          "cost_usd": 0.0
+        },
+        "coordination": {
+          "tokens": 0,
+          "cost_usd": 0.0
+        },
+        "unclassified": {
+          "tokens": 0,
+          "cost_usd": 0.0
+        }
+      },
       "last_activity": null,
       "plan": false
     }

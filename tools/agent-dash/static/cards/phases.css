@@ -1,0 +1,32 @@
+/* Usage-by-phase card: stacked bars per workstream, legend, takeaway,
+   cumulative chart, and the thin management-table bar. */
+.phase-usage .phase-tabs { display: inline-flex; margin: 0 12px 4px 0; }
+.ph-list { display: flex; flex-direction: column; gap: 10px; margin-top: 10px; }
+.ph-row { display: grid; grid-template-columns: minmax(180px, 260px) 1fr auto; gap: 10px; align-items: center; }
+.ph-name { background: none; border: 0; padding: 0; text-align: left; font: inherit; color: var(--ink); cursor: pointer; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ph-name:hover { color: var(--accent); text-decoration: underline; }
+.ph-bar { display: flex; height: 18px; border-radius: var(--r-sm); overflow: hidden; background: var(--raised); min-width: 60px; }
+.ph-seg { height: 100%; min-width: 0; }
+.ph-seg:hover { filter: brightness(1.15); }
+.ph-total { font-family: var(--mono); font-size: var(--fs-micro); color: var(--ink-2); text-align: right; min-width: 64px; }
+.phase-legend { margin-top: 8px; }
+.ph-foot { margin-top: 10px; font-size: var(--fs-sub); color: var(--ink-2); }
+.ph-other { color: var(--muted); }
+.ph-takeaway { margin-top: 8px; font-size: var(--fs-body); color: var(--ink); }
+.ph-wsbar { display: flex; align-items: center; gap: 10px; margin: 8px 0 4px; }
+.ph-wsbar .mg-phase { flex: 1; max-width: none; }
+.ph-wsnote { font-size: var(--fs-sub); color: var(--ink-2); white-space: nowrap; }
+/* Thin two-segment bar in management table rows: planning vs execution
+   share of lifetime tokens; the tooltip names every phase. */
+.mg-phase { display: flex; height: 5px; border-radius: 3px; overflow: hidden; background: var(--raised); margin-top: 4px; max-width: 220px; }
+.mg-phase-seg { height: 100%; min-width: 0; }
+@media (max-width:700px) {
+  .ph-row { grid-template-columns: 1fr auto; }
+  .ph-bar { grid-column: 1 / -1; order: 2; }
+  .ph-name { overflow: hidden; text-overflow: ellipsis; }
+  .ph-wsnote { white-space: normal; }
+  .phase-usage .phase-tabs { margin-bottom: 8px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .ph-seg:hover { filter: none; }
+}

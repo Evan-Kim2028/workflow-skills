@@ -16,7 +16,7 @@
    which stays in the page script and is read as a plain global at call time. */
 (function (global) {
   "use strict";
-  var FIXMAP = {"/api/snapshot": "snapshot", "/api/runs": "runs", "/api/usage": "usage-model-hour", "/api/concurrency": "concurrency", "/api/sessions": "sessions", "/api/workstreams": "workstreams", "/api/project": "project", "/api/projects": "projects", "/api/archive": "archive", "/api/health": "health", "/api/reconcile": "reconcile"};
+  var FIXMAP = {"/api/snapshot": "snapshot", "/api/runs": "runs", "/api/usage": "usage-model-hour", "/api/concurrency": "concurrency", "/api/sessions": "sessions", "/api/workstreams": "workstreams", "/api/project": "project", "/api/projects": "projects", "/api/archive": "archive", "/api/health": "health", "/api/reconcile": "reconcile", "/api/project/phases": "phases"};
   /* Hidden-tab pause: stream ticks and background warmups cost server
      work and renders nobody sees, so they no-op while hidden; the next
      visible tick refreshes. */

@@ -1,0 +1,3779 @@
+{
+  "scope": "24h",
+  "since": 1761913560,
+  "until": 1761999960,
+  "day": "UTC",
+  "rules_hash": "fixture",
+  "rules_version": 1,
+  "caption": "Split by run label: explicit plan, exec, review and coord marks first, then review affixes, plan task matches, planning, review, doing and coordination words, unmapped lead sessions and early exploration. The rest reads Unclassified.",
+  "workstreams": [
+    {
+      "ws": "WS0",
+      "name": "Stabilize",
+      "by_phase": {
+        "planning": {
+          "tokens": {
+            "input": 0,
+            "output": 0,
+            "cache_read": 0,
+            "cache_write": 0,
+            "reasoning": 0
+          },
+          "billed_tokens": 0,
+          "cost_usd": 0.0,
+          "unpriced_tokens": 0,
+          "agents": 0,
+          "runs": 0,
+          "hours": 0.0
+        },
+        "execution": {
+          "tokens": {
+            "input": 0,
+            "output": 0,
+            "cache_read": 0,
+            "cache_write": 0,
+            "reasoning": 0
+          },
+          "billed_tokens": 0,
+          "cost_usd": 0.0,
+          "unpriced_tokens": 0,
+          "agents": 0,
+          "runs": 0,
+          "hours": 0.0
+        },
+        "review": {
+          "tokens": {
+            "input": 0,
+            "output": 0,
+            "cache_read": 0,
+            "cache_write": 0,
+            "reasoning": 0
+          },
+          "billed_tokens": 0,
+          "cost_usd": 0.0,
+          "unpriced_tokens": 0,
+          "agents": 0,
+          "runs": 0,
+          "hours": 0.0
+        },
+        "coordination": {
+          "tokens": {
+            "input": 0,
+            "output": 0,
+            "cache_read": 0,
+            "cache_write": 0,
+            "reasoning": 0
+          },
+          "billed_tokens": 0,
+          "cost_usd": 0.0,
+          "unpriced_tokens": 0,
+          "agents": 0,
+          "runs": 0,
+          "hours": 0.0
+        },
+        "unclassified": {
+          "tokens": {
+            "input": 0,
+            "output": 0,
+            "cache_read": 0,
+            "cache_write": 0,
+            "reasoning": 0
+          },
+          "billed_tokens": 0,
+          "cost_usd": 0.0,
+          "unpriced_tokens": 0,
+          "agents": 0,
+          "runs": 0,
+          "hours": 0.0
+        }
+      },
+      "total": {
+        "tokens": {
+          "input": 0,
+          "output": 0,
+          "cache_read": 0,
+          "cache_write": 0,
+          "reasoning": 0
+        },
+        "cost_usd": 0.0
+      },
+      "days": [
+        1761350400,
+        1761436800,
+        1761523200,
+        1761609600,
+        1761696000,
+        1761782400,
+        1761868800,
+        1761955200
+      ],
+      "series": {
+        "planning": {
+          "cost": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "tokens": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "cumulative_cost": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "cumulative_tokens": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "execution": {
+          "cost": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "tokens": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "cumulative_cost": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "cumulative_tokens": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "review": {
+          "cost": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "tokens": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "cumulative_cost": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "cumulative_tokens": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "coordination": {
+          "cost": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "tokens": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "cumulative_cost": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "cumulative_tokens": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "unclassified": {
+          "cost": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "tokens": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "cumulative_cost": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "cumulative_tokens": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        }
+      }
+    },
+    {
+      "ws": "WS1",
+      "name": "Identity",
+      "by_phase": {
+        "planning": {
+          "tokens": {
+            "input": 0,
+            "output": 0,
+            "cache_read": 0,
+            "cache_write": 0,
+            "reasoning": 0
+          },
+          "billed_tokens": 8306,
+          "cost_usd": 0.0896,
+          "unpriced_tokens": 0,
+          "agents": 0,
+          "runs": 1,
+          "hours": 0.0
+        },
+        "execution": {
+          "tokens": {
+            "input": 0,
+            "output": 0,
+            "cache_read": 0,
+            "cache_write": 0,
+            "reasoning": 0
+          },
+          "billed_tokens": 409608,
+          "cost_usd": 1.9193,
+          "unpriced_tokens": 0,
+          "agents": 36,
+          "runs": 56,
+          "hours": 0.0
+        },
+        "review": {
+          "tokens": {
+            "input": 0,
+            "output": 0,
+            "cache_read": 0,
+            "cache_write": 0,
+            "reasoning": 0
+          },
+          "billed_tokens": 5917,
+          "cost_usd": 0.0,
+          "unpriced_tokens": 0,
+          "agents": 1,
+          "runs": 1,
+          "hours": 0.0
+        },
+        "coordination": {
+          "tokens": {
+            "input": 0,
+            "output": 0,
+            "cache_read": 0,
+            "cache_write": 0,
+            "reasoning": 0
+          },
+          "billed_tokens": 0,
+          "cost_usd": 0.0,
+          "unpriced_tokens": 0,
+          "agents": 0,
+          "runs": 0,
+          "hours": 0.0
+        },
+        "unclassified": {
+          "tokens": {
+            "input": 0,
+            "output": 0,
+            "cache_read": 0,
+            "cache_write": 0,
+            "reasoning": 0
+          },
+          "billed_tokens": 13058,
+          "cost_usd": 0.0087,
+          "unpriced_tokens": 0,
+          "agents": 2,
+          "runs": 2,
+          "hours": 0.0
+        }
+      },
+      "total": {
+        "tokens": {
+          "input": 0,
+          "output": 0,
+          "cache_read": 0,
+          "cache_write": 0,
+          "reasoning": 0
+        },
+        "cost_usd": 2.0176
+      },
+      "days": [
+        1761350400,
+        1761436800,
+        1761523200,
+        1761609600,
+        1761696000,
+        1761782400,
+        1761868800,
+        1761955200
+      ],
+      "series": {
+        "planning": {
+          "cost": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0896
+          ],
+          "tokens": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            8306
+          ],
+          "cumulative_cost": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0896
+          ],
+          "cumulative_tokens": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            8306
+          ]
+        },
+        "execution": {
+          "cost": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            1.9193
+          ],
+          "tokens": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            409608
+          ],
+          "cumulative_cost": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            1.9193
+          ],
+          "cumulative_tokens": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            409608
+          ]
+        },
+        "review": {
+          "cost": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "tokens": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            5917
+          ],
+          "cumulative_cost": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "cumulative_tokens": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            5917
+          ]
+        },
+        "coordination": {
+          "cost": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "tokens": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "cumulative_cost": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "cumulative_tokens": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "unclassified": {
+          "cost": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0087
+          ],
+          "tokens": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            13058
+          ],
+          "cumulative_cost": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0087
+          ],
+          "cumulative_tokens": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            13058
+          ]
+        }
+      }
+    },
+    {
+      "ws": "WS2",
+      "name": "Public API",
+      "by_phase": {
+        "planning": {
+          "tokens": {
+            "input": 0,
+            "output": 0,
+            "cache_read": 0,
+            "cache_write": 0,
+            "reasoning": 0
+          },
+          "billed_tokens": 0,
+          "cost_usd": 0.0,
+          "unpriced_tokens": 0,
+          "agents": 0,
+          "runs": 0,
+          "hours": 0.0
+        },
+        "execution": {
+          "tokens": {
+            "input": 0,
+            "output": 0,
+            "cache_read": 0,
+            "cache_write": 0,
+            "reasoning": 0
+          },
+          "billed_tokens": 360883,
+          "cost_usd": 0.4083,
+          "unpriced_tokens": 0,
+          "agents": 40,
+          "runs": 45,
+          "hours": 0.0
+        },
+        "review": {
+          "tokens": {
+            "input": 0,
+            "output": 0,
+            "cache_read": 0,
+            "cache_write": 0,
+            "reasoning": 0
+          },
+          "billed_tokens": 0,
+          "cost_usd": 0.0,
+          "unpriced_tokens": 0,
+          "agents": 0,
+          "runs": 0,
+          "hours": 0.0
+        },
+        "coordination": {
+          "tokens": {
+            "input": 0,
+            "output": 0,
+            "cache_read": 0,
+            "cache_write": 0,
+            "reasoning": 0
+          },
+          "billed_tokens": 0,
+          "cost_usd": 0.0,
+          "unpriced_tokens": 0,
+          "agents": 0,
+          "runs": 0,
+          "hours": 0.0
+        },
+        "unclassified": {
+          "tokens": {
+            "input": 0,
+            "output": 0,
+            "cache_read": 0,
+            "cache_write": 0,
+            "reasoning": 0
+          },
+          "billed_tokens": 0,
+          "cost_usd": 0.0,
+          "unpriced_tokens": 0,
+          "agents": 0,
+          "runs": 0,
+          "hours": 0.0
+        }
+      },
+      "total": {
+        "tokens": {
+          "input": 0,
+          "output": 0,
+          "cache_read": 0,
+          "cache_write": 0,
+          "reasoning": 0
+        },
+        "cost_usd": 0.4083
+      },
+      "days": [
+        1761350400,
+        1761436800,
+        1761523200,
+        1761609600,
+        1761696000,
+        1761782400,
+        1761868800,
+        1761955200
+      ],
+      "series": {
+        "planning": {
+          "cost": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "tokens": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "cumulative_cost": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "cumulative_tokens": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "execution": {
+          "cost": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.4083
+          ],
+          "tokens": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            360883
+          ],
+          "cumulative_cost": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.4083
+          ],
+          "cumulative_tokens": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            360883
+          ]
+        },
+        "review": {
+          "cost": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "tokens": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "cumulative_cost": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "cumulative_tokens": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "coordination": {
+          "cost": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "tokens": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "cumulative_cost": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "cumulative_tokens": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "unclassified": {
+          "cost": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "tokens": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "cumulative_cost": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "cumulative_tokens": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        }
+      }
+    },
+    {
+      "ws": "WS3",
+      "name": "Gateway",
+      "by_phase": {
+        "planning": {
+          "tokens": {
+            "input": 0,
+            "output": 0,
+            "cache_read": 0,
+            "cache_write": 0,
+            "reasoning": 0
+          },
+          "billed_tokens": 0,
+          "cost_usd": 0.0,
+          "unpriced_tokens": 0,
+          "agents": 0,
+          "runs": 0,
+          "hours": 0.0
+        },
+        "execution": {
+          "tokens": {
+            "input": 0,
+            "output": 0,
+            "cache_read": 0,
+            "cache_write": 0,
+            "reasoning": 0
+          },
+          "billed_tokens": 0,
+          "cost_usd": 0.0,
+          "unpriced_tokens": 0,
+          "agents": 0,
+          "runs": 0,
+          "hours": 0.0
+        },
+        "review": {
+          "tokens": {
+            "input": 0,
+            "output": 0,
+            "cache_read": 0,
+            "cache_write": 0,
+            "reasoning": 0
+          },
+          "billed_tokens": 0,
+          "cost_usd": 0.0,
+          "unpriced_tokens": 0,
+          "agents": 0,
+          "runs": 0,
+          "hours": 0.0
+        },
+        "coordination": {
+          "tokens": {
+            "input": 0,
+            "output": 0,
+            "cache_read": 0,
+            "cache_write": 0,
+            "reasoning": 0
+          },
+          "billed_tokens": 0,
+          "cost_usd": 0.0,
+          "unpriced_tokens": 0,
+          "agents": 0,
+          "runs": 0,
+          "hours": 0.0
+        },
+        "unclassified": {
+          "tokens": {
+            "input": 0,
+            "output": 0,
+            "cache_read": 0,
+            "cache_write": 0,
+            "reasoning": 0
+          },
+          "billed_tokens": 0,
+          "cost_usd": 0.0,
+          "unpriced_tokens": 0,
+          "agents": 0,
+          "runs": 0,
+          "hours": 0.0
+        }
+      },
+      "total": {
+        "tokens": {
+          "input": 0,
+          "output": 0,
+          "cache_read": 0,
+          "cache_write": 0,
+          "reasoning": 0
+        },
+        "cost_usd": 0.0
+      },
+      "days": [
+        1761350400,
+        1761436800,
+        1761523200,
+        1761609600,
+        1761696000,
+        1761782400,
+        1761868800,
+        1761955200
+      ],
+      "series": {
+        "planning": {
+          "cost": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "tokens": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "cumulative_cost": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "cumulative_tokens": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "execution": {
+          "cost": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "tokens": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "cumulative_cost": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "cumulative_tokens": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "review": {
+          "cost": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "tokens": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "cumulative_cost": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "cumulative_tokens": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "coordination": {
+          "cost": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "tokens": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "cumulative_cost": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "cumulative_tokens": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "unclassified": {
+          "cost": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "tokens": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "cumulative_cost": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "cumulative_tokens": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        }
+      }
+    },
+    {
+      "ws": "WS4",
+      "name": "Offers",
+      "by_phase": {
+        "planning": {
+          "tokens": {
+            "input": 0,
+            "output": 0,
+            "cache_read": 0,
+            "cache_write": 0,
+            "reasoning": 0
+          },
+          "billed_tokens": 0,
+          "cost_usd": 0.0,
+          "unpriced_tokens": 0,
+          "agents": 0,
+          "runs": 0,
+          "hours": 0.0
+        },
+        "execution": {
+          "tokens": {
+            "input": 0,
+            "output": 0,
+            "cache_read": 0,
+            "cache_write": 0,
+            "reasoning": 0
+          },
+          "billed_tokens": 0,
+          "cost_usd": 0.0,
+          "unpriced_tokens": 0,
+          "agents": 0,
+          "runs": 0,
+          "hours": 0.0
+        },
+        "review": {
+          "tokens": {
+            "input": 0,
+            "output": 0,
+            "cache_read": 0,
+            "cache_write": 0,
+            "reasoning": 0
+          },
+          "billed_tokens": 0,
+          "cost_usd": 0.0,
+          "unpriced_tokens": 0,
+          "agents": 0,
+          "runs": 0,
+          "hours": 0.0
+        },
+        "coordination": {
+          "tokens": {
+            "input": 0,
+            "output": 0,
+            "cache_read": 0,
+            "cache_write": 0,
+            "reasoning": 0
+          },
+          "billed_tokens": 0,
+          "cost_usd": 0.0,
+          "unpriced_tokens": 0,
+          "agents": 0,
+          "runs": 0,
+          "hours": 0.0
+        },
+        "unclassified": {
+          "tokens": {
+            "input": 0,
+            "output": 0,
+            "cache_read": 0,
+            "cache_write": 0,
+            "reasoning": 0
+          },
+          "billed_tokens": 0,
+          "cost_usd": 0.0,
+          "unpriced_tokens": 0,
+          "agents": 0,
+          "runs": 0,
+          "hours": 0.0
+        }
+      },
+      "total": {
+        "tokens": {
+          "input": 0,
+          "output": 0,
+          "cache_read": 0,
+          "cache_write": 0,
+          "reasoning": 0
+        },
+        "cost_usd": 0.0
+      },
+      "days": [
+        1761350400,
+        1761436800,
+        1761523200,
+        1761609600,
+        1761696000,
+        1761782400,
+        1761868800,
+        1761955200
+      ],
+      "series": {
+        "planning": {
+          "cost": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "tokens": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "cumulative_cost": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "cumulative_tokens": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "execution": {
+          "cost": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "tokens": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "cumulative_cost": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "cumulative_tokens": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "review": {
+          "cost": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "tokens": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "cumulative_cost": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "cumulative_tokens": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "coordination": {
+          "cost": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "tokens": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "cumulative_cost": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "cumulative_tokens": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "unclassified": {
+          "cost": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "tokens": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "cumulative_cost": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "cumulative_tokens": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        }
+      }
+    },
+    {
+      "ws": "WS5",
+      "name": "Clients",
+      "by_phase": {
+        "planning": {
+          "tokens": {
+            "input": 0,
+            "output": 0,
+            "cache_read": 0,
+            "cache_write": 0,
+            "reasoning": 0
+          },
+          "billed_tokens": 0,
+          "cost_usd": 0.0,
+          "unpriced_tokens": 0,
+          "agents": 0,
+          "runs": 0,
+          "hours": 0.0
+        },
+        "execution": {
+          "tokens": {
+            "input": 0,
+            "output": 0,
+            "cache_read": 0,
+            "cache_write": 0,
+            "reasoning": 0
+          },
+          "billed_tokens": 0,
+          "cost_usd": 0.0,
+          "unpriced_tokens": 0,
+          "agents": 0,
+          "runs": 0,
+          "hours": 0.0
+        },
+        "review": {
+          "tokens": {
+            "input": 0,
+            "output": 0,
+            "cache_read": 0,
+            "cache_write": 0,
+            "reasoning": 0
+          },
+          "billed_tokens": 0,
+          "cost_usd": 0.0,
+          "unpriced_tokens": 0,
+          "agents": 0,
+          "runs": 0,
+          "hours": 0.0
+        },
+        "coordination": {
+          "tokens": {
+            "input": 0,
+            "output": 0,
+            "cache_read": 0,
+            "cache_write": 0,
+            "reasoning": 0
+          },
+          "billed_tokens": 0,
+          "cost_usd": 0.0,
+          "unpriced_tokens": 0,
+          "agents": 0,
+          "runs": 0,
+          "hours": 0.0
+        },
+        "unclassified": {
+          "tokens": {
+            "input": 0,
+            "output": 0,
+            "cache_read": 0,
+            "cache_write": 0,
+            "reasoning": 0
+          },
+          "billed_tokens": 0,
+          "cost_usd": 0.0,
+          "unpriced_tokens": 0,
+          "agents": 0,
+          "runs": 0,
+          "hours": 0.0
+        }
+      },
+      "total": {
+        "tokens": {
+          "input": 0,
+          "output": 0,
+          "cache_read": 0,
+          "cache_write": 0,
+          "reasoning": 0
+        },
+        "cost_usd": 0.0
+      },
+      "days": [
+        1761350400,
+        1761436800,
+        1761523200,
+        1761609600,
+        1761696000,
+        1761782400,
+        1761868800,
+        1761955200
+      ],
+      "series": {
+        "planning": {
+          "cost": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "tokens": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "cumulative_cost": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "cumulative_tokens": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "execution": {
+          "cost": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "tokens": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "cumulative_cost": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "cumulative_tokens": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "review": {
+          "cost": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "tokens": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "cumulative_cost": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "cumulative_tokens": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "coordination": {
+          "cost": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "tokens": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "cumulative_cost": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "cumulative_tokens": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "unclassified": {
+          "cost": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "tokens": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "cumulative_cost": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "cumulative_tokens": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        }
+      }
+    },
+    {
+      "ws": "WS6",
+      "name": "Cleanup",
+      "by_phase": {
+        "planning": {
+          "tokens": {
+            "input": 0,
+            "output": 0,
+            "cache_read": 0,
+            "cache_write": 0,
+            "reasoning": 0
+          },
+          "billed_tokens": 0,
+          "cost_usd": 0.0,
+          "unpriced_tokens": 0,
+          "agents": 0,
+          "runs": 0,
+          "hours": 0.0
+        },
+        "execution": {
+          "tokens": {
+            "input": 0,
+            "output": 0,
+            "cache_read": 0,
+            "cache_write": 0,
+            "reasoning": 0
+          },
+          "billed_tokens": 0,
+          "cost_usd": 0.0,
+          "unpriced_tokens": 0,
+          "agents": 0,
+          "runs": 0,
+          "hours": 0.0
+        },
+        "review": {
+          "tokens": {
+            "input": 0,
+            "output": 0,
+            "cache_read": 0,
+            "cache_write": 0,
+            "reasoning": 0
+          },
+          "billed_tokens": 0,
+          "cost_usd": 0.0,
+          "unpriced_tokens": 0,
+          "agents": 0,
+          "runs": 0,
+          "hours": 0.0
+        },
+        "coordination": {
+          "tokens": {
+            "input": 0,
+            "output": 0,
+            "cache_read": 0,
+            "cache_write": 0,
+            "reasoning": 0
+          },
+          "billed_tokens": 0,
+          "cost_usd": 0.0,
+          "unpriced_tokens": 0,
+          "agents": 0,
+          "runs": 0,
+          "hours": 0.0
+        },
+        "unclassified": {
+          "tokens": {
+            "input": 0,
+            "output": 0,
+            "cache_read": 0,
+            "cache_write": 0,
+            "reasoning": 0
+          },
+          "billed_tokens": 0,
+          "cost_usd": 0.0,
+          "unpriced_tokens": 0,
+          "agents": 0,
+          "runs": 0,
+          "hours": 0.0
+        }
+      },
+      "total": {
+        "tokens": {
+          "input": 0,
+          "output": 0,
+          "cache_read": 0,
+          "cache_write": 0,
+          "reasoning": 0
+        },
+        "cost_usd": 0.0
+      },
+      "days": [
+        1761350400,
+        1761436800,
+        1761523200,
+        1761609600,
+        1761696000,
+        1761782400,
+        1761868800,
+        1761955200
+      ],
+      "series": {
+        "planning": {
+          "cost": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "tokens": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "cumulative_cost": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "cumulative_tokens": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "execution": {
+          "cost": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "tokens": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "cumulative_cost": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "cumulative_tokens": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "review": {
+          "cost": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "tokens": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "cumulative_cost": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "cumulative_tokens": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "coordination": {
+          "cost": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "tokens": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "cumulative_cost": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "cumulative_tokens": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "unclassified": {
+          "cost": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "tokens": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "cumulative_cost": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "cumulative_tokens": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        }
+      }
+    },
+    {
+      "ws": "WS7",
+      "name": "Launch",
+      "by_phase": {
+        "planning": {
+          "tokens": {
+            "input": 0,
+            "output": 0,
+            "cache_read": 0,
+            "cache_write": 0,
+            "reasoning": 0
+          },
+          "billed_tokens": 7935,
+          "cost_usd": 0.1905,
+          "unpriced_tokens": 0,
+          "agents": 0,
+          "runs": 1,
+          "hours": 0.0
+        },
+        "execution": {
+          "tokens": {
+            "input": 0,
+            "output": 0,
+            "cache_read": 0,
+            "cache_write": 0,
+            "reasoning": 0
+          },
+          "billed_tokens": 13774,
+          "cost_usd": 0.0,
+          "unpriced_tokens": 0,
+          "agents": 2,
+          "runs": 2,
+          "hours": 0.0
+        },
+        "review": {
+          "tokens": {
+            "input": 0,
+            "output": 0,
+            "cache_read": 0,
+            "cache_write": 0,
+            "reasoning": 0
+          },
+          "billed_tokens": 0,
+          "cost_usd": 0.0,
+          "unpriced_tokens": 0,
+          "agents": 0,
+          "runs": 0,
+          "hours": 0.0
+        },
+        "coordination": {
+          "tokens": {
+            "input": 0,
+            "output": 0,
+            "cache_read": 0,
+            "cache_write": 0,
+            "reasoning": 0
+          },
+          "billed_tokens": 0,
+          "cost_usd": 0.0,
+          "unpriced_tokens": 0,
+          "agents": 0,
+          "runs": 0,
+          "hours": 0.0
+        },
+        "unclassified": {
+          "tokens": {
+            "input": 0,
+            "output": 0,
+            "cache_read": 0,
+            "cache_write": 0,
+            "reasoning": 0
+          },
+          "billed_tokens": 296032,
+          "cost_usd": 0.3029,
+          "unpriced_tokens": 0,
+          "agents": 35,
+          "runs": 39,
+          "hours": 0.0
+        }
+      },
+      "total": {
+        "tokens": {
+          "input": 0,
+          "output": 0,
+          "cache_read": 0,
+          "cache_write": 0,
+          "reasoning": 0
+        },
+        "cost_usd": 0.4934
+      },
+      "days": [
+        1761350400,
+        1761436800,
+        1761523200,
+        1761609600,
+        1761696000,
+        1761782400,
+        1761868800,
+        1761955200
+      ],
+      "series": {
+        "planning": {
+          "cost": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.1905
+          ],
+          "tokens": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            7935
+          ],
+          "cumulative_cost": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.1905
+          ],
+          "cumulative_tokens": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            7935
+          ]
+        },
+        "execution": {
+          "cost": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "tokens": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            13774
+          ],
+          "cumulative_cost": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "cumulative_tokens": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            13774
+          ]
+        },
+        "review": {
+          "cost": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "tokens": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "cumulative_cost": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "cumulative_tokens": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "coordination": {
+          "cost": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "tokens": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "cumulative_cost": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "cumulative_tokens": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "unclassified": {
+          "cost": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.3029
+          ],
+          "tokens": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            296032
+          ],
+          "cumulative_cost": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.3029
+          ],
+          "cumulative_tokens": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            296032
+          ]
+        }
+      }
+    },
+    {
+      "ws": "WS9",
+      "name": "Relay",
+      "by_phase": {
+        "planning": {
+          "tokens": {
+            "input": 0,
+            "output": 0,
+            "cache_read": 0,
+            "cache_write": 0,
+            "reasoning": 0
+          },
+          "billed_tokens": 0,
+          "cost_usd": 0.0,
+          "unpriced_tokens": 0,
+          "agents": 0,
+          "runs": 0,
+          "hours": 0.0
+        },
+        "execution": {
+          "tokens": {
+            "input": 0,
+            "output": 0,
+            "cache_read": 0,
+            "cache_write": 0,
+            "reasoning": 0
+          },
+          "billed_tokens": 0,
+          "cost_usd": 0.0,
+          "unpriced_tokens": 0,
+          "agents": 0,
+          "runs": 0,
+          "hours": 0.0
+        },
+        "review": {
+          "tokens": {
+            "input": 0,
+            "output": 0,
+            "cache_read": 0,
+            "cache_write": 0,
+            "reasoning": 0
+          },
+          "billed_tokens": 0,
+          "cost_usd": 0.0,
+          "unpriced_tokens": 0,
+          "agents": 0,
+          "runs": 0,
+          "hours": 0.0
+        },
+        "coordination": {
+          "tokens": {
+            "input": 0,
+            "output": 0,
+            "cache_read": 0,
+            "cache_write": 0,
+            "reasoning": 0
+          },
+          "billed_tokens": 0,
+          "cost_usd": 0.0,
+          "unpriced_tokens": 0,
+          "agents": 0,
+          "runs": 0,
+          "hours": 0.0
+        },
+        "unclassified": {
+          "tokens": {
+            "input": 0,
+            "output": 0,
+            "cache_read": 0,
+            "cache_write": 0,
+            "reasoning": 0
+          },
+          "billed_tokens": 0,
+          "cost_usd": 0.0,
+          "unpriced_tokens": 0,
+          "agents": 0,
+          "runs": 0,
+          "hours": 0.0
+        }
+      },
+      "total": {
+        "tokens": {
+          "input": 0,
+          "output": 0,
+          "cache_read": 0,
+          "cache_write": 0,
+          "reasoning": 0
+        },
+        "cost_usd": 0.0
+      },
+      "days": [
+        1761350400,
+        1761436800,
+        1761523200,
+        1761609600,
+        1761696000,
+        1761782400,
+        1761868800,
+        1761955200
+      ],
+      "series": {
+        "planning": {
+          "cost": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "tokens": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "cumulative_cost": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "cumulative_tokens": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "execution": {
+          "cost": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "tokens": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "cumulative_cost": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "cumulative_tokens": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "review": {
+          "cost": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "tokens": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "cumulative_cost": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "cumulative_tokens": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "coordination": {
+          "cost": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "tokens": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "cumulative_cost": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "cumulative_tokens": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "unclassified": {
+          "cost": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "tokens": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "cumulative_cost": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "cumulative_tokens": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        }
+      }
+    },
+    {
+      "ws": "WS10",
+      "name": "Ledger",
+      "by_phase": {
+        "planning": {
+          "tokens": {
+            "input": 0,
+            "output": 0,
+            "cache_read": 0,
+            "cache_write": 0,
+            "reasoning": 0
+          },
+          "billed_tokens": 0,
+          "cost_usd": 0.0,
+          "unpriced_tokens": 0,
+          "agents": 0,
+          "runs": 0,
+          "hours": 0.0
+        },
+        "execution": {
+          "tokens": {
+            "input": 0,
+            "output": 0,
+            "cache_read": 0,
+            "cache_write": 0,
+            "reasoning": 0
+          },
+          "billed_tokens": 0,
+          "cost_usd": 0.0,
+          "unpriced_tokens": 0,
+          "agents": 0,
+          "runs": 0,
+          "hours": 0.0
+        },
+        "review": {
+          "tokens": {
+            "input": 0,
+            "output": 0,
+            "cache_read": 0,
+            "cache_write": 0,
+            "reasoning": 0
+          },
+          "billed_tokens": 0,
+          "cost_usd": 0.0,
+          "unpriced_tokens": 0,
+          "agents": 0,
+          "runs": 0,
+          "hours": 0.0
+        },
+        "coordination": {
+          "tokens": {
+            "input": 0,
+            "output": 0,
+            "cache_read": 0,
+            "cache_write": 0,
+            "reasoning": 0
+          },
+          "billed_tokens": 0,
+          "cost_usd": 0.0,
+          "unpriced_tokens": 0,
+          "agents": 0,
+          "runs": 0,
+          "hours": 0.0
+        },
+        "unclassified": {
+          "tokens": {
+            "input": 0,
+            "output": 0,
+            "cache_read": 0,
+            "cache_write": 0,
+            "reasoning": 0
+          },
+          "billed_tokens": 0,
+          "cost_usd": 0.0,
+          "unpriced_tokens": 0,
+          "agents": 0,
+          "runs": 0,
+          "hours": 0.0
+        }
+      },
+      "total": {
+        "tokens": {
+          "input": 0,
+          "output": 0,
+          "cache_read": 0,
+          "cache_write": 0,
+          "reasoning": 0
+        },
+        "cost_usd": 0.0
+      },
+      "days": [
+        1761350400,
+        1761436800,
+        1761523200,
+        1761609600,
+        1761696000,
+        1761782400,
+        1761868800,
+        1761955200
+      ],
+      "series": {
+        "planning": {
+          "cost": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "tokens": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "cumulative_cost": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "cumulative_tokens": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "execution": {
+          "cost": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "tokens": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "cumulative_cost": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "cumulative_tokens": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "review": {
+          "cost": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "tokens": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "cumulative_cost": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "cumulative_tokens": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "coordination": {
+          "cost": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "tokens": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "cumulative_cost": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "cumulative_tokens": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "unclassified": {
+          "cost": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "tokens": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "cumulative_cost": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "cumulative_tokens": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        }
+      }
+    },
+    {
+      "ws": "WS11",
+      "name": "Export",
+      "by_phase": {
+        "planning": {
+          "tokens": {
+            "input": 0,
+            "output": 0,
+            "cache_read": 0,
+            "cache_write": 0,
+            "reasoning": 0
+          },
+          "billed_tokens": 0,
+          "cost_usd": 0.0,
+          "unpriced_tokens": 0,
+          "agents": 0,
+          "runs": 0,
+          "hours": 0.0
+        },
+        "execution": {
+          "tokens": {
+            "input": 0,
+            "output": 0,
+            "cache_read": 0,
+            "cache_write": 0,
+            "reasoning": 0
+          },
+          "billed_tokens": 0,
+          "cost_usd": 0.0,
+          "unpriced_tokens": 0,
+          "agents": 0,
+          "runs": 0,
+          "hours": 0.0
+        },
+        "review": {
+          "tokens": {
+            "input": 0,
+            "output": 0,
+            "cache_read": 0,
+            "cache_write": 0,
+            "reasoning": 0
+          },
+          "billed_tokens": 0,
+          "cost_usd": 0.0,
+          "unpriced_tokens": 0,
+          "agents": 0,
+          "runs": 0,
+          "hours": 0.0
+        },
+        "coordination": {
+          "tokens": {
+            "input": 0,
+            "output": 0,
+            "cache_read": 0,
+            "cache_write": 0,
+            "reasoning": 0
+          },
+          "billed_tokens": 0,
+          "cost_usd": 0.0,
+          "unpriced_tokens": 0,
+          "agents": 0,
+          "runs": 0,
+          "hours": 0.0
+        },
+        "unclassified": {
+          "tokens": {
+            "input": 0,
+            "output": 0,
+            "cache_read": 0,
+            "cache_write": 0,
+            "reasoning": 0
+          },
+          "billed_tokens": 0,
+          "cost_usd": 0.0,
+          "unpriced_tokens": 0,
+          "agents": 0,
+          "runs": 0,
+          "hours": 0.0
+        }
+      },
+      "total": {
+        "tokens": {
+          "input": 0,
+          "output": 0,
+          "cache_read": 0,
+          "cache_write": 0,
+          "reasoning": 0
+        },
+        "cost_usd": 0.0
+      },
+      "days": [
+        1761350400,
+        1761436800,
+        1761523200,
+        1761609600,
+        1761696000,
+        1761782400,
+        1761868800,
+        1761955200
+      ],
+      "series": {
+        "planning": {
+          "cost": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "tokens": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "cumulative_cost": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "cumulative_tokens": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "execution": {
+          "cost": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "tokens": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "cumulative_cost": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "cumulative_tokens": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "review": {
+          "cost": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "tokens": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "cumulative_cost": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "cumulative_tokens": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "coordination": {
+          "cost": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "tokens": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "cumulative_cost": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "cumulative_tokens": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "unclassified": {
+          "cost": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "tokens": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "cumulative_cost": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "cumulative_tokens": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        }
+      }
+    },
+    {
+      "ws": "WS12",
+      "name": "Sunset",
+      "by_phase": {
+        "planning": {
+          "tokens": {
+            "input": 0,
+            "output": 0,
+            "cache_read": 0,
+            "cache_write": 0,
+            "reasoning": 0
+          },
+          "billed_tokens": 0,
+          "cost_usd": 0.0,
+          "unpriced_tokens": 0,
+          "agents": 0,
+          "runs": 0,
+          "hours": 0.0
+        },
+        "execution": {
+          "tokens": {
+            "input": 0,
+            "output": 0,
+            "cache_read": 0,
+            "cache_write": 0,
+            "reasoning": 0
+          },
+          "billed_tokens": 0,
+          "cost_usd": 0.0,
+          "unpriced_tokens": 0,
+          "agents": 0,
+          "runs": 0,
+          "hours": 0.0
+        },
+        "review": {
+          "tokens": {
+            "input": 0,
+            "output": 0,
+            "cache_read": 0,
+            "cache_write": 0,
+            "reasoning": 0
+          },
+          "billed_tokens": 0,
+          "cost_usd": 0.0,
+          "unpriced_tokens": 0,
+          "agents": 0,
+          "runs": 0,
+          "hours": 0.0
+        },
+        "coordination": {
+          "tokens": {
+            "input": 0,
+            "output": 0,
+            "cache_read": 0,
+            "cache_write": 0,
+            "reasoning": 0
+          },
+          "billed_tokens": 0,
+          "cost_usd": 0.0,
+          "unpriced_tokens": 0,
+          "agents": 0,
+          "runs": 0,
+          "hours": 0.0
+        },
+        "unclassified": {
+          "tokens": {
+            "input": 0,
+            "output": 0,
+            "cache_read": 0,
+            "cache_write": 0,
+            "reasoning": 0
+          },
+          "billed_tokens": 0,
+          "cost_usd": 0.0,
+          "unpriced_tokens": 0,
+          "agents": 0,
+          "runs": 0,
+          "hours": 0.0
+        }
+      },
+      "total": {
+        "tokens": {
+          "input": 0,
+          "output": 0,
+          "cache_read": 0,
+          "cache_write": 0,
+          "reasoning": 0
+        },
+        "cost_usd": 0.0
+      },
+      "days": [
+        1761350400,
+        1761436800,
+        1761523200,
+        1761609600,
+        1761696000,
+        1761782400,
+        1761868800,
+        1761955200
+      ],
+      "series": {
+        "planning": {
+          "cost": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "tokens": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "cumulative_cost": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "cumulative_tokens": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "execution": {
+          "cost": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "tokens": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "cumulative_cost": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "cumulative_tokens": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "review": {
+          "cost": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "tokens": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "cumulative_cost": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "cumulative_tokens": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "coordination": {
+          "cost": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "tokens": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "cumulative_cost": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "cumulative_tokens": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "unclassified": {
+          "cost": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "tokens": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "cumulative_cost": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "cumulative_tokens": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        }
+      }
+    }
+  ],
+  "total": {
+    "tokens": {
+      "input": 0,
+      "output": 0,
+      "cache_read": 0,
+      "cache_write": 0,
+      "reasoning": 0
+    },
+    "cost_usd": 2.9193
+  },
+  "unclassified_share": 0.2771,
+  "_note": "Seeded synthetic data for the offline preview. Seed 1. No local sessions are read."
+}

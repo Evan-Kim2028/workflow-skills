@@ -19,6 +19,27 @@ from .util import (BILLED_FIELDS, RANGE_S, WS_STATUSES,
                  _money, _sum_costs, _tool_key, _ws_sort)
 
 
+def _by_phase_row(phase_map: dict, ws: str) -> dict:
+    """Lifetime ``{phase: {tokens, cost_usd}}`` for one row, zero-filled.
+
+    Every phase is always present so the page can paint the stacked bar
+    without branching; workstreams with no spend read all zeros.
+    """
+    try:
+        from dash.phases import PHASES
+    except Exception:
+        PHASES = ("planning", "execution", "review", "coordination", "unclassified")
+    row = (phase_map or {}).get(ws) if isinstance(phase_map, dict) else None
+    out = {}
+    for phase in PHASES:
+        cell = row.get(phase) if isinstance(row, dict) else None
+        out[phase] = {
+            "tokens": int((cell or {}).get("tokens") or 0),
+            "cost_usd": float((cell or {}).get("cost_usd") or 0.0),
+        }
+    return out
+
+
 class QueriesMixin:
         def get_run(self, run_id: str):
             with self._lock:
@@ -357,6 +378,13 @@ class QueriesMixin:
                 roll = self._summarize_locked(
                     shown_all, parents, now, since, until, usage=usage_once
                 )
+            # Lifetime usage split by phase for every row below. Outside
+            # the lock (it takes it itself); a rules edit retags through
+            # workstreams_key, which carries the rules hash.
+            try:
+                phase_map = self.by_phase_all_time()
+            except Exception:
+                phase_map = {}
             boards = {row["ws"]: row for row in counts}
             seen = set()
 
@@ -389,6 +417,7 @@ class QueriesMixin:
                         "cost_usd": row["cost_usd"],
                         "tokens_all_time": row["tokens_all_time"],
                         "cost_usd_all_time": row["cost_usd_all_time"],
+                        "by_phase": _by_phase_row(phase_map, row["ws"]),
                         "last_activity": row["last_activity"],
                         "plan": row["ws"] in plan_ws,
                         "ws_confidence": list(row.get("ws_confidence") or []),
@@ -409,6 +438,7 @@ class QueriesMixin:
                         "cost_usd": 0.0,
                         "tokens_all_time": 0,
                         "cost_usd_all_time": 0.0,
+                        "by_phase": _by_phase_row(phase_map, ws),
                         "last_activity": None,
                         "plan": ws in plan_ws,
                         "ws_confidence": [],
@@ -433,6 +463,7 @@ class QueriesMixin:
                         "cost_usd": row["cost_usd"],
                         "tokens_all_time": row["tokens_all_time"],
                         "cost_usd_all_time": row["cost_usd_all_time"],
+                        "by_phase": _by_phase_row(phase_map, row["ws"]),
                         "last_activity": row["last_activity"],
                         "plan": False,
                         "ws_confidence": list(row.get("ws_confidence") or []),
@@ -488,6 +519,12 @@ class QueriesMixin:
             except TypeError:
                 return None
             try:
+                from dash import phases as phases_mod
+
+                phases_digest = phases_mod.current_hash()
+            except Exception:
+                phases_digest = None
+            try:
                 return (
                     self._data_seq,
                     None if since is None else int(float(since) // 30),
@@ -497,6 +534,7 @@ class QueriesMixin:
                     allowed,
                     meta_digest,
                     stamp,
+                    phases_digest,
                 )
             except (TypeError, ValueError):
                 return None

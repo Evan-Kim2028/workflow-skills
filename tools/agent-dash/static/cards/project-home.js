@@ -16,7 +16,7 @@
   /* Slot mount points for chart cards. A registry entry with scope
      "project" and a slot naming one of these renders inside it; the rest
      render as their own sections after the slots, in registry order. */
-  var PROJECT_SLOTS = ["exec-burnup", "exec-health", "exec-depgraph"];
+  var PROJECT_SLOTS = ["exec-burnup", "exec-phases", "exec-health", "exec-depgraph"];
 
   /* Pure: the closing-report basename the archive payload exposes for one
      id, or null. The payload only ever carries the basename, never a path
@@ -85,7 +85,9 @@
   /* Phases strip from /api/project phases (each already carries its
      rolled-up state). Status is colour plus symbol plus word. */
   function phasesSection(project) {
-    var c = el("div", {class: "card pj-phases", "data-nav": "Phases"});
+    /* Explicit anchor: the sidenav would otherwise slug data-nav
+       "Phases" to exec-phases, which the Usage-by-phase slot owns. */
+    var c = el("div", {class: "card pj-phases", "data-nav": "Phases", id: "exec-project-phases"});
     c.appendChild(secHead("Phases", "From project.json — gate-based, no dates."));
     var phases = (project && project.phases) || [];
     if (!phases.length) {

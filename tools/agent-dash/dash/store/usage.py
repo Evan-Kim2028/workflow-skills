@@ -501,6 +501,83 @@ class UsageMixin:
             for run_id, events in grouped.items():
                 out[run_id] = _fold_events(events, _table=table, _memo=memo)
             return out
+        def phase_events(
+            self,
+            since: float | None = None,
+            until: float | None = None,
+        ) -> tuple[list[dict], list[dict]]:
+            """``(run rows, usage events)`` for the phases fold, one lock pass.
+
+            Events drop the ``grok-context`` estimate tool, exactly like
+            the hourly buckets and the per-run fold, so phase sums match
+            the bucket totals. ``since``/``until`` bound event ``ts``
+            (NULL stamps never match a bound, as in the bucket rebuild);
+            runs always come back whole for classification context.
+            """
+            with self._lock:
+                runs = [dict(row) for row in self._all_runs()]
+                sql = """SELECT run_id, ts, model, input_tokens, output_tokens,
+                                cache_read, cache_write, reasoning,
+                                cache_write_5m, cache_write_1h
+                         FROM usage_events WHERE COALESCE(tool, '') != 'grok-context'"""
+                args: list = []
+                if since is not None:
+                    sql += " AND ts >= ?"
+                    args.append(since)
+                if until is not None:
+                    sql += " AND ts < ?"
+                    args.append(until)
+                events = [dict(row) for row in self._conn.execute(sql, args).fetchall()]
+            return runs, events
+        def by_phase_all_time(self) -> dict:
+            """``{ws: {phase: {tokens, cost_usd}}}`` over rolled-up all-time usage.
+
+            Child-chat usage folds onto its parent run (the same
+            ``_parent_map``/``_rollup_usage`` pair the snapshot uses) and
+            the owner's phase takes it all. Unpriced runs contribute
+            tokens but no cost, like the bucket sums. Classification
+            reads the live rules files (cached by mtime); callers key
+            their caches on :func:`dash.phases.current_hash`.
+            """
+            from dash import phases as phases_mod
+
+            from .runs import _parent_map, _rollup_usage
+            from .util import BILLED_FIELDS, UNASSIGNED, _money
+
+            with self._lock:
+                raw = [dict(row) for row in self._all_runs()]
+                rolled = _rollup_usage(dict(self._usage_by_run()), _parent_map([dict(row) for row in raw]))
+            by_id = {row["run_id"]: row for row in raw if row.get("run_id")}
+            ws_ids = sorted({str(row.get("workstream") or UNASSIGNED) for row in raw if row.get("run_id")})
+            plan_tasks = phases_mod.plan_tasks_for(ws_ids)
+            try:
+                from dash.taskmatch import load_taskmap
+
+                taskmap = load_taskmap()
+            except Exception:
+                taskmap = {}
+            rules, _digest, _version = phases_mod.load_rules(local=phases_mod.local_path())
+            phase_of = phases_mod.classify_runs(raw, taskmap=taskmap, plan_tasks=plan_tasks, rules=rules)
+            out: dict = {}
+            for owner_run, entry in rolled.items():
+                folded, cost, _unpriced = entry
+                row = by_id.get(owner_run)
+                if row is None:
+                    continue
+                ws = str(row.get("workstream") or UNASSIGNED)
+                phase, _rule = phase_of.get(owner_run, ("unclassified", "none"))
+                if phase not in phases_mod.PHASES:
+                    phase = "unclassified"
+                bucket = out.setdefault(
+                    ws, {item: {"tokens": 0, "cost_usd": 0.0} for item in phases_mod.PHASES}
+                )
+                bucket[phase]["tokens"] += sum(int(folded.get(part) or 0) for part in BILLED_FIELDS)
+                if cost is not None:
+                    bucket[phase]["cost_usd"] += cost
+            for ws in out:
+                for phase in out[ws]:
+                    out[ws][phase]["cost_usd"] = _money(out[ws][phase]["cost_usd"])
+            return out
         def _context_by_run(self) -> dict:
             """Latest grok-context input per run. Caller holds the lock.
 

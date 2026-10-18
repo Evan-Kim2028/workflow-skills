@@ -277,6 +277,12 @@ The page pins a run to the task chip when the label holds the task id. That cove
 
 The server serves the resolved file at `/static/taskmap.json`. A run that maps to a workstream but no task is listed above the map as not mapped; that list is the signal to add an entry.
 
+### Labelling for usage by phase
+
+The Project home "Usage by phase" card splits each workstream's tokens and cost into planning, execution, review, coordination, and unclassified, from labels only. Mark a run explicitly and the split is exact: put one token right after the workstream id — `ws9-plan-<slug>` for planning, `ws9-exec-<slug>` for execution, `ws9-review-<slug>` (or `ws9-rev-<slug>`) for review passes, `ws9-coord-<slug>` for coordination. Without a mark the classifier falls back, in order, to review affixes (`r-` leads, `-rev1`/`-fix1` tails), plan task matches (a run naming a plan task id reads as execution), planning/review/doing words (`design`, `audit`, `verify`, `deploy`, `train-`, `ops-`, ...), unmapped lead sessions (planning), and runs older than the first task-mapped run (planning). Whatever matches nothing reads Unclassified: its own grey bucket, never merged. The full rule tables live in `catalog/phases.json` (edit words there, not in code); a `phases.local.json` beside `project.json` runs first and can add or disable rules without touching the shipped file.
+
+Recommendation: adopt the explicit mark going forward. Name every planning lane `ws<N>-plan-<slug>` before it starts, every build lane `ws<N>-exec-<slug>`, and every verify pass `ws<N>-review-<slug>` (or keep the `-rev1`/`-fix1` tails, which already classify as review). Task lanes that name their plan task id need no mark — they already read as execution. Lead and hub sessions need no mark either — unmapped, they already read as planning. With that convention the planning-versus-execution split is exact by construction, the Unclassified bucket holds only genuinely ambiguous lanes, and no rules-file editing is ever needed.
+
 ## 4. Verdict lines
 
 Write the verdict as the first matching line of the report or out file:

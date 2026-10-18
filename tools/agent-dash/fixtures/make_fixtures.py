@@ -5,6 +5,7 @@ import datetime
 import json
 import math
 import random
+import re
 import sys
 from pathlib import Path
 
@@ -430,6 +431,62 @@ def build_runs():
     return runs
 
 
+PHASE_ORDER = ("planning", "execution", "review", "coordination", "unclassified")
+
+
+def _phase_of_label(label, parent):
+    """Mirror of catalog/phases.json for fixture runs (mirrored, never
+    imported: fixtures must not read the machine). Explicit ws marks,
+    review affixes, planning/review/doing words, unmapped lead runs,
+    else unclassified."""
+    text = label or ""
+    hit = re.search(
+        r"ws\d+[-_. ]?(plan(?:ning)?|exec(?:ution)?|review|rev|coord(?:ination)?)\b",
+        text, re.IGNORECASE)
+    if hit:
+        token = hit.group(1).lower()
+        if token.startswith("plan"):
+            return "planning"
+        if token.startswith("exec"):
+            return "execution"
+        if token.startswith("coord"):
+            return "coordination"
+        return "review"
+    if re.search(r"^r-|^rev-|^fix\\b|-rev\\d*$|-fix\\d*$|-rev-", text, re.IGNORECASE):
+        return "review"
+    if re.search(r"ws\d+[-._]\d", text, re.IGNORECASE):
+        return "execution"
+    low = text.lower()
+    planning = ("plan", "design", "spec", "audit", "scope", "research", "adr",
+                "measure", "map", "survey", "architect", "baseline", "overview", "docs")
+    if any(word in low for word in planning):
+        return "planning"
+    review = ("review", "verify", "qa", "adversarial", "approv", "check", "fix")
+    if any(word in low for word in review):
+        return "review"
+    doing = ("build", "ship", "deploy", "train-", "lander", "landing", "cut",
+             "ops", "emit", "rebuild", "launch", "gold")
+    if any(word in low for word in doing):
+        return "execution"
+    if any(word in low for word in ("agentdash", "harness", "sync", "status")):
+        return "coordination"
+    if not parent:
+        return "planning"
+    return "unclassified"
+
+
+def _phase_split(mine):
+    """Lifetime {phase: {tokens, cost_usd}} over fixture runs, endpoint shape."""
+    out = {phase: {"tokens": 0, "cost_usd": 0.0} for phase in PHASE_ORDER}
+    for run in mine:
+        phase = _phase_of_label(run.get("label"), run.get("parent_session_id"))
+        billed = sum(run["tokens"][key] for key in TOKEN_KEYS)
+        out[phase]["tokens"] += billed
+        if run["cost_usd"] is not None:
+            out[phase]["cost_usd"] = round(out[phase]["cost_usd"] + run["cost_usd"], 4)
+    return out
+
+
 def _is_agent(run):
     """Mirror of dash.store._is_counted_agent: lead sessions and shell rows are not agents."""
     source = run.get("source") or ""
@@ -634,6 +691,7 @@ def _workstreams(runs, now, plans, scope="default"):
             "cost_usd": cost,
             "tokens_all_time": tokens,
             "cost_usd_all_time": cost,
+            "by_phase": _phase_split(mine),
             "last_activity": max([run["ended_at"] if run["ended_at"] is not None else run["started_at"] for run in mine] or [0]) or None,
             "plan": code in PLAN_WS,
         })
@@ -1225,6 +1283,93 @@ def _check(runs, conc):
     return peak
 
 
+def _phases(runs, now):
+    """Fixture mirror of GET /api/project/phases: per-workstream billed
+    tokens and cost split by phase (the _phase_split mirror over fixture
+    run labels), plus cumulative-by-day cost and token series per phase
+    on UTC days. Eight days like the burn-up; fixture runs land on the
+    last days and earlier days read zero."""
+    today = int(now // 86400) * 86400
+    days = [today - offset * 86400 for offset in range(7, -1, -1)]
+    names = {code: name for code, name, _counts in BOARD}
+    order = [code for code, _name, _counts in BOARD]
+    workstreams = []
+    for ws in order:
+        mine = [run for run in runs if (run["workstream"] or "unassigned") == ws]
+        split = _phase_split(mine)
+        by_phase = {}
+        for phase in PHASE_ORDER:
+            by_phase[phase] = {
+                "tokens": {key: 0 for key in ("input", "output", "cache_read", "cache_write", "reasoning")},
+                "billed_tokens": split[phase]["tokens"],
+                "cost_usd": split[phase]["cost_usd"],
+                "unpriced_tokens": 0,
+                "agents": sum(1 for run in mine if _phase_of_label(run.get("label"), run.get("parent_session_id")) == phase and _is_agent(run)),
+                "runs": sum(1 for run in mine if _phase_of_label(run.get("label"), run.get("parent_session_id")) == phase),
+                "hours": 0.0,
+            }
+        per_day_cost = {phase: [0.0] * len(days) for phase in PHASE_ORDER}
+        per_day_tokens = {phase: [0] * len(days) for phase in PHASE_ORDER}
+        for run in mine:
+            day = int(run["started_at"] // 86400) * 86400
+            if day not in days:
+                continue
+            pos = days.index(day)
+            phase = _phase_of_label(run.get("label"), run.get("parent_session_id"))
+            billed = sum(run["tokens"][key] for key in TOKEN_KEYS)
+            per_day_tokens[phase][pos] += billed
+            if run["cost_usd"] is not None:
+                per_day_cost[phase][pos] = round(per_day_cost[phase][pos] + run["cost_usd"], 4)
+        series = {}
+        for phase in PHASE_ORDER:
+            running_cost = 0.0
+            running_tokens = 0
+            cum_cost = []
+            cum_tokens = []
+            for pos in range(len(days)):
+                running_cost = round(running_cost + per_day_cost[phase][pos], 4)
+                running_tokens += per_day_tokens[phase][pos]
+                cum_cost.append(running_cost)
+                cum_tokens.append(running_tokens)
+            series[phase] = {
+                "cost": per_day_cost[phase],
+                "tokens": per_day_tokens[phase],
+                "cumulative_cost": cum_cost,
+                "cumulative_tokens": cum_tokens,
+            }
+        total = {key: 0 for key in ("input", "output", "cache_read", "cache_write", "reasoning")}
+        total_cost = round(sum(split[phase]["cost_usd"] for phase in PHASE_ORDER), 4)
+        workstreams.append({
+            "ws": ws,
+            "name": names.get(ws, ""),
+            "by_phase": by_phase,
+            "total": {"tokens": total, "cost_usd": total_cost},
+            "days": days,
+            "series": series,
+        })
+    grand = {"tokens": {key: 0 for key in ("input", "output", "cache_read", "cache_write", "reasoning")}, "cost_usd": 0.0}
+    for item in workstreams:
+        grand["cost_usd"] = round(grand["cost_usd"] + item["total"]["cost_usd"], 4)
+    unc = sum(item["by_phase"]["unclassified"]["billed_tokens"] for item in workstreams)
+    billed = sum(item["by_phase"][phase]["billed_tokens"] for item in workstreams for phase in PHASE_ORDER)
+    return {
+        "scope": "24h",
+        "since": now - 86400,
+        "until": now,
+        "day": "UTC",
+        "rules_hash": "fixture",
+        "rules_version": 1,
+        "caption": ("Split by run label: explicit plan, exec, review and coord marks first, "
+                    "then review affixes, plan task matches, planning, review, doing and "
+                    "coordination words, unmapped lead sessions and early exploration. "
+                    "The rest reads Unclassified."),
+        "workstreams": workstreams,
+        "total": grand,
+        "unclassified_share": round(unc / billed, 4) if billed else 0.0,
+        "_note": NOTE,
+    }
+
+
 def main():
     runs = build_runs()
     plans = _plans()
@@ -1253,6 +1398,7 @@ def main():
         "reconcile.json": _reconcile(runs, NOW),
         "graph.json": _graph(runs, plans),
         "burnup.json": _burnup(runs, NOW, plans),
+        "phases.json": _phases(runs, NOW),
         "health.json": {
             "ok": True,
             "sources": [

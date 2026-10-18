@@ -1,0 +1,75 @@
+{
+  "_comment": "Usage-by-phase classifier rules. Ordered: the first matching rule wins for a run. Edit words here, not in code; the dashboard re-reads this file (plus phases.local.json beside project.json, whose entries run first) and the rules hash in API payloads changes, invalidating caches. Only labels are ever read, never prompts or argv.",
+  "version": 1,
+  "phases": ["planning", "execution", "review", "coordination", "unclassified"],
+  "rules": [
+    {
+      "id": "convention",
+      "type": "convention",
+      "comment": "Explicit convention wins: ws9-plan-xxx, ws9-exec-xxx, ws9-review-xxx, ws9-coord-xxx (dashes, dots, underscores and spaces all count).",
+      "pattern": "ws\\d+[-_. ]?(plan(?:ning)?|exec(?:ution)?|review|rev|coord(?:ination)?)(?![a-z0-9])",
+      "map": {"plan": "planning", "planning": "planning", "exec": "execution", "execution": "execution", "review": "review", "rev": "review", "coord": "coordination", "coordination": "coordination"}
+    },
+    {
+      "id": "tooling",
+      "type": "keyword",
+      "phase": "coordination",
+      "comment": "Dashboard tooling lanes attributed to a workstream (harness, composer) are coordination, even when they carry -fix/-rev suffixes.",
+      "patterns": ["agentdash", "harness", "\\bcomposer\\b"]
+    },
+    {
+      "id": "review-affix",
+      "type": "keyword",
+      "phase": "review",
+      "comment": "Structural review marks: an r- lead (review rounds), a -rev/-fix/-check tail (verify iterations), or a -rev- infix (ws9-rev-s-itemkey). Checked before task mapping so a review pass over a task counts as review.",
+      "patterns": ["^r-", "^rev-", "^fix\\b", "-rev\\d*$", "-fix\\d*$", "-check\\d*$", "-rev-"]
+    },
+    {
+      "id": "task",
+      "type": "task",
+      "phase": "execution",
+      "comment": "A run mapped to a plan task id is execution: exact taskmap keys, /regex/ taskmap keys, the WS1/WS2/WS7 page matchers, plan-id substrings, and the generic ws<N>-<slug> form (ws9-s-tbench names plan task WS9.s-tbench)."
+    },
+    {
+      "id": "planning",
+      "type": "keyword",
+      "phase": "planning",
+      "comment": "Planning words: scoping and design work before and around the build.",
+      "patterns": ["\\bplan(?:ning|\\d+)?\\b", "\\bdesign\\b", "\\bspec\\b", "\\baudit\\b", "\\bscope\\b", "scoping", "research", "\\badr\\b", "\\bmeasure\\b", "measur", "\\bmap\\b", "mapping", "inventor", "\\bassess\\b", "survey", "explor", "\\bspike\\b", "feasib", "architect", "proposal", "blueprint", "\\bbaseline\\b", "\\bdecide\\b", "\\banaly\\b", "trace\\b", "\\bscan\\b", "\\bdetail\\b", "\\bread\\b", "identif", "investigat", "attribut", "profil", "\\boverview\\b", "flat-", "\\bdocs\\b", "\\bapply\\b", "derisk", "\\bcloseout\\b", "probe"]
+    },
+    {
+      "id": "review-words",
+      "type": "keyword",
+      "phase": "review",
+      "comment": "Review words: verification passes over built work. 'diff' (comparing marts) and 'check' read as verification; task-mapped diff lanes already matched above.",
+      "patterns": ["review", "verify", "verif", "\\bqa\\b", "adversarial", "approv", "validat", "\\bdiff\\b", "\\bcheck\\b", "indep-", "\\bclose\\b", "\\bfix\\b", "\\bcert\\b"]
+    },
+    {
+      "id": "execution",
+      "type": "keyword",
+      "phase": "execution",
+      "comment": "Doing words: building, shipping and operating the pipeline.",
+      "patterns": ["implement", "\\bbuild\\b", "\\bship\\b", "deploy", "rollout", "\\bland\\b", "landing", "lander", "migrat", "train-", "\\bcut\\b", "ops-", "\\bemit\\b", "seam", "backfill", "rebuild", "relaunch", "recove", "promot", "kill-", "restor", "rewrite", "incident", "outage", "hotfix", "\\bprod\\b", "wp-", "core-", "op-", "\\bops\\b", "\\bsink\\b", "\\bmart\\b", "\\bgold\\b", "\\bidentity\\b", "\\bcleanup\\b", "\\bperf\\b", "\\bstamp\\b", "\\bscrape\\b", "\\bready\\b", "\\blaunch\\b", "\\brebase\\b"]
+    },
+    {
+      "id": "coordination",
+      "type": "keyword",
+      "phase": "coordination",
+      "comment": "Coordination words: status and sync traffic, not build work.",
+      "patterns": ["\\bsync\\b", "standup", "\\bstatus\\b", "stand-up", "-today\\b", "unblock", "triage"]
+    },
+    {
+      "id": "lead",
+      "type": "lead",
+      "phase": "planning",
+      "comment": "An unmapped lead session (no parent run, a lead source) is the planning surface: the hub thinking, not a task lane. Task-mapped and keyword runs already matched above.",
+      "sources": ["claude-main"]
+    },
+    {
+      "id": "window",
+      "type": "window",
+      "phase": "planning",
+      "comment": "Still unclassified and started before the workstream's first task-mapped run: early exploration belongs to planning."
+    }
+  ]
+}

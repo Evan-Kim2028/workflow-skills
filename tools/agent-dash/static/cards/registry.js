@@ -93,6 +93,17 @@
     }},
     {id: "burnup", order: 50, scope: "project", slot: "exec-burnup", spec: function (state, snap) {
       return burnupSpec(state, snap);
+    }},
+    /* Usage by phase: the project card paints the per-workstream stacked
+       bars (slot exec-phases, right after burn-up); the compact variant
+       sits near the top of each workstream execution tab. */
+    {id: "phases", order: 51, scope: "project", slot: "exec-phases", spec: function (state, snap) {
+      if (typeof phaseUsageSpec !== "function") return null;
+      return phaseUsageSpec(state, snap);
+    }},
+    {id: "phases-ws", order: 8, scope: "workstream", spec: function (state, snap) {
+      if (typeof phaseUsageWsSpec !== "function") return null;
+      return phaseUsageWsSpec(state, snap);
     }}
   ];
 })(window);

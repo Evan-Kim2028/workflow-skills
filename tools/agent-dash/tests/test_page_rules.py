@@ -2054,6 +2054,123 @@ console.log("applySections proof ok");
             "prefers-reduced-motion",
         ):
             self.assertIn(marker, css, f"depgraph.css lost the style rule: {marker}")
+
+    def test_phases_card_contract(self):
+        """The usage-by-phase card keeps its integration points: one file
+        plus one registry line per scope over the phase specs, the
+        exec-phases slot on the Project home right after burn-up, the
+        compact workstream variant near the top of its tab, axes and
+        compact formatters only, tooltips with exact values, legend
+        glyphs with words, loading/empty/failed states, a takeaway
+        naming the main split, and no doctor/health words."""
+        card = (STATIC / "cards" / "phases.js").read_text()
+        for marker in (
+            "phaseUsageSpec",
+            "phaseUsageCard",
+            "phaseUsageWsSpec",
+            "phaseUsageWsCard",
+            "phaseBar",
+            "phaseShares",
+            "cumSum",
+            "Usage by phase",
+            "data-nav",
+            "axes(",
+            "fmtN(",
+            "fmtUsd(",
+            "showTip",
+            "hideTip",
+            "mousemove",
+            "mouseleave",
+            "aria-pressed",
+            "aria-label",
+            "cumulative_cost",
+            "Most of ",
+            "could not be split by label",
+            "request failed",
+            "Loading usage by phase",
+            "No usage recorded",
+            "/api/project/phases",
+        ):
+            self.assertIn(marker, card, f"phases.js lost the card branch: {marker}")
+        for bad in (".toFixed(", "toLocaleString()", '"dagster"', "'dagster'", "Infinity", "doctor", "health", "fetch("):
+            self.assertNotIn(bad, card, f"phases.js must not contain {bad}")
+        reg = (STATIC / "cards" / "registry.js").read_text()
+        self.assertIn('"phases"', reg, "phases is not registered")
+        self.assertIn('"phases-ws"', reg, "the workstream variant is not registered")
+        self.assertIn('scope: "project"', reg, "phases misses the project scope")
+        self.assertIn('scope: "workstream"', reg, "phases misses the workstream scope")
+        self.assertIn('slot: "exec-phases"', reg, "phases misses its slot")
+        home = (STATIC / "cards" / "project-home.js").read_text()
+        self.assertIn("exec-phases", home, "the home lost the exec-phases slot")
+        self.assertLess(
+            home.index('"exec-burnup", "exec-phases"'),
+            home.index('"exec-health"'),
+            "exec-phases no longer mounts right after burn-up",
+        )
+        page = (STATIC / "index.html").read_text()
+        self.assertIn("/static/cards/phases.css", page, "index.html never loads the card CSS")
+        self.assertIn("/static/cards/phases.js", page, "index.html never loads the card script")
+        api_src = (STATIC / "core" / "api.js").read_text()
+        self.assertIn('"/api/project/phases": "phases"', api_src, "FIXMAP never maps /api/project/phases")
+        tokens = (STATIC / "tokens.css").read_text()
+        for var in ("--ph-planning", "--ph-execution", "--ph-review", "--ph-coordination", "--ph-unclassified"):
+            self.assertIn(var, tokens, f"tokens.css lost the phase colour {var}")
+        css = (STATIC / "cards" / "phases.css").read_text()
+        for marker in (
+            ".ph-bar",
+            ".ph-seg",
+            ".phase-legend",
+            ".ph-takeaway",
+            ".mg-phase",
+            "@media (max-width:700px)",
+            "prefers-reduced-motion",
+        ):
+            self.assertIn(marker, css, f"phases.css lost the style rule: {marker}")
+        for bad in ("doctor", "health"):
+            self.assertNotIn(bad, css.lower(), f"phases.css carries a {bad!r} word")
+
+    def test_phases_stacked_bar_math(self):
+        """The stacked-bar shares and cumulative series are pure: shares
+        sum to one, a zero total shares nothing, cumulatives accumulate."""
+        script = (
+            "const fs=require('fs');"
+            "var window={};"
+            "eval(fs.readFileSync(process.argv[1],'utf8'));"
+            "const C=window.AdPage.cards;"
+            "const assert=require('assert');"
+            "const shares=C.phaseShares([{phase:'planning',value:30},{phase:'execution',value:60},{phase:'unclassified',value:10}]);"
+            "assert.deepStrictEqual(shares.map(s=>s.share),[0.3,0.6,0.1]);"
+            "assert.ok(Math.abs(shares.reduce((a,s)=>a+s.share,0)-1)<1e-9);"
+            "const zero=C.phaseShares([{phase:'planning',value:0},{phase:'execution',value:0}]);"
+            "assert.deepStrictEqual(zero.map(s=>s.share),[0,0]);"
+            "assert.deepStrictEqual(C.cumSum([2,0,5]),[2,2,7]);"
+            "assert.deepStrictEqual(C.cumSum(null),[]);"
+            "assert.deepStrictEqual(C.cumSum([]),[]);"
+        )
+        proc = subprocess.run(
+            ["node", "-e", script, str(STATIC / "cards" / "phases.js")],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr or proc.stdout)
+
+    def test_phases_fixture_shape(self):
+        """fixtures/phases.json mirrors the endpoint shape the card reads."""
+        import json as _json
+        doc = _json.loads(((STATIC.parent / "fixtures") / "phases.json").read_text())
+        self.assertEqual(
+            set(doc),
+            {"scope", "since", "until", "day", "rules_hash", "rules_version",
+             "caption", "workstreams", "total", "unclassified_share", "_note"},
+        )
+        self.assertTrue(doc["workstreams"])
+        row = doc["workstreams"][0]
+        self.assertEqual(set(row), {"ws", "name", "by_phase", "total", "days", "series"})
+        self.assertEqual(
+            set(row["by_phase"]), {"planning", "execution", "review", "coordination", "unclassified"}
+        )
+
+
 class ProjectSwitcherTests(unittest.TestCase):
     def test_switcher_wiring(self):
         """The switcher reads /api/projects, needs fixtures + CSS, and is

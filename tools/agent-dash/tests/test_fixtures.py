@@ -52,6 +52,7 @@ FILES = (
     "projects.json",
     "archive.json",
     "burnup.json",
+    "phases.json",
     "reconcile.json",
     "project.json",
     "decisions.json",

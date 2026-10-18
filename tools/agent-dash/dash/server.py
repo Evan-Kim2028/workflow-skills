@@ -233,6 +233,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._project_timeline()
             elif path == "/api/project/burnup":
                 self._burnup(query)
+            elif path == "/api/project/phases":
+                self._project_phases(query)
             elif path == "/api/reconcile":
                 self._reconcile(query)
             elif path == "/api/plan":
@@ -746,6 +748,30 @@ class Handler(BaseHTTPRequestHandler):
         """
         from dash.projectburn import build_burnup
         self._json(200, {"burnup": build_burnup(self.server.store)})
+
+    def _project_phases(self, query):
+        """``GET /api/project/phases?scope=24h|7d|all``: usage by phase.
+
+        Per workstream (and an all-scope total) the billed tokens, cost,
+        agents, runs and hours split into planning, execution, review,
+        coordination and unclassified, plus a cumulative-by-day cost and
+        token series per phase (see ``dash/projectphases.py``). A bad
+        scope is a 400. Identity tag covers scope, data version, rules
+        hash, ignore list, plan and taskmap stamps, so an unchanged
+        dashboard 304s without recomputing.
+        """
+        from dash import projectphases
+        scope = _choice(query, "scope", "24h", set(projectphases.SCOPES))
+        now = time.time()
+        store = self.server.store
+        try:
+            key = projectphases.cache_key(store, scope)
+        except Exception:
+            key = None
+        etag = _identity_etag("project-phases", scope, key) if key is not None else None
+        if self._not_modified(etag):
+            return
+        self._json(200, projectphases.build_phases(store, scope, now), etag=etag)
 
     def _reconcile(self, query):
         from dash.workstates import hidden_ids

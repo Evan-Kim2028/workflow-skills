@@ -64,6 +64,16 @@
   --s8: #f06666;  /* eighth series red ........... ~6.2:1 */
   --other: #6b7484;  /* unassigned / unknown, with label */
 
+  /* ---- Usage-by-phase entity colours (Okabe-Ito-inspired, told apart
+         by hue even under red-green colour blindness; every legend pairs
+         a glyph plus a word with its swatch, never colour alone).
+         Line/fill use on --card: */
+  --ph-planning: #4c96ff;  /* planning blue ......... 6.14:1, glyph ◆ */
+  --ph-execution: #43b34d;  /* execution green ....... 6.73:1, glyph ■ */
+  --ph-review: #f4733a;  /* review orange ......... 6.35:1, glyph ▲ */
+  --ph-coordination: #9b8cf2;  /* coordination violet ... 6.41:1, glyph ● */
+  --ph-unclassified: #6b7484;  /* unclassified grey (same tone as --other, never an entity colour), glyph ○ */
+
   /* ---- Radii ---- */
   --r-sm: 6px;    /* controls, chips, swatches */
   --r-md: 10px;   /* inner wells, tooltips */
@@ -185,6 +195,12 @@
   --s1: #2a78d6; --s2: #eb6834; --s3: #1baf7a; --s4: #eda100;
   --s5: #e87ba4; --s6: #008300; --s7: #6250d6; --s8: #e34948;
   --other: #a8a69e;
+  /* Usage-by-phase entity hues for light (same hues as dark, deeper shades). */
+  --ph-planning: #2a78d6;
+  --ph-execution: #008300;
+  --ph-review: #eb6834;
+  --ph-coordination: #6250d6;
+  --ph-unclassified: #a8a69e;
 
   --shadow-card: 0 1px 2px rgba(13, 20, 32, .06),
                  0 12px 32px -16px rgba(13, 20, 32, .18);

@@ -200,6 +200,12 @@ def _state_key(store, processes, cfg, now: float, doctor_generated) -> tuple | N
         ignore_key = ignore_cache_key(read_ignore_list(cfg))
     except Exception:
         ignore_key = ()
+    try:
+        from dash import phases as phases_mod
+
+        phases_digest = phases_mod.current_hash()
+    except Exception:
+        phases_digest = None
     return (
         path,
         seq,
@@ -209,6 +215,7 @@ def _state_key(store, processes, cfg, now: float, doctor_generated) -> tuple | N
         _actions_flag(cfg),
         doctor_generated,
         ignore_key,
+        phases_digest,
         int(now // STATE_CACHE_TTL_S),
     )
 
@@ -323,6 +330,13 @@ def _build_state_body(store, cfg, now: float, processes, doctor, build) -> dict:
         kind = item.get("kind") if isinstance(item, dict) else None
         return _allowed_actions(ws, st, kind)
 
+    try:
+        from dash.store.queries import _by_phase_row as _phase_row
+
+        phase_map = store.by_phase_all_time()
+    except Exception:
+        _phase_row = None
+        phase_map = {}
     workstreams = []
     for row in roll["rows"]:
         ws = row["ws"]
@@ -342,6 +356,7 @@ def _build_state_body(store, cfg, now: float, processes, doctor, build) -> dict:
                 "prev_24h": dict(row.get("prev_24h") or {"tokens": 0, "cost_usd": 0.0, "finished": 0, "live_agents": 0}),
                 "tokens_all_time": row["tokens_all_time"],
                 "cost_usd_all_time": row["cost_usd_all_time"],
+                "by_phase": _phase_row(phase_map, ws) if _phase_row is not None else {},
                 "last_activity": row["last_activity"],
             }
         )
@@ -367,6 +382,7 @@ def _build_state_body(store, cfg, now: float, processes, doctor, build) -> dict:
                         "prev_24h": {"tokens": 0, "cost_usd": 0.0, "finished": 0, "live_agents": 0},
                         "tokens_all_time": 0,
                         "cost_usd_all_time": 0.0,
+                        "by_phase": _phase_row(phase_map, ws) if _phase_row is not None else {},
                         "last_activity": None,
                     }
                 )
