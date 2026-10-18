@@ -146,7 +146,7 @@ unreachable (docs/integrate.md, For agents).
 
 `GET /` -> `static/index.html`.
 
-`GET /api/snapshot?ws=<WSn|all>&since=&until=&usage_group=<model|workstream|tool>`
+`GET /api/snapshot?ws=<WSn|all>&since=&until=&usage_group=<model|workstream|tool>&recent_limit=&recent_offset=`
 ```json
 {"now": 0, "seq": 0,
  "counts": {"live_agents": 0, "live_by_tool": {"grok": 0, "muse": 0, "glm": 0, "claude": 0}, "prod_jobs": 0, "prod_jobs_finished": 0, "finished_today": 0, "finished_in_range": 0, "finished_by_verdict": {}},
@@ -189,6 +189,7 @@ the all-scope numbers exactly (cost within 1e-6).
 started_at, ended_at, elapsed_s, clock_source, out_bytes, out_growing, err_bytes, pid, rss_kb, tokens: {input, output, cache_read, cache_write}, cost_usd, context_tokens}`.
 `context_tokens` is the latest `grok-context` input for that run, or null. It is a context-window estimate. It is not part of `tokens`, totals, buckets, or cost. `elapsed_s` is null when `started_at` is null.
 `recent` = runs ended inside the window (one fixed 24 h by default, `since`/`until` narrow it), newest first, max 50. Production jobs (source `dagster`) are never in `recent`; they are the `counts.prod_jobs_finished` count. The page shows it as `Finished (24 h)`.
+`?recent_limit=&recent_offset=` pages that window (defaults 50 and 0, the historic shape): `recent` carries rows `[offset, offset+limit)` newest-first, `recent_shown` their count, and `recent_total` the true window total on every page, so later pages are fetchable without growing the default payload. The snapshot cache and the conditional ETag key both carry the page, and a bad value is a 400. The page pager reads `recent_total` (falling back to `counts.finished_in_range`) and fetches beyond the held 50 only.
 
 `GET /api/stream` -> SSE. Event `tick` every 2 s: `{"seq": n, "running": [Run], "sources": [{name, last_poll, lag_s}]}`; the page refetches snapshot when `seq` changes. `sources` mirrors the registry freshness so the page can show staleness per source.
 

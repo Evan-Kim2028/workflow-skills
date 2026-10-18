@@ -439,16 +439,20 @@ class Handler(BaseHTTPRequestHandler):
         since = _float(query, "since")
         until = _float(query, "until")
         usage_group = _one(query, "usage_group")
+        recent_limit = _recent_limit(query)
+        recent_offset = _offset(query, "recent_offset")
         store = self.server.store
         # Identity names the result-cache entry, not the poll clock:
         # store.seq advances on every poll (process samples, counts) while
         # no served byte changes, so tagging it would 200 every tick and
         # the conditional layer could never engage. data_seq is the true
-        # data version: it moves only when a write lands.
+        # data version: it moves only when a write lands. The recent page
+        # rides the identity too, so one page's 304 never serves another's
+        # bytes and page fetches stay small.
         try:
             ident = (
                 "snapshot",
-                store.snapshot_key(ws, since, until, usage_group),
+                store.snapshot_key(ws, since, until, usage_group, recent_limit, recent_offset),
                 store.data_seq,
             )
         except Exception:
@@ -458,7 +462,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         self._json(
             200,
-            store.snapshot_cached(now, ws, since, until, usage_group=usage_group),
+            store.snapshot_cached(now, ws, since, until, usage_group=usage_group, recent_limit=recent_limit, recent_offset=recent_offset),
             etag=etag,
         )
 
@@ -1216,6 +1220,34 @@ def _limit(query: dict) -> int:
     return min(number, 5000)
 
 
+def _recent_limit(query: dict) -> int:
+    """Finished-page size for ``GET /api/snapshot`` (default 50, the historic window)."""
+    value = _one(query, "recent_limit")
+    if value is None:
+        return 50
+    try:
+        number = int(value)
+    except ValueError as exc:
+        raise ValueError("bad limit") from exc
+    if number < 1:
+        raise ValueError("bad limit")
+    return min(number, 5000)
+
+
+def _offset(query: dict, name: str) -> int:
+    """Zero-based page start for a paged list (default 0)."""
+    value = _one(query, name)
+    if value is None:
+        return 0
+    try:
+        number = int(value)
+    except ValueError as exc:
+        raise ValueError(f"bad {name}") from exc
+    if number < 0:
+        raise ValueError(f"bad {name}")
+    return number
+
+
 def _choice(query: dict, name: str, default: str, allowed: set[str]) -> str:
     value = _one(query, name) or default
     if value not in allowed:
@@ -1235,6 +1267,8 @@ def _hint_for(error: str) -> str:
         return "Pass epoch seconds, e.g. /api/reconcile?hours=24."
     if error == "bad limit":
         return "Pass an integer 1-5000, e.g. /api/runs?limit=50."
+    if error == "bad recent_offset":
+        return "Pass an integer 0 or greater, e.g. /api/snapshot?recent_limit=10&recent_offset=20."
     if error in ("bad usage_group", "bad group", "bad bucket"):
         return "Use group=model|workstream|tool and bucket=hour|day."
     if error == "bad state":

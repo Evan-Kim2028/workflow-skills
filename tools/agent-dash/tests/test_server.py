@@ -2614,5 +2614,100 @@ class ConditionalGetTest(unittest.TestCase):
         self.assertTrue(heads.get("etag") and heads.get("etag") != tag)
 
 
+class SnapshotRecentPagingTest(unittest.TestCase):
+    """recent_limit/recent_offset page the finished window: the default page
+    keeps the historic shape, every page carries the true total, pages join
+    up newest-first, bad values are 400s, and each page 304s on its own tag."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.store = Store(Path(self.tmp.name) / "dash.sqlite")
+        self.now = time.time()
+        for i in range(55):
+            self.store.upsert_run(
+                {
+                    "run_id": f"muse:pg:ws21-fin-{i:02d}",
+                    "source": "muse",
+                    "tier": "muse",
+                    "model": "claude-sonnet-4-5",
+                    "label": f"ws21-pg-fin-{i:02d}",
+                    "status": "done",
+                    "started_at": self.now - 3600 - i * 60,
+                    "ended_at": self.now - 60 * (i + 1),
+                }
+            )
+        self.server, self.thread = start(self.store)
+        self.port = self.server.server_address[1]
+
+    def tearDown(self):
+        stop(self.server, self.thread)
+        self.store.close()
+        self.tmp.cleanup()
+
+    def fetch(self, path, tag=None):
+        headers = {} if tag is None else {"If-None-Match": tag}
+        return geth(self.port, path, headers)
+
+    def snap(self, path):
+        status, _, body = self.fetch(path)
+        self.assertEqual(status, 200, path)
+        return json.loads(body)
+
+    def test_default_page_is_the_historic_window(self):
+        payload = self.snap("/api/snapshot?ws=all")
+        self.assertEqual(len(payload["recent"]), 50)
+        self.assertEqual(payload["recent_shown"], 50)
+        self.assertEqual(payload["recent_total"], 55)
+        self.assertEqual(payload["recent_limit"], 50)
+        self.assertEqual(payload["recent_offset"], 0)
+        ended = [run["ended_at"] for run in payload["recent"]]
+        self.assertEqual(ended, sorted(ended, reverse=True), "pages must stay newest-first")
+
+    def test_pages_join_up_with_a_true_total(self):
+        default = self.snap("/api/snapshot?ws=all")
+        want = [run["run_id"] for run in default["recent"]]
+        got = []
+        for offset in (0, 10, 20, 30, 40, 50):
+            page = self.snap(f"/api/snapshot?ws=all&recent_limit=10&recent_offset={offset}")
+            self.assertEqual(page["recent_total"], 55, f"offset {offset} lost the true total")
+            self.assertEqual(page["recent_limit"], 10)
+            self.assertEqual(page["recent_offset"], offset)
+            self.assertEqual(page["recent_shown"], len(page["recent"]))
+            got.extend(run["run_id"] for run in page["recent"])
+        self.assertEqual(got[:50], want, "paged rows drifted off the default window")
+        self.assertEqual(len(got), 55, "the last page never arrived")
+        self.assertEqual(len(set(got)), 55, "pages overlap")
+        self.assertEqual(
+            [run["ended_at"] for run in default["recent"]][:1],
+            [self.snap("/api/snapshot?ws=all&recent_limit=1&recent_offset=0")["recent"][0]["ended_at"]],
+            "offset 0 is not the newest row",
+        )
+
+    def test_bad_page_values_are_400s(self):
+        for path in (
+            "/api/snapshot?ws=all&recent_limit=0",
+            "/api/snapshot?ws=all&recent_limit=nope",
+            "/api/snapshot?ws=all&recent_offset=-1",
+            "/api/snapshot?ws=all&recent_offset=nope",
+        ):
+            status, _, body = self.fetch(path)
+            self.assertEqual(status, 400, path)
+            self.assertIn("hint", json.loads(body), f"{path} names no next step")
+
+    def test_each_page_304s_on_its_own_tag(self):
+        page_a = "/api/snapshot?ws=all&recent_limit=10&recent_offset=0"
+        page_b = "/api/snapshot?ws=all&recent_limit=10&recent_offset=10"
+        _, heads_a, _ = self.fetch(page_a)
+        _, heads_b, _ = self.fetch(page_b)
+        self.assertTrue(heads_a.get("etag"), "page A has no ETag")
+        self.assertTrue(heads_b.get("etag"), "page B has no ETag")
+        self.assertNotEqual(heads_a.get("etag"), heads_b.get("etag"), "one page's tag must not serve another's bytes")
+        status, _, empty = self.fetch(page_a, heads_a.get("etag"))
+        self.assertEqual(status, 304, "an unchanged page should 304")
+        self.assertEqual(empty, b"")
+        status, _, _ = self.fetch(page_b, heads_a.get("etag"))
+        self.assertEqual(status, 200, "a cross-page tag must refetch, not 304")
+
+
 if __name__ == "__main__":
     unittest.main()

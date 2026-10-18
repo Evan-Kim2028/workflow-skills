@@ -114,7 +114,7 @@
     tr.appendChild(el("td", null, [statusEl(r), r.verdict ? verdictEl(r.verdict) : null]));
     return tr;
   }
-  function runsTable(title, sub, runs, empty) {
+  function runsTable(title, sub, runs, empty, pager) {
     var attrs = {class: "card", "data-nav": title};
     if (title === "Running now") attrs.id = "exec-running";
     else if (title === "Finished (24 h)") { attrs.id = "exec-finished"; attrs["data-nav"] = "Finished (24 h)"; }
@@ -141,6 +141,9 @@
     var t = el("table", {"aria-label": title}, [el("thead", null, [el("tr", null, ["Model", "Label", "WS", "Elapsed", "Output", "Tokens", "Status"].map(function (h, i) { return el("th", {scope: "col", class: (i === 3 || i === 4) ? "hidephone" : "", style: i >= 3 && i <= 5 ? "text-align:right" : ""}, [h]); }))]), tb]);
     if (extraTb) t.appendChild(extraTb);
     c.appendChild(el("div", {class: "twrap"}, [t]));
+    /* The finished tables page through the shared pager (Execution overall
+       plus each workstream tab); Running now keeps its own disclosure. */
+    if (pager) c.appendChild(pager);
     if (extraTb) {
       /* Progressive disclosure below the table: a real button that flips
          the extra rows in place. Direct DOM flip, no redraw, so ticks and
@@ -163,7 +166,7 @@
      window holds more finished runs than the table shows, so the hidden gap
      is visible instead of silently omitted. */
   function finishedSub(snap) {
-    var shown = (snap.recent || []).length;
+    var shown = (snap && snap.recent_shown != null) ? snap.recent_shown : (snap.recent || []).length;
     var total = (snap.counts && snap.counts.finished_in_range != null)
       ? snap.counts.finished_in_range
       : (snap.recent_total != null ? snap.recent_total : shown);

@@ -70,7 +70,15 @@
       return ["gantt", keyOf([(state.runs || []).map(runRow), expanded, Math.floor(Date.now() / 60000)]), function () { return gantt(); }, "margin-top:14px"];
     }},
     {id: "finished", order: 90, scope: "both", spec: function (state, snap) {
-      return ["finished", keyOf([(snap.recent || []).map(runRow), snap.recent_shown, snap.recent_total, snap.counts && snap.counts.finished_in_range]), function () { return runsTable("Finished (24 h)", finishedSub(snap), snap.recent || [], state.snapError ? "request failed" : "Nothing finished in the last 24 h."); }, "margin-top:14px"];
+      /* Ten finished agents per page through the shared pager: the key
+         carries page and size (never volatile clocks), so pager clicks and
+         new rows rebuild only this section while the page stays put. */
+      var scope = state.ws;
+      var page = resolveFinished(snap, scope);
+      return ["finished", keyOf([page.rows.map(runRow), page.total, page.page, page.size, scope]), function () {
+        var foot = renderPager("finished", "Finished agents", scope, page.total, redrawSection("finished"));
+        return runsTable("Finished (24 h)", finishedSub(snap), page.rows, state.snapError ? "request failed" : (page.pending ? "Loading this page of finished agents…" : "Nothing finished in the last 24 h."), foot);
+      }, "margin-top:14px"];
     }},
     {id: "decisions", order: 58, scope: "project", spec: function (state, snap) {
       return decisionsSpec(state, snap);

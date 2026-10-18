@@ -31,6 +31,8 @@ class SummarizeMixin:
             since: float | None = None,
             until: float | None = None,
             usage_group: str | None = None,
+            recent_limit: int = 50,
+            recent_offset: int = 0,
         ) -> dict:
             """Scope snapshot with counts, totals, and (optionally) usage buckets.
 
@@ -53,6 +55,10 @@ class SummarizeMixin:
             """
             if usage_group is not None and usage_group not in ("model", "workstream", "tool"):
                 raise ValueError("bad usage_group")
+            if isinstance(recent_limit, bool) or not isinstance(recent_limit, int) or not 1 <= recent_limit <= 5000:
+                raise ValueError("bad limit")
+            if isinstance(recent_offset, bool) or not isinstance(recent_offset, int) or recent_offset < 0:
+                raise ValueError("bad recent_offset")
             with self._lock:
                 shown_all, parents = self._shown_locked(now)
                 live_open, shadows = self._live_open_with_shadows_locked(now, shown_all)
@@ -78,7 +84,10 @@ class SummarizeMixin:
                 ]
                 recent_all.sort(key=lambda run: run["ended_at"] or 0, reverse=True)
                 recent_total = len(recent_all)
-                recent = recent_all[:50]
+                # Paged window over the full newest-first list: the default
+                # page (offset 0, limit 50) is the historic shape, and the
+                # total stays true no matter which page is served.
+                recent = recent_all[recent_offset:recent_offset + recent_limit]
                 usage_once = self._usage_by_run()
                 roll = self._summarize_locked(
                     shown_all, parents, now, since, until, live_open, usage=usage_once
@@ -115,6 +124,8 @@ class SummarizeMixin:
                     "recent": recent,
                     "recent_shown": len(recent),
                     "recent_total": recent_total,
+                    "recent_limit": recent_limit,
+                    "recent_offset": recent_offset,
                     "totals": totals,
                     "prev_24h": dict(scope["prev_24h"]),
                     "totals_all_time": roll["all_time"][key]
@@ -136,18 +147,23 @@ class SummarizeMixin:
             since: float | None = None,
             until: float | None = None,
             usage_group: str | None = None,
+            recent_limit: int = 50,
+            recent_offset: int = 0,
         ) -> tuple:
             """Identity of a snapshot request for caches and ETags.
 
             Window edges quantize to the same 30 s grid ``snapshot_cached``
             uses, so the server's conditional tag names the exact entry the
-            bytes would come from. Pair with ``(data_seq, seq)``.
+            bytes would come from. Pair with ``(data_seq, seq)``. The recent
+            page rides the same key: one page never serves another's bytes.
             """
             return (
                 ws,
                 None if since is None else int(float(since) // 30),
                 None if until is None else int(float(until) // 30),
                 usage_group,
+                recent_limit,
+                recent_offset,
             )
         def snapshot_cached(
             self,
@@ -156,6 +172,8 @@ class SummarizeMixin:
             since: float | None = None,
             until: float | None = None,
             usage_group: str | None = None,
+            recent_limit: int = 50,
+            recent_offset: int = 0,
         ) -> dict:
             """Serve reads from the snapshot cache between writes.
 
@@ -177,7 +195,7 @@ class SummarizeMixin:
             key alone. A 24 h window moving by seconds is invisible in the
             sums. See :meth:`snapshot_key` for the shared key computation.
             """
-            key = self.snapshot_key(ws, since, until, usage_group)
+            key = self.snapshot_key(ws, since, until, usage_group, recent_limit, recent_offset)
             with self._lock:
                 hit = self._snapshot_cache.get(key)
                 if hit is not None and hit[0] == self._data_seq:
@@ -187,7 +205,7 @@ class SummarizeMixin:
                     payload["data_seq"] = self._data_seq
                     payload["last_data_ts"] = self._last_data_ts
                     return payload
-            payload = self.snapshot(now, ws, since, until, usage_group=usage_group)
+            payload = self.snapshot(now, ws, since, until, usage_group=usage_group, recent_limit=recent_limit, recent_offset=recent_offset)
             with self._lock:
                 if len(self._snapshot_cache) > 32:
                     self._snapshot_cache.clear()

@@ -2566,6 +2566,123 @@ class FinalPolishTests(unittest.TestCase):
         )
         self.assertEqual(proc.returncode, 0, proc.stderr or proc.stdout)
 
+    def test_finished_lists_share_one_pager(self):
+        """Every finished agents/runs list pages through the one shared
+        footer (static/core/paginate.js on window.AdPage): the Finished
+        (24 h) tables (Execution overall plus each workstream tab) and
+        Recently done (Project home). Ten rows per page by default, real
+        Prev/Next buttons with list-naming aria-labels, numbered pages with
+        ellipsis, a 10/25/50 size selector persisted per list in
+        sessionStorage behind try/catch, hidden at 10 or fewer rows, and a
+        section key carrying page and size but no volatile values."""
+        pager = STATIC / "core" / "paginate.js"
+        self.assertTrue(pager.is_file(), "the shared pager module is missing")
+        page = (STATIC / "index.html").read_text()
+        self.assertIn(
+            '<script src="/static/core/paginate.js"></script>',
+            page,
+            "index.html never loads the shared pager",
+        )
+        src = pager.read_text()
+        tables = (STATIC / "cards" / "tables.js").read_text()
+        registry = (STATIC / "cards" / "registry.js").read_text()
+        home = (STATIC / "cards" / "project-home.js").read_text()
+        css = (STATIC / "cards" / "tables.css").read_text()
+        self.assertIn("resolveFinished(snap, scope)", registry, "the Finished table bypasses the pager")
+        self.assertIn('renderPager("finished", "Finished agents"', registry)
+        self.assertIn('redrawSection("finished")', registry)
+        self.assertIn("page.page, page.size, scope", registry, "the finished key lost page/size/scope")
+        self.assertIn("function runsTable(title, sub, runs, empty, pager)", tables)
+        self.assertIn('pagerState("recently-done", "project")', home, "Recently done bypasses the pager")
+        self.assertIn('renderPager("recently-done", "Recently done"', home)
+        self.assertIn('redrawSection("project-done")', home)
+        self.assertIn("pgSlice(rows", home)
+        self.assertIn("shelfDoneCount()", home, "the project-done key lost its count")
+        self.assertIn("DEFAULT_PAGE_SIZE = 10", src, "the default page size drifted off 10")
+        self.assertIn("PAGE_SIZES = [10, 25, 50]", src)
+        self.assertIn("agent-dash-pagesize:", src, "the size key lost its prefix")
+        self.assertIn('el("button"', src, "the pager controls are not real <button>s")
+        self.assertIn('"Previous page of " + listName', src, "Prev never names its list")
+        self.assertIn('"Next page of " + listName', src, "Next never names its list")
+        self.assertIn('"Page " + n + " of " + listName', src, "numbered pages never name their list")
+        self.assertIn('"Rows per page for " + listName', src, "the size selector never names its list")
+        self.assertIn('"Showing " + r.from', src, "the footer lost its Showing label")
+        self.assertIn("if (pages <= 1) return null;", src, "the footer no longer hides on one page")
+        self.assertIn('setAttribute("disabled"', src, "ends never disable Prev/Next")
+        bodies = dict(functions(src))
+        for name in ("readPageSize", "writePageSize"):
+            self.assertIn(name, bodies, f"{name} is gone from paginate.js")
+            for marker in ("try", "catch", "sessionStorage"):
+                self.assertIn(marker, bodies[name], f"{name} touches storage unguarded")
+        for marker in (".pg-foot", ".pg-label", ".pg-pages", ".pg-size"):
+            self.assertIn(marker, css, f"the pager stylesheet lost {marker}")
+
+    def test_pager_pure_helpers(self):
+        """Slice, clamp, page windows with ellipsis, label text, totals and
+        size persistence are pure functions on window.AdPage.paginate."""
+        script = (
+            "const fs=require('fs');"
+            "var window={};"
+            "eval(fs.readFileSync(process.argv[1],'utf8'));"
+            "const P=window.AdPage.paginate;"
+            "const assert=require('assert');"
+            "assert.strictEqual(P.DEFAULT_PAGE_SIZE,10);"
+            "assert.deepStrictEqual(P.PAGE_SIZES,[10,25,50]);"
+            "assert.strictEqual(P.pgCount(35,10),4);"
+            "assert.strictEqual(P.pgCount(0,10),1);"
+            "assert.strictEqual(P.pgCount(10,10),1);"
+            "assert.strictEqual(P.pgCount(11,10),2);"
+            "assert.strictEqual(P.pgClamp(9,35,10),4);"
+            "assert.strictEqual(P.pgClamp(0,35,10),1);"
+            "assert.strictEqual(P.pgClamp(2,0,10),1);"
+            "const rows=Array.from({length:35},(_,i)=>({run_id:'r'+i}));"
+            "assert.deepStrictEqual(P.pgSlice(rows,1,10).map(r=>r.run_id),rows.slice(0,10).map(r=>r.run_id));"
+            "assert.strictEqual(P.pgSlice(rows,4,10).length,5);"
+            "assert.strictEqual(P.pgSlice(rows,9,10).length,5);"
+            "assert.deepStrictEqual(P.pgSlice(null,1,10),[]);"
+            "assert.deepStrictEqual(P.pgWindow(1,1),[1]);"
+            "assert.deepStrictEqual(P.pgWindow(2,4),[1,2,3,4]);"
+            "assert.deepStrictEqual(P.pgWindow(1,7),[1,2,3,4,5,6,7]);"
+            "assert.deepStrictEqual(P.pgWindow(1,20),[1,2,'…',20]);"
+            "assert.deepStrictEqual(P.pgWindow(2,20),[1,2,3,'…',20]);"
+            "assert.deepStrictEqual(P.pgWindow(10,20),[1,'…',9,10,11,'…',20]);"
+            "assert.deepStrictEqual(P.pgWindow(19,20),[1,'…',18,19,20]);"
+            "assert.deepStrictEqual(P.pgWindow(20,20),[1,'…',19,20]);"
+            "assert.deepStrictEqual(P.pgWindow(4,8),[1,'…',3,4,5,'…',8]);"
+            "assert.deepStrictEqual(P.pgRange(2,10,35),{from:11,to:20});"
+            "assert.deepStrictEqual(P.pgRange(4,10,35),{from:31,to:35});"
+            "assert.deepStrictEqual(P.pgRange(1,10,0),{from:0,to:0});"
+            "assert.strictEqual(P.pgLabel(1,10,35),'Showing 1-10 of 35');"
+            "assert.strictEqual(P.pgLabel(2,10,35),'Showing 11-20 of 35');"
+            "assert.strictEqual(P.pgLabel(4,10,35),'Showing 31-35 of 35');"
+            "assert.strictEqual(P.finishedTotal({recent:[1,2],recent_total:35,counts:{finished_in_range:35}}),35);"
+            "assert.strictEqual(P.finishedTotal({recent:[1,2],counts:{finished_in_range:7}}),7);"
+            "assert.strictEqual(P.finishedTotal({recent:[1,2]}),2);"
+            "assert.strictEqual(P.pagerState('finished','all').size,10);"
+            "assert.strictEqual(P.pagerState('finished','all').page,1);"
+            "assert.ok(P.pagerKey('finished','WS1')!==P.pagerKey('finished','all'));"
+            "var h={recent:rows,recent_total:35,counts:{finished_in_range:35}};"
+            "var r=P.resolveFinished(h,'all');"
+            "assert.strictEqual(r.rows.length,10);"
+            "assert.strictEqual(r.total,35);"
+            "assert.strictEqual(r.pending,false);"
+            "var store={};window.sessionStorage={getItem:k=>store[k]??null,setItem:(k,v)=>{store[k]=String(v)},removeItem:k=>{delete store[k]}};"
+            "P.writePageSize('finished',25);"
+            "P.resetPager('finished','all');"
+            "assert.strictEqual(P.pagerState('finished','all').size,25);"
+            "P.resetPager('finished','WS9');"
+            "assert.strictEqual(P.pagerState('finished','WS9').size,25);"
+            "window.sessionStorage={getItem(){throw new Error('denied')},setItem(){throw new Error('denied')}};"
+            "P.resetPager('finished','all');"
+            "assert.strictEqual(P.pagerState('finished','all').size,10);"
+            "assert.strictEqual(P.readPageSize('finished'),10);"
+        )
+        proc = subprocess.run(
+            ["node", "-e", script, str(STATIC / "core" / "paginate.js")],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr or proc.stdout)
 
 
 if __name__ == "__main__":

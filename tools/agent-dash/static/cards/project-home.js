@@ -240,6 +240,12 @@
     return c;
   }
 
+  /* Count for the section key (the pager clamps against the same rows the
+     shelf renders, so the key names the count, never a volatile value). */
+  function shelfDoneCount() {
+    return shelfRows("done").length;
+  }
+
   /* Recently done: done but not archived, each with its tasks, tokens,
      cost, a Plan button, a Report link when the archive payload exposes
      the closing-report basename, and a real Archive button (inline
@@ -253,7 +259,11 @@
       c.appendChild(el("p", {class: "pj-note", text: "Nothing waiting to archive."}));
       return c;
     }
-    rows.forEach(function (w) {
+    /* Ten per page through the shared pager, like every finished list. */
+    var ps = pagerState("recently-done", "project");
+    ps.page = pgClamp(ps.page, rows.length, ps.size);
+    var foot = renderPager("recently-done", "Recently done", "project", rows.length, redrawSection("project-done"));
+    pgSlice(rows, ps.page, ps.size).forEach(function (w) {
       var tc = taskCounts(w);
       var row = el("div", {class: "prog-row s-done"});
       var name = el("div", {class: "prog-name"});
@@ -292,6 +302,7 @@
       row.appendChild(acts);
       c.appendChild(row);
     });
+    if (foot) c.appendChild(foot);
     return c;
   }
 
@@ -372,7 +383,7 @@
       if (unplanned) wrap.appendChild(unplanned);
       return wrap;
     }, ""]);
-    specs.push(["project-done", keyOf([(state.wss || []).map(function (w) { return [w.ws, w.progress, w.tokens, w.cost_usd]; }), state.archive]), function () {
+    specs.push(["project-done", keyOf([(state.wss || []).map(function (w) { return [w.ws, w.progress, w.tokens, w.cost_usd]; }), state.archive, pagerPage("recently-done", "project", shelfDoneCount()), pagerState("recently-done", "project").size]), function () {
       return doneRows();
     }, ""]);
     PROJECT_SLOTS.forEach(function (id) { if (id !== "exec-depgraph") specs.push(slotSection(id, bySlot[id] || null)); });
