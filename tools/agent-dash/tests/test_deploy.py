@@ -274,6 +274,39 @@ class RunRefusalTest(CliStateMixin, unittest.TestCase):
         self.assertIn(build_info()["build_id"], out.getvalue())
 
 
+class YesLiveForwardTest(CliStateMixin, unittest.TestCase):
+    """``--yes-live`` reaches the release restarts (state-dir guard)."""
+
+    def setUp(self):
+        self.bind_temp_state()
+
+    def test_restart_release_appends_flag(self):
+        seen = []
+        with mock.patch.object(
+            deploy_lib,
+            "_run",
+            side_effect=lambda argv, cwd, timeout_s, label: seen.append(list(argv)) or (True, ""),
+        ):
+            deploy_lib.restart_release("/tmp/tool-x", True)
+            deploy_lib.restart_release("/tmp/tool-x")
+        self.assertIn("--yes-live", seen[0])
+        self.assertNotIn("--yes-live", seen[1])
+
+    def test_cmd_deploy_forwards_yes_live(self):
+        with mock.patch.object(deploy_lib, "deploy", return_value=(True, "deployed")) as dep:
+            with redirect_stdout(io.StringIO()):
+                self.assertEqual(main(["deploy", "--yes-live"]), 0)
+        self.assertTrue(dep.call_args.kwargs["yes_live"])
+        with mock.patch.object(deploy_lib, "deploy", return_value=(True, "deployed")) as dep:
+            with redirect_stdout(io.StringIO()):
+                self.assertEqual(main(["deploy"]), 0)
+        self.assertFalse(dep.call_args.kwargs["yes_live"])
+
+    def test_cmd_deploy_rejects_unknown_flags(self):
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(main(["deploy", "--bogus"]), 2)
+
+
 class PortOverrideTest(CliStateMixin, unittest.TestCase):
     def setUp(self):
         self.bind_temp_state()
@@ -382,14 +415,16 @@ class DeployLibTest(unittest.TestCase):
         prev = deploy_lib.current_release(self.state)
         restarts = []
         with mock.patch.object(deploy_lib, "run_gate", return_value=(False, "gate boom")), mock.patch.object(
-            deploy_lib, "restart_release", side_effect=lambda tool: restarts.append(Path(tool)) or (True, "")
+            deploy_lib,
+            "restart_release",
+            side_effect=lambda tool, yes_live=False: restarts.append((Path(tool), yes_live)) or (True, ""),
         ):
             ok, message = deploy_lib.deploy(self.state, self.repo, ref=self.sha1, url="http://127.0.0.1:1")
         self.assertFalse(ok)
         self.assertIn("gate failed", message)
         self.assertIn("gate boom", message)
         self.assertEqual(deploy_lib.current_release(self.state), prev)
-        self.assertIn(deploy_lib.tool_dir_of(prev), restarts)
+        self.assertIn(deploy_lib.tool_dir_of(prev), [tool for tool, _flag in restarts])
         first = deploy_lib.releases_dir(self.state) / self.sha1
         self.assertEqual(deploy_lib.previous_release(self.state), first)
 

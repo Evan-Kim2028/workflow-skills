@@ -84,6 +84,26 @@ def build_mismatch(port: int, theirs: str, mine: str) -> str:
     )
 
 
+def foreign_state(action: str, pid: int, port: int, target_hash: str | None, current_hash: str) -> str:
+    target = target_hash or "unknown"
+    return (
+        f"{action} refused: dashboard pid {pid} on 127.0.0.1:{port} "
+        f"belongs to another state dir (state {target}, not {current_hash}). "
+        "A trial that sets AGENT_DASH_STATE_DIR can never signal the live "
+        "dashboard by accident. "
+        f"Run with --yes-live to signal it anyway: python3 agent_dash.py {action} --yes-live"
+    )
+
+
+def live_needs_flag(action: str) -> str:
+    return (
+        f"{action} refused: this would signal the live dashboard from a "
+        "non-interactive session without AGENT_DASH_STATE_DIR set. "
+        "Never run stop or restart in tests without AGENT_DASH_STATE_DIR and AGENT_DASH_PORT. "
+        f"Run with --yes-live to signal it anyway: python3 agent_dash.py {action} --yes-live"
+    )
+
+
 def bundle_not_found(ws: str) -> str:
     return (
         f"bundle not found: {ws}. "

@@ -4,6 +4,7 @@ os.environ["AGENT_DASH_IGNORE_LOCAL"] = "1"
 import http.client
 import io
 import json
+import socket
 import sys
 import tempfile
 import threading
@@ -14,10 +15,22 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from agent_dash import default_cfg, main
+from dash import errors
 from dash.bundles import cmd_ws
 from dash.server import DashServer
 from dash.sources import Registry
 from dash.store import Store
+
+
+def _free_port():
+    """A free port that is never the live 8765."""
+    while True:
+        sock = socket.socket()
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+        sock.close()
+        if port != 8765:
+            return port
 
 
 def _run(argv):
@@ -221,6 +234,44 @@ class PortAndActionArgsTest(unittest.TestCase):
         code, _out, err = _main(["restart", "--verbose"])
         self.assertEqual(code, 2)
         self.assertIn("restart takes no arguments", err)
+
+    def test_stop_restart_accept_yes_live_without_server(self):
+        os.environ["AGENT_DASH_PORT"] = str(_free_port())
+        try:
+            code, out, _err = _main(["stop", "--yes-live"])
+        finally:
+            os.environ.pop("AGENT_DASH_PORT", None)
+        self.assertEqual(code, 1)
+        self.assertIn("stopped", out)
+
+    def test_stop_restart_bogus_flags_still_usage(self):
+        for cmd in ("stop", "restart"):
+            code, _out, err = _main([cmd, "--bogus"])
+            self.assertEqual(code, 2, cmd)
+            self.assertIn(f"{cmd} takes no arguments", err)
+
+    def test_status_bogus_flag_is_usage_error(self):
+        code, _out, err = _main(["status", "--bogus"])
+        self.assertEqual(code, 2)
+        self.assertIn("agent-dash", err)
+
+    def test_foreign_state_message_names_hashes_and_flag(self):
+        msg = errors.foreign_state("stop", 4242, 8822, "aaa111", "bbb222")
+        self.assertIn("stop refused", msg)
+        self.assertIn("4242", msg)
+        self.assertIn("8822", msg)
+        self.assertIn("aaa111", msg)
+        self.assertIn("bbb222", msg)
+        self.assertIn("--yes-live", msg)
+
+    def test_live_needs_flag_message_has_worker_sentence(self):
+        msg = errors.live_needs_flag("restart")
+        self.assertIn("restart refused", msg)
+        self.assertIn(
+            "Never run stop or restart in tests without AGENT_DASH_STATE_DIR and AGENT_DASH_PORT.",
+            msg,
+        )
+        self.assertIn("--yes-live", msg)
 
     def test_port_env_rebinds_url(self):
         os.environ.pop("AGENT_DASH_URL", None)

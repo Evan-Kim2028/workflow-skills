@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -19,7 +20,7 @@ from dash.buildinfo import build_info
 from dash.bundles import cmd_ws
 from dash.locate import expand, ignore_local
 from dash.pricing import reprice as reprice_usage
-from dash.server import DashServer
+from dash.server import DashServer, state_dir_hash
 from dash.sources import Registry
 from dash.sources.generic import FILE_NAME as GENERIC_FILE
 from dash.sources.generic import default_run_id as generic_run_id
@@ -65,12 +66,12 @@ def _base_url() -> str:
 
 USAGE = """agent-dash: local read-only execution dashboard
 
-  python3 agent_dash.py run [--force-replace]
-  python3 agent_dash.py stop
-  python3 agent_dash.py restart
-  python3 agent_dash.py deploy [--ref origin/main] [--worktree DIR]
+  python3 agent_dash.py run [--force-replace] [--yes-live]
+  python3 agent_dash.py stop [--yes-live]
+  python3 agent_dash.py restart [--yes-live]
+  python3 agent_dash.py deploy [--ref origin/main] [--worktree DIR] [--yes-live]
   python3 agent_dash.py rollback
-  python3 agent_dash.py status
+  python3 agent_dash.py status [--json] [--repair]
   python3 agent_dash.py backfill --session <id>
   python3 agent_dash.py reprice
   python3 agent_dash.py reconcile
@@ -297,17 +298,22 @@ def main(argv: list[str] | None = None) -> int:
         # the port unless the caller already points elsewhere.
         os.environ.setdefault("AGENT_DASH_URL", URL)
     cmd = args[0] if args else "run"
-    if cmd in ("run", "stop", "restart"):
-        allowed = ("--force-replace",) if cmd == "run" else ()
+    if cmd == "run":
+        allowed = ("--force-replace", "--yes-live")
+    elif cmd in ("stop", "restart"):
+        allowed = ("--yes-live",)
+    else:
+        allowed = None
+    if allowed is not None:
         guard = _no_extra_args(cmd, args, allowed)
         if guard is not None:
             return guard
     if cmd == "run":
         return cmd_run(args[1:])
     if cmd == "stop":
-        return cmd_stop()
+        return cmd_stop(args[1:])
     if cmd == "restart":
-        return cmd_restart()
+        return cmd_restart(args[1:])
     if cmd == "deploy":
         return cmd_deploy(args[1:])
     if cmd == "rollback":
@@ -347,12 +353,16 @@ def cmd_run(argv: list[str] | None = None) -> int:
     this checkout refuses to start (pass ``--force-replace`` to restart
     it instead). ``--force-replace`` restarts even when our own pidfile
     server is up. The same build answering without a pidfile counts as
-    already running.
+    already running. ``--yes-live`` is accepted and forwarded to the
+    restart, for the state-dir guard.
     """
     force = False
+    yes_live = False
     for flag in argv or []:
         if flag == "--force-replace":
             force = True
+        elif flag == "--yes-live":
+            yes_live = True
         else:
             print(USAGE, end="", file=sys.stderr)
             return 2
@@ -368,6 +378,8 @@ def cmd_run(argv: list[str] | None = None) -> int:
         theirs = str(remote.get("build_id") or "unknown")
         if theirs != mine:
             if force:
+                if yes_live:
+                    return cmd_restart(["--yes-live"])
                 return cmd_restart()
             print(errors.build_mismatch(_port(), theirs, mine), file=sys.stderr)
             return 1
@@ -394,21 +406,49 @@ def cmd_run(argv: list[str] | None = None) -> int:
     os._exit(0)
 
 
-def cmd_stop() -> int:
+def cmd_stop(argv: list[str] | None = None) -> int:
     """Stop the dashboard and return 0 only once it is really down.
 
     SIGTERM first, then up to 10 s of polling for the exit. A process
     that is still alive after that gets SIGKILL, but only when it is still
     the pidfile pid and still the dashboard (a reused pid is never
-    signaled). The pidfile is removed and 0 is returned only once the
-    port is free, so an immediate ``run`` can bind.
+    signaled). The pidfile is removed (only when it still names the
+    stopped pid) and 0 is returned only once the port is free, so an
+    immediate ``run`` can bind.
+
+    The dashboard is found even without a pidfile: when the configured
+    port answers ``/api/health`` and the listener is the dashboard, that
+    pid is stopped. A target from another state dir is refused unless
+    ``--yes-live`` is passed; with the default state dir, a
+    non-interactive session must also pass ``--yes-live``.
     """
+    for flag in argv or []:
+        if flag != "--yes-live":
+            print(USAGE, end="", file=sys.stderr)
+            return 2
+    yes_live = "--yes-live" in (argv or [])
     bind_state()
-    pid = read_pid()
-    if not pid or _gone(pid) or not is_dash(pid):
-        PIDFILE.unlink(missing_ok=True)
+    current_hash = state_dir_hash(STATE_DIR)
+    pid, listed = _claimed_pid()
+    via_pidfile = pid is not None
+    health = None
+    if pid is None:
+        pid, health = _dashboard_on_port()
+    if pid is None:
+        if listed is not None:
+            _release_stale_pidfile(listed)
         print("stopped")
         return 1
+    if health is None:
+        health = _probe_health()
+    health = health if isinstance(health, dict) else {}
+    target_hash = current_hash if via_pidfile else health.get("state_hash")
+    build = str(health.get("build_id") or "unknown")
+    refused = _refuse_to_signal("stop", pid, target_hash, current_hash, yes_live)
+    if refused is not None:
+        print(refused, file=sys.stderr)
+        return 1
+    print(f"stopping dashboard pid {pid} on port {_port()} (state {target_hash or 'unknown'}, build {build})")
     try:
         os.kill(pid, signal.SIGTERM)
     except OSError:
@@ -431,12 +471,46 @@ def cmd_stop() -> int:
     if not _gone(pid) and is_dash(pid):
         print("stop signal sent; process still running")
         return 1
-    PIDFILE.unlink(missing_ok=True)
+    _release_pidfile(pid)
     if not _port_free():
         print("stopped (port still bound)")
         return 1
     print("stopped")
     return 0
+
+
+def _refuse_to_signal(action: str, pid: int, target_hash: str | None, current_hash: str, yes_live: bool) -> str | None:
+    """None when signaling may proceed, else the refusal message.
+
+    A target from another state dir needs ``--yes-live``. With the
+    default state dir (no ``AGENT_DASH_STATE_DIR``), a non-interactive
+    session also needs ``--yes-live``: a trial that sets the env can
+    never signal the live dashboard by accident, and neither can a
+    stray non-interactive call that forgot the env.
+    """
+    if target_hash != current_hash and not yes_live:
+        return errors.foreign_state(action, pid, _port(), target_hash, current_hash)
+    if (
+        target_hash == current_hash
+        and _default_state_dir()
+        and not _stdin_is_tty()
+        and not yes_live
+    ):
+        return errors.live_needs_flag(action)
+    return None
+
+
+def _default_state_dir() -> bool:
+    """True when the state dir is the live default (no env override)."""
+    return os.environ.get("AGENT_DASH_STATE_DIR") is None
+
+
+def _stdin_is_tty() -> bool:
+    """True for an interactive session; False (safe) when unreadable."""
+    try:
+        return sys.stdin.isatty()
+    except (OSError, ValueError):
+        return False
 
 
 def _gone(pid: int) -> bool:
@@ -455,14 +529,22 @@ def _gone(pid: int) -> bool:
 
 
 def _port_free() -> bool:
-    """True when nothing listens on the dashboard address anymore."""
+    """True when nothing holds the dashboard address anymore.
+
+    A refused connection means free. A timeout means something holds
+    the bind without accepting (a full backlog): the next ``run``
+    could not bind it either, so that counts as still bound.
+    """
+    import errno
     import socket
 
     sock = socket.socket()
     sock.settimeout(1)
     try:
         sock.connect((HOST, _port()))
-    except OSError:
+    except OSError as exc:
+        if isinstance(exc, socket.timeout) or getattr(exc, "errno", None) == errno.ETIMEDOUT:
+            return False
         return True
     finally:
         sock.close()
@@ -484,10 +566,12 @@ def cmd_deploy(argv: list[str]) -> int:
 
     Records the previous release first, gates the new one, then
     restarts with a health gate; any failure restarts the previous
-    release and exits 1 with the reason.
+    release and exits 1 with the reason. ``--yes-live`` is forwarded
+    to the release restarts for the state-dir guard.
     """
     ref = deploy_lib.DEFAULT_REF
     worktree = None
+    yes_live = False
     rest = list(argv)
     while rest:
         flag = rest.pop(0)
@@ -495,6 +579,8 @@ def cmd_deploy(argv: list[str]) -> int:
             ref = rest.pop(0)
         elif flag == "--worktree" and rest:
             worktree = rest.pop(0)
+        elif flag == "--yes-live":
+            yes_live = True
         else:
             print(USAGE, end="", file=sys.stderr)
             return 2
@@ -505,6 +591,7 @@ def cmd_deploy(argv: list[str]) -> int:
         ref=ref,
         worktree=worktree,
         url=_base_url(),
+        yes_live=yes_live,
     )
     print(message, file=sys.stdout if ok else sys.stderr)
     return 0 if ok else 1
@@ -521,14 +608,24 @@ def cmd_rollback(argv: list[str]) -> int:
     return 0 if ok else 1
 
 
-def cmd_restart() -> int:
+def cmd_restart(argv: list[str] | None = None) -> int:
     """Stop, then run again, and wait for /api/health to answer.
 
     The restarted server backgrounds itself and writes the pidfile like
-    ``run`` does. Returns 0 only once health answers ``ok``.
+    ``run`` does. Returns 0 only once health answers ``ok``. The old
+    server is found by pidfile or, when that is missing or stale, by
+    the answering port; a foreign state dir is refused like ``stop``.
     """
-    cmd_stop()
-    if live_pid():
+    for flag in argv or []:
+        if flag != "--yes-live":
+            print(USAGE, end="", file=sys.stderr)
+            return 2
+    yes_live = "--yes-live" in (argv or [])
+    if yes_live:
+        cmd_stop(["--yes-live"])
+    else:
+        cmd_stop()
+    if live_pid() is not None or _dashboard_on_port()[0] is not None:
         print("restart failed: old server still running", file=sys.stderr)
         return 1
     if cmd_run() != 0:
@@ -573,14 +670,26 @@ def _health_payload():
 
 
 def cmd_status(argv: list[str] | None = None) -> int:
+    """Report whether the dashboard runs, finding it without a pidfile.
+
+    When the pidfile is missing or stale but the configured port answers
+    ``/api/health`` and the listener is the dashboard, status reports
+    ``running (pidfile missing, pid N)``; ``status --repair`` rewrites
+    the pidfile for that pid, and only in that case.
+    """
     args = list(argv or [])
     json_mode = "--json" in args
-    rest = [item for item in args if item != "--json"]
+    repair = "--repair" in args
+    rest = [item for item in args if item not in ("--json", "--repair")]
     if rest:
         print(USAGE, end="", file=sys.stderr)
         return 2
     bind_state()
     pid = live_pid()
+    if pid is None:
+        found, health = _dashboard_on_port()
+        if found is not None:
+            return _status_pidfile_less(found, health, json_mode, repair)
     if not pid:
         local = build_info()
         if json_mode:
@@ -605,6 +714,43 @@ def cmd_status(argv: list[str] | None = None) -> int:
         errors.emit_json({"running": True, "pid": pid, "url": _base_url(), **info})
     else:
         _print_running(pid, info)
+    return 0
+
+
+def _status_pidfile_less(pid: int, health: dict, json_mode: bool, repair: bool) -> int:
+    """Report a dashboard the pidfile does not name; repair rewrites it."""
+    info = {
+        "build_id": health.get("build_id") or "unknown",
+        "started_at": health.get("started_at"),
+    }
+    repaired = False
+    if repair:
+        _write_pidfile(pid)
+        repaired = read_pid() == pid
+    if json_mode:
+        errors.emit_json(
+            {
+                "running": True,
+                "pid": pid,
+                "pidfile_missing": True,
+                "repaired": repaired,
+                "url": _base_url(),
+                **info,
+            }
+        )
+    else:
+        print(f"running (pidfile missing, pid {pid})")
+        print(f"url {_base_url()}")
+        print(f"build {info['build_id']}")
+        if repair:
+            if repaired:
+                print(f"pidfile rewritten for pid {pid}")
+            else:
+                print(f"pidfile repair failed for pid {pid}", file=sys.stderr)
+        else:
+            print(f"Run: python3 agent_dash.py status --repair (to record pid {pid} in the pidfile)")
+    if repair and not repaired:
+        return 1
     return 0
 
 
@@ -1347,6 +1493,114 @@ def is_dash(pid: int) -> bool:
     return "agent_dash.py" in text
 
 
+def _write_pidfile(pid: int) -> None:
+    """Record ``pid`` atomically (temp file + replace), as ``_serve`` does."""
+    tmp = PIDFILE.with_suffix(".tmp")
+    tmp.write_text(str(pid) + "\n", encoding="utf-8")
+    os.replace(tmp, PIDFILE)
+
+
+def _release_pidfile(pid: int) -> None:
+    """Remove the pidfile, but only when it still names ``pid``.
+
+    A restart writes a new pidfile while the old server shuts down; an
+    unconditional unlink by the exiting server would orphan the new one
+    (status "stopped" forever, stop unable to find it). Never raises.
+    """
+    try:
+        if read_pid() != pid:
+            return
+        PIDFILE.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _claimed_pid() -> tuple[int | None, int | None]:
+    """``(live, listed)``: the pidfile pid when it is a live dashboard,
+    plus the raw pidfile entry (kept so the stale path can owner-check
+    the exact value it verified, not a later replacement)."""
+    listed = read_pid()
+    if listed is not None and pid_exists(listed) and is_dash(listed):
+        return listed, listed
+    return None, listed
+
+
+def _release_stale_pidfile(pid: int) -> None:
+    """Remove a stale pidfile entry its verifier already checked.
+
+    The entry is removed only when the pidfile still names ``pid`` and
+    ``pid`` is not a live dashboard (a racing replacement, possibly
+    under a reused pid number, is always kept). Never raises.
+    """
+    try:
+        if read_pid() != pid:
+            return
+        if pid_exists(pid) and is_dash(pid):
+            return
+        PIDFILE.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _listener_pid(port: int) -> int | None:
+    """The pid listening on 127.0.0.1:``port``, via read-only ``lsof``.
+
+    None when nothing listens, ``lsof`` is missing, or the output does
+    not parse. Never signals anything.
+    """
+    try:
+        proc = subprocess.run(
+            ["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN", "-t"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return None
+    for line in (proc.stdout or "").splitlines():
+        try:
+            return int(line.strip())
+        except ValueError:
+            continue
+    return None
+
+
+def _serves_dashboard(pid: int) -> bool:
+    """True when ``pid``'s command line is the dashboard server process."""
+    try:
+        proc = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "command="],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    text = proc.stdout or ""
+    return "agent_dash.py" in text and re.search(r"\brun\b", text) is not None
+
+
+def _dashboard_on_port() -> tuple[int | None, dict | None]:
+    """``(pid, health)`` for the dashboard answering the configured port.
+
+    The port must answer ``/api/health`` and its listener's command
+    line must be the dashboard server. ``(None, None)`` otherwise; this
+    is how ``status``/``stop``/``restart`` find a dashboard whose
+    pidfile is missing or stale.
+    """
+    health = _probe_health()
+    if not isinstance(health, dict):
+        return None, None
+    pid = _listener_pid(_port())
+    if pid is not None and pid_exists(pid) and _serves_dashboard(pid):
+        return pid, health
+    return None, None
+
+
 def reconcile_if_due(store, now: float, last: float | None, interval: float = RECONCILE_INTERVAL_S) -> float:
     """Call ``reconcile_running`` when ``interval`` seconds have passed.
 
@@ -1429,9 +1683,7 @@ def _serve() -> None:
     server = DashServer(store, registry, HOST, _port(), cfg=cfg)
     server.doctor = DoctorScheduler(store, registry, cfg, build=server.build)
     server.doctor.start()
-    tmp = PIDFILE.with_suffix(".tmp")
-    tmp.write_text(str(os.getpid()) + "\n", encoding="utf-8")
-    os.replace(tmp, PIDFILE)
+    _write_pidfile(os.getpid())
     stop = threading.Event()
 
     def on_stop(signum, frame):
@@ -1469,7 +1721,7 @@ def _serve() -> None:
             pass
         server.server_close()
         store.close()
-        PIDFILE.unlink(missing_ok=True)
+        _release_pidfile(os.getpid())
 
 
 def _wait_for_child() -> int:

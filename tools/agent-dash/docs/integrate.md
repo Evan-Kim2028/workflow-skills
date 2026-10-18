@@ -106,11 +106,27 @@ python3 tools/agent-dash/agent_dash.py check --page
 
 Health prints `"ok": true` with one entry per source, each `last_error: null`. `check` prints one table row per workstream and exits 1 on any mismatch. `check --page` drives the live page in headless Chrome and compares every tile against the API; it skips with a clear message when Chrome is missing. Restart with `python3 tools/agent-dash/agent_dash.py restart`: it stops (SIGTERM, up to 10 s of polling, SIGKILL only for the pidfile pid), starts again in the background, and returns 0 once `/api/health` answers. `stop` alone waits the same way and returns 0 only once the port is free, so an immediate `run` can bind.
 
+### Process control and the state-dir guard
+
+Never run stop or restart in tests without AGENT_DASH_STATE_DIR and AGENT_DASH_PORT.
+
+`stop`, `restart`, and `deploy` never signal a dashboard from another state dir. Every server serves a `state_hash` on `/api/health` (a short hash of its state dir, never the path); before acting, the CLI compares it with the current state dir and refuses unless `--yes-live` is passed, printing which pid on which port it would have signaled:
+
+```bash
+python3 tools/agent-dash/agent_dash.py stop
+# stop refused: dashboard pid 1234 on 127.0.0.1:8765 belongs to another state dir (state abc..., not def...). ...
+python3 tools/agent-dash/agent_dash.py stop --yes-live
+# stopping dashboard pid 1234 on port 8765 (state abc..., build cafef00d)
+# stopped
+```
+
+The default state dir (no `AGENT_DASH_STATE_DIR`) is the live one, so a test or worker that sets it can never take down the live dashboard — and a non-interactive call without it must also pass `--yes-live`. The pidfile is only ever removed by its owner: an exiting server, `stop`, and `restart` erase it only when it still names their own pid, so a restart racing a start can no longer orphan the new server. `status` finds a running dashboard even with a missing or stale pidfile (`running (pidfile missing, pid N)`); `status --repair` records that pid in the pidfile, and only in that case.
+
 State lives in `~/.local/share/agent-dash/` (`dash.sqlite`, pidfile, log, `generic.jsonl`). Point `AGENT_DASH_STATE_DIR` at an empty directory to trial the dashboard without touching live state. Point `AGENT_DASH_WORKSTREAMS` at another directory to trial bundles. Point `AGENT_DASH_PORT` at a free port (such as 8815) to trial beside a live dashboard: every command (`run`, `status`, `stop`, `check`, `state`, `doctor`, and the `ws` live reads) follows it. Set `AGENT_DASH_URL` explicitly only to point the `ws` live reads at yet another dashboard. Config-file `host`/`port` stay ignored.
 
 ### Safe deploy (run the live dashboard from a clean release)
 
-Every server captures a `build_id` (git short sha plus `-dirty` when the checkout had uncommitted changes at start) and its start time, served on `/api/health` (`build_id`, `started_at`) and `/api/state` (`version` block) and printed by `status`. `run` refuses to start when the port already answers with a different build, naming both builds and the fix:
+Every server captures a `build_id` (git short sha plus `-dirty` when the checkout had uncommitted changes at start) and its start time, served on `/api/health` (`build_id`, `started_at`, plus `state_hash`, a short hash of the server's state dir that the state-dir guard compares) and `/api/state` (`version` block) and printed by `status`. `run` refuses to start when the port already answers with a different build, naming both builds and the fix:
 
 ```bash
 python3 tools/agent-dash/agent_dash.py run

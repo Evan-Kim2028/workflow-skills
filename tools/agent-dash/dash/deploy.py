@@ -311,10 +311,17 @@ def wait_settled(url: str, timeout_s: float = SETTLE_TIMEOUT_S) -> tuple[bool, s
     return False, f"sources did not all poll within {timeout_s:.0f} s; running check anyway"
 
 
-def restart_release(release_tool: Path | str) -> tuple[bool, str]:
-    """Restart the dashboard from a release checkout. Returns ``(ok, reason)``."""
+def restart_release(release_tool: Path | str, yes_live: bool = False) -> tuple[bool, str]:
+    """Restart the dashboard from a release checkout. Returns ``(ok, reason)``.
+
+    ``yes_live`` forwards ``--yes-live`` so the restart passes the
+    state-dir guard when the target is the live dashboard.
+    """
     cli = Path(release_tool) / "agent_dash.py"
-    return _run([sys.executable, str(cli), "restart"], Path(release_tool), RESTART_TIMEOUT_S, "restart")
+    argv = [sys.executable, str(cli), "restart"]
+    if yes_live:
+        argv.append("--yes-live")
+    return _run(argv, Path(release_tool), RESTART_TIMEOUT_S, "restart")
 
 
 def run_check(release_tool: Path | str) -> tuple[bool, str]:
@@ -328,12 +335,12 @@ def _release_build(release: Path) -> str | None:
     return short if code == 0 and short else None
 
 
-def _recover(state_dir: Path | str, prev: Path | None, url: str | None, health_timeout_s: float) -> str:
+def _recover(state_dir: Path | str, prev: Path | None, url: str | None, health_timeout_s: float, yes_live: bool = False) -> str:
     """Best-effort restart of the previous release after a failed deploy."""
     if prev is None:
         return "no previous release recorded; the dashboard was left as-is"
     set_current(state_dir, prev)
-    ok, reason = restart_release(tool_dir_of(prev))
+    ok, reason = restart_release(tool_dir_of(prev), yes_live)
     if not ok:
         return f"automatic rollback to {prev} failed to restart: {reason}"
     prev_build = _release_build(prev)
@@ -351,11 +358,13 @@ def deploy(
     worktree: Path | str | None = None,
     url: str | None = None,
     health_timeout_s: float = 25.0,
+    yes_live: bool = False,
 ) -> tuple[bool, str]:
     """Deploy ``ref`` as a clean release and switch the dashboard to it.
 
     Returns ``(ok, message)``; failures name the reason and the
     recovery. The previous release restarts automatically on failure.
+    ``yes_live`` forwards ``--yes-live`` to the release restarts.
     """
     state_dir = Path(state_dir)
     try:
@@ -365,22 +374,22 @@ def deploy(
     prev = current_release(state_dir)
     ok, reason = run_gate(release)
     if not ok:
-        recovered = _recover(state_dir, prev, url, health_timeout_s)
+        recovered = _recover(state_dir, prev, url, health_timeout_s, yes_live)
         return False, f"gate failed for {sha}: {reason}; {recovered}"
     set_current(state_dir, release)
-    ok, reason = restart_release(tool_dir_of(release))
+    ok, reason = restart_release(tool_dir_of(release), yes_live)
     if not ok:
-        recovered = _recover(state_dir, prev, url, health_timeout_s)
+        recovered = _recover(state_dir, prev, url, health_timeout_s, yes_live)
         return False, f"restart of {sha} failed: {reason}; {recovered}"
     if url is not None:
         ok, reason = wait_healthy(url, expected, timeout_s=health_timeout_s)
         if not ok:
-            recovered = _recover(state_dir, prev, url, health_timeout_s)
+            recovered = _recover(state_dir, prev, url, health_timeout_s, yes_live)
             return False, f"new release unhealthy: {reason}; {recovered}"
         wait_settled(url)
     ok, reason = run_check(tool_dir_of(release))
     if not ok:
-        recovered = _recover(state_dir, prev, url, health_timeout_s)
+        recovered = _recover(state_dir, prev, url, health_timeout_s, yes_live)
         return False, f"check failed on {sha}: {reason}; {recovered}"
     if prev is not None and prev != release:
         set_previous(state_dir, prev)
@@ -394,11 +403,12 @@ def rollback(
     state_dir: Path | str,
     url: str | None = None,
     health_timeout_s: float = 25.0,
+    yes_live: bool = False,
 ) -> tuple[bool, str]:
     """Switch the dashboard back to the previous release manually.
 
     Returns ``(ok, message)``; failures swap the links back and name
-    the reason.
+    the reason. ``yes_live`` forwards ``--yes-live`` to the restart.
     """
     state_dir = Path(state_dir)
     cur = current_release(state_dir)
@@ -414,7 +424,7 @@ def rollback(
         set_previous(state_dir, cur)
     set_current(state_dir, prev)
     prev_build = _release_build(prev)
-    ok, reason = restart_release(tool_dir_of(prev))
+    ok, reason = restart_release(tool_dir_of(prev), yes_live)
     if not ok and cur is not None:
         set_current(state_dir, cur)
         set_previous(state_dir, prev)

@@ -252,9 +252,9 @@ variant. Clip playback compresses idle stretches by cumulative event count
 blended with real time; plain replay stays on real time with an optional
 "Compress idle" toggle.
 
-`GET /api/health` -> `{"ok": true, "sources": [{name, last_poll, last_error, lag_s, last_duration_s, interval_s, stalled, state, started_at}], "slow_sources": 0, "dagster": {"skipped_closeouts": 0}, "pricing": {...}, "disconnects_1h": 0, "unpriced_models": [{"model", "rows", "tokens"}], "scratch_roots": [...], "run_dirs": [...], "warnings": [...], "build_id": "abc1234", "started_at": 0}`.
+`GET /api/health` -> `{"ok": true, "sources": [{name, last_poll, last_error, lag_s, last_duration_s, interval_s, stalled, state, started_at}], "slow_sources": 0, "dagster": {"skipped_closeouts": 0}, "pricing": {...}, "disconnects_1h": 0, "unpriced_models": [{"model", "rows", "tokens"}], "scratch_roots": [...], "run_dirs": [...], "warnings": [...], "build_id": "abc1234", "started_at": 0, "state_hash": "0123abcd"}`.
 Each source carries `state`: `starting`, `ok`, `slow`, `stalled`, or `error`, plus `started_at` (the collector process start). A source that never completed a poll — and recorded no failure — is `starting`, not stalled, until max(3x its interval, 90 s) after process start; `ok` stays true while starting, and neither reconcile nor doctor reports a starting source as stalled. Positive failure evidence (an error or a poll-budget overrun) still reports `error` immediately, even on the first poll. A poll that returned but took longer than 15 s is `slow` (counted in `slow_sources`, still ok). `dagster.skipped_closeouts` counts polls that saw a full active page and skipped the close-out pass.
-`build_id` is the git short sha of the tool directory plus `-dirty` when the checkout had uncommitted changes at start (`"unknown"` outside git); `started_at` is the process start epoch. Both are captured once at start, never re-read per request. `run` refuses to start when the port answers with a different `build_id` (unless `--force-replace`); `deploy` health-gates the new release on it.
+`build_id` is the git short sha of the tool directory plus `-dirty` when the checkout had uncommitted changes at start (`"unknown"` outside git); `started_at` is the process start epoch. Both are captured once at start, never re-read per request. `run` refuses to start when the port answers with a different `build_id` (unless `--force-replace`); `deploy` health-gates the new release on it. `state_hash` is the short sha256 of the server's resolved state dir (never the path); `stop`, `restart`, and `deploy` compare it with the current state dir and refuse a foreign one unless `--yes-live` is passed.
 `ok` is false when any model with usage rows in the last 24 h has no
 catalog rate; those models are listed in `unpriced_models` (absent when
 empty) and each is also an `unpriced model: <id> (<tokens> tokens in 24 h)`
@@ -578,6 +578,22 @@ deploy resolves the ref as-is, so fetch first when the latest
 upstream commit is wanted. `run` refuses to start when the port
 answers with a different `build_id` (use `--force-replace` to restart
 it instead); `status` prints the running build.
+
+Process control never orphans or mis-signals. The pidfile is written
+atomically and removed only by its owner: the exiting server, `stop`,
+and `restart` erase it only when it still names their own pid, so an
+old server shutting down after a restart cannot erase the new
+server's entry. `status`, `stop`, and `restart` find the dashboard
+even with a missing or stale pidfile: when the configured port
+answers `/api/health` and the listener's command line is the
+dashboard server, `status` reports `running (pidfile missing, pid N)`
+(`status --repair` records that pid, and only in that case) and
+`stop`/`restart` act on that pid. `stop`, `restart`, and `deploy`
+refuse a target from another state dir (compared by `state_hash`)
+unless `--yes-live` is passed, and always print `stopping dashboard
+pid N on port P (state <hash>, build B)` before acting; with the
+default (live) state dir, a non-interactive session must also pass
+`--yes-live`.
 
 A release checkout is clean, so its own `config.local.json` never
 holds the user's settings. Config search order is

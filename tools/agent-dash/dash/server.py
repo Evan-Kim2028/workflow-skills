@@ -20,6 +20,25 @@ from dash.plans import PlanError
 from dash.pricing import health_block
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def state_dir_hash(state_dir) -> str:
+    """Short opaque id for a state dir: sha256 of the resolved path.
+
+    The hex digest names the state dir without ever exposing the path,
+    so ``stop``/``restart``/``deploy`` can refuse a foreign state dir
+    over ``/api/health``. Empty or unreadable input hashes as itself.
+    """
+    import hashlib
+    import os
+
+    try:
+        text = os.path.realpath(str(state_dir or ""))
+    except (OSError, ValueError):
+        text = str(state_dir or "")
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:12]
+
+
 _MAP_LOG = logging.getLogger("agent_dash.maplayout")
 _MAP_WARNED: set = set()
 INDEX_PATH = ROOT / "static" / "index.html"
@@ -188,6 +207,7 @@ class Handler(BaseHTTPRequestHandler):
                 build = getattr(self.server, "build", None) or {}
                 body["build_id"] = build.get("build_id", "unknown")
                 body["started_at"] = build.get("started_at")
+                body["state_hash"] = state_dir_hash((self.server.cfg or {}).get("state_dir"))
                 self._json(200, body)
             elif path == "/api/doctor":
                 self._doctor(query)
