@@ -16,6 +16,7 @@ stored ``--model`` flag value) ever leaves a process listing.
 
 from __future__ import annotations
 
+import calendar
 import glob
 import hashlib
 import json
@@ -108,6 +109,9 @@ def doctor_cfg(cfg: dict | None) -> dict:
         "fix_rounds_cap": 2,
         "recent_hours": 24.0,
         "ghost_share": 0.2,
+        "archive_nag_days": 7.0,
+        "active_idle_days": 3.0,
+        "phase_slip_days": 7.0,
         "model_policy": {
             "muse_reasoning_effort": policy.get("muse_reasoning_effort", "xhigh"),
             "grok_require_bracketed_500k": policy.get("grok_require_bracketed_500k", True),
@@ -116,6 +120,7 @@ def doctor_cfg(cfg: dict | None) -> dict:
     for key in (
         "interval_s", "stuck_hours", "approval_days", "train_hours",
         "idle_ready_minutes", "long_tail_minutes", "recent_hours",
+        "archive_nag_days", "active_idle_days", "phase_slip_days",
     ):
         try:
             value = float(raw.get(key, out[key]))
@@ -258,6 +263,7 @@ def collect_problems(
     _collect_reconcile(ctx)
     _collect_bundles(ctx)
     _collect_orchestration(ctx)
+    _collect_lifecycle(ctx)
     _collect_fleet(ctx)
     _collect_page(ctx)
     _collect_config(ctx)
@@ -2258,6 +2264,429 @@ def _orch_deferred_orphan(ctx, row: dict, states: dict, recent_s: float) -> int:
         key=tid,
     )
     return 1
+
+
+LIFECYCLE_STATES = ("planned", "active", "paused", "done", "archived", "dropped")
+LIFECYCLE_DONE_STATES = ("done", "archived")
+_LIFECYCLE_META_KEYS = (
+    "state", "state_changed_at", "archived_at", "summary", "depends_on", "milestone",
+)
+_LIFECYCLE_CODES = (
+    "done-not-archived", "active-idle", "planned-blocked", "planned-ready", "phase-slipping",
+)
+
+
+def _lifecycle_meta(ws: str) -> dict:
+    """Lifecycle fields from ``bundle.json``. Absent state reads as active."""
+    from dash.bundles import bundle_dir
+
+    meta = {
+        "state": "active",
+        "state_changed_at": None,
+        "archived_at": None,
+        "depends_on": [],
+        "milestone": None,
+        "has_lifecycle": False,
+    }
+    try:
+        path = bundle_dir(ws)
+    except Exception:
+        return meta
+    if path is None:
+        return meta
+    try:
+        raw = json.loads((path / "bundle.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return meta
+    if not isinstance(raw, dict):
+        return meta
+    meta["has_lifecycle"] = any(key in raw for key in _LIFECYCLE_META_KEYS)
+    state = raw.get("state")
+    if isinstance(state, str) and state in LIFECYCLE_STATES:
+        meta["state"] = state
+    for key in ("state_changed_at", "archived_at"):
+        try:
+            stamp = float(raw.get(key))
+        except (TypeError, ValueError):
+            continue
+        if stamp > 0:
+            meta[key] = stamp
+    deps = raw.get("depends_on")
+    if isinstance(deps, list):
+        meta["depends_on"] = [str(item) for item in deps if isinstance(item, str) and item]
+    milestone = raw.get("milestone")
+    if isinstance(milestone, str) and milestone:
+        meta["milestone"] = milestone
+    return meta
+
+
+def _lifecycle_history(ws: str) -> tuple[float | None, float | None]:
+    """(last move, last done move) over raw ``history.jsonl`` rows. Never raises.
+
+    Reads the file directly instead of ``replay.read_history`` because the
+    lifecycle ``{kind: state}`` lines carry no task id and that reader drops
+    them; the nag only needs the newest stamp of each kind.
+    """
+    from dash.bundles import bundle_dir
+
+    try:
+        path = bundle_dir(ws)
+    except Exception:
+        return None, None
+    if path is None:
+        return None, None
+    try:
+        text = (path / "history.jsonl").read_text(encoding="utf-8")
+    except OSError:
+        return None, None
+    last_any: float | None = None
+    last_done: float | None = None
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(row, dict):
+            continue
+        try:
+            stamp = float(row.get("ts"))
+        except (TypeError, ValueError):
+            continue
+        if stamp <= 0:
+            continue
+        if last_any is None or stamp > last_any:
+            last_any = stamp
+        if row.get("to") == "done" and (last_done is None or stamp > last_done):
+            last_done = stamp
+    return last_any, last_done
+
+
+def _lifecycle_plan(ws: str) -> tuple[dict | None, float | None]:
+    """(tasks-or-None, plan mtime-or-None) for one bundle. Never raises."""
+    try:
+        tasks, _plan_ids, mtime, _history, error = _bundle_task_map(ws)
+    except Exception:
+        return None, None
+    if error or tasks is None:
+        return None, mtime
+    return tasks, mtime
+
+
+def _lifecycle_project_exists() -> bool:
+    """Whether ``project.json`` sits beside the bundles. Never raises."""
+    from dash.bundles import workstreams_root
+
+    try:
+        root = workstreams_root()
+    except Exception:
+        return False
+    try:
+        raw = json.loads((root / "project.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return isinstance(raw, dict)
+
+
+def _lifecycle_phases() -> list | None:
+    """Phase entries from ``project.json``, or None. Never raises."""
+    from dash.bundles import workstreams_root
+
+    try:
+        root = workstreams_root()
+    except Exception:
+        return None
+    try:
+        raw = json.loads((root / "project.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    phases = raw.get("phases") if isinstance(raw, dict) else None
+    if not isinstance(phases, list):
+        return None
+    return [
+        entry for entry in phases
+        if isinstance(entry, dict) and isinstance(entry.get("name"), str) and entry["name"]
+    ]
+
+
+def _lifecycle_target(entry: dict) -> tuple[float | None, str]:
+    """(epoch-or-None, raw text) for a phase target date. Never raises."""
+    for key in ("target", "target_date", "due", "deadline"):
+        value = entry.get(key)
+        if value is None or isinstance(value, bool):
+            continue
+        if isinstance(value, (int, float)):
+            return (float(value), str(value)) if float(value) > 0 else (None, "")
+        if not isinstance(value, str) or not value.strip():
+            continue
+        text = value.strip()
+        try:
+            stamp = float(text)
+            return (stamp, text) if stamp > 0 else (None, "")
+        except ValueError:
+            pass
+        try:
+            parsed = time.strptime(text[:10], "%Y-%m-%d")
+            return calendar.timegm(parsed), text
+        except (ValueError, OverflowError):
+            continue
+    return None, ""
+
+
+def _lifecycle_done_nag(ctx, ws: str, meta: dict) -> int:
+    """A done (or 100% active) workstream waiting past the archive nag (warn)."""
+    tasks, mtime = _lifecycle_plan(ws)
+    if meta["state"] == "active":
+        if not tasks:
+            return 0
+        total = sum(1 for info in tasks.values() if info.get("status") != "deferred")
+        done = sum(1 for info in tasks.values() if info.get("status") == "done")
+        if total <= 0 or done != total:
+            return 0
+    hist_any, _hist_done = _lifecycle_history(ws)
+    base = meta.get("state_changed_at") or hist_any or mtime
+    if base is None:
+        return 0
+    nag_s = float(ctx.dcfg["archive_nag_days"]) * 86400
+    if ctx.now - base <= nag_s:
+        return 0
+    days = (ctx.now - base) / 86400
+    title = _ws_title(ctx, ws)
+    if meta["state"] == "done":
+        heading = f"{title} ({ws}) is done but not archived"
+    else:
+        heading = f"{title} ({ws}) is 100% complete but not archived"
+    _add(
+        ctx, "done-not-archived", "warn", f"ws:{ws}", ws,
+        heading,
+        f"{title} ({ws}) has been done for {days:.1f} days "
+        f"(nag limit {ctx.dcfg['archive_nag_days']:g} days). Write docs/closing-report.md "
+        "in the bundle, then archive it",
+        f"python3 agent_dash.py ws archive {ws}",
+    )
+    return 1
+
+
+def _lifecycle_idle(ctx, ws: str, meta: dict, runs: list) -> int:
+    """An active workstream with open tasks but no recent activity (warn)."""
+    tasks, mtime = _lifecycle_plan(ws)
+    if not tasks:
+        return 0
+    total = sum(1 for info in tasks.values() if info.get("status") != "deferred")
+    done = sum(1 for info in tasks.values() if info.get("status") == "done")
+    if total <= 0 or total - done <= 0:
+        return 0
+    last: float | None = None
+    for run in runs:
+        if not isinstance(run, dict) or run.get("workstream") != ws:
+            continue
+        for key in ("started_at", "ended_at"):
+            try:
+                stamp = float(run.get(key))
+            except (TypeError, ValueError):
+                continue
+            if stamp > 0 and (last is None or stamp > last):
+                last = stamp
+    hist_any, _hist_done = _lifecycle_history(ws)
+    if hist_any is not None and (last is None or hist_any > last):
+        last = hist_any
+    if last is None:
+        last = mtime
+    if last is None:
+        return 0
+    idle_s = float(ctx.dcfg["active_idle_days"]) * 86400
+    if ctx.now - last <= idle_s:
+        return 0
+    days = (ctx.now - last) / 86400
+    title = _ws_title(ctx, ws)
+    _add(
+        ctx, "active-idle", "warn", f"ws:{ws}", ws,
+        f"{title} ({ws}) is active but idle",
+        f"{title} ({ws}) has no runs or history moves for {days:.1f} days "
+        f"(limit {ctx.dcfg['active_idle_days']:g} days) with {total - done} of {total} "
+        "tasks still open. Start work, or pause it with a note",
+        f"python3 agent_dash.py ws next {ws}",
+    )
+    return 1
+
+
+def _lifecycle_planned(ctx, ws: str, meta: dict, metas: dict) -> tuple[int, int]:
+    """A planned workstream: blocked (info) or ready to start (info)."""
+    unmet = []
+    for dep in meta.get("depends_on") or []:
+        dep_meta = metas.get(dep)
+        dep_state = dep_meta["state"] if dep_meta is not None else None
+        if dep_state not in LIFECYCLE_DONE_STATES:
+            unmet.append(dep)
+    stale: list = []
+    body: dict | None = None
+    try:
+        from dash import orchestrate
+        from dash.bundles import resolve_plan
+
+        _source, body = resolve_plan(ws)
+        gates = orchestrate.stale_gates(body, ctx.now) if isinstance(body, dict) else []
+        stale = [gate for gate in gates if isinstance(gate, dict) and gate.get("stale")]
+    except Exception:
+        stale = []
+    title = _ws_title(ctx, ws)
+    if unmet or stale:
+        waits = []
+        for dep in unmet:
+            if dep in metas:
+                waits.append(f"{_ws_title(ctx, dep)} ({dep})")
+            else:
+                waits.append(f"unknown workstream ({dep})")
+        try:
+            from dash import orchestrate as _orch
+
+            _by_id, _deps, _order = _orch.plan_tasks(body if isinstance(body, dict) else {})
+        except Exception:
+            _by_id = {}
+        for gate in stale:
+            gid = str(gate.get("id") or "")
+            signal = gate.get("signal") or "an unnamed signal"
+            waits.append(f"{_item_label(_by_id.get(gid, {}).get('title'), gid)} waits on {signal}")
+        _add(
+            ctx, "planned-blocked", "info", f"ws:{ws}", ws,
+            f"{title} ({ws}) is planned and waiting",
+            f"{title} ({ws}) is planned and waits on: "
+            + "; ".join(waits)
+            + ". Check gate freshness, then activate it when ready",
+            f"python3 agent_dash.py ws gates {ws}",
+        )
+        return 1, 0
+    deps = meta.get("depends_on") or []
+    if deps:
+        dep_text = f"all {len(deps)} {_plural(len(deps), 'dependency', 'dependencies')} done or archived"
+    else:
+        dep_text = "no dependencies"
+    _add(
+        ctx, "planned-ready", "info", f"ws:{ws}", ws,
+        f"{title} ({ws}) is planned and ready to start",
+        f"{title} ({ws}) is ready to start: {dep_text}, no stale gates",
+        f"python3 agent_dash.py ws state {ws} active",
+    )
+    return 0, 1
+
+
+def _lifecycle_phase_members(entry: dict, metas: dict) -> list[str]:
+    """Member workstream ids for a phase: explicit list, else milestone match."""
+    raw = entry.get("workstreams")
+    if isinstance(raw, list) and raw:
+        return sorted({str(item) for item in raw if isinstance(item, str) and item in metas})
+    name = entry.get("name")
+    return sorted(ws for ws, meta in metas.items() if meta.get("milestone") == name)
+
+
+def _lifecycle_done_moment(ctx, ws: str, metas: dict) -> float | None:
+    """When a workstream finished: state move, else history, else plan mtime."""
+    hist_any, _hist_done = _lifecycle_history(ws)
+    _tasks, mtime = _lifecycle_plan(ws)
+    return metas[ws].get("state_changed_at") or hist_any or mtime
+
+
+def _lifecycle_phases_check(ctx, metas: dict, phases: list | None) -> int:
+    """Finished phases whose successor never started, and passed targets (info)."""
+    if phases is None:
+        return 0
+    count = 0
+    slip_s = float(ctx.dcfg["phase_slip_days"]) * 86400
+    for index, entry in enumerate(phases):
+        name = entry.get("name")
+        members = _lifecycle_phase_members(entry, metas)
+        target, raw_target = _lifecycle_target(entry)
+        if target is not None and members and ctx.now > target:
+            unfinished = [ws for ws in members if metas[ws]["state"] not in LIFECYCLE_DONE_STATES]
+            if unfinished:
+                shown = ", ".join(f"{_ws_title(ctx, ws)} ({ws})" for ws in unfinished[:3])
+                if len(unfinished) > 3:
+                    shown += f" (+{len(unfinished) - 3} more)"
+                _add(
+                    ctx, "phase-slipping", "info", "global", None,
+                    f"Phase {name} passed its target with work still open",
+                    f"phase {name} passed its target ({raw_target}) with unfinished "
+                    f"workstreams: {shown}. Review the plan",
+                    "python3 agent_dash.py project show",
+                    key=f"target:{name}",
+                )
+                count += 1
+        if index + 1 < len(phases) and members and all(
+            metas[ws]["state"] in LIFECYCLE_DONE_STATES for ws in members
+        ):
+            nxt = phases[index + 1]
+            nxt_name = nxt.get("name")
+            nxt_members = _lifecycle_phase_members(nxt, metas)
+            if not nxt_members:
+                continue
+            if any(metas[ws]["state"] != "planned" for ws in nxt_members):
+                continue
+            moments = [_lifecycle_done_moment(ctx, ws, metas) for ws in members]
+            if any(moment is None for moment in moments):
+                continue
+            finished = max(moment for moment in moments if moment is not None)
+            if ctx.now - finished <= slip_s:
+                continue
+            days = (ctx.now - finished) / 86400
+            _add(
+                ctx, "phase-slipping", "info", "global", None,
+                f"Phase {name} is done but {nxt_name} has not started",
+                f"phase {name} finished {days:.1f} days ago "
+                f"(limit {ctx.dcfg['phase_slip_days']:g} days) and phase {nxt_name} "
+                f"has not started ({len(nxt_members)} planned "
+                f"{_plural(len(nxt_members), 'workstream', 'workstreams')}). Review the plan",
+                "python3 agent_dash.py project show",
+                key=f"after:{name}",
+            )
+            count += 1
+    return count
+
+
+def _collect_lifecycle(ctx) -> None:
+    """Nags for workstream lifecycle states and slipping project phases.
+
+    Silent for projects without lifecycle data (no lifecycle keys in any
+    ``bundle.json`` and no ``project.json``). Reuses the already-loaded
+    bundles and the cached run rows; each bundle costs one small metadata
+    read, plus plan and history reads only for bundles in a state the
+    checks inspect. Absent ``state`` reads as ``active``.
+    """
+    metas: dict[str, dict] = {}
+    for item in ctx._bundles or []:
+        ws = item.get("id") if isinstance(item, dict) else None
+        if isinstance(ws, str) and ws:
+            metas[ws] = _lifecycle_meta(ws)
+    project = _lifecycle_project_exists()
+    phases = _lifecycle_phases() if project else None
+    if not any(meta.get("has_lifecycle") for meta in metas.values()) and not project:
+        for name in _LIFECYCLE_CODES:
+            _check(ctx, name, True, "no lifecycle data")
+        return
+    runs = _runs_ro(ctx)
+    counts = {"done-not-archived": 0, "active-idle": 0, "planned-blocked": 0, "planned-ready": 0}
+    for ws in sorted(metas):
+        state = metas[ws]["state"]
+        if state in ("done", "active"):
+            counts["done-not-archived"] += _lifecycle_done_nag(ctx, ws, metas[ws])
+        if state == "active":
+            counts["active-idle"] += _lifecycle_idle(ctx, ws, metas[ws], runs)
+        if state == "planned":
+            blocked, ready = _lifecycle_planned(ctx, ws, metas[ws], metas)
+            counts["planned-blocked"] += blocked
+            counts["planned-ready"] += ready
+    for code in ("done-not-archived", "active-idle", "planned-blocked", "planned-ready"):
+        total = counts[code]
+        _check(
+            ctx, code, total == 0,
+            f"{total} open" if total else "clean",
+        )
+    slipping = _lifecycle_phases_check(ctx, metas, phases)
+    _check(
+        ctx, "phase-slipping", slipping == 0,
+        f"{slipping} open" if slipping else ("clean" if phases else "no project phases"),
+    )
 
 
 def model_policy_reason(kind: str | None, model: str | None, reasoning_effort: str | None, policy: dict | None) -> str | None:

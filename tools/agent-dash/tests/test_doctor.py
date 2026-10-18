@@ -618,6 +618,441 @@ class WorkstreamHygieneTest(unittest.TestCase):
         self.assertEqual(found[0]["id"], "train-stuck:ws:WS9:T1")
 
 
+class LifecycleDoctorTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.wsroot = self.root / "ws"
+        self.wsroot.mkdir()
+        self.state = self.root / "state"
+        self.state.mkdir()
+        self.old_ws = os.environ.get("AGENT_DASH_WORKSTREAMS")
+        os.environ["AGENT_DASH_WORKSTREAMS"] = str(self.wsroot)
+        self.store = Store(self.state / "dash.sqlite")
+        self.now = 1_700_000_000.0
+        self.codes = (
+            "done-not-archived", "active-idle", "planned-blocked",
+            "planned-ready", "phase-slipping",
+        )
+
+    def tearDown(self):
+        self.store.close()
+        if self.old_ws is None:
+            os.environ.pop("AGENT_DASH_WORKSTREAMS", None)
+        else:
+            os.environ["AGENT_DASH_WORKSTREAMS"] = self.old_ws
+        self.tmp.cleanup()
+
+    def _cfg(self, **doctor):
+        cfg = _cfg(state_dir=str(self.state))
+        cfg["roots"]["scratchpads"] = []
+        if doctor:
+            cfg["doctor"] = dict(doctor)
+        return cfg
+
+    def _bundle(self, ws, title, tasks, state=None, state_changed_at=None,
+                depends_on=None, milestone=None, history=None, plan_age_days=30):
+        from dash.bundles import cmd_ws
+
+        self.assertEqual(cmd_ws(["new", ws, title]), 0)
+        root = self.wsroot / ws
+        plan = root / "plan.json"
+        data = json.loads(plan.read_text(encoding="utf-8"))
+        data["dag"]["groups"] = [
+            {"id": "build", "col": 0, "title": "Build", "tasks": tasks}
+        ]
+        plan.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        meta = json.loads((root / "bundle.json").read_text(encoding="utf-8"))
+        if state is not None:
+            meta["state"] = state
+        if state_changed_at is not None:
+            meta["state_changed_at"] = state_changed_at
+        if depends_on is not None:
+            meta["depends_on"] = depends_on
+        if milestone is not None:
+            meta["milestone"] = milestone
+        (root / "bundle.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+        if history:
+            (root / "history.jsonl").write_text(
+                "".join(json.dumps(row) + "\n" for row in history), encoding="utf-8"
+            )
+        old = self.now - plan_age_days * 86400
+        os.utime(plan, (old, old))
+        return root
+
+    def _collect(self, cfg=None, **over):
+        from dash.doctor import collect_problems
+
+        params = {"health": {"ok": True, "sources": []}, "processes": []}
+        params.update(over)
+        with mock.patch("dash.doctor._home_scratch", return_value=str(self.root / "noscratch")):
+            return collect_problems(self.store, cfg or self._cfg(), self.now, **params)
+
+    def _problems(self, result, code):
+        return [item for item in result["problems"] if item["code"] == code]
+
+    def test_done_state_fires_warn(self):
+        self._bundle(
+            "WS41", "North Meadow",
+            tasks=[{"id": "WS41.1", "title": "First", "status": "done", "deps": []}],
+            state="done", state_changed_at=self.now - 8 * 86400,
+        )
+        found = self._problems(self._collect(), "done-not-archived")
+        self.assertEqual(len(found), 1)
+        item = found[0]
+        self.assertEqual(item["id"], "done-not-archived:ws:WS41")
+        self.assertEqual(item["scope"], "ws:WS41")
+        self.assertEqual(item["ws"], "WS41")
+        self.assertEqual(item["severity"], "warn")
+        self.assertLess(item["title"].index("North Meadow"), item["title"].index("WS41"))
+        self.assertIn("8.0 days", item["detail"])
+        self.assertIn("docs/closing-report.md", item["detail"])
+        self.assertEqual(item["fix_command"], "python3 agent_dash.py ws archive WS41")
+
+    def test_done_state_silent_inside_nag(self):
+        self._bundle(
+            "WS41", "North Meadow",
+            tasks=[{"id": "WS41.1", "title": "First", "status": "done", "deps": []}],
+            state="done", state_changed_at=self.now - 2 * 86400,
+        )
+        self.assertFalse(self._problems(self._collect(), "done-not-archived"))
+
+    def test_done_nag_threshold_edge(self):
+        self._bundle(
+            "WS41", "North Meadow",
+            tasks=[{"id": "WS41.1", "title": "First", "status": "done", "deps": []}],
+            state="done", state_changed_at=self.now - 7 * 86400,
+        )
+        self.assertFalse(self._problems(self._collect(), "done-not-archived"))
+        meta = json.loads((self.wsroot / "WS41" / "bundle.json").read_text(encoding="utf-8"))
+        meta["state_changed_at"] = self.now - 7 * 86400 - 120
+        (self.wsroot / "WS41" / "bundle.json").write_text(json.dumps(meta), encoding="utf-8")
+        found = self._problems(self._collect(), "done-not-archived")
+        self.assertEqual(len(found), 1)
+
+    def test_done_nag_config_override(self):
+        self._bundle(
+            "WS41", "North Meadow",
+            tasks=[{"id": "WS41.1", "title": "First", "status": "done", "deps": []}],
+            state="done", state_changed_at=self.now - 8 * 86400,
+        )
+        self.assertFalse(
+            self._problems(self._collect(self._cfg(archive_nag_days=30)), "done-not-archived")
+        )
+
+    def test_active_complete_plan_fires(self):
+        self._bundle(
+            "WS41", "North Meadow",
+            tasks=[
+                {"id": "WS41.1", "title": "First", "status": "done", "deps": []},
+                {"id": "WS41.2", "title": "Moved", "status": "deferred", "deps": []},
+            ],
+            state="active",
+            history=[{"ts": self.now - 8 * 86400, "task": "WS41.1",
+                      "from": "pr", "to": "done"}],
+        )
+        found = self._problems(self._collect(), "done-not-archived")
+        self.assertEqual(len(found), 1)
+        self.assertIn("100%", found[0]["title"])
+
+    def test_active_incomplete_plan_silent_for_nag(self):
+        self._bundle(
+            "WS41", "North Meadow",
+            tasks=[
+                {"id": "WS41.1", "title": "First", "status": "done", "deps": []},
+                {"id": "WS41.2", "title": "Second", "status": "todo", "deps": []},
+            ],
+            state="active",
+            history=[{"ts": self.now - 8 * 86400, "task": "WS41.1",
+                      "from": "pr", "to": "done"}],
+        )
+        self.assertFalse(self._problems(self._collect(), "done-not-archived"))
+
+    def test_archived_never_nags(self):
+        self._bundle(
+            "WS41", "North Meadow",
+            tasks=[{"id": "WS41.1", "title": "First", "status": "done", "deps": []}],
+            state="archived", state_changed_at=self.now - 60 * 86400,
+        )
+        self.assertFalse(self._problems(self._collect(), "done-not-archived"))
+
+    def test_active_idle_fires_warn(self):
+        self._bundle(
+            "WS41", "North Meadow",
+            tasks=[{"id": "WS41.1", "title": "First", "status": "todo", "deps": []}],
+            state="active",
+            history=[{"ts": self.now - 4 * 86400, "task": "WS41.1",
+                      "from": "todo", "to": "wip"}],
+        )
+        found = self._problems(self._collect(), "active-idle")
+        self.assertEqual(len(found), 1)
+        item = found[0]
+        self.assertEqual(item["id"], "active-idle:ws:WS41")
+        self.assertEqual(item["severity"], "warn")
+        self.assertLess(item["title"].index("North Meadow"), item["title"].index("WS41"))
+        self.assertIn("4.0 days", item["detail"])
+        self.assertEqual(item["fix_command"], "python3 agent_dash.py ws next WS41")
+
+    def test_active_idle_silent_when_recent(self):
+        self._bundle(
+            "WS41", "North Meadow",
+            tasks=[{"id": "WS41.1", "title": "First", "status": "todo", "deps": []}],
+            state="active",
+            history=[{"ts": self.now - 3600, "task": "WS41.1",
+                      "from": "todo", "to": "wip"}],
+        )
+        self.assertFalse(self._problems(self._collect(), "active-idle"))
+
+    def test_active_idle_silent_when_paused_or_nothing_open(self):
+        self._bundle(
+            "WS41", "North Meadow",
+            tasks=[{"id": "WS41.1", "title": "First", "status": "todo", "deps": []}],
+            state="paused",
+            history=[{"ts": self.now - 10 * 86400, "task": "WS41.1",
+                      "from": "todo", "to": "wip"}],
+        )
+        self._bundle(
+            "WS42", "South Field",
+            tasks=[{"id": "WS42.1", "title": "First", "status": "done", "deps": []}],
+            state="active",
+            history=[{"ts": self.now - 10 * 86400, "task": "WS42.1",
+                      "from": "pr", "to": "done"}],
+        )
+        self.assertFalse(self._problems(self._collect(), "active-idle"))
+
+    def test_active_idle_config_override(self):
+        self._bundle(
+            "WS41", "North Meadow",
+            tasks=[{"id": "WS41.1", "title": "First", "status": "todo", "deps": []}],
+            state="active",
+            history=[{"ts": self.now - 4 * 86400, "task": "WS41.1",
+                      "from": "todo", "to": "wip"}],
+        )
+        self.assertFalse(
+            self._problems(self._collect(self._cfg(active_idle_days=10)), "active-idle")
+        )
+
+    def test_absent_state_reads_as_active(self):
+        self._bundle(
+            "WS41", "North Meadow",
+            tasks=[{"id": "WS41.1", "title": "First", "status": "todo", "deps": []}],
+            milestone="Alpha",
+            history=[{"ts": self.now - 4 * 86400, "task": "WS41.1",
+                      "from": "todo", "to": "wip"}],
+        )
+        found = self._problems(self._collect(), "active-idle")
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0]["ws"], "WS41")
+
+    def test_planned_blocked_on_dependency(self):
+        self._bundle(
+            "WS41", "North Meadow",
+            tasks=[{"id": "WS41.1", "title": "First", "status": "done", "deps": []}],
+            state="active",
+            history=[{"ts": self.now - 3600, "task": "WS41.1",
+                      "from": "pr", "to": "done"}],
+        )
+        self._bundle(
+            "WS42", "South Field",
+            tasks=[{"id": "WS42.1", "title": "First", "status": "todo", "deps": []}],
+            state="planned", depends_on=["WS41"],
+        )
+        found = self._problems(self._collect(), "planned-blocked")
+        self.assertEqual(len(found), 1)
+        item = found[0]
+        self.assertEqual(item["id"], "planned-blocked:ws:WS42")
+        self.assertEqual(item["severity"], "info")
+        self.assertLess(item["title"].index("South Field"), item["title"].index("WS42"))
+        self.assertIn("North Meadow (WS41)", item["detail"])
+        self.assertEqual(item["fix_command"], "python3 agent_dash.py ws gates WS42")
+        self.assertFalse(self._problems(self._collect(), "planned-ready"))
+
+    def test_planned_blocked_on_unknown_dependency(self):
+        self._bundle(
+            "WS42", "South Field",
+            tasks=[{"id": "WS42.1", "title": "First", "status": "todo", "deps": []}],
+            state="planned", depends_on=["WS99"],
+        )
+        found = self._problems(self._collect(), "planned-blocked")
+        self.assertEqual(len(found), 1)
+        self.assertIn("unknown workstream (WS99)", found[0]["detail"])
+
+    def test_planned_blocked_on_stale_gate(self):
+        self._bundle(
+            "WS41", "North Meadow",
+            tasks=[{"id": "WS41.1", "title": "First", "status": "done", "deps": []}],
+            state="done", state_changed_at=self.now - 3600,
+        )
+        self._bundle(
+            "WS42", "South Field",
+            tasks=[
+                {"id": "WS42.g", "title": "Freeze lifts", "status": "todo",
+                 "kind": "gate", "deps": [], "signal": "site freeze",
+                 "confirmed_at": "2020-01-01T00:00:00Z", "fresh_hours": 24},
+                {"id": "WS42.1", "title": "First", "status": "todo", "deps": []},
+            ],
+            state="planned", depends_on=["WS41"],
+        )
+        found = self._problems(self._collect(), "planned-blocked")
+        self.assertEqual(len(found), 1)
+        self.assertIn("WS42.g", found[0]["detail"])
+        self.assertIn("site freeze", found[0]["detail"])
+
+    def test_planned_ready_when_clear(self):
+        self._bundle(
+            "WS41", "North Meadow",
+            tasks=[{"id": "WS41.1", "title": "First", "status": "done", "deps": []}],
+            state="done", state_changed_at=self.now - 3600,
+        )
+        self._bundle(
+            "WS42", "South Field",
+            tasks=[{"id": "WS42.1", "title": "First", "status": "todo", "deps": []}],
+            state="planned", depends_on=["WS41"],
+        )
+        found = self._problems(self._collect(), "planned-ready")
+        self.assertEqual(len(found), 1)
+        item = found[0]
+        self.assertEqual(item["id"], "planned-ready:ws:WS42")
+        self.assertEqual(item["severity"], "info")
+        self.assertIn("ready to start", item["title"])
+        self.assertEqual(item["fix_command"], "python3 agent_dash.py ws state WS42 active")
+        self.assertFalse(self._problems(self._collect(), "planned-blocked"))
+
+    def test_planned_ready_with_no_dependencies(self):
+        self._bundle(
+            "WS42", "South Field",
+            tasks=[{"id": "WS42.1", "title": "First", "status": "todo", "deps": []}],
+            state="planned",
+        )
+        found = self._problems(self._collect(), "planned-ready")
+        self.assertEqual(len(found), 1)
+
+    def test_phase_slipping_after_finished_phase(self):
+        (self.wsroot / "project.json").write_text(json.dumps({
+            "name": "Demo project",
+            "phases": [{"name": "Alpha"}, {"name": "Beta"}],
+        }), encoding="utf-8")
+        self._bundle(
+            "WS51", "Alpha One",
+            tasks=[{"id": "WS51.1", "title": "First", "status": "done", "deps": []}],
+            state="done", state_changed_at=self.now - 10 * 86400, milestone="Alpha",
+        )
+        self._bundle(
+            "WS53", "Beta One",
+            tasks=[{"id": "WS53.1", "title": "First", "status": "todo", "deps": []}],
+            state="planned", milestone="Beta",
+        )
+        found = self._problems(self._collect(), "phase-slipping")
+        self.assertEqual(len(found), 1)
+        item = found[0]
+        self.assertEqual(item["id"], "phase-slipping:global:after:Alpha")
+        self.assertEqual(item["scope"], "global")
+        self.assertEqual(item["severity"], "info")
+        self.assertIn("Alpha", item["title"])
+        self.assertIn("Beta", item["title"])
+        self.assertEqual(item["fix_command"], "python3 agent_dash.py project show")
+
+    def test_phase_slipping_silent_when_next_started(self):
+        (self.wsroot / "project.json").write_text(json.dumps({
+            "name": "Demo project",
+            "phases": [{"name": "Alpha"}, {"name": "Beta"}],
+        }), encoding="utf-8")
+        self._bundle(
+            "WS51", "Alpha One",
+            tasks=[{"id": "WS51.1", "title": "First", "status": "done", "deps": []}],
+            state="done", state_changed_at=self.now - 10 * 86400, milestone="Alpha",
+        )
+        self._bundle(
+            "WS53", "Beta One",
+            tasks=[{"id": "WS53.1", "title": "First", "status": "todo", "deps": []}],
+            state="active", milestone="Beta",
+            history=[{"ts": self.now - 3600, "task": "WS53.1",
+                      "from": "todo", "to": "wip"}],
+        )
+        self.assertFalse(self._problems(self._collect(), "phase-slipping"))
+
+    def test_phase_slipping_config_override(self):
+        (self.wsroot / "project.json").write_text(json.dumps({
+            "name": "Demo project",
+            "phases": [{"name": "Alpha"}, {"name": "Beta"}],
+        }), encoding="utf-8")
+        self._bundle(
+            "WS51", "Alpha One",
+            tasks=[{"id": "WS51.1", "title": "First", "status": "done", "deps": []}],
+            state="done", state_changed_at=self.now - 10 * 86400, milestone="Alpha",
+        )
+        self._bundle(
+            "WS53", "Beta One",
+            tasks=[{"id": "WS53.1", "title": "First", "status": "todo", "deps": []}],
+            state="planned", milestone="Beta",
+        )
+        self.assertFalse(
+            self._problems(self._collect(self._cfg(phase_slip_days=30)), "phase-slipping")
+        )
+
+    def test_phase_target_passed_fires(self):
+        (self.wsroot / "project.json").write_text(json.dumps({
+            "name": "Demo project",
+            "phases": [{"name": "Gamma", "target": "2023-01-01",
+                        "workstreams": ["WS54"]}],
+        }), encoding="utf-8")
+        self._bundle(
+            "WS54", "Gamma One",
+            tasks=[{"id": "WS54.1", "title": "First", "status": "todo", "deps": []}],
+            state="active",
+            history=[{"ts": self.now - 3600, "task": "WS54.1",
+                      "from": "todo", "to": "wip"}],
+        )
+        found = self._problems(self._collect(), "phase-slipping")
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0]["id"], "phase-slipping:global:target:Gamma")
+        self.assertIn("Gamma One (WS54)", found[0]["detail"])
+
+    def test_phase_target_future_silent(self):
+        (self.wsroot / "project.json").write_text(json.dumps({
+            "name": "Demo project",
+            "phases": [{"name": "Gamma", "target": "2099-01-01",
+                        "workstreams": ["WS54"]}],
+        }), encoding="utf-8")
+        self._bundle(
+            "WS54", "Gamma One",
+            tasks=[{"id": "WS54.1", "title": "First", "status": "todo", "deps": []}],
+            state="active",
+            history=[{"ts": self.now - 3600, "task": "WS54.1",
+                      "from": "todo", "to": "wip"}],
+        )
+        self.assertFalse(self._problems(self._collect(), "phase-slipping"))
+
+    def test_no_lifecycle_data_is_silent(self):
+        from dash.bundles import cmd_ws
+
+        self.assertEqual(cmd_ws(["new", "WS41", "North Meadow"]), 0)
+        result = self._collect()
+        for code in self.codes:
+            self.assertFalse(
+                [item for item in result["problems"] if item["code"] == code],
+                f"{code} fired without lifecycle data",
+            )
+            check = next(item for item in result["checks"] if item["name"] == code)
+            self.assertTrue(check["ok"])
+            self.assertIn("no lifecycle data", check["detail"])
+
+    def test_one_group_per_code_and_scope(self):
+        for ws, title in (("WS41", "North Meadow"), ("WS42", "South Field")):
+            self._bundle(
+                ws, title,
+                tasks=[{"id": f"{ws}.1", "title": "First", "status": "done", "deps": []}],
+                state="done", state_changed_at=self.now - 8 * 86400,
+            )
+        found = self._problems(self._collect(), "done-not-archived")
+        self.assertEqual(len(found), 2)
+        self.assertEqual(
+            {item["id"] for item in found},
+            {"done-not-archived:ws:WS41", "done-not-archived:ws:WS42"},
+        )
+        self.assertEqual({item["scope"] for item in found}, {"ws:WS41", "ws:WS42"})
+
+
 class FleetTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
