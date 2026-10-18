@@ -10,7 +10,10 @@ from __future__ import annotations
 
 from dash.liveness import (DAGSTER_ACTIVE_FRESH_S,
                       STALE_IDLE_S,
+                      STALLED_AFTER_S,
+                      STALLED_SOURCES,
                       pid_alive as _pid_alive,
+                      proc_started_ok,
                       stale_grace_s,)
 
 from .util import (WORKER_SOURCES, WRAPPER_SOURCES)
@@ -116,11 +119,13 @@ class RunningMixin:
             if sample_max is None:
                 sample_max = self._sample_max_locked(open_rows)
             stale = []
+            pid_starts = self._pid_start_locked([row.get("pid") for row in open_rows])
             for row in open_rows:
-                if _is_idle_lead(row, now, usage_max, sample_max, check):
+                pid_start = pid_starts.get(_int_pid(row.get("pid")))
+                if _is_idle_lead(row, now, usage_max, sample_max, check, pid_start):
                     continue
                 reason = self._stale_reason_locked(
-                    row, now, dag_ids, dag_fresh, usage_max, sample_max, check
+                    row, now, dag_ids, dag_fresh, usage_max, sample_max, check, pid_start
                 )
                 if reason:
                     stale.append((dict(row), reason))
@@ -145,11 +150,98 @@ class RunningMixin:
                 usage_max = self._usage_max_locked([row["run_id"] for row in open_rows])
             if sample_max is None:
                 sample_max = self._sample_max_locked(open_rows)
+            pid_starts = self._pid_start_locked([row.get("pid") for row in open_rows])
             return [
                 dict(row)
                 for row in open_rows
-                if _is_idle_lead(row, now, usage_max, sample_max, check)
+                if _is_idle_lead(
+                    row, now, usage_max, sample_max, check,
+                    pid_starts.get(_int_pid(row.get("pid"))),
+                )
             ]
+        def _stalled_locked(self, now: float, rows: list, pid_alive_fn=None, usage_max=None) -> dict:
+            """Open worker rows stuck on a live process, by run id to idle seconds.
+
+            A ``STALLED_SOURCES`` row whose pid is still alive but whose
+            output evidence (usage heartbeats, out-file growth; never
+            process sightings, which a stuck process keeps emitting) is
+            older than ``STALLED_AFTER_S`` is stalled, not live. A row
+            that only just started is never stalled; a row with no output
+            evidence at all is left to the stale path. Caller holds the
+            lock. File stats stay bounded: only open worker rows stat.
+            """
+            import os as _os
+
+            now = float(now)
+            check = pid_alive_fn or _pid_alive
+            open_rows = [
+                row for row in rows
+                if row.get("status") in ("running", "queued")
+                and (row.get("source") or "") in STALLED_SOURCES
+            ]
+            if not open_rows:
+                return {}
+            if usage_max is None:
+                usage_max = self._usage_max_locked([row["run_id"] for row in open_rows])
+            found = {}
+            for row in open_rows:
+                pid = row.get("pid")
+                if pid is None:
+                    continue
+                try:
+                    alive = bool(check(pid))
+                except Exception:
+                    alive = False
+                if not alive:
+                    continue
+                stamps = []
+                started = row.get("started_at")
+                if isinstance(started, (int, float)) and not isinstance(started, bool):
+                    stamps.append(float(started))
+                hit = usage_max.get(row.get("run_id"))
+                if hit is not None:
+                    stamps.append(float(hit))
+                out_path = row.get("out_path")
+                if isinstance(out_path, str) and out_path:
+                    try:
+                        stamps.append(float(_os.stat(out_path).st_mtime))
+                    except OSError:
+                        pass
+                if not stamps:
+                    continue
+                idle = now - max(stamps)
+                if idle > STALLED_AFTER_S:
+                    found[row["run_id"]] = idle
+            return found
+        def _pid_start_locked(self, pids: list) -> dict:
+            """Process start epoch by pid from the latest sample. Caller holds the lock."""
+            wanted = []
+            for pid in pids or ():
+                try:
+                    wanted.append(int(pid))
+                except (TypeError, ValueError):
+                    continue
+            if not wanted:
+                return {}
+            found = {}
+            step = 500
+            for index in range(0, len(wanted), step):
+                chunk = wanted[index:index + step]
+                marks = ",".join("?" for _ in chunk)
+                for row in self._conn.execute(
+                    f"SELECT pid, ts, elapsed_s FROM process_samples "
+                    f"WHERE pid IN ({marks}) AND ts IS NOT NULL AND elapsed_s IS NOT NULL "
+                    f"ORDER BY ts DESC",
+                    chunk,
+                ).fetchall():
+                    pid = int(row["pid"])
+                    if pid in found:
+                        continue
+                    try:
+                        found[pid] = float(row["ts"]) - float(row["elapsed_s"])
+                    except (TypeError, ValueError):
+                        continue
+            return found
         def _live_open_ids_locked(self, now: float, rows: list, pid_alive_fn=None) -> set:
             """Run ids of open rows with liveness evidence. Caller holds the lock.
 
@@ -203,7 +295,7 @@ class RunningMixin:
             return open_ids - set(shadows), shadows
         def _stale_reason_locked(
             self, run: dict, now: float, dag_ids, dag_fresh: bool,
-            usage_max: dict, sample_max: dict, check,
+            usage_max: dict, sample_max: dict, check, pid_start=None,
         ):
             source = run.get("source") or ""
             status = run.get("status")
@@ -221,12 +313,19 @@ class RunningMixin:
                 return None
             pid = run.get("pid")
             dead_pid = False
+            reused_pid = False
             if pid is not None:
                 try:
                     alive = bool(check(pid))
                 except Exception:
                     alive = False
                 dead_pid = not alive
+                if alive and not _proc_is_ours(run, pid_start):
+                    # The pid is alive but belongs to a newer process: the
+                    # run's agent is gone. This reads stale (and closes
+                    # through the normal path) instead of hiding behind a
+                    # recycled pid.
+                    reused_pid = True
             stamps = []
             started = run.get("started_at")
             if isinstance(started, (int, float)) and not isinstance(started, bool):
@@ -242,6 +341,8 @@ class RunningMixin:
                 if hit is not None:
                     stamps.append(float(hit))
             last = max(stamps) if stamps else None
+            if reused_pid:
+                return f"pid {pid} is a newer process, not the run's agent (pid reused)"
             if dead_pid:
                 if last is not None and now - last <= stale_grace_s(source):
                     return None
@@ -379,7 +480,29 @@ class RunningMixin:
             }
 
 
-def _is_idle_lead(run: dict, now: float, usage_max: dict, sample_max: dict, check) -> bool:
+def _int_pid(pid):
+    try:
+        return int(pid)
+    except (TypeError, ValueError):
+        return None
+
+
+def _proc_is_ours(run: dict, pid_start) -> bool:
+    """True when the process start (when known) fits the run's start.
+
+    Unknown starts never veto: without both clocks there is nothing to
+    compare, exactly as before.
+    """
+    if pid_start is None:
+        return True
+    try:
+        started = float(run.get("started_at"))
+    except (TypeError, ValueError):
+        return True
+    return proc_started_ok(pid_start, started)
+
+
+def _is_idle_lead(run: dict, now: float, usage_max: dict, sample_max: dict, check, pid_start=None) -> bool:
     """True for an alive-but-idle interactive lead session.
 
     A ``claude-main`` row whose pid is still alive but whose newest source
@@ -387,8 +510,10 @@ def _is_idle_lead(run: dict, now: float, usage_max: dict, sample_max: dict, chec
     an intended state: the lead is attached but has written nothing. It is
     hidden from views like a stale row, but it is never a mismatch and it
     is never closed. A dead pid is not idle (it stays a stale ``dead pid``
-    mismatch); a row with no pid or no evidence at all is not idle either,
-    so both are still reported exactly as before.
+    mismatch), and neither is a pid that now belongs to a newer process
+    (a stale ``pid reused`` mismatch instead); a row with no pid or no
+    evidence at all is not idle either, so all are still reported exactly
+    as before.
     """
     if (run.get("source") or "") != "claude-main":
         return False
@@ -402,6 +527,8 @@ def _is_idle_lead(run: dict, now: float, usage_max: dict, sample_max: dict, chec
     except Exception:
         alive = False
     if not alive:
+        return False
+    if not _proc_is_ours(run, pid_start):
         return False
     run_id = run.get("run_id")
     stamps = []

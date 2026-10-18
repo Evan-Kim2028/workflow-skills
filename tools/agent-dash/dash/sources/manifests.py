@@ -473,9 +473,11 @@ def _emit_files(
     if quota_hit and not superseded:
         # A quota/rate-limit failure ends the run even while the label is
         # still lit by a relaunch or the out file is still growing: the
-        # log names the failure, and BLOCKED keeps it out of PASS counts.
-        status = "done"
-        verdict = "BLOCKED"
+        # log names the failure, and died_early keeps it out of PASS
+        # counts. The session died without a verdict, so it reads died
+        # (red), never blocked (orange): QUOTA names the reason.
+        status = "died_early"
+        verdict = "QUOTA"
     elif superseded and status in ("running", "unknown"):
         # An older attempt sharing the label/out file with a newer open
         # row: the growth and the live label belong to the newer attempt.

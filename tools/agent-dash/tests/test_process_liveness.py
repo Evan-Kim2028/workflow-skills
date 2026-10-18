@@ -306,7 +306,7 @@ class VetoTests(unittest.TestCase):
         old = self.old_row()
         new = self.new_row()
         store = self.vstore({old["run_id"]: old, new["run_id"]: new})
-        proc = dict(self.live_proc(), session_id=self.OLD_SID)
+        proc = dict(self.live_proc(), session_id=self.OLD_SID, started_at=990)
         run = {"run_id": old["run_id"], "label": self.LABEL, "session_id": self.OLD_SID}
         process.apply_liveness(store, run, "muse", [proc])
         self.assertEqual(run.get("status"), "running")
@@ -338,7 +338,7 @@ class VetoTests(unittest.TestCase):
         ended = process.reconcile_running(store, 3000, [self.live_proc()])
         self.assertEqual(store.get_run(new["run_id"])["status"], "running")
         self.assertEqual(store.get_run(new["run_id"])["pid"], 200)
-        self.assertEqual(store.get_run(old["run_id"])["status"], "done")
+        self.assertEqual(store.get_run(old["run_id"])["status"], "died_early")
         self.assertIsNone(store.get_run(old["run_id"])["pid"])
         self.assertEqual(ended, 1)
 
@@ -389,7 +389,7 @@ class ApplyLivenessTests(unittest.TestCase):
         process.apply_liveness(store, run, "muse", [muse_row()])
         self.assertEqual(run["status"], "running")
 
-    def test_gone_process_ends_labeled_run_as_done(self):
+    def test_gone_process_ends_labeled_run_as_died_early(self):
         store = Store(
             {
                 "muse:s:ws7-plan": {
@@ -401,7 +401,7 @@ class ApplyLivenessTests(unittest.TestCase):
         )
         run = {"run_id": "muse:s:ws7-plan", "label": "ws7-plan", "pid": 3}
         process.apply_liveness(store, run, "muse", [])
-        self.assertEqual(run["status"], "done")
+        self.assertEqual(run["status"], "died_early")
 
     def test_gone_process_ends_unlabeled_run_as_unknown(self):
         store = Store(
@@ -417,6 +417,73 @@ class ApplyLivenessTests(unittest.TestCase):
         process.apply_liveness(store, run, "muse", [])
         self.assertEqual(run["status"], "unknown")
 
+    def test_close_never_downgrades_a_reported_finish(self):
+        store = Store(
+            {
+                "muse:s:ws7-plan": {
+                    "run_id": "muse:s:ws7-plan",
+                    "status": "running",
+                    "started_at": 50,
+                }
+            }
+        )
+        run = {
+            "run_id": "muse:s:ws7-plan",
+            "label": "ws7-plan",
+            "pid": 3,
+            "status": "done",
+            "verdict": "PASS",
+            "ended_at": 60,
+        }
+        process.apply_liveness(store, run, "muse", [])
+        self.assertEqual(run["status"], "done")
+        self.assertEqual(run["verdict"], "PASS")
+
+    def test_reused_pid_never_vouches_the_old_row(self):
+        proc = dict(muse_row(), started_at=1792164000.0 + 3600.0)
+        self.assertIsNone(process.match_agent("muse", 28553, None, [proc], SID, 1792164000.0))
+        store = Store(
+            {
+                "muse:%s:ws2-old" % SID: {
+                    "run_id": "muse:%s:ws2-old" % SID,
+                    "source": "muse",
+                    "session_id": SID,
+                    "label": "ws2-old",
+                    "status": "running",
+                    "pid": 28553,
+                    "started_at": 1792164000.0,
+                }
+            }
+        )
+        run = {"run_id": "muse:%s:ws2-old" % SID, "label": "ws2-old", "pid": 28553,
+               "started_at": 1792164000.0}
+        process.apply_liveness(store, run, "muse", [proc])
+        self.assertEqual(run["status"], "died_early")
+
+    def test_label_scan_skips_a_reused_process(self):
+        old = dict(muse_row(), pid=111, started_at=1792164000.0 + 3600.0, label="ws2-x")
+        new = dict(muse_row(), pid=222, started_at=1792163990.0, label="ws2-x")
+        got = process.match_agent("muse", None, "ws2-x", [old, new], None, 1792164000.0)
+        self.assertIsNotNone(got)
+        self.assertEqual(got["pid"], 222)
+
+    def test_reconcile_closes_a_vanished_labeled_row_as_died_early(self):
+        store = Store(
+            {
+                "muse:s:ws7-plan": {
+                    "run_id": "muse:s:ws7-plan",
+                    "source": "muse",
+                    "status": "running",
+                    "label": "ws7-plan",
+                    "pid": 3,
+                    "started_at": 50,
+                }
+            }
+        )
+        ended = process.reconcile_running(store, 200, [])
+        self.assertEqual(ended, 1)
+        self.assertEqual(store.get_run("muse:s:ws7-plan")["status"], "died_early")
+
     def test_reconcile_keeps_session_matched_muse_running(self):
         store = Store(
             {
@@ -427,7 +494,7 @@ class ApplyLivenessTests(unittest.TestCase):
                     "label": "ws2-x",
                     "status": "running",
                     "pid": None,
-                    "started_at": 100,
+                    "started_at": 1792163990.0,
                 }
             }
         )
@@ -554,7 +621,8 @@ class PromptFileTests(unittest.TestCase):
         self.assertEqual(dead["status"], "done")
         self.assertEqual(dead["ended_at"], 50)
         self.assertIsNone(dead["pid"])
-        live = {"run_id": run_id, "label": "ws2-x", "pid": None, "session_id": SID}
+        live = {"run_id": run_id, "label": "ws2-x", "pid": None, "session_id": SID,
+                "started_at": 1792163990.0}
         process.apply_liveness(store, live, "muse", [muse_row()])
         self.assertEqual(live["status"], "running")
         self.assertEqual(live["pid"], 28553)
@@ -584,7 +652,7 @@ class PromptFileTests(unittest.TestCase):
                 },
             }
         )
-        ended = process.reconcile_running(store, 200, [muse_row()])
+        ended = process.reconcile_running(store, 200, [dict(muse_row(), started_at=90)])
         self.assertEqual(ended, 0)
         self.assertEqual(store.get_run(shadow)["status"], "unknown")
         self.assertEqual(store.get_run(shadow)["parent_session_id"], labeled)

@@ -1250,7 +1250,7 @@ files.forEach(function (p) { eval(fs.readFileSync(p, "utf8")); });
   assert.strictEqual(typeof global[n], "function", n + " is not exported");
 });
 assert.strictEqual(typeof global.expanded, "object", "expanded lane state is not exported");
-assert.deepStrictEqual(Object.keys(OUTCOME).sort(), ["blocked", "died", "ok", "part", "run", "unk"]);
+assert.deepStrictEqual(Object.keys(OUTCOME).sort(), ["blocked", "cancelled", "died", "ok", "part", "run", "stalled", "unk"]);
 function walk(node, out) {
   out.push(node);
   (node.children || []).forEach(function (c) { if (c && c.children) walk(c, out); });
@@ -1316,8 +1316,11 @@ bars.forEach(function (b) {
 });
 var legend = nodes.filter(function (n) { return n.attrs.class === "legend"; })[0];
 var legendText = JSON.stringify(legend);
-["\u25CF running", "\u2713 finished", "\u25D0 partial", "\u2298 blocked", "\u2715 died", "? ended, outcome unknown"].forEach(function (want) {
+["\u25CF running", "\u2713 finished", "\u25D0 partial", "\u2298 blocked", "\u2715 died", "\u25CB no verdict"].forEach(function (want) {
   assert.ok(legendText.indexOf(want) >= 0, "legend never says " + want);
+});
+["cancelled", "stalled"].forEach(function (absent) {
+  assert.ok(legendText.indexOf(absent) < 0, "legend lists absent class " + absent);
 });
 /* Scenario B: one lane with 500 overlapping runs goes dense but keeps its count and its expand. */
 runs = [];
@@ -2794,8 +2797,8 @@ class FinalPolishTests(unittest.TestCase):
         self.assertIn("total", act)
         self.assertIn('"aria-label": actTimelineAria(', act)
         self.assertIn("Agent runs in the selected range", act)
-        self.assertIn("blocked, ", act)
-        self.assertIn("died, ", act)
+        for word in ('"finished"', '"partial"', '"blocked"', '"died"', '"cancelled"', '"stalled"', '"running"', '"no verdict"'):
+            self.assertIn(word, act, f"aria never says {word}")
         self.assertNotIn("died or blocked", act)
         burn = (STATIC / "cards" / "burnup.js").read_text()
         self.assertIn('"aria-label": label', burn)
@@ -2822,6 +2825,29 @@ class FinalPolishTests(unittest.TestCase):
         light = _ratio(var(r':root\[data-theme="light"\]', "--muted"), var(r':root\[data-theme="light"\]', "--card"))
         self.assertGreaterEqual(dark, 4.5, f"dark muted contrast {dark:.2f}")
         self.assertGreaterEqual(light, 4.5, f"light muted contrast {light:.2f}")
+
+    def test_outcome_marks_meet_graphics_contrast(self):
+        """Every outcome mark clears 3:1 on the card in both themes, so
+        died red and blocked orange differ by measurement, not by eye —
+        and the grey (cancelled, no verdict) and amber (partial, stalled)
+        marks stay legible too."""
+        css = (STATIC / "tokens.css").read_text()
+
+        def var(block, name):
+            m = re.search(block + r"\s*\{([^}]*)\}", css, re.S)
+            self.assertIsNotNone(m, f"tokens.css lost {block}")
+            m2 = re.search(re.escape(name) + r":\s*(#[0-9a-fA-F]{6})", m.group(1))
+            self.assertIsNotNone(m2, f"tokens.css lost {name} in {block}")
+            return m2.group(1)
+
+        for theme, block in (("dark", r":root"), ("light", r':root\[data-theme="light"\]')):
+            card = var(block, "--card")
+            for name in ("--critical", "--serious", "--warning", "--muted", "--good"):
+                ratio = _ratio(var(block, name), card)
+                self.assertGreaterEqual(ratio, 3.0, f"{theme} {name} mark contrast {ratio:.2f}")
+            self.assertNotEqual(
+                var(block, "--critical"), var(block, "--serious"), f"{theme} died/blocked share a mark"
+            )
 
     def test_accent_text_never_sits_on_accent_fill(self):
         css = (STATIC / "cards" / "plan-progress.css").read_text()
@@ -2858,9 +2884,9 @@ class FinalPolishTests(unittest.TestCase):
         live = (STATIC / "cards" / "activity.js").read_text()
         self.assertIn("No live agents in this window.", live)
         tiles = (STATIC / "cards" / "tiles.js").read_text()
-        self.assertIn("(passN + part + blockedN + diedN)", tiles)
-        self.assertIn("blocked ·", tiles)
-        self.assertIn("died (24 h)", tiles)
+        self.assertIn("(passN + part + blockedN + diedN + cancN + unkN)", tiles)
+        for word in ('" pass"', '" partial"', '" blocked"', '" died"', '" cancelled"', '" no verdict"', '" (24 h)"'):
+            self.assertIn(word, tiles, f"tile caption never says {word}")
 
     def test_planned_cards_state_the_wait_once(self):
         home = (STATIC / "cards" / "project-home.js").read_text()
@@ -3542,14 +3568,24 @@ console.log("activity tick spans ok");
 
     def test_outcome_tokens_split_blocked_and_died(self):
         """Blocked and died resolve to different outcome tokens, glyphs
-        and words everywhere outcomes are coloured (timeline.js
-        outcomeOf/OUTCOME, mirrored by the replay): blocked is serious
+        and words everywhere outcomes are coloured (the one ADM.outcomeOf
+        in models.js, mirrored by the server): blocked is serious
         orange with ⊘, died is critical red with ✕, both colour-blind
-        safe next to partial amber and pass green."""
+        safe next to partial amber and pass green. Cancelled is grey,
+        stalled amber-ish with its own glyph and word, unknown grey
+        hollow with 'no verdict'."""
+        for name in ("cards/timeline.js", "cards/plan-progress.js"):
+            src = (STATIC / name).read_text()
+            self.assertNotIn("died_early", src, f"{name} keeps its own outcome if-chain")
+        self.assertIn(
+            "ADM.outcomeOf", (STATIC / "cards" / "timeline.js").read_text(),
+            "timeline.js no longer reads the one class function",
+        )
         script = (
             "const fs=require('fs');"
             "globalThis.window=globalThis;"
             "eval(fs.readFileSync(process.argv[1],'utf8'));"
+            "eval(fs.readFileSync(process.argv[2],'utf8'));"
             "const assert=require('assert');"
             "assert.ok(OUTCOME.blocked[0]!==OUTCOME.died[0],'blocked and died share one colour');"
             "assert.strictEqual(OUTCOME.blocked[0],'var(--serious)');"
@@ -3560,23 +3596,32 @@ console.log("activity tick spans ok");
             "assert.ok(OUTCOME.blocked[2]!==OUTCOME.died[2],'blocked and died share one word');"
             "assert.strictEqual(OUTCOME.part[0],'var(--warning)');"
             "assert.strictEqual(OUTCOME.ok[0],'var(--good)');"
+            "assert.strictEqual(OUTCOME.cancelled[0],'var(--muted)');"
+            "assert.strictEqual(OUTCOME.cancelled[1],'\\u23F9');"
+            "assert.strictEqual(OUTCOME.unk[1],'\\u25CB');"
+            "assert.strictEqual(OUTCOME.unk[2],'no verdict');"
+            "assert.strictEqual(OUTCOME.stalled[1],'\\u25D4');"
             "function run(o){return Object.assign({ended_at:1700000100,status:'done',verdict:null},o||{});}"
             "assert.strictEqual(outcomeOf(run({status:'killed'})),'died');"
             "assert.strictEqual(outcomeOf(run({status:'died_early'})),'died');"
             "assert.strictEqual(outcomeOf(run({verdict:'FAILURE'})),'died');"
-            "assert.strictEqual(outcomeOf(run({verdict:'CANCELED'})),'died');"
+            "assert.strictEqual(outcomeOf(run({verdict:'FAIL'})),'died');"
+            "assert.strictEqual(outcomeOf(run({verdict:'QUOTA'})),'died');"
+            "assert.strictEqual(outcomeOf(run({verdict:'CANCELED'})),'cancelled');"
             "assert.strictEqual(outcomeOf(run({status:'killed',verdict:'BLOCKED'})),'died');"
             "assert.strictEqual(outcomeOf(run({verdict:'BLOCKED'})),'blocked');"
             "assert.strictEqual(outcomeOf(run({verdict:'REQUEST_CHANGES'})),'blocked');"
+            "assert.strictEqual(outcomeOf(run({verdict:'FIX'})),'blocked');"
             "assert.strictEqual(outcomeOf(run({verdict:'PARTIAL'})),'part');"
             "assert.strictEqual(outcomeOf(run({verdict:'APPROVE_WITH_CHANGES'})),'part');"
             "assert.strictEqual(outcomeOf(run({verdict:'PASS'})),'ok');"
             "assert.strictEqual(outcomeOf({status:'running'}) ,'run');"
+            "assert.strictEqual(outcomeOf({status:'running',stalled:3600}) ,'stalled');"
             "assert.strictEqual(outcomeColor(run({verdict:'BLOCKED'})),'var(--serious)');"
             "assert.strictEqual(outcomeColor(run({status:'killed'})),'var(--critical)');"
         )
         proc = subprocess.run(
-            ["node", "-e", script, str(STATIC / "cards" / "timeline.js")],
+            ["node", "-e", script, str(STATIC / "models.js"), str(STATIC / "cards" / "timeline.js")],
             capture_output=True,
             text=True,
         )
@@ -3597,6 +3642,8 @@ console.log("activity tick spans ok");
             "assert.deepStrictEqual(verdictPill('PARTIAL'),['part','\\u25D0 partial']);"
             "assert.deepStrictEqual(verdictPill('APPROVE_WITH_CHANGES'),['part','\\u25D0 partial']);"
             "assert.deepStrictEqual(verdictPill('PASS'),['pass','\\u2713 pass']);"
+            "assert.deepStrictEqual(verdictPill('CANCELED'),['cancelled','\\u23F9 cancelled']);"
+            "assert.deepStrictEqual(verdictPill('FAILURE'),['died','\\u2715 failed']);"
             "assert.strictEqual(typeof verdictEl,'function','the drawer pill helper is not exported');"
         )
         proc = subprocess.run(

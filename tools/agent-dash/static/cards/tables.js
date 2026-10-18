@@ -42,10 +42,21 @@
     if (st === "killed" || st === "died_early") return "\u2715";
     return "\u25CB";
   }
+  /* One derivation for the status cell too: the outcome class names
+     the state (colour plus glyph plus word), the title keeps the raw
+     status and verdict for the exact record. A stalled row reads
+     stalled here, never running. */
   function statusEl(r) {
     var st = r.status || "unknown";
-    var word = st === "died_early" ? "died early" : st;
-    return el("span", {class: "st " + st, title: "status: " + word}, [el("i"), statusSym(st) + " " + word]);
+    var oc = (typeof ADM !== "undefined" && ADM.outcomeOf) ? ADM.outcomeOf(r) : null;
+    var o = (typeof ADM !== "undefined" && ADM.OUTCOME && oc) ? ADM.OUTCOME[oc] : null;
+    if (!o) {
+      var word = st === "died_early" ? "died early" : st;
+      return el("span", {class: "st " + st, title: "status: " + word}, [el("i"), statusSym(st) + " " + word]);
+    }
+    var detail = "status: " + st + (r.verdict ? " · verdict: " + r.verdict : " · no verdict");
+    if (r.outcome_reason) detail += " · " + r.outcome_reason;
+    return el("span", {class: "st " + st + " oc-" + oc, title: detail}, [el("i"), o[1] + " " + o[2]]);
   }
 
   /* Verdict pills: colour plus glyph plus word. The raw verdict stays in
@@ -58,6 +69,8 @@
     if (v === "PARTIAL" || v === "APPROVE_WITH_CHANGES") return ["part", "\u25D0 partial"];
     if (v === "REQUEST_CHANGES") return ["blocked", "\u21BB changes asked"];
     if (v === "BLOCKED") return ["blocked", "\u2298 blocked"];
+    if (v === "CANCELED") return ["cancelled", "\u23F9 cancelled"];
+    if (v === "FAILURE" || v === "FAIL") return ["died", "\u2715 failed"];
     return ["none", "\u2014 no verdict"];
   }
   function verdictEl(v) {
@@ -69,11 +82,15 @@
      with the exact token value left to the row's data attributes. */
   function tipRows(r) {
     var t = r.tokens || {};
+    var oc = (typeof ADM !== "undefined" && ADM.outcomeOf) ? ADM.outcomeOf(r) : null;
+    var o = (oc && ADM.OUTCOME) ? ADM.OUTCOME[oc] : null;
+    var why = (typeof ADM !== "undefined" && ADM.outcomeReason) ? ADM.outcomeReason(r, oc) : null;
+    var state = o ? o[1] + " " + o[2] + (why ? " \u2014 " + why : "") : ((r.status || "unknown") + (r.verdict ? " \u00B7 " + r.verdict : ""));
     return [
       {k: "Model", v: fullName(tierKey(r))},
       {k: "Elapsed", v: fmtDur(r.elapsed_s)},
       {k: "Tokens", v: fmtN(tokTotal(t))},
-      {k: "Status", v: (r.status || "unknown") + (r.verdict ? " \u00B7 " + r.verdict : "")}
+      {k: "Status", v: state}
     ];
   }
 
@@ -303,9 +320,12 @@
   /* One agent row, label first, then model, elapsed, output, tokens,
      status. The workstream cell renders only in flat overview tables,
      where no workstream header names it. */
+  /* A stalled row keeps its place but reads muted: the process is
+     alive, the agent is not answering. Owner-visible words, not a
+     warning count. */
   function agentRowEl(r, showWs) {
     var k = tierKey(r);
-    var tr = el("tr", {class: "clk", tabindex: "0",
+    var tr = el("tr", {class: r.stalled ? "clk is-stalled" : "clk", tabindex: "0",
       onclick: function () { openRun(r); },
       onkeydown: function (ev) { if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); openRun(r); } },
       onmousemove: function (ev) { showTip(ev, r.label || r.run_id, tipRows(r)); },
@@ -430,6 +450,8 @@
     function build() {
       c.innerHTML = "";
       var heading = title + " \u00B7 " + runs.length;
+      var stalledN = runs.filter(function (r) { return r.stalled; }).length;
+      if (stalledN) heading += " \u00B7 \u25D4 " + stalledN + " stalled";
       c.appendChild(el("h2", {text: heading}));
       c.appendChild(el("p", {class: "sub", text: sub}));
       if (!runs.length) { c.appendChild(el("div", {class: "empty", text: empty})); return; }

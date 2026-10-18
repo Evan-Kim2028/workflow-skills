@@ -37,6 +37,47 @@ PID_SOURCES = ("claude-main", "muse", "grok", "glm", "shell")
 # real death: the next polls then emit done and the close lands.
 PROCESS_GONE_GRACE_S = 30.0
 
+# A headless worker (muse, glm, grok, generic) whose process is still
+# alive but whose output evidence (usage heartbeats, out-file growth) is
+# older than this is stuck, not live: it reads "stalled", not "running".
+# Thirty minutes is far longer than any healthy turn gap (a live agent
+# emits usage heartbeats or grows its out file every few minutes) and
+# far shorter than the 6 h stale bound, so stalls surface the same day.
+# Process sightings alone never count: a stuck process is still sighted
+# every poll, which is exactly why it used to read live. Interactive
+# lead sessions (claude-main), the scheduler-owned Dagster jobs, and
+# shell rows are exempt: a lead thinking for an hour is using the
+# dashboard, not stuck in it.
+STALLED_AFTER_S = 30 * 60
+
+# Sources whose quiet-but-alive rows read stalled. Everything else keeps
+# the old rules (idle leads hide, Dagster follows its active set).
+STALLED_SOURCES = ("muse", "glm", "grok", "generic", "cursor")
+
+# A process sample may only vouch for a run it could have produced: the
+# process must have started no later than this after the run did, or the
+# pid (or label) was reused by a newer worker. Five minutes covers clock
+# skew between the manifest clock and the process clock without adopting
+# a relaunched twin's process onto the dead row.
+PROC_START_SKEW_S = 5 * 60
+
+
+def proc_started_ok(proc_started, run_started, skew_s: float = PROC_START_SKEW_S) -> bool:
+    """True when a matched process could belong to the run.
+
+    A process that started well after the run did is a reused pid (or a
+    relaunched same-label twin), not the run's agent. Unknown starts
+    never veto: without both clocks there is nothing to compare.
+    """
+    try:
+        proc_started = float(proc_started)
+        run_started = float(run_started)
+        skew = float(skew_s)
+    except (TypeError, ValueError):
+        return True
+    return proc_started <= run_started + skew
+
+
 # Poll cadence per source (seconds). The stale check ignores a dead-pid row
 # whose last evidence is within two poll intervals of its source: the source
 # closes the row on its next poll, so flagging it in between is noise. For

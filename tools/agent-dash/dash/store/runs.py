@@ -575,11 +575,12 @@ class RunsMixin:
                 rss = self._rss_maps(now)
                 bare = [dict(row) for row in raw]
                 live_open, shadows = self._live_open_with_shadows_locked(now, bare)
+                stalled = self._stalled_locked(now, bare)
                 rows = []
                 for row in raw:
                     if row["run_id"] in parents:
                         continue
-                    view = self._run_view(row, now, usage, rss, context)
+                    view = self._run_view(row, now, usage, rss, context, stalled.get(row["run_id"]))
                     if not include_jobs and is_prod_job_run(view):
                         continue
                     if (

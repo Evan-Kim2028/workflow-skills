@@ -82,6 +82,28 @@ tr.clk:focus-visible {
 .st.unknown i {
   background: var(--muted);
 }
+/* Outcome classes beyond raw statuses: cancelled is grey like unknown
+   (⏹ vs ○ carry the difference), stalled is amber like partial (◔ vs ◐)
+   with no pulse — a stuck row never throbs like a live one. The oc-*
+   rule comes after the status rules so the outcome always wins the dot. */
+.st.oc-cancelled i {
+  background: var(--muted);
+}
+.st.oc-unk i {
+  background: var(--muted);
+}
+.st.oc-stalled i {
+  background: var(--warning);
+}
+.st.oc-cancelled,
+.st.oc-stalled,
+.st.oc-unk {
+  color: var(--ink-2);
+}
+/* A stalled row keeps its place but reads muted. */
+tr.is-stalled td {
+  opacity: .62;
+}
 .vpill {
   display: inline-flex;
   align-items: center;
@@ -110,6 +132,16 @@ tr.clk:focus-visible {
 }
 .vpill.none {
   color: var(--muted);
+}
+.vpill.cancelled {
+  color: var(--muted);
+  border-color: color-mix(in srgb, var(--muted) 55%, transparent);
+  background: var(--mute-soft, color-mix(in srgb, var(--muted) 14%, transparent));
+}
+.vpill.died {
+  color: var(--critical-ink, var(--critical));
+  border-color: color-mix(in srgb, var(--critical) 50%, transparent);
+  background: var(--critical-soft, color-mix(in srgb, var(--critical) 14%, transparent));
 }
 .grow {
   color: var(--good-ink, var(--good));

@@ -18,7 +18,7 @@ import re
 import subprocess
 import time
 
-from dash.liveness import PROCESS_GONE_GRACE_S
+from dash.liveness import PROCESS_GONE_GRACE_S, proc_started_ok
 
 NAME = "process"
 INTERVAL_S = 5
@@ -198,13 +198,16 @@ def run_worker_label_from_args(text: str) -> str | None:
     return label
 
 
-def match_agent(source: str, pid, label, processes: list[dict], session_id=None):
+def match_agent(source: str, pid, label, processes: list[dict], session_id=None, started_at=None):
     """The live process for this run.
 
     Match by pid first, then by a muse ``--session-id`` uuid, then by
     ``[label: ...]`` or by a muse ``--prompt-file`` whose path ends in
     ``/<label>.md``. The label leg is weak: callers give a newer row with
-    the same label the process (see ``_vetoed``).
+    the same label the process (see ``_vetoed``). Every leg is guarded by
+    ``started_at`` when known: a process that started well after the run
+    did is a reused pid (or a relaunched same-label twin), not the run's
+    agent, so it never vouches the old row alive.
     """
     comms = SOURCE_COMMS.get(source)
     if not comms:
@@ -213,7 +216,7 @@ def match_agent(source: str, pid, label, processes: list[dict], session_id=None)
     if number is not None:
         for row in processes:
             if row["pid"] == number and _canon_comm(row.get("comm")) in comms:
-                return row
+                return _checked(row, started_at)
     sid = session_id if isinstance(session_id, str) and _UUID_OK.match(session_id) else None
     if sid and source == "muse":
         want = sid.lower()
@@ -224,16 +227,41 @@ def match_agent(source: str, pid, label, processes: list[dict], session_id=None)
                 and isinstance(got, str)
                 and got.lower() == want
             ):
-                return row
+                checked = _checked(row, started_at)
+                if checked is not None:
+                    return checked
     text = label if isinstance(label, str) and label else None
     if text:
         for row in processes:
             if _canon_comm(row.get("comm")) not in comms:
                 continue
             if row.get("label") == text:
-                return row
-            if source == "muse" and row.get("prompt_label") == text:
-                return row
+                checked = _checked(row, started_at)
+                if checked is not None:
+                    return checked
+            elif source == "muse" and row.get("prompt_label") == text:
+                checked = _checked(row, started_at)
+                if checked is not None:
+                    return checked
+    return None
+
+
+def _checked(proc: dict, started_at) -> dict | None:
+    """A matched process that cannot be the run's agent matches nothing.
+
+    Without both clocks there is nothing to compare and the match
+    stands, exactly as before.
+    """
+    if started_at is None:
+        return proc
+    try:
+        proc_started = proc.get("started_at")
+    except AttributeError:
+        return proc
+    if proc_started is None:
+        return proc
+    if proc_started_ok(proc_started, started_at):
+        return proc
     return None
 
 
@@ -327,15 +355,17 @@ def apply_liveness(store, run: dict, source: str, processes) -> None:
     """Set ``running`` while the process is alive.
 
     When the process is gone and the stored row was ``running``, mark it
-    ``done`` (a labeled or verdicted run) or ``unknown``, with ``ended_at``
-    at the last activity. An open ``unknown`` row is revived when a process
-    matches, and closed (``done``, with ``ended_at``) when it does not.
-    A failed process listing (``processes is None``) leaves the row alone.
-    Liveness wins over file evidence: a row with a process sample for its
-    id or stored pid within ``PROCESS_GONE_GRACE_S`` is kept ``running``
-    instead of being closed by a quiet file. Other terminal statuses are
-    not rewritten. An ``unknown`` row that already has ``ended_at`` is
-    left alone.
+    ``died_early`` (a labeled or verdicted run: the session ended without
+    a verdict) or ``unknown``, with ``ended_at`` at the last activity. An
+    open ``unknown`` row is revived when a process matches, and closed
+    (``done``, with ``ended_at``) when it does not. A failed process
+    listing (``processes is None``) leaves the row alone. A run the
+    reporter already ended this poll is never downgraded. Liveness wins
+    over file evidence: a row with a process sample for its id or stored
+    pid within ``PROCESS_GONE_GRACE_S`` is kept ``running`` instead of
+    being closed by a quiet file. Other terminal statuses are not
+    rewritten. An ``unknown`` row that already has ``ended_at`` is left
+    alone.
     """
     if processes is None or not run.get("run_id"):
         return
@@ -345,11 +375,11 @@ def apply_liveness(store, run: dict, source: str, processes) -> None:
         pid = existing.get("pid")
     label = run.get("label") or (existing or {}).get("label")
     session = _run_session(run, existing)
-    proc = match_agent(source, pid, label, processes, session)
+    started = run.get("started_at")
+    if started is None and existing:
+        started = existing.get("started_at")
+    proc = match_agent(source, pid, label, processes, session, started)
     if proc is not None:
-        started = run.get("started_at")
-        if started is None and existing:
-            started = existing.get("started_at")
         leg = _match_leg(source, pid, session, proc)
         if _vetoed(store, source, run["run_id"], label, started, session, proc, leg):
             proc = None
@@ -380,7 +410,15 @@ def apply_liveness(store, run: dict, source: str, processes) -> None:
         run["status"] = "running"
         run["ended_at"] = None
         return
-    run["status"] = "done" if label or existing.get("verdict") else "unknown"
+    if run.get("status") in ("done", "killed", "died_early", "finished"):
+        # The reporter already ended the run this poll (a finish line beat
+        # the process listing): the close-out must not downgrade it.
+        return
+    # The process vanished without a finish line. A labeled or verdicted
+    # run reads died_early, never done: it ended without a verdict, so the
+    # dashboard colours it died (red), not finished (green) or blocked
+    # (orange). An anonymous row with nothing to say reads unknown.
+    run["status"] = "died_early" if label or existing.get("verdict") else "unknown"
     run["ended_at"] = _last_activity(store, run["run_id"], existing.get("started_at") or run.get("started_at"))
     run["pid"] = None
 
@@ -422,7 +460,7 @@ def reconcile_running(store, now: float, processes=None) -> int:
         if source not in SOURCE_COMMS:
             continue
         session = _run_session(row, None)
-        proc = match_agent(source, row.get("pid"), row.get("label"), processes, session)
+        proc = match_agent(source, row.get("pid"), row.get("label"), processes, session, row.get("started_at"))
         if proc is not None:
             leg = _match_leg(source, row.get("pid"), session, proc)
             if _vetoed(
@@ -455,7 +493,9 @@ def reconcile_running(store, now: float, processes=None) -> int:
             continue
         patch = {
             "run_id": row["run_id"],
-            "status": "done" if row.get("label") or row.get("verdict") else "unknown",
+            # Vanished without a finish line: died_early reads died (red),
+            # never done (green). Anonymous rows stay unknown.
+            "status": "died_early" if row.get("label") or row.get("verdict") else "unknown",
             "ended_at": _last_activity(store, row["run_id"], row.get("started_at")) or float(now),
             "pid": None,
         }
@@ -497,15 +537,19 @@ def _close_stale_claude_shell(store, now: float) -> int:
             continue
         if run.get("status") != "running":
             continue
-        store.upsert_run(
-            {
-                "run_id": run["run_id"],
-                "status": "done" if run.get("label") or run.get("verdict") else "unknown",
-                "ended_at": _last_activity(store, run["run_id"], run.get("started_at"))
-                or float(now),
-                "pid": None,
-            }
-        )
+        anon = not run.get("label") and not run.get("verdict")
+        patch = {
+            "run_id": run["run_id"],
+            # Idle closes ended without a verdict: died_early reads died
+            # (red). The IDLE verdict names the reason in tooltips.
+            "status": "unknown" if anon else "died_early",
+            "ended_at": _last_activity(store, run["run_id"], run.get("started_at"))
+            or float(now),
+            "pid": None,
+        }
+        if not anon and not run.get("verdict"):
+            patch["verdict"] = "IDLE"
+        store.upsert_run(patch)
         ended += 1
     return ended
 

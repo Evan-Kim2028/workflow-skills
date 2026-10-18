@@ -811,7 +811,7 @@ class StoreTest(unittest.TestCase):
         self.assertEqual(counts["live_by_tool"], {"grok": 1, "muse": 0, "glm": 0, "claude": 0, "deepseek": 0, "other": 0})
         self.assertEqual(counts["finished_today"], 1)
         self.assertEqual(counts["finished_in_range"], 1)
-        self.assertEqual(counts["finished_by_verdict"], {"PASS": 1})
+        self.assertEqual(counts["finished_by_verdict"], {"ok": 1})
         running = [run["run_id"] for run in snap["running"]]
         self.assertIn("grok:parent:ws1-parent", running)
         self.assertIn("claude-main:s:main", running)
@@ -1463,7 +1463,7 @@ class ProcessParseTest(unittest.TestCase):
         self.assertEqual(shadow["parent_session_id"], "grok:chat:dash-a")
         self.assertEqual(shadow["ended_at"], 100)
         self.assertEqual(labeled["status"], "running")
-        self.assertEqual(muse["status"], "done")
+        self.assertEqual(muse["status"], "died_early")
         self.assertEqual(muse["ended_at"], 50)
 
     def test_reconcile_moves_orphan_usage_and_deletes_the_row(self):
@@ -1709,7 +1709,7 @@ class ProcessParseTest(unittest.TestCase):
             finally:
                 store.close()
         self.assertEqual(ended, 1)
-        self.assertEqual(row["status"], "done")
+        self.assertEqual(row["status"], "died_early")
         self.assertEqual(row["started_at"], 1792167818.0)
         self.assertEqual(row["ended_at"], 1792167946.0)
         self.assertIsNone(row["pid"])
@@ -2083,6 +2083,201 @@ class StaleRunningTest(unittest.TestCase):
         self.assertFalse(any(run_id in item for item in report["mismatches"]))
 
 
+class StalledTest(unittest.TestCase):
+    """A live process with no output is stuck, not live."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.store = memory(Path(self.tmp.name))
+        self.now = time.time()
+
+    def tearDown(self):
+        self.store.close()
+        self.tmp.cleanup()
+
+    def _running(self, run_id, source="muse", pid=True, started_ago=7200, **over):
+        row = {
+            "run_id": run_id,
+            "source": source,
+            "tier": source,
+            "label": run_id.split(":")[-1],
+            "status": "running",
+            "pid": os.getpid() if pid else None,
+            "started_at": self.now - started_ago,
+        }
+        row.update(over)
+        self.store.upsert_run(row)
+        return row
+
+    def _heartbeat(self, run_id, ts=None):
+        self.store.add_usage(
+            {
+                "ts": self.now if ts is None else ts,
+                "session_id": "sess",
+                "run_id": run_id,
+                "model": "muse-spark-1.3",
+                "tool": "muse",
+                "message_id": "m-%s" % run_id,
+                "input": 1,
+                "output": 1,
+                "cache_read": 0,
+                "cache_write": 0,
+                "reasoning": 0,
+            }
+        )
+
+    def test_quiet_alive_worker_reads_stalled(self):
+        now = self.now
+        run_id = "muse:s:ws1-stuck"
+        self._running(run_id)
+        stalled = self.store._stalled_locked(now, [dict(self.store.get_run(run_id))])
+        self.assertIn(run_id, stalled)
+        self.assertGreater(stalled[run_id], 1800)
+        snap = self.store.snapshot(now, "all")
+        row = next(run for run in snap["running"] if run["run_id"] == run_id)
+        self.assertTrue(row["stalled"])
+        self.assertEqual(row["outcome_class"], "stalled")
+        self.assertIn("no output", row["outcome_reason"])
+        self.assertEqual(snap["counts"]["live_agents"], 0)
+        self.assertEqual(snap["counts"]["stalled"], 1)
+
+    def test_fresh_output_reads_live(self):
+        now = self.now
+        run_id = "muse:s:ws1-live"
+        self._running(run_id)
+        self._heartbeat(run_id)
+        stalled = self.store._stalled_locked(now, [dict(self.store.get_run(run_id))])
+        self.assertEqual(stalled, {})
+        snap = self.store.snapshot(now, "all")
+        self.assertEqual(snap["counts"]["live_agents"], 1)
+        self.assertEqual(snap["counts"]["stalled"], 0)
+
+    def test_fresh_out_file_reads_live(self):
+        now = self.now
+        out = os.path.join(self.tmp.name, "out-ws1-fresh.md")
+        with open(out, "w") as fh:
+            fh.write("working\n")
+        run_id = "muse:s:ws1-fresh"
+        self._running(run_id, out_path=out)
+        stalled = self.store._stalled_locked(now, [dict(self.store.get_run(run_id))])
+        self.assertEqual(stalled, {})
+
+    def test_dead_pid_is_never_stalled(self):
+        now = self.now
+        run_id = "muse:s:ws1-dead"
+        self.store.upsert_run(
+            {
+                "run_id": run_id,
+                "source": "muse",
+                "tier": "muse",
+                "label": "ws1-dead",
+                "status": "running",
+                "pid": 99999999,
+                "started_at": now - 7200,
+            }
+        )
+        stalled = self.store._stalled_locked(now, [dict(self.store.get_run(run_id))])
+        self.assertEqual(stalled, {})
+
+    def test_leads_and_jobs_are_exempt(self):
+        now = self.now
+        lead = "claude-main:sess:main"
+        self._running(lead, source="claude-main")
+        job = "dagster:job:stuck"
+        self.store.upsert_run(
+            {
+                "run_id": job,
+                "source": "dagster",
+                "label": "stuck",
+                "status": "running",
+                "pid": os.getpid(),
+                "started_at": now - 7200,
+            }
+        )
+        rows = [dict(self.store.get_run(lead)), dict(self.store.get_run(job))]
+        self.assertEqual(self.store._stalled_locked(now, rows), {})
+
+    def test_reused_pid_reads_stale_not_idle(self):
+        now = self.now
+        run_id = "claude-main:old:main"
+        self._running(run_id, source="claude-main", started_ago=45 * 3600)
+        self.store.add_process_sample(
+            {
+                "ts": now,
+                "pid": os.getpid(),
+                "comm": "claude",
+                "rss_kb": 10,
+                "elapsed_s": 5.0,
+                "label": "main",
+                "run_id": "other:new:row",
+                "model": None,
+            }
+        )
+        stale = self.store.stale_running(now, pid_alive_fn=lambda pid: True)
+        self.assertEqual([run["run_id"] for run, _reason in stale], [run_id])
+        self.assertIn("reused", stale[0][1])
+
+    def test_idle_shell_close_reads_died(self):
+        from dash.outcomes import outcome_class
+
+        now = self.now
+        run_id = "shell:s:ws1-quiet"
+        self.store.upsert_run(
+            {
+                "run_id": run_id,
+                "source": "shell",
+                "label": "ws1-quiet",
+                "status": "running",
+                "started_at": now - 7 * 3600,
+            }
+        )
+        ended = reconcile_running(self.store, now, processes=[])
+        self.assertGreaterEqual(ended, 1)
+        row = self.store.get_run(run_id)
+        self.assertEqual(row["status"], "died_early")
+        self.assertEqual(row["verdict"], "IDLE")
+        self.assertEqual(outcome_class(row), "died")
+
+    def test_views_carry_outcome_class_and_reason(self):
+        from dash.outcomes import outcome_class as cls
+
+        now = self.now
+        self.store.upsert_run(
+            {
+                "run_id": "muse:s:ws1-doomed",
+                "source": "muse",
+                "tier": "muse",
+                "label": "ws1-doomed",
+                "status": "killed",
+                "started_at": now - 200,
+                "ended_at": now - 30,
+            }
+        )
+        self.store.upsert_run(
+            {
+                "run_id": "dagster:job:cancelled",
+                "source": "dagster",
+                "label": "cancelled",
+                "status": "finished",
+                "verdict": "CANCELED",
+                "started_at": now - 200,
+                "ended_at": now - 30,
+            }
+        )
+        rows = self.store.query_runs(now, "all", None, None, 50, include_jobs=True)
+        by_id = {run["run_id"]: run for run in rows}
+        doomed = by_id["muse:s:ws1-doomed"]
+        self.assertEqual(doomed["outcome_class"], "died")
+        self.assertIn("SIGTERM", doomed["outcome_reason"])
+        cancelled = by_id["dagster:job:cancelled"]
+        self.assertEqual(cancelled["outcome_class"], "cancelled")
+        snap = self.store.snapshot(now, "all")
+        recent = {run["run_id"]: run for run in snap["recent"]}
+        self.assertEqual(recent["muse:s:ws1-doomed"]["outcome_class"], "died")
+        for run in list(by_id.values()) + list(recent.values()):
+            self.assertEqual(run["outcome_class"], cls(run))
+
+
 class LaneAndUnseenTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -2308,7 +2503,7 @@ class LaneAndUnseenTest(unittest.TestCase):
         ended = reconcile_running(self.store, now, processes=[])
         self.assertEqual(ended, 1)
         row = self.store.get_run("glm:sid9:ws9-WS9.2-plan")
-        self.assertEqual(row["status"], "done")
+        self.assertEqual(row["status"], "died_early")
         self.assertEqual(row["ended_at"], 1_792_000_400.0)
 class GracePeriodTest(unittest.TestCase):
     """A dead-pid row within two poll intervals of its source is not stale."""

@@ -310,19 +310,24 @@
     if (!Object.keys(lbm).length) run.forEach(function (r) { if (!isAgent(r)) return; var k = tierKey(r); lbm[k] = (lbm[k] || 0) + 1; });
     ADM.sortKeys(Object.keys(lbm).filter(function (k) { return lbm[k]; })).forEach(function (k) { var f = ADM.famOf(k); (byFam[f] = byFam[f] || []).push(k); });
     var liveLines = [ADM.FAMS.filter(function (f) { return byFam[f]; }).map(function (f) { var ks = byFam[f], n = ks.reduce(function (a, k) { return a + lbm[k]; }, 0); return ADM.FAM[f].name + " " + fmtN(n) + " (" + ks.map(function (k) { return ADM.nameOf(k) + " " + fmtN(lbm[k]); }).join(", ") + ")"; }).join(" · ") || "idle"];
+    /* Stalled workers are stuck, not live: their own words, never folded
+       into the live count. */
+    if (cn.stalled) liveLines.push("◔ " + fmtN(cn.stalled) + " stalled");
     var jobBits = [];
     if (cn.prod_jobs) jobBits.push(fmtN(cn.prod_jobs) + " prod jobs");
     if (cn.prod_jobs_finished) jobBits.push(fmtN(cn.prod_jobs_finished) + " prod jobs ran");
     if (jobBits.length) liveLines.push(jobBits.join(" · "));
-    /* Blocked (review verdicts that send work back) and died (runs that
-       never finished, counted server-side under "died") keep their own
-       colour plus glyph plus word: blocked is ⊘ serious orange, died is
-       ✕ critical red, partial stays ◐ amber, pass ✓ green. */
-    var blockedN = (fv.BLOCKED || 0) + (fv.REQUEST_CHANGES || 0), part = (fv.PARTIAL || 0) + (fv.APPROVE_WITH_CHANGES || 0);
-    var passN = (fv.PASS || 0) + (fv.APPROVE || 0) + (fv.APPROVE_WITH_NITS || 0);
-    var diedN = fv.died || 0;
+    /* One derivation for the caption too: finished_by_verdict carries
+       outcome classes (dash/outcomes.py), so blocked (⊘ serious orange,
+       a reported verdict) and died (✕ critical red, the session ended
+       without one) never share a bucket here either. */
+    var passN = fv.ok || 0, part = fv.part || 0, blockedN = fv.blocked || 0;
+    var diedN = fv.died || 0, cancN = fv.cancelled || 0, unkN = fv.unk || 0;
     /* No outcomes recorded means no outcome line, not a row of zeros. */
-    var finLines = (passN + part + blockedN + diedN) ? ["✓ " + fmtN(passN) + " pass · ◐ " + fmtN(part) + " partial · ⊘ " + fmtN(blockedN) + " blocked · ✕ " + fmtN(diedN) + " died (24 h)"] : [];
+    var finBits = ["✓ " + fmtN(passN) + " pass", "◐ " + fmtN(part) + " partial", "⊘ " + fmtN(blockedN) + " blocked", "✕ " + fmtN(diedN) + " died"];
+    if (cancN) finBits.push("⏹ " + fmtN(cancN) + " cancelled");
+    if (unkN) finBits.push("○ " + fmtN(unkN) + " no verdict");
+    var finLines = (passN + part + blockedN + diedN + cancN + unkN) ? [finBits.join(" · ") + " (24 h)"] : [];
     var tokVal = allTok ? fmtN(allTok) : "0 in 24 h";
     var tokLines = allTok
       ? [cachedPct(tk) + "% cached · out " + fmtN(tk.output || 0), fmtN(allTimeTok) + " all time"]

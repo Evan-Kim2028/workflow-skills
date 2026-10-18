@@ -151,6 +151,67 @@ class ServerTest(unittest.TestCase):
         runs = json.loads(body)["runs"]
         self.assertEqual(runs[0]["run_id"], "muse:s:ws7-landing")
 
+    def test_runs_and_snapshot_carry_outcome_class(self):
+        """Every /api/runs row and snapshot row carries the one server
+        derivation (run.outcome_class plus run.outcome_reason), and the
+        finished buckets count classes, never raw verdicts: a killed row
+        with a BLOCKED verdict reads died, a quota row reads died with
+        its reason, a CANCELED job reads cancelled."""
+        now = time.time()
+        self.store.upsert_run(
+            {
+                "run_id": "muse:s:ws7-doomed",
+                "source": "muse",
+                "tier": "muse",
+                "label": "ws7-doomed",
+                "status": "killed",
+                "verdict": "BLOCKED",
+                "started_at": now - 200,
+                "ended_at": now - 100,
+            }
+        )
+        self.store.upsert_run(
+            {
+                "run_id": "glm:s:ws7-quota",
+                "source": "glm",
+                "tier": "glm",
+                "label": "ws7-quota",
+                "status": "died_early",
+                "verdict": "QUOTA",
+                "started_at": now - 200,
+                "ended_at": now - 100,
+            }
+        )
+        self.store.upsert_run(
+            {
+                "run_id": "muse:s:ws7-pass",
+                "source": "muse",
+                "tier": "muse",
+                "label": "ws7-pass",
+                "status": "done",
+                "verdict": "PASS",
+                "started_at": now - 200,
+                "ended_at": now - 100,
+            }
+        )
+        status, _, body = get(self.port, "/api/runs?limit=10")
+        self.assertEqual(status, 200)
+        by_id = {row["run_id"]: row for row in json.loads(body)["runs"]}
+        self.assertEqual(by_id["muse:s:ws7-doomed"]["outcome_class"], "died")
+        self.assertIn("SIGTERM", by_id["muse:s:ws7-doomed"]["outcome_reason"])
+        self.assertEqual(by_id["glm:s:ws7-quota"]["outcome_class"], "died")
+        self.assertIn("quota", by_id["glm:s:ws7-quota"]["outcome_reason"])
+        self.assertEqual(by_id["muse:s:ws7-pass"]["outcome_class"], "ok")
+        status, _, body = get(self.port, "/api/snapshot?ws=all")
+        self.assertEqual(status, 200)
+        payload = json.loads(body)
+        recent = {row["run_id"]: row for row in payload["recent"]}
+        self.assertEqual(recent["muse:s:ws7-doomed"]["outcome_class"], "died")
+        self.assertEqual(recent["glm:s:ws7-quota"]["outcome_class"], "died")
+        self.assertEqual(
+            payload["counts"]["finished_by_verdict"], {"died": 2, "ok": 1}
+        )
+
     def test_agent_areas_hold_no_prod_jobs(self):
         """Production jobs are a count, never a list: the snapshot running
         and recent lists and /api/runs (default) hold no dagster row, while

@@ -449,7 +449,7 @@ class GrokRunDirEvidenceTests(unittest.TestCase):
         }
         self.assertEqual(grok._latest_per_label(manifests), {"new-sid", "other-sid"})
 
-    def test_quota_err_closes_newest_attempt_as_blocked(self):
+    def test_quota_err_closes_newest_attempt_as_died(self):
         with tempfile.TemporaryDirectory() as tmp:
             cfg, _scratch = self.tree(
                 tmp,
@@ -459,8 +459,8 @@ class GrokRunDirEvidenceTests(unittest.TestCase):
             store = Store()
             self.poll(store, cfg, 1792154000)
             run = store.runs["glm:%s:quota-run" % SID]
-            self.assertEqual(run["status"], "done")
-            self.assertEqual(run["verdict"], "BLOCKED")
+            self.assertEqual(run["status"], "died_early")
+            self.assertEqual(run["verdict"], "QUOTA")
             self.assertNotIn("pid", run)
 
     def test_quota_closeout_wins_over_a_live_label_match(self):
@@ -473,11 +473,11 @@ class GrokRunDirEvidenceTests(unittest.TestCase):
             row = {"label": "quota-run", "session_id": SID, "started_at": 1792153370.0}
             procs = [{"pid": 99999, "comm": "grok", "label": "quota-run", "model": None,
                       "reasoning_effort": None, "prompt_label": None, "session_id": None,
-                      "started_at": 1792153990.0}]
+                      "started_at": 1792153300.0}]
             grok._upsert_run(store, row, None, None, procs, pad, True, 1792154000)
             run = store.runs["glm:%s:quota-run" % SID]
-            self.assertEqual(run["status"], "done")
-            self.assertEqual(run["verdict"], "BLOCKED")
+            self.assertEqual(run["status"], "died_early")
+            self.assertEqual(run["verdict"], "QUOTA")
             self.assertNotIn("pid", run)
 
     def test_pid_file_is_adopted_without_forcing_status(self):
@@ -505,7 +505,7 @@ class GrokRunDirEvidenceTests(unittest.TestCase):
             store = Store()
             self.poll(store, cfg, 1792154000)
             new = store.runs["glm:%s:same-label" % SID]
-            self.assertEqual((new["status"], new["verdict"]), ("done", "BLOCKED"))
+            self.assertEqual((new["status"], new["verdict"]), ("died_early", "QUOTA"))
             prev = store.runs["glm:%s:same-label" % old]
             self.assertNotIn("status", prev)
             self.assertNotIn("verdict", prev)

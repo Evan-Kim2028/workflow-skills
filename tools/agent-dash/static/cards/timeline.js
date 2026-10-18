@@ -31,18 +31,12 @@
     });
     return rows;
   }
-  /* Died first: a run that never finished reads died whatever its
-     verdict field holds. Blocked covers the review verdicts that send
-     work back (BLOCKED, REQUEST_CHANGES). */
-  function outcomeOf(r) {
-    if (!r.ended_at) return r.status === "running" ? "run" : "unk";
-    if (r.status === "died_early" || r.status === "killed" || r.verdict === "FAILURE" || r.verdict === "CANCELED") return "died";
-    if (r.verdict === "BLOCKED" || r.verdict === "REQUEST_CHANGES") return "blocked";
-    if (r.verdict === "PARTIAL" || r.verdict === "APPROVE_WITH_CHANGES") return "part";
-    if (r.status === "done" || r.verdict === "SUCCESS") return "ok";
-    return "unk";
-  }
-  var OUTCOME = {run: ["var(--s1)", "\u25CF", "running"], ok: ["var(--good)", "\u2713", "finished"], part: ["var(--warning)", "\u25D0", "partial"], blocked: ["var(--serious)", "\u2298", "blocked"], died: ["var(--critical)", "\u2715", "died"], unk: ["var(--muted)", "?", "ended, outcome unknown"]};
+  /* One derivation only: outcome classes live in static/models.js
+     (ADM.outcomeOf, mirroring dash/outcomes.py) and the server exposes
+     run.outcome_class on its views. This file keeps the global names so
+     existing callers and tests keep working, but holds no if-chain. */
+  function outcomeOf(r) { return ADM.outcomeOf(r); }
+  var OUTCOME = ADM.OUTCOME;
   function outcomeColor(r) { var o = outcomeOf(r); return o === "run" || o === "unk" ? null : OUTCOME[o][0]; }
   function famOfRun(r) { return ADM.famOf(tierKey(r)); }
   function famName(f) { return (ADM.FAM[f] || ADM.FAM.other).name; }

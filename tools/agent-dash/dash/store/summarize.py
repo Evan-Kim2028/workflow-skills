@@ -9,6 +9,7 @@ runs under the facade lock.
 from __future__ import annotations
 
 from dash.models import run_model_key
+from dash.outcomes import outcome_class, outcome_reason
 
 from .runs import (_is_manifest_twin, _nearest_twin,
                    _parent_map, _rollup_usage)
@@ -429,7 +430,12 @@ class SummarizeMixin:
             raw, usage, parents = self._scoped_usage()
             context = self._context_by_run()
             rss = self._rss_maps(now)
-            views = [self._run_view(row, now, usage, rss, context) for row in raw]
+            bare = [dict(row) for row in raw]
+            stalled = self._stalled_locked(now, bare)
+            views = [
+                self._run_view(row, now, usage, rss, context, stalled.get(row["run_id"]))
+                for row in raw
+            ]
             shown = _drop_launch_echoes([view for view in views if view["run_id"] not in parents])
             return shown, parents
         def _summarize_locked(self, shown_all: list, parents: dict, now: float, since, until, live_open=None, usage=None) -> dict:
@@ -448,6 +454,13 @@ class SummarizeMixin:
                 live_open = self._live_open_ids_locked(now, shown_all)
             if usage is None:
                 usage = self._usage_by_run()
+            # Stalled flags ride in from _shown_locked (usage plus out-file
+            # evidence); reuse them so one snapshot stats each file once.
+            stalled = {
+                run["run_id"]: run["stalled"]
+                for run in shown_all
+                if run.get("stalled")
+            }
             range_since = now - RANGE_S if since is None else float(since)
             range_until = float(now if until is None else until)
             cells = self._query_usage_locked("workstream", "hour", None, range_since, range_until)
@@ -459,6 +472,7 @@ class SummarizeMixin:
                 shown_all, parents, usage, now, since, until, range_since, range_until,
                 [cell for group in buckets.values() for cell in group],
                 live_open,
+                stalled,
             )
             workstreams = sorted({run.get("workstream") or UNASSIGNED for run in shown_all}, key=_ws_sort)
             if UNASSIGNED not in workstreams:
@@ -469,6 +483,7 @@ class SummarizeMixin:
                     members, parents, usage, now, since, until, range_since, range_until,
                     buckets.get(ws, []),
                     live_open,
+                    stalled,
                 )
             # The 24 hours immediately before the window, per scope, with the
             # same bucket sums and the same agent rule as the windowed
@@ -540,8 +555,12 @@ class SummarizeMixin:
                 if row["pid"] not in by_pid:
                     by_pid[row["pid"]] = row["rss_kb"]
             return by_run, by_pid
-        def _run_view(self, row, now: float, usage: dict, rss: tuple[dict, dict], context: dict | None = None) -> dict:
+        def _run_view(self, row, now: float, usage: dict, rss: tuple[dict, dict], context: dict | None = None, stalled=None) -> dict:
             data = dict(row)
+            outcome_row = dict(data)
+            if stalled:
+                outcome_row["stalled"] = stalled
+            cls = outcome_class(outcome_row)
             present = data["run_id"] in usage
             folded, cost, _unpriced = usage.get(data["run_id"], (_zeros(), 0.0, False))
             by_run, by_pid = rss
@@ -566,6 +585,9 @@ class SummarizeMixin:
                 "parent_session_id": data.get("parent_session_id"),
                 "status": data.get("status"),
                 "verdict": data.get("verdict"),
+                "outcome_class": cls,
+                "outcome_reason": outcome_reason(outcome_row, cls),
+                "stalled": stalled if stalled else False,
                 "started_at": data.get("started_at"),
                 "ended_at": data.get("ended_at"),
                 "elapsed_s": _elapsed(data, now),
@@ -660,15 +682,17 @@ def _scope_numbers(
     range_until: float,
     cells: list,
     live_open=None,
+    stalled=None,
 ) -> dict:
     """Counts and totals for one scope (all, one workstream, or unassigned).
 
     Counts use the agent rule (lead sessions and Dagster jobs are not agents)
     and the window. Token and cost sums add up the ``/api/usage`` cells for the
     same window, so the snapshot, the tiles, and the chart legend agree.
-    Live counts use ``live_open`` (the one filtered running set).
+    Live counts use ``live_open`` (the one filtered running set); stalled
+    rows are counted separately under ``counts["stalled"]``.
     """
-    counts = _agent_counts(runs, parents, now, since, until, live_open)
+    counts = _agent_counts(runs, parents, now, since, until, live_open, stalled)
     summed = _sum_cells(cells)
     unpriced_runs = sum(
         1
@@ -840,7 +864,7 @@ def _empty_scope() -> dict:
     }
 
 
-def _agent_counts(runs: list, parents: dict, now: float, since, until, live_open=None) -> dict:
+def _agent_counts(runs: list, parents: dict, now: float, since, until, live_open=None, stalled=None) -> dict:
     range_since = now - RANGE_S if since is None else float(since)
     range_until = float(now if until is None else until)
     today = _local_midnight(now)
@@ -848,11 +872,13 @@ def _agent_counts(runs: list, parents: dict, now: float, since, until, live_open
     live_by_model: dict = {}
     seen = set()
     live_n = 0
+    stalled_n = 0
     prod_jobs = 0
     prod_jobs_finished = 0
     finished_today = 0
     finished_range = 0
     by_verdict = {}
+    stalled_ids = set(stalled or ())
     for run in runs:
         if run["run_id"] in parents:
             continue
@@ -875,6 +901,11 @@ def _agent_counts(runs: list, parents: dict, now: float, since, until, live_open
         if run.get("status") == "running":
             if live_open is not None and run["run_id"] not in live_open:
                 continue
+            if run["run_id"] in stalled_ids:
+                # Stuck on a live process, not live: counted separately
+                # with its own pill, never in the live-agents strip.
+                stalled_n += 1
+                continue
             tool = _tool_key(run)
             key = (tool, run.get("label") or run["run_id"])
             if key in seen:
@@ -892,18 +923,17 @@ def _agent_counts(runs: list, parents: dict, now: float, since, until, live_open
             finished_today += 1
         if range_since <= ended <= range_until:
             finished_range += 1
-            # A run that never finished reads as died whatever its verdict
-            # field holds, so the dashboard can colour died apart from
-            # blocked (review verdicts) instead of lumping both together.
-            if run.get("status") in ("killed", "died_early"):
-                verdict = "died"
-            else:
-                verdict = run.get("verdict") or "none"
-            by_verdict[verdict] = by_verdict.get(verdict, 0) + 1
+            # One derivation for every surface: the tile caption, the
+            # Finished filters, the timeline, the drawer, and the legends
+            # all read outcome classes, never raw verdicts, so a dead
+            # session can never bucket as blocked (or finished).
+            cls = outcome_class(run)
+            by_verdict[cls] = by_verdict.get(cls, 0) + 1
     return {
         "live_agents": live_n,
         "live_by_tool": live_by,
         "live_by_model": live_by_model,
+        "stalled": stalled_n,
         "prod_jobs": prod_jobs,
         "prod_jobs_finished": prod_jobs_finished,
         "finished_today": finished_today,

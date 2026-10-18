@@ -946,15 +946,11 @@
        painted from the same rpCursorTime playhead. Bars appear as their run
        starts and grow until it ends; a vertical cursor sweeps the shared
        time axis. Clicking or dragging the plot scrubs both cards. */
-    /* Mirrors outcomeOf (static/cards/timeline.js): died and blocked are
-       distinct outcomes with their own colours and glyphs. */
+    /* One derivation only: the replay adapts its run shape onto the
+       shared ADM.outcomeOf (static/models.js, mirroring
+       dash/outcomes.py) and holds no if-chain of its own. */
     function rpOutcomeOf(run) {
-      if (!run.end) return run.status === "running" ? "run" : "unk";
-      if (run.status === "died_early" || run.status === "killed" || run.verdict === "FAILURE" || run.verdict === "CANCELED") return "died";
-      if (run.verdict === "BLOCKED" || run.verdict === "REQUEST_CHANGES") return "blocked";
-      if (run.verdict === "PARTIAL" || run.verdict === "APPROVE_WITH_CHANGES") return "part";
-      if (run.status === "done" || run.verdict === "SUCCESS") return "ok";
-      return "unk";
+      return outcomeOf({status: run.status, verdict: run.verdict, ended_at: run.end == null ? null : run.end, stalled: run.stalled, outcome_class: run.outcome_class});
     }
     /* Pack runs into rows in axis space (rpTimeToFrac), not wall-clock
        seconds, so rows follow the same warp as the axis: runs across a
@@ -974,7 +970,10 @@
     function rpTimelineCard() {
       var c = el("div", {class: "card", id: "exec-timeline", "data-nav": "Run timeline"}, [el("h2", {text: "Run timeline"}), el("p", {class: "sub", text: "The same playhead as the plan progress map above: bars appear as their run starts and grow until it ends. The strip is how many worker agents ran at each moment. Click or drag to scrub both; hover a bar for the run."})]);
       var lg = el("div", {class: "legend"});
-      ["run", "ok", "part", "blocked", "died"].forEach(function (k) {
+      /* Exactly the classes present in this span, in severity order. */
+      var rpPresent = {};
+      (RP.tlRuns || []).forEach(function (r) { rpPresent[rpOutcomeOf(r)] = true; });
+      ["run", "ok", "part", "blocked", "died", "cancelled", "stalled", "unk"].filter(function (k) { return rpPresent[k]; }).forEach(function (k) {
         var o = OUTCOME[k], sp = el("span");
         var sw = el("i", {class: "sw"}); sw.style.background = o[0]; sp.appendChild(sw);
         sp.appendChild(document.createTextNode(o[1] + " " + o[2])); lg.appendChild(sp);
@@ -1059,8 +1058,10 @@
             var bar = s("rect", {y: ry, height: rowH, rx: 2, fill: "var(--s1)", class: "rp-tl-bar"});
             bar.setAttribute("data-task", r.task);
             bar.addEventListener("mousemove", function (ev) {
-              var o = OUTCOME[rpOutcomeOf({end: r.end, status: r.status, verdict: r.verdict})] || OUTCOME.run;
-              showTip(ev, r.label || r.task, [{k: "outcome", v: o[1] + " " + (r.verdict || o[2]), c: o[0]}, {k: "model", v: r.family || "other"}, {k: "elapsed", v: r.end ? fmtDur(r.end - r.start) : "end not recorded"}, {k: "task", v: r.task}]);
+              var rr = {end: r.end, status: r.status, verdict: r.verdict, outcome_class: r.outcome_class};
+              var oc = rpOutcomeOf(rr), o = OUTCOME[oc] || OUTCOME.run;
+              var why = (typeof ADM !== "undefined" && ADM.outcomeReason) ? ADM.outcomeReason({status: r.status, verdict: r.verdict, outcome_reason: r.outcome_reason}, oc) : null;
+              showTip(ev, r.label || r.task, [{k: "outcome", v: o[1] + " " + o[2] + (why ? " \u2014 " + why : ""), c: o[0]}, {k: "model", v: r.family || "other"}, {k: "elapsed", v: r.end ? fmtDur(r.end - r.start) : "end not recorded"}, {k: "task", v: r.task}]);
               if (chipEl[r.task]) chipEl[r.task].classList.add("rp-hi");
             });
             bar.addEventListener("mouseleave", function () { hideTip(); if (chipEl[r.task]) chipEl[r.task].classList.remove("rp-hi"); });

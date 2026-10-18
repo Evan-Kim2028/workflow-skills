@@ -183,13 +183,18 @@ class QueriesMixin:
             with self._lock:
                 shown_all, parents = self._shown_locked(now)
                 live_open = self._live_open_ids_locked(now, shown_all)
+                stalled = self._stalled_locked(now, shown_all)
                 roll = self._summarize_locked(shown_all, parents, now, since, until, live_open)
                 mismatches = self._mismatches_locked(
                     roll, shown_all, now, lambda ws: _scope_tab(roll, ws), processes
                 )
                 by_source: dict[str, int] = {}
                 for run in shown_all:
-                    if run.get("status") == "running" and run.get("run_id") in live_open:
+                    if (
+                        run.get("status") == "running"
+                        and run.get("run_id") in live_open
+                        and run.get("run_id") not in stalled
+                    ):
                         key = run.get("source") or "unknown"
                         by_source[key] = by_source.get(key, 0) + 1
                 range_since = now - RANGE_S if since is None else float(since)
@@ -237,6 +242,7 @@ class QueriesMixin:
             with self._lock:
                 runs = [dict(row) for row in self._all_runs()]
                 live_open = self._live_open_ids_locked(now, runs)
+                stalled = self._stalled_locked(now, runs)
             parents = _parent_map(runs)
             runs = _drop_launch_echoes([run for run in runs if run["run_id"] not in parents and _is_counted_agent(run)])
             runs = [
@@ -244,6 +250,13 @@ class QueriesMixin:
                 for run in runs
                 if not (run.get("status") in ("running", "queued") and run["run_id"] not in live_open)
             ]
+            # Stalled rows end at the stall point: their history stays on
+            # the strip, but nothing past the stall reads live.
+            stall_end = {
+                run_id: now - idle
+                for run_id, idle in stalled.items()
+                if isinstance(idle, (int, float))
+            }
             if ws and ws != "all":
                 runs = [run for run in runs if run["workstream"] == ws]
             # Sweep-line over start/end events: one bisect per (tool, model)
@@ -264,7 +277,11 @@ class QueriesMixin:
                 if lane is None:
                     lane = lanes[(key, run_model_key(run))] = ([], [], [])
                 if run.get("status") == "running":
-                    lane[2].append(start)
+                    if run["run_id"] in stall_end:
+                        lane[0].append(start)
+                        lane[1].append(stall_end[run["run_id"]])
+                    else:
+                        lane[2].append(start)
                 else:
                     end = run.get("ended_at")
                     if end is None:

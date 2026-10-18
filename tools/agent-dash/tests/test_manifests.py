@@ -722,7 +722,7 @@ class ManifestQuotaAndSupersedeTests(unittest.TestCase):
         self.assertGreaterEqual(left, 0)
         return self.store.runs[run_id]
 
-    def test_quota_err_closes_running_row_as_blocked(self):
+    def test_quota_err_closes_running_row_as_died(self):
         row = self._emit(
             "quota-lane",
             GLM,
@@ -733,8 +733,8 @@ class ManifestQuotaAndSupersedeTests(unittest.TestCase):
             quota_hit=True,
             superseded=False,
         )
-        self.assertEqual(row["status"], "done")
-        self.assertEqual(row["verdict"], "BLOCKED")
+        self.assertEqual(row["status"], "died_early")
+        self.assertEqual(row["verdict"], "QUOTA")
         self.assertEqual(row["pid"], 4242)
         self.assertIsNotNone(row.get("ended_at"))
 
@@ -782,7 +782,7 @@ class ManifestQuotaAndSupersedeTests(unittest.TestCase):
         )
         self.assertIsNone(stale.get("pid"))
 
-    def test_poll_quota_err_marks_glm_row_blocked(self):
+    def test_poll_quota_err_marks_glm_row_died(self):
         _write(
             os.path.join(self.scratch, "glm-sessions.tsv"),
             f"quota-poll\t{GLM}\t1700000002\tglm-5.3\n",
@@ -808,8 +808,8 @@ class ManifestQuotaAndSupersedeTests(unittest.TestCase):
         }
         manifests.poll(self.store, cfg, NOW)
         row = self.store.runs[f"glm:{GLM}:quota-poll"]
-        self.assertEqual(row["status"], "done")
-        self.assertEqual(row["verdict"], "BLOCKED")
+        self.assertEqual(row["status"], "died_early")
+        self.assertEqual(row["verdict"], "QUOTA")
 
 
 class ManifestSmokeTests(unittest.TestCase):

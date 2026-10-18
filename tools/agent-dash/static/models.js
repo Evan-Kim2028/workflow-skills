@@ -70,5 +70,59 @@
     });
   }
   function famColor(fam) { return "var(" + (FAM[fam] || FAM.other).hue + ")"; }
-  global.ADM = {FAMS: FAMS, FAM: FAM, info: info, keyOf: keyOf, nameOf: nameOf, famOf: famOf, colorOf: colorOf, famColor: famColor, sortKeys: sortKeys};
+  /* Run outcome classes, the one client derivation. Mirrors
+     dash/outcomes.py outcome_class/outcome_reason exactly: the server
+     exposes run.outcome_class (plus run.outcome_reason) on its views,
+     and outcomeOf trusts it when present, so the timeline, the replay,
+     the tile caption, the tables, and the drawer never keep their own
+     if-chains. Every class ships colour plus glyph plus word, never
+     colour alone; blocked (orange, a reported verdict) and died (red,
+     the session ended without one) never share a look. */
+  var OUTCOME = {
+    run: ["var(--s1)", "\u25CF", "running"],
+    ok: ["var(--good)", "\u2713", "finished"],
+    part: ["var(--warning)", "\u25D0", "partial"],
+    blocked: ["var(--serious)", "\u2298", "blocked"],
+    died: ["var(--critical)", "\u2715", "died"],
+    cancelled: ["var(--muted)", "\u23F9", "cancelled"],
+    stalled: ["var(--warning)", "\u25D4", "stalled"],
+    unk: ["var(--muted)", "\u25CB", "no verdict"]
+  };
+  function outcomeOf(r) {
+    r = r || {};
+    if (r.outcome_class && OUTCOME[r.outcome_class]) return r.outcome_class;
+    var st = r.status, v = r.verdict == null ? null : String(r.verdict).toUpperCase();
+    if (r.stalled && (st === "running" || st === "queued") && r.ended_at == null) return "stalled";
+    if (r.ended_at == null) return st === "running" ? "run" : "unk";
+    if (st === "killed" || st === "died_early") return "died";
+    if (st === "unknown") return "unk";
+    if (v === "FAILURE" || v === "FAIL" || v === "UNRESOLVED" || v === "QUOTA" || v === "IDLE") return "died";
+    if (v === "CANCELED") return "cancelled";
+    if (v === "BLOCKED" || v === "REQUEST_CHANGES" || v === "FIX") return "blocked";
+    if (v === "PARTIAL" || v === "APPROVE_WITH_CHANGES") return "part";
+    if (v && (v.indexOf("APPROVE") === 0 || v.indexOf("PASS") === 0 || v.indexOf("SUCCESS") === 0 || v.indexOf("SHIP") === 0)) return "ok";
+    if (st === "done" || st === "finished") return "ok";
+    return "unk";
+  }
+  function outcomeReason(r, cls) {
+    r = r || {};
+    if (r.outcome_reason != null) return r.outcome_reason;
+    var o = cls || outcomeOf(r), v = r.verdict == null ? null : String(r.verdict).toUpperCase();
+    if (o === "died") {
+      if (r.status === "killed") return "terminated: SIGTERM trace in the err log";
+      if (v === "QUOTA") return "quota/rate limit ended the run";
+      if (v === "IDLE") return "closed idle: no output, session never finished";
+      if (v === "FAILURE" || v === "FAIL") return "reported FAILURE";
+      if (v === "UNRESOLVED") return "ended unresolved";
+      return "process exited without a verdict";
+    }
+    if (o === "stalled") {
+      var age = (typeof r.stalled === "number") ? r.stalled : null;
+      var when = age == null ? null : (age < 90 ? Math.floor(age) + "s" : (age < 5400 ? Math.floor(age / 60) + "m" : (Math.round(age / 360) / 10) + "h"));
+      return when ? "no output for " + when + "; process still alive" : "no output; process still alive";
+    }
+    if (o === "unk") return "no verdict recorded";
+    return null;
+  }
+  global.ADM = {FAMS: FAMS, FAM: FAM, info: info, keyOf: keyOf, nameOf: nameOf, famOf: famOf, colorOf: colorOf, famColor: famColor, sortKeys: sortKeys, OUTCOME: OUTCOME, outcomeOf: outcomeOf, outcomeReason: outcomeReason};
 })(window);

@@ -401,12 +401,14 @@ def _adopt_pid_file(run, pad, label) -> None:
 
 
 def _apply_quota_closeout(run, pad, label, now=None) -> None:
-    """Close a quota/rate-limit failure as done/BLOCKED (in place).
+    """Close a quota/rate-limit failure as died_early/QUOTA (in place).
 
     Runs after ``apply_liveness`` and wins over it: a quota hit in the
     run dir's err/out logs ends the run even while a label match still
     reads running, so quota failures never linger as running or inherit
-    a shared out file's PASS. Missing files change nothing; failures
+    a shared out file's PASS. The session died without reporting a
+    verdict, so it reads died (red): a close-out BLOCKED would paint a
+    dead session blocked-orange. Missing files change nothing; failures
     never raise.
     """
     try:
@@ -425,8 +427,8 @@ def _apply_quota_closeout(run, pad, label, now=None) -> None:
         quota_paths = []
     if not quota_paths:
         return
-    run["status"] = "done"
-    run["verdict"] = "BLOCKED"
+    run["status"] = "died_early"
+    run["verdict"] = "QUOTA"
     try:
         stamp = _quota_ended_at(quota_paths, now if now is not None else __import__("time").time())
     except Exception:

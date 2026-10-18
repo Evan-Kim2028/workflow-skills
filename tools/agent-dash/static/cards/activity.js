@@ -76,8 +76,12 @@
   /* Pure hover-text builders: every number the user sees on hover is
      compact (fmtN), with the exact value left to data-v/data-t attrs. */
   function actLegendTip(name, total) { return name + " " + fmtN(total) + " tokens"; }
-  function actTimelineAria(n, ok, part, blocked, died, run) {
-    return "Agent runs in the selected range, one lane per model family: " + fmtN(n) + " runs, " + fmtN(ok) + " finished, " + fmtN(part) + " partial, " + fmtN(blocked) + " blocked, " + fmtN(died) + " died, " + fmtN(run) + " running";
+  function actTimelineAria(counts, n) {
+    function bits() {
+      var want = [["ok", "finished"], ["part", "partial"], ["blocked", "blocked"], ["died", "died"], ["cancelled", "cancelled"], ["stalled", "stalled"], ["run", "running"], ["unk", "no verdict"]];
+      return want.filter(function (p) { return counts[p[0]]; }).map(function (p) { return fmtN(counts[p[0]]) + " " + p[1]; }).join(", ");
+    }
+    return "Agent runs in the selected range, one lane per model family: " + fmtN(n) + " runs" + (bits() ? ", " + bits() : "");
   }
   function actConcAria(name, peak) { return name + " live runs in the selected range, peak " + fmtN(peak); }
   /* Pixel<->time on one shared axis: time t in [from, to] sits at pixel
@@ -686,6 +690,18 @@
     if (r.status === "running") return fmtDur(now - r.started_at);
     return "end not recorded";
   }
+  /* Tooltip outcome line: the class in words first, then the recorded
+     verdict when it says more than the word, then the reason when one is
+     known ("process exited without a verdict"). Close-out markers (QUOTA,
+     IDLE) never print raw: the reason already names them. */
+  function actOutcomeText(r, oc, o) {
+    var reason = (typeof ADM !== "undefined" && ADM.outcomeReason) ? ADM.outcomeReason(r, oc) : null;
+    var text = o[1] + " " + o[2];
+    var v = r.verdict ? String(r.verdict) : null;
+    if (v && v.toUpperCase() !== o[2].toUpperCase() && v !== "QUOTA" && v !== "IDLE") text += " (" + v + ")";
+    if (reason) text += " \u2014 " + reason;
+    return text;
+  }
   function actDrawBar(svg, r, x1, x2, y, h, model, now, clipped) {
     var oc = outcomeOf(r), o = OUTCOME[oc];
     var bar = s("rect", {x: x1, y: y, width: Math.max(2, x2 - x1 - 1), height: h, rx: Math.min(2, h / 2), fill: r.clock_source === "mtime" ? "url(#act-hatch)" : o[0], stroke: r.clock_source === "mtime" ? o[0] : "none", class: "tl-bar"});
@@ -693,7 +709,7 @@
     bar.setAttribute("data-run-id", r.run_id || r.label || "");
     bar.setAttribute("data-outcome", oc);
     if (clipped) bar.setAttribute("data-clipped", clipped);
-    bar.addEventListener("mousemove", function (ev) { showTip(ev, r.label || r.run_id, [{k: "model", v: model}, {k: "outcome", v: o[1] + " " + (r.verdict || o[2]), c: o[0]}, {k: "duration", v: actDurText(r, now)}, {k: "workstream", v: r.workstream || "unattributed"}]); });
+    bar.addEventListener("mousemove", function (ev) { showTip(ev, r.label || r.run_id, [{k: "model", v: model}, {k: "outcome", v: actOutcomeText(r, oc, o), c: o[0]}, {k: "duration", v: actDurText(r, now)}, {k: "workstream", v: r.workstream || "unattributed"}]); });
     bar.addEventListener("mouseleave", hideTip);
     bar.addEventListener("click", function () { openRun(r); });
     svg.appendChild(bar);
@@ -713,7 +729,11 @@
     var R = (loaded.runs || []).filter(function (r) { return r.started_at && runEnd(r, now) >= from && r.started_at <= to; });
     if (!R.length) { wrap.appendChild(el("div", {class: "empty", text: "No runs in this window."})); return {node: wrap, hasData: false}; }
     var lg = el("div", {class: "legend"});
-    ["run", "ok", "part", "blocked", "died", "unk"].forEach(function (k) { var o = OUTCOME[k], sp = el("span"); var sw = el("i", {class: "sw"}); sw.style.background = o[0]; sp.appendChild(sw); sp.appendChild(document.createTextNode(o[1] + " " + o[2])); lg.appendChild(sp); });
+    /* The legend lists exactly the classes present in this window, in
+       severity order — never a fixed roster with zeroes. */
+    var present = {};
+    R.forEach(function (r) { present[outcomeOf(r)] = true; });
+    ["run", "ok", "part", "blocked", "died", "cancelled", "stalled", "unk"].filter(function (k) { return present[k]; }).forEach(function (k) { var o = OUTCOME[k], sp = el("span"); var sw = el("i", {class: "sw"}); sw.style.background = o[0]; sp.appendChild(sw); sp.appendChild(document.createTextNode(o[1] + " " + o[2])); lg.appendChild(sp); });
     wrap.appendChild(lg);
     var W = g.W, L = g.L, Rm = g.R, pw = g.pw, T = 8, stripH = 30;
     var st = actSharedTicks(range, g), X = st.X;
@@ -743,9 +763,9 @@
     var stripY = 12, yy = stripY + stripH + 14;
     lanes.forEach(function (lane) { lane.y = yy; yy += 22 + lane.h + 10; });
     var plotB = yy - 10, H = Math.ceil(plotB + 32);
-    var ocCount = {run: 0, ok: 0, part: 0, blocked: 0, died: 0, unk: 0};
-    R.forEach(function (r) { ocCount[outcomeOf(r)]++; });
-    var svg = s("svg", {viewBox: "0 0 " + W + " " + H, width: W, height: H, style: "display:block;max-width:100%", role: "img", "data-strip": "timeline", "data-x-from": String(Math.round(from)), "data-x-to": String(Math.round(to)), "aria-label": actTimelineAria(R.length, ocCount.ok, ocCount.part, ocCount.blocked, ocCount.died, ocCount.run)});
+    var ocCount = {run: 0, ok: 0, part: 0, blocked: 0, died: 0, cancelled: 0, stalled: 0, unk: 0};
+    R.forEach(function (r) { var k = outcomeOf(r); ocCount[k] = (ocCount[k] || 0) + 1; });
+    var svg = s("svg", {viewBox: "0 0 " + W + " " + H, width: W, height: H, style: "display:block;max-width:100%", role: "img", "data-strip": "timeline", "data-x-from": String(Math.round(from)), "data-x-to": String(Math.round(to)), "aria-label": actTimelineAria(ocCount, R.length)});
     var defs = s("defs", {}); var pat = s("pattern", {id: "act-hatch", width: 6, height: 6, patternUnits: "userSpaceOnUse", patternTransform: "rotate(45)"}); pat.appendChild(s("rect", {width: 6, height: 6, fill: "var(--surface-2)"})); pat.appendChild(s("line", {x1: 0, y1: 0, x2: 0, y2: 6, stroke: "var(--muted)", "stroke-width": 2})); defs.appendChild(pat); svg.appendChild(defs);
     /* Gridlines on the shared ticks in every lane; labels only bottom. */
     var gTicks = withX ? st.ticks : [];
