@@ -31,7 +31,13 @@ The one argv value ever kept is the worker's `--model` flag value, recorded on p
 | `dash/sources/claude.py`, `dash/sources/manifests.py`, `dash/sources/generic.py` | src-ai |
 | `dash/sources/muse.py`, `dash/sources/grok_cli.py` | src-tools |
 | `dash/sources/cursor.py` | src-cursor |
-| `static/index.html` (all UI, vanilla JS, inline SVG/canvas charts) | Claude (parent) |
+| `static/index.html` (page shell, card functions and their wiring, boot) | Claude (parent) |
+| `static/core/el.js` (DOM helpers, text/format glue, tooltip, copy button) | Claude (parent) |
+| `static/core/state.js` (page state, route read/write, tab filter/order plumbing) | Claude (parent) |
+| `static/core/api.js` (fetch and fixtures, SSE stream, refresh orchestration) | Claude (parent) |
+| `static/core/cache.js` (exec/section keyed caches, keyed-section renderer) | Claude (parent) |
+| `static/core/charts.js` (shared chart/axis and token-cell helpers) | Claude (parent) |
+| `static/core/drawer.js` (run details drawer) | Claude (parent) |
 | `fixtures/*.json` (seeded synthetic API responses from `fixtures/make_fixtures.py`) | fixture |
 | `tests/test_*.py` (unittest, stdlib) | each owner for its files |
 | `docs/roadmap.md` (open work plan) + `docs/design-v2.md` + `docs/design-v2-tokens.css` (proposed v2 spec) | core (docs only; spec builds only on owner approval) |

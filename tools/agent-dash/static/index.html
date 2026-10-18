@@ -371,218 +371,20 @@ body.clip #main{zoom:.92}
 <script src="/static/tokencache.js"></script>
 <script src="/static/tabs.js"></script>
 <script src="/static/models.js"></script>
+<script src="/static/core/el.js"></script>
+<script src="/static/core/state.js"></script>
+<script src="/static/core/api.js"></script>
+<script src="/static/core/cache.js"></script>
+<script src="/static/core/charts.js"></script>
+<script src="/static/core/drawer.js"></script>
 <script src="/static/vendor/mermaid.min.js"></script>
 <script src="/static/plan.js"></script>
 <script>
 (function () {
   "use strict";
-  var Q = new URLSearchParams(location.search);
-  var FIX = Q.has("fixtures");
-  /* Clip mode frames the plan progress map and the run timeline as one promo
-     composition: page chrome hides and overlays carry the story. */
-  function isClipMode() { return Q.has("clip"); }
-  function isClipVertical() { var v = (Q.get("clip") || "").toLowerCase(); return v === "4x5" || v === "v" || v === "vertical"; }
-  var execCache = {};
-  var execGen = 0;
-  var WINDOW_HOURS = 24;
-  var state = {view: "exec", ws: "all", snap: null, runs: [], usage: [], conc: [], wss: [], bundles: [], plan: null, seq: -1, groupBy: "model", approvals: [], snapError: null, lastSeqChange: 0, lastPoll: null, lastDataTs: null};
-  /* Models: family = hue, model = shade of it (static/models.js). Keys look like grok-4.7, composer-2.5, glm-5.3-flash, haiku. */
-  function modelName(k) { return ADM.nameOf(k); }
-  function fullName(k) { var f = ADM.FAM[ADM.famOf(k)].name, n = ADM.nameOf(k); return n.indexOf(f + " ") === 0 ? n : f + " \u00B7 " + n; }
-  var WSCOL = ["--s1", "--s2", "--s3", "--s4", "--s5", "--s6", "--s7"];
-  var wsColor = {};
-  function wsNum(w) { var m = /(\d+)/.exec(w.ws || ""); return m ? +m[1] : 999; }
-  function shown(list) { return list.filter(function (w) { return w.plan; }).sort(function (x, y) { return wsNum(x) - wsNum(y); }); }
-  function cssv(n) { return getComputedStyle(document.documentElement).getPropertyValue(n).trim(); }
-  function tierKey(r) { return ADM.info(r).key; }
-  function modelKey(m) { return ADM.keyOf(m)[1]; }
-  /* Legend grouped by family: "Cursor ■ Grok 4.7 ■ Composer 2.5". */
-  function modelLegend(keys, counts) {
-    var lg = el("div", {class: "legend mlegend"}), byF = {};
-    ADM.sortKeys(keys).forEach(function (k) { var f = ADM.famOf(k); (byF[f] = byF[f] || []).push(k); });
-    ADM.FAMS.forEach(function (f) {
-      if (!byF[f]) return;
-      var grp = el("span", {class: "mfam"}, [el("b", {text: ADM.FAM[f].name})]);
-      byF[f].forEach(function (k) { var sp = el("span"); var sw = el("i", {class: "sw"}); sw.style.background = ADM.colorOf(k); sp.appendChild(sw); sp.appendChild(document.createTextNode(ADM.nameOf(k) + (counts && counts[k] != null ? " " + counts[k] : ""))); grp.appendChild(sp); });
-      lg.appendChild(grp);
-    });
-    return lg;
-  }
-  function colorOf(key, kind) {
-    if (kind === "workstream") { if (!key || key === "null" || key === "unassigned") return "var(--other)"; if (!wsColor[key]) wsColor[key] = WSCOL[Object.keys(wsColor).length % WSCOL.length]; return "var(" + wsColor[key] + ")"; }
-    return ADM.colorOf(key);
-  }
-  /* axes() and the compact formatters live in format.js and are shared with the plan view. */
-  var fmtDate = AD.fmtDate, fmtN = AD.fmtN, fmtUsd = AD.fmtUsd, fmtDur = AD.fmtDur, fmtT = AD.fmtT, axes = AD.axes, timeTicks = AD.timeTicks, warpTime = AD.warpTime, warpPos = AD.warpPos;
-  function el(tag, attrs, kids) { var e = document.createElement(tag); if (attrs) for (var k in attrs) { if (k === "text") e.textContent = attrs[k]; else if (k === "html") e.innerHTML = attrs[k]; else if (k.slice(0, 2) === "on") e.addEventListener(k.slice(2), attrs[k]); else e.setAttribute(k, attrs[k]); } (kids || []).forEach(function (c) { if (c) e.appendChild(typeof c === "string" ? document.createTextNode(c) : c); }); return e; }
-  var NS = "http://www.w3.org/2000/svg";
-  function s(tag, attrs) { var e = document.createElementNS(NS, tag); for (var k in attrs) e.setAttribute(k, attrs[k]); return e; }
 
-  var FIXMAP = {"/api/snapshot": "snapshot", "/api/runs": "runs", "/api/usage": "usage-model-hour", "/api/concurrency": "concurrency", "/api/sessions": "sessions", "/api/workstreams": "workstreams", "/api/health": "health", "/api/reconcile": "reconcile"};
-  function api(path, params) {
-    var qs = new URLSearchParams(params || {}).toString();
-    if (FIX) {
-      if (path === "/api/approvals") {
-        return fetch("../fixtures/approvals.json").then(function (r) { if (!r.ok) throw new Error(r.status); return r.json(); }).then(function (j) {
-          var wanted = params && params.ws;
-          if (wanted && wanted !== "all") {
-            var hit = (j.approvals || []).filter(function (row) { return row.ws === wanted; })[0];
-            return hit || {ws: wanted, decided_at: null, decided_by: null, items: []};
-          }
-          return j;
-        });
-      }
-      if (path === "/api/snapshot") {
-        var sbase = "snapshot";
-        if (params && params.ws && params.ws !== "all") sbase = "snapshot-" + params.ws;
-        return fetch("../fixtures/" + sbase + ".json").then(function (r) { if (!r.ok) throw new Error(r.status); return r.json(); }).then(function (snap) {
-          if (params && params.usage_group && !Array.isArray(snap.usage)) {
-            var ubase = params.usage_group === "workstream" ? "usage-workstream-hour" : "usage-model-hour";
-            return fetch("../fixtures/" + ubase + ".json").then(function (r) { if (!r.ok) throw new Error(r.status); return r.json(); }).then(function (u) {
-              snap.usage = u.buckets || [];
-              return snap;
-            });
-          }
-          return snap;
-        });
-      }
-      var base = FIXMAP[path] || path.replace("/api/", "");
-      if (path === "/api/usage" && params && params.group === "workstream") base = "usage-workstream-hour";
-      if (path === "/api/plan") base = "plan-" + params.ws;
-      if (path === "/api/replay") base = "replay-" + params.ws;
-      return fetch("../fixtures/" + base + ".json").then(function (r) { if (!r.ok) throw new Error(r.status); return r.json(); });
-    }
-    return fetch(path + (qs ? "?" + qs : "")).then(function (r) { if (!r.ok) throw new Error(r.status); return r.json(); });
-  }
-  window.DashApi = api;
 
-  /* tooltip */
-  var tip = document.getElementById("tip");
-  function showTip(ev, title, rows) {
-    tip.innerHTML = ""; tip.appendChild(el("b", {text: title}));
-    rows.forEach(function (r) { var d = el("div", {class: "r"}); var a = el("span"); if (r.c) { var i = el("i"); i.style.background = r.c; a.appendChild(i); } a.appendChild(document.createTextNode(r.k)); d.appendChild(a); d.appendChild(el("span", {text: r.v})); tip.appendChild(d); });
-    tip.style.display = "block";
-    var x = ev.clientX + 14, y = ev.clientY + 14, w = tip.offsetWidth, h = tip.offsetHeight;
-    if (x + w > innerWidth - 8) x = ev.clientX - w - 14; if (y + h > innerHeight - 8) y = ev.clientY - h - 14;
-    tip.style.left = x + "px"; tip.style.top = y + "px";
-  }
-  function hideTip() { tip.style.display = "none"; }
 
-  function canonWs(ws) {
-    if (!ws || String(ws).toLowerCase() === "all" || String(ws).toLowerCase() === "overview") return "all";
-    if (/^ws\d+$/i.test(ws)) return String(ws).toUpperCase();
-    return String(ws);
-  }
-  function readRoute() {
-    var q = new URLSearchParams(location.search);
-    var view = q.get("view");
-    var path = location.pathname;
-    if (view !== "plan" && view !== "exec") view = (path === "/plan" || /plan\.html$/.test(path)) ? "plan" : "exec";
-    return {view: view, ws: canonWs(q.get("ws") || "")};
-  }
-  function planIdFor(ws) {
-    if (ws && ws !== "all") return ws;
-    var program = null;
-    (state.bundles || []).forEach(function (b) { if (!program && (b.kind === "program" || b.id === "OVERVIEW")) program = b; });
-    if (program) return program.id;
-    return (state.bundles && state.bundles.length) ? state.bundles[0].id : "OVERVIEW";
-  }
-  function queryWs() {
-    if (state.view === "plan") return planIdFor(state.ws);
-    return state.ws === "all" ? "all" : state.ws;
-  }
-  function pushRoute(hash) {
-    var u = new URL(location.href);
-    var path = location.pathname;
-    if (path === "/plan" || /\/plan\.html$/.test(path)) u.pathname = /plan\.html$/.test(path) ? path.replace(/plan\.html$/, "index.html") : "/";
-    u.searchParams.set("view", state.view);
-    u.searchParams.set("ws", queryWs());
-    if (FIX) u.searchParams.set("fixtures", "");
-    u.hash = hash || "";
-    var next = u.pathname + u.search + u.hash;
-    if (next === location.pathname + location.search + location.hash) return;
-    history.pushState({view: state.view, ws: state.ws}, "", u);
-  }
-  function applyChrome() {
-    var plan = state.view === "plan";
-    document.getElementById("exec-view").hidden = plan;
-    document.getElementById("plan-view").hidden = !plan;
-    document.getElementById("view-plan").setAttribute("aria-pressed", plan ? "true" : "false");
-    document.getElementById("view-exec").setAttribute("aria-pressed", plan ? "false" : "true");
-    document.getElementById("title").textContent = "Agent dashboard";
-    document.title = (plan ? "Plan" : "Execution") + " \u00B7 Agent dashboard";
-  }
-  function scrollHash() {
-    if (!location.hash) return;
-    var node = document.querySelector(location.hash);
-    if (node && node.scrollIntoView) node.scrollIntoView();
-  }
-  /* One source per number: the exec cache is keyed by tab and usage
-     grouping (one fixed 24 h window), and an entry older than one refresh
-     interval never draws. A tab switch draws cached data only when its key
-     matches, otherwise a loading state, never another tab's numbers. */
-  function groupFor() { return state.ws === "all" ? state.groupBy : "model"; }
-  function reqKey() { return ADC.currentKey(state); }
-  function getCache() {
-    var hit = execCache[reqKey()];
-    if (hit && ADC.fresh(hit, Date.now(), ADC.TTL_MS)) return hit;
-    return null;
-  }
-  function setCache(key, body) { body.at = Date.now(); body.key = key; execCache[key] = body; }
-  function applyHit(hit) {
-    state.snap = hit.snap; state.runs = hit.runs; state.usage = hit.usage; state.conc = hit.conc; state.plan = hit.plan; state.seq = hit.seq; state.approvals = hit.approvals || [];
-  }
-  function showLoading() {
-    state.snap = null; state.runs = []; state.usage = []; state.conc = []; state.plan = null; state.approvals = [];
-    var m = document.getElementById("main");
-    m.innerHTML = "";
-    m.appendChild(el("div", {class: "card", id: "exec-loading"}, [el("h2", {text: "Loading " + (state.ws === "all" ? "overview" : state.ws) + " · last 24 h"}), el("div", {class: "skel"}), el("div", {class: "skel"}), el("div", {class: "skel"})]));
-  }
-  function showCurrent() {
-    if (window.__adReplayOn && window.__adReplayExit) window.__adReplayExit(true);
-    window.__adReplayOn = false;
-    applyChrome();
-    renderTabs();
-    if (state.view === "exec") {
-      var hit = getCache();
-      if (hit) {
-        applyHit(hit);
-        drawMain();
-      } else {
-        showLoading();
-      }
-      refreshAll();
-      return;
-    }
-    var id = planIdFor(state.ws);
-    var job = window.PlanView ? PlanView.show(id) : null;
-    if (job && job.then) job.then(function (ok) { setLive(ok !== false); scrollHash(); });
-  }
-  function selectTab(ws) {
-    ws = canonWs(ws);
-    if (ws === state.ws) return;
-    state.ws = ws;
-    pushRoute();
-    showCurrent();
-  }
-  function selectView(view) {
-    if (state.view === view) return;
-    state.view = view;
-    pushRoute();
-    showCurrent();
-  }
-  function openPlan(ws) {
-    state.ws = canonWs(ws);
-    state.view = "plan";
-    pushRoute("");
-    showCurrent();
-  }
-  function openApprovals(ws) {
-    state.ws = canonWs(ws);
-    state.view = "plan";
-    pushRoute(String(planIdFor(state.ws)).toLowerCase() + "-approvals");
-    showCurrent();
-  }
   /* Tab progress comes from the /api/workstreams row (the same progress
      object /api/plan carries), falling back to the per-plan sums the
      "Where we are" panel loads. No plan data means not completed. */
@@ -594,130 +396,6 @@ body.clip #main{zoom:.92}
     if (hit) return hit;
     return planSum[id] || null;
   }
-  function tabRows() {
-    var seen = {}, rows = [];
-    shown(state.wss || []).forEach(function (w) {
-      var key = String(w.ws).toUpperCase();
-      if (seen[key]) return;
-      seen[key] = 1;
-      rows.push({ws: w.ws, name: w.ws + (w.name ? " " + w.name : ""), running: w.live_agents, progress: progressFor(w.ws)});
-    });
-    (state.bundles || []).forEach(function (b) {
-      if (!b || b.kind === "program" || b.id === "OVERVIEW") return;
-      var key = String(b.id).toUpperCase();
-      if (seen[key]) return;
-      seen[key] = 1;
-      rows.push({ws: b.id, name: b.id + (b.title ? " " + b.title : ""), running: 0, progress: progressFor(b.id)});
-    });
-    rows.sort(function (a, b) { return wsNum(a) - wsNum(b); });
-    return [{ws: "all", name: state.view === "plan" ? "Overview" : "Overall", progress: null}].concat(rows);
-  }
-  /* Tab filter (All | Active | Completed) and drag order, remembered per
-     viewer. The overview tab stays pinned first and is not draggable. A
-     re-render while a drag is in progress is deferred to dragend so the
-     dragged tab is never lost to a refresh. */
-  var tabFilter = ADT.loadMode();
-  var tabDrag = null, tabDragPending = false, tabClickGuard = 0;
-  function currentOrder() {
-    var t = document.getElementById("tabs"), ids = [];
-    [].forEach.call(t.querySelectorAll("button.tab[data-ws]"), function (b) {
-      var id = String(b.getAttribute("data-ws")).toUpperCase();
-      if (id !== "ALL" && ids.indexOf(id) < 0) ids.push(id);
-    });
-    return ids;
-  }
-  function onTabDragStart(ev, ws) {
-    tabDrag = {id: String(ws).toUpperCase(), after: false};
-    try { ev.dataTransfer.setData("text/plain", String(ws)); ev.dataTransfer.effectAllowed = "move"; } catch (e) {}
-  }
-  function onTabDragOver(ev, btn) {
-    if (!tabDrag) return;
-    ev.preventDefault();
-    try { ev.dataTransfer.dropEffect = "move"; } catch (e) {}
-    var r = btn.getBoundingClientRect();
-    tabDrag.after = (ev.clientX - r.left) > r.width / 2;
-    var t = document.getElementById("tabs");
-    [].forEach.call(t.querySelectorAll(".drop-before,.drop-after"), function (n) { n.classList.remove("drop-before", "drop-after"); });
-    btn.classList.add(tabDrag.after ? "drop-after" : "drop-before");
-  }
-  function finishTabDrag(targetWs, after) {
-    if (!tabDrag || !tabDrag.id) return;
-    var ids = currentOrder().filter(function (id) { return id !== tabDrag.id; });
-    var at = ids.indexOf(String(targetWs).toUpperCase());
-    ids.splice(at < 0 ? ids.length : at + (after ? 1 : 0), 0, tabDrag.id);
-    ADT.saveOrder(ids);
-    tabDrag = null;
-    tabDragPending = false;
-    tabClickGuard = Date.now() + 400;
-    renderTabs();
-  }
-  function onTabDragEnd() {
-    if (!tabDrag) return;
-    tabDrag = null;
-    tabDragPending = false;
-    tabClickGuard = Date.now() + 400;
-    renderTabs();
-  }
-  function onTabKey(ev, ws) {
-    if (!ev.altKey || !ev.shiftKey) return;
-    var left = ev.key === "ArrowLeft", right = ev.key === "ArrowRight";
-    if (!left && !right) return;
-    ev.preventDefault();
-    ADT.saveOrder(ADT.move(currentOrder(), ws, left ? -1 : 1));
-    renderTabs();
-    var btn = document.getElementById("tabs").querySelector('button.tab[data-ws="' + ws + '"]');
-    if (btn) btn.focus();
-  }
-  function filterCtl(counts) {
-    var wrap = el("span", {class: "tabfilter", role: "group", "aria-label": "Filter workstream tabs"});
-    [["all", "All"], ["active", "Active"], ["completed", "Completed"]].forEach(function (m) {
-      var b = el("button", {type: "button", "aria-pressed": String(tabFilter === m[0]), title: "Show " + m[0] + " workstream tabs", onclick: function () { tabFilter = m[0]; ADT.saveMode(m[0]); renderTabs(); }}, [m[1] + " " + fmtN(counts[m[0]])]);
-      wrap.appendChild(b);
-    });
-    wrap.appendChild(el("button", {type: "button", class: "tabreset", title: "Restore the default tab order", onclick: function () { ADT.saveOrder([]); renderTabs(); }}, ["Reset order"]));
-    return wrap;
-  }
-  function renderTabs() {
-    if (tabDrag) { tabDragPending = true; return; }
-    var t = document.getElementById("tabs"); if (!t) return;
-    t.innerHTML = "";
-    var rows = ADT.applyOrder(tabRows(), ADT.loadOrder());
-    var counts = ADT.countByMode(rows);
-    var vis = ADT.filterByMode(rows, tabFilter, state.ws);
-    var nWs = 0;
-    vis.forEach(function (w) {
-      var overview = w.ws === "all";
-      if (!overview) nWs++;
-      var titles = [];
-      if (w.muted) titles.push("Shown although the filter hides it: this tab is selected.");
-      if (!overview && ADT.isCompleted(w.progress)) titles.push(ADT.completeTitle(w.progress));
-      var attrs = {class: "tab" + (w.muted ? " muted" : ""), role: "tab", "data-ws": w.ws, "aria-selected": String(state.ws === w.ws), onclick: function () { if (Date.now() < tabClickGuard) return; selectTab(w.ws); }};
-      if (titles.length) attrs.title = titles.join(" ");
-      var b = el("button", attrs, [w.name]);
-      if (w.running) b.appendChild(el("span", {class: "c", text: w.running + " live"}));
-      if (!overview && ADT.isCompleted(w.progress)) b.appendChild(el("span", {class: "tick", text: "\u2713"}));
-      if (!overview) {
-        b.setAttribute("draggable", "true");
-        b.addEventListener("dragstart", function (ev) { onTabDragStart(ev, w.ws); });
-        b.addEventListener("dragover", function (ev) { onTabDragOver(ev, b); });
-        b.addEventListener("dragleave", function () { b.classList.remove("drop-before", "drop-after"); });
-        b.addEventListener("drop", function (ev) { ev.preventDefault(); finishTabDrag(w.ws, tabDrag ? tabDrag.after : false); });
-        b.addEventListener("dragend", onTabDragEnd);
-        b.addEventListener("keydown", function (ev) { onTabKey(ev, w.ws); });
-      }
-      t.appendChild(b);
-    });
-    if (!nWs) t.appendChild(el("span", {class: "tabs-empty", text: tabFilter === "completed" ? "No completed workstreams" : tabFilter === "active" ? "No active workstreams" : "No workstreams"}));
-    t.appendChild(filterCtl(counts));
-  }
-  function planUrl(ws) {
-    var id = canonWs(ws);
-    var q = new URLSearchParams(location.search);
-    q.set("view", "plan");
-    q.set("ws", id === "all" ? "OVERVIEW" : id);
-    return "?" + q.toString();
-  }
-  function go(ws) { selectTab(ws); }
   /* components */
   /* Token and cost tiles read the server snapshot totals for this scope and
      the one fixed 24 h window (windowed and reconciled server-side). They
@@ -853,40 +531,7 @@ body.clip #main{zoom:.92}
     var axg = axes(svg, {L: L, T: T, pw: pw, ph: ph, yMax: nice, xTicks: xt, yTitle: "tokens", xTitle: "hour"}); svg.insertBefore(axg, svg.firstChild); c.appendChild(svg);
     return c;
   }
-  function CW() { var m = document.getElementById("main"); var w = m && m.clientWidth ? m.clientWidth : 1100; return Math.max(560, Math.floor(w - 36)); }
-  /* Tokens cell: billed input + output, cached reads in muted ink, and for a live Grok run with no billed usage yet the context-window estimate (never counted in totals). */
-  function tokTotal(t) { t = t || {}; return (t.input || 0) + (t.output || 0) + (t.cache_read || 0) + (t.cache_write || 0); }
-  function cachedPct(t) { var tot = tokTotal(t); return tot ? Math.round(100 * (t.cache_read || 0) / tot) : 0; }
-  function tokCell(r) {
-    var t = r.tokens || {}, tot = tokTotal(t);
-    var td = el("td", {class: "n", title: "total " + fmtN(tot) + " \u00B7 input " + fmtN(t.input) + " \u00B7 output " + fmtN(t.output) + " \u00B7 cache read " + fmtN(t.cache_read) + " \u00B7 cache write " + fmtN(t.cache_write)});
-    if (!tot && r.context_tokens && !r.ended_at) {
-      td.appendChild(document.createTextNode("~" + fmtN(r.context_tokens))); td.appendChild(el("span", {class: "cached", text: " live"}));
-      td.title = "Estimate: context window now. Billed tokens arrive when the run ends.";
-      return td;
-    }
-    td.appendChild(document.createTextNode(fmtN(tot)));
-    if (tot) td.appendChild(el("span", {class: "cached", text: " " + cachedPct(t) + "% cached"}));
-    return td;
-  }
 
-  function copyBtn(text) {
-    var b = el("button", {class: "copybtn", title: "Copy the paste-ready prompt that starts this workstream's lead in a fresh Claude Code session", text: "Copy start prompt"});
-    b.addEventListener("click", function (ev) {
-      ev.stopPropagation();
-      var done = function () { b.textContent = "Copied \u2713"; b.classList.add("ok"); setTimeout(function () { b.textContent = "Copy start prompt"; b.classList.remove("ok"); }, 2000); };
-      var fallback = function () { var d = el("div", {class: "copy-modal"}), ta = el("textarea", {readonly: "readonly"}); ta.value = text; var close = el("button", {text: "Close"}); close.addEventListener("click", function () { d.remove(); }); d.appendChild(el("p", {text: "Copy this prompt (Cmd+C):"})); d.appendChild(ta); d.appendChild(close); document.body.appendChild(d); ta.focus(); ta.select(); };
-      if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(text).then(done, fallback); else fallback();
-    });
-    return b;
-  }
-  window.DashCopyBtn = copyBtn;
-  function countUp(node, from, to) {
-    if (window.matchMedia && matchMedia("(prefers-reduced-motion: reduce)").matches || from === to) { node.textContent = to + "%"; return; }
-    var i = 0, n = 28, h = setInterval(function () { i++; var k = i / n, e = 1 - Math.pow(1 - k, 3); node.textContent = Math.round(from + (to - from) * e) + "%"; if (i >= n) clearInterval(h); }, 25);
-    (window.__adCountUp = window.__adCountUp || []).push(h);
-  }
-  function niceMax(v) { if (v <= 0) return 1; var p = Math.pow(10, Math.floor(Math.log10(v))); var m = v / p; return (m <= 1 ? 1 : m <= 2 ? 2 : m <= 5 ? 5 : 10) * p; }
 
   /* live agents over time: one strip per model family, its models stacked as shades of the family hue */
   function concChart(snap) {
@@ -2221,27 +1866,9 @@ body.clip #main{zoom:.92}
     return c;
   }
 
-  /* run drawer */
-  var drawer = document.getElementById("drawer");
-  function openRun(r) {
-    drawer.innerHTML = "";
-    drawer.appendChild(el("div", {style: "display:flex;align-items:center;gap:10px"}, [el("h2", {style: "margin:0;font-size:16px", text: r.label || r.run_id}), el("span", {class: "sp"}), el("button", {onclick: function () { drawer.classList.remove("open"); }}, ["Close"])]));
-    drawer.appendChild(el("p", {style: "margin:6px 0 14px"}, [statusEl(r), r.verdict ? el("span", {class: "vd", style: "margin-left:8px", text: r.verdict}) : null]));
-    var tk = r.tokens || {};
-    var kv = el("dl", {class: "kv"});
-    [["Model", fullName(tierKey(r)) + (r.model ? " (" + r.model + ")" : "")], ["Launched by", r.source], ["Workstream", (r.workstream || "–") + (r.ws_confidence ? " (" + r.ws_confidence + ")" : "")], ["Session", r.session_id], ["Parent", r.parent_session_id], ["Started", r.started_at ? fmtDate(r.started_at) : "–"], ["Ended", r.ended_at ? fmtDate(r.ended_at) : "running"], ["Elapsed", fmtDur(r.elapsed_s)], ["Clock", r.clock_source], ["Output", fmtN(r.out_bytes) + "B" + (r.out_growing ? " (growing)" : "")], ["Errors", fmtN(r.err_bytes) + "B"], ["PID", r.pid || "–"], ["Memory", r.rss_kb ? fmtN(r.rss_kb * 1024) + "B" : "–"], ["Tokens", fmtN(tokTotal(tk)) + " (" + cachedPct(tk) + "% cached)"], ["Input / output", fmtN(tk.input) + " / " + fmtN(tk.output)], ["Cache read / write", fmtN(tk.cache_read) + " / " + fmtN(tk.cache_write)], ["Est. cost", fmtUsd(r.cost_usd)]].forEach(function (p) { kv.appendChild(el("dt", {text: p[0]})); kv.appendChild(el("dd", {text: p[1] == null ? "–" : String(p[1])})); });
-    drawer.appendChild(kv);
-    drawer.classList.add("open");
-  }
   document.addEventListener("keydown", function (e) { if (e.key === "Escape") { drawer.classList.remove("open"); if (window.__adReplayOn && window.__adReplayExit) window.__adReplayExit(false); } });
 
   /* layout */
-  function approvalList(j) {
-    if (!j) return [];
-    if (j.approvals) return j.approvals;
-    if (j.items) return [j];
-    return [];
-  }
   function needsCard() {
     var list = state.approvals || [];
     var c = el("div", {class: "card needs-you", id: "exec-needs", "data-nav": "Needs you"}, [el("h2", {text: "Needs you"}), el("p", {class: "sub", text: "Pending decisions for this view."})]);
@@ -2275,9 +1902,6 @@ body.clip #main{zoom:.92}
   setInterval(function () { if (state.view === "exec" && !window.__adReplayOn) { drawMain(); } }, 60000);
   var resizeT = null;
   window.addEventListener("resize", function () { clearTimeout(resizeT); resizeT = setTimeout(function () { if (window.__adReplayOn) return; if (state.view === "exec") drawMain(); else if (window.__adPlanDraw) window.__adPlanDraw(); }, 150); });
-  /* Keyed sections: a section is rebuilt only when its data key changes, and unchanged nodes are never moved, so animations and hover state survive live updates. */
-  var secCache = {};
-  function keyOf(v) { try { return JSON.stringify(v); } catch (e) { return String(Math.random()); } }
   /* Finished subtitle names the truncation: "Newest 50 of 1,452" when the
      window holds more finished runs than the table shows, so the hidden gap
      is visible instead of silently omitted. */
@@ -2318,209 +1942,14 @@ body.clip #main{zoom:.92}
       if (isClipVertical()) document.body.classList.add("clip-v");
       specs = specs.filter(function (sp) { return sp[0] === "plan"; });
     }
-    var want = [];
-    specs.forEach(function (sp) {
-      var hit = secCache[sp[0]];
-      if (!hit || hit.key !== sp[1]) {
-        var node = el("section", {class: "sec", "data-sec": sp[0], id: "x-" + sp[0], style: sp[3]});
-        var inner = sp[2](); if (inner) node.appendChild(inner);
-        if (hit && hit.node.parentNode === m) m.replaceChild(node, hit.node);
-        secCache[sp[0]] = hit = {key: sp[1], node: node};
-      }
-      want.push(hit.node);
-    });
-    want.forEach(function (node, idx) { if (m.children[idx] !== node) m.insertBefore(node, m.children[idx] || null); });
-    while (m.children.length > want.length) m.removeChild(m.lastChild);
+    applySections(m, specs);
   }
 
 
-  function since() { return Math.floor(Date.now() / 1000 - WINDOW_HOURS * 3600); }
-  function wsParam() { return state.ws === "all" ? {} : {ws: state.ws}; }
-  /* Every async response applies only when it still matches the current tab
-     and grouping (one fixed 24 h window); a late arrival from another scope
-     is dropped. */
-  function loadNav() {
-    var bundlesP = fetch(FIX ? "../fixtures/bundles.json" : "/api/bundles", {cache: "no-store"}).then(function (r) { return r.ok ? r.json() : {bundles: []}; }).then(function (j) { state.bundles = j.bundles || []; }).catch(function () {});
-    var wsP = api("/api/workstreams", {since: since()}).then(function (j) { state.wss = j.workstreams || []; }).catch(function () {});
-    return Promise.all([bundlesP, wsP]).then(function () { renderTabs(); });
-  }
-  /* Muted footer line: the reconcile check for the fixed 24 h window. Status color always ships with a word and symbol. */
-  function refreshFoot() {
-    var foot = document.getElementById("foot");
-    if (!foot || state.view !== "exec" || state.ws !== "all") return;
-    api("/api/reconcile", {hours: WINDOW_HOURS}).then(function (j) {
-      if (state.view !== "exec" || state.ws !== "all") return;
-      var bad = (j.mismatches || [])[0], n = (j.rows || []).length;
-      var base = "Updated " + new Date().toLocaleTimeString() + (FIX ? " · fixture data" : "") + " · read-only, 127.0.0.1";
-      foot.textContent = "";
-      foot.appendChild(document.createTextNode(base + " · "));
-      var mark = el("span", {text: bad ? "\u2717 " + bad : "\u2713 Numbers reconcile across " + n + " workstreams"});
-      mark.setAttribute("style", "color:" + (bad ? "var(--critical)" : "var(--good)"));
-      foot.appendChild(mark);
-    }).catch(function () {});
-  }
-  /* Warm every other tab's Execution data in the background, one tab at a time, so a first switch draws from cache instantly. Entries are keyed by tab and group (one fixed 24 h window) with the window captured up front, and fresh entries are not refetched. */
-  var warming = false;
-  function warmTabs() {
-    if (warming || FIX) return;
-    var group = state.groupBy, reqSince = Math.floor(Date.now() / 1000 - WINDOW_HOURS * 3600);
-    var list = ["all"].concat(shown(state.wss).map(function (w) { return w.ws; })).filter(function (ws) { return ws !== state.ws; });
-    if (!list.length) return;
-    warming = true;
-    var step = function (i) {
-      if (i >= list.length) { warming = false; return; }
-      var ws = list[i], wsArg = ws === "all" ? {} : {ws: ws}, wsGroup = ws === "all" ? group : "model";
-      var key = ADC.key(ws, wsGroup);
-      if (execCache[key] && ADC.fresh(execCache[key], Date.now(), ADC.TTL_MS)) { setTimeout(function () { step(i + 1); }, 150); return; }
-      Promise.all([
-        api("/api/snapshot", {ws: ws, since: reqSince, usage_group: wsGroup}).catch(function () { return null; }),
-        api("/api/runs", Object.assign({since: reqSince, limit: 5000}, wsArg)).then(function (j) { return j.runs || []; }).catch(function () { return []; }),
-        api("/api/concurrency", Object.assign({since: reqSince, step: 60}, wsArg)).then(function (j) { return j.points || []; }).catch(function () { return []; }),
-        ws !== "all" ? api("/api/plan", {ws: ws}).then(function (j) { return j && j.groups ? j : null; }).catch(function () { return null; }) : Promise.resolve(null),
-        api("/api/approvals", {ws: ws === "all" ? "all" : ws}).then(approvalList).catch(function () { return []; })
-      ]).then(function (p) {
-        if (p[0]) setCache(key, {snap: p[0], runs: p[1], usage: Array.isArray(p[0].usage) ? p[0].usage : [], conc: p[2], plan: p[3], seq: p[0].seq, approvals: p[4]});
-      }).then(function () { setTimeout(function () { step(i + 1); }, 150); });
-    };
-    step(0);
-  }
   setTimeout(warmTabs, 1500);
   setInterval(warmTabs, 45000);
   setInterval(function () { if (!state.wss.length) return; loadPlanSums().then(function () { if (state.view === "exec" && state.ws === "all") drawMain(); }); }, 30000);
-  /* A failed fetch is never a silent zero: the banner names the scope and
-     the tiles carry data-failed-scope, so "request failed" reads differently
-     from "0 in 24 h". A cached scope keeps its last numbers under the banner. */
-  function showSnapError(ws) {
-    state.snapError = "request failed for " + ws + " \u2014 showing last known data";
-    renderErrBanner();
-  }
-  function clearSnapError() {
-    state.snapError = null;
-    renderErrBanner();
-  }
-  function renderErrBanner() {
-    var b = document.getElementById("err-banner");
-    if (!b) return;
-    if (state.snapError) {
-      b.hidden = false;
-      if (b.textContent !== state.snapError) b.textContent = state.snapError;
-      b.setAttribute("data-failed-scope", state.ws);
-    } else {
-      b.hidden = true;
-      if (b.textContent !== "") b.textContent = "";
-      b.removeAttribute("data-failed-scope");
-    }
-  }
-  /* Freshness: the tick carries seq + last_poll. The seq drives refetches;
-     when it stays frozen for 3 poll intervals with an open SSE stream the
-     page badges "stale" instead of reading "live" on old data. A fresh poll
-     with an unchanged seq (healthy idle) stays live. */
-  var STALE_AFTER_S = 6;
-  function updateStale(nowS) {
-    var badge = document.getElementById("stale-badge");
-    var txt = document.getElementById("live-txt");
-    if (!badge || !txt) return;
-    if (!state.lastSeqChange) { badge.hidden = true; return; }
-    nowS = nowS || Date.now() / 1000;
-    var seqAge = nowS - state.lastSeqChange;
-    var pollAge = state.lastPoll == null ? 0 : nowS - state.lastPoll;
-    var stale = seqAge > STALE_AFTER_S && (state.lastPoll == null || pollAge > STALE_AFTER_S);
-    badge.hidden = !stale;
-    if (stale) txt.textContent = "stale";
-    else if (txt.textContent === "stale") txt.textContent = "live";
-  }
-  /* Tiles and chart come from one snapshot response: totals and usage buckets
-     are applied together or not at all, so they can never disagree. */
-  function refreshAll() {
-    if (window.__adReplayOn) return Promise.resolve();
-    var ws = state.ws;
-    var key = reqKey();
-    var gen = ++execGen;
-    var wsArg = ws === "all" ? {} : {ws: ws};
-    var group = groupFor();
-    var reqSince = since();
-    var jobs = [
-      api("/api/snapshot", {ws: ws, since: reqSince, usage_group: group}).catch(function () { return null; }),
-      api("/api/runs", Object.assign({since: reqSince, limit: 5000}, wsArg)).then(function (j) { return j.runs || []; }).catch(function () { return []; }),
-      api("/api/concurrency", Object.assign({since: reqSince, step: 60}, wsArg)).then(function (j) { return j.points || []; }).catch(function () { return []; }),
-      loadNav(),
-      ws !== "all" ? api("/api/plan", {ws: ws}).then(function (j) { return j && j.groups ? j : null; }).catch(function () { return null; }) : Promise.resolve(null),
-      api("/api/approvals", {ws: ws === "all" ? "all" : ws}).then(approvalList).catch(function () { return []; })
-    ];
-    return Promise.all(jobs).then(function (parts) {
-      if (gen !== execGen || !ADC.applies(key, state)) return;
-      if (!parts[0]) {
-        showSnapError(ws);
-        if (state.view === "exec") { drawMain(); setLive(false); }
-        return;
-      }
-      clearSnapError();
-      if (parts[0].seq !== state.seq) state.lastSeqChange = Date.now() / 1000;
-      if (parts[0].last_data_ts != null) state.lastDataTs = parts[0].last_data_ts;
-      state.snap = parts[0];
-      state.seq = parts[0].seq;
-      state.runs = parts[1];
-      state.usage = Array.isArray(parts[0].usage) ? parts[0].usage : [];
-      state.conc = parts[2];
-      state.plan = parts[4];
-      state.approvals = parts[5];
-      setCache(key, {snap: state.snap, runs: state.runs, usage: state.usage, conc: state.conc, plan: state.plan, seq: state.seq, approvals: state.approvals});
-      if (state.snap && window.DashCache) window.DashCache.snap[ws] = state.snap;
-      renderTabs();
-      if (state.view === "exec") {
-        drawMain();
-        window.__adSettled = state.ws + "|24|" + state.seq;
-        setLive(true);
-        updateStale();
-        if (state.ws === "all") refreshFoot();
-        else { var foot = document.getElementById("foot"); if (foot) foot.textContent = "Updated " + new Date().toLocaleTimeString() + (FIX ? " · fixture data" : "") + " · read-only, 127.0.0.1"; }
-      }
-    }).catch(function () { if (gen === execGen && ADC.applies(key, state)) { showSnapError(ws); setLive(false); } });
-  }
-  function setLive(ok) {
-    document.getElementById("live-dot").className = "dot" + (ok ? " on" : "");
-    document.getElementById("live-txt").textContent = ok ? "live" : "offline";
-    if (!ok) { var badge = document.getElementById("stale-badge"); if (badge) badge.hidden = true; }
-    else updateStale();
-  }
 
-  function stream() {
-    if (FIX || !window.EventSource) return;
-    var es = new EventSource("/api/stream");
-    es.addEventListener("tick", function (ev) {
-      try {
-        var d = JSON.parse(ev.data);
-        var nowS = d.now || Date.now() / 1000;
-        if (d.last_poll != null) state.lastPoll = d.last_poll;
-        if (d.last_data_ts != null) state.lastDataTs = d.last_data_ts;
-        if (state.lastSeqChange === 0) state.lastSeqChange = nowS;
-        if (d.seq !== state.seq) { state.lastSeqChange = nowS; refreshSnapshot(); }
-        else updateStale(nowS);
-      } catch (e) {}
-      setLive(true);
-      updateStale();
-    });
-    es.onerror = function () { setLive(false); };
-  }
-  /* Stream ticks refresh through the same one-response path: the snapshot
-     carries the usage buckets, and totals plus buckets apply together. */
-  function refreshSnapshot() {
-    if (window.__adReplayOn) return;
-    var ws = state.ws, key = reqKey();
-    api("/api/snapshot", {ws: ws, since: since(), usage_group: groupFor()}).then(function (j) {
-      if (!ADC.applies(key, state)) return;
-      clearSnapError();
-      if (j.seq !== state.seq) state.lastSeqChange = Date.now() / 1000;
-      if (j.last_data_ts != null) state.lastDataTs = j.last_data_ts;
-      state.snap = j; state.seq = j.seq;
-      state.usage = Array.isArray(j.usage) ? j.usage : [];
-      var hit = execCache[key];
-      if (hit) { hit.snap = j; hit.usage = state.usage; }
-      if (window.DashCache) window.DashCache.snap[ws] = j;
-      if (state.view === "exec") drawMain();
-      updateStale();
-    }).catch(function () { showSnapError(ws); if (state.view === "exec") drawMain(); });
-  }
 
   document.getElementById("theme").addEventListener("click", function () {
     var r = document.documentElement, cur = r.getAttribute("data-theme"), dark = cur ? cur === "dark" : matchMedia("(prefers-color-scheme: dark)").matches;
@@ -2555,7 +1984,15 @@ body.clip #main{zoom:.92}
       else { loadNav(); if (window.PlanView) PlanView.refresh(); }
     });
   }, 30000);
+  /* F-core: names the staying page script shares with static/core/*.js.
+     Each core file attaches its side to window.AdPage and keeps the same
+     plain global, so the card functions below keep calling every name
+     unchanged. */
+  window.drawMain = drawMain;
+  window.progressFor = progressFor;
+  window.statusEl = statusEl;
 })();
+
 </script>
 <script src="/static/sidenav.js"></script>
 </body>

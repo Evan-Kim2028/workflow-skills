@@ -30,10 +30,19 @@ def functions(src):
         yield m.group(1), src[m.start():end]
 
 
+def _core_scripts():
+    """static/core/*.js in the order index.html loads them (execution order)."""
+    page = (STATIC / "index.html").read_text()
+    names = re.findall(r'<script src="(/static/core/[^"]+\.js)"></script>', page)
+    return [(STATIC / src[len("/static/"):]).read_text() for src in names]
+
+
 def inline_scripts():
-    """The executable script of static/index.html (external src files excluded)."""
+    """One logical script: static/core/*.js in script-tag order, then the
+    executable inline script of static/index.html."""
     text = (STATIC / "index.html").read_text()
-    return "\n".join(re.findall(r"<script>(.*?)</script>", text, re.S))
+    inline = "\n".join(re.findall(r"<script>(.*?)</script>", text, re.S))
+    return "\n".join(_core_scripts() + [inline])
 
 
 def _extract_taskof(path, name):
