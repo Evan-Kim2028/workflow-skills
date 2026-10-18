@@ -2080,7 +2080,7 @@ class FinalPolishTests(unittest.TestCase):
         """While scrolled only one slim row stays pinned: .topbar at
         --pinned-h (48 px desktop, 44 px phone). The full header
         (.topscroll: live pill, Plan | Execution, Project | Current |
-        Planned | Archive) scrolls away, and no other top-anchored
+        Planned | Archive, Theme) scrolls away, and no other top-anchored
         sticky may sneak back in. Anchors land below the slim row
         through scroll-padding-top tied to the same token."""
         tokens = (STATIC / "tokens.css").read_text()
@@ -2100,16 +2100,72 @@ class FinalPolishTests(unittest.TestCase):
         topbar = re.search(r'<div class="topbar">(.*?)</div>\s*<div id="exec-view"', page, re.S)
         self.assertIsNotNone(topbar, "the .topbar shell is gone")
         slim = topbar.group(1)
-        for keep in ('id="title"', 'id="tabs"', 'id="theme"'):
+        for keep in ('id="title"', 'id="tabs"'):
             self.assertIn(keep, slim, f"the slim row lost {keep}")
-        for gone in ('id="view-nav"', "view-toggle", 'class="live"'):
-            self.assertNotIn(gone, slim, f"a secondary header row stays pinned: {gone}")
+        for gone in ('id="view-nav"', "view-toggle", 'class="live"', 'id="theme"', "nav-sections"):
+            self.assertNotIn(gone, slim, f"a secondary header control stays pinned: {gone}")
         self.assertIn('class="topscroll"', page, "the scrolling full header is gone")
         self.assertIn("scroll-padding-top", style, "no scroll-padding-top for the pinned row")
         self.assertIn("var(--pinned-h)", style, "the scroll offset is not tied to --pinned-h")
         checker = (STATIC.parent / "scripts" / "page_check.mjs").read_text()
         for marker in ("pinned", "Emulation.setDeviceMetricsOverride", "scrollTo", "m.pinned > 48", "m.pinned > 44"):
             self.assertIn(marker, checker, f"page_check.mjs lost the pinned-chrome gate: {marker}")
+
+    def test_project_name_is_never_truncated(self):
+        """The project name keeps its natural width: .topbar h1 has no
+        max-width and no ellipsis (desktop or phone); the tab strip
+        flexes and scrolls to give way instead."""
+        page = (STATIC / "index.html").read_text()
+        style = "\n".join(re.findall(r"<style>(.*?)</style>", page, re.S))
+        desk = re.search(r"\.topbar h1\{(.*?)\}", style)
+        self.assertIsNotNone(desk, ".topbar h1 rule is gone")
+        self.assertNotIn("max-width", desk.group(1), "the project name is width-capped")
+        self.assertNotIn("text-overflow", desk.group(1), "the project name ellipsizes")
+        self.assertNotIn("ellipsis", desk.group(1), "the project name ellipsizes")
+        self.assertIn("flex:none", desk.group(1).replace(" ", ""), "the project name does not keep its natural width")
+        phone = re.search(r"\.topbar h1#title\{(.*?)\}", style)
+        self.assertIsNotNone(phone, "the phone title rule is gone")
+        self.assertNotIn("max-width", phone.group(1), "the phone project name is width-capped")
+        self.assertNotIn("ellipsis", phone.group(1), "the phone project name ellipsizes")
+        tabs = re.search(r"\.topbar \.tabs\{(.*?)\}", style)
+        self.assertIsNotNone(tabs, ".topbar .tabs rule is gone")
+        self.assertIn("flex:1", tabs.group(1).replace(" ", ""), "the tab strip no longer flexes to give way")
+
+    def test_theme_toggle_sits_top_right_alone(self):
+        """Exactly one Theme control: a real button with an aria-label in
+        the scrolling top row (far right via margin-left:auto), never in
+        the pinned tab strip, still wired to the click handler."""
+        page = (STATIC / "index.html").read_text()
+        self.assertEqual(page.count('id="theme"'), 1, "there is not exactly one Theme control")
+        top = re.search(r'<div class="topscroll">(.*?)</div>\s*<div class="topbar">', page, re.S)
+        self.assertIsNotNone(top, "the scrolling top header is gone")
+        theme = re.search(r'<button[^>]*id="theme"[^>]*>', top.group(1))
+        self.assertIsNotNone(theme, "the Theme control is not in the scrolling top row")
+        self.assertIn("aria-label", theme.group(0), "the Theme button has no aria-label")
+        style = "\n".join(re.findall(r"<style>(.*?)</style>", page, re.S))
+        right = re.search(r"header\.shell #theme\{(.*?)\}", style)
+        self.assertIsNotNone(right, "the Theme control lost its far-right rule")
+        self.assertIn("margin-left:auto", right.group(1).replace(" ", ""), "the Theme control is not right-aligned")
+        self.assertIn('getElementById("theme")', page, "the Theme click wiring is gone")
+
+    def test_sections_button_is_gone(self):
+        """No Sections button anywhere: no markup, styles, handlers,
+        shortcut hints, or dead references. The hover rail itself stays."""
+        page = (STATIC / "index.html").read_text()
+        nav = (STATIC / "sidenav.js").read_text()
+        tokens = (STATIC / "tokens.css").read_text()
+        for name, src in (("index.html", page), ("sidenav.js", nav), ("tokens.css", tokens)):
+            self.assertNotIn("nav-sections", src, f"{name} still references the Sections button")
+        for src in (STATIC / "tabs.js", STATIC / "sidenav.js"):
+            if src.exists():
+                self.assertNotIn("nav-sections", src.read_text(), f"{src.name} still references the Sections button")
+        for src in (STATIC / "core").glob("*.js"):
+            self.assertNotIn("nav-sections", src.read_text(), f"{src.name} still references the Sections button")
+        self.assertNotIn("keyshortcuts", page.lower(), "a Sections shortcut hint is left in the page")
+        self.assertNotIn('key !== "["', nav, "the [ shortcut outlived the Sections button")
+        self.assertIn("Escape", nav, "the rail lost its Escape-to-close")
+        self.assertIn("sidenav-hot", nav, "the hover rail itself is gone")
+        self.assertIn("sidenav-hot", tokens, "the hover rail lost its styles")
 
     def test_fmt_durations_never_print_sixty(self):
         harness = (

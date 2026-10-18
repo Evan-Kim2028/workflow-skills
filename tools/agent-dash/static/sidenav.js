@@ -37,7 +37,10 @@
   document.body.appendChild(hot);
   document.body.appendChild(nav);
 
-  var btn = document.getElementById("nav-sections");
+  /* No Sections button: on desktop the always-visible floating dock
+     expands on CSS hover by itself; `pinned` (latched via ?nav=open)
+     only adds the open shadow until Escape or pointer-leave. The edge
+     hot strip stays hidden, and phones show no rail entry at all. */
   var pinned = false;
   var hover = false;
   var suppress = false;
@@ -147,8 +150,6 @@
   function sync() {
     var on = opened();
     nav.classList.toggle("is-open", on);
-
-    if (btn) btn.setAttribute("aria-expanded", on ? "true" : "false");
   }
 
   function over(x, y) {
@@ -344,19 +345,12 @@
     return !ev.pointerType || ev.pointerType === "mouse";
   }
 
-  function typing(node) {
-    if (!node || !node.tagName) return false;
-    var tag = node.tagName;
-    if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return true;
-    return !!node.isContentEditable;
-  }
-
   function closeNav(fromKey) {
     pinned = false;
     hover = false;
     suppress = true;
     sync();
-    if (fromKey && btn && nav.contains(document.activeElement)) btn.focus({preventScroll: true});
+    if (fromKey && nav.contains(document.activeElement) && document.activeElement.blur) document.activeElement.blur();
   }
 
   function openNav(fromKey) {
@@ -367,13 +361,6 @@
     var first = list.querySelector("a");
     if (first) first.focus({preventScroll: true});
   }
-
-  function toggle(fromKey) {
-    if (opened()) closeNav(fromKey);
-    else openNav(fromKey);
-  }
-
-  if (btn) btn.addEventListener("click", function () { toggle(false); });
 
   hot.addEventListener("pointerenter", function (ev) {
     if (!isMouse(ev) || suppress) return;
@@ -410,15 +397,13 @@
     sync();
   });
 
+  /* Escape closes a latched rail. The old "[" shortcut went away with
+     the Sections button that hinted it. */
   document.addEventListener("keydown", function (ev) {
     if (ev.key === "Escape") {
       if (!opened()) return;
       closeNav(true);
-      return;
     }
-    if (ev.repeat || ev.key !== "[" || ev.metaKey || ev.ctrlKey || ev.altKey || typing(ev.target)) return;
-    ev.preventDefault();
-    toggle(true);
   });
 
   window.addEventListener("scroll", function () {

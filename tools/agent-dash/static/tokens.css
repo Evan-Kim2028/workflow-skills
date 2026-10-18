@@ -438,7 +438,9 @@ html.dock-hidden .dock-mode { width: 18px; height: 56px; margin: 0; border: 0; b
 html.dock-compact .sidenav:not(:hover):not(:focus-within) a { box-shadow: none; }
 html.dock-compact .sidenav:not(:hover):not(:focus-within) a.is-sub { display: none; }
 /* Phone: the floating rail would cover content, so the dock stays shut
-   until the Sections button opens it as an overlay. */
+   with no UI entry (the Sections button was its only one). The .is-open
+   overlay below now serves ?nav=open only; the shut-rail hiding above
+   stays live. */
 @media (max-width: 700px) {
   html.dock-compact .sidenav:not(.is-open),
   html.dock-pinned .sidenav:not(.is-open),
