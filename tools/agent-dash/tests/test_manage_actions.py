@@ -28,6 +28,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from unittest import mock
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -67,6 +68,9 @@ def _bundle(root: Path, ws: str, title: str, state: str = "active", done: bool =
 
 class ManageActionsTest(unittest.TestCase):
     def setUp(self):
+        pin = mock.patch.dict(os.environ, {"AGENT_DASH_URL": "http://127.0.0.1:9"})
+        pin.start()
+        self.addCleanup(pin.stop)
         self.old_ws = os.environ.get("AGENT_DASH_WORKSTREAMS")
         self.old_ro = os.environ.get("AGENT_DASH_READONLY")
         self.bundles = tempfile.TemporaryDirectory()
