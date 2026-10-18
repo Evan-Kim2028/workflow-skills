@@ -150,6 +150,7 @@ def _first_event(port):
 
 PATHS = [
     "/api/project",
+    "/api/projects",
     "/api/snapshot?ws=all",
     "/api/runs?limit=50",
     "/api/runs?limit=50&include=jobs",

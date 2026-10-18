@@ -38,6 +38,19 @@ a:hover{text-decoration:underline}
 header{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
 header h1{font-size:var(--fs-h1);margin:0;font-weight:750;letter-spacing:-.01em}
 .proj-sub{font-weight:400;color:var(--muted)}
+.proj-wrap{position:relative;display:inline-block}
+.proj-switcher{font:inherit;color:inherit;background:none;border:1px solid transparent;border-radius:8px;padding:2px 8px;margin:-2px -8px;cursor:pointer}
+.proj-switcher:hover{border-color:var(--ring)}
+.proj-menu{position:absolute;top:calc(100% + 6px);left:0;z-index:50;min-width:300px;max-width:90vw;background:var(--surface);border:1px solid var(--ring);border-radius:12px;padding:6px;box-shadow:0 20px 60px rgba(0,0,0,.4)}
+.proj-item{display:flex;align-items:center;gap:8px;width:100%;box-sizing:border-box;text-align:left;padding:8px 10px;border:0;background:none;border-radius:8px;color:var(--ink);text-decoration:none;font-size:13px}
+a.proj-item:hover,.proj-item:focus-visible{background:var(--surface-2);outline:none}
+.proj-dot{font-style:normal;flex:none}
+.proj-dot.on{color:var(--good)}
+.proj-dot.off{color:var(--muted)}
+.proj-item-name{font-weight:650;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.proj-state{color:var(--muted);font-size:11.5px;flex:none}
+.proj-cmd{font:11px var(--mono);color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.proj-copy{margin-left:auto;flex:none;font-size:11.5px;border-radius:999px;padding:3px 10px}
 .live{display:inline-flex;align-items:center;gap:7px;font:600 12px var(--mono);color:var(--ink-2);border:1px solid var(--ring);border-radius:var(--r-pill);padding:4px 11px 4px 8px;background:var(--surface)}
 .dot{width:9px;height:9px;border-radius:50%;background:var(--muted);flex:none}
 .dot.on{background:var(--good);box-shadow:0 0 0 3px var(--good-soft);animation:beat 2s var(--ease-out) infinite}

@@ -165,6 +165,19 @@ date	id	decision	status	owner
 2026-10-17	D-104	single metering point	proposed	ben
 ```
 
+### Running several projects
+
+One dashboard instance serves one project: its own data root, state, port, and name.
+The registry is projects.json (AGENT_DASH_PROJECTS overrides; default ~/.config/agent-dash/projects.json).
+python3 tools/agent-dash/agent_dash.py project add demo --data-root /tmp/demo-data --init
+python3 tools/agent-dash/agent_dash.py project add second --data-root /tmp/second-data
+python3 tools/agent-dash/agent_dash.py project list
+python3 tools/agent-dash/agent_dash.py project launch demo
+python3 tools/agent-dash/agent_dash.py project launch second
+python3 tools/agent-dash/agent_dash.py --project demo state
+python3 tools/agent-dash/agent_dash.py project stop second
+python3 tools/agent-dash/agent_dash.py project remove second
+
 ### Safe deploy (run the live dashboard from a clean release)
 
 Every server captures a `build_id` (git short sha plus `-dirty` when the checkout had uncommitted changes at start) and its start time, served on `/api/health` (`build_id`, `started_at`, plus `state_hash`, a short hash of the server's state dir that the state-dir guard compares) and `/api/state` (`version` block) and printed by `status`. `run` refuses to start when the port already answers with a different build, naming both builds and the fix:

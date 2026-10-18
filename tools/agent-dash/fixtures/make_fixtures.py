@@ -657,6 +657,7 @@ def _project(runs, now, plans):
             cost += run["cost_usd"]
     billed = sum(tokens[key] for key in TOKEN_KEYS)
     return {
+        "id": None,
         "name": "Seeded demo project",
         "short": "demo",
         "description": "Seeded synthetic project for the offline preview.",
@@ -716,6 +717,21 @@ def _timeline(runs, now, plans):
         {"started": project["started"], "target": project["target"], "phases": project["phases"]}, now)
     doc["_note"] = NOTE
     return doc
+def _projects():
+    """Fixture mirror of GET /api/projects: two seeded registry rows.
+    Seeded names and loopback ports only, never filesystem paths: the
+    endpoint carries id, name, port, running, and current, and the
+    offline preview uses it to draw the header switcher menu."""
+    return {
+        "projects": [
+            {"id": "demo", "name": "Seeded demo project", "port": 8765,
+             "running": True, "current": True},
+            {"id": "second", "name": "Seeded second project", "port": 8766,
+             "running": False, "current": False},
+        ],
+        "current": "demo",
+        "_note": NOTE,
+    }
 
 
 def _archive(now, plans):
@@ -1229,6 +1245,7 @@ def main():
         "workstreams-all.json": _workstreams(runs, NOW, plans, scope="all"),
         "project.json": _project(runs, NOW, plans),
         "timeline.json": _timeline(runs, NOW, plans),
+        "projects.json": _projects(),
         "archive.json": _archive(NOW, plans),
         "approvals.json": _approvals(),
         "decisions.json": _decisions(),

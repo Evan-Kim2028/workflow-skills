@@ -1569,6 +1569,172 @@ setTimeout(function () {
             text=True,
         )
         self.assertEqual(proc.returncode, 0, proc.stderr or proc.stdout)
+class ProjectSwitcherTests(unittest.TestCase):
+    def test_switcher_wiring(self):
+        """The switcher reads /api/projects, needs fixtures + CSS, and is
+        keyboard accessible; the API map covers the new endpoint."""
+        core = (STATIC / "core" / "project.js").read_text()
+        for needle in (
+            "/api/projects",
+            "../fixtures/projects.json",
+            "proj-switcher",
+            "proj-menu",
+            "proj-item",
+            "proj-dot",
+            "running",
+            "stopped",
+            "project launch",
+            "copy",
+            "aria-haspopup",
+            "aria-expanded",
+            "menuitem",
+            "Escape",
+            "ArrowDown",
+            "ArrowUp",
+            "onkeydown",
+            "loadProjects",
+            "projectList",
+        ):
+            self.assertIn(needle, core, f"project.js lost {needle!r}")
+        api = (STATIC / "core" / "api.js").read_text()
+        self.assertIn('"/api/projects": "projects"', api, "FIXMAP never maps /api/projects")
+        fixture = STATIC.parent / "fixtures" / "projects.json"
+        self.assertTrue(fixture.is_file(), "fixtures/projects.json is missing")
+        doc = json.loads(fixture.read_text(encoding="utf-8"))
+        self.assertGreaterEqual(len(doc["projects"]), 2, "the switcher needs 2+ fixture projects")
+        for row in doc["projects"]:
+            self.assertEqual(set(row) - {"_note"}, {"id", "name", "port", "running", "current"}, row)
+            self.assertNotIn("data_root", row)
+        page = (STATIC / "index.html").read_text()
+        for needle in (".proj-switcher", ".proj-menu", ".proj-item", ".proj-dot"):
+            self.assertIn(needle, page, f"index.html lost switcher CSS {needle!r}")
+    def test_switcher_renders_only_with_two_projects(self):
+        """One project keeps the plain name; two build the menu button with
+        a running link and a stopped launch command; the button toggles and
+        Escape closes. Keyboard-operable, read-only (no writes)."""
+        harness = r'''
+const fs = require("fs");
+const assert = require("assert");
+const src = fs.readFileSync(process.argv[2], "utf8");
+function El(tag) {
+  return {tag: tag, attrs: {}, children: [], hidden: false, parentNode: null,
+    setAttribute: function (k, v) { this.attrs[k] = String(v); },
+    appendChild: function (c) { c.parentNode = this; this.children.push(c); return c; },
+    removeChild: function (c) { var i = this.children.indexOf(c); if (i >= 0) this.children.splice(i, 1); return c; },
+    querySelector: function (sel) {
+      var cls = sel[0] === "." ? sel.slice(1) : null;
+      var found = null;
+      (function walk(n) { n.children.forEach(function (c) {
+        if (found) return;
+        if (cls && c.attrs && c.attrs.class && c.attrs.class.split(" ").indexOf(cls) >= 0) { found = c; return; }
+        if (c.children) walk(c);
+      }); })(this);
+      return found;
+    },
+    querySelectorAll: function (sel) {
+      var cls = sel[0] === "." ? sel.slice(1) : null;
+      var out = [];
+      (function walk(n) { n.children.forEach(function (c) {
+        if (cls && c.attrs && c.attrs.class && c.attrs.class.split(" ").indexOf(cls) >= 0) out.push(c);
+        if (c.children) walk(c);
+      }); })(this);
+      return out;
+    }};
+}
+function textOf(n) {
+  if (!n) return "";
+  if (n.text !== undefined) return String(n.text);
+  if (typeof n.textContent === "string" && (!n.children || !n.children.length)) return n.textContent;
+  return (n.children || []).map(textOf).join(" ");
+}
+var titleEl = El("h1");
+titleEl._text = "Agent dashboard";
+Object.defineProperty(titleEl, "textContent", {
+  get: function () {
+    if (!this.children.length) return this._text;
+    return this.children.map(textOf).join(" ");
+  },
+  set: function (v) { this._text = String(v); this.children = []; },
+});
+Object.defineProperty(titleEl, "innerHTML", {
+  get: function () { return ""; },
+  set: function () { this.children = []; },
+});
+var header = El("header");
+header.appendChild(titleEl);
+var docListeners = [];
+global.window = globalThis;
+global.addEventListener = function () {};
+global.document = {
+  title: "",
+  getElementById: function (id) { return id === "title" ? titleEl : null; },
+  createElement: function (t) { return El(t); },
+  createTextNode: function (t) { return {text: String(t)}; },
+  addEventListener: function (t, f) { docListeners.push([t, f]); },
+};
+global.state = {view: "exec", ws: "all"};
+global.FIX = false;
+global.applyChrome = function () {};
+var mode = "single";
+var single = {projects: [{id: "demo", name: "Demo project", port: 8890, running: true, current: true}], current: "demo"};
+var multi = {projects: [
+  {id: "demo", name: "Demo project", port: 8890, running: true, current: true},
+  {id: "beta", name: "Beta project", port: 8891, running: false, current: false}], current: "demo"};
+global.fetch = function (url) {
+  var body = String(url).indexOf("projects") >= 0 ? (mode === "single" ? single : multi) : {name: "Demo project"};
+  return Promise.resolve({ok: true, json: function () { return Promise.resolve(body); }});
+};
+eval(src);
+setTimeout(function () {
+  try {
+    assert.strictEqual(header.querySelector(".proj-switcher"), null, "one project must keep the plain name");
+    assert.ok(titleEl.textContent.indexOf("Demo project") >= 0, "header lost the name: " + titleEl.textContent);
+    mode = "multi";
+    loadProjects();
+    setTimeout(function () {
+      try {
+        var btn = header.querySelector(".proj-switcher");
+        assert.ok(btn, "two projects must build the menu button");
+        assert.strictEqual(btn.attrs["aria-haspopup"], "true");
+        var menu = header.querySelector(".proj-menu");
+        assert.ok(menu, "two projects must build the menu");
+        assert.strictEqual(menu.attrs.role, "menu");
+        var items = menu.querySelectorAll(".proj-item");
+        assert.strictEqual(items.length, 2, "menu lists every project");
+        assert.strictEqual(items[0].tag, "a", "a running project navigates");
+        assert.ok(String(items[0].attrs.href).indexOf("127.0.0.1:8890") >= 0, "running row links the port: " + items[0].attrs.href);
+        assert.ok(textOf(items[0]).indexOf("running") >= 0, "running row says the word: " + textOf(items[0]));
+        assert.ok(textOf(items[0]).indexOf("\u25CF") >= 0, "running row carries the dot");
+        assert.strictEqual(items[1].tag, "div", "a stopped project is not a link");
+        assert.ok(textOf(items[1]).indexOf("stopped") >= 0, "stopped row says the word: " + textOf(items[1]));
+        assert.ok(textOf(items[1]).indexOf("python3 agent_dash.py project launch beta") >= 0, "stopped row shows the command: " + textOf(items[1]));
+        var copy = items[1].querySelector(".proj-copy");
+        assert.ok(copy, "stopped row offers the command to copy");
+        assert.strictEqual(typeof btn.onclick, "function", "the button toggles by click");
+        btn.onclick();
+        assert.strictEqual(menu.hidden, false, "click opens the menu");
+        assert.strictEqual(btn.attrs["aria-expanded"], "true");
+        var esc = docListeners.filter(function (l) { return l[0] === "keydown"; })[0];
+        assert.ok(esc, "Escape closes the menu from the keyboard");
+        esc[1]({key: "Escape"});
+        assert.strictEqual(menu.hidden, true, "Escape never leaves the menu open");
+        assert.ok(items[1].onkeydown, "rows move with the arrow keys");
+        console.log("project switcher proof ok");
+      } catch (e) { console.error("ASSERT: " + e.message); process.exit(1); }
+    }, 100);
+  } catch (e) { console.error("ASSERT: " + e.message); process.exit(1); }
+}, 100);
+'''
+        with tempfile.TemporaryDirectory() as tmp:
+            harness_path = Path(tmp) / "project_switcher.js"
+            harness_path.write_text(harness, encoding="utf-8")
+            proc = subprocess.run(
+                ["node", str(harness_path), str(STATIC / "core" / "project.js")],
+                capture_output=True,
+                text=True,
+            )
+        self.assertEqual(proc.returncode, 0, proc.stderr or proc.stdout)
+        self.assertIn("project switcher proof ok", proc.stdout)
 
 
 if __name__ == "__main__":

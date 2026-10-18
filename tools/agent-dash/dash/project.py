@@ -42,13 +42,24 @@ PROJECT_USAGE = """agent-dash project descriptor
   python3 agent_dash.py project init <name> [--data-root DIR]
   python3 agent_dash.py project show [--json] [--data-root DIR]
   python3 agent_dash.py project set <field> <value> [--data-root DIR]
+  python3 agent_dash.py project add <id> --data-root DIR [--name NAME] [--port N] [--init] [--json]
+  python3 agent_dash.py project list [--json]
+  python3 agent_dash.py project launch <id> [--json]
+  python3 agent_dash.py project stop <id> [--json]
+  python3 agent_dash.py project open <id> [--json]
+  python3 agent_dash.py project remove <id> [--json]
 
 <field> is one of: name, short, description, target. init creates
 project.json plus the data dirs and refuses to overwrite an existing
 file. show prints the descriptor with computed phase states (exit 4
 when the file fails validation). Missing project.json is fine: the
 name reads null and the page header falls back to "Agent dashboard".
-Exit codes: 0 ok, 2 usage error, 3 not found, 4 invalid data.
+add/list/launch/stop/open/remove manage the multi-project registry
+(projects.json, default ~/.config/agent-dash/projects.json): one
+dashboard instance per project, each with its own data root, state,
+port, and name. Agents working on a project pass --project <id> (or
+set the env) for state, check, doctor, ws ..., status.
+Exit codes: 0 ok, 1 check failed, 2 usage error, 3 not found, 4 invalid data.
 """
 
 LIFECYCLE_STATES = ("planned", "active", "paused", "done", "archived", "dropped")
@@ -275,6 +286,7 @@ def build_payload(store=None, cfg: dict | None = None, root=None, now: float | N
         except Exception:
             totals = _zero_totals()
     payload = {
+        "id": (os.environ.get("AGENT_DASH_PROJECT_ID") or "").strip() or None,
         "name": data.get("name") if isinstance(data.get("name"), str) else None,
         "short": data.get("short") if isinstance(data.get("short"), str) else "",
         "description": data.get("description") if isinstance(data.get("description"), str) else "",
@@ -324,6 +336,10 @@ def cmd_project(argv: list[str]) -> int:
     if not args or args[0] in ("-h", "--help"):
         print(PROJECT_USAGE, end="")
         return 0 if args and args[0] in ("-h", "--help") else errors.USAGE
+    from dash.projects import COMMANDS, cmd_projects
+
+    if args[0] in COMMANDS:
+        return cmd_projects(args)
     cmd = args[0]
     rest = args[1:]
     root = None

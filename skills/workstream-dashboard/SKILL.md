@@ -25,7 +25,7 @@ python3 agent_dash.py backfill --session <session-uuid>
 
 Never run stop or restart in tests without AGENT_DASH_STATE_DIR and AGENT_DASH_PORT.
 
-`stop`, `restart`, and `deploy` refuse a dashboard from another state dir unless `--yes-live` is passed (the default state dir is the live one, so trials always set `AGENT_DASH_STATE_DIR` to an empty directory and `AGENT_DASH_PORT` to a free port first). `status` finds a running dashboard with a missing or stale pidfile; `status --repair` records its pid. The pidfile is only removed by its owner.
+`stop`, `restart`, and `deploy` refuse a dashboard from another state dir unless `--yes-live` is passed (the default state dir is the live one, so trials always set `AGENT_DASH_STATE_DIR` to an empty directory and `AGENT_DASH_PORT` to a free port first). `status` finds a running dashboard with a missing or stale pidfile; `status --repair` records its pid. The pidfile is only removed by its owner. Several projects run as one instance each via the registry (`project add|list|launch|stop|open|remove`, `GET /api/projects`, header switcher with 2+ projects); agents pass `--project <id>` for `state`, `check`, `doctor`, `ws ...`, `status`.
 
 Do not run it with `python3 -I` (the package imports from its own directory). Restart after changing any Python module. `static/` files are read on every request.
 

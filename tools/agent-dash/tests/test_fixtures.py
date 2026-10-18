@@ -49,6 +49,7 @@ FILES = (
     "workstreams-all.json",
     "project.json",
     "timeline.json",
+    "projects.json",
     "archive.json",
     "burnup.json",
     "reconcile.json",
@@ -576,6 +577,7 @@ class ProjectViewFixtureTests(unittest.TestCase):
         cls.archive = load("archive.json")
         cls.timeline = load("timeline.json")
         cls.plans = {ws: load(f"plan-{ws}.json") for ws in ("WS9", "WS10", "WS11")}
+        cls.projects = load("projects.json")
     def test_project_shape(self):
         for key in ("name", "short", "description", "goals", "started", "target", "phases", "counts", "totals", "data_root_hash"):
             self.assertIn(key, self.project, key)
@@ -593,6 +595,21 @@ class ProjectViewFixtureTests(unittest.TestCase):
             len(self.wss_all),
             "counts by state must cover the all-states list",
         )
+
+    def test_projects_shape(self):
+        rows = self.projects["projects"]
+        self.assertGreaterEqual(len(rows), 2, "the switcher needs 2+ fixture projects")
+        seen_current = 0
+        for row in rows:
+            self.assertEqual(set(row), {"id", "name", "port", "running", "current"}, row)
+            self.assertTrue(row["id"])
+            self.assertTrue(row["name"])
+            self.assertIsInstance(row["port"], int)
+            self.assertIsInstance(row["running"], bool)
+            self.assertIsInstance(row["current"], bool)
+            seen_current += row["current"]
+        self.assertEqual(seen_current, 1, "exactly one fixture project is current")
+        self.assertIsInstance(self.projects["_note"], str)
     def test_workstream_lifecycle_coverage(self):
         by_id = {row["ws"]: row for row in self.wss_all}
         seen = {row["state"] for row in self.wss_all}

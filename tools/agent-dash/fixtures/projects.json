@@ -1,0 +1,20 @@
+{
+  "projects": [
+    {
+      "id": "demo",
+      "name": "Seeded demo project",
+      "port": 8765,
+      "running": true,
+      "current": true
+    },
+    {
+      "id": "second",
+      "name": "Seeded second project",
+      "port": 8766,
+      "running": false,
+      "current": false
+    }
+  ],
+  "current": "demo",
+  "_note": "Seeded synthetic data for the offline preview. Seed 1. No local sessions are read."
+}

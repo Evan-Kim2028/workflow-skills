@@ -9,10 +9,11 @@ The one argv value ever kept is the worker's `--model` flag value, recorded on p
 
 | Path | Owner |
 |---|---|
-| `agent_dash.py` (CLI: `run`, `stop`, `restart`, `deploy`, `rollback`, `status`, `state`, `doctor`, `backfill --session <id>`, `reprice`, `reconcile`, `check`, `ws`, `project`, `report`) | core |
+| `agent_dash.py` (CLI: `run`, `stop`, `restart`, `deploy`, `rollback`, `status`, `state`, `doctor`, `backfill --session <id>`, `reprice`, `reconcile`, `check`, `ws`, `project`, `report`; global `--project <id>` for `state`, `check`, `doctor`, `ws ...`, `status`) | core |
 | `dash/state.py` (`GET /api/state`), `dash/doctor.py` (`doctor`), `dash/errors.py` (exit codes, messages) | cli |
 | `dash/dataroot.py` (data-root resolution: `data_root`, `state_dir`, `workstreams_dir`, `hub_dir`, `project_file`; the `Storage` seam, local only) | core |
 | `dash/project.py` (project descriptor: `project.json` read/validate, `project` CLI, `GET /api/project` payload) | core |
+| `dash/projects.py` (multi-project registry: `projects.json` read/write, `project add|list|launch|stop|open|remove`, `GET /api/projects` payload, `--project` env resolution) | core |
 | `dash/store/` (facade: `Store` with the same public API over concern mixins) | core |
 | `dash/store/base.py` (connect, schema, migrations, offsets, doctor persistence) | core |
 | `dash/store/runs.py` (run/session upserts, merge aliases, attribution glue, run reads) | core |
@@ -67,7 +68,7 @@ The one argv value ever kept is the worker's `--model` flag value, recorded on p
 | `static/core/cache.js` (exec/section keyed caches, keyed-section renderer) | Claude (parent) |
 | `static/core/charts.js` (shared chart/axis and token-cell helpers) | Claude (parent) |
 | `static/core/drawer.js` (run details drawer) | Claude (parent) |
-| `static/core/project.js` (project header/title from `GET /api/project`, once per load and on focus) | Claude (parent) |
+| `static/core/project.js` (project header/title from `GET /api/project`, once per load and on focus; the header switcher menu from `GET /api/projects`, shown only with 2+ projects) | Claude (parent) |
 | `fixtures/*.json` (seeded synthetic API responses from `fixtures/make_fixtures.py`) | fixture |
 | `tests/test_*.py` (unittest, stdlib) | each owner for its files |
 | `docs/roadmap.md` (open work plan) + `docs/design-v2.md` + `docs/design-v2-tokens.css` (proposed v2 spec) | core (docs only; spec builds only on owner approval) |
@@ -395,6 +396,44 @@ python3 agent_dash.py project set description "What ships."
 `init` writes a starter template and refuses to overwrite (exit 2);
 `set` takes `name`, `short`, `description`, or `target` (exit 2 on a bad
 field, 3 when no `project.json` exists, 4 on invalid data).
+`GET /api/project` also carries the instance's project `id` (from
+`AGENT_DASH_PROJECT_ID` when launched via `project launch`, else null);
+`/api/health` carries the same id as `project_id` (id only, never paths).
+
+One dashboard instance serves one project: its own data root, state,
+port, and name. The registry is `projects.json` (default
+`~/.config/agent-dash/projects.json`, override `AGENT_DASH_PROJECTS`,
+never inside any data root):
+`{"projects": [{"id", "name", "data_root", "port", "added_at"}]}`.
+```bash
+python3 agent_dash.py project add <id> --data-root DIR [--name NAME] [--port N] [--init] [--json]
+python3 agent_dash.py project list [--json]
+python3 agent_dash.py project launch <id> [--json]
+python3 agent_dash.py project stop <id> [--json]
+python3 agent_dash.py project open <id> [--json]
+python3 agent_dash.py project remove <id> [--json]
+```
+`add` defaults to the lowest free port from 8765 up not used by another
+registered project (`--init` also creates `project.json` in a missing
+data root) and refuses duplicate ids or ports (exit 2). `list --json`
+carries the `data_root` basename only (the table shows the full path),
+plus `running` (a 1 s `/api/health` probe matched by `state_hash`, so a
+different project on that port reads `port taken by another`) and the
+`build_id`. `launch` starts the instance exactly as `run` does (with
+that project's data root, state dir, port, and project id in the env),
+waits for health, and refuses a port serving another state hash (exit
+1). `stop` runs the guarded stop with the project's env; `remove`
+unregisters only and never touches data. Agents working on a project
+pass `--project <id>` (or set the env) for `state`, `check`, `doctor`,
+`ws ...`, `status`.
+`GET /api/projects` lists the registry as
+`{"projects": [{"id", "name", "port", "running", "current"}], "current": <id>}`
+(`current` marks this instance), probed per entry over HTTP and cached
+10 s; with no registry it holds just this instance. It never reads
+another project's data root — only its `/api/health` — and never
+exposes a path. The header switcher (menu over these rows, running dot
+as glyph plus word, stopped rows showing the launch command to copy) is
+shown only when the registry lists 2 or more projects.
 
 `GET /static/<file>` serves a file from `static/` or one subdirectory (`vendor/`). `/static/taskmap.json` is the resolved task map (`taskmap.local.json`, else `taskmap.example.json`). Context-window rows use tool `grok-context` and are left out of cost.
 

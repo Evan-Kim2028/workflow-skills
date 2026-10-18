@@ -102,7 +102,17 @@ USAGE = """agent-dash: local read-only execution dashboard
   python3 agent_dash.py project init <name> [--data-root DIR]
   python3 agent_dash.py project show [--json]
   python3 agent_dash.py project set <field> <value>
+  python3 agent_dash.py project add <id> --data-root DIR [--name NAME] [--port N] [--init] [--json]
+  python3 agent_dash.py project list [--json]
+  python3 agent_dash.py project launch <id> [--json]
+  python3 agent_dash.py project stop <id> [--json]
+  python3 agent_dash.py project open <id> [--json]
+  python3 agent_dash.py project remove <id> [--json]
   python3 agent_dash.py lead-profile <session-id|--ws ID> [--json]
+
+Agents working on a project pass --project <id> (or set the env) for
+state, check, doctor, ws ..., status: it sets the data root, state
+dir, and URL/port from the registry for that call.
 
 Exit codes: 0 ok, 1 check failed (mismatches found, or doctor found
 problems), 2 usage error, 3 not found, 4 invalid data, 5 dashboard
@@ -296,12 +306,51 @@ def _no_extra_args(cmd: str, args: list[str], allowed: tuple = ()) -> int | None
     return errors.USAGE
 
 
+def _extract_project_flag(args: list[str]) -> tuple[list[str], str | None, int | None]:
+    """Split a global ``--project <id>`` out of argv.
+
+    Returns ``(cleaned, project_id-or-None, error-code-or-None)``. The
+    flag may sit before the command or among its flags; both read the
+    same way so agents can append it to any call.
+    """
+    cleaned: list[str] = []
+    pid: str | None = None
+    index = 0
+    while index < len(args):
+        if args[index] == "--project":
+            if index + 1 >= len(args) or args[index + 1].startswith("-"):
+                print(
+                    "agent-dash needs --project <id>. Run: python3 agent_dash.py project list",
+                    file=sys.stderr,
+                )
+                return args, None, 2
+            if pid is not None:
+                print(USAGE, end="", file=sys.stderr)
+                return args, None, 2
+            pid = args[index + 1]
+            index += 2
+        else:
+            cleaned.append(args[index])
+            index += 1
+    return cleaned, pid, None
+
+
 def main(argv: list[str] | None = None) -> int:
     global PORT, URL
     args = list(sys.argv[1:] if argv is None else argv)
     if args and args[0] in ("-h", "--help"):
         print(USAGE, end="")
         return 0
+    args, proj, proj_err = _extract_project_flag(args)
+    if proj_err is not None:
+        return proj_err
+    if proj is not None and (not args or args[0] != "project"):
+        from dash.projects import apply_project_env
+
+        _entry, _error = apply_project_env(proj)
+        if _entry is None:
+            print(_error, file=sys.stderr)
+            return 3
     raw_port = os.environ.get("AGENT_DASH_PORT", "")
     if raw_port.strip():
         try:

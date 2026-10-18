@@ -374,6 +374,107 @@ class ProjectEndpointTest(unittest.TestCase):
         self.assertTrue(payload["issues"])
 
 
+class ProjectsRegistryEndpointTest(unittest.TestCase):
+    """GET /api/projects: registry rows plus probes, never another root."""
+
+    def setUp(self):
+        from dash import projects as projects_mod
+
+        projects_mod.clear_cache()
+        self.addCleanup(projects_mod.clear_cache)
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root_a = os.path.join(self.tmp.name, "a-data")
+        self.root_b = os.path.join(self.tmp.name, "b-data")
+        os.makedirs(self.root_a, exist_ok=True)
+        os.makedirs(self.root_b, exist_ok=True)
+        self.reg = os.path.join(self.tmp.name, "projects.json")
+        self.own_root = os.path.join(self.tmp.name, "own-data")
+        os.makedirs(self.own_root, exist_ok=True)
+        self._env = mock.patch.dict(
+            os.environ,
+            {
+                "AGENT_DASH_PROJECTS": self.reg,
+                "AGENT_DASH_PROJECT_ID": "aaa",
+                "AGENT_DASH_DATA_ROOT": self.own_root,
+            },
+        )
+        self._env.start()
+        self.addCleanup(self._env.stop)
+        self.store = Store(Path(self.tmp.name) / "dash.sqlite")
+        self.server, self.thread = start(self.store)
+        self.port = self.server.server_address[1]
+
+    def tearDown(self):
+        stop(self.server, self.thread)
+        self.store.close()
+        self.tmp.cleanup()
+
+    def _write_registry(self, rows):
+        import time as _time
+
+        with open(self.reg, "w", encoding="utf-8") as fh:
+            json.dump(
+                {"projects": [
+                    {"id": pid, "name": name, "data_root": root,
+                     "port": port, "added_at": int(_time.time())}
+                    for pid, name, root, port in rows
+                ]},
+                fh,
+            )
+
+    def _silent_port(self):
+        import socket as _socket
+
+        sock = _socket.socket()
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+        sock.close()
+        self.assertNotEqual(port, 8765)
+        return port
+
+    def test_lists_registry_with_current_and_no_paths(self):
+        port_a, port_b = self._silent_port(), self._silent_port()
+        self._write_registry([
+            ("aaa", "Alpha project", self.root_a, port_a),
+            ("bbb", "Beta project", self.root_b, port_b),
+        ])
+        status, _, body = get(self.port, "/api/projects")
+        self.assertEqual(status, 200)
+        payload = json.loads(body)
+        self.assertEqual(payload["current"], "aaa")
+        rows = {row["id"]: row for row in payload["projects"]}
+        self.assertEqual(set(rows), {"aaa", "bbb"})
+        for row in rows.values():
+            self.assertEqual(set(row), {"id", "name", "port", "running", "current"}, row)
+        self.assertTrue(rows["aaa"]["current"])
+        self.assertFalse(rows["bbb"]["current"])
+        # The serving instance reads running even when its own probe
+        # is slow: current implies running by construction.
+        self.assertTrue(rows["aaa"]["running"])
+        self.assertFalse(rows["bbb"]["running"])
+        text = body.decode("utf-8", "replace")
+        self.assertNotIn(self.root_a, text)
+        self.assertNotIn(self.root_b, text)
+        self.assertNotIn("data_root", text)
+
+    def test_no_registry_returns_just_this_instance(self):
+        status, _, body = get(self.port, "/api/projects")
+        self.assertEqual(status, 200)
+        payload = json.loads(body)
+        self.assertEqual(len(payload["projects"]), 1)
+        row = payload["projects"][0]
+        self.assertEqual(row["id"], "aaa")
+        self.assertTrue(row["current"])
+        self.assertTrue(row["running"])
+        self.assertNotIn("data_root", body.decode("utf-8", "replace"))
+
+    def test_instance_identity_on_project_and_health(self):
+        status, _, body = get(self.port, "/api/project")
+        self.assertEqual(json.loads(body)["id"], "aaa")
+        status, _, body = get(self.port, "/api/health")
+        self.assertEqual(json.loads(body)["project_id"], "aaa")
+
+
 class PlanAndBackfillTest(unittest.TestCase):
     def test_missing_plan_file(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -5,7 +5,7 @@
   "map": {
     "agent_dash.py": ["test_server", "test_config", "test_errors", "test_state", "test_doctor"],
     "dash/store*.py": ["test_store", "test_server", "test_state", "test_doctor", "test_orchestrate", "test_poll_budgets"],
-    "dash/server.py": ["test_server", "test_bundles_api", "test_doctor", "test_errors", "test_state"],
+    "dash/server.py": ["test_server", "test_bundles_api", "test_doctor", "test_errors", "test_state", "test_projects"],
     "dash/state.py": ["test_state", "test_server"],
     "dash/doctor.py": ["test_doctor", "test_state", "test_errors"],
     "dash/bundles.py": ["test_ws_cli", "test_bundles_api", "test_orchestrate", "test_planrender", "test_errors"],
@@ -15,6 +15,8 @@
     "dash/pricing.py": ["test_pricing", "test_store"],
     "dash/models.py": ["test_models"],
     "dash/plans.py": ["test_server", "test_ws_cli", "test_bundles_api"],
+    "dash/project.py": ["test_project", "test_projects", "test_server"],
+    "dash/projects.py": ["test_projects", "test_server", "test_page_rules"],
     "dash/replay.py": ["test_server", "test_page_rules"],
     "dash/taskmatch.py": ["test_page_rules"],
     "dash/liveness.py": ["test_process_liveness", "test_server"],

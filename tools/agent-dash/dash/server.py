@@ -222,6 +222,9 @@ class Handler(BaseHTTPRequestHandler):
                 body["build_id"] = build.get("build_id", "unknown")
                 body["started_at"] = build.get("started_at")
                 body["state_hash"] = state_dir_hash((self.server.cfg or {}).get("state_dir"))
+                import os as _os
+
+                body["project_id"] = (_os.environ.get("AGENT_DASH_PROJECT_ID") or "").strip() or None
                 self._json(200, body)
             elif path == "/api/doctor":
                 self._doctor(query)
@@ -229,6 +232,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._state()
             elif path == "/api/project":
                 self._project()
+            elif path == "/api/projects":
+                self._projects()
             elif path.startswith("/static/"):
                 self._static(path[len("/static/"):])
             elif path.startswith("/docs/problems/"):
@@ -268,6 +273,11 @@ class Handler(BaseHTTPRequestHandler):
         from dash import project as project_mod
 
         self._json(200, project_mod.build_payload(self.server.store, self.server.cfg))
+
+    def _projects(self):
+        from dash import projects as projects_mod
+
+        self._json(200, projects_mod.build_projects_payload(self.server.cfg))
 
     def _doctor_block(self, now: float) -> dict:
         """The ``doctor`` block for ``/api/health``: summary plus generation time."""
