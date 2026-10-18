@@ -511,6 +511,203 @@ class SnapshotAgreementTest(unittest.TestCase):
             conn.close()
 
 
+LANES = ("grok", "muse", "glm", "claude", "deepseek", "other")
+
+
+def _grok_run(store, run_id, model, start, end=None, status="done", label=None):
+    """A synthetic Grok CLI run row: ids and counts only, never prompt text."""
+    store.upsert_run(
+        {
+            "run_id": run_id,
+            "source": "glm",
+            "tier": "glm",
+            "model": model,
+            "label": label or run_id,
+            "session_id": "sess-" + run_id.replace(":", "-"),
+            "status": status,
+            "started_at": start,
+            "ended_at": end,
+        }
+    )
+
+
+class GrokCliFamilyTest(unittest.TestCase):
+    def test_model_ids_map_to_families(self):
+        cases = {
+            "deepseek-flash": ("deepseek", "deepseek-flash"),
+            "deepseek-v4-flash": ("deepseek", "deepseek-flash"),
+            "deepseek-v4-flash-vision-exp": ("deepseek", "deepseek-flash"),
+            "deepseek-v4-pro": ("deepseek", "deepseek-v4-pro"),
+            "glm-5.3": ("glm", "glm-5.3"),
+            "glm-5.3-flash": ("glm", "glm-5.3-flash"),
+        }
+        for model, want in cases.items():
+            self.assertEqual(model_key(model, "glm glm"), want, model)
+            self.assertEqual(model_key(model), want, model)
+
+    def test_unknown_grok_hosted_id_is_other(self):
+        from dash.store import _tool_key
+
+        for model in ("mimo-v2-flash", "step-3.5-flash", "zzz-9"):
+            self.assertEqual(model_key(model, "glm glm"), ("other", "other"), model)
+            self.assertEqual(model_key(model), ("other", "other"), model)
+            run = {"source": "glm", "tier": "glm", "model": model}
+            self.assertEqual(_tool_key(run), "other", model)
+
+    def test_unrecorded_model_stays_glm(self):
+        from dash.store import _tool_key
+
+        for model in (None, ""):
+            self.assertEqual(model_key(model, "glm glm"), ("glm", "glm-unknown"))
+            run = {"source": "glm", "tier": "glm", "model": model}
+            self.assertEqual(_tool_key(run), "glm")
+
+    def test_tool_lanes_split_only_deepseek_and_other(self):
+        from dash.store import _tool_key
+
+        self.assertEqual(
+            _tool_key({"source": "glm", "tier": "glm", "model": "deepseek-flash"}),
+            "deepseek",
+        )
+        # GLM ids, unrecorded models, and other families through the same
+        # CLI keep the GLM lane: existing GLM counts do not move.
+        for model in ("glm-5.3", "glm-5.3-flash", None, "", "grok-4.7"):
+            self.assertEqual(
+                _tool_key({"source": "glm", "tier": "glm", "model": model}),
+                "glm",
+                repr(model),
+            )
+        self.assertIsNone(_tool_key({"source": "dagster", "tier": "", "model": None}))
+
+
+class ConcurrencySplitTest(unittest.TestCase):
+    BASE = 1_700_000_000
+
+    def _points(self, store):
+        return store.query_concurrency(self.BASE + 1000, None, self.BASE - 60, 60)
+
+    def test_overlapping_glm_and_deepseek_runs_split(self):
+        from dash.store import Store
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "dash.sqlite")
+            try:
+                b = self.BASE
+                _grok_run(store, "glm:s1:g-build", "glm-5.3-flash", b, b + 500)
+                _grok_run(store, "glm:s2:ds-review", "deepseek-flash", b + 200, b + 700)
+                points = self._points(store)
+                self.assertTrue(points)
+                for point in points:
+                    self.assertEqual(set(point), {"t", "models"} | set(LANES))
+                    lane_total = sum(point[key] for key in LANES)
+                    self.assertEqual(lane_total, sum(point["models"].values()))
+                by_t = {point["t"]: point for point in points}
+                # GLM-only stretch: the GLM lane is untouched by the split.
+                self.assertEqual((by_t[b]["glm"], by_t[b]["deepseek"]), (1, 0))
+                # Overlap: two lanes with the right peaks.
+                self.assertEqual((by_t[b + 240]["glm"], by_t[b + 240]["deepseek"]), (1, 1))
+                self.assertEqual(
+                    by_t[b + 240]["models"], {"glm-5.3-flash": 1, "deepseek-flash": 1}
+                )
+                # DeepSeek-only stretch.
+                self.assertEqual((by_t[b + 600]["glm"], by_t[b + 600]["deepseek"]), (0, 1))
+                self.assertEqual(max(point["glm"] for point in points), 1)
+                self.assertEqual(max(point["deepseek"] for point in points), 1)
+                self.assertEqual(sum(point["glm"] for point in points), 9)
+            finally:
+                store.close()
+
+    def test_other_family_run_leaves_glm_alone(self):
+        from dash.store import Store
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "dash.sqlite")
+            try:
+                b = self.BASE
+                _grok_run(store, "glm:s1:g-build", "glm-5.3-flash", b, b + 500)
+                _grok_run(store, "glm:s3:mimo-x", "mimo-v2-flash", b + 120, b + 240)
+                points = self._points(store)
+                by_t = {point["t"]: point for point in points}
+                self.assertEqual(by_t[b + 180]["other"], 1)
+                self.assertEqual(by_t[b + 180]["models"], {"glm-5.3-flash": 1, "other": 1})
+                self.assertEqual(by_t[b]["other"], 0)
+                self.assertEqual(by_t[b + 300]["other"], 0)
+                # The GLM lane still counts exactly its own run.
+                self.assertEqual(sum(point["glm"] for point in points), 9)
+            finally:
+                store.close()
+
+
+class ConcurrencyApiTest(unittest.TestCase):
+    def test_concurrency_endpoint_splits_families(self):
+        import time
+
+        from dash.server import DashServer
+        from dash.sources import Registry
+        from dash.store import Store
+        from agent_dash import default_cfg
+
+        now = time.time()
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "dash.sqlite")
+            server = DashServer(store, Registry([]), "127.0.0.1", 0, cfg=default_cfg())
+            thread = threading.Thread(
+                target=server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True
+            )
+            thread.start()
+            try:
+                _grok_run(
+                    store, "glm:s1:g-build", "glm-5.3-flash",
+                    now - 300, None, status="running",
+                )
+                _grok_run(
+                    store, "glm:s2:ds-review", "deepseek-flash",
+                    now - 200, None, status="running",
+                )
+                snap = self._get(server.server_address[1], "/api/snapshot?ws=all")
+                self.assertEqual(snap["counts"]["live_agents"], 2)
+                by_tool = snap["counts"]["live_by_tool"]
+                self.assertEqual((by_tool["glm"], by_tool["deepseek"]), (1, 1))
+                self.assertEqual(sum(by_tool.values()), 2)
+                by_model = snap["counts"]["live_by_model"]
+                self.assertEqual(
+                    (by_model["glm-5.3-flash"], by_model["deepseek-flash"]), (1, 1)
+                )
+                conc = self._get(
+                    server.server_address[1],
+                    "/api/concurrency?since=%s&step=60" % (now - 600),
+                )
+                points = conc["points"]
+                self.assertTrue(points)
+                for point in points:
+                    self.assertEqual(set(point), {"t", "models"} | set(LANES))
+                    self.assertEqual(
+                        sum(point[key] for key in LANES),
+                        sum(point["models"].values()),
+                    )
+                last = points[-1]
+                self.assertEqual((last["glm"], last["deepseek"]), (1, 1))
+                self.assertEqual(
+                    last["models"], {"glm-5.3-flash": 1, "deepseek-flash": 1}
+                )
+            finally:
+                server.stop.set()
+                server.shutdown()
+                thread.join(3)
+                server.server_close()
+                store.close()
+
+    def _get(self, port, path):
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        try:
+            conn.request("GET", path)
+            response = conn.getresponse()
+            self.assertEqual(response.status, 200, path)
+            return json.loads(response.read().decode("utf-8"))
+        finally:
+            conn.close()
+
+
 class DoctorPricingTest(unittest.TestCase):
     def _cfg(self, state_dir):
         from agent_dash import default_cfg

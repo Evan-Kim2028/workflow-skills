@@ -6,7 +6,7 @@ A fresh install runs with the shipped examples. You add a `*.local.json` file on
 
 ## Example files
 
-Four example files ship under `tools/agent-dash/`. `*.local.json` next to an example is gitignored.
+Example files ship under `tools/agent-dash/`. `*.local.json` next to an example is gitignored.
 
 ### config.example.json
 
@@ -44,6 +44,10 @@ Code defaults that the example file can override, if you put them in `config.loc
 | `cursor_usage` | unset. The collector then reads `cursor-usage.jsonl` in the state directory. |
 
 `host` and `port` in a config file are ignored. The server binds to 127.0.0.1 port 8765 unless `AGENT_DASH_PORT` names another port.
+
+### grok-config.deepseek.example.toml
+
+The Grok Build model block for DeepSeek V4.1 Flash. Copy its `[[model]]` block into `~/.grok/config.toml` (the Grok CLI's own config, not this dashboard's). The shipped template is key-free: the key travels through `env_key = "DEEPSEEK_API_KEY"` (a placeholder, never a real key). The inline alternative is `api_key = "<key>"`, local-only and never committed. Store the key in the macOS Keychain (`security add-generic-password -a "$USER" -s deepseek-api-key -w`, then export it per shell) or in a `chmod 600` file. The full run guide — worker command, manifest model column, labelling, prices, and what the dashboard shows — is [Run DeepSeek through Grok Build](../tools/agent-dash/docs/integrate.md#run-deepseek-through-grok-build).
 
 ### map.example.json
 

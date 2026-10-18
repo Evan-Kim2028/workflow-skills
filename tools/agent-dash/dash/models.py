@@ -5,7 +5,10 @@ cursor, muse, glm, deepseek, dagster) and a model key such as ``grok-4.7`` or
 ``composer-2.5``. DeepSeek ids map to ``deepseek-flash`` (including the legacy
 ``deepseek-v4-flash`` and ``deepseek-v4-flash-vision-exp`` aliases) or
 ``deepseek-v4-pro``. A run whose model id was never recorded gets
-``<family>-unknown``. A Dagster job keeps the job name after ``dagster:``.
+``<family>-unknown``. A Grok CLI run whose model id is recorded but matches
+no known family (``mimo-*``, ``step-*``, or any other grok-hosted id) maps
+to ``other``: only an empty id falls back to ``glm-unknown``. A Dagster job
+keeps the job name after ``dagster:``.
 """
 
 from __future__ import annotations
@@ -45,6 +48,8 @@ def model_key(model: str | None, hint: str | None = None) -> tuple[str, str]:
         return "claude", match.group(1)
     for fam, words in (("cursor", ("grok", "cursor", "composer")), ("muse", ("muse",)), ("glm", ("glm",)), ("claude", ("claude",))):
         if any(word in h for word in words):
+            if fam == "glm" and m:
+                return "other", "other"
             return fam, f"{fam}-unknown"
     return "other", "other"
 

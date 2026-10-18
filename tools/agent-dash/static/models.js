@@ -1,5 +1,7 @@
 /* Model families. One place maps a run or a model id to its family (hue) and model (shade of that hue).
-   dash/models.py holds the same rules for the server-side counts. */
+   dash/models.py holds the same rules for the server-side counts. A Grok CLI
+   run with a recorded-but-unknown model id (mimo-*, step-*) reads as Other;
+   only an empty id reads as glm-unknown. */
 (function (global) {
   "use strict";
   var FAMS = ["claude", "cursor", "muse", "glm", "deepseek", "dagster", "other"];
@@ -31,7 +33,9 @@
     if (v) return ["claude", v[1]];
     if (/grok|cursor|composer/.test(h)) return ["cursor", "cursor-unknown"];
     if (/muse/.test(h)) return ["muse", "muse-unknown"];
-    if (/glm/.test(h)) return ["glm", "glm-unknown"];
+    /* A recorded-but-unknown Grok CLI id (mimo-*, step-*) is Other; only an
+       empty id falls back to glm-unknown. Mirrors dash/models.py. */
+    if (/glm/.test(h)) return m ? ["other", "other"] : ["glm", "glm-unknown"];
     if (/claude/.test(h)) return ["claude", "claude-unknown"];
     return ["other", "other"];
   }

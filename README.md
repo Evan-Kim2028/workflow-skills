@@ -41,4 +41,5 @@ The lead loop is [Running a workstream end to end](tools/agent-dash/docs/workstr
 - [docs/concepts.md](docs/concepts.md)
 - [docs/configuration.md](docs/configuration.md)
 - [tools/agent-dash/docs/integrate.md](tools/agent-dash/docs/integrate.md)
+- [Run DeepSeek through Grok Build](tools/agent-dash/docs/integrate.md#run-deepseek-through-grok-build) ([config](docs/configuration.md#grok-configdeepseekexampletoml), [key-free template](tools/agent-dash/catalog/grok-config.deepseek.example.toml))
 - [tools/agent-dash/CONTRACT.md](tools/agent-dash/CONTRACT.md)

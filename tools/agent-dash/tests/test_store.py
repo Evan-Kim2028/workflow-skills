@@ -808,7 +808,7 @@ class StoreTest(unittest.TestCase):
         self.assertNotIn("caps", snap)
         counts = snap["counts"]
         self.assertEqual(counts["live_agents"], 1)
-        self.assertEqual(counts["live_by_tool"], {"grok": 1, "muse": 0, "glm": 0, "claude": 0})
+        self.assertEqual(counts["live_by_tool"], {"grok": 1, "muse": 0, "glm": 0, "claude": 0, "deepseek": 0, "other": 0})
         self.assertEqual(counts["finished_today"], 1)
         self.assertEqual(counts["finished_in_range"], 1)
         self.assertEqual(counts["finished_by_verdict"], {"PASS": 1})

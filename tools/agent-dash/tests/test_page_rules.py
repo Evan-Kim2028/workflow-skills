@@ -871,6 +871,53 @@ class PageRules(unittest.TestCase):
         for needle in ("No live agents in this window", "data-failed-scope", "request failed"):
             self.assertIn(needle, paint, f"the stack hides an empty live strip: {needle!r}")
 
+    def test_conc_strips_come_from_families_not_a_tool_list(self):
+        """The live-agents strip list is built from the window's model
+        families (actConcFams over ADM.FAMS), never a hard-coded tool list:
+        a DeepSeek run earns a DeepSeek strip, and a family with no runs in
+        the window gets no strip. The hover tooltip breaks the same
+        families down to exact per-model counts."""
+        src = (STATIC / "cards" / "activity.js").read_text()
+        self.assertNotIn('["claude", "cursor", "muse", "glm"]', src)
+        script = inline_scripts()
+        bodies = dict(functions(script))
+        self.assertIn("actConcFams", bodies)
+        strips = bodies["actConcStrips"]
+        self.assertIn("actConcFams", strips)
+        self.assertIn("ADM.FAMS", bodies["actConcFams"])
+        tip = bodies["actConcStrip"]
+        for needle in ("data-fam", "data-peak", "actConcFams(all)"):
+            self.assertIn(needle, tip, f"actConcStrip lost {needle!r}")
+
+    def test_conc_fams_node(self):
+        """Node proof for the pure strip-family builder: model keys in give
+        ADM.FAMS-ordered families out, DeepSeek included, empties dropped."""
+        harness = r'''
+const fs = require("fs");
+const assert = require("assert");
+global.window = globalThis;
+eval(fs.readFileSync(process.argv[2], "utf8"));
+eval(fs.readFileSync(process.argv[3], "utf8"));
+assert.strictEqual(typeof actConcFams, "function", "actConcFams is not exported");
+assert.deepStrictEqual(actConcFams(["glm-5.3-flash", "deepseek-flash"]), ["glm", "deepseek"]);
+assert.deepStrictEqual(actConcFams(["deepseek-flash", "glm-5.3-flash", "deepseek-v4-pro"]), ["glm", "deepseek"]);
+assert.deepStrictEqual(actConcFams(["glm-unknown"]), ["glm"]);
+assert.deepStrictEqual(actConcFams(["other"]), ["other"]);
+assert.deepStrictEqual(actConcFams([]), []);
+assert.deepStrictEqual(actConcFams(null), []);
+assert.strictEqual(ADM.famColor("deepseek"), "var(--s8)", "DeepSeek strip lost its --s8 hue");
+console.log("conc fams proof ok");
+'''
+        with tempfile.TemporaryDirectory() as tmp:
+            harness_path = Path(tmp) / "conc_fams.js"
+            harness_path.write_text(harness, encoding="utf-8")
+            proc = subprocess.run(
+                ["node", str(harness_path), str(STATIC / "models.js"), str(STATIC / "cards" / "activity.js")],
+                capture_output=True,
+                text=True,
+            )
+        self.assertEqual(proc.returncode, 0, proc.stderr or proc.stdout)
+
     def test_unknown_duration_is_a_dash(self):
         script = (
             "const fs=require('fs');"

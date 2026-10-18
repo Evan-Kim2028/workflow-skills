@@ -17,7 +17,8 @@
    top-up in state.actWide); Date.now for the rolling window.
    Exports (on window.AdPage, also kept as plain globals): activityCard
    plus the pure range helpers actClampRange, actPresetRange, actTimeToX,
-   actXToTime, actDragHandle, actDragMove and actTickStep (node-tested).
+   actXToTime, actDragHandle, actDragMove and actTickStep (node-tested) and
+   the pure strip-family helper actConcFams (node-tested).
    Needs: el, s, CW, axes, timeTicks, fmtN, fmtDur, fmtT, fmtDate,
    showTip, hideTip, openRun, drawMain, api, colorOf, fullName, tierKey,
    modelKey, state, since, groupFor, expanded, isAgent, runEnd, packRows,
@@ -331,7 +332,7 @@
     }
     /* The x axis labels draw once at the bottom of the stack: only the
        last strip that actually drew gets ticks. */
-    if (conc.length) conc[conc.length - 1] = actConcStrip(range, loaded, g, conc[conc.length - 1].fam, true);
+    if (conc.length) conc[conc.length - 1] = actConcStrip(range, loaded, g, conc[conc.length - 1].fam, true, null, null, true);
     else tml = actTimelineStrip(range, loaded, now, g, true);
     strips.appendChild(tok.node);
     strips.appendChild(tml.node);
@@ -814,29 +815,35 @@
   /* Live-agents strips: one gradient strip per model family on its own
      scale and the shared x, with peak dot and pk annotation. Only the
      bottom strip of the stack carries x labels. */
-  var ACT_TOOLFAM = {grok: "cursor", muse: "muse", glm: "glm", claude: "claude"};
-  var ACT_FAMS = ["claude", "cursor", "muse", "glm"];
+  var ACT_TOOLFAM = {grok: "cursor", muse: "muse", glm: "glm", claude: "claude", deepseek: "deepseek", other: "other"};
   function actMods(p) {
     if (p.models) return p.models;
     var o = {};
     Object.keys(ACT_TOOLFAM).forEach(function (t) { if (p[t]) o[ACT_TOOLFAM[t] + "-unknown"] = p[t]; });
     return o;
   }
+  /* Strip families come from the window's own model keys in ADM.FAMS order,
+     never a hard-coded tool list: a family with no runs in the window gets
+     no strip. Job rows never appear among the keys (they are not counted
+     agents), so no family needs excluding by name. Pure: no DOM, no state. */
+  function actConcFams(keys) {
+    var fams = [];
+    (keys || []).forEach(function (k) {
+      var f = ADM.famOf(k);
+      if (fams.indexOf(f) < 0) fams.push(f);
+    });
+    return ADM.FAMS.filter(function (f) { return fams.indexOf(f) >= 0; });
+  }
   function actConcStrips(range, loaded, g, withX) {
     var P = (loaded.conc || []).filter(function (p) { return p.t >= range.from - 60 && p.t <= range.to; });
     if (!P.length) return [];
     var seen = {};
     P.forEach(function (p) { var m = actMods(p); for (var k in m) if (m[k]) seen[k] = 1; });
-    var anyPeak = ACT_FAMS.some(function (f) {
-      return P.some(function (p) {
-        var m = actMods(p);
-        return Object.keys(m).some(function (k) { return m[k] && ADM.famOf(k) === f; });
-      });
-    });
-    if (!anyPeak) return [];
-    return ACT_FAMS.map(function (f) { return actConcStrip(range, loaded, g, f, false, P, seen); });
+    var fams = actConcFams(Object.keys(seen));
+    if (!fams.length) return [];
+    return fams.map(function (f, i) { return actConcStrip(range, loaded, g, f, false, P, seen, i === fams.length - 1); });
   }
-  function actConcStrip(range, loaded, g, fam, withX, P, seen) {
+  function actConcStrip(range, loaded, g, fam, withX, P, seen, isLast) {
     var from = range.from, to = range.to;
     P = P || (loaded.conc || []).filter(function (p) { return p.t >= from - 60 && p.t <= to; });
     seen = seen || {};
@@ -848,7 +855,7 @@
     series.forEach(function (v) { peak = Math.max(peak, v); });
     var mx = Math.max(2, Math.ceil(peak / 2) * 2);
     var attrs = {class: "conc-strip act-strip", "data-fam": fam, "data-peak": String(peak)};
-    if (fam === ACT_FAMS[ACT_FAMS.length - 1]) attrs.id = "exec-live";
+    if (isLast) attrs.id = "exec-live";
     var wrap = el("div", attrs);
     var head = el("div", {class: "conc-head"});
     var dot = el("i", {class: "sw"}); dot.style.background = ADM.famColor(fam); head.appendChild(dot);
@@ -885,7 +892,7 @@
       var best = P[0];
       P.forEach(function (p) { if (Math.abs(p.t - tt) < Math.abs(best.t - tt)) best = p; });
       var m = actMods(best), rows = [];
-      ACT_FAMS.forEach(function (f) {
+      actConcFams(all).forEach(function (f) {
         var fks = all.filter(function (k) { return ADM.famOf(k) === f; });
         var tot = fks.reduce(function (a, k) { return a + (m[k] || 0); }, 0);
         rows.push({k: ADM.FAM[f].name, v: String(tot), c: ADM.famColor(f)});
@@ -918,6 +925,7 @@
   AdPage.actTimelineStrip = actTimelineStrip;
   AdPage.actConcStrips = actConcStrips;
   AdPage.actConcStrip = actConcStrip;
+  AdPage.actConcFams = actConcFams;
   AdPage.actBrush = actBrush;
   AdPage.actClampRange = actClampRange;
   AdPage.actPresetRange = actPresetRange;
@@ -933,6 +941,7 @@
   global.actTimelineStrip = actTimelineStrip;
   global.actConcStrips = actConcStrips;
   global.actConcStrip = actConcStrip;
+  global.actConcFams = actConcFams;
   global.actBrush = actBrush;
   global.actClampRange = actClampRange;
   global.actPresetRange = actPresetRange;

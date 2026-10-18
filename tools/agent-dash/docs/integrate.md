@@ -254,7 +254,7 @@ ws4-WS4.1-notes-index	550e8400-e29b-41d4-a716-446655440000	1700000000	demo-model
 
 Status comes from the files: growing output means running, a SIGTERM trace in the err file means killed, an empty out file with a real error means died early, else done. The verdict comes from the first matching line of the out file (next section). Tokens do not travel this path; pair it with a `report usage` line or `generic.jsonl` usage lines. The shipped scratch glob is `$HOME/agent-scratch/*`, one directory deep; add deeper paths to `roots.scratchpads` and restart. Manifest rows prove liveness through out-file growth or a live sample of a shipped worker binary: a custom binary whose out file stays quiet reads `done` while it lives, and registering the folder does not revive it. When your binary is not one of the shipped launchers, report liveness with `report start` / `report usage` heartbeats / `report finish` instead of relying on the manifest alone.
 
-The live-agents tile counts the `grok`, `muse`, `glm`, and `claude` buckets. A generic run shows in the running table, on its task chip, and in tokens and cost either way; set `--tier` to the closest bucket only when the tile must count it.
+The live-agents tile counts the `grok`, `muse`, `glm`, `deepseek`, `other`, and `claude` buckets. Grok CLI runs split by model family: `deepseek-*` counts as DeepSeek, `glm-*` as GLM, anything else as Other. A generic run shows in the running table, on its task chip, and in tokens and cost either way; set `--tier` to the closest bucket only when the tile must count it.
 
 ## 3. Labels and the task map
 
@@ -319,6 +319,41 @@ Workers run with `grok --model deepseek-flash` (DeepSeek-V4.1-Flash-1017 via Dee
 Off-peak is half of peak; there are no context tiers. Peak is 01:00-04:00 and 06:00-10:00 UTC Monday through Friday, excluding mainland China public holidays (best-effort dated list in `dash/pricing.py` as `CHINA_HOLIDAYS_2026`: New Year's Day, the Spring Festival week, the observed Qingming day, the Labour Day week, Dragon Boat Festival, Mid-Autumn Festival, the National Day week); every other hour is off-peak, and any day missing from that list follows the normal weekday rule. Each usage record prices from its own timestamp (per-turn `endedAt` where the log has per-turn rows); a session-level record with no turn timestamps prices at its own timestamp as an approximation, and a record with no timestamp at all prices at the peak band (conservative). Stored `input` is the cache miss and `cache_read` the hit: the Grok Build `usage.json` reports `inputTokens` *including* `cachedReadTokens` (`totalTokens` = `inputTokens` + `outputTokens`), while the CLI's `-p --output-format json` final object reports `input_tokens` as the miss (`total_tokens` = miss + `cache_read_input_tokens` + `output_tokens`). The reader stores miss/hit separately and the catalog bills miss at the miss rate, hit at the hit rate. `reasoningTokens` is stored but billed at no separate rate: the `chat_completions` output count already includes reasoning, so billing `output` covers it with no double count.
 
 To update: re-check the pricing page, edit the four rows' peak rates and `offpeak` block in `tools/agent-dash/catalog/prices.json` (keep `retrieved_at` current), adjust `CHINA_HOLIDAYS_2026` in `dash/pricing.py` if the holiday list changed, then run `python3 agent_dash.py reprice` and the DeepSeek tests (`python3 -m unittest discover -s tests -p 'test_deepseek*.py'`).
+
+### Run DeepSeek through Grok Build
+
+Add one model block to `~/.grok/config.toml`. Copy the key-free template `tools/agent-dash/catalog/grok-config.deepseek.example.toml`:
+
+```toml
+[[model]]
+id = "deepseek-flash"
+name = "DeepSeek V4.1 Flash"
+base_url = "https://api.deepseek.com"
+api_backend = "chat_completions"
+context_window = 1048576
+max_completion_tokens = 65536
+env_key = "DEEPSEEK_API_KEY"
+reasoning_efforts = ["low", "high", "max"]
+```
+
+The key travels through `env_key = "DEEPSEEK_API_KEY"` (a placeholder, never a real key). The inline alternative is `api_key = "<key>"` in the same block, local-only: never commit that file. Store the key in the macOS Keychain:
+
+```bash
+security add-generic-password -a "$USER" -s deepseek-api-key -w
+export DEEPSEEK_API_KEY="$(security find-generic-password -s deepseek-api-key -w)"
+```
+
+or in a `chmod 600` file your shell reads. Never commit a key.
+
+Run a worker with:
+
+```bash
+grok -p "<prompt>" --model deepseek-flash --output-format json
+```
+
+Write the manifest row with the model fourth (`label`, session uuid, start epoch, `deepseek-flash`) in `glm-sessions.tsv`, and label the run `ws<N>-plan-<slug>`, `ws<N>-exec-<slug>`, or `ws<N>-review-<slug>` (§3). The legacy aliases `deepseek-v4-flash` and `deepseek-v4-flash-vision-exp` price as `deepseek-flash`; `deepseek-v4-pro` is the Pro id.
+
+The dashboard shows DeepSeek tokens with the cache split (stored `input` is the miss, `cache_read` the hit), time-aware cost, and its own Live agents strip in Activity over time once a DeepSeek run exists in the window. Any other grok-hosted id (`mimo-*`, `step-*`) reads as Other: priced only when the catalog names it, and counted outside the GLM lane.
 
 ## 6. Drive a workstream
 

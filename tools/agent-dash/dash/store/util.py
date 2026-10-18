@@ -10,7 +10,7 @@ import re
 from datetime import datetime
 
 
-TOOL_KEYS = ("grok", "muse", "glm", "claude")
+TOOL_KEYS = ("grok", "muse", "glm", "claude", "deepseek", "other")
 
 
 FINISHED = ("done", "killed", "died_early")
@@ -199,10 +199,29 @@ def _tool_key(run: dict) -> str | None:
     if source == "muse" or tier == "muse":
         return "muse"
     if source == "glm" or tier == "glm":
-        return "glm"
+        return _grok_cli_key(run)
     if source.startswith("claude") or tier in ("opus", "sonnet", "haiku"):
         return "claude"
     return None
+
+
+def _grok_cli_key(run: dict) -> str:
+    """Tool lane for a Grok CLI run: split by model family, not the CLI name.
+
+    The family comes from the one derivation in ``dash.models`` (lazy import:
+    this module takes no dash imports at load): ``deepseek-*`` runs count as
+    ``deepseek``, ``glm-*`` and unrecorded models stay ``glm``, and any other
+    grok-hosted id (``mimo-*``, ``step-*``) counts as ``other``.
+    """
+    from dash.models import model_key
+
+    hint = " ".join(str(run.get(name) or "") for name in ("tier", "source"))
+    fam, _key = model_key(run.get("model"), hint)
+    if fam == "deepseek":
+        return "deepseek"
+    if fam == "other":
+        return "other"
+    return "glm"
 
 
 def is_prod_job_run(run: dict) -> bool:

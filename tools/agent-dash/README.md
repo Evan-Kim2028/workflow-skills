@@ -42,6 +42,7 @@ Zero config runs. `config.local.json` deep-merges over `config.example.json`. Th
 ## Links
 
 - [Plug in any agent](docs/integrate.md)
+- [Run DeepSeek through Grok Build](docs/integrate.md#run-deepseek-through-grok-build) ([config](../../docs/configuration.md#grok-configdeepseekexampletoml), [key-free template](catalog/grok-config.deepseek.example.toml))
 - [CONTRACT.md](CONTRACT.md)
 - [quickstart](../../docs/quickstart.md) and [concepts](../../docs/concepts.md)
 - [landing page](../../README.md)

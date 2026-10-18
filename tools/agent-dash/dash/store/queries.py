@@ -14,7 +14,7 @@ from dash.models import run_model_key
 
 from .runs import _parent_map
 from .summarize import _scope_tab
-from .util import (BILLED_FIELDS, RANGE_S, WS_STATUSES,
+from .util import (BILLED_FIELDS, RANGE_S, TOOL_KEYS, WS_STATUSES,
                  _drop_launch_echoes, _is_counted_agent,
                  _money, _sum_costs, _tool_key, _ws_sort)
 
@@ -283,7 +283,7 @@ class QueriesMixin:
                 if t > now + 1e-6:
                     break
                 live = t <= now
-                point = {"t": t, "grok": 0, "muse": 0, "glm": 0, "claude": 0, "models": {}}
+                point = {"t": t, **{key: 0 for key in TOOL_KEYS}, "models": {}}
                 for (key, model), (starts, ends, open_starts) in lanes.items():
                     active = bisect_right(starts, t) - bisect_right(ends, t)
                     if live:

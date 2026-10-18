@@ -1,0 +1,23 @@
+# Example Grok Build model block for DeepSeek V4.1 Flash. Copy the
+# [[model]] block into ~/.grok/config.toml and keep this file key-free:
+# the API key lives in the environment (DEEPSEEK_API_KEY), never here.
+#
+# Setup: export DEEPSEEK_API_KEY='<paste-key-here>' (or store it in the
+# macOS Keychain and export it per shell), then run:
+#   grok -p "<prompt>" --model deepseek-flash --output-format json
+#
+# The dashboard guide is tools/agent-dash/docs/integrate.md (§5 DeepSeek)
+# and docs/configuration.md (Grok Build model block); prices are
+# time-aware per https://api-docs.deepseek.com/quick_start/pricing.
+
+[[model]]
+id = "deepseek-flash"
+name = "DeepSeek V4.1 Flash"
+base_url = "https://api.deepseek.com"
+api_backend = "chat_completions"
+context_window = 1048576
+max_completion_tokens = 65536
+env_key = "DEEPSEEK_API_KEY"
+# api_key = "<paste-key-here>"  # LOCAL-ONLY alternative: never commit this file with a real key in it.
+
+reasoning_efforts = ["low", "high", "max"]
