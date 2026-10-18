@@ -78,6 +78,12 @@ def _extract_taskof(path, name, func="taskOf"):
 
 
 class PageRules(unittest.TestCase):
+    def test_shell_has_no_favicon_404(self):
+        """The shell inlines an empty icon so no view logs a favicon
+        404 (one console error and one failed request per load)."""
+        page = (STATIC / "index.html").read_text()
+        self.assertIn('rel="icon"', page, "index.html lost its icon link")
+
     def test_every_chart_has_axes(self):
         for path, src in pages():
             for name, body in functions(src):
