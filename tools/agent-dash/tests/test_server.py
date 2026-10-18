@@ -1510,6 +1510,73 @@ class DoctorApiTest(unittest.TestCase):
             self.assertIn("command", item)
 
 
+class ArchiveReportResolutionTest(unittest.TestCase):
+    """Archive cards name the closing report by basename, wherever it lives.
+
+    ``ws archive`` requires ``docs/closing-report.md``; the card must find it
+    there with no ``reports/`` dir, and must never surface a path or body.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _archived(self, ws, summary=None):
+        bundle = self.root / ws
+        bundle.mkdir(parents=True)
+        (bundle / "bundle.json").write_text(json.dumps(
+            {"id": ws, "title": "Probe " + ws, "state": "archived", "archived_at": 100}),
+            encoding="utf-8")
+        if summary is not None:
+            (bundle / "summary.json").write_text(json.dumps(summary), encoding="utf-8")
+        return bundle
+
+    def _report(self, ws):
+        from dash.workstates import archive_cards, all_bundle_meta
+
+        cards = archive_cards(all_bundle_meta(self.root), self.root)
+        return next(card["report"] for card in cards if card["id"] == ws)
+
+    def test_docs_closing_report_without_reports_dir(self):
+        bundle = self._archived("WS51", {"ws": "WS51", "closing_report": True})
+        (bundle / "docs").mkdir()
+        (bundle / "docs" / "closing-report.md").write_text("SECRET BODY\n", encoding="utf-8")
+        self.assertFalse((bundle / "reports").exists())
+        self.assertEqual(self._report("WS51"), "closing-report.md")
+
+    def test_frozen_name_wins_when_file_exists(self):
+        bundle = self._archived("WS52", {"ws": "WS52", "closing_report": True,
+                                        "closing_report_name": "final.md"})
+        (bundle / "docs").mkdir()
+        (bundle / "docs" / "final.md").write_text("body\n", encoding="utf-8")
+        (bundle / "docs" / "closing-report.md").write_text("body\n", encoding="utf-8")
+        self.assertEqual(self._report("WS52"), "final.md")
+
+    def test_frozen_name_without_file_falls_back(self):
+        bundle = self._archived("WS53", {"ws": "WS53", "closing_report": True,
+                                        "closing_report_name": "gone.md"})
+        (bundle / "docs").mkdir()
+        (bundle / "docs" / "closing-report.md").write_text("body\n", encoding="utf-8")
+        self.assertEqual(self._report("WS53"), "closing-report.md")
+
+    def test_frozen_name_is_reduced_to_basename(self):
+        self._archived("WS54", {"ws": "WS54", "closing_report_name": "../../secret/closing.md"})
+        self.assertIsNone(self._report("WS54"))
+
+    def test_reports_glob_still_resolves(self):
+        bundle = self._archived("WS55")
+        (bundle / "reports").mkdir()
+        (bundle / "reports" / "2026-10-17-closing.md").write_text("body\n", encoding="utf-8")
+        self.assertEqual(self._report("WS55"), "2026-10-17-closing.md")
+
+    def test_neither_gives_no_report(self):
+        self._archived("WS56", {"ws": "WS56", "closing_report": False})
+        self.assertIsNone(self._report("WS56"))
+
+
 class WorkstreamStatesApiTest(unittest.TestCase):
     """Lifecycle states on the API: scoped workstream rows plus /api/archive.
 

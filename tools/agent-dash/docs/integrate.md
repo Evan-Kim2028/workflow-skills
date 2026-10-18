@@ -330,7 +330,7 @@ python3 tools/agent-dash/agent_dash.py ws restore WS4   # archived -> done, keep
 python3 tools/agent-dash/agent_dash.py ws list --state all
 ```
 
-`ws archive` freezes `summary.json` (final stats, lifetime tokens/cost when the dashboard is reachable) and never deletes anything. The full state rules are in [SKILL-PLAN.md](../SKILL-PLAN.md#workstream-lifecycle).
+`ws archive` freezes `summary.json` (final stats, lifetime tokens/cost when the dashboard is reachable) and never deletes anything. The archive card's Report link names `docs/closing-report.md` (basename only, body never served), so write the report there rather than only under `reports/`. The full state rules are in [SKILL-PLAN.md](../SKILL-PLAN.md#workstream-lifecycle).
 
 Status is `todo`, `wip`, `pr`, `prog`, `done`, or `deferred`. `wip` is work on a branch; `pr` is approved or open; `prog` is merged with a production step left; `done` is merged and live. `--moved-to` and `--note` belong only on `deferred`. Status edits read live; `render` is only for prose and drawings. `ws validate` fails on a dep that names an unknown task or the task itself, a `dep_notes` key outside the task's `deps`, and a bare number citation (name things first: `the notes cutover (WS4.3)`).
 

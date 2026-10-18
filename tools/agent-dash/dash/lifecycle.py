@@ -116,6 +116,7 @@ def freeze_summary(
     approvals: dict | None,
     usage: dict | None,
     closing_report: bool,
+    closing_report_name: str | None = None,
     note: str | None = None,
 ) -> dict:
     """Frozen archive card for a workstream from already-read facts.
@@ -126,7 +127,10 @@ def freeze_summary(
     ``approvals_for`` record, and ``usage`` the
     ``fetch_workstream_usage`` payload (nulls with a note when the
     dashboard was unreachable). ``duration_s`` is None when no start
-    moment was ever recorded.
+    moment was ever recorded. ``closing_report_name`` is the basename of
+    the closing report frozen with the bundle (``closing-report.md``), or
+    None when none was present; the boolean ``closing_report`` stays for
+    older readers.
     """
     counts = {}
     done = 0
@@ -171,6 +175,7 @@ def freeze_summary(
         "approvals": approval_counts,
         "usage": usage,
         "closing_report": closing_report,
+        "closing_report_name": closing_report_name,
         "note": note,
     }
 
@@ -433,6 +438,7 @@ def archive_bundle(
         approvals=approvals,
         usage=usage,
         closing_report=has_report,
+        closing_report_name=CLOSING_REPORT.name if has_report else None,
         note=note.strip() if isinstance(note, str) and note.strip() else None,
     )
     with _bundle_lock(path):

@@ -31,6 +31,9 @@ DEFAULT_STATES = ("planned", "active", "paused", "done")
 #: Keys a closing-report reference may hide under inside ``summary.json``.
 _REPORT_KEYS = ("report", "closing_report", "report_path", "closing-report")
 
+#: Closing-report filename ``ws archive`` requires at ``docs/`` in a bundle.
+_CLOSING_REPORT_NAME = "closing-report.md"
+
 
 def workstreams_root() -> Path:
     """Bundle directory, honoring the same override as the bundle reader."""
@@ -203,23 +206,39 @@ def _summary_card(ws: str, base: Path) -> dict | None:
 def _report_basename(ws: str, base: Path, summary: dict | None) -> str | None:
     """Closing-report reference as a basename only, never a path or body.
 
-    Prefers the reference frozen in ``summary.json``; else the newest
-    ``reports/*closing*.md`` file. Absolute or directory-qualified values
-    reduce to their final component so local paths never leak.
+    Resolution order: the ``closing_report_name`` frozen in
+    ``summary.json`` when that file still exists in the bundle's
+    ``docs/``; then ``docs/closing-report.md`` (where ``ws archive``
+    requires it); then the legacy ``summary.json`` report keys; then the
+    newest ``reports/*closing*.md`` file. Absolute or directory-qualified
+    values reduce to their final component so local paths never leak.
     """
+    docs = base / ws / "docs"
+    if isinstance(summary, dict):
+        frozen = _basename(summary.get("closing_report_name"))
+        if frozen and (docs / frozen).is_file():
+            return frozen
+    if (docs / _CLOSING_REPORT_NAME).is_file():
+        return _CLOSING_REPORT_NAME
     if isinstance(summary, dict):
         for key in _REPORT_KEYS:
-            value = summary.get(key)
-            if isinstance(value, str) and value.strip():
-                name = value.strip().split("/")[-1].split("\\")[-1]
-                if name and name not in (".", ".."):
-                    return name
+            name = _basename(summary.get(key))
+            if name:
+                return name
     try:
         reports = base / ws / "reports"
         candidates = sorted(reports.glob("*closing*.md")) if reports.is_dir() else []
     except OSError:
         candidates = []
     return candidates[-1].name if candidates else None
+
+
+def _basename(value) -> str | None:
+    """Final path component of a non-empty string, or None."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    name = value.strip().split("/")[-1].split("\\")[-1]
+    return name if name and name not in (".", "..") else None
 
 
 def archive_cards(meta: dict | None = None, root: Path | None = None) -> list:

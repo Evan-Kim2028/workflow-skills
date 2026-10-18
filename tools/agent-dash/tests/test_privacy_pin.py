@@ -411,6 +411,21 @@ class ArchivePrivacyTest(unittest.TestCase):
             json.dump({"tasks_done": 1, "tasks_total": 1, "report": "reports/2026-10-18-closing.md"}, fh)
         with open(os.path.join(dest, "reports", "2026-10-18-closing.md"), "w") as fh:
             fh.write("closing body with %s and %s and %s and %s\n" % SENTINELS)
+        docs_dir = os.path.join(self.wsroot, "WS40", "docs")
+        os.makedirs(docs_dir)
+        with open(os.path.join(self.wsroot, "WS40", "bundle.json"), "w") as fh:
+            json.dump(
+                {"id": "WS40", "title": "Probe WS40", "short": "WS40",
+                 "order": 40, "kind": "workstream", "state": "archived",
+                 "state_changed_at": int(self.now) - 60,
+                 "archived_at": int(self.now) - 500},
+                fh,
+            )
+        with open(os.path.join(self.wsroot, "WS40", "summary.json"), "w") as fh:
+            json.dump({"tasks_done": 1, "tasks_total": 1, "closing_report": True,
+                       "closing_report_name": "closing-report.md"}, fh)
+        with open(os.path.join(docs_dir, "closing-report.md"), "w") as fh:
+            fh.write("docs body with %s and %s and %s and %s\n" % SENTINELS)
         self._env = mock.patch.dict(os.environ, {"AGENT_DASH_WORKSTREAMS": self.wsroot})
         self._env.start()
         self.addCleanup(self._env.stop)
@@ -432,6 +447,8 @@ class ArchivePrivacyTest(unittest.TestCase):
         text = body.decode("utf-8", "replace")
         payload = json.loads(text)
         self.assertEqual(payload["archive"][0]["report"], "2026-10-18-closing.md")
+        by_id = {card["id"]: card for card in payload["archive"]}
+        self.assertEqual(by_id["WS40"]["report"], "closing-report.md")
         for sentinel in SENTINELS:
             self.assertNotIn(sentinel, text)
         status, body = _get(self.port, "/api/workstreams?state=all")

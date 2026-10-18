@@ -255,6 +255,7 @@ class WsArchiveTest(unittest.TestCase):
         self.assertEqual(summary["tasks"]["done"], summary["tasks"]["total"])
         self.assertGreater(summary["tasks"]["total"], 0)
         self.assertTrue(summary["closing_report"])
+        self.assertEqual(summary["closing_report_name"], "closing-report.md")
         self.assertIsNone(summary["usage"]["tokens_all_time"])
         self.assertIsNone(summary["usage"]["cost_usd_all_time"])
         self.assertFalse(summary["usage"]["reachable"])
@@ -396,9 +397,12 @@ class PureHelpersTest(unittest.TestCase):
             ]},
             usage={"tokens_all_time": 10, "cost_usd_all_time": 0.1, "reachable": True, "note": None},
             closing_report=True,
+            closing_report_name="closing-report.md",
             note=None,
         )
         self.assertEqual(summary["ws"], "WS9")
+        self.assertTrue(summary["closing_report"])
+        self.assertEqual(summary["closing_report_name"], "closing-report.md")
         self.assertEqual(summary["duration_s"], 3600.0)
         self.assertEqual(summary["tasks"]["done"], 2)
         self.assertEqual(summary["trains"], {"total": 2, "by_status": {"merged": 1, "planned": 1}})
