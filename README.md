@@ -1,49 +1,44 @@
 # workflow-skills
 
-A local dashboard and a small kit for running many coding agents at once, from any harness. You plan a workstream, send the independent lanes out in a wave, watch the agents on one page, and see what the tokens cost.
+<img src="docs/img/dashboard-flow.svg" width="900" alt="Flow from agents through collectors to the store and dashboard, plus six steps for scoping work so it can be tracked">
+
+The dashboard workstream is one local page that tracks many agents working in parallel across tools. With several agents running at once, you lose track of what is planned, running, done, and what it costs. The dashboard reads what agents already write, shows it by workstream, and nudges agents to scope and label work so it stays trackable.
 
 ![Execution overview, dark theme](docs/screenshots/overview-dark.png)
 
-**Execution overview.** Live agents, finished runs, tokens and cost, workstream progress, and every run. More views are in [docs/screenshots](docs/screenshots).
+## What you get
 
-## 30 seconds
+- Every run on one page: live agents, finished runs, tokens and cost.
+- A plan map per workstream: tasks, dependencies, gates, and progress.
+- Project, Current, Planned, and Archive views, with a dependency graph and burn-up.
+- A doctor command that names what is broken and the exact fix.
+- Lifecycle buttons on the page with undo: start, pause, done, archive, restore.
+- Local and read-only: labels, timings, and token counts only; data stays on your machine.
 
-From this directory:
+## Quickstart
 
 ```bash
 ./install.sh
 python3 tools/agent-dash/agent_dash.py run
 ```
 
-`install.sh` symlinks the skills and the tool into `~/.claude/`; running it again is safe. `run` prints `running`, a pid, and `url http://127.0.0.1:8765/`. Open that URL. The address is fixed.
+Open http://127.0.0.1:8765 . The ten-minute path with sample data is [docs/quickstart.md](docs/quickstart.md).
 
-```bash
-curl -s http://127.0.0.1:8765/api/health
-```
+## Scope work well
 
-Look for `"ok": true`. Stop with `python3 tools/agent-dash/agent_dash.py stop`. The ten-minute path with sample data and a first wave is [docs/quickstart.md](docs/quickstart.md).
+1. One workstream, one outcome.
+2. Break it into tasks with ids and depends_on.
+3. Define gates (what proves it is done).
+4. Label every agent run with its workstream and task.
+5. Tag planning, execution, and review runs.
+6. Move state as you go; archive when done.
 
-## Plug in your agents
+The lead loop is [Running a workstream end to end](tools/agent-dash/docs/workstream-lead.md).
 
-[Plug in any agent](tools/agent-dash/docs/integrate.md) is the harness-neutral guide: install and run in three commands, one reporting path per harness (Claude Code, muse, cursor-agent, any other CLI, custom code, remote agents), run labels and the task map, verdict lines, token and cost reporting, driving a workstream, and troubleshooting.
+## Links
 
-## Map
-
-| Piece | Path | What it does |
-|---|---|---|
-| workstream-dashboard | [skills/workstream-dashboard/SKILL.md](skills/workstream-dashboard/SKILL.md) | Runs and changes the local dashboard. |
-| workstream-planner | [skills/workstream-planner/SKILL.md](skills/workstream-planner/SKILL.md) | Turns a goal into a plan bundle, an execution plan, approvals, and a kickoff brief. |
-| workstream-lead | [skills/workstream-lead/SKILL.md](skills/workstream-lead/SKILL.md) | Runs that bundle wave by wave and moves task status as facts change. |
-| workstream-orchestration | [skills/workstream-orchestration/SKILL.md](skills/workstream-orchestration/SKILL.md) | Keeps parallel work moving: the steady-state loop and the twelve principles from measured runs. |
-| agent-dash | [tools/agent-dash](tools/agent-dash/README.md) | The page, the collectors, and the `ws` and `report` commands. State lives in `~/.local/share/agent-dash/`. |
-| ws-wave | [tools/agent-dash/workflows/ws-wave.js](tools/agent-dash/workflows/ws-wave.js) | One wave. Each lane is built, reviewed, and fixed until approved or out of rounds. |
-| Worker launchers | [run_worker.sh](tools/agent-dash/scripts/run_worker.sh) | Starts one registry worker and writes the row the dashboard reads. |
-| Concepts, configuration | [docs/concepts.md](docs/concepts.md), [docs/configuration.md](docs/configuration.md) | Labels, tokens, files, overrides, environment variables. |
-
-## Privacy
-
-The page binds to 127.0.0.1 on port 8765. Configuration cannot move that address. Collectors read logs and process samples. `stop` signals only the dashboard pid in the pidfile. The database keeps labels, timings, and token counts. Prompt bodies, argv, secrets, and environment values stay unread.
-
-Plan bundles live under `~/.local/share/agent-dash/workstreams/` and stay out of this repository. Files named `*.local.json` are gitignored. Do not commit a session id, a home-directory path, or a token dump.
-
-`scripts/privacy_audit.sh` fails when a tracked file contains a personal path, a private project name, or key material. Run it before you push.
+- [docs/quickstart.md](docs/quickstart.md)
+- [docs/concepts.md](docs/concepts.md)
+- [docs/configuration.md](docs/configuration.md)
+- [tools/agent-dash/docs/integrate.md](tools/agent-dash/docs/integrate.md)
+- [tools/agent-dash/CONTRACT.md](tools/agent-dash/CONTRACT.md)

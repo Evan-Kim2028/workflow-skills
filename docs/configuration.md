@@ -235,3 +235,7 @@ The new source should appear under `sources` with `last_error` set to null.
 ## Worker registry
 
 Workers come from a registry: [`../tools/agent-dash/workers.example.json`](../tools/agent-dash/workers.example.json), replaced on one machine by a gitignored `workers.local.json` (or `AGENT_DASH_WORKERS`). Each worker has a kind (muse, cursor-agent, or Grok Build CLI), a model, a concurrency cap and quota patterns. `scripts/run_worker.sh` and the `ws-wave` workflow take `default` (the registry's default worker), a worker name, or `auto`. `auto` starts the first worker in `auto_order` that is under its cap and not cooling down after a quota error, and relaunches a lane on the next one when it hits a limit.
+
+## Before you push
+
+`sh scripts/privacy_audit.sh` from the repo root fails when a tracked file contains a personal path, a private project name, or key material. Run it before you push. Plan bundles live under `~/.local/share/agent-dash/workstreams/` and stay out of this repository. Files named `*.local.json` are gitignored. Do not commit a session id, a home-directory path, or a token dump.

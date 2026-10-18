@@ -1,0 +1,162 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 600" role="img">
+<title>Dashboard data flow: agents label runs, collectors read them, plans and store keep state, the dashboard shows it</title>
+<desc>Four lanes left to right: Agents do the work and label runs; read-only Collectors gather labels, timings and token counts; Store plus plan bundles keep SQLite data and plan files locally; the Dashboard shows Project, Current, Planned and Archive views with a doctor command. Below, six steps for scoping work so it can be tracked.</desc>
+<style>
+text{font-family:system-ui,-apple-system,"Segoe UI",Inter,sans-serif}
+.t{fill:#0d1420;font-size:16px;font-weight:650}
+.sub{fill:#3f4a5c;font-size:14px}
+.hd{fill:#0d1420;font-size:17px;font-weight:700}
+.bandt{fill:#0d1420;font-size:18px;font-weight:700}
+.note-t{fill:#3f4a5c;font-size:14px}
+.chip-t{fill:#0d1420;font-size:14px}
+.num-t{fill:#ffffff;font-size:14px;font-weight:700;text-anchor:middle}
+.box{fill:#ffffff;stroke:#dfe5ec;stroke-width:1.5}
+.band{fill:#f1f4f8;stroke:#dfe5ec;stroke-width:1.5}
+.chip{fill:#ffffff;stroke:#dfe5ec;stroke-width:1.5}
+.note{fill:none;stroke:#b9c3d1;stroke-width:1.5;stroke-dasharray:6 4}
+.arrow{stroke:#68768c;stroke-width:3;fill:none}
+.ahead{fill:#68768c;stroke:none}
+.lh1{fill:#2a78d6;fill-opacity:.13;stroke:#2a78d6;stroke-width:1.5}
+.lh2{fill:#1baf7a;fill-opacity:.13;stroke:#1baf7a;stroke-width:1.5}
+.lh3{fill:#eda100;fill-opacity:.16;stroke:#eda100;stroke-width:1.5}
+.lh4{fill:#e87ba4;fill-opacity:.13;stroke:#e87ba4;stroke-width:1.5}
+.d1{fill:#2a78d6}.d4{fill:#eda100}.d5{fill:#e87ba4}.d0{fill:#68768c}.d3{fill:#1baf7a}
+.num{fill:#2a78d6;stroke:none}
+@media (prefers-color-scheme:dark){
+.t{fill:#f2f4f8}.sub{fill:#b9c1ce}.hd{fill:#f2f4f8}.bandt{fill:#f2f4f8}
+.note-t{fill:#b9c1ce}.chip-t{fill:#f2f4f8}.num-t{fill:#071224}
+.box{fill:#12161d;stroke:#232b38}
+.band{fill:#12161d;stroke:#232b38}
+.chip{fill:#1a212c;stroke:#232b38}
+.note{stroke:#3a4557}
+.arrow{stroke:#7e8898}.ahead{fill:#7e8898}
+.lh1{fill:#4c96ff;stroke:#4c96ff}
+.lh2{fill:#2bbf9b;stroke:#2bbf9b}
+.lh3{fill:#f2b705;stroke:#f2b705}
+.lh4{fill:#f075a8;stroke:#f075a8}
+.d1{fill:#4c96ff}.d4{fill:#f2b705}.d5{fill:#f075a8}.d0{fill:#7e8898}.d3{fill:#2bbf9b}
+.num{fill:#4c96ff}
+}
+</style>
+<!-- lane headers -->
+<rect x="24" y="14" width="252" height="42" rx="10" class="lh1"/>
+<text x="40" y="42" class="hd">1 &#183; AGENTS</text>
+<rect x="324" y="14" width="252" height="42" rx="10" class="lh2"/>
+<text x="340" y="42" class="hd">2 &#183; COLLECTORS</text>
+<rect x="624" y="14" width="252" height="42" rx="10" class="lh3"/>
+<text x="640" y="42" class="hd">3 &#183; STORE + BUNDLES</text>
+<rect x="924" y="14" width="252" height="42" rx="10" class="lh4"/>
+<text x="940" y="42" class="hd">4 &#183; DASHBOARD</text>
+<!-- lane 1 boxes -->
+<rect x="24" y="66" width="252" height="60" rx="9" class="box"/>
+<circle cx="42" cy="90" r="6" class="d1"/>
+<text x="56" y="92" class="t">Claude Code</text>
+<text x="56" y="113" class="sub">transcripts</text>
+<rect x="24" y="136" width="252" height="60" rx="9" class="box"/>
+<circle cx="42" cy="160" r="6" class="d5"/>
+<text x="56" y="162" class="t">muse</text>
+<text x="56" y="183" class="sub">sessions + TSV</text>
+<rect x="24" y="206" width="252" height="60" rx="9" class="box"/>
+<circle cx="42" cy="230" r="6" class="d4"/>
+<text x="56" y="232" class="t">Cursor &#183; Grok</text>
+<text x="56" y="253" class="sub">chats + usage lines</text>
+<rect x="24" y="276" width="252" height="60" rx="9" class="box"/>
+<circle cx="42" cy="300" r="6" class="d0"/>
+<text x="56" y="302" class="t">scripts &#183; report</text>
+<text x="56" y="323" class="sub">generic.jsonl rows</text>
+<rect x="24" y="344" width="252" height="52" rx="9" class="note"/>
+<text x="40" y="366" class="note-t">do the work, label each run</text>
+<text x="40" y="387" class="note-t">ws4-WS4.1-slug</text>
+<!-- lane 2 boxes -->
+<rect x="324" y="66" width="252" height="60" rx="9" class="box"/>
+<circle cx="342" cy="90" r="6" class="d3"/>
+<text x="356" y="92" class="t">transcripts</text>
+<text x="356" y="113" class="sub">labels + token counts</text>
+<rect x="324" y="136" width="252" height="60" rx="9" class="box"/>
+<circle cx="342" cy="160" r="6" class="d3"/>
+<text x="356" y="162" class="t">manifests</text>
+<text x="356" y="183" class="sub">label &#183; session &#183; start</text>
+<rect x="324" y="206" width="252" height="60" rx="9" class="box"/>
+<circle cx="342" cy="230" r="6" class="d3"/>
+<text x="356" y="232" class="t">process samples</text>
+<text x="356" y="253" class="sub">liveness right now</text>
+<rect x="324" y="276" width="252" height="60" rx="9" class="box"/>
+<circle cx="342" cy="300" r="6" class="d3"/>
+<text x="356" y="302" class="t">Dagster &#183; hub files</text>
+<text x="356" y="323" class="sub">jobs &#183; decisions &#183; risks</text>
+<rect x="324" y="344" width="252" height="52" rx="9" class="note"/>
+<text x="340" y="366" class="note-t">labels, timings, tokens only</text>
+<text x="340" y="387" class="note-t">no prompts, no secrets</text>
+<!-- lane 3 boxes -->
+<rect x="624" y="66" width="252" height="60" rx="9" class="box"/>
+<text x="640" y="92" class="t">SQLite store</text>
+<text x="640" y="113" class="sub">runs &#183; usage &#183; cost</text>
+<rect x="624" y="136" width="252" height="60" rx="9" class="box"/>
+<text x="640" y="162" class="t">plan.json</text>
+<text x="640" y="183" class="sub">tasks &#183; depends_on &#183; gates</text>
+<rect x="624" y="206" width="252" height="60" rx="9" class="box"/>
+<text x="640" y="232" class="t">approvals &#183; history</text>
+<text x="640" y="253" class="sub">gates &#183; replay</text>
+<rect x="624" y="276" width="252" height="60" rx="9" class="box"/>
+<text x="640" y="302" class="t">lifecycle</text>
+<text x="640" y="323" class="sub">planned to archived</text>
+<rect x="624" y="344" width="252" height="52" rx="9" class="note"/>
+<text x="640" y="366" class="note-t">local data only,</text>
+<text x="640" y="387" class="note-t">stays on your machine</text>
+<!-- lane 4 boxes -->
+<rect x="924" y="66" width="252" height="60" rx="9" class="box"/>
+<text x="940" y="92" class="t">Project</text>
+<text x="940" y="113" class="sub">roadmap &#183; depgraph &#183; burn-up</text>
+<rect x="924" y="136" width="252" height="60" rx="9" class="box"/>
+<text x="940" y="162" class="t">Current</text>
+<text x="940" y="183" class="sub">start &#183; pause &#183; done &#183; archive</text>
+<rect x="924" y="206" width="252" height="60" rx="9" class="box"/>
+<text x="940" y="232" class="t">Planned &#183; Archive</text>
+<text x="940" y="253" class="sub">readiness &#183; summaries &#183; undo</text>
+<rect x="924" y="276" width="252" height="60" rx="9" class="box"/>
+<text x="940" y="302" class="t">doctor (CLI)</text>
+<text x="940" y="323" class="sub">what to fix, exact command</text>
+<rect x="924" y="344" width="252" height="52" rx="9" class="note"/>
+<text x="940" y="366" class="note-t">page writes lifecycle only,</text>
+<text x="940" y="387" class="note-t">undo kept 10 s</text>
+<!-- arrows -->
+<line x1="284" y1="201" x2="312" y2="201" class="arrow"/>
+<polygon points="312,192 324,201 312,210" class="ahead"/>
+<line x1="584" y1="201" x2="612" y2="201" class="arrow"/>
+<polygon points="612,192 624,201 612,210" class="ahead"/>
+<line x1="884" y1="201" x2="912" y2="201" class="arrow"/>
+<polygon points="912,192 924,201 912,210" class="ahead"/>
+<!-- scope band -->
+<rect x="24" y="412" width="1152" height="172" rx="12" class="band"/>
+<text x="44" y="444" class="bandt">Scope work so the dashboard can track it</text>
+<rect x="40" y="456" width="176" height="112" rx="9" class="chip"/>
+<circle cx="62" cy="482" r="12" class="num"/>
+<text x="62" y="487" class="num-t">1</text>
+<text x="56" y="510" class="chip-t">One workstream,</text>
+<text x="56" y="529" class="chip-t">one outcome</text>
+<rect x="228" y="456" width="176" height="112" rx="9" class="chip"/>
+<circle cx="250" cy="482" r="12" class="num"/>
+<text x="250" y="487" class="num-t">2</text>
+<text x="244" y="510" class="chip-t">Tasks with ids</text>
+<text x="244" y="529" class="chip-t">+ depends_on</text>
+<rect x="416" y="456" width="176" height="112" rx="9" class="chip"/>
+<circle cx="438" cy="482" r="12" class="num"/>
+<text x="438" y="487" class="num-t">3</text>
+<text x="432" y="510" class="chip-t">Define gates:</text>
+<text x="432" y="529" class="chip-t">what proves done</text>
+<rect x="604" y="456" width="176" height="112" rx="9" class="chip"/>
+<circle cx="626" cy="482" r="12" class="num"/>
+<text x="626" y="487" class="num-t">4</text>
+<text x="620" y="510" class="chip-t">Label every run:</text>
+<text x="620" y="529" class="chip-t">workstream + task</text>
+<rect x="792" y="456" width="176" height="112" rx="9" class="chip"/>
+<circle cx="814" cy="482" r="12" class="num"/>
+<text x="814" y="487" class="num-t">5</text>
+<text x="808" y="510" class="chip-t">Tag planning,</text>
+<text x="808" y="529" class="chip-t">execution, review</text>
+<rect x="980" y="456" width="176" height="112" rx="9" class="chip"/>
+<circle cx="1002" cy="482" r="12" class="num"/>
+<text x="1002" y="487" class="num-t">6</text>
+<text x="996" y="510" class="chip-t">Move state often;</text>
+<text x="996" y="529" class="chip-t">archive when done</text>
+</svg>
