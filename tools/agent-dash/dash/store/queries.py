@@ -14,7 +14,7 @@ from dash.models import run_model_key
 
 from .runs import _parent_map
 from .summarize import _scope_tab
-from .util import (BILLED_FIELDS, RANGE_S, TOOL_KEYS, WS_STATUSES,
+from .util import (BILLED_FIELDS, RANGE_S, TOOL_KEYS, WORKER_SOURCES, WS_STATUSES,
                  _drop_launch_echoes, _is_counted_agent,
                  _money, _sum_costs, _tool_key, _ws_sort)
 
@@ -234,6 +234,38 @@ class QueriesMixin:
                     "boards": boards,
                     "stale": stale,
                 }
+        def _marker_run_ids_locked(self, runs: list) -> set:
+            """Run ids placeholder rows must never lend a model bucket to.
+
+            Raw store rows carry no usage fold, so the no-usage leg of
+            :func:`is_marker_run` is confirmed here against the usage
+            table instead of the view's ``tokens``: a worker-source row
+            with no model, no verdict, and no usage event is a marker.
+            Rows with any usage history stay, even zero-token ones, as
+            do ``killed``/``died_early`` rows, which read as ``died``.
+            Caller holds the lock.
+            """
+            cands = [
+                run["run_id"]
+                for run in runs
+                if (run.get("source") or "") in WORKER_SOURCES
+                and not run.get("model")
+                and not run.get("verdict")
+                and run.get("status") not in ("killed", "died_early")
+            ]
+            out = set()
+            for chunk in (cands[pos:pos + 500] for pos in range(0, len(cands), 500)):
+                if not chunk:
+                    continue
+                placeholders = ",".join("?" for _ in chunk)
+                for row in self._conn.execute(
+                    "SELECT run_id FROM runs WHERE run_id IN (%s)"
+                    " AND NOT EXISTS (SELECT 1 FROM usage_events"
+                    " WHERE usage_events.run_id = runs.run_id)" % placeholders,
+                    chunk,
+                ).fetchall():
+                    out.add(row["run_id"])
+            return out
         def query_concurrency(self, now: float, ws: str | None, since: float, step: float) -> list:
             step = float(step) if step and step >= 1 else 60.0
             span = max(0.0, now - since)
@@ -241,9 +273,18 @@ class QueriesMixin:
                 step = span / 5000
             with self._lock:
                 runs = [dict(row) for row in self._all_runs()]
+                marker_ids = self._marker_run_ids_locked(
+                    [run for run in runs if _is_counted_agent(run)]
+                )
                 live_open = self._live_open_ids_locked(now, runs)
                 stalled = self._stalled_locked(now, runs)
+                # A stalled row is proven live activity, never a
+                # placeholder: its history stays in the lanes (truncated
+                # at the stall point below) even when it names no model.
+                marker_ids = marker_ids - set(stalled)
             parents = _parent_map(runs)
+            if marker_ids:
+                runs = [run for run in runs if run["run_id"] not in marker_ids]
             runs = _drop_launch_echoes([run for run in runs if run["run_id"] not in parents and _is_counted_agent(run)])
             runs = [
                 run

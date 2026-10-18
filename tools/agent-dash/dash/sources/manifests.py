@@ -482,6 +482,26 @@ def _emit_files(
         # An older attempt sharing the label/out file with a newer open
         # row: the growth and the live label belong to the newer attempt.
         status = "done"
+    if (
+        source in ("muse", "glm", "grok")
+        and not model
+        and verdict is None
+        and not out_bytes
+        and not err_nonempty
+        and not err_sig
+        and alive is not True
+    ):
+        # Zero-evidence worker row: no output, no error content, no live
+        # process, no model, no verdict. A launch that never produced
+        # anything must not open a placeholder run: while live it would
+        # invent a "<family>-unknown" ("model not recorded") bucket, and
+        # once quiet it would count as a finished agent. The row is
+        # created when evidence arrives instead; a live label still
+        # reaches the page through the tool sources' own liveness. Sizes
+        # are still remembered so a later growth reads as running.
+        _remember_size(store, out_path, out_st)
+        _remember_size(store, err_path, err_st)
+        return left
     ended = None
     if status in ("done", "killed", "died_early"):
         mtimes = [st.st_mtime for st in (out_st, err_st, report_st) if st is not None]

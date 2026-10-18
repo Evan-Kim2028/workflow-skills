@@ -247,7 +247,7 @@ class MuseTests(unittest.TestCase):
             scratch = os.path.join(tmp, "scratch")
             os.makedirs(scratch)
             with open(os.path.join(scratch, "muse-sessions.tsv"), "w") as fh:
-                fh.write("ws7-notes\t%s\t1792152010\n" % SID)
+                fh.write("ws7-notes\t%s\t1792152010\tmuse-spark-1.3-contributor\n" % SID)
             store = Store()
             cfg = self.cfg(os.path.join(tmp, "missing-sessions"), scratch)
             cfg["roots"] = {"muse_sessions": cfg["roots"]["muse_sessions"], "scratch": scratch}
@@ -256,6 +256,7 @@ class MuseTests(unittest.TestCase):
             run = store.runs["muse:%s:ws7-notes" % SID]
             self.assertEqual(run["clock_source"], "manifest")
             self.assertEqual(run["started_at"], 1792152010.0)
+            self.assertEqual(run["model"], "muse-spark-1.3-contributor")
             self.assertEqual(store.usage, {})
 
     def test_live_model_fills_run_without_log_model(self):
@@ -718,7 +719,7 @@ class MuseTests(unittest.TestCase):
             pad = os.path.join(tmp, "enc", HUB, "scratchpad", "runs")
             os.makedirs(pad)
             with open(os.path.join(pad, "muse-sessions.tsv"), "w") as fh:
-                fh.write("ws2-WS2.14-prod-columns\t%s\t1792167605\n" % SID)
+                fh.write("ws2-WS2.14-prod-columns\t%s\t1792167605\tmuse-spark-1.3-contributor\n" % SID)
             store = Store()
             self.poll(store, self.cfg(sessions, os.path.join(tmp, "enc")), 1792168000)
             run = store.runs["muse:%s:ws2-WS2.14-prod-columns" % SID]
@@ -859,7 +860,7 @@ class ManifestDirsTests(unittest.TestCase):
             rundir = os.path.join(tmp, "ws2")
             os.makedirs(rundir)
             with open(os.path.join(rundir, "muse-sessions.tsv"), "w") as fh:
-                fh.write("ws2-build\t%s\t1792152010\n" % SID)
+                fh.write("ws2-build\t%s\t1792152010\tmuse-spark-1.3-contributor\n" % SID)
             state = os.path.join(tmp, "state")
             os.makedirs(state)
             with open(os.path.join(state, "run-dirs.txt"), "w") as fh:

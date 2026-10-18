@@ -240,6 +240,51 @@ def _is_counted_agent(run: dict) -> bool:
     return _tool_key(run) in TOOL_KEYS
 
 
+def marker_billed_tokens(run: dict) -> int:
+    """Billed tokens carried on a run view's ``tokens`` fold, or 0.
+
+    Run views always carry a zero-filled ``tokens`` dict; raw store rows
+    carry none, which reads as 0 here (callers with raw rows must confirm
+    the no-usage leg against the usage table themselves).
+    """
+    tokens = run.get("tokens")
+    if not isinstance(tokens, dict):
+        return 0
+    return sum(int(tokens.get(key) or 0) for key in BILLED_FIELDS)
+
+
+def is_marker_run(run: dict) -> bool:
+    """True for a placeholder run row that must never read as a model bucket.
+
+    A marker is a worker-source row (muse, glm, grok) with no model id, no
+    verdict, and zero billed tokens: a manifest row for a launch that never
+    produced output, a live process seen before its session/manifest/usage
+    match, or an unlabeled session row with no completions. It is real
+    activity while live, but it names no model, so counting it would invent
+    a ``<family>-unknown`` ("model not recorded") bucket in the usage and
+    live model legends. A worker run with tokens, a model, or a verdict is
+    never a marker -- including a real zero-token completed run, which
+    always carries a verdict, and an unknown-model run with tokens, which
+    honestly reads as "model not recorded". Two quiet rows are never
+    markers either: a row the liveness layer flagged ``stalled`` is a
+    proven live-but-stuck process with its own pill and count, and a
+    ``killed``/``died_early`` row is terminal death evidence the outcome
+    layer reads as ``died``. Both are real agent outcomes, never
+    placeholders.
+    """
+    if (run.get("source") or "") not in WORKER_SOURCES:
+        return False
+    if run.get("stalled"):
+        return False
+    if run.get("status") in ("killed", "died_early"):
+        return False
+    if run.get("model"):
+        return False
+    if run.get("verdict"):
+        return False
+    return marker_billed_tokens(run) <= 0
+
+
 WORKER_SOURCES = frozenset({"muse", "glm", "grok"})
 
 

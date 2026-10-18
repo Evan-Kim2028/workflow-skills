@@ -251,7 +251,7 @@ class ManifestPollTests(unittest.TestCase):
         )
         _write(
             os.path.join(self.scratch, "grok-sessions.tsv"),
-            "label\tsession_id\tstarted\nnote-row\t-\t1700000003\n",
+            "label\tsession_id\tstarted\nnote-row\t-\t1700000003\tgrok-4.7-high\n",
             NOW,
         )
         _write(
@@ -365,7 +365,10 @@ class ManifestPollTests(unittest.TestCase):
         _write(err, b"boom\n", NOW)
         store = MemStore()
         manifests.poll(store, self._cfg(), NOW)
-        self.assertEqual(store.runs[f"muse:{MUSE}:alpha"]["status"], "unknown")
+        # An empty out file with no live process is zero evidence: no
+        # placeholder row opens for alpha until its file grows. Beta's
+        # error content is evidence, so it reads unknown.
+        self.assertNotIn(f"muse:{MUSE}:alpha", store.runs)
         self.assertEqual(store.runs[f"muse:{MUSE}:beta"]["status"], "unknown")
 
         with open(out, "ab") as fh:
@@ -388,7 +391,7 @@ class ManifestPollTests(unittest.TestCase):
             f"alpha\t{MUSE}\t1700000000\n",
             NOW,
         )
-        _write(os.path.join(self.scratch, "muse", "out-alpha.md"), b"", NOW)
+        _write(os.path.join(self.scratch, "muse", "out-alpha.md"), b"x", NOW)
 
         class Sampled(MemStore):
             def process_samples(self):

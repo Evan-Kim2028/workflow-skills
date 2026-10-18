@@ -1907,7 +1907,8 @@ class OrchestrationChecksTest(unittest.TestCase):
             }
         )
         self._run("ws9-WS9.1-x", status="running", age_s=3600,
-                  session_id="child-1", parent_session_id="lead-1")
+                  session_id="child-1", parent_session_id="lead-1",
+                  model="muse-spark-1.3-contributor")
         result = self._collect()
         found = self._by_code(result, "lead-undelegated")
         self.assertEqual(len(found), 1)
@@ -1915,7 +1916,8 @@ class OrchestrationChecksTest(unittest.TestCase):
         self.assertIn("LOW-DELEGATION", found[0]["detail"])
         self.assertEqual(found[0]["fix_command"], "python3 agent_dash.py lead-profile --ws WS9")
         self._run("ws9-WS9.1-y", status="running", age_s=1800,
-                  session_id="child-2", parent_session_id="lead-1")
+                  session_id="child-2", parent_session_id="lead-1",
+                  model="muse-spark-1.3-contributor")
         delegating = self._collect()
         self.assertFalse(self._by_code(delegating, "lead-undelegated"))
 

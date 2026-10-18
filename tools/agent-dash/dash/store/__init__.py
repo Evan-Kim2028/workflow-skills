@@ -106,6 +106,7 @@ from .util import (
     _local_midnight,
     _manifest_family,
     _money,
+    is_marker_run,
     _one_run_per_process,
     _opt_int,
     _same,
@@ -202,6 +203,7 @@ __all__ = [
     "clean_label",
     "model_key",
     "run_model_key",
+    "is_marker_run",
 ]
 
 

@@ -11,7 +11,7 @@
       "cap": 25,
       "pgrep": "[m]use-bin|[m]use exec",
       "manifest": "muse-sessions.tsv",
-      "columns": ["label", "session_id", "epoch"],
+      "columns": ["label", "session_id", "epoch", "model"],
       "quota_patterns": ["rate limit", "quota", "429", "usage limit"],
       "cost_rank": 1
     },

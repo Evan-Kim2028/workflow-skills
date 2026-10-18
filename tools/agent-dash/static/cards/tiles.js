@@ -305,11 +305,17 @@
       return "flat";
     }
 
-    /* Tertiary lines: one fact per line, at most two lines, never crammed. */
-    var lbm = cn.live_by_model || {}, byFam = {};
-    if (!Object.keys(lbm).length) run.forEach(function (r) { if (!isAgent(r)) return; var k = tierKey(r); lbm[k] = (lbm[k] || 0) + 1; });
+    /* Tertiary lines: one fact per line, at most two lines, never crammed.
+       Live agents with no model yet (a process seen before its session,
+       manifest, or usage match) count in the headline but never in a
+       model bucket: the family line reads them as "starting", never as
+       "model not recorded". */
+    var lbm = cn.live_by_model || {}, lbt = cn.live_by_tool || {}, byFam = {};
+    if (!Object.keys(lbm).length) run.forEach(function (r) { if (!isAgent(r)) return; if (!r.model && !r.verdict && !ADC.billed(r.tokens || {})) return; var k = tierKey(r); lbm[k] = (lbm[k] || 0) + 1; });
     ADM.sortKeys(Object.keys(lbm).filter(function (k) { return lbm[k]; })).forEach(function (k) { var f = ADM.famOf(k); (byFam[f] = byFam[f] || []).push(k); });
-    var liveLines = [ADM.FAMS.filter(function (f) { return byFam[f]; }).map(function (f) { var ks = byFam[f], n = ks.reduce(function (a, k) { return a + lbm[k]; }, 0); return ADM.FAM[f].name + " " + fmtN(n) + " (" + ks.map(function (k) { return ADM.nameOf(k) + " " + fmtN(lbm[k]); }).join(", ") + ")"; }).join(" · ") || "idle"];
+    var toolFam = {grok: "cursor", muse: "muse", glm: "glm", claude: "claude", deepseek: "deepseek", other: "other"};
+    Object.keys(lbt || {}).forEach(function (t) { if (lbt[t] && toolFam[t] && !byFam[toolFam[t]]) byFam[toolFam[t]] = []; });
+    var liveLines = [ADM.FAMS.filter(function (f) { return byFam[f]; }).map(function (f) { var ks = byFam[f], n = ks.reduce(function (a, k) { return a + lbm[k]; }, 0); var toolN = 0; Object.keys(lbt || {}).forEach(function (t) { if (toolFam[t] === f) toolN += lbt[t]; }); var bits = ks.map(function (k) { return ADM.nameOf(k) + " " + fmtN(lbm[k]); }); if (toolN > n) bits.push("starting " + fmtN(toolN - n)); return ADM.FAM[f].name + " " + fmtN(Math.max(n, toolN)) + " (" + bits.join(", ") + ")"; }).join(" · ") || "idle"];
     /* Stalled workers are stuck, not live: their own words, never folded
        into the live count. */
     if (cn.stalled) liveLines.push("◔ " + fmtN(cn.stalled) + " stalled");

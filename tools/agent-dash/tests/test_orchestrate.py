@@ -356,6 +356,7 @@ def _seed_profile_db(path: Path) -> float:
         {
             "run_id": "muse:bash-1:ws9-WS9.2-build",
             "source": "muse",
+            "model": "muse-spark-1.3-contributor",
             "label": "ws9-WS9.2-build",
             "session_id": "bash-1",
             "status": "done",

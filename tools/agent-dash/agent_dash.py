@@ -77,6 +77,7 @@ USAGE = """agent-dash: local read-only execution dashboard
   python3 agent_dash.py backfill --session <id>
   python3 agent_dash.py reprice
   python3 agent_dash.py reconcile
+  python3 agent_dash.py runs prune-markers [--dry-run] [--yes]
   python3 agent_dash.py check [--url URL] [--hours N] [--json]
   python3 agent_dash.py check --page [--url URL] [--json]
   python3 agent_dash.py state [--url URL] [--json]
@@ -408,6 +409,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_reprice()
     if cmd == "reconcile":
         return cmd_reconcile()
+    if cmd == "runs":
+        return cmd_runs(args[1:])
     if cmd == "check":
         return cmd_check(args[1:])
     if cmd == "report":
@@ -1165,6 +1168,79 @@ def cmd_reconcile() -> int:
     finally:
         store.close()
     print(f"reconcile ended {ended}")
+    return 0
+
+
+def cmd_runs(argv: list[str] | None = None) -> int:
+    """Run-row maintenance. ``runs prune-markers`` lists (default dry run)
+    or deletes placeholder run rows: worker-source rows with no model, no
+    verdict, and no usage history. ``--yes`` performs the deletion after
+    copying the database to a timestamped backup; without it nothing is
+    written. ``AGENT_DASH_DB`` selects the database, defaulting to the
+    configured state dir.
+    """
+    rest = list(argv or [])
+    if not rest or rest[0] != "prune-markers":
+        print(USAGE, end="", file=sys.stderr)
+        return 2
+    rest = rest[1:]
+    yes = False
+    for flag in rest:
+        if flag == "--yes":
+            yes = True
+        elif flag == "--dry-run":
+            continue
+        else:
+            print(USAGE, end="", file=sys.stderr)
+            return 2
+    bind_state()
+    db = os.environ.get("AGENT_DASH_DB")
+    path = Path(expand(db)) if db else DBFILE
+    if not path.is_file():
+        print(f"no database {path}", file=sys.stderr)
+        return 2
+    backup = None
+    if yes:
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        backup = path.with_name(f"{path.name}.bak-markers-{stamp}")
+        try:
+            import sqlite3 as _sqlite3
+
+            source = _sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+            try:
+                target = _sqlite3.connect(str(backup))
+                try:
+                    source.backup(target)
+                finally:
+                    target.close()
+            finally:
+                source.close()
+        except Exception as exc:
+            print(f"prune-markers backup failed: {exc}", file=sys.stderr)
+            return 1
+    store = Store(path)
+    try:
+        report = store.prune_marker_runs(dry_run=not yes)
+    finally:
+        store.close()
+    markers = report.get("markers", [])
+    for row in markers:
+        print(
+            "%s\t%s\t%s\t%s"
+            % (
+                row.get("run_id"),
+                row.get("source"),
+                row.get("label"),
+                row.get("status"),
+            )
+        )
+    if not yes:
+        print(f"prune-markers dry run: {len(markers)} marker row(s) listed, 0 deleted")
+        return 0
+    print(
+        "prune-markers backup %s: %d marker row(s) listed, %d deleted"
+        % (backup, len(markers), report.get("deleted", 0))
+    )
     return 0
 
 

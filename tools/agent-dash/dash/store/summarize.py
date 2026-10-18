@@ -21,7 +21,7 @@ from .util import (BILLED_FIELDS, FINISHED, MERGE_WINDOW_S,
                  _drop_launch_echoes, _elapsed, _epoch, _in_ws,
                  _is_counted_agent, _local_midnight, _money,
                  _tool_key, _ws_sort, _zeros,
-                 is_prod_job_run)
+                 is_marker_run, is_prod_job_run)
 
 
 class SummarizeMixin:
@@ -71,6 +71,7 @@ class SummarizeMixin:
                     if run["status"] == "running"
                     and run["run_id"] in live_open
                     and not is_prod_job_run(run)
+                    and not is_marker_run(run)
                 ]
                 running.sort(key=lambda run: run["started_at"] or 0, reverse=True)
                 range_since = now - RANGE_S if since is None else float(since)
@@ -80,6 +81,7 @@ class SummarizeMixin:
                     for run in scoped
                     if not is_prod_job_run(run)
                     and run["status"] != "running"
+                    and not is_marker_run(run)
                     and run["ended_at"] is not None
                     and range_since <= float(run["ended_at"]) <= range_until
                 ]
@@ -911,10 +913,23 @@ def _agent_counts(runs: list, parents: dict, now: float, since, until, live_open
             if key in seen:
                 continue
             seen.add(key)
+            if is_marker_run(run):
+                # Live-presence only: a process seen before its session,
+                # manifest, or usage match names no model, so it counts
+                # toward the live total and its (known) tool but never
+                # toward a model bucket. The tile caption reads the
+                # remainder as "starting".
+                live_by[tool] += 1
+                live_n += 1
+                continue
             live_by[tool] += 1
             model = run_model_key(run)
             live_by_model[model] = live_by_model.get(model, 0) + 1
             live_n += 1
+            continue
+        if is_marker_run(run):
+            # A placeholder that never ran is not a finished agent, even
+            # though its status reads done.
             continue
         if run.get("status") not in FINISHED or run.get("ended_at") is None:
             continue

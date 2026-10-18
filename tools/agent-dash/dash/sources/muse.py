@@ -6,13 +6,16 @@ the ``subagent/`` children of those logs. Token rows come from
 are taken as stored, and cache read is ``max(cached_tokens, cache_read_tokens)``.
 
 Run ids are ``muse:<session_uuid>:<label>``. The label comes from
-``muse-sessions.tsv`` (``label``, session uuid, started epoch), including a
-file nested one level under the scratchpad such as ``runs/muse-sessions.tsv``.
-The run's ``started_at`` is that epoch. When no manifest row exists, it is
-the timestamp of the first event in ``session.jsonl``. The label slot is
-then the session uuid, and ``session_id`` on the run and on each usage row
-is that same uuid. A later row for the same session may fill a blank label.
-It does not replace a known start with an empty one.
+``muse-sessions.tsv`` (``label``, session uuid, started epoch, optional
+model), including a file nested one level under the scratchpad such as
+``runs/muse-sessions.tsv``. The run's ``started_at`` is that epoch. When no
+manifest row exists, it is the timestamp of the first event in
+``session.jsonl``. The label slot is then the session uuid, and
+``session_id`` on the run and on each usage row is that same uuid. A later
+row for the same session may fill a blank label. It does not replace a
+known start with an empty one. A manifest row with no model, no live
+process, no log event, and no stored row opens no run: a launch intent is
+not evidence, so it never becomes a placeholder ``muse-unknown`` row.
 
 ``cfg["roots"]["muse_sessions"]`` overrides the session root. Scratchpads come
 from ``roots.scratchpads`` (one path, a list, or a glob). The default is no
@@ -341,6 +344,11 @@ def _upsert_run(store, sid, manifests, muse_parent, model, have_log_start, log_t
         live_model = _live_model(processes, ident)
         if live_model:
             run["model"] = live_model
+    if not run.get("model") and row and row.get("model"):
+        # The launcher records the worker model in the manifest TSV when
+        # it knows it; a session whose log has no completion yet still
+        # names its model this way instead of reading unknown.
+        run["model"] = row["model"]
     if parent:
         run["parent_session_id"] = parent
     start, clock = _start_clock(store, run_id, row, have_log_start, log_ts, log_path)
@@ -348,6 +356,24 @@ def _upsert_run(store, sid, manifests, muse_parent, model, have_log_start, log_t
         run["started_at"] = start
         run["clock_source"] = clock
     apply_liveness(store, run, "muse", processes)
+    if (
+        not run.get("model")
+        and run.get("status") != "running"
+        and not have_log_start
+        and log_ts is None
+        and _stored_start(store, run_id) is None
+        and not _shadow_exists(store, ident, run_id)
+    ):
+        # Zero-evidence session row: no stored row, no log event, no
+        # model, no live process, and no unlabeled shadow holding this
+        # session's usage. A bare manifest epoch is a launch intent, not
+        # evidence, so it never opens a placeholder run: while live it
+        # would invent a "muse-unknown" ("model not recorded") bucket,
+        # and once quiet it would count as finished. The row is created
+        # when evidence arrives instead. (A stored start means this row
+        # already exists: keep updating it, and let the prune-markers
+        # command clear old placeholders.)
+        return
     try:
         store.upsert_run(run)
     except Exception:
@@ -419,6 +445,29 @@ def _live_model(processes, sid):
         if isinstance(got, str) and got.lower() == want and proc.get("model"):
             return proc["model"]
     return None
+
+
+def _shadow_exists(store, sid, run_id):
+    """True when an unlabeled ``muse:<sid>:<sid>`` row already holds this session.
+
+    A labeled manifest row for a session whose usage sits on its shadow is
+    the same agent, not a placeholder: the labeled row is created so the
+    shadow can retire onto it and the usage can move over. Unknown stores
+    (no ``get_run``) read as no shadow.
+    """
+    getter = getattr(store, "get_run", None)
+    if not callable(getter) or not isinstance(sid, str):
+        return False
+    for form in (sid, sid.lower()):
+        shadow = "muse:%s:%s" % (form, form)
+        if shadow == run_id:
+            continue
+        try:
+            if getter(shadow):
+                return True
+        except Exception:
+            return False
+    return False
 
 
 def _retire_shadow(store, sid, label):
@@ -508,7 +557,10 @@ def _parse_manifest(text):
                 started = float(parts[2].strip())
             except ValueError:
                 started = None
-        rows.append({"label": label, "session_id": sid, "started_at": started})
+        model = parts[3].strip() if len(parts) > 3 and parts[3].strip() else None
+        rows.append(
+            {"label": label, "session_id": sid, "started_at": started, "model": model}
+        )
     return rows
 
 
@@ -527,19 +579,19 @@ def _keep_latest(manifests, row):
     old_ts = prev.get("started_at")
     if new_ts is None and old_ts is not None:
         merged = dict(prev)
-        _fill_blank(merged, row, ("label", "parent_session_id"))
+        _fill_blank(merged, row, ("label", "parent_session_id", "model"))
         manifests[key] = merged
         return
     if old_ts is None and new_ts is not None:
         merged = dict(row)
-        _fill_blank(merged, prev, ("label", "parent_session_id"))
+        _fill_blank(merged, prev, ("label", "parent_session_id", "model"))
         manifests[key] = merged
         return
     if (new_ts or -1) >= (old_ts or -1):
         merged = dict(row)
         if merged.get("started_at") is None and old_ts is not None:
             merged["started_at"] = old_ts
-        _fill_blank(merged, prev, ("label", "parent_session_id"))
+        _fill_blank(merged, prev, ("label", "parent_session_id", "model"))
         manifests[key] = merged
         return
     manifests[key] = prev

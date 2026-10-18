@@ -324,7 +324,7 @@ def command(worker, label, workspace, prompt_file, session_id):
 # dashboard collectors; a worker entry that names no manifest/columns of
 # its own still lands in its kind's TSV with its model recorded.
 MANIFEST_BY_KIND = {
-    "muse": ("muse-sessions.tsv", ["label", "session_id", "epoch"]),
+    "muse": ("muse-sessions.tsv", ["label", "session_id", "epoch", "model"]),
     "cursor": ("cursor-sessions.tsv", ["label", "session_id", "epoch", "model"]),
     "grok-build": ("glm-sessions.tsv", ["label", "session_id", "epoch", "model"]),
 }

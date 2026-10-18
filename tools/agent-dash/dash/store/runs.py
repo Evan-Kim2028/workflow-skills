@@ -20,7 +20,7 @@ from .util import (_ESTIMATE_TOOL, MERGE_WINDOW_S, RUN_COLS,
                  RUN_INPUT, SESSION_COLS, TOKEN_FIELDS,
                  _collapse_workflows, _drop_launch_echoes,
                  _epoch, _in_ws, _manifest_family, _same, _zeros,
-                 is_prod_job_run)
+                 is_marker_run, is_prod_job_run)
 
 
 class RunsMixin:
@@ -564,6 +564,92 @@ class RunsMixin:
                 self.upsert_run(patch)
                 changed += 1
             return changed
+        def find_marker_runs(self) -> list:
+            """Placeholder run rows safe to prune: worker-source rows with no model, no verdict, no usage history, and no merge-alias reference, never currently running.
+
+            This is the durable twin of :func:`is_marker_run`: the read-time
+            predicate works off run views (whose ``tokens`` fold stands in
+            for the usage leg), while this lists the exact stored rows the
+            prune command may delete. A row with any usage event stays even
+            when its billed tokens are zero; so does a running row, a row
+            named by ``run_aliases``, a ``killed``/``died_early`` row (which
+            reads as ``died``), and of course any row with tokens, a
+            model, or a verdict.
+            """
+            with self._lock:
+                rows = [
+                    dict(row)
+                    for row in self._conn.execute(
+                        """SELECT run_id, source, label, status, started_at, ended_at
+                           FROM runs
+                           WHERE source IN ('muse', 'glm', 'grok')
+                             AND (model IS NULL OR model = '')
+                             AND (verdict IS NULL OR verdict = '')
+                             AND status != 'running'
+                             AND status NOT IN ('killed', 'died_early')
+                             AND NOT EXISTS (
+                                 SELECT 1 FROM usage_events
+                                 WHERE usage_events.run_id = runs.run_id)
+                             AND NOT EXISTS (
+                                 SELECT 1 FROM run_aliases
+                                 WHERE alias_run_id = runs.run_id
+                                    OR target_run_id = runs.run_id)"""
+                    ).fetchall()
+                ]
+            return sorted(rows, key=lambda row: row["run_id"] or "")
+        def prune_marker_runs(self, dry_run: bool = True) -> dict:
+            """Delete placeholder run rows, or list them when ``dry_run``.
+
+            Every candidate from :meth:`find_marker_runs` is re-verified
+            in Python before deletion (no model, no verdict, no usage
+            billed tokens, not running), so a row that gained evidence
+            since the listing survives. Returns ``{"markers", "deleted",
+            "backup"}`` with the listed rows, the deleted count (0 on a
+            dry run), and no backup path (the caller copies the database
+            first). Usage buckets are untouched: markers never have usage
+            events, so token and cost totals cannot move.
+            """
+            markers = self.find_marker_runs()
+            if dry_run:
+                return {"markers": markers, "deleted": 0, "backup": None}
+            deleted = 0
+            with self._lock:
+                for row in markers:
+                    current = self._one(
+                        "SELECT * FROM runs WHERE run_id=?", (row["run_id"],)
+                    )
+                    if current is None:
+                        continue
+                    if current.get("model") or current.get("verdict"):
+                        continue
+                    if (current.get("status") or "") == "running":
+                        continue
+                    usage = self._conn.execute(
+                        """SELECT COALESCE(SUM(COALESCE(input_tokens, 0)
+                                            + COALESCE(output_tokens, 0)
+                                            + COALESCE(cache_read, 0)
+                                            + COALESCE(cache_write, 0)), 0) AS tokens
+                           FROM usage_events WHERE run_id=?""",
+                        (row["run_id"],),
+                    ).fetchone()
+                    if usage and (usage["tokens"] or 0):
+                        continue
+                    alias = self._conn.execute(
+                        """SELECT 1 FROM run_aliases
+                           WHERE alias_run_id=? OR target_run_id=?""",
+                        (row["run_id"], row["run_id"]),
+                    ).fetchone()
+                    if alias:
+                        continue
+                    self._conn.execute(
+                        "DELETE FROM runs WHERE run_id=?", (row["run_id"],)
+                    )
+                    deleted += 1
+                self._conn.commit()
+                self._seq += 1
+                self._data_seq += 1
+                self._note_data_write()
+            return {"markers": markers, "deleted": deleted, "backup": None}
         def query_runs(self, now: float, ws: str | None, since: float | None, until: float | None, limit: int, include_jobs: bool = False) -> list:
             """Gantt input. Open bars come from the one filtered running set, so a
             stale row the snapshot hides never shows as an open bar here. Production
@@ -582,6 +668,8 @@ class RunsMixin:
                         continue
                     view = self._run_view(row, now, usage, rss, context, stalled.get(row["run_id"]))
                     if not include_jobs and is_prod_job_run(view):
+                        continue
+                    if is_marker_run(view):
                         continue
                     if (
                         view.get("status") in ("running", "queued")

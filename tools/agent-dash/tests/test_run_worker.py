@@ -134,7 +134,7 @@ class RunWorkerTests(unittest.TestCase):
         self.assertIn(str(self.prompt), cmd)
         self.assertIn("muse-spark-1.3-contributor", cmd)
         row = (self.run_dir / "muse-sessions.tsv").read_text(encoding="utf-8").strip()
-        self.assertEqual(row, "lane-1\t%s\t1700000000" % SID)
+        self.assertEqual(row, "lane-1\t%s\t1700000000\tmuse-spark-1.3-contributor" % SID)
         self.assertEqual((self.run_dir / "lane-1.tier").read_text(encoding="utf-8").strip(), "muse")
 
     def test_auto_skips_a_worker_at_its_cap(self):
