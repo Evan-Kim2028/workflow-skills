@@ -2,7 +2,10 @@
 
 A labelled worker process is still alive after 10 minutes although its
 parent is pid 1 (reparented) or its run row already ended. The doctor
-never signals it; this only reports.
+never signals it; this only reports. One global problem
+(`orphan-worker:global`) for all orphans: the title carries the count,
+the detail lists the worst 3, and `items` carries up to 20 member rows
+(`doctor --all` for all).
 
 ## Why it matters
 
@@ -14,7 +17,7 @@ Its output may never be collected and its verdict never recorded.
 Check what it is doing, then close the row so the books balance:
 
 ```bash
-python3 agent_dash.py check
+python3 agent_dash.py doctor --all
 python3 agent_dash.py report finish --label <label> --verdict PASS --status done
 ```
 

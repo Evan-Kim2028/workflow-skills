@@ -504,11 +504,13 @@ class WorkstreamHygieneTest(unittest.TestCase):
         result = self._collect()
         stuck = [item for item in result["problems"] if item["code"] == "stuck-task"]
         self.assertEqual(len(stuck), 1)
-        self.assertEqual(stuck[0]["id"], "stuck-task:ws:WS9:WS9.1")
+        self.assertEqual(stuck[0]["id"], "stuck-task:ws:WS9")
         self.assertEqual(stuck[0]["scope"], "ws:WS9")
         self.assertEqual(stuck[0]["ws"], "WS9")
         self.assertEqual(stuck[0]["severity"], "warn")
         self.assertIn("WS9.1", stuck[0]["detail"])
+        self.assertIn("1 task", stuck[0]["title"])
+        self.assertEqual(stuck[0]["fix_command"], "python3 agent_dash.py doctor --ws WS9 --all")
         live = [{"pid": 4242, "comm": "cursor-agent", "label": "ws9-WS9.1-slug",
                  "started_at": self.now - 60}]
         again = self._collect(processes=live)
@@ -544,10 +546,12 @@ class WorkstreamHygieneTest(unittest.TestCase):
         result = self._collect()
         found = [item for item in result["problems"] if item["code"] == "done-before-deps"]
         self.assertEqual(len(found), 1)
-        self.assertEqual(found[0]["id"], "done-before-deps:ws:WS9:WS9.2")
-        self.assertIn("Second (WS9.2)", found[0]["title"])
-        self.assertIn("First (WS9.1)", found[0]["title"])
-        self.assertIn("WS9.1", found[0]["detail"])
+        self.assertEqual(found[0]["id"], "done-before-deps:ws:WS9")
+        self.assertIn("1 task", found[0]["title"])
+        self.assertIn("WS9", found[0]["title"])
+        self.assertIn("Second (WS9.2)", found[0]["detail"])
+        self.assertIn("First (WS9.1)", found[0]["detail"])
+        self.assertEqual(found[0]["fix_command"], "python3 agent_dash.py doctor --ws WS9 --all")
 
     def test_gate_blocking(self):
         self._bundle(tasks=[
@@ -652,9 +656,10 @@ class FleetTest(unittest.TestCase):
         result = self._collect(processes=procs, ppids={9: 1})
         found = [item for item in result["problems"] if item["code"] == "orphan-worker"]
         self.assertEqual(len(found), 1)
-        self.assertEqual(found[0]["id"], "orphan-worker:global:ws1-old")
+        self.assertEqual(found[0]["id"], "orphan-worker:global")
         self.assertIn("ws1-old", found[0]["detail"])
         self.assertNotIn("--model", json.dumps(found[0]))
+        self.assertEqual(found[0]["fix_command"], "python3 agent_dash.py doctor --all")
 
     def test_orphan_row_ended(self):
         self.store.upsert_run(
@@ -697,13 +702,13 @@ class FleetTest(unittest.TestCase):
                  "reasoning_effort": None},
         }
         result = self._collect(processes=procs, argv_tokens=tokens)
-        found = {item["id"]: item for item in result["problems"] if item["code"] == "model-policy"}
-        self.assertEqual(
-            set(found),
-            {"model-policy:global:ws1-bad-effort", "model-policy:global:ws1-bare-high",
-             "model-policy:global:ws1-fast-id"},
-        )
-        self.assertIn("ws1-bad-effort", found["model-policy:global:ws1-bad-effort"]["detail"])
+        found = [item for item in result["problems"] if item["code"] == "model-policy"]
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0]["id"], "model-policy:global")
+        self.assertIn("3 workers", found[0]["title"])
+        member_ids = {member["id"] for member in found[0]["items"]}
+        self.assertEqual(member_ids, {"ws1-bad-effort", "ws1-bare-high", "ws1-fast-id"})
+        self.assertIn("ws1-bad-effort", found[0]["detail"])
 
     def test_model_policy_reason_units(self):
         from dash.doctor import model_policy_reason
@@ -723,8 +728,9 @@ class FleetTest(unittest.TestCase):
         result = self._collect(workers_registry=registry, pgrep_counts={"[m]use": 3})
         found = [item for item in result["problems"] if item["code"] == "over-cap"]
         self.assertEqual(len(found), 1)
-        self.assertEqual(found[0]["id"], "over-cap:global:muse")
+        self.assertEqual(found[0]["id"], "over-cap:global")
         self.assertIn("3", found[0]["detail"])
+        self.assertEqual(found[0]["fix_command"], "python3 agent_dash.py doctor --all")
         calm = self._collect(workers_registry=registry, pgrep_counts={"[m]use": 1})
         self.assertFalse([item for item in calm["problems"] if item["code"] == "over-cap"])
 
@@ -1220,9 +1226,10 @@ class OrchestrationChecksTest(unittest.TestCase):
         result = self._collect()
         found = self._by_code(result, "dep-jump")
         self.assertEqual(len(found), 1)
-        self.assertEqual(found[0]["id"], "dep-jump:ws:WS9:WS9.2")
+        self.assertEqual(found[0]["id"], "dep-jump:ws:WS9")
         self.assertEqual(found[0]["severity"], "warn")
         self.assertIn("WS9.1", found[0]["detail"])
+        self.assertIn("1 task", found[0]["title"])
         self.assertEqual(found[0]["fix_command"], "python3 agent_dash.py ws next WS9")
         (self.wsroot / "WS9" / "history.jsonl").unlink()
         self._history("WS9", ("WS9.2", self.now - 25 * 3600, "todo", "wip"))
@@ -1492,6 +1499,473 @@ class OrchestrationChecksTest(unittest.TestCase):
             self.assertFalse(
                 self._by_code(result, code), f"{code} fired with no plan tasks",
             )
+
+
+class GroupingTest(unittest.TestCase):
+    """One problem per (code, workstream); old per-item ids are gone."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.wsroot = self.root / "ws"
+        self.wsroot.mkdir()
+        self.state = self.root / "state"
+        self.state.mkdir()
+        self.old_ws = os.environ.get("AGENT_DASH_WORKSTREAMS")
+        os.environ["AGENT_DASH_WORKSTREAMS"] = str(self.wsroot)
+        self.store = Store(self.state / "dash.sqlite")
+        self.now = 1_700_000_000.0
+        self.health = {"ok": True, "sources": []}
+
+    def tearDown(self):
+        self.store.close()
+        if self.old_ws is None:
+            os.environ.pop("AGENT_DASH_WORKSTREAMS", None)
+        else:
+            os.environ["AGENT_DASH_WORKSTREAMS"] = self.old_ws
+        self.tmp.cleanup()
+
+    def _cfg(self):
+        cfg = _cfg(state_dir=str(self.state))
+        cfg["roots"]["scratchpads"] = []
+        return cfg
+
+    def _bundle(self, ws="WS9", tasks=None):
+        from dash.bundles import cmd_ws
+
+        if not (self.wsroot / ws).is_dir():
+            self.assertEqual(cmd_ws(["new", ws, "Example"]), 0)
+        plan = self.wsroot / ws / "plan.json"
+        data = json.loads(plan.read_text(encoding="utf-8"))
+        if tasks is not None:
+            data["dag"]["groups"] = [
+                {"id": "build", "col": 0, "title": "Build", "tasks": tasks}
+            ]
+        plan.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        return self.wsroot / ws
+
+    def _collect(self, **over):
+        from dash.doctor import collect_problems
+
+        params = {"health": self.health, "processes": []}
+        params.update(over)
+        with mock.patch("dash.doctor._home_scratch", return_value=str(self.root / "noscratch")):
+            return collect_problems(self.store, self._cfg(), self.now, **params)
+
+    def test_five_stuck_tasks_are_one_group(self):
+        tasks = [
+            {"id": f"WS9.{n}", "title": f"Thing {n}", "status": "wip", "deps": []}
+            for n in range(1, 6)
+        ]
+        self._bundle(tasks=tasks)
+        history = "\n".join(
+            json.dumps({"ts": self.now - 7 * 3600, "task": f"WS9.{n}",
+                        "from": "todo", "to": "wip"})
+            for n in range(1, 6)
+        ) + "\n"
+        (self.wsroot / "WS9" / "history.jsonl").write_text(history, encoding="utf-8")
+        result = self._collect()
+        stuck = [item for item in result["problems"] if item["code"] == "stuck-task"]
+        self.assertEqual(len(stuck), 1)
+        group = stuck[0]
+        self.assertEqual(group["id"], "stuck-task:ws:WS9")
+        self.assertIn("Example (WS9)", group["title"])
+        self.assertIn("5 tasks", group["title"])
+        self.assertNotIn("WS9.1", group["title"])
+        for n in (1, 2, 3):
+            self.assertIn(f"Thing {n} (WS9.{n})", group["detail"])
+        self.assertIn("+2 more", group["detail"])
+        self.assertEqual(len(group["items"]), 5)
+        for member in group["items"]:
+            self.assertEqual(set(member), {"title", "id", "since"})
+        self.assertEqual(
+            group["fix_command"], "python3 agent_dash.py doctor --ws WS9 --all"
+        )
+
+    def test_no_per_item_ids_remain(self):
+        tasks = [
+            {"id": "WS9.1", "title": "First", "status": "todo", "deps": []},
+            {"id": "WS9.2", "title": "Second", "status": "done", "deps": ["WS9.1"]},
+            {"id": "WS9.3", "title": "Third", "status": "wip",
+             "deps": ["WS9.1"]},
+        ]
+        self._bundle(tasks=tasks)
+        (self.wsroot / "WS9" / "history.jsonl").write_text(
+            json.dumps({"ts": self.now - 7 * 3600, "task": "WS9.3",
+                        "from": "todo", "to": "wip"}) + "\n",
+            encoding="utf-8",
+        )
+        result = self._collect()
+        ids = [item["id"] for item in result["problems"]]
+        self.assertNotIn("done-before-deps:ws:WS9:WS9.2", ids)
+        self.assertIn("done-before-deps:ws:WS9", ids)
+        for ident in ids:
+            self.assertLessEqual(ident.count(":"), 2, ident)
+
+    def test_ghost_group_carries_member_rows(self):
+        self._bundle(tasks=[{"id": "WS9.1", "title": "Task WS9.1",
+                             "status": "todo", "deps": []}])
+        for suffix in ("a", "b", "c", "d"):
+            self.store.upsert_run(
+                {"run_id": f"muse:s:ws9-WS9.1-{suffix}", "source": "muse",
+                 "tier": "muse", "label": f"ws9-WS9.1-{suffix}",
+                 "session_id": "s", "status": "done",
+                 "started_at": self.now - 3600, "ended_at": self.now - 3000}
+            )
+        self.store.upsert_run(
+            {"run_id": "muse:s:ws9-random-thing", "source": "muse",
+             "tier": "muse", "label": "ws9-random-thing",
+             "session_id": "s", "status": "done",
+             "started_at": self.now - 3600, "ended_at": self.now - 3000}
+        )
+        result = self._collect()
+        ghosts = [item for item in result["problems"] if item["code"] == "ghost-runs"]
+        self.assertEqual(len(ghosts), 1)
+        self.assertEqual(ghosts[0]["id"], "ghost-runs:ws:WS9")
+        self.assertTrue(ghosts[0]["items"])
+        self.assertTrue(
+            any(member["title"] == "ws9-random-thing" for member in ghosts[0]["items"])
+        )
+
+
+class MemberCapTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.store = Store(Path(self.tmp.name) / "dash.sqlite")
+        self.now = 1_700_000_000.0
+
+    def tearDown(self):
+        self.store.close()
+        self.tmp.cleanup()
+
+    def test_items_cap_at_20_and_all_returns_everything(self):
+        members = [
+            {"title": f"Thing {n}", "id": f"WS9.{n}", "since": self.now - n}
+            for n in range(25)
+        ]
+        payload = self.store.doctor_snapshot(
+            [{"id": "stuck-task:ws:WS9", "code": "stuck-task",
+              "severity": "warn", "scope": "ws:WS9", "ws": "WS9",
+              "title": "Example (WS9): 25 tasks stuck with no live agent",
+              "detail": "many", "fix_command": "python3 agent_dash.py doctor --ws WS9 --all",
+              "safe_auto": False, "items": members}],
+            self.now,
+        )
+        self.assertEqual(payload["summary"].get("items_total"), 25)
+        group = next(item for item in payload["problems"] if item["id"] == "stuck-task:ws:WS9")
+        self.assertEqual(len(group["items"]), 20)
+        self.assertEqual(group["items_total"], 25)
+        full = self.store.doctor_latest(self.now, include_all=True)
+        group_full = next(item for item in full["problems"] if item["id"] == "stuck-task:ws:WS9")
+        self.assertEqual(len(group_full["items"]), 25)
+        scoped = self.store.doctor_latest(self.now, ws="WS9", include_all=True)
+        self.assertEqual(len(scoped["problems"][0]["items"]), 25)
+
+
+class MigrationTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.store = Store(Path(self.tmp.name) / "dash.sqlite")
+        self.now = 1_700_000_000.0
+
+    def tearDown(self):
+        self.store.close()
+        self.tmp.cleanup()
+
+    def _fresh(self, pid, code="stuck-task", severity="warn", scope="ws:WS9", ws="WS9"):
+        return {
+            "id": pid, "code": code, "severity": severity, "scope": scope, "ws": ws,
+            "title": f"title {pid}", "detail": f"detail {pid}",
+            "fix_command": "python3 agent_dash.py check", "safe_auto": False,
+        }
+
+    def test_old_per_item_ids_resolve_on_first_grouped_run(self):
+        self.store.doctor_snapshot(
+            [
+                self._fresh("dep-jump:ws:WS9:WS9.2", "dep-jump"),
+                self._fresh("stuck-task:ws:WS9:WS9.1"),
+                self._fresh("orphan-worker:global:ws1-old", "orphan-worker",
+                           "warn", "global", None),
+                self._fresh("model-policy:global:ws1-bad", "model-policy",
+                           "warn", "global", None),
+            ],
+            self.now,
+        )
+        payload = self.store.doctor_snapshot(
+            [
+                {**self._fresh("dep-jump:ws:WS9", "dep-jump"),
+                 "items": [{"title": "Second", "id": "WS9.2", "since": self.now - 10}]},
+                {**self._fresh("stuck-task:ws:WS9"),
+                 "items": [{"title": "First", "id": "WS9.1", "since": self.now - 10}]},
+            ],
+            self.now + 10,
+        )
+        ids = {item["id"] for item in payload["problems"]}
+        self.assertIn("dep-jump:ws:WS9", ids)
+        self.assertIn("stuck-task:ws:WS9", ids)
+        self.assertNotIn("dep-jump:ws:WS9:WS9.2", ids)
+        self.assertNotIn("stuck-task:ws:WS9:WS9.1", ids)
+        self.assertNotIn("orphan-worker:global:ws1-old", ids)
+        resolved = {entry["id"] for entry in payload["resolved_24h"]}
+        self.assertIn("dep-jump:ws:WS9:WS9.2", resolved)
+        self.assertIn("stuck-task:ws:WS9:WS9.1", resolved)
+
+
+class DepJumpSeverityTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.wsroot = self.root / "ws"
+        self.wsroot.mkdir()
+        self.state = self.root / "state"
+        self.state.mkdir()
+        self.old_ws = os.environ.get("AGENT_DASH_WORKSTREAMS")
+        os.environ["AGENT_DASH_WORKSTREAMS"] = str(self.wsroot)
+        self.store = Store(self.state / "dash.sqlite")
+        self.now = 1_700_000_000.0
+        self.health = {"ok": True, "sources": []}
+
+    def tearDown(self):
+        self.store.close()
+        if self.old_ws is None:
+            os.environ.pop("AGENT_DASH_WORKSTREAMS", None)
+        else:
+            os.environ["AGENT_DASH_WORKSTREAMS"] = self.old_ws
+        self.tmp.cleanup()
+
+    def _cfg(self):
+        cfg = _cfg(state_dir=str(self.state))
+        cfg["roots"]["scratchpads"] = []
+        return cfg
+
+    def _bundle(self):
+        from dash.bundles import cmd_ws
+
+        self.assertEqual(cmd_ws(["new", "WS9", "Example"]), 0)
+        plan = self.wsroot / "WS9" / "plan.json"
+        data = json.loads(plan.read_text(encoding="utf-8"))
+        data["dag"]["groups"] = [
+            {"id": "build", "col": 0, "title": "Build", "tasks": [
+                {"id": "WS9.1", "title": "Task WS9.1", "status": "todo", "deps": []},
+                {"id": "WS9.2", "title": "Task WS9.2", "status": "wip", "deps": ["WS9.1"]},
+                {"id": "WS9.3", "title": "Task WS9.3", "status": "wip", "deps": ["WS9.1"]},
+            ]}
+        ]
+        plan.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+    def _collect(self):
+        from dash.doctor import collect_problems
+
+        with mock.patch("dash.doctor._home_scratch", return_value=str(self.root / "noscratch")):
+            return collect_problems(
+                self.store, self._cfg(), self.now,
+                health=self.health, processes=[])
+
+    def test_mixed_recent_and_old_is_warn(self):
+        self._bundle()
+        path = self.wsroot / "WS9" / "history.jsonl"
+        path.write_text(
+            json.dumps({"ts": self.now - 3600, "task": "WS9.2",
+                        "from": "todo", "to": "wip"}) + "\n"
+            + json.dumps({"ts": self.now - 25 * 3600, "task": "WS9.3",
+                          "from": "todo", "to": "wip"}) + "\n",
+            encoding="utf-8",
+        )
+        result = self._collect()
+        found = [item for item in result["problems"] if item["code"] == "dep-jump"]
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0]["severity"], "warn")
+        self.assertEqual(len(found[0]["items"]), 2)
+
+    def test_all_old_is_info(self):
+        self._bundle()
+        path = self.wsroot / "WS9" / "history.jsonl"
+        path.write_text(
+            json.dumps({"ts": self.now - 25 * 3600, "task": "WS9.2",
+                        "from": "todo", "to": "wip"}) + "\n"
+            + json.dumps({"ts": self.now - 26 * 3600, "task": "WS9.3",
+                          "from": "todo", "to": "wip"}) + "\n",
+            encoding="utf-8",
+        )
+        result = self._collect()
+        found = [item for item in result["problems"] if item["code"] == "dep-jump"]
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0]["severity"], "info")
+
+
+class DigestTest(unittest.TestCase):
+    def _payload(self):
+        def problem(pid, code, severity, ws, title, members):
+            return {
+                "id": pid, "code": code, "severity": severity,
+                "scope": f"ws:{ws}" if ws else "global", "ws": ws,
+                "title": title, "detail": "d",
+                "fix": {"command": "python3 agent_dash.py check",
+                        "safe_auto": False, "doc": f"docs/problems/{code}.md"},
+                "first_seen": 1, "last_seen": 2, "count": 1,
+                "regressed": False,
+                "items_total": len(members), "items": members,
+            }
+
+        crit_members = [
+            {"title": f"C member {n}", "id": f"c{n}", "since": n} for n in range(5)
+        ]
+        warn_members = [
+            {"title": "W member a", "id": "wa", "since": 1},
+            {"title": "W member b", "id": "wb", "since": 2},
+        ]
+        return {
+            "generated_at": 10, "next_run_at": 310, "interval_s": 300,
+            "summary": {"critical": 1, "warn": 1, "info": 1, "regressed": 0,
+                       "items_total": 8},
+            "problems": [
+                problem("x:global", "dashboard-dirty-checkout", "info", None,
+                        "Info group", [{"title": "i", "id": "i", "since": 1}]),
+                problem("dep-jump:ws:WS9", "dep-jump", "warn", "WS9",
+                        "Example (WS9): 2 tasks started before a dependency finished",
+                        warn_members),
+                problem("unseen-worker:global:g", "unseen-worker", "critical", None,
+                        "Worker is invisible on the dashboard", crit_members),
+            ],
+            "resolved_24h": [],
+        }
+
+    def test_digest_sorts_and_shows_top3_and_footer(self):
+        from dash.doctor import format_doctor_human
+
+        text = format_doctor_human(self._payload())
+        lines = text.splitlines()
+        group_lines = [line for line in lines if line[:1] in ("✖", "⚠", "ℹ")]
+        self.assertEqual(len(group_lines), 3)
+        self.assertTrue(group_lines[0].startswith("✖ critical"))
+        self.assertTrue(group_lines[1].startswith("⚠ warn"))
+        self.assertTrue(group_lines[2].startswith("ℹ info"))
+        for line in group_lines:
+            parts = line.split()
+            self.assertGreaterEqual(len(parts), 5)
+        self.assertIn("unseen-worker", group_lines[0])
+        self.assertIn("x5", group_lines[0])
+        member_lines = [line for line in lines if line.startswith("  - ")]
+        self.assertEqual(len(member_lines), 3 + 2)
+        self.assertIn("(+2 more)", text)
+        self.assertIn("3 groups, 8 items", text)
+        self.assertIn("doctor --all to expand", text)
+        self.assertIn("doctor --ws", text)
+
+    def test_digest_omits_zero_count_and_caps_resolved(self):
+        from dash.doctor import format_doctor_human
+
+        payload = self._payload()
+        payload["problems"].append(
+            {
+                "id": "idle-ready:ws:WS9:queue", "code": "idle-ready",
+                "severity": "warn", "scope": "ws:WS9", "ws": "WS9",
+                "title": "Example (WS9): 1 ready task with no live agent",
+                "detail": "d",
+                "fix": {"command": "python3 agent_dash.py ws next WS9",
+                        "safe_auto": False, "doc": "docs/problems/idle-ready.md"},
+                "first_seen": 1, "last_seen": 2, "count": 1,
+                "regressed": False,
+            }
+        )
+        payload["resolved_24h"] = [
+            {"id": f"old:{n}", "code": "dep-jump", "title": f"old {n}",
+             "resolved_at": 3}
+            for n in range(25)
+        ]
+        text = format_doctor_human(payload)
+        idle = next(
+            line for line in text.splitlines() if "idle-ready" in line
+        )
+        self.assertNotIn("x0", idle)
+        self.assertIn("resolved in the last 24 h (25):", text)
+        self.assertIn("(+15 more)", text)
+
+    def test_all_expands_every_member(self):
+        from dash.doctor import format_doctor_human
+
+        text = format_doctor_human(self._payload(), show_all=True)
+        member_lines = [line for line in text.splitlines() if line.startswith("  - ")]
+        self.assertEqual(len(member_lines), 5 + 2 + 1)
+        self.assertNotIn("more)", text)
+
+
+class UnseenGraceTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.wsroot = self.root / "ws"
+        self.wsroot.mkdir()
+        self.state = self.root / "state"
+        self.state.mkdir()
+        self.old_ws = os.environ.get("AGENT_DASH_WORKSTREAMS")
+        os.environ["AGENT_DASH_WORKSTREAMS"] = str(self.wsroot)
+        self.store = Store(self.state / "dash.sqlite")
+        self.now = 1_700_000_000.0
+
+    def tearDown(self):
+        self.store.close()
+        if self.old_ws is None:
+            os.environ.pop("AGENT_DASH_WORKSTREAMS", None)
+        else:
+            os.environ["AGENT_DASH_WORKSTREAMS"] = self.old_ws
+        self.tmp.cleanup()
+
+    def _registry(self, last_poll):
+        class FakeSource:
+            NAME = "muse"
+            INTERVAL_S = 2
+
+        class FakeRegistry:
+            def __init__(self, born, state):
+                self.sources = [FakeSource()]
+                self.state = state
+                self._born = born
+
+        return FakeRegistry(self.now - 1000, {"muse": {"last_poll": last_poll}})
+
+    def _collect(self, registry):
+        from dash.doctor import collect_problems
+
+        cfg = _cfg(state_dir=str(self.state))
+        cfg["roots"]["scratchpads"] = []
+        procs = [{"pid": 4242, "comm": "cursor-agent", "label": "ws1-ghost",
+                  "started_at": self.now - 3600}]
+        with mock.patch("dash.doctor._home_scratch", return_value=str(self.root / "noscratch")):
+            return collect_problems(
+                self.store, cfg, self.now,
+                health={"ok": True, "sources": []},
+                registry=registry, processes=procs)
+
+    def test_starting_registry_emits_no_unseen_worker(self):
+        result = self._collect(self._registry(None))
+        self.assertFalse(
+            [item for item in result["problems"] if item["code"] == "unseen-worker"]
+        )
+
+    def test_first_poll_completed_emits_unseen_worker(self):
+        result = self._collect(self._registry(self.now - 10))
+        unseen = [item for item in result["problems"] if item["code"] == "unseen-worker"]
+        self.assertEqual(len(unseen), 1)
+        self.assertIn("ws1-ghost", unseen[0]["detail"])
+
+    def test_health_based_rule_for_check(self):
+        from dash.doctor import unseen_startup_ready
+
+        starting = {
+            "ok": True,
+            "sources": [{"name": "muse", "last_poll": None, "last_error": None,
+                         "lag_s": None, "state": "starting",
+                         "started_at": self.now - 5, "interval_s": 2}],
+        }
+        self.assertFalse(unseen_startup_ready(None, starting, self.now))
+        ready = {
+            "ok": True,
+            "sources": [{"name": "muse", "last_poll": self.now - 2, "last_error": None,
+                         "lag_s": 2.0, "state": "ok",
+                         "started_at": self.now - 1000, "interval_s": 2}],
+        }
+        self.assertTrue(unseen_startup_ready(None, ready, self.now))
 
 
 if __name__ == "__main__":

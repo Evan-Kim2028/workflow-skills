@@ -2,8 +2,11 @@
 
 A plan task has a first-active moment (run start or status change) at or
 before a dependency's done moment, or its dependency is still
-unfinished. Jumps from the last `doctor.recent_hours` (default 24 h)
-are `warn`; older ones are `info`.
+unfinished. One problem per workstream (`dep-jump:ws:<ID>`): the title
+names the workstream and the count, the detail lists the worst 3, and
+`items` carries up to 20 member rows (`?all=1` for all). The group is
+`warn` when any jump started within the last `doctor.recent_hours`
+(default 24 h), else `info`.
 
 ## Why it matters
 

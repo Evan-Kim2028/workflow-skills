@@ -270,7 +270,8 @@ class BaseMixin:
                   last_seen REAL,
                   count INTEGER DEFAULT 1,
                   resolved_at REAL,
-                  regressed INTEGER DEFAULT 0
+                  regressed INTEGER DEFAULT 0,
+                  items_json TEXT
                 );
                 CREATE TABLE IF NOT EXISTS doctor_meta (
                   key TEXT PRIMARY KEY,
@@ -298,6 +299,7 @@ class BaseMixin:
             self._migrate_uncached_input()
             self._migrate_run_aliases()
             self._migrate_session_hint()
+            self._migrate_doctor_items()
         def _migrate_uncached_input(self) -> None:
             """Once: muse and GLM logged input with cached tokens inside it; store uncached input like every other source, then rebuild the hourly buckets."""
             self._conn.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)")
@@ -344,14 +346,28 @@ class BaseMixin:
             sample_cols = {row[1] for row in self._conn.execute("PRAGMA table_info(process_samples)")}
             if "model" not in sample_cols:
                 self._conn.execute("ALTER TABLE process_samples ADD COLUMN model TEXT")
+        def _migrate_doctor_items(self) -> None:
+            """Once: grouped problems carry compact member rows.
+
+            Existing databases gain ``items_json`` on ``doctor_problems``;
+            old per-item rows (e.g. ``dep-jump:ws:WS9:WS9.2``) need no
+            rewrite: the next snapshot only emits group ids, so absent
+            old ids resolve on that first run.
+            """
+            cols = {row[1] for row in self._conn.execute("PRAGMA table_info(doctor_problems)")}
+            if "items_json" not in cols:
+                self._conn.execute("ALTER TABLE doctor_problems ADD COLUMN items_json TEXT")
         def doctor_snapshot(self, problems: list, now: float, interval_s: float = 300) -> dict:
             """Persist one doctor run and return the ``GET /api/doctor`` payload.
 
             ``problems`` are fresh dicts with ``id, code, severity, scope, ws,
-            title, detail, fix_command, safe_auto``. A problem absent from this
-            run resolves (``resolved_at`` set); one that reappears after a
-            resolution is ``regressed`` (sticky). Resolved rows older than 14
-            days are deleted. Never raises for bad rows: they are skipped.
+            title, detail, fix_command, safe_auto`` plus optional ``items``
+            (compact ``{title, id, since}`` member rows for grouped
+            problems). A problem absent from this run resolves
+            (``resolved_at`` set, so old per-item ids resolve on the first
+            grouped run); one that reappears after a resolution is
+            ``regressed`` (sticky). Resolved rows older than 14 days are
+            deleted. Never raises for bad rows: they are skipped.
             """
             now = float(now)
             try:
@@ -372,6 +388,9 @@ class BaseMixin:
                         if not pid:
                             continue
                         seen.add(pid)
+                        items_json = _doctor_items_json(
+                            item.get("items") if isinstance(item, dict) else None
+                        )
                         row = self._conn.execute(
                             "SELECT count, resolved_at, regressed FROM doctor_problems WHERE id=?",
                             (pid,),
@@ -381,8 +400,8 @@ class BaseMixin:
                                 """INSERT INTO doctor_problems(
                                      id, code, severity, scope, ws, title, detail,
                                      fix_command, safe_auto, first_seen, last_seen,
-                                     count, resolved_at, regressed)
-                                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                                     count, resolved_at, regressed, items_json)
+                                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                                 (
                                     pid,
                                     str(item.get("code") or ""),
@@ -398,6 +417,7 @@ class BaseMixin:
                                     1,
                                     None,
                                     0,
+                                    items_json,
                                 ),
                             )
                         else:
@@ -410,7 +430,7 @@ class BaseMixin:
                                      code=?, severity=?, scope=?, ws=?, title=?, detail=?,
                                      fix_command=?, safe_auto=?, last_seen=?,
                                      count=COALESCE(count, 0) + 1,
-                                     resolved_at=?, regressed=?
+                                     resolved_at=?, regressed=?, items_json=?
                                    WHERE id=?""",
                                 (
                                     str(item.get("code") or ""),
@@ -424,6 +444,7 @@ class BaseMixin:
                                     now,
                                     resolved_at,
                                     regressed,
+                                    items_json,
                                     pid,
                                 ),
                             )
@@ -461,16 +482,19 @@ class BaseMixin:
             now: float,
             ws: str | None = None,
             min_severity: str | None = None,
+            include_all: bool = False,
         ) -> dict:
             """The ``GET /api/doctor`` payload from the latest persisted run.
 
             Never runs checks: it only reads. ``ws`` keeps that workstream's
             problems plus global ones. ``min_severity`` (critical|warn|info) is
             the least severe level included. Unknown values yield no filtering.
+            ``include_all`` (``?all=1``) returns every member row; by
+            default each problem carries up to 20.
             """
             with self._lock:
-                return self._doctor_latest_locked(float(now), ws, min_severity)
-        def _doctor_latest_locked(self, now: float, ws, min_severity) -> dict:
+                return self._doctor_latest_locked(float(now), ws, min_severity, include_all)
+        def _doctor_latest_locked(self, now: float, ws, min_severity, include_all: bool = False) -> dict:
             meta = {
                 row["key"]: row["value"]
                 for row in self._conn.execute("SELECT key, value FROM doctor_meta").fetchall()
@@ -495,11 +519,15 @@ class BaseMixin:
                 ).fetchall()
             ]
             summary = {"critical": 0, "warn": 0, "info": 0, "regressed": 0}
+            items_total = 0
             for row in rows:
                 if row.get("severity") in summary:
                     summary[row["severity"]] += 1
                 if row.get("regressed"):
                     summary["regressed"] += 1
+                items_total += len(_doctor_items(row))
+            if items_total:
+                summary["items_total"] = items_total
             resolved = [
                 {
                     "id": row["id"],
@@ -515,7 +543,7 @@ class BaseMixin:
                 ).fetchall()
             ]
             problems = [
-                _doctor_api_row(row)
+                _doctor_api_row(row, include_all)
                 for row in rows
                 if _doctor_visible(row, ws, min_severity)
             ]
@@ -592,10 +620,79 @@ class BaseMixin:
             )
 
 
-def _doctor_api_row(row: dict) -> dict:
-    """One persisted problem in ``GET /api/doctor`` shape."""
+def _doctor_items_json(items) -> str | None:
+    """Compact member rows for storage, or None when there are none."""
+    if not isinstance(items, list) or not items:
+        return None
+    compact = []
+    for entry in items:
+        if not isinstance(entry, dict):
+            continue
+        title = str(entry.get("title") or entry.get("id") or "")
+        ident = str(entry.get("id") or "")
+        if not ident and not title:
+            continue
+        try:
+            since = float(entry.get("since")) if entry.get("since") is not None else None
+        except (TypeError, ValueError):
+            since = None
+        compact.append({"title": title, "id": ident, "since": since})
+    if not compact:
+        return None
+    import json as _json
+
+    try:
+        return _json.dumps(compact)
+    except (TypeError, ValueError):
+        return None
+
+
+def _doctor_items(row: dict) -> list:
+    """All persisted member rows for one problem (possibly empty)."""
+    raw = row.get("items_json") if isinstance(row, dict) else None
+    if not raw:
+        items = row.get("items") if isinstance(row, dict) else None
+        if isinstance(items, list):
+            return [
+                {"title": str(entry.get("title") or entry.get("id") or ""),
+                 "id": str(entry.get("id") or ""),
+                 "since": entry.get("since")}
+                for entry in items
+                if isinstance(entry, dict)
+            ]
+        return []
+    import json as _json
+
+    try:
+        data = _json.loads(raw)
+    except (TypeError, ValueError):
+        return []
+    if not isinstance(data, list):
+        return []
+    out = []
+    for entry in data:
+        if not isinstance(entry, dict):
+            continue
+        out.append(
+            {
+                "title": str(entry.get("title") or entry.get("id") or ""),
+                "id": str(entry.get("id") or ""),
+                "since": entry.get("since"),
+            }
+        )
+    return out
+
+
+def _doctor_api_row(row: dict, include_all: bool = False) -> dict:
+    """One persisted problem in ``GET /api/doctor`` shape.
+
+    Grouped problems also carry ``items`` (up to 20 compact member
+    rows by default, every row with ``?all=1``) and ``items_total``
+    (the full member count). Both keys are present only when the
+    problem has members, so rows without members keep the old shape.
+    """
     code = str(row.get("code") or "")
-    return {
+    out = {
         "id": str(row.get("id") or ""),
         "code": code,
         "severity": str(row.get("severity") or "warn"),
@@ -613,6 +710,11 @@ def _doctor_api_row(row: dict) -> dict:
         "count": row.get("count") or 0,
         "regressed": bool(row.get("regressed")),
     }
+    members = _doctor_items(row)
+    if members:
+        out["items_total"] = len(members)
+        out["items"] = members if include_all else members[:20]
+    return out
 
 
 def _doctor_visible(row: dict, ws, min_severity) -> bool:

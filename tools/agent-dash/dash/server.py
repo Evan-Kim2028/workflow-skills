@@ -241,6 +241,7 @@ class Handler(BaseHTTPRequestHandler):
         severity = _one(query, "severity")
         if severity is not None and severity not in ("critical", "warn", "info"):
             raise ValueError("bad severity")
+        include_all = _one(query, "all") == "1"
         refresh = _one(query, "refresh")
         scheduler = getattr(self.server, "doctor", None)
         if refresh == "1" and scheduler is not None:
@@ -251,11 +252,11 @@ class Handler(BaseHTTPRequestHandler):
         now = time.time()
         if scheduler is not None:
             try:
-                body = scheduler.latest(now, ws, severity)
+                body = scheduler.latest(now, ws, severity, include_all)
             except Exception:
-                body = self.server.store.doctor_latest(now, ws, severity)
+                body = self.server.store.doctor_latest(now, ws, severity, include_all)
         else:
-            body = self.server.store.doctor_latest(now, ws, severity)
+            body = self.server.store.doctor_latest(now, ws, severity, include_all)
         self._json(200, body)
 
     def _static(self, name):

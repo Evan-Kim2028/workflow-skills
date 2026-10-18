@@ -4,7 +4,10 @@ A live worker's argv model flags violate the configured policy: `muse`
 workers require `--reasoning-effort xhigh` (or the configured level);
 `cursor-agent` workers running a `grok-4.7` model must use the bracketed
 500k form, never a bare `grok-4.7-high` or a `-fast` id. Only the label is
-reported, never the rest of argv.
+reported, never the rest of argv. One global problem
+(`model-policy:global`) for all violators: the title carries the count,
+the detail lists the worst 3, and `items` carries up to 20 member rows
+(`doctor --all` for all).
 
 ## Why it matters
 
@@ -16,7 +19,7 @@ every lane on the model the lead budgeted for.
 Fix the registry entry, then relaunch the worker:
 
 ```bash
-python3 agent_dash.py check
+python3 agent_dash.py doctor --all
 ```
 
 Edit `workers.local.json`: give the muse worker `--reasoning-effort

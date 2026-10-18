@@ -2,7 +2,10 @@
 
 Runs from the last `doctor.recent_hours` (default 24 h) that map to no
 plan task, in a workstream where at least `doctor.ghost_share`
-(default 20%) of recent runs are unmapped. The detail names the labels.
+(default 20%) of recent runs are unmapped. One problem per workstream
+(`ghost-runs:ws:<ID>`): the title names the workstream and the count,
+the detail lists the worst 3, and `items` carries up to 20 member rows
+(`doctor --ws <ID> --all` for all).
 
 ## Why it matters
 

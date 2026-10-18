@@ -50,7 +50,7 @@ USAGE = """agent-dash: local read-only execution dashboard
   python3 agent_dash.py check --page [--url URL] [--json]
   python3 agent_dash.py state [--url URL] [--json]
   python3 agent_dash.py status [--json]
-  python3 agent_dash.py doctor [--url URL] [--json] [--ws ID] [--severity S]
+  python3 agent_dash.py doctor [--url URL] [--json] [--ws ID] [--severity S] [--all]
   python3 agent_dash.py doctor --fix [--yes]
   python3 agent_dash.py doctor report [--since 24h] [--md]
   python3 agent_dash.py report start --label <label> [--model M] [--session S] [--run-id R] [--tier T]
@@ -576,6 +576,7 @@ def cmd_doctor(argv: list[str]) -> int:
     json_mode = False
     ws = None
     severity = None
+    show_all = False
     fix = False
     yes = False
     rest = list(argv)
@@ -591,6 +592,8 @@ def cmd_doctor(argv: list[str]) -> int:
             ws = rest.pop(0)
         elif flag == "--severity" and rest:
             severity = rest.pop(0)
+        elif flag == "--all":
+            show_all = True
         elif flag == "--fix":
             fix = True
         elif flag == "--yes":
@@ -609,14 +612,14 @@ def cmd_doctor(argv: list[str]) -> int:
         print("doctor --yes needs --fix. Run: python3 agent_dash.py doctor --fix --yes", file=sys.stderr)
         return 2
     cfg = bind_state()
-    payload, store = _doctor_payload(cfg, url, ws, severity)
+    payload, store = _doctor_payload(cfg, url, ws, severity, show_all)
     try:
         if fix:
             return cmd_doctor_fix(store, cfg, payload, yes, json_mode)
         if json_mode:
             errors.emit_json(_doctor_cli_json(payload))
         else:
-            print(format_doctor_human(payload))
+            print(format_doctor_human(payload, show_all))
         return _doctor_exit(payload)
     finally:
         if store is not None:
@@ -626,7 +629,7 @@ def cmd_doctor(argv: list[str]) -> int:
                 pass
 
 
-def _doctor_payload(cfg: dict, url: str, ws, severity):
+def _doctor_payload(cfg: dict, url: str, ws, severity, include_all: bool = False):
     """``(payload, store-or-None)`` from the server, else a local run.
 
     The local fallback collects and snapshots with the background
@@ -640,6 +643,8 @@ def _doctor_payload(cfg: dict, url: str, ws, severity):
         params += f"&ws={ws}" if params else f"?ws={ws}"
     if severity is not None:
         params += f"&severity={severity}" if params else f"?severity={severity}"
+    if include_all:
+        params += "&all=1" if params else "?all=1"
     payload, _error = _fetch(url, f"/api/doctor{params}")
     if payload is not None:
         return payload, None
@@ -653,8 +658,8 @@ def _doctor_payload(cfg: dict, url: str, ws, severity):
     now = time.time()
     result = collect_problems(store, cfg, now, url=url, health=None, processes=processes)
     payload = store.doctor_snapshot(result["problems"], now, doctor_cfg(cfg)["interval_s"])
-    if ws not in (None, "all") or severity is not None:
-        payload = store.doctor_latest(now, ws, severity)
+    if ws not in (None, "all") or severity is not None or include_all:
+        payload = store.doctor_latest(now, ws, severity, include_all)
     return payload, store
 
 
@@ -892,6 +897,16 @@ def cmd_check(argv: list[str]) -> int:
     payload, _error = _fetch(url, f"/api/reconcile?hours={hours:g}")
     if payload is None:
         return _unreachable(url, json_mode)
+    mismatches = list(payload.get("mismatches", []))
+    unseen = [item for item in mismatches if str(item).startswith("unseen worker: ")]
+    if unseen:
+        from dash.doctor import unseen_startup_ready
+
+        health, _health_error = _fetch(url, "/api/health")
+        if not unseen_startup_ready(None, health, time.time()):
+            payload["mismatches"] = [
+                item for item in mismatches if not str(item).startswith("unseen worker: ")
+            ]
     if json_mode:
         errors.emit_json(payload)
         return 1 if payload.get("mismatches") else 0

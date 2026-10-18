@@ -212,6 +212,34 @@ class StateProblemsTest(unittest.TestCase):
         payload = build_state(self.store, StubRegistry([]), {}, now=now)
         self.assertEqual(payload["problems"], [])
 
+    def test_grouped_problem_keeps_ids_and_carries_items(self):
+        now = time.time()
+        self.store.doctor_snapshot(
+            [
+                {
+                    "id": "dep-jump:ws:WS9", "code": "dep-jump",
+                    "severity": "warn", "scope": "ws:WS9", "ws": "WS9",
+                    "title": "Example (WS9): 2 tasks started before a dependency finished",
+                    "detail": "Thing 2 (WS9.2); Thing 3 (WS9.3)",
+                    "fix_command": "python3 agent_dash.py ws next WS9",
+                    "safe_auto": False,
+                    "items": [
+                        {"title": "Thing 2", "id": "WS9.2", "since": now - 10},
+                        {"title": "Thing 3", "id": "WS9.3", "since": now - 20},
+                    ],
+                },
+            ],
+            now,
+        )
+        payload = build_state(self.store, StubRegistry([]), {}, now=now)
+        expected = [item["id"] for item in self.store.doctor_latest(now)["problems"]]
+        self.assertEqual([item["id"] for item in payload["problems"]], expected)
+        group = payload["problems"][0]
+        self.assertEqual(group["id"], "dep-jump:ws:WS9")
+        self.assertEqual(len(group["items"]), 2)
+        self.assertEqual(group["items_total"], 2)
+        self.assertIn("WS9.2", group["message"])
+
     def test_reconcile_still_live_without_a_doctor_run(self):
         now = time.time()
         self.store.upsert_run(

@@ -37,6 +37,14 @@ log = logging.getLogger("agent_dash.doctor")
 
 SEVERITIES = ("critical", "warn", "info")
 SEV_RANK = {"critical": 0, "warn": 1, "info": 2}
+
+GROUPED_CODES = frozenset({
+    "dep-jump", "ghost-runs", "orphan-worker", "done-before-deps",
+    "stuck-task", "bare-citation", "model-policy", "over-cap",
+})
+MEMBER_CAP_DEFAULT = 20
+GROUP_FIX_GLOBAL = "python3 agent_dash.py doctor --all"
+SEV_GLYPH = {"critical": "✖", "warn": "⚠", "info": "ℹ"}
 TERMINAL_RUN = ("done", "killed", "died_early")
 TERMINAL_TRAIN = ("merged", "dropped")
 ORPHAN_MIN_AGE_S = 600.0
@@ -159,10 +167,17 @@ def make_problem(
     command: str,
     safe_auto: bool = False,
     key: str | None = None,
+    items: list | None = None,
 ) -> dict:
-    """One fresh (unpersisted) problem. The store fills history on snapshot."""
+    """One fresh (unpersisted) problem. The store fills history on snapshot.
+
+    Grouped problems (one per code+workstream, see ``GROUPED_CODES``)
+    carry ``items``: compact ``{title, id, since}`` member rows. Old
+    per-item ids are never emitted; rows for them resolve on snapshot
+    because they are absent from the run.
+    """
     pid = f"{code}:{scope}" + (f":{key}" if key else "")
-    return {
+    out = {
         "id": pid,
         "code": code,
         "severity": severity if severity in SEV_RANK else "warn",
@@ -173,6 +188,17 @@ def make_problem(
         "fix_command": command,
         "safe_auto": bool(safe_auto),
     }
+    if items:
+        out["items"] = [
+            {
+                "title": str(item.get("title") or item.get("id") or ""),
+                "id": str(item.get("id") or ""),
+                "since": item.get("since"),
+            }
+            for item in items
+            if isinstance(item, dict)
+        ]
+    return out
 
 
 def collect_problems(
@@ -216,6 +242,7 @@ def collect_problems(
         problems=[],
         checks=[],
         emitted=set(),
+        groups={},
         _runs=None,
         _runs_loaded=False,
         _bundles=None,
@@ -233,16 +260,157 @@ def collect_problems(
     _collect_config(ctx)
     _collect_checkout(ctx)
     _collect_python(ctx)
+    _emit_grouped(ctx)
     return {"problems": ctx.problems, "checks": ctx.checks}
 
 
-def _add(ctx, code, severity, scope, ws, title, detail, command, safe_auto=False, key=None):
-    item = make_problem(code, severity, scope, ws, title, detail, command, safe_auto, key)
+def _add(ctx, code, severity, scope, ws, title, detail, command, safe_auto=False, key=None, items=None):
+    item = make_problem(code, severity, scope, ws, title, detail, command, safe_auto, key, items)
     if item["id"] in ctx.emitted:
         return None
     ctx.emitted.add(item["id"])
     ctx.problems.append(item)
     return item
+
+
+def _group_add(ctx, code, severity, scope, ws, member_title, member_id, since, member_detail=""):
+    """Collect one member of a grouped problem (one problem per code+workstream).
+
+    Per-item ids are never emitted; :func:`_emit_grouped` builds the
+    single group problem with the worst member severity, a title naming
+    the workstream and the count, a detail with the worst 3, and the one
+    list-all fix command.
+    """
+    bucket = ctx.groups.setdefault(
+        (str(code), str(scope), ws), {"severity": "info", "members": []}
+    )
+    if SEV_RANK.get(severity, 9) < SEV_RANK.get(bucket["severity"], 9):
+        bucket["severity"] = severity if severity in SEV_RANK else "warn"
+    try:
+        stamp = float(since)
+    except (TypeError, ValueError):
+        stamp = 0.0
+    bucket["members"].append(
+        {
+            "title": " ".join(str(member_title or member_id or "").split()) or str(member_id or ""),
+            "id": str(member_id or ""),
+            "since": stamp,
+            "detail": str(member_detail or ""),
+            "severity": severity if severity in SEV_RANK else "warn",
+        }
+    )
+    return bucket
+
+
+def _ws_title(ctx, ws: str | None) -> str:
+    """Workstream display title for a group title, or the bare id."""
+    if not ws:
+        return "global"
+    for bundle in ctx._bundles or []:
+        if isinstance(bundle, dict) and bundle.get("id") == ws:
+            title = " ".join(str(bundle.get("title") or "").split())
+            return title or str(ws)
+    return str(ws)
+
+
+def _plural(n: int, one: str, many: str) -> str:
+    return one if n == 1 else many
+
+
+def _order_members(code: str, members: list) -> list:
+    """Worst-first order per code for the detail's top 3."""
+    rows = list(members)
+    if code in ("stuck-task", "orphan-worker"):
+        rows.sort(key=lambda m: (m.get("since") or 0, str(m.get("id"))))
+    elif code == "dep-jump":
+        rows.sort(key=lambda m: (-(m.get("since") or 0), str(m.get("id"))))
+    else:
+        rows.sort(key=lambda m: str(m.get("id")))
+    return rows
+
+
+def _group_fix(code: str, ws: str | None) -> str:
+    if code == "dep-jump" and ws:
+        return f"python3 agent_dash.py ws next {ws}"
+    if ws:
+        return f"python3 agent_dash.py doctor --ws {ws} --all"
+    return GROUP_FIX_GLOBAL
+
+
+def _group_title(code: str, ws_title: str, ws: str | None, members: list) -> str:
+    n = len(members)
+    if code == "dep-jump":
+        return (
+            f"{ws_title} ({ws}): {n} "
+            f"{_plural(n, 'task', 'tasks')} started before a dependency finished"
+        )
+    if code == "stuck-task":
+        return (
+            f"{ws_title} ({ws}): {n} "
+            f"{_plural(n, 'task', 'tasks')} stuck with no live agent"
+        )
+    if code == "done-before-deps":
+        return (
+            f"{ws_title} ({ws}): {n} "
+            f"{_plural(n, 'task', 'tasks')} marked done before a dependency finished"
+        )
+    if code == "bare-citation":
+        return (
+            f"{ws_title} ({ws}): {n} bare number "
+            f"{_plural(n, 'citation', 'citations')} with no name"
+        )
+    if code == "ghost-runs":
+        return (
+            f"{ws_title} ({ws}): {n} recent "
+            f"{_plural(n, 'run', 'runs')} map to no plan task"
+        )
+    if code == "orphan-worker":
+        return f"{n} orphan {_plural(n, 'worker', 'workers')} still alive"
+    if code == "model-policy":
+        return f"{n} {_plural(n, 'worker', 'workers')} break the model policy"
+    if code == "over-cap":
+        return f"{n} worker {_plural(n, 'tier', 'tiers')} over cap"
+    return f"{ws_title} ({ws}): {n} open" if ws else f"{n} open"
+
+
+def _group_detail(code: str, members: list) -> str:
+    top = members[:3]
+    parts = []
+    for member in top:
+        label = _item_label(member.get("title"), member.get("id"))
+        extra = f" — {member['detail']}" if member.get("detail") else ""
+        parts.append(f"{label}{extra}")
+    text = "; ".join(parts)
+    if len(members) > 3:
+        text += f" (+{len(members) - 3} more)"
+    tails = {
+        "ghost-runs": "add exact or /regex/ entries to static/taskmap.local.json for the labels above, then reload",
+        "model-policy": "fix the model or flags in workers.local.json, then relaunch the worker",
+        "over-cap": "wait for lanes to finish, or raise the cap in workers.local.json",
+        "orphan-worker": "it is reported, never signaled",
+        "bare-citation": "name the decision, task, PR, issue or ADR before its number",
+    }
+    if code in tails:
+        text += f". {tails[code]}"
+    return text
+
+
+def _emit_grouped(ctx) -> None:
+    """Build one problem per (code, workstream) from collected members."""
+    for (code, scope, ws), bucket in sorted(ctx.groups.items()):
+        members = _order_members(code, bucket.get("members") or [])
+        if not members:
+            continue
+        severity = bucket.get("severity") or "warn"
+        ws_title = _ws_title(ctx, ws)
+        title = _group_title(code, ws_title, ws, members)
+        detail = _group_detail(code, members)
+        command = _group_fix(code, ws)
+        items = [
+            {"title": m.get("title"), "id": m.get("id"), "since": m.get("since")}
+            for m in members
+        ]
+        _add(ctx, code, severity, scope, ws, title, detail, command, False, None, items)
 
 
 def _check(ctx, name: str, ok: bool, detail: str):
@@ -450,9 +618,86 @@ def _collect_reconcile(ctx) -> None:
         _reconcile_problem(ctx, item)
 
 
+def unseen_startup_ready(registry=None, health=None, now: float | None = None) -> bool:
+    """Startup grace for the unseen-worker check (shared by doctor and ``check``).
+
+    No unseen-worker problem is emitted for a worker unless the
+    dashboard process is older than ``max(3x the slowest source
+    interval, 90 s)`` AND every source has completed at least one poll
+    since start (the registry's :func:`has_completed_poll
+    <dash.sources.has_completed_poll>` / ``starting`` state). The
+    per-worker half (alive longer than 2 poll intervals) already lives
+    in the store's unseen check; this is the dashboard-startup half.
+    ``registry`` wins when present (server path); otherwise ``health``
+    (the ``/api/health`` sources with ``interval_s``, ``started_at``,
+    and ``last_poll``) decides. Unknown state reads as not ready.
+    """
+    import time as _time
+
+    now = float(now if now is not None else _time.time())
+    if registry is not None:
+        try:
+            sources = list(getattr(registry, "sources", None) or [])
+            slowest = max(
+                [float(getattr(item, "INTERVAL_S", 0) or 0) for item in sources]
+                or [0.0]
+            )
+            born = float(getattr(registry, "_born", now))
+            raw = getattr(registry, "state", None) or {}
+            states = [item for item in raw.values() if isinstance(item, dict)]
+        except Exception:
+            return False
+        if sources and not states:
+            return False
+        if not sources:
+            return True
+        try:
+            from dash.sources import has_completed_poll
+        except Exception:
+            return False
+        try:
+            if any(not has_completed_poll(state) for state in states):
+                return False
+        except Exception:
+            return False
+        return (now - born) > max(3.0 * slowest, 90.0)
+    if isinstance(health, dict):
+        sources = health.get("sources")
+        if not isinstance(sources, list):
+            return False
+        if not sources:
+            return True
+        try:
+            slowest = max(
+                [float(item.get("interval_s") or 0) for item in sources
+                 if isinstance(item, dict)] or [0.0]
+            )
+        except (TypeError, ValueError):
+            slowest = 0.0
+        stamps = [
+            item.get("started_at") for item in sources
+            if isinstance(item, dict) and item.get("started_at") is not None
+        ]
+        try:
+            born = min(float(stamp) for stamp in stamps) if stamps else None
+        except (TypeError, ValueError):
+            born = None
+        if born is None:
+            return False
+        for item in sources:
+            if not isinstance(item, dict):
+                continue
+            if item.get("last_poll") is None:
+                return False
+        return (now - born) > max(3.0 * slowest, 90.0)
+    return False
+
+
 def _reconcile_problem(ctx, item: str) -> None:
     """Map one mismatch string to its problem code and severity."""
     if item.startswith("unseen worker: "):
+        if not unseen_startup_ready(ctx.registry, ctx.health, ctx.now):
+            return
         rest = item[len("unseen worker: "):]
         label = rest.split(" (", 1)[0].strip()
         _add(
@@ -1107,14 +1352,10 @@ def _collect_bundles(ctx) -> None:
         issues = failing[ws]
         bare = [issue for issue in issues if "bare citation" in issue]
         rest = [issue for issue in issues if "bare citation" not in issue]
-        if bare:
-            first = bare[0]
-            extra = f" (+{len(bare) - 1} more)" if len(bare) > 1 else ""
-            _add(
+        for issue in bare:
+            _group_add(
                 ctx, "bare-citation", "warn", f"ws:{ws}", ws,
-                "Bundle text cites a number with no name",
-                f"bundle {ws} has bare citations: {first}{extra}",
-                f"python3 agent_dash.py ws validate {ws}",
+                str(issue)[:60], slug(issue), ctx.now, str(issue),
             )
         if rest:
             first = rest[0]
@@ -1201,28 +1442,20 @@ def _collect_workstream(ctx, ws: str, taskmap: dict, runs: list, live_ids: set, 
             last = max(stamps) if stamps else 0
             if last and ctx.now - last > stuck_hours * 3600:
                 hours = (ctx.now - last) / 3600
-                label = _item_label(info["title"], tid)
-                _add(
+                _group_add(
                     ctx, "stuck-task", "warn", f"ws:{ws}", ws,
-                    f"{label} is stuck in {status} with no live agent",
-                    f"{label} in {ws} has status {status} with no live agent "
-                    f"mapped to it and no run for {hours:.1f} h (limit {stuck_hours:g} h)",
-                    f"python3 agent_dash.py ws plan {ws}",
-                    key=tid,
+                    info["title"], tid, last,
+                    f"{status} with no live agent for {hours:.1f} h (limit {stuck_hours:g} h)",
                 )
                 count += 1
         if status == "done":
             for dep in info["deps"]:
                 if dep in status_of and status_of[dep] != "done":
-                    label = _item_label(info["title"], tid)
                     dep_label = _item_label(tasks[dep]["title"], dep)
-                    _add(
+                    _group_add(
                         ctx, "done-before-deps", "warn", f"ws:{ws}", ws,
-                        f"{label} is done before {dep_label} it depends on",
-                        f"{label} in {ws} is done while {dep_label} is "
-                        f"{status_of[dep]} (not done)",
-                        f"python3 agent_dash.py ws plan {ws}",
-                        key=tid,
+                        info["title"], tid, history.get(tid) or mtime or ctx.now,
+                        f"done while {dep_label} is {status_of[dep]} (not done)",
                     )
                     count += 1
                     break
@@ -1657,20 +1890,17 @@ def _orch_dep_jumps(ctx, ws: str, state: dict) -> int:
             else:
                 when = "finished " + time.strftime("%Y-%m-%d %H:%M", time.gmtime(done_at)) + " UTC"
             parts.append(f"{dep_label} ({when})")
-        label = _item_label(by_id[tid].get("title"), tid)
         start = starts.get(tid, 0.0)
         started = time.strftime("%Y-%m-%d %H:%M", time.gmtime(float(start))) + " UTC"
-        _add(
+        _group_add(
             ctx, "dep-jump",
             "warn" if start >= recent_cut else "info",
             f"ws:{ws}", ws,
-            f"{label} started before its dependency finished",
-            f"{label} in {ws} started at {started} before {'; '.join(parts)}",
-            f"python3 agent_dash.py ws next {ws}",
-            key=tid,
+            by_id[tid].get("title"), tid, start,
+            f"started at {started} before {'; '.join(parts)}",
         )
         count += 1
-    return count
+    return 1 if count else 0
 
 
 def _orch_stale_gates(ctx, ws: str, state: dict) -> int:
@@ -1842,19 +2072,18 @@ def _orch_ghost_runs(ctx, ws: str, state: dict) -> int:
     share = len(ghosts) / len(window)
     if share < float(ctx.dcfg["ghost_share"]):
         return 0
-    names = sorted({str(run.get("label") or run.get("run_id")) for run in ghosts})
-    shown = ", ".join(names[:5])
-    if len(names) > 5:
-        shown += f" (+{len(names) - 5} more)"
-    title = state["title"]
-    _add(
-        ctx, "ghost-runs", "info", f"ws:{ws}", ws,
-        f"{title} ({ws}) has {len(ghosts)} of {len(window)} recent runs mapping to no task",
-        f"{len(ghosts)} of {len(window)} runs in {ws} from the last "
-        f"{ctx.dcfg['recent_hours']:g} h map to no plan task "
-        f"({share * 100:.0f}% >= {float(ctx.dcfg['ghost_share']) * 100:.0f}%): {shown}",
-        "add exact or /regex/ entries to static/taskmap.local.json for the labels above, then reload",
-    )
+    for run in ghosts:
+        label = str(run.get("label") or run.get("run_id"))
+        try:
+            stamp = float(run.get("started_at") or run.get("ended_at") or 0)
+        except (TypeError, ValueError):
+            stamp = 0.0
+        _group_add(
+            ctx, "ghost-runs", "info", f"ws:{ws}", ws,
+            label, str(run.get("run_id") or label), stamp,
+            f"{len(ghosts)} of {len(window)} recent runs map to no task "
+            f"({share * 100:.0f}% >= {float(ctx.dcfg['ghost_share']) * 100:.0f}%)",
+        )
     return 1
 
 
@@ -2080,12 +2309,13 @@ def _collect_fleet(ctx) -> None:
             effort = proc.get("reasoning_effort")
         reason = model_policy_reason(kind, model, effort, policy)
         if reason is not None:
-            _add(
+            try:
+                started = float(proc.get("started_at") or 0)
+            except (TypeError, ValueError):
+                started = 0.0
+            _group_add(
                 ctx, "model-policy", "warn", "global", None,
-                f"Worker {label} breaks the model policy",
-                f"worker {label!r} {reason}",
-                "fix the model or flags in workers.local.json, then relaunch the worker",
-                key=label,
+                label, label, started or ctx.now, reason,
             )
             count += 1
         if age is not None and age >= ORPHAN_MIN_AGE_S:
@@ -2096,14 +2326,15 @@ def _collect_fleet(ctx) -> None:
             if ended or reparented:
                 minutes = age / 60
                 why = "its run row ended" if ended else "its parent is pid 1"
-                _add(
+                try:
+                    started = float(proc.get("started_at") or 0)
+                except (TypeError, ValueError):
+                    started = 0.0
+                _group_add(
                     ctx, "orphan-worker", "warn", "global", None,
-                    f"Orphan worker {label} is still alive",
-                    f"labelled worker {label!r} ({proc.get('comm')} pid {proc.get('pid')}) "
-                    f"is still alive after {minutes:.0f} min though {why}; "
-                    "it is reported, never signaled",
-                    "python3 agent_dash.py check",
-                    key=label,
+                    label, label, started or ctx.now,
+                    f"{proc.get('comm')} pid {proc.get('pid')} alive "
+                    f"{minutes:.0f} min though {why}",
                 )
                 count += 1
     registry = ctx.workers_registry
@@ -2127,12 +2358,10 @@ def _collect_fleet(ctx) -> None:
                 counts[pattern] = live
             if live > cap:
                 where = f" in {reg_path}" if reg_path is not None else ""
-                _add(
+                _group_add(
                     ctx, "over-cap", "warn", "global", None,
-                    f"Worker tier {name} is over its cap",
+                    f"tier {name}", str(name), ctx.now,
                     f"tier {name}{where} has {live} live workers above cap {cap}",
-                    "wait for lanes to finish, or raise the cap in workers.local.json",
-                    key=str(name),
                 )
                 count += 1
     _check(
@@ -2199,8 +2428,17 @@ class DoctorScheduler:
         self._next_run_at = now + self.interval_s
         return payload
 
-    def latest(self, now: float, ws: str | None = None, min_severity: str | None = None) -> dict:
-        payload = self.store.doctor_latest(now, ws, min_severity)
+    def latest(
+        self,
+        now: float,
+        ws: str | None = None,
+        min_severity: str | None = None,
+        include_all: bool = False,
+    ) -> dict:
+        try:
+            payload = self.store.doctor_latest(now, ws, min_severity, include_all)
+        except TypeError:
+            payload = self.store.doctor_latest(now, ws, min_severity)
         if self._next_run_at is not None:
             payload["next_run_at"] = self._next_run_at
         return payload
@@ -2237,8 +2475,13 @@ class DoctorScheduler:
 
 
 def summarize(problems: list) -> dict:
-    """Severity counts over fresh or persisted problems (open only)."""
+    """Severity counts over fresh or persisted problems (open only).
+
+    Counts groups; ``items_total`` is the member count across them
+    (present when nonzero).
+    """
     out = {"critical": 0, "warn": 0, "info": 0, "regressed": 0}
+    total = 0
     for item in problems or []:
         if not isinstance(item, dict):
             continue
@@ -2249,6 +2492,13 @@ def summarize(problems: list) -> dict:
             out[sev] += 1
         if item.get("regressed"):
             out["regressed"] += 1
+        members = item.get("items")
+        if isinstance(members, list):
+            total += len(members)
+        elif isinstance(item.get("items_total"), int):
+            total += item["items_total"]
+    if total:
+        out["items_total"] = total
     return out
 
 
@@ -2270,8 +2520,26 @@ def filter_problems(problems: list, ws: str | None = None, min_severity: str | N
     return out
 
 
-def format_doctor_human(payload: dict) -> str:
-    """Human rendering of a ``GET /api/doctor`` payload."""
+def _group_size(item: dict) -> int:
+    """Member count for digest sorting: full total, else shown rows."""
+    try:
+        total = int(item.get("items_total") or 0)
+    except (TypeError, ValueError):
+        total = 0
+    if total:
+        return total
+    members = item.get("items")
+    return len(members) if isinstance(members, list) else 0
+
+
+def format_doctor_human(payload: dict, show_all: bool = False) -> str:
+    """Compact digest of a ``GET /api/doctor`` payload: one line per group.
+
+    Groups sort by severity then size. Each line carries the severity
+    glyph and word, code, workstream, member count, and one-line title.
+    Critical and warn groups show their top 3 members; ``show_all``
+    (``doctor --all``) prints every member under every group.
+    """
     summary = payload.get("summary") or {}
     lines = [
         "doctor: {c} critical, {w} warn, {i} info "
@@ -2287,21 +2555,59 @@ def format_doctor_human(payload: dict) -> str:
     problems = payload.get("problems") or []
     if not problems:
         lines.append("doctor: clean, no problems found")
-    for item in problems:
+    ordered = sorted(
+        [item for item in problems if isinstance(item, dict)],
+        key=lambda entry: (
+            SEV_RANK.get(str(entry.get("severity")), 9),
+            -_group_size(entry),
+            str(entry.get("code")),
+            str(entry.get("id")),
+        ),
+    )
+    for item in ordered:
+        sev = str(item.get("severity") or "warn")
+        glyph = SEV_GLYPH.get(sev, "?")
+        code = item.get("code") or ""
+        ws = item.get("ws") or "global"
+        count = _group_size(item)
+        title = " ".join(str(item.get("title") or "").split())
+        size = f" x{count}" if count else ""
+        lines.append(f"{glyph} {sev} {code} {ws}{size} {title} ({item.get('id')})")
+        members = item.get("items")
+        rows = list(members) if isinstance(members, list) else []
+        if show_all:
+            for member in rows:
+                if isinstance(member, dict):
+                    lines.append(f"  - {_item_label(member.get('title'), member.get('id'))}")
+        elif sev in ("critical", "warn"):
+            for member in rows[:3]:
+                if isinstance(member, dict):
+                    lines.append(f"  - {_item_label(member.get('title'), member.get('id'))}")
+            if len(rows) > 3:
+                lines.append(f"  (+{len(rows) - 3} more)")
         fix = item.get("fix") or {}
-        lines.append(f"[{item.get('severity')}] {item.get('title')} ({item.get('id')})")
-        if item.get("detail"):
-            lines.append(f"  {item.get('detail')}")
         if fix.get("command"):
             auto = " [safe-auto]" if fix.get("safe_auto") else ""
             lines.append(f"  fix: {fix.get('command')}{auto}")
         if item.get("regressed"):
             lines.append("  regressed since its last resolution")
+    try:
+        items_total = int(summary.get("items_total") or 0)
+    except (TypeError, ValueError):
+        items_total = 0
+    if not items_total:
+        items_total = sum(_group_size(item) for item in ordered)
+    lines.append(
+        f"{len(ordered)} groups, {items_total} items; "
+        "doctor --all to expand; doctor --ws <ID>"
+    )
     resolved = payload.get("resolved_24h") or []
     if resolved:
         lines.append(f"resolved in the last 24 h ({len(resolved)}):")
-        for entry in resolved:
+        for entry in resolved[:10]:
             lines.append(f"  {entry.get('code')}: {entry.get('title')}")
+        if len(resolved) > 10:
+            lines.append(f"  (+{len(resolved) - 10} more)")
     return "\n".join(lines)
 
 
