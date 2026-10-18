@@ -2098,19 +2098,23 @@ console.log("applySections proof ok");
         """The planning-versus-execution card keeps its integration points: one file
         plus one registry line per scope over the phase specs, the
         exec-phases slot on the Project home right after burn-up, the
-        compact workstream variant near the top of its tab, axes and
-        compact formatters only, tooltips with exact values, legend
-        glyphs with words, loading/empty/failed states, a takeaway
-        naming the main split, and no doctor/health words."""
+        workstream and overall variants as stacked bars at the bottom of
+        their Execution views, axes and compact formatters only, tooltips
+        with exact values, legend glyphs with words, loading/empty/failed
+        states, a takeaway naming the main split, and no doctor/health
+        words."""
         card = (STATIC / "cards" / "phases.js").read_text()
         for marker in (
             "phaseUsageSpec",
             "phaseUsageCard",
+            "phaseUsageAllSpec",
             "phaseUsageWsSpec",
             "phaseUsageWsCard",
             "phaseBar",
             "phaseShares",
             "cumSum",
+            "phaseStackDays",
+            "phaseStackedBars",
             "Planning versus execution",
             "Kind of work",
             "data-nav",
@@ -2124,21 +2128,28 @@ console.log("applySections proof ok");
             "aria-pressed",
             "aria-label",
             "cumulative_cost",
+            "Per day",
+            "Cumulative",
+            "vallab",
             "Most of ",
             "could not be split by label",
+            "went to ",
             "request failed",
             "Loading planning versus execution",
             "No usage recorded",
             "/api/project/phases",
         ):
             self.assertIn(marker, card, f"phases.js lost the card branch: {marker}")
+        self.assertIn('s("rect"', card, "phases.js draws no stacked rects")
         for bad in (".toFixed(", "toLocaleString()", '"dagster"', "'dagster'", "Infinity", "doctor", "health", "fetch("):
             self.assertNotIn(bad, card, f"phases.js must not contain {bad}")
         reg = (STATIC / "cards" / "registry.js").read_text()
         self.assertIn('"phases"', reg, "phases is not registered")
         self.assertIn('"phases-ws"', reg, "the workstream variant is not registered")
+        self.assertIn('"phases-all"', reg, "the overall variant is not registered")
         self.assertIn('scope: "project"', reg, "phases misses the project scope")
         self.assertIn('scope: "workstream"', reg, "phases misses the workstream scope")
+        self.assertIn('scope: "overview"', reg, "phases misses the overview scope")
         self.assertIn('slot: "exec-phases"', reg, "phases misses its slot")
         home = (STATIC / "cards" / "project-home.js").read_text()
         self.assertIn("exec-phases", home, "the home lost the exec-phases slot")
@@ -2171,7 +2182,9 @@ console.log("applySections proof ok");
 
     def test_phases_stacked_bar_math(self):
         """The stacked-bar shares and cumulative series are pure: shares
-        sum to one, a zero total shares nothing, cumulatives accumulate."""
+        sum to one, a zero total shares nothing, cumulatives accumulate,
+        and the per-day stacks carry offsets, totals, empty days, and
+        unclassified last."""
         script = (
             "const fs=require('fs');"
             "var window={};"
@@ -2186,6 +2199,36 @@ console.log("applySections proof ok");
             "assert.deepStrictEqual(C.cumSum([2,0,5]),[2,2,7]);"
             "assert.deepStrictEqual(C.cumSum(null),[]);"
             "assert.deepStrictEqual(C.cumSum([]),[]);"
+            "assert.strictEqual(typeof C.phaseStackDays,'function');"
+            "const item={days:[1000,2000,3000],series:{"
+            "planning:{cost:[3,0,1],tokens:[30,0,10]},"
+            "execution:{cost:[6,0,1],tokens:[60,0,10]},"
+            "review:{cost:[0,0,1],tokens:[0,0,10]},"
+            "coordination:{cost:[0,0,1],tokens:[0,0,10]},"
+            "unclassified:{cost:[1,0,1],tokens:[10,0,10]}}};"
+            "const st=C.phaseStackDays(item,'cost');"
+            "assert.strictEqual(st.stacks.length,3);"
+            "assert.deepStrictEqual(st.stacks.map(s=>s.total),[10,0,5]);"
+            "assert.strictEqual(st.max,10);"
+            "assert.strictEqual(st.grand,15);"
+            "const first=st.stacks[0];"
+            "assert.deepStrictEqual(first.segs.map(s=>s.phase),['planning','execution','review','coordination','unclassified']);"
+            "assert.deepStrictEqual(first.segs.map(s=>s.y0),[0,3,9,9,9]);"
+            "assert.deepStrictEqual(first.segs.map(s=>s.y1),[3,9,9,9,10]);"
+            "assert.ok(Math.abs(first.segs.reduce((a,s)=>a+s.share,0)-1)<1e-9);"
+            "const empty=st.stacks[1];"
+            "assert.strictEqual(empty.total,0);"
+            "assert.deepStrictEqual(empty.segs.map(s=>s.value),[0,0,0,0,0]);"
+            "assert.deepStrictEqual(empty.segs.map(s=>s.y0),[0,0,0,0,0]);"
+            "assert.deepStrictEqual(empty.segs.map(s=>s.share),[0,0,0,0,0]);"
+            "const toks=C.phaseStackDays(item,'tokens');"
+            "assert.deepStrictEqual(toks.stacks.map(s=>s.total),[100,0,50]);"
+            "const ranged=C.phaseStackDays(item,'cost',{since:1500,until:2500});"
+            "assert.deepStrictEqual(ranged.days,[2000]);"
+            "assert.deepStrictEqual(ranged.stacks.map(s=>s.total),[0]);"
+            "assert.deepStrictEqual(C.phaseStackDays(null,'cost').stacks,[]);"
+            "assert.deepStrictEqual(C.phaseSortByTotal([{ws:'A',by_phase:{planning:{cost_usd:1},execution:{cost_usd:0},review:{cost_usd:0},coordination:{cost_usd:0},unclassified:{cost_usd:0}}},{ws:'B',by_phase:{planning:{cost_usd:5},execution:{cost_usd:0},review:{cost_usd:0},coordination:{cost_usd:0},unclassified:{cost_usd:0}}}],'cost').map(r=>r.ws),['B','A']);"
+            "assert.ok(C.phaseWsTakeaway('Relay (WS9)',{by_phase:{planning:{cost_usd:9},execution:{cost_usd:1},review:{cost_usd:0},coordination:{cost_usd:0},unclassified:{cost_usd:0}}},'cost').indexOf('went to planning')>=0);"
         )
         proc = subprocess.run(
             ["node", "-e", script, str(STATIC / "cards" / "phases.js")],
@@ -2729,8 +2772,10 @@ class FinalPolishTests(unittest.TestCase):
     def test_exec_section_order_activity_stack(self):
         """One Activity over time card replaces the three separate chart
         sections: on both exec scopes the registry order is ... plan,
-        activity, finished. The sidenav derives its order from the DOM, so
-        no pin there; the page comment and DESIGN.md name the same order."""
+        activity, finished, and the planning-versus-execution stacked
+        bars sit last on the workstream and overall scopes. The sidenav
+        derives its order from the DOM, so no pin there; the page comment
+        and DESIGN.md name the same order."""
         registry = (STATIC / "cards" / "registry.js").read_text()
         entries = re.findall(
             r'\{id:\s*"([^"]+)",\s*order:\s*(\d+),\s*scope:\s*"([^"]+)"', registry
@@ -2748,8 +2793,18 @@ class FinalPolishTests(unittest.TestCase):
             self.assertNotIn(
                 gone.replace('"', 'id: "'), registry, f"the registry still registers {gone}"
             )
+        by_scope = {}
+        for ident, order, scope in entries:
+            by_scope.setdefault(scope, []).append((int(order), ident))
+        ws = [ident for _, ident in sorted(by_scope.get("workstream", []))]
+        self.assertEqual(ws[-1], "phases-ws", "the workstream usage card is not the last section")
+        ov = [ident for _, ident in sorted(by_scope.get("overview", []))]
+        self.assertEqual(ov[-1], "phases-all", "the overall usage card is not the last section")
+        orders = {ident: int(order) for ident, order, _scope in entries}
+        self.assertGreater(orders["phases-ws"], orders["finished"], "the workstream usage card sits before Finished")
         page = (STATIC / "index.html").read_text()
         self.assertIn("plan, activity, finished", page)
+        self.assertIn("planning-versus-execution stacked bars last", page)
         self.assertIn('<script src="/static/cards/activity.js"></script>', page)
         self.assertNotIn("token-chart.js", page, "index.html still loads the old token chart")
         self.assertNotIn("live-chart.js", page, "index.html still loads the old live chart")
@@ -2760,8 +2815,16 @@ class FinalPolishTests(unittest.TestCase):
             design.index("Finished (24 h)"),
             "DESIGN.md no longer lists the stack before Finished",
         )
+        self.assertLess(
+            design.index("Finished (24 h)"),
+            design.index("usage-by-phase stacked bars last"),
+            "DESIGN.md no longer lists the usage bars after Finished",
+        )
         sidenav = (STATIC / "sidenav.js").read_text()
         self.assertNotIn('"activity"', sidenav, "the sidenav hard-codes a section order")
+        self.assertNotIn('"gantt"', sidenav, "the sidenav hard-codes a section order")
+        self.assertNotIn('"conc"', sidenav, "the sidenav hard-codes a section order")
+        self.assertNotIn('"phases', sidenav, "the sidenav hard-codes a section order")
 
     def test_activity_range_math_runs_in_node(self):
         """The stack's range helpers are pure functions on window.AdPage:
@@ -2876,6 +2939,24 @@ console.log("activity range math ok");
             self.assertIn(strip, paint, f"the stack no longer renders {strip}")
         self.assertLess(paint.index("actTokenStrip"), paint.index("actTimelineStrip"), "tokens must stack first")
         self.assertLess(paint.index("actTimelineStrip"), paint.index("actConcStrips"), "runs must stack before agents")
+
+    def test_phases_card_is_not_before_running(self):
+        """The usage card never leads an Execution view: on the
+        workstream and overall scopes its registry order sits after the
+        running-now table, so it cannot render at the top."""
+        registry = (STATIC / "cards" / "registry.js").read_text()
+        entries = re.findall(
+            r'\{id:\s*"([^"]+)",\s*order:\s*(\d+),\s*scope:\s*"([^"]+)"', registry
+        )
+        orders = {(ident, scope): int(order) for ident, order, scope in entries}
+        running_both = [o for (i, s), o in orders.items() if i == "running" and s == "both"]
+        self.assertTrue(running_both, "the running entry is gone from the registry")
+        for key in (("phases-ws", "workstream"), ("phases-all", "overview")):
+            self.assertIn(key, orders, f"the {key[0]} entry is gone from the registry")
+            self.assertGreater(
+                orders[key], max(running_both),
+                f"{key[0]} renders before running on its exec scope",
+            )
 
     def test_running_now_disclosure(self):
         """Running now shows the top agents with a progressive disclosure
@@ -3141,7 +3222,7 @@ console.log("activity range math ok");
             re.compile(r"phases-(wrap|cap|line)"),
             re.compile(r'"phase"|pj-phase'),
             re.compile(r"phasesSection|project-phases"),
-            re.compile(r"exec-phases|phaseUsage|Usage by phase|phases-ws"),
+            re.compile(r"exec-phases|phaseUsage|Usage by phase|phases-ws|phases-all"),
             re.compile(r"never phases|phase-sequence|phase sequence|\"phases\" misleads|same groups and phases|"
                        r"phases strip from /api/project|Phases strip from /api/project|mockup order: phases"),
             re.compile(r"From project\.json|No phases listed|its phases|\"Phases\"|\|\| \"Phase\""),

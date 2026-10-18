@@ -1,18 +1,23 @@
 /* Page card: Planning versus execution (?view=project, slot exec-phases;
-   compact variant on the workstream execution tab).
-   The project card paints GET /api/project/phases (../fixtures/phases.json
-   under ?fixtures): stacked horizontal bars per workstream with
-   kind-of-work colours, a tokens/cost toggle, scope tabs, totals, and a
-   plain-words takeaway. Clicking a workstream opens its tab. The
-   workstream card paints the same payload for the open tab: a lifetime
-   split bar plus cumulative cost by kind of work over time, so the
-   planning spend reads as a line that flattens when planning ends.
-   Unclassified is its own grey bucket, never merged.
+   the all-workstreams variant on the overall Execution view; the
+   workstream variant as the last section of each workstream Execution
+   tab, below Finished).
+   The project and overall cards paint GET /api/project/phases
+   (../fixtures/phases.json under ?fixtures): stacked horizontal bars per
+   workstream with kind-of-work colours, a tokens/cost toggle, scope tabs,
+   totals, and a plain-words takeaway, sorted by total descending.
+   Clicking a workstream opens its tab. The workstream card paints the
+   same payload for the open tab: per-day stacked columns by kind of
+   work (planning, execution, review, coordination, unclassified grey)
+   with a Cost | Tokens toggle and a Per day | Cumulative toggle
+   (per-day stacked bars by default, the cumulative lines behind the
+   toggle), so the planning spend reads as a line that flattens when
+   planning ends. Unclassified is its own grey bucket, never merged.
    Reads: state.phaseUsage (per scope), state.phaseUsageError,
    state.phaseUsageAt, state.view, state.ws, state.wss/wssAll.
    Exports (on window.AdPage.cards, also kept as plain globals):
-   phaseUsageSpec, phaseUsageCard, phaseUsageWsSpec, phaseUsageWsCard,
-   phaseBar, phaseShares, cumSum.
+   phaseUsageSpec, phaseUsageCard, phaseUsageAllSpec, phaseUsageWsSpec,
+   phaseUsageWsCard, phaseBar, phaseShares, cumSum, phaseStackDays.
    Needs: el, s, CW, axes, niceMax, fmtN, fmtUsd, showTip, hideTip,
    keyOf, drawMain, api, go, secCache, state (plain globals). */
 (function (global) {
@@ -52,6 +57,56 @@
     for (i = 0; i < (values || []).length; i++) { running += (+values[i] || 0); out.push(running); }
     return out;
   }
+
+  /* Pure: per-day stacks for one workstream item. Each day becomes one
+     column with one segment per kind of work in PHASES order
+     (unclassified last): {phase, value, y0, y1, share}. Empty days keep
+     zero totals and zero offsets instead of dividing by zero. The
+     optional range ({since, until} in unix seconds) filters days, so a
+     shared time filter can pass through without this file depending on
+     its module. */
+  function phaseStackDays(item, metric, range) {
+    var days = (item && item.days) || [];
+    var series = (item && item.series) || {};
+    var key = metric === "cost" ? "cost" : "tokens";
+    var out = [], max = 0, grand = 0, i, p;
+    for (i = 0; i < days.length; i++) {
+      if (range && range.since != null && +days[i] < +range.since) continue;
+      if (range && range.until != null && +days[i] > +range.until) continue;
+      var total = 0, vals = [];
+      for (p = 0; p < PHASES.length; p++) {
+        var arr = ((series[PHASES[p]] || {})[key]) || [];
+        var v = +arr[i] || 0;
+        vals.push(v);
+        total += v;
+      }
+      var segs = [], y0 = 0;
+      for (p = 0; p < PHASES.length; p++) {
+        var value = vals[p];
+        segs.push({phase: PHASES[p], value: value, y0: y0, y1: y0 + value,
+          share: total > 0 ? value / total : 0});
+        y0 += value;
+      }
+      out.push({day: days[i], total: total, segs: segs});
+      if (total > max) max = total;
+      grand += total;
+    }
+    return {days: out.map(function (d) { return d.day; }), stacks: out, max: max, grand: grand};
+  }
+
+  /* Pure: workstream rows sorted by their total under a metric,
+     descending. Zero-total rows sink to the end in stable order. */
+  function phaseSortByTotal(items, metric) {
+    var scored = (items || []).map(function (item, idx) {
+      var sum = 0;
+      PHASES.forEach(function (ph) { sum += phaseValue((item.by_phase || {})[ph], metric); });
+      return {item: item, total: sum, idx: idx};
+    });
+    scored.sort(function (a, b) { return (b.total - a.total) || (a.idx - b.idx); });
+    return scored.map(function (s) { return s.item; });
+  }
+
+  var phaseWsView = "bars";
 
   /* Exact integers with thousand separators and exact dollars, without
      locale formatting (page rule: compact fmt helpers for axes, exact
@@ -101,6 +156,8 @@
   function phaseRedraw() {
     try { delete secCache["exec-phases"]; } catch (e) {}
     try { delete secCache["phases-ws"]; } catch (e) {}
+    try { delete secCache["phases"]; } catch (e) {}
+    try { delete secCache["phases-all"]; } catch (e) {}
     drawMain();
   }
 
@@ -239,7 +296,7 @@
       c.appendChild(el("div", {class: "empty", text: "Loading planning versus execution\u2026"}));
       return c;
     }
-    var items = (data.workstreams || []).filter(function (w) { return w.ws !== "Other"; });
+    var items = phaseSortByTotal((data.workstreams || []).filter(function (w) { return w.ws !== "Other"; }), phaseMetric);
     var other = (data.workstreams || []).filter(function (w) { return w.ws === "Other"; })[0];
     var grandCells = PHASES.map(function (ph) {
       var sum = 0;
@@ -280,6 +337,13 @@
   /* Registry spec for the Project home slot exec-phases. */
   function phaseUsageSpec(passedState, snap) {
     return ["phases", keyOf([state.phaseUsage, state.phaseUsageError, state.seq, phaseScope, phaseMetric]), function () { return phaseUsageCard(); }, ""];
+  }
+
+  /* Registry spec for the overall Execution view (all workstreams): the
+     same stacked bars as the Project home card, as its own bottom
+     section below Finished. */
+  function phaseUsageAllSpec(passedState, snap) {
+    return ["phases-all", keyOf([state.phaseUsage, state.phaseUsageError, state.seq, phaseScope, phaseMetric]), function () { return phaseUsageCard(); }, "margin-top:14px"];
   }
 
   /* Thin two-segment bar for a management table row: planning versus
@@ -326,37 +390,42 @@
     return d.getUTCFullYear() + "-" + (m < 10 ? "0" + m : m) + "-" + (day < 10 ? "0" + day : day);
   }
 
-  /* Cumulative cost by kind of work over time for one workstream: one
-     line per kind with spend, planning first so the planning line
-     flattening reads as planning ending. */
-  function phaseCumulative(host, item) {
+  /* Cumulative lines by kind of work over time for one workstream, behind
+     the Cumulative toggle: one line per kind with spend (cost or tokens
+     via metric), planning first so the planning line flattening reads
+     as planning ending. */
+  function phaseCumulative(host, item, metric) {
+    var m = metric === "tokens" ? "tokens" : "cost";
+    var cumKey = m === "cost" ? "cumulative_cost" : "cumulative_tokens";
     var days = item.days || [];
     if (!days.length) return false;
     var order = PHASES.filter(function (ph) {
-      var cum = ((item.series || {})[ph] || {}).cumulative_cost || [];
+      var cum = ((item.series || {})[ph] || {})[cumKey] || [];
       return cum.length && cum[cum.length - 1] > 0;
     });
     if (!order.length) return false;
     var peak = 0;
     order.forEach(function (ph) {
-      ((item.series || {})[ph].cumulative_cost || []).forEach(function (v) { if (v > peak) peak = v; });
+      ((item.series || {})[ph][cumKey] || []).forEach(function (v) { if (v > peak) peak = v; });
     });
     var nice = niceMax(peak);
+    var yFmt = m === "cost" ? fmtUsd : fmtN;
+    var exact = m === "cost" ? phaseExactUsd : function (v) { return phaseExact(v) + " tokens"; };
     var W = CW(), H = 240, L = 64, R = 14, T = 24, Bm = 44;
     var pw = W - L - R, ph = H - T - Bm;
     var n = Math.max(1, days.length);
     var X = function (t) { return L + ((t - days[0]) / 86400) * (pw / n) + (pw / n) / 2; };
     var Y = function (v) { return T + ph - v / nice * ph; };
     var svg = s("svg", {viewBox: "0 0 " + W + " " + H, width: W, height: H, style: "display:block;max-width:100%", role: "img",
-      "aria-label": "Cumulative cost by kind of work over time for " + wsLabel(item.ws, item.name)});
+      "aria-label": "Cumulative " + m + " by kind of work over time for " + wsLabel(item.ws, item.name)});
     order.forEach(function (phase) {
-      var cum = item.series[phase].cumulative_cost || [];
+      var cum = item.series[phase][cumKey] || [];
       var line = cum.map(function (v, i) { return X(days[i]) + "," + Y(v); }).join(" ");
       svg.appendChild(s("polyline", {points: line, fill: "none", stroke: PHASE_COLOR[phase], "stroke-width": "2.2", "data-key": phase, "data-v": String(cum.length ? cum[cum.length - 1] : 0)}));
       var last = cum.length ? cum[cum.length - 1] : 0;
       var dot = s("circle", {cx: X(days[days.length - 1]), cy: Y(last), r: "3.5", fill: PHASE_COLOR[phase], "data-key": phase, "data-v": String(last)});
       dot.addEventListener("mousemove", function (ev) {
-        showTip(ev, PHASE_GLYPH[phase] + " " + PHASE_WORD[phase], [{k: "Cumulative", v: phaseExactUsd(last), c: PHASE_COLOR[phase]}]);
+        showTip(ev, PHASE_GLYPH[phase] + " " + PHASE_WORD[phase], [{k: "Cumulative", v: exact(last), c: PHASE_COLOR[phase]}]);
       });
       dot.addEventListener("mouseleave", hideTip);
       svg.appendChild(dot);
@@ -369,33 +438,132 @@
       xt.push({x: X(days[i]) + (i === 0 ? 4 : lastTick ? -4 : 0),
         label: phaseDay(days[i]), anchor: i === 0 ? "start" : lastTick ? "end" : "middle"});
     }
-    var axg = axes(svg, {L: L, T: T, pw: pw, ph: ph, yMax: nice, yTicks: 4, yFmt: fmtUsd, xTicks: xt, yTitle: "USD cumulative", xTitle: "UTC day"});
+    var axg = axes(svg, {L: L, T: T, pw: pw, ph: ph, yMax: nice, yTicks: 4, yFmt: yFmt, xTicks: xt, yTitle: m === "cost" ? "USD cumulative" : "tokens cumulative", xTitle: "UTC day"});
     svg.insertBefore(axg, svg.firstChild);
     host.appendChild(svg);
     return true;
   }
 
-  /* Compact variant for the workstream tab: the lifetime split bar from
-     the tab row plus the cumulative cost chart from the shared payload. */
-  function phaseUsageWsCard() {
+  /* Per-day stacked columns for one workstream: one column per UTC day,
+     one rect segment per kind of work from the by-day series. The shared
+     axes() helper draws both axes; compact formatters label them while
+     tooltips carry exact values. Totals label the last few bars. */
+  function phaseStackedBars(host, item, metric, range) {
+    var m = metric === "tokens" ? "tokens" : "cost";
+    var stacked = phaseStackDays(item, m, range);
+    if (!stacked.stacks.length || !(stacked.grand > 0)) return false;
+    var label = wsLabel(item.ws, item.name);
+    var yFmt = m === "cost" ? fmtUsd : fmtN;
+    var nice = niceMax(stacked.max);
+    var W = CW(), H = 280, L = 64, R = 14, T = 30, Bm = 44;
+    var pw = W - L - R, ph = H - T - Bm;
+    var n = stacked.stacks.length;
+    var slot = pw / Math.max(1, n), bw = Math.max(3, Math.min(28, slot - 4));
+    var GAP = 2;
+    var X = function (i) { return L + i * slot + (slot - bw) / 2; };
+    var Y = function (v) { return T + ph - v / nice * ph; };
+    var unit = m === "cost" ? "cost" : "tokens";
+    var svg = s("svg", {viewBox: "0 0 " + W + " " + H, width: W, height: H, style: "display:block;max-width:100%", role: "img",
+      "aria-label": "Per-day " + unit + " stacked by kind of work for " + label + ": " + phaseFmt(m, stacked.grand) + " total"});
+    stacked.stacks.forEach(function (col, i) {
+      var x = X(i), y0 = T + ph;
+      var order = [];
+      col.segs.forEach(function (sg, ki) { if (sg.value > 0) order.push(ki); });
+      col.segs.forEach(function (sg, ki) {
+        if (!(sg.value > 0)) return;
+        var h = ph * sg.value / nice, top = Y(sg.y1);
+        var gap = ki !== order[0] ? GAP : 0;
+        var y = top + gap, hh = h - gap;
+        if (hh < 0) { hh = 0; y = y0; }
+        var r = s("rect", {x: x, y: y, width: bw, height: Math.max(hh, 0.4), fill: PHASE_COLOR[sg.phase],
+          "data-key": sg.phase, "data-v": String(sg.value), "data-t": String(col.day)});
+        svg.appendChild(r); y0 = top;
+      });
+      var pct = function (sg) { return col.total > 0 ? Math.round(sg.value / col.total * 1000) / 10 : 0; };
+      var tipRows = col.segs.filter(function (sg) { return sg.value > 0; }).map(function (sg) {
+        return {k: PHASE_GLYPH[sg.phase] + " " + PHASE_WORD[sg.phase] + " " + pct(sg) + "%",
+          v: phaseExactFmt(m, sg.value), c: PHASE_COLOR[sg.phase]};
+      });
+      tipRows.push({k: "Total", v: phaseExactFmt(m, col.total), c: "var(--ink)"});
+      var hit = s("rect", {x: x - 1, y: T, width: bw + 2, height: ph, fill: "transparent",
+        "data-t": String(col.day), "data-v": String(col.total)});
+      hit.addEventListener("mousemove", function (ev) {
+        showTip(ev, label + " \u00B7 " + phaseDay(col.day), tipRows);
+      });
+      hit.addEventListener("mouseleave", hideTip);
+      svg.appendChild(hit);
+    });
+    /* Visible totals above the last few non-empty bars. */
+    var labelled = 0;
+    for (var li = stacked.stacks.length - 1; li >= 0 && labelled < 3; li--) {
+      var colL = stacked.stacks[li];
+      if (!(colL.total > 0)) continue;
+      var topY = Y(colL.total), cx = X(li) + bw / 2;
+      var t = s("text", {x: cx, y: Math.max(topY - 5, 10), "text-anchor": "middle", class: "vallab"});
+      t.textContent = phaseFmt(m, colL.total);
+      svg.appendChild(t);
+      labelled++;
+    }
+    var maxTicks = Math.max(2, Math.floor(pw / 70));
+    var step = Math.max(1, Math.ceil(n / maxTicks));
+    var xt = [];
+    for (var xi = 0; xi < n; xi += step) {
+      var isLast = xi + step >= n;
+      xt.push({x: X(xi) + bw / 2 + (xi === 0 ? 4 : isLast ? -4 : 0),
+        label: phaseDay(stacked.stacks[xi].day), anchor: xi === 0 ? "start" : isLast ? "end" : "middle"});
+    }
+    var axg = axes(svg, {L: L, T: T, pw: pw, ph: ph, yMax: nice, yTicks: 4, yFmt: yFmt,
+      xTicks: xt, yTitle: m === "cost" ? "USD per day" : "tokens per day", xTitle: "UTC day"});
+    svg.insertBefore(axg, svg.firstChild);
+    host.appendChild(svg);
+    return true;
+  }
+
+  /* Plain-words takeaway for one workstream: which kind of work took
+     most of its cost or tokens. Names first, never bare ids. */
+  function phaseWsTakeaway(label, item, metric) {
+    var cells = PHASES.map(function (ph) { return {phase: ph, value: phaseValue((item.by_phase || {})[ph], metric)}; });
+    var lead = {phase: "unclassified", value: 0};
+    cells.forEach(function (c) { if (c.value > lead.value) lead = c; });
+    if (!(lead.value > 0)) return null;
+    var unit = metric === "cost" ? "cost" : "tokens";
+    if (lead.phase === "unclassified")
+      return "Most of " + label + "\u2019s " + unit + " could not be split by label \u2014 it reads Unclassified.";
+    return "Most of " + label + "\u2019s " + unit + " went to " + PHASE_WORD[lead.phase].toLowerCase() + ".";
+  }
+
+  /* Metric toggle shared by the workstream card (Cost | Tokens). */
+  function phaseWsMetricTabs(host) {
+    var met = el("div", {class: "seg-ctl phase-tabs", role: "group", "aria-label": "Usage measure"});
+    [["tokens", "Tokens"], ["cost", "Cost"]].forEach(function (t) {
+      met.appendChild(el("button", {type: "button", "aria-pressed": String(phaseMetric === t[0]), onclick: function () { phaseMetric = t[0]; phaseRedraw(); }}, [t[1]]));
+    });
+    host.appendChild(met);
+    var view = el("div", {class: "seg-ctl phase-tabs", role: "group", "aria-label": "Usage view"});
+    [["bars", "Per day"], ["lines", "Cumulative"]].forEach(function (t) {
+      view.appendChild(el("button", {type: "button", "aria-pressed": String(phaseWsView === t[0]), onclick: function () { phaseWsView = t[0]; phaseRedraw(); }}, [t[1]]));
+    });
+    host.appendChild(view);
+  }
+
+  /* Last section of the workstream Execution tab: per-day stacked columns
+     by kind of work (default) with the cumulative lines behind a small
+     toggle. The optional range ({since, until}) lets a shared time
+     filter narrow the days without this file depending on its module. */
+  function phaseUsageWsCard(range) {
     var row = wsRow();
     var c = el("div", {class: "card phase-usage phase-ws", "data-nav": "Planning versus execution"});
     c.appendChild(el("h2", {text: "Planning versus execution"}));
+    c.appendChild(el("p", {class: "sub", text: "Per-day split by kind of work for this workstream."}));
+    phaseWsMetricTabs(c);
     if (!row) {
       c.appendChild(el("div", {class: "empty", text: "No workstream selected."}));
       return c;
     }
     var label = wsLabel(row.ws, row.name);
-    var bar = row.by_phase ? phaseBar(row.by_phase) : null;
-    if (bar) {
-      var wrap = el("div", {class: "ph-wsbar"});
-      wrap.appendChild(bar);
-      wrap.appendChild(el("span", {class: "ph-wsnote", text: "Lifetime tokens: planning in blue, execution in green."}));
-      c.appendChild(wrap);
-    }
     var data = phasePayloadFor("all");
     if (state.phaseUsageError && !data) {
-      c.appendChild(el("div", {class: "empty err", text: "request failed \u2014 " + state.phaseUsageError}));
+      c.appendChild(el("div", {class: "empty err", "data-failed-scope": "workstream", text: "request failed \u2014 " + state.phaseUsageError}));
       return c;
     }
     if (!data) {
@@ -411,20 +579,31 @@
       c.appendChild(el("div", {class: "empty", text: "No usage recorded for " + label + " yet."}));
       return c;
     }
-    var cells = PHASES.map(function (ph) { return {phase: ph, value: phaseValue((item.by_phase || {})[ph], "cost")}; });
-    phaseLegend(c, cells, "cost");
-    if (!phaseCumulative(c, item)) {
-      c.appendChild(el("div", {class: "empty", text: "No cumulative cost yet for " + label + "."}));
+    var cells = PHASES.map(function (ph) { return {phase: ph, value: phaseValue((item.by_phase || {})[ph], phaseMetric)}; });
+    phaseLegend(c, cells, phaseMetric);
+    if (phaseWsView === "lines") {
+      if (!phaseCumulative(c, item, phaseMetric)) {
+        c.appendChild(el("div", {class: "empty", text: "No cumulative " + (phaseMetric === "cost" ? "cost" : "tokens") + " yet for " + label + "."}));
+      } else {
+        c.appendChild(el("p", {class: "ph-foot", text: "Cumulative " + (phaseMetric === "cost" ? "cost" : "tokens") + " by kind of work \u2014 a flattening line means that kind stopped spending."}));
+      }
     } else {
-      c.appendChild(el("p", {class: "ph-foot", text: "Cumulative cost by kind of work \u2014 a flattening line means that kind of work stopped spending."}));
+      if (!phaseStackedBars(c, item, phaseMetric, range)) {
+        c.appendChild(el("div", {class: "empty", text: "No usage recorded for " + label + " yet."}));
+      } else {
+        c.appendChild(el("p", {class: "ph-foot", text: "Stacked columns per day \u2014 each segment is one kind of work."}));
+      }
     }
+    var take = phaseWsTakeaway(label, item, phaseMetric);
+    if (take) c.appendChild(el("p", {class: "ph-takeaway", text: take}));
     return c;
   }
 
-  /* Registry spec for the workstream tab, near the top. */
+  /* Registry spec for the workstream tab, as the last section below
+     Finished (and its pager). */
   function phaseUsageWsSpec(passedState, snap) {
     var row = wsRow();
-    return ["phases-ws", keyOf([state.ws, row && row.by_phase, state.phaseUsage, state.phaseUsageError, state.seq]), function () { return phaseUsageWsCard(); }, ""];
+    return ["phases-ws", keyOf([state.ws, row && row.by_phase, state.phaseUsage, state.phaseUsageError, state.seq, phaseMetric, phaseWsView]), function () { return phaseUsageWsCard(); }, "margin-top:14px"];
   }
 
   var AdPage = (global.AdPage = global.AdPage || {});
@@ -433,12 +612,17 @@
   AdPage.cards.phaseUsageWs = phaseUsageWsCard;
   AdPage.cards.phaseShares = phaseShares;
   AdPage.cards.cumSum = cumSum;
+  AdPage.cards.phaseStackDays = phaseStackDays;
+  AdPage.cards.phaseSortByTotal = phaseSortByTotal;
+  AdPage.cards.phaseWsTakeaway = phaseWsTakeaway;
   global.phaseUsageSpec = phaseUsageSpec;
   global.phaseUsageCard = phaseUsageCard;
+  global.phaseUsageAllSpec = phaseUsageAllSpec;
   global.phaseUsageWsSpec = phaseUsageWsSpec;
   global.phaseUsageWsCard = phaseUsageWsCard;
   global.phaseBar = phaseBar;
   global.phaseShares = phaseShares;
   global.cumSum = cumSum;
+  global.phaseStackDays = phaseStackDays;
 })(window);
 

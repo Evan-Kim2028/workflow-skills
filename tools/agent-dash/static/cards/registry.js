@@ -91,15 +91,20 @@
     }},
     /* Planning versus execution: the project card paints the
        per-workstream stacked bars (slot exec-phases, right after
-       burn-up); the compact variant sits near the top of each
-       workstream execution tab. */
+       burn-up); the workstream and overall variants sit at the bottom
+       of their Execution views, below Finished (and its pager), as
+       stacked bars by kind of work. */
     {id: "phases", order: 51, scope: "project", slot: "exec-phases", spec: function (state, snap) {
       if (typeof phaseUsageSpec !== "function") return null;
       return phaseUsageSpec(state, snap);
     }},
-    {id: "phases-ws", order: 8, scope: "workstream", spec: function (state, snap) {
+    {id: "phases-ws", order: 100, scope: "workstream", spec: function (state, snap) {
       if (typeof phaseUsageWsSpec !== "function") return null;
       return phaseUsageWsSpec(state, snap);
+    }},
+    {id: "phases-all", order: 100, scope: "overview", spec: function (state, snap) {
+      if (typeof phaseUsageAllSpec !== "function") return null;
+      return phaseUsageAllSpec(state, snap);
     }}
   ];
 })(window);

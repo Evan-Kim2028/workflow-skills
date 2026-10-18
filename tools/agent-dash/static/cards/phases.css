@@ -1,5 +1,6 @@
 /* Planning-versus-execution card: stacked bars per workstream, legend,
-   takeaway, cumulative chart, and the thin management-table bar. */
+   takeaway, per-day stacked columns, cumulative lines, and the thin
+   management-table bar. */
 .phase-usage .phase-tabs { display: inline-flex; margin: 0 12px 4px 0; }
 .phase-legend .lhead { font-weight: 600; margin-right: 4px; }
 .ph-list { display: flex; flex-direction: column; gap: 10px; margin-top: 10px; }
@@ -17,6 +18,13 @@
 .ph-wsbar { display: flex; align-items: center; gap: 10px; margin: 8px 0 4px; }
 .ph-wsbar .mg-phase { flex: 1; max-width: none; }
 .ph-wsnote { font-size: var(--fs-sub); color: var(--ink-2); white-space: nowrap; }
+.phase-usage svg { display: block; max-width: 100%; }
+.phase-usage svg text { fill: var(--ink-2); font-size: 11px; }
+.phase-usage svg text.vallab { fill: var(--ink-2); font-size: 11px; }
+.phase-usage svg text.peaklab { fill: var(--ink); font-size: 11px; font-weight: 600; }
+.phase-usage svg .gl { stroke: var(--line); stroke-width: 1; opacity: 0.5; }
+.phase-usage svg .bl { stroke: var(--line); stroke-width: 1; }
+.phase-usage svg .axt { fill: var(--muted); font-size: 11px; }
 /* Thin two-segment bar in management table rows: planning vs execution
    share of lifetime tokens; the tooltip names every phase. */
 .mg-phase { display: flex; height: 5px; border-radius: 3px; overflow: hidden; background: var(--raised); margin-top: 4px; max-width: 220px; }
@@ -27,6 +35,8 @@
   .ph-name { overflow: hidden; text-overflow: ellipsis; }
   .ph-wsnote { white-space: normal; }
   .phase-usage .phase-tabs { margin-bottom: 8px; }
+  .phase-usage svg text { font-size: 10px; }
+  .phase-ws .sub { font-size: var(--fs-sub); }
 }
 @media (prefers-reduced-motion: reduce) {
   .ph-seg:hover { filter: none; }
