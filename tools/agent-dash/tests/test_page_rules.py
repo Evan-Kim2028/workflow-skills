@@ -2990,6 +2990,7 @@ class FinalPolishTests(unittest.TestCase):
             re.compile(r"phases-(wrap|cap|line)"),
             re.compile(r'"phase"|pj-phase'),
             re.compile(r"phasesSection|project-phases"),
+            re.compile(r"exec-phases|phaseUsage|Usage by phase|phases-ws"),
             re.compile(r"never phases|phase-sequence|phase sequence|\"phases\" misleads|same groups and phases|"
                        r"phases strip from /api/project|Phases strip from /api/project|mockup order: phases"),
             re.compile(r"From project\.json|No phases listed|its phases|\"Phases\"|\|\| \"Phase\""),
