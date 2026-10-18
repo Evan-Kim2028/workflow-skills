@@ -239,6 +239,57 @@ class StoreTest(unittest.TestCase):
         self.assertEqual(buckets[0]["key"], "glm")
         self.assertIsNone(buckets[0]["cost_usd"])
 
+    def test_zero_token_unpriced_model_is_ignored(self):
+        def add(model, message, tokens):
+            self.store.add_usage(
+                {
+                    "ts": 1,
+                    "session_id": "s-synth",
+                    "run_id": "claude-main:s-synth:marker",
+                    "model": model,
+                    "tool": "claude",
+                    "message_id": message,
+                    "input": tokens,
+                    "output": 0,
+                    "cache_read": 0,
+                    "cache_write": 0,
+                    "reasoning": 0,
+                }
+            )
+
+        add("<synthetic>", "m-zero", 0)
+        self.assertEqual(self.store.unpriced_models(10, 0, 100), [])
+        snap = self.store.snapshot(10)
+        self.assertEqual(snap["totals"]["unpriced_models"], [])
+        self.assertEqual(snap["totals"]["unpriced_tokens"], 0)
+
+        add("<synthetic>", "m-one", 1)
+        self.assertEqual(
+            self.store.unpriced_models(10, 0, 100),
+            [{"model": "<synthetic>", "rows": 2, "tokens": 1}],
+        )
+        snap = self.store.snapshot(10)
+        self.assertEqual(snap["totals"]["unpriced_models"], ["<synthetic>"])
+        self.assertEqual(snap["totals"]["unpriced_tokens"], 1)
+
+    def test_priced_model_never_unpriced(self):
+        self.store.add_usage(
+            {
+                "ts": 1,
+                "session_id": "s-priced",
+                "run_id": "claude-main:s-priced:r",
+                "model": "claude-sonnet-5-5",
+                "tool": "claude",
+                "message_id": "m-priced",
+                "input": 5,
+                "output": 0,
+                "cache_read": 0,
+                "cache_write": 0,
+                "reasoning": 0,
+            }
+        )
+        self.assertEqual(self.store.unpriced_models(10, 0, 100), [])
+
     def test_missing_field_nulls_cost(self):
         self.store.upsert_run(
             {

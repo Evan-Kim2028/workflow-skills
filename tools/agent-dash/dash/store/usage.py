@@ -296,13 +296,15 @@ class UsageMixin:
             until: float | None = None,
             ws: str | None = None,
         ) -> list[dict]:
-            """Models with usage rows in the window and no catalog rate.
+            """Models with billed tokens in the window and no catalog rate.
 
             One entry per model: ``{"model", "rows", "tokens"}``, sorted by
             model. A missing rate never becomes zero: these tokens are left
             out of cost, and health, reconcile, and the cost tile say so
-            loudly. Rows with no model id are skipped (data quality, not a
-            price gap).
+            loudly. A model whose windowed rows carry zero billed tokens
+            (Claude Code's ``<synthetic>`` interrupt and error markers) is
+            not a price gap and is left out. Rows with no model id are
+            skipped (data quality, not a price gap).
             """
             range_since = now - RANGE_S if since is None else float(since)
             range_until = float(now if until is None else until)
@@ -328,7 +330,8 @@ class UsageMixin:
                 model = row["model"]
                 if not model:
                     continue
-                if int(row["rows"] or 0) <= 0:
+                tokens = int(row["tokens"] or 0)
+                if tokens <= 0:
                     continue
                 if price_status(model)["priced"]:
                     continue
@@ -336,7 +339,7 @@ class UsageMixin:
                     {
                         "model": model,
                         "rows": int(row["rows"]),
-                        "tokens": int(row["tokens"] or 0),
+                        "tokens": tokens,
                     }
                 )
             out.sort(key=lambda entry: entry["model"])
