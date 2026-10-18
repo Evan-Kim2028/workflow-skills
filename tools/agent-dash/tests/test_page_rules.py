@@ -239,6 +239,9 @@ assert.strictEqual(fmtPct(0.6233), "62%");
 assert.strictEqual(fmtPct(0.043), "4.3%");
 assert.strictEqual(fmtBytes(950), "950 B");
 assert.strictEqual(fmtBytes(1234567), "1.2 MB");
+assert.strictEqual(fmtBytes(0), "0 B");
+assert.strictEqual(fmtBytes(null), "–");
+assert.strictEqual(fmtBytes(undefined), "–");
 assert.strictEqual(W.actLegendTip("Claude", 123456789), "Claude 123.5M tokens");
 assert.strictEqual(W.planColbarTip(123456, 789012), "123.5K of 789K done in this section");
 assert.strictEqual(W.swCountAria(123456), "Switch workstream, 123.5K open workstreams. Shortcut: slash.");
@@ -306,6 +309,17 @@ console.log("hover builders proof ok: " + seen.length + " strings compact");
         )
         self.assertEqual(proc.returncode, 0, proc.stderr or proc.stdout)
         self.assertIn("hover builders proof ok", proc.stdout)
+
+    def test_drawer_bytes_use_fmt_bytes(self):
+        """Run-details byte rows go through fmtBytes ("950 B", "1.2 MB",
+        "–" when unknown), never fmtN with a glued-on "B" ("-B")."""
+        drawer = (STATIC / "core" / "drawer.js").read_text()
+        self.assertNotIn('+ "B"', drawer, "the drawer still glues a B onto a count")
+        for marker in ('["Output", fmtBytes(r.out_bytes)',
+                        '["Errors", fmtBytes(r.err_bytes)',
+                        'fmtBytes(r.rss_kb * 1024)'):
+            self.assertIn(marker, drawer, f"the drawer lost its byte formatter: {marker}")
+        self.assertIn("fmtBytes", drawer[:1500], "drawer.js no longer declares its fmtBytes need")
 
     def test_progress_comes_from_the_server(self):
         """Plan % done is computed once on the server. The pages read
