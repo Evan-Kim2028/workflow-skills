@@ -160,6 +160,7 @@ PATHS = [
     "/api/workstreams?state=all",
     "/api/project/graph",
     "/api/archive",
+    "/api/project/timeline",
     "/api/reconcile?hours=24",
     "/api/plan?ws=WS1",
     "/api/replay?ws=WS1",

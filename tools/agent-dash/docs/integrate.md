@@ -428,6 +428,17 @@ One file plus one registry line. Put the renderer in a new IIFE file under `stat
 {id: "burnup-plan", order: 55, scope: "planned", slot: "exec-roadmap", spec: burnupSpec},
 ```
 
+The live example is the roadmap swimlane (`static/cards/roadmap.js`, fed by
+`GET /api/project/timeline` from `dash/projecttimeline.py`). Its card file
+fetches its own endpoint (or `../fixtures/timeline.json` under `?fixtures`)
+with a 30 s stale-while-refresh, so the shared refresh paths stay untouched;
+a failed fetch renders "request failed", never zeros. A new endpoint module
+stays pure — plain data in, JSON out — with a small `collect(store, now)`
+the server hook calls, builder tests in `tests/test_projecttimeline.py`,
+endpoint tests in `tests/test_server.py`, a `timeline.json` writer in
+`fixtures/make_fixtures.py`, and the endpoint path added to
+`tests/test_privacy_pin.py` (names and numbers only, never bodies or paths).
+
 `spec` returns one `applySections` spec `[name, key, render, style]`, or null when the card does not apply. Keep the two-space `function name(` indent: `tests/test_page_rules.py` splits the logical script (core + cards in tag order + inline) on it. The `needs.js` card is the worked example for the project scope: registered once (`scope: "project"`), rendered beside Recently done. New views obey `DESIGN.md`: status as colour plus symbol plus word, numbers through the `fmt` helpers only, hover tooltips, axes on charts (the shared `axes()` helper).
 
 ### Server-fed project cards (feed, decisions)

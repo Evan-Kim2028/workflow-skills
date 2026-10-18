@@ -62,6 +62,7 @@ RNG = random.Random(SEED)
 
 sys.path.insert(0, str(ROOT))
 from dash import taskmatch  # noqa: E402  (the shared run-to-task rule)
+from dash import projecttimeline as timeline_mod  # noqa: E402  (the roadmap lane builder)
 from dash import replay as replay_mod  # noqa: E402  (shared replay run entries and done moments)
 from dash import maplayout as maplayout_mod  # noqa: E402  (the shared map layout standard)
 
@@ -675,6 +676,48 @@ def _project(runs, now, plans):
     }
 
 
+def _timeline(runs, now, plans):
+    """Fixture mirror of GET /api/project/timeline: one lane per fixture
+    workstream from the seeded runs, plan progress, and the project block.
+    Fixture bundles carry no history files, so active lanes without seeded
+    runs read before_history and planned lanes read as estimates — the
+    same honesty rules as the live endpoint."""
+    bundles = []
+    for i, (code, name, _counts) in enumerate(BOARD):
+        bundles.append({
+            "id": code, "title": name, "short": code, "order": (i + 1) * 10,
+            "kind": "workstream", "state": WS_STATES.get(code, "active"),
+            "state_changed_at": now - 30 * 86400, "archived_at": None,
+            "depends_on": list(WS_DEPENDS.get(code, [])), "milestone": WS_MILESTONE.get(code),
+        })
+    usages = {}
+    for code, _name, _ in BOARD:
+        mine = [run for run in runs if run.get("workstream") == code]
+        starts = [run["started_at"] for run in mine if run.get("started_at") is not None]
+        stamps = []
+        for run in mine:
+            stamp = run.get("ended_at") if run.get("ended_at") is not None else run.get("started_at")
+            if stamp is not None:
+                stamps.append(stamp)
+        tokens = sum(run["tokens"][key] for run in mine for key in TOKEN_KEYS)
+        cost = sum(run["cost_usd"] for run in mine if run["cost_usd"] is not None)
+        usages[code] = {"runs": len(mine), "tokens": tokens, "cost": cost,
+                        "first_run_at": min(starts) if starts else None,
+                        "last_run_at": max(stamps) if stamps else None}
+    progresses = {}
+    for code, _name, _ in BOARD:
+        if code in plans:
+            progresses[code] = dict(plans[code]["progress"])
+        else:
+            progresses[code] = {"done": 0, "total": 0, "pct": 0}
+    project = _project(runs, now, plans)
+    doc = timeline_mod.build_timeline(
+        bundles, {}, progresses, usages,
+        {"started": project["started"], "target": project["target"], "phases": project["phases"]}, now)
+    doc["_note"] = NOTE
+    return doc
+
+
 def _archive(now, plans):
     """Fixture mirror of GET /api/archive: one frozen summary card per
     archived workstream, newest first, plus the archived lifetime share.
@@ -1092,6 +1135,7 @@ def main():
         "workstreams.json": _workstreams(runs, NOW, plans),
         "workstreams-all.json": _workstreams(runs, NOW, plans, scope="all"),
         "project.json": _project(runs, NOW, plans),
+        "timeline.json": _timeline(runs, NOW, plans),
         "archive.json": _archive(NOW, plans),
         "approvals.json": _approvals(),
         "decisions.json": _decisions(),

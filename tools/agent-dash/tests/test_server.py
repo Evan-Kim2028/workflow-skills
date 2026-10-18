@@ -2128,6 +2128,150 @@ class ProjectGraphApiTest(unittest.TestCase):
         self.assertNotIn(self.wsroot, text)
         self.assertNotIn(".md", text)
         self.assertNotIn("reports/", text)
+class TimelineEndpointTest(unittest.TestCase):
+    """GET /api/project/timeline: one lane per workstream from recorded evidence.
+    Synthetic bundles cover the lane shapes (WS41 planned with an unmet
+    dep, WS42 active with runs plus history, WS43 done via a state move,
+    WS44 active with no dates at all), each with priced runs in the store.
+    """
+    MODEL = "claude-sonnet-5-5"
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.now = time.time()
+        self.wsroot = os.path.join(self.tmp.name, "ws")
+        os.makedirs(self.wsroot)
+        bundles = {
+            "WS41": {"state": "planned", "depends_on": ["WS42"], "milestone": "Second wave"},
+            "WS42": {"state": "active"},
+            "WS43": {"state": "done"},
+            "WS44": {"state": "active"},
+        }
+        for ws, fields in bundles.items():
+            bundle = {"id": ws, "title": "Probe %s" % ws, "short": ws,
+                      "order": int(ws[2:]), "kind": "workstream"}
+            for key in ("state", "depends_on", "milestone"):
+                if key in fields:
+                    bundle[key] = fields[key]
+            bundle["state_changed_at"] = int(self.now) - 50
+            dest = os.path.join(self.wsroot, ws)
+            os.makedirs(dest)
+            with open(os.path.join(dest, "bundle.json"), "w") as fh:
+                json.dump(bundle, fh)
+        plans = {
+            "WS42": [("WS42.1", "done"), ("WS42.2", "todo")],
+            "WS43": [("WS43.1", "done")],
+        }
+        for ws, tasks in plans.items():
+            plan = {"dag": {"cols": ["Build"], "groups": [
+                {"id": "build", "col": 0, "title": "Build",
+                 "tasks": [{"id": tid, "title": "Probe %s" % tid, "status": status} for tid, status in tasks]}],
+                "edges": []}, "narrative": {}}
+            with open(os.path.join(self.wsroot, ws, "plan.json"), "w") as fh:
+                json.dump(plan, fh)
+        history = {
+            "WS42": [
+                {"ts": self.now - 4000, "task": "WS42.1", "from": "todo", "to": "done"},
+                {"ts": self.now - 3000, "task": "WS42.2", "from": "todo", "to": "wip"},
+            ],
+            "WS43": [
+                {"ts": self.now - 5000, "task": "WS43.1", "from": "todo", "to": "done"},
+                {"kind": "state", "ts": self.now - 200, "ws": "WS43", "from": "active", "to": "done"},
+            ],
+        }
+        for ws, rows in history.items():
+            with open(os.path.join(self.wsroot, ws, "history.jsonl"), "w") as fh:
+                for row in rows:
+                    fh.write(json.dumps(row) + "\n")
+        with open(os.path.join(self.wsroot, "project.json"), "w") as fh:
+            json.dump({"name": "Probe project", "started": "2025-10-01", "target": None,
+                       "phases": [{"title": "First wave", "state": "done"}]}, fh)
+        self._env = mock.patch.dict(os.environ, {"AGENT_DASH_WORKSTREAMS": self.wsroot})
+        self._env.start()
+        self.addCleanup(self._env.stop)
+        self._live = mock.patch("dash.server._live_workers", return_value=[])
+        self._live.start()
+        self.addCleanup(self._live.stop)
+        self.store = Store(Path(self.tmp.name) / "dash.sqlite")
+        runs = [
+            ("41", self.now - 5000, self.now - 4000),
+            ("42", self.now - 7200, self.now - 3600),
+            ("42b", self.now - 7100, self.now - 3500),
+            ("43", self.now - 9000, self.now - 8000),
+        ]
+        for num, started, ended in runs:
+            run_id = "muse:s%s:ws%s-probe" % (num, num)
+            self.store.upsert_run(
+                {
+                    "run_id": run_id,
+                    "source": "muse",
+                    "tier": "muse",
+                    "model": self.MODEL,
+                    "label": "ws%s-WS%s.1-probe" % (num, num),
+                    "session_id": "sess-%s" % num,
+                    "status": "done",
+                    "started_at": started,
+                    "ended_at": ended,
+                }
+            )
+            self.store.add_usage(
+                {
+                    "ts": ended - 10,
+                    "session_id": "sess-%s" % num,
+                    "run_id": run_id,
+                    "model": self.MODEL,
+                    "tool": "muse",
+                    "message_id": "m-%s" % run_id,
+                    "input": 1000,
+                    "output": 500,
+                    "cache_read": 0,
+                    "cache_write": 0,
+                }
+            )
+        self.server, self.thread = start(self.store)
+        self.port = self.server.server_address[1]
+    def tearDown(self):
+        stop(self.server, self.thread)
+        self.store.close()
+        self.tmp.cleanup()
+    def _payload(self):
+        status, ctype, body = get(self.port, "/api/project/timeline")
+        self.assertEqual(status, 200)
+        self.assertIn("application/json", ctype)
+        return json.loads(body)
+    def test_lanes_come_from_recorded_evidence(self):
+        payload = self._payload()
+        self.assertEqual(
+            payload["order"], ["WS43", "WS42", "WS44", "WS41"]
+        )
+        by_id = {lane["id"]: lane for lane in payload["lanes"]}
+        self.assertEqual(sorted(by_id), ["WS41", "WS42", "WS43", "WS44"])
+        active = by_id["WS42"]
+        self.assertEqual(active["started_at"], self.now - 7200)
+        self.assertIsNone(active["done_at"])
+        self.assertFalse(active["before_history"])
+        self.assertEqual(active["progress"], {"done": 1, "total": 2, "pct": 50})
+        self.assertEqual(active["runs"], 2)
+        self.assertEqual(active["tokens"], 3000)
+        done = by_id["WS43"]
+        self.assertEqual(done["done_at"], self.now - 200)
+        self.assertFalse(done["done_inferred"])
+        band = by_id["WS44"]
+        self.assertTrue(band["before_history"])
+        self.assertIsNone(band["started_at"])
+        planned = by_id["WS41"]
+        self.assertFalse(planned["before_history"])
+        self.assertEqual(planned["estimate_days"], 7)
+        self.assertEqual(planned["blocked_by"], ["WS42"])
+        self.assertEqual(planned["milestone"], "Second wave")
+        self.assertEqual(payload["history_floor"], self.now - 5000)
+        self.assertEqual(payload["project"]["started"], "2025-10-01")
+        self.assertIsNone(payload["project"]["target"])
+        self.assertEqual(payload["project"]["phases"], [{"title": "First wave", "state": "done"}])
+    def test_missing_project_file_falls_back_gracefully(self):
+        os.remove(os.path.join(self.wsroot, "project.json"))
+        payload = self._payload()
+        self.assertEqual(payload["project"], {"started": None, "target": None, "phases": []})
+        self.assertEqual(len(payload["lanes"]), 4)
 
 
 if __name__ == "__main__":

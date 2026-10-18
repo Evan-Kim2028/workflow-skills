@@ -1,0 +1,363 @@
+{
+  "now": 1761999960.0,
+  "project": {
+    "started": "2025-10-01",
+    "target": null,
+    "phases": [
+      {
+        "id": "wave-1",
+        "title": "First wave",
+        "summary": "Seeded lanes land.",
+        "gate": "All seeded checks pass.",
+        "state": "done"
+      },
+      {
+        "id": "wave-2",
+        "title": "Second wave",
+        "summary": "Planned lanes start.",
+        "gate": "Gates confirm and approvals land.",
+        "state": "active"
+      }
+    ]
+  },
+  "history_floor": null,
+  "lanes": [
+    {
+      "id": "WS0",
+      "title": "Stabilize",
+      "state": "active",
+      "group": "active",
+      "order": 10,
+      "started_at": null,
+      "last_active_at": null,
+      "done_at": null,
+      "done_inferred": false,
+      "archived_at": null,
+      "has_history": false,
+      "before_history": true,
+      "progress": {
+        "done": 0,
+        "total": 0,
+        "pct": 0
+      },
+      "milestone": null,
+      "depends_on": [],
+      "blocked_by": [],
+      "runs": 0,
+      "tokens": 0,
+      "cost_usd": 0.0,
+      "estimate_days": null
+    },
+    {
+      "id": "WS1",
+      "title": "Identity",
+      "state": "active",
+      "group": "active",
+      "order": 20,
+      "started_at": 1761978360.0,
+      "last_active_at": 1761999840.0,
+      "done_at": null,
+      "done_inferred": false,
+      "archived_at": null,
+      "has_history": false,
+      "before_history": false,
+      "progress": {
+        "done": 2,
+        "total": 5,
+        "pct": 40
+      },
+      "milestone": null,
+      "depends_on": [],
+      "blocked_by": [],
+      "runs": 60,
+      "tokens": 436889,
+      "cost_usd": 2.0176,
+      "estimate_days": null
+    },
+    {
+      "id": "WS2",
+      "title": "Public API",
+      "state": "done",
+      "group": "done",
+      "order": 30,
+      "started_at": 1761978360.0,
+      "last_active_at": 1761999840.0,
+      "done_at": null,
+      "done_inferred": false,
+      "archived_at": null,
+      "has_history": false,
+      "before_history": false,
+      "progress": {
+        "done": 5,
+        "total": 5,
+        "pct": 100
+      },
+      "milestone": null,
+      "depends_on": [],
+      "blocked_by": [],
+      "runs": 45,
+      "tokens": 360883,
+      "cost_usd": 0.4083,
+      "estimate_days": null
+    },
+    {
+      "id": "WS3",
+      "title": "Gateway",
+      "state": "active",
+      "group": "active",
+      "order": 40,
+      "started_at": null,
+      "last_active_at": null,
+      "done_at": null,
+      "done_inferred": false,
+      "archived_at": null,
+      "has_history": false,
+      "before_history": true,
+      "progress": {
+        "done": 0,
+        "total": 0,
+        "pct": 0
+      },
+      "milestone": null,
+      "depends_on": [],
+      "blocked_by": [],
+      "runs": 0,
+      "tokens": 0,
+      "cost_usd": 0.0,
+      "estimate_days": null
+    },
+    {
+      "id": "WS4",
+      "title": "Offers",
+      "state": "active",
+      "group": "active",
+      "order": 50,
+      "started_at": null,
+      "last_active_at": null,
+      "done_at": null,
+      "done_inferred": false,
+      "archived_at": null,
+      "has_history": false,
+      "before_history": true,
+      "progress": {
+        "done": 0,
+        "total": 0,
+        "pct": 0
+      },
+      "milestone": null,
+      "depends_on": [],
+      "blocked_by": [],
+      "runs": 0,
+      "tokens": 0,
+      "cost_usd": 0.0,
+      "estimate_days": null
+    },
+    {
+      "id": "WS5",
+      "title": "Clients",
+      "state": "paused",
+      "group": "active",
+      "order": 60,
+      "started_at": null,
+      "last_active_at": null,
+      "done_at": null,
+      "done_inferred": false,
+      "archived_at": null,
+      "has_history": false,
+      "before_history": true,
+      "progress": {
+        "done": 0,
+        "total": 0,
+        "pct": 0
+      },
+      "milestone": null,
+      "depends_on": [],
+      "blocked_by": [],
+      "runs": 0,
+      "tokens": 0,
+      "cost_usd": 0.0,
+      "estimate_days": null
+    },
+    {
+      "id": "WS6",
+      "title": "Cleanup",
+      "state": "active",
+      "group": "active",
+      "order": 70,
+      "started_at": null,
+      "last_active_at": null,
+      "done_at": null,
+      "done_inferred": false,
+      "archived_at": null,
+      "has_history": false,
+      "before_history": true,
+      "progress": {
+        "done": 0,
+        "total": 0,
+        "pct": 0
+      },
+      "milestone": null,
+      "depends_on": [],
+      "blocked_by": [],
+      "runs": 0,
+      "tokens": 0,
+      "cost_usd": 0.0,
+      "estimate_days": null
+    },
+    {
+      "id": "WS7",
+      "title": "Launch",
+      "state": "active",
+      "group": "active",
+      "order": 80,
+      "started_at": 1761978460.0,
+      "last_active_at": 1761999840.0,
+      "done_at": null,
+      "done_inferred": false,
+      "archived_at": null,
+      "has_history": false,
+      "before_history": false,
+      "progress": {
+        "done": 1,
+        "total": 5,
+        "pct": 20
+      },
+      "milestone": null,
+      "depends_on": [],
+      "blocked_by": [],
+      "runs": 42,
+      "tokens": 317741,
+      "cost_usd": 0.4934,
+      "estimate_days": null
+    },
+    {
+      "id": "WS9",
+      "title": "Relay",
+      "state": "planned",
+      "group": "planned",
+      "order": 90,
+      "started_at": null,
+      "last_active_at": null,
+      "done_at": null,
+      "done_inferred": false,
+      "archived_at": null,
+      "has_history": false,
+      "before_history": false,
+      "progress": {
+        "done": 0,
+        "total": 3,
+        "pct": 0
+      },
+      "milestone": "Second wave",
+      "depends_on": [
+        "WS6"
+      ],
+      "blocked_by": [
+        "WS6"
+      ],
+      "runs": 0,
+      "tokens": 0,
+      "cost_usd": 0.0,
+      "estimate_days": 7
+    },
+    {
+      "id": "WS10",
+      "title": "Ledger",
+      "state": "planned",
+      "group": "planned",
+      "order": 100,
+      "started_at": null,
+      "last_active_at": null,
+      "done_at": null,
+      "done_inferred": false,
+      "archived_at": null,
+      "has_history": false,
+      "before_history": false,
+      "progress": {
+        "done": 0,
+        "total": 3,
+        "pct": 0
+      },
+      "milestone": "Second wave",
+      "depends_on": [
+        "WS8",
+        "WS9"
+      ],
+      "blocked_by": [
+        "WS8",
+        "WS9"
+      ],
+      "runs": 0,
+      "tokens": 0,
+      "cost_usd": 0.0,
+      "estimate_days": 7
+    },
+    {
+      "id": "WS11",
+      "title": "Export",
+      "state": "archived",
+      "group": "done",
+      "order": 110,
+      "started_at": null,
+      "last_active_at": null,
+      "done_at": null,
+      "done_inferred": false,
+      "archived_at": null,
+      "has_history": false,
+      "before_history": true,
+      "progress": {
+        "done": 3,
+        "total": 3,
+        "pct": 100
+      },
+      "milestone": "First wave",
+      "depends_on": [],
+      "blocked_by": [],
+      "runs": 0,
+      "tokens": 0,
+      "cost_usd": 0.0,
+      "estimate_days": null
+    },
+    {
+      "id": "WS12",
+      "title": "Sunset",
+      "state": "dropped",
+      "group": "planned",
+      "order": 120,
+      "started_at": null,
+      "last_active_at": null,
+      "done_at": null,
+      "done_inferred": false,
+      "archived_at": null,
+      "has_history": false,
+      "before_history": true,
+      "progress": {
+        "done": 0,
+        "total": 0,
+        "pct": 0
+      },
+      "milestone": null,
+      "depends_on": [],
+      "blocked_by": [],
+      "runs": 0,
+      "tokens": 0,
+      "cost_usd": 0.0,
+      "estimate_days": 7
+    }
+  ],
+  "order": [
+    "WS2",
+    "WS11",
+    "WS1",
+    "WS7",
+    "WS0",
+    "WS3",
+    "WS4",
+    "WS5",
+    "WS6",
+    "WS9",
+    "WS10",
+    "WS12"
+  ],
+  "_note": "Seeded synthetic data for the offline preview. Seed 1. No local sessions are read."
+}

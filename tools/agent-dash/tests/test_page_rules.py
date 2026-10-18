@@ -1482,6 +1482,93 @@ setTimeout(function () {
             "prefers-reduced-motion",
         ):
             self.assertIn(marker, css, f"depgraph.css lost the style rule: {marker}")
+    def test_roadmap_swimlane_contract(self):
+        """The roadmap swimlane keeps its integration points: the axis
+        comes from the shared helpers, every lane carries its workstream
+        id and state, planned bars say estimate, dateless lanes name the
+        before-history band, numbers stay compact, and a failed fetch is
+        loud instead of a zero."""
+        src = (STATIC / "cards" / "roadmap.js").read_text()
+        for token in ("axes(", "timeTicks(", "data-ws", "data-state", "data-road-lanes",
+                      "viewBox", 'role: "img"', "aria-label", "fmtN", "fmtUsd",
+                      "estimate: plan size", "before history", "waits on ",
+                      "request failed", "roadState", "openPlan",
+                      'delete secCache["exec-roadmap"]'):
+            self.assertIn(token, src, f"roadmap.js lost {token}")
+        for bad in (".toFixed(", "toLocaleString()", '"dagster"', "'dagster'",
+                    "doctor-pill", "DashDoctor", "refreshDoctor", "docwarn", "exec-health",
+                    "plan needs attention"):
+            self.assertNotIn(bad, src, f"roadmap.js must not contain {bad}")
+        hits = re.findall(r"Math\.round\s*\(\s*100\s*\*[^;]*?done", src, re.I)
+        self.assertEqual(hits, [], f"roadmap.js computes % done itself: {hits[:2]}")
+        reg = (STATIC / "cards" / "registry.js").read_text()
+        for token in ('"roadmap"', '"roadmap-plan"', 'scope: "project"', 'scope: "planned"',
+                      'slot: "exec-roadmap"', "roadmapSpec"):
+            self.assertIn(token, reg, f"registry.js lost the roadmap entry: {token}")
+        page = (STATIC / "index.html").read_text()
+        self.assertIn("/static/cards/roadmap.css", page, "index.html never loads the roadmap CSS")
+        self.assertIn("/static/cards/roadmap.js", page, "index.html never loads the roadmap card")
+        script = inline_scripts()
+        bodies = dict(functions(script))
+        self.assertIn("roadmapCard", bodies)
+        self.assertIn("roadmapSpec", bodies)
+        card = bodies["roadmapCard"]
+        self.assertIn("axes(", card, "roadmapCard draws a chart without axes()")
+        self.assertIn("timeTicks(", card, "roadmapCard lost its shared time axis")
+    def test_roadmap_edges_only_on_focus(self):
+        """No always-on dependency lines: connectors are created only in
+        the focus handler (hover, keyboard focus, or pin) and cleared on
+        the way out. The draw path carries no edge."""
+        src = (STATIC / "cards" / "roadmap.js").read_text()
+        def body(name):
+            start = src.index(f"function {name}(")
+            brace = src.index("{", start)
+            depth = 0
+            for pos in range(brace, len(src)):
+                if src[pos] == "{":
+                    depth += 1
+                elif src[pos] == "}":
+                    depth -= 1
+                    if depth == 0:
+                        return src[start:pos + 1]
+            raise AssertionError(f"{name} body never closes")
+        focus = body("focusLane")
+        self.assertIn("road-link", focus, "focusLane draws no connectors")
+        self.assertIn("road-focus", focus, "focusLane has no connector group")
+        self.assertIn("var(--warning)", focus, "upstream connectors lost their amber")
+        self.assertIn("var(--s1)", focus, "downstream connectors lost their blue")
+        card = body("roadmapCard")
+        self.assertNotIn("road-link", card, "roadmapCard draws always-on edges; connectors belong in focusLane only")
+        self.assertNotIn("road-focus", card, "roadmapCard mounts an edge group; connectors belong in focusLane only")
+        clear = body("clearLane")
+        self.assertIn("road-focus", clear, "clearLane removes nothing")
+    def test_roadmap_pure_helpers(self):
+        """roadState is glyph plus word for every lifecycle state, and
+        roadDay is a UTC calendar day (never a locale string)."""
+        harness = (
+            "var window={};"
+            "eval(require('fs').readFileSync(process.argv[1],'utf8'));"
+            "const assert=require('assert');"
+            "for(const [st,mark,word] of ["
+            "['done','\\u2713','Done'],['archived','\\u2713','Archived'],"
+            "['active','\\u25CF','Active'],['paused','\\u23F8','Paused'],"
+            "['planned','\\u25CB','Planned'],['dropped','\\u2715','Dropped']]){"
+            "const got=window.roadState(st);"
+            "assert.strictEqual(got.mark,mark,st);"
+            "assert.strictEqual(got.word,word,st);"
+            "assert.ok(got.color,'no colour for '+st);}"
+            "assert.strictEqual(window.roadState('bogus').word,'Active');"
+            "assert.strictEqual(window.roadDay(0),'1970-01-01');"
+            "assert.strictEqual(window.roadDay(1762000000),'2025-11-01');"
+            "assert.strictEqual(window.roadDay(null),'\\u2013');"
+            "assert.strictEqual(window.roadDay(undefined),'\\u2013');"
+        )
+        proc = subprocess.run(
+            ["node", "-e", harness, str(STATIC / "cards" / "roadmap.js")],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr or proc.stdout)
 
 
 if __name__ == "__main__":

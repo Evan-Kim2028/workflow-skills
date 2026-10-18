@@ -77,6 +77,14 @@
     }},
     {id: "depgraph-plan", order: 62, scope: "planned", slot: "exec-depgraph", spec: function (state, snap) {
       return depGraphSpec(state, snap);
+    }},
+    /* Project roadmap swimlane (one file, one spec, two scopes): the
+       Project home and the Planned view each mount it in exec-roadmap. */
+    {id: "roadmap", order: 60, scope: "project", slot: "exec-roadmap", spec: function (state, snap) {
+      return roadmapSpec(state, snap);
+    }},
+    {id: "roadmap-plan", order: 60, scope: "planned", slot: "exec-roadmap", spec: function (state, snap) {
+      return roadmapSpec(state, snap);
     }}
   ];
 })(window);

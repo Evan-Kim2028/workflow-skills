@@ -48,6 +48,7 @@ FILES = (
     "workstreams.json",
     "workstreams-all.json",
     "project.json",
+    "timeline.json",
     "archive.json",
     "reconcile.json",
     "project.json",
@@ -572,6 +573,7 @@ class ProjectViewFixtureTests(unittest.TestCase):
         cls.wss = load("workstreams.json")["workstreams"]
         cls.wss_all = load("workstreams-all.json")["workstreams"]
         cls.archive = load("archive.json")
+        cls.timeline = load("timeline.json")
         cls.plans = {ws: load(f"plan-{ws}.json") for ws in ("WS9", "WS10", "WS11")}
     def test_project_shape(self):
         for key in ("name", "short", "description", "goals", "started", "target", "phases", "counts", "totals", "data_root_hash"):
@@ -660,6 +662,39 @@ class ProjectViewFixtureTests(unittest.TestCase):
         self.assertTrue({"dependency", "gate"} <= kinds, kinds)
         self.assertTrue(statuses <= {"met", "waiting", "stale"}, statuses)
         self.assertIsInstance(doc["cycles"], list)
+    def test_timeline_shape(self):
+        doc = self.timeline
+        self.assertTrue(num(doc["now"]), "timeline needs a now stamp")
+        self.assertEqual(doc["project"]["started"], self.project["started"])
+        lanes = {lane["id"]: lane for lane in doc["lanes"]}
+        self.assertEqual(sorted(lanes), sorted(row["ws"] for row in self.wss_all),
+                         "one lane per workstream, all states")
+        self.assertEqual(sorted(doc["order"]), sorted(lanes),
+                         "the lane order covers every lane exactly once")
+        groups = [lanes[lane_id]["group"] for lane_id in doc["order"]]
+        self.assertEqual(groups, sorted(groups, key=["done", "active", "planned"].index),
+                         "lanes group Done / Active / Planned")
+        for lane_id, lane in lanes.items():
+            for key in ("id", "title", "state", "group", "started_at", "last_active_at",
+                        "done_at", "done_inferred", "archived_at", "has_history",
+                        "before_history", "progress", "milestone", "depends_on",
+                        "blocked_by", "runs", "tokens", "cost_usd", "estimate_days"):
+                self.assertIn(key, lane, lane_id)
+            self.assertEqual(set(lane["progress"]), {"done", "total", "pct"})
+            self.assertTrue(num(lane["runs"]) and lane["runs"] >= 0, lane_id)
+            self.assertTrue(num(lane["tokens"]) and lane["tokens"] >= 0, lane_id)
+            self.assertTrue(num(lane["cost_usd"]) and lane["cost_usd"] >= 0, lane_id)
+            if lane["state"] == "planned":
+                self.assertFalse(lane["before_history"], lane_id)
+                self.assertTrue(num(lane["estimate_days"]), lane_id)
+            if lane["before_history"]:
+                self.assertIsNone(lane["started_at"], lane_id)
+        planned = [lane for lane in lanes.values() if lane["state"] == "planned"]
+        self.assertTrue(planned, "the offline roadmap needs a planned estimate lane")
+        self.assertTrue(any(lane["blocked_by"] for lane in planned),
+                        "a planned lane should demonstrate waits-on")
+        band = [lane for lane in lanes.values() if lane["before_history"]]
+        self.assertTrue(band, "the offline roadmap needs a before-history band lane")
     def test_planned_fixture_plans_have_gates(self):
         ws9 = self.plans["WS9"]
         gates = [task for group in ws9["groups"] for task in group["tasks"] if task.get("kind") == "gate"]

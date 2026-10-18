@@ -180,6 +180,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._archive(query)
             elif path == "/api/project/graph":
                 self._project_graph(query)
+            elif path == "/api/project/timeline":
+                self._project_timeline()
             elif path == "/api/reconcile":
                 self._reconcile(query)
             elif path == "/api/plan":
@@ -426,7 +428,6 @@ class Handler(BaseHTTPRequestHandler):
 
     def _project_graph(self, _query):
         """``GET /api/project/graph``: the cross-workstream dependency graph.
-
         Nodes are workstream bundles (id, title, state, progress, live
         agents, milestone, depth); edges come from ``depends_on``, gate
         tasks naming another workstream, and deferred tasks that moved.
@@ -437,7 +438,6 @@ class Handler(BaseHTTPRequestHandler):
         from dash import projectgraph
         from dash.bundles import list_bundles
         from dash.workstates import STATES, all_bundle_meta
-
         now = time.time()
         meta = all_bundle_meta()
         rows = self.server.store.query_workstreams(
@@ -465,6 +465,25 @@ class Handler(BaseHTTPRequestHandler):
             if isinstance(body, dict):
                 plans[ws] = body
         self._json(200, projectgraph.build_graph(bundles, plans, live, progress, now))
+    def _project_timeline(self):
+        """``GET /api/project/timeline``: one lane per workstream over time.
+        Dates come only from recorded evidence (mapped runs, history
+        moves, state moves); lanes with none read ``before_history`` and
+        the card draws them in a labelled band without pretending dates.
+        Only names and numbers cross this boundary: ids, titles, states,
+        dates, progress, milestones, dependency ids, run/token/cost sums,
+        and the project started/target/phases block (nulls when no
+        project file exists).
+        """
+        import time
+        from dash import projecttimeline
+        now = time.time()
+        try:
+            body = projecttimeline.collect(self.server.store, now)
+        except Exception:
+            self._json(500, api_error("timeline unavailable", "timeline_unavailable", "Check the workstreams directory and retry."))
+            return
+        self._json(200, body)
 
     def _reconcile(self, query):
         from dash.workstates import hidden_ids
