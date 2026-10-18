@@ -30,6 +30,7 @@ import re
 from collections import namedtuple
 from datetime import datetime, timezone
 
+from dash.attribution import ws_from_bundle_path
 from dash.liveness import pid_alive as _pid_alive
 
 NAME = "claude"
@@ -81,6 +82,7 @@ _reg_sid: dict = {}
 _emit_sig: dict = {}
 _last_model: dict = {}
 _cwd: dict = {}
+_ws_hint: dict = {}
 _saw_bof: dict = {}
 _meta_cache: dict = {}
 _journal_seen: dict = {}
@@ -105,6 +107,7 @@ def reset_state() -> None:
     _emit_sig.clear()
     _last_model.clear()
     _cwd.clear()
+    _ws_hint.clear()
     _saw_bof.clear()
     _meta_cache.clear()
     _journal_seen.clear()
@@ -225,8 +228,20 @@ def poll(store, cfg, now: float) -> None:
         per_file, per_tick = _budgets(cfg)
         left = _poll_registry(store, cfg, per_tick)
         _poll_transcripts(store, cfg, now, left, per_file)
+        _refresh_inheritance(store, now)
     except Exception as exc:
         _log.warning("claude poll: %s", type(exc).__name__)
+
+
+def _refresh_inheritance(store, now: float) -> None:
+    """Recompute inherited/inferred workstreams; explicit ones are kept."""
+    refresh = getattr(store, "refresh_workstream_inheritance", None)
+    if not callable(refresh):
+        return
+    try:
+        refresh(now)
+    except Exception as exc:
+        _log.warning("claude inherit refresh: %s", type(exc).__name__)
 
 
 def _poll_registry(store, cfg, left) -> int:
@@ -663,6 +678,7 @@ def _ingest_jsonl(store, target, now, fresh_s, left, per_file, backfill, window)
 
     rows = parse_assistant_lines(lines)
     _note_times(run_id, rows)
+    _note_bundle_hint(run_id, lines)
     _emit_usage(store, target, rows, now)
     new_offset = offset + consumed
     caught_up = new_offset >= st.st_size
@@ -814,6 +830,7 @@ def _emit_transcript_run(store, target, st, fresh, caught_up) -> None:
                 "started_at": _first_ts.get(run_id),
                 "status": sess_status,
                 "parent_session_id": None,
+                "ws_hint": _ws_hint.get(run_id),
             },
         )
     pid = _pids.get(target.session_id) if target.kind == "main" else None
@@ -838,6 +855,58 @@ def _emit_transcript_run(store, target, st, fresh, caught_up) -> None:
         _emit_run(store, patch, force_status=status)
     else:
         _emit_run(store, patch, force_status=status, clear=("ended_at",))
+
+
+def _note_bundle_hint(run_id, lines) -> None:
+    """Remember a workstream bundle dir this run wrote to.
+
+    Read-only scan of the already-read chunk: Write/Edit tool-use blocks
+    whose file path lands under a workstream bundle directory. Only the
+    bundle id is kept, never the path or the prompt. The newest evidence
+    in the chunk wins.
+    """
+    found = None
+    for line in lines:
+        if b"tool_use" not in line:
+            continue
+        if b'"Write"' not in line and b'"Edit"' not in line:
+            continue
+        hint = _bundle_hint_from_line(line)
+        if hint:
+            found = hint
+    if found:
+        _ws_hint[run_id] = found
+
+
+def _bundle_hint_from_line(line: bytes) -> str | None:
+    try:
+        rec = json.loads(line)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(rec, dict):
+        return None
+    msg = rec.get("message")
+    if not isinstance(msg, dict):
+        return None
+    content = msg.get("content")
+    if not isinstance(content, list):
+        return None
+    for block in content:
+        if not isinstance(block, dict) or block.get("type") != "tool_use":
+            continue
+        if block.get("name") not in ("Write", "Edit"):
+            continue
+        tool_input = block.get("input")
+        if not isinstance(tool_input, dict):
+            continue
+        for key in ("file_path", "path"):
+            value = tool_input.get(key)
+            if not isinstance(value, str) or not value:
+                continue
+            hint = ws_from_bundle_path(value)
+            if hint:
+                return hint
+    return None
 
 
 def _note_times(run_id, rows) -> None:

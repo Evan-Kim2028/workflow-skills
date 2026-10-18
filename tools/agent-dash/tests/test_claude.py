@@ -472,6 +472,117 @@ class ClaudePollTests(unittest.TestCase):
         self.assertIn(("claude", SID2, "b"), self.store.usage)
 
 
+class ClaudeInheritanceTests(unittest.TestCase):
+    def setUp(self):
+        claude.reset_state()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.store = MemStore()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+        claude.reset_state()
+
+    def test_main_has_no_parent_subagent_links_to_lead(self):
+        cfg, projects, _sessions = _cfg(self.tmp.name, running_mtime_s=100)
+        _write(
+            os.path.join(projects, "enc", f"{SID}.jsonl"),
+            _line("m1", 1),
+            NOW,
+        )
+        base = os.path.join(projects, "enc", SID, "subagents")
+        _write(os.path.join(base, "agent-aaa.jsonl"), _line("m2", 2, model="claude-haiku-5-5"), NOW)
+        claude.poll(self.store, cfg, NOW)
+        main = self.store.runs[f"claude-main:{SID}:main"]
+        self.assertIsNone(main["parent_session_id"])
+        sub = self.store.runs[f"claude-subagent:{SID}:aaa"]
+        self.assertEqual(sub["parent_session_id"], SID)
+        self.assertEqual(sub["session_id"], SID)
+
+    def test_journal_only_workflow_row_links_to_lead(self):
+        cfg, projects, _sessions = _cfg(self.tmp.name)
+        wf = os.path.join(projects, "enc", SID, "subagents", "workflows", "wf_x")
+        _write(
+            os.path.join(wf, "journal.jsonl"),
+            json.dumps({"type": "started", "agentId": "aaa", "label": "helper"}) + "\n",
+            NOW,
+        )
+        claude.poll(self.store, cfg, NOW)
+        run = self.store.runs[f"claude-workflow:{SID}:wf_x/aaa"]
+        self.assertEqual(run["parent_session_id"], SID)
+        self.assertEqual(run["session_id"], SID)
+
+    def test_bundle_write_hint_lands_on_session(self):
+        bundles = os.path.join(self.tmp.name, "bundles")
+        os.makedirs(os.path.join(bundles, "WS9"), exist_ok=True)
+        old = os.environ.get("AGENT_DASH_WORKSTREAMS")
+        os.environ["AGENT_DASH_WORKSTREAMS"] = bundles
+        try:
+            cfg, projects, _sessions = _cfg(self.tmp.name, running_mtime_s=100)
+            rec = {
+                "type": "assistant",
+                "timestamp": "2026-10-16T00:00:00.000Z",
+                "sessionId": SID,
+                "cwd": "/tmp/example",
+                "message": {
+                    "id": "m1",
+                    "model": "claude-sonnet-5-5",
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "t1",
+                            "name": "Write",
+                            "input": {"file_path": os.path.join(bundles, "WS9", "plan.json")},
+                        }
+                    ],
+                    "usage": {"input_tokens": 2, "output_tokens": 3},
+                },
+            }
+            _write(
+                os.path.join(projects, "enc", f"{SID}.jsonl"),
+                json.dumps(rec, separators=(",", ":")).encode() + b"\n",
+                NOW,
+            )
+            claude.poll(self.store, cfg, NOW)
+            self.assertEqual(self.store.sessions[SID].get("ws_hint"), "WS9")
+            self.assertNotIn(bundles, _dump(self.store))
+        finally:
+            if old is None:
+                os.environ.pop("AGENT_DASH_WORKSTREAMS", None)
+            else:
+                os.environ["AGENT_DASH_WORKSTREAMS"] = old
+
+    def test_write_outside_bundles_leaves_no_hint(self):
+        cfg, projects, _sessions = _cfg(self.tmp.name, running_mtime_s=100)
+        rec = {
+            "type": "assistant",
+            "timestamp": "2026-10-16T00:00:00.000Z",
+            "sessionId": SID,
+            "cwd": "/tmp/example",
+            "message": {
+                "id": "m1",
+                "model": "claude-sonnet-5-5",
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "t1",
+                        "name": "Write",
+                        "input": {"file_path": "/tmp/example/notes.md"},
+                    }
+                ],
+                "usage": {"input_tokens": 2, "output_tokens": 3},
+            },
+        }
+        _write(
+            os.path.join(projects, "enc", f"{SID}.jsonl"),
+            json.dumps(rec, separators=(",", ":")).encode() + b"\n",
+            NOW,
+        )
+        claude.poll(self.store, cfg, NOW)
+        self.assertIsNone(self.store.sessions[SID].get("ws_hint"))
+
+
 class ClaudeSmokeTests(unittest.TestCase):
     @unittest.skipUnless(os.environ.get("AGENT_DASH_SMOKE") == "1", "set AGENT_DASH_SMOKE=1 to read a local transcript")
     def test_transcript_prefix(self):

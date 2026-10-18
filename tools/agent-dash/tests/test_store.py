@@ -2733,5 +2733,181 @@ class PruneOffsetsTest(unittest.TestCase):
         self.assertEqual(remaining, {live})
 
 
+class StoreInheritanceTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.store = memory(Path(self.tmp.name))
+
+    def tearDown(self):
+        self.store.close()
+        self.tmp.cleanup()
+
+    def _session(self, sid):
+        return self.store._one("SELECT * FROM sessions WHERE session_id=?", (sid,))
+
+    def test_child_run_inherits_parent_session_workstream(self):
+        self.store.upsert_session(
+            {"session_id": "lead-1", "tool": "claude", "label": "ws7-landing", "status": "busy"}
+        )
+        self.store.upsert_run(
+            {
+                "run_id": "claude-subagent:lead-1:aaa",
+                "source": "claude-subagent",
+                "session_id": "lead-1",
+                "parent_session_id": "lead-1",
+                "label": "helper",
+                "status": "running",
+                "started_at": 10,
+            }
+        )
+        run = self.store.get_run("claude-subagent:lead-1:aaa")
+        self.assertEqual(run["workstream"], "WS7")
+        self.assertEqual(run["ws_confidence"], "inherited")
+
+    def test_lead_session_infers_dominant_workers(self):
+        now = time.time()
+        for index in range(3):
+            self.store.upsert_run(
+                {
+                    "run_id": f"claude-subagent:lead-2:w{index}",
+                    "source": "claude-subagent",
+                    "session_id": "lead-2",
+                    "parent_session_id": "lead-2",
+                    "label": f"ws4-task-{index}",
+                    "status": "done",
+                    "started_at": now - 100,
+                    "ended_at": now - 50,
+                }
+            )
+        self.store.upsert_session(
+            {"session_id": "lead-2", "tool": "claude", "cwd": "/repo/main", "status": "busy"}
+        )
+        session = self._session("lead-2")
+        self.assertEqual(session["workstream"], "WS4")
+        self.assertEqual(session["ws_confidence"], "inferred")
+
+    def test_lead_run_row_infers_like_its_session(self):
+        now = time.time()
+        for index in range(3):
+            self.store.upsert_run(
+                {
+                    "run_id": f"claude-subagent:lead-3:w{index}",
+                    "source": "claude-subagent",
+                    "session_id": "lead-3",
+                    "parent_session_id": "lead-3",
+                    "label": f"ws4-task-{index}",
+                    "status": "done",
+                    "started_at": now - 100,
+                    "ended_at": now - 50,
+                }
+            )
+        self.store.upsert_run(
+            {
+                "run_id": "claude-main:lead-3:main",
+                "source": "claude-main",
+                "session_id": "lead-3",
+                "status": "running",
+                "started_at": now - 200,
+            }
+        )
+        run = self.store.get_run("claude-main:lead-3:main")
+        self.assertEqual(run["workstream"], "WS4")
+        self.assertEqual(run["ws_confidence"], "inferred")
+
+    def test_split_workers_leave_lead_unassigned(self):
+        now = time.time()
+        labels = ["ws4-a", "ws4-b", "ws7-c", "ws7-d"]
+        for index, label in enumerate(labels):
+            self.store.upsert_run(
+                {
+                    "run_id": f"claude-subagent:lead-4:w{index}",
+                    "source": "claude-subagent",
+                    "session_id": "lead-4",
+                    "parent_session_id": "lead-4",
+                    "label": label,
+                    "status": "done",
+                    "started_at": now - 100,
+                    "ended_at": now - 50,
+                }
+            )
+        self.store.upsert_session(
+            {"session_id": "lead-4", "tool": "claude", "cwd": "/repo/main", "status": "busy"}
+        )
+        session = self._session("lead-4")
+        self.assertIsNone(session["workstream"])
+        self.assertIsNone(session["ws_confidence"])
+
+    def test_refresh_never_overwrites_explicit(self):
+        self.store.upsert_session(
+            {"session_id": "lead-5", "tool": "claude", "label": "ws7-landing", "status": "busy"}
+        )
+        self.store.upsert_run(
+            {
+                "run_id": "muse:s:ws2-fix",
+                "source": "muse",
+                "session_id": "lead-5",
+                "parent_session_id": "lead-5",
+                "label": "ws2-fix",
+                "status": "running",
+                "started_at": 10,
+            }
+        )
+        changed = self.store.refresh_workstream_inheritance(time.time())
+        self.assertEqual(changed, 0)
+        run = self.store.get_run("muse:s:ws2-fix")
+        self.assertEqual(run["workstream"], "WS2")
+        self.assertEqual(run["ws_confidence"], "regex")
+
+    def test_refresh_recomputes_when_parent_loses_workstream(self):
+        self.store.upsert_session(
+            {"session_id": "lead-6", "tool": "claude", "label": "ws7-landing", "status": "busy"}
+        )
+        self.store.upsert_run(
+            {
+                "run_id": "claude-subagent:lead-6:aaa",
+                "source": "claude-subagent",
+                "session_id": "lead-6",
+                "parent_session_id": "lead-6",
+                "label": "helper",
+                "status": "running",
+                "started_at": 10,
+            }
+        )
+        self.assertEqual(
+            self.store.get_run("claude-subagent:lead-6:aaa")["ws_confidence"], "inherited"
+        )
+        self.store.upsert_session(
+            {
+                "session_id": "lead-6",
+                "tool": "claude",
+                "label": None,
+                "cwd": "/repo/main",
+                "status": "busy",
+            }
+        )
+        session = self._session("lead-6")
+        self.assertIsNone(session["workstream"])
+        changed = self.store.refresh_workstream_inheritance(time.time() + 1000)
+        self.assertGreaterEqual(changed, 1)
+        run = self.store.get_run("claude-subagent:lead-6:aaa")
+        self.assertIsNone(run["workstream"])
+        self.assertIsNone(run["ws_confidence"])
+
+    def test_ws_rows_expose_confidence(self):
+        self.store.upsert_run(
+            {
+                "run_id": "muse:s:ws7-landing",
+                "source": "muse",
+                "label": "ws7-landing",
+                "session_id": "child",
+                "status": "running",
+                "started_at": 10,
+            }
+        )
+        snap = self.store.snapshot(20, "all")
+        rows = {row["ws"]: row for row in snap["by_workstream"]}
+        self.assertEqual(rows["WS7"]["ws_confidence"], ["regex"])
+
+
 if __name__ == "__main__":
     unittest.main()

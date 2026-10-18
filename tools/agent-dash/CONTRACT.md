@@ -3,7 +3,7 @@
 Local, read-only execution dashboard. One Python 3 process (stdlib only), binds 127.0.0.1:8765.
 Code is this directory. `install.sh` links it to `~/.claude/tools/agent-dash`. State: `~/.local/share/agent-dash/` (dash.sqlite WAL, pidfile, log).
 Never writes to any source, never signals agent processes, never stores prompt bodies or argv.
-The one argv value ever kept is the worker's `--model` flag value, recorded on process samples and live-process rows so a run whose model is otherwise unknown can be named. Model ids, labels, and token counts are the only worker-derived strings in the store.
+The one argv value ever kept is the worker's `--model` flag value, recorded on process samples and live-process rows so a run whose model is otherwise unknown can be named. Model ids, labels, token counts, and the session `ws_hint` (a workstream id derived from a bundle tool-use path, never served by any endpoint) are the only worker-derived strings in the store.
 
 ## Layout and file ownership (one writer per file)
 
@@ -76,10 +76,31 @@ Enums. `source`: claude-main, claude-subagent, claude-workflow, muse, glm, grok 
 `clock_source`: transcript, muse_log, manifest, mtime. Times are epoch seconds (float), UTC.
 `run_id` is stable: `<source>:<session-or-uuid>:<label-or-agent-id>`.
 
-Workstream attribution happens in core (`attribution.py`), not in sources: label via the map file, exact then regex
+Workstream attribution happens in core (`attribution.py`, store binding in
+`dash/inherit.py`), not in sources: label via the map file, exact then regex
 (`^ws(\d+)` -> WSn, `WS(\d+)\.` -> WSn, `^g-` -> WS1, `^dash-` -> TOOLS), then session default from the map
 `sessions` object, else null. `map.local.json` replaces `map.example.json` when present. Store `workstream` and `ws_confidence`
-(`label`, `regex`, `session-default`).
+(`label`, `regex`, `session-default`, `inherited`, `inferred`).
+
+Attribution rules. (a) A run with an explicit label, map, or regex
+workstream keeps it with its confidence unchanged. (b) A subagent or
+workflow step with no workstream inherits its parent session's
+workstream with confidence `inherited`. (c) A lead session's own
+workstream is inferred, in order, from: the dominant workstream of the
+workers it launched in the last 6 h (at least 60% share and at least 3
+runs), then the git worktree path or branch in its cwd matching a
+bundle's known worktree or branch naming (bundle plan trains' branch
+names, or a `ws<N>/` branch prefix or path segment), then a workstream
+bundle directory it wrote to (a Write/Edit tool-use path under a
+bundle dir seen in its transcript tail; the source scans only bytes it
+already read and keeps just the bundle id in the session's `ws_hint`).
+Otherwise the lead stays unassigned: a lead running several
+workstreams keeps none unless one share clears 60%. (d) Inference is
+recomputed each poll and may change; it never overwrites an explicit
+attribution. The page and reconcile count `inherited`/`inferred` runs
+like any workstream row, and every workstream row exposes
+`ws_confidence` (the distinct confidences behind it) so agents can see
+which rows are inferred.
 
 ## HTTP API (all GET, JSON, 127.0.0.1 only)
 
@@ -98,7 +119,7 @@ unreachable (docs/integrate.md, For agents).
  "totals": {"tokens": {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0, "reasoning": 0}, "cost_usd": 0.0, "unpriced_runs": 0, "unpriced_tokens": 0, "unpriced_models": []},
  "totals_all_time": {"tokens": {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0, "reasoning": 0}, "cost_usd": 0.0},
  "last_activity": 0,
- "by_workstream": [{"ws": "WS7", "live_agents": 0, "finished_in_range": 0, "finished_today": 0, "tokens": 0, "cost_usd": 0.0, "tokens_all_time": 0, "cost_usd_all_time": 0.0, "last_activity": 0}],
+ "by_workstream": [{"ws": "WS7", "live_agents": 0, "finished_in_range": 0, "finished_today": 0, "tokens": 0, "cost_usd": 0.0, "tokens_all_time": 0, "cost_usd_all_time": 0.0, "last_activity": 0, "ws_confidence": ["regex"]}],
  "usage": [{"t": 0, "key": "opus", "input": 0, "output": 0, "cache_read": 0, "cache_write": 0, "reasoning": 0, "cost_usd": 0.0}]}
 ```
 `usage` is present only when `usage_group` is given: the hourly usage
@@ -130,7 +151,7 @@ started_at, ended_at, elapsed_s, clock_source, out_bytes, out_growing, err_bytes
 
 `GET /api/sessions` -> `{"sessions": [{session_id, tool, cwd, label, workstream, started_at, status, runs: n, tokens, cost_usd}]}`
 
-`GET /api/workstreams?since=&until=` -> `{"workstreams": [{ws, name, tk: {backlog, todo, doing, review, done, cancelled}, live_agents, finished_in_range, finished_today, tokens, cost_usd, tokens_all_time, cost_usd_all_time, last_activity, plan: bool, progress: {done, total, counts, pct} | null}]}`.
+`GET /api/workstreams?since=&until=` -> `{"workstreams": [{ws, name, tk: {backlog, todo, doing, review, done, cancelled}, live_agents, finished_in_range, finished_today, tokens, cost_usd, tokens_all_time, cost_usd_all_time, last_activity, plan: bool, ws_confidence: [..], progress: {done, total, counts, pct} | null}]}`.
 Rows come from the same rollup as the snapshot, so they match the tabs for the
 same window. `tk` is the hub issue board (issue counts, never plan progress).
 `progress` is the same object `/api/plan` carries for that workstream, resolved

@@ -285,6 +285,7 @@ class QueriesMixin:
                         "cost_usd_all_time": row["cost_usd_all_time"],
                         "last_activity": row["last_activity"],
                         "plan": row["ws"] in plan_ws,
+                        "ws_confidence": list(row.get("ws_confidence") or []),
                     }
                 )
             for ws in sorted(set(boards) - seen, key=_ws_sort):
@@ -303,6 +304,7 @@ class QueriesMixin:
                         "cost_usd_all_time": 0.0,
                         "last_activity": None,
                         "plan": ws in plan_ws,
+                        "ws_confidence": [],
                     }
                 )
             if roll["has_unassigned"]:
@@ -321,6 +323,7 @@ class QueriesMixin:
                         "cost_usd_all_time": row["cost_usd_all_time"],
                         "last_activity": row["last_activity"],
                         "plan": False,
+                        "ws_confidence": list(row.get("ws_confidence") or []),
                     }
                 )
             out.sort(key=lambda item: _ws_sort(item["ws"]))

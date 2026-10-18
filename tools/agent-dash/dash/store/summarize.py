@@ -612,6 +612,13 @@ def _ws_row(ws: str, scope: dict, all_time: dict | None = None) -> dict:
         "tokens": _billed_total(scope["totals"]["tokens"]),
         "cost_usd": scope["totals"]["cost_usd"],
         "last_activity": _last_activity(scope["runs"]),
+        "ws_confidence": sorted(
+            {
+                run.get("ws_confidence")
+                for run in scope["runs"]
+                if run.get("ws_confidence")
+            }
+        ),
     }
     if all_time is not None:
         row["tokens_all_time"] = _billed_total(all_time["tokens"])

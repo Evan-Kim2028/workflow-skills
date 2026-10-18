@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import time as _time
 
+from dash import inherit as _inherit
 from dash.attribution import attribute, clean_label
 
 from .running import _annotate_lanes
@@ -22,6 +23,22 @@ from .util import (_ESTIMATE_TOOL, MERGE_WINDOW_S, RUN_COLS,
 
 
 class RunsMixin:
+        def _attribute_locked(self, label, session_id, parent_session_id):
+            """Explicit attribution, else workstream inheritance (caller holds the lock)."""
+            workstream, confidence = attribute(
+                label,
+                session_id,
+                parent_session_id=parent_session_id,
+            )
+            if workstream is not None:
+                return workstream, confidence
+            return _inherit.resolve(self, label, session_id, parent_session_id)
+
+        def refresh_workstream_inheritance(self, now: float) -> int:
+            """Recompute inherited/inferred rows; never touch explicit ones."""
+            with self._lock:
+                return _inherit.refresh(self, now)
+
         def upsert_session(self, row: dict) -> None:
             session_id = row.get("session_id")
             if not session_id:
@@ -30,14 +47,14 @@ class RunsMixin:
                 existing = self._one("SELECT * FROM sessions WHERE session_id=?", (session_id,))
                 merged = dict(existing or {})
                 merged["session_id"] = session_id
-                for key in ("tool", "cwd", "started_at", "status", "parent_session_id", "label"):
+                for key in ("tool", "cwd", "started_at", "status", "parent_session_id", "label", "ws_hint"):
                     if key in row:
                         merged[key] = row[key]
                 merged["label"] = clean_label(merged.get("label"))
-                workstream, confidence = attribute(
+                workstream, confidence = self._attribute_locked(
                     merged.get("label"),
                     merged.get("session_id"),
-                    parent_session_id=merged.get("parent_session_id"),
+                    merged.get("parent_session_id"),
                 )
                 merged["workstream"] = workstream
                 merged["ws_confidence"] = confidence
@@ -73,10 +90,10 @@ class RunsMixin:
                 merged["label"] = clean_label(merged.get("label"))
                 if not merged.get("status"):
                     merged["status"] = "unknown"
-                workstream, confidence = attribute(
+                workstream, confidence = self._attribute_locked(
                     merged.get("label"),
                     merged.get("session_id"),
-                    parent_session_id=merged.get("parent_session_id"),
+                    merged.get("parent_session_id"),
                 )
                 merged["workstream"] = workstream
                 merged["ws_confidence"] = confidence
@@ -125,10 +142,10 @@ class RunsMixin:
                 ):
                     if merged.get(key) in (None, "") and src.get(key) not in (None, ""):
                         merged[key] = src[key]
-                workstream, confidence = attribute(
+                workstream, confidence = self._attribute_locked(
                     merged.get("label"),
                     merged.get("session_id"),
-                    parent_session_id=merged.get("parent_session_id"),
+                    merged.get("parent_session_id"),
                 )
                 merged["workstream"] = workstream
                 merged["ws_confidence"] = confidence
@@ -361,10 +378,10 @@ class RunsMixin:
             Caller holds the lock.
             """
             merged = _fold_manifest_patch(dst, src)
-            workstream, confidence = attribute(
+            workstream, confidence = self._attribute_locked(
                 merged.get("label"),
                 merged.get("session_id"),
-                parent_session_id=merged.get("parent_session_id"),
+                merged.get("parent_session_id"),
             )
             merged["workstream"] = workstream
             merged["ws_confidence"] = confidence

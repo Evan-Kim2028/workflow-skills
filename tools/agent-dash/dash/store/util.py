@@ -98,6 +98,7 @@ SESSION_COLS = (
     "label",
     "workstream",
     "ws_confidence",
+    "ws_hint",
 )
 
 

@@ -223,7 +223,8 @@ class BaseMixin:
                   parent_session_id TEXT,
                   label TEXT,
                   workstream TEXT,
-                  ws_confidence TEXT
+                  ws_confidence TEXT,
+                  ws_hint TEXT
                 );
                 CREATE TABLE IF NOT EXISTS ws_counts (
                   ws TEXT PRIMARY KEY,
@@ -283,6 +284,8 @@ class BaseMixin:
                 CREATE INDEX IF NOT EXISTS idx_runs_pid ON runs(pid);
                 CREATE INDEX IF NOT EXISTS idx_runs_source ON runs(source);
                 CREATE INDEX IF NOT EXISTS idx_runs_label ON runs(label);
+                CREATE INDEX IF NOT EXISTS idx_runs_parent ON runs(parent_session_id);
+                CREATE INDEX IF NOT EXISTS idx_runs_session ON runs(session_id);
                 CREATE INDEX IF NOT EXISTS idx_usage_run ON usage_events(run_id);
                 CREATE INDEX IF NOT EXISTS idx_usage_ts ON usage_events(ts);
                 CREATE INDEX IF NOT EXISTS idx_samples_ts ON process_samples(ts);
@@ -294,6 +297,7 @@ class BaseMixin:
             self._migrate_usage_splits()
             self._migrate_uncached_input()
             self._migrate_run_aliases()
+            self._migrate_session_hint()
         def _migrate_uncached_input(self) -> None:
             """Once: muse and GLM logged input with cached tokens inside it; store uncached input like every other source, then rebuild the hourly buckets."""
             self._conn.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)")
@@ -327,6 +331,11 @@ class BaseMixin:
             self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_aliases_target ON run_aliases(target_run_id)"
             )
+        def _migrate_session_hint(self) -> None:
+            """Once: bundle-write evidence for lead workstream inference."""
+            cols = {row[1] for row in self._conn.execute("PRAGMA table_info(sessions)")}
+            if "ws_hint" not in cols:
+                self._conn.execute("ALTER TABLE sessions ADD COLUMN ws_hint TEXT")
         def _migrate_usage_splits(self) -> None:
             cols = {row[1] for row in self._conn.execute("PRAGMA table_info(usage_events)")}
             for name in ("cache_write_5m", "cache_write_1h"):
