@@ -227,6 +227,10 @@ answers `state: done`, `archived_at: null`). Errors keep the house shape
 kinds, already-archived (archive), non-archived (restore), dropped, or an
 unfinished plan or missing closing report 409 `not_eligible` (archiving an
 archived workstream is a 409, never a crash), bad body 400 `bad_request`.
+A bundle that moved between the eligibility check and the write lock is
+409 `changed` (reload and retry); a non-JSON Content-Type is 415
+`unsupported_media_type`; a failed write is 500 `write_failed` (or
+`internal`), never a dropped connection.
 Guards, all fail-closed: `Host` must be `127.0.0.1:<port>` or
 `localhost:<port>`; a present `Origin` must match that local origin; every
 call must carry `X-AgentDash-Action: 1` (blocks cross-site form posts and
@@ -334,7 +338,7 @@ in the last hour; they are counted, never traceback-logged.
 `scratch_roots` is the configured, resolved `roots.scratchpads` list (a local config that narrows it shows up here); `run_dirs` is the registered run folders. `warnings` names each registered folder outside the configured roots that holds a manifest for a currently live worker, so a run folder the config does not cover is loud instead of silently invisible.
 `doctor` is the always-on check summary: `{"summary": {"critical": 0, "warn": 0, "info": 0, "regressed": 0}, "generated_at": 0}` (`generated_at` is null until the first run, 30 s after start). `ok` is false when `summary.critical` is above 0.
 
-`GET /api/doctor` -> the latest persisted doctor run. The server runs the checks in a background thread every `doctor.interval_s` seconds (default 300; first run 30 s after start, after the first full poll) and persists them in the `doctor_problems` table. The endpoint never runs checks inline; `?refresh=1` only queues a run.
+`GET /api/doctor` -> the latest persisted doctor run. The server runs the checks in a background thread every `doctor.interval_s` seconds (default 300; first run 30 s after start, after the first full poll) and persists them in the `doctor_problems` table. The endpoint never runs checks inline; `?refresh=1` only queues a run. That flag is the one GET with a side effect: it queues a background doctor run, which writes only the dashboard's own state database (`doctor_problems`), never sources or bundles.
 ```json
 {"generated_at": 0, "next_run_at": 0, "interval_s": 300,
  "summary": {"critical": 0, "warn": 0, "info": 0, "regressed": 0, "items_total": 0},

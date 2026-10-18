@@ -63,6 +63,21 @@ CLOSING_REPORT = Path("docs") / "closing-report.md"
 #: ``dash.bundles._dash_url`` without importing it).
 _DEFAULT_URL = "http://127.0.0.1:8765"
 
+#: Test seam for the archive check-then-act gap: when set, ``archive_bundle``
+#: calls it as ``hook(ws, path)`` after the (unlocked) eligibility checks
+#: and before taking the per-bundle write lock, so a test can flip the
+#: bundle state or rewrite the plan in between and prove the in-lock
+#: re-check refuses with ``changed``. Always None in production.
+_ARCHIVE_PRE_LOCK_HOOK = None
+
+
+def _plan_stamp(path: Path):
+    """``st_mtime_ns`` of a bundle's ``plan.json``, or None when missing."""
+    try:
+        return (path / "plan.json").stat().st_mtime_ns
+    except OSError:
+        return None
+
 
 def legal_moves(state: str) -> list[str]:
     """Legal next states from ``state`` (empty for terminal states).
@@ -362,6 +377,12 @@ def archive_bundle(
     run/token/cost totals from the dashboard API when reachable, else
     records nulls with a note. Never deletes anything: the bundle, its
     plan, and its history stay, and ``ws restore`` reopens it.
+
+    The eligibility checks read outside the per-bundle lock, so the
+    state, ``state_changed_at``, and plan mtime they saw are snapshotted
+    first and re-verified under the write lock: a bundle that moved (or
+    whose plan was rewritten) in between is refused as changed, and the
+    frozen summary is built from data re-read under the lock.
     """
     from dash.bundles import _atomic_write, _bundle_lock, _read_json, approvals_for, bundle_dir
 
@@ -381,6 +402,11 @@ def archive_bundle(
     if frm == "dropped":
         print(f"{ws} is dropped and cannot be archived. Run: python3 agent_dash.py ws list --state all", flush=True)
         return errors.USAGE
+    # Snapshot what the unlocked eligibility checks below are about to
+    # judge, so the write lock can refuse a bundle that moved meanwhile.
+    snap_state = frm
+    snap_changed_at = meta.get("state_changed_at")
+    snap_plan_stamp = _plan_stamp(path)
     from dash.bundles import resolve_plan
     from dash.plans import plan_progress
 
@@ -425,22 +451,13 @@ def archive_bundle(
             flush=True,
         )
         return errors.USAGE
-    trains = body.get("trains") if isinstance(body.get("trains"), list) else []
-    approvals = approvals_for(ws, root)
+    # The dashboard usage fetch stays outside the lock: it is network I/O
+    # with its own short timeout, and its result (totals or nulls with a
+    # note) is only recorded, never judged.
     usage = fetch_workstream_usage(base_url, ws)
-    started_at, _last = _history_bounds(path)
-    summary = freeze_summary(
-        ws,
-        started_at=started_at,
-        finished_at=moment,
-        progress=progress,
-        trains=trains,
-        approvals=approvals,
-        usage=usage,
-        closing_report=has_report,
-        closing_report_name=CLOSING_REPORT.name if has_report else None,
-        note=note.strip() if isinstance(note, str) and note.strip() else None,
-    )
+    pre_lock = _ARCHIVE_PRE_LOCK_HOOK
+    if pre_lock is not None:
+        pre_lock(ws, path)
     with _bundle_lock(path):
         meta = _read_json(path / "bundle.json")
         if not isinstance(meta, dict):
@@ -450,6 +467,50 @@ def archive_bundle(
         if frm == "archived":
             print(f"{ws} is already archived. Run: python3 agent_dash.py ws restore {ws} to reopen it", flush=True)
             return errors.USAGE
+        if frm == "dropped" or frm != snap_state or meta.get("state_changed_at") != snap_changed_at or _plan_stamp(path) != snap_plan_stamp:
+            print(
+                f"refusing to archive {ws}: the bundle changed while preparing "
+                f"(state {snap_state} -> {frm}). Reload and retry: "
+                f"python3 agent_dash.py ws archive {ws}",
+                flush=True,
+            )
+            return errors.USAGE
+        # Freeze the summary from data re-read under the lock, so the
+        # card records the plan the lock verified, not the one the
+        # unlocked checks saw.
+        fresh = _read_json(path / "plan.json")
+        if not isinstance(fresh, dict):
+            try:
+                _source, fresh = resolve_plan(ws)
+            except Exception:
+                fresh = None
+        if not isinstance(fresh, dict):
+            print(errors.plan_unreadable(ws), flush=True)
+            return errors.INVALID_DATA
+        progress = fresh.get("progress") if isinstance(fresh.get("progress"), dict) else None
+        if progress is None:
+            dag = fresh.get("dag") if isinstance(fresh.get("dag"), dict) else {}
+            groups = dag.get("groups") if isinstance(dag.get("groups"), list) else []
+            if not groups and isinstance(fresh.get("groups"), list):
+                groups = fresh.get("groups")
+            progress = plan_progress(groups)
+        trains = fresh.get("trains") if isinstance(fresh.get("trains"), list) else []
+        approvals = approvals_for(ws, root)
+        started_at, _last = _history_bounds(path)
+        report = closing_report_path(path)
+        has_report = report.is_file()
+        summary = freeze_summary(
+            ws,
+            started_at=started_at,
+            finished_at=moment,
+            progress=progress,
+            trains=trains,
+            approvals=approvals,
+            usage=usage,
+            closing_report=has_report,
+            closing_report_name=CLOSING_REPORT.name if has_report else None,
+            note=note.strip() if isinstance(note, str) and note.strip() else None,
+        )
         meta["state"] = "archived"
         meta["state_changed_at"] = moment
         meta["archived_at"] = moment

@@ -48,6 +48,27 @@ _WS = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 #: Cap on an action body: a workstream id is at most 64 chars.
 _MAX_BODY = 8192
 
+#: A stalled POST body must not hold a handler thread forever.
+_BODY_READ_TIMEOUT_S = 10
+
+
+class BadContentType(ValueError):
+    """The POST did not carry ``Content-Type: application/json`` (a 415)."""
+
+
+def _readonly_value(value) -> bool:
+    """True when a config ``readonly`` value means read-only.
+
+    Strings compare case-insensitively (``"True"``, ``"YES"``, ``"on"``,
+    ``"1"`` all count), so a hand-written config cannot slip through on
+    capitalisation.
+    """
+    if value is True or value == 1:
+        return True
+    if isinstance(value, str) and value.strip().lower() in ("1", "true", "yes", "on"):
+        return True
+    return False
+
 #: Bundle kinds (and the ids) the page may never archive.
 _PROGRAM_KINDS = ("program",)
 _NEVER_ARCHIVE_IDS = ("OVERVIEW",)
@@ -63,7 +84,7 @@ def actions_enabled(cfg=None) -> bool:
     """
     if (os.environ.get("AGENT_DASH_READONLY") or "").strip() == "1":
         return False
-    if isinstance(cfg, dict) and cfg.get("readonly") in (True, 1, "1", "true", "yes"):
+    if isinstance(cfg, dict) and _readonly_value(cfg.get("readonly")):
         return False
     return True
 
@@ -147,12 +168,55 @@ def api_error_compat(error: str, code: str, hint: str) -> dict:
     return errors.api_error(error, code, hint)
 
 
+def _reject_dupes(pairs):
+    """``object_pairs_hook`` that refuses duplicate JSON keys with a 400."""
+    body = {}
+    for key, value in pairs:
+        if key in body:
+            raise ValueError("bad body")
+        body[key] = value
+    return body
+
+
+def _read_body(handler, length: int) -> bytes:
+    """Read exactly ``length`` body bytes with a bounded socket timeout.
+
+    A stalled client must not hold a handler thread forever: the read
+    runs under a short socket timeout (restored afterwards), and a
+    timeout surfaces as ``OSError`` (``socket.timeout`` subclasses it),
+    which the caller folds into ``bad body`` like any other short read.
+    """
+    conn = getattr(handler, "connection", None)
+    if conn is None:
+        return handler.rfile.read(length)
+    try:
+        old_timeout = conn.gettimeout()
+    except (OSError, ValueError):
+        return handler.rfile.read(length)
+    try:
+        try:
+            conn.settimeout(_BODY_READ_TIMEOUT_S)
+        except (OSError, ValueError):
+            pass
+        return handler.rfile.read(length)
+    finally:
+        try:
+            conn.settimeout(old_timeout)
+        except (OSError, ValueError):
+            pass
+
+
 def read_ws_body(handler) -> str:
     """The ``{"ws": "<ID>"}`` body. Raises ValueError naming the problem.
 
     The body carries the workstream id and nothing else: extra fields,
-    a missing id, a bad id shape, or unparseable JSON are all a 400.
+    a missing id, a bad id shape, duplicate JSON keys, or unparseable
+    JSON are all a 400. A missing or non-JSON ``Content-Type`` raises
+    ``BadContentType`` (served as a 415, not a 400).
     """
+    content_type = (handler.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+    if content_type != "application/json":
+        raise BadContentType("bad content type")
     try:
         length = int(handler.headers.get("Content-Length") or 0)
     except (TypeError, ValueError):
@@ -160,11 +224,11 @@ def read_ws_body(handler) -> str:
     if length <= 0 or length > _MAX_BODY:
         raise ValueError("bad body")
     try:
-        raw = handler.rfile.read(length)
+        raw = _read_body(handler, length)
     except (OSError, ValueError):
         raise ValueError("bad body")
     try:
-        body = json.loads(raw.decode("utf-8"))
+        body = json.loads(raw.decode("utf-8"), object_pairs_hook=_reject_dupes)
     except (ValueError, UnicodeDecodeError):
         raise ValueError("bad body")
     if not isinstance(body, dict):
@@ -174,21 +238,29 @@ def read_ws_body(handler) -> str:
         raise ValueError("ws required")
     if set(body) != {"ws"}:
         raise ValueError("bad body")
-    if not _WS.match(ws):
+    if ws in (".", "..") or not _WS.match(ws):
         raise ValueError("bad ws")
     return ws
 
 
 def _bundle_meta(ws: str):
-    """``(path, meta)`` for ``ws`` under the bundle root, or ``(None, None)``."""
+    """``(path, meta)`` for ``ws`` under the bundle root, or ``(None, None)``.
+
+    The resolved bundle must name the requested id exactly: both the
+    directory name and the ``bundle.json`` ``id`` must equal ``ws``,
+    else the request is an alias miss (a case-insensitive-filesystem
+    twin like ``ws1`` for ``WS1``, or a symlink pointing at another
+    bundle) and reads as not found. Archiving through an alias would
+    write the wrong bundle's lifecycle fields.
+    """
     from dash.bundles import _read_json, bundle_dir
 
     path = bundle_dir(ws)
-    if path is None:
+    if path is None or path.name != ws:
         return None, None
     meta = _read_json(path / "bundle.json")
-    if not isinstance(meta, dict):
-        return path, None
+    if not isinstance(meta, dict) or meta.get("id") != ws:
+        return None, None
     return path, meta
 
 
@@ -298,9 +370,26 @@ def _lifecycle_result(server, ws: str, action: str, code: int, output: str) -> t
         )
     hint = " ".join(output.split()) or "See the CLI for the next step."
     if code == errors.INVALID_DATA:
+        if "plan.json" in output:
+            return (
+                500,
+                {**errors.api_error(errors.plan_unreadable(ws), "invalid_data", f"Run: python3 agent_dash.py ws validate {ws}"), "ws": ws},
+            )
         return (
             500,
             {**errors.api_error(f"bundle.json for {ws} is unreadable", "invalid_data", f"Run: python3 agent_dash.py ws validate {ws}"), "ws": ws},
+        )
+    if "changed while preparing" in output:
+        return (
+            409,
+            {
+                **errors.api_error(
+                    f"{ws} changed while the archive was being prepared",
+                    "changed",
+                    "Reload the workstream and retry the archive.",
+                ),
+                "ws": ws,
+            },
         )
     return (
         409,

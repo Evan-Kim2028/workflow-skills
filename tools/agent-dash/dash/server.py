@@ -537,10 +537,41 @@ class Handler(BaseHTTPRequestHandler):
             return
         try:
             ws = actions_mod.read_ws_body(self)
+        except actions_mod.BadContentType:
+            self._json(
+                415,
+                api_error(
+                    "expected Content-Type: application/json",
+                    "unsupported_media_type",
+                    "Send JSON {\"ws\": \"<ID>\"} with Content-Type: application/json, e.g. POST /api/workstreams/archive.",
+                ),
+            )
+            return
         except ValueError as exc:
             self._json(400, api_error(str(exc) or "bad request", "bad_request", _hint_for(str(exc))))
             return
-        status, body = actions_mod.perform(self.server, action, ws)
+        try:
+            status, body = actions_mod.perform(self.server, action, ws)
+        except Exception as exc:
+            # A failed write (read-only bundle dir, full disk, or any
+            # other surprise from the lifecycle functions) is a 500 in
+            # the house shape, never a dropped connection: the body
+            # names no path, and the one log line names only the
+            # workstream id and the exception class (no traceback).
+            code = "write_failed" if isinstance(exc, OSError) else "internal"
+            actions_mod.LOG.warning("%s %s failed (%s)", action, ws, type(exc).__name__)
+            self._json(
+                500,
+                {
+                    **api_error(
+                        f"{action} failed for {ws}",
+                        code,
+                        f"Retry, or run: python3 agent_dash.py ws validate {ws}",
+                    ),
+                    "ws": ws,
+                },
+            )
+            return
         self._json(status, body)
 
     def _project_graph(self, _query):
