@@ -17,8 +17,52 @@
 (function (global) {
   "use strict";
   var FIXMAP = {"/api/snapshot": "snapshot", "/api/runs": "runs", "/api/usage": "usage-model-hour", "/api/concurrency": "concurrency", "/api/sessions": "sessions", "/api/workstreams": "workstreams", "/api/project": "project", "/api/projects": "projects", "/api/archive": "archive", "/api/health": "health", "/api/reconcile": "reconcile"};
+  /* Hidden-tab pause: stream ticks and background warmups cost server
+     work and renders nobody sees, so they no-op while hidden; the next
+     visible tick refreshes. */
+  function tabHidden() {
+    try { return typeof document !== "undefined" && !!document.hidden; }
+    catch (e) { return false; }
+  }
+  /* Conditional refetch: the server tags every 200 with an ETag and
+     answers 304 when the entry is unchanged, so idle ticks cost headers
+     only. Bodies wait here keyed by URL (bounded); a 304 replays the
+     stored body, a lost entry refetches unconditionally. */
+  var condTag = {};
+  var condBody = {};
+  var condOrder = [];
+  function condSave(url, tag, body) {
+    if (!tag) return body;
+    condTag[url] = tag;
+    condBody[url] = body;
+    condOrder.push(url);
+    while (condOrder.length > 24) {
+      var old = condOrder.shift();
+      if (old !== url) { delete condTag[old]; delete condBody[old]; }
+    }
+    return body;
+  }
+  function condFetch(url, tag) {
+    var headers = {};
+    if (tag) headers["If-None-Match"] = tag;
+    return fetch(url, {headers: headers});
+  }
+  function condRead(url, r) {
+    var tag = (r.headers && r.headers.get) ? r.headers.get("ETag") : null;
+    return r.json().then(function (j) { return condSave(url, tag, j); });
+  }
+  function snapSig(j) {
+    /* Render signature: the snapshot minus its volatile clock. Equal
+       signatures mean an identical render, so stream ticks that only move
+       the store sequence skip drawMain instead of rebuilding sections. */
+    if (!j || typeof j !== "object") return null;
+    try {
+      return JSON.stringify(j, function (k, v) { return k === "now" ? 0 : v; });
+    } catch (e) { return null; }
+  }
   function api(path, params) {
     var qs = new URLSearchParams(params || {}).toString();
+    var url = path + (qs ? "?" + qs : "");
     if (FIX) {
       if (path === "/api/approvals") {
         return fetch("../fixtures/approvals.json").then(function (r) { if (!r.ok) throw new Error(r.status); return r.json(); }).then(function (j) {
@@ -51,7 +95,17 @@
       if (path === "/api/replay") base = "replay-" + params.ws;
       return fetch("../fixtures/" + base + ".json").then(function (r) { if (!r.ok) throw new Error(r.status); return r.json(); });
     }
-    return fetch(path + (qs ? "?" + qs : "")).then(function (r) { if (!r.ok) throw new Error(r.status); return r.json(); });
+    return condFetch(url, condTag[url]).then(function (r) {
+      if (r.status === 304) {
+        if (condBody[url]) return JSON.parse(JSON.stringify(condBody[url]));
+        return condFetch(url, null).then(function (r2) {
+          if (!r2.ok) throw new Error(r2.status);
+          return condRead(url, r2);
+        });
+      }
+      if (!r.ok) throw new Error(r.status);
+      return condRead(url, r);
+    });
   }
   window.DashApi = api;
   function approvalList(j) {
@@ -130,6 +184,7 @@
       state.seq = parts[0].seq;
       state.runs = parts[1];
       state.usage = Array.isArray(parts[0].usage) ? parts[0].usage : [];
+      state.snapSig = snapSig(parts[0]);
       state.conc = parts[2];
       state.archive = (parts[4] && parts[4].archive) ? parts[4] : {archive: [], totals: {workstreams: 0, tokens: 0, cost_usd: 0.0, runs: 0}};
       state.approvals = parts[5];
@@ -155,7 +210,7 @@
   /* Warm every other tab's Execution data in the background, one tab at a time, so a first switch draws from cache instantly. Entries are keyed by tab and group (one fixed 24 h window) with the window captured up front, and fresh entries are not refetched. */
   var warming = false;
   function warmTabs() {
-    if (warming || FIX || isProjectView()) return;
+    if (warming || FIX || isProjectView() || tabHidden()) return;
     var group = state.groupBy, reqSince = Math.floor(Date.now() / 1000 - WINDOW_HOURS * 3600);
     var list = ["all"].concat(shown(state.wss).map(function (w) { return w.ws; })).filter(function (ws) { return ws !== state.ws; });
     if (!list.length) return;
@@ -239,6 +294,10 @@
     ];
     return Promise.all(jobs).then(function (parts) {
       if (gen !== execGen || !ADC.applies(key, state)) return;
+      /* Landing can flip exec to a project view mid-flight (boot no
+         longer waits for nav): hand off instead of drawing exec under
+         it. The project refresh reuses the same cached responses. */
+      if (isProjectView()) { refreshProject(); return; }
       if (!parts[0]) {
         showSnapError(ws);
         if (state.view === "exec") { drawMain(); setLive(false); }
@@ -251,6 +310,7 @@
       state.seq = parts[0].seq;
       state.runs = parts[1];
       state.usage = Array.isArray(parts[0].usage) ? parts[0].usage : [];
+      state.snapSig = snapSig(parts[0]);
       state.conc = parts[2];
       state.plan = parts[4];
       state.approvals = parts[5];
@@ -277,6 +337,7 @@
     if (FIX || !window.EventSource) return;
     var es = new EventSource("/api/stream");
     es.addEventListener("tick", function (ev) {
+      if (tabHidden()) return;
       try {
         var d = JSON.parse(ev.data);
         var nowS = d.now || Date.now() / 1000;
@@ -295,10 +356,20 @@
      carries the usage buckets, and totals plus buckets apply together. */
   function refreshSnapshot() {
     if (window.__adReplayOn) return;
+    if (tabHidden()) return;
     var ws = state.ws, key = reqKey();
     api("/api/snapshot", {ws: ws, since: since(), usage_group: groupFor()}).then(function (j) {
       if (!ADC.applies(key, state)) return;
       clearSnapError();
+      var sig = snapSig(j);
+      if (sig !== null && sig === state.snapSig) {
+        if (j.seq !== state.seq) state.lastSeqChange = Date.now() / 1000;
+        state.seq = j.seq;
+        if (j.last_data_ts != null) state.lastDataTs = j.last_data_ts;
+        updateStale();
+        return;
+      }
+      state.snapSig = sig;
       if (j.seq !== state.seq) state.lastSeqChange = Date.now() / 1000;
       if (j.last_data_ts != null) state.lastDataTs = j.last_data_ts;
       state.snap = j; state.seq = j.seq;
@@ -312,6 +383,8 @@
   }
   var AdPage = (global.AdPage = global.AdPage || {});
   AdPage.FIXMAP = FIXMAP;
+  AdPage.tabHidden = tabHidden;
+  AdPage.snapSig = snapSig;
   AdPage.api = api;
   AdPage.approvalList = approvalList;
   AdPage.loadNav = loadNav;
@@ -331,6 +404,8 @@
   AdPage.stream = stream;
   AdPage.refreshSnapshot = refreshSnapshot;
   global.FIXMAP = FIXMAP;
+  global.tabHidden = tabHidden;
+  global.snapSig = snapSig;
   global.api = api;
   global.approvalList = approvalList;
   global.loadNav = loadNav;

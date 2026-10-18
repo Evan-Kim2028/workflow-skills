@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import gzip
+import hashlib
 import json
 import logging
 import re
@@ -127,6 +129,53 @@ class DashServer(ThreadingHTTPServer):
         self._disconnects_lock = threading.Lock()
         super().__init__((host, port), Handler)
 
+    def warm(self) -> None:
+        """Fill the hot caches off the request path, in a daemon thread.
+
+        The first ``/api/state`` otherwise pays the full usage fold, a
+        dozen plan reads plus validations, and a ``ps`` storm (~0.8 s on a
+        large database). Warming at startup moves that work to process
+        start so the first request serves warm (~ms). Opt-in: tests and
+        CLIs construct ``DashServer`` without it; the serve path calls it.
+        Never raises.
+        """
+        def _fill():
+            try:
+                from dash.state import build_state
+
+                now = time.time()
+                processes = _live_workers()
+                build_state(
+                    self.store, self.registry, self.cfg,
+                    now=now, processes=processes, build=self.build,
+                )
+                store = self.store
+                store.snapshot_cached(now, "all")
+                # Page-shaped entries: the first load fetches the all-scope
+                # snapshot with usage buckets and both workstream scopes, so
+                # precompute those keys too (shared caches fill as a side
+                # effect even when the seq already moved on).
+                since = now - 24 * 3600
+                store.snapshot_cached(now, "all", since, None, usage_group="model")
+                try:
+                    from dash.bundles import workstream_plan_ids
+                    from dash.workstates import STATES, all_bundle_meta
+
+                    meta = all_bundle_meta()
+                    plan_ids = workstream_plan_ids()
+                    store.query_workstreams(plan_ids, since, None, now=now, bundle_meta=meta, allowed_states=None)
+                    store.query_workstreams(plan_ids, since, None, now=now, bundle_meta=meta, allowed_states=set(STATES))
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
+        try:
+            thread = threading.Thread(target=_fill, name="dash-warm", daemon=True)
+            thread.start()
+        except Exception:
+            pass
+
     def note_disconnect(self) -> None:
         """Record a client that went away mid-response. Never raises."""
         now = time.time()
@@ -208,7 +257,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._bundle_page(path)
             elif path == "/api/health":
                 now = time.time()
-                body = self.server.registry.health(now, self.server.cfg)
+                body = _health_with_live(self.server.registry, now, self.server.cfg)
                 body["pricing"] = health_block(self.server.store.usage_model_stats())
                 body["disconnects_1h"] = self.server.disconnects_1h()
                 unpriced = self.server.store.unpriced_models(now, now - 86400, now)
@@ -256,17 +305,24 @@ class Handler(BaseHTTPRequestHandler):
         return
 
     def _state(self):
-        from dash.state import build_state
+        from dash.state import build_state, state_identity
 
+        now = time.time()
+        processes = _live_workers()
+        etag = state_identity(self.server.store, self.server.cfg, processes, now)
+        if self._not_modified(etag):
+            return
         self._json(
             200,
             build_state(
                 self.server.store,
                 self.server.registry,
                 self.server.cfg,
-                processes=_live_workers(),
+                now=now,
+                processes=processes,
                 build=getattr(self.server, "build", None),
             ),
+            etag=etag,
         )
 
     def _project(self):
@@ -331,15 +387,9 @@ class Handler(BaseHTTPRequestHandler):
             self._json(404, api_error("not found", "not_found", "Try GET /api/state for the whole dashboard state."))
             return
         body = target.read_bytes()
-        try:
-            self.send_response(200)
-            self.send_header("Content-Type", types[target.suffix])
-            self.send_header("Content-Length", str(len(body)))
-            self.send_header("Cache-Control", "no-store")
-            self.end_headers()
-            self.wfile.write(body)
-        except (BrokenPipeError, ConnectionResetError):
-            self.server.note_disconnect()
+        # Stat tag + revalidate (no-cache): reloads cost a 304, never a
+        # stale script, and never a full re-download when unchanged.
+        self._send_body(200, body, types[target.suffix], etag=_stat_etag(target))
 
     def _problem_doc(self, name):
         """Serve one runbook from docs/problems/ as text. Only bare ``<slug>.md`` names; anything else is a 404."""
@@ -348,15 +398,7 @@ class Handler(BaseHTTPRequestHandler):
             self._json(404, api_error("not found", "not_found", "Try GET /api/state for the whole dashboard state."))
             return
         body = target.read_bytes()
-        try:
-            self.send_response(200)
-            self.send_header("Content-Type", "text/plain; charset=utf-8")
-            self.send_header("Content-Length", str(len(body)))
-            self.send_header("Cache-Control", "no-store")
-            self.end_headers()
-            self.wfile.write(body)
-        except (BrokenPipeError, ConnectionResetError):
-            self.server.note_disconnect()
+        self._send_body(200, body, "text/plain; charset=utf-8", etag=_stat_etag(target))
 
     def _taskmap(self):
         from dash.locate import layered_path
@@ -373,10 +415,9 @@ class Handler(BaseHTTPRequestHandler):
         if path.is_file():
             body = path.read_bytes()
             content_type = "text/html; charset=utf-8"
+            self._send_body(200, body, content_type, etag=_stat_etag(path))
         else:
-            body = PLACEHOLDER
-            content_type = "text/html; charset=utf-8"
-        self._bytes(200, body, content_type)
+            self._bytes(200, PLACEHOLDER, "text/html; charset=utf-8")
 
     def _snapshot(self, query):
         ws = _ws(query, default="all")
@@ -384,9 +425,23 @@ class Handler(BaseHTTPRequestHandler):
         since = _float(query, "since")
         until = _float(query, "until")
         usage_group = _one(query, "usage_group")
+        store = self.server.store
+        try:
+            ident = (
+                "snapshot",
+                store.snapshot_key(ws, since, until, usage_group),
+                store.data_seq,
+                store.seq,
+            )
+        except Exception:
+            ident = None
+        etag = _identity_etag(*ident) if ident is not None else None
+        if self._not_modified(etag):
+            return
         self._json(
             200,
-            self.server.store.snapshot_cached(now, ws, since, until, usage_group=usage_group),
+            store.snapshot_cached(now, ws, since, until, usage_group=usage_group),
+            etag=etag,
         )
 
     def _workstreams(self, query):
@@ -394,11 +449,20 @@ class Handler(BaseHTTPRequestHandler):
 
         since = _float(query, "since")
         until = _float(query, "until")
+        now = time.time()
         allowed = parse_state_param(_one(query, "state"))
         meta = all_bundle_meta()
         plan_ids = workstream_plan_ids()
-        rows = self.server.store.query_workstreams(
-            plan_ids, since, until,
+        store = self.server.store
+        try:
+            wkey = store.workstreams_key(plan_ids, since, until, now, meta, allowed)
+        except Exception:
+            wkey = None
+        etag = _identity_etag("workstreams", wkey) if wkey is not None else None
+        if self._not_modified(etag):
+            return
+        rows = store.query_workstreams(
+            plan_ids, since, until, now=now,
             bundle_meta=meta, allowed_states=allowed,
         )
         have = {row.get("ws") for row in rows}
@@ -409,7 +473,7 @@ class Handler(BaseHTTPRequestHandler):
         for row in rows:
             if "progress" not in row:
                 row["progress"] = _row_progress(row.get("ws"))
-        self._json(200, {"workstreams": rows})
+        self._json(200, {"workstreams": rows}, etag=etag)
 
     def _archive(self, _query):
         """``GET /api/archive``: frozen summary cards for archived workstreams.
@@ -542,7 +606,24 @@ class Handler(BaseHTTPRequestHandler):
         include = _one(query, "include")
         if include is not None and include != "jobs":
             raise ValueError("bad include")
-        self._json(200, {"runs": self.server.store.query_runs(now, ws, since, until, limit, include_jobs=include == "jobs")})
+        # Identity tag names the entry (seqs, quantized window, minute):
+        # per-request fields like elapsed_s make content hashes useless,
+        # but the rows only move on store writes, so a match skips the
+        # whole query and the megabytes of transfer.
+        store = self.server.store
+        try:
+            ident = (
+                "runs", ws,
+                None if since is None else int(float(since) // 30),
+                None if until is None else int(float(until) // 30),
+                limit, include, int(now // 60), store.data_seq, store.seq,
+            )
+        except Exception:
+            ident = None
+        etag = _identity_etag(*ident) if ident is not None else None
+        if self._not_modified(etag):
+            return
+        self._json(200, {"runs": store.query_runs(now, ws, since, until, limit, include_jobs=include == "jobs")}, etag=etag)
 
     def _usage(self, query):
         group = _choice(query, "group", "model", {"model", "workstream", "tool"})
@@ -559,7 +640,17 @@ class Handler(BaseHTTPRequestHandler):
             since = now - 24 * 3600
         step = _float(query, "step") or 60.0
         ws = _ws(query, default=None)
-        self._json(200, {"points": self.server.store.query_concurrency(now, ws, since, step)})
+        # Same identity-tag rationale as /api/runs: the point grid slides
+        # with the request clock, but the lanes only move on store writes.
+        store = self.server.store
+        try:
+            ident = ("concurrency", ws, int(float(since) // 30), float(step), int(now // 60), store.data_seq, store.seq)
+        except Exception:
+            ident = None
+        etag = _identity_etag(*ident) if ident is not None else None
+        if self._not_modified(etag):
+            return
+        self._json(200, {"points": store.query_concurrency(now, ws, since, step)}, etag=etag)
 
     def _plan(self, query):
         ws = _one(query, "ws")
@@ -607,7 +698,7 @@ class Handler(BaseHTTPRequestHandler):
         if not path.is_file():
             self._json(404, api_error("not found", "not_found", "Try GET /api/state for the whole dashboard state."))
             return
-        self._bytes(200, path.read_bytes(), "text/html; charset=utf-8")
+        self._send_body(200, path.read_bytes(), "text/html; charset=utf-8", etag=_stat_etag(path))
 
     def _approvals(self, query):
         ws = _one(query, "ws")
@@ -721,20 +812,82 @@ class Handler(BaseHTTPRequestHandler):
             if self.server.stop.wait(interval):
                 return
 
-    def _json(self, status: int, body: dict) -> None:
+    def _json(self, status: int, body: dict, etag: str | None = None) -> None:
         raw = json.dumps(body, separators=(",", ":"), allow_nan=False).encode()
-        self._bytes(status, raw, "application/json; charset=utf-8")
+        self._send_body(status, raw, "application/json; charset=utf-8", etag=etag)
 
     def _bytes(self, status: int, body: bytes, content_type: str) -> None:
+        self._send_body(status, body, content_type)
+
+    def _request_header(self, name: str):
+        """One request header, or None outside a real request (unit stubs)."""
+        headers = getattr(self, "headers", None)
+        if headers is None:
+            return None
+        try:
+            return headers.get(name)
+        except Exception:
+            return None
+
+    def _not_modified(self, etag: str | None, cache: str = "no-store") -> bool:
+        """Send 304 when ``If-None-Match`` names ``etag``. True when sent."""
+        if etag is None or not _etag_matches(self._request_header("If-None-Match"), etag):
+            return False
+        try:
+            self.send_response(304)
+            self.send_header("ETag", etag)
+            self.send_header("Cache-Control", cache)
+            self.end_headers()
+        except (BrokenPipeError, ConnectionResetError):
+            self.server.note_disconnect()
+        return True
+
+    def _send_body(self, status: int, body: bytes, content_type: str, etag: str | None = None) -> None:
+        """Send a body with ETag revalidation and gzip for big payloads.
+
+        Every 200 response carries an ETag (content hash, or the caller's
+        stat-based tag for files): a matching ``If-None-Match`` answers
+        304 with no body, so idle ticks and reloads cost headers only.
+        Bodies over 8 KB go out gzipped when the client accepts it
+        (``/api/runs`` shrinks from ~2 MB to ~150 KB). Errors never 304:
+        only 200s revalidate.
+        """
+        use_etag = etag if etag is not None else (_content_etag(body) if status == 200 else None)
+        if status == 200 and use_etag is not None:
+            cache = "no-store" if content_type.startswith("application/json") else "no-cache"
+            if self._not_modified(use_etag, cache):
+                return
+        encoding = None
+        if len(body) > 8192 and _accepts_gzip(self._request_header("Accept-Encoding")):
+            body = gzip.compress(body, compresslevel=4)
+            encoding = "gzip"
         try:
             self.send_response(status)
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(body)))
-            self.send_header("Cache-Control", "no-store")
+            if encoding is not None:
+                self.send_header("Content-Encoding", "gzip")
+                self.send_header("Vary", "Accept-Encoding")
+            if use_etag is not None:
+                self.send_header("ETag", use_etag)
+            self.send_header("Cache-Control", "no-store" if content_type.startswith("application/json") else "no-cache")
             self.end_headers()
-            self.wfile.write(body)
+            if status != 304:
+                self.wfile.write(body)
         except (BrokenPipeError, ConnectionResetError):
             self.server.note_disconnect()
+
+
+#: Live-worker ``ps`` listing cache: ``{"at", "rows"}`` under ``_LIVE_LOCK``.
+#: Spawning half a dozen ``ps`` children costs ~200 ms on a loaded host,
+#: and ``/api/state``, ``/api/health``, and ``/api/reconcile`` each listed
+#: live workers per request. A 15 s TTL keeps liveness seconds-stale (well
+#: inside the unseen-worker grace of two poll intervals) while idle ticks
+#: skip the spawn storm. Copies on the way out; tests still stub this
+#: function outright.
+_LIVE_WORKERS_TTL_S = 15.0
+_LIVE_WORKERS_CACHE: dict = {"at": 0.0, "rows": []}
+_LIVE_WORKERS_LOCK = threading.Lock()
 
 
 def _live_workers() -> list:
@@ -744,12 +897,96 @@ def _live_workers() -> list:
     yields no unseen-worker mismatches rather than failing the endpoint.
     Tests stub this function to isolate from machine-global ps state.
     """
+    now = time.monotonic()
+    with _LIVE_WORKERS_LOCK:
+        if now - _LIVE_WORKERS_CACHE["at"] < _LIVE_WORKERS_TTL_S:
+            return [dict(row) for row in _LIVE_WORKERS_CACHE["rows"]]
     try:
         from dash.sources.process import live_worker_processes
 
-        return live_worker_processes() or []
+        rows = live_worker_processes() or []
     except Exception:
         return []
+    with _LIVE_WORKERS_LOCK:
+        _LIVE_WORKERS_CACHE["at"] = time.monotonic()
+        _LIVE_WORKERS_CACHE["rows"] = [dict(row) for row in rows]
+    return [dict(row) for row in rows]
+
+
+def _health_with_live(registry, now: float, cfg, processes=None):
+    """``registry.health`` fed by the cached live-worker listing.
+
+    The real registry's ``describe_roots`` used to spawn its own ``ps``
+    storm per request (``processes="auto"``); passing the 15 s TTL listing
+    keeps the same labels without the spawn. Stub registries (tests, CLI)
+    keep their two-arg call and never pay for a listing they ignore.
+    """
+    live = processes
+    real = False
+    try:
+        from dash.sources import Registry as _Registry
+
+        real = isinstance(registry, _Registry)
+    except Exception:
+        real = False
+    if live is None and real:
+        try:
+            live = _live_workers()
+        except Exception:
+            live = None
+    if live is not None or real:
+        try:
+            return registry.health(now, cfg, processes=live)
+        except TypeError:
+            pass
+    try:
+        return registry.health(now, cfg)
+    except TypeError:
+        return registry.health(now)
+
+
+def _content_etag(body: bytes) -> str:
+    """Opaque content tag for a response body (never a path or datum)."""
+    return '"%s"' % hashlib.sha256(body).hexdigest()[:32]
+
+
+def _identity_etag(*parts) -> str:
+    """Opaque tag for an identity (seqs, params, file stamps), not content.
+
+    Lets endpoints 304 without recomputing: the tag names the exact cache
+    entry the bytes would come from, so a match means the client's copy is
+    current (modulo volatile timestamps like ``now``, which revalidate
+    does not cover and readers already tolerate).
+    """
+    digest = hashlib.sha256(repr(parts).encode("utf-8")).hexdigest()[:32]
+    return '"id-%s"' % digest
+
+
+def _stat_etag(path: Path) -> str | None:
+    """Cheap file tag from ``(mtime_ns, size)``: an edit always retags."""
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    return '"%x-%x"' % (stat.st_mtime_ns, stat.st_size)
+
+
+def _etag_matches(header_value, etag: str) -> bool:
+    """True when ``If-None-Match`` names our tag (or ``*``)."""
+    if not header_value or not etag:
+        return False
+    tags = [tag.strip() for tag in str(header_value).split(",")]
+    return etag in tags or "*" in tags
+
+
+def _accepts_gzip(header_value) -> bool:
+    """True when the client offers gzip in ``Accept-Encoding``."""
+    if not header_value:
+        return False
+    return any(
+        part.strip().split(";")[0].strip().lower() == "gzip"
+        for part in str(header_value).split(",")
+    )
 
 
 def _last_poll(registry) -> float | None:

@@ -7,13 +7,14 @@ helpers. Every method runs under the facade lock.
 
 from __future__ import annotations
 
+from bisect import bisect_right
+
 from dash.attribution import clean_label
 from dash.models import run_model_key
 
 from .runs import _parent_map
 from .summarize import _scope_tab
 from .util import (BILLED_FIELDS, RANGE_S, WS_STATUSES,
-                 _active,
                  _drop_launch_echoes, _is_counted_agent,
                  _money, _sum_costs, _tool_key, _ws_sort)
 
@@ -224,19 +225,51 @@ class QueriesMixin:
             ]
             if ws and ws != "all":
                 runs = [run for run in runs if run["workstream"] == ws]
+            # Sweep-line over start/end events: one bisect per (tool, model)
+            # lane per point instead of one _active check per run per point.
+            # Boundaries match _active exactly: a start at t counts
+            # (start <= t), a finish at t does not (t < end), and a running
+            # run stays open through now (t <= now). Lanes keep first-run
+            # order so the per-point models dict reads identically.
+            lanes: dict = {}
+            for run in runs:
+                key = _tool_key(run)
+                if not key:
+                    continue
+                start = run.get("started_at")
+                if start is None:
+                    continue
+                lane = lanes.get((key, run_model_key(run)))
+                if lane is None:
+                    lane = lanes[(key, run_model_key(run))] = ([], [], [])
+                if run.get("status") == "running":
+                    lane[2].append(start)
+                else:
+                    end = run.get("ended_at")
+                    if end is None:
+                        continue
+                    lane[0].append(start)
+                    lane[1].append(end)
+            for starts, ends, _open in lanes.values():
+                starts.sort()
+                ends.sort()
+            for _starts, _ends, open_starts in lanes.values():
+                open_starts.sort()
             points = []
             count = int(span / step) + 1
             for index in range(count):
                 t = since + index * step
                 if t > now + 1e-6:
                     break
+                live = t <= now
                 point = {"t": t, "grok": 0, "muse": 0, "glm": 0, "claude": 0, "models": {}}
-                for run in runs:
-                    key = _tool_key(run)
-                    if key and _active(run, t, now):
-                        point[key] += 1
-                        model = run_model_key(run)
-                        point["models"][model] = point["models"].get(model, 0) + 1
+                for (key, model), (starts, ends, open_starts) in lanes.items():
+                    active = bisect_right(starts, t) - bisect_right(ends, t)
+                    if live:
+                        active += bisect_right(open_starts, t)
+                    if active:
+                        point[key] += active
+                        point["models"][model] = point["models"].get(model, 0) + active
                 points.append(point)
             return points
         def query_sessions(self) -> list:
@@ -297,13 +330,26 @@ class QueriesMixin:
             none. ``allowed_states`` scopes the rows: None keeps the
             default scope (drops ``archived``/``dropped``); a set from
             ``dash.workstates.parse_state_param`` overrides it. The
-            ``unassigned`` row always stays."""
+            ``unassigned`` row always stays.
+
+            Rows serve from a small result cache keyed by
+            :meth:`workstreams_key`: the rollup costs ~140 ms on a large
+            database and the page fetches two scopes per refresh. Copies
+            on the way out: the server adds per-row progress in place.
+            """
+            import copy as _copy
             import time as _time
 
             from dash.workstates import filter_rows as _filter_rows
             from dash.workstates import state_of as _state_of
 
             now = float(now if now is not None else _time.time())
+            key = self.workstreams_key(plan_ws, since, until, now, bundle_meta, allowed_states)
+            if key is not None:
+                with self._lock:
+                    hit = self._workstreams_cache.get(key)
+                    if hit is not None:
+                        return _copy.deepcopy(hit)
             with self._lock:
                 counts = [dict(row) for row in self._conn.execute("SELECT * FROM ws_counts").fetchall()]
                 shown_all, parents = self._shown_locked(now)
@@ -394,4 +440,62 @@ class QueriesMixin:
                 )
             out = _filter_rows(out, allowed_states, bundle_meta)
             out.sort(key=lambda item: _ws_sort(item["ws"]))
+            if key is not None:
+                with self._lock:
+                    if len(self._workstreams_cache) > 8:
+                        self._workstreams_cache.clear()
+                    self._workstreams_cache[key] = _copy.deepcopy(out)
             return out
+        def workstreams_key(
+            self,
+            plan_ws,
+            since: float | None,
+            until: float | None,
+            now: float,
+            bundle_meta: dict | None,
+            allowed_states,
+        ) -> tuple | None:
+            """Identity of a workstream-rows request for caches and ETags.
+
+            Store sequences (every write bumps them), the quantized window
+            and a 60 s ``now`` quantum (liveness moves with time; anything
+            finer-grained recomputes every tick), the plan set, the scope,
+            a digest of the caller's metadata map, and the plan-file stamps
+            behind row progress. None when an input is unhashable: the
+            caller then recomputes without caching.
+            """
+            import hashlib as _hashlib
+
+            try:
+                from dash.bundles import plans_stamp as _plans_stamp
+
+                stamp = _plans_stamp()
+            except Exception:
+                stamp = None
+            try:
+                meta_digest = (
+                    None
+                    if bundle_meta is None
+                    else _hashlib.sha1(repr(bundle_meta).encode("utf-8")).hexdigest()
+                )
+            except Exception:
+                return None
+            try:
+                plans = None if plan_ws is None else frozenset(plan_ws)
+                allowed = None if allowed_states is None else frozenset(allowed_states)
+            except TypeError:
+                return None
+            try:
+                return (
+                    self._data_seq,
+                    self._seq,
+                    None if since is None else int(float(since) // 30),
+                    None if until is None else int(float(until) // 30),
+                    int(float(now) // 60),
+                    plans,
+                    allowed,
+                    meta_digest,
+                    stamp,
+                )
+            except (TypeError, ValueError):
+                return None

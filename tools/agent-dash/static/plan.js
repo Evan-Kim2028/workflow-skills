@@ -103,6 +103,24 @@
     });
   }
 
+  /* Mermaid (3.5 MB) loads on the first plan render, never with the
+     page: the Execution first paint skips parsing it entirely. */
+  var mermaidWaiters = [];
+  function ensureMermaid(done) {
+    if (window.mermaid) { done(); return; }
+    mermaidWaiters.push(done);
+    if (mermaidWaiters.length > 1) return;
+    var script = document.createElement("script");
+    script.src = "/static/vendor/mermaid.min.js";
+    script.onload = function () {
+      var fns = mermaidWaiters;
+      mermaidWaiters = [];
+      fns.forEach(function (fn) { try { fn(); } catch (e) {} });
+    };
+    script.onerror = function () { mermaidWaiters = []; };
+    document.head.appendChild(script);
+  }
+
   function runMermaid() {
     if (!window.mermaid || !sources.length) return;
     var nodes = [];
@@ -399,7 +417,7 @@
     }
     if (hit.html) {
       captureMermaid(main);
-      runMermaid();
+      ensureMermaid(runMermaid);
       var host = main.querySelector("[data-plan-progress]");
       if (host && hit.bundle) drawSummary(host, dagOf(hit.bundle, id), hit.snap || {running: [], recent: []}, id, hit.bundle && hit.bundle.start_prompt, hit.bundle && hit.bundle.progress);
       drawTrains(main, id, hit.bundle);
@@ -554,7 +572,7 @@
     show: show,
     refresh: function () { return current ? refreshProgress(current) : Promise.resolve(); },
     restyle: function () {
-      runMermaid();
+      ensureMermaid(runMermaid);
       if (current) return refreshProgress(current);
     }
   };

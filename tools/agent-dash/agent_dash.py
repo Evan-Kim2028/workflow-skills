@@ -1750,6 +1750,7 @@ def _serve() -> None:
     server = DashServer(store, registry, HOST, _port(), cfg=cfg)
     server.doctor = DoctorScheduler(store, registry, cfg, build=server.build)
     server.doctor.start()
+    server.warm()
     _write_pidfile(os.getpid())
     stop = threading.Event()
 

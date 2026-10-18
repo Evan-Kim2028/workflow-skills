@@ -37,14 +37,18 @@ const MAX_ATTEMPTS = 3;
 const RETRY_MS = 1500;
 
 function args(argv) {
-  const out = { url: "http://127.0.0.1:8765", chrome: null, ws: null };
+  const out = { url: "http://127.0.0.1:8765", chrome: null, ws: null, perf: false };
   for (let i = 0; i < argv.length; i++) {
     const flag = argv[i];
     if (flag === "--url" && argv[i + 1]) out.url = argv[++i].replace(/\/+$/, "");
     else if (flag === "--chrome" && argv[i + 1]) out.chrome = argv[++i];
     else if (flag === "--ws" && argv[i + 1]) out.ws = argv[++i];
+    else if (flag === "--perf") out.perf = true;
     else if (flag === "-h" || flag === "--help") {
-      console.log("usage: page_check.mjs [--url URL] [--chrome PATH] [--ws WS]");
+      console.log("usage: page_check.mjs [--url URL] [--chrome PATH] [--ws WS] [--perf]");
+      console.log("  --perf runs only the snappiness gates: first section under 1.5 s");
+      console.log("  and idle re-renders under 3 per 30 s (run against an idle server;");
+      console.log("  a live server with active writers legitimately re-renders more).");
       process.exit(0);
     } else {
       console.error(`unknown flag ${flag}`);
@@ -436,6 +440,43 @@ async function main() {
           );
         }
       }
+    }
+    if (opts.perf) {
+      // Snappiness gates on a fresh navigation: first section fast, then
+      // a quiet idle. Skips the coherence loops; run against an idle
+      // server (a live one with active writers re-renders for real).
+      await cdp.send("Page.navigate", { url: `${opts.url}/?view=exec&ws=all` });
+      const t0 = Date.now();
+      let firstMs = null;
+      for (;;) {
+        let has = false;
+        try {
+          has = await evaluate(cdp, "!!document.querySelector('[data-sec]')");
+        } catch {
+          has = false;
+        }
+        if (has) {
+          firstMs = Date.now() - t0;
+          break;
+        }
+        if (Date.now() - t0 > 60000) break;
+        await new Promise((r) => setTimeout(r, 100));
+      }
+      console.log(`perf: first section drawn in ${firstMs} ms (budget 1500 ms)`);
+      if (firstMs == null || firstMs > 1500) {
+        throw new Error(`perf: first draw ${firstMs} ms exceeds the 1500 ms budget`);
+      }
+      const rendersBefore = await evaluate(cdp, "window.__adRenders || 0");
+      await new Promise((r) => setTimeout(r, 30000));
+      const rendersAfter = await evaluate(cdp, "window.__adRenders || 0");
+      const idleRenders = rendersAfter - rendersBefore;
+      console.log(`perf: ${idleRenders} idle re-render(s) per 30 s (budget under 3)`);
+      if (idleRenders >= 3) {
+        throw new Error(`perf: ${idleRenders} idle re-renders per 30 s, want under 3`);
+      }
+      console.log("perf: ok");
+      finish(0);
+      return;
     }
     let tabs = [];
     {

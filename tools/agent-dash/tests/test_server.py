@@ -2477,5 +2477,104 @@ class BurnupEndpointTest(unittest.TestCase):
             )
 
 
+def geth(port, path, headers=None):
+    """GET with request headers: returns (status, headers, body)."""
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+    try:
+        conn.request("GET", path, headers=headers or {})
+        response = conn.getresponse()
+        heads = {key.lower(): value for key, value in response.getheaders()}
+        return response.status, heads, response.read()
+    finally:
+        conn.close()
+
+
+class ConditionalGetTest(unittest.TestCase):
+    """ETag revalidation: an unchanged entry 304s, a store write retags."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.store = Store(Path(self.tmp.name) / "dash.sqlite")
+        self.now = time.time()
+        self.store.upsert_run(
+            {
+                "run_id": "muse:cond:ws1-first",
+                "source": "muse",
+                "tier": "muse",
+                "model": "claude-sonnet-4-5",
+                "label": "ws1-first",
+                "session_id": "sess-cond",
+                "status": "done",
+                "started_at": self.now - 5000,
+                "ended_at": self.now - 4000,
+            }
+        )
+        # A persisted doctor run pins generated_at/next_run_at so the
+        # doctor payload is stable across requests (without one,
+        # next_run_at floats on every read and nothing can 304).
+        self.store.doctor_snapshot([], self.now)
+        self.server, self.thread = start(self.store)
+        self.port = self.server.server_address[1]
+
+    def tearDown(self):
+        stop(self.server, self.thread)
+        self.store.close()
+        self.tmp.cleanup()
+
+    def fetch(self, path, tag=None):
+        headers = {} if tag is None else {"If-None-Match": tag}
+        return geth(self.port, path, headers)
+
+    def test_state_304_then_new_etag_after_write(self):
+        status, heads, body = self.fetch("/api/state")
+        self.assertEqual(status, 200)
+        first = json.loads(body)
+        tag = heads.get("etag")
+        self.assertTrue(tag, "state has no ETag")
+        status, _, empty = self.fetch("/api/state", tag)
+        self.assertEqual(status, 304, "unchanged state should 304")
+        self.assertEqual(empty, b"")
+        self.store.upsert_run(
+            {
+                "run_id": "muse:cond:ws1-second",
+                "source": "muse",
+                "tier": "muse",
+                "model": "claude-sonnet-4-5",
+                "label": "ws1-second",
+                "session_id": "sess-cond",
+                "status": "done",
+                "started_at": self.now - 500,
+                "ended_at": self.now - 100,
+            }
+        )
+        status, heads, body = self.fetch("/api/state")
+        self.assertEqual(status, 200)
+        self.assertNotEqual(heads.get("etag"), tag, "write did not retag state")
+        second = json.loads(body)
+        self.assertNotEqual(
+            json.dumps(first["workstreams"], sort_keys=True),
+            json.dumps(second["workstreams"], sort_keys=True),
+            "write did not change state content",
+        )
+        status, _, _ = self.fetch("/api/state", tag)
+        self.assertEqual(status, 200, "stale tag should refetch, not 304")
+
+    def test_snapshot_workstreams_plan_304(self):
+        since = int(self.now - 12 * 3600)
+        for path in (
+            f"/api/snapshot?ws=all&since={since}&usage_group=model",
+            f"/api/workstreams?since={since}",
+            "/api/plan?ws=WS1",
+            "/api/doctor",
+        ):
+            status, heads, _ = self.fetch(path)
+            self.assertEqual(status, 200, path)
+            tag = heads.get("etag")
+            self.assertTrue(tag, f"{path} has no ETag")
+            status, _, empty = self.fetch(path, tag)
+            self.assertEqual(status, 304, f"{path} should 304 when unchanged")
+            self.assertEqual(empty, b"")
+
+
 if __name__ == "__main__":
     unittest.main()

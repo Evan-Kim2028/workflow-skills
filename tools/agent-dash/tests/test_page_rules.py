@@ -130,6 +130,32 @@ class PageRules(unittest.TestCase):
         self.assertIn("xline", body)
         self.assertIn("--warning", body)
 
+    def test_polling_pauses_when_hidden(self):
+        """Background work no-ops while the tab is hidden: stream ticks,
+        warmups, snapshot ticks, and the refresh intervals check first so
+        a hidden tab costs no fetches and no renders."""
+        script = inline_scripts()
+        bodies = dict(functions(script))
+        for name in ("stream", "warmTabs", "refreshSnapshot"):
+            self.assertIn(name, bodies, f"{name} is gone from the page")
+            self.assertIn(
+                "tabHidden", bodies[name], f"{name} polls while the tab is hidden"
+            )
+        page = (STATIC / "index.html").read_text()
+        self.assertGreaterEqual(
+            page.count("document.hidden"), 3, "the refresh intervals never pause when hidden"
+        )
+
+    def test_unchanged_tick_skips_redraw(self):
+        """A stream tick whose snapshot renders identically skips drawMain:
+        the signature covers the payload minus its clock, and refreshAll
+        reseeds it so the next tick compares against the latest draw."""
+        script = inline_scripts()
+        bodies = dict(functions(script))
+        self.assertIn("snapSig", bodies["refreshSnapshot"])
+        self.assertIn("state.snapSig", bodies["refreshSnapshot"])
+        self.assertIn("state.snapSig", bodies["refreshAll"])
+
     def test_refresh_paths_read_one_snapshot_response(self):
         """Tiles and chart come from one snapshot response: refreshAll,
         refreshSnapshot (stream ticks) and warmTabs request usage_group with

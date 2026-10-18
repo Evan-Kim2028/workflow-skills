@@ -130,6 +130,25 @@ class SummarizeMixin:
                         usage_group, "hour", scope_ws, roll["since"], roll["until"]
                     )
                 return response
+        def snapshot_key(
+            self,
+            ws: str = "all",
+            since: float | None = None,
+            until: float | None = None,
+            usage_group: str | None = None,
+        ) -> tuple:
+            """Identity of a snapshot request for caches and ETags.
+
+            Window edges quantize to the same 30 s grid ``snapshot_cached``
+            uses, so the server's conditional tag names the exact entry the
+            bytes would come from. Pair with ``(data_seq, seq)``.
+            """
+            return (
+                ws,
+                None if since is None else int(float(since) // 30),
+                None if until is None else int(float(until) // 30),
+                usage_group,
+            )
         def snapshot_cached(
             self,
             now: float,
@@ -147,8 +166,13 @@ class SummarizeMixin:
             badge covers. Misses compute one full snapshot and fill the cache.
             ``prev_24h`` rides the same entry and the same invalidation as
             every other number: no extra key, same staleness bound.
+            The window edges quantize to a 30 s grid for the key only (the
+            compute still uses the exact edges): the page's ``since`` slides
+            every second, and without this every tick would miss on the key
+            alone. A 24 h window moving by seconds is invisible in the sums.
+            See :meth:`snapshot_key` for the shared key computation.
             """
-            key = (ws, since, until, usage_group)
+            key = self.snapshot_key(ws, since, until, usage_group)
             with self._lock:
                 hit = self._snapshot_cache.get(key)
                 if (

@@ -38,6 +38,8 @@ class BaseMixin:
             self._data_seq = 0
             self._last_data_ts: float | None = None
             self._snapshot_cache: dict = {}
+            self._model_stats_cache = None
+            self._workstreams_cache: dict = {}
             self._prune_after = 0
             self._pruned_since_vacuum = 0
             self._prune_cycles = 0

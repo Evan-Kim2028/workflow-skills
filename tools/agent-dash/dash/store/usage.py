@@ -267,7 +267,18 @@ class UsageMixin:
             out.sort(key=lambda item: (item["t"], str(item["key"] or "")))
             return out
         def usage_model_stats(self) -> list[dict]:
+            """Per-model usage totals, cached by data sequence.
+
+            The full-table ``GROUP BY model`` scan costs tens of ms on a
+            large database and ``/api/health`` calls it on every request,
+            so idle ticks reuse the cached rows: any usage write bumps
+            ``_data_seq`` and invalidates precisely. Callers get fresh
+            row dicts, never the cached objects.
+            """
             with self._lock:
+                hit = self._model_stats_cache
+                if hit is not None and hit[0] == self._data_seq:
+                    return [dict(row) for row in hit[1]]
                 rows = self._conn.execute(
                     """SELECT model AS model, COUNT(*) AS rows,
                               SUM(input_tokens) AS input, SUM(output_tokens) AS output,
@@ -275,6 +286,10 @@ class UsageMixin:
                               SUM(reasoning) AS reasoning
                        FROM usage_events GROUP BY model"""
                 ).fetchall()
+                stats = self._model_stats_rows(rows)
+                self._model_stats_cache = (self._data_seq, stats)
+                return [dict(row) for row in stats]
+        def _model_stats_rows(self, rows) -> list[dict]:
             stats = []
             for row in rows:
                 stats.append(

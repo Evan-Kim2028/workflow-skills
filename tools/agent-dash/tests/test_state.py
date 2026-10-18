@@ -212,6 +212,53 @@ class StateShapeTest(unittest.TestCase):
             Store._summarize_locked = real
         self.assertEqual(len(calls), 1)
 
+    def test_cached_state_equals_uncached(self):
+        """The state body cache serves the same payload a recompute would."""
+        from dash.state import _STATE_CACHE
+
+        _STATE_CACHE.clear()
+        now = time.time()
+        self.store.upsert_run(
+            {
+                "run_id": "muse:cache:ws1-cached",
+                "source": "muse",
+                "tier": "muse",
+                "label": "ws1-cached",
+                "session_id": "s-cache",
+                "status": "done",
+                "started_at": now - 200,
+                "ended_at": now - 100,
+            }
+        )
+        first = build_state(self.store, StubRegistry([]), {}, now=now)
+        second = build_state(self.store, StubRegistry([]), {}, now=now)
+        self.assertEqual(first, second)
+
+    def test_state_write_invalidates_cache(self):
+        """A store write after a cached read changes the served content."""
+        from dash.state import _STATE_CACHE
+
+        _STATE_CACHE.clear()
+        now = time.time()
+        before = build_state(self.store, StubRegistry([]), {}, now=now)
+        self.store.upsert_run(
+            {
+                "run_id": "muse:cache:ws1-fresh",
+                "source": "muse",
+                "tier": "muse",
+                "label": "ws1-fresh",
+                "session_id": "s-cache",
+                "status": "done",
+                "started_at": now - 200,
+                "ended_at": now - 100,
+            }
+        )
+        after = build_state(self.store, StubRegistry([]), {}, now=now)
+        self.assertNotEqual(
+            json.dumps(before["workstreams"], sort_keys=True),
+            json.dumps(after["workstreams"], sort_keys=True),
+        )
+
     def test_verdict_matches_reconcile(self):
         now = time.time()
         self.store.upsert_run(

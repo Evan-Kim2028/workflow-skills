@@ -117,8 +117,10 @@
       return;
     }
     var id = planIdFor(state.ws);
-    var job = window.PlanView ? PlanView.show(id) : null;
-    if (job && job.then) job.then(function (ok) { setLive(ok !== false); scrollHash(); });
+    loadNav().then(function () {
+      var job = window.PlanView ? PlanView.show(id) : null;
+      if (job && job.then) job.then(function (ok) { setLive(ok !== false); scrollHash(); });
+    });
   }
   function selectTab(ws) {
     ws = canonWs(ws);

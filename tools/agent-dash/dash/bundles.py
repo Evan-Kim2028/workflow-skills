@@ -343,11 +343,125 @@ def _view_groups(value) -> list:
     return groups
 
 
+#: ``bundle_plan_view`` results keyed by ``(base, ws)``: the entry also
+#: holds the ``(mtime_ns, size)`` of every file the view reads, so an edit
+#: to any of them misses precisely and an untouched bundle never re-reads
+#: or re-validates. Entries are deep copies on the way out: ``/api/plan``
+#: mutates the served body in place.
+_PLAN_VIEW_CACHE: dict = {}
+_PLAN_VIEW_LOCK = None  # lazy threading.Lock, so import stays side-effect free
+
+
+def _plan_view_lock():
+    global _PLAN_VIEW_LOCK
+    if _PLAN_VIEW_LOCK is None:
+        import threading
+
+        _PLAN_VIEW_LOCK = threading.Lock()
+    return _PLAN_VIEW_LOCK
+
+
+def _file_stamp(path: Path):
+    """``(mtime_ns, size)`` for a cache key, or None when unreadable."""
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    return (stat.st_mtime_ns, stat.st_size)
+
+
+def plans_map_path() -> Path | None:
+    """The plans-map file ``resolve_plan`` falls back to, best effort."""
+    try:
+        from dash.locate import layered_path
+    except Exception:
+        layered_path = None
+    if layered_path is not None:
+        try:
+            found = layered_path("plans", "AGENT_DASH_PLANS")
+        except Exception:
+            found = None
+        if found is not None:
+            return Path(found)
+    try:
+        from dash.plans import DEFAULT_PATH
+    except Exception:
+        return None
+    return Path(DEFAULT_PATH)
+
+
+def plans_map_stamps() -> tuple:
+    """Stamps of the plans-map file and the plan files it points at.
+
+    Best effort: an unreadable map contributes its (missing) stamp only.
+    """
+    try:
+        path = plans_map_path()
+    except Exception:
+        return (None,)
+    stamps = [_file_stamp(path) if path is not None else None]
+    if path is None:
+        return tuple(stamps)
+    try:
+        mapping = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return tuple(stamps)
+    targets = mapping.get("plans") if isinstance(mapping, dict) else None
+    if isinstance(targets, dict):
+        for target in targets.values():
+            if isinstance(target, str) and target:
+                stamps.append(_file_stamp(Path(target)))
+    return tuple(stamps)
+
+
+def plans_stamp(root: Path | None = None) -> tuple:
+    """``(mtime_ns, size)`` of every bundle ``plan.json`` and ``bundle.json``.
+
+    The workstream-row cache keys on this: row progress reads the plans
+    and fallback rows read bundle titles (lifecycle state rides the
+    caller's metadata map), so a bundle edit retags precisely and
+    untouched bundles never re-read.
+    """
+    base = Path(root) if root is not None else workstreams_root()
+    try:
+        children = sorted(
+            path for path in base.iterdir()
+            if path.is_dir() and not path.name.startswith(".")
+            and (path / "bundle.json").is_file()
+        )
+    except OSError:
+        return ()
+    stamps = [
+        (_file_stamp(child / "plan.json"), _file_stamp(child / "bundle.json"))
+        for child in children
+    ]
+    try:
+        stamps.append(plans_map_stamps())
+    except Exception:
+        pass
+    return tuple(stamps)
+
+
 def bundle_plan_view(ws: str) -> dict | None:
-    """Dashboard plan shape for a bundle that is not listed in plans.json."""
+    """Dashboard plan shape for a bundle that is not listed in plans.json.
+
+    Cached by the ``(mtime_ns, size)`` of ``plan.json``, ``bundle.json``,
+    ``approvals.json``, and ``START-PROMPT.md``: the hot paths
+    (``/api/state`` progress, risks, workstream rows) read a dozen plans
+    per request, and the validation below re-reads all three JSON files.
+    """
+    import copy
+
     path = bundle_dir(ws)
     if path is None:
         return None
+    base = str(path.parent)
+    stamps = tuple(_file_stamp(path / name) for name in ("plan.json", "bundle.json", "approvals.json", "START-PROMPT.md"))
+    lock = _plan_view_lock()
+    with lock:
+        hit = _PLAN_VIEW_CACHE.get((base, ws))
+        if hit is not None and hit[0] == stamps:
+            return copy.deepcopy(hit[1])
     data = _read_json(path / "plan.json")
     if not isinstance(data, dict):
         return None
@@ -363,7 +477,7 @@ def bundle_plan_view(ws: str) -> dict | None:
         if isinstance(item, dict):
             phases.append({"name": item.get("name"), "goal": item.get("goal"), "gate": item.get("gate")})
     groups = _view_groups(dag.get("groups"))
-    return {
+    view = {
         "ws": ws,
         "cols": cols,
         "groups": groups,
@@ -374,6 +488,11 @@ def bundle_plan_view(ws: str) -> dict | None:
         "start_prompt": start_prompt_text(ws),
         "issues": validate_bundle(ws),
     }
+    with lock:
+        if len(_PLAN_VIEW_CACHE) > 256:
+            _PLAN_VIEW_CACHE.clear()
+        _PLAN_VIEW_CACHE[(base, ws)] = (stamps, view)
+    return copy.deepcopy(view)
 
 
 def read_page(ws: str) -> bytes | None:
@@ -824,17 +943,37 @@ def _public_approvals(data: dict, ws: str) -> dict:
 
 
 def approvals_for(ws: str, root: Path | None = None) -> dict | None:
-    """None when the bundle directory is missing. An empty record when the file is absent."""
+    """None when the bundle directory is missing. An empty record when the file is absent.
+
+    Cached by the ``approvals.json`` ``(mtime_ns, size)``: risks and the
+    approvals roll-up read every bundle's file per request. Copies on the
+    way out so callers never mutate the cached record.
+    """
+    import copy
+
     path = bundle_dir(ws, root)
     if path is None:
         return None
     file = path / "approvals.json"
+    stamp = _file_stamp(file)
+    lock = _plan_view_lock()
+    with lock:
+        hit = _PLAN_VIEW_CACHE.get(("approvals", str(path), ws))
+        if hit is not None and hit[0] == stamp:
+            return copy.deepcopy(hit[1])
     if not file.is_file():
-        return empty_approvals(ws)
-    data = _read_json(file)
-    if not isinstance(data, dict):
-        return empty_approvals(ws)
-    return _public_approvals(data, ws)
+        record = empty_approvals(ws)
+    else:
+        data = _read_json(file)
+        if not isinstance(data, dict):
+            record = empty_approvals(ws)
+        else:
+            record = _public_approvals(data, ws)
+    with lock:
+        if len(_PLAN_VIEW_CACHE) > 256:
+            _PLAN_VIEW_CACHE.clear()
+        _PLAN_VIEW_CACHE[("approvals", str(path), ws)] = (stamp, record)
+    return copy.deepcopy(record)
 
 
 def approvals_all(root: Path | None = None) -> list[dict]:

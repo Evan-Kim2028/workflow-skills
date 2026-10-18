@@ -236,7 +236,6 @@ html{scroll-padding-top:calc(var(--pinned-h) + 10px)}
 <script src="/static/core/charts.js"></script>
 <script src="/static/core/drawer.js"></script>
 <script src="/static/core/project.js"></script>
-<script src="/static/vendor/mermaid.min.js"></script>
 <script src="/static/plan.js"></script>
 <script src="/static/cards/tiles.js"></script>
 <script src="/static/cards/token-chart.js"></script>
@@ -260,7 +259,7 @@ html{scroll-padding-top:calc(var(--pinned-h) + 10px)}
 
   document.addEventListener("keydown", function (e) { if (e.key === "Escape") { drawer.classList.remove("open"); if (window.__adReplayOn && window.__adReplayExit) window.__adReplayExit(false); } });
 
-  setInterval(function () { if ((state.view === "exec" || isProjectView()) && !window.__adReplayOn) { drawMain(); } }, 60000);
+  setInterval(function () { if (document.hidden) return; if ((state.view === "exec" || isProjectView()) && !window.__adReplayOn) { drawMain(); } }, 60000);
   var resizeT = null;
   window.addEventListener("resize", function () { clearTimeout(resizeT); resizeT = setTimeout(function () { if (window.__adReplayOn) return; if (state.view === "exec" || isProjectView()) drawMain(); else if (window.__adPlanDraw) window.__adPlanDraw(); }, 150); });
 
@@ -328,7 +327,7 @@ html{scroll-padding-top:calc(var(--pinned-h) + 10px)}
 
   setTimeout(warmTabs, 1500);
   setInterval(warmTabs, 45000);
-  setInterval(function () { if (!state.wss.length) return; loadPlanSums().then(function () { if ((state.view === "exec" && state.ws === "all") || isProjectView()) drawMain(); }); }, 30000);
+  setInterval(function () { if (document.hidden || !state.wss.length) return; loadPlanSums().then(function () { if ((state.view === "exec" && state.ws === "all") || isProjectView()) drawMain(); }); }, 30000);
 
 
   document.getElementById("theme").addEventListener("click", function () {
@@ -356,9 +355,14 @@ html{scroll-padding-top:calc(var(--pinned-h) + 10px)}
   if (window.PlanView) PlanView.configure({fixtures: FIX, taskmapGet: function () { return TASKMAP; }});
   applyChrome();
   renderTabs();
-  loadTaskmap().then(loadNav).then(function () { showCurrent(); });
+  /* First paint overlaps nav with data: refreshAll/refreshProject already
+     loadNav themselves, so booting straight into showCurrent fetches
+     everything in parallel instead of serializing nav before data. The
+     plan branch keeps its own nav for tabs and chrome. */
+  loadTaskmap().then(function () { showCurrent(); });
   stream();
   setInterval(function () {
+    if (document.hidden) return;
     loadTaskmap().then(function () {
       if (state.view === "exec") refreshAll();
       else if (isProjectView()) refreshProject();
