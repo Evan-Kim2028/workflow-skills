@@ -1023,6 +1023,99 @@ def _replay_doc(runs, ws, groups):
     }
 
 
+def _burnup(runs, now, plans):
+    """Fixture mirror of GET /api/project/burnup: recorded task moves vs
+    plan totals plus per-day cost and token burn by workstream, on UTC
+    days. Recorded moves are spread over the week so the area, the dashed
+    plan line, and the pre-history gap band all render; the archived lane
+    keeps an undated gap (no history) and the planned lanes stay at zero.
+    Cost and tokens re-cut the fixture runs by UTC day and workstream."""
+    today = int(now // 86400) * 86400
+    days = [today - offset * 86400 for offset in range(7, -1, -1)]
+    order = ["WS1", "WS2", "WS7", "WS9", "WS10", "WS11", "unassigned"]
+    first = days[1] + 3600
+    by_ws = {}
+    for ws in order:
+        plan = plans.get(ws)
+        total = plan["progress"]["total"] if plan else None
+        done = plan["progress"]["done"] if plan else 0
+        if ws in ("WS1", "WS2", "WS7"):
+            recorded = done
+            undated = 0
+            gap = None
+            seen = 0
+            cumulative = []
+            for pos in range(len(days)):
+                if 1 <= pos <= 6 and seen < recorded:
+                    seen += 1
+                cumulative.append(seen)
+        elif ws == "WS11":
+            recorded = 0
+            undated = done
+            n = "task" if undated == 1 else "tasks"
+            first_day = datetime.datetime.fromtimestamp(first, datetime.timezone.utc)
+            gap = "no history before %04d-%02d-%02d: %d done %s not dated" % (
+                first_day.year, first_day.month, first_day.day, undated, n)
+            cumulative = [0] * len(days)
+        else:
+            recorded = 0
+            undated = 0
+            gap = None
+            cumulative = [0] * len(days)
+        by_ws[ws] = {
+            "cumulative": cumulative,
+            "plan_total": total,
+            "recorded": recorded,
+            "undated": undated,
+            "gap": gap,
+            "first_recorded": first if ws in ("WS1", "WS2", "WS7") else None,
+        }
+    project = [0] * len(days)
+    for ws in order:
+        for pos, value in enumerate(by_ws[ws]["cumulative"]):
+            project[pos] += value
+    cost_ws = {ws: [0.0] * len(days) for ws in order}
+    token_ws = {ws: [0] * len(days) for ws in order}
+    unpriced = [0] * len(days)
+    for run in runs:
+        day = int(run["started_at"] // 86400) * 86400
+        if day not in days:
+            continue
+        pos = days.index(day)
+        ws = run["workstream"] or "unassigned"
+        if ws not in cost_ws:
+            continue
+        billed = sum(run["tokens"][key] for key in TOKEN_KEYS)
+        token_ws[ws][pos] += billed
+        if run["cost_usd"] is not None:
+            cost_ws[ws][pos] = round(cost_ws[ws][pos] + run["cost_usd"], 4)
+        else:
+            unpriced[pos] += billed
+    return {
+        "burnup": {
+            "days": days,
+            "day": "UTC",
+            "first_recorded": first,
+            "workstreams": order,
+            "tasks": {
+                "by_workstream": by_ws,
+                "project": project,
+                "plan_total": sum(by_ws[ws]["plan_total"] or 0 for ws in order),
+            },
+            "cost": {
+                "by_workstream": cost_ws,
+                "project": [round(sum(cost_ws[ws][pos] for ws in order), 4) for pos in range(len(days))],
+                "unpriced_tokens": unpriced,
+            },
+            "tokens": {
+                "by_workstream": token_ws,
+                "project": [sum(token_ws[ws][pos] for ws in order) for pos in range(len(days))],
+            },
+        },
+        "_note": NOTE,
+    }
+
+
 def _counts(runs, now):
     tools = ("grok", "muse", "glm", "claude")
     live_by = {key: 0 for key in tools}
@@ -1142,6 +1235,7 @@ def main():
         "project/feed.json": _feed(NOW),
         "reconcile.json": _reconcile(runs, NOW),
         "graph.json": _graph(runs, plans),
+        "burnup.json": _burnup(runs, NOW, plans),
         "health.json": {
             "ok": True,
             "sources": [

@@ -182,6 +182,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._project_graph(query)
             elif path == "/api/project/timeline":
                 self._project_timeline()
+            elif path == "/api/project/burnup":
+                self._burnup(query)
             elif path == "/api/reconcile":
                 self._reconcile(query)
             elif path == "/api/plan":
@@ -484,6 +486,13 @@ class Handler(BaseHTTPRequestHandler):
             self._json(500, api_error("timeline unavailable", "timeline_unavailable", "Check the workstreams directory and retry."))
             return
         self._json(200, body)
+    def _burnup(self, _query):
+        """``GET /api/project/burnup``: recorded task burn-up plus per-day
+        cost and token burn by workstream (see ``dash/projectburn.py``).
+        Days are UTC calendar days; undated work stays a labelled gap.
+        """
+        from dash.projectburn import build_burnup
+        self._json(200, {"burnup": build_burnup(self.server.store)})
 
     def _reconcile(self, query):
         from dash.workstates import hidden_ids

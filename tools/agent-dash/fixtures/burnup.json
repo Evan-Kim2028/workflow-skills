@@ -1,0 +1,338 @@
+{
+  "burnup": {
+    "days": [
+      1761350400,
+      1761436800,
+      1761523200,
+      1761609600,
+      1761696000,
+      1761782400,
+      1761868800,
+      1761955200
+    ],
+    "day": "UTC",
+    "first_recorded": 1761440400,
+    "workstreams": [
+      "WS1",
+      "WS2",
+      "WS7",
+      "WS9",
+      "WS10",
+      "WS11",
+      "unassigned"
+    ],
+    "tasks": {
+      "by_workstream": {
+        "WS1": {
+          "cumulative": [
+            0,
+            1,
+            2,
+            2,
+            2,
+            2,
+            2,
+            2
+          ],
+          "plan_total": 5,
+          "recorded": 2,
+          "undated": 0,
+          "gap": null,
+          "first_recorded": 1761440400
+        },
+        "WS2": {
+          "cumulative": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            5,
+            5
+          ],
+          "plan_total": 5,
+          "recorded": 5,
+          "undated": 0,
+          "gap": null,
+          "first_recorded": 1761440400
+        },
+        "WS7": {
+          "cumulative": [
+            0,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1
+          ],
+          "plan_total": 5,
+          "recorded": 1,
+          "undated": 0,
+          "gap": null,
+          "first_recorded": 1761440400
+        },
+        "WS9": {
+          "cumulative": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "plan_total": 3,
+          "recorded": 0,
+          "undated": 0,
+          "gap": null,
+          "first_recorded": null
+        },
+        "WS10": {
+          "cumulative": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "plan_total": 3,
+          "recorded": 0,
+          "undated": 0,
+          "gap": null,
+          "first_recorded": null
+        },
+        "WS11": {
+          "cumulative": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "plan_total": 3,
+          "recorded": 0,
+          "undated": 3,
+          "gap": "no history before 2025-10-26: 3 done tasks not dated",
+          "first_recorded": null
+        },
+        "unassigned": {
+          "cumulative": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "plan_total": null,
+          "recorded": 0,
+          "undated": 0,
+          "gap": null,
+          "first_recorded": null
+        }
+      },
+      "project": [
+        0,
+        3,
+        5,
+        6,
+        7,
+        8,
+        8,
+        8
+      ],
+      "plan_total": 24
+    },
+    "cost": {
+      "by_workstream": {
+        "WS1": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          2.0176
+        ],
+        "WS2": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.4083
+        ],
+        "WS7": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.4934
+        ],
+        "WS9": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "WS10": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "WS11": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "unassigned": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      "project": [
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        2.9193
+      ],
+      "unpriced_tokens": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        525028
+      ]
+    },
+    "tokens": {
+      "by_workstream": {
+        "WS1": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          436889
+        ],
+        "WS2": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          360883
+        ],
+        "WS7": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          317741
+        ],
+        "WS9": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "WS10": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "WS11": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "unassigned": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ]
+      },
+      "project": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        1115513
+      ]
+    }
+  },
+  "_note": "Seeded synthetic data for the offline preview. Seed 1. No local sessions are read."
+}

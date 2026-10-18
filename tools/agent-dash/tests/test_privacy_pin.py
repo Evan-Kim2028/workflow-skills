@@ -161,6 +161,7 @@ PATHS = [
     "/api/project/graph",
     "/api/archive",
     "/api/project/timeline",
+    "/api/project/burnup",
     "/api/reconcile?hours=24",
     "/api/plan?ws=WS1",
     "/api/replay?ws=WS1",

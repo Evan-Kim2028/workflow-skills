@@ -50,6 +50,7 @@ FILES = (
     "project.json",
     "timeline.json",
     "archive.json",
+    "burnup.json",
     "reconcile.json",
     "project.json",
     "decisions.json",

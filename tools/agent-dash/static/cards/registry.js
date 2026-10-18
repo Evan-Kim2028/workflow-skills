@@ -85,6 +85,9 @@
     }},
     {id: "roadmap-plan", order: 60, scope: "planned", slot: "exec-roadmap", spec: function (state, snap) {
       return roadmapSpec(state, snap);
+    }},
+    {id: "burnup", order: 50, scope: "project", slot: "exec-burnup", spec: function (state, snap) {
+      return burnupSpec(state, snap);
     }}
   ];
 })(window);

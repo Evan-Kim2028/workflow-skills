@@ -2272,6 +2272,108 @@ class TimelineEndpointTest(unittest.TestCase):
         payload = self._payload()
         self.assertEqual(payload["project"], {"started": None, "target": None, "phases": []})
         self.assertEqual(len(payload["lanes"]), 4)
+class BurnupEndpointTest(unittest.TestCase):
+    """GET /api/project/burnup: recorded task burn-up plus per-day cost
+    and token burn by workstream on UTC days, with honest history gaps.
+    Synthetic bundles use invented ids (WS48 with history, WS49 planned
+    with plan-done work but no history file, so its gap is labelled).
+    """
+    MODEL = "claude-sonnet-5-5"
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.now = time.time()
+        self.wsroot = os.path.join(self.tmp.name, "ws")
+        os.makedirs(self.wsroot)
+        day = lambda n: int(self.now // 86400) * 86400 - n * 86400
+        self._bundle(
+            "WS48", "active",
+            [{"id": "WS48.1", "title": "First probe task", "status": "done"},
+             {"id": "WS48.2", "title": "Second probe task", "status": "todo"}],
+            [{"ts": day(2) + 60, "task": "WS48.1", "from": "todo", "to": "done"}],
+        )
+        self._bundle(
+            "WS49", "planned",
+            [{"id": "WS49.1", "title": "First probe task", "status": "done"}],
+            None,
+        )
+        self._env = mock.patch.dict(os.environ, {"AGENT_DASH_WORKSTREAMS": self.wsroot})
+        self._env.start()
+        self.addCleanup(self._env.stop)
+        self.store = Store(Path(self.tmp.name) / "dash.sqlite")
+        self.store.upsert_run(
+            {
+                "run_id": "muse:s48:ws48-probe",
+                "source": "muse",
+                "tier": "muse",
+                "model": self.MODEL,
+                "label": "ws48-WS48.1-probe",
+                "session_id": "sess-48",
+                "status": "done",
+                "started_at": self.now - 3700,
+                "ended_at": self.now - 3600,
+            }
+        )
+        self.store.add_usage(
+            {
+                "ts": self.now - 3650,
+                "session_id": "sess-48",
+                "run_id": "muse:s48:ws48-probe",
+                "model": self.MODEL,
+                "tool": "muse",
+                "message_id": "m-48",
+                "input": 100,
+                "output": 50,
+                "cache_read": 10,
+                "cache_write": 5,
+            }
+        )
+        self.server, self.thread = start(self.store)
+        self.port = self.server.server_address[1]
+    def tearDown(self):
+        stop(self.server, self.thread)
+        self.store.close()
+        self.tmp.cleanup()
+    def _bundle(self, ws, state, tasks, history):
+        dest = os.path.join(self.wsroot, ws)
+        os.makedirs(dest)
+        bundle = {"id": ws, "title": "Probe %s" % ws, "short": ws,
+                  "order": int(ws[2:]), "kind": "workstream", "state": state,
+                  "state_changed_at": int(self.now) - 50}
+        with open(os.path.join(dest, "bundle.json"), "w") as fh:
+            json.dump(bundle, fh)
+        with open(os.path.join(dest, "plan.json"), "w") as fh:
+            json.dump(
+                {"dag": {"cols": ["Build"],
+                         "groups": [{"id": "g", "col": 0, "title": "Build", "tasks": tasks}],
+                         "edges": []},
+                 "narrative": {"phases": []}},
+                fh,
+            )
+        if history:
+            with open(os.path.join(dest, "history.jsonl"), "w") as fh:
+                for row in history:
+                    fh.write(json.dumps(row) + "\n")
+    def test_burnup_endpoint(self):
+        status, _, body = get(self.port, "/api/project/burnup")
+        self.assertEqual(status, 200)
+        payload = json.loads(body)["burnup"]
+        self.assertEqual(payload["day"], "UTC")
+        self.assertTrue(payload["days"])
+        by_ws = payload["tasks"]["by_workstream"]
+        self.assertEqual(by_ws["WS48"]["recorded"], 1)
+        self.assertEqual(by_ws["WS48"]["plan_total"], 2)
+        self.assertIn("not dated", by_ws["WS49"]["gap"])
+        self.assertTrue(by_ws["WS49"]["gap"].startswith("no history before "))
+        self.assertEqual(payload["tasks"]["plan_total"], 3)
+        for pos in range(len(payload["days"])):
+            self.assertEqual(
+                payload["tasks"]["project"][pos],
+                sum(item["cumulative"][pos] for item in by_ws.values()),
+            )
+            self.assertEqual(
+                payload["tokens"]["project"][pos],
+                sum(item[pos] for item in payload["tokens"]["by_workstream"].values()),
+            )
 
 
 if __name__ == "__main__":

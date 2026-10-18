@@ -452,6 +452,8 @@ endpoint is absent. It registers one line per scope over the same spec
 (`scope: "project"` and `scope: "planned"`, both `slot: "exec-depgraph"`).
 `fixtures/graph.json` (from `fixtures/make_fixtures.py`) feeds the
 `?fixtures` preview. Cards never write: the dashboard stays read-only.
+### Project burn-up
+The worked example for a project card with its own endpoint is `static/cards/burnup.js` (slot `exec-burnup`, `scope: "project"`), fed by `GET /api/project/burnup` (`dash/projectburn.py`, pure builder plus a small hook in `dash/server.py`). The card fetches its endpoint itself with a loading state and a distinct `request failed` state (project refresh paths stay on the one snapshot response), and reads `../fixtures/burnup.json` under `?fixtures` (built by `fixtures/make_fixtures.py`). History that was never recorded is a labelled gap (`no history before <date>: N done tasks not dated`), never interpolated dates; days are UTC calendar days. New endpoints get tests in `tests/test_server.py` plus a privacy-pin path entry (names and numbers only, never file bodies or paths).
 
 ### Before you push
 
