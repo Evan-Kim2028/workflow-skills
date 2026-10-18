@@ -53,3 +53,15 @@
 .pj-shelf{grid-template-columns:minmax(0,1fr)}
 .pj-done .prog-acts{display:flex}
 }
+/* Archive/restore action controls (the one write action). .arch-btn is the
+   real button; .arch-copy is the small link-style CLI affordance beside it.
+   .arch-confirm is the inline confirm popover (never window.confirm). */
+.arch-ctl{display:inline-flex;gap:8px;align-items:center}
+.arch-btn{font:600 12.5px var(--font);border-radius:999px;padding:4px 11px}
+.arch-copy{background:none;border:0;padding:0;color:var(--muted);text-decoration:underline;cursor:pointer;font:400 12px var(--font)}
+.arch-copy:hover{color:var(--fg)}
+.arch-confirm{position:fixed;z-index:70;max-width:min(92vw,360px);background:var(--overlay);border:1px solid var(--ring-strong);border-radius:10px;padding:12px 14px;box-shadow:var(--shadow-pop);font:400 13px var(--font)}
+.arch-confirm p{margin:0 0 10px}
+.arch-confirm-btns{display:flex;gap:8px;justify-content:flex-end}
+#toast.has-action{pointer-events:auto}
+.toast-undo{margin-left:8px;font:600 13px var(--font);border-radius:999px;padding:2px 12px;cursor:pointer}

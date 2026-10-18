@@ -107,7 +107,23 @@
       return condRead(url, r);
     });
   }
+  /* POST through the same layer (archive/restore: the one write action
+     the page performs). Always sends X-AgentDash-Action: 1, which the
+     server requires alongside its local Host/Origin checks. Fixture
+     mode (?fixtures) never writes, so it rejects there and the caller
+     falls back to the copy-command button. Rejects with the server's
+     {status, error, code, hint} for a toast, never silent. */
+  function apiPost(path, body) {
+    if (FIX) return Promise.reject({status: 403, error: "fixture preview is read-only", code: "read_only", hint: "Archive from the live dashboard, or run: python3 agent_dash.py ws archive <ID>"});
+    return fetch(path, {method: "POST", headers: {"Content-Type": "application/json", "X-AgentDash-Action": "1"}, body: JSON.stringify(body || {})}).then(function (r) {
+      return r.json().then(function (j) {
+        if (!r.ok) { var err = (j && typeof j === "object") ? j : {error: "request failed " + r.status}; err.status = r.status; throw err; }
+        return j;
+      });
+    });
+  }
   window.DashApi = api;
+  window.DashApiPost = apiPost;
   function approvalList(j) {
     if (!j) return [];
     if (j.approvals) return j.approvals;
@@ -123,7 +139,7 @@
     /* Project identity (missing project.json means name null: the header
        falls back to Agent dashboard) and the all-states list behind the
        Planned/Archive pill counts. Both are best-effort on older servers. */
-    var projP = api("/api/project", {}).then(function (j) { state.project = (j && typeof j === "object") ? j : {name: null}; }).catch(function () { state.project = {name: null}; });
+    var projP = api("/api/project", {}).then(function (j) { state.project = (j && typeof j === "object") ? j : {name: null}; state.actionsArchive = !!(j && j.actions && j.actions.archive); }).catch(function () { state.project = {name: null}; state.actionsArchive = false; });
     var allP = api("/api/workstreams", {since: since(), state: "all"}).then(function (j) { state.wssAll = j.workstreams || []; }).catch(function () { state.wssAll = []; });
     return Promise.all([bundlesP, wsP, projP, allP]).then(function () { renderTabs(); applyChrome(); resolveLanding(); });
   }
@@ -196,7 +212,7 @@
         setLive(true);
         updateStale();
         var foot = document.getElementById("foot");
-        if (foot) foot.textContent = "Updated " + new Date().toLocaleTimeString() + (FIX ? " \u00B7 fixture data" : "") + " \u00B7 read-only, 127.0.0.1";
+        if (foot) foot.textContent = "Updated " + new Date().toLocaleTimeString() + (FIX ? " \u00B7 fixture data" : "") + " \u00B7 local, 127.0.0.1";
       });
     }).catch(function () { if (gen === execGen && isProjectView()) { showSnapError("all"); setLive(false); } });
   }
@@ -205,7 +221,7 @@
   function refreshFoot() {
     var foot = document.getElementById("foot");
     if (!foot || state.view !== "exec" || state.ws !== "all") return;
-    foot.textContent = "Updated " + new Date().toLocaleTimeString() + (FIX ? " · fixture data" : "") + " · read-only, 127.0.0.1";
+    foot.textContent = "Updated " + new Date().toLocaleTimeString() + (FIX ? " · fixture data" : "") + " · local, 127.0.0.1";
   }
   /* Warm every other tab's Execution data in the background, one tab at a time, so a first switch draws from cache instantly. Entries are keyed by tab and group (one fixed 24 h window) with the window captured up front, and fresh entries are not refetched. */
   var warming = false;
@@ -323,7 +339,7 @@
         setLive(true);
         updateStale();
         if (state.ws === "all") refreshFoot();
-        else { var foot = document.getElementById("foot"); if (foot) foot.textContent = "Updated " + new Date().toLocaleTimeString() + (FIX ? " · fixture data" : "") + " · read-only, 127.0.0.1"; }
+        else { var foot = document.getElementById("foot"); if (foot) foot.textContent = "Updated " + new Date().toLocaleTimeString() + (FIX ? " · fixture data" : "") + " · local, 127.0.0.1"; }
       }
     }).catch(function () { if (gen === execGen && ADC.applies(key, state)) { showSnapError(ws); setLive(false); } });
   }
@@ -386,6 +402,7 @@
   AdPage.tabHidden = tabHidden;
   AdPage.snapSig = snapSig;
   AdPage.api = api;
+  AdPage.apiPost = apiPost;
   AdPage.approvalList = approvalList;
   AdPage.loadNav = loadNav;
   AdPage.resolveLanding = resolveLanding;
@@ -407,6 +424,7 @@
   global.tabHidden = tabHidden;
   global.snapSig = snapSig;
   global.api = api;
+  global.apiPost = apiPost;
   global.approvalList = approvalList;
   global.loadNav = loadNav;
   global.resolveLanding = resolveLanding;

@@ -80,6 +80,16 @@ def _stamp(path: Path):
     return (stat.st_mtime_ns, stat.st_size)
 
 
+def _actions_flag(cfg) -> bool:
+    """Whether page actions are enabled: part of the state cache key so
+    flipping the read-only switch never serves a stale payload."""
+    try:
+        from dash.actions import actions_enabled
+        return bool(actions_enabled(cfg))
+    except Exception:
+        return False
+
+
 def _files_fingerprint(cfg=None) -> tuple:
     """``(mtime_ns, size)`` over every file ``build_state`` reads.
 
@@ -190,6 +200,7 @@ def _state_key(store, processes, cfg, now: float, doctor_generated) -> tuple | N
         data_seq,
         _workers_key(processes),
         _files_fingerprint(cfg),
+        _actions_flag(cfg),
         doctor_generated,
         int(now // STATE_CACHE_TTL_S),
     )
@@ -282,6 +293,10 @@ def _build_state_body(store, cfg, now: float, processes, doctor, build) -> dict:
         bundle_fallback_rows = None
         hidden_ids = None
         state_of = None
+    try:
+        from dash.actions import actions_enabled
+    except Exception:
+        actions_enabled = None
     meta = {}
     if all_bundle_meta is not None:
         try:
@@ -371,6 +386,9 @@ def _build_state_body(store, cfg, now: float, processes, doctor, build) -> dict:
         # /api/project) fills this block from project.json. Reads use
         # payload.get("project", {}).get("name") so both shapes work.
         "project": {"name": None},
+        # The one write action the page may offer. False in read-only
+        # mode, when the Archive buttons fall back to copy-command.
+        "actions": {"archive": bool(actions_enabled is not None and actions_enabled(cfg))},
         "decisions": decisions,
         "risks": risks,
         "workstreams": workstreams,

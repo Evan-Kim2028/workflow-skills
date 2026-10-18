@@ -1,8 +1,9 @@
 # agent-dash contract (v1)
 
-Local, read-only execution dashboard. One Python 3 process (stdlib only), binds 127.0.0.1:8765.
+Local execution dashboard, read-only except the page archive action. One Python 3 process (stdlib only), binds 127.0.0.1:8765.
 Code is this directory. `install.sh` links it to `~/.claude/tools/agent-dash`. State: `~/.local/share/agent-dash/` (dash.sqlite WAL, pidfile, log).
 Never writes to any source, never signals agent processes, never stores prompt bodies or argv.
+Archive and restore from the page (`POST /api/workstreams/archive`, `POST /api/workstreams/restore`) is the only write action the dashboard performs, and it exists so a done workstream can leave the Current view without a terminal round-trip: it writes only bundle lifecycle fields (`state`, `archived_at`, the frozen `summary.json`) through the same `dash/lifecycle.py` functions the CLI uses, never sources, plan content, or approvals, and it stays local-only (Host/Origin plus `X-AgentDash-Action: 1`) with a read-only switch (`AGENT_DASH_READONLY=1`, config `readonly: true`).
 The one argv value ever kept is the worker's `--model` flag value, recorded on process samples and live-process rows so a run whose model is otherwise unknown can be named. Model ids, labels, token counts, and the session `ws_hint` (a workstream id derived from a bundle tool-use path, never served by any endpoint) are the only worker-derived strings in the store.
 
 ## Layout and file ownership (one writer per file)
@@ -28,6 +29,7 @@ The one argv value ever kept is the worker's `--model` flag value, recorded on p
 | `dash/buildinfo.py` (build id + process start time) | core |
 | `dash/deploy.py` (clean-release deploy, rollback, `releases/`) | core |
 | `dash/server.py` (HTTP + SSE, routes below) | core |
+| `dash/actions.py` (the one write action: guarded `POST /api/workstreams/archive|restore` through the CLI lifecycle functions, local-only, read-only switch) | core |
 | `dash/attribution.py`, `map.example.json` (`map.local.json` replaces it) | core |
 | `dash/pricing.py`, `catalog/prices.json` | core |
 | `dash/plans.py`, `plans.example.json` (`plans.local.json` replaces it) | core |
@@ -62,7 +64,8 @@ The one argv value ever kept is the worker's `--model` flag value, recorded on p
 | `static/cards/burnup.js` + `burnup.css` (Project burn-up `?view=project` slot `exec-burnup`: tasks area with plan line and gap band, stacked cost/token bars, togglable lanes) | dash-c3 |
 | `static/core/el.js` (DOM helpers, text/format glue, tooltip, copy button) | Claude (parent) |
 | `static/core/state.js` (page state, route read/write, tab filter/order plumbing) | Claude (parent) |
-| `static/core/api.js` (fetch and fixtures, SSE stream, refresh orchestration) | Claude (parent) |
+| `static/core/api.js` (fetch and fixtures, SSE stream, refresh orchestration; `apiPost` for the one write action with the action header) | Claude (parent) |
+| `static/core/actions.js` (archive/restore controls: inline confirm popover, undo toast, real buttons with workstream aria-labels, copy-command fallback) | Claude (parent) |
 | `static/core/cache.js` (exec/section keyed caches, keyed-section renderer) | Claude (parent) |
 | `static/core/charts.js` (shared chart/axis and token-cell helpers) | Claude (parent) |
 | `static/core/drawer.js` (run details drawer) | Claude (parent) |
@@ -212,6 +215,29 @@ bad state name is a 400. The existing live/progress fields stay on every row
 returned, and the `unassigned` row stays in every scope with null lifecycle
 fields (it is not a workstream).
 
+`POST /api/workstreams/archive` and `POST /api/workstreams/restore` (JSON
+body `{"ws": "<ID>"}` and nothing else) are the only writes the server
+accepts; every other POST is a 405. They run the same `dash/lifecycle.py`
+`archive_bundle`/`restore_bundle` the CLI uses (frozen `summary.json`,
+`state` `archived`, `archived_at`, atomic temp-file-plus-replace writes
+under the per-bundle file lock), under the bundle root only, and answer
+`{"ok": true, "ws": "<ID>", "state": "archived", "archived_at": 0}` (restore
+answers `state: done`, `archived_at: null`). Errors keep the house shape
+`{error, code, hint}`: unknown workstream 404 `not_found`, program/`OVERVIEW`
+kinds, already-archived (archive), non-archived (restore), dropped, or an
+unfinished plan or missing closing report 409 `not_eligible` (archiving an
+archived workstream is a 409, never a crash), bad body 400 `bad_request`.
+Guards, all fail-closed: `Host` must be `127.0.0.1:<port>` or
+`localhost:<port>`; a present `Origin` must match that local origin; every
+call must carry `X-AgentDash-Action: 1` (blocks cross-site form posts and
+simple fetches). Disabled with 403 `read_only` when `AGENT_DASH_READONLY=1`
+or the config carries `readonly: true`; then `GET /api/project` and
+`GET /api/state` report `{"actions": {"archive": false}}` and the page
+falls back to copy-command buttons. Each action is logged to the dashboard
+log with the workstream id only, and invalidates the bundle-state caches
+(store sequences plus snapshot cache, the server per-plan caches), so the
+next poll lists the workstream in its new state.
+
 `GET /api/reconcile?hours=&since=&until=` -> `{"now": 0, "since": 0, "until": 0, "all": {live_agents, finished_in_range, finished_today, tokens, cost_usd, prev_24h: {tokens, cost_usd, finished, live_agents}}, "all_time": {tokens, cost_usd}, "rows": [per-workstream rows], "unassigned": {...}, "archived": {tokens, cost_usd, tokens_all_time, cost_usd_all_time, workstreams: []}, "mismatches": []}`.
 `archived` sums the rows in a default-hidden lifecycle state
 (`archived`/`dropped`), windowed plus lifetime, so project totals keep
@@ -239,6 +265,11 @@ drives the live page in headless Chrome over the DevTools protocol
 (`scripts/page_check.mjs`, stdlib only) and compares every rendered tile and
 chart legend against the API for the overview and every workstream tab at the
 one fixed 24 h window; it skips with a clear message when Chrome is missing.
+The archive-from-the-page flow has its own check, `node
+scripts/archive_action_check.mjs` (boots a temp server with synthetic done
+bundles, clicks Archive through Undo and Restore over CDP, takes the
+confirm/toast/archive screenshots; run it, don't fold it into `check
+--page`: it takes minutes, not seconds).
 
 `GET /api/plan?ws=WS7` -> that workstream's plan with a `progress` object
 (plus an `issues` list, the `ws validate` findings, empty when clean; a bad
@@ -359,7 +390,9 @@ object `/api/plan` carries, or null. `health` carries the same
 `scratch_roots`, `run_dirs`, and `warnings` as `/api/health`.
 `problems` is the persisted doctor list: the same entries (same ids)
 as `GET /api/doctor`, each additionally carrying the legacy `message`
-(`title: detail`) and `command` keys. Fields are only added, never
+(`title: detail`) and `command` keys. `actions` is `{"archive": bool}`:
+whether the page may offer the real archive/restore buttons (false in
+read-only mode). Fields are only added, never
 renamed.
 `python3 agent_dash.py state [--json]` prints the same payload.
 `doctor` additionally reports each health `warnings` entry as a
@@ -399,6 +432,9 @@ field, 3 when no `project.json` exists, 4 on invalid data).
 `GET /api/project` also carries the instance's project `id` (from
 `AGENT_DASH_PROJECT_ID` when launched via `project launch`, else null);
 `/api/health` carries the same id as `project_id` (id only, never paths).
+Both `GET /api/project` and `GET /api/state` carry `actions`:
+`{"archive": bool}`, false when `AGENT_DASH_READONLY=1` or the config
+carries `readonly: true` (the page then shows copy-command buttons).
 
 One dashboard instance serves one project: its own data root, state,
 port, and name. The registry is `projects.json` (default

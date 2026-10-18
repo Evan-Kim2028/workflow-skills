@@ -8,7 +8,7 @@ Start with [Plug in any agent](docs/integrate.md): install and run in three comm
 
 The Overall tab in the dark theme, rendered from the bundled sample data.
 
-The page binds to 127.0.0.1 port 8765. That address is fixed. The store keeps labels, timings, and token counts. Prompt bodies, argv, secrets, and environment values stay unread. Several projects run as one instance each via the project registry (`project add|list|launch|stop|open|remove`, `GET /api/projects`, header switcher); see "Running several projects" in [Plug in any agent](docs/integrate.md).
+The page binds to 127.0.0.1 port 8765. That address is fixed. The store keeps labels, timings, and token counts. Prompt bodies, argv, secrets, and environment values stay unread. Archiving from the page (inline confirm, Undo toast) is the only write action; everything else copies its CLI command. Several projects run as one instance each via the project registry (`project add|list|launch|stop|open|remove`, `GET /api/projects`, header switcher); see "Running several projects" in [Plug in any agent](docs/integrate.md).
 
 ## Install
 

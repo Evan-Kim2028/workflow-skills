@@ -1148,14 +1148,20 @@ setTimeout(function () {
         self.assertEqual(proc.returncode, 0, proc.stderr or proc.stdout)
 
     def test_project_views_are_readonly(self):
-        """The dashboard stays read-only: no page fetch uses a non-GET
-        method, and the Archive/Restore buttons only copy the exact CLI
-        command to the clipboard (with a textarea fallback and a toast)."""
+        """The dashboard stays read-only except the one write action: the
+        only non-GET fetch on the page is apiPost's POST (archive/restore
+        with the action header), and the Archive/Restore buttons keep the
+        copy-command affordance beside the real button (clipboard with a
+        textarea fallback and a toast)."""
         script = inline_scripts()
         plan_js = (STATIC / "plan.js").read_text()
-        for name, src in (("index.html", script), ("plan.js", plan_js)):
-            hits = re.findall(r"method\s*:\s*[\"'](POST|PUT|DELETE|PATCH)[\"']", src, re.I)
-            self.assertEqual(hits, [], f"{name} fetches with a non-GET method: {hits[:2]}")
+        hits = re.findall(r"method\s*:\s*[\"'](POST|PUT|DELETE|PATCH)[\"']", script, re.I)
+        self.assertEqual(hits, ["POST"], f"a second writer appeared beside archive/restore: {hits}")
+        api_src = (STATIC / "core" / "api.js").read_text()
+        post_sites = re.findall(r"method\s*:\s*[\"']POST[\"']", api_src)
+        self.assertEqual(len(post_sites), 1, "the POST must live in apiPost alone")
+        self.assertIn("X-AgentDash-Action", api_src)
+        self.assertEqual(re.findall(r"method\s*:\s*[\"'](POST|PUT|DELETE|PATCH)[\"']", plan_js, re.I), [])
         for name in ("project-home.js", "planned.js", "archive.js"):
             text = (STATIC / "cards" / name).read_text()
             self.assertNotIn("fetch(", text, f"{name} fetches; project views read state only")
@@ -1947,7 +1953,7 @@ class FinalPolishTests(unittest.TestCase):
         self.assertNotIn('api("/api/reconcile"', api)
         self.assertNotIn("Numbers reconcile", api)
         self.assertNotIn("mismatches", api)
-        self.assertIn("read-only, 127.0.0.1", api)
+        self.assertIn("local, 127.0.0.1", api)
 
     def test_slot_key_folds_in_the_entry_key(self):
         for name in ("cards/project-home.js", "cards/planned.js"):
@@ -2126,6 +2132,82 @@ class FinalPolishTests(unittest.TestCase):
             )
         self.assertEqual(proc.returncode, 0, proc.stderr or proc.stdout)
         self.assertIn("fmtDur proof ok", proc.stdout)
+
+    def test_archive_confirm_never_uses_window_confirm(self):
+        """The archive confirm is an inline popover, never window.confirm:
+        no page script may call the blocking dialog."""
+        script = inline_scripts()
+        plan_js = (STATIC / "plan.js").read_text()
+        for name, src in (("index.html", script), ("plan.js", plan_js)):
+            self.assertNotIn("window.confirm(", src, f"{name} blocks on window.confirm")
+            hits = re.findall(r"(?<![A-Za-z0-9_$])confirm\s*\(", src)
+            self.assertEqual(hits, [], f"{name} calls a bare confirm(): {hits[:2]}")
+
+    def test_archive_post_goes_through_the_shared_api_layer(self):
+        """Archive/restore POST through apiPost in static/core/api.js with
+        the X-AgentDash-Action header; the controls never raw-fetch."""
+        api_src = (STATIC / "core" / "api.js").read_text()
+        self.assertIn("function apiPost(", api_src, "the shared POST helper is gone")
+        self.assertIn("X-AgentDash-Action", api_src, "apiPost lost the action header")
+        actions_src = (STATIC / "core" / "actions.js").read_text()
+        self.assertIn('apiPost("/api/workstreams/archive"', actions_src)
+        self.assertIn('apiPost("/api/workstreams/restore"', actions_src)
+        self.assertNotIn("fetch(", actions_src, "the action controls bypass the shared api layer")
+        page = (STATIC / "index.html").read_text()
+        self.assertIn('<script src="/static/core/actions.js"></script>', page)
+
+    def test_archive_buttons_name_the_workstream(self):
+        """Every Archive/Restore button is a real <button> whose
+        aria-label names the workstream; requests disable the control
+        in flight (no double submit)."""
+        actions_src = (STATIC / "core" / "actions.js").read_text()
+        for fn in ("archiveControl", "restoreControl"):
+            self.assertIn("function %s(" % fn, actions_src, f"{fn} is gone")
+        self.assertIn('"aria-label", "Archive " + displayName', actions_src)
+        self.assertIn('"aria-label", "Restore " + displayName', actions_src)
+        self.assertIn("displayName(id, name)", actions_src)
+        self.assertIn("btns[i].disabled", actions_src, "in-flight buttons stay clickable")
+        for path, marker in (
+            ("cards/ws-cards.js", "archiveControl(w.ws, w.name)"),
+            ("cards/project-home.js", "archiveControl(w.ws, w.name)"),
+            ("cards/archive.js", "restoreControl(id, card.title)"),
+        ):
+            src = (STATIC / path).read_text()
+            self.assertIn(marker, src, f"{path} lost its real action control")
+
+    def test_archive_confirm_and_undo_pattern(self):
+        """The confirm popover names the workstream, offers Archive and
+        Cancel, closes on Escape, manages focus, and success toasts an
+        Undo kept 10 s; restore stays confirm-free."""
+        actions_src = (STATIC / "core" / "actions.js").read_text()
+        for marker in (
+            '"Archive " + label + "? It moves to the Archive view; you can restore it."',
+            'role: "dialog"',
+            '"Cancel"',
+            '"Escape"',
+            ".focus()",
+            '"Undo"',
+            "10000",
+            '"Restored "',
+            '"Archived "',
+            "Copy command",
+        ):
+            self.assertIn(marker, actions_src, f"actions.js lost the confirm/undo branch: {marker}")
+        archive_src = (STATIC / "cards" / "archive.js").read_text()
+        self.assertIn("restoreControl", archive_src)
+
+    def test_archive_falls_back_to_copy_command(self):
+        """With writes off (read-only server, fixture preview) every
+        control degrades to the copy-command button, so the CLI path
+        stays visible."""
+        actions_src = (STATIC / "core" / "actions.js").read_text()
+        self.assertIn("actionsEnabled()", actions_src)
+        self.assertIn("state.actionsArchive", actions_src)
+        self.assertIn('copyBtn("python3 agent_dash.py ws archive " + id, "Archive")', actions_src)
+        self.assertIn('copyBtn("python3 agent_dash.py ws restore " + id, "Restore")', actions_src)
+        api_src = (STATIC / "core" / "api.js").read_text()
+        self.assertIn("state.actionsArchive = !!", api_src, "loadNav lost the actions flag")
+        self.assertIn("state.actionsArchive = false", api_src)
 
 
 if __name__ == "__main__":

@@ -63,6 +63,18 @@ class BaseMixin:
         def _note_data_write(self) -> None:
             """Stamp the last data-changing write. Caller holds the lock."""
             self._last_data_ts = _time.time()
+        def note_bundle_change(self) -> None:
+            """Stamp a bundle-lifecycle write (archive/restore from the page).
+
+            Bumps both sequences so the next SSE tick carries a new seq,
+            and drops the snapshot cache outright, so the next poll
+            recomputes instead of serving the pre-archive payload.
+            """
+            with self._lock:
+                self._data_seq += 1
+                self._seq += 1
+                self._snapshot_cache.clear()
+                self._note_data_write()
         def get_offset(self, path: str):
             with self._lock:
                 row = self._conn.execute(

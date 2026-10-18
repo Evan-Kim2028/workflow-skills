@@ -52,6 +52,7 @@ The dashboard is read by a visual thinker. Every view answers its question with 
 ## Behavior
 
 - Read-only on every source. Never shows prompt bodies, argv, secrets or env values. Labels only.
+- Archive is the one write action, and it asks first: the Archive button opens an inline confirm popover (never `window.confirm`) naming the workstream — "Archive <name>? It moves to the Archive view; you can restore it." — with Archive and Cancel, Escape cancels, focus moves in and back. Success toasts "Archived <name>" with an Undo button kept 10 s; Restore is confirm-free with a "Restored <name>" toast. Failures toast the hint, never silent. A small "Copy command" link stays beside each real button.
 - Refresh: SSE `tick` every 2 s triggers a snapshot refetch; everything else refetches every 30 s.
 - Production jobs (source `dagster`) are never in agent lists; they are a count: the live tile shows `N prod jobs` / `N prod jobs ran`.
 - `?fixtures` loads `../fixtures/*.json` for offline design work.

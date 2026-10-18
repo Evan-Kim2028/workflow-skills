@@ -293,7 +293,17 @@ class Handler(BaseHTTPRequestHandler):
             self._json(400, api_error(str(exc) or "bad request", "bad_request", _hint_for(str(exc))))
 
     def do_POST(self):
-        self._json(405, api_error("method not allowed", "method_not_allowed", "The API is GET only; change state with the CLI, e.g. python3 agent_dash.py ws task <ID> <task> <status>"))
+        parsed = urlparse(self.path)
+        path = parsed.path
+        try:
+            if path == "/api/workstreams/archive":
+                self._workstream_action("archive")
+            elif path == "/api/workstreams/restore":
+                self._workstream_action("restore")
+            else:
+                self._json(405, api_error("method not allowed", "method_not_allowed", "The API is read-only except POST /api/workstreams/archive and /api/workstreams/restore; change other state with the CLI, e.g. python3 agent_dash.py ws task <ID> <task> <status>"))
+        except ValueError as exc:
+            self._json(400, api_error(str(exc) or "bad request", "bad_request", _hint_for(str(exc))))
 
     def do_PUT(self):
         self._json(405, api_error("method not allowed", "method_not_allowed", "The API is GET only; change state with the CLI, e.g. python3 agent_dash.py ws task <ID> <task> <status>"))
@@ -508,6 +518,30 @@ class Handler(BaseHTTPRequestHandler):
                 },
             },
         )
+
+    def _workstream_action(self, action: str):
+        """``POST /api/workstreams/archive|restore``: the one write action.
+
+        Guarded local-only (Host, Origin, ``X-AgentDash-Action: 1``) and
+        refused with 403 ``read_only`` when ``AGENT_DASH_READONLY=1`` or
+        the config carries ``readonly: true``. Runs the CLI's lifecycle
+        functions (see ``dash/actions.py``), which write only bundle
+        lifecycle fields under the per-bundle lock.
+        """
+        from dash import actions as actions_mod
+
+        refused = actions_mod.guard(self, self.server.cfg or {})
+        if refused is not None:
+            status, body = refused
+            self._json(status, body)
+            return
+        try:
+            ws = actions_mod.read_ws_body(self)
+        except ValueError as exc:
+            self._json(400, api_error(str(exc) or "bad request", "bad_request", _hint_for(str(exc))))
+            return
+        status, body = actions_mod.perform(self.server, action, ws)
+        self._json(status, body)
 
     def _project_graph(self, _query):
         """``GET /api/project/graph``: the cross-workstream dependency graph.
@@ -1088,6 +1122,8 @@ def _hint_for(error: str) -> str:
         return "Add ?ws=<ID>, e.g. /api/plan?ws=WS7; use ws=all where the endpoint allows it."
     if error == "bad ws":
         return "Use a workstream id like WS7 (see GET /api/bundles for the ids)."
+    if error == "bad body":
+        return "Send JSON {\"ws\": \"<ID>\"} with header X-AgentDash-Action: 1, e.g. POST /api/workstreams/archive."
     if error in ("bad hours", "bad since", "bad until"):
         return "Pass epoch seconds, e.g. /api/reconcile?hours=24."
     if error == "bad limit":

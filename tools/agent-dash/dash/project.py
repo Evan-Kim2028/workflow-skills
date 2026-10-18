@@ -285,9 +285,16 @@ def build_payload(store=None, cfg: dict | None = None, root=None, now: float | N
                 totals = candidate
         except Exception:
             totals = _zero_totals()
+    try:
+        from dash.actions import actions_enabled
+
+        actions_on = bool(actions_enabled(cfg))
+    except Exception:
+        actions_on = False
     payload = {
         "id": (os.environ.get("AGENT_DASH_PROJECT_ID") or "").strip() or None,
         "name": data.get("name") if isinstance(data.get("name"), str) else None,
+        "actions": {"archive": actions_on},
         "short": data.get("short") if isinstance(data.get("short"), str) else "",
         "description": data.get("description") if isinstance(data.get("description"), str) else "",
         "goals": list(data.get("goals")) if isinstance(data.get("goals"), list) else [],

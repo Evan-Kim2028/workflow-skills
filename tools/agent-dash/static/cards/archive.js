@@ -3,8 +3,9 @@
    lifetime totals including archived work, and an honest empty state.
    Each card shows dates, duration, tasks, tokens, and cost through the
    shared fmt helpers, the closing-report basename with a Report link to
-   the plan view, a Plan button, and a Restore button that copies the
-   exact CLI command (read-only, never runs it). Archived workstream plan
+   the plan view, a Plan button, and a real Restore button (confirm-free,
+   toast on restore) when the server allows writes, else the copy-command
+   button. Archived workstream plan
    pages stay reachable read-only with an "Archived <date>" banner (the
    plan fetch needs no scope change: /api/plan and /api/bundle serve
    archived bundles directly).
@@ -94,9 +95,12 @@
       rl.addEventListener("click", function () { openPlan(id); });
       acts.appendChild(rl);
     }
-    var rb = el("button", {type: "button", class: "pj-copy", title: "Copy the exact command (read-only: nothing runs)", text: "Restore"});
-    rb.addEventListener("click", function (ev) { ev.stopPropagation(); copyCmd("python3 agent_dash.py ws restore " + id); });
-    acts.appendChild(rb);
+    if (typeof restoreControl === "function") acts.appendChild(restoreControl(id, card.title));
+    else {
+      var rb = el("button", {type: "button", class: "pj-copy", title: "Copy the exact command (read-only: nothing runs)", text: "Restore"});
+      rb.addEventListener("click", function (ev) { ev.stopPropagation(); copyCmd("python3 agent_dash.py ws restore " + id); });
+      acts.appendChild(rb);
+    }
     d.appendChild(acts);
     return d;
   }

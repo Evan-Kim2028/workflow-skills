@@ -220,8 +220,9 @@
 
   /* Recently done: done but not archived, each with its tasks, tokens,
      cost, a Plan button, a Report link when the archive payload exposes
-     the closing-report basename, and an Archive button that copies the
-     exact CLI command (read-only, never runs it). */
+     the closing-report basename, and a real Archive button (inline
+     confirm, undo toast) when the server allows writes, else the
+     copy-command button. */
   function doneRows() {
     var c = el("div", {class: "card pj-done", "data-nav": "Recently done"});
     c.appendChild(secHead("Recently done", "Done, not yet archived — archive after the closing report."));
@@ -264,7 +265,8 @@
         rl.addEventListener("click", function () { openPlan(w.ws); });
         acts.appendChild(rl);
       }
-      acts.appendChild(copyBtn("python3 agent_dash.py ws archive " + w.ws, "Archive"));
+      if (typeof archiveControl === "function") acts.appendChild(archiveControl(w.ws, w.name));
+      else acts.appendChild(copyBtn("python3 agent_dash.py ws archive " + w.ws, "Archive"));
       row.appendChild(acts);
       c.appendChild(row);
     });

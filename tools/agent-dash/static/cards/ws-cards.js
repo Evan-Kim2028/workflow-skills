@@ -161,16 +161,22 @@
       var bp = el("button", {text: "Plan"}); bp.addEventListener("click", function () { openPlan(w.ws); }); acts.appendChild(bp);
       var bl = el("button", {text: "Live"}); bl.addEventListener("click", function () { if (window.DashNav) window.DashNav.openExec(w.ws); }); acts.appendChild(bl);
       if (readyToArchive(w, pr)) {
-        var ab = el("button", {type: "button", class: "pj-copy", title: "Copy the exact command (read-only: nothing runs)", text: "Archive"});
-        (function (id) {
-          ab.addEventListener("click", function (ev) {
-            ev.stopPropagation();
-            var cmd = "python3 agent_dash.py ws archive " + id;
-            if (typeof copyCmd === "function") copyCmd(cmd);
-            else if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(cmd);
-          });
-        })(w.ws);
-        acts.appendChild(ab);
+        /* Real archive button when the server allows writes, else the
+           copy-command button. The control names the workstream in its
+           aria-label and disables itself while the POST is in flight. */
+        if (typeof archiveControl === "function") acts.appendChild(archiveControl(w.ws, w.name));
+        else {
+          var ab = el("button", {type: "button", class: "pj-copy", title: "Copy the exact command (read-only: nothing runs)", text: "Archive"});
+          (function (id) {
+            ab.addEventListener("click", function (ev) {
+              ev.stopPropagation();
+              var cmd = "python3 agent_dash.py ws archive " + id;
+              if (typeof copyCmd === "function") copyCmd(cmd);
+              else if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(cmd);
+            });
+          })(w.ws);
+          acts.appendChild(ab);
+        }
       }
       if (planPrompt[w.ws]) acts.appendChild(copyBtn(planPrompt[w.ws]));
       row.appendChild(acts);
