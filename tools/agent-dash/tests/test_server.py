@@ -887,6 +887,92 @@ class UnpricedAlertTest(unittest.TestCase):
         self.assertEqual(totals["unpriced_models"], [self.MODEL])
 
 
+class Prev24hEndpointTest(unittest.TestCase):
+    """Snapshot and state carry prev_24h per scope; reconcile checks it."""
+
+    MODEL = "claude-sonnet-5-5"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.store = Store(Path(self.tmp.name) / "dash.sqlite")
+        self.now = time.time()
+        self._run("muse:win:ws7-win", "ws7-win", "done", self.now - 7200, self.now - 3600, "s-win")
+        self._usage(self.now - 3500, "s-win", "muse:win:ws7-win", "m-win", 1000)
+        self._run("muse:prev:ws7-prev", "ws7-prev", "done", self.now - 32 * 3600, self.now - 30 * 3600, "s-prev")
+        self._usage(self.now - 30 * 3600 + 60, "s-prev", "muse:prev:ws7-prev", "m-prev", 2000)
+        self._run("muse:prev:ws1-prev", "ws1-prev", "done", self.now - 42 * 3600, self.now - 40 * 3600, "s-old")
+        self._usage(self.now - 41 * 3600, "s-old", "muse:prev:ws1-prev", "m-old", 400)
+        self.server, self.thread = start(self.store)
+        self.port = self.server.server_address[1]
+
+    def tearDown(self):
+        stop(self.server, self.thread)
+        self.store.close()
+        self.tmp.cleanup()
+
+    def _run(self, run_id, label, status, started, ended, session):
+        self.store.upsert_run(
+            {
+                "run_id": run_id,
+                "source": "muse",
+                "tier": "muse",
+                "model": self.MODEL,
+                "label": label,
+                "session_id": session,
+                "status": status,
+                "started_at": started,
+                "ended_at": ended,
+            }
+        )
+
+    def _usage(self, ts, session, run_id, message, tokens):
+        self.store.add_usage(
+            {
+                "ts": ts,
+                "session_id": session,
+                "run_id": run_id,
+                "model": self.MODEL,
+                "tool": "muse",
+                "message_id": message,
+                "input": tokens,
+                "output": tokens // 2,
+                "cache_read": 0,
+                "cache_write": 0,
+            }
+        )
+
+    def fetch(self, path):
+        status, _, body = get(self.port, path)
+        self.assertEqual(status, 200, path)
+        return json.loads(body)
+
+    def test_snapshot_carries_prev_24h_with_scope_filter(self):
+        payload = self.fetch("/api/snapshot?ws=all")
+        self.assertEqual(payload["prev_24h"]["tokens"], 3000 + 600)
+        self.assertEqual(payload["prev_24h"]["finished"], 2)
+        self.assertEqual(payload["prev_24h"]["live_agents"], 0)
+        scoped = self.fetch("/api/snapshot?ws=WS7")
+        self.assertEqual(scoped["prev_24h"]["tokens"], 3000)
+        self.assertEqual(scoped["prev_24h"]["finished"], 1)
+        self.assertEqual(len(scoped["by_workstream"]), 1)
+        self.assertEqual(scoped["by_workstream"][0]["prev_24h"], scoped["prev_24h"])
+
+    def test_state_totals_and_rows_carry_prev_24h(self):
+        payload = self.fetch("/api/state")
+        self.assertEqual(payload["totals"]["prev_24h"]["tokens"], 3000 + 600)
+        by_id = {row["id"]: row for row in payload["workstreams"]}
+        self.assertEqual(by_id["WS7"]["prev_24h"]["tokens"], 3000)
+        self.assertEqual(by_id["WS1"]["prev_24h"]["finished"], 1)
+
+    def test_reconcile_carries_prev_24h_without_mismatch(self):
+        payload = self.fetch("/api/reconcile?hours=24")
+        self.assertEqual(payload["all"]["prev_24h"]["tokens"], 3000 + 600)
+        self.assertFalse(
+            [item for item in payload["mismatches"] if "prev_24h" in item],
+            payload["mismatches"],
+        )
+
+
 class DisconnectSilenceTest(unittest.TestCase):
     """Item 9: BrokenPipe/ConnectionReset are counted, not printed. Real
     errors still log."""

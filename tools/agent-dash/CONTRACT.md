@@ -126,6 +126,7 @@ unreachable (docs/integrate.md, For agents).
  "counts": {"live_agents": 0, "live_by_tool": {"grok": 0, "muse": 0, "glm": 0, "claude": 0}, "prod_jobs": 0, "prod_jobs_finished": 0, "finished_today": 0, "finished_in_range": 0, "finished_by_verdict": {}},
  "running": [Run], "recent": [Run],
  "totals": {"tokens": {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0, "reasoning": 0}, "cost_usd": 0.0, "unpriced_runs": 0, "unpriced_tokens": 0, "unpriced_models": []},
+ "prev_24h": {"tokens": 0, "cost_usd": 0.0, "finished": 0, "live_agents": 0},
  "totals_all_time": {"tokens": {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0, "reasoning": 0}, "cost_usd": 0.0},
  "last_activity": 0,
  "by_workstream": [{"ws": "WS7", "live_agents": 0, "finished_in_range": 0, "finished_today": 0, "tokens": 0, "cost_usd": 0.0, "tokens_all_time": 0, "cost_usd_all_time": 0.0, "last_activity": 0, "ws_confidence": ["regex"]}],
@@ -139,6 +140,19 @@ bad `usage_group` is a 400.
 no window, summed by the same helper. `last_activity` is the scope's newest
 run stamp, or null when the scope has no runs. The page tiles read these
 fields directly and never re-sum buckets on the client.
+`prev_24h` (`{tokens, cost_usd, finished, live_agents}`) is the same scope's
+numbers for the 24 hours immediately before the window (`[since - 24 h,
+since]`; the default window makes that `[now - 48 h, now - 24 h]`), computed
+with the same bucket sums and the same agent rule as the windowed totals, so
+a delta compares like with like. `tokens` is billed tokens, `cost_usd` the
+priced cost under the same unpriced rule, `finished` the finished-in-range
+count for that earlier window (agent runs only: lead sessions, shell rows,
+and Dagster jobs are not agents), and `live_agents` the point-in-time count
+of agents overlapping the window start (`now - 24 h` by default), not a peak.
+Each `by_workstream` row carries its own scope's `prev_24h`. The field is
+additive: no existing field changed, and the snapshot cache keys it with the
+same entry and invalidation as the rest. Retention caveat: when data older
+than the window is pruned, `prev_24h` reads as whatever the database holds.
 One function (`Store._summarize_locked`) computes the all-scope counts and totals,
 every workstream row, and the `unassigned` row from the same run list, the same
 agent rule, and the same window. The `by_workstream` row for a workstream equals
@@ -168,11 +182,16 @@ through the one plan resolver (`dash.bundles.resolve_plan`), so one request
 gives the tab bar its completed state; it is null when the workstream has no
 plan. An `unassigned` row appears when runs have no workstream.
 
-`GET /api/reconcile?hours=&since=&until=` -> `{"now": 0, "since": 0, "until": 0, "all": {live_agents, finished_in_range, finished_today, tokens, cost_usd}, "all_time": {tokens, cost_usd}, "rows": [per-workstream rows], "unassigned": {...}, "mismatches": []}`.
+`GET /api/reconcile?hours=&since=&until=` -> `{"now": 0, "since": 0, "until": 0, "all": {live_agents, finished_in_range, finished_today, tokens, cost_usd, prev_24h: {tokens, cost_usd, finished, live_agents}}, "all_time": {tokens, cost_usd}, "rows": [per-workstream rows], "unassigned": {...}, "mismatches": []}`.
 Computed in one store pass under the lock. Rows carry `tokens_all_time` and
 `cost_usd_all_time` next to the windowed numbers. `mismatches` lists every violated
 invariant, windowed and all-time (rows plus unassigned equal the all-scope
 numbers, and each row equals its workstream tab), and is empty when consistent.
+One more invariant covers the previous window: every row and `unassigned`
+carry their scope's `prev_24h`, `all` carries the all-scope `prev_24h`, and
+the rows plus unassigned must equal it — tokens to the token, cost to the
+cent (`prev_24h_tokens: ...` / `prev_24h_cost_usd: ...` mismatches, reported
+like the others).
 `python3 agent_dash.py check [--url URL] [--hours N]` prints the rows as a
 table and exits 1 on any mismatch, including one `unseen worker: <label>`
 mismatch per live worker process (a `[label:]`, muse prompt-file label, or
@@ -272,13 +291,17 @@ store pass (`Store.state_view`):
    "live_agents": 0, "tokens": 0, "cost_usd": 0.0, "tokens_all_time": 0, "cost_usd_all_time": 0.0, "last_activity": 0}],
  "unassigned": {"live_agents": 0, "tokens": 0, "cost_usd": 0.0, "tokens_all_time": 0, "cost_usd_all_time": 0.0, "last_activity": 0},
  "running": {"count": 0, "by_source": {"muse": 0}, "prod_jobs": 0, "prod_jobs_finished": 0},
- "totals": {"tokens": {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0, "reasoning": 0}, "cost_usd": 0.0, "unpriced_runs": 0, "prod_jobs": 0, "prod_jobs_finished": 0},
+ "totals": {"tokens": {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0, "reasoning": 0}, "cost_usd": 0.0, "unpriced_runs": 0, "prev_24h": {"tokens": 0, "cost_usd": 0.0, "finished": 0, "live_agents": 0}, "prod_jobs": 0, "prod_jobs_finished": 0},
  "totals_all_time": {"tokens": {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0, "reasoning": 0}, "cost_usd": 0.0},
  "reconcile": {"ok": true, "mismatches": []},
  "problems": [{"code": "stale-running", "message": "", "command": "python3 agent_dash.py check"}]}
 ```
 `version.tool` is the git short sha of the tool directory, `"unknown"`
-outside git. The window is the one fixed 24 h. `progress` is the same
+outside git. The window is the one fixed 24 h. `totals.prev_24h` and each
+workstream row's (and `unassigned`'s) `prev_24h` are the snapshot
+`prev_24h` for those scopes: the 24 h before the window, same functions
+and attribution, `live_agents` point-in-time at the window start.
+`progress` is the same
 object `/api/plan` carries, or null. `health` carries the same
 `scratch_roots`, `run_dirs`, and `warnings` as `/api/health`.
 `problems` is the persisted doctor list: the same entries (same ids)

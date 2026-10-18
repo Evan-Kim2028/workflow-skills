@@ -288,7 +288,7 @@ class StoreTest(unittest.TestCase):
         snap = self.store.snapshot(now)
         self.assertEqual(
             set(snap),
-            {"now", "seq", "data_seq", "last_data_ts", "counts", "running", "recent", "recent_shown", "recent_total", "totals", "totals_all_time", "last_activity", "by_workstream"},
+            {"now", "seq", "data_seq", "last_data_ts", "counts", "running", "recent", "recent_shown", "recent_total", "totals", "prev_24h", "totals_all_time", "last_activity", "by_workstream"},
         )
         self.assertEqual(snap["counts"]["live_agents"], 0)
         recent_ids = [run["run_id"] for run in snap["recent"]]
@@ -1121,6 +1121,203 @@ class ReconcileTest(unittest.TestCase):
         mine = {row["ws"]: row for row in boards if row["ws"] in ("WS1", "unassigned")}
         self.assertEqual(mine["WS1"]["live_agents"], 2)
         self.assertEqual(mine["unassigned"]["live_agents"], 1)
+
+
+class Prev24hTest(unittest.TestCase):
+    """Snapshot prev_24h: the 24 h before the window, like with like.
+
+    Tokens and cost come from the same hourly bucket cells over the
+    earlier window (same priced-cost fallback, so the same unpriced
+    rule); finished is the same finished-in-range count for that
+    window, agent runs only; live_agents is the point-in-time overlap
+    at the window start, not a peak.
+    """
+
+    MODEL = "claude-sonnet-5-5"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.store = memory(Path(self.tmp.name))
+        self.now = 1_761_999_960.0
+
+    def tearDown(self):
+        self.store.close()
+        self.tmp.cleanup()
+
+    def _run(self, run_id, source, tier, label, status, started, ended, session=None):
+        self.store.upsert_run(
+            {
+                "run_id": run_id,
+                "source": source,
+                "tier": tier,
+                "model": self.MODEL,
+                "label": label,
+                "session_id": session or run_id,
+                "status": status,
+                "started_at": started,
+                "ended_at": ended,
+            }
+        )
+
+    def _usage(self, ts, session, run_id, message, tokens, model=None):
+        self.store.add_usage(
+            {
+                "ts": ts,
+                "session_id": session,
+                "run_id": run_id,
+                "model": model or self.MODEL,
+                "tool": "muse",
+                "message_id": message,
+                "input": tokens,
+                "output": tokens // 2,
+                "cache_read": 0,
+                "cache_write": 0,
+            }
+        )
+
+    def seed(self):
+        now = self.now
+        hour = 3600
+        # Windowed WS7 run: 1500 billed tokens in the window.
+        self._run("muse:win:ws7-win", "muse", "muse", "ws7-win", "done",
+                  now - 2 * hour, now - hour, session="s-win")
+        self._usage(now - hour - 100, "s-win", "muse:win:ws7-win", "m-win", 1000)
+        # Previous-window WS7 run: 3000 billed tokens before the window.
+        self._run("muse:prev:ws7-prev", "muse", "muse", "ws7-prev", "done",
+                  now - 32 * hour, now - 30 * hour, session="s-prev")
+        self._usage(now - 31 * hour, "s-prev", "muse:prev:ws7-prev", "m-prev", 2000)
+        # Unpriced model in the previous window: tokens count, cost does not.
+        self._run("muse:prevu:ws7-unpriced", "muse", "muse", "ws7-unpriced", "done",
+                  now - 33 * hour, now - 31 * hour, session="s-prevu")
+        self._usage(now - 32 * hour, "s-prevu", "muse:prevu:ws7-unpriced",
+                    "m-prevu", 100, model="no-such-model-xyz")
+        # Previous-window WS1 run: 600 billed tokens, ended before the start.
+        self._run("muse:old:ws1-old", "muse", "muse", "ws1-old", "done",
+                  now - 42 * hour, now - 40 * hour, session="s-old")
+        self._usage(now - 41 * hour, "s-old", "muse:old:ws1-old", "m-old", 400)
+        # Unassigned previous-window run: 90 billed tokens.
+        self._run("muse:u:helper", "muse", "muse", "helper", "done",
+                  now - 34 * hour, now - 33 * hour, session="s-u")
+        self._usage(now - 33 * hour - 100, "s-u", "muse:u:helper", "m-u", 60)
+        # WS1 runner live across the window start, kept fresh by a sample.
+        self._run("muse:run:ws1-live", "muse", "muse", "ws1-live", "running",
+                  now - 50 * hour, None, session="s-run")
+        self.store.add_process_sample(
+            {"ts": now - 60, "pid": 4242, "run_id": "muse:run:ws1-live", "label": "ws1-live"}
+        )
+        # WS7 run spanning the window start: live then, finished in the window.
+        self._run("muse:long:ws7-long", "muse", "muse", "ws7-long", "done",
+                  now - 50 * hour, now - hour, session="s-long")
+        # A lead session, a shell row, and a Dagster job overlapping the
+        # previous window are never agents: out of finished and live counts.
+        self._run("claude-main:lead:ws7-lead", "claude-main", "opus", "ws7-lead", "running",
+                  now - 50 * hour, None, session="lead")
+        self.store.add_process_sample(
+            {"ts": now - 60, "pid": 4243, "run_id": "claude-main:lead:ws7-lead", "label": "ws7-lead"}
+        )
+        self._run("shell:exec:ws1-sh", "shell", "generic", "ws1-sh", "done",
+                  now - 33 * hour, now - 32 * hour, session="s-sh")
+        self.store.upsert_run(
+            {
+                "run_id": "dagster:job:prev",
+                "source": "dagster",
+                "model": "nightly",
+                "label": "ws1-backfill",
+                "session_id": "dagster:job:prev",
+                "status": "finished",
+                "started_at": now - 33 * hour,
+                "ended_at": now - 32 * hour,
+                "clock_source": "dagster",
+            }
+        )
+
+    def test_exact_values(self):
+        self.seed()
+        snap = self.store.snapshot(self.now, "all")
+        prev = snap["prev_24h"]
+        self.assertEqual(set(prev), {"tokens", "cost_usd", "finished", "live_agents"})
+        self.assertEqual(prev["tokens"], 3000 + 150 + 600 + 90)
+        self.assertAlmostEqual(
+            prev["cost_usd"],
+            cost(self.MODEL, 2000, 1000, 0, 0)
+            + cost(self.MODEL, 400, 200, 0, 0)
+            + cost(self.MODEL, 60, 30, 0, 0),
+            places=6,
+        )
+        # Four finished agent runs; the shell row and the Dagster job do not count.
+        self.assertEqual(prev["finished"], 4)
+        # The WS1 runner and the spanning WS7 run; the lead session does not count.
+        self.assertEqual(prev["live_agents"], 2)
+        # The window itself is untouched by the earlier data.
+        self.assertEqual(snap["counts"]["finished_in_range"], 2)
+        self.assertEqual(snap["counts"]["live_agents"], 1)
+
+    def test_scope_filter(self):
+        self.seed()
+        ws7 = self.store.snapshot(self.now, "WS7")["prev_24h"]
+        self.assertEqual(ws7["tokens"], 3000 + 150)
+        self.assertEqual(ws7["finished"], 2)
+        self.assertEqual(ws7["live_agents"], 1)
+        ws1 = self.store.snapshot(self.now, "WS1")["prev_24h"]
+        self.assertEqual(ws1["tokens"], 600)
+        self.assertEqual(ws1["finished"], 1)
+        self.assertEqual(ws1["live_agents"], 1)
+        unassigned = self.store.snapshot(self.now, "unassigned")["prev_24h"]
+        self.assertEqual(unassigned["tokens"], 90)
+        self.assertEqual(unassigned["finished"], 1)
+        self.assertEqual(unassigned["live_agents"], 0)
+
+    def test_rows_plus_unassigned_equal_all(self):
+        self.seed()
+        roll = self.store.ws_rollup(self.now)
+        everything = list(roll["rows"]) + [roll["unassigned"]]
+        self.assertEqual(
+            sum(row["prev_24h"]["tokens"] for row in everything),
+            roll["all"]["prev_24h"]["tokens"],
+        )
+        self.assertAlmostEqual(
+            sum(row["prev_24h"]["cost_usd"] for row in everything),
+            roll["all"]["prev_24h"]["cost_usd"],
+            places=6,
+        )
+        for row in everything:
+            tab = self.store.snapshot(self.now, row["ws"])
+            self.assertEqual(row["prev_24h"], tab["prev_24h"], row["ws"])
+        report = self.store.reconcile_numbers(self.now, processes=[])
+        self.assertEqual(report["mismatches"], [])
+        self.assertEqual(report["all"]["prev_24h"], self.store.snapshot(self.now, "all")["prev_24h"])
+
+    def test_prev_mismatch_reported_like_the_others(self):
+        import copy
+
+        from dash.store import _scope_tab
+
+        self.seed()
+        now = self.now
+        with self.store._lock:
+            shown_all, parents = self.store._shown_locked(now)
+            roll = self.store._summarize_locked(shown_all, parents, now, None, None, None)
+            doctored = copy.deepcopy(roll)
+            doctored["rows"][0]["prev_24h"]["tokens"] += 1
+            mismatches = self.store._mismatches_locked(
+                doctored, shown_all, now, lambda ws: _scope_tab(doctored, ws), []
+            )
+        self.assertTrue(
+            any(item.startswith("prev_24h_tokens: workstream rows sum to") for item in mismatches),
+            mismatches,
+        )
+        with self.store._lock:
+            shown_all, parents = self.store._shown_locked(now)
+            roll = self.store._summarize_locked(shown_all, parents, now, None, None, None)
+            doctored = copy.deepcopy(roll)
+            doctored["rows"][0]["prev_24h"]["cost_usd"] += 1.0
+            mismatches = self.store._mismatches_locked(
+                doctored, shown_all, now, lambda ws: _scope_tab(doctored, ws), []
+            )
+        self.assertTrue(
+            any(item.startswith("prev_24h_cost_usd: workstream rows sum to") for item in mismatches),
+            mismatches,
+        )
 
 
 class ProcessParseTest(unittest.TestCase):

@@ -89,6 +89,7 @@ def build_state(store, registry, cfg=None, now: float | None = None, processes=N
                 "live_agents": row["live_agents"],
                 "tokens": row["tokens"],
                 "cost_usd": row["cost_usd"],
+                "prev_24h": dict(row.get("prev_24h") or {"tokens": 0, "cost_usd": 0.0, "finished": 0, "live_agents": 0}),
                 "tokens_all_time": row["tokens_all_time"],
                 "cost_usd_all_time": row["cost_usd_all_time"],
                 "last_activity": row["last_activity"],
@@ -96,6 +97,7 @@ def build_state(store, registry, cfg=None, now: float | None = None, processes=N
         )
     unassigned = roll["unassigned"]
     totals = roll["all"]["totals"]
+    totals_prev = dict(roll["all"].get("prev_24h") or {"tokens": 0, "cost_usd": 0.0, "finished": 0, "live_agents": 0})
 
     problems = _doctor_problems(store, now)
 
@@ -113,12 +115,13 @@ def build_state(store, registry, cfg=None, now: float | None = None, processes=N
             "live_agents": unassigned["live_agents"],
             "tokens": unassigned["tokens"],
             "cost_usd": unassigned["cost_usd"],
+            "prev_24h": dict(unassigned.get("prev_24h") or {"tokens": 0, "cost_usd": 0.0, "finished": 0, "live_agents": 0}),
             "tokens_all_time": unassigned["tokens_all_time"],
             "cost_usd_all_time": unassigned["cost_usd_all_time"],
             "last_activity": unassigned["last_activity"],
         },
         "running": {"count": sum(by_source.values()), "by_source": by_source, "prod_jobs": prod_jobs, "prod_jobs_finished": prod_jobs_finished},
-        "totals": {**totals, "prod_jobs": prod_jobs, "prod_jobs_finished": prod_jobs_finished},
+        "totals": {**totals, "prev_24h": totals_prev, "prod_jobs": prod_jobs, "prod_jobs_finished": prod_jobs_finished},
         "totals_all_time": roll["all_time"]["all"],
         "reconcile": {"ok": not mismatches, "mismatches": mismatches},
         "problems": problems,

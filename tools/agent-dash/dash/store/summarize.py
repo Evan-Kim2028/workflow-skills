@@ -12,11 +12,11 @@ from dash.models import run_model_key
 
 from .runs import (_is_manifest_twin, _nearest_twin,
                    _parent_map, _rollup_usage)
-from .running import _annotate_lanes
+from .running import _annotate_lanes, _lane_shadows
 from .util import (BILLED_FIELDS, FINISHED, MERGE_WINDOW_S,
                  RANGE_S,
                  SAMPLE_FRESH_S, TOKEN_FIELDS,
-                 TOOL_KEYS, UNASSIGNED, _billed_total,
+                 TOOL_KEYS, UNASSIGNED, _active, _billed_total,
                  _drop_launch_echoes, _elapsed, _epoch, _in_ws,
                  _is_counted_agent, _local_midnight, _money,
                  _tool_key, _ws_sort, _zeros,
@@ -39,6 +39,17 @@ class SummarizeMixin:
             ``usage``, read under the same lock pass as the totals, so the bucket
             token sum equals ``totals`` by construction. Without it the key is
             absent and the payload is the historic shape.
+
+            ``prev_24h`` carries the same scope's numbers for the 24 hours
+            immediately before the window (``[since - 24h, since]``; the
+            default window makes that ``[now - 48h, now - 24h]``), computed
+            with the same bucket sums and the same agent rule as the
+            windowed totals, so a delta compares like with like. ``tokens``
+            is billed tokens, ``cost_usd`` the priced cost under the same
+            unpriced rule, ``finished`` the finished-in-range count for that
+            earlier window, and ``live_agents`` the point-in-time count of
+            agents overlapping the window start (``now - 24h`` by default),
+            not a peak. Pruned data reads as whatever the database holds.
             """
             if usage_group is not None and usage_group not in ("model", "workstream", "tool"):
                 raise ValueError("bad usage_group")
@@ -105,6 +116,7 @@ class SummarizeMixin:
                     "recent_shown": len(recent),
                     "recent_total": recent_total,
                     "totals": totals,
+                    "prev_24h": dict(scope["prev_24h"]),
                     "totals_all_time": roll["all_time"][key]
                     if key in roll["all_time"]
                     else {"tokens": {field: 0 for field in TOKEN_FIELDS}, "cost_usd": 0.0},
@@ -133,6 +145,8 @@ class SummarizeMixin:
             recomputing, so idle tabs cost nothing. ``now`` and ``seq`` refresh
             on a hit; the run lists are seconds-stale at most, which the stale
             badge covers. Misses compute one full snapshot and fill the cache.
+            ``prev_24h`` rides the same entry and the same invalidation as
+            every other number: no extra key, same staleness bound.
             """
             key = (ws, since, until, usage_group)
             with self._lock:
@@ -213,12 +227,15 @@ class SummarizeMixin:
                     "now": now,
                     "since": roll["since"],
                     "until": roll["until"],
+                    "prev_since": roll["prev_since"],
+                    "prev_until": roll["prev_until"],
                     "all": {
                         "live_agents": all_counts["live_agents"],
                         "finished_in_range": all_counts["finished_in_range"],
                         "finished_today": all_counts["finished_today"],
                         "tokens": _billed_total(all_totals["tokens"]),
                         "cost_usd": all_totals["cost_usd"],
+                        "prev_24h": dict(roll["all"]["prev_24h"]),
                     },
                     "all_time": {
                         "tokens": all_time_total,
@@ -237,10 +254,11 @@ class SummarizeMixin:
             roll's already-computed scopes (``all_time`` is None when the roll
             holds no all-time scope for ``ws``); both callers pass
             ``_scope_tab`` over their own roll, so both agree with each other
-            and emit ``/api/reconcile`` order: row sums, per-row tabs, all-time
-            sums, unpriced models, stale running, unseen workers, then
-            duplicate runs. ``processes`` is the live worker listing for the
-            ``unseen worker`` check (``[]`` for none).
+            and emit ``/api/reconcile`` order: row sums, previous-window row
+            sums (tokens to the token, cost to the cent), per-row tabs,
+            all-time sums, unpriced models, stale running, unseen workers,
+            then duplicate runs. ``processes`` is the live worker listing for
+            the ``unseen worker`` check (``[]`` for none).
             """
             everything = list(roll["rows"]) + [roll["unassigned"]]
             all_counts = roll["all"]["counts"]
@@ -259,6 +277,21 @@ class SummarizeMixin:
                     "cost_usd: workstream rows sum to "
                     f"{sum(row['cost_usd'] for row in everything):.6f}, "
                     f"overview shows {all_totals['cost_usd']:.6f}"
+                )
+            prev_all = roll["all"].get("prev_24h") or {}
+            prev_tokens_total = sum((row.get("prev_24h") or {}).get("tokens", 0) for row in everything)
+            if prev_tokens_total != (prev_all.get("tokens", 0) or 0):
+                mismatches.append(
+                    "prev_24h_tokens: workstream rows sum to "
+                    f"{prev_tokens_total}, "
+                    f"overview shows {prev_all.get('tokens', 0)}"
+                )
+            prev_cost_total = sum((row.get("prev_24h") or {}).get("cost_usd", 0.0) for row in everything)
+            if round(prev_cost_total, 2) != round(prev_all.get("cost_usd", 0.0) or 0.0, 2):
+                mismatches.append(
+                    "prev_24h_cost_usd: workstream rows sum to "
+                    f"{prev_cost_total:.6f}, "
+                    f"overview shows {(prev_all.get('cost_usd', 0.0) or 0.0):.6f}"
                 )
             for row in roll["rows"]:
                 tab_counts, tab_totals, tab_all_time = tab_of(row["ws"])
@@ -367,6 +400,28 @@ class SummarizeMixin:
                     buckets.get(ws, []),
                     live_open,
                 )
+            # The 24 hours immediately before the window, per scope, with the
+            # same bucket sums and the same agent rule as the windowed
+            # numbers, so a delta compares like with like. Tokens and cost
+            # come from the same hourly cells over the earlier window (same
+            # priced-cost fallback, so the same unpriced rule); finished is
+            # the same finished-in-range count over that window; live is the
+            # point-in-time overlap at the window start, not a peak.
+            prev_since = range_since - RANGE_S
+            prev_until = range_since
+            prev_cells = self._query_usage_locked("workstream", "hour", None, prev_since, prev_until)
+            prev_buckets: dict[str, list] = {}
+            for cell in prev_cells:
+                prev_buckets.setdefault(cell["key"], []).append(cell)
+            live_at_start = _live_at_point_ids(shown_all, parents, prev_until, now)
+            scopes["all"]["prev_24h"] = _prev_24h(
+                shown_all, parents, now, prev_since, prev_until, prev_cells, live_open, live_at_start,
+            )
+            for ws in workstreams:
+                members = [run for run in shown_all if (run.get("workstream") or UNASSIGNED) == ws]
+                scopes[ws]["prev_24h"] = _prev_24h(
+                    members, parents, now, prev_since, prev_until, prev_buckets.get(ws, []), live_open, live_at_start,
+                )
             # All-time tokens and cost per scope from the same bucket cells with no
             # window, summed by the same helper as the windowed numbers.
             everything = self._query_usage_locked("workstream", "hour", None, None, None)
@@ -382,6 +437,8 @@ class SummarizeMixin:
             return {
                 "since": range_since,
                 "until": range_until,
+                "prev_since": prev_since,
+                "prev_until": prev_until,
                 "all": scopes["all"],
                 "scopes": scopes,
                 "rows": rows,
@@ -603,6 +660,70 @@ def _scope_tab(roll: dict, ws: str):
     return scope["counts"], scope["totals"], roll["all_time"].get(ws)
 
 
+def _zero_prev() -> dict:
+    """Empty previous-window numbers, mirroring the ``prev_24h`` shape."""
+    return {"tokens": 0, "cost_usd": 0.0, "finished": 0, "live_agents": 0}
+
+
+def _prev_24h(members: list, parents: dict, now: float, prev_since: float, prev_until: float, prev_cells: list, live_open, live_at_start: set) -> dict:
+    """Previous-window numbers for one scope, like with like.
+
+    Token and cost sums go through the same ``_sum_cells`` helper over the
+    earlier window's bucket cells (same priced-cost fallback, so the same
+    unpriced rule); ``finished`` is the same ``_agent_counts``
+    finished-in-range count over that window (agent runs only: lead
+    sessions, shell rows, and Dagster jobs are not agents);
+    ``live_agents`` is the point-in-time count of those members overlapping
+    the window start, one lane one agent, not a peak.
+    """
+    finished = _agent_counts(members, parents, now, prev_since, prev_until, live_open)["finished_in_range"]
+    summed = _sum_cells(prev_cells)
+    return {
+        "tokens": _billed_total(summed["tokens"]),
+        "cost_usd": summed["cost_usd"],
+        "finished": finished,
+        "live_agents": _point_live_count(members, live_at_start),
+    }
+
+
+def _live_at_point_ids(runs: list, parents: dict, t0: float, now: float) -> set:
+    """Run ids live at the point ``t0``, minus lane shadows.
+
+    A counted agent overlaps ``t0`` by the same rule the concurrency chart
+    uses (``_active``: started at or before ``t0``, still open past it); a
+    ``claude-workflow`` wrapper shadowed by a live worker row on the same
+    label counts once, the worker, exactly as the live-open set does today.
+    Runs with no start time are never live at a point.
+    """
+    live = {
+        run["run_id"]
+        for run in runs
+        if run["run_id"] not in parents
+        and _is_counted_agent(run)
+        and _active(run, t0, now)
+    }
+    return live - set(_lane_shadows(runs, live))
+
+
+def _point_live_count(members: list, live_ids: set) -> int:
+    """Point-in-time live agents for one scope's members.
+
+    Same one-lane-one-agent dedup as the live count: two rows for one
+    ``(tool, label)`` lane count once.
+    """
+    seen = set()
+    count = 0
+    for run in members:
+        if run["run_id"] not in live_ids:
+            continue
+        key = (_tool_key(run), run.get("label") or run["run_id"])
+        if key in seen:
+            continue
+        seen.add(key)
+        count += 1
+    return count
+
+
 def _ws_row(ws: str, scope: dict, all_time: dict | None = None) -> dict:
     row = {
         "ws": ws,
@@ -611,6 +732,7 @@ def _ws_row(ws: str, scope: dict, all_time: dict | None = None) -> dict:
         "finished_today": scope["counts"]["finished_today"],
         "tokens": _billed_total(scope["totals"]["tokens"]),
         "cost_usd": scope["totals"]["cost_usd"],
+        "prev_24h": dict(scope.get("prev_24h") or _zero_prev()),
         "last_activity": _last_activity(scope["runs"]),
         "ws_confidence": sorted(
             {
@@ -644,6 +766,7 @@ def _empty_scope() -> dict:
             "cost_usd": 0.0,
             "unpriced_runs": 0,
         },
+        "prev_24h": _zero_prev(),
     }
 
 

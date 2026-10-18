@@ -60,13 +60,17 @@ from .summarize import (
     _duplicate_run_mismatches,
     _empty_scope,
     _last_activity,
+    _live_at_point_ids,
     _overlap,
+    _point_live_count,
+    _prev_24h,
     _run_overlaps_window,
     _scope_numbers,
     _scope_tab,
     _sum_cells,
     _usage_unpriced,
     _ws_row,
+    _zero_prev,
 )
 from .usage import UsageMixin, _fold_events
 from .util import (
@@ -181,6 +185,10 @@ __all__ = [
     "_ws_row",
     "_empty_scope",
     "_agent_counts",
+    "_zero_prev",
+    "_prev_24h",
+    "_live_at_point_ids",
+    "_point_live_count",
     "price_cost",
     "series_key",
     "price_status",

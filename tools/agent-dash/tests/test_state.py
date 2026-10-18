@@ -102,6 +102,73 @@ class StateShapeTest(unittest.TestCase):
             self.assertIn("message", item)
             self.assertIn("command", item)
 
+    def test_prev_24h_rides_totals_unassigned_and_rows(self):
+        now = time.time()
+        self.store.upsert_run(
+            {
+                "run_id": "muse:win:ws7-win",
+                "source": "muse",
+                "tier": "muse",
+                "model": "claude-sonnet-5-5",
+                "label": "ws7-win",
+                "session_id": "s-win",
+                "status": "done",
+                "started_at": now - 7200,
+                "ended_at": now - 3600,
+            }
+        )
+        self.store.add_usage(
+            {
+                "ts": now - 3500,
+                "session_id": "s-win",
+                "run_id": "muse:win:ws7-win",
+                "model": "claude-sonnet-5-5",
+                "tool": "muse",
+                "message_id": "m-win",
+                "input": 1000,
+                "output": 500,
+                "cache_read": 0,
+                "cache_write": 0,
+            }
+        )
+        self.store.upsert_run(
+            {
+                "run_id": "muse:prev:ws7-prev",
+                "source": "muse",
+                "tier": "muse",
+                "model": "claude-sonnet-5-5",
+                "label": "ws7-prev",
+                "session_id": "s-prev",
+                "status": "done",
+                "started_at": now - 32 * 3600,
+                "ended_at": now - 30 * 3600,
+            }
+        )
+        self.store.add_usage(
+            {
+                "ts": now - 30 * 3600 + 60,
+                "session_id": "s-prev",
+                "run_id": "muse:prev:ws7-prev",
+                "model": "claude-sonnet-5-5",
+                "tool": "muse",
+                "message_id": "m-prev",
+                "input": 2000,
+                "output": 1000,
+                "cache_read": 0,
+                "cache_write": 0,
+            }
+        )
+        payload = build_state(self.store, StubRegistry([]), {}, now=now)
+        self.assertEqual(payload["totals"]["prev_24h"]["tokens"], 3000)
+        self.assertEqual(payload["totals"]["prev_24h"]["finished"], 1)
+        self.assertEqual(payload["totals"]["prev_24h"]["live_agents"], 0)
+        by_id = {row["id"]: row for row in payload["workstreams"]}
+        self.assertEqual(by_id["WS7"]["prev_24h"]["finished"], 1)
+        self.assertEqual(
+            payload["unassigned"]["prev_24h"],
+            {"tokens": 0, "cost_usd": 0.0, "finished": 0, "live_agents": 0},
+        )
+
     def test_one_store_pass(self):
         calls = []
         real = Store._summarize_locked
