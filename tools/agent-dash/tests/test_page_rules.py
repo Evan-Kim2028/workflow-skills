@@ -183,6 +183,7 @@ class PageRules(unittest.TestCase):
             "cards/burnup.js": ["function burnupLegendTip(", "function burnupTasksAria(", "function burnupDoneRows(", "function burnupWsRow("],
             "cards/depgraph.js": ["function depAriaTip(", "function depTaskLine(", "function depTipRows("],
             "cards/phases.js": ["function phaseSegTip(", "function phaseFmt(", "function phaseStackTip("],
+            "cards/progress.js": ["function progLegendTip(", "function progMileRows(", "function progStepRows(", "function progBarRows(", "function progTakeaway("],
             "cards/plan-progress.js": ["function planAttText(", "function planSecTip(", "function planColbarTip(", "function planBigAria(", "function planBigTip("],
             "cards/tables.js": ["function tipRows("],
             "cards/tiles.js": ["function tileTokensTitle(", "function tileTokensApproxTitle(", "function tileCostTitle(", "function tileCostApproxTitle(", "function tileFinTitle(", "function tileFinApproxTitle(", "function tileLiveTitle(", "function tileLiveApproxTitle("],
@@ -226,7 +227,7 @@ function tokTotal(t) { t = t || {}; return (t.input || 0) + (t.output || 0) + (t
 load("format.js");
 var AD = window.AD;
 var fmtN = AD.fmtN, fmtUsd = AD.fmtUsd, fmtDur = AD.fmtDur, fmtPct = AD.fmtPct, fmtBytes = AD.fmtBytes;
-["activity.js", "burnup.js", "depgraph.js", "phases.js", "plan-progress.js", "tables.js", "tiles.js", "ws-cards.js", "project-home.js", "planned.js", "manage.js", "switcher.js"].forEach(load);
+["activity.js", "burnup.js", "depgraph.js", "phases.js", "plan-progress.js", "tables.js", "tiles.js", "ws-cards.js", "project-home.js", "planned.js", "manage.js", "switcher.js", "progress.js"].forEach(load);
 var W = window;
 var seen = [];
 function hover(s) { seen.push(String(s)); return s; }
@@ -282,6 +283,12 @@ hover(W.phProgAria("WS9", 123456, 789012));
 hover(W.plProgAria("WS9", 123456, 789012));
 hover(W.mgProgAria("WS9", 123456, 789012, 16));
 hover(W.swCountAria(123456));
+assert.strictEqual(W.progLegendTip("✓ Done", 0.6233), "✓ Done 62% of tasks");
+hover(W.progLegendTip("✓ Done", 0.6233));
+W.progMileRows(123456, 789012, 98765).forEach(function (r) { hover(r.v); });
+W.progStepRows(123456, 789012, 3456).forEach(function (r) { hover(r.v); });
+W.progBarRows(123456).forEach(function (r) { hover(r.v); });
+hover(W.progTakeaway(123456, 789012, 67, "60%", 98765, 23456));
 assert.ok(seen.length >= 40, "only " + seen.length + " hover strings reached the check");
 var bad = seen.filter(function (s) { return /\d{5,}/.test(s) || /\d,\d{3}/.test(s); });
 assert.deepStrictEqual(bad, [], "raw numbers survived in hover text: " + JSON.stringify(bad.slice(0, 5)));
@@ -289,7 +296,7 @@ console.log("hover builders proof ok: " + seen.length + " strings compact");
 '''
         files = (
             [STATIC / "format.js"]
-            + [STATIC / "cards" / name for name in ("activity.js", "burnup.js", "depgraph.js", "phases.js", "plan-progress.js", "tables.js", "tiles.js", "ws-cards.js", "project-home.js", "planned.js")]
+            + [STATIC / "cards" / name for name in ("activity.js", "burnup.js", "depgraph.js", "phases.js", "plan-progress.js", "tables.js", "tiles.js", "ws-cards.js", "project-home.js", "planned.js", "progress.js")]
             + [STATIC / "core" / name for name in ("manage.js", "switcher.js")]
         )
         proc = subprocess.run(
@@ -3081,10 +3088,11 @@ class FinalPolishTests(unittest.TestCase):
     def test_exec_section_order_activity_stack(self):
         """One Activity over time card replaces the three separate chart
         sections: on both exec scopes the registry order is ... plan,
-        activity, finished, and the planning-versus-execution stacked
-        bars sit last on the workstream and overall scopes. The sidenav
-        derives its order from the DOM, so no pin there; the page comment
-        and DESIGN.md name the same order."""
+        activity, finished, the planning-versus-execution stacked bars
+        follow, and the progress-over-time charts sit last on the
+        workstream scope (the overall scope still ends with its usage
+        card). The sidenav derives its order from the DOM, so no pin
+        there; the page comment and DESIGN.md name the same order."""
         registry = (STATIC / "cards" / "registry.js").read_text()
         entries = re.findall(
             r'\{id:\s*"([^"]+)",\s*order:\s*(\d+),\s*scope:\s*"([^"]+)"', registry
@@ -3106,14 +3114,17 @@ class FinalPolishTests(unittest.TestCase):
         for ident, order, scope in entries:
             by_scope.setdefault(scope, []).append((int(order), ident))
         ws = [ident for _, ident in sorted(by_scope.get("workstream", []))]
-        self.assertEqual(ws[-1], "phases-ws", "the workstream usage card is not the last section")
+        self.assertEqual(ws[-1], "progress", "the progress charts are not the last workstream section")
+        self.assertEqual(ws[-2], "phases-ws", "the workstream usage card is not above the progress charts")
         ov = [ident for _, ident in sorted(by_scope.get("overview", []))]
         self.assertEqual(ov[-1], "phases-all", "the overall usage card is not the last section")
         orders = {ident: int(order) for ident, order, _scope in entries}
         self.assertGreater(orders["phases-ws"], orders["finished"], "the workstream usage card sits before Finished")
+        self.assertGreater(orders["progress"], orders["phases-ws"], "the progress charts sit before the usage card")
         page = (STATIC / "index.html").read_text()
         self.assertIn("plan, activity, finished", page)
-        self.assertIn("planning-versus-execution stacked bars last", page)
+        self.assertIn("progress-over-time", page)
+        self.assertIn("charts last on workstream tabs", page)
         self.assertIn('<script src="/static/cards/activity.js"></script>', page)
         self.assertNotIn("token-chart.js", page, "index.html still loads the old token chart")
         self.assertNotIn("live-chart.js", page, "index.html still loads the old live chart")
@@ -3126,8 +3137,13 @@ class FinalPolishTests(unittest.TestCase):
         )
         self.assertLess(
             design.index("Finished (24 h)"),
-            design.index("usage-by-phase stacked bars last"),
+            design.index("usage-by-phase per-day stacked columns below Finished"),
             "DESIGN.md no longer lists the usage bars after Finished",
+        )
+        self.assertLess(
+            design.index("usage-by-phase per-day stacked columns below Finished"),
+            design.index("Progress over time charts last"),
+            "DESIGN.md no longer lists the progress charts last on the workstream tab",
         )
         sidenav = (STATIC / "sidenav.js").read_text()
         self.assertNotIn('"activity"', sidenav, "the sidenav hard-codes a section order")

@@ -58,7 +58,9 @@ The one argv value ever kept is the worker's `--model` flag value, recorded on p
 | `dash/projectfeed.py` (pure feed builder for `GET /api/project/feed`: page API only, no card) | feed |
 | `dash/projecttimeline.py` (pure timeline builder + project reader + the `/api/project/timeline` collector: page API only, no card) | core |
 | `dash/projectburn.py` (`GET /api/project/burnup`: recorded task burn-up plus per-day cost/token burn, UTC days, honest history gaps) | dash-c3 |
+| `dash/wsprogress.py` (`GET /api/ws/progress`: per-workstream progress over time — done-% steps with the recorded prog band, milestone first-cross times, runs started per hour) | dash-progress |
 | `static/cards/burnup.js` + `burnup.css` (Project burn-up `?view=project` slot `exec-burnup`: tasks area with plan line and gap band, stacked cost/token bars, togglable lanes) | dash-c3 |
+| `static/cards/progress.js` + `progress.css` (Progress over time on the workstream Execution tab: done-% step area with prog band and milestone markers, runs-per-hour bars on the shared time axis) | dash-progress |
 | `dash/phases.py` (planning-versus-execution classifier: explicit `ws<N>-plan/exec/review/coord` marks, review affixes, plan task matches, planning/review/doing/coordination words, unmapped lead sessions, the pre-task planning window; rules in `catalog/phases.json` — the file name is historical — with a `phases.local.json` owner override beside `project.json`; `unclassified` is its own bucket) | dash-phases |
 | `catalog/phases.json` (shipped kind-of-work rules, table-driven and ordered; first match wins; labels only, never prompts) | dash-phases |
 | `dash/projectphases.py` (`GET /api/project/phases`: per-workstream and total tokens/cost/agents/runs/hours by kind of work plus cumulative-by-day series, cached by scope/seq/rules-hash/ignore/plans/taskmap) | dash-phases |

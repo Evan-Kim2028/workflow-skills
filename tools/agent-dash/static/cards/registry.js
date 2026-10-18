@@ -102,6 +102,12 @@
       if (typeof phaseUsageWsSpec !== "function") return null;
       return phaseUsageWsSpec(state, snap);
     }},
+    /* Progress over time: completion plus runs per hour, below the
+       planning-versus-execution card on the workstream Execution tab. */
+    {id: "progress", order: 110, scope: "workstream", spec: function (state, snap) {
+      if (typeof progressSpec !== "function") return null;
+      return progressSpec(state, snap);
+    }},
     {id: "phases-all", order: 100, scope: "overview", spec: function (state, snap) {
       if (typeof phaseUsageAllSpec !== "function") return null;
       return phaseUsageAllSpec(state, snap);

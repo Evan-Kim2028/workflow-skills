@@ -18,6 +18,7 @@
     "dash/project.py": ["test_project", "test_projects", "test_server"],
     "dash/projects.py": ["test_projects", "test_server", "test_page_rules"],
     "dash/replay.py": ["test_server", "test_page_rules"],
+    "dash/wsprogress.py": ["test_wsprogress", "test_server", "test_page_rules"],
     "dash/taskmatch.py": ["test_page_rules"],
     "dash/liveness.py": ["test_process_liveness", "test_server"],
     "dash/rundirs.py": ["test_server", "test_config"],

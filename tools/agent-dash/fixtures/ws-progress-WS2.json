@@ -1,0 +1,115 @@
+{
+  "wsprogress": {
+    "ws": "WS2",
+    "total": 5,
+    "done": 5,
+    "pct": 100,
+    "counts": {
+      "todo": 0,
+      "wip": 0,
+      "pr": 0,
+      "prog": 0,
+      "done": 5,
+      "deferred": 0
+    },
+    "start": 1761990960,
+    "end": 1761999960.0,
+    "now": 1761999960,
+    "points": [
+      {
+        "t": 1761992760.0,
+        "done": 1,
+        "prog": 0,
+        "pct": 20.0
+      },
+      {
+        "t": 1761994560.0,
+        "done": 2,
+        "prog": 0,
+        "pct": 40.0
+      },
+      {
+        "t": 1761996360.0,
+        "done": 3,
+        "prog": 0,
+        "pct": 60.0
+      },
+      {
+        "t": 1761998160.0,
+        "done": 4,
+        "prog": 0,
+        "pct": 80.0
+      },
+      {
+        "t": 1761999960.0,
+        "done": 5,
+        "prog": 0,
+        "pct": 100.0
+      }
+    ],
+    "milestones": [
+      {
+        "pct": 20,
+        "t": 1761992760.0,
+        "done": 1,
+        "elapsed": 1800.0,
+        "reached": true
+      },
+      {
+        "pct": 40,
+        "t": 1761994560.0,
+        "done": 2,
+        "elapsed": 3600.0,
+        "reached": true
+      },
+      {
+        "pct": 60,
+        "t": 1761996360.0,
+        "done": 3,
+        "elapsed": 5400.0,
+        "reached": true
+      },
+      {
+        "pct": 80,
+        "t": 1761998160.0,
+        "done": 4,
+        "elapsed": 7200.0,
+        "reached": true
+      },
+      {
+        "pct": 100,
+        "t": 1761999960.0,
+        "done": 5,
+        "elapsed": 9000.0,
+        "reached": true
+      }
+    ],
+    "runs_per_hour": [
+      {
+        "t": 1761976800,
+        "n": 13
+      },
+      {
+        "t": 1761980400,
+        "n": 20
+      },
+      {
+        "t": 1761994800,
+        "n": 10
+      },
+      {
+        "t": 1761998400,
+        "n": 2
+      }
+    ],
+    "runs_total": 45,
+    "undated_runs": 0,
+    "observed": 5,
+    "inferred": 0,
+    "dated": 5,
+    "undated": 0,
+    "gap": null,
+    "backfilled": []
+  },
+  "_note": "Seeded synthetic data for the offline preview. Seed 1. No local sessions are read."
+}

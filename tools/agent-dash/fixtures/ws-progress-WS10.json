@@ -1,0 +1,67 @@
+{
+  "wsprogress": {
+    "ws": "WS10",
+    "total": 3,
+    "done": 0,
+    "pct": 0,
+    "counts": {
+      "todo": 3,
+      "wip": 0,
+      "pr": 0,
+      "prog": 0,
+      "done": 0,
+      "deferred": 0
+    },
+    "start": 1761996360,
+    "end": 1761996360,
+    "now": 1761999960,
+    "points": [],
+    "milestones": [
+      {
+        "pct": 20,
+        "t": null,
+        "done": 1,
+        "elapsed": null,
+        "reached": false
+      },
+      {
+        "pct": 40,
+        "t": null,
+        "done": 2,
+        "elapsed": null,
+        "reached": false
+      },
+      {
+        "pct": 60,
+        "t": null,
+        "done": 2,
+        "elapsed": null,
+        "reached": false
+      },
+      {
+        "pct": 80,
+        "t": null,
+        "done": 3,
+        "elapsed": null,
+        "reached": false
+      },
+      {
+        "pct": 100,
+        "t": null,
+        "done": 3,
+        "elapsed": null,
+        "reached": false
+      }
+    ],
+    "runs_per_hour": [],
+    "runs_total": 0,
+    "undated_runs": 0,
+    "observed": 0,
+    "inferred": 0,
+    "dated": 0,
+    "undated": 0,
+    "gap": null,
+    "backfilled": []
+  },
+  "_note": "Seeded synthetic data for the offline preview. Seed 1. No local sessions are read."
+}
