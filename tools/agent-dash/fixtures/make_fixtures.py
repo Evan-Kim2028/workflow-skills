@@ -46,6 +46,7 @@ RNG = random.Random(SEED)
 sys.path.insert(0, str(ROOT))
 from dash import taskmatch  # noqa: E402  (the shared run-to-task rule)
 from dash import replay as replay_mod  # noqa: E402  (shared replay run entries and done moments)
+from dash import maplayout as maplayout_mod  # noqa: E402  (the shared map layout standard)
 
 RAW_PLANS = {
     "WS1": {
@@ -614,7 +615,7 @@ def _plans():
                 "phases": body["phases"],
                 "trains": body.get("trains", []),
             }
-        written[ws] = {
+        doc = {
             "ws": ws,
             "cols": view["cols"],
             "groups": view["groups"],
@@ -624,6 +625,13 @@ def _plans():
             "progress": _progress(view["groups"]),
             "_note": "Seeded example plan for the fixture preview.",
         }
+        # The offline page consumes the same server-computed map layout as
+        # the live page (dash/maplayout.py); the map falls back to today's
+        # behaviour when these keys are absent.
+        layout_view = {key: doc[key] for key in ("ws", "cols", "groups", "edges", "phases", "trains")}
+        doc["layout"] = maplayout_mod.layout(layout_view)
+        doc["map_warnings"] = maplayout_mod.map_warnings(layout_view)
+        written[ws] = doc
     return written
 
 

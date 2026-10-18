@@ -9,7 +9,8 @@
    here next.
    Reads: state.plan, state.runs, state.approvals; window.ADC.
    Exports (on window.AdPage.cards, also kept as plain globals):
-   planCard, loadTaskmap, taskOf, planTaskIds; TASKMAP by accessor.
+   planCard, loadTaskmap, taskOf, taskOfVerified, shortChipLabel, layoutOf,
+   planTaskIds; TASKMAP by accessor.
    Needs: el, s, api, OUTCOME, drawMain, refreshAll, openRun,
    openApprovals, canonWs, copyBtn, countUp, fmtN, fmtDate, axes,
    timeTicks, warpTime, warpPos, showTip, hideTip, secCache, Q, FIX,
@@ -38,6 +39,31 @@
     }
     return null;
   }
+  /* Phantom-task guard, mirroring dash/taskmatch.task_of_verified: a mapped
+     id that names no task in this workstream's plan stays unmapped (it lands
+     in the "running, mapped to no task" list instead of claiming a chip
+     that does not exist, e.g. WS7.OPS). With no plan ids to check against,
+     verification is impossible and the raw mapping stands. */
+  function taskOfVerified(r, ws) {
+    var t = taskOf(r, ws);
+    if (t == null) return null;
+    var ids = planTaskIds(ws);
+    if (!ids.length) return t;
+    return ids.indexOf(t) !== -1 ? t : null;
+  }
+  /* Chip display text from the map standard: the id with the WS<digits>.
+     prefix stripped, capped at 14 chars with an end ellipsis. The full id
+     stays in the chip tooltip. Mirrors dash/maplayout.capped_label. */
+  function shortChipLabel(id) {
+    var s = String(id).replace(/^WS\d+\./, "");
+    return s.length > 14 ? s.slice(0, 13) + "…" : s;
+  }
+  /* The server-computed map layout (/api/plan layout object), or null when
+     the server predates it: the map falls back to today's behaviour. */
+  function layoutOf(plan) {
+    var l = plan && plan.layout;
+    return (l && typeof l === "object") ? l : null;
+  }
   /* Task ids of a workstream's plan, so any workstream's labels map to chips (e.g. ws4-WS4.3-slug or ws4-3-slug when 3 is a task id). */
   function planTaskIds(ws) {
     var p = state.plan && state.plan.ws === ws ? state.plan : null;
@@ -50,12 +76,12 @@
   /* plan DAG for a workstream */
   function planCard(plan, snap) {
     var live = {}, just = {}, unassigned = [], now = Date.now() / 1000;
-    ((snap && snap.running) || []).forEach(function (r) { if (r.workstream && r.workstream !== plan.ws) return; var t = taskOf(r, plan.ws); if (t) (live[t] = live[t] || []).push(r); else if (r.workstream === plan.ws) unassigned.push(r); });
-    ((snap && snap.recent) || []).forEach(function (r) { if (r.ended_at && now - r.ended_at < 900) { var t = taskOf(r, plan.ws); if (t) just[t] = r; } });
+    ((snap && snap.running) || []).forEach(function (r) { if (r.workstream && r.workstream !== plan.ws) return; var t = taskOfVerified(r, plan.ws); if (t) (live[t] = live[t] || []).push(r); else if (r.workstream === plan.ws) unassigned.push(r); });
+    ((snap && snap.recent) || []).forEach(function (r) { if (r.ended_at && now - r.ended_at < 900) { var t = taskOfVerified(r, plan.ws); if (t) just[t] = r; } });
     var att = {}, seenRun = {};
     (state.runs || []).concat((snap && snap.running) || [], (snap && snap.recent) || []).forEach(function (r) {
       var id = r.run_id || r.label; if (!id || seenRun[id]) return; seenRun[id] = 1;
-      if (r.workstream && r.workstream !== plan.ws) return; var t = taskOf(r, plan.ws); if (!t) return;
+      if (r.workstream && r.workstream !== plan.ws) return; var t = taskOfVerified(r, plan.ws); if (!t) return;
       var a = att[t] = att[t] || {runs: 0, reviews: 0, sentBack: 0}; a.runs++;
       var isRev = /(^|[-_ ])(rev|review)/i.test(r.label || "") || /^(APPROVE|REQUEST_CHANGES)/.test(r.verdict || "");
       if (isRev) a.reviews++;
@@ -81,13 +107,49 @@
     }
     if (unassigned.length) { var ua = el("div", {class: "unassigned"}, [el("b", {style: "font-size:12px;color:var(--ink-2)", text: "Running, not mapped to a task:"})]); unassigned.forEach(function (r) { var sp = el("span", {title: (r.tier || "") + " · " + fmtDur(r.elapsed_s), text: r.label || r.run_id}); sp.style.borderColor = colorOf(tierKey(r)); ua.appendChild(sp); }); c.appendChild(ua); }
     var gs = {}, colStat = {};
+    /* Server-computed map layout (dash/maplayout.py, carried on /api/plan):
+       density, per-group collapse state, slim columns, chip labels, arrows
+       policy, train tags, phases line. Null when the server predates it, and
+       the map below falls back to today's behaviour branch by branch. */
+    var L = layoutOf(plan), LGroup = {}, LCol = {}, LTrain = null, foldedIdx = {};
+    if (L) {
+      (L.groups || []).forEach(function (rg) { if (rg && rg.id != null) LGroup[rg.id] = rg; });
+      (L.columns || []).forEach(function (rc) { if (rc && rc.index != null) LCol[rc.index] = rc; });
+      if (L.folded_rail) (L.folded_rail.columns || []).forEach(function (fc) { if (fc && fc.index != null) foldedIdx[fc.index] = fc; });
+      if (L.trains) {
+        LTrain = {tagged: {}, legend: L.trains.legend || [], more: L.trains.more_trains || 0, caption: L.trains.caption || null};
+        (L.trains.tagged || []).forEach(function (id) { LTrain.tagged[id] = 1; });
+      }
+    }
+    var taskById = {};
+    plan.groups.forEach(function (g) { (g.tasks || []).forEach(function (t) { taskById[t.id] = t; }); });
+    /* Chips the layout folds away (hidden done chips, deferred chips) stay
+       out of the arrow router until their expander opens. */
+    var foldedIds = {};
     var trains = (plan.trains || []).filter(function (t) { return t && typeof t === "object"; });
     var trainOf = {};
-    trains.forEach(function (t, i) { ((t.members) || []).forEach(function (m) { trainOf[m] = {train: t, slot: (i % 8) + 1}; }); });
+    trains.forEach(function (t, i) { if (LTrain && t.id != null && !LTrain.tagged[t.id]) return; ((t.members) || []).forEach(function (m) { trainOf[m] = {train: t, slot: (i % 8) + 1}; }); });
     var prevSt = (window.__adPrevStatus = window.__adPrevStatus || {});
-    var wrap = el("div", {class: "dag-scroll"}), dag = el("div", {class: "dag"}), svg = s("svg", {class: "dedges"}); dag.appendChild(svg); wrap.appendChild(dag);
-    dag.style.gridTemplateColumns = "repeat(" + plan.cols.length + ",1fr)";
-    var cols = plan.cols.map(function (n) { var d = el("div", {class: "dcol"}, [el("div", {class: "dcolh", text: n})]); dag.appendChild(d); return d; });
+    var wrap = el("div", {class: "dag-scroll" + (L ? " fitted" : "")}), dag = el("div", {class: "dag" + (L && L.density === "compact" ? " compact" : "")}), svg = s("svg", {class: "dedges"}); dag.appendChild(svg); wrap.appendChild(dag);
+    if (L) {
+      var widths = [];
+      plan.cols.forEach(function (n, i) { if (!foldedIdx[i]) widths.push((LCol[i] && LCol[i].state !== "full") ? "0.55fr" : "1fr"); });
+      if (L.folded_rail) widths.push("0.7fr");
+      dag.style.gridTemplateColumns = widths.join(" ");
+    } else {
+      dag.style.gridTemplateColumns = "repeat(" + plan.cols.length + ",1fr)";
+    }
+    var cols = [];
+    plan.cols.forEach(function (n, i) {
+      if (foldedIdx[i]) return;
+      var d = el("div", {class: "dcol" + ((LCol[i] && LCol[i].state === "slim") ? " slim-col" : "")}, [el("div", {class: "dcolh", text: n})]);
+      dag.appendChild(d); cols[i] = d;
+    });
+    /* Balance caption (standard B7): when the tallest column outweighs the
+       shortest more than 3x, the short side says so instead of looking empty. */
+    if (L && L.balance && L.balance.ratio != null && L.balance.ratio > 3 && L.balance.shortest && L.balance.tallest && cols[L.balance.shortest.column]) {
+      cols[L.balance.shortest.column].appendChild(el("div", {class: "balance-note", title: "The tallest stage (" + L.balance.tallest.title + ") holds " + L.balance.tallest.tasks + " tasks; the renderer compacts but never moves groups"}, [L.balance.shortest.tasks + " tasks · lightest stage"]));
+    }
     var nodes = {}, chipEl = {}, tGroup = {}, tTitle = {}, tUp = {}, tDown = {}, depth = {};
     var tKind = {}, tStatus = {}, tNotes = {};
     plan.groups.forEach(function (g) { g.tasks.forEach(function (t) { tGroup[t.id] = g.id; tTitle[t.id] = t.title || ""; tStatus[t.id] = t.status || "todo"; if (t.kind === "gate") tKind[t.id] = "gate"; if (t.dep_notes && typeof t.dep_notes === "object") tNotes[t.id] = t.dep_notes; }); });
@@ -97,59 +159,190 @@
     function depMet(d) { return tStatus[d] === "done"; }
     function fmtDep(b) { return function (d) { var s = d + " " + (tTitle[d] || "") + " (" + (depMet(d) ? "met" : "not met") + ")"; var note = (tNotes[b] || {})[d]; if (typeof note === "string" && note) s += ": " + note; return s; }; }
     function edgeTitle(a, b) { var note = (tNotes[b] || {})[a]; if (typeof note === "string" && note) return b + " " + (tTitle[b] || "") + " waits on " + a + " " + (tTitle[a] || "") + ": " + note + " (" + (depMet(a) ? "met" : "not met") + ")"; return b + " waits on " + a; }
-    plan.groups.forEach(function (g) {
-      var cnt = {done: 0, wip: 0, prog: 0, pr: 0, todo: 0, moved: 0, deferred: 0}; g.tasks.forEach(function (t) { cnt[t.status || "todo"] = (cnt[t.status || "todo"] || 0) + 1; });
-      var live = g.tasks.length - (cnt.moved || 0) - (cnt.deferred || 0);
-      var n = el("div", {class: "dnode " + (live && cnt.done === live ? "s-done" : (cnt.done + cnt.prog + cnt.pr ? "s-prog" : ""))});
-      n.appendChild(el("h4", {text: g.title}));
-      var gr = 0, gv = 0; g.tasks.forEach(function (t) { var a = att[t.id]; if (a) { gr += a.runs; gv += a.reviews; } });
-      var left = live - cnt.done;
-      n.appendChild(el("div", {class: "m", title: cnt.done + " done, " + cnt.wip + " in progress, " + cnt.pr + " waiting to merge, " + cnt.prog + " merged and waiting on a prod step, " + cnt.todo + " not started" + (cnt.deferred ? ", " + cnt.deferred + " deferred" : "") + (gr ? "\n" + fmtN(gr) + " agent runs, " + fmtN(gv) + " of them reviews" : "")}, [el("b", {text: cnt.done + " of " + live}), " done" + (left ? " \u00B7 " + left + " to go" : "")]));
-      var mini = el("div", {class: "mini"}); [["done", "var(--good)"], ["pr", "var(--warning)"], ["prog", "var(--s5)"]].forEach(function (p) { var sp = el("span"); sp.style.width = (live ? 100 * cnt[p[0]] / live : 0) + "%"; sp.style.background = p[1]; sp.style.display = "block"; mini.appendChild(sp); }); n.appendChild(mini);
-      var gLive = 0;
-      var ordered = hasTaskDeps ? g.tasks.map(function (t, i) { return [depthOf(t.id), i, t]; }).sort(function (a, b) { return a[0] - b[0] || a[1] - b[1]; }).map(function (x) { return x[2]; }) : g.tasks;
-      var ch = el("div", {class: "chips"}); ordered.forEach(function (t) {
-        var st = t.status || "todo", rs = live[t.id] || [], jr = just[t.id], gate = t.kind === "gate";
-        var cp = el("span", {class: "chip " + st + (rs.length ? " live" : "") + (jr && !rs.length ? " just" : "") + (gate ? " gate" : ""), title: t.id + " · " + (t.title || "") + (gate ? " · gate (" + (st === "done" ? "met" : "not met") + ")" : " · " + st) + (t.moved_to ? " to " + t.moved_to : "") + (t.note ? " (" + t.note + ")" : "") + (rs.length ? " · working: " + rs.map(function (r) { return (r.label || r.run_id) + " (" + (r.tier || "") + ", " + fmtDur(r.elapsed_s) + ")"; }).join(", ") : "") + (jr && !rs.length ? " · just finished: " + (jr.label || "") + (jr.verdict ? " " + jr.verdict : "") : "")}, [t.id]);
-        var sk = plan.ws + ":" + t.id; if (prevSt[sk] && prevSt[sk] !== st) cp.classList.add("changed"); prevSt[sk] = st;
-        var at = att[t.id]; if (at) { cp.title += " · " + attText(at); if (at.runs > 1) cp.appendChild(el("span", {class: "att" + (at.sentBack >= 2 ? " hot" : ""), text: "\u21BB" + fmtN(at.runs)})); }
-        var tr = trainOf[t.id];
-        if (tr) {
-          cp.classList.add("intrain");
-          cp.style.borderLeft = "3px solid var(--s" + tr.slot + ")";
-          cp.title += "\nTrain: " + (tr.train.title || tr.train.id) + (tr.train.id ? " (" + tr.train.id + ")" : "") + " · " + (tr.train.status || "planned");
-          cp.appendChild(el("span", {class: "trtag", text: tr.train.id || "T?", title: (tr.train.title || "") + " · " + (tr.train.status || "planned")}));
-        }
-        if (t.wave) cp.title += "\nWave: " + t.wave;
+    var gTitle = {};
+    plan.groups.forEach(function (g) { gTitle[g.id] = g.title || g.id; });
+    var deps = {}; (plan.edges || []).forEach(function (e) { (deps[e[1]] = deps[e[1]] || []).push(e[0]); });
+    /* Local chip meta for tasks the layout folds away, mirroring
+       dash/maplayout._chip_tooltip plus capped_label. */
+    function localChipMeta(t) {
+      var s = t.id + " · " + (t.title || "") + " · " + (t.status || "todo");
+      if (t.kind === "gate") s += " · gate";
+      if (t.moved_to) s += " to " + t.moved_to;
+      if (t.note) s += " (" + t.note + ")";
+      var dn = (t.dep_notes && typeof t.dep_notes === "object") ? t.dep_notes : {};
+      var ups = (t.deps || []).filter(function (d) { return typeof d === "string"; }).map(function (d) { return d + ((typeof dn[d] === "string" && dn[d]) ? ": " + dn[d] : ""); });
+      if (ups.length) s += " · waits on " + ups.join(", ");
+      var ndeps = (t.deps || []).filter(function (d) { return typeof d === "string"; }).length;
+      return {label: shortChipLabel(t.id), tooltip: s, fan_in: ndeps > 6 ? ndeps : 0};
+    }
+    /* One task chip. lg is the layout chip ({label, tooltip, fan_in}) or null
+       on the fallback path. Live-agent badges and pulses, the "just finished"
+       outline, run counts, train tags, gate diamonds and hover/pin tracing
+       behave the same on both paths. */
+    function makeChip(g, t, lg) {
+      var st = t.status || "todo", rs = live[t.id] || [], jr = just[t.id], gate = t.kind === "gate";
+      var label = lg ? lg.label : t.id;
+      var tip = lg ? lg.tooltip : (t.id + " · " + (t.title || "") + (gate ? " · gate (" + (st === "done" ? "met" : "not met") + ")" : " · " + st) + (t.moved_to ? " to " + t.moved_to : "") + (t.note ? " (" + t.note + ")" : ""));
+      if (rs.length) tip += " · working: " + rs.map(function (r) { return (r.label || r.run_id) + " (" + (r.tier || "") + ", " + fmtDur(r.elapsed_s) + ")"; }).join(", ");
+      if (jr && !rs.length) tip += " · just finished: " + (jr.label || "") + (jr.verdict ? " " + jr.verdict : "");
+      var cp = el("span", {class: "chip " + st + (rs.length ? " live" : "") + (jr && !rs.length ? " just" : "") + (gate ? " gate" : ""), title: tip}, [label]);
+      var sk = plan.ws + ":" + t.id; if (prevSt[sk] && prevSt[sk] !== st) cp.classList.add("changed"); prevSt[sk] = st;
+      var at = att[t.id]; if (at) { cp.title += " · " + attText(at); if (at.runs > 1) cp.appendChild(el("span", {class: "att" + (at.sentBack >= 2 ? " hot" : ""), text: "↻" + fmtN(at.runs)})); }
+      var tr = trainOf[t.id];
+      if (tr) {
+        cp.classList.add("intrain");
+        cp.style.borderLeft = "3px solid var(--s" + tr.slot + ")";
+        cp.title += "\nTrain: " + (tr.train.title || tr.train.id) + (tr.train.id ? " (" + tr.train.id + ")" : "") + " · " + (tr.train.status || "planned");
+        cp.appendChild(el("span", {class: "trtag", text: tr.train.id || "T?", title: (tr.train.title || "") + " · " + (tr.train.status || "planned")}));
+      }
+      if (lg && lg.fan_in) cp.appendChild(el("span", {class: "fanin", title: "Waits on " + lg.fan_in + " tasks; hover to trace them all", text: "↓" + lg.fan_in}));
+      if (t.wave) cp.title += "\nWave: " + t.wave;
+      if (!lg) {
         if (tUp[t.id]) cp.title += "\nWaits on: " + tUp[t.id].map(fmtDep(t.id)).join(", ");
         if (tDown[t.id]) cp.title += "\nUnblocks: " + tDown[t.id].map(function (d) { return d + " " + (tTitle[d] || ""); }).join(", ");
-        if (rs.length) { gLive += rs.length; var b = el("span", {class: "ag", text: String(rs.length)}); b.style.background = colorOf(tierKey(rs[0])); cp.appendChild(b); cp.style.cursor = "pointer"; cp.addEventListener("click", function () { openRun(rs[0]); }); }
-        else if (hasTaskDeps) { cp.style.cursor = "pointer"; cp.addEventListener("click", function (ev) { ev.stopPropagation(); pinned = pinned === t.id ? null : t.id; if (pinned) focusTask(t.id); else { clearTask(); groupEnter(g.id); } }); }
-        if (hasTaskDeps) { cp.addEventListener("mouseenter", function () { focusTask(t.id); }); cp.addEventListener("mouseleave", function () { if (pinned) focusTask(pinned); else { clearTask(); groupEnter(g.id); } }); }
-        chipEl[t.id] = cp;
-        ch.appendChild(cp); });
-      if (gLive) { n.insertBefore(el("div", {class: "live-n", text: "\u25CF " + gLive + " agent" + (gLive > 1 ? "s" : "") + " working"}), n.children[2]); n.classList.add("s-live"); }
+      }
+      if (rs.length) { var b = el("span", {class: "ag", text: String(rs.length)}); b.style.background = colorOf(tierKey(rs[0])); cp.appendChild(b); cp.style.cursor = "pointer"; cp.addEventListener("click", function () { openRun(rs[0]); }); }
+      else if (hasTaskDeps) { cp.style.cursor = "pointer"; cp.addEventListener("click", function (ev) { ev.stopPropagation(); pinned = pinned === t.id ? null : t.id; if (pinned) focusTask(t.id); else { clearTask(); groupEnter(g.id); } }); }
+      if (hasTaskDeps) { cp.addEventListener("mouseenter", function () { focusTask(t.id); }); cp.addEventListener("mouseleave", function () { if (pinned) focusTask(pinned); else { clearTask(); groupEnter(g.id); } }); }
+      return cp;
+    }
+    /* In-place expander for folded chips ("+N done", "↷N deferred"): the
+       chips render once inside a hidden span so replay and hover tracing keep
+       working, and the button toggles them open. */
+    function foldWrap(label, cls, tip, items) {
+      var box = el("span", {class: "folded-chips"});
+      box.style.display = "none";
+      items.forEach(function (it) { var cp = makeChip(it.g, it.t, it.lg); foldedIds[it.t.id] = 1; chipEl[it.t.id] = cp; box.appendChild(cp); });
+      var open = false;
+      var btn = el("button", {class: "more-btn " + cls, title: tip, text: label, "aria-expanded": "false"});
+      btn.addEventListener("click", function (ev) {
+        ev.stopPropagation();
+        open = !open;
+        box.style.display = open ? "" : "none";
+        btn.setAttribute("aria-expanded", String(open));
+        if (label.charAt(0) === "+") btn.textContent = open ? "−" + label.slice(1) : label;
+        if (open) items.forEach(function (it) { delete foldedIds[it.t.id]; });
+        else items.forEach(function (it) { foldedIds[it.t.id] = 1; });
+        clearTask(true); draw();
+      });
+      return el("span", {class: "fold-wrap"}, [btn, box]);
+    }
+    function groupCounts(g) {
+      var cnt = {done: 0, wip: 0, prog: 0, pr: 0, todo: 0, moved: 0, deferred: 0};
+      (g.tasks || []).forEach(function (t) { cnt[t.status || "todo"] = (cnt[t.status || "todo"] || 0) + 1; });
+      return cnt;
+    }
+    function buildTile(g) {
+      var cnt = groupCounts(g);
+      var liveTotal = (g.tasks || []).length - (cnt.moved || 0) - (cnt.deferred || 0);
+      var n = el("div", {class: "dnode " + (liveTotal && cnt.done === liveTotal ? "s-done" : (cnt.done + cnt.prog + cnt.pr ? "s-prog" : ""))});
+      n.appendChild(el("h4", {text: g.title}));
+      var gr = 0, gv = 0; (g.tasks || []).forEach(function (t) { var a = att[t.id]; if (a) { gr += a.runs; gv += a.reviews; } });
+      var left = liveTotal - cnt.done;
+      n.appendChild(el("div", {class: "m", title: cnt.done + " done, " + cnt.wip + " in progress, " + cnt.pr + " waiting to merge, " + cnt.prog + " merged and waiting on a prod step, " + cnt.todo + " not started" + (cnt.deferred ? ", " + cnt.deferred + " deferred" : "") + (gr ? "\n" + fmtN(gr) + " agent runs, " + fmtN(gv) + " of them reviews" : "")}, [el("b", {text: cnt.done + " of " + liveTotal}), " done" + (left ? " · " + left + " to go" : "")]));
+      var mini = el("div", {class: "mini"}); [["done", "var(--good)"], ["pr", "var(--warning)"], ["prog", "var(--s5)"]].forEach(function (p) { var sp = el("span"); sp.style.width = (liveTotal ? 100 * cnt[p[0]] / liveTotal : 0) + "%"; sp.style.background = p[1]; sp.style.display = "block"; mini.appendChild(sp); }); n.appendChild(mini);
+      if (L) {
+        var ups = (deps[g.id] || []).map(function (d) { return gTitle[d] || d; });
+        if (ups.length && !(liveTotal && cnt.done === liveTotal)) n.appendChild(el("div", {class: "tile-waits", title: "Group edge: this stage waits on " + ups.join(", ")}, ["← waits on " + ups.join(", ")]));
+      }
+      var ch = el("div", {class: "chips"});
+      var gLive = 0;
+      var lg = L ? LGroup[g.id] : null;
+      if (lg) {
+        (lg.chips || []).forEach(function (lc) {
+          var t = taskById[lc.id]; if (!t) return;
+          var cp = makeChip(g, t, lc);
+          if ((live[t.id] || []).length) gLive += live[t.id].length;
+          chipEl[t.id] = cp; ch.appendChild(cp);
+        });
+        var hidden = (lg.hidden_done_ids || []).map(function (id) { return taskById[id]; }).filter(Boolean);
+        if (hidden.length && lg.more_token) ch.appendChild(foldWrap(lg.more_token, "is-done", hidden.length + " finished tasks are folded here; click to expand in place", hidden.map(function (t) { return {g: g, t: t, lg: localChipMeta(t)}; })));
+        var defs = (g.tasks || []).filter(function (t) { return (t.status || "todo") === "deferred"; });
+        if (defs.length && lg.deferred_token) ch.appendChild(foldWrap(lg.deferred_token, "is-def", defs.length + " deferred tasks are folded here; click to expand in place", defs.map(function (t) { return {g: g, t: t, lg: localChipMeta(t)}; })));
+      } else {
+        var ordered = hasTaskDeps ? (g.tasks || []).map(function (t, i) { return [depthOf(t.id), i, t]; }).sort(function (a, b) { return a[0] - b[0] || a[1] - b[1]; }).map(function (x) { return x[2]; }) : (g.tasks || []);
+        ordered.forEach(function (t) {
+          var cp = makeChip(g, t, null);
+          if ((live[t.id] || []).length) gLive += live[t.id].length;
+          chipEl[t.id] = cp; ch.appendChild(cp);
+        });
+      }
+      if (gLive) { n.insertBefore(el("div", {class: "live-n", text: "● " + gLive + " agent" + (gLive > 1 ? "s" : "") + " working"}), n.children[2]); n.classList.add("s-live"); }
       n.appendChild(ch);
-      cols[g.col].appendChild(n); nodes[g.id] = n;
-      gs[g.id] = {done: live > 0 && cnt.done === live, started: cnt.done + cnt.wip + cnt.prog + cnt.pr > 0, active: gLive > 0 || cnt.wip + cnt.prog + cnt.pr > 0, col: g.col, cnt: cnt, live: gLive, title: g.title};
-      colStat[g.col] = colStat[g.col] || {done: 0, tot: 0, now: false}; colStat[g.col].done += cnt.done; colStat[g.col].tot += live;
-    });
-    var deps = {}; (plan.edges || []).forEach(function (e) { (deps[e[1]] = deps[e[1]] || []).push(e[0]); });
-    plan.groups.forEach(function (g) {
+      nodes[g.id] = n;
+      gs[g.id] = {done: liveTotal > 0 && cnt.done === liveTotal, started: cnt.done + cnt.wip + cnt.prog + cnt.pr > 0, active: gLive > 0 || cnt.wip + cnt.prog + cnt.pr > 0, col: g.col, cnt: cnt, live: gLive, title: g.title};
+      if (cols[g.col]) { colStat[g.col] = colStat[g.col] || {done: 0, tot: 0, now: false}; colStat[g.col].done += cnt.done; colStat[g.col].tot += liveTotal; }
+      return n;
+    }
+    /* Slim tile for an all-done stage when columns overflow: title, ✓N/N and
+       the bar, no chips. Click expands the full tile in place. */
+    function slimTile(g) {
+      var cnt = groupCounts(g);
+      var liveTotal = (g.tasks || []).length - (cnt.moved || 0) - (cnt.deferred || 0);
+      var lg = LGroup[g.id] || {};
+      var sum = lg.slim_summary || {done: cnt.done, total: liveTotal};
+      var b = el("button", {class: "slim-tile", title: (g.title || g.id) + " · all done (" + sum.done + " of " + sum.total + "); click to expand the chips in place"}, [el("b", {text: g.title || g.id}), el("span", {text: "✓" + sum.done + "/" + sum.total})]);
+      var mini = el("div", {class: "mini"}); var f = el("span"); f.style.width = "100%"; f.style.background = "var(--good)"; f.style.display = "block"; mini.appendChild(f); b.appendChild(mini);
+      b.addEventListener("click", function (ev) {
+        ev.stopPropagation();
+        var full = buildTile(g);
+        b.replaceWith(full); paintStage(g);
+        clearTask(true); draw();
+      });
+      nodes[g.id] = b;
+      gs[g.id] = {done: true, started: true, active: false, col: g.col, cnt: cnt, live: 0, title: g.title};
+      if (cols[g.col]) { colStat[g.col] = colStat[g.col] || {done: 0, tot: 0, now: false}; colStat[g.col].done += cnt.done; colStat[g.col].tot += liveTotal; }
+      return b;
+    }
+    /* Stage pill per group tile: where it stands and why. Skips slim tiles
+       (they already read ✓N/N) and folded columns (no tile yet). */
+    function paintStage(g) {
       var st = gs[g.id], n = nodes[g.id]; if (!st || !n) return;
+      if (n.classList.contains("slim-tile")) return;
+      if (n.querySelector(":scope > .gtag")) return;
       var k = st.cnt, stage, cls, why;
       var waitOn = (deps[g.id] || []).filter(function (d) { return !(gs[d] && gs[d].done); });
-      if (st.done) { n.classList.add("g-done"); stage = "\u2713 Done"; cls = "done"; why = "Every task is merged and live."; }
+      if (st.done) { n.classList.add("g-done"); stage = "✓ Done"; cls = "done"; why = "Every task is merged and live."; }
       else if (st.active) {
-        n.classList.add("g-now"); colStat[g.col].now = true;
-        if (st.live || k.wip) { stage = "\u25B6 Building"; cls = "now"; why = "Agents are building tasks in this stage."; }
+        n.classList.add("g-now"); if (colStat[g.col]) colStat[g.col].now = true;
+        if (st.live || k.wip) { stage = "▶ Building"; cls = "now"; why = "Agents are building tasks in this stage."; }
         else if (k.pr) { stage = "Merging"; cls = "merge"; why = "Work is built and approved; it is waiting to merge."; }
         else { stage = "Rolling out"; cls = "prod"; why = "Merged; waiting on a production step."; }
       }
       else if (!waitOn.length) { n.classList.add("g-ready"); stage = st.started ? "Partly done" : "Ready to start"; cls = "ready"; why = st.started ? "Some tasks are done and nothing is running now." : "Everything it waits on is done."; }
       else { stage = "Waiting"; cls = "wait"; why = "Waits on " + waitOn.map(function (d) { return gs[d] ? gs[d].title : d; }).join(", ") + "."; }
       n.insertBefore(el("span", {class: "gtag " + cls, title: why, text: stage}), n.firstChild);
+    }
+    plan.groups.forEach(function (g) {
+      if (foldedIdx[g.col]) {
+        var cnt = groupCounts(g);
+        var liveTotal = (g.tasks || []).length - (cnt.moved || 0) - (cnt.deferred || 0);
+        var gLive = 0; (g.tasks || []).forEach(function (t) { gLive += (live[t.id] || []).length; });
+        gs[g.id] = {done: liveTotal > 0 && cnt.done === liveTotal, started: cnt.done + cnt.wip + cnt.prog + cnt.pr > 0, active: gLive > 0 || cnt.wip + cnt.prog + cnt.pr > 0, col: g.col, cnt: cnt, live: gLive, title: g.title};
+        return;
+      }
+      var tile = (L && LGroup[g.id] && LGroup[g.id].state === "slim") ? slimTile(g) : buildTile(g);
+      cols[g.col].appendChild(tile);
     });
+    if (L && L.folded_rail) {
+      var rail = el("div", {class: "dcol fold-rail"}, [el("div", {class: "dcolh", text: "Later stages"})]);
+      (L.folded_rail.columns || []).forEach(function (fc) {
+        var sb = el("button", {class: "slim-tile", title: (fc.title || "") + " · " + (fc.tasks || 0) + " tasks; click to expand this stage in place"}, [el("b", {text: fc.title || ("Stage " + (fc.index + 1))}), el("span", {text: "+" + (fc.tasks || 0) + " tasks"})]);
+        sb.addEventListener("click", function (ev) {
+          ev.stopPropagation();
+          var frag = document.createDocumentFragment();
+          plan.groups.forEach(function (gg) {
+            if (gg.col !== fc.index) return;
+            frag.appendChild((LGroup[gg.id] && LGroup[gg.id].state === "slim") ? slimTile(gg) : buildTile(gg));
+            paintStage(gg);
+          });
+          sb.replaceWith(frag); clearTask(true); draw();
+        });
+        rail.appendChild(sb);
+      });
+      dag.appendChild(rail);
+    }
+    plan.groups.forEach(function (g) { paintStage(g); });
     cols.forEach(function (d, i) { var cs = colStat[i]; if (!cs) return; var mb = el("div", {class: "colbar", title: cs.done + " of " + cs.tot + " done in this phase"}); var f = el("i"); f.style.width = (cs.tot ? 100 * cs.done / cs.tot : 0) + "%"; mb.appendChild(f); d.insertBefore(mb, d.children[1]); if (cs.now) d.classList.add("c-now"); });
     /* Overall progress comes from the server progress object, never recomputed here. */
     var pprog = plan.progress || {done: 0, total: 0, counts: {}, pct: 0};
@@ -173,17 +366,67 @@
     ob.appendChild(el("div", {class: "pbig-txt", title: tot.done + " done, " + tot.wip + " in progress, " + tot.pr + " waiting to merge, " + tot.prog + " merged and waiting on a prod step, " + tot.todo + " not started" + (tot.deferred ? ", " + tot.deferred + " deferred" : "")}, [el("b", {text: tot.done + " of " + all + " tasks done"}), " \u00B7 " + (all - tot.done) + " to go \u00B7 " + phaseTxt + (nLive ? " \u00B7 " + nLive + " agent" + (nLive > 1 ? "s" : "") + " working" : "")]));
     c.appendChild(ob);
     setTimeout(function () { var pb = (window.__adPrevBar = window.__adPrevBar || {})[plan.ws] = {}; [].forEach.call(obBar.children, function (sp) { sp.style.width = sp.dataset.w + "%"; pb[sp.dataset.k] = sp.dataset.w; }); countUp(obPct, (window.__adPrevPct || {})[plan.ws] || 0, pct); (window.__adPrevPct = window.__adPrevPct || {})[plan.ws] = pct; }, 40);
-    c.appendChild(wrap);
-    if (trains.length) {
-      var trl = el("div", {class: "trlegend"});
-      trains.forEach(function (t, i) {
-        var sw = el("i", {class: "sw"});
-        sw.style.background = "var(--s" + ((i % 8) + 1) + ")";
-        var label = (t.title || t.id) + (t.id ? " (" + t.id + ")" : "") + " · " + (t.status || "planned");
-        var tip = (t.title || t.id) + (t.id ? " (" + t.id + ")" : "") + (t.status ? " · " + t.status : "") + (t.branch ? " · " + t.branch : "") + (t.pr != null ? " · PR " + t.pr : "");
-        var item = el("span", {title: tip}, [sw, document.createTextNode(label)]);
-        trl.appendChild(item);
+    /* Always-visible compact legend row (standard layer B): status colour plus
+       symbol plus word, then the arrows mode and why. Details stay in the
+       Legend popover as today. */
+    if (L) {
+      var mleg = el("div", {class: "map-legend"});
+      mleg.appendChild(el("span", {class: "cap", text: "Map"}));
+      [["done", "✓", "done"], ["live", "●", "working now"], ["gate", "◇", "gate"], ["todo", "·", "not started"], ["deferred", "↷", "deferred"]].forEach(function (p) {
+        mleg.appendChild(el("span", {title: p[2]}, [el("span", {class: "chip " + p[0] + " sample", text: p[1]}), document.createTextNode(p[2])]));
       });
+      mleg.appendChild(el("span", {class: "arrows-why", title: arrowWhy, text: (L.arrows && L.arrows.reason) || ""}));
+      c.appendChild(mleg);
+    }
+    c.appendChild(wrap);
+    if (trains.length || (LTrain && LTrain.caption)) {
+      var trl = el("div", {class: "trlegend"});
+      if (LTrain) {
+        var shownTrains = trains.filter(function (t) { return t.id != null && LTrain.tagged[t.id]; });
+        var byId = {};
+        shownTrains.forEach(function (t) { byId[t.id] = t; });
+        (LTrain.legend || []).forEach(function (id) {
+          var t = byId[id]; if (!t) return;
+          var i = shownTrains.indexOf(t);
+          var sw = el("i", {class: "sw"});
+          sw.style.background = "var(--s" + ((i % 8) + 1) + ")";
+          var label = (t.title || t.id) + (t.id ? " (" + t.id + ")" : "") + " · " + (t.status || "planned");
+          var tip = (t.title || t.id) + (t.id ? " (" + t.id + ")" : "") + (t.status ? " · " + t.status : "") + (t.branch ? " · " + t.branch : "") + (t.pr != null ? " · PR " + t.pr : "");
+          trl.appendChild(el("span", {title: tip}, [sw, document.createTextNode(label)]));
+        });
+        if (LTrain.more) {
+          var rest = shownTrains.filter(function (t) { return LTrain.legend.indexOf(t.id) === -1; });
+          var rbox = el("span", {class: "folded-trains"});
+          rbox.style.display = "none";
+          rest.forEach(function (t) {
+            var i = shownTrains.indexOf(t);
+            var sw2 = el("i", {class: "sw"});
+            sw2.style.background = "var(--s" + ((i % 8) + 1) + ")";
+            rbox.appendChild(el("span", {title: (t.title || t.id) + " · " + (t.status || "planned")}, [sw2, document.createTextNode((t.title || t.id) + (t.id ? " (" + t.id + ")" : ""))]));
+          });
+          var topen = false;
+          var tbtn = el("button", {class: "more-btn is-train", title: "Click to show the remaining merge trains", text: "+" + LTrain.more + " more trains", "aria-expanded": "false"});
+          tbtn.addEventListener("click", function (ev) {
+            ev.stopPropagation();
+            topen = !topen;
+            rbox.style.display = topen ? "" : "none";
+            tbtn.setAttribute("aria-expanded", String(topen));
+            tbtn.textContent = topen ? "−" + LTrain.more + " more trains" : "+" + LTrain.more + " more trains";
+            clearTask(true); draw();
+          });
+          trl.appendChild(tbtn); trl.appendChild(rbox);
+        }
+        if (LTrain.caption) trl.appendChild(el("span", {class: "trcap", title: "Trains with a single member render no tag (MAP107)", text: LTrain.caption}));
+      } else {
+        trains.forEach(function (t, i) {
+          var sw = el("i", {class: "sw"});
+          sw.style.background = "var(--s" + ((i % 8) + 1) + ")";
+          var label = (t.title || t.id) + (t.id ? " (" + t.id + ")" : "") + " · " + (t.status || "planned");
+          var tip = (t.title || t.id) + (t.id ? " (" + t.id + ")" : "") + (t.status ? " · " + t.status : "") + (t.branch ? " · " + t.branch : "") + (t.pr != null ? " · PR " + t.pr : "");
+          var item = el("span", {title: tip}, [sw, document.createTextNode(label)]);
+          trl.appendChild(item);
+        });
+      }
       c.appendChild(trl);
     }
     /* Always-on task arrows: every task dependency draws from the prerequisite chip to the dependent chip. */
@@ -191,8 +434,10 @@
     Object.keys(tUp).forEach(function (b) { nTaskEdges += (tUp[b] || []).length; });
     var storedArrows = null;
     try { storedArrows = localStorage.getItem("agent-dash-arrows"); } catch (e) {}
-    var arrowMode = storedArrows === "focus" ? "focus" : storedArrows === "all" ? "all" : (nTaskEdges > 150 ? "focus" : "all");
-    var arrowsTg = el("span", {class: "arrows-toggle", title: nTaskEdges + " task deps" + (nTaskEdges > 150 ? ": over 150, so the map defaults to on-focus arrows" : "")}, [document.createTextNode("Arrows: ")]);
+    var layoutArrows = (L && L.arrows) ? (L.arrows.mode === "on-focus" ? "focus" : "all") : null;
+    var arrowWhy = (L && L.arrows && L.arrows.reason) ? L.arrows.reason : (nTaskEdges + " task deps" + (nTaskEdges > 150 ? ": over 150, so the map defaults to on-focus arrows" : ""));
+    var arrowMode = storedArrows === "focus" ? "focus" : storedArrows === "all" ? "all" : (layoutArrows || (nTaskEdges > 150 ? "focus" : "all"));
+    var arrowsTg = el("span", {class: "arrows-toggle", title: arrowWhy}, [document.createTextNode("Arrows: ")]);
     var arrowsSeg = el("span", {class: "seg-ctl"});
     var arrowsAll = el("button", {text: "all", title: "Draw every task dependency arrow"});
     var arrowsFocus = el("button", {text: "on focus", title: "Draw task arrows only for the hovered or pinned chip"});
@@ -286,7 +531,7 @@
       var box = dag.getBoundingClientRect(), L = box.left, T = box.top, R = {};
       function rect(k) { if (!R[k]) { var r = chipEl[k].getBoundingClientRect(); R[k] = {l: r.left - L, r: r.right - L, t: r.top - T, b: r.bottom - T, cx: (r.left + r.right) / 2 - L, cy: (r.top + r.bottom) / 2 - T, w: r.width, h: r.height}; } return R[k]; }
       var sides = {};
-      links = links.filter(function (k) { return chipEl[k.a] && chipEl[k.b]; });
+      links = links.filter(function (k) { return chipEl[k.a] && chipEl[k.b] && !foldedIds[k.a] && !foldedIds[k.b]; });
       links.forEach(function (k) {
         var A = rect(k.a), B = rect(k.b), dx = B.cx - A.cx, dy = B.cy - A.cy;
         if (tGroup[k.a] === tGroup[k.b] && Math.abs(dy) < 4) { k.kind = "arc"; k.sa = "t"; k.sb = "t"; }
@@ -353,7 +598,10 @@
       }
       drawTaskLinks(links);
     }
-    if (plan.phases && plan.phases.length) { var ph = el("div", {class: "phases"}); plan.phases.forEach(function (p) { ph.appendChild(el("div", {class: "phase", title: p.gate ? "Done when: " + p.gate : ""}, [el("b", {text: p.name}), p.goal, p.gate ? el("small", {class: "gate", text: "Done when \u24D8"}) : null])); }); c.appendChild(ph); }
+    /* Narrative phases strip (standard B8): one line on the execution map;
+       the full prose cards stay on the plan view where they belong. */
+    if (L && L.phases_line) c.appendChild(el("div", {class: "phases-line", title: "Full prose lives on the plan view", text: L.phases_line}));
+    else if (plan.phases && plan.phases.length) { var ph = el("div", {class: "phases"}); plan.phases.forEach(function (p) { ph.appendChild(el("div", {class: "phase", title: p.gate ? "Done when: " + p.gate : ""}, [el("b", {text: p.name}), p.goal, p.gate ? el("small", {class: "gate", text: "Done when \u24D8"}) : null])); }); c.appendChild(ph); }
     /* Replay: play this workstream's history as a sped-up animation on the map.
        Chips start gray, pulse in their tool color while a mapped run is
        active, and turn done at their done moment; unblocking a dependent
@@ -495,7 +743,8 @@
        live state: each tile's pill, count, bar and done/active styling. */
     function rpGroupEls(gid) {
       var hit = RP.groups[gid];
-      if (hit) return hit;
+      if (hit && hit.node && hit.node.isConnected) return hit;
+      if (hit) delete RP.groups[gid];
       var node = nodes[gid];
       if (!node) return null;
       var minis = node.querySelectorAll(".mini > span");
@@ -1125,6 +1374,9 @@
   global.planCard = planCard;
   global.loadTaskmap = loadTaskmap;
   global.taskOf = taskOf;
+  global.taskOfVerified = taskOfVerified;
+  global.shortChipLabel = shortChipLabel;
+  global.layoutOf = layoutOf;
   global.planTaskIds = planTaskIds;
   Object.defineProperty(global, "TASKMAP", {
     configurable: true,

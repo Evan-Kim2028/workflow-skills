@@ -101,5 +101,214 @@
     },
     "pct": 100
   },
-  "_note": "Seeded example plan for the fixture preview."
+  "_note": "Seeded example plan for the fixture preview.",
+  "layout": {
+    "ws": "WS2",
+    "density": "comfortable",
+    "ultra": false,
+    "live_tasks": 5,
+    "deferred_tasks": 0,
+    "total_tasks": 5,
+    "task_edges": 0,
+    "group_edges": 3,
+    "columns": [
+      {
+        "index": 0,
+        "title": "Contract",
+        "state": "full",
+        "groups": [
+          "contract"
+        ],
+        "tasks": 1,
+        "live_tasks": 1,
+        "visible_chips": 1
+      },
+      {
+        "index": 1,
+        "title": "Routes",
+        "state": "full",
+        "groups": [
+          "routes"
+        ],
+        "tasks": 2,
+        "live_tasks": 2,
+        "visible_chips": 2
+      },
+      {
+        "index": 2,
+        "title": "Clients",
+        "state": "full",
+        "groups": [
+          "clients"
+        ],
+        "tasks": 1,
+        "live_tasks": 1,
+        "visible_chips": 1
+      },
+      {
+        "index": 3,
+        "title": "Remove",
+        "state": "full",
+        "groups": [
+          "remove"
+        ],
+        "tasks": 1,
+        "live_tasks": 1,
+        "visible_chips": 1
+      }
+    ],
+    "folded_rail": null,
+    "groups": [
+      {
+        "id": "contract",
+        "title": "Contract",
+        "col": 0,
+        "column": "Contract",
+        "state": "open",
+        "live_tasks": 1,
+        "deferred_tasks": 0,
+        "chips": [
+          {
+            "id": "WS2.1",
+            "label": "1",
+            "tooltip": "WS2.1 \u00b7 Publish the route list \u00b7 done",
+            "status": "done",
+            "kind": "task",
+            "train": null,
+            "fan_in": 0
+          }
+        ],
+        "shown_done": 1,
+        "hidden_done": 0,
+        "hidden_done_ids": [],
+        "more_token": null,
+        "deferred_token": null
+      },
+      {
+        "id": "routes",
+        "title": "Routes",
+        "col": 1,
+        "column": "Routes",
+        "state": "open",
+        "live_tasks": 2,
+        "deferred_tasks": 0,
+        "chips": [
+          {
+            "id": "WS2.3",
+            "label": "3",
+            "tooltip": "WS2.3 \u00b7 Read route \u00b7 done",
+            "status": "done",
+            "kind": "task",
+            "train": null,
+            "fan_in": 0
+          },
+          {
+            "id": "WS2.4",
+            "label": "4",
+            "tooltip": "WS2.4 \u00b7 List route \u00b7 done",
+            "status": "done",
+            "kind": "task",
+            "train": null,
+            "fan_in": 0
+          }
+        ],
+        "shown_done": 2,
+        "hidden_done": 0,
+        "hidden_done_ids": [],
+        "more_token": null,
+        "deferred_token": null
+      },
+      {
+        "id": "clients",
+        "title": "Clients",
+        "col": 2,
+        "column": "Clients",
+        "state": "open",
+        "live_tasks": 1,
+        "deferred_tasks": 0,
+        "chips": [
+          {
+            "id": "WS2.8",
+            "label": "8",
+            "tooltip": "WS2.8 \u00b7 Point the client at the new route \u00b7 done",
+            "status": "done",
+            "kind": "task",
+            "train": null,
+            "fan_in": 0
+          }
+        ],
+        "shown_done": 1,
+        "hidden_done": 0,
+        "hidden_done_ids": [],
+        "more_token": null,
+        "deferred_token": null
+      },
+      {
+        "id": "remove",
+        "title": "Remove",
+        "col": 3,
+        "column": "Remove",
+        "state": "open",
+        "live_tasks": 1,
+        "deferred_tasks": 0,
+        "chips": [
+          {
+            "id": "WS2.9",
+            "label": "9",
+            "tooltip": "WS2.9 \u00b7 Delete the old handler \u00b7 done",
+            "status": "done",
+            "kind": "task",
+            "train": null,
+            "fan_in": 0
+          }
+        ],
+        "shown_done": 1,
+        "hidden_done": 0,
+        "hidden_done_ids": [],
+        "more_token": null,
+        "deferred_token": null
+      }
+    ],
+    "labels": {
+      "shortened": 5,
+      "collisions": []
+    },
+    "arrows": {
+      "mode": "all",
+      "task_edges": 0,
+      "group_edges": 3,
+      "reason": "0 task deps: arrows all",
+      "fan_in": []
+    },
+    "trains": {
+      "tagged": [],
+      "untagged": [],
+      "caption": null,
+      "legend": [],
+      "more_trains": 0
+    },
+    "phases_line": "1 Routes  \u2192  2 Remove",
+    "balance": {
+      "tallest": {
+        "column": 1,
+        "title": "Routes",
+        "tasks": 2
+      },
+      "shortest": {
+        "column": 0,
+        "title": "Contract",
+        "tasks": 1
+      },
+      "ratio": 2.0
+    }
+  },
+  "map_warnings": [
+    {
+      "code": "MAP109",
+      "severity": "info",
+      "title": "3 of 4 groups hold a single task",
+      "detail": "3 single-task groups out of 4 (bar: half or more)",
+      "fix": "Merge 1-task groups into their stage group"
+    }
+  ]
 }

@@ -80,6 +80,17 @@
     (dag.groups || []).forEach(function (g) { (g.tasks || []).forEach(function (t) { if (t.id != null && String(t.id).length > 0) out.push(String(t.id)); }); });
     return out;
   }
+  /* Phantom-task guard, mirroring dash/taskmatch.task_of_verified: a mapped
+     id that names no task in this plan stays unmapped instead of claiming a
+     chip that does not exist (e.g. WS7.OPS). With no plan ids to check
+     against, verification is impossible and the raw mapping stands. */
+  function taskOfVerified(run, ws, ids) {
+    var hit = taskOf(run, ws, ids);
+    if (hit == null) return null;
+    var list = ids || [];
+    if (!list.length) return hit;
+    return list.indexOf(hit) !== -1 ? hit : null;
+  }
 
   function captureMermaid(root) {
     sources = [];
@@ -131,13 +142,13 @@
     var ids = dagTaskIds(dag);
     ((snap && snap.running) || []).forEach(function (run) {
       if (run.workstream && run.workstream !== dag.ws) return;
-      var task = taskOf(run, dag.ws, ids);
+      var task = taskOfVerified(run, dag.ws, ids);
       if (task) (live[task] = live[task] || []).push(run);
       else if (run.workstream === dag.ws) unassigned.push(run);
     });
     ((snap && snap.recent) || []).forEach(function (run) {
       if (run.ended_at && now - run.ended_at < 900) {
-        var task = taskOf(run, dag.ws, ids);
+        var task = taskOfVerified(run, dag.ws, ids);
         if (task) just[task] = run;
       }
     });

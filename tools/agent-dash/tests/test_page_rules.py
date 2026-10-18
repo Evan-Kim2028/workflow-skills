@@ -52,17 +52,17 @@ def inline_scripts():
     return "\n".join(_core_scripts() + _card_scripts() + [inline])
 
 
-def _extract_taskof(path, name):
+def _extract_taskof(path, name, func="taskOf"):
     """The page's taskOf source with its name swapped, so node can run it
     against the same samples as dash/taskmatch.py. taskOf lives in a card
     file now, so fall back to the card scripts in script-tag order."""
     text = Path(path).read_text()
-    if "function taskOf(" not in text:
+    if f"function {func}(" not in text:
         for cand in _card_scripts():
-            if "function taskOf(" in cand:
+            if f"function {func}(" in cand:
                 text = cand
                 break
-    start = text.index("function taskOf(")
+    start = text.index(f"function {func}(")
     brace = text.index("{", start)
     depth = 0
     for pos in range(brace, len(text)):
@@ -71,8 +71,8 @@ def _extract_taskof(path, name):
         elif text[pos] == "}":
             depth -= 1
             if depth == 0:
-                return text[start:pos + 1].replace("function taskOf(", f"function {name}(", 1)
-    raise AssertionError(f"taskOf body never closes in {path}")
+                return text[start:pos + 1].replace(f"function {func}(", f"function {name}(", 1)
+    raise AssertionError(f"{func} body never closes in {path}")
 
 
 class PageRules(unittest.TestCase):
@@ -347,6 +347,149 @@ class PageRules(unittest.TestCase):
         for (ws, label, expected), (exec_hit, plan_hit) in zip(samples, rows):
             self.assertEqual(exec_hit, expected, f"index.html taskOf drifts on {label!r}")
             self.assertEqual(plan_hit, expected, f"plan.js taskOf drifts on {label!r}")
+        phantom = [
+            ("WS7", "ws7-ops-gold-rebuild", None),
+            ("WS1", "ws1-99-missing", None),
+            ("WS1", "ws1-schema", "12"),
+            ("WS7", "ws7-landing", "WS7.LANDING"),
+        ]
+        for ws, label, expected in phantom:
+            self.assertEqual(
+                taskmatch.task_of_verified(label, ws, taskmap, ids.get(ws, [])),
+                expected,
+                f"server verified rule drifts on {label!r}",
+            )
+            if expected is None:
+                self.assertIsNotNone(
+                    taskmatch.task_of(label, ws, taskmap, ids.get(ws, [])),
+                    f"the raw rule no longer maps {label!r}; the guard must be what drops it",
+                )
+        vexec = _extract_taskof(STATIC / "index.html", "taskOfVerifiedExec", func="taskOfVerified").replace("taskOf(", "taskOfExec(")
+        vplan = _extract_taskof(STATIC / "plan.js", "taskOfVerifiedPlan", func="taskOfVerified").replace("taskOf(", "taskOfPlan(")
+        harness2 = (
+            "var TASKMAP=" + _json.dumps(taskmap) + ";"
+            "var IDS=" + _json.dumps(ids) + ";"
+            "function planTaskIds(ws){return IDS[ws]||[];}"
+            "function taskmapGet(){return TASKMAP;}"
+            + _extract_taskof(STATIC / "index.html", "taskOfExec")
+            + _extract_taskof(STATIC / "plan.js", "taskOfPlan")
+            + vexec + vplan
+            + "var PH=" + _json.dumps([[ws, label] for ws, label, _ in phantom]) + ";"
+            "var VOUT=PH.map(function(s){"
+            "return [taskOfVerifiedExec({label:s[1]},s[0]),taskOfVerifiedPlan({label:s[1]},s[0],IDS[s[0]]||[])];});"
+            "console.log(JSON.stringify(VOUT));"
+        )
+        proc = subprocess.run(["node", "-e", harness2], capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 0, proc.stderr or proc.stdout)
+        vrows = _json.loads(proc.stdout)
+        self.assertEqual(len(vrows), len(phantom))
+        for (ws, label, expected), (exec_hit, plan_hit) in zip(phantom, vrows):
+            self.assertEqual(exec_hit, expected, f"index.html verified guard drifts on {label!r}")
+            self.assertEqual(plan_hit, expected, f"plan.js verified guard drifts on {label!r}")
+
+    def test_plan_map_layout_helpers(self):
+        """The plan card's layout helpers behave like dash/maplayout.py:
+        shortChipLabel strips the WS prefix and caps at 14 chars, layoutOf
+        passes the server layout through and falls back to null, and the
+        exported taskOfVerified drops phantom ids against the plan ids."""
+        script = (
+            "const fs=require('fs');"
+            "const src=fs.readFileSync(process.argv[1],'utf8');"
+            "var window={};"
+            "var state={plan:{ws:'WS7',groups:[{id:'g',tasks:[{id:'WS7.LANDING'},{id:'WS7.NOTES'}]}]}};"
+            "var TASKMAPSEED={'WS7':{}};"
+            "eval(src);"
+            "window.TASKMAP=TASKMAPSEED;"
+            "const assert=require('assert');"
+            "assert.strictEqual(window.shortChipLabel('WS8.52'),'52');"
+            "assert.strictEqual(window.shortChipLabel('74b'),'74b');"
+            "assert.strictEqual(window.shortChipLabel('WS7.LANDING'),'LANDING');"
+            "assert.strictEqual(window.shortChipLabel('op-rp-manifest-dryrun'),'op-rp-manifes\\u2026');"
+            "assert.strictEqual(window.shortChipLabel('WS8.123456789012345'),'1234567890123\\u2026');"
+            "assert.strictEqual(window.layoutOf(null),null);"
+            "assert.strictEqual(window.layoutOf({}),null);"
+            "assert.strictEqual(window.layoutOf({layout:null}),null);"
+            "assert.strictEqual(window.layoutOf({layout:{density:'compact'}}).density,'compact');"
+            "assert.strictEqual(window.taskOfVerified({label:'ws7-landing'},'WS7'),'WS7.LANDING');"
+            "assert.strictEqual(window.taskOfVerified({label:'ws7-ops-gold-rebuild'},'WS7'),null);"
+            "state.plan={ws:'WS9',groups:[]};" 
+            "assert.strictEqual(window.taskOfVerified({label:'ws7-ops-gold-rebuild'},'WS7'),'WS7.OPS');"
+        )
+        proc = subprocess.run(
+            ["node", "-e", script, str(STATIC / "cards" / "plan-progress.js")],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr or proc.stdout)
+
+    def test_plan_map_layout_branches(self):
+        """The plan card consumes the server layout and keeps every
+        interaction: collapse and slim expanders, the arrows toggle,
+        hover/pin focus, the one-line phases strip and the compact legend."""
+        card = (STATIC / "cards" / "plan-progress.js").read_text()
+        for marker in (
+            "plan.layout",
+            "more_token",
+            "deferred_token",
+            "hidden_done_ids",
+            "slim-tile",
+            "fold-rail",
+            "phases_line",
+            "phases-line",
+            "map-legend",
+            "arrows-why",
+            "fanin",
+            "tile-waits",
+            "trcap",
+            "more-btn",
+            "aria-expanded",
+            "foldedIds",
+        ):
+            self.assertIn(marker, card, f"plan-progress.js lost the layout branch: {marker}")
+        for marker in (
+            "function taskOfVerified(",
+            "function shortChipLabel(",
+            "function layoutOf(",
+            "function makeChip(",
+            "function buildTile(",
+            "function slimTile(",
+            "function paintStage(",
+        ):
+            self.assertEqual(
+                len(re.findall(rf"function {marker[9:-1]}\(", card)),
+                1,
+                f"{marker} must be defined exactly once",
+            )
+        for kept in (
+            "drawAllTaskEdges",
+            "focusTask",
+            "clearTask",
+            "groupEnter",
+            "arrows-toggle",
+            "aria-pressed",
+            "function rpCursorTime(",
+            "function rpSeek(",
+            "__adReplay",
+        ):
+            self.assertIn(kept, card, f"plan-progress.js lost kept behaviour: {kept}")
+        css = (STATIC / "cards" / "plan-progress.css").read_text()
+        for marker in (
+            ".dag.fitted",
+            ".dag.compact",
+            ".slim-tile",
+            ".more-btn",
+            ".fanin",
+            ".phases-line",
+            ".map-legend",
+            ".tile-waits",
+            ".balance-note",
+            ".fold-rail",
+            "@media (max-width:640px)",
+            "prefers-reduced-motion",
+        ):
+            self.assertIn(marker, css, f"plan-progress.css lost the layout rule: {marker}")
+        page = (STATIC / "index.html").read_text()
+        self.assertIn("/static/cards/plan-progress.css", page, "index.html never loads the card CSS")
 
     def test_replay_and_timeline_share_one_playhead(self):
         """The plan progress map and the run timeline play back together:

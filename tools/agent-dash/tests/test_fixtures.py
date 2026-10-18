@@ -361,6 +361,29 @@ class FixtureShapeTests(unittest.TestCase):
         self.assertEqual(len(noted), 1)
         self.assertTrue(set(noted[0]["dep_notes"]) <= set(noted[0].get("deps", [])))
 
+    def test_plans_carry_map_layout(self):
+        sys.path.insert(0, str(ROOT))
+        from dash import maplayout as maplayout_mod
+
+        for name in ("plan-WS1.json", "plan-WS2.json", "plan-WS7.json"):
+            plan = self.docs[name]
+            for key in ("layout", "map_warnings"):
+                self.assertIn(key, plan, name)
+            view = {key: plan[key] for key in ("ws", "cols", "groups", "edges", "phases", "trains")}
+            self.assertEqual(plan["layout"], maplayout_mod.layout(view), name)
+            self.assertEqual(plan["map_warnings"], maplayout_mod.map_warnings(view), name)
+            layout = plan["layout"]
+            self.assertEqual(
+                set(layout),
+                {"ws", "density", "ultra", "live_tasks", "deferred_tasks", "total_tasks",
+                 "task_edges", "group_edges", "columns", "folded_rail", "groups", "labels",
+                 "arrows", "trains", "phases_line", "balance"},
+                name,
+            )
+            self.assertIn(layout["density"], ("comfortable", "compact"), name)
+            self.assertIn(layout["arrows"]["mode"], ("all", "on-focus"), name)
+            self.assertTrue(layout["phases_line"], name)
+
     def test_replay_fixtures(self):
         for ws in ("WS1", "WS2", "WS7"):
             replay = self.docs[f"replay-{ws}.json"]

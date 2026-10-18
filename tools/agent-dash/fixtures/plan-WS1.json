@@ -97,5 +97,157 @@
     },
     "pct": 40
   },
-  "_note": "Seeded example plan for the fixture preview."
+  "_note": "Seeded example plan for the fixture preview.",
+  "layout": {
+    "ws": "WS1",
+    "density": "comfortable",
+    "ultra": false,
+    "live_tasks": 5,
+    "deferred_tasks": 0,
+    "total_tasks": 5,
+    "task_edges": 3,
+    "group_edges": 0,
+    "columns": [
+      {
+        "index": 0,
+        "title": "Shape",
+        "state": "full",
+        "groups": [
+          "start"
+        ],
+        "tasks": 5,
+        "live_tasks": 5,
+        "visible_chips": 5
+      },
+      {
+        "index": 1,
+        "title": "Build",
+        "state": "full",
+        "groups": [],
+        "tasks": 0,
+        "live_tasks": 0,
+        "visible_chips": 0
+      },
+      {
+        "index": 2,
+        "title": "Prove",
+        "state": "full",
+        "groups": [],
+        "tasks": 0,
+        "live_tasks": 0,
+        "visible_chips": 0
+      }
+    ],
+    "folded_rail": null,
+    "groups": [
+      {
+        "id": "start",
+        "title": "First group",
+        "col": 0,
+        "column": "Shape",
+        "state": "open",
+        "live_tasks": 5,
+        "deferred_tasks": 0,
+        "chips": [
+          {
+            "id": "0",
+            "label": "0",
+            "tooltip": "0 \u00b7 Upstream freeze signal is in \u00b7 done \u00b7 gate",
+            "status": "done",
+            "kind": "gate",
+            "train": null,
+            "fan_in": 0
+          },
+          {
+            "id": "1",
+            "label": "1",
+            "tooltip": "1 \u00b7 Agree the contract \u00b7 todo",
+            "status": "todo",
+            "kind": "task",
+            "train": null,
+            "fan_in": 0
+          },
+          {
+            "id": "2",
+            "label": "2",
+            "tooltip": "2 \u00b7 Land the read route \u00b7 pr \u00b7 waits on 1",
+            "status": "pr",
+            "kind": "task",
+            "train": "T2",
+            "fan_in": 0
+          },
+          {
+            "id": "3",
+            "label": "3",
+            "tooltip": "3 \u00b7 Retire the old readers \u00b7 wip \u00b7 waits on 2, 0: retire the readers only after the freeze signal",
+            "status": "wip",
+            "kind": "task",
+            "train": "T2",
+            "fan_in": 0
+          },
+          {
+            "id": "4",
+            "label": "4",
+            "tooltip": "4 \u00b7 Freeze the old contract \u00b7 done",
+            "status": "done",
+            "kind": "task",
+            "train": null,
+            "fan_in": 0
+          }
+        ],
+        "shown_done": 1,
+        "hidden_done": 0,
+        "hidden_done_ids": [],
+        "more_token": null,
+        "deferred_token": null
+      }
+    ],
+    "labels": {
+      "shortened": 0,
+      "collisions": []
+    },
+    "arrows": {
+      "mode": "all",
+      "task_edges": 3,
+      "group_edges": 0,
+      "reason": "3 task deps: arrows all",
+      "fan_in": []
+    },
+    "trains": {
+      "tagged": [
+        "T2"
+      ],
+      "untagged": [
+        "T1"
+      ],
+      "caption": "1 single-task train untagged (MAP107)",
+      "legend": [
+        "T2"
+      ],
+      "more_trains": 0
+    },
+    "phases_line": "1 Shape",
+    "balance": {
+      "tallest": {
+        "column": 0,
+        "title": "Shape",
+        "tasks": 5
+      },
+      "shortest": {
+        "column": 1,
+        "title": "Build",
+        "tasks": 0
+      },
+      "ratio": null
+    }
+  },
+  "map_warnings": [
+    {
+      "code": "MAP107",
+      "severity": "info",
+      "title": "Train T1 rides solo (1 member)",
+      "detail": "train T1 has 1 members; solo trains render no tag",
+      "fix": "Drop train T1; keep a task note instead"
+    }
+  ]
 }

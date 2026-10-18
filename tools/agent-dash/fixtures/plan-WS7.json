@@ -101,5 +101,214 @@
     },
     "pct": 20
   },
-  "_note": "Seeded example plan for the fixture preview."
+  "_note": "Seeded example plan for the fixture preview.",
+  "layout": {
+    "ws": "WS7",
+    "density": "comfortable",
+    "ultra": false,
+    "live_tasks": 5,
+    "deferred_tasks": 0,
+    "total_tasks": 5,
+    "task_edges": 0,
+    "group_edges": 3,
+    "columns": [
+      {
+        "index": 0,
+        "title": "Frame",
+        "state": "full",
+        "groups": [
+          "frame"
+        ],
+        "tasks": 1,
+        "live_tasks": 1,
+        "visible_chips": 1
+      },
+      {
+        "index": 1,
+        "title": "Pages",
+        "state": "full",
+        "groups": [
+          "pages"
+        ],
+        "tasks": 2,
+        "live_tasks": 2,
+        "visible_chips": 2
+      },
+      {
+        "index": 2,
+        "title": "Data",
+        "state": "full",
+        "groups": [
+          "data"
+        ],
+        "tasks": 1,
+        "live_tasks": 1,
+        "visible_chips": 1
+      },
+      {
+        "index": 3,
+        "title": "Ship",
+        "state": "full",
+        "groups": [
+          "ship"
+        ],
+        "tasks": 1,
+        "live_tasks": 1,
+        "visible_chips": 1
+      }
+    ],
+    "folded_rail": null,
+    "groups": [
+      {
+        "id": "frame",
+        "title": "Frame",
+        "col": 0,
+        "column": "Frame",
+        "state": "open",
+        "live_tasks": 1,
+        "deferred_tasks": 0,
+        "chips": [
+          {
+            "id": "WS7.FRAME",
+            "label": "FRAME",
+            "tooltip": "WS7.FRAME \u00b7 App shell \u00b7 done",
+            "status": "done",
+            "kind": "task",
+            "train": null,
+            "fan_in": 0
+          }
+        ],
+        "shown_done": 1,
+        "hidden_done": 0,
+        "hidden_done_ids": [],
+        "more_token": null,
+        "deferred_token": null
+      },
+      {
+        "id": "pages",
+        "title": "Pages",
+        "col": 1,
+        "column": "Pages",
+        "state": "open",
+        "live_tasks": 2,
+        "deferred_tasks": 0,
+        "chips": [
+          {
+            "id": "WS7.LANDING",
+            "label": "LANDING",
+            "tooltip": "WS7.LANDING \u00b7 Landing page \u00b7 prog",
+            "status": "prog",
+            "kind": "task",
+            "train": null,
+            "fan_in": 0
+          },
+          {
+            "id": "WS7.NOTES",
+            "label": "NOTES",
+            "tooltip": "WS7.NOTES \u00b7 Notes page \u00b7 todo",
+            "status": "todo",
+            "kind": "task",
+            "train": null,
+            "fan_in": 0
+          }
+        ],
+        "shown_done": 0,
+        "hidden_done": 0,
+        "hidden_done_ids": [],
+        "more_token": null,
+        "deferred_token": null
+      },
+      {
+        "id": "data",
+        "title": "Data",
+        "col": 2,
+        "column": "Data",
+        "state": "open",
+        "live_tasks": 1,
+        "deferred_tasks": 0,
+        "chips": [
+          {
+            "id": "WS7.FEED",
+            "label": "FEED",
+            "tooltip": "WS7.FEED \u00b7 Feed the page from the API \u00b7 pr",
+            "status": "pr",
+            "kind": "task",
+            "train": null,
+            "fan_in": 0
+          }
+        ],
+        "shown_done": 0,
+        "hidden_done": 0,
+        "hidden_done_ids": [],
+        "more_token": null,
+        "deferred_token": null
+      },
+      {
+        "id": "ship",
+        "title": "Ship",
+        "col": 3,
+        "column": "Ship",
+        "state": "open",
+        "live_tasks": 1,
+        "deferred_tasks": 0,
+        "chips": [
+          {
+            "id": "WS7.CHECK",
+            "label": "CHECK",
+            "tooltip": "WS7.CHECK \u00b7 Check the empty and error states \u00b7 todo",
+            "status": "todo",
+            "kind": "task",
+            "train": null,
+            "fan_in": 0
+          }
+        ],
+        "shown_done": 0,
+        "hidden_done": 0,
+        "hidden_done_ids": [],
+        "more_token": null,
+        "deferred_token": null
+      }
+    ],
+    "labels": {
+      "shortened": 5,
+      "collisions": []
+    },
+    "arrows": {
+      "mode": "all",
+      "task_edges": 0,
+      "group_edges": 3,
+      "reason": "0 task deps: arrows all",
+      "fan_in": []
+    },
+    "trains": {
+      "tagged": [],
+      "untagged": [],
+      "caption": null,
+      "legend": [],
+      "more_trains": 0
+    },
+    "phases_line": "1 Pages  \u2192  2 Ship",
+    "balance": {
+      "tallest": {
+        "column": 1,
+        "title": "Pages",
+        "tasks": 2
+      },
+      "shortest": {
+        "column": 0,
+        "title": "Frame",
+        "tasks": 1
+      },
+      "ratio": 2.0
+    }
+  },
+  "map_warnings": [
+    {
+      "code": "MAP109",
+      "severity": "info",
+      "title": "3 of 4 groups hold a single task",
+      "detail": "3 single-task groups out of 4 (bar: half or more)",
+      "fix": "Merge 1-task groups into their stage group"
+    }
+  ]
 }
