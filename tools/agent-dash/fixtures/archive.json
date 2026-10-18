@@ -1,0 +1,55 @@
+{
+  "archive": [
+    {
+      "ws": "WS11",
+      "state": "archived",
+      "frozen_at": 1761827160,
+      "started_at": 1759407960,
+      "finished_at": 1761827160,
+      "duration_s": 2419200,
+      "tasks": {
+        "done": 3,
+        "total": 3,
+        "counts": {
+          "todo": 0,
+          "wip": 0,
+          "pr": 0,
+          "prog": 0,
+          "done": 3,
+          "deferred": 0
+        },
+        "pct": 100
+      },
+      "trains": {
+        "total": 0,
+        "by_status": {}
+      },
+      "approvals": {
+        "pending": 0,
+        "approved": 2,
+        "denied": 0,
+        "total": 2
+      },
+      "usage": {
+        "tokens_all_time": 0,
+        "cost_usd_all_time": 0.0,
+        "reachable": true,
+        "url": "seeded",
+        "note": "seeded fixture: no runs attribute to WS11"
+      },
+      "closing_report": true,
+      "note": null,
+      "id": "WS11",
+      "title": "Export",
+      "archived_at": 1761827160,
+      "report": "2025-10-30-closing.md"
+    }
+  ],
+  "totals": {
+    "workstreams": 1,
+    "tokens": 0,
+    "cost_usd": 0.0,
+    "runs": 0
+  },
+  "_note": "Seeded synthetic data for the offline preview. Seed 1. No local sessions are read."
+}

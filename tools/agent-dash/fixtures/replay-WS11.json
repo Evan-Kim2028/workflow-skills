@@ -1,0 +1,31 @@
+{
+  "ws": "WS11",
+  "span": null,
+  "tasks": {
+    "WS11.1": {
+      "status": "done",
+      "first_active": null,
+      "done_at": null,
+      "inferred": true,
+      "runs": []
+    },
+    "WS11.2": {
+      "status": "done",
+      "first_active": null,
+      "done_at": null,
+      "inferred": true,
+      "runs": []
+    },
+    "WS11.3": {
+      "status": "done",
+      "first_active": null,
+      "done_at": null,
+      "inferred": true,
+      "runs": []
+    }
+  },
+  "events": [],
+  "observed": 0,
+  "inferred": 3,
+  "_note": "Seeded synthetic data for the offline preview. Seed 1. No local sessions are read."
+}

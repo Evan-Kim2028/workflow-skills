@@ -1,0 +1,42 @@
+{
+  "name": "Seeded demo project",
+  "short": "demo",
+  "description": "Seeded synthetic project for the offline preview.",
+  "goals": [
+    "Seeded lanes stay green",
+    "The offline preview renders every view"
+  ],
+  "started": "2025-10-01",
+  "target": null,
+  "phases": [
+    {
+      "id": "wave-1",
+      "title": "First wave",
+      "summary": "Seeded lanes land.",
+      "gate": "All seeded checks pass.",
+      "state": "done"
+    },
+    {
+      "id": "wave-2",
+      "title": "Second wave",
+      "summary": "Planned lanes start.",
+      "gate": "Gates confirm and approvals land.",
+      "state": "active"
+    }
+  ],
+  "counts": {
+    "planned": 2,
+    "active": 6,
+    "paused": 1,
+    "done": 1,
+    "archived": 1,
+    "dropped": 1
+  },
+  "totals": {
+    "tokens": 1145059,
+    "cost_usd": 3.0178,
+    "runs": 150
+  },
+  "data_root_hash": "seeded0000",
+  "_note": "Seeded synthetic data for the offline preview. Seed 1. No local sessions are read."
+}

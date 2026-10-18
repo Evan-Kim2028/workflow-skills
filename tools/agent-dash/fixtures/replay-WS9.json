@@ -1,0 +1,31 @@
+{
+  "ws": "WS9",
+  "span": null,
+  "tasks": {
+    "WS9.G1": {
+      "status": "todo",
+      "first_active": null,
+      "done_at": null,
+      "inferred": false,
+      "runs": []
+    },
+    "WS9.1": {
+      "status": "todo",
+      "first_active": null,
+      "done_at": null,
+      "inferred": false,
+      "runs": []
+    },
+    "WS9.2": {
+      "status": "todo",
+      "first_active": null,
+      "done_at": null,
+      "inferred": false,
+      "runs": []
+    }
+  },
+  "events": [],
+  "observed": 0,
+  "inferred": 0,
+  "_note": "Seeded synthetic data for the offline preview. Seed 1. No local sessions are read."
+}

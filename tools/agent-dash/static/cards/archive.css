@@ -1,0 +1,13 @@
+/* Archive shelf card styles (?view=archive). Frozen summary cards,
+   lifetime header, honest empty state, and the read-only plan banner. */
+.pj-arch-wrap .pj-shelf{margin-top:4px}
+.pj-arch-head{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.pj-arch .pj-wn{font:700 15px var(--mono)}
+.pj-arch .pj-wt{font-size:13.5px;font-weight:650;margin:2px 0 8px}
+.pj-arch .pj-kv{margin-top:4px}
+.pj-rules{margin-top:14px}
+.pj-rules h3{font-size:var(--fs-h2);margin:0 0 2px;font-weight:700}
+.pj-empty{color:var(--ink-2);font-size:13.5px}
+.pj-empty p{margin:0 0 10px}
+/* Read-only banner on archived workstream plan pages. */
+.arch-banner{margin:4px 0 18px;padding:10px 14px;border:1px solid var(--ring-strong);border-radius:var(--r-md);background:var(--raised);color:var(--ink-2);font-size:13.5px;font-weight:600}

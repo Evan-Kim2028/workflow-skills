@@ -932,5 +932,205 @@ console.log("timeline every-run proof ok: 640 + 505 + 640 bars");
         self.assertEqual(proc.returncode, 0, proc.stderr or proc.stdout)
 
 
+    def test_project_view_routing(self):
+        """?view=project|current|planned|archive route beside plan|exec;
+        current is the exec alias; unknown views fall back to exec."""
+        script = (
+            "const fs=require('fs');"
+            "globalThis.window=globalThis;"
+            "globalThis.location={search:'',pathname:'/'};"
+            "globalThis.document={getElementById:function(){return null;}};"
+            "eval(fs.readFileSync(process.argv[1],'utf8'));"
+            "eval(fs.readFileSync(process.argv[2],'utf8'));"
+            "const assert=require('assert');"
+            "function route(search,path){globalThis.location={search:search,pathname:path};return readRoute();}"
+            "assert.deepStrictEqual(route('?view=project','/'),{view:'project',ws:'all'});"
+            "assert.deepStrictEqual(route('?view=planned','/'),{view:'planned',ws:'all'});"
+            "assert.deepStrictEqual(route('?view=archive','/'),{view:'archive',ws:'all'});"
+            "assert.deepStrictEqual(route('?view=current','/'),{view:'exec',ws:'all'});"
+            "assert.deepStrictEqual(route('?view=current&ws=ws9','/'),{view:'exec',ws:'WS9'});"
+            "assert.deepStrictEqual(route('?view=exec&ws=WS7','/'),{view:'exec',ws:'WS7'});"
+            "assert.deepStrictEqual(route('?view=plan&ws=WS7','/'),{view:'plan',ws:'WS7'});"
+            "assert.deepStrictEqual(route('?view=bogus','/'),{view:'exec',ws:'all'});"
+            "assert.deepStrictEqual(route('','/plan'),{view:'plan',ws:'all'});"
+            "assert.deepStrictEqual(route('','/'),{view:'exec',ws:'all'});"
+            "assert.strictEqual(isProjectView(),false);"
+            "state.view='planned';assert.strictEqual(isProjectView(),true);"
+            "state.view='project';assert.strictEqual(isProjectView(),true);"
+            "state.view='archive';assert.strictEqual(isProjectView(),true);"
+            "state.view='plan';assert.strictEqual(isProjectView(),false);"
+            "assert.strictEqual(projectLanding({name:'Demo'},[]),'project');"
+            "assert.strictEqual(projectLanding({name:null},[{state:'active'},{state:'active'}]),'exec');"
+            "assert.strictEqual(projectLanding(null,[]),'exec');"
+            "assert.strictEqual(projectLanding({name:null},[{state:'active'},{state:'planned'}]),'project');"
+            "assert.strictEqual(projectLanding({name:null},[{state:'paused'}]),'project');"
+            "assert.strictEqual(projectLanding({name:null},[{}]),'exec');"
+        )
+        proc = subprocess.run(
+            ["node", "-e", script, str(STATIC / "tabs.js"), str(STATIC / "core" / "state.js")],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr or proc.stdout)
+
+    def test_tab_lifecycle_helpers(self):
+        """Tabs keep active/paused/done states; absent or unknown reads as
+        active, the same default the API uses."""
+        script = (
+            "const fs=require('fs');"
+            "eval(fs.readFileSync(process.argv[1],'utf8'));"
+            "const T=globalThis.ADT;"
+            "const assert=require('assert');"
+            "assert.deepStrictEqual(T.TAB_STATES,['active','paused','done']);"
+            "assert.strictEqual(T.wsStateOf({state:'planned'}),'planned');"
+            "assert.strictEqual(T.wsStateOf({state:'paused'}),'paused');"
+            "assert.strictEqual(T.wsStateOf({state:'done'}),'done');"
+            "assert.strictEqual(T.wsStateOf({state:'archived'}),'archived');"
+            "assert.strictEqual(T.wsStateOf({state:'dropped'}),'dropped');"
+            "assert.strictEqual(T.wsStateOf({}),'active');"
+            "assert.strictEqual(T.wsStateOf(null),'active');"
+            "assert.strictEqual(T.wsStateOf({state:'flying'}),'active');"
+            "assert.strictEqual(T.isTabState('active'),true);"
+            "assert.strictEqual(T.isTabState('paused'),true);"
+            "assert.strictEqual(T.isTabState('done'),true);"
+            "assert.strictEqual(T.isTabState('planned'),false);"
+            "assert.strictEqual(T.isTabState('archived'),false);"
+            "assert.strictEqual(T.isTabState('dropped'),false);"
+        )
+        proc = subprocess.run(
+            ["node", "-e", script, str(STATIC / "tabs.js")],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr or proc.stdout)
+
+    def test_project_views_are_readonly(self):
+        """The dashboard stays read-only: no page fetch uses a non-GET
+        method, and the Archive/Restore buttons only copy the exact CLI
+        command to the clipboard (with a textarea fallback and a toast)."""
+        script = inline_scripts()
+        plan_js = (STATIC / "plan.js").read_text()
+        for name, src in (("index.html", script), ("plan.js", plan_js)):
+            hits = re.findall(r"method\s*:\s*[\"'](POST|PUT|DELETE|PATCH)[\"']", src, re.I)
+            self.assertEqual(hits, [], f"{name} fetches with a non-GET method: {hits[:2]}")
+        for name in ("project-home.js", "planned.js", "archive.js"):
+            text = (STATIC / "cards" / name).read_text()
+            self.assertNotIn("fetch(", text, f"{name} fetches; project views read state only")
+            self.assertNotIn("XMLHttpRequest", text, f"{name} fetches; project views read state only")
+        home = (STATIC / "cards" / "project-home.js").read_text()
+        self.assertIn("navigator.clipboard", home, "no clipboard copy path")
+        self.assertIn("execCommand", home, "no textarea copy fallback")
+        self.assertIn("showToast", home, "no confirmation toast")
+        self.assertIn("ws archive", home, "Archive button names no command")
+        arch = (STATIC / "cards" / "archive.js").read_text()
+        self.assertIn("ws restore", arch, "Restore button names no command")
+
+    def test_project_slots_and_registry_scopes(self):
+        """Chart slots exist by id on the project views, and the registry
+        gains the project/planned scopes with the slot contract."""
+        home = (STATIC / "cards" / "project-home.js").read_text()
+        planned = (STATIC / "cards" / "planned.js").read_text()
+        for slot in ("exec-burnup", "exec-feed", "exec-health", "exec-roadmap", "exec-depgraph"):
+            self.assertIn(slot, home, f"project home lost the {slot} slot")
+        for slot in ("exec-roadmap", "exec-depgraph"):
+            self.assertIn(slot, planned, f"planned view lost the {slot} slot")
+        reg = (STATIC / "cards" / "registry.js").read_text()
+        self.assertIn('scope: "project"', reg, "no project registry scope")
+        self.assertIn('"planned" entries on the Planned view', reg, "no planned registry scope in the contract")
+        self.assertIn("registryFor", reg, "no scope-matching registry helper")
+        self.assertIn('registryFor("planned")', planned, "planned view never mounts its scope entries")
+        self.assertIn('"needs"', reg, "needs.js is not registered for the project scope")
+        script = inline_scripts()
+        bodies = dict(functions(script))
+        self.assertIn("projectHomeSpecs", bodies)
+        self.assertIn("plannedSpecs", bodies)
+        self.assertIn("archiveSpecs", bodies)
+        self.assertIn("projectSpecs", bodies)
+        self.assertIn("projectHomeSpecs(", bodies["projectSpecs"])
+        for name in ("project-phases", "project-tiles", "project-current", "planned-ready", "archive-shelf"):
+            self.assertIn(name, script, f"the {name} section never renders")
+
+    def test_project_pure_helpers_on_fixtures(self):
+        """The project-view data helpers agree with the generated fixtures:
+        landing, report basenames, gate staleness, start readiness, the
+        gated-but-live scan, and archive ordering."""
+        import json as _json
+
+        fx = Path(__file__).resolve().parent.parent / "fixtures"
+        project = _json.loads((fx / "project.json").read_text())
+        wss = _json.loads((fx / "workstreams.json").read_text())["workstreams"]
+        wss_all = _json.loads((fx / "workstreams-all.json").read_text())["workstreams"]
+        archive = _json.loads((fx / "archive.json").read_text())
+        plan_ws9 = _json.loads((fx / "plan-WS9.json").read_text())
+        approvals = _json.loads((fx / "approvals.json").read_text())["approvals"]
+        harness = (
+            "const fs=require('fs');"
+            "globalThis.window=globalThis;"
+            "globalThis.location={search:'',pathname:'/'};"
+            "globalThis.document={getElementById:function(){return null;}};"
+            "eval(fs.readFileSync(process.argv[1],'utf8'));"
+            "eval(fs.readFileSync(process.argv[2],'utf8'));"
+            "eval(fs.readFileSync(process.argv[3],'utf8'));"
+            "eval(fs.readFileSync(process.argv[4],'utf8'));"
+            "eval(fs.readFileSync(process.argv[5],'utf8'));"
+            "eval(fs.readFileSync(process.argv[6],'utf8'));"
+            "eval(fs.readFileSync(process.argv[7],'utf8'));"
+            "eval(fs.readFileSync(process.argv[8],'utf8'));"
+            "const assert=require('assert');"
+            "var PROJECT=" + _json.dumps(project) + ";"
+            "var WSS=" + _json.dumps(wss) + ";"
+            "var ARCHIVE=" + _json.dumps(archive) + ";"
+            "var PLAN9=" + _json.dumps(plan_ws9) + ";"
+            "var APPROVALS=" + _json.dumps(approvals) + ";"
+            "var NOW=1761999960;"
+            "assert.strictEqual(projectLanding(PROJECT,WSS),'project');"
+            "assert.strictEqual(projectLanding({name:null},WSS),'project');"
+            "assert.strictEqual(reportFor('WS11',ARCHIVE),'2025-10-30-closing.md');"
+            "assert.strictEqual(reportFor('ws11',ARCHIVE),'2025-10-30-closing.md');"
+            "assert.strictEqual(reportFor('WS9',ARCHIVE),null);"
+            "var gate9=PLAN9.groups[0].tasks[0];"
+            "assert.strictEqual(gate9.kind,'gate');"
+            "assert.strictEqual(gateStale(gate9,NOW),true);"
+            "assert.strictEqual(gateStale({fresh_hours:24,confirmed_at:'2025-11-01T12:00:00Z'},NOW),false);"
+            "assert.strictEqual(gateStale({confirmed_at:'2020-01-01T00:00:00Z'},NOW),false);"
+            "assert.strictEqual(gateStale({fresh_hours:0,confirmed_at:'2020-01-01T00:00:00Z'},NOW),false);"
+            "var ws9=WSS.filter(function(w){return w.ws==='WS9';})[0];"
+            "var states={};"
+            + _json.dumps(wss_all) + ".forEach(function(w){states[w.ws]=w.state;});"
+            "var r=readinessOf(ws9,PLAN9,APPROVALS,states,NOW);"
+            "assert.strictEqual(r.ready,false);"
+            "assert.ok(r.reason.indexOf('WS6')>=0,'reason names the blocking workstream: '+r.reason);"
+            "assert.strictEqual(r.pending,2);"
+            "assert.strictEqual(r.gates,1);"
+            "assert.strictEqual(r.staleGates,1);"
+            "assert.strictEqual(r.done,0);"
+            "assert.ok(r.waitText.indexOf('WS6')>=0);"
+            "var okRow={ws:'WSX',depends_on:[],progress:{done:1,total:1}};"
+            "var rok=readinessOf(okRow,{groups:[]},[],{WSX:'planned'},NOW);"
+            "assert.strictEqual(rok.ready,true);"
+            "assert.strictEqual(gatedLive([],{},NOW).length,0);"
+            "var held=gatedLive([{ws:'WS6',name:'Cutover',progress:{done:2,total:78,pct:3}}],"
+            "{WS6:{groups:[{tasks:[{id:'g',kind:'gate',status:'todo',signal:'owner-signoff gate is approved'}]}]}},NOW);"
+            "assert.strictEqual(held.length,1);"
+            "assert.strictEqual(held[0].ws,'WS6');"
+            "var sorted=sortArchive(ARCHIVE.archive.concat([{id:'WS0',archived_at:null}]));"
+            "assert.strictEqual(sorted[0].id,'WS11');"
+            "assert.strictEqual(sorted[sorted.length-1].id,'WS0');"
+            "assert.strictEqual(durStr(28*86400),'28d');"
+            "assert.strictEqual(durStr(90),'1m 30s');"
+            "assert.strictEqual(durStr(null),'\u2013');"
+        )
+        proc = subprocess.run(
+            ["node", "-e", harness,
+             str(STATIC / "tabs.js"), str(STATIC / "format.js"), str(STATIC / "core" / "el.js"),
+             str(STATIC / "core" / "state.js"), str(STATIC / "cards" / "registry.js"),
+             str(STATIC / "cards" / "planned.js"), str(STATIC / "cards" / "project-home.js"),
+             str(STATIC / "cards" / "archive.js")],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr or proc.stdout)
+
+
 if __name__ == "__main__":
     unittest.main()

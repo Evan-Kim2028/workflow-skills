@@ -46,10 +46,16 @@ FILES = (
     "concurrency.json",
     "sessions.json",
     "workstreams.json",
+    "workstreams-all.json",
+    "project.json",
+    "archive.json",
     "reconcile.json",
     "plan-WS1.json",
     "plan-WS2.json",
     "plan-WS7.json",
+    "plan-WS9.json",
+    "plan-WS10.json",
+    "plan-WS11.json",
     "replay-WS1.json",
     "replay-WS2.json",
     "replay-WS7.json",
@@ -324,8 +330,15 @@ class FixtureShapeTests(unittest.TestCase):
                 done += row["tk"]["done"]
                 backlog += row["tk"]["backlog"]
             self.assertEqual(row["plan"], row["ws"] in fx.PLAN_WS)
-        self.assertEqual(done, fx.DONE_TOTAL)
-        self.assertEqual(backlog, fx.BACKLOG_TOTAL)
+        # workstreams.json is the default scope: archived/dropped BOARD
+        # rows never land here, so the BOARD sums skip hidden states.
+        visible = [
+            counts
+            for code, _name, counts in fx.BOARD
+            if fx.WS_STATES.get(code, "active") not in fx.HIDDEN_STATES
+        ]
+        self.assertEqual(done, sum(counts[4] for counts in visible))
+        self.assertEqual(backlog, sum(counts[0] for counts in visible))
         for row in board:
             if row["ws"] in fx.PLAN_WS:
                 self.assertEqual(set(row["progress"]), {"done", "total", "counts", "pct"})
@@ -515,6 +528,93 @@ class FixtureShapeTests(unittest.TestCase):
             self.assertTrue(hits, label)
             self.assertEqual(hits[0]["workstream"], ws)
             self.assertEqual(hits[0]["ws_confidence"], confidence)
+
+
+class ProjectViewFixtureTests(unittest.TestCase):
+    """Shapes behind the project views: project.json, all-state
+    workstreams, archive.json, and the planned fixture plans."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.project = load("project.json")
+        cls.wss = load("workstreams.json")["workstreams"]
+        cls.wss_all = load("workstreams-all.json")["workstreams"]
+        cls.archive = load("archive.json")
+        cls.plans = {ws: load(f"plan-{ws}.json") for ws in ("WS9", "WS10", "WS11")}
+
+    def test_project_shape(self):
+        for key in ("name", "short", "description", "goals", "started", "target", "phases", "counts", "totals", "data_root_hash"):
+            self.assertIn(key, self.project, key)
+        self.assertTrue(self.project["name"], "offline preview needs a project name to land on")
+        self.assertIsInstance(self.project["goals"], list)
+        self.assertTrue(self.project["goals"])
+        states = {phase["state"] for phase in self.project["phases"]}
+        self.assertTrue(states <= {"planned", "active", "done"}, states)
+        for phase in self.project["phases"]:
+            for key in ("id", "title", "summary", "gate", "state"):
+                self.assertIn(key, phase, key)
+        counts = self.project["counts"]
+        self.assertEqual(
+            sum(counts.values()),
+            len(self.wss_all),
+            "counts by state must cover the all-states list",
+        )
+
+    def test_workstream_lifecycle_coverage(self):
+        by_id = {row["ws"]: row for row in self.wss_all}
+        seen = {row["state"] for row in self.wss_all}
+        self.assertEqual(
+            seen,
+            {"planned", "active", "paused", "done", "archived", "dropped"},
+            "the offline preview needs every lifecycle state",
+        )
+        default_ids = {row["ws"] for row in self.wss}
+        for row in self.wss_all:
+            for key in ("state", "state_changed_at", "archived_at", "depends_on", "milestone"):
+                self.assertIn(key, row, row["ws"])
+            self.assertIsInstance(row["depends_on"], list)
+            if row["state"] in ("archived", "dropped"):
+                self.assertNotIn(row["ws"], default_ids, "default scope keeps archived/dropped rows")
+            else:
+                self.assertIn(row["ws"], default_ids, "default scope drops a visible row")
+            if row["state"] == "archived":
+                self.assertTrue(num(row["archived_at"]), row["ws"])
+        planned = [row for row in self.wss if by_id[row["ws"]]["state"] == "planned"]
+        self.assertTrue(planned, "no planned rows in the default scope")
+        for row in planned:
+            self.assertTrue(row["depends_on"], f"{row['ws']} names nothing it waits on")
+
+    def test_archive_shape(self):
+        cards = self.archive["archive"]
+        self.assertTrue(cards, "the offline Archive shelf needs a card")
+        stamps = []
+        for card in cards:
+            for key in ("ws", "state", "frozen_at", "started_at", "finished_at", "duration_s",
+                        "tasks", "trains", "approvals", "usage", "closing_report",
+                        "id", "title", "archived_at", "report"):
+                self.assertIn(key, card, card.get("id"))
+            self.assertEqual(card["state"], "archived")
+            self.assertTrue(num(card["archived_at"]))
+            self.assertNotIn("/", card["report"] or "", "report is a basename, never a path")
+            self.assertNotIn("\\", card["report"] or "", "report is a basename, never a path")
+            stamps.append(card["archived_at"])
+        self.assertEqual(stamps, sorted(stamps, reverse=True), "archive is newest first")
+        totals = self.archive["totals"]
+        self.assertEqual(totals["workstreams"], len(cards))
+        for key in ("tokens", "cost_usd", "runs"):
+            self.assertTrue(num(totals[key]), key)
+
+    def test_planned_fixture_plans_have_gates(self):
+        ws9 = self.plans["WS9"]
+        gates = [task for group in ws9["groups"] for task in group["tasks"] if task.get("kind") == "gate"]
+        self.assertTrue(gates, "the readiness table needs a gate to mark stale")
+        for gate in gates:
+            for key in ("signal", "confirmed_at", "fresh_hours"):
+                self.assertIn(key, gate, gate.get("id"))
+        self.assertEqual(ws9["progress"]["done"], 0)
+        ws11 = self.plans["WS11"]
+        self.assertEqual(ws11["progress"]["done"], ws11["progress"]["total"])
+        self.assertGreater(ws11["progress"]["total"], 0)
 
 
 class FixtureSmokeTests(unittest.TestCase):

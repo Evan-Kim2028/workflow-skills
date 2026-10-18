@@ -3,17 +3,20 @@
    (api is also window.DashApi, used by the plan view; with ?fixtures every
    path reads ../fixtures/*.json instead of the network); approvalList
    (approvals-response normalizer); loadNav, refreshFoot (tab-list and footer
-   refresh); warming, warmTabs (background per-tab warmup); showSnapError,
+   refresh); resolveLanding (first-load default view); refreshProject,
+   loadProjectPlans (the all-scope project-view refresh paths); warming,
+   warmTabs (background per-tab warmup); showSnapError,
    clearSnapError, renderErrBanner (loud fetch failures); STALE_AFTER_S,
    updateStale (tick-freshness badge); refreshAll, setLive, stream,
    refreshSnapshot (the one-response refresh paths).
    Needs: FIX from el.js; WINDOW_HOURS, state, since, wsParam, groupFor,
    reqKey, getCache, setCache, execCache from the state/cache files;
-   window.ADC; renderTabs from state.js; drawMain, which stays in the page
-   script and is read as a plain global at call time. */
+   window.ADC; renderTabs, applyChrome, projectLanding, isProjectView from
+   state.js; planSum, planPrompt, planProg from the ws-cards file; drawMain,
+   which stays in the page script and is read as a plain global at call time. */
 (function (global) {
   "use strict";
-  var FIXMAP = {"/api/snapshot": "snapshot", "/api/runs": "runs", "/api/usage": "usage-model-hour", "/api/concurrency": "concurrency", "/api/sessions": "sessions", "/api/workstreams": "workstreams", "/api/health": "health", "/api/reconcile": "reconcile"};
+  var FIXMAP = {"/api/snapshot": "snapshot", "/api/runs": "runs", "/api/usage": "usage-model-hour", "/api/concurrency": "concurrency", "/api/sessions": "sessions", "/api/workstreams": "workstreams", "/api/project": "project", "/api/archive": "archive", "/api/health": "health", "/api/reconcile": "reconcile"};
   function api(path, params) {
     var qs = new URLSearchParams(params || {}).toString();
     if (FIX) {
@@ -43,6 +46,7 @@
       }
       var base = FIXMAP[path] || path.replace("/api/", "");
       if (path === "/api/usage" && params && params.group === "workstream") base = "usage-workstream-hour";
+      if (path === "/api/workstreams" && params && params.state) base = "workstreams-all";
       if (path === "/api/plan") base = "plan-" + params.ws;
       if (path === "/api/replay") base = "replay-" + params.ws;
       return fetch("../fixtures/" + base + ".json").then(function (r) { if (!r.ok) throw new Error(r.status); return r.json(); });
@@ -62,7 +66,84 @@
   function loadNav() {
     var bundlesP = fetch(FIX ? "../fixtures/bundles.json" : "/api/bundles", {cache: "no-store"}).then(function (r) { return r.ok ? r.json() : {bundles: []}; }).then(function (j) { state.bundles = j.bundles || []; }).catch(function () {});
     var wsP = api("/api/workstreams", {since: since()}).then(function (j) { state.wss = j.workstreams || []; }).catch(function () {});
-    return Promise.all([bundlesP, wsP]).then(function () { renderTabs(); });
+    /* Project identity (missing project.json means name null: the header
+       falls back to Agent dashboard) and the all-states list behind the
+       Planned/Archive pill counts. Both are best-effort on older servers. */
+    var projP = api("/api/project", {}).then(function (j) { state.project = (j && typeof j === "object") ? j : {name: null}; }).catch(function () { state.project = {name: null}; });
+    var allP = api("/api/workstreams", {since: since(), state: "all"}).then(function (j) { state.wssAll = j.workstreams || []; }).catch(function () { state.wssAll = []; });
+    return Promise.all([bundlesP, wsP, projP, allP]).then(function () { renderTabs(); applyChrome(); resolveLanding(); });
+  }
+  /* First-load default view, once per page load: Project home when the
+     project names itself or any workstream left the active state,
+     otherwise today's Overview. An explicit ?view= always wins. */
+  function resolveLanding() {
+    if (state.landed) return;
+    state.landed = true;
+    var explicit = false;
+    try { explicit = new URLSearchParams(location.search).has("view"); } catch (e) { explicit = true; }
+    if (explicit) return;
+    var next = projectLanding(state.project, state.wss);
+    if (next && next !== state.view) {
+      state.view = next;
+      pushRoute();
+    }
+  }
+  /* All-scope refresh for the Project, Planned, and Archive views: the
+     tiles reuse the same all-scope snapshot the exec Overview reads, the
+     cards read the all-states workstreams plus plans, archive, and the
+     approvals roll-up. Tiles and usage apply together or not at all. */
+  function loadProjectPlans() {
+    var ids = [];
+    (state.wss || []).forEach(function (w) { if (w.plan && ids.indexOf(w.ws) < 0) ids.push(w.ws); });
+    return Promise.all(ids.map(function (id) {
+      return api("/api/plan", {ws: id}).then(function (p) {
+        state.plans[id] = (p && p.groups) ? p : null;
+        planSum[id] = planProg(null, p);
+        planPrompt[id] = p && p.start_prompt;
+      }).catch(function () {});
+    })).then(function () { renderTabs(); });
+  }
+  function refreshProject() {
+    if (window.__adReplayOn) return Promise.resolve();
+    var group = state.groupBy;
+    var reqSince = since();
+    var gen = ++execGen;
+    var jobs = [
+      api("/api/snapshot", {ws: "all", since: reqSince, usage_group: group}).catch(function () { return null; }),
+      api("/api/runs", {since: reqSince, limit: 5000}).then(function (j) { return j.runs || []; }).catch(function () { return []; }),
+      api("/api/concurrency", {since: reqSince, step: 60}).then(function (j) { return j.points || []; }).catch(function () { return []; }),
+      loadNav(),
+      api("/api/archive", {}).then(function (j) { return j; }).catch(function () { return null; }),
+      api("/api/approvals", {ws: "all"}).then(approvalList).catch(function () { return []; })
+    ];
+    return Promise.all(jobs).then(function (parts) {
+      if (gen !== execGen || !isProjectView()) return;
+      if (!parts[0]) {
+        showSnapError("all");
+        if (isProjectView()) { drawMain(); setLive(false); }
+        return;
+      }
+      clearSnapError();
+      if (parts[0].seq !== state.seq) state.lastSeqChange = Date.now() / 1000;
+      if (parts[0].last_data_ts != null) state.lastDataTs = parts[0].last_data_ts;
+      state.snap = parts[0];
+      state.seq = parts[0].seq;
+      state.runs = parts[1];
+      state.usage = Array.isArray(parts[0].usage) ? parts[0].usage : [];
+      state.conc = parts[2];
+      state.archive = (parts[4] && parts[4].archive) ? parts[4] : {archive: [], totals: {workstreams: 0, tokens: 0, cost_usd: 0.0, runs: 0}};
+      state.approvals = parts[5];
+      return loadProjectPlans().then(function () {
+        if (gen !== execGen || !isProjectView()) return;
+        renderTabs();
+        drawMain();
+        window.__adSettled = "project-" + state.view + "|24|" + state.seq;
+        setLive(true);
+        updateStale();
+        var foot = document.getElementById("foot");
+        if (foot) foot.textContent = "Updated " + new Date().toLocaleTimeString() + (FIX ? " \u00B7 fixture data" : "") + " \u00B7 read-only, 127.0.0.1";
+      });
+    }).catch(function () { if (gen === execGen && isProjectView()) { showSnapError("all"); setLive(false); } });
   }
   /* Muted footer line: the reconcile check for the fixed 24 h window. Status color always ships with a word and symbol. */
   function refreshFoot() {
@@ -82,7 +163,7 @@
   /* Warm every other tab's Execution data in the background, one tab at a time, so a first switch draws from cache instantly. Entries are keyed by tab and group (one fixed 24 h window) with the window captured up front, and fresh entries are not refetched. */
   var warming = false;
   function warmTabs() {
-    if (warming || FIX) return;
+    if (warming || FIX || isProjectView()) return;
     var group = state.groupBy, reqSince = Math.floor(Date.now() / 1000 - WINDOW_HOURS * 3600);
     var list = ["all"].concat(shown(state.wss).map(function (w) { return w.ws; })).filter(function (ws) { return ws !== state.ws; });
     if (!list.length) return;
@@ -210,7 +291,7 @@
         if (d.last_poll != null) state.lastPoll = d.last_poll;
         if (d.last_data_ts != null) state.lastDataTs = d.last_data_ts;
         if (state.lastSeqChange === 0) state.lastSeqChange = nowS;
-        if (d.seq !== state.seq) { state.lastSeqChange = nowS; refreshSnapshot(); }
+        if (d.seq !== state.seq) { state.lastSeqChange = nowS; if (isProjectView()) refreshProject(); else refreshSnapshot(); }
         else updateStale(nowS);
       } catch (e) {}
       setLive(true);
@@ -242,6 +323,9 @@
   AdPage.api = api;
   AdPage.approvalList = approvalList;
   AdPage.loadNav = loadNav;
+  AdPage.resolveLanding = resolveLanding;
+  AdPage.loadProjectPlans = loadProjectPlans;
+  AdPage.refreshProject = refreshProject;
   AdPage.refreshFoot = refreshFoot;
   AdPage.warming = warming;
   AdPage.warmTabs = warmTabs;
@@ -258,6 +342,9 @@
   global.api = api;
   global.approvalList = approvalList;
   global.loadNav = loadNav;
+  global.resolveLanding = resolveLanding;
+  global.loadProjectPlans = loadProjectPlans;
+  global.refreshProject = refreshProject;
   global.refreshFoot = refreshFoot;
   global.warming = warming;
   global.warmTabs = warmTabs;

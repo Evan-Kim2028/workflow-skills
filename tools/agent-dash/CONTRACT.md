@@ -43,7 +43,10 @@ The one argv value ever kept is the worker's `--model` flag value, recorded on p
 | `static/cards/ws-cards.js` (Where we are, workstream cards, planSum cache) | Claude (parent) |
 | `static/cards/plan-progress.js` (plan progress map, task map, replay) | Claude (parent) |
 | `static/cards/needs.js` (needs-you/approvals card, currently unregistered) | Claude (parent) |
-| `static/cards/registry.js` (ordered card list: adding a card is one file plus one line) | Claude (parent) |
+| `static/cards/registry.js` (ordered card list: adding a card is one file plus one line; scopes `overview\|workstream\|both\|project\|planned`) | Claude (parent) |
+| `static/cards/project-home.js` + `project-home.css` (Project home `?view=project`: phases, tiles, Current, Planned shelf, Recently done, needs-you, chart slots) | Claude (parent) |
+| `static/cards/planned.js` + `planned.css` (Planned view `?view=planned`: start-readiness table, gated-but-live, roadmap slots) | Claude (parent) |
+| `static/cards/archive.js` + `archive.css` (Archive shelf `?view=archive`: frozen summary cards, lifetime totals, read-only plan banner style) | Claude (parent) |
 | `static/core/el.js` (DOM helpers, text/format glue, tooltip, copy button) | Claude (parent) |
 | `static/core/state.js` (page state, route read/write, tab filter/order plumbing) | Claude (parent) |
 | `static/core/api.js` (fetch and fixtures, SSE stream, refresh orchestration) | Claude (parent) |
@@ -343,6 +346,16 @@ renamed.
 ## Plan bundles
 
 Plan and Execution are one shell, `static/index.html`. `GET /` and `GET /plan` both serve that file. The page swaps the view in place (`?view=plan|exec&ws=<ID>`). `/static/index.html?ws=<ID>` still opens Execution. Project text stays out of the tool directory, under `AGENT_DASH_WORKSTREAMS` (default `~/.local/share/agent-dash/workstreams`). One directory per bundle id. A directory with `bundle.json` shows up on the plan view and, for `kind: workstream`, on `GET /api/plan`. When both a bundle and the plans map name a workstream, the bundle's `plan.json` wins (`resolve_plan`).
+
+## Project views
+
+Top-level views beside Plan | Execution: `?view=project` (Project home, the default landing when `GET /api/project` names the project or any workstream left the `active` state, else today's Overview), `?view=current` (alias of the `exec` view: today's execution), `?view=planned` (start-readiness), `?view=archive` (frozen summary cards). `?view=exec&ws=<ID>` and `?view=plan&ws=<ID>` are unchanged, including for archived ids (archived plan pages render read-only with an "Archived \<date\>" banner). The header nav pills (Project | Current | Planned | Archive, with counts on Planned and Archive) mark the active view; the Plan | Execution switch stays for a selected workstream.
+
+Tabs list workstreams in `active`, `paused`, or `done` state (absent reads as `active`); planned bundles appear in the Planned view, never as tabs; archived and dropped live on the Archive shelf. A paused tab carries a pause glyph plus word in its title. The All | Active | Completed filter keeps its identical completed rule over these tabs.
+
+The dashboard stays read-only: Archive/Restore buttons copy the exact CLI command (`python3 agent_dash.py ws archive <ID>`, `python3 agent_dash.py ws restore <ID>`) to the clipboard with a confirmation toast; they never write. Closing reports are basename-only on every payload; Report links open the plan view.
+
+Card registry scopes are `overview`, `workstream`, `both` (the exec tabs), plus `project` (Project home slots `exec-burnup`, `exec-feed`, `exec-health`, `exec-roadmap`, `exec-depgraph`) and `planned` (Planned slots `exec-roadmap`, `exec-depgraph`). A slotted entry mounts inside its named slot; an unslotted entry renders as its own section after the slots in registry order; the `needs` entry renders beside Recently done. A chart needed on both views adds one registry line per scope over the same spec function: still one file plus registry lines, no routing edits.
 
 ## One number, one truth
 

@@ -380,7 +380,14 @@ One file plus one registry line. Put the renderer in a new IIFE file under `stat
 {id: "needs", order: 45, scope: "both", spec: needsSpec}, // registry.js
 ```
 
-`scope` is `overview` (only on `ws=all`), `workstream` (only off it), or `both`. `spec` returns one `applySections` spec `[name, key, render, style]`, or null when the card does not apply. Keep the two-space `function name(` indent: `tests/test_page_rules.py` splits the logical script (core + cards in tag order + inline) on it. The `needs.js` card is the worked example: written, exported, and deliberately unregistered (registering it would add a visible card).
+`scope` is `overview` (only on `ws=all`), `workstream` (only off it), or `both`. Two more scopes mount on the project views: `project` (the Project home, `?view=project`) and `planned` (the Planned view, `?view=planned`). A project/planned entry with a `slot` naming one of the view's slot containers (`exec-burnup`, `exec-feed`, `exec-health`, `exec-roadmap`, `exec-depgraph` on the home; `exec-roadmap`, `exec-depgraph` on Planned) renders inside that slot; one without a `slot` renders as its own section after the slots, in registry order. A chart needed on both views adds one registry line per scope over the same spec function:
+
+```js
+{id: "burnup", order: 55, scope: "project", slot: "exec-burnup", spec: burnupSpec},
+{id: "burnup-plan", order: 55, scope: "planned", slot: "exec-roadmap", spec: burnupSpec},
+```
+
+`spec` returns one `applySections` spec `[name, key, render, style]`, or null when the card does not apply. Keep the two-space `function name(` indent: `tests/test_page_rules.py` splits the logical script (core + cards in tag order + inline) on it. The `needs.js` card is the worked example for the project scope: registered once (`scope: "project"`), rendered beside Recently done. New views obey `DESIGN.md`: status as colour plus symbol plus word, numbers through the `fmt` helpers only, hover tooltips, axes on charts (the shared `axes()` helper).
 
 ### Before you push
 

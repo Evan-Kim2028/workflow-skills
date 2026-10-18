@@ -299,11 +299,26 @@
 
   function fetchBundle(id) {
     if (FIX) {
-      return fetch("../fixtures/bundles/" + encodeURIComponent(id) + "/plan.json", {cache: "no-store"}).then(function (response) {
-        if (!response.ok) return null;
-        return response.json().then(function (plan) { return {plan: plan}; });
-      }).then(function (hit) {
+      var planP = fetch("../fixtures/bundles/" + encodeURIComponent(id) + "/plan.json", {cache: "no-store"}).then(function (response) {
+        if (response.ok) return response.json().then(function (plan) { return {plan: plan}; });
+        /* Planned and archived fixture bundles have no bundle directory:
+           fall back to the generated plan view (same groups and phases). */
+        return fetch("../fixtures/plan-" + encodeURIComponent(id) + ".json", {cache: "no-store"}).then(function (r2) {
+          if (!r2.ok) return null;
+          return r2.json().then(function (view) {
+            return {plan: {dag: {cols: view.cols || [], groups: view.groups || [], edges: view.edges || []}, narrative: {phases: view.phases || []}, trains: view.trains || []}};
+          });
+        });
+      }).catch(function () { return null; });
+      var metaP = fetch("../fixtures/bundles/" + encodeURIComponent(id) + "/bundle.json", {cache: "no-store"}).then(function (response) {
+        return response.ok ? response.json() : null;
+      }).catch(function () { return null; });
+      return Promise.all([planP, metaP]).then(function (parts) {
+        var hit = parts[0];
         if (!hit) return null;
+        /* Bundle meta travels beside the plan (never inside it) so the
+           trains section keeps reading the plan shape it always did. */
+        if (parts[1]) hit.bundleMeta = parts[1];
         return fetch("../fixtures/plan-" + encodeURIComponent(id) + ".json", {cache: "no-store"}).then(function (response) {
           return response.ok ? response.json() : null;
         }).then(function (view) {
@@ -353,11 +368,31 @@
     });
   }
 
+  /* Archived bundles stay reachable read-only at the same URL, with an
+     "Archived <date>" banner. The bundle payload already carries the
+     lifecycle fields, so no scope change on the fetch was needed. */
+  function archBanner(meta) {
+    if (!meta || meta.state !== "archived") return null;
+    var stamp = meta.archived_at;
+    var day = "an unknown date";
+    if (typeof stamp === "number" && isFinite(stamp)) {
+      var d = new Date(stamp * 1000);
+      var m = d.getUTCMonth() + 1, dday = d.getUTCDate();
+      day = d.getUTCFullYear() + "-" + (m < 10 ? "0" + m : m) + "-" + (dday < 10 ? "0" + dday : dday);
+    }
+    var b = document.createElement("div");
+    b.className = "arch-banner";
+    b.setAttribute("role", "note");
+    b.textContent = "\u25A0 Archived " + day + " — read-only";
+    return b;
+  }
   function paint(id, hit) {
     var main = document.getElementById("plan-body");
     if (!main || current !== id) return;
     if (hit.html) main.innerHTML = hit.html;
     else main.innerHTML = '<p class="sub">This bundle has no page yet.</p>';
+    var banner = archBanner((hit.bundle && hit.bundle.bundle) || hit.bundleMeta);
+    if (banner) main.insertBefore(banner, main.firstChild);
     if (String(id).toUpperCase() === "OVERVIEW" && window.DashProgram) {
       var top = document.createElement("section"); top.id = "ov-where"; top.className = "program-host"; top.style.margin = "4px 0 18px";
       main.insertBefore(top, main.firstChild); window.DashProgram.mount(top);

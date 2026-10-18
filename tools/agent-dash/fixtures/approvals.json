@@ -26,11 +26,41 @@
       "decided_at": "2026-04-02T15:04:00Z",
       "decided_by": "owner",
       "items": [
-        {"id": "route-list", "step": "Publish the route list", "status": "approved", "reversible": true, "conditions": "The contract is frozen."},
-        {"id": "client-contract", "step": "Freeze the client contract", "status": "approved", "reversible": true, "conditions": "Callers can read the new shape."},
-        {"id": "error-shape", "step": "Keep the old error shape", "status": "approved", "reversible": false, "conditions": "Existing clients parse this body."},
-        {"id": "read-route", "step": "Ship the read route", "status": "approved", "reversible": true, "conditions": "The sample set loads."},
-        {"id": "old-client", "step": "Retire the duplicate client", "status": "approved", "reversible": false, "conditions": "No caller still imports it."}
+        {
+          "id": "route-list",
+          "step": "Publish the route list",
+          "status": "approved",
+          "reversible": true,
+          "conditions": "The contract is frozen."
+        },
+        {
+          "id": "client-contract",
+          "step": "Freeze the client contract",
+          "status": "approved",
+          "reversible": true,
+          "conditions": "Callers can read the new shape."
+        },
+        {
+          "id": "error-shape",
+          "step": "Keep the old error shape",
+          "status": "approved",
+          "reversible": false,
+          "conditions": "Existing clients parse this body."
+        },
+        {
+          "id": "read-route",
+          "step": "Ship the read route",
+          "status": "approved",
+          "reversible": true,
+          "conditions": "The sample set loads."
+        },
+        {
+          "id": "old-client",
+          "step": "Retire the duplicate client",
+          "status": "approved",
+          "reversible": false,
+          "conditions": "No caller still imports it."
+        }
       ]
     },
     {
@@ -38,10 +68,64 @@
       "decided_at": "2026-04-02T15:10:00Z",
       "decided_by": "owner",
       "items": [
-        {"id": "checklist", "step": "Publish the launch checklist", "status": "approved", "reversible": true, "conditions": "The gate task is written down."},
-        {"id": "rollback", "step": "Keep the rollback note", "status": "approved", "reversible": true, "conditions": "The note names the previous route."},
-        {"id": "hold-note", "step": "Hold the launch note", "status": "denied", "reversible": false, "conditions": "The gate task is still open."}
+        {
+          "id": "checklist",
+          "step": "Publish the launch checklist",
+          "status": "approved",
+          "reversible": true,
+          "conditions": "The gate task is written down."
+        },
+        {
+          "id": "rollback",
+          "step": "Keep the rollback note",
+          "status": "approved",
+          "reversible": true,
+          "conditions": "The note names the previous route."
+        },
+        {
+          "id": "hold-note",
+          "step": "Hold the launch note",
+          "status": "denied",
+          "reversible": false,
+          "conditions": "The gate task is still open."
+        }
+      ]
+    },
+    {
+      "ws": "WS9",
+      "decided_at": null,
+      "decided_by": null,
+      "items": [
+        {
+          "id": "relay-go",
+          "step": "Start the relay once the cleanup batch lands",
+          "status": "pending",
+          "reversible": true,
+          "conditions": "The gate task is met."
+        },
+        {
+          "id": "relay-scope",
+          "step": "Freeze the relay scope",
+          "status": "pending",
+          "reversible": true,
+          "conditions": "The seeded batch is listed."
+        }
+      ]
+    },
+    {
+      "ws": "WS10",
+      "decided_at": null,
+      "decided_by": null,
+      "items": [
+        {
+          "id": "ledger-go",
+          "step": "Start the ledger once both signals confirm",
+          "status": "pending",
+          "reversible": false,
+          "conditions": "Both gate tasks are met."
+        }
       ]
     }
-  ]
+  ],
+  "_note": "Seeded synthetic data for the offline preview. Seed 1. No local sessions are read."
 }

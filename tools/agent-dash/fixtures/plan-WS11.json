@@ -1,0 +1,212 @@
+{
+  "ws": "WS11",
+  "cols": [
+    "Shape",
+    "Ship"
+  ],
+  "groups": [
+    {
+      "id": "shape",
+      "col": 0,
+      "title": "Shape",
+      "tasks": [
+        {
+          "id": "WS11.1",
+          "title": "Shape the export",
+          "status": "done"
+        },
+        {
+          "id": "WS11.2",
+          "title": "Freeze the export columns",
+          "status": "done"
+        }
+      ]
+    },
+    {
+      "id": "ship",
+      "col": 1,
+      "title": "Ship",
+      "tasks": [
+        {
+          "id": "WS11.3",
+          "title": "Ship the export",
+          "status": "done",
+          "deps": [
+            "WS11.1",
+            "WS11.2"
+          ]
+        }
+      ]
+    }
+  ],
+  "edges": [
+    [
+      "shape",
+      "ship"
+    ]
+  ],
+  "phases": [
+    {
+      "name": "Shape",
+      "goal": "The export columns freeze.",
+      "gate": "The seeded export loads."
+    },
+    {
+      "name": "Ship",
+      "goal": "The export ships.",
+      "gate": "The ship task is done."
+    }
+  ],
+  "trains": [],
+  "progress": {
+    "done": 3,
+    "total": 3,
+    "counts": {
+      "todo": 0,
+      "wip": 0,
+      "pr": 0,
+      "prog": 0,
+      "done": 3,
+      "deferred": 0
+    },
+    "pct": 100
+  },
+  "_note": "Seeded example plan for the fixture preview.",
+  "layout": {
+    "ws": "WS11",
+    "density": "comfortable",
+    "ultra": false,
+    "live_tasks": 3,
+    "deferred_tasks": 0,
+    "total_tasks": 3,
+    "task_edges": 2,
+    "group_edges": 1,
+    "columns": [
+      {
+        "index": 0,
+        "title": "Shape",
+        "state": "full",
+        "groups": [
+          "shape"
+        ],
+        "tasks": 2,
+        "live_tasks": 2,
+        "visible_chips": 2
+      },
+      {
+        "index": 1,
+        "title": "Ship",
+        "state": "full",
+        "groups": [
+          "ship"
+        ],
+        "tasks": 1,
+        "live_tasks": 1,
+        "visible_chips": 1
+      }
+    ],
+    "folded_rail": null,
+    "groups": [
+      {
+        "id": "shape",
+        "title": "Shape",
+        "col": 0,
+        "column": "Shape",
+        "state": "open",
+        "live_tasks": 2,
+        "deferred_tasks": 0,
+        "chips": [
+          {
+            "id": "WS11.1",
+            "label": "1",
+            "tooltip": "WS11.1 \u00b7 Shape the export \u00b7 done",
+            "status": "done",
+            "kind": "task",
+            "train": null,
+            "fan_in": 0
+          },
+          {
+            "id": "WS11.2",
+            "label": "2",
+            "tooltip": "WS11.2 \u00b7 Freeze the export columns \u00b7 done",
+            "status": "done",
+            "kind": "task",
+            "train": null,
+            "fan_in": 0
+          }
+        ],
+        "shown_done": 2,
+        "hidden_done": 0,
+        "hidden_done_ids": [],
+        "more_token": null,
+        "deferred_token": null
+      },
+      {
+        "id": "ship",
+        "title": "Ship",
+        "col": 1,
+        "column": "Ship",
+        "state": "open",
+        "live_tasks": 1,
+        "deferred_tasks": 0,
+        "chips": [
+          {
+            "id": "WS11.3",
+            "label": "3",
+            "tooltip": "WS11.3 \u00b7 Ship the export \u00b7 done \u00b7 waits on WS11.1, WS11.2",
+            "status": "done",
+            "kind": "task",
+            "train": null,
+            "fan_in": 0
+          }
+        ],
+        "shown_done": 1,
+        "hidden_done": 0,
+        "hidden_done_ids": [],
+        "more_token": null,
+        "deferred_token": null
+      }
+    ],
+    "labels": {
+      "shortened": 3,
+      "collisions": []
+    },
+    "arrows": {
+      "mode": "all",
+      "task_edges": 2,
+      "group_edges": 1,
+      "reason": "2 task deps: arrows all",
+      "fan_in": []
+    },
+    "trains": {
+      "tagged": [],
+      "untagged": [],
+      "caption": null,
+      "legend": [],
+      "more_trains": 0
+    },
+    "phases_line": "1 Shape  \u2192  2 Ship",
+    "balance": {
+      "tallest": {
+        "column": 0,
+        "title": "Shape",
+        "tasks": 2
+      },
+      "shortest": {
+        "column": 1,
+        "title": "Ship",
+        "tasks": 1
+      },
+      "ratio": 2.0
+    }
+  },
+  "map_warnings": [
+    {
+      "code": "MAP109",
+      "severity": "info",
+      "title": "1 of 2 groups hold a single task",
+      "detail": "1 single-task groups out of 2 (bar: half or more)",
+      "fix": "Merge 1-task groups into their stage group"
+    }
+  ]
+}

@@ -4,6 +4,9 @@
    always-visible key, and tokens/cost/live in the secondary line), the
    per-workstream cards on the overview, and owns the planSum/planPrompt
    caches plus the progressFor fallback the tab bar reads.
+   programPanel(onlyStates, bare): the optional state list keeps rows in
+   those lifecycle states; bare skips the outer card and head for embedding
+   (the Project home wraps it in its own section).
    window.DashProgram mounts the panel for embedding.
    Reads: state.wss, state.snap, state.plan; window.ADT.
    Exports (on window.AdPage.cards, also kept as plain globals):
@@ -60,16 +63,20 @@
   /* "Where we are": one two-line row per workstream. First line: id, name
      and the right-aligned %; the status pill sits under the name. The
      segmented bar carries the done-of-total value in its accessible label;
-     the secondary line names tokens, cost and live agents. */
-  function programPanel() {
-    var c = el("div", {class: "card program", "data-nav": "Where we are"});
-    c.appendChild(el("div", {class: "prog-h"}, [el("h2", {text: "Where we are"}), el("span", {class: "sub", text: "Plan progress per workstream \u00B7 deferred tasks leave every count"})]));
+     the secondary line names tokens, cost and live agents. The optional
+     onlyStates list keeps rows in those lifecycle states (the Project
+     home passes active/paused, Recently done passes done); without it
+     every row renders, as before. */
+  function programPanel(only, bare) {
+    var c = el("div", {class: bare ? "program bare" : "card program", "data-nav": "Where we are"});
+    if (!bare) c.appendChild(el("div", {class: "prog-h"}, [el("h2", {text: "Where we are"}), el("span", {class: "sub", text: "Plan progress per workstream \u00B7 deferred tasks leave every count"})]));
     var key = el("div", {class: "prog-legend", role: "note", "aria-label": "Progress bar key"});
     [["sw-done", "Done"], ["sw-pr", "To merge"], ["sw-prog", "On prod"], ["sw-wip", "Working"]].forEach(function (k) {
       key.appendChild(el("span", {class: "prog-key"}, [el("i", {class: "sw " + k[0]}), document.createTextNode(k[1])]));
     });
     c.appendChild(key);
     var rows = (state.wss || []).slice().sort(function (x, y) { return wsNum(x) - wsNum(y); });
+    if (only) rows = rows.filter(function (w) { return only.indexOf(ADT.wsStateOf(w)) >= 0; });
     var all = {done: 0, tot: 0, live: 0};
     rows.forEach(function (w) { all.live += w.live_agents || 0; });
     rows.forEach(function (w) {
@@ -77,8 +84,10 @@
       var pc = pr ? pr.counts : {}, tot = pr ? pr.total : 0, pct = pr ? pr.pct : 0, done = pr ? pr.done : 0;
       if (pr) { all.done += done; all.tot += tot; }
       /* Status is colour plus symbol plus word, never colour alone. The
-         shared completed rule (server progress object) decides Done. */
-      var st = !pr ? ["none", "No plan"] : ADT.isCompleted(pr) ? ["done", "\u2713 Done"] : (done + (pc.wip || 0) + (pc.prog || 0) + (pc.pr || 0) || w.live_agents) ? ["active", "\u25CF In progress"] : ["todo", "\u25CB Not started"];
+         shared completed rule (server progress object) decides Done; a
+         paused workstream keeps its muted pill with glyph plus word even
+         before its plan loads. */
+      var st = ADT.isCompleted(pr) ? ["done", "\u2713 Done"] : ADT.wsStateOf(w) === "paused" ? ["paused", "\u23F8 Paused"] : !pr ? ["none", "No plan"] : (done + (pc.wip || 0) + (pc.prog || 0) + (pc.pr || 0) || w.live_agents) ? ["active", "\u25CF In progress"] : ["todo", "\u25CB Not started"];
       var use = wsUsage(w.ws);
       var tok = use ? use.tokens : w.tokens, cost = use ? use.cost_usd : w.cost_usd;
       var row = el("div", {class: "prog-row s-" + st[0]});
@@ -165,6 +174,7 @@
     var byWs = {};
     ((state.snap && state.snap.by_workstream) || []).forEach(function (r) { byWs[r.ws] = r; });
     shown(state.wss).forEach(function (w) {
+      if (!ADT.isTabState(ADT.wsStateOf(w))) return;
       var hit = byWs[w.ws];
       c.appendChild(wsCard(w.ws, w.name, w.live_agents, hit ? hit.tokens : w.tokens, hit ? hit.cost_usd : w.cost_usd, planSum[w.ws], true));
     });

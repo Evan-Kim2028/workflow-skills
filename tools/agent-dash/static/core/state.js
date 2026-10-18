@@ -4,11 +4,14 @@
    isClipMode, isClipVertical (clip query flags); wsNum, shown
    (workstream-list helpers); canonWs, readRoute, planIdFor, queryWs,
    pushRoute, applyChrome, scrollHash (route read/write and shell chrome);
-   selectTab, selectView, showCurrent, openPlan, openApprovals (view
-   switching); tabFilter, tabDrag, tabDragPending, tabClickGuard,
+   isProjectView, projectLanding (project-view helpers); selectTab,
+   selectView, showCurrent, openPlan, openApprovals (view switching);
+   tabFilter, tabDrag, tabDragPending, tabClickGuard,
    currentOrder, onTabDragStart, onTabDragOver, finishTabDrag, onTabDragEnd,
-   onTabKey, filterCtl, renderTabs (the All | Active | Completed filter and
-   drag order, remembered per viewer); planUrl, go, since, wsParam.
+   onTabKey, filterCtl, renderTabs, viewCounts, updateViewNav (the All |
+   Active | Completed filter and drag order, remembered per viewer, plus
+   the Project | Current | Planned | Archive nav pills); planUrl, go,
+   since, wsParam.
    Needs: window.ADT (static/tabs.js), window.ADC (static/tokencache.js), the
    globals the exec cache and refresh files keep (execCache helpers, api),
    and progressFor + drawMain, which stay in the page script and are read as
@@ -20,7 +23,21 @@
   function isClipMode() { return Q.has("clip"); }
   function isClipVertical() { var v = (Q.get("clip") || "").toLowerCase(); return v === "4x5" || v === "v" || v === "vertical"; }
   var WINDOW_HOURS = 24;
-  var state = {view: "exec", ws: "all", snap: null, runs: [], usage: [], conc: [], wss: [], bundles: [], plan: null, seq: -1, groupBy: "model", approvals: [], snapError: null, lastSeqChange: 0, lastPoll: null, lastDataTs: null};
+  var state = {view: "exec", ws: "all", snap: null, runs: [], usage: [], conc: [], wss: [], wssAll: [], bundles: [], plan: null, plans: {}, project: null, archive: null, landed: false, seq: -1, groupBy: "model", approvals: [], snapError: null, lastSeqChange: 0, lastPoll: null, lastDataTs: null};
+  var VIEWS = ["plan", "exec", "project", "planned", "archive"];
+  /* Project views (Project home, Planned, Archive) render from the same
+     all-scope data beside the exec tabs; "current" is the exec alias. */
+  function isProjectView() { return state.view === "project" || state.view === "planned" || state.view === "archive"; }
+  /* Default landing: Project home when /api/project names the project or
+     any workstream has left the active state; otherwise today's Overview. */
+  function projectLanding(project, rows) {
+    if (project && project.name) return "project";
+    var list = rows || [];
+    for (var i = 0; i < list.length; i++) {
+      if (ADT.wsStateOf(list[i]) !== "active") return "project";
+    }
+    return "exec";
+  }
   function wsNum(w) { var m = /(\d+)/.exec(w.ws || ""); return m ? +m[1] : 999; }
   function shown(list) { return list.filter(function (w) { return w.plan; }).sort(function (x, y) { return wsNum(x) - wsNum(y); }); }
   function canonWs(ws) {
@@ -31,8 +48,9 @@
   function readRoute() {
     var q = new URLSearchParams(location.search);
     var view = q.get("view");
+    if (view === "current") view = "exec";
     var path = location.pathname;
-    if (view !== "plan" && view !== "exec") view = (path === "/plan" || /plan\.html$/.test(path)) ? "plan" : "exec";
+    if (VIEWS.indexOf(view) < 0) view = (path === "/plan" || /plan\.html$/.test(path)) ? "plan" : "exec";
     return {view: view, ws: canonWs(q.get("ws") || "")};
   }
   function planIdFor(ws) {
@@ -64,8 +82,13 @@
     document.getElementById("plan-view").hidden = !plan;
     document.getElementById("view-plan").setAttribute("aria-pressed", plan ? "true" : "false");
     document.getElementById("view-exec").setAttribute("aria-pressed", plan ? "false" : "true");
-    document.getElementById("title").textContent = "Agent dashboard";
-    document.title = (plan ? "Plan" : "Execution") + " \u00B7 Agent dashboard";
+    /* The header names the project once /api/project answers; without a
+       project.json it falls back to Agent dashboard. */
+    var proj = (state.project && state.project.name) || "Agent dashboard";
+    document.getElementById("title").textContent = proj;
+    var names = {plan: "Plan", exec: "Execution", project: "Project", planned: "Planned", archive: "Archive"};
+    document.title = (names[state.view] || "Execution") + " \u00B7 " + proj;
+    updateViewNav();
   }
   function scrollHash() {
     if (!location.hash) return;
@@ -77,6 +100,11 @@
     window.__adReplayOn = false;
     applyChrome();
     renderTabs();
+    if (isProjectView()) {
+      showLoading();
+      refreshProject();
+      return;
+    }
     if (state.view === "exec") {
       var hit = getCache();
       if (hit) {
@@ -100,6 +128,7 @@
     showCurrent();
   }
   function selectView(view) {
+    if (VIEWS.indexOf(view) < 0) return;
     if (state.view === view) return;
     state.view = view;
     pushRoute();
@@ -117,21 +146,34 @@
     pushRoute(String(planIdFor(state.ws)).toLowerCase() + "-approvals");
     showCurrent();
   }
+  /* Tabs list the workstreams that keep one: active, paused, or done
+     (planned bundles appear in the Planned view, never as tabs; archived
+     and dropped live on the Archive shelf). The All | Active | Completed
+     filter keeps working over these rows with its identical completed
+     rule. */
   function tabRows() {
     var seen = {}, rows = [];
+    var byId = {};
+    /* State lookups read the all-states list first: a bundle whose row
+       left the default scope (archived, dropped) still resolves to its
+       real state here instead of the active default. */
+    (state.wssAll || []).forEach(function (w) { byId[String(w.ws).toUpperCase()] = w; });
+    (state.wss || []).forEach(function (w) { byId[String(w.ws).toUpperCase()] = w; });
     shown(state.wss || []).forEach(function (w) {
       var key = String(w.ws).toUpperCase();
       if (seen[key]) return;
       seen[key] = 1;
-      rows.push({ws: w.ws, name: w.ws + (w.name ? " " + w.name : ""), running: w.live_agents, progress: progressFor(w.ws)});
+      rows.push({ws: w.ws, name: w.ws + (w.name ? " " + w.name : ""), running: w.live_agents, progress: progressFor(w.ws), state: ADT.wsStateOf(w)});
     });
     (state.bundles || []).forEach(function (b) {
       if (!b || b.kind === "program" || b.id === "OVERVIEW") return;
       var key = String(b.id).toUpperCase();
       if (seen[key]) return;
       seen[key] = 1;
-      rows.push({ws: b.id, name: b.id + (b.title ? " " + b.title : ""), running: 0, progress: progressFor(b.id)});
+      var hit = byId[key];
+      rows.push({ws: b.id, name: b.id + (b.title ? " " + b.title : ""), running: 0, progress: progressFor(b.id), state: ADT.wsStateOf(hit)});
     });
+    rows = rows.filter(function (r) { return ADT.isTabState(r.state); });
     rows.sort(function (a, b) { return wsNum(a) - wsNum(b); });
     return [{ws: "all", name: state.view === "plan" ? "Overview" : "Overall", progress: null}].concat(rows);
   }
@@ -214,11 +256,13 @@
       var titles = [];
       if (w.muted) titles.push("Shown although the filter hides it: this tab is selected.");
       if (!overview && ADT.isCompleted(w.progress)) titles.push(ADT.completeTitle(w.progress));
+      if (!overview && (w.state || "active") === "paused") titles.push("\u23F8 Paused: " + w.name);
       var attrs = {class: "tab" + (w.muted ? " muted" : ""), role: "tab", "data-ws": w.ws, "aria-selected": String(state.ws === w.ws), onclick: function () { if (Date.now() < tabClickGuard) return; selectTab(w.ws); }};
       if (titles.length) attrs.title = titles.join(" ");
       var b = el("button", attrs, [w.name]);
       if (w.running) b.appendChild(el("span", {class: "c", text: w.running + " live"}));
       if (!overview && ADT.isCompleted(w.progress)) b.appendChild(el("span", {class: "tick", text: "\u2713"}));
+      if (!overview && (w.state || "active") === "paused") b.appendChild(el("span", {class: "tick pause", text: "\u23F8", title: "\u23F8 Paused"}));
       if (!overview) {
         b.setAttribute("draggable", "true");
         b.addEventListener("dragstart", function (ev) { onTabDragStart(ev, w.ws); });
@@ -232,6 +276,37 @@
     });
     if (!nWs) t.appendChild(el("span", {class: "tabs-empty", text: tabFilter === "completed" ? "No completed workstreams" : tabFilter === "active" ? "No active workstreams" : "No workstreams"}));
     t.appendChild(filterCtl(counts));
+    updateViewNav();
+  }
+  /* Header nav pills (Project | Current | Planned | Archive) beside the
+     Plan | Execution switch. Planned and Archive carry their counts from
+     the all-states workstream list; the active pill marks the view. */
+  function viewCounts() {
+    var rows = (state.wssAll && state.wssAll.length ? state.wssAll : state.wss) || [];
+    var planned = 0, archive = 0;
+    rows.forEach(function (w) {
+      var st = ADT.wsStateOf(w);
+      if (st === "planned") planned++;
+      else if (st === "archived" || st === "dropped") archive++;
+    });
+    if ((!state.wssAll || !state.wssAll.length) && state.archive && state.archive.totals) {
+      var n = +(state.archive.totals.workstreams || 0);
+      if (n > archive) archive = n;
+    }
+    return {planned: planned, archive: archive};
+  }
+  function updateViewNav() {
+    var nav = document.getElementById("view-nav");
+    if (!nav) return;
+    var counts = viewCounts();
+    var defs = [["project", "Project", null], ["exec", "Current", null], ["planned", "Planned", counts.planned], ["archive", "Archive", counts.archive]];
+    nav.innerHTML = "";
+    defs.forEach(function (d) {
+      var label = d[1] + (d[2] == null ? "" : " " + fmtN(d[2]));
+      var attrs = {type: "button", "data-view": d[0], title: d[1] + " view", onclick: function () { selectView(d[0]); }};
+      if (state.view === d[0]) attrs["aria-current"] = "page";
+      nav.appendChild(el("button", attrs, [label]));
+    });
   }
   function planUrl(ws) {
     var id = canonWs(ws);
@@ -248,6 +323,8 @@
   AdPage.state = state;
   AdPage.isClipMode = isClipMode;
   AdPage.isClipVertical = isClipVertical;
+  AdPage.isProjectView = isProjectView;
+  AdPage.projectLanding = projectLanding;
   AdPage.wsNum = wsNum;
   AdPage.shown = shown;
   AdPage.canonWs = canonWs;
@@ -275,6 +352,8 @@
   AdPage.onTabKey = onTabKey;
   AdPage.filterCtl = filterCtl;
   AdPage.renderTabs = renderTabs;
+  AdPage.viewCounts = viewCounts;
+  AdPage.updateViewNav = updateViewNav;
   AdPage.planUrl = planUrl;
   AdPage.go = go;
   AdPage.since = since;
@@ -283,6 +362,8 @@
   global.state = state;
   global.isClipMode = isClipMode;
   global.isClipVertical = isClipVertical;
+  global.isProjectView = isProjectView;
+  global.projectLanding = projectLanding;
   global.wsNum = wsNum;
   global.shown = shown;
   global.canonWs = canonWs;
@@ -310,6 +391,8 @@
   global.onTabKey = onTabKey;
   global.filterCtl = filterCtl;
   global.renderTabs = renderTabs;
+  global.viewCounts = viewCounts;
+  global.updateViewNav = updateViewNav;
   global.planUrl = planUrl;
   global.go = go;
   global.since = since;

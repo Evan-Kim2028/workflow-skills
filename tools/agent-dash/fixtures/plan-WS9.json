@@ -1,0 +1,221 @@
+{
+  "ws": "WS9",
+  "cols": [
+    "Wait",
+    "Relay"
+  ],
+  "groups": [
+    {
+      "id": "wait",
+      "col": 0,
+      "title": "Wait",
+      "tasks": [
+        {
+          "id": "WS9.G1",
+          "title": "Cleanup batch is merged",
+          "status": "todo",
+          "kind": "gate",
+          "signal": "WS6 cutover batch is merged",
+          "confirmed_at": "2025-10-22T12:00:00Z",
+          "fresh_hours": 24
+        }
+      ]
+    },
+    {
+      "id": "relay",
+      "col": 1,
+      "title": "Relay",
+      "tasks": [
+        {
+          "id": "WS9.1",
+          "title": "Relay the seeded batch",
+          "status": "todo",
+          "deps": [
+            "WS9.G1"
+          ],
+          "dep_notes": {
+            "WS9.G1": "run only after the cleanup batch lands"
+          }
+        },
+        {
+          "id": "WS9.2",
+          "title": "Prove the relay",
+          "status": "todo",
+          "deps": [
+            "WS9.1"
+          ]
+        }
+      ]
+    }
+  ],
+  "edges": [
+    [
+      "wait",
+      "relay"
+    ]
+  ],
+  "phases": [
+    {
+      "name": "Wait",
+      "goal": "The cleanup batch lands.",
+      "gate": "The gate task is met."
+    },
+    {
+      "name": "Relay",
+      "goal": "The seeded batch relays.",
+      "gate": "The prove task is done."
+    }
+  ],
+  "trains": [],
+  "progress": {
+    "done": 0,
+    "total": 3,
+    "counts": {
+      "todo": 3,
+      "wip": 0,
+      "pr": 0,
+      "prog": 0,
+      "done": 0,
+      "deferred": 0
+    },
+    "pct": 0
+  },
+  "_note": "Seeded example plan for the fixture preview.",
+  "layout": {
+    "ws": "WS9",
+    "density": "comfortable",
+    "ultra": false,
+    "live_tasks": 3,
+    "deferred_tasks": 0,
+    "total_tasks": 3,
+    "task_edges": 2,
+    "group_edges": 1,
+    "columns": [
+      {
+        "index": 0,
+        "title": "Wait",
+        "state": "full",
+        "groups": [
+          "wait"
+        ],
+        "tasks": 1,
+        "live_tasks": 1,
+        "visible_chips": 1
+      },
+      {
+        "index": 1,
+        "title": "Relay",
+        "state": "full",
+        "groups": [
+          "relay"
+        ],
+        "tasks": 2,
+        "live_tasks": 2,
+        "visible_chips": 2
+      }
+    ],
+    "folded_rail": null,
+    "groups": [
+      {
+        "id": "wait",
+        "title": "Wait",
+        "col": 0,
+        "column": "Wait",
+        "state": "open",
+        "live_tasks": 1,
+        "deferred_tasks": 0,
+        "chips": [
+          {
+            "id": "WS9.G1",
+            "label": "G1",
+            "tooltip": "WS9.G1 \u00b7 Cleanup batch is merged \u00b7 todo \u00b7 gate",
+            "status": "todo",
+            "kind": "gate",
+            "train": null,
+            "fan_in": 0
+          }
+        ],
+        "shown_done": 0,
+        "hidden_done": 0,
+        "hidden_done_ids": [],
+        "more_token": null,
+        "deferred_token": null
+      },
+      {
+        "id": "relay",
+        "title": "Relay",
+        "col": 1,
+        "column": "Relay",
+        "state": "open",
+        "live_tasks": 2,
+        "deferred_tasks": 0,
+        "chips": [
+          {
+            "id": "WS9.1",
+            "label": "1",
+            "tooltip": "WS9.1 \u00b7 Relay the seeded batch \u00b7 todo \u00b7 waits on WS9.G1: run only after the cleanup batch lands",
+            "status": "todo",
+            "kind": "task",
+            "train": null,
+            "fan_in": 0
+          },
+          {
+            "id": "WS9.2",
+            "label": "2",
+            "tooltip": "WS9.2 \u00b7 Prove the relay \u00b7 todo \u00b7 waits on WS9.1",
+            "status": "todo",
+            "kind": "task",
+            "train": null,
+            "fan_in": 0
+          }
+        ],
+        "shown_done": 0,
+        "hidden_done": 0,
+        "hidden_done_ids": [],
+        "more_token": null,
+        "deferred_token": null
+      }
+    ],
+    "labels": {
+      "shortened": 3,
+      "collisions": []
+    },
+    "arrows": {
+      "mode": "all",
+      "task_edges": 2,
+      "group_edges": 1,
+      "reason": "2 task deps: arrows all",
+      "fan_in": []
+    },
+    "trains": {
+      "tagged": [],
+      "untagged": [],
+      "caption": null,
+      "legend": [],
+      "more_trains": 0
+    },
+    "phases_line": "1 Wait  \u2192  2 Relay",
+    "balance": {
+      "tallest": {
+        "column": 1,
+        "title": "Relay",
+        "tasks": 2
+      },
+      "shortest": {
+        "column": 0,
+        "title": "Wait",
+        "tasks": 1
+      },
+      "ratio": 2.0
+    }
+  },
+  "map_warnings": [
+    {
+      "code": "MAP109",
+      "severity": "info",
+      "title": "1 of 2 groups hold a single task",
+      "detail": "1 single-task groups out of 2 (bar: half or more)",
+      "fix": "Merge 1-task groups into their stage group"
+    }
+  ]
+}

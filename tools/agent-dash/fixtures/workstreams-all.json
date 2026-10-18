@@ -1,0 +1,406 @@
+{
+  "workstreams": [
+    {
+      "ws": "WS0",
+      "name": "Stabilize",
+      "tk": {
+        "backlog": 3,
+        "todo": 1,
+        "doing": 0,
+        "review": 0,
+        "done": 2,
+        "cancelled": 0
+      },
+      "state": "active",
+      "state_changed_at": null,
+      "archived_at": null,
+      "depends_on": [],
+      "milestone": null,
+      "progress": null,
+      "live_agents": 0,
+      "finished_in_range": 0,
+      "finished_today": 0,
+      "tokens": 0,
+      "cost_usd": 0,
+      "tokens_all_time": 0,
+      "cost_usd_all_time": 0,
+      "last_activity": null,
+      "plan": false
+    },
+    {
+      "ws": "WS1",
+      "name": "Identity",
+      "tk": {
+        "backlog": 2,
+        "todo": 1,
+        "doing": 1,
+        "review": 0,
+        "done": 4,
+        "cancelled": 0
+      },
+      "state": "active",
+      "state_changed_at": null,
+      "archived_at": null,
+      "depends_on": [],
+      "milestone": null,
+      "progress": {
+        "done": 2,
+        "total": 5,
+        "counts": {
+          "todo": 1,
+          "wip": 1,
+          "pr": 1,
+          "prog": 0,
+          "done": 2,
+          "deferred": 0
+        },
+        "pct": 40
+      },
+      "live_agents": 2,
+      "finished_in_range": 36,
+      "finished_today": 36,
+      "tokens": 436889,
+      "cost_usd": 2.0176,
+      "tokens_all_time": 436889,
+      "cost_usd_all_time": 2.0176,
+      "last_activity": 1761999840,
+      "plan": true
+    },
+    {
+      "ws": "WS2",
+      "name": "Public API",
+      "tk": {
+        "backlog": 2,
+        "todo": 0,
+        "doing": 1,
+        "review": 1,
+        "done": 3,
+        "cancelled": 0
+      },
+      "state": "done",
+      "state_changed_at": 1761740760,
+      "archived_at": null,
+      "depends_on": [],
+      "milestone": null,
+      "progress": {
+        "done": 5,
+        "total": 5,
+        "counts": {
+          "todo": 0,
+          "wip": 0,
+          "pr": 0,
+          "prog": 0,
+          "done": 5,
+          "deferred": 0
+        },
+        "pct": 100
+      },
+      "live_agents": 2,
+      "finished_in_range": 38,
+      "finished_today": 38,
+      "tokens": 360883,
+      "cost_usd": 0.4083,
+      "tokens_all_time": 360883,
+      "cost_usd_all_time": 0.4083,
+      "last_activity": 1761999840,
+      "plan": true
+    },
+    {
+      "ws": "WS3",
+      "name": "Gateway",
+      "tk": {
+        "backlog": 1,
+        "todo": 0,
+        "doing": 0,
+        "review": 0,
+        "done": 1,
+        "cancelled": 0
+      },
+      "state": "active",
+      "state_changed_at": null,
+      "archived_at": null,
+      "depends_on": [],
+      "milestone": null,
+      "progress": null,
+      "live_agents": 0,
+      "finished_in_range": 0,
+      "finished_today": 0,
+      "tokens": 0,
+      "cost_usd": 0,
+      "tokens_all_time": 0,
+      "cost_usd_all_time": 0,
+      "last_activity": null,
+      "plan": false
+    },
+    {
+      "ws": "WS4",
+      "name": "Offers",
+      "tk": {
+        "backlog": 1,
+        "todo": 1,
+        "doing": 0,
+        "review": 0,
+        "done": 1,
+        "cancelled": 0
+      },
+      "state": "active",
+      "state_changed_at": null,
+      "archived_at": null,
+      "depends_on": [],
+      "milestone": null,
+      "progress": null,
+      "live_agents": 0,
+      "finished_in_range": 0,
+      "finished_today": 0,
+      "tokens": 0,
+      "cost_usd": 0,
+      "tokens_all_time": 0,
+      "cost_usd_all_time": 0,
+      "last_activity": null,
+      "plan": false
+    },
+    {
+      "ws": "WS5",
+      "name": "Clients",
+      "tk": {
+        "backlog": 1,
+        "todo": 0,
+        "doing": 0,
+        "review": 0,
+        "done": 2,
+        "cancelled": 0
+      },
+      "state": "paused",
+      "state_changed_at": 1761740760,
+      "archived_at": null,
+      "depends_on": [],
+      "milestone": null,
+      "progress": null,
+      "live_agents": 0,
+      "finished_in_range": 0,
+      "finished_today": 0,
+      "tokens": 0,
+      "cost_usd": 0,
+      "tokens_all_time": 0,
+      "cost_usd_all_time": 0,
+      "last_activity": null,
+      "plan": false
+    },
+    {
+      "ws": "WS6",
+      "name": "Cleanup",
+      "tk": {
+        "backlog": 2,
+        "todo": 0,
+        "doing": 0,
+        "review": 0,
+        "done": 0,
+        "cancelled": 1
+      },
+      "state": "active",
+      "state_changed_at": null,
+      "archived_at": null,
+      "depends_on": [],
+      "milestone": null,
+      "progress": null,
+      "live_agents": 0,
+      "finished_in_range": 0,
+      "finished_today": 0,
+      "tokens": 0,
+      "cost_usd": 0,
+      "tokens_all_time": 0,
+      "cost_usd_all_time": 0,
+      "last_activity": null,
+      "plan": false
+    },
+    {
+      "ws": "WS7",
+      "name": "Launch",
+      "tk": {
+        "backlog": 1,
+        "todo": 0,
+        "doing": 1,
+        "review": 0,
+        "done": 2,
+        "cancelled": 0
+      },
+      "state": "active",
+      "state_changed_at": null,
+      "archived_at": null,
+      "depends_on": [],
+      "milestone": null,
+      "progress": {
+        "done": 1,
+        "total": 5,
+        "counts": {
+          "todo": 2,
+          "wip": 0,
+          "pr": 1,
+          "prog": 1,
+          "done": 1,
+          "deferred": 0
+        },
+        "pct": 20
+      },
+      "live_agents": 3,
+      "finished_in_range": 33,
+      "finished_today": 33,
+      "tokens": 317741,
+      "cost_usd": 0.4934,
+      "tokens_all_time": 317741,
+      "cost_usd_all_time": 0.4934,
+      "last_activity": 1761999840,
+      "plan": true
+    },
+    {
+      "ws": "WS9",
+      "name": "Relay",
+      "tk": {
+        "backlog": 1,
+        "todo": 2,
+        "doing": 0,
+        "review": 0,
+        "done": 0,
+        "cancelled": 0
+      },
+      "state": "planned",
+      "state_changed_at": 1761740760,
+      "archived_at": null,
+      "depends_on": [
+        "WS6"
+      ],
+      "milestone": "Second wave",
+      "progress": {
+        "done": 0,
+        "total": 3,
+        "counts": {
+          "todo": 3,
+          "wip": 0,
+          "pr": 0,
+          "prog": 0,
+          "done": 0,
+          "deferred": 0
+        },
+        "pct": 0
+      },
+      "live_agents": 0,
+      "finished_in_range": 0,
+      "finished_today": 0,
+      "tokens": 0,
+      "cost_usd": 0,
+      "tokens_all_time": 0,
+      "cost_usd_all_time": 0,
+      "last_activity": null,
+      "plan": true
+    },
+    {
+      "ws": "WS10",
+      "name": "Ledger",
+      "tk": {
+        "backlog": 1,
+        "todo": 1,
+        "doing": 0,
+        "review": 0,
+        "done": 0,
+        "cancelled": 0
+      },
+      "state": "planned",
+      "state_changed_at": 1761740760,
+      "archived_at": null,
+      "depends_on": [
+        "WS8",
+        "WS9"
+      ],
+      "milestone": "Second wave",
+      "progress": {
+        "done": 0,
+        "total": 3,
+        "counts": {
+          "todo": 3,
+          "wip": 0,
+          "pr": 0,
+          "prog": 0,
+          "done": 0,
+          "deferred": 0
+        },
+        "pct": 0
+      },
+      "live_agents": 0,
+      "finished_in_range": 0,
+      "finished_today": 0,
+      "tokens": 0,
+      "cost_usd": 0,
+      "tokens_all_time": 0,
+      "cost_usd_all_time": 0,
+      "last_activity": null,
+      "plan": true
+    },
+    {
+      "ws": "WS11",
+      "name": "Export",
+      "tk": {
+        "backlog": 0,
+        "todo": 0,
+        "doing": 0,
+        "review": 0,
+        "done": 1,
+        "cancelled": 0
+      },
+      "state": "archived",
+      "state_changed_at": 1761740760,
+      "archived_at": 1761827160,
+      "depends_on": [],
+      "milestone": "First wave",
+      "progress": {
+        "done": 3,
+        "total": 3,
+        "counts": {
+          "todo": 0,
+          "wip": 0,
+          "pr": 0,
+          "prog": 0,
+          "done": 3,
+          "deferred": 0
+        },
+        "pct": 100
+      },
+      "live_agents": 0,
+      "finished_in_range": 0,
+      "finished_today": 0,
+      "tokens": 0,
+      "cost_usd": 0,
+      "tokens_all_time": 0,
+      "cost_usd_all_time": 0,
+      "last_activity": null,
+      "plan": true
+    },
+    {
+      "ws": "WS12",
+      "name": "Sunset",
+      "tk": {
+        "backlog": 1,
+        "todo": 1,
+        "doing": 0,
+        "review": 0,
+        "done": 0,
+        "cancelled": 0
+      },
+      "state": "dropped",
+      "state_changed_at": 1761740760,
+      "archived_at": null,
+      "depends_on": [],
+      "milestone": null,
+      "progress": null,
+      "live_agents": 0,
+      "finished_in_range": 0,
+      "finished_today": 0,
+      "tokens": 0,
+      "cost_usd": 0,
+      "tokens_all_time": 0,
+      "cost_usd_all_time": 0,
+      "last_activity": null,
+      "plan": false
+    }
+  ],
+  "_note": "Seeded synthetic data for the offline preview. Seed 1. No local sessions are read."
+}

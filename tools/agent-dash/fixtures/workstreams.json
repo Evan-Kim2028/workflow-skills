@@ -11,6 +11,11 @@
         "done": 2,
         "cancelled": 0
       },
+      "state": "active",
+      "state_changed_at": null,
+      "archived_at": null,
+      "depends_on": [],
+      "milestone": null,
       "progress": null,
       "live_agents": 0,
       "finished_in_range": 0,
@@ -33,6 +38,11 @@
         "done": 4,
         "cancelled": 0
       },
+      "state": "active",
+      "state_changed_at": null,
+      "archived_at": null,
+      "depends_on": [],
+      "milestone": null,
       "progress": {
         "done": 2,
         "total": 5,
@@ -67,6 +77,11 @@
         "done": 3,
         "cancelled": 0
       },
+      "state": "done",
+      "state_changed_at": 1761740760,
+      "archived_at": null,
+      "depends_on": [],
+      "milestone": null,
       "progress": {
         "done": 5,
         "total": 5,
@@ -101,6 +116,11 @@
         "done": 1,
         "cancelled": 0
       },
+      "state": "active",
+      "state_changed_at": null,
+      "archived_at": null,
+      "depends_on": [],
+      "milestone": null,
       "progress": null,
       "live_agents": 0,
       "finished_in_range": 0,
@@ -123,6 +143,11 @@
         "done": 1,
         "cancelled": 0
       },
+      "state": "active",
+      "state_changed_at": null,
+      "archived_at": null,
+      "depends_on": [],
+      "milestone": null,
       "progress": null,
       "live_agents": 0,
       "finished_in_range": 0,
@@ -145,6 +170,11 @@
         "done": 2,
         "cancelled": 0
       },
+      "state": "paused",
+      "state_changed_at": 1761740760,
+      "archived_at": null,
+      "depends_on": [],
+      "milestone": null,
       "progress": null,
       "live_agents": 0,
       "finished_in_range": 0,
@@ -167,6 +197,11 @@
         "done": 0,
         "cancelled": 1
       },
+      "state": "active",
+      "state_changed_at": null,
+      "archived_at": null,
+      "depends_on": [],
+      "milestone": null,
       "progress": null,
       "live_agents": 0,
       "finished_in_range": 0,
@@ -189,6 +224,11 @@
         "done": 2,
         "cancelled": 0
       },
+      "state": "active",
+      "state_changed_at": null,
+      "archived_at": null,
+      "depends_on": [],
+      "milestone": null,
       "progress": {
         "done": 1,
         "total": 5,
@@ -210,6 +250,89 @@
       "tokens_all_time": 317741,
       "cost_usd_all_time": 0.4934,
       "last_activity": 1761999840,
+      "plan": true
+    },
+    {
+      "ws": "WS9",
+      "name": "Relay",
+      "tk": {
+        "backlog": 1,
+        "todo": 2,
+        "doing": 0,
+        "review": 0,
+        "done": 0,
+        "cancelled": 0
+      },
+      "state": "planned",
+      "state_changed_at": 1761740760,
+      "archived_at": null,
+      "depends_on": [
+        "WS6"
+      ],
+      "milestone": "Second wave",
+      "progress": {
+        "done": 0,
+        "total": 3,
+        "counts": {
+          "todo": 3,
+          "wip": 0,
+          "pr": 0,
+          "prog": 0,
+          "done": 0,
+          "deferred": 0
+        },
+        "pct": 0
+      },
+      "live_agents": 0,
+      "finished_in_range": 0,
+      "finished_today": 0,
+      "tokens": 0,
+      "cost_usd": 0,
+      "tokens_all_time": 0,
+      "cost_usd_all_time": 0,
+      "last_activity": null,
+      "plan": true
+    },
+    {
+      "ws": "WS10",
+      "name": "Ledger",
+      "tk": {
+        "backlog": 1,
+        "todo": 1,
+        "doing": 0,
+        "review": 0,
+        "done": 0,
+        "cancelled": 0
+      },
+      "state": "planned",
+      "state_changed_at": 1761740760,
+      "archived_at": null,
+      "depends_on": [
+        "WS8",
+        "WS9"
+      ],
+      "milestone": "Second wave",
+      "progress": {
+        "done": 0,
+        "total": 3,
+        "counts": {
+          "todo": 3,
+          "wip": 0,
+          "pr": 0,
+          "prog": 0,
+          "done": 0,
+          "deferred": 0
+        },
+        "pct": 0
+      },
+      "live_agents": 0,
+      "finished_in_range": 0,
+      "finished_today": 0,
+      "tokens": 0,
+      "cost_usd": 0,
+      "tokens_all_time": 0,
+      "cost_usd_all_time": 0,
+      "last_activity": null,
       "plan": true
     }
   ],

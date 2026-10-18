@@ -13,6 +13,9 @@
 <link rel="stylesheet" href="/static/cards/live-chart.css">
 <link rel="stylesheet" href="/static/cards/ws-cards.css">
 <link rel="stylesheet" href="/static/cards/tables.css">
+<link rel="stylesheet" href="/static/cards/project-home.css">
+<link rel="stylesheet" href="/static/cards/planned.css">
+<link rel="stylesheet" href="/static/cards/archive.css">
 <script src="/static/core/theme.js"></script>
 <style>
 *{box-sizing:border-box}
@@ -107,6 +110,9 @@ svg{display:block;overflow:visible}
 .view-toggle{display:inline-flex;border:1px solid var(--ring);border-radius:var(--r-pill);padding:3px;background:var(--surface);gap:2px}
 .view-toggle button{border:0;border-radius:var(--r-pill);background:transparent;color:var(--ink-2);font-weight:650;font-size:13px;padding:5px 14px}
 .view-toggle button[aria-pressed="true"]{background:var(--accent-fill,var(--accent));color:var(--accent-ink)}
+.view-nav{display:inline-flex;border:1px solid var(--ring);border-radius:var(--r-pill);padding:3px;background:var(--surface);gap:2px}
+.view-nav button{border:0;border-radius:var(--r-pill);background:transparent;color:var(--ink-2);font-weight:650;font-size:13px;padding:5px 14px;white-space:nowrap}
+.view-nav button[aria-current="page"]{background:var(--accent-fill,var(--accent));color:var(--accent-ink)}
 .needs-you{margin-bottom:14px}
 .needs-line{margin:4px 0;font-size:13px;color:var(--ink-2)}
 .needs-row{display:flex;flex-wrap:wrap;gap:8px 12px;align-items:baseline;padding:6px 0;border-bottom:1px solid var(--grid);font-size:13.5px}
@@ -182,6 +188,7 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible,[ta
 <button type="button" id="view-plan" aria-pressed="false">Plan</button>
 <button type="button" id="view-exec" aria-pressed="true">Execution</button>
 </nav>
+<nav class="view-nav" id="view-nav" aria-label="Views"></nav>
 <button type="button" id="nav-sections" aria-expanded="false" aria-controls="sidenav" aria-keyshortcuts="[" title="Section list">Sections</button>
 <span class="sp"></span>
 <button id="theme" title="Toggle light or dark">Theme</button>
@@ -219,6 +226,9 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible,[ta
 <script src="/static/cards/ws-cards.js"></script>
 <script src="/static/cards/plan-progress.js"></script>
 <script src="/static/cards/needs.js"></script>
+<script src="/static/cards/planned.js"></script>
+<script src="/static/cards/project-home.js"></script>
+<script src="/static/cards/archive.js"></script>
 <script src="/static/cards/registry.js"></script>
 <script>
 (function () {
@@ -228,16 +238,27 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible,[ta
 
   document.addEventListener("keydown", function (e) { if (e.key === "Escape") { drawer.classList.remove("open"); if (window.__adReplayOn && window.__adReplayExit) window.__adReplayExit(false); } });
 
-  setInterval(function () { if (state.view === "exec" && !window.__adReplayOn) { drawMain(); } }, 60000);
+  setInterval(function () { if ((state.view === "exec" || isProjectView()) && !window.__adReplayOn) { drawMain(); } }, 60000);
   var resizeT = null;
-  window.addEventListener("resize", function () { clearTimeout(resizeT); resizeT = setTimeout(function () { if (window.__adReplayOn) return; if (state.view === "exec") drawMain(); else if (window.__adPlanDraw) window.__adPlanDraw(); }, 150); });
+  window.addEventListener("resize", function () { clearTimeout(resizeT); resizeT = setTimeout(function () { if (window.__adReplayOn) return; if (state.view === "exec" || isProjectView()) drawMain(); else if (window.__adPlanDraw) window.__adPlanDraw(); }, 150); });
+
+  /* Project-view specs, one per view; the card files own the sections. */
+  function projectSpecs(snap) {
+    if (state.view === "project") return projectHomeSpecs(state, snap);
+    if (state.view === "planned") return plannedSpecs(state, snap);
+    return archiveSpecs(state, snap);
+  }
 
   function drawMain() {
     renderErrBanner();
     var m = document.getElementById("main");
     var snap = state.snap || {running: [], recent: [], totals: {tokens: {}}};
-    var scope = state.ws + "|24|" + (window.innerWidth >> 5);
+    var scope = state.view + "|" + state.ws + "|24|" + (window.innerWidth >> 5);
     if (m.dataset.scope !== scope || !m.querySelector("[data-sec]")) { m.innerHTML = ""; secCache = {}; m.dataset.scope = scope; m.classList.remove("fresh"); void m.offsetWidth; m.classList.add("fresh"); }
+    if (isProjectView()) {
+      applySections(m, projectSpecs(snap));
+      return;
+    }
     /* Cards run in registry order (static/cards/registry.js): program,
        tiles, running, cards, plan, tokens, conc, gantt, finished. The
        running/tiles specs key on state.snapError so a failed scope reads
@@ -263,7 +284,7 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible,[ta
 
   setTimeout(warmTabs, 1500);
   setInterval(warmTabs, 45000);
-  setInterval(function () { if (!state.wss.length) return; loadPlanSums().then(function () { if (state.view === "exec" && state.ws === "all") drawMain(); }); }, 30000);
+  setInterval(function () { if (!state.wss.length) return; loadPlanSums().then(function () { if ((state.view === "exec" && state.ws === "all") || isProjectView()) drawMain(); }); }, 30000);
 
 
   document.getElementById("theme").addEventListener("click", function () {
@@ -271,7 +292,7 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible,[ta
     var next = dark ? "light" : "dark";
     r.setAttribute("data-theme", next);
     try { localStorage.setItem("agent-dash-theme", next); } catch (e) {}
-    if (state.view === "exec" && state.snap) drawMain();
+    if ((state.view === "exec" || isProjectView()) && state.snap) drawMain();
     else if (window.PlanView) PlanView.restyle();
   });
   document.getElementById("view-plan").addEventListener("click", function () { selectView("plan"); });
@@ -296,6 +317,7 @@ button:focus-visible,.tab:focus-visible,a:focus-visible,tr.clk:focus-visible,[ta
   setInterval(function () {
     loadTaskmap().then(function () {
       if (state.view === "exec") refreshAll();
+      else if (isProjectView()) refreshProject();
       else { loadNav(); if (window.PlanView) PlanView.refresh(); }
     });
   }, 30000);

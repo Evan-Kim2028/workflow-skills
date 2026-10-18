@@ -17,7 +17,7 @@ WS2S = "00000000-0000-0000-0000-000000000003"
 WS7S = "00000000-0000-0000-0000-000000000007"
 MAINS = (WS1, PLAN, WS2S, WS7S)
 TK_KEYS = ("backlog", "todo", "doing", "review", "done", "cancelled")
-PLAN_WS = ("WS1", "WS2", "WS7")
+PLAN_WS = ("WS1", "WS2", "WS7", "WS9", "WS10", "WS11")
 BOARD = (
     ("WS0", "Stabilize", (3, 1, 0, 0, 2, 0)),
     ("WS1", "Identity", (2, 1, 1, 0, 4, 0)),
@@ -27,7 +27,24 @@ BOARD = (
     ("WS5", "Clients", (1, 0, 0, 0, 2, 0)),
     ("WS6", "Cleanup", (2, 0, 0, 0, 0, 1)),
     ("WS7", "Launch", (1, 0, 1, 0, 2, 0)),
+    ("WS9", "Relay", (1, 2, 0, 0, 0, 0)),
+    ("WS10", "Ledger", (1, 1, 0, 0, 0, 0)),
+    ("WS11", "Export", (0, 0, 0, 0, 1, 0)),
+    ("WS12", "Sunset", (1, 1, 0, 0, 0, 0)),
 )
+#: Lifecycle state per fixture workstream (mirrors bundle.json ``state``;
+#: absent reads as ``active`` on the API, so every row carries it here).
+WS_STATES = {
+    "WS0": "active", "WS1": "active", "WS2": "done", "WS3": "active",
+    "WS4": "active", "WS5": "paused", "WS6": "active", "WS7": "active",
+    "WS9": "planned", "WS10": "planned", "WS11": "archived", "WS12": "dropped",
+}
+#: States hidden from the default ``/api/workstreams`` scope.
+HIDDEN_STATES = ("archived", "dropped")
+#: ``depends_on`` per fixture workstream (mirrors bundle.json).
+WS_DEPENDS = {"WS9": ["WS6"], "WS10": ["WS8", "WS9"]}
+#: ``milestone`` (project phase name) per fixture workstream.
+WS_MILESTONE = {"WS9": "Second wave", "WS10": "Second wave", "WS11": "First wave"}
 DONE_TOTAL = sum(row[2][4] for row in BOARD)
 BACKLOG_TOTAL = sum(row[2][0] for row in BOARD)
 SESSION_DEFAULTS = {WS1: "WS1", PLAN: "PLANNING", WS2S: "WS2", WS7S: "WS7"}
@@ -107,6 +124,62 @@ RAW_PLANS = {
         "phases": [
             {"name": "Routes", "goal": "The read route answers.", "gate": "A client can call it."},
             {"name": "Remove", "goal": "The old handler is gone.", "gate": "No caller remains."},
+        ],
+    },
+    "WS9": {
+        "cols": ["Wait", "Relay"],
+        "groups": [
+            {"id": "wait", "col": 0, "title": "Wait", "tasks": [
+                {"id": "WS9.G1", "title": "Cleanup batch is merged", "status": "todo", "kind": "gate",
+                 "signal": "WS6 cutover batch is merged", "confirmed_at": "2025-10-22T12:00:00Z", "fresh_hours": 24},
+            ]},
+            {"id": "relay", "col": 1, "title": "Relay", "tasks": [
+                {"id": "WS9.1", "title": "Relay the seeded batch", "status": "todo", "deps": ["WS9.G1"],
+                 "dep_notes": {"WS9.G1": "run only after the cleanup batch lands"}},
+                {"id": "WS9.2", "title": "Prove the relay", "status": "todo", "deps": ["WS9.1"]},
+            ]},
+        ],
+        "edges": [["wait", "relay"]],
+        "phases": [
+            {"name": "Wait", "goal": "The cleanup batch lands.", "gate": "The gate task is met."},
+            {"name": "Relay", "goal": "The seeded batch relays.", "gate": "The prove task is done."},
+        ],
+    },
+    "WS10": {
+        "cols": ["Wait", "Ledger"],
+        "groups": [
+            {"id": "wait", "col": 0, "title": "Wait", "tasks": [
+                {"id": "WS10.G1", "title": "Launch feed is steady", "status": "todo", "kind": "gate",
+                 "signal": "WS8 launch feed is steady", "confirmed_at": "2025-10-20T12:00:00Z", "fresh_hours": 24},
+                {"id": "WS10.G2", "title": "Relay loop is live", "status": "todo", "kind": "gate",
+                 "signal": "WS9 relay loop is live", "confirmed_at": "2025-10-31T20:00:00Z", "fresh_hours": 24},
+            ]},
+            {"id": "ledger", "col": 1, "title": "Ledger", "tasks": [
+                {"id": "WS10.1", "title": "Ledger the seeded rows", "status": "todo", "deps": ["WS10.G1", "WS10.G2"],
+                 "dep_notes": {"WS10.G1": "run only after the feed is steady"}},
+            ]},
+        ],
+        "edges": [["wait", "ledger"]],
+        "phases": [
+            {"name": "Wait", "goal": "Both signals confirm.", "gate": "Both gate tasks are met."},
+            {"name": "Ledger", "goal": "The seeded rows ledger.", "gate": "The ledger task is done."},
+        ],
+    },
+    "WS11": {
+        "cols": ["Shape", "Ship"],
+        "groups": [
+            {"id": "shape", "col": 0, "title": "Shape", "tasks": [
+                {"id": "WS11.1", "title": "Shape the export", "status": "done"},
+                {"id": "WS11.2", "title": "Freeze the export columns", "status": "done"},
+            ]},
+            {"id": "ship", "col": 1, "title": "Ship", "tasks": [
+                {"id": "WS11.3", "title": "Ship the export", "status": "done", "deps": ["WS11.1", "WS11.2"]},
+            ]},
+        ],
+        "edges": [["shape", "ship"]],
+        "phases": [
+            {"name": "Shape", "goal": "The export columns freeze.", "gate": "The seeded export loads."},
+            {"name": "Ship", "goal": "The export ships.", "gate": "The ship task is done."},
         ],
     },
     "WS7": {
@@ -522,13 +595,20 @@ def _sessions(runs):
     return {"sessions": rows, "_note": NOTE}
 
 
-def _workstreams(runs, now, plans):
+def _workstreams(runs, now, plans, scope="default"):
     """Fixture mirror of GET /api/workstreams: the same rollup row plus the
-    plan progress object (null when the workstream has no plan)."""
+    plan progress object (null when the workstream has no plan) plus the
+    lifecycle fields (state, state_changed_at, archived_at, depends_on,
+    milestone; absent reads as active on the API, so every row carries
+    them here). The default scope drops archived/dropped rows;
+    ``scope="all"`` keeps every state."""
     moment = datetime.datetime.fromtimestamp(now).astimezone()
     today = moment.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
     rows = []
     for code, name, counts in BOARD:
+        state = WS_STATES.get(code, "active")
+        if scope != "all" and state in HIDDEN_STATES:
+            continue
         tk = dict(zip(TK_KEYS, counts))
         mine = [run for run in runs if run["workstream"] == code]
         tokens = sum(sum(run["tokens"][key] for key in TOKEN_KEYS) for run in mine)
@@ -540,6 +620,11 @@ def _workstreams(runs, now, plans):
             "ws": code,
             "name": name,
             "tk": tk,
+            "state": state,
+            "state_changed_at": now - 3 * 86400 if state != "active" else None,
+            "archived_at": now - 2 * 86400 if state == "archived" else None,
+            "depends_on": list(WS_DEPENDS.get(code, [])),
+            "milestone": WS_MILESTONE.get(code),
             "progress": dict(plan["progress"]) if plan and isinstance(plan.get("progress"), dict) else None,
             "live_agents": live,
             "finished_in_range": fin,
@@ -552,6 +637,121 @@ def _workstreams(runs, now, plans):
             "plan": code in PLAN_WS,
         })
     return {"workstreams": rows, "_note": NOTE}
+
+
+def _project(runs, now, plans):
+    """Fixture mirror of GET /api/project: the project.json identity plus
+    the phase roll-up (state per phase), counts by workstream state, and
+    lifetime totals. Missing project.json means name null on the API; the
+    fixture always carries one so the offline preview lands on it."""
+    counts = {state: 0 for state in ("planned", "active", "paused", "done", "archived", "dropped")}
+    for _code, _name, _counts in BOARD:
+        counts[WS_STATES.get(_code, "active")] += 1
+    tokens = {key: 0 for key in TOKEN_KEYS}
+    cost = 0.0
+    for run in runs:
+        for key in TOKEN_KEYS:
+            tokens[key] += run["tokens"][key]
+        if run["cost_usd"] is not None:
+            cost += run["cost_usd"]
+    billed = sum(tokens[key] for key in TOKEN_KEYS)
+    return {
+        "name": "Seeded demo project",
+        "short": "demo",
+        "description": "Seeded synthetic project for the offline preview.",
+        "goals": ["Seeded lanes stay green", "The offline preview renders every view"],
+        "started": "2025-10-01",
+        "target": None,
+        "phases": [
+            {"id": "wave-1", "title": "First wave", "summary": "Seeded lanes land.",
+             "gate": "All seeded checks pass.", "state": "done"},
+            {"id": "wave-2", "title": "Second wave", "summary": "Planned lanes start.",
+             "gate": "Gates confirm and approvals land.", "state": "active"},
+        ],
+        "counts": counts,
+        "totals": {"tokens": billed, "cost_usd": round(cost, 4), "runs": len(runs)},
+        "data_root_hash": "seeded0000",
+        "_note": NOTE,
+    }
+
+
+def _archive(now, plans):
+    """Fixture mirror of GET /api/archive: one frozen summary card per
+    archived workstream, newest first, plus the archived lifetime share.
+    The card mirrors dash/lifecycle.py freeze_summary plus id, title,
+    archived_at, and the closing-report basename (never a path or body)."""
+    plan = plans["WS11"]
+    cards = [{
+        "ws": "WS11",
+        "state": "archived",
+        "frozen_at": now - 2 * 86400,
+        "started_at": now - 30 * 86400,
+        "finished_at": now - 2 * 86400,
+        "duration_s": 28 * 86400,
+        "tasks": dict(plan["progress"]),
+        "trains": {"total": 0, "by_status": {}},
+        "approvals": {"pending": 0, "approved": 2, "denied": 0, "total": 2},
+        "usage": {"tokens_all_time": 0, "cost_usd_all_time": 0.0, "reachable": True,
+                  "url": "seeded", "note": "seeded fixture: no runs attribute to WS11"},
+        "closing_report": True,
+        "note": None,
+        "id": "WS11",
+        "title": "Export",
+        "archived_at": now - 2 * 86400,
+        "report": "2025-10-30-closing.md",
+    }]
+    return {
+        "archive": cards,
+        "totals": {"workstreams": len(cards), "tokens": 0, "cost_usd": 0.0, "runs": 0},
+        "_note": NOTE,
+    }
+
+
+def _approvals():
+    """Fixture mirror of GET /api/approvals?ws=all: the long-standing
+    seeded blocks plus pending items on the planned lanes, so the
+    start-readiness table can count approvals pending per workstream."""
+    return {
+        "approvals": [
+            {"ws": "WS1", "decided_at": "2026-04-02T15:00:00Z", "decided_by": "owner", "items": [
+                {"id": "sample-load", "step": "Load the sample set before cutover",
+                 "status": "pending", "reversible": False, "conditions": "The sample set is on disk."},
+                {"id": "route-name", "step": "Keep the public route name",
+                 "status": "approved", "reversible": True, "conditions": "Clients already call this route."},
+            ]},
+            {"ws": "WS2", "decided_at": "2026-04-02T15:04:00Z", "decided_by": "owner", "items": [
+                {"id": "route-list", "step": "Publish the route list",
+                 "status": "approved", "reversible": True, "conditions": "The contract is frozen."},
+                {"id": "client-contract", "step": "Freeze the client contract",
+                 "status": "approved", "reversible": True, "conditions": "Callers can read the new shape."},
+                {"id": "error-shape", "step": "Keep the old error shape",
+                 "status": "approved", "reversible": False, "conditions": "Existing clients parse this body."},
+                {"id": "read-route", "step": "Ship the read route",
+                 "status": "approved", "reversible": True, "conditions": "The sample set loads."},
+                {"id": "old-client", "step": "Retire the duplicate client",
+                 "status": "approved", "reversible": False, "conditions": "No caller still imports it."},
+            ]},
+            {"ws": "WS7", "decided_at": "2026-04-02T15:10:00Z", "decided_by": "owner", "items": [
+                {"id": "checklist", "step": "Publish the launch checklist",
+                 "status": "approved", "reversible": True, "conditions": "The gate task is written down."},
+                {"id": "rollback", "step": "Keep the rollback note",
+                 "status": "approved", "reversible": True, "conditions": "The note names the previous route."},
+                {"id": "hold-note", "step": "Hold the launch note",
+                 "status": "denied", "reversible": False, "conditions": "The gate task is still open."},
+            ]},
+            {"ws": "WS9", "decided_at": None, "decided_by": None, "items": [
+                {"id": "relay-go", "step": "Start the relay once the cleanup batch lands",
+                 "status": "pending", "reversible": True, "conditions": "The gate task is met."},
+                {"id": "relay-scope", "step": "Freeze the relay scope",
+                 "status": "pending", "reversible": True, "conditions": "The seeded batch is listed."},
+            ]},
+            {"ws": "WS10", "decided_at": None, "decided_by": None, "items": [
+                {"id": "ledger-go", "step": "Start the ledger once both signals confirm",
+                 "status": "pending", "reversible": False, "conditions": "Both gate tasks are met."},
+            ]},
+        ],
+        "_note": NOTE,
+    }
 
 
 def _progress(groups):
@@ -576,6 +776,13 @@ def _clean_task(task):
     notes = task.get("dep_notes")
     if isinstance(notes, dict):
         row["dep_notes"] = {key: value for key, value in notes.items() if isinstance(key, str) and isinstance(value, str)}
+    # Gate fields pass through every plan API sanitized like other fields.
+    if isinstance(task.get("signal"), str):
+        row["signal"] = task["signal"]
+    if isinstance(task.get("confirmed_at"), str):
+        row["confirmed_at"] = task["confirmed_at"]
+    if isinstance(task.get("fresh_hours"), (int, float)) and not isinstance(task.get("fresh_hours"), bool):
+        row["fresh_hours"] = task["fresh_hours"]
     return row
 
 
@@ -604,7 +811,10 @@ def _plans():
     }
     for ws, body in RAW_PLANS.items():
         raw = {"ws": ws, "dag": {"cols": body["cols"], "groups": body["groups"], "edges": body["edges"]}, "narrative": {"phases": body["phases"]}}
-        (plan_dir / f"{ws.lower()}.json").write_text(json.dumps(raw, indent=2) + "\n", encoding="utf-8")
+        # Refresh the live example plans that already exist; fixture-only
+        # plans (WS9+) stay out of the live plans/ directory.
+        if (plan_dir / f"{ws.lower()}.json").exists():
+            (plan_dir / f"{ws.lower()}.json").write_text(json.dumps(raw, indent=2) + "\n", encoding="utf-8")
         if ws == "WS1":
             view = bundle_view
         else:
@@ -790,6 +1000,10 @@ def main():
         "concurrency.json": conc,
         "sessions.json": _sessions(runs),
         "workstreams.json": _workstreams(runs, NOW, plans),
+        "workstreams-all.json": _workstreams(runs, NOW, plans, scope="all"),
+        "project.json": _project(runs, NOW, plans),
+        "archive.json": _archive(NOW, plans),
+        "approvals.json": _approvals(),
         "reconcile.json": _reconcile(runs, NOW),
         "health.json": {
             "ok": True,

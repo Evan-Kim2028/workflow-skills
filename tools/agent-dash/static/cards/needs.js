@@ -1,9 +1,8 @@
 /* Page card: Needs you (approvals).
    Renders pending decisions for this view from state.approvals.
-   Currently unreferenced by the registry (registering it would add a
-   visible card, a behaviour change); kept here so enabling it is one
-   registry line.
-   Reads: state.approvals, state.ws.
+   Registered for the Project home only (scope "project" in registry.js),
+   where it renders beside Recently done; the exec tabs never show it.
+   Reads: state.approvals, state.ws, state.view.
    Exports (on window.AdPage.cards, also kept as plain globals): needsCard.
    Needs: el, openApprovals, fmtN (plain globals). */
 (function (global) {
@@ -28,7 +27,8 @@
       pending.forEach(function (item) {
         var row = el("div", {class: "needs-row"});
         var href = "?view=plan&ws=" + encodeURIComponent(block.ws) + "#" + String(block.ws).toLowerCase() + "-approvals";
-        var label = (state.ws === "all" ? block.ws + " · " : "") + (item.step || item.id);
+        var showWs = state.ws === "all" || (state.view && state.view !== "exec" && state.view !== "plan");
+        var label = (showWs ? block.ws + " · " : "") + (item.step || item.id);
         var link = el("a", {href: href, text: label});
         link.addEventListener("click", function (ev) { ev.preventDefault(); openApprovals(block.ws); });
         row.appendChild(link);

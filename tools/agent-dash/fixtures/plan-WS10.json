@@ -1,0 +1,223 @@
+{
+  "ws": "WS10",
+  "cols": [
+    "Wait",
+    "Ledger"
+  ],
+  "groups": [
+    {
+      "id": "wait",
+      "col": 0,
+      "title": "Wait",
+      "tasks": [
+        {
+          "id": "WS10.G1",
+          "title": "Launch feed is steady",
+          "status": "todo",
+          "kind": "gate",
+          "signal": "WS8 launch feed is steady",
+          "confirmed_at": "2025-10-20T12:00:00Z",
+          "fresh_hours": 24
+        },
+        {
+          "id": "WS10.G2",
+          "title": "Relay loop is live",
+          "status": "todo",
+          "kind": "gate",
+          "signal": "WS9 relay loop is live",
+          "confirmed_at": "2025-10-31T20:00:00Z",
+          "fresh_hours": 24
+        }
+      ]
+    },
+    {
+      "id": "ledger",
+      "col": 1,
+      "title": "Ledger",
+      "tasks": [
+        {
+          "id": "WS10.1",
+          "title": "Ledger the seeded rows",
+          "status": "todo",
+          "deps": [
+            "WS10.G1",
+            "WS10.G2"
+          ],
+          "dep_notes": {
+            "WS10.G1": "run only after the feed is steady"
+          }
+        }
+      ]
+    }
+  ],
+  "edges": [
+    [
+      "wait",
+      "ledger"
+    ]
+  ],
+  "phases": [
+    {
+      "name": "Wait",
+      "goal": "Both signals confirm.",
+      "gate": "Both gate tasks are met."
+    },
+    {
+      "name": "Ledger",
+      "goal": "The seeded rows ledger.",
+      "gate": "The ledger task is done."
+    }
+  ],
+  "trains": [],
+  "progress": {
+    "done": 0,
+    "total": 3,
+    "counts": {
+      "todo": 3,
+      "wip": 0,
+      "pr": 0,
+      "prog": 0,
+      "done": 0,
+      "deferred": 0
+    },
+    "pct": 0
+  },
+  "_note": "Seeded example plan for the fixture preview.",
+  "layout": {
+    "ws": "WS10",
+    "density": "comfortable",
+    "ultra": false,
+    "live_tasks": 3,
+    "deferred_tasks": 0,
+    "total_tasks": 3,
+    "task_edges": 2,
+    "group_edges": 1,
+    "columns": [
+      {
+        "index": 0,
+        "title": "Wait",
+        "state": "full",
+        "groups": [
+          "wait"
+        ],
+        "tasks": 2,
+        "live_tasks": 2,
+        "visible_chips": 2
+      },
+      {
+        "index": 1,
+        "title": "Ledger",
+        "state": "full",
+        "groups": [
+          "ledger"
+        ],
+        "tasks": 1,
+        "live_tasks": 1,
+        "visible_chips": 1
+      }
+    ],
+    "folded_rail": null,
+    "groups": [
+      {
+        "id": "wait",
+        "title": "Wait",
+        "col": 0,
+        "column": "Wait",
+        "state": "open",
+        "live_tasks": 2,
+        "deferred_tasks": 0,
+        "chips": [
+          {
+            "id": "WS10.G1",
+            "label": "G1",
+            "tooltip": "WS10.G1 \u00b7 Launch feed is steady \u00b7 todo \u00b7 gate",
+            "status": "todo",
+            "kind": "gate",
+            "train": null,
+            "fan_in": 0
+          },
+          {
+            "id": "WS10.G2",
+            "label": "G2",
+            "tooltip": "WS10.G2 \u00b7 Relay loop is live \u00b7 todo \u00b7 gate",
+            "status": "todo",
+            "kind": "gate",
+            "train": null,
+            "fan_in": 0
+          }
+        ],
+        "shown_done": 0,
+        "hidden_done": 0,
+        "hidden_done_ids": [],
+        "more_token": null,
+        "deferred_token": null
+      },
+      {
+        "id": "ledger",
+        "title": "Ledger",
+        "col": 1,
+        "column": "Ledger",
+        "state": "open",
+        "live_tasks": 1,
+        "deferred_tasks": 0,
+        "chips": [
+          {
+            "id": "WS10.1",
+            "label": "1",
+            "tooltip": "WS10.1 \u00b7 Ledger the seeded rows \u00b7 todo \u00b7 waits on WS10.G1: run only after the feed is steady, WS10.G2",
+            "status": "todo",
+            "kind": "task",
+            "train": null,
+            "fan_in": 0
+          }
+        ],
+        "shown_done": 0,
+        "hidden_done": 0,
+        "hidden_done_ids": [],
+        "more_token": null,
+        "deferred_token": null
+      }
+    ],
+    "labels": {
+      "shortened": 3,
+      "collisions": []
+    },
+    "arrows": {
+      "mode": "all",
+      "task_edges": 2,
+      "group_edges": 1,
+      "reason": "2 task deps: arrows all",
+      "fan_in": []
+    },
+    "trains": {
+      "tagged": [],
+      "untagged": [],
+      "caption": null,
+      "legend": [],
+      "more_trains": 0
+    },
+    "phases_line": "1 Wait  \u2192  2 Ledger",
+    "balance": {
+      "tallest": {
+        "column": 0,
+        "title": "Wait",
+        "tasks": 2
+      },
+      "shortest": {
+        "column": 1,
+        "title": "Ledger",
+        "tasks": 1
+      },
+      "ratio": 2.0
+    }
+  },
+  "map_warnings": [
+    {
+      "code": "MAP109",
+      "severity": "info",
+      "title": "1 of 2 groups hold a single task",
+      "detail": "1 single-task groups out of 2 (bar: half or more)",
+      "fix": "Merge 1-task groups into their stage group"
+    }
+  ]
+}

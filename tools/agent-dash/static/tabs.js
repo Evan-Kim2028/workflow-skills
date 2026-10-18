@@ -16,6 +16,19 @@
     return !!(total > 0 && done === total);
   }
 
+  /* Lifecycle states that keep a tab: active, paused, and done. Planned
+     workstreams live in the Planned view ("no tab yet"); archived and
+     dropped leave the tab bar for the Archive shelf. Unknown or absent
+     reads as active, the same default the API uses. */
+  var TAB_STATES = ["active", "paused", "done"];
+  function wsStateOf(row) {
+    var s = row && row.state;
+    return s === "planned" || s === "active" || s === "paused" || s === "done" || s === "archived" || s === "dropped" ? s : "active";
+  }
+  function isTabState(state) {
+    return state === "active" || state === "paused" || state === "done";
+  }
+
   function normMode(mode) {
     return mode === "active" || mode === "completed" ? mode : "all";
   }
@@ -176,6 +189,9 @@
     MODES: MODES,
     MODE_KEY: MODE_KEY,
     ORDER_KEY: ORDER_KEY,
+    TAB_STATES: TAB_STATES,
+    wsStateOf: wsStateOf,
+    isTabState: isTabState,
     isCompleted: isCompleted,
     normMode: normMode,
     applyOrder: applyOrder,
