@@ -2808,5 +2808,155 @@ class SnapshotRecentPagingTest(unittest.TestCase):
         self.assertEqual(status, 200, "a cross-page tag must refetch, not 304")
 
 
+def _section_bundle(root: Path) -> Path:
+    """A WS9 bundle whose plan holds two sections: Alpha (A1, A2) and
+    Beta (B1). Task ids are plan-id substrings of the seeded labels, so
+    run-to-task mapping needs no taskmap file."""
+    ws = root / "WS9"
+    ws.mkdir(parents=True, exist_ok=True)
+    (ws / "bundle.json").write_text(
+        json.dumps({"id": "WS9", "title": "Nine", "kind": "workstream"}),
+        encoding="utf-8",
+    )
+    plan = {
+        "dag": {
+            "cols": ["Build", "Ship"],
+            "groups": [
+                {
+                    "id": "g1",
+                    "col": 0,
+                    "title": "Alpha",
+                    "tasks": [
+                        {"id": "A1", "title": "First", "status": "wip"},
+                        {"id": "A2", "title": "Second", "status": "todo"},
+                    ],
+                },
+                {
+                    "id": "g2",
+                    "col": 1,
+                    "title": "Beta",
+                    "tasks": [{"id": "B1", "title": "Third", "status": "todo"}],
+                },
+            ],
+            "edges": [],
+        },
+        "narrative": {"phases": []},
+    }
+    (ws / "plan.json").write_text(json.dumps(plan), encoding="utf-8")
+    return ws / "plan.json"
+
+
+class RunSectionTest(unittest.TestCase):
+    """Run rows carry their plan section (dash/sections.py): a run whose
+    label maps to a task in section A reads section A, an unmapped run
+    reads null, a plan edit invalidates the map, and the snapshot and
+    runs ETags retag on a plan edit."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.old_ws = os.environ.get("AGENT_DASH_WORKSTREAMS")
+        self.root = Path(self.tmp.name) / "ws"
+        self.root.mkdir()
+        self.plan_path = _section_bundle(self.root)
+        os.environ["AGENT_DASH_WORKSTREAMS"] = str(self.root)
+        self.now = time.time()
+        self.store = Store(Path(self.tmp.name) / "dash.sqlite")
+        self.store.upsert_run(
+            {
+                "run_id": "muse:sec:ws9-a1-k1",
+                "source": "muse",
+                "tier": "muse",
+                "label": "ws9-a1-k1",
+                "status": "running",
+                "started_at": self.now - 5,
+            }
+        )
+        self.store.upsert_run(
+            {
+                "run_id": "muse:sec:ws9-zzz",
+                "source": "muse",
+                "tier": "muse",
+                "label": "ws9-zzz-unmapped",
+                "status": "running",
+                "started_at": self.now - 4,
+            }
+        )
+        self.store.upsert_run(
+            {
+                "run_id": "muse:sec:ws9-b1-old",
+                "source": "muse",
+                "tier": "muse",
+                "label": "ws9-b1-old",
+                "status": "done",
+                "started_at": self.now - 200,
+                "ended_at": self.now - 100,
+            }
+        )
+        self.server, self.thread = start(self.store)
+        self.port = self.server.server_address[1]
+
+    def tearDown(self):
+        stop(self.server, self.thread)
+        self.store.close()
+        if self.old_ws is None:
+            os.environ.pop("AGENT_DASH_WORKSTREAMS", None)
+        else:
+            os.environ["AGENT_DASH_WORKSTREAMS"] = self.old_ws
+        self.tmp.cleanup()
+
+    def fetch(self, path, tag=None):
+        headers = {} if tag is None else {"If-None-Match": tag}
+        return geth(self.port, path, headers)
+
+    def test_running_rows_carry_section(self):
+        status, _, body = self.fetch("/api/snapshot?ws=all")
+        self.assertEqual(status, 200)
+        rows = {row["label"]: row for row in json.loads(body)["running"]}
+        self.assertEqual(rows["ws9-a1-k1"]["section"], "Alpha")
+        self.assertEqual(rows["ws9-a1-k1"]["section_index"], 0)
+        self.assertIsNone(rows["ws9-zzz-unmapped"]["section"])
+        self.assertIsNone(rows["ws9-zzz-unmapped"]["section_index"])
+
+    def test_recent_rows_carry_section(self):
+        status, _, body = self.fetch("/api/snapshot?ws=all")
+        self.assertEqual(status, 200)
+        rows = {row["label"]: row for row in json.loads(body)["recent"]}
+        self.assertEqual(rows["ws9-b1-old"]["section"], "Beta")
+        self.assertEqual(rows["ws9-b1-old"]["section_index"], 1)
+
+    def test_runs_endpoint_carries_section(self):
+        status, _, body = self.fetch("/api/runs?limit=10")
+        self.assertEqual(status, 200)
+        rows = {row["label"]: row for row in json.loads(body)["runs"]}
+        self.assertEqual(rows["ws9-a1-k1"]["section"], "Alpha")
+        self.assertIsNone(rows["ws9-zzz-unmapped"]["section"])
+
+    def test_plan_edit_invalidates_and_retags(self):
+        _, snap_heads, _ = self.fetch("/api/snapshot?ws=all")
+        _, runs_heads, _ = self.fetch("/api/runs?limit=10")
+        snap_tag = snap_heads.get("etag")
+        runs_tag = runs_heads.get("etag")
+        self.assertTrue(snap_tag, "snapshot has no ETag")
+        self.assertTrue(runs_tag, "runs has no ETag")
+        status, _, empty = self.fetch("/api/snapshot?ws=all", snap_tag)
+        self.assertEqual(status, 304, "an unchanged snapshot should 304")
+        self.assertEqual(empty, b"")
+        plan = json.loads(self.plan_path.read_text(encoding="utf-8"))
+        plan["dag"]["groups"][0]["title"] = "Alpha2"
+        self.plan_path.write_text(json.dumps(plan), encoding="utf-8")
+        stamp = time.time() + 5
+        os.utime(self.plan_path, (stamp, stamp))
+        status, snap_new, body = self.fetch("/api/snapshot?ws=all", snap_tag)
+        self.assertEqual(status, 200, "a plan edit should retag the snapshot")
+        self.assertNotEqual(snap_new.get("etag"), snap_tag, "snapshot tag ignored the plan edit")
+        rows = {row["label"]: row for row in json.loads(body)["running"]}
+        self.assertEqual(rows["ws9-a1-k1"]["section"], "Alpha2")
+        status, runs_new, body = self.fetch("/api/runs?limit=10", runs_tag)
+        self.assertEqual(status, 200, "a plan edit should retag the runs list")
+        self.assertNotEqual(runs_new.get("etag"), runs_tag, "runs tag ignored the plan edit")
+        rows = {row["label"]: row for row in json.loads(body)["runs"]}
+        self.assertEqual(rows["ws9-a1-k1"]["section"], "Alpha2")
+
+
 if __name__ == "__main__":
     unittest.main()

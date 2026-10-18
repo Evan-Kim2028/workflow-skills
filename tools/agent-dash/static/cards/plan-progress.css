@@ -1,5 +1,5 @@
-/* Plan progress map card (static/cards/plan-progress.js): group tiles in
-   group columns, task chips, group and task arrows, legend, replay and clip.
+/* Plan progress map card (static/cards/plan-progress.js): section tiles in
+   plan columns, task chips, section and task arrows, legend, replay and clip.
    Moved verbatim from static/index.html; the v2 bold-dark refinements and
    the map-standard layout rules are appended after the "layout standard"
    marker. New rules use v2 token names with current-token fallbacks, so the
@@ -101,7 +101,7 @@
 .working-now>b{font:700 12px var(--mono);color:var(--s1);margin-right:4px}
 .wn-pill{display:inline-flex;align-items:center;gap:6px;font:12px var(--mono);padding:3px 10px 3px 6px;border-radius:999px;border:1px solid color-mix(in srgb,var(--s1) 45%,var(--ring));background:color-mix(in srgb,var(--s1) 10%,var(--surface))}
 .wn-pill i{width:8px;height:8px;border-radius:50%;animation:livering 1.8s ease-out infinite}
-.wn-pill .wn-id{font-weight:700;color:var(--ink)}.wn-pill .wn-slug{color:var(--ink-2)}.wn-pill .wn-tok{color:var(--muted);font-size:11px}
+.wn-pill .wn-id{font-weight:700;color:var(--ink)}.wn-pill .wn-sec{color:var(--accent);font-size:11px}.wn-pill .wn-slug{color:var(--ink-2)}.wn-pill .wn-tok{color:var(--muted);font-size:11px}
 
 /* plan map focus-on-hover */
 .dag.focus .dnode{opacity:.32;transition:opacity .2s ease}
@@ -175,8 +175,8 @@ body.clip #main{zoom:.92}
 .gchip{font:11px var(--mono);padding:2px 6px;border-radius:5px;border:1.5px dashed var(--muted);color:var(--ink-2)}
 
 /* ---- map-standard layout rules (standard.md layer B) ---- */
-/* Fitted grid: the layout's columns share the card width, so every stage is
-   visible without horizontal scroll at 1440 px. Slim all-done stages run at
+/* Fitted grid: the layout's columns share the card width, so every section is
+   visible without horizontal scroll at 1440 px. Slim all-done sections run at
    about half width in their original position. */
 .dag-scroll.fitted{overflow-x:visible;background:var(--inset, var(--surface-2))}
 .dag.fitted{min-width:0;gap:14px;background:var(--inset, var(--surface-2))}
@@ -199,7 +199,7 @@ body.clip #main{zoom:.92}
 .fold-wrap{display:inline-flex;flex-wrap:wrap;gap:4px;align-items:center}
 .folded-chips{display:inline-flex;flex-wrap:wrap;gap:4px}
 .folded-trains{display:inline-flex;flex-wrap:wrap;gap:6px 14px}
-/* Slim all-done stage: title, check count and bar; click expands the chips. */
+/* Slim all-done section: title, check count and bar; click expands the chips. */
 .slim-tile{display:block;width:100%;text-align:left;background:var(--raised, var(--surface));border:1px solid var(--good);border-radius:10px;padding:8px 10px;margin:0 0 8px;cursor:pointer;color:var(--ink);font:inherit}
 .slim-tile:hover{border-color:var(--good-ink, var(--good))}
 .slim-tile b{display:block;font-size:12.5px}
@@ -223,18 +223,18 @@ body.clip #main{zoom:.92}
 .mleg-item .fam-dot{width:10px;height:10px;border-radius:50%;display:inline-block;border:1px solid var(--ring-strong);flex:none}
 .mleg-item svg{overflow:visible}
 .mleg-item .att.hot{font:600 9.5px var(--mono);color:var(--ink);margin-left:2px;padding:0 3px;border-radius:4px;border:1px solid var(--warning)}
-/* Narrative strip keeps its data under a "Work groups" label. */
+/* Narrative strip keeps its data under a "Sections" label. */
 .phases-wrap{margin-top:12px}
 .phases-cap{font:600 11px var(--font);color:var(--muted);text-transform:uppercase;letter-spacing:.05em;margin-bottom:6px}
 .phases-wrap .phases{margin-top:0}
 .phases-line b{color:var(--ink-2)}
-/* Group-edge microcopy on non-done tiles with upstream stages. */
+/* Section-edge microcopy on non-done tiles with upstream sections. */
 .tile-waits{font:11px var(--mono);color:var(--muted);margin:2px 0 6px}
-/* Balance caption under the lightest stage header. */
+/* Balance caption under the lightest section header. */
 .balance-note{font:11px var(--mono);color:var(--muted);margin:0 0 8px}
 /* Narrative phases as a one-line strip; full prose stays on the plan view. */
 .phases-line{margin-top:10px;font:12px var(--mono);color:var(--ink-2);border-top:1px solid var(--grid);padding-top:8px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-/* Later-stages rail for trailing folded columns. */
+/* Later-sections rail for trailing folded columns. */
 .fold-rail{border-style:dashed}
 /* Phone: columns stack vertically, no horizontal scroll. */
 @media (max-width:640px){

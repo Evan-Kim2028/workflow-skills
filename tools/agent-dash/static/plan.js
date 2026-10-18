@@ -153,7 +153,7 @@
   function drawProgress(host, dag, snap) {
     host.innerHTML = "";
     if (!dag.groups.length) {
-      host.appendChild(el("p", {class: "sub", text: "This plan has no task groups yet."}));
+      host.appendChild(el("p", {class: "sub", text: "This plan has no sections yet."}));
       return;
     }
     var live = {};
@@ -203,6 +203,9 @@
       return column;
     });
     var nodes = {};
+    /* Section per task, next to the label wherever agents are listed. */
+    var secOf = {};
+    dag.groups.forEach(function (group) { ((group.tasks) || []).forEach(function (task) { if (task && task.id != null) secOf[task.id] = group.title || group.id; }); });
     dag.groups.forEach(function (group) {
       var counts = {done: 0, prog: 0, pr: 0, todo: 0, deferred: 0};
       (group.tasks || []).forEach(function (task) {
@@ -234,7 +237,7 @@
         var recent = just[task.id];
         var chipClass = "pp-chip " + status + (runs.length ? " live" : "") + (recent && !runs.length ? " just" : "");
         var label = (task.title || task.id) + " · " + status + (task.moved_to ? " · moved to " + task.moved_to : "") + (task.note ? " · " + task.note : "");
-        if (runs.length) label += " · working: " + runs.map(function (run) { return (run.label || run.run_id) + " (" + (run.tier || "") + ", " + fmtDur(run.elapsed_s) + ")"; }).join(", ");
+        if (runs.length) label += " · working: " + runs.map(function (run) { var sec = secOf[task.id] || run.section; return (run.label || run.run_id) + (sec ? " · " + sec : "") + " (" + (run.tier || "") + ", " + fmtDur(run.elapsed_s) + ")"; }).join(", ");
         var chip = el("span", {class: chipClass, title: label, "aria-label": label}, [document.createTextNode(task.id)]);
         if (runs.length) {
           groupLive += runs.length;

@@ -521,7 +521,7 @@ class PageRules(unittest.TestCase):
 
     def test_plan_headline_has_no_phase_wording(self):
         """The plan progress headline is counts only ("N of M tasks done ·
-        K to go · J agents working"): groups run in parallel, so no
+        K to go · J agents working"): sections run in parallel, so no
         phase-sequence wording ("now in X (phase i of n)", "active in n of
         m phases", "next up", "every phase done")."""
         card = (STATIC / "cards" / "plan-progress.js").read_text()
@@ -534,6 +534,13 @@ class PageRules(unittest.TestCase):
             "now in ",
             "done in this phase",
             "Each tile is a stage of the plan, left to right",
+            "done in this group",
+            "Each tile is a group of tasks",
+            "Work groups",
+            "Later groups",
+            "Agents are building tasks in this group",
+            "every group done",
+            "which group waits on",
         ):
             self.assertNotIn(gone, card, f"plan-progress.js still says {gone!r}")
         for kept in (
@@ -541,9 +548,10 @@ class PageRules(unittest.TestCase):
             "tasks done",
             " to go",
             " working",
-            "done in this group",
-            "groups run in parallel",
-            "Work groups",
+            "done in this section",
+            "sections run in parallel",
+            "Sections",
+            "Each tile is a section of the plan",
         ):
             self.assertIn(kept, card, f"plan-progress.js lost {kept!r}")
 
@@ -2720,30 +2728,38 @@ class FinalPolishTests(unittest.TestCase):
 
     def test_running_now_disclosure(self):
         """Running now shows the top agents with a progressive disclosure
-        button: a real <button> with aria-expanded and aria-controls over
-        the extra rows, a cap constant of 5, sessionStorage guarded by
-        try/catch, the full count in the header, and no button at 5 or
-        fewer. The data-nav label stays "Running now" for the sidenav."""
+        button: a real <button> with aria-expanded and aria-controls that
+        rebuilds the card in place (no drawMain, so ticks never collapse
+        it), a cap constant of 5, sessionStorage guarded by try/catch, the
+        full count in the header, and no button at 5 or fewer. The data-nav
+        label stays "Running now" for the sidenav. Rows group workstream ->
+        section -> label with section headers, a Section | None toggle, and
+        label-first agent rows."""
         tables = (STATIC / "cards" / "tables.js").read_text()
         self.assertIn("RUNNING_TOP_N = 5", tables, "the top-5 cap constant drifted")
         self.assertIn('el("button"', tables, "the disclosure is not a real <button>")
-        for marker in ("aria-expanded", "aria-controls", "exec-running-extra"):
+        for marker in ("aria-expanded", "aria-controls", "exec-running-rows", "runmore"):
             self.assertIn(marker, tables, f"the disclosure lost {marker}")
+        self.assertNotIn("exec-running-extra", tables, "the hidden-tbody flip is back")
         self.assertIn('"Show all " + total + " running agents"', tables)
         self.assertIn('"Show top " + RUNNING_TOP_N + " agents"', tables)
         self.assertIn('title + " \\u00B7 " + runs.length', tables, "the header lost its full count")
         self.assertIn('"data-nav": title', tables, "the data-nav label must stay the plain title")
-        self.assertIn("rows.length > RUNNING_TOP_N", tables, "the button must hide at 5 or fewer")
-        self.assertIn('setAttribute("hidden"', tables)
-        self.assertIn('removeAttribute("hidden"', tables)
+        self.assertIn("runs.length > RUNNING_TOP_N", tables, "the button must hide at 5 or fewer")
+        for marker in ("groupRuns", "visibleGroups", "sec-h", "ws-chev", "Group by", "aria-pressed", '"Section"', '"None"'):
+            self.assertIn(marker, tables, f"the grouping lost {marker}")
+        self.assertIn('var cols = ["Label", "Model"];', tables, "agent rows are no longer label-first")
+        self.assertIn('"WS", "Section"', tables, "the Finished table lost its Section column")
         bodies = dict(functions(tables))
         self.assertIn("agents", bodies["runningToggleLabel"], "the toggle label must name agents")
-        for name in ("readRunningExpanded", "writeRunningExpanded"):
+        for name in ("readRunningExpanded", "writeRunningExpanded", "readGroupMode", "writeGroupMode",
+                     "readWsCollapsed", "writeWsCollapsed"):
             self.assertIn(name, bodies, f"{name} is gone from tables.js")
             self.assertIn("try", bodies[name], f"{name} touches storage unguarded")
             self.assertIn("catch", bodies[name], f"{name} touches storage unguarded")
             self.assertIn("sessionStorage", bodies[name], f"{name} no longer uses sessionStorage")
         self.assertIn("agent-dash-running:", tables, "the storage key lost its per-scope prefix")
+        self.assertIn("agent-dash-group:", tables, "the group-by key lost its per-scope prefix")
 
     def test_running_visible_helpers(self):
         """The top-5 slicing and label text are pure functions on
@@ -2894,6 +2910,109 @@ class FinalPolishTests(unittest.TestCase):
             text=True,
         )
         self.assertEqual(proc.returncode, 0, proc.stderr or proc.stdout)
+
+    def test_group_runs_ordering(self):
+        """The grouping builder is pure and exported
+        (window.AdPage.cards.groupRuns): rows group workstream -> section
+        -> rows with counts, sections in plan order with Unsectioned last,
+        rows newest-first inside a section, mode "none" flat. The collapsed
+        slice keeps the first 5 agents most-recently-active-first with the
+        freshest section on top; expanded returns the plan order untouched.
+        The Group by toggle defaults to Section and survives denied
+        storage."""
+        script = (
+            "const fs=require('fs');"
+            "var window={};"
+            "eval(fs.readFileSync(process.argv[1],'utf8'));"
+            "const C=window.AdPage.cards;"
+            "const assert=require('assert');"
+            "assert.strictEqual(typeof C.groupRuns,'function');"
+            "assert.strictEqual(typeof C.visibleGroups,'function');"
+            "const rows=["
+            "{run_id:'r1',workstream:'WS9',label:'ws9-b1-a',section:'Beta',section_index:1,started_at:300},"
+            "{run_id:'r2',workstream:'WS9',label:'ws9-a1-a',section:'Alpha',section_index:0,started_at:100},"
+            "{run_id:'r3',workstream:'WS9',label:'ws9-a2-a',section:'Alpha',section_index:0,started_at:200},"
+            "{run_id:'r4',workstream:'WS9',label:'ws9-zzz',section:null,section_index:null,started_at:400}];"
+            "const g=C.groupRuns(rows,['Alpha','Beta'],'section');"
+            "assert.strictEqual(g.length,1);"
+            "assert.strictEqual(g[0].ws,'WS9');"
+            "assert.deepStrictEqual(g[0].sections.map(s=>s.name),['Alpha','Beta',null]);"
+            "assert.deepStrictEqual(g[0].sections.map(s=>s.count),[2,1,1]);"
+            "assert.deepStrictEqual(g[0].sections[0].rows.map(r=>r.run_id),['r3','r2']);"
+            "const g2=C.groupRuns(rows,null,'section');"
+            "assert.deepStrictEqual(g2[0].sections.map(s=>s.name),['Alpha','Beta',null]);"
+            "const g3=C.groupRuns(rows,{WS9:['Beta','Alpha']},'section');"
+            "assert.deepStrictEqual(g3[0].sections.map(s=>s.name),['Beta','Alpha',null]);"
+            "const flat=C.groupRuns(rows,['Alpha','Beta'],'none');"
+            "assert.strictEqual(flat[0].sections.length,1);"
+            "assert.strictEqual(flat[0].sections[0].name,null);"
+            "assert.deepStrictEqual(flat[0].sections[0].rows.map(r=>r.run_id),['r4','r1','r3','r2']);"
+            "const multi=C.groupRuns(rows.concat([{run_id:'r5',workstream:'WS8',label:'ws8-x',section:'S',section_index:0,started_at:900}]),null,'section');"
+            "assert.deepStrictEqual(multi.map(w=>w.ws),['WS8','WS9']);"
+            "const vis=C.visibleGroups(g,false,2);"
+            "assert.deepStrictEqual(vis[0].sections.map(s=>s.name),[null,'Beta']);"
+            "assert.deepStrictEqual(vis[0].sections.map(s=>s.count),[1,1]);"
+            "assert.strictEqual(vis[0].sections[0].rows[0].run_id,'r4');"
+            "assert.deepStrictEqual(C.visibleGroups(g,true,2),g);"
+            "var store={};window.sessionStorage={getItem:k=>store[k]??null,setItem:(k,v)=>{store[k]=String(v)},removeItem:k=>{delete store[k]}};"
+            "assert.strictEqual(C.readGroupMode('running','all'),'section');"
+            "C.writeGroupMode('running','all','none');"
+            "assert.strictEqual(C.readGroupMode('running','all'),'none');"
+            "C.writeGroupMode('running','all','section');"
+            "assert.strictEqual(C.readGroupMode('running','all'),'section');"
+            "window.sessionStorage={getItem(){throw new Error('denied')},setItem(){throw new Error('denied')},removeItem(){throw new Error('denied')}};"
+            "assert.strictEqual(C.readGroupMode('running','all'),'section');"
+            "C.writeGroupMode('running','all','none');"
+        )
+        proc = subprocess.run(
+            ["node", "-e", script, str(STATIC / "cards" / "tables.js")],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr or proc.stdout)
+
+    def test_plan_sections_term_rule(self):
+        """Plan task groupings are SECTIONS on the page: no string in
+        static/cards/*.js or static/*.js (excluding phases.js, the
+        planning-vs-execution usage card) says "phase"/"phases" for plan
+        sections. Data-key identifiers (narrative.phases, phases_line,
+        .phases reads, the kept CSS section classes) and the genuinely
+        serial project.json phases strip stay, each on an explicit
+        allow-list; DESIGN.md states the term."""
+        word = re.compile(r"phase", re.IGNORECASE)
+        allow = [
+            re.compile(r"\.phases\b"),
+            re.compile(r"phases_line"),
+            re.compile(r"['\"]phases['\"]"),
+            re.compile(r"\bphases:"),
+            re.compile(r"phases\s*\|\|"),
+            re.compile(r"phases\s*\.?(forEach|length)"),
+            re.compile(r"phases-(wrap|cap|line)"),
+            re.compile(r'"phase"|pj-phase'),
+            re.compile(r"phasesSection|project-phases"),
+            re.compile(r"never phases|phase-sequence|phase sequence|\"phases\" misleads|same groups and phases|"
+                       r"phases strip from /api/project|Phases strip from /api/project|mockup order: phases"),
+            re.compile(r"From project\.json|No phases listed|its phases|\"Phases\"|\|\| \"Phase\""),
+        ]
+        files = sorted((STATIC / "cards").glob("*.js")) + sorted(STATIC.glob("*.js"))
+        bad = []
+        for path in files:
+            if path.name == "phases.js":
+                continue
+            for lineno, line in enumerate(path.read_text().splitlines(), 1):
+                if not word.search(line):
+                    continue
+                if any(rx.search(line) for rx in allow):
+                    continue
+                bad.append(f"{path.name}:{lineno}: {line.strip()[:160]}")
+        self.assertEqual(bad, [], "phase-wording outside the allow-list:\n" + "\n".join(bad))
+        for path in files:
+            if path.name == "phases.js":
+                continue
+            self.assertNotIn("Work groups", path.read_text(), f"{path.name} still says Work groups")
+        design = (STATIC.parent / "DESIGN.md").read_text()
+        for kept in ("SECTIONS", "sections run in parallel", '"Sections" label', "Machine keys"):
+            self.assertIn(kept, design, f"DESIGN.md no longer states the sections term ({kept})")
 
 
 if __name__ == "__main__":

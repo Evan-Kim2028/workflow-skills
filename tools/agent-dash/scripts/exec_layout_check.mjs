@@ -8,11 +8,12 @@
  * child_process, no npm installs) and asserts:
  *   - the Run timeline section (gantt) directly follows Tokens per hour
  *     in DOM order, then Live agents over time (conc), then finished;
- *   - collapsed Running now shows exactly 5 rows with a real <button>
- *     reading "Show all 12 running agents" (aria-expanded, aria-controls);
- *   - clicking expands to all 12 in place, keeps drawer clicks working,
- *     and a re-render (drawMain, the same path a stream tick takes)
- *     does not collapse it;
+ *   - collapsed Running now shows exactly 5 agent rows grouped under
+ *     section headers with a real <button> reading "Show all 12 running
+ *     agents" (aria-expanded, aria-controls);
+ *   - clicking expands to all 12 grouped in place, keeps drawer clicks
+ *     working, and a re-render (drawMain, the same path a stream tick
+ *     takes) does not collapse it;
  *   - per-scope state (all vs WS1) and no button at 5 or fewer (WS2);
  *   - zero console errors throughout.
  *
@@ -341,17 +342,15 @@ async function main() {
       if (!card) return null;
       var h2 = card.querySelector('h2');
       var tbodies = Array.prototype.slice.call(card.querySelectorAll('tbody'));
-      var extra = document.getElementById('exec-running-extra');
       var btn = card.querySelector('button.runmore');
       var rows = [];
-      tbodies.forEach(function(tb){
-        Array.prototype.forEach.call(tb.querySelectorAll('tr'), function(tr){
-          var lbl = tr.querySelector('.lbl');
-          rows.push({label: lbl ? lbl.textContent : '', visible: !!(tr.offsetParent)});
-        });
+      Array.prototype.forEach.call(card.querySelectorAll('tbody tr.clk'), function(tr){
+        var lbl = tr.querySelector('.lbl');
+        rows.push({label: lbl ? lbl.textContent : '', visible: !!(tr.offsetParent)});
       });
       return {h2: h2 ? h2.textContent : '', nav: card.getAttribute('data-nav'),
-        tbodies: tbodies.length, extraHidden: extra ? extra.hidden : null,
+        tbodies: tbodies.length, extraGone: !document.getElementById('exec-running-extra'),
+        secHeads: card.querySelectorAll('tr.sec-h').length,
         btn: btn ? {text: btn.textContent, expanded: btn.getAttribute('aria-expanded'),
           controls: btn.getAttribute('aria-controls'), tag: btn.tagName,
           lastChild: btn.parentElement.lastChild === btn} : null,
@@ -374,8 +373,9 @@ async function main() {
       const st = await evaluate(cdp, `(${runningState})`);
       eq(st.h2, "Running now · 12", "header keeps the full count");
       eq(st.nav, "Running now", "data-nav label");
-      eq(st.tbodies, 2, "top + extra tbodies");
-      eq(st.extraHidden, true, "extra rows hidden");
+      eq(st.tbodies, 1, "one tbody; the toggle rebuilds it in place");
+      eq(st.extraGone, true, "the hidden-tbody flip is gone");
+      if (!st.secHeads) fail("no section headers while collapsed");
       eq(st.rows.filter((r) => r.visible).length, 5, "collapsed shows exactly 5 rows");
       eq(JSON.stringify(st.rows.slice(0, 5).map((r) => r.label)), JSON.stringify(apiLabels.slice(0, 5)),
         "top 5 are the most recently active first");
@@ -383,7 +383,7 @@ async function main() {
       if (!st.btn.text.startsWith("Show all 12 running")) fail(`button reads ${JSON.stringify(st.btn.text)}`);
       if (st.btn.text.indexOf("agents") < 0) fail(`button never says agents: ${JSON.stringify(st.btn.text)}`);
       eq(st.btn.expanded, "false", "aria-expanded");
-      eq(st.btn.controls, "exec-running-extra", "aria-controls");
+      eq(st.btn.controls, "exec-running-rows", "aria-controls");
       if (!st.btn.lastChild) fail("the disclosure button is not below the table");
     });
 
@@ -394,7 +394,7 @@ async function main() {
       eq(st.rows.filter((r) => r.visible).length, 12, "expanded shows all 12");
       eq(st.btn.text, "Show top 5 agents", "button reads Show top 5");
       eq(st.btn.expanded, "true", "aria-expanded after expand");
-      eq(st.extraHidden, false, "extra rows unhidden");
+      if (!st.secHeads) fail("no section headers while expanded");
       await evaluate(cdp, `window.__xRunning = document.querySelector('#x-running')`);
       await evaluate(cdp, `window.drawMain()`);
       await new Promise((r) => setTimeout(r, 400));
@@ -404,8 +404,7 @@ async function main() {
       eq(await evaluate(cdp, "window.__xRunning === document.querySelector('#x-running')"), true,
         "an unchanged re-render keeps the section node (no reflow storm)");
       const sixth = await evaluate(cdp, `(function(){
-        var extra = document.getElementById('exec-running-extra');
-        var tr = extra && extra.querySelector('tr');
+        var tr = document.querySelector('#exec-running tr.clk');
         if (!tr) return null;
         tr.click();
         return document.getElementById('drawer').className;

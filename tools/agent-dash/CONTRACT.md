@@ -191,7 +191,8 @@ that workstream tab's `counts` and `totals`. `unassigned` carries runs with no
 workstream; it appears only when such runs exist. Row sums plus unassigned equal
 the all-scope numbers exactly (cost within 1e-6).
 `Run` = `{run_id, source, tier, model, label, workstream, ws_confidence, session_id, parent_session_id, status, verdict,
-started_at, ended_at, elapsed_s, clock_source, out_bytes, out_growing, err_bytes, pid, rss_kb, tokens: {input, output, cache_read, cache_write}, cost_usd, context_tokens}`.
+started_at, ended_at, elapsed_s, clock_source, out_bytes, out_growing, err_bytes, pid, rss_kb, tokens: {input, output, cache_read, cache_write}, cost_usd, context_tokens, section, section_index}`.
+Every run row in `running`, `recent`, and `GET /api/runs` carries its plan section: `section` is the name of the plan section holding the run's task (the `groups` entry in plan order whose tasks contain the mapped task id) and `section_index` its position in the plan, so tables group workstream → section → label without refetching plans. Runs that map to no task read `section: null` (`section_index: null`); the page shows them under "Unsectioned". The fields are additive and cached by plan mtime like the other plan caches; the snapshot and runs conditional ETags carry the plan stamp, so a plan edit retags even when no store write landed.
 `context_tokens` is the latest `grok-context` input for that run, or null. It is a context-window estimate. It is not part of `tokens`, totals, buckets, or cost. `elapsed_s` is null when `started_at` is null.
 `recent` = runs ended inside the window (one fixed 24 h by default, `since`/`until` narrow it), newest first, max 50. Production jobs (source `dagster`) are never in `recent`; they are the `counts.prod_jobs_finished` count. The page shows it as `Finished (24 h)`.
 `?recent_limit=&recent_offset=` pages that window (defaults 50 and 0, the historic shape): `recent` carries rows `[offset, offset+limit)` newest-first, `recent_shown` their count, and `recent_total` the true window total on every page, so later pages are fetchable without growing the default payload. The snapshot cache and the conditional ETag key both carry the page, and a bad value is a 400. The page pager reads `recent_total` (falling back to `counts.finished_in_range`) and fetches beyond the held 50 only.
@@ -330,7 +331,7 @@ plan still serves 200 with its issues named, so bad states are never drawn
 as tasks; the page does not show the issues, which `ws validate` and this field carry):
 `{"ws": "WS7", "cols": [..], "groups": [{id, col, title, tasks: [{id, title, status, deps, kind, dep_notes}]}], "edges": [[a, b]], "phases": [{name, goal, gate}], "progress": {"done": 0, "total": 0, "counts": {todo, wip, pr, prog, done, deferred}, "pct": 0}, "ready": ["WS7.2"], "critical_path": ["WS7.1", "WS7.2"], "max_parallel": 3, "layout": {...}, "map_warnings": [{code, severity, title, detail, fix}]}`.
 `ready` is the todo-with-satisfied-deps task ids ranked by critical-path impact, `critical_path` is the longest dep chain, and `max_parallel` is the widest dependency wave; all three come from `dash/orchestrate.py` with no store reads, cached by `plan.json` mtime.
-`layout` is the computed map layout from `dash/maplayout.py` (density, per-group collapse state, columns, chip labels, arrows mode, train tags, phases line), and `map_warnings` is the MAP101–MAP111 lint for that plan; both are cached by `plan.json` mtime like the orchestration fields. The page consumes `layout`; `ws layout <ID>` prints the same object without touching the page.
+`layout` is the computed map layout from `dash/maplayout.py` (density, per-section collapse state, columns, chip labels, arrows mode, train tags, sections line), and `map_warnings` is the MAP101–MAP111 lint for that plan; both are cached by `plan.json` mtime like the orchestration fields. The page consumes `layout`; `ws layout <ID>` prints the same object without touching the page.
 A task's `kind` is `task` or `gate` (an outside signal or condition, drawn as a diamond); absent means `task`. `dep_notes` maps one of the task's dep ids to the short condition on that edge. A task may also carry `files` (declared file footprints, a non-empty list of glob strings), and a gate may carry `signal` (what it waits on), `confirmed_at` (ISO-8601 UTC of the last check), and `fresh_hours` (recheck bound; older or missing confirmations read STALE). A deferred task may carry `received_as` (the task id in the receiving workstream that picked it up). All pass through every plan API sanitized like other fields. `/api/bundle` carries the same task shape inside `plan.dag.groups`.
 `plans.local.json` replaces `plans.example.json`. Each value is a path. Relative paths resolve next to the plans file. The loader reads `dag` and `narrative.phases`.
 One resolver (`dash.bundles.resolve_plan`) picks the plan file: a bundle's
@@ -693,19 +694,19 @@ invalid data, 5 dashboard unreachable (docs/integrate.md, For agents).
 
 `ws new` writes a valid template (`--state` sets the lifecycle state, default `active`). `ws task` writes `plan.json` through a temp file and `os.replace`, holding a per-bundle `fcntl` lock across the read-modify-write so concurrent writers keep every update. `ws approve` writes `approvals.json` the same way. `ws state`, `ws archive`, and `ws restore` write `bundle.json` under the same lock and append one `{kind: "state"}` line to `history.jsonl`; `ws archive` also freezes `summary.json` and never deletes anything. Moving a `done` or `deferred` task back to `wip` or `pr` needs `--force`. A new pending item needs `--step`, `--reversible yes|no`, and `--conditions`. `approved` or `denied` sets `decided_at` and `decided_by` to `owner`. `ws approvals` prints a table. `ws validate` checks the schema, including `approvals.json` when that file exists, and the naming rule: a TU-style id, a #-prefixed issue number, or an ADR number with no phrase earlier on the same line is a failure.
 
-Map warnings (MAP101–MAP111) are the plan-shape lint from `dash/maplayout.py`: warnings, never errors. `ws validate` prints them after errors under a `warnings:` heading and lists them in `--json` under `warnings`; the exit code follows the schema errors alone. `ws layout <ID> [--json]` prints the computed layout (density, columns, group states, label shortening count, arrows policy) plus the same warnings with fix hints. Run it before kickoff and aim for zero MAP warnings. The codes:
+Map warnings (MAP101–MAP111) are the plan-shape lint from `dash/maplayout.py`: warnings, never errors. `ws validate` prints them after errors under a `warnings:` heading and lists them in `--json` under `warnings`; the exit code follows the schema errors alone. `ws layout <ID> [--json]` prints the computed layout (density, columns, section states, label shortening count, arrows policy) plus the same warnings with fix hints. Run it before kickoff and aim for zero MAP warnings. The codes:
 
 | Code | Warns when | Fix |
 |---|---|---|
-| MAP101 | a group has more than 14 tasks | split the group into two stage groups |
-| MAP102 | more than 5 columns | re-stage into at most 5 columns |
-| MAP103 | a column holds groups but no live tasks | drop the column or move a group into it |
-| MAP104 | tallest column > 3x shortest with > 40 live tasks | regroup across stages |
-| MAP105 | a group title is a bare id | retitle in plain words |
-| MAP106 | 3+ columns and a non-first-column group has no waits-on edge | add stage waits-on edges |
+| MAP101 | a section has more than 14 tasks | split the section into two sections |
+| MAP102 | more than 5 columns | lay out in at most 5 columns |
+| MAP103 | a column holds sections but no live tasks | drop the column or move a section into it |
+| MAP104 | tallest column > 3x shortest with > 40 live tasks | move sections across columns |
+| MAP105 | a section title is a bare id | retitle in plain words |
+| MAP106 | 3+ columns and a non-first-column section has no waits-on edge | add section waits-on edges |
 | MAP107 | a train has fewer than 2 members | drop the train, keep a task note |
-| MAP108 | more than 40 task edges (arrows default to on-focus) | add dep_notes to cross-group edges |
-| MAP109 | half or more groups hold exactly 1 task | merge 1-task groups |
+| MAP108 | more than 40 task edges (arrows default to on-focus) | add dep_notes to cross-section edges |
+| MAP109 | half or more sections hold exactly 1 task | merge 1-task sections |
 | MAP110 | a task id suffix is longer than 12 chars | shorten the id |
 | MAP111 | deferred share above 20% (info) | no action; deferred auto-collapse |
 

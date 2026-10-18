@@ -1,5 +1,5 @@
 /* Page card: plan progress map, including the replay.
-   Renders the workstream plan DAG (groups in columns, task chips, dep
+   Renders the workstream plan DAG (sections in columns, task chips, dep
    and train arrows, legend) and owns the run-to-task map (TASKMAP,
    loadTaskmap, taskOf, planTaskIds) plus the whole replay: the rp*
    functions nested inside planCard share the one rpCursorTime playhead
@@ -59,7 +59,7 @@
     return s.length > 14 ? s.slice(0, 13) + "…" : s;
   }
   /* Headline for the overall progress bar: counts only, never phases.
-     Groups run in parallel, so naming a phase sequence here misleads. */
+     Sections run in parallel, so naming a phase sequence here misleads. */
   function planHeadline(done, total, nLive) {
     var d = +done || 0, t = +total || 0;
     var s = d + " of " + t + " tasks done · " + (t - d) + " to go";
@@ -133,7 +133,7 @@
     });
     function attText(a) { return a.runs + " run" + (a.runs > 1 ? "s" : "") + ": " + (a.runs - a.reviews) + " build, " + a.reviews + " review" + (a.reviews === 1 ? "" : "s") + (a.sentBack ? ", " + a.sentBack + " sent back (changes, partial or blocked)" : ""); }
     var nLive = Object.keys(live).reduce(function (a, k) { return a + live[k].length; }, 0);
-    var c = el("div", {class: "card", id: "exec-progress", "data-nav": "Plan progress"}, [el("div", {style: "display:flex;align-items:baseline;gap:10px;flex-wrap:wrap"}, [el("h2", {text: plan.ws + " plan progress" + (nLive ? " · " + nLive + " agent" + (nLive > 1 ? "s" : "") + " working" : "")}), (plan.start_prompt ? copyBtn(plan.start_prompt) : null), el("a", {class: "planbtn", href: planUrl(plan.ws), onclick: function (ev) { ev.preventDefault(); openPlan(plan.ws); }, text: "Open the " + plan.ws + " plan"})]), el("p", {class: "sub", text: "Each tile is a group of tasks; groups run in parallel unless an arrow says one waits on another. The pill says where it stands; hover a tile's progress line for the exact counts, or a chip for what it waits on and unblocks."})]);
+    var c = el("div", {class: "card", id: "exec-progress", "data-nav": "Plan progress"}, [el("div", {style: "display:flex;align-items:baseline;gap:10px;flex-wrap:wrap"}, [el("h2", {text: plan.ws + " plan progress" + (nLive ? " · " + nLive + " agent" + (nLive > 1 ? "s" : "") + " working" : "")}), (plan.start_prompt ? copyBtn(plan.start_prompt) : null), el("a", {class: "planbtn", href: planUrl(plan.ws), onclick: function (ev) { ev.preventDefault(); openPlan(plan.ws); }, text: "Open the " + plan.ws + " plan"})]), el("p", {class: "sub", text: "Each tile is a section of the plan; sections run in parallel unless an arrow says one waits on another. The pill says where it stands; hover a tile's progress line for the exact counts, or a chip for what it waits on and unblocks."})]);
     var legendPop = el("div", {class: "pop"}, [el("b", {text: "What the chips mean"})]);
     var legendBtn = el("span", {class: "legend-tip", tabindex: "0", "aria-label": "Legend"}, ["Legend \u24D8", legendPop]);
     c.firstChild.appendChild(legendBtn);
@@ -177,11 +177,17 @@
     mleg.appendChild(legGroup("Edges", legData.edges.map(legEdge)));
     c.appendChild(mleg);
     var workingIds = Object.keys(live);
+    /* Section per working task, next to the label: the plan section
+       holding the task (task -> section title), so the strip reads
+       workstream -> section -> label like the run tables. */
+    var secOf = {};
+    (plan.groups || []).forEach(function (g) { ((g.tasks) || []).forEach(function (t) { if (t && t.id != null) secOf[t.id] = g.title || g.id; }); });
     if (workingIds.length) {
       var wn = el("div", {class: "working-now"}, [el("b", {text: "\u25CF Working now (" + nLive + ")"})]);
       workingIds.forEach(function (tid) { live[tid].forEach(function (r) {
         var slug = String(r.label || "").replace(new RegExp("^" + plan.ws.toLowerCase() + "[-._]?", "i"), "").replace(tid, "").replace(/^[-._]+/, "");
-        var pill = el("button", {class: "wn-pill", title: (r.label || "") + " \u00B7 " + fullName(tierKey(r)) + " \u00B7 " + fmtDur(r.elapsed_s)}, [el("i"), el("span", {class: "wn-id", text: tid}), el("span", {class: "wn-slug", text: slug}), el("span", {class: "wn-tok", text: tokTotal(r.tokens) ? fmtN(tokTotal(r.tokens)) + " \u00B7 " + cachedPct(r.tokens) + "% cached" : (r.context_tokens ? "~" + fmtN(r.context_tokens) + " \u00B7 live" : "")})]);
+        var sec = secOf[tid] || r.section || null;
+        var pill = el("button", {class: "wn-pill", title: (r.label || "") + " \u00B7 " + fullName(tierKey(r)) + " \u00B7 " + fmtDur(r.elapsed_s)}, [el("i"), el("span", {class: "wn-id", text: tid}), sec ? el("span", {class: "wn-sec", text: sec}) : null, el("span", {class: "wn-slug", text: slug}), el("span", {class: "wn-tok", text: tokTotal(r.tokens) ? fmtN(tokTotal(r.tokens)) + " \u00B7 " + cachedPct(r.tokens) + "% cached" : (r.context_tokens ? "~" + fmtN(r.context_tokens) + " \u00B7 live" : "")})]);
         pill.firstChild.style.background = colorOf(tierKey(r));
         pill.addEventListener("click", function () { openRun(r); });
         wn.appendChild(pill);
@@ -191,8 +197,8 @@
     if (unassigned.length) { var ua = el("div", {class: "unassigned"}, [el("b", {style: "font-size:12px;color:var(--ink-2)", text: "Running, not mapped to a task:"})]); unassigned.forEach(function (r) { var sp = el("span", {title: (r.tier || "") + " · " + fmtDur(r.elapsed_s), text: r.label || r.run_id}); sp.style.borderColor = colorOf(tierKey(r)); ua.appendChild(sp); }); c.appendChild(ua); }
     var gs = {}, colStat = {};
     /* Server-computed map layout (dash/maplayout.py, carried on /api/plan):
-       density, per-group collapse state, slim columns, chip labels, arrows
-       policy, train tags, phases line. Null when the server predates it, and
+       density, per-section collapse state, slim columns, chip labels, arrows
+       policy, train tags, sections line. Null when the server predates it, and
        the map below falls back to today's behaviour branch by branch. */
     var L = layoutOf(plan), LGroup = {}, LCol = {}, LTrain = null, foldedIdx = {};
     if (L) {
@@ -231,7 +237,7 @@
     /* Balance caption (standard B7): when the tallest column outweighs the
        shortest more than 3x, the short side says so instead of looking empty. */
     if (L && L.balance && L.balance.ratio != null && L.balance.ratio > 3 && L.balance.shortest && L.balance.tallest && cols[L.balance.shortest.column]) {
-      cols[L.balance.shortest.column].appendChild(el("div", {class: "balance-note", title: "The tallest group (" + L.balance.tallest.title + ") holds " + L.balance.tallest.tasks + " tasks; the renderer compacts but never moves groups"}, [L.balance.shortest.tasks + " tasks · lightest group"]));
+      cols[L.balance.shortest.column].appendChild(el("div", {class: "balance-note", title: "The tallest section (" + L.balance.tallest.title + ") holds " + L.balance.tallest.tasks + " tasks; the renderer compacts but never moves sections"}, [L.balance.shortest.tasks + " tasks · lightest section"]));
     }
     var nodes = {}, chipEl = {}, tGroup = {}, tTitle = {}, tUp = {}, tDown = {}, depth = {};
     var tKind = {}, tStatus = {}, tNotes = {};
@@ -341,7 +347,7 @@
       var mini = el("div", {class: "mini"}); [["done", "var(--good)"], ["pr", "var(--warning)"], ["prog", "var(--s5)"]].forEach(function (p) { var sp = el("span"); sp.style.width = (liveTotal ? 100 * cnt[p[0]] / liveTotal : 0) + "%"; sp.style.background = p[1]; sp.style.display = "block"; mini.appendChild(sp); }); n.appendChild(mini);
       if (L) {
         var ups = (deps[g.id] || []).map(function (d) { return gTitle[d] || d; });
-        if (ups.length && !(liveTotal && cnt.done === liveTotal)) n.appendChild(el("div", {class: "tile-waits", title: "Group edge: this group waits on " + ups.join(", ")}, ["← waits on " + ups.join(", ")]));
+        if (ups.length && !(liveTotal && cnt.done === liveTotal)) n.appendChild(el("div", {class: "tile-waits", title: "Section edge: this section waits on " + ups.join(", ")}, ["← waits on " + ups.join(", ")]));
       }
       var ch = el("div", {class: "chips"});
       var gLive = 0;
@@ -372,7 +378,7 @@
       if (cols[g.col]) { colStat[g.col] = colStat[g.col] || {done: 0, tot: 0, now: false}; colStat[g.col].done += cnt.done; colStat[g.col].tot += liveTotal; }
       return n;
     }
-    /* Slim tile for an all-done group when columns overflow: title, ✓N/N and
+    /* Slim tile for an all-done section when columns overflow: title, ✓N/N and
        the bar, no chips. Click expands the full tile in place. */
     function slimTile(g) {
       var cnt = groupCounts(g);
@@ -392,7 +398,7 @@
       if (cols[g.col]) { colStat[g.col] = colStat[g.col] || {done: 0, tot: 0, now: false}; colStat[g.col].done += cnt.done; colStat[g.col].tot += liveTotal; }
       return b;
     }
-    /* Status pill per group tile: where it stands and why. Skips slim tiles
+    /* Status pill per section tile: where it stands and why. Skips slim tiles
        (they already read ✓N/N) and folded columns (no tile yet). */
     function paintStage(g) {
       var st = gs[g.id], n = nodes[g.id]; if (!st || !n) return;
@@ -403,7 +409,7 @@
       if (st.done) { n.classList.add("g-done"); stage = "✓ Done"; cls = "done"; why = "Every task is merged and live."; }
       else if (st.active) {
         n.classList.add("g-now"); if (colStat[g.col]) colStat[g.col].now = true;
-        if (st.live || k.wip) { stage = "▶ Building"; cls = "now"; why = "Agents are building tasks in this group."; }
+        if (st.live || k.wip) { stage = "▶ Building"; cls = "now"; why = "Agents are building tasks in this section."; }
         else if (k.pr) { stage = "Merging"; cls = "merge"; why = "Work is built and approved; it is waiting to merge."; }
         else { stage = "Rolling out"; cls = "prod"; why = "Merged; waiting on a production step."; }
       }
@@ -423,9 +429,9 @@
       cols[g.col].appendChild(tile);
     });
     if (L && L.folded_rail) {
-      var rail = el("div", {class: "dcol fold-rail"}, [el("div", {class: "dcolh", text: "Later groups"})]);
+      var rail = el("div", {class: "dcol fold-rail"}, [el("div", {class: "dcolh", text: "Later sections"})]);
       (L.folded_rail.columns || []).forEach(function (fc) {
-        var sb = el("button", {class: "slim-tile", title: (fc.title || "") + " · " + (fc.tasks || 0) + " tasks; click to expand this group in place"}, [el("b", {text: fc.title || ("Group " + (fc.index + 1))}), el("span", {text: "+" + (fc.tasks || 0) + " tasks"})]);
+        var sb = el("button", {class: "slim-tile", title: (fc.title || "") + " · " + (fc.tasks || 0) + " tasks; click to expand this section in place"}, [el("b", {text: fc.title || ("Section " + (fc.index + 1))}), el("span", {text: "+" + (fc.tasks || 0) + " tasks"})]);
         sb.addEventListener("click", function (ev) {
           ev.stopPropagation();
           var frag = document.createDocumentFragment();
@@ -441,7 +447,7 @@
       dag.appendChild(rail);
     }
     plan.groups.forEach(function (g) { paintStage(g); });
-    cols.forEach(function (d, i) { var cs = colStat[i]; if (!cs) return; var mb = el("div", {class: "colbar", title: cs.done + " of " + cs.tot + " done in this group"}); var f = el("i"); f.style.width = (cs.tot ? 100 * cs.done / cs.tot : 0) + "%"; mb.appendChild(f); d.insertBefore(mb, d.children[1]); if (cs.now) d.classList.add("c-now"); });
+    cols.forEach(function (d, i) { var cs = colStat[i]; if (!cs) return; var mb = el("div", {class: "colbar", title: cs.done + " of " + cs.tot + " done in this section"}); var f = el("i"); f.style.width = (cs.tot ? 100 * cs.done / cs.tot : 0) + "%"; mb.appendChild(f); d.insertBefore(mb, d.children[1]); if (cs.now) d.classList.add("c-now"); });
     /* Overall progress comes from the server progress object, never recomputed here. */
     var pprog = plan.progress || {done: 0, total: 0, counts: {}, pct: 0};
     pprog.counts = pprog.counts || {};
@@ -449,12 +455,12 @@
     var lg = el("div", {class: "plegend"});
     [["live", "agent working now"], ["wip", "in progress (branch, not merged)"], ["pr", "waiting to merge (approved or PR open)"], ["prog", "merged, waiting on a prod step"], ["done", "done"], ["just", "finished in the last 15 min"], ["todo", "not started"], ["deferred", "deferred or moved to another workstream"]].forEach(function (p) { var ch2 = el("span", {class: "chip " + (p[0] === "just" ? "done just" : p[0])}, [p[0] === "live" ? "\u25CF" : p[0] === "todo" ? "\u00B7" : "\u2009"]); lg.appendChild(el("span", {style: "display:inline-flex;align-items:center;gap:6px"}, [ch2, p[1]])); });
     legendPop.appendChild(lg);
-    legendPop.appendChild(el("p", {text: "The badge on a working chip is the model family and how many agents are on it. \u21BBN counts the agent runs on a task in the last 24 h (an amber edge means it was sent back twice or more). Arrows between tiles show which group waits on which; hover a tile to light up its chain. Every task dependency is an arrow between chips: solid when the prerequisite is done, dashed while it waits; hover an arrow for its condition. Hover a chip to see the tasks it waits on (amber) and unblocks (blue); click to pin the whole chain. A \u25C7 chip is a gate, an outside signal: a check means met. The Arrows toggle switches between all arrows and on-focus only. Chips in a tile run left to right in the order they can start."}));
+    legendPop.appendChild(el("p", {text: "The badge on a working chip is the model family and how many agents are on it. \u21BBN counts the agent runs on a task in the last 24 h (an amber edge means it was sent back twice or more). Arrows between tiles show which section waits on which; hover a tile to light up its chain. Every task dependency is an arrow between chips: solid when the prerequisite is done, dashed while it waits; hover an arrow for its condition. Hover a chip to see the tasks it waits on (amber) and unblocks (blue); click to pin the whole chain. A \u25C7 chip is a gate, an outside signal: a check means met. The Arrows toggle switches between all arrows and on-focus only. Chips in a tile run left to right in the order they can start."}));
     var ob = el("div", {class: "pbig"}), obBar = el("div", {class: "pbig-bar", role: "img", "aria-label": tot.done + " of " + all + " tasks done"});
     [["done", "var(--good)"], ["prog", "var(--s5)"], ["pr", "var(--warning)"]].forEach(function (p) { var sp = el("span"); sp.style.background = p[1]; var pw0 = ((window.__adPrevBar || {})[plan.ws] || {})[p[0]]; sp.style.width = (pw0 == null ? 0 : pw0) + "%"; sp.dataset.w = all ? (100 * (tot[p[0]] || 0) / all) : 0; sp.dataset.k = p[0]; obBar.appendChild(sp); });
     var obPct = el("b", {class: "pbig-pct", text: "0%"});
     ob.appendChild(obPct); ob.appendChild(obBar);
-    /* Counts only: groups run in parallel, so no phase-sequence wording. */
+    /* Counts only: sections run in parallel, so no phase-sequence wording. */
     var headMain = tot.done + " of " + all + " tasks done";
     var headFull = planHeadline(tot.done, all, nLive);
     ob.appendChild(el("div", {class: "pbig-txt", title: tot.done + " done, " + tot.wip + " in progress, " + tot.pr + " waiting to merge, " + tot.prog + " merged and waiting on a prod step, " + tot.todo + " not started" + (tot.deferred ? ", " + tot.deferred + " deferred" : "")}, [el("b", {text: headMain}), headFull.slice(headMain.length)]));
@@ -685,10 +691,10 @@
     }
     /* Narrative groups strip (standard B8): one line on the execution map;
        the full prose cards stay on the plan view where they belong. The
-       strip keeps its data but is labelled "Work groups": the groups run
+       strip keeps its data but is labelled "Sections": the sections run
        in parallel, so "phases" misleads. */
-    if (L && L.phases_line) c.appendChild(el("div", {class: "phases-line", title: "Full prose lives on the plan view"}, [el("b", {text: "Work groups: "}), L.phases_line]));
-    else if (plan.phases && plan.phases.length) { var phw = el("div", {class: "phases-wrap"}); phw.appendChild(el("div", {class: "phases-cap", text: "Work groups"})); var ph = el("div", {class: "phases"}); plan.phases.forEach(function (p) { ph.appendChild(el("div", {class: "phase", title: p.gate ? "Done when: " + p.gate : ""}, [el("b", {text: p.name}), p.goal, p.gate ? el("small", {class: "gate", text: "Done when \u24D8"}) : null])); }); phw.appendChild(ph); c.appendChild(phw); }
+    if (L && L.phases_line) c.appendChild(el("div", {class: "phases-line", title: "Full prose lives on the plan view"}, [el("b", {text: "Sections: "}), L.phases_line]));
+    else if (plan.phases && plan.phases.length) { var phw = el("div", {class: "phases-wrap"}); phw.appendChild(el("div", {class: "phases-cap", text: "Sections"})); var ph = el("div", {class: "phases"}); plan.phases.forEach(function (p) { ph.appendChild(el("div", {class: "phase", title: p.gate ? "Done when: " + p.gate : ""}, [el("b", {text: p.name}), p.goal, p.gate ? el("small", {class: "gate", text: "Done when \u24D8"}) : null])); }); phw.appendChild(ph); c.appendChild(phw); }
     /* Replay: play this workstream's history as a sped-up animation on the map.
        Chips start gray, pulse in their tool color while a mapped run is
        active, and turn done at their done moment; unblocking a dependent
@@ -883,7 +889,7 @@
         var waitOn = (deps[g.id] || []).filter(function (d) { return !gDone[d]; });
         var stage, cls, why;
         if (tot > 0 && n === tot) { stage = "✓ Done"; cls = "done"; why = "Every task is merged and live."; }
-        else if (liveN > 0 || wip > 0) { stage = "▶ Building"; cls = "now"; why = "Agents are building tasks in this group."; }
+        else if (liveN > 0 || wip > 0) { stage = "▶ Building"; cls = "now"; why = "Agents are building tasks in this section."; }
         else if (!waitOn.length) { stage = started ? "Partly done" : "Ready to start"; cls = "ready"; why = started ? "Some tasks are done and nothing is running now." : "Everything it waits on is done."; }
         else { stage = "Waiting"; cls = "wait"; why = "Waits on " + waitOn.map(function (d) { return (gs[d] && gs[d].title) || d; }).join(", ") + "."; }
         els.node.classList.remove("s-done", "s-prog", "s-live", "g-done", "g-now", "g-ready");
@@ -1293,7 +1299,7 @@
         var label;
         if (best) label = "Now building · " + best.title;
         else if (fallback) label = (fallback.stage === "Partly done" ? "Still open · " : fallback.stage === "Ready to start" ? "Ready to start · " : "In progress · ") + fallback.title;
-        else if (rpDoneAt(T) >= rpTotal()) label = "Complete · every group done";
+        else if (rpDoneAt(T) >= rpTotal()) label = "Complete · every section done";
         else label = "Starting · " + (((plan.groups || [])[0] || {}).title || "");
         RP.capStage.textContent = label;
       }

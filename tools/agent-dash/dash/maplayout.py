@@ -2,12 +2,12 @@
 
 Layer B of the map standard lives here, ported from the mockup renderer
 (``mockups/render.js`` in the map-standard scratchpad): density from the
-live task count, done-collapse in oversized groups, short chip labels,
+live task count, done-collapse in oversized sections, short chip labels,
 focus-driven arrows above 40 task edges, solo-train untagging, slim
-all-done columns past 5, and the one-line phases strip.
+all-done columns past 5, and the one-line sections strip.
 
 ``layout`` never rewrites meaning: it never moves a task to another
-group or a group to another column. It only collapses, shortens, caps,
+section or a section to another column. It only collapses, shortens, caps,
 and folds, so ``ws layout`` prints exactly what the page will do.
 ``map_warnings`` is the layer C lint (MAP101 to MAP111): warnings, never
 errors, each naming the threshold, the actual number, and the fix.
@@ -24,9 +24,9 @@ import re
 DENSITY_COMFORT_MAX = 40
 #: Live tasks above this render compact plus full done-collapse.
 DENSITY_ULTRA_MIN = 80
-#: A group with more live tasks than this collapses its done chips.
+#: A section with more live tasks than this collapses its done chips.
 COLLAPSE_ABOVE = 12
-#: Done chips a collapsed group still shows before the ``+N done`` token.
+#: Done chips a collapsed section still shows before the ``+N done`` token.
 COLLAPSE_SHOWN_DONE = 4
 #: Task edges at or below this render arrows-all; above renders on-focus.
 ARROWS_ALL_MAX = 40
@@ -38,7 +38,7 @@ MAX_COLUMNS = 5
 CHIP_TEXT_CAP = 14
 #: A task id suffix longer than this draws a MAP110 warning.
 ID_SUFFIX_WARN = 12
-#: A group with more live tasks than this draws a MAP101 warning.
+#: A section with more live tasks than this draws a MAP101 warning.
 GROUP_BIG_WARN = 14
 #: Trains with fewer members than this render no tag (MAP107).
 TRAIN_MIN_MEMBERS = 2
@@ -48,12 +48,12 @@ LEGEND_TRAINS = 4
 #: (only with more than this many live tasks).
 BALANCE_RATIO = 3
 BALANCE_MIN_LIVE = 40
-#: Half or more single-task groups draws a MAP109 warning.
+#: Half or more single-task sections draws a MAP109 warning.
 SINGLETON_SHARE = 0.5
 #: Deferred share above this draws a MAP111 info.
 DEFERRED_SHARE = 0.20
 #: Columns at or above this count draw a MAP106 warning when a
-#: non-first-column group has no incoming group edge.
+#: non-first-column section has no incoming section edge.
 EDGES_MIN_COLS = 3
 
 _WS_PREFIX = re.compile(r"^WS\d+\.")
@@ -154,7 +154,7 @@ def layout(plan_view: dict, *, viewport_cols: int = 5, density: str | None = Non
     """Compute the map layout for a plan view (flat ``cols/groups/edges`` shape).
 
     ``viewport_cols`` caps how many full columns fit before trailing ones
-    fold into a ``+N later stages`` rail. ``density`` overrides the
+    fold into a ``+N later sections`` rail. ``density`` overrides the
     task-count rule (``comfortable`` or ``compact``).
     """
     if density is not None and density not in ("comfortable", "compact"):
@@ -235,7 +235,7 @@ def layout(plan_view: dict, *, viewport_cols: int = 5, density: str | None = Non
     if folded:
         folded_rail = {
             "columns": [{"index": index, "title": cols[index], "tasks": 0} for index in folded],
-            "label": f"+{len(folded)} later stages",
+            "label": f"+{len(folded)} later sections",
         }
 
     column_groups: dict[int, list[dict]] = {index: [] for index in range(len(cols))}
@@ -431,7 +431,7 @@ def map_warnings(plan_view: dict) -> list[dict]:
 
     Warnings, never errors: a strange plan still renders. Every entry
     carries the machine ``code``, ``severity`` info (the level the doctor
-    reports them at), a human ``title`` naming the group or stage before
+    reports them at), a human ``title`` naming the section before
     any id, the ``detail`` with actual-vs-threshold numbers, and the
     one-line ``fix``. Deterministic: plan order throughout.
     """
@@ -461,9 +461,9 @@ def map_warnings(plan_view: dict) -> list[dict]:
             found.append(
                 _warn(
                     "MAP101",
-                    f'"{title or gid}" group holds {live} tasks ({gid})',
-                    f"{live} live tasks in one group; groups above {COLLAPSE_ABOVE} collapse done chips, groups above {GROUP_BIG_WARN} should split",
-                    f'Split "{title or gid}" ({gid}, {live} tasks) into two stage groups',
+                    f'"{title or gid}" section holds {live} tasks ({gid})',
+                    f"{live} live tasks in one section; sections above {COLLAPSE_ABOVE} collapse done chips, sections above {GROUP_BIG_WARN} should split",
+                    f'Split "{title or gid}" ({gid}, {live} tasks) into two sections',
                 )
             )
 
@@ -473,7 +473,7 @@ def map_warnings(plan_view: dict) -> list[dict]:
                 "MAP102",
                 f"Plan has {len(cols)} columns",
                 f"{len(cols)} authored columns; at most {MAX_COLUMNS} render full, the rest slim or fold into a rail",
-                f"Re-stage into at most {MAX_COLUMNS} columns; columns {MAX_COLUMNS + 1}+ fold into a rail",
+                f"Lay out in at most {MAX_COLUMNS} columns; columns {MAX_COLUMNS + 1}+ fold into a rail",
             )
         )
 
@@ -493,8 +493,8 @@ def map_warnings(plan_view: dict) -> list[dict]:
                 _warn(
                     "MAP103",
                     f'"{title}" column has no live tasks',
-                    f"column {index} ({title}) holds groups but no live tasks",
-                    f'Drop "{title}" or move a group into it',
+                    f"column {index} ({title}) holds sections but no live tasks",
+                    f'Drop "{title}" or move a section into it',
                 )
             )
 
@@ -510,7 +510,7 @@ def map_warnings(plan_view: dict) -> list[dict]:
                     "MAP104",
                     f'"{cols[tall]}" column outweighs "{cols[short]}" ({col_total[tall]} to {col_total[short]} tasks)',
                     f"tallest column holds {col_total[tall]} tasks, shortest {col_total[short]} (bar: {BALANCE_RATIO}x with more than {BALANCE_MIN_LIVE} live tasks)",
-                    "Regroup across stages; the renderer compacts but never moves groups",
+                    "Move sections across columns; the renderer compacts but never moves sections",
                 )
             )
 
@@ -523,8 +523,8 @@ def map_warnings(plan_view: dict) -> list[dict]:
             found.append(
                 _warn(
                     "MAP105",
-                    f'"{title}" group title is a bare id ({gid})',
-                    f"group {gid} titles itself with an id-shaped string, not plain words",
+                    f'"{title}" section title is a bare id ({gid})',
+                    f"section {gid} titles itself with an id-shaped string, not plain words",
                     f"Retitle {gid} in plain words",
                 )
             )
@@ -546,9 +546,9 @@ def map_warnings(plan_view: dict) -> list[dict]:
             found.append(
                 _warn(
                     "MAP106",
-                    f"{len(uncovered)} stage groups have no waits-on edge",
-                    f"{len(edges)} group edges across {len(cols)} columns leave {', '.join(uncovered)} with no upstream stage",
-                    "Add stage waits-on edges so columns mean something",
+                    f"{len(uncovered)} sections have no waits-on edge",
+                    f"{len(edges)} section edges across {len(cols)} columns leave {', '.join(uncovered)} with no upstream section",
+                    "Add section waits-on edges so columns mean something",
                 )
             )
 
@@ -572,7 +572,7 @@ def map_warnings(plan_view: dict) -> list[dict]:
                 "MAP108",
                 f"Plan has {task_edges} task deps",
                 f"{task_edges} task deps (bar: {ARROWS_ALL_MAX}); the map defaults to on-focus arrows",
-                "Map defaults to on-focus arrows; add dep_notes to cross-group edges",
+                "Map defaults to on-focus arrows; add dep_notes to cross-section edges",
             )
         )
 
@@ -582,9 +582,9 @@ def map_warnings(plan_view: dict) -> list[dict]:
             found.append(
                 _warn(
                     "MAP109",
-                    f"{singletons} of {len(groups)} groups hold a single task",
-                    f"{singletons} single-task groups out of {len(groups)} (bar: half or more)",
-                    "Merge 1-task groups into their stage group",
+                    f"{singletons} of {len(groups)} sections hold a single task",
+                    f"{singletons} single-task sections out of {len(groups)} (bar: half or more)",
+                    "Merge 1-task sections into their column's section",
                 )
             )
 

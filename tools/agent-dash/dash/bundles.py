@@ -577,10 +577,10 @@ def _template_plan(ws: str) -> dict:
                     "verify": "the command to run",
                 }
             ],
-            "new_tasks": [{"id": f"{ws}.1", "title": "First task", "phase": "First phase", "size": "S"}],
+            "new_tasks": [{"id": f"{ws}.1", "title": "First task", "phase": "First section", "size": "S"}],
         },
         "dag": {
-            # One starting stage: the planner adds the 4 to 5 stage columns
+            # One starting section: the planner adds the 4 to 5 columns
             # from the map checklist as the plan takes shape, so a fresh
             # bundle carries zero MAP warnings.
             "cols": ["Shape"],
@@ -588,7 +588,7 @@ def _template_plan(ws: str) -> dict:
                 {
                     "id": "start",
                     "col": 0,
-                    "title": "First group",
+                    "title": "First section",
                     "tasks": [{"id": f"{ws}.1", "title": "First task", "status": "todo", "deps": []}],
                 }
             ],
@@ -599,8 +599,8 @@ def _template_plan(ws: str) -> dict:
             "end_state": "What is true when this workstream is done.",
             "phases": [
                 {
-                    "name": "First phase",
-                    "goal": "What this phase delivers.",
+                    "name": "First section",
+                    "goal": "What this section delivers.",
                     "gate": "What must be true to leave it.",
                 }
             ],
@@ -728,25 +728,25 @@ def _validate_dag(issues: list[str], dag) -> None:
     ids = set()
     for group in groups:
         if not isinstance(group, dict):
-            issues.append("plan.json: each group must be an object")
+            issues.append("plan.json: each section (a dag.groups entry) must be an object")
             continue
         gid = group.get("id")
-        _require_str(issues, "plan.json", gid, "group id")
+        _require_str(issues, "plan.json", gid, "section id")
         if isinstance(gid, str):
             if gid in ids:
-                issues.append(f"plan.json: duplicate group id {gid}")
+                issues.append(f"plan.json: duplicate section id {gid}")
             ids.add(gid)
         col = group.get("col")
         if not isinstance(col, int) or isinstance(col, bool) or col < 0 or (cols and col >= len(cols)):
-            issues.append(f"plan.json: group {gid} col is outside dag.cols")
-        _require_str(issues, "plan.json", group.get("title"), f"group {gid} title")
+            issues.append(f"plan.json: section {gid} col is outside dag.cols")
+        _require_str(issues, "plan.json", group.get("title"), f"section {gid} title")
         tasks = group.get("tasks")
         if not isinstance(tasks, list):
-            issues.append(f"plan.json: group {gid} tasks must be a list")
+            issues.append(f"plan.json: section {gid} tasks must be a list")
             continue
         for task in tasks:
             if not isinstance(task, dict):
-                issues.append(f"plan.json: group {gid} has a task that is not an object")
+                issues.append(f"plan.json: section {gid} has a task that is not an object")
                 continue
             tid = task.get("id")
             _require_str(issues, "plan.json", tid, "task id")
@@ -920,10 +920,10 @@ def _validate_narrative(issues: list[str], narrative, require: bool) -> None:
         return
     for phase in phases:
         if not isinstance(phase, dict):
-            issues.append("plan.json: each phase must be an object")
+            issues.append("plan.json: each section (a narrative.phases entry) must be an object")
             continue
         for key in ("name", "goal", "gate"):
-            _require_str(issues, "plan.json", phase.get(key), f"phase {key}")
+            _require_str(issues, "plan.json", phase.get(key), f"section {key}")
 
 
 def empty_approvals(ws: str) -> dict:
@@ -1421,7 +1421,7 @@ def print_layout(ws: str, json_mode: bool = False) -> int:
     print(
         f"{ws} map layout: {result['density']} density "
         f"({result['live_tasks']} live, {result['deferred_tasks']} deferred), "
-        f"arrows {result['arrows']['mode']} ({result['arrows']['reason']}, {result['group_edges']} group edges)"
+        f"arrows {result['arrows']['mode']} ({result['arrows']['reason']}, {result['group_edges']} section edges)"
     )
     parts = [f"{col['title']}[{col['tasks']} {col['state']}]" for col in result["columns"]]
     print(f"columns ({len(parts)}): {' '.join(parts)}")
@@ -1436,7 +1436,7 @@ def print_layout(ws: str, json_mode: bool = False) -> int:
     for group in result["groups"]:
         counts[group["state"]] = counts.get(group["state"], 0) + 1
     print(
-        f"groups ({len(result['groups'])}): {counts.get('open', 0)} open, "
+        f"sections ({len(result['groups'])}): {counts.get('open', 0)} open, "
         f"{counts.get('collapsed-done', 0)} collapsed-done, {counts.get('slim', 0)} slim"
     )
     for group in result["groups"]:
@@ -1783,7 +1783,7 @@ def print_plan(ws: str, json_mode: bool = False) -> int:
         return 0
     print(f"plan {ws}: {sum(len(group['tasks']) for group in groups)} tasks")
     for group in groups:
-        print(f"group {group.get('id')}: {group.get('title')}")
+        print(f"section {group.get('id')}: {group.get('title')}")
         for task in group["tasks"]:
             deps = f" (deps: {', '.join(task['deps'])})" if task["deps"] else ""
             print(f"  {task.get('id')} [{task.get('status')}] {task.get('title')}{deps}")

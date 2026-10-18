@@ -16,7 +16,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from dash.buildinfo import build_info
-from dash.bundles import approvals_all, approvals_for, list_bundles, load_bundle_api, read_page, resolve_plan, start_prompt_text, workstream_plan_ids
+from dash.bundles import approvals_all, approvals_for, list_bundles, load_bundle_api, plans_stamp, read_page, resolve_plan, start_prompt_text, workstream_plan_ids
 from dash.errors import api_error
 from dash.plans import PlanError
 from dash.pricing import health_block
@@ -108,6 +108,29 @@ def _plan_map_cached(ws: str, body: dict) -> dict:
     if mtime is not None:
         _PLAN_MAP_CACHE[ws] = (mtime, payload)
     return payload
+
+
+def _with_run_sections(body: dict) -> dict:
+    """Snapshot body with plan sections on its running/recent rows.
+
+    Copies, never mutates: the snapshot cache owns the stored payload, so
+    the annotated lists replace (never mutate) its entries. Rows that map
+    to no plan task read ``section: null`` ("Unsectioned" on the page).
+    Never raises: an annotation failure serves the rows as they were.
+    """
+    if not isinstance(body, dict):
+        return body
+    try:
+        from dash import sections as _sections
+
+        body = dict(body)
+        if isinstance(body.get("running"), list):
+            body["running"] = _sections.annotate_runs(body["running"])
+        if isinstance(body.get("recent"), list):
+            body["recent"] = _sections.annotate_runs(body["recent"])
+    except Exception:
+        pass
+    return body
 
 
 class DashServer(ThreadingHTTPServer):
@@ -457,13 +480,17 @@ class Handler(BaseHTTPRequestHandler):
         # the conditional layer could never engage. data_seq is the true
         # data version: it moves only when a write lands. The recent page
         # rides the identity too, so one page's 304 never serves another's
-        # bytes and page fetches stay small.
+        # bytes and page fetches stay small. The plan stamp rides along as
+        # well: run rows carry their plan section, so a plan edit retags
+        # even when no store write landed. All three are stable file stats
+        # and counters, never volatile clocks.
         try:
             ident = (
                 "snapshot",
                 store.snapshot_key(ws, since, until, usage_group, recent_limit, recent_offset),
                 store.data_seq,
                 ignore_key,
+                plans_stamp(),
             )
         except Exception:
             ident = None
@@ -486,7 +513,7 @@ class Handler(BaseHTTPRequestHandler):
                     body["usage"] = fold_other_keys(body["usage"], ignored)
                 except Exception:
                     pass
-        self._json(200, body, etag=etag)
+        self._json(200, _with_run_sections(body), etag=etag)
 
     def _workstreams(self, query):
         from dash.workstates import all_bundle_meta, bundle_fallback_rows, filter_rows, parse_state_param
@@ -809,6 +836,8 @@ class Handler(BaseHTTPRequestHandler):
         # useless, but the rows only move on store writes, so a match
         # skips the whole query and the megabytes of transfer. store.seq
         # stays out: it advances on every poll without moving any row.
+        # The plan stamp rides along too: rows carry their plan section,
+        # so a plan edit retags even when no store write landed.
         store = self.server.store
         try:
             ident = (
@@ -816,13 +845,17 @@ class Handler(BaseHTTPRequestHandler):
                 None if since is None else int(float(since) // 30),
                 None if until is None else int(float(until) // 30),
                 limit, include, int(now // 60), store.data_seq,
+                plans_stamp(),
             )
         except Exception:
             ident = None
         etag = _identity_etag(*ident) if ident is not None else None
         if self._not_modified(etag):
             return
-        self._json(200, {"runs": store.query_runs(now, ws, since, until, limit, include_jobs=include == "jobs")}, etag=etag)
+        from dash import sections as _sections
+
+        rows = store.query_runs(now, ws, since, until, limit, include_jobs=include == "jobs")
+        self._json(200, {"runs": _sections.annotate_runs(rows)}, etag=etag)
 
     def _usage(self, query):
         group = _choice(query, "group", "model", {"model", "workstream", "tool"})

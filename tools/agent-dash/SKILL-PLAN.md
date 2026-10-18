@@ -14,7 +14,7 @@ That writes `bundle.json`, a template `plan.json`, `layout.json`, an empty `visu
 
 Fill `plan.json` before you render. The shape is the decision record: `dag`, `decisions`, `motivation`, `agent_friendly`, `narrative`. Task status is `todo`, `wip`, `pr`, `prog`, `done`, or `deferred`. `wip` is work on a branch; `pr` is approved or open. A deferred task can set `moved_to` to a workstream id and a `note`. Keep done tasks in the dag so the map shows progress.
 
-`dag.cols` is the column titles, left to right. Each group has `id`, `col`, `title`, and `tasks`. Each task has `id`, `title`, and `status`. A task may carry `deps` (task ids it waits on) and `dep_notes` (a map from one of its dep ids to the short condition on that edge, e.g. "run only after the export"). A task that is an outside signal or condition rather than work in this workstream carries `"kind": "gate"` (default `"task"`); the map draws it as a diamond. Edges are pairs of group ids and mean "this group waits on that one".
+`dag.cols` is the column titles, left to right. Each section (a `dag.groups` entry) has `id`, `col`, `title`, and `tasks`. Each task has `id`, `title`, and `status`. A task may carry `deps` (task ids it waits on) and `dep_notes` (a map from one of its dep ids to the short condition on that edge, e.g. "run only after the export"). A task that is an outside signal or condition rather than work in this workstream carries `"kind": "gate"` (default `"task"`); the map draws it as a diamond. Edges are pairs of section ids and mean "this section waits on that one".
 
 A task may declare `"files": ["api/x.py", "api/*.py"]`, the file footprints it touches. `ws waves` splits a dependency level so no two tasks in one wave share a file, and `ws overlap` warns while colliding tasks are still open. Keep the globs tight: a literal path beats a wildcard.
 
@@ -41,14 +41,14 @@ Open `http://127.0.0.1:8765/plan?ws=WS4`. Overview is first, then bundles in ord
 
 The plan-progress map stays readable when the plan follows these nine rules. Run `ws layout <ID>` before kickoff and aim for zero MAP warnings. `ws validate` reports the same MAP101–MAP111 codes as warnings (exit stays 0); each names its threshold, the actual number, and the fix.
 
-1. Stage 4 to 5 columns with one- or two-word plain names. Never more than 5 (MAP102), never an empty column (MAP103).
-2. Keep 2 to 4 groups per column and 3 to 12 tasks per group. Merge 1-task groups into their stage group (MAP109); split groups above 14 tasks (MAP101).
-3. Title each group with the outcome in plain words (at most 40 chars), never a bare id (MAP105).
+1. Lay out 4 to 5 columns with one- or two-word plain names. Never more than 5 (MAP102), never an empty column (MAP103).
+2. Keep 2 to 4 sections per column and 3 to 12 tasks per section. Merge 1-task sections into their column's section (MAP109); split sections above 14 tasks (MAP101).
+3. Title each section with the outcome in plain words (at most 40 chars), never a bare id (MAP105).
 4. Keep task id suffixes short and unique inside the workstream (at most 12 chars, MAP110). The map strips the `WS<n>.` prefix and caps display at 14 chars.
-5. Give every group outside the first column a waits-on edge to a group on its left, so columns tell the left-to-right story (MAP106).
+5. Give every section outside the first column a waits-on edge to a section on its left, so columns tell the left-to-right story (MAP106).
 6. Mark outside signals as `kind: gate` diamonds with `signal`, `confirmed_at`, and `fresh_hours`. Keep gate ids short.
 7. Keep trains at 2 to 8 members. A 1-member train renders untagged (MAP107); keep a task note instead.
-8. Put one short condition (at most 80 chars) in `dep_notes` on each cross-group dep. Above 40 task edges the map defaults to on-focus arrows (MAP108).
+8. Put one short condition (at most 80 chars) in `dep_notes` on each cross-section dep. Above 40 task edges the map defaults to on-focus arrows (MAP108).
 9. Keep done tasks in the dag. Leave deferred tasks where planned with `moved_to` plus `note`; the map folds them to one chip (above 20% deferred is MAP111, info only).
 
 ## Move a task

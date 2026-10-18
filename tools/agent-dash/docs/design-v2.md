@@ -32,7 +32,7 @@ All numbers below are invented examples, not live data.
 
 Same tiles scoped to the workstream (live, finished, tokens, cost with the same sparkline/delta components), then the **plan progress map**:
 
-- Always-visible compact legend row (colour + symbol + words; details stay in the popover as today). Columns = plan phases, cards = groups with `N of M done`, chips = tasks: `✓` done green, `●` working-now blue solid + pulse + agent-count badge, `⧗` open-PR amber, `⇡` merged-waiting-prod magenta, `◇` gate dashed (hollow unmet, `✓` met), `↷` deferred dotted-faded, dashed gray not-started.
+- Always-visible compact legend row (colour + symbol + words; details stay in the popover as today). Columns hold plan sections, cards = sections with `N of M done`, chips = tasks: `✓` done green, `●` working-now blue solid + pulse + agent-count badge, `⧗` open-PR amber, `⇡` merged-waiting-prod magenta, `◇` gate dashed (hollow unmet, `✓` met), `↷` deferred dotted-faded, dashed gray not-started.
 - **Arrows on focus:** hovering or keyboard-focusing a chip dims unrelated groups, outlines the chip, draws amber dashed arrows from its prerequisites and blue dashed arrows to its dependents, and lists `waits on: …` in the tooltip. Group-level dashed arrows between columns render always (from the plan's group edges).
 - Merge-train members get a tag + a caption line naming the trains (example: `3 merge trains — showing tags for: …`).
 

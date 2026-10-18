@@ -47,7 +47,7 @@
       return ["tiles", keyOf([snap.counts, snap.totals, snap.totals_all_time, snap.last_activity, state.ws, state.snapError]), function () { return tiles(snap); }, state.ws === "all" ? "margin-top:14px" : ""];
     }},
     {id: "running", order: 30, scope: "both", spec: function (state, snap) {
-      return ["running", keyOf((snap.running || []).map(runRow)), function () { return runsTable("Running now", "Most recently active first. Click a row for details. Output \u25B2 means the out file grew since the last poll.", snap.running || [], state.snapError ? "request failed" : "Nothing running."); }, "margin-top:14px"];
+      return ["running", keyOf((snap.running || []).map(function (r) { return [runRow(r), r.section, r.section_index]; })), function () { return runsTable("Running now", "Grouped workstream \u2192 section \u2192 agent; freshest first when collapsed. Click a row for details. Output \u25B2 means the out file grew since the last poll.", snap.running || [], state.snapError ? "request failed" : "Nothing running."); }, "margin-top:14px"];
     }},
     /* Workstream cards on the overview read the same snapshot rows the tiles
        read, so each card matches its workstream tab for the fixed 24 h window. */
@@ -56,7 +56,7 @@
     }},
     {id: "plan", order: 50, scope: "both", spec: function (state, snap) {
       if (!state.plan) return null;
-      return ["plan", keyOf([state.plan, (snap.running || []).map(function (r) { return [r.label, r.workstream, r.run_id]; }), (snap.recent || []).map(function (r) { return [r.label, r.ended_at, r.verdict]; }), (state.runs || []).length]), function () { return planCard(state.plan, snap); }, "margin-top:14px"];
+      return ["plan", keyOf([state.plan, (snap.running || []).map(function (r) { return [r.label, r.workstream, r.run_id, r.section]; }), (snap.recent || []).map(function (r) { return [r.label, r.ended_at, r.verdict]; }), (state.runs || []).length]), function () { return planCard(state.plan, snap); }, "margin-top:14px"];
     }},
     {id: "tokens", order: 60, scope: "both", spec: function (state, snap) {
       return ["tokens", keyOf([state.usage, state.groupBy, Math.floor(Date.now() / 60000)]), function () { return tokenChart(); }, "margin-top:14px"];
@@ -75,7 +75,7 @@
          new rows rebuild only this section while the page stays put. */
       var scope = state.ws;
       var page = resolveFinished(snap, scope);
-      return ["finished", keyOf([page.rows.map(runRow), page.total, page.page, page.size, scope]), function () {
+      return ["finished", keyOf([page.rows.map(function (r) { return [runRow(r), r.section, r.section_index]; }), page.total, page.page, page.size, scope]), function () {
         var foot = renderPager("finished", "Finished agents", scope, page.total, redrawSection("finished"));
         return runsTable("Finished (24 h)", finishedSub(snap), page.rows, state.snapError ? "request failed" : (page.pending ? "Loading this page of finished agents…" : "Nothing finished in the last 24 h."), foot);
       }, "margin-top:14px"];

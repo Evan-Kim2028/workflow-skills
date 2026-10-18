@@ -272,7 +272,7 @@ class MapLayoutThresholdTest(unittest.TestCase):
         result = maplayout.layout(body)
         states = [col["state"] for col in result["columns"]]
         self.assertEqual(states, ["full"] * 5 + ["folded"])
-        self.assertEqual(result["folded_rail"]["label"], "+1 later stages")
+        self.assertEqual(result["folded_rail"]["label"], "+1 later sections")
         self.assertEqual([entry["title"] for entry in result["folded_rail"]["columns"]], ["Six"])
 
     def test_unmet_gate_blocks_the_fold(self):

@@ -213,9 +213,9 @@
     {
       "code": "MAP109",
       "severity": "info",
-      "title": "1 of 2 groups hold a single task",
-      "detail": "1 single-task groups out of 2 (bar: half or more)",
-      "fix": "Merge 1-task groups into their stage group"
+      "title": "1 of 2 sections hold a single task",
+      "detail": "1 single-task sections out of 2 (bar: half or more)",
+      "fix": "Merge 1-task sections into their column's section"
     }
   ]
 }

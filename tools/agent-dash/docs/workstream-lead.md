@@ -14,7 +14,7 @@ This creates a bundle in `~/.local/share/agent-dash/workstreams/WS4/`. Fill thes
 
 | File | What goes in it |
 |---|---|
-| `plan.json` | The decision record. Decisions with alternatives and evidence. Motivation: today, after, costs, and where it is not better. The agent-friendly litmus. The task graph: `dag.cols`, `groups[].tasks` with `id`, `title`, `status`, `deps` (the task ids it waits on, across groups) and optional `wave`, plus group `edges`. The narrative: thesis, end state, and phases. |
+| `plan.json` | The decision record. Decisions with alternatives and evidence. Motivation: today, after, costs, and where it is not better. The agent-friendly litmus. The task graph: `dag.cols`, `groups[].tasks` with `id`, `title`, `status`, `deps` (the task ids it waits on, across sections) and optional `wave`, plus section `edges`. The narrative: thesis, end state, and sections (`narrative.phases`). |
 | `visuals.html` | Hand-made diagrams and charts, as `<section class="pl-sec lay"><h2>Title</h2>...</section>`. Every chart has x and y axes and compact numbers. |
 | `layout.json` | Which visual sections go in Why, End state, Plan, Agent-friendly and Reference. |
 
