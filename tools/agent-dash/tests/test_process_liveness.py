@@ -17,6 +17,17 @@ def load(name):
 
 process = load("process")
 
+
+def load_liveness():
+    path = os.path.join(ROOT, "dash", "liveness.py")
+    spec = importlib.util.spec_from_file_location("dash_liveness", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+liveness = load_liveness()
+
 SID = "ce22eaff-a7d1-4b65-8e9d-0ff213fcc1f5"
 SID_UPPER = SID.upper()
 MUSE_ARGV = (
@@ -648,6 +659,56 @@ class RunWorkerLabelTests(unittest.TestCase):
                 set(row),
                 {"pid", "comm", "started_at", "label", "prompt_label", "session_id"},
             )
+
+
+class QuotaAndPidFileTests(unittest.TestCase):
+    def test_text_patterns(self):
+        self.assertTrue(liveness.text_shows_quota("Usage limit reached for 5 hours"))
+        self.assertTrue(liveness.text_shows_quota("RATE LIMIT exceeded, retry later"))
+        self.assertTrue(liveness.text_shows_quota("request failed with error 429"))
+        self.assertTrue(liveness.text_shows_quota("429 Too Many Requests"))
+        self.assertTrue(liveness.text_shows_quota("over quota, cooling down"))
+        self.assertFalse(liveness.text_shows_quota("PASS\nall done\n"))
+        self.assertFalse(liveness.text_shows_quota(""))
+        self.assertFalse(liveness.text_shows_quota(None))
+        self.assertFalse(liveness.text_shows_quota("all good", patterns=["(["]))
+
+    def test_file_tail(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            hit = os.path.join(tmp, "err.log")
+            with open(hit, "wb") as fh:
+                fh.write(b"x" * 9000 + b"\nUsage limit reached for 5 hour\n")
+            self.assertTrue(liveness.file_shows_quota(hit))
+            miss = os.path.join(tmp, "clean.log")
+            with open(miss, "wb") as fh:
+                fh.write(b"working\nPASS\n")
+            self.assertFalse(liveness.file_shows_quota(miss))
+            empty = os.path.join(tmp, "empty.log")
+            open(empty, "wb").close()
+            self.assertFalse(liveness.file_shows_quota(empty))
+            self.assertFalse(liveness.file_shows_quota(os.path.join(tmp, "missing.log")))
+            self.assertFalse(liveness.file_shows_quota(None))
+
+    def test_read_pid_file(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            pid_path = os.path.join(tmp, "ws9-x.pid")
+            with open(pid_path, "w") as fh:
+                fh.write("25345\n")
+            self.assertEqual(liveness.read_pid_file(pid_path), 25345)
+            blank = os.path.join(tmp, "blank.pid")
+            with open(blank, "w") as fh:
+                fh.write("   \n")
+            self.assertIsNone(liveness.read_pid_file(blank))
+            junk = os.path.join(tmp, "junk.pid")
+            with open(junk, "w") as fh:
+                fh.write("not-a-pid\n")
+            self.assertIsNone(liveness.read_pid_file(junk))
+            self.assertIsNone(liveness.read_pid_file(os.path.join(tmp, "missing.pid")))
+            self.assertIsNone(liveness.read_pid_file(None))
 
 
 if __name__ == "__main__":

@@ -40,6 +40,7 @@ import os
 import zlib
 from datetime import datetime
 
+from dash.liveness import file_shows_quota, read_pid_file
 from dash.sources.process import apply_liveness, live_agent_processes
 
 log = logging.getLogger("agent_dash.grok_cli")
@@ -74,6 +75,7 @@ def _poll(store, cfg, now):
     processes = _agent_processes()
 
     manifests = {}
+    pads = {}
     for scratch in _scratch_roots(cfg):
         for pad, parent in _manifest_dirs(scratch, "glm-sessions.tsv", only):
             path = os.path.join(pad, "glm-sessions.tsv")
@@ -82,10 +84,12 @@ def _poll(store, cfg, now):
                 continue
             for row in _parse_manifest(text):
                 row["parent_session_id"] = parent
-                _keep_latest(manifests, row)
+                if _keep_latest(manifests, row):
+                    pads[row["session_id"]] = pad
 
+    latest = _latest_per_label(manifests)
     for row in manifests.values():
-        _upsert_run(store, row, None, None, processes)
+        _upsert_run(store, row, None, None, processes, pads.get(row["session_id"]), row["session_id"] in latest, now)
 
     index = _session_index(sessions)
     authoritative = set()
@@ -329,7 +333,7 @@ def _add_usage(store, row):
         _fail("usage")
 
 
-def _upsert_run(store, row, model, pid, processes=None):
+def _upsert_run(store, row, model, pid, processes=None, pad=None, is_latest=True, now=None):
     sid = row["session_id"]
     run = {
         "run_id": _run_id(row),
@@ -350,7 +354,11 @@ def _upsert_run(store, row, model, pid, processes=None):
         run["clock_source"] = "manifest"
     if pid:
         run["pid"] = pid
+    if is_latest and pad and row.get("label") and run.get("pid") is None:
+        _adopt_pid_file(run, pad, row["label"])
     apply_liveness(store, run, "glm", processes)
+    if is_latest and pad and row.get("label"):
+        _apply_quota_closeout(run, pad, row["label"], now)
     try:
         store.upsert_run(run)
     except Exception:
@@ -367,6 +375,65 @@ def _upsert_run(store, row, model, pid, processes=None):
         store.upsert_session(session)
     except Exception:
         _fail("session")
+
+
+def _adopt_pid_file(run, pad, label) -> None:
+    """Adopt the run dir's ``<label>.pid`` onto ``run`` (in place).
+
+    Runs before ``apply_liveness`` so the authoritative pid joins the
+    pid-leg match and the dead-pid close: a dead pid closes through the
+    fast dead-pid path (with its grace and sample checks) instead of the
+    6 h idle one. Missing files change nothing; failures never raise.
+    """
+    try:
+        pid_paths, _err_paths, _out_paths = _run_log_files(pad, label)
+    except Exception:
+        return
+    try:
+        for path in pid_paths:
+            candidate = read_pid_file(path)
+            if candidate is None:
+                continue
+            run["pid"] = candidate
+            return
+    except Exception:
+        return
+
+
+def _apply_quota_closeout(run, pad, label, now=None) -> None:
+    """Close a quota/rate-limit failure as done/BLOCKED (in place).
+
+    Runs after ``apply_liveness`` and wins over it: a quota hit in the
+    run dir's err/out logs ends the run even while a label match still
+    reads running, so quota failures never linger as running or inherit
+    a shared out file's PASS. Missing files change nothing; failures
+    never raise.
+    """
+    try:
+        _pid_paths, err_paths, out_paths = _run_log_files(pad, label)
+    except Exception:
+        return
+    quota_paths = []
+    try:
+        for path in list(err_paths) + list(out_paths):
+            try:
+                if file_shows_quota(path):
+                    quota_paths.append(path)
+            except Exception:
+                continue
+    except Exception:
+        quota_paths = []
+    if not quota_paths:
+        return
+    run["status"] = "done"
+    run["verdict"] = "BLOCKED"
+    try:
+        stamp = _quota_ended_at(quota_paths, now if now is not None else __import__("time").time())
+    except Exception:
+        stamp = None
+    if stamp is not None:
+        run["ended_at"] = stamp
+    run["pid"] = None
 
 
 def _agent_processes():
@@ -413,9 +480,62 @@ def _parse_manifest(text):
 
 
 def _keep_latest(manifests, row):
+    """Keep the newest row per session id. True when ``row`` was kept."""
     prev = manifests.get(row["session_id"])
     if prev is None or (row.get("started_at") or -1) >= (prev.get("started_at") or -1):
         manifests[row["session_id"]] = row
+        return True
+    return False
+
+
+def _latest_per_label(manifests) -> set:
+    """Session ids of the newest manifest row per label.
+
+    Retries reuse the label under a new session id while the TSV keeps
+    every attempt. Pid files and err logs are per label, so they name the
+    newest attempt only: quota and pid evidence applies to it alone.
+    """
+    best: dict = {}
+    for sid, row in (manifests or {}).items():
+        label = (row.get("label") or "").strip()
+        if not label:
+            continue
+        started = row.get("started_at")
+        started = float(started) if isinstance(started, (int, float)) and not isinstance(started, bool) else -1.0
+        prev = best.get(label)
+        if prev is None or started >= prev[0]:
+            best[label] = (started, sid)
+    return {sid for _, sid in best.values()}
+
+
+def _run_log_files(pad, label):
+    """Candidate ``(<label>.pid``, ``err-<label>.log``, ``out-<label>.md``) paths.
+
+    ``run_worker.py`` writes the pid file and the logs beside the manifest
+    TSV: directly beside it in a flat run folder, or under the ``glm/``
+    tool folder in a session pad. Every candidate is room-checked by the
+    caller; missing files simply miss.
+    """
+    pid_paths, err_paths, out_paths = [], [], []
+    if pad and isinstance(pad, str) and label:
+        for directory in (pad, os.path.join(pad, "glm")):
+            pid_paths.append(os.path.join(directory, "%s.pid" % label))
+            err_paths.append(os.path.join(directory, "err-%s.log" % label))
+            out_paths.append(os.path.join(directory, "out-%s.md" % label))
+    return pid_paths, err_paths, out_paths
+
+
+def _quota_ended_at(paths, now):
+    """Newest mtime of the quota-hit logs, or ``now`` when unreadable."""
+    latest = None
+    for path in paths or ():
+        try:
+            mtime = os.path.getmtime(path)
+        except OSError:
+            continue
+        if latest is None or mtime > latest:
+            latest = mtime
+    return latest if latest is not None else now
 
 
 def _session_index(root):
