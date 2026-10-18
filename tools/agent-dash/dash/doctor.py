@@ -214,6 +214,7 @@ def collect_problems(
     pgrep_counts: dict | None = None,
     workers_registry: dict | None = None,
     ppids: dict | None = None,
+    tool_root=None,
 ) -> dict:
     """Run every check. Returns ``{"problems", "checks"}`` with fresh problems.
 
@@ -223,7 +224,8 @@ def collect_problems(
     the dashboard is down. ``processes`` is the live worker listing; when
     None the fleet checks that need it are skipped. ``argv_tokens``,
     ``pgrep_counts``, ``workers_registry``, and ``ppids`` override the
-    live reads (tests inject fakes).
+    live reads (tests inject fakes). ``tool_root`` overrides the checkout
+    the git-backed checks read (tests point it at a temp repo).
     """
     cfg = cfg if isinstance(cfg, dict) else {}
     ctx = SimpleNamespace(
@@ -239,6 +241,7 @@ def collect_problems(
         pgrep_counts=pgrep_counts,
         workers_registry=workers_registry,
         ppids=ppids,
+        tool_root=Path(tool_root) if tool_root is not None else TOOL_ROOT,
         problems=[],
         checks=[],
         emitted=set(),
@@ -259,6 +262,7 @@ def collect_problems(
     _collect_page(ctx)
     _collect_config(ctx)
     _collect_checkout(ctx)
+    _collect_build(ctx)
     _collect_python(ctx)
     _emit_grouped(ctx)
     return {"problems": ctx.problems, "checks": ctx.checks}
@@ -1067,20 +1071,41 @@ def _collect_page(ctx) -> None:
         )
 
 
-def _config_files() -> list[Path]:
+def _state_config_file(state_dir=None) -> Path | None:
+    """``<state-dir>/config.local.json`` when local files count.
+
+    Mirrors ``load_cfg``: the state dir copy lets a release checkout run
+    with the user's settings. Skipped under ``AGENT_DASH_IGNORE_LOCAL``
+    so tests see only the shipped example files.
+    """
+    from dash.locate import expand, ignore_local
+
+    if ignore_local():
+        return None
+    raw = os.environ.get("AGENT_DASH_STATE_DIR") or state_dir
+    if not raw:
+        raw = str(Path.home() / ".local" / "share" / "agent-dash")
+    return Path(expand(str(raw))) / "config.local.json"
+
+
+def _config_files(state_dir=None) -> list[Path]:
     files = [TOOL_ROOT / "config.example.json", TOOL_ROOT / "config.local.json"]
     override = os.environ.get("AGENT_DASH_CONFIG")
     if override:
         from dash.locate import expand
 
         files.append(Path(expand(override)))
+    state_config = _state_config_file(state_dir)
+    if state_config is not None:
+        files.append(state_config)
     return files
 
 
 def _collect_config(ctx) -> None:
     bad = []
     unknown = []
-    for file in _config_files():
+    cfg_state = ctx.cfg.get("state_dir") if isinstance(ctx.cfg, dict) else None
+    for file in _config_files(cfg_state):
         if file.name != "config.example.json" and not file.is_file():
             continue
         try:
@@ -1126,7 +1151,7 @@ def _collect_config(ctx) -> None:
 def _collect_checkout(ctx) -> None:
     try:
         proc = subprocess.run(
-            ["git", "-C", str(TOOL_ROOT), "status", "--short"],
+            ["git", "-C", str(ctx.tool_root), "status", "--short"],
             check=False,
             capture_output=True,
             text=True,
@@ -1149,6 +1174,80 @@ def _collect_checkout(ctx) -> None:
         f"tool checkout has {len(dirty)} uncommitted changes",
         "review with: git status --short",
     )
+
+
+def _looks_like_sha(text: str) -> bool:
+    """A plausible git sha (full or abbreviated): hex, 4 to 40 chars."""
+    return 4 <= len(text) <= 40 and all(ch in "0123456789abcdef" for ch in text)
+
+
+def _git_line(ctx, *args: str) -> str:
+    """One stdout line from a read-only git command, or ``""``."""
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(ctx.tool_root), *args],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    if proc.returncode != 0:
+        return ""
+    return (proc.stdout or "").strip()
+
+
+def _collect_build(ctx) -> None:
+    """The running build: dirty flag plus distance from ``origin/main``.
+
+    Reads the ``build_id`` the dashboard reported in its health payload
+    (``build-dirty`` warns when it carries the dirty flag) and compares
+    the running commit against ``origin/main`` in the tool checkout
+    (``build-behind`` is info when the running build is strictly older).
+    Anything git cannot tell skips quietly.
+    """
+    health = ctx.health
+    if health is None:
+        _check(ctx, "build", True, "skipped, dashboard is down")
+        return
+    build = str(health.get("build_id") or "")
+    if not build:
+        _check(ctx, "build", True, "server reports no build id")
+        return
+    dirty = build.endswith("-dirty")
+    base = build[: -len("-dirty")] if dirty else build
+    detail = f"running build {build}"
+    behind = False
+    tip = ""
+    if _looks_like_sha(base):
+        # Resolve both ends to full shas first: the running build is
+        # abbreviated, and merge-base prints full shas.
+        full = _git_line(ctx, "rev-parse", "--verify", f"{base}^{{commit}}")
+        tip = _git_line(ctx, "rev-parse", "--verify", "origin/main^{commit}")
+        if full and tip and _looks_like_sha(full) and _looks_like_sha(tip) and tip != full:
+            # The merge base of the two is the running commit exactly
+            # when the running build is strictly older than origin/main.
+            behind = _git_line(ctx, "merge-base", full, tip) == full
+            if behind:
+                detail += f"; origin/main is {tip}"
+    if dirty:
+        _add(
+            ctx, "build-dirty", "warn", "global", None,
+            "Running build is dirty",
+            f"dashboard at {ctx.url} runs build {build}, built from uncommitted changes",
+            "python3 agent_dash.py deploy",
+        )
+    if behind:
+        _add(
+            ctx, "build-behind", "info", "global", None,
+            "Running build is behind origin/main",
+            f"dashboard runs {base}, origin/main is {tip}",
+            "python3 agent_dash.py deploy",
+        )
+    if behind and not dirty:
+        detail += " (advisory only)"
+    _check(ctx, "build", not dirty, detail)
 
 
 def _collect_python(ctx) -> None:
@@ -2374,10 +2473,14 @@ def _collect_fleet(ctx) -> None:
 class DoctorScheduler:
     """Background doctor: collect, snapshot, sleep. Started by ``run``."""
 
-    def __init__(self, store, registry, cfg: dict | None = None):
+    def __init__(self, store, registry, cfg: dict | None = None, build: dict | None = None):
         self.store = store
         self.registry = registry
         self.cfg = cfg if isinstance(cfg, dict) else {}
+        # The server's captured build, so the build checks see the
+        # running build without re-reading git (the registry health the
+        # scheduler collects from carries no build id of its own).
+        self.build = dict(build) if isinstance(build, dict) else None
         self.interval_s = doctor_cfg(self.cfg)["interval_s"]
         self._stop = threading.Event()
         self._refresh = threading.Event()
@@ -2410,6 +2513,10 @@ class DoctorScheduler:
             health = self.registry.health(now, self.cfg)
         except Exception:
             health = None
+        if isinstance(health, dict) and isinstance(self.build, dict) and self.build.get("build_id"):
+            health = dict(health)
+            health.setdefault("build_id", self.build["build_id"])
+            health.setdefault("started_at", self.build.get("started_at"))
         try:
             from dash.sources.process import live_worker_processes
 

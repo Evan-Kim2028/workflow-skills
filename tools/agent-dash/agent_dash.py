@@ -14,6 +14,8 @@ import time
 from pathlib import Path
 
 from dash import errors
+from dash import deploy as deploy_lib
+from dash.buildinfo import build_info
 from dash.bundles import cmd_ws
 from dash.locate import expand, ignore_local
 from dash.pricing import reprice as reprice_usage
@@ -37,11 +39,37 @@ PRUNE_INTERVAL_S = 60
 BACKUP_KEEP = 3
 URL = f"http://{HOST}:{PORT}/"
 
+
+def _port() -> int:
+    """The dashboard port: ``AGENT_DASH_PORT`` wins for trials, else ``PORT``.
+
+    The live address stays 127.0.0.1:8765; the env override exists so a
+    release can be health-checked on another port without touching it.
+    Tests assign ``agent_dash.PORT`` directly, which this honors too.
+    """
+    raw = os.environ.get("AGENT_DASH_PORT")
+    if raw:
+        try:
+            value = int(raw)
+        except ValueError:
+            pass
+        else:
+            if 1 <= value <= 65535:
+                return value
+    return PORT
+
+
+def _base_url() -> str:
+    """The dashboard base URL from the current host and port."""
+    return f"http://{HOST}:{_port()}/"
+
 USAGE = """agent-dash: local read-only execution dashboard
 
-  python3 agent_dash.py run
+  python3 agent_dash.py run [--force-replace]
   python3 agent_dash.py stop
   python3 agent_dash.py restart
+  python3 agent_dash.py deploy [--ref origin/main] [--worktree DIR]
+  python3 agent_dash.py rollback
   python3 agent_dash.py status
   python3 agent_dash.py backfill --session <id>
   python3 agent_dash.py reprice
@@ -124,11 +152,15 @@ def load_cfg(path: Path | None = None) -> dict:
         _merge_file(cfg, ROOT / "config.example.json")
         if not ignore_local():
             _merge_file(cfg, ROOT / "config.local.json")
+            # A release checkout is clean, so its own config.local.json
+            # never holds the user's settings: the state dir copy wins,
+            # letting the dashboard run from a release unchanged.
+            _merge_file(cfg, _state_config_path(cfg))
     _apply_env(cfg)
     _expand_cfg(cfg)
     cfg.pop("caps", None)
     cfg["host"] = HOST
-    cfg["port"] = PORT
+    cfg["port"] = _port()
     budget = cfg.get("read_budget") if isinstance(cfg.get("read_budget"), dict) else {}
     cfg["read_budget"] = {
         "per_file": int(budget.get("per_file", cfg.get("read_budget_per_file") or 4 * 1024 * 1024)),
@@ -137,6 +169,16 @@ def load_cfg(path: Path | None = None) -> dict:
     cfg["read_budget_per_file"] = cfg["read_budget"]["per_file"]
     cfg["read_budget_per_tick"] = cfg["read_budget"]["per_tick"]
     return cfg
+
+
+def _state_config_path(cfg: dict) -> Path:
+    """``<state-dir>/config.local.json``: the release-proof config file.
+
+    The state dir comes from the env override first (trials), then the
+    merged config, then the default. Missing files simply do not merge.
+    """
+    raw = os.environ.get("AGENT_DASH_STATE_DIR") or cfg.get("state_dir") or str(STATE_DIR)
+    return Path(expand(str(raw))) / "config.local.json"
 
 
 def bind_state(cfg: dict | None = None) -> dict:
@@ -224,13 +266,15 @@ def _parse_port(raw: str) -> int:
     raise ValueError(raw)
 
 
-def _no_extra_args(cmd: str, args: list[str]) -> int | None:
-    """None when the action runs bare; 0 after --help; 2 after extras."""
+def _no_extra_args(cmd: str, args: list[str], allowed: tuple = ()) -> int | None:
+    """None when the action runs bare (or with only allowed flags); 0 after --help; 2 after extras."""
     if len(args) <= 1:
         return None
     if len(args) == 2 and args[1] in ("-h", "--help"):
         print(USAGE, end="")
         return 0
+    if allowed and all(flag in allowed for flag in args[1:]):
+        return None
     print(errors.action_takes_no_args(cmd, args[1]), file=sys.stderr)
     return errors.USAGE
 
@@ -254,15 +298,20 @@ def main(argv: list[str] | None = None) -> int:
         os.environ.setdefault("AGENT_DASH_URL", URL)
     cmd = args[0] if args else "run"
     if cmd in ("run", "stop", "restart"):
-        guard = _no_extra_args(cmd, args)
+        allowed = ("--force-replace",) if cmd == "run" else ()
+        guard = _no_extra_args(cmd, args, allowed)
         if guard is not None:
             return guard
     if cmd == "run":
-        return cmd_run()
+        return cmd_run(args[1:])
     if cmd == "stop":
         return cmd_stop()
     if cmd == "restart":
         return cmd_restart()
+    if cmd == "deploy":
+        return cmd_deploy(args[1:])
+    if cmd == "rollback":
+        return cmd_rollback(args[1:])
     if cmd == "status":
         return cmd_status(args[1:])
     if cmd == "state":
@@ -291,12 +340,38 @@ def main(argv: list[str] | None = None) -> int:
     return 2
 
 
-def cmd_run() -> int:
+def cmd_run(argv: list[str] | None = None) -> int:
+    """Start the dashboard unless the port already serves another build.
+
+    A port answering ``/api/health`` with a different ``build_id`` than
+    this checkout refuses to start (pass ``--force-replace`` to restart
+    it instead). ``--force-replace`` restarts even when our own pidfile
+    server is up. The same build answering without a pidfile counts as
+    already running.
+    """
+    force = False
+    for flag in argv or []:
+        if flag == "--force-replace":
+            force = True
+        else:
+            print(USAGE, end="", file=sys.stderr)
+            return 2
     bind_state()
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     pid = live_pid()
-    if pid:
+    if pid and not force:
         _print_running(pid)
+        return 0
+    remote = _probe_health()
+    if remote is not None:
+        mine = build_info()["build_id"]
+        theirs = str(remote.get("build_id") or "unknown")
+        if theirs != mine:
+            if force:
+                return cmd_restart()
+            print(errors.build_mismatch(_port(), theirs, mine), file=sys.stderr)
+            return 1
+        _print_running_unknown(remote)
         return 0
     try:
         os.nice(10)
@@ -386,12 +461,64 @@ def _port_free() -> bool:
     sock = socket.socket()
     sock.settimeout(1)
     try:
-        sock.connect((HOST, PORT))
+        sock.connect((HOST, _port()))
     except OSError:
         return True
     finally:
         sock.close()
     return False
+
+
+def _probe_health(timeout_s: float = 2.0) -> dict | None:
+    """GET /api/health as a dict, or None when the port does not answer.
+
+    A bound port serving non-JSON (not the dashboard) also reads as
+    None, leaving the bind to fail loudly in the child.
+    """
+    payload, _error = _fetch(_base_url(), "/api/health", timeout=timeout_s)
+    return payload if isinstance(payload, dict) else None
+
+
+def cmd_deploy(argv: list[str]) -> int:
+    """Deploy a clean release of ``--ref`` and switch the dashboard to it.
+
+    Records the previous release first, gates the new one, then
+    restarts with a health gate; any failure restarts the previous
+    release and exits 1 with the reason.
+    """
+    ref = deploy_lib.DEFAULT_REF
+    worktree = None
+    rest = list(argv)
+    while rest:
+        flag = rest.pop(0)
+        if flag == "--ref" and rest:
+            ref = rest.pop(0)
+        elif flag == "--worktree" and rest:
+            worktree = rest.pop(0)
+        else:
+            print(USAGE, end="", file=sys.stderr)
+            return 2
+    bind_state()
+    ok, message = deploy_lib.deploy(
+        STATE_DIR,
+        deploy_lib.default_repo(ROOT),
+        ref=ref,
+        worktree=worktree,
+        url=_base_url(),
+    )
+    print(message, file=sys.stdout if ok else sys.stderr)
+    return 0 if ok else 1
+
+
+def cmd_rollback(argv: list[str]) -> int:
+    """Switch the dashboard back to the previous release manually."""
+    if list(argv or []):
+        print(USAGE, end="", file=sys.stderr)
+        return 2
+    bind_state()
+    ok, message = deploy_lib.rollback(STATE_DIR, url=_base_url())
+    print(message, file=sys.stdout if ok else sys.stderr)
+    return 0 if ok else 1
 
 
 def cmd_restart() -> int:
@@ -437,7 +564,7 @@ def _health_payload():
 
     try:
         with urllib.request.urlopen(
-            f"http://{HOST}:{PORT}/api/health", timeout=5
+            _base_url() + "api/health", timeout=5
         ) as response:
             payload = json.loads(response.read().decode("utf-8"))
     except (urllib.error.URLError, OSError, ValueError):
@@ -455,15 +582,29 @@ def cmd_status(argv: list[str] | None = None) -> int:
     bind_state()
     pid = live_pid()
     if not pid:
+        local = build_info()
         if json_mode:
-            errors.emit_json({"running": False, "hint": "Run: python3 agent_dash.py run"})
+            errors.emit_json(
+                {
+                    "running": False,
+                    "hint": "Run: python3 agent_dash.py run",
+                    "build_id": local["build_id"],
+                    "started_at": local["started_at"],
+                }
+            )
         else:
-            print("stopped. Run: python3 agent_dash.py run")
+            print(f"stopped (local build {local['build_id']}). Run: python3 agent_dash.py run")
         return 1
-    if json_mode:
-        errors.emit_json({"running": True, "pid": pid, "url": URL})
+    health = _probe_health()
+    if isinstance(health, dict) and health.get("build_id"):
+        info = {"build_id": health.get("build_id"), "started_at": health.get("started_at")}
     else:
-        _print_running(pid)
+        local = build_info()
+        info = {"build_id": local["build_id"], "started_at": local["started_at"]}
+    if json_mode:
+        errors.emit_json({"running": True, "pid": pid, "url": _base_url(), **info})
+    else:
+        _print_running(pid, info)
     return 0
 
 
@@ -490,7 +631,7 @@ def _unreachable(url: str, json_mode: bool) -> int:
 
 def cmd_state(argv: list[str]) -> int:
     """One call that tells an agent everything: GET /api/state, human or JSON."""
-    url = URL
+    url = _base_url()
     json_mode = False
     rest = list(argv)
     while rest:
@@ -572,7 +713,7 @@ def cmd_doctor(argv: list[str]) -> int:
         safe_fixes,
     )
 
-    url = URL
+    url = _base_url()
     json_mode = False
     ws = None
     severity = None
@@ -866,7 +1007,7 @@ def cmd_lead_profile(argv: list[str]) -> int:
 
 def cmd_check(argv: list[str]) -> int:
     """Ask a running dashboard for GET /api/reconcile, print the table, exit 1 on any mismatch."""
-    url = URL
+    url = _base_url()
     hours = 24.0
     page = False
     json_mode = False
@@ -1285,8 +1426,8 @@ def _serve() -> None:
     cfg = load_cfg()
     store = Store(DBFILE)
     registry = Registry()
-    server = DashServer(store, registry, HOST, PORT, cfg=cfg)
-    server.doctor = DoctorScheduler(store, registry, cfg)
+    server = DashServer(store, registry, HOST, _port(), cfg=cfg)
+    server.doctor = DoctorScheduler(store, registry, cfg, build=server.build)
     server.doctor.start()
     tmp = PIDFILE.with_suffix(".tmp")
     tmp.write_text(str(os.getpid()) + "\n", encoding="utf-8")
@@ -1354,8 +1495,17 @@ def _redirect_stdio() -> None:
     os.close(log)
 
 
-def _print_running(pid: int) -> None:
-    print(f"running\npid {pid}\nurl {URL}")
+def _print_running(pid: int, build: dict | None = None) -> None:
+    lines = [f"running\npid {pid}\nurl {_base_url()}"]
+    if build is not None:
+        lines.append(f"build {build.get('build_id', 'unknown')}")
+        lines.append(f"started_at {build.get('started_at')}")
+    print("\n".join(lines))
+
+
+def _print_running_unknown(health: dict) -> None:
+    """The port answers our build but the pidfile is stale: still running."""
+    print(f"running\nurl {_base_url()}\nbuild {health.get('build_id', 'unknown')}\nstarted_at {health.get('started_at')}")
 
 
 def _session_arg(args: list[str]) -> str | None:

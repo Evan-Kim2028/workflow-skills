@@ -13,6 +13,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+from dash.buildinfo import build_info
 from dash.bundles import approvals_all, approvals_for, list_bundles, load_bundle_api, read_page, resolve_plan, start_prompt_text, workstream_plan_ids
 from dash.errors import api_error
 from dash.plans import PlanError
@@ -92,11 +93,14 @@ class DashServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
-    def __init__(self, store, registry, host="127.0.0.1", port=8765, index_path=None, stream_interval=2.0, cfg=None):
+    def __init__(self, store, registry, host="127.0.0.1", port=8765, index_path=None, stream_interval=2.0, cfg=None, build=None):
         self.store = store
         self.registry = registry
         self.cfg = cfg or {}
         self.doctor = None
+        # Captured once at start: the safe deploy flow compares this
+        # against the port instead of re-reading git per request.
+        self.build = dict(build) if isinstance(build, dict) else build_info()
         self.index_path = Path(index_path) if index_path is not None else INDEX_PATH
         self.stream_interval = stream_interval
         self.stop = threading.Event()
@@ -181,6 +185,9 @@ class Handler(BaseHTTPRequestHandler):
                 body["doctor"] = self._doctor_block(now)
                 if int((body["doctor"].get("summary") or {}).get("critical", 0)) > 0:
                     body["ok"] = False
+                build = getattr(self.server, "build", None) or {}
+                body["build_id"] = build.get("build_id", "unknown")
+                body["started_at"] = build.get("started_at")
                 self._json(200, body)
             elif path == "/api/doctor":
                 self._doctor(query)
@@ -217,6 +224,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.server.registry,
                 self.server.cfg,
                 processes=_live_workers(),
+                build=getattr(self.server, "build", None),
             ),
         )
 

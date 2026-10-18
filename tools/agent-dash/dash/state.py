@@ -13,6 +13,7 @@ import subprocess
 import time
 from pathlib import Path
 
+from dash.buildinfo import build_info
 from dash.store import RANGE_S
 
 TOOL_ROOT = Path(__file__).resolve().parents[1]
@@ -38,11 +39,13 @@ def tool_version(root: Path | None = None) -> str:
     return sha if proc.returncode == 0 and sha else "unknown"
 
 
-def build_state(store, registry, cfg=None, now: float | None = None, processes=None) -> dict:
+def build_state(store, registry, cfg=None, now: float | None = None, processes=None, build=None) -> dict:
     """Assemble the /api/state payload. ``cfg`` feeds the health block
     (``scratch_roots``, ``run_dirs``, ``warnings``); pricing and bundles
     resolve from the store and the workstreams root. ``processes`` is the
-    live worker listing for the ``unseen worker`` mismatch check."""
+    live worker listing for the ``unseen worker`` mismatch check.
+    ``build`` is the server's captured ``{"build_id", "started_at"}``
+    (computed fresh when omitted)."""
     now = float(now if now is not None else time.time())
     try:
         health = registry.health(now, cfg)
@@ -104,9 +107,15 @@ def build_state(store, registry, cfg=None, now: float | None = None, processes=N
     by_source = dict(view.get("running_by_source") or {})
     prod_jobs = int(view.get("prod_jobs") or 0)
     prod_jobs_finished = int(view.get("prod_jobs_finished") or 0)
+    info = dict(build) if isinstance(build, dict) else build_info()
     return {
         "schema": SCHEMA_VERSION,
-        "version": {"tool": tool_version(), "schema": SCHEMA_VERSION},
+        "version": {
+            "tool": tool_version(),
+            "build_id": info.get("build_id", "unknown"),
+            "started_at": info.get("started_at"),
+            "schema": SCHEMA_VERSION,
+        },
         "now": now,
         "window": {"since": now - WINDOW_S, "until": now, "hours": WINDOW_S / 3600},
         "health": health,

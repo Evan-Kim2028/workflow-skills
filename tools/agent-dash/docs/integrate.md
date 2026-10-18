@@ -108,6 +108,28 @@ Health prints `"ok": true` with one entry per source, each `last_error: null`. `
 
 State lives in `~/.local/share/agent-dash/` (`dash.sqlite`, pidfile, log, `generic.jsonl`). Point `AGENT_DASH_STATE_DIR` at an empty directory to trial the dashboard without touching live state. Point `AGENT_DASH_WORKSTREAMS` at another directory to trial bundles. Point `AGENT_DASH_PORT` at a free port (such as 8815) to trial beside a live dashboard: every command (`run`, `status`, `stop`, `check`, `state`, `doctor`, and the `ws` live reads) follows it. Set `AGENT_DASH_URL` explicitly only to point the `ws` live reads at yet another dashboard. Config-file `host`/`port` stay ignored.
 
+### Safe deploy (run the live dashboard from a clean release)
+
+Every server captures a `build_id` (git short sha plus `-dirty` when the checkout had uncommitted changes at start) and its start time, served on `/api/health` (`build_id`, `started_at`) and `/api/state` (`version` block) and printed by `status`. `run` refuses to start when the port already answers with a different build, naming both builds and the fix:
+
+```bash
+python3 tools/agent-dash/agent_dash.py run
+# run refused: 127.0.0.1:8765 already serves build abc1234, this checkout is build def5678-dirty. ...
+python3 tools/agent-dash/agent_dash.py run --force-replace  # restart it instead
+```
+
+Ship a clean release instead of running a dirty checkout:
+
+```bash
+git fetch origin  # deploy resolves --ref as-is; fetch first when the latest commit is wanted
+python3 tools/agent-dash/agent_dash.py deploy [--ref origin/main] [--worktree DIR]
+python3 tools/agent-dash/agent_dash.py rollback  # back to the previous release
+```
+
+`deploy` makes (or reuses) a clean detached worktree of the ref under `<state-dir>/releases/<sha>` (pass `--worktree DIR` to choose the path), records the previous release in `releases/CURRENT` and `releases/PREVIOUS` symlinks, gates the new release (`scripts/gate.sh` when present, else the page-rules and server test files), restarts from it with a health gate (`/api/health` must report the release build, then `check` must pass), and on any failure restarts the previous release automatically and exits 1 with the reason. Both commands only read the source repo and never touch another session's checkout. The doctor warns on a dirty running build (`build-dirty`, see `docs/problems/build-dirty.md`) and advises when the running build is older than `origin/main` (`build-behind`, see `docs/problems/build-behind.md`).
+
+A release checkout is clean, so its own `config.local.json` never holds your settings: keep them in `<state-dir>/config.local.json` (read after the checkout copy, so a release runs unchanged) or point `AGENT_DASH_CONFIG` at a file (replaces the search when set). The other layered files keep their env overrides (`AGENT_DASH_MAP`, `AGENT_DASH_PLANS`, `AGENT_DASH_TASKMAP`, `AGENT_DASH_WORKERS`, `AGENT_DASH_WORKSTREAMS`). Point `AGENT_DASH_PORT` at another port to trial a release without touching the live 127.0.0.1:8765 dashboard.
+
 ## 2. Make your sub-agents show up
 
 | Harness | Dashboard reads | You write | Minimum |

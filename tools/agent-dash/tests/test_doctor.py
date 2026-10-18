@@ -182,7 +182,7 @@ class DoctorDashboardTest(unittest.TestCase):
         self.assertIn("checks", result)
         names = [item["name"] for item in result["checks"]]
         for expected in ("dashboard", "sources", "run-dirs", "scratch-roots", "manifest-coverage", "pricing",
-                          "reconcile", "page-check", "config", "bundles", "checkout", "python"):
+                          "reconcile", "page-check", "config", "bundles", "checkout", "build", "python"):
             self.assertIn(expected, names)
         for item in result["checks"]:
             self.assertIn("ok", item)
@@ -1966,6 +1966,84 @@ class UnseenGraceTest(unittest.TestCase):
                          "started_at": self.now - 1000, "interval_s": 2}],
         }
         self.assertTrue(unseen_startup_ready(None, ready, self.now))
+class BuildChecksTest(unittest.TestCase):
+    """Safe deploy: build-dirty warns on a dirty running build,
+    build-behind is info when the running build is older than
+    origin/main. Temp git repos stand in for the tool checkout."""
+
+    def setUp(self):
+        import subprocess
+
+        self.subprocess = subprocess
+        self.tmp = tempfile.TemporaryDirectory()
+        self.repo = Path(self.tmp.name) / "tool"
+        self.repo.mkdir()
+        self.git("init", "-b", "main")
+        (self.repo / "file.txt").write_text("one\n", encoding="utf-8")
+        self.git("add", ".")
+        self.git("commit", "-m", "first")
+        self.old = self.git("rev-parse", "HEAD")
+        (self.repo / "file.txt").write_text("two\n", encoding="utf-8")
+        self.git("commit", "-am", "second")
+        self.new = self.git("rev-parse", "HEAD")
+        self.git("update-ref", "refs/remotes/origin/main", self.new)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def git(self, *args):
+        proc = self.subprocess.run(
+            ["git", "-c", "user.name=agent-dash-test", "-c", "user.email=agent-dash-test@example.invalid",
+             "-C", str(self.repo), *args],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        return proc.stdout.strip()
+
+    def short(self, sha):
+        return self.git("rev-parse", "--short", sha)
+
+    def collect(self, health):
+        from dash.doctor import collect_problems
+
+        return collect_problems(
+            None, default_cfg(), time.time(), url="http://127.0.0.1:1",
+            health=health, tool_root=self.repo,
+        )
+
+    def test_dirty_build_is_a_warning(self):
+        result = self.collect({"ok": True, "sources": [], "build_id": self.short(self.new) + "-dirty"})
+        dirty = [item for item in result["problems"] if item["code"] == "build-dirty"]
+        self.assertEqual(len(dirty), 1)
+        self.assertEqual(dirty[0]["severity"], "warn")
+        self.assertIn("python3 agent_dash.py deploy", dirty[0]["fix_command"])
+        build = next(item for item in result["checks"] if item["name"] == "build")
+        self.assertFalse(build["ok"])
+
+    def test_clean_current_build_is_quiet(self):
+        result = self.collect({"ok": True, "sources": [], "build_id": self.short(self.new)})
+        self.assertFalse([item for item in result["problems"] if item["code"] in ("build-dirty", "build-behind")])
+        build = next(item for item in result["checks"] if item["name"] == "build")
+        self.assertTrue(build["ok"])
+
+    def test_older_build_is_behind_but_advisory(self):
+        result = self.collect({"ok": True, "sources": [], "build_id": self.short(self.old)})
+        behind = [item for item in result["problems"] if item["code"] == "build-behind"]
+        self.assertEqual(len(behind), 1)
+        self.assertEqual(behind[0]["severity"], "info")
+        self.assertIn("python3 agent_dash.py deploy", behind[0]["fix_command"])
+        build = next(item for item in result["checks"] if item["name"] == "build")
+        self.assertTrue(build["ok"])
+
+    def test_unknown_build_and_down_dashboard_skip(self):
+        for health in ({"ok": True, "sources": [], "build_id": "unknown"}, {"ok": True, "sources": []}, None):
+            result = self.collect(health)
+            self.assertFalse(
+                [item for item in result["problems"] if item["code"] in ("build-dirty", "build-behind")],
+                health,
+            )
 
 
 if __name__ == "__main__":

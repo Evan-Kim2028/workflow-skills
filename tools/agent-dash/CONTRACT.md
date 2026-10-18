@@ -9,7 +9,7 @@ The one argv value ever kept is the worker's `--model` flag value, recorded on p
 
 | Path | Owner |
 |---|---|
-| `agent_dash.py` (CLI: `run`, `stop`, `restart`, `status`, `state`, `doctor`, `backfill --session <id>`, `reprice`, `reconcile`, `check`, `ws`, `report`) | core |
+| `agent_dash.py` (CLI: `run`, `stop`, `restart`, `deploy`, `rollback`, `status`, `state`, `doctor`, `backfill --session <id>`, `reprice`, `reconcile`, `check`, `ws`, `report`) | core |
 | `dash/state.py` (`GET /api/state`), `dash/doctor.py` (`doctor`), `dash/errors.py` (exit codes, messages) | cli |
 | `dash/store/` (facade: `Store` with the same public API over concern mixins) | core |
 | `dash/store/base.py` (connect, schema, migrations, offsets, doctor persistence) | core |
@@ -19,6 +19,8 @@ The one argv value ever kept is the worker's `--model` flag value, recorded on p
 | `dash/store/summarize.py` (snapshots, rollups, reconcile, mismatches) | core |
 | `dash/store/queries.py` (state, workstream, concurrency, session reads) | core |
 | `dash/store/util.py` (shared constants, pure helpers) | core |
+| `dash/buildinfo.py` (build id + process start time) | core |
+| `dash/deploy.py` (clean-release deploy, rollback, `releases/`) | core |
 | `dash/server.py` (HTTP + SSE, routes below) | core |
 | `dash/attribution.py`, `map.example.json` (`map.local.json` replaces it) | core |
 | `dash/pricing.py`, `catalog/prices.json` | core |
@@ -250,8 +252,9 @@ variant. Clip playback compresses idle stretches by cumulative event count
 blended with real time; plain replay stays on real time with an optional
 "Compress idle" toggle.
 
-`GET /api/health` -> `{"ok": true, "sources": [{name, last_poll, last_error, lag_s, last_duration_s, interval_s, stalled, state, started_at}], "slow_sources": 0, "dagster": {"skipped_closeouts": 0}, "pricing": {...}, "disconnects_1h": 0, "unpriced_models": [{"model", "rows", "tokens"}], "scratch_roots": [...], "run_dirs": [...], "warnings": [...]}`.
+`GET /api/health` -> `{"ok": true, "sources": [{name, last_poll, last_error, lag_s, last_duration_s, interval_s, stalled, state, started_at}], "slow_sources": 0, "dagster": {"skipped_closeouts": 0}, "pricing": {...}, "disconnects_1h": 0, "unpriced_models": [{"model", "rows", "tokens"}], "scratch_roots": [...], "run_dirs": [...], "warnings": [...], "build_id": "abc1234", "started_at": 0}`.
 Each source carries `state`: `starting`, `ok`, `slow`, `stalled`, or `error`, plus `started_at` (the collector process start). A source that never completed a poll — and recorded no failure — is `starting`, not stalled, until max(3x its interval, 90 s) after process start; `ok` stays true while starting, and neither reconcile nor doctor reports a starting source as stalled. Positive failure evidence (an error or a poll-budget overrun) still reports `error` immediately, even on the first poll. A poll that returned but took longer than 15 s is `slow` (counted in `slow_sources`, still ok). `dagster.skipped_closeouts` counts polls that saw a full active page and skipped the close-out pass.
+`build_id` is the git short sha of the tool directory plus `-dirty` when the checkout had uncommitted changes at start (`"unknown"` outside git); `started_at` is the process start epoch. Both are captured once at start, never re-read per request. `run` refuses to start when the port answers with a different `build_id` (unless `--force-replace`); `deploy` health-gates the new release on it.
 `ok` is false when any model with usage rows in the last 24 h has no
 catalog rate; those models are listed in `unpriced_models` (absent when
 empty) and each is also an `unpriced model: <id> (<tokens> tokens in 24 h)`
@@ -278,13 +281,13 @@ in the last hour; they are counted, never traceback-logged.
 Per-item checks that can fan out emit one problem per (code, workstream): `dep-jump`, `ghost-runs`, `orphan-worker`, `done-before-deps`, `stuck-task`, `bare-citation`, `model-policy`, `over-cap`. The id is `<code>:ws:<ID>` (workstream) or `<code>:global` (fleet); the title names the workstream and the member count before any ids; the detail lists the worst 3 as title-then-id with `+N more` for the rest; the fix command is the single command that lists all members (`ws next <ID>` or `doctor --ws <ID> --all`, `doctor --all` for global). Severity is the worst member's; `regressed`/`first_seen` track the group. Old per-item ids are never emitted; their rows resolve on the first grouped run (no rewrite needed; `items_json` migrates the table).
 Each problem keeps every existing field and gains `items` (up to 20 compact `{title, id, since}` member rows, present only when the problem has members) and `items_total` (the full member count). The summary counts groups and gains `items_total` (present when nonzero). `?ws=<ID>` keeps that workstream's problems plus global ones; `?ws=<ID>&all=1` returns every member row instead of the first 20. `doctor` prints a one-line-per-group digest (severity glyph and word, code, workstream, count, title; top 3 members under critical/warn groups; footer `N groups, M items; doctor --all to expand; doctor --ws <ID>`); `doctor --all` prints every member. `--json` is the API body plus the exit verdict.
 `?ws=<ID>` keeps that workstream's problems plus global ones; `?severity=critical|warn|info` is the minimum level shown. A problem absent from a run resolves (`resolved_at` set, kept 14 days); one that reappears after resolution is `regressed`. Critical means the numbers are wrong or the dashboard is blind: source stalled, unseen workers, dashboard down, unpriced model with tokens, reconcile mismatch. Warn is workflow hygiene: stuck task, policy breach, orphan process, stale approval, invalid bundle, a slow-but-returning source poll (`source-slow`), skipped Dagster close-outs (`dagster-closeout-skipped`), and friends. Info is advisory: dirty checkout, run folder outside roots. Every code has a page under `docs/problems/<code>.md`.
-`?ws=<ID>` keeps that workstream's problems plus global ones; `?severity=critical|warn|info` is the minimum level shown. A problem absent from a run resolves (`resolved_at` set, kept 14 days); one that reappears after resolution is `regressed`. Critical means the numbers are wrong or the dashboard is blind: source stalled, unseen workers, dashboard down, unpriced model with tokens, reconcile mismatch. Warn is workflow hygiene: stuck task, policy breach, orphan process, stale approval, invalid bundle, and friends, plus the orchestration flags (idle-ready work, dep jumps, stale gates, review spirals, undelegated leads). Info is advisory: dirty checkout, run folder outside roots, plus the orchestration advisories (deferred orphans, wave tails, ghost runs). Every code has a page under `docs/problems/<code>.md`.
+`?ws=<ID>` keeps that workstream's problems plus global ones; `?severity=critical|warn|info` is the minimum level shown. A problem absent from a run resolves (`resolved_at` set, kept 14 days); one that reappears after resolution is `regressed`. Critical means the numbers are wrong or the dashboard is blind: source stalled, unseen workers, dashboard down, unpriced model with tokens, reconcile mismatch. Warn is workflow hygiene: stuck task, policy breach, orphan process, stale approval, invalid bundle, and friends, plus the orchestration flags (idle-ready work, dep jumps, stale gates, review spirals, undelegated leads) and a dirty running build (`build-dirty`). Info is advisory: dirty checkout, run folder outside roots, a running build behind `origin/main` (`build-behind`), plus the orchestration advisories (deferred orphans, wave tails, ghost runs). Every code has a page under `docs/problems/<code>.md`.
 Orchestration thresholds live under `doctor.*` in config: `idle_ready_minutes` (default 30: a ready queue with fewer than 2 live agents fires once the plan sits unchanged that long), `long_tail_minutes` (default 60: a wave finished except one still-running lane), `fix_rounds_cap` (default 2: distinct `-fixN`/`-revN` rounds on an open task), `recent_hours` (default 24: the recent/old cut for dep jumps and deferred orphans, the ghost-run window, and the no-activity gate — a workstream with no plan, or with no run or plan activity inside it, never fires an orchestration problem; a dep-jump group is `warn` only when it holds a jump started inside the window, else `info`), `ghost_share` (default 0.2: the unmapped-run share that fires ghost-runs).
 
 `GET /api/state` -> the whole dashboard in one call, computed in one
 store pass (`Store.state_view`):
 ```json
-{"schema": 1, "version": {"tool": "<git-sha|unknown>", "schema": 1},
+{"schema": 1, "version": {"tool": "<git-sha|unknown>", "build_id": "<sha[-dirty]|unknown>", "started_at": 0, "schema": 1},
  "now": 0, "window": {"since": 0, "until": 0, "hours": 24},
  "health": {"ok": true, "sources": [{name, last_poll, last_error, lag_s}], "scratch_roots": [], "run_dirs": [], "warnings": []},
  "workstreams": [{"id": "WS7", "title": "", "plan": true, "progress": {"done": 0, "total": 0, "counts": {}, "pct": 0},
@@ -297,7 +300,9 @@ store pass (`Store.state_view`):
  "problems": [{"code": "stale-running", "message": "", "command": "python3 agent_dash.py check"}]}
 ```
 `version.tool` is the git short sha of the tool directory, `"unknown"`
-outside git. The window is the one fixed 24 h. `totals.prev_24h` and each
+outside git. `version.build_id` adds the `-dirty` flag for a checkout
+with uncommitted changes at start; `version.started_at` is the process
+start epoch. The window is the one fixed 24 h. `totals.prev_24h` and each
 workstream row's (and `unassigned`'s) `prev_24h` are the snapshot
 `prev_24h` for those scopes: the 24 h before the window, same functions
 and attribution, `live_agents` point-in-time at the window start.
@@ -554,6 +559,35 @@ python3 agent_dash.py report usage --label <label> --input N --output N [--model
 `REQUEST_CHANGES`. The live-agents tile counts the `grok`, `muse`,
 `glm`, and `claude` buckets; a generic run shows in the running table,
 on its task chip, and in tokens and cost either way.
+
+## Safe deploy
+
+The live dashboard runs from a release, never a dirty working
+checkout. A release is a clean detached worktree of one commit under
+`<state-dir>/releases/<sha>`; `releases/CURRENT` and
+`releases/PREVIOUS` are symlinks naming the running release and the
+one before it. `deploy [--ref origin/main] [--worktree DIR]` records
+the previous release, gates the new one (`scripts/gate.sh` when
+present, else the page-rules and server test files), switches
+`CURRENT`, and restarts from the new release with a health gate
+(`/api/health` must report the release build, then `check` must
+pass). Any failure restarts the previous release and exits 1 with the
+reason. `rollback` performs the same switch back on demand. Both are
+read-only on sources and never touch another session's checkout;
+deploy resolves the ref as-is, so fetch first when the latest
+upstream commit is wanted. `run` refuses to start when the port
+answers with a different `build_id` (use `--force-replace` to restart
+it instead); `status` prints the running build.
+
+A release checkout is clean, so its own `config.local.json` never
+holds the user's settings. Config search order is
+`config.example.json`, then the checkout `config.local.json`, then
+`<state-dir>/config.local.json`, then the `AGENT_DASH_CONFIG` file
+override (which replaces the search when set). The other layered
+files keep their env overrides (`AGENT_DASH_MAP`,
+`AGENT_DASH_PLANS`, `AGENT_DASH_TASKMAP`, `AGENT_DASH_WORKERS`,
+`AGENT_DASH_WORKSTREAMS`). `AGENT_DASH_PORT` trials the server on
+another port; the live address stays 127.0.0.1:8765.
 
 ## Checks
 

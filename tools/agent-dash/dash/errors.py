@@ -73,6 +73,17 @@ def action_takes_no_args(cmd: str, arg: str) -> str:
     )
 
 
+def build_mismatch(port: int, theirs: str, mine: str) -> str:
+    return (
+        f"run refused: 127.0.0.1:{port} already serves build {theirs}, "
+        f"this checkout is build {mine}. "
+        "Run: python3 agent_dash.py restart (to replace it with this build), "
+        "or: python3 agent_dash.py status (to inspect the running build). "
+        "Run with --force-replace to restart it directly: "
+        "python3 agent_dash.py run --force-replace"
+    )
+
+
 def bundle_not_found(ws: str) -> str:
     return (
         f"bundle not found: {ws}. "

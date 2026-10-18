@@ -23,6 +23,23 @@ from dash.sources import Registry
 from dash.store import Store
 
 
+_KEPT_PORT = os.environ.get("AGENT_DASH_PORT")
+
+
+def setUpModule():
+    # main() re-reads AGENT_DASH_PORT on every call, so a trial port
+    # inherited from a deploy would clobber the in-process test ports.
+    # The tests choose their own ports; the env override stays out.
+    os.environ.pop("AGENT_DASH_PORT", None)
+
+
+def tearDownModule():
+    if _KEPT_PORT is None:
+        os.environ.pop("AGENT_DASH_PORT", None)
+    else:
+        os.environ["AGENT_DASH_PORT"] = _KEPT_PORT
+
+
 def start(store, index=None, registry=None, interval=2.0):
     registry = registry if registry is not None else Registry([])
     server = DashServer(store, registry, "127.0.0.1", 0, index_path=index, stream_interval=interval, cfg=default_cfg())
@@ -971,6 +988,62 @@ class Prev24hEndpointTest(unittest.TestCase):
             [item for item in payload["mismatches"] if "prev_24h" in item],
             payload["mismatches"],
         )
+class BuildInfoEndpointTest(unittest.TestCase):
+    """Safe deploy: /api/health and /api/state carry the captured build."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.store = Store(Path(self.tmp.name) / "dash.sqlite")
+        self.server, self.thread = start(self.store)
+        self.port = self.server.server_address[1]
+
+    def tearDown(self):
+        stop(self.server, self.thread)
+        self.store.close()
+        self.tmp.cleanup()
+
+    def test_health_carries_captured_build(self):
+        status, _, body = get(self.port, "/api/health")
+        self.assertEqual(status, 200)
+        health = json.loads(body)
+        self.assertEqual(health["build_id"], self.server.build["build_id"])
+        self.assertEqual(health["started_at"], self.server.build["started_at"])
+        self.assertTrue(health["build_id"])
+
+    def test_state_version_carries_build(self):
+        status, _, body = get(self.port, "/api/state")
+        self.assertEqual(status, 200)
+        version = json.loads(body)["version"]
+        self.assertEqual(version["build_id"], self.server.build["build_id"])
+        self.assertEqual(version["started_at"], self.server.build["started_at"])
+        self.assertTrue(version["tool"])
+        self.assertIn("schema", version)
+
+    def test_explicit_build_is_served_verbatim(self):
+        stop(self.server, self.thread)
+        from dash.server import DashServer
+
+        self.server = DashServer(
+            self.store,
+            Registry([]),
+            "127.0.0.1",
+            0,
+            cfg=default_cfg(),
+            build={"build_id": "cafef00d", "started_at": 1700000001.5},
+        )
+        self.thread = threading.Thread(
+            target=self.server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True
+        )
+        self.thread.start()
+        self.port = self.server.server_address[1]
+        status, _, body = get(self.port, "/api/health")
+        health = json.loads(body)
+        self.assertEqual(health["build_id"], "cafef00d")
+        self.assertEqual(health["started_at"], 1700000001.5)
+        status, _, body = get(self.port, "/api/state")
+        version = json.loads(body)["version"]
+        self.assertEqual(version["build_id"], "cafef00d")
+        self.assertEqual(version["started_at"], 1700000001.5)
 
 
 class DisconnectSilenceTest(unittest.TestCase):
