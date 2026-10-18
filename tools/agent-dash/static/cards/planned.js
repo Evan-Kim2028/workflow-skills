@@ -2,7 +2,7 @@
    Start-readiness per planned workstream (depends-on, gate freshness with
    stale markers, approvals pending, tasks, Ready pill), the "Gated but
    live" section for active workstreams held by an unmet owner/sign-off
-   gate, and the slot mount points for the roadmap/dependency charts.
+   gate, and the slot mount point for the dependency chart.
    Gate freshness mirrors dash/orchestrate.py stale_gates: a gate is STALE
    when fresh_hours is set and confirmed_at is missing or older than that
    many hours; gates without fresh_hours never go stale. Planned
@@ -13,9 +13,9 @@
    Needs: el, fmtN, openPlan, keyOf, registryFor (plain globals). */
 (function (global) {
   "use strict";
-  /* Slot mount points for the roadmap/dependency charts (shared with the
-     project home, which also mounts them). */
-  var PLANNED_SLOTS = ["exec-roadmap", "exec-depgraph"];
+  /* Slot mount points for the dependency chart (shared with the
+     project home, which also mounts it). */
+  var PLANNED_SLOTS = ["exec-depgraph"];
 
   /* Pure: one gate task's staleness at nowS (epoch seconds). */
   function gateStale(task, nowS) {

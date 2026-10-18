@@ -53,13 +53,13 @@
     return out || "part";
   }
 
-  /* At most five top-level groups; a group's sections show only while you are in it. */
+  /* At most four top-level groups; a group's sections show only while you are in it.
+     No group names owner calls: the plan tab renders no such section. */
   function planGroup(label) {
     var l = String(label || "").toLowerCase();
     if (l === "where we are" || l === "workstreams") return "Where we are";
     if (l === "why") return "Why";
     if (l === "end state" || l === "end outcome" || l === "plan" || l === "progress" || l === "merge trains") return "Plan";
-    if (l === "decided" || l === "decisions" || l === "agent-friendly") return "Decisions";
     return "Reference";
   }
   function execGroup(label) {

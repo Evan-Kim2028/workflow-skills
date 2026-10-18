@@ -325,9 +325,14 @@ class BundlesApiTest(unittest.TestCase):
         status, _, state_js = get(self.port, "/static/core/state.js")
         self.assertEqual(status, 200)
         self.assertIn(b"pushState", state_js)
-        status, _, needs_js = get(self.port, "/static/cards/needs.js")
+        status, _, decisions_js = get(self.port, "/static/cards/decisions.js")
         self.assertEqual(status, 200)
-        self.assertIn(b"Needs you", needs_js)
+        self.assertIn(b"Decisions", decisions_js)
+        for gone in ("/static/cards/needs.js", "/static/cards/feed.js",
+                     "/static/cards/feed.css", "/static/cards/roadmap.js",
+                     "/static/cards/roadmap.css"):
+            status, _, _ = get(self.port, gone)
+            self.assertEqual(status, 404, f"{gone} is still served")
 
 
 class TrainsApiTest(unittest.TestCase):

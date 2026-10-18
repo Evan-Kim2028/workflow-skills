@@ -3,21 +3,20 @@
    the 24 h tiles (the shared tiles card, never a fork), Current
    workstreams (the Where-we-are rows for active/paused only, through the
    ws-cards helpers with a state filter), a Planned shelf, Recently done
-   with Report links and clipboard Archive buttons, the needs-you roll-up
-   (the registered needs entry), and empty slot containers where chart
-   workers mount by scope (see registry.js).
+   with Report links and clipboard Archive buttons, and empty slot
+   containers where chart workers mount by scope (see registry.js).
    Reads: state.project, state.wss, state.wssAll, state.snap, state.archive,
    state.approvals, state.plans; planSum through programPanel.
    Exports (on window.AdPage.cards, also kept as plain globals):
    projectHomeSpecs, reportFor, showToast, copyCmd, PROJECT_SLOTS.
    Needs: el, fmtN, fmtUsd, fmtDur, tiles, programPanel, readinessOf,
-   needsCard, openPlan, keyOf, ADT (plain globals). */
+   openPlan, keyOf, ADT (plain globals). */
 (function (global) {
   "use strict";
   /* Slot mount points for chart cards. A registry entry with scope
      "project" and a slot naming one of these renders inside it; the rest
      render as their own sections after the slots, in registry order. */
-  var PROJECT_SLOTS = ["exec-burnup", "exec-feed", "exec-health", "exec-roadmap", "exec-depgraph"];
+  var PROJECT_SLOTS = ["exec-burnup", "exec-health", "exec-depgraph"];
 
   /* Pure: the closing-report basename the archive payload exposes for one
      id, or null. The payload only ever carries the basename, never a path
@@ -324,9 +323,9 @@
   }
 
   /* Spec list for drawMain, in mockup order: phases, tiles, Current,
-     Planned shelf, Recently done beside needs-you, chart slots, then any
-     other scope-"project" registry entry as its own section. The needs
-     entry renders beside Recently done; entries naming a slot mount there. */
+     Planned shelf, Recently done, chart slots, then any other
+     scope-"project" registry entry as its own section. Entries naming a
+     slot mount there. */
   function projectHomeSpecs(passedState, snap) {
     var specs = [];
     var entries = registryFor("project") || [];
@@ -349,22 +348,12 @@
       if (unplanned) wrap.appendChild(unplanned);
       return wrap;
     }, ""]);
-    specs.push(["project-done-needs", keyOf([(state.wss || []).map(function (w) { return [w.ws, w.progress, w.tokens, w.cost_usd]; }), state.archive, state.approvals]), function () {
-      var grid = el("div", {class: "grid g-2"});
-      grid.appendChild(doneRows());
-      var needsEntry = (registryFor("project") || []).filter(function (e) { return e.id === "needs"; })[0];
-      var needNode = null;
-      if (needsEntry) {
-        var sp = needsEntry.spec(state, snap);
-        if (sp && sp[2]) needNode = sp[2]();
-      }
-      if (!needNode) needNode = needsCard();
-      grid.appendChild(needNode);
-      return grid;
+    specs.push(["project-done", keyOf([(state.wss || []).map(function (w) { return [w.ws, w.progress, w.tokens, w.cost_usd]; }), state.archive]), function () {
+      return doneRows();
     }, ""]);
     PROJECT_SLOTS.forEach(function (id) { if (id !== "exec-depgraph") specs.push(slotSection(id, bySlot[id] || null)); });
     entries.forEach(function (e) {
-      if (e.id === "needs" || e.slot) return;
+      if (e.slot) return;
       specs.push([e.id, keyOf([e.id, state.seq]), function () {
         var sp = e.spec(state, snap);
         return (sp && sp[2]) ? sp[2]() : el("div");

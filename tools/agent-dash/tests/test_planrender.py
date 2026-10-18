@@ -33,7 +33,7 @@ class PlanRenderTest(unittest.TestCase):
                 {
                     "workstream": "WS9",
                     "motivation": {"verdict": "WORTH_IT", "verdict_reason": "Because the measure moved.", "today": [], "after": [], "costs": [], "not_better": []},
-                    "decisions": [],
+                    "decisions": [{"id": "D1", "question": "Ship?", "decision": "Yes.", "why": "The measure moved.", "reversible": True, "alternatives": [], "evidence": [], "risk": "Low."}],
                     "agent_friendly": {"litmus": "One command proves it.", "litmus_check": "run the command", "requirements": []},
                     "narrative": {
                         "thesis": "A single contract replaces three readers.",
@@ -75,7 +75,10 @@ class PlanRenderTest(unittest.TestCase):
         self.assertNotIn('data-plan-approvals', page)
         self.assertNotIn("wsp-figs", page)
         self.assertNotIn("<script", page)
-        order = [page.index(f'id="ws9-{anchor}"') for anchor in ("why", "end", "plan", "progress", "decided", "agent")]
+        order = [page.index(f'id="ws9-{anchor}"') for anchor in ("why", "end", "plan", "progress", "agent")]
+        self.assertNotIn('id="ws9-decided"', page)
+        self.assertNotIn("Decisions, made by review", page)
+        self.assertNotIn("dec-grid", page)
         self.assertNotIn('id="ws9-ref"', page)
         self.assertEqual(order, sorted(order))
         self.assertLess(page.index("Why"), page.index("End state"))

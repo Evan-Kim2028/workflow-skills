@@ -1147,16 +1147,17 @@ setTimeout(function () {
         gains the project/planned scopes with the slot contract."""
         home = (STATIC / "cards" / "project-home.js").read_text()
         planned = (STATIC / "cards" / "planned.js").read_text()
-        for slot in ("exec-burnup", "exec-feed", "exec-health", "exec-roadmap", "exec-depgraph"):
+        for slot in ("exec-burnup", "exec-health", "exec-depgraph"):
             self.assertIn(slot, home, f"project home lost the {slot} slot")
-        for slot in ("exec-roadmap", "exec-depgraph"):
-            self.assertIn(slot, planned, f"planned view lost the {slot} slot")
+        self.assertIn("exec-depgraph", planned, "planned view lost the exec-depgraph slot")
         reg = (STATIC / "cards" / "registry.js").read_text()
         self.assertIn('scope: "project"', reg, "no project registry scope")
         self.assertIn('"planned" entries on the Planned view', reg, "no planned registry scope in the contract")
         self.assertIn("registryFor", reg, "no scope-matching registry helper")
         self.assertIn('registryFor("planned")', planned, "planned view never mounts its scope entries")
-        self.assertIn('"needs"', reg, "needs.js is not registered for the project scope")
+        for token in ('"needs"', '"feed"', '"roadmap"', '"roadmap-plan"',
+                      'slot: "exec-feed"', 'slot: "exec-roadmap"'):
+            self.assertNotIn(token, reg, f"registry.js still registers {token}")
         script = inline_scripts()
         bodies = dict(functions(script))
         self.assertIn("projectHomeSpecs", bodies)
@@ -1164,8 +1165,26 @@ setTimeout(function () {
         self.assertIn("archiveSpecs", bodies)
         self.assertIn("projectSpecs", bodies)
         self.assertIn("projectHomeSpecs(", bodies["projectSpecs"])
-        for name in ("project-phases", "project-tiles", "project-current", "planned-ready", "archive-shelf"):
+        for name in ("project-phases", "project-tiles", "project-current", "project-done", "planned-ready", "archive-shelf"):
             self.assertIn(name, script, f"the {name} section never renders")
+
+    def test_removed_cards_are_gone(self):
+        """The dropped What-changed, roadmap, and Needs-you cards leave
+        no file, tag, registry line, slot, or heading behind."""
+        for name in ("feed.js", "feed.css", "roadmap.js", "roadmap.css", "needs.js"):
+            self.assertFalse((STATIC / "cards" / name).exists(), f"static/cards/{name} is back")
+        page = (STATIC / "index.html").read_text()
+        for tag in ("/static/cards/feed.js", "/static/cards/feed.css",
+                    "/static/cards/roadmap.js", "/static/cards/roadmap.css",
+                    "/static/cards/needs.js"):
+            self.assertNotIn(tag, page, f"index.html still loads {tag}")
+        for word in ("What changed", "Project roadmap", "Needs you"):
+            self.assertNotIn(word, page, f"index.html still names {word!r}")
+        home = (STATIC / "cards" / "project-home.js").read_text()
+        planned = (STATIC / "cards" / "planned.js").read_text()
+        for token in ("exec-feed", "exec-roadmap", "needsCard", "project-done-needs"):
+            self.assertNotIn(token, home, f"project-home.js still names {token}")
+            self.assertNotIn(token, planned, f"planned.js still names {token}")
 
     def test_project_pure_helpers_on_fixtures(self):
         """The project-view data helpers agree with the generated fixtures:
@@ -1503,44 +1522,36 @@ console.log("applySections proof ok");
         )
 
 
-    def test_feed_and_decisions_have_no_doctor_words(self):
-        """Neither new card names doctor output: no health/doctor words in
-        either file or stylesheet, no motion in the stylesheets, and no
-        raw fetch or non-GET method (both cards load through api())."""
-        for name in ("feed.js", "feed.css", "decisions.js", "decisions.css"):
+    def test_decisions_has_no_doctor_words(self):
+        """The decisions card names no doctor output: no health/doctor
+        words in the file or stylesheet, no motion in the stylesheet, and
+        no raw fetch or non-GET method (it loads through api())."""
+        for name in ("decisions.js", "decisions.css"):
             text = (STATIC / "cards" / name).read_text()
             for word in ("doctor", "health"):
                 self.assertNotIn(word, text.lower(), f"{name} carries a {word!r} word")
-        for name in ("feed.css", "decisions.css"):
-            text = (STATIC / "cards" / name).read_text()
-            for prop in ("animation", "transition"):
-                self.assertNotIn(prop, text, f"{name} animates; reduced motion stays still")
-        for name in ("feed.js", "decisions.js"):
-            text = (STATIC / "cards" / name).read_text()
-            self.assertNotIn("fetch(", text, f"{name} fetches; project cards read api()/state only")
-            self.assertNotIn("XMLHttpRequest", text, f"{name} fetches; project cards read api()/state only")
-            hits = re.findall(r"method\s*:\s*[\"'](POST|PUT|DELETE|PATCH)[\"']", text, re.I)
-            self.assertEqual(hits, [], f"{name} writes with a non-GET method: {hits[:2]}")
+        text = (STATIC / "cards" / "decisions.css").read_text()
+        for prop in ("animation", "transition"):
+            self.assertNotIn(prop, text, f"decisions.css animates; reduced motion stays still")
+        text = (STATIC / "cards" / "decisions.js").read_text()
+        self.assertNotIn("fetch(", text, "decisions.js fetches; project cards read api()/state only")
+        self.assertNotIn("XMLHttpRequest", text, "decisions.js fetches; project cards read api()/state only")
+        hits = re.findall(r"method\s*:\s*[\"'](POST|PUT|DELETE|PATCH)[\"']", text, re.I)
+        self.assertEqual(hits, [], f"decisions.js writes with a non-GET method: {hits[:2]}")
         reg = (STATIC / "cards" / "registry.js").read_text()
         self.assertIn('scope: "project"', reg, "no project registry scope")
-        self.assertIn('"feed"', reg, "feed.js is not registered")
         self.assertIn('"decisions"', reg, "decisions.js is not registered")
-        self.assertIn("exec-feed", reg, "feed entry names no home slot")
         page = (STATIC / "index.html").read_text()
         for tag in (
-            '<script src="/static/cards/feed.js">',
             '<script src="/static/cards/decisions.js">',
-            '<link rel="stylesheet" href="/static/cards/feed.css">',
             '<link rel="stylesheet" href="/static/cards/decisions.css">',
         ):
             self.assertIn(tag, page, f"index.html lost {tag}")
-    def test_feed_and_decisions_cards_on_fixtures(self):
-        """The feed groups fixture lines by day with chips and an honest
-        gap footer; the decisions card pills, filters, and link rules hold;
-        and the decisions spec hides when its source is absent."""
+    def test_decisions_card_on_fixtures(self):
+        """The decisions card pills, filters, and link rules hold; and the
+        decisions spec hides when its source is absent."""
         import json as _json
         fx = Path(__file__).resolve().parent.parent / "fixtures"
-        feed = _json.loads((fx / "project" / "feed.json").read_text())
         decisions = _json.loads((fx / "decisions.json").read_text())
         harness = (
             "const fs=require('fs');"
@@ -1556,24 +1567,18 @@ console.log("applySections proof ok");
             "eval(fs.readFileSync(process.argv[1],'utf8'));"
             "eval(fs.readFileSync(process.argv[2],'utf8'));"
             "eval(fs.readFileSync(process.argv[3],'utf8'));"
-            "eval(fs.readFileSync(process.argv[4],'utf8'));"
             "const assert=require('assert');"
-            "var opened=[];"
-            "globalThis.openPlan=function(ws){opened.push(ws);};"
-            "var draws=0;"
-            "globalThis.drawMain=function(){draws++;};"
+            "globalThis.drawMain=function(){};"
             "globalThis.secCache={};"
             "globalThis.keyOf=function(v){return JSON.stringify(v);};"
             "globalThis.api=function(){return {then:function(){return {catch:function(){}};}}};"
-            "var state={view:'project',ws:'all',seq:7,feed:null,feedError:null,feedSeq:-1,"
+            "var state={view:'project',ws:'all',seq:7,"
             " decisions:null,wss:[{ws:'WS9',name:'Relay'}],wssAll:[{ws:'WS9',name:'Relay'},{ws:'WS7',name:'Launch'}]};"
             "function byClass(node,token,out){out=out||[];"
             " (node.kids||[]).forEach(function(k){"
             "  if(k&&k.attrs&&(' '+k.attrs.class+' ').indexOf(' '+token+' ')>=0)out.push(k);"
             "  byClass(k,token,out);});return out;}"
             "function texts(nodes){return nodes.map(function(n){return n.textContent;});}"
-            "assert.strictEqual(dayLabel('2026-10-17'),'Oct 17');"
-            "assert.strictEqual(dayLabel('nope'),'nope');"
             "assert.strictEqual(decisionPill('approved').text,'\\u2713 Approved');"
             "assert.strictEqual(decisionPill('denied').text,'\\u2717 Denied');"
             "assert.strictEqual(decisionPill('pending').text,'\\u25CB Pending');"
@@ -1587,18 +1592,6 @@ console.log("applySections proof ok");
             "assert.strictEqual(decisionsSpec(state,{}),null);"
             "state.decisions={decisions:[],counts:{},source:{present:true}};"
             "assert.strictEqual(decisionsSpec(state,{}),null);"
-            "var fspec=feedSpec(state,{});"
-            "assert.ok(Array.isArray(fspec)&&typeof fspec[2]==='function');"
-            "state.feed=" + _json.dumps(feed) + ";state.feedSeq=7;"
-            "var card=feedCard();"
-            "assert.strictEqual(byClass(card,'fd-day').length,2);"
-            "assert.strictEqual(byClass(card,'fd-line').length,7);"
-            "var chips=byClass(card,'fd-ws');"
-            "assert.ok(chips.length>0);"
-            "assert.ok(chips.every(function(c){return c.tag==='button';}));"
-            "chips[0]._on.click();"
-            "assert.strictEqual(opened[0],chips[0].textContent);"
-            "assert.ok(card.kids.some(function(k){return (k.textContent||'').indexOf('No history before')>=0;}),'gap footer missing');"
             "state.decisions=" + _json.dumps(decisions) + ";"
             "var dspec=decisionsSpec(state,{});"
             "assert.ok(Array.isArray(dspec)&&typeof dspec[2]==='function');"
@@ -1623,7 +1616,7 @@ console.log("applySections proof ok");
         proc = subprocess.run(
             ["node", "-e", harness,
              str(STATIC / "format.js"), str(STATIC / "core" / "el.js"),
-             str(STATIC / "cards" / "feed.js"), str(STATIC / "cards" / "decisions.js")],
+             str(STATIC / "cards" / "decisions.js")],
             capture_output=True,
             text=True,
         )
@@ -1736,93 +1729,6 @@ console.log("applySections proof ok");
             "prefers-reduced-motion",
         ):
             self.assertIn(marker, css, f"depgraph.css lost the style rule: {marker}")
-    def test_roadmap_swimlane_contract(self):
-        """The roadmap swimlane keeps its integration points: the axis
-        comes from the shared helpers, every lane carries its workstream
-        id and state, planned bars say estimate, dateless lanes name the
-        before-history band, numbers stay compact, and a failed fetch is
-        loud instead of a zero."""
-        src = (STATIC / "cards" / "roadmap.js").read_text()
-        for token in ("axes(", "timeTicks(", "data-ws", "data-state", "data-road-lanes",
-                      "viewBox", 'role: "img"', "aria-label", "fmtN", "fmtUsd",
-                      "estimate: plan size", "before history", "waits on ",
-                      "request failed", "roadState", "openPlan",
-                      'delete secCache["exec-roadmap"]'):
-            self.assertIn(token, src, f"roadmap.js lost {token}")
-        for bad in (".toFixed(", "toLocaleString()", '"dagster"', "'dagster'",
-                    "doctor-pill", "DashDoctor", "refreshDoctor", "docwarn", "exec-health",
-                    "plan needs attention"):
-            self.assertNotIn(bad, src, f"roadmap.js must not contain {bad}")
-        hits = re.findall(r"Math\.round\s*\(\s*100\s*\*[^;]*?done", src, re.I)
-        self.assertEqual(hits, [], f"roadmap.js computes % done itself: {hits[:2]}")
-        reg = (STATIC / "cards" / "registry.js").read_text()
-        for token in ('"roadmap"', '"roadmap-plan"', 'scope: "project"', 'scope: "planned"',
-                      'slot: "exec-roadmap"', "roadmapSpec"):
-            self.assertIn(token, reg, f"registry.js lost the roadmap entry: {token}")
-        page = (STATIC / "index.html").read_text()
-        self.assertIn("/static/cards/roadmap.css", page, "index.html never loads the roadmap CSS")
-        self.assertIn("/static/cards/roadmap.js", page, "index.html never loads the roadmap card")
-        script = inline_scripts()
-        bodies = dict(functions(script))
-        self.assertIn("roadmapCard", bodies)
-        self.assertIn("roadmapSpec", bodies)
-        card = bodies["roadmapCard"]
-        self.assertIn("axes(", card, "roadmapCard draws a chart without axes()")
-        self.assertIn("timeTicks(", card, "roadmapCard lost its shared time axis")
-    def test_roadmap_edges_only_on_focus(self):
-        """No always-on dependency lines: connectors are created only in
-        the focus handler (hover, keyboard focus, or pin) and cleared on
-        the way out. The draw path carries no edge."""
-        src = (STATIC / "cards" / "roadmap.js").read_text()
-        def body(name):
-            start = src.index(f"function {name}(")
-            brace = src.index("{", start)
-            depth = 0
-            for pos in range(brace, len(src)):
-                if src[pos] == "{":
-                    depth += 1
-                elif src[pos] == "}":
-                    depth -= 1
-                    if depth == 0:
-                        return src[start:pos + 1]
-            raise AssertionError(f"{name} body never closes")
-        focus = body("focusLane")
-        self.assertIn("road-link", focus, "focusLane draws no connectors")
-        self.assertIn("road-focus", focus, "focusLane has no connector group")
-        self.assertIn("var(--warning)", focus, "upstream connectors lost their amber")
-        self.assertIn("var(--s1)", focus, "downstream connectors lost their blue")
-        card = body("roadmapCard")
-        self.assertNotIn("road-link", card, "roadmapCard draws always-on edges; connectors belong in focusLane only")
-        self.assertNotIn("road-focus", card, "roadmapCard mounts an edge group; connectors belong in focusLane only")
-        clear = body("clearLane")
-        self.assertIn("road-focus", clear, "clearLane removes nothing")
-    def test_roadmap_pure_helpers(self):
-        """roadState is glyph plus word for every lifecycle state, and
-        roadDay is a UTC calendar day (never a locale string)."""
-        harness = (
-            "var window={};"
-            "eval(require('fs').readFileSync(process.argv[1],'utf8'));"
-            "const assert=require('assert');"
-            "for(const [st,mark,word] of ["
-            "['done','\\u2713','Done'],['archived','\\u2713','Archived'],"
-            "['active','\\u25CF','Active'],['paused','\\u23F8','Paused'],"
-            "['planned','\\u25CB','Planned'],['dropped','\\u2715','Dropped']]){"
-            "const got=window.roadState(st);"
-            "assert.strictEqual(got.mark,mark,st);"
-            "assert.strictEqual(got.word,word,st);"
-            "assert.ok(got.color,'no colour for '+st);}"
-            "assert.strictEqual(window.roadState('bogus').word,'Active');"
-            "assert.strictEqual(window.roadDay(0),'1970-01-01');"
-            "assert.strictEqual(window.roadDay(1762000000),'2025-11-01');"
-            "assert.strictEqual(window.roadDay(null),'\\u2013');"
-            "assert.strictEqual(window.roadDay(undefined),'\\u2013');"
-        )
-        proc = subprocess.run(
-            ["node", "-e", harness, str(STATIC / "cards" / "roadmap.js")],
-            capture_output=True,
-            text=True,
-        )
-        self.assertEqual(proc.returncode, 0, proc.stderr or proc.stdout)
 class ProjectSwitcherTests(unittest.TestCase):
     def test_switcher_wiring(self):
         """The switcher reads /api/projects, needs fixtures + CSS, and is
@@ -2029,9 +1935,6 @@ class FinalPolishTests(unittest.TestCase):
         prog = (STATIC / "cards" / "plan-progress.js").read_text()
         for needle in ('"role", "button"', '"tabindex", "0"', '"aria-label"', '"keydown"', "chipActivate"):
             self.assertIn(needle, prog, f"plan-progress.js lost {needle}")
-        road = (STATIC / "cards" / "roadmap.js").read_text()
-        for needle in ('role: "button"', 'tabindex: "0"', '"aria-label"', '"keydown"'):
-            self.assertIn(needle, road, f"roadmap.js lost {needle}")
         tl = (STATIC / "cards" / "timeline.js").read_text()
         for needle in ('role: "button"', 'tabindex: "0"', '"aria-label"', '"keydown"'):
             self.assertIn(needle, tl, f"timeline.js lost {needle}")
@@ -2056,8 +1959,6 @@ class FinalPolishTests(unittest.TestCase):
         self.assertIn('"aria-label": label', burn)
         self.assertIn("recorded", burn)
         self.assertIn("total, peak", burn)
-        road = (STATIC / "cards" / "roadmap.js").read_text()
-        self.assertIn("lanes,", road)
         tl = (STATIC / "cards" / "timeline.js").read_text()
         self.assertIn('"aria-label": "Agent runs over the last 24 hours', tl)
         self.assertIn("died or blocked, ", tl)
@@ -2118,14 +2019,17 @@ class FinalPolishTests(unittest.TestCase):
         tiles = (STATIC / "cards" / "tiles.js").read_text()
         self.assertIn("(passN + part + bad)", tiles)
 
-    def test_roadmap_badge_names_blockers(self):
-        road = (STATIC / "cards" / "roadmap.js").read_text()
-        self.assertIn("blockers.join", road)
-        self.assertIn('"waits on " + blockers', road)
-
     def test_planned_cards_state_the_wait_once(self):
         home = (STATIC / "cards" / "project-home.js").read_text()
         self.assertNotIn("pj-wait", home)
+
+    def test_plan_sidenav_has_no_decisions_group(self):
+        """The plan tab sidenav names no Decisions group: the plan tab
+        renders no decisions section, so agent-friendly falls to Reference."""
+        nav = (STATIC / "sidenav.js").read_text()
+        self.assertNotIn("Decisions", nav)
+        self.assertNotIn("decided", nav)
+        self.assertIn('"Reference"', nav)
 
     def test_untitled_decisions_show_no_dash(self):
         dec = (STATIC / "cards" / "decisions.js").read_text()

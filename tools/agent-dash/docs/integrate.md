@@ -417,45 +417,45 @@ Picking up dashboard work (not just feeding it runs)? Read [roadmap.md](roadmap.
 One file plus one registry line. Put the renderer in a new IIFE file under `static/cards/` (copy the header docblock: what it renders, what it reads from `state`, what it exports), attach the render function to `window.AdPage.cards` and keep it as a plain global, add the `<script src="/static/cards/<name>.js">` tag in `static/index.html` before `registry.js`, and add one line to `static/cards/registry.js`:
 
 ```js
-/* static/cards/needs.js */
+/* static/cards/decisions.js */
 (function (global) {
   "use strict";
-  function needsCard() {
+  function decisionsCard() {
     var c = el("div", {class: "card"});
-    (state.approvals || []).forEach(function (b) {
+    (state.decisions || []).forEach(function (b) {
       c.appendChild(el("p", {text: b.ws}));
     });
     return c;
   }
   var AdPage = (global.AdPage = global.AdPage || {});
   AdPage.cards = AdPage.cards || {};
-  AdPage.cards.needs = global.needsCard = needsCard;
+  AdPage.cards.decisions = global.decisionsCard = decisionsCard;
 })(window);
-{id: "needs", order: 45, scope: "both", spec: needsSpec}, // registry.js
+{id: "decisions", order: 58, scope: "project", spec: decisionsSpec}, // registry.js
 ```
 
-`scope` is `overview` (only on `ws=all`), `workstream` (only off it), or `both`. Two more scopes mount on the project views: `project` (the Project home, `?view=project`) and `planned` (the Planned view, `?view=planned`). A project/planned entry with a `slot` naming one of the view's slot containers (`exec-burnup`, `exec-feed`, `exec-health`, `exec-roadmap`, `exec-depgraph` on the home; `exec-roadmap`, `exec-depgraph` on Planned) renders inside that slot; one without a `slot` renders as its own section after the slots, in registry order. A chart needed on both views adds one registry line per scope over the same spec function:
+`scope` is `overview` (only on `ws=all`), `workstream` (only off it), or `both`. Two more scopes mount on the project views: `project` (the Project home, `?view=project`) and `planned` (the Planned view, `?view=planned`). A project/planned entry with a `slot` naming one of the view's slot containers (`exec-burnup`, `exec-health`, `exec-depgraph` on the home; `exec-depgraph` on Planned) renders inside that slot; one without a `slot` renders as its own section after the slots, in registry order. A chart needed on both views adds one registry line per scope over the same spec function:
 
 ```js
-{id: "burnup", order: 55, scope: "project", slot: "exec-burnup", spec: burnupSpec},
-{id: "burnup-plan", order: 55, scope: "planned", slot: "exec-roadmap", spec: burnupSpec},
+{id: "depgraph", order: 62, scope: "project", slot: "exec-depgraph", spec: depGraphSpec},
+{id: "depgraph-plan", order: 62, scope: "planned", slot: "exec-depgraph", spec: depGraphSpec},
 ```
 
-The live example is the roadmap swimlane (`static/cards/roadmap.js`, fed by
-`GET /api/project/timeline` from `dash/projecttimeline.py`). Its card file
-fetches its own endpoint (or `../fixtures/timeline.json` under `?fixtures`)
-with a 30 s stale-while-refresh, so the shared refresh paths stay untouched;
+The live example is the burn-up chart (`static/cards/burnup.js`, fed by
+`GET /api/project/burnup` from `dash/projectburn.py`). Its card file
+fetches its own endpoint (or `../fixtures/burnup.json` under `?fixtures`)
+with an in-flight guard, so the shared refresh paths stay untouched;
 a failed fetch renders "request failed", never zeros. A new endpoint module
 stays pure — plain data in, JSON out — with a small `collect(store, now)`
-the server hook calls, builder tests in `tests/test_projecttimeline.py`,
-endpoint tests in `tests/test_server.py`, a `timeline.json` writer in
+the server hook calls, builder tests in `tests/test_projectburn.py`,
+endpoint tests in `tests/test_server.py`, a `burnup.json` writer in
 `fixtures/make_fixtures.py`, and the endpoint path added to
 `tests/test_privacy_pin.py` (names and numbers only, never bodies or paths).
 
-`spec` returns one `applySections` spec `[name, key, render, style]`, or null when the card does not apply. Keep the two-space `function name(` indent: `tests/test_page_rules.py` splits the logical script (core + cards in tag order + inline) on it. The `needs.js` card is the worked example for the project scope: registered once (`scope: "project"`), rendered beside Recently done. New views obey `DESIGN.md`: status as colour plus symbol plus word, numbers through the `fmt` helpers only, hover tooltips, axes on charts (the shared `axes()` helper).
+`spec` returns one `applySections` spec `[name, key, render, style]`, or null when the card does not apply. Keep the two-space `function name(` indent: `tests/test_page_rules.py` splits the logical script (core + cards in tag order + inline) on it. The `decisions.js` card is the worked example for the project scope: registered once (`scope: "project"`), rendered as its own section after the slots, hiding entirely when its source is absent. New views obey `DESIGN.md`: status as colour plus symbol plus word, numbers through the `fmt` helpers only, hover tooltips, axes on charts (the shared `axes()` helper).
 
-### Server-fed project cards (feed, decisions)
-A project card that needs its own endpoint keeps the endpoint beside the card: a pure builder module under `dash/` (see `dash/projectfeed.py`: plain data in, JSON out, no I/O in `build_feed`) plus a small `GET` hook in `dash/server.py` that parses params and serves it. The card file stays read-only: it loads through the shared `api()` helper (never raw `fetch`, never a non-GET method), so fixture mode (`?fixtures`) keeps working via `fixtures/<name>.json`. Because the load resolves after the first paint, the loader deletes its own `secCache` section and calls `drawMain()` once, guarded by an in-flight flag and the current `state.seq`, so a slow endpoint never flashes and never refetches per tick. A card whose source is optional (the decisions card over `GET /api/decisions`) returns null from its spec while loading and whenever the endpoint is absent or reports `source.present` as false: the section stays an empty node, never a "nothing here" placeholder. Neither card carries doctor output: no status counts, no problem words anywhere in the card or its stylesheet.
+### Server-fed project cards (decisions and friends)
+A project card that needs its own endpoint keeps the endpoint beside the card: a pure builder module under `dash/` (see `dash/projectfeed.py`: plain data in, JSON out, no I/O in `build_feed`) plus a small `GET` hook in `dash/server.py` that parses params and serves it. The card file stays read-only: it loads through the shared `api()` helper (never raw `fetch`, never a non-GET method), so fixture mode (`?fixtures`) keeps working via `fixtures/<name>.json`. Because the load resolves after the first paint, the loader deletes its own `secCache` section and calls `drawMain()` once, guarded by an in-flight flag and the current `state.seq`, so a slow endpoint never flashes and never refetches per tick. A card whose source is optional (the decisions card over `GET /api/decisions`) returns null from its spec while loading and whenever the endpoint is absent or reports `source.present` as false: the section stays an empty node, never a "nothing here" placeholder. The card carries no doctor output: no status counts, no problem words anywhere in the card or its stylesheet.
 A card with its own endpoint fetches it itself: `static/cards/depgraph.js`
 is the worked example. It reads `GET /api/project/graph` (built by the
 pure `dash/projectgraph.py` builder over local bundles: `depends_on`,

@@ -59,7 +59,7 @@ python3 ~/.claude/tools/agent-dash/agent_dash.py ws approve WS4 notes-cutover pe
 python3 ~/.claude/tools/agent-dash/agent_dash.py ws approvals WS4
 ```
 
-Pending items show in the dashboard's "Needs you" card and in the Plan page's Approvals section.
+Pending items show in the dashboard's Start readiness table (Approvals column) and the Project home Planned shelf; the lead reads the full list with `ws approvals`.
 
 ## 4. Execute each wave with the `ws-wave` workflow
 

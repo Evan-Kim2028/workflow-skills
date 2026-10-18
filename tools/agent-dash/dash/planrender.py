@@ -1,7 +1,9 @@
 """Render a plan bundle's page.html from plan.json, visuals.html, and layout.json.
 
-Section order is fixed: Why, End state, Plan, Progress, Decided, Agent-friendly, Reference.
+Section order is fixed: Why, End state, Plan, Progress, Agent-friendly, Reference.
 The Progress section is a placeholder. The plan page fills it from the live plan.
+There is no decisions section on the plan tab: plan-level decisions stay in
+the CLI and the API, never on the page.
 """
 
 from __future__ import annotations
@@ -106,29 +108,6 @@ def progress_block(ws: str) -> str:
     return f'<div id="plan-progress" class="plan-progress" data-plan-progress data-ws="{esc(ws)}"></div>'
 
 
-def decisions_block(decisions, review: str) -> str:
-    rows = []
-    for item in decisions or []:
-        if not isinstance(item, dict):
-            continue
-        alternatives = "".join(
-            f"<li><b>{esc(alt.get('option'))}</b>: {esc(alt.get('why_not'))}</li>"
-            for alt in item.get("alternatives") or []
-            if isinstance(alt, dict)
-        )
-        evidence = "; ".join(esc(entry) for entry in (item.get("evidence") or [])[:4])
-        reversible = "reversible" if item.get("reversible") else "one-way"
-        rows.append(
-            f'<div class="dec-c"><div class="dec-h"><span class="id">{esc(item.get("id"))}</span>'
-            f'<span class="pill s-exists">decided</span><span class="pill p-pass">{reversible}</span></div>'
-            f'<p class="dec-q">{esc(item.get("question"))}</p><p class="dec-d">{esc(item.get("decision"))}</p>'
-            f'<p class="why">{esc(item.get("why"))}</p>'
-            f"<details><summary>Alternatives and evidence</summary><ul>{alternatives}</ul>"
-            f'<p class="cap">Evidence: {evidence}</p><p class="cap">Risk: {esc(item.get("risk"))}</p></details></div>'
-        )
-    return f'<p class="sub">{esc(review)}</p><div class="dec-grid">{"".join(rows)}</div>'
-
-
 def agent_block(agent: dict) -> str:
     agent = agent or {}
     requirements = "".join(
@@ -165,7 +144,6 @@ def build(ws: str, data: dict, fragments: dict, layout: dict) -> str:
         ("end", "End state"),
         ("plan", "Plan"),
         ("progress", "Progress"),
-        ("decided", "Decided"),
         ("agent", "Agent-friendly"),
         ("ref", "Reference"),
     ]
@@ -214,12 +192,6 @@ def build(ws: str, data: dict, fragments: dict, layout: dict) -> str:
             progress_block(ws),
             lead="A summary of the live plan. The full task map, with agents working on it now, is on the Execution view.",
         )
-    body += sec(
-        f"{prefix}-decided",
-        "Decided",
-        "Decisions, made by review",
-        decisions_block(data.get("decisions") or [], layout.get("review_note") or ""),
-    )
     body += sec(
         f"{prefix}-agent",
         "Agent-friendly",

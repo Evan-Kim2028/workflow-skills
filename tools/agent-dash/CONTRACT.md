@@ -47,18 +47,16 @@ The one argv value ever kept is the worker's `--model` flag value, recorded on p
 | `static/cards/tables.js` (running and finished run tables) | Claude (parent) |
 | `static/cards/ws-cards.js` (Where we are, workstream cards, planSum cache) | Claude (parent) |
 | `static/cards/plan-progress.js` (plan progress map, task map, replay) | Claude (parent) |
-| `static/cards/needs.js` (needs-you/approvals card, currently unregistered) | Claude (parent) |
 | `static/cards/registry.js` (ordered card list: adding a card is one file plus one line; scopes `overview\|workstream\|both\|project\|planned`) | Claude (parent) |
-| `static/cards/project-home.js` + `project-home.css` (Project home `?view=project`: phases, tiles, Current, Planned shelf, Recently done, needs-you, chart slots) | Claude (parent) |
-| `static/cards/planned.js` + `planned.css` (Planned view `?view=planned`: start-readiness table, gated-but-live, roadmap slots) | Claude (parent) |
+| `static/cards/project-home.js` + `project-home.css` (Project home `?view=project`: phases, tiles, Current, Planned shelf, Recently done, chart slots) | Claude (parent) |
+| `static/cards/planned.js` + `planned.css` (Planned view `?view=planned`: start-readiness table, gated-but-live, dependency-graph slot) | Claude (parent) |
 | `dash/projectgraph.py` (pure cross-workstream graph builder for `GET /api/project/graph`: nodes, depends_on/gate/moved edges, cycles, depths) | depgraph |
 | `static/cards/depgraph.js` + `depgraph.css` (dependency graph card on `?view=project` and `?view=planned`, `exec-depgraph` slot on both) | depgraph |
 | `static/cards/archive.js` + `archive.css` (Archive shelf `?view=archive`: frozen summary cards, lifetime totals, read-only plan banner style) | Claude (parent) |
-| `static/cards/feed.js` + `feed.css` (What changed on the Project home, scope `project`, slot `exec-feed`: day-grouped newest-first lines from `GET /api/project/feed`) | feed |
 | `static/cards/decisions.js` + `decisions.css` (read-only decisions mirror on the Project home, scope `project`, unslotted: reads `GET /api/decisions`, hides entirely when the endpoint is absent or `source.present` is false) | feed |
+| `dash/projectfeed.py` (pure feed builder for `GET /api/project/feed`: page API only, no card) | feed |
 ||||||| parent of 628bd9d (feat(dash): project roadmap swimlane with focus-only dependency connectors)
-| `dash/projecttimeline.py` (pure roadmap lane builder + project reader + the `/api/project/timeline` collector) | core |
-| `static/cards/roadmap.js` + `roadmap.css` (Project roadmap swimlane on `?view=project` and `?view=planned`: dated bars, before-history band, planned estimates, focus-only dependency connectors) | dash-c1 |
+| `dash/projecttimeline.py` (pure timeline builder + project reader + the `/api/project/timeline` collector: page API only, no card) | core |
 ||||||| parent of 245220a (feat(dash): project burn-up with an honest history gap, and cost and token burn by workstream)
 | `dash/projectburn.py` (`GET /api/project/burnup`: recorded task burn-up plus per-day cost/token burn, UTC days, honest history gaps) | dash-c3 |
 | `static/cards/burnup.js` + `burnup.css` (Project burn-up `?view=project` slot `exec-burnup`: tasks area with plan line and gap band, stacked cost/token bars, togglable lanes) | dash-c3 |
@@ -451,7 +449,7 @@ Tabs list workstreams in `active`, `paused`, or `done` state (absent reads as `a
 
 The dashboard stays read-only: Archive/Restore buttons copy the exact CLI command (`python3 agent_dash.py ws archive <ID>`, `python3 agent_dash.py ws restore <ID>`) to the clipboard with a confirmation toast; they never write. Closing reports are basename-only on every payload; Report links open the plan view.
 
-Card registry scopes are `overview`, `workstream`, `both` (the exec tabs), plus `project` (Project home slots `exec-burnup`, `exec-feed`, `exec-health`, `exec-roadmap`, `exec-depgraph`) and `planned` (Planned slots `exec-roadmap`, `exec-depgraph`). A slotted entry mounts inside its named slot; an unslotted entry renders as its own section after the slots in registry order; the `needs` entry renders beside Recently done. A chart needed on both views adds one registry line per scope over the same spec function: still one file plus registry lines, no routing edits. The live example is the roadmap swimlane: `roadmap.js` registers `roadmap` (scope `project`) and `roadmap-plan` (scope `planned`), both slotted `exec-roadmap` over the one `roadmapSpec`, fed by `GET /api/project/timeline`.
+Card registry scopes are `overview`, `workstream`, `both` (the exec tabs), plus `project` (Project home slots `exec-burnup`, `exec-health`, `exec-depgraph`) and `planned` (Planned slot `exec-depgraph`). A slotted entry mounts inside its named slot; an unslotted entry renders as its own section after the slots in registry order. A chart needed on both views adds one registry line per scope over the same spec function: still one file plus registry lines, no routing edits. The live example is the dependency graph: `depgraph.js` registers `depgraph` (scope `project`) and `depgraph-plan` (scope `planned`), both slotted `exec-depgraph` over the one `depGraphSpec`, fed by `GET /api/project/graph`.
 
 ## One number, one truth
 
@@ -562,7 +560,7 @@ Each bundle:
 | `layout.json` | Which visual sections land in Why, End state, Plan, Agent-friendly, and Reference. |
 | `START-PROMPT.md` | Optional. Paste-ready prompt that starts this workstream's lead. `ws new` writes a template. |
 
-`dash/planrender.py` `render(bundle_dir)` writes `page.html` in this order: Approvals, Why, End state, Plan, Progress, Decided, Agent-friendly, Reference. Approvals is an empty `data-plan-approvals` node. Progress is an empty `data-plan-progress` node. The page fills both from the live bundle. Deferred tasks stay on the map and leave the counts.
+`dash/planrender.py` `render(bundle_dir)` writes `page.html` in this order: Approvals, Why, End state, Plan, Progress, Agent-friendly, Reference. There is no Decided section on the plan tab (removed on owner request); plan-level decisions stay in the CLI and the API. Approvals is an empty `data-plan-approvals` node. Progress is an empty `data-plan-progress` node. The page fills both from the live bundle. Deferred tasks stay on the map and leave the counts.
 
 ```
 python3 agent_dash.py ws list [--state S[,S...]|all] [--json]

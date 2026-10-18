@@ -9,11 +9,10 @@
    off it, "both" on either exec tab; "project" entries render on the
    Project home (?view=project) and "planned" entries on the Planned view
    (?view=planned). A project/planned entry with a slot naming one of the
-   view's slot containers (exec-burnup, exec-feed, exec-health,
-   exec-roadmap, exec-depgraph) mounts inside that slot; one without a
-   slot renders as its own section after the slots, in registry order; the
-   entry with id "needs" renders beside Recently done. A chart needed on
-   both views adds one line per scope over the same spec function. So a
+   view's slot containers (exec-burnup, exec-health, exec-depgraph)
+   mounts inside that slot; one without a slot renders as its own section
+   after the slots, in registry order. A chart needed on both views adds
+   one line per scope over the same spec function. So a
    later chart card stays one file plus one registry line, with no routing
    edits. registryFor(scope) returns the matching entries in order.
    Each spec closes over nothing at load; every name it calls (tiles,
@@ -59,14 +58,6 @@
     {id: "finished", order: 90, scope: "both", spec: function (state, snap) {
       return ["finished", keyOf([(snap.recent || []).map(runRow), snap.recent_shown, snap.recent_total, snap.counts && snap.counts.finished_in_range]), function () { return runsTable("Finished (24 h)", finishedSub(snap), snap.recent || [], state.snapError ? "request failed" : "Nothing finished in the last 24 h."); }, "margin-top:14px"];
     }},
-    /* Needs-you roll-up: registered for the Project home only (scope
-       "project"), where it renders beside Recently done. */
-    {id: "needs", order: 45, scope: "project", spec: function (state, snap) {
-      return ["needs", keyOf([state.approvals, state.ws, state.view]), function () { return needsCard(); }, ""];
-    }},
-    {id: "feed", order: 50, scope: "project", slot: "exec-feed", spec: function (state, snap) {
-      return feedSpec(state, snap);
-    }},
     {id: "decisions", order: 58, scope: "project", spec: function (state, snap) {
       return decisionsSpec(state, snap);
     }},
@@ -77,14 +68,6 @@
     }},
     {id: "depgraph-plan", order: 62, scope: "planned", slot: "exec-depgraph", spec: function (state, snap) {
       return depGraphSpec(state, snap);
-    }},
-    /* Project roadmap swimlane (one file, one spec, two scopes): the
-       Project home and the Planned view each mount it in exec-roadmap. */
-    {id: "roadmap", order: 60, scope: "project", slot: "exec-roadmap", spec: function (state, snap) {
-      return roadmapSpec(state, snap);
-    }},
-    {id: "roadmap-plan", order: 60, scope: "planned", slot: "exec-roadmap", spec: function (state, snap) {
-      return roadmapSpec(state, snap);
     }},
     {id: "burnup", order: 50, scope: "project", slot: "exec-burnup", spec: function (state, snap) {
       return burnupSpec(state, snap);

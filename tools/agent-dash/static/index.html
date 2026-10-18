@@ -16,10 +16,8 @@
 <link rel="stylesheet" href="/static/cards/project-home.css">
 <link rel="stylesheet" href="/static/cards/planned.css">
 <link rel="stylesheet" href="/static/cards/archive.css">
-<link rel="stylesheet" href="/static/cards/feed.css">
 <link rel="stylesheet" href="/static/cards/decisions.css">
 <link rel="stylesheet" href="/static/cards/depgraph.css">
-<link rel="stylesheet" href="/static/cards/roadmap.css">
 <link rel="stylesheet" href="/static/cards/burnup.css">
 <script src="/static/core/theme.js"></script>
 <style>
@@ -135,20 +133,6 @@ svg{display:block;overflow:visible}
 .view-nav{display:inline-flex;border:1px solid var(--ring);border-radius:var(--r-pill);padding:3px;background:var(--surface);gap:2px}
 .view-nav button{border:0;border-radius:var(--r-pill);background:transparent;color:var(--ink-2);font-weight:650;font-size:13px;padding:5px 14px;white-space:nowrap}
 .view-nav button[aria-current="page"]{background:var(--accent-fill,var(--accent));color:var(--accent-ink)}
-.needs-you{margin-bottom:14px}
-.needs-line{margin:4px 0;font-size:13px;color:var(--ink-2)}
-.needs-row{display:flex;flex-wrap:wrap;gap:8px 12px;align-items:baseline;padding:6px 0;border-bottom:1px solid var(--grid);font-size:13.5px}
-.needs-row a{color:var(--ink);font-weight:650;text-decoration:none}
-.needs-row a:hover,.needs-row a:focus-visible{color:var(--s1)}
-.ap-badge{display:inline-block;font:600 11px var(--mono);padding:2px 7px;border-radius:999px;border:1px solid var(--grid);white-space:nowrap}
-.ap-badge.oneway{color:var(--critical);border-color:var(--critical);background:color-mix(in srgb,var(--critical) 12%,transparent)}
-.ap-badge.rev{color:var(--good-ink);border-color:var(--good);background:color-mix(in srgb,var(--good) 12%,transparent)}
-.ap-group{margin-top:12px}
-.ap-group h3{font-size:13px;margin:0 0 4px}
-.ap-row{display:grid;grid-template-columns:minmax(0,1.4fr) auto minmax(0,1fr);gap:10px;align-items:baseline;padding:7px 0;border-bottom:1px solid var(--grid);font-size:14px}
-.ap-cond{color:var(--ink-2);font-size:13px}
-.ap-step{min-width:0}
-@media (max-width:640px){.ap-row{grid-template-columns:minmax(0,1fr)}}
 /* phone (390 px): 16 px gutters, no horizontal scroll. Tables and chart
    internals adapt in their own card CSS; the shell stacks, goes 2-up for
    tiles, and offers .hidephone for non-essential columns. */
@@ -261,14 +245,11 @@ html{scroll-padding-top:calc(var(--pinned-h) + 10px)}
 <script src="/static/cards/tables.js"></script>
 <script src="/static/cards/ws-cards.js"></script>
 <script src="/static/cards/plan-progress.js"></script>
-<script src="/static/cards/needs.js"></script>
 <script src="/static/cards/planned.js"></script>
 <script src="/static/cards/project-home.js"></script>
 <script src="/static/cards/archive.js"></script>
-<script src="/static/cards/feed.js"></script>
 <script src="/static/cards/decisions.js"></script>
 <script src="/static/cards/depgraph.js"></script>
-<script src="/static/cards/roadmap.js"></script>
 <script src="/static/cards/burnup.js"></script>
 <script src="/static/cards/registry.js"></script>
 <script>
