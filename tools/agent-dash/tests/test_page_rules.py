@@ -618,6 +618,26 @@ class PageRules(unittest.TestCase):
         self.assertIn("tokens unpriced", body, "cost tile no longer says whose tokens it excludes")
         self.assertIn("data-unpriced-tokens", body, "cost tile lost its unpriced data attribute")
 
+    def test_tiles_delta_chips(self):
+        """KPI tiles carry a change chip and a sparkline: deltas prefer the
+        exact rolling priors in snap.prev_24h, fall back to the hour-bucket
+        approximation labelled approx. in the chip tooltip, and render a
+        prior-zero window as "new past 24 h", never an infinite percent."""
+        script = inline_scripts()
+        bodies = dict(functions(script))
+        self.assertIn("tiles", bodies)
+        body = bodies["tiles"]
+        self.assertIn("prev_24h", body, "tiles() ignores the exact rolling priors")
+        self.assertIn("approx.", body, "the bucket fallback never says approx.")
+        self.assertIn("tilePctChip", bodies)
+        self.assertIn("tileCountChip", bodies)
+        self.assertIn("past 24 h", bodies["tilePctChip"], "prior-zero has no new-past-24h chip")
+        self.assertIn("past 24 h", bodies["tileCountChip"], "live prior-zero has no new chip")
+        self.assertNotIn("Infinity", script, "a delta can read as an infinite percent")
+        self.assertIn("tileSpark(", body, "tiles() draws no sparkline")
+        self.assertIn("tileSpark", bodies)
+        self.assertIn("aria-hidden", bodies["tileSpark"], "the sparkline is not marked decorative")
+
     def test_stale_badge_reads_tick_freshness(self):
         """The tick carries seq + freshness; the page badges stale when the
         seq stays frozen for 3 poll intervals with an open SSE stream."""

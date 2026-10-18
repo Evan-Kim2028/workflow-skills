@@ -1,0 +1,21 @@
+/* KPI tiles (v2): label, headline value, delta chip, sparkline, tertiary lines.
+   Every var below falls back to the current token name so the card reads
+   right on both the old palette and design-v2-tokens.css. */
+.tile .l{font-size:12.5px;color:var(--ink-2);font-weight:600}
+.tile .v{font-size:var(--fs-hero,34px);font-weight:750;letter-spacing:-.02em;line-height:1.15;margin-top:2px;font-variant-numeric:var(--tnum,tabular-nums)}
+.tile .delta{display:inline-flex;align-items:center;gap:5px;font:700 12px var(--mono);font-variant-numeric:var(--tnum,tabular-nums);border-radius:var(--r-pill,999px);padding:2px 9px;margin-top:6px;border:1px solid transparent;white-space:nowrap}
+.tile .delta.up{color:var(--good-ink,var(--good));background:var(--good-soft,var(--ok-soft));border-color:color-mix(in srgb,var(--good) 40%,transparent)}
+.tile .delta.down{color:var(--critical-ink,var(--critical));background:var(--critical-soft,var(--crit-soft));border-color:color-mix(in srgb,var(--critical) 40%,transparent)}
+.tile .delta.flat{color:var(--ink-2);background:var(--mute-soft,var(--surface-2));border-color:var(--grid)}
+.tile .delta.new{color:var(--accent-ink,#fff);background:var(--accent);border-color:transparent}
+.tile .delta .w{font-family:var(--font);font-weight:600;font-size:11px}
+.tile .spark{margin-top:8px;display:block;width:100%;height:44px}
+.tile .x{font:12px var(--mono);font-variant-numeric:var(--tnum,tabular-nums);color:var(--muted);margin-top:6px}
+.tile .xline{padding:1px 0;overflow-wrap:anywhere;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+@media (max-width:700px){
+  .tile .v{font-size:26px}
+  .tile .delta{white-space:normal}
+}
+@media (prefers-reduced-motion:reduce){
+  .tile .delta{transition:none}
+}
