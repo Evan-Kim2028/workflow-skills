@@ -150,7 +150,10 @@ async function main() {
   await send("Page.enable");
   await send("Runtime.enable");
   await send("Page.navigate", { url: `${URL}/?view=exec&ws=all` });
-  check("current table renders 13 open rows", await waitFor(
+  check("current table shows the top 5 by default", await waitFor(
+    `document.querySelectorAll('[data-mg-rows] tr').length === 5`), "want the top-5 default");
+  await ev(`(function(){var bs=document.querySelectorAll('[data-mg-more] button');for(var i=0;i<bs.length;i++){if(/Show all/.test(bs[i].textContent)){bs[i].click();break;}}})()`);
+  check("show-all expands to every open row", await waitFor(
     `document.querySelectorAll('[data-mg-rows] tr').length >= 13`), "bulk of the 14 minus archived");
 
   // Bar height on desktop with 14 workstreams.
