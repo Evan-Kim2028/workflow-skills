@@ -47,7 +47,7 @@
       return ["tiles", keyOf([snap.counts, snap.totals, snap.totals_all_time, snap.last_activity, state.ws, state.snapError]), function () { return tiles(snap); }, state.ws === "all" ? "margin-top:14px" : ""];
     }},
     {id: "running", order: 30, scope: "both", spec: function (state, snap) {
-      return ["running", keyOf((snap.running || []).map(runRow)), function () { return runsTable("Running now", "Click a row for details. Output \u25B2 means the out file grew since the last poll.", snap.running || [], state.snapError ? "request failed" : "Nothing running."); }, "margin-top:14px"];
+      return ["running", keyOf((snap.running || []).map(runRow)), function () { return runsTable("Running now", "Most recently active first. Click a row for details. Output \u25B2 means the out file grew since the last poll.", snap.running || [], state.snapError ? "request failed" : "Nothing running."); }, "margin-top:14px"];
     }},
     /* Workstream cards on the overview read the same snapshot rows the tiles
        read, so each card matches its workstream tab for the fixed 24 h window. */
@@ -64,7 +64,9 @@
     {id: "conc", order: 70, scope: "both", spec: function (state, snap) {
       return ["conc", keyOf([state.conc, Math.floor(Date.now() / 60000)]), function () { return concChart(snap); }, "margin-top:14px"];
     }},
-    {id: "gantt", order: 80, scope: "both", spec: function (state, snap) {
+    /* The run timeline sits directly under Tokens per hour (owner ask):
+       tokens, then gantt, then Live agents over time, then finished. */
+    {id: "gantt", order: 65, scope: "both", spec: function (state, snap) {
       return ["gantt", keyOf([(state.runs || []).map(runRow), expanded, Math.floor(Date.now() / 60000)]), function () { return gantt(); }, "margin-top:14px"];
     }},
     {id: "finished", order: 90, scope: "both", spec: function (state, snap) {

@@ -2475,6 +2475,97 @@ class FinalPolishTests(unittest.TestCase):
         self.assertIn("state.actionsArchive = !!", api_src, "loadNav lost the actions flag")
         self.assertIn("state.actionsArchive = false", api_src)
 
+    def test_exec_section_order_tokens_then_timeline(self):
+        """The run timeline sits directly below Tokens per hour: on both
+        exec scopes the registry order is ... tokens, gantt, conc,
+        finished, with every other section unchanged relative to the
+        rest. The sidenav derives its order from the DOM, so no pin
+        there; the page comment and DESIGN.md name the same order."""
+        registry = (STATIC / "cards" / "registry.js").read_text()
+        entries = re.findall(
+            r'\{id:\s*"([^"]+)",\s*order:\s*(\d+),\s*scope:\s*"([^"]+)"', registry
+        )
+        self.assertGreater(len(entries), 5, "the registry entry pattern no longer matches")
+        both = sorted(
+            [(int(order), ident) for ident, order, scope in entries if scope == "both"]
+        )
+        self.assertEqual(
+            [ident for _, ident in both],
+            ["tiles", "running", "plan", "tokens", "gantt", "conc", "finished"],
+            "exec order drifted: want tokens, then gantt, then conc, then finished",
+        )
+        page = (STATIC / "index.html").read_text()
+        self.assertIn("tokens, gantt, conc, finished", page)
+        design = (STATIC.parent / "DESIGN.md").read_text()
+        self.assertIn("run timeline directly below it", design)
+        self.assertLess(
+            design.index("run timeline directly below it"),
+            design.index("Finished (24 h)"),
+            "DESIGN.md no longer lists the timeline before Finished",
+        )
+        sidenav = (STATIC / "sidenav.js").read_text()
+        self.assertNotIn('"gantt"', sidenav, "the sidenav hard-codes a section order")
+        self.assertNotIn('"conc"', sidenav, "the sidenav hard-codes a section order")
+
+    def test_running_now_disclosure(self):
+        """Running now shows the top agents with a progressive disclosure
+        button: a real <button> with aria-expanded and aria-controls over
+        the extra rows, a cap constant of 5, sessionStorage guarded by
+        try/catch, the full count in the header, and no button at 5 or
+        fewer. The data-nav label stays "Running now" for the sidenav."""
+        tables = (STATIC / "cards" / "tables.js").read_text()
+        self.assertIn("RUNNING_TOP_N = 5", tables, "the top-5 cap constant drifted")
+        self.assertIn('el("button"', tables, "the disclosure is not a real <button>")
+        for marker in ("aria-expanded", "aria-controls", "exec-running-extra"):
+            self.assertIn(marker, tables, f"the disclosure lost {marker}")
+        self.assertIn('"Show all " + total + " running agents"', tables)
+        self.assertIn('"Show top " + RUNNING_TOP_N + " agents"', tables)
+        self.assertIn('title + " \\u00B7 " + runs.length', tables, "the header lost its full count")
+        self.assertIn('"data-nav": title', tables, "the data-nav label must stay the plain title")
+        self.assertIn("rows.length > RUNNING_TOP_N", tables, "the button must hide at 5 or fewer")
+        self.assertIn('setAttribute("hidden"', tables)
+        self.assertIn('removeAttribute("hidden"', tables)
+        bodies = dict(functions(tables))
+        self.assertIn("agents", bodies["runningToggleLabel"], "the toggle label must name agents")
+        for name in ("readRunningExpanded", "writeRunningExpanded"):
+            self.assertIn(name, bodies, f"{name} is gone from tables.js")
+            self.assertIn("try", bodies[name], f"{name} touches storage unguarded")
+            self.assertIn("catch", bodies[name], f"{name} touches storage unguarded")
+            self.assertIn("sessionStorage", bodies[name], f"{name} no longer uses sessionStorage")
+        self.assertIn("agent-dash-running:", tables, "the storage key lost its per-scope prefix")
+
+    def test_running_visible_helpers(self):
+        """The top-5 slicing and label text are pure functions on
+        window.AdPage.cards: newest started_at first (stable on ties),
+        top 5 collapsed, all rows expanded, agent-naming labels."""
+        script = (
+            "const fs=require('fs');"
+            "var window={};"
+            "eval(fs.readFileSync(process.argv[1],'utf8'));"
+            "const C=window.AdPage.cards;"
+            "const assert=require('assert');"
+            "assert.strictEqual(C.RUNNING_TOP_N,5);"
+            "const rows=[100,700,300,500,200,600,400].map((t,i)=>({run_id:'r'+i,started_at:t}));"
+            "assert.deepStrictEqual(C.runningOrder(rows).map(r=>r.started_at),[700,600,500,400,300,200,100]);"
+            "const ties=[{run_id:'a',started_at:9},{run_id:'b',started_at:9}];"
+            "assert.deepStrictEqual(C.runningOrder(ties).map(r=>r.run_id),['a','b']);"
+            "assert.deepStrictEqual(C.runningOrder(null),[]);"
+            "const top=C.runningVisible(rows,false);"
+            "assert.strictEqual(top.length,5);"
+            "assert.deepStrictEqual(top.map(r=>r.started_at),[700,600,500,400,300]);"
+            "assert.strictEqual(C.runningVisible(rows,true).length,7);"
+            "assert.strictEqual(C.runningVisible(rows.slice(0,3),false).length,3);"
+            "assert.strictEqual(C.runningToggleLabel(12,false),'Show all 12 running agents');"
+            "assert.strictEqual(C.runningToggleLabel(12,true),'Show top 5 agents');"
+            "assert.ok(C.runningScopeKey('WS1')!==C.runningScopeKey('all'));"
+        )
+        proc = subprocess.run(
+            ["node", "-e", script, str(STATIC / "cards" / "tables.js")],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr or proc.stdout)
+
 
 
 if __name__ == "__main__":

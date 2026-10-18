@@ -172,6 +172,17 @@ tr.clk:focus-visible {
   font: 600 11.5px var(--mono);
   color: var(--ink-2);
 }
+/* Running-now disclosure: a quiet full-width button below the table. */
+.runmore {
+  display: block;
+  width: 100%;
+  margin-top: 10px;
+  border-radius: var(--r-sm);
+  color: var(--ink-2);
+}
+.runmore:hover {
+  color: var(--ink);
+}
 
 @media (max-width: 700px) {
   .hidephone {
