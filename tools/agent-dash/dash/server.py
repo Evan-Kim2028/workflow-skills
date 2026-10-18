@@ -777,12 +777,12 @@ class Handler(BaseHTTPRequestHandler):
         self._json(200, {"burnup": build_burnup(self.server.store)})
 
     def _project_phases(self, query):
-        """``GET /api/project/phases?scope=24h|7d|all``: usage by phase.
+        """``GET /api/project/phases?scope=24h|7d|all``: planning versus execution.
 
         Per workstream (and an all-scope total) the billed tokens, cost,
         agents, runs and hours split into planning, execution, review,
         coordination and unclassified, plus a cumulative-by-day cost and
-        token series per phase (see ``dash/projectphases.py``). A bad
+        token series per kind of work (see ``dash/projectphases.py``). A bad
         scope is a 400. Identity tag covers scope, data version, rules
         hash, ignore list, plan and taskmap stamps, so an unchanged
         dashboard 304s without recomputing.

@@ -1,11 +1,11 @@
-"""Usage by phase: classifier rules, folds, endpoint, and card wiring.
+"""Planning versus execution: classifier rules, folds, endpoint, and card wiring.
 
 Seeds synthetic bundles (invented labels on WS1/WS2, exact-label map) in
 a temp workstreams dir plus usage rows in a temp store, then pins the
 contract: every rule class and its precedence, the explicit ws mark
 convention, the unclassified bucket, task mapping (dash/dot
 insensitive, plan members only), lead and planning-window context,
-local override merge and hash, per-phase folds that sum to the
+local override merge and hash, per-kind folds that sum to the
 all-scope totals to the cent, scope windows, the ignore list and Other
 bucket, rules-hash cache invalidation, the HTTP endpoint shape (304,
 400), by_phase on workstream and state rows, the phases fixture shape,

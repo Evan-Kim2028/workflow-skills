@@ -1359,7 +1359,8 @@ def _phases(runs, now):
         "day": "UTC",
         "rules_hash": "fixture",
         "rules_version": 1,
-        "caption": ("Split by run label: explicit plan, exec, review and coord marks first, "
+        "caption": ("Split by kind of work: planning, execution, review, coordination. "
+                    "Explicit plan, exec, review and coord marks first, "
                     "then review affixes, plan task matches, planning, review, doing and "
                     "coordination words, unmapped lead sessions and early exploration. "
                     "The rest reads Unclassified."),

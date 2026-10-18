@@ -1,6 +1,7 @@
-/* Usage-by-phase card: stacked bars per workstream, legend, takeaway,
-   cumulative chart, and the thin management-table bar. */
+/* Planning-versus-execution card: stacked bars per workstream, legend,
+   takeaway, cumulative chart, and the thin management-table bar. */
 .phase-usage .phase-tabs { display: inline-flex; margin: 0 12px 4px 0; }
+.phase-legend .lhead { font-weight: 600; margin-right: 4px; }
 .ph-list { display: flex; flex-direction: column; gap: 10px; margin-top: 10px; }
 .ph-row { display: grid; grid-template-columns: minmax(180px, 260px) 1fr auto; gap: 10px; align-items: center; }
 .ph-name { background: none; border: 0; padding: 0; text-align: left; font: inherit; color: var(--ink); cursor: pointer; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

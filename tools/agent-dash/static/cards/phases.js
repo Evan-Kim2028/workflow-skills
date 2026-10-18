@@ -1,13 +1,13 @@
-/* Page card: Usage by phase (?view=project, slot exec-phases; compact
-   variant on the workstream execution tab).
+/* Page card: Planning versus execution (?view=project, slot exec-phases;
+   compact variant on the workstream execution tab).
    The project card paints GET /api/project/phases (../fixtures/phases.json
-   under ?fixtures): stacked horizontal bars per workstream with phase
-   colours, a tokens/cost toggle, scope tabs, totals, and a plain-words
-   takeaway. Clicking a workstream opens its tab. The workstream card
-   paints the same payload for the open tab: a lifetime split bar plus
-   cumulative cost by phase over time, so the planning spend reads as a
-   line that flattens when planning ends. Unclassified is its own grey
-   bucket, never merged.
+   under ?fixtures): stacked horizontal bars per workstream with
+   kind-of-work colours, a tokens/cost toggle, scope tabs, totals, and a
+   plain-words takeaway. Clicking a workstream opens its tab. The
+   workstream card paints the same payload for the open tab: a lifetime
+   split bar plus cumulative cost by kind of work over time, so the
+   planning spend reads as a line that flattens when planning ends.
+   Unclassified is its own grey bucket, never merged.
    Reads: state.phaseUsage (per scope), state.phaseUsageError,
    state.phaseUsageAt, state.view, state.ws, state.wss/wssAll.
    Exports (on window.AdPage.cards, also kept as plain globals):
@@ -143,13 +143,14 @@
     host.appendChild(met);
   }
 
-  /* Legend: every phase is a glyph plus a word plus its swatch, never
-     colour alone; each entry carries raw values for agents. */
+  /* Legend: every kind of work is a glyph plus a word plus its swatch,
+     never colour alone; each entry carries raw values for agents. */
   function phaseLegend(host, cells, metric) {
     var lg = el("div", {class: "legend phase-legend"});
     var grand = 0;
     cells.forEach(function (c) { grand += (+c.value || 0); });
-    lg.appendChild(el("span", {class: "ltotal", "data-legend-total": String(grand), title: "All phases in this view"}, [el("b", {text: "Total " + phaseFmt(metric, grand)})]));
+    lg.appendChild(el("span", {class: "lhead", text: "Kind of work"}));
+    lg.appendChild(el("span", {class: "ltotal", "data-legend-total": String(grand), title: "All kinds of work in this view"}, [el("b", {text: "Total " + phaseFmt(metric, grand)})]));
     phaseShares(cells).forEach(function (c) {
       if (!c.value) return;
       var sp = el("span", {class: "lentry", "data-key": c.phase, "data-v": String(c.value),
@@ -203,7 +204,7 @@
   }
 
   /* The plain-words takeaway: which workstream dominates this view and
-     which phase took most of it. Names first, never bare ids. */
+     which kind of work took most of it. Names first, never bare ids. */
   function phaseTakeaway(items, metric) {
     var scope = SCOPE_WORD[phaseScope] === "All time" ? "so far" : "in the last " + SCOPE_WORD[phaseScope];
     var top = null, topValue = 0;
@@ -224,8 +225,8 @@
   }
 
   function phaseUsageCard() {
-    var c = el("div", {class: "card phase-usage", "data-nav": "Usage by phase"});
-    c.appendChild(el("h2", {text: "Usage by phase"}));
+    var c = el("div", {class: "card phase-usage", "data-nav": "Planning versus execution"});
+    c.appendChild(el("h2", {text: "Planning versus execution"}));
     var data = phasePayload();
     c.appendChild(el("p", {class: "sub", text: (data && data.caption) || "Planning versus execution per workstream."}));
     phaseSegTabs(c);
@@ -235,7 +236,7 @@
     }
     if (!data) {
       ensurePhaseUsage();
-      c.appendChild(el("div", {class: "empty", text: "Loading usage by phase\u2026"}));
+      c.appendChild(el("div", {class: "empty", text: "Loading planning versus execution\u2026"}));
       return c;
     }
     var items = (data.workstreams || []).filter(function (w) { return w.ws !== "Other"; });
@@ -282,8 +283,8 @@
   }
 
   /* Thin two-segment bar for a management table row: planning versus
-     execution share of lifetime tokens, the rest of the phases named in
-     the tooltip. Returns null when the row carries no split. */
+     execution share of lifetime tokens, the rest of the kinds of work
+     named in the tooltip. Returns null when the row carries no split. */
   function phaseBar(byPhase) {
     if (!byPhase) return null;
     var cells = PHASES.map(function (ph) { return {phase: ph, value: phaseValue(byPhase[ph], "tokens")}; });
@@ -295,8 +296,8 @@
     var tip = shares.filter(function (c) { return c.value > 0; }).map(function (c) {
       return PHASE_WORD[c.phase] + " " + phaseExact(c.value);
     }).join(" \u00B7 ");
-    bar.setAttribute("aria-label", "Lifetime tokens by phase: " + tip);
-    bar.title = "Lifetime tokens by phase \u2014 " + tip + " \u00B7 " + phaseExact(total) + " total";
+    bar.setAttribute("aria-label", "Lifetime tokens by kind of work: " + tip);
+    bar.title = "Lifetime tokens by kind of work \u2014 " + tip + " \u00B7 " + phaseExact(total) + " total";
     ["planning", "execution"].forEach(function (ph) {
       var cell = null;
       shares.forEach(function (c) { if (c.phase === ph) cell = c; });
@@ -325,9 +326,9 @@
     return d.getUTCFullYear() + "-" + (m < 10 ? "0" + m : m) + "-" + (day < 10 ? "0" + day : day);
   }
 
-  /* Cumulative cost by phase over time for one workstream: one line per
-     phase with spend, planning first so the planning line flattening
-     reads as planning ending. */
+  /* Cumulative cost by kind of work over time for one workstream: one
+     line per kind with spend, planning first so the planning line
+     flattening reads as planning ending. */
   function phaseCumulative(host, item) {
     var days = item.days || [];
     if (!days.length) return false;
@@ -347,7 +348,7 @@
     var X = function (t) { return L + ((t - days[0]) / 86400) * (pw / n) + (pw / n) / 2; };
     var Y = function (v) { return T + ph - v / nice * ph; };
     var svg = s("svg", {viewBox: "0 0 " + W + " " + H, width: W, height: H, style: "display:block;max-width:100%", role: "img",
-      "aria-label": "Cumulative cost by phase over time for " + wsLabel(item.ws, item.name)});
+      "aria-label": "Cumulative cost by kind of work over time for " + wsLabel(item.ws, item.name)});
     order.forEach(function (phase) {
       var cum = item.series[phase].cumulative_cost || [];
       var line = cum.map(function (v, i) { return X(days[i]) + "," + Y(v); }).join(" ");
@@ -378,8 +379,8 @@
      the tab row plus the cumulative cost chart from the shared payload. */
   function phaseUsageWsCard() {
     var row = wsRow();
-    var c = el("div", {class: "card phase-usage phase-ws", "data-nav": "Usage by phase"});
-    c.appendChild(el("h2", {text: "Usage by phase"}));
+    var c = el("div", {class: "card phase-usage phase-ws", "data-nav": "Planning versus execution"});
+    c.appendChild(el("h2", {text: "Planning versus execution"}));
     if (!row) {
       c.appendChild(el("div", {class: "empty", text: "No workstream selected."}));
       return c;
@@ -399,7 +400,7 @@
     }
     if (!data) {
       ensurePhaseUsageFor("all");
-      c.appendChild(el("div", {class: "empty", text: "Loading usage by phase\u2026"}));
+      c.appendChild(el("div", {class: "empty", text: "Loading planning versus execution\u2026"}));
       return c;
     }
     var item = null;
@@ -415,7 +416,7 @@
     if (!phaseCumulative(c, item)) {
       c.appendChild(el("div", {class: "empty", text: "No cumulative cost yet for " + label + "."}));
     } else {
-      c.appendChild(el("p", {class: "ph-foot", text: "Cumulative cost by phase \u2014 a flattening line means that phase stopped spending."}));
+      c.appendChild(el("p", {class: "ph-foot", text: "Cumulative cost by kind of work \u2014 a flattening line means that kind of work stopped spending."}));
     }
     return c;
   }

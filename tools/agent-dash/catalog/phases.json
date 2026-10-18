@@ -1,5 +1,5 @@
 {
-  "_comment": "Usage-by-phase classifier rules. Ordered: the first matching rule wins for a run. Edit words here, not in code; the dashboard re-reads this file (plus phases.local.json beside project.json, whose entries run first) and the rules hash in API payloads changes, invalidating caches. Only labels are ever read, never prompts or argv.",
+  "_comment": "Planning-versus-execution classifier rules (file name is historical). Ordered: the first matching rule wins for a run. Edit words here, not in code; the dashboard re-reads this file (plus phases.local.json beside project.json, whose entries run first) and the rules hash in API payloads changes, invalidating caches. Only labels are ever read, never prompts or argv.",
   "version": 1,
   "phases": ["planning", "execution", "review", "coordination", "unclassified"],
   "rules": [

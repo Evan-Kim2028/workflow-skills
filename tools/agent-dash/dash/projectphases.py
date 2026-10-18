@@ -1,9 +1,10 @@
-"""Usage by phase: planning versus execution per workstream.
+"""Planning versus execution per workstream.
 
-``GET /api/project/phases?scope=24h|7d|all`` answers what the "Usage by
-phase" card paints: per workstream (and an all-scope total) the billed
-tokens, cost, agents, runs and hours split by phase, plus a
-cumulative-by-day cost and token series per phase for each workstream.
+``GET /api/project/phases?scope=24h|7d|all`` answers what the "Planning
+versus execution" card paints: per workstream (and an all-scope total)
+the billed tokens, cost, agents, runs and hours split by kind of work,
+plus a cumulative-by-day cost and token series per kind of work for
+each workstream.
 
 Attribution is per usage event: each event joins its run, the run is
 classified by :mod:`dash.phases` (explicit ``ws<N>-plan``/``-exec``/
@@ -13,8 +14,9 @@ sessions, and the pre-task planning window), and child-chat events fold
 onto their parent run exactly like the snapshot does. Cost uses the
 same catalog pricing with the same unpriced rule (priced events sum,
 unpriced tokens are counted but costed nowhere), so the all-scope
-total equals the sum of phases to the cent, and per-workstream phase
-sums equal the bucket totals for the same window.
+total equals the sum of the kinds of work to the cent, and
+per-workstream kind-of-work sums equal the bucket totals for the same
+window.
 
 ``unclassified`` is its own grey bucket, never merged. The payload
 carries the rules hash (caches key on it: editing the rules file
@@ -48,8 +50,9 @@ SCOPES: dict[str, int | None] = {"24h": 86400, "7d": 7 * 86400, "all": None}
 
 #: How the split was decided, in words (rule names, not numbers).
 CAPTION = (
-    "Split by run label: explicit plan, exec, review and coord marks first, "
-    "then review affixes, plan task matches, planning, review, doing and "
+    "Split by kind of work: planning, execution, review, coordination. "
+    "Explicit plan, exec, review and coord marks first, then review "
+    "affixes, plan task matches, planning, review, doing and "
     "coordination words, unmapped lead sessions and early exploration. "
     "The rest reads Unclassified."
 )

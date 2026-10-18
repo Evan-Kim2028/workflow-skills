@@ -693,8 +693,8 @@
     name.appendChild(open);
     if (w.name) name.appendChild(el("span", {class: "mg-title", text: w.name}));
     /* Lifetime planning-vs-execution bar under the name; the tooltip
-       names every phase with exact values. Absent on rows with no
-       split (older payloads, zero spend). */
+       names every kind of work with exact values. Absent on rows with
+       no split (older payloads, zero spend). */
     if (w.by_phase && typeof phaseBar === "function") {
       try {
         var split = phaseBar(w.by_phase);

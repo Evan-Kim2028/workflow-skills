@@ -1,11 +1,11 @@
-"""Usage-by-phase classifier: which phase of a workstream a run belongs to.
+"""Planning-versus-execution classifier: which kind of work a run belongs to.
 
-Phases are ``planning``, ``execution``, ``review``, ``coordination`` and
-``unclassified``. Rules are table-driven and live in
-``catalog/phases.json`` (shipped) with an optional owner override file
-``phases.local.json`` beside ``project.json`` whose entries run first;
-the first matching rule wins for a run. Only labels are ever read,
-never prompts or argv.
+Kinds of work are ``planning``, ``execution``, ``review``,
+``coordination`` and ``unclassified``. Rules are table-driven and live
+in ``catalog/phases.json`` (shipped; the file name is historical) with
+an optional owner override file ``phases.local.json`` beside
+``project.json`` whose entries run first; the first matching rule wins
+for a run. Only labels are ever read, never prompts or argv.
 
 Rule types, in file order:
 
@@ -27,7 +27,7 @@ Rule types, in file order:
   first task-mapped run is early exploration: planning.
 
 ``unclassified`` is a real bucket (grey on the page), never silently
-merged into another phase.
+merged into another kind of work.
 """
 
 from __future__ import annotations

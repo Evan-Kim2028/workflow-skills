@@ -3,7 +3,7 @@
 The local page for this kit. It reads transcripts, manifests, and process samples on your machine and shows runs, token use, and a plan map per workstream.
 
 <img src="../../docs/img/dashboard-flow.svg" width="900" alt="Flow from agents through collectors to the store and dashboard, plus six steps for scoping work">
-Start with [Plug in any agent](docs/integrate.md): install and run in three commands, one reporting path per harness, labels, verdicts, pricing, and troubleshooting. The contract is [CONTRACT.md](CONTRACT.md). The Project home "Usage by phase" card splits each workstream's tokens and cost into planning, execution, review, coordination, and unclassified from run labels (`catalog/phases.json` rules, `GET /api/project/phases`). The repository root holds the [landing page](../../README.md), [quickstart](../../docs/quickstart.md), [concepts](../../docs/concepts.md), and [configuration](../../docs/configuration.md).
+Start with [Plug in any agent](docs/integrate.md): install and run in three commands, one reporting path per harness, labels, verdicts, pricing, and troubleshooting. The contract is [CONTRACT.md](CONTRACT.md). The Project home "Planning versus execution" card splits each workstream's tokens and cost into planning, execution, review, coordination, and unclassified from run labels (`catalog/phases.json` rules — the file name is historical — `GET /api/project/phases`). The repository root holds the [landing page](../../README.md), [quickstart](../../docs/quickstart.md), [concepts](../../docs/concepts.md), and [configuration](../../docs/configuration.md).
 
 The page binds to 127.0.0.1 port 8765. That address is fixed. Lifecycle controls from the page are the one write action: local, header-guarded, off with AGENT_DASH_READONLY=1.
 

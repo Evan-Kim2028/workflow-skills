@@ -2064,7 +2064,7 @@ console.log("applySections proof ok");
             self.assertIn(marker, css, f"depgraph.css lost the style rule: {marker}")
 
     def test_phases_card_contract(self):
-        """The usage-by-phase card keeps its integration points: one file
+        """The planning-versus-execution card keeps its integration points: one file
         plus one registry line per scope over the phase specs, the
         exec-phases slot on the Project home right after burn-up, the
         compact workstream variant near the top of its tab, axes and
@@ -2080,7 +2080,8 @@ console.log("applySections proof ok");
             "phaseBar",
             "phaseShares",
             "cumSum",
-            "Usage by phase",
+            "Planning versus execution",
+            "Kind of work",
             "data-nav",
             "axes(",
             "fmtN(",
@@ -2095,7 +2096,7 @@ console.log("applySections proof ok");
             "Most of ",
             "could not be split by label",
             "request failed",
-            "Loading usage by phase",
+            "Loading planning versus execution",
             "No usage recorded",
             "/api/project/phases",
         ):
