@@ -272,7 +272,9 @@ class BundlesApiTest(unittest.TestCase):
         self.assertIn(b"Execution", plan)
         self.assertIn(b"/static/plan.css", plan)
         self.assertIn(b"/static/tokens.css", plan)
-        self.assertIn(b"pushState", plan)
+        status, _, state_js = get(self.port, "/static/core/state.js")
+        self.assertEqual(status, 200)
+        self.assertIn(b"pushState", state_js)
         self.assertIn(b"Needs you", plan)
 
 
