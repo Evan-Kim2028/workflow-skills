@@ -270,6 +270,28 @@ class DepJumpTest(unittest.TestCase):
         self.assertEqual(orch.dep_jumps(body, {"WS9.2": 2000.0}, {"WS9.1": 1000.0}), [])
 
 
+class LabelRoundsTest(unittest.TestCase):
+    def test_fix_and_rev_markers(self):
+        self.assertEqual(orch.label_rounds("ws4-WS4.1-slug-fix2"), [("fix", 2)])
+        self.assertEqual(orch.label_rounds("ws4-WS4.1-slug-rev1"), [("rev", 1)])
+        self.assertEqual(orch.label_rounds("ws4-WS4.1-x-fix1-rev2"), [("fix", 1), ("rev", 2)])
+
+    def test_plain_label_has_no_rounds(self):
+        self.assertEqual(orch.label_rounds("ws4-WS4.1-notes-index"), [])
+        self.assertEqual(orch.label_rounds(None), [])
+        self.assertEqual(orch.label_rounds(""), [])
+
+    def test_slug_words_without_numbers_do_not_count(self):
+        self.assertEqual(orch.label_rounds("ws4-WS4.1-prefix-notes"), [])
+        self.assertEqual(orch.label_rounds("ws4-WS4.1-revamp-fix"), [])
+
+    def test_multi_digit_rounds(self):
+        self.assertEqual(orch.label_rounds("ws4-WS4.1-x-rev10"), [("rev", 10)])
+
+    def test_case_insensitive(self):
+        self.assertEqual(orch.label_rounds("ws4-WS4.1-x-FIX1"), [("fix", 1)])
+
+
 class LiveByTaskTest(unittest.TestCase):
     def test_newest_run_wins(self):
         runs = [

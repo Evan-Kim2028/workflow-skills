@@ -67,22 +67,33 @@ wave numbers never gate it.
 
 ## Anti-patterns (symptom → rule broken)
 
+Each names its doctor code; `doctor --ws <ID>` flags them on the live
+board.
+
 - **Serialized execution:** 1 live worker, open lanes. One workstream ran 5x
   its critical path this way. → Principles 1, 2, 5.
-- **Starving queue:** ready count > 0 while live workers ≤ 1. → Principle 1.
+- **Starving queue:** ready count > 0 while live workers ≤ 1.
+  Doctor: `idle-ready`. → Principle 1.
 - **Jumped dep:** a lane starts whose dep is not done. Doctor flags the
-  edge. → Principle 2.
-- **Review spiral:** attempt count climbs past the fix cap. → Principle 7.
-- **Burst-plus-tail:** wave done except one lane for hours. → Principle 8.
-- **Ghost work:** runs above the map map to no task. → Principle 9.
+  edge: `dep-jump`. → Principle 2.
+- **Review spiral:** attempt count climbs past the fix cap.
+  Doctor: `review-spiral`. → Principle 7.
+- **Burst-plus-tail:** wave done except one lane for hours.
+  Doctor: `long-tail`. → Principle 8.
+- **Ghost work:** runs above the map map to no task.
+  Doctor: `ghost-runs`. → Principle 9.
 - **Stale plan:** merged work still `wip`; finished runs unread. → Principle 10.
-- **Stale gate:** `ws gates` shows an expired check treated as green. →
-  Principle 11.
+- **Stale gate:** `ws gates` shows an expired check treated as green.
+  Doctor: `stale-gate`. → Principle 11.
 - **Idle hold:** zero live workers while waiting on another group. →
   Principle 12.
+- **Orphaned handoff:** a deferred task with no receiving end; the sender
+  counts it gone and nobody counts it at all. Doctor: `deferred-orphan`.
+  → Principle 12.
 - **Lead does worker jobs:** every profiled lead session passed the context
   limit doing reads and runs directly. `agent_dash.py lead-profile` flags it.
-  → Delegate every multi-step job; hand off at the limit (next section).
+  Doctor: `lead-undelegated`. → Delegate every multi-step job; hand off
+  at the limit (next section).
 - **Foreground waiting and kill-to-rescope:** sleeps in the lead thread;
   killed runs leave no report and their cost is lost. → Never wait, never
   kill to rescope; launch a separate run.

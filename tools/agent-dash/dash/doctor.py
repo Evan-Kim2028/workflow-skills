@@ -95,18 +95,38 @@ def doctor_cfg(cfg: dict | None) -> dict:
         "stuck_hours": 6.0,
         "approval_days": 3.0,
         "train_hours": 24.0,
+        "idle_ready_minutes": 30.0,
+        "long_tail_minutes": 60.0,
+        "fix_rounds_cap": 2,
+        "recent_hours": 24.0,
+        "ghost_share": 0.2,
         "model_policy": {
             "muse_reasoning_effort": policy.get("muse_reasoning_effort", "xhigh"),
             "grok_require_bracketed_500k": policy.get("grok_require_bracketed_500k", True),
         },
     }
-    for key in ("interval_s", "stuck_hours", "approval_days", "train_hours"):
+    for key in (
+        "interval_s", "stuck_hours", "approval_days", "train_hours",
+        "idle_ready_minutes", "long_tail_minutes", "recent_hours",
+    ):
         try:
             value = float(raw.get(key, out[key]))
         except (TypeError, ValueError):
             continue
         if value > 0:
             out[key] = value
+    try:
+        cap = int(raw.get("fix_rounds_cap", out["fix_rounds_cap"]))
+    except (TypeError, ValueError):
+        cap = -1
+    if cap >= 0:
+        out["fix_rounds_cap"] = cap
+    try:
+        share = float(raw.get("ghost_share", out["ghost_share"]))
+    except (TypeError, ValueError):
+        share = -1.0
+    if 0.0 <= share <= 1.0:
+        out["ghost_share"] = share
     return out
 
 
@@ -198,12 +218,16 @@ def collect_problems(
         emitted=set(),
         _runs=None,
         _runs_loaded=False,
+        _bundles=None,
+        _taskmap=None,
+        _live_ids=None,
     )
     _collect_dashboard(ctx)
     _collect_roots(ctx)
     _collect_pricing(ctx)
     _collect_reconcile(ctx)
     _collect_bundles(ctx)
+    _collect_orchestration(ctx)
     _collect_fleet(ctx)
     _collect_page(ctx)
     _collect_config(ctx)
@@ -935,9 +959,10 @@ def _runs_ro(ctx) -> list[dict]:
                 "status": row["status"],
                 "started_at": row["started_at"],
                 "ended_at": row["ended_at"],
+                "workstream": row["workstream"],
             }
             for row in conn.execute(
-                "SELECT run_id, source, label, status, started_at, ended_at FROM runs"
+                "SELECT run_id, source, label, status, started_at, ended_at, workstream FROM runs"
             ).fetchall()
         ]
     except sqlite3.Error:
@@ -1103,6 +1128,9 @@ def _collect_bundles(ctx) -> None:
     taskmap = load_taskmap()
     live_ids = _live_run_ids(ctx)
     runs = _runs_ro(ctx)
+    ctx._bundles = bundles
+    ctx._taskmap = taskmap
+    ctx._live_ids = live_ids
     stuck_hours = ctx.dcfg["stuck_hours"]
     hygiene = 0
     for item in bundles:
@@ -1317,6 +1345,591 @@ def _collect_trains(ctx, bundles) -> int:
             )
             count += 1
     return count
+
+
+def _collect_orchestration(ctx) -> None:
+    """Flag the failure modes the orchestration study measured.
+
+    Wires the pure ``dash/orchestrate.py`` helpers into the doctor: one
+    plan read per workstream plus the already-cached run rows, and one
+    ``lead_profile`` call only for workstreams with a live run right
+    now. No extra store scans per workstream. A workstream with no plan
+    (no resolvable tasks), or with no activity inside the recent window
+    (no mapped or attributed run stamps, no live run, no plan write),
+    never fires: a quiet board is not a failure.
+    """
+    from dash import orchestrate
+    from dash.bundles import list_bundles, resolve_plan
+    from dash.taskmatch import load_taskmap
+
+    bundles = ctx._bundles
+    if bundles is None:
+        try:
+            bundles = list_bundles()
+        except Exception:
+            bundles = []
+    taskmap = ctx._taskmap if isinstance(ctx._taskmap, dict) else load_taskmap()
+    live_ids = ctx._live_ids if isinstance(ctx._live_ids, set) else _live_run_ids(ctx)
+    runs = _runs_ro(ctx)
+    recent_s = float(ctx.dcfg["recent_hours"]) * 3600
+    bodies: dict[str, dict] = {}
+    titles: dict[str, str] = {}
+    for item in bundles or []:
+        ws = item.get("id") if isinstance(item, dict) else None
+        if not isinstance(ws, str) or not ws:
+            continue
+        try:
+            _source, body = resolve_plan(ws)
+        except Exception:
+            body = None
+        if isinstance(body, dict):
+            bodies[ws] = body
+            title = item.get("title") if isinstance(item, dict) else None
+            titles[ws] = str(title or ws)
+    counts = {
+        "idle-ready": 0, "dep-jump": 0, "stale-gate": 0,
+        "deferred-orphan": 0, "long-tail": 0, "review-spiral": 0,
+        "ghost-runs": 0, "lead-undelegated": 0,
+    }
+    states: dict[str, dict] = {}
+    for ws in sorted(bodies):
+        try:
+            state = _orch_ws_state(ctx, ws, bodies[ws], titles[ws], taskmap, runs, live_ids, recent_s)
+        except Exception:
+            state = None
+        if state is None:
+            continue
+        states[ws] = state
+        counts["idle-ready"] += _orch_idle_ready(ctx, ws, state)
+        counts["dep-jump"] += _orch_dep_jumps(ctx, ws, state)
+        counts["stale-gate"] += _orch_stale_gates(ctx, ws, state)
+        counts["long-tail"] += _orch_long_tail(ctx, ws, state)
+        counts["review-spiral"] += _orch_review_spiral(ctx, ws, state)
+        counts["ghost-runs"] += _orch_ghost_runs(ctx, ws, state)
+        counts["lead-undelegated"] += _orch_lead(ctx, ws, state)
+    try:
+        ledger = orchestrate.deferred_ledger(bodies)
+    except Exception:
+        ledger = []
+    for row in ledger if isinstance(ledger, list) else []:
+        counts["deferred-orphan"] += _orch_deferred_orphan(ctx, row, states, recent_s)
+    for code in counts:
+        total = counts[code]
+        _check(
+            ctx, code, total == 0,
+            f"{total} open" if total else "clean",
+        )
+
+
+def _orch_plan_change(ws: str) -> tuple[float | None, list]:
+    """(last_change, history_rows) for one bundle: plan mtime over history."""
+    from dash.bundles import bundle_dir
+    from dash.replay import read_history
+
+    change: float | None = None
+    rows: list = []
+    try:
+        path = bundle_dir(ws)
+    except Exception:
+        path = None
+    if path is None:
+        return None, []
+    try:
+        change = (path / "plan.json").stat().st_mtime
+    except OSError:
+        change = None
+    try:
+        rows = read_history(ws) or []
+    except Exception:
+        rows = []
+    if not isinstance(rows, list):
+        rows = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        try:
+            stamp = float(row.get("ts"))
+        except (TypeError, ValueError):
+            continue
+        if change is None or stamp > change:
+            change = stamp
+    return change, rows
+
+
+def _orch_ws_state(ctx, ws: str, body: dict, title: str, taskmap: dict,
+                   runs: list, live_ids: set, recent_s: float) -> dict | None:
+    """Mapped runs, live lanes, and history for one workstream, or None.
+
+    None means the workstream must not fire: no plan tasks, or no
+    activity inside the recent window. One pass over the cached runs;
+    the plan body is already loaded by the caller.
+    """
+    from dash import orchestrate
+    from dash.taskmatch import task_of
+
+    by_id, _deps, order = orchestrate.plan_tasks(body)
+    if not by_id:
+        return None
+    by_task: dict[str, list] = {}
+    for run in runs:
+        if not isinstance(run, dict):
+            continue
+        owner = run.get("workstream")
+        if owner and owner != ws:
+            continue
+        try:
+            tid = task_of(run.get("label") or "", ws, taskmap, order)
+        except Exception:
+            tid = None
+        if isinstance(tid, str) and tid in by_id:
+            by_task.setdefault(tid, []).append(run)
+    ws_runs = [run for run in runs if isinstance(run, dict) and run.get("workstream") == ws]
+    live_map: dict[str, str] = {}
+    live_labels: set[str] = set()
+    for tid, rows in by_task.items():
+        alive = [run for run in rows if str(run.get("run_id")) in live_ids]
+        if not alive:
+            continue
+
+        def _started(run) -> float:
+            try:
+                return float(run.get("started_at") or 0)
+            except (TypeError, ValueError):
+                return 0.0
+
+        alive.sort(key=_started)
+        label = str(alive[-1].get("label") or alive[-1].get("run_id"))
+        live_map[tid] = label
+        for run in alive:
+            live_labels.add(str(run.get("label") or run.get("run_id")))
+    proc_tasks: dict[str, list] = {}
+    for proc in ctx.processes or []:
+        if not isinstance(proc, dict) or not proc.get("label"):
+            continue
+        try:
+            tid = task_of(str(proc["label"]), ws, taskmap, order)
+        except Exception:
+            tid = None
+        if isinstance(tid, str) and tid in by_id:
+            proc_tasks.setdefault(tid, []).append(str(proc["label"]))
+    plan_change, history = _orch_plan_change(ws)
+    cutoff = ctx.now - recent_s
+    mapped = [row for rows in by_task.values() for row in rows]
+    live_run_here = any(str(run.get("run_id")) in live_ids for run in mapped + ws_runs)
+    recent_run = False
+    for run in mapped + ws_runs:
+        for key in ("started_at", "ended_at"):
+            try:
+                stamp = float(run.get(key))
+            except (TypeError, ValueError):
+                continue
+            if stamp >= cutoff:
+                recent_run = True
+                break
+        if recent_run:
+            break
+    fresh_plan = plan_change is not None and ctx.now - plan_change <= recent_s
+    if not (live_run_here or proc_tasks or recent_run or fresh_plan):
+        return None
+    return {
+        "body": body, "title": title, "by_id": by_id, "order": order,
+        "by_task": by_task, "ws_runs": ws_runs, "live_map": live_map,
+        "live_labels": live_labels, "proc_tasks": proc_tasks,
+        "history": history, "plan_change": plan_change,
+        "taskmap": taskmap, "live_ids": live_ids,
+    }
+
+
+def _orch_idle_ready(ctx, ws: str, state: dict) -> int:
+    """Ready tasks with nobody to run them (warn, one per workstream)."""
+    from dash import orchestrate
+
+    by_id = state["by_id"]
+    try:
+        ready = orchestrate.ready_queue(state["body"], state["live_map"])
+    except Exception:
+        return 0
+    tasks = [row for row in ready if by_id.get(row["id"], {}).get("kind") != "gate"]
+    if not tasks:
+        return 0
+    agents: set[str] = set(state["live_labels"])
+    for labels in state["proc_tasks"].values():
+        agents.update(labels)
+    if len(agents) >= 2:
+        return 0
+    idle_s = float(ctx.dcfg["idle_ready_minutes"]) * 60
+    change = state["plan_change"]
+    if change is None or ctx.now - change <= idle_s:
+        return 0
+    top = ", ".join(
+        f"{_item_label(by_id[row['id']].get('title'), row['id'])} (chain {row['chain']})"
+        for row in tasks[:3]
+    )
+    who = "no live agent" if not agents else "only 1 live agent"
+    title = state["title"]
+    _add(
+        ctx, "idle-ready", "warn", f"ws:{ws}", ws,
+        f"{title} ({ws}) has {len(tasks)} ready tasks with {who}",
+        f"{title} ({ws}) has {len(tasks)} ready tasks and {who} mapped to it, "
+        f"unchanged for {_orch_age_text(ctx.now - change)} "
+        f"(limit {ctx.dcfg['idle_ready_minutes']:g} min). "
+        f"Top by critical-path rank: {top}",
+        f"python3 agent_dash.py ws next {ws}",
+        key="queue",
+    )
+    return 1
+
+
+def _orch_done_moment(state: dict, tid: str) -> float | None:
+    """Latest done evidence for one task: history, else a satisfied status's runs."""
+    from dash import orchestrate
+
+    best: float | None = None
+    for row in state["history"]:
+        if not isinstance(row, dict) or row.get("task") != tid or row.get("to") != "done":
+            continue
+        try:
+            stamp = float(row.get("ts"))
+        except (TypeError, ValueError):
+            continue
+        if best is None or stamp > best:
+            best = stamp
+    if best is None and state["by_id"].get(tid, {}).get("status") in orchestrate.SATISFIED_STATUSES:
+        for run in state["by_task"].get(tid, []):
+            try:
+                stamp = float(run.get("ended_at"))
+            except (TypeError, ValueError):
+                continue
+            if best is None or stamp > best:
+                best = stamp
+    return best
+
+
+def _orch_dep_jumps(ctx, ws: str, state: dict) -> int:
+    """Tasks that started before a dependency finished (warn recent, info old)."""
+    from dash import orchestrate
+
+    by_id = state["by_id"]
+    starts: dict[str, float] = {}
+    for row in state["history"]:
+        if not isinstance(row, dict):
+            continue
+        task = row.get("task")
+        if not isinstance(task, str) or task not in by_id:
+            continue
+        try:
+            stamp = float(row.get("ts"))
+        except (TypeError, ValueError):
+            continue
+        if task not in starts or stamp < starts[task]:
+            starts[task] = stamp
+    for tid, rows in state["by_task"].items():
+        for run in rows:
+            try:
+                stamp = float(run.get("started_at"))
+            except (TypeError, ValueError):
+                continue
+            if tid not in starts or stamp < starts[tid]:
+                starts[tid] = stamp
+    dones: dict[str, float] = {}
+    for tid in by_id:
+        moment = _orch_done_moment(state, tid)
+        if moment is not None:
+            dones[tid] = moment
+    try:
+        jumps = orchestrate.dep_jumps(state["body"], starts, dones)
+    except Exception:
+        return 0
+    grouped: dict[str, list] = {}
+    for jump in jumps:
+        grouped.setdefault(jump["task"], []).append(jump)
+    recent_cut = ctx.now - float(ctx.dcfg["recent_hours"]) * 3600
+    count = 0
+    for tid in sorted(grouped):
+        parts = []
+        for jump in grouped[tid]:
+            dep = jump["dep"]
+            dep_task = by_id.get(dep, {})
+            dep_label = _item_label(dep_task.get("title"), dep)
+            done_at = jump.get("dep_done_at")
+            if done_at is None:
+                when = f"still {dep_task.get('status')}"
+            else:
+                when = "finished " + time.strftime("%Y-%m-%d %H:%M", time.gmtime(done_at)) + " UTC"
+            parts.append(f"{dep_label} ({when})")
+        label = _item_label(by_id[tid].get("title"), tid)
+        start = starts.get(tid, 0.0)
+        started = time.strftime("%Y-%m-%d %H:%M", time.gmtime(float(start))) + " UTC"
+        _add(
+            ctx, "dep-jump",
+            "warn" if start >= recent_cut else "info",
+            f"ws:{ws}", ws,
+            f"{label} started before its dependency finished",
+            f"{label} in {ws} started at {started} before {'; '.join(parts)}",
+            f"python3 agent_dash.py ws next {ws}",
+            key=tid,
+        )
+        count += 1
+    return count
+
+
+def _orch_stale_gates(ctx, ws: str, state: dict) -> int:
+    """Gates whose freshness bound expired while still unmet (warn)."""
+    from dash import orchestrate
+
+    try:
+        gates = orchestrate.stale_gates(state["body"], ctx.now)
+    except Exception:
+        return 0
+    by_id = state["by_id"]
+    count = 0
+    for gate in gates:
+        if not gate.get("stale"):
+            continue
+        task = by_id.get(gate["id"], {})
+        if task.get("status") == "done":
+            continue
+        label = _item_label(task.get("title"), gate["id"])
+        blocked = [
+            _item_label(by_id[dep].get("title"), dep)
+            for dep in (gate.get("blocked") or [])[:3]
+            if dep in by_id
+        ]
+        extra = len(gate.get("blocked") or []) - len(blocked)
+        if extra > 0:
+            blocked.append(f"+{extra} more")
+        confirmed = gate.get("confirmed_at") or "never confirmed"
+        _add(
+            ctx, "stale-gate", "warn", f"ws:{ws}", ws,
+            f"{label} confirmation is stale",
+            f"{label} in {ws} waits on {gate.get('signal') or 'an unnamed signal'}; "
+            f"last confirmation {confirmed} is past its {gate.get('fresh_hours')} h bound. "
+            f"Blocks: {', '.join(blocked) if blocked else 'nothing yet'}",
+            f"python3 agent_dash.py ws gates {ws}",
+            key=gate["id"],
+        )
+        count += 1
+    return count
+
+
+def _orch_long_tail(ctx, ws: str, state: dict) -> int:
+    """A wave finished except one still-running lane (info)."""
+    from dash import orchestrate
+
+    by_id = state["by_id"]
+    try:
+        wave_list = orchestrate.waves(state["body"])
+    except Exception:
+        return 0
+    tail_s = float(ctx.dcfg["long_tail_minutes"]) * 60
+    live_tasks = set(state["live_map"]) | set(state["proc_tasks"])
+    count = 0
+    for wave in wave_list:
+        lanes = [tid for tid in wave if tid in by_id and by_id[tid].get("status") != "deferred"]
+        if len(lanes) < 2:
+            continue
+        done_at = {}
+        for tid in lanes:
+            if by_id[tid].get("status") not in orchestrate.SATISFIED_STATUSES:
+                continue
+            moment = _orch_done_moment(state, tid)
+            if moment is not None:
+                done_at[tid] = moment
+        open_lanes = [tid for tid in lanes if tid not in done_at]
+        if len(open_lanes) != 1:
+            continue
+        lane = open_lanes[0]
+        if by_id[lane].get("status") not in orchestrate.ACTIVE_STATUSES:
+            continue
+        if lane not in live_tasks:
+            continue
+        if not done_at or any(ctx.now - moment <= tail_s for moment in done_at.values()):
+            continue
+        label = _item_label(by_id[lane].get("title"), lane)
+        finished = ", ".join(
+            f"{_item_label(by_id[tid].get('title'), tid)} "
+            f"({_orch_age_text(ctx.now - moment)} ago)"
+            for tid, moment in sorted(done_at.items())
+        )
+        live_label = state["live_map"].get(lane) or (state["proc_tasks"].get(lane) or [""])[0]
+        _add(
+            ctx, "long-tail", "info", f"ws:{ws}", ws,
+            f"{label} still runs while its wave finished long ago",
+            f"{label} in {ws} still runs ({live_label}) while the rest of its wave "
+            f"finished more than {_orch_age_text(tail_s)} ago: {finished}. "
+            "Split the lane or reassign it",
+            f"python3 agent_dash.py ws waves {ws}",
+            key=lane,
+        )
+        count += 1
+    return count
+
+
+def _orch_age_text(seconds: float) -> str:
+    """Short age for problem detail: minutes under two hours, else hours."""
+    if seconds >= 7200:
+        return f"{seconds / 3600:.1f} h"
+    return f"{seconds / 60:.0f} min"
+
+
+def _orch_review_spiral(ctx, ws: str, state: dict) -> int:
+    """A task past the fix/review round cap (warn, open tasks only)."""
+    from dash import orchestrate
+
+    cap = int(ctx.dcfg["fix_rounds_cap"])
+    by_id = state["by_id"]
+    count = 0
+    for tid in sorted(state["by_task"]):
+        if by_id.get(tid, {}).get("status") not in ("todo", "wip", "pr"):
+            continue
+        rounds: set[tuple[str, int]] = set()
+        for run in state["by_task"][tid]:
+            for marker in orchestrate.label_rounds(run.get("label")):
+                rounds.add(marker)
+        for label in state["proc_tasks"].get(tid, []):
+            for marker in orchestrate.label_rounds(label):
+                rounds.add(marker)
+        if len(rounds) <= cap:
+            continue
+        label = _item_label(by_id[tid].get("title"), tid)
+        shown = ", ".join(f"{kind}{num}" for kind, num in sorted(rounds)[:6])
+        top = max(num for _kind, num in rounds)
+        _add(
+            ctx, "review-spiral", "warn", f"ws:{ws}", ws,
+            f"{label} is past the fix-round cap ({len(rounds)} rounds, cap {cap})",
+            f"{label} in {ws} has {len(rounds)} fix/review rounds ({shown}), "
+            f"latest round {top}. The third round goes to the lead: "
+            "take the lane over or re-brief it",
+            f"python3 agent_dash.py ws plan {ws}",
+            key=tid,
+        )
+        count += 1
+    return count
+
+
+def _orch_ghost_runs(ctx, ws: str, state: dict) -> int:
+    """Recent runs mapping to no plan task (info, one per workstream)."""
+    from dash.taskmatch import task_of
+
+    recent_s = float(ctx.dcfg["recent_hours"]) * 3600
+    cutoff = ctx.now - recent_s
+    window = []
+    for run in state["ws_runs"]:
+        recent = False
+        for key in ("started_at", "ended_at"):
+            try:
+                stamp = float(run.get(key))
+            except (TypeError, ValueError):
+                continue
+            if stamp >= cutoff:
+                recent = True
+                break
+        if recent:
+            window.append(run)
+    if not window:
+        return 0
+    by_id = state["by_id"]
+    ghosts = []
+    for run in window:
+        try:
+            tid = task_of(run.get("label") or "", ws, state["taskmap"], state["order"])
+        except Exception:
+            tid = None
+        if not isinstance(tid, str) or tid not in by_id:
+            ghosts.append(run)
+    if not ghosts:
+        return 0
+    share = len(ghosts) / len(window)
+    if share < float(ctx.dcfg["ghost_share"]):
+        return 0
+    names = sorted({str(run.get("label") or run.get("run_id")) for run in ghosts})
+    shown = ", ".join(names[:5])
+    if len(names) > 5:
+        shown += f" (+{len(names) - 5} more)"
+    title = state["title"]
+    _add(
+        ctx, "ghost-runs", "info", f"ws:{ws}", ws,
+        f"{title} ({ws}) has {len(ghosts)} of {len(window)} recent runs mapping to no task",
+        f"{len(ghosts)} of {len(window)} runs in {ws} from the last "
+        f"{ctx.dcfg['recent_hours']:g} h map to no plan task "
+        f"({share * 100:.0f}% >= {float(ctx.dcfg['ghost_share']) * 100:.0f}%): {shown}",
+        "add exact or /regex/ entries to static/taskmap.local.json for the labels above, then reload",
+    )
+    return 1
+
+
+def _orch_lead(ctx, ws: str, state: dict) -> int:
+    """A live lead flagged LOW-DELEGATION or CONTEXT>250k (warn)."""
+    if ctx.store is None:
+        return 0
+    if not any(str(run.get("run_id")) in state["live_ids"] for run in state["ws_runs"]):
+        return 0
+    from dash import orchestrate
+
+    try:
+        profile = orchestrate.lead_profile(ctx.store, ws=ws, now=ctx.now)
+    except Exception:
+        return 0
+    if not isinstance(profile, dict):
+        return 0
+    flags = [flag for flag in profile.get("flags") or [] if flag in ("LOW-DELEGATION", "CONTEXT>250k")]
+    if not flags:
+        return 0
+    sid = str(profile.get("session_id") or "")
+    title = state["title"]
+    launched = profile.get("workers_launched")
+    calls = profile.get("own_tool_calls")
+    tokens = profile.get("context_tokens")
+    _add(
+        ctx, "lead-undelegated", "warn", f"ws:{ws}", ws,
+        f"{title} ({ws}) lead shows {', '.join(flags)}",
+        f"lead {sid[:8] or 'unknown'} in {ws} launched {launched} workers "
+        f"with {calls} own tool calls and {tokens} context tokens: "
+        f"{', '.join(flags)}. Hand multi-step jobs to workers; "
+        "re-brief or start a successor past the context limit",
+        f"python3 agent_dash.py lead-profile --ws {ws}",
+        key=sid or "lead",
+    )
+    return 1
+
+
+def _orch_deferred_orphan(ctx, row: dict, states: dict, recent_s: float) -> int:
+    """A deferred task nobody picked up (info, older than the window)."""
+    if not isinstance(row, dict) or not row.get("orphan"):
+        return 0
+    ws, tid = row.get("ws"), row.get("id")
+    state = states.get(ws) if isinstance(ws, str) else None
+    if state is None or not isinstance(tid, str) or tid not in state["by_id"]:
+        return 0
+    defer_at: float | None = None
+    for hist in state["history"]:
+        if not isinstance(hist, dict) or hist.get("task") != tid or hist.get("to") != "deferred":
+            continue
+        try:
+            stamp = float(hist.get("ts"))
+        except (TypeError, ValueError):
+            continue
+        if defer_at is None or stamp > defer_at:
+            defer_at = stamp
+    if defer_at is None:
+        defer_at = state["plan_change"]
+    if defer_at is None or ctx.now - defer_at <= recent_s:
+        return 0
+    task = state["by_id"][tid]
+    label = _item_label(task.get("title"), tid)
+    moved = row.get("moved_to") or "no destination"
+    received = row.get("received_as") or "none recorded"
+    note = row.get("note") or "no note"
+    _add(
+        ctx, "deferred-orphan", "info", f"ws:{ws}", ws,
+        f"{label} deferred to {moved} has no receiving task",
+        f"{label} in {ws} was deferred {_orch_age_text(ctx.now - defer_at)} ago "
+        f"(moved_to={moved}, received_as={received}, note={note}) "
+        "and no receiving workstream picked it up",
+        f"python3 agent_dash.py ws deferred {ws}",
+        key=tid,
+    )
+    return 1
 
 
 def model_policy_reason(kind: str | None, model: str | None, reasoning_effort: str | None, policy: dict | None) -> str | None:

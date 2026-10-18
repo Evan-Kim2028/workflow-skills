@@ -29,6 +29,7 @@ Study rules these enforce (generic form, no private data):
 from __future__ import annotations
 
 import fnmatch
+import re
 import sqlite3
 import time
 from collections import Counter
@@ -261,6 +262,27 @@ def dep_jumps(body: dict, starts: dict, dones: dict) -> list[dict]:
                 rows.append({"task": tid, "dep": dep, "started_at": start_f, "dep_done_at": done_f})
     rows.sort(key=lambda row: (row["task"], row["dep"]))
     return rows
+
+
+#: Numbered fix/review markers in run labels (``-fixN``, ``-revN``).
+_FIXREV_RE = re.compile(r"-(fix|rev)(\d+)(?![0-9])", re.IGNORECASE)
+
+
+def label_rounds(label: str | None) -> list[tuple[str, int]]:
+    """Fix/review round markers in one run label: ``[(kind, number)]``.
+
+    Reviews append ``-revN`` and fixes append ``-fixN`` (see
+    docs/integrate.md), so ``ws4-WS4.1-slug-fix2`` carries
+    ``[("fix", 2)]`` and a plain lane label carries none. Matching is
+    case-insensitive and purely on the label string: a slug that merely
+    contains those letters without the hyphen-plus-number form does not
+    count. Callers union the markers across a task's labels and compare
+    the distinct count against the fix-round cap.
+    """
+    return [
+        (match.group(1).lower(), int(match.group(2)))
+        for match in _FIXREV_RE.finditer(str(label or ""))
+    ]
 
 
 def _topo_order(by_id: dict, deps: dict) -> list[str]:

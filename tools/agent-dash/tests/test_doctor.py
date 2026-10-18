@@ -1064,5 +1064,435 @@ class ReportTest(unittest.TestCase):
         self.assertIn("### New (2)", md)
 
 
+class OrchestrationChecksTest(unittest.TestCase):
+    """The orchestration study's failure modes, wired into the doctor."""
+
+    NEW_CODES = (
+        "idle-ready", "dep-jump", "stale-gate", "deferred-orphan",
+        "long-tail", "review-spiral", "ghost-runs", "lead-undelegated",
+    )
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.wsroot = self.root / "ws"
+        self.wsroot.mkdir()
+        self.state = self.root / "state"
+        self.state.mkdir()
+        self.old_ws = os.environ.get("AGENT_DASH_WORKSTREAMS")
+        os.environ["AGENT_DASH_WORKSTREAMS"] = str(self.wsroot)
+        self.store = Store(self.state / "dash.sqlite")
+        self.now = 1_700_000_000.0
+        self.health = {"ok": True, "sources": []}
+
+    def tearDown(self):
+        self.store.close()
+        if self.old_ws is None:
+            os.environ.pop("AGENT_DASH_WORKSTREAMS", None)
+        else:
+            os.environ["AGENT_DASH_WORKSTREAMS"] = self.old_ws
+        self.tmp.cleanup()
+
+    def _cfg(self, **doctor_over):
+        cfg = _cfg(state_dir=str(self.state))
+        cfg["roots"]["scratchpads"] = []
+        cfg.setdefault("doctor", {}).update(doctor_over)
+        return cfg
+
+    def _bundle(self, ws="WS9", tasks=None, trains=None):
+        from dash.bundles import cmd_ws
+
+        if not (self.wsroot / ws).is_dir():
+            self.assertEqual(cmd_ws(["new", ws, "Example"]), 0)
+        plan = self.wsroot / ws / "plan.json"
+        data = json.loads(plan.read_text(encoding="utf-8"))
+        if tasks is not None:
+            data["dag"]["groups"] = [
+                {"id": "build", "col": 0, "title": "Build", "tasks": tasks}
+            ]
+        if trains is not None:
+            data["trains"] = trains
+        plan.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        return self.wsroot / ws
+
+    def _task(self, tid, status="todo", deps=None, **extra):
+        row = {"id": tid, "title": f"Task {tid}", "status": status, "deps": deps or []}
+        row.update(extra)
+        return row
+
+    def _history(self, ws, *rows):
+        path = self.wsroot / ws / "history.jsonl"
+        with path.open("a", encoding="utf-8") as handle:
+            for task, ts, frm, to in rows:
+                handle.write(json.dumps({"ts": ts, "task": task, "from": frm, "to": to}) + "\n")
+
+    def _backdate_plan(self, ws, age_s):
+        old = self.now - age_s
+        os.utime(self.wsroot / ws / "plan.json", (old, old))
+
+    def _run(self, label, status="done", age_s=3600, duration_s=600, **over):
+        row = {
+            "run_id": f"muse:s:{label}",
+            "source": "muse",
+            "tier": "muse",
+            "label": label,
+            "session_id": "s",
+            "status": status,
+            "started_at": self.now - age_s,
+        }
+        if status in ("done", "killed", "died_early"):
+            row["ended_at"] = self.now - age_s + duration_s
+        row.update(over)
+        self.store.upsert_run(row)
+        return row
+
+    def _collect(self, cfg=None, **over):
+        from dash.doctor import collect_problems
+
+        params = {"health": self.health, "processes": []}
+        params.update(over)
+        with mock.patch("dash.doctor._home_scratch", return_value=str(self.root / "noscratch")):
+            return collect_problems(self.store, cfg or self._cfg(), self.now, **params)
+
+    def _by_code(self, result, code):
+        return [item for item in result["problems"] if item["code"] == code]
+
+    def test_doctor_cfg_orchestration_defaults_and_overrides(self):
+        from dash.doctor import doctor_cfg
+
+        cfg = doctor_cfg({})
+        self.assertEqual(
+            (cfg["idle_ready_minutes"], cfg["long_tail_minutes"], cfg["fix_rounds_cap"],
+             cfg["recent_hours"], cfg["ghost_share"]),
+            (30.0, 60.0, 2, 24.0, 0.2),
+        )
+        cfg = doctor_cfg({"doctor": {"idle_ready_minutes": 5, "fix_rounds_cap": 4, "ghost_share": 0.5}})
+        self.assertEqual((cfg["idle_ready_minutes"], cfg["fix_rounds_cap"], cfg["ghost_share"]),
+                         (5.0, 4, 0.5))
+        cfg = doctor_cfg({"doctor": {"idle_ready_minutes": "nope", "fix_rounds_cap": -1, "ghost_share": 9}})
+        self.assertEqual((cfg["idle_ready_minutes"], cfg["fix_rounds_cap"], cfg["ghost_share"]),
+                         (30.0, 2, 0.2))
+
+    def test_idle_ready_fires_and_names_top_tasks(self):
+        self._bundle(tasks=[
+            self._task("WS9.0", "todo", kind="gate"),
+            self._task("WS9.1", "todo"),
+            self._task("WS9.2", "todo", ["WS9.0"]),
+        ])
+        self._backdate_plan("WS9", 31 * 60)
+        result = self._collect()
+        found = self._by_code(result, "idle-ready")
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0]["id"], "idle-ready:ws:WS9:queue")
+        self.assertEqual(found[0]["scope"], "ws:WS9")
+        self.assertEqual(found[0]["severity"], "warn")
+        self.assertIn("WS9.1", found[0]["detail"])
+        self.assertNotIn("WS9.0", found[0]["detail"].split("Top by")[1])
+        self.assertEqual(found[0]["fix_command"], "python3 agent_dash.py ws next WS9")
+
+    def test_idle_ready_quiet_when_fresh_two_agents_or_capped(self):
+        self._bundle(tasks=[self._task("WS9.1", "todo")])
+        result = self._collect()
+        self.assertFalse(self._by_code(result, "idle-ready"))
+        self._backdate_plan("WS9", 30 * 60)
+        edge = self._collect()
+        self.assertFalse(self._by_code(edge, "idle-ready"))
+        self._run("ws9-WS9.1-a", status="running", age_s=60)
+        self._run("ws9-WS9.1-b", status="running", age_s=60)
+        self._backdate_plan("WS9", 31 * 60)
+        busy = self._collect()
+        self.assertFalse(self._by_code(busy, "idle-ready"))
+
+    def test_idle_ready_config_override(self):
+        self._bundle(tasks=[self._task("WS9.1", "todo")])
+        self._backdate_plan("WS9", 10 * 60)
+        quick = self._collect(cfg=self._cfg(idle_ready_minutes=5))
+        self.assertEqual(len(self._by_code(quick, "idle-ready")), 1)
+        slow = self._collect(cfg=self._cfg(idle_ready_minutes=60))
+        self.assertFalse(self._by_code(slow, "idle-ready"))
+
+    def test_dep_jump_warn_recent_and_info_old(self):
+        self._bundle(tasks=[
+            self._task("WS9.1", "todo"),
+            self._task("WS9.2", "wip", ["WS9.1"]),
+        ])
+        self._history("WS9", ("WS9.2", self.now - 3600, "todo", "wip"))
+        result = self._collect()
+        found = self._by_code(result, "dep-jump")
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0]["id"], "dep-jump:ws:WS9:WS9.2")
+        self.assertEqual(found[0]["severity"], "warn")
+        self.assertIn("WS9.1", found[0]["detail"])
+        self.assertEqual(found[0]["fix_command"], "python3 agent_dash.py ws next WS9")
+        (self.wsroot / "WS9" / "history.jsonl").unlink()
+        self._history("WS9", ("WS9.2", self.now - 25 * 3600, "todo", "wip"))
+        old = self._collect()
+        aged = self._by_code(old, "dep-jump")
+        self.assertEqual(len(aged), 1)
+        self.assertEqual(aged[0]["severity"], "info")
+
+    def test_dep_jump_healthy_order_is_clean(self):
+        self._bundle(tasks=[
+            self._task("WS9.1", "done"),
+            self._task("WS9.2", "wip", ["WS9.1"]),
+        ])
+        self._history(
+            "WS9",
+            ("WS9.1", self.now - 7200, "wip", "done"),
+            ("WS9.2", self.now - 3600, "todo", "wip"),
+        )
+        result = self._collect()
+        self.assertFalse(self._by_code(result, "dep-jump"))
+
+    def test_stale_gate_fires_and_fresh_does_not(self):
+        import datetime
+
+        def iso(age_s):
+            moment = datetime.datetime.fromtimestamp(self.now - age_s, tz=datetime.timezone.utc)
+            return moment.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        self._bundle(tasks=[
+            self._task("WS9.0", "todo", kind="gate", signal="Freeze lifts",
+                       fresh_hours=24, confirmed_at=iso(25 * 3600)),
+            self._task("WS9.1", "todo", ["WS9.0"]),
+            self._task("WS9.9", "todo", kind="gate", signal="Standing signal"),
+        ])
+        result = self._collect()
+        found = self._by_code(result, "stale-gate")
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0]["id"], "stale-gate:ws:WS9:WS9.0")
+        self.assertEqual(found[0]["severity"], "warn")
+        self.assertIn("Freeze lifts", found[0]["detail"])
+        self.assertEqual(found[0]["fix_command"], "python3 agent_dash.py ws gates WS9")
+
+    def test_stale_gate_done_or_fresh_is_clean(self):
+        import datetime
+
+        def iso(age_s):
+            moment = datetime.datetime.fromtimestamp(self.now - age_s, tz=datetime.timezone.utc)
+            return moment.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        self._bundle(tasks=[
+            self._task("WS9.0", "done", kind="gate", signal="Freeze lifts",
+                       fresh_hours=24, confirmed_at=iso(25 * 3600)),
+            self._task("WS9.1", "todo", kind="gate", signal="Fresh check",
+                       fresh_hours=24, confirmed_at=iso(3600)),
+        ])
+        result = self._collect()
+        self.assertFalse(self._by_code(result, "stale-gate"))
+
+    def test_deferred_orphan_fires_and_received_does_not(self):
+        self._bundle(tasks=[
+            self._task("WS9.1", "done"),
+            {"id": "WS9.3", "title": "Third thing", "status": "deferred",
+             "deps": [], "moved_to": "WS8", "note": "waits on the freeze"},
+        ])
+        self._bundle(ws="WS8", tasks=[self._task("WS8.1", "todo")])
+        self._run("ws9-WS9.1-x", status="done", age_s=7200, duration_s=600)
+        self._history("WS9", ("WS9.3", self.now - 25 * 3600, "wip", "deferred"))
+        result = self._collect()
+        found = self._by_code(result, "deferred-orphan")
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0]["id"], "deferred-orphan:ws:WS9:WS9.3")
+        self.assertEqual(found[0]["severity"], "info")
+        self.assertIn("WS8", found[0]["detail"])
+        self.assertEqual(found[0]["fix_command"], "python3 agent_dash.py ws deferred WS9")
+
+    def test_deferred_recent_or_received_is_clean(self):
+        self._bundle(tasks=[
+            {"id": "WS9.3", "title": "Third thing", "status": "deferred",
+             "deps": [], "moved_to": "WS8", "note": "waits on the freeze",
+             "received_as": "WS8.7"},
+            self._task("WS9.1", "done"),
+        ])
+        self._bundle(ws="WS8", tasks=[self._task("WS8.7", "todo")])
+        self._run("ws9-WS9.1-x", status="done", age_s=7200, duration_s=600)
+        self._history("WS9", ("WS9.3", self.now - 3600, "wip", "deferred"))
+        result = self._collect()
+        self.assertFalse(self._by_code(result, "deferred-orphan"))
+
+    def test_long_tail_fires_and_edge_is_clean(self):
+        self._bundle(tasks=[
+            self._task("WS9.1", "done"),
+            self._task("WS9.2", "done"),
+            self._task("WS9.3", "wip"),
+        ])
+        self._history(
+            "WS9",
+            ("WS9.1", self.now - 61 * 60, "wip", "done"),
+            ("WS9.2", self.now - 61 * 60, "wip", "done"),
+        )
+        self._run("ws9-WS9.3-x", status="running", age_s=70 * 60)
+        result = self._collect()
+        found = self._by_code(result, "long-tail")
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0]["id"], "long-tail:ws:WS9:WS9.3")
+        self.assertEqual(found[0]["severity"], "info")
+        self.assertIn("WS9.3", found[0]["title"])
+        self.assertEqual(found[0]["fix_command"], "python3 agent_dash.py ws waves WS9")
+        (self.wsroot / "WS9" / "history.jsonl").unlink()
+        self._history(
+            "WS9",
+            ("WS9.1", self.now - 60 * 60, "wip", "done"),
+            ("WS9.2", self.now - 60 * 60, "wip", "done"),
+        )
+        edge = self._collect()
+        self.assertFalse(self._by_code(edge, "long-tail"))
+
+    def test_long_tail_quiet_without_a_live_lane(self):
+        self._bundle(tasks=[
+            self._task("WS9.1", "done"),
+            self._task("WS9.2", "done"),
+            self._task("WS9.3", "wip"),
+        ])
+        self._history(
+            "WS9",
+            ("WS9.1", self.now - 61 * 60, "wip", "done"),
+            ("WS9.2", self.now - 61 * 60, "wip", "done"),
+        )
+        result = self._collect()
+        self.assertFalse(self._by_code(result, "long-tail"))
+
+    def test_review_spiral_fires_cap_edge_and_override(self):
+        self._bundle(tasks=[self._task("WS9.1", "wip")])
+        self._run("ws9-WS9.1-a-fix1", age_s=7200, duration_s=600)
+        self._run("ws9-WS9.1-b-fix2", age_s=5400, duration_s=600)
+        two = self._collect()
+        self.assertFalse(self._by_code(two, "review-spiral"))
+        self._run("ws9-WS9.1-c-rev3", age_s=3600, duration_s=600)
+        result = self._collect()
+        found = self._by_code(result, "review-spiral")
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0]["id"], "review-spiral:ws:WS9:WS9.1")
+        self.assertEqual(found[0]["severity"], "warn")
+        self.assertIn("fix1", found[0]["detail"])
+        self.assertEqual(found[0]["fix_command"], "python3 agent_dash.py ws plan WS9")
+        capped = self._collect(cfg=self._cfg(fix_rounds_cap=3))
+        self.assertFalse(self._by_code(capped, "review-spiral"))
+
+    def test_review_spiral_done_task_is_clean(self):
+        self._bundle(tasks=[self._task("WS9.1", "done")])
+        self._run("ws9-WS9.1-a-fix1", age_s=7200, duration_s=600)
+        self._run("ws9-WS9.1-b-fix2", age_s=5400, duration_s=600)
+        self._run("ws9-WS9.1-c-fix3", age_s=3600, duration_s=600)
+        result = self._collect()
+        self.assertFalse(self._by_code(result, "review-spiral"))
+
+    def test_ghost_runs_fires_at_share_and_config(self):
+        self._bundle(tasks=[self._task("WS9.1", "todo")])
+        for suffix in ("a", "b", "c", "d"):
+            self._run(f"ws9-WS9.1-{suffix}", age_s=3600, duration_s=600)
+        self._run("ws9-random-thing", age_s=3600, duration_s=600)
+        result = self._collect()
+        found = self._by_code(result, "ghost-runs")
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0]["id"], "ghost-runs:ws:WS9")
+        self.assertEqual(found[0]["severity"], "info")
+        self.assertIn("ws9-random-thing", found[0]["detail"])
+        raised = self._collect(cfg=self._cfg(ghost_share=0.5))
+        self.assertFalse(self._by_code(raised, "ghost-runs"))
+        self._run("ws9-WS9.1-e", age_s=3600, duration_s=600)
+        sixth = self._collect()
+        self.assertFalse(self._by_code(sixth, "ghost-runs"))
+
+    def test_lead_undelegated_fires_and_clears(self):
+        self._bundle(tasks=[self._task("WS9.1", "wip")])
+        self.store.upsert_session(
+            {
+                "session_id": "lead-1",
+                "tool": "muse",
+                "label": "ws9-lead",
+                "started_at": self.now - 7200,
+                "status": "running",
+            }
+        )
+        self._run("ws9-WS9.1-x", status="running", age_s=3600,
+                  session_id="child-1", parent_session_id="lead-1")
+        result = self._collect()
+        found = self._by_code(result, "lead-undelegated")
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0]["severity"], "warn")
+        self.assertIn("LOW-DELEGATION", found[0]["detail"])
+        self.assertEqual(found[0]["fix_command"], "python3 agent_dash.py lead-profile --ws WS9")
+        self._run("ws9-WS9.1-y", status="running", age_s=1800,
+                  session_id="child-2", parent_session_id="lead-1")
+        delegating = self._collect()
+        self.assertFalse(self._by_code(delegating, "lead-undelegated"))
+
+    def test_lead_context_flag_fires(self):
+        self._bundle(tasks=[self._task("WS9.1", "wip")])
+        self.store.upsert_session(
+            {
+                "session_id": "lead-1",
+                "tool": "muse",
+                "label": "ws9-lead",
+                "started_at": self.now - 7200,
+                "status": "running",
+            }
+        )
+        self._run("ws9-WS9.1-x", status="running", age_s=3600,
+                  session_id="child-1", parent_session_id="lead-1")
+        self._run("ws9-WS9.1-y", status="running", age_s=1800,
+                  session_id="child-2", parent_session_id="lead-1")
+        self._run("ws9-WS9.1-lead", status="done", age_s=7200, duration_s=600,
+                  session_id="lead-1", run_id="muse:lead-1:ws9-lead")
+        self.store.add_usage(
+            {
+                "ts": self.now - 600,
+                "session_id": "lead-1",
+                "run_id": "muse:lead-1:ws9-lead",
+                "model": "test-model-xyz",
+                "tool": "muse",
+                "message_id": "m1",
+                "input": 300000,
+                "output": 100,
+                "cache_read": 0,
+                "cache_write": 0,
+                "reasoning": 0,
+            }
+        )
+        result = self._collect()
+        found = self._by_code(result, "lead-undelegated")
+        self.assertEqual(len(found), 1)
+        self.assertIn("CONTEXT>250k", found[0]["detail"])
+
+    def test_lead_quiet_without_a_live_run(self):
+        self._bundle(tasks=[self._task("WS9.1", "wip")])
+        self.store.upsert_session(
+            {
+                "session_id": "lead-1",
+                "tool": "muse",
+                "label": "ws9-lead",
+                "started_at": self.now - 7200,
+                "status": "running",
+            }
+        )
+        self._run("ws9-WS9.1-x", status="done", age_s=3600, duration_s=600,
+                  session_id="child-1", parent_session_id="lead-1")
+        result = self._collect()
+        self.assertFalse(self._by_code(result, "lead-undelegated"))
+
+    def test_quiet_workstream_fires_nothing_new(self):
+        self._bundle(tasks=[
+            self._task("WS9.1", "done"),
+            self._task("WS9.2", "done", ["WS9.1"]),
+        ])
+        self._backdate_plan("WS9", 2 * 86400)
+        result = self._collect()
+        for code in self.NEW_CODES:
+            self.assertFalse(
+                self._by_code(result, code), f"{code} fired on a quiet workstream",
+            )
+
+    def test_empty_plan_fires_nothing_new(self):
+        self._bundle(tasks=[])
+        self._run("ws9-WS9.1-x", status="done", age_s=3600, duration_s=600)
+        result = self._collect()
+        for code in self.NEW_CODES:
+            self.assertFalse(
+                self._by_code(result, code), f"{code} fired with no plan tasks",
+            )
+
+
 if __name__ == "__main__":
     unittest.main()
