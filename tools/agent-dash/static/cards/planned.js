@@ -227,15 +227,16 @@
      then any other scope-"planned" registry entry as its own section. */
   function plannedSpecs(passedState, snap) {
     var specs = [];
+    var entries = (typeof registryFor === "function" ? registryFor("planned") : []) || [];
+    var bySlot = {};
+    entries.forEach(function (e) { if (e.slot) bySlot[e.slot] = e; });
+    specs.push(slotSection("exec-depgraph", bySlot["exec-depgraph"] || null));
     specs.push(["planned-ready", keyOf([(state.wss || []).map(function (w) { return [w.ws, w.progress, w.depends_on]; }), state.bundles, state.plans, state.approvals]), function () { return readinessTable(); }, ""]);
     specs.push(["planned-gated", keyOf([(state.wss || []).map(function (w) { return [w.ws, w.progress]; }), state.plans]), function () {
       var node = gatedLiveSection();
       return node || el("div", {class: "pj-empty-gated"});
     }, ""]);
-    var entries = (typeof registryFor === "function" ? registryFor("planned") : []) || [];
-    var bySlot = {};
-    entries.forEach(function (e) { if (e.slot) bySlot[e.slot] = e; });
-    PLANNED_SLOTS.forEach(function (id) { specs.push(slotSection(id, bySlot[id] || null)); });
+    PLANNED_SLOTS.forEach(function (id) { if (id !== "exec-depgraph") specs.push(slotSection(id, bySlot[id] || null)); });
     entries.forEach(function (e) {
       if (e.slot) return;
       specs.push([e.id, keyOf([e.id, state.seq]), function () {

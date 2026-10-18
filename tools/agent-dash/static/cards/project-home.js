@@ -329,6 +329,10 @@
      entry renders beside Recently done; entries naming a slot mount there. */
   function projectHomeSpecs(passedState, snap) {
     var specs = [];
+    var entries = registryFor("project") || [];
+    var bySlot = {};
+    entries.forEach(function (e) { if (e.slot) bySlot[e.slot] = e; });
+    specs.push(slotSection("exec-depgraph", bySlot["exec-depgraph"] || null));
     specs.push(["project-phases", keyOf([state.project]), function () { return phasesSection(state.project); }, ""]);
     specs.push(["project-tiles", keyOf([snap && snap.totals, snap && snap.totals_all_time, state.ws, state.snapError]), function () { return tilesSection(snap); }, ""]);
     specs.push(["project-current", keyOf([(state.wss || []).map(function (w) { return [w.ws, w.live_agents, w.tokens, w.cost_usd]; }), planSum]), function () {
@@ -358,10 +362,7 @@
       grid.appendChild(needNode);
       return grid;
     }, ""]);
-    var entries = registryFor("project") || [];
-    var bySlot = {};
-    entries.forEach(function (e) { if (e.slot) bySlot[e.slot] = e; });
-    PROJECT_SLOTS.forEach(function (id) { specs.push(slotSection(id, bySlot[id] || null)); });
+    PROJECT_SLOTS.forEach(function (id) { if (id !== "exec-depgraph") specs.push(slotSection(id, bySlot[id] || null)); });
     entries.forEach(function (e) {
       if (e.id === "needs" || e.slot) return;
       specs.push([e.id, keyOf([e.id, state.seq]), function () {
