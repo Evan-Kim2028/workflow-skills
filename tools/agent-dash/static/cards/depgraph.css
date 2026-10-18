@@ -1,0 +1,63 @@
+/* Dependency graph card styles (?view=project + ?view=planned).
+   Layered DAG: state-coloured pills, met/waiting/stale edges, amber/blue
+   chain highlights, side panel, legend. Phone widths stack the panel under
+   the graph. */
+.dep-bar{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin:0 0 12px}
+.dep-toggle{border-radius:999px;padding:4px 12px;font-weight:600}
+.dep-toggle[aria-pressed="true"]{border-color:var(--accent);color:var(--accent)}
+.dep-counts{font:12.5px var(--mono);color:var(--ink-2);font-variant-numeric:tabular-nums}
+.dep-body{display:grid;grid-template-columns:minmax(0,1fr) 300px;gap:14px;align-items:start}
+.dep-svg{width:100%;height:auto;display:block;background:var(--surface-2);border:1px solid var(--grid);border-radius:var(--r-md)}
+.dep-node{cursor:pointer}
+.dep-node:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.dep-box{fill:var(--surface);stroke:var(--ring-strong);stroke-width:1.5}
+.dep-node.st-active .dep-box{stroke:var(--s1)}
+.dep-node.st-done .dep-box{stroke:var(--good)}
+.dep-node.st-planned .dep-box{stroke:var(--muted);stroke-dasharray:5 4}
+.dep-node.st-paused .dep-box{stroke:var(--muted)}
+.dep-node.st-archived .dep-box{stroke:var(--muted);opacity:.75}
+.dep-node.st-dropped .dep-box{stroke:var(--serious,var(--critical))}
+.dep-title{fill:var(--ink);font:600 12.5px var(--font)}
+.dep-state{fill:var(--ink-2);font:600 11px var(--font)}
+.dep-node.st-done .dep-state{fill:var(--good)}
+.dep-node.st-active .dep-state{fill:var(--s1)}
+.dep-node.st-planned .dep-state{fill:var(--muted)}
+.dep-track{fill:var(--grid)}
+.dep-fill{fill:var(--muted)}
+.dep-node.st-done .dep-fill{fill:var(--good)}
+.dep-node.st-active .dep-fill{fill:var(--s1)}
+.dep-live{fill:var(--s1);animation:beat 2s ease-out infinite}
+.dep-edge{fill:none;stroke-width:2;opacity:.75}
+.dep-edge.e-met{stroke:var(--good)}
+.dep-edge.e-waiting{stroke:var(--muted);stroke-dasharray:6 5}
+.dep-edge.e-stale{stroke:var(--warning);stroke-dasharray:6 5}
+.dep-edge:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.dep-node.dim,.dep-edge.dim{opacity:.14}
+.dep-node.hl-self .dep-box{stroke-width:3}
+.dep-node.hl-up .dep-box{stroke:var(--warning);stroke-width:2.5}
+.dep-node.hl-down .dep-box{stroke:var(--s1);stroke-width:2.5}
+.dep-edge.hl-up{stroke:var(--warning);stroke-width:3;opacity:1}
+.dep-edge.hl-down{stroke:var(--s1);stroke-width:3;opacity:1}
+.dep-node,.dep-edge{transition:opacity .16s ease}
+.dep-panel{min-width:0;border:1px solid var(--grid);border-radius:var(--r-md);padding:12px 14px;background:var(--raised);max-height:560px;overflow:auto}
+.dep-hint{font-size:12.5px;color:var(--muted);margin:6px 0}
+.dep-sel{font-weight:700;font-size:13px;margin:0 0 8px}
+.dep-chain h4{font-size:12px;margin:10px 0 6px;color:var(--ink-2)}
+.dep-chain.dep-up h4{color:var(--warning)}
+.dep-chain.dep-down h4{color:var(--s1)}
+.dep-erow{border-top:1px solid var(--grid);padding:7px 0;font-size:12.5px}
+.dep-ename{font-weight:650}
+.dep-econd{color:var(--ink-2);margin-top:2px;overflow-wrap:anywhere}
+.dep-erow.e-met .dep-econd{color:var(--good)}
+.dep-erow.e-stale .dep-econd{color:var(--warning)}
+.dep-erow .prog-acts{margin-top:6px}
+.dep-legend{margin-top:12px}
+.dep-cycles{font-size:12.5px;color:var(--warning);margin:10px 0 0}
+@media (max-width:700px){
+.dep-body{grid-template-columns:minmax(0,1fr)}
+.dep-panel{max-height:none}
+}
+@media (prefers-reduced-motion: reduce){
+.dep-live{animation:none}
+.dep-node,.dep-edge{transition:none}
+}

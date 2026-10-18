@@ -178,6 +178,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._workstreams(query)
             elif path == "/api/archive":
                 self._archive(query)
+            elif path == "/api/project/graph":
+                self._project_graph(query)
             elif path == "/api/reconcile":
                 self._reconcile(query)
             elif path == "/api/plan":
@@ -421,6 +423,48 @@ class Handler(BaseHTTPRequestHandler):
                 },
             },
         )
+
+    def _project_graph(self, _query):
+        """``GET /api/project/graph``: the cross-workstream dependency graph.
+
+        Nodes are workstream bundles (id, title, state, progress, live
+        agents, milestone, depth); edges come from ``depends_on``, gate
+        tasks naming another workstream, and deferred tasks that moved.
+        Cycles are reported in the payload, never an error. Read-only over
+        local bundles; only ids, titles, states, counts, and plan
+        condition texts cross the boundary (never paths or bodies).
+        """
+        from dash import projectgraph
+        from dash.bundles import list_bundles
+        from dash.workstates import STATES, all_bundle_meta
+
+        now = time.time()
+        meta = all_bundle_meta()
+        rows = self.server.store.query_workstreams(
+            workstream_plan_ids(), None, None,
+            bundle_meta=meta, allowed_states=set(STATES),
+        )
+        live = {}
+        progress = {}
+        for row in rows:
+            ws = row.get("ws")
+            if not ws or ws == "unassigned":
+                continue
+            live[ws] = row.get("live_agents", 0) or 0
+            prog = _row_progress(ws)
+            if isinstance(prog, dict):
+                progress[ws] = prog
+        bundles = [item for item in list_bundles() if item.get("kind") == "workstream"]
+        plans: dict = {}
+        for item in bundles:
+            ws = item["id"]
+            try:
+                _source, body = resolve_plan(ws)
+            except Exception:
+                body = None
+            if isinstance(body, dict):
+                plans[ws] = body
+        self._json(200, projectgraph.build_graph(bundles, plans, live, progress, now))
 
     def _reconcile(self, query):
         from dash.workstates import hidden_ids

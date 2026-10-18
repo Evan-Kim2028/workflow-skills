@@ -1032,6 +1032,35 @@ def _counts(runs, now):
     }
 
 
+def _graph(runs, plans):
+    """Fixture mirror of GET /api/project/graph: the pure builder run over
+    the fixture workstreams (BOARD names, WS_STATES, WS_DEPENDS,
+    WS_MILESTONE), the fixture plan views (gate signals included), and
+    live-agent counts from the fixture runs. generated_at is the fixture
+    NOW so the offline preview is stable."""
+    from dash import projectgraph as projectgraph_mod
+
+    bundles = []
+    for code, name, _counts in BOARD:
+        row = {"id": code, "title": name, "state": WS_STATES.get(code, "active")}
+        if code in WS_DEPENDS:
+            row["depends_on"] = list(WS_DEPENDS[code])
+        if code in WS_MILESTONE:
+            row["milestone"] = WS_MILESTONE[code]
+        bundles.append(row)
+    live = {}
+    for run in runs:
+        if run["status"] == "running" and _is_agent(run) and run["workstream"]:
+            live[run["workstream"]] = live.get(run["workstream"], 0) + 1
+    progress = {}
+    for code, doc in plans.items():
+        if isinstance(doc.get("progress"), dict):
+            progress[code] = doc["progress"]
+    body = projectgraph_mod.build_graph(bundles, plans, live, progress, NOW)
+    body["_note"] = NOTE
+    return body
+
+
 def _check(runs, conc):
     peak = max(sum(point[key] for key in ("grok", "muse", "glm", "claude")) for point in conc["points"])
     if not 20 <= peak <= 40:
@@ -1068,6 +1097,7 @@ def main():
         "decisions.json": _decisions(),
         "project/feed.json": _feed(NOW),
         "reconcile.json": _reconcile(runs, NOW),
+        "graph.json": _graph(runs, plans),
         "health.json": {
             "ok": True,
             "sources": [

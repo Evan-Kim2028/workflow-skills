@@ -1997,6 +1997,137 @@ class FeedEndpointTest(unittest.TestCase):
         self.assertEqual(payload["feed"], [])
         self.assertEqual(payload["total"], 0)
         self.assertIsNone(payload["earliest_ts"])
+class ProjectGraphApiTest(unittest.TestCase):
+    """GET /api/project/graph over synthetic bundles: every edge kind, a
+    cycle, stale gates, moved tasks, and archived nodes in one payload."""
+    MODEL = "claude-sonnet-5-5"
+    def _bundle(self, ws, state="active", depends_on=None, milestone=None):
+        bundle = {"id": ws, "title": "Probe %s" % ws, "short": ws,
+                  "order": int(ws[2:]), "kind": "workstream"}
+        if state != "active":
+            bundle["state"] = state
+        bundle["state_changed_at"] = int(self.now) - 50
+        if depends_on:
+            bundle["depends_on"] = depends_on
+        if milestone:
+            bundle["milestone"] = milestone
+        dest = os.path.join(self.wsroot, ws)
+        os.makedirs(dest, exist_ok=True)
+        with open(os.path.join(dest, "bundle.json"), "w") as fh:
+            json.dump(bundle, fh)
+    def _plan(self, ws, tasks):
+        doc = {"dag": {"cols": ["Build"], "groups": [
+            {"id": "build", "col": 0, "title": "Build", "tasks": tasks}]},
+               "narrative": {"thesis": "probe", "end_state": "done",
+                             "phases": []}, "trains": []}
+        with open(os.path.join(self.wsroot, ws, "plan.json"), "w") as fh:
+            json.dump(doc, fh)
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.now = time.time()
+        self.wsroot = os.path.join(self.tmp.name, "ws")
+        os.makedirs(self.wsroot)
+        self._bundle("WS51", state="planned", depends_on=["WS52"], milestone="Part 2")
+        self._bundle("WS52")
+        self._bundle("WS53", state="done")
+        self._bundle("WS54", state="planned", depends_on=["WS53"])
+        self._bundle("WS55")
+        self._bundle("WS56")
+        self._bundle("WS57", depends_on=["WS58"])
+        self._bundle("WS58", depends_on=["WS57"])
+        self._bundle("WS59", state="archived")
+        self._plan("WS51", [
+            {"id": "WS51.1", "title": "First probe task", "status": "todo", "deps": []},
+        ])
+        self._plan("WS54", [
+            {"id": "WS54.G1", "title": "Signal batch is merged", "status": "todo",
+             "kind": "gate", "signal": "WS52 signal batch is merged",
+             "confirmed_at": "2020-01-01T00:00:00Z", "fresh_hours": 24},
+            {"id": "WS54.G2", "title": "Handoff is complete", "status": "done",
+             "kind": "gate", "signal": "WS53 handoff is complete"},
+        ])
+        self._plan("WS55", [
+            {"id": "WS55.1", "title": "Shared probe task", "status": "deferred",
+             "moved_to": "WS52", "received_as": "WS52.9", "note": "handed over"},
+        ])
+        self._plan("WS56", [
+            {"id": "WS56.1", "title": "Reconcile the cold archive", "status": "deferred",
+             "moved_to": "WS52", "note": "nobody picked this up"},
+        ])
+        self._plan("WS52", [
+            {"id": "WS52.9", "title": "Shared probe task follow-up", "status": "todo", "deps": []},
+        ])
+        self._env = mock.patch.dict(os.environ, {"AGENT_DASH_WORKSTREAMS": self.wsroot})
+        self._env.start()
+        self.addCleanup(self._env.stop)
+        self._live = mock.patch("dash.server._live_workers", return_value=[])
+        self._live.start()
+        self.addCleanup(self._live.stop)
+        self.store = Store(Path(self.tmp.name) / "dash.sqlite")
+        self.store.upsert_run(
+            {"run_id": "muse:s51:ws51-probe", "source": "muse", "tier": "muse",
+             "model": self.MODEL, "label": "ws51-WS51.1-probe",
+             "session_id": "sess-51", "status": "done",
+             "started_at": self.now - 7200, "ended_at": self.now - 3600}
+        )
+        self.server, self.thread = start(self.store)
+        self.port = self.server.server_address[1]
+    def tearDown(self):
+        stop(self.server, self.thread)
+        self.store.close()
+        self.tmp.cleanup()
+    def test_graph_payload_shape(self):
+        status, ctype, body = get(self.port, "/api/project/graph")
+        self.assertEqual(status, 200)
+        self.assertIn("application/json", ctype)
+        payload = json.loads(body)
+        self.assertEqual(set(payload), {"nodes", "edges", "cycles", "generated_at"})
+        nodes = {node["id"]: node for node in payload["nodes"]}
+        self.assertEqual(sorted(nodes),
+                         ["WS51", "WS52", "WS53", "WS54", "WS55", "WS56", "WS57", "WS58", "WS59"])
+        for node in nodes.values():
+            self.assertEqual(set(node),
+                             {"id", "title", "state", "progress", "live_agents", "milestone", "depth"})
+        self.assertEqual(nodes["WS51"]["state"], "planned")
+        self.assertEqual(nodes["WS51"]["milestone"], "Part 2")
+        self.assertEqual(nodes["WS53"]["state"], "done")
+        self.assertEqual(nodes["WS59"]["state"], "archived")
+        self.assertEqual(nodes["WS51"]["progress"]["done"], 0)
+        self.assertEqual(nodes["WS51"]["progress"]["total"], 1)
+    def test_graph_edges_and_states(self):
+        status, _, body = get(self.port, "/api/project/graph")
+        self.assertEqual(status, 200)
+        payload = json.loads(body)
+        by_key = {(edge["from"], edge["to"], edge["kind"]): edge for edge in payload["edges"]}
+        for edge in payload["edges"]:
+            self.assertEqual(set(edge) >= {"from", "to", "kind", "status", "condition"}, True)
+            self.assertIn(edge["kind"], ("dependency", "gate", "moved"))
+            self.assertIn(edge["status"], ("met", "waiting", "stale"))
+        self.assertEqual(by_key[("WS52", "WS51", "dependency")]["status"], "waiting")
+        self.assertEqual(by_key[("WS53", "WS54", "dependency")]["status"], "met")
+        self.assertEqual(by_key[("WS52", "WS54", "gate")]["status"], "stale")
+        self.assertEqual(by_key[("WS53", "WS54", "gate")]["status"], "met")
+        self.assertEqual(by_key[("WS55", "WS52", "moved")]["status"], "met")
+        self.assertEqual(by_key[("WS56", "WS52", "moved")]["status"], "waiting")
+    def test_graph_reports_cycles_and_layers(self):
+        status, _, body = get(self.port, "/api/project/graph")
+        self.assertEqual(status, 200)
+        payload = json.loads(body)
+        self.assertIn(["WS57", "WS58"], payload["cycles"])
+        depths = {node["id"]: node["depth"] for node in payload["nodes"]}
+        self.assertEqual(depths["WS53"], 0)
+        self.assertEqual(depths["WS55"], 0)
+        self.assertEqual(depths["WS56"], 0)
+        self.assertEqual(depths["WS52"], 1)
+        self.assertEqual(depths["WS51"], 2)
+        self.assertEqual(depths["WS54"], 2)
+    def test_graph_carries_no_paths_or_bodies(self):
+        status, _, body = get(self.port, "/api/project/graph")
+        self.assertEqual(status, 200)
+        text = body.decode("utf-8", "replace")
+        self.assertNotIn(self.wsroot, text)
+        self.assertNotIn(".md", text)
+        self.assertNotIn("reports/", text)
 
 
 if __name__ == "__main__":

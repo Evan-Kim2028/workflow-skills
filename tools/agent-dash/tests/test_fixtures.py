@@ -53,6 +53,7 @@ FILES = (
     "project.json",
     "decisions.json",
     "project/feed.json",
+    "graph.json",
     "plan-WS1.json",
     "plan-WS2.json",
     "plan-WS7.json",
@@ -631,6 +632,34 @@ class ProjectViewFixtureTests(unittest.TestCase):
         self.assertEqual(totals["workstreams"], len(cards))
         for key in ("tokens", "cost_usd", "runs"):
             self.assertTrue(num(totals[key]), key)
+
+    def test_graph_fixture_shape(self):
+        doc = load("graph.json")
+        self.assertEqual(
+            set(doc) - {"_note"},
+            {"nodes", "edges", "cycles", "generated_at"},
+            "graph fixture must mirror GET /api/project/graph",
+        )
+        self.assertTrue(num(doc["generated_at"]))
+        kinds = set()
+        statuses = set()
+        for node in doc["nodes"]:
+            self.assertEqual(
+                set(node),
+                {"id", "title", "state", "progress", "live_agents", "milestone", "depth"},
+                node.get("id"),
+            )
+            self.assertIsInstance(node["depth"], int)
+        for edge in doc["edges"]:
+            self.assertTrue(
+                {"from", "to", "kind", "status", "condition"} <= set(edge),
+                edge,
+            )
+            kinds.add(edge["kind"])
+            statuses.add(edge["status"])
+        self.assertTrue({"dependency", "gate"} <= kinds, kinds)
+        self.assertTrue(statuses <= {"met", "waiting", "stale"}, statuses)
+        self.assertIsInstance(doc["cycles"], list)
     def test_planned_fixture_plans_have_gates(self):
         ws9 = self.plans["WS9"]
         gates = [task for group in ws9["groups"] for task in group["tasks"] if task.get("kind") == "gate"]

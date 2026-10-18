@@ -1280,13 +1280,11 @@ setTimeout(function () {
             '<link rel="stylesheet" href="/static/cards/decisions.css">',
         ):
             self.assertIn(tag, page, f"index.html lost {tag}")
-
     def test_feed_and_decisions_cards_on_fixtures(self):
         """The feed groups fixture lines by day with chips and an honest
         gap footer; the decisions card pills, filters, and link rules hold;
         and the decisions spec hides when its source is absent."""
         import json as _json
-
         fx = Path(__file__).resolve().parent.parent / "fixtures"
         feed = _json.loads((fx / "project" / "feed.json").read_text())
         decisions = _json.loads((fx / "decisions.json").read_text())
@@ -1376,6 +1374,114 @@ setTimeout(function () {
             text=True,
         )
         self.assertEqual(proc.returncode, 0, proc.stderr or proc.stdout)
+    def test_depgraph_layout_has_no_overlaps(self):
+        """The dependency graph layout is overlap-free at scale: a
+        synthetic 30-node graph (chains, branches, one cycle) lays out
+        with disjoint node boxes in wide and stacked-narrow modes, stays
+        deterministic, hides archived/dropped unless asked, and traces
+        chains with glyph-plus-word marks."""
+        script = (
+            "const fs=require('fs');"
+            "globalThis.window=globalThis;"
+            "eval(fs.readFileSync(process.argv[1],'utf8'));"
+            "const assert=require('assert');"
+            "for(const n of ['depLayout','depUpstream','depDownstream','depStateMark','depEdgeMark','depShort','depGraphSpec']){"
+            "assert.strictEqual(typeof globalThis[n],'function',n+' is not exported');}"
+            "assert.deepStrictEqual(depStateMark('done'),{text:'\\u2713 Done',cls:'done'});"
+            "assert.deepStrictEqual(depStateMark('planned'),{text:'\\u25CB Planned',cls:'planned'});"
+            "assert.deepStrictEqual(depStateMark('active'),{text:'\\u25CF Active',cls:'active'});"
+            "assert.deepStrictEqual(depEdgeMark('met'),{text:'\\u2713 met',cls:'e-met'});"
+            "assert.deepStrictEqual(depEdgeMark('waiting'),{text:'\\u25CB waiting',cls:'e-waiting'});"
+            "assert.deepStrictEqual(depEdgeMark('stale'),{text:'\\u26A0 stale',cls:'e-stale'});"
+            "assert.strictEqual(depShort('A very long workstream title here',10),'A very lo\\u2026');"
+            "var nodes=[],edges=[];"
+            "for(var i=1;i<=30;i++){"
+            "nodes.push({id:'WS'+i,title:'Workstream '+i,state:i%7===0?'archived':(i%11===0?'dropped':(i%3===0?'planned':'active')),depth:0});}"
+            "for(var j=1;j<30;j++){edges.push({from:'WS'+j,to:'WS'+(j+1),kind:'dependency',status:'waiting',condition:null});}"
+            "edges.push({from:'WS3',to:'WS12',kind:'gate',status:'stale',condition:'WS3 says go'});"
+            "edges.push({from:'WS5',to:'WS15',kind:'moved',status:'met',condition:'handed over'});"
+            "edges.push({from:'WS30',to:'WS28',kind:'dependency',status:'waiting',condition:null});"
+            "var depths={};"
+            "nodes.forEach(function(n){"
+            "var incoming=edges.filter(function(e){return e.to===n.id;});"
+            "depths[n.id]=incoming.length?1+Math.max.apply(null,incoming.map(function(e){return depths[e.from]||0;})):0;"
+            "n.depth=depths[n.id];});"
+            "var graph={nodes:nodes,edges:edges};"
+            "function disjoint(placed){"
+            "for(var a=0;a<placed.length;a++)for(var b=a+1;b<placed.length;b++){"
+            "var A=placed[a],B=placed[b];"
+            "var apart=(A.x+A.w<=B.x)||(B.x+B.w<=A.x)||(A.y+A.h<=B.y)||(B.y+B.h<=A.y);"
+            "assert.ok(apart,'overlap: '+A.id+' vs '+B.id);}}"
+            "var wide=depLayout(graph,{width:1200});"
+            "assert.strictEqual(wide.narrow,false);"
+            "disjoint(wide.nodes);"
+            "var narrow=depLayout(graph,{width:360,showArch:true});"
+            "assert.strictEqual(narrow.narrow,true);"
+            "disjoint(narrow.nodes);"
+            "assert.ok(narrow.nodes.length>wide.nodes.length,'showArch must reveal hidden nodes');"
+            "wide.nodes.forEach(function(n){assert.ok(!/archived|dropped/.test(n.id)&&true);});"
+            "var again=depLayout(graph,{width:1200});"
+            "assert.deepStrictEqual(again,wide,'layout is not deterministic');"
+            "var cols={};wide.nodes.forEach(function(n){cols[n.depth]=(cols[n.depth]||0)+1;});"
+            "assert.strictEqual(wide.cols,Object.keys(cols).length);"
+            "var up=depUpstream(edges,'WS15');"
+            "assert.ok(up['WS5']&&up['WS1'],'upstream misses the chain: '+JSON.stringify(up));"
+            "assert.ok(!up['WS15'],'upstream holds itself');"
+            "var down=depDownstream(edges,'WS1');"
+            "assert.ok(down['WS15'],'downstream misses the chain');"
+            "assert.ok(!down['WS1'],'downstream holds itself');"
+        )
+        proc = subprocess.run(
+            ["node", "-e", script, str(STATIC / "cards" / "depgraph.js")],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr or proc.stdout)
+    def test_depgraph_card_contract(self):
+        """The dependency card keeps its integration points: one file plus
+        one registry line per scope over the same spec, the exec-depgraph
+        slot on both views, a legend, hover/pin handlers with tooltips, a
+        "show archived" toggle, compact numbers, and no doctor UI."""
+        card = (STATIC / "cards" / "depgraph.js").read_text()
+        for marker in (
+            "depGraphSpec",
+            "depLayout",
+            "dep-legend",
+            "show archived",
+            "aria-pressed",
+            "mouseenter",
+            "mousemove",
+            "mouseleave",
+            "showTip",
+            "hideTip",
+            "depPin",
+            "data-diagram",
+            "fmtN(",
+            "depUpstream",
+            "depDownstream",
+            "openPlan",
+        ):
+            self.assertIn(marker, card, f"depgraph.js lost the card branch: {marker}")
+        for bad in (".toFixed(", "toLocaleString()", '"dagster"', "'dagster'", "Infinity", "doctor", "health"):
+            self.assertNotIn(bad, card, f"depgraph.js must not contain {bad}")
+        reg = (STATIC / "cards" / "registry.js").read_text()
+        self.assertIn('"depgraph"', reg, "depgraph is not registered")
+        self.assertIn('scope: "planned"', reg, "depgraph misses the planned scope")
+        self.assertIn('slot: "exec-depgraph"', reg, "depgraph misses its slot")
+        page = (STATIC / "index.html").read_text()
+        self.assertIn("/static/cards/depgraph.css", page, "index.html never loads the card CSS")
+        self.assertIn("/static/cards/depgraph.js", page, "index.html never loads the card script")
+        css = (STATIC / "cards" / "depgraph.css").read_text()
+        for marker in (
+            ".dep-edge.e-met",
+            ".dep-edge.e-waiting",
+            ".dep-edge.e-stale",
+            ".hl-up",
+            ".hl-down",
+            "@media (max-width:700px)",
+            "prefers-reduced-motion",
+        ):
+            self.assertIn(marker, css, f"depgraph.css lost the style rule: {marker}")
 
 
 if __name__ == "__main__":

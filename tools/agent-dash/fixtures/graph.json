@@ -1,0 +1,225 @@
+{
+  "nodes": [
+    {
+      "id": "WS0",
+      "title": "Stabilize",
+      "state": "active",
+      "progress": null,
+      "live_agents": 0,
+      "milestone": null,
+      "depth": 0
+    },
+    {
+      "id": "WS1",
+      "title": "Identity",
+      "state": "active",
+      "progress": {
+        "done": 2,
+        "total": 5,
+        "counts": {
+          "todo": 1,
+          "wip": 1,
+          "pr": 1,
+          "prog": 0,
+          "done": 2,
+          "deferred": 0
+        },
+        "pct": 40
+      },
+      "live_agents": 2,
+      "milestone": null,
+      "depth": 0
+    },
+    {
+      "id": "WS10",
+      "title": "Ledger",
+      "state": "planned",
+      "progress": {
+        "done": 0,
+        "total": 3,
+        "counts": {
+          "todo": 3,
+          "wip": 0,
+          "pr": 0,
+          "prog": 0,
+          "done": 0,
+          "deferred": 0
+        },
+        "pct": 0
+      },
+      "live_agents": 0,
+      "milestone": "Second wave",
+      "depth": 2
+    },
+    {
+      "id": "WS11",
+      "title": "Export",
+      "state": "archived",
+      "progress": {
+        "done": 3,
+        "total": 3,
+        "counts": {
+          "todo": 0,
+          "wip": 0,
+          "pr": 0,
+          "prog": 0,
+          "done": 3,
+          "deferred": 0
+        },
+        "pct": 100
+      },
+      "live_agents": 0,
+      "milestone": "First wave",
+      "depth": 0
+    },
+    {
+      "id": "WS12",
+      "title": "Sunset",
+      "state": "dropped",
+      "progress": null,
+      "live_agents": 0,
+      "milestone": null,
+      "depth": 0
+    },
+    {
+      "id": "WS2",
+      "title": "Public API",
+      "state": "done",
+      "progress": {
+        "done": 5,
+        "total": 5,
+        "counts": {
+          "todo": 0,
+          "wip": 0,
+          "pr": 0,
+          "prog": 0,
+          "done": 5,
+          "deferred": 0
+        },
+        "pct": 100
+      },
+      "live_agents": 2,
+      "milestone": null,
+      "depth": 0
+    },
+    {
+      "id": "WS3",
+      "title": "Gateway",
+      "state": "active",
+      "progress": null,
+      "live_agents": 0,
+      "milestone": null,
+      "depth": 0
+    },
+    {
+      "id": "WS4",
+      "title": "Offers",
+      "state": "active",
+      "progress": null,
+      "live_agents": 0,
+      "milestone": null,
+      "depth": 0
+    },
+    {
+      "id": "WS5",
+      "title": "Clients",
+      "state": "paused",
+      "progress": null,
+      "live_agents": 0,
+      "milestone": null,
+      "depth": 0
+    },
+    {
+      "id": "WS6",
+      "title": "Cleanup",
+      "state": "active",
+      "progress": null,
+      "live_agents": 0,
+      "milestone": null,
+      "depth": 0
+    },
+    {
+      "id": "WS7",
+      "title": "Launch",
+      "state": "active",
+      "progress": {
+        "done": 1,
+        "total": 5,
+        "counts": {
+          "todo": 2,
+          "wip": 0,
+          "pr": 1,
+          "prog": 1,
+          "done": 1,
+          "deferred": 0
+        },
+        "pct": 20
+      },
+      "live_agents": 3,
+      "milestone": null,
+      "depth": 0
+    },
+    {
+      "id": "WS9",
+      "title": "Relay",
+      "state": "planned",
+      "progress": {
+        "done": 0,
+        "total": 3,
+        "counts": {
+          "todo": 3,
+          "wip": 0,
+          "pr": 0,
+          "prog": 0,
+          "done": 0,
+          "deferred": 0
+        },
+        "pct": 0
+      },
+      "live_agents": 0,
+      "milestone": "Second wave",
+      "depth": 1
+    }
+  ],
+  "edges": [
+    {
+      "from": "WS6",
+      "to": "WS9",
+      "kind": "dependency",
+      "status": "waiting",
+      "condition": "WS9 waits on WS6"
+    },
+    {
+      "from": "WS6",
+      "to": "WS9",
+      "kind": "gate",
+      "status": "stale",
+      "condition": "WS6 cutover batch is merged",
+      "gate": "WS9.G1",
+      "signal": "WS6 cutover batch is merged",
+      "confirmed_at": "2025-10-22T12:00:00Z",
+      "fresh_hours": 24
+    },
+    {
+      "from": "WS9",
+      "to": "WS10",
+      "kind": "dependency",
+      "status": "waiting",
+      "condition": "WS10 waits on WS9"
+    },
+    {
+      "from": "WS9",
+      "to": "WS10",
+      "kind": "gate",
+      "status": "met",
+      "condition": "WS9 relay loop is live",
+      "gate": "WS10.G2",
+      "signal": "WS9 relay loop is live",
+      "confirmed_at": "2025-10-31T20:00:00Z",
+      "fresh_hours": 24
+    }
+  ],
+  "cycles": [],
+  "generated_at": 1761999960,
+  "_note": "Seeded synthetic data for the offline preview. Seed 1. No local sessions are read."
+}
