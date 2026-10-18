@@ -111,6 +111,28 @@ _WF = re.compile(r"(wf_[A-Za-z0-9-]+)")
 _SEV_ORDER = {"critical": 0, "warn": 1, "info": 2}
 
 
+def _manifest_family(run_id) -> str | None:
+    """Source family of a launcher-manifest row id, or None.
+
+    The launcher writes one manifest row per worker it starts while the
+    worker's own log makes a second row for the same run. Cursor rows
+    carry ``:cursor/``; muse/glm rows without a session uuid carry
+    ``@<epoch>`` on the last segment (``muse:None:<label>@<epoch>``).
+    Worker-row labels never end in ``@<digits>``, so the tail names
+    manifest rows exactly.
+    """
+    if not isinstance(run_id, str):
+        return None
+    if ":cursor/" in run_id:
+        return "grok"
+    head, sep, _rest = run_id.partition(":")
+    if sep and head in ("muse", "glm"):
+        tail = run_id.rsplit(":", 1)[-1]
+        if tail and re.fullmatch(r".*@\d+", tail):
+            return head
+    return None
+
+
 def _hour(ts: float) -> int:
     return int(ts // 3600) * 3600
 

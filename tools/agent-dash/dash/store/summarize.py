@@ -459,15 +459,15 @@ def _duplicate_run_mismatches(runs: list, window_s: float = MERGE_WINDOW_S) -> l
 
     Two rows with the same label overlapping in time from the same source
     are one run recorded twice: the manifest row the launcher wrote plus
-    the worker's own row. The merge (``merge_grok_manifests``) folds them;
-    whatever it leaves behind is reported here so it gets fixed instead of
-    double-counted. Non-manifest siblings that share a label (a relaunch,
-    a probe, workflow children) are legitimate and never flagged. The rule:
-    a manifest row the merge would fold (a same-label non-manifest twin
-    starting within ``window_s``) is skipped, because the next merge pass
-    folds it; only a surviving manifest row with an overlapping
-    same-source twin the merge would NOT fold, and not shadow-linked to
-    it, is a mismatch.
+    the worker's own row. The merge (``merge_manifest_rows``, per source
+    family) folds them; whatever it leaves behind is reported here so it
+    gets fixed instead of double-counted. Non-manifest siblings that share
+    a label (a relaunch, a probe, workflow children) are legitimate and
+    never flagged. The rule: a manifest row the merge would fold (a
+    same-label non-manifest twin starting within ``window_s``) is skipped,
+    because the next merge pass folds it; only a surviving manifest row
+    with an overlapping same-source twin the merge would NOT fold, and not
+    shadow-linked to it, is a mismatch.
     """
     by_key: dict = {}
     for row in runs:

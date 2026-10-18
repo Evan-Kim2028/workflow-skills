@@ -18,6 +18,8 @@ import re
 import subprocess
 import time
 
+from dash.liveness import PROCESS_GONE_GRACE_S
+
 NAME = "process"
 INTERVAL_S = 5
 COMMS = ("cursor-agent", "claude", "grok", "muse", "muse-bin")
@@ -295,6 +297,32 @@ def _vetoed(store, source: str, run_id, label, started_at, run_session, proc, le
     return False
 
 
+def process_alive(store, run_id, pid, label) -> bool:
+    """True when fresh process evidence vouches for the run.
+
+    Liveness wins over file evidence: a sample for the run id — or for
+    its stored pid under the same label, which is what a live pid
+    observably means (a reused pid from another worker cannot vouch) —
+    within ``PROCESS_GONE_GRACE_S`` means the worker is still there even
+    when no live listing row matches it right now. Bare-label samples are
+    not consulted: they may belong to a newer same-label run. Unknown
+    stores (no ``last_sample_ts``) keep the old behavior.
+    """
+    sample_fn = getattr(store, "last_sample_ts", None)
+    if not callable(sample_fn):
+        return False
+    try:
+        found = sample_fn(run_id, pid, label)
+    except Exception:
+        return False
+    if found is None:
+        return False
+    try:
+        return time.time() - float(found) <= PROCESS_GONE_GRACE_S
+    except (TypeError, ValueError):
+        return False
+
+
 def apply_liveness(store, run: dict, source: str, processes) -> None:
     """Set ``running`` while the process is alive.
 
@@ -303,8 +331,11 @@ def apply_liveness(store, run: dict, source: str, processes) -> None:
     at the last activity. An open ``unknown`` row is revived when a process
     matches, and closed (``done``, with ``ended_at``) when it does not.
     A failed process listing (``processes is None``) leaves the row alone.
-    Other terminal statuses are not rewritten. An ``unknown`` row that
-    already has ``ended_at`` is left alone.
+    Liveness wins over file evidence: a row with a process sample for its
+    id or stored pid within ``PROCESS_GONE_GRACE_S`` is kept ``running``
+    instead of being closed by a quiet file. Other terminal statuses are
+    not rewritten. An ``unknown`` row that already has ``ended_at`` is
+    left alone.
     """
     if processes is None or not run.get("run_id"):
         return
@@ -333,6 +364,10 @@ def apply_liveness(store, run: dict, source: str, processes) -> None:
     if status == "unknown":
         if existing.get("ended_at") is not None:
             return
+        if process_alive(store, run["run_id"], pid, label):
+            run["status"] = "running"
+            run["ended_at"] = None
+            return
         run["status"] = "done"
         run["ended_at"] = _last_activity(
             store, run["run_id"], existing.get("started_at") or run.get("started_at")
@@ -340,6 +375,10 @@ def apply_liveness(store, run: dict, source: str, processes) -> None:
         run["pid"] = None
         return
     if status != "running":
+        return
+    if process_alive(store, run["run_id"], pid, label):
+        run["status"] = "running"
+        run["ended_at"] = None
         return
     run["status"] = "done" if label or existing.get("verdict") else "unknown"
     run["ended_at"] = _last_activity(store, run["run_id"], existing.get("started_at") or run.get("started_at"))
@@ -351,14 +390,16 @@ def reconcile_running(store, now: float, processes=None) -> int:
 
     A muse row still marked unknown is adopted when a live process matches
     its prompt-file label or session uuid, and closed (``done`` with
-    ``ended_at``) when nothing matches. An unlabeled row that shares a
-    session with a labeled run is linked to that run (``parent_session_id``
-    = the labeled run id) so it is not a second agent; a live process is
-    recorded on the labeled run. Orphan muse usage is moved onto the labeled
-    run and the orphan row is deleted. A missing muse start is filled from
-    the earliest usage event, and a finished end that sits before the latest
-    usage event is raised to it. Returns how many rows were ended
-    because the process was gone.
+    ``ended_at``) when nothing matches. Liveness wins over file evidence:
+    a row with a process sample for its id or stored pid within
+    ``PROCESS_GONE_GRACE_S`` stays (or becomes) ``running`` instead of
+    closing. An unlabeled row that shares a session with a labeled run is
+    linked to that run (``parent_session_id`` = the labeled run id) so it
+    is not a second agent; a live process is recorded on the labeled run.
+    Orphan muse usage is moved onto the labeled run and the orphan row is
+    deleted. A missing muse start is filled from the earliest usage event,
+    and a finished end that sits before the latest usage event is raised to
+    it. Returns how many rows were ended because the process was gone.
     """
     if processes is None:
         processes = live_agent_processes(now)
@@ -397,6 +438,12 @@ def reconcile_running(store, now: float, processes=None) -> int:
         if proc:
             if row.get("pid") != proc["pid"] or row.get("status") != "running":
                 _mark_running(store, row["run_id"], proc["pid"])
+            continue
+        if not labeled and process_alive(
+            store, row["run_id"], row.get("pid"), row.get("label")
+        ):
+            if row.get("status") != "running" or row.get("ended_at") is not None:
+                _mark_running(store, row["run_id"], row.get("pid"))
             continue
         if row.get("status") != "running":
             if row.get("status") == "unknown" and row.get("ended_at") is None and not labeled:

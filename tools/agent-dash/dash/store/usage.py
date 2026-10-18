@@ -16,7 +16,7 @@ from dash.pricing import status as price_status
 
 from .util import (_ESTIMATE_TOOL, RANGE_S, SAMPLE_KEEP_S,
                  TOKEN_FIELDS, UNASSIGNED, WS_STATUSES,
-                 _hour, _money, _opt_int, _same)
+                 _hour, _manifest_family, _money, _opt_int, _same)
 
 
 class UsageMixin:
@@ -44,7 +44,7 @@ class UsageMixin:
                 reasoning=values["reasoning"],
             )
             with self._lock:
-                if isinstance(run_id, str) and ":cursor/" in run_id:
+                if isinstance(run_id, str) and _manifest_family(run_id) is not None:
                     run_id = self._resolve_alias_locked(run_id)
                 previous = self._one(
                     """SELECT ts FROM usage_events
@@ -121,7 +121,7 @@ class UsageMixin:
             ts = float(row["ts"])
             with self._lock:
                 run_id = row.get("run_id")
-                if isinstance(run_id, str) and ":cursor/" in run_id:
+                if isinstance(run_id, str) and _manifest_family(run_id) is not None:
                     run_id = self._resolve_alias_locked(run_id)
                 self._conn.execute("BEGIN IMMEDIATE")
                 try:

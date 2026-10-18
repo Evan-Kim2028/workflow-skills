@@ -12,13 +12,14 @@ import time as _time
 
 from dash import inherit as _inherit
 from dash.attribution import attribute, clean_label
+from dash.liveness import PROCESS_GONE_GRACE_S
 
 from .running import _annotate_lanes
 
 from .util import (_ESTIMATE_TOOL, MERGE_WINDOW_S, RUN_COLS,
                  RUN_INPUT, SESSION_COLS, TOKEN_FIELDS,
                  _collapse_workflows, _drop_launch_echoes,
-                 _epoch, _in_ws, _same, _zeros,
+                 _epoch, _in_ws, _manifest_family, _same, _zeros,
                  is_prod_job_run)
 
 
@@ -69,7 +70,7 @@ class RunsMixin:
             if not run_id:
                 raise ValueError("run_id required")
             with self._lock:
-                if isinstance(run_id, str) and ":cursor/" in run_id:
+                if isinstance(run_id, str) and _manifest_family(run_id) is not None:
                     target = self._resolve_alias_locked(run_id)
                     if target != run_id and self._upsert_aliased_locked(run_id, target, row):
                         return
@@ -111,7 +112,13 @@ class RunsMixin:
                     if twin_id is not None:
                         dst = self._one("SELECT * FROM runs WHERE run_id=?", (twin_id,))
                         if dst is not None:
-                            self._fold_locked(run_id, twin_id, merged, dict(dst))
+                            family = _manifest_family(run_id)
+                            revive = (
+                                _time.time()
+                                if family in ("muse", "glm")
+                                else None
+                            )
+                            self._fold_locked(run_id, twin_id, merged, dict(dst), revive_at=revive)
                             return
                 self._write_run(merged)
                 if changed_ws:
@@ -194,8 +201,16 @@ class RunsMixin:
             for whatever the manifest re-read resurrected and later restarts
             resolve instead of re-inserting. Returns ``(models_filled, merged)``.
             """
-            merged = self.merge_grok_manifests(window_s)
-            filled = self.backfill_grok_models(now)
+            return self.repair_manifest_runs("grok", now, window_s)
+        def repair_manifest_runs(self, source: str, now: float, window_s: float = MERGE_WINDOW_S) -> tuple[int, int]:
+            """Fill NULL ``source`` models from usage and fold manifest twins.
+
+            Same repair as ``repair_grok_runs`` for one source family: the
+            muse source calls this with ``"muse"`` every poll, the GLM
+            source with ``"glm"``. Returns ``(models_filled, merged)``.
+            """
+            merged = self.merge_manifest_rows(source, window_s, now=now if source != "grok" else None)
+            filled = self.backfill_tool_models(source, now)
             return filled, merged
         def backfill_grok_models(self, now: float) -> int:
             """Fill a NULL-model grok run from its latest usage event model.
@@ -204,10 +219,17 @@ class RunsMixin:
             model at the end keeps it here too. Runs with no usage model stay
             NULL ("model not recorded"). Returns how many rows changed.
             """
+            return self.backfill_tool_models("grok", now)
+        def backfill_tool_models(self, source: str, now: float) -> int:
+            """Fill a NULL-model ``source`` run from its latest usage event model.
+
+            Same backfill as ``backfill_grok_models`` for one source family.
+            Returns how many rows changed.
+            """
             now = float(now)
             with self._lock:
                 row = self._conn.execute(
-                    "SELECT value FROM meta WHERE key='grok_models_ts'"
+                    "SELECT value FROM meta WHERE key=?", (f"{source}_models_ts",)
                 ).fetchone()
                 if row and row["value"]:
                     try:
@@ -218,7 +240,8 @@ class RunsMixin:
                 pending = [
                     dict(item)
                     for item in self._conn.execute(
-                        "SELECT run_id FROM runs WHERE source='grok' AND (model IS NULL OR model='')"
+                        "SELECT run_id FROM runs WHERE source=? AND (model IS NULL OR model='')",
+                        (source,),
                     ).fetchall()
                 ]
             filled = 0
@@ -236,9 +259,9 @@ class RunsMixin:
                 filled += 1
             with self._lock:
                 self._conn.execute(
-                    "INSERT INTO meta(key, value) VALUES('grok_models_ts', ?) "
+                    "INSERT INTO meta(key, value) VALUES(?, ?) "
                     "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                    (str(now),),
+                    (f"{source}_models_ts", str(now)),
                 )
             return filled
         def merge_grok_manifests(self, window_s: float = MERGE_WINDOW_S) -> int:
@@ -257,13 +280,30 @@ class RunsMixin:
             row. A manifest row with no twin stays. Returns how many rows
             merged.
             """
+            return self.merge_manifest_rows("grok", window_s)
+        def merge_manifest_rows(self, source: str, window_s: float = MERGE_WINDOW_S, now=None) -> int:
+            """Fold launcher manifest rows of one source into their worker row.
+
+            Same merge as ``merge_grok_manifests`` for one source family. A
+            muse ``muse-sessions.tsv`` row without a session uuid becomes
+            ``muse:<parent>:<label>@<epoch>`` while the session itself is
+            ``muse:<uuid>:<label>`` (likewise ``glm``): a manifest row whose
+            label matches a non-manifest row of the same source that started
+            within ``window_s`` is that same run and folds the same way
+            (earliest start, gap-fill, usage and samples moved, durable alias
+            in the same transaction). ``now`` enables the liveness revival
+            for muse/glm (a running manifest row with fresh process evidence
+            reopens a wrongly closed worker row); the grok path never revives,
+            exactly as before. Returns how many rows merged.
+            """
+            revive = now if source in ("muse", "glm") else None
             with self._lock:
                 manifests = [
                     row
                     for row in (
                         dict(item)
                         for item in self._conn.execute(
-                            "SELECT * FROM runs WHERE source='grok'"
+                            "SELECT * FROM runs WHERE source=?", (source,)
                         ).fetchall()
                     )
                     if _is_manifest_twin(row)
@@ -276,8 +316,8 @@ class RunsMixin:
                         for row in (
                             dict(item)
                             for item in self._conn.execute(
-                                "SELECT * FROM runs WHERE source='grok' AND label=? AND run_id != ?",
-                                (manifest.get("label"), manifest["run_id"]),
+                                "SELECT * FROM runs WHERE source=? AND label=? AND run_id != ?",
+                                (source, manifest.get("label"), manifest["run_id"]),
                             ).fetchall()
                         )
                         if not _is_manifest_twin(row)
@@ -285,7 +325,7 @@ class RunsMixin:
                 twin = _nearest_twin(manifest, twins, window_s)
                 if twin is None:
                     continue
-                if self._merge_run_into(manifest["run_id"], twin["run_id"]):
+                if self._merge_run_into(manifest["run_id"], twin["run_id"], revive_at=revive):
                     merged += 1
             return merged
         def resolve_run_id(self, run_id: str) -> str:
@@ -295,7 +335,7 @@ class RunsMixin:
             so a restart re-ingest of the same TSV row resolves to the chat row
             instead of resurrecting a deleted row. Unknown ids return unchanged.
             """
-            if not isinstance(run_id, str) or ":cursor/" not in run_id:
+            if _manifest_family(run_id) is None:
                 return run_id
             with self._lock:
                 return self._resolve_alias_locked(run_id)
@@ -314,21 +354,22 @@ class RunsMixin:
                 current = hit["target_run_id"]
             return current
         def _find_merge_target_locked(self, manifest: dict):
-            """Chat row the merge would fold ``manifest`` into, or None.
+            """Worker row the merge would fold ``manifest`` into, or None.
 
-            Same rule as ``merge_grok_manifests``: the nearest non-manifest
-            same-label grok row starting within ``MERGE_WINDOW_S``. Caller
-            holds the lock.
+            Same rule as ``merge_manifest_rows``: the nearest non-manifest
+            same-label row of the same source starting within
+            ``MERGE_WINDOW_S``. Caller holds the lock.
             """
             label = manifest.get("label")
             run_id = manifest.get("run_id")
-            if not label or not run_id:
+            source = manifest.get("source")
+            if not label or not run_id or not source:
                 return None
             twins = [
                 dict(item)
                 for item in self._conn.execute(
-                    "SELECT * FROM runs WHERE source='grok' AND label=? AND run_id != ?",
-                    (label, run_id),
+                    "SELECT * FROM runs WHERE source=? AND label=? AND run_id != ?",
+                    (source, label, run_id),
                 ).fetchall()
                 if not _is_manifest_twin(dict(item))
             ]
@@ -354,10 +395,16 @@ class RunsMixin:
                 if value is not None:
                     base[key] = value
             base["run_id"] = alias_id
-            self._fold_locked(alias_id, target_id, base, dict(dst))
+            family = _manifest_family(alias_id)
+            revive = _time.time() if family in ("muse", "glm") else None
+            self._fold_locked(alias_id, target_id, base, dict(dst), revive_at=revive)
             return True
-        def _merge_run_into(self, src_id: str, dst_id: str) -> bool:
-            """Fold manifest row ``src_id`` into chat row ``dst_id`` and delete it."""
+        def _merge_run_into(self, src_id: str, dst_id: str, revive_at=None) -> bool:
+            """Fold manifest row ``src_id`` into worker row ``dst_id`` and delete it.
+
+            ``revive_at`` (an epoch) enables the liveness revival for
+            muse/glm pairs; the grok path never revives.
+            """
             if not src_id or not dst_id or src_id == dst_id:
                 return False
             with self._lock:
@@ -365,19 +412,69 @@ class RunsMixin:
                 dst = self._one("SELECT * FROM runs WHERE run_id=?", (dst_id,))
                 if not src or not dst:
                     return False
-                self._fold_locked(src_id, dst_id, src, dst)
+                self._fold_locked(src_id, dst_id, src, dst, revive_at=revive_at)
             return True
-        def _fold_locked(self, alias_id: str, target_id: str, src: dict, dst: dict) -> None:
-            """Fold manifest data into its chat row and record the alias.
+        def _fold_revive_locked(self, alias_id: str, target_id: str, merged: dict, now: float) -> bool:
+            """True when fresh process evidence says the folded run is alive.
+
+            A manifest row the source marked ``running`` carries a liveness
+            claim: the source only emits that with fresh evidence (out growth
+            or a live label). When a process sample for either folded id —
+            or for their label, when no newer open same-label row owns it —
+            is fresher than ``PROCESS_GONE_GRACE_S``, the target's closed
+            status is stale (a quiet file closed a live worker) and the
+            merge reopens it. Caller holds the lock.
+            """
+            try:
+                now = float(now)
+            except (TypeError, ValueError):
+                return False
+            try:
+                hit = self._conn.execute(
+                    "SELECT MAX(ts) AS ts FROM process_samples WHERE run_id=? OR run_id=?",
+                    (alias_id, target_id),
+                ).fetchone()
+                if hit and hit["ts"] is not None and now - float(hit["ts"]) <= PROCESS_GONE_GRACE_S:
+                    return True
+                label = merged.get("label")
+                if not label:
+                    return False
+                hit = self._conn.execute(
+                    "SELECT MAX(ts) AS ts FROM process_samples WHERE label=?", (label,)
+                ).fetchone()
+                if hit is None or hit["ts"] is None:
+                    return False
+                if now - float(hit["ts"]) > PROCESS_GONE_GRACE_S:
+                    return False
+                twin = self.newer_open_label_row(
+                    label, merged.get("source"), merged.get("started_at"), target_id
+                )
+                return twin is None
+            except (TypeError, ValueError, AttributeError):
+                return False
+        def _fold_locked(self, alias_id: str, target_id: str, src: dict, dst: dict, revive_at=None) -> None:
+            """Fold manifest data into its worker row and record the alias.
 
             The alias row is written in the same transaction that moves the
             usage and samples and deletes the manifest row, so a restart can
             never see the row without the alias. ``src`` may be a stored row
             (merge pass) or a fresh re-ingest patch overlaid on it (restart
             re-read); when no stored row exists the usage moves are no-ops.
+            ``revive_at`` reopens a wrongly closed muse/glm worker row when
+            the folded manifest row is running with fresh process evidence;
+            without it the target status is never touched, exactly as before.
             Caller holds the lock.
             """
             merged = _fold_manifest_patch(dst, src)
+            if (
+                revive_at is not None
+                and _manifest_family(alias_id) in ("muse", "glm")
+                and src.get("status") == "running"
+                and merged.get("status") not in ("running", "queued")
+                and self._fold_revive_locked(alias_id, target_id, merged, revive_at)
+            ):
+                merged["status"] = "running"
+                merged["ended_at"] = None
             workstream, confidence = self._attribute_locked(
                 merged.get("label"),
                 merged.get("session_id"),
@@ -505,17 +602,24 @@ class RunsMixin:
 
 
 def _is_manifest_twin(row: dict) -> bool:
-    """A launcher-manifest grok row (``grok:<id>:cursor/<label>``).
+    """A launcher-manifest row.
 
-    Chat run ids are ``grok:<chat-uuid>:<label>`` and labels never produce
-    a ``:cursor/`` segment, so the marker names manifest rows exactly.
+    Cursor rows are ``grok:<id>:cursor/<label>`` (chat run ids are
+    ``grok:<chat-uuid>:<label>`` and labels never produce a ``:cursor/``
+    segment, so the marker names them exactly). Muse/glm rows without a
+    session uuid are ``<source>:<parent>:<label>@<epoch>`` of the same
+    source (worker-row labels never end in ``@<digits>``). Either marker
+    needs ``clock_source == "manifest"``.
     """
+    if row.get("clock_source") != "manifest":
+        return False
     run_id = row.get("run_id")
-    return (
-        isinstance(run_id, str)
-        and ":cursor/" in run_id
-        and row.get("clock_source") == "manifest"
-    )
+    if not isinstance(run_id, str):
+        return False
+    if ":cursor/" in run_id:
+        return True
+    family = _manifest_family(run_id)
+    return family is not None and row.get("source") == family
 
 
 def _fold_manifest_patch(target: dict, incoming: dict) -> dict:

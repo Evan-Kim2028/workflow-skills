@@ -14,7 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from dash.pricing import cost
 from dash.sources.hub import poll as hub_poll
-from dash.sources.process import label_from_args, parse_etime, parse_ps, poll as process_poll, reconcile_running
+from dash.sources.process import apply_liveness, label_from_args, parse_etime, parse_ps, poll as process_poll, reconcile_running
 from dash.store import Store
 
 HUB = "00000000-0000-0000-0000-000000000001"
@@ -2589,6 +2589,306 @@ class RunAliasTest(unittest.TestCase):
         report = self.store.reconcile_numbers(1792246400.0 + 3700, 1792246400.0, 1792246400.0 + 3700)
         dups = [item for item in report["mismatches"] if "duplicate run" in item]
         self.assertEqual(len(dups), 1)
+
+
+class MergeMuseManifestsTest(unittest.TestCase):
+    """One row per muse run: manifest rows fold into their session row.
+
+    Reproduces the live failure: the session row closed as done while the
+    worker was alive, the manifest row stayed running with the process
+    samples, and Running now showed no row for the label (unseen worker).
+    """
+
+    LABEL = "ws8-WS8.26-ops-matcher"
+    UUID = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+    SESSION = "muse:aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee:ws8-WS8.26-ops-matcher"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.store = memory(Path(self.tmp.name))
+        self.now = time.time()
+        self.epoch = int(self.now - 600)
+        self.manifest_id = "muse:None:%s@%d" % (self.LABEL, self.epoch)
+
+    def tearDown(self):
+        self.store.close()
+        self.tmp.cleanup()
+
+    def add_broken_pair(self, sample_age_s=10.0, usage_age_s=120.0):
+        """The exact failure: session done, manifest running with samples."""
+        self.store.upsert_run(
+            {
+                "run_id": self.manifest_id,
+                "source": "muse",
+                "tier": "muse",
+                "label": self.LABEL,
+                "session_id": None,
+                "status": "running",
+                "started_at": float(self.epoch),
+                "clock_source": "manifest",
+                "out_path": "/tmp/pads/muse/out-%s.md" % self.LABEL,
+            }
+        )
+        self.store.upsert_run(
+            {
+                "run_id": self.SESSION,
+                "source": "muse",
+                "tier": "muse",
+                "label": self.LABEL,
+                "session_id": self.UUID,
+                "model": "muse-spark-1.3-contributor",
+                "status": "running",
+                "started_at": float(self.epoch + 2),
+                "clock_source": "muse_log",
+            }
+        )
+        self.store.add_usage(
+            {
+                "ts": self.now - usage_age_s,
+                "session_id": self.UUID,
+                "run_id": self.manifest_id,
+                "model": "muse-spark-1.3-contributor",
+                "tool": "muse",
+                "message_id": "m-muse-merge",
+                "input": 10,
+                "output": 5,
+            }
+        )
+        self.store.add_process_sample(
+            {
+                "ts": self.now - sample_age_s,
+                "pid": 87654321,
+                "comm": "muse-bin",
+                "label": self.LABEL,
+                "run_id": self.manifest_id,
+            }
+        )
+        # The bug: a quiet session file closed the live session row.
+        self.store.upsert_run(
+            {
+                "run_id": self.SESSION,
+                "status": "done",
+                "ended_at": float(self.epoch + 100),
+                "pid": None,
+            }
+        )
+
+    def restart(self):
+        """Fresh Store on the same file, like a dashboard restart."""
+        self.store.close()
+        self.store = memory(Path(self.tmp.name))
+
+    def reingest_manifest(self, status="running"):
+        """What the restart manifest poll re-emits for the TSV row."""
+        self.store.upsert_run(
+            {
+                "run_id": self.manifest_id,
+                "source": "muse",
+                "tier": "muse",
+                "model": None,
+                "label": self.LABEL,
+                "session_id": None,
+                "status": status,
+                "started_at": float(self.epoch),
+                "clock_source": "manifest",
+                "out_bytes": 0,
+                "err_bytes": 0,
+                "out_path": "/tmp/pads/muse/out-%s.md" % self.LABEL,
+            }
+        )
+
+    def live_proc(self):
+        return {
+            "pid": 87654321,
+            "comm": "muse-bin",
+            "started_at": self.now - 600,
+            "label": self.LABEL,
+            "model": "muse-spark-1.3-contributor",
+            "prompt_label": self.LABEL,
+            "session_id": self.UUID,
+        }
+
+    def unseen(self, store, now):
+        report = store.reconcile_numbers(now, None, None, [self.live_proc()])
+        return [item for item in report["mismatches"] if "unseen worker" in item]
+
+    def duplicates(self, store, now):
+        report = store.reconcile_numbers(now, None, None, [])
+        return [item for item in report["mismatches"] if "duplicate run" in item]
+
+    def test_restart_reingest_merges_to_one_running_row(self):
+        self.add_broken_pair()
+        self.assertIsNotNone(self.store.get_run(self.manifest_id))
+        self.assertEqual(self.store.get_run(self.SESSION)["status"], "done")
+        self.restart()
+        self.reingest_manifest()
+        now = time.time()
+        self.assertIsNone(self.store.get_run(self.manifest_id))
+        merged = self.store.get_run(self.SESSION)
+        self.assertEqual(merged["status"], "running")
+        self.assertIsNone(merged["ended_at"])
+        self.assertEqual(merged["started_at"], float(self.epoch))
+        self.assertEqual(merged["out_path"], "/tmp/pads/muse/out-%s.md" % self.LABEL)
+        moved = self.store._conn.execute(
+            "SELECT DISTINCT run_id FROM process_samples"
+        ).fetchall()
+        self.assertEqual([row[0] for row in moved], [self.SESSION])
+        usage = self.store._conn.execute(
+            "SELECT run_id FROM usage_events WHERE message_id='m-muse-merge'"
+        ).fetchone()
+        self.assertEqual(usage["run_id"], self.SESSION)
+        self.assertEqual(self.store.resolve_run_id(self.manifest_id), self.SESSION)
+        alias = self.store._conn.execute(
+            "SELECT target_run_id FROM run_aliases WHERE alias_run_id=?",
+            (self.manifest_id,),
+        ).fetchone()
+        self.assertEqual(alias["target_run_id"], self.SESSION)
+        shot = self.store.snapshot(now, "all")
+        labels = [row["label"] for row in shot["running"]]
+        self.assertEqual(labels.count(self.LABEL), 1)
+        self.assertEqual(self.unseen(self.store, now), [])
+        self.assertEqual(self.duplicates(self.store, now), [])
+
+    def test_second_restart_never_resurrects_the_manifest_row(self):
+        self.add_broken_pair()
+        self.restart()
+        self.reingest_manifest()
+        first = self.store.get_run(self.SESSION)
+        self.assertEqual(first["status"], "running")
+        self.restart()
+        self.reingest_manifest()
+        now = time.time()
+        self.assertIsNone(self.store.get_run(self.manifest_id))
+        self.assertEqual(self.store.get_run(self.SESSION)["status"], "running")
+        self.assertEqual(self.store.merge_manifest_rows("muse", now=now), 0)
+        shot = self.store.snapshot(now, "all")
+        labels = [row["label"] for row in shot["running"]]
+        self.assertEqual(labels.count(self.LABEL), 1)
+        self.assertEqual(self.unseen(self.store, now), [])
+
+    def test_stale_evidence_never_reopens_a_dead_row(self):
+        self.add_broken_pair(sample_age_s=3600.0, usage_age_s=3600.0)
+        self.restart()
+        self.reingest_manifest()
+        now = time.time()
+        self.assertIsNone(self.store.get_run(self.manifest_id))
+        self.assertEqual(self.store.get_run(self.SESSION)["status"], "done")
+        self.assertEqual(self.duplicates(self.store, now), [])
+
+    def test_glm_manifest_rows_merge_into_their_session_row(self):
+        label = "ws8-glm-check"
+        session = "glm:bbbbbbbb-cccc-4ddd-8eee-ffffffffffff:%s" % label
+        manifest = "glm:None:%s@%d" % (label, self.epoch)
+        self.store.upsert_run(
+            {
+                "run_id": manifest,
+                "source": "glm",
+                "tier": "glm",
+                "label": label,
+                "status": "running",
+                "started_at": float(self.epoch),
+                "clock_source": "manifest",
+            }
+        )
+        self.store.upsert_run(
+            {
+                "run_id": session,
+                "source": "glm",
+                "tier": "glm",
+                "label": label,
+                "session_id": "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff",
+                "status": "running",
+                "started_at": float(self.epoch + 2),
+                "clock_source": "manifest",
+            }
+        )
+        self.assertEqual(self.store.merge_manifest_rows("glm", now=time.time()), 1)
+        self.assertIsNone(self.store.get_run(manifest))
+        self.assertIsNotNone(self.store.get_run(session))
+        self.assertEqual(self.store.resolve_run_id(manifest), session)
+        report = self.store.reconcile_numbers(time.time(), None, None, [])
+        dups = [item for item in report["mismatches"] if "duplicate run" in item]
+        self.assertEqual(dups, [])
+
+    def test_genuine_muse_twin_still_mismatches(self):
+        self.store.upsert_run(
+            {
+                "run_id": self.manifest_id,
+                "source": "muse",
+                "tier": "muse",
+                "label": self.LABEL,
+                "status": "done",
+                "started_at": float(self.epoch),
+                "ended_at": float(self.epoch + 5000),
+                "clock_source": "manifest",
+            }
+        )
+        self.store.upsert_run(
+            {
+                "run_id": self.SESSION,
+                "source": "muse",
+                "tier": "muse",
+                "label": self.LABEL,
+                "session_id": self.UUID,
+                "status": "done",
+                "started_at": float(self.epoch + 3600),
+                "ended_at": float(self.epoch + 3700),
+                "clock_source": "muse_log",
+            }
+        )
+        self.assertEqual(self.store.merge_manifest_rows("muse", now=time.time()), 0)
+        dups = self.duplicates(self.store, time.time())
+        self.assertEqual(len(dups), 1)
+
+    def test_quiet_poll_keeps_a_sampled_row_running(self):
+        self.store.upsert_run(
+            {
+                "run_id": self.SESSION,
+                "source": "muse",
+                "tier": "muse",
+                "label": self.LABEL,
+                "session_id": self.UUID,
+                "status": "running",
+                "started_at": float(self.epoch),
+            }
+        )
+        self.store.add_process_sample(
+            {
+                "ts": time.time() - 5,
+                "pid": 87654321,
+                "comm": "muse-bin",
+                "label": self.LABEL,
+                "run_id": self.SESSION,
+            }
+        )
+        run = {"run_id": self.SESSION}
+        apply_liveness(self.store, run, "muse", [])
+        self.assertEqual(run.get("status"), "running")
+        self.assertIsNone(run.get("ended_at"))
+
+    def test_reconcile_keeps_a_sampled_row_running(self):
+        self.store.upsert_run(
+            {
+                "run_id": self.SESSION,
+                "source": "muse",
+                "tier": "muse",
+                "label": self.LABEL,
+                "session_id": self.UUID,
+                "status": "running",
+                "started_at": float(self.epoch),
+            }
+        )
+        self.store.add_process_sample(
+            {
+                "ts": time.time() - 5,
+                "pid": 87654321,
+                "comm": "muse-bin",
+                "label": self.LABEL,
+                "run_id": self.SESSION,
+            }
+        )
+        self.assertEqual(reconcile_running(self.store, time.time(), []), 0)
+        self.assertEqual(self.store.get_run(self.SESSION)["status"], "running")
 
 
 class MatchRunNewestTest(unittest.TestCase):

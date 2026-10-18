@@ -114,7 +114,7 @@ def _poll(store, cfg, now):
             _drain_files(
                 store, cold, "muse:rotate", budget, per_file, now, processes, manifests
             )
-    _repair(store)
+    _repair(store, now)
 
 
 def _candidate_files(store, root, manifests, now, fresh_hours, scan_s):
@@ -204,7 +204,7 @@ def _drain_files(store, files, key, budget, per_file, now, processes, manifests)
     return budget
 
 
-def _repair(store):
+def _repair(store, now):
     for name, where in (("repair_muse_orphans", "orphan"), ("repair_muse_clocks", "clock")):
         fn = getattr(store, name, None)
         if not callable(fn):
@@ -213,6 +213,12 @@ def _repair(store):
             fn()
         except Exception:
             _fail(where)
+    merge = getattr(store, "merge_manifest_rows", None)
+    if callable(merge):
+        try:
+            merge("muse", now=now)
+        except Exception:
+            _fail("merge")
 
 
 def _tail_file(store, path, sid, manifests, muse_parent, budget, per_file, now, processes):

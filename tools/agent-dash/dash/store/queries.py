@@ -44,6 +44,39 @@ class QueriesMixin:
                     (session_id,),
                 ).fetchall()
             return [dict(row) for row in rows]
+        def last_sample_ts(self, run_id: str, pid=None, label=None):
+            """Latest process-sample time for a run id, pid, or label.
+
+            Scopes to the run id first; the pid leg also requires the
+            label so a reused pid from another worker cannot vouch for
+            this run. Unknown stores lack this method and keep the old
+            close behavior. Returns an epoch float or None.
+            """
+            if pid is not None:
+                try:
+                    pid = int(pid)
+                except (TypeError, ValueError):
+                    pid = None
+            with self._lock:
+                hit = self._conn.execute(
+                    "SELECT MAX(ts) AS ts FROM process_samples WHERE run_id=?", (run_id,)
+                ).fetchone()
+                if hit and hit["ts"] is not None:
+                    return float(hit["ts"])
+                if pid is None:
+                    return None
+                if label:
+                    hit = self._conn.execute(
+                        "SELECT MAX(ts) AS ts FROM process_samples WHERE pid=? AND label=?",
+                        (pid, label),
+                    ).fetchone()
+                else:
+                    hit = self._conn.execute(
+                        "SELECT MAX(ts) AS ts FROM process_samples WHERE pid=?", (pid,)
+                    ).fetchone()
+            if hit and hit["ts"] is not None:
+                return float(hit["ts"])
+            return None
         def last_activity(self, run_id: str, started_at=None):
             """Latest evidence for a run: usage event, process sample, or start.
 

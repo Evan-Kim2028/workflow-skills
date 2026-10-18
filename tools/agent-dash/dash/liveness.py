@@ -29,6 +29,13 @@ DAGSTER_ACTIVE_FRESH_S = 300
 # plus the idle bound above.
 PID_SOURCES = ("claude-main", "muse", "grok", "glm", "shell")
 
+# A run whose process vanished is closed only after the process has been
+# gone this long: a quiet session file never closes a muse/glm/grok run
+# with a live pid or a process sample fresher than this. Thirty seconds
+# covers a missed process listing or two (5 s cadence) without hiding a
+# real death: the next polls then emit done and the close lands.
+PROCESS_GONE_GRACE_S = 30.0
+
 # Poll cadence per source (seconds). The stale check ignores a dead-pid row
 # whose last evidence is within two poll intervals of its source: the source
 # closes the row on its next poll, so flagging it in between is noise. For

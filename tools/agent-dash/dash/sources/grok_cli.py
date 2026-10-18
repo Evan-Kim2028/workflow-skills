@@ -100,6 +100,8 @@ def _poll(store, cfg, now):
     if os.path.isfile(log_path) and budget > 0 and manifests:
         _tail_log(store, log_path, manifests, authoritative, budget, per_file, now, processes)
 
+    _repair(store, now)
+
 
 def _apply_usage(store, path, row, budget, per_file, now, processes):
     """Return ``(authoritative, budget)``. Unchanged files are not re-emitted."""
@@ -664,6 +666,20 @@ def _is_uuid(value):
         return False
     hexdigits = "0123456789abcdefABCDEF"
     return all(c in hexdigits for part in parts for c in part)
+
+
+def _repair(store, now):
+    """Fold GLM launcher rows into their session row.
+
+    Unknown stores keep the old behavior.
+    """
+    repair = getattr(store, "merge_manifest_rows", None)
+    if not callable(repair):
+        return
+    try:
+        repair("glm", now=now)
+    except Exception:
+        _fail("glm-repair")
 
 
 def _fail(where):
