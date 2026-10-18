@@ -109,7 +109,8 @@ class WatchdogTests(unittest.TestCase):
         entry = body["sources"][0]
         self.assertEqual(
             set(entry),
-            {"name", "last_poll", "last_error", "lag_s", "last_duration_s", "interval_s", "stalled"},
+            {"name", "last_poll", "last_error", "lag_s", "last_duration_s", "interval_s", "stalled",
+             "state", "started_at"},
         )
         self.assertTrue(entry["stalled"])
         self.assertIsNotNone(entry["last_duration_s"])
@@ -149,6 +150,107 @@ class WatchdogTests(unittest.TestCase):
         self.assertFalse(body["ok"])
         self.assertEqual(body["sources"][0]["last_error"], "RuntimeError: boom")
         self.assertEqual(body["sources"][0]["lag_s"], 2)
+
+
+class RestartGraceTests(unittest.TestCase):
+    """The first poll cycle after a restart is "starting", never stalled."""
+
+    class _FirstScanSlow:
+        NAME = "first-scan-slow"
+        INTERVAL_S = 2
+
+        def __init__(self):
+            import threading
+
+            self.entered = threading.Event()
+            self.release = threading.Event()
+
+        def poll(self, store, cfg, now):
+            self.entered.set()
+            self.release.wait(30)
+
+    def test_slow_first_scan_is_starting_not_stalled(self):
+        import threading
+
+        store = MemStore()
+        source = self._FirstScanSlow()
+        registry = Registry([source])
+        born = registry._born
+        worker = threading.Thread(
+            target=registry.tick, args=(store, {}, born + 1), kwargs={"force": True}, daemon=True
+        )
+        worker.start()
+        try:
+            self.assertTrue(source.entered.wait(10))
+            # The first scan takes longer than the 2 s interval; the source
+            # has never completed a poll, so it is starting, not stalled.
+            body = registry.health(born + 5)
+            self.assertTrue(body["ok"])
+            entry = body["sources"][0]
+            self.assertEqual(entry["state"], "starting")
+            self.assertFalse(entry["stalled"])
+            self.assertEqual(entry["started_at"], born)
+            self.assertEqual(body["slow_sources"], 0)
+            self.assertEqual(registry.stalled_messages(born + 5), [])
+        finally:
+            source.release.set()
+            worker.join(10)
+        self.assertFalse(worker.is_alive())
+        body = registry.health(born + 3)
+        self.assertTrue(body["ok"])
+        self.assertEqual(body["sources"][0]["state"], "ok")
+
+    def test_never_polled_source_leaves_grace(self):
+        registry = Registry([_Fast()])
+        registry._born = NOW
+        body = registry.health(NOW + 10)
+        self.assertTrue(body["ok"])
+        self.assertEqual(body["sources"][0]["state"], "starting")
+        self.assertEqual(registry.stalled_messages(NOW + 10), [])
+        # Grace is max(3x interval, 90 s): 90 s here.
+        body = registry.health(NOW + 91)
+        self.assertFalse(body["ok"])
+        self.assertEqual(body["sources"][0]["state"], "stalled")
+        self.assertEqual(len(registry.stalled_messages(NOW + 91)), 1)
+
+    def test_long_interval_grace_is_three_intervals(self):
+        class _Hourly:
+            NAME = "hourly"
+            INTERVAL_S = 60
+
+        registry = Registry([_Hourly()])
+        registry._born = NOW
+        body = registry.health(NOW + 100)
+        self.assertEqual(body["sources"][0]["state"], "starting")
+        body = registry.health(NOW + 181)
+        self.assertEqual(body["sources"][0]["state"], "stalled")
+
+    def test_first_poll_error_is_error_not_starting(self):
+        class _Bad:
+            NAME = "bad"
+            INTERVAL_S = 1
+
+            def poll(self, store, cfg, now):
+                raise RuntimeError("boom")
+
+        store = MemStore()
+        registry = Registry([_Bad()])
+        born = registry._born
+        registry.tick(store, {}, born + 1, force=True)
+        body = registry.health(born + 2)
+        self.assertFalse(body["ok"])
+        self.assertEqual(body["sources"][0]["state"], "error")
+
+    def test_slow_returning_poll_is_slow_but_ok(self):
+        store = MemStore()
+        fast = _Fast()
+        registry = Registry([fast])
+        registry.tick(store, {}, NOW, force=True)
+        registry.state["fast"]["last_duration_s"] = 16.0
+        body = registry.health(NOW + 1)
+        self.assertTrue(body["ok"])
+        self.assertEqual(body["sources"][0]["state"], "slow")
+        self.assertEqual(body["slow_sources"], 1)
 
 
 def _count_fresh_listings():

@@ -54,6 +54,7 @@ store.set_ws_counts(list)     # rows: ws, name, backlog, todo, doing, review, do
 ```
 
 `cfg` is the merged config (roots, intervals, read budgets: 4 MB per file, 8 MB per tick; poll budget `poll_budget_s`, default 25 s). There is no concurrency cap.
+A source may also expose `health_extra() -> dict`, merged into `/api/health` under its own name (Dagster reports `skipped_closeouts` this way).
 Sources must be incremental (byte offsets), budget-bounded, and exception-safe (log, never crash the loop). Directory listings are cached by (inode, mtime) with a per-pass cap on fresh listings, so repeat polls over a quiet tree cost stats, not walks. Dead offset rows (absolute paths that no longer exist) are pruned a batch per reconcile tick with one VACUUM per pass; only the newest 3 `*.bak-*` stay in the state dir.
 
 Enums. `source`: claude-main, claude-subagent, claude-workflow, muse, glm, grok (cursor-agent), shell, generic.
@@ -186,7 +187,8 @@ variant. Clip playback compresses idle stretches by cumulative event count
 blended with real time; plain replay stays on real time with an optional
 "Compress idle" toggle.
 
-`GET /api/health` -> `{"ok": true, "sources": [{name, last_poll, last_error, lag_s, last_duration_s, interval_s, stalled}], "pricing": {...}, "disconnects_1h": 0, "unpriced_models": [{"model", "rows", "tokens"}], "scratch_roots": [...], "run_dirs": [...], "warnings": [...]}`.
+`GET /api/health` -> `{"ok": true, "sources": [{name, last_poll, last_error, lag_s, last_duration_s, interval_s, stalled, state, started_at}], "slow_sources": 0, "dagster": {"skipped_closeouts": 0}, "pricing": {...}, "disconnects_1h": 0, "unpriced_models": [{"model", "rows", "tokens"}], "scratch_roots": [...], "run_dirs": [...], "warnings": [...]}`.
+Each source carries `state`: `starting`, `ok`, `slow`, `stalled`, or `error`, plus `started_at` (the collector process start). A source that never completed a poll — and recorded no failure — is `starting`, not stalled, until max(3x its interval, 90 s) after process start; `ok` stays true while starting, and neither reconcile nor doctor reports a starting source as stalled. Positive failure evidence (an error or a poll-budget overrun) still reports `error` immediately, even on the first poll. A poll that returned but took longer than 15 s is `slow` (counted in `slow_sources`, still ok). `dagster.skipped_closeouts` counts polls that saw a full active page and skipped the close-out pass.
 `ok` is false when any model with usage rows in the last 24 h has no
 catalog rate; those models are listed in `unpriced_models` (absent when
 empty) and each is also an `unpriced model: <id> (<tokens> tokens in 24 h)`
@@ -209,7 +211,7 @@ in the last hour; they are counted, never traceback-logged.
    "first_seen": 0, "last_seen": 0, "count": 1, "regressed": false}],
  "resolved_24h": [{"id": "", "code": "", "title": "", "resolved_at": 0}]}
 ```
-`?ws=<ID>` keeps that workstream's problems plus global ones; `?severity=critical|warn|info` is the minimum level shown. A problem absent from a run resolves (`resolved_at` set, kept 14 days); one that reappears after resolution is `regressed`. Critical means the numbers are wrong or the dashboard is blind: source stalled, unseen workers, dashboard down, unpriced model with tokens, reconcile mismatch. Warn is workflow hygiene: stuck task, policy breach, orphan process, stale approval, invalid bundle, and friends. Info is advisory: dirty checkout, run folder outside roots. Every code has a page under `docs/problems/<code>.md`.
+`?ws=<ID>` keeps that workstream's problems plus global ones; `?severity=critical|warn|info` is the minimum level shown. A problem absent from a run resolves (`resolved_at` set, kept 14 days); one that reappears after resolution is `regressed`. Critical means the numbers are wrong or the dashboard is blind: source stalled, unseen workers, dashboard down, unpriced model with tokens, reconcile mismatch. Warn is workflow hygiene: stuck task, policy breach, orphan process, stale approval, invalid bundle, a slow-but-returning source poll (`source-slow`), skipped Dagster close-outs (`dagster-closeout-skipped`), and friends. Info is advisory: dirty checkout, run folder outside roots. Every code has a page under `docs/problems/<code>.md`.
 
 `GET /api/state` -> the whole dashboard in one call, computed in one
 store pass (`Store.state_view`):

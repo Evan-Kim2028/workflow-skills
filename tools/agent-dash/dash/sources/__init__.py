@@ -30,6 +30,14 @@ log = logging.getLogger("agent_dash.sources")
 
 POLL_BUDGET_S = 25.0
 STALL_FACTOR = 3.0
+# A source that has never completed a poll is "starting", not stalled,
+# until this long after process start (per-source grace is the max of
+# this floor and 3x its interval). The first scan can take tens of
+# seconds while the interval is only a few.
+START_GRACE_S = 90.0
+# A poll that returned but took longer than this is "slow": surfaced in
+# health and doctor, but still ok (unlike an over-budget timeout).
+SLOW_AFTER_S = 15.0
 
 
 def _budget(cfg) -> float:
@@ -147,16 +155,21 @@ class Registry:
 
     def health(self, now: float, cfg=None, processes="auto") -> dict:
         sources = []
+        extra_body: dict = {}
         ok = True
+        slow = 0
         with self._lock:
             items = [(source, dict(self.state.get(source.NAME) or {})) for source in self.sources]
             born = self._born
         for source, state in items:
             error = state.get("last_error")
             last = state.get("last_poll")
-            stalled = _is_stalled(source, state, now, born)
-            if error or stalled or state.get("timed_out"):
+            name = source_state(source, state, now, born)
+            stalled = name == "stalled"
+            if name in ("error", "stalled"):
                 ok = False
+            if name == "slow":
+                slow += 1
             sources.append(
                 {
                     "name": source.NAME,
@@ -166,9 +179,20 @@ class Registry:
                     "last_duration_s": state.get("last_duration_s"),
                     "interval_s": source.INTERVAL_S,
                     "stalled": stalled,
+                    "state": name,
+                    "started_at": born,
                 }
             )
-        body: dict = {"ok": ok, "sources": sources}
+            extra = getattr(source, "health_extra", None)
+            if callable(extra):
+                try:
+                    info = extra()
+                except Exception:
+                    info = None
+                if isinstance(info, dict) and info:
+                    extra_body.setdefault(source.NAME, {}).update(info)
+        body: dict = {"ok": ok, "sources": sources, "slow_sources": slow}
+        body.update(extra_body)
         if cfg is not None:
             try:
                 from dash.rundirs import describe_roots
@@ -210,11 +234,50 @@ def _run_poll(registry: Registry, source, store, cfg, now: float, budget: float)
                 log.warning("source %s: %s", source.NAME, state["last_error"])
 
 
+def has_completed_poll(state: dict) -> bool:
+    """One shared definition of "this source finished a poll at least once".
+
+    The registry health path (``starting`` vs ``stalled``) and the
+    doctor scheduler (first-run wait) both use this, so they agree.
+    """
+    return state.get("last_poll") is not None
+
+
+def start_grace_s(source) -> float:
+    """Grace after process start before a never-polled source may stall."""
+    return max(STALL_FACTOR * float(getattr(source, "INTERVAL_S", 0) or 0), START_GRACE_S)
+
+
+def source_state(source, state: dict, now: float, born: float) -> str:
+    """One of ``starting``, ``error``, ``stalled``, ``slow``, ``ok``.
+
+    A source that never completed a poll — and has no failure recorded —
+    is ``starting`` (not stalled) inside its grace window. Positive
+    failure evidence (an error or a budget overrun) still reports
+    ``error`` immediately, even on the first poll. A poll that returned
+    but took longer than ``SLOW_AFTER_S`` is ``slow``: surfaced, but
+    still ok.
+    """
+    if state.get("last_error") or state.get("timed_out"):
+        return "error"
+    if not has_completed_poll(state) and now - born <= start_grace_s(source):
+        return "starting"
+    if _is_stalled(source, state, now, born):
+        return "stalled"
+    try:
+        duration = float(state.get("last_duration_s") or 0)
+    except (TypeError, ValueError):
+        duration = 0.0
+    if duration > SLOW_AFTER_S:
+        return "slow"
+    return "ok"
+
+
 def _is_stalled(source, state: dict, now: float, born: float) -> bool:
     limit = STALL_FACTOR * float(getattr(source, "INTERVAL_S", 0) or 0)
     last = state.get("last_poll")
     if last is None:
-        return now - born > limit
+        return now - born > max(limit, START_GRACE_S)
     return now - last > limit
 
 

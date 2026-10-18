@@ -53,12 +53,14 @@ class DagsterTests(unittest.TestCase):
         self._ssh = dagster._ssh
         dagster._ssh = self._blocked
         dagster.last_error = None
+        dagster.skipped_closeouts = 0
         self.tmp = tempfile.TemporaryDirectory()
         self.store = Store(Path(self.tmp.name) / "dash.sqlite")
 
     def tearDown(self):
         dagster._ssh = self._ssh
         dagster.last_error = None
+        dagster.skipped_closeouts = 0
         self.store.close()
         self.tmp.cleanup()
 
@@ -452,6 +454,68 @@ class DagsterTests(unittest.TestCase):
         dagster.poll(self.store, CFG, NOW)
         kept = self.store.get_run("dagster:" + gone_id)
         self.assertEqual(kept["status"], "running")
+
+    def test_full_page_counts_skipped_closeouts_in_health(self):
+        active = [
+            _run("%08x-0000-4000-8000-%012x" % (i, i), "test_job_bulk", "STARTED")
+            for i in range(200)
+        ]
+        self._feed(active, [])
+        self.assertEqual(dagster.skipped_closeouts, 1)
+        body = Registry([dagster]).health(NOW)
+        self.assertEqual(body["dagster"], {"skipped_closeouts": 1})
+        self.assertTrue(body["ok"])
+        self._feed(active, [])
+        self.assertEqual(dagster.skipped_closeouts, 2)
+        body = Registry([dagster]).health(NOW)
+        self.assertEqual(body["dagster"], {"skipped_closeouts": 2})
+
+    def test_slow_poll_is_slow_not_error(self):
+        import time as time_mod
+        from unittest import mock
+
+        from dash.doctor import collect_problems
+
+        real = time_mod.monotonic
+        calls = {"n": 0}
+
+        def fake_clock():
+            calls["n"] += 1
+            if calls["n"] <= 2:
+                return 1000.0 + (16.0 if calls["n"] == 2 else 0.0)
+            return real()
+
+        self._feed([], [])
+        with mock.patch("dash.sources.time.monotonic", side_effect=fake_clock):
+            registry = Registry([dagster])
+            registry.tick(self.store, CFG, NOW, force=True)
+            body = registry.health(NOW)
+        entry = body["sources"][0]
+        self.assertGreater(entry["last_duration_s"], 15.0)
+        self.assertEqual(entry["state"], "slow")
+        self.assertFalse(entry["stalled"])
+        self.assertIsNone(entry["last_error"])
+        self.assertTrue(body["ok"])
+        self.assertEqual(body["slow_sources"], 1)
+        result = collect_problems(None, {}, NOW, health=body)
+        slow = [item for item in result["problems"] if item["code"] == "source-slow"]
+        self.assertEqual(len(slow), 1)
+        self.assertEqual(slow[0]["severity"], "warn")
+        self.assertIn("dagster", slow[0]["detail"])
+
+    def test_skipped_closeouts_raise_doctor_warn(self):
+        from dash.doctor import collect_problems
+
+        active = [
+            _run("%08x-0000-4000-8000-%012x" % (i, i), "test_job_bulk", "STARTED")
+            for i in range(200)
+        ]
+        self._feed(active, [])
+        body = Registry([dagster]).health(NOW)
+        result = collect_problems(None, {}, NOW, health=body)
+        skipped = [item for item in result["problems"] if item["code"] == "dagster-closeout-skipped"]
+        self.assertEqual(len(skipped), 1)
+        self.assertEqual(skipped[0]["severity"], "warn")
 
     def test_unknown_run_closes_as_finished_unknown(self):
         gone_id = "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee"

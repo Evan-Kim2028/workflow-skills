@@ -448,6 +448,51 @@ class WorkstreamHygieneTest(unittest.TestCase):
     def _codes(self, result):
         return [(item["code"], item["id"], item["scope"], item["ws"]) for item in result["problems"]]
 
+    def test_starting_source_emits_no_stalled_problem(self):
+        self.health = {
+            "ok": True,
+            "sources": [
+                {"name": "muse", "last_poll": None, "last_error": None, "lag_s": None,
+                 "stalled": False, "state": "starting", "started_at": self.now - 5,
+                 "interval_s": 2},
+            ],
+        }
+        result = self._collect()
+        codes = [item["code"] for item in result["problems"]]
+        self.assertNotIn("source-stalled", codes)
+        sources = next(item for item in result["checks"] if item["name"] == "sources")
+        self.assertTrue(sources["ok"])
+
+    def test_slow_source_is_a_warn_problem(self):
+        self.health = {
+            "ok": True,
+            "sources": [
+                {"name": "dagster", "last_poll": self.now - 1, "last_error": None, "lag_s": 1.0,
+                 "stalled": False, "state": "slow", "started_at": self.now - 900,
+                 "interval_s": 60, "last_duration_s": 16.2},
+            ],
+            "slow_sources": 1,
+        }
+        result = self._collect()
+        slow = [item for item in result["problems"] if item["code"] == "source-slow"]
+        self.assertEqual(len(slow), 1)
+        self.assertEqual(slow[0]["severity"], "warn")
+        self.assertIn("16.2", slow[0]["detail"])
+        slow_check = next(item for item in result["checks"] if item["name"] == "slow-sources")
+        self.assertFalse(slow_check["ok"])
+
+    def test_dagster_closeout_skip_is_a_warn_problem(self):
+        self.health = {
+            "ok": True,
+            "sources": [],
+            "dagster": {"skipped_closeouts": 2},
+        }
+        result = self._collect()
+        skipped = [item for item in result["problems"] if item["code"] == "dagster-closeout-skipped"]
+        self.assertEqual(len(skipped), 1)
+        self.assertEqual(skipped[0]["severity"], "warn")
+        self.assertIn("2", skipped[0]["detail"])
+
     def test_stuck_task_and_live_agent_clears_it(self):
         self._bundle(tasks=[
             {"id": "WS9.1", "title": "Do the thing", "status": "wip", "deps": []},
@@ -877,6 +922,27 @@ class SchedulerTest(unittest.TestCase):
             [item["id"] for item in payload["problems"]],
         )
         self.assertEqual(served["next_run_at"], 1_700_000_000.0 + 300.0)
+
+    def test_full_poll_done_matches_starting_definition(self):
+        from dash.doctor import DoctorScheduler
+        from dash.sources import source_state
+
+        class FakeSource:
+            NAME = "muse"
+            INTERVAL_S = 2
+
+        class FakeRegistry:
+            def __init__(self):
+                self.state = {"muse": {"last_poll": None}}
+
+        sched = DoctorScheduler(self.store, FakeRegistry(), _cfg(state_dir=self.tmp.name))
+        born = time.time()
+        self.assertFalse(sched._full_poll_done())
+        self.assertEqual(
+            source_state(FakeSource(), {"last_poll": None}, born + 1, born), "starting"
+        )
+        sched.registry.state["muse"]["last_poll"] = born + 1
+        self.assertTrue(sched._full_poll_done())
 
     def test_background_thread_runs_after_first_delay(self):
         import dash.doctor as doctor_mod

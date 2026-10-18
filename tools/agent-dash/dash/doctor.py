@@ -240,7 +240,11 @@ def _collect_dashboard(ctx) -> None:
         return
     sources = health.get("sources") or []
     bad = [s.get("name") for s in sources if s.get("last_error")]
-    stalled = [s.get("name") for s in sources if not s.get("last_error") and s.get("stalled")]
+    stalled = [
+        s.get("name")
+        for s in sources
+        if not s.get("last_error") and s.get("stalled") and s.get("state") != "starting"
+    ]
     if health.get("ok") and not bad and not stalled:
         _check(ctx, "dashboard", True, f"up at {ctx.url}, {len(sources)} sources healthy")
     else:
@@ -275,9 +279,12 @@ def _collect_dashboard(ctx) -> None:
                 "python3 agent_dash.py status",
                 key=str(name),
             )
-        elif source.get("stalled") or (
-            not source.get("last_error")
-            and (source.get("last_poll") is None or (source.get("lag_s") or 0) > SOURCE_STALE_S)
+        elif source.get("state") != "starting" and (
+            source.get("stalled")
+            or (
+                not source.get("last_error")
+                and (source.get("last_poll") is None or (source.get("lag_s") or 0) > SOURCE_STALE_S)
+            )
         ):
             _add(
                 ctx, "source-stalled", "critical", "global", None,
@@ -289,14 +296,65 @@ def _collect_dashboard(ctx) -> None:
     stale = [
         str(s.get("name"))
         for s in sources
-        if not s.get("last_error")
+        if s.get("state") != "starting"
+        and not s.get("last_error")
         and (s.get("last_poll") is None or (s.get("lag_s") or 0) > SOURCE_STALE_S)
     ]
     if not stale:
         _check(ctx, "sources", True, f"{len(sources)} sources polled recently, no errors")
     else:
         _check(ctx, "sources", False, f"stale: {', '.join(stale)}")
+    _check_slow_sources(ctx, sources)
+    _check_dagster_closeouts(ctx, health)
     _check_health_roots(ctx)
+
+
+def _check_slow_sources(ctx, sources: list) -> None:
+    """Warn on polls that returned but took longer than SLOW_AFTER_S."""
+    from dash.sources import SLOW_AFTER_S
+
+    slow = []
+    for source in sources or []:
+        if source.get("last_error") or source.get("state") == "starting":
+            continue
+        try:
+            duration = float(source.get("last_duration_s") or 0)
+        except (TypeError, ValueError):
+            continue
+        if source.get("state") == "slow" or duration > SLOW_AFTER_S:
+            slow.append((source.get("name"), duration))
+    if not slow:
+        _check(ctx, "slow-sources", True, "no source poll over the slow threshold")
+        return
+    _check(ctx, "slow-sources", False, f"slow: {', '.join(str(name) for name, _ in slow)}")
+    for name, duration in slow:
+        _add(
+            ctx, "source-slow", "warn", "global", None,
+            f"Source {name} is slow",
+            f"source {name!r} last poll took {duration:.1f}s (over {SLOW_AFTER_S:g}s) but returned",
+            "python3 agent_dash.py status",
+            key=str(name),
+        )
+
+
+def _check_dagster_closeouts(ctx, health: dict) -> None:
+    """Warn when full active pages skipped Dagster close-outs."""
+    dag = (health or {}).get("dagster") or {}
+    try:
+        skipped = int(dag.get("skipped_closeouts") or 0)
+    except (TypeError, ValueError):
+        skipped = 0
+    if not skipped:
+        _check(ctx, "dagster-closeouts", True, "no skipped close-outs")
+        return
+    _check(ctx, "dagster-closeouts", False, f"{skipped} skipped close-out(s)")
+    _add(
+        ctx, "dagster-closeout-skipped", "warn", "global", None,
+        "Dagster close-outs were skipped",
+        f"{skipped} close-out(s) skipped: the active set hit the page limit, so finished runs may still show running",
+        "python3 agent_dash.py status",
+        key="closeouts",
+    )
 
 
 def _check_health_roots(ctx) -> None:
@@ -1535,12 +1593,16 @@ class DoctorScheduler:
         return payload
 
     def _full_poll_done(self) -> bool:
+        # Same definition as the registry "starting" state: no source may
+        # still be waiting for its first completed poll.
+        from dash.sources import has_completed_poll
+
         try:
             state = getattr(self.registry, "state", None) or {}
         except Exception:
             return True
         return all(
-            isinstance(info, dict) and info.get("last_poll") is not None
+            isinstance(info, dict) and has_completed_poll(info)
             for info in state.values()
         )
 

@@ -86,6 +86,14 @@ query DagsterRunsById($ids: [String!]) {
 
 log = logging.getLogger("agent_dash.dagster")
 last_error = None
+# Close-outs skipped because the active page was full (ACTIVE_LIMIT).
+# Surfaced on /api/health as ``dagster.skipped_closeouts``.
+skipped_closeouts = 0
+
+
+def health_extra() -> dict:
+    """Extra health payload merged by the registry under ``dagster``."""
+    return {"skipped_closeouts": skipped_closeouts}
 
 
 def poll(store, cfg, now: float) -> None:
@@ -137,7 +145,7 @@ def select_tags(tags) -> dict:
 
 
 def _poll(store, cfg: dict, now: float) -> None:
-    global last_error
+    global last_error, skipped_closeouts
     settings = _settings(cfg)
     if settings is None:
         last_error = None
@@ -170,6 +178,7 @@ def _poll(store, cfg: dict, now: float) -> None:
     _remember_active(store, active_ids, now, full_page)
     last_error = None
     if full_page:
+        skipped_closeouts += 1
         log.warning("dagster: active page full (%d); skipping close-out", len(active_raw))
         return
     _close_absent(store, host, url, active_ids, now)
