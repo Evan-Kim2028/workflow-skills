@@ -159,7 +159,9 @@
   }
 
   /* Toast with an Undo button on the shared #toast node, kept 10 s.
-     Same node and timing as the archive toast. */
+     Same node and timing as the archive toast. Expiry detaches the
+     button with its handler: an opacity-hidden Undo must never stay
+     keyboard-reachable or re-fire its action after the window closes. */
   function toastUndo(msg, onUndo) {
     var t = document.getElementById("toast");
     if (!t) {
@@ -182,7 +184,10 @@
     t.appendChild(u);
     t.classList.add("show");
     t.classList.add("has-action");
-    toastUndo._h = setTimeout(function () { t.classList.remove("show"); t.classList.remove("has-action"); }, 10000);
+    toastUndo._h = setTimeout(function () {
+      t.classList.remove("show"); t.classList.remove("has-action");
+      if (u.parentNode === t) t.removeChild(u);
+    }, 10000);
   }
 
   function failToast(verb, err, label) {

@@ -47,7 +47,9 @@
     }).catch(function () {});
   }
   /* Toast with an Undo button on the shared #toast node, kept 10 s.
-     Undo POSTs restore for the same workstream. */
+     Undo POSTs restore for the same workstream. Expiry detaches the
+     button with its handler: an opacity-hidden Undo must never stay
+     keyboard-reachable or re-fire its action after the window closes. */
   function actionToast(msg, onUndo) {
     var t = document.getElementById("toast");
     if (!t) {
@@ -70,7 +72,10 @@
     t.appendChild(u);
     t.classList.add("show");
     t.classList.add("has-action");
-    actionToast._h = setTimeout(function () { t.classList.remove("show"); t.classList.remove("has-action"); }, 10000);
+    actionToast._h = setTimeout(function () {
+      t.classList.remove("show"); t.classList.remove("has-action");
+      if (u.parentNode === t) t.removeChild(u);
+    }, 10000);
   }
   function doArchive(id, name, scope) {
     setBusy(scope, true);

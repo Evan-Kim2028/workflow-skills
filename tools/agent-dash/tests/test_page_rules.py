@@ -3101,6 +3101,15 @@ class FinalPolishTests(unittest.TestCase):
         archive_src = (STATIC / "cards" / "archive.js").read_text()
         self.assertIn("restoreControl", archive_src)
 
+    def test_undo_expires_with_the_toast(self):
+        """The toast hides with opacity, so expiry must detach the Undo
+        button with its handler: an invisible Undo must never stay
+        keyboard-reachable or re-fire its action after the 10 s window."""
+        for path in ("core/manage.js", "core/actions.js"):
+            src = (STATIC / path).read_text()
+            self.assertIn("if (u.parentNode === t) t.removeChild(u)", src,
+                          f"{path} leaves a stale Undo behind when the toast expires")
+
     def test_archive_falls_back_to_copy_command(self):
         """With writes off (read-only server, fixture preview) every
         control degrades to the copy-command button, so the CLI path
