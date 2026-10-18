@@ -773,8 +773,8 @@ console.log("hover builders proof ok: " + seen.length + " strings compact");
     def test_plan_legend_is_always_visible(self):
         """The map legend is an always-visible list under the intro line,
         not a hover-only popover: labelled Task status / Agent family /
-        Edges groups, family colours from the model palette, and the long
-        Legend popover kept for the details."""
+        Edges groups, family colours from the model palette. The old
+        Legend hover popover is gone (owner request)."""
         card = (STATIC / "cards" / "plan-progress.js").read_text()
         for kept in (
             "planLegend",
@@ -793,7 +793,9 @@ console.log("hover builders proof ok: " + seen.length + " strings compact");
         css = (STATIC / "cards" / "plan-progress.css").read_text()
         for marker in (".map-legend", ".mleg-group", ".mleg-item", ".fam-dot", ".phases-cap"):
             self.assertIn(marker, css, f"plan-progress.css lost the legend rule: {marker}")
-        self.assertIn("Legend", card, "the long Legend popover is gone")
+        self.assertNotIn("legend-tip", card, "the Legend hover popover is back")
+        self.assertNotIn("legendPop", card, "the Legend hover popover is back")
+        self.assertNotIn(".legend-tip", css, "dead hover popover CSS is back")
 
     def test_plan_map_fits_the_page(self):
         """The plan progress card never pushes the page sideways: tiles wrap

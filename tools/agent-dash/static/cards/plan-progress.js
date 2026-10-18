@@ -149,9 +149,6 @@
     function attText(a) { return planAttText(a); }
     var nLive = Object.keys(live).reduce(function (a, k) { return a + live[k].length; }, 0);
     var c = el("div", {class: "card", id: "exec-progress", "data-nav": "Plan progress"}, [el("div", {style: "display:flex;align-items:baseline;gap:10px;flex-wrap:wrap"}, [el("h2", {text: plan.ws + " plan progress" + (nLive ? " · " + nLive + " agent" + (nLive > 1 ? "s" : "") + " working" : "")}), (plan.start_prompt ? copyBtn(plan.start_prompt) : null), el("a", {class: "planbtn", href: planUrl(plan.ws), onclick: function (ev) { ev.preventDefault(); openPlan(plan.ws); }, text: "Open the " + plan.ws + " plan"})]), el("p", {class: "sub", text: "Each tile is a section of the plan; sections run in parallel unless an arrow says one waits on another. The pill says where it stands; hover a tile's progress line for the counts, or a chip for what it waits on and unblocks."})]);
-    var legendPop = el("div", {class: "pop"}, [el("b", {text: "What the chips mean"})]);
-    var legendBtn = el("span", {class: "legend-tip", tabindex: "0", "aria-label": "Legend"}, ["Legend \u24D8", legendPop]);
-    c.firstChild.appendChild(legendBtn);
     /* Always-visible legend, right under the intro line (above the map).
        The old compact row
        lived below the progress bar and the chip rows, and only with a
@@ -466,10 +463,6 @@
     var pprog = plan.progress || {done: 0, total: 0, counts: {}, pct: 0};
     pprog.counts = pprog.counts || {};
     var all = pprog.total, pct = pprog.pct, tot = pprog.counts;
-    var lg = el("div", {class: "plegend"});
-    [["live", "agent working now"], ["wip", "in progress (branch, not merged)"], ["pr", "waiting to merge (approved or PR open)"], ["prog", "merged, waiting on a prod step"], ["done", "done"], ["just", "finished in the last 15 min"], ["todo", "not started"], ["deferred", "deferred or moved to another workstream"]].forEach(function (p) { var ch2 = el("span", {class: "chip " + (p[0] === "just" ? "done just" : p[0])}, [p[0] === "live" ? "\u25CF" : p[0] === "todo" ? "\u00B7" : "\u2009"]); lg.appendChild(el("span", {style: "display:inline-flex;align-items:center;gap:6px"}, [ch2, p[1]])); });
-    legendPop.appendChild(lg);
-    legendPop.appendChild(el("p", {text: "The badge on a working chip is the model family and how many agents are on it. \u21BBN counts the agent runs on a task in the last 24 h (an amber edge means it was sent back twice or more). Arrows between tiles show which section waits on which; hover a tile to light up its chain. Every task dependency is an arrow between chips: solid when the prerequisite is done, dashed while it waits; hover an arrow for its condition. Hover a chip to see the tasks it waits on (amber) and unblocks (blue); click to pin the whole chain. A \u25C7 chip is a gate, an outside signal: a check means met. The Arrows toggle switches between all arrows and on-focus only. Chips in a tile run left to right in the order they can start."}));
     var ob = el("div", {class: "pbig"}), obBar = el("div", {class: "pbig-bar", role: "img", "aria-label": planBigAria(tot.done, all)});
     [["done", "var(--good)"], ["prog", "var(--s5)"], ["pr", "var(--warning)"]].forEach(function (p) { var sp = el("span"); sp.style.background = p[1]; var pw0 = ((window.__adPrevBar || {})[plan.ws] || {})[p[0]]; sp.style.width = (pw0 == null ? 0 : pw0) + "%"; sp.dataset.w = all ? (100 * (tot[p[0]] || 0) / all) : 0; sp.dataset.k = p[0]; obBar.appendChild(sp); });
     var obPct = el("b", {class: "pbig-pct", text: "0%"});
