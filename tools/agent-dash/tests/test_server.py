@@ -657,6 +657,55 @@ class StopRestartTest(unittest.TestCase):
         self.assertEqual(main(["stop"]), 0)
         self.assertTrue(agent_dash._port_free())
 
+    def test_restart_succeeds_when_health_reports_problems(self):
+        import io
+        import time
+        from contextlib import redirect_stderr, redirect_stdout
+
+        agent_dash.is_dash = lambda pid: True
+        agent_dash.bind_state()
+        store = Store(agent_dash.DBFILE)
+        now = time.time()
+        try:
+            store.upsert_run(
+                {
+                    "run_id": "generic:u1:ws9-unpriced",
+                    "source": "generic",
+                    "tier": "generic",
+                    "model": "demo-model",
+                    "label": "ws9-unpriced",
+                    "status": "done",
+                    "started_at": now - 100,
+                    "ended_at": now - 50,
+                }
+            )
+            store.add_usage(
+                {
+                    "ts": now - 60,
+                    "session_id": "u1",
+                    "run_id": "generic:u1:ws9-unpriced",
+                    "model": "demo-model",
+                    "tool": "generic",
+                    "message_id": "m1",
+                    "input": 100,
+                    "output": 50,
+                    "cache_read": 0,
+                    "cache_write": 0,
+                }
+            )
+        finally:
+            store.close()
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = main(["restart"])
+        self.assertEqual(code, 0)
+        self.assertIn("restarted (health reports problems", out.getvalue())
+        self.assertIn("doctor", out.getvalue())
+        self.assertTrue(agent_dash._health_answers())
+        self.assertFalse(agent_dash._health_ok())
+        self.assertEqual(main(["stop"]), 0)
+        self.assertTrue(agent_dash._port_free())
+
 
 class SnapshotUsageEndpointTest(unittest.TestCase):
     """GET /api/snapshot?usage_group= carries the hourly chart buckets for

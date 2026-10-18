@@ -12,7 +12,7 @@ That writes `bundle.json`, a template `plan.json`, `layout.json`, an empty `visu
 
 `START-PROMPT.md` is the paste-ready prompt that starts this workstream's lead in a fresh session. Edit it so it names the kickoff brief and the done criteria. The bundle API and the plan API return that text as `start_prompt`. A missing file is null.
 
-Fill `plan.json` before you render. The shape is the decision record: `dag`, `decisions`, `motivation`, `agent_friendly`, `narrative`. Task status is `todo`, `pr`, `prog`, `done`, or `deferred`. A deferred task can set `moved_to` to a workstream id and a `note`. Keep done tasks in the dag so the map shows progress.
+Fill `plan.json` before you render. The shape is the decision record: `dag`, `decisions`, `motivation`, `agent_friendly`, `narrative`. Task status is `todo`, `wip`, `pr`, `prog`, `done`, or `deferred`. `wip` is work on a branch; `pr` is approved or open. A deferred task can set `moved_to` to a workstream id and a `note`. Keep done tasks in the dag so the map shows progress.
 
 `dag.cols` is the column titles, left to right. Each group has `id`, `col`, `title`, and `tasks`. Each task has `id`, `title`, and `status`. A task may carry `deps` (task ids it waits on) and `dep_notes` (a map from one of its dep ids to the short condition on that edge, e.g. "run only after the export"). A task that is an outside signal or condition rather than work in this workstream carries `"kind": "gate"` (default `"task"`); the map draws it as a diamond. Edges are pairs of group ids and mean "this group waits on that one".
 
@@ -31,7 +31,7 @@ python3 agent_dash.py ws render WS4
 python3 agent_dash.py ws validate WS4
 ```
 
-`ws render` rewrites `page.html`. `ws validate` checks the schema and the naming rule. Do not cite a decision, task, pull request, ADR, or issue by number alone. Write a short phrase first. The number can sit in parentheses after it. `the read-path migration decision (D-12)` is the shape. The checker flags a TU-style id, an issue number of 3 to 5 digits, or an ADR number when no phrase sits earlier on the same line. It looks after the last tag, so a class name earlier in the tag does not count as the phrase.
+`ws render` rewrites `page.html`. `ws validate` checks the schema and the naming rule. Do not cite a decision, task, pull request, ADR, or issue by number alone. Write a short phrase first. The number can sit in parentheses after it. `the read-path migration decision (D-12)` is the shape. The checker flags a TU-style id, a #-prefixed issue number, or an ADR number when no phrase sits earlier on the same line. It looks after the last tag, so a class name earlier in the tag does not count as the phrase.
 
 Open `http://127.0.0.1:8765/plan?ws=WS4`. Overview is first, then bundles in order. Plan | Execution keeps the same workstream and does not reload the page. Execution is the dashboard view in the same shell.
 
@@ -39,7 +39,7 @@ Open `http://127.0.0.1:8765/plan?ws=WS4`. Overview is first, then bundles in ord
 
 ## Move a task
 
-Label the run `ws4-<task-id>-<slug>`, for example `ws4-1-read-route`. The progress map matches that label to the task id.
+Label the run `ws4-<task-id>-<slug>`, for example `ws4-WS4.1-read-route`. The label must hold the full task id or the progress map cannot pin it. The progress map matches that label to the task id.
 
 When the status changes:
 

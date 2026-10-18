@@ -243,6 +243,25 @@ class ReportCliTests(unittest.TestCase):
             agent_dash.cmd_report(["usage", "--label", "ws4-x", "--input", "1"]), 2
         )
 
+    def test_report_finish_rejects_unknown_verdict(self):
+        import agent_dash
+
+        self.assertEqual(
+            agent_dash.cmd_report(["finish", "--label", "ws4-x", "--verdict", "PAS"]), 2
+        )
+        dest = Path(self.tmp.name) / "generic.jsonl"
+        self.assertFalse(dest.exists())
+
+    def test_report_run_dir_registers_folder(self):
+        import agent_dash
+
+        rundir = Path(self.tmp.name) / "runs"
+        rundir.mkdir()
+        self.assertEqual(agent_dash.cmd_report(["--run-dir", str(rundir)]), 0)
+        registered = (Path(self.tmp.name) / "run-dirs.txt").read_text(encoding="utf-8")
+        self.assertIn(str(rundir), registered)
+        self.assertEqual(agent_dash.cmd_report(["--run-dir"]), 2)
+
 
 if __name__ == "__main__":
     unittest.main()

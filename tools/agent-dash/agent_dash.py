@@ -215,12 +215,47 @@ def _expand_value(value):
     return value
 
 
+def _parse_port(raw: str) -> int:
+    """AGENT_DASH_PORT value as a port number. Raises ValueError when bad."""
+    port = int((raw or "").strip())
+    if 1 <= port <= 65535:
+        return port
+    raise ValueError(raw)
+
+
+def _no_extra_args(cmd: str, args: list[str]) -> int | None:
+    """None when the action runs bare; 0 after --help; 2 after extras."""
+    if len(args) <= 1:
+        return None
+    if len(args) == 2 and args[1] in ("-h", "--help"):
+        print(USAGE, end="")
+        return 0
+    print(errors.action_takes_no_args(cmd, args[1]), file=sys.stderr)
+    return errors.USAGE
+
+
 def main(argv: list[str] | None = None) -> int:
+    global PORT, URL
     args = list(sys.argv[1:] if argv is None else argv)
     if args and args[0] in ("-h", "--help"):
         print(USAGE, end="")
         return 0
+    raw_port = os.environ.get("AGENT_DASH_PORT", "")
+    if raw_port.strip():
+        try:
+            PORT = _parse_port(raw_port)
+        except ValueError:
+            print(errors.bad_port(raw_port.strip()), file=sys.stderr)
+            return errors.USAGE
+        URL = f"http://{HOST}:{PORT}/"
+        # The ws live-data fetches read AGENT_DASH_URL, not PORT: follow
+        # the port unless the caller already points elsewhere.
+        os.environ.setdefault("AGENT_DASH_URL", URL)
     cmd = args[0] if args else "run"
+    if cmd in ("run", "stop", "restart"):
+        guard = _no_extra_args(cmd, args)
+        if guard is not None:
+            return guard
     if cmd == "run":
         return cmd_run()
     if cmd == "stop":
@@ -372,8 +407,11 @@ def cmd_restart() -> int:
         return 1
     deadline = time.time() + 20
     while time.time() < deadline:
-        if _health_ok():
-            print("restarted")
+        if _health_answers():
+            if _health_ok():
+                print("restarted")
+            else:
+                print("restarted (health reports problems; run: python3 agent_dash.py doctor)")
             return 0
         time.sleep(0.25)
     print("restarted but health check failed", file=sys.stderr)
@@ -382,6 +420,17 @@ def cmd_restart() -> int:
 
 def _health_ok() -> bool:
     """True when GET /api/health answers ``{"ok": true}``."""
+    payload = _health_payload()
+    return bool(payload.get("ok")) if payload is not None else False
+
+
+def _health_answers() -> bool:
+    """True when GET /api/health answers with a payload, whatever it says."""
+    return _health_payload() is not None
+
+
+def _health_payload():
+    """The /api/health payload, or None when the dashboard does not answer."""
     import urllib.error
     import urllib.request
 
@@ -391,8 +440,8 @@ def _health_ok() -> bool:
         ) as response:
             payload = json.loads(response.read().decode("utf-8"))
     except (urllib.error.URLError, OSError, ValueError):
-        return False
-    return bool(payload.get("ok"))
+        return None
+    return payload if isinstance(payload, dict) and "ok" in payload else None
 
 
 def cmd_status(argv: list[str] | None = None) -> int:
@@ -942,8 +991,10 @@ def cmd_report(argv: list[str]) -> int:
     next poll. Never stores prompts or secrets: the schema has no field
     for them.
     """
+    if argv and argv[0] == "--run-dir":
+        return cmd_report_run_dir(_report_flags(argv))
     if not argv or argv[0] not in ("start", "finish", "usage"):
-        print("usage: python3 agent_dash.py report start|finish|usage --label <label> ... Run: python3 agent_dash.py report start --label ws4-WS4.1-slug --model <model> --session <id>", file=sys.stderr)
+        print("usage: python3 agent_dash.py report start|finish|usage --label <label> ... or report --run-dir <dir>. Run: python3 agent_dash.py report start --label ws4-WS4.1-slug --model <model> --session <id>", file=sys.stderr)
         return 2
     action = argv[0]
     flags = _report_flags(argv[1:])
@@ -973,6 +1024,9 @@ def cmd_report(argv: list[str]) -> int:
         verdict = flags.get("verdict")
         if not verdict:
             print(f"report finish requires --verdict <VERDICT>. Use one of: {', '.join(errors.VERDICTS)}", file=sys.stderr)
+            return 2
+        if verdict not in errors.VERDICTS:
+            print(errors.unknown_verdict(verdict), file=sys.stderr)
             return 2
         status = flags.get("status") or "done"
         if status not in ("done", "killed", "died_early"):
@@ -1029,14 +1083,30 @@ def cmd_report(argv: list[str]) -> int:
     return 0
 
 
-def _register_report_dir(state: Path, run_dir: str) -> None:
+def cmd_report_run_dir(flags: dict) -> int:
+    """Register a manifest folder: ``report --run-dir <dir>``. No run line."""
+    run_dir = flags.get("run-dir")
+    if not run_dir:
+        print("report --run-dir <dir> registers a manifest folder. Run: python3 agent_dash.py report --run-dir <dir>", file=sys.stderr)
+        return 2
+    cfg = bind_state()
+    state = Path(expand(str(cfg.get("state_dir") or STATE_DIR)))
+    state.mkdir(parents=True, exist_ok=True)
+    if _register_report_dir(state, run_dir):
+        print(f"registered run dir {run_dir}")
+        return 0
+    print(f"report could not register run dir {run_dir!r}", file=sys.stderr)
+    return 1
+
+
+def _register_report_dir(state: Path, run_dir: str) -> bool:
     """Register a harness run folder from ``report --run-dir``. Never raises."""
     try:
         from dash.rundirs import register_run_dir
 
-        register_run_dir(state, run_dir)
+        return bool(register_run_dir(state, run_dir))
     except Exception:
-        pass
+        return False
 
 
 def _report_flags(argv: list[str]) -> dict:

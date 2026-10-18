@@ -2,6 +2,29 @@
 
 The dashboard shows agent runs, tokens, cost, and plan progress. Any harness can feed it. The two paths are the `report` command (three lines per run) and the manifest files (one TSV row plus report files). Detail lives in [CONTRACT.md](../CONTRACT.md).
 
+## Fresh agent checklist
+
+Ten commands, verified end to end. Run from the checkout root. They touch
+only `/tmp/dash-try` (state, bundles) and port 8815 — never the live
+dashboard, never your sessions. `stop` at the end frees the port.
+
+1. `./install.sh`
+2. `mkdir -p /tmp/dash-try/state /tmp/dash-try/ws && export AGENT_DASH_STATE_DIR=/tmp/dash-try/state AGENT_DASH_WORKSTREAMS=/tmp/dash-try/ws AGENT_DASH_PORT=8815`
+3. `python3 tools/agent-dash/agent_dash.py run` — expect `running`, a pid, `url http://127.0.0.1:8815/`
+4. `curl -s http://127.0.0.1:8815/api/health` — expect `"ok": true`
+5. `python3 tools/agent-dash/agent_dash.py doctor` — expect `no problems found` (on a shared machine, warnings about other agents' workers are theirs, not yours)
+6. `python3 tools/agent-dash/agent_dash.py ws new WS9 "Probe"` — expect `created` and a path ending in `WS9`
+7. `python3 tools/agent-dash/agent_dash.py report start --label ws9-WS9.1-probe --model claude-haiku-5-5 --session s1` — expect `reported start`
+8. `python3 tools/agent-dash/agent_dash.py report usage --label ws9-WS9.1-probe --model claude-haiku-5-5 --session s1 --input 100 --output 50 --message-id turn-1` — expect `reported usage`
+9. `python3 tools/agent-dash/agent_dash.py report finish --label ws9-WS9.1-probe --verdict PASS --session s1` — expect `reported finish`
+10. `sleep 4 && python3 tools/agent-dash/agent_dash.py check` — expect `no mismatches`
+
+Then `python3 tools/agent-dash/agent_dash.py stop` and delete `/tmp/dash-try`.
+Any model id from `tools/agent-dash/catalog/prices.json` works in steps
+7-8; an id outside the catalog reports fine but stays unpriced (step 10
+names it). The label in step 7 must hold a task id from step 6's plan
+(the scaffold already has `WS9.1`).
+
 ## For agents
 
 Two commands tell you everything. Run them first, in this order:
@@ -24,7 +47,10 @@ checks in a background thread every `doctor.interval_s` seconds
 run (never inline; `?refresh=1` queues one), with `?ws=<ID>` and
 `?severity=critical|warn|info` filters. `doctor` reads that endpoint
 when the server is up and otherwise runs the same checks locally.
-`doctor` exits 0 when clean, 1 when problems found. `doctor --fix` is a
+`doctor` exits 0 when clean, 1 when problems found. The served run is at
+most `doctor.interval_s` seconds old (default 300): right after a change,
+`check` sees it first and `doctor` catches up on the next background run;
+the header carries the generation epoch. `doctor --fix` is a
 dry run of the safe automatic fixes; `doctor --fix --yes` applies only
 safe, local, reversible ones (register a run dir, add a missing scratch
 root to `config.local.json` with a backup, prune, restart a stalled
@@ -32,7 +58,9 @@ dashboard, reprice and backfill models). `doctor report --since 24h
 [--md]` digests history (new, regressed, resolved, open by severity
 and workstream) for hub reports. Every problem code has a page under
 `docs/problems/` (for example `docs/problems/stuck-task.md`) with what
-it means, the exact fix commands, and how to verify.
+it means, the exact fix commands, and how to verify. The CLI prints the
+fix command, not the page path: when the fix command only re-diagnoses
+(such as `check` for an unseen worker), open that code's page.
 
 These commands take `--json` for machine output on stdout only (human
 text moves to stderr when `--json` is set): `check`, `check --page`
@@ -78,7 +106,7 @@ python3 tools/agent-dash/agent_dash.py check --page
 
 Health prints `"ok": true` with one entry per source, each `last_error: null`. `check` prints one table row per workstream and exits 1 on any mismatch. `check --page` drives the live page in headless Chrome and compares every tile against the API; it skips with a clear message when Chrome is missing. Restart with `python3 tools/agent-dash/agent_dash.py restart`: it stops (SIGTERM, up to 10 s of polling, SIGKILL only for the pidfile pid), starts again in the background, and returns 0 once `/api/health` answers. `stop` alone waits the same way and returns 0 only once the port is free, so an immediate `run` can bind.
 
-State lives in `~/.local/share/agent-dash/` (`dash.sqlite`, pidfile, log, `generic.jsonl`). Point `AGENT_DASH_STATE_DIR` at an empty directory to trial the dashboard without touching live state. Point `AGENT_DASH_WORKSTREAMS` at another directory to trial bundles.
+State lives in `~/.local/share/agent-dash/` (`dash.sqlite`, pidfile, log, `generic.jsonl`). Point `AGENT_DASH_STATE_DIR` at an empty directory to trial the dashboard without touching live state. Point `AGENT_DASH_WORKSTREAMS` at another directory to trial bundles. Point `AGENT_DASH_PORT` at a free port (such as 8815) to trial beside a live dashboard: every command (`run`, `status`, `stop`, `check`, `state`, `doctor`, and the `ws` live reads) follows it. Set `AGENT_DASH_URL` explicitly only to point the `ws` live reads at yet another dashboard. Config-file `host`/`port` stay ignored.
 
 ## 2. Make your sub-agents show up
 
@@ -100,7 +128,13 @@ python3 $DASH report usage --label ws4-WS4.1-notes-index --model demo-model --se
 python3 $DASH report finish --label ws4-WS4.1-notes-index --verdict PASS --session abc
 ```
 
-That is the whole minimum: label, model, workstream (read from the label), task (read from the label), status (`running`, then `done`), verdict (`PASS`), tokens (100 in, 50 out), cost (priced from the catalog). `--session` ties the three lines to one run id (`generic:abc:ws4-WS4.1-notes-index`); omit it and the id is `generic:<label>`. `--run-id` overrides both. `finish --status` is `done`, `killed`, or `died_early` (default `done`). `finish` without `--model` keeps the model from `start`.
+That is the whole minimum: label, model, workstream (read from the label), task (read from the label), status (`running`, then `done`), verdict (`PASS`), tokens (100 in, 50 out), cost (priced from the catalog). `demo-model` above is a placeholder, not a catalog row: the three lines report fine, but the run stays unpriced (`check` names it) until `--model` names a catalog id or you add the §5 row. List the priced ids with:
+
+```bash
+python3 -c "import json; print('\n'.join(m['model'] for m in json.load(open('tools/agent-dash/catalog/prices.json'))['models']))"
+```
+
+`--session` ties the three lines to one run id (`generic:abc:ws4-WS4.1-notes-index`); omit it and the id is `generic:<label>`. `--run-id` overrides both. `finish --status` is `done`, `killed`, or `died_early` (default `done`). `finish` without `--model` keeps the model from `start`. `finish --verdict` must be one of `PASS`, `PARTIAL`, `BLOCKED`, `APPROVE`, `APPROVE_WITH_NITS`, `APPROVE_WITH_CHANGES`, `REQUEST_CHANGES`; anything else exits 2 and writes nothing.
 
 Raw JSONL works the same when the CLI is out of reach. Append to `<state-dir>/generic.jsonl`, one object per line:
 
@@ -118,7 +152,7 @@ The file path alternative is the scratchpad manifest. The dashboard scans each s
 ws4-WS4.1-notes-index	550e8400-e29b-41d4-a716-446655440000	1700000000	demo-model
 ```
 
-Status comes from the files: growing output means running, a SIGTERM trace in the err file means killed, an empty out file with a real error means died early, else done. The verdict comes from the first matching line of the out file (next section). Tokens do not travel this path; pair it with a `report usage` line or `generic.jsonl` usage lines. The shipped scratch glob is `$HOME/agent-scratch/*`, one directory deep; add deeper paths to `roots.scratchpads` and restart.
+Status comes from the files: growing output means running, a SIGTERM trace in the err file means killed, an empty out file with a real error means died early, else done. The verdict comes from the first matching line of the out file (next section). Tokens do not travel this path; pair it with a `report usage` line or `generic.jsonl` usage lines. The shipped scratch glob is `$HOME/agent-scratch/*`, one directory deep; add deeper paths to `roots.scratchpads` and restart. Manifest rows prove liveness through out-file growth or a live sample of a shipped worker binary: a custom binary whose out file stays quiet reads `done` while it lives, and registering the folder does not revive it. When your binary is not one of the shipped launchers, report liveness with `report start` / `report usage` heartbeats / `report finish` instead of relying on the manifest alone.
 
 The live-agents tile counts the `grok`, `muse`, `glm`, and `claude` buckets. A generic run shows in the running table, on its task chip, and in tokens and cost either way; set `--tier` to the closest bucket only when the tile must count it.
 
@@ -256,11 +290,11 @@ Who writes what (one writer per file): the lead owns the bundle (`plan.json` via
 | Symptom | Likely cause | Command |
 |---|---|---|
 | Run missing | Label has a `/`, `\`, leading dot, or newline; or the collector has not polled yet | Fix the label; wait one poll; check `/api/health` `last_error` |
-| Worker invisible, wrapper shows alone | Run folder outside `roots.scratchpads` and not registered | Check `/api/health` `scratch_roots`, `run_dirs`, `warnings`; register the folder (`run-dirs.txt` line or `report --run-dir`); `check` reports live-but-invisible workers as `unseen worker` |
+| Worker invisible, wrapper shows alone | Run folder outside `roots.scratchpads` and not registered | Register the folder (`python3 agent_dash.py report --run-dir <dir>`, or one line in `run-dirs.txt`); check `/api/health` `scratch_roots`, `run_dirs`, `warnings`; `check` reports live-but-invisible workers as `unseen worker` ([page](problems/unseen-worker.md)) |
 | Lane counts twice | Wrapper and worker share a label but the worker row is missing | Same as above: the lane counts once the worker row is live |
 | Wrong workstream | Label regex missed; session fallback claimed it | Check `/api/runs` `ws_confidence`; add a `map.local.json` exact entry |
 | Run not on its chip | Label does not hold the task id and no task-map entry covers it | Add the entry; reload; `taskmap.json` serves resolved |
-| Unpriced run | Model string differs from the catalog, or a rate is null | Match the string exactly; add the row; cost counts unpriced, never `$0` |
+| Unpriced run | Model string differs from the catalog, or a rate is null | Match the string exactly or add the §5 row, then `reprice` (or `doctor --fix --yes`); cost counts unpriced runs separately, never `$0` ([page](problems/unpriced-model.md)) |
 | Stale running run | Process died without a finish line, or the source stopped reporting it | Send `report finish` (a generic run with no `report` line for 6 h counts as stale, so long runs send `report usage` as a heartbeat); the collector closes rows whose process is gone or that the source (Dagster) no longer lists, and `check` reports any `stale running` row it finds (CONTRACT.md, Liveness) |
 | Critical problem before a wave | Dashboard blind, numbers wrong, or model unpriced | Run `doctor --json --severity critical`; the `ws-wave` workflow does this once before the wave and stops on any critical problem (pass `skipDoctor: true` to skip) |
 | Worker will not launch | Preflight blocks the launch | `run_worker.py` runs a doctor preflight (dashboard reachable, run dir visible, tier model priced and policy-compliant) and exits 1 with the problem and fix unless `--no-preflight` is passed |

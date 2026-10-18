@@ -40,7 +40,7 @@ python3 ~/.claude/tools/agent-dash/agent_dash.py status
 
 `status` prints the same three lines while the dashboard is up. When it is down, the command prints `stopped`.
 
-Open http://127.0.0.1:8765/ . With no sessions on the machine the tables are empty. The shipped plans still add tabs for WS1, WS2, and WS7.
+Open http://127.0.0.1:8765/ . With no sessions on the machine the tables are empty. On a shared machine you will see other agents' live labels instead: the process scan is machine-global. The shipped plans still add tabs for WS1, WS2, and WS7.
 
 ```bash
 curl -s http://127.0.0.1:8765/api/health

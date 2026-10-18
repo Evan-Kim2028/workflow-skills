@@ -58,6 +58,21 @@ def dashboard_unreachable(url: str) -> str:
     )
 
 
+def bad_port(raw: str) -> str:
+    return (
+        f"bad port AGENT_DASH_PORT={raw!r}. "
+        "Use an integer 1-65535, e.g. AGENT_DASH_PORT=8815. "
+        "Unset it to use the default 8765."
+    )
+
+
+def action_takes_no_args(cmd: str, arg: str) -> str:
+    return (
+        f"{cmd} takes no arguments (got {arg!r}). "
+        f"Run: python3 agent_dash.py {cmd}"
+    )
+
+
 def bundle_not_found(ws: str) -> str:
     return (
         f"bundle not found: {ws}. "
@@ -91,6 +106,14 @@ def unknown_finish_status(status: str) -> str:
     return (
         f"unknown finish status {status!r}. "
         f"Use one of: {', '.join(FINISH_STATUSES)}"
+    )
+
+
+def unknown_verdict(verdict: str) -> str:
+    return (
+        f"unknown verdict {verdict!r}. "
+        f"Use one of: {', '.join(VERDICTS)}. "
+        "Run: python3 agent_dash.py report finish --label <label> --verdict PASS"
     )
 
 

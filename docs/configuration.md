@@ -43,7 +43,7 @@ Code defaults that the example file can override, if you put them in `config.loc
 | `read_budget.per_tick` | 8 MiB |
 | `cursor_usage` | unset. The collector then reads `cursor-usage.jsonl` in the state directory. |
 
-`host` and `port` in a config file are ignored. The server always binds to 127.0.0.1 port 8765.
+`host` and `port` in a config file are ignored. The server binds to 127.0.0.1 port 8765 unless `AGENT_DASH_PORT` names another port.
 
 ### map.example.json
 
@@ -127,6 +127,8 @@ Set variables override the merged config. An empty variable is ignored.
 | `AGENT_DASH_TASKMAP` | Task map file. Replaces example and local. |
 | `AGENT_DASH_IGNORE_LOCAL` | Hide `*.local.json` when the value is not empty and not `0`. |
 | `AGENT_DASH_DB` | Database path for `reconcile` only. The server uses the state directory. |
+| `AGENT_DASH_PORT` | Dashboard port for this invocation. Default 8765; every command (`run`, `status`, `stop`, `check`, `state`, `doctor`, `ws` live reads) follows it. A bad value exits 2. |
+| `AGENT_DASH_URL` | Dashboard base URL for the `ws` live-data fetches (`next`, `waves`, `overlap`). Defaults to the port URL above; set it explicitly to point at another dashboard instead. |
 | `AGENT_DASH_CURSOR_USAGE` | Where the stop hook and `launch_grok.sh` append billed lines. Default is `cursor-usage.jsonl` in the state directory. The collector does not read this variable. It reads the state-directory file, or `cursor_usage` in config. Point them at the same path. |
 
 Test-only variables. Smoke tests stay skipped unless `AGENT_DASH_SMOKE` is `1`. Each test also needs its own path variable, and still reads only the path you set.

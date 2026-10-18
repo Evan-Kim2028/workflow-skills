@@ -171,6 +171,90 @@ class WsJsonTest(unittest.TestCase):
         self.assertEqual(items[0]["status"], "pending")
 
 
+class PortAndActionArgsTest(unittest.TestCase):
+    def setUp(self):
+        import agent_dash
+
+        self.dash = agent_dash
+        self.keep_port = agent_dash.PORT
+        self.keep_url = agent_dash.URL
+        self.keep_env = os.environ.get("AGENT_DASH_PORT")
+        self.keep_state = os.environ.get("AGENT_DASH_STATE_DIR")
+        self.keep_url_env = os.environ.get("AGENT_DASH_URL")
+        self.tmp = tempfile.TemporaryDirectory()
+        os.environ["AGENT_DASH_STATE_DIR"] = self.tmp.name
+        self.addCleanup(self.restore)
+
+    def restore(self):
+        self.dash.PORT = self.keep_port
+        self.dash.URL = self.keep_url
+        if self.keep_env is None:
+            os.environ.pop("AGENT_DASH_PORT", None)
+        else:
+            os.environ["AGENT_DASH_PORT"] = self.keep_env
+        if self.keep_url_env is None:
+            os.environ.pop("AGENT_DASH_URL", None)
+        else:
+            os.environ["AGENT_DASH_URL"] = self.keep_url_env
+        if self.keep_state is None:
+            os.environ.pop("AGENT_DASH_STATE_DIR", None)
+        else:
+            os.environ["AGENT_DASH_STATE_DIR"] = self.keep_state
+        self.tmp.cleanup()
+
+    def test_run_help_prints_usage_without_starting(self):
+        code, out, _err = _main(["run", "--help"])
+        self.assertEqual(code, 0)
+        self.assertIn("agent-dash", out)
+        self.assertFalse(Path(self.tmp.name, "agent-dash.pid").exists())
+
+    def test_run_extra_arg_is_usage_error(self):
+        code, _out, err = _main(["run", "--bogus"])
+        self.assertEqual(code, 2)
+        self.assertIn("run takes no arguments", err)
+        self.assertIn("Run: python3 agent_dash.py run", err)
+
+    def test_stop_restart_help_and_extras(self):
+        code, out, _err = _main(["stop", "--help"])
+        self.assertEqual(code, 0)
+        self.assertIn("agent-dash", out)
+        code, _out, err = _main(["restart", "--verbose"])
+        self.assertEqual(code, 2)
+        self.assertIn("restart takes no arguments", err)
+
+    def test_port_env_rebinds_url(self):
+        os.environ.pop("AGENT_DASH_URL", None)
+        os.environ["AGENT_DASH_PORT"] = "8815"
+        code, _out, _err = _main(["status"])
+        self.assertEqual(code, 1)  # no server in the temp state dir
+        self.assertEqual(self.dash.PORT, 8815)
+        self.assertTrue(self.dash.URL.endswith(":8815/"))
+        self.assertEqual(os.environ.get("AGENT_DASH_URL"), "http://127.0.0.1:8815/")
+
+    def test_explicit_dash_url_wins_over_port(self):
+        os.environ["AGENT_DASH_URL"] = "http://127.0.0.1:9999"
+        os.environ["AGENT_DASH_PORT"] = "8815"
+        code, _out, _err = _main(["status"])
+        self.assertEqual(code, 1)
+        self.assertEqual(self.dash.PORT, 8815)
+        self.assertEqual(os.environ.get("AGENT_DASH_URL"), "http://127.0.0.1:9999")
+
+    def test_bad_port_is_usage_error(self):
+        for raw in ("bogus", "0", "99999", "-1"):
+            os.environ["AGENT_DASH_PORT"] = raw
+            code, _out, err = _main(["status"])
+            self.assertEqual(code, 2, raw)
+            self.assertIn("bad port", err, raw)
+            self.assertIn("AGENT_DASH_PORT", err, raw)
+        self.assertEqual(self.dash.PORT, self.keep_port)
+
+    def test_no_port_env_leaves_port_alone(self):
+        os.environ.pop("AGENT_DASH_PORT", None)
+        _main(["stop", "--help"])
+        self.assertEqual(self.dash.PORT, self.keep_port)
+        self.assertEqual(self.dash.URL, self.keep_url)
+
+
 class UnreachableTest(unittest.TestCase):
     def test_state_and_check_exit_5_with_next_command(self):
         code, _out, err = _main(["state", "--url", "http://127.0.0.1:1"])
