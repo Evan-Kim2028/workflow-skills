@@ -123,3 +123,13 @@ Dependencies: V-tokens before V-tiles/V-charts; `prev_24h` after retention. Para
 ## In flight elsewhere
 
 The promo clip work (trim to the busiest 85%, camera, active-work blinking borders, a ticking token/cost/subagent counter, and the GIF/MP4 improvements in `scripts/render_replay.mjs`) lives on the local branch `feat/dash-ws1-replay`, is not merged, and the owner decides when to merge it.
+
+## How a new workstream appears
+
+No dashboard edits: one bundle per id under `AGENT_DASH_WORKSTREAMS`.
+
+- `python3 agent_dash.py ws new WS4 "Read path"` writes the bundle; it lands on the Planned shelf and in the Planned view.
+- The first agent run maps to it; the page shows it under Current with a "first agent started" hint until `python3 agent_dash.py ws state WS4 active` moves it.
+- Plan 100% of non-deferred tasks shows a "Ready to archive" chip with `python3 agent_dash.py ws archive WS4` to copy.
+- `ws archive` freezes the summary and moves it to Archive; `ws restore` reopens to done.
+- Runs with no bundle list under "Unplanned activity" as "Active without a plan: <id>" with `ws new` to copy.

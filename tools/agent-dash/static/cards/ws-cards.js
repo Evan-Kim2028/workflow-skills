@@ -67,13 +67,34 @@
     ((state.snap && state.snap.by_workstream) || []).forEach(function (r) { if (r.ws === id) hit = r; });
     return hit;
   }
+  /* A row has activity when any run, token, or live-agent evidence exists.
+     Planned rows with activity are the first-agent case: the state file
+     still says planned, but work already started. */
+  function hasActivity(w) {
+    return !!(w && (w.live_agents || w.last_activity || w.tokens || w.cost_usd || w.finished_in_range || w.finished_today));
+  }
+  function firstRunAt(ws) {
+    var best = null;
+    ((state.runs) || []).forEach(function (r) {
+      if (!r || r.workstream !== ws) return;
+      var t = +r.started_at || +r.ended_at || 0;
+      if (t > 0 && (best == null || t < best)) best = t;
+    });
+    return best;
+  }
+  function readyToArchive(w, pr) {
+    if (!pr || !ADT.isCompleted(pr)) return false;
+    var st = ADT.wsStateOf(w);
+    return st === "active" || st === "paused" || st === "done";
+  }
   /* "Where we are": one two-line row per workstream. First line: id, name
      and the right-aligned %; the status pill sits under the name. The
      segmented bar carries the done-of-total value in its accessible label;
      the secondary line names tokens, cost and live agents. The optional
      onlyStates list keeps rows in those lifecycle states (the Project
      home passes active/paused, Recently done passes done); without it
-     every row renders, as before. */
+     every row renders, as before. A Current filter (active/paused) also
+     keeps planned rows with activity, shown with a first-agent hint. */
   function programPanel(only, bare) {
     var c = el("div", {class: bare ? "program bare" : "card program", "data-nav": "Where we are"});
     if (!bare) c.appendChild(el("div", {class: "prog-h"}, [el("h2", {text: "Where we are"}), el("span", {class: "sub", text: "Plan progress per workstream \u00B7 deferred tasks leave every count"})]));
@@ -83,11 +104,20 @@
     });
     c.appendChild(key);
     var rows = (state.wss || []).slice().sort(function (x, y) { return wsNum(x) - wsNum(y); });
-    if (only) rows = rows.filter(function (w) { return only.indexOf(ADT.wsStateOf(w)) >= 0; });
+    if (only) rows = rows.filter(function (w) {
+      var st = ADT.wsStateOf(w);
+      if (only.indexOf(st) >= 0) return true;
+      if (st === "planned" && only.indexOf("active") >= 0 && hasActivity(w)) return true;
+      return false;
+    });
     var all = {done: 0, tot: 0, live: 0};
     rows.forEach(function (w) { all.live += w.live_agents || 0; });
-    rows.forEach(function (w) {
-      var pr = planSum[w.ws] || null;
+    var cap = 10, expanded = programPanel._expanded || {};
+    var capKey = (bare ? "bare-" : "full-") + (only || []).join(",");
+    var showAll = !!expanded[capKey];
+    var visible = (rows.length > cap && !showAll) ? rows.slice(0, cap) : rows;
+    visible.forEach(function (w) {
+      var pr = planSum[w.ws] || w.progress || null;
       var pc = pr ? pr.counts : {}, tot = pr ? pr.total : 0, pct = pr ? pr.pct : 0, done = pr ? pr.done : 0;
       if (pr) { all.done += done; all.tot += tot; }
       /* Status is colour plus symbol plus word, never colour alone. The
@@ -104,6 +134,11 @@
       idline.appendChild(el("span", {text: w.name || ""}));
       name.appendChild(idline);
       name.appendChild(el("span", {class: "prog-pill " + st[0], text: st[1]}));
+      if (ADT.wsStateOf(w) === "planned" && hasActivity(w)) {
+        var first = firstRunAt(w.ws) || w.last_activity;
+        if (first) name.appendChild(el("span", {class: "prog-hint", text: "first agent started " + fmtDate(first), title: "Runs exist but the bundle state is still planned — activate with: python3 agent_dash.py ws state " + w.ws + " active"}));
+      }
+      if (readyToArchive(w, pr)) name.appendChild(el("span", {class: "prog-pill ready", text: "\u2713 Ready to archive", title: "Plan is 100% — archive after the closing report"}));
       row.appendChild(name);
       var bar = el("div", {class: "prog-bar", role: "img", "aria-label": tot ? (w.ws + " " + done + " of " + tot + " tasks done (" + pct + "%)") : (w.ws + " has no plan")});
       if (tot) {
@@ -125,10 +160,27 @@
       var acts = el("div", {class: "prog-acts"});
       var bp = el("button", {text: "Plan"}); bp.addEventListener("click", function () { openPlan(w.ws); }); acts.appendChild(bp);
       var bl = el("button", {text: "Live"}); bl.addEventListener("click", function () { if (window.DashNav) window.DashNav.openExec(w.ws); }); acts.appendChild(bl);
+      if (readyToArchive(w, pr)) {
+        var ab = el("button", {type: "button", class: "pj-copy", title: "Copy the exact command (read-only: nothing runs)", text: "Archive"});
+        (function (id) {
+          ab.addEventListener("click", function (ev) {
+            ev.stopPropagation();
+            var cmd = "python3 agent_dash.py ws archive " + id;
+            if (typeof copyCmd === "function") copyCmd(cmd);
+            else if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(cmd);
+          });
+        })(w.ws);
+        acts.appendChild(ab);
+      }
       if (planPrompt[w.ws]) acts.appendChild(copyBtn(planPrompt[w.ws]));
       row.appendChild(acts);
       c.appendChild(row);
     });
+    if (rows.length > cap) {
+      var toggle = el("button", {type: "button", class: "prog-more", text: showAll ? "Show less" : "Show " + (rows.length - cap) + " more", title: showAll ? "Collapse the list" : "Show the full list"});
+      toggle.addEventListener("click", function () { expanded[capKey] = !showAll; programPanel._expanded = expanded; drawMain(); });
+      c.appendChild(toggle);
+    }
     /* Overall hero: summed server counts plus live agents. No % here: plan %
        is computed once on the server and the page never derives one from
        task counts itself. */

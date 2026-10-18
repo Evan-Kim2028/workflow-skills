@@ -130,6 +130,25 @@
   color: var(--muted);
   background: var(--surface-2);
 }
+.prog-pill.ready {
+  color: var(--good-ink, var(--good));
+  border-color: color-mix(in srgb, var(--good) 55%, transparent);
+  background: var(--good-soft, color-mix(in srgb, var(--good) 18%, transparent));
+}
+.prog-hint {
+  display: inline-flex;
+  margin-top: 5px;
+  margin-left: 8px;
+  font-size: 12px;
+  color: var(--ink-2);
+  white-space: nowrap;
+}
+.prog-more {
+  margin-top: 10px;
+  border-radius: var(--r-pill, 999px);
+  padding: 5px 14px;
+  font-weight: 650;
+}
 .prog-bar {
   display: flex;
   gap: 2px;

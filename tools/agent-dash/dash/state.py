@@ -80,10 +80,11 @@ def build_state(store, registry, cfg=None, now: float | None = None, processes=N
             plan_ids = set()
 
     try:
-        from dash.workstates import all_bundle_meta, archived_aggregate, hidden_ids, state_of
+        from dash.workstates import all_bundle_meta, archived_aggregate, bundle_fallback_rows, hidden_ids, state_of
     except Exception:
         all_bundle_meta = None
         archived_aggregate = None
+        bundle_fallback_rows = None
         hidden_ids = None
         state_of = None
     meta = {}
@@ -113,6 +114,31 @@ def build_state(store, registry, cfg=None, now: float | None = None, processes=N
                 "last_activity": row["last_activity"],
             }
         )
+    if bundle_fallback_rows is not None:
+        try:
+            have = {row.get("id") for row in workstreams}
+            have |= {row.get("ws") for row in roll["rows"]}
+            for extra in bundle_fallback_rows(have, plan_ids=plan_ids) or []:
+                ws = extra.get("ws")
+                progress = _row_progress(resolve_plan, ws) if resolve_plan is not None else None
+                workstreams.append(
+                    {
+                        "id": ws,
+                        "title": titles.get(ws) or bundles.get(ws, {}).get("title", "") or extra.get("name", "") or "",
+                        "state": extra.get("state", "active"),
+                        "plan": ws in plan_ids,
+                        "progress": progress,
+                        "live_agents": 0,
+                        "tokens": 0,
+                        "cost_usd": 0.0,
+                        "prev_24h": {"tokens": 0, "cost_usd": 0.0, "finished": 0, "live_agents": 0},
+                        "tokens_all_time": 0,
+                        "cost_usd_all_time": 0.0,
+                        "last_activity": None,
+                    }
+                )
+        except Exception:
+            pass
     unassigned = roll["unassigned"]
     totals = roll["all"]["totals"]
     totals_prev = dict(roll["all"].get("prev_24h") or {"tokens": 0, "cost_usd": 0.0, "finished": 0, "live_agents": 0})

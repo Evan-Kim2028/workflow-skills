@@ -390,18 +390,25 @@ class Handler(BaseHTTPRequestHandler):
         )
 
     def _workstreams(self, query):
-        from dash.workstates import all_bundle_meta, parse_state_param
+        from dash.workstates import all_bundle_meta, bundle_fallback_rows, filter_rows, parse_state_param
 
         since = _float(query, "since")
         until = _float(query, "until")
         allowed = parse_state_param(_one(query, "state"))
         meta = all_bundle_meta()
+        plan_ids = workstream_plan_ids()
         rows = self.server.store.query_workstreams(
-            workstream_plan_ids(), since, until,
+            plan_ids, since, until,
             bundle_meta=meta, allowed_states=allowed,
         )
+        have = {row.get("ws") for row in rows}
+        for extra in bundle_fallback_rows(have, plan_ids=plan_ids):
+            extra["progress"] = _row_progress(extra.get("ws"))
+            rows.append(extra)
+        rows = filter_rows(rows, allowed, meta)
         for row in rows:
-            row["progress"] = _row_progress(row.get("ws"))
+            if "progress" not in row:
+                row["progress"] = _row_progress(row.get("ws"))
         self._json(200, {"workstreams": rows})
 
     def _archive(self, _query):

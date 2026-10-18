@@ -94,17 +94,35 @@
     return h;
   }
 
+  function plannedShelfRows() {
+    var seen = {}, out = [];
+    (state.wss || []).forEach(function (w) {
+      var key = String(w.ws).toUpperCase();
+      if (seen[key]) return;
+      seen[key] = 1;
+      if (ADT.wsStateOf(w) === "planned") out.push(w);
+    });
+    (state.bundles || []).forEach(function (b) {
+      if (!b || b.kind === "program" || b.id === "OVERVIEW") return;
+      var key = String(b.id).toUpperCase();
+      if (seen[key]) return;
+      if ((b.state || "active") !== "planned") return;
+      seen[key] = 1;
+      out.push({ws: b.id, name: b.title || "", progress: null, depends_on: b.depends_on || [], state: "planned"});
+    });
+    return out.slice().sort(function (x, y) { return wsNum(x) - wsNum(y); });
+  }
   function readinessTable() {
     var c = el("div", {class: "card pj-ready", "data-nav": "Start readiness"});
     c.appendChild(secHead("Start readiness", "Can we start it? Dependencies, gates, and approvals per planned workstream."));
-    var rows = (state.wss || []).filter(function (w) { return ADT.wsStateOf(w) === "planned"; })
-      .slice().sort(function (x, y) { return wsNum(x) - wsNum(y); });
+    var rows = plannedShelfRows();
     if (!rows.length) {
       c.appendChild(el("p", {class: "pj-note", text: "No planned workstreams: every bundle has a tab."}));
       return c;
     }
     var states = {};
     (state.wssAll && state.wssAll.length ? state.wssAll : state.wss || []).forEach(function (w) { states[String(w.ws).toUpperCase()] = ADT.wsStateOf(w); });
+    (state.bundles || []).forEach(function (b) { if (b && b.id && !states[String(b.id).toUpperCase()]) states[String(b.id).toUpperCase()] = b.state || "active"; });
     var nowS = Date.now() / 1000;
     var table = el("table", {class: "pj-table", "aria-label": "Start readiness"});
     var head = el("tr");
@@ -199,7 +217,7 @@
      then any other scope-"planned" registry entry as its own section. */
   function plannedSpecs(passedState, snap) {
     var specs = [];
-    specs.push(["planned-ready", keyOf([(state.wss || []).map(function (w) { return [w.ws, w.progress, w.depends_on]; }), state.plans, state.approvals]), function () { return readinessTable(); }, ""]);
+    specs.push(["planned-ready", keyOf([(state.wss || []).map(function (w) { return [w.ws, w.progress, w.depends_on]; }), state.bundles, state.plans, state.approvals]), function () { return readinessTable(); }, ""]);
     specs.push(["planned-gated", keyOf([(state.wss || []).map(function (w) { return [w.ws, w.progress]; }), state.plans]), function () {
       var node = gatedLiveSection();
       return node || el("div", {class: "pj-empty-gated"});

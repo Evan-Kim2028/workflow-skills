@@ -2278,8 +2278,27 @@ _LIFECYCLE_META_KEYS = (
     "state", "state_changed_at", "archived_at", "summary", "depends_on", "milestone",
 )
 _LIFECYCLE_CODES = (
-    "done-not-archived", "active-idle", "planned-blocked", "planned-ready", "phase-slipping",
+    "done-not-archived", "active-idle", "planned-blocked", "planned-ready", "planned-live",
+    "phase-slipping", "unplanned-activity",
 )
+
+
+def _suggest_title(ws: str) -> str:
+    """Human title suggestion for ``ws new`` when a run id has no bundle."""
+    text = str(ws or "").strip()
+    upper = text.upper()
+    if upper == "TOOLS":
+        return "Shared tooling"
+    if upper == "PLANNING":
+        return "Planning lane"
+    return f"{text} work" if text else "Untitled work"
+
+
+def _looks_shared_lane(ws: str) -> bool:
+    """True when an id reads like a shared tool or planning lane, not a WS number."""
+    import re as _re
+
+    return not bool(_re.match(r"(?i)^ws\d+$", str(ws or "").strip()))
 
 
 def _lifecycle_meta(ws: str) -> dict:
@@ -2582,6 +2601,101 @@ def _lifecycle_planned(ctx, ws: str, meta: dict, metas: dict) -> tuple[int, int]
     return 0, 1
 
 
+def _lifecycle_planned_live(ctx, ws: str, meta: dict, runs: list) -> int:
+    """A planned workstream with runs behind it: the first agent started.
+
+    The dashboard never writes bundles, so the state stays ``planned``
+    until a human runs ``ws state <ID> active``. This nag names that
+    command and the earliest run start, so the Current view hint and the
+    CLI agree. One problem per workstream, no member rows.
+    """
+    first: float | None = None
+    count = 0
+    for run in runs or []:
+        if not isinstance(run, dict) or run.get("workstream") != ws:
+            continue
+        count += 1
+        try:
+            stamp = float(run.get("started_at") or 0)
+        except (TypeError, ValueError):
+            continue
+        if stamp > 0 and (first is None or stamp < first):
+            first = stamp
+    if not count or first is None:
+        return 0
+    title = _ws_title(ctx, ws)
+    when = time.strftime("%Y-%m-%d %H:%M", time.gmtime(first)) + " UTC"
+    _add(
+        ctx, "planned-live", "warn", f"ws:{ws}", ws,
+        f"{title} ({ws}) is planned but has runs",
+        f"{title} ({ws}) is still planned but its first agent started {when} "
+        f"({count} {_plural(count, 'run', 'runs')} recorded). The page shows it "
+        f"under Current until the state moves. Activate it with",
+        f"python3 agent_dash.py ws state {ws} active",
+    )
+    return 1
+
+
+def _collect_unplanned(ctx, bundles, runs) -> int:
+    """Runs attributed to an id with no plan bundle (one finding per id).
+
+    Shared lanes (an id without a workstream number, such as a tool or
+    planning lane) get the same ``ws new`` command with a lane-style
+    suggested title; the detail says to keep it as a workstream bundle
+    or, when it is truly shared, to record it as a program bundle by
+    setting ``kind`` to ``program`` in ``bundle.json`` after creation.
+    No ignore list exists, so none is named.
+    """
+    have = set()
+    for item in bundles or []:
+        ws = item.get("id") if isinstance(item, dict) else None
+        if isinstance(ws, str) and ws:
+            have.add(ws)
+    by_ws: dict[str, list] = {}
+    for run in runs or []:
+        if not isinstance(run, dict):
+            continue
+        ws = run.get("workstream")
+        if not isinstance(ws, str) or not ws or ws == "unassigned":
+            continue
+        if ws in have:
+            continue
+        by_ws.setdefault(ws, []).append(run)
+    count = 0
+    for ws in sorted(by_ws):
+        rows = by_ws[ws]
+        first: float | None = None
+        for run in rows:
+            try:
+                stamp = float(run.get("started_at") or run.get("ended_at") or 0)
+            except (TypeError, ValueError):
+                continue
+            if stamp > 0 and (first is None or stamp < first):
+                first = stamp
+        title = _suggest_title(ws)
+        when = (time.strftime("%Y-%m-%d %H:%M", time.gmtime(first)) + " UTC") if first else "recently"
+        detail = (
+            f"Active without a plan: {ws} has {len(rows)} "
+            f"{_plural(len(rows), 'run', 'runs')} recorded (first {when}) "
+            f"but no plan bundle. Create it with: "
+            f"python3 agent_dash.py ws new {ws} \"{title}\""
+        )
+        if _looks_shared_lane(ws):
+            detail += (
+                ". This id looks like a shared tool or planning lane: if it is "
+                "shared rather than one workstream, set \"kind\" to \"program\" "
+                "in bundle.json after creation"
+            )
+        _add(
+            ctx, "unplanned-activity", "warn", f"ws:{ws}", ws,
+            f"Active without a plan: {ws}",
+            detail,
+            f"python3 agent_dash.py ws new {ws} \"{title}\"",
+        )
+        count += 1
+    return count
+
+
 def _lifecycle_phase_members(entry: dict, metas: dict) -> list[str]:
     """Member workstream ids for a phase: explicit list, else milestone match."""
     raw = entry.get("workstreams")
@@ -2671,11 +2785,14 @@ def _collect_lifecycle(ctx) -> None:
     project = _lifecycle_project_exists()
     phases = _lifecycle_phases() if project else None
     if not any(meta.get("has_lifecycle") for meta in metas.values()) and not project:
-        for name in _LIFECYCLE_CODES:
+        for name in [code for code in _LIFECYCLE_CODES if code != "unplanned-activity"]:
             _check(ctx, name, True, "no lifecycle data")
+        runs = _runs_ro(ctx)
+        found = _collect_unplanned(ctx, ctx._bundles or [], runs)
+        _check(ctx, "unplanned-activity", found == 0, f"{found} open" if found else "clean")
         return
     runs = _runs_ro(ctx)
-    counts = {"done-not-archived": 0, "active-idle": 0, "planned-blocked": 0, "planned-ready": 0}
+    counts = {"done-not-archived": 0, "active-idle": 0, "planned-blocked": 0, "planned-ready": 0, "planned-live": 0, "unplanned-activity": 0}
     for ws in sorted(metas):
         state = metas[ws]["state"]
         if state in ("done", "active"):
@@ -2683,10 +2800,12 @@ def _collect_lifecycle(ctx) -> None:
         if state == "active":
             counts["active-idle"] += _lifecycle_idle(ctx, ws, metas[ws], runs)
         if state == "planned":
+            counts["planned-live"] += _lifecycle_planned_live(ctx, ws, metas[ws], runs)
             blocked, ready = _lifecycle_planned(ctx, ws, metas[ws], metas)
             counts["planned-blocked"] += blocked
             counts["planned-ready"] += ready
-    for code in ("done-not-archived", "active-idle", "planned-blocked", "planned-ready"):
+    counts["unplanned-activity"] += _collect_unplanned(ctx, ctx._bundles or [], runs)
+    for code in ("done-not-archived", "active-idle", "planned-blocked", "planned-ready", "planned-live", "unplanned-activity"):
         total = counts[code]
         _check(
             ctx, code, total == 0,

@@ -126,7 +126,52 @@
   function statesById() {
     var map = {};
     (state.wssAll && state.wssAll.length ? state.wssAll : state.wss || []).forEach(function (w) { map[String(w.ws).toUpperCase()] = ADT.wsStateOf(w); });
+    (state.bundles || []).forEach(function (b) {
+      if (!b || !b.id) return;
+      var key = String(b.id).toUpperCase();
+      if (!map[key]) map[key] = b.state || "active";
+    });
     return map;
+  }
+  function shelfRows(want) {
+    var seen = {}, out = [];
+    (state.wss || []).forEach(function (w) {
+      var key = String(w.ws).toUpperCase();
+      if (seen[key]) return;
+      seen[key] = 1;
+      if (wsState(w) === want) out.push(w);
+    });
+    (state.bundles || []).forEach(function (b) {
+      if (!b || b.kind === "program" || b.id === "OVERVIEW") return;
+      var key = String(b.id).toUpperCase();
+      if (seen[key]) return;
+      var st = b.state || "active";
+      if (st !== want) return;
+      seen[key] = 1;
+      out.push({ws: b.id, name: b.title || "", progress: (typeof progressFor === "function" ? progressFor(b.id) : null), depends_on: b.depends_on || [], state: st});
+    });
+    return byWs(out);
+  }
+  function unplannedRows() {
+    var have = {};
+    (state.bundles || []).forEach(function (b) { if (b && b.id) have[String(b.id).toUpperCase()] = 1; });
+    var out = [];
+    (state.wss || []).forEach(function (w) {
+      if (!w || w.ws === "unassigned") return;
+      if (have[String(w.ws).toUpperCase()]) return;
+      if (w.plan) return;
+      var runs = (w.finished_in_range || 0) + (w.live_agents || 0);
+      var active = runs > 0 || (w.tokens || 0) > 0 || (w.cost_usd || 0) > 0 || !!w.last_activity;
+      if (!active) return;
+      out.push(w);
+    });
+    return byWs(out);
+  }
+  function suggestTitle(id) {
+    var up = String(id || "").toUpperCase();
+    if (up === "TOOLS") return "Shared tooling";
+    if (up === "PLANNING") return "Planning lane";
+    return id + " work";
   }
   function taskCounts(row) {
     var pr = row.progress || {done: 0, total: 0};
@@ -138,7 +183,7 @@
      shared planned helper, never recomputed here. */
   function plannedShelf() {
     var c = el("div", {class: "pj-shelf", "data-nav": "Planned"});
-    var rows = byWs((state.wss || []).filter(function (w) { return wsState(w) === "planned"; }));
+    var rows = shelfRows("planned");
     var states = statesById();
     var nowS = Date.now() / 1000;
     rows.forEach(function (w) {
@@ -180,7 +225,7 @@
   function doneRows() {
     var c = el("div", {class: "card pj-done", "data-nav": "Recently done"});
     c.appendChild(secHead("Recently done", "Done, not yet archived — archive after the closing report."));
-    var rows = byWs((state.wss || []).filter(function (w) { return wsState(w) === "done"; }));
+    var rows = shelfRows("done");
     if (!rows.length) {
       c.appendChild(el("p", {class: "pj-note", text: "Nothing waiting to archive."}));
       return c;
@@ -194,6 +239,7 @@
       idline.appendChild(el("span", {text: w.name || ""}));
       name.appendChild(idline);
       name.appendChild(el("span", {class: "prog-pill done", text: "\u2713 Done"}));
+      name.appendChild(el("span", {class: "prog-pill ready", text: "\u2713 Ready to archive", title: "Plan is 100% — archive after the closing report"}));
       row.appendChild(name);
       var bar = el("div", {class: "prog-bar", role: "img", "aria-label": w.ws + " " + tc.done + " of " + tc.total + " tasks done"});
       if (tc.total) {
@@ -221,6 +267,28 @@
       acts.appendChild(copyBtn("python3 agent_dash.py ws archive " + w.ws, "Archive"));
       row.appendChild(acts);
       c.appendChild(row);
+    });
+    return c;
+  }
+
+  function unplannedStrip() {
+    var rows = unplannedRows();
+    if (!rows.length) return null;
+    var c = el("div", {class: "card pj-unplanned", "data-nav": "Unplanned activity"});
+    c.appendChild(secHead("Unplanned activity", "To-do: each id below has runs but no plan bundle yet."));
+    rows.forEach(function (w) {
+      var n = (w.finished_in_range || 0) + (w.live_agents || 0);
+      var label = "Active without a plan: " + (w.name ? w.ws + " " + w.name : w.ws);
+      var line = el("div", {class: "prog-row s-unplanned"});
+      var name = el("div", {class: "prog-name"});
+      name.appendChild(el("span", {text: label}));
+      var sub = w.live_agents ? w.live_agents + " live" : n ? n + " runs" : fmtN(w.tokens || 0) + " tokens";
+      name.appendChild(el("span", {class: "prog-meta", text: sub}));
+      line.appendChild(name);
+      var acts = el("div", {class: "prog-acts"});
+      acts.appendChild(copyBtn("python3 agent_dash.py ws new " + w.ws + " \"" + suggestTitle(w.ws) + "\"", "Copy ws new"));
+      line.appendChild(acts);
+      c.appendChild(line);
     });
     return c;
   }
@@ -257,10 +325,12 @@
       c.appendChild(programPanel(["active", "paused"], true));
       return c;
     }, ""]);
-    specs.push(["project-planned", keyOf([(state.wss || []).map(function (w) { return [w.ws, w.progress, w.depends_on]; }), state.plans, state.approvals]), function () {
+    specs.push(["project-planned", keyOf([(state.wss || []).map(function (w) { return [w.ws, w.progress, w.depends_on]; }), state.bundles, state.plans, state.approvals]), function () {
       var wrap = el("div", {class: "pj-planned-wrap"});
       wrap.appendChild(secHead("Planned", "No tab yet — each names what it waits on."));
       wrap.appendChild(plannedShelf());
+      var unplanned = unplannedStrip();
+      if (unplanned) wrap.appendChild(unplanned);
       return wrap;
     }, ""]);
     specs.push(["project-done-needs", keyOf([(state.wss || []).map(function (w) { return [w.ws, w.progress, w.tokens, w.cost_usd]; }), state.archive, state.approvals]), function () {

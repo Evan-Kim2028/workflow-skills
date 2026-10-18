@@ -272,3 +272,61 @@ def archive_cards(meta: dict | None = None, root: Path | None = None) -> list:
         cards.append(card)
     cards.sort(key=lambda card: (card.get("archived_at") is not None, card.get("archived_at") or 0, card.get("id") or ""), reverse=True)
     return cards
+
+
+def bundle_fallback_rows(existing_ids, bundles=None, plan_ids=None, root=None) -> list:
+    """Zero-activity rows for workstream bundles with no run or board row.
+
+    ``existing_ids`` holds the workstream ids the caller already has rows
+    for (run rollup rows plus board rows). Every ``kind: workstream``
+    bundle missing from it gains one row shaped like a
+    ``query_workstreams`` row with no activity: zero live agents, tokens,
+    and cost, ``last_activity`` None, empty ``ws_confidence``, and the
+    bundle lifecycle fields. ``plan_ids`` marks the ``plan`` flag (all
+    bundles when omitted). Program bundles and OVERVIEW never gain rows:
+    they are not workstream tabs. Callers add ``progress`` and then run
+    ``filter_rows`` with their ``?state=`` scope, so planned bundles with
+    no runs still reach the Planned view and the project home shelves.
+    """
+    from dash.bundles import list_bundles as _list_bundles
+
+    try:
+        items = list(bundles) if bundles is not None else _list_bundles(root)
+    except Exception:
+        return []
+    have = {str(ws) for ws in (existing_ids or set())}
+    plans = set(plan_ids) if plan_ids is not None else None
+    out = []
+    for bundle in items or []:
+        if not isinstance(bundle, dict):
+            continue
+        ws = bundle.get("id")
+        if not isinstance(ws, str) or not ws or ws in have:
+            continue
+        if bundle.get("kind") != "workstream":
+            continue
+        if ws == "OVERVIEW":
+            continue
+        out.append(
+            {
+                "ws": ws,
+                "name": bundle.get("title") if isinstance(bundle.get("title"), str) else "",
+                "tk": {key: 0 for key in ("backlog", "todo", "doing", "review", "done", "cancelled")},
+                "state": bundle.get("state") if bundle.get("state") in STATES else "active",
+                "state_changed_at": bundle.get("state_changed_at"),
+                "archived_at": bundle.get("archived_at"),
+                "depends_on": list(bundle.get("depends_on") or []),
+                "milestone": bundle.get("milestone"),
+                "live_agents": 0,
+                "finished_in_range": 0,
+                "finished_today": 0,
+                "tokens": 0,
+                "cost_usd": 0.0,
+                "tokens_all_time": 0,
+                "cost_usd_all_time": 0.0,
+                "last_activity": None,
+                "plan": (ws in plans) if plans is not None else True,
+                "ws_confidence": [],
+            }
+        )
+    return out
