@@ -320,9 +320,22 @@ def command(worker, label, workspace, prompt_file, session_id):
     ]
 
 
+# Manifest wiring by launcher kind. Every file named here is scanned by the
+# dashboard collectors; a worker entry that names no manifest/columns of
+# its own still lands in its kind's TSV with its model recorded.
+MANIFEST_BY_KIND = {
+    "muse": ("muse-sessions.tsv", ["label", "session_id", "epoch"]),
+    "cursor": ("cursor-sessions.tsv", ["label", "session_id", "epoch", "model"]),
+    "grok-build": ("glm-sessions.tsv", ["label", "session_id", "epoch", "model"]),
+}
+
+
 def append_manifest(worker, run_dir, label, session_id, epoch, model):
-    name = str(worker.get("manifest") or "sessions.tsv")
-    cols = worker.get("columns") or ["label", "session_id", "epoch"]
+    default_name, default_cols = MANIFEST_BY_KIND.get(
+        worker.get("kind") or "", ("sessions.tsv", ["label", "session_id", "epoch"])
+    )
+    name = str(worker.get("manifest") or default_name)
+    cols = worker.get("columns") or default_cols
     values = {
         "label": label,
         "session_id": session_id,
@@ -471,8 +484,8 @@ def pgrep_count(pattern: str) -> int:
     if not pattern:
         return 0
     cmd = ["pgrep", "-f"]
-    if any(ch in pattern for ch in "|()"):
-        cmd.append("-E")
+    if pattern.startswith("-"):
+        cmd.append("--")
     cmd.append(pattern)
     try:
         proc = subprocess.run(cmd, check=False, capture_output=True, text=True, timeout=2)

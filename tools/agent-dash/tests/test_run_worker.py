@@ -176,6 +176,30 @@ class RunWorkerTests(unittest.TestCase):
         row = (self.run_dir / "glm-sessions.tsv").read_text(encoding="utf-8").strip().split("\t")
         self.assertEqual(row, ["lane-1", SID, "1700000000", "glm-5.3"])
 
+    def test_sparse_grok_build_worker_lands_in_glm_manifest_with_model(self):
+        # A grok-build tier without manifest/columns wiring (like a bare
+        # deepseek-flash entry) still lands in glm-sessions.tsv with its
+        # model, where the collectors read it — never in sessions.tsv.
+        data = registry()
+        data["workers"]["deepseek-flash"] = {
+            "enabled": True,
+            "kind": "grok-build",
+            "model": "deepseek-flash",
+            "cap": 10,
+        }
+        self.reg.write_text(json.dumps(data), encoding="utf-8")
+        self.counts = {}
+        launch = Launch()
+        code, line = self.go("deepseek-flash", launch)
+        self.assertEqual(code, 0)
+        self.assertIn("tier=deepseek-flash", line)
+        cmd = launch.cmds[0]
+        self.assertEqual(cmd[0], "grok")
+        self.assertEqual(cmd[cmd.index("-m") + 1], "deepseek-flash")
+        self.assertFalse((self.run_dir / "sessions.tsv").exists())
+        row = (self.run_dir / "glm-sessions.tsv").read_text(encoding="utf-8").strip().split("\t")
+        self.assertEqual(row, ["lane-1", SID, "1700000000", "deepseek-flash"])
+
     def test_quota_on_auto_relaunches_the_next_tier(self):
         self.counts = {}
         launch = Launch(quota_on=1)
