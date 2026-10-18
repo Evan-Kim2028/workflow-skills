@@ -307,6 +307,30 @@ Plan `% done` comes from the server (`progress` on `/api/plan` and `/api/bundle`
 
 Picking up dashboard work (not just feeding it runs)? Read [roadmap.md](roadmap.md) first: what landed with proof, and the open worker-sized tasks in value order. The visual future is the [proposed v2 design spec](design-v2.md) (owner approval pending) with its [tokens](design-v2-tokens.css). Ownership of every file is the table in [CONTRACT.md](../CONTRACT.md). Coordinating the work itself is the [workstream-orchestration skill](../../../skills/workstream-orchestration/SKILL.md) and its [principles](orchestration.md).
 
+### Adding a card
+
+One file plus one registry line. Put the renderer in a new IIFE file under `static/cards/` (copy the header docblock: what it renders, what it reads from `state`, what it exports), attach the render function to `window.AdPage.cards` and keep it as a plain global, add the `<script src="/static/cards/<name>.js">` tag in `static/index.html` before `registry.js`, and add one line to `static/cards/registry.js`:
+
+```js
+/* static/cards/needs.js */
+(function (global) {
+  "use strict";
+  function needsCard() {
+    var c = el("div", {class: "card"});
+    (state.approvals || []).forEach(function (b) {
+      c.appendChild(el("p", {text: b.ws}));
+    });
+    return c;
+  }
+  var AdPage = (global.AdPage = global.AdPage || {});
+  AdPage.cards = AdPage.cards || {};
+  AdPage.cards.needs = global.needsCard = needsCard;
+})(window);
+{id: "needs", order: 45, scope: "both", spec: needsSpec}, // registry.js
+```
+
+`scope` is `overview` (only on `ws=all`), `workstream` (only off it), or `both`. `spec` returns one `applySections` spec `[name, key, render, style]`, or null when the card does not apply. Keep the two-space `function name(` indent: `tests/test_page_rules.py` splits the logical script (core + cards in tag order + inline) on it. The `needs.js` card is the worked example: written, exported, and deliberately unregistered (registering it would add a visible card).
+
 ### Before you push
 
 Run the scoped gate from `tools/agent-dash`. It maps your changed files to test files (`scripts/gate_map.json`), runs each selected test file on its own (never a bare suite), checks changed scripts, and runs the repo privacy audit:

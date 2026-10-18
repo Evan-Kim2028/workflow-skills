@@ -299,7 +299,9 @@ class BundlesApiTest(unittest.TestCase):
         status, _, state_js = get(self.port, "/static/core/state.js")
         self.assertEqual(status, 200)
         self.assertIn(b"pushState", state_js)
-        self.assertIn(b"Needs you", plan)
+        status, _, needs_js = get(self.port, "/static/cards/needs.js")
+        self.assertEqual(status, 200)
+        self.assertIn(b"Needs you", needs_js)
 
 
 class TrainsApiTest(unittest.TestCase):

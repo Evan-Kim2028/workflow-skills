@@ -31,7 +31,16 @@ The one argv value ever kept is the worker's `--model` flag value, recorded on p
 | `dash/sources/claude.py`, `dash/sources/manifests.py`, `dash/sources/generic.py` | src-ai |
 | `dash/sources/muse.py`, `dash/sources/grok_cli.py` | src-tools |
 | `dash/sources/cursor.py` | src-cursor |
-| `static/index.html` (page shell, card functions and their wiring, boot) | Claude (parent) |
+| `static/index.html` (page shell, markup, CSS, script tags, wiring, boot, drawMain registry loop) | Claude (parent) |
+| `static/cards/tiles.js` (headline stat tiles) | Claude (parent) |
+| `static/cards/token-chart.js` (tokens-per-hour stacked bars) | Claude (parent) |
+| `static/cards/live-chart.js` (live-agents-over-time strips) | Claude (parent) |
+| `static/cards/timeline.js` (run timeline gantt + shared run-classify helpers) | Claude (parent) |
+| `static/cards/tables.js` (running and finished run tables) | Claude (parent) |
+| `static/cards/ws-cards.js` (Where we are, workstream cards, planSum cache) | Claude (parent) |
+| `static/cards/plan-progress.js` (plan progress map, task map, replay) | Claude (parent) |
+| `static/cards/needs.js` (needs-you/approvals card, currently unregistered) | Claude (parent) |
+| `static/cards/registry.js` (ordered card list: adding a card is one file plus one line) | Claude (parent) |
 | `static/core/el.js` (DOM helpers, text/format glue, tooltip, copy button) | Claude (parent) |
 | `static/core/state.js` (page state, route read/write, tab filter/order plumbing) | Claude (parent) |
 | `static/core/api.js` (fetch and fixtures, SSE stream, refresh orchestration) | Claude (parent) |

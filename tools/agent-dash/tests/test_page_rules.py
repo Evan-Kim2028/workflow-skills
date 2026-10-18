@@ -37,18 +37,31 @@ def _core_scripts():
     return [(STATIC / src[len("/static/"):]).read_text() for src in names]
 
 
+def _card_scripts():
+    """static/cards/*.js in the order index.html loads them (execution order)."""
+    page = (STATIC / "index.html").read_text()
+    names = re.findall(r'<script src="(/static/cards/[^"]+\.js)"></script>', page)
+    return [(STATIC / src[len("/static/"):]).read_text() for src in names]
+
+
 def inline_scripts():
-    """One logical script: static/core/*.js in script-tag order, then the
-    executable inline script of static/index.html."""
+    """One logical script: static/core/*.js then static/cards/*.js in
+    script-tag order, then the executable inline script of static/index.html."""
     text = (STATIC / "index.html").read_text()
     inline = "\n".join(re.findall(r"<script>(.*?)</script>", text, re.S))
-    return "\n".join(_core_scripts() + [inline])
+    return "\n".join(_core_scripts() + _card_scripts() + [inline])
 
 
 def _extract_taskof(path, name):
     """The page's taskOf source with its name swapped, so node can run it
-    against the same samples as dash/taskmatch.py."""
+    against the same samples as dash/taskmatch.py. taskOf lives in a card
+    file now, so fall back to the card scripts in script-tag order."""
     text = Path(path).read_text()
+    if "function taskOf(" not in text:
+        for cand in _card_scripts():
+            if "function taskOf(" in cand:
+                text = cand
+                break
     start = text.index("function taskOf(")
     brace = text.index("{", start)
     depth = 0
