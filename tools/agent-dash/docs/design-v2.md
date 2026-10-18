@@ -1,7 +1,8 @@
-# Dashboard design v2 — "bold, dark-first" (PROPOSED)
+# Dashboard design v2 — "bold, dark-first"
 
-**Status: Proposed; owner approval pending.** Nothing here is built yet.
-When approved, the build order is [roadmap.md](roadmap.md) Phase 3.
+**Status: base layer landed** (v2 tokens in `static/tokens.css`, page shell
+in `static/index.html`, dark by default). Cards build on top per §2–§4.
+The build order is [roadmap.md](roadmap.md) Phase 3.
 Anything not named here stays as `DESIGN.md` says — entity→colour
 mapping, status as colour plus symbol plus word, one shared `axes()`
 helper, compact formats, hover with exact values.
@@ -91,3 +92,45 @@ Zero is a number and renders like one; empty and error never do.
 10. Type rule: tabular numerals for every number; 34px KPI values; contrast numbers stated per token.
 
 Everything else in `DESIGN.md` stands unchanged.
+
+## 9. Landed tokens
+
+The full set lives in `static/tokens.css` (dark `:root` default, light under
+`:root[data-theme="light"]`). Card CSS may use any of these names; every old
+palette name still works as an alias (right column) so CSS written against
+either set renders the same. Do not invent new token names — reuse these.
+
+| Use | v2 name | Old alias (still works) |
+|---|---|---|
+| App page background | `--bg` | `--page` |
+| Card / panel background | `--card` | `--surface` |
+| Table head, wells, hover fill, skeleton base | `--raised` | `--surface-2` |
+| Drawer, tooltip, popover | `--overlay` | — |
+| Sunken chart plot | `--inset` | — |
+| Primary / secondary / tertiary text | `--ink`, `--ink-2`, `--muted` | `--fg`, `--fg2`, `--fg3`, `--mute` |
+| Chart gridlines, hairline dividers | `--grid` | `--line` |
+| Axis baselines, tick marks | `--axis` | `--pass` (axis-coloured marks) |
+| Card borders / hover borders | `--ring`, `--ring-strong` | — |
+| Accent links, lines, ticks | `--accent` | — |
+| Text on accent fills (near-black; white fails) | `--accent-ink` | — |
+| Accent fill (dark = accent; light = darker shade) | `--accent-fill` | — |
+| Accent tint wash / pulse halo | `--accent-soft`, `--accent-glow` | — |
+| Status greens / ambers / reds | `--good`, `--warning`, `--serious`, `--critical` | `--ok`, `--warn`, `--crit` |
+| Status small-text inks | `--good-ink`, `--warning-ink`, `--critical-ink` | — |
+| Status tint washes | `--good-soft`, `--warning-soft`, `--critical-soft` | `--ok-soft`, `--warn-soft`, `--crit-soft` |
+| Entity hues (family colour) | `--s1` … `--s8`, `--other` | `--port` (= `--s1`), `--unk` (= `--grid`) |
+| Model shades | — | `--m-print`, `--m-veto`, `--m-cat`, `--m-inst`, `--m-replay`, `--m-none` |
+| Radii: controls / wells / cards / pills | `--r-sm`, `--r-md`, `--r-card` (16px), `--r-pill` | — |
+| Shadows | `--shadow-card`, `--shadow-pop`, `--shadow-drawer` | — |
+| Type stacks | `--font`, `--mono` | `--f-display`, `--f-body`, `--f-mono` |
+| Type sizes | `--fs-hero` (34px KPI), `--fs-h1`, `--fs-h2`, `--fs-body`, `--fs-sub`, `--fs-micro` | — |
+| Tabular numerals for every number | `--tnum` | — |
+| Spacing 4/8/12/16/24/32 | `--sp-1` … `--sp-6` | — |
+| Page gutters desktop / phone | `--gutter`, `--gutter-phone` | — |
+| Motion durations / easings | `--dur-instant`, `--dur-swift`, `--dur-settle`, `--ease-out`, `--ease-spring` | — |
+| Chart bar gap / radius / area fill / peak dot | `--bar-gap`, `--bar-radius`, `--area-fill`, `--peak-dot` | — |
+| Chart heights desktop / phone | `--chart-h`, `--chart-h-phone` | — |
+
+Hard rules (from §1): filled accent/blue pills use `--accent-ink` text
+(never white in dark mode); `--muted` passes AA even at 11px; status is
+always colour plus symbol plus word.

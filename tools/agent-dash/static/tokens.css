@@ -1,51 +1,127 @@
-/* Reference palette from DESIGN.md. One :root, two dark scopes. Plan fragments alias these names. */
+/* =====================================================================
+   agent-dash design v2 tokens — DARK FIRST (default), light on toggle.
+   Status: LANDED (see docs/design-v2.md "Landed tokens"). Dark is the
+   default: plain :root carries the dark set, and only an explicit
+   data-theme="light" switches. No media-query guessing.
+
+   Every contrast ratio below was computed, not eyeballed
+   (relative luminance, WCAG 2.x formula; AA normal text needs >= 4.5:1,
+   large text / graphics >= 3:1). Re-check with the same function after
+   any hex change: lum = 0.2126R + 0.7152G + 0.0722B (linearised).
+   ===================================================================== */
 
 :root {
-  color-scheme: light;
-  --page: #f9f9f7;
-  --surface: #fcfcfb;
-  --surface-2: #f0efec;
-  --ink: #0b0b0b;
-  --ink-2: #52514e;
-  --muted: #898781;
-  --grid: #e1e0d9;
-  --axis: #c3c2b7;
-  --ring: rgba(11, 11, 11, .10);
-  --s1: #2a78d6;
-  --s2: #eb6834;
-  --s3: #1baf7a;
-  --s4: #eda100;
-  --s5: #e87ba4;
-  --s6: #008300;
-  --s7: #6250d6;
-  --s8: #e34948;
-  --good: #0ca30c;
-  --warning: #fab219;
-  --serious: #ec835a;
-  --critical: #d03b3b;
-  --good-ink: #006300;
-  --other: #a8a69e;
-  --font: system-ui, -apple-system, "Segoe UI", sans-serif;
-  --mono: ui-monospace, Menlo, Consolas, monospace;
-  --bg: var(--page);
-  --fg: var(--ink);
-  --fg2: var(--ink-2);
-  --fg3: var(--muted);
+  color-scheme: dark;
+
+  /* ---- Surface levels (dark default) ---- */
+  --bg:      #0a0c10;  /* app page.       --ink on --bg      = 17.77:1 */
+  --card:    #12161d;  /* cards, panels.   --ink on --card    = 16.47:1 */
+  --raised:  #1a212c;  /* table head, wells, hover fill, skeleton base */
+  --overlay: #222b3a;  /* drawer, tooltip, popover, dock */
+  --inset:   #0d1117;  /* sunken chart plot behind gridlines */
+
+  /* ---- Ink levels (dark) ---- */
+  --ink:   #f2f4f8;  /* primary text.   on --card 16.47:1, on --bg 17.77:1 */
+  --ink-2: #b9c1ce;  /* secondary text. on --card 10.00:1, on --bg  10.79:1 */
+  --muted: #7e8898;  /* ticks, tertiary, decoration. on --card 5.06:1 —
+                        passes AA even for 11px labels, so small text is
+                        never the thing that fails. */
+
+  /* ---- Lines ---- */
+  --grid: #232b38;  /* recessive chart gridlines, hairline dividers */
+  --axis: #3a4557;  /* axis baselines + tick marks */
+  --ring: rgba(148, 163, 184, .16);  /* card borders */
+  --ring-strong: rgba(148, 163, 184, .30);  /* hover / focus-adjacent borders */
+
+  /* ---- Accent (blue family, = --s1 entity hue) ---- */
+  --accent:      #4c96ff;  /* on --card 6.14:1 — safe for links, ticks, lines */
+  --accent-ink: #071224;  /* text ON accent fills: 6.35:1 (white would be 2.95:1) */
+  --accent-fill: var(--accent);  /* dark fills use the bright accent w/ dark ink */
+  --accent-soft: rgba(76, 150, 255, .14);   /* tint wash behind live pills */
+  --accent-glow: rgba(76, 150, 255, .45);   /* pulse ring / focus halo */
+
+  /* ---- Status (colour + symbol + word, never colour alone) ---- */
+  --good:     #3fd669;  /* on --card 9.53:1 */
+  --good-ink: #4be07a;  /* small "done" text on --card */
+  --good-soft: rgba(63, 214, 105, .14);
+  --warning:     #f5b81e;  /* on --card 10.15:1 */
+  --warning-ink: #ffcf4d;
+  --warning-soft: rgba(245, 184, 30, .16);
+  --serious: #f08a5c;  /* merged-waiting-prod is --s5, not this; serious = dying */
+  --critical:     #f26d6d;  /* on --card 6.20:1 */
+  --critical-ink: #ff8a8a;
+  --critical-soft: rgba(242, 109, 109, .14);
+
+  /* ---- Entity palette, tuned for dark (same hues as light, raised
+         lightness; family = hue, model = shade). Text/line use on --card: */
+  --s1: #4c96ff;  /* opus / Claude blue .......... 6.14:1 */
+  --s2: #f4733a;  /* haiku orange ................ 6.35:1 */
+  --s3: #2bbf9b;  /* sonnet aqua ................. 7.79:1 */
+  --s4: #f2b705;  /* grok / Cursor yellow ........ 9.97:1 */
+  --s5: #f075a8;  /* muse magenta ............... 6.75:1 */
+  --s6: #43b34d;  /* glm green ................... 6.73:1 */
+  --s7: #9b8cf2;  /* dagster violet .............. 6.41:1 */
+  --s8: #f06666;  /* eighth series red ........... ~6.2:1 */
+  --other: #6b7484;  /* unassigned / unknown, with label */
+
+  /* ---- Radii ---- */
+  --r-sm: 6px;    /* controls, chips, swatches */
+  --r-md: 10px;   /* inner wells, tooltips */
+  --r-card: 16px; /* cards — the "bolder" corner */
+  --r-pill: 999px;
+
+  /* ---- Elevation (dark: borders do the work, shadows deepen) ---- */
+  --shadow-card: 0 1px 0 rgba(255, 255, 255, .03) inset,
+                 0 12px 32px -16px rgba(0, 0, 0, .70);
+  --shadow-pop:  0 18px 50px -12px rgba(0, 0, 0, .75),
+                 0 0 0 1px var(--ring-strong);
+  --shadow-drawer: -24px 0 60px rgba(0, 0, 0, .55);
+
+  /* ---- Type scale (system stack; numbers always tabular) ---- */
+  --font: system-ui, -apple-system, "Segoe UI", Inter, sans-serif;
+  --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  --fs-hero: 34px;   /* KPI value, weight 750, letter-spacing -0.02em */
+  --fs-h1: 20px;     /* header title, 700 */
+  --fs-h2: 14px;     /* card title, 700 */
+  --fs-body: 14px;
+  --fs-sub: 12.5px;  /* card sub-line, ink-2 */
+  --fs-micro: 11.5px;/* ticks, tertiary, mono */
+  --tnum: tabular-nums;  /* every value, axis label, table cell with a number */
+
+  /* ---- Spacing scale (4pt) ---- */
+  --sp-1: 4px; --sp-2: 8px; --sp-3: 12px; --sp-4: 16px;
+  --sp-5: 24px; --sp-6: 32px;
+  --gutter: 20px;        /* desktop page gutter */
+  --gutter-phone: 16px;  /* 390px phone gutter; no horizontal scroll */
+
+  /* ---- Motion (all off under prefers-reduced-motion) ---- */
+  --dur-instant: 120ms;  /* hovers, tab underline */
+  --dur-swift: 200ms;    /* tooltips, chips, drawer */
+  --dur-settle: 450ms;   /* bars/areas drawing in, KPI count-up */
+  --ease-out: cubic-bezier(.2, .8, .2, 1);
+  --ease-spring: cubic-bezier(.3, 1.4, .4, 1);  /* live dot, sparingly */
+
+  /* ---- Charts ---- */
+  --bar-gap: 2px;        /* surface gap between stacked segments */
+  --bar-radius: 5px;     /* rounded bar ends */
+  --area-fill: .28;      /* gradient area peak opacity (fades to 0) */
+  --peak-dot: 3px;
+  --chart-h: 190px;      /* desktop chart height */
+  --chart-h-phone: 150px;
+
+  /* Back-compat aliases the current page expects. These names predate
+     v2; they alias the v2 tokens so CSS written against either set
+     renders the same. Do not add new uses of the left-hand names. */
+  --page: var(--bg);
+  --surface: var(--card);
+  --surface-2: var(--raised);
+  --fg: var(--ink); --fg2: var(--ink-2); --fg3: var(--muted);
   --line: var(--grid);
-  --accent: var(--s1);
-  --accent-ink: #fff;
-  --accent-soft: color-mix(in srgb, var(--s1) 16%, var(--surface));
-  --ok: var(--good);
-  --ok-soft: color-mix(in srgb, var(--good) 16%, var(--surface));
-  --warn: var(--warning);
-  --warn-soft: color-mix(in srgb, var(--warning) 24%, var(--surface));
-  --crit: var(--critical);
-  --crit-soft: color-mix(in srgb, var(--critical) 16%, var(--surface));
-  --mute: var(--muted);
-  --mute-soft: var(--surface-2);
-  --port: var(--s1);
-  --pass: var(--axis);
-  --unk: var(--grid);
+  --ok: var(--good); --ok-soft: var(--good-soft);
+  --warn: var(--warning); --warn-soft: var(--warning-soft);
+  --crit: var(--critical); --crit-soft: var(--critical-soft);
+  --mute: var(--muted); --mute-soft: var(--raised);
+  --port: var(--s1); --pass: var(--axis); --unk: var(--grid);
   --m-print: var(--s1);
   --m-veto: var(--s6);
   --m-cat: var(--s4);
@@ -57,52 +133,69 @@
   --f-mono: var(--mono);
 }
 
-@media (prefers-color-scheme: dark) {
-  :root:where(:not([data-theme="light"])) {
-    color-scheme: dark;
-    --page: #0d0d0d;
-    --surface: #1a1a19;
-    --surface-2: #242422;
-    --ink: #f0efec;
-    --ink-2: #c3c2b7;
-    --muted: #898781;
-    --grid: #2c2c2a;
-    --axis: #383835;
-    --ring: rgba(255, 255, 255, .10);
-    --s1: #3987e5;
-    --s2: #d95926;
-    --s3: #199e70;
-    --s4: #c98500;
-    --s5: #d55181;
-    --s6: #008300;
-    --s7: #9085e9;
-    --s8: #e66767;
-    --good-ink: #0ca30c;
-    --other: #5f5e59;
-  }
-}
-
+/* An explicit data-theme="dark" is the same as the default. */
 :root[data-theme="dark"] {
   color-scheme: dark;
-  --page: #0d0d0d;
-  --surface: #1a1a19;
-  --surface-2: #242422;
-  --ink: #f0efec;
-  --ink-2: #c3c2b7;
-  --muted: #898781;
-  --grid: #2c2c2a;
-  --axis: #383835;
-  --ring: rgba(255, 255, 255, .10);
-  --s1: #3987e5;
-  --s2: #d95926;
-  --s3: #199e70;
-  --s4: #c98500;
-  --s5: #d55181;
-  --s6: #008300;
-  --s7: #9085e9;
-  --s8: #e66767;
-  --good-ink: #0ca30c;
-  --other: #5f5e59;
+}
+
+/* ================= LIGHT (toggle only; same names) ================= */
+:root[data-theme="light"] {
+  color-scheme: light;
+
+  --bg:      #edf0f4;  /* cooler page so white cards lift off it */
+  --card:    #ffffff;
+  --raised:  #f1f4f8;
+  --overlay: #ffffff;
+  --inset:   #f6f8fb;
+
+  /* --ink on --card 18.45:1 · --ink-2 8.95:1 · --muted 4.61:1 (AA at 11px) */
+  --ink:   #0d1420;
+  --ink-2: #3f4a5c;
+  --muted: #68768c;
+
+  --grid: #e3e8ef;
+  --axis: #b9c3d1;
+  --ring: rgba(13, 20, 32, .10);
+  --ring-strong: rgba(13, 20, 32, .22);
+
+  /* Fills keep the validated light hues; text-on-fill is a darker shade
+     of the same hue: white on --accent-fill = 5.54:1. */
+  --accent:      #2a78d6;  /* links, lines (white on it 4.42:1 — large only) */
+  --accent-fill: #2668bc;  /* filled pills/tabs: white on it 5.54:1 */
+  --accent-ink: #ffffff;
+  --accent-soft: rgba(42, 120, 214, .12);
+  --accent-glow: rgba(42, 120, 214, .35);
+
+  --good: #0ca30c; --good-ink: #006300;  /* ink on card 7.54:1 */
+  --good-soft: rgba(12, 163, 12, .12);
+  --warning: #b97a00;  /* darkened amber so words on card pass AA */
+  --warning-ink: #7a5200;
+  --warning-soft: rgba(185, 122, 0, .14);
+  --serious: #d06028;
+  --critical: #c93a3a; --critical-ink: #a82a2a;
+  --critical-soft: rgba(201, 58, 58, .10);
+
+  /* Validated light entity hues (unchanged): */
+  --s1: #2a78d6; --s2: #eb6834; --s3: #1baf7a; --s4: #eda100;
+  --s5: #e87ba4; --s6: #008300; --s7: #6250d6; --s8: #e34948;
+  --other: #a8a69e;
+
+  --shadow-card: 0 1px 2px rgba(13, 20, 32, .06),
+                 0 12px 32px -16px rgba(13, 20, 32, .18);
+  --shadow-pop:  0 18px 50px -12px rgba(13, 20, 32, .28),
+                 0 0 0 1px var(--ring-strong);
+  --shadow-drawer: -24px 0 60px rgba(13, 20, 32, .22);
+
+  --page: var(--bg);
+  --surface: var(--card);
+  --surface-2: var(--raised);
+  --fg: var(--ink); --fg2: var(--ink-2); --fg3: var(--muted);
+  --line: var(--grid);
+  --ok: var(--good); --ok-soft: var(--good-soft);
+  --warn: var(--warning); --warn-soft: var(--warning-soft);
+  --crit: var(--critical); --crit-soft: var(--critical-soft);
+  --mute: var(--muted); --mute-soft: var(--raised);
+  --port: var(--s1); --pass: var(--axis); --unk: var(--grid);
 }
 
 /* Hover-reveal section list. Fixed overlay: the page layout does not move. */
