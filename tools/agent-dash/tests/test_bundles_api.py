@@ -162,6 +162,30 @@ class BundlesApiTest(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(json.loads(body)["issues"], [])
 
+    def test_plan_carries_layout_and_map_warnings(self):
+        status, _, body = get(self.port, "/api/plan?ws=WS9")
+        self.assertEqual(status, 200)
+        payload = json.loads(body)
+        self.assertEqual(payload["layout"]["density"], "comfortable")
+        self.assertEqual(payload["layout"]["live_tasks"], 1)
+        self.assertEqual(payload["layout"]["arrows"]["mode"], "all")
+        self.assertEqual(payload["map_warnings"], [])
+
+    def test_layout_follows_plan_mtime(self):
+        status, _, first = get(self.port, "/api/plan?ws=WS9")
+        self.assertEqual(json.loads(first)["map_warnings"], [])
+        plan_path = Path(self.tmp.name) / "WS9" / "plan.json"
+        plan = json.loads(plan_path.read_text(encoding="utf-8"))
+        plan["trains"] = [{"id": "solo", "title": "Solo train", "members": ["WS9.1"], "status": "planned"}]
+        plan_path.write_text(json.dumps(plan), encoding="utf-8")
+        stat = plan_path.stat()
+        os.utime(plan_path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 5_000_000_000))
+        status, _, second = get(self.port, "/api/plan?ws=WS9")
+        self.assertEqual(status, 200)
+        payload = json.loads(second)
+        self.assertEqual([warn["code"] for warn in payload["map_warnings"]], ["MAP107"])
+        self.assertEqual(len(payload["layout"]["trains"]["untagged"]), 1)
+
     def test_invalid_bundle_serves_with_issues(self):
         plan_path = Path(self.tmp.name) / "WS9" / "plan.json"
         plan = json.loads(plan_path.read_text(encoding="utf-8"))
@@ -597,6 +621,7 @@ class OrchestrateApiTest(unittest.TestCase):
         plan["dag"]["groups"][0]["tasks"][1]["files"] = "api/x.py"
         plan_path.write_text(json.dumps(plan), encoding="utf-8")
         self.assertTrue(any("files" in issue for issue in validate_bundle("WS9")))
+
 
 
 if __name__ == "__main__":

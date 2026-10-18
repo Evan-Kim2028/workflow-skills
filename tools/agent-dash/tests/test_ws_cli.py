@@ -628,5 +628,185 @@ class OrchestrateCliTest(unittest.TestCase):
         self.assertTrue(any("received_as" in issue for issue in validate_bundle("WS9")))
 
 
+class WsLayoutCliTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.old = os.environ.get("AGENT_DASH_WORKSTREAMS")
+        os.environ["AGENT_DASH_WORKSTREAMS"] = self.tmp.name
+        self.root = Path(self.tmp.name)
+
+    def tearDown(self):
+        if self.old is None:
+            os.environ.pop("AGENT_DASH_WORKSTREAMS", None)
+        else:
+            os.environ["AGENT_DASH_WORKSTREAMS"] = self.old
+        self.tmp.cleanup()
+
+    def _write_plan(self, ws: str, dag: dict, trains=None) -> None:
+        from dash.bundles import bundle_dir
+
+        path = bundle_dir(ws)
+        assert path is not None
+        plan = json.loads((path / "plan.json").read_text(encoding="utf-8"))
+        plan["dag"] = dag
+        plan["trains"] = trains if trains is not None else []
+        (path / "plan.json").write_text(json.dumps(plan), encoding="utf-8")
+
+    def _rich_dag(self) -> dict:
+        return {
+            "cols": ["Shape", "Build", "Prove"],
+            "groups": [
+                {
+                    "id": "g1",
+                    "col": 0,
+                    "title": "First stage group",
+                    "tasks": [
+                        {"id": f"WS9.{pos}", "title": f"Task {pos}", "status": "done"}
+                        for pos in range(1, 16)
+                    ],
+                },
+                {
+                    "id": "g2",
+                    "col": 1,
+                    "title": "Second stage group",
+                    "tasks": [
+                        {"id": "WS9.16", "title": "Task 16", "status": "todo", "deps": ["WS9.1"]},
+                        {"id": "WS9.17", "title": "Task 17", "status": "todo", "deps": ["WS9.16"]},
+                    ],
+                },
+                {
+                    "id": "g3",
+                    "col": 2,
+                    "title": "Third stage group",
+                    "tasks": [
+                        {"id": "WS9.18", "title": "Task 18", "status": "todo", "deps": ["WS9.17"]},
+                        {"id": "WS9.19", "title": "Task 19", "status": "todo", "deps": ["WS9.18"]},
+                    ],
+                },
+            ],
+            "edges": [["g1", "g2"], ["g2", "g3"]],
+        }
+
+    def test_template_has_zero_map_warnings(self):
+        from dash.bundles import plan_map_warnings
+
+        self.assertEqual(cmd_ws(["new", "WS9", "Sample"]), 0)
+        self.assertEqual(plan_map_warnings("WS9"), [])
+        self.assertEqual(cmd_ws(["validate", "WS9"]), 0)
+
+    def test_layout_json_matches_layout_object(self):
+        import contextlib
+        import io
+
+        from dash import maplayout
+        from dash.bundles import bundle_plan_view
+
+        self.assertEqual(cmd_ws(["new", "WS9", "Sample"]), 0)
+        self._write_plan("WS9", self._rich_dag())
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.assertEqual(cmd_ws(["layout", "WS9", "--json"]), 0)
+        payload = json.loads(buf.getvalue())
+        self.assertEqual(payload["ws"], "WS9")
+        body = bundle_plan_view("WS9")
+        assert body is not None
+        self.assertEqual(payload["layout"], maplayout.layout(body))
+        self.assertEqual(payload["map_warnings"], maplayout.map_warnings(body))
+        self.assertEqual(payload["layout"]["density"], "comfortable")
+        codes = [warn["code"] for warn in payload["map_warnings"]]
+        self.assertIn("MAP101", codes)
+
+    def test_layout_human_names_modes_and_warnings(self):
+        import contextlib
+        import io
+
+        self.assertEqual(cmd_ws(["new", "WS9", "Sample"]), 0)
+        self._write_plan(
+            "WS9",
+            self._rich_dag(),
+            trains=[{"id": "solo", "title": "Solo train", "members": ["WS9.1"], "status": "planned"}],
+        )
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.assertEqual(cmd_ws(["layout", "WS9"]), 0)
+        text = buf.getvalue()
+        self.assertIn("comfortable density", text)
+        self.assertIn("arrows all", text)
+        self.assertIn("labels:", text)
+        self.assertIn("warning MAP101:", text)
+        self.assertIn("warning MAP107:", text)
+        self.assertIn("Fix:", text)
+
+    def test_layout_exit_codes(self):
+        self.assertEqual(cmd_ws(["layout", "NOPE"]), 3)
+        self.assertEqual(cmd_ws(["layout"]), 2)
+        self.assertEqual(cmd_ws(["new", "WS9", "Sample"]), 0)
+        (self.root / "WS9" / "plan.json").write_text("{nope", encoding="utf-8")
+        self.assertEqual(cmd_ws(["layout", "WS9"]), 4)
+
+    def test_validate_warnings_keep_exit_zero(self):
+        import contextlib
+        import io
+
+        self.assertEqual(cmd_ws(["new", "WS9", "Sample"]), 0)
+        self._write_plan(
+            "WS9",
+            self._rich_dag(),
+            trains=[{"id": "solo", "title": "Solo train", "members": ["WS9.1"], "status": "planned"}],
+        )
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.assertEqual(cmd_ws(["validate", "WS9"]), 0)
+        text = buf.getvalue()
+        self.assertIn("warnings:", text)
+        self.assertIn("warning MAP101:", text)
+        self.assertIn("warning MAP107:", text)
+        self.assertIn("OK WS9", text)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.assertEqual(cmd_ws(["validate", "WS9", "--json"]), 0)
+        payload = json.loads(buf.getvalue())
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["issues"], [])
+        codes = [warn["code"] for warn in payload["warnings"]]
+        self.assertIn("MAP101", codes)
+        self.assertIn("MAP107", codes)
+
+    def test_validate_errors_still_fail_with_warnings(self):
+        import contextlib
+        import io
+
+        self.assertEqual(cmd_ws(["new", "WS9", "Sample"]), 0)
+        plan_path = self.root / "WS9" / "plan.json"
+        plan = json.loads(plan_path.read_text(encoding="utf-8"))
+        plan["dag"] = self._rich_dag()
+        plan["dag"]["groups"][0]["tasks"][0]["deps"] = ["WS9.missing"]
+        plan_path.write_text(json.dumps(plan), encoding="utf-8")
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.assertEqual(cmd_ws(["validate", "WS9"]), 4)
+        self.assertIn("warning MAP101:", buf.getvalue())
+
+    def test_layout_failure_warns_and_keeps_exit_zero(self):
+        import contextlib
+        import io
+        from unittest import mock
+
+        self.assertEqual(cmd_ws(["new", "WS9", "Sample"]), 0)
+        boom = ValueError("layout boom")
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch("dash.maplayout.layout", side_effect=boom), mock.patch("dash.maplayout.map_warnings", side_effect=boom):
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                self.assertEqual(cmd_ws(["layout", "WS9"]), 0)
+                self.assertEqual(cmd_ws(["validate", "WS9"]), 0)
+            js = io.StringIO()
+            with contextlib.redirect_stdout(js), contextlib.redirect_stderr(err):
+                self.assertEqual(cmd_ws(["layout", "WS9", "--json"]), 0)
+        self.assertIn("warning: map layout unavailable (ValueError)", err.getvalue())
+        payload = json.loads(js.getvalue())
+        self.assertIsNone(payload["layout"])
+        self.assertEqual(payload["map_warnings"], [])
+
+
 if __name__ == "__main__":
     unittest.main()

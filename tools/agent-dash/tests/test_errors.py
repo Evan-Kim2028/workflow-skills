@@ -132,7 +132,7 @@ class WsJsonTest(unittest.TestCase):
     def test_validate_json_shapes(self):
         code, payload = self._json(["validate", "WS9", "--json"])
         self.assertEqual(code, 0)
-        self.assertEqual(payload, {"ws": "WS9", "ok": True, "issues": []})
+        self.assertEqual(payload, {"ws": "WS9", "ok": True, "issues": [], "warnings": []})
         code, _out, err = _run(["validate", "NOPE", "--json"])
         self.assertEqual(code, 3)
         self.assertIn("ws list", err)

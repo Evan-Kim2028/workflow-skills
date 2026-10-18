@@ -11,10 +11,11 @@ import fcntl
 import json
 import os
 import re
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-from dash import errors
+from dash import errors, maplayout
 from dash.plans import PlanNotFound, configured
 from dash.plans import load as load_plan
 from dash.plans import plan_progress
@@ -70,6 +71,7 @@ WS_USAGE = """agent-dash workstream bundles
   python3 agent_dash.py ws overlap <ID> [--all] [--cross] [--json]
   python3 agent_dash.py ws gates <ID> [--json]
   python3 agent_dash.py ws deferred [<ID>] [--json]
+  python3 agent_dash.py ws layout <ID> [--json]
 
 Status is todo, wip, pr, prog, done, or deferred. deferred may set --moved-to and --note.
 `ws plan` lists the bundle's tasks (ids, titles, status, deps). `--json` prints
@@ -426,7 +428,10 @@ def _template_plan(ws: str) -> dict:
             "new_tasks": [{"id": f"{ws}.1", "title": "First task", "phase": "First phase", "size": "S"}],
         },
         "dag": {
-            "cols": ["Shape", "Build", "Prove", "Ship", "Clean up"],
+            # One starting stage: the planner adds the 4 to 5 stage columns
+            # from the map checklist as the plan takes shape, so a fresh
+            # bundle carries zero MAP warnings.
+            "cols": ["Shape"],
             "groups": [
                 {
                     "id": "start",
@@ -1109,6 +1114,119 @@ def validate_bundle(ws: str, root: Path | None = None) -> list[str]:
         for hit in naming_issues(text):
             issues.append(f"{name}:{hit.line}: bare citation {hit.token}")
     return issues
+
+
+def plan_map_warnings(ws: str, root: Path | None = None) -> list[dict]:
+    """Layer C lint dicts (MAP101 to MAP111) for a bundle's plan.
+
+    Warnings, never errors: empty when the plan is missing or unreadable,
+    so callers keep their own not-found and invalid-plan paths.
+    """
+    path = bundle_dir(ws, root)
+    if path is None:
+        return []
+    plan = _read_json(path / "plan.json")
+    if not isinstance(plan, dict):
+        return []
+    dag = plan.get("dag") if isinstance(plan.get("dag"), dict) else {}
+    narrative = plan.get("narrative") if isinstance(plan.get("narrative"), dict) else {}
+    view = {
+        "ws": ws,
+        "cols": [item for item in dag.get("cols") or [] if isinstance(item, str)],
+        "groups": dag.get("groups") if isinstance(dag.get("groups"), list) else [],
+        "edges": dag.get("edges") if isinstance(dag.get("edges"), list) else [],
+        "phases": narrative.get("phases") if isinstance(narrative.get("phases"), list) else [],
+        "trains": plan.get("trains") if isinstance(plan.get("trains"), list) else [],
+    }
+    try:
+        return maplayout.map_warnings(view)
+    except Exception as exc:
+        _map_unavailable(exc)
+        return []
+
+
+def _map_unavailable(exc: Exception) -> None:
+    """Warnings channel for a map layout failure: stderr, exit code untouched."""
+    print(f"warning: map layout unavailable ({type(exc).__name__})", file=sys.stderr)
+
+
+def _print_map_warnings(warnings: list[dict]) -> None:
+    """One ``warning MAPnnn: ...`` line per lint finding, with the fix hint."""
+    if not warnings:
+        return
+    print("warnings:")
+    for warn in warnings:
+        print(f"warning {warn['code']}: {warn['title']} ({warn['detail']}). Fix: {warn['fix']}")
+
+
+def print_layout(ws: str, json_mode: bool = False) -> int:
+    """Print the computed map layout for a workstream without touching the page."""
+    body, message, code = _resolve_body(ws)
+    if body is None:
+        assert message is not None
+        _say(message, json_mode)
+        return code
+    view = body if isinstance(body, dict) else {}
+    result: dict | None = None
+    warnings: list[dict] = []
+    try:
+        result = maplayout.layout(view)
+    except Exception as exc:
+        _map_unavailable(exc)
+    try:
+        warnings = maplayout.map_warnings(view)
+    except Exception as exc:
+        _map_unavailable(exc)
+    if json_mode:
+        errors.emit_json({"ws": ws, "layout": result, "map_warnings": warnings})
+        return 0
+    if result is None:
+        _print_map_warnings(warnings)
+        return 0
+    print(
+        f"{ws} map layout: {result['density']} density "
+        f"({result['live_tasks']} live, {result['deferred_tasks']} deferred), "
+        f"arrows {result['arrows']['mode']} ({result['arrows']['reason']}, {result['group_edges']} group edges)"
+    )
+    parts = [f"{col['title']}[{col['tasks']} {col['state']}]" for col in result["columns"]]
+    print(f"columns ({len(parts)}): {' '.join(parts)}")
+    if result["folded_rail"] is not None:
+        print(f"folded rail: {result['folded_rail']['label']}")
+    balance = result["balance"]
+    if balance["tallest"] is not None:
+        tall = balance["tallest"]
+        short = balance["shortest"]
+        print(f"tallest {tall['title']} ({tall['tasks']} tasks) vs shortest {short['title']} ({short['tasks']} tasks)")
+    counts = {"open": 0, "collapsed-done": 0, "slim": 0}
+    for group in result["groups"]:
+        counts[group["state"]] = counts.get(group["state"], 0) + 1
+    print(
+        f"groups ({len(result['groups'])}): {counts.get('open', 0)} open, "
+        f"{counts.get('collapsed-done', 0)} collapsed-done, {counts.get('slim', 0)} slim"
+    )
+    for group in result["groups"]:
+        if group["state"] == "collapsed-done":
+            print(f"  collapsed \"{group['title']}\" ({group['id']}): {group['live_tasks']} live, {group['more_token']}")
+        elif group["state"] == "slim" and group.get("slim_summary") is not None:
+            summary = group["slim_summary"]
+            print(f"  slim \"{group['title']}\" ({group['id']}): ✓{summary['done']}/{summary['total']}")
+    labels = result["labels"]
+    collisions = f", {len(labels['collisions'])} collisions disambiguated" if labels["collisions"] else ""
+    print(f"labels: {labels['shortened']} shortened{collisions}")
+    fan_in = ", ".join(f"{row['id']} ({row['deps']} deps)" for row in result["arrows"]["fan_in"])
+    print(f"fan-in: {fan_in if fan_in else 'none'}")
+    trains = result["trains"]
+    if trains["caption"] is not None:
+        print(f"trains: {len(trains['tagged'])} tagged, {len(trains['untagged'])} untagged — {trains['caption']}")
+    elif trains["tagged"]:
+        print(f"trains: {', '.join(str(tid) for tid in trains['legend'])}")
+    else:
+        print("trains: none")
+    print(f"phases: {result['phases_line'] if result['phases_line'] else '(no phases)'}")
+    _print_map_warnings(warnings)
+    if not warnings:
+        print("(no MAP warnings)")
+    return 0
 
 
 def set_task(
@@ -1799,16 +1917,23 @@ def cmd_ws(argv: list[str]) -> int:
             _say(errors.bundle_not_found(ws), json_mode)
             return errors.NOT_FOUND
         issues = validate_bundle(ws)
+        warnings = plan_map_warnings(ws)
         if json_mode:
-            errors.emit_json({"ws": ws, "ok": not issues, "issues": issues})
+            errors.emit_json({"ws": ws, "ok": not issues, "issues": issues, "warnings": warnings})
             return errors.INVALID_DATA if issues else errors.OK
+        for issue in issues:
+            print(issue)
+        _print_map_warnings(warnings)
         if issues:
-            for issue in issues:
-                print(issue)
             print(f"validate failed for {ws}: {len(issues)} issues. Fix the files above, then re-run: python3 agent_dash.py ws validate {ws}")
             return errors.INVALID_DATA
         print(f"OK {ws}")
         return 0
+    if cmd == "layout":
+        if len(rest) != 1:
+            print(WS_USAGE, end="", flush=True)
+            return errors.USAGE
+        return print_layout(rest[0], json_mode=json_mode)
     if cmd == "plan":
         if len(rest) != 1:
             print(WS_USAGE, end="", flush=True)

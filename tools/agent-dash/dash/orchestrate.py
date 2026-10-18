@@ -596,7 +596,7 @@ def live_by_task(
         if owner and owner != ws:
             continue
         label = run.get("label") or ""
-        tid = taskmatch.task_of(label, ws, table, ids)
+        tid = taskmatch.task_of_verified(label, ws, table, ids)
         if not isinstance(tid, str):
             continue
         start = run.get("started_at") or 0

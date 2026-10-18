@@ -206,7 +206,7 @@ def build_replay(store, ws: str, now: float | None = None) -> dict:
         owner = run.get("workstream")
         if owner and owner != ws:
             continue
-        tid = taskmatch.task_of(run.get("label"), ws, taskmap, ids)
+        tid = taskmatch.task_of_verified(run.get("label"), ws, taskmap, ids)
         if tid is None or tid not in per_task:
             continue
         start = run.get("started_at")

@@ -180,8 +180,9 @@ one fixed 24 h window; it skips with a clear message when Chrome is missing.
 (plus an `issues` list, the `ws validate` findings, empty when clean; a bad
 plan still serves 200 with its issues named, so bad states are never drawn
 as tasks; the page does not show the issues, which `ws validate` and this field carry):
-`{"ws": "WS7", "cols": [..], "groups": [{id, col, title, tasks: [{id, title, status, deps, kind, dep_notes}]}], "edges": [[a, b]], "phases": [{name, goal, gate}], "progress": {"done": 0, "total": 0, "counts": {todo, wip, pr, prog, done, deferred}, "pct": 0}, "ready": ["WS7.2"], "critical_path": ["WS7.1", "WS7.2"], "max_parallel": 3}`.
+`{"ws": "WS7", "cols": [..], "groups": [{id, col, title, tasks: [{id, title, status, deps, kind, dep_notes}]}], "edges": [[a, b]], "phases": [{name, goal, gate}], "progress": {"done": 0, "total": 0, "counts": {todo, wip, pr, prog, done, deferred}, "pct": 0}, "ready": ["WS7.2"], "critical_path": ["WS7.1", "WS7.2"], "max_parallel": 3, "layout": {...}, "map_warnings": [{code, severity, title, detail, fix}]}`.
 `ready` is the todo-with-satisfied-deps task ids ranked by critical-path impact, `critical_path` is the longest dep chain, and `max_parallel` is the widest dependency wave; all three come from `dash/orchestrate.py` with no store reads, cached by `plan.json` mtime.
+`layout` is the computed map layout from `dash/maplayout.py` (density, per-group collapse state, columns, chip labels, arrows mode, train tags, phases line), and `map_warnings` is the MAP101–MAP111 lint for that plan; both are cached by `plan.json` mtime like the orchestration fields. The page consumes `layout`; `ws layout <ID>` prints the same object without touching the page.
 A task's `kind` is `task` or `gate` (an outside signal or condition, drawn as a diamond); absent means `task`. `dep_notes` maps one of the task's dep ids to the short condition on that edge. A task may also carry `files` (declared file footprints, a non-empty list of glob strings), and a gate may carry `signal` (what it waits on), `confirmed_at` (ISO-8601 UTC of the last check), and `fresh_hours` (recheck bound; older or missing confirmations read STALE). A deferred task may carry `received_as` (the task id in the receiving workstream that picked it up). All pass through every plan API sanitized like other fields. `/api/bundle` carries the same task shape inside `plan.dag.groups`.
 `plans.local.json` replaces `plans.example.json`. Each value is a path. Relative paths resolve next to the plans file. The loader reads `dag` and `narrative.phases`.
 One resolver (`dash.bundles.resolve_plan`) picks the plan file: a bundle's
@@ -395,6 +396,7 @@ python3 agent_dash.py ws new <ID> "<title>"
 python3 agent_dash.py ws validate <ID>
 python3 agent_dash.py ws render <ID>
 python3 agent_dash.py ws plan <ID>
+python3 agent_dash.py ws layout <ID>
 python3 agent_dash.py ws task <ID> <task-id> <status> [--moved-to WSn] [--note "..."] [--force]
 python3 agent_dash.py ws approve <ID> <item-id> <approved|denied|pending> [--note "..."] [--step "..."] [--reversible yes|no] [--conditions "..."]
 python3 agent_dash.py ws approvals [<ID>]
@@ -405,6 +407,22 @@ Exit codes are 0 ok, 1 check failed, 2 usage error, 3 not found, 4
 invalid data, 5 dashboard unreachable (docs/integrate.md, For agents).
 
 `ws new` writes a valid template. `ws task` writes `plan.json` through a temp file and `os.replace`, holding a per-bundle `fcntl` lock across the read-modify-write so concurrent writers keep every update. `ws approve` writes `approvals.json` the same way. Moving a `done` or `deferred` task back to `wip` or `pr` needs `--force`. A new pending item needs `--step`, `--reversible yes|no`, and `--conditions`. `approved` or `denied` sets `decided_at` and `decided_by` to `owner`. `ws approvals` prints a table. `ws validate` checks the schema, including `approvals.json` when that file exists, and the naming rule: a TU-style id, a #-prefixed issue number, or an ADR number with no phrase earlier on the same line is a failure.
+
+Map warnings (MAP101–MAP111) are the plan-shape lint from `dash/maplayout.py`: warnings, never errors. `ws validate` prints them after errors under a `warnings:` heading and lists them in `--json` under `warnings`; the exit code follows the schema errors alone. `ws layout <ID> [--json]` prints the computed layout (density, columns, group states, label shortening count, arrows policy) plus the same warnings with fix hints. Run it before kickoff and aim for zero MAP warnings. The codes:
+
+| Code | Warns when | Fix |
+|---|---|---|
+| MAP101 | a group has more than 14 tasks | split the group into two stage groups |
+| MAP102 | more than 5 columns | re-stage into at most 5 columns |
+| MAP103 | a column holds groups but no live tasks | drop the column or move a group into it |
+| MAP104 | tallest column > 3x shortest with > 40 live tasks | regroup across stages |
+| MAP105 | a group title is a bare id | retitle in plain words |
+| MAP106 | 3+ columns and a non-first-column group has no waits-on edge | add stage waits-on edges |
+| MAP107 | a train has fewer than 2 members | drop the train, keep a task note |
+| MAP108 | more than 40 task edges (arrows default to on-focus) | add dep_notes to cross-group edges |
+| MAP109 | half or more groups hold exactly 1 task | merge 1-task groups |
+| MAP110 | a task id suffix is longer than 12 chars | shorten the id |
+| MAP111 | deferred share above 20% (info) | no action; deferred auto-collapse |
 
 HTTP, still GET only, 127.0.0.1:
 

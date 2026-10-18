@@ -308,6 +308,23 @@ class LiveByTaskTest(unittest.TestCase):
         runs = [{"run_id": "a", "label": "ws9-WS9.1-x", "workstream": "WS10", "status": "running", "started_at": 1.0}]
         self.assertEqual(orch.live_by_task(runs, "WS9", ["WS9.1"]), {})
 
+    def test_phantom_task_id_drops_to_unmapped(self):
+        from dash import taskmatch
+
+        ids = ["WS7.8"]
+        self.assertEqual(taskmatch.task_of("ws7-ops-gold-rebuild", "WS7", {}, ids), "WS7.OPS")
+        self.assertIsNone(taskmatch.task_of_verified("ws7-ops-gold-rebuild", "WS7", {}, ids))
+        self.assertEqual(taskmatch.task_of_verified("ws7-WS7.8-x", "WS7", {}, ids), "WS7.8")
+        self.assertEqual(
+            taskmatch.task_of_verified("ws7-ops-gold-rebuild", "WS7", {}, []),
+            "WS7.OPS",
+        )
+        runs = [
+            {"run_id": "a", "label": "ws7-ops-gold-rebuild", "workstream": "WS7", "status": "running", "started_at": 100.0},
+            {"run_id": "b", "label": "ws7-WS7.8-x", "workstream": "WS7", "status": "running", "started_at": 200.0},
+        ]
+        self.assertEqual(orch.live_by_task(runs, "WS7", ids), {"WS7.8": "ws7-WS7.8-x"})
+
 
 def _seed_profile_db(path: Path) -> float:
     """Synthetic dashboard: one lead, a subagent child, a Bash-launched

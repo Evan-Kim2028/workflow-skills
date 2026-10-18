@@ -65,7 +65,7 @@ fix command, not the page path: when the fix command only re-diagnoses
 These commands take `--json` for machine output on stdout only (human
 text moves to stderr when `--json` is set): `check`, `check --page`
 (summary), `state`, `status`, `doctor`, `ws validate`, `ws approvals`,
-`ws trains`, `ws plan <ID>`. The schema only gains fields, never
+`ws trains`, `ws plan <ID>`, `ws layout <ID>`. The schema only gains fields, never
 renames them.
 
 Exit codes are the same in `agent_dash.py` and every `ws` subcommand:

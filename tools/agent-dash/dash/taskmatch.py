@@ -110,6 +110,21 @@ def task_of(label: str | None, ws: str | None, taskmap: dict | None = None, plan
     return None
 
 
+def task_of_verified(label: str | None, ws: str | None, taskmap: dict | None = None, plan_ids: list[str] | tuple = ()) -> str | None:
+    """``task_of`` with the phantom live-mapping fix.
+
+    A mapped task id that is not in the workstream's plan (for example
+    the WS7 built-in mapping ``ws7-ops-gold-rebuild`` to ``WS7.OPS``,
+    which names no task on the map) drops to unmapped instead of
+    claiming a chip that does not exist. With no plan ids to check
+    against, verification is impossible and the raw mapping stands.
+    """
+    tid = task_of(label, ws, taskmap, plan_ids)
+    if tid is None or not plan_ids:
+        return tid
+    return tid if tid in set(plan_ids) else None
+
+
 def run_family(run: dict) -> str:
     """Model family for replay pulses: tier when known, else the source tool."""
     tier = str(run.get("tier") or "").lower()

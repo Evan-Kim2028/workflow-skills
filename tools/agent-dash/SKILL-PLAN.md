@@ -37,6 +37,20 @@ Open `http://127.0.0.1:8765/plan?ws=WS4`. Overview is first, then bundles in ord
 
 `fixtures/bundles/` in this repo is a tiny OVERVIEW plus one workstream, for tests. Point `AGENT_DASH_WORKSTREAMS` at that directory when you want the plan page to render with no private data.
 
+## Map checklist
+
+The plan-progress map stays readable when the plan follows these nine rules. Run `ws layout <ID>` before kickoff and aim for zero MAP warnings. `ws validate` reports the same MAP101–MAP111 codes as warnings (exit stays 0); each names its threshold, the actual number, and the fix.
+
+1. Stage 4 to 5 columns with one- or two-word plain names. Never more than 5 (MAP102), never an empty column (MAP103).
+2. Keep 2 to 4 groups per column and 3 to 12 tasks per group. Merge 1-task groups into their stage group (MAP109); split groups above 14 tasks (MAP101).
+3. Title each group with the outcome in plain words (at most 40 chars), never a bare id (MAP105).
+4. Keep task id suffixes short and unique inside the workstream (at most 12 chars, MAP110). The map strips the `WS<n>.` prefix and caps display at 14 chars.
+5. Give every group outside the first column a waits-on edge to a group on its left, so columns tell the left-to-right story (MAP106).
+6. Mark outside signals as `kind: gate` diamonds with `signal`, `confirmed_at`, and `fresh_hours`. Keep gate ids short.
+7. Keep trains at 2 to 8 members. A 1-member train renders untagged (MAP107); keep a task note instead.
+8. Put one short condition (at most 80 chars) in `dep_notes` on each cross-group dep. Above 40 task edges the map defaults to on-focus arrows (MAP108).
+9. Keep done tasks in the dag. Leave deferred tasks where planned with `moved_to` plus `note`; the map folds them to one chip (above 20% deferred is MAP111, info only).
+
 ## Move a task
 
 Label the run `ws4-<task-id>-<slug>`, for example `ws4-WS4.1-read-route`. The label must hold the full task id or the progress map cannot pin it. The progress map matches that label to the task id.

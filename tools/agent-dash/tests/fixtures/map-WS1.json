@@ -1,0 +1,1087 @@
+{
+ "_note": "Genericized fixture for map-layout golden tests. Shape (counts, statuses, deps, edges, trains) mirrors a real plan; all prose replaced.",
+ "ws": "WS1",
+ "cols": [
+  "North",
+  "East",
+  "South",
+  "West",
+  "Center"
+ ],
+ "groups": [
+  {
+   "id": "g1",
+   "col": 0,
+   "title": "Stage group 1",
+   "tasks": [
+    {
+     "id": "1",
+     "title": "Task 1",
+     "status": "done",
+     "deps": [],
+     "wave": "Wave 01"
+    },
+    {
+     "id": "1s",
+     "title": "Task 1s",
+     "status": "done",
+     "deps": []
+    },
+    {
+     "id": "2",
+     "title": "Task 2",
+     "status": "done",
+     "deps": [
+      "1"
+     ],
+     "wave": "Wave 01"
+    },
+    {
+     "id": "3",
+     "title": "Task 3",
+     "status": "done",
+     "deps": [],
+     "wave": "Wave 01"
+    },
+    {
+     "id": "4",
+     "title": "Task 4",
+     "status": "done",
+     "deps": [],
+     "wave": "Wave 01"
+    },
+    {
+     "id": "5",
+     "title": "Task 5",
+     "status": "done",
+     "deps": [
+      "4"
+     ],
+     "wave": "Wave 01"
+    },
+    {
+     "id": "6",
+     "title": "Task 6",
+     "status": "done",
+     "deps": [
+      "4"
+     ],
+     "wave": "Wave 01"
+    }
+   ]
+  },
+  {
+   "id": "g2",
+   "col": 0,
+   "title": "Stage group 2",
+   "tasks": [
+    {
+     "id": "8",
+     "title": "Task 8",
+     "status": "done",
+     "deps": []
+    },
+    {
+     "id": "9",
+     "title": "Task 9",
+     "status": "done",
+     "deps": []
+    },
+    {
+     "id": "10",
+     "title": "Task 10",
+     "status": "done",
+     "deps": [
+      "8"
+     ],
+     "wave": "Wave 01"
+    },
+    {
+     "id": "11",
+     "title": "Task 11",
+     "status": "done",
+     "deps": [
+      "9",
+      "10"
+     ],
+     "wave": "Wave 01"
+    },
+    {
+     "id": "12",
+     "title": "Task 12",
+     "status": "done",
+     "deps": []
+    },
+    {
+     "id": "39",
+     "title": "Task 39",
+     "status": "done",
+     "deps": [
+      "20"
+     ]
+    },
+    {
+     "id": "79",
+     "title": "Task 79",
+     "status": "done",
+     "deps": [
+      "13"
+     ]
+    }
+   ]
+  },
+  {
+   "id": "g3",
+   "col": 0,
+   "title": "Stage group 3",
+   "tasks": [
+    {
+     "id": "13",
+     "title": "Task 13",
+     "status": "done",
+     "deps": [
+      "1",
+      "4"
+     ],
+     "wave": "Wave 01"
+    },
+    {
+     "id": "7",
+     "title": "Task 7",
+     "status": "done",
+     "deps": [
+      "2",
+      "3"
+     ],
+     "wave": "Wave 01"
+    },
+    {
+     "id": "19",
+     "title": "Task 19",
+     "status": "done",
+     "deps": [
+      "13"
+     ],
+     "wave": "Wave 01"
+    },
+    {
+     "id": "77",
+     "title": "Task 77",
+     "status": "done",
+     "deps": [
+      "13"
+     ],
+     "wave": "Wave 01"
+    },
+    {
+     "id": "54",
+     "title": "Task 54",
+     "status": "done",
+     "deps": [
+      "13",
+      "19"
+     ],
+     "wave": "Wave 01"
+    },
+    {
+     "id": "55",
+     "title": "Task 55",
+     "status": "done",
+     "deps": [
+      "5"
+     ],
+     "wave": "Wave 01"
+    },
+    {
+     "id": "23",
+     "title": "Task 23",
+     "status": "done",
+     "deps": [],
+     "wave": "Wave 01"
+    }
+   ]
+  },
+  {
+   "id": "g4",
+   "col": 1,
+   "title": "Stage group 4",
+   "tasks": [
+    {
+     "id": "26",
+     "title": "Task 26",
+     "status": "done",
+     "deps": [
+      "25"
+     ],
+     "wave": "Wave 01"
+    },
+    {
+     "id": "32",
+     "title": "Task 32",
+     "status": "done",
+     "deps": [
+      "26",
+      "29",
+      "77"
+     ],
+     "wave": "Wave 01"
+    },
+    {
+     "id": "33",
+     "title": "Task 33",
+     "status": "done",
+     "deps": [
+      "32"
+     ],
+     "wave": "Wave 01"
+    },
+    {
+     "id": "34",
+     "title": "Task 34",
+     "status": "done",
+     "deps": [
+      "32"
+     ],
+     "wave": "Wave 01"
+    },
+    {
+     "id": "35",
+     "title": "Task 35",
+     "status": "done",
+     "deps": [
+      "32"
+     ],
+     "wave": "Wave 01"
+    },
+    {
+     "id": "36",
+     "title": "Task 36",
+     "status": "done",
+     "deps": [],
+     "wave": "Wave 01"
+    },
+    {
+     "id": "37",
+     "title": "Task 37",
+     "status": "done",
+     "deps": [
+      "26"
+     ],
+     "wave": "Wave 01"
+    },
+    {
+     "id": "25",
+     "title": "Task 25",
+     "status": "done",
+     "deps": [
+      "4"
+     ],
+     "wave": "Wave 01"
+    },
+    {
+     "id": "38",
+     "title": "Task 38",
+     "status": "done",
+     "deps": [
+      "25"
+     ],
+     "wave": "Wave 01"
+    }
+   ]
+  },
+  {
+   "id": "g5",
+   "col": 1,
+   "title": "Stage group 5",
+   "tasks": [
+    {
+     "id": "20",
+     "title": "Task 20",
+     "status": "done",
+     "deps": [
+      "19"
+     ],
+     "wave": "Wave 01"
+    },
+    {
+     "id": "21",
+     "title": "Task 21",
+     "status": "done",
+     "deps": [
+      "20"
+     ],
+     "wave": "Wave 01"
+    },
+    {
+     "id": "22",
+     "title": "Task 22",
+     "status": "done",
+     "deps": [
+      "20"
+     ],
+     "wave": "Wave 01"
+    },
+    {
+     "id": "56",
+     "title": "Task 56",
+     "status": "done",
+     "deps": [
+      "21",
+      "25"
+     ],
+     "wave": "Wave 01"
+    },
+    {
+     "id": "57",
+     "title": "Task 57",
+     "status": "done",
+     "deps": [
+      "35"
+     ]
+    },
+    {
+     "id": "60",
+     "title": "Task 60",
+     "status": "done",
+     "deps": [
+      "56"
+     ],
+     "wave": "Wave 02"
+    },
+    {
+     "id": "61",
+     "title": "Task 61",
+     "status": "done",
+     "deps": [
+      "19"
+     ],
+     "wave": "Wave 01"
+    },
+    {
+     "id": "106",
+     "title": "Task 106",
+     "status": "done",
+     "deps": [
+      "20",
+      "57",
+      "60"
+     ],
+     "wave": "Wave 03"
+    },
+    {
+     "id": "107",
+     "title": "Task 107",
+     "status": "done",
+     "deps": [
+      "56"
+     ],
+     "wave": "Wave 04"
+    },
+    {
+     "id": "108",
+     "title": "Task 108",
+     "status": "done",
+     "deps": [
+      "105",
+      "60"
+     ],
+     "wave": "Wave 05"
+    }
+   ]
+  },
+  {
+   "id": "g6",
+   "col": 1,
+   "title": "Stage group 6",
+   "tasks": [
+    {
+     "id": "29",
+     "title": "Task 29",
+     "status": "done",
+     "deps": [
+      "5"
+     ],
+     "wave": "Wave 01"
+    },
+    {
+     "id": "30",
+     "title": "Task 30",
+     "status": "done",
+     "deps": [
+      "5",
+      "8"
+     ],
+     "wave": "Wave 01"
+    },
+    {
+     "id": "31",
+     "title": "Task 31",
+     "status": "done",
+     "deps": [
+      "5",
+      "36"
+     ],
+     "wave": "Wave 01"
+    },
+    {
+     "id": "45",
+     "title": "Task 45",
+     "status": "done",
+     "deps": [
+      "19",
+      "29"
+     ],
+     "wave": "Wave 02"
+    },
+    {
+     "id": "100",
+     "title": "Task 100",
+     "status": "done",
+     "deps": [
+      "45"
+     ]
+    }
+   ]
+  },
+  {
+   "id": "g7",
+   "col": 1,
+   "title": "Stage group 7",
+   "tasks": [
+    {
+     "id": "81",
+     "title": "Task 81",
+     "status": "done",
+     "deps": [
+      "13",
+      "36"
+     ],
+     "wave": "Wave 06"
+    },
+    {
+     "id": "82",
+     "title": "Task 82",
+     "status": "done",
+     "deps": [
+      "81"
+     ],
+     "wave": "Wave 06"
+    },
+    {
+     "id": "97",
+     "title": "Task 97",
+     "status": "done",
+     "deps": [],
+     "wave": "Wave 06"
+    },
+    {
+     "id": "90",
+     "title": "Task 90",
+     "status": "deferred",
+     "deps": [],
+     "moved_to": "WS8",
+     "note": "note on 90"
+    }
+   ]
+  },
+  {
+   "id": "g8",
+   "col": 2,
+   "title": "Stage group 8",
+   "tasks": [
+    {
+     "id": "40",
+     "title": "Task 40",
+     "status": "done",
+     "deps": [
+      "32"
+     ],
+     "wave": "Wave 02"
+    },
+    {
+     "id": "41",
+     "title": "Task 41",
+     "status": "done",
+     "deps": [
+      "19",
+      "40"
+     ],
+     "wave": "Wave 02"
+    },
+    {
+     "id": "42",
+     "title": "Task 42",
+     "status": "done",
+     "deps": [
+      "5",
+      "41"
+     ],
+     "wave": "Wave 02"
+    },
+    {
+     "id": "43",
+     "title": "Task 43",
+     "status": "done",
+     "deps": [],
+     "wave": "Wave 02"
+    },
+    {
+     "id": "44",
+     "title": "Task 44",
+     "status": "done",
+     "deps": [
+      "40",
+      "41",
+      "42"
+     ],
+     "wave": "Wave 02"
+    },
+    {
+     "id": "53",
+     "title": "Task 53",
+     "status": "done",
+     "deps": [
+      "13"
+     ],
+     "wave": "Wave 02"
+    }
+   ]
+  },
+  {
+   "id": "g9",
+   "col": 2,
+   "title": "Stage group 9",
+   "tasks": [
+    {
+     "id": "62",
+     "title": "Task 62",
+     "status": "done",
+     "deps": [
+      "19",
+      "32",
+      "36"
+     ],
+     "wave": "Wave 02"
+    },
+    {
+     "id": "63",
+     "title": "Task 63",
+     "status": "done",
+     "deps": [
+      "62"
+     ],
+     "wave": "Wave 02"
+    },
+    {
+     "id": "64",
+     "title": "Task 64",
+     "status": "done",
+     "deps": [
+      "36"
+     ],
+     "wave": "Wave 02"
+    },
+    {
+     "id": "65",
+     "title": "Task 65",
+     "status": "done",
+     "deps": [
+      "64"
+     ],
+     "wave": "Wave 02"
+    },
+    {
+     "id": "67",
+     "title": "Task 67",
+     "status": "done",
+     "deps": [
+      "62"
+     ],
+     "wave": "Wave 02"
+    },
+    {
+     "id": "83",
+     "title": "Task 83",
+     "status": "done",
+     "deps": [],
+     "wave": "Wave 01"
+    },
+    {
+     "id": "66",
+     "title": "Task 66",
+     "status": "done",
+     "deps": [
+      "12"
+     ],
+     "wave": "Wave 07"
+    }
+   ]
+  },
+  {
+   "id": "g10",
+   "col": 2,
+   "title": "Stage group 10",
+   "tasks": [
+    {
+     "id": "46",
+     "title": "Task 46",
+     "status": "done",
+     "deps": [
+      "32",
+      "45"
+     ],
+     "wave": "Wave 02"
+    },
+    {
+     "id": "68",
+     "title": "Task 68",
+     "status": "done",
+     "deps": [
+      "41",
+      "46"
+     ],
+     "wave": "Wave 02"
+    },
+    {
+     "id": "78",
+     "title": "Task 78",
+     "status": "done",
+     "deps": [
+      "41",
+      "46",
+      "55"
+     ],
+     "wave": "Wave 02"
+    },
+    {
+     "id": "69",
+     "title": "Task 69",
+     "status": "done",
+     "deps": [
+      "68"
+     ]
+    },
+    {
+     "id": "101",
+     "title": "Task 101",
+     "status": "done",
+     "deps": [
+      "41",
+      "45",
+      "46"
+     ]
+    },
+    {
+     "id": "102",
+     "title": "Task 102",
+     "status": "done",
+     "deps": [
+      "78",
+      "101"
+     ]
+    },
+    {
+     "id": "103",
+     "title": "Task 103",
+     "status": "done",
+     "deps": [
+      "46",
+      "78",
+      "101",
+      "102"
+     ]
+    },
+    {
+     "id": "104",
+     "title": "Task 104",
+     "status": "done",
+     "deps": [
+      "46"
+     ]
+    },
+    {
+     "id": "110",
+     "title": "Task 110",
+     "status": "deferred",
+     "deps": [
+      "100",
+      "108",
+      "109",
+      "46"
+     ],
+     "moved_to": "WS6",
+     "note": "note on 110"
+    }
+   ]
+  },
+  {
+   "id": "g11",
+   "col": 3,
+   "title": "Stage group 11",
+   "tasks": [
+    {
+     "id": "47",
+     "title": "Task 47",
+     "status": "done",
+     "deps": [
+      "20",
+      "46",
+      "78",
+      "99",
+      "100",
+      "101",
+      "102",
+      "103"
+     ],
+     "wave": "Wave 02"
+    },
+    {
+     "id": "48",
+     "title": "Task 48",
+     "status": "deferred",
+     "deps": [
+      "31",
+      "36",
+      "47"
+     ],
+     "note": "note on 48"
+    },
+    {
+     "id": "49",
+     "title": "Task 49",
+     "status": "deferred",
+     "deps": [
+      "8",
+      "10",
+      "30",
+      "48"
+     ],
+     "wave": "Wave 07",
+     "moved_to": "WS6",
+     "note": "note on 49"
+    },
+    {
+     "id": "58",
+     "title": "Task 58",
+     "status": "deferred",
+     "deps": [
+      "30",
+      "49",
+      "56"
+     ],
+     "wave": "Wave 07",
+     "moved_to": "WS6",
+     "note": "note on 58"
+    },
+    {
+     "id": "59",
+     "title": "Task 59",
+     "status": "deferred",
+     "deps": [
+      "9",
+      "11",
+      "56"
+     ],
+     "wave": "Wave 07",
+     "moved_to": "WS6",
+     "note": "note on 59"
+    },
+    {
+     "id": "51",
+     "title": "Task 51",
+     "status": "deferred",
+     "deps": [
+      "42",
+      "49"
+     ],
+     "wave": "Wave 07",
+     "note": "note on 51"
+    },
+    {
+     "id": "52",
+     "title": "Task 52",
+     "status": "deferred",
+     "deps": [
+      "12",
+      "42"
+     ],
+     "wave": "Wave 07",
+     "moved_to": "WS6",
+     "note": "note on 52"
+    },
+    {
+     "id": "105",
+     "title": "Task 105",
+     "status": "done",
+     "deps": [
+      "57",
+      "60"
+     ]
+    },
+    {
+     "id": "109",
+     "title": "Task 109",
+     "status": "deferred",
+     "deps": [
+      "46",
+      "99",
+      "100",
+      "101",
+      "102",
+      "103",
+      "105",
+      "106",
+      "107",
+      "108"
+     ],
+     "moved_to": "WS6",
+     "note": "note on 109"
+    }
+   ]
+  },
+  {
+   "id": "g12",
+   "col": 3,
+   "title": "Stage group 12",
+   "tasks": [
+    {
+     "id": "70",
+     "title": "Task 70",
+     "status": "done",
+     "deps": [
+      "34",
+      "55",
+      "78",
+      "79"
+     ],
+     "wave": "Wave 02"
+    }
+   ]
+  },
+  {
+   "id": "g13",
+   "col": 3,
+   "title": "Stage group 13",
+   "tasks": [
+    {
+     "id": "99",
+     "title": "Task 99",
+     "status": "done",
+     "deps": [
+      "46",
+      "55",
+      "70",
+      "78"
+     ],
+     "wave": "Wave 08"
+    }
+   ]
+  },
+  {
+   "id": "g14",
+   "col": 4,
+   "title": "Stage group 14",
+   "tasks": [
+    {
+     "id": "71",
+     "title": "Task 71",
+     "status": "deferred",
+     "deps": [
+      "70"
+     ],
+     "moved_to": "WS6"
+    },
+    {
+     "id": "72",
+     "title": "Task 72",
+     "status": "deferred",
+     "deps": [
+      "70",
+      "77"
+     ],
+     "moved_to": "WS6"
+    },
+    {
+     "id": "80",
+     "title": "Task 80",
+     "status": "deferred",
+     "deps": [
+      "72",
+      "77"
+     ],
+     "moved_to": "WS6"
+    },
+    {
+     "id": "74a",
+     "title": "Task 74a",
+     "status": "deferred",
+     "deps": [
+      "72",
+      "73",
+      "80"
+     ],
+     "moved_to": "WS6"
+    },
+    {
+     "id": "74b",
+     "title": "Task 74b",
+     "status": "deferred",
+     "deps": [
+      "74a"
+     ],
+     "moved_to": "WS6"
+    },
+    {
+     "id": "73",
+     "title": "Task 73",
+     "status": "deferred",
+     "deps": [
+      "48",
+      "49",
+      "59"
+     ],
+     "moved_to": "WS5"
+    },
+    {
+     "id": "75",
+     "title": "Task 75",
+     "status": "done",
+     "deps": [
+      "62"
+     ]
+    },
+    {
+     "id": "92",
+     "title": "Task 92",
+     "status": "done",
+     "deps": [
+      "70"
+     ]
+    }
+   ]
+  },
+  {
+   "id": "g15",
+   "col": 4,
+   "title": "Stage group 15",
+   "tasks": [
+    {
+     "id": "76",
+     "title": "Task 76",
+     "status": "done",
+     "deps": [
+      "30",
+      "42"
+     ],
+     "wave": "Wave 09"
+    },
+    {
+     "id": "111",
+     "title": "Task 111",
+     "status": "done",
+     "deps": [
+      "47",
+      "99"
+     ]
+    }
+   ]
+  }
+ ],
+ "edges": [
+  [
+   "g1",
+   "g3"
+  ],
+  [
+   "g1",
+   "g4"
+  ],
+  [
+   "g2",
+   "g6"
+  ],
+  [
+   "g3",
+   "g5"
+  ],
+  [
+   "g3",
+   "g6"
+  ],
+  [
+   "g3",
+   "g7"
+  ],
+  [
+   "g4",
+   "g10"
+  ],
+  [
+   "g4",
+   "g9"
+  ],
+  [
+   "g5",
+   "g9"
+  ],
+  [
+   "g5",
+   "g10"
+  ],
+  [
+   "g6",
+   "g10"
+  ],
+  [
+   "g6",
+   "g8"
+  ],
+  [
+   "g10",
+   "g11"
+  ],
+  [
+   "g9",
+   "g11"
+  ],
+  [
+   "g11",
+   "g12"
+  ],
+  [
+   "g11",
+   "g13"
+  ],
+  [
+   "g12",
+   "g14"
+  ],
+  [
+   "g11",
+   "g14"
+  ],
+  [
+   "g13",
+   "g14"
+  ],
+  [
+   "g14",
+   "g15"
+  ]
+ ],
+ "phases": [],
+ "trains": [],
+ "progress": {
+  "done": 77,
+  "total": 77,
+  "counts": {
+   "todo": 0,
+   "wip": 0,
+   "pr": 0,
+   "prog": 0,
+   "done": 77,
+   "deferred": 15
+  },
+  "pct": 100
+ }
+}

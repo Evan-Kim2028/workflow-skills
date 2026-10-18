@@ -1,0 +1,1196 @@
+{
+ "_note": "Genericized fixture for map-layout golden tests. Shape (counts, statuses, deps, edges, trains) mirrors a real plan; all prose replaced.",
+ "ws": "WS7",
+ "cols": [
+  "North",
+  "East",
+  "South",
+  "West",
+  "Center"
+ ],
+ "groups": [
+  {
+   "id": "g1",
+   "col": 0,
+   "title": "Stage group 1",
+   "tasks": [
+    {
+     "id": "S0-1",
+     "title": "Task S0-1",
+     "status": "done",
+     "deps": [
+      "WS7.Q6"
+     ],
+     "wave": "Wave 01"
+    },
+    {
+     "id": "S0-3",
+     "title": "Task S0-3",
+     "status": "done",
+     "deps": [
+      "WS7.Q6"
+     ],
+     "wave": "Wave 01"
+    },
+    {
+     "id": "S0-4",
+     "title": "Task S0-4",
+     "status": "deferred",
+     "deps": [
+      "WS7.Q6"
+     ],
+     "wave": "Wave 01",
+     "note": "note on S0-4"
+    },
+    {
+     "id": "S0-6",
+     "title": "Task S0-6",
+     "status": "done",
+     "deps": [
+      "WS7.Q6"
+     ],
+     "wave": "Wave 01"
+    },
+    {
+     "id": "WS7.S0M",
+     "title": "Task WS7.S0M",
+     "status": "done",
+     "deps": [],
+     "wave": "Wave 02"
+    }
+   ]
+  },
+  {
+   "id": "g2",
+   "col": 1,
+   "title": "Stage group 2",
+   "tasks": [
+    {
+     "id": "P0-1",
+     "title": "Task P0-1",
+     "status": "done",
+     "wave": "Wave 01"
+    },
+    {
+     "id": "P0-2",
+     "title": "Task P0-2",
+     "status": "done",
+     "wave": "Wave 01"
+    },
+    {
+     "id": "P0-3",
+     "title": "Task P0-3",
+     "status": "done",
+     "wave": "Wave 01"
+    },
+    {
+     "id": "P0-7",
+     "title": "Task P0-7",
+     "status": "done",
+     "wave": "Wave 01"
+    },
+    {
+     "id": "P0-9",
+     "title": "Task P0-9",
+     "status": "done",
+     "wave": "Wave 01"
+    },
+    {
+     "id": "WS7.8",
+     "title": "Task WS7.8",
+     "status": "done"
+    },
+    {
+     "id": "WS7.S1",
+     "title": "Task WS7.S1",
+     "status": "done",
+     "wave": "Wave 01"
+    },
+    {
+     "id": "op-rp-manifest-dryrun",
+     "title": "Task op-rp-manifest-dryrun",
+     "status": "done",
+     "deps": [
+      "P0-2",
+      "WS7.Q6"
+     ]
+    },
+    {
+     "id": "op-rp-acl-dryrun",
+     "title": "Task op-rp-acl-dryrun",
+     "status": "done",
+     "deps": [
+      "P0-7",
+      "WS7.Q6"
+     ]
+    }
+   ]
+  },
+  {
+   "id": "g3",
+   "col": 1,
+   "title": "Stage group 3",
+   "tasks": [
+    {
+     "id": "P0-4",
+     "title": "Task P0-4",
+     "status": "done",
+     "deps": [
+      "P0-1"
+     ],
+     "wave": "Wave 03"
+    },
+    {
+     "id": "P0-5",
+     "title": "Task P0-5",
+     "status": "done",
+     "deps": [
+      "P0-1"
+     ],
+     "wave": "Wave 03"
+    },
+    {
+     "id": "P0-6",
+     "title": "Task P0-6",
+     "status": "done",
+     "wave": "Wave 01"
+    },
+    {
+     "id": "P0-8",
+     "title": "Task P0-8",
+     "status": "done",
+     "deps": [
+      "P0-4",
+      "WS7.C1",
+      "WS7.10"
+     ],
+     "wave": "Wave 04"
+    },
+    {
+     "id": "op-rp-dlq",
+     "title": "Task op-rp-dlq",
+     "status": "done",
+     "deps": [
+      "P0-5",
+      "WS7.Q6"
+     ]
+    },
+    {
+     "id": "op-rp-lag-timer",
+     "title": "Task op-rp-lag-timer",
+     "status": "done",
+     "deps": [
+      "P0-6",
+      "WS7.Q6"
+     ]
+    }
+   ]
+  },
+  {
+   "id": "g4",
+   "col": 2,
+   "title": "Stage group 4",
+   "tasks": [
+    {
+     "id": "WS7.10",
+     "title": "Task WS7.10",
+     "status": "done",
+     "deps": [
+      "P0-1"
+     ],
+     "wave": "Wave 03"
+    },
+    {
+     "id": "WS7.C1",
+     "title": "Task WS7.C1",
+     "status": "done",
+     "deps": [
+      "P0-1"
+     ],
+     "wave": "Wave 03"
+    },
+    {
+     "id": "WS7.C2",
+     "title": "Task WS7.C2",
+     "status": "done",
+     "deps": [
+      "WS7.K2",
+      "WS7.41"
+     ],
+     "wave": "Wave 05"
+    },
+    {
+     "id": "WS7.C3",
+     "title": "Task WS7.C3",
+     "status": "deferred",
+     "deps": [
+      "WS7.12",
+      "P0-8"
+     ],
+     "wave": "Wave 06",
+     "note": "note on WS7.C3"
+    },
+    {
+     "id": "WS7.11",
+     "title": "Task WS7.11",
+     "status": "done",
+     "deps": [
+      "P0-4",
+      "WS7.C1",
+      "WS7.10"
+     ],
+     "wave": "Wave 04"
+    },
+    {
+     "id": "WS7.12",
+     "title": "Task WS7.12",
+     "status": "done",
+     "deps": [
+      "WS7.11",
+      "WS7.K1"
+     ],
+     "wave": "Wave 07"
+    },
+    {
+     "id": "WS7.13",
+     "title": "Task WS7.13",
+     "status": "done",
+     "deps": [
+      "P0-8",
+      "WS7.11"
+     ],
+     "wave": "Wave 08"
+    },
+    {
+     "id": "WS7.K1",
+     "title": "Task WS7.K1",
+     "status": "done",
+     "wave": "Wave 01"
+    },
+    {
+     "id": "WS7.K2",
+     "title": "Task WS7.K2",
+     "status": "done",
+     "deps": [
+      "WS7.11",
+      "WS7.K1"
+     ],
+     "wave": "Wave 07"
+    },
+    {
+     "id": "WS7.K3",
+     "title": "Task WS7.K3",
+     "status": "done",
+     "deps": [
+      "WS7.K2"
+     ],
+     "wave": "Wave 09"
+    },
+    {
+     "id": "WS7.K4",
+     "title": "Task WS7.K4",
+     "status": "done",
+     "deps": [
+      "WS7.11",
+      "WS7.K1"
+     ],
+     "wave": "Wave 07"
+    },
+    {
+     "id": "WS7.NAME",
+     "title": "Task WS7.NAME",
+     "status": "done",
+     "wave": "Wave 01"
+    },
+    {
+     "id": "WS7.16",
+     "title": "Task WS7.16",
+     "status": "done",
+     "deps": [
+      "WS7.12"
+     ],
+     "wave": "Wave 06"
+    },
+    {
+     "id": "WS7.17",
+     "title": "Task WS7.17",
+     "status": "done",
+     "deps": [
+      "P0-9"
+     ],
+     "wave": "Wave 10"
+    },
+    {
+     "id": "WS7.18",
+     "title": "Task WS7.18",
+     "status": "done",
+     "deps": [
+      "WS7.K1"
+     ],
+     "wave": "Wave 11"
+    },
+    {
+     "id": "WS7.19",
+     "title": "Task WS7.19",
+     "status": "done",
+     "wave": "Wave 01"
+    },
+    {
+     "id": "WS7.20",
+     "title": "Task WS7.20",
+     "status": "done",
+     "wave": "Wave 01"
+    },
+    {
+     "id": "WS7.22",
+     "title": "Task WS7.22",
+     "status": "done",
+     "wave": "Wave 01"
+    },
+    {
+     "id": "WS7.43",
+     "title": "Task WS7.43",
+     "status": "done",
+     "deps": [
+      "WS7.44"
+     ],
+     "wave": "Wave 12"
+    },
+    {
+     "id": "WS7.44",
+     "title": "Task WS7.44",
+     "status": "done",
+     "deps": [
+      "WS7.20",
+      "WS7.22",
+      "WS7.16"
+     ],
+     "wave": "Wave 13"
+    },
+    {
+     "id": "WS7.41",
+     "title": "Task WS7.41",
+     "status": "done",
+     "deps": [
+      "WS7.17"
+     ],
+     "wave": "Wave 14"
+    },
+    {
+     "id": "WS7.CI1",
+     "title": "Task WS7.CI1",
+     "status": "done",
+     "deps": [
+      "WS7.K1"
+     ],
+     "wave": "Wave 15"
+    },
+    {
+     "id": "WS7.CI2",
+     "title": "Task WS7.CI2",
+     "status": "done",
+     "deps": [],
+     "wave": "Wave 15"
+    },
+    {
+     "id": "WS7.CI3",
+     "title": "Task WS7.CI3",
+     "status": "done",
+     "deps": [
+      "WS7.C1"
+     ],
+     "wave": "Wave 15"
+    },
+    {
+     "id": "WS7.CI4",
+     "title": "Task WS7.CI4",
+     "status": "done",
+     "deps": [
+      "WS7.CI2"
+     ],
+     "wave": "Wave 15"
+    },
+    {
+     "id": "WS7.CI5",
+     "title": "Task WS7.CI5",
+     "status": "done",
+     "deps": [
+      "WS7.CI2"
+     ],
+     "wave": "Wave 16"
+    },
+    {
+     "id": "WS7.NAME2",
+     "title": "Task WS7.NAME2",
+     "status": "done",
+     "deps": [
+      "WS7.NAME"
+     ],
+     "wave": "Wave 16"
+    },
+    {
+     "id": "WS7.KW",
+     "title": "Task WS7.KW",
+     "status": "done",
+     "deps": [
+      "WS7.K1"
+     ],
+     "wave": "Wave 17"
+    }
+   ]
+  },
+  {
+   "id": "g5",
+   "col": 2,
+   "title": "Stage group 5",
+   "tasks": [
+    {
+     "id": "WS7.Q1",
+     "title": "Task WS7.Q1",
+     "status": "done",
+     "wave": "Wave 18"
+    },
+    {
+     "id": "WS7.Q6",
+     "title": "Task WS7.Q6",
+     "status": "done",
+     "deps": [
+      "WS7.Q1"
+     ],
+     "wave": "Wave 18"
+    },
+    {
+     "id": "op-measure",
+     "title": "Task op-measure",
+     "status": "done",
+     "deps": [
+      "WS7.S1",
+      "WS7.Q6"
+     ]
+    }
+   ]
+  },
+  {
+   "id": "g6",
+   "col": 3,
+   "title": "Stage group 6",
+   "tasks": [
+    {
+     "id": "op-rp-scrape-topics",
+     "title": "Task op-rp-scrape-topics",
+     "status": "done",
+     "deps": [
+      "op-measure",
+      "S0-1",
+      "S0-3",
+      "S0-6",
+      "WS7.10",
+      "WS7.Q1",
+      "WS7.Q6"
+     ],
+     "wave": "Wave 19"
+    }
+   ]
+  },
+  {
+   "id": "g7",
+   "col": 3,
+   "title": "Stage group 7",
+   "tasks": [
+    {
+     "id": "WS7.E3",
+     "title": "Task WS7.E3",
+     "status": "done",
+     "deps": [
+      "WS7.12"
+     ],
+     "wave": "Wave 20"
+    },
+    {
+     "id": "WS7.E2",
+     "title": "Task WS7.E2",
+     "status": "done",
+     "deps": [
+      "WS7.12"
+     ],
+     "wave": "Wave 20"
+    },
+    {
+     "id": "WS7.E1",
+     "title": "Task WS7.E1",
+     "status": "done",
+     "deps": [
+      "WS7.12"
+     ],
+     "wave": "Wave 20"
+    },
+    {
+     "id": "WS7.21",
+     "title": "Task WS7.21",
+     "status": "done",
+     "deps": [
+      "WS7.20",
+      "WS7.22",
+      "WS7.16"
+     ],
+     "wave": "Wave 13"
+    },
+    {
+     "id": "OP-WS7.A",
+     "title": "Task OP-WS7.A",
+     "status": "deferred",
+     "deps": [
+      "op-rp-scrape-topics",
+      "WS7.20",
+      "WS7.21"
+     ],
+     "wave": "Wave 21",
+     "note": "note on OP-WS7.A"
+    },
+    {
+     "id": "OP-WS7.B",
+     "title": "Task OP-WS7.B",
+     "status": "done",
+     "deps": [
+      "OP-WS7.A",
+      "WS7.NAME"
+     ],
+     "wave": "Wave 22"
+    },
+    {
+     "id": "WS7.23",
+     "title": "Task WS7.23",
+     "status": "done",
+     "deps": [
+      "WS7.20",
+      "WS7.22",
+      "WS7.16"
+     ],
+     "wave": "Wave 13"
+    },
+    {
+     "id": "OP-WS7.C",
+     "title": "Task OP-WS7.C",
+     "status": "deferred",
+     "deps": [
+      "W-L2"
+     ],
+     "wave": "Wave 23",
+     "note": "note on OP-WS7.C"
+    },
+    {
+     "id": "OP-WS7.D",
+     "title": "Task OP-WS7.D",
+     "status": "done",
+     "deps": [
+      "W-L2",
+      "OP-WS7.C"
+     ],
+     "wave": "Wave 23"
+    },
+    {
+     "id": "W-L1",
+     "title": "Task W-L1",
+     "status": "done",
+     "deps": [
+      "OP-WS7.B"
+     ],
+     "wave": "Wave 24"
+    }
+   ]
+  },
+  {
+   "id": "g8",
+   "col": 4,
+   "title": "Stage group 8",
+   "tasks": [
+    {
+     "id": "W-L2",
+     "title": "Task W-L2",
+     "status": "deferred",
+     "deps": [
+      "W-L1"
+     ],
+     "wave": "Wave 25",
+     "note": "note on W-L2"
+    },
+    {
+     "id": "W-L3",
+     "title": "Task W-L3",
+     "status": "deferred",
+     "deps": [
+      "W-L2"
+     ],
+     "wave": "Wave 23",
+     "note": "note on W-L3"
+    },
+    {
+     "id": "W-L4",
+     "title": "Task W-L4",
+     "status": "done",
+     "deps": [
+      "W-L3"
+     ],
+     "wave": "Wave 26"
+    },
+    {
+     "id": "W-S1",
+     "title": "Task W-S1",
+     "status": "deferred",
+     "deps": [
+      "W-L2"
+     ],
+     "wave": "Wave 23",
+     "note": "note on W-S1"
+    },
+    {
+     "id": "W-S2",
+     "title": "Task W-S2",
+     "status": "deferred",
+     "deps": [
+      "W-L2"
+     ],
+     "wave": "Wave 23",
+     "note": "note on W-S2"
+    },
+    {
+     "id": "W-S3",
+     "title": "Task W-S3",
+     "status": "deferred",
+     "deps": [
+      "OP-WS7.C",
+      "OP-WS7.D"
+     ],
+     "wave": "Wave 27",
+     "note": "note on W-S3"
+    },
+    {
+     "id": "W-S4",
+     "title": "Task W-S4",
+     "status": "deferred",
+     "deps": [
+      "S0-3",
+      "OP-WS7.B",
+      "OP-WS7.D"
+     ],
+     "wave": "Wave 28",
+     "note": "note on W-S4"
+    },
+    {
+     "id": "W-S5",
+     "title": "Task W-S5",
+     "status": "deferred",
+     "deps": [
+      "W-S4"
+     ],
+     "wave": "Wave 29",
+     "note": "note on W-S5"
+    },
+    {
+     "id": "W-L5",
+     "title": "Task W-L5",
+     "status": "deferred",
+     "deps": [
+      "W-L4"
+     ],
+     "wave": "Wave 26",
+     "note": "note on W-L5"
+    },
+    {
+     "id": "W-L6",
+     "title": "Task W-L6",
+     "status": "deferred",
+     "deps": [
+      "W-L5"
+     ],
+     "wave": "Wave 26",
+     "note": "note on W-L6"
+    },
+    {
+     "id": "W-L7",
+     "title": "Task W-L7",
+     "status": "deferred",
+     "deps": [
+      "W-L6"
+     ],
+     "wave": "Wave 26",
+     "note": "note on W-L7"
+    },
+    {
+     "id": "W-S6",
+     "title": "Task W-S6",
+     "status": "deferred",
+     "deps": [
+      "W-S3"
+     ],
+     "wave": "Wave 30",
+     "note": "note on W-S6"
+    },
+    {
+     "id": "WS7.HOLD",
+     "title": "Task WS7.HOLD",
+     "status": "done",
+     "wave": "Wave 01"
+    },
+    {
+     "id": "WS7.SB1",
+     "title": "Task WS7.SB1",
+     "status": "done",
+     "deps": [
+      "WS7.K1"
+     ],
+     "wave": "Wave 31"
+    },
+    {
+     "id": "WS7.ST1",
+     "title": "Task WS7.ST1",
+     "status": "done",
+     "deps": [
+      "WS7.K1"
+     ],
+     "wave": "Wave 31"
+    },
+    {
+     "id": "WS7.SC1",
+     "title": "Task WS7.SC1",
+     "status": "done",
+     "deps": [
+      "WS7.K1"
+     ],
+     "wave": "Wave 31"
+    },
+    {
+     "id": "WS7.SP1",
+     "title": "Task WS7.SP1",
+     "status": "done",
+     "deps": [
+      "WS7.K1"
+     ],
+     "wave": "Wave 31"
+    },
+    {
+     "id": "WS7.SM1",
+     "title": "Task WS7.SM1",
+     "status": "done",
+     "deps": [
+      "WS7.K1"
+     ],
+     "wave": "Wave 31"
+    },
+    {
+     "id": "WS7.DR2",
+     "title": "Task WS7.DR2",
+     "status": "done",
+     "deps": [
+      "WS7.K1"
+     ],
+     "wave": "Wave 31"
+    },
+    {
+     "id": "WS7.EB",
+     "title": "Task WS7.EB",
+     "status": "deferred",
+     "deps": [
+      "WS7.12"
+     ],
+     "wave": "Wave 20",
+     "note": "note on WS7.EB"
+    },
+    {
+     "id": "WS7.ET",
+     "title": "Task WS7.ET",
+     "status": "done",
+     "deps": [
+      "WS7.12"
+     ],
+     "wave": "Wave 20"
+    },
+    {
+     "id": "WS7.EC",
+     "title": "Task WS7.EC",
+     "status": "done",
+     "deps": [
+      "WS7.12"
+     ],
+     "wave": "Wave 20"
+    },
+    {
+     "id": "WS7.EP",
+     "title": "Task WS7.EP",
+     "status": "done",
+     "deps": [
+      "WS7.12"
+     ],
+     "wave": "Wave 20"
+    },
+    {
+     "id": "WS7.EM",
+     "title": "Task WS7.EM",
+     "status": "done",
+     "deps": [
+      "WS7.12"
+     ],
+     "wave": "Wave 20"
+    },
+    {
+     "id": "WS7.EB2",
+     "title": "Task WS7.EB2",
+     "status": "done",
+     "deps": [
+      "WS7.K1"
+     ],
+     "wave": "Wave 17"
+    },
+    {
+     "id": "WS7.LR",
+     "title": "Task WS7.LR",
+     "status": "done",
+     "deps": [
+      "WS7.K1"
+     ],
+     "wave": "Wave 17"
+    },
+    {
+     "id": "WS7.SF2",
+     "title": "Task WS7.SF2",
+     "status": "done",
+     "deps": [
+      "WS7.K1"
+     ],
+     "wave": "Wave 17"
+    },
+    {
+     "id": "WS7.SA2",
+     "title": "Task WS7.SA2",
+     "status": "done",
+     "deps": [
+      "WS7.K1"
+     ],
+     "wave": "Wave 17"
+    },
+    {
+     "id": "WS7.SR2",
+     "title": "Task WS7.SR2",
+     "status": "done",
+     "deps": [
+      "WS7.K1"
+     ],
+     "wave": "Wave 17"
+    },
+    {
+     "id": "WS7.SZ2",
+     "title": "Task WS7.SZ2",
+     "status": "done",
+     "deps": [
+      "WS7.K1"
+     ],
+     "wave": "Wave 17"
+    },
+    {
+     "id": "WS7.SY2",
+     "title": "Task WS7.SY2",
+     "status": "done",
+     "deps": [
+      "WS7.K1"
+     ],
+     "wave": "Wave 17"
+    },
+    {
+     "id": "WS7.SX2",
+     "title": "Task WS7.SX2",
+     "status": "done",
+     "deps": [
+      "WS7.K1"
+     ],
+     "wave": "Wave 17"
+    },
+    {
+     "id": "WS7.SJ2",
+     "title": "Task WS7.SJ2",
+     "status": "done",
+     "deps": [
+      "WS7.K1"
+     ],
+     "wave": "Wave 17"
+    },
+    {
+     "id": "WS7.EF2",
+     "title": "Task WS7.EF2",
+     "status": "done",
+     "deps": [
+      "WS7.12"
+     ],
+     "wave": "Wave 32"
+    },
+    {
+     "id": "WS7.EA2",
+     "title": "Task WS7.EA2",
+     "status": "done",
+     "deps": [
+      "WS7.12"
+     ],
+     "wave": "Wave 32"
+    },
+    {
+     "id": "WS7.ER2",
+     "title": "Task WS7.ER2",
+     "status": "done",
+     "deps": [
+      "WS7.12"
+     ],
+     "wave": "Wave 32"
+    },
+    {
+     "id": "WS7.EZ2",
+     "title": "Task WS7.EZ2",
+     "status": "done",
+     "deps": [
+      "WS7.12"
+     ],
+     "wave": "Wave 32"
+    },
+    {
+     "id": "WS7.EY2",
+     "title": "Task WS7.EY2",
+     "status": "done",
+     "deps": [
+      "WS7.12"
+     ],
+     "wave": "Wave 32"
+    },
+    {
+     "id": "WS7.EX2",
+     "title": "Task WS7.EX2",
+     "status": "done",
+     "deps": [
+      "WS7.12"
+     ],
+     "wave": "Wave 32"
+    },
+    {
+     "id": "WS7.EJ2",
+     "title": "Task WS7.EJ2",
+     "status": "done",
+     "deps": [
+      "WS7.12"
+     ],
+     "wave": "Wave 32"
+    },
+    {
+     "id": "OP-WS7.RS1",
+     "title": "Task OP-WS7.RS1",
+     "status": "done",
+     "deps": [
+      "WS7.K2"
+     ],
+     "wave": "Wave 33"
+    },
+    {
+     "id": "OP-WS7.RS2",
+     "title": "Task OP-WS7.RS2",
+     "status": "done",
+     "deps": [
+      "WS7.K2"
+     ],
+     "wave": "Wave 33"
+    },
+    {
+     "id": "OP-WS7.RS3",
+     "title": "Task OP-WS7.RS3",
+     "status": "done",
+     "deps": [
+      "WS7.K2"
+     ],
+     "wave": "Wave 33"
+    },
+    {
+     "id": "OP-WS7.RS4",
+     "title": "Task OP-WS7.RS4",
+     "status": "done",
+     "deps": [
+      "WS7.K2"
+     ],
+     "wave": "Wave 33"
+    },
+    {
+     "id": "OP-WS7.RS5",
+     "title": "Task OP-WS7.RS5",
+     "status": "done",
+     "deps": [
+      "WS7.K2"
+     ],
+     "wave": "Wave 33"
+    },
+    {
+     "id": "OP-WS7.RS6",
+     "title": "Task OP-WS7.RS6",
+     "status": "done",
+     "deps": [
+      "WS7.K2"
+     ],
+     "wave": "Wave 33"
+    },
+    {
+     "id": "OP-WS7.RL",
+     "title": "Task OP-WS7.RL",
+     "status": "done",
+     "deps": [
+      "WS7.K2"
+     ],
+     "wave": "Wave 33"
+    }
+   ]
+  },
+  {
+   "id": "g9",
+   "col": 4,
+   "title": "Stage group 9",
+   "tasks": [
+    {
+     "id": "WS7.X1",
+     "title": "Task WS7.X1",
+     "status": "prog",
+     "deps": [],
+     "wave": "Wave 34",
+     "note": "note on WS7.X1"
+    },
+    {
+     "id": "WS7.X2",
+     "title": "Task WS7.X2",
+     "status": "prog",
+     "deps": [],
+     "wave": "Wave 34",
+     "note": "note on WS7.X2"
+    },
+    {
+     "id": "WS7.X3",
+     "title": "Task WS7.X3",
+     "status": "done",
+     "deps": [],
+     "wave": "Wave 34",
+     "note": "note on WS7.X3"
+    },
+    {
+     "id": "WS7.X4",
+     "title": "Task WS7.X4",
+     "status": "prog",
+     "deps": [],
+     "wave": "Wave 34",
+     "note": "note on WS7.X4"
+    },
+    {
+     "id": "WS7.X5",
+     "title": "Task WS7.X5",
+     "status": "prog",
+     "deps": [],
+     "wave": "Wave 34",
+     "note": "note on WS7.X5"
+    },
+    {
+     "id": "WS7.X6",
+     "title": "Task WS7.X6",
+     "status": "done",
+     "deps": [],
+     "wave": "Wave 34",
+     "note": "note on WS7.X6"
+    },
+    {
+     "id": "WS7.X7",
+     "title": "Task WS7.X7",
+     "status": "done",
+     "deps": [],
+     "wave": "Wave 34",
+     "note": "note on WS7.X7"
+    },
+    {
+     "id": "WS7.X8",
+     "title": "Task WS7.X8",
+     "status": "todo",
+     "deps": [],
+     "wave": "Wave 34",
+     "note": "note on WS7.X8"
+    }
+   ]
+  }
+ ],
+ "edges": [
+  [
+   "g2",
+   "g3"
+  ],
+  [
+   "g2",
+   "g5"
+  ],
+  [
+   "g3",
+   "g4"
+  ],
+  [
+   "g1",
+   "g6"
+  ],
+  [
+   "g4",
+   "g6"
+  ],
+  [
+   "g5",
+   "g6"
+  ],
+  [
+   "g6",
+   "g7"
+  ],
+  [
+   "g7",
+   "g8"
+  ]
+ ],
+ "phases": [
+  {
+   "name": "Stage 1",
+   "goal": "Generic goal for stage 1.",
+   "gate": "Generic gate for stage 1."
+  },
+  {
+   "name": "Stage 2",
+   "goal": "Generic goal for stage 2.",
+   "gate": "Generic gate for stage 2."
+  },
+  {
+   "name": "Stage 3",
+   "goal": "Generic goal for stage 3.",
+   "gate": "Generic gate for stage 3."
+  },
+  {
+   "name": "Stage 4",
+   "goal": "Generic goal for stage 4.",
+   "gate": "Generic gate for stage 4."
+  },
+  {
+   "name": "Stage 5",
+   "goal": "Generic goal for stage 5.",
+   "gate": "Generic gate for stage 5."
+  },
+  {
+   "name": "Stage 6",
+   "goal": "Generic goal for stage 6.",
+   "gate": "Generic gate for stage 6."
+  }
+ ],
+ "trains": [],
+ "progress": {
+  "done": 96,
+  "total": 101,
+  "counts": {
+   "todo": 1,
+   "wip": 0,
+   "pr": 0,
+   "prog": 4,
+   "done": 96,
+   "deferred": 16
+  },
+  "pct": 95
+ }
+}

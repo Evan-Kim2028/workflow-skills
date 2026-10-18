@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 import sys
 import threading
@@ -18,6 +19,8 @@ from dash.plans import PlanError
 from dash.pricing import health_block
 
 ROOT = Path(__file__).resolve().parents[1]
+_MAP_LOG = logging.getLogger("agent_dash.maplayout")
+_MAP_WARNED: set = set()
 INDEX_PATH = ROOT / "static" / "index.html"
 PLACEHOLDER = b"agent-dash\n"
 _WS = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
@@ -28,6 +31,10 @@ _PROBLEM_DOC = re.compile(r"^[a-z0-9][a-z0-9-]*\.md$")
 #: Map-backed plans have no single file, so their mtime is None and they
 #: recompute every request (still cheap: one DAG pass, no store reads).
 _PLAN_EXTRA_CACHE: dict = {}
+
+#: /api/plan map-layout fields keyed by workstream: (plan mtime, payload).
+#: Same mtime rule as the orchestration fields above.
+_PLAN_MAP_CACHE: dict = {}
 
 
 def _plan_extra_cached(ws: str, body: dict) -> dict:
@@ -49,6 +56,35 @@ def _plan_extra_cached(ws: str, body: dict) -> dict:
     payload = orchestrate.plan_extra(body)
     if mtime is not None:
         _PLAN_EXTRA_CACHE[ws] = (mtime, payload)
+    return payload
+
+
+def _plan_map_cached(ws: str, body: dict) -> dict:
+    """``{"layout", "map_warnings"}`` cached by plan mtime."""
+    from dash import maplayout
+    from dash.bundles import bundle_dir
+
+    mtime = None
+    try:
+        path = bundle_dir(ws)
+        if path is not None:
+            mtime = (path / "plan.json").stat().st_mtime_ns
+    except OSError:
+        mtime = None
+    if mtime is not None:
+        hit = _PLAN_MAP_CACHE.get(ws)
+        if hit is not None and hit[0] == mtime:
+            return hit[1]
+    try:
+        payload = {"layout": maplayout.layout(body), "map_warnings": maplayout.map_warnings(body)}
+    except Exception as exc:
+        key = f"{type(exc).__name__}: {exc}"
+        if key not in _MAP_WARNED:
+            _MAP_WARNED.add(key)
+            _MAP_LOG.warning("map layout unavailable for %s (%s)", ws, key, exc_info=True)
+        payload = {"layout": None, "map_warnings": []}
+    if mtime is not None:
+        _PLAN_MAP_CACHE[ws] = (mtime, payload)
     return payload
 
 
@@ -367,6 +403,8 @@ class Handler(BaseHTTPRequestHandler):
             body["issues"] = []
         if isinstance(body, dict):
             for key, value in _plan_extra_cached(ws, body).items():
+                body.setdefault(key, value)
+            for key, value in _plan_map_cached(ws, body).items():
                 body.setdefault(key, value)
         self._json(200, body)
 

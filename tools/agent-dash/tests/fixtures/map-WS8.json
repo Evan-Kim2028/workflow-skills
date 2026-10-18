@@ -1,0 +1,1092 @@
+{
+ "_note": "Genericized fixture for map-layout golden tests. Shape (counts, statuses, deps, edges, trains) mirrors a real plan; all prose replaced.",
+ "ws": "WS8",
+ "cols": [
+  "North",
+  "East",
+  "South",
+  "West",
+  "Center",
+  "Harbor",
+  "Summit"
+ ],
+ "groups": [
+  {
+   "id": "g1",
+   "col": 0,
+   "title": "Stage group 1",
+   "tasks": [
+    {
+     "id": "WS8.52",
+     "title": "Task WS8.52",
+     "status": "done",
+     "deps": [],
+     "wave": "Wave 01"
+    },
+    {
+     "id": "WS8.53",
+     "title": "Task WS8.53",
+     "status": "done",
+     "deps": [],
+     "wave": "Wave 01"
+    },
+    {
+     "id": "WS8.55",
+     "title": "Task WS8.55",
+     "status": "wip",
+     "deps": [],
+     "wave": "Wave 01"
+    },
+    {
+     "id": "WS8.59",
+     "title": "Task WS8.59",
+     "status": "done",
+     "deps": [],
+     "kind": "gate",
+     "wave": "Wave 02",
+     "note": "note on WS8.59"
+    },
+    {
+     "id": "WS8.60",
+     "title": "Task WS8.60",
+     "status": "done",
+     "deps": [
+      "WS8.59"
+     ],
+     "kind": "gate",
+     "dep_notes": {
+      "WS8.59": "run only after WS8.59 lands"
+     },
+     "wave": "Wave 02",
+     "note": "note on WS8.60"
+    },
+    {
+     "id": "WS8.56",
+     "title": "Task WS8.56",
+     "status": "done",
+     "deps": [
+      "WS8.1",
+      "WS8.3",
+      "WS8.4"
+     ],
+     "wave": "Wave 03"
+    },
+    {
+     "id": "WS8.57",
+     "title": "Task WS8.57",
+     "status": "done",
+     "deps": [
+      "WS8.1"
+     ],
+     "wave": "Wave 03"
+    },
+    {
+     "id": "WS8.1",
+     "title": "Task WS8.1",
+     "status": "done",
+     "deps": [
+      "WS8.52"
+     ],
+     "wave": "Wave 04"
+    },
+    {
+     "id": "WS8.2",
+     "title": "Task WS8.2",
+     "status": "done",
+     "deps": [
+      "WS8.1"
+     ],
+     "wave": "Wave 03"
+    },
+    {
+     "id": "WS8.3",
+     "title": "Task WS8.3",
+     "status": "prog",
+     "deps": [],
+     "wave": "Wave 04"
+    },
+    {
+     "id": "WS8.4",
+     "title": "Task WS8.4",
+     "status": "done",
+     "deps": [
+      "WS8.1",
+      "WS8.3",
+      "WS8.5",
+      "WS8.6"
+     ],
+     "wave": "Wave 03"
+    },
+    {
+     "id": "WS8.5",
+     "title": "Task WS8.5",
+     "status": "done",
+     "deps": [],
+     "wave": "Wave 04"
+    },
+    {
+     "id": "WS8.6",
+     "title": "Task WS8.6",
+     "status": "done",
+     "deps": [],
+     "wave": "Wave 04"
+    },
+    {
+     "id": "WS8.7",
+     "title": "Task WS8.7",
+     "status": "done",
+     "deps": [
+      "WS8.1",
+      "WS8.2",
+      "WS8.21"
+     ],
+     "wave": "Wave 05"
+    },
+    {
+     "id": "WS8.8",
+     "title": "Task WS8.8",
+     "status": "done",
+     "deps": [
+      "WS8.7"
+     ],
+     "wave": "Wave 06"
+    }
+   ]
+  },
+  {
+   "id": "g2",
+   "col": 1,
+   "title": "Stage group 2",
+   "tasks": [
+    {
+     "id": "WS8.9",
+     "title": "Task WS8.9",
+     "status": "done",
+     "deps": [
+      "WS8.1"
+     ],
+     "wave": "Wave 03"
+    },
+    {
+     "id": "WS8.10",
+     "title": "Task WS8.10",
+     "status": "done",
+     "deps": [
+      "WS8.9",
+      "WS8.15",
+      "WS8.21"
+     ],
+     "wave": "Wave 05"
+    },
+    {
+     "id": "WS8.11",
+     "title": "Task WS8.11",
+     "status": "done",
+     "deps": [],
+     "wave": "Wave 04"
+    },
+    {
+     "id": "WS8.12",
+     "title": "Task WS8.12",
+     "status": "done",
+     "deps": [],
+     "wave": "Wave 04"
+    },
+    {
+     "id": "WS8.13",
+     "title": "Task WS8.13",
+     "status": "done",
+     "deps": [
+      "WS8.52"
+     ],
+     "wave": "Wave 04"
+    },
+    {
+     "id": "WS8.14",
+     "title": "Task WS8.14",
+     "status": "done",
+     "deps": [
+      "WS8.10",
+      "WS8.13",
+      "WS8.21"
+     ],
+     "wave": "Wave 06"
+    },
+    {
+     "id": "WS8.15",
+     "title": "Task WS8.15",
+     "status": "done",
+     "deps": [
+      "WS8.9"
+     ],
+     "wave": "Wave 07"
+    },
+    {
+     "id": "WS8.16",
+     "title": "Task WS8.16",
+     "status": "done",
+     "deps": [],
+     "wave": "Wave 04"
+    },
+    {
+     "id": "WS8.50",
+     "title": "Task WS8.50",
+     "status": "done",
+     "deps": [
+      "WS8.32",
+      "WS8.54"
+     ],
+     "wave": "Wave 08"
+    }
+   ]
+  },
+  {
+   "id": "g3",
+   "col": 2,
+   "title": "Stage group 3",
+   "tasks": [
+    {
+     "id": "WS8.17",
+     "title": "Task WS8.17",
+     "status": "done",
+     "deps": [],
+     "wave": "Wave 09"
+    },
+    {
+     "id": "WS8.18",
+     "title": "Task WS8.18",
+     "status": "done",
+     "deps": [],
+     "wave": "Wave 04"
+    },
+    {
+     "id": "WS8.19",
+     "title": "Task WS8.19",
+     "status": "done",
+     "deps": [],
+     "wave": "Wave 09"
+    },
+    {
+     "id": "WS8.20",
+     "title": "Task WS8.20",
+     "status": "done",
+     "deps": [],
+     "wave": "Wave 03"
+    },
+    {
+     "id": "WS8.21",
+     "title": "Task WS8.21",
+     "status": "done",
+     "deps": [
+      "WS8.52"
+     ],
+     "wave": "Wave 04"
+    },
+    {
+     "id": "WS8.22",
+     "title": "Task WS8.22",
+     "status": "done",
+     "deps": [
+      "WS8.21"
+     ],
+     "wave": "Wave 03"
+    },
+    {
+     "id": "WS8.23",
+     "title": "Task WS8.23",
+     "status": "done",
+     "deps": [
+      "WS8.21",
+      "WS8.59"
+     ],
+     "dep_notes": {
+      "WS8.59": "run only after WS8.59 lands"
+     },
+     "wave": "Wave 03"
+    },
+    {
+     "id": "WS8.24",
+     "title": "Task WS8.24",
+     "status": "prog",
+     "deps": [
+      "WS8.21",
+      "WS8.54"
+     ],
+     "wave": "Wave 10"
+    },
+    {
+     "id": "WS8.25",
+     "title": "Task WS8.25",
+     "status": "done",
+     "deps": [],
+     "wave": "Wave 09"
+    },
+    {
+     "id": "WS8.26",
+     "title": "Task WS8.26",
+     "status": "prog",
+     "deps": [
+      "WS8.59",
+      "WS8.60"
+     ],
+     "dep_notes": {
+      "WS8.59": "run only after WS8.59 lands",
+      "WS8.60": "run only after WS8.60 lands"
+     },
+     "wave": "Wave 04"
+    },
+    {
+     "id": "WS8.27",
+     "title": "Task WS8.27",
+     "status": "done",
+     "deps": [
+      "WS8.10",
+      "WS8.13",
+      "WS8.14",
+      "WS8.29",
+      "WS8.36",
+      "WS8.37"
+     ],
+     "wave": "Wave 11"
+    }
+   ]
+  },
+  {
+   "id": "g4",
+   "col": 3,
+   "title": "Stage group 4",
+   "tasks": [
+    {
+     "id": "WS8.54",
+     "title": "Task WS8.54",
+     "status": "done",
+     "deps": [],
+     "wave": "Wave 12"
+    },
+    {
+     "id": "WS8.28",
+     "title": "Task WS8.28",
+     "status": "done",
+     "deps": [
+      "WS8.52"
+     ],
+     "wave": "Wave 04"
+    },
+    {
+     "id": "WS8.29",
+     "title": "Task WS8.29",
+     "status": "done",
+     "deps": [
+      "WS8.13",
+      "WS8.21"
+     ],
+     "wave": "Wave 06"
+    },
+    {
+     "id": "WS8.30",
+     "title": "Task WS8.30",
+     "status": "done",
+     "deps": [
+      "WS8.14",
+      "WS8.31"
+     ],
+     "wave": "Wave 13"
+    },
+    {
+     "id": "WS8.31",
+     "title": "Task WS8.31",
+     "status": "done",
+     "deps": [
+      "WS8.1",
+      "WS8.10",
+      "WS8.12",
+      "WS8.14",
+      "WS8.38"
+     ],
+     "wave": "Wave 14"
+    },
+    {
+     "id": "WS8.32",
+     "title": "Task WS8.32",
+     "status": "done",
+     "deps": [
+      "WS8.30",
+      "WS8.31"
+     ],
+     "wave": "Wave 15"
+    },
+    {
+     "id": "WS8.33",
+     "title": "Task WS8.33",
+     "status": "done",
+     "deps": [
+      "WS8.21"
+     ],
+     "wave": "Wave 03"
+    },
+    {
+     "id": "WS8.34",
+     "title": "Task WS8.34",
+     "status": "done",
+     "deps": [
+      "WS8.28",
+      "WS8.30",
+      "WS8.31",
+      "WS8.32",
+      "WS8.33"
+     ],
+     "wave": "Wave 16"
+    },
+    {
+     "id": "WS8.70",
+     "title": "Task WS8.70",
+     "status": "done",
+     "deps": [],
+     "kind": "gate",
+     "wave": "Wave 17"
+    }
+   ]
+  },
+  {
+   "id": "g5",
+   "col": 4,
+   "title": "Stage group 5",
+   "tasks": [
+    {
+     "id": "WS8.35",
+     "title": "Task WS8.35",
+     "status": "done",
+     "deps": [
+      "WS8.21"
+     ],
+     "wave": "Wave 03"
+    },
+    {
+     "id": "WS8.58",
+     "title": "Task WS8.58",
+     "status": "done",
+     "deps": [
+      "WS8.54"
+     ],
+     "wave": "Wave 18"
+    },
+    {
+     "id": "WS8.36",
+     "title": "Task WS8.36",
+     "status": "done",
+     "deps": [
+      "WS8.21",
+      "WS8.52",
+      "WS8.70"
+     ],
+     "dep_notes": {
+      "WS8.70": "run only after WS8.70 lands"
+     },
+     "wave": "Wave 19"
+    },
+    {
+     "id": "WS8.37",
+     "title": "Task WS8.37",
+     "status": "done",
+     "deps": [
+      "WS8.21"
+     ],
+     "wave": "Wave 16"
+    },
+    {
+     "id": "WS8.38",
+     "title": "Task WS8.38",
+     "status": "done",
+     "deps": [
+      "WS8.12",
+      "WS8.21"
+     ],
+     "wave": "Wave 03"
+    },
+    {
+     "id": "WS8.39",
+     "title": "Task WS8.39",
+     "status": "done",
+     "deps": [],
+     "wave": "Wave 04"
+    },
+    {
+     "id": "WS8.40",
+     "title": "Task WS8.40",
+     "status": "done",
+     "deps": [],
+     "wave": "Wave 04"
+    }
+   ]
+  },
+  {
+   "id": "g6",
+   "col": 5,
+   "title": "Stage group 6",
+   "tasks": [
+    {
+     "id": "WS8.41",
+     "title": "Task WS8.41",
+     "status": "done",
+     "deps": [],
+     "wave": "Wave 04"
+    },
+    {
+     "id": "WS8.42",
+     "title": "Task WS8.42",
+     "status": "done",
+     "deps": [
+      "WS8.8",
+      "WS8.41"
+     ],
+     "wave": "Wave 20"
+    },
+    {
+     "id": "WS8.43",
+     "title": "Task WS8.43",
+     "status": "prog",
+     "deps": [
+      "WS8.42",
+      "WS8.21"
+     ],
+     "wave": "Wave 21"
+    },
+    {
+     "id": "WS8.44",
+     "title": "Task WS8.44",
+     "status": "wip",
+     "deps": [
+      "WS8.43",
+      "WS8.21",
+      "WS8.55",
+      "WS8.59",
+      "WS8.63"
+     ],
+     "dep_notes": {
+      "WS8.59": "run only after WS8.59 lands",
+      "WS8.63": "run only after WS8.63 lands"
+     },
+     "wave": "Wave 22"
+    },
+    {
+     "id": "WS8.45",
+     "title": "Task WS8.45",
+     "status": "prog",
+     "deps": [
+      "WS8.7",
+      "WS8.21"
+     ],
+     "wave": "Wave 06"
+    },
+    {
+     "id": "WS8.49",
+     "title": "Task WS8.49",
+     "status": "prog",
+     "deps": [
+      "WS8.45",
+      "WS8.21"
+     ],
+     "wave": "Wave 23"
+    },
+    {
+     "id": "WS8.46",
+     "title": "Task WS8.46",
+     "status": "done",
+     "deps": [
+      "WS8.21"
+     ],
+     "wave": "Wave 03"
+    }
+   ]
+  },
+  {
+   "id": "g7",
+   "col": 6,
+   "title": "Stage group 7",
+   "tasks": [
+    {
+     "id": "WS8.51",
+     "title": "Task WS8.51",
+     "status": "prog",
+     "deps": [
+      "WS8.27",
+      "WS8.35",
+      "WS8.44"
+     ],
+     "wave": "Wave 24"
+    },
+    {
+     "id": "WS8.47",
+     "title": "Task WS8.47",
+     "status": "prog",
+     "deps": [
+      "WS8.21",
+      "WS8.22",
+      "WS8.24",
+      "WS8.27",
+      "WS8.32",
+      "WS8.44",
+      "WS8.45",
+      "WS8.49",
+      "WS8.50",
+      "WS8.63"
+     ],
+     "dep_notes": {
+      "WS8.63": "run only after WS8.63 lands"
+     },
+     "wave": "Wave 25"
+    },
+    {
+     "id": "WS8.48",
+     "title": "Task WS8.48",
+     "status": "todo",
+     "deps": [
+      "WS8.47",
+      "WS8.55"
+     ],
+     "wave": "Wave 26",
+     "note": "note on WS8.48"
+    }
+   ]
+  },
+  {
+   "id": "g8",
+   "col": 2,
+   "title": "Stage group 8",
+   "tasks": [
+    {
+     "id": "WS8.61",
+     "title": "Task WS8.61",
+     "status": "done",
+     "deps": [],
+     "wave": "Wave 27"
+    },
+    {
+     "id": "WS8.62",
+     "title": "Task WS8.62",
+     "status": "done",
+     "deps": [
+      "WS8.61"
+     ],
+     "wave": "Wave 27"
+    },
+    {
+     "id": "WS8.63",
+     "title": "Task WS8.63",
+     "status": "done",
+     "deps": [],
+     "wave": "Wave 27"
+    },
+    {
+     "id": "WS8.64",
+     "title": "Task WS8.64",
+     "status": "done",
+     "deps": [],
+     "wave": "Wave 27"
+    },
+    {
+     "id": "WS8.65",
+     "title": "Task WS8.65",
+     "status": "done",
+     "deps": [
+      "WS8.61"
+     ],
+     "wave": "Wave 27"
+    },
+    {
+     "id": "WS8.66",
+     "title": "Task WS8.66",
+     "status": "prog",
+     "deps": [
+      "WS8.62",
+      "WS8.65",
+      "WS8.64"
+     ],
+     "wave": "Wave 27"
+    },
+    {
+     "id": "WS8.67",
+     "title": "Task WS8.67",
+     "status": "deferred",
+     "deps": [
+      "WS8.66"
+     ],
+     "wave": "Wave 27",
+     "note": "note on WS8.67"
+    },
+    {
+     "id": "WS8.68",
+     "title": "Task WS8.68",
+     "status": "done",
+     "deps": [],
+     "wave": "Wave 27"
+    },
+    {
+     "id": "WS8.69",
+     "title": "Task WS8.69",
+     "status": "done",
+     "deps": [],
+     "wave": "Wave 27"
+    }
+   ]
+  }
+ ],
+ "edges": [
+  [
+   "g6",
+   "g7"
+  ]
+ ],
+ "phases": [
+  {
+   "name": "Stage 1",
+   "goal": "Generic goal for stage 1.",
+   "gate": "Generic gate for stage 1."
+  },
+  {
+   "name": "Stage 2",
+   "goal": "Generic goal for stage 2.",
+   "gate": "Generic gate for stage 2."
+  },
+  {
+   "name": "Stage 3",
+   "goal": "Generic goal for stage 3.",
+   "gate": "Generic gate for stage 3."
+  },
+  {
+   "name": "Stage 4",
+   "goal": "Generic goal for stage 4.",
+   "gate": "Generic gate for stage 4."
+  },
+  {
+   "name": "Stage 5",
+   "goal": "Generic goal for stage 5.",
+   "gate": "Generic gate for stage 5."
+  },
+  {
+   "name": "Stage 6",
+   "goal": "Generic goal for stage 6.",
+   "gate": "Generic gate for stage 6."
+  },
+  {
+   "name": "Stage 7",
+   "goal": "Generic goal for stage 7.",
+   "gate": "Generic gate for stage 7."
+  }
+ ],
+ "trains": [
+  {
+   "id": "solo-01",
+   "title": "Solo train 1",
+   "branch": "train/solo-01",
+   "members": [
+    "WS8.1"
+   ],
+   "status": "merged",
+   "pr": 5452,
+   "shared_files": [
+    "src/mod1.py"
+   ],
+   "gate": null,
+   "note": "note on solo-01"
+  },
+  {
+   "id": "solo-02",
+   "title": "Solo train 2",
+   "branch": "train/solo-02",
+   "members": [
+    "WS8.21"
+   ],
+   "status": "merged",
+   "pr": 5451,
+   "shared_files": [
+    "src/mod2.py"
+   ],
+   "gate": null,
+   "note": "note on solo-02"
+  },
+  {
+   "id": "solo-03",
+   "title": "Solo train 3",
+   "branch": "train/solo-03",
+   "members": [
+    "WS8.22"
+   ],
+   "status": "planned",
+   "pr": null,
+   "shared_files": [],
+   "gate": null,
+   "note": "note on solo-03"
+  },
+  {
+   "id": "solo-04",
+   "title": "Solo train 4",
+   "branch": "train/solo-04",
+   "members": [
+    "WS8.23"
+   ],
+   "status": "planned",
+   "pr": null,
+   "shared_files": [],
+   "gate": null,
+   "note": "note on solo-04"
+  },
+  {
+   "id": "solo-05",
+   "title": "Solo train 5",
+   "branch": "train/solo-05",
+   "members": [
+    "WS8.33"
+   ],
+   "status": "planned",
+   "pr": null,
+   "shared_files": [],
+   "gate": null,
+   "note": "note on solo-05"
+  },
+  {
+   "id": "solo-06",
+   "title": "Solo train 6",
+   "branch": "train/solo-06",
+   "members": [
+    "WS8.35"
+   ],
+   "status": "planned",
+   "pr": null,
+   "shared_files": [],
+   "gate": null,
+   "note": "note on solo-06"
+  },
+  {
+   "id": "solo-07",
+   "title": "Solo train 7",
+   "branch": "train/solo-07",
+   "members": [
+    "WS8.36"
+   ],
+   "status": "planned",
+   "pr": null,
+   "shared_files": [
+    "src/mod3.py"
+   ],
+   "gate": null,
+   "note": "note on solo-07"
+  },
+  {
+   "id": "solo-08",
+   "title": "Solo train 8",
+   "branch": "train/solo-08",
+   "members": [
+    "WS8.38"
+   ],
+   "status": "planned",
+   "pr": null,
+   "shared_files": [
+    "src/mod4.py"
+   ],
+   "gate": null,
+   "note": "note on solo-08"
+  },
+  {
+   "id": "solo-09",
+   "title": "Solo train 9",
+   "branch": "train/solo-09",
+   "members": [
+    "WS8.46"
+   ],
+   "status": "planned",
+   "pr": null,
+   "shared_files": [],
+   "gate": null,
+   "note": "note on solo-09"
+  },
+  {
+   "id": "solo-10",
+   "title": "Solo train 10",
+   "branch": "train/solo-10",
+   "members": [
+    "WS8.7"
+   ],
+   "status": "planned",
+   "pr": null,
+   "shared_files": [
+    "src/mod5.py"
+   ],
+   "gate": null,
+   "note": "note on solo-10"
+  },
+  {
+   "id": "solo-11",
+   "title": "Solo train 11",
+   "branch": "train/solo-11",
+   "members": [
+    "WS8.14"
+   ],
+   "status": "planned",
+   "pr": null,
+   "shared_files": [
+    "src/mod6.py",
+    "src/mod7.py"
+   ],
+   "gate": null,
+   "note": "note on solo-11"
+  },
+  {
+   "id": "solo-12",
+   "title": "Solo train 12",
+   "branch": "train/solo-12",
+   "members": [
+    "WS8.29"
+   ],
+   "status": "planned",
+   "pr": null,
+   "shared_files": [
+    "src/mod8.py"
+   ],
+   "gate": null,
+   "note": "note on solo-12"
+  },
+  {
+   "id": "solo-13",
+   "title": "Solo train 13",
+   "branch": "train/solo-13",
+   "members": [
+    "WS8.31"
+   ],
+   "status": "planned",
+   "pr": null,
+   "shared_files": [
+    "src/mod9.py",
+    "src/mod10.py"
+   ],
+   "gate": null,
+   "note": "note on solo-13"
+  },
+  {
+   "id": "solo-14",
+   "title": "Solo train 14",
+   "branch": "train/solo-14",
+   "members": [
+    "WS8.45"
+   ],
+   "status": "planned",
+   "pr": null,
+   "shared_files": [],
+   "gate": null,
+   "note": "note on solo-14"
+  },
+  {
+   "id": "solo-15",
+   "title": "Solo train 15",
+   "branch": "train/solo-15",
+   "members": [
+    "WS8.50"
+   ],
+   "status": "planned",
+   "pr": null,
+   "shared_files": [
+    "src/mod11.py"
+   ],
+   "gate": null,
+   "note": "note on solo-15"
+  },
+  {
+   "id": "solo-16",
+   "title": "Solo train 16",
+   "branch": "train/solo-16",
+   "members": [
+    "WS8.24"
+   ],
+   "status": "planned",
+   "pr": null,
+   "shared_files": [],
+   "gate": null,
+   "note": "note on solo-16"
+  },
+  {
+   "id": "solo-17",
+   "title": "Solo train 17",
+   "branch": "train/solo-17",
+   "members": [
+    "WS8.32"
+   ],
+   "status": "planned",
+   "pr": null,
+   "shared_files": [
+    "src/mod12.py",
+    "src/mod13.py"
+   ],
+   "gate": null,
+   "note": null
+  },
+  {
+   "id": "solo-18",
+   "title": "Solo train 18",
+   "branch": "train/solo-18",
+   "members": [
+    "WS8.43"
+   ],
+   "status": "planned",
+   "pr": null,
+   "shared_files": [
+    "src/mod14.py"
+   ],
+   "gate": null,
+   "note": "note on solo-18"
+  },
+  {
+   "id": "solo-19",
+   "title": "Solo train 19",
+   "branch": "train/solo-19",
+   "members": [
+    "WS8.37"
+   ],
+   "status": "planned",
+   "pr": null,
+   "shared_files": [],
+   "gate": null,
+   "note": "note on solo-19"
+  },
+  {
+   "id": "solo-20",
+   "title": "Solo train 20",
+   "branch": "train/solo-20",
+   "members": [
+    "WS8.44"
+   ],
+   "status": "planned",
+   "pr": null,
+   "shared_files": [
+    "src/mod15.py"
+   ],
+   "gate": null,
+   "note": "note on solo-20"
+  },
+  {
+   "id": "solo-21",
+   "title": "Solo train 21",
+   "branch": "train/solo-21",
+   "members": [
+    "WS8.49"
+   ],
+   "status": "planned",
+   "pr": null,
+   "shared_files": [],
+   "gate": null,
+   "note": "note on solo-21"
+  }
+ ],
+ "progress": {
+  "done": 57,
+  "total": 69,
+  "counts": {
+   "todo": 1,
+   "wip": 2,
+   "pr": 0,
+   "prog": 9,
+   "done": 57,
+   "deferred": 1
+  },
+  "pct": 83
+ }
+}

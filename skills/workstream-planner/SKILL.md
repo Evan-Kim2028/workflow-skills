@@ -41,6 +41,20 @@ Tool: `tools/agent-dash/` in this repo (`~/.claude/tools/agent-dash/` after `./i
    - `KICKOFF.md` is self-contained: paths, waves, the wave call, run labels `ws4-<task>-<slug>`, `ws task` status moves, merge and test rules, coordination contacts, done criteria, and the naming rule.
    - `START-PROMPT.md` is the short paste-ready prompt that points a fresh session at the brief and the approvals.
 
+## Map checklist (before kickoff)
+
+The plan-progress map stays readable when the plan follows these rules. Run `ws layout WS4` before kickoff and aim for zero MAP warnings (`ws validate` reports the same codes; warnings never fail the exit code).
+
+- Stage 4 to 5 columns with one- or two-word plain names. Never more than 5 (MAP102), never an empty column (MAP103).
+- Keep 2 to 4 groups per column and 3 to 12 tasks per group. Merge 1-task groups (MAP109); split groups above 14 (MAP101).
+- Title each group with the outcome in plain words (at most 40 chars), never a bare id (MAP105).
+- Keep task id suffixes short and unique inside the workstream (at most 12 chars, MAP110).
+- Give every group outside the first column a waits-on edge to a group on its left (MAP106).
+- Mark outside signals as `kind: gate` diamonds with `signal`, `confirmed_at`, and `fresh_hours`.
+- Keep trains at 2 to 8 members; a 1-member train renders untagged (MAP107).
+- Put one short condition (at most 80 chars) in `dep_notes` on each cross-group dep (MAP108).
+- Keep done tasks in the dag; leave deferred tasks where planned with `moved_to` plus `note` (MAP111).
+
 ## Decompose for parallelism
 
 Size work so waves fan out. Detail and evidence: [orchestration principles](../../tools/agent-dash/docs/orchestration.md).
@@ -50,7 +64,7 @@ Size work so waves fan out. Detail and evidence: [orchestration principles](../.
 - **Interface-first tasks.** Every fan-out starts with a frozen interface (spec, shapes, manifest, route list) that dependents name in `deps`. A deploy gate is not an interface: everything behind it serializes.
 - **Deps that are real.** A dep is a task id that must be on main before the lane starts. Test one by asking: if the dep's branch vanished, would this lane rebuild on wrong ground? If no, cut the edge. Group edges never substitute — except a scope declared `mostly_landed` (already on main, small disjoint adds), which may skip task deps.
 - **Gates for outside signals.** Anything owned elsewhere is a `"kind": "gate"` task with the condition in the dependent's `dep_notes`; every gate carries a freshness bound, and an expired gate blocks starts.
-- **Trains grouped by shared files.** Batch tasks expected to touch the same files or carry migrations, at most 8 members; re-cut from member diffs as they land. Exception: one table, one migration number, or one drop ships alone as a single-member train.
+- **Trains grouped by shared files.** Batch tasks expected to touch the same files or carry migrations, 2 to 8 members; re-cut from member diffs as they land. A single-member train renders untagged with a MAP107 warning: one table, one migration number, or one drop ships alone as a task note, not a train.
 - **Definition of ready and done.** Ready: deps done or merged, wave start condition holds, no other lane owns its files, production step approved. Done: merged to main and live where the task says live (`wip` → `pr` → `prog` → `done`; `prog` only after merge with a production step left).
 - **Acceptance numeric, with tolerance.** Every task names metric, threshold plus tolerance, and probe command; the reviewer reports evidence and the lead closes on the number, not in chat.
 - **Check max parallelism before kickoff.** Run `ws waves`: if the plan's widest wave is 1 where lanes could be disjoint, re-split before anyone starts.

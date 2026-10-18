@@ -9,6 +9,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 import http.client
 from pathlib import Path
 
@@ -226,6 +227,16 @@ class ServerTest(unittest.TestCase):
         raw2 = json.loads(Path(mapping["WS2"]).read_text(encoding="utf-8"))
         self.assertEqual(status, 200)
         self.assertEqual(ws2["cols"], raw2["dag"]["cols"])
+
+    def test_plan_survives_layout_failure(self):
+        with mock.patch("dash.maplayout.layout", side_effect=ValueError("layout boom")), mock.patch.dict("dash.server._PLAN_MAP_CACHE", clear=True):
+            with self.assertLogs("agent_dash.maplayout", level="WARNING"):
+                status, _, body = get(self.port, "/api/plan?ws=WS7")
+        self.assertEqual(status, 200)
+        plan = json.loads(body)
+        self.assertEqual(plan["ws"], "WS7")
+        self.assertIsNone(plan["layout"])
+        self.assertEqual(plan["map_warnings"], [])
 
     def test_workstreams_carry_plan_progress(self):
         from dash.bundles import resolve_plan
