@@ -718,6 +718,23 @@ class PageRules(unittest.TestCase):
             self.assertNotIn(marker, page, f"index.html still has doctor UI: {marker}")
         self.assertFalse((STATIC / "doctor.js").exists(), "static/doctor.js is back")
 
+    def test_chart_cards_expose_agent_data(self):
+        """The v2 charts carry raw values for agents: the token legend
+        entries have data-key/data-v, the bar samples data-t/data-v, the
+        peak bar a direct label; every live strip has its own y axis, a
+        gradient fill and a pk annotation, and an empty window reads
+        "No samples in this window", never a silent zero or a failure."""
+        script = inline_scripts()
+        bodies = dict(functions(script))
+        self.assertIn("tokenChart", bodies)
+        tok = bodies["tokenChart"]
+        for needle in ("data-key", "data-v", "data-t", "peaklab", "data-legend-total"):
+            self.assertIn(needle, tok, f"tokenChart lost {needle!r}")
+        self.assertIn("concChart", bodies)
+        conc = bodies["concChart"]
+        for needle in ("data-fam", "data-peak", "pk ", "linearGradient", "No samples in this window", "data-failed-scope", "request failed"):
+            self.assertIn(needle, conc, f"concChart lost {needle!r}")
+
     def test_unknown_duration_is_a_dash(self):
         script = (
             "const fs=require('fs');"

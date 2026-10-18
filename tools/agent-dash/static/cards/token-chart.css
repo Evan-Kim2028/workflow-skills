@@ -1,0 +1,35 @@
+/* Token chart card (v2): stacked hourly bars with labelled peaks,
+   a family-total legend and a pill grouping toggle. Scoped to
+   #exec-tokens so other cards sharing .legend/.seg-ctl are untouched. */
+
+/* Header: title left, grouping toggle right. */
+#exec-tokens .tok-head{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+#exec-tokens .tok-head h2{margin:0}
+
+/* Grouping toggle as a pill segmented control (active = filled accent). */
+#exec-tokens .seg-ctl{border-radius:999px;padding:3px;gap:2px;background:var(--surface)}
+#exec-tokens .seg-ctl button{border:0;background:transparent;color:var(--ink-2);font-weight:650;font-size:12.5px;padding:5px 14px;border-radius:999px;cursor:pointer}
+#exec-tokens .seg-ctl button:hover{color:var(--ink)}
+#exec-tokens .seg-ctl button[aria-pressed="true"]{background:var(--accent-fill, var(--accent));color:var(--accent-ink)}
+#exec-tokens .seg-ctl button:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+
+/* Legend: Total first, then one family (or workstream) entry each with a
+   right-aligned tabular value. Raw totals ride data-key/data-v. */
+#exec-tokens .tok-legend{align-items:baseline}
+#exec-tokens .tok-legend .lentry{display:inline-flex;align-items:center;gap:6px}
+#exec-tokens .tok-legend .lname{color:var(--ink-2)}
+#exec-tokens .tok-legend .lv{font-variant-numeric:tabular-nums;text-align:right;min-width:3.4em;font-weight:700;color:var(--ink)}
+
+/* Direct bar labels: peak above its bar, stack totals above top hours. */
+#exec-tokens .peaklab{font:700 11px var(--mono);fill:var(--ink);font-variant-numeric:tabular-nums}
+#exec-tokens .vallab{font:600 10.5px var(--mono);fill:var(--muted);font-variant-numeric:tabular-nums}
+
+/* Keep the svg aspect when the column narrows (phone widths). */
+#exec-tokens svg{height:auto}
+
+/* Failed scope: loud, never a silent zero. */
+#exec-tokens .empty.err{color:var(--critical)}
+
+@media (prefers-reduced-motion: reduce){
+  #exec-tokens .seg-ctl button{transition:none}
+}
