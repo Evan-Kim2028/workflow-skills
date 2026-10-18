@@ -412,7 +412,7 @@ class StateLifecycleTest(unittest.TestCase):
         self.store = _store(self.tmp.name)
         self.wsroot = os.path.join(self.tmp.name, "ws")
         os.makedirs(self.wsroot)
-        self._env = mock.patch.dict(os.environ, {"AGENT_DASH_WORKSTREAMS": self.wsroot})
+        self._env = mock.patch.dict(os.environ, {"AGENT_DASH_WORKSTREAMS": self.wsroot, "AGENT_DASH_DATA_ROOT": self.tmp.name})
         self._env.start()
         self.addCleanup(self._env.stop)
 
