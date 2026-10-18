@@ -9,8 +9,10 @@ The one argv value ever kept is the worker's `--model` flag value, recorded on p
 
 | Path | Owner |
 |---|---|
-| `agent_dash.py` (CLI: `run`, `stop`, `restart`, `deploy`, `rollback`, `status`, `state`, `doctor`, `backfill --session <id>`, `reprice`, `reconcile`, `check`, `ws`, `report`) | core |
+| `agent_dash.py` (CLI: `run`, `stop`, `restart`, `deploy`, `rollback`, `status`, `state`, `doctor`, `backfill --session <id>`, `reprice`, `reconcile`, `check`, `ws`, `project`, `report`) | core |
 | `dash/state.py` (`GET /api/state`), `dash/doctor.py` (`doctor`), `dash/errors.py` (exit codes, messages) | cli |
+| `dash/dataroot.py` (data-root resolution: `data_root`, `state_dir`, `workstreams_dir`, `hub_dir`, `project_file`; the `Storage` seam, local only) | core |
+| `dash/project.py` (project descriptor: `project.json` read/validate, `project` CLI, `GET /api/project` payload) | core |
 | `dash/store/` (facade: `Store` with the same public API over concern mixins) | core |
 | `dash/store/base.py` (connect, schema, migrations, offsets, doctor persistence) | core |
 | `dash/store/runs.py` (run/session upserts, merge aliases, attribution glue, run reads) | core |
@@ -53,6 +55,7 @@ The one argv value ever kept is the worker's `--model` flag value, recorded on p
 | `static/core/cache.js` (exec/section keyed caches, keyed-section renderer) | Claude (parent) |
 | `static/core/charts.js` (shared chart/axis and token-cell helpers) | Claude (parent) |
 | `static/core/drawer.js` (run details drawer) | Claude (parent) |
+| `static/core/project.js` (project header/title from `GET /api/project`, once per load and on focus) | Claude (parent) |
 | `fixtures/*.json` (seeded synthetic API responses from `fixtures/make_fixtures.py`) | fixture |
 | `tests/test_*.py` (unittest, stdlib) | each owner for its files |
 | `docs/roadmap.md` (open work plan) + `docs/design-v2.md` + `docs/design-v2-tokens.css` (proposed v2 spec) | core (docs only; spec builds only on owner approval) |
@@ -342,6 +345,38 @@ renamed.
 `python3 agent_dash.py state [--json]` prints the same payload.
 `doctor` additionally reports each health `warnings` entry as a
 `run-dir-outside-roots` problem.
+
+`GET /api/project` -> the project descriptor plus the computed roll-up:
+```json
+{"name": "Demo project", "short": "demo", "description": "", "goals": [],
+ "started": "2026-10-15", "target": null,
+ "phases": [{"id": "p1", "title": "First cut", "summary": "", "gate": ["WS1"],
+   "state": "active", "members": [{"ws": "WS1", "state": "active"}]}],
+ "links": [], "owner_notes": "",
+ "data_root_hash": "0123456789ab",
+ "totals_all_time": {"tokens": {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0, "reasoning": 0}, "cost_usd": 0.0},
+ "counts": {"planned": 0, "active": 1, "paused": 0, "done": 0, "archived": 0, "dropped": 0},
+ "issues": []}
+```
+`project.json` lives in the data root (`dash/dataroot.py` `project_file`).
+A phase `gate` names member workstream ids (a list) or carries gate text
+(a string); `state` is computed, never stored: `done` when every member
+is `done`/`archived`, `active` while any member is `active`/`paused`,
+`planned` before that, `dropped` when every member is `dropped`. Member
+states come from `bundle.json` `state` when present, else `active`.
+`totals_all_time` is the same summary the snapshot serves (archived work
+included); `counts` tallies bundles by lifecycle state. `data_root_hash`
+names the data root without exposing the path. A missing `project.json`
+reads `name: null` (the header falls back to "Agent dashboard") with
+empty `issues`; a misshapen one still serves 200 with its issues named.
+```bash
+python3 agent_dash.py project init "Demo project" [--data-root DIR]
+python3 agent_dash.py project show [--json]
+python3 agent_dash.py project set description "What ships."
+```
+`init` writes a starter template and refuses to overwrite (exit 2);
+`set` takes `name`, `short`, `description`, or `target` (exit 2 on a bad
+field, 3 when no `project.json` exists, 4 on invalid data).
 
 `GET /static/<file>` serves a file from `static/` or one subdirectory (`vendor/`). `/static/taskmap.json` is the resolved task map (`taskmap.local.json`, else `taskmap.example.json`). Context-window rows use tool `grok-context` and are left out of cost.
 

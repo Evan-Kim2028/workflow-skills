@@ -11,6 +11,7 @@
   "hub_dir": "",
   "issues_dir": "",
   "workstreams_tsv": "",
+  "data_root": "$HOME/.local/share/agent-dash",
   "state_dir": "$HOME/.local/share/agent-dash",
   "doctor": {
     "interval_s": 300,

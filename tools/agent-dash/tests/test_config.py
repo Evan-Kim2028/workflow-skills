@@ -9,8 +9,10 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from agent_dash import default_cfg, load_cfg
+from dash import dataroot
 from dash.locate import layered_path, scratch_roots
 from dash.sources.hub import poll as hub_poll
 from dash.store import Store
@@ -68,6 +70,28 @@ class ConfigTests(unittest.TestCase):
                 else:
                     os.environ[key] = previous
             self.assertEqual(overridden["hub_dir"], tmp)
+
+    def test_data_root_default_env_and_state_fallback(self):
+        self.assertEqual(default_cfg()["data_root"], default_cfg()["state_dir"])
+        with tempfile.TemporaryDirectory() as tmp:
+            key = "AGENT_DASH_DATA_ROOT"
+            previous = os.environ.get(key)
+            os.environ[key] = tmp
+            try:
+                overridden = load_cfg()
+            finally:
+                if previous is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = previous
+            self.assertEqual(overridden["data_root"], tmp)
+            self.assertEqual(overridden["state_dir"], tmp)
+            self.assertEqual(dataroot.data_root(overridden), Path(tmp))
+            self.assertEqual(dataroot.state_dir(overridden), Path(tmp))
+            # This module points AGENT_DASH_WORKSTREAMS at the fixtures;
+            # clear it to see the data-root default.
+            with mock.patch.dict(os.environ, {"AGENT_DASH_WORKSTREAMS": ""}):
+                self.assertEqual(dataroot.workstreams_dir(overridden), Path(tmp) / "workstreams")
 
     def test_unset_hub_poll_is_a_no_op(self):
         with tempfile.TemporaryDirectory() as tmp:

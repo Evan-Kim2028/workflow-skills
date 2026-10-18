@@ -296,6 +296,84 @@ class ServerTest(unittest.TestCase):
         conn.close()
 
 
+class ProjectEndpointTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = os.path.join(self.tmp.name, "dataroot")
+        os.makedirs(self.root, exist_ok=True)
+        self._env = mock.patch.dict(
+            os.environ,
+            {
+                "AGENT_DASH_DATA_ROOT": self.root,
+                "AGENT_DASH_STATE_DIR": os.path.join(self.tmp.name, "state"),
+            },
+        )
+        self._env.start()
+        self.addCleanup(self._env.stop)
+        self.store = Store(Path(self.tmp.name) / "dash.sqlite")
+        self.server, self.thread = start(self.store)
+        self.port = self.server.server_address[1]
+
+    def tearDown(self):
+        stop(self.server, self.thread)
+        self.store.close()
+        self.tmp.cleanup()
+
+    def _write_project(self, data):
+        path = os.path.join(self.root, "project.json")
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(data, fh)
+        return path
+
+    def test_missing_project_reads_null_name(self):
+        status, _, body = get(self.port, "/api/project")
+        self.assertEqual(status, 200)
+        payload = json.loads(body)
+        self.assertIsNone(payload["name"])
+        self.assertEqual(payload["phases"], [])
+        self.assertEqual(payload["issues"], [])
+        self.assertEqual(len(payload["data_root_hash"]), 12)
+        self.assertEqual(set(payload["counts"]), {"planned", "active", "paused", "done", "archived", "dropped"})
+        self.assertIn("tokens", payload["totals_all_time"])
+        self.assertNotIn(self.root, body.decode("utf-8", "replace"))
+
+    def test_present_project_computes_phase_states(self):
+        self._write_project(
+            {
+                "name": "Demo project",
+                "short": "demo",
+                "description": "Seeded.",
+                "goals": ["Ship the first cut"],
+                "started": "2026-10-15",
+                "target": None,
+                "phases": [
+                    {"id": "p1", "title": "First cut", "summary": "", "gate": ["WS1"]},
+                ],
+                "links": [],
+                "owner_notes": "",
+            }
+        )
+        status, _, body = get(self.port, "/api/project")
+        self.assertEqual(status, 200)
+        payload = json.loads(body)
+        self.assertEqual(payload["name"], "Demo project")
+        self.assertEqual(payload["issues"], [])
+        # Fixture bundles carry no lifecycle state yet, so members read active.
+        self.assertEqual(payload["phases"][0]["state"], "active")
+        self.assertEqual(payload["phases"][0]["members"], [{"ws": "WS1", "state": "active"}])
+        self.assertGreaterEqual(payload["counts"]["active"], 1)
+        self.assertNotIn(self.root, body.decode("utf-8", "replace"))
+
+    def test_invalid_project_serves_issues(self):
+        with open(os.path.join(self.root, "project.json"), "w", encoding="utf-8") as fh:
+            fh.write("{not json")
+        status, _, body = get(self.port, "/api/project")
+        self.assertEqual(status, 200)
+        payload = json.loads(body)
+        self.assertIsNone(payload["name"])
+        self.assertTrue(payload["issues"])
+
+
 class PlanAndBackfillTest(unittest.TestCase):
     def test_missing_plan_file(self):
         with tempfile.TemporaryDirectory() as tmp:

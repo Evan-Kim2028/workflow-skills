@@ -25,15 +25,10 @@ PRUNE_AFTER_S = 14 * 86400
 
 
 def state_dir_of(cfg: dict | None = None) -> Path:
-    """State dir for run registration: config, env, then the default."""
-    if isinstance(cfg, dict):
-        raw = cfg.get("state_dir")
-        if isinstance(raw, str) and raw.strip():
-            return Path(_expand(raw))
-    env = os.environ.get("AGENT_DASH_STATE_DIR")
-    if env and env.strip():
-        return Path(_expand(env.strip()))
-    return Path.home() / ".local" / "share" / "agent-dash"
+    """State dir for run registration: env, config, then the data root."""
+    from dash import dataroot as _dataroot
+
+    return _dataroot.state_dir(cfg)
 
 
 def register_run_dir(state_dir, run_dir) -> bool:

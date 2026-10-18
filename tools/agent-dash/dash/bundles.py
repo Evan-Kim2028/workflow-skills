@@ -98,12 +98,9 @@ class Citation:
 
 
 def workstreams_root() -> Path:
-    from dash.locate import expand
+    from dash import dataroot as _dataroot
 
-    raw = os.environ.get("AGENT_DASH_WORKSTREAMS")
-    if raw:
-        return Path(expand(raw))
-    return Path.home() / ".local" / "share" / "agent-dash" / "workstreams"
+    return _dataroot.workstreams_dir()
 
 
 def _prose_window(text: str, start: int) -> str:

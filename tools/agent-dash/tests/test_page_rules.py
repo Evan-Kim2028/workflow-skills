@@ -4,6 +4,7 @@ import subprocess
 
 os.environ["AGENT_DASH_IGNORE_LOCAL"] = "1"
 os.environ.setdefault("AGENT_DASH_WORKSTREAMS", os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "fixtures", "bundles"))
+import json
 import re
 import tempfile
 import unittest
@@ -930,6 +931,122 @@ console.log("timeline every-run proof ok: 640 + 505 + 640 bars");
                 text=True,
             )
         self.assertEqual(proc.returncode, 0, proc.stderr or proc.stdout)
+
+    def test_project_header_wiring(self):
+        """The header follows GET /api/project: the shell loads project.js,
+        the h1 keeps its "Agent dashboard" fallback, and the core file
+        fetches once per load and on focus with a fixtures path."""
+        page = (STATIC / "index.html").read_text()
+        self.assertIn('<script src="/static/core/project.js"></script>', page)
+        self.assertLess(
+            page.index("/static/core/drawer.js"), page.index("/static/core/project.js")
+        )
+        self.assertIn('<h1 id="title">Agent dashboard</h1>', page)
+        self.assertIn(".proj-sub", page)
+        core = (STATIC / "core" / "project.js").read_text()
+        for needle in (
+            "/api/project",
+            "../fixtures/project.json",
+            "Agent dashboard",
+            "/ project tracker",
+            "document.title",
+            "applyChrome",
+            'addEventListener("focus"',
+            "MutationObserver",
+            "loadProject",
+            "applyProject",
+        ):
+            self.assertIn(needle, core, f"project.js lost {needle!r}")
+        api = (STATIC / "core" / "api.js").read_text()
+        self.assertIn('"/api/project": "project"', api, "FIXMAP never maps /api/project")
+        fixture = STATIC.parent / "fixtures" / "project.json"
+        self.assertTrue(fixture.is_file(), "fixtures/project.json is missing")
+        self.assertTrue(json.loads(fixture.read_text(encoding="utf-8"))["name"].strip())
+
+    def test_project_header_renders(self):
+        """project.js shows the project name with its muted suffix (and the
+        name in <title>), falls back without a name, and keeps the name
+        across applyChrome view switches."""
+        harness = r'''
+const fs = require("fs");
+const assert = require("assert");
+const src = fs.readFileSync(process.argv[2], "utf8");
+var focusListeners = [];
+var titleEl = {children: [], _text: "Agent dashboard",
+  appendChild: function (c) { this.children.push(c); return c; }};
+Object.defineProperty(titleEl, "textContent", {
+  get: function () {
+    if (!this.children.length) return this._text;
+    return this.children.map(function (c) { return c.text || c.textContent || ""; }).join(" ");
+  },
+  set: function (v) { this._text = String(v); this.children = []; },
+});
+Object.defineProperty(titleEl, "innerHTML", {
+  get: function () { return ""; },
+  set: function () { this.children = []; },
+});
+function mkTag(tag) {
+  return {tag: tag, attrs: {}, children: [], textContent: "",
+    setAttribute: function (k, v) { this.attrs[k] = String(v); },
+    appendChild: function (c) { this.children.push(c); return c; }};
+}
+global.window = globalThis;
+global.addEventListener = function (t, f) { focusListeners.push([t, f]); };
+global.document = {
+  title: "",
+  getElementById: function (id) { return id === "title" ? titleEl : null; },
+  createElement: mkTag,
+  createTextNode: function (t) { return {text: String(t)}; },
+};
+global.state = {view: "exec", ws: "all"};
+global.FIX = false;
+global.applyChrome = function () {};
+var mode = "named";
+global.fetch = function () {
+  var body = mode === "named" ? {name: "Demo project"} : {name: null};
+  return Promise.resolve({ok: true, json: function () { return Promise.resolve(body); }});
+};
+eval(src);
+assert.strictEqual(typeof loadProject, "function");
+assert.strictEqual(typeof applyProject, "function");
+assert.ok(focusListeners.some(function (l) { return l[0] === "focus"; }), "no focus refetch");
+setTimeout(function () {
+  try {
+    assert.ok(titleEl.textContent.indexOf("Demo project") >= 0, "header never shows the name: " + titleEl.textContent);
+    assert.ok(titleEl.textContent.indexOf("/ project tracker") >= 0, "header never shows the suffix");
+    assert.ok(global.document.title.indexOf("Demo project") >= 0, "title never shows the name");
+    mode = "anon";
+    loadProject();
+    setTimeout(function () {
+      try {
+        assert.strictEqual(titleEl.textContent, "Agent dashboard", "no-name payload never falls back");
+        assert.ok(global.document.title.indexOf("Agent dashboard") >= 0, "title never falls back");
+        mode = "named";
+        loadProject();
+        setTimeout(function () {
+          try {
+            global.state.view = "plan";
+            global.applyChrome();
+            assert.ok(global.document.title.indexOf("Plan") === 0, "wrapped chrome lost the view prefix");
+            assert.ok(global.document.title.indexOf("Demo project") >= 0, "wrapped chrome lost the name");
+            console.log("project header proof ok");
+          } catch (e) { console.error("ASSERT: " + e.message); process.exit(1); }
+        }, 50);
+      } catch (e) { console.error("ASSERT: " + e.message); process.exit(1); }
+    }, 50);
+  } catch (e) { console.error("ASSERT: " + e.message); process.exit(1); }
+}, 50);
+'''
+        with tempfile.TemporaryDirectory() as tmp:
+            harness_path = Path(tmp) / "project_header.js"
+            harness_path.write_text(harness, encoding="utf-8")
+            proc = subprocess.run(
+                ["node", str(harness_path), str(STATIC / "core" / "project.js")],
+                capture_output=True,
+                text=True,
+            )
+        self.assertEqual(proc.returncode, 0, proc.stderr or proc.stdout)
+        self.assertIn("project header proof ok", proc.stdout)
 
 
     def test_project_view_routing(self):

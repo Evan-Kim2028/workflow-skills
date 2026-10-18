@@ -19,9 +19,11 @@ _log = logging.getLogger("agent_dash.hub")
 
 
 def poll(store, cfg, now: float) -> None:
+    from dash import dataroot as _dataroot
+
     del now
     cfg = cfg or {}
-    hub = _path(cfg.get("hub_dir"))
+    hub = _path(_dataroot.hub_dir(cfg))
     issues = _path(cfg.get("issues_dir"))
     catalog = _path(cfg.get("workstreams_tsv"))
     if hub is not None:

@@ -50,6 +50,7 @@ FILES = (
     "project.json",
     "archive.json",
     "reconcile.json",
+    "project.json",
     "plan-WS1.json",
     "plan-WS2.json",
     "plan-WS7.json",
@@ -533,7 +534,6 @@ class FixtureShapeTests(unittest.TestCase):
 class ProjectViewFixtureTests(unittest.TestCase):
     """Shapes behind the project views: project.json, all-state
     workstreams, archive.json, and the planned fixture plans."""
-
     @classmethod
     def setUpClass(cls):
         cls.project = load("project.json")
@@ -541,7 +541,6 @@ class ProjectViewFixtureTests(unittest.TestCase):
         cls.wss_all = load("workstreams-all.json")["workstreams"]
         cls.archive = load("archive.json")
         cls.plans = {ws: load(f"plan-{ws}.json") for ws in ("WS9", "WS10", "WS11")}
-
     def test_project_shape(self):
         for key in ("name", "short", "description", "goals", "started", "target", "phases", "counts", "totals", "data_root_hash"):
             self.assertIn(key, self.project, key)
@@ -559,7 +558,6 @@ class ProjectViewFixtureTests(unittest.TestCase):
             len(self.wss_all),
             "counts by state must cover the all-states list",
         )
-
     def test_workstream_lifecycle_coverage(self):
         by_id = {row["ws"]: row for row in self.wss_all}
         seen = {row["state"] for row in self.wss_all}
@@ -583,7 +581,6 @@ class ProjectViewFixtureTests(unittest.TestCase):
         self.assertTrue(planned, "no planned rows in the default scope")
         for row in planned:
             self.assertTrue(row["depends_on"], f"{row['ws']} names nothing it waits on")
-
     def test_archive_shape(self):
         cards = self.archive["archive"]
         self.assertTrue(cards, "the offline Archive shelf needs a card")
@@ -603,7 +600,6 @@ class ProjectViewFixtureTests(unittest.TestCase):
         self.assertEqual(totals["workstreams"], len(cards))
         for key in ("tokens", "cost_usd", "runs"):
             self.assertTrue(num(totals[key]), key)
-
     def test_planned_fixture_plans_have_gates(self):
         ws9 = self.plans["WS9"]
         gates = [task for group in ws9["groups"] for task in group["tasks"] if task.get("kind") == "gate"]

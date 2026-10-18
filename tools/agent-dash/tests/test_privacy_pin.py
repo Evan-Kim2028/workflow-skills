@@ -149,6 +149,7 @@ def _first_event(port):
 
 
 PATHS = [
+    "/api/project",
     "/api/snapshot?ws=all",
     "/api/runs?limit=50",
     "/api/runs?limit=50&include=jobs",
@@ -192,6 +193,13 @@ class PrivacyPinEndpointTest(unittest.TestCase):
         self.root = self.tmp.name
         self.state_dir = os.path.join(self.root, "state")
         os.makedirs(self.state_dir, exist_ok=True)
+        # /api/project reads the data root: keep it inside the temp tree
+        # so the sweep never touches the machine's real project file.
+        self._dataroot_patch = mock.patch.dict(
+            os.environ, {"AGENT_DASH_DATA_ROOT": os.path.join(self.root, "dataroot")}
+        )
+        self._dataroot_patch.start()
+        self.addCleanup(self._dataroot_patch.stop)
         self.store = Store(Path(self.root) / "dash.sqlite")
         self._seed()
         self.server, self.thread = _start(self.store)

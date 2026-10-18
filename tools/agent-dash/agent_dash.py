@@ -14,12 +14,14 @@ import threading
 import time
 from pathlib import Path
 
+from dash import dataroot
 from dash import errors
 from dash import deploy as deploy_lib
 from dash.buildinfo import build_info
 from dash.bundles import cmd_ws
 from dash.locate import expand, ignore_local
 from dash.pricing import reprice as reprice_usage
+from dash.project import cmd_project
 from dash.server import DashServer, state_dir_hash
 from dash.sources import Registry
 from dash.sources.generic import FILE_NAME as GENERIC_FILE
@@ -97,6 +99,9 @@ USAGE = """agent-dash: local read-only execution dashboard
   python3 agent_dash.py ws task <ID> <task-id> <status> [--moved-to WSn] [--note "..."] [--force]
   python3 agent_dash.py ws train <ID> <train-id> [--title T] [--branch B] [--status S] [--add id,id] [--remove id,id] [--pr N] [--shared f1,f2] [--gate "..."] [--note "..."]
   python3 agent_dash.py ws trains <ID> [--json]
+  python3 agent_dash.py project init <name> [--data-root DIR]
+  python3 agent_dash.py project show [--json]
+  python3 agent_dash.py project set <field> <value>
   python3 agent_dash.py lead-profile <session-id|--ws ID> [--json]
 
 Exit codes: 0 ok, 1 check failed (mismatches found, or doctor found
@@ -128,6 +133,7 @@ def default_cfg() -> dict:
         "hub_dir": "",
         "issues_dir": "",
         "workstreams_tsv": "",
+        "data_root": str(STATE_DIR),
         "state_dir": str(STATE_DIR),
         "poll_budget_s": 25.0,
         "backfill": False,
@@ -162,6 +168,13 @@ def load_cfg(path: Path | None = None) -> dict:
             _merge_file(cfg, _state_config_path(cfg))
     _apply_env(cfg)
     _expand_cfg(cfg)
+    # The state dir defaults to the data root: pointing AGENT_DASH_DATA_ROOT
+    # (or config data_root) at a fresh tree moves the sqlite state with it,
+    # while an explicit state dir (env or config) keeps winning.
+    if not os.environ.get("AGENT_DASH_STATE_DIR"):
+        pristine = str(Path.home() / ".local" / "share" / "agent-dash")
+        if cfg.get("state_dir") == pristine and cfg.get("data_root") not in (None, "", pristine):
+            cfg["state_dir"] = cfg["data_root"]
     cfg.pop("caps", None)
     cfg["host"] = HOST
     cfg["port"] = _port()
@@ -179,16 +192,15 @@ def _state_config_path(cfg: dict) -> Path:
     """``<state-dir>/config.local.json``: the release-proof config file.
 
     The state dir comes from the env override first (trials), then the
-    merged config, then the default. Missing files simply do not merge.
+    merged config, then the data root. Missing files simply do not merge.
     """
-    raw = os.environ.get("AGENT_DASH_STATE_DIR") or cfg.get("state_dir") or str(STATE_DIR)
-    return Path(expand(str(raw))) / "config.local.json"
+    return dataroot.state_dir(cfg) / "config.local.json"
 
 
 def bind_state(cfg: dict | None = None) -> dict:
     global STATE_DIR, PIDFILE, LOGFILE, DBFILE
     cfg = load_cfg() if cfg is None else cfg
-    state = Path(expand(str(cfg.get("state_dir") or STATE_DIR)))
+    state = dataroot.state_dir(cfg)
     STATE_DIR = state
     PIDFILE = STATE_DIR / "agent-dash.pid"
     LOGFILE = STATE_DIR / "agent-dash.log"
@@ -238,6 +250,7 @@ def _apply_env(cfg: dict) -> None:
         ("AGENT_DASH_HUB_DIR", "hub_dir"),
         ("AGENT_DASH_ISSUES_DIR", "issues_dir"),
         ("AGENT_DASH_WORKSTREAMS_TSV", "workstreams_tsv"),
+        ("AGENT_DASH_DATA_ROOT", "data_root"),
         ("AGENT_DASH_STATE_DIR", "state_dir"),
     ):
         if os.environ.get(env):
@@ -249,7 +262,7 @@ def _expand_cfg(cfg: dict) -> None:
     if isinstance(roots, dict):
         for key, value in list(roots.items()):
             roots[key] = _expand_value(value)
-    for key in ("hub_dir", "issues_dir", "workstreams_tsv", "state_dir"):
+    for key in ("hub_dir", "issues_dir", "workstreams_tsv", "data_root", "state_dir"):
         if isinstance(cfg.get(key), str):
             cfg[key] = expand(cfg[key])
 
@@ -329,6 +342,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_doctor(args[1:])
     if cmd == "ws":
         return cmd_ws(args[1:])
+    if cmd == "project":
+        return cmd_project(args[1:])
     if cmd == "backfill":
         session = _session_arg(args[1:])
         if not session:

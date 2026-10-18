@@ -124,6 +124,39 @@ The default state dir (no `AGENT_DASH_STATE_DIR`) is the live one, so a test or 
 
 State lives in `~/.local/share/agent-dash/` (`dash.sqlite`, pidfile, log, `generic.jsonl`). Point `AGENT_DASH_STATE_DIR` at an empty directory to trial the dashboard without touching live state. Point `AGENT_DASH_WORKSTREAMS` at another directory to trial bundles. Point `AGENT_DASH_PORT` at a free port (such as 8815) to trial beside a live dashboard: every command (`run`, `status`, `stop`, `check`, `state`, `doctor`, and the `ws` live reads) follows it. Set `AGENT_DASH_URL` explicitly only to point the `ws` live reads at yet another dashboard. Config-file `host`/`port` stay ignored.
 
+### Data root and project name
+
+One directory owns every data path (`dash/dataroot.py` resolves all of
+them, precedence environment, then config, then the default): the project
+descriptor (`project.json`), the bundles (`workstreams/`), the sqlite
+state, the run-folder registry, and the hub checkout. The default data
+root is today's `~/.local/share/agent-dash`, so nothing moves. Point
+`AGENT_DASH_DATA_ROOT` at another local path — or a mounted/synced cloud
+folder — to move everything at once; the narrower overrides
+(`AGENT_DASH_STATE_DIR`, `AGENT_DASH_WORKSTREAMS`, `AGENT_DASH_HUB_DIR`,
+config `data_root`, `state_dir`, `hub_dir`) keep working. The hub is read
+directly from the data-root `hub` directory when it exists (no sync
+command, no mirror). Real cloud clients are future work; the seam is the
+tiny `Storage` protocol in `dash/dataroot.py` (local filesystem only).
+No project data is ever committed to the dashboard repo.
+
+Name the project once; the page header and `<title>` follow it:
+
+```bash
+python3 tools/agent-dash/agent_dash.py project init "Demo project"
+python3 tools/agent-dash/agent_dash.py project show
+python3 tools/agent-dash/agent_dash.py project set description "What ships."
+```
+
+`project.json` holds `name`, `short`, `description`, `goals`, `started`,
+`target`, `phases` (each with `id`, `title`, `summary`, and a `gate` of
+member workstream ids or gate text), `links`, and `owner_notes`.
+`GET /api/project` serves the file plus the computed roll-up: per-phase
+`state` (from the member workstreams, never stored), lifetime
+`totals_all_time`, `counts` by workstream state, and `data_root_hash`
+(the digest, never the path). A missing file is fine: the name reads
+null and the header falls back to "Agent dashboard".
+
 ### Safe deploy (run the live dashboard from a clean release)
 
 Every server captures a `build_id` (git short sha plus `-dirty` when the checkout had uncommitted changes at start) and its start time, served on `/api/health` (`build_id`, `started_at`, plus `state_hash`, a short hash of the server's state dir that the state-dir guard compares) and `/api/state` (`version` block) and printed by `status`. `run` refuses to start when the port already answers with a different build, naming both builds and the fix:

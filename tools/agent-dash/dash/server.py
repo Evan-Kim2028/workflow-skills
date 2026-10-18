@@ -215,6 +215,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._doctor(query)
             elif path == "/api/state":
                 self._state()
+            elif path == "/api/project":
+                self._project()
             elif path.startswith("/static/"):
                 self._static(path[len("/static/"):])
             elif path.startswith("/docs/problems/"):
@@ -249,6 +251,11 @@ class Handler(BaseHTTPRequestHandler):
                 build=getattr(self.server, "build", None),
             ),
         )
+
+    def _project(self):
+        from dash import project as project_mod
+
+        self._json(200, project_mod.build_payload(self.server.store, self.server.cfg))
 
     def _doctor_block(self, now: float) -> dict:
         """The ``doctor`` block for ``/api/health``: summary plus generation time."""
