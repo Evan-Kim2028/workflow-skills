@@ -11,7 +11,14 @@ The one argv value ever kept is the worker's `--model` flag value, recorded on p
 |---|---|
 | `agent_dash.py` (CLI: `run`, `stop`, `restart`, `status`, `state`, `doctor`, `backfill --session <id>`, `reprice`, `reconcile`, `check`, `ws`, `report`) | core |
 | `dash/state.py` (`GET /api/state`), `dash/doctor.py` (`doctor`), `dash/errors.py` (exit codes, messages) | cli |
-| `dash/store.py` (schema, offsets, upserts, buckets, counts) | core |
+| `dash/store/` (facade: `Store` with the same public API over concern mixins) | core |
+| `dash/store/base.py` (connect, schema, migrations, offsets, doctor persistence) | core |
+| `dash/store/runs.py` (run/session upserts, merge aliases, attribution glue, run reads) | core |
+| `dash/store/usage.py` (usage events, buckets, pricing application, usage by run) | core |
+| `dash/store/running.py` (running set, liveness, stale/idle/unseen logic) | core |
+| `dash/store/summarize.py` (snapshots, rollups, reconcile, mismatches) | core |
+| `dash/store/queries.py` (state, workstream, concurrency, session reads) | core |
+| `dash/store/util.py` (shared constants, pure helpers) | core |
 | `dash/server.py` (HTTP + SSE, routes below) | core |
 | `dash/attribution.py`, `map.example.json` (`map.local.json` replaces it) | core |
 | `dash/pricing.py`, `catalog/prices.json` | core |
@@ -39,7 +46,7 @@ INTERVAL_S = 2             # poll period
 def poll(store, cfg, now: float) -> None: ...
 ```
 
-`store` methods (implemented by core in `dash/store.py`):
+`store` methods (implemented by core in `dash/store/`: the facade `Store` holds the single lock and connection; concern mixins `base`, `runs`, `usage`, `running`, `summarize`, `queries` expose the logic, `util` the shared constants and pure helpers):
 
 ```python
 store.get_offset(path) -> (inode, offset) | None

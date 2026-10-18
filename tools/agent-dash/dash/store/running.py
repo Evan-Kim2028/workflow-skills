@@ -1,0 +1,498 @@
+"""Running set, liveness, stale/idle/unseen logic.
+
+Owns the one filtered running set, liveness evidence, and
+stale/idle/unseen logic (via ``dash.liveness``). Public
+methods run under the facade lock; ``_locked`` helpers assume
+it and never take it.
+"""
+
+from __future__ import annotations
+
+from dash.liveness import (DAGSTER_ACTIVE_FRESH_S,
+                      STALE_IDLE_S,
+                      pid_alive as _pid_alive,
+                      stale_grace_s,)
+
+from .util import (WORKER_SOURCES, WRAPPER_SOURCES)
+
+
+class RunningMixin:
+        def set_dagster_active(self, run_ids, now: float, full_page: bool = False) -> None:
+            """Remember the latest successful Dagster active set for stale checks."""
+            import json as _json
+
+            payload = _json.dumps(
+                {"ids": sorted(set(run_ids)), "now": float(now), "full_page": bool(full_page)}
+            )
+            with self._lock:
+                self._conn.execute(
+                    "INSERT INTO meta(key, value) VALUES('dagster_active', ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    (payload,),
+                )
+        def get_dagster_active(self):
+            """Latest successful active set, or None when no poll has succeeded."""
+            import json as _json
+
+            with self._lock:
+                row = self._conn.execute(
+                    "SELECT value FROM meta WHERE key='dagster_active'"
+                ).fetchone()
+            if not row or not row["value"]:
+                return None
+            try:
+                data = _json.loads(row["value"])
+            except (TypeError, ValueError):
+                return None
+            if not isinstance(data, dict):
+                return None
+            return data
+        def note_dagster_seen(self, run_ids, now: float) -> None:
+            """Record when each active Dagster run was last seen (for close-out)."""
+            if not run_ids:
+                return
+            with self._lock:
+                self._conn.executemany(
+                    "INSERT INTO dagster_seen(run_id, last_seen) VALUES(?, ?) "
+                    "ON CONFLICT(run_id) DO UPDATE SET last_seen=excluded.last_seen",
+                    [(rid, float(now)) for rid in set(run_ids)],
+                )
+        def dagster_last_seen(self, run_id: str):
+            with self._lock:
+                row = self._conn.execute(
+                    "SELECT last_seen FROM dagster_seen WHERE run_id=?", (run_id,)
+                ).fetchone()
+            return float(row["last_seen"]) if row and row["last_seen"] is not None else None
+        def dagster_open_runs(self) -> list:
+            """Stored Dagster rows still marked running or queued."""
+            with self._lock:
+                rows = self._conn.execute(
+                    "SELECT * FROM runs WHERE source='dagster' AND status IN ('running','queued')"
+                ).fetchall()
+            return [dict(row) for row in rows]
+        def stale_running(self, now: float, pid_alive_fn=None) -> list:
+            """Running rows with no liveness evidence, each with a reason.
+
+            Reasons: a dead pid; a Dagster run absent from the latest successful
+            active set; or no source evidence (usage, process sample, start) for
+            longer than STALE_IDLE_S. Dagster rows are stale only when the active
+            set is fresh and not a full page; a failed or full-page poll reports
+            nothing. An alive-but-idle lead session (``claude-main`` with a live
+            pid, quiet for longer than STALE_IDLE_S) is an intended state, not
+            stale: it is hidden from views but never reported here and never
+            closed. Returns a list of ``(run, reason)``.
+            """
+            with self._lock:
+                rows = [
+                    dict(row)
+                    for row in self._conn.execute(
+                        "SELECT * FROM runs WHERE status IN ('running','queued')"
+                    ).fetchall()
+                ]
+                return self._stale_locked(now, rows, pid_alive_fn=pid_alive_fn)
+        def _stale_locked(self, now: float, rows: list, pid_alive_fn=None, usage_max=None, sample_max=None) -> list:
+            """Stale subset of ``rows``. Caller holds the lock."""
+            now = float(now)
+            check = pid_alive_fn or _pid_alive
+            dagster_active = self._dagster_active_locked()
+            dag_ids = None
+            dag_fresh = False
+            if dagster_active is not None:
+                try:
+                    poll_time = float(dagster_active.get("now") or 0)
+                except (TypeError, ValueError):
+                    poll_time = 0
+                full = bool(dagster_active.get("full_page"))
+                if not full and now - poll_time <= DAGSTER_ACTIVE_FRESH_S:
+                    dag_fresh = True
+                    dag_ids = set(dagster_active.get("ids") or [])
+            open_rows = [
+                row for row in rows if (row.get("status") in ("running", "queued"))
+            ]
+            if not open_rows:
+                return []
+            if usage_max is None:
+                usage_max = self._usage_max_locked([row["run_id"] for row in open_rows])
+            if sample_max is None:
+                sample_max = self._sample_max_locked(open_rows)
+            stale = []
+            for row in open_rows:
+                if _is_idle_lead(row, now, usage_max, sample_max, check):
+                    continue
+                reason = self._stale_reason_locked(
+                    row, now, dag_ids, dag_fresh, usage_max, sample_max, check
+                )
+                if reason:
+                    stale.append((dict(row), reason))
+            return stale
+        def _idle_locked(self, now: float, rows: list, pid_alive_fn=None, usage_max=None, sample_max=None) -> list:
+            """Alive-but-idle lead sessions. Caller holds the lock.
+
+            A ``claude-main`` row with a live pid and no source evidence for
+            longer than STALE_IDLE_S is an intended interactive state: the lead
+            is still attached but has written nothing. It stays out of every
+            view like a stale row, but it is never a mismatch and it is never
+            closed, so a later transcript write returns it to Running now.
+            """
+            now = float(now)
+            check = pid_alive_fn or _pid_alive
+            open_rows = [
+                row for row in rows if (row.get("status") in ("running", "queued"))
+            ]
+            if not open_rows:
+                return []
+            if usage_max is None:
+                usage_max = self._usage_max_locked([row["run_id"] for row in open_rows])
+            if sample_max is None:
+                sample_max = self._sample_max_locked(open_rows)
+            return [
+                dict(row)
+                for row in open_rows
+                if _is_idle_lead(row, now, usage_max, sample_max, check)
+            ]
+        def _live_open_ids_locked(self, now: float, rows: list, pid_alive_fn=None) -> set:
+            """Run ids of open rows with liveness evidence. Caller holds the lock.
+
+            This is the one filtered running set every view uses: the snapshot
+            running list, ``counts.live_agents``, ``/api/workstreams``
+            ``live_agents``, and the timeline's open bars all derive from it, so
+            no view can show a run another hides. Idle leads are excluded here
+            too, so they stay out of Running now exactly as before. A
+            ``claude-workflow`` wrapper shadowed by a live worker row on the
+            same label (one lane, one agent) is excluded here as well; the
+            worker carries the lane.
+            """
+            live, _shadows = self._live_open_with_shadows_locked(now, rows, pid_alive_fn)
+            return live
+        def _live_open_with_shadows_locked(self, now: float, rows: list, pid_alive_fn=None):
+            """The one running set plus the lane-shadow map. Caller holds the lock.
+
+            ``shadows`` maps a shadowed wrapper run id to its live worker run
+            id. It is computed against the pre-subtraction open set, so pass
+            that open set (``live | set(shadows)``) — not the subtracted set —
+            to ``_lane_shadows``/``_annotate_lanes``.
+            """
+            open_rows = [
+                row for row in rows if (row.get("status") in ("running", "queued"))
+            ]
+            if open_rows:
+                usage_max = self._usage_max_locked([row["run_id"] for row in open_rows])
+                sample_max = self._sample_max_locked(open_rows)
+            else:
+                usage_max, sample_max = {}, {}
+            stale_ids = {
+                run["run_id"]
+                for run, _reason in self._stale_locked(
+                    now, rows, pid_alive_fn, usage_max=usage_max, sample_max=sample_max
+                )
+            }
+            idle_ids = {
+                row["run_id"]
+                for row in self._idle_locked(
+                    now, rows, pid_alive_fn, usage_max=usage_max, sample_max=sample_max
+                )
+            }
+            open_ids = {
+                row["run_id"]
+                for row in rows
+                if row.get("status") in ("running", "queued")
+                and row.get("run_id") not in stale_ids
+                and row.get("run_id") not in idle_ids
+            }
+            shadows = _lane_shadows(rows, open_ids)
+            return open_ids - set(shadows), shadows
+        def _stale_reason_locked(
+            self, run: dict, now: float, dag_ids, dag_fresh: bool,
+            usage_max: dict, sample_max: dict, check,
+        ):
+            source = run.get("source") or ""
+            status = run.get("status")
+            run_id = run.get("run_id")
+            if status not in ("running", "queued"):
+                return None
+            if source == "dagster":
+                if status not in ("running", "queued"):
+                    return None
+                if dag_ids is None or not dag_fresh:
+                    return None
+                short = run_id[len("dagster:"):] if run_id.startswith("dagster:") else run_id
+                if short not in dag_ids and run_id not in dag_ids:
+                    return "dagster run missing from the latest successful active set"
+                return None
+            pid = run.get("pid")
+            dead_pid = False
+            if pid is not None:
+                try:
+                    alive = bool(check(pid))
+                except Exception:
+                    alive = False
+                dead_pid = not alive
+            stamps = []
+            started = run.get("started_at")
+            if isinstance(started, (int, float)) and not isinstance(started, bool):
+                stamps.append(float(started))
+            hit = usage_max.get(run_id)
+            if hit is not None:
+                stamps.append(float(hit))
+            hit = sample_max.get(run_id)
+            if hit is not None:
+                stamps.append(float(hit))
+            if pid is not None:
+                hit = sample_max.get(f"pid:{pid}")
+                if hit is not None:
+                    stamps.append(float(hit))
+            last = max(stamps) if stamps else None
+            if dead_pid:
+                if last is not None and now - last <= stale_grace_s(source):
+                    return None
+                return f"dead pid {pid}"
+            if last is None:
+                return None
+            if now - last > STALE_IDLE_S:
+                return f"no source evidence for longer than {int(STALE_IDLE_S // 3600)}h"
+            return None
+        def _dagster_active_locked(self):
+            import json as _json
+
+            row = self._conn.execute(
+                "SELECT value FROM meta WHERE key='dagster_active'"
+            ).fetchone()
+            if not row or not row["value"]:
+                return None
+            try:
+                data = _json.loads(row["value"])
+            except (TypeError, ValueError):
+                return None
+            return data if isinstance(data, dict) else None
+        def _usage_max_locked(self, run_ids: list) -> dict:
+            if not run_ids:
+                return {}
+            found = {}
+            step = 500
+            for index in range(0, len(run_ids), step):
+                chunk = run_ids[index:index + step]
+                marks = ",".join("?" for _ in chunk)
+                for row in self._conn.execute(
+                    f"SELECT run_id, MAX(ts) AS ts FROM usage_events "
+                    f"WHERE run_id IN ({marks}) GROUP BY run_id",
+                    chunk,
+                ).fetchall():
+                    if row["ts"] is not None:
+                        found[row["run_id"]] = float(row["ts"])
+            return found
+        def _sample_max_locked(self, rows: list) -> dict:
+            """Latest process-sample ts by run id and by pid."""
+            run_ids = [row.get("run_id") for row in rows if row.get("run_id")]
+            pids = [row.get("pid") for row in rows if row.get("pid") is not None]
+            found = {}
+            if run_ids:
+                step = 500
+                for index in range(0, len(run_ids), step):
+                    chunk = run_ids[index:index + step]
+                    marks = ",".join("?" for _ in chunk)
+                    for row in self._conn.execute(
+                        f"SELECT run_id, MAX(ts) AS ts FROM process_samples "
+                        f"WHERE run_id IN ({marks}) GROUP BY run_id",
+                        chunk,
+                    ).fetchall():
+                        if row["run_id"] and row["ts"] is not None:
+                            found[row["run_id"]] = float(row["ts"])
+            if pids:
+                uniq = sorted({int(pid) for pid in pids})
+                step = 500
+                for index in range(0, len(uniq), step):
+                    chunk = uniq[index:index + step]
+                    marks = ",".join("?" for _ in chunk)
+                    for row in self._conn.execute(
+                        f"SELECT pid, MAX(ts) AS ts FROM process_samples "
+                        f"WHERE pid IN ({marks}) GROUP BY pid",
+                        chunk,
+                    ).fetchall():
+                        if row["ts"] is not None:
+                            found[f"pid:{int(row['pid'])}"] = float(row["ts"])
+            return found
+        def _unseen_workers_locked(self, now: float, shown_all: list, processes) -> list:
+            """``unseen worker`` mismatches: live worker, no running worker row.
+
+            A live worker process (``[label:]``, a muse prompt-file label, or a
+            ``run_worker.py`` argv label) with no ``running``/``queued`` worker
+            row (``muse``/``glm``/``grok``) on that label is invisible on the
+            dashboard: one mismatch per label. Only the label is reported; argv
+            beyond it is never stored or printed. Caller holds the lock.
+
+            Grace, like the stale check: a worker younger than two poll
+            intervals of its source is not yet a mismatch — by process age, or
+            when this dashboard first sampled it within that window (a fresh
+            dashboard has only just met it, e.g. ramp-up transients). Older,
+            longer-seen workers with no running row still fail the check.
+            """
+            have = set()
+            for run in shown_all:
+                if (
+                    run.get("status") in ("running", "queued")
+                    and run.get("source") in WORKER_SOURCES
+                    and run.get("label")
+                ):
+                    have.add(run["label"])
+            pending: dict = {}
+            for proc in processes or []:
+                if not isinstance(proc, dict):
+                    continue
+                label = proc.get("label")
+                if not label or label in have or label in pending:
+                    continue
+                pending[label] = proc
+            first_seen = self._first_sample_ts_locked(set(pending)) if pending else {}
+            out = []
+            for label in sorted(pending):
+                proc = pending[label]
+                grace = stale_grace_s(_unseen_source(proc))
+                try:
+                    age = now - float(proc.get("started_at"))
+                except (TypeError, ValueError):
+                    age = None
+                if age is not None and age < grace:
+                    continue
+                seen_at = first_seen.get(label)
+                if seen_at is not None and now - seen_at < grace:
+                    continue
+                comm = proc.get("comm") or "worker"
+                pid = proc.get("pid")
+                detail = f"{comm} pid {pid}" if pid is not None else str(comm)
+                out.append(f"unseen worker: {label} ({detail})")
+            return out
+        def _first_sample_ts_locked(self, labels: set) -> dict:
+            """First process-sample time per label. Caller holds the lock."""
+            wanted = [label for label in labels if isinstance(label, str) and label]
+            if not wanted:
+                return {}
+            marks = ",".join("?" for _ in wanted)
+            rows = self._conn.execute(
+                "SELECT label, MIN(ts) AS first_ts FROM process_samples "
+                f"WHERE label IN ({marks}) GROUP BY label",
+                tuple(wanted),
+            ).fetchall()
+            return {
+                row["label"]: float(row["first_ts"])
+                for row in rows
+                if row["first_ts"] is not None
+            }
+
+
+def _is_idle_lead(run: dict, now: float, usage_max: dict, sample_max: dict, check) -> bool:
+    """True for an alive-but-idle interactive lead session.
+
+    A ``claude-main`` row whose pid is still alive but whose newest source
+    evidence (start, usage, process sample) is older than STALE_IDLE_S is
+    an intended state: the lead is attached but has written nothing. It is
+    hidden from views like a stale row, but it is never a mismatch and it
+    is never closed. A dead pid is not idle (it stays a stale ``dead pid``
+    mismatch); a row with no pid or no evidence at all is not idle either,
+    so both are still reported exactly as before.
+    """
+    if (run.get("source") or "") != "claude-main":
+        return False
+    if run.get("status") not in ("running", "queued"):
+        return False
+    pid = run.get("pid")
+    if pid is None:
+        return False
+    try:
+        alive = bool(check(pid))
+    except Exception:
+        alive = False
+    if not alive:
+        return False
+    run_id = run.get("run_id")
+    stamps = []
+    started = run.get("started_at")
+    if isinstance(started, (int, float)) and not isinstance(started, bool):
+        stamps.append(float(started))
+    hit = usage_max.get(run_id)
+    if hit is not None:
+        stamps.append(float(hit))
+    hit = sample_max.get(run_id)
+    if hit is not None:
+        stamps.append(float(hit))
+    hit = sample_max.get(f"pid:{pid}")
+    if hit is not None:
+        stamps.append(float(hit))
+    if not stamps:
+        return False
+    return now - max(stamps) > STALE_IDLE_S
+
+
+def _lane_shadows(rows: list, live_ids: set) -> dict:
+    """Wrapper run id -> worker run id for lanes with a live worker.
+
+    A ``claude-workflow`` wrapper (the Haiku step a ws-wave lane runs in)
+    and a ``muse``/``glm``/``grok`` worker row share the lane label. When
+    the worker row is live, the lane counts once — the worker — and the
+    wrapper id is shadowed out of the one running set. With no live
+    worker row for the wrapper's label (still launching, or the worker
+    died), the wrapper is not shadowed and counts as the lane itself.
+    """
+    live_worker: dict = {}
+    for run in rows:
+        if (
+            run.get("run_id") in live_ids
+            and run.get("source") in WORKER_SOURCES
+            and run.get("label")
+        ):
+            live_worker.setdefault(run["label"], run["run_id"])
+    shadows = {}
+    for run in rows:
+        if (
+            run.get("run_id") in live_ids
+            and run.get("source") in WRAPPER_SOURCES
+            and run.get("label")
+            and run["label"] in live_worker
+        ):
+            shadows[run["run_id"]] = live_worker[run["label"]]
+    return shadows
+
+
+def _annotate_lanes(views: list, live_open: set) -> list:
+    """Mark lane shadows on run views (view-only; stored rows are untouched).
+
+    A shadowed wrapper view carries ``lane_shadow: True`` so the timeline
+    strip counts the lane once while the bar stays clickable. A live
+    worker view with no parent names its wrapper run id as
+    ``parent_session_id``, so Running now shows the worker via its
+    workflow step.
+    """
+    shadows = _lane_shadows(views, live_open)
+    if not shadows:
+        return views
+    worker_to_wrapper: dict = {}
+    for wrapper_id, worker_id in shadows.items():
+        worker_to_wrapper.setdefault(worker_id, wrapper_id)
+    for view in views:
+        run_id = view.get("run_id")
+        if run_id in shadows:
+            view["lane_shadow"] = True
+        elif run_id in worker_to_wrapper and not view.get("parent_session_id"):
+            view["parent_session_id"] = worker_to_wrapper[run_id]
+    return views
+
+
+def _unseen_source(proc: dict) -> str | None:
+    """Worker source for a live-worker row, for the grace interval.
+
+    Inverts the process listing's comm map; an unknown comm (a
+    ``run_worker.py`` launcher, a bare ``[label:]`` token) takes the
+    default interval. Every worker source polls at 2 s today, so this is
+    4 s either way; the lookup keeps it honest if one diverges.
+    """
+    try:
+        from dash.sources.process import SOURCE_COMMS
+    except Exception:
+        SOURCE_COMMS = {}
+    comm = proc.get("comm") if isinstance(proc, dict) else None
+    for source, comms in (SOURCE_COMMS or {}).items():
+        try:
+            if comm in comms:
+                return source
+        except TypeError:
+            continue
+    return None
