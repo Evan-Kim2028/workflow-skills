@@ -19,11 +19,6 @@
     (kids || []).forEach(function (kid) { if (kid) node.appendChild(kid); });
     return node;
   }
-  function svg(tag, attrs) {
-    var node = document.createElementNS("http://www.w3.org/2000/svg", tag);
-    Object.keys(attrs || {}).forEach(function (key) { node.setAttribute(key, attrs[key]); });
-    return node;
-  }
   function darkNow() {
     /* Same rule as the shell (static/core/theme.js): an explicit choice wins,
        otherwise dark. No prefers-color-scheme fallback. */
@@ -31,12 +26,6 @@
     var set = document.documentElement.getAttribute("data-theme");
     if (set) return set === "dark";
     return true;
-  }
-  function fmtDur(seconds) {
-    return AD.fmtDur(seconds);
-  }
-  function tierKey(run) {
-    return ADM.info(run || {}).key;
   }
 
   /* Same rule as the execution map and dash/taskmatch.py: exact label,
@@ -77,11 +66,6 @@
       if (best) return best;
     }
     return null;
-  }
-  function dagTaskIds(dag) {
-    var out = [];
-    (dag.groups || []).forEach(function (g) { (g.tasks || []).forEach(function (t) { if (t.id != null && String(t.id).length > 0) out.push(String(t.id)); }); });
-    return out;
   }
   /* Phantom-task guard, mirroring dash/taskmatch.task_of_verified: a mapped
      id that names no task in this plan stays unmapped instead of claiming a
@@ -150,145 +134,55 @@
     return {ws: ws, cols: dag.cols || [], groups: dag.groups || [], edges: dag.edges || []};
   }
 
-  function drawProgress(host, dag, snap) {
-    host.innerHTML = "";
-    if (!dag.groups.length) {
-      host.appendChild(el("p", {class: "sub", text: "This plan has no sections yet."}));
-      return;
+  /* Same endpoint the Execution tab reads, so the map below the summary
+     is the same live task-chip map: progress, status colors, chips and
+     dependency arrows from the one planCard renderer. window.DashApi
+     covers fixture preview too (/api/plan maps to plan-<id>.json). */
+  function planApi(path, params) {
+    if (window.DashApi) return window.DashApi(path, params);
+    var qs = new URLSearchParams(params || {}).toString();
+    return fetch(path + (qs ? "?" + qs : ""), {cache: "no-store"}).then(function (response) {
+      if (!response.ok) throw new Error("http " + response.status);
+      return response.json();
+    });
+  }
+
+  function fetchPlan(id) {
+    return planApi("/api/plan", {ws: id}).then(function (plan) {
+      return plan && plan.groups ? plan : null;
+    }).catch(function () { return null; });
+  }
+
+  function fetchRuns(id) {
+    var dayAgo = Math.floor(Date.now() / 1000) - 24 * 3600;
+    return planApi("/api/runs", {ws: id, since: dayAgo, limit: 5000}).then(function (payload) {
+      return (payload && payload.runs) || [];
+    }).catch(function () { return []; });
+  }
+
+  /* The live map under the summary: the Execution tab's own planCard
+     (static/cards/plan-progress.js), never a second copy. planCard reads
+     the shared page state for the run-to-task map and the run-count
+     badges, so this tab lends it its plan and runs and puts the
+     Execution tab's values back before returning; everything it closes
+     over runs synchronously, so the restore cannot race its timers.
+     Replay stays off here: its exit path rebuilds the Execution view. */
+  function drawMap(host, plan, snap, runs, id) {
+    var mount = host.querySelector("[data-plan-map]");
+    if (!mount) {
+      mount = el("div", {class: "plan-live-map", "data-plan-map": "", "data-ws": id});
+      host.appendChild(mount);
     }
-    /* Running agents that map to no task simply do not appear in the map
-       (they still appear in Running now): there is no unmapped strip. */
-    var live = {};
-    var just = {};
-    var now = Date.now() / 1000;
-    var ids = dagTaskIds(dag);
-    ((snap && snap.running) || []).forEach(function (run) {
-      if (run.workstream && run.workstream !== dag.ws) return;
-      var task = taskOfVerified(run, dag.ws, ids);
-      if (task) (live[task] = live[task] || []).push(run);
-    });
-    ((snap && snap.recent) || []).forEach(function (run) {
-      if (run.ended_at && now - run.ended_at < 900) {
-        var task = taskOfVerified(run, dag.ws, ids);
-        if (task) just[task] = run;
-      }
-    });
-    var legend = el("div", {class: "pp-legend"});
-    [
-      ["live", "agent working now"],
-      ["pr", "waiting to merge (open PR)"],
-      ["prog", "merged, waiting on a prod step"],
-      ["done", "done"],
-      ["just", "finished in the last 15 min"],
-      ["todo", "not started"],
-      ["deferred", "deferred or moved to another workstream"]
-    ].forEach(function (pair) {
-      var sample = pair[0] === "just" ? "done just" : pair[0];
-      legend.appendChild(el("span", {}, [el("span", {class: "pp-chip " + sample}, [document.createTextNode("\u2007")]), document.createTextNode(pair[1])]));
-    });
-    host.appendChild(legend);
-    var totals = {done: 0, prog: 0, pr: 0, todo: 0, deferred: 0};
-    var scroll = el("div", {class: "pp-scroll"});
-    var board = el("div", {class: "pp-dag"});
-    var edges = svg("svg", {class: "pp-edges"});
-    board.appendChild(edges);
-    board.style.gridTemplateColumns = "repeat(" + Math.max(dag.cols.length, 1) + ",1fr)";
-    var columns = (dag.cols.length ? dag.cols : ["Plan"]).map(function (name) {
-      var column = el("div", {class: "pp-col"}, [el("div", {class: "pp-colh", text: name})]);
-      board.appendChild(column);
-      return column;
-    });
-    var nodes = {};
-    /* Section per task, next to the label wherever agents are listed. */
-    var secOf = {};
-    dag.groups.forEach(function (group) { ((group.tasks) || []).forEach(function (task) { if (task && task.id != null) secOf[task.id] = group.title || group.id; }); });
-    dag.groups.forEach(function (group) {
-      var counts = {done: 0, prog: 0, pr: 0, todo: 0, deferred: 0};
-      (group.tasks || []).forEach(function (task) {
-        var status = task.status || "todo";
-        counts[status] = (counts[status] || 0) + 1;
-      });
-      var active = (group.tasks || []).length - (counts.deferred || 0);
-      var nodeClass = "pp-node";
-      if (active && counts.done === active) nodeClass += " s-done";
-      else if (counts.done + counts.prog + counts.pr) nodeClass += " s-prog";
-      var node = el("div", {class: nodeClass});
-      node.appendChild(el("h4", {text: group.title || group.id || ""}));
-      var meta = counts.done + " done · " + counts.pr + " waiting to merge · " + counts.prog + " waiting on prod · " + counts.todo + " not started";
-      if (counts.deferred) meta += " · " + counts.deferred + " deferred";
-      node.appendChild(el("div", {class: "m", text: meta}));
-      var mini = el("div", {class: "pp-mini"});
-      [["done", "var(--good)"], ["pr", "var(--warning)"], ["prog", "var(--s5)"]].forEach(function (pair) {
-        var bar = el("span");
-        bar.style.width = (active ? 100 * (counts[pair[0]] || 0) / active : 0) + "%";
-        bar.style.background = pair[1];
-        mini.appendChild(bar);
-      });
-      node.appendChild(mini);
-      var chips = el("div", {class: "pp-chips"});
-      var groupLive = 0;
-      (group.tasks || []).forEach(function (task) {
-        var status = task.status || "todo";
-        var runs = live[task.id] || [];
-        var recent = just[task.id];
-        var chipClass = "pp-chip " + status + (runs.length ? " live" : "") + (recent && !runs.length ? " just" : "");
-        var label = (task.title || task.id) + " · " + status + (task.moved_to ? " · moved to " + task.moved_to : "") + (task.note ? " · " + task.note : "");
-        if (runs.length) label += " · working: " + runs.map(function (run) { var sec = secOf[task.id] || run.section; return (run.label || run.run_id) + (sec ? " · " + sec : "") + " (" + (run.tier || "") + ", " + fmtDur(run.elapsed_s) + ")"; }).join(", ");
-        var chip = el("span", {class: chipClass, title: label, "aria-label": label}, [document.createTextNode(task.id)]);
-        if (runs.length) {
-          groupLive += runs.length;
-          var badge = el("span", {class: "ag", text: String(runs.length)});
-          badge.style.background = ADM.colorOf(tierKey(runs[0]));
-          chip.appendChild(badge);
-        }
-        chips.appendChild(chip);
-      });
-      if (groupLive) {
-        node.insertBefore(el("div", {class: "pp-live", text: "● " + groupLive + " working"}), node.children[1]);
-        node.classList.add("s-live");
-      }
-      node.appendChild(chips);
-      var column = columns[group.col];
-      if (column) column.appendChild(node);
-      nodes[group.id] = node;
-      ["done", "prog", "pr", "todo", "deferred"].forEach(function (key) { totals[key] += counts[key] || 0; });
-    });
-    var all = totals.done + totals.prog + totals.pr + totals.todo;
-    var summary = totals.done + " of " + all + " done · " + totals.pr + " waiting to merge · " + totals.prog + " waiting on prod · " + totals.todo + " not started";
-    if (totals.deferred) summary += " · " + totals.deferred + " deferred";
-    host.appendChild(el("p", {class: "pp-sum", text: summary}));
-    scroll.appendChild(board);
-    host.appendChild(scroll);
-    function draw() {
-      while (edges.firstChild) edges.removeChild(edges.firstChild);
-      var box = board.getBoundingClientRect();
-      if (!box.width) return;
-      edges.setAttribute("width", board.scrollWidth);
-      edges.setAttribute("height", board.scrollHeight);
-      (dag.edges || []).forEach(function (edge) {
-        if (!nodes[edge[0]] || !nodes[edge[1]]) return;
-        var from = nodes[edge[0]].getBoundingClientRect();
-        var to = nodes[edge[1]].getBoundingClientRect();
-        var path;
-        if (Math.abs(from.left - to.left) < 4) {
-          var x1 = from.left + from.width * 0.85 - box.left;
-          var y1 = from.bottom - box.top;
-          var x2 = to.left + to.width * 0.85 - box.left;
-          var y2 = to.top - box.top;
-          path = "M" + x1 + "," + y1 + " C" + (x1 + 14) + "," + (y1 + 10) + " " + (x2 + 14) + "," + (y2 - 10) + " " + x2 + "," + y2;
-        } else {
-          var ax = from.right - box.left;
-          var ay = from.top + Math.min(26, from.height / 2) - box.top;
-          var bx = to.left - box.left - 2;
-          var by = to.top + Math.min(26, to.height / 2) - box.top;
-          var mid = (ax + bx) / 2;
-          path = "M" + ax + "," + ay + " C" + mid + "," + ay + " " + mid + "," + by + " " + bx + "," + by;
-        }
-        edges.appendChild(svg("path", {d: path}));
-      });
-    }
-    requestAnimationFrame(function () { requestAnimationFrame(draw); });
-    window.addEventListener("resize", draw);
+    mount.innerHTML = "";
+    if (!plan || typeof planCard !== "function") return;
+    var gs = (typeof state !== "undefined" && state) ? state : null;
+    var prevPlan = gs ? gs.plan : null, prevRuns = gs ? gs.runs : null;
+    var card = null;
+    if (gs) { gs.plan = plan; gs.runs = runs || []; }
+    try { card = planCard(plan, snap, {replay: false}); }
+    catch (e) { card = null; }
+    if (gs) { gs.plan = prevPlan; gs.runs = prevRuns; }
+    if (card) mount.appendChild(card);
   }
 
   function fetchPage(id) {
@@ -419,12 +313,14 @@
       ensureMermaid(runMermaid);
       var host = main.querySelector("[data-plan-progress]");
       if (host && hit.bundle) drawSummary(host, dagOf(hit.bundle, id), hit.snap || {running: [], recent: []}, id, hit.bundle && hit.bundle.start_prompt, hit.bundle && hit.bundle.progress);
+      if (host) drawMap(host, hit.plan, hit.snap || {running: [], recent: []}, hit.runs || [], id);
       drawTrains(main, id, hit.bundle);
     }
     stampSectionIds(main);
   }
 
-  /* The live progress map lives on Execution only; the Plan page shows a compact summary and a jump there.
+  /* The progress summary stays on top; the live task-chip map mounts below
+     it through drawMap (the Execution tab's own renderer, replay off).
      Overall progress comes from the server progress object, never recomputed here. */
   function drawSummary(host, dag, snap, id, startPrompt, progress) {
     var pr = progress || {done: 0, total: 0, counts: {}, pct: 0};
@@ -446,18 +342,21 @@
   }
 
   function refreshProgress(id) {
-    return Promise.all([fetchApprovals(id), fetchBundle(id), fetchSnap(id)]).then(function (parts) {
+    return Promise.all([fetchApprovals(id), fetchBundle(id), fetchSnap(id), fetchPlan(id), fetchRuns(id)]).then(function (parts) {
       if (current !== id) return;
       var hit = cache[id] || {html: null};
       hit.approvals = parts[0];
       hit.bundle = parts[1];
       hit.snap = parts[2];
+      hit.plan = parts[3];
+      hit.runs = parts[4];
       cache[id] = hit;
       if (window.DashCache) window.DashCache.snap[id] = parts[2];
       var main = document.getElementById("plan-body");
       if (!main) return;
       var host = main.querySelector("[data-plan-progress]");
       if (host && parts[1]) drawSummary(host, dagOf(parts[1], id), parts[2] || {running: [], recent: []}, id, parts[1] && parts[1].start_prompt, parts[1] && parts[1].progress);
+      if (host) drawMap(host, parts[3], parts[2] || {running: [], recent: []}, parts[4] || [], id);
       drawTrains(main, id, parts[1]);
       stampSectionIds(main);
     }).catch(function () {});
@@ -550,9 +449,9 @@
     var main = document.getElementById("plan-body");
     if (hit && hit.html !== undefined) paint(id, hit);
     else if (main) main.textContent = "Loading.";
-    return Promise.all([fetchPage(id), fetchApprovals(id), fetchBundle(id), fetchSnap(id)]).then(function (parts) {
+    return Promise.all([fetchPage(id), fetchApprovals(id), fetchBundle(id), fetchSnap(id), fetchPlan(id), fetchRuns(id)]).then(function (parts) {
       if (current !== id || gen !== showGen) return true;
-      var next = {html: parts[0], approvals: parts[1], bundle: parts[2], snap: parts[3]};
+      var next = {html: parts[0], approvals: parts[1], bundle: parts[2], snap: parts[3], plan: parts[4], runs: parts[5]};
       cache[id] = next;
       if (window.DashCache) {
         window.DashCache.snap[id] = parts[3];
