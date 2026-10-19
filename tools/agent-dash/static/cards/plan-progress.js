@@ -130,8 +130,12 @@
     return out;
   }
 
-  /* plan DAG for a workstream */
-  function planCard(plan, snap) {
+  /* plan DAG for a workstream. opts.replay === false mounts the live map
+     without the replay controls: replay exit rebuilds the Execution view,
+     so the Plan tab (which has no Execution section to rebuild into)
+     mounts the same map live-only. */
+  function planCard(plan, snap, opts) {
+    var replayOn = !(opts && opts.replay === false);
     /* Running agents that map to no task simply do not appear in the map
        (they still appear in Running now): there is no unmapped strip. */
     var live = {}, just = {}, now = Date.now() / 1000;
@@ -712,7 +716,7 @@
     var RP = {on: false, playing: false, loading: false, tasks: {}, prevDone: {}, savedCss: {}, elapsed: 0, duration: 15, raf: null, compress: false, warp: null, tlRuns: [], tl: null, groups: {}, clip: false};
     var replayBtn = el("button", {class: "planbtn", title: "Play this workstream's history as a sped-up animation", text: "Replay"});
     replayBtn.addEventListener("click", function () { startReplay(true); });
-    c.firstChild.appendChild(replayBtn);
+    if (replayOn) c.firstChild.appendChild(replayBtn);
     function rpTotal() { return (plan.progress && plan.progress.total) || 0; }
     function rpDoneAt(T) {
       var ids = Object.keys(RP.tasks), n = 0;
@@ -1463,7 +1467,7 @@
       }
     }
     window.__adReplayExit = null;
-    if (!window.__adReplayTried && Q.has("replay")) {
+    if (replayOn && !window.__adReplayTried && Q.has("replay")) {
       var wantWs = canonWs(Q.get("ws") || "");
       if (!Q.get("ws") || wantWs === plan.ws) {
         window.__adReplayTried = true;
