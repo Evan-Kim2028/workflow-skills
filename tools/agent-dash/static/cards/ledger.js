@@ -139,9 +139,9 @@
   }
 
   /* Status chip: colour plus symbol plus word, never colour alone. */
-  function ledgerChip(failed) {
-    if (failed > 0) return el("span", {class: "delta down", title: ledFailTitle(failed, null, 0)}, ["\u25BC ", fmtN(failed), el("span", {class: "w", text: "failed"})]);
-    return el("span", {class: "delta flat", title: ledFailTitle(0, null, 0)}, ["\u25C6 flat", el("span", {class: "w", text: "no failures"})]);
+  function ledgerChip(failed, title) {
+    if (failed > 0) return el("span", {class: "delta down", title: title || ledFailTitle(failed, null, 0)}, ["\u25BC ", fmtN(failed), el("span", {class: "w", text: "failed"})]);
+    return el("span", {class: "delta flat", title: title || ledFailTitle(0, null, 0)}, ["\u25C6 flat", el("span", {class: "w", text: "no failures"})]);
   }
 
   function ledgerCard(rows) {
@@ -172,7 +172,7 @@
       ledFailTitle(sum.failed, sum.topClass, sum.topN),
       sum.failed ? [{k: "Failed", v: fmtN(sum.failed)}, {k: "Top error", v: String(sum.topClass)}] : null
     );
-    failTile.insertBefore(ledgerChip(sum.failed), failTile.childNodes[2] || null);
+    failTile.insertBefore(ledgerChip(sum.failed, ledFailTitle(sum.failed, sum.topClass, sum.topN)), failTile.childNodes[2] || null);
     grid.appendChild(failTile);
     grid.appendChild(ledgerTile(
       "Slowest load (24 h)",
