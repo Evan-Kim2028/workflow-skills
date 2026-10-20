@@ -228,3 +228,12 @@ instead of holding the wave.
   tasks remain.
 - *Fix:* file the relay today, launch the local ready set, arm one watcher
   on the signal; on the date, either resume or re-file with a new deadline.
+
+## Field notes from real runs
+
+[`field-notes-high-concurrency.md`](field-notes-high-concurrency.md) — measured failure modes from the WS11 run (15 PRs, ~85 lanes, 20
+concurrent workers): the launch-preflight thundering herd, labels that do not pin to tasks, status writes that
+did not persist and silently froze the ready frontier, build-versus-activation filtering, grouping lanes that
+share a file set behind one integration owner, and the verification traps (stale bases, environment-dependent
+tests, static inventories used as oracles for destructive work). Also `scripts/reap_worktrees.sh` for reclaiming
+merged worktrees.

@@ -98,6 +98,16 @@ python3 tools/agent-dash/agent_dash.py ws archive <ID>
 
 `ws archive` refuses unless the plan is 100% done of non-deferred tasks and the closing report exists (or `--force --note "..."` for a reviewed early archive). It freezes `summary.json` — started/finished dates, duration, task counts by status, trains, approvals counts, lifetime tokens/cost — and flips state to `archived` without deleting anything. `ws restore <ID>` reopens to `done` and keeps the summary.
 
+## Field notes
+
+Measured failure modes from real runs are in
+[`tools/agent-dash/docs/field-notes-high-concurrency.md`](../../tools/agent-dash/docs/field-notes-high-concurrency.md). The four that
+cost the most: launches fail a 3 s dashboard preflight when fired concurrently; `ws task` status writes can fail
+to persist, which freezes `ws next` and makes a full ready queue look empty (keep your own ledger and sync it);
+excluding every lane that carries an `approval_id` drops the build lanes too, since most name an approval for
+their *later* activation; and lanes sharing a file set must ship as one integration-owner branch, not as
+competing lanes. Reap merged worktrees with `tools/agent-dash/scripts/reap_worktrees.sh <ws>`.
+
 ## Rules
 
 - **Name things, not numbers:** in anything written for the owner, put a short phrase first; the number can follow in parentheses.
