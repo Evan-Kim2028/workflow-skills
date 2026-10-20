@@ -29,6 +29,7 @@ from dash.sources.generic import default_run_id as generic_run_id
 from dash.sources.generic import tier_of as generic_tier_of
 from dash.sources.process import reconcile_running
 from dash.store import Store
+from dash.worktrees import cmd_worktrees
 
 ROOT = Path(__file__).resolve().parent
 STATE_DIR = Path.home() / ".local" / "share" / "agent-dash"
@@ -110,6 +111,7 @@ USAGE = """agent-dash: local read-only execution dashboard
   python3 agent_dash.py project open <id> [--json]
   python3 agent_dash.py project remove <id> [--json]
   python3 agent_dash.py lead-profile <session-id|--ws ID> [--json]
+  python3 agent_dash.py worktrees reap --repo <path> [--apply] [--skip <path-or-branch>] [--min-age <dur>] [--json]
 
 Agents working on a project pass --project <id> (or set the env) for
 state, check, doctor, ws ..., status: it sets the data root, state
@@ -417,6 +419,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_report(args[1:])
     if cmd == "lead-profile":
         return cmd_lead_profile(args[1:])
+    if cmd == "worktrees":
+        return cmd_worktrees(args[1:])
     print(USAGE, end="", file=sys.stderr)
     return 2
 

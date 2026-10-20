@@ -8,6 +8,7 @@
     "dash/server.py": ["test_server", "test_bundles_api", "test_doctor", "test_errors", "test_state", "test_projects"],
     "dash/state.py": ["test_state", "test_server"],
     "dash/doctor.py": ["test_doctor", "test_state", "test_errors"],
+    "dash/worktrees.py": ["test_worktrees"],
     "dash/bundles.py": ["test_ws_cli", "test_bundles_api", "test_orchestrate", "test_planrender", "test_errors"],
     "dash/planrender.py": ["test_planrender", "test_bundles_api"],
     "dash/orchestrate.py": ["test_orchestrate", "test_ws_cli", "test_bundles_api"],

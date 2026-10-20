@@ -10,7 +10,7 @@ The one argv value ever kept is the worker's `--model` flag value, recorded on p
 
 | Path | Owner |
 |---|---|
-| `agent_dash.py` (CLI: `run`, `stop`, `restart`, `deploy`, `rollback`, `status`, `state`, `doctor`, `backfill --session <id>`, `reprice`, `reconcile`, `check`, `ws`, `project`, `report`; global `--project <id>` for `state`, `check`, `doctor`, `ws ...`, `status`) | core |
+| `agent_dash.py` (CLI: `run`, `stop`, `restart`, `deploy`, `rollback`, `status`, `state`, `doctor`, `backfill --session <id>`, `reprice`, `reconcile`, `check`, `ws`, `project`, `report`, `worktrees`; global `--project <id>` for `state`, `check`, `doctor`, `ws ...`, `status`) | core |
 | `dash/state.py` (`GET /api/state`), `dash/doctor.py` (`doctor`), `dash/errors.py` (exit codes, messages) | cli |
 | `dash/dataroot.py` (data-root resolution: `data_root`, `state_dir`, `workstreams_dir`, `hub_dir`, `project_file`; the `Storage` seam, local only) | core |
 | `dash/project.py` (project descriptor: `project.json` read/validate, `project` CLI, `GET /api/project` payload) | core |
@@ -28,6 +28,7 @@ The one argv value ever kept is the worker's `--model` flag value, recorded on p
 | `dash/store/util.py` (shared constants, pure helpers) | core |
 | `dash/buildinfo.py` (build id + process start time) | core |
 | `dash/deploy.py` (clean-release deploy, rollback, `releases/`) | core |
+| `dash/worktrees.py` (safe worktree reaper: `worktrees reap --repo <path>` lists linked worktrees and, with `--apply`, removes only clean merged idle old ones via `worktree remove` plus `branch -d`; dry-run by default) | core |
 | `dash/server.py` (HTTP + SSE, routes below) | core |
 | `dash/actions.py` (the page write actions: guarded `POST /api/workstreams/archive|restore|state|bulk` through the CLI lifecycle functions, local-only, read-only switch; `allowed_actions_for` names each row's legal buttons) | core |
 | `dash/attribution.py`, `map.example.json` (`map.local.json` replaces it) | core |
