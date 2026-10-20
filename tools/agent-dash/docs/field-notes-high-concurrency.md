@@ -100,3 +100,57 @@ had already recorded success. The log carries the correction and the retry.
 - `ls` aliased to a modern replacement breaks `ls <path> && cmd`; use `test -f`.
 - A merge tool that waits for named remote checks waits forever on a docs-only PR that starts none — use its
   override flag or merge directly.
+
+## Round two: dispatch, deploy and serving lessons
+
+Measured during a later orchestration pass over the same large run. Same format — symptom, cause, rule — and the
+same generalisation: patterns, not project specifics.
+
+**Slicing a sibling's prompt leaks the sibling's scope.** Symptom: workers commit to the wrong branch and refuse
+their real task as out of scope. Cause: deriving a new lane prompt by slicing a sibling's prompt copies the
+sibling's branch, worktree, unit title, lane id, write paths and test command. Rule: generate lane headers from
+the shared policy only; the task body is the sole authority on scope.
+
+**Reused run labels replay stale results.** Symptom: reusing a run label returns the previous run's result
+instantly; worse, a label whose slug collides with an unrelated plan task id can resolve to that task and return
+its stale output. Cause: results are keyed on the label string, and a slug that overlaps a task id resolves to
+the wrong owner. Rule: labels unique per run; check a new label against existing runs and task ids for collisions
+before launching.
+
+**Live unit edits ahead of merge trip the drift gate.** Symptom: applying service-unit changes live before the
+change merges makes the deploy drift gate block every later deploy (live looks ahead of the stale checkout), and
+the gate's suggested remedy syncs repo → live, reverting the live change. Cause: the gate compares live state
+against the checkout, so an unmerged live edit reads as drift in the wrong direction. Rule: never apply unit
+changes ahead of merge, or deploy immediately after so live and the checkout agree.
+
+**A service running a copy outside the checkout drifts silently.** Symptom: merged fixes never go live, with no
+error anywhere. Cause: the service executes a copy staged outside the deployed checkout, so the repo path the
+review approved is not the path that runs. Rule: execute the repo path; test for it — a deploy check that the
+running artifact resolves inside the checkout.
+
+**A registry flip without a live source serves from nothing.** Symptom: merging a registry or alias flip before
+its source exists or has ever produced makes serving load from nothing. Cause: the flip was reviewed as a pointer
+edit while nobody verified the target. Rule: a live preflight that checks the source exists, has rows and is
+fresh; and a self-referential source must fail closed until the loader's behavior for it is proven.
+
+**Load-time freshness reads green while serving is frozen.** Symptom: a freshness signal that measures load time
+rather than source-data recency reports green while serving is frozen. Cause: the timestamp advances on every
+load attempt, including loads that changed nothing. Rule: alarm on source recency, and make a degraded probe
+visible as its own state rather than letting it read as "no breach".
+
+**An unbounded worker process can take down the database.** Symptom: a worker's unbounded data process on a shared
+production box grew until the host-level OOM killer fired — on a box where the database holds much of the RAM,
+the killer may pick the database. Cause: no memory bound on worker data processes, and whole-table loads into
+memory. Rule: memory-cap every data process; a cgroup kill of your own process is acceptable, a host OOM is not.
+Stream or chunk instead of loading whole tables, check free memory first, and never scan a whole table on a
+shared box.
+
+**Static writer inventories miss live writers.** Symptom: static allowlists and literal-name detectors report "no
+writer" for targets with live writers reached through imports, f-strings or CLI flags. Cause: the inventory only
+sees the spellings it enumerates, while real writes arrive under synonyms and indirections. Rule: treat a static
+"no writer" as a hypothesis; confirm with a gate that flags undecidable references rather than passing them.
+
+**A stale base manufactures blockers.** Symptom: a review that judges a branch against its own stale base raises a
+blocker that a rebase dissolves. Cause: the base moved under the branch, so the diff under review describes a
+world that no longer exists. Rule: check the base before acting on a blocker — rebase and re-derive the diff from
+the merge base first.
