@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Launch one registry worker and wait. A second call for the same label only waits.
+"""Launch one registry worker and wait. A second call for a live label only waits.
 
 Usage: run_worker.py <tier|default|auto> <label> <workspace> <prompt-file> <run-dir> [max-wait] [--no-preflight]
 
@@ -35,6 +35,54 @@ LABEL_OK = re.compile(r"^[\w.+-]{1,80}$")
 KINDS = ("muse", "cursor", "grok-build")
 READ_LIMIT = 262144
 PREFLIGHT_TIMEOUT_S = 3.0
+ROUND_RE = re.compile(r"^(?P<body>.+)-r(?P<n>[1-9][0-9]*)$")
+
+
+def _split_round(label: str) -> tuple[str, int | None]:
+    """Body and round number for a label, or the label with None."""
+    match = ROUND_RE.match(label)
+    if not match:
+        return label, None
+    return match.group("body"), int(match.group("n"))
+
+
+def _next_label(run_dir: Path, label: str) -> str:
+    """First unused ``-rN`` round suffix for a label in a run dir."""
+    body, number = _split_round(label)
+    number = number or 0
+    while True:
+        number += 1
+        candidate = f"{body}-r{number}"
+        if not (run_dir / f"{candidate}.tier").exists():
+            return candidate
+
+
+def _prior_run_live(ctx) -> bool:
+    """True while the prior run recorded in the context still runs."""
+    pid = read_pid(ctx["pid_path"])
+    if pid is None:
+        return False
+    try:
+        return bool(ctx["hooks"]["alive"](pid))
+    except Exception:
+        return False
+
+
+def _refuse_reuse(ctx, stored: str) -> int:
+    """Refuse a launch whose label already has a finished run.
+
+    Names the prior run and suggests the next ``-rN`` round so the
+    retry starts new work instead of returning the old report.
+    """
+    suggestion = _next_label(Path(ctx["run_dir"]), ctx["label"])
+    print(
+        f"label reuse refused: {ctx['label']!r} already has a finished run "
+        f"(tier={stored}, out={ctx['out']}). "
+        f"Relaunch with a round suffix: {suggestion}",
+        file=sys.stderr,
+    )
+    emit("failed", ctx["out"], ctx["err"], stored, "label-reuse")
+    return 2
 
 
 def dashboard_url() -> str:
@@ -149,7 +197,9 @@ def run(argv, spawn=None, pgrep=None, sleep=None, now=None, alive=None, new_uuid
     }
     if tier_path.is_file():
         stored = tier_path.read_text(encoding="utf-8").strip() or requested
-        return observe(ctx, stored, set())
+        if _prior_run_live(ctx):
+            return observe(ctx, stored, set())
+        return _refuse_reuse(ctx, stored)
     if not no_preflight:
         blocked = run_preflight(registry, requested, ctx)
         if blocked is not None:

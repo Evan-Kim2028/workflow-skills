@@ -89,6 +89,7 @@ USAGE = """agent-dash: local read-only execution dashboard
   python3 agent_dash.py report start --label <label> [--model M] [--session S] [--run-id R] [--tier T]
   python3 agent_dash.py report finish --label <label> --verdict PASS [--session S] [--run-id R] [--status done]
   python3 agent_dash.py report usage --label <label> --input N --output N [--model M] [--session S] [--run-id R]
+  python3 agent_dash.py label check <label> [--ws WS]
   python3 agent_dash.py ws list [--state S[,S...]|all] [--json]
   python3 agent_dash.py ws new <ID> "<title>" [--state planned|active]
   python3 agent_dash.py ws state <ID> <state> [--force] [--note "..."]
@@ -418,6 +419,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_check(args[1:])
     if cmd == "report":
         return cmd_report(args[1:])
+    if cmd == "label":
+        return cmd_label(args[1:])
     if cmd == "lead-profile":
         return cmd_lead_profile(args[1:])
     if cmd == "worktrees":
@@ -1644,6 +1647,141 @@ def _register_report_dir(state: Path, run_dir: str) -> bool:
         return bool(register_run_dir(state, run_dir))
     except Exception:
         return False
+
+
+def _label_plan_ids(ws_filter: str | None = None) -> dict:
+    """Plan task ids per workstream, best effort. Never raises."""
+    found: dict[str, list[str]] = {}
+    try:
+        root = dataroot.workstreams_dir()
+    except Exception:
+        return found
+    try:
+        if ws_filter:
+            targets = [str(ws_filter).upper()]
+        else:
+            targets = [entry.name for entry in root.iterdir() if entry.is_dir()]
+    except OSError:
+        return found
+    for target in targets:
+        ws_id = str(target).upper()
+        try:
+            data = json.loads((root / target / "plan.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        try:
+            from dash.taskmatch import plan_task_ids
+
+            groups = data.get("dag", {}).get("groups") if isinstance(data, dict) else None
+            found[ws_id] = [str(item) for item in plan_task_ids(groups)]
+        except Exception:
+            continue
+    return found
+
+
+def _label_taskmap() -> dict:
+    """Resolved label-to-task map, or empty when unreadable. Never raises."""
+    try:
+        from dash.taskmatch import load_taskmap
+
+        table = load_taskmap()
+    except Exception:
+        return {}
+    return table if isinstance(table, dict) else {}
+
+
+def cmd_label(argv: list[str]) -> int:
+    """Check a worker label against plan task ids.
+
+    ``label check`` exits 0 with an ``ok`` line for a well-formed
+    label, plus a warning line when the label equals or collides with
+    a plan task id (the run would attribute to that task), and exits
+    2 with a fix for a malformed label.
+    """
+    if not argv or argv[0] != "check":
+        print(
+            "usage: python3 agent_dash.py label check <label> [--ws WS]",
+            file=sys.stderr,
+        )
+        return 2
+    rest = argv[1:]
+    flags = _report_flags(rest)
+    label = flags.get("label")
+    if label is None:
+        skip_next = False
+        for token in rest:
+            if skip_next:
+                skip_next = False
+                continue
+            if token.startswith("--"):
+                skip_next = True
+                continue
+            label = token
+            break
+    if label is None:
+        print(
+            "label check needs a label. Run: python3 agent_dash.py label check <label> [--ws WS]",
+            file=sys.stderr,
+        )
+        return 2
+    if (
+        not label
+        or len(label) > 200
+        or "/" in label
+        or "\\" in label
+        or label.startswith(".")
+        or "\n" in label
+    ):
+        print(
+            "label refused: no /, \\, leading dot, or newline; max 200 chars. "
+            "Use a short dash label, e.g. ws11-plan-scout-10",
+            file=sys.stderr,
+        )
+        return 2
+    ws = flags.get("ws")
+    ws_id = str(ws).upper() if ws else None
+    plans = _label_plan_ids(ws_id)
+    if ws_id and ws_id not in plans:
+        plans = _label_plan_ids(None)
+    taskmap = _label_taskmap()
+    warning = None
+    lowered = label.casefold()
+    for scope in sorted(plans):
+        ids = plans[scope]
+        if ws_id is not None and scope != ws_id:
+            continue
+        for ident in ids:
+            if str(ident).casefold() == lowered:
+                warning = (
+                    f"warning: label equals plan task {ident} ({scope}); "
+                    f"the run will attribute to that task"
+                )
+                break
+        if warning is not None:
+            break
+    if warning is None:
+        try:
+            from dash.taskmatch import task_of
+        except Exception:
+            task_of = None
+        if task_of is not None:
+            for scope in sorted(plans):
+                if ws_id is not None and scope != ws_id:
+                    continue
+                try:
+                    hit = task_of(label, scope, taskmap, plans[scope])
+                except Exception:
+                    continue
+                if hit:
+                    warning = (
+                        f"warning: label collides with plan task {hit} ({scope}); "
+                        f"the run will attribute to that task"
+                    )
+                    break
+    print(f"ok: {label}")
+    if warning:
+        print(warning)
+    return 0
 
 
 def _report_flags(argv: list[str]) -> dict:
