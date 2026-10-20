@@ -10,7 +10,7 @@ The one argv value ever kept is the worker's `--model` flag value, recorded on p
 
 | Path | Owner |
 |---|---|
-| `agent_dash.py` (CLI: `run`, `stop`, `restart`, `deploy`, `rollback`, `status`, `state`, `doctor`, `backfill --session <id>`, `reprice`, `reconcile`, `check`, `ws`, `project`, `report`, `worktrees`; global `--project <id>` for `state`, `check`, `doctor`, `ws ...`, `status`) | core |
+| `agent_dash.py` (CLI: `run`, `stop`, `restart`, `deploy`, `rollback`, `status`, `state`, `doctor`, `backfill --session <id>`, `reprice`, `reconcile`, `check`, `ws`, `project`, `report`, `label`, `lead-profile`, `worktrees`, `lanes`; global `--project <id>` for `state`, `check`, `doctor`, `ws ...`, `status`) | core |
 | `dash/state.py` (`GET /api/state`), `dash/doctor.py` (`doctor`), `dash/errors.py` (exit codes, messages) | cli |
 | `dash/dataroot.py` (data-root resolution: `data_root`, `state_dir`, `workstreams_dir`, `hub_dir`, `project_file`; the `Storage` seam, local only) | core |
 | `dash/project.py` (project descriptor: `project.json` read/validate, `project` CLI, `GET /api/project` payload) | core |
@@ -39,6 +39,7 @@ The one argv value ever kept is the worker's `--model` flag value, recorded on p
 | `dash/sources/__init__.py` (registry, scheduler) | core |
 | `dash/rundirs.py` (run-folder registration, `run-dirs.txt`) | core |
 | `dash/sources/process.py`, `dash/sources/hub.py` | core |
+| `dash/lanes.py` (live-lane grouping: one lane per distinct run from the live-worker listing; pure, no ps, no store) | core |
 | `dash/sources/claude.py`, `dash/sources/manifests.py`, `dash/sources/generic.py` | src-ai |
 | `dash/sources/muse.py`, `dash/sources/grok_cli.py` | src-tools |
 | `dash/sources/cursor.py` | src-cursor |
