@@ -272,9 +272,9 @@ class RunWorkerTests(unittest.TestCase):
         self.assertEqual(code, 0)
         listed = (self.state / "run-dirs.txt").read_text(encoding="utf-8").splitlines()
         self.assertEqual(listed, [str(self.run_dir)])
-        # A second call for the same label only waits; registration dedupes.
-        code, _line = self.go("default", launch)
-        self.assertEqual(code, 0)
+        code, line = self.go("default", launch)
+        self.assertEqual(code, 2)
+        self.assertIn("reason=label-reuse", line)
         listed = (self.state / "run-dirs.txt").read_text(encoding="utf-8").splitlines()
         self.assertEqual(listed, [str(self.run_dir)])
         self.assertEqual(registered_run_dirs(self.state), [str(self.run_dir)])
