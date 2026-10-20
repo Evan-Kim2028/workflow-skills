@@ -89,7 +89,8 @@ USAGE = """agent-dash: local read-only execution dashboard
   python3 agent_dash.py report start --label <label> [--model M] [--session S] [--run-id R] [--tier T]
   python3 agent_dash.py report finish --label <label> --verdict PASS [--session S] [--run-id R] [--status done]
   python3 agent_dash.py report usage --label <label> --input N --output N [--model M] [--session S] [--run-id R]
-  python3 agent_dash.py label check <label> [--ws WS]
+  python3 agent_dash.py label make --scope ws11 --mark plan --slug scout-10-partition-cold [--round 1]
+  python3 agent_dash.py label check <label> [--ws WS11]
   python3 agent_dash.py ws list [--state S[,S...]|all] [--json]
   python3 agent_dash.py ws new <ID> "<title>" [--state planned|active]
   python3 agent_dash.py ws state <ID> <state> [--force] [--note "..."]
@@ -1690,20 +1691,92 @@ def _label_taskmap() -> dict:
     return table if isinstance(table, dict) else {}
 
 
-def cmd_label(argv: list[str]) -> int:
-    """Check a worker label against plan task ids.
+def _label_collision_warning(
+    label: str, scope: str | None, plans: dict, taskmap: dict
+) -> str | None:
+    """Plan-task collision for a label the strict check accepted.
 
-    ``label check`` exits 0 with an ``ok`` line for a well-formed
-    label, plus a warning line when the label equals or collides with
-    a plan task id (the run would attribute to that task), and exits
-    2 with a fix for a malformed label.
+    Only the label's own workstream is consulted: a run attributes
+    inside its own scope, so task ids from other workstreams are never
+    a collision. Returns the warning line, or None when quiet.
     """
-    if not argv or argv[0] != "check":
+    text = str(label or "")
+    scope_id = str(scope or "").upper()
+    if scope_id == "HUB":
+        return None
+    if not scope_id:
+        head, dash, _rest = text.partition("-")
+        if dash and re.fullmatch(r"ws[1-9][0-9]*|hub", head.lower()):
+            scope_id = head.upper()
+    if not scope_id or scope_id == "HUB":
+        return None
+    ids = [str(item) for item in (plans.get(scope_id) or []) if str(item)]
+    if not ids:
+        return None
+    lowered = text.casefold()
+    for ident in ids:
+        if ident.casefold() == lowered:
+            return (
+                f"warning: label equals plan task {ident} ({scope_id}); "
+                f"the run will attribute to that task"
+            )
+    try:
+        from dash.phases import resolve_task
+    except Exception:
+        return None
+    try:
+        hit = resolve_task(text, scope_id, taskmap, ids)
+    except Exception:
+        return None
+    if hit is not None and str(hit) in set(ids):
+        return (
+            f"warning: label collides with plan task {hit} ({scope_id}); "
+            f"the run will attribute to that task"
+        )
+    return None
+
+
+def cmd_label(argv: list[str]) -> int:
+    """Build or check a canonical run label (``dash/labels.py``).
+
+    ``label make`` prints the label. ``label check`` exits 0 when the
+    label is strong (printing phase and rule, plus any conflict
+    warning), 2 when refused (printing the one-line fix). A label that
+    names a plan task of its own workstream gains the collision
+    warning even when the strict verdict stays quiet.
+    """
+    from dash import labels as label_lib
+
+    if not argv or argv[0] not in ("make", "check"):
         print(
-            "usage: python3 agent_dash.py label check <label> [--ws WS]",
+            "usage: python3 agent_dash.py label make --scope <wsN|hub> "
+            "--mark <plan|exec|review|coord> --slug <slug> [--round N] "
+            "or python3 agent_dash.py label check <label> [--ws <WS>]",
             file=sys.stderr,
         )
         return 2
+    if argv[0] == "make":
+        flags = _report_flags(argv[1:])
+        if not flags.get("scope") or not flags.get("mark") or not flags.get("slug"):
+            print(
+                "label make needs --scope, --mark, and --slug. Run: python3 agent_dash.py "
+                "label make --scope ws11 --mark plan --slug scout-10-partition-cold --round 1",
+                file=sys.stderr,
+            )
+            return 2
+        try:
+            print(
+                label_lib.make(
+                    flags.get("scope", ""),
+                    flags.get("mark", ""),
+                    flags.get("slug", ""),
+                    flags.get("round"),
+                )
+            )
+        except ValueError as exc:
+            print(f"label make failed: {exc}", file=sys.stderr)
+            return 2
+        return 0
     rest = argv[1:]
     flags = _report_flags(rest)
     label = flags.get("label")
@@ -1720,65 +1793,22 @@ def cmd_label(argv: list[str]) -> int:
             break
     if label is None:
         print(
-            "label check needs a label. Run: python3 agent_dash.py label check <label> [--ws WS]",
+            "label check needs a label. Run: python3 agent_dash.py label check <label> [--ws <WS>]",
             file=sys.stderr,
         )
         return 2
-    if (
-        not label
-        or len(label) > 200
-        or "/" in label
-        or "\\" in label
-        or label.startswith(".")
-        or "\n" in label
-    ):
-        print(
-            "label refused: no /, \\, leading dot, or newline; max 200 chars. "
-            "Use a short dash label, e.g. ws11-plan-scout-10",
-            file=sys.stderr,
-        )
+    verdict = label_lib.check(label, ws=flags.get("ws"))
+    if not verdict["ok"]:
+        print(f"label refused: {verdict['fix']}", file=sys.stderr)
         return 2
-    ws = flags.get("ws")
-    ws_id = str(ws).upper() if ws else None
-    plans = _label_plan_ids(ws_id)
-    if ws_id and ws_id not in plans:
-        plans = _label_plan_ids(None)
-    taskmap = _label_taskmap()
-    warning = None
-    lowered = label.casefold()
-    for scope in sorted(plans):
-        ids = plans[scope]
-        if ws_id is not None and scope != ws_id:
-            continue
-        for ident in ids:
-            if str(ident).casefold() == lowered:
-                warning = (
-                    f"warning: label equals plan task {ident} ({scope}); "
-                    f"the run will attribute to that task"
-                )
-                break
-        if warning is not None:
-            break
-    if warning is None:
-        try:
-            from dash.taskmatch import task_of
-        except Exception:
-            task_of = None
-        if task_of is not None:
-            for scope in sorted(plans):
-                if ws_id is not None and scope != ws_id:
-                    continue
-                try:
-                    hit = task_of(label, scope, taskmap, plans[scope])
-                except Exception:
-                    continue
-                if hit:
-                    warning = (
-                        f"warning: label collides with plan task {hit} ({scope}); "
-                        f"the run will attribute to that task"
-                    )
-                    break
-    print(f"ok: {label}")
+    print(f"ok: {label} -> {verdict['phase']} via {verdict['rule']}")
+    if verdict.get("warning"):
+        print(verdict["warning"])
+        return 0
+    scope = str(verdict.get("scope") or "").upper()
+    warning = _label_collision_warning(
+        label, scope or None, _label_plan_ids(scope or None), _label_taskmap()
+    )
     if warning:
         print(warning)
     return 0

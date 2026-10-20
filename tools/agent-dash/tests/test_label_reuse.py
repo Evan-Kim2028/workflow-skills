@@ -174,7 +174,7 @@ def write_plan(workstreams, ws, task_ids):
 
 
 class LabelCheckTests(unittest.TestCase):
-    """Task-id equality and collision warn; clean labels stay quiet."""
+    """Strict verdicts plus the plan-task collision warning. Temp state only."""
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -200,41 +200,69 @@ class LabelCheckTests(unittest.TestCase):
             code = agent_dash.cmd_label(list(args))
         return code, out.getvalue().strip(), err.getvalue().strip()
 
-    def test_label_equal_to_task_id_warns(self):
+    def test_clean_label_has_no_warning(self):
         write_plan(self.workstreams, "WS11", ["WS11.pgload"])
-        code, out, _err = self.check("check", "WS11.pgload")
+        code, out, err = self.check("check", "ws11-plan-scout-10")
         self.assertEqual(code, 0)
-        self.assertIn("ok: WS11.pgload", out)
+        self.assertEqual(out, "ok: ws11-plan-scout-10 -> planning via convention")
+        self.assertEqual(err, "")
+
+    def test_label_flag_form_matches_positional(self):
+        write_plan(self.workstreams, "WS11", ["WS11.pgload"])
+        code, out, _err = self.check("check", "--label", "ws11-exec-foo")
+        self.assertEqual(code, 0)
+        self.assertEqual(out, "ok: ws11-exec-foo -> execution via convention")
+
+    def test_flag_order_does_not_steal_the_label(self):
+        write_plan(self.workstreams, "WS11", ["WS11.pgload"])
+        code, out, _err = self.check("check", "--ws", "WS11", "ws11-exec-foo")
+        self.assertEqual(code, 0)
+        self.assertEqual(out, "ok: ws11-exec-foo -> execution via convention")
+
+    def test_make_prints_canonical_label(self):
+        out, err = StringIO(), StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = agent_dash.cmd_label(
+                ["make", "--scope", "ws11", "--mark", "exec", "--slug", "foo"]
+            )
+        self.assertEqual(code, 0)
+        self.assertEqual(out.getvalue().strip(), "ws11-exec-foo")
+        self.assertEqual(err.getvalue().strip(), "")
+
+    def test_task_lane_warns_the_collision(self):
+        write_plan(self.workstreams, "WS11", ["WS11.pgload"])
+        code, out, _err = self.check("check", "ws11-pgload-hook", "--ws", "WS11")
+        self.assertEqual(code, 0)
+        self.assertIn("ok: ws11-pgload-hook -> execution via task", out)
         self.assertIn("warning", out)
         self.assertIn("WS11.pgload", out)
 
-    def test_scoped_check_warns(self):
-        write_plan(self.workstreams, "WS11", ["WS11.pgload"])
-        code, out, _err = self.check("check", "WS11.pgload", "--ws", "WS11")
+    def test_equal_task_id_warns(self):
+        write_plan(self.workstreams, "WS11", ["ws11-pgload-hook"])
+        code, out, _err = self.check("check", "ws11-pgload-hook")
         self.assertEqual(code, 0)
         self.assertIn("warning", out)
+        self.assertIn("ws11-pgload-hook", out)
 
     def test_other_workstream_stays_quiet(self):
         write_plan(self.workstreams, "WS11", ["WS11.pgload"])
-        (self.workstreams / "WS12").mkdir()
-        code, out, _err = self.check("check", "WS11.pgload", "--ws", "WS12")
+        write_plan(self.workstreams, "WS1", ["1"])
+        code, out, _err = self.check("check", "ws11-exec-foo")
         self.assertEqual(code, 0)
-        self.assertIn("ok: WS11.pgload", out)
-        self.assertNotIn("warning", out)
+        self.assertEqual(out, "ok: ws11-exec-foo -> execution via convention")
 
-    def test_colliding_label_warns(self):
-        write_plan(self.workstreams, "WS11", ["pgload"])
-        code, out, _err = self.check("check", "ws11-pgload-hook", "--ws", "WS11")
-        self.assertEqual(code, 0)
-        self.assertIn("warning", out)
-        self.assertIn("pgload", out)
-
-    def test_clean_label_has_no_warning(self):
+    def test_scoped_check_stays_quiet(self):
         write_plan(self.workstreams, "WS11", ["WS11.pgload"])
-        code, out, _err = self.check("check", "ws11-plan-scout-10")
+        code, out, _err = self.check("check", "ws11-plan-scout-10", "--ws", "WS11")
         self.assertEqual(code, 0)
-        self.assertIn("ok: ws11-plan-scout-10", out)
         self.assertNotIn("warning", out)
+
+    def test_mark_conflict_warns_once(self):
+        write_plan(self.workstreams, "WS11", ["WS11.pgload"])
+        code, out, _err = self.check("check", "ws11-plan-pgload-hook", "--ws", "WS11")
+        self.assertEqual(code, 0)
+        self.assertIn("planning via convention", out)
+        self.assertEqual(out.count("warning"), 1)
 
     def test_malformed_label_is_refused(self):
         code, _out, err = self.check("check", "bad/label")
