@@ -112,6 +112,7 @@ USAGE = """agent-dash: local read-only execution dashboard
   python3 agent_dash.py project remove <id> [--json]
   python3 agent_dash.py lead-profile <session-id|--ws ID> [--json]
   python3 agent_dash.py worktrees reap --repo <path> [--apply] [--skip <path-or-branch>] [--min-age <dur>] [--json]
+  python3 agent_dash.py lanes live [--json]
 
 Agents working on a project pass --project <id> (or set the env) for
 state, check, doctor, ws ..., status: it sets the data root, state
@@ -421,6 +422,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_lead_profile(args[1:])
     if cmd == "worktrees":
         return cmd_worktrees(args[1:])
+    if cmd == "lanes":
+        return cmd_lanes(args[1:])
     print(USAGE, end="", file=sys.stderr)
     return 2
 
@@ -1300,6 +1303,85 @@ def cmd_lead_profile(argv: list[str]) -> int:
         print(f"  tail {tail.get('label')}: {tail.get('seconds')}s")
     flags = profile.get("flags") or []
     print(f"flags: {', '.join(flags) if flags else '-'}")
+    return 0
+
+
+def cmd_lanes(argv: list[str] | None = None) -> int:
+    """List distinct live lanes, one per run, not per process.
+
+    ``lanes live`` groups the dashboard live-worker listing by run
+    identity (muse session uuid, bracket label, prompt-file label) so a
+    run spawning several worker processes counts once. Tiers cover
+    muse, cursor-agent as grok, the grok CLI as glm, and Claude
+    subagents as claude when visible. The listing reuses
+    ``live_worker_processes``, the same source the dashboard uses for
+    its live set, so both agree. ``--json`` emits machine JSON.
+    """
+    rest = list(argv or [])
+    if not rest or rest[0] != "live":
+        print(USAGE, end="", file=sys.stderr)
+        return 2
+    rest = rest[1:]
+    json_mode = False
+    for flag in rest:
+        if flag == "--json":
+            json_mode = True
+        else:
+            print(USAGE, end="", file=sys.stderr)
+            return 2
+    from dash import lanes as lanes_lib
+    from dash.sources.process import live_worker_processes
+
+    try:
+        processes = live_worker_processes()
+    except Exception as exc:
+        message = "lanes live failed: %s" % (exc,)
+        if json_mode:
+            errors.emit_json({"error": message, "code": "unavailable"})
+        else:
+            print(message, file=sys.stderr)
+        return 1
+    if processes is None:
+        processes = []
+    lanes = lanes_lib.group_live_processes(processes)
+    total = len(processes)
+    if json_mode:
+        errors.emit_json({"count": len(lanes), "processes": total, "lanes": lanes})
+        return 0
+    print("live lanes: %d (from %d processes)" % (len(lanes), total))
+    if lanes:
+        width_label = max([len(str(lane.get("label") or "-")) for lane in lanes] + [5])
+        width_tier = max([len(str(lane.get("tier") or "-")) for lane in lanes] + [4])
+        print(
+            "%s %s %s %s %s %s"
+            % (
+                "label".ljust(width_label),
+                "tier".ljust(width_tier),
+                "pid".rjust(8),
+                "elapsed".rjust(10),
+                "prompt".ljust(12),
+                "procs".rjust(5),
+            )
+        )
+        for lane in lanes:
+            label = str(lane.get("label") or "-")
+            tier = str(lane.get("tier") or "-")
+            pid = lane.get("pid")
+            pid_text = str(pid) if isinstance(pid, int) else "-"
+            elapsed = lanes_lib.format_elapsed(lane.get("elapsed_s"))
+            prompt = str(lane.get("prompt_label") or "-")
+            procs = int(lane.get("processes") or 0)
+            print(
+                "%s %s %s %s %s %s"
+                % (
+                    label.ljust(width_label),
+                    tier.ljust(width_tier),
+                    pid_text.rjust(8),
+                    elapsed.rjust(10),
+                    prompt.ljust(12),
+                    str(procs).rjust(5),
+                )
+            )
     return 0
 
 
