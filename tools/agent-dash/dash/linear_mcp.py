@@ -656,6 +656,11 @@ class McpClient:
         """Add a comment to an issue."""
         self._tool("save_comment", {"issueId": self._real(issue_id), "body": body})
 
+    def post_update(self, project_id: str, body: str, health: str) -> str | None:
+        """Create a project status update (save_status_update) with a markdown body and a health enum. Returns its id."""
+        value = self._tool("save_status_update", {"type": "project", "project": project_id, "body": body, "health": health})
+        return _uuid_of(value)
+
     def _change(self, row: dict) -> dict:
         """One pulled issue as the sync reads it: id, identifier, url, updatedAt and a state."""
         status = row.get("status") if isinstance(row.get("status"), str) else None
