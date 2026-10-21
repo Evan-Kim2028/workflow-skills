@@ -43,7 +43,7 @@ Code defaults that the example file can override, if you put them in `config.loc
 | `read_budget.per_tick` | 8 MiB |
 | `cursor_usage` | unset. The collector then reads `cursor-usage.jsonl` in the state directory. |
 
-The `linear` key holds one non-secret setting, `interval_s`, the Linear poll interval (default 60 seconds). The key itself is never in a config file. See [Linear as a task backend](../tools/agent-dash/docs/linear.md).
+The `linear` key holds one non-secret setting, `max_backoff_s` (default 300 seconds). The Linear poll runs every 60 seconds. After failed syncs, the delay doubles on each further failure, up to `max_backoff_s`. The key itself is never in a config file. See [Linear as a task backend](../tools/agent-dash/docs/linear.md).
 
 `host` and `port` in a config file are ignored. The server binds to 127.0.0.1 port 8765 unless `AGENT_DASH_PORT` names another port.
 
