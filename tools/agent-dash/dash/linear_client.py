@@ -62,6 +62,7 @@ from typing import Callable
 
 ENDPOINT = "https://api.linear.app/graphql"
 PAGE_SIZE = 100
+MAX_PAGES = 50
 STATE_PAGE = 250
 MESSAGE_CLIP = 200
 
@@ -173,7 +174,13 @@ mutation IssueCreate($input: IssueCreateInput!) {
 
 RELATION_CREATE = """
 mutation IssueRelationCreate($input: IssueRelationCreateInput!) {
-  issueRelationCreate(input: $input) { success }
+  issueRelationCreate(input: $input) { success issueRelation { id } }
+}
+"""
+
+RELATION_DELETE = """
+mutation IssueRelationDelete($id: String!) {
+  issueRelationDelete(id: $id) { success }
 }
 """
 
@@ -191,7 +198,7 @@ query ProjectIssues($filter: IssueFilter, $first: Int, $after: String) {
       identifier
       url
       updatedAt
-      state { name type }
+      state { id name type }
     }
     pageInfo { hasNextPage endCursor }
   }
@@ -490,10 +497,13 @@ class Client:
         """Move an issue to a workflow state."""
         self.query(ISSUE_UPDATE, {"id": issue_id, "input": {"stateId": state_id}})
 
-    def ensure_blocks(self, blocker_issue_id: str, blocked_issue_id: str) -> None:
-        """Record that the blocker blocks the blocked issue. A duplicate counts as success."""
+    def ensure_blocks(self, blocker_issue_id: str, blocked_issue_id: str) -> str | None:
+        """Record that the blocker blocks the blocked issue.
+
+        Returns the relation id, or None when the relation already existed.
+        """
         try:
-            self.query(
+            data = self.query(
                 RELATION_CREATE,
                 {
                     "input": {
@@ -504,7 +514,17 @@ class Client:
                 },
             )
         except LinearError as exc:
-            if not _is_duplicate(exc):
+            if _is_duplicate(exc):
+                return None
+            raise
+        return data["issueRelationCreate"]["issueRelation"]["id"]
+
+    def delete_relation(self, relation_id: str) -> None:
+        """Delete an issue relation by id. A relation already gone (NOT_FOUND) counts as success."""
+        try:
+            self.query(RELATION_DELETE, {"id": relation_id})
+        except LinearError as exc:
+            if exc.code != "NOT_FOUND":
                 raise
 
     def comment(self, issue_id: str, body: str) -> None:
@@ -514,14 +534,16 @@ class Client:
     def issues_updated_since(self, project_id: str, since_iso: str | None) -> list[dict]:
         """Return every issue in the project updated after ``since_iso``, ordered by updatedAt.
 
-        Pages through the whole result, 100 issues per request.
+        Pages through the whole result, 100 issues per request. Raises
+        LinearError when the cursor repeats or more than MAX_PAGES pages come back.
         """
         flt: dict = {"project": {"id": {"eq": project_id}}}
         if since_iso:
             flt["updatedAt"] = {"gt": since_iso}
         out: list[dict] = []
         after: str | None = None
-        while True:
+        seen: set[str] = set()
+        for _page in range(MAX_PAGES):
             conn = self.query(
                 PROJECT_ISSUES,
                 {"filter": flt, "first": PAGE_SIZE, "after": after},
@@ -533,3 +555,7 @@ class Client:
             after = info.get("endCursor")
             if not after:
                 raise self._error("GRAPHQL", "pagination cursor missing")
+            if after in seen:
+                raise self._error("GRAPHQL", "pagination cursor repeated")
+            seen.add(after)
+        raise self._error("GRAPHQL", f"pagination exceeded {MAX_PAGES} pages")

@@ -149,25 +149,70 @@ def _cancel_note(task: dict) -> str:
     return " ".join(parts)
 
 
+def _detach(record: dict, kind: str, key: str) -> None:
+    """Forget a task or approval whose Linear issue was deleted in Linear.
+
+    The key is listed under ``record["detached"]`` so no later push recreates it.
+    """
+    token = f"{kind}:{key}"
+    detached = record.setdefault("detached", [])
+    if token not in detached:
+        detached.append(token)
+    bucket = record.get("tasks" if kind == "task" else "approvals") or {}
+    bucket.pop(key, None)
+
+
+def _relation_map(record: dict) -> dict[str, str | None]:
+    """The record's blocks relations as {"<blocker>><blocked>": relation id or None}.
+
+    The old list form has no relation ids; it migrates to null ids on first read.
+    """
+    raw = record.get("relations")
+    if isinstance(raw, dict):
+        relations = {str(edge): value if isinstance(value, str) else None for edge, value in raw.items()}
+    else:
+        relations = {edge: None for edge in bundles._str_list(raw)}
+    record["relations"] = relations
+    return relations
+
+
+def _resolve_state(known: dict[str, str], state: object) -> dict:
+    """``{'name', 'type'}`` for a pulled Linear state.
+
+    A team rename keeps the state id, so the id maps back to the workflow name
+    the status table knows. An id outside the workspace map keeps the name Linear sent.
+    """
+    if not isinstance(state, dict):
+        return {}
+    sid = state.get("id")
+    name = known[sid] if isinstance(sid, str) and sid in known else state.get("name")
+    return {"name": name, "type": state.get("type")}
+
+
 def _push(client: Client, ws: str, root: Path | None, record: dict, ws_data: dict, plan: dict, now: float, force: bool) -> int:
     """Upsert every task and pending approval, then milestones and blocks relations.
 
-    Skipped when the rendered spec hash matches the one recorded at the last push.
-    Returns the number of issues upserted.
+    Detached keys are skipped. Tasks that left the plan are canceled once with a
+    note and dropped from the record. Relations whose edge left the plan are
+    deleted. Skipped when the rendered spec hash matches the one recorded at the
+    last push. Returns the number of issues upserted.
     """
     project_id = record["project"]["id"]
     team_id = ws_data["team"]["id"]
     states = ws_data["states"]
     cols = _cols(plan)
     trains = _train_titles(plan)
+    detached = set(record.get("detached") or [])
 
     entries: list[tuple] = []
     for group, task in _dag_entries(plan):
+        if f"task:{task['id']}" in detached:
+            continue
         col = _col_name(cols, group)
         rendered = linear.render_issue(ws, task, col, trains.get(task["id"]))
         entries.append(("task", task["id"], rendered, col, task))
     for item in _approval_items(ws, root).values():
-        if item.get("status") == "pending":
+        if item.get("status") == "pending" and f"approval:{item['id']}" not in detached:
             entries.append(("approval", item["id"], linear.render_approval(ws, item), None, item))
 
     digest = linear.spec_hash([entry[2] for entry in entries])
@@ -184,6 +229,17 @@ def _push(client: Client, ws: str, root: Path | None, record: dict, ws_data: dic
 
     tasks = record.setdefault("tasks", {})
     approvals = record.setdefault("approvals", {})
+    live = {task["id"] for _group, task in _dag_entries(plan)}
+    for key in list(tasks):
+        if key in live:
+            continue
+        try:
+            client.set_issue_state(tasks[key]["id"], states[linear.STATE_FOR_STATUS["deferred"]])
+            client.comment(tasks[key]["id"], "Removed from the plan.")
+        except LinearError as exc:
+            if exc.code != "NOT_FOUND":
+                raise
+        del tasks[key]
     count = 0
     for kind, key, rendered, col, obj in entries:
         if kind == "task":
@@ -218,19 +274,24 @@ def _push(client: Client, ws: str, root: Path | None, record: dict, ws_data: dic
             approvals[key] = {"id": ref["id"], "identifier": ref["identifier"], "url": ref["url"]}
         count += 1
 
-    relations = record.setdefault("relations", [])
-    seen = set(relations)
+    relations = _relation_map(record)
+    wanted: dict[str, tuple[str, str]] = {}
     for _group, task in _dag_entries(plan):
         blocked = task["id"]
         if blocked not in tasks:
             continue
         for dep in bundles._str_list(task.get("deps")):
-            edge = f"{dep}>{blocked}"
-            if dep not in tasks or edge in seen:
-                continue
-            client.ensure_blocks(tasks[dep]["id"], tasks[blocked]["id"])
-            relations.append(edge)
-            seen.add(edge)
+            if dep in tasks:
+                wanted[f"{dep}>{blocked}"] = (dep, blocked)
+    for edge in list(relations):
+        if edge in wanted:
+            continue
+        relation_id = relations.pop(edge)
+        if relation_id is not None:
+            client.delete_relation(relation_id)
+    for edge, (dep, blocked) in wanted.items():
+        if edge not in relations:
+            relations[edge] = client.ensure_blocks(tasks[dep]["id"], tasks[blocked]["id"])
 
     record["spec_hash"] = digest
     record["pushed_at"] = now
@@ -270,16 +331,26 @@ def _flush(client: Client, ws: str, root: Path | None, record: dict, ws_data: di
             if ref is None or task is None:
                 continue
             task_status = _task_status(task)
-            client.set_issue_state(ref["id"], states[linear.STATE_FOR_STATUS[task_status]])
-            if task_status == "deferred" and not ref.get("canceled_noted"):
-                client.comment(ref["id"], _cancel_note(task))
-                ref["canceled_noted"] = True
+            try:
+                client.set_issue_state(ref["id"], states[linear.STATE_FOR_STATUS[task_status]])
+                if task_status == "deferred" and not ref.get("canceled_noted"):
+                    client.comment(ref["id"], _cancel_note(task))
+                    ref["canceled_noted"] = True
+            except LinearError as exc:
+                if exc.code != "NOT_FOUND":
+                    raise
+                _detach(record, kind, key)
         else:
             ref = approvals.get(key)
             item = items.get(key)
             if ref is None or item is None or item.get("status") not in linear.APPROVAL_STATE:
                 continue
-            client.set_issue_state(ref["id"], states[linear.APPROVAL_STATE[item["status"]]])
+            try:
+                client.set_issue_state(ref["id"], states[linear.APPROVAL_STATE[item["status"]]])
+            except LinearError as exc:
+                if exc.code != "NOT_FOUND":
+                    raise
+                _detach(record, kind, key)
         sent += 1
     linear.drain_outbox(ws, high, root)
     return sent
@@ -340,6 +411,7 @@ def _pull(client: Client, ws: str, root: Path | None, record: dict) -> tuple[int
         reverse[ref["id"]] = ("task", key)
     for key, ref in (record.get("approvals") or {}).items():
         reverse[ref["id"]] = ("approval", key)
+    known = {sid: name for name, sid in ((linear.read_workspace() or {}).get("states") or {}).items() if isinstance(sid, str)}
     cursor = record.get("cursor")
     issues = client.issues_updated_since(record["project"]["id"], cursor)
     mapped = applied = 0
@@ -356,7 +428,7 @@ def _pull(client: Client, ws: str, root: Path | None, record: dict) -> tuple[int
         if hit is None:
             continue
         mapped += 1
-        state = issue.get("state") if isinstance(issue.get("state"), dict) else {}
+        state = _resolve_state(known, issue.get("state"))
         if hit[0] == "task":
             applied += _apply_task(ws, root, hit[1], state)
         else:

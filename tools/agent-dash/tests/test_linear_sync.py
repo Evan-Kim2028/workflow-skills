@@ -524,5 +524,133 @@ class UnlinkAndTrainsTest(LinearSyncTest):
         self.assertIsNone(train_refs("WS9", train, self.root))
 
 
+
+class RecordingFake(FakeLinear):
+    """FakeLinear plus issues deleted in Linear and blocks relations with ids."""
+
+    def __init__(self):
+        super().__init__()
+        self.deleted: set[str] = set()
+        self.relations: dict[str, tuple[str, str]] = {}
+        self.relation_seq = 0
+
+    def set_issue_state(self, issue_id, state_id):
+        if issue_id in self.deleted:
+            self.calls.append(("state", issue_id, state_id))
+            raise LinearError("NOT_FOUND", "Entity not found")
+        super().set_issue_state(issue_id, state_id)
+
+    def comment(self, issue_id, body):
+        if issue_id in self.deleted:
+            raise LinearError("NOT_FOUND", "Entity not found")
+        super().comment(issue_id, body)
+
+    def _row(self, issue):
+        row = super()._row(issue)
+        row["state"]["id"] = issue["state_id"]
+        return row
+
+    def issues_updated_since(self, project_id, since_iso):
+        return [row for row in super().issues_updated_since(project_id, since_iso) if row["id"] not in self.deleted]
+
+    def ensure_blocks(self, blocker_issue_id, blocked_issue_id):
+        super().ensure_blocks(blocker_issue_id, blocked_issue_id)
+        self.relation_seq += 1
+        relation_id = f"rel-{self.relation_seq}"
+        self.relations[relation_id] = (blocker_issue_id, blocked_issue_id)
+        return relation_id
+
+    def delete_relation(self, relation_id):
+        self.calls.append(("delete_relation", relation_id))
+        self.relations.pop(relation_id, None)
+
+
+class DeletedAndRemovedTest(LinearSyncTest):
+    def setUp(self):
+        super().setUp()
+        self.fake = RecordingFake()
+        self._link()
+
+    def _edit_plan(self, edit) -> None:
+        plan = self._plan()
+        edit(plan)
+        (self.root / "WS9" / "plan.json").write_text(json.dumps(plan), encoding="utf-8")
+
+    def test_deleted_issue_detaches_and_later_syncs_do_not_recreate(self):
+        ident = self._ident("WS9.3")
+        issue_id = linear.stable_id("task", "WS9", "WS9.3")
+        self.fake.deleted.add(issue_id)
+        with self._quiet():
+            bundles.set_task("WS9", "WS9.3", "pr", None, None, root=self.root)
+
+        result = self._sync(self.now + 1)
+        self.assertIsNone(result["error"])
+        self.assertEqual(result["flushed"], 1)
+        record = self._link_record()
+        self.assertEqual(record["detached"], ["task:WS9.3"])
+        self.assertNotIn("WS9.3", record["tasks"])
+        self.assertEqual(linear.read_outbox("WS9", self.root), [])
+
+        self.fake.calls.clear()
+        self._edit_plan(lambda plan: next(t for g in plan["dag"]["groups"] for t in g["tasks"] if t["id"] == "WS9.3").update(title="Third task, renamed"))
+        later = self._sync(self.now + 2)
+        self.assertIsNone(later["error"])
+        self.assertFalse([c for c in self.fake.calls if c[0] in ("create", "update") and c[1] == ident])
+        self.assertFalse([c for c in self.fake.calls if c[0] == "state" and c[1] == issue_id])
+        self.assertNotIn("WS9.3", self._link_record()["tasks"])
+        self.assertEqual(self._sync(self.now + 3)["error"], None)
+
+    def test_renamed_awaiting_prod_state_still_maps_to_prog_by_id(self):
+        state_id = self.fake.team_states.pop("Awaiting prod")[0]
+        self.fake.team_states["Ready for prod"] = (state_id, "started")
+        self.fake.linear_move(self._ident("WS9.2"), "Ready for prod")
+
+        result = self._sync(self.now + 1)
+        self.assertIsNone(result["error"])
+        self.assertEqual(result["applied"], 1)
+        self.assertEqual(self._task("WS9.2")["status"], "prog")
+
+    def test_removed_dependency_deletes_its_relation(self):
+        edge = "WS9.2>WS9.3"
+        relation_id = self._link_record()["relations"][edge]
+        self.assertIsNotNone(relation_id)
+        self._edit_plan(lambda plan: next(t for g in plan["dag"]["groups"] for t in g["tasks"] if t["id"] == "WS9.3").update(deps=[]))
+
+        result = self._sync(self.now + 1)
+        self.assertIsNone(result["error"])
+        self.assertIn(("delete_relation", relation_id), self.fake.calls)
+        self.assertNotIn(relation_id, self.fake.relations)
+        relations = self._link_record()["relations"]
+        self.assertNotIn(edge, relations)
+        self.assertIn("WS9.1>WS9.2", relations)
+
+    def test_removed_task_is_canceled_once_with_comment_and_leaves_mapping(self):
+        issue_id = linear.stable_id("task", "WS9", "WS9.4")
+
+        def drop(plan):
+            build = plan["dag"]["groups"][1]
+            build["tasks"] = [t for t in build["tasks"] if t["id"] != "WS9.4"]
+
+        self._edit_plan(drop)
+        result = self._sync(self.now + 1)
+        self.assertIsNone(result["error"])
+        self.assertEqual([c for c in self.fake.calls if c[0] == "state" and c[1] == issue_id], [("state", issue_id, "s-canceled")])
+        removed = [c for c in self.fake.calls if c[0] == "comment" and c[1] == issue_id and c[2] == "Removed from the plan."]
+        self.assertEqual(len(removed), 1)
+        self.assertNotIn("WS9.4", self._link_record()["tasks"])
+        self.assertNotIn("WS9.4", linear.task_links("WS9", self.root))
+
+        self.fake.calls.clear()
+        self.assertIsNone(self._sync(self.now + 2)["error"])
+        self.assertFalse([c for c in self.fake.calls if c[0] in ("state", "comment") and c[1] == issue_id])
+
+    def test_legacy_relation_list_migrates_to_null_ids(self):
+        from dash import linear_sync as sync_module
+
+        record = {"relations": ["WS9.1>WS9.2", "WS9.2>WS9.3"]}
+        self.assertEqual(sync_module._relation_map(record), {"WS9.1>WS9.2": None, "WS9.2>WS9.3": None})
+        self.assertEqual(record["relations"], {"WS9.1>WS9.2": None, "WS9.2>WS9.3": None})
+
+
 if __name__ == "__main__":
     unittest.main()
