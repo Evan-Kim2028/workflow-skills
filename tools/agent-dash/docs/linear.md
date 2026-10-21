@@ -101,6 +101,7 @@ When Linear holds a state name that the table does not list, the poller maps it 
 ## Daily flow
 
 - **Status changes from either side.** Run `ws task` in the terminal, or move the issue in Linear. Both reach the other side.
+- **Older CLIs and hand edits.** A status set by an older CLI without Linear support, or by hand-editing `plan.json` or `approvals.json`, is detected as drift and sent on the next sync.
 - **The poller syncs every minute.** Each cycle sends queued local changes first, then pulls Linear changes. The poller runs inside the dashboard.
 - **Conflicts.** A local change that has not reached Linear yet wins; it is sent on the next sync. Otherwise the most recent change in Linear wins.
 - **Edit the spec in the plan.** Do not edit an issue description in Linear. Each push rewrites the description from `plan.json`, so a Linear edit to the description is lost. Status edits in Linear are kept.

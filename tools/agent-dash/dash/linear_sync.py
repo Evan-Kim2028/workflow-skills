@@ -287,6 +287,7 @@ def _push(client: Client, ws: str, root: Path | None, record: dict, ws_data: dic
             prior = tasks.get(key) or {}
             entry = {"id": ref["id"], "identifier": ref["identifier"], "url": ref["url"]}
             entry["canceled_noted"] = bool(prior.get("canceled_noted"))
+            entry["synced_status"] = task_status
             tasks[key] = entry
             if task_status == "deferred" and not entry["canceled_noted"]:
                 client.comment(ref["id"], _cancel_note(obj))
@@ -302,7 +303,7 @@ def _push(client: Client, ws: str, root: Path | None, record: dict, ws_data: dic
                 state_id=states[linear.APPROVAL_STATE["pending"]],
                 label_ids=[ws_data["approval_label"]],
             )
-            approvals[key] = {"id": ref["id"], "identifier": ref["identifier"], "url": ref["url"]}
+            approvals[key] = {"id": ref["id"], "identifier": ref["identifier"], "url": ref["url"], "synced_status": "pending"}
         count += 1
 
     relations = _relation_map(record)
@@ -340,41 +341,80 @@ def _push(client: Client, ws: str, root: Path | None, record: dict, ws_data: dic
     return count
 
 
-def _flush(client: Client, ws: str, root: Path | None, record: dict, ws_data: dict) -> int:
-    """Send the current local status of every outbox key, then drain the outbox.
+def _synced_mark(ref: dict, local: str) -> bool:
+    """True when the entry's ``synced_status`` differs from ``local``. A missing mark is set to ``local`` and is not drift."""
+    synced = ref.get("synced_status")
+    if not isinstance(synced, str):
+        ref["synced_status"] = local
+        return False
+    return synced != local
 
-    Rows are read first and the plan and approvals are read after them: a
+
+def _drift_keys(record: dict, plan: dict, items: dict) -> set:
+    """Mapped, non-detached task and approval keys whose local status differs from ``synced_status``.
+
+    Records written before ``synced_status`` existed get it initialized from the
+    local status here, so they never send a backlog on their first cycle.
+    """
+    detached = set(record.get("detached") or [])
+    index = {task["id"]: task for _group, task in _dag_entries(plan)}
+    drift: set = set()
+    for key, ref in (record.get("tasks") or {}).items():
+        task = index.get(key)
+        if task is None or not isinstance(ref, dict) or f"task:{key}" in detached:
+            continue
+        if _synced_mark(ref, _task_status(task)):
+            drift.add(("task", key))
+    for key, ref in (record.get("approvals") or {}).items():
+        item = items.get(key)
+        if item is None or not isinstance(ref, dict) or f"approval:{key}" in detached:
+            continue
+        if item.get("status") not in linear.APPROVAL_STATE:
+            continue
+        if _synced_mark(ref, item["status"]):
+            drift.add(("approval", key))
+    return drift
+
+
+def _flush(client: Client, ws: str, root: Path | None, record: dict, ws_data: dict) -> int:
+    """Send the current local status of every outbox key and every drift key, then drain the outbox.
+
+    Outbox rows are read first and the plan and approvals after them: a
     row is written only after its plan write, so every row read is visible
     in the later reads and the value sent is never older than the row. The
-    newest row per key wins. Keys with no mapped issue are skipped. The
-    rows read are drained by id, so rows appended meanwhile stay; a failure leaves it
-    untouched and the next cycle resends (state sets are idempotent).
+    newest row per key wins. Drift keys (local status differs from
+    ``synced_status``, e.g. a hand edit of plan.json or a write from an older
+    CLI) are sent the same way and need no row. Keys with no mapped issue are
+    skipped. Each sent key records its status as ``synced_status``. The rows
+    read are drained by id, so rows appended meanwhile stay; a failure leaves
+    the outbox untouched and the next cycle resends (state sets are idempotent).
     """
     rows = linear.read_outbox(ws, root)
-    if not rows:
-        return 0
-    newest: dict[tuple[str, str], dict] = {}
-    for row in rows:
-        newest[(row["kind"], row["key"])] = row
     plan = _plan(ws, root)
     if plan is None:
         raise RuntimeError(f"plan.json for {ws} is unreadable")
+    items = _approval_items(ws, root)
+    newest: dict = {}
+    for row in rows:
+        newest[(row["kind"], row["key"])] = row
+    order = list(dict.fromkeys(list(newest) + sorted(_drift_keys(record, plan, items))))
+    if not order:
+        return 0
     tasks = record.get("tasks") or {}
     approvals = record.get("approvals") or {}
     index = {task["id"]: task for _group, task in _dag_entries(plan)}
-    items = _approval_items(ws, root)
     states = ws_data["states"]
     sent = 0
-    for kind, key in newest:
+    for kind, key in order:
         if kind == "task":
             ref = tasks.get(key)
             task = index.get(key)
             if ref is None or task is None:
                 continue
-            task_status = _task_status(task)
+            status = _task_status(task)
             try:
-                client.set_issue_state(ref["id"], states[linear.STATE_FOR_STATUS[task_status]])
-                if task_status == "deferred" and not ref.get("canceled_noted"):
+                client.set_issue_state(ref["id"], states[linear.STATE_FOR_STATUS[status]])
+                if status == "deferred" and not ref.get("canceled_noted"):
                     client.comment(ref["id"], _cancel_note(task))
                     ref["canceled_noted"] = True
             except LinearError as exc:
@@ -386,14 +426,17 @@ def _flush(client: Client, ws: str, root: Path | None, record: dict, ws_data: di
             item = items.get(key)
             if ref is None or item is None or item.get("status") not in linear.APPROVAL_STATE:
                 continue
+            status = item["status"]
             try:
-                client.set_issue_state(ref["id"], states[linear.APPROVAL_STATE[item["status"]]])
+                client.set_issue_state(ref["id"], states[linear.APPROVAL_STATE[status]])
             except LinearError as exc:
                 if exc.code != "NOT_FOUND" or client.issue_exists(ref["id"]):
                     raise
                 _detach(record, kind, key)
+        ref["synced_status"] = status
         sent += 1
-    linear.drain_outbox(ws, {row["id"] for row in rows}, root)
+    if rows:
+        linear.drain_outbox(ws, {row["id"] for row in rows}, root)
     return sent
 
 
@@ -444,13 +487,16 @@ def _apply_approval(ws: str, root: Path | None, key: str, state: dict) -> int:
 def _pull(client: Client, ws: str, root: Path | None, record: dict) -> tuple[int, int]:
     """Read issues updated since the cursor and apply changed statuses locally.
 
-    A key with a local write still in the outbox is never applied from
-    Linear: the local change is newer and reaches Linear on the next flush.
-    Such an issue counts as mapped, and the cursor stops before it so the
-    next cycle reads it again. Returns (mapped issues read, local changes applied).
+    A key with a local write still in the outbox, or a drift key (local status
+    differs from ``synced_status``), is never applied from Linear: the local
+    change is newer and reaches Linear on the next flush. Such an issue counts
+    as mapped, and the cursor stops before it so the next cycle reads it again.
+    An applied change, or one where Linear already matches local, sets the
+    key's ``synced_status``. Returns (mapped issues read, local changes applied).
     The cursor otherwise moves to the newest updatedAt seen, mapped or not.
     """
-    pending = {(row["kind"], row["key"]) for row in linear.read_outbox(ws, root)}
+    drift = _drift_keys(record, _plan(ws, root) or {}, _approval_items(ws, root))
+    pending = {(row["kind"], row["key"]) for row in linear.read_outbox(ws, root)} | drift
     reverse: dict[str, tuple[str, str]] = {}
     for key, ref in (record.get("tasks") or {}).items():
         reverse[ref["id"]] = ("task", key)
@@ -476,8 +522,10 @@ def _pull(client: Client, ws: str, root: Path | None, record: dict) -> tuple[int
         state = _resolve_state(known, issue.get("state"))
         if hit[0] == "task":
             applied += _apply_task(ws, root, hit[1], state)
+            record["tasks"][hit[1]]["synced_status"] = linear.status_for_state(state.get("name"), state.get("type"))
         else:
             applied += _apply_approval(ws, root, hit[1], state)
+            record["approvals"][hit[1]]["synced_status"] = linear.approval_for_state(state.get("type"))
     record["cursor"] = cursor
     return mapped, applied
 
