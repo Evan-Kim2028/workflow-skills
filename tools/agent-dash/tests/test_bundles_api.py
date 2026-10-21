@@ -106,6 +106,31 @@ class BundlesApiTest(unittest.TestCase):
             os.environ["AGENT_DASH_WORKSTREAMS"] = self.old
         self.tmp.cleanup()
 
+    def test_linked_bundle_start_prompt_carries_linear_section(self):
+        from dash import linear
+        from dash.bundles import linear_start_section
+
+        prompt_path = Path(self.tmp.name) / "WS9" / "START-PROMPT.md"
+        prompt_path.write_text("You are the WS9 (Example) lead.\n", encoding="utf-8")
+        url = "https://linear.app/example/project/notes-cutover"
+        linear.write_link(
+            "WS9",
+            {"version": 1, "team_key": "ENG", "project": {"id": "p1", "url": url, "name": "Notes"}, "tasks": {}, "synced_at": 3.0},
+        )
+        status, _, body = get(self.port, "/api/bundle?ws=WS9")
+        self.assertEqual(status, 200)
+        prompt = json.loads(body)["start_prompt"]
+        self.assertTrue(prompt.startswith("You are the WS9 (Example) lead.\n\n## Linear\n"))
+        self.assertIn(f"Project: {url}", prompt)
+        self.assertIn("Status syncs both ways within a minute", prompt)
+        self.assertIn("ws task WS9 <task-id> <status>", prompt)
+        self.assertIn("ws linear comment WS9 <task-id>", prompt)
+        self.assertIn("ws trains WS9", prompt)
+        self.assertIn("ws linear update WS9", prompt)
+        self.assertIn("ws linear status WS9", prompt)
+        self.assertEqual(prompt_path.read_text(encoding="utf-8"), "You are the WS9 (Example) lead.\n")
+        self.assertEqual(linear_start_section("WS9").splitlines()[0], "## Linear")
+
     def test_bundle_routes_and_traversal(self):
         status, content_type, body = get(self.port, "/api/bundles")
         self.assertEqual(status, 200)
@@ -385,6 +410,53 @@ class BundlesApiTest(unittest.TestCase):
         before = bundles.plans_stamp(root)
         self._link("ENG-3")
         self.assertNotEqual(before, bundles.plans_stamp(root))
+
+
+class StartPromptLinearTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.old = os.environ.get("AGENT_DASH_WORKSTREAMS")
+        os.environ["AGENT_DASH_WORKSTREAMS"] = self.tmp.name
+        self.old_data = os.environ.get("AGENT_DASH_DATA_ROOT")
+        os.environ["AGENT_DASH_DATA_ROOT"] = str(Path(self.tmp.name) / "data")
+        bundle = Path(self.tmp.name) / "WS9"
+        bundle.mkdir()
+        (bundle / "bundle.json").write_text(json.dumps({"id": "WS9", "title": "Example", "short": "Ex", "order": 1, "kind": "workstream"}), encoding="utf-8")
+        self.prompt = "You are the WS9 (Example) lead.\n\nRead KICKOFF.md.\n"
+        (bundle / "START-PROMPT.md").write_text(self.prompt, encoding="utf-8")
+
+    def tearDown(self):
+        for key, old in (("AGENT_DASH_WORKSTREAMS", self.old), ("AGENT_DASH_DATA_ROOT", self.old_data)):
+            if old is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = old
+        self.tmp.cleanup()
+
+    def test_unlinked_prompt_is_unchanged(self):
+        from dash.bundles import start_prompt_text
+
+        self.assertEqual(start_prompt_text("WS9"), self.prompt)
+
+    def test_linked_prompt_appends_section_without_touching_file(self):
+        from dash import linear
+        from dash.bundles import start_prompt_text
+
+        linear.write_link("WS9", {"version": 1, "project": {"url": "https://linear.app/example/project/x"}, "tasks": {}})
+        text = start_prompt_text("WS9")
+        self.assertTrue(text.startswith(self.prompt + "\n## Linear\n"))
+        self.assertIn("Project: https://linear.app/example/project/x", text)
+        self.assertIn("agent_dash.py ws approve WS9 <item-id> approved|denied", text)
+        self.assertEqual((Path(self.tmp.name) / "WS9" / "START-PROMPT.md").read_text(encoding="utf-8"), self.prompt)
+
+    def test_linked_prompt_without_https_project_url_still_has_section(self):
+        from dash import linear
+        from dash.bundles import start_prompt_text
+
+        linear.write_link("WS9", {"version": 1, "project": {"url": "http://insecure.example"}, "tasks": {}})
+        text = start_prompt_text("WS9")
+        self.assertIn("Project: not synced yet", text)
+        self.assertNotIn("http://insecure.example", text)
 
 
 class TrainsApiTest(unittest.TestCase):
