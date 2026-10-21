@@ -924,6 +924,17 @@ class WsLinearCliTest(unittest.TestCase):
             bundles.set_approval("WS9", "A1", "pending", "Deploy tier", True, "Prod window", None, root=self.root)
         self.assertEqual([(row["kind"], row["key"]) for row in self._outbox()], [("approval", "A1")])
 
+    def test_decided_by_names_linear_only_for_linear_origin(self):
+        self._link_file()
+        with contextlib.redirect_stdout(io.StringIO()):
+            bundles.set_approval("WS9", "A1", "approved", "Deploy tier", True, "Prod window", None, root=self.root)
+        data = json.loads((self.root / "WS9" / "approvals.json").read_text(encoding="utf-8"))
+        self.assertEqual(data["decided_by"], "owner")
+        with contextlib.redirect_stdout(io.StringIO()):
+            bundles.set_approval("WS9", "A2", "denied", "Canary", False, "", None, root=self.root, origin="linear")
+        data = json.loads((self.root / "WS9" / "approvals.json").read_text(encoding="utf-8"))
+        self.assertEqual(data["decided_by"], "linear")
+
     def test_ws_linear_usage_errors(self):
         self.assertEqual(self._run(["linear"])[0], errors.USAGE)
         self.assertEqual(self._run(["linear", "link"])[0], errors.USAGE)

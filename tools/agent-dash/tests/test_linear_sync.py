@@ -524,5 +524,113 @@ class UnlinkAndTrainsTest(LinearSyncTest):
         self.assertIsNone(train_refs("WS9", train, self.root))
 
 
+class LinearAtomicityTest(LinearSyncTest):
+    """Local writes and Linear pulls share the bundle lock; Linear-origin writes yield to pending local rows."""
+
+    def setUp(self):
+        super().setUp()
+        self._link()
+
+    def test_local_write_landing_during_pull_survives_the_next_sync(self):
+        self.fake.linear_move(self._ident("WS9.1"), "In Progress")
+        real_pull = self.fake.issues_updated_since
+        fired = []
+
+        def pull_with_local_write(project_id, since_iso):
+            if not fired:
+                fired.append(True)
+                with self._quiet():
+                    self.assertEqual(bundles.set_task("WS9", "WS9.1", "pr", None, None, root=self.root), 0)
+            return real_pull(project_id, since_iso)
+
+        self.fake.issues_updated_since = pull_with_local_write
+        result = self._sync(self.now + 1)
+        self.assertIsNone(result["error"])
+        self.assertEqual(fired, [True])
+        self.assertEqual(self._task("WS9.1")["status"], "pr")
+        self.assertEqual(result["applied"], 0)
+
+        result = self._sync(self.now + 2)
+        self.assertIsNone(result["error"])
+        issue = self.fake.issues[linear.stable_id("task", "WS9", "WS9.1")]
+        self.assertEqual(issue["state_id"], "s-pr")
+        self.assertEqual(self._task("WS9.1")["status"], "pr")
+        self.assertEqual(linear.read_outbox("WS9", self.root), [])
+
+    def test_linear_origin_write_is_skipped_while_local_row_pending(self):
+        with self._quiet():
+            bundles.set_task("WS9", "WS9.2", "done", None, None, root=self.root)
+        history_before = len(self._history())
+        with self._quiet() as out:
+            rc = bundles.set_task("WS9", "WS9.2", "wip", None, None, root=self.root, force=True, origin="linear")
+        self.assertEqual(rc, errors.SKIPPED_PENDING)
+        self.assertEqual(out.getvalue(), "")
+        self.assertEqual(self._task("WS9.2")["status"], "done")
+        self.assertEqual(len(self._history()), history_before)
+        self.assertEqual(linear_sync._apply_task("WS9", self.root, "WS9.2", {"name": "In Progress", "type": "started"}), 0)
+
+    def test_skipped_approval_apply_counts_zero(self):
+        with self._quiet():
+            bundles.set_approval("WS9", "A1", "approved", None, None, None, None, root=self.root)
+        with self._quiet():
+            rc = bundles.set_approval("WS9", "A1", "denied", None, None, None, None, root=self.root, origin="linear")
+        self.assertEqual(rc, errors.SKIPPED_PENDING)
+        self.assertEqual(self._approval_status("A1"), "approved")
+        self.assertEqual(linear_sync._apply_approval("WS9", self.root, "A1", {"type": "canceled"}), 0)
+
+    def test_approval_decided_by_names_linear_for_linear_origin_writes(self):
+        with self._quiet():
+            bundles.set_approval("WS9", "A1", "approved", None, None, None, None, root=self.root)
+        data = json.loads((self.root / "WS9" / "approvals.json").read_text(encoding="utf-8"))
+        self.assertEqual(data["decided_by"], "owner")
+        self.assertEqual(linear.read_outbox("WS9", self.root)[-1]["key"], "A1")
+
+        self.fake.linear_move(self._ident("WS9.2"), "Done")
+        self.assertEqual(linear_sync._apply_task("WS9", self.root, "WS9.2", {"name": "Done", "type": "completed"}), 1)
+        self.assertEqual(self._history()[-1]["by"], "linear")
+
+        with self._quiet():
+            rc = bundles.set_approval("WS9", "A2", "denied", None, None, None, None, root=self.root, origin="linear")
+        self.assertEqual(rc, 0)
+        data = json.loads((self.root / "WS9" / "approvals.json").read_text(encoding="utf-8"))
+        self.assertEqual(data["decided_by"], "linear")
+        self.assertEqual(self._approval_status("A2"), "denied")
+
+    def test_drain_keeps_row_appended_mid_flush_with_equal_timestamp(self):
+        linear.enqueue("WS9", "task", "WS9.3", root=self.root, now=self.now)
+        self.fake.on_state = lambda _issue_id: linear.enqueue("WS9", "task", "WS9.3", root=self.root, now=self.now)
+        result = self._sync(self.now + 1)
+        self.assertIsNone(result["error"])
+        self.assertEqual(result["flushed"], 1)
+        rows = linear.read_outbox("WS9", self.root)
+        self.assertEqual([(row["key"], row["ts"]) for row in rows], [("WS9.3", self.now)])
+
+    def test_unlink_racing_enqueue_never_leaves_an_outbox_behind(self):
+        import threading
+
+        bundle = self.root / "WS9"
+        record = self._link_record()
+        for i in range(25):
+            linear.write_link("WS9", record, self.root)
+            start = threading.Barrier(2)
+
+            def do_unlink():
+                start.wait()
+                with self._quiet():
+                    unlink("WS9", root=self.root)
+
+            def do_enqueue():
+                start.wait()
+                linear.enqueue("WS9", "task", "WS9.1", root=self.root, now=float(i))
+
+            threads = [threading.Thread(target=do_unlink), threading.Thread(target=do_enqueue)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+            self.assertFalse(linear.is_linked("WS9", self.root))
+            self.assertFalse((bundle / linear.OUTBOX_FILE).exists(), f"iteration {i}")
+
+
 if __name__ == "__main__":
     unittest.main()

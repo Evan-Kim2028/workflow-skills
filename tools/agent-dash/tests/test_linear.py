@@ -15,6 +15,7 @@ from dash.linear import (
     approval_for_state,
     drain_outbox,
     enqueue,
+    has_pending,
     is_linked,
     link_path,
     page_link,
@@ -327,10 +328,11 @@ class OutboxTest(LinearTestBase):
         enqueue("WS9", "task", "WS9.1", root=self.root, now=1.0)
         enqueue("WS9", "approval", "deploy-gate", root=self.root, now=2.0)
         rows = read_outbox("WS9", root=self.root)
-        self.assertEqual(rows, [
+        self.assertEqual([{k: v for k, v in row.items() if k != "id"} for row in rows], [
             {"ts": 1.0, "kind": "task", "key": "WS9.1"},
             {"ts": 2.0, "kind": "approval", "key": "deploy-gate"},
         ])
+        self.assertEqual(len({row["id"] for row in rows}), 2)
 
     def test_read_outbox_skips_malformed_lines(self):
         write_link("WS9", _link_data(), root=self.root)
@@ -338,16 +340,52 @@ class OutboxTest(LinearTestBase):
             '{"ts": 1.0, "kind": "task", "key": "WS9.1"}\nnot json\n{"ts": 2.0, "kind": "bogus", "key": "x"}\n',
             encoding="utf-8",
         )
-        self.assertEqual(read_outbox("WS9", root=self.root), [{"ts": 1.0, "kind": "task", "key": "WS9.1"}])
+        rows = read_outbox("WS9", root=self.root)
+        self.assertEqual([{k: v for k, v in row.items() if k != "id"} for row in rows], [{"ts": 1.0, "kind": "task", "key": "WS9.1"}])
+        self.assertTrue(rows[0]["id"])
 
-    def test_drain_keeps_only_newer_rows(self):
+    def test_drain_removes_exactly_the_given_ids(self):
         write_link("WS9", _link_data(), root=self.root)
         for ts in (1.0, 2.0, 3.0):
             enqueue("WS9", "task", f"WS9.{int(ts)}", root=self.root, now=ts)
-        drain_outbox("WS9", 2.0, root=self.root)
-        self.assertEqual(read_outbox("WS9", root=self.root), [{"ts": 3.0, "kind": "task", "key": "WS9.3"}])
-        drain_outbox("WS9", 9.0, root=self.root)
+        rows = read_outbox("WS9", root=self.root)
+        drain_outbox("WS9", {rows[0]["id"], rows[1]["id"]}, root=self.root)
+        self.assertEqual([row["key"] for row in read_outbox("WS9", root=self.root)], ["WS9.3"])
+        drain_outbox("WS9", {rows[2]["id"]}, root=self.root)
         self.assertEqual(read_outbox("WS9", root=self.root), [])
+
+    def test_drain_keeps_a_row_appended_with_an_equal_timestamp(self):
+        write_link("WS9", _link_data(), root=self.root)
+        enqueue("WS9", "task", "WS9.1", root=self.root, now=5.0)
+        flushed = {row["id"] for row in read_outbox("WS9", root=self.root)}
+        enqueue("WS9", "task", "WS9.2", root=self.root, now=5.0)
+        drain_outbox("WS9", flushed, root=self.root)
+        self.assertEqual([row["key"] for row in read_outbox("WS9", root=self.root)], ["WS9.2"])
+
+    def test_legacy_rows_without_id_get_a_stable_derived_id(self):
+        write_link("WS9", _link_data(), root=self.root)
+        (self.bundle / "linear-outbox.jsonl").write_text('{"ts": 1.0, "kind": "task", "key": "WS9.1"}\n', encoding="utf-8")
+        first = read_outbox("WS9", root=self.root)[0]["id"]
+        self.assertEqual(read_outbox("WS9", root=self.root)[0]["id"], first)
+        drain_outbox("WS9", {first}, root=self.root)
+        self.assertEqual(read_outbox("WS9", root=self.root), [])
+
+    def test_has_pending_matches_kind_and_key(self):
+        self.assertFalse(has_pending("WS9", "task", "WS9.1", root=self.root))
+        write_link("WS9", _link_data(), root=self.root)
+        enqueue("WS9", "task", "WS9.1", root=self.root, now=1.0)
+        self.assertTrue(has_pending("WS9", "task", "WS9.1", root=self.root))
+        self.assertFalse(has_pending("WS9", "approval", "WS9.1", root=self.root))
+        self.assertFalse(has_pending("WS9", "task", "WS9.2", root=self.root))
+        drain_outbox("WS9", {row["id"] for row in read_outbox("WS9", root=self.root)}, root=self.root)
+        self.assertFalse(has_pending("WS9", "task", "WS9.1", root=self.root))
+
+    def test_unlink_then_enqueue_leaves_no_outbox(self):
+        write_link("WS9", _link_data(), root=self.root)
+        (self.bundle / "linear.json").unlink()
+        (self.bundle / "linear-outbox.jsonl").unlink(missing_ok=True)
+        enqueue("WS9", "task", "WS9.1", root=self.root, now=1.0)
+        self.assertFalse((self.bundle / "linear-outbox.jsonl").exists())
 
     def test_drain_on_unlinked_bundle_is_safe(self):
         drain_outbox("WS9", 1.0, root=self.root)
@@ -398,6 +436,77 @@ class StampTest(LinearTestBase):
         data["last_error"] = "RATELIMITED: retry later"
         write_link("WS9", data, root=self.root)
         self.assertNotEqual(stamp("WS9", root=self.root), before)
+
+
+class ApiKeyShapeTest(LinearTestBase):
+    def setUp(self):
+        super().setUp()
+        self.old_key = os.environ.get(linear.ENV_KEY)
+
+    def tearDown(self):
+        if self.old_key is None:
+            os.environ.pop(linear.ENV_KEY, None)
+        else:
+            os.environ[linear.ENV_KEY] = self.old_key
+        super().tearDown()
+
+    def test_rejects_embedded_whitespace_and_control_characters(self):
+        for bad in ("lin_a b", "lin_a\nb", "lin_a\tb", "lin_a\rb", "lin_\x7fb", "lin_\u00e9"):
+            os.environ[linear.ENV_KEY] = bad
+            self.assertIsNone(linear.api_key(), repr(bad))
+
+    def test_strips_ends_and_keeps_a_clean_key(self):
+        os.environ[linear.ENV_KEY] = "  lin_ok123  \n"
+        self.assertEqual(linear.api_key(), "lin_ok123")
+        os.environ[linear.ENV_KEY] = "   "
+        self.assertIsNone(linear.api_key())
+
+
+class WriteUniqueTest(LinearTestBase):
+    def test_parallel_write_link_calls_all_land_as_valid_json(self):
+        import threading
+
+        errors_seen: list[BaseException] = []
+
+        def writer(n: int) -> None:
+            try:
+                for i in range(20):
+                    data = _link_data()
+                    data["synced_at"] = float(n * 100 + i)
+                    write_link("WS9", data, root=self.root)
+            except BaseException as exc:  # noqa: BLE001 - collected and asserted below
+                errors_seen.append(exc)
+
+        threads = [threading.Thread(target=writer, args=(n,)) for n in range(4)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(errors_seen, [])
+        record = json.loads((self.bundle / "linear.json").read_text(encoding="utf-8"))
+        self.assertIn("synced_at", record)
+        self.assertEqual([p.name for p in self.bundle.iterdir() if p.name.endswith(".tmp")], [])
+
+
+class UrlFilterTest(LinearTestBase):
+    def _set(self, project_url, task_url):
+        data = _link_data()
+        data["project"]["url"] = project_url
+        data["tasks"]["WS9.1"]["url"] = task_url
+        write_link("WS9", data, root=self.root)
+
+    def test_javascript_and_http_urls_are_dropped(self):
+        for bad in ("javascript:alert(1)", "http://linear.app/x", ""):
+            self._set(bad, bad)
+            self.assertIsNone(page_link("WS9", root=self.root)["url"], bad)
+            row = task_links("WS9", root=self.root)["WS9.1"]
+            self.assertIsNone(row["url"], bad)
+            self.assertEqual(row["identifier"], "ENG-12")
+
+    def test_https_url_is_kept(self):
+        self._set("https://linear.app/x/project/ex", "https://linear.app/x/issue/ENG-12")
+        self.assertEqual(page_link("WS9", root=self.root)["url"], "https://linear.app/x/project/ex")
+        self.assertEqual(task_links("WS9", root=self.root)["WS9.1"]["url"], "https://linear.app/x/issue/ENG-12")
 
 
 if __name__ == "__main__":
