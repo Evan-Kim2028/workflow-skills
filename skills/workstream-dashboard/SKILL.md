@@ -62,6 +62,7 @@ Labels pin runs to workstreams and task chips. Verdicts are `PASS`, `PARTIAL`, `
 - **Add a workstream bundle.** `python3 agent_dash.py ws new WS4 "Read path"`, fill `plan.json`, then `ws render WS4` and `ws validate WS4`. Bundles live under `AGENT_DASH_WORKSTREAMS` and stay out of the repo.
 - **Move a task.** `python3 agent_dash.py ws task <ID> <task> <todo|wip|pr|prog|done|deferred>`. Status edits read live.
 - **Record a train or approval.** `ws train` / `ws trains`, `ws approve` / `ws approvals`. The lead reads approvals before any production step.
+- **Link a workstream to Linear.** `python3 agent_dash.py ws linear link <ID> --team <KEY>`, with `LINEAR_API_KEY` set. See [Linear as a task backend](../../tools/agent-dash/docs/linear.md).
 - **Map a label to a task.** Exact label or `/regex/` to task id under the workstream in `static/taskmap.local.json`. No restart.
 - **Add a data source.** New module `dash/sources/<name>.py` with `NAME`, `INTERVAL_S`, `poll(store, cfg, now)`. Incremental by byte offset. Bounded per tick. Exceptions isolated. Add `tests/test_<name>.py`. Restart and check `/api/health`.
 - **Price DeepSeek runs.** `grok --model deepseek-flash` usage prices from the catalog with peak/off-peak bands; see the integration guide pricing section.

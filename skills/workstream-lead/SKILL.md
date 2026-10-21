@@ -79,6 +79,8 @@ Production updates go out fastest when every merge is small in CI time, not in s
 
   `prog` never means "in progress".
 
+  When the workstream is linked to Linear, these commands do not change. Linear follows within a minute. See [Linear as a task backend](../../tools/agent-dash/docs/linear.md).
+
 ## Hand-off
 
 At about 250K context, or at a milestone, run `doctor --ws <ID>` once more, then write `state.md`: done, in flight (labels and PIDs), next wave, blockers and messages owed. Then end. A fresh lead resumes from the brief plus `state.md`. Hub reports include `doctor report --md` output.
