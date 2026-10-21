@@ -415,5 +415,56 @@ class EnsureTests(unittest.TestCase):
         self.assertEqual(fake.calls[1]["body"]["variables"], {"id": "i1", "input": {"stateId": "s1"}})
 
 
+
+class RelationAndPagingTests(unittest.TestCase):
+    def test_ensure_blocks_returns_relation_id(self) -> None:
+        reply = _ok({"issueRelationCreate": {"success": True, "issueRelation": {"id": "rel-1"}}})
+        client, fake = _client([reply])
+        self.assertEqual(client.ensure_blocks("a", "b"), "rel-1")
+        self.assertIn("issueRelation { id }", fake.calls[0]["body"]["query"])
+
+    def test_ensure_blocks_returns_none_on_duplicate(self) -> None:
+        client, _ = _client([_err(200, [{"message": "Relation already exists"}])])
+        self.assertIsNone(client.ensure_blocks("a", "b"))
+
+    def test_delete_relation_sends_id_and_tolerates_not_found(self) -> None:
+        client, fake = _client([_ok({"issueRelationDelete": {"success": True}}), _not_found()])
+        client.delete_relation("rel-9")
+        self.assertIn("issueRelationDelete(id:", fake.calls[0]["body"]["query"])
+        self.assertEqual(fake.calls[0]["body"]["variables"], {"id": "rel-9"})
+        client.delete_relation("rel-gone")
+        self.assertEqual(len(fake.calls), 2)
+
+    def test_delete_relation_raises_other_errors(self) -> None:
+        client, _ = _client([_err(200, [{"message": "Field is invalid"}])])
+        with self.assertRaises(lc.LinearError) as caught:
+            client.delete_relation("rel-1")
+        self.assertEqual(caught.exception.code, "GRAPHQL")
+
+    def test_issues_query_requests_state_id(self) -> None:
+        client, fake = _client([_ok({"issues": {"nodes": [], "pageInfo": {"hasNextPage": False, "endCursor": None}}})])
+        client.issues_updated_since("p1", None)
+        self.assertIn("state { id name type }", fake.calls[0]["body"]["query"])
+
+    def test_repeated_cursor_raises(self) -> None:
+        page = {"issues": {"nodes": [{"id": "a"}], "pageInfo": {"hasNextPage": True, "endCursor": "c1"}}}
+        client, fake = _client([_ok(page), _ok(page), _ok(page)])
+        with self.assertRaises(lc.LinearError) as caught:
+            client.issues_updated_since("p1", None)
+        self.assertEqual(caught.exception.code, "GRAPHQL")
+        self.assertEqual(len(fake.calls), 2)
+
+    def test_page_cap_raises_after_fifty_pages(self) -> None:
+        replies = [
+            _ok({"issues": {"nodes": [], "pageInfo": {"hasNextPage": True, "endCursor": f"c{index}"}}})
+            for index in range(lc.MAX_PAGES + 5)
+        ]
+        client, fake = _client(replies)
+        with self.assertRaises(lc.LinearError) as caught:
+            client.issues_updated_since("p1", None)
+        self.assertEqual(caught.exception.code, "GRAPHQL")
+        self.assertEqual(len(fake.calls), lc.MAX_PAGES)
+
+
 if __name__ == "__main__":
     unittest.main()
