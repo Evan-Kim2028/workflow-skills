@@ -60,7 +60,51 @@ def plan_task_ids(groups) -> list[str]:
 
 
 def task_of(label: str | None, ws: str | None, taskmap: dict | None = None, plan_ids: list[str] | tuple = ()) -> str | None:
-    """Map a run label to a plan task id. Mirrors the page's ``taskOf``."""
+    """Map a run label to a plan task id. Mirrors the page's ``taskOf``.
+
+    The taskmap, built-in and plan-substring rules run first. A hit that
+    names a task in the plan is kept. Otherwise the canonical-label rule
+    (:func:`_canonical_label_task`) gets a chance, and the first hit
+    stands when it finds nothing.
+    """
+    hit = _base_task(label, ws, taskmap, plan_ids)
+    if hit is not None and (not plan_ids or hit in plan_ids):
+        return hit
+    return _canonical_label_task(label, ws, plan_ids) or hit
+
+
+_CANONICAL_LABEL = re.compile(r"^ws(\d+)-(?:plan|exec|review|coord)-(.+?)(?:-r\d+)?$", re.IGNORECASE)
+
+
+def _canonical_label_task(label: str | None, ws: str | None, plan_ids: list[str] | tuple = ()) -> str | None:
+    """The task a canonical ``ws<N>-<mark>-<slug>[-rK]`` label names.
+
+    The slug maps to ``WS<N>.<slug>`` when that task is in the plan, else
+    to the longest dash-bounded prefix of the slug that is. The label's
+    workstream must be ``ws`` itself, so nothing maps across workstreams.
+    """
+    match = _CANONICAL_LABEL.match(label or "")
+    if not match or not plan_ids:
+        return None
+    number, slug = match.group(1), match.group(2)
+    if str(ws or "").upper() != f"WS{number}":
+        return None
+    prefix = f"WS{number}."
+    by_lower = {}
+    for ident in plan_ids:
+        text = str(ident)
+        if text.lower().startswith(prefix.lower()):
+            by_lower.setdefault(text.lower(), text)
+    parts = slug.split("-")
+    for cut in range(len(parts), 0, -1):
+        found = by_lower.get((prefix + "-".join(parts[:cut])).lower())
+        if found is not None:
+            return found
+    return None
+
+
+def _base_task(label: str | None, ws: str | None, taskmap: dict | None = None, plan_ids: list[str] | tuple = ()) -> str | None:
+    """The taskmap, built-in and plan-substring rules, before the canonical-label rule."""
     lab = label or ""
     table = (taskmap or {}).get(ws) if isinstance(taskmap, dict) else None
     table = table if isinstance(table, dict) else {}

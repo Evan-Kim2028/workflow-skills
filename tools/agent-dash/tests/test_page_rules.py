@@ -650,6 +650,59 @@ console.log("hover builders proof ok: " + seen.length + " strings compact");
             self.assertEqual(exec_hit, expected, f"index.html verified guard drifts on {label!r}")
             self.assertEqual(plan_hit, expected, f"plan.js verified guard drifts on {label!r}")
 
+    def test_canonical_label_rule_agrees_on_pages(self):
+        """A canonical ws<N>-<mark>-<slug>[-rK] label maps to the same plan
+        task in dash/taskmatch.py and in both page taskOf copies."""
+        import json as _json
+        import sys as _sys
+
+        _sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+        from dash import taskmatch
+
+        taskmap = {"WS4": {"ws4-exec-pinned": "WS4.zzz"}}
+        ids = {
+            "WS4": ["WS4.classify", "WS4.Fixtures", "WS4.classify-fixtures", "WS4.zzz"],
+            "WS5": ["WS5.classify"],
+            "WS7": ["WS7.LANDING"],
+        }
+        samples = [
+            ("WS4", "ws4-exec-classify", "WS4.classify"),
+            ("WS4", "ws4-review-classify-r2", "WS4.classify"),
+            ("WS4", "ws4-exec-fixtures-x", "WS4.Fixtures"),
+            ("WS4", "ws4-exec-FIXTURES", "WS4.Fixtures"),
+            ("WS4", "ws4-exec-classify-fixtures-r2", "WS4.classify-fixtures"),
+            ("WS4", "ws4-exec-missing", None),
+            ("WS4", "ws4-exec-pinned", "WS4.zzz"),
+            ("WS4", "ws5-exec-classify", None),
+            ("WS5", "ws4-exec-classify", None),
+            ("WS7", "ws7-exec-landing", "WS7.LANDING"),
+        ]
+        for ws, label, expected in samples:
+            self.assertEqual(
+                taskmatch.task_of(label, ws, taskmap, ids.get(ws, [])),
+                expected,
+                f"server canonical rule drifts on {label!r}",
+            )
+        harness = (
+            "var TASKMAP=" + _json.dumps(taskmap) + ";"
+            "var IDS=" + _json.dumps(ids) + ";"
+            "function planTaskIds(ws){return IDS[ws]||[];}"
+            "function taskmapGet(){return TASKMAP;}"
+            + _extract_taskof(STATIC / "index.html", "taskOfExec")
+            + _extract_taskof(STATIC / "plan.js", "taskOfPlan")
+            + "var SAMPLES=" + _json.dumps([[ws, label] for ws, label, _ in samples]) + ";"
+            "var OUT=SAMPLES.map(function(s){"
+            "return [taskOfExec({label:s[1]},s[0]),taskOfPlan({label:s[1]},s[0],IDS[s[0]]||[])];});"
+            "console.log(JSON.stringify(OUT));"
+        )
+        proc = subprocess.run(["node", "-e", harness], capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 0, proc.stderr or proc.stdout)
+        rows = _json.loads(proc.stdout)
+        self.assertEqual(len(rows), len(samples))
+        for (ws, label, expected), (exec_hit, plan_hit) in zip(samples, rows):
+            self.assertEqual(exec_hit, expected, f"plan-progress taskOf drifts on {label!r}")
+            self.assertEqual(plan_hit, expected, f"plan.js taskOf drifts on {label!r}")
+
     def test_plan_map_layout_helpers(self):
         """The plan card's layout helpers behave like dash/maplayout.py:
         shortChipLabel strips the WS prefix and caps at 14 chars, layoutOf

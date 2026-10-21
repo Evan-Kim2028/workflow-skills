@@ -20,7 +20,9 @@
   var TASKMAP = {};
   function loadTaskmap() { return fetch(FIX ? "taskmap.json" : "/static/taskmap.json").then(function (r) { return r.ok ? r.json() : {}; }).then(function (j) { TASKMAP = j || {}; }).catch(function () {}); }
   function taskOf(r, ws) {
-    var lab = r.label || "", ov = TASKMAP[ws] || {}, m;
+    var lab = r.label || "", list = planTaskIds(ws) || [];
+    var hit = (function () {
+    var ov = TASKMAP[ws] || {}, m;
     if (ov[lab]) return ov[lab];
     for (var k in ov) if (k.charAt(0) === "/" && k.length > 2) { try { if (new RegExp(k.slice(1, -1), "i").test(lab)) return ov[k]; } catch (e) {} }
     if (ws === "WS1") { m = /(?:^|[^a-z0-9])ws1[-._]?(\d+[a-z]?)/i.exec(lab) || /WS1\.(\d+[a-z]?)/.exec(lab); if (m) return m[1].toLowerCase(); }
@@ -38,6 +40,26 @@
       if (best) return best;
     }
     return null;
+    })();
+    /* Canonical label ws<N>-<mark>-<slug>[-rK] names WS<N>.<slug>, else the
+       longest dash-bounded prefix of the slug that is a plan task. Same rule
+       as dash/taskmatch.py _canonical_label_task. */
+    function canonicalTask() {
+      var m = /^ws(\d+)-(?:plan|exec|review|coord)-(.+?)(?:-r\d+)?$/i.exec(lab);
+      if (!m || !list.length || String(ws || "").toUpperCase() !== "WS" + m[1]) return null;
+      var prefix = "WS" + m[1] + ".", byLower = {}, parts = m[2].split("-"), k, found;
+      list.forEach(function (id) {
+        var text = String(id), key = text.toLowerCase();
+        if (key.indexOf(prefix.toLowerCase()) === 0 && !byLower[key]) byLower[key] = text;
+      });
+      for (k = parts.length; k > 0; k--) {
+        found = byLower[(prefix + parts.slice(0, k).join("-")).toLowerCase()];
+        if (found) return found;
+      }
+      return null;
+    }
+    if (hit != null && (!list.length || list.indexOf(hit) !== -1)) return hit;
+    return canonicalTask() || hit;
   }
   /* Phantom-task guard, mirroring dash/taskmatch.task_of_verified: a mapped
      id that names no task in this workstream's plan stays unmapped (it
