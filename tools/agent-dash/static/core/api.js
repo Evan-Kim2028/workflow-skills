@@ -186,6 +186,7 @@
         state.plans[id] = (p && p.groups) ? p : null;
         planSum[id] = planProg(null, p);
         planPrompt[id] = p && p.start_prompt;
+        planLinear[id] = (p && p.linear) || null;
       }).catch(function () {});
     })).then(function () { renderTabs(); });
   }

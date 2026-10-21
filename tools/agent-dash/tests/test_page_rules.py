@@ -790,6 +790,43 @@ console.log("hover builders proof ok: " + seen.length + " strings compact");
         ):
             self.assertIn(kept, card, f"plan-progress.js lost {kept!r}")
 
+    def test_linear_header_renders_no_anchor_without_a_url(self):
+        """linearHeader renders the Linear anchor only for a non-empty url;
+        a null url keeps the sync-age text and never emits href="null"."""
+        card = (STATIC / "cards" / "plan-progress.js").read_text()
+        start = card.index("function linearHeader(")
+        depth = 0
+        end = None
+        for i in range(card.index("{", start), len(card)):
+            if card[i] == "{":
+                depth += 1
+            elif card[i] == "}":
+                depth -= 1
+                if depth == 0:
+                    end = i + 1
+                    break
+        self.assertIsNotNone(end, "linearHeader body did not close")
+        script = (
+            "const assert=require('assert');"
+            "var state={wss:[]};"
+            "function el(tag,attrs){return {tag:tag,attrs:attrs||{}};}"
+            "function fmtDate(x){return 'date';}"
+            "function fmtDur(x){return '2m';}"
+            + card[start:end] + ";"
+            "var out=linearHeader({ws:'WS9',linear:{url:null,synced_at:null}},100);"
+            "assert.strictEqual(out.length,1);assert.strictEqual(out[0].tag,'span');"
+            "out=linearHeader({ws:'WS9',linear:{url:null,synced_at:50}},100);"
+            "assert.strictEqual(out.length,1);assert.strictEqual(out[0].attrs.class,'linear-sync');"
+            "out=linearHeader({ws:'WS9',linear:{url:'',synced_at:50}},100);"
+            "assert.ok(out.every(function(n){return n.tag!=='a';}));"
+            "out=linearHeader({ws:'WS9',linear:{url:'https://linear.app/x/project/y',synced_at:50}},100);"
+            "assert.strictEqual(out.length,2);assert.strictEqual(out[0].tag,'a');"
+            "assert.strictEqual(out[0].attrs.href,'https://linear.app/x/project/y');"
+            "assert.deepStrictEqual(linearHeader({ws:'WS9'},1),[]);"
+        )
+        proc = subprocess.run(["node", "-e", script], capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 0, proc.stderr or proc.stdout)
+
     def test_plan_legend_is_always_visible(self):
         """The map legend is an always-visible list under the intro line,
         not a hover-only popover: labelled Task status / Agent family /
@@ -4134,6 +4171,69 @@ class TableColumnTests(unittest.TestCase):
             for m in re.finditer(r'\[\s*"([A-Za-z? ]+)",\s*"(c-[a-z]+)"\s*\]', path.read_text()):
                 self.assertIn(m.group(2), COLUMN_MODIFIERS,
                               f"{path.name} pairs a header with a non-column class: {m.group(0)[:80]}")
+
+
+    def test_linear_link_and_sync_age_follow_page_rules(self):
+        """The plan header Linear link is a real external link with an
+        accessible name, the sync age is a muted line with the exact time
+        in its title, both hide in clip mode, the new CSS uses tokens only,
+        and the code names no doctor or health state and formats nothing
+        with toFixed or toLocaleString."""
+        import json as _json
+        src = (STATIC / "cards" / "plan-progress.js").read_text()
+        body = dict(functions(src))["linearHeader"]
+        for needle in ('el("a"', 'class: "linear-link"', 'target: "_blank"', 'rel: "noopener"', '"aria-label": "Open "', 'class: "linear-sync"'):
+            self.assertIn(needle, body, f"linearHeader lost {needle}")
+        for word in ("doctor", "health"):
+            self.assertNotIn(word, body.lower(), f"linearHeader carries a {word!r} word")
+        for bad in (".toFixed(", "toLocaleString"):
+            self.assertNotIn(bad, body, f"linearHeader formats with {bad}")
+        css = (STATIC / "cards" / "plan-progress.css").read_text()
+        clip = [line for line in css.splitlines() if "body.clip #exec-progress .linear-link" in line]
+        self.assertTrue(clip, "the Linear link is not hidden in clip mode")
+        self.assertIn("body.clip #exec-progress .linear-sync", clip[0])
+        self.assertIn("display:none", clip[0])
+        tokens = (STATIC / "tokens.css").read_text()
+        for name in set(re.findall(r"var\((--[\w-]+)\)", "\n".join(l for l in css.splitlines() if "linear-" in l))):
+            self.assertIn(f"{name}:", tokens, f"{name} is not a tokens.css token")
+        ws = (STATIC / "cards" / "ws-cards.js").read_text()
+        self.assertIn('class: "linear-link"', ws, "the Where-we-are row has no Linear link")
+        self.assertIn("planLinear[w.ws]", ws, "the Where-we-are row reads no linear field")
+        harness = (
+            "const fs=require('fs');const assert=require('assert');"
+            "globalThis.window=globalThis;"
+            "globalThis.location={search:'',pathname:'/'};"
+            "function fakeNode(tag){"
+            " var n={tag:tag,attrs:{},kids:[],textContent:'',_on:{},"
+            "  setAttribute:function(k,v){this.attrs[k]=v;},"
+            "  appendChild:function(c){this.kids.push(c);return c;},"
+            "  addEventListener:function(t,f){this._on[t]=f;}};"
+            " return n;}"
+            "globalThis.document={createElement:fakeNode,getElementById:function(){return null;},querySelector:function(){return null;}};"
+            "eval(fs.readFileSync(process.argv[1],'utf8'));"
+            "eval(fs.readFileSync(process.argv[2],'utf8'));"
+            "var fmtDur=AD.fmtDur,fmtDate=AD.fmtDate;"
+            "var state={wss:[{ws:'WS1',name:'Identity'}]};"
+            "eval(" + _json.dumps(body) + ");"
+            "assert.deepStrictEqual(linearHeader({ws:'WS1'},1761999960),[]);"
+            "var a=linearHeader({ws:'WS1',linear:{url:'https://linear.app/example/project/notes-cutover',synced_at:1761999720}},1761999960);"
+            "assert.strictEqual(a.length,2);"
+            "assert.strictEqual(a[0].tag,'a');"
+            "assert.strictEqual(a[0].attrs.target,'_blank');"
+            "assert.strictEqual(a[0].attrs.rel,'noopener');"
+            "assert.strictEqual(a[0].attrs['aria-label'],'Open Identity in Linear');"
+            "assert.strictEqual(a[0].attrs.href,'https://linear.app/example/project/notes-cutover');"
+            "assert.strictEqual(a[1].textContent,'synced 4m 0s ago');"
+            "assert.strictEqual(a[1].attrs.title,AD.fmtDate(1761999720));"
+            "var n=linearHeader({ws:'WS1',linear:{url:'https://linear.app/x',synced_at:null}},1761999960);"
+            "assert.strictEqual(n[1].textContent,'not synced yet');"
+        )
+        proc = subprocess.run(
+            ["node", "-e", harness, str(STATIC / "format.js"), str(STATIC / "core" / "el.js")],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr or proc.stdout)
 
 
 if __name__ == "__main__":

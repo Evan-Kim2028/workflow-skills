@@ -2,6 +2,8 @@ import os
 
 os.environ["AGENT_DASH_IGNORE_LOCAL"] = "1"
 os.environ.setdefault("AGENT_DASH_WORKSTREAMS", os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "fixtures", "bundles"))
+import contextlib
+import io
 import json
 import os
 import sys
@@ -11,6 +13,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from dash import bundles, errors, linear
 from dash.bundles import cmd_ws, naming_issues, set_task, validate_bundle
 
 
@@ -815,6 +818,146 @@ class WsLayoutCliTest(unittest.TestCase):
         payload = json.loads(js.getvalue())
         self.assertIsNone(payload["layout"])
         self.assertEqual(payload["map_warnings"], [])
+
+
+
+class WsLinearCliTest(unittest.TestCase):
+    """Linear hooks on the ws write path, the ws linear CLI and ws trains refs."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name) / "workstreams"
+        self.root.mkdir()
+        self.env_old = {name: os.environ.get(name) for name in ("AGENT_DASH_WORKSTREAMS", "AGENT_DASH_DATA_ROOT")}
+        os.environ["AGENT_DASH_WORKSTREAMS"] = str(self.root)
+        os.environ["AGENT_DASH_DATA_ROOT"] = str(Path(self.tmp.name) / "data")
+        bundle = self.root / "WS9"
+        bundle.mkdir()
+        (bundle / "bundle.json").write_text(json.dumps({"id": "WS9", "title": "Notes cutover", "state": "active"}), encoding="utf-8")
+        plan = {
+            "workstream": "WS9",
+            "dag": {
+                "cols": ["Shape"],
+                "groups": [
+                    {
+                        "id": "g1",
+                        "col": 0,
+                        "title": "Shape",
+                        "tasks": [
+                            {"id": "WS9.1", "title": "First", "status": "todo", "deps": []},
+                            {"id": "WS9.2", "title": "Second", "status": "todo", "deps": []},
+                        ],
+                    }
+                ],
+                "edges": [],
+            },
+            "trains": [],
+        }
+        (bundle / "plan.json").write_text(json.dumps(plan), encoding="utf-8")
+        (bundle / "approvals.json").write_text(
+            json.dumps({"ws": "WS9", "decided_at": None, "decided_by": None, "items": []}), encoding="utf-8"
+        )
+
+    def tearDown(self):
+        for name, value in self.env_old.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+        self.tmp.cleanup()
+
+    def _link_file(self, tasks=None):
+        record = {
+            "version": 1,
+            "team_key": "ENG",
+            "project": {"id": "p", "url": "https://linear.app/project/p", "name": "Notes cutover"},
+            "milestones": {},
+            "tasks": tasks or {},
+            "approvals": {},
+            "relations": [],
+            "spec_hash": "x",
+            "cursor": None,
+            "linked_at": 1.0,
+            "pushed_at": 1.0,
+            "synced_at": 1.0,
+            "last_error": None,
+        }
+        linear.write_link("WS9", record, self.root)
+
+    def _outbox(self):
+        path = self.root / "WS9" / linear.OUTBOX_FILE
+        if not path.is_file():
+            return []
+        return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line]
+
+    def _history(self):
+        return [json.loads(line) for line in (self.root / "WS9" / "history.jsonl").read_text(encoding="utf-8").splitlines()]
+
+    def _run(self, argv):
+        with contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(io.StringIO()):
+            rc = cmd_ws(argv)
+        return rc, out.getvalue()
+
+    def test_local_set_task_enqueues_only_when_linked(self):
+        with contextlib.redirect_stdout(io.StringIO()):
+            set_task("WS9", "WS9.1", "wip", None, None, root=self.root)
+        self.assertEqual(self._outbox(), [])
+        self._link_file()
+        with contextlib.redirect_stdout(io.StringIO()):
+            set_task("WS9", "WS9.1", "pr", None, None, root=self.root)
+        self.assertEqual([(row["kind"], row["key"]) for row in self._outbox()], [("task", "WS9.1")])
+
+    def test_linear_origin_sets_history_by_and_does_not_enqueue(self):
+        self._link_file()
+        with contextlib.redirect_stdout(io.StringIO()):
+            set_task("WS9", "WS9.1", "wip", None, None, root=self.root)
+            self.assertEqual(self._history()[-1].get("by"), None)
+            set_task("WS9", "WS9.2", "done", None, None, root=self.root, force=True, origin="linear")
+        last = self._history()[-1]
+        self.assertEqual(last["by"], "linear")
+        self.assertEqual(last["task"], "WS9.2")
+        self.assertEqual([row["key"] for row in self._outbox()], ["WS9.1"])
+
+    def test_set_approval_enqueues_when_linked(self):
+        self._link_file()
+        with contextlib.redirect_stdout(io.StringIO()):
+            bundles.set_approval("WS9", "A1", "pending", "Deploy tier", True, "Prod window", None, root=self.root)
+        self.assertEqual([(row["kind"], row["key"]) for row in self._outbox()], [("approval", "A1")])
+
+    def test_decided_by_names_linear_only_for_linear_origin(self):
+        self._link_file()
+        with contextlib.redirect_stdout(io.StringIO()):
+            bundles.set_approval("WS9", "A1", "approved", "Deploy tier", True, "Prod window", None, root=self.root)
+        data = json.loads((self.root / "WS9" / "approvals.json").read_text(encoding="utf-8"))
+        self.assertEqual(data["decided_by"], "owner")
+        with contextlib.redirect_stdout(io.StringIO()):
+            bundles.set_approval("WS9", "A2", "denied", "Canary", False, "", None, root=self.root, origin="linear")
+        data = json.loads((self.root / "WS9" / "approvals.json").read_text(encoding="utf-8"))
+        self.assertEqual(data["decided_by"], "linear")
+
+    def test_ws_linear_usage_errors(self):
+        self.assertEqual(self._run(["linear"])[0], errors.USAGE)
+        self.assertEqual(self._run(["linear", "link"])[0], errors.USAGE)
+        rc, _ = self._run(["linear", "link", "WS9"])
+        self.assertEqual(rc, errors.USAGE)
+        rc, _ = self._run(["linear", "bogus", "WS9"])
+        self.assertEqual(rc, errors.USAGE)
+        rc, _ = self._run(["linear", "status", "WS9", "--team", "ENG"])
+        self.assertEqual(rc, errors.USAGE)
+        rc, _ = self._run(["linear", "status", "NOPE"])
+        self.assertEqual(rc, errors.NOT_FOUND)
+
+    def test_ws_trains_prints_refs_when_linked(self):
+        rc, _ = self._run(["train", "WS9", "t1", "--title", "Doctor cut", "--add", "WS9.1,WS9.2"])
+        self.assertEqual(rc, 0)
+        rc, plain = self._run(["trains", "WS9"])
+        self.assertEqual(rc, 0)
+        self.assertNotIn("LINEAR", plain)
+        self._link_file({"WS9.1": {"id": "a", "identifier": "ENG-1", "url": "u"}, "WS9.2": {"id": "b", "identifier": "ENG-2", "url": "u"}})
+        rc, linked = self._run(["trains", "WS9"])
+        self.assertEqual(rc, 0)
+        self.assertIn("LINEAR", linked.splitlines()[0])
+        self.assertIn("Fixes ENG-1, ENG-2", linked)
 
 
 if __name__ == "__main__":

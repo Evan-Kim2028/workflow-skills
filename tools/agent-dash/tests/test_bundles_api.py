@@ -335,6 +335,58 @@ class BundlesApiTest(unittest.TestCase):
             self.assertEqual(status, 404, f"{gone} is still served")
 
 
+    def _link(self, identifier, synced_at=1_700_000_000.0):
+        from dash import linear
+
+        linear.write_link(
+            "WS9",
+            {
+                "project": {"name": "WS9", "url": "https://linear.app/x/project/ws9"},
+                "synced_at": synced_at,
+                "last_error": None,
+                "tasks": {"WS9.1": {"identifier": identifier, "url": f"https://linear.app/x/issue/{identifier}"}},
+            },
+            root=Path(self.tmp.name),
+        )
+
+    def _plan(self):
+        status, _, body = get(self.port, "/api/plan?ws=WS9")
+        self.assertEqual(status, 200)
+        return json.loads(body)
+
+    def test_plan_has_no_linear_when_unlinked(self):
+        payload = self._plan()
+        self.assertNotIn("linear", payload)
+        self.assertNotIn("linear", payload["groups"][0]["tasks"][0])
+
+    def test_plan_carries_linear_page_link_and_task_identifiers(self):
+        self._link("ENG-101")
+        payload = self._plan()
+        self.assertEqual(payload["linear"], {"url": "https://linear.app/x/project/ws9", "synced_at": 1_700_000_000.0})
+        task = payload["groups"][0]["tasks"][0]
+        self.assertEqual(task["linear"], {"identifier": "ENG-101", "url": "https://linear.app/x/issue/ENG-101"})
+
+    def test_plan_cache_follows_linear_json_without_plan_change(self):
+        self._link("ENG-7")
+        first = self._plan()
+        self.assertEqual(first["groups"][0]["tasks"][0]["linear"]["identifier"], "ENG-7")
+        plan_path = Path(self.tmp.name) / "WS9" / "plan.json"
+        plan_stat = plan_path.stat()
+        self._link("ENG-12345")
+        os.utime(plan_path, ns=(plan_stat.st_atime_ns, plan_stat.st_mtime_ns))
+        second = self._plan()
+        self.assertEqual(second["groups"][0]["tasks"][0]["linear"]["identifier"], "ENG-12345")
+        self.assertEqual(second["layout"]["groups"][0]["chips"][0]["tooltip"].endswith(" · ENG-12345"), True)
+
+    def test_plans_stamp_changes_with_linear_json(self):
+        from dash import bundles
+
+        root = Path(self.tmp.name)
+        before = bundles.plans_stamp(root)
+        self._link("ENG-3")
+        self.assertNotEqual(before, bundles.plans_stamp(root))
+
+
 class TrainsApiTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

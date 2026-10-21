@@ -27,7 +27,7 @@
     if (hit) return hit;
     return planSum[id] || null;
   }
-  var planSum = {}, planPrompt = {};
+  var planSum = {}, planPrompt = {}, planLinear = {};
   /* Plan progress is computed once on the server (/api/plan progress object);
      the page only reads progress.pct, progress.done and progress.total. */
   function planProg(w, p) {
@@ -44,7 +44,7 @@
     if (planSumInflight) return planSumInflight;
     planSumInflight = Promise.all(shown(state.wss).map(function (w) {
       return api("/api/plan", {ws: w.ws}).then(function (p) {
-        planSum[w.ws] = planProg(w, p); planPrompt[w.ws] = p && p.start_prompt;
+        planSum[w.ws] = planProg(w, p); planPrompt[w.ws] = p && p.start_prompt; planLinear[w.ws] = (p && p.linear) || null;
       }).catch(function () {});
     })).then(function () { renderTabs(); }).then(function () { planSumInflight = null; }, function () { planSumInflight = null; });
     return planSumInflight;
@@ -166,6 +166,8 @@
       var acts = el("div", {class: "prog-acts"});
       var bp = el("button", {text: "Plan"}); bp.addEventListener("click", function () { openPlan(w.ws); }); acts.appendChild(bp);
       var bl = el("button", {text: "Live"}); bl.addEventListener("click", function () { if (window.DashNav) window.DashNav.openExec(w.ws); }); acts.appendChild(bl);
+      var lk = planLinear[w.ws];
+      if (lk && lk.url) acts.appendChild(el("a", {class: "linear-link", href: lk.url, target: "_blank", rel: "noopener", "aria-label": "Open " + (w.name || w.ws) + " in Linear", text: "Linear \u2197"}));
       /* The management-table primary (Mark done, Start, Resume path;
          Archive already renders beside it via archiveControl, so that
          one is skipped here). Guarded: nothing changes when the manage
@@ -331,5 +333,10 @@
     configurable: true,
     get: function () { return planPrompt; },
     set: function (v) { planPrompt = v; }
+  });
+  Object.defineProperty(global, "planLinear", {
+    configurable: true,
+    get: function () { return planLinear; },
+    set: function (v) { planLinear = v; }
   });
 })(window);
