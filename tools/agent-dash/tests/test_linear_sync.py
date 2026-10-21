@@ -900,5 +900,126 @@ class BrokenPlanAndRelationTest(LinearSyncTest):
         self._write_plan(plan)
 
 
+class DriftTest(LinearSyncTest):
+    """Local status that differs from ``synced_status`` is sent on the next sync, with or without an outbox row."""
+
+    def setUp(self):
+        super().setUp()
+        self._link()
+
+    def _edit_plan(self, edit) -> None:
+        plan = self._plan()
+        edit(plan)
+        (self.root / "WS9" / "plan.json").write_text(json.dumps(plan), encoding="utf-8")
+
+    def _state_calls(self) -> list[tuple]:
+        return [call for call in self.fake.calls if call[0] == "state"]
+
+    def _set_approval_status(self, item_id: str, status: str) -> None:
+        path = self.root / "WS9" / "approvals.json"
+        data = json.loads(path.read_text(encoding="utf-8"))
+        next(item for item in data["items"] if item["id"] == item_id)["status"] = status
+        path.write_text(json.dumps(data), encoding="utf-8")
+
+    def test_hand_edited_plan_status_reaches_linear_without_outbox_row(self):
+        def set_pr(plan):
+            next(t for g in plan["dag"]["groups"] for t in g["tasks"] if t["id"] == "WS9.3")["status"] = "pr"
+
+        self._edit_plan(set_pr)
+        self.assertEqual(linear.read_outbox("WS9", self.root), [])
+        self.fake.calls.clear()
+
+        result = self._sync(self.now + 1)
+        self.assertIsNone(result["error"])
+        issue_id = linear.stable_id("task", "WS9", "WS9.3")
+        self.assertEqual(self._state_calls(), [("state", issue_id, "s-pr")])
+        self.assertEqual(self._link_record()["tasks"]["WS9.3"]["synced_status"], "pr")
+
+        self.fake.calls.clear()
+        self.assertIsNone(self._sync(self.now + 2)["error"])
+        self.assertEqual(self._state_calls(), [])
+
+    def test_hand_edit_wins_over_a_concurrent_linear_change(self):
+        def set_pr(plan):
+            next(t for g in plan["dag"]["groups"] for t in g["tasks"] if t["id"] == "WS9.3")["status"] = "pr"
+
+        self._edit_plan(set_pr)
+        self.fake.linear_move(self._ident("WS9.3"), "Done")
+        self.fake.calls.clear()
+
+        result = self._sync(self.now + 1)
+        self.assertIsNone(result["error"])
+        self.assertEqual(self._task("WS9.3")["status"], "pr")
+        issue = self.fake.issues[linear.stable_id("task", "WS9", "WS9.3")]
+        self.assertEqual(issue["state_id"], "s-pr")
+        self.assertEqual(result["applied"], 0)
+        self.assertEqual(self._link_record()["tasks"]["WS9.3"]["synced_status"], "pr")
+
+    def test_record_without_synced_status_initializes_without_sending(self):
+        record = self._link_record()
+        for ref in record["tasks"].values():
+            ref.pop("synced_status", None)
+        for ref in record["approvals"].values():
+            ref.pop("synced_status", None)
+        linear.write_link("WS9", record, self.root)
+        self.fake.calls.clear()
+
+        result = self._sync(self.now + 1)
+        self.assertIsNone(result["error"])
+        self.assertEqual(self._state_calls(), [])
+        record = self._link_record()
+        self.assertEqual(record["tasks"]["WS9.1"]["synced_status"], "todo")
+        self.assertEqual(record["tasks"]["WS9.2"]["synced_status"], "wip")
+        self.assertEqual(record["approvals"]["A1"]["synced_status"], "pending")
+
+    def test_pull_that_applies_a_linear_change_updates_synced_status(self):
+        self.fake.linear_move(self._ident("WS9.2"), "Done")
+        self.fake.calls.clear()
+
+        result = self._sync(self.now + 1)
+        self.assertIsNone(result["error"])
+        self.assertEqual(result["applied"], 1)
+        self.assertEqual(self._task("WS9.2")["status"], "done")
+        self.assertEqual(self._link_record()["tasks"]["WS9.2"]["synced_status"], "done")
+
+        self.fake.calls.clear()
+        result = self._sync(self.now + 2)
+        self.assertIsNone(result["error"])
+        self.assertEqual(result["flushed"], 0)
+        self.assertEqual(self._state_calls(), [])
+
+    def test_hand_edited_approval_reaches_linear_without_outbox_row(self):
+        self._set_approval_status("A1", "approved")
+        self.assertEqual(linear.read_outbox("WS9", self.root), [])
+        self.fake.calls.clear()
+
+        result = self._sync(self.now + 1)
+        self.assertIsNone(result["error"])
+        issue_id = linear.stable_id("approval", "WS9", "A1")
+        self.assertEqual(self._state_calls(), [("state", issue_id, "s-done")])
+        self.assertEqual(self._link_record()["approvals"]["A1"]["synced_status"], "approved")
+
+        self.fake.calls.clear()
+        self.assertIsNone(self._sync(self.now + 2)["error"])
+        self.assertEqual(self._state_calls(), [])
+
+    def test_approval_pull_updates_synced_status_and_next_cycle_is_quiet(self):
+        self.fake.linear_move(self._ident_approval("A1"), "Canceled")
+        self.fake.calls.clear()
+
+        result = self._sync(self.now + 1)
+        self.assertIsNone(result["error"])
+        self.assertEqual(result["applied"], 1)
+        self.assertEqual(self._approval_status("A1"), "denied")
+        self.assertEqual(self._link_record()["approvals"]["A1"]["synced_status"], "denied")
+
+        self.fake.calls.clear()
+        self.assertIsNone(self._sync(self.now + 2)["error"])
+        self.assertEqual(self._state_calls(), [])
+
+    def _ident_approval(self, item_id: str) -> str:
+        return self._link_record()["approvals"][item_id]["identifier"]
+
+
 if __name__ == "__main__":
     unittest.main()
