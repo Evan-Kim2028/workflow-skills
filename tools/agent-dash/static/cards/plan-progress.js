@@ -134,6 +134,20 @@
      without the replay controls: replay exit rebuilds the Execution view,
      so the Plan tab (which has no Execution section to rebuild into)
      mounts the same map live-only. */
+  /* Linear link and sync age beside the plan button. Present only when the
+     /api/plan body carries a top-level linear object; a null synced_at reads
+     "not synced yet". The exact sync time is the title, through fmtDate. */
+  function linearHeader(plan, now) {
+    var ln = plan.linear;
+    if (!ln) return [];
+    var hit = (state.wss || []).filter(function (w) { return w.ws === plan.ws; })[0];
+    var name = (hit && hit.name) || plan.ws;
+    var link = el("a", {class: "linear-link", href: ln.url, target: "_blank", rel: "noopener", "aria-label": "Open " + name + " in Linear", text: "Linear \u2197"});
+    var sync = ln.synced_at == null
+      ? el("span", {class: "linear-sync", text: "not synced yet"})
+      : el("span", {class: "linear-sync", title: fmtDate(ln.synced_at), text: "synced " + fmtDur(now - ln.synced_at) + " ago"});
+    return [link, sync];
+  }
   function planCard(plan, snap, opts) {
     var replayOn = !(opts && opts.replay === false);
     /* Running agents that map to no task simply do not appear in the map
@@ -152,7 +166,7 @@
     });
     function attText(a) { return planAttText(a); }
     var nLive = Object.keys(live).reduce(function (a, k) { return a + live[k].length; }, 0);
-    var c = el("div", {class: "card", id: "exec-progress", "data-nav": "Plan progress"}, [el("div", {style: "display:flex;align-items:baseline;gap:10px;flex-wrap:wrap"}, [el("h2", {text: plan.ws + " plan progress" + (nLive ? " · " + nLive + " agent" + (nLive > 1 ? "s" : "") + " working" : "")}), (plan.start_prompt ? copyBtn(plan.start_prompt) : null), el("a", {class: "planbtn", href: planUrl(plan.ws), onclick: function (ev) { ev.preventDefault(); openPlan(plan.ws); }, text: "Open the " + plan.ws + " plan"})]), el("p", {class: "sub", text: "Each tile is a section of the plan; sections run in parallel unless an arrow says one waits on another. The pill says where it stands; hover a tile's progress line for the counts, or a chip for what it waits on and unblocks."})]);
+    var c = el("div", {class: "card", id: "exec-progress", "data-nav": "Plan progress"}, [el("div", {style: "display:flex;align-items:baseline;gap:10px;flex-wrap:wrap"}, [el("h2", {text: plan.ws + " plan progress" + (nLive ? " · " + nLive + " agent" + (nLive > 1 ? "s" : "") + " working" : "")}), (plan.start_prompt ? copyBtn(plan.start_prompt) : null), el("a", {class: "planbtn", href: planUrl(plan.ws), onclick: function (ev) { ev.preventDefault(); openPlan(plan.ws); }, text: "Open the " + plan.ws + " plan"})].concat(linearHeader(plan, now))), el("p", {class: "sub", text: "Each tile is a section of the plan; sections run in parallel unless an arrow says one waits on another. The pill says where it stands; hover a tile's progress line for the counts, or a chip for what it waits on and unblocks."})]);
     /* Always-visible legend, right under the intro line (above the map).
        The old compact row
        lived below the progress bar and the chip rows, and only with a
@@ -286,7 +300,7 @@
     function makeChip(g, t, lg) {
       var st = t.status || "todo", rs = live[t.id] || [], jr = just[t.id], gate = t.kind === "gate";
       var label = lg ? lg.label : t.id;
-      var tip = lg ? lg.tooltip : (t.id + " · " + (t.title || "") + (gate ? " · gate (" + (st === "done" ? "met" : "not met") + ")" : " · " + st) + (t.moved_to ? " to " + t.moved_to : "") + (t.note ? " (" + t.note + ")" : ""));
+      var tip = lg ? lg.tooltip : (t.id + " · " + (t.title || "") + (gate ? " · gate (" + (st === "done" ? "met" : "not met") + ")" : " · " + st) + (t.moved_to ? " to " + t.moved_to : "") + (t.note ? " (" + t.note + ")" : "") + (t.linear && t.linear.identifier ? " \u00B7 " + t.linear.identifier : ""));
       if (rs.length) tip += " · working: " + rs.map(function (r) { return (r.label || r.run_id) + " (" + (r.tier || "") + ", " + fmtDur(r.elapsed_s) + ")"; }).join(", ");
       if (jr && !rs.length) tip += " · just finished: " + (jr.label || "") + (jr.verdict ? " " + jr.verdict : "");
       var cp = el("span", {class: "chip " + st + (rs.length ? " live" : "") + (jr && !rs.length ? " just" : "") + (gate ? " gate" : ""), title: tip}, [label]);

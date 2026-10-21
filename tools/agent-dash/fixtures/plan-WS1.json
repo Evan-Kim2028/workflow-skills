@@ -15,7 +15,11 @@
           "id": "0",
           "title": "Upstream freeze signal is in",
           "status": "done",
-          "kind": "gate"
+          "kind": "gate",
+          "linear": {
+            "identifier": "PD-1",
+            "url": "https://linear.app/example/issue/PD-1"
+          }
         },
         {
           "id": "1",
@@ -28,7 +32,11 @@
           "status": "pr",
           "deps": [
             "1"
-          ]
+          ],
+          "linear": {
+            "identifier": "PD-3",
+            "url": "https://linear.app/example/issue/PD-3"
+          }
         },
         {
           "id": "3",
@@ -249,5 +257,9 @@
       "detail": "train T1 has 1 members; solo trains render no tag",
       "fix": "Drop train T1; keep a task note instead"
     }
-  ]
+  ],
+  "linear": {
+    "url": "https://linear.app/example/project/pipeline-doctor",
+    "synced_at": 1761999720
+  }
 }

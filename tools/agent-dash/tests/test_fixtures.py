@@ -510,13 +510,19 @@ class FixtureShapeTests(unittest.TestCase):
             self.assertIsInstance(group["col"], int)
             ids.add(group["id"])
             for task in group["tasks"]:
-                self.assertEqual(set(task) - {"deps", "kind", "dep_notes"}, {"id", "title", "status"})
+                self.assertEqual(set(task) - {"deps", "kind", "dep_notes", "linear"}, {"id", "title", "status"})
+                if "linear" in task:
+                    self.assertEqual(set(task["linear"]), {"identifier", "url"})
                 self.assertIsInstance(task["status"], str)
                 self.assertTrue(task["status"])
         for edge in plan["edges"]:
             self.assertEqual(len(edge), 2)
             self.assertIn(edge[0], ids)
             self.assertIn(edge[1], ids)
+        if "linear" in plan:
+            self.assertEqual(set(plan["linear"]), {"url", "synced_at"})
+            self.assertIsInstance(plan["linear"]["url"], str)
+            self.assertTrue(plan["linear"]["synced_at"] is None or isinstance(plan["linear"]["synced_at"], (int, float)))
         self.assertTrue(plan["phases"])
         for phase in plan["phases"]:
             self.assertEqual(set(phase), {"name", "goal", "gate"})

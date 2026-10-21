@@ -67,6 +67,7 @@ The dashboard is read by a visual thinker. Every view answers its question with 
 - Production jobs (source `dagster`) are never in agent lists; they are a count: the live tile shows `N prod jobs` / `N prod jobs ran`.
 - `?fixtures` loads `../fixtures/*.json` for offline design work.
 - No health or warning cards on the page; doctor is CLI and API only. Read the problem list with `agent_dash.py doctor` or `GET /api/doctor`.
+- A linked workstream shows a `Linear ↗` link and its sync age (muted, exact time on hover) on the plan card header and the Where we are row; sync failures stay in doctor.
 
 ## Accessibility and phone
 
