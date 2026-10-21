@@ -780,6 +780,45 @@ class OrchestrateApiTest(unittest.TestCase):
         self.assertTrue(any("files" in issue for issue in validate_bundle("WS9")))
 
 
+class StableToolPathTest(unittest.TestCase):
+    def setUp(self):
+        from dash.bundles import _stable_tool_dir
+
+        self.stable = _stable_tool_dir
+        self.tmp = tempfile.TemporaryDirectory()
+        self.base = Path(os.path.realpath(self.tmp.name))
+        self.releases = self.base / "state" / "releases"
+        self.sha = "a" * 40
+        self.tool = self.releases / self.sha / "tools" / "agent-dash"
+        self.tool.mkdir(parents=True)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_current_link_to_same_release_uses_stable_path(self):
+        os.symlink(self.releases / self.sha, self.releases / "CURRENT")
+        self.assertEqual(self.stable(self.tool), self.releases / "CURRENT" / "tools" / "agent-dash")
+
+    def test_no_current_link_keeps_sha_path(self):
+        self.assertEqual(self.stable(self.tool), self.tool)
+
+    def test_current_pointing_elsewhere_keeps_sha_path(self):
+        other = self.releases / ("b" * 40)
+        (other / "tools" / "agent-dash").mkdir(parents=True)
+        os.symlink(other, self.releases / "CURRENT")
+        self.assertEqual(self.stable(self.tool), self.tool)
+
+    def test_flat_release_maps_to_current(self):
+        flat = self.releases / self.sha
+        os.symlink(flat, self.releases / "CURRENT")
+        self.assertEqual(self.stable(flat), self.releases / "CURRENT")
+
+    def test_non_release_path_unchanged(self):
+        plain = self.base / "checkout" / "tools" / "agent-dash"
+        plain.mkdir(parents=True)
+        self.assertEqual(self.stable(plain), plain)
+
+
 
 if __name__ == "__main__":
     unittest.main()
