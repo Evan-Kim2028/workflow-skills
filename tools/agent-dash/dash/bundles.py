@@ -76,6 +76,8 @@ WS_USAGE = """agent-dash workstream bundles
   python3 agent_dash.py ws deferred [<ID>] [--json]
   python3 agent_dash.py ws layout <ID> [--json]
   python3 agent_dash.py ws linear <link|sync|status|unlink> <ID> [--team KEY] [--json]
+  python3 agent_dash.py ws linear login
+  python3 agent_dash.py ws linear logout
 
 Status is todo, wip, pr, prog, done, or deferred. deferred may set --moved-to and --note.
 Workstream state is planned, active, paused, done, archived, or dropped (default active).
@@ -2183,6 +2185,19 @@ def print_deferred(ws: str | None, json_mode: bool = False) -> int:
 LINEAR_SUBCOMMANDS = ("link", "sync", "status", "unlink")
 
 
+def _cmd_linear_auth(args: list[str], team: str | None) -> int:
+    """``ws linear login`` and ``ws linear logout``: the account sign-in, no flags and no workstream id."""
+    from dash import linear_auth
+
+    sub, rest = args[0], args[1:]
+    if team is not None or rest:
+        print(f"ws linear {sub} takes no arguments. Run: python3 agent_dash.py ws linear {sub}", flush=True)
+        return errors.USAGE
+    if sub == "logout":
+        return linear_auth.logout()
+    return linear_auth.login()
+
+
 def _cmd_linear(rest: list[str], json_mode: bool = False) -> int:
     """``ws linear <link|sync|status|unlink> <WS> [--team KEY]``: Linear mirror of one bundle."""
     args = list(rest)
@@ -2197,6 +2212,8 @@ def _cmd_linear(rest: list[str], json_mode: bool = False) -> int:
     if not args:
         print(WS_USAGE, end="", flush=True)
         return errors.USAGE
+    if args[0] in ("login", "logout"):
+        return _cmd_linear_auth(args, team)
     sub = args[0]
     if sub not in LINEAR_SUBCOMMANDS:
         print(f"unknown linear subcommand {sub!r}. Use one of: {', '.join(LINEAR_SUBCOMMANDS)}. Run: python3 agent_dash.py ws linear status <ID>", flush=True)

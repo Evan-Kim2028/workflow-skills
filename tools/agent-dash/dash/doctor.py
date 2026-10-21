@@ -1207,13 +1207,13 @@ def _linear_epoch(value):
 
 
 def _collect_linear(ctx) -> None:
-    """Linear sync health for linked bundles: key, last sync error, outbox backlog.
+    """Linear sync health for linked bundles: sign-in, last sync error, outbox backlog.
 
-    Emits nothing when no bundle is linked. With no key, only the key problem
+    Emits nothing when no bundle is linked. Without a credential, only the sign-in problem
     is reported. With the read-only switch on, the poller is off by design, so
     the outbox backlog is not reported.
     """
-    from dash import linear
+    from dash import linear, linear_auth
     from dash.actions import actions_enabled
     from dash.bundles import list_bundles
 
@@ -1225,13 +1225,13 @@ def _collect_linear(ctx) -> None:
     if not linked:
         return
     problems = []
-    if linear.api_key() is None:
-        problems.append(f"LINEAR_API_KEY unset; linked: {', '.join(linked)}")
+    if linear_auth.credential() is None:
+        problems.append(f"not signed in to Linear; linked: {', '.join(linked)}")
         _add(
             ctx, "linear-key-missing", "warn", "global", None,
-            "Linear key is missing for linked bundles",
+            "Not signed in to Linear",
             problems[-1],
-            "export LINEAR_API_KEY=<key from Linear settings>, then restart the dashboard",
+            "python3 agent_dash.py ws linear login",
             key="linear-key-missing",
         )
         _check(ctx, "linear", False, problems[-1])
