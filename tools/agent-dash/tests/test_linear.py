@@ -509,5 +509,17 @@ class UrlFilterTest(LinearTestBase):
         self.assertEqual(task_links("WS9", root=self.root)["WS9.1"]["url"], "https://linear.app/x/issue/ENG-12")
 
 
+class TestCommandRenderTest(unittest.TestCase):
+    def test_single_command_is_wrapped_once(self) -> None:
+        text = render_issue("WS4", {"id": "WS4.a", "title": "A", "test_cmd": "`make test`"}, None, None)["description"]
+        self.assertIn("## Test command\n\n`make test`", text)
+
+    def test_mixed_prose_with_inline_code_is_kept_as_written(self) -> None:
+        raw = "`make test` (exit 0), plus `make lint`."
+        text = render_issue("WS4", {"id": "WS4.a", "title": "A", "test_cmd": raw}, None, None)["description"]
+        self.assertIn("## Test command\n\n" + raw, text)
+        self.assertNotIn("`.`", text)
+
+
 if __name__ == "__main__":
     unittest.main()

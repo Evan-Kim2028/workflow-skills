@@ -154,7 +154,9 @@ def render_issue(ws: str, task: dict, col: str | None, train: str | None) -> dic
         blocks.append("## Files\n\n" + "\n".join(f"- `{path}`" for path in files))
 
     if _present(task.get("test_cmd")):
-        blocks.append("## Test command\n\n`" + _strip_ticks(str(task["test_cmd"])) + "`")
+        raw = str(task["test_cmd"]).strip()
+        bare = _strip_ticks(raw)
+        blocks.append("## Test command\n\n" + (raw if "`" in bare else "`" + bare + "`"))
 
     for key, label in (("rollback", "Rollback"), ("deploy_tier", "Deploy tier"), ("approval", "Approval")):
         if _present(task.get(key)):
