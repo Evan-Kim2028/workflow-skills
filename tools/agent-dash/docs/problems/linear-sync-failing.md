@@ -17,9 +17,9 @@ python3 ~/.claude/tools/agent-dash/agent_dash.py ws linear status WS4 --json
 Then act on the code:
 
 - `AUTH`: the key is wrong or revoked. Create a new personal API key, export it as `LINEAR_API_KEY`, and restart the dashboard.
-- `RATELIMITED`: wait. The poller backs off up to 300 seconds and retries.
+- `RATELIMITED`: wait. The poller pauses every linked workstream until Linear's reset time, or 300 seconds when the reset time is unknown, and then retries.
 - `NETWORK`, `HTTP`, `GRAPHQL`: check the connection to `api.linear.app`. Retry once the network is back.
-- `NOT_FOUND`: a Linear object was deleted in Linear. Run `ws linear unlink WS4`, then `ws linear link WS4 --team ENG` to recreate it.
+- `NOT_FOUND`: a Linear object was deleted in Linear. A deleted issue is recreated on the next push. If the error persists, run `ws linear unlink WS4`, then `ws linear link WS4 --team ENG`.
 
 Run one sync to test the fix:
 

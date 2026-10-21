@@ -3,9 +3,10 @@
 Off unless ``LINEAR_API_KEY`` is set and at least one bundle carries a
 ``linear.json``. The read-only switch (``AGENT_DASH_READONLY=1`` or config
 ``readonly: true``) skips every poll. Each linked bundle is synced by
-``dash.linear_sync``; a result carrying ``error`` counts as a failed poll
-and the next attempt backs off like the dagster source. The key is never
-logged or returned.
+``dash.linear_sync``. A failed bundle backs off on its own clock, so a
+healthy bundle keeps its cadence. A ``RATELIMITED`` result stops the poll
+for every bundle and pauses all of them. The key is never logged or
+returned.
 """
 
 from __future__ import annotations
@@ -23,12 +24,14 @@ NAME = "linear"
 INTERVAL_S = 60
 
 DEFAULT_MAX_BACKOFF_S = 300.0
+RATE_LIMIT_PAUSE_S = 300.0
 
 last_error = None
 _clock = time.monotonic
-_fail_streak = 0
-_backoff_s = 0.0
-_next_attempt = None
+_fail_streak: dict[str, int] = {}
+_backoff: dict[str, float] = {}
+_next_attempt: dict[str, float] = {}
+_rate_limit_until: float | None = None
 
 
 def _linked() -> list[str]:
@@ -56,7 +59,9 @@ def health_extra() -> dict:
     """Extra health payload merged by the registry under ``linear``.
 
     ``workstreams`` carries only the non-secret sync fields per linked bundle:
-    ``synced_at``, ``last_error`` and the outbox row count.
+    ``synced_at``, ``last_error``, the outbox row count and that bundle's
+    ``backoff_s`` (0 when healthy). ``rate_limit_pause_s`` is the shared pause
+    left after a ``RATELIMITED`` result (0 when none).
     """
     workstreams = {}
     try:
@@ -70,12 +75,19 @@ def health_extra() -> dict:
             "synced_at": state.get("synced_at"),
             "last_error": _clip(state["last_error"]) if state.get("last_error") else None,
             "outbox": int(state.get("outbox") or 0),
+            "backoff_s": _backoff.get(ws, 0.0),
         }
     return {
         "linked": len(linked),
-        "backoff_s": _backoff_s,
+        "rate_limit_pause_s": _rate_limit_remaining(),
         "workstreams": workstreams,
     }
+
+
+def _rate_limit_remaining() -> float:
+    if _rate_limit_until is None:
+        return 0.0
+    return max(0.0, float(_rate_limit_until - _clock()))
 
 
 def _max_backoff(cfg: dict) -> float:
@@ -95,21 +107,33 @@ def _budget(cfg: dict) -> float:
     return value if value > 0 else POLL_BUDGET_S
 
 
-def _record_success() -> None:
-    global _fail_streak, _backoff_s, _next_attempt
-    _fail_streak = 0
-    _backoff_s = 0.0
-    _next_attempt = None
+def _record_success(ws: str) -> None:
+    for table in (_fail_streak, _backoff, _next_attempt):
+        table.pop(ws, None)
 
 
-def _record_failure(cfg: dict) -> None:
-    """Count one failed poll and schedule the next attempt after the back-off delay."""
-    global _fail_streak, _backoff_s, _next_attempt
-    _fail_streak += 1
-    delay = INTERVAL_S * (2 ** min(_fail_streak - 1, 30))
-    _backoff_s = float(min(delay, _max_backoff(cfg)))
-    _next_attempt = _clock() + _backoff_s
-    log.warning("linear: backing off %gs after %d failed poll(s)", _backoff_s, _fail_streak)
+def _record_failure(ws: str, cfg: dict) -> None:
+    """Count one failed poll of ``ws`` and schedule its next attempt after the back-off delay."""
+    streak = _fail_streak.get(ws, 0) + 1
+    _fail_streak[ws] = streak
+    delay = float(min(INTERVAL_S * (2 ** min(streak - 1, 30)), _max_backoff(cfg)))
+    _backoff[ws] = delay
+    _next_attempt[ws] = _clock() + delay
+    log.warning("linear: %s backing off %gs after %d failed poll(s)", ws, delay, streak)
+
+
+def _rate_limit_pause(result: dict) -> float:
+    """Seconds to pause every bundle after a RATELIMITED result.
+
+    Uses the result's ``reset_at`` (epoch seconds, when present and later
+    than now) and falls back to RATE_LIMIT_PAUSE_S.
+    """
+    reset_at = result.get("reset_at")
+    if isinstance(reset_at, (int, float)) and not isinstance(reset_at, bool):
+        remaining = float(reset_at) - time.time()
+        if remaining > 0:
+            return remaining
+    return RATE_LIMIT_PAUSE_S
 
 
 def poll(store, cfg, now: float) -> None:
@@ -122,6 +146,7 @@ def poll(store, cfg, now: float) -> None:
 
 
 def _poll(cfg: dict) -> None:
+    global _rate_limit_until
     if not actions_enabled(cfg):
         return
     if linear.api_key() is None:
@@ -129,14 +154,18 @@ def _poll(cfg: dict) -> None:
     bundles = _linked()
     if not bundles:
         return
-    if _next_attempt is not None and _clock() < _next_attempt:
+    if _rate_limit_until is not None and _clock() < _rate_limit_until:
+        return
+    _rate_limit_until = None
+    now = _clock()
+    due = [ws for ws in bundles if now >= _next_attempt.get(ws, 0.0)]
+    if not due:
         return
     budget = _budget(cfg)
     started = _clock()
     attempted = 0
-    failed = 0
     longest = 0.0
-    for ws in bundles:
+    for ws in due:
         elapsed = _clock() - started
         if attempted and elapsed + longest > budget:
             log.info("linear: poll budget reached after %d bundle(s)", attempted)
@@ -148,16 +177,22 @@ def _poll(cfg: dict) -> None:
             result = {"error": _clip(f"{type(exc).__name__}: {exc}")}
         longest = max(longest, _clock() - began)
         attempted += 1
-        if isinstance(result, dict) and result.get("error"):
-            failed += 1
-            log.warning("linear: %s sync failed: %s", ws, _clip(result["error"]))
-    if not attempted:
-        return
-    if failed:
-        _record_failure(cfg)
-    else:
-        _record_success()
+        error = result.get("error") if isinstance(result, dict) else None
+        if error and str(error).startswith("RATELIMITED"):
+            _rate_limit_until = _clock() + _rate_limit_pause(result)
+            log.warning("linear: rate limited; pausing all bundles for %gs", _rate_limit_until - _clock())
+            return
+        if error:
+            log.warning("linear: %s sync failed: %s", ws, _clip(error))
+            _record_failure(ws, cfg)
+        else:
+            _record_success(ws)
 
 
 def _clip(text) -> str:
-    return str(text).replace("\n", " ").strip()[:200]
+    """Clip a message to 200 characters with the exact API key replaced by ``[redacted]``."""
+    out = str(text).replace("\n", " ").strip()
+    key = linear.api_key()
+    if key:
+        out = out.replace(key, "[redacted]")
+    return out[:200]

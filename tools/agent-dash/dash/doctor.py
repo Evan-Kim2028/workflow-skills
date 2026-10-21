@@ -1207,8 +1207,14 @@ def _linear_epoch(value):
 
 
 def _collect_linear(ctx) -> None:
-    """Linear sync health for linked bundles: key, last sync error, outbox backlog."""
+    """Linear sync health for linked bundles: key, last sync error, outbox backlog.
+
+    Emits nothing when no bundle is linked. With no key, only the key problem
+    is reported. With the read-only switch on, the poller is off by design, so
+    the outbox backlog is not reported.
+    """
     from dash import linear
+    from dash.actions import actions_enabled
     from dash.bundles import list_bundles
 
     try:
@@ -1217,7 +1223,6 @@ def _collect_linear(ctx) -> None:
         _check(ctx, "linear", False, f"bundle list failed: {exc}")
         return
     if not linked:
-        _check(ctx, "linear", True, "no bundle is linked to Linear")
         return
     problems = []
     if linear.api_key() is None:
@@ -1229,6 +1234,9 @@ def _collect_linear(ctx) -> None:
             "export LINEAR_API_KEY=<key from Linear settings>, then restart the dashboard",
             key="linear-key-missing",
         )
+        _check(ctx, "linear", False, problems[-1])
+        return
+    poller_on = actions_enabled(ctx.cfg)
     for ws in linked:
         state = linear.sync_state(ws) or {}
         synced_at = _linear_epoch(state.get("synced_at"))
@@ -1243,7 +1251,7 @@ def _collect_linear(ctx) -> None:
                 key=ws,
             )
         rows = linear.read_outbox(ws)
-        if not rows:
+        if not rows or not poller_on:
             continue
         oldest = _linear_epoch(rows[0].get("ts"))
         aged = oldest is not None and ctx.now - oldest > LINEAR_STALE_S
