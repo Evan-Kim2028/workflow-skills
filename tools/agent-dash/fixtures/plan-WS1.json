@@ -106,6 +106,10 @@
     "pct": 40
   },
   "_note": "Seeded example plan for the fixture preview.",
+  "linear": {
+    "url": "https://linear.app/example/project/pipeline-doctor",
+    "synced_at": 1761999720
+  },
   "layout": {
     "ws": "WS1",
     "density": "comfortable",
@@ -160,7 +164,7 @@
           {
             "id": "0",
             "label": "0",
-            "tooltip": "0 \u00b7 Upstream freeze signal is in \u00b7 done \u00b7 gate",
+            "tooltip": "0 \u00b7 Upstream freeze signal is in \u00b7 done \u00b7 gate \u00b7 PD-1",
             "status": "done",
             "kind": "gate",
             "train": null,
@@ -178,7 +182,7 @@
           {
             "id": "2",
             "label": "2",
-            "tooltip": "2 \u00b7 Land the read route \u00b7 pr \u00b7 waits on 1",
+            "tooltip": "2 \u00b7 Land the read route \u00b7 pr \u00b7 waits on 1 \u00b7 PD-3",
             "status": "pr",
             "kind": "task",
             "train": "T2",
@@ -257,9 +261,5 @@
       "detail": "train T1 has 1 members; solo trains render no tag",
       "fix": "Drop train T1; keep a task note instead"
     }
-  ],
-  "linear": {
-    "url": "https://linear.app/example/project/pipeline-doctor",
-    "synced_at": 1761999720
-  }
+  ]
 }

@@ -1023,15 +1023,15 @@ def _plans():
         # The offline page consumes the same server-computed map layout as
         # the live page (dash/maplayout.py); the map falls back to today's
         # behaviour when these keys are absent.
-        layout_view = {key: doc[key] for key in ("ws", "cols", "groups", "edges", "phases", "trains")}
-        doc["layout"] = maplayout_mod.layout(layout_view)
-        doc["map_warnings"] = maplayout_mod.map_warnings(layout_view)
         if ws == "WS1":
             doc["linear"] = dict(LINEAR_WS1)
             for group in doc["groups"]:
                 for task in group["tasks"]:
                     if task["id"] in LINEAR_TASKS:
                         task["linear"] = dict(LINEAR_TASKS[task["id"]])
+        layout_view = {key: doc[key] for key in ("ws", "cols", "groups", "edges", "phases", "trains")}
+        doc["layout"] = maplayout_mod.layout(layout_view)
+        doc["map_warnings"] = maplayout_mod.map_warnings(layout_view)
         written[ws] = doc
     return written
 
