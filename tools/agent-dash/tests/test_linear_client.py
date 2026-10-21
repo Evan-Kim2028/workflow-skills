@@ -2,7 +2,7 @@
 
 Every test uses a fake transport that records each request and returns canned
 JSON. Nothing here calls the live Linear API. The one default-transport test
-patches urllib.request.urlopen.
+patches the module opener (lc._OPENER.open).
 """
 
 from __future__ import annotations
@@ -10,8 +10,11 @@ from __future__ import annotations
 import io
 import json
 import sys
+import threading
+import time
 import unittest
 import urllib.error
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest import mock
 
@@ -76,17 +79,17 @@ class AuthHeaderTests(unittest.TestCase):
         response = mock.MagicMock()
         response.status = 200
         response.headers = {}
-        response.read.return_value = b'{"data": {"ok": true}}'
+        response.read1.side_effect = [b'{"data": {"ok": true}}', b""]
         context = mock.MagicMock()
         context.__enter__.return_value = response
-        with mock.patch("urllib.request.urlopen", return_value=context) as urlopen:
+        with mock.patch.object(lc._OPENER, "open", return_value=context) as open_call:
             data = lc.Client(KEY).query("query Q { ok }")
-        request = urlopen.call_args.args[0]
+        request = open_call.call_args.args[0]
         self.assertEqual(data, {"ok": True})
         self.assertEqual(request.get_method(), "POST")
         self.assertEqual(request.get_header("Authorization"), KEY)
         self.assertEqual(request.get_header("Content-type"), "application/json")
-        self.assertEqual(urlopen.call_args.kwargs["timeout"], 20.0)
+        self.assertEqual(open_call.call_args.kwargs["timeout"], 20.0)
 
 
 class ErrorMappingTests(unittest.TestCase):
@@ -127,13 +130,13 @@ class ErrorMappingTests(unittest.TestCase):
 
     def test_default_transport_http_error_is_mapped(self) -> None:
         error = urllib.error.HTTPError("https://api.linear.app/graphql", 401, "Unauthorized", {}, io.BytesIO(b""))
-        with mock.patch("urllib.request.urlopen", side_effect=error):
+        with mock.patch.object(lc._OPENER, "open", side_effect=error):
             with self.assertRaises(lc.LinearError) as caught:
                 lc.Client(KEY).query("query Q { x }")
         self.assertEqual(caught.exception.code, "AUTH")
 
     def test_default_transport_timeout_is_network(self) -> None:
-        with mock.patch("urllib.request.urlopen", side_effect=TimeoutError("slow")):
+        with mock.patch.object(lc._OPENER, "open", side_effect=TimeoutError("slow")):
             with self.assertRaises(lc.LinearError) as caught:
                 lc.Client(KEY).query("query Q { x }")
         self.assertEqual(caught.exception.code, "NETWORK")
@@ -165,7 +168,7 @@ class KeyRedactionTests(unittest.TestCase):
         self._assert_no_key(caught.exception)
 
     def test_default_transport_error_has_no_key(self) -> None:
-        with mock.patch("urllib.request.urlopen", side_effect=urllib.error.URLError(f"no route {KEY}")):
+        with mock.patch.object(lc._OPENER, "open", side_effect=urllib.error.URLError(f"no route {KEY}")):
             with self.assertRaises(lc.LinearError) as caught:
                 lc.Client(KEY).query("query Q { x }")
         self._assert_no_key(caught.exception)
@@ -464,6 +467,150 @@ class RelationAndPagingTests(unittest.TestCase):
             client.issues_updated_since("p1", None)
         self.assertEqual(caught.exception.code, "GRAPHQL")
         self.assertEqual(len(fake.calls), lc.MAX_PAGES)
+
+class _LocalServer:
+    """A 127.0.0.1 HTTP server on a free port. ``hits`` records each POST it receives."""
+
+    def __init__(self, respond) -> None:
+        handler = type(
+            "Handler",
+            (BaseHTTPRequestHandler,),
+            {"do_POST": _post_hook(respond), "log_message": lambda self, *args: None},
+        )
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        self.server.daemon_threads = True
+        self.server.hits = []
+        self.url = f"http://127.0.0.1:{self.server.server_address[1]}/graphql"
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    def close(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+
+
+def _post_hook(respond):
+    def do_POST(self) -> None:
+        length = int(self.headers.get("Content-Length") or 0)
+        self.rfile.read(length)
+        self.server.hits.append(dict(self.headers.items()))
+        respond(self)
+
+    return do_POST
+
+
+def _json_reply(data: dict):
+    def respond(handler) -> None:
+        raw = json.dumps({"data": data}).encode("utf-8")
+        handler.send_response(200)
+        handler.send_header("Content-Type", "application/json")
+        handler.send_header("Content-Length", str(len(raw)))
+        handler.end_headers()
+        handler.wfile.write(raw)
+
+    return respond
+
+
+class TransportHardeningTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.servers: list[_LocalServer] = []
+
+    def tearDown(self) -> None:
+        for server in self.servers:
+            server.close()
+
+    def _serve(self, respond) -> _LocalServer:
+        server = _LocalServer(respond)
+        self.servers.append(server)
+        return server
+
+    def test_redirect_is_refused_and_target_receives_nothing(self) -> None:
+        target = self._serve(_json_reply({"ok": True}))
+
+        def redirect(handler) -> None:
+            handler.send_response(302)
+            handler.send_header("Location", target.url)
+            handler.send_header("Content-Length", "0")
+            handler.end_headers()
+
+        origin = self._serve(redirect)
+        client = lc.Client(KEY, endpoint=origin.url)
+        with self.assertRaises(lc.LinearError) as caught:
+            client.query("query Q { ok }")
+        self.assertEqual(caught.exception.code, "HTTP")
+        self.assertEqual(caught.exception.message, "redirect refused")
+        self.assertEqual(target.server.hits, [])
+        self.assertEqual(len(origin.server.hits), 1)
+
+    def test_trickling_body_hits_total_deadline(self) -> None:
+        def trickle(handler) -> None:
+            handler.send_response(200)
+            handler.send_header("Content-Type", "application/json")
+            handler.send_header("Content-Length", "100000")
+            handler.end_headers()
+            try:
+                for _ in range(50):
+                    handler.wfile.write(b" ")
+                    handler.wfile.flush()
+                    time.sleep(0.2)
+            except OSError:
+                pass
+
+        server = self._serve(trickle)
+        client = lc.Client(KEY, endpoint=server.url, timeout=5.0, deadline=1.0)
+        started = time.monotonic()
+        with self.assertRaises(lc.LinearError) as caught:
+            client.query("query Q { ok }")
+        elapsed = time.monotonic() - started
+        self.assertEqual(caught.exception.code, "NETWORK")
+        self.assertEqual(caught.exception.message, "deadline exceeded")
+        self.assertLess(elapsed, 1.0 + 2.0)
+
+    def test_oversized_body_is_refused(self) -> None:
+        size = lc.MAX_BODY_BYTES + 1
+
+        def oversized(handler) -> None:
+            handler.send_response(200)
+            handler.send_header("Content-Length", str(size))
+            handler.end_headers()
+            try:
+                handler.wfile.write(b"x" * size)
+            except OSError:
+                pass
+
+        server = self._serve(oversized)
+        with self.assertRaises(lc.LinearError) as caught:
+            lc.Client(KEY, endpoint=server.url).query("query Q { ok }")
+        self.assertEqual(caught.exception.code, "HTTP")
+        self.assertEqual(caught.exception.message, "response too large")
+
+    def test_non_https_endpoint_is_rejected_at_construction(self) -> None:
+        for endpoint in ("http://example.com/graphql", "ftp://127.0.0.1/graphql", "https:///graphql"):
+            with self.subTest(endpoint):
+                with self.assertRaises(ValueError):
+                    lc.Client(KEY, endpoint=endpoint)
+
+    def test_https_and_localhost_http_endpoints_are_accepted(self) -> None:
+        lc.Client(KEY, endpoint="https://api.linear.app/graphql")
+        server = self._serve(_json_reply({"ok": True}))
+        self.assertTrue(server.url.startswith("http://127.0.0.1:"))
+        self.assertEqual(lc.Client(KEY, endpoint=server.url).query("query Q { ok }"), {"ok": True})
+
+    def test_key_never_appears_in_raised_messages(self) -> None:
+        leaking = self._serve(lambda handler: handler.send_response(500) or handler.end_headers() or handler.wfile.write(f"bad {KEY}".encode("utf-8")))
+        cases = [
+            ("http 500 echo", lambda: lc.Client(KEY, endpoint=leaking.url).query("query Q { ok }")),
+            ("refused", lambda: lc.Client(KEY, endpoint="http://127.0.0.1:1/graphql").query("query Q { ok }")),
+        ]
+        for label, call in cases:
+            with self.subTest(label):
+                with self.assertRaises(lc.LinearError) as caught:
+                    call()
+                self.assertNotIn(KEY, str(caught.exception))
+                self.assertNotIn(KEY, repr(caught.exception))
+        scrubbed = lc._transport_failure(OSError(f"socket for {KEY} dropped"), KEY)
+        self.assertNotIn(KEY, scrubbed.message)
+        self.assertIn("[redacted]", scrubbed.message)
 
 
 if __name__ == "__main__":
