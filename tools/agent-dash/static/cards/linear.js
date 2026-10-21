@@ -54,6 +54,25 @@
     return t;
   }
 
+  /* Pure: the y scale for a count chart. niceMax ceilings are 1/2/5 times a
+     power of ten, so the tick count is the largest of 5/4/2/1 that divides
+     the ceiling evenly: every label is then a whole number of changes. */
+  function linScale(max) {
+    var yMax = niceMax(max > 0 ? max : 1);
+    var prefs = [5, 4, 2, 1];
+    for (var i = 0; i < prefs.length; i++) {
+      if (Math.abs(yMax / prefs[i] - Math.round(yMax / prefs[i])) < 1e-9) return {yMax: yMax, yTicks: prefs[i]};
+    }
+    return {yMax: yMax, yTicks: 1};
+  }
+
+  /* Chart width in px: the 560 px design width, shrunk on phones so the
+     SVG renders at 1:1 and its 11 px axis text keeps its size. */
+  function linWidth() {
+    var vw = (typeof window !== "undefined" && window.innerWidth) || 560;
+    return Math.min(560, Math.max(280, Math.floor(vw - 72)));
+  }
+
   /* Pure: sync state as glyph plus word. Errors win, then queued, then synced. */
   function linSyncState(w) {
     if (w && w.last_error) return {glyph: "⚠", word: "Sync error"};
@@ -111,23 +130,24 @@
   }
 
   function linChart(rows) {
-    var W = 560, H = 220, L = 56, T = 26, R = 16, B = 44;
+    var W = linWidth(), H = 220, L = 56, T = 26, R = 16, B = 44;
     var pw = W - L - R, ph = H - T - B, yb = T + ph;
     var data = WINDOWS.map(function (win) {
       var t = linTotals(rows, win.key);
       return {label: win.label, local: t.local, linear: t.linear, total: t.local + t.linear};
     });
     var max = data.reduce(function (m, d) { return Math.max(m, d.total); }, 0);
-    var yMax = niceMax(max > 0 ? max : 1);
+    var scale = linScale(max);
+    var yMax = scale.yMax;
     var slot = pw / data.length;
     var barW = Math.min(90, slot * 0.4);
-    var svg = svgEl("svg", {viewBox: "0 0 " + W + " " + H, class: "lin-svg", role: "img"});
+    var svg = svgEl("svg", {viewBox: "0 0 " + W + " " + H, width: W, height: H, class: "lin-svg", role: "img"});
     var parts = data.map(function (d) {
       return d.label.toLowerCase() + ": " + fmtN(d.local) + " local, " + fmtN(d.linear) + " from Linear";
     });
     svg.setAttribute("aria-label", "Status changes by source. " + parts.join("; ") + ".");
     axes(svg, {
-      L: L, T: T, pw: pw, ph: ph, yMax: yMax, yTicks: 4, yFmt: fmtN,
+      L: L, T: T, pw: pw, ph: ph, yMax: yMax, yTicks: scale.yTicks, yFmt: fmtN,
       xTicks: data.map(function (d, i) { return {x: L + slot * i + slot / 2, label: d.label}; }),
       yTitle: "status changes", xTitle: null
     });
@@ -286,4 +306,5 @@
   global.linTotals = linTotals;
   global.linSyncState = linSyncState;
   global.linSignIn = linSignIn;
+  global.linScale = linScale;
 })(window);
