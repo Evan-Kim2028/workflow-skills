@@ -36,9 +36,10 @@ class LinearSourceTest(unittest.TestCase):
         )
         self.env.start()
         os.environ.pop("AGENT_DASH_READONLY", None)
-        source._fail_streak = 0
-        source._backoff_s = 0.0
-        source._next_attempt = None
+        source._fail_streak.clear()
+        source._backoff.clear()
+        source._next_attempt.clear()
+        source._rate_limit_until = None
         self.clock = [1000.0]
         self.clock_patch = mock.patch.object(source, "_clock", lambda: self.clock[0])
         self.clock_patch.start()
@@ -78,39 +79,96 @@ class LinearSourceTest(unittest.TestCase):
     def test_each_linked_bundle_is_synced(self):
         self._poll()
         self.assertEqual([c.args[0] for c in self.sync.call_args_list], ["WS9", "WS10"])
-        self.assertIsNone(source._next_attempt)
+        self.assertEqual(source._next_attempt, {})
+
+    def _results(self, results):
+        """Route each bundle to its own result dict; unlisted bundles succeed."""
+        ok = {"pushed": 0, "flushed": 0, "pulled": 0, "applied": 0, "error": None}
+        self.sync.side_effect = lambda ws: results.get(ws, ok)
 
     def test_failure_backs_off_and_later_success_resets(self):
-        self.sync.return_value = {"error": "HTTP 500"}
+        self._results({"WS9": {"error": "HTTP 500"}})
         self._poll()
-        self.assertEqual(source._fail_streak, 1)
-        self.assertEqual(source._backoff_s, float(source.INTERVAL_S))
-        self.assertEqual(source.health_extra()["backoff_s"], float(source.INTERVAL_S))
+        self.assertEqual(source._fail_streak, {"WS9": 1})
+        self.assertEqual(source._backoff, {"WS9": float(source.INTERVAL_S)})
+        with mock.patch.object(source, "_linked_on_disk", return_value=["WS9", "WS10"]):
+            extra = source.health_extra()
+        self.assertEqual(extra["workstreams"]["WS9"]["backoff_s"], float(source.INTERVAL_S))
+        self.assertEqual(extra["workstreams"]["WS10"]["backoff_s"], 0.0)
 
-        # Inside the window: no sync attempt.
+        # Inside the window: WS9 is not attempted again.
         self.sync.reset_mock()
         self.clock[0] += 10
         self._poll()
-        self.sync.assert_not_called()
+        self.assertEqual([c.args[0] for c in self.sync.call_args_list], ["WS10"])
 
-        # Window passed and the next cycle succeeds: back-off clears.
+        # Window passed and WS9 succeeds: its back-off clears.
         self.sync.reset_mock()
-        self.sync.return_value = {"error": None}
+        self._results({})
         self.clock[0] += source.INTERVAL_S
         self._poll()
         self.assertEqual(self.sync.call_count, 2)
-        self.assertEqual(source._fail_streak, 0)
-        self.assertEqual(source._backoff_s, 0.0)
-        self.assertIsNone(source._next_attempt)
+        self.assertEqual(source._fail_streak, {})
+        self.assertEqual(source._backoff, {})
+        self.assertEqual(source._next_attempt, {})
 
-    def test_backoff_doubles_and_respects_max(self):
-        self.sync.return_value = {"error": "boom"}
+    def test_failing_bundle_does_not_delay_healthy_bundle(self):
+        self._results({"WS9": {"error": "HTTP 500"}})
+        self._poll()
+        self.sync.reset_mock()
+        self.clock[0] += 10
+        self._poll()
+        self.assertEqual([c.args[0] for c in self.sync.call_args_list], ["WS10"])
+        self.assertNotIn("WS10", source._next_attempt)
+
+    def test_backoff_doubles_and_respects_max_per_bundle(self):
+        self._results({"WS9": {"error": "boom"}})
         cfg = {"linear": {"max_backoff_s": 90}}
         self._poll(cfg)
-        self.assertEqual(source._backoff_s, 60.0)
+        self.assertEqual(source._backoff["WS9"], 60.0)
         self.clock[0] += 60
         self._poll(cfg)
-        self.assertEqual(source._backoff_s, 90.0)
+        self.assertEqual(source._backoff["WS9"], 90.0)
+        self.assertNotIn("WS10", source._backoff)
+
+    def test_ratelimited_stops_the_loop_and_pauses_every_bundle(self):
+        self._results({"WS9": {"error": "RATELIMITED: slow down"}})
+        self._poll()
+        self.assertEqual([c.args[0] for c in self.sync.call_args_list], ["WS9"])
+        self.assertEqual(source._rate_limit_until, 1000.0 + 300.0)
+        self.assertEqual(source._fail_streak, {})
+        self.assertEqual(source.health_extra()["rate_limit_pause_s"], 300.0)
+
+        self.sync.reset_mock()
+        self.clock[0] += 100
+        self._poll()
+        self.sync.assert_not_called()
+
+        self.clock[0] += 201
+        self._results({})
+        self.sync.reset_mock()
+        self._poll()
+        self.assertEqual([c.args[0] for c in self.sync.call_args_list], ["WS9", "WS10"])
+        self.assertIsNone(source._rate_limit_until)
+
+    def test_ratelimit_pause_uses_reset_time_when_result_has_one(self):
+        import time as real_time
+
+        self._results({"WS9": {"error": "RATELIMITED: slow down", "reset_at": real_time.time() + 120}})
+        self._poll()
+        self.assertAlmostEqual(source._rate_limit_until - self.clock[0], 120.0, delta=5.0)
+
+    def test_poll_error_redacts_the_api_key(self):
+        self.linked.side_effect = RuntimeError(f"bad request with {SECRET} inside")
+        self._poll()
+        self.assertIsNotNone(source.last_error)
+        self.assertNotIn(SECRET, source.last_error)
+        self.assertIn("[redacted]", source.last_error)
+
+    def test_sync_error_text_is_redacted_in_health(self):
+        self._results({"WS9": {"error": f"AUTH: key {SECRET} rejected"}})
+        self._poll()
+        self.assertNotIn(SECRET, json.dumps(source.health_extra()))
 
     def test_budget_stops_before_the_next_bundle(self):
         self.linked.return_value = ["WS1", "WS2", "WS3"]
@@ -138,12 +196,12 @@ class LinearSourceTest(unittest.TestCase):
         )
         linear.enqueue("WS9", "task", "WS9.1", now=1400.0)
         extra = source.health_extra()
-        self.assertEqual(set(extra), {"linked", "backoff_s", "workstreams"})
+        self.assertEqual(set(extra), {"linked", "rate_limit_pause_s", "workstreams"})
         self.assertEqual(extra["linked"], 1)
-        self.assertIsInstance(extra["backoff_s"], float)
+        self.assertIsInstance(extra["rate_limit_pause_s"], float)
         self.assertEqual(
             extra["workstreams"],
-            {"WS9": {"synced_at": 1500.0, "last_error": None, "outbox": 1}},
+            {"WS9": {"synced_at": 1500.0, "last_error": None, "outbox": 1, "backoff_s": 0.0}},
         )
         self.assertNotIn(SECRET, json.dumps(extra))
         self.assertNotIn("linear.app", json.dumps(extra))
