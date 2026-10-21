@@ -55,8 +55,11 @@ scrubbed from every message this module raises.
 
 from __future__ import annotations
 
+import http.client
 import json
+import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from typing import Callable
 
@@ -64,6 +67,10 @@ ENDPOINT = "https://api.linear.app/graphql"
 PAGE_SIZE = 100
 STATE_PAGE = 250
 MESSAGE_CLIP = 200
+MAX_BODY_BYTES = 8 * 1024 * 1024
+READ_CHUNK = 64 * 1024
+DEADLINE_SECONDS = 30.0
+LOCAL_HOSTS = frozenset({"127.0.0.1", "localhost"})
 
 Transport = Callable[[bytes, dict], tuple[int, dict, bytes]]
 
@@ -212,19 +219,14 @@ class LinearError(Exception):
         self.message = message
 
 
-def _urllib_transport(endpoint: str, timeout: float) -> Transport:
-    """Build the default transport: a POST over urllib with a fixed timeout."""
+class _RefuseRedirects(urllib.request.HTTPRedirectHandler):
+    """Refuse every redirect, so the Authorization header never leaves the endpoint."""
 
-    def send(body: bytes, headers: dict) -> tuple[int, dict, bytes]:
-        request = urllib.request.Request(endpoint, data=body, headers=headers, method="POST")
-        try:
-            with urllib.request.urlopen(request, timeout=timeout) as response:
-                return response.status, dict(response.headers.items()), response.read()
-        except urllib.error.HTTPError as exc:
-            headers_out = dict(exc.headers.items()) if exc.headers else {}
-            return exc.code, headers_out, exc.read()
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise LinearError("HTTP", "redirect refused")
 
-    return send
+
+_OPENER = urllib.request.build_opener(_RefuseRedirects)
 
 
 def _clip(text: object, key: str) -> str:
@@ -233,6 +235,69 @@ def _clip(text: object, key: str) -> str:
     if key:
         flat = flat.replace(key, "[redacted]")
     return flat[:MESSAGE_CLIP]
+
+
+def _check_endpoint(endpoint: str) -> None:
+    """Allow https everywhere and plain http only for a local test server."""
+    parts = urllib.parse.urlsplit(endpoint)
+    host = parts.hostname or ""
+    if parts.scheme == "https" and host:
+        return
+    if parts.scheme == "http" and host in LOCAL_HOSTS:
+        return
+    raise ValueError("Linear endpoint must be https (http is allowed only for localhost)")
+
+
+def _read_capped(stream: object, deadline_at: float) -> bytes:
+    """Read a body in chunks, enforcing the size cap and the overall deadline."""
+    reader = getattr(stream, "read1", None) or stream.read
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        if time.monotonic() >= deadline_at:
+            raise LinearError("NETWORK", "deadline exceeded")
+        chunk = reader(READ_CHUNK)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > MAX_BODY_BYTES:
+            raise LinearError("HTTP", "response too large")
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def _transport_failure(exc: BaseException, key: str) -> LinearError:
+    return LinearError("NETWORK", _clip(f"request failed ({type(exc).__name__}): {exc}", key))
+
+
+def _urllib_transport(endpoint: str, timeout: float, deadline: float, key: str) -> Transport:
+    """Build the default transport: one POST over urllib, no redirects, bounded time and size."""
+
+    def send(body: bytes, headers: dict) -> tuple[int, dict, bytes]:
+        deadline_at = time.monotonic() + deadline
+        budget = max(deadline_at - time.monotonic(), 0.001)
+        request = urllib.request.Request(endpoint, data=body, headers=headers, method="POST")
+        try:
+            opened = _OPENER.open(request, timeout=min(timeout, budget))
+        except urllib.error.HTTPError as exc:
+            if 300 <= exc.code < 400:
+                raise LinearError("HTTP", "redirect refused") from None
+            headers_out = dict(exc.headers.items()) if exc.headers else {}
+            try:
+                error_body = _read_capped(exc, deadline_at)
+            except (OSError, http.client.HTTPException) as read_exc:
+                raise _transport_failure(read_exc, key) from None
+            return exc.code, headers_out, error_body
+        except (OSError, http.client.HTTPException) as exc:
+            raise _transport_failure(exc, key) from None
+        with opened as response:
+            try:
+                raw = _read_capped(response, deadline_at)
+            except (OSError, http.client.HTTPException) as exc:
+                raise _transport_failure(exc, key) from None
+            return response.status, dict(response.headers.items()), raw
+
+    return send
 
 
 def _parse(raw: bytes) -> object:
@@ -266,9 +331,15 @@ class Client:
         transport: Transport | None = None,
         endpoint: str = ENDPOINT,
         timeout: float = 20.0,
+        deadline: float = DEADLINE_SECONDS,
     ) -> None:
+        """Build a client. ``timeout`` bounds each socket wait; ``deadline`` bounds one whole request.
+
+        Raises ValueError when ``endpoint`` is not https (http is allowed only for localhost).
+        """
+        _check_endpoint(endpoint)
         self._key = key
-        self._transport = transport or _urllib_transport(endpoint, timeout)
+        self._transport = transport or _urllib_transport(endpoint, timeout, deadline, key)
         self.last_rate: dict = {}
 
     def _error(self, code: str, message: str) -> LinearError:
