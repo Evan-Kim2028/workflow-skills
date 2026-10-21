@@ -2728,6 +2728,7 @@ class LinearDoctorTest(unittest.TestCase):
     def _collect(self, env):
         from dash.doctor import collect_problems
 
+        env = dict(env, AGENT_DASH_STATE_DIR=str(self.state))
         with mock.patch.dict(os.environ, env, clear=True), mock.patch(
             "dash.doctor._home_scratch", return_value=str(self.root / "noscratch")
         ):
@@ -2767,7 +2768,7 @@ class LinearDoctorTest(unittest.TestCase):
         self.assertEqual(codes, ["linear-key-missing"])
         self.assertEqual(items[0]["severity"], "warn")
         self.assertFalse(items[0]["safe_auto"])
-        self.assertIn("LINEAR_API_KEY", items[0]["fix_command"])
+        self.assertEqual(items[0]["fix_command"], "python3 agent_dash.py ws linear login")
 
     def test_key_present_raises_no_key_code(self):
         self._link("WS9", synced_at=self.NOW - 30, last_error=None)

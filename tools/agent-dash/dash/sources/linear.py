@@ -1,6 +1,6 @@
 """Linear sync poller: pushes linked workstream bundles to Linear.
 
-Off unless ``LINEAR_API_KEY`` is set and at least one bundle carries a
+Off unless a Linear credential is available (OAuth sign-in or ``LINEAR_API_KEY``) and at least one bundle carries a
 ``linear.json``. The read-only switch (``AGENT_DASH_READONLY=1`` or config
 ``readonly: true``) skips every poll. Each linked bundle is synced by
 ``dash.linear_sync``. A failed bundle backs off on its own clock, so a
@@ -14,7 +14,7 @@ from __future__ import annotations
 import logging
 import time
 
-from dash import linear
+from dash import linear, linear_auth
 from dash.actions import actions_enabled
 from dash.sources import POLL_BUDGET_S
 
@@ -149,7 +149,7 @@ def _poll(cfg: dict) -> None:
     global _rate_limit_until
     if not actions_enabled(cfg):
         return
-    if linear.api_key() is None:
+    if linear_auth.credential() is None:
         return
     bundles = _linked()
     if not bundles:

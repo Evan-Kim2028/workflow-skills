@@ -15,7 +15,7 @@ import io
 import time
 from pathlib import Path
 
-from dash import bundles, errors, linear, project
+from dash import bundles, errors, linear, linear_auth, project
 from dash.linear_client import Client, LinearError
 
 WORKFLOW_STATES = (
@@ -65,11 +65,21 @@ def _error_text(exc: Exception) -> str:
     return _scrub(f"{type(exc).__name__}: {exc}")
 
 
-def _make_client() -> Client:
-    key = linear.api_key()
-    if key is None:
-        raise LinearError("AUTH", f"{linear.ENV_KEY} is not set")
-    return Client(key)
+NOT_SIGNED_IN = "Not signed in to Linear. Run: python3 agent_dash.py ws linear login (or set LINEAR_API_KEY for headless use)."
+
+
+def _make_client():
+    """The client for the current credential: the MCP transport for a sign-in, the GraphQL client for an API key."""
+    cred = linear_auth.credential()
+    if cred is None:
+        raise LinearError("AUTH", NOT_SIGNED_IN)
+    if cred[0] == "mcp":
+        try:
+            from dash.linear_mcp import McpClient
+        except ImportError:
+            raise LinearError("AUTH", "the MCP transport is not available; set LINEAR_API_KEY for headless use") from None
+        return McpClient(cred[1])
+    return Client(cred[1])
 
 
 def _plan(ws: str, root: Path | None) -> dict | None:
@@ -515,11 +525,11 @@ def _ensure_workspace(client: Client, team_key: str, ws: str, root: Path | None)
 def link(ws: str, team_key: str, root: Path | None = None, client=None, now: float | None = None) -> int:
     """Link one bundle to a Linear project and run a full push. Returns the CLI exit code.
 
-    Refuses without ``LINEAR_API_KEY``. Re-linking a linked bundle is a
+    Refuses when not signed in (no OAuth token and no ``LINEAR_API_KEY``). Re-linking a linked bundle is a
     full push that updates in place, so it creates nothing twice.
     """
-    if linear.api_key() is None:
-        print(f"{linear.ENV_KEY} is not set. Export the Linear API key, then run: python3 agent_dash.py ws linear link {ws} --team {team_key}", flush=True)
+    if linear_auth.credential() is None:
+        print(NOT_SIGNED_IN, flush=True)
         return errors.USAGE
     path = bundles.bundle_dir(ws, root)
     if path is None:

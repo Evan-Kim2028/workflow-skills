@@ -22,26 +22,34 @@ Status commands are unchanged when a workstream is linked. `ws task` still write
 
 ## Setup
 
-1. Create a personal API key. In Linear, open Settings, Security & access, Personal API keys, and create one.
-2. Export the key in the shell that runs the dashboard and the CLI:
+Two steps.
+
+1. **Sign in.** Run the command, and the browser opens. Click Authorize. It is the same sign-in Linear's MCP connection uses:
 
    ```bash
-   export LINEAR_API_KEY="<your key>"
+   python3 ~/.claude/tools/agent-dash/agent_dash.py ws linear login
    ```
 
-3. Start the dashboard from that shell, or restart it so it reads the key:
+   The token is stored in `<state_dir>/linear-token.json` with mode 0600. It refreshes on its own, so you sign in once. `ws linear logout` deletes the token.
 
-   ```bash
-   python3 ~/.claude/tools/agent-dash/agent_dash.py restart
-   ```
-
-4. Link the workstream to a Linear team. The team key is the prefix of its issue ids, such as `ENG`:
+2. **Link the workstream to a Linear team.** The team key is the prefix of its issue ids, such as `ENG`:
 
    ```bash
    python3 ~/.claude/tools/agent-dash/agent_dash.py ws linear link WS4 --team ENG
    ```
 
-`link` refuses to run when `LINEAR_API_KEY` is unset. The error names the variable.
+`link` refuses to run until you are signed in. The error names the login command.
+
+### Headless machines
+
+Where a browser cannot open, use a personal API key instead. Create it in Linear under Settings, Security & access, Personal API keys. Export it in the shell that runs the dashboard and the CLI, then restart the dashboard from that shell so it reads the key:
+
+```bash
+export LINEAR_API_KEY="<your key>"
+python3 ~/.claude/tools/agent-dash/agent_dash.py restart
+```
+
+A saved sign-in always wins over the key.
 
 `link` creates these objects in Linear:
 
@@ -140,7 +148,7 @@ Only plan content leaves the machine:
 - task status and approval text;
 - the workstream and project names.
 
-Nothing else is sent. Run labels, token counts, costs, prompts, and transcripts stay local. Paths appear only when the plan lists them as task files. The API key lives only in the environment. It is never written to a file, a log, or an error message.
+Nothing else is sent. Run labels, token counts, costs, prompts, and transcripts stay local. Paths appear only when the plan lists them as task files. The OAuth token and the API key are never written to a log or an error message. The token file is the only place the token is stored, with mode 0600.
 
 The Linear poller is the dashboard's one background network call. It runs only for linked workstreams, and it is off under `AGENT_DASH_READONLY=1`. The `ws linear` commands are explicit CLI actions and still run under that switch.
 
@@ -150,7 +158,7 @@ The dashboard doctor reports three Linear problems. It names each one in the CLI
 
 | Code | Meaning | Page |
 |---|---|---|
-| `linear-key-missing` | A workstream is linked, and `LINEAR_API_KEY` is not set in the dashboard's environment. | [problems/linear-key-missing.md](problems/linear-key-missing.md) |
+| `linear-key-missing` | A workstream is linked, and there is no Linear sign-in and no `LINEAR_API_KEY` in the dashboard's environment. | [problems/linear-key-missing.md](problems/linear-key-missing.md) |
 | `linear-sync-failing` | The last sync failed, and the last good sync is more than 10 minutes old. | [problems/linear-sync-failing.md](problems/linear-sync-failing.md) |
 | `linear-outbox-backlog` | Queued changes are more than 10 minutes old, or there are more than 50 of them. | [problems/linear-outbox-backlog.md](problems/linear-outbox-backlog.md) |
 

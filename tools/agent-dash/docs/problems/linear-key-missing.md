@@ -1,6 +1,6 @@
-# linear-key-missing: a linked workstream has no API key
+# linear-key-missing: a linked workstream has no Linear sign-in
 
-A bundle has `linear.json`, and `LINEAR_API_KEY` is not set in the environment of the dashboard process.
+A bundle has `linear.json`, and the dashboard has no Linear credential: no saved OAuth sign-in, and no `LINEAR_API_KEY` in its environment.
 
 ## Why it matters
 
@@ -8,7 +8,13 @@ The poller cannot sync the workstream. Status changes made in the terminal queue
 
 ## How to fix
 
-Export the key in the shell, then restart the dashboard from that shell so it reads the key:
+Sign in through the browser. The setup is in [linear.md](../linear.md#setup):
+
+```bash
+python3 ~/.claude/tools/agent-dash/agent_dash.py ws linear login
+```
+
+On a headless machine, export a personal API key, then restart the dashboard from that shell:
 
 ```bash
 export LINEAR_API_KEY="<your key>"
