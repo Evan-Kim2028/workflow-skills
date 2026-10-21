@@ -1,0 +1,535 @@
+"""Stdlib client for the Linear GraphQL API, used by the agent-dash task backend.
+
+This is the only module that imports urllib for Linear. Every operation below
+was checked against the public schema (linear/linear master,
+packages/sdk/src/schema.graphql, read 2026-10-21). Line numbers refer to that
+file.
+
+Operations and schema anchors:
+
+- Query.teams L41868 (filter TeamFilter L47608, key L47636); Team.states L47211
+  (WorkflowStateConnection L52915); Team.id L46777
+- Query.team(id) L41821; Query.project(id) L41105
+- Query.issues L40846 (filter IssueFilter L19389: project L19589, updatedAt
+  L19669; NullableProjectFilter L30313, id L30393; EntityIdentifierIDComparator
+  L12372; DateComparator L9930 gt L9938; orderBy PaginationOrderBy L33252
+  updatedAt; PageInfo L33215 hasNextPage L33223 endCursor L33219)
+- Query.issueLabels L40661 (IssueLabelFilter L20544, team L20580,
+  NullableTeamFilter id IDComparator L14071); Query.initiatives L40398
+  (InitiativeFilter L14954, name L15014)
+- Mutation.issueCreate L26411 (IssueCreateInput L19027: id L19075, teamId
+  L19159, projectId L19107, projectMilestoneId L19111, stateId L19147, title
+  L19167, description L19055, labelIds L19083)
+- Mutation.issueUpdate L26903 (id arg; IssueUpdateInput L22793: stateId L22905,
+  title L22921, description L22821, labelIds L22841, projectId L22861,
+  projectMilestoneId L22865)
+- Mutation.workflowStateCreate L28553 (WorkflowStateCreateInput L52924: id,
+  teamId L52948, name L52940, type L52952, color L52928)
+- Mutation.issueLabelCreate L26676 (IssueLabelCreateInput L20494: teamId
+  L20530, name L20518)
+- Mutation.initiativeCreate L25230 (InitiativeCreateInput L14866, name L14898)
+- Mutation.initiativeToProjectCreate L25358 (InitiativeToProjectCreateInput
+  L16133: initiativeId L16141, projectId L16145)
+- Mutation.projectCreate L27366 (ProjectCreateInput L35071: id L35095, name
+  L35119, teamIds L35155, description L35087)
+- Mutation.projectUpdate L27642 (id arg; ProjectUpdateInput L38181: name
+  L38237, description L38205)
+- Mutation.projectMilestoneCreate L27492 (ProjectMilestoneCreateInput L36081:
+  id L36093, projectId L36101, name L36097, sortOrder L36105); Project.
+  projectMilestones L34547
+- Mutation.issueRelationCreate L26733 (IssueRelationCreateInput L21064: issueId
+  L21072, relatedIssueId L21076, type L21080; IssueRelationType enum with
+  blocks, L21126)
+- Mutation.commentCreate L24425 (CommentCreateInput L6070: issueId L6118, body
+  L6074)
+
+Payload fields used: IssuePayload.issue L20981, ProjectPayload.project L36585,
+InitiativePayload.initiative L15884, IssueLabelPayload.issueLabel L20594,
+WorkflowStatePayload.workflowState L53028, ProjectMilestonePayload
+.projectMilestone L36271, and success on each mutation.
+
+Linear reports RATELIMITED as an error object with extensions.code, usually on
+an HTTP 400 response. The key is sent only in the Authorization header and is
+scrubbed from every message this module raises.
+"""
+
+from __future__ import annotations
+
+import json
+import urllib.error
+import urllib.request
+from typing import Callable
+
+ENDPOINT = "https://api.linear.app/graphql"
+PAGE_SIZE = 100
+STATE_PAGE = 250
+MESSAGE_CLIP = 200
+
+Transport = Callable[[bytes, dict], tuple[int, dict, bytes]]
+
+_RATE_HEADERS = {
+    "X-RateLimit-Requests-Remaining": "requests_remaining",
+    "X-RateLimit-Complexity-Remaining": "complexity_remaining",
+    "X-RateLimit-Requests-Reset": "reset",
+}
+
+TEAM_BY_KEY = """
+query TeamByKey($key: String!) {
+  teams(filter: {key: {eq: $key}}, first: 5) {
+    nodes {
+      id
+      key
+      states(first: 250, includeArchived: true) { nodes { id name type } }
+    }
+  }
+}
+"""
+
+TEAM_STATES = """
+query TeamStates($id: String!) {
+  team(id: $id) {
+    states(first: 250, includeArchived: true) { nodes { id name type } }
+  }
+}
+"""
+
+WORKFLOW_STATE_CREATE = """
+mutation WorkflowStateCreate($input: WorkflowStateCreateInput!) {
+  workflowStateCreate(input: $input) { success workflowState { id } }
+}
+"""
+
+LABEL_FIND = """
+query LabelByName($teamId: ID!, $name: String!) {
+  issueLabels(filter: {name: {eq: $name}, team: {id: {eq: $teamId}}}, first: 10) {
+    nodes { id name }
+  }
+}
+"""
+
+LABEL_CREATE = """
+mutation LabelCreate($input: IssueLabelCreateInput!) {
+  issueLabelCreate(input: $input) { success issueLabel { id } }
+}
+"""
+
+INITIATIVE_FIND = """
+query InitiativeByName($name: String!) {
+  initiatives(filter: {name: {eq: $name}}, first: 10) {
+    nodes { id name url }
+  }
+}
+"""
+
+INITIATIVE_CREATE = """
+mutation InitiativeCreate($input: InitiativeCreateInput!) {
+  initiativeCreate(input: $input) { success initiative { id name url } }
+}
+"""
+
+PROJECT_UPDATE = """
+mutation ProjectUpdate($id: String!, $input: ProjectUpdateInput!) {
+  projectUpdate(id: $id, input: $input) { success project { id name url } }
+}
+"""
+
+PROJECT_CREATE = """
+mutation ProjectCreate($input: ProjectCreateInput!) {
+  projectCreate(input: $input) { success project { id name url } }
+}
+"""
+
+INITIATIVE_LINK = """
+mutation InitiativeToProjectCreate($input: InitiativeToProjectCreateInput!) {
+  initiativeToProjectCreate(input: $input) { success }
+}
+"""
+
+PROJECT_MILESTONES = """
+query ProjectMilestones($id: String!) {
+  project(id: $id) {
+    projectMilestones(first: 250, includeArchived: true) { nodes { id name } }
+  }
+}
+"""
+
+MILESTONE_CREATE = """
+mutation ProjectMilestoneCreate($input: ProjectMilestoneCreateInput!) {
+  projectMilestoneCreate(input: $input) { success projectMilestone { id } }
+}
+"""
+
+ISSUE_UPDATE = """
+mutation IssueUpdate($id: String!, $input: IssueUpdateInput!) {
+  issueUpdate(id: $id, input: $input) { success issue { id identifier url } }
+}
+"""
+
+ISSUE_CREATE = """
+mutation IssueCreate($input: IssueCreateInput!) {
+  issueCreate(input: $input) { success issue { id identifier url } }
+}
+"""
+
+RELATION_CREATE = """
+mutation IssueRelationCreate($input: IssueRelationCreateInput!) {
+  issueRelationCreate(input: $input) { success }
+}
+"""
+
+COMMENT_CREATE = """
+mutation CommentCreate($input: CommentCreateInput!) {
+  commentCreate(input: $input) { success }
+}
+"""
+
+PROJECT_ISSUES = """
+query ProjectIssues($filter: IssueFilter, $first: Int, $after: String) {
+  issues(filter: $filter, first: $first, after: $after, orderBy: updatedAt) {
+    nodes {
+      id
+      identifier
+      url
+      updatedAt
+      state { name type }
+    }
+    pageInfo { hasNextPage endCursor }
+  }
+}
+"""
+
+
+class LinearError(Exception):
+    """A Linear call failed.
+
+    ``code`` is one of RATELIMITED, AUTH, NOT_FOUND, HTTP, GRAPHQL or NETWORK.
+    ``message`` is clipped and never contains the API key.
+    """
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(f"{code}: {message}")
+        self.code = code
+        self.message = message
+
+
+def _urllib_transport(endpoint: str, timeout: float) -> Transport:
+    """Build the default transport: a POST over urllib with a fixed timeout."""
+
+    def send(body: bytes, headers: dict) -> tuple[int, dict, bytes]:
+        request = urllib.request.Request(endpoint, data=body, headers=headers, method="POST")
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                return response.status, dict(response.headers.items()), response.read()
+        except urllib.error.HTTPError as exc:
+            headers_out = dict(exc.headers.items()) if exc.headers else {}
+            return exc.code, headers_out, exc.read()
+
+    return send
+
+
+def _clip(text: object, key: str) -> str:
+    """Flatten, redact the key, and cap the length of a message."""
+    flat = str(text).replace("\n", " ").strip()
+    if key:
+        flat = flat.replace(key, "[redacted]")
+    return flat[:MESSAGE_CLIP]
+
+
+def _parse(raw: bytes) -> object:
+    try:
+        return json.loads(raw.decode("utf-8")) if raw else None
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+
+
+def _drop_none(values: dict) -> dict:
+    return {k: v for k, v in values.items() if v is not None}
+
+
+def _issue_ref(issue: dict) -> dict:
+    return {"id": issue["id"], "identifier": issue["identifier"], "url": issue["url"]}
+
+
+def _is_duplicate(exc: LinearError) -> bool:
+    if exc.code != "GRAPHQL":
+        return False
+    text = exc.message.lower()
+    return any(word in text for word in ("already", "duplicate", "unique"))
+
+
+class Client:
+    """Linear GraphQL client. Every ``ensure_*`` method is safe to repeat."""
+
+    def __init__(
+        self,
+        key: str,
+        transport: Transport | None = None,
+        endpoint: str = ENDPOINT,
+        timeout: float = 20.0,
+    ) -> None:
+        self._key = key
+        self._transport = transport or _urllib_transport(endpoint, timeout)
+        self.last_rate: dict = {}
+
+    def _error(self, code: str, message: str) -> LinearError:
+        return LinearError(code, _clip(message, self._key))
+
+    def _record_rate(self, headers: dict) -> None:
+        lowered = {str(name).lower(): value for name, value in (headers or {}).items()}
+        for header, field in _RATE_HEADERS.items():
+            raw = lowered.get(header.lower())
+            if raw is None:
+                continue
+            try:
+                self.last_rate[field] = int(str(raw).strip())
+            except ValueError:
+                continue
+
+    def _graphql_error(self, errors: object) -> LinearError:
+        items = [item for item in errors if isinstance(item, dict)] if isinstance(errors, list) else []
+        first = items[0] if items else {}
+        codes = {
+            str((item.get("extensions") or {}).get("code") or "")
+            for item in items
+            if isinstance(item.get("extensions"), dict)
+        }
+        message = _clip(first.get("message") or "GraphQL error", self._key)
+        if "RATELIMITED" in codes:
+            return LinearError("RATELIMITED", message)
+        if "AUTHENTICATION_ERROR" in codes:
+            return LinearError("AUTH", message)
+        if "not found" in message.lower():
+            return LinearError("NOT_FOUND", message)
+        return LinearError("GRAPHQL", message)
+
+    def query(self, document: str, variables: dict | None = None) -> dict:
+        """POST one GraphQL document and return its ``data`` object.
+
+        Raises LinearError. The key is sent only in the Authorization header.
+        """
+        body = json.dumps({"query": document, "variables": variables or {}}).encode("utf-8")
+        headers = {"Content-Type": "application/json", "Authorization": self._key}
+        try:
+            status, resp_headers, raw = self._transport(body, headers)
+        except OSError as exc:
+            raise LinearError("NETWORK", f"request failed ({type(exc).__name__})") from None
+        self._record_rate(resp_headers)
+        payload = _parse(raw)
+        if status in (401, 403):
+            raise self._error("AUTH", f"HTTP {status}: key rejected")
+        if status == 429:
+            raise self._error("RATELIMITED", "HTTP 429: rate limited")
+        errors = payload.get("errors") if isinstance(payload, dict) else None
+        if errors:
+            raise self._graphql_error(errors)
+        if status >= 400:
+            raise self._error("HTTP", f"HTTP {status}")
+        if not isinstance(payload, dict) or not isinstance(payload.get("data"), dict):
+            raise self._error("GRAPHQL", "response carried no data")
+        return payload["data"]
+
+    def _team_states(self, team_id: str) -> list[dict]:
+        data = self.query(TEAM_STATES, {"id": team_id})
+        return data["team"]["states"]["nodes"]
+
+    def team(self, key: str) -> dict:
+        """Return the team with this key: id, key, and its workflow states."""
+        nodes = self.query(TEAM_BY_KEY, {"key": key})["teams"]["nodes"]
+        if not nodes:
+            raise self._error("NOT_FOUND", f"team {key} not found")
+        node = nodes[0]
+        states = [
+            {"id": state["id"], "name": state["name"], "type": state["type"]}
+            for state in node["states"]["nodes"]
+        ]
+        return {"id": node["id"], "key": node["key"], "states": states}
+
+    def ensure_state(self, team_id: str, state_id: str, name: str, state_type: str, color: str) -> str:
+        """Return the id of a workflow state, creating it with ``state_id`` when missing.
+
+        A state already on the team is matched by id first, then by name.
+        """
+        states = self._team_states(team_id)
+        for state in states:
+            if state["id"] == state_id:
+                return state_id
+        for state in states:
+            if state["name"] == name:
+                return state["id"]
+        data = self.query(
+            WORKFLOW_STATE_CREATE,
+            {
+                "input": {
+                    "id": state_id,
+                    "teamId": team_id,
+                    "name": name,
+                    "type": state_type,
+                    "color": color,
+                }
+            },
+        )
+        return data["workflowStateCreate"]["workflowState"]["id"]
+
+    def ensure_label(self, team_id: str, name: str) -> str:
+        """Return the id of a team label by name, creating it when missing."""
+        data = self.query(LABEL_FIND, {"teamId": team_id, "name": name})
+        for node in data["issueLabels"]["nodes"]:
+            if node["name"] == name:
+                return node["id"]
+        created = self.query(LABEL_CREATE, {"input": {"teamId": team_id, "name": name}})
+        return created["issueLabelCreate"]["issueLabel"]["id"]
+
+    def ensure_initiative(self, name: str) -> dict:
+        """Return the initiative with this exact name, creating it when missing."""
+        data = self.query(INITIATIVE_FIND, {"name": name})
+        for node in data["initiatives"]["nodes"]:
+            if node["name"] == name:
+                return {"id": node["id"], "name": node["name"], "url": node["url"]}
+        created = self.query(INITIATIVE_CREATE, {"input": {"name": name}})
+        initiative = created["initiativeCreate"]["initiative"]
+        return {"id": initiative["id"], "name": initiative["name"], "url": initiative["url"]}
+
+    def ensure_project(self, project_id: str, name: str, team_id: str, description: str) -> dict:
+        """Update the project with this id, or create it with that id when missing."""
+        try:
+            data = self.query(
+                PROJECT_UPDATE,
+                {"id": project_id, "input": {"name": name, "description": description}},
+            )
+            project = data["projectUpdate"]["project"]
+        except LinearError as exc:
+            if exc.code != "NOT_FOUND":
+                raise
+            data = self.query(
+                PROJECT_CREATE,
+                {
+                    "input": {
+                        "id": project_id,
+                        "name": name,
+                        "teamIds": [team_id],
+                        "description": description,
+                    }
+                },
+            )
+            project = data["projectCreate"]["project"]
+        return {"id": project["id"], "url": project["url"], "name": project["name"]}
+
+    def add_project_to_initiative(self, initiative_id: str, project_id: str) -> None:
+        """Link a project to an initiative. An existing link counts as success."""
+        try:
+            self.query(
+                INITIATIVE_LINK,
+                {"input": {"initiativeId": initiative_id, "projectId": project_id}},
+            )
+        except LinearError as exc:
+            if not _is_duplicate(exc):
+                raise
+
+    def ensure_milestone(self, milestone_id: str, project_id: str, name: str, sort_order: float) -> str:
+        """Return the milestone id, creating it with ``milestone_id`` when missing."""
+        data = self.query(PROJECT_MILESTONES, {"id": project_id})
+        for node in data["project"]["projectMilestones"]["nodes"]:
+            if node["id"] == milestone_id:
+                return milestone_id
+        created = self.query(
+            MILESTONE_CREATE,
+            {
+                "input": {
+                    "id": milestone_id,
+                    "projectId": project_id,
+                    "name": name,
+                    "sortOrder": sort_order,
+                }
+            },
+        )
+        return created["projectMilestoneCreate"]["projectMilestone"]["id"]
+
+    def upsert_issue(
+        self,
+        issue_id: str,
+        team_id: str,
+        project_id: str,
+        milestone_id: str | None,
+        title: str,
+        description: str,
+        state_id: str | None = None,
+        label_ids: list[str] | None = None,
+    ) -> dict:
+        """Update the issue with this id, or create it with that id on NOT_FOUND.
+
+        ``state_id`` is sent only on create, so a status set in Linear survives
+        a spec re-push. Returns {'id', 'identifier', 'url'}.
+        """
+        update = _drop_none(
+            {
+                "title": title,
+                "description": description,
+                "projectId": project_id,
+                "projectMilestoneId": milestone_id,
+                "labelIds": label_ids,
+            }
+        )
+        try:
+            data = self.query(ISSUE_UPDATE, {"id": issue_id, "input": update})
+        except LinearError as exc:
+            if exc.code != "NOT_FOUND":
+                raise
+            create = _drop_none(
+                {
+                    "id": issue_id,
+                    "teamId": team_id,
+                    "stateId": state_id,
+                    **update,
+                }
+            )
+            data = self.query(ISSUE_CREATE, {"input": create})
+            return _issue_ref(data["issueCreate"]["issue"])
+        return _issue_ref(data["issueUpdate"]["issue"])
+
+    def set_issue_state(self, issue_id: str, state_id: str) -> None:
+        """Move an issue to a workflow state."""
+        self.query(ISSUE_UPDATE, {"id": issue_id, "input": {"stateId": state_id}})
+
+    def ensure_blocks(self, blocker_issue_id: str, blocked_issue_id: str) -> None:
+        """Record that the blocker blocks the blocked issue. A duplicate counts as success."""
+        try:
+            self.query(
+                RELATION_CREATE,
+                {
+                    "input": {
+                        "issueId": blocker_issue_id,
+                        "relatedIssueId": blocked_issue_id,
+                        "type": "blocks",
+                    }
+                },
+            )
+        except LinearError as exc:
+            if not _is_duplicate(exc):
+                raise
+
+    def comment(self, issue_id: str, body: str) -> None:
+        """Add a comment to an issue."""
+        self.query(COMMENT_CREATE, {"input": {"issueId": issue_id, "body": body}})
+
+    def issues_updated_since(self, project_id: str, since_iso: str | None) -> list[dict]:
+        """Return every issue in the project updated after ``since_iso``, ordered by updatedAt.
+
+        Pages through the whole result, 100 issues per request.
+        """
+        flt: dict = {"project": {"id": {"eq": project_id}}}
+        if since_iso:
+            flt["updatedAt"] = {"gt": since_iso}
+        out: list[dict] = []
+        after: str | None = None
+        while True:
+            conn = self.query(
+                PROJECT_ISSUES,
+                {"filter": flt, "first": PAGE_SIZE, "after": after},
+            )["issues"]
+            out.extend(conn["nodes"])
+            info = conn.get("pageInfo") or {}
+            if not info.get("hasNextPage"):
+                return out
+            after = info.get("endCursor")
+            if not after:
+                raise self._error("GRAPHQL", "pagination cursor missing")
