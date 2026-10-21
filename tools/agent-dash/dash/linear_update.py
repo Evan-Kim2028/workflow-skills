@@ -6,9 +6,10 @@ and records ``last_update_at`` in ``linear.json`` on success. ``due`` is the
 daily rule the poller checks after a successful sync; ``send_daily`` is the
 poller's entry point and reports failures as text instead of raising.
 
-Every post runs under the bundle's sync lock and first lists today's project
-updates: an update from today whose first line is this body's first line is
-taken as already posted, so an ambiguous failure never posts the day twice.
+Every post runs under the bundle's sync lock. The daily path first lists today's
+project updates: one from today whose first line is this body's first line is
+taken as already posted, so an ambiguous failure never posts the day twice. A
+manual post always posts.
 """
 
 from __future__ import annotations
@@ -278,12 +279,14 @@ def _posted_today(client, project_id: str, body: str, now: float) -> str | None:
     return None
 
 
-def _send(ws: str, root: Path | None, client, body: str, health: str, stamp: float) -> tuple[str | None, str | None, bool]:
-    """Post the body unless today already carries it. Returns (update id or None, error text or None, reused).
+def _send(ws: str, root: Path | None, client, body: str, health: str, stamp: float, dedupe: bool) -> tuple[str | None, str | None]:
+    """Post the body and return (update id or None, error text or None).
 
-    The attempt is stamped before the list and the post, so a failed write
-    or a lost response never leads to a second post a minute later; the
-    next try after RETRY_S lists today's updates first. The caller holds the sync lock.
+    ``dedupe`` is the daily path: it lists today's updates first and takes a
+    matching one as posted. A manual post never lists and always posts. The
+    attempt is stamped before the list and the post, so a failed write or a
+    lost response never leads to a second daily post a minute later; the
+    next daily try after RETRY_S lists first. The caller holds the sync lock.
     """
     from dash import linear_sync
 
@@ -293,21 +296,21 @@ def _send(ws: str, root: Path | None, client, body: str, health: str, stamp: flo
     if not isinstance(project_id, str) or not project_id:
         message = f"not linked: run python3 agent_dash.py ws linear link {ws} --team KEY"
         _note(ws, root, {"update_attempt_at": stamp, "last_error": message})
-        return None, message, False
+        return None, message
     try:
         _write_fields(ws, root, {"update_attempt_at": stamp})
         active = client if client is not None else linear_sync._make_client()
-        existing = _posted_today(active, project_id, body, stamp)
+        existing = _posted_today(active, project_id, body, stamp) if dedupe else None
         if existing is not None:
-            update_id, reused = existing, True
+            update_id = existing
         else:
-            update_id, reused = active.post_update(project_id, body, health) or "", False
+            update_id = active.post_update(project_id, body, health) or ""
         _write_fields(ws, root, {"last_update_at": stamp})
     except Exception as exc:
         message = linear_sync._error_text(exc)
         _note(ws, root, {"last_error": message})
-        return None, message, False
-    return update_id, None, reused
+        return None, message
+    return update_id, None
 
 
 def send_daily(ws: str, now: float, root: Path | None = None, client=None) -> str | None:
@@ -325,7 +328,7 @@ def send_daily(ws: str, now: float, root: Path | None = None, client=None) -> st
             if link is not None and not _owed(link, now):
                 return None
             update = build_update(ws, root=root, now=now)
-            _id, error, _reused = _send(ws, root, client, update["body"], update["health"], now)
+            _id, error = _send(ws, root, client, update["body"], update["health"], now, dedupe=True)
             return error
     except Exception as exc:
         return f"{type(exc).__name__}: {exc}"
@@ -335,8 +338,9 @@ def post(ws: str, health: str | None = None, dry_run: bool = False, root: Path |
     """Post the update for one workstream and return the CLI exit code.
 
     ``health`` (on-track, at-risk, off-track or the Linear enum) overrides the
-    plan's value. A dry run prints the body and posts nothing. A post that
-    today's update already covers prints that and posts nothing.
+    plan's value. A dry run prints the body and posts nothing. A manual post
+    always posts, even when today already has an update; only the daily path
+    de-duplicates.
     """
     from dash.linear_sync import _sync_lock
 
@@ -356,12 +360,9 @@ def post(ws: str, health: str | None = None, dry_run: bool = False, root: Path |
         print(update["body"], end="", flush=True)
         return errors.OK
     with _sync_lock(_bundle_path(ws, root)):
-        _id, error, reused = _send(ws, root, client, update["body"], chosen or update["health"], stamp)
+        _id, error = _send(ws, root, client, update["body"], chosen or update["health"], stamp, dedupe=False)
     if error is not None:
         print(f"update not posted for {ws}: {error}", flush=True)
         return errors.UNREACHABLE
-    if reused:
-        print(f"Linear project update for {ws} is already posted for today", flush=True)
-    else:
-        print(f"posted Linear project update for {ws}", flush=True)
+    print(f"posted Linear project update for {ws}", flush=True)
     return errors.OK

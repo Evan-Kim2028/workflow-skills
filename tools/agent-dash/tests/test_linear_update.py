@@ -515,11 +515,20 @@ class StandupSafetyTest(UpdateTest):
         self._write()
         self.assertTrue(linear_update.due("WS9", datetime(2026, 10, 21, 10, 30).timestamp(), root=self.root))
 
-    def test_existing_update_today_with_the_same_purpose_is_reused(self):
+    def test_manual_post_posts_even_when_today_has_a_matching_update(self):
         existing = {"id": "upd-0", "body": self._purpose_line() + "\n\nEarlier text", "createdAt": _iso(NOW - 600)}
         client = RecentUpdatesClient(existing=[existing])
-        rc, _out = self._post(client)
+        rc, out = self._post(client)
         self.assertEqual(rc, errors.OK)
+        self.assertEqual(len(client.calls), 1)
+        self.assertEqual(client.listed, [])
+        self.assertIn("posted Linear project update for WS9", out)
+        self.assertEqual(self._link()["last_update_at"], NOW)
+
+    def test_daily_post_dedupes_against_a_matching_update_from_today(self):
+        existing = {"id": "upd-0", "body": self._purpose_line() + "\n\nEarlier text", "createdAt": _iso(NOW - 600)}
+        client = RecentUpdatesClient(existing=[existing])
+        self.assertIsNone(linear_update.send_daily("WS9", NOW, self.root, client))
         self.assertEqual(client.calls, [])
         self.assertEqual(self._link()["last_update_at"], NOW)
 
