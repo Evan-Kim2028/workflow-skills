@@ -385,6 +385,8 @@ def main(argv: list[str] | None = None) -> int:
             return guard
     if cmd == "run":
         return cmd_run(args[1:])
+    if cmd == "serve":
+        return cmd_serve(args[1:])
     if cmd == "stop":
         return cmd_stop(args[1:])
     if cmd == "restart":
@@ -472,21 +474,56 @@ def cmd_run(argv: list[str] | None = None) -> int:
         os.nice(10)
     except OSError:
         pass
-    child = os.fork()
-    if child > 0:
-        return _wait_for_child(child)
-    os.setsid()
-    try:
-        _redirect_stdio()
-        logging.basicConfig(
-            level=logging.INFO,
-            format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    child = _spawn_child()
+    return _wait_for_child(child.pid)
+
+
+def _spawn_child() -> subprocess.Popen:
+    """Start the dashboard server as ``agent_dash.py serve`` in its own session.
+
+    A fresh interpreter, not ``os.fork()``: this process has run the
+    health probes, whose proxy lookup starts CoreFoundation threads on
+    macOS. A child forked from it can die with SIGSEGV before exec, or
+    abort on its first CoreFoundation call. stdout and stderr go to the log.
+    """
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    env = dict(os.environ, AGENT_DASH_PORT=str(_port()))
+    with open(LOGFILE, "ab") as log:
+        return subprocess.Popen(
+            [sys.executable, str(Path(__file__).resolve()), "serve"],
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+            close_fds=True,
         )
+
+
+def cmd_serve(argv: list[str] | None = None) -> int:
+    """Run the dashboard server in this process; the child ``cmd_run`` spawns.
+
+    Logs a start line, then either a normal return or the exception (any
+    ``BaseException``, ``SystemExit`` included), so a failed start always
+    leaves a trace in agent-dash.log. Returns the child's exit status.
+    """
+    if argv:
+        print(USAGE, end="", file=sys.stderr)
+        return 2
+    bind_state()
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
+    status = 1
+    try:
+        logging.info("agent-dash child %d starting _serve", os.getpid())
         _serve()
-    except Exception:
+        logging.info("agent-dash child %d _serve returned", os.getpid())
+        status = 0
+    except BaseException:
         logging.exception("agent-dash exited")
-        os._exit(1)
-    os._exit(0)
+    return status
 
 
 def cmd_stop(argv: list[str] | None = None) -> int:
@@ -1804,7 +1841,7 @@ def _listener_pid(port: int) -> int | None:
 
 
 def _serves_dashboard(pid: int) -> bool:
-    """True when ``pid``'s command line is the dashboard server process."""
+    """True when ``pid``'s command line is the dashboard server (``run`` or the spawned ``serve``)."""
     try:
         proc = subprocess.run(
             ["ps", "-p", str(pid), "-o", "command="],
@@ -1816,7 +1853,7 @@ def _serves_dashboard(pid: int) -> bool:
     except (OSError, subprocess.TimeoutExpired):
         return False
     text = proc.stdout or ""
-    return "agent_dash.py" in text and re.search(r"\brun\b", text) is not None
+    return "agent_dash.py" in text and re.search(r"\b(run|serve)\b", text) is not None
 
 
 def _dashboard_on_port() -> tuple[int | None, dict | None]:
@@ -1961,7 +1998,7 @@ def _serve() -> None:
 
 
 def _wait_for_child(child: int) -> int:
-    """Wait for the forked dashboard ``child`` to record its pidfile, or to exit.
+    """Wait for the spawned dashboard ``child`` to record its pidfile, or to exit.
 
     The child writes the pidfile only after its store, sources and server
     are up, which can take longer than a few seconds on a loaded machine.
@@ -1976,26 +2013,23 @@ def _wait_for_child(child: int) -> int:
             _print_running(child)
             return 0
         try:
-            reaped, _status = os.waitpid(child, os.WNOHANG)
+            reaped, status = os.waitpid(child, os.WNOHANG)
         except ChildProcessError:
-            reaped = child
+            print(f"failed to start: the dashboard process was already reaped (log: {LOGFILE})", file=sys.stderr)
+            return 1
         if reaped == child:
-            print(f"failed to start: the dashboard process exited (log: {LOGFILE})", file=sys.stderr)
+            print(f"failed to start: the dashboard process exited ({_how_ended(status)}; log: {LOGFILE})", file=sys.stderr)
             return 1
         time.sleep(0.05)
     print(f"failed to start: no pidfile after {CHILD_START_S:g} s (log: {LOGFILE})", file=sys.stderr)
     return 1
 
 
-def _redirect_stdio() -> None:
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
-    log = os.open(LOGFILE, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
-    devnull = os.open(os.devnull, os.O_RDONLY)
-    os.dup2(devnull, 0)
-    os.dup2(log, 1)
-    os.dup2(log, 2)
-    os.close(devnull)
-    os.close(log)
+def _how_ended(status: int) -> str:
+    """Words for a ``waitpid`` status: the exit code or the signal."""
+    if os.WIFSIGNALED(status):
+        return f"signal {signal.Signals(os.WTERMSIG(status)).name}"
+    return f"exit code {os.WEXITSTATUS(status)}"
 
 
 def _print_running(pid: int, build: dict | None = None) -> None:
