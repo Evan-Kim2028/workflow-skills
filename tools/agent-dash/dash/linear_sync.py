@@ -385,20 +385,27 @@ def _flush(client: Client, ws: str, root: Path | None, record: dict, ws_data: di
     newest row per key wins. Drift keys (local status differs from
     ``synced_status``, e.g. a hand edit of plan.json or a write from an older
     CLI) are sent the same way and need no row. Keys with no mapped issue are
-    skipped. Each sent key records its status as ``synced_status``. The rows
-    read are drained by id, so rows appended meanwhile stay; a failure leaves
-    the outbox untouched and the next cycle resends (state sets are idempotent).
+    skipped. Each sent key records its status as ``synced_status``.
+
+    Comment rows (``kind == "comment"``) are not part of the newest-per-key
+    rule and never touch status or drift: every one is posted, in ts order,
+    and drained by id as soon as it is posted or skipped, so a later failure
+    never reposts it. The status rows read are drained by id at the end. Rows
+    appended meanwhile stay; a failure leaves the status rows untouched and
+    the next cycle resends (state sets are idempotent).
     """
     rows = linear.read_outbox(ws, root)
     plan = _plan(ws, root)
     if plan is None:
         raise RuntimeError(f"plan.json for {ws} is unreadable")
     items = _approval_items(ws, root)
+    status_rows = [row for row in rows if row["kind"] != "comment"]
+    comment_rows = sorted((row for row in rows if row["kind"] == "comment"), key=lambda row: row["ts"])
     newest: dict = {}
-    for row in rows:
+    for row in status_rows:
         newest[(row["kind"], row["key"])] = row
     order = list(dict.fromkeys(list(newest) + sorted(_drift_keys(record, plan, items))))
-    if not order:
+    if not order and not comment_rows:
         return 0
     tasks = record.get("tasks") or {}
     approvals = record.get("approvals") or {}
@@ -435,8 +442,24 @@ def _flush(client: Client, ws: str, root: Path | None, record: dict, ws_data: di
                 _detach(record, kind, key)
         ref["synced_status"] = status
         sent += 1
-    if rows:
-        linear.drain_outbox(ws, {row["id"] for row in rows}, root)
+    done: set[str] = set()
+    try:
+        for row in comment_rows:
+            ref = tasks.get(row["key"])
+            if ref is not None and row["key"] in index:
+                try:
+                    client.comment(ref["id"], row["body"])
+                except LinearError as exc:
+                    if exc.code != "NOT_FOUND" or client.issue_exists(ref["id"]):
+                        raise
+                    _detach(record, "task", row["key"])
+                sent += 1
+            done.add(row["id"])
+    finally:
+        if done:
+            linear.drain_outbox(ws, done, root)
+    if status_rows:
+        linear.drain_outbox(ws, {row["id"] for row in status_rows}, root)
     return sent
 
 

@@ -1021,5 +1021,72 @@ class DriftTest(LinearSyncTest):
         return self._link_record()["approvals"][item_id]["identifier"]
 
 
+class AgentCommentTest(LinearSyncTest):
+    """Agent comments: every row posts in ts order, and none touches status or drift."""
+
+    def setUp(self):
+        super().setUp()
+        self._link()
+        self.issue = self._link_record()["tasks"]["WS9.1"]["id"]
+
+    def _comments(self) -> list[tuple]:
+        return [call for call in self.fake.calls_named("comment") if call[1] == self.issue]
+
+    def test_two_comments_on_one_task_both_post_in_order(self):
+        linear.enqueue_comment("WS9", "WS9.1", "second", root=self.root, now=self.now + 2)
+        linear.enqueue_comment("WS9", "WS9.1", "first", root=self.root, now=self.now + 1)
+        self.fake.calls.clear()
+        result = self._sync()
+        self.assertIsNone(result["error"])
+        self.assertEqual(self._comments(), [("comment", self.issue, "first"), ("comment", self.issue, "second")])
+        self.assertEqual(linear.read_outbox("WS9", self.root), [])
+
+    def test_comments_do_not_change_status_or_drift(self):
+        before = dict(self._link_record()["tasks"]["WS9.1"])
+        plan_before = self._plan()
+        linear.enqueue_comment("WS9", "WS9.1", "verdict PASS", root=self.root, now=self.now + 1)
+        self.fake.calls.clear()
+        self._sync()
+        self.assertEqual(self.fake.calls_named("state"), [])
+        self.assertEqual(self._plan(), plan_before)
+        after = self._link_record()["tasks"]["WS9.1"]
+        self.assertEqual(after.get("synced_status"), before.get("synced_status"))
+        self.assertEqual(self._history(), [])
+
+    def test_comment_posts_alongside_a_status_change(self):
+        with self._quiet():
+            bundles.set_task("WS9", "WS9.1", "pr", None, None, root=self.root)
+        linear.enqueue_comment("WS9", "WS9.1", "PR up", root=self.root, now=self.now + 5)
+        self.fake.calls.clear()
+        self._sync(self.now + 6)
+        self.assertEqual(self.fake.calls_named("state"), [("state", self.issue, "s-pr")])
+        self.assertEqual(self._comments(), [("comment", self.issue, "PR up")])
+        self.assertEqual(linear.read_outbox("WS9", self.root), [])
+
+    def test_comment_on_unmapped_task_is_drained_without_a_post(self):
+        linear.enqueue_comment("WS9", "WS9.3", "no issue yet", root=self.root, now=self.now + 1)
+        self.fake.calls.clear()
+        self._sync()
+        self.assertEqual(self._comments(), [])
+        self.assertEqual(linear.read_outbox("WS9", self.root), [])
+
+    def test_rows_appended_during_the_flush_stay_queued(self):
+        fake = self.fake
+        linear.enqueue_comment("WS9", "WS9.1", "first", root=self.root, now=self.now + 1)
+        original = fake.comment
+        late = {"done": False}
+
+        def comment(issue_id, body):
+            original(issue_id, body)
+            if not late["done"]:
+                late["done"] = True
+                linear.enqueue_comment("WS9", "WS9.2", "late", root=self.root, now=self.now + 9)
+
+        fake.comment = comment
+        self._sync()
+        self.assertEqual([row["body"] for row in linear.read_outbox("WS9", self.root)], ["late"])
+        self.assertEqual(self._comments(), [("comment", self.issue, "first")])
+
+
 if __name__ == "__main__":
     unittest.main()

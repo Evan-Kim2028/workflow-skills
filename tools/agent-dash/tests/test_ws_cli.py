@@ -960,5 +960,52 @@ class WsLinearCliTest(unittest.TestCase):
         self.assertIn("Fixes ENG-1, ENG-2", linked)
 
 
+class WsLinearCommentCliTest(unittest.TestCase):
+    """``ws linear comment <WS> <TASK-ID> <TEXT...>``: queue an agent comment for the next sync."""
+
+    setUp = WsLinearCliTest.setUp
+    tearDown = WsLinearCliTest.tearDown
+    _link_file = WsLinearCliTest._link_file
+    _outbox = WsLinearCliTest._outbox
+    _run = WsLinearCliTest._run
+
+    def test_comment_queues_when_linked(self):
+        self._link_file()
+        rc, out = self._run(["linear", "comment", "WS9", "WS9.1", "verdict", "PASS", "PR", "#7"])
+        self.assertEqual(rc, errors.OK)
+        self.assertEqual(out, "queued comment for WS9.1; it posts on the next sync\n")
+        self.assertEqual([(row["kind"], row["key"], row["body"]) for row in self._outbox()], [("comment", "WS9.1", "verdict PASS PR #7")])
+
+    def test_refuses_when_unlinked(self):
+        rc, out = self._run(["linear", "comment", "WS9", "WS9.1", "hello"])
+        self.assertEqual(rc, errors.USAGE)
+        self.assertIn("not linked", out)
+        self.assertEqual(self._outbox(), [])
+
+    def test_refuses_unknown_task(self):
+        self._link_file()
+        rc, out = self._run(["linear", "comment", "WS9", "WS9.99", "hello"])
+        self.assertEqual(rc, errors.NOT_FOUND)
+        self.assertIn("WS9.99", out)
+        self.assertEqual(self._outbox(), [])
+
+    def test_refuses_empty_and_too_long_text(self):
+        self._link_file()
+        self.assertEqual(self._run(["linear", "comment", "WS9", "WS9.1"])[0], errors.USAGE)
+        rc, out = self._run(["linear", "comment", "WS9", "WS9.1", "   "])
+        self.assertEqual(rc, errors.USAGE)
+        self.assertIn("empty", out)
+        rc, out = self._run(["linear", "comment", "WS9", "WS9.1", "x" * 2001])
+        self.assertEqual(rc, errors.USAGE)
+        self.assertIn("2001", out)
+        self.assertEqual(self._outbox(), [])
+
+    def test_refuses_unknown_bundle_and_team_flag(self):
+        self._link_file()
+        self.assertEqual(self._run(["linear", "comment", "NOPE", "WS9.1", "hi"])[0], errors.NOT_FOUND)
+        self.assertEqual(self._run(["linear", "comment", "WS9", "WS9.1", "hi", "--team", "ENG"])[0], errors.USAGE)
+        self.assertEqual(self._outbox(), [])
+
+
 if __name__ == "__main__":
     unittest.main()

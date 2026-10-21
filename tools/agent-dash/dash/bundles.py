@@ -76,6 +76,7 @@ WS_USAGE = """agent-dash workstream bundles
   python3 agent_dash.py ws deferred [<ID>] [--json]
   python3 agent_dash.py ws layout <ID> [--json]
   python3 agent_dash.py ws linear <link|sync|status|unlink> <ID> [--team KEY] [--json]
+  python3 agent_dash.py ws linear comment <ID> <TASK-ID> <TEXT...>
   python3 agent_dash.py ws linear login
   python3 agent_dash.py ws linear logout
 
@@ -2182,7 +2183,8 @@ def print_deferred(ws: str | None, json_mode: bool = False) -> int:
     return 0
 
 
-LINEAR_SUBCOMMANDS = ("link", "sync", "status", "unlink")
+LINEAR_SUBCOMMANDS = ("link", "sync", "status", "unlink", "comment")
+LINEAR_COMMENT_LIMIT_HINT = "Run: python3 agent_dash.py ws linear comment <ID> <TASK-ID> <TEXT...>"
 
 
 def _cmd_linear_auth(args: list[str], team: str | None) -> int:
@@ -2196,6 +2198,35 @@ def _cmd_linear_auth(args: list[str], team: str | None) -> int:
     if sub == "logout":
         return linear_auth.logout()
     return linear_auth.login()
+
+
+def _cmd_linear_comment(args: list[str]) -> int:
+    """``ws linear comment <WS> <TASK-ID> <TEXT...>``: queue one comment on the task's Linear issue. ``args`` starts with ``comment``."""
+    from dash import linear
+
+    if len(args) < 4:
+        print(f"ws linear comment needs a workstream id, a task id and text. {LINEAR_COMMENT_LIMIT_HINT}", flush=True)
+        return errors.USAGE
+    ws, task_id, text = args[1], args[2], " ".join(args[3:])
+    path = bundle_dir(ws)
+    if path is None:
+        print(errors.bundle_not_found(ws), flush=True)
+        return errors.NOT_FOUND
+    if not linear.is_linked(ws):
+        print(f"{ws} is not linked to Linear. Run: python3 agent_dash.py ws linear link {ws} --team ENG", flush=True)
+        return errors.USAGE
+    plan = _read_json(path / "plan.json")
+    known = _dag_task_ids(plan) if isinstance(plan, dict) else set()
+    if task_id not in known:
+        print(errors.task_not_found(ws, task_id, len(known)), flush=True)
+        return errors.NOT_FOUND
+    try:
+        linear.enqueue_comment(ws, task_id, text)
+    except ValueError as exc:
+        print(f"comment not queued: {exc}. {LINEAR_COMMENT_LIMIT_HINT}", flush=True)
+        return errors.USAGE
+    print(f"queued comment for {task_id}; it posts on the next sync", flush=True)
+    return errors.OK
 
 
 def _cmd_linear(rest: list[str], json_mode: bool = False) -> int:
@@ -2215,6 +2246,11 @@ def _cmd_linear(rest: list[str], json_mode: bool = False) -> int:
     if args[0] in ("login", "logout"):
         return _cmd_linear_auth(args, team)
     sub = args[0]
+    if sub == "comment":
+        if team is not None:
+            print(f"--team does not apply to comment. {LINEAR_COMMENT_LIMIT_HINT}", flush=True)
+            return errors.USAGE
+        return _cmd_linear_comment(args)
     if sub not in LINEAR_SUBCOMMANDS:
         print(f"unknown linear subcommand {sub!r}. Use one of: {', '.join(LINEAR_SUBCOMMANDS)}. Run: python3 agent_dash.py ws linear status <ID>", flush=True)
         return errors.USAGE
