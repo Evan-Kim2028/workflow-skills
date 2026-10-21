@@ -77,6 +77,7 @@ class FakeLinear:
         }
         self.issues: dict[str, dict] = {}
         self.fail_pull: Exception | None = None
+        self.on_state = None
 
     def _tick(self) -> str:
         self.clock += 1
@@ -168,6 +169,9 @@ class FakeLinear:
         issue = self.issues[issue_id]
         issue["state_id"] = state_id
         issue["updatedAt"] = self._tick()
+        hook, self.on_state = self.on_state, None
+        if hook is not None:
+            hook(issue_id)
 
     def ensure_blocks(self, blocker_issue_id, blocked_issue_id):
         self.calls.append(("blocks", blocker_issue_id, blocked_issue_id))
@@ -361,6 +365,71 @@ class SyncTest(LinearSyncTest):
         self.assertEqual(last["by"], "linear")
         self.assertEqual(last["task"], "WS9.2")
         self.assertEqual(last["to"], "done")
+        self.assertEqual(linear.read_outbox("WS9", self.root), [])
+
+    def test_local_write_during_flush_is_not_lost(self):
+        with self._quiet():
+            bundles.set_task("WS9", "WS9.3", "wip", None, None, root=self.root)
+
+        def concurrent(_issue_id):
+            with self._quiet():
+                bundles.set_task("WS9", "WS9.3", "pr", None, None, root=self.root)
+
+        self.fake.on_state = concurrent
+        result = self._sync(self.now + 1)
+        self.assertIsNone(result["error"])
+        self.assertEqual(self._task("WS9.3")["status"], "pr")
+        self.assertEqual(len(linear.read_outbox("WS9", self.root)), 1)
+
+        result = self._sync(self.now + 2)
+        self.assertIsNone(result["error"])
+        issue = self.fake.issues[linear.stable_id("task", "WS9", "WS9.3")]
+        self.assertEqual(issue["state_id"], "s-pr")
+        self.assertEqual(self._task("WS9.3")["status"], "pr")
+        self.assertEqual(linear.read_outbox("WS9", self.root), [])
+
+    def test_flush_reads_plan_after_outbox_so_a_racing_write_is_sent(self):
+        with self._quiet():
+            bundles.set_task("WS9", "WS9.3", "wip", None, None, root=self.root)
+        real_plan = linear_sync._plan
+        fired = []
+
+        def racing_plan(ws, root):
+            if sys._getframe(1).f_code.co_name == "_flush" and not fired:
+                fired.append(True)
+                with self._quiet():
+                    bundles.set_task("WS9", "WS9.3", "pr", None, None, root=self.root)
+            return real_plan(ws, root)
+
+        linear_sync._plan = racing_plan
+        try:
+            result = self._sync(self.now + 1)
+        finally:
+            linear_sync._plan = real_plan
+        self.assertIsNone(result["error"])
+        self.assertEqual(fired, [True])
+        issue = self.fake.issues[linear.stable_id("task", "WS9", "WS9.3")]
+        self.assertEqual(issue["state_id"], "s-pr")
+        self.assertEqual(len(linear.read_outbox("WS9", self.root)), 1)
+
+    def test_pull_does_not_overwrite_pending_local_change(self):
+        cursor_before = self._link_record()["cursor"]
+        with self._quiet():
+            bundles.set_task("WS9", "WS9.2", "done", None, None, root=self.root)
+        self.fake.linear_move(self._ident("WS9.2"), "In Review")
+        record = self._link_record()
+        with self._quiet():
+            mapped, applied = linear_sync._pull(self.fake, "WS9", self.root, record)
+        self.assertEqual((mapped, applied), (1, 0))
+        self.assertEqual(self._task("WS9.2")["status"], "done")
+        self.assertEqual(len(linear.read_outbox("WS9", self.root)), 1)
+        self.assertEqual(record["cursor"], cursor_before)
+
+        result = self._sync(self.now + 5)
+        self.assertIsNone(result["error"])
+        issue = self.fake.issues[linear.stable_id("task", "WS9", "WS9.2")]
+        self.assertEqual(issue["state_id"], "s-done")
+        self.assertEqual(self._task("WS9.2")["status"], "done")
         self.assertEqual(linear.read_outbox("WS9", self.root), [])
 
     def test_pull_of_unchanged_status_is_a_noop(self):

@@ -237,13 +237,15 @@ def _push(client: Client, ws: str, root: Path | None, record: dict, ws_data: dic
     return count
 
 
-def _flush(client: Client, ws: str, root: Path | None, record: dict, ws_data: dict, plan: dict) -> int:
+def _flush(client: Client, ws: str, root: Path | None, record: dict, ws_data: dict) -> int:
     """Send the current local status of every outbox key, then drain the outbox.
 
-    Rows are pointers: the value is read from the local files now. The newest
-    row per key wins. Keys with no mapped issue are skipped. The outbox is
-    drained up to the newest row read; a failure leaves it untouched and the
-    next cycle resends (state sets are idempotent).
+    Rows are read first and the plan and approvals are read after them: a
+    row is written only after its plan write, so every row read is visible
+    in the later reads and the value sent is never older than the row. The
+    newest row per key wins. Keys with no mapped issue are skipped. The
+    outbox is drained up to the newest row read; a failure leaves it
+    untouched and the next cycle resends (state sets are idempotent).
     """
     rows = linear.read_outbox(ws, root)
     if not rows:
@@ -252,6 +254,9 @@ def _flush(client: Client, ws: str, root: Path | None, record: dict, ws_data: di
     for row in rows:
         newest[(row["kind"], row["key"])] = row
     high = max(row["ts"] for row in rows)
+    plan = _plan(ws, root)
+    if plan is None:
+        raise RuntimeError(f"plan.json for {ws} is unreadable")
     tasks = record.get("tasks") or {}
     approvals = record.get("approvals") or {}
     index = {task["id"]: task for _group, task in _dag_entries(plan)}
@@ -323,9 +328,13 @@ def _apply_approval(ws: str, root: Path | None, key: str, state: dict) -> int:
 def _pull(client: Client, ws: str, root: Path | None, record: dict) -> tuple[int, int]:
     """Read issues updated since the cursor and apply changed statuses locally.
 
-    Returns (mapped issues read, local changes applied). The cursor moves to
-    the newest updatedAt seen, mapped or not.
+    A key with a local write still in the outbox is never applied from
+    Linear: the local change is newer and reaches Linear on the next flush.
+    Such an issue counts as mapped, and the cursor stops before it so the
+    next cycle reads it again. Returns (mapped issues read, local changes applied).
+    The cursor otherwise moves to the newest updatedAt seen, mapped or not.
     """
+    pending = {(row["kind"], row["key"]) for row in linear.read_outbox(ws, root)}
     reverse: dict[str, tuple[str, str]] = {}
     for key, ref in (record.get("tasks") or {}).items():
         reverse[ref["id"]] = ("task", key)
@@ -334,11 +343,16 @@ def _pull(client: Client, ws: str, root: Path | None, record: dict) -> tuple[int
     cursor = record.get("cursor")
     issues = client.issues_updated_since(record["project"]["id"], cursor)
     mapped = applied = 0
+    held = False
     for issue in issues:
         updated = issue.get("updatedAt")
-        if isinstance(updated, str) and (cursor is None or updated > cursor):
-            cursor = updated
         hit = reverse.get(issue.get("id"))
+        if hit is not None and hit in pending:
+            mapped += 1
+            held = True
+            continue
+        if not held and isinstance(updated, str) and (cursor is None or updated > cursor):
+            cursor = updated
         if hit is None:
             continue
         mapped += 1
@@ -360,7 +374,7 @@ def _cycle(ws: str, root: Path | None, client: Client, record: dict, now: float,
     if plan is None:
         raise RuntimeError(f"plan.json for {ws} is unreadable")
     pushed = _push(client, ws, root, record, ws_data, plan, now, force_push)
-    flushed = _flush(client, ws, root, record, ws_data, plan)
+    flushed = _flush(client, ws, root, record, ws_data)
     pulled, applied = _pull(client, ws, root, record)
     return {"pushed": pushed, "flushed": flushed, "pulled": pulled, "applied": applied}
 
