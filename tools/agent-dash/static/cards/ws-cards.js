@@ -334,4 +334,9 @@
     get: function () { return planPrompt; },
     set: function (v) { planPrompt = v; }
   });
+  Object.defineProperty(global, "planLinear", {
+    configurable: true,
+    get: function () { return planLinear; },
+    set: function (v) { planLinear = v; }
+  });
 })(window);
