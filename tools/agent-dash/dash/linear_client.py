@@ -61,6 +61,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from datetime import UTC, datetime
 from typing import Callable
 
 ENDPOINT = "https://api.linear.app/graphql"
@@ -208,6 +209,14 @@ query IssueRelations($id: String!) {
 PROJECT_UPDATE_CREATE = """
 mutation ProjectUpdateCreate($input: ProjectUpdateCreateInput!) {
   projectUpdateCreate(input: $input) { success projectUpdate { id } }
+}
+"""
+
+PROJECT_UPDATES = """
+query ProjectUpdates($id: String!, $first: Int!) {
+  project(id: $id) {
+    projectUpdates(first: $first, orderBy: createdAt) { nodes { id body createdAt } }
+  }
 }
 """
 
@@ -389,6 +398,24 @@ def _parse(raw: bytes) -> object:
 
 def _drop_none(values: dict) -> dict:
     return {k: v for k, v in values.items() if v is not None}
+
+
+def _instant(value: object) -> datetime | None:
+    """An ISO-8601 string as an aware datetime (naive reads as UTC), or None when it cannot be read."""
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
+
+
+def created_since(row: dict, since_iso: str) -> bool:
+    """True when the row's createdAt is at or after since_iso. A row whose createdAt cannot be read is kept."""
+    created = _instant(row.get("createdAt"))
+    floor = _instant(since_iso)
+    return created is None or floor is None or created >= floor
 
 
 def _issue_ref(issue: dict) -> dict:
@@ -715,6 +742,12 @@ class Client:
             raise LinearError("GRAPHQL", "project update was not saved")
         update = payload.get("projectUpdate") or {}
         return update.get("id")
+
+    def recent_updates(self, project_id: str, since_iso: str) -> list[dict]:
+        """The project's status updates created at or after ``since_iso``, newest first (one page of 50)."""
+        project = self.query(PROJECT_UPDATES, {"id": project_id, "first": 50}).get("project") or {}
+        nodes = ((project.get("projectUpdates") or {}).get("nodes")) or []
+        return [row for row in nodes if isinstance(row, dict) and created_since(row, since_iso)]
 
     def issues_updated_since(self, project_id: str, since_iso: str | None) -> list[dict]:
         """Return every issue in the project updated after ``since_iso``, ordered by updatedAt.

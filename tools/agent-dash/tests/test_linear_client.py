@@ -813,5 +813,21 @@ class LabelCacheTests(unittest.TestCase):
         self.assertEqual(len(fake.calls), 5)
 
 
+
+
+class RecentUpdatesGraphqlTest(unittest.TestCase):
+    def test_lists_project_updates_created_since_the_bound(self):
+        data = {"project": {"projectUpdates": {"nodes": [
+            {"id": "u1", "body": "today", "createdAt": "2026-10-21T09:00:00.000Z"},
+            {"id": "u0", "body": "old", "createdAt": "2026-10-19T09:00:00.000Z"},
+        ]}}}
+        transport = FakeTransport([_ok(data)])
+        client = lc.Client(KEY, transport=transport)
+        out = client.recent_updates("11111111-2222-3333-4444-555555555555", "2026-10-21T00:00:00+00:00")
+        self.assertEqual([row["id"] for row in out], ["u1"])
+        sent = transport.calls[0]["body"]
+        self.assertEqual(sent["variables"]["id"], "11111111-2222-3333-4444-555555555555")
+        self.assertIn("projectUpdates", sent["query"])
+
 if __name__ == "__main__":
     unittest.main()

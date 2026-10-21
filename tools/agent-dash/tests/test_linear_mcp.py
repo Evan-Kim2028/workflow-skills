@@ -803,5 +803,24 @@ class McpMetaPushTest(McpTestBase):
             self.assertEqual(self.fake.projects[project["id"]]["status"], "Completed")
 
 
+
+class RecentUpdatesMcpTest(unittest.TestCase):
+    def test_get_status_updates_is_asked_for_project_updates_since_the_bound(self):
+        from unittest import mock
+
+        client = McpClient("tok", transport=lambda *_a, **_k: (200, {}, b""))
+        rows = [
+            {"id": "u1", "body": "today", "createdAt": "2026-10-21T09:00:00.000Z"},
+            {"id": "u0", "body": "old", "createdAt": "2026-10-19T09:00:00.000Z"},
+        ]
+        with mock.patch.object(client, "_tool", return_value={"statusUpdates": rows, "hasNextPage": False}) as tool:
+            out = client.recent_updates("11111111-2222-3333-4444-555555555555", "2026-10-21T00:00:00+00:00")
+        name, args = tool.call_args.args
+        self.assertEqual(name, "get_status_updates")
+        self.assertEqual(args["type"], "project")
+        self.assertEqual(args["project"], "11111111-2222-3333-4444-555555555555")
+        self.assertEqual(args["createdAt"], "2026-10-21T00:00:00+00:00")
+        self.assertEqual([row["id"] for row in out], ["u1"])
+
 if __name__ == "__main__":
     unittest.main()
