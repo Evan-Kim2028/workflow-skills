@@ -10,10 +10,12 @@ import os
 os.environ["AGENT_DASH_IGNORE_LOCAL"] = "1"
 os.environ.setdefault("AGENT_DASH_WORKSTREAMS", os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "fixtures", "bundles"))
 
+import contextlib
 import http.server
 import io
 import json
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -545,6 +547,78 @@ class StateDirGuardTest(ControlMixin, unittest.TestCase):
                     code = main(["stop"])
                 self.assertEqual(code, 0)
                 self.assertTrue(self.wait_gone(proc.pid))
+
+
+class WaitForChildTest(unittest.TestCase):
+    """``_wait_for_child`` against real forked children that write, skip or never write the pidfile."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.pidfile = Path(self.tmp.name) / "agent-dash.pid"
+        self.children: list[int] = []
+        patches = [
+            mock.patch.object(agent_dash, "PIDFILE", self.pidfile),
+            mock.patch.object(agent_dash, "LOGFILE", Path(self.tmp.name) / "agent-dash.log"),
+        ]
+        for patch in patches:
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def tearDown(self):
+        for pid in self.children:
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(pid, signal.SIGKILL)
+            with contextlib.suppress(ChildProcessError, OSError):
+                os.waitpid(pid, 0)
+        self.tmp.cleanup()
+
+    def _fork(self, delay_s: float, write_pidfile: bool = True, exit_code: int | None = None) -> int:
+        pid = os.fork()
+        if pid == 0:
+            try:
+                if exit_code is not None:
+                    os._exit(exit_code)
+                time.sleep(delay_s)
+                if write_pidfile:
+                    self.pidfile.write_text(f"{os.getpid()}\n", encoding="utf-8")
+                time.sleep(60)
+            finally:
+                os._exit(0)
+        self.children.append(pid)
+        return pid
+
+    def _wait(self, child: int) -> tuple[int, str]:
+        err = io.StringIO()
+        with redirect_stderr(err), redirect_stdout(io.StringIO()):
+            code = agent_dash._wait_for_child(child)
+        return code, err.getvalue()
+
+    def test_child_that_records_its_pidfile_late_is_reported_running(self):
+        child = self._fork(delay_s=4.0)
+        with mock.patch.object(agent_dash, "CHILD_START_S", 15.0):
+            code, err = self._wait(child)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(agent_dash.read_pid(), child)
+
+    def test_child_that_exits_before_recording_fails_at_once(self):
+        child = self._fork(delay_s=0.0, exit_code=1)
+        started = time.time()
+        with mock.patch.object(agent_dash, "CHILD_START_S", 15.0):
+            code, err = self._wait(child)
+        self.assertEqual(code, 1)
+        self.assertIn("failed to start", err)
+        self.assertIn("exited", err)
+        self.assertLess(time.time() - started, 5.0)
+
+    def test_child_that_never_records_fails_after_the_start_bound(self):
+        child = self._fork(delay_s=0.0, write_pidfile=False)
+        with mock.patch.object(agent_dash, "CHILD_START_S", 1.0):
+            code, err = self._wait(child)
+        self.assertEqual(code, 1)
+        self.assertIn("no pidfile after 1 s", err)
+
+    def test_default_start_bound_is_longer_than_the_old_three_seconds(self):
+        self.assertGreaterEqual(agent_dash.CHILD_START_S, 20.0)
 
 
 if __name__ == "__main__":

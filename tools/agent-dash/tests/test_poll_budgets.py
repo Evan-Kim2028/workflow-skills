@@ -17,6 +17,7 @@ import json
 import sqlite3
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -586,6 +587,40 @@ class RotationTests(unittest.TestCase):
             (state / "dash.sqlite.bak-0").write_bytes(b"z")
             self.assertEqual(agent_dash.rotate_backups(state), [])
             self.assertTrue((state / "dash.sqlite.bak-0").is_file())
+
+
+class _Blocked:
+    NAME = "blocked"
+    INTERVAL_S = 2
+
+    def __init__(self):
+        self.release = threading.Event()
+
+    def poll(self, store, cfg, now):
+        self.release.wait(30)
+
+
+class StopDuringPollTests(unittest.TestCase):
+    def test_stop_during_a_blocked_poll_returns_the_collector_tick_at_once(self):
+        blocked = _Blocked()
+        self.addCleanup(blocked.release.set)
+        registry = Registry([blocked])
+        stop = threading.Event()
+        worker = threading.Thread(
+            target=registry.tick,
+            args=(MemStore(), {"poll_budget_s": 60}, NOW),
+            kwargs={"stop": stop},
+            daemon=True,
+        )
+        worker.start()
+        deadline = time.monotonic() + 5
+        while registry.state["blocked"].get("thread") is None and time.monotonic() < deadline:
+            time.sleep(0.01)
+        stop.set()
+        started = time.monotonic()
+        worker.join(3)
+        self.assertFalse(worker.is_alive())
+        self.assertLess(time.monotonic() - started, 2.0)
 
 
 if __name__ == "__main__":

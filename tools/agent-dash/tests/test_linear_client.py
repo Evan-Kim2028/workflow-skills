@@ -735,10 +735,10 @@ class MetaClientTests(unittest.TestCase):
                 "start_date": "2026-10-21",
                 "target_date": "2026-12-01",
                 "labels": ["Infrastructure"],
-                "links": [{"title": "Dashboard", "url": "https://example.test/d"}],
                 "status": "In Progress",
             },
         )
+        client.create_link("proj-1", "https://example.test/d", "Dashboard")
         update = transport.inputs("ProjectUpdate")[0]
         self.assertEqual(
             update,
@@ -792,6 +792,25 @@ class MetaClientTests(unittest.TestCase):
         client, transport = self._client(handlers)
         client.set_issue_meta("issue-1", ["Manual"], None)
         self.assertEqual([name for name, _ in transport.calls], ["IssueLabels", "LabelByName"])
+
+
+class LabelCacheTests(unittest.TestCase):
+    def test_team_label_is_resolved_once_per_client_not_per_issue(self) -> None:
+        issue = {"team": {"id": "t1"}, "labels": {"nodes": []}}
+        client, fake = _client(
+            [
+                _ok({"issue": issue}),
+                _ok({"issueLabels": {"nodes": [{"id": "L1", "name": "Infra"}]}}),
+                _ok({}),
+                _ok({"issue": issue}),
+                _ok({}),
+            ]
+        )
+        client.set_issue_meta("I1", ["Infra"], 2)
+        client.set_issue_meta("I2", ["Infra"], 3)
+        finds = [call for call in fake.calls if "issueLabels(filter:" in call["body"]["query"]]
+        self.assertEqual(len(finds), 1)
+        self.assertEqual(len(fake.calls), 5)
 
 
 if __name__ == "__main__":

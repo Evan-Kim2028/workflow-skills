@@ -419,6 +419,7 @@ class Client:
         """
         _check_endpoint(endpoint)
         self._key = key
+        self._label_ids: dict[tuple[str, str], str] = {}
         self._transport = transport or _urllib_transport(endpoint, timeout, deadline, key)
         self.last_rate: dict = {}
 
@@ -769,7 +770,8 @@ class Client:
 
         Summary maps to the short ``description`` field and description to the long ``content``.
         Labels are appended to the project's current labels, which are never removed. Links are
-        appended as external links. A lead or status name that Linear does not know is skipped.
+        not part of this call (see ``create_link``). A lead or status name that Linear does not
+        know is skipped.
         """
         update: dict = {}
         if meta.get("summary"):
@@ -799,14 +801,23 @@ class Client:
                 update["statusId"] = status_id
         if update:
             self.query(PROJECT_UPDATE, {"id": project_id, "input": update})
-        for link in meta.get("links") or []:
-            self.query(LINK_CREATE, {"input": {"projectId": project_id, "url": link["url"], "label": link["title"]}})
+
+    def create_link(self, project_id: str, url: str, title: str) -> None:
+        """Append one external link to a project (one call per link, so a caller can record each success)."""
+        self.query(LINK_CREATE, {"input": {"projectId": project_id, "url": url, "label": title}})
 
     def update_milestone_meta(self, milestone_id: str, project_id: str, description: str | None, target_date: str | None) -> None:
         """Set a milestone's description and target date. ``project_id`` is accepted for signature parity with the MCP client."""
         update = _drop_none({"description": description, "targetDate": target_date})
         if update:
             self.query(MILESTONE_UPDATE, {"id": milestone_id, "input": update})
+
+    def _team_label_id(self, team_id: str, name: str) -> str:
+        """The team label id, resolved once per client (one run) instead of once per issue."""
+        key = (team_id, name)
+        if key not in self._label_ids:
+            self._label_ids[key] = self.ensure_label(team_id, name)
+        return self._label_ids[key]
 
     def set_issue_meta(self, issue_id: str, add_labels: list[str], priority: int | None) -> None:
         """Append labels to an issue (creating missing team labels) and set its priority.
@@ -819,7 +830,7 @@ class Client:
             ids = [label["id"] for label in node["labels"]["nodes"]]
             added = False
             for name in add_labels:
-                label_id = self.ensure_label(node["team"]["id"], name)
+                label_id = self._team_label_id(node["team"]["id"], name)
                 if label_id not in ids:
                     ids.append(label_id)
                     added = True

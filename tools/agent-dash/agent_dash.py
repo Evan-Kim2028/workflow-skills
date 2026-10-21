@@ -40,6 +40,7 @@ HOST = "127.0.0.1"
 PORT = 8765
 RECONCILE_INTERVAL_S = 60
 PRUNE_INTERVAL_S = 60
+CHILD_START_S = 20.0
 BACKUP_KEEP = 3
 URL = f"http://{HOST}:{PORT}/"
 
@@ -473,7 +474,7 @@ def cmd_run(argv: list[str] | None = None) -> int:
         pass
     child = os.fork()
     if child > 0:
-        return _wait_for_child()
+        return _wait_for_child(child)
     os.setsid()
     try:
         _redirect_stdio()
@@ -1959,15 +1960,30 @@ def _serve() -> None:
         _release_pidfile(os.getpid())
 
 
-def _wait_for_child() -> int:
-    deadline = time.time() + 3
+def _wait_for_child(child: int) -> int:
+    """Wait for the forked dashboard ``child`` to record its pidfile, or to exit.
+
+    The child writes the pidfile only after its store, sources and server
+    are up, which can take longer than a few seconds on a loaded machine.
+    A child that exits first has failed and is reported at once; a child
+    still starting gets ``CHILD_START_S`` seconds before the start counts
+    as failed. The pidfile names ``child`` itself, so no ``ps`` probe is
+    needed (a slow probe would read as a failed start).
+    """
+    deadline = time.time() + CHILD_START_S
     while time.time() < deadline:
-        pid = live_pid()
-        if pid:
-            _print_running(pid)
+        if read_pid() == child and pid_exists(child):
+            _print_running(child)
             return 0
+        try:
+            reaped, _status = os.waitpid(child, os.WNOHANG)
+        except ChildProcessError:
+            reaped = child
+        if reaped == child:
+            print(f"failed to start: the dashboard process exited (log: {LOGFILE})", file=sys.stderr)
+            return 1
         time.sleep(0.05)
-    print("failed to start", file=sys.stderr)
+    print(f"failed to start: no pidfile after {CHILD_START_S:g} s (log: {LOGFILE})", file=sys.stderr)
     return 1
 
 

@@ -175,7 +175,6 @@ def _poll(cfg: dict) -> None:
             result = _sync(ws)
         except Exception as exc:
             result = {"error": _clip(f"{type(exc).__name__}: {exc}")}
-        longest = max(longest, _clock() - began)
         attempted += 1
         error = result.get("error") if isinstance(result, dict) else None
         if error and str(error).startswith("RATELIMITED"):
@@ -187,7 +186,11 @@ def _poll(cfg: dict) -> None:
             _record_failure(ws, cfg)
         else:
             _record_success(ws)
-            _daily_update(ws)
+            if _clock() - started < budget:
+                _daily_update(ws)
+            else:
+                log.info("linear: %s daily update deferred, poll budget spent; retries next poll", ws)
+        longest = max(longest, _clock() - began)
 
 
 def _daily_update(ws: str) -> None:

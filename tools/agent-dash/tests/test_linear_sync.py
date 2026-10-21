@@ -78,6 +78,7 @@ class FakeLinear:
         self.issues: dict[str, dict] = {}
         self.fail_pull: Exception | None = None
         self.on_state = None
+        self.fail_link_urls: set[str] = set()
 
     def _tick(self) -> str:
         self.clock += 1
@@ -193,6 +194,11 @@ class FakeLinear:
 
     def set_issue_meta(self, issue_id, add_labels, priority):
         self.calls.append(("issue_meta", issue_id, list(add_labels), priority))
+
+    def create_link(self, project_id, url, title):
+        if url in self.fail_link_urls:
+            raise LinearError("GRAPHQL", "boom")
+        self.calls.append(("link", project_id, url, title))
 
     def issues_updated_since(self, project_id, since_iso):
         if self.fail_pull is not None:
@@ -1217,7 +1223,7 @@ class MetaPushTest(LinearSyncTest):
         issues = {call[1]: (call[2], call[3]) for call in self.fake.calls_named("issue_meta")}
         for task in ("WS9.1", "WS9.2", "WS9.3"):
             self.assertEqual(issues[linear.stable_id("task", "WS9", task)], (["Infrastructure"], 2))
-        self.assertEqual(issues[linear.stable_id("approval", "WS9", "A1")], (["approval"], 2))
+        self.assertNotIn(linear.stable_id("approval", "WS9", "A1"), issues)
         self.assertNotIn(linear.stable_id("task", "WS9", "WS9.4"), issues)
         self.assertNotIn(linear.stable_id("approval", "WS9", "A2"), issues)
 
@@ -1234,34 +1240,192 @@ class MetaPushTest(LinearSyncTest):
         milestone_calls = self.fake.calls_named("milestone_meta")
         self.assertEqual(milestone_calls, [("milestone_meta", linear.stable_id("milestone", "WS9", "Shape"), "Shape gate", "2026-11-01")])
 
-    def test_links_are_sent_once_each(self):
-        link = {"title": "Dashboard", "url": "https://example.test/d"}
-        self._set_tracker({"links": [link]})
+    def test_metadata_pass_resumes_across_cycles_without_resending_done_calls(self):
+        clock = {"t": 0.0}
+        for name in ("update_project_meta", "set_issue_meta", "update_milestone_meta"):
+            real = getattr(self.fake, name)
+
+            def ticking(*args, _real=real, **kwargs):
+                clock["t"] += 1.0
+                return _real(*args, **kwargs)
+
+            setattr(self.fake, name, ticking)
+        self._set_tracker({"summary": "Resume me", "issue_labels": ["Infrastructure"], "milestones": {"Shape": {"description": "Gate"}}})
+        sent_all: list[tuple] = []
+        batches: list[int] = []
+        for cycle in range(20):
+            clock["t"] = 0.0
+            self.fake.calls.clear()
+            result = sync("WS9", root=self.root, client=self.fake, now=self.now + 1 + cycle,
+                          meta_budget_s=2.5, clock=lambda: clock["t"])
+            self.assertIsNone(result["error"])
+            sent = [call for call in self.fake.calls if call[0] in ("project_meta", "issue_meta", "milestone_meta")]
+            sent_all.extend(sent)
+            batches.append(len(sent))
+            if not sent:
+                break
+        self.assertGreater(len(batches), 2)
+        self.assertEqual(batches[-1], 0)
+        self.assertEqual(len(sent_all), len({repr(call) for call in sent_all}))
+        self.assertEqual(len([call for call in sent_all if call[0] == "project_meta"]), 1)
+
+    def test_status_change_does_not_rewrite_the_project(self):
+        with self._quiet():
+            bundles.set_task("WS9", "WS9.3", "wip", None, None, root=self.root)
+        self.fake.calls.clear()
         self.assertIsNone(self._sync(self.now + 1)["error"])
-        self.assertEqual(self._project_meta_calls()[0]["links"], [link])
-        self.assertEqual(self._link_record()["meta_links"], [link["url"]])
+        self.assertEqual(self._project_meta_calls(), [])
+        self.assertEqual(self.fake.calls_named("milestone_meta"), [])
 
-        self._set_tracker({"summary": "Changed", "links": [link]})
+    def test_unchanged_milestone_is_not_resent_when_another_changes(self):
+        self._set_tracker({"milestones": {"Shape": {"description": "Shape gate", "target_date": "2026-11-01"}}})
+        self.assertIsNone(self._sync(self.now + 1)["error"])
+        self.fake.calls.clear()
+        self._set_tracker({"milestones": {"Shape": {"description": "Shape gate", "target_date": "2026-11-01"}, "Build": {"description": "Build gate"}}})
         self.assertIsNone(self._sync(self.now + 2)["error"])
-        self.assertNotIn("links", self._project_meta_calls()[-1])
+        self.assertEqual([call[2] for call in self.fake.calls_named("milestone_meta")], ["Build gate"])
 
-    def test_failed_metadata_push_keeps_the_old_hash_and_repeats_in_full(self):
-        before = self._link_record()["meta_hash"]
+    def test_failed_project_push_keeps_its_digest_and_repeats_next_cycle(self):
         real = self.fake.update_project_meta
 
         def refuse(project_id, meta):
             raise LinearError("GRAPHQL", "boom")
 
+        before = self._link_record()["meta_digests"]["project"]
         self._set_tracker({"summary": "Retry me"})
         self.fake.update_project_meta = refuse
         self.assertIsNotNone(self._sync(self.now + 1)["error"])
-        self.assertEqual(self._link_record()["meta_hash"], before)
-
+        self.assertEqual(self._link_record()["meta_digests"]["project"], before)
         self.fake.update_project_meta = real
         self.fake.calls.clear()
         self.assertIsNone(self._sync(self.now + 2)["error"])
         self.assertEqual([meta.get("summary") for meta in self._project_meta_calls()], ["Retry me"])
-        self.assertNotEqual(self._link_record()["meta_hash"], before)
+        self.assertNotEqual(self._link_record()["meta_digests"]["project"], before)
+
+    def test_links_are_created_once_each_and_recorded_as_they_succeed(self):
+        link = {"title": "Dashboard", "url": "https://example.test/d"}
+        self._set_tracker({"links": [link]})
+        self.assertIsNone(self._sync(self.now + 1)["error"])
+        project_id = self._link_record()["project"]["id"]
+        self.assertEqual(self.fake.calls_named("link"), [("link", project_id, link["url"], link["title"])])
+        self.assertEqual(self._link_record()["meta_links"], [link["url"]])
+
+        self.fake.calls.clear()
+        self._set_tracker({"summary": "Changed", "links": [link]})
+        self.assertIsNone(self._sync(self.now + 2)["error"])
+        self.assertEqual(self.fake.calls_named("link"), [])
+        self.assertNotIn("links", self._project_meta_calls()[-1])
+
+    def test_failed_link_create_keeps_the_sent_links_and_resumes_at_the_failed_one(self):
+        first = {"title": "One", "url": "https://example.test/1"}
+        second = {"title": "Two", "url": "https://example.test/2"}
+        self._set_tracker({"links": [first, second]})
+        self.fake.fail_link_urls = {second["url"]}
+        self.assertIsNotNone(self._sync(self.now + 1)["error"])
+        self.assertEqual(self._link_record()["meta_links"], [first["url"]])
+        self.fake.fail_link_urls = set()
+        self.fake.calls.clear()
+        self.assertIsNone(self._sync(self.now + 2)["error"])
+        self.assertEqual([call[2] for call in self.fake.calls_named("link")], [second["url"]])
+        self.assertEqual(self._link_record()["meta_links"], sorted([first["url"], second["url"]]))
+
+    def test_metadata_failure_does_not_stop_the_status_flush_or_the_pull(self):
+        self._set_tracker({"summary": "Boom"})
+        real = self.fake.update_project_meta
+
+        def refuse(project_id, meta):
+            raise LinearError("GRAPHQL", "boom")
+
+        self.fake.update_project_meta = refuse
+        with self._quiet():
+            bundles.set_task("WS9", "WS9.3", "wip", None, None, root=self.root)
+        self.fake.calls.clear()
+        result = self._sync(self.now + 1)
+        self.fake.update_project_meta = real
+        self.assertIn("boom", result["error"])
+        issue_id = linear.stable_id("task", "WS9", "WS9.3")
+        self.assertEqual([call for call in self.fake.calls_named("state") if call[1] == issue_id], [("state", issue_id, "s-wip")])
+        self.assertEqual(result["flushed"], 1)
+        self.assertEqual(linear.read_outbox("WS9", self.root), [])
+        self.assertIn("boom", self._link_record()["last_error"])
+
+    def test_not_found_meta_call_detaches_its_task_and_the_pass_goes_on(self):
+        target = self._link_record()["tasks"]["WS9.1"]["id"]
+        self._set_tracker({"issue_labels": ["Infrastructure"]})
+        real_set = self.fake.set_issue_meta
+        real_exists = self.fake.issue_exists
+
+        def gone(issue_id, labels, priority):
+            if issue_id == target:
+                raise LinearError("NOT_FOUND", "gone")
+            return real_set(issue_id, labels, priority)
+
+        self.fake.set_issue_meta = gone
+        self.fake.issue_exists = lambda issue_id: issue_id != target
+        self.fake.calls.clear()
+        result = self._sync(self.now + 1)
+        self.fake.set_issue_meta = real_set
+        self.fake.issue_exists = real_exists
+        self.assertIsNone(result["error"])
+        self.assertIn("task:WS9.1", self._link_record()["detached"])
+        sent = {call[1] for call in self.fake.calls_named("issue_meta")}
+        self.assertIn(linear.stable_id("task", "WS9", "WS9.2"), sent)
+        self.assertIn(linear.stable_id("task", "WS9", "WS9.3"), sent)
+
+    def test_failed_status_send_does_not_block_comments_and_keeps_its_row(self):
+        with self._quiet():
+            bundles.set_task("WS9", "WS9.3", "wip", None, None, root=self.root)
+            linear.enqueue_comment("WS9", "WS9.1", "Hello there", root=self.root, now=self.now)
+        real = self.fake.set_issue_state
+        target = linear.stable_id("task", "WS9", "WS9.3")
+
+        def broken(issue_id, state_id):
+            if issue_id == target:
+                raise LinearError("GRAPHQL", "boom")
+            return real(issue_id, state_id)
+
+        self.fake.set_issue_state = broken
+        self.fake.calls.clear()
+        result = self._sync(self.now + 1)
+        self.fake.set_issue_state = real
+        self.assertIn("boom", result["error"])
+        self.assertIn(("comment", linear.stable_id("task", "WS9", "WS9.1"), "Hello there"), self.fake.calls)
+        self.assertEqual([(row["kind"], row["key"]) for row in linear.read_outbox("WS9", self.root)], [("task", "WS9.3")])
+
+    def test_comment_with_no_linear_issue_is_counted_as_dropped(self):
+        with self._quiet():
+            linear.enqueue_comment("WS9", "WS9.99", "Not in the plan", root=self.root, now=self.now)
+        self.assertIsNone(self._sync(self.now + 1)["error"])
+        self.assertEqual(self._link_record()["dropped_comments"], 1)
+        self.assertEqual(linear.read_outbox("WS9", self.root), [])
+        with self._quiet() as out:
+            linear_sync.status("WS9", root=self.root)
+        self.assertIn("dropped comments: 1", out.getvalue())
+
+
+class DerivedPriorityTest(unittest.TestCase):
+    def test_closed_tasks_are_absent_and_do_not_shape_the_critical_path(self):
+        plan = {
+            "dag": {
+                "groups": [
+                    {
+                        "tasks": [
+                            {"id": "a", "status": "done", "deps": []},
+                            {"id": "b", "status": "todo", "deps": ["a"]},
+                            {"id": "c", "status": "wip", "deps": []},
+                            {"id": "d", "status": "todo", "deps": ["c"]},
+                            {"id": "e", "deps": []},
+                        ]
+                    }
+                ]
+            }
+        }
+        priorities = linear.derived_priorities(plan)
+        self.assertNotIn("a", priorities)
+        self.assertEqual(priorities["b"], linear.PRIORITY_READY)
+        self.assertEqual(priorities["c"], linear.PRIORITY_CRITICAL)
+        self.assertEqual(priorities["d"], linear.PRIORITY_CRITICAL)
+        self.assertEqual(priorities["e"], linear.PRIORITY_OTHER)
 
 
 if __name__ == "__main__":
