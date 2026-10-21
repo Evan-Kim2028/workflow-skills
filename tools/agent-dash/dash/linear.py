@@ -28,6 +28,7 @@ SYNC_LOCK = ".linear.lock"
 OUTBOX_LOCK = ".linear-outbox.lock"
 AWAITING_PROD = "Awaiting prod"
 APPROVAL_LABEL = "approval"
+COMMENT_LIMIT = 2000
 
 STATE_FOR_STATUS: dict[str, str] = {
     "todo": "Todo",
@@ -304,43 +305,70 @@ def _parse_rows(path: Path) -> list[dict]:
         if (
             isinstance(row, dict)
             and isinstance(row.get("ts"), (int, float))
-            and row.get("kind") in ("task", "approval")
+            and row.get("kind") in ("task", "approval", "comment")
             and isinstance(row.get("key"), str)
+            and (row.get("kind") != "comment" or isinstance(row.get("body"), str))
         ):
             row.setdefault("id", hashlib.sha256(line.encode("utf-8")).hexdigest()[:32])
             rows.append(row)
     return rows
 
 
-def enqueue(ws: str, kind: str, key: str, root: Path | None = None, now: float | None = None) -> None:
-    """Record one local write for the next sync. No-op when the bundle is not linked.
+def _append_row(ws: str, root: Path | None, fields: dict, now: float | None) -> bool:
+    """Append one outbox row built from ``fields``; False when the bundle is not linked.
 
     The row gets a unique ``id`` and its ``ts`` is stamped inside the outbox
-    lock, so rows are ordered by when they were appended. Callers hold the
-    bundle ``.lock`` across the plan write and this call, so a pull that
-    holds the same lock sees either both or neither. One O_APPEND line,
-    fsynced. A failed append warns and returns, so the local write itself is
-    never blocked.
+    lock, so rows are ordered by when they were appended. One O_APPEND line,
+    fsynced. Raises OSError on a failed append.
     """
     bundle = bundle_dir(ws, root)
     if bundle is None or not is_linked(ws, root):
-        return
+        return False
+    with _outbox_lock(bundle):
+        if not is_linked(ws, root):
+            return False
+        row = {"id": uuid.uuid4().hex, "ts": time.time() if now is None else now, **fields}
+        with open(bundle / OUTBOX_FILE, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(row, sort_keys=True, ensure_ascii=False) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+    return True
+
+
+def enqueue(ws: str, kind: str, key: str, root: Path | None = None, now: float | None = None) -> None:
+    """Record one local write for the next sync. No-op when the bundle is not linked.
+
+    Callers hold the bundle ``.lock`` across the plan write and this call, so
+    a pull that holds the same lock sees either both or neither. A failed
+    append warns and returns, so the local write itself is never blocked.
+    """
     try:
-        with _outbox_lock(bundle):
-            if not is_linked(ws, root):
-                return
-            row = {
-                "id": uuid.uuid4().hex,
-                "ts": time.time() if now is None else now,
-                "kind": kind,
-                "key": key,
-            }
-            with open(bundle / OUTBOX_FILE, "a", encoding="utf-8") as handle:
-                handle.write(json.dumps(row, sort_keys=True, ensure_ascii=False) + "\n")
-                handle.flush()
-                os.fsync(handle.fileno())
+        _append_row(ws, root, {"kind": kind, "key": key}, now)
     except OSError as exc:
         print(f"linear outbox not recorded for {ws} {key}: {exc}", flush=True)
+
+
+def enqueue_comment(ws: str, task_id: str, body: str, root: Path | None = None, now: float | None = None) -> None:
+    """Queue one agent comment on a task's Linear issue for the next sync.
+
+    ``body`` is trimmed. Raises ValueError when the text is empty or longer
+    than ``COMMENT_LIMIT`` characters, when the bundle is not linked, or when
+    the append fails, so the CLI can refuse with a message. Comments do not
+    change status and are never deduplicated by key.
+    """
+    text = body.strip()
+    if not text:
+        raise ValueError("comment text is empty")
+    if len(text) > COMMENT_LIMIT:
+        raise ValueError(f"comment is {len(text)} characters; the limit is {COMMENT_LIMIT}")
+    if not is_linked(ws, root):
+        raise ValueError(f"workstream {ws} is not linked to Linear")
+    try:
+        queued = _append_row(ws, root, {"kind": "comment", "key": task_id, "body": text}, now)
+    except OSError as exc:
+        raise ValueError(f"linear outbox not recorded for {ws} {task_id}: {exc}") from exc
+    if not queued:
+        raise ValueError(f"workstream {ws} is not linked to Linear")
 
 
 def has_pending(ws: str, kind: str, key: str, root: Path | None = None) -> bool:
