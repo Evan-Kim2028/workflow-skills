@@ -476,5 +476,28 @@ class PlanViewShapeTest(unittest.TestCase):
             self.assertEqual(maplayout.map_warnings(view), [])
 
 
+class ChipTooltipLinearTest(unittest.TestCase):
+    """The chip tooltip appends the Linear identifier only when the task row carries one."""
+
+    def test_identifier_appended_when_linked(self):
+        task = {"id": "WS1.1", "title": "Task one", "status": "todo", "linear": {"identifier": "TU-42", "url": "https://linear.app/x/issue/TU-42"}}
+        self.assertEqual(maplayout._chip_tooltip(task, "WS1"), "WS1.1 · Task one · todo · TU-42")
+
+    def test_unlinked_tooltip_unchanged(self):
+        task = {"id": "WS1.1", "title": "Task one", "status": "todo"}
+        self.assertEqual(maplayout._chip_tooltip(task, "WS1"), "WS1.1 · Task one · todo")
+
+    def test_identifier_follows_existing_suffixes(self):
+        task = {
+            "id": "WS1.2",
+            "title": "Task two",
+            "status": "todo",
+            "deps": ["WS1.1"],
+            "dep_notes": {"WS1.1": "needs shape"},
+            "linear": {"identifier": "TU-43", "url": None},
+        }
+        self.assertEqual(maplayout._chip_tooltip(task, "WS1"), "WS1.2 · Task two · todo · waits on WS1.1: needs shape · TU-43")
+
+
 if __name__ == "__main__":
     unittest.main()

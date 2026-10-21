@@ -96,6 +96,9 @@ def _chip_tooltip(task: dict, ws: str) -> str:
         ups.append(dep + (": " + note if note else ""))
     if ups:
         out += " · waits on " + ", ".join(ups)
+    linked = task.get("linear")
+    if isinstance(linked, dict) and linked.get("identifier"):
+        out += " · " + str(linked.get("identifier"))
     return out
 
 
