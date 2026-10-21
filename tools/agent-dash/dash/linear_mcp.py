@@ -27,6 +27,7 @@ from dash.linear_client import (
     _clip,
     _drop_none,
     _urllib_transport,
+    created_since,
 )
 
 MCP_ENDPOINT = "https://mcp.linear.app/mcp"
@@ -660,6 +661,16 @@ class McpClient:
         """Create a project status update (save_status_update) with a markdown body and a health enum. Returns its id."""
         value = self._tool("save_status_update", {"type": "project", "project": project_id, "body": body, "health": health})
         return _uuid_of(value)
+
+    def recent_updates(self, project_id: str, since_iso: str) -> list[dict]:
+        """The project's status updates created at or after ``since_iso`` (get_status_updates), newest first."""
+        rows = self._paged(
+            "get_status_updates",
+            {"type": "project", "project": project_id, "createdAt": since_iso, "orderBy": "createdAt"},
+            "statusUpdates",
+            PROJECT_PAGE,
+        )
+        return [row for row in rows if created_since(row, since_iso)]
 
     def _change(self, row: dict) -> dict:
         """One pulled issue as the sync reads it: id, identifier, url, updatedAt and a state."""

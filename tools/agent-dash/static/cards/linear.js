@@ -160,7 +160,8 @@
         var mark = svgEl("rect", {
           x: cx - barW / 2, y: base - h, width: barW, height: h, rx: 3,
           fill: SOURCE[key].fill, stroke: "var(--surface)", "stroke-width": 2,
-          class: "lin-bar lin-" + key, tabindex: "0", "data-source": key
+          class: "lin-bar lin-" + key, tabindex: "0", "data-source": key,
+          role: "img", "aria-label": d.label + ", " + SOURCE[key].word + ": " + fmtN(n) + " changes"
         });
         tipOn(mark, d.label, [{k: SOURCE[key].glyph + " " + SOURCE[key].word, v: fmtN(n) + " changes", c: SOURCE[key].fill}]);
         svg.appendChild(mark);
@@ -216,8 +217,8 @@
   function linRecentRow(row) {
     var li = el("li", {class: "lin-recent"});
     li.appendChild(el("b", {class: "lin-recent-title", text: row.title || row.task || ""}));
-    var from = STATUS_WORD[row.from] || row.from || "New";
-    var to = STATUS_WORD[row.to] || row.to || "";
+    var from = (Object.prototype.hasOwnProperty.call(STATUS_WORD, row.from) ? STATUS_WORD[row.from] : null) || row.from || "New";
+    var to = (Object.prototype.hasOwnProperty.call(STATUS_WORD, row.to) ? STATUS_WORD[row.to] : null) || row.to || "";
     var src = SOURCE[row.by === "linear" ? "linear" : "local"];
     li.appendChild(el("div", {class: "lin-recent-meta", text: from + " → " + to + " · " + src.glyph + " " + src.word + " · " + linAgo(row.ts)}));
     return li;

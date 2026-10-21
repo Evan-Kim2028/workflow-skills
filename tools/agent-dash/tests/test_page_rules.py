@@ -4294,6 +4294,14 @@ class LinearCardRulesTests(unittest.TestCase):
         self.assertIn("var(--s7)", self.js)
         self.assertIn("var(--muted)", self.js)
 
+    def test_bars_are_named_images_and_status_lookup_uses_own_keys(self):
+        self.assertIn('role: "img"', self.js)
+        self.assertIn('"aria-label": d.label + ", " + SOURCE[key].word + ": " + fmtN(n) + " changes"', self.js)
+        self.assertIn("Object.prototype.hasOwnProperty.call(STATUS_WORD, row.from)", self.js)
+        self.assertNotIn("STATUS_WORD[row.from] ||", self.js)
+        self.assertNotIn("STATUS_WORD[row.to] ||", self.js)
+
+
     def test_no_number_formatting_outside_the_helpers(self):
         self.assertNotIn("toFixed(", self.js)
         self.assertNotIn("toLocaleString(", self.js)
