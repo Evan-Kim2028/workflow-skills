@@ -2208,7 +2208,10 @@ def _cmd_linear_comment(args: list[str]) -> int:
     if len(args) < 4:
         print(f"ws linear comment needs a workstream id, a task id and text. {LINEAR_COMMENT_LIMIT_HINT}", flush=True)
         return errors.USAGE
-    ws, task_id, text = args[1], args[2], " ".join(args[3:])
+    text_args = args[3:]
+    if text_args[:1] == ["--"]:
+        text_args = text_args[1:]
+    ws, task_id, text = args[1], args[2], " ".join(text_args)
     path = bundle_dir(ws)
     if path is None:
         print(errors.bundle_not_found(ws), flush=True)
@@ -2263,6 +2266,8 @@ def _cmd_linear_update(args: list[str]) -> int:
 def _cmd_linear(rest: list[str], json_mode: bool = False) -> int:
     """``ws linear <link|sync|status|unlink> <WS> [--team KEY]``: Linear mirror of one bundle."""
     args = list(rest)
+    if args[:1] == ["comment"]:
+        return _cmd_linear_comment(args)
     team: str | None = None
     if "--team" in args:
         pos = args.index("--team")
@@ -2277,11 +2282,6 @@ def _cmd_linear(rest: list[str], json_mode: bool = False) -> int:
     if args[0] in ("login", "logout"):
         return _cmd_linear_auth(args, team)
     sub = args[0]
-    if sub == "comment":
-        if team is not None:
-            print(f"--team does not apply to comment. {LINEAR_COMMENT_LIMIT_HINT}", flush=True)
-            return errors.USAGE
-        return _cmd_linear_comment(args)
     if sub == "update":
         if team is not None:
             print("--team applies to link only. Run: python3 agent_dash.py ws linear update <ID>", flush=True)
@@ -2315,7 +2315,7 @@ def cmd_ws(argv: list[str]) -> int:
     if rest[:1] == ["--json"]:
         json_mode = True
         rest = rest[1:]
-    elif rest[-1:] == ["--json"]:
+    elif rest[-1:] == ["--json"] and not (cmd == "linear" and rest[:1] == ["comment"]):
         json_mode = True
         rest = rest[:-1]
     if cmd == "list":
