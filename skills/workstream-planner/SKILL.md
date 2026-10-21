@@ -41,6 +41,10 @@ Tool: `tools/agent-dash/` in this repo (`~/.claude/tools/agent-dash/` after `./i
    - `KICKOFF.md` is self-contained: paths, waves, the wave call, run labels `ws4-<task>-<slug>`, `ws task` status moves, merge and test rules, coordination contacts, done criteria, and the naming rule.
    - `START-PROMPT.md` is the short paste-ready prompt that points a fresh session at the brief and the approvals.
 
+## Linear tracker (when the workstream is tracked in Linear)
+
+Fill `plan.json` `tracker` before anyone runs `ws linear link`. Write the summary and description for a non-engineer: what the workstream delivers, why now, and what done looks like. Set `lead`, `labels`, and a plain-language description for each DAG column under `milestones`. Set `update.daily_hour` if the owner wants a daily standup post. The project status comes from the lifecycle state, so do not set it here. Fields and push rules: [Linear as a task backend](../../tools/agent-dash/docs/linear.md#project-details-for-everyone) and `tracker` in `tools/agent-dash/SKILL-PLAN.md`.
+
 ## Map checklist (before kickoff)
 
 The plan-progress map stays readable when the plan follows these rules. Run `ws layout WS4` before kickoff and aim for zero MAP warnings (`ws validate` reports the same codes; warnings never fail the exit code).
