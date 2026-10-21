@@ -399,6 +399,21 @@ class FakeLinear:
             raise GqlError("Entity not found")
         return {"issueRelationDelete": {"success": True}}
 
+    def op_IssueExists(self, v: dict) -> dict:
+        issue = self.issues.get(v.get("id"))
+        return {"issue": None if issue is None else {"id": issue["id"]}}
+
+    def op_IssueRelations(self, v: dict) -> dict:
+        issue = self.issues.get(v.get("id"))
+        if issue is None:
+            raise GqlError("Entity not found")
+        nodes = [
+            {"id": rid, "type": edge[2], "relatedIssue": {"id": edge[1]}}
+            for rid, edge in self.relations.items()
+            if edge[0] == issue["id"]
+        ]
+        return {"issue": {"relations": {"nodes": nodes}}}
+
     def op_CommentCreate(self, v: dict) -> dict:
         data = v["input"]
         if data["issueId"] not in self.issues:

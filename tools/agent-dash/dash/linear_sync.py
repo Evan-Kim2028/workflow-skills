@@ -87,6 +87,12 @@ def _bundle_title(ws: str, root: Path | None) -> str:
     return title.strip() if isinstance(title, str) and title.strip() else ws
 
 
+def _plan_has_dag(plan: dict) -> bool:
+    """True when the plan carries a dag dict with a non-empty groups list."""
+    dag = plan.get("dag")
+    return isinstance(dag, dict) and isinstance(dag.get("groups"), list) and bool(dag["groups"])
+
+
 def _dag_entries(plan: dict) -> list[tuple[dict, dict]]:
     """(group, task) pairs for every dag task with a string id, in plan order."""
     dag = plan.get("dag")
@@ -230,7 +236,10 @@ def _push(client: Client, ws: str, root: Path | None, record: dict, ws_data: dic
     tasks = record.setdefault("tasks", {})
     approvals = record.setdefault("approvals", {})
     live = {task["id"] for _group, task in _dag_entries(plan)}
+    prune = _plan_has_dag(plan) and bool(live)
     for key in list(tasks):
+        if not prune:
+            break
         if key in live:
             continue
         try:
@@ -284,14 +293,24 @@ def _push(client: Client, ws: str, root: Path | None, record: dict, ws_data: dic
             if dep in tasks:
                 wanted[f"{dep}>{blocked}"] = (dep, blocked)
     for edge in list(relations):
+        if not prune:
+            break
         if edge in wanted:
             continue
         relation_id = relations.pop(edge)
+        if relation_id is None:
+            dep, blocked = edge.split(">", 1)
+            relation_id = client.find_relation(
+                linear.stable_id("task", ws, dep), linear.stable_id("task", ws, blocked)
+            )
         if relation_id is not None:
             client.delete_relation(relation_id)
     for edge, (dep, blocked) in wanted.items():
         if edge not in relations:
-            relations[edge] = client.ensure_blocks(tasks[dep]["id"], tasks[blocked]["id"])
+            relation_id = client.ensure_blocks(tasks[dep]["id"], tasks[blocked]["id"])
+            if relation_id is None:
+                relation_id = client.find_relation(tasks[dep]["id"], tasks[blocked]["id"])
+            relations[edge] = relation_id
 
     record["spec_hash"] = digest
     record["pushed_at"] = now
@@ -336,7 +355,7 @@ def _flush(client: Client, ws: str, root: Path | None, record: dict, ws_data: di
                     client.comment(ref["id"], _cancel_note(task))
                     ref["canceled_noted"] = True
             except LinearError as exc:
-                if exc.code != "NOT_FOUND":
+                if exc.code != "NOT_FOUND" or client.issue_exists(ref["id"]):
                     raise
                 _detach(record, kind, key)
         else:
@@ -347,7 +366,7 @@ def _flush(client: Client, ws: str, root: Path | None, record: dict, ws_data: di
             try:
                 client.set_issue_state(ref["id"], states[linear.APPROVAL_STATE[item["status"]]])
             except LinearError as exc:
-                if exc.code != "NOT_FOUND":
+                if exc.code != "NOT_FOUND" or client.issue_exists(ref["id"]):
                     raise
                 _detach(record, kind, key)
         sent += 1

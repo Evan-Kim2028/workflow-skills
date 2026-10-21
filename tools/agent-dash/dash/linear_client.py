@@ -191,6 +191,20 @@ mutation IssueRelationDelete($id: String!) {
 }
 """
 
+ISSUE_EXISTS = """
+query IssueExists($id: String!) {
+  issue(id: $id) { id }
+}
+"""
+
+ISSUE_RELATIONS = """
+query IssueRelations($id: String!) {
+  issue(id: $id) {
+    relations(first: 250) { nodes { id type relatedIssue { id } } }
+  }
+}
+"""
+
 COMMENT_CREATE = """
 mutation CommentCreate($input: CommentCreateInput!) {
   commentCreate(input: $input) { success }
@@ -257,7 +271,10 @@ def _check_endpoint(endpoint: str) -> None:
 
 def _read_capped(stream: object, deadline_at: float) -> bytes:
     """Read a body in chunks, enforcing the size cap and the overall deadline."""
-    reader = getattr(stream, "read1", None) or stream.read
+    try:
+        reader = getattr(stream, "read1", None) or stream.read
+    except AttributeError as exc:
+        raise LinearError("NETWORK", f"response stream is not readable ({type(exc).__name__})") from None
     chunks: list[bytes] = []
     total = 0
     while True:
@@ -589,6 +606,37 @@ class Client:
                 return None
             raise
         return data["issueRelationCreate"]["issueRelation"]["id"]
+
+    def find_relation(self, blocker_issue_id: str, blocked_issue_id: str) -> str | None:
+        """Return the id of the blocks relation from the blocker to the blocked issue, or None.
+
+        A blocker that no longer exists reads as no relation.
+        """
+        try:
+            data = self.query(ISSUE_RELATIONS, {"id": blocker_issue_id})
+        except LinearError as exc:
+            if exc.code != "NOT_FOUND":
+                raise
+            return None
+        issue = data.get("issue") or {}
+        for node in ((issue.get("relations") or {}).get("nodes")) or []:
+            related = node.get("relatedIssue") or {}
+            if node.get("type") == "blocks" and related.get("id") == blocked_issue_id:
+                return node["id"]
+        return None
+
+    def issue_exists(self, issue_id: str) -> bool:
+        """True when Linear returns the issue; False when it reports the issue not found.
+
+        Any other error propagates.
+        """
+        try:
+            data = self.query(ISSUE_EXISTS, {"id": issue_id})
+        except LinearError as exc:
+            if exc.code != "NOT_FOUND":
+                raise
+            return False
+        return data.get("issue") is not None
 
     def delete_relation(self, relation_id: str) -> None:
         """Delete an issue relation by id. A relation already gone (NOT_FOUND) counts as success."""
