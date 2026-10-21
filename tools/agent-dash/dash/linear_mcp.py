@@ -437,7 +437,7 @@ class McpClient:
 
     def team(self, key: str) -> dict:
         """Return the team with this key: id, key, and its workflow states."""
-        rows = _rows(self._tool("list_teams", {"query": key, "limit": PAGE}), "teams")
+        rows = _rows(self._tool("list_teams", {"limit": PAGE}), "teams")
         match = next((row for row in rows if row.get("key") == key and _is_uuid(row.get("id"))), None)
         if match is None:
             raise self._error("NOT_FOUND", f"team {key} not found")
