@@ -252,9 +252,11 @@ class ListenerDiscoveryTest(ControlMixin, unittest.TestCase):
 
     def test_serves_dashboard_matches_server_argv(self):
         run_proc = self.sleeper("agent_dash.py run")
+        serve_proc = self.sleeper("agent_dash.py serve")
         plain_proc = self.sleeper("sleep")
         restart_proc = self.sleeper("agent_dash.py restart")
         self.assertTrue(agent_dash._serves_dashboard(run_proc.pid))
+        self.assertTrue(agent_dash._serves_dashboard(serve_proc.pid))
         self.assertFalse(agent_dash._serves_dashboard(plain_proc.pid))
         self.assertFalse(agent_dash._serves_dashboard(restart_proc.pid))
         self.assertFalse(agent_dash._serves_dashboard(self.dead_pid()))
@@ -549,6 +551,55 @@ class StateDirGuardTest(ControlMixin, unittest.TestCase):
                 self.assertTrue(self.wait_gone(proc.pid))
 
 
+class ServeChildTest(ControlMixin, unittest.TestCase):
+    """``cmd_serve`` logs how the child ended, for normal returns and for any BaseException."""
+
+    def setUp(self):
+        self.bind_temp_state()
+
+    def test_normal_return_is_logged_and_exits_zero(self):
+        with mock.patch.object(agent_dash, "_serve", return_value=None), self.assertLogs(level="INFO") as logs:
+            code = agent_dash.cmd_serve([])
+        self.assertEqual(code, 0)
+        self.assertTrue(any("_serve returned" in line for line in logs.output), logs.output)
+
+    def test_system_exit_is_logged_with_its_traceback(self):
+        with mock.patch.object(agent_dash, "_serve", side_effect=SystemExit(3)), self.assertLogs(level="INFO") as logs:
+            code = agent_dash.cmd_serve([])
+        self.assertEqual(code, 1)
+        self.assertIs(logs.records[-1].exc_info[0], SystemExit)
+        self.assertIn("agent-dash exited", logs.output[-1])
+
+
+class SpawnedChildTest(ControlMixin, unittest.TestCase):
+    """``run`` starts the server as a spawned interpreter: no ``os.fork`` in the parent, and it answers health."""
+
+    def setUp(self):
+        self.bind_temp_state()
+
+    def test_run_spawns_a_server_that_answers_health(self):
+        self.assertNotEqual(agent_dash.PORT, LIVE_PORT)
+        out = io.StringIO()
+        with mock.patch.object(os, "fork", side_effect=AssertionError("run must not fork")), redirect_stdout(out):
+            code = main(["run"])
+        pid = agent_dash.read_pid()
+        self.addCleanup(self.kill_pid, pid)
+        self.assertEqual(code, 0, out.getvalue())
+        self.assertIsNotNone(pid)
+        deadline = time.time() + 30
+        health = None
+        while time.time() < deadline and health is None:
+            health = agent_dash._probe_health()
+            time.sleep(0.2)
+        self.assertIsNotNone(health, "spawned child never answered /api/health")
+        self.assertTrue(health.get("ok"))
+        self.assertEqual(agent_dash.read_pid(), pid)
+
+    def kill_pid(self, pid):
+        with contextlib.suppress(ProcessLookupError, OSError):
+            os.kill(pid, signal.SIGKILL)
+
+
 class WaitForChildTest(unittest.TestCase):
     """``_wait_for_child`` against real forked children that write, skip or never write the pidfile."""
 
@@ -572,12 +623,20 @@ class WaitForChildTest(unittest.TestCase):
                 os.waitpid(pid, 0)
         self.tmp.cleanup()
 
-    def _fork(self, delay_s: float, write_pidfile: bool = True, exit_code: int | None = None) -> int:
+    def _fork(
+        self,
+        delay_s: float,
+        write_pidfile: bool = True,
+        exit_code: int | None = None,
+        signal_num: int | None = None,
+    ) -> int:
         pid = os.fork()
         if pid == 0:
             try:
                 if exit_code is not None:
                     os._exit(exit_code)
+                if signal_num is not None:
+                    os.kill(os.getpid(), signal_num)
                 time.sleep(delay_s)
                 if write_pidfile:
                     self.pidfile.write_text(f"{os.getpid()}\n", encoding="utf-8")
@@ -607,8 +666,15 @@ class WaitForChildTest(unittest.TestCase):
             code, err = self._wait(child)
         self.assertEqual(code, 1)
         self.assertIn("failed to start", err)
-        self.assertIn("exited", err)
+        self.assertIn("exited (exit code 1", err)
         self.assertLess(time.time() - started, 5.0)
+
+    def test_child_killed_by_a_signal_reports_the_signal(self):
+        child = self._fork(delay_s=0.0, signal_num=signal.SIGTERM)
+        with mock.patch.object(agent_dash, "CHILD_START_S", 15.0):
+            code, err = self._wait(child)
+        self.assertEqual(code, 1)
+        self.assertIn("exited (signal SIGTERM", err)
 
     def test_child_that_never_records_fails_after_the_start_bound(self):
         child = self._fork(delay_s=0.0, write_pidfile=False)
