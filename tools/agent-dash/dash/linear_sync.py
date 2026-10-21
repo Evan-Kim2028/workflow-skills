@@ -205,6 +205,15 @@ def _resolve_state(known: dict[str, str], state: object) -> dict:
     return {"name": name, "type": state.get("type")}
 
 
+def _recorded_id(entry: object, fallback: str) -> str:
+    """The Linear id recorded in linear.json for an entry (a dict with id, or a bare id), else the stable id."""
+    if isinstance(entry, dict) and isinstance(entry.get("id"), str) and entry["id"]:
+        return entry["id"]
+    if isinstance(entry, str) and entry:
+        return entry
+    return fallback
+
+
 def _push(client: Client, ws: str, root: Path | None, record: dict, ws_data: dict, plan: dict, now: float, force: bool) -> int:
     """Upsert every task and pending approval, then milestones and blocks relations.
 
@@ -240,7 +249,10 @@ def _push(client: Client, ws: str, root: Path | None, record: dict, ws_data: dic
     for index, col in enumerate(cols):
         if col and col in used:
             milestones[col] = client.ensure_milestone(
-                linear.stable_id("milestone", ws, col), project_id, col, float(index)
+                _recorded_id(milestones.get(col), linear.stable_id("milestone", ws, col)),
+                project_id,
+                col,
+                float(index),
             )
 
     tasks = record.setdefault("tasks", {})
@@ -264,7 +276,7 @@ def _push(client: Client, ws: str, root: Path | None, record: dict, ws_data: dic
         if kind == "task":
             task_status = _task_status(obj)
             ref = client.upsert_issue(
-                linear.stable_id("task", ws, key),
+                _recorded_id(tasks.get(key), linear.stable_id("task", ws, key)),
                 team_id,
                 project_id,
                 milestones.get(col) if col else None,
@@ -281,7 +293,7 @@ def _push(client: Client, ws: str, root: Path | None, record: dict, ws_data: dic
                 entry["canceled_noted"] = True
         else:
             ref = client.upsert_issue(
-                linear.stable_id("approval", ws, key),
+                _recorded_id(approvals.get(key), linear.stable_id("approval", ws, key)),
                 team_id,
                 project_id,
                 None,
@@ -311,7 +323,8 @@ def _push(client: Client, ws: str, root: Path | None, record: dict, ws_data: dic
         if relation_id is None:
             dep, blocked = edge.split(">", 1)
             relation_id = client.find_relation(
-                linear.stable_id("task", ws, dep), linear.stable_id("task", ws, blocked)
+                _recorded_id(tasks.get(dep), linear.stable_id("task", ws, dep)),
+                _recorded_id(tasks.get(blocked), linear.stable_id("task", ws, blocked)),
             )
         if relation_id is not None:
             client.delete_relation(relation_id)
