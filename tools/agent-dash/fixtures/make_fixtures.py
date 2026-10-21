@@ -972,6 +972,13 @@ def _clean_groups(groups):
     ]
 
 
+LINEAR_WS1 = {"url": "https://linear.app/example/project/pipeline-doctor", "synced_at": NOW - 240}
+LINEAR_TASKS = {
+    "0": {"identifier": "PD-1", "url": "https://linear.app/example/issue/PD-1"},
+    "2": {"identifier": "PD-3", "url": "https://linear.app/example/issue/PD-3"},
+}
+
+
 def _plans():
     """Fixture plan views. WS1 resolves from its bundle (bundle wins over the
     plans map), so the plan view and the execution map agree on one source."""
@@ -1019,6 +1026,12 @@ def _plans():
         layout_view = {key: doc[key] for key in ("ws", "cols", "groups", "edges", "phases", "trains")}
         doc["layout"] = maplayout_mod.layout(layout_view)
         doc["map_warnings"] = maplayout_mod.map_warnings(layout_view)
+        if ws == "WS1":
+            doc["linear"] = dict(LINEAR_WS1)
+            for group in doc["groups"]:
+                for task in group["tasks"]:
+                    if task["id"] in LINEAR_TASKS:
+                        task["linear"] = dict(LINEAR_TASKS[task["id"]])
         written[ws] = doc
     return written
 
