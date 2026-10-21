@@ -1,6 +1,6 @@
 # Linear as a task backend
 
-A workstream can keep its tasks in Linear. Linear then shows the same tasks, status, and approvals as the dashboard, and the phone and the cloud agents see them too. The bundle stays the source of truth. Linear is a replica that the dashboard keeps in step.
+A workstream can keep its tasks in Linear. Linear then shows the same tasks, status, and approvals as the dashboard, and the phone and the cloud agents see them too. The plan in the bundle stays the source of truth for what each task is. Status and approvals sync both ways.
 
 Local mode is the default. A workstream with no `linear.json` in its bundle behaves as it always has and makes no network call.
 
@@ -96,7 +96,7 @@ When Linear holds a state name that the table does not list, the poller maps it 
 - **The poller syncs every minute.** Each cycle sends queued local changes first, then pulls Linear changes. The poller runs inside the dashboard.
 - **Whatever Linear holds last wins.** When both sides change between two syncs, the change saved last in Linear is the one that stands.
 - **Edit the spec in the plan.** Do not edit an issue description in Linear. Each push rewrites the description from `plan.json`, so a Linear edit to the description is lost. Status edits in Linear are kept.
-- **Put the Linear links in the pull request.** Run `ws trains <WS>`. For each train, a linked workstream prints a `Fixes TRD-…` string that names its member issues. Paste it into the train PR body. Linear moves those issues to In Review when the PR opens and to Done when it merges.
+- **Put the Linear links in the pull request.** Run `ws trains <WS>`. For each train, a linked workstream prints a `Fixes TRD-…` string that names its member issues. Paste it into the train PR body. This needs Linear's GitHub integration connected to the repository. By default Linear moves linked issues to In Progress when the PR opens and to Done when it merges; set the team's pull request automation to move them to In Review on open so they match the dashboard's `pr` status.
 - **Approve from Linear.** Move the approval issue to Done to approve it, or to Canceled to deny it. The next sync writes the answer to `approvals.json`.
 - **Approve from the terminal.** `ws approve` still works. It queues the change for Linear.
 
