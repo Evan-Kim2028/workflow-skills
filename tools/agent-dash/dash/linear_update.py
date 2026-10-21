@@ -118,7 +118,8 @@ def _changed(rows: list[dict], since: float, titles: dict, links: dict) -> list[
         task_id = str(row.get("task", ""))
         source = " (in Linear)" if row.get("by") == "linear" else ""
         before = row.get("from") or "new"
-        lines.append(f"- {_label(task_id, titles.get(task_id), links)}: {before} -> {row.get('to')}{source}")
+        name = "Workstream" if row.get("kind") == "state" or not task_id else _label(task_id, titles.get(task_id), links)
+        lines.append(f"- {name}: {before} -> {row.get('to')}{source}")
     if not lines:
         lines.append("- Nothing changed.")
     return _more(lines, min(len(recent), CHANGED_LIMIT), len(recent))

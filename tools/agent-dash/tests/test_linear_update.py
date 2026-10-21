@@ -457,5 +457,12 @@ class McpPostUpdateTest(unittest.TestCase):
         self.assertEqual(update_id, "11111111-2222-3333-4444-666666666666")
 
 
+class LifecycleRowTest(unittest.TestCase):
+    def test_workstream_state_row_names_the_workstream(self) -> None:
+        rows = [{"kind": "state", "ts": 10.0, "ws": "WS4", "from": "planned", "to": "active"}]
+        lines = linear_update._changed(rows, 0.0, {}, {})
+        self.assertEqual(lines[0], "- Workstream: planned -> active")
+
+
 if __name__ == "__main__":
     unittest.main()
