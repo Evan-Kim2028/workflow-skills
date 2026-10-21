@@ -2688,5 +2688,123 @@ class IgnoreListDoctorTest(unittest.TestCase):
         self.assertIsNotNone(row["resolved_at"])
 
 
+class LinearDoctorTest(unittest.TestCase):
+    """Linear doctor codes: key missing, sync failing, outbox backlog; none for unlinked setups."""
+
+    NOW = 1_700_000_000.0
+
+    def setUp(self):
+        from dash import linear
+        from dash.bundles import cmd_ws
+
+        self.linear = linear
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.wsroot = self.root / "ws"
+        self.wsroot.mkdir()
+        self.state = self.root / "state"
+        self.state.mkdir()
+        self.old_ws = os.environ.get("AGENT_DASH_WORKSTREAMS")
+        os.environ["AGENT_DASH_WORKSTREAMS"] = str(self.wsroot)
+        self.store = Store(self.state / "dash.sqlite")
+        with mock.patch("sys.stdout", new=io.StringIO()):
+            self.assertEqual(cmd_ws(["new", "WS9", "Example"]), 0)
+            self.assertEqual(cmd_ws(["new", "WS10", "Other"]), 0)
+        self.env_clean = {k: v for k, v in os.environ.items() if k != "LINEAR_API_KEY"}
+
+    def tearDown(self):
+        self.store.close()
+        if self.old_ws is None:
+            os.environ.pop("AGENT_DASH_WORKSTREAMS", None)
+        else:
+            os.environ["AGENT_DASH_WORKSTREAMS"] = self.old_ws
+        self.tmp.cleanup()
+
+    def _cfg(self):
+        cfg = _cfg(state_dir=str(self.state))
+        cfg["roots"]["scratchpads"] = []
+        return cfg
+
+    def _collect(self, env):
+        from dash.doctor import collect_problems
+
+        with mock.patch.dict(os.environ, env, clear=True), mock.patch(
+            "dash.doctor._home_scratch", return_value=str(self.root / "noscratch")
+        ):
+            return collect_problems(
+                self.store, self._cfg(), self.NOW, health={"ok": True, "sources": []}, processes=[]
+            )
+
+    def _linear_items(self, result):
+        return [item for item in result["problems"] if item["code"].startswith("linear-")]
+
+    def _link(self, ws, **extra):
+        data = {"project": {"id": "p1", "url": "https://linear.app/x/project/ex", "name": "Pipeline"}}
+        data.update(extra)
+        self.linear.write_link(ws, data)
+
+    def test_unlinked_setup_raises_no_linear_codes(self):
+        result = self._collect(self.env_clean)
+        self.assertEqual(self._linear_items(result), [])
+        check = [c for c in result["checks"] if c["name"] == "linear"]
+        self.assertEqual(len(check), 1)
+        self.assertTrue(check[0]["ok"])
+
+    def test_key_missing_when_linked_and_unset(self):
+        self._link("WS9", synced_at=self.NOW - 30, last_error=None)
+        items = self._linear_items(self._collect(self.env_clean))
+        codes = [item["code"] for item in items]
+        self.assertEqual(codes, ["linear-key-missing"])
+        self.assertEqual(items[0]["severity"], "warn")
+        self.assertFalse(items[0]["safe_auto"])
+        self.assertIn("LINEAR_API_KEY", items[0]["fix_command"])
+
+    def test_key_present_raises_no_key_code(self):
+        self._link("WS9", synced_at=self.NOW - 30, last_error=None)
+        env = dict(self.env_clean, LINEAR_API_KEY="lin_test_key")
+        items = self._linear_items(self._collect(env))
+        self.assertNotIn("linear-key-missing", [item["code"] for item in items])
+
+    def test_sync_failing_when_error_and_never_synced(self):
+        self._link("WS9", synced_at=None, last_error="HTTP 500 from Linear")
+        env = dict(self.env_clean, LINEAR_API_KEY="lin_test_key")
+        items = [i for i in self._linear_items(self._collect(env)) if i["code"] == "linear-sync-failing"]
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["ws"], "WS9")
+        self.assertEqual(items[0]["severity"], "warn")
+        self.assertEqual(items[0]["fix_command"], "python3 agent_dash.py ws linear status WS9")
+        self.assertFalse(items[0]["safe_auto"])
+
+    def test_sync_failing_silent_while_recently_synced(self):
+        self._link("WS9", synced_at=self.NOW - 60, last_error="HTTP 500 from Linear")
+        env = dict(self.env_clean, LINEAR_API_KEY="lin_test_key")
+        codes = [i["code"] for i in self._linear_items(self._collect(env))]
+        self.assertNotIn("linear-sync-failing", codes)
+
+    def test_outbox_backlog_when_oldest_row_is_old(self):
+        self._link("WS9", synced_at=self.NOW, last_error=None)
+        self.linear.enqueue("WS9", "task", "WS9.1", now=self.NOW - 700)
+        env = dict(self.env_clean, LINEAR_API_KEY="lin_test_key")
+        items = [i for i in self._linear_items(self._collect(env)) if i["code"] == "linear-outbox-backlog"]
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["ws"], "WS9")
+        self.assertEqual(items[0]["fix_command"], "python3 agent_dash.py ws linear sync WS9")
+        self.assertFalse(items[0]["safe_auto"])
+
+    def test_outbox_backlog_when_more_than_fifty_rows(self):
+        self._link("WS9", synced_at=self.NOW, last_error=None)
+        for n in range(51):
+            self.linear.enqueue("WS9", "task", f"WS9.{n}", now=self.NOW - 1)
+        env = dict(self.env_clean, LINEAR_API_KEY="lin_test_key")
+        codes = [i["code"] for i in self._linear_items(self._collect(env))]
+        self.assertEqual(codes, ["linear-outbox-backlog"])
+
+    def test_small_recent_outbox_is_quiet(self):
+        self._link("WS9", synced_at=self.NOW, last_error=None)
+        self.linear.enqueue("WS9", "task", "WS9.1", now=self.NOW - 5)
+        env = dict(self.env_clean, LINEAR_API_KEY="lin_test_key")
+        self.assertEqual(self._linear_items(self._collect(env)), [])
+
+
 if __name__ == "__main__":
     unittest.main()

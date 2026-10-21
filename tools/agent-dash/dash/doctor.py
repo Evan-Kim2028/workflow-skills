@@ -69,6 +69,7 @@ KNOWN_TOP_KEYS = {
     "dagster",
     "caps",
     "doctor",
+    "linear",
 }
 KNOWN_ROOT_KEYS = {
     "claude_projects",
@@ -275,6 +276,7 @@ def collect_problems(
     _collect_fleet(ctx)
     _collect_page(ctx)
     _collect_config(ctx)
+    _collect_linear(ctx)
     _collect_checkout(ctx)
     _collect_build(ctx)
     _collect_python(ctx)
@@ -1191,6 +1193,77 @@ def _collect_config(ctx) -> None:
         _check(ctx, "config", False, "; ".join(unknown))
     if not bad and not unknown:
         _check(ctx, "config", True, "config files parse, no unknown keys")
+
+
+LINEAR_OUTBOX_MAX_ROWS = 50
+LINEAR_STALE_S = 600.0
+
+
+def _linear_epoch(value):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _collect_linear(ctx) -> None:
+    """Linear sync health for linked bundles: key, last sync error, outbox backlog."""
+    from dash import linear
+    from dash.bundles import list_bundles
+
+    try:
+        linked = sorted(item["id"] for item in list_bundles() if linear.is_linked(item["id"]))
+    except Exception as exc:
+        _check(ctx, "linear", False, f"bundle list failed: {exc}")
+        return
+    if not linked:
+        _check(ctx, "linear", True, "no bundle is linked to Linear")
+        return
+    problems = []
+    if linear.api_key() is None:
+        problems.append(f"LINEAR_API_KEY unset; linked: {', '.join(linked)}")
+        _add(
+            ctx, "linear-key-missing", "warn", "global", None,
+            "Linear key is missing for linked bundles",
+            problems[-1],
+            "export LINEAR_API_KEY=<key from Linear settings>, then restart the dashboard",
+            key="linear-key-missing",
+        )
+    for ws in linked:
+        state = linear.sync_state(ws) or {}
+        synced_at = _linear_epoch(state.get("synced_at"))
+        stale = synced_at is None or ctx.now - synced_at > LINEAR_STALE_S
+        if state.get("last_error") and stale:
+            problems.append(f"{ws}: sync failing: {state['last_error']}")
+            _add(
+                ctx, "linear-sync-failing", "warn", f"ws:{ws}", ws,
+                f"Linear sync failing for {ws}",
+                _clip_text(f"last error: {state['last_error']}"),
+                f"python3 agent_dash.py ws linear status {ws}",
+                key=ws,
+            )
+        rows = linear.read_outbox(ws)
+        if not rows:
+            continue
+        oldest = _linear_epoch(rows[0].get("ts"))
+        aged = oldest is not None and ctx.now - oldest > LINEAR_STALE_S
+        if aged or len(rows) > LINEAR_OUTBOX_MAX_ROWS:
+            problems.append(f"{ws}: outbox {len(rows)} row(s)")
+            _add(
+                ctx, "linear-outbox-backlog", "warn", f"ws:{ws}", ws,
+                f"Linear outbox backlog for {ws}",
+                f"{len(rows)} pending row(s); oldest is {'older than 10 minutes' if aged else 'recent'}",
+                f"python3 agent_dash.py ws linear sync {ws}",
+                key=ws,
+            )
+    if problems:
+        _check(ctx, "linear", False, "; ".join(problems))
+    else:
+        _check(ctx, "linear", True, f"{len(linked)} linked bundle(s) synced")
+
+
+def _clip_text(text) -> str:
+    return str(text).replace("\n", " ").strip()[:200]
 
 
 def _collect_checkout(ctx) -> None:
