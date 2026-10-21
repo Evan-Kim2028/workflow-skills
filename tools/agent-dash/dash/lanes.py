@@ -18,6 +18,7 @@ the model, and anything else by model family with generic fallback.
 
 from __future__ import annotations
 
+import math
 import re
 import time
 
@@ -248,21 +249,31 @@ def group_live_processes(rows, now: float | None = None) -> list:
 
 
 def format_elapsed(seconds) -> str:
-    """Compact duration matching the dashboard fmtDur helper."""
+    """Compact duration, string-for-string the dashboard fmtDur helper.
+
+    Under a minute rounds to whole seconds; under 48 hours reads as minutes
+    and hours; then days with hours (to 14 days), whole days (to 365 days),
+    and years with days. Non-finite or unparsable input is "-".
+    """
     try:
-        total = max(0, int(float(seconds)))
+        value = float(seconds)
     except (TypeError, ValueError):
         return "-"
-    if total < 60:
-        return "%ds" % total
-    minutes = total // 60
-    rest = total % 60
-    if minutes < 60:
-        if rest == 0:
-            return "%dm" % minutes
-        return "%dm %ds" % (minutes, rest)
-    hours = minutes // 60
-    minutes = minutes % 60
-    if minutes == 0:
-        return "%dh" % hours
-    return "%dh %dm" % (hours, minutes)
+    if not math.isfinite(value):
+        return "-"
+    value = max(0.0, value)
+    if value < 60:
+        return "%ds" % math.floor(value + 0.5)
+    total = int(value)
+    if total < 3600:
+        return "%dm %ds" % (total // 60, total % 60)
+    if total < 172800:
+        return "%dh %dm" % (total // 3600, (total % 3600) // 60)
+    days = total // 86400
+    hours = (total % 86400) // 3600
+    if days < 14:
+        return "%dd %dh" % (days, hours)
+    if days < 365:
+        return "%dd" % days
+    years, rest = divmod(days, 365)
+    return "%dy %dd" % (years, rest) if rest else "%dy" % years

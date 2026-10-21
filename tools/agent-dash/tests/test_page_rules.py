@@ -3080,7 +3080,7 @@ class FinalPolishTests(unittest.TestCase):
             "var window = {};\n"
             "eval(fs.readFileSync(process.argv[2], 'utf8'));\n"
             "assert.strictEqual(window.AD.fmtDur(90), '1m 30s');\n"
-            "assert.strictEqual(window.AD.fmtDur(579599), '160h 59m');\n"
+            "assert.strictEqual(window.AD.fmtDur(579599), '6d 16h');\n"
             "assert.strictEqual(window.AD.fmtDur(359.6), '5m 59s');\n"
             "console.log('fmtDur proof ok');\n"
         )
@@ -3094,6 +3094,26 @@ class FinalPolishTests(unittest.TestCase):
             )
         self.assertEqual(proc.returncode, 0, proc.stderr or proc.stdout)
         self.assertIn("fmtDur proof ok", proc.stdout)
+
+    def test_fmt_durations_read_in_days_and_years(self):
+        """Below 48h the hour form is unchanged; from 48h durations read in
+        days ("2d 3h", then whole days to 14d) and from 365d in years."""
+        script = (
+            "const fs=require('fs');"
+            "const src=fs.readFileSync(process.argv[1],'utf8').replace('})(window);','})(global);');"
+            "eval(src);"
+            "const want=[[0,'0s'],[90,'1m 30s'],[359.6,'5m 59s'],[3599,'59m 59s'],"
+            "[172799,'47h 59m'],[172800,'2d 0h'],[183610,'2d 3h'],[579599,'6d 16h'],"
+            "[7200,'2h 0m'],[120,'2m 0s'],[1209599,'13d 23h'],[1209600,'14d'],[1227600,'14d'],[31535999,'364d'],"
+            "[31536000,'1y'],[34560000,'1y 35d'],[-5,'0s'],[NaN,'\\u2013'],[null,'\\u2013'],[undefined,'\\u2013']];"
+            "for (const [v,w] of want) { const got=AD.fmtDur(v); if (got!==w) { console.error(String(v)+' -> '+got+' want '+w); process.exit(1); } }"
+        )
+        proc = subprocess.run(
+            ["node", "-e", script, str(STATIC / "format.js")],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr or proc.stdout)
 
     def test_archive_confirm_never_uses_window_confirm(self):
         """The archive confirm is an inline popover, never window.confirm:

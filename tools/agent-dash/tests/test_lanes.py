@@ -3,7 +3,10 @@
 import io
 import json
 import os
+import shutil
+import subprocess
 import sys
+import tempfile
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
@@ -17,6 +20,28 @@ os.environ["AGENT_DASH_IGNORE_LOCAL"] = "1"
 
 import agent_dash
 from dash import lanes as lanes_lib
+
+STATIC_FORMAT = Path(__file__).resolve().parent.parent / "static" / "format.js"
+
+ELAPSED_SAMPLES = [
+    (0, "0s"),
+    (90, "1m 30s"),
+    (120, "2m 0s"),
+    (359.6, "5m 59s"),
+    (3599, "59m 59s"),
+    (7200, "2h 0m"),
+    (172799, "47h 59m"),
+    (172800, "2d 0h"),
+    (183610, "2d 3h"),
+    (579599, "6d 16h"),
+    (1209599, "13d 23h"),
+    (1209600, "14d"),
+    (1227600, "14d"),
+    (31535999, "364d"),
+    (31536000, "1y"),
+    (34560000, "1y 35d"),
+    (-5, "0s"),
+]
 
 SID_ONE = "11111111-1111-4111-8111-111111111111"
 SID_TWO = "22222222-2222-4222-8222-222222222222"
@@ -198,6 +223,51 @@ class TierTests(unittest.TestCase):
         self.assertEqual(lanes_lib.format_elapsed(45), "45s")
         self.assertEqual(lanes_lib.format_elapsed(190), "3m 10s")
         self.assertEqual(lanes_lib.format_elapsed(7500), "2h 5m")
+
+    def test_format_elapsed_matches_sample_table(self):
+        """The lanes formatter returns the same strings as fmtDur (see
+        ELAPSED_SAMPLES, shared with the page-rules JS test)."""
+        for seconds, want in ELAPSED_SAMPLES:
+            with self.subTest(seconds=seconds):
+                self.assertEqual(lanes_lib.format_elapsed(seconds), want)
+
+    def test_format_elapsed_dash_and_negative_handling(self):
+        self.assertEqual(lanes_lib.format_elapsed(None), "-")
+        self.assertEqual(lanes_lib.format_elapsed("abc"), "-")
+        self.assertEqual(lanes_lib.format_elapsed(float("nan")), "-")
+        self.assertEqual(lanes_lib.format_elapsed(float("inf")), "-")
+        self.assertEqual(lanes_lib.format_elapsed(-5), "0s")
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_format_elapsed_cross_checks_fmt_dur_in_node(self):
+        """Run fmtDur in node over the same inputs and compare string by
+        string with the Python mirror, across a wide spread of seconds."""
+        inputs = [v for v, _ in ELAPSED_SAMPLES] + [
+            0.4, 59.4, 59.5, 60, 3599.5, 3600, 86399.9, 172799.9, 1209599.5,
+            31535999.9, 10 ** 9, 0.25 * 3600 * 48,
+        ]
+        harness = (
+            "const fs = require('fs');\n"
+            "var window = {};\n"
+            "eval(fs.readFileSync(process.argv[2], 'utf8'));\n"
+            "const inputs = JSON.parse(fs.readFileSync(process.argv[3], 'utf8'));\n"
+            "process.stdout.write(JSON.stringify(inputs.map(function (v) { return window.AD.fmtDur(v); })));\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            harness_path = Path(tmp) / "fmtdur_cross.js"
+            inputs_path = Path(tmp) / "inputs.json"
+            harness_path.write_text(harness, encoding="utf-8")
+            inputs_path.write_text(json.dumps(inputs), encoding="utf-8")
+            proc = subprocess.run(
+                ["node", str(harness_path), str(STATIC_FORMAT), str(inputs_path)],
+                capture_output=True,
+                text=True,
+            )
+        self.assertEqual(proc.returncode, 0, proc.stderr or proc.stdout)
+        js_values = json.loads(proc.stdout)
+        for seconds, js in zip(inputs, js_values):
+            with self.subTest(seconds=seconds):
+                self.assertEqual(lanes_lib.format_elapsed(seconds), js)
 
 
 class CliTests(unittest.TestCase):
