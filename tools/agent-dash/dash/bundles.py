@@ -76,6 +76,7 @@ WS_USAGE = """agent-dash workstream bundles
   python3 agent_dash.py ws deferred [<ID>] [--json]
   python3 agent_dash.py ws layout <ID> [--json]
   python3 agent_dash.py ws linear <link|sync|status|unlink> <ID> [--team KEY] [--json]
+  python3 agent_dash.py ws linear update <ID> [--health on-track|at-risk|off-track] [--dry-run]
   python3 agent_dash.py ws linear login
   python3 agent_dash.py ws linear logout
 
@@ -2182,7 +2183,7 @@ def print_deferred(ws: str | None, json_mode: bool = False) -> int:
     return 0
 
 
-LINEAR_SUBCOMMANDS = ("link", "sync", "status", "unlink")
+LINEAR_SUBCOMMANDS = ("link", "sync", "status", "unlink", "update")
 
 
 def _cmd_linear_auth(args: list[str], team: str | None) -> int:
@@ -2196,6 +2197,36 @@ def _cmd_linear_auth(args: list[str], team: str | None) -> int:
     if sub == "logout":
         return linear_auth.logout()
     return linear_auth.login()
+
+
+def _cmd_linear_update(args: list[str]) -> int:
+    """``ws linear update <WS> [--health on-track|at-risk|off-track] [--dry-run]``: one standup update to Linear."""
+    from dash import linear_update
+
+    health: str | None = None
+    dry_run = False
+    rest: list[str] = []
+    pos = 0
+    while pos < len(args):
+        arg = args[pos]
+        if arg == "--dry-run":
+            dry_run = True
+        elif arg == "--health":
+            if pos + 1 >= len(args) or args[pos + 1].startswith("-"):
+                print("--health needs on-track, at-risk or off-track. Run: python3 agent_dash.py ws linear update <ID> --health on-track", flush=True)
+                return errors.USAGE
+            health = args[pos + 1]
+            pos += 1
+        elif arg.startswith("-"):
+            print(f"unknown flag {arg!r} for ws linear update. Run: python3 agent_dash.py ws linear update <ID> [--health on-track] [--dry-run]", flush=True)
+            return errors.USAGE
+        else:
+            rest.append(arg)
+        pos += 1
+    if len(rest) != 1:
+        print("ws linear update needs one workstream id. Run: python3 agent_dash.py ws linear update <ID> [--dry-run]", flush=True)
+        return errors.USAGE
+    return linear_update.post(rest[0], health=health, dry_run=dry_run)
 
 
 def _cmd_linear(rest: list[str], json_mode: bool = False) -> int:
@@ -2215,6 +2246,11 @@ def _cmd_linear(rest: list[str], json_mode: bool = False) -> int:
     if args[0] in ("login", "logout"):
         return _cmd_linear_auth(args, team)
     sub = args[0]
+    if sub == "update":
+        if team is not None:
+            print("--team applies to link only. Run: python3 agent_dash.py ws linear update <ID>", flush=True)
+            return errors.USAGE
+        return _cmd_linear_update(args[1:])
     if sub not in LINEAR_SUBCOMMANDS:
         print(f"unknown linear subcommand {sub!r}. Use one of: {', '.join(LINEAR_SUBCOMMANDS)}. Run: python3 agent_dash.py ws linear status <ID>", flush=True)
         return errors.USAGE

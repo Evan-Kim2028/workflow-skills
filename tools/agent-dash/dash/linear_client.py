@@ -205,6 +205,12 @@ query IssueRelations($id: String!) {
 }
 """
 
+PROJECT_UPDATE_CREATE = """
+mutation ProjectUpdateCreate($input: ProjectUpdateCreateInput!) {
+  projectUpdateCreate(input: $input) { success projectUpdate { id } }
+}
+"""
+
 COMMENT_CREATE = """
 mutation CommentCreate($input: CommentCreateInput!) {
   commentCreate(input: $input) { success }
@@ -649,6 +655,15 @@ class Client:
     def comment(self, issue_id: str, body: str) -> None:
         """Add a comment to an issue."""
         self.query(COMMENT_CREATE, {"input": {"issueId": issue_id, "body": body}})
+
+    def post_update(self, project_id: str, body: str, health: str) -> str | None:
+        """Create a project status update with a markdown body and a health enum (onTrack, atRisk, offTrack). Returns its id."""
+        data = self.query(PROJECT_UPDATE_CREATE, {"input": {"projectId": project_id, "body": body, "health": health}})
+        payload = data["projectUpdateCreate"]
+        if not payload.get("success"):
+            raise LinearError("GRAPHQL", "project update was not saved")
+        update = payload.get("projectUpdate") or {}
+        return update.get("id")
 
     def issues_updated_since(self, project_id: str, since_iso: str | None) -> list[dict]:
         """Return every issue in the project updated after ``since_iso``, ordered by updatedAt.
