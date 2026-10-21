@@ -21,6 +21,7 @@ import tempfile
 import threading
 import unittest
 import uuid
+from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -119,11 +120,12 @@ class FakeLinear:
         self.projects: dict[str, dict] = {}
         self.milestones: dict[str, dict] = {}
         self.issues: dict[str, dict] = {}
-        self.relations: list[tuple[str, str, str]] = []
+        self.relations: dict[str, tuple[str, str, str]] = {}
         self.comments: list[dict] = []
         self.ops: list[str] = []
         self.rate_limit_next = 0
         self.error_next: str | None = None
+        self.during_issues: Callable[[], None] | None = None
         self.issue_seq = 0
         team_id = "team-eng"
         self.teams[team_id] = {"id": team_id, "key": TEAM_KEY, "states": []}
@@ -386,10 +388,16 @@ class FakeLinear:
         if data["issueId"] not in self.issues or data["relatedIssueId"] not in self.issues:
             raise GqlError("Entity not found")
         edge = (data["issueId"], data["relatedIssueId"], data["type"])
-        if edge in self.relations:
+        if edge in self.relations.values():
             raise GqlError("Issue relation already exists")
-        self.relations.append(edge)
-        return {"issueRelationCreate": {"success": True}}
+        relation_id = self._new_id("relation")
+        self.relations[relation_id] = edge
+        return {"issueRelationCreate": {"success": True, "issueRelation": {"id": relation_id}}}
+
+    def op_IssueRelationDelete(self, v: dict) -> dict:
+        if self.relations.pop(v.get("id"), None) is None:
+            raise GqlError("Entity not found")
+        return {"issueRelationDelete": {"success": True}}
 
     def op_CommentCreate(self, v: dict) -> dict:
         data = v["input"]
@@ -399,6 +407,9 @@ class FakeLinear:
         return {"commentCreate": {"success": True}}
 
     def op_ProjectIssues(self, v: dict) -> dict:
+        hook, self.during_issues = self.during_issues, None
+        if hook is not None:
+            hook()
         flt = v.get("filter") or {}
         project_id = ((flt.get("project") or {}).get("id") or {}).get("eq")
         since = (flt.get("updatedAt") or {}).get("gt")
@@ -420,7 +431,11 @@ class FakeLinear:
                 "identifier": issue["identifier"],
                 "url": issue["url"],
                 "updatedAt": issue["updatedAt"],
-                "state": {"name": self.states[issue["stateId"]]["name"], "type": self.states[issue["stateId"]]["type"]},
+                "state": {
+                    "id": issue["stateId"],
+                    "name": self.states[issue["stateId"]]["name"],
+                    "type": self.states[issue["stateId"]]["type"],
+                },
             }
             for issue in page
         ]
@@ -433,6 +448,14 @@ class FakeLinear:
             issue = self.by_identifier(identifier)
             issue["stateId"] = next(sid for sid, state in self.states.items() if state["name"] == state_name)
             issue["updatedAt"] = self._stamp()
+
+    def delete_issue(self, identifier: str) -> None:
+        """Delete an issue in Linear, cascading its relations as Linear does."""
+        with self.lock:
+            issue = self.by_identifier(identifier)
+            del self.issues[issue["id"]]
+            for relation_id in [rid for rid, edge in self.relations.items() if issue["id"] in edge[:2]]:
+                del self.relations[relation_id]
 
     def by_identifier(self, identifier: str) -> dict:
         return next(issue for issue in self.issues.values() if issue["identifier"] == identifier)
@@ -559,7 +582,16 @@ class LinkEndToEndTest(LinearE2ETest):
             (self._issue_id("WS4.2"), self._issue_id("WS4.3"), "blocks"),
             (self._issue_id("WS4.1"), self._issue_id("WS4.4"), "blocks"),
         }
-        self.assertEqual(set(self.fake.relations), expected)
+        self.assertEqual(set(self.fake.relations.values()), expected)
+        ids_by_pair = {edge[:2]: rid for rid, edge in self.fake.relations.items()}
+        self.assertEqual(
+            record["relations"],
+            {
+                "WS4.1>WS4.2": ids_by_pair[(self._issue_id("WS4.1"), self._issue_id("WS4.2"))],
+                "WS4.2>WS4.3": ids_by_pair[(self._issue_id("WS4.2"), self._issue_id("WS4.3"))],
+                "WS4.1>WS4.4": ids_by_pair[(self._issue_id("WS4.1"), self._issue_id("WS4.4"))],
+            },
+        )
 
         workspace = linear.read_workspace()
         awaiting = self.fake.state_named("Awaiting prod")
@@ -620,6 +652,8 @@ class SyncEndToEndTest(LinearE2ETest):
         self.assertIsNone(result["error"])
         self.assertEqual(result["applied"], 1)
         self.assertEqual(self._approval_status("A1"), "approved")
+        decided = json.loads((self.root / WS / "approvals.json").read_text(encoding="utf-8"))
+        self.assertEqual(decided["decided_by"], "linear")
         self.assertEqual(linear.read_outbox(WS, self.root), [])
 
     def test_rate_limit_sets_last_error_and_next_sync_recovers(self) -> None:
@@ -671,6 +705,62 @@ class SyncEndToEndTest(LinearE2ETest):
 
         self.assertEqual(self.fake.counts(), before)
         self.assertEqual({key: self._issue_id(key) for key in before_ids}, before_ids)
+
+
+class DeletedAndMidPullEndToEndTest(LinearE2ETest):
+    def setUp(self) -> None:
+        super().setUp()
+        self._link()
+
+    def test_issue_deleted_in_linear_is_detached_and_never_recreated(self) -> None:
+        ident = self._ident("WS4.3")
+        self.fake.delete_issue(ident)
+        issues_after_delete = self.fake.counts()["issues"]
+        self.assertEqual(self.fake.counts()["relations"], 2)
+
+        self._set_local("WS4.3", "wip")
+        result = self._sync(now=self.now + 1)
+
+        self.assertIsNone(result["error"])
+        record = self._link_record()
+        self.assertIn("task:WS4.3", record["detached"])
+        self.assertNotIn("WS4.3", record["tasks"])
+        self.assertIsNone(record["last_error"])
+        self.assertEqual(linear.read_outbox(WS, self.root), [])
+
+        self.fake.ops.clear()
+        self._set_local("WS4.4", "wip")
+        self.assertIsNone(self._sync(now=self.now + 2)["error"])
+        self._link(now=self.now + 3)
+        self.assertIsNone(self._sync(now=self.now + 4)["error"])
+
+        self.assertNotIn("IssueCreate", self.fake.ops)
+        self.assertEqual(self.fake.counts()["issues"], issues_after_delete)
+        with self.assertRaises(StopIteration):
+            self.fake.by_identifier(ident)
+        self.assertEqual(self.fake.counts()["relations"], 2)
+        self.assertEqual(self._task_status("WS4.3"), "wip")
+
+    def test_local_write_during_issues_pull_survives_and_reaches_linear(self) -> None:
+        ident = self._ident("WS4.3")
+        self.fake.set_state(ident, "In Review")
+
+        def local_write() -> None:
+            bundles.set_task(WS, "WS4.3", "wip", None, None, root=self.root, origin="local")
+
+        self.fake.during_issues = local_write
+        first = self._sync(now=self.now + 1)
+
+        self.assertIsNone(first["error"])
+        self.assertEqual(first["applied"], 0)
+        self.assertEqual(self._task_status("WS4.3"), "wip")
+        self.assertEqual(len(linear.read_outbox(WS, self.root)), 1)
+
+        second = self._sync(now=self.now + 2)
+        self.assertIsNone(second["error"])
+        self.assertEqual(self._task_status("WS4.3"), "wip")
+        self.assertEqual(self.fake.by_identifier(ident)["stateId"], self.fake.state_named("In Progress")["id"])
+        self.assertEqual(linear.read_outbox(WS, self.root), [])
 
 
 if __name__ == "__main__":
