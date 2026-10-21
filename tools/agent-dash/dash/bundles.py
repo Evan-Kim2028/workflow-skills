@@ -1056,6 +1056,18 @@ def set_approval(
     root: Path | None = None,
     origin: str = "local",
 ) -> int:
+    """Set one approval item's status and write approvals.json.
+
+    ``origin="local"`` (the owner's ``ws approve``) records the change in the
+    Linear outbox while the bundle ``.lock`` is held, so a concurrent pull
+    either sees the row or has not read the old value yet. ``origin="linear"``
+    (a pull) writes nothing and returns ``errors.SKIPPED_PENDING`` when a local
+    row for the item is still in the outbox; the local decision wins and
+    reaches Linear on the next flush. Decisions made with ``origin="linear"``
+    record ``decided_by="linear"``, others ``"owner"``.
+    """
+    from dash import linear
+
     if not _ITEM.match(item_id):
         print(f"bad approval id {item_id!r}: use letters, digits, _, ., - (max 64 chars)", flush=True)
         return errors.USAGE
@@ -1068,6 +1080,8 @@ def set_approval(
         return errors.NOT_FOUND
     file = path / "approvals.json"
     with _bundle_lock(path):
+        if origin == "linear" and linear.has_pending(ws, "approval", item_id, root):
+            return errors.SKIPPED_PENDING
         if file.is_file():
             data = _read_json(file)
             if not isinstance(data, dict):
@@ -1112,7 +1126,7 @@ def set_approval(
                 found["note"] = note
         if status in ("approved", "denied"):
             data["decided_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-            data["decided_by"] = "owner"
+            data["decided_by"] = "linear" if origin == "linear" else "owner"
         else:
             data.setdefault("decided_at", None)
             data.setdefault("decided_by", None)
@@ -1123,10 +1137,8 @@ def set_approval(
             "items": items,
         }
         _atomic_write(file, json.dumps(payload, indent=2, ensure_ascii=False) + "\n")
-    if origin == "local":
-        from dash import linear
-
-        linear.enqueue(ws, "approval", item_id, root=root)
+        if origin == "local":
+            linear.enqueue(ws, "approval", item_id, root=root)
     print(f"{ws} {item_id} {status}")
     return 0
 
@@ -1494,6 +1506,17 @@ def set_task(
     force: bool = False,
     origin: str = "local",
 ) -> int:
+    """Set one task's status in plan.json and append history.
+
+    ``origin="local"`` (the owner's ``ws task``) records the change in the
+    Linear outbox while the bundle ``.lock`` is held, so a concurrent pull
+    either sees the row or has not read the old value yet. ``origin="linear"``
+    (a pull) writes nothing, appends no history and prints nothing, and
+    returns ``errors.SKIPPED_PENDING`` when a local row for the task is still
+    in the outbox; the local status wins and reaches Linear on the next flush.
+    """
+    from dash import linear
+
     if status not in STATUSES:
         print(f"unknown status {status!r}. Use one of: {', '.join(STATUSES)}", flush=True)
         for key in STATUSES:
@@ -1514,6 +1537,8 @@ def set_task(
         return errors.NOT_FOUND
     plan_path = path / "plan.json"
     with _bundle_lock(path):
+        if origin == "linear" and linear.has_pending(ws, "task", task_id, root):
+            return errors.SKIPPED_PENDING
         data = _read_json(plan_path)
         if not isinstance(data, dict):
             print(errors.plan_unreadable(ws), flush=True)
@@ -1551,12 +1576,10 @@ def set_task(
             print(errors.task_not_found(ws, task_id, known), flush=True)
             return errors.NOT_FOUND
         _atomic_write(plan_path, json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+        if origin == "local":
+            linear.enqueue(ws, "task", task_id, root=root)
     if old_status != status:
         append_history(ws, task_id, old_status, status, root=root, by=origin if origin != "local" else None)
-    if origin == "local":
-        from dash import linear
-
-        linear.enqueue(ws, "task", task_id, root=root)
     print(f"{ws} {task_id} {status}")
     return 0
 

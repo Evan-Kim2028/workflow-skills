@@ -12,6 +12,8 @@ import fcntl
 import hashlib
 import json
 import os
+import re
+import tempfile
 import time
 import uuid
 from pathlib import Path
@@ -68,13 +70,22 @@ _RENDER_FOOTER = (
     "Status syncs both ways._"
 )
 
+_KEY_SHAPE = re.compile(r"[\x21-\x7e]+")
+
 _APPROVAL_FOOTER = "_Decision lives in the agent-dash approvals list; the approval state syncs both ways._"
 
 
 def api_key() -> str | None:
-    """The Linear API key from ``LINEAR_API_KEY``, or None when unset or blank."""
+    """The Linear API key from ``LINEAR_API_KEY``, or None when unset, blank or malformed.
+
+    A key is one run of printable ASCII without spaces once the ends are
+    stripped. Anything else (an embedded newline or space) is rejected, so a
+    bad key can never reach an http.client error message.
+    """
     raw = os.environ.get(ENV_KEY, "").strip()
-    return raw or None
+    if not raw or _KEY_SHAPE.fullmatch(raw) is None:
+        return None
+    return raw
 
 
 def stable_id(*parts: str) -> str:
@@ -207,12 +218,30 @@ def read_link(ws: str, root: Path | None = None) -> dict | None:
     return data if isinstance(data, dict) else None
 
 
+def _write_unique(path: Path, text: str) -> None:
+    """Write ``text`` to ``path`` through a uniquely named temp file and os.replace.
+
+    Two concurrent writers each get their own temp file, so neither can
+    replace the other's half-written file. The temp file is removed on error.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".linear-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(text)
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+
+
 def write_link(ws: str, data: dict, root: Path | None = None) -> None:
-    """Write ``linear.json`` through a temp file and os.replace. Raises ValueError for an unknown bundle."""
+    """Write ``linear.json`` through a unique temp file and os.replace. Raises ValueError for an unknown bundle."""
     path = link_path(ws, root)
     if path is None:
         raise ValueError(f"unknown workstream bundle: {ws}")
-    _atomic_write(path, json.dumps(data, indent=2, sort_keys=True, ensure_ascii=False) + "\n")
+    _write_unique(path, json.dumps(data, indent=2, sort_keys=True, ensure_ascii=False) + "\n")
 
 
 def is_linked(ws: str, root: Path | None = None) -> bool:
@@ -236,16 +265,17 @@ def read_workspace() -> dict | None:
 
 
 def write_workspace(data: dict) -> None:
-    """Write the workspace ``linear.json`` through a temp file and os.replace."""
-    _atomic_write(workspace_path(), json.dumps(data, indent=2, sort_keys=True, ensure_ascii=False) + "\n")
+    """Write the workspace ``linear.json`` through a unique temp file and os.replace."""
+    _write_unique(workspace_path(), json.dumps(data, indent=2, sort_keys=True, ensure_ascii=False) + "\n")
 
 
 @contextlib.contextmanager
 def _outbox_lock(bundle: Path):
-    """Short exclusive lock around one outbox append or rewrite.
+    """Short exclusive lock around one outbox append, read or rewrite.
 
     Separate from the sync cycle lock, so a local write never waits on a
     running sync: it only serializes the append against a drain's rewrite.
+    Lock order is the bundle ``.lock`` first, then this one, never the reverse.
     """
     with open(bundle / OUTBOX_LOCK, "a+b") as handle:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
@@ -256,6 +286,7 @@ def _outbox_lock(bundle: Path):
 
 
 def _parse_rows(path: Path) -> list[dict]:
+    """Valid outbox rows in file order. A row without an ``id`` (written before ids existed) gets one derived from its line, so it drains like any other."""
     if not path.is_file():
         return []
     try:
@@ -274,6 +305,7 @@ def _parse_rows(path: Path) -> list[dict]:
             and row.get("kind") in ("task", "approval")
             and isinstance(row.get("key"), str)
         ):
+            row.setdefault("id", hashlib.sha256(line.encode("utf-8")).hexdigest()[:32])
             rows.append(row)
     return rows
 
@@ -281,21 +313,41 @@ def _parse_rows(path: Path) -> list[dict]:
 def enqueue(ws: str, kind: str, key: str, root: Path | None = None, now: float | None = None) -> None:
     """Record one local write for the next sync. No-op when the bundle is not linked.
 
-    One O_APPEND line, fsynced, like ``bundles.append_history``. A failed
-    append warns and returns, so the local write itself is never blocked.
+    The row gets a unique ``id`` and its ``ts`` is stamped inside the outbox
+    lock, so rows are ordered by when they were appended. Callers hold the
+    bundle ``.lock`` across the plan write and this call, so a pull that
+    holds the same lock sees either both or neither. One O_APPEND line,
+    fsynced. A failed append warns and returns, so the local write itself is
+    never blocked.
     """
-    if not is_linked(ws, root):
-        return
     bundle = bundle_dir(ws, root)
-    row = {"ts": time.time() if now is None else now, "kind": kind, "key": key}
+    if bundle is None or not is_linked(ws, root):
+        return
     try:
         with _outbox_lock(bundle):
+            if not is_linked(ws, root):
+                return
+            row = {
+                "id": uuid.uuid4().hex,
+                "ts": time.time() if now is None else now,
+                "kind": kind,
+                "key": key,
+            }
             with open(bundle / OUTBOX_FILE, "a", encoding="utf-8") as handle:
                 handle.write(json.dumps(row, sort_keys=True, ensure_ascii=False) + "\n")
                 handle.flush()
                 os.fsync(handle.fileno())
     except OSError as exc:
         print(f"linear outbox not recorded for {ws} {key}: {exc}", flush=True)
+
+
+def has_pending(ws: str, kind: str, key: str, root: Path | None = None) -> bool:
+    """True when the outbox holds a row for this kind and key, read under the outbox lock."""
+    bundle = bundle_dir(ws, root)
+    if bundle is None:
+        return False
+    with _outbox_lock(bundle):
+        return any(row["kind"] == kind and row["key"] == key for row in _parse_rows(bundle / OUTBOX_FILE))
 
 
 def read_outbox(ws: str, root: Path | None = None) -> list[dict]:
@@ -306,14 +358,18 @@ def read_outbox(ws: str, root: Path | None = None) -> list[dict]:
     return _parse_rows(path)
 
 
-def drain_outbox(ws: str, upto_ts: float, root: Path | None = None) -> None:
-    """Rewrite the outbox keeping only rows with ts > upto_ts (temp + replace)."""
+def drain_outbox(ws: str, ids: set[str], root: Path | None = None) -> None:
+    """Remove exactly the outbox rows whose ``id`` is in ``ids``, then rewrite the file (temp + replace).
+
+    Rows not in ``ids`` stay, including any appended after the caller read
+    the outbox. An unlinked bundle with no outbox file is a no-op.
+    """
     bundle = bundle_dir(ws, root)
     if bundle is None:
         return
     path = bundle / OUTBOX_FILE
     with _outbox_lock(bundle):
-        keep = [row for row in _parse_rows(path) if row["ts"] > upto_ts]
+        keep = [row for row in _parse_rows(path) if row["id"] not in ids]
         if not path.exists() and not keep:
             return
         text = "".join(json.dumps(row, sort_keys=True, ensure_ascii=False) + "\n" for row in keep)
@@ -335,23 +391,34 @@ def sync_state(ws: str, root: Path | None = None) -> dict | None:
     }
 
 
+def _https_url(value) -> str | None:
+    """The value when it is a string starting with ``https://``, else None. The page renders these as hrefs."""
+    return value if isinstance(value, str) and value.startswith("https://") else None
+
+
 def page_link(ws: str, root: Path | None = None) -> dict | None:
-    """None when unlinked, else {'url', 'synced_at'}: the only Linear data the page payload carries at plan level."""
+    """None when unlinked, else {'url', 'synced_at'}: the only Linear data the page payload carries at plan level.
+
+    ``url`` is None unless it is an https URL, so a stored ``javascript:`` or ``http:`` value never reaches an href.
+    """
     link = read_link(ws, root)
     if link is None:
         return None
     project = link.get("project") if isinstance(link.get("project"), dict) else {}
-    return {"url": project.get("url"), "synced_at": link.get("synced_at")}
+    return {"url": _https_url(project.get("url")), "synced_at": link.get("synced_at")}
 
 
 def task_links(ws: str, root: Path | None = None) -> dict[str, dict]:
-    """{task_id: {'identifier', 'url'}}; empty when unlinked."""
+    """{task_id: {'identifier', 'url'}}; empty when unlinked.
+
+    ``url`` is None unless it is an https URL; the identifier is kept either way.
+    """
     link = read_link(ws, root)
     tasks = link.get("tasks") if link is not None else None
     if not isinstance(tasks, dict):
         return {}
     return {
-        tid: {"identifier": entry.get("identifier"), "url": entry.get("url")}
+        tid: {"identifier": entry.get("identifier"), "url": _https_url(entry.get("url"))}
         for tid, entry in tasks.items()
         if isinstance(entry, dict)
     }

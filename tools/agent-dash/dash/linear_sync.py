@@ -305,7 +305,7 @@ def _flush(client: Client, ws: str, root: Path | None, record: dict, ws_data: di
     row is written only after its plan write, so every row read is visible
     in the later reads and the value sent is never older than the row. The
     newest row per key wins. Keys with no mapped issue are skipped. The
-    outbox is drained up to the newest row read; a failure leaves it
+    rows read are drained by id, so rows appended meanwhile stay; a failure leaves it
     untouched and the next cycle resends (state sets are idempotent).
     """
     rows = linear.read_outbox(ws, root)
@@ -314,7 +314,6 @@ def _flush(client: Client, ws: str, root: Path | None, record: dict, ws_data: di
     newest: dict[tuple[str, str], dict] = {}
     for row in rows:
         newest[(row["kind"], row["key"])] = row
-    high = max(row["ts"] for row in rows)
     plan = _plan(ws, root)
     if plan is None:
         raise RuntimeError(f"plan.json for {ws} is unreadable")
@@ -352,7 +351,7 @@ def _flush(client: Client, ws: str, root: Path | None, record: dict, ws_data: di
                     raise
                 _detach(record, kind, key)
         sent += 1
-    linear.drain_outbox(ws, high, root)
+    linear.drain_outbox(ws, {row["id"] for row in rows}, root)
     return sent
 
 
@@ -367,6 +366,8 @@ def _apply_task(ws: str, root: Path | None, key: str, state: dict) -> int:
     note = "canceled in Linear" if target == "deferred" else None
     with contextlib.redirect_stdout(io.StringIO()):
         rc = bundles.set_task(ws, key, target, moved_to=None, note=note, root=root, force=True, origin="linear")
+    if rc == errors.SKIPPED_PENDING:
+        return 0
     if rc != 0:
         raise RuntimeError(f"local apply failed for task {key} (exit {rc})")
     return 1
@@ -391,6 +392,8 @@ def _apply_approval(ws: str, root: Path | None, key: str, state: dict) -> int:
             root=root,
             origin="linear",
         )
+    if rc == errors.SKIPPED_PENDING:
+        return 0
     if rc != 0:
         raise RuntimeError(f"local apply failed for approval {key} (exit {rc})")
     return 1
@@ -632,7 +635,7 @@ def unlink(ws: str, root: Path | None = None) -> int:
         print(f"{ws} is not linked; nothing to remove")
         return errors.OK
     project_url = (record.get("project") or {}).get("url") or "-"
-    with _sync_lock(path):
+    with _sync_lock(path), linear._outbox_lock(path):
         (path / linear.LINK_FILE).unlink(missing_ok=True)
         (path / linear.OUTBOX_FILE).unlink(missing_ok=True)
     print(f"unlinked {ws}. Kept in Linear: project {project_url} and its issues (not deleted).")
