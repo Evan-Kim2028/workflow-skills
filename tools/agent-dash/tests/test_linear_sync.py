@@ -56,7 +56,7 @@ APPROVALS = {
 def _write_bundle(root: Path) -> None:
     bundle = root / "WS9"
     bundle.mkdir(parents=True)
-    (bundle / "bundle.json").write_text(json.dumps({"id": "WS9", "title": "Pipeline doctor", "state": "active"}), encoding="utf-8")
+    (bundle / "bundle.json").write_text(json.dumps({"id": "WS9", "title": "Notes cutover", "state": "active"}), encoding="utf-8")
     (bundle / "plan.json").write_text(json.dumps(PLAN), encoding="utf-8")
     (bundle / "approvals.json").write_text(json.dumps(APPROVALS), encoding="utf-8")
 
@@ -151,8 +151,8 @@ class FakeLinear:
             self.count += 1
             issue = {
                 "id": issue_id,
-                "identifier": f"TRD-{self.count}",
-                "url": f"https://linear.app/team/TRD/issue/TRD-{self.count}",
+                "identifier": f"ENG-{self.count}",
+                "url": f"https://linear.app/team/ENG/issue/ENG-{self.count}",
                 "state_id": state_id,
                 "project": project_id,
             }
@@ -216,7 +216,7 @@ class LinearSyncTest(unittest.TestCase):
 
     def _link(self):
         with self._quiet() as out:
-            rc = link("WS9", "TRD", root=self.root, client=self.fake, now=self.now)
+            rc = link("WS9", "ENG", root=self.root, client=self.fake, now=self.now)
         self.assertEqual(rc, 0)
         return out.getvalue()
 
@@ -254,7 +254,7 @@ class LinkTest(LinearSyncTest):
     def test_link_refuses_without_key(self):
         del os.environ[linear.ENV_KEY]
         with self._quiet() as out:
-            rc = link("WS9", "TRD", root=self.root, client=self.fake, now=self.now)
+            rc = link("WS9", "ENG", root=self.root, client=self.fake, now=self.now)
         self.assertEqual(rc, errors.USAGE)
         self.assertIn(linear.ENV_KEY, out.getvalue())
         self.assertFalse(linear.is_linked("WS9", self.root))
@@ -265,7 +265,7 @@ class LinkTest(LinearSyncTest):
         self.assertIn("https://linear.app/project/", out)
 
         creates = self.fake.calls_named("create")
-        self.assertEqual([call[1] for call in creates], ["TRD-1", "TRD-2", "TRD-3", "TRD-4", "TRD-5"])
+        self.assertEqual([call[1] for call in creates], ["ENG-1", "ENG-2", "ENG-3", "ENG-4", "ENG-5"])
         self.assertEqual(len(self.fake.calls_named("milestone")), 2)
         ids = {key: self._link_record()["tasks"][key]["id"] for key in ("WS9.1", "WS9.2", "WS9.3")}
         self.assertEqual(
@@ -310,7 +310,7 @@ class LinkTest(LinearSyncTest):
 
         self.fake.calls.clear()
         with self._quiet():
-            rc = link("WS9", "TRD", root=self.root, client=self.fake, now=self.now + 2)
+            rc = link("WS9", "ENG", root=self.root, client=self.fake, now=self.now + 2)
         self.assertEqual(rc, 0)
         self.assertEqual(self.fake.calls_named("create"), [])
         self.assertEqual(self.fake.calls_named("blocks"), [])
@@ -517,7 +517,7 @@ class UnlinkAndTrainsTest(LinearSyncTest):
     def test_train_refs_lists_linked_members(self):
         self._link()
         train = PLAN["trains"][0]
-        self.assertEqual(train_refs("WS9", train, self.root), "Fixes TRD-1, TRD-2")
+        self.assertEqual(train_refs("WS9", train, self.root), "Fixes ENG-1, ENG-2")
         self.assertIsNone(train_refs("WS9", {"members": []}, self.root))
         with self._quiet():
             unlink("WS9", root=self.root)

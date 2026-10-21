@@ -218,7 +218,7 @@ class TeamTests(unittest.TestCase):
                     "nodes": [
                         {
                             "id": "t1",
-                            "key": "TRD",
+                            "key": "ENG",
                             "states": {"nodes": [{"id": "s1", "name": "Todo", "type": "unstarted"}]},
                         }
                     ]
@@ -226,10 +226,10 @@ class TeamTests(unittest.TestCase):
             }
         )
         client, fake = _client([reply])
-        team = client.team("TRD")
-        self.assertEqual(team, {"id": "t1", "key": "TRD", "states": [{"id": "s1", "name": "Todo", "type": "unstarted"}]})
+        team = client.team("ENG")
+        self.assertEqual(team, {"id": "t1", "key": "ENG", "states": [{"id": "s1", "name": "Todo", "type": "unstarted"}]})
         self.assertIn("teams(filter:", fake.calls[0]["body"]["query"])
-        self.assertEqual(fake.calls[0]["body"]["variables"], {"key": "TRD"})
+        self.assertEqual(fake.calls[0]["body"]["variables"], {"key": "ENG"})
 
     def test_missing_team_is_not_found(self) -> None:
         client, _ = _client([_ok({"teams": {"nodes": []}})])
@@ -240,10 +240,10 @@ class TeamTests(unittest.TestCase):
 
 class UpsertIssueTests(unittest.TestCase):
     def test_update_path_never_sends_state(self) -> None:
-        reply = _ok({"issueUpdate": {"success": True, "issue": {"id": "i1", "identifier": "TRD-1", "url": "https://l/1"}}})
+        reply = _ok({"issueUpdate": {"success": True, "issue": {"id": "i1", "identifier": "ENG-1", "url": "https://l/1"}}})
         client, fake = _client([reply])
         result = client.upsert_issue("i1", "t1", "p1", "m1", "Title", "Body", state_id="s1", label_ids=["l1"])
-        self.assertEqual(result, {"id": "i1", "identifier": "TRD-1", "url": "https://l/1"})
+        self.assertEqual(result, {"id": "i1", "identifier": "ENG-1", "url": "https://l/1"})
         self.assertEqual(len(fake.calls), 1)
         body = fake.calls[0]["body"]
         self.assertIn("issueUpdate(id:", body["query"])
@@ -254,10 +254,10 @@ class UpsertIssueTests(unittest.TestCase):
         self.assertNotIn("teamId", body["variables"]["input"])
 
     def test_create_on_not_found_uses_client_id_and_state(self) -> None:
-        created = _ok({"issueCreate": {"success": True, "issue": {"id": "i2", "identifier": "TRD-2", "url": "https://l/2"}}})
+        created = _ok({"issueCreate": {"success": True, "issue": {"id": "i2", "identifier": "ENG-2", "url": "https://l/2"}}})
         client, fake = _client([_not_found(), created])
         result = client.upsert_issue("i2", "t1", "p1", "m1", "Title", "Body", state_id="s1", label_ids=["l1"])
-        self.assertEqual(result["identifier"], "TRD-2")
+        self.assertEqual(result["identifier"], "ENG-2")
         self.assertEqual(len(fake.calls), 2)
         self.assertIn("issueUpdate(id:", fake.calls[0]["body"]["query"])
         create = fake.calls[1]["body"]
@@ -335,11 +335,11 @@ class EnsureTests(unittest.TestCase):
         self.assertEqual(body["variables"]["input"]["type"], "started")
 
     def test_ensure_initiative_finds_or_creates(self) -> None:
-        found = _ok({"initiatives": {"nodes": [{"id": "I1", "name": "Traded API unification", "url": "u1"}]}})
+        found = _ok({"initiatives": {"nodes": [{"id": "I1", "name": "Example program", "url": "u1"}]}})
         client, fake = _client([found])
         self.assertEqual(
-            client.ensure_initiative("Traded API unification"),
-            {"id": "I1", "name": "Traded API unification", "url": "u1"},
+            client.ensure_initiative("Example program"),
+            {"id": "I1", "name": "Example program", "url": "u1"},
         )
         self.assertEqual(len(fake.calls), 1)
         created = _ok({"initiativeCreate": {"success": True, "initiative": {"id": "I2", "name": "New", "url": "u2"}}})
@@ -348,17 +348,17 @@ class EnsureTests(unittest.TestCase):
         self.assertEqual(fake.calls[1]["body"]["variables"]["input"], {"name": "New"})
 
     def test_ensure_project_updates_existing(self) -> None:
-        reply = _ok({"projectUpdate": {"success": True, "project": {"id": "p1", "name": "Pipeline doctor", "url": "pu"}}})
+        reply = _ok({"projectUpdate": {"success": True, "project": {"id": "p1", "name": "Notes cutover", "url": "pu"}}})
         client, fake = _client([reply])
-        result = client.ensure_project("p1", "Pipeline doctor", "t1", "desc")
-        self.assertEqual(result, {"id": "p1", "url": "pu", "name": "Pipeline doctor"})
+        result = client.ensure_project("p1", "Notes cutover", "t1", "desc")
+        self.assertEqual(result, {"id": "p1", "url": "pu", "name": "Notes cutover"})
         self.assertEqual(len(fake.calls), 1)
         self.assertIn("projectUpdate(id:", fake.calls[0]["body"]["query"])
 
     def test_ensure_project_creates_with_client_id_on_not_found(self) -> None:
-        created = _ok({"projectCreate": {"success": True, "project": {"id": "p1", "name": "Pipeline doctor", "url": "pc"}}})
+        created = _ok({"projectCreate": {"success": True, "project": {"id": "p1", "name": "Notes cutover", "url": "pc"}}})
         client, fake = _client([_not_found(), created])
-        result = client.ensure_project("p1", "Pipeline doctor", "t1", "desc")
+        result = client.ensure_project("p1", "Notes cutover", "t1", "desc")
         self.assertEqual(result["url"], "pc")
         body = fake.calls[1]["body"]
         self.assertIn("projectCreate(input:", body["query"])

@@ -35,10 +35,10 @@ Status commands are unchanged when a workstream is linked. `ws task` still write
    python3 ~/.claude/tools/agent-dash/agent_dash.py restart
    ```
 
-4. Link the workstream to a Linear team. The team key is the prefix of its issue ids, such as `TRD`:
+4. Link the workstream to a Linear team. The team key is the prefix of its issue ids, such as `ENG`:
 
    ```bash
-   python3 ~/.claude/tools/agent-dash/agent_dash.py ws linear link WS4 --team TRD
+   python3 ~/.claude/tools/agent-dash/agent_dash.py ws linear link WS4 --team ENG
    ```
 
 `link` refuses to run when `LINEAR_API_KEY` is unset. The error names the variable.
@@ -96,7 +96,7 @@ When Linear holds a state name that the table does not list, the poller maps it 
 - **The poller syncs every minute.** Each cycle sends queued local changes first, then pulls Linear changes. The poller runs inside the dashboard.
 - **Whatever Linear holds last wins.** When both sides change between two syncs, the change saved last in Linear is the one that stands.
 - **Edit the spec in the plan.** Do not edit an issue description in Linear. Each push rewrites the description from `plan.json`, so a Linear edit to the description is lost. Status edits in Linear are kept.
-- **Put the Linear links in the pull request.** Run `ws trains <WS>`. For each train, a linked workstream prints a `Fixes TRD-…` string that names its member issues. Paste it into the train PR body. This needs Linear's GitHub integration connected to the repository. By default Linear moves linked issues to In Progress when the PR opens and to Done when it merges; set the team's pull request automation to move them to In Review on open so they match the dashboard's `pr` status.
+- **Put the Linear links in the pull request.** Run `ws trains <WS>`. For each train, a linked workstream prints a `Fixes ENG-…` string that names its member issues. Paste it into the train PR body. This needs Linear's GitHub integration connected to the repository. By default Linear moves linked issues to In Progress when the PR opens and to Done when it merges; set the team's pull request automation to move them to In Review on open so they match the dashboard's `pr` status.
 - **Approve from Linear.** Move the approval issue to Done to approve it, or to Canceled to deny it. The next sync writes the answer to `approvals.json`.
 - **Approve from the terminal.** `ws approve` still works. It queues the change for Linear.
 

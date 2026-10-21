@@ -568,7 +568,7 @@ def unlink(ws: str, root: Path | None = None) -> int:
 
 
 def train_refs(ws: str, train: dict, root: Path | None = None) -> str | None:
-    """'Fixes TRD-1, TRD-2' for the train's linked members, None when unlinked or none are linked."""
+    """'Fixes ENG-1, ENG-2' for the train's linked members, None when unlinked or none are linked."""
     record = linear.read_link(ws, root)
     if record is None:
         return None

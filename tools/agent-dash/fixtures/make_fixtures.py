@@ -972,7 +972,7 @@ def _clean_groups(groups):
     ]
 
 
-LINEAR_WS1 = {"url": "https://linear.app/example/project/pipeline-doctor", "synced_at": NOW - 240}
+LINEAR_WS1 = {"url": "https://linear.app/example/project/notes-cutover", "synced_at": NOW - 240}
 LINEAR_TASKS = {
     "0": {"identifier": "PD-1", "url": "https://linear.app/example/issue/PD-1"},
     "2": {"identifier": "PD-3", "url": "https://linear.app/example/issue/PD-3"},

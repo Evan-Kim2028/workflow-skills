@@ -833,7 +833,7 @@ class WsLinearCliTest(unittest.TestCase):
         os.environ["AGENT_DASH_DATA_ROOT"] = str(Path(self.tmp.name) / "data")
         bundle = self.root / "WS9"
         bundle.mkdir()
-        (bundle / "bundle.json").write_text(json.dumps({"id": "WS9", "title": "Pipeline doctor", "state": "active"}), encoding="utf-8")
+        (bundle / "bundle.json").write_text(json.dumps({"id": "WS9", "title": "Notes cutover", "state": "active"}), encoding="utf-8")
         plan = {
             "workstream": "WS9",
             "dag": {
@@ -869,8 +869,8 @@ class WsLinearCliTest(unittest.TestCase):
     def _link_file(self, tasks=None):
         record = {
             "version": 1,
-            "team_key": "TRD",
-            "project": {"id": "p", "url": "https://linear.app/project/p", "name": "Pipeline doctor"},
+            "team_key": "ENG",
+            "project": {"id": "p", "url": "https://linear.app/project/p", "name": "Notes cutover"},
             "milestones": {},
             "tasks": tasks or {},
             "approvals": {},
@@ -931,7 +931,7 @@ class WsLinearCliTest(unittest.TestCase):
         self.assertEqual(rc, errors.USAGE)
         rc, _ = self._run(["linear", "bogus", "WS9"])
         self.assertEqual(rc, errors.USAGE)
-        rc, _ = self._run(["linear", "status", "WS9", "--team", "TRD"])
+        rc, _ = self._run(["linear", "status", "WS9", "--team", "ENG"])
         self.assertEqual(rc, errors.USAGE)
         rc, _ = self._run(["linear", "status", "NOPE"])
         self.assertEqual(rc, errors.NOT_FOUND)
@@ -942,11 +942,11 @@ class WsLinearCliTest(unittest.TestCase):
         rc, plain = self._run(["trains", "WS9"])
         self.assertEqual(rc, 0)
         self.assertNotIn("LINEAR", plain)
-        self._link_file({"WS9.1": {"id": "a", "identifier": "TRD-1", "url": "u"}, "WS9.2": {"id": "b", "identifier": "TRD-2", "url": "u"}})
+        self._link_file({"WS9.1": {"id": "a", "identifier": "ENG-1", "url": "u"}, "WS9.2": {"id": "b", "identifier": "ENG-2", "url": "u"}})
         rc, linked = self._run(["trains", "WS9"])
         self.assertEqual(rc, 0)
         self.assertIn("LINEAR", linked.splitlines()[0])
-        self.assertIn("Fixes TRD-1, TRD-2", linked)
+        self.assertIn("Fixes ENG-1, ENG-2", linked)
 
 
 if __name__ == "__main__":

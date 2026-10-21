@@ -2167,7 +2167,7 @@ def _cmd_linear(rest: list[str], json_mode: bool = False) -> int:
     if "--team" in args:
         pos = args.index("--team")
         if pos + 1 >= len(args) or args[pos + 1].startswith("-"):
-            print("--team needs a Linear team key, e.g. --team TRD. Run: python3 agent_dash.py ws linear link <ID> --team TRD", flush=True)
+            print("--team needs a Linear team key, e.g. --team ENG. Run: python3 agent_dash.py ws linear link <ID> --team ENG", flush=True)
             return errors.USAGE
         team = args[pos + 1]
         del args[pos:pos + 2]
@@ -2183,7 +2183,7 @@ def _cmd_linear(rest: list[str], json_mode: bool = False) -> int:
         return errors.USAGE
     ws = args[1]
     if sub == "link" and not team:
-        print(f"team required to link. Run: python3 agent_dash.py ws linear link {ws} --team TRD", flush=True)
+        print(f"team required to link. Run: python3 agent_dash.py ws linear link {ws} --team ENG", flush=True)
         return errors.USAGE
     if sub != "link" and team is not None:
         print(f"--team applies to link only. Run: python3 agent_dash.py ws linear {sub} {ws}", flush=True)

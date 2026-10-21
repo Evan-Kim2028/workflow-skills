@@ -41,10 +41,10 @@ STATE_TYPE_FOR_STATUS = {
 }
 
 SAMPLE_TASK = {
-    "id": "WS14.classify",
+    "id": "WS4.classify",
     "title": "Run, step, and backend classifier",
     "status": "todo",
-    "deps": ["WS14.replay"],
+    "deps": ["WS4.replay"],
     "size": "M",
     "files": ["doctor/src/lor_doctor/modes/run.py", "doctor/tests/test_run.py"],
     "acceptance": {
@@ -56,7 +56,7 @@ SAMPLE_TASK = {
     "rollback": "revert commit",
     "deploy_tier": "code-only",
     "approval": "none (read-only)",
-    "dep_notes": {"WS14.replay": "pack fixtures carry spec-shaped baselines"},
+    "dep_notes": {"WS4.replay": "pack fixtures carry spec-shaped baselines"},
     "wave": "C1",
     "test_cmd": "`uv run pytest doctor/tests/test_run.py -q`",
     "phase": "A",
@@ -65,7 +65,7 @@ SAMPLE_TASK = {
 
 SAMPLE_APPROVAL = {
     "id": "deploy-gate",
-    "step": "Enable the new gate on lor-main",
+    "step": "Enable the new gate on prod",
     "status": "pending",
     "reversible": True,
     "conditions": "only after the dry run passes",
@@ -90,11 +90,11 @@ def _bundle(root: Path, ws: str = "WS9") -> Path:
 def _link_data() -> dict:
     return {
         "version": 1,
-        "team_key": "TRD",
-        "project": {"id": "p1", "url": "https://linear.app/x/project/ex", "name": "Pipeline doctor"},
+        "team_key": "ENG",
+        "project": {"id": "p1", "url": "https://linear.app/x/project/ex", "name": "Notes cutover"},
         "milestones": {"Shape": "m1"},
         "tasks": {
-            "WS9.1": {"id": "i1", "identifier": "TRD-12", "url": "https://linear.app/x/issue/TRD-12"},
+            "WS9.1": {"id": "i1", "identifier": "ENG-12", "url": "https://linear.app/x/issue/ENG-12"},
         },
         "approvals": {},
         "relations": [],
@@ -181,17 +181,17 @@ class ApprovalMappingTest(unittest.TestCase):
 
 class RenderIssueTest(unittest.TestCase):
     def test_deterministic(self):
-        first = render_issue("WS14", SAMPLE_TASK, "Shape", "train-a")
-        second = render_issue("WS14", dict(SAMPLE_TASK), "Shape", "train-a")
+        first = render_issue("WS4", SAMPLE_TASK, "Shape", "train-a")
+        second = render_issue("WS4", dict(SAMPLE_TASK), "Shape", "train-a")
         self.assertEqual(first, second)
 
     def test_title_and_header(self):
-        issue = render_issue("WS14", SAMPLE_TASK, "Shape", None)
+        issue = render_issue("WS4", SAMPLE_TASK, "Shape", None)
         self.assertEqual(issue["title"], "Run, step, and backend classifier")
-        self.assertTrue(issue["description"].startswith("Task `WS14.classify` in workstream WS14"))
+        self.assertTrue(issue["description"].startswith("Task `WS4.classify` in workstream WS4"))
 
     def test_full_task_fields_present(self):
-        text = render_issue("WS14", SAMPLE_TASK, "Shape", "train-a")["description"]
+        text = render_issue("WS4", SAMPLE_TASK, "Shape", "train-a")["description"]
         for expected in (
             "- Section: Shape",
             "- Wave: C1",
@@ -207,7 +207,7 @@ class RenderIssueTest(unittest.TestCase):
             "## Rollback\n\nrevert commit",
             "## Deploy tier\n\ncode-only",
             "## Approval\n\nnone (read-only)",
-            "- `WS14.replay`: pack fixtures carry spec-shaped baselines",
+            "- `WS4.replay`: pack fixtures carry spec-shaped baselines",
         ):
             self.assertIn(expected, text)
         self.assertTrue(text.rstrip().endswith(
@@ -237,7 +237,7 @@ class RenderIssueTest(unittest.TestCase):
 class RenderApprovalTest(unittest.TestCase):
     def test_title_and_fields(self):
         issue = render_approval("WS9", SAMPLE_APPROVAL)
-        self.assertEqual(issue["title"], "Approve: Enable the new gate on lor-main")
+        self.assertEqual(issue["title"], "Approve: Enable the new gate on prod")
         text = issue["description"]
         self.assertIn("Approval `deploy-gate` for workstream WS9", text)
         self.assertIn("- Reversible: yes", text)
@@ -262,9 +262,9 @@ class SpecHashTest(unittest.TestCase):
         self.assertEqual(spec_hash(a), spec_hash(b))
 
     def test_changes_with_content(self):
-        base = [render_issue("WS14", SAMPLE_TASK, "Shape", None)]
+        base = [render_issue("WS4", SAMPLE_TASK, "Shape", None)]
         changed = dict(SAMPLE_TASK, title="Different title")
-        self.assertNotEqual(spec_hash(base), spec_hash([render_issue("WS14", changed, "Shape", None)]))
+        self.assertNotEqual(spec_hash(base), spec_hash([render_issue("WS4", changed, "Shape", None)]))
 
     def test_is_hex_sha256(self):
         value = spec_hash([])
@@ -298,8 +298,8 @@ class LinkFileTest(LinearTestBase):
 
     def test_workspace_round_trip_uses_data_root(self):
         self.assertIsNone(linear.read_workspace())
-        linear.write_workspace({"team": {"id": "t1", "key": "TRD"}})
-        self.assertEqual(linear.read_workspace(), {"team": {"id": "t1", "key": "TRD"}})
+        linear.write_workspace({"team": {"id": "t1", "key": "ENG"}})
+        self.assertEqual(linear.read_workspace(), {"team": {"id": "t1", "key": "ENG"}})
         self.assertEqual(linear.workspace_path(), self.root / "data" / "linear.json")
 
     def test_api_key_from_env(self):
@@ -368,7 +368,7 @@ class LinkShapesTest(LinearTestBase):
             "synced_at": 3.0,
             "last_error": None,
             "outbox": 1,
-            "project": "Pipeline doctor",
+            "project": "Notes cutover",
         })
 
     def test_page_link_shape(self):
@@ -381,7 +381,7 @@ class LinkShapesTest(LinearTestBase):
     def test_task_links_shape(self):
         write_link("WS9", _link_data(), root=self.root)
         self.assertEqual(task_links("WS9", root=self.root), {
-            "WS9.1": {"identifier": "TRD-12", "url": "https://linear.app/x/issue/TRD-12"},
+            "WS9.1": {"identifier": "ENG-12", "url": "https://linear.app/x/issue/ENG-12"},
         })
 
 
