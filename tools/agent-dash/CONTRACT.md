@@ -6,11 +6,13 @@ Never writes to any source, never signals agent processes, never stores prompt b
 Lifecycle controls from the page (`POST /api/workstreams/archive`, `POST /api/workstreams/restore`, `POST /api/workstreams/state`, `POST /api/workstreams/bulk`) are the only writes the dashboard performs, and they exist so a workstream can move through its lifecycle without a terminal round-trip: they write only bundle lifecycle fields (`state`, `state_changed_at`, `archived_at`, the frozen `summary.json`) through the same `dash/lifecycle.py` functions the CLI uses, never sources, plan content, or approvals, and they stay local-only (Host/Origin plus `X-AgentDash-Action: 1`) with a read-only switch (`AGENT_DASH_READONLY=1`, config `readonly: true`).
 The one argv value ever kept is the worker's `--model` flag value, recorded on process samples and live-process rows so a run whose model is otherwise unknown can be named. Model ids, labels, token counts, and the session `ws_hint` (a workstream id derived from a bundle tool-use path, never served by any endpoint) are the only worker-derived strings in the store.
 
+The Linear source (`dash/sources/linear.py`) is the one outbound network call. It is opt-in per bundle by `linear.json`, sends plan content only (titles, specs, status, approval text), and writes plan state only through the `ws task` and `ws approve` functions, with history rows `by: "linear"`. It is off under the read-only switch (`AGENT_DASH_READONLY=1`, config `readonly: true`).
+
 ## Layout and file ownership (one writer per file)
 
 | Path | Owner |
 |---|---|
-| `agent_dash.py` (CLI: `run`, `stop`, `restart`, `deploy`, `rollback`, `status`, `state`, `doctor`, `backfill --session <id>`, `reprice`, `reconcile`, `check`, `ws`, `project`, `report`, `label`, `lead-profile`, `worktrees`, `lanes`; global `--project <id>` for `state`, `check`, `doctor`, `ws ...`, `status`) | core |
+| `agent_dash.py` (CLI: `run`, `stop`, `restart`, `deploy`, `rollback`, `status`, `state`, `doctor`, `backfill --session <id>`, `reprice`, `reconcile`, `check`, `ws`, `ws linear`, `project`, `report`, `label`, `lead-profile`, `worktrees`, `lanes`; global `--project <id>` for `state`, `check`, `doctor`, `ws ...`, `status`) | core |
 | `dash/state.py` (`GET /api/state`), `dash/doctor.py` (`doctor`), `dash/errors.py` (exit codes, messages) | cli |
 | `dash/dataroot.py` (data-root resolution: `data_root`, `state_dir`, `workstreams_dir`, `hub_dir`, `project_file`; the `Storage` seam, local only) | core |
 | `dash/project.py` (project descriptor: `project.json` read/validate, `project` CLI, `GET /api/project` payload) | core |
@@ -31,6 +33,12 @@ The one argv value ever kept is the worker's `--model` flag value, recorded on p
 | `dash/worktrees.py` (safe worktree reaper: `worktrees reap --repo <path>` lists linked worktrees and, with `--apply`, removes only clean merged idle old ones via `worktree remove` plus `branch -d`; dry-run by default) | core |
 | `dash/server.py` (HTTP + SSE, routes below) | core |
 | `dash/actions.py` (the page write actions: guarded `POST /api/workstreams/archive|restore|state|bulk` through the CLI lifecycle functions, local-only, read-only switch; `allowed_actions_for` names each row's legal buttons) | core |
+| `dash/linear.py` (Linear link and outbox files, stable ids, status mapping, description render; pure, no network) | linear |
+| `dash/linear_client.py` (Linear GraphQL client; the only module that opens a Linear connection) | linear |
+| `dash/linear_sync.py` (link, sync, unlink, status; `ws linear` CLI) | linear |
+| `dash/sources/linear.py` (poller, `NAME` `linear`, `INTERVAL_S` 60) | linear |
+| `tests/test_linear*.py` (Linear client, sync and poller tests) | linear |
+| `docs/linear.md` (Linear how-to) | linear |
 | `dash/attribution.py`, `map.example.json` (`map.local.json` replaces it) | core |
 | `dash/pricing.py`, `catalog/prices.json` | core |
 | `dash/plans.py`, `plans.example.json` (`plans.local.json` replaces it) | core |
@@ -333,6 +341,7 @@ confirm/toast/archive screenshots; run it, don't fold it into `check
 plan still serves 200 with its issues named, so bad states are never drawn
 as tasks; the page does not show the issues, which `ws validate` and this field carry):
 `{"ws": "WS7", "cols": [..], "groups": [{id, col, title, tasks: [{id, title, status, deps, kind, dep_notes}]}], "edges": [[a, b]], "phases": [{name, goal, gate}], "progress": {"done": 0, "total": 0, "counts": {todo, wip, pr, prog, done, deferred}, "pct": 0}, "ready": ["WS7.2"], "critical_path": ["WS7.1", "WS7.2"], "max_parallel": 3, "layout": {...}, "map_warnings": [{code, severity, title, detail, fix}]}`.
+On a linked workstream (`linear.json` in the bundle) the body adds optional `linear` objects: top-level `linear: {url, synced_at}` (`synced_at` is null until the first sync), and `linear: {identifier, url}` on each task row. Both are absent when the bundle is not linked. See [docs/linear.md](docs/linear.md).
 `ready` is the todo-with-satisfied-deps task ids ranked by critical-path impact, `critical_path` is the longest dep chain, and `max_parallel` is the widest dependency wave; all three come from `dash/orchestrate.py` with no store reads, cached by `plan.json` mtime.
 `layout` is the computed map layout from `dash/maplayout.py` (density, per-section collapse state, columns, chip labels, arrows mode, train tags, sections line), and `map_warnings` is the MAP101–MAP111 lint for that plan; both are cached by `plan.json` mtime like the orchestration fields. The page consumes `layout`; `ws layout <ID>` prints the same object without touching the page.
 A task's `kind` is `task` or `gate` (an outside signal or condition, drawn as a diamond); absent means `task`. `dep_notes` maps one of the task's dep ids to the short condition on that edge. A task may also carry `files` (declared file footprints, a non-empty list of glob strings), and a gate may carry `signal` (what it waits on), `confirmed_at` (ISO-8601 UTC of the last check), and `fresh_hours` (recheck bound; older or missing confirmations read STALE). A deferred task may carry `received_as` (the task id in the receiving workstream that picked it up). All pass through every plan API sanitized like other fields. `/api/bundle` carries the same task shape inside `plan.dag.groups`.

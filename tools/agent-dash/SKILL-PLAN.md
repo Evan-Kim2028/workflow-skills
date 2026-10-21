@@ -64,6 +64,8 @@ python3 agent_dash.py ws task WS4 WS4.1 deferred --moved-to WS6 --note "waits on
 
 `pr` is an open pull request. `prog` is merged and waiting on a prod step. `done` is finished. `todo` is not started. Deferred tasks stay on the map and drop out of the counts. The write is a temp file plus replace, so a crash does not leave a half-written plan.
 
+When the workstream is linked to Linear, the same command also queues the change for Linear. See [docs/linear.md](docs/linear.md).
+
 Every status change also appends one `{ts, task, from, to}` line to `history.jsonl` in the bundle (a single flushed append, so one line is atomic; no change writes no line). That file is the recorded history `GET /api/replay` prefers over inferred times: the replay plays real transitions once they exist instead of guessing them from run labels.
 
 Run `ws render` again only when the prose or the drawings change. Status edits do not need a render. The page reads `plan.json` live.

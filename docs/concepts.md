@@ -44,6 +44,8 @@ A task status is one of five words.
 | `done` | Finished. |
 | `deferred` | Left the active count. Optional `moved_to` is a workstream id such as WS6. Optional `note` says why. |
 
+With a workstream linked to Linear, `ws task` also writes the status to Linear. See the [Linear how-to](../tools/agent-dash/docs/linear.md).
+
 Deferred tasks stay on the map and drop out of the done-of-total count. `ws task` is the writer. The write is a temp file plus replace. `--moved-to` and `--note` are accepted only when the status is `deferred`.
 
 The map is one board of columns. Each group is a card of chips. A chip with a running agent uses a solid pulse and a badge with the tool color and the count. A chip whose run finished in the last 15 minutes gets a green outline, unless an agent is still running on it. A `↻` count appears when more than one run in the last 24 h mapped to that task. The edge of that count turns amber when two or more of those runs were sent back. Sending back means a verdict of `REQUEST_CHANGES`, `APPROVE_WITH_CHANGES`, `PARTIAL`, or `BLOCKED`.
