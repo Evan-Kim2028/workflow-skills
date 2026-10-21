@@ -98,3 +98,132 @@ real changes; the idle timers alone draw ~1–2 per 30 s.
 
 Host load moves every number: compare before/after at similar `uptime`
 load, one profile at a time.
+
+## Stage 2 (this branch): contention plus repeated cold recomputation
+
+Same live-shaped copy (8,221 runs, ~153k usage events), own instance,
+real sources polling plus a replayed exec-view pattern (snapshot every
+2 s, full burst every 30 s). Before → after, warmed server:
+
+| endpoint | before warm p50/p95 | after warm p50/p95 | after cold |
+|---|---|---|---|
+| /api/snapshot (all, model) | 28 ms / 31 ms | 8 ms / 9 ms | 210 ms |
+| /api/runs | 998 ms / 1041 ms | 134 ms / 179 ms | 140 ms |
+| /api/concurrency | 111 ms / 164 ms | 99 ms / 103 ms | 100 ms |
+| /api/workstreams | 13 ms / 306 ms | 25 ms / 26 ms | 280 ms |
+| /api/workstreams (state=all) | 9 ms / 34 ms | 11 ms / 14 ms | 230 ms |
+| /api/state | 6 ms / 6 ms | 8 ms / 9 ms | 510 ms |
+| /api/project/phases (24 h) | 4 ms / 7 ms | 4 ms / 6 ms | 340 ms |
+
+Under per-2 s replay ticks with live writes churning (every tick a data
+version miss): snapshot p50 0.93 s → 0.21 s, workstreams p50 ~0.5 s →
+~0.25 s. Source poll durations on a comparable workload: muse ~0.36 s →
+~0.22 s (catch-up 1.23 s → 0.70 s), cursor ~0.4 s steady, lag back under
+~1.5x interval.
+
+What changed: the per-run usage fold is incremental (per-run versions,
+bulk rewrites bump an epoch; a write refolds only that run); pricing
+folds token sums per (model, band, tier, split) shape with identical
+totals (per-run costs on all 3,982 folded runs match the old code; 104
+runs differ by 1 ulp, all identical after 6-decimal money rounding);
+`by_phase` reuses per-run classifications keyed on (rules hash, taskmap
+content, plan stamp, run inputs) and classifies only rollup owners
+outside the store lock; rate vectors and time bands are cached per price
+shape in `dash/pricing.py`; the hourly bucket rebuild reads the catalog
+once; concurrent identical cold requests share one computation
+(`dash/singleflight.py`, wired by ETag identity on snapshot,
+workstreams, runs, concurrency, phases, state). Regression tests:
+`tests/test_perf_stage2.py` (incremental-equals-full property test with
+fixed seed, grouped-vs-per-event pricing, phase invalidation,
+single-flight, classify-without-lock, snapshot/bucket consistency).
+
+Staleness bounds are unchanged: content caches still key on the data
+version (any usage/run write retags); per-run caches carry their inputs
+key, so a rules, taskmap, or plan edit retags precisely. API payloads
+are byte-identical minus timestamps on a frozen DB (see scratchpad
+freeze manifests); residual diffs under a live DB are window slides,
+reconcile status closes, and live-agent decay only.
+
+Not done: the store lock is still held through snapshot/rollup compute
+(step 5) and page polling is uncoalesced (step 6); per-request Python
+over ~8k runs (~0.2 s snapshot under churn) and source file scans (~20%
+core) remain the floor. If server CPU stays above target, those are the
+next levers.
+
+## Perf guard: lighter page load (item 4, measured 2026-10-20)
+
+First-load waterfall of the exec view on a quiet instance (headless
+Chrome over CDP, `/`, ~7 s window):
+
+| | before | after |
+|---|---|---|
+| requests | 89 | 83-84 |
+| bytes | 521,351 | ~512,000 |
+| boot snapshot fetches | 2 | 1 (takeSeq seeds lastTickView) |
+| boot bundles / project fetches | 2 / 2 | 1 / 1 (loadNav single-flight + freshness gate; project chrome rides the shared conditional layer) |
+| repeated nav (landing flip, post-action) | 5 x 200 | 0 (2 s freshness gate; actions force) |
+| unchanged refetch cost | 200 | 304, headers only (all 16 polled endpoints pinned in tests/test_etag.py) |
+
+gzip verified on the wire: 57,005 B snapshot -> 8,556 B (85% off) with
+`Vary: Accept-Encoding` and the ETag intact; plan-progress.js 96,319 B
+-> 28,517 B. Below-the-fold plan sums defer to an IntersectionObserver
+on the program panel (same renderer once visible; panel-less views stop
+refetching after the first load); concurrent identical GETs share one
+fetch with per-consumer clones. HTTP/1.0 without keep-alive kept as is
+(out of scope). No visual change: tests/test_page_rules.py 127 green,
+exec_layout_check green. page_check.mjs shows 8-10 mismatches on
+finished workstreams on every instance (token tile 0 vs plan-task
+legend: a check-vs-data-shape artifact for workstreams with no 24 h
+usage; active workstreams agree exactly); page_settle_check BUSY-IDLE
+on the shared laptop (live writers move seq; view_seq holds).
+
+## Perf guard: process split (item 6, measured 2026-10-20)
+
+5x seed, 60 page-like snapshots: idle p50/p95 5/8 ms, with writer
+sources 5/9 ms (1.07x/1.11x); lock wait p95 0.001 ms vs the 200 ms
+budget. Recommendation: do NOT split; see docs/process-split.md for
+numbers, revisit triggers, and the unimplemented sketch.
+
+## Perf guard: TTL coalescing + cheaper cold snapshot (measured 2026-10-20)
+
+Live symptom: with 18 live agents the store moves on every poll, the
+`data_seq`-keyed snapshot cache missed on every request, and the page
+paid a full cold recompute (~420 ms over ~8.2k runs, 1.4 snapshots/s)
+for roughly a whole core. Two changes share the fix.
+
+Server-side TTL coalescing (`dash/respcache.py`, freshness contract in
+CONTRACT.md): heavy reads serve the generation computed within the
+last `response_ttl_s` (default 1.5 s) regardless of store movement,
+single-flight with stale-while-revalidate (hard 5 s max staleness),
+explicit POST invalidation, 10 s pinned windows, `response_ttl_s=0`
+disables. The `/api/health` `perf` block carries per-endpoint TTL
+`hits`/`stale`/`recomputes`/`waits`/`hit_ratio`.
+
+Cheaper cold path (payload-identical, proven by
+tests/test_ttl.py counts-equivalence + fragment properties and the
+green suites): per-run view-fragment cache keyed on
+(run/usage versions, epoch, rss, context, children's usage); one
+grouped counting pass replaces 38 per-scope `_agent_counts` walks and
+builds running/recent/last-activity/confidence inline; shared
+liveness evidence per top call; outcome memo; composite
+`(pid|run_id, ts)` and `(run_id, ts)` indexes turn per-group MAX scans
+into seeks; per-pid `LIMIT 1` pid starts.
+
+Cold p50 on the live-shaped state copy (this laptop):
+
+| endpoint | before (live) | after (copy) | budget |
+|---|---|---|---|
+| snapshot | 421 ms | ~80 ms | <100 ms |
+| runs | 315 ms | ~60 ms | <100 ms |
+| concurrency | 160 ms | ~57 ms | <100 ms |
+| workstreams | 981 ms | ~144 ms | <200 ms |
+
+Churn gate (`tests/perf/test_perf_budget.py::test_churn_coalescing_under_budget`,
+budgets in the `churn` section of `perf_budgets.json`): writer on 5
+live runs every 200 ms with tabs polling, ~20 s window on the 1x seed.
+Remaining hot (profile lines): per-row `dict.get` floor over ~8.6k
+views, `_all_runs` row materialisation, `_drop_launch_echoes` twin
+fill, `_parent_map`. The store lock is still held through compute;
+per-request Python over all rows remains the floor — if server CPU
+stays above target, a lock-free snapshot copy or row-column layout is
+next, not more key caching.

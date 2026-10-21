@@ -22,7 +22,8 @@ Rule types, in file order:
   task ``WS9.s-tbench``. A hit outside the workstream's plan is not a
   task run.
 - ``lead``: an unmapped lead session (no parent run, a lead source
-  such as ``claude-main``) is the planning surface.
+  such as ``claude-main`` or the top-level Codex TUI surface ``codex``)
+  is the planning surface.
 - ``window``: still unclassified and started before the workstream's
   first task-mapped run is early exploration: planning.
 
@@ -71,7 +72,7 @@ def _minimal_rules() -> list[dict]:
         {
             "id": "convention",
             "type": "convention",
-            "pattern": r"ws\d+[-_. ]?(plan(?:ning)?|exec(?:ution)?|review|rev|coord(?:ination)?)(?![a-z0-9])",
+            "pattern": r"(?:ws\d+|hub)[-_. ]?(plan(?:ning)?|exec(?:ution)?|review|rev|coord(?:ination)?)(?![a-z0-9])",
             "map": {
                 "plan": "planning",
                 "planning": "planning",
@@ -279,6 +280,7 @@ def resolve_task(
     ids = [str(item) for item in (plan_ids or []) if str(item)]
     if not ids:
         return None
+    members, skeletons = _plan_id_index(tuple(ids))
     try:
         from dash.taskmatch import task_of
     except Exception:
@@ -288,19 +290,41 @@ def resolve_task(
             hit = task_of(label, ws, taskmap, ids)
         except Exception:
             hit = None
-        if hit is not None and str(hit) in set(ids):
+        if hit is not None and str(hit) in members:
             return str(hit)
     lab = _norm(label)
     if not lab:
         return None
     best = None
-    for ident in ids:
-        skeleton = _norm(ident)
+    best_len = 0
+    for ident, skeleton in skeletons:
         if not skeleton or skeleton not in lab:
             continue
-        if best is None or len(skeleton) > len(_norm(best)):
+        if best is None or len(skeleton) > best_len:
             best = ident
+            best_len = len(skeleton)
     return best
+
+
+_plan_id_cache: dict = {}
+
+
+def _plan_id_index(ids: tuple) -> tuple:
+    """``(frozenset of ids, ((id, skeleton), ...))`` cached per id tuple.
+
+    The skeleton is :func:`_norm` of the id, so the fallback match in
+    :func:`resolve_task` normalises each plan id once rather than on
+    every run.
+    """
+    hit = _plan_id_cache.get(ids)
+    if hit is not None:
+        return hit
+    index = (frozenset(ids), tuple((ident, _norm(ident)) for ident in ids))
+    with _lock:
+        if len(_plan_id_cache) >= 256:
+            _plan_id_cache.clear()
+        _plan_id_cache[ids] = index
+    return index
 
 
 def classify_run(run: dict, ctx: dict | None = None, *, rules=None) -> tuple[str, str]:

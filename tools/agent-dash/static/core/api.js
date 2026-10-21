@@ -31,6 +31,7 @@
   var condTag = {};
   var condBody = {};
   var condOrder = [];
+  var getInflight = {};
   function condSave(url, tag, body) {
     if (!tag) return body;
     if (condTag[url] === undefined) condOrder.push(url);
@@ -111,7 +112,17 @@
       if (path === "/api/ws/progress") base = "ws-progress-" + params.ws;
       return fetch("../fixtures/" + base + ".json").then(function (r) { if (!r.ok) throw new Error(r.status); return r.json(); });
     }
-    return condFetch(url, condTag[url]).then(function (r) {
+    /* One fetch per URL at a time: boot fires the same endpoint from two
+       places at once (nav chrome and nav data both want /api/project),
+       and without this both requests fly before either stores its ETag.
+       Concurrent callers share the one response; each shared copy is
+       cloned, so one caller mutating its object cannot corrupt the
+       other's. Sequential calls are unaffected: the entry clears on
+       settle, and the next call revalidates with If-None-Match. */
+    if (getInflight[url]) {
+      return getInflight[url].then(function (j) { return JSON.parse(JSON.stringify(j)); });
+    }
+    var ap = condFetch(url, condTag[url]).then(function (r) {
       if (r.status === 304) {
         if (condBody[url]) return JSON.parse(JSON.stringify(condBody[url]));
         return condFetch(url, null).then(function (r2) {
@@ -122,6 +133,10 @@
       if (!r.ok) throw new Error(r.status);
       return condRead(url, r);
     });
+    getInflight[url] = ap;
+    var apClear = function () { if (getInflight[url] === ap) delete getInflight[url]; };
+    ap.then(apClear, apClear);
+    return ap;
   }
   /* POST through the same layer (archive/restore: the one write action
      the page performs). Always sends X-AgentDash-Action: 1, which the
@@ -149,15 +164,30 @@
   /* Every async response applies only when it still matches the current tab
      and grouping (one fixed 24 h window); a late arrival from another scope
      is dropped. */
-  function loadNav() {
-    var bundlesP = fetch(FIX ? "../fixtures/bundles.json" : "/api/bundles", {cache: "no-store"}).then(function (r) { return r.ok ? r.json() : {bundles: []}; }).then(function (j) { state.bundles = j.bundles || []; }).catch(function () {});
+  /* One nav load in flight at a time: boot fires refreshAll and the route
+     landing back to back, and both call loadNav with the same scope, so
+     without this the bundles and project endpoints fetch twice. Concurrent
+     callers share the one load; the data they await is identical. */
+  var navInflight = null, lastNavDone = 0;
+  function loadNav(force) {
+    if (navInflight) return navInflight;
+    /* A nav load that just finished is still current: the boot landing
+       flip (refreshAll, then refreshProject) and the post-action refresh
+       both call loadNav back to back with the same scope, and the second
+       load would only buy 304s. Actions pass force to skip this gate so
+       the counts they show are post-action, never pre-action. */
+    if (!force && Date.now() - lastNavDone < 2000) return Promise.resolve();
+    /* Bundles ride the conditional layer like every other nav fetch, so a
+       repeated nav load costs a 304 instead of a second full body. */
+    var bundlesP = api("/api/bundles", {}).then(function (j) { state.bundles = (j && j.bundles) || []; }).catch(function () {});
     var wsP = api("/api/workstreams", {since: since()}).then(function (j) { state.wss = j.workstreams || []; }).catch(function () {});
     /* Project identity (missing project.json means name null: the header
        falls back to Agent dashboard) and the all-states list behind the
        Planned/Archive pill counts. Both are best-effort on older servers. */
     var projP = api("/api/project", {}).then(function (j) { state.project = (j && typeof j === "object") ? j : {name: null}; state.actionsArchive = !!(j && j.actions && j.actions.archive); }).catch(function () { state.project = {name: null}; state.actionsArchive = false; });
     var allP = api("/api/workstreams", {since: since(), state: "all"}).then(function (j) { state.wssAll = j.workstreams || []; }).catch(function () { state.wssAll = []; });
-    return Promise.all([bundlesP, wsP, projP, allP]).then(function () { renderTabs(); applyChrome(); resolveLanding(); });
+    navInflight = Promise.all([bundlesP, wsP, projP, allP]).then(function () { renderTabs(); applyChrome(); resolveLanding(); }).then(function () { navInflight = null; lastNavDone = Date.now(); }, function () { navInflight = null; });
+    return navInflight;
   }
   /* First-load default view, once per page load: Project home when the
      project names itself or any workstream left the active state,
@@ -209,6 +239,7 @@
     var reqSince = since();
     var gen = ++execGen;
     refreshActive++;
+    if (quiet) snapBegan();
     var finished = false;
     var jobs = [
       api("/api/snapshot", {ws: "all", since: reqSince, usage_group: group}).catch(function () { return null; }),
@@ -220,6 +251,7 @@
     ];
     return Promise.all(jobs).then(function (parts) {
       finished = true; refreshDone();
+      if (quiet) snapFinished();
       if (gen !== execGen || !isProjectView()) return;
       if (!parts[0]) {
         showSnapError("all");
@@ -227,10 +259,8 @@
         return;
       }
       clearSnapError();
-      if (parts[0].seq !== state.seq) state.lastSeqChange = Date.now() / 1000;
-      if (parts[0].last_data_ts != null) state.lastDataTs = parts[0].last_data_ts;
+      takeSeq(parts[0]);
       state.snap = parts[0];
-      state.seq = parts[0].seq;
       state.runs = parts[1];
       state.usage = Array.isArray(parts[0].usage) ? parts[0].usage : [];
       state.snapSig = snapSig(parts[0]);
@@ -252,7 +282,7 @@
         var foot = document.getElementById("foot");
         if (foot) foot.textContent = "Updated " + new Date().toLocaleTimeString() + (FIX ? " \u00B7 fixture data" : "") + " \u00B7 local, 127.0.0.1";
       });
-    }).catch(function () { if (!finished) { finished = true; refreshDone(); } if (gen === execGen && isProjectView()) { showSnapError("all"); setLive(false); } });
+    }).catch(function () { if (!finished) { finished = true; refreshDone(); } if (quiet) snapFinished(); if (gen === execGen && isProjectView()) { showSnapError("all"); setLive(false); } });
   }
   /* Muted footer line: the refresh time only. Reconcile and doctor output
      stay in the CLI and the API by owner decision, never on the page. */
@@ -289,7 +319,7 @@
         ws !== "all" ? api("/api/plan", {ws: ws}).then(function (j) { return j && j.groups ? j : null; }).catch(function () { return null; }) : Promise.resolve(null),
         api("/api/approvals", {ws: ws === "all" ? "all" : ws}).then(approvalList).catch(function () { return []; })
       ]).then(function (p) {
-        if (p[0]) setCache(key, {snap: p[0], runs: p[1], usage: Array.isArray(p[0].usage) ? p[0].usage : [], conc: p[2], plan: p[3], seq: p[0].seq, approvals: p[4]});
+        if (p[0]) setCache(key, {snap: p[0], runs: p[1], usage: Array.isArray(p[0].usage) ? p[0].usage : [], conc: p[2], plan: p[3], seq: p[0].seq, viewSeq: p[0].view_seq != null ? p[0].view_seq : p[0].seq, approvals: p[4]});
       }).then(function () { setTimeout(function () { step(i + 1); }, 150); });
     };
     step(0);
@@ -318,10 +348,10 @@
       b.removeAttribute("data-failed-scope");
     }
   }
-  /* Freshness: the tick carries seq + last_poll. The seq drives refetches;
-     when it stays frozen for 3 poll intervals with an open SSE stream the
-     page badges "stale" instead of reading "live" on old data. A fresh poll
-     with an unchanged seq (healthy idle) stays live. */
+  /* Freshness: the tick carries view_seq + last_poll. The view_seq drives
+     refetches; when it stays frozen for 3 poll intervals with an open SSE
+     stream the page badges "stale" instead of reading "live" on old data.
+     A fresh poll with an unchanged view (healthy idle) stays live. */
   var STALE_AFTER_S = 6;
   function updateStale(nowS) {
     var badge = document.getElementById("stale-badge");
@@ -376,17 +406,15 @@
         return;
       }
       clearSnapError();
-      if (parts[0].seq !== state.seq) state.lastSeqChange = Date.now() / 1000;
-      if (parts[0].last_data_ts != null) state.lastDataTs = parts[0].last_data_ts;
+      takeSeq(parts[0]);
       state.snap = parts[0];
-      state.seq = parts[0].seq;
       state.runs = parts[1];
       state.usage = Array.isArray(parts[0].usage) ? parts[0].usage : [];
       state.snapSig = snapSig(parts[0]);
       state.conc = parts[2];
       state.plan = parts[4];
       state.approvals = parts[5];
-      setCache(key, {snap: state.snap, runs: state.runs, usage: state.usage, conc: state.conc, plan: state.plan, seq: state.seq, approvals: state.approvals});
+      setCache(key, {snap: state.snap, runs: state.runs, usage: state.usage, conc: state.conc, plan: state.plan, seq: state.seq, viewSeq: curView(), approvals: state.approvals});
       if (state.snap && window.DashCache) window.DashCache.snap[ws] = state.snap;
       renderTabs();
       if (state.view === "exec") {
@@ -405,6 +433,50 @@
     if (!ok) { var badge = document.getElementById("stale-badge"); if (badge) badge.hidden = true; }
     else updateStale();
   }
+  /* Page-visible sequence: the tick and the snapshot carry view_seq,
+     which moves only when rendered numbers change (offset cursors,
+     heartbeats, and telemetry-only rewrites move seq/data_seq but not
+     this). Older servers send no view_seq; the seq fallback keeps them
+     working at the old refresh rate. */
+  function tickView(d) { return d.view_seq != null ? d.view_seq : d.seq; }
+  function curView() { return state.viewSeq != null && state.viewSeq !== -1 ? state.viewSeq : state.seq; }
+  function takeSeq(j) {
+    var v = j.view_seq != null ? j.view_seq : j.seq;
+    if (v !== curView()) state.lastSeqChange = Date.now() / 1000;
+    state.seq = j.seq;
+    if (j.view_seq != null) state.viewSeq = j.view_seq;
+    if (j.last_data_ts != null) state.lastDataTs = j.last_data_ts;
+    /* A stored snapshot IS the page holding that view, so the next tick
+       with the same view needs no refetch. Without this the boot burst
+       always refetches once more: the first tick compares against the
+       null seed and replays the snapshot the boot just loaded. The seed
+       only moves forward: a stale refresh landing after a newer tick
+       must not clobber the newer view, or its change waits a full extra
+       tick instead of the trailing edge. */
+    if (lastTickView == null || v > lastTickView) lastTickView = v;
+  }
+  /* Adaptive refresh: at most one quiet snapshot refresh per
+     max(2 s, 3x the last snapshot duration), so a slow server is never
+     stacked tick-on-tick. A tick that lands during the cooldown or
+     mid-flight is not dropped: its view is remembered and one trailing
+     refresh runs at the edge, so the latest change always lands. */
+  var snapLastMs = 0, snapCoolUntil = 0, snapTrailTimer = null, lastTickView = null, snapStartT = 0;
+  function snapMinInterval() { return Math.max(2000, 3 * (snapLastMs || 0)); }
+  function wantQuietRefresh() {
+    if (snapInflight || refreshBusy()) return;
+    var wait = snapCoolUntil - Date.now();
+    if (wait > 0) {
+      if (!snapTrailTimer) snapTrailTimer = setTimeout(function () { snapTrailTimer = null; wantQuietRefresh(); }, wait);
+      return;
+    }
+    if (isProjectView()) refreshProject(true); else refreshSnapshot();
+  }
+  function snapBegan() { snapStartT = Date.now(); }
+  function snapFinished() {
+    snapLastMs = Date.now() - snapStartT;
+    snapCoolUntil = Date.now() + snapMinInterval();
+    if (lastTickView != null && lastTickView !== curView() && !tabHidden()) wantQuietRefresh();
+  }
   function stream() {
     if (FIX || !window.EventSource) return;
     var es = new EventSource("/api/stream");
@@ -416,7 +488,8 @@
         if (d.last_poll != null) state.lastPoll = d.last_poll;
         if (d.last_data_ts != null) state.lastDataTs = d.last_data_ts;
         if (state.lastSeqChange === 0) state.lastSeqChange = nowS;
-        if (d.seq !== state.seq) { state.lastSeqChange = nowS; if (!refreshBusy()) { if (isProjectView()) refreshProject(true); else refreshSnapshot(); } }
+        lastTickView = tickView(d);
+        if (lastTickView !== curView()) { state.lastSeqChange = nowS; wantQuietRefresh(); }
         else updateStale(nowS);
       } catch (e) {}
       setLive(true);
@@ -437,30 +510,29 @@
     if (tabHidden()) return;
     if (snapInflight || refreshBusy()) return;
     snapInflight = true;
+    snapBegan();
     var ws = state.ws, key = reqKey();
     api("/api/snapshot", {ws: ws, since: since(), usage_group: groupFor()}).then(function (j) {
       snapInflight = false;
+      snapFinished();
       if (!ADC.applies(key, state)) return;
       clearSnapError();
       var sig = snapSig(j);
       if (sig !== null && sig === state.snapSig) {
-        if (j.seq !== state.seq) state.lastSeqChange = Date.now() / 1000;
-        state.seq = j.seq;
-        if (j.last_data_ts != null) state.lastDataTs = j.last_data_ts;
+        takeSeq(j);
         updateStale();
         return;
       }
       state.snapSig = sig;
-      if (j.seq !== state.seq) state.lastSeqChange = Date.now() / 1000;
-      if (j.last_data_ts != null) state.lastDataTs = j.last_data_ts;
-      state.snap = j; state.seq = j.seq;
+      takeSeq(j);
+      state.snap = j;
       state.usage = Array.isArray(j.usage) ? j.usage : [];
       var hit = execCache[key];
       if (hit) { hit.snap = j; hit.usage = state.usage; }
       if (window.DashCache) window.DashCache.snap[ws] = j;
       if (state.view === "exec") drawMain();
       updateStale();
-    }).catch(function () { snapInflight = false; showSnapError(ws); if (state.view === "exec") drawMain(); });
+    }).catch(function () { snapInflight = false; snapFinished(); showSnapError(ws); if (state.view === "exec") drawMain(); });
   }
   var AdPage = (global.AdPage = global.AdPage || {});
   AdPage.FIXMAP = FIXMAP;
@@ -486,6 +558,11 @@
   AdPage.setLive = setLive;
   AdPage.stream = stream;
   AdPage.refreshSnapshot = refreshSnapshot;
+  AdPage.tickView = tickView;
+  AdPage.curView = curView;
+  AdPage.takeSeq = takeSeq;
+  AdPage.snapMinInterval = snapMinInterval;
+  AdPage.wantQuietRefresh = wantQuietRefresh;
   global.FIXMAP = FIXMAP;
   global.tabHidden = tabHidden;
   global.snapSig = snapSig;
@@ -509,4 +586,9 @@
   global.setLive = setLive;
   global.stream = stream;
   global.refreshSnapshot = refreshSnapshot;
+  global.tickView = tickView;
+  global.curView = curView;
+  global.takeSeq = takeSeq;
+  global.snapMinInterval = snapMinInterval;
+  global.wantQuietRefresh = wantQuietRefresh;
 })(window);

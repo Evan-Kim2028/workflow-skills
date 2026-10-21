@@ -93,8 +93,15 @@ class RunningMixin:
                     ).fetchall()
                 ]
                 return self._stale_locked(now, rows, pid_alive_fn=pid_alive_fn)
-        def _stale_locked(self, now: float, rows: list, pid_alive_fn=None, usage_max=None, sample_max=None) -> list:
-            """Stale subset of ``rows``. Caller holds the lock."""
+        def _stale_locked(self, now: float, rows: list, pid_alive_fn=None, usage_max=None, sample_max=None, pid_starts=None) -> list:
+            """Stale subset of ``rows``. Caller holds the lock.
+
+            ``usage_max``/``sample_max``/``pid_starts`` are shared
+            liveness evidence: pass them when one top-level call
+            already computed them for the same open rows (each is a
+            GROUP BY over the usage/process tables); None computes
+            them here, exactly as before.
+            """
             now = float(now)
             check = pid_alive_fn or _pid_alive
             dagster_active = self._dagster_active_locked()
@@ -119,8 +126,15 @@ class RunningMixin:
             if sample_max is None:
                 sample_max = self._sample_max_locked(open_rows)
             stale = []
-            pid_starts = self._pid_start_locked([row.get("pid") for row in open_rows])
+            if pid_starts is None:
+                pid_starts = self._pid_start_locked([row.get("pid") for row in open_rows])
             for row in open_rows:
+                if row.get("slice_of"):
+                    # A slice is never stale on its own: it follows its
+                    # primary's liveness (see the live-open set), so a
+                    # quiet slice is hidden with its session, never
+                    # reported as a mismatch.
+                    continue
                 pid_start = pid_starts.get(_int_pid(row.get("pid")))
                 if _is_idle_lead(row, now, usage_max, sample_max, check, pid_start):
                     continue
@@ -130,7 +144,7 @@ class RunningMixin:
                 if reason:
                     stale.append((dict(row), reason))
             return stale
-        def _idle_locked(self, now: float, rows: list, pid_alive_fn=None, usage_max=None, sample_max=None) -> list:
+        def _idle_locked(self, now: float, rows: list, pid_alive_fn=None, usage_max=None, sample_max=None, pid_starts=None) -> list:
             """Alive-but-idle lead sessions. Caller holds the lock.
 
             A ``claude-main`` row with a live pid and no source evidence for
@@ -138,6 +152,9 @@ class RunningMixin:
             is still attached but has written nothing. It stays out of every
             view like a stale row, but it is never a mismatch and it is never
             closed, so a later transcript write returns it to Running now.
+
+            Shared-evidence parameters behave exactly as in
+            :meth:`_stale_locked`.
             """
             now = float(now)
             check = pid_alive_fn or _pid_alive
@@ -150,7 +167,8 @@ class RunningMixin:
                 usage_max = self._usage_max_locked([row["run_id"] for row in open_rows])
             if sample_max is None:
                 sample_max = self._sample_max_locked(open_rows)
-            pid_starts = self._pid_start_locked([row.get("pid") for row in open_rows])
+            if pid_starts is None:
+                pid_starts = self._pid_start_locked([row.get("pid") for row in open_rows])
             return [
                 dict(row)
                 for row in open_rows
@@ -159,7 +177,7 @@ class RunningMixin:
                     pid_starts.get(_int_pid(row.get("pid"))),
                 )
             ]
-        def _stalled_locked(self, now: float, rows: list, pid_alive_fn=None, usage_max=None) -> dict:
+        def _stalled_locked(self, now: float, rows: list, pid_alive_fn=None, usage_max=None, sample_max=None) -> dict:
             """Open worker rows stuck on a live process, by run id to idle seconds.
 
             A ``STALLED_SOURCES`` row whose pid is still alive but whose
@@ -169,6 +187,11 @@ class RunningMixin:
             that only just started is never stalled; a row with no output
             evidence at all is left to the stale path. Caller holds the
             lock. File stats stay bounded: only open worker rows stat.
+
+            ``usage_max`` is shared liveness evidence (see
+            :meth:`_stale_locked`); ``sample_max`` is accepted and ignored
+            (stalled rows never read process sightings), so one call site
+            can pass the same pair to every evidence consumer.
             """
             import os as _os
 
@@ -214,7 +237,15 @@ class RunningMixin:
                     found[row["run_id"]] = idle
             return found
         def _pid_start_locked(self, pids: list) -> dict:
-            """Process start epoch by pid from the latest sample. Caller holds the lock."""
+            """Process start epoch by pid from the latest sample. Caller holds the lock.
+
+            One ``LIMIT 1`` lookup per pid instead of one global
+            ``ORDER BY ts`` over every sample those pids ever wrote: the
+            (pid, ts) index seeks straight to each pid's latest sample
+            instead of sorting hundreds of thousands of history rows.
+            Same row per pid (the max-ts one; ties carry the same
+            sampler-measured values), so the starts are identical.
+            """
             wanted = []
             for pid in pids or ():
                 try:
@@ -224,25 +255,21 @@ class RunningMixin:
             if not wanted:
                 return {}
             found = {}
-            step = 500
-            for index in range(0, len(wanted), step):
-                chunk = wanted[index:index + step]
-                marks = ",".join("?" for _ in chunk)
-                for row in self._conn.execute(
-                    f"SELECT pid, ts, elapsed_s FROM process_samples "
-                    f"WHERE pid IN ({marks}) AND ts IS NOT NULL AND elapsed_s IS NOT NULL "
-                    f"ORDER BY ts DESC",
-                    chunk,
-                ).fetchall():
-                    pid = int(row["pid"])
-                    if pid in found:
-                        continue
-                    try:
-                        found[pid] = float(row["ts"]) - float(row["elapsed_s"])
-                    except (TypeError, ValueError):
-                        continue
+            for pid in sorted(set(wanted)):
+                row = self._conn.execute(
+                    "SELECT pid, ts, elapsed_s FROM process_samples "
+                    "WHERE pid=? AND ts IS NOT NULL AND elapsed_s IS NOT NULL "
+                    "ORDER BY ts DESC LIMIT 1",
+                    (pid,),
+                ).fetchone()
+                if row is None:
+                    continue
+                try:
+                    found[pid] = float(row["ts"]) - float(row["elapsed_s"])
+                except (TypeError, ValueError):
+                    continue
             return found
-        def _live_open_ids_locked(self, now: float, rows: list, pid_alive_fn=None) -> set:
+        def _live_open_ids_locked(self, now: float, rows: list, pid_alive_fn=None, usage_max=None, sample_max=None, pid_starts=None) -> set:
             """Run ids of open rows with liveness evidence. Caller holds the lock.
 
             This is the one filtered running set every view uses: the snapshot
@@ -254,9 +281,10 @@ class RunningMixin:
             same label (one lane, one agent) is excluded here as well; the
             worker carries the lane.
             """
-            live, _shadows = self._live_open_with_shadows_locked(now, rows, pid_alive_fn)
+            live, _shadows = self._live_open_with_shadows_locked(
+                now, rows, pid_alive_fn, usage_max, sample_max, pid_starts)
             return live
-        def _live_open_with_shadows_locked(self, now: float, rows: list, pid_alive_fn=None):
+        def _live_open_with_shadows_locked(self, now: float, rows: list, pid_alive_fn=None, usage_max=None, sample_max=None, pid_starts=None):
             """The one running set plus the lane-shadow map. Caller holds the lock.
 
             ``shadows`` maps a shadowed wrapper run id to its live worker run
@@ -268,29 +296,47 @@ class RunningMixin:
                 row for row in rows if (row.get("status") in ("running", "queued"))
             ]
             if open_rows:
-                usage_max = self._usage_max_locked([row["run_id"] for row in open_rows])
-                sample_max = self._sample_max_locked(open_rows)
+                if usage_max is None:
+                    usage_max = self._usage_max_locked([row["run_id"] for row in open_rows])
+                if sample_max is None:
+                    sample_max = self._sample_max_locked(open_rows)
+                if pid_starts is None:
+                    pid_starts = self._pid_start_locked([row.get("pid") for row in open_rows])
             else:
-                usage_max, sample_max = {}, {}
+                usage_max, sample_max, pid_starts = {}, {}, {}
             stale_ids = {
                 run["run_id"]
                 for run, _reason in self._stale_locked(
-                    now, rows, pid_alive_fn, usage_max=usage_max, sample_max=sample_max
+                    now, rows, pid_alive_fn, usage_max=usage_max, sample_max=sample_max,
+                    pid_starts=pid_starts,
                 )
             }
             idle_ids = {
                 row["run_id"]
                 for row in self._idle_locked(
-                    now, rows, pid_alive_fn, usage_max=usage_max, sample_max=sample_max
+                    now, rows, pid_alive_fn, usage_max=usage_max, sample_max=sample_max,
+                    pid_starts=pid_starts,
                 )
             }
             open_ids = {
                 row["run_id"]
                 for row in rows
                 if row.get("status") in ("running", "queued")
+                and not row.get("slice_of")
                 and row.get("run_id") not in stale_ids
                 and row.get("run_id") not in idle_ids
             }
+            # Slices carry no liveness of their own: a slice is live
+            # exactly when its primary is. Lead sources are never
+            # counted agents, so slices cannot inflate live_agents no
+            # matter how many show in the running list.
+            for row in rows:
+                if (
+                    row.get("status") in ("running", "queued")
+                    and row.get("slice_of")
+                    and row.get("slice_of") in open_ids
+                ):
+                    open_ids.add(row["run_id"])
             shadows = _lane_shadows(rows, open_ids)
             return open_ids - set(shadows), shadows
         def _stale_reason_locked(

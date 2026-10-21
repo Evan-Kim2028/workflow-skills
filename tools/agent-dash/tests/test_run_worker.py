@@ -82,7 +82,7 @@ class RunWorkerTests(unittest.TestCase):
                 os.environ[key] = value
         self.tmp.cleanup()
 
-    def go(self, tier, launch, label="lane-1", max_wait="0", no_preflight=True):
+    def go(self, tier, launch, label="ws1-plan-lane-1", max_wait="0", no_preflight=True):
         from io import StringIO
         import contextlib
 
@@ -134,8 +134,8 @@ class RunWorkerTests(unittest.TestCase):
         self.assertIn(str(self.prompt), cmd)
         self.assertIn("muse-spark-1.3-contributor", cmd)
         row = (self.run_dir / "muse-sessions.tsv").read_text(encoding="utf-8").strip()
-        self.assertEqual(row, "lane-1\t%s\t1700000000\tmuse-spark-1.3-contributor" % SID)
-        self.assertEqual((self.run_dir / "lane-1.tier").read_text(encoding="utf-8").strip(), "muse")
+        self.assertEqual(row, "ws1-plan-lane-1\t%s\t1700000000\tmuse-spark-1.3-contributor" % SID)
+        self.assertEqual((self.run_dir / "ws1-plan-lane-1.tier").read_text(encoding="utf-8").strip(), "muse")
 
     def test_auto_skips_a_worker_at_its_cap(self):
         self.counts = {"[m]use-bin|[m]use exec": 25}
@@ -147,8 +147,60 @@ class RunWorkerTests(unittest.TestCase):
         self.assertEqual(launch.cmds[0][4], registry()["workers"]["grok"]["model"])
         text = (self.run_dir / "cursor-sessions.tsv").read_text(encoding="utf-8").strip()
         self.assertEqual(
-            text, "lane-1\t-\t1700000000\t%s" % registry()["workers"]["grok"]["model"]
+            text, "ws1-plan-lane-1\t-\t1700000000\t%s" % registry()["workers"]["grok"]["model"]
         )
+
+    def test_weak_label_refuses_before_launch(self):
+        # No mark, no task match: exit 2 with the fix, nothing spawned,
+        # no tier file, no manifest row. Workstreams point at the empty
+        # temp dir so no live plan can rescue the label.
+        self.counts = {}
+        launch = Launch()
+        old_ws = os.environ.get("AGENT_DASH_WORKSTREAMS")
+        os.environ["AGENT_DASH_WORKSTREAMS"] = str(self.root / "noworkstreams")
+        try:
+            code, line = self.go("default", launch, label="ws1-visuals")
+        finally:
+            if old_ws is None:
+                os.environ.pop("AGENT_DASH_WORKSTREAMS", None)
+            else:
+                os.environ["AGENT_DASH_WORKSTREAMS"] = old_ws
+        self.assertEqual(code, 2)
+        self.assertIn("reason=bad-label", line)
+        self.assertEqual(launch.cmds, [])
+        self.assertFalse((self.run_dir / "ws1-visuals.tier").exists())
+        self.assertFalse((self.run_dir / "muse-sessions.tsv").exists())
+
+    def test_legacy_hatch_warns_and_launches(self):
+        self.counts = {}
+        launch = Launch()
+        old = os.environ.get("AGENT_DASH_ALLOW_LEGACY_LABELS")
+        os.environ["AGENT_DASH_ALLOW_LEGACY_LABELS"] = "1"
+        try:
+            code, line = self.go("default", launch, label="ws1-visuals")
+        finally:
+            if old is None:
+                os.environ.pop("AGENT_DASH_ALLOW_LEGACY_LABELS", None)
+            else:
+                os.environ["AGENT_DASH_ALLOW_LEGACY_LABELS"] = old
+        self.assertEqual(code, 0)
+        self.assertIn("STATUS: done", line)
+        self.assertEqual(len(launch.cmds), 1)
+
+    def test_append_manifest_refuses_a_weak_label(self):
+        old_ws = os.environ.get("AGENT_DASH_WORKSTREAMS")
+        os.environ["AGENT_DASH_WORKSTREAMS"] = str(self.root / "noworkstreams")
+        try:
+            with self.assertRaises(ValueError):
+                runner.append_manifest(
+                    {"kind": "muse"}, self.run_dir, "ws1-visuals", "s", NOW, "m"
+                )
+        finally:
+            if old_ws is None:
+                os.environ.pop("AGENT_DASH_WORKSTREAMS", None)
+            else:
+                os.environ["AGENT_DASH_WORKSTREAMS"] = old_ws
+        self.assertFalse((self.run_dir / "muse-sessions.tsv").exists())
 
     def test_auto_skips_a_worker_in_cooldown(self):
         self.counts = {}
@@ -174,7 +226,7 @@ class RunWorkerTests(unittest.TestCase):
         self.assertIn("bypassPermissions", cmd)
         self.assertIn("plain", cmd)
         row = (self.run_dir / "glm-sessions.tsv").read_text(encoding="utf-8").strip().split("\t")
-        self.assertEqual(row, ["lane-1", SID, "1700000000", "glm-5.3"])
+        self.assertEqual(row, ["ws1-plan-lane-1", SID, "1700000000", "glm-5.3"])
 
     def test_sparse_grok_build_worker_lands_in_glm_manifest_with_model(self):
         # A grok-build tier without manifest/columns wiring (like a bare
@@ -198,7 +250,7 @@ class RunWorkerTests(unittest.TestCase):
         self.assertEqual(cmd[cmd.index("-m") + 1], "deepseek-flash")
         self.assertFalse((self.run_dir / "sessions.tsv").exists())
         row = (self.run_dir / "glm-sessions.tsv").read_text(encoding="utf-8").strip().split("\t")
-        self.assertEqual(row, ["lane-1", SID, "1700000000", "deepseek-flash"])
+        self.assertEqual(row, ["ws1-plan-lane-1", SID, "1700000000", "deepseek-flash"])
 
     def test_quota_on_auto_relaunches_the_next_tier(self):
         self.counts = {}
@@ -210,7 +262,7 @@ class RunWorkerTests(unittest.TestCase):
         self.assertEqual(len(launch.cmds), 2)
         self.assertEqual(launch.cmds[0][0], "muse")
         self.assertTrue(launch.cmds[1][0].endswith("launch_grok.sh"))
-        archived = (self.run_dir / "err-lane-1.muse.log").read_text(encoding="utf-8")
+        archived = (self.run_dir / "err-ws1-plan-lane-1.muse.log").read_text(encoding="utf-8")
         self.assertIn("429", archived)
         cooled = json.loads((self.state / "worker-cooldowns.json").read_text(encoding="utf-8"))
         self.assertEqual(cooled["muse"], NOW + 30 * 60)
@@ -224,7 +276,7 @@ class RunWorkerTests(unittest.TestCase):
         self.assertIn("reason=quota", line)
         self.assertIn("tier=muse", line)
         self.assertEqual(len(launch.cmds), 1)
-        self.assertFalse((self.run_dir / "out-lane-1.muse.md").exists())
+        self.assertFalse((self.run_dir / "out-ws1-plan-lane-1.muse.md").exists())
 
     def test_a_later_call_only_waits(self):
         self.counts = {}
@@ -377,7 +429,7 @@ class PreflightTests(unittest.TestCase):
     def pgrep(self, pattern):
         return self.counts.get(pattern, 0)
 
-    def launch(self, tier, label="lane-1", no_preflight=False):
+    def launch(self, tier, label="ws1-plan-lane-1", no_preflight=False):
         from io import StringIO
         import contextlib
 

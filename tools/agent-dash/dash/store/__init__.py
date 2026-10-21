@@ -72,6 +72,7 @@ from .summarize import (
     _ws_row,
     _zero_prev,
 )
+from .split import SplitMixin
 from .usage import UsageMixin, _fold_events
 from .util import (
     BILLED_FIELDS,
@@ -214,6 +215,7 @@ class Store(
     RunningMixin,
     SummarizeMixin,
     QueriesMixin,
+    SplitMixin,
 ):
     """SQLite-backed dashboard store behind one re-entrant lock.
 

@@ -1,0 +1,45 @@
+{
+  "_doc": "Performance budgets for agent-dash. Every number carries its measured baseline on the reference machine and 2x headroom: budget ~= 2x baseline, so a breach means a real regression, not noise. A change that breaks a budget must fix the code or raise the budget here with a written reason (see docs/perf.md). tests/perf/test_perf_budget.py (ADASH_PERF=1; selected by scripts/gate.sh for dash/store/*, dash/server.py, dash/sources/*, dash/phases.py, dash/pricing.py, dash/taskmatch.py, dash/state.py) asserts cold/warm endpoint latency on the 1x and 5x seeds, steady-state CPU, per-source poll duration, and the incremental scaling rule. dash/doctor.py slow-endpoint reads endpoints.*.warm_ms from this file.",
+  "reference": "MacBook Pro, synthetic seeds from scripts/perf_seed.py (1x: 8,431 runs / 157k usage rows / 244k samples / 70 MB; 5x: 42,155 runs / 787k usage rows / 1.2M samples / 355 MB), warmed server, 2026-10-19/20",
+  "headroom_rule": "budget is 2x the measured baseline, rounded up; raise only with a written reason",
+  "cold_scaling_note": "A cold open must touch every row once, so cold endpoints scale linearly with data by construction (measured 3.7-5.7x at 5x; no accidental superlinearity). The sublinear guarantee this gate enforces is the incremental one below: a fixed-size write refolds only its runs, independent of total data. Per-scale cold caps live next to each endpoint.",
+  "endpoints": {
+    "state": {"cold_ms": 2000, "cold_5x_ms": 8000, "warm_ms": 100, "baseline_cold_ms": 1017, "baseline_cold_5x_ms": 3997, "baseline_warm_ms": 9},
+    "snapshot": {"cold_ms": 1500, "cold_5x_ms": 6500, "warm_ms": 300, "baseline_cold_ms": 719, "baseline_cold_5x_ms": 3135, "baseline_warm_ms": 9},
+    "workstreams": {"cold_ms": 1000, "cold_5x_ms": 3500, "warm_ms": 300, "baseline_cold_ms": 436, "baseline_cold_5x_ms": 1612, "baseline_warm_ms": 26},
+    "runs": {"cold_ms": 500, "cold_5x_ms": 600, "warm_ms": 300, "baseline_cold_ms": 62, "baseline_cold_5x_ms": 296, "baseline_warm_ms": 179},
+    "usage": {"cold_ms": 500, "cold_5x_ms": 500, "warm_ms": 300, "baseline_cold_ms": 6, "baseline_cold_5x_ms": 8, "baseline_warm_ms": 40},
+    "concurrency": {"cold_ms": 500, "cold_5x_ms": 600, "warm_ms": 300, "baseline_cold_ms": 47, "baseline_cold_5x_ms": 269, "baseline_warm_ms": 103},
+    "project/phases": {"cold_ms": 1200, "cold_5x_ms": 5000, "warm_ms": 300, "baseline_cold_ms": 529, "baseline_cold_5x_ms": 2236, "baseline_warm_ms": 6},
+    "health": {"cold_ms": 500, "cold_5x_ms": 1200, "warm_ms": 100, "baseline_cold_ms": 77, "baseline_cold_5x_ms": 507, "baseline_warm_ms": 16},
+    "plan": {"cold_ms": 500, "cold_5x_ms": 500, "warm_ms": 100, "baseline_cold_ms": 30, "baseline_warm_ms": 2, "baseline_cold_5x_ms": 2},
+    "doctor": {"cold_ms": 1000, "cold_5x_ms": 1000, "warm_ms": 300, "baseline_cold_ms": 60, "baseline_cold_5x_ms": 1, "baseline_warm_ms": 3}
+  },
+  "churn": {
+    "_doc": "Live-like churn: a writer lands usage on 5 live runs every 200 ms while tabs poll snapshot+runs (tests/perf/test_perf_budget.py::test_churn_coalescing_under_budget, ~20 s window on the 1x seed). Baselines measured on the reference machine 2026-10-20; budgets keep the 2x headroom rule. recompute_min_interval_s bounds the recompute rate (one per ttl_s, not one per request); hit_ratio_min proves coalescing engages; endpoint_p95_ms is the served p95 under churn; *_cold_p50_ms are recompute costs with the TTL bypassed. Reference baselines: recompute interval ~1.5 s, hit ratio ~0.97, p95 ~40 ms, cold snapshot ~35 ms, runs ~20 ms, concurrency ~20 ms, workstreams ~45 ms on the 1x synthetic seed.",
+    "window_s": 20,
+    "recompute_min_interval_s": 1.0,
+    "hit_ratio_min": 0.5,
+    "endpoint_p95_ms": 300,
+    "snapshot_cold_p50_ms": 100,
+    "runs_cold_p50_ms": 100,
+    "concurrency_cold_p50_ms": 100,
+    "workstreams_cold_p50_ms": 200
+  },
+  "scaling": {
+    "incremental_max_ratio": 2.5,
+    "incremental_note": "One fixed-size usage write, then _usage_by_run: 5x data costs under 2.5x the 1x time (measured ~1.0x: only the written run refolds). A linear refold regresses this to ~5x and fails the gate.",
+    "incremental_abs_ms": 1000
+  },
+  "cpu_steady_pct": 25,
+  "cpu_steady_note": "process cputime delta over a 20 s window with stub sources polling and one simulated open page (conditional snapshot every 2 s) on the 5x seed",
+  "poll_s": 1.0,
+  "poll_note": "every source poll duration under 1 s against small synthetic roots (overhead bound); live-workload poll durations are baselined in docs/perf.md",
+  "lock_wait_p95_ms": 200,
+  "source_lag_x": 3,
+  "source_lag_polls": 3,
+  "db_warn_mb": 500,
+  "db_crit_mb": 1000,
+  "db_growth_warn_mb_per_day": 50,
+  "slow_request_ms": 2000
+}

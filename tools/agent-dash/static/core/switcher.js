@@ -127,8 +127,11 @@
     return r.progress && typeof r.progress.pct === "number" ? r.progress.pct : null;
   }
 
-  /* Pick a row: archived rows open the Archive view, planned rows the
-     Planned view, the rest their execution tab. */
+  /* Pick a row (mouse click or Enter in the popover). Archived rows open
+     the Archive view. Planned rows open the Planned view, except from the
+     Plan view: there the picked workstream's own plan opens (its plan
+     bundle exists before it starts), and the view stays Plan. The rest
+     open their execution tab. */
   function pickWs(id, st) {
     closeSwitcher();
     var up = String(id).toUpperCase();
@@ -137,7 +140,7 @@
     var want = (st || (found && found.state) || "active");
     if (want === "archived") {
       if (state.view !== "archive") selectView("archive");
-    } else if (want === "planned") {
+    } else if (want === "planned" && state.view !== "plan") {
       if (state.view !== "planned") selectView("planned");
     } else {
       if (typeof isProjectView === "function" && isProjectView()) selectView("exec");

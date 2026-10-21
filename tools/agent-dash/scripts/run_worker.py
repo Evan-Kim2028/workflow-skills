@@ -116,6 +116,21 @@ def run(argv, spawn=None, pgrep=None, sleep=None, now=None, alive=None, new_uuid
     if not LABEL_OK.fullmatch(label):
         emit("failed", "", "", requested, "bad-label")
         return 2
+    # A weak label launches nothing: refuse with the exact corrected
+    # label before any spawn, manifest row, or registration. Replays of
+    # old runs set AGENT_DASH_ALLOW_LEGACY_LABELS=1 for a warning instead.
+    from dash import labels as label_lib
+
+    verdict = label_lib.check(label)
+    if not verdict["ok"]:
+        if label_lib.legacy_allowed():
+            print(f"label warning (legacy replay): {verdict['fix']}", file=sys.stderr)
+        else:
+            print(f"label refused: {verdict['fix']}", file=sys.stderr)
+            emit("failed", "", "", requested, "bad-label")
+            return 2
+    elif verdict.get("warning"):
+        print(verdict["warning"], file=sys.stderr)
     run_path = Path(run_dir)
     out = run_path / f"out-{label}.md"
     err = run_path / f"err-{label}.log"
@@ -331,6 +346,13 @@ MANIFEST_BY_KIND = {
 
 
 def append_manifest(worker, run_dir, label, session_id, epoch, model):
+    # Defense in depth: no manifest row for a weak label. ``run()``
+    # refuses first; this raises on any direct misuse.
+    from dash import labels as label_lib
+
+    verdict = label_lib.check(label)
+    if not verdict["ok"] and not label_lib.legacy_allowed():
+        raise ValueError(verdict["fix"])
     default_name, default_cols = MANIFEST_BY_KIND.get(
         worker.get("kind") or "", ("sessions.tsv", ["label", "session_id", "epoch"])
     )

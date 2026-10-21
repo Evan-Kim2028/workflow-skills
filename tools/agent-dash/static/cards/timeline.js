@@ -20,7 +20,7 @@
   var DENSE_ROWS = 400;
   /* A run with no end time is drawn to now only while it is running; an ended run whose end was never seen gets a one-minute stub. */
   /* Lead sessions and shell rows are drawn but not counted as agents. */
-  function isAgent(r) { return r.source !== "claude-main" && r.source !== "shell" && !r.lane_shadow; }
+  function isAgent(r) { return r.source !== "claude-main" && r.source !== "codex" && r.source !== "shell" && !r.lane_shadow; }
   function runEnd(r, now) { return r.ended_at || (r.status === "running" ? now : (r.started_at || now) + 60); }
   function packRows(runs, gapS) {
     var rows = [];

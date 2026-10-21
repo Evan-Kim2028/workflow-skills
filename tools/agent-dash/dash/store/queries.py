@@ -182,8 +182,12 @@ class QueriesMixin:
             names, and the stale running rows. No nested snapshot calls."""
             with self._lock:
                 shown_all, parents = self._shown_locked(now)
-                live_open = self._live_open_ids_locked(now, shown_all)
-                stalled = self._stalled_locked(now, shown_all)
+                # One evidence pass shared by the live-open set, the
+                # stalled map, and the stale list below (same run list,
+                # same GROUP BYs, computed once).
+                _umax, _smax, _pstarts = self._open_evidence_locked(shown_all)
+                live_open = self._live_open_ids_locked(now, shown_all, None, _umax, _smax, _pstarts)
+                stalled = self._stalled_locked(now, shown_all, None, _umax, _smax)
                 roll = self._summarize_locked(shown_all, parents, now, since, until, live_open)
                 mismatches = self._mismatches_locked(
                     roll, shown_all, now, lambda ws: _scope_tab(roll, ws), processes
@@ -223,7 +227,7 @@ class QueriesMixin:
                         "label": run.get("label"),
                         "reason": reason,
                     }
-                    for run, reason in self._stale_locked(now, shown_all)
+                    for run, reason in self._stale_locked(now, shown_all, None, _umax, _smax, _pstarts)
                 ]
                 return {
                     "roll": roll,
@@ -276,8 +280,9 @@ class QueriesMixin:
                 marker_ids = self._marker_run_ids_locked(
                     [run for run in runs if _is_counted_agent(run)]
                 )
-                live_open = self._live_open_ids_locked(now, runs)
-                stalled = self._stalled_locked(now, runs)
+                _umax, _smax, _pstarts = self._open_evidence_locked(runs)
+                live_open = self._live_open_ids_locked(now, runs, None, _umax, _smax, _pstarts)
+                stalled = self._stalled_locked(now, runs, None, _umax, _smax)
                 # A stalled row is proven live activity, never a
                 # placeholder: its history stays in the lanes (truncated
                 # at the stall point below) even when it names no model.

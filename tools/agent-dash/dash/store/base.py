@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import os
 import sqlite3
-import threading
 import time as _time
 
 from pathlib import Path
@@ -26,7 +25,9 @@ class BaseMixin:
             self.path = Path(path)
             if str(self.path) != ":memory:":
                 self.path.parent.mkdir(parents=True, exist_ok=True)
-            self._lock = threading.RLock()
+            from dash import perfmon as _perfmon
+
+            self._lock = _perfmon.TimedRLock()
             self._conn = sqlite3.connect(
                 self.path, check_same_thread=False, isolation_level=None, timeout=5
             )
@@ -36,10 +37,33 @@ class BaseMixin:
             self._conn.execute("PRAGMA busy_timeout=5000")
             self._seq = 0
             self._data_seq = 0
+            self._view_seq = 0
+            self._cursor_seq = 0
             self._last_data_ts: float | None = None
             self._snapshot_cache: dict = {}
             self._model_stats_cache = None
             self._workstreams_cache: dict = {}
+            self._usage_folds: dict = {}
+            self._usage_fold_versions: dict = {}
+            self._usage_run_versions: dict = {}
+            self._usage_fold_epoch = 0
+            self._usage_fold_built_epoch = -1
+            # Per-run view-fragment versions, mirroring the usage fold:
+            # ``_run_versions[run_id]`` bumps on every run write through
+            # ``_write_run``; ``_run_epoch`` bumps on structural changes
+            # that bypass it (merges, deletes, parent reassigns). The
+            # fragment cache in ``summarize`` keys finished-row views on
+            # these plus the usage-fold version, so under churn only
+            # touched rows rebuild their views. ``_view_frags`` maps
+            # run_id -> (frag_key, view_dict).
+            self._run_versions: dict = {}
+            self._run_epoch = 0
+            self._view_frags: dict = {}
+            self._phase_inputs_key = None
+            self._phase_task_cache: dict = {}
+            self._phase_class_cache: dict = {}
+            self._rollup_cache: dict = {}
+            self._unpriced_cache: dict = {}
             self._prune_after = 0
             self._pruned_since_vacuum = 0
             self._prune_cycles = 0
@@ -58,11 +82,62 @@ class BaseMixin:
         def data_seq(self) -> int:
             return self._data_seq
         @property
+        def view_seq(self) -> int:
+            return self._view_seq
+        @property
+        def cursor_seq(self) -> int:
+            return self._cursor_seq
+        @property
         def last_data_ts(self) -> float | None:
             return self._last_data_ts
         def _note_data_write(self) -> None:
             """Stamp the last data-changing write. Caller holds the lock."""
             self._last_data_ts = _time.time()
+        def _bump_usage_run(self, run_id) -> None:
+            """Mark one run's usage fold stale. Caller holds the lock.
+
+            The incremental :meth:`_usage_by_run` refolds only bumped
+            runs, so every usage write names its run here. Bulk
+            rewrites that cannot name runs bump
+            ``_usage_fold_epoch`` instead and refold everything once.
+            """
+            if run_id is None:
+                return
+            if not isinstance(run_id, str):
+                run_id = str(run_id)
+            self._usage_run_versions[run_id] = self._usage_run_versions.get(run_id, 0) + 1
+        def _bump_run_version(self, run_id) -> None:
+            """Mark one run's cached view fragment stale. Caller holds the lock.
+
+            Every ``_write_run`` funnels through here, so per-row view
+            fragments keyed on this version stay exact. Structural paths
+            that bypass ``_write_run`` (merges, deletes, parent
+            reassigns) bump ``_run_epoch`` instead and clear nothing:
+            the key carries the epoch, so old entries simply miss.
+            """
+            if run_id is None:
+                return
+            if not isinstance(run_id, str):
+                run_id = str(run_id)
+            self._run_versions[run_id] = self._run_versions.get(run_id, 0) + 1
+
+        def _bump_run_epoch(self) -> None:
+            """Invalidate every cached view fragment. Caller holds the lock."""
+            self._run_epoch += 1
+            if len(self._view_frags) > 40000:
+                self._view_frags.clear()
+
+        def _note_view_write(self) -> None:
+            """Advance the page-visible sequence. Caller holds the lock.
+
+            Call exactly when a write changes a value the snapshot
+            or usage buckets expose (new usage rows, run status or
+            attribution changes, rollup moves). Offset cursors,
+            process samples, heartbeats, and telemetry-only rewrites
+            bump ``_seq`` (or ``_data_seq``) but never this, so an
+            idle page's tick comparison stays quiet.
+            """
+            self._view_seq += 1
         def note_bundle_change(self) -> None:
             """Stamp a bundle-lifecycle write (archive/restore from the page).
 
@@ -75,6 +150,7 @@ class BaseMixin:
                 self._seq += 1
                 self._snapshot_cache.clear()
                 self._note_data_write()
+                self._note_view_write()
         def get_offset(self, path: str):
             with self._lock:
                 row = self._conn.execute(
@@ -109,8 +185,12 @@ class BaseMixin:
                     self._conn.execute("ROLLBACK")
                     raise
                 if previous != (int(inode), int(offset)):
-                    self._data_seq += 1
+                    # Read cursors only: no served byte changes, so the
+                    # snapshot cache and the page-visible sequence stay.
+                    # The cursor sequence still moves: batch jobs (backfill)
+                    # treat an advancing scan cursor as progress.
                     self._seq += 1
+                    self._cursor_seq += 1
                     self._note_data_write()
         def prune_offsets(self, batch: int = PRUNE_BATCH) -> int:
             """Delete up to ``batch`` offset rows whose path no longer exists.
@@ -160,7 +240,6 @@ class BaseMixin:
                         self._conn.execute("ROLLBACK")
                         raise
                     self._pruned_since_vacuum += len(gone)
-                    self._data_seq += 1
                     self._seq += 1
                 return len(gone)
         def _create(self) -> None:
@@ -185,7 +264,8 @@ class BaseMixin:
                   out_growing INTEGER DEFAULT 0,
                   err_bytes INTEGER,
                   pid INTEGER,
-                  out_path TEXT
+                  out_path TEXT,
+                  slice_of TEXT
                 );
                 CREATE TABLE IF NOT EXISTS usage_events (
                   tool TEXT NOT NULL,
@@ -202,6 +282,7 @@ class BaseMixin:
                   cache_write_1h INTEGER,
                   reasoning INTEGER,
                   est_cost_usd REAL,
+                  ws_split TEXT,
                   PRIMARY KEY (tool, session_id, message_id)
                 );
                 CREATE TABLE IF NOT EXISTS usage_buckets (
@@ -218,6 +299,24 @@ class BaseMixin:
                   cost_usd REAL,
                   PRIMARY KEY (hour_ts, model, workstream, tool)
                 );
+                CREATE TABLE IF NOT EXISTS usage_rollup_1h (
+                  run_id TEXT NOT NULL,
+                  hour_ts INTEGER NOT NULL,
+                  model TEXT NOT NULL DEFAULT '',
+                  tool TEXT NOT NULL DEFAULT '',
+                  ws_split TEXT NOT NULL DEFAULT '',
+                  n_events INTEGER NOT NULL,
+                  input_tokens INTEGER NOT NULL DEFAULT 0,
+                  output_tokens INTEGER NOT NULL DEFAULT 0,
+                  cache_read INTEGER NOT NULL DEFAULT 0,
+                  cache_write INTEGER NOT NULL DEFAULT 0,
+                  reasoning INTEGER,
+                  missing INTEGER NOT NULL DEFAULT 0,
+                  unpriced INTEGER NOT NULL DEFAULT 0,
+                  cost_usd REAL,
+                  PRIMARY KEY (run_id, hour_ts, model, tool, ws_split)
+                );
+                CREATE INDEX IF NOT EXISTS idx_rollup_hour ON usage_rollup_1h(hour_ts);
                 CREATE TABLE IF NOT EXISTS process_samples (
                   ts REAL NOT NULL,
                   pid INTEGER NOT NULL,
@@ -301,19 +400,76 @@ class BaseMixin:
                 CREATE INDEX IF NOT EXISTS idx_runs_label ON runs(label);
                 CREATE INDEX IF NOT EXISTS idx_runs_parent ON runs(parent_session_id);
                 CREATE INDEX IF NOT EXISTS idx_runs_session ON runs(session_id);
+                CREATE INDEX IF NOT EXISTS idx_usage_session ON usage_events(session_id);
                 CREATE INDEX IF NOT EXISTS idx_usage_run ON usage_events(run_id);
                 CREATE INDEX IF NOT EXISTS idx_usage_ts ON usage_events(ts);
                 CREATE INDEX IF NOT EXISTS idx_samples_ts ON process_samples(ts);
                 CREATE INDEX IF NOT EXISTS idx_samples_pid ON process_samples(pid);
                 CREATE INDEX IF NOT EXISTS idx_samples_run ON process_samples(run_id);
+                CREATE INDEX IF NOT EXISTS idx_samples_pid_ts ON process_samples(pid, ts);
+                CREATE INDEX IF NOT EXISTS idx_samples_run_ts ON process_samples(run_id, ts);
+                CREATE INDEX IF NOT EXISTS idx_usage_run_ts ON usage_events(run_id, ts);
                 CREATE INDEX IF NOT EXISTS idx_aliases_target ON run_aliases(target_run_id);
                 """
             )
             self._migrate_usage_splits()
+            self._migrate_lead_split()
+            self._migrate_rollup()
             self._migrate_uncached_input()
             self._migrate_run_aliases()
             self._migrate_session_hint()
             self._migrate_doctor_items()
+        def _migrate_lead_split(self) -> None:
+            """Once: per-turn workstream numbers and slice links for lead splits.
+
+            Existing databases gain ``usage_events.ws_split`` (a
+            workstream number per assistant turn, never text) and
+            ``runs.slice_of`` (a slice run's primary run id), plus an
+            index so per-session split reads stay indexed.
+            """
+            usage_cols = {row[1] for row in self._conn.execute("PRAGMA table_info(usage_events)")}
+            if "ws_split" not in usage_cols:
+                self._conn.execute("ALTER TABLE usage_events ADD COLUMN ws_split TEXT")
+            run_cols = {row[1] for row in self._conn.execute("PRAGMA table_info(runs)")}
+            if "slice_of" not in run_cols:
+                self._conn.execute("ALTER TABLE runs ADD COLUMN slice_of TEXT")
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_usage_session ON usage_events(session_id)"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_runs_slice ON runs(slice_of)"
+            )
+        def _migrate_rollup(self) -> None:
+            """Once: the hourly usage rollup table for bounded growth.
+
+            Existing databases gain ``usage_rollup_1h`` (one row per
+            rolled (run, hour, model, tool, split) with exact token sums
+            and the group cost) plus its hour index. The table starts
+            empty; the rollup job fills it. Rolling back this code
+            leaves the table behind, which older code ignores.
+            """
+            self._conn.execute(
+                """CREATE TABLE IF NOT EXISTS usage_rollup_1h (
+                  run_id TEXT NOT NULL,
+                  hour_ts INTEGER NOT NULL,
+                  model TEXT NOT NULL DEFAULT '',
+                  tool TEXT NOT NULL DEFAULT '',
+                  ws_split TEXT NOT NULL DEFAULT '',
+                  n_events INTEGER NOT NULL,
+                  input_tokens INTEGER NOT NULL DEFAULT 0,
+                  output_tokens INTEGER NOT NULL DEFAULT 0,
+                  cache_read INTEGER NOT NULL DEFAULT 0,
+                  cache_write INTEGER NOT NULL DEFAULT 0,
+                  reasoning INTEGER,
+                  missing INTEGER NOT NULL DEFAULT 0,
+                  unpriced INTEGER NOT NULL DEFAULT 0,
+                  cost_usd REAL,
+                  PRIMARY KEY (run_id, hour_ts, model, tool, ws_split)
+                )"""
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_rollup_hour ON usage_rollup_1h(hour_ts)"
+            )
         def _migrate_uncached_input(self) -> None:
             """Once: muse and GLM logged input with cached tokens inside it; store uncached input like every other source, then rebuild the hourly buckets."""
             self._conn.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)")
@@ -615,6 +771,7 @@ class BaseMixin:
         def _all_runs(self) -> list:
             return self._conn.execute("SELECT * FROM runs").fetchall()
         def _write_run(self, merged: dict) -> None:
+            self._bump_run_version((merged or {}).get("run_id"))
             values = [merged.get(col) for col in RUN_COLS]
             placeholders = ",".join("?" for _ in RUN_COLS)
             updates = ",".join(f"{col}=excluded.{col}" for col in RUN_COLS if col != "run_id")

@@ -9,6 +9,13 @@ L="$1"; WS="$2"; PF="$3"
 MODEL="${4:-grok-4.7[context=500k,reasoning_effort=xhigh,fast=false]}"
 [ -n "$L" ] && [ -d "$WS" ] && [ -f "$PF" ] || { echo "usage: launch_grok.sh <label> <workspace> <prompt-file> [model]" >&2; exit 2; }
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# A weak label launches nothing: refuse with the exact corrected label.
+# Replays of old runs set AGENT_DASH_ALLOW_LEGACY_LABELS=1 for a warning.
+if [ "${AGENT_DASH_ALLOW_LEGACY_LABELS:-}" = "1" ]; then
+  warn=$(/usr/bin/python3 "$HERE/../agent_dash.py" label check "$L" 2>&1) || echo "label warning (legacy replay): $warn" >&2
+else
+  fix=$(/usr/bin/python3 "$HERE/../agent_dash.py" label check "$L" 2>&1) || { echo "$fix" >&2; exit 2; }
+fi
 prompt=$(cat "$PF")
 cursor-agent -p --model "$MODEL" --force --trust --workspace "$WS" --output-format stream-json "$prompt" \
   | /usr/bin/python3 "$HERE/grok_stream_filter.py" --label "$L" --cwd "$WS" --model "$MODEL"

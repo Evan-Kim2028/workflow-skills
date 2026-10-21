@@ -793,7 +793,7 @@
       }
       return out;
     }
-    function rpIsAgentRun(r) { var src = r.source; return src !== "claude-main" && src !== "shell" && src !== "dagster"; }
+    function rpIsAgentRun(r) { var src = r.source; return src !== "claude-main" && src !== "codex" && src !== "shell" && src !== "dagster"; }
     function rpPaint(frac, fire) {
       var T = rpCursorTime(frac), now = {};
       Object.keys(RP.tasks).forEach(function (tid) {

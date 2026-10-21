@@ -1156,7 +1156,7 @@
   /* Live-agents strips: one gradient strip per model family on its own
      scale and the shared x, with peak dot and pk annotation. Only the
      bottom strip of the stack carries x labels. */
-  var ACT_TOOLFAM = {grok: "cursor", muse: "muse", glm: "glm", claude: "claude", deepseek: "deepseek", other: "other"};
+  var ACT_TOOLFAM = {grok: "cursor", muse: "muse", glm: "glm", claude: "claude", deepseek: "deepseek", codex: "codex", other: "other"};
   function actMods(p) {
     if (p.models) return p.models;
     var o = {};

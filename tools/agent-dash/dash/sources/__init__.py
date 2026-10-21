@@ -221,6 +221,18 @@ class Registry:
         return body
 
 
+def _perf_poll(source, duration: float) -> None:
+    """One finished poll into the process monitor (never raises)."""
+    try:
+        from dash import perfmon as _perfmon
+
+        _perfmon.get().record_poll(
+            source.NAME, duration, getattr(source, "INTERVAL_S", None)
+        )
+    except Exception:
+        pass
+
+
 def _run_poll(registry: Registry, source, store, cfg, now: float, budget: float) -> None:
     """Poll one source and record the outcome. Always runs in a worker thread."""
     start = time.monotonic()
@@ -236,6 +248,7 @@ def _run_poll(registry: Registry, source, store, cfg, now: float, budget: float)
             if duration <= budget:
                 state["timed_out"] = False
         log.warning("source %s: %s", source.NAME, state["last_error"])
+        _perf_poll(source, duration)
     else:
         duration = time.monotonic() - start
         with registry._lock:
@@ -250,6 +263,7 @@ def _run_poll(registry: Registry, source, store, cfg, now: float, budget: float)
                     f"TimeoutError: poll took {duration:.1f}s, over {budget:g}s budget"
                 )
                 log.warning("source %s: %s", source.NAME, state["last_error"])
+        _perf_poll(source, duration)
 
 
 def has_completed_poll(state: dict) -> bool:

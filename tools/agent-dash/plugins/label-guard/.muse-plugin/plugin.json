@@ -1,0 +1,8 @@
+{
+  "name": "label-guard",
+  "version": "1.0.0",
+  "description": "Refuse worker launches with invalid run labels (agent-dash label guard)",
+  "schemaVersion": 1,
+  "compat": {"manifestDir": ".muse-plugin"},
+  "capabilities": {"hooks": [{"id": "label-guard-pretooluse", "event": "PreToolUse", "command": ["python3", "hooks/guard.py"]}]}
+}

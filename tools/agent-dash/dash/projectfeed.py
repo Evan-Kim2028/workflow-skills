@@ -39,7 +39,7 @@ FORWARD_TO = ("done", "pr", "prog")
 FINISHED_STATUS = ("done", "killed", "died_early")
 
 #: Sources that are never agents (interactive leads, launch rows, jobs).
-NON_AGENT_SOURCES = frozenset({"", "claude-main", "shell", "dagster"})
+NON_AGENT_SOURCES = frozenset({"", "claude-main", "codex", "shell", "dagster"})
 
 VERDICT_WORDS = {
     "PASS": "pass",
@@ -99,6 +99,8 @@ def _tool_key(run: dict) -> str | None:
         return "muse"
     if source == "glm" or tier == "glm":
         return "glm"
+    if source in ("codex", "codex-exec") or tier == "codex":
+        return "codex"
     if source.startswith("claude") or tier in ("opus", "sonnet", "haiku"):
         return "claude"
     return None

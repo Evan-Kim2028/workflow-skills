@@ -27,7 +27,7 @@
   }
   function setCache(key, body) { body.at = Date.now(); body.key = key; execCache[key] = body; }
   function applyHit(hit) {
-    state.snap = hit.snap; state.runs = hit.runs; state.usage = hit.usage; state.conc = hit.conc; state.plan = hit.plan; state.seq = hit.seq; state.approvals = hit.approvals || [];
+    state.snap = hit.snap; state.runs = hit.runs; state.usage = hit.usage; state.conc = hit.conc; state.plan = hit.plan; state.seq = hit.seq; state.viewSeq = hit.viewSeq != null ? hit.viewSeq : hit.seq; state.approvals = hit.approvals || [];
   }
   function showLoading() {
     state.snap = null; state.runs = []; state.usage = []; state.conc = []; state.plan = null; state.approvals = [];

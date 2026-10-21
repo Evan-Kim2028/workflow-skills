@@ -15,6 +15,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+from dash import respcache as _respcache_mod
 from dash.buildinfo import build_info
 from dash.bundles import approvals_all, approvals_for, list_bundles, load_bundle_api, plans_stamp, read_page, resolve_plan, start_prompt_text, workstream_plan_ids
 from dash.errors import api_error
@@ -110,6 +111,63 @@ def _plan_map_cached(ws: str, body: dict) -> dict:
     return payload
 
 
+def _snapshot_refresh(store):
+    """Per-serve volatile refresh for TTL-cached snapshots (no recompute).
+
+    The cached generation keeps its ETag, but the page's tick logic
+    compares ``seq``/``view_seq`` and prints ``now``: those ride fresh
+    on every serve while the sums stay frozen at compute time. Reading
+    five counters costs nothing next to a recompute.
+    """
+
+    def refresh(payload: dict, now: float) -> dict:
+        try:
+            payload["now"] = now
+            payload["seq"] = store.seq
+            payload["data_seq"] = store.data_seq
+            payload["view_seq"] = store.view_seq
+            payload["last_data_ts"] = store.last_data_ts
+        except Exception:
+            pass
+        return payload
+
+    return refresh
+
+
+def _ttl_viewer_params(server) -> dict:
+    """Request-independent inputs that change GET content, for TTL keys.
+
+    The read-only switch flips ``actions`` in the project and state
+    payloads, so its current value rides every key for those endpoints:
+    toggling it recomputes at once instead of within the TTL. Cheap
+    (one env read); never raises.
+    """
+    try:
+        from dash import actions as actions_mod
+
+        readonly = not actions_mod.actions_enabled(server.cfg)
+    except Exception:
+        readonly = False
+    return {"ro": bool(readonly)}
+
+
+def _state_refresh(payload: dict, now: float) -> dict:
+    """Per-serve clock refresh for TTL-cached state bodies (no recompute).
+
+    ``now``/``window`` ride fresh; the rollup, mismatches, boards, and
+    health stay frozen at compute time (at most ttl_s old). The ETag
+    still names the generation, so a match 304s without a recompute.
+    """
+    try:
+        from dash.state import WINDOW_S
+
+        payload["now"] = now
+        payload["window"] = {"since": now - WINDOW_S, "until": now, "hours": WINDOW_S / 3600}
+    except Exception:
+        pass
+    return payload
+
+
 def _with_run_sections(body: dict) -> dict:
     """Snapshot body with plan sections on its running/recent rows.
 
@@ -138,10 +196,21 @@ class DashServer(ThreadingHTTPServer):
     allow_reuse_address = True
 
     def __init__(self, store, registry, host="127.0.0.1", port=8765, index_path=None, stream_interval=2.0, cfg=None, build=None):
+        from dash.singleflight import SingleFlight
+
         self.store = store
         self.registry = registry
         self.cfg = cfg or {}
         self.doctor = None
+        # One computation per concurrent identical cold request: a slow
+        # server used to stack a full fold per SSE tick behind the one
+        # already running. Callers that mutate a shared result copy first.
+        self.flight = SingleFlight()
+        # TTL response cache (stale-while-revalidate) in front of the
+        # heavy reads: under write churn every request would otherwise
+        # recompute cold. POST user actions invalidate it explicitly.
+        # ``response_ttl_s=0`` disables it (legacy path, byte-identical).
+        self.respcache = _respcache_mod.ResponseCache()
         # Captured once at start: the safe deploy flow compares this
         # against the port instead of re-reading git per request.
         self.build = dict(build) if isinstance(build, dict) else build_info()
@@ -229,6 +298,17 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         parsed = urlparse(self.path)
+        if parsed.path == "/api/stream":
+            # Long-lived SSE: timing it as one request would poison max.
+            self._dispatch_get(parsed)
+            return
+        start = time.monotonic()
+        try:
+            self._dispatch_get(parsed)
+        finally:
+            _record_http(self.server, parsed, (time.monotonic() - start) * 1000.0)
+
+    def _dispatch_get(self, parsed):
         path = parsed.path
         query = parse_qs(parsed.query)
         try:
@@ -283,25 +363,7 @@ class Handler(BaseHTTPRequestHandler):
             elif path.startswith("/bundle/"):
                 self._bundle_page(path)
             elif path == "/api/health":
-                now = time.time()
-                body = _health_with_live(self.server.registry, now, self.server.cfg)
-                body["pricing"] = health_block(self.server.store.usage_model_stats())
-                body["disconnects_1h"] = self.server.disconnects_1h()
-                unpriced = self.server.store.unpriced_models(now, now - 86400, now)
-                if unpriced:
-                    body["ok"] = False
-                    body["unpriced_models"] = unpriced
-                body["doctor"] = self._doctor_block(now)
-                if int((body["doctor"].get("summary") or {}).get("critical", 0)) > 0:
-                    body["ok"] = False
-                build = getattr(self.server, "build", None) or {}
-                body["build_id"] = build.get("build_id", "unknown")
-                body["started_at"] = build.get("started_at")
-                body["state_hash"] = state_dir_hash((self.server.cfg or {}).get("state_dir"))
-                import os as _os
-
-                body["project_id"] = (_os.environ.get("AGENT_DASH_PROJECT_ID") or "").strip() or None
-                self._json(200, body)
+                self._health()
             elif path == "/api/doctor":
                 self._doctor(query)
             elif path == "/api/state":
@@ -321,6 +383,13 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         parsed = urlparse(self.path)
+        start = time.monotonic()
+        try:
+            self._dispatch_post(parsed)
+        finally:
+            _record_http(self.server, parsed, (time.monotonic() - start) * 1000.0)
+
+    def _dispatch_post(self, parsed):
         path = parsed.path
         try:
             if path == "/api/workstreams/archive":
@@ -349,27 +418,64 @@ class Handler(BaseHTTPRequestHandler):
         from dash.state import build_state, state_identity
 
         now = time.time()
+
+        def compute():
+            return build_state(
+                self.server.store,
+                self.server.registry,
+                self.server.cfg,
+                now=now,
+                processes=_live_workers(),
+                build=getattr(self.server, "build", None),
+            )
+
+        params = _ttl_viewer_params(self.server)
+        if self._ttl_serve("state", params, compute, _state_refresh):
+            return
         processes = _live_workers()
         etag = state_identity(self.server.store, self.server.cfg, processes, now)
         if self._not_modified(etag):
             return
-        self._json(
-            200,
-            build_state(
+        if etag is not None:
+            payload = self.server.flight.do(
+                ("state", etag),
+                lambda: build_state(
+                    self.server.store,
+                    self.server.registry,
+                    self.server.cfg,
+                    now=now,
+                    processes=processes,
+                    build=getattr(self.server, "build", None),
+                ),
+            )
+        else:
+            payload = build_state(
                 self.server.store,
                 self.server.registry,
                 self.server.cfg,
                 now=now,
                 processes=processes,
                 build=getattr(self.server, "build", None),
-            ),
-            etag=etag,
-        )
+            )
+        self._json(200, payload, etag=etag)
+
+    def _health(self):
+        def compute():
+            return _health_body(self.server, time.time(), self._doctor_block)
+
+        if self._ttl_serve("health", {}, compute):
+            return
+        self._json(200, _health_body(self.server, time.time(), self._doctor_block))
 
     def _project(self):
         from dash import project as project_mod
 
-        self._json(200, project_mod.build_payload(self.server.store, self.server.cfg))
+        def compute():
+            return project_mod.build_payload(self.server.store, self.server.cfg)
+
+        if self._ttl_serve("project", _ttl_viewer_params(self.server), compute):
+            return
+        self._json(200, compute())
 
     def _projects(self):
         from dash import projects as projects_mod
@@ -476,6 +582,34 @@ class Handler(BaseHTTPRequestHandler):
             ignore_key = ignore_cache_key(ignored)
         except Exception:
             ignore_key = ()
+
+        def compute():
+            body = store.snapshot_cached(now, ws, since, until, usage_group=usage_group, recent_limit=recent_limit, recent_offset=recent_offset)
+            if ignored and ws == "all" and isinstance(body, dict):
+                # Copy-on-write: the store cache owns this dict, so the
+                # filtered lists replace (never mutate) its entries. Totals
+                # stay all-scope; only the per-workstream breakdown shrinks,
+                # and usage buckets fold the ignored share into "Other" so a
+                # stacked chart still sums to the legend Total.
+                body = dict(body)
+                body["by_workstream"] = _drop_ignored_rows(body.get("by_workstream"), entries=ignored)
+                if usage_group == "workstream" and isinstance(body.get("usage"), list):
+                    try:
+                        from dash.project import fold_other_keys
+
+                        body["usage"] = fold_other_keys(body["usage"], ignored)
+                    except Exception:
+                        pass
+            return _with_run_sections(body)
+
+        if self._ttl_serve(
+            "snapshot",
+            {"ws": ws, "since": since, "until": until, "usage_group": usage_group,
+             "recent_limit": recent_limit, "recent_offset": recent_offset},
+            compute,
+            _snapshot_refresh(store),
+        ):
+            return
         # Identity names the result-cache entry, not the poll clock:
         # store.seq advances on every poll (process samples, counts) while
         # no served byte changes, so tagging it would 200 every tick and
@@ -499,23 +633,11 @@ class Handler(BaseHTTPRequestHandler):
         etag = _identity_etag(*ident) if ident is not None else None
         if self._not_modified(etag):
             return
-        body = store.snapshot_cached(now, ws, since, until, usage_group=usage_group, recent_limit=recent_limit, recent_offset=recent_offset)
-        if ignored and ws == "all" and isinstance(body, dict):
-            # Copy-on-write: the store cache owns this dict, so the
-            # filtered lists replace (never mutate) its entries. Totals
-            # stay all-scope; only the per-workstream breakdown shrinks,
-            # and usage buckets fold the ignored share into "Other" so a
-            # stacked chart still sums to the legend Total.
-            body = dict(body)
-            body["by_workstream"] = _drop_ignored_rows(body.get("by_workstream"), entries=ignored)
-            if usage_group == "workstream" and isinstance(body.get("usage"), list):
-                try:
-                    from dash.project import fold_other_keys
-
-                    body["usage"] = fold_other_keys(body["usage"], ignored)
-                except Exception:
-                    pass
-        self._json(200, _with_run_sections(body), etag=etag)
+        if etag is not None:
+            body = self.server.flight.do(("snapshot", etag), compute)
+        else:
+            body = compute()
+        self._json(200, body, etag=etag)
 
     def _workstreams(self, query):
         from dash.workstates import all_bundle_meta, bundle_fallback_rows, filter_rows, parse_state_param
@@ -534,6 +656,50 @@ class Handler(BaseHTTPRequestHandler):
             ignore_key = ignore_cache_key(ignored)
         except Exception:
             ignore_key = ()
+        def compute():
+            rows = store.query_workstreams(
+                plan_ids, since, until, now=now,
+                bundle_meta=meta, allowed_states=allowed,
+            )
+            # The compute may be shared between concurrent callers
+            # (single-flight then, TTL generations now); copy before the
+            # appends and per-row fields below.
+            rows = [dict(row) for row in rows]
+            have = {row.get("ws") for row in rows}
+            for extra in bundle_fallback_rows(have, plan_ids=plan_ids):
+                extra["progress"] = _row_progress(extra.get("ws"))
+                rows.append(extra)
+            rows = filter_rows(rows, allowed, meta)
+            from dash import actions as actions_mod
+            from dash.bundles import list_bundles as _list_bundles
+
+            try:
+                kinds = {item.get("id"): item.get("kind") for item in (_list_bundles() or []) if isinstance(item, dict)}
+            except Exception:
+                kinds = {}
+            for row in rows:
+                if "progress" not in row:
+                    row["progress"] = _row_progress(row.get("ws"))
+                # The page never offers an invalid button: every row names
+                # the actions its state allows (none for program bundles,
+                # OVERVIEW, and the unassigned row).
+                ws = row.get("ws")
+                if ws == "unassigned" or not ws:
+                    row["allowed_actions"] = []
+                else:
+                    row["allowed_actions"] = actions_mod.allowed_actions_for(
+                        ws, row.get("state") or meta.get(ws, {}).get("state", "active"), kinds.get(ws)
+                    )
+            if ignored:
+                rows = _drop_ignored_rows(rows, entries=ignored)
+            return {"workstreams": rows}
+
+        if self._ttl_serve(
+            "workstreams",
+            {"since": since, "until": until, "state": _one(query, "state")},
+            compute,
+        ):
+            return
         try:
             wkey = store.workstreams_key(plan_ids, since, until, now, meta, allowed)
         except Exception:
@@ -541,38 +707,11 @@ class Handler(BaseHTTPRequestHandler):
         etag = _identity_etag("workstreams", wkey, ignore_key) if wkey is not None else None
         if self._not_modified(etag):
             return
-        rows = store.query_workstreams(
-            plan_ids, since, until, now=now,
-            bundle_meta=meta, allowed_states=allowed,
-        )
-        have = {row.get("ws") for row in rows}
-        for extra in bundle_fallback_rows(have, plan_ids=plan_ids):
-            extra["progress"] = _row_progress(extra.get("ws"))
-            rows.append(extra)
-        rows = filter_rows(rows, allowed, meta)
-        from dash import actions as actions_mod
-        from dash.bundles import list_bundles as _list_bundles
-
-        try:
-            kinds = {item.get("id"): item.get("kind") for item in (_list_bundles() or []) if isinstance(item, dict)}
-        except Exception:
-            kinds = {}
-        for row in rows:
-            if "progress" not in row:
-                row["progress"] = _row_progress(row.get("ws"))
-            # The page never offers an invalid button: every row names
-            # the actions its state allows (none for program bundles,
-            # OVERVIEW, and the unassigned row).
-            ws = row.get("ws")
-            if ws == "unassigned" or not ws:
-                row["allowed_actions"] = []
-            else:
-                row["allowed_actions"] = actions_mod.allowed_actions_for(
-                    ws, row.get("state") or meta.get(ws, {}).get("state", "active"), kinds.get(ws)
-                )
-        if ignored:
-            rows = _drop_ignored_rows(rows, entries=ignored)
-        self._json(200, {"workstreams": rows}, etag=etag)
+        if etag is not None:
+            body = self.server.flight.do(("workstreams", etag), compute)
+        else:
+            body = compute()
+        self._json(200, body, etag=etag)
 
     def _archive(self, _query):
         """``GET /api/archive``: frozen summary cards for archived workstreams.
@@ -641,6 +780,11 @@ class Handler(BaseHTTPRequestHandler):
             return
         try:
             status, body = actions_mod.perform(self.server, action, ws)
+            if status < 400:
+                # A user-visible action shows immediately: drop every
+                # TTL generation so the next poll recomputes instead of
+                # serving the pre-action body for up to ttl_s.
+                self.server.respcache.invalidate_all()
         except Exception as exc:
             # A failed write (read-only bundle dir, full disk, or any
             # other surprise from the lifecycle functions) is a 500 in
@@ -686,6 +830,8 @@ class Handler(BaseHTTPRequestHandler):
             self._json(400, api_error(str(exc) or "bad request", "bad_request", _hint_for(str(exc))))
             return
         status, body = actions_mod.perform_state(self.server, ws, target, note)
+        if status < 400:
+            self.server.respcache.invalidate_all()
         self._json(status, body)
 
     def _workstream_bulk(self):
@@ -710,7 +856,10 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError as exc:
             self._json(400, api_error(str(exc) or "bad request", "bad_request", _hint_for(str(exc))))
             return
-        self._json(200, actions_mod.perform_bulk(self.server, action, ids, target, note))
+        body = actions_mod.perform_bulk(self.server, action, ids, target, note)
+        if body.get("changed"):
+            self.server.respcache.invalidate_all()
+        self._json(200, body)
 
     def _project_graph(self, _query):
         """``GET /api/project/graph``: the cross-workstream dependency graph.
@@ -793,6 +942,12 @@ class Handler(BaseHTTPRequestHandler):
         scope = _choice(query, "scope", "24h", set(projectphases.SCOPES))
         now = time.time()
         store = self.server.store
+
+        def compute():
+            return projectphases.build_phases(store, scope, now)
+
+        if self._ttl_serve("project/phases", {"scope": scope}, compute):
+            return
         try:
             key = projectphases.cache_key(store, scope)
         except Exception:
@@ -800,7 +955,11 @@ class Handler(BaseHTTPRequestHandler):
         etag = _identity_etag("project-phases", scope, key) if key is not None else None
         if self._not_modified(etag):
             return
-        self._json(200, projectphases.build_phases(store, scope, now), etag=etag)
+        if etag is not None:
+            payload = self.server.flight.do(("project-phases", etag), compute)
+        else:
+            payload = compute()
+        self._json(200, payload, etag=etag)
 
     def _reconcile(self, query):
         from dash.workstates import hidden_ids
@@ -813,16 +972,26 @@ class Handler(BaseHTTPRequestHandler):
             if hours <= 0:
                 raise ValueError("bad hours")
             since = now - hours * 3600
-        body = self.server.store.reconcile_numbers(
-            now, since, until, processes=_live_workers(), archived_ws=hidden_ids()
-        )
-        try:
-            stalled = self.server.registry.stalled_messages(now)
-        except Exception:
-            stalled = []
-        if stalled:
-            body["mismatches"] = list(body.get("mismatches", [])) + stalled
-        self._json(200, body)
+
+        def compute():
+            body = self.server.store.reconcile_numbers(
+                now, since, until, processes=_live_workers(), archived_ws=hidden_ids()
+            )
+            try:
+                stalled = self.server.registry.stalled_messages(now)
+            except Exception:
+                stalled = []
+            if stalled:
+                body["mismatches"] = list(body.get("mismatches", [])) + stalled
+            return body
+
+        if self._ttl_serve(
+            "reconcile",
+            {"hours": hours, "since": _one(query, "since"), "until": _one(query, "until")},
+            compute,
+        ):
+            return
+        self._json(200, compute())
 
     def _runs(self, query):
         now = time.time()
@@ -833,6 +1002,20 @@ class Handler(BaseHTTPRequestHandler):
         include = _one(query, "include")
         if include is not None and include != "jobs":
             raise ValueError("bad include")
+        from dash import sections as _sections
+
+        store = self.server.store
+
+        def compute():
+            rows = store.query_runs(now, ws, since, until, limit, include_jobs=include == "jobs")
+            return {"runs": _sections.annotate_runs(rows)}
+
+        if self._ttl_serve(
+            "runs",
+            {"ws": ws, "since": since, "until": until, "limit": limit, "include": include},
+            compute,
+        ):
+            return
         # Identity tag names the entry (data version, quantized window,
         # minute): per-request fields like elapsed_s make content hashes
         # useless, but the rows only move on store writes, so a match
@@ -840,7 +1023,6 @@ class Handler(BaseHTTPRequestHandler):
         # stays out: it advances on every poll without moving any row.
         # The plan stamp rides along too: rows carry their plan section,
         # so a plan edit retags even when no store write landed.
-        store = self.server.store
         try:
             ident = (
                 "runs", ws,
@@ -854,10 +1036,11 @@ class Handler(BaseHTTPRequestHandler):
         etag = _identity_etag(*ident) if ident is not None else None
         if self._not_modified(etag):
             return
-        from dash import sections as _sections
-
-        rows = store.query_runs(now, ws, since, until, limit, include_jobs=include == "jobs")
-        self._json(200, {"runs": _sections.annotate_runs(rows)}, etag=etag)
+        if etag is not None:
+            body = self.server.flight.do(("runs", etag), compute)
+        else:
+            body = compute()
+        self._json(200, body, etag=etag)
 
     def _usage(self, query):
         group = _choice(query, "group", "model", {"model", "workstream", "tool"})
@@ -865,10 +1048,20 @@ class Handler(BaseHTTPRequestHandler):
         ws = _ws(query, default=None)
         since = _float(query, "since")
         until = _float(query, "until")
-        buckets = self.server.store.query_usage(group, bucket, ws, since, until)
-        if group == "workstream":
-            buckets = _fold_other(buckets)
-        self._json(200, {"buckets": buckets})
+
+        def compute():
+            buckets = self.server.store.query_usage(group, bucket, ws, since, until)
+            if group == "workstream":
+                buckets = _fold_other(buckets)
+            return {"buckets": buckets}
+
+        if self._ttl_serve(
+            "usage",
+            {"group": group, "bucket": bucket, "ws": ws, "since": since, "until": until},
+            compute,
+        ):
+            return
+        self._json(200, compute())
 
     def _concurrency(self, query):
         now = time.time()
@@ -877,10 +1070,18 @@ class Handler(BaseHTTPRequestHandler):
             since = now - 24 * 3600
         step = _float(query, "step") or 60.0
         ws = _ws(query, default=None)
+        store = self.server.store
+
+        def compute():
+            return {"points": store.query_concurrency(now, ws, since, step)}
+
+        if self._ttl_serve(
+            "concurrency", {"ws": ws, "since": since, "step": step}, compute
+        ):
+            return
         # Same identity-tag rationale as /api/runs: the point grid slides
         # with the request clock, but the lanes only move on store writes
         # (store.seq still stays out: it moves on every poll regardless).
-        store = self.server.store
         try:
             ident = ("concurrency", ws, int(float(since) // 30), float(step), int(now // 60), store.data_seq)
         except Exception:
@@ -888,7 +1089,11 @@ class Handler(BaseHTTPRequestHandler):
         etag = _identity_etag(*ident) if ident is not None else None
         if self._not_modified(etag):
             return
-        self._json(200, {"points": store.query_concurrency(now, ws, since, step)}, etag=etag)
+        if etag is not None:
+            body = self.server.flight.do(("concurrency", etag), compute)
+        else:
+            body = compute()
+        self._json(200, body, etag=etag)
 
     def _plan(self, query):
         ws = _one(query, "ws")
@@ -1067,6 +1272,7 @@ class Handler(BaseHTTPRequestHandler):
                 sources = []
             data = {
                 "seq": payload["seq"],
+                "view_seq": payload.get("view_seq"),
                 "running": payload["running"],
                 "now": now,
                 "data_seq": payload.get("data_seq"),
@@ -1083,6 +1289,46 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if self.server.stop.wait(interval):
                 return
+
+    def _ttl_serve(self, endpoint: str, params: dict, compute, refresh=None) -> bool:
+        """Serve one heavy endpoint through the TTL cache. True when sent.
+
+        ``params`` is the normalised request dict (used for the TTL and
+        the canonical key); ``compute`` builds the payload dict (runs on
+        the requesting thread when this request becomes the computer);
+        ``refresh(payload, now)`` optionally refreshes volatile clock
+        fields on the served copy. ``False`` means fall through to the
+        legacy path, byte-identical to before: the TTL is disabled
+        (``response_ttl_s=0``), or the compute failed with nothing
+        servable (``get_or_compute`` re-raises only then; a servable
+        stale generation is served instead).
+        """
+        ttl = _respcache_mod.ttl_for(self.server.cfg, endpoint, params)
+        if ttl <= 0:
+            return False
+        key = _respcache_mod.canonical_key(endpoint, params, getattr(self, "headers", None))
+        try:
+            payload, etag, generated, _kind = self.server.respcache.get_or_compute(
+                key, endpoint, ttl, compute, refresh
+            )
+        except Exception:
+            return False
+        now = time.time()
+        raw = json.dumps(payload, separators=(",", ":"), allow_nan=False).encode()
+        if etag is None:
+            etag = _content_etag(raw)
+            self.server.respcache.store_etag(key, etag)
+        try:
+            age_ms = max(0, int((now - float(generated or now)) * 1000))
+        except (TypeError, ValueError):
+            age_ms = 0
+        if self._not_modified(etag):
+            return True
+        self._send_body(
+            200, raw, "application/json; charset=utf-8", etag=etag,
+            extra={"X-AgentDash-Age-Ms": str(age_ms)},
+        )
+        return True
 
     def _json(self, status: int, body: dict, etag: str | None = None) -> None:
         raw = json.dumps(body, separators=(",", ":"), allow_nan=False).encode()
@@ -1114,7 +1360,7 @@ class Handler(BaseHTTPRequestHandler):
             self.server.note_disconnect()
         return True
 
-    def _send_body(self, status: int, body: bytes, content_type: str, etag: str | None = None) -> None:
+    def _send_body(self, status: int, body: bytes, content_type: str, etag: str | None = None, extra: dict | None = None) -> None:
         """Send a body with ETag revalidation and gzip for big payloads.
 
         Every 200 response carries an ETag (content hash, or the caller's
@@ -1142,6 +1388,12 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_header("Vary", "Accept-Encoding")
             if use_etag is not None:
                 self.send_header("ETag", use_etag)
+            if extra:
+                for header, value in extra.items():
+                    try:
+                        self.send_header(header, value)
+                    except Exception:
+                        pass
             self.send_header("Cache-Control", "no-store" if content_type.startswith("application/json") else "no-cache")
             self.end_headers()
             if status != 304:
@@ -1215,6 +1467,77 @@ def _health_with_live(registry, now: float, cfg, processes=None):
         return registry.health(now, cfg)
     except TypeError:
         return registry.health(now)
+
+
+def _record_http(server, parsed, elapsed_ms: float) -> None:
+    """One served request into the process monitor, plus the slow log.
+
+    Records the endpoint path and workstream id only — never other
+    query values or bodies. Requests over 2 s log one line with the
+    endpoint, milliseconds, and ws. Never raises.
+    """
+    try:
+        from dash import perfmon as _perfmon
+
+        query = parse_qs(parsed.query)
+        values = query.get("ws")
+        ws = values[0] if values else None
+        _perfmon.get().record_request(parsed.path, elapsed_ms, ws=ws)
+        if elapsed_ms > 2000:
+            logging.getLogger("agent_dash.server").warning(
+                "slow request %s %.0fms ws=%s", parsed.path, elapsed_ms, ws
+            )
+    except Exception:
+        pass
+
+
+def _health_body(server, now: float, doctor_block) -> dict:
+    """The ``GET /api/health`` payload: reachability plus self-monitoring.
+
+    Every historic key is kept; the additive ``perf`` block carries
+    per-endpoint latency (count, p50, p95, max over 10 min), per-source
+    poll duration and lag, store lock wait/hold, single-flight sharing,
+    result-cache hit ratios, thread count, and process CPU. ``now``
+    fixes the clock for tests; ``doctor_block`` builds the doctor
+    summary (``Handler._doctor_block`` on the live path).
+    """
+    body = _health_with_live(server.registry, now, server.cfg)
+    body["pricing"] = health_block(server.store.usage_model_stats())
+    body["disconnects_1h"] = server.disconnects_1h()
+    unpriced = server.store.unpriced_models(now, now - 86400, now)
+    if unpriced:
+        body["ok"] = False
+        body["unpriced_models"] = unpriced
+    body["doctor"] = doctor_block(now)
+    if int((body["doctor"].get("summary") or {}).get("critical", 0)) > 0:
+        body["ok"] = False
+    build = getattr(server, "build", None) or {}
+    body["build_id"] = build.get("build_id", "unknown")
+    body["started_at"] = build.get("started_at")
+    body["state_hash"] = state_dir_hash((server.cfg or {}).get("state_dir"))
+    import os as _os
+
+    body["project_id"] = (_os.environ.get("AGENT_DASH_PROJECT_ID") or "").strip() or None
+    try:
+        from dash import perfmon as _perfmon
+
+        lag_now = {}
+        try:
+            for row in server.registry.source_states(now):
+                if row.get("lag_s") is not None:
+                    lag_now[row.get("name")] = row.get("lag_s")
+        except Exception:
+            pass
+        perf = _perfmon.get().snapshot(lag_now)
+        try:
+            perf["singleflight"] = server.flight.stats()
+            perf["ttl"] = server.respcache.stats()
+        except Exception:
+            pass
+        body["perf"] = perf
+    except Exception:
+        pass
+    return body
 
 
 def _content_etag(body: bytes) -> str:

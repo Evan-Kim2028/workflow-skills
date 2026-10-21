@@ -84,6 +84,46 @@ set is small, and the next command. `stop`/`status` keep their older
 contract: they print `stopped` (plus the `run` command) and exit 1
 when no live dashboard answers.
 
+Two readouts to know before you trust the numbers. A quiet lead
+session (no transcript write for 3 minutes, no live child, no
+in-flight tool call) reads `unknown`, not `running`: it is idle, not
+dead, and it is never counted as a live agent. A lead that worked
+several workstreams appears once per workstream as
+`claude-main:<sid>:main@WS<n>` (linked to the primary via `slice_of`);
+the slices plus the primary remainder tile the session total exactly,
+per token kind and per model, so sum them freely and never double
+count. A Claude Code Agent subagent (`claude-subagent:<sid>:<agent>`)
+inherits the workstream of the main-session turn that spawned it
+(confidence `inherited`): the spawning turn's own signal wins, then
+the majority of the subagent's own signals, then the inherited cursor
+value at the spawn, else Unassigned; one run is never sliced. The
+linkage is ids only (the Agent tool_use id, the sidecar `toolUseId`,
+the parent tool result `agentId`), and the signals are labels only —
+lane labels, task ids, worktree paths, branch names, bundle dirs —
+never prompt text or tool arguments, which are never stored.
+Per-turn signals count only TARGETING fields: the assistant record's
+`cwd`, tool-use path fields (`file_path`, `path`, `notebook_path`,
+glob/pattern paths, `file`, `filename`, `dir`, `directory`,
+`workdir`), and Bash `command` segments that are operands of a
+targeting action (`cd` / `git -C` into a worktree or branch, `git
+worktree add`, `git checkout` / `switch`, worker launches via
+prompt-file path or label operand, `gh pr` branch operands, `ssh …
+<path>` operands, reads/writes under `workstreams/WS<N>/`,
+`agent_dash … ws … WS<N>`, test paths). Never counted (TEXT):
+assistant text blocks, `Agent`/`Task` `prompt` and `description`,
+`Write`/`Edit` `content` / `new_string` / `old_string`, heredoc
+bodies and quoted multi-line string literals in Bash, `echo` /
+`printf` payloads, search patterns (`grep` / `rg` arguments,
+`ToolSearch` / `WebSearch` / codegraph `query`), `label make` /
+`label check` example commands, URLs and URL query strings, `Bash`
+`description`, and `tool_result` bodies (except the structured
+`agentId:` spawn linkage). When unsure whether an operand targets, it
+does not count. `SIGNAL_RULES_VERSION` in `dash/lead_split.py` is
+folded into the stored per-session marker: a version mismatch on the
+next ingest rebuilds that session's slices and votes from the same
+bytes (offsets reset, tokens conserved), so no manual reset is
+needed.
+
 ## 1. Install and run
 
 Three commands, from any checkout of this repo:
@@ -258,11 +298,39 @@ The live-agents tile counts the `grok`, `muse`, `glm`, `deepseek`, `other`, and 
 
 ## 3. Labels and the task map
 
-A run label is `ws<N>-<task-id>-<slug>`, lowercase workstream first:
+A new run label is `<scope>-<mark>-<slug>[-rN]`, all lowercase, dashes
+only: scope `ws<N>` (a workstream) or `hub` (dashboard tooling,
+cross-workstream ops), mark one of `plan`, `exec`, `review`, `coord`.
+Build it, never hand-write it:
 
-- `ws4-WS4.1-notes-index` is workstream WS4 (the shipped `^ws(\d+)` regex).
-- Reviews append `-rev1`, `-rev2`. Fixes append `-fix1`, `-fix2`.
-- The workstream id in the label must match the bundle id (`WS4`, not `ws4`).
+```bash
+python3 tools/agent-dash/agent_dash.py label make --scope ws11 --mark plan --slug scout-10-partition-cold --round 1
+# ws11-plan-scout-10-partition-cold-r1
+python3 tools/agent-dash/agent_dash.py label check ws11-visuals
+# label refused: ... use ws11-plan-visuals ... (exit 2)
+```
+
+`label check` exits 0 for a strong label (convention mark, plan-task
+lane, or review affix), 2 with the exact corrected label otherwise.
+Two older shapes stay strong without a mark: a task-lane label
+`ws<N>-<task-id>-<slug>` that names a plan task (`ws4-WS4.1-notes-index`
+is workstream WS4 via the shipped `^ws(\d+)` regex), and the review
+affixes (`-rev1`, `-fix1` tails). Reviews append `-rev1`, `-rev2`.
+Fixes append `-fix1`, `-fix2`. The workstream id in the label must
+match the bundle id (`WS4`, not `ws4`).
+
+Weak labels are structurally impossible: `report start`,
+`scripts/run_worker.py`, and `scripts/launch_grok.sh` validate the
+label and exit 2 with the fix before launching anything, and a Claude
+Code PreToolUse hook (`scripts/label_guard_hook.py`, installed with
+`sh scripts/install_hooks.sh --claude-label-guard`) stops
+hand-launched workers the same way. Replaying old runs (and only
+then): `AGENT_DASH_ALLOW_LEGACY_LABELS=1` downgrades the refusal to a
+warning at every entry point. The doctor backstop
+(`unlabeled-runs`, `docs/problems/unlabeled-runs.md`) lists every
+live-store run whose phase is unclassified or whose label fails the
+strict check, with the corrected label per family: `warn` for legacy
+runs, `critical` for runs started after the guard landed.
 
 The page pins a run to the task chip when the label holds the task id. That covers `ws4-WS4.1-notes-index` to `WS4.1` with no extra file; WS1, WS2, and WS7 have extra built-in matchers. `static/taskmap.local.json` (replaces the example file, no restart) is the override for labels that do not hold the id. Keys are exact labels or `/regex/` strings; values are task ids:
 
@@ -354,6 +422,22 @@ grok -p "<prompt>" --model deepseek-flash --output-format json
 Write the manifest row with the model fourth (`label`, session uuid, start epoch, `deepseek-flash`) in `glm-sessions.tsv`, and label the run `ws<N>-plan-<slug>`, `ws<N>-exec-<slug>`, or `ws<N>-review-<slug>` (§3). The legacy aliases `deepseek-v4-flash` and `deepseek-v4-flash-vision-exp` price as `deepseek-flash`; `deepseek-v4-pro` is the Pro id.
 
 The dashboard shows DeepSeek tokens with the cache split (stored `input` is the miss, `cache_read` the hit), time-aware cost, and its own Live agents strip in Activity over time once a DeepSeek run exists in the window. Any other grok-hosted id (`mimo-*`, `step-*`) reads as Other: priced only when the catalog names it, and counted outside the GLM lane.
+
+### Codex CLI (plan-included, unpriced until rates verify)
+
+`dash/sources/codex.py` tails `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl` (override with `roots.codex_sessions`). The file name carries the thread id; each spawned subagent gets its own rollout file. The additive ledger is the `token_usage_record` `usage` deltas keyed by `response_id` (the `token_count` echo rows are never emitted, so nothing double counts; compaction-adjacent zero-delta rows contribute nothing). Verified on real rollouts: `total_tokens` equals `input_tokens` plus `output_tokens`, `cached_input_tokens` sits inside `input_tokens`, and `reasoning_output_tokens` sits inside `output_tokens`. Stored `input` is the miss (`input_tokens` minus `cached_input_tokens`), `cache_read` the hit, `reasoning` unbilled like the other CLI sources. Each call attributes to its turn's `turn_context` model, so a mid-session model switch splits cleanly. Cross-check each session's stored sum against the final `thread_token_usage` total (equal on every thread seen) and `state_5.sqlite`'s `threads.tokens_used`.
+
+Labels only, never prompt bodies: the parser reads event types, ids, timestamps, model names, cwd, counts, originator, and branch, and never `base_instructions`, message content, task text, or compaction history. Codex threads carry no user-given name (the sqlite `title`/`name` mirror prompt text), so every run is `codex:<thread>:codex-<first 8>` and the store attributes the workstream from cwd/worktree path or branch (e.g. `lor-wt-ws12-...`, `ws12/...`), parent inheritance for subagents (via `thread_spawn_edges`), else Unassigned. A top-level `codex-tui` thread runs as source `codex` (the lead surface in `catalog/phases.json`); exec and subagent threads run as `codex-exec` and classify through their parent.
+
+The catalog prices the seen Codex ids (`gpt-6-luna`, `gpt-6.1-sol`, `gpt-6-sol`, `gpt-6-astra`, `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`, `gpt-reserve`, `codex-auto-review`) as `billing_mode` `plan-included` carrying the API-list price as an equivalent-cost estimate. The seven `gpt-5.6-*` and `gpt-6*` rows carry the standard short-context API list rates from https://developers.openai.com/api/docs/pricing (retrieved 2026-10-19, confidence `published`), with a `long_context` block at 272,000 input tokens (whole request at 2x input, cached input and cache write, 1.5x output). Fast, ultrafast, batch and flex tiers are not modelled. The seat here is a ChatGPT Plus login, so the figures are an equivalent-cost estimate, not billed spend. `gpt-reserve` and `codex-auto-review` have no published list rate: their rows stay null with confidence `unverified`, so their tokens show as unpriced, never as an invented cost. To re-price, re-check the pricing page, edit the row's rates plus `retrieved_at`, and run `python3 agent_dash.py reprice` plus the Codex tests.
+
+### Codex CLI (plan-included, unpriced until rates verify)
+
+`dash/sources/codex.py` tails `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl` (override with `roots.codex_sessions`). The file name carries the thread id; each spawned subagent gets its own rollout file. The additive ledger is the `token_usage_record` `usage` deltas keyed by `response_id` (the `token_count` echo rows are never emitted, so nothing double counts; compaction-adjacent zero-delta rows contribute nothing). Verified on real rollouts: `total_tokens` equals `input_tokens` plus `output_tokens`, `cached_input_tokens` sits inside `input_tokens`, and `reasoning_output_tokens` sits inside `output_tokens`. Stored `input` is the miss (`input_tokens` minus `cached_input_tokens`), `cache_read` the hit, `reasoning` unbilled like the other CLI sources. Each call attributes to its turn's `turn_context` model, so a mid-session model switch splits cleanly. Cross-check each session's stored sum against the final `thread_token_usage` total (equal on every thread seen) and `state_5.sqlite`'s `threads.tokens_used`.
+
+Labels only, never prompt bodies: the parser reads event types, ids, timestamps, model names, cwd, counts, originator, and branch, and never `base_instructions`, message content, task text, or compaction history. Codex threads carry no user-given name (the sqlite `title`/`name` mirror prompt text), so every run is `codex:<thread>:codex-<first 8>` and the store attributes the workstream from cwd/worktree path or branch (e.g. `lor-wt-ws12-...`, `ws12/...`), parent inheritance for subagents (via `thread_spawn_edges`), else Unassigned. A top-level `codex-tui` thread runs as source `codex` (the lead surface in `catalog/phases.json`); exec and subagent threads run as `codex-exec` and classify through their parent.
+
+The catalog prices the seen Codex ids (`gpt-6-luna`, `gpt-6.1-sol`, `gpt-6-sol`, `gpt-6-astra`, `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`, `gpt-reserve`, `codex-auto-review`) as `billing_mode` `plan-included` carrying the API-list price as an equivalent-cost estimate. The seven `gpt-5.6-*` and `gpt-6*` rows carry the standard short-context API list rates from https://developers.openai.com/api/docs/pricing (retrieved 2026-10-19, confidence `published`), with a `long_context` block at 272,000 input tokens (whole request at 2x input, cached input and cache write, 1.5x output). Fast, ultrafast, batch and flex tiers are not modelled. The seat here is a ChatGPT Plus login, so the figures are an equivalent-cost estimate, not billed spend. `gpt-reserve` and `codex-auto-review` have no published list rate: their rows stay null with confidence `unverified`, so their tokens show as unpriced, never as an invented cost. To re-price, re-check the pricing page, edit the row's rates plus `retrieved_at`, and run `python3 agent_dash.py reprice` plus the Codex tests.
 
 ## 6. Drive a workstream
 
@@ -465,14 +549,17 @@ Who writes what (one writer per file): the lead owns the bundle (`plan.json` via
 | Stale running run | Process died without a finish line, or the source stopped reporting it | Send `report finish` (a generic run with no `report` line for 6 h counts as stale, so long runs send `report usage` as a heartbeat); the collector closes rows whose process is gone or that the source (Dagster) no longer lists, and `check` reports any `stale running` row it finds (CONTRACT.md, Liveness) |
 | Critical problem before a wave | Dashboard blind, numbers wrong, or model unpriced | Run `doctor --json --severity critical`; the `ws-wave` workflow does this once before the wave and stops on any critical problem (pass `skipDoctor: true` to skip) |
 | Worker will not launch | Preflight blocks the launch | `run_worker.py` runs a doctor preflight (dashboard reachable, run dir visible, tier model priced and policy-compliant) and exits 1 with the problem and fix unless `--no-preflight` is passed |
+| Label refused | `report start`, a launcher, or the label-guard hook exits 2 with `use <label>` | Build the label with `label make`, or use the named one; replays of old runs set `AGENT_DASH_ALLOW_LEGACY_LABELS=1` |
 | Numbers disagree | Tile, chart, and rows read one snapshot; a custom sum re-sums buckets | Run `check`; it exits 1 with the mismatch table |
 | Page blank | Dashboard down, or fixture URL on the live port | `status`; open `http://127.0.0.1:8765/`; fixtures need the `http.server` preview URL |
+| State DB keeps growing | Usage rows accumulate daily | `python3 agent_dash.py db stats` shows size and rollup coverage; `db rollup --dry-run` previews, `db rollup` compacts rows older than `rollup_after_days` (default 14) into hourly bundles with identical aggregates; doctor `db-growth` warns with a 90-day projection (CONTRACT.md, HTTP API) |
+| Page slow on first load | Cold folds or full refetch bursts | `doctor` names it (`slow-endpoint`, `server-cpu-bound`); every polled endpoint 304s when unchanged and gzip applies over 8 KB — check `/api/health` `perf` for the endpoint p95 before changing code |
 
 Plan `% done` comes from the server (`progress` on `/api/plan` and `/api/bundle`); the page never computes it. Hub issue counts are issue counts, never progress.
 
 ## 8. Working on the dashboard itself
 
-Picking up dashboard work (not just feeding it runs)? Read [roadmap.md](roadmap.md) first: what landed with proof, and the open worker-sized tasks in value order. The visual future is the [proposed v2 design spec](design-v2.md) (owner approval pending) with its [tokens](design-v2-tokens.css). Ownership of every file is the table in [CONTRACT.md](../CONTRACT.md). Coordinating the work itself is the [workstream-orchestration skill](../../../skills/workstream-orchestration/SKILL.md) and its [principles](orchestration.md).
+Picking up dashboard work (not just feeding it runs)? Read [roadmap.md](roadmap.md) first: what landed with proof, and the open worker-sized tasks in value order. The visual future is the [proposed v2 design spec](design-v2.md) (owner approval pending) with its [tokens](design-v2-tokens.css). Ownership of every file is the table in [CONTRACT.md](../CONTRACT.md). Performance budgets live in [perf_budgets.json](../perf_budgets.json) (2x headroom over the measured baseline; `tests/perf/test_perf_budget.py` enforces them on the 1x/5x seeds): a change that breaks a budget must fix the code or raise the budget with a written reason in [perf.md](perf.md). Coordinating the work itself is the [workstream-orchestration skill](../../../skills/workstream-orchestration/SKILL.md) and its [principles](orchestration.md).
 
 ### Adding a card
 

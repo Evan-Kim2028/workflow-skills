@@ -49,6 +49,62 @@
     })).then(function () { renderTabs(); }).then(function () { planSumInflight = null; }, function () { planSumInflight = null; });
     return planSumInflight;
   }
+  /* Lazy plan sums: the "Where we are" panel renders a skeleton until the
+     sums land, so fetching them only when the panel is on screen changes
+     nothing once visible but keeps ten plan fetches off the first-paint
+     waterfall when the panel sits below the fold. An IntersectionObserver
+     fires on scroll-into-view; the periodic refresh re-checks through the
+     same gate, so a hidden panel never fetches and a shown one always
+     does. No IntersectionObserver (old browsers, node harness) means no
+     gating: load at once, exactly as before. */
+  var planIO = null, planWanted = false;
+  /* After a deferred load lands, redraw only when it added plan data,
+     mirroring the overview one-shot: the section cache keys the program
+     panel on planSum, so without the delete the bars stay skeleton. */
+  function planSumsSettled(before) {
+    if (Object.keys(planSum).length !== before) {
+      try { delete secCache.program; delete secCache.cards; } catch (e) {}
+      if (typeof drawMain === "function") drawMain();
+    }
+  }
+  function panelVisible() {
+    if (typeof document === "undefined" || !document.querySelectorAll) return true;
+    var nodes = document.querySelectorAll('[data-nav="Where we are"]');
+    if (!nodes.length) return !planWanted;
+    planWanted = true;
+    for (var i = 0; i < nodes.length; i++) {
+      try {
+        var r = nodes[i].getBoundingClientRect();
+        if (r.bottom > 0 && r.top < (window.innerHeight || 1e9)) return true;
+      } catch (e) {}
+    }
+    return false;
+  }
+  function maybeLoadPlanSums() {
+    if (planSumInflight) return planSumInflight;
+    if (panelVisible()) { planWanted = true; return loadPlanSums(); }
+    if (typeof IntersectionObserver !== "undefined" && typeof document !== "undefined") {
+      try {
+        if (!planIO) planIO = new IntersectionObserver(function (es) {
+          for (var i = 0; i < es.length; i++) {
+            if (es[i].isIntersecting) {
+              planIO.disconnect();
+              planWanted = true;
+              var before = Object.keys(planSum).length;
+              loadPlanSums().then(function () { planSumsSettled(before); });
+              return;
+            }
+          }
+        });
+        planIO.disconnect();
+        var nodes = document.querySelectorAll('[data-nav="Where we are"]');
+        for (var k = 0; k < nodes.length; k++) planIO.observe(nodes[k]);
+      } catch (e) { planWanted = true; return loadPlanSums(); }
+      return Promise.resolve();
+    }
+    planWanted = true;
+    return loadPlanSums();
+  }
   /* Bar segments, in paint order: done green, to-merge amber,
      merged-waiting-on-prod magenta, working-now blue. */
   function progSegs(bar, pc, tot) {
@@ -239,7 +295,7 @@
   window.DashProgram = {mount: function (host) {
     var draw = function () { host.innerHTML = ""; host.appendChild(programPanel()); };
     draw();
-    var go2 = function () { (state.wss.length ? Promise.resolve() : api("/api/workstreams").then(function (j) { state.wss = j.workstreams || []; })).then(loadPlanSums).then(draw).catch(function () {}); };
+    var go2 = function () { (state.wss.length ? Promise.resolve() : api("/api/workstreams").then(function (j) { state.wss = j.workstreams || []; })).then(maybeLoadPlanSums).then(draw).catch(function () {}); };
     go2();
     clearInterval(window.__adProgT); window.__adProgT = setInterval(function () { if (document.body.contains(host)) go2(); else clearInterval(window.__adProgT); }, 30000);
   }};
@@ -303,6 +359,7 @@
   global.progressFor = progressFor;
   global.planProg = planProg;
   global.loadPlanSums = loadPlanSums;
+  global.maybeLoadPlanSums = maybeLoadPlanSums;
   global.programPanel = programPanel;
   global.wsCard = wsCard;
   global.wsCards = wsCards;

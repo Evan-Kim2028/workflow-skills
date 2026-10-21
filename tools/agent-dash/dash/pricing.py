@@ -83,9 +83,11 @@ def series_key(model: str | None) -> str:
     if fam:
         return fam
     text = (model or "").lower()
-    for name in ("grok", "muse", "glm", "deepseek"):
+    for name in ("grok", "muse", "glm", "deepseek", "codex"):
         if name in text:
             return name
+    if text.startswith("gpt-") or text == "gpt-reserve":
+        return "codex"
     return "other"
 
 
@@ -168,6 +170,115 @@ def band_for(model: str | None, ts, table=None) -> str | None:
     return "offpeak"
 
 
+#: Resolved per-class Decimal rate vectors:
+#: ``(id(table), model, band, tier_over) -> rates``. The merge (tier,
+#: time band) and the ``Decimal`` conversion run once per key instead of
+#: once per usage event; the arithmetic below consumes the same values
+#: in the same order as the uncached path, so totals are unchanged.
+_RATES_CACHE: dict = {}
+_RATES_LIMIT = 4096
+
+#: Time-band answers: ``(id(table), model, hour_bucket) -> band``. Band
+#: edges sit on hour and day boundaries, so every timestamp in one UTC
+#: hour bucket shares its band exactly.
+_BAND_CACHE: dict = {}
+_BAND_LIMIT = 8192
+
+
+def _tier_over(row: dict, prompt: int) -> bool:
+    """Whether ``prompt`` clears the row's long-context threshold.
+
+    Mirrors :func:`_apply_tier` exactly: an unknown comparison never
+    clears, ``None`` and ``"gte"`` compare with ``>=``, ``"gt"``
+    (the default) with ``>``.
+    """
+    tier = row.get("long_context")
+    if not isinstance(tier, dict):
+        return False
+    threshold = tier.get("threshold")
+    if threshold is None:
+        return False
+    comparison = tier.get("comparison", "gt")
+    if comparison not in (None, "gt", "gte"):
+        return False
+    if comparison == "gt":
+        return prompt > int(threshold)
+    return prompt >= int(threshold)
+
+
+def _rate_vector(table, model: str, band: str | None, over: bool) -> dict:
+    """Cached resolved rates for one price shape, Decimals included.
+
+    Applies the tier merge then the time-band merge exactly as
+    :func:`_apply_tier` plus :func:`_apply_time_band` do, and converts
+    every rate with :func:`_dec` once. ``table`` stays alive through the
+    entry like :data:`_index_memo`, so an id is never reused underneath.
+    """
+    key = (id(table), model, band, over)
+    hit = _RATES_CACHE.get(key)
+    if hit is not None and hit[0] is table:
+        return hit[1]
+    row = _lookup(model, table)
+    merged = dict(row)
+    if over:
+        tier = row.get("long_context")
+        if isinstance(tier, dict):
+            for name in PRICE_KEYS:
+                if tier.get(name) is not None:
+                    merged[name] = tier[name]
+    if band == "offpeak":
+        spec = merged.get("time_bands") if isinstance(merged, dict) else None
+        off = spec.get("offpeak") if isinstance(spec, dict) else None
+        if isinstance(off, dict):
+            merged = dict(merged)
+            for name in ("input", "output", "cache_read"):
+                if off.get(name) is not None:
+                    merged[name] = off[name]
+    vector = {name: (_dec(merged[name]) if merged.get(name) is not None else None) for name in PRICE_KEYS}
+    with _lock:
+        if len(_RATES_CACHE) >= _RATES_LIMIT:
+            _RATES_CACHE.clear()
+        _RATES_CACHE[key] = (table, vector)
+    return vector
+
+
+def _band_cached(table, model: str, bucket) -> str | None:
+    """Band for one model and UTC hour bucket (or the ``None``-ts slot)."""
+    key = (id(table), model, bucket)
+    hit = _BAND_CACHE.get(key)
+    if hit is not None and hit[0] is table:
+        return hit[1]
+    if bucket is None:
+        row = _lookup(model, table)
+        spec = row.get("time_bands") if isinstance(row, dict) else None
+        fallback = spec.get("unknown_ts") if isinstance(spec, dict) else None
+        band = fallback if fallback in ("peak", "offpeak") else "peak"
+    else:
+        ts = bucket * 3600
+        try:
+            moment = datetime.fromtimestamp(float(ts), tz=timezone.utc)
+        except (TypeError, ValueError, OverflowError, OSError):
+            moment = None
+        if moment is None:
+            band = "peak"
+        elif moment.strftime("%Y-%m-%d") in CHINA_HOLIDAYS_2026:
+            band = "offpeak"
+        elif moment.weekday() not in DEEPSEEK_PEAK_WEEKDAYS:
+            band = "offpeak"
+        else:
+            band = "offpeak"
+            hour = moment.hour + moment.minute / 60.0 + moment.second / 3600.0
+            for start, end in DEEPSEEK_PEAK_WINDOWS:
+                if start <= hour < end:
+                    band = "peak"
+                    break
+    with _lock:
+        if len(_BAND_CACHE) >= _BAND_LIMIT:
+            _BAND_CACHE.clear()
+        _BAND_CACHE[key] = (table, band)
+    return band
+
+
 def cost(
     model: str | None,
     input_tokens,
@@ -185,17 +296,27 @@ def cost(
 
     ``ts`` is the usage record's own epoch timestamp (UTC). Rows with a
     ``time_bands`` block (DeepSeek) pick the peak or off-peak rate set
-    from it; rows without one ignore ``ts`` entirely.
+    from it; rows without one ignore ``ts`` entirely. Tier and band
+    resolution plus the ``Decimal`` conversion are cached per price
+    shape; the per-class arithmetic is unchanged.
     """
-    row = _lookup(model, catalog() if table is None else table)
+    resolved = catalog() if table is None else table
+    row = _lookup(model, resolved)
     if row is None or row.get("input") is None or row.get("output") is None:
         return None
     if any(value is None for value in (input_tokens, output_tokens, cache_read, cache_write)):
         return None
     prompt = _prompt_len(row, input_tokens, cache_read, cache_write)
-    rates = _apply_tier(row, prompt)
-    band = band_for(model, ts, table) if isinstance(row.get("time_bands"), dict) else None
-    rates = _apply_time_band(rates, band)
+    over = _tier_over(row, prompt)
+    if isinstance(row.get("time_bands"), dict):
+        bucket = int(float(ts) // 3600) if ts is not None else None
+        try:
+            band: str | None = _band_cached(resolved, model, bucket)  # type: ignore[arg-type]
+        except (TypeError, ValueError, OverflowError, OSError):
+            band = "peak"
+    else:
+        band = None
+    rates = _rate_vector(resolved, model, band, over)  # type: ignore[arg-type]
     bill_input = int(input_tokens)
     if row.get("input_includes_cache_read"):
         if int(cache_read) > bill_input:
@@ -255,6 +376,7 @@ def reprice(store, projects_root: str | None) -> dict:
     updates = []
     after_pairs = []
     still_missing = 0
+    table = catalog()
     for event in events:
         five = event["cache_write_5m"]
         one = event["cache_write_1h"]
@@ -274,6 +396,7 @@ def reprice(store, projects_root: str | None) -> dict:
             event["output_tokens"],
             event["cache_read"],
             event["cache_write"],
+            table,
             cache_write_5m=five,
             cache_write_1h=one,
             reasoning=event["reasoning"],
@@ -292,18 +415,37 @@ def reprice(store, projects_root: str | None) -> dict:
     }
 
 
+#: ``id(table) -> (table, {model: first row})`` for list catalogs. The
+#: list is kept alive by the entry, so an id is never reused while cached;
+#: a reloaded catalog is a new list object and gets its own index.
+_index_memo: dict = {}
+_INDEX_LIMIT = 16
+
+
 def _lookup(model, table):
     if not model:
         return None
     if isinstance(table, dict):
         return table.get(model)
-    for row in table:
-        if row.get("model") == model:
-            return row
-    return None
+    memo = _index_memo.get(id(table))
+    if memo is None or memo[0] is not table:
+        index: dict = {}
+        for row in table:
+            index.setdefault(row.get("model"), row)
+        with _lock:
+            if len(_index_memo) >= _INDEX_LIMIT:
+                _index_memo.clear()
+            _index_memo[id(table)] = (table, index)
+        memo = (table, index)
+    try:
+        return memo[1].get(model)
+    except TypeError:
+        return None
 
 
 def _prompt_len(row, input_tokens, cache_read, cache_write) -> int:
+    if not row.get("long_context") and not row.get("input_includes_cache_read"):
+        return int(input_tokens) + int(cache_read) + int(cache_write)
     tier = row.get("long_context") or {}
     counts = tier.get("counts") or ("input", "cache_read", "cache_write")
     includes = bool(row.get("input_includes_cache_read"))

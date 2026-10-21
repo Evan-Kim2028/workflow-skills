@@ -1,56 +1,300 @@
 {
-  "_comment": "Changed-file to test-file table for scripts/gate.sh. Keys are paths relative to tools/agent-dash; shell fnmatch globs (*, ?, no / special-casing). A changed file collects the union of every pattern it matches. tests/test_<name>.py must exist for test_<name>. test_gate covers gate.sh and gate_map.json themselves.",
-  "always": ["test_privacy_pin", "test_page_rules"],
-  "default": ["test_page_rules", "test_server"],
+  "_comment": "Changed-file to test-file table for scripts/gate.sh. Keys are paths relative to tools/agent-dash; shell fnmatch globs (*, ?, no / special-casing). A changed file collects the union of every pattern it matches. tests/test_<name>.py must exist for test_<name>; tests/<dir>/test_<name>.py must exist for <dir>/test_<name> (runs as tests.<dir>.test_<name> with ADASH_PERF=1). test_gate covers gate.sh and gate_map.json themselves.",
+  "always": [
+    "test_privacy_pin",
+    "test_page_rules"
+  ],
+  "default": [
+    "test_page_rules",
+    "test_server"
+  ],
   "map": {
-    "agent_dash.py": ["test_server", "test_config", "test_errors", "test_state", "test_doctor"],
-    "dash/store*.py": ["test_store", "test_server", "test_state", "test_doctor", "test_orchestrate", "test_poll_budgets"],
-    "dash/server.py": ["test_server", "test_bundles_api", "test_doctor", "test_errors", "test_state", "test_projects"],
-    "dash/state.py": ["test_state", "test_server"],
-    "dash/doctor.py": ["test_doctor", "test_state", "test_errors"],
-    "dash/bundles.py": ["test_ws_cli", "test_bundles_api", "test_orchestrate", "test_planrender", "test_errors"],
-    "dash/planrender.py": ["test_planrender", "test_bundles_api"],
-    "dash/orchestrate.py": ["test_orchestrate", "test_ws_cli", "test_bundles_api"],
-    "dash/attribution.py": ["test_attribution"],
-    "dash/pricing.py": ["test_pricing", "test_store"],
-    "dash/models.py": ["test_models"],
-    "dash/plans.py": ["test_server", "test_ws_cli", "test_bundles_api"],
-    "dash/project.py": ["test_project", "test_projects", "test_server"],
-    "dash/projects.py": ["test_projects", "test_server", "test_page_rules"],
-    "dash/replay.py": ["test_server", "test_page_rules"],
-    "dash/wsprogress.py": ["test_wsprogress", "test_server", "test_page_rules"],
-    "dash/taskmatch.py": ["test_page_rules"],
-    "dash/liveness.py": ["test_process_liveness", "test_server"],
-    "dash/rundirs.py": ["test_server", "test_config"],
-    "dash/locate.py": ["test_config"],
-    "dash/errors.py": ["test_errors"],
-    "dash/sources/__init__.py": ["test_poll_budgets", "test_server"],
-    "dash/sources/claude.py": ["test_claude", "test_poll_budgets"],
-    "dash/sources/cursor.py": ["test_cursor", "test_poll_budgets"],
-    "dash/sources/muse.py": ["test_muse", "test_poll_budgets"],
-    "dash/sources/grok_cli.py": ["test_grok_cli", "test_poll_budgets"],
-    "dash/sources/manifests.py": ["test_manifests", "test_poll_budgets"],
-    "dash/sources/generic.py": ["test_generic", "test_poll_budgets"],
-    "dash/sources/hub.py": ["test_config", "test_store", "test_poll_budgets"],
-    "dash/sources/process.py": ["test_process_liveness", "test_store", "test_poll_budgets"],
-    "dash/sources/dagster.py": ["test_dagster", "test_poll_budgets"],
-    "static/*": ["test_page_rules", "test_fixtures"],
-    "fixtures/*": ["test_fixtures", "test_page_rules"],
-    "scripts/run_worker.py": ["test_run_worker", "test_ws_wave"],
-    "scripts/run_worker.sh": ["test_run_worker"],
-    "scripts/launch_grok.sh": ["test_ws_wave"],
-    "scripts/cursor_usage_hook.py": ["test_cursor"],
-    "scripts/grok_stream_filter.py": ["test_grok_cli"],
-    "scripts/page_check.mjs": ["test_page_rules"],
-    "scripts/page_settle_check.mjs": ["test_page_rules"],
-    "scripts/gate.sh": ["test_gate"],
-    "scripts/gate_map.json": ["test_gate"],
-    "scripts/install_hooks.sh": ["test_gate"],
-    "workflows/*": ["test_ws_wave"],
-    "catalog/*": ["test_pricing"],
-    "workers.example.json": ["test_run_worker"],
-    "map.example.json": ["test_attribution"],
-    "plans.example.json": ["test_server", "test_ws_cli"],
-    "config.example.json": ["test_config"]
+    "agent_dash.py": [
+      "test_server",
+      "test_config",
+      "test_errors",
+      "test_state",
+      "test_doctor",
+      "test_labels",
+      "test_deploy",
+      "test_rollup"
+    ],
+    "catalog/*": [
+      "test_pricing",
+      "test_phases",
+      "test_labels"
+    ],
+    "config.example.json": [
+      "test_config"
+    ],
+    "dash/attribution.py": [
+      "test_attribution"
+    ],
+    "dash/bundles.py": [
+      "test_ws_cli",
+      "test_bundles_api",
+      "test_orchestrate",
+      "test_planrender",
+      "test_errors"
+    ],
+    "dash/doctor.py": [
+      "test_doctor",
+      "test_state",
+      "test_errors",
+      "test_unlabeled_runs",
+      "test_perfmon",
+      "test_rollup"
+    ],
+    "dash/errors.py": [
+      "test_errors"
+    ],
+    "dash/labels.py": [
+      "test_labels",
+      "test_run_worker",
+      "test_unlabeled_runs",
+      "test_phases"
+    ],
+    "dash/liveness.py": [
+      "test_process_liveness",
+      "test_server"
+    ],
+    "dash/locate.py": [
+      "test_config"
+    ],
+    "dash/models.py": [
+      "test_models"
+    ],
+    "dash/orchestrate.py": [
+      "test_orchestrate",
+      "test_ws_cli",
+      "test_bundles_api"
+    ],
+    "dash/perfmon.py": [
+      "test_perfmon",
+      "test_doctor",
+      "test_server"
+    ],
+    "dash/phases.py": [
+      "test_phases",
+      "test_labels",
+      "test_unlabeled_runs",
+      "perf/test_perf_budget"
+    ],
+    "dash/planrender.py": [
+      "test_planrender",
+      "test_bundles_api"
+    ],
+    "dash/plans.py": [
+      "test_server",
+      "test_ws_cli",
+      "test_bundles_api"
+    ],
+    "dash/pricing.py": [
+      "test_pricing",
+      "test_store",
+      "perf/test_perf_budget"
+    ],
+    "dash/project.py": [
+      "test_project",
+      "test_projects",
+      "test_server"
+    ],
+    "dash/projectphases.py": [
+      "test_rollup",
+      "test_phases",
+      "test_projects",
+      "test_perfmon"
+    ],
+    "dash/projects.py": [
+      "test_projects",
+      "test_server",
+      "test_page_rules"
+    ],
+    "dash/replay.py": [
+      "test_server",
+      "test_page_rules"
+    ],
+    "dash/rundirs.py": [
+      "test_server",
+      "test_config"
+    ],
+    "dash/server.py": [
+      "test_server",
+      "test_bundles_api",
+      "test_doctor",
+      "test_errors",
+      "test_state",
+      "test_projects",
+      "test_view_seq",
+      "test_no_cold_fold_on_request_path",
+      "test_perfmon",
+      "perf/test_perf_budget",
+      "test_rollup"
+    ],
+    "dash/singleflight.py": [
+      "test_perf_stage2",
+      "test_perfmon"
+    ],
+    "dash/sources/__init__.py": [
+      "test_poll_budgets",
+      "test_server",
+      "test_perfmon",
+      "perf/test_perf_budget"
+    ],
+    "dash/sources/claude.py": [
+      "test_claude",
+      "test_poll_budgets",
+      "perf/test_perf_budget"
+    ],
+    "dash/sources/cursor.py": [
+      "test_cursor",
+      "test_poll_budgets",
+      "perf/test_perf_budget"
+    ],
+    "dash/sources/dagster.py": [
+      "test_dagster",
+      "test_poll_budgets",
+      "perf/test_perf_budget"
+    ],
+    "dash/sources/generic.py": [
+      "test_generic",
+      "test_poll_budgets",
+      "perf/test_perf_budget"
+    ],
+    "dash/sources/grok_cli.py": [
+      "test_grok_cli",
+      "test_poll_budgets",
+      "perf/test_perf_budget"
+    ],
+    "dash/sources/hub.py": [
+      "test_config",
+      "test_store",
+      "test_poll_budgets",
+      "perf/test_perf_budget"
+    ],
+    "dash/sources/manifests.py": [
+      "test_manifests",
+      "test_poll_budgets",
+      "perf/test_perf_budget"
+    ],
+    "dash/sources/muse.py": [
+      "test_muse",
+      "test_poll_budgets",
+      "perf/test_perf_budget"
+    ],
+    "dash/sources/process.py": [
+      "test_process_liveness",
+      "test_store",
+      "test_poll_budgets",
+      "perf/test_perf_budget"
+    ],
+    "dash/state.py": [
+      "test_state",
+      "test_server",
+      "perf/test_perf_budget"
+    ],
+    "dash/store*.py": [
+      "test_store",
+      "test_server",
+      "test_state",
+      "test_doctor",
+      "test_orchestrate",
+      "test_poll_budgets",
+      "test_view_seq",
+      "test_migration",
+      "test_no_cold_fold_on_request_path",
+      "test_perfmon",
+      "perf/test_perf_budget",
+      "test_rollup"
+    ],
+    "dash/taskmatch.py": [
+      "test_page_rules",
+      "perf/test_perf_budget"
+    ],
+    "dash/wsprogress.py": [
+      "test_wsprogress",
+      "test_server",
+      "test_page_rules"
+    ],
+    "fixtures/*": [
+      "test_fixtures",
+      "test_page_rules"
+    ],
+    "map.example.json": [
+      "test_attribution"
+    ],
+    "perf_budgets.json": [
+      "test_perfmon",
+      "test_doctor",
+      "perf/test_perf_budget"
+    ],
+    "plans.example.json": [
+      "test_server",
+      "test_ws_cli"
+    ],
+    "plugins/*": [
+      "test_label_guard_clis"
+    ],
+    "scripts/cursor_usage_hook.py": [
+      "test_cursor"
+    ],
+    "scripts/gate.sh": [
+      "test_gate"
+    ],
+    "scripts/gate_map.json": [
+      "test_gate"
+    ],
+    "scripts/grok_stream_filter.py": [
+      "test_grok_cli"
+    ],
+    "scripts/install_hooks.sh": [
+      "test_gate",
+      "test_label_guard_hook",
+      "test_label_guard_clis"
+    ],
+    "scripts/label_guard_hook.py": [
+      "test_label_guard_hook",
+      "test_label_guard_clis"
+    ],
+    "scripts/launch_grok.sh": [
+      "test_ws_wave",
+      "test_labels"
+    ],
+    "scripts/page_check.mjs": [
+      "test_page_rules"
+    ],
+    "scripts/page_settle_check.mjs": [
+      "test_page_rules"
+    ],
+    "scripts/run_worker.py": [
+      "test_run_worker",
+      "test_ws_wave",
+      "test_labels"
+    ],
+    "scripts/run_worker.sh": [
+      "test_run_worker"
+    ],
+    "scripts/schema_snapshot.py": [
+      "test_migration"
+    ],
+    "shims/*": [
+      "test_label_guard_clis"
+    ],
+    "static/*": [
+      "test_page_rules",
+      "test_fixtures",
+      "test_view_seq",
+      "test_etag"
+    ],
+    "tests/fixtures/*": [
+      "test_migration",
+      "test_fixtures"
+    ],
+    "workers.example.json": [
+      "test_run_worker"
+    ],
+    "workflows/*": [
+      "test_ws_wave"
+    ]
   }
 }

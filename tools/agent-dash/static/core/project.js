@@ -226,10 +226,13 @@
   function loadProject() {
     if (inflight) return;
     inflight = true;
-    fetch(projectUrl(), {cache: "no-store"}).then(function (r) {
+    /* Through the shared conditional layer (not a raw fetch): the nav
+       data load wants the same URL at the same time, and sharing one
+       fetch plus ETag/304 keeps the header chrome off the waterfall. */
+    (typeof DashApi === "function" ? DashApi("/api/project", {}) : fetch(projectUrl(), {cache: "no-store"}).then(function (r) {
       if (!r.ok) throw new Error(String(r.status));
       return r.json();
-    }).then(function (j) {
+    })).then(function (j) {
       project = j || null;
       applyProject();
     }).catch(function () {}).then(function () {
@@ -239,10 +242,10 @@
   function loadProjects() {
     if (projectsInflight) return;
     projectsInflight = true;
-    fetch(projectsUrl(), {cache: "no-store"}).then(function (r) {
+    (typeof DashApi === "function" ? DashApi("/api/projects", {}) : fetch(projectsUrl(), {cache: "no-store"}).then(function (r) {
       if (!r.ok) throw new Error(String(r.status));
       return r.json();
-    }).then(function (j) {
+    })).then(function (j) {
       projects = j || null;
       applyProject();
     }).catch(function () {}).then(function () {

@@ -77,6 +77,7 @@ USAGE = """agent-dash: local read-only execution dashboard
   python3 agent_dash.py backfill --session <id>
   python3 agent_dash.py reprice
   python3 agent_dash.py reconcile
+  python3 agent_dash.py db stats|rollup [--dry-run] [--days N] [--batch N]
   python3 agent_dash.py runs prune-markers [--dry-run] [--yes]
   python3 agent_dash.py check [--url URL] [--hours N] [--json]
   python3 agent_dash.py check --page [--url URL] [--json]
@@ -88,6 +89,8 @@ USAGE = """agent-dash: local read-only execution dashboard
   python3 agent_dash.py report start --label <label> [--model M] [--session S] [--run-id R] [--tier T]
   python3 agent_dash.py report finish --label <label> --verdict PASS [--session S] [--run-id R] [--status done]
   python3 agent_dash.py report usage --label <label> --input N --output N [--model M] [--session S] [--run-id R]
+  python3 agent_dash.py label make --scope ws11 --mark plan --slug scout-10-partition-cold [--round 1]
+  python3 agent_dash.py label check <label> [--ws WS11]
   python3 agent_dash.py ws list [--state S[,S...]|all] [--json]
   python3 agent_dash.py ws new <ID> "<title>" [--state planned|active]
   python3 agent_dash.py ws state <ID> <state> [--force] [--note "..."]
@@ -149,6 +152,7 @@ def default_cfg() -> dict:
         "poll_budget_s": 25.0,
         "backfill": False,
         "backfill_session": None,
+        "rollup_after_days": 14,
         "doctor": {
             "interval_s": 300,
             "stuck_hours": 6,
@@ -409,12 +413,16 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_reprice()
     if cmd == "reconcile":
         return cmd_reconcile()
+    if cmd == "db":
+        return cmd_db(args[1:])
     if cmd == "runs":
         return cmd_runs(args[1:])
     if cmd == "check":
         return cmd_check(args[1:])
     if cmd == "report":
         return cmd_report(args[1:])
+    if cmd == "label":
+        return cmd_label(args[1:])
     if cmd == "lead-profile":
         return cmd_lead_profile(args[1:])
     print(USAGE, end="", file=sys.stderr)
@@ -683,6 +691,61 @@ def cmd_rollback(argv: list[str]) -> int:
     return 0 if ok else 1
 
 
+def preflight_db_open() -> tuple[bool, str]:
+    """Open a copy of the live database with this checkout's Store.
+
+    restart/deploy preflight: copies the live database to a temp file
+    with the sqlite backup API (read-only on the source, safe against
+    concurrent writers), opens it with the current Store — running
+    every migration — then closes and deletes the copy. Returns
+    ``(True, message)`` or ``(False, reason)``; the caller must not
+    stop the live server on ``False``. A missing database is not a
+    failure (fresh state dir).
+    """
+    db = DBFILE
+    if not db.is_file():
+        return True, "preflight: no database yet; nothing to migrate"
+    import sqlite3
+    import tempfile
+
+    from dash.store import Store
+
+    tmp: Path | None = None
+    try:
+        fd, tmppath = tempfile.mkstemp(prefix="adash-preflight-", suffix=".sqlite")
+        os.close(fd)
+        tmp = Path(tmppath)
+        src = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=10)
+        try:
+            dst = sqlite3.connect(str(tmp), timeout=10)
+            try:
+                src.backup(dst)
+            finally:
+                dst.close()
+        finally:
+            src.close()
+        store = Store(tmp)
+        try:
+            store._conn.execute("SELECT COUNT(*) FROM runs").fetchone()
+        finally:
+            store.close()
+    except Exception as exc:
+        return (
+            False,
+            f"preflight: this build cannot open the live database copy "
+            f"({type(exc).__name__}: {exc})",
+        )
+    finally:
+        if tmp is not None:
+            for cand in (tmp, Path(str(tmp) + "-wal"), Path(str(tmp) + "-shm")):
+                try:
+                    if cand.exists():
+                        cand.unlink()
+                except OSError:
+                    pass
+    return True, "preflight: live database copy opens with this build"
+
+
 def cmd_restart(argv: list[str] | None = None) -> int:
     """Stop, then run again, and wait for /api/health to answer.
 
@@ -690,12 +753,21 @@ def cmd_restart(argv: list[str] | None = None) -> int:
     ``run`` does. Returns 0 only once health answers ``ok``. The old
     server is found by pidfile or, when that is missing or stale, by
     the answering port; a foreign state dir is refused like ``stop``.
+    Before signalling anything, the new code opens a copy of the live
+    database: a build that cannot migrate it refuses to stop the live
+    server. ``deploy`` funnels through here, so it is covered too.
     """
     for flag in argv or []:
         if flag != "--yes-live":
             print(USAGE, end="", file=sys.stderr)
             return 2
     yes_live = "--yes-live" in (argv or [])
+    bind_state()
+    ok, message = preflight_db_open()
+    if not ok:
+        print(message, file=sys.stderr)
+        print("restart refused: live server left running", file=sys.stderr)
+        return 1
     if yes_live:
         cmd_stop(["--yes-live"])
     else:
@@ -1151,6 +1223,69 @@ def _claude_projects(cfg: dict) -> str:
     return str(Path.home() / ".claude" / "projects")
 
 
+def cmd_db(argv: list[str] | None = None) -> int:
+    """Database maintenance: stats, usage rollup, dry runs.
+
+    ``db stats`` prints size, row counts, rollup coverage, and the
+    live/rolled time span. ``db rollup --dry-run`` reports what would
+    roll without writing. ``db rollup [--days N] [--batch N]`` compacts
+    usage rows older than N days (default: rollup_after_days, 14) into
+    hourly bundles, batch after batch until nothing qualifies, with a
+    per-batch verification that rolls back on mismatch. The live
+    server is never touched; run this against the state dir directly.
+    """
+    rest = list(argv or [])
+    if not rest or rest[0] not in ("stats", "rollup"):
+        print("usage: python3 agent_dash.py db stats|rollup [--dry-run] [--days N] [--batch N]", file=sys.stderr)
+        return 2
+    bind_state()
+    from dash.store import Store
+
+    dry = "--dry-run" in rest
+    days = 14
+    batch = 200
+    try:
+        if "--days" in rest:
+            days = float(rest[rest.index("--days") + 1])
+        if "--batch" in rest:
+            batch = int(rest[rest.index("--batch") + 1])
+    except (ValueError, IndexError):
+        print("db: --days N and --batch N take numbers", file=sys.stderr)
+        return 2
+    store = Store(DBFILE)
+    try:
+        if rest[0] == "stats":
+            stats = store.db_rollup_stats()
+            size = "unknown" if stats["size_mb"] is None else f"{stats['size_mb']:.0f} MB"
+            print(f"database {DBFILE} ({size})")
+            print(f"runs: {stats['runs']}, usage rows live: {stats['usage_event_rows']}, buckets: {stats['buckets']}")
+            print(f"rolled: {stats['rolled_events']} event(s) in {stats['rollup_bundle_rows']} bundle(s)")
+            print(f"live span: {stats['live_ts_min']}..{stats['live_ts_max']}")
+            print(f"rolled span: {stats['rolled_hour_min']}..{stats['rolled_hour_max']}")
+            return 0
+        if dry:
+            report = store.rollup_usage(older_than_days=days, batch_runs=batch, dry_run=True)
+            print(
+                f"rollup dry run: {report['candidate_rows']} row(s) across {report['candidate_runs']} run(s)"
+                f" older than {days:g} days would roll (cutoff {report['cutoff']})"
+            )
+            return 0
+        total_runs = total_rows = total_bundles = 0
+        while True:
+            report = store.rollup_usage(older_than_days=days, batch_runs=batch, time_budget_s=25.0)
+            total_runs += report["rolled_runs"]
+            total_rows += report["rolled_rows"]
+            total_bundles += report["rolled_bundles"]
+            if report.get("failed_runs"):
+                print(f"rollup: verification kept {len(report['failed_runs'])} run(s) live", file=sys.stderr)
+            if report["rolled_runs"] == 0:
+                break
+        print(f"rollup: compacted {total_rows} row(s) into {total_bundles} bundle(s) across {total_runs} run(s)")
+        return 0
+    finally:
+        store.close()
+
+
 def cmd_reconcile() -> int:
     """Mark grok, muse, and glm rows whose process is gone.
 
@@ -1434,6 +1569,64 @@ def cmd_page_check(url: str, json_mode: bool = False) -> int:
     return 0 if proc.returncode == 0 else 1
 
 
+def cmd_label(argv: list[str]) -> int:
+    """Build or check a canonical run label (``dash/labels.py``).
+
+    ``label make`` prints the label. ``label check`` exits 0 when the
+    label is strong (printing phase and rule, plus any conflict
+    warning), 2 when refused (printing the one-line fix).
+    """
+    from dash import labels as label_lib
+
+    if not argv or argv[0] not in ("make", "check"):
+        print(
+            "usage: python3 agent_dash.py label make --scope <wsN|hub> "
+            "--mark <plan|exec|review|coord> --slug <slug> [--round N] "
+            "or python3 agent_dash.py label check <label> [--ws <WS>]",
+            file=sys.stderr,
+        )
+        return 2
+    if argv[0] == "make":
+        flags = _report_flags(argv[1:])
+        if not flags.get("scope") or not flags.get("mark") or not flags.get("slug"):
+            print(
+                "label make needs --scope, --mark, and --slug. Run: python3 agent_dash.py "
+                "label make --scope ws11 --mark plan --slug scout-10-partition-cold --round 1",
+                file=sys.stderr,
+            )
+            return 2
+        try:
+            print(
+                label_lib.make(
+                    flags.get("scope", ""),
+                    flags.get("mark", ""),
+                    flags.get("slug", ""),
+                    flags.get("round"),
+                )
+            )
+        except ValueError as exc:
+            print(f"label make failed: {exc}", file=sys.stderr)
+            return 2
+        return 0
+    rest = argv[1:]
+    label = next((token for token in rest if not token.startswith("--")), None)
+    if label is None:
+        print(
+            "label check needs a label. Run: python3 agent_dash.py label check <label> [--ws <WS>]",
+            file=sys.stderr,
+        )
+        return 2
+    flags = _report_flags(rest)
+    verdict = label_lib.check(label, ws=flags.get("ws"))
+    if not verdict["ok"]:
+        print(f"label refused: {verdict['fix']}", file=sys.stderr)
+        return 2
+    print(f"ok: {label} -> {verdict['phase']} via {verdict['rule']}")
+    if verdict.get("warning"):
+        print(verdict["warning"])
+    return 0
+
+
 def cmd_report(argv: list[str]) -> int:
     """Append one generic.jsonl line so any harness can report a run.
 
@@ -1453,6 +1646,21 @@ def cmd_report(argv: list[str]) -> int:
     if not label or len(label) > 200 or "/" in label or "\\" in label or label.startswith("."):
         print("report requires --label <label>, e.g. --label ws4-WS4.1-slug (no /, \\, or leading dot; max 200 chars)", file=sys.stderr)
         return 2
+    if action == "start":
+        # A bad label never opens a run: refuse before anything launches
+        # or appends, with the exact corrected label. finish/usage stay
+        # open so already-running (including legacy) runs can close out.
+        from dash import labels as label_lib
+
+        verdict = label_lib.check(label)
+        if not verdict["ok"]:
+            if label_lib.legacy_allowed():
+                print(f"label warning (legacy replay): {verdict['fix']}", file=sys.stderr)
+            else:
+                print(f"label refused: {verdict['fix']}", file=sys.stderr)
+                return 2
+        elif verdict.get("warning"):
+            print(verdict["warning"], file=sys.stderr)
     session = flags.get("session")
     run_id = generic_run_id(label, session, flags.get("run-id"))
     model = flags.get("model")
@@ -1588,10 +1796,10 @@ def run_backfill(store, registry, cfg: dict, session_id: str, max_passes: int = 
     idle = 0
     passes = 0
     for _ in range(max_passes):
-        before = store.data_seq
+        before = (store.data_seq, store.cursor_seq)
         registry.tick(store, cfg, time.time(), force=True)
         passes += 1
-        if store.data_seq == before:
+        if (store.data_seq, store.cursor_seq) == before:
             idle += 1
             if idle >= 2:
                 break
@@ -1761,6 +1969,61 @@ def reconcile_if_due(store, now: float, last: float | None, interval: float = RE
     return now
 
 
+ROLLUP_INTERVAL_S = 300
+
+
+def rollup_if_due(store, cfg: dict, now: float, last: float | None, interval: float = ROLLUP_INTERVAL_S) -> float:
+    """Compact old usage rows and tend the database file when due.
+
+    Runs at low priority every few minutes: a small time-budgeted
+    rollup batch (off unless ``rollup_after_days`` is positive), a
+    passive WAL checkpoint so the -wal stays small, and a weekly
+    ``PRAGMA optimize`` so the planner keeps its statistics. Returns
+    the timestamp of the last run. Never raises.
+    """
+    if last is not None and now - last < interval:
+        return last
+    log = logging.getLogger("agent_dash.rollup")
+    try:
+        days = (cfg or {}).get("rollup_after_days", 14)
+        report = store.rollup_usage(older_than_days=days, batch_runs=200, time_budget_s=2.0, now=now)
+        if report.get("rolled_rows"):
+            log.info(
+                "rollup compacted %d row(s) into %d bundle(s) across %d run(s) in %.1fs",
+                report["rolled_rows"], report["rolled_bundles"], report["rolled_runs"], report["elapsed_s"],
+            )
+        if report.get("failed_runs"):
+            log.warning("rollup verification kept %d run(s) live", len(report["failed_runs"]))
+    except Exception:
+        log.exception("rollup batch failed")
+    # The store connection is shared with the request threads: every
+    # statement here runs under the facade lock, like any other store
+    # access. rollup_usage locks internally per batch.
+    try:
+        with store._lock:
+            store._conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+    except Exception:
+        pass
+    try:
+        with store._lock:
+            meta = store._conn.execute("SELECT value FROM meta WHERE key='rollup_optimize_at'").fetchone()
+            last_opt = float(meta["value"]) if meta and meta["value"] else 0.0
+            if now - last_opt > 7 * 86400:
+                store._conn.execute("PRAGMA optimize")
+                try:
+                    store._conn.execute("ANALYZE usage_events")
+                except Exception:
+                    pass
+                store._conn.execute(
+                    "INSERT INTO meta(key, value) VALUES('rollup_optimize_at', ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    (str(now),),
+                )
+    except Exception:
+        log.exception("optimize failed")
+    return now
+
+
 def rotate_backups(state_dir, keep: int = BACKUP_KEEP, dest=None) -> list:
     """Move ``*.bak-*`` files beyond the newest ``keep`` out of the state dir.
 
@@ -1846,12 +2109,14 @@ def _serve() -> None:
     def loop():
         last_reconcile = None
         last_prune = None
+        last_rollup = None
         while not stop.wait(0.25):
             now = time.time()
             try:
                 registry.tick(store, cfg, now, stop=stop)
                 last_reconcile = reconcile_if_due(store, now, last_reconcile)
                 last_prune = prune_if_due(store, STATE_DIR, now, last_prune)
+                last_rollup = rollup_if_due(store, cfg, now, last_rollup)
             except Exception:
                 logging.exception("collector tick failed")
         server.stop.set()

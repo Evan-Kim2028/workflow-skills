@@ -1,10 +1,12 @@
 """Model families and model keys.
 
 The same rules live in ``static/models.js``. A run maps to a family (claude,
-cursor, muse, glm, deepseek, dagster) and a model key such as ``grok-4.7`` or
-``composer-2.5``. DeepSeek ids map to ``deepseek-flash`` (including the legacy
-``deepseek-v4-flash`` and ``deepseek-v4-flash-vision-exp`` aliases) or
-``deepseek-v4-pro``. A run whose model id was never recorded gets
+cursor, muse, glm, deepseek, codex, dagster) and a model key such as
+``grok-4.7`` or ``composer-2.5``. DeepSeek ids map to ``deepseek-flash``
+(including the legacy ``deepseek-v4-flash`` and
+``deepseek-v4-flash-vision-exp`` aliases) or ``deepseek-v4-pro``. Codex ids
+(``gpt-*``, ``codex-*``, ``gpt-reserve``) map to the ``codex`` family under
+their lowercased id. A run whose model id was never recorded gets
 ``<family>-unknown``. A Grok CLI run whose model id is recorded but matches
 no known family (``mimo-*``, ``step-*``, or any other grok-hosted id) maps
 to ``other``: only an empty id falls back to ``glm-unknown``. A Dagster job
@@ -43,6 +45,10 @@ def model_key(model: str | None, hint: str | None = None) -> tuple[str, str]:
     if "muse" in m:
         match = re.search(r"muse-(spark|wonder)(?:-full)?-(\d+(?:\.\d+)?)", m)
         return "muse", f"muse-{match.group(1)}-{match.group(2)}" if match else "muse-unknown"
+    if "codex" in h or m == "codex-unknown":
+        return "codex", m or "codex-unknown"
+    if m.startswith("gpt-") or m == "gpt-reserve" or m.startswith("codex-"):
+        return "codex", m
     match = _CLAUDE.search(m) or _CLAUDE.search(h)
     if match:
         return "claude", match.group(1)

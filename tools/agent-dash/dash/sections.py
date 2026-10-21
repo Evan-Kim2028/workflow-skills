@@ -25,7 +25,7 @@ from pathlib import Path
 _SECTION_CACHE: dict = {}
 _SECTION_LOCK = threading.Lock()
 
-#: The resolved run-label to task-id map: ``(path, mtime) -> rules``.
+#: The resolved run-label to task-id map: ``path -> ((mtime_ns, size), rules)``.
 _TASKMAP_CACHE: dict = {}
 _TASKMAP_LOCK = threading.Lock()
 
@@ -173,14 +173,15 @@ def _taskmap_cached() -> dict:
         return {}
     path = Path(found)
     try:
-        mtime = path.stat().st_mtime_ns
+        stat = path.stat()
+        stamp = (stat.st_mtime_ns, stat.st_size)
     except OSError:
-        mtime = None
+        stamp = None
     key = str(path)
-    if mtime is not None:
+    if stamp is not None:
         with _TASKMAP_LOCK:
             hit = _TASKMAP_CACHE.get(key)
-            if hit is not None and hit[0] == mtime:
+            if hit is not None and hit[0] == stamp:
                 return hit[1]
     try:
         from dash.taskmatch import load_taskmap
@@ -190,7 +191,7 @@ def _taskmap_cached() -> dict:
         rules = {}
     if not isinstance(rules, dict):
         rules = {}
-    if mtime is not None:
+    if stamp is not None:
         with _TASKMAP_LOCK:
-            _TASKMAP_CACHE[key] = (mtime, rules)
+            _TASKMAP_CACHE[key] = (stamp, rules)
     return rules

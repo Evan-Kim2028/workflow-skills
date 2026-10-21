@@ -10,7 +10,7 @@ import re
 from datetime import datetime
 
 
-TOOL_KEYS = ("grok", "muse", "glm", "claude", "deepseek", "other")
+TOOL_KEYS = ("grok", "muse", "glm", "claude", "deepseek", "codex", "other")
 
 
 FINISHED = ("done", "killed", "died_early")
@@ -66,6 +66,7 @@ RUN_COLS = (
     "err_bytes",
     "pid",
     "out_path",
+    "slice_of",
 )
 
 
@@ -85,6 +86,7 @@ RUN_INPUT = (
     "err_bytes",
     "pid",
     "out_path",
+    "slice_of",
 )
 
 
@@ -100,6 +102,16 @@ SESSION_COLS = (
     "ws_confidence",
     "ws_hint",
 )
+
+
+# view_seq advances only when a write changes a value the snapshot or
+# usage buckets expose. Per-poll telemetry (byte counters, growth
+# flags, pids) rides the data sequence instead: it still invalidates
+# content caches and retags ETags, but it does not wake an idle page.
+RUN_VIEW_IGNORE = ("out_bytes", "out_growing", "err_bytes", "pid")
+
+
+RUN_VIEW_COLS = tuple(col for col in RUN_COLS if col not in RUN_VIEW_IGNORE)
 
 
 WS_STATUSES = ("backlog", "todo", "doing", "review", "done", "cancelled")
@@ -200,6 +212,8 @@ def _tool_key(run: dict) -> str | None:
         return "muse"
     if source == "glm" or tier == "glm":
         return _grok_cli_key(run)
+    if source in ("codex", "codex-exec") or tier == "codex":
+        return "codex"
     if source.startswith("claude") or tier in ("opus", "sonnet", "haiku"):
         return "claude"
     return None
@@ -233,9 +247,9 @@ def is_prod_job_run(run: dict) -> bool:
 
 
 def _is_counted_agent(run: dict) -> bool:
-    """Interactive Claude sessions and shell launch rows are not agents."""
+    """Interactive Claude and Codex lead sessions and shell launch rows are not agents."""
     source = run.get("source") or ""
-    if source in ("claude-main", "shell", "dagster", ""):
+    if source in ("claude-main", "codex", "shell", "dagster", ""):
         return False
     return _tool_key(run) in TOOL_KEYS
 

@@ -23,7 +23,7 @@
   function isClipMode() { return Q.has("clip"); }
   function isClipVertical() { var v = (Q.get("clip") || "").toLowerCase(); return v === "4x5" || v === "v" || v === "vertical"; }
   var WINDOW_HOURS = 24;
-  var state = {view: "exec", ws: "all", snap: null, runs: [], usage: [], conc: [], wss: [], wssAll: [], bundles: [], plan: null, plans: {}, project: null, archive: null, landed: false, seq: -1, groupBy: "model", approvals: [], snapError: null, lastSeqChange: 0, lastPoll: null, lastDataTs: null};
+  var state = {view: "exec", ws: "all", snap: null, runs: [], usage: [], conc: [], wss: [], wssAll: [], bundles: [], plan: null, plans: {}, project: null, archive: null, landed: false, seq: -1, viewSeq: -1, groupBy: "model", approvals: [], snapError: null, lastSeqChange: 0, lastPoll: null, lastDataTs: null};
   var VIEWS = ["plan", "exec", "project", "planned", "archive"];
   /* Project views (Project home, Planned, Archive) render from the same
      all-scope data beside the exec tabs; "current" is the exec alias. */

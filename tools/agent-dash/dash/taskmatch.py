@@ -18,6 +18,7 @@ Only labels are read, never prompts or argv.
 from __future__ import annotations
 
 import re
+import threading
 from pathlib import Path
 
 _WS1_A = re.compile(r"(?:^|[^a-z0-9])ws1[-._]?(\d+[a-z]?)", re.IGNORECASE)
@@ -31,6 +32,19 @@ _LEAD_LETTER = re.compile(r"^[a-z]", re.IGNORECASE)
 _BOUND = re.compile(r"[a-z0-9]")
 
 _FAMILIES = ("opus", "sonnet", "haiku", "muse", "glm", "grok")
+
+#: Compiled ``/regex/`` rule bodies keyed by pattern text. A taskmap can hold
+#: well over Python's 512-entry ``re`` cache, so compiling per call thrashes
+#: it; this keeps one compiled object per distinct pattern (``None`` for a
+#: pattern that does not compile). Bounded: an edited taskmap adds patterns.
+_RULE_RX: dict = {}
+_RULE_RX_LOCK = threading.Lock()
+_RULE_RX_LIMIT = 4096
+
+#: Plan-id index per distinct ``plan_ids`` tuple: ``(text, lowered)`` pairs in
+#: plan order with empty ids dropped, so the substring scan lowercases once.
+_PLAN_INDEX: dict = {}
+_PLAN_INDEX_LIMIT = 256
 
 
 def load_taskmap(root: Path | None = None) -> dict:
@@ -69,11 +83,9 @@ def task_of(label: str | None, ws: str | None, taskmap: dict | None = None, plan
     for key, value in table.items():
         if not isinstance(key, str) or len(key) < 3 or not key.startswith("/"):
             continue
-        try:
-            if re.search(key[1:-1], lab, re.IGNORECASE):
-                return value
-        except re.error:
-            continue
+        rule = _rule_regex(key[1:-1])
+        if rule is not None and rule.search(lab):
+            return value
     if ws == "WS1":
         match = _WS1_A.search(lab) or _WS1_B.search(lab)
         if match:
@@ -93,11 +105,8 @@ def task_of(label: str | None, ws: str | None, taskmap: dict | None = None, plan
     if plan_ids:
         lower = lab.lower()
         best = None
-        for ident in plan_ids:
-            text = str(ident)
-            if not text:
-                continue
-            start = lower.find(text.lower())
+        for text, low in _plan_index(plan_ids):
+            start = lower.find(low)
             if start < 0:
                 continue
             before = lower[start - 1] if start > 0 else ""
@@ -108,6 +117,45 @@ def task_of(label: str | None, ws: str | None, taskmap: dict | None = None, plan
         if best is not None:
             return best
     return None
+
+
+def _rule_regex(pattern: str):
+    """The compiled ``/regex/`` body, compiled once per pattern text.
+
+    ``None`` when the pattern does not compile (the rule is skipped, as
+    the ``re.error`` handling always did). Case-insensitive, JS-like.
+    """
+    with _RULE_RX_LOCK:
+        if pattern in _RULE_RX:
+            return _RULE_RX[pattern]
+    try:
+        compiled = re.compile(pattern, re.IGNORECASE)
+    except re.error:
+        compiled = None
+    with _RULE_RX_LOCK:
+        if len(_RULE_RX) >= _RULE_RX_LIMIT:
+            _RULE_RX.clear()
+        _RULE_RX[pattern] = compiled
+    return compiled
+
+
+def _plan_index(plan_ids) -> tuple:
+    """``(text, lowered)`` for each non-empty plan id, cached per id tuple."""
+    try:
+        key = tuple(plan_ids)
+        hit = _PLAN_INDEX.get(key)
+    except TypeError:
+        key, hit = None, None
+    if hit is not None:
+        return hit
+    texts = (str(ident) for ident in plan_ids)
+    index = tuple((text, text.lower()) for text in texts if text)
+    if key is not None:
+        with _RULE_RX_LOCK:
+            if len(_PLAN_INDEX) >= _PLAN_INDEX_LIMIT:
+                _PLAN_INDEX.clear()
+            _PLAN_INDEX[key] = index
+    return index
 
 
 def task_of_verified(label: str | None, ws: str | None, taskmap: dict | None = None, plan_ids: list[str] | tuple = ()) -> str | None:
