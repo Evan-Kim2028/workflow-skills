@@ -661,6 +661,29 @@ def _template_start_prompt(ws: str, title: str) -> str:
     )
 
 
+def _stable_tool_dir(tool_dir: Path) -> Path:
+    """The tool directory, written through ``releases/CURRENT`` when it is a release.
+
+    A deployed tool runs from ``<X>/releases/<sha>/tools/agent-dash`` (or from a
+    flat ``<X>/releases/<sha>``). When ``<X>/releases/CURRENT`` resolves to that
+    same release, the path goes through the stable link so it survives the next
+    deploy. Any other directory keeps its own path.
+    """
+    tool_dir = Path(tool_dir)
+    candidates = []
+    if tool_dir.parent.name == "tools" and len(tool_dir.parents) >= 2:
+        release = tool_dir.parents[1]
+        candidates.append((release, tool_dir.relative_to(release)))
+    candidates.append((tool_dir, Path(".")))
+    for release, rel in candidates:
+        current = release.parent / "CURRENT"
+        if release.parent.name != "releases" or not current.exists():
+            continue
+        if os.path.realpath(current) == os.path.realpath(release):
+            return current / rel
+    return tool_dir
+
+
 def linear_start_section(ws: str, root: Path | None = None) -> str:
     """The generated Linear section appended to the start prompt of a linked bundle.
 
@@ -671,7 +694,7 @@ def linear_start_section(ws: str, root: Path | None = None) -> str:
 
     page = linear.page_link(ws, root) or {}
     url = page.get("url") or "not synced yet; run the status command below"
-    tool = shlex.quote(str(Path(__file__).resolve().parents[1] / "agent_dash.py"))
+    tool = shlex.quote(str(_stable_tool_dir(Path(__file__).resolve().parents[1]) / "agent_dash.py"))
     py = f"python3 {tool}"
     return "\n".join(
         [
