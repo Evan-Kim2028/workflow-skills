@@ -1263,6 +1263,36 @@ class MetaPushTest(LinearSyncTest):
         self.assertEqual([meta.get("summary") for meta in self._project_meta_calls()], ["Retry me"])
         self.assertNotEqual(self._link_record()["meta_hash"], before)
 
+    def test_metadata_pass_resumes_across_cycles_without_resending_done_calls(self):
+        clock = {"t": 0.0}
+        for name in ("update_project_meta", "set_issue_meta"):
+            real = getattr(self.fake, name)
+
+            def ticking(*args, _real=real, **kwargs):
+                clock["t"] += 1.0
+                return _real(*args, **kwargs)
+
+            setattr(self.fake, name, ticking)
+        self._set_tracker({"summary": "Resume me"})
+        cycles = 0
+        while True:
+            clock["t"] = 0.0
+            result = sync("WS9", root=self.root, client=self.fake, now=self.now + 1 + cycles,
+                          meta_budget_s=2.5, clock=lambda: clock["t"])
+            self.assertIsNone(result["error"])
+            cycles += 1
+            if "meta_progress" not in self._link_record():
+                break
+            self.assertLess(cycles, 20)
+        self.assertGreater(cycles, 1)
+        meta_calls = [call for call in self.fake.calls if call[0] in ("project_meta", "issue_meta")]
+        self.assertEqual(len(meta_calls), len({repr(call) for call in meta_calls}))
+        self.assertEqual(len(self._project_meta_calls()), 1)
+        self.assertGreaterEqual(len(self.fake.calls_named("issue_meta")), 2)
+        self.fake.calls.clear()
+        self.assertIsNone(self._sync(self.now + 50)["error"])
+        self.assertEqual([call for call in self.fake.calls if call[0] in ("project_meta", "issue_meta")], [])
+
 
 if __name__ == "__main__":
     unittest.main()

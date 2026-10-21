@@ -13,6 +13,8 @@ import contextlib
 import fcntl
 import io
 import time
+from collections.abc import Callable, Iterator
+from functools import partial
 from pathlib import Path
 
 from dash import bundles, errors, lifecycle, linear, linear_auth, project
@@ -28,6 +30,8 @@ WORKFLOW_STATES = (
 )
 
 ERROR_CLIP = 200
+META_BUDGET_S = 15.0
+"""Seconds one sync cycle may spend on metadata calls before it yields; the rest resumes next cycle."""
 
 
 def _now(now: float | None) -> float:
@@ -214,10 +218,11 @@ def _recorded_id(entry: object, fallback: str) -> str:
     return fallback
 
 
-def _push(client: Client, ws: str, root: Path | None, record: dict, ws_data: dict, plan: dict, now: float, force: bool) -> int:
+def _push(client: Client, ws: str, root: Path | None, record: dict, ws_data: dict, plan: dict, now: float, force: bool,
+          out_of_time: Callable[[], bool] | None = None) -> int:
     """The spec push, then the metadata pass. Returns the spec push's upsert count."""
     count = _push_spec(client, ws, root, record, ws_data, plan, now, force)
-    _push_meta(client, ws, root, record, plan, force)
+    _push_meta(client, ws, root, record, plan, force, out_of_time)
     return count
 
 
@@ -240,30 +245,32 @@ def _project_meta(tracker: dict, state: str, links: list[dict]) -> dict:
     return meta
 
 
-def _push_meta(client: Client, ws: str, root: Path | None, record: dict, plan: dict, force: bool) -> None:
-    """Push project, milestone and issue metadata when its hash differs from the recorded ``meta_hash``.
+def _meta_steps(client: Client, ws: str, root: Path | None, record: dict, plan: dict, state: str,
+                priorities: dict, issue_labels: list) -> Iterator[tuple[str, Callable[[], None]]]:
+    """The metadata calls of one pass as ``(key, call)`` pairs, in a fixed order.
 
-    The hash covers the tracker section, the lifecycle state, the derived
-    priorities and the issue labels. Open tasks get their derived priority and
-    the tracker's issue labels; pending approvals get priority 2 and the approval
-    label. Links are sent once each. ``meta_hash`` and the sent link urls are
-    recorded only after every call succeeds, so a failed pass repeats in full.
+    Order: project (status, tracker fields and the new links), milestones,
+    open tasks (derived priority and the tracker's issue labels), pending
+    approvals (priority 2 and the approval label). The keys are stable across
+    cycles of one plan, so a pass resumes at the first key not yet recorded.
+    The project call records its sent link urls as soon as it succeeds.
     """
     tracker = linear.tracker_of(plan)
-    state = _lifecycle_state(ws, root)
-    priorities = linear.derived_priorities(plan)
-    issue_labels = list(tracker.get("issue_labels") or [])
-    digest = linear.meta_hash(tracker, state, priorities, issue_labels)
-    if not force and digest == record.get("meta_hash"):
-        return
     project_id = record["project"]["id"]
-    sent = set(record.get("meta_links") or [])
-    links = [link for link in tracker.get("links") or [] if link["url"] not in sent]
-    client.update_project_meta(project_id, _project_meta(tracker, state, links))
+
+    def send_project() -> None:
+        sent = set(record.get("meta_links") or [])
+        links = [link for link in tracker.get("links") or [] if link["url"] not in sent]
+        client.update_project_meta(project_id, _project_meta(tracker, state, links))
+        record["meta_links"] = sorted(sent | {link["url"] for link in links})
+
+    yield "project", send_project
     milestones = record.get("milestones") or {}
     for col, entry in (tracker.get("milestones") or {}).items():
         if col in milestones:
-            client.update_milestone_meta(milestones[col], project_id, entry.get("description"), entry.get("target_date"))
+            yield f"milestone:{col}", partial(
+                client.update_milestone_meta, milestones[col], project_id, entry.get("description"), entry.get("target_date")
+            )
     detached = set(record.get("detached") or [])
     tasks = record.get("tasks") or {}
     for _group, task in _dag_entries(plan):
@@ -271,14 +278,50 @@ def _push_meta(client: Client, ws: str, root: Path | None, record: dict, plan: d
         if ref is None or f"task:{task['id']}" in detached or _task_status(task) in linear.CLOSED_TASK_STATUSES:
             continue
         if task["id"] in priorities:
-            client.set_issue_meta(ref["id"], issue_labels, priorities[task["id"]])
+            yield f"task:{task['id']}", partial(client.set_issue_meta, ref["id"], issue_labels, priorities[task["id"]])
     approvals = record.get("approvals") or {}
     for item in _approval_items(ws, root).values():
         ref = approvals.get(item.get("id"))
         if item.get("status") == "pending" and ref is not None and f"approval:{item['id']}" not in detached:
-            client.set_issue_meta(ref["id"], [linear.APPROVAL_LABEL], linear.APPROVAL_PRIORITY)
+            yield f"approval:{item['id']}", partial(client.set_issue_meta, ref["id"], [linear.APPROVAL_LABEL], linear.APPROVAL_PRIORITY)
+
+
+def _push_meta(client: Client, ws: str, root: Path | None, record: dict, plan: dict, force: bool,
+               out_of_time: Callable[[], bool] | None = None) -> bool:
+    """Push project, milestone and issue metadata in resumable steps. Returns True once the pass is complete.
+
+    The hash covers the tracker section, the lifecycle state, the derived
+    priorities and the issue labels. A pass with the recorded ``meta_hash``
+    does nothing. Otherwise each step's key is recorded in ``meta_progress``
+    (with the pass digest) as it succeeds, and ``out_of_time`` is checked
+    before each call: a pass cut short returns False and the next cycle
+    resumes at the first unfinished step. ``meta_hash`` is set only when every
+    step has succeeded, so a failed call repeats on the next cycle; the other
+    steps already sent are not resent.
+    """
+    tracker = linear.tracker_of(plan)
+    state = _lifecycle_state(ws, root)
+    priorities = linear.derived_priorities(plan)
+    issue_labels = list(tracker.get("issue_labels") or [])
+    digest = linear.meta_hash(tracker, state, priorities, issue_labels)
+    progress = record.get("meta_progress")
+    if not force and progress is None and digest == record.get("meta_hash"):
+        return True
+    if force or not isinstance(progress, dict) or progress.get("digest") != digest:
+        progress = {"digest": digest, "done": []}
+        record["meta_progress"] = progress
+    done = set(progress["done"])
+    for key, call in _meta_steps(client, ws, root, record, plan, state, priorities, issue_labels):
+        if key in done:
+            continue
+        if out_of_time is not None and out_of_time():
+            return False
+        call()
+        done.add(key)
+        progress["done"].append(key)
+    record.pop("meta_progress", None)
     record["meta_hash"] = digest
-    record["meta_links"] = sorted(sent | {link["url"] for link in links})
+    return True
 
 
 def _push_spec(client: Client, ws: str, root: Path | None, record: dict, ws_data: dict, plan: dict, now: float, force: bool) -> int:
@@ -620,7 +663,8 @@ def _pull(client: Client, ws: str, root: Path | None, record: dict) -> tuple[int
     return mapped, applied
 
 
-def _cycle(ws: str, root: Path | None, client: Client, record: dict, now: float, force_push: bool) -> dict:
+def _cycle(ws: str, root: Path | None, client: Client, record: dict, now: float, force_push: bool,
+           out_of_time: Callable[[], bool] | None = None) -> dict:
     """One push, flush and pull pass. Mutates ``record``; the caller writes it."""
     ws_data = linear.read_workspace()
     if ws_data is None:
@@ -628,18 +672,30 @@ def _cycle(ws: str, root: Path | None, client: Client, record: dict, now: float,
     plan = _plan(ws, root)
     if plan is None:
         raise RuntimeError(f"plan.json for {ws} is unreadable")
-    pushed = _push(client, ws, root, record, ws_data, plan, now, force_push)
+    pushed = _push(client, ws, root, record, ws_data, plan, now, force_push, out_of_time)
     flushed = _flush(client, ws, root, record, ws_data)
     pulled, applied = _pull(client, ws, root, record)
     return {"pushed": pushed, "flushed": flushed, "pulled": pulled, "applied": applied}
 
 
-def sync(ws: str, root: Path | None = None, client=None, now: float | None = None) -> dict:
+def _out_of_time(budget_s: float | None, clock: Callable[[], float]) -> Callable[[], bool] | None:
+    """A check that turns True once ``budget_s`` seconds of ``clock`` have passed; None when unbounded."""
+    if budget_s is None:
+        return None
+    deadline = clock() + budget_s
+    return lambda: clock() >= deadline
+
+
+def sync(ws: str, root: Path | None = None, client=None, now: float | None = None,
+         meta_budget_s: float | None = META_BUDGET_S, clock: Callable[[], float] = time.monotonic) -> dict:
     """One sync cycle under ``.linear.lock``. Never raises.
 
-    Returns {'pushed', 'flushed', 'pulled', 'applied', 'error'}. A failed cycle
-    records ``last_error`` and leaves ``synced_at`` alone; a completed one sets
-    ``synced_at`` and clears ``last_error``.
+    The metadata pass stops after ``meta_budget_s`` seconds and resumes in the
+    next cycle (``meta_progress`` in the link record), so one cycle never runs
+    for minutes; None means unbounded. Returns {'pushed', 'flushed', 'pulled',
+    'applied', 'error'}. A failed cycle records ``last_error`` and leaves
+    ``synced_at`` alone; a completed one sets ``synced_at`` and clears
+    ``last_error``.
     """
     stamp = _now(now)
     result: dict = {"pushed": 0, "flushed": 0, "pulled": 0, "applied": 0, "error": None}
@@ -654,7 +710,8 @@ def sync(ws: str, root: Path | None = None, client=None, now: float | None = Non
                 result["error"] = f"not linked: run python3 agent_dash.py ws linear link {ws} --team KEY"
                 return result
             try:
-                counts = _cycle(ws, root, client if client is not None else _make_client(), record, stamp, False)
+                counts = _cycle(ws, root, client if client is not None else _make_client(), record, stamp, False,
+                                _out_of_time(meta_budget_s, clock))
             except Exception as exc:
                 record["last_error"] = _error_text(exc)
                 linear.write_link(ws, record, root)
