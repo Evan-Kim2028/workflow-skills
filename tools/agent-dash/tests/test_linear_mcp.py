@@ -76,6 +76,8 @@ class FakeMcp:
         self.projects: dict[str, dict] = {}
         self.milestones: dict[str, dict] = {}
         self.labels: dict[str, str] = {}
+        self.project_labels: dict[str, str] = {}
+        self.project_states = ("Planned", "In Progress", "Completed", "Canceled")
         self.comments: list[tuple[str, str]] = []
         self.states = {name: {"id": str(uuid.uuid4()), "name": name, "type": kind} for name, kind in STATES}
         self.server: ThreadingHTTPServer | None = None
@@ -211,6 +213,7 @@ class FakeMcp:
             "updatedAt": issue["updatedAt"],
             "project": issue["project"],
             "projectMilestone": issue["milestone"],
+            "priority": issue.get("priority", 0),
         }
         if not fields:
             return full
@@ -267,6 +270,7 @@ class FakeMcp:
                 project["description"] = args["description"]
             for initiative in args.get("addInitiatives") or []:
                 project["initiatives"].append(initiative)
+            self._apply_project_meta(project, args)
             return {"uuid": project["uuid"], "name": project["name"], "url": project["url"]}
         pid = str(uuid.uuid4())
         slug = args["name"].lower().replace(" ", "-")
@@ -276,9 +280,39 @@ class FakeMcp:
             "url": f"https://linear.app/example/project/{slug}-{pid[:6]}",
             "description": args.get("description", ""),
             "initiatives": [],
+            "links": [],
         }
         self.projects[pid] = project
         return {"id": pid, "url": project["url"], "name": project["name"]}
+
+    def _apply_project_meta(self, project: dict, args: dict) -> None:
+        """Store the metadata fields save_project accepts; a status name outside the workspace's list is refused."""
+        for key, field in (("summary", "summary"), ("lead", "lead"), ("priority", "priority"), ("startDate", "startDate"), ("targetDate", "targetDate")):
+            if key in args:
+                project[field] = args[key]
+        if "labels" in args:
+            project["labels"] = list(args["labels"])
+        for link in args.get("links") or []:
+            project["links"].append(dict(link))
+        if "state" in args:
+            if args["state"] not in self.project_states:
+                raise ToolError(f"Could not find project status {args['state']}")
+            project["status"] = args["state"]
+
+    def _t_get_project(self, args: dict) -> dict:
+        project = self._project(args["query"])
+        return {"uuid": project["uuid"], "name": project["name"], "url": project["url"], "labels": [{"name": n} for n in project.get("labels", [])]}
+
+    def _t_list_project_labels(self, args: dict) -> dict:
+        rows = [{"id": lid, "name": name} for lid, name in self.project_labels.items()]
+        if args.get("name"):
+            rows = [row for row in rows if row["name"] == args["name"]]
+        return {"labels": rows, "hasNextPage": False}
+
+    def _t_save_project_label(self, args: dict) -> dict:
+        lid = str(uuid.uuid4())
+        self.project_labels[lid] = args["name"]
+        return {"id": lid, "name": args["name"]}
 
     def _t_list_milestones(self, args: dict) -> dict:
         self._project(args["project"])
@@ -290,6 +324,9 @@ class FakeMcp:
         if args.get("id"):
             milestone = self.milestones[args["id"]]
             milestone["name"] = args.get("name", milestone["name"])
+            for key in ("description", "targetDate"):
+                if key in args:
+                    milestone[key] = args[key]
             return {"id": milestone["id"], "name": milestone["name"]}
         mid = str(uuid.uuid4())
         self.milestones[mid] = {"id": mid, "name": args["name"], "project": args["project"]}
@@ -320,6 +357,8 @@ class FakeMcp:
                 self._label_id(name)
                 if name not in issue["labels"]:
                     issue["labels"].append(name)
+            if "priority" in args:
+                issue["priority"] = args["priority"]
             for name in args.get("removeLabels") or []:
                 if name not in issue["labels"]:
                     raise ToolError(f"Label {name} is not on the issue")
@@ -646,6 +685,122 @@ class LinearSyncPushOverMcpTest(McpTestBase):
             self.assertEqual(linear_sync._push(client, "WS4", root, record, ws_data, plan, 3.0, True), 2)
             self.assertEqual(len(self.fake.issues), 2)
             self.assertEqual(record["tasks"]["WS4.1"]["id"], first_id)
+
+
+
+class McpMetaPushTest(McpTestBase):
+    def _team_and_project(self):
+        client = self.client()
+        info = client.team(TEAM_KEY)
+        project = client.ensure_project(linear.stable_id("project", "WS4"), "Example cutover", info["id"], "d")
+        return client, info, project
+
+    def _push(self, client, root, record, ws_data, plan, now, force):
+        return linear_sync._push(client, "WS4", root, record, ws_data, plan, now, force)
+
+    def test_project_meta_sets_fields_appends_labels_and_links(self) -> None:
+        client, _info, project = self._team_and_project()
+        client.update_project_meta(
+            project["id"],
+            {
+                "summary": "Short",
+                "description": "Long",
+                "priority": 2,
+                "start_date": "2026-10-21",
+                "target_date": "2026-12-01",
+                "labels": ["Infrastructure"],
+                "links": [{"title": "Dashboard", "url": "https://example.test/d"}],
+                "status": "In Progress",
+            },
+        )
+        stored = self.fake.projects[project["id"]]
+        self.assertEqual(stored["summary"], "Short")
+        self.assertEqual(stored["description"], "Long")
+        self.assertEqual(stored["priority"], 2)
+        self.assertEqual((stored["startDate"], stored["targetDate"]), ("2026-10-21", "2026-12-01"))
+        self.assertEqual(stored["labels"], ["Infrastructure"])
+        self.assertEqual(stored["links"], [{"title": "Dashboard", "url": "https://example.test/d"}])
+        self.assertEqual(stored["status"], "In Progress")
+
+    def test_project_labels_and_links_are_append_only(self) -> None:
+        client, _info, project = self._team_and_project()
+        client.update_project_meta(project["id"], {"labels": ["Infrastructure"]})
+        self.fake.projects[project["id"]]["labels"].append("Added in Linear")
+        client.update_project_meta(project["id"], {"labels": ["Other"], "links": [{"title": "A", "url": "https://example.test/a"}]})
+        client.update_project_meta(project["id"], {"links": [{"title": "B", "url": "https://example.test/b"}]})
+        stored = self.fake.projects[project["id"]]
+        self.assertEqual(stored["labels"], ["Infrastructure", "Added in Linear", "Other"])
+        self.assertEqual([link["url"] for link in stored["links"]], ["https://example.test/a", "https://example.test/b"])
+        self.assertIn("Other", self.fake.project_labels.values())
+
+    def test_status_missing_from_the_workspace_is_skipped(self) -> None:
+        client, _info, project = self._team_and_project()
+        client.update_project_meta(project["id"], {"status": "Paused", "summary": "Still set"})
+        stored = self.fake.projects[project["id"]]
+        self.assertNotIn("status", stored)
+        self.assertEqual(stored["summary"], "Still set")
+
+    def test_milestone_and_issue_meta_keep_existing_labels(self) -> None:
+        client, info, project = self._team_and_project()
+        states = {state["name"]: state["id"] for state in info["states"]}
+        milestone = client.ensure_milestone(linear.stable_id("milestone", "WS4", "Build"), project["id"], "Build", 0.0)
+        client.update_milestone_meta(milestone, project["id"], "Build gate", "2026-11-01")
+        self.assertEqual(self.fake.milestones[milestone]["description"], "Build gate")
+        self.assertEqual(self.fake.milestones[milestone]["targetDate"], "2026-11-01")
+
+        ref = client.upsert_issue(linear.stable_id("task", "WS4", "WS4.1"), info["id"], project["id"], None, "First", DESC_TASK_1, state_id=states["Todo"])
+        client.ensure_label(info["id"], "Manual")
+        client.set_issue_meta(ref["id"], ["Infrastructure"], 2)
+        issue = self.fake.issues[ref["id"]]
+        self.assertEqual(sorted(issue["labels"]), ["Infrastructure"])
+        self.assertEqual(issue["priority"], 2)
+
+        self.fake.issues[ref["id"]]["labels"].append("Manual")
+        client.set_issue_meta(ref["id"], ["Infrastructure", "Manual"], None)
+        self.assertEqual(sorted(issue["labels"]), ["Infrastructure", "Manual"])
+        self.assertEqual(issue["priority"], 2)
+
+    def test_push_sends_metadata_once_until_it_changes(self) -> None:
+        client, info, project = self._team_and_project()
+        states = {state["name"]: state["id"] for state in info["states"]}
+        states[AWAITING] = client.ensure_state(info["id"], "x", AWAITING, "started", "#a855f7")
+        label_id = client.ensure_label(info["id"], "approval")
+        ws_data = {"team": {"id": info["id"], "key": TEAM_KEY}, "states": states, "approval_label": label_id}
+        plan = {
+            "tracker": {"summary": "Short", "issue_labels": ["Infrastructure"]},
+            "dag": {
+                "cols": [],
+                "groups": [
+                    {"id": "g1", "tasks": [{"id": "WS4.1", "title": "First", "status": "todo", "deps": []}, {"id": "WS4.2", "title": "Second", "status": "todo", "deps": ["WS4.1"]}]}
+                ],
+            },
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "WS4").mkdir()
+            (root / "WS4" / "bundle.json").write_text(json.dumps({"id": "WS4", "title": "Example cutover"}), encoding="utf-8")
+            record = {"project": project, "milestones": {}, "tasks": {}, "approvals": {}, "relations": {}, "spec_hash": None}
+            self._push(client, root, record, ws_data, plan, 1.0, True)
+            stored = self.fake.projects[project["id"]]
+            self.assertEqual(stored["summary"], "Short")
+            self.assertEqual(stored["status"], "In Progress")
+            first_id = record["tasks"]["WS4.1"]["id"]
+            self.assertEqual(self.fake.issues[first_id]["priority"], 2)
+            self.assertEqual(sorted(self.fake.issues[first_id]["labels"]), ["Infrastructure"])
+            summary_calls = lambda: [args for name, args in self.fake.calls if name == "save_project" and "summary" in args]
+            self.assertEqual(len(summary_calls()), 1)
+
+            self._push(client, root, record, ws_data, plan, 2.0, False)
+            self.assertEqual(len(summary_calls()), 1)
+
+            plan["tracker"]["summary"] = "Changed"
+            self._push(client, root, record, ws_data, plan, 3.0, False)
+            self.assertEqual(len(summary_calls()), 2)
+            self.assertEqual(self.fake.projects[project["id"]]["summary"], "Changed")
+
+            (root / "WS4" / "bundle.json").write_text(json.dumps({"id": "WS4", "title": "Example cutover", "state": "done"}), encoding="utf-8")
+            self._push(client, root, record, ws_data, plan, 4.0, False)
+            self.assertEqual(self.fake.projects[project["id"]]["status"], "Completed")
 
 
 if __name__ == "__main__":

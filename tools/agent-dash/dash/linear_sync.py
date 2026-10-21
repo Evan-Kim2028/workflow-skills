@@ -15,7 +15,7 @@ import io
 import time
 from pathlib import Path
 
-from dash import bundles, errors, linear, linear_auth, project
+from dash import bundles, errors, lifecycle, linear, linear_auth, project
 from dash.linear_client import Client, LinearError
 
 WORKFLOW_STATES = (
@@ -215,6 +215,73 @@ def _recorded_id(entry: object, fallback: str) -> str:
 
 
 def _push(client: Client, ws: str, root: Path | None, record: dict, ws_data: dict, plan: dict, now: float, force: bool) -> int:
+    """The spec push, then the metadata pass. Returns the spec push's upsert count."""
+    count = _push_spec(client, ws, root, record, ws_data, plan, now, force)
+    _push_meta(client, ws, root, record, plan, force)
+    return count
+
+
+def _lifecycle_state(ws: str, root: Path | None) -> str:
+    """The bundle's lifecycle state from bundle.json, defaulting like the dashboard does."""
+    path = bundles.bundle_dir(ws, root)
+    meta = bundles._read_json(path / "bundle.json") if path is not None else None
+    state = meta.get("state") if isinstance(meta, dict) else None
+    return state if state in lifecycle.STATES else lifecycle.DEFAULT_STATE
+
+
+def _project_meta(tracker: dict, state: str, links: list[dict]) -> dict:
+    """The project metadata payload for ``update_project_meta``: only the fields the tracker sets, plus the status and new links."""
+    meta = {key: tracker[key] for key in ("summary", "description", "lead", "labels", "priority", "start_date", "target_date") if key in tracker}
+    if links:
+        meta["links"] = links
+    status = linear.project_status_for_state(state)
+    if status is not None:
+        meta["status"] = status
+    return meta
+
+
+def _push_meta(client: Client, ws: str, root: Path | None, record: dict, plan: dict, force: bool) -> None:
+    """Push project, milestone and issue metadata when its hash differs from the recorded ``meta_hash``.
+
+    The hash covers the tracker section, the lifecycle state, the derived
+    priorities and the issue labels. Open tasks get their derived priority and
+    the tracker's issue labels; pending approvals get priority 2 and the approval
+    label. Links are sent once each. ``meta_hash`` and the sent link urls are
+    recorded only after every call succeeds, so a failed pass repeats in full.
+    """
+    tracker = linear.tracker_of(plan)
+    state = _lifecycle_state(ws, root)
+    priorities = linear.derived_priorities(plan)
+    issue_labels = list(tracker.get("issue_labels") or [])
+    digest = linear.meta_hash(tracker, state, priorities, issue_labels)
+    if not force and digest == record.get("meta_hash"):
+        return
+    project_id = record["project"]["id"]
+    sent = set(record.get("meta_links") or [])
+    links = [link for link in tracker.get("links") or [] if link["url"] not in sent]
+    client.update_project_meta(project_id, _project_meta(tracker, state, links))
+    milestones = record.get("milestones") or {}
+    for col, entry in (tracker.get("milestones") or {}).items():
+        if col in milestones:
+            client.update_milestone_meta(milestones[col], project_id, entry.get("description"), entry.get("target_date"))
+    detached = set(record.get("detached") or [])
+    tasks = record.get("tasks") or {}
+    for _group, task in _dag_entries(plan):
+        ref = tasks.get(task["id"])
+        if ref is None or f"task:{task['id']}" in detached or _task_status(task) in linear.CLOSED_TASK_STATUSES:
+            continue
+        if task["id"] in priorities:
+            client.set_issue_meta(ref["id"], issue_labels, priorities[task["id"]])
+    approvals = record.get("approvals") or {}
+    for item in _approval_items(ws, root).values():
+        ref = approvals.get(item.get("id"))
+        if item.get("status") == "pending" and ref is not None and f"approval:{item['id']}" not in detached:
+            client.set_issue_meta(ref["id"], [linear.APPROVAL_LABEL], linear.APPROVAL_PRIORITY)
+    record["meta_hash"] = digest
+    record["meta_links"] = sorted(sent | {link["url"] for link in links})
+
+
+def _push_spec(client: Client, ws: str, root: Path | None, record: dict, ws_data: dict, plan: dict, now: float, force: bool) -> int:
     """Upsert every task and pending approval, then milestones and blocks relations.
 
     Detached keys are skipped. Tasks that left the plan are canceled once with a

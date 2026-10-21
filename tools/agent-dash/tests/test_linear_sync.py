@@ -185,6 +185,15 @@ class FakeLinear:
     def comment(self, issue_id, body):
         self.calls.append(("comment", issue_id, body))
 
+    def update_project_meta(self, project_id, meta):
+        self.calls.append(("project_meta", project_id, dict(meta)))
+
+    def update_milestone_meta(self, milestone_id, project_id, description, target_date):
+        self.calls.append(("milestone_meta", milestone_id, description, target_date))
+
+    def set_issue_meta(self, issue_id, add_labels, priority):
+        self.calls.append(("issue_meta", issue_id, list(add_labels), priority))
+
     def issues_updated_since(self, project_id, since_iso):
         if self.fail_pull is not None:
             raise self.fail_pull
@@ -1019,6 +1028,173 @@ class DriftTest(LinearSyncTest):
 
     def _ident_approval(self, item_id: str) -> str:
         return self._link_record()["approvals"][item_id]["identifier"]
+
+
+
+class MetaPushTest(LinearSyncTest):
+    def setUp(self):
+        super().setUp()
+        self._link()
+        self.fake.calls.clear()
+
+    def _set_plan(self, edit) -> None:
+        plan = self._plan()
+        edit(plan)
+        (self.root / "WS9" / "plan.json").write_text(json.dumps(plan), encoding="utf-8")
+
+    def _set_tracker(self, tracker: dict) -> None:
+        self._set_plan(lambda plan: plan.__setitem__("tracker", tracker))
+
+    def _set_state(self, state: str) -> None:
+        path = self.root / "WS9" / "bundle.json"
+        meta = json.loads(path.read_text(encoding="utf-8"))
+        meta["state"] = state
+        path.write_text(json.dumps(meta), encoding="utf-8")
+
+    def _project_meta_calls(self) -> list[dict]:
+        return [call[2] for call in self.fake.calls_named("project_meta")]
+
+    def test_tracker_of_keeps_valid_fields_and_drops_the_rest(self):
+        plan = {
+            "tracker": {
+                "summary": "Short",
+                "description": "Long",
+                "lead": "Evan Kim",
+                "labels": ["Infrastructure", "", 3, "Infrastructure"],
+                "issue_labels": ["Infrastructure"],
+                "priority": 2,
+                "start_date": "2026-10-21",
+                "target_date": "2026-13-40",
+                "links": [
+                    {"title": "Dashboard", "url": "https://example.test/d"},
+                    {"title": "Bad", "url": "javascript:alert(1)"},
+                    {"url": "https://example.test/x"},
+                ],
+                "milestones": {"Shape": {"description": "Gate", "target_date": None, "extra": 1}, "": {"description": "x"}},
+                "update": {"health": "onTrack", "daily_hour": 25},
+                "unknown": True,
+            }
+        }
+        self.assertEqual(
+            linear.tracker_of(plan),
+            {
+                "summary": "Short",
+                "description": "Long",
+                "lead": "Evan Kim",
+                "labels": ["Infrastructure"],
+                "issue_labels": ["Infrastructure"],
+                "priority": 2,
+                "start_date": "2026-10-21",
+                "links": [{"title": "Dashboard", "url": "https://example.test/d"}],
+                "milestones": {"Shape": {"description": "Gate"}},
+                "update": {"health": "onTrack"},
+            },
+        )
+        self.assertEqual(linear.tracker_of({}), {})
+        self.assertEqual(linear.tracker_of({"tracker": "text"}), {})
+        self.assertEqual(linear.tracker_of({"tracker": {"summary": "x" * 256, "priority": True}}), {})
+
+    def test_derived_priorities_rank_critical_then_ready_then_other_open(self):
+        plan = {
+            "dag": {
+                "cols": [],
+                "groups": [
+                    {
+                        "id": "g1",
+                        "tasks": [
+                            {"id": "A", "status": "todo", "deps": []},
+                            {"id": "B", "status": "todo", "deps": ["A"]},
+                            {"id": "C", "status": "todo", "deps": ["B"]},
+                            {"id": "D", "status": "todo", "deps": []},
+                            {"id": "E", "status": "todo", "deps": ["D"]},
+                            {"id": "F", "status": "done", "deps": []},
+                            {"id": "G", "status": "deferred", "deps": []},
+                        ],
+                    }
+                ],
+                "edges": [],
+            }
+        }
+        self.assertEqual(linear.derived_priorities(plan), {"A": 2, "B": 2, "C": 2, "D": 3, "E": 4})
+
+    def test_metadata_is_pushed_once_and_again_only_when_it_changes(self):
+        self._set_tracker({"summary": "One line"})
+        self.assertIsNone(self._sync(self.now + 1)["error"])
+        self.assertEqual([meta.get("summary") for meta in self._project_meta_calls()], ["One line"])
+
+        self.fake.calls.clear()
+        self.assertIsNone(self._sync(self.now + 2)["error"])
+        self.assertEqual(self._project_meta_calls(), [])
+
+        self._set_tracker({"summary": "Changed line"})
+        self.assertIsNone(self._sync(self.now + 3)["error"])
+        self.assertEqual([meta.get("summary") for meta in self._project_meta_calls()], ["Changed line"])
+
+    def test_lifecycle_change_pushes_status_without_a_tracker(self):
+        self.assertNotIn("tracker", self._plan())
+        self._set_state("done")
+        self.assertIsNone(self._sync(self.now + 1)["error"])
+        meta = self._project_meta_calls()[0]
+        self.assertEqual(meta["status"], "Completed")
+        self.assertNotIn("summary", meta)
+        self.assertNotIn("description", meta)
+
+    def test_archived_state_leaves_the_project_status_alone(self):
+        self._set_state("archived")
+        self.assertIsNone(self._sync(self.now + 1)["error"])
+        self.assertNotIn("status", self._project_meta_calls()[0])
+
+    def test_issue_metadata_sets_derived_priority_tracker_labels_and_approval(self):
+        self._set_tracker({"issue_labels": ["Infrastructure"]})
+        self.assertIsNone(self._sync(self.now + 1)["error"])
+        issues = {call[1]: (call[2], call[3]) for call in self.fake.calls_named("issue_meta")}
+        for task in ("WS9.1", "WS9.2", "WS9.3"):
+            self.assertEqual(issues[linear.stable_id("task", "WS9", task)], (["Infrastructure"], 2))
+        self.assertEqual(issues[linear.stable_id("approval", "WS9", "A1")], (["approval"], 2))
+        self.assertNotIn(linear.stable_id("task", "WS9", "WS9.4"), issues)
+        self.assertNotIn(linear.stable_id("approval", "WS9", "A2"), issues)
+
+    def test_milestone_metadata_goes_to_mapped_columns_only(self):
+        self._set_tracker(
+            {
+                "milestones": {
+                    "Shape": {"description": "Shape gate", "target_date": "2026-11-01"},
+                    "Unmapped": {"description": "never pushed"},
+                }
+            }
+        )
+        self.assertIsNone(self._sync(self.now + 1)["error"])
+        milestone_calls = self.fake.calls_named("milestone_meta")
+        self.assertEqual(milestone_calls, [("milestone_meta", linear.stable_id("milestone", "WS9", "Shape"), "Shape gate", "2026-11-01")])
+
+    def test_links_are_sent_once_each(self):
+        link = {"title": "Dashboard", "url": "https://example.test/d"}
+        self._set_tracker({"links": [link]})
+        self.assertIsNone(self._sync(self.now + 1)["error"])
+        self.assertEqual(self._project_meta_calls()[0]["links"], [link])
+        self.assertEqual(self._link_record()["meta_links"], [link["url"]])
+
+        self._set_tracker({"summary": "Changed", "links": [link]})
+        self.assertIsNone(self._sync(self.now + 2)["error"])
+        self.assertNotIn("links", self._project_meta_calls()[-1])
+
+    def test_failed_metadata_push_keeps_the_old_hash_and_repeats_in_full(self):
+        before = self._link_record()["meta_hash"]
+        real = self.fake.update_project_meta
+
+        def refuse(project_id, meta):
+            raise LinearError("GRAPHQL", "boom")
+
+        self._set_tracker({"summary": "Retry me"})
+        self.fake.update_project_meta = refuse
+        self.assertIsNotNone(self._sync(self.now + 1)["error"])
+        self.assertEqual(self._link_record()["meta_hash"], before)
+
+        self.fake.update_project_meta = real
+        self.fake.calls.clear()
+        self.assertIsNone(self._sync(self.now + 2)["error"])
+        self.assertEqual([meta.get("summary") for meta in self._project_meta_calls()], ["Retry me"])
+        self.assertNotEqual(self._link_record()["meta_hash"], before)
 
 
 if __name__ == "__main__":

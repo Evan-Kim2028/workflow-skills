@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import io
 import json
+import re
 import sys
 import threading
 import time
@@ -686,6 +687,111 @@ class LookupAndStreamTests(unittest.TestCase):
             with self.assertRaises(lc.LinearError) as caught:
                 client.query("query Q { ok }")
         self.assertEqual(caught.exception.code, "NETWORK")
+
+
+
+class RouteTransport:
+    """Answers each GraphQL operation from a handler table, by operation name, and records every request."""
+
+    def __init__(self, handlers: dict) -> None:
+        self.handlers = handlers
+        self.calls: list[tuple[str, dict]] = []
+
+    def __call__(self, body: bytes, headers: dict) -> tuple:
+        payload = json.loads(body.decode("utf-8"))
+        name = re.search(r"\b(?:query|mutation)\s+(\w+)", payload["query"]).group(1)
+        self.calls.append((name, payload["variables"]))
+        handler = self.handlers.get(name)
+        data = handler(payload["variables"]) if handler is not None else {}
+        return _ok(data)
+
+    def inputs(self, name: str) -> list[dict]:
+        return [variables.get("input", variables) for op, variables in self.calls if op == name]
+
+
+class MetaClientTests(unittest.TestCase):
+    def _client(self, handlers: dict) -> tuple[lc.Client, RouteTransport]:
+        transport = RouteTransport(handlers)
+        return lc.Client(KEY, transport=transport), transport
+
+    def test_project_meta_maps_summary_and_content_and_resolves_ids(self) -> None:
+        handlers = {
+            "ProjectStatuses": lambda v: {"projectStatuses": {"nodes": [{"id": "st-wip", "name": "In Progress"}]}},
+            "UserByName": lambda v: {"users": {"nodes": [{"id": "user-evan", "name": "Evan Kim", "displayName": "evan"}]}},
+            "ProjectDetail": lambda v: {"project": {"labels": {"nodes": [{"id": "pl-keep", "name": "Manual"}]}}},
+            "ProjectLabelByName": lambda v: {"projectLabels": {"nodes": []}},
+            "ProjectLabelCreate": lambda v: {"projectLabelCreate": {"success": True, "projectLabel": {"id": "pl-new"}}},
+            "ProjectUpdate": lambda v: {"projectUpdate": {"success": True, "project": {"id": v["id"], "name": "x", "url": "u"}}},
+            "EntityExternalLinkCreate": lambda v: {"entityExternalLinkCreate": {"success": True}},
+        }
+        client, transport = self._client(handlers)
+        client.update_project_meta(
+            "proj-1",
+            {
+                "summary": "Short",
+                "description": "Long",
+                "lead": "Evan Kim",
+                "priority": 2,
+                "start_date": "2026-10-21",
+                "target_date": "2026-12-01",
+                "labels": ["Infrastructure"],
+                "links": [{"title": "Dashboard", "url": "https://example.test/d"}],
+                "status": "In Progress",
+            },
+        )
+        update = transport.inputs("ProjectUpdate")[0]
+        self.assertEqual(
+            update,
+            {
+                "description": "Short",
+                "content": "Long",
+                "priority": 2,
+                "startDate": "2026-10-21",
+                "targetDate": "2026-12-01",
+                "leadId": "user-evan",
+                "labelIds": ["pl-keep", "pl-new"],
+                "statusId": "st-wip",
+            },
+        )
+        self.assertEqual(
+            transport.inputs("EntityExternalLinkCreate"),
+            [{"projectId": "proj-1", "url": "https://example.test/d", "label": "Dashboard"}],
+        )
+
+    def test_unknown_status_and_lead_are_skipped_not_failed(self) -> None:
+        handlers = {
+            "ProjectStatuses": lambda v: {"projectStatuses": {"nodes": [{"id": "st-wip", "name": "In Progress"}]}},
+            "UserByName": lambda v: {"users": {"nodes": []}},
+            "ProjectUpdate": lambda v: {"projectUpdate": {"success": True, "project": {"id": "p", "name": "x", "url": "u"}}},
+        }
+        client, transport = self._client(handlers)
+        client.update_project_meta("proj-1", {"summary": "Still set", "status": "Paused", "lead": "Nobody"})
+        self.assertEqual(transport.inputs("ProjectUpdate"), [{"description": "Still set"}])
+
+    def test_milestone_meta_sends_only_set_fields(self) -> None:
+        client, transport = self._client({"ProjectMilestoneUpdate": lambda v: {"projectMilestoneUpdate": {"success": True}}})
+        client.update_milestone_meta("ms-1", "proj-1", "Gate", None)
+        client.update_milestone_meta("ms-1", "proj-1", None, None)
+        self.assertEqual(transport.inputs("ProjectMilestoneUpdate"), [{"description": "Gate"}])
+
+    def test_issue_meta_appends_labels_and_sets_priority(self) -> None:
+        handlers = {
+            "IssueLabels": lambda v: {"issue": {"team": {"id": "team-1"}, "labels": {"nodes": [{"id": "lab-keep", "name": "Manual"}]}}},
+            "LabelByName": lambda v: {"issueLabels": {"nodes": {"Infrastructure": [{"id": "lab-infra", "name": "Infrastructure"}], "Manual": [{"id": "lab-keep", "name": "Manual"}]}.get(v["name"], [])}},
+            "IssueUpdate": lambda v: {"issueUpdate": {"success": True, "issue": {"id": v["id"], "identifier": "ENG-1", "url": "u"}}},
+        }
+        client, transport = self._client(handlers)
+        client.set_issue_meta("issue-1", ["Infrastructure", "Manual"], 2)
+        self.assertEqual(transport.inputs("IssueUpdate"), [{"labelIds": ["lab-keep", "lab-infra"], "priority": 2}])
+
+    def test_issue_meta_with_nothing_to_change_sends_no_update(self) -> None:
+        handlers = {
+            "IssueLabels": lambda v: {"issue": {"team": {"id": "team-1"}, "labels": {"nodes": [{"id": "lab-keep", "name": "Manual"}]}}},
+            "LabelByName": lambda v: {"issueLabels": {"nodes": [{"id": "lab-keep", "name": "Manual"}]}},
+        }
+        client, transport = self._client(handlers)
+        client.set_issue_meta("issue-1", ["Manual"], None)
+        self.assertEqual([name for name, _ in transport.calls], ["IssueLabels", "LabelByName"])
 
 
 if __name__ == "__main__":
