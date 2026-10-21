@@ -56,6 +56,7 @@ FILES = (
     "reconcile.json",
     "project.json",
     "decisions.json",
+    "linear.json",
     "project/feed.json",
     "graph.json",
     "plan-WS1.json",
