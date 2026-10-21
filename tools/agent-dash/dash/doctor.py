@@ -2063,14 +2063,20 @@ def _orch_done_moment(state: dict, tid: str) -> float | None:
     return best
 
 
+#: History moves that mean a task has started (dep-jump): wip, pr, prog, done.
+_DEP_JUMP_START_TO = ("wip", "pr", "prog", "done")
+
+
 def _orch_dep_jumps(ctx, ws: str, state: dict) -> int:
     """Tasks that started before a dependency finished (warn recent, info old)."""
     from dash import orchestrate
 
+    from dash.taskmatch import label_mark
+
     by_id = state["by_id"]
     starts: dict[str, float] = {}
     for row in state["history"]:
-        if not isinstance(row, dict):
+        if not isinstance(row, dict) or row.get("to") not in _DEP_JUMP_START_TO:
             continue
         task = row.get("task")
         if not isinstance(task, str) or task not in by_id:
@@ -2083,6 +2089,8 @@ def _orch_dep_jumps(ctx, ws: str, state: dict) -> int:
             starts[task] = stamp
     for tid, rows in state["by_task"].items():
         for run in rows:
+            if label_mark(run.get("label")) not in (None, "exec"):
+                continue
             try:
                 stamp = float(run.get("started_at"))
             except (TypeError, ValueError):

@@ -1744,6 +1744,32 @@ class OrchestrationChecksTest(unittest.TestCase):
         result = self._collect()
         self.assertFalse(self._by_code(result, "dep-jump"))
 
+    def test_dep_jump_ignores_plan_mark_run(self):
+        self._bundle(tasks=[
+            self._task("WS9.1", "todo"),
+            self._task("WS9.2", "wip", ["WS9.1"]),
+        ])
+        self._run("ws9-plan-2", status="done", age_s=3600)
+        self.assertFalse(self._by_code(self._collect(), "dep-jump"))
+
+    def test_dep_jump_counts_exec_mark_run(self):
+        self._bundle(tasks=[
+            self._task("WS9.1", "todo"),
+            self._task("WS9.2", "wip", ["WS9.1"]),
+        ])
+        self._run("ws9-exec-2", status="done", age_s=3600)
+        found = self._by_code(self._collect(), "dep-jump")
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0]["id"], "dep-jump:ws:WS9")
+
+    def test_dep_jump_counts_wip_history_row(self):
+        self._bundle(tasks=[
+            self._task("WS9.1", "todo"),
+            self._task("WS9.2", "wip", ["WS9.1"]),
+        ])
+        self._history("WS9", ("WS9.2", self.now - 3600, "todo", "wip"))
+        self.assertEqual(len(self._by_code(self._collect(), "dep-jump")), 1)
+
     def test_stale_gate_fires_and_fresh_does_not(self):
         import datetime
 

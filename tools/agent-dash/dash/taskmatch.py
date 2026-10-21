@@ -74,6 +74,17 @@ def task_of(label: str | None, ws: str | None, taskmap: dict | None = None, plan
 
 
 _CANONICAL_LABEL = re.compile(r"^ws(\d+)-(?:plan|exec|review|coord)-(.+?)(?:-r\d+)?$", re.IGNORECASE)
+_LABEL_MARK = re.compile(r"^ws\d+-(plan|exec|review|coord)-", re.IGNORECASE)
+
+
+def label_mark(label: str | None) -> str | None:
+    """The mark (``plan``, ``exec``, ``review`` or ``coord``) of a canonical label.
+
+    None for any label without a canonical ``ws<N>-<mark>-`` prefix, so
+    unlabelled and hand-named runs carry no mark.
+    """
+    match = _LABEL_MARK.match(label or "")
+    return match.group(1).lower() if match else None
 
 
 def _canonical_label_task(label: str | None, ws: str | None, plan_ids: list[str] | tuple = ()) -> str | None:
