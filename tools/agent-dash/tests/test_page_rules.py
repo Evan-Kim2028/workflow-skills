@@ -3104,7 +3104,7 @@ class FinalPolishTests(unittest.TestCase):
             "eval(src);"
             "const want=[[0,'0s'],[90,'1m 30s'],[359.6,'5m 59s'],[3599,'59m 59s'],"
             "[172799,'47h 59m'],[172800,'2d 0h'],[183610,'2d 3h'],[579599,'6d 16h'],"
-            "[1209599,'13d 23h'],[1209600,'14d'],[1227600,'14d'],[31535999,'364d'],"
+            "[7200,'2h 0m'],[120,'2m 0s'],[1209599,'13d 23h'],[1209600,'14d'],[1227600,'14d'],[31535999,'364d'],"
             "[31536000,'1y'],[34560000,'1y 35d'],[-5,'0s'],[NaN,'\\u2013'],[null,'\\u2013'],[undefined,'\\u2013']];"
             "for (const [v,w] of want) { const got=AD.fmtDur(v); if (got!==w) { console.error(String(v)+' -> '+got+' want '+w); process.exit(1); } }"
         )
