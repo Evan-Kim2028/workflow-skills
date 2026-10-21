@@ -32,6 +32,8 @@
      /regex/ keys, WS1/WS2/WS7 built-ins, then plan task-id substring. */
   function taskOf(run, ws, ids) {
     var label = run.label || "";
+    var list = ids || [];
+    var hit = (function () {
     var table = (taskmapGet() || {})[ws] || {};
     var match;
     if (table[label]) return table[label];
@@ -66,6 +68,26 @@
       if (best) return best;
     }
     return null;
+    })();
+    /* Canonical label ws<N>-<mark>-<slug>[-rK] names WS<N>.<slug>, else the
+       longest dash-bounded prefix of the slug that is a plan task. Same rule
+       as dash/taskmatch.py _canonical_label_task. */
+    function canonicalTask() {
+      var m = /^ws(\d+)-(?:plan|exec|review|coord)-(.+?)(?:-r\d+)?$/i.exec(label);
+      if (!m || !list.length || String(ws || "").toUpperCase() !== "WS" + m[1]) return null;
+      var prefix = "WS" + m[1] + ".", byLower = {}, parts = m[2].split("-"), k, found;
+      list.forEach(function (id) {
+        var text = String(id), key = text.toLowerCase();
+        if (key.indexOf(prefix.toLowerCase()) === 0 && !byLower[key]) byLower[key] = text;
+      });
+      for (k = parts.length; k > 0; k--) {
+        found = byLower[(prefix + parts.slice(0, k).join("-")).toLowerCase()];
+        if (found) return found;
+      }
+      return null;
+    }
+    if (hit != null && (!list.length || list.indexOf(hit) !== -1)) return hit;
+    return canonicalTask() || hit;
   }
   /* Phantom-task guard, mirroring dash/taskmatch.task_of_verified: a mapped
      id that names no task in this plan stays unmapped instead of claiming a
