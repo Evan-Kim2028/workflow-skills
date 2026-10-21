@@ -75,6 +75,7 @@ WS_USAGE = """agent-dash workstream bundles
   python3 agent_dash.py ws gates <ID> [--json]
   python3 agent_dash.py ws deferred [<ID>] [--json]
   python3 agent_dash.py ws layout <ID> [--json]
+  python3 agent_dash.py ws linear <link|sync|status|unlink> <ID> [--team KEY] [--json]
 
 Status is todo, wip, pr, prog, done, or deferred. deferred may set --moved-to and --note.
 Workstream state is planned, active, paused, done, archived, or dropped (default active).
@@ -1039,6 +1040,7 @@ def set_approval(
     conditions: str | None,
     note: str | None,
     root: Path | None = None,
+    origin: str = "local",
 ) -> int:
     if not _ITEM.match(item_id):
         print(f"bad approval id {item_id!r}: use letters, digits, _, ., - (max 64 chars)", flush=True)
@@ -1107,6 +1109,10 @@ def set_approval(
             "items": items,
         }
         _atomic_write(file, json.dumps(payload, indent=2, ensure_ascii=False) + "\n")
+    if origin == "local":
+        from dash import linear
+
+        linear.enqueue(ws, "approval", item_id, root=root)
     print(f"{ws} {item_id} {status}")
     return 0
 
@@ -1472,6 +1478,7 @@ def set_task(
     note: str | None,
     root: Path | None = None,
     force: bool = False,
+    origin: str = "local",
 ) -> int:
     if status not in STATUSES:
         print(f"unknown status {status!r}. Use one of: {', '.join(STATUSES)}", flush=True)
@@ -1531,7 +1538,11 @@ def set_task(
             return errors.NOT_FOUND
         _atomic_write(plan_path, json.dumps(data, indent=2, ensure_ascii=False) + "\n")
     if old_status != status:
-        append_history(ws, task_id, old_status, status, root=root)
+        append_history(ws, task_id, old_status, status, root=root, by=origin if origin != "local" else None)
+    if origin == "local":
+        from dash import linear
+
+        linear.enqueue(ws, "task", task_id, root=root)
     print(f"{ws} {task_id} {status}")
     return 0
 
@@ -1543,8 +1554,11 @@ def append_history(
     to_status: str,
     root: Path | None = None,
     now: float | None = None,
+    by: str | None = None,
 ) -> None:
     """Append one ``{ts, task, from, to}`` line to the bundle's history file.
+
+    ``by`` names the writer when it is not the local owner (``"linear"``).
 
     The plan write above stays temp-file-plus-replace; a history line is a
     single append, flushed and fsynced so one line is atomic. A failed
@@ -1559,6 +1573,8 @@ def append_history(
     row: dict = {"ts": _time.time() if now is None else now, "task": task_id, "to": to_status}
     if isinstance(from_status, str) and from_status:
         row["from"] = from_status
+    if by is not None:
+        row["by"] = by
     try:
         with open(path / "history.jsonl", "a", encoding="utf-8") as handle:
             handle.write(json.dumps(row, ensure_ascii=False) + "\n")
@@ -1588,6 +1604,7 @@ def set_train(
     gate: str | None = None,
     note: str | None = None,
     root: Path | None = None,
+    origin: str = "local",
 ) -> int:
     if not isinstance(train_id, str) or not _TRAIN_ID.match(train_id):
         print(f"bad train id {train_id!r}: use letters, digits, ., _, - (max 40 chars)", flush=True)
@@ -1719,29 +1736,38 @@ def print_trains(ws: str, root: Path | None = None, json_mode: bool = False) -> 
     if rows is False:
         _say(errors.plan_unreadable(ws), json_mode)
         return errors.INVALID_DATA
+    from dash import linear
+
+    linked = linear.is_linked(ws, root)
+    if linked:
+        from dash import linear_sync
+
+        for item in rows:
+            item["linear_refs"] = linear_sync.train_refs(ws, item, root)
     if json_mode:
         errors.emit_json({"ws": ws, "trains": rows})
         return 0
     if not rows:
         print("(no trains)")
         return 0
-    print("TRAIN\tSTATUS\tBRANCH\tPR\tMEMBERS\tSHARED")
+    header = "TRAIN\tSTATUS\tBRANCH\tPR\tMEMBERS\tSHARED"
+    header += "\tLINEAR" if linked else ""
+    print(header)
     for item in rows:
         members = item.get("members") or []
         member_text = ",".join(f"{member}({dag_status.get(member, '?')})" for member in members) or "-"
         shared = item.get("shared_files") or []
-        print(
-            "\t".join(
-                [
-                    _cell(item.get("id")),
-                    _cell(item.get("status")),
-                    _cell(item.get("branch") or "-"),
-                    _cell(item.get("pr") if item.get("pr") is not None else "-"),
-                    _cell(member_text),
-                    str(len(shared)),
-                ]
-            )
-        )
+        cells = [
+            _cell(item.get("id")),
+            _cell(item.get("status")),
+            _cell(item.get("branch") or "-"),
+            _cell(item.get("pr") if item.get("pr") is not None else "-"),
+            _cell(member_text),
+            str(len(shared)),
+        ]
+        if linked:
+            cells.append(_cell(item.get("linear_refs") or "-"))
+        print("\t".join(cells))
     return 0
 
 
@@ -2117,6 +2143,42 @@ def print_deferred(ws: str | None, json_mode: bool = False) -> int:
     return 0
 
 
+LINEAR_SUBCOMMANDS = ("link", "sync", "status", "unlink")
+
+
+def _cmd_linear(rest: list[str], json_mode: bool = False) -> int:
+    """``ws linear <link|sync|status|unlink> <WS> [--team KEY]``: Linear mirror of one bundle."""
+    args = list(rest)
+    team: str | None = None
+    if "--team" in args:
+        pos = args.index("--team")
+        if pos + 1 >= len(args) or args[pos + 1].startswith("-"):
+            print("--team needs a Linear team key, e.g. --team TRD. Run: python3 agent_dash.py ws linear link <ID> --team TRD", flush=True)
+            return errors.USAGE
+        team = args[pos + 1]
+        del args[pos:pos + 2]
+    if not args:
+        print(WS_USAGE, end="", flush=True)
+        return errors.USAGE
+    sub = args[0]
+    if sub not in LINEAR_SUBCOMMANDS:
+        print(f"unknown linear subcommand {sub!r}. Use one of: {', '.join(LINEAR_SUBCOMMANDS)}. Run: python3 agent_dash.py ws linear status <ID>", flush=True)
+        return errors.USAGE
+    if len(args) != 2:
+        print(f"ws linear {sub} needs one workstream id. Run: python3 agent_dash.py ws linear {sub} <ID>", flush=True)
+        return errors.USAGE
+    ws = args[1]
+    if sub == "link" and not team:
+        print(f"team required to link. Run: python3 agent_dash.py ws linear link {ws} --team TRD", flush=True)
+        return errors.USAGE
+    if sub != "link" and team is not None:
+        print(f"--team applies to link only. Run: python3 agent_dash.py ws linear {sub} {ws}", flush=True)
+        return errors.USAGE
+    from dash import linear_sync
+
+    return linear_sync.run(sub, ws, team_key=team, json_mode=json_mode)
+
+
 def cmd_ws(argv: list[str]) -> int:
     if not argv or argv[0] in ("-h", "--help"):
         print(WS_USAGE, end="")
@@ -2283,6 +2345,8 @@ def cmd_ws(argv: list[str]) -> int:
             print(WS_USAGE, end="", flush=True)
             return errors.USAGE
         return print_trains(rest[0], json_mode=json_mode)
+    if cmd == "linear":
+        return _cmd_linear(rest, json_mode=json_mode)
     if cmd == "approve":
         if len(rest) < 3:
             print(WS_USAGE, end="", flush=True)

@@ -1,0 +1,588 @@
+"""Linear sync for one workstream bundle: link, push, flush the outbox, pull status back.
+
+Orchestration only. ``dash/linear.py`` holds the pure model (stable ids,
+status mapping, rendered issues, the link and outbox files) and
+``dash/linear_client.py`` the network client. Local writes stay in
+``dash/bundles.py``; a pull applies with ``origin='linear'`` so it never
+re-enqueues the change (no ping-pong).
+"""
+
+from __future__ import annotations
+
+import contextlib
+import fcntl
+import io
+import time
+from pathlib import Path
+
+from dash import bundles, errors, linear, project
+from dash.linear_client import Client, LinearError
+
+WORKFLOW_STATES = (
+    ("Todo", "unstarted", "#bec2c8"),
+    ("In Progress", "started", "#f2c94c"),
+    ("In Review", "started", "#5e6ad2"),
+    (linear.AWAITING_PROD, "started", "#a855f7"),
+    ("Done", "completed", "#4cb782"),
+    ("Canceled", "canceled", "#95a2b3"),
+)
+
+ERROR_CLIP = 200
+
+
+def _now(now: float | None) -> float:
+    return time.time() if now is None else now
+
+
+def linked_bundles(root: Path | None = None) -> list[str]:
+    """Workstream ids whose bundle carries a ``linear.json``."""
+    return [row["id"] for row in bundles.list_bundles(root) if linear.is_linked(row["id"], root)]
+
+
+@contextlib.contextmanager
+def _sync_lock(path: Path):
+    """Exclusive flock on ``.linear.lock`` for one whole sync or link cycle."""
+    with open(path / linear.SYNC_LOCK, "a+b") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def _scrub(text: object) -> str:
+    """Flatten, redact the API key and clip a message for storage or print."""
+    flat = " ".join(str(text).split())
+    key = linear.api_key()
+    if key:
+        flat = flat.replace(key, "[redacted]")
+    return flat[:ERROR_CLIP]
+
+
+def _error_text(exc: Exception) -> str:
+    if isinstance(exc, LinearError):
+        return _scrub(f"{exc.code}: {exc.message}")
+    return _scrub(f"{type(exc).__name__}: {exc}")
+
+
+def _make_client() -> Client:
+    key = linear.api_key()
+    if key is None:
+        raise LinearError("AUTH", f"{linear.ENV_KEY} is not set")
+    return Client(key)
+
+
+def _plan(ws: str, root: Path | None) -> dict | None:
+    path = bundles.bundle_dir(ws, root)
+    if path is None:
+        return None
+    data = bundles._read_json(path / "plan.json")
+    return data if isinstance(data, dict) else None
+
+
+def _bundle_title(ws: str, root: Path | None) -> str:
+    path = bundles.bundle_dir(ws, root)
+    meta = bundles._read_json(path / "bundle.json") if path is not None else None
+    title = meta.get("title") if isinstance(meta, dict) else None
+    return title.strip() if isinstance(title, str) and title.strip() else ws
+
+
+def _dag_entries(plan: dict) -> list[tuple[dict, dict]]:
+    """(group, task) pairs for every dag task with a string id, in plan order."""
+    dag = plan.get("dag")
+    if not isinstance(dag, dict):
+        return []
+    pairs = []
+    for group in dag.get("groups") or []:
+        if not isinstance(group, dict):
+            continue
+        for task in group.get("tasks") or []:
+            if isinstance(task, dict) and isinstance(task.get("id"), str):
+                pairs.append((group, task))
+    return pairs
+
+
+def _cols(plan: dict) -> list[str]:
+    dag = plan.get("dag")
+    cols = dag.get("cols") if isinstance(dag, dict) else None
+    return [col if isinstance(col, str) else "" for col in cols] if isinstance(cols, list) else []
+
+
+def _col_name(cols: list[str], group: dict) -> str | None:
+    index = group.get("col")
+    if isinstance(index, int) and not isinstance(index, bool) and 0 <= index < len(cols) and cols[index]:
+        return cols[index]
+    return None
+
+
+def _train_titles(plan: dict) -> dict[str, str]:
+    """Task id to the title of the train that lists it as a member."""
+    titles: dict[str, str] = {}
+    for train in plan.get("trains") or []:
+        if not isinstance(train, dict) or not isinstance(train.get("title"), str):
+            continue
+        for member in bundles._str_list(train.get("members")):
+            titles.setdefault(member, train["title"])
+    return titles
+
+
+def _task_status(task: dict) -> str:
+    status = task.get("status")
+    return status if status in bundles.STATUSES else "todo"
+
+
+def _approval_items(ws: str, root: Path | None) -> dict[str, dict]:
+    record = bundles.approvals_for(ws, root) or {}
+    return {
+        item["id"]: item
+        for item in record.get("items") or []
+        if isinstance(item, dict) and isinstance(item.get("id"), str)
+    }
+
+
+def _cancel_note(task: dict) -> str:
+    parts = ["Deferred in agent-dash."]
+    if task.get("moved_to"):
+        parts.append(f"Moved to {task['moved_to']}.")
+    if task.get("note"):
+        parts.append(f"Note: {task['note']}")
+    return " ".join(parts)
+
+
+def _push(client: Client, ws: str, root: Path | None, record: dict, ws_data: dict, plan: dict, now: float, force: bool) -> int:
+    """Upsert every task and pending approval, then milestones and blocks relations.
+
+    Skipped when the rendered spec hash matches the one recorded at the last push.
+    Returns the number of issues upserted.
+    """
+    project_id = record["project"]["id"]
+    team_id = ws_data["team"]["id"]
+    states = ws_data["states"]
+    cols = _cols(plan)
+    trains = _train_titles(plan)
+
+    entries: list[tuple] = []
+    for group, task in _dag_entries(plan):
+        col = _col_name(cols, group)
+        rendered = linear.render_issue(ws, task, col, trains.get(task["id"]))
+        entries.append(("task", task["id"], rendered, col, task))
+    for item in _approval_items(ws, root).values():
+        if item.get("status") == "pending":
+            entries.append(("approval", item["id"], linear.render_approval(ws, item), None, item))
+
+    digest = linear.spec_hash([entry[2] for entry in entries])
+    if not force and digest == record.get("spec_hash"):
+        return 0
+
+    milestones = record.setdefault("milestones", {})
+    used = {entry[3] for entry in entries if entry[0] == "task" and entry[3]}
+    for index, col in enumerate(cols):
+        if col and col in used:
+            milestones[col] = client.ensure_milestone(
+                linear.stable_id("milestone", ws, col), project_id, col, float(index)
+            )
+
+    tasks = record.setdefault("tasks", {})
+    approvals = record.setdefault("approvals", {})
+    count = 0
+    for kind, key, rendered, col, obj in entries:
+        if kind == "task":
+            task_status = _task_status(obj)
+            ref = client.upsert_issue(
+                linear.stable_id("task", ws, key),
+                team_id,
+                project_id,
+                milestones.get(col) if col else None,
+                rendered["title"],
+                rendered["description"],
+                state_id=states[linear.STATE_FOR_STATUS[task_status]],
+            )
+            prior = tasks.get(key) or {}
+            entry = {"id": ref["id"], "identifier": ref["identifier"], "url": ref["url"]}
+            entry["canceled_noted"] = bool(prior.get("canceled_noted"))
+            tasks[key] = entry
+            if task_status == "deferred" and not entry["canceled_noted"]:
+                client.comment(ref["id"], _cancel_note(obj))
+                entry["canceled_noted"] = True
+        else:
+            ref = client.upsert_issue(
+                linear.stable_id("approval", ws, key),
+                team_id,
+                project_id,
+                None,
+                rendered["title"],
+                rendered["description"],
+                state_id=states[linear.APPROVAL_STATE["pending"]],
+                label_ids=[ws_data["approval_label"]],
+            )
+            approvals[key] = {"id": ref["id"], "identifier": ref["identifier"], "url": ref["url"]}
+        count += 1
+
+    relations = record.setdefault("relations", [])
+    seen = set(relations)
+    for _group, task in _dag_entries(plan):
+        blocked = task["id"]
+        if blocked not in tasks:
+            continue
+        for dep in bundles._str_list(task.get("deps")):
+            edge = f"{dep}>{blocked}"
+            if dep not in tasks or edge in seen:
+                continue
+            client.ensure_blocks(tasks[dep]["id"], tasks[blocked]["id"])
+            relations.append(edge)
+            seen.add(edge)
+
+    record["spec_hash"] = digest
+    record["pushed_at"] = now
+    return count
+
+
+def _flush(client: Client, ws: str, root: Path | None, record: dict, ws_data: dict, plan: dict) -> int:
+    """Send the current local status of every outbox key, then drain the outbox.
+
+    Rows are pointers: the value is read from the local files now. The newest
+    row per key wins. Keys with no mapped issue are skipped. The outbox is
+    drained up to the newest row read; a failure leaves it untouched and the
+    next cycle resends (state sets are idempotent).
+    """
+    rows = linear.read_outbox(ws, root)
+    if not rows:
+        return 0
+    newest: dict[tuple[str, str], dict] = {}
+    for row in rows:
+        newest[(row["kind"], row["key"])] = row
+    high = max(row["ts"] for row in rows)
+    tasks = record.get("tasks") or {}
+    approvals = record.get("approvals") or {}
+    index = {task["id"]: task for _group, task in _dag_entries(plan)}
+    items = _approval_items(ws, root)
+    states = ws_data["states"]
+    sent = 0
+    for kind, key in newest:
+        if kind == "task":
+            ref = tasks.get(key)
+            task = index.get(key)
+            if ref is None or task is None:
+                continue
+            task_status = _task_status(task)
+            client.set_issue_state(ref["id"], states[linear.STATE_FOR_STATUS[task_status]])
+            if task_status == "deferred" and not ref.get("canceled_noted"):
+                client.comment(ref["id"], _cancel_note(task))
+                ref["canceled_noted"] = True
+        else:
+            ref = approvals.get(key)
+            item = items.get(key)
+            if ref is None or item is None or item.get("status") not in linear.APPROVAL_STATE:
+                continue
+            client.set_issue_state(ref["id"], states[linear.APPROVAL_STATE[item["status"]]])
+        sent += 1
+    linear.drain_outbox(ws, high, root)
+    return sent
+
+
+def _apply_task(ws: str, root: Path | None, key: str, state: dict) -> int:
+    plan = _plan(ws, root) or {}
+    task = {task_obj["id"]: task_obj for _group, task_obj in _dag_entries(plan)}.get(key)
+    if task is None:
+        return 0
+    target = linear.status_for_state(state.get("name"), state.get("type"))
+    if target == _task_status(task):
+        return 0
+    note = "canceled in Linear" if target == "deferred" else None
+    with contextlib.redirect_stdout(io.StringIO()):
+        rc = bundles.set_task(ws, key, target, moved_to=None, note=note, root=root, force=True, origin="linear")
+    if rc != 0:
+        raise RuntimeError(f"local apply failed for task {key} (exit {rc})")
+    return 1
+
+
+def _apply_approval(ws: str, root: Path | None, key: str, state: dict) -> int:
+    item = _approval_items(ws, root).get(key)
+    if item is None:
+        return 0
+    target = linear.approval_for_state(state.get("type"))
+    if target == item.get("status"):
+        return 0
+    with contextlib.redirect_stdout(io.StringIO()):
+        rc = bundles.set_approval(
+            ws,
+            key,
+            target,
+            step=item.get("step"),
+            reversible=item.get("reversible"),
+            conditions=item.get("conditions"),
+            note=item.get("note"),
+            root=root,
+            origin="linear",
+        )
+    if rc != 0:
+        raise RuntimeError(f"local apply failed for approval {key} (exit {rc})")
+    return 1
+
+
+def _pull(client: Client, ws: str, root: Path | None, record: dict) -> tuple[int, int]:
+    """Read issues updated since the cursor and apply changed statuses locally.
+
+    Returns (mapped issues read, local changes applied). The cursor moves to
+    the newest updatedAt seen, mapped or not.
+    """
+    reverse: dict[str, tuple[str, str]] = {}
+    for key, ref in (record.get("tasks") or {}).items():
+        reverse[ref["id"]] = ("task", key)
+    for key, ref in (record.get("approvals") or {}).items():
+        reverse[ref["id"]] = ("approval", key)
+    cursor = record.get("cursor")
+    issues = client.issues_updated_since(record["project"]["id"], cursor)
+    mapped = applied = 0
+    for issue in issues:
+        updated = issue.get("updatedAt")
+        if isinstance(updated, str) and (cursor is None or updated > cursor):
+            cursor = updated
+        hit = reverse.get(issue.get("id"))
+        if hit is None:
+            continue
+        mapped += 1
+        state = issue.get("state") if isinstance(issue.get("state"), dict) else {}
+        if hit[0] == "task":
+            applied += _apply_task(ws, root, hit[1], state)
+        else:
+            applied += _apply_approval(ws, root, hit[1], state)
+    record["cursor"] = cursor
+    return mapped, applied
+
+
+def _cycle(ws: str, root: Path | None, client: Client, record: dict, now: float, force_push: bool) -> dict:
+    """One push, flush and pull pass. Mutates ``record``; the caller writes it."""
+    ws_data = linear.read_workspace()
+    if ws_data is None:
+        raise RuntimeError(f"workspace linear.json is missing; run: python3 agent_dash.py ws linear link {ws} --team KEY")
+    plan = _plan(ws, root)
+    if plan is None:
+        raise RuntimeError(f"plan.json for {ws} is unreadable")
+    pushed = _push(client, ws, root, record, ws_data, plan, now, force_push)
+    flushed = _flush(client, ws, root, record, ws_data, plan)
+    pulled, applied = _pull(client, ws, root, record)
+    return {"pushed": pushed, "flushed": flushed, "pulled": pulled, "applied": applied}
+
+
+def sync(ws: str, root: Path | None = None, client=None, now: float | None = None) -> dict:
+    """One sync cycle under ``.linear.lock``. Never raises.
+
+    Returns {'pushed', 'flushed', 'pulled', 'applied', 'error'}. A failed cycle
+    records ``last_error`` and leaves ``synced_at`` alone; a completed one sets
+    ``synced_at`` and clears ``last_error``.
+    """
+    stamp = _now(now)
+    result: dict = {"pushed": 0, "flushed": 0, "pulled": 0, "applied": 0, "error": None}
+    try:
+        path = bundles.bundle_dir(ws, root)
+        if path is None:
+            result["error"] = f"bundle not found: {ws}"
+            return result
+        with _sync_lock(path):
+            record = linear.read_link(ws, root)
+            if record is None:
+                result["error"] = f"not linked: run python3 agent_dash.py ws linear link {ws} --team KEY"
+                return result
+            try:
+                counts = _cycle(ws, root, client if client is not None else _make_client(), record, stamp, False)
+            except Exception as exc:
+                record["last_error"] = _error_text(exc)
+                linear.write_link(ws, record, root)
+                result["error"] = record["last_error"]
+                return result
+            record["synced_at"] = stamp
+            record["last_error"] = None
+            linear.write_link(ws, record, root)
+            result.update(counts)
+            return result
+    except Exception as exc:
+        result["error"] = _error_text(exc)
+        return result
+
+
+def _ensure_workspace(client: Client, team_key: str, ws: str, root: Path | None) -> dict:
+    team = client.team(team_key)
+    team_id = team["id"]
+    states: dict[str, str] = {}
+    for name, state_type, color in WORKFLOW_STATES:
+        states[name] = client.ensure_state(
+            team_id, linear.stable_id("state", team_key, name), name, state_type, color
+        )
+    label_id = client.ensure_label(team_id, linear.APPROVAL_LABEL)
+    data, _path, _issues = project.read_project()
+    initiative_name = data.get("name") if isinstance(data, dict) and isinstance(data.get("name"), str) else None
+    initiative = client.ensure_initiative(initiative_name or _bundle_title(ws, root))
+    ws_data = {
+        "team": {"id": team_id, "key": team_key},
+        "states": states,
+        "initiative": initiative,
+        "approval_label": label_id,
+    }
+    linear.write_workspace(ws_data)
+    return ws_data
+
+
+def link(ws: str, team_key: str, root: Path | None = None, client=None, now: float | None = None) -> int:
+    """Link one bundle to a Linear project and run a full push. Returns the CLI exit code.
+
+    Refuses without ``LINEAR_API_KEY``. Re-linking a linked bundle is a
+    full push that updates in place, so it creates nothing twice.
+    """
+    if linear.api_key() is None:
+        print(f"{linear.ENV_KEY} is not set. Export the Linear API key, then run: python3 agent_dash.py ws linear link {ws} --team {team_key}", flush=True)
+        return errors.USAGE
+    path = bundles.bundle_dir(ws, root)
+    if path is None:
+        print(errors.bundle_not_found(ws), flush=True)
+        return errors.NOT_FOUND
+    existing_ws = linear.read_workspace()
+    if existing_ws is not None and (existing_ws.get("team") or {}).get("key") not in (None, team_key):
+        print(f"agent-dash is linked to team {existing_ws['team']['key']}, not {team_key}. Use --team {existing_ws['team']['key']}", flush=True)
+        return errors.USAGE
+    stamp = _now(now)
+    record: dict | None = None
+    try:
+        with _sync_lock(path):
+            existing = linear.read_link(ws, root)
+            if existing is not None and existing.get("team_key") not in (None, team_key):
+                print(f"{ws} is linked to team {existing['team_key']}, not {team_key}. Run: python3 agent_dash.py ws linear unlink {ws} first", flush=True)
+                return errors.USAGE
+            api = client if client is not None else _make_client()
+            ws_data = _ensure_workspace(api, team_key, ws, root)
+            record = existing or {
+                "version": 1,
+                "team_key": team_key,
+                "project": {},
+                "milestones": {},
+                "tasks": {},
+                "approvals": {},
+                "relations": [],
+                "spec_hash": None,
+                "cursor": None,
+                "linked_at": stamp,
+                "pushed_at": 0.0,
+                "synced_at": 0.0,
+                "last_error": None,
+            }
+            title = _bundle_title(ws, root)
+            proj = api.ensure_project(
+                linear.stable_id("project", ws),
+                title,
+                ws_data["team"]["id"],
+                f"Workstream {ws}: {title}. Tasks and pending approvals mirror the agent-dash bundle.",
+            )
+            api.add_project_to_initiative(ws_data["initiative"]["id"], proj["id"])
+            record["project"] = proj
+            linear.write_link(ws, record, root)
+            _cycle(ws, root, api, record, stamp, True)
+            record["synced_at"] = stamp
+            record["last_error"] = None
+            linear.write_link(ws, record, root)
+    except Exception as exc:
+        message = _error_text(exc)
+        if record is not None:
+            record["last_error"] = message
+            linear.write_link(ws, record, root)
+        print(f"linear link failed for {ws}: {message}. Run: python3 agent_dash.py ws linear sync {ws}", flush=True)
+        return errors.CHECK_FAILED
+    print(record["project"]["url"], flush=True)
+    return 0
+
+
+def _age(now: float, stamp: float | None) -> str:
+    if not stamp:
+        return "never"
+    seconds = max(0, int(now - stamp))
+    if seconds < 120:
+        return f"{seconds}s ago"
+    if seconds < 7200:
+        return f"{seconds // 60}m ago"
+    return f"{seconds // 3600}h ago"
+
+
+def status(ws: str, root: Path | None = None, as_json: bool = False) -> int:
+    """Print the Linear link state of one bundle: human lines, or one JSON object."""
+    if bundles.bundle_dir(ws, root) is None:
+        print(errors.bundle_not_found(ws), flush=True)
+        return errors.NOT_FOUND
+    record = linear.read_link(ws, root)
+    if record is None:
+        if as_json:
+            errors.emit_json({"ws": ws, "linked": False})
+        else:
+            print(f"{ws} is not linked to Linear. Run: python3 agent_dash.py ws linear link {ws} --team KEY")
+        return errors.OK
+    state = linear.sync_state(ws, root) or {}
+    payload = {
+        "ws": ws,
+        "linked": True,
+        "url": state.get("url"),
+        "project": state.get("project"),
+        "synced_at": state.get("synced_at"),
+        "last_error": state.get("last_error"),
+        "outbox": state.get("outbox", 0),
+        "linked_tasks": len(record.get("tasks") or {}),
+    }
+    if as_json:
+        errors.emit_json(payload)
+        return errors.OK
+    print(f"{ws} project: {payload['url'] or '-'}")
+    print(f"synced: {_age(time.time(), payload['synced_at'])}")
+    print(f"last error: {payload['last_error'] or 'none'}")
+    print(f"outbox: {payload['outbox']}")
+    print(f"linked tasks: {payload['linked_tasks']}")
+    return errors.OK
+
+
+def unlink(ws: str, root: Path | None = None) -> int:
+    """Remove ``linear.json`` and the outbox. Linear issues and the project stay."""
+    path = bundles.bundle_dir(ws, root)
+    if path is None:
+        print(errors.bundle_not_found(ws), flush=True)
+        return errors.NOT_FOUND
+    record = linear.read_link(ws, root)
+    if record is None:
+        print(f"{ws} is not linked; nothing to remove")
+        return errors.OK
+    project_url = (record.get("project") or {}).get("url") or "-"
+    with _sync_lock(path):
+        (path / linear.LINK_FILE).unlink(missing_ok=True)
+        (path / linear.OUTBOX_FILE).unlink(missing_ok=True)
+    print(f"unlinked {ws}. Kept in Linear: project {project_url} and its issues (not deleted).")
+    return errors.OK
+
+
+def train_refs(ws: str, train: dict, root: Path | None = None) -> str | None:
+    """'Fixes TRD-1, TRD-2' for the train's linked members, None when unlinked or none are linked."""
+    record = linear.read_link(ws, root)
+    if record is None:
+        return None
+    tasks = record.get("tasks") or {}
+    refs = []
+    for member in bundles._str_list(train.get("members")):
+        entry = tasks.get(member)
+        if isinstance(entry, dict) and entry.get("identifier"):
+            refs.append(entry["identifier"])
+    return f"Fixes {', '.join(refs)}" if refs else None
+
+
+def run(sub: str, ws: str, team_key: str | None = None, json_mode: bool = False) -> int:
+    """CLI entry for ``ws linear <sub> <ws>``. Returns the exit code."""
+    if sub == "link":
+        return link(ws, team_key or "")
+    if bundles.bundle_dir(ws) is None:
+        print(errors.bundle_not_found(ws), flush=True)
+        return errors.NOT_FOUND
+    if sub == "sync":
+        result = sync(ws)
+        if json_mode:
+            errors.emit_json({"ws": ws, **result})
+        elif result["error"]:
+            print(f"linear sync failed for {ws}: {result['error']}. Run: python3 agent_dash.py ws linear status {ws}")
+        else:
+            print(f"{ws} linear sync: pushed {result['pushed']}, flushed {result['flushed']}, pulled {result['pulled']}, applied {result['applied']}")
+        return errors.CHECK_FAILED if result["error"] else errors.OK
+    if sub == "status":
+        return status(ws, as_json=json_mode)
+    return unlink(ws)
