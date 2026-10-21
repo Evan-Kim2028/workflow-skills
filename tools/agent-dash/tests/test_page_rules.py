@@ -3198,8 +3198,8 @@ class FinalPolishTests(unittest.TestCase):
         )
         self.assertEqual(
             [ident for _, ident in both],
-            ["tiles", "running", "plan", "activity", "finished"],
-            "exec order drifted: want the activity stack between plan and finished",
+            ["tiles", "running", "plan", "linear", "activity", "finished"],
+            "exec order drifted: want the Linear card and the activity stack between plan and finished",
         )
         for gone in ('"tokens"', '"gantt"', '"conc"', '"progress"'):
             self.assertNotIn(
@@ -4234,6 +4234,93 @@ class TableColumnTests(unittest.TestCase):
             text=True,
         )
         self.assertEqual(proc.returncode, 0, proc.stderr or proc.stdout)
+
+
+class LinearCardRulesTests(unittest.TestCase):
+    """The Linear card: chart on the shared axes(), real links, tooltips without raw numbers, glyph plus word states, tokens only."""
+
+    def setUp(self):
+        self.js = (STATIC / "cards" / "linear.js").read_text()
+        self.css = (STATIC / "cards" / "linear.css").read_text()
+        self.registry = (STATIC / "cards" / "registry.js").read_text()
+        self.page = (STATIC / "index.html").read_text()
+
+    def test_chart_uses_shared_axes_helper(self):
+        self.assertIn("axes(svg, {", self.js)
+        self.assertIn("yFmt: fmtN", self.js)
+        self.assertIn("yTitle:", self.js)
+        self.assertIn('"Status changes by source. "', self.js)
+
+    def test_legend_pairs_swatch_glyph_and_word(self):
+        self.assertIn('list.className = "lin-legend"', self.js)
+        self.assertIn('SOURCE[key].glyph + " " + SOURCE[key].word', self.js)
+        self.assertIn('glyph: "■", word: "Local"', self.js)
+        self.assertIn('glyph: "◆", word: "Linear"', self.js)
+        self.assertIn('sw.setAttribute("aria-hidden", "true")', self.js)
+
+    def test_tooltips_use_compact_numbers_only(self):
+        tips = re.findall(r"tipOn\(mark, [^\n]+", self.js)
+        self.assertTrue(tips, "the bars carry no tooltip")
+        for line in tips:
+            self.assertNotRegex(line, r'v: "\s*\+|String\(|toFixed', line)
+        self.assertIn('v: fmtN(n) + " changes"', self.js)
+        self.assertIn("showTip(ev, title, rows)", self.js)
+        self.assertIn('node.addEventListener("focus"', self.js)
+
+    def test_bars_are_keyboard_reachable(self):
+        self.assertIn('tabindex: "0"', self.js)
+
+    def test_linear_links_open_in_new_tab_with_label(self):
+        self.assertIn('target: "_blank", rel: "noopener"', self.js)
+        self.assertGreaterEqual(self.js.count('"aria-label": "Open '), 2)
+        self.assertIn('text: "Linear ↗"', self.js)
+        self.assertIn(r"/^https:\/\//", self.js)
+
+    def test_sync_state_is_glyph_plus_word(self):
+        for glyph, word in (("✓", "Synced"), ("◔", "Queued"), ("⚠", "Sync error")):
+            self.assertIn('glyph: "%s", word: "%s"' % (glyph, word), self.js)
+        self.assertIn('class: "lin-state"', self.js)
+        self.assertIn(".lin-state{font-weight:650}", self.css)
+
+    def test_sign_in_word_never_shows_a_token(self):
+        self.assertIn("Signed in (browser)", self.js)
+        self.assertIn("Not signed in", self.js)
+        self.assertNotIn("access_token", self.js)
+
+    def test_colours_come_from_tokens_only(self):
+        for name, text in (("linear.js", self.js), ("linear.css", self.css)):
+            self.assertIsNone(re.search(r"#[0-9a-fA-F]{3,8}\b", text), name + " hard-codes a hex colour")
+            self.assertIsNone(re.search(r"\brgba?\(", text), name + " hard-codes an rgb colour")
+        self.assertIn("var(--s7)", self.js)
+        self.assertIn("var(--muted)", self.js)
+
+    def test_no_number_formatting_outside_the_helpers(self):
+        self.assertNotIn("toFixed(", self.js)
+        self.assertNotIn("toLocaleString(", self.js)
+
+    def test_card_hides_when_empty_and_filters_on_workstream_tabs(self):
+        self.assertIn("if (!data || !data.workstreams || !data.workstreams.length) return null;", self.js)
+        self.assertIn("linFilter(data.workstreams, state.ws)", self.js)
+        self.assertIn('if (!ws || ws === "all") return all;', self.js)
+
+    def test_registry_line_is_scope_both(self):
+        self.assertRegex(self.registry, r'\{id: "linear", order: \d+, scope: "both"')
+
+    def test_page_loads_card_assets(self):
+        self.assertIn('href="/static/cards/linear.css"', self.page)
+        self.assertIn('src="/static/cards/linear.js"', self.page)
+        self.assertLess(self.page.index("/static/cards/linear.js"), self.page.index("/static/cards/registry.js"))
+
+    def test_recent_changes_use_shared_disclosure(self):
+        self.assertIn('discloseRows(recentAll, "linear-recent", "changes")', self.js)
+        self.assertIn("discloseButton(info,", self.js)
+        self.assertIn("discloseRedraw(LIN_SEC", self.js)
+
+    def test_section_key_has_no_clock_or_randomness(self):
+        key_line = [line for line in self.js.splitlines() if "keyOf([linSeq" in line]
+        self.assertEqual(len(key_line), 1)
+        self.assertNotIn("Date", key_line[0])
+        self.assertNotIn("Math.random", key_line[0])
 
 
 if __name__ == "__main__":
