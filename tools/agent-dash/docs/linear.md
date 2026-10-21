@@ -1,6 +1,6 @@
 # Linear as a task backend
 
-A workstream can keep its tasks in Linear. Linear then shows the same tasks, status, and approvals as the dashboard, and the phone and the cloud agents see them too. The plan in the bundle stays the source of truth for what each task is. Status and approvals sync both ways.
+A workstream can keep its tasks in Linear. Linear then shows the same tasks, status, and approvals as the dashboard, and the phone and the cloud agents see them too. The plan in the bundle stays the source of truth for what each task is. Status and approvals sync both ways. The project details (summary, description, priorities, labels, dates, milestone text) come from the plan and are pushed one way, from the plan to Linear. The workstream can also post standup updates and receive comments from agents.
 
 Local mode is the default. A workstream with no `linear.json` in its bundle behaves as it always has and makes no network call.
 
@@ -16,7 +16,7 @@ Local mode is the default. A workstream with no `linear.json` in its bundle beha
 
 ## What changes and what does not
 
-Agents and skills keep using the same commands: `ws task`, `ws train`, and `ws approve`. Nothing changes for them. In a linked workstream, each of those writes also queues a change for Linear. The next sync sends it.
+Agents and skills keep using the same commands: `ws task`, `ws train`, and `ws approve`. Nothing changes for them. In a linked workstream, each of those writes also queues a change for Linear. The next sync sends it. Agents report results with one more command, `ws linear comment`. See [Agents and Linear](#agents-and-linear).
 
 Status commands are unchanged when a workstream is linked. `ws task` still writes the bundle first. Linear receives the change within a minute.
 
@@ -76,6 +76,66 @@ A saved sign-in always wins over the key.
 | Task spec: acceptance, files, test command, rollback, wave, size, train, dependency notes | Issue description, rendered from the plan |
 | Pending approval | Issue with the `approval` label |
 | Train | Not mirrored as a label. The train name appears in the description. |
+| `tracker` section of `plan.json` | Project summary, description, lead, labels, priority, dates, links, and milestone text |
+| Lifecycle state (`bundle.json`) | Project status |
+| Standup update (`ws linear update`) | Project status update |
+| Agent comment (`ws linear comment`) | Issue comment |
+
+## Project details for everyone
+
+The plan can carry a `tracker` section in `plan.json`. It holds the words and dates that a non-engineer reads in Linear: the project summary and description, the lead, labels, priority, dates, links, and one short description per milestone. Every field is optional. A workstream without `tracker` keeps the project description it had before.
+
+```json
+"tracker": {
+  "summary": "Move the notes read path to Postgres, one table at a time.",
+  "description": "Why now, what done looks like, and how to read progress.",
+  "lead": "Alex Rivera",
+  "labels": ["Infrastructure"],
+  "issue_labels": ["Infrastructure"],
+  "priority": 2,
+  "start_date": "2026-10-21",
+  "target_date": null,
+  "links": [{"title": "Dashboard", "url": "http://127.0.0.1:8765/?ws=WS4&view=exec"}],
+  "milestones": {"Read path": {"description": "Reads come from Postgres. Gate: parity check passes.", "target_date": null}},
+  "update": {"health": "onTrack", "daily_hour": 9}
+}
+```
+
+| Field | What it does |
+|---|---|
+| `summary` | One line, at most 255 characters, for non-engineers. Becomes the project summary. |
+| `description` | Markdown for non-engineers. Becomes the project description. |
+| `lead` | The name of the project lead in Linear. |
+| `labels` | Project labels. Linear creates a label that does not exist yet. |
+| `issue_labels` | Labels added to every task issue. The sync adds them and never removes a label that someone added in Linear. |
+| `priority` | Project priority on Linear's scale: 0 none, 1 urgent, 2 high, 3 medium, 4 low. |
+| `start_date`, `target_date` | Project dates, `YYYY-MM-DD`. `null` clears the target date. |
+| `links` | Links shown on the project. The sync appends new links and does not remove old ones. |
+| `milestones` | Keyed by DAG column name. Each entry sets the milestone description and target date. |
+| `update` | Standup settings. `health` is the default health for a standup update (`onTrack`, `atRisk`, or `offTrack`). `daily_hour` is the local hour for the automatic daily update. See [Standup updates](#standup-updates). |
+
+The plan owns these fields. Edit them in `plan.json`, not in Linear. The sync keeps Linear in step: it pushes the metadata when it changes. Linear edits to the project description or to a priority are overwritten at the next metadata push.
+
+The project status follows the workstream lifecycle state in `bundle.json`:
+
+| Lifecycle state | Project status |
+|---|---|
+| `planned` | Planned |
+| `active` | In Progress |
+| `paused` | Paused, when the workspace has that status. Otherwise the status is left as it is. |
+| `done` | Completed |
+| `dropped` | Canceled |
+| `archived` | Left as it is. |
+
+Issue priorities are derived from the plan. They are not stored in the plan.
+
+- Tasks on the critical path are High (2).
+- Tasks that are ready now are Medium (3).
+- Other open tasks are Low (4).
+- Approval issues are High (2).
+- Done and deferred tasks keep their current priority.
+
+The metadata push runs only when the metadata changes. The sync keeps a hash of the `tracker` section, the lifecycle state, and the derived priorities in `linear.json` as `meta_hash`. A task status change does not trigger it, because that goes through the status path.
 
 ## Status
 
@@ -104,13 +164,63 @@ When Linear holds a state name that the table does not list, the poller maps it 
 - **Older CLIs and hand edits.** A status set by an older CLI without Linear support, or by hand-editing `plan.json` or `approvals.json`, is detected as drift and sent on the next sync.
 - **The poller syncs every minute.** Each cycle sends queued local changes first, then pulls Linear changes. The poller runs inside the dashboard.
 - **Conflicts.** A local change that has not reached Linear yet wins; it is sent on the next sync. Otherwise the most recent change in Linear wins.
-- **Edit the spec in the plan.** Do not edit an issue description in Linear. Each push rewrites the description from `plan.json`, so a Linear edit to the description is lost. Status edits in Linear are kept.
+- **Edit the spec in the plan.** Do not edit an issue title or description in Linear. Each push rewrites the description from `plan.json`, so a Linear edit to the description is lost. Status edits in Linear are kept. Labels that someone adds in Linear are kept too.
 - **Put the Linear links in the pull request.** Run `ws trains <WS>`. For each train, a linked workstream prints a `Fixes ENG-…` string that names its member issues. Paste it into the train PR body. This needs Linear's GitHub integration connected to the repository. By default Linear moves linked issues to In Progress when the PR opens and to Done when it merges; set the team's pull request automation to move them to In Review on open so they match the dashboard's `pr` status.
 - **Reopen from Linear.** Moving an issue back from Done or Canceled to an open state reopens the task locally. The next sync applies it.
 - **Tasks and dependencies removed from the plan.** The next push moves the task's issue to Canceled once, with the comment "Removed from the plan.", and stops tracking it. A `blocks` relation for a dependency the plan no longer lists is deleted.
 - **Deleted issues.** If an issue is deleted in Linear, its task is detached on the next sync. The record lists it under `detached` in the bundle's `linear.json`, and no later push recreates it. The task stays in the plan, but its status no longer syncs. `ws linear status` does not print the detached count; read the `detached` list in `linear.json`. A relink (`ws linear unlink`, then `ws linear link`) starts a new record and recreates the issue under the same id.
 - **Approve from Linear.** Move the approval issue to Done to approve it, or to Canceled to deny it. The next sync writes the answer to `approvals.json`. Anyone with access to the Linear team can approve or deny by moving the issue, not only the owner. Keep approval issues in a team limited to people who may approve. A decision made in Linear is recorded in `approvals.json` with `decided_by` set to `linear`. A decision made in the terminal records `owner`.
 - **Approve from the terminal.** `ws approve` still works. It queues the change for Linear.
+
+## Agents and Linear
+
+Agents report to Linear through the same local commands they use for the plan. The protocol:
+
+1. Change task status with `ws task`. The status change reaches Linear through the sync.
+2. Report each result with `ws linear comment <WS> <task-id> "<verdict and PR link>"`. For example, `ws linear comment WS4 WS4.3 "PASS. PR https://github.com/example/repo/pull/123"`. The comment is queued in the outbox and posted on the next sync. It works offline. The command refuses when the workstream is not linked or the task id is unknown. A comment is at most 2000 characters. A comment never changes status.
+3. In each pull request body for a train, paste the `Fixes ENG-…` line that `ws trains <WS>` prints for that train. Linear links the issues to the pull request.
+4. Never edit issue titles or descriptions in Linear. The plan owns them (see [Daily flow](#daily-flow)).
+5. A Claude agent with the Linear MCP connection may comment on an issue or change its status directly. The sync picks up both, as it picks up any Linear change.
+
+## Standup updates
+
+`ws linear update` posts one project status update to the workstream's Linear project:
+
+```bash
+python3 ~/.claude/tools/agent-dash/agent_dash.py ws linear update WS4
+python3 ~/.claude/tools/agent-dash/agent_dash.py ws linear update WS4 --health at-risk
+python3 ~/.claude/tools/agent-dash/agent_dash.py ws linear update WS4 --dry-run
+```
+
+`--health` takes `on-track`, `at-risk`, or `off-track`. Without it, the command uses `tracker.update.health`, and then `onTrack`. `--dry-run` prints the body and posts nothing.
+
+The body is plain markdown:
+
+1. One line of purpose, from `tracker.summary` or the plan thesis.
+2. Progress: how many tasks are done, as a count and a percentage. It also gives the number in progress, in review, and waiting on a production step.
+3. What changed since the last update: task titles with the old and new status. A change that came from Linear is marked "(in Linear)". At most 10 lines, then "and K more".
+4. In progress now: task titles. At most 10.
+5. Next up: the first 5 tasks in the ready queue.
+6. Needs a decision: pending approvals, with their step text.
+
+The window for "what changed" starts at the last update. With no earlier update, it starts 24 hours back. A successful post records the time in `last_update_at` in `linear.json`.
+
+For a daily update without running the command, set `tracker.update.daily_hour` (a local hour, 0 to 23). The dashboard poller posts one update per local day, at or after that hour, when none was posted that day. The poller runs only inside the dashboard.
+
+## The Linear card
+
+The dashboard shows a Linear card when at least one workstream is linked. With no linked workstream, the card is hidden. On the Overall page the card lists every linked workstream. On a workstream's own tab it shows only that workstream.
+
+The card shows, in this order:
+
+- A bar chart of status changes by source, local or Linear, over the last 24 hours and the last 7 days. It has axes and a legend. Each source has a glyph and a word.
+- One row per linked workstream: a "Linear" link to the project, the age of the last sync, the sign-in method (OAuth, key, or none), and the number of queued changes.
+- Recent changes: the last 5, with a control to show more.
+- Waiting on a decision in Linear: pending approvals, each with a link to its issue.
+
+Sync state is shown as a word with a symbol: synced, queued, or sync error. The dashboard never shows a token.
+
+The card reads `GET /api/linear`, a local read-only endpoint with the same data.
 
 ## When the dashboard is not running
 
@@ -120,7 +230,7 @@ The poller runs only inside the dashboard. When the dashboard is stopped, run on
 python3 ~/.claude/tools/agent-dash/agent_dash.py ws linear sync WS4
 ```
 
-The sync pushes the spec when it changed, sends queued status changes, and pulls Linear changes. It does not start a poll loop.
+The sync pushes the spec and the project metadata when they changed, sends queued status changes and comments, and pulls Linear changes. It does not start a poll loop. The daily standup update needs the poller, so run `ws linear update` by hand when the dashboard is stopped.
 
 To check the link:
 
@@ -147,7 +257,10 @@ Only plan content leaves the machine:
 
 - task and milestone titles, and the rendered task specs;
 - task status and approval text;
-- the workstream and project names.
+- the workstream and project names;
+- the `tracker` text (summary, description, milestone descriptions, links), the lead name, labels, dates, and derived priorities;
+- standup update bodies: task titles, status changes, counts, and pending approval steps;
+- comment text. Agents write it, so keep comments to a verdict and links.
 
 Nothing else is sent. Run labels, token counts, costs, prompts, and transcripts stay local. Paths appear only when the plan lists them as task files. The OAuth token and the API key are never written to a log or an error message. The token file is the only place the token is stored, with mode 0600.
 

@@ -81,6 +81,15 @@ Production updates go out fastest when every merge is small in CI time, not in s
 
   When the workstream is linked to Linear, these commands do not change. Linear follows within a minute. See [Linear as a task backend](../../tools/agent-dash/docs/linear.md).
 
+## Linear
+
+If the workstream is linked to Linear (`ws linear link`), keep the Linear side current with the protocol in [Agents and Linear](../../tools/agent-dash/docs/linear.md#agents-and-linear):
+
+- Change status with `ws task` as usual. Linear follows within a minute.
+- Post one standup update before each standup with `ws linear update <ID>` (`--dry-run` to preview). Or set `tracker.update.daily_hour` so the dashboard posts one each day. Both are described in [Standup updates](../../tools/agent-dash/docs/linear.md#standup-updates).
+- Put the `Fixes ENG-…` line from `ws trains <ID>` in each train PR body.
+- Never edit issue titles or descriptions in Linear. The plan owns them.
+
 ## Hand-off
 
 At about 250K context, or at a milestone, run `doctor --ws <ID>` once more, then write `state.md`: done, in flight (labels and PIDs), next wave, blockers and messages owed. Then end. A fresh lead resumes from the brief plus `state.md`. Hub reports include `doctor report --md` output.
