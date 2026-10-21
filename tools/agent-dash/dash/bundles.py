@@ -11,6 +11,7 @@ import fcntl
 import json
 import os
 import re
+import shlex
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -660,8 +661,44 @@ def _template_start_prompt(ws: str, title: str) -> str:
     )
 
 
+def linear_start_section(ws: str, root: Path | None = None) -> str:
+    """The generated Linear section appended to the start prompt of a linked bundle.
+
+    It names the running tool's ``agent_dash.py`` by absolute path, so the
+    commands work from any cwd. It is generated, never written into START-PROMPT.md.
+    """
+    from dash import linear
+
+    page = linear.page_link(ws, root) or {}
+    url = page.get("url") or "not synced yet; run the status command below"
+    tool = shlex.quote(str(Path(__file__).resolve().parents[1] / "agent_dash.py"))
+    py = f"python3 {tool}"
+    return "\n".join(
+        [
+            "## Linear",
+            "",
+            f"Project: {url}",
+            "Status syncs both ways within a minute; the plan owns titles, descriptions and the tracker section.",
+            "",
+            "Your duties for this workstream:",
+            f"1. Change task status only with `{py} ws task {ws} <task-id> <status>`.",
+            f"2. After each worker verdict, post one line with `{py} ws linear comment {ws} <task-id> \"<verdict> <PR link>\"`.",
+            f"3. Put the `Fixes ...` line from `{py} ws trains {ws}` in every train PR body.",
+            f"4. Post `{py} ws linear update {ws}` before standup, or rely on `tracker.update.daily_hour` when it is set. Add `--health at-risk` or `--health off-track` when the workstream is at risk.",
+            f"5. At the start of each session, check `{py} ws linear status {ws}` and `{py} doctor`.",
+            "6. Read issues with a Linear MCP tool when one is available. Never edit issue titles or descriptions in Linear.",
+            f"7. Approvals labelled `approval` are decided by the owner in Linear or with `{py} ws approve {ws} <item-id> approved|denied`.",
+            "",
+        ]
+    )
+
+
 def start_prompt_text(ws: str, root: Path | None = None) -> str | None:
-    """Text of START-PROMPT.md, or None when the bundle has no such file."""
+    """Text of START-PROMPT.md, or None when the bundle has no such file.
+
+    A Linear-linked bundle gets the generated Linear section appended; an
+    unlinked bundle gets the file text unchanged.
+    """
     path = bundle_dir(ws, root)
     if path is None:
         return None
@@ -674,7 +711,13 @@ def start_prompt_text(ws: str, root: Path | None = None) -> str | None:
         return None
     if not text.strip():
         return None
-    return text
+    from dash import linear
+
+    if not linear.is_linked(ws, root):
+        return text
+    if not text.endswith("\n"):
+        text += "\n"
+    return text + "\n" + linear_start_section(ws, root)
 
 
 def cmd_new(ws: str, title: str, root: Path | None = None, state: str = "active") -> int:

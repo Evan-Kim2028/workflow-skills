@@ -182,6 +182,8 @@ Agents report to Linear through the same local commands they use for the plan. T
 4. Never edit issue titles or descriptions in Linear. The plan owns them (see [Daily flow](#daily-flow)).
 5. A Claude agent with the Linear MCP connection may comment on an issue or change its status directly. The sync picks up both, as it picks up any Linear change.
 
+The copied start prompt for a linked workstream includes a Linear section with these duties.
+
 ## Standup updates
 
 `ws linear update` posts one project status update to the workstream's Linear project:
