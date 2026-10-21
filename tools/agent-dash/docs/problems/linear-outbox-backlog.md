@@ -14,13 +14,15 @@ Check whether a sync is failing. A failing sync is the usual cause:
 python3 ~/.claude/tools/agent-dash/agent_dash.py ws linear status WS4
 ```
 
-If `last_error` is set, fix it first. See [linear-sync-failing](linear-sync-failing.md). If the dashboard is stopped, flush the outbox by hand:
+If `last_error` is set, fix it first. See [linear-sync-failing](linear-sync-failing.md). If the dashboard is stopped, flush the outbox by hand. This command writes to Linear, so run it on purpose:
 
 ```bash
 python3 ~/.claude/tools/agent-dash/agent_dash.py ws linear sync WS4
 ```
 
 The sync sends the current local status of each queued task, so a long queue of old rows for one task sends one update.
+
+While the read-only switch (`AGENT_DASH_READONLY=1`) is on, the poller is off by design, and `doctor` does not report this problem.
 
 ## How to verify
 

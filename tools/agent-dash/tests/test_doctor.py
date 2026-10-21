@@ -2743,12 +2743,22 @@ class LinearDoctorTest(unittest.TestCase):
         data.update(extra)
         self.linear.write_link(ws, data)
 
-    def test_unlinked_setup_raises_no_linear_codes(self):
+    def test_unlinked_setup_emits_no_linear_lines(self):
         result = self._collect(self.env_clean)
         self.assertEqual(self._linear_items(result), [])
-        check = [c for c in result["checks"] if c["name"] == "linear"]
-        self.assertEqual(len(check), 1)
-        self.assertTrue(check[0]["ok"])
+        self.assertEqual([c for c in result["checks"] if c["name"] == "linear"], [])
+
+    def test_key_missing_reports_only_the_key_code(self):
+        self._link("WS9", synced_at=self.NOW, last_error=None)
+        self.linear.enqueue("WS9", "task", "WS9.1", now=self.NOW - 700)
+        codes = [i["code"] for i in self._linear_items(self._collect(self.env_clean))]
+        self.assertEqual(codes, ["linear-key-missing"])
+
+    def test_readonly_switch_suppresses_outbox_backlog(self):
+        self._link("WS9", synced_at=self.NOW, last_error=None)
+        self.linear.enqueue("WS9", "task", "WS9.1", now=self.NOW - 700)
+        env = dict(self.env_clean, LINEAR_API_KEY="lin_test_key", AGENT_DASH_READONLY="1")
+        self.assertEqual(self._linear_items(self._collect(env)), [])
 
     def test_key_missing_when_linked_and_unset(self):
         self._link("WS9", synced_at=self.NOW - 30, last_error=None)

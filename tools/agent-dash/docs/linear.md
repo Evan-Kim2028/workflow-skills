@@ -94,10 +94,13 @@ When Linear holds a state name that the table does not list, the poller maps it 
 
 - **Status changes from either side.** Run `ws task` in the terminal, or move the issue in Linear. Both reach the other side.
 - **The poller syncs every minute.** Each cycle sends queued local changes first, then pulls Linear changes. The poller runs inside the dashboard.
-- **Whatever Linear holds last wins.** When both sides change between two syncs, the change saved last in Linear is the one that stands.
+- **Conflicts.** A local change that has not reached Linear yet wins; it is sent on the next sync. Otherwise the most recent change in Linear wins.
 - **Edit the spec in the plan.** Do not edit an issue description in Linear. Each push rewrites the description from `plan.json`, so a Linear edit to the description is lost. Status edits in Linear are kept.
 - **Put the Linear links in the pull request.** Run `ws trains <WS>`. For each train, a linked workstream prints a `Fixes ENG-…` string that names its member issues. Paste it into the train PR body. This needs Linear's GitHub integration connected to the repository. By default Linear moves linked issues to In Progress when the PR opens and to Done when it merges; set the team's pull request automation to move them to In Review on open so they match the dashboard's `pr` status.
-- **Approve from Linear.** Move the approval issue to Done to approve it, or to Canceled to deny it. The next sync writes the answer to `approvals.json`.
+- **Reopen from Linear.** Moving an issue back from Done or Canceled to an open state reopens the task locally. The next sync applies it.
+- **Tasks and dependencies removed from the plan.** The next push moves the task's issue to Canceled once, with the comment "Removed from the plan.", and stops tracking it. A `blocks` relation for a dependency the plan no longer lists is deleted.
+- **Deleted issues.** If an issue is deleted in Linear, its task is detached on the next sync. The record lists it under `detached` in the bundle's `linear.json`, and no later push recreates it. The task stays in the plan, but its status no longer syncs. `ws linear status` does not print the detached count; read the `detached` list in `linear.json`. A relink (`ws linear unlink`, then `ws linear link`) starts a new record and recreates the issue under the same id.
+- **Approve from Linear.** Move the approval issue to Done to approve it, or to Canceled to deny it. The next sync writes the answer to `approvals.json`. Anyone with access to the Linear team can approve or deny by moving the issue, not only the owner. Keep approval issues in a team limited to people who may approve. A decision made in Linear is recorded in `approvals.json` with `decided_by` set to `linear`. A decision made in the terminal records `owner`.
 - **Approve from the terminal.** `ws approve` still works. It queues the change for Linear.
 
 ## When the dashboard is not running
@@ -139,7 +142,7 @@ Only plan content leaves the machine:
 
 Nothing else is sent. Run labels, token counts, costs, prompts, and transcripts stay local. Paths appear only when the plan lists them as task files. The API key lives only in the environment. It is never written to a file, a log, or an error message.
 
-The Linear source is the dashboard's one outbound network call. It runs only for linked workstreams, and it is off under `AGENT_DASH_READONLY=1`.
+The Linear poller is the dashboard's one background network call. It runs only for linked workstreams, and it is off under `AGENT_DASH_READONLY=1`. The `ws linear` commands are explicit CLI actions and still run under that switch.
 
 ## Troubleshooting
 
