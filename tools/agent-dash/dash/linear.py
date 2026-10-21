@@ -16,10 +16,12 @@ import re
 import tempfile
 import time
 import uuid
+from datetime import date
 from pathlib import Path
 
 from dash import dataroot
 from dash.bundles import _atomic_write, _file_stamp, _read_json, bundle_dir
+from dash.orchestrate import critical_path, plan_tasks, ready_queue
 
 ENV_KEY = "LINEAR_API_KEY"
 LINK_FILE = "linear.json"
@@ -460,3 +462,190 @@ def stamp(ws: str, root: Path | None = None) -> tuple:
     if path is None:
         return (0, 0)
     return _file_stamp(path) or (0, 0)
+
+
+PROJECT_STATUS_BY_STATE: dict[str, str | None] = {
+    "planned": "Planned",
+    "active": "In Progress",
+    "paused": "Paused",
+    "done": "Completed",
+    "dropped": "Canceled",
+    "archived": None,
+}
+
+CLOSED_TASK_STATUSES = ("done", "deferred")
+
+PRIORITY_CRITICAL = 2
+PRIORITY_READY = 3
+PRIORITY_OTHER = 4
+APPROVAL_PRIORITY = 2
+
+_HEALTH_VALUES = ("onTrack", "atRisk", "offTrack")
+_DATE = re.compile(r"\d{4}-\d{2}-\d{2}")
+
+
+def _clean_text(value, limit: int | None = None) -> str | None:
+    """The stripped string, or None when it is not a non-empty string within ``limit``."""
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text or (limit is not None and len(text) > limit):
+        return None
+    return text
+
+
+def _clean_date(value) -> str | None:
+    """The value when it is an ISO calendar date (YYYY-MM-DD), else None."""
+    if not isinstance(value, str) or _DATE.fullmatch(value) is None:
+        return None
+    try:
+        date.fromisoformat(value)
+    except ValueError:
+        return None
+    return value
+
+
+def _clean_priority(value) -> int | None:
+    """The value when it is an int from 0 to 4 (Linear's scale; bool is not an int here), else None."""
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 4:
+        return None
+    return value
+
+
+def _clean_names(value) -> list[str]:
+    """Distinct non-empty label names, in order; anything that is not a list of strings gives []."""
+    if not isinstance(value, list):
+        return []
+    names: list[str] = []
+    for item in value:
+        text = _clean_text(item)
+        if text is not None and text not in names:
+            names.append(text)
+    return names
+
+
+def _clean_links(value) -> list[dict]:
+    """{'title', 'url'} rows with a title and an https url; other rows are dropped."""
+    if not isinstance(value, list):
+        return []
+    links = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        title = _clean_text(item.get("title"), 255)
+        url = _https_url(item.get("url"))
+        if title is not None and url is not None:
+            links.append({"title": title, "url": url})
+    return links
+
+
+def _clean_milestones(value) -> dict[str, dict]:
+    """{column: {'description'?, 'target_date'?}} for each column that carries a valid field."""
+    if not isinstance(value, dict):
+        return {}
+    out: dict[str, dict] = {}
+    for col, entry in value.items():
+        if not isinstance(col, str) or not col.strip() or not isinstance(entry, dict):
+            continue
+        clean: dict = {}
+        description = _clean_text(entry.get("description"))
+        if description is not None:
+            clean["description"] = description
+        target = _clean_date(entry.get("target_date"))
+        if target is not None:
+            clean["target_date"] = target
+        if clean:
+            out[col.strip()] = clean
+    return out
+
+
+def _clean_update(value) -> dict:
+    """{'health'?, 'daily_hour'?} with a known health word and an hour from 0 to 23."""
+    if not isinstance(value, dict):
+        return {}
+    clean: dict = {}
+    if value.get("health") in _HEALTH_VALUES:
+        clean["health"] = value["health"]
+    hour = value.get("daily_hour")
+    if not isinstance(hour, bool) and isinstance(hour, int) and 0 <= hour <= 23:
+        clean["daily_hour"] = hour
+    return clean
+
+
+def tracker_of(plan) -> dict:
+    """The validated ``tracker`` section of a plan, or {} when absent.
+
+    Every field is type-checked; an invalid value is dropped, and keys the
+    schema does not name are dropped too. Empty fields are omitted from the
+    result, so callers test ``in`` rather than ``None``.
+    """
+    raw = plan.get("tracker") if isinstance(plan, dict) else None
+    if not isinstance(raw, dict):
+        return {}
+    out: dict = {}
+    for key, limit in (("summary", 255), ("description", None), ("lead", None)):
+        text = _clean_text(raw.get(key), limit)
+        if text is not None:
+            out[key] = text
+    for key in ("labels", "issue_labels"):
+        names = _clean_names(raw.get(key))
+        if names:
+            out[key] = names
+    priority = _clean_priority(raw.get("priority"))
+    if priority is not None:
+        out["priority"] = priority
+    for key in ("start_date", "target_date"):
+        day = _clean_date(raw.get(key))
+        if day is not None:
+            out[key] = day
+    links = _clean_links(raw.get("links"))
+    if links:
+        out["links"] = links
+    milestones = _clean_milestones(raw.get("milestones"))
+    if milestones:
+        out["milestones"] = milestones
+    update = _clean_update(raw.get("update"))
+    if update:
+        out["update"] = update
+    return out
+
+
+def derived_priorities(plan) -> dict[str, int]:
+    """Priority per open task id: critical path 2, ready now 3, other open 4.
+
+    Open means any status other than done or deferred; closed tasks are absent
+    from the result because the sync never touches them. A critical-path task
+    that is also ready takes the higher priority (2).
+    """
+    if not isinstance(plan, dict):
+        return {}
+    by_id, _deps, _order = plan_tasks(plan)
+    critical = set(critical_path(plan))
+    ready = {row["id"] for row in ready_queue(plan)}
+    out: dict[str, int] = {}
+    for tid, task in by_id.items():
+        if task.get("status", "todo") in CLOSED_TASK_STATUSES:
+            continue
+        if tid in critical:
+            out[tid] = PRIORITY_CRITICAL
+        elif tid in ready:
+            out[tid] = PRIORITY_READY
+        else:
+            out[tid] = PRIORITY_OTHER
+    return out
+
+
+def project_status_for_state(state: str | None) -> str | None:
+    """The Linear project status name for a bundle lifecycle state, or None to leave the status alone."""
+    return PROJECT_STATUS_BY_STATE.get(state or "")
+
+
+def meta_hash(tracker: dict, state: str | None, priorities: dict[str, int], issue_labels: list[str]) -> str:
+    """sha256 of the canonical JSON of the metadata inputs; equal inputs give an equal hash."""
+    text = json.dumps(
+        {"tracker": tracker, "state": state, "priorities": priorities, "issue_labels": issue_labels},
+        sort_keys=True,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
