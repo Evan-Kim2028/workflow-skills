@@ -176,6 +176,12 @@ class FakeLinear:
     def ensure_blocks(self, blocker_issue_id, blocked_issue_id):
         self.calls.append(("blocks", blocker_issue_id, blocked_issue_id))
 
+    def find_relation(self, blocker_issue_id, blocked_issue_id):
+        return None
+
+    def issue_exists(self, issue_id):
+        return issue_id in self.issues
+
     def comment(self, issue_id, body):
         self.calls.append(("comment", issue_id, body))
 
@@ -564,6 +570,15 @@ class RecordingFake(FakeLinear):
         self.calls.append(("delete_relation", relation_id))
         self.relations.pop(relation_id, None)
 
+    def find_relation(self, blocker_issue_id, blocked_issue_id):
+        for relation_id, edge in self.relations.items():
+            if edge == (blocker_issue_id, blocked_issue_id):
+                return relation_id
+        return None
+
+    def issue_exists(self, issue_id):
+        return super().issue_exists(issue_id) and issue_id not in self.deleted
+
 
 class DeletedAndRemovedTest(LinearSyncTest):
     def setUp(self):
@@ -757,6 +772,132 @@ class LinearAtomicityTest(LinearSyncTest):
                 thread.join()
             self.assertFalse(linear.is_linked("WS9", self.root))
             self.assertFalse((bundle / linear.OUTBOX_FILE).exists(), f"iteration {i}")
+
+
+class BrokenPlanAndRelationTest(LinearSyncTest):
+    """A broken plan never mass-cancels; stale relation ids are looked up, not leaked."""
+
+    def setUp(self):
+        super().setUp()
+        self.fake = RecordingFake()
+        self._link()
+
+    def _write_plan(self, plan) -> None:
+        (self.root / "WS9" / "plan.json").write_text(json.dumps(plan), encoding="utf-8")
+
+    def _tracked(self) -> set[str]:
+        return set(self._link_record()["tasks"])
+
+    def test_missing_dag_cancels_nothing_and_records_no_error(self):
+        plan = self._plan()
+        del plan["dag"]
+        self._write_plan(plan)
+        before = self._tracked()
+        self.fake.calls.clear()
+
+        result = self._sync(self.now + 1)
+        self.assertIsNone(result["error"])
+        self.assertEqual(self._tracked(), before)
+        self.assertFalse([c for c in self.fake.calls if c[0] in ("state", "comment", "delete_relation")])
+        self.assertIsNone(self._link_record().get("last_error"))
+
+    def test_non_dict_dag_and_empty_groups_cancel_nothing(self):
+        for broken in ("oops", {"cols": [], "groups": []}, {"groups": "nope"}):
+            with self.subTest(dag=broken):
+                plan = self._plan()
+                plan["dag"] = broken
+                self._write_plan(plan)
+                before = self._tracked()
+                self.fake.calls.clear()
+                self.assertIsNone(self._sync(self.now + 1)["error"])
+                self.assertEqual(self._tracked(), before)
+                self.assertFalse([c for c in self.fake.calls if c[0] in ("state", "comment", "delete_relation")])
+
+    def test_empty_live_set_with_tracked_tasks_cancels_nothing(self):
+        plan = self._plan()
+        for group in plan["dag"]["groups"]:
+            group["tasks"] = []
+        self._write_plan(plan)
+        before = self._tracked()
+        self.fake.calls.clear()
+        self.assertIsNone(self._sync(self.now + 1)["error"])
+        self.assertEqual(self._tracked(), before)
+        self.assertFalse([c for c in self.fake.calls if c[0] == "state"])
+
+    def test_stale_null_relation_id_is_looked_up_and_deleted(self):
+        edge = "WS9.2>WS9.3"
+        blocker = linear.stable_id("task", "WS9", "WS9.2")
+        blocked = linear.stable_id("task", "WS9", "WS9.3")
+        rel_id = next(rid for rid, pair in self.fake.relations.items() if pair == (blocker, blocked))
+        record = self._link_record()
+        record["relations"][edge] = None
+        linear.write_link("WS9", record, self.root)
+        self._edit_plan_deps("WS9.3", [])
+
+        result = self._sync(self.now + 1)
+        self.assertIsNone(result["error"])
+        self.assertIn(("delete_relation", rel_id), self.fake.calls)
+        self.assertNotIn(rel_id, self.fake.relations)
+        self.assertNotIn(edge, self._link_record()["relations"])
+
+    def test_null_relation_with_no_live_relation_is_dropped_without_delete(self):
+        edge = "WS9.2>WS9.3"
+        record = self._link_record()
+        record["relations"][edge] = None
+        linear.write_link("WS9", record, self.root)
+        blocker = linear.stable_id("task", "WS9", "WS9.2")
+        blocked = linear.stable_id("task", "WS9", "WS9.3")
+        for rid, pair in list(self.fake.relations.items()):
+            if pair == (blocker, blocked):
+                del self.fake.relations[rid]
+        self._edit_plan_deps("WS9.3", [])
+        self.fake.calls.clear()
+
+        self.assertIsNone(self._sync(self.now + 1)["error"])
+        self.assertFalse([c for c in self.fake.calls if c[0] == "delete_relation"])
+        self.assertNotIn(edge, self._link_record()["relations"])
+
+    def test_create_on_duplicate_stores_the_looked_up_relation_id(self):
+        blocker = linear.stable_id("task", "WS9", "WS9.1")
+        blocked = linear.stable_id("task", "WS9", "WS9.2")
+        existing = "rel-existing"
+        for rid, pair in list(self.fake.relations.items()):
+            if pair == (blocker, blocked):
+                del self.fake.relations[rid]
+        self.fake.relations[existing] = (blocker, blocked)
+        record = self._link_record()
+        del record["relations"]["WS9.1>WS9.2"]
+        linear.write_link("WS9", record, self.root)
+        self.fake.ensure_blocks = lambda blocker_id, blocked_id: None
+        self._edit_plan_title("WS9.2", "Second task, renamed")
+
+        self.assertIsNone(self._sync(self.now + 1)["error"])
+        self.assertEqual(self._link_record()["relations"]["WS9.1>WS9.2"], existing)
+
+    def test_not_found_for_a_live_issue_is_not_detached(self):
+        def misreported(issue_id, state_id):
+            raise LinearError("NOT_FOUND", "Team not found")
+
+        self.fake.set_issue_state = misreported
+        with self._quiet():
+            bundles.set_task("WS9", "WS9.3", "pr", None, None, root=self.root)
+
+        result = self._sync(self.now + 1)
+        self.assertIsNotNone(result["error"])
+        record = self._link_record()
+        self.assertNotIn("task:WS9.3", record.get("detached") or [])
+        self.assertIn("WS9.3", record["tasks"])
+        self.assertEqual(len(linear.read_outbox("WS9", self.root)), 1)
+
+    def _edit_plan_deps(self, task_id, deps):
+        plan = self._plan()
+        next(t for g in plan["dag"]["groups"] for t in g["tasks"] if t["id"] == task_id)["deps"] = deps
+        self._write_plan(plan)
+
+    def _edit_plan_title(self, task_id, title):
+        plan = self._plan()
+        next(t for g in plan["dag"]["groups"] for t in g["tasks"] if t["id"] == task_id)["title"] = title
+        self._write_plan(plan)
 
 
 if __name__ == "__main__":

@@ -613,5 +613,80 @@ class TransportHardeningTests(unittest.TestCase):
         self.assertIn("[redacted]", scrubbed.message)
 
 
+class LookupAndStreamTests(unittest.TestCase):
+    def test_find_relation_returns_the_blocks_id_to_the_blocked_issue(self) -> None:
+        reply = _ok(
+            {
+                "issue": {
+                    "relations": {
+                        "nodes": [
+                            {"id": "rel-other", "type": "related", "relatedIssue": {"id": "i-blocked"}},
+                            {"id": "rel-wrong", "type": "blocks", "relatedIssue": {"id": "i-else"}},
+                            {"id": "rel-hit", "type": "blocks", "relatedIssue": {"id": "i-blocked"}},
+                        ]
+                    }
+                }
+            }
+        )
+        client, fake = _client([reply])
+        self.assertEqual(client.find_relation("i-blocker", "i-blocked"), "rel-hit")
+        body = fake.calls[0]["body"]
+        self.assertIn("relations(", body["query"])
+        self.assertIn("relatedIssue { id }", body["query"])
+        self.assertEqual(body["variables"], {"id": "i-blocker"})
+
+    def test_find_relation_returns_none_when_absent_or_blocker_gone(self) -> None:
+        client, _ = _client([_ok({"issue": {"relations": {"nodes": []}}})])
+        self.assertIsNone(client.find_relation("i-blocker", "i-blocked"))
+        client, _ = _client([_not_found()])
+        self.assertIsNone(client.find_relation("i-blocker", "i-blocked"))
+
+    def test_find_relation_raises_other_errors(self) -> None:
+        client, _ = _client([_err(200, [{"message": "Field is invalid"}])])
+        with self.assertRaises(lc.LinearError) as caught:
+            client.find_relation("a", "b")
+        self.assertEqual(caught.exception.code, "GRAPHQL")
+
+    def test_issue_exists_is_true_for_data_and_false_for_not_found(self) -> None:
+        client, fake = _client([_ok({"issue": {"id": "i-1"}}), _not_found(), _ok({"issue": None})])
+        self.assertTrue(client.issue_exists("i-1"))
+        self.assertIn("issue(id:", fake.calls[0]["body"]["query"])
+        self.assertEqual(fake.calls[0]["body"]["variables"], {"id": "i-1"})
+        self.assertFalse(client.issue_exists("i-gone"))
+        self.assertFalse(client.issue_exists("i-null"))
+
+    def test_issue_exists_reraises_other_errors(self) -> None:
+        client, _ = _client([_err(429, [])])
+        with self.assertRaises(lc.LinearError) as caught:
+            client.issue_exists("i-1")
+        self.assertEqual(caught.exception.code, "RATELIMITED")
+
+    def test_stream_without_read_is_a_network_error(self) -> None:
+        class Unreadable:
+            pass
+
+        with self.assertRaises(lc.LinearError) as caught:
+            lc._read_capped(Unreadable(), time.monotonic() + 5)
+        self.assertEqual(caught.exception.code, "NETWORK")
+        self.assertNotIn(KEY, caught.exception.message)
+
+    def test_stream_without_read_through_transport_is_a_network_error(self) -> None:
+        class Opened:
+            status = 200
+            headers: dict = {}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        client = lc.Client(KEY, transport=lc._urllib_transport("https://api.linear.app/graphql", 5.0, 5.0, KEY))
+        with mock.patch.object(lc._OPENER, "open", return_value=Opened()):
+            with self.assertRaises(lc.LinearError) as caught:
+                client.query("query Q { ok }")
+        self.assertEqual(caught.exception.code, "NETWORK")
+
+
 if __name__ == "__main__":
     unittest.main()

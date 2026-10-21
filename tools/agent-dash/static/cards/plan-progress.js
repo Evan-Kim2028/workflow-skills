@@ -142,11 +142,13 @@
     if (!ln) return [];
     var hit = (state.wss || []).filter(function (w) { return w.ws === plan.ws; })[0];
     var name = (hit && hit.name) || plan.ws;
-    var link = el("a", {class: "linear-link", href: ln.url, target: "_blank", rel: "noopener", "aria-label": "Open " + name + " in Linear", text: "Linear \u2197"});
+    var link = (ln.url && typeof ln.url === "string")
+      ? el("a", {class: "linear-link", href: ln.url, target: "_blank", rel: "noopener", "aria-label": "Open " + name + " in Linear", text: "Linear \u2197"})
+      : null;
     var sync = ln.synced_at == null
       ? el("span", {class: "linear-sync", text: "not synced yet"})
       : el("span", {class: "linear-sync", title: fmtDate(ln.synced_at), text: "synced " + fmtDur(now - ln.synced_at) + " ago"});
-    return [link, sync];
+    return link ? [link, sync] : [sync];
   }
   function planCard(plan, snap, opts) {
     var replayOn = !(opts && opts.replay === false);

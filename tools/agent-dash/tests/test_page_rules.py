@@ -790,6 +790,43 @@ console.log("hover builders proof ok: " + seen.length + " strings compact");
         ):
             self.assertIn(kept, card, f"plan-progress.js lost {kept!r}")
 
+    def test_linear_header_renders_no_anchor_without_a_url(self):
+        """linearHeader renders the Linear anchor only for a non-empty url;
+        a null url keeps the sync-age text and never emits href="null"."""
+        card = (STATIC / "cards" / "plan-progress.js").read_text()
+        start = card.index("function linearHeader(")
+        depth = 0
+        end = None
+        for i in range(card.index("{", start), len(card)):
+            if card[i] == "{":
+                depth += 1
+            elif card[i] == "}":
+                depth -= 1
+                if depth == 0:
+                    end = i + 1
+                    break
+        self.assertIsNotNone(end, "linearHeader body did not close")
+        script = (
+            "const assert=require('assert');"
+            "var state={wss:[]};"
+            "function el(tag,attrs){return {tag:tag,attrs:attrs||{}};}"
+            "function fmtDate(x){return 'date';}"
+            "function fmtDur(x){return '2m';}"
+            + card[start:end] + ";"
+            "var out=linearHeader({ws:'WS9',linear:{url:null,synced_at:null}},100);"
+            "assert.strictEqual(out.length,1);assert.strictEqual(out[0].tag,'span');"
+            "out=linearHeader({ws:'WS9',linear:{url:null,synced_at:50}},100);"
+            "assert.strictEqual(out.length,1);assert.strictEqual(out[0].attrs.class,'linear-sync');"
+            "out=linearHeader({ws:'WS9',linear:{url:'',synced_at:50}},100);"
+            "assert.ok(out.every(function(n){return n.tag!=='a';}));"
+            "out=linearHeader({ws:'WS9',linear:{url:'https://linear.app/x/project/y',synced_at:50}},100);"
+            "assert.strictEqual(out.length,2);assert.strictEqual(out[0].tag,'a');"
+            "assert.strictEqual(out[0].attrs.href,'https://linear.app/x/project/y');"
+            "assert.deepStrictEqual(linearHeader({ws:'WS9'},1),[]);"
+        )
+        proc = subprocess.run(["node", "-e", script], capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 0, proc.stderr or proc.stdout)
+
     def test_plan_legend_is_always_visible(self):
         """The map legend is an always-visible list under the intro line,
         not a hover-only popover: labelled Task status / Agent family /
