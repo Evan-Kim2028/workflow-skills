@@ -82,15 +82,19 @@ def _plan_extra_cached(ws: str, body: dict) -> dict:
 
 
 def _plan_map_cached(ws: str, body: dict) -> dict:
-    """``{"layout", "map_warnings"}`` cached by plan mtime."""
-    from dash import maplayout
+    """``{"layout", "map_warnings"}`` cached by plan mtime and linear.json stamp.
+
+    The layout's chip tooltips carry Linear identifiers, so a link edit
+    must miss the cache even when plan.json is untouched.
+    """
+    from dash import linear, maplayout
     from dash.bundles import bundle_dir
 
     mtime = None
     try:
         path = bundle_dir(ws)
         if path is not None:
-            mtime = (path / "plan.json").stat().st_mtime_ns
+            mtime = ((path / "plan.json").stat().st_mtime_ns, linear.stamp(ws))
     except OSError:
         mtime = None
     if mtime is not None:

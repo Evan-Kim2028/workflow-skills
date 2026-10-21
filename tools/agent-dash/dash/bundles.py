@@ -300,9 +300,12 @@ def load_bundle_api(ws: str) -> dict | None:
     }
 
 
-def _view_groups(value) -> list:
+def _view_groups(value, links: dict | None = None) -> list:
+    """Plan groups as the dashboard view carries them. ``links`` maps task id
+    to its Linear ``{identifier, url}``; a task with an entry gains ``linear``."""
     if not isinstance(value, list):
         return []
+    links = links or {}
     groups = []
     for item in value:
         if not isinstance(item, dict):
@@ -338,6 +341,8 @@ def _view_groups(value) -> list:
                 row["fresh_hours"] = fresh
             if isinstance(task.get("received_as"), str):
                 row["received_as"] = task.get("received_as")
+            if isinstance(row["id"], str) and row["id"] in links:
+                row["linear"] = links[row["id"]]
             tasks.append(row)
         groups.append({"id": item.get("id"), "col": item.get("col"), "title": item.get("title"), "tasks": tasks})
     return groups
@@ -415,13 +420,16 @@ def plans_map_stamps() -> tuple:
 
 
 def plans_stamp(root: Path | None = None) -> tuple:
-    """``(mtime_ns, size)`` of every bundle ``plan.json`` and ``bundle.json``.
+    """``(mtime_ns, size)`` of every bundle ``plan.json``, ``bundle.json`` and
+    ``linear.json``.
 
     The workstream-row cache keys on this: row progress reads the plans
     and fallback rows read bundle titles (lifecycle state rides the
     caller's metadata map), so a bundle edit retags precisely and
     untouched bundles never re-read.
     """
+    from dash import linear
+
     base = Path(root) if root is not None else workstreams_root()
     try:
         children = sorted(
@@ -432,7 +440,7 @@ def plans_stamp(root: Path | None = None) -> tuple:
     except OSError:
         return ()
     stamps = [
-        (_file_stamp(child / "plan.json"), _file_stamp(child / "bundle.json"))
+        (_file_stamp(child / "plan.json"), _file_stamp(child / "bundle.json"), linear.stamp(child.name, base))
         for child in children
     ]
     try:
@@ -452,11 +460,14 @@ def bundle_plan_view(ws: str) -> dict | None:
     """
     import copy
 
+    from dash import linear
+
     path = bundle_dir(ws)
     if path is None:
         return None
     base = str(path.parent)
     stamps = tuple(_file_stamp(path / name) for name in ("plan.json", "bundle.json", "approvals.json", "START-PROMPT.md"))
+    stamps += (linear.stamp(ws),)
     lock = _plan_view_lock()
     with lock:
         hit = _PLAN_VIEW_CACHE.get((base, ws))
@@ -476,7 +487,7 @@ def bundle_plan_view(ws: str) -> dict | None:
     for item in narrative.get("phases") or []:
         if isinstance(item, dict):
             phases.append({"name": item.get("name"), "goal": item.get("goal"), "gate": item.get("gate")})
-    groups = _view_groups(dag.get("groups"))
+    groups = _view_groups(dag.get("groups"), linear.task_links(ws))
     view = {
         "ws": ws,
         "cols": cols,
@@ -488,6 +499,9 @@ def bundle_plan_view(ws: str) -> dict | None:
         "start_prompt": start_prompt_text(ws),
         "issues": validate_bundle(ws),
     }
+    page_link = linear.page_link(ws)
+    if page_link is not None:
+        view["linear"] = page_link
     with lock:
         if len(_PLAN_VIEW_CACHE) > 256:
             _PLAN_VIEW_CACHE.clear()
