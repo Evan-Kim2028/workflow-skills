@@ -46,7 +46,12 @@
     seconds = Math.max(0, +seconds);
     if (seconds < 60) return Math.round(seconds) + "s";
     if (seconds < 3600) return Math.floor(seconds / 60) + "m " + Math.floor(seconds % 60) + "s";
-    return Math.floor(seconds / 3600) + "h " + Math.floor((seconds % 3600) / 60) + "m";
+    if (seconds < 172800) return Math.floor(seconds / 3600) + "h " + Math.floor((seconds % 3600) / 60) + "m";
+    var days = Math.floor(seconds / 86400), hours = Math.floor((seconds % 86400) / 3600);
+    if (days < 14) return days + "d " + hours + "h";
+    if (days < 365) return days + "d";
+    var years = Math.floor(days / 365), rest = days % 365;
+    return rest ? years + "y " + rest + "d" : years + "y";
   }
 
   function fmtT(t) {

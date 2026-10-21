@@ -181,6 +181,31 @@ class LinearSourceTest(unittest.TestCase):
         self._poll({"poll_budget_s": 15})
         self.assertEqual([c.args[0] for c in self.sync.call_args_list], ["WS1"])
 
+    def test_daily_update_time_counts_toward_the_budget(self):
+        self.linked.return_value = ["WS1", "WS2"]
+
+        def daily(ws, now):
+            self.clock[0] += 20
+            return None
+
+        with mock.patch("dash.linear_update.due", return_value=True), mock.patch("dash.linear_update.send_daily", side_effect=daily) as send:
+            self._poll({"poll_budget_s": 25})
+        self.assertEqual([c.args[0] for c in self.sync.call_args_list], ["WS1"])
+        self.assertEqual([c.args[0] for c in send.call_args_list], ["WS1"])
+
+    def test_daily_post_is_skipped_once_the_budget_is_spent(self):
+        self.linked.return_value = ["WS1", "WS2"]
+
+        def slow_sync(ws):
+            self.clock[0] += 20
+            return {"error": None}
+
+        self.sync.side_effect = slow_sync
+        with mock.patch("dash.linear_update.due", return_value=True), mock.patch("dash.linear_update.send_daily", return_value=None) as send:
+            self._poll({"poll_budget_s": 15})
+        self.assertEqual([c.args[0] for c in self.sync.call_args_list], ["WS1"])
+        send.assert_not_called()
+
     def test_health_extra_shape_with_linked_bundle(self):
         from dash.bundles import cmd_ws
 

@@ -3080,7 +3080,7 @@ class FinalPolishTests(unittest.TestCase):
             "var window = {};\n"
             "eval(fs.readFileSync(process.argv[2], 'utf8'));\n"
             "assert.strictEqual(window.AD.fmtDur(90), '1m 30s');\n"
-            "assert.strictEqual(window.AD.fmtDur(579599), '160h 59m');\n"
+            "assert.strictEqual(window.AD.fmtDur(579599), '6d 16h');\n"
             "assert.strictEqual(window.AD.fmtDur(359.6), '5m 59s');\n"
             "console.log('fmtDur proof ok');\n"
         )
@@ -3094,6 +3094,26 @@ class FinalPolishTests(unittest.TestCase):
             )
         self.assertEqual(proc.returncode, 0, proc.stderr or proc.stdout)
         self.assertIn("fmtDur proof ok", proc.stdout)
+
+    def test_fmt_durations_read_in_days_and_years(self):
+        """Below 48h the hour form is unchanged; from 48h durations read in
+        days ("2d 3h", then whole days to 14d) and from 365d in years."""
+        script = (
+            "const fs=require('fs');"
+            "const src=fs.readFileSync(process.argv[1],'utf8').replace('})(window);','})(global);');"
+            "eval(src);"
+            "const want=[[0,'0s'],[90,'1m 30s'],[359.6,'5m 59s'],[3599,'59m 59s'],"
+            "[172799,'47h 59m'],[172800,'2d 0h'],[183610,'2d 3h'],[579599,'6d 16h'],"
+            "[7200,'2h 0m'],[120,'2m 0s'],[1209599,'13d 23h'],[1209600,'14d'],[1227600,'14d'],[31535999,'364d'],"
+            "[31536000,'1y'],[34560000,'1y 35d'],[-5,'0s'],[NaN,'\\u2013'],[null,'\\u2013'],[undefined,'\\u2013']];"
+            "for (const [v,w] of want) { const got=AD.fmtDur(v); if (got!==w) { console.error(String(v)+' -> '+got+' want '+w); process.exit(1); } }"
+        )
+        proc = subprocess.run(
+            ["node", "-e", script, str(STATIC / "format.js")],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr or proc.stdout)
 
     def test_archive_confirm_never_uses_window_confirm(self):
         """The archive confirm is an inline popover, never window.confirm:
@@ -4294,6 +4314,14 @@ class LinearCardRulesTests(unittest.TestCase):
         self.assertIn("var(--s7)", self.js)
         self.assertIn("var(--muted)", self.js)
 
+    def test_bars_are_named_images_and_status_lookup_uses_own_keys(self):
+        self.assertIn('role: "img"', self.js)
+        self.assertIn('"aria-label": d.label + ", " + SOURCE[key].word + ": " + fmtN(n) + " changes"', self.js)
+        self.assertIn("Object.prototype.hasOwnProperty.call(STATUS_WORD, row.from)", self.js)
+        self.assertNotIn("STATUS_WORD[row.from] ||", self.js)
+        self.assertNotIn("STATUS_WORD[row.to] ||", self.js)
+
+
     def test_no_number_formatting_outside_the_helpers(self):
         self.assertNotIn("toFixed(", self.js)
         self.assertNotIn("toLocaleString(", self.js)
@@ -4321,6 +4349,61 @@ class LinearCardRulesTests(unittest.TestCase):
         self.assertEqual(len(key_line), 1)
         self.assertNotIn("Date", key_line[0])
         self.assertNotIn("Math.random", key_line[0])
+
+    def test_links_use_the_link_colour_token_with_aa_contrast(self):
+        """Linear links take --accent (never --accent-ink, which is the text-on-fill ink and vanishes on the card) pulled toward --ink so they clear 4.5:1 on the card in both themes."""
+        rule = re.search(r"\.lin-link\{[^}]*\}", self.css)
+        self.assertIsNotNone(rule, "linear.css lost the .lin-link rule")
+        self.assertNotIn("--accent-ink", rule.group(0))
+        self.assertIn("color-mix(in srgb,var(--accent) 85%,var(--ink))", rule.group(0))
+        tokens = (STATIC / "tokens.css").read_text()
+
+        def var(block, name):
+            m = re.search(block + r"\s*\{([^}]*)\}", tokens, re.S)
+            self.assertIsNotNone(m, f"tokens.css lost {block}")
+            m2 = re.search(re.escape(name) + r":\s*(#[0-9a-fA-F]{6})", m.group(1))
+            self.assertIsNotNone(m2, f"tokens.css lost {name} in {block}")
+            return m2.group(1)
+
+        def mix(a, b, p):
+            a, b = a.lstrip("#"), b.lstrip("#")
+            return "#" + "".join("%02x" % round(int(a[i:i + 2], 16) * p + int(b[i:i + 2], 16) * (1 - p)) for i in (0, 2, 4))
+
+        for theme, block in (("dark", r":root"), ("light", r':root\[data-theme="light"\]')):
+            link = mix(var(block, "--accent"), var(block, "--ink"), 0.85)
+            card = var(block, "--card")
+            ratio = _ratio(link, card)
+            self.assertGreaterEqual(ratio, 4.5, f"{theme} Linear link contrast {ratio:.2f} on the card")
+
+    def test_count_axis_ticks_are_integers(self):
+        """The count chart's y ticks land on whole numbers for every max: linScale picks a tick count that divides the niceMax ceiling."""
+        charts = (STATIC / "core" / "charts.js").read_text()
+        nice = re.search(r"  function niceMax\(v\)[^\n]*\n", charts)
+        self.assertIsNotNone(nice, "core/charts.js lost niceMax")
+        start = self.js.index("  function linScale(")
+        end = self.js.index("\n  }\n", start) + len("\n  }\n")
+        script = (
+            "const assert=require('assert');"
+            + nice.group(0)
+            + self.js[start:end]
+            + "for(var max=0;max<=5000;max++){"
+            "var sc=linScale(max);var n=sc.yTicks;"
+            "assert.ok(Number.isInteger(sc.yMax),'yMax not integer at '+max);"
+            "assert.ok(Number.isInteger(n)&&n>0,'tick count not integer at '+max);"
+            "assert.strictEqual(sc.yMax%n,0,'fractional tick at max '+max+': '+sc.yMax+'/'+n);"
+            "}"
+            "assert.strictEqual(linScale(5).yTicks,5);assert.strictEqual(linScale(3).yMax,5);"
+        )
+        proc = subprocess.run(["node", "-e", script], capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 0, proc.stderr or proc.stdout)
+        self.assertIn("yTicks: scale.yTicks", self.js)
+
+    def test_count_chart_stays_at_one_to_one_on_phones(self):
+        """The chart renders at its own pixel width (linWidth), so its 11 px axis text is not scaled down on a 390 px phone."""
+        self.assertIn("function linWidth(", self.js)
+        self.assertIn("width: W, height: H", self.js)
+        self.assertNotIn("width:100%;height:auto;display:block;max-height", self.css)
+        self.assertIn(".lin-svg{max-width:100%", self.css)
 
 
 if __name__ == "__main__":

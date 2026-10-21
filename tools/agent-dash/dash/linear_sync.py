@@ -13,6 +13,8 @@ import contextlib
 import fcntl
 import io
 import time
+from collections.abc import Callable, Iterator
+from functools import partial
 from pathlib import Path
 
 from dash import bundles, errors, lifecycle, linear, linear_auth, project
@@ -28,6 +30,8 @@ WORKFLOW_STATES = (
 )
 
 ERROR_CLIP = 200
+META_BUDGET_S = 15.0
+"""Seconds one sync cycle may spend on metadata calls before it yields; the rest resumes next cycle."""
 
 
 def _now(now: float | None) -> float:
@@ -214,10 +218,11 @@ def _recorded_id(entry: object, fallback: str) -> str:
     return fallback
 
 
-def _push(client: Client, ws: str, root: Path | None, record: dict, ws_data: dict, plan: dict, now: float, force: bool) -> int:
+def _push(client: Client, ws: str, root: Path | None, record: dict, ws_data: dict, plan: dict, now: float, force: bool,
+          out_of_time: Callable[[], bool] | None = None) -> int:
     """The spec push, then the metadata pass. Returns the spec push's upsert count."""
     count = _push_spec(client, ws, root, record, ws_data, plan, now, force)
-    _push_meta(client, ws, root, record, plan, force)
+    _push_meta(client, ws, root, record, plan, force, out_of_time)
     return count
 
 
@@ -229,41 +234,41 @@ def _lifecycle_state(ws: str, root: Path | None) -> str:
     return state if state in lifecycle.STATES else lifecycle.DEFAULT_STATE
 
 
-def _project_meta(tracker: dict, state: str, links: list[dict]) -> dict:
-    """The project metadata payload for ``update_project_meta``: only the fields the tracker sets, plus the status and new links."""
-    meta = {key: tracker[key] for key in ("summary", "description", "lead", "labels", "priority", "start_date", "target_date") if key in tracker}
-    if links:
-        meta["links"] = links
+PROJECT_FIELDS = ("summary", "description", "lead", "labels", "priority", "start_date", "target_date")
+
+
+def _project_meta(tracker: dict, state: str) -> dict:
+    """The project payload for ``update_project_meta``: the tracker's project fields plus the status."""
+    meta = {key: tracker[key] for key in PROJECT_FIELDS if key in tracker}
     status = linear.project_status_for_state(state)
     if status is not None:
         meta["status"] = status
     return meta
 
 
-def _push_meta(client: Client, ws: str, root: Path | None, record: dict, plan: dict, force: bool) -> None:
-    """Push project, milestone and issue metadata when its hash differs from the recorded ``meta_hash``.
+def _meta_parts(client: Client, ws: str, root: Path | None, record: dict, plan: dict, state: str,
+                priorities: dict, issue_labels: list) -> Iterator[tuple]:
+    """The metadata parts of one pass as ``(key, digest, call, kind, ident, ref_id)``, in a fixed order.
 
-    The hash covers the tracker section, the lifecycle state, the derived
-    priorities and the issue labels. Open tasks get their derived priority and
-    the tracker's issue labels; pending approvals get priority 2 and the approval
-    label. Links are sent once each. ``meta_hash`` and the sent link urls are
-    recorded only after every call succeeds, so a failed pass repeats in full.
+    One part per project (fields and status), per milestone, per open task
+    (derived priority and the tracker's issue labels) and per pending approval
+    (priority 2 and the approval label). A part's digest covers exactly the
+    inputs its call sends, so an unchanged part is never resent. ``kind`` and
+    ``ident`` name the local task or approval a NOT_FOUND detaches, and
+    ``ref_id`` is the Linear issue the existence check asks about.
     """
     tracker = linear.tracker_of(plan)
-    state = _lifecycle_state(ws, root)
-    priorities = linear.derived_priorities(plan)
-    issue_labels = list(tracker.get("issue_labels") or [])
-    digest = linear.meta_hash(tracker, state, priorities, issue_labels)
-    if not force and digest == record.get("meta_hash"):
-        return
     project_id = record["project"]["id"]
-    sent = set(record.get("meta_links") or [])
-    links = [link for link in tracker.get("links") or [] if link["url"] not in sent]
-    client.update_project_meta(project_id, _project_meta(tracker, state, links))
+    fields = {key: tracker[key] for key in PROJECT_FIELDS if key in tracker}
+    yield ("project", linear.part_digest({"fields": fields, "state": state}),
+           partial(client.update_project_meta, project_id, _project_meta(tracker, state)), None, None, None)
     milestones = record.get("milestones") or {}
     for col, entry in (tracker.get("milestones") or {}).items():
         if col in milestones:
-            client.update_milestone_meta(milestones[col], project_id, entry.get("description"), entry.get("target_date"))
+            description, target = entry.get("description"), entry.get("target_date")
+            yield (f"milestone:{col}", linear.part_digest({"description": description, "target_date": target}),
+                   partial(client.update_milestone_meta, milestones[col], project_id, description, target),
+                   None, None, None)
     detached = set(record.get("detached") or [])
     tasks = record.get("tasks") or {}
     for _group, task in _dag_entries(plan):
@@ -271,14 +276,67 @@ def _push_meta(client: Client, ws: str, root: Path | None, record: dict, plan: d
         if ref is None or f"task:{task['id']}" in detached or _task_status(task) in linear.CLOSED_TASK_STATUSES:
             continue
         if task["id"] in priorities:
-            client.set_issue_meta(ref["id"], issue_labels, priorities[task["id"]])
+            priority = priorities[task["id"]]
+            yield (f"task:{task['id']}", linear.part_digest({"labels": issue_labels, "priority": priority}),
+                   partial(client.set_issue_meta, ref["id"], issue_labels, priority),
+                   "task", task["id"], ref["id"])
     approvals = record.get("approvals") or {}
     for item in _approval_items(ws, root).values():
         ref = approvals.get(item.get("id"))
         if item.get("status") == "pending" and ref is not None and f"approval:{item['id']}" not in detached:
-            client.set_issue_meta(ref["id"], [linear.APPROVAL_LABEL], linear.APPROVAL_PRIORITY)
-    record["meta_hash"] = digest
-    record["meta_links"] = sorted(sent | {link["url"] for link in links})
+            digest = linear.part_digest({"labels": [linear.APPROVAL_LABEL], "priority": linear.APPROVAL_PRIORITY})
+            yield (f"approval:{item['id']}", digest,
+                   partial(client.set_issue_meta, ref["id"], [linear.APPROVAL_LABEL], linear.APPROVAL_PRIORITY),
+                   "approval", item["id"], ref["id"])
+
+
+def _push_meta(client: Client, ws: str, root: Path | None, record: dict, plan: dict, force: bool,
+               out_of_time: Callable[[], bool] | None = None) -> bool:
+    """Push project, milestone, issue and link metadata in resumable parts. Returns True once the pass is complete.
+
+    Each part's digest is recorded in ``meta_digests`` (linear.json) as its call
+    succeeds, and a part whose digest is unchanged is not sent. So a status
+    change resends only the issues whose priority moved and never rewrites the
+    project fields. A pass cut short by ``out_of_time``, or failed by a call,
+    resumes at the first unsent part next cycle. A NOT_FOUND on a task or
+    approval issue is confirmed with ``issue_exists`` and detaches it, as the
+    flush does. Links are created one call each; ``meta_links`` records each
+    url as its create succeeds.
+    """
+    tracker = linear.tracker_of(plan)
+    state = _lifecycle_state(ws, root)
+    priorities = linear.derived_priorities(plan)
+    issue_labels = list(tracker.get("issue_labels") or [])
+    digests = record.get("meta_digests")
+    if not isinstance(digests, dict):
+        digests = {}
+    record["meta_digests"] = digests
+    keys: set[str] = set()
+    for key, digest, call, kind, ident, ref_id in _meta_parts(client, ws, root, record, plan, state, priorities, issue_labels):
+        keys.add(key)
+        if not force and digests.get(key) == digest:
+            continue
+        if out_of_time is not None and out_of_time():
+            return False
+        try:
+            call()
+        except LinearError as exc:
+            if kind is None or exc.code != "NOT_FOUND" or client.issue_exists(ref_id):
+                raise
+            _detach(record, kind, ident)
+        digests[key] = digest
+    project_id = record["project"]["id"]
+    sent = set(record.get("meta_links") or [])
+    for link in tracker.get("links") or []:
+        if link["url"] in sent:
+            continue
+        if out_of_time is not None and out_of_time():
+            return False
+        client.create_link(project_id, link["url"], link["title"])
+        sent.add(link["url"])
+        record["meta_links"] = sorted(sent)
+    record["meta_digests"] = {key: value for key, value in digests.items() if key in keys}
+    return True
 
 
 def _push_spec(client: Client, ws: str, root: Path | None, record: dict, ws_data: dict, plan: dict, now: float, force: bool) -> int:
@@ -443,23 +501,60 @@ def _drift_keys(record: dict, plan: dict, items: dict) -> set:
     return drift
 
 
+def _drop_comment(record: dict) -> None:
+    """Count one agent comment that could not be posted (no Linear issue, or its task left the plan)."""
+    record["dropped_comments"] = int(record.get("dropped_comments") or 0) + 1
+
+
+def _send_status(client: Client, record: dict, kind: str, key: str, tasks: dict, approvals: dict,
+                 index: dict, items: dict, states: dict) -> int:
+    """Send one task or approval's current status. Returns 1 when sent, 0 when skipped (no issue or no plan item)."""
+    if kind == "task":
+        ref = tasks.get(key)
+        task = index.get(key)
+        if ref is None or task is None:
+            return 0
+        status = _task_status(task)
+        try:
+            client.set_issue_state(ref["id"], states[linear.STATE_FOR_STATUS[status]])
+            if status == "deferred" and not ref.get("canceled_noted"):
+                client.comment(ref["id"], _cancel_note(task))
+                ref["canceled_noted"] = True
+        except LinearError as exc:
+            if exc.code != "NOT_FOUND" or client.issue_exists(ref["id"]):
+                raise
+            _detach(record, kind, key)
+    else:
+        ref = approvals.get(key)
+        item = items.get(key)
+        if ref is None or item is None or item.get("status") not in linear.APPROVAL_STATE:
+            return 0
+        status = item["status"]
+        try:
+            client.set_issue_state(ref["id"], states[linear.APPROVAL_STATE[status]])
+        except LinearError as exc:
+            if exc.code != "NOT_FOUND" or client.issue_exists(ref["id"]):
+                raise
+            _detach(record, kind, key)
+    ref["synced_status"] = status
+    return 1
+
+
 def _flush(client: Client, ws: str, root: Path | None, record: dict, ws_data: dict) -> int:
-    """Send the current local status of every outbox key and every drift key, then drain the outbox.
+    """Send the current local status of every outbox key and every drift key, then comments, then drain.
 
-    Outbox rows are read first and the plan and approvals after them: a
-    row is written only after its plan write, so every row read is visible
-    in the later reads and the value sent is never older than the row. The
-    newest row per key wins. Drift keys (local status differs from
-    ``synced_status``, e.g. a hand edit of plan.json or a write from an older
-    CLI) are sent the same way and need no row. Keys with no mapped issue are
-    skipped. Each sent key records its status as ``synced_status``.
+    Outbox rows are read first and the plan and approvals after them: a row is
+    written only after its plan write, so every row read is visible in the later
+    reads and the value sent is never older than the row. The newest row per key
+    wins. Drift keys (local status differs from ``synced_status``) are sent the
+    same way and need no row. Keys with no mapped issue are skipped. A key whose
+    send fails keeps its rows and does not stop the other keys or the comments; the
+    first failure is raised after the comments are posted and drained.
 
-    Comment rows (``kind == "comment"``) are not part of the newest-per-key
-    rule and never touch status or drift: every one is posted, in ts order,
-    and drained by id as soon as it is posted or skipped, so a later failure
-    never reposts it. The status rows read are drained by id at the end. Rows
-    appended meanwhile stay; a failure leaves the status rows untouched and
-    the next cycle resends (state sets are idempotent).
+    Comment rows (``kind == "comment"``) are not part of the newest-per-key rule:
+    each is posted in ts order and drained as soon as it is posted, or dropped.
+    A comment is dropped, and counted in ``dropped_comments``, when its task has no
+    Linear issue, left the plan, or was deleted in Linear.
     """
     rows = linear.read_outbox(ws, root)
     plan = _plan(ws, root)
@@ -479,54 +574,40 @@ def _flush(client: Client, ws: str, root: Path | None, record: dict, ws_data: di
     index = {task["id"]: task for _group, task in _dag_entries(plan)}
     states = ws_data["states"]
     sent = 0
+    failures: list[LinearError] = []
+    done_keys: set = set()
     for kind, key in order:
-        if kind == "task":
-            ref = tasks.get(key)
-            task = index.get(key)
-            if ref is None or task is None:
-                continue
-            status = _task_status(task)
-            try:
-                client.set_issue_state(ref["id"], states[linear.STATE_FOR_STATUS[status]])
-                if status == "deferred" and not ref.get("canceled_noted"):
-                    client.comment(ref["id"], _cancel_note(task))
-                    ref["canceled_noted"] = True
-            except LinearError as exc:
-                if exc.code != "NOT_FOUND" or client.issue_exists(ref["id"]):
-                    raise
-                _detach(record, kind, key)
-        else:
-            ref = approvals.get(key)
-            item = items.get(key)
-            if ref is None or item is None or item.get("status") not in linear.APPROVAL_STATE:
-                continue
-            status = item["status"]
-            try:
-                client.set_issue_state(ref["id"], states[linear.APPROVAL_STATE[status]])
-            except LinearError as exc:
-                if exc.code != "NOT_FOUND" or client.issue_exists(ref["id"]):
-                    raise
-                _detach(record, kind, key)
-        ref["synced_status"] = status
-        sent += 1
-    done: set[str] = set()
+        try:
+            sent += _send_status(client, record, kind, key, tasks, approvals, index, items, states)
+        except LinearError as exc:
+            failures.append(exc)
+            continue
+        done_keys.add((kind, key))
+    done_ids = {row["id"] for row in status_rows if (row["kind"], row["key"]) in done_keys}
     try:
         for row in comment_rows:
             ref = tasks.get(row["key"])
-            if ref is not None and row["key"] in index:
-                try:
-                    client.comment(ref["id"], row["body"])
-                except LinearError as exc:
-                    if exc.code != "NOT_FOUND" or client.issue_exists(ref["id"]):
-                        raise
-                    _detach(record, "task", row["key"])
-                sent += 1
-            done.add(row["id"])
+            if ref is None or row["key"] not in index:
+                _drop_comment(record)
+                done_ids.add(row["id"])
+                continue
+            try:
+                client.comment(ref["id"], row["body"])
+            except LinearError as exc:
+                if exc.code != "NOT_FOUND" or client.issue_exists(ref["id"]):
+                    failures.append(exc)
+                    continue
+                _detach(record, "task", row["key"])
+                _drop_comment(record)
+                done_ids.add(row["id"])
+                continue
+            sent += 1
+            done_ids.add(row["id"])
     finally:
-        if done:
-            linear.drain_outbox(ws, done, root)
-    if status_rows:
-        linear.drain_outbox(ws, {row["id"] for row in status_rows}, root)
+        if done_ids:
+            linear.drain_outbox(ws, done_ids, root)
+    if failures:
+        raise failures[0]
     return sent
 
 
@@ -620,26 +701,48 @@ def _pull(client: Client, ws: str, root: Path | None, record: dict) -> tuple[int
     return mapped, applied
 
 
-def _cycle(ws: str, root: Path | None, client: Client, record: dict, now: float, force_push: bool) -> dict:
-    """One push, flush and pull pass. Mutates ``record``; the caller writes it."""
+def _cycle(ws: str, root: Path | None, client: Client, record: dict, now: float, force_push: bool,
+           out_of_time: Callable[[], bool] | None = None) -> dict:
+    """One spec push, metadata pass, flush and pull. Mutates ``record``; the caller writes it.
+
+    A metadata failure does not stop the flush or the pull: it comes back as
+    ``meta_error`` (None when the pass succeeded) and the caller records it.
+    """
     ws_data = linear.read_workspace()
     if ws_data is None:
         raise RuntimeError(f"workspace linear.json is missing; run: python3 agent_dash.py ws linear link {ws} --team KEY")
     plan = _plan(ws, root)
     if plan is None:
         raise RuntimeError(f"plan.json for {ws} is unreadable")
-    pushed = _push(client, ws, root, record, ws_data, plan, now, force_push)
+    pushed = _push_spec(client, ws, root, record, ws_data, plan, now, force_push)
+    meta_error = None
+    try:
+        _push_meta(client, ws, root, record, plan, force_push, out_of_time)
+    except Exception as exc:
+        meta_error = _error_text(exc)
     flushed = _flush(client, ws, root, record, ws_data)
     pulled, applied = _pull(client, ws, root, record)
-    return {"pushed": pushed, "flushed": flushed, "pulled": pulled, "applied": applied}
+    return {"pushed": pushed, "flushed": flushed, "pulled": pulled, "applied": applied, "meta_error": meta_error}
 
 
-def sync(ws: str, root: Path | None = None, client=None, now: float | None = None) -> dict:
+def _out_of_time(budget_s: float | None, clock: Callable[[], float]) -> Callable[[], bool] | None:
+    """A check that turns True once ``budget_s`` seconds of ``clock`` have passed; None when unbounded."""
+    if budget_s is None:
+        return None
+    deadline = clock() + budget_s
+    return lambda: clock() >= deadline
+
+
+def sync(ws: str, root: Path | None = None, client=None, now: float | None = None,
+         meta_budget_s: float | None = META_BUDGET_S, clock: Callable[[], float] = time.monotonic) -> dict:
     """One sync cycle under ``.linear.lock``. Never raises.
 
-    Returns {'pushed', 'flushed', 'pulled', 'applied', 'error'}. A failed cycle
-    records ``last_error`` and leaves ``synced_at`` alone; a completed one sets
-    ``synced_at`` and clears ``last_error``.
+    The metadata pass stops after ``meta_budget_s`` seconds and resumes in the
+    next cycle (the per-part ``meta_digests`` in the link record), so one cycle
+    never runs for minutes; None means unbounded. Returns {'pushed', 'flushed', 'pulled',
+    'applied', 'error'}. A failed cycle records ``last_error`` and leaves
+    ``synced_at`` alone; a completed one sets ``synced_at`` and clears
+    ``last_error``.
     """
     stamp = _now(now)
     result: dict = {"pushed": 0, "flushed": 0, "pulled": 0, "applied": 0, "error": None}
@@ -654,11 +757,19 @@ def sync(ws: str, root: Path | None = None, client=None, now: float | None = Non
                 result["error"] = f"not linked: run python3 agent_dash.py ws linear link {ws} --team KEY"
                 return result
             try:
-                counts = _cycle(ws, root, client if client is not None else _make_client(), record, stamp, False)
+                counts = _cycle(ws, root, client if client is not None else _make_client(), record, stamp, False,
+                                _out_of_time(meta_budget_s, clock))
             except Exception as exc:
                 record["last_error"] = _error_text(exc)
                 linear.write_link(ws, record, root)
                 result["error"] = record["last_error"]
+                return result
+            meta_error = counts.pop("meta_error", None)
+            if meta_error:
+                record["last_error"] = meta_error
+                linear.write_link(ws, record, root)
+                result.update(counts)
+                result["error"] = meta_error
                 return result
             record["synced_at"] = stamp
             record["last_error"] = None
@@ -744,7 +855,9 @@ def link(ws: str, team_key: str, root: Path | None = None, client=None, now: flo
             api.add_project_to_initiative(ws_data["initiative"]["id"], proj["id"])
             record["project"] = proj
             linear.write_link(ws, record, root)
-            _cycle(ws, root, api, record, stamp, True)
+            meta_error = _cycle(ws, root, api, record, stamp, True)["meta_error"]
+            if meta_error:
+                raise RuntimeError(meta_error)
             record["synced_at"] = stamp
             record["last_error"] = None
             linear.write_link(ws, record, root)
@@ -792,6 +905,7 @@ def status(ws: str, root: Path | None = None, as_json: bool = False) -> int:
         "last_error": state.get("last_error"),
         "outbox": state.get("outbox", 0),
         "linked_tasks": len(record.get("tasks") or {}),
+        "dropped_comments": int(record.get("dropped_comments") or 0),
     }
     if as_json:
         errors.emit_json(payload)
@@ -801,6 +915,7 @@ def status(ws: str, root: Path | None = None, as_json: bool = False) -> int:
     print(f"last error: {payload['last_error'] or 'none'}")
     print(f"outbox: {payload['outbox']}")
     print(f"linked tasks: {payload['linked_tasks']}")
+    print(f"dropped comments: {payload['dropped_comments']}")
     return errors.OK
 
 

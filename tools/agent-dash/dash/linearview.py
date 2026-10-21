@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import copy
 import json
+import math
 import threading
 from pathlib import Path
 
@@ -24,8 +25,27 @@ _CACHE_LOCK = threading.Lock()
 _CACHE: dict = {"key": None, "at": 0.0, "body": None}
 
 
+def _finite(value: object) -> float | None:
+    """The value as a finite float; None for a bool, a non-number, NaN, infinity or an int too large for a float.
+
+    The payload is written with allow_nan=False, so a non-finite number here would fail the whole response.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        number = float(value)
+    except OverflowError:
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _reject_constant(name: str) -> object:
+    """json.loads hook: NaN, Infinity and -Infinity are malformed lines, not numbers."""
+    raise ValueError(f"{name} is not a finite number")
+
+
 def _history_rows(path: Path) -> list[dict]:
-    """Every ``history.jsonl`` row with a numeric ``ts``, oldest first. Unreadable lines are skipped."""
+    """Every ``history.jsonl`` row with a finite numeric ``ts``, oldest first. Malformed or non-finite lines are skipped."""
     try:
         text = (path / "history.jsonl").read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError):
@@ -33,12 +53,13 @@ def _history_rows(path: Path) -> list[dict]:
     rows = []
     for line in text.splitlines():
         try:
-            row = json.loads(line)
-        except (ValueError, TypeError):
+            row = json.loads(line, parse_constant=_reject_constant)
+        except (ValueError, TypeError, RecursionError):
             continue
-        ts = row.get("ts") if isinstance(row, dict) else None
-        if isinstance(ts, bool) or not isinstance(ts, (int, float)):
+        stamp = _finite(row.get("ts")) if isinstance(row, dict) else None
+        if stamp is None:
             continue
+        row["ts"] = stamp
         rows.append(row)
     rows.sort(key=lambda row: row["ts"])
     return rows
@@ -126,10 +147,10 @@ def _workstream(bundle: dict, root: Path | None, now: float) -> dict | None:
         "ws": ws,
         "title": bundle.get("title") or ws,
         "url": page.get("url"),
-        "synced_at": state.get("synced_at"),
+        "synced_at": _finite(state.get("synced_at")),
         "last_error": state.get("last_error"),
         "outbox": int(state.get("outbox") or 0),
-        "last_update_at": link.get("last_update_at") if isinstance(link.get("last_update_at"), (int, float)) else None,
+        "last_update_at": _finite(link.get("last_update_at")),
         "recent": _recent(rows, titles),
         "pending_approvals": _pending(ws, link, root),
     }

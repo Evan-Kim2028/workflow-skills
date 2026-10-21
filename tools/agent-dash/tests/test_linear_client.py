@@ -735,10 +735,10 @@ class MetaClientTests(unittest.TestCase):
                 "start_date": "2026-10-21",
                 "target_date": "2026-12-01",
                 "labels": ["Infrastructure"],
-                "links": [{"title": "Dashboard", "url": "https://example.test/d"}],
                 "status": "In Progress",
             },
         )
+        client.create_link("proj-1", "https://example.test/d", "Dashboard")
         update = transport.inputs("ProjectUpdate")[0]
         self.assertEqual(
             update,
@@ -793,6 +793,41 @@ class MetaClientTests(unittest.TestCase):
         client.set_issue_meta("issue-1", ["Manual"], None)
         self.assertEqual([name for name, _ in transport.calls], ["IssueLabels", "LabelByName"])
 
+
+class LabelCacheTests(unittest.TestCase):
+    def test_team_label_is_resolved_once_per_client_not_per_issue(self) -> None:
+        issue = {"team": {"id": "t1"}, "labels": {"nodes": []}}
+        client, fake = _client(
+            [
+                _ok({"issue": issue}),
+                _ok({"issueLabels": {"nodes": [{"id": "L1", "name": "Infra"}]}}),
+                _ok({}),
+                _ok({"issue": issue}),
+                _ok({}),
+            ]
+        )
+        client.set_issue_meta("I1", ["Infra"], 2)
+        client.set_issue_meta("I2", ["Infra"], 3)
+        finds = [call for call in fake.calls if "issueLabels(filter:" in call["body"]["query"]]
+        self.assertEqual(len(finds), 1)
+        self.assertEqual(len(fake.calls), 5)
+
+
+
+
+class RecentUpdatesGraphqlTest(unittest.TestCase):
+    def test_lists_project_updates_created_since_the_bound(self):
+        data = {"project": {"projectUpdates": {"nodes": [
+            {"id": "u1", "body": "today", "createdAt": "2026-10-21T09:00:00.000Z"},
+            {"id": "u0", "body": "old", "createdAt": "2026-10-19T09:00:00.000Z"},
+        ]}}}
+        transport = FakeTransport([_ok(data)])
+        client = lc.Client(KEY, transport=transport)
+        out = client.recent_updates("11111111-2222-3333-4444-555555555555", "2026-10-21T00:00:00+00:00")
+        self.assertEqual([row["id"] for row in out], ["u1"])
+        sent = transport.calls[0]["body"]
+        self.assertEqual(sent["variables"]["id"], "11111111-2222-3333-4444-555555555555")
+        self.assertIn("projectUpdates", sent["query"])
 
 if __name__ == "__main__":
     unittest.main()

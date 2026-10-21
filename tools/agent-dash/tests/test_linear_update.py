@@ -12,7 +12,7 @@ import os
 import sys
 import tempfile
 import unittest
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from unittest import mock
 
@@ -71,6 +71,9 @@ class FakeClient:
     def __init__(self, error: BaseException | None = None) -> None:
         self.error = error
         self.calls: list[tuple] = []
+
+    def recent_updates(self, project_id, since_iso):
+        return []
 
     def post_update(self, project_id, body, health):
         self.calls.append((project_id, body, health))
@@ -456,6 +459,183 @@ class McpPostUpdateTest(unittest.TestCase):
         )
         self.assertEqual(update_id, "11111111-2222-3333-4444-666666666666")
 
+
+class LifecycleRowTest(unittest.TestCase):
+    def test_workstream_state_row_names_the_workstream(self) -> None:
+        rows = [{"kind": "state", "ts": 10.0, "ws": "WS4", "from": "planned", "to": "active"}]
+        lines = linear_update._changed(rows, 0.0, {}, {})
+        self.assertEqual(lines[0], "- Workstream: planned -> active")
+
+
+
+class RecentUpdatesClient(FakeClient):
+    """A fake client that lists project updates and can fail the post or the listing."""
+
+    def __init__(self, existing=(), post_error=None, list_error=None, hold=None):
+        super().__init__()
+        self.existing = list(existing)
+        self.post_error = post_error
+        self.list_error = list_error
+        self.hold = hold
+        self.held_at_post = None
+        self.listed = []
+
+    def recent_updates(self, project_id, since_iso):
+        self.listed.append((project_id, since_iso))
+        if self.list_error is not None:
+            raise self.list_error
+        return list(self.existing)
+
+    def post_update(self, project_id, body, health):
+        self.calls.append((project_id, body, health))
+        if self.hold is not None:
+            self.held_at_post = self.hold["held"]
+        if self.post_error is not None:
+            raise self.post_error
+        return "upd-new"
+
+
+def _iso(stamp):
+    return datetime.fromtimestamp(stamp, UTC).isoformat()
+
+
+class StandupSafetyTest(UpdateTest):
+    def _purpose_line(self):
+        return self._update()["body"].split("\n", 1)[0]
+
+    def test_non_finite_stamps_are_not_stamps(self):
+        self.assertIsNone(linear_update._stamp_of(float("nan")))
+        self.assertIsNone(linear_update._stamp_of(float("inf")))
+        self.assertIsNone(linear_update._stamp_of(10 ** 400))
+        self.assertEqual(linear_update._stamp_of(5), 5.0)
+
+    def test_nan_attempt_stamp_does_not_block_the_retry(self):
+        self.link["update_attempt_at"] = float("nan")
+        self.plan["tracker"] = {"update": {"daily_hour": 9}}
+        self._write()
+        self.assertTrue(linear_update.due("WS9", datetime(2026, 10, 21, 10, 30).timestamp(), root=self.root))
+
+    def test_manual_post_posts_even_when_today_has_a_matching_update(self):
+        existing = {"id": "upd-0", "body": self._purpose_line() + "\n\nEarlier text", "createdAt": _iso(NOW - 600)}
+        client = RecentUpdatesClient(existing=[existing])
+        rc, out = self._post(client)
+        self.assertEqual(rc, errors.OK)
+        self.assertEqual(len(client.calls), 1)
+        self.assertEqual(client.listed, [])
+        self.assertIn("posted Linear project update for WS9", out)
+        self.assertEqual(self._link()["last_update_at"], NOW)
+
+    def test_daily_post_dedupes_against_a_matching_update_from_today(self):
+        existing = {"id": "upd-0", "body": self._purpose_line() + "\n\nEarlier text", "createdAt": _iso(NOW - 600)}
+        client = RecentUpdatesClient(existing=[existing])
+        self.assertIsNone(linear_update.send_daily("WS9", NOW, self.root, client))
+        self.assertEqual(client.calls, [])
+        self.assertEqual(self._link()["last_update_at"], NOW)
+
+    def test_yesterdays_update_with_the_same_purpose_is_not_reused(self):
+        existing = {"id": "upd-0", "body": self._purpose_line() + "\n\nOld", "createdAt": _iso(datetime(2026, 10, 20, 23, 0).timestamp())}
+        client = RecentUpdatesClient(existing=[existing])
+        rc, _out = self._post(client)
+        self.assertEqual(rc, errors.OK)
+        self.assertEqual(len(client.calls), 1)
+
+    def test_a_different_purpose_line_is_not_reused(self):
+        existing = {"id": "upd-0", "body": "Something else entirely\n\nOld", "createdAt": _iso(NOW - 600)}
+        client = RecentUpdatesClient(existing=[existing])
+        self._post(client)
+        self.assertEqual(len(client.calls), 1)
+
+    def test_ambiguous_timeout_then_retry_does_not_repost(self):
+        self._write()
+        client = RecentUpdatesClient(post_error=TimeoutError("read timed out"))
+        error = linear_update.send_daily("WS9", NOW, self.root, client)
+        self.assertIn("TimeoutError", error)
+        self.assertEqual(len(client.calls), 1)
+        client.post_error = None
+        client.existing = [{"id": "upd-0", "body": self._purpose_line() + "\n\nCommitted", "createdAt": _iso(NOW)}]
+        self.assertIsNone(linear_update.send_daily("WS9", NOW + linear_update.RETRY_S, self.root, client))
+        self.assertEqual(len(client.calls), 1)
+        self.assertEqual(self._link()["last_update_at"], NOW + linear_update.RETRY_S)
+
+    def test_listing_failure_posts_nothing(self):
+        client = RecentUpdatesClient(list_error=LinearError("NETWORK", "down"))
+        error = linear_update.send_daily("WS9", NOW, self.root, client)
+        self.assertEqual(error, "NETWORK: down")
+        self.assertEqual(client.calls, [])
+        self.assertEqual(self._link()["update_attempt_at"], NOW)
+
+    def test_write_failure_after_the_post_does_not_repost_a_minute_later(self):
+        self._write()
+        client = RecentUpdatesClient()
+        real = linear.write_link
+
+        def flaky(ws, data, root=None):
+            if data.get("last_update_at") == NOW:
+                raise OSError("disk full")
+            return real(ws, data, root)
+
+        with mock.patch("dash.linear.write_link", side_effect=flaky):
+            error = linear_update.send_daily("WS9", NOW, self.root, client)
+        self.assertIn("disk full", error)
+        self.assertEqual(len(client.calls), 1)
+        client.existing = [{"id": "upd-new", "body": self._purpose_line() + "\n\nPosted", "createdAt": _iso(NOW)}]
+        linear_update.send_daily("WS9", NOW + 60, self.root, client)
+        self.assertEqual(len(client.calls), 1)
+
+    def test_daily_post_runs_under_the_sync_lock(self):
+        state = {"held": False}
+
+        @contextlib.contextmanager
+        def fake_lock(path):
+            state["held"] = True
+            try:
+                yield
+            finally:
+                state["held"] = False
+
+        client = RecentUpdatesClient(hold=state)
+        with mock.patch("dash.linear_sync._sync_lock", fake_lock):
+            self.assertIsNone(linear_update.send_daily("WS9", NOW, self.root, client))
+        self.assertTrue(client.held_at_post)
+
+    def test_manual_post_runs_under_the_sync_lock(self):
+        state = {"held": False}
+
+        @contextlib.contextmanager
+        def fake_lock(path):
+            state["held"] = True
+            try:
+                yield
+            finally:
+                state["held"] = False
+
+        client = RecentUpdatesClient(hold=state)
+        with mock.patch("dash.linear_sync._sync_lock", fake_lock):
+            rc, _out = self._post(client)
+        self.assertEqual(rc, errors.OK)
+        self.assertTrue(client.held_at_post)
+
+    def test_daily_recheck_inside_the_lock_skips_a_day_already_posted(self):
+        self.link["last_update_at"] = NOW - 600
+        self._write()
+        client = RecentUpdatesClient()
+        self.assertIsNone(linear_update.send_daily("WS9", NOW, self.root, client))
+        self.assertEqual(client.calls, [])
+
+    def test_unlinked_project_stamps_the_attempt(self):
+        self.link = {k: v for k, v in self.link.items() if k != "project"}
+        self._write()
+        error = linear_update.send_daily("WS9", NOW, self.root, RecentUpdatesClient())
+        self.assertIn("not linked", error)
+        self.assertEqual(self._link()["update_attempt_at"], NOW)
+
+    def test_plan_text_is_escaped_for_markdown(self):
+        self.plan["dag"]["groups"][0]["tasks"][1]["title"] = "# Wire *the* @team\n- [loader](x) `code`"
+        self.approvals["items"][0]["step"] = "> Approve_the_load\n\n@here"
+        body = self._update()["body"]
+        self.assertIn(r"\# Wire \*the\* \@team - \[loader\]\(x\) \`code\`", body)
+        self.assertIn(r"- \> Approve\_the\_load \@here", body)
+        self.assertNotRegex(body, r"(?<!\\)@")
 
 if __name__ == "__main__":
     unittest.main()

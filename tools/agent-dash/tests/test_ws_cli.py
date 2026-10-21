@@ -1000,11 +1000,53 @@ class WsLinearCommentCliTest(unittest.TestCase):
         self.assertIn("2001", out)
         self.assertEqual(self._outbox(), [])
 
-    def test_refuses_unknown_bundle_and_team_flag(self):
+    def test_refuses_unknown_bundle(self):
         self._link_file()
         self.assertEqual(self._run(["linear", "comment", "NOPE", "WS9.1", "hi"])[0], errors.NOT_FOUND)
-        self.assertEqual(self._run(["linear", "comment", "WS9", "WS9.1", "hi", "--team", "ENG"])[0], errors.USAGE)
         self.assertEqual(self._outbox(), [])
+
+
+class WsLinearCommentTextTest(unittest.TestCase):
+    """Comment text after ``<WS> <TASK-ID>`` is verbatim: option-looking words are never parsed."""
+
+    setUp = WsLinearCliTest.setUp
+    tearDown = WsLinearCliTest.tearDown
+    _link_file = WsLinearCliTest._link_file
+    _outbox = WsLinearCliTest._outbox
+    _run = WsLinearCliTest._run
+
+    def _bodies(self):
+        return [row["body"] for row in self._outbox()]
+
+    def test_trailing_json_stays_in_text(self):
+        self._link_file()
+        rc, _ = self._run(["linear", "comment", "WS9", "WS9.1", "fine", "text", "--json"])
+        self.assertEqual(rc, errors.OK)
+        self.assertEqual(self._bodies(), ["fine text --json"])
+
+    def test_team_flag_stays_in_text(self):
+        self._link_file()
+        rc, _ = self._run(["linear", "comment", "WS9", "WS9.1", "deploy", "with", "--team", "X"])
+        self.assertEqual(rc, errors.OK)
+        self.assertEqual(self._bodies(), ["deploy with --team X"])
+
+    def test_dry_run_stays_in_text(self):
+        self._link_file()
+        rc, _ = self._run(["linear", "comment", "WS9", "WS9.1", "--dry-run", "kept"])
+        self.assertEqual(rc, errors.OK)
+        self.assertEqual(self._bodies(), ["--dry-run kept"])
+
+    def test_double_dash_ends_options_and_is_dropped(self):
+        self._link_file()
+        rc, _ = self._run(["linear", "comment", "WS9", "WS9.1", "--", "-- leading dash text"])
+        self.assertEqual(rc, errors.OK)
+        self.assertEqual(self._bodies(), ["-- leading dash text"])
+
+    def test_leading_dash_text_after_double_dash(self):
+        self._link_file()
+        rc, _ = self._run(["linear", "comment", "WS9", "WS9.1", "--", "-x", "--json"])
+        self.assertEqual(rc, errors.OK)
+        self.assertEqual(self._bodies(), ["-x --json"])
 
 
 if __name__ == "__main__":

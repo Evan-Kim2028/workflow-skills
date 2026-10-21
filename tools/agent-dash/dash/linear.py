@@ -21,7 +21,7 @@ from pathlib import Path
 
 from dash import dataroot
 from dash.bundles import _atomic_write, _file_stamp, _read_json, bundle_dir
-from dash.orchestrate import critical_path, plan_tasks, ready_queue
+from dash.orchestrate import _groups_of, critical_path, plan_tasks, ready_queue
 
 ENV_KEY = "LINEAR_API_KEY"
 LINK_FILE = "linear.json"
@@ -614,13 +614,15 @@ def derived_priorities(plan) -> dict[str, int]:
     """Priority per open task id: critical path 2, ready now 3, other open 4.
 
     Open means any status other than done or deferred; closed tasks are absent
-    from the result because the sync never touches them. A critical-path task
-    that is also ready takes the higher priority (2).
+    from the result because the sync never touches them. Ready is the
+    ``ready_queue`` rule (status todo, every dep satisfied). The critical path
+    is computed over the open tasks only, so closed tasks never shape it. A
+    critical-path task that is also ready takes the higher priority (2).
     """
     if not isinstance(plan, dict):
         return {}
     by_id, _deps, _order = plan_tasks(plan)
-    critical = set(critical_path(plan))
+    critical = set(critical_path(_open_body(plan)))
     ready = {row["id"] for row in ready_queue(plan)}
     out: dict[str, int] = {}
     for tid, task in by_id.items():
@@ -635,17 +637,26 @@ def derived_priorities(plan) -> dict[str, int]:
     return out
 
 
+def _open_body(plan: dict) -> dict:
+    """A plan body holding only the open tasks (no done or deferred ones), in the same group shape."""
+    groups = []
+    for group in _groups_of(plan):
+        tasks = group.get("tasks") if isinstance(group, dict) else None
+        open_tasks = [
+            task
+            for task in tasks or []
+            if isinstance(task, dict) and task.get("status", "todo") not in CLOSED_TASK_STATUSES
+        ]
+        groups.append({"tasks": open_tasks})
+    return {"groups": groups}
+
+
 def project_status_for_state(state: str | None) -> str | None:
     """The Linear project status name for a bundle lifecycle state, or None to leave the status alone."""
     return PROJECT_STATUS_BY_STATE.get(state or "")
 
 
-def meta_hash(tracker: dict, state: str | None, priorities: dict[str, int], issue_labels: list[str]) -> str:
-    """sha256 of the canonical JSON of the metadata inputs; equal inputs give an equal hash."""
-    text = json.dumps(
-        {"tracker": tracker, "state": state, "priorities": priorities, "issue_labels": issue_labels},
-        sort_keys=True,
-        ensure_ascii=False,
-        separators=(",", ":"),
-    )
+def part_digest(payload) -> str:
+    """sha256 of the canonical JSON of one metadata part; equal payloads give an equal digest."""
+    text = json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
     return hashlib.sha256(text.encode("utf-8")).hexdigest()

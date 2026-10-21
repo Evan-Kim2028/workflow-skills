@@ -136,5 +136,56 @@ class LinearViewTest(unittest.TestCase):
         self.assertEqual(len(linearview.cached(NOW, self.root)["workstreams"]), 1)
 
 
+
+class BadHistoryRowsTest(unittest.TestCase):
+    """A NaN, Infinity, overflowing or malformed history line never reaches the payload, and the payload stays strict JSON."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        linearview._CACHE.update({"key": None, "at": 0.0, "body": None})
+        status = mock.patch("dash.linearview.linear_auth.status", return_value={"method": "oauth", "issuer": "x", "expires_at": None})
+        status.start()
+        self.addCleanup(status.stop)
+
+    def _history(self, lines):
+        _bundle(self.root, "WS5", "Cutover", rows=None)
+        _write(self.root / "WS5" / "history.jsonl", "".join(line + "\n" for line in lines))
+
+    def test_non_finite_and_overflowing_stamps_are_skipped_and_payload_is_strict_json(self):
+        good = json.dumps({"ts": NOW - 60, "task": "WS5.a", "from": "todo", "to": "wip"})
+        bad = [
+            '{"ts": NaN, "task": "WS5.a", "to": "wip"}',
+            '{"ts": Infinity, "task": "WS5.a", "to": "wip"}',
+            '{"ts": -Infinity, "task": "WS5.a", "to": "wip"}',
+            '{"ts": 1e400, "task": "WS5.a", "to": "wip"}',
+            '{"ts": ' + "9" * 400 + ', "task": "WS5.a", "to": "wip"}',
+        ]
+        self._history([good, *bad])
+        body = linearview.build(NOW, self.root)
+        text = json.dumps(body, allow_nan=False)
+        ws = body["workstreams"][0]
+        self.assertEqual(ws["changes_24h"], {"local": 1, "linear": 0})
+        self.assertEqual(len(ws["recent"]), 1)
+        self.assertNotIn("NaN", text)
+
+    def test_malformed_lines_are_skipped_including_deep_nesting(self):
+        good = json.dumps({"ts": NOW - 60, "task": "WS5.a", "from": "todo", "to": "wip"})
+        self._history([good, "[" * 100000, '{"ts": 1,', "null", "[1, 2]", '"text"'])
+        body = linearview.build(NOW, self.root)
+        self.assertEqual(len(body["workstreams"][0]["recent"]), 1)
+        json.dumps(body, allow_nan=False)
+
+    def test_non_finite_last_update_is_not_passed_through(self):
+        self._history([])
+        link = json.loads((self.root / "WS5" / "linear.json").read_text(encoding="utf-8"))
+        link["last_update_at"] = float("nan")
+        link["synced_at"] = float("inf")
+        _write(self.root / "WS5" / "linear.json", json.dumps(link))
+        body = linearview.build(NOW, self.root)
+        json.dumps(body, allow_nan=False)
+        self.assertIsNone(body["workstreams"][0]["last_update_at"])
+
 if __name__ == "__main__":
     unittest.main()
