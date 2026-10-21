@@ -35,7 +35,8 @@ wave numbers never gate it.
 ## Principles (ordered by measured impact)
 
 1. **Keep the ready queue empty.** Idle ready tasks were up to 95% of the
-   clock in the worst case. Check: ready count on the Plan page is 0.
+   clock in the worst case. Refill on every finish, before any other step.
+   Check: ready count on the Plan page is 0, or running count sits at the cap.
 2. **Never launch past an unfinished dependency.** Dozens of tasks started
    before a dep finished and paid it back in rework. Check: `ws next` lists
    the task, i.e. every dep is done or merged.
@@ -64,6 +65,39 @@ wave numbers never gate it.
 12. **Cross-workstream holds go through the hub with a deadline.** Holds were
     the binding constraint everywhere measured. Check: waiting tasks name the
     hub relay and the date they resume; local ready work runs meanwhile.
+
+## Throughput rules
+
+Added after the measured twelve, so they carry no measurements yet. They
+follow from the twelve and the loop. Each one ends in a check that names an
+observable. Numbered T1 to T5 so the measured numbering stays stable.
+
+- **T1. Never idle.** On every worker completion, read only that report, move
+  its status, and launch the next ready batch in the same turn. Keep running
+  workers at the cap while ready work exists; no turn ends with ready work and
+  free capacity. Check: ready count and running count on the dashboard, with
+  running at the cap or ready at 0.
+- **T2. Break sequential chains.** Run read-only research, review and
+  verification beside the writers. Split a long serial task into one interface
+  task plus parallel implementers (principle 3). Put every wait on a background
+  watcher, never in the foreground. Check: critical path length in `ws next`
+  or the Plan page is shorter than the previous wave's; no foreground sleeps in
+  any lead session.
+- **T3. Production in batches by area.** Group production steps by area: host,
+  service, table family, or schedule. Run independent areas in parallel and
+  serialize only within an area. Each batch has one owner approval row, one
+  rollback line, and a named verification signal, and lands in a quiet window.
+  Check: every production step belongs to a batch with an area, an approval
+  row, and a rollback line; no two batches touch the same area at once.
+- **T4. Ship continuously.** Commit per task. Push the branch or train when its
+  local gate passes, open the PR, merge on the green local gate, and move status
+  in the same step (principle 10). Finished work never sits unpushed. Check: no
+  `done` task without a merged PR or a recorded reason; `git log origin/main`
+  contains the work.
+- **T5. Keep the tracker in step.** On a Linear-linked workstream, change status
+  with `ws task`, post results with `ws linear comment`, and post the standup
+  update before standup. Check: `ws linear status` shows an empty outbox and no
+  error.
 
 ## Anti-patterns (symptom → rule broken)
 
