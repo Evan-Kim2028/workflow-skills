@@ -205,6 +205,12 @@ query IssueRelations($id: String!) {
 }
 """
 
+PROJECT_UPDATE_CREATE = """
+mutation ProjectUpdateCreate($input: ProjectUpdateCreateInput!) {
+  projectUpdateCreate(input: $input) { success projectUpdate { id } }
+}
+"""
+
 COMMENT_CREATE = """
 mutation CommentCreate($input: CommentCreateInput!) {
   commentCreate(input: $input) { success }
@@ -226,6 +232,56 @@ query ProjectIssues($filter: IssueFilter, $first: Int, $after: String) {
 }
 """
 
+
+PROJECT_DETAIL = """
+query ProjectDetail($id: String!) {
+  project(id: $id) { labels(first: 250) { nodes { id name } } }
+}
+"""
+
+PROJECT_LABEL_FIND = """
+query ProjectLabelByName($name: String!) {
+  projectLabels(filter: {name: {eq: $name}}, first: 10) { nodes { id name } }
+}
+"""
+
+PROJECT_LABEL_CREATE = """
+mutation ProjectLabelCreate($input: ProjectLabelCreateInput!) {
+  projectLabelCreate(input: $input) { success projectLabel { id } }
+}
+"""
+
+PROJECT_STATUSES = """
+query ProjectStatuses {
+  projectStatuses(first: 50) { nodes { id name } }
+}
+"""
+
+USER_FIND = """
+query UserByName($name: String!) {
+  users(filter: {or: [{name: {eq: $name}}, {displayName: {eq: $name}}]}, first: 5) {
+    nodes { id name displayName }
+  }
+}
+"""
+
+LINK_CREATE = """
+mutation EntityExternalLinkCreate($input: EntityExternalLinkCreateInput!) {
+  entityExternalLinkCreate(input: $input) { success }
+}
+"""
+
+MILESTONE_UPDATE = """
+mutation ProjectMilestoneUpdate($id: String!, $input: ProjectMilestoneUpdateInput!) {
+  projectMilestoneUpdate(id: $id, input: $input) { success }
+}
+"""
+
+ISSUE_LABELS = """
+query IssueLabels($id: String!) {
+  issue(id: $id) { team { id } labels(first: 250) { nodes { id name } } }
+}
+"""
 
 class LinearError(Exception):
     """A Linear call failed.
@@ -650,6 +706,15 @@ class Client:
         """Add a comment to an issue."""
         self.query(COMMENT_CREATE, {"input": {"issueId": issue_id, "body": body}})
 
+    def post_update(self, project_id: str, body: str, health: str) -> str | None:
+        """Create a project status update with a markdown body and a health enum (onTrack, atRisk, offTrack). Returns its id."""
+        data = self.query(PROJECT_UPDATE_CREATE, {"input": {"projectId": project_id, "body": body, "health": health}})
+        payload = data["projectUpdateCreate"]
+        if not payload.get("success"):
+            raise LinearError("GRAPHQL", "project update was not saved")
+        update = payload.get("projectUpdate") or {}
+        return update.get("id")
+
     def issues_updated_since(self, project_id: str, since_iso: str | None) -> list[dict]:
         """Return every issue in the project updated after ``since_iso``, ordered by updatedAt.
 
@@ -678,3 +743,89 @@ class Client:
                 raise self._error("GRAPHQL", "pagination cursor repeated")
             seen.add(after)
         raise self._error("GRAPHQL", f"pagination exceeded {MAX_PAGES} pages")
+
+
+    def _ensure_project_label(self, name: str) -> str:
+        """The id of a workspace project label with this exact name, created when missing."""
+        nodes = self.query(PROJECT_LABEL_FIND, {"name": name})["projectLabels"]["nodes"]
+        for node in nodes:
+            if node["name"] == name:
+                return node["id"]
+        created = self.query(PROJECT_LABEL_CREATE, {"input": {"name": name}})
+        return created["projectLabelCreate"]["projectLabel"]["id"]
+
+    def _project_status_id(self, name: str) -> str | None:
+        """The id of the workspace project status with this exact name, or None when there is none."""
+        nodes = self.query(PROJECT_STATUSES)["projectStatuses"]["nodes"]
+        return next((node["id"] for node in nodes if node["name"] == name), None)
+
+    def _user_id(self, name: str) -> str | None:
+        """The id of the user whose name or display name is exactly this value, or None."""
+        nodes = self.query(USER_FIND, {"name": name})["users"]["nodes"]
+        return next((node["id"] for node in nodes if name in (node.get("name"), node.get("displayName"))), None)
+
+    def update_project_meta(self, project_id: str, meta: dict) -> None:
+        """Set project metadata from a dict with any of: summary, description, lead, labels, priority, start_date, target_date, links, status.
+
+        Summary maps to the short ``description`` field and description to the long ``content``.
+        Labels are appended to the project's current labels, which are never removed. Links are
+        appended as external links. A lead or status name that Linear does not know is skipped.
+        """
+        update: dict = {}
+        if meta.get("summary"):
+            update["description"] = meta["summary"]
+        if meta.get("description"):
+            update["content"] = meta["description"]
+        if meta.get("priority") is not None:
+            update["priority"] = meta["priority"]
+        if meta.get("start_date"):
+            update["startDate"] = meta["start_date"]
+        if meta.get("target_date"):
+            update["targetDate"] = meta["target_date"]
+        if meta.get("lead"):
+            lead_id = self._user_id(meta["lead"])
+            if lead_id is not None:
+                update["leadId"] = lead_id
+        if meta.get("labels"):
+            ids = [node["id"] for node in self.query(PROJECT_DETAIL, {"id": project_id})["project"]["labels"]["nodes"]]
+            for name in meta["labels"]:
+                label_id = self._ensure_project_label(name)
+                if label_id not in ids:
+                    ids.append(label_id)
+            update["labelIds"] = ids
+        if meta.get("status"):
+            status_id = self._project_status_id(meta["status"])
+            if status_id is not None:
+                update["statusId"] = status_id
+        if update:
+            self.query(PROJECT_UPDATE, {"id": project_id, "input": update})
+        for link in meta.get("links") or []:
+            self.query(LINK_CREATE, {"input": {"projectId": project_id, "url": link["url"], "label": link["title"]}})
+
+    def update_milestone_meta(self, milestone_id: str, project_id: str, description: str | None, target_date: str | None) -> None:
+        """Set a milestone's description and target date. ``project_id`` is accepted for signature parity with the MCP client."""
+        update = _drop_none({"description": description, "targetDate": target_date})
+        if update:
+            self.query(MILESTONE_UPDATE, {"id": milestone_id, "input": update})
+
+    def set_issue_meta(self, issue_id: str, add_labels: list[str], priority: int | None) -> None:
+        """Append labels to an issue (creating missing team labels) and set its priority.
+
+        The issue's current labels are kept; only names not yet on the issue are added.
+        """
+        update: dict = {}
+        if add_labels:
+            node = self.query(ISSUE_LABELS, {"id": issue_id})["issue"]
+            ids = [label["id"] for label in node["labels"]["nodes"]]
+            added = False
+            for name in add_labels:
+                label_id = self.ensure_label(node["team"]["id"], name)
+                if label_id not in ids:
+                    ids.append(label_id)
+                    added = True
+            if added:
+                update["labelIds"] = ids
+        if priority is not None:
+            update["priority"] = priority
+        if update:
+            self.query(ISSUE_UPDATE, {"id": issue_id, "input": update})

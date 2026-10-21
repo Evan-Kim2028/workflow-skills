@@ -521,5 +521,44 @@ class TestCommandRenderTest(unittest.TestCase):
         self.assertNotIn("`.`", text)
 
 
+class EnqueueCommentTest(LinearTestBase):
+    def test_comment_row_shape_and_trim(self):
+        write_link("WS9", _link_data(), root=self.root)
+        linear.enqueue_comment("WS9", "WS9.1", "  verdict PASS, PR #1  ", root=self.root, now=5.0)
+        rows = read_outbox("WS9", root=self.root)
+        self.assertEqual([{k: v for k, v in row.items() if k != "id"} for row in rows], [
+            {"ts": 5.0, "kind": "comment", "key": "WS9.1", "body": "verdict PASS, PR #1"},
+        ])
+        self.assertTrue(rows[0]["id"])
+
+    def test_comment_limit_is_2000_characters(self):
+        write_link("WS9", _link_data(), root=self.root)
+        linear.enqueue_comment("WS9", "WS9.1", "x" * 2000, root=self.root, now=1.0)
+        with self.assertRaises(ValueError):
+            linear.enqueue_comment("WS9", "WS9.1", "x" * 2001, root=self.root, now=2.0)
+        self.assertEqual([len(row["body"]) for row in read_outbox("WS9", root=self.root)], [2000])
+
+    def test_empty_text_is_refused(self):
+        write_link("WS9", _link_data(), root=self.root)
+        with self.assertRaises(ValueError):
+            linear.enqueue_comment("WS9", "WS9.1", "   \n ", root=self.root, now=1.0)
+        self.assertEqual(read_outbox("WS9", root=self.root), [])
+
+    def test_unlinked_bundle_is_refused_without_a_file(self):
+        with self.assertRaises(ValueError):
+            linear.enqueue_comment("WS9", "WS9.1", "hello", root=self.root, now=1.0)
+        self.assertFalse((self.bundle / "linear-outbox.jsonl").exists())
+
+    def test_comment_rows_do_not_count_as_pending_status(self):
+        write_link("WS9", _link_data(), root=self.root)
+        linear.enqueue_comment("WS9", "WS9.1", "hello", root=self.root, now=1.0)
+        self.assertFalse(has_pending("WS9", "task", "WS9.1", root=self.root))
+
+    def test_comment_row_without_body_is_skipped(self):
+        write_link("WS9", _link_data(), root=self.root)
+        (self.bundle / "linear-outbox.jsonl").write_text('{"ts": 1.0, "kind": "comment", "key": "WS9.1"}\n', encoding="utf-8")
+        self.assertEqual(read_outbox("WS9", root=self.root), [])
+
+
 if __name__ == "__main__":
     unittest.main()

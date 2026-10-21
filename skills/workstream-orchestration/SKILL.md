@@ -98,6 +98,10 @@ board.
   killed runs leave no report and their cost is lost. → Never wait, never
   kill to rescope; launch a separate run.
 
+## Linear reporting
+
+On a Linear-linked workstream, each worker reports its verdict and PR link with `ws linear comment <ID> <task-id> "<verdict and PR link>"`. Comments never change status; move the status with `ws task`. Keep each comment to a verdict and links, because the text is sent to Linear. See [Agents and Linear](../../tools/agent-dash/docs/linear.md#agents-and-linear).
+
 ## Handoff and context
 
 At ~250k context or a milestone, write `reports/<ID>/state.md`: done,

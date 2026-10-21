@@ -656,6 +656,11 @@ class McpClient:
         """Add a comment to an issue."""
         self._tool("save_comment", {"issueId": self._real(issue_id), "body": body})
 
+    def post_update(self, project_id: str, body: str, health: str) -> str | None:
+        """Create a project status update (save_status_update) with a markdown body and a health enum. Returns its id."""
+        value = self._tool("save_status_update", {"type": "project", "project": project_id, "body": body, "health": health})
+        return _uuid_of(value)
+
     def _change(self, row: dict) -> dict:
         """One pulled issue as the sync reads it: id, identifier, url, updatedAt and a state."""
         status = row.get("status") if isinstance(row.get("status"), str) else None
@@ -692,3 +697,70 @@ class McpClient:
         changes.sort(key=lambda change: str(change.get("updatedAt") or ""))
         return changes
 
+    def _ensure_project_label(self, name: str) -> None:
+        """Create a workspace project label with this exact name when no label has it."""
+        rows = _rows(self._tool("list_project_labels", {"name": name, "limit": PAGE}), "labels")
+        if any(row.get("name") == name for row in rows):
+            return
+        self._tool("save_project_label", {"name": name})
+
+    def _set_project_labels(self, project_id: str, names: list[str]) -> None:
+        """Append project labels to the project's current set. Skipped when Linear does not return the current labels, since a replace could drop them."""
+        if not names:
+            return
+        value = self._tool("get_project", {"query": project_id})
+        current = value.get("labels") if isinstance(value, dict) else None
+        if not isinstance(current, list):
+            return
+        existing = _label_names({"labels": current})
+        wanted = [name for name in names if name not in existing]
+        if not wanted:
+            return
+        for name in wanted:
+            self._ensure_project_label(name)
+        self._tool("save_project", {"id": project_id, "labels": existing + wanted})
+
+    def update_project_meta(self, project_id: str, meta: dict) -> None:
+        """Set project metadata from a dict with any of: summary, description, lead, labels, priority, start_date, target_date, links, status.
+
+        Summary and description map to the project's ``summary`` and ``description``. Labels are
+        appended (see ``_set_project_labels``) and links are appended by Linear. A status name the
+        workspace does not have is skipped, not failed.
+        """
+        fields = _drop_none(
+            {
+                "id": project_id,
+                "summary": meta.get("summary"),
+                "description": meta.get("description"),
+                "lead": meta.get("lead"),
+                "priority": meta.get("priority"),
+                "startDate": meta.get("start_date"),
+                "targetDate": meta.get("target_date"),
+                "links": meta.get("links") or None,
+            }
+        )
+        if len(fields) > 1:
+            self._tool("save_project", fields)
+        self._set_project_labels(project_id, list(meta.get("labels") or []))
+        status = meta.get("status")
+        if status:
+            try:
+                self._tool("save_project", {"id": project_id, "state": status})
+            except LinearError as exc:
+                if exc.code not in ("NOT_FOUND", "GRAPHQL"):
+                    raise
+
+    def update_milestone_meta(self, milestone_id: str, project_id: str, description: str | None, target_date: str | None) -> None:
+        """Set a milestone's description and target date."""
+        fields = _drop_none({"project": project_id, "id": milestone_id, "description": description, "targetDate": target_date})
+        if len(fields) > 2:
+            self._tool("save_milestone", fields)
+
+    def set_issue_meta(self, issue_id: str, add_labels: list[str], priority: int | None) -> None:
+        """Append team labels to an issue (creating missing ones) and set its priority. Labels already on the issue are kept."""
+        real = self._real(issue_id)
+        for name in add_labels:
+            self._ensure_named_label(name)
+        fields = _drop_none({"id": real, "addLabels": list(add_labels) or None, "priority": priority})
+        if len(fields) > 1:
+            self._tool("save_issue", fields)

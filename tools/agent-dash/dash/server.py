@@ -280,6 +280,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._approvals(query)
             elif path == "/api/decisions":
                 self._decisions()
+            elif path == "/api/linear":
+                self._linear()
             elif path == "/api/risks":
                 self._risks()
             elif path == "/api/project/feed":
@@ -995,6 +997,12 @@ class Handler(BaseHTTPRequestHandler):
         """``GET /api/decisions``: hub decisions, newest first, read-only."""
         from dash.decisions import decisions_payload, resolve_hub_dir
         self._json(200, decisions_payload(resolve_hub_dir(self.server.cfg)))
+
+    def _linear(self):
+        """``GET /api/linear``: the Linear card payload, read-only, cached by bundle stamps. Never a token."""
+        from dash.linearview import cached
+        self._json(200, cached(time.time()))
+
     def _risks(self):
         """``GET /api/risks``: computed risks first, then hub file rows."""
         from dash.decisions import risks_payload

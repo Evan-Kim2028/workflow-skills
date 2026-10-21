@@ -63,6 +63,7 @@
        inside one card (exec-activity) on one shared x axis with one time
        filter. The progress strip reads its own payload (see
        static/cards/activity.js actProgKey), so the key carries it. */
+    {id: "linear", order: 55, scope: "both", spec: function (state, snap) { return typeof linearSpec === "function" ? linearSpec(state, snap) : null; }},
     {id: "activity", order: 60, scope: "both", spec: function (state, snap) {
       return ["activity", keyOf([state.usage, state.groupBy, (state.runs || []).map(runRow), expanded, state.conc, AdPage.actRangeKey(state.ws), AdPage.actProgKey(), Math.floor(Date.now() / 60000)]), function () { return activityCard(); }, "margin-top:14px"];
     }},

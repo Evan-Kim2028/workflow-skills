@@ -187,6 +187,21 @@ def _poll(cfg: dict) -> None:
             _record_failure(ws, cfg)
         else:
             _record_success(ws)
+            _daily_update(ws)
+
+
+def _daily_update(ws: str) -> None:
+    """Post the bundle's daily standup update when it is due (``dash.linear_update`` owns the rule). Never raises."""
+    try:
+        from dash import linear_update
+
+        now = time.time()
+        if linear_update.due(ws, now):
+            error = linear_update.send_daily(ws, now)
+            if error:
+                log.warning("linear: %s daily update failed: %s", ws, _clip(error))
+    except Exception as exc:
+        log.warning("linear: %s daily update failed: %s", ws, _clip(f"{type(exc).__name__}: {exc}"))
 
 
 def _clip(text) -> str:

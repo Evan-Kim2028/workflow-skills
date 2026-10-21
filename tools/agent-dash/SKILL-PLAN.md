@@ -128,6 +128,37 @@ python3 agent_dash.py ws trains WS4
 
 Re-cut the trains as member diffs land: per member `git diff --name-only origin/main...<branch>`, intersect the lists into `shared_files`, set the `gate` to the tests for those files, and move the train status with `ws train`. Set `pr` when the train PR opens and `merged` after it lands. `ws validate` checks the schema, the member cap, and the naming rule on train titles and notes.
 
+## Linear tracker
+
+`plan.json` may carry an optional top-level `tracker` object. It holds the non-engineer text and dates that the Linear project shows. Every field is optional. The sync pushes it only for a linked bundle (see [docs/linear.md](docs/linear.md)).
+
+```json
+"tracker": {
+  "summary": "Move the notes read path to Postgres, one table at a time.",
+  "description": "Markdown for non-engineers: purpose, why now, what done looks like.",
+  "lead": "Alex Rivera",
+  "labels": ["Infrastructure"],
+  "issue_labels": ["Infrastructure"],
+  "priority": 2,
+  "start_date": "2026-10-21",
+  "target_date": null,
+  "links": [{"title": "Dashboard", "url": "http://127.0.0.1:8765/?ws=WS4&view=exec"}],
+  "milestones": {"Read path": {"description": "What this section delivers and its gate.", "target_date": null}},
+  "update": {"health": "onTrack", "daily_hour": 9}
+}
+```
+
+- `summary` is one line, at most 255 characters. `description` is Markdown.
+- `lead` is the name of a Linear user.
+- `labels` are project labels, created when missing. `issue_labels` are added to every task issue and are never removed by the sync.
+- `priority` uses Linear's scale: 0 none, 1 urgent, 2 high, 3 medium, 4 low. Task priorities are derived from the plan (critical path high, ready now medium, other open tasks low), so they are not stored here.
+- `start_date` and `target_date` are `YYYY-MM-DD`, or `null`.
+- `links` is a list of `{title, url}`. The sync appends new links and does not remove old ones.
+- `milestones` is keyed by DAG column name. Each entry has a plain-language `description` and a `target_date`.
+- `update.health` is the default standup health: `onTrack`, `atRisk`, or `offTrack`. `update.daily_hour` is the local hour (0 to 23) for the automatic daily standup update. See `ws linear update` in [docs/linear.md](docs/linear.md).
+
+The project status follows `bundle.json` `state`, so do not put a status in `tracker`. Name things in the text fields by a short phrase first, as in the rest of the plan.
+
 ## Approvals
 
 The lead records a pending decision before asking the owner to take it. The owner sets the status. The lead reads that status before any production step.

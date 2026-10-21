@@ -117,6 +117,7 @@ class FakeLinear:
         self.labels: dict[str, dict] = {}
         self.initiatives: dict[str, dict] = {}
         self.project_links: set[tuple[str, str]] = set()
+        self.project_labels: dict[str, dict] = {}
         self.projects: dict[str, dict] = {}
         self.milestones: dict[str, dict] = {}
         self.issues: dict[str, dict] = {}
@@ -230,6 +231,53 @@ class FakeLinear:
         if team is None:
             raise GqlError("Entity not found")
         return team
+
+    def op_ProjectStatuses(self, v: dict) -> dict:
+        names = ("Planned", "In Progress", "Completed", "Canceled")
+        nodes = [{"id": f"status-{name.lower().replace(' ', '-')}", "name": name} for name in names]
+        return {"projectStatuses": {"nodes": nodes}}
+
+    def op_ProjectDetail(self, v: dict) -> dict:
+        project = self.projects.get(v.get("id"))
+        if project is None:
+            raise GqlError("Entity not found")
+        nodes = [dict(self.project_labels[lid]) for lid in project.get("labelIds", []) if lid in self.project_labels]
+        return {"project": {"labels": {"nodes": nodes}}}
+
+    def op_ProjectLabelByName(self, v: dict) -> dict:
+        nodes = [dict(label) for label in self.project_labels.values() if label["name"] == v.get("name")]
+        return {"projectLabels": {"nodes": nodes}}
+
+    def op_ProjectLabelCreate(self, v: dict) -> dict:
+        label_id = self._new_id("project-label")
+        self.project_labels[label_id] = {"id": label_id, "name": v["input"]["name"]}
+        return {"projectLabelCreate": {"success": True, "projectLabel": {"id": label_id}}}
+
+    def op_UserByName(self, v: dict) -> dict:
+        return {"users": {"nodes": []}}
+
+    def op_EntityExternalLinkCreate(self, v: dict) -> dict:
+        data = v["input"]
+        if data.get("projectId") not in self.projects:
+            raise GqlError("Entity not found")
+        self.project_links.add((data["projectId"], data["url"]))
+        return {"entityExternalLinkCreate": {"success": True}}
+
+    def op_ProjectMilestoneUpdate(self, v: dict) -> dict:
+        milestone = self.milestones.get(v.get("id"))
+        if milestone is None:
+            raise GqlError("Entity not found")
+        for field in ("description", "targetDate"):
+            if field in v["input"]:
+                milestone[field] = v["input"][field]
+        return {"projectMilestoneUpdate": {"success": True}}
+
+    def op_IssueLabels(self, v: dict) -> dict:
+        issue = self.issues.get(v.get("id"))
+        if issue is None:
+            raise GqlError("Entity not found")
+        nodes = [dict(self.labels[lid]) for lid in issue.get("labelIds", []) if lid in self.labels]
+        return {"issue": {"team": {"id": issue.get("teamId", "team-eng")}, "labels": {"nodes": nodes}}}
 
     def op_TeamByKey(self, v: dict) -> dict:
         nodes = [
