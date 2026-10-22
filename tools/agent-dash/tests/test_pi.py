@@ -316,6 +316,47 @@ class SourceTest(unittest.TestCase):
         self.assertEqual(run["status"], "running")
         self.assertEqual(run["pid"], 424242)
 
+    def test_cmd_outdir_running_files_are_not_pi_runs(self):
+        cmd = self.scratch / "enc2" / SID / "scratchpad" / "cmd"
+        cmd.mkdir(parents=True)
+        (cmd / "cmd-sessions.tsv").write_text(
+            "label\tmodel\tsession_id\tstarted_epoch\tended_epoch\tinput_tokens\toutput_tokens\tstatus\n",
+            encoding="utf-8",
+        )
+        (cmd / "running").mkdir()
+        (cmd / "running" / "ws16-exec-f-wire").write_text("424242\tbeam", encoding="utf-8")
+        self.poll()
+        self.assertEqual(self.store.runs, {})
+
+    def test_live_row_without_a_session_waits_for_the_next_poll(self):
+        label = "ws15-exec-early"
+        (self.pad / "running").mkdir()
+        (self.pad / "running" / label).write_text("424242\t%s" % DEEPSEEK, encoding="utf-8")
+        self.poll()
+        self.assertEqual(self.store.runs, {})
+        (self.pad / ("stream-%s.ndjson" % label)).write_bytes(FIXTURE.read_bytes())
+        self.poll()
+        run = self.store.runs[self.run_id(label)]
+        self.assertEqual(run["session_id"], SID)
+        self.assertNotIn("pi:%s:%s" % (label, label), self.store.runs)
+
+    def test_run_id_stays_stable_from_stream_to_tsv(self):
+        label = "ws15-exec-stable"
+        (self.pad / "running").mkdir()
+        (self.pad / "running" / label).write_text("424242\t%s" % DEEPSEEK, encoding="utf-8")
+        (self.pad / ("stream-%s.ndjson" % label)).write_bytes(FIXTURE.read_bytes())
+        self.poll()
+        self.assertIn(self.run_id(label), self.store.runs)
+        self.assertNotIn("pi:%s:%s" % (label, label), self.store.runs)
+        (self.pad / "running" / label).unlink()
+        self.write_tsv([[label, SID, 1792000000, DEEPSEEK]])
+        (self.pad / ("out-%s.md" % label)).write_text("PASS\nDid it.\n", encoding="utf-8")
+        self.poll()
+        run = self.store.runs[self.run_id(label)]
+        self.assertEqual(run["status"], "done")
+        self.assertEqual(run["verdict"], "PASS")
+        self.assertNotIn("pi:%s:%s" % (label, label), self.store.runs)
+
 
 class ProcessLivenessTest(unittest.TestCase):
     def test_pi_label_from_prompt_path(self):

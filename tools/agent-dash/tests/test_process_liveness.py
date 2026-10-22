@@ -505,6 +505,109 @@ class ApplyLivenessTests(unittest.TestCase):
         self.assertEqual(row["pid"], 28553)
 
 
+class ReconcilePiTests(unittest.TestCase):
+    def test_reconcile_closes_a_vanished_pi_row_as_died_early(self):
+        store = Store(
+            {
+                "pi:ws15-exec-gone:ws15-exec-gone": {
+                    "run_id": "pi:ws15-exec-gone:ws15-exec-gone",
+                    "source": "pi",
+                    "label": "ws15-exec-gone",
+                    "status": "running",
+                    "pid": 424242,
+                    "started_at": 50,
+                }
+            }
+        )
+        ended = process.reconcile_running(store, 200, [])
+        self.assertEqual(ended, 1)
+        row = store.get_run("pi:ws15-exec-gone:ws15-exec-gone")
+        self.assertEqual(row["status"], "died_early")
+        self.assertIsNone(row.get("pid"))
+
+    def test_reconcile_keeps_a_label_matched_pi_run_running(self):
+        store = Store(
+            {
+                "pi:s1:ws15-exec-live": {
+                    "run_id": "pi:s1:ws15-exec-live",
+                    "source": "pi",
+                    "label": "ws15-exec-live",
+                    "status": "running",
+                    "pid": 7,
+                    "started_at": 90,
+                }
+            }
+        )
+        procs = [
+            {
+                "pid": 7,
+                "comm": "node",
+                "started_at": 95.0,
+                "label": "ws15-exec-live",
+                "model": None,
+                "reasoning_effort": None,
+                "prompt_label": None,
+                "session_id": None,
+            }
+        ]
+        ended = process.reconcile_running(store, 200, procs)
+        self.assertEqual(ended, 0)
+        row = store.get_run("pi:s1:ws15-exec-live")
+        self.assertEqual(row["status"], "running")
+        self.assertEqual(row["pid"], 7)
+
+    def test_reconcile_skips_commandcode_rows_for_the_source_close_out(self):
+        store = Store(
+            {
+                "commandcode:s:ws6-plan-gone": {
+                    "run_id": "commandcode:s:ws6-plan-gone",
+                    "source": "commandcode",
+                    "label": "ws6-plan-gone",
+                    "status": "running",
+                    "pid": 424242,
+                    "started_at": 50,
+                }
+            }
+        )
+        ended = process.reconcile_running(store, 200, [])
+        self.assertEqual(ended, 0)
+        self.assertEqual(store.get_run("commandcode:s:ws6-plan-gone")["status"], "running")
+
+
+class StaleStore(Store):
+    def stale_running(self, now):
+        return [
+            (dict(row), "no source evidence for longer than 6h")
+            for row in self.saved.values()
+            if row.get("status") == "running"
+        ]
+
+
+class StaleGenericTests(unittest.TestCase):
+    def test_quiet_generic_run_closes_as_died_early(self):
+        store = StaleStore(
+            {
+                "generic:s:ws15-plan-pcdedup": {
+                    "run_id": "generic:s:ws15-plan-pcdedup",
+                    "source": "generic",
+                    "label": "ws15-plan-pcdedup",
+                    "status": "running",
+                    "pid": None,
+                    "started_at": 50,
+                }
+            }
+        )
+        ended = process.reconcile_running(store, 200, [])
+        self.assertEqual(ended, 1)
+        row = store.get_run("generic:s:ws15-plan-pcdedup")
+        self.assertEqual(row["status"], "died_early")
+
+    def test_generic_row_with_fresh_stale_evidence_is_left_alone(self):
+        store = StaleStore()
+        ended = process.reconcile_running(store, 200, [])
+        self.assertEqual(ended, 0)
+
+
 class PromptFileTests(unittest.TestCase):
     ARGV = (
         "muse-bin-1.4.9 exec --prompt-file "
