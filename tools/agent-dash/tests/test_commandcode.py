@@ -276,6 +276,46 @@ class PollTest(Fixture):
         self.poll()
         self.assertEqual(self.store.runs, {})
 
+    def test_pi_outdir_with_running_folder_is_ignored(self):
+        # A live pi launch (its own running/ folder plus a pi-shaped
+        # stream, a prompt file, even a manifest) must not read as a
+        # second commandcode run for the same label.
+        pi_pad = self.scratch / "-home-someone-x" / SID_OK / "scratchpad" / "pi"
+        pi_pad.mkdir(parents=True)
+        (pi_pad / "running").mkdir()
+        (pi_pad / "running" / "ws6-plan-pi").write_text(
+            "%d\triver/deepseek-ai/DeepSeek-V4.1-Flash-1017" % os.getpid(), encoding="utf-8"
+        )
+        (pi_pad / "stream-ws6-plan-pi.ndjson").write_text(
+            '{"type": "session", "id": "pi-sid-1"}\n', encoding="utf-8"
+        )
+        (pi_pad / "prompt-ws6-plan-pi.md").write_text(
+            "[label: ws6-plan-pi]\ndo it\n", encoding="utf-8"
+        )
+        self.poll()
+        self.assertEqual(self.store.runs, {})
+        (pi_pad / "pi-sessions.tsv").write_text(
+            "label\tsession_id\tstarted_epoch\tmodel\n"
+            "ws6-plan-pi\tpi-sid-1\t1792000000\triver/deepseek-ai/DeepSeek-V4.1-Flash-1017\n",
+            encoding="utf-8",
+        )
+        self.poll()
+        self.assertEqual(self.store.runs, {})
+
+    def test_running_only_cmd_attempt_is_kept(self):
+        # The guard must not hide a genuine Command Code launch that has
+        # no TSV row yet: running/ plus a cooldown marker and an attempt
+        # stream is a cmd outdir from the first attempt.
+        (self.pad / "running").mkdir()
+        (self.pad / "running" / "ws6-plan-early").write_text(
+            "%d\treflection/beam:free" % os.getpid(), encoding="utf-8"
+        )
+        (self.pad / "cooldown.json").write_text("{}", encoding="utf-8")
+        stream(self.pad / "stream-ws6-plan-early-1.ndjson", SID_LIVE)
+        session_file(self.project_dir() / (SID_LIVE + ".jsonl"), SID_LIVE, "/x", [])
+        self.poll()
+        self.assertIn("commandcode:%s:ws6-plan-early" % SID_LIVE, self.store.runs)
+
     def test_unlabelled_session_is_a_run_with_no_label(self):
         session_file(
             self.project_dir("home-someone-projects-other-repo") / (SID_INTERACTIVE + ".jsonl"),

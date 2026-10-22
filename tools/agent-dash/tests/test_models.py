@@ -95,6 +95,57 @@ class LaunchEchoTest(unittest.TestCase):
         self.assertEqual(kept, [wrapper["run_id"], worker["run_id"]])
 
 
+class BeamFamilyTest(unittest.TestCase):
+    def test_pi_beam_ids_map_to_the_beam_family(self):
+        self.assertEqual(
+            model_key("reflection/Beam-1.0-501B-A23B"), ("beam", "beam-1.0")
+        )
+        self.assertEqual(
+            model_key("Beam-1.0-501B-A23B", "beam pi"), ("beam", "beam-1.0")
+        )
+        self.assertEqual(model_key("beam", "pi"), ("beam", "beam"))
+
+    def test_grok_build_and_commandcode_win_over_beam(self):
+        self.assertEqual(model_key("reflection-beam"), ("grok", "reflection-beam"))
+        self.assertEqual(
+            model_key("reflection/beam:free"),
+            ("commandcode", "reflection/beam:free"),
+        )
+        self.assertEqual(
+            model_key("reflection-beam", "pi"), ("grok", "reflection-beam")
+        )
+
+    def test_pi_glm_hint_does_not_read_as_grok_build(self):
+        self.assertEqual(
+            model_key("river/zai-org/GLM-5.3-Flash", "glm pi"),
+            ("glm", "glm-5.3-flash"),
+        )
+        self.assertEqual(
+            run_model_key(
+                {
+                    "model": "river/zai-org/GLM-5.3-Flash",
+                    "tier": "glm",
+                    "source": "pi",
+                }
+            ),
+            "glm-5.3-flash",
+        )
+        self.assertEqual(
+            run_model_key(
+                {
+                    "model": "reflection/Beam-1.0-501B-A23B",
+                    "tier": "beam",
+                    "source": "generic",
+                }
+            ),
+            "beam-1.0",
+        )
+
+    def test_grok_build_hint_without_pi_still_groups_as_grok(self):
+        self.assertEqual(model_key("glm-5.3", "grok glm"), ("grok", "glm-5.3"))
+        self.assertEqual(model_key("future-1", "glm glm"), ("grok", "future-1"))
+
+
 class OneRunPerProcessTest(unittest.TestCase):
     def test_same_label_and_pid_keeps_the_real_row(self):
         ghost = {"run_id": "grok:a:job", "label": "job", "status": "running", "pid": 7, "model": None, "out_bytes": None, "clock_source": "transcript", "source": "grok", "started_at": 1.0}

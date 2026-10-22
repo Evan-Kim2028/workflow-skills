@@ -67,6 +67,7 @@
   --s9: #c08a4e;  /* codex bronze (ninth series, est. ~5.5:1; glyph+word carry it) */
   --s10: #5cc8dc;  /* Command Code cyan (tenth series; glyph+word carry it, contrast not yet measured) */
   --s11: #a3c14a;  /* Grok Build lime (eleventh series; 8.88:1 on --card, glyph+word carry it) */
+  --s12: #8d9bff;  /* Beam indigo (twelfth series; glyph+word carry it, contrast not yet measured) */
   --other: #6b7484;  /* unassigned / unknown, with label */
 
   /* ---- Usage-by-phase entity colours (Okabe-Ito-inspired, told apart
@@ -203,6 +204,7 @@
   --s5: #e87ba4; --s6: #008300; --s7: #6250d6; --s8: #e34948; --s9: #8f5f23;
   --s10: #0e7f93;
   --s11: #4f6e00;  /* Grok Build olive (5.89:1 on white; glyph+word carry it) */
+  --s12: #3f4cc0;  /* Beam indigo (twelfth series; glyph+word carry it, contrast not yet measured) */
   --other: #a8a69e;
   /* Usage-by-phase entity hues for light (same hues as dark, deeper shades). */
   --ph-planning: #2a78d6;

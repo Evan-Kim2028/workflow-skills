@@ -10,7 +10,7 @@ import re
 from datetime import datetime
 
 
-TOOL_KEYS = ("grok", "muse", "glm", "claude", "deepseek", "codex", "other")
+TOOL_KEYS = ("grok", "muse", "glm", "claude", "deepseek", "beam", "codex", "other")
 
 
 FINISHED = ("done", "killed", "died_early")
@@ -218,7 +218,36 @@ def _tool_key(run: dict) -> str | None:
         return "other"
     if source.startswith("claude") or tier in ("opus", "sonnet", "haiku"):
         return "claude"
+    if (
+        source == "pi"
+        or tier == "pi"
+        or (isinstance(run.get("run_id"), str) and run.get("run_id", "").startswith("pi:"))
+    ):
+        # A pi run keeps its model-family lane whichever source wrote the
+        # row: the pi manifest source (source ``pi``) and the launcher's
+        # generic.jsonl run lines (source ``generic``, same ``pi:`` run id)
+        # upsert the same row on alternate polls, so the run id names the
+        # harness, never the transport.
+        return _pi_key(run)
     return None
+
+
+def _pi_key(run: dict) -> str:
+    """Tool lane for a pi run: its model family, never the transport.
+
+    The family comes from the one derivation in ``dash.models`` (lazy import:
+    this module takes no dash imports at load). Only the id decides: a pi
+    River-GLM id must not read as ``grok`` through the Grok Build
+    tier-``glm`` rule, so the hint carries just the source, never the tier.
+    Anything outside beam/deepseek/glm (a Command Code free id, a Claude id,
+    or no model yet) counts in ``other``.
+    """
+    from dash.models import model_key
+
+    fam, _key = model_key(run.get("model"), run.get("source") or "pi")
+    if fam in ("beam", "deepseek", "glm"):
+        return fam
+    return "other"
 
 
 def _grok_cli_key(run: dict) -> str:

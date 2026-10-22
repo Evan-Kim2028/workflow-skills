@@ -25,6 +25,7 @@ sys.path.insert(0, str(ROOT))
 
 from dash import pricing  # noqa: E402
 from dash.models import model_key, run_model_key  # noqa: E402
+from dash.store.util import TOOL_KEYS, _tool_key  # noqa: E402
 
 SPEC = importlib.util.spec_from_file_location("dash_sources_pi", ROOT / "dash" / "sources" / "pi.py")
 pi = importlib.util.module_from_spec(SPEC)
@@ -196,7 +197,7 @@ class SourceTest(unittest.TestCase):
         self.assertEqual(run["status"], "done")
         self.assertEqual(run["verdict"], "PASS")
         self.assertEqual(run["source"], "pi")
-        self.assertEqual(run["tier"], "pi")
+        self.assertEqual(run["tier"], "deepseek")
         self.assertEqual(run["model"], DEEPSEEK)
         self.assertAlmostEqual(run["started_at"], 1792000000.0)
         self.assertIn("out-ws15-exec-wire.md", run["out_path"])
@@ -211,6 +212,45 @@ class SourceTest(unittest.TestCase):
         # pid 999999 is dead, so the stream's own session read plus the absent
         # out file leaves it unknown rather than a false running.
         self.assertIn(run["status"], ("running", "unknown", "died_early"))
+
+    def test_commandcode_outdir_with_running_folder_is_ignored(self):
+        # A live Command Code launch (its own running/ folder, attempt
+        # streams, even a manifest) must not read as a second pi: run for
+        # the same label: no pi: run id may mention the cmd label.
+        cmd = self.scratch / "enc" / SID / "scratchpad" / "cmd"
+        cmd.mkdir(parents=True)
+        (cmd / "running").mkdir()
+        (cmd / "running" / "ws15-exec-cmd").write_text(
+            "999999\treflection/beam:free", encoding="utf-8"
+        )
+        (cmd / "stream-ws15-exec-cmd-1.ndjson").write_text(
+            '{"type": "event", "event": {"type": "run_start", "sessionId": "cmd-sid-1"}}\n',
+            encoding="utf-8",
+        )
+        self.poll()
+        self.assertEqual(self.store.runs, {})
+        (cmd / "cmd-sessions.tsv").write_text(
+            "label\tmodel\tsession_id\tstarted_epoch\tended_epoch\tinput_tokens\toutput_tokens\tstatus\n"
+            "ws15-exec-cmd\treflection/beam:free\tcmd-sid-1\t1792000000\t1792000060\t10\t2\tok\n",
+            encoding="utf-8",
+        )
+        self.poll()
+        self.assertEqual(self.store.runs, {})
+
+    def test_running_only_pi_launch_is_kept(self):
+        # The guard must not hide a genuine pi launch that has no TSV row
+        # yet: running/ plus a prompt file and a pi-shaped stream is a pi
+        # outdir from the first second.
+        (self.pad / "running").mkdir()
+        (self.pad / "running" / "ws15-exec-early").write_text(
+            "999999\t%s" % DEEPSEEK, encoding="utf-8"
+        )
+        (self.pad / "prompt-ws15-exec-early.md").write_text(
+            "[label: ws15-exec-early]\ndo it\n", encoding="utf-8"
+        )
+        (self.pad / "stream-ws15-exec-early.ndjson").write_bytes(FIXTURE.read_bytes())
+        self.poll()
+        self.assertIn(self.run_id("ws15-exec-early"), self.store.runs)
 
     def test_quota_file_finishes_died_early_blocked(self):
         self.write_tsv([["ws15-exec-quota", SID, 1792000000, DEEPSEEK]])
@@ -452,3 +492,50 @@ class FixturePhasesTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ModelTierTest(unittest.TestCase):
+    def test_model_family_is_the_tier(self):
+        self.assertEqual(pi._model_tier("reflection/Beam-1.0-501B-A23B"), "beam")
+        self.assertEqual(pi._model_tier("river/zai-org/GLM-5.3-Flash"), "glm")
+        self.assertEqual(pi._model_tier("river/deepseek-ai/DeepSeek-V4.1-Flash-1017"), "deepseek")
+        self.assertEqual(pi._model_tier(None), "pi")
+
+
+BEAM = "reflection/Beam-1.0-501B-A23B"
+
+
+class PiLaneTest(unittest.TestCase):
+    def test_beam_lane_exists(self):
+        self.assertIn("beam", TOOL_KEYS)
+
+    def test_pi_runs_keep_a_family_lane(self):
+        beam = {"source": "pi", "tier": "beam", "run_id": "pi:s:ws1-exec-b", "model": BEAM}
+        self.assertEqual(_tool_key(beam), "beam")
+        glm = {"source": "pi", "tier": "glm", "run_id": "pi:s:ws1-exec-g", "model": GLM}
+        self.assertEqual(_tool_key(glm), "glm")
+        deepseek = {"source": "pi", "tier": "deepseek", "run_id": "pi:s:ws1-exec-d", "model": DEEPSEEK}
+        self.assertEqual(_tool_key(deepseek), "deepseek")
+
+    def test_generic_transported_pi_run_keeps_the_pi_lane(self):
+        # The launcher's generic.jsonl run lines (source generic, same pi:
+        # run id) upsert the same row on alternate polls; the run id names
+        # the harness so the row counts whichever source wrote it last.
+        row = {"source": "generic", "tier": "beam", "run_id": "pi:s:ws1-exec-b", "model": BEAM}
+        self.assertEqual(_tool_key(row), "beam")
+
+    def test_commandcode_and_unknown_models_stay_out_of_family_lanes(self):
+        cmd = {"source": "commandcode", "tier": "commandcode",
+               "run_id": "commandcode:s:l", "model": "reflection/beam:free"}
+        self.assertEqual(_tool_key(cmd), "other")
+        modeless = {"source": "pi", "tier": "pi", "run_id": "pi:s:ws1-exec-x"}
+        self.assertEqual(_tool_key(modeless), "other")
+
+
+class BeamPricingTest(unittest.TestCase):
+    def test_pi_beam_rows_price_zero_not_unpriced(self):
+        for model in ("Beam-1.0-501B-A23B", "reflection/Beam-1.0-501B-A23B"):
+            self.assertEqual(pricing.cost(model, 1000, 100, 0, 0), 0)
+            self.assertTrue(pricing.status(model)["priced"], model)
+            self.assertEqual(model_key(model, "pi")[0], "beam")
+            self.assertEqual(pricing.series_key(model), "beam")

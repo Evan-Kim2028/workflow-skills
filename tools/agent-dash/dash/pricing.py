@@ -120,7 +120,7 @@ def series_key(model: str | None, hint: str | None = None) -> str:
         # ``glm`` while the run tier reads ``grok``): any current or
         # future model it runs groups under the grok provider.
         return "grok"
-    for name in ("grok", "muse", "glm", "deepseek", "codex"):
+    for name in ("grok", "muse", "glm", "deepseek", "beam", "codex"):
         if name in text:
             return name
     if text.startswith("gpt-") or text == "gpt-reserve":

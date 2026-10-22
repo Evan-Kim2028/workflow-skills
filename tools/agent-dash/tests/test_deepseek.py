@@ -529,7 +529,7 @@ class SnapshotAgreementTest(unittest.TestCase):
             conn.close()
 
 
-LANES = ("grok", "muse", "glm", "claude", "deepseek", "codex", "other")
+LANES = ("grok", "muse", "glm", "claude", "deepseek", "beam", "codex", "other")
 
 
 def _grok_run(store, run_id, model, start, end=None, status="done", label=None):

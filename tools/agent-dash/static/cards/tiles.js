@@ -316,7 +316,7 @@
        totals above still include every live agent, hidden or not. */
     var showU = AdUnatt.shown(state.ws);
     ADM.sortKeys(Object.keys(lbm).filter(function (k) { return lbm[k]; })).filter(function (k) { return showU || !AdUnatt.isUnattributed(k); }).forEach(function (k) { var f = ADM.famOf(k); (byFam[f] = byFam[f] || []).push(k); });
-    var toolFam = {grok: "cursor", muse: "muse", glm: "glm", claude: "claude", deepseek: "deepseek", codex: "codex", other: "other"};
+    var toolFam = {grok: "cursor", muse: "muse", glm: "glm", claude: "claude", deepseek: "deepseek", beam: "beam", codex: "codex", other: "other"};
     Object.keys(lbt || {}).forEach(function (t) { if (lbt[t] && toolFam[t] && !byFam[toolFam[t]]) byFam[toolFam[t]] = []; });
     var liveLines = [ADM.FAMS.filter(function (f) { return byFam[f]; }).map(function (f) { var ks = byFam[f], n = ks.reduce(function (a, k) { return a + lbm[k]; }, 0); var toolN = 0; Object.keys(lbt || {}).forEach(function (t) { if (toolFam[t] === f) toolN += lbt[t]; }); var bits = ks.map(function (k) { return ADM.nameOf(k) + " " + fmtN(lbm[k]); }); if (toolN > n) bits.push("starting " + fmtN(toolN - n)); return ADM.FAM[f].name + " " + fmtN(Math.max(n, toolN)) + " (" + bits.join(", ") + ")"; }).join(" · ") || "idle"];
     /* Stalled workers are stuck, not live: their own words, never folded

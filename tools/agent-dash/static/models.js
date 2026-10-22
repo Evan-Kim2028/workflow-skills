@@ -2,14 +2,15 @@
    dash/models.py holds the same rules for the server-side counts. A Grok Build
    run (the grok-build launcher kind: tier grok with a glm source or usage
    tool, or one of the known Grok Build ids) reads as Grok under its recorded
-   id. A non-Grok-Build run with a recorded-but-unknown model id (mimo-*,
+   id. Reflection Beam ids through the pi harness read as Beam under
+   beam-<major>.<minor>. A non-Grok-Build run with a recorded-but-unknown model id (mimo-*,
    step-*) reads as Other. Codex ids (gpt-*, codex-*, gpt-reserve) read as
    Codex under their id; an empty id with a codex tier or source reads as
    codex-unknown. reflection-beam (Grok Build, free) is distinct from
    reflection/beam:free (Command Code, free). */
 (function (global) {
   "use strict";
-  var FAMS = ["claude", "cursor", "muse", "glm", "grok", "deepseek", "codex", "commandcode", "dagster", "other"];
+  var FAMS = ["claude", "cursor", "muse", "glm", "grok", "deepseek", "beam", "codex", "commandcode", "dagster", "other"];
   var FAM = {
     claude: {name: "Claude", hue: "--s1", order: ["opus", "fable", "sonnet", "haiku"]},
     cursor: {name: "Cursor", hue: "--s4", order: ["grok-4.7", "composer-2.5"]},
@@ -17,6 +18,7 @@
     glm: {name: "GLM", hue: "--s6", order: ["glm-5.3", "glm-5.3-flash"]},
     grok: {name: "Grok", hue: "--s11", order: ["glm-5.3", "glm-5.3-flash", "deepseek-flash", "reflection-beam"]},
     deepseek: {name: "DeepSeek", hue: "--s8", order: ["deepseek-flash", "deepseek-v4-pro"]},
+    beam: {name: "Beam", hue: "--s12", order: ["beam-1.0"]},
     codex: {name: "Codex", hue: "--s9", order: ["gpt-6.1-sol", "gpt-6-luna"]},
     commandcode: {name: "Command Code", hue: "--s10", order: ["reflection/beam:free", "minimax/minimax-m3.1-flash:free", "ornith/ornith-1.5-122b:free", "poolside/laguna-s-2.1-free", "stealth/glyph-cluster:free"]},
     dagster: {name: "Dagster", hue: "--s7", order: []},
@@ -39,9 +41,13 @@
     if (v) return [v[1], m];
     /* Grok Build launcher kind (manifest source and usage tool stay glm
        while the run tier reads grok): the recorded id is the per-model
-       breakdown, never collapsed to Other. */
-    if (/glm/.test(h)) return ["grok", m || "grok-unknown"];
+       breakdown, never collapsed to Other. A pi River-GLM hint also
+       carries glm, so pi in the hint keeps the id-based GLM branch. */
+    if (/glm/.test(h) && !/pi/.test(h)) return ["grok", m || "grok-unknown"];
     if (GROK_BUILD_MODELS.indexOf(m) >= 0) return ["grok", m];
+    /* Reflection Beam through the pi harness: reflection-beam (Grok
+       Build) and reflection/beam:free (Command Code) return earlier. */
+    if (/beam/.test(m)) { v = /beam[-_ ]?(\d+(?:\.\d+)?)/.exec(m); return ["beam", "beam" + (v ? "-" + v[1] : "")]; }
     if (/composer/.test(m)) { v = /composer[-_ ]?(\d+(?:\.\d+)?)/.exec(m); return ["cursor", "composer" + (v ? "-" + v[1] : "")]; }
     if (/grok/.test(m)) { v = /grok[-_ ]?(\d+(?:\.\d+)?)/.exec(m); return ["cursor", "grok" + (v ? "-" + v[1] : "")]; }
     if (/glm/.test(m)) { v = /glm[-_ ]?(\d+(?:\.\d+)?)/.exec(m); return ["glm", "glm" + (v ? "-" + v[1] : "") + (/flash/.test(m) ? "-flash" : "")]; }

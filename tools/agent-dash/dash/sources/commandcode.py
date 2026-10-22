@@ -116,7 +116,11 @@ def _outdirs(root, only=None):
     finished, so a launch shows before its TSV row lands. Checked: the root
     itself, then ``<enc>/<session>/scratchpad`` and each folder under it.
     The root may be an encoded-cwd folder (``<tmpdir>/claude-<uid>/*``)
-    or the folder above one; both are walked.
+    or the folder above one; both are walked. A bare ``running/`` folder
+    is not enough: the pi launcher keeps its own ``running/`` folder, so
+    a manifest-less outdir must also carry Command Code evidence (the
+    ``cooldown.json`` marker or a ``stream-<label>-<n>.ndjson`` attempt
+    stream, never the pi ``stream-<label>.ndjson`` shape).
     """
     found = []
     seen = set()
@@ -125,7 +129,9 @@ def _outdirs(root, only=None):
         real = os.path.realpath(path)
         if real in seen:
             return
-        if os.path.isfile(os.path.join(path, MANIFEST)) or os.path.isdir(os.path.join(path, RUNNING)):
+        if os.path.isfile(os.path.join(path, MANIFEST)) or (
+            os.path.isdir(os.path.join(path, RUNNING)) and _looks_like_cmd_dir(path)
+        ):
             seen.add(real)
             found.append(path)
 
@@ -141,6 +147,23 @@ def _outdirs(root, only=None):
             for child in _subdirs(pad):
                 take(child)
     return found
+
+
+def _looks_like_cmd_dir(path):
+    """True when a manifest-less folder carries Command Code-only evidence.
+
+    ``out-``/``err-`` files and ``running/`` are shared with the pi
+    launcher, so they do not count: only the ``cooldown.json`` marker or a
+    ``stream-<label>-<n>.ndjson`` attempt stream (never the pi
+    ``stream-<label>.ndjson`` shape).
+    """
+    try:
+        names = os.listdir(path)
+    except OSError:
+        return False
+    if "cooldown.json" in names:
+        return True
+    return any(_STREAM.match(name) for name in names)
 
 
 def _subdirs(path):
