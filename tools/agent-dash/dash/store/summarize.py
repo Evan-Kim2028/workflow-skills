@@ -170,7 +170,7 @@ class SummarizeMixin:
             live = sum(
                 num
                 for key, num in (counts.get("live_by_model") or {}).items()
-                if key.endswith("-unknown")
+                if key.split("@", 1)[0].endswith("-unknown")
             )
             finished = 0
             for run in recent_all:
@@ -184,7 +184,7 @@ class SummarizeMixin:
                     finished += 1
             cells = self._query_usage_locked("model", "hour", scope_ws, range_since, range_until)
             summed = _sum_cells(
-                [cell for cell in cells if (cell.get("key") or "").endswith("-unknown")]
+                [cell for cell in cells if (cell.get("key") or "").split("@", 1)[0].endswith("-unknown")]
             )
             return {
                 "runs": live + finished,

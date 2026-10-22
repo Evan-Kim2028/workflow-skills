@@ -172,6 +172,8 @@ class BeamJsTests(unittest.TestCase):
             "assert.deepStrictEqual(keyOf('','commandcode'),['commandcode','commandcode-unknown']);"
             "assert.strictEqual(window.ADM.nameOf('beam-1.0'),'Beam 1.0');"
             "assert.strictEqual(window.ADM.nameOf('beam'),'Beam');"
+            "assert.strictEqual(window.ADM.nameOf('poolside/laguna-s-2.1-free'),'laguna-s-2.1-free');"
+            "assert.strictEqual(window.ADM.nameOf('stealth/glyph-cluster:free'),'glyph-cluster:free');"
             "assert.strictEqual(window.ADM.famOf('beam-1.0'),'beam');"
             "assert.strictEqual(window.ADM.FAMS.indexOf('beam'),window.ADM.FAMS.indexOf('deepseek')+1);"
             "assert.strictEqual(window.ADM.FAM.commandcode.order.indexOf('reflection/beam:free'),-1);"
