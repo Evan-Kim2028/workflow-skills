@@ -7,6 +7,9 @@ merely mentions a launcher) passes untouched:
 
 - ``muse exec ... --prompt-file <dir>/<label>.md`` (label = basename)
 - ``launch_grok.sh <label> ...``
+- ``launch_cmd.py <label> <workspace> <prompt-file> <outdir>``
+- ``cmd -p "<prompt>"`` (Command Code headless): the prompt must start with
+  ``[label: <label>]``; a prompt without that prefix is refused
 - ``run_worker.sh|run_worker.py <tier> <label> ...``
 - ``agent_dash.py report start --label <label>``
 - appends to ``muse-sessions.tsv`` / ``cursor-sessions.tsv`` (first column)
@@ -46,7 +49,13 @@ if str(ROOT) not in sys.path:
 
 TSV_NAMES = ("muse-sessions.tsv", "cursor-sessions.tsv")
 _WRAPPERS = {"nohup", "sudo", "env", "setsid", "nice"}
-_LAUNCHERS = {"launch_grok.sh", "run_worker.sh", "run_worker.py"}
+_LAUNCHERS = {"launch_grok.sh", "launch_cmd.py", "run_worker.sh", "run_worker.py"}
+_COMMANDCODE_BINARIES = ("cmd", "commandcode")
+
+#: Command Code headless prompt label prefix, ``[label: <label>]``.
+_CMD_LABEL = re.compile(r"^\s*\[label:\s*([^\]]*?)\s*\]")
+#: Shell expansion inside a Command Code prompt: the label is unknowable.
+_CMD_EXPANSION_RE = re.compile(r"[$`]")
 _TSV_WRITERS = ("echo", "printf", "cat", "tee")
 
 #: A shell expansion we cannot resolve: variable, command substitution,
@@ -171,9 +180,11 @@ def _label_from_argv(argv: list[str]) -> str | None:
             return None
         name = _base(items[at + 1])
         return name[:-3] if name.endswith(".md") else None
+    if base in _COMMANDCODE_BINARIES:
+        return _label_from_cmd(items[1:])
     if base in _LAUNCHERS:
         rest = _nonflags(items[1:])
-        if base == "launch_grok.sh":
+        if base in ("launch_grok.sh", "launch_cmd.py"):
             return rest[0] if rest else None
         return rest[1] if len(rest) >= 2 else None
     if base in ("python", "python3") and len(items) > 1:
@@ -181,12 +192,36 @@ def _label_from_argv(argv: list[str]) -> str | None:
         if inner == "run_worker.py":
             rest = _nonflags(items[2:])
             return rest[1] if len(rest) >= 2 else None
+        if inner == "launch_cmd.py":
+            rest = _nonflags(items[2:])
+            return rest[0] if rest else None
         if inner == "agent_dash.py":
             return _label_from_report(items[2:])
         return None
     if base == "agent_dash.py":
         return _label_from_report(items[1:])
     return None
+
+
+def _label_from_cmd(argv: list[str]) -> str | None:
+    """Command Code headless launch: the ``-p`` prompt's ``[label: ...]`` prefix.
+
+    No ``-p`` means an interactive session, not a worker launch. A prompt
+    that opens with a shell expansion fails open. Any other prompt with no
+    prefix yields an empty label, which the strict check refuses.
+    """
+    if "-p" not in argv:
+        return None
+    at = argv.index("-p")
+    if at + 1 >= len(argv):
+        return None
+    prompt = argv[at + 1]
+    found = _CMD_LABEL.match(prompt)
+    if found:
+        return found.group(1)
+    if _CMD_EXPANSION_RE.search(prompt):
+        return None
+    return ""
 
 
 def _label_from_report(argv: list[str]) -> str | None:

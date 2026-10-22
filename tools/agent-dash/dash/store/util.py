@@ -214,6 +214,8 @@ def _tool_key(run: dict) -> str | None:
         return _grok_cli_key(run)
     if source in ("codex", "codex-exec") or tier == "codex":
         return "codex"
+    if source == "commandcode" or tier == "commandcode":
+        return "other"
     if source.startswith("claude") or tier in ("opus", "sonnet", "haiku"):
         return "claude"
     return None

@@ -35,6 +35,19 @@ python3 ~/.claude/tools/agent-dash/agent_dash.py project list
 
 `run` prints `running`, a pid, and `url http://127.0.0.1:8765/`.
 
+### Command Code workers (`cmd`)
+
+`scripts/launch_cmd.py <label> <workspace> <prompt-file> <outdir>` runs one
+headless `cmd -p` worker on the free models, rotating to the next model
+when one throttles (15 minute cooldown, up to 8 attempts). `outdir` is any
+folder the dashboard scans, such as a scratchpad `cmd/` folder. It writes
+`cmd-sessions.tsv` (one row per attempt: model, session, tokens, status
+`ok`, `throttled` or `failed rc=N`), `running/<label>` while an attempt is
+live, `stream-<label>-<n>.ndjson`, `out-<label>.md` and `err-<label>.log`.
+The `commandcode` source reads those rows and the session files under
+`~/.commandcode/projects`. Unlabelled Command Code sessions show as runs with
+no label. Throttled attempts show as `died_early` with verdict `QUOTA`.
+
 ## Config
 
 Zero config runs. `config.local.json` deep-merges over `config.example.json`. The full tables are in [configuration](../../docs/configuration.md).

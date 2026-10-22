@@ -320,8 +320,11 @@ Fixes append `-fix1`, `-fix2`. The workstream id in the label must
 match the bundle id (`WS4`, not `ws4`).
 
 Weak labels are structurally impossible: `report start`,
-`scripts/run_worker.py`, and `scripts/launch_grok.sh` validate the
-label and exit 2 with the fix before launching anything, and a Claude
+`scripts/run_worker.py`, `scripts/launch_grok.sh`, and
+`scripts/launch_cmd.py` (Command Code, see the README) validate the
+label and exit 2 with the fix before launching anything. A headless
+`cmd -p` prompt must open with `[label: <label>]`, and the hook refuses
+one that does not. A Claude
 Code PreToolUse hook (`scripts/label_guard_hook.py`, installed with
 `sh scripts/install_hooks.sh --claude-label-guard`) stops
 hand-launched workers the same way. Replaying old runs (and only

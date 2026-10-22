@@ -6,7 +6,7 @@
    tier or source reads as codex-unknown. */
 (function (global) {
   "use strict";
-  var FAMS = ["claude", "cursor", "muse", "glm", "deepseek", "codex", "dagster", "other"];
+  var FAMS = ["claude", "cursor", "muse", "glm", "deepseek", "codex", "commandcode", "dagster", "other"];
   var FAM = {
     claude: {name: "Claude", hue: "--s1", order: ["opus", "fable", "sonnet", "haiku"]},
     cursor: {name: "Cursor", hue: "--s4", order: ["grok-4.7", "composer-2.5"]},
@@ -14,13 +14,17 @@
     glm: {name: "GLM", hue: "--s6", order: ["glm-5.3", "glm-5.3-flash"]},
     deepseek: {name: "DeepSeek", hue: "--s8", order: ["deepseek-flash", "deepseek-v4-pro"]},
     codex: {name: "Codex", hue: "--s9", order: ["gpt-6.1-sol", "gpt-6-luna"]},
+    commandcode: {name: "Command Code", hue: "--s10", order: ["reflection/beam:free", "minimax/minimax-m3.1-flash:free", "ornith/ornith-1.5-122b:free", "poolside/laguna-s-2.1-free", "stealth/glyph-cluster:free"]},
     dagster: {name: "Dagster", hue: "--s7", order: []},
     other: {name: "Other", hue: "--other", order: ["other"]}
   };
   var WORD = {grok: "Grok", composer: "Composer", glm: "GLM", flash: "Flash", spark: "Spark", wonder: "Wonder", muse: "muse", opus: "Opus", fable: "Fable", sonnet: "Sonnet", haiku: "Haiku", other: "Other", deepseek: "DeepSeek", pro: "Pro", codex: "Codex", gpt: "GPT", sol: "Sol", luna: "Luna", astra: "Astra", terra: "Terra", reserve: "Reserve", auto: "Auto", review: "Review"};
 
+  var COMMANDCODE_FREE = ["reflection/beam:free", "minimax/minimax-m3.1-flash:free", "ornith/ornith-1.5-122b:free", "poolside/laguna-s-2.1-free", "stealth/glyph-cluster:free"];
+
   function keyOf(model, hint) {
     var m = String(model || "").toLowerCase(), h = String(hint || "").toLowerCase(), v;
+    if (/commandcode/.test(h) || COMMANDCODE_FREE.indexOf(m) >= 0) return ["commandcode", m || "commandcode-unknown"];
     if (/^dagster:/.test(m) || /dagster/.test(h)) {
       var job = /^dagster:/.test(m) ? m.slice(8) : m;
       return ["dagster", "dagster:" + (job || "job")];
@@ -46,6 +50,7 @@
   }
   function nameOf(key) {
     if (/^dagster:/.test(key)) return key.slice(8) || "job";
+    if (famOf(key) === "commandcode") return key;
     if (/-unknown$/.test(key)) return "model not recorded";
     if (key === "deepseek-flash") return "DeepSeek V4.1 Flash";
     if (key === "deepseek-v4-pro") return "DeepSeek V4 Pro";

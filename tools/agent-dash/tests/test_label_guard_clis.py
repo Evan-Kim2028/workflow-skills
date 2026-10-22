@@ -107,6 +107,41 @@ class MusePayloadTests(unittest.TestCase):
         self.assertEqual(code, 0)
 
 
+CMD_LAUNCH_BAD = "nohup python3 scripts/launch_cmd.py ws6-gaps /repo /x/prompt.md /x/cmd > /x/l.log 2>&1 &"
+CMD_LAUNCH_GOOD = CMD_LAUNCH_BAD.replace("ws6-gaps", "ws6-plan-gaps")
+CMD_PROMPT_GOOD = 'cmd -p "[label: ws6-plan-gaps]\\nlist the routes" -m reflection/beam:free --output-format json'
+CMD_PROMPT_BAD = 'cmd -p "list the routes" -m reflection/beam:free --output-format json'
+
+
+class CommandCodePayloadTests(unittest.TestCase):
+    """Command Code launches: launch_cmd.py positional label and the headless -p prompt prefix."""
+
+    def payload(self, command):
+        return {"tool_name": "Bash", "tool_input": {"command": command}}
+
+    def test_launcher_with_a_plan_label_passes(self):
+        self.assertEqual(run_hook(self.payload(CMD_LAUNCH_GOOD)), (0, ""))
+
+    def test_launcher_with_a_weak_label_refused(self):
+        code, err = run_hook(self.payload(CMD_LAUNCH_BAD))
+        self.assertEqual(code, 2)
+        self.assertIn("ws6-plan-gaps", err)
+
+    def test_headless_prompt_with_label_prefix_passes(self):
+        self.assertEqual(run_hook(self.payload(CMD_PROMPT_GOOD)), (0, ""))
+
+    def test_headless_prompt_without_label_prefix_refused(self):
+        code, err = run_hook(self.payload(CMD_PROMPT_BAD))
+        self.assertEqual(code, 2)
+        self.assertIn("label refused", err)
+
+    def test_headless_prompt_with_shell_expansion_fails_open(self):
+        self.assertEqual(run_hook(self.payload('cmd -p "$PROMPT" -m reflection/beam:free')), (0, ""))
+
+    def test_interactive_cmd_without_p_passes(self):
+        self.assertEqual(run_hook(self.payload("cmd --version")), (0, ""))
+
+
 class ShimTests(unittest.TestCase):
     """shims/muse with the real binary pointed at /bin/echo."""
 

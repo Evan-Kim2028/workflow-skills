@@ -10,7 +10,9 @@ their lowercased id. A run whose model id was never recorded gets
 ``<family>-unknown``. A Grok CLI run whose model id is recorded but matches
 no known family (``mimo-*``, ``step-*``, or any other grok-hosted id) maps
 to ``other``: only an empty id falls back to ``glm-unknown``. A Dagster job
-keeps the job name after ``dagster:``.
+keeps the job name after ``dagster:``. A Command Code run (tier or source
+``commandcode``, or one of the five free ids) maps to the ``commandcode``
+family under its id, and an empty id reads as ``commandcode-unknown``.
 """
 
 from __future__ import annotations
@@ -18,6 +20,18 @@ from __future__ import annotations
 import re
 
 _CLAUDE = re.compile(r"(opus|fable|sonnet|haiku)")
+
+#: Command Code free-tier ids (``cmd -m``). A run whose tier or source is
+#: ``commandcode`` takes any id; these ids alone are enough outside that hint.
+COMMANDCODE_FREE = frozenset(
+    {
+        "reflection/beam:free",
+        "minimax/minimax-m3.1-flash:free",
+        "ornith/ornith-1.5-122b:free",
+        "poolside/laguna-s-2.1-free",
+        "stealth/glyph-cluster:free",
+    }
+)
 
 
 def _ver(pattern: str, text: str) -> str:
@@ -32,6 +46,8 @@ def model_key(model: str | None, hint: str | None = None) -> tuple[str, str]:
     if "dagster" in h or m.startswith("dagster:"):
         job = m[len("dagster:") :] if m.startswith("dagster:") else m
         return "dagster", "dagster:" + (job or "job")
+    if "commandcode" in h or m in COMMANDCODE_FREE:
+        return "commandcode", m or "commandcode-unknown"
     if "composer" in m:
         return "cursor", "composer" + _ver(r"composer[-_ ]?(\d+(?:\.\d+)?)", m)
     if "grok" in m:

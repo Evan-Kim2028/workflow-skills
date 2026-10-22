@@ -78,11 +78,24 @@ def family(model: str | None, table: dict | None = None) -> str | None:
     return None
 
 
+_COMMANDCODE_FREE = frozenset(
+    {
+        "reflection/beam:free",
+        "minimax/minimax-m3.1-flash:free",
+        "ornith/ornith-1.5-122b:free",
+        "poolside/laguna-s-2.1-free",
+        "stealth/glyph-cluster:free",
+    }
+)
+
+
 def series_key(model: str | None) -> str:
     fam = family(model)
     if fam:
         return fam
     text = (model or "").lower()
+    if text in _COMMANDCODE_FREE:
+        return "commandcode"
     for name in ("grok", "muse", "glm", "deepseek", "codex"):
         if name in text:
             return name
