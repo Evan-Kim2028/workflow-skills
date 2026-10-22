@@ -222,17 +222,19 @@ def _tool_key(run: dict) -> str | None:
 
 
 def _grok_cli_key(run: dict) -> str:
-    """Tool lane for a Grok CLI run: split by model family, not the CLI name.
+    """Tool lane for a Grok Build run: the grok provider, not the CLI name.
 
     The family comes from the one derivation in ``dash.models`` (lazy import:
-    this module takes no dash imports at load): ``deepseek-*`` runs count as
-    ``deepseek``, ``glm-*`` and unrecorded models stay ``glm``, and any other
-    grok-hosted id (``mimo-*``, ``step-*``) counts as ``other``.
+    this module takes no dash imports at load): every Grok Build run (the
+    ``grok-build`` launcher kind behind source ``glm``) counts as ``grok``,
+    whatever model it runs. Other sources never reach this helper.
     """
     from dash.models import model_key
 
     hint = " ".join(str(run.get(name) or "") for name in ("tier", "source"))
     fam, _key = model_key(run.get("model"), hint)
+    if fam == "grok":
+        return "grok"
     if fam == "deepseek":
         return "deepseek"
     if fam == "other":

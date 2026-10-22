@@ -332,7 +332,7 @@ class ManifestPollTests(unittest.TestCase):
 
         glm = self.store.runs[f"glm:{GLM}:rev"]
         self.assertEqual(glm["model"], "glm-5.3")
-        self.assertEqual(glm["tier"], "glm")
+        self.assertEqual(glm["tier"], "grok")
         self.assertEqual(glm["parent_session_id"], PARENT)
         self.assertEqual(glm["status"], "unknown")
 
@@ -469,7 +469,7 @@ class ManifestPollTests(unittest.TestCase):
         glm = self.store.runs[f"glm:{GLM}:rev"]
         self.assertEqual(glm["model"], "glm-5.3")
         self.assertEqual(glm["source"], "glm")
-        self.assertEqual(glm["tier"], "glm")
+        self.assertEqual(glm["tier"], "grok")
         self.assertEqual(glm["parent_session_id"], PARENT)
 
     def test_backfill_includes_old_exec(self):
@@ -520,7 +520,7 @@ class ManifestPollTests(unittest.TestCase):
         manifests.poll(self.store, self._cfg(state_dir=state), NOW)
         glm = self.store.runs[f"glm:{GLM}:ws9-WS9.1-build"]
         self.assertEqual(glm["source"], "glm")
-        self.assertEqual(glm["tier"], "glm")
+        self.assertEqual(glm["tier"], "grok")
         self.assertEqual(glm["label"], "ws9-WS9.1-build")
         self.assertEqual(glm["status"], "done")
         self.assertEqual(glm["verdict"], "PASS")

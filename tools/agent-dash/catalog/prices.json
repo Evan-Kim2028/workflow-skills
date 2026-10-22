@@ -2208,6 +2208,24 @@
    "retrieved_at": "2026-10-22",
    "confidence": "published",
    "input_note": "input is stored uncached at ingest (Command Code inputTokens is the whole prompt and includes cacheReadTokens)"
+  },
+  {
+   "provider": "grok-build/reflection",
+   "model": "reflection-beam",
+   "input": 0,
+   "output": 0,
+   "cache_read": 0,
+   "cache_write_5m": 0,
+   "cache_write_1h": 0,
+   "reasoning": null,
+   "long_context": null,
+   "input_includes_cache_read": false,
+   "billing_mode": "free",
+   "price_scope": "Reflection Beam through the Grok Build CLI (grok -m reflection-beam); free allotment, billed $0 like the Command Code free tier",
+   "source_url": null,
+   "retrieved_at": "2026-10-22",
+   "confidence": "inferred",
+   "input_note": "input is stored uncached at ingest (Command Code inputTokens is the whole prompt and includes cacheReadTokens)"
   }
 
  ]

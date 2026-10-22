@@ -1,7 +1,10 @@
-"""GLM source for sessions launched through the grok CLI.
+"""Grok Build source for sessions launched through the grok CLI.
 
 Manifest rows (``glm-sessions.tsv``: label, uuid, started epoch, model) become
-runs ``glm:<uuid>:<label>``. Token rows prefer ``usage.json`` under
+runs ``glm:<uuid>:<label>`` with tier ``grok`` (the launcher kind is
+grok-build, so every model it runs groups under the grok provider; the
+run id keeps its ``glm:`` prefix and usage keeps tool ``glm`` so stored
+rows and usage keys stay stable). Token rows prefer ``usage.json`` under
 ``~/.grok/sessions/<encoded-cwd>/<uuid>/``. ``inputTokens`` already includes
 ``cachedReadTokens``; both are stored raw. Per-turn objects are the additive
 ledger (the session object is used only when ``turns`` is empty).
@@ -338,7 +341,7 @@ def _upsert_run(store, row, model, pid, processes=None, pad=None, is_latest=True
     run = {
         "run_id": _run_id(row),
         "source": "glm",
-        "tier": "glm",
+        "tier": "grok",
         "session_id": sid,
     }
     if row.get("label"):

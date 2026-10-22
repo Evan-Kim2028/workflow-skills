@@ -295,7 +295,7 @@ ws4-WS4.1-notes-index	550e8400-e29b-41d4-a716-446655440000	1700000000	demo-model
 
 Status comes from the files: growing output means running, a SIGTERM trace in the err file means killed, an empty out file with a real error means died early, else done. The verdict comes from the first matching line of the out file (next section). Tokens do not travel this path; pair it with a `report usage` line or `generic.jsonl` usage lines. The shipped scratch glob is `$HOME/agent-scratch/*`, one directory deep; add deeper paths to `roots.scratchpads` and restart. Manifest rows prove liveness through out-file growth or a live sample of a shipped worker binary: a custom binary whose out file stays quiet reads `done` while it lives, and registering the folder does not revive it. When your binary is not one of the shipped launchers, report liveness with `report start` / `report usage` heartbeats / `report finish` instead of relying on the manifest alone.
 
-The live-agents tile counts the `grok`, `muse`, `glm`, `deepseek`, `other`, and `claude` buckets. Grok CLI runs split by model family: `deepseek-*` counts as DeepSeek, `glm-*` as GLM, anything else as Other. A generic run shows in the running table, on its task chip, and in tokens and cost either way; set `--tier` to the closest bucket only when the tile must count it.
+The live-agents tile counts the `grok`, `muse`, `glm`, `deepseek`, `other`, and `claude` buckets. Every Grok Build run (launcher kind `grok-build`, manifest `glm-sessions.tsv`) counts as grok with its model id kept for the per-model breakdown; cursor-agent Grok runs count as grok too. `glm-*` ids outside Grok Build (pi River rows) still count as GLM. A generic run shows in the running table, on its task chip, and in tokens and cost either way; set `--tier` to the closest bucket only when the tile must count it.
 
 ### pi workers
 
@@ -477,7 +477,7 @@ grok -p "<prompt>" --model deepseek-flash --output-format json
 
 Write the manifest row with the model fourth (`label`, session uuid, start epoch, `deepseek-flash`) in `glm-sessions.tsv`, and label the run `ws<N>-plan-<slug>`, `ws<N>-exec-<slug>`, or `ws<N>-review-<slug>` (§3). The legacy aliases `deepseek-v4-flash` and `deepseek-v4-flash-vision-exp` price as `deepseek-flash`; `deepseek-v4-pro` is the Pro id.
 
-The dashboard shows DeepSeek tokens with the cache split (stored `input` is the miss, `cache_read` the hit), time-aware cost, and its own Live agents strip in Activity over time once a DeepSeek run exists in the window. Any other grok-hosted id (`mimo-*`, `step-*`) reads as Other: priced only when the catalog names it, and counted outside the GLM lane.
+The dashboard shows DeepSeek tokens with the cache split (stored `input` is the miss, `cache_read` the hit) and time-aware cost. Grok Build runs land in the Grok lane (with a Grok strip in Activity over time once such a run exists in the window) whatever model they run; pi River DeepSeek runs keep their own DeepSeek strip. Any other grok-hosted id (`mimo-*`, `step-*`) through Grok Build reads as Grok under its own id: priced only when the catalog names it.
 
 ### Codex CLI (plan-included, unpriced until rates verify)
 

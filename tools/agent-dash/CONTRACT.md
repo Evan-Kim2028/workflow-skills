@@ -887,7 +887,8 @@ python3 agent_dash.py report usage --label <label> --input N --output N [--model
 `finish --status` is `done`, `killed`, or `died_early`. `finish` without
 `--model` keeps the model from `start`. Verdicts are `PASS`, `PARTIAL`,
 `BLOCKED`, `APPROVE`, `APPROVE_WITH_CHANGES`, `APPROVE_WITH_NITS`, or
-`REQUEST_CHANGES`. The live-agents tile counts the `grok`, `muse`,
+`REQUEST_CHANGES`. The live-agents tile counts the `grok` (cursor-agent
+and Grok Build runs, the latter with tier `grok`), `muse`,
 `glm`, and `claude` buckets; a generic run shows in the running table,
 on its task chip, and in tokens and cost either way.
 

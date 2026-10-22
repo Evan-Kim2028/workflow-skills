@@ -242,7 +242,7 @@ class StoreTest(unittest.TestCase):
         self.assertEqual(snap["totals"]["cost_usd"], 0.0)
         self.assertIsNone(snap["recent"][0]["cost_usd"])
         buckets = self.store.query_usage("model", "hour", None, None)
-        self.assertEqual(buckets[0]["key"], "glm")
+        self.assertEqual(buckets[0]["key"], "glm-unlisted")
         self.assertIsNone(buckets[0]["cost_usd"])
 
     def test_zero_token_unpriced_model_is_ignored(self):
@@ -2336,7 +2336,8 @@ class LaneAndUnseenTest(unittest.TestCase):
         self._lane(now)
         snap = self.store.snapshot(now, "all")
         self.assertEqual(snap["counts"]["live_agents"], 1)
-        self.assertEqual(snap["counts"]["live_by_tool"]["glm"], 1)
+        self.assertEqual(snap["counts"]["live_by_tool"]["grok"], 1)
+        self.assertEqual(snap["counts"]["live_by_tool"]["glm"], 0)
         self.assertEqual(snap["counts"]["live_by_tool"]["claude"], 0)
         running = snap["running"]
         self.assertEqual(len(running), 1)

@@ -46,9 +46,14 @@ TSV_CAP = 1024 * 1024
 PROCESS_TTL_S = 30
 
 # filename, source, directory, default tier
+#
+# ``glm-sessions.tsv`` is written only by the Grok Build launcher kind
+# (``scripts/run_worker.py`` kind ``grok-build``), so its rows group under
+# the grok provider. The run id keeps its ``glm:`` prefix so stored rows
+# stay stable; only the tier reads ``grok``.
 _MANIFESTS = (
     ("muse-sessions.tsv", "muse", "muse", "muse"),
-    ("glm-sessions.tsv", "glm", "glm", "glm"),
+    ("glm-sessions.tsv", "glm", "glm", "grok"),
     ("grok-sessions.tsv", "grok", "grok", "grok"),
     ("cursor-sessions.tsv", "grok", "cursor", "grok"),
 )
@@ -320,7 +325,12 @@ def _emit_manifest(
     report_path = os.path.join(base, f"report-{label}.md")
     run_id = _run_id(source, directory, row["session_uuid"], parent, label, row["started_at"])
     model = row["model"]
-    tier = tier_of(model) or default_tier
+    if source == "glm":
+        # Grok Build launcher kind: every model it runs (glm-*, deepseek-*,
+        # reflection-beam, future ids) groups under the grok provider.
+        tier = "grok"
+    else:
+        tier = tier_of(model) or default_tier
     pid_file = _pid_file_for(scratch, base, label)
     quota_hit = _quota_hit_for(source, err_path, out_path)
     superseded = _superseded(store, source, run_id, label, row["started_at"])

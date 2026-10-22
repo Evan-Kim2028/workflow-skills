@@ -1,26 +1,32 @@
 /* Model families. One place maps a run or a model id to its family (hue) and model (shade of that hue).
-   dash/models.py holds the same rules for the server-side counts. A Grok CLI
-   run with a recorded-but-unknown model id (mimo-*, step-*) reads as Other;
-   only an empty id reads as glm-unknown. Codex ids (gpt-*, codex-*,
-   gpt-reserve) read as Codex under their id; an empty id with a codex
-   tier or source reads as codex-unknown. */
+   dash/models.py holds the same rules for the server-side counts. A Grok Build
+   run (the grok-build launcher kind: tier grok with a glm source or usage
+   tool, or one of the known Grok Build ids) reads as Grok under its recorded
+   id. A non-Grok-Build run with a recorded-but-unknown model id (mimo-*,
+   step-*) reads as Other. Codex ids (gpt-*, codex-*, gpt-reserve) read as
+   Codex under their id; an empty id with a codex tier or source reads as
+   codex-unknown. reflection-beam (Grok Build, free) is distinct from
+   reflection/beam:free (Command Code, free). */
 (function (global) {
   "use strict";
-  var FAMS = ["claude", "cursor", "muse", "glm", "deepseek", "codex", "commandcode", "dagster", "other"];
+  var FAMS = ["claude", "cursor", "muse", "glm", "grok", "deepseek", "codex", "commandcode", "dagster", "other"];
   var FAM = {
     claude: {name: "Claude", hue: "--s1", order: ["opus", "fable", "sonnet", "haiku"]},
     cursor: {name: "Cursor", hue: "--s4", order: ["grok-4.7", "composer-2.5"]},
     muse: {name: "muse", hue: "--s5", order: ["muse-spark-1.3", "muse-wonder-1.0"]},
     glm: {name: "GLM", hue: "--s6", order: ["glm-5.3", "glm-5.3-flash"]},
+    grok: {name: "Grok", hue: "--s11", order: ["glm-5.3", "glm-5.3-flash", "deepseek-flash", "reflection-beam"]},
     deepseek: {name: "DeepSeek", hue: "--s8", order: ["deepseek-flash", "deepseek-v4-pro"]},
     codex: {name: "Codex", hue: "--s9", order: ["gpt-6.1-sol", "gpt-6-luna"]},
     commandcode: {name: "Command Code", hue: "--s10", order: ["reflection/beam:free", "minimax/minimax-m3.1-flash:free", "ornith/ornith-1.5-122b:free", "poolside/laguna-s-2.1-free", "stealth/glyph-cluster:free"]},
     dagster: {name: "Dagster", hue: "--s7", order: []},
     other: {name: "Other", hue: "--other", order: ["other"]}
   };
-  var WORD = {grok: "Grok", composer: "Composer", glm: "GLM", flash: "Flash", spark: "Spark", wonder: "Wonder", muse: "muse", opus: "Opus", fable: "Fable", sonnet: "Sonnet", haiku: "Haiku", other: "Other", deepseek: "DeepSeek", pro: "Pro", codex: "Codex", gpt: "GPT", sol: "Sol", luna: "Luna", astra: "Astra", terra: "Terra", reserve: "Reserve", auto: "Auto", review: "Review"};
+  var WORD = {grok: "Grok", composer: "Composer", glm: "GLM", flash: "Flash", spark: "Spark", wonder: "Wonder", muse: "muse", opus: "Opus", fable: "Fable", sonnet: "Sonnet", haiku: "Haiku", other: "Other", deepseek: "DeepSeek", pro: "Pro", codex: "Codex", gpt: "GPT", sol: "Sol", luna: "Luna", astra: "Astra", terra: "Terra", reserve: "Reserve", auto: "Auto", review: "Review", reflection: "Reflection", beam: "Beam"};
 
   var COMMANDCODE_FREE = ["reflection/beam:free", "minimax/minimax-m3.1-flash:free", "ornith/ornith-1.5-122b:free", "poolside/laguna-s-2.1-free", "stealth/glyph-cluster:free"];
+
+  var GROK_BUILD_MODELS = ["glm-5.3", "glm-5.3-flash", "deepseek-flash", "deepseek-v4-flash", "deepseek-v4-flash-vision-exp", "deepseek-v4-pro", "reflection-beam"];
 
   function keyOf(model, hint) {
     var m = String(model || "").toLowerCase(), h = String(hint || "").toLowerCase(), v;
@@ -29,8 +35,13 @@
       var job = /^dagster:/.test(m) ? m.slice(8) : m;
       return ["dagster", "dagster:" + (job || "job")];
     }
-    v = /^(claude|cursor|muse|glm|codex)-unknown$/.exec(m);
+    v = /^(claude|cursor|muse|glm|grok|codex)-unknown$/.exec(m);
     if (v) return [v[1], m];
+    /* Grok Build launcher kind (manifest source and usage tool stay glm
+       while the run tier reads grok): the recorded id is the per-model
+       breakdown, never collapsed to Other. */
+    if (/glm/.test(h)) return ["grok", m || "grok-unknown"];
+    if (GROK_BUILD_MODELS.indexOf(m) >= 0) return ["grok", m];
     if (/composer/.test(m)) { v = /composer[-_ ]?(\d+(?:\.\d+)?)/.exec(m); return ["cursor", "composer" + (v ? "-" + v[1] : "")]; }
     if (/grok/.test(m)) { v = /grok[-_ ]?(\d+(?:\.\d+)?)/.exec(m); return ["cursor", "grok" + (v ? "-" + v[1] : "")]; }
     if (/glm/.test(m)) { v = /glm[-_ ]?(\d+(?:\.\d+)?)/.exec(m); return ["glm", "glm" + (v ? "-" + v[1] : "") + (/flash/.test(m) ? "-flash" : "")]; }
@@ -42,10 +53,10 @@
     if (v) return ["claude", v[1]];
     if (/grok|cursor|composer/.test(h)) return ["cursor", "cursor-unknown"];
     if (/muse/.test(h)) return ["muse", "muse-unknown"];
-    /* A recorded-but-unknown Grok CLI id (mimo-*, step-*) is Other; only an
-       empty id falls back to glm-unknown. Mirrors dash/models.py. */
-    if (/glm/.test(h)) return m ? ["other", "other"] : ["glm", "glm-unknown"];
     if (/claude/.test(h)) return ["claude", "claude-unknown"];
+    /* A non-Grok-Build run with a recorded-but-unknown id (mimo-*, step-*)
+       is Other. Grok Build hints return earlier, so a Grok Build id never
+       reaches here. Mirrors dash/models.py. */
     return ["other", "other"];
   }
   function nameOf(key) {

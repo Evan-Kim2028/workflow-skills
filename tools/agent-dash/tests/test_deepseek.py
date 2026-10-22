@@ -196,12 +196,22 @@ class CostMathTest(unittest.TestCase):
 
 class ModelKeyTest(unittest.TestCase):
     def test_deepseek_keys(self):
-        self.assertEqual(model_key("deepseek-flash"), ("deepseek", "deepseek-flash"))
-        self.assertEqual(model_key("deepseek-v4-flash"), ("deepseek", "deepseek-flash"))
-        self.assertEqual(model_key("deepseek-v4-flash-vision-exp"), ("deepseek", "deepseek-flash"))
-        self.assertEqual(model_key("deepseek-v4-pro"), ("deepseek", "deepseek-v4-pro"))
-        self.assertEqual(series_key("deepseek-flash"), "deepseek")
-        self.assertEqual(series_key("deepseek-v4-pro"), "deepseek")
+        # Grok Build DeepSeek ids group under the grok provider; the River
+        # ids behind pi keep the DeepSeek family.
+        self.assertEqual(model_key("deepseek-flash"), ("grok", "deepseek-flash"))
+        self.assertEqual(model_key("deepseek-v4-flash"), ("grok", "deepseek-v4-flash"))
+        self.assertEqual(
+            model_key("deepseek-v4-flash-vision-exp"),
+            ("grok", "deepseek-v4-flash-vision-exp"),
+        )
+        self.assertEqual(model_key("deepseek-v4-pro"), ("grok", "deepseek-v4-pro"))
+        self.assertEqual(series_key("deepseek-flash"), "grok")
+        self.assertEqual(series_key("deepseek-v4-pro"), "grok")
+        self.assertEqual(
+            model_key("deepseek-ai/DeepSeek-V4.1-Flash-1017", "pi pi"),
+            ("deepseek", "deepseek-flash"),
+        )
+        self.assertEqual(series_key("deepseek-ai/DeepSeek-V4.1-Flash-1017"), "deepseek")
 
     def test_run_hint_does_not_swallow_deepseek(self):
         # Grok CLI runs carry tier/source glm; the model id still decides.
@@ -430,6 +440,14 @@ class StorePricingTest(unittest.TestCase):
                     sum(cell["input"] for cell in flash), 18129 * 2,
                 )
                 self.assertEqual(sum(cell["cache_read"] for cell in flash), 8192 * 2)
+                # The tool lane reads grok even though the stored usage tool
+                # stays glm for row identity.
+                tools = store.query_usage("tool", "hour", None, OFF_SUN_1537 - 3600, PEAK_MON_0200 + 7200)
+                by_key = {cell["key"] for cell in tools}
+                self.assertIn("grok", by_key)
+                self.assertNotIn("glm", by_key)
+                grok = [cell for cell in tools if cell["key"] == "grok"]
+                self.assertEqual(sum(cell["input"] for cell in grok), 18129 * 2)
             finally:
                 store.close()
 
@@ -511,16 +529,16 @@ class SnapshotAgreementTest(unittest.TestCase):
             conn.close()
 
 
-LANES = ("grok", "muse", "glm", "claude", "deepseek", "other")
+LANES = ("grok", "muse", "glm", "claude", "deepseek", "codex", "other")
 
 
 def _grok_run(store, run_id, model, start, end=None, status="done", label=None):
-    """A synthetic Grok CLI run row: ids and counts only, never prompt text."""
+    """A synthetic Grok Build run row: ids and counts only, never prompt text."""
     store.upsert_run(
         {
             "run_id": run_id,
             "source": "glm",
-            "tier": "glm",
+            "tier": "grok",
             "model": model,
             "label": label or run_id,
             "session_id": "sess-" + run_id.replace(":", "-"),
@@ -533,50 +551,65 @@ def _grok_run(store, run_id, model, start, end=None, status="done", label=None):
 
 class GrokCliFamilyTest(unittest.TestCase):
     def test_model_ids_map_to_families(self):
+        # Every Grok Build id groups under the grok provider with its own
+        # model key, whether or not a run hint names the launcher.
         cases = {
-            "deepseek-flash": ("deepseek", "deepseek-flash"),
-            "deepseek-v4-flash": ("deepseek", "deepseek-flash"),
-            "deepseek-v4-flash-vision-exp": ("deepseek", "deepseek-flash"),
-            "deepseek-v4-pro": ("deepseek", "deepseek-v4-pro"),
-            "glm-5.3": ("glm", "glm-5.3"),
-            "glm-5.3-flash": ("glm", "glm-5.3-flash"),
+            "deepseek-flash": ("grok", "deepseek-flash"),
+            "deepseek-v4-flash": ("grok", "deepseek-v4-flash"),
+            "deepseek-v4-flash-vision-exp": ("grok", "deepseek-v4-flash-vision-exp"),
+            "deepseek-v4-pro": ("grok", "deepseek-v4-pro"),
+            "glm-5.3": ("grok", "glm-5.3"),
+            "glm-5.3-flash": ("grok", "glm-5.3-flash"),
+            "reflection-beam": ("grok", "reflection-beam"),
         }
         for model, want in cases.items():
             self.assertEqual(model_key(model, "glm glm"), want, model)
+            self.assertEqual(model_key(model, "grok glm"), want, model)
             self.assertEqual(model_key(model), want, model)
 
-    def test_unknown_grok_hosted_id_is_other(self):
+    def test_unknown_grok_hosted_id_groups_as_grok_with_hint(self):
         from dash.store import _tool_key
 
+        # A future grok-hosted id keeps its own model key once the run hint
+        # names the Grok Build launcher; without a hint it stays other.
         for model in ("mimo-v2-flash", "step-3.5-flash", "zzz-9"):
-            self.assertEqual(model_key(model, "glm glm"), ("other", "other"), model)
+            self.assertEqual(model_key(model, "glm glm"), ("grok", model), model)
+            self.assertEqual(model_key(model, "grok glm"), ("grok", model), model)
             self.assertEqual(model_key(model), ("other", "other"), model)
-            run = {"source": "glm", "tier": "glm", "model": model}
-            self.assertEqual(_tool_key(run), "other", model)
+            run = {"source": "glm", "tier": "grok", "model": model}
+            self.assertEqual(_tool_key(run), "grok", model)
 
-    def test_unrecorded_model_stays_glm(self):
+    def test_unrecorded_model_reads_grok_unknown(self):
         from dash.store import _tool_key
 
         for model in (None, ""):
-            self.assertEqual(model_key(model, "glm glm"), ("glm", "glm-unknown"))
-            run = {"source": "glm", "tier": "glm", "model": model}
-            self.assertEqual(_tool_key(run), "glm")
+            self.assertEqual(model_key(model, "glm glm"), ("grok", "grok-unknown"))
+            run = {"source": "glm", "tier": "grok", "model": model}
+            self.assertEqual(_tool_key(run), "grok")
 
-    def test_tool_lanes_split_only_deepseek_and_other(self):
+    def test_tool_lanes_group_all_grok_build_as_grok(self):
         from dash.store import _tool_key
 
-        self.assertEqual(
-            _tool_key({"source": "glm", "tier": "glm", "model": "deepseek-flash"}),
-            "deepseek",
-        )
-        # GLM ids, unrecorded models, and other families through the same
-        # CLI keep the GLM lane: existing GLM counts do not move.
-        for model in ("glm-5.3", "glm-5.3-flash", None, "", "grok-4.7"):
+        # Every Grok Build run shares the grok lane, whatever model it
+        # runs; the per-model breakdown carries the ids, not the lane.
+        for model in (
+            "deepseek-flash",
+            "glm-5.3",
+            "glm-5.3-flash",
+            "reflection-beam",
+            "mimo-v2-flash",
+            None,
+            "",
+        ):
             self.assertEqual(
-                _tool_key({"source": "glm", "tier": "glm", "model": model}),
-                "glm",
+                _tool_key({"source": "glm", "tier": "grok", "model": model}),
+                "grok",
                 repr(model),
             )
+        self.assertEqual(
+            _tool_key({"source": "glm", "tier": "glm", "model": "glm-5.3"}),
+            "grok",
+        )
         self.assertIsNone(_tool_key({"source": "dagster", "tier": "", "model": None}))
 
 
@@ -602,22 +635,21 @@ class ConcurrencySplitTest(unittest.TestCase):
                     lane_total = sum(point[key] for key in LANES)
                     self.assertEqual(lane_total, sum(point["models"].values()))
                 by_t = {point["t"]: point for point in points}
-                # GLM-only stretch: the GLM lane is untouched by the split.
-                self.assertEqual((by_t[b]["glm"], by_t[b]["deepseek"]), (1, 0))
-                # Overlap: two lanes with the right peaks.
-                self.assertEqual((by_t[b + 240]["glm"], by_t[b + 240]["deepseek"]), (1, 1))
+                # Both Grok Build runs share the grok lane; the models
+                # dict keeps the per-model breakdown.
+                self.assertEqual(by_t[b]["grok"], 1)
+                self.assertEqual(by_t[b + 240]["grok"], 2)
                 self.assertEqual(
                     by_t[b + 240]["models"], {"glm-5.3-flash": 1, "deepseek-flash": 1}
                 )
-                # DeepSeek-only stretch.
-                self.assertEqual((by_t[b + 600]["glm"], by_t[b + 600]["deepseek"]), (0, 1))
-                self.assertEqual(max(point["glm"] for point in points), 1)
-                self.assertEqual(max(point["deepseek"] for point in points), 1)
-                self.assertEqual(sum(point["glm"] for point in points), 9)
+                self.assertEqual(by_t[b + 600]["grok"], 1)
+                self.assertEqual((by_t[b + 600]["glm"], by_t[b + 600]["deepseek"]), (0, 0))
+                self.assertEqual(max(point["grok"] for point in points), 2)
+                self.assertEqual(sum(point["grok"] for point in points), 9 + 8)
             finally:
                 store.close()
 
-    def test_other_family_run_leaves_glm_alone(self):
+    def test_future_grok_hosted_id_shares_the_grok_lane(self):
         from dash.store import Store
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -628,12 +660,15 @@ class ConcurrencySplitTest(unittest.TestCase):
                 _grok_run(store, "glm:s3:mimo-x", "mimo-v2-flash", b + 120, b + 240)
                 points = self._points(store)
                 by_t = {point["t"]: point for point in points}
-                self.assertEqual(by_t[b + 180]["other"], 1)
-                self.assertEqual(by_t[b + 180]["models"], {"glm-5.3-flash": 1, "other": 1})
+                self.assertEqual(by_t[b + 180]["grok"], 2)
+                self.assertEqual(
+                    by_t[b + 180]["models"],
+                    {"glm-5.3-flash": 1, "mimo-v2-flash": 1},
+                )
                 self.assertEqual(by_t[b]["other"], 0)
                 self.assertEqual(by_t[b + 300]["other"], 0)
-                # The GLM lane still counts exactly its own run.
-                self.assertEqual(sum(point["glm"] for point in points), 9)
+                # The grok lane counts both Grok Build runs exactly.
+                self.assertEqual(sum(point["grok"] for point in points), 9 + 2)
             finally:
                 store.close()
 
@@ -667,7 +702,8 @@ class ConcurrencyApiTest(unittest.TestCase):
                 snap = self._get(server.server_address[1], "/api/snapshot?ws=all")
                 self.assertEqual(snap["counts"]["live_agents"], 2)
                 by_tool = snap["counts"]["live_by_tool"]
-                self.assertEqual((by_tool["glm"], by_tool["deepseek"]), (1, 1))
+                self.assertEqual(by_tool["grok"], 2)
+                self.assertEqual((by_tool["glm"], by_tool["deepseek"]), (0, 0))
                 self.assertEqual(sum(by_tool.values()), 2)
                 by_model = snap["counts"]["live_by_model"]
                 self.assertEqual(
@@ -686,7 +722,8 @@ class ConcurrencyApiTest(unittest.TestCase):
                         sum(point["models"].values()),
                     )
                 last = points[-1]
-                self.assertEqual((last["glm"], last["deepseek"]), (1, 1))
+                self.assertEqual(last["grok"], 2)
+                self.assertEqual((last["glm"], last["deepseek"]), (0, 0))
                 self.assertEqual(
                     last["models"], {"glm-5.3-flash": 1, "deepseek-flash": 1}
                 )

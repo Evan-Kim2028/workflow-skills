@@ -1,18 +1,25 @@
 """Model families and model keys.
 
 The same rules live in ``static/models.js``. A run maps to a family (claude,
-cursor, muse, glm, deepseek, codex, dagster) and a model key such as
+cursor, muse, glm, grok, deepseek, codex, dagster) and a model key such as
 ``grok-4.7`` or ``composer-2.5``. DeepSeek ids map to ``deepseek-flash``
 (including the legacy ``deepseek-v4-flash`` and
 ``deepseek-v4-flash-vision-exp`` aliases) or ``deepseek-v4-pro``. Codex ids
 (``gpt-*``, ``codex-*``, ``gpt-reserve``) map to the ``codex`` family under
 their lowercased id. A run whose model id was never recorded gets
-``<family>-unknown``. A Grok CLI run whose model id is recorded but matches
-no known family (``mimo-*``, ``step-*``, or any other grok-hosted id) maps
-to ``other``: only an empty id falls back to ``glm-unknown``. A Dagster job
+``<family>-unknown``. A Grok Build run (the ``grok-build`` launcher kind:
+tier ``grok`` with a ``glm`` source or usage tool, or one of the known
+Grok Build ids below) maps to the ``grok`` family under its recorded id,
+so every model it runs (``glm-5.3``, ``glm-5.3-flash``, ``deepseek-flash``,
+``reflection-beam``, and any future id) keeps a per-model breakdown. A
+non-Grok-Build run whose model id matches no known family (``mimo-*``,
+``step-*``, or any other unknown id) maps to ``other``. A Dagster job
 keeps the job name after ``dagster:``. A Command Code run (tier or source
 ``commandcode``, or one of the five free ids) maps to the ``commandcode``
 family under its id, and an empty id reads as ``commandcode-unknown``.
+``reflection-beam`` (Grok Build, free) is distinct from
+``reflection/beam:free`` (Command Code, free): only the latter reads as
+``commandcode``.
 """
 
 from __future__ import annotations
@@ -33,6 +40,25 @@ COMMANDCODE_FREE = frozenset(
     }
 )
 
+#: Grok Build model ids (``grok -m`` through the ``grok-build`` launcher
+#: kind). These group under the grok provider even with no run hint; any
+#: other grok-hosted id groups the same way once a run hint names the
+#: Grok Build launcher (``glm`` in the tier/source hint: the manifest
+#: source and usage tool stay ``glm`` while the run tier reads ``grok``).
+#: ``reflection-beam`` here is the Grok Build free id, distinct from the
+#: Command Code ``reflection/beam:free`` id above.
+GROK_BUILD_MODELS = frozenset(
+    {
+        "glm-5.3",
+        "glm-5.3-flash",
+        "deepseek-flash",
+        "deepseek-v4-flash",
+        "deepseek-v4-flash-vision-exp",
+        "deepseek-v4-pro",
+        "reflection-beam",
+    }
+)
+
 
 def _ver(pattern: str, text: str) -> str:
     match = re.search(pattern, text)
@@ -48,6 +74,13 @@ def model_key(model: str | None, hint: str | None = None) -> tuple[str, str]:
         return "dagster", "dagster:" + (job or "job")
     if "commandcode" in h or m in COMMANDCODE_FREE:
         return "commandcode", m or "commandcode-unknown"
+    if "glm" in h:
+        # Grok Build launcher kind (manifest source and usage tool stay
+        # ``glm`` while the run tier reads ``grok``): the recorded id is
+        # the per-model breakdown, never collapsed to ``other``.
+        return "grok", m or "grok-unknown"
+    if m in GROK_BUILD_MODELS or m == "grok-unknown":
+        return "grok", m
     if "composer" in m:
         return "cursor", "composer" + _ver(r"composer[-_ ]?(\d+(?:\.\d+)?)", m)
     if "grok" in m:
@@ -68,10 +101,8 @@ def model_key(model: str | None, hint: str | None = None) -> tuple[str, str]:
     match = _CLAUDE.search(m) or _CLAUDE.search(h)
     if match:
         return "claude", match.group(1)
-    for fam, words in (("cursor", ("grok", "cursor", "composer")), ("muse", ("muse",)), ("glm", ("glm",)), ("claude", ("claude",))):
+    for fam, words in (("cursor", ("grok", "cursor", "composer")), ("muse", ("muse",)), ("claude", ("claude",))):
         if any(word in h for word in words):
-            if fam == "glm" and m:
-                return "other", "other"
             return fam, f"{fam}-unknown"
     return "other", "other"
 

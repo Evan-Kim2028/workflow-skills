@@ -98,7 +98,8 @@ def _tool_key(run: dict) -> str | None:
     if source == "muse" or tier == "muse":
         return "muse"
     if source == "glm" or tier == "glm":
-        return "glm"
+        # Grok Build launcher kind (source ``glm``): the grok provider.
+        return "grok"
     if source in ("codex", "codex-exec") or tier == "codex":
         return "codex"
     if source.startswith("claude") or tier in ("opus", "sonnet", "haiku"):

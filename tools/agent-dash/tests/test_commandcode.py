@@ -328,7 +328,7 @@ class FreeModelPricingTest(unittest.TestCase):
             self.assertEqual(model_key(model, "")[0], "commandcode", model)
             self.assertEqual(pricing.series_key(model), "commandcode")
         self.assertEqual(model_key("", "commandcode"), ("commandcode", "commandcode-unknown"))
-        self.assertEqual(model_key("glm-5.3", ""), ("glm", "glm-5.3"))
+        self.assertEqual(model_key("glm-5.3", ""), ("grok", "glm-5.3"))
 
 
 class LiveRunEvidenceTest(unittest.TestCase):

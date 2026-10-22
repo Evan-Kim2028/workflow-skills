@@ -166,7 +166,7 @@ class GrokCliTests(unittest.TestCase):
             self.poll(store, cfg, 1792154000)
             run = store.runs["glm:%s:glm-review" % SID]
             self.assertEqual(run["source"], "glm")
-            self.assertEqual(run["tier"], "glm")
+            self.assertEqual(run["tier"], "grok")
             self.assertEqual(run["label"], "glm-review")
             self.assertEqual(run["model"], "glm-5.3")
             self.assertEqual(run["session_id"], SID)
@@ -331,6 +331,56 @@ class GrokCliTests(unittest.TestCase):
             )
         self.assertEqual(store.runs, {})
 
+    def test_reflection_beam_groups_as_grok_and_prices_zero(self):
+        """A Grok Build reflection-beam run reads tier grok and stays priced.
+
+        The manifest model is kept verbatim, token usage comes from the
+        grok session's usage.json keyed by the manifest session id, and
+        the zero-price catalog row keeps it priced (never unpriced).
+        """
+        doc = {
+            "updatedAt": "2026-10-22T12:00:00+00:00",
+            "session": {"primaryModelId": "reflection-beam"},
+            "turns": [
+                {
+                    "turnNumber": 1,
+                    "endedAt": "2026-10-22T12:00:01+00:00",
+                    "inputTokens": 1000,
+                    "cachedReadTokens": 100,
+                    "outputTokens": 50,
+                    "cacheCreationTokens": 0,
+                    "reasoningTokens": 0,
+                    "primaryModelId": "reflection-beam",
+                }
+            ],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg, _log, _usage, _other = self.tree(
+                tmp, "beam-run\t%s\t1792153370\treflection-beam\n" % SID, usage=doc
+            )
+            store = Store()
+            self.poll(store, cfg, 1792154000)
+        run = store.runs["glm:%s:beam-run" % SID]
+        self.assertEqual(run["source"], "glm")
+        self.assertEqual(run["tier"], "grok")
+        self.assertEqual(run["model"], "reflection-beam")
+        total = summed(store, SID)
+        self.assertEqual(
+            (total["input"], total["cache_read"], total["output"]),
+            (900, 100, 50),
+        )
+        from dash.models import model_key
+        from dash.pricing import cost, status
+
+        self.assertEqual(
+            model_key("reflection-beam", "grok glm"), ("grok", "reflection-beam")
+        )
+        self.assertEqual(model_key("reflection-beam"), ("grok", "reflection-beam"))
+        info = status("reflection-beam")
+        self.assertTrue(info["priced"])
+        self.assertEqual(info["provider"], "grok-build/reflection")
+        self.assertEqual(cost("reflection-beam", 900, 50, 100, 0), 0.0)
+
     def test_encoded_cwd_root_attributes_glm_manifest(self):
         with tempfile.TemporaryDirectory() as tmp:
             enc = os.path.join(tmp, "enc")
@@ -352,7 +402,7 @@ class GrokCliTests(unittest.TestCase):
             self.poll(store, cfg, 1792154000)
             run = store.runs["glm:%s:glm-review" % SID]
             self.assertEqual(run["model"], "glm-5.3")
-            self.assertEqual(run["tier"], "glm")
+            self.assertEqual(run["tier"], "grok")
             self.assertEqual(run["label"], "glm-review")
             self.assertEqual(run["parent_session_id"], HUB)
             self.assertEqual(run["started_at"], 1792153370.0)

@@ -89,13 +89,37 @@ _COMMANDCODE_FREE = frozenset(
 )
 
 
-def series_key(model: str | None) -> str:
+#: Grok Build model ids (``grok -m`` through the ``grok-build`` launcher
+#: kind). Mirrors ``dash.models.GROK_BUILD_MODELS``: these group under the
+#: grok provider. ``reflection-beam`` here is the Grok Build free id,
+#: distinct from the Command Code ``reflection/beam:free`` id.
+_GROK_BUILD_MODELS = frozenset(
+    {
+        "glm-5.3",
+        "glm-5.3-flash",
+        "deepseek-flash",
+        "deepseek-v4-flash",
+        "deepseek-v4-flash-vision-exp",
+        "deepseek-v4-pro",
+        "reflection-beam",
+    }
+)
+
+
+def series_key(model: str | None, hint: str | None = None) -> str:
     fam = family(model)
     if fam:
         return fam
     text = (model or "").lower()
     if text in _COMMANDCODE_FREE:
         return "commandcode"
+    if text in _GROK_BUILD_MODELS:
+        return "grok"
+    if hint and "glm" in hint.lower():
+        # Grok Build launcher kind (manifest source and usage tool stay
+        # ``glm`` while the run tier reads ``grok``): any current or
+        # future model it runs groups under the grok provider.
+        return "grok"
     for name in ("grok", "muse", "glm", "deepseek", "codex"):
         if name in text:
             return name

@@ -1197,13 +1197,15 @@ global.window = globalThis;
 eval(fs.readFileSync(process.argv[2], "utf8"));
 eval(fs.readFileSync(process.argv[3], "utf8"));
 assert.strictEqual(typeof actConcFams, "function", "actConcFams is not exported");
-assert.deepStrictEqual(actConcFams(["glm-5.3-flash", "deepseek-flash"]), ["glm", "deepseek"]);
-assert.deepStrictEqual(actConcFams(["deepseek-flash", "glm-5.3-flash", "deepseek-v4-pro"]), ["glm", "deepseek"]);
+assert.deepStrictEqual(actConcFams(["glm-5.3-flash", "deepseek-flash"]), ["grok"]);
+assert.deepStrictEqual(actConcFams(["deepseek-flash", "glm-5.3-flash", "deepseek-v4-pro"]), ["grok"]);
+assert.deepStrictEqual(actConcFams(["reflection-beam"]), ["grok"]);
 assert.deepStrictEqual(actConcFams(["glm-unknown"]), ["glm"]);
 assert.deepStrictEqual(actConcFams(["other"]), ["other"]);
 assert.deepStrictEqual(actConcFams([]), []);
 assert.deepStrictEqual(actConcFams(null), []);
 assert.strictEqual(ADM.famColor("deepseek"), "var(--s8)", "DeepSeek strip lost its --s8 hue");
+assert.strictEqual(ADM.famColor("grok"), "var(--s11)", "Grok strip lost its --s11 hue");
 console.log("conc fams proof ok");
 '''
         with tempfile.TemporaryDirectory() as tmp:

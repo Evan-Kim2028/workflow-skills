@@ -233,9 +233,13 @@ class UsageMixin:
                 if group == "model":
                     key = model_key(row["model"], row["tool"])[1]
                 elif group == "family":
-                    key = series_key(row["model"])
+                    key = series_key(row["model"], row["tool"])
                 elif group == "workstream":
                     key = row["workstream"] or UNASSIGNED
+                elif (row["tool"] or None) == "glm":
+                    # Grok Build usage keeps tool ``glm`` for row identity;
+                    # the provider lane is grok, for stored rows too.
+                    key = "grok"
                 else:
                     key = row["tool"] or None
                 start = int(row["hour_ts"] // 86400) * 86400 if bucket == "day" else row["hour_ts"]

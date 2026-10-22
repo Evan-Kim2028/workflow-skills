@@ -17,8 +17,8 @@ class ModelKeyTest(unittest.TestCase):
             "composer-2.5": ("cursor", "composer-2.5"),
             "grok-4.7[context=500k,reasoning_effort=xhigh,fast=false]": ("cursor", "grok-4.7"),
             "grok-4.7-high": ("cursor", "grok-4.7"),
-            "glm-5.3": ("glm", "glm-5.3"),
-            "glm-5.3-flash": ("glm", "glm-5.3-flash"),
+            "glm-5.3": ("grok", "glm-5.3"),
+            "glm-5.3-flash": ("grok", "glm-5.3-flash"),
             "muse-spark-1.3-contributor": ("muse", "muse-spark-1.3"),
             "muse-wonder-full-1.0": ("muse", "muse-wonder-1.0"),
             "claude-opus-5-5": ("claude", "opus"),
@@ -37,6 +37,43 @@ class ModelKeyTest(unittest.TestCase):
         self.assertEqual(run_model_key({"model": None, "tier": "grok", "source": "grok"}), "cursor-unknown")
         self.assertEqual(run_model_key({"model": "", "tier": "muse"}), "muse-unknown")
         self.assertEqual(run_model_key({"model": None, "tier": "haiku"}), "haiku")
+
+    def test_grok_build_groups_as_grok(self):
+        # Every Grok Build id keeps its model key under the grok family,
+        # with or without a run hint; the launcher hint also covers ids
+        # the catalog has never seen.
+        for model in (
+            "glm-5.3",
+            "glm-5.3-flash",
+            "deepseek-flash",
+            "reflection-beam",
+            "future-1",
+        ):
+            self.assertEqual(model_key(model, "glm glm"), ("grok", model), model)
+            self.assertEqual(
+                run_model_key({"model": model, "tier": "grok", "source": "glm"}),
+                model,
+                model,
+            )
+        for model in ("glm-5.3", "glm-5.3-flash", "deepseek-flash", "reflection-beam"):
+            self.assertEqual(model_key(model)[0], "grok", model)
+        self.assertEqual(model_key(None, "glm glm"), ("grok", "grok-unknown"))
+        self.assertEqual(model_key("", "grok glm"), ("grok", "grok-unknown"))
+
+    def test_commandcode_still_wins_over_grok_build(self):
+        self.assertEqual(
+            model_key("reflection/beam:free"), ("commandcode", "reflection/beam:free")
+        )
+        self.assertEqual(
+            model_key("reflection-beam", "commandcode commandcode"),
+            ("commandcode", "reflection-beam"),
+        )
+        self.assertEqual(
+            run_model_key(
+                {"model": "reflection-beam", "tier": "grok", "source": "glm"}
+            ),
+            "reflection-beam",
+        )
 
 
 class LaunchEchoTest(unittest.TestCase):
