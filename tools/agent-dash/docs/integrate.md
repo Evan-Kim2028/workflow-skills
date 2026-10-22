@@ -214,6 +214,7 @@ A release checkout is clean, so its own `config.local.json` never holds your set
 |---|---|---|---|
 | Claude Code | Transcripts under `~/.claude/projects`, registry under `~/.claude/sessions` | Nothing; label each run | First prompt line `[label: ws4-WS4.1-slug]` |
 | muse | Sessions under `~/.local/share/muse/sessions`, `muse-sessions.tsv` on a scratch root | One TSV row per run | `label`, session uuid, start epoch |
+| pi | `pi-sessions.tsv` on a scratch root (a `pi/` folder beside it), `generic.jsonl` usage lines | TSV row plus `report usage` lines | `label`, session id, start epoch, model |
 | cursor-agent / Grok | Chats under `~/.cursor`, `cursor-sessions.tsv` on a scratch root, `cursor-usage.jsonl` in state dir | TSV row plus usage lines | Same TSV row with the model fourth; hook appends usage |
 | Codex or any other CLI | `generic.jsonl` in the state dir | Three `report` lines per run | Label, verdict, input/output counts |
 | Custom Python or shell | Same `generic.jsonl`, or a TSV row plus `out-<label>.md` on a scratch root | Same as above | Same as above |
@@ -255,6 +256,34 @@ ws4-WS4.1-notes-index	550e8400-e29b-41d4-a716-446655440000	1700000000	demo-model
 Status comes from the files: growing output means running, a SIGTERM trace in the err file means killed, an empty out file with a real error means died early, else done. The verdict comes from the first matching line of the out file (next section). Tokens do not travel this path; pair it with a `report usage` line or `generic.jsonl` usage lines. The shipped scratch glob is `$HOME/agent-scratch/*`, one directory deep; add deeper paths to `roots.scratchpads` and restart. Manifest rows prove liveness through out-file growth or a live sample of a shipped worker binary: a custom binary whose out file stays quiet reads `done` while it lives, and registering the folder does not revive it. When your binary is not one of the shipped launchers, report liveness with `report start` / `report usage` heartbeats / `report finish` instead of relying on the manifest alone.
 
 The live-agents tile counts the `grok`, `muse`, `glm`, `deepseek`, `other`, and `claude` buckets. Grok CLI runs split by model family: `deepseek-*` counts as DeepSeek, `glm-*` as GLM, anything else as Other. A generic run shows in the running table, on its task chip, and in tokens and cost either way; set `--tier` to the closest bucket only when the tile must count it.
+
+### pi workers
+
+`scripts/launch_pi.py <label> <workspace> <prompt-file> <outdir> [--model M]`
+runs one headless `pi` (`@mariozechner/pi-coding-agent`) worker. The
+default model is `river/deepseek-ai/DeepSeek-V4.1-Flash-1017`; pass
+`--model river/zai-org/GLM-5.3-Flash` for GLM. The label is validated and
+refused with the exact fix on a weak one, and the prompt is copied to
+`<outdir>/prompt-<label>.md` with a `[label: <label>]` first line added when
+missing. `stdin` is closed (pi hangs otherwise).
+
+The launcher writes `pi-sessions.tsv` (`label`, session id, start epoch,
+model), `stream-<label>.ndjson`, `out-<label>.md` (final assistant text),
+`err-<label>.log`, and `running/<label>` while the run is live, and appends
+one `generic.jsonl` start line, one usage line per assistant message
+(`message_id` = session id + index, run id `pi:<session>:<label>`), and one
+finish line. The `pi` source reads the manifest and a `pi/` folder beside
+it, takes status and verdict from the files, and reads liveness from the
+live `node .../pi-coding-agent/dist/cli.js` process (the label rides in its
+prompt path). The tile counts River DeepSeek as DeepSeek and River GLM as
+GLM by their model ids.
+
+Quota or credit exhaustion (an `errorMessage` naming
+insufficient/credit/quota/balance, or HTTP 402/429) finishes `died_early`
+with verdict `BLOCKED` and writes `<outdir>/QUOTA` naming the model and
+label, so the lead knows to swap the API key. Run the worker with a
+`ws<N>-plan-<slug>` or `ws<N>-exec-<slug>` label so the Project home
+planning-versus-execution card splits it correctly (§3).
 
 ## 3. Labels and the task map
 
@@ -306,6 +335,30 @@ Add a model by appending a row:
 ```
 
 A model with no input rate or no output rate stays unpriced: the cost tile counts unpriced runs instead of showing `$0`. Zero tokens cost zero even with no rate for that class. A `reasoning` rate requires reasoning counts, else the run stays unpriced. `billing_mode` (`api`, `plan-included`, `subscription`, `unknown`) is a note; the numeric rates still apply. A `long_context` block prices prompts past its threshold at the higher rates.
+
+### pi workers (River AI)
+
+`scripts/launch_pi.py` runs one headless `pi` worker on the River AI
+provider (`https://api.river.ai/v1`); the default model is
+`river/deepseek-ai/DeepSeek-V4.1-Flash-1017`. The catalog prices River's
+four inference models as `provider` `river`, confidence `published`,
+from River's public price list (https://console.river.ai/api/public/pricing,
+retrieved 2026-10-22), USD per 1M tokens, flat with no time bands:
+
+| model | input (miss) | cache_read (hit) | output |
+|---|---|---|---|
+| `deepseek-ai/DeepSeek-V4.1-Flash-1017` | 0.12 | 0.0024 | 0.48 |
+| `deepseek-ai/DeepSeek-V4.1-Flash` | 0.12 | 0.0024 | 0.48 |
+| `zai-org/GLM-5.3-Flash` | 0.12 | 0.024 | 0.40 |
+| `nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4` | 0.07 | 0.024 | 0.37 |
+
+Each model has two rows: `river/<id>` (what the launcher reports) and
+the bare `<id>` (what pi writes in its usage events), so a `report usage`
+line and the stream both price. Use the `inference` list from that feed;
+its `training_and_sampling` list is fine-tuning pricing, not API pricing.
+`input` is the cache miss and `cache_read` the hit. To re-price, rewrite
+the river rows from the feed, update `retrieved_at`, then run
+`python3 agent_dash.py reprice` and `python3 -m unittest tests.test_pi`.
 
 ### DeepSeek V4.1 Flash (time-aware standard API prices)
 

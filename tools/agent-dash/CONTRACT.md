@@ -47,6 +47,7 @@ The Linear source (`dash/sources/linear.py`) is the one outbound network call. I
 | `dash/sources/__init__.py` (registry, scheduler) | core |
 | `dash/rundirs.py` (run-folder registration, `run-dirs.txt`) | core |
 | `dash/sources/process.py`, `dash/sources/hub.py` | core |
+| `dash/sources/pi.py`, `scripts/launch_pi.py` (pi harness: manifest + `pi/` folder, stream usage, launcher) | core |
 | `dash/lanes.py` (live-lane grouping: one lane per distinct run from the live-worker listing; pure, no ps, no store) | core |
 | `dash/sources/claude.py`, `dash/sources/manifests.py`, `dash/sources/generic.py` | src-ai |
 | `dash/sources/muse.py`, `dash/sources/grok_cli.py` | src-tools |
@@ -118,8 +119,8 @@ store.set_ws_counts(list)     # rows: ws, name, backlog, todo, doing, review, do
 A source may also expose `health_extra() -> dict`, merged into `/api/health` under its own name (Dagster reports `skipped_closeouts` this way).
 Sources must be incremental (byte offsets), budget-bounded, and exception-safe (log, never crash the loop). Directory listings are cached by (inode, mtime) with a per-pass cap on fresh listings, so repeat polls over a quiet tree cost stats, not walks. Dead offset rows (absolute paths that no longer exist) are pruned a batch per reconcile tick with one VACUUM per pass; only the newest 3 `*.bak-*` stay in the state dir.
 
-Enums. `source`: claude-main, claude-subagent, claude-workflow, muse, glm, grok (cursor-agent), shell, generic.
-`tier`: opus, sonnet, haiku, muse, glm, grok. The generic source passes its tier through and defaults to `generic` (from the model name when it holds a known family). `status`: running, done, killed, died_early, unknown.
+Enums. `source`: claude-main, claude-subagent, claude-workflow, muse, glm, grok (cursor-agent), pi, shell, generic.
+`tier`: opus, sonnet, haiku, muse, glm, grok, pi. The generic source passes its tier through and defaults to `generic` (from the model name when it holds a known family). `status`: running, done, killed, died_early, unknown.
 `verdict`: PASS, PARTIAL, BLOCKED, APPROVE, APPROVE_WITH_NITS, APPROVE_WITH_CHANGES, REQUEST_CHANGES, or null.
 `clock_source`: transcript, muse_log, manifest, mtime. Times are epoch seconds (float), UTC.
 `run_id` is stable: `<source>:<session-or-uuid>:<label-or-agent-id>`.
@@ -772,6 +773,8 @@ Run labels for a task are `ws<N>-<task-id>-<slug>`. `SKILL-PLAN.md` is the short
 ```
 
 `kind` selects the launch, not the model string. `muse` runs `muse exec` with `--model`, `--workspace`, `--prompt-file`, `--session-id`, then `extra_args`. `cursor` runs `scripts/launch_grok.sh` so billed tokens are logged. `grok-build` runs `grok -p` with the prompt, a run rule appended, `-m`, `-s`, `--permission-mode bypassPermissions`, `--cwd`, and `--output-format plain`. `columns` is the manifest row. `glm-sessions.tsv` uses `label`, `session_id`, `epoch`, `model`. `manifests.py` and `grok_cli.py` read that shape. `cost_rank` is a lower-is-cheaper hint. `auto` follows `auto_order`, not `cost_rank`.
+
+`agent_dash.py label make --scope <wsN|hub> --mark <plan|exec|review|coord> --slug <slug> [--round N]` prints the canonical label (`dash/labels.py`). `agent_dash.py label check [--label] <label> [--ws WS]` prints `ok: <label> -> <phase> via <rule>` for a strong label plus a warning line when the label equals or collides with a plan task id of its own workstream (the run would attribute to that task), and exits 2 with the one-line fix for a weak label. `scripts/launch_pi.py` refuses a weak label through the same module, printing `label refused: <fix>`.
 
 `run_worker.py <tier|default|auto> <label> <workspace> <prompt-file> <run-dir> [max-wait]` prints `STATUS: running|done|failed out=... err=... tier=<name>`. It records the chosen worker in `<run-dir>/<label>.tier` and the pid in `<run-dir>/<label>.pid`. A later call for that label only waits. Before launching, it records `<run-dir>` in `<state-dir>/run-dirs.txt` (one absolute path per line, deduped, atomic; honours `AGENT_DASH_STATE_DIR`), so the manifest sources scan that folder wherever the lead put it. `default` uses the registry `default`. `auto` uses the first enabled worker in `auto_order` that is under `cap` (live count from `pgrep`) and not in cooldown. A failed run whose stderr or report matches `quota_patterns` cools that worker down for `cooldown_minutes`. Cooldowns live in `worker-cooldowns.json` in the agent-dash state dir. If the request was `auto` or `default`, the runner archives the report to `out-<label>.<tier>.md` and launches the next eligible worker. Registered folders that no longer exist are skipped; folders untouched for 14 days are dropped from the file (capped at 256 entries). A harness that writes manifests elsewhere registers its folder with one line in `run-dirs.txt`, or with `agent_dash.py report --run-dir <dir>`.
 

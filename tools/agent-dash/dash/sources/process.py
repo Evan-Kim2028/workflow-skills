@@ -22,13 +22,18 @@ from dash.liveness import PROCESS_GONE_GRACE_S, proc_started_ok
 
 NAME = "process"
 INTERVAL_S = 5
-COMMS = ("cursor-agent", "claude", "grok", "muse", "muse-bin")
+COMMS = ("cursor-agent", "claude", "grok", "muse", "muse-bin", "node")
 _COMM = set(COMMS)
-# Tool source -> OS comm. ``grok`` the binary is the GLM CLI; cursor-agent is Grok.
+# Tool source -> OS comm. ``grok`` the binary is the GLM CLI; cursor-agent is
+# Grok. pi ships as a node script (``node .../pi-coding-agent/dist/cli.js``):
+# a node row only counts as a pi worker when its argv carries the pi cli path
+# and a worker label (see ``pi_worker_label_from_args``), so unrelated node
+# processes never match.
 SOURCE_COMMS = {
     "grok": frozenset({"cursor-agent"}),
     "muse": frozenset({"muse", "muse-bin"}),
     "glm": frozenset({"grok"}),
+    "pi": frozenset({"node", "pi"}),
 }
 _LABEL = re.compile(r"\[label:\s*([^\]]+?)\]")
 _RUN_WORKER = re.compile(r"(?:^|\s)\S*run_worker\.py(\s.*)?$")
@@ -38,6 +43,8 @@ _UUID = r"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f
 _SESSION = re.compile(r"--session-id(?:=|\s+)(" + _UUID + r")")
 _PROMPT = re.compile(r"--prompt-file(?:=|\s+)(\S+)")
 _MODEL = re.compile(r"--model(?:=|\s+)(\S+)")
+_PI_CLI = re.compile(r"pi-coding-agent")
+_PI_PROMPT = re.compile(r"@?([^\s'\"]*/([^\s'\"/]+?)\.md)")
 _MODEL_OK = re.compile(r"^[^\s'\";|&<>]{1,200}$")
 _REASONING_EFFORT = re.compile(r"--reasoning-effort(?:=|\s+)(\S+)")
 _EFFORT_OK = re.compile(r"^[A-Za-z0-9_.-]{1,32}$")
@@ -69,23 +76,30 @@ def poll(store, cfg, now: float) -> None:
 
 
 def live_agent_processes(now: float | None = None) -> list[dict]:
-    """Live grok, muse, and glm processes.
+    """Live grok, muse, glm, and pi processes.
 
     Each row is ``pid``, ``comm``, ``started_at``, ``label``, ``model``,
     and (for muse processes) ``prompt_label`` and ``session_id``. The
     command line is read only to extract the bracket label, the
-    ``--prompt-file`` label, ``--session-id``, and the ``--model`` flag
-    value. The path and the rest of argv are not returned.
+    ``--prompt-file`` label, ``--session-id``, the pi prompt-path label,
+    and the ``--model`` flag value. The path and the rest of argv are not
+    returned. A ``node`` row is emitted only when its argv names the pi
+    cli and a worker label: plain node processes never appear.
     """
     now = time.time() if now is None else float(now)
     tokens = _tokens_by_pid()
     rows = []
     wanted = set().union(*SOURCE_COMMS.values())
     muse_comms = SOURCE_COMMS["muse"]
+    pi_comms = SOURCE_COMMS["pi"]
     for row in _ps():
         if row["comm"] not in wanted:
             continue
         token = tokens.get(row["pid"], {})
+        pi = row["comm"] in pi_comms and token.get("pi")
+        if row["comm"] in pi_comms and not pi:
+            # A ``node`` row that is not a labelled pi worker is not ours.
+            continue
         muse = row["comm"] in muse_comms
         prompt_label = token.get("prompt_label") if muse else None
         label = token.get("label")
@@ -658,7 +672,8 @@ def _tokens_by_pid() -> dict:
     """Pid -> label, prompt-file label, session uuid, and ``--model`` value.
 
     The command line is read only to extract those tokens. The prompt path
-    and the rest of argv are discarded and never returned.
+    and the rest of argv are discarded and never returned. A pi worker's
+    label comes from the ``<label>.md`` prompt path it was handed.
     """
     try:
         proc = subprocess.run(
@@ -679,7 +694,12 @@ def _tokens_by_pid() -> dict:
         prompt_label = prompt_label_from_args(line)
         model = model_from_args(line)
         effort = reasoning_effort_from_args(line)
-        if not label and not session_id and not prompt_label and not model and not effort:
+        pi_label = pi_worker_label_from_args(line)
+        if not label and pi_label:
+            # A pi launch carries the label only in its prompt path; use it
+            # for the other consumers that read the single "label" slot.
+            label = pi_label
+        if not label and not session_id and not prompt_label and not model and not effort and not pi_label:
             continue
         pid = _pid(line.strip().split(None, 1)[0] if line.strip() else None)
         if pid is not None:
@@ -689,6 +709,7 @@ def _tokens_by_pid() -> dict:
                 "prompt_label": prompt_label,
                 "model": model,
                 "reasoning_effort": effort,
+                "pi": pi_label is not None,
             }
     return found
 
@@ -766,6 +787,24 @@ def session_id_from_args(text: str) -> str | None:
     if not match:
         return None
     return match.group(1)
+
+
+def pi_worker_label_from_args(text: str) -> str | None:
+    """Label of a live pi worker launch, or None.
+
+    A pi process runs as ``node .../pi-coding-agent/dist/cli.js``; the
+    label is carried in the prompt path (``@/dir/<label>.md``) because the
+    prompt body sits in a file, not on the command line. Both the pi cli
+    path and the prompt path must be present; only the label basename is
+    returned, never the path. Non-pi node processes return None.
+    """
+    if not text or not _PI_CLI.search(text):
+        return None
+    for match in _PI_PROMPT.finditer(text):
+        candidate = match.group(2)
+        if _LABEL_OK.fullmatch(candidate):
+            return candidate
+    return None
 
 
 def model_from_args(text: str) -> str | None:
