@@ -505,7 +505,7 @@ class EndpointTests(FoldCase):
         self.assertEqual(
             set(payload),
             {"scope", "since", "until", "day", "rules_hash", "rules_version",
-             "caption", "workstreams", "total", "unclassified_share"},
+             "caption", "workstreams", "total", "unclassified_share", "generated_at"},
         )
         row = [item for item in payload["workstreams"] if item["ws"] == "WS1"][0]
         self.assertEqual(set(row), {"ws", "name", "by_phase", "total", "days", "series"})
