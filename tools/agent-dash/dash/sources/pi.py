@@ -39,6 +39,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 
 from dash.liveness import file_shows_quota
 from dash.sources import grok_cli as _grok
@@ -92,7 +93,13 @@ def _outdirs(root):
     A pi outdir holds ``pi-sessions.tsv`` or a ``running/`` folder. The
     running folder exists from the first launch, before any TSV row lands.
     The root itself is accepted (a registered flat run folder) and every
-    ``pi/`` child of a scratchpad / one level under it.
+    ``pi/`` child of a scratchpad / one level under it. A bare ``running/``
+    folder is not enough: another harness's outdir (Command Code keeps its
+    own ``running/``) would read as a second ``pi:`` run for the same
+    label, so a manifest-less outdir must also carry pi evidence (a
+    ``prompt-`` file, the ``QUOTA`` marker, a ``sessions/`` dir, or a
+    pi-shaped ``stream-<label>.ndjson``, never the ``-<n>`` Command Code
+    shape).
     """
     found = []
     seen = set()
@@ -103,8 +110,8 @@ def _outdirs(root):
         real = os.path.realpath(path)
         if real in seen:
             return
-        if os.path.isfile(os.path.join(path, MANIFEST)) or os.path.isdir(
-            os.path.join(path, RUNNING)
+        if os.path.isfile(os.path.join(path, MANIFEST)) or (
+            os.path.isdir(os.path.join(path, RUNNING)) and _looks_like_pi_dir(path)
         ):
             seen.add(real)
             found.append(path)
@@ -196,6 +203,37 @@ def _read_rows(path):
     rows = parse_rows(text)
     _tsv_cache[path] = (sig, rows)
     return rows
+
+
+_CMD_STREAM = re.compile(r"^stream-(.+)-(\d+)\.ndjson$")
+
+
+def _looks_like_pi_dir(path):
+    """True when a manifest-less folder carries pi-only evidence.
+
+    ``out-``/``err-`` files and ``running/`` are shared with the Command
+    Code launcher, so they do not count: only a ``prompt-`` file, the
+    ``QUOTA`` marker, the pi ``sessions/`` dir, or a pi-shaped stream
+    (``stream-<label>.ndjson``, never the ``-<n>`` Command Code shape).
+    """
+    try:
+        names = os.listdir(path)
+    except OSError:
+        return False
+    if "QUOTA" in names:
+        return True
+    if "sessions" in names and os.path.isdir(os.path.join(path, "sessions")):
+        return True
+    for name in names:
+        if name.startswith("prompt-") and name.endswith(".md"):
+            return True
+        if (
+            name.startswith("stream-")
+            and name.endswith(".ndjson")
+            and not _CMD_STREAM.match(name)
+        ):
+            return True
+    return False
 
 
 def _row_key(row):

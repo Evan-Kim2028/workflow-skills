@@ -212,6 +212,45 @@ class SourceTest(unittest.TestCase):
         # out file leaves it unknown rather than a false running.
         self.assertIn(run["status"], ("running", "unknown", "died_early"))
 
+    def test_commandcode_outdir_with_running_folder_is_ignored(self):
+        # A live Command Code launch (its own running/ folder, attempt
+        # streams, even a manifest) must not read as a second pi: run for
+        # the same label: no pi: run id may mention the cmd label.
+        cmd = self.scratch / "enc" / SID / "scratchpad" / "cmd"
+        cmd.mkdir(parents=True)
+        (cmd / "running").mkdir()
+        (cmd / "running" / "ws15-exec-cmd").write_text(
+            "999999\treflection/beam:free", encoding="utf-8"
+        )
+        (cmd / "stream-ws15-exec-cmd-1.ndjson").write_text(
+            '{"type": "event", "event": {"type": "run_start", "sessionId": "cmd-sid-1"}}\n',
+            encoding="utf-8",
+        )
+        self.poll()
+        self.assertEqual(self.store.runs, {})
+        (cmd / "cmd-sessions.tsv").write_text(
+            "label\tmodel\tsession_id\tstarted_epoch\tended_epoch\tinput_tokens\toutput_tokens\tstatus\n"
+            "ws15-exec-cmd\treflection/beam:free\tcmd-sid-1\t1792000000\t1792000060\t10\t2\tok\n",
+            encoding="utf-8",
+        )
+        self.poll()
+        self.assertEqual(self.store.runs, {})
+
+    def test_running_only_pi_launch_is_kept(self):
+        # The guard must not hide a genuine pi launch that has no TSV row
+        # yet: running/ plus a prompt file and a pi-shaped stream is a pi
+        # outdir from the first second.
+        (self.pad / "running").mkdir()
+        (self.pad / "running" / "ws15-exec-early").write_text(
+            "999999\t%s" % DEEPSEEK, encoding="utf-8"
+        )
+        (self.pad / "prompt-ws15-exec-early.md").write_text(
+            "[label: ws15-exec-early]\ndo it\n", encoding="utf-8"
+        )
+        (self.pad / "stream-ws15-exec-early.ndjson").write_bytes(FIXTURE.read_bytes())
+        self.poll()
+        self.assertIn(self.run_id("ws15-exec-early"), self.store.runs)
+
     def test_quota_file_finishes_died_early_blocked(self):
         self.write_tsv([["ws15-exec-quota", SID, 1792000000, DEEPSEEK]])
         (self.pad / "QUOTA").write_text("model\t%s\nlabel\tws15-exec-quota\n" % DEEPSEEK, encoding="utf-8")
