@@ -39,7 +39,7 @@ FORWARD_TO = ("done", "pr", "prog")
 FINISHED_STATUS = ("done", "killed", "died_early")
 
 #: Sources that are never agents (interactive leads, launch rows, jobs).
-NON_AGENT_SOURCES = frozenset({"", "claude-main", "shell", "dagster"})
+NON_AGENT_SOURCES = frozenset({"", "claude-main", "codex", "shell", "dagster"})
 
 VERDICT_WORDS = {
     "PASS": "pass",
@@ -87,6 +87,26 @@ def parse_iso(value) -> float | None:
         return None
 
 
+#: Tool lane for a pi/generic run, by model family. Mirrors the store's
+#: mapping: cursor-family models count as ``grok`` (the Cursor tool lane).
+_FAMILY_TOOL = {
+    "beam": "beam",
+    "deepseek": "deepseek",
+    "glm": "glm",
+    "claude": "claude",
+    "codex": "codex",
+    "cursor": "grok",
+    "muse": "muse",
+}
+
+
+def _model_family(run: dict) -> str:
+    from dash.models import model_key
+
+    hint = " ".join(str(run.get(name) or "") for name in ("tier", "source"))
+    return model_key(run.get("model"), hint)[0]
+
+
 def _tool_key(run: dict) -> str | None:
     """Mirror of the store's tool mapping: which agent family, if any."""
     source = run.get("source") or ""
@@ -98,9 +118,24 @@ def _tool_key(run: dict) -> str | None:
     if source == "muse" or tier == "muse":
         return "muse"
     if source == "glm" or tier == "glm":
+        fam = _model_family(run)
+        if fam == "deepseek":
+            return "deepseek"
+        if fam == "beam":
+            return "beam"
+        if fam == "other":
+            return "other"
         return "glm"
+    if source in ("codex", "codex-exec") or tier == "codex":
+        return "codex"
+    if source == "commandcode" or tier == "commandcode":
+        return "beam" if _model_family(run) == "beam" else "commandcode"
     if source.startswith("claude") or tier in ("opus", "sonnet", "haiku"):
         return "claude"
+    if source in ("pi", "generic"):
+        return _FAMILY_TOOL.get(_model_family(run), "other")
+    if _model_family(run) == "beam":
+        return "beam"
     return None
 
 

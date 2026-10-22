@@ -426,6 +426,33 @@ class ClaudePollTests(unittest.TestCase):
         run = self.store.runs[f"claude-main:{SID}:main"]
         self.assertEqual(run["status"], "done")
 
+    def test_quiet_main_past_short_window_is_idle(self):
+        # Twelve quiet minutes: past the 3 min main window, inside the
+        # old 15 min bound. Reads idle (unknown), never running.
+        cfg, projects, _sessions = _cfg(self.tmp.name, running_mtime_s=900)
+        _write(
+            os.path.join(projects, "enc", f"{SID}.jsonl"),
+            _line("m1", 1),
+            NOW - 720,
+        )
+        claude.poll(self.store, cfg, NOW)
+        run = self.store.runs[f"claude-main:{SID}:main"]
+        self.assertEqual(run["status"], "unknown")
+        self.assertEqual(self.store.sessions[SID]["status"], "idle")
+
+    def test_main_window_is_configurable(self):
+        cfg, projects, _sessions = _cfg(
+            self.tmp.name, running_mtime_s=900, main_running_mtime_s=3600
+        )
+        _write(
+            os.path.join(projects, "enc", f"{SID}.jsonl"),
+            _line("m1", 1),
+            NOW - 720,
+        )
+        claude.poll(self.store, cfg, NOW)
+        run = self.store.runs[f"claude-main:{SID}:main"]
+        self.assertEqual(run["status"], "running")
+
     def test_bad_json_and_offset_error_do_not_stop_the_tick(self):
         cfg, projects, _sessions = _cfg(self.tmp.name)
 

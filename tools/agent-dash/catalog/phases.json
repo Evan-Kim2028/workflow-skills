@@ -6,8 +6,8 @@
     {
       "id": "convention",
       "type": "convention",
-      "comment": "Explicit convention wins: ws9-plan-xxx, ws9-exec-xxx, ws9-review-xxx, ws9-coord-xxx (dashes, dots, underscores and spaces all count).",
-      "pattern": "ws\\d+[-_. ]?(plan(?:ning)?|exec(?:ution)?|review|rev|coord(?:ination)?)(?![a-z0-9])",
+      "comment": "Explicit convention wins: ws9-plan-xxx, ws9-exec-xxx, ws9-review-xxx, ws9-coord-xxx, or hub-plan-xxx for cross-workstream work (dashes, dots, underscores and spaces all count).",
+      "pattern": "(?:ws\\d+|hub)[-_. ]?(plan(?:ning)?|exec(?:ution)?|review|rev|coord(?:ination)?)(?![a-z0-9])",
       "map": {"plan": "planning", "planning": "planning", "exec": "execution", "execution": "execution", "review": "review", "rev": "review", "coord": "coordination", "coordination": "coordination"}
     },
     {
@@ -62,8 +62,8 @@
       "id": "lead",
       "type": "lead",
       "phase": "planning",
-      "comment": "An unmapped lead session (no parent run, a lead source) is the planning surface: the hub thinking, not a task lane. Task-mapped and keyword runs already matched above.",
-      "sources": ["claude-main"]
+      "comment": "An unmapped lead session (no parent run, a lead source) is the planning surface: the hub thinking, not a task lane. Task-mapped and keyword runs already matched above. Only the top-level Codex TUI surface (source codex) counts: exec and subagent threads run as codex-exec and classify through their parent.",
+      "sources": ["claude-main", "codex"]
     },
     {
       "id": "window",

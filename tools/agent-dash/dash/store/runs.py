@@ -17,14 +17,14 @@ from dash.liveness import PROCESS_GONE_GRACE_S
 from .running import _annotate_lanes
 
 from .util import (_ESTIMATE_TOOL, MERGE_WINDOW_S, RUN_COLS,
-                 RUN_INPUT, SESSION_COLS, TOKEN_FIELDS,
+                 RUN_INPUT, RUN_VIEW_COLS, SESSION_COLS, TOKEN_FIELDS,
                  _collapse_workflows, _drop_launch_echoes,
                  _epoch, _in_ws, _manifest_family, _same, _zeros,
                  is_marker_run, is_prod_job_run)
 
 
 class RunsMixin:
-        def _attribute_locked(self, label, session_id, parent_session_id):
+        def _attribute_locked(self, label, session_id, parent_session_id, run_id=None):
             """Explicit attribution, else workstream inheritance (caller holds the lock)."""
             workstream, confidence = attribute(
                 label,
@@ -33,12 +33,18 @@ class RunsMixin:
             )
             if workstream is not None:
                 return workstream, confidence
-            return _inherit.resolve(self, label, session_id, parent_session_id)
+            return _inherit.resolve(self, label, session_id, parent_session_id, run_id=run_id)
 
         def refresh_workstream_inheritance(self, now: float) -> int:
             """Recompute inherited/inferred rows; never touch explicit ones."""
             with self._lock:
-                return _inherit.refresh(self, now)
+                changed = _inherit.refresh(self, now)
+                if changed:
+                    self._seq += 1
+                    self._data_seq += 1
+                    self._note_data_write()
+                    self._note_view_write()
+                return changed
 
         def upsert_session(self, row: dict) -> None:
             session_id = row.get("session_id")
@@ -57,6 +63,18 @@ class RunsMixin:
                     merged.get("session_id"),
                     merged.get("parent_session_id"),
                 )
+                if (
+                    workstream is None
+                    and confidence is None
+                    and existing
+                    and existing.get("ws_confidence") in ("inherited", "inferred")
+                ):
+                    # No evidence right now is not evidence of absence: a
+                    # settled inference survives the write, and the inherit
+                    # refresh (with poll-now evidence) remains the sole
+                    # clearer. Explicit attributions always overwrite.
+                    workstream = existing.get("workstream")
+                    confidence = existing.get("ws_confidence")
                 merged["workstream"] = workstream
                 merged["ws_confidence"] = confidence
                 if existing and _same(existing, merged, SESSION_COLS):
@@ -65,6 +83,7 @@ class RunsMixin:
                 self._seq += 1
                 self._data_seq += 1
                 self._note_data_write()
+                self._note_view_write()
         def upsert_run(self, row: dict) -> None:
             run_id = row.get("run_id")
             if not run_id:
@@ -95,7 +114,20 @@ class RunsMixin:
                     merged.get("label"),
                     merged.get("session_id"),
                     merged.get("parent_session_id"),
+                    run_id=merged.get("run_id"),
                 )
+                if (
+                    workstream is None
+                    and confidence is None
+                    and existing
+                    and existing.get("ws_confidence") in ("inherited", "inferred")
+                ):
+                    # No evidence right now is not evidence of absence: a
+                    # settled inference survives the write, and the inherit
+                    # refresh (with poll-now evidence) remains the sole
+                    # clearer. Explicit attributions always overwrite.
+                    workstream = existing.get("workstream")
+                    confidence = existing.get("ws_confidence")
                 merged["workstream"] = workstream
                 merged["ws_confidence"] = confidence
                 if "out_bytes" in row:
@@ -107,6 +139,7 @@ class RunsMixin:
                 changed_ws = not existing or existing.get("workstream") != merged.get("workstream")
                 if existing and _same(existing, merged, RUN_COLS):
                     return
+                view_changed = not existing or not _same(existing, merged, RUN_VIEW_COLS)
                 if _is_manifest_twin(merged):
                     twin_id = self._find_merge_target_locked(merged)
                     if twin_id is not None:
@@ -127,6 +160,8 @@ class RunsMixin:
                 self._seq += 1
                 self._data_seq += 1
                 self._note_data_write()
+                if view_changed:
+                    self._note_view_write()
         def reassign_run(self, src_id: str, dst_id: str) -> bool:
             """Move usage from ``src_id`` onto ``dst_id``, fill empty fields, delete ``src_id``."""
             if not src_id or not dst_id or src_id == dst_id:
@@ -153,6 +188,7 @@ class RunsMixin:
                     merged.get("label"),
                     merged.get("session_id"),
                     merged.get("parent_session_id"),
+                    run_id=merged.get("run_id"),
                 )
                 merged["workstream"] = workstream
                 merged["ws_confidence"] = confidence
@@ -163,6 +199,7 @@ class RunsMixin:
                         "UPDATE usage_events SET run_id=? WHERE run_id=?",
                         (dst_id, src_id),
                     )
+                    self._move_rollup_locked(src_id, dst_id)
                     self._conn.execute(
                         "UPDATE process_samples SET run_id=? WHERE run_id=?",
                         (dst_id, src_id),
@@ -190,6 +227,10 @@ class RunsMixin:
                 self._seq += 1
                 self._data_seq += 1
                 self._note_data_write()
+                self._note_view_write()
+                self._bump_usage_run(src_id)
+                self._bump_usage_run(dst_id)
+                self._bump_run_version(src_id)
             return True
         def repair_grok_runs(self, now: float, window_s: float = MERGE_WINDOW_S) -> tuple[int, int]:
             """Fill NULL grok models from usage and fold manifest twins into chat rows.
@@ -479,6 +520,7 @@ class RunsMixin:
                 merged.get("label"),
                 merged.get("session_id"),
                 merged.get("parent_session_id"),
+                run_id=merged.get("run_id"),
             )
             merged["workstream"] = workstream
             merged["ws_confidence"] = confidence
@@ -489,12 +531,14 @@ class RunsMixin:
                     "UPDATE usage_events SET run_id=? WHERE run_id=?",
                     (target_id, alias_id),
                 )
+                self._move_rollup_locked(alias_id, target_id)
                 self._conn.execute(
                     "UPDATE process_samples SET run_id=? WHERE run_id=?",
                     (target_id, alias_id),
                 )
                 self._write_run(merged)
                 self._conn.execute("DELETE FROM runs WHERE run_id=?", (alias_id,))
+                self._bump_run_version(alias_id)
                 self._conn.execute(
                     """INSERT INTO run_aliases(alias_run_id, target_run_id, merged_at)
                        VALUES(?,?,?)
@@ -511,6 +555,9 @@ class RunsMixin:
                 raise
             self._seq += 1
             self._data_seq += 1
+            self._note_view_write()
+            self._bump_usage_run(alias_id)
+            self._bump_usage_run(target_id)
         def repair_muse_orphans(self) -> int:
             """Move orphan muse usage onto the labeled run and delete the orphan."""
             with self._lock:
@@ -649,6 +696,9 @@ class RunsMixin:
                 self._seq += 1
                 self._data_seq += 1
                 self._note_data_write()
+                self._note_view_write()
+                if deleted:
+                    self._bump_run_epoch()
             return {"markers": markers, "deleted": deleted, "backup": None}
         def query_runs(self, now: float, ws: str | None, since: float | None, until: float | None, limit: int, include_jobs: bool = False) -> list:
             """Gantt input. Open bars come from the one filtered running set, so a
@@ -659,32 +709,48 @@ class RunsMixin:
                 raw, usage, parents = self._scoped_usage()
                 context = self._context_by_run()
                 rss = self._rss_maps(now)
-                bare = [dict(row) for row in raw]
-                live_open, shadows = self._live_open_with_shadows_locked(now, bare)
-                stalled = self._stalled_locked(now, bare)
+                # raw rows are already fresh dicts; evidence consumers
+                # only read them, so no second copy.
+                usage_max, sample_max, pid_starts = self._open_evidence_locked(raw)
+                live_open, shadows = self._live_open_with_shadows_locked(
+                    now, raw, None, usage_max, sample_max, pid_starts)
+                stalled = self._stalled_locked(now, raw, None, usage_max, sample_max)
+                usage_versions = dict(self._usage_fold_versions)
+                children_of: dict = {}
+                for child, parent in parents.items():
+                    children_of.setdefault(parent, []).append(child)
+                live_or_shadow = live_open | set(shadows)
                 rows = []
                 for row in raw:
+                    # Cheap raw-row gates first: views are only built for
+                    # rows the old code would keep (identical predicates on
+                    # identical values: views copy these fields verbatim).
+                    # The marker check stays on the view: it needs the
+                    # usage fold, which raw rows do not carry.
                     if row["run_id"] in parents:
                         continue
-                    view = self._run_view(row, now, usage, rss, context, stalled.get(row["run_id"]))
-                    if not include_jobs and is_prod_job_run(view):
+                    if not include_jobs and (row.get("source") or "") == "dagster":
                         continue
-                    if is_marker_run(view):
+                    if not _in_ws(row, ws):
                         continue
+                    status = row.get("status")
                     if (
-                        view.get("status") in ("running", "queued")
-                        and view["run_id"] not in live_open
-                        and view["run_id"] not in shadows
+                        status in ("running", "queued")
+                        and row["run_id"] not in live_or_shadow
                     ):
                         continue
-                    if not _in_ws(view, ws):
+                    if since is not None and (row.get("ended_at") or now) < since:
                         continue
-                    if since is not None and (view["ended_at"] or now) < since:
+                    if until is not None and (row.get("started_at") or 0) > until:
                         continue
-                    if until is not None and (view["started_at"] or 0) > until:
+                    view = self._cached_view(
+                        row, now, usage, rss, usage_versions, context, stalled,
+                        children_of,
+                    )
+                    if is_marker_run(view):
                         continue
                     rows.append(view)
-                rows = _annotate_lanes(rows, live_open | set(shadows))
+                rows = _annotate_lanes(rows, live_or_shadow)
             rows = _collapse_workflows(_drop_launch_echoes(rows), now)
             rows.sort(key=lambda run: run["started_at"] or 0)
             return rows[-limit:]

@@ -1759,6 +1759,12 @@ class DoctorApiTest(unittest.TestCase):
         self.assertEqual(health["doctor"]["summary"]["critical"], 1)
         self.assertFalse(health["ok"])
         self.store.doctor_snapshot([], time.time())
+        # A background write keeps the TTL generation within the window,
+        # then the invalidated entry recomputes.
+        status, _, body = get(self.port, "/api/health")
+        health = json.loads(body)
+        self.assertEqual(health["doctor"]["summary"]["critical"], 1)
+        self.server.respcache.invalidate_all()
         status, _, body = get(self.port, "/api/health")
         health = json.loads(body)
         self.assertEqual(health["doctor"]["summary"]["critical"], 0)
@@ -2710,6 +2716,10 @@ class ConditionalGetTest(unittest.TestCase):
                 "ended_at": self.now - 100,
             }
         )
+        status, _, empty = self.fetch("/api/state", tag)
+        self.assertEqual(status, 304, "a data write within the TTL must keep the stable generation")
+        self.assertEqual(empty, b"")
+        self.server.respcache.invalidate_all()
         status, heads, body = self.fetch("/api/state")
         self.assertEqual(status, 200)
         self.assertNotEqual(heads.get("etag"), tag, "write did not retag state")
@@ -2742,7 +2752,8 @@ class ConditionalGetTest(unittest.TestCase):
         """A poll cycle that writes no data (process samples, counts bump
         only the poll clock) must not retag the snapshot: the client's
         If-None-Match still names the entry, so idle ticks 304. A real
-        data write still retags to 200."""
+        data write keeps the TTL generation (304 within the window) and
+        retags to 200 once the entry is invalidated."""
         since = int(self.now - 12 * 3600)
         path = f"/api/snapshot?ws=all&since={since}&usage_group=model"
         status, heads, _ = self.fetch(path)
@@ -2772,8 +2783,12 @@ class ConditionalGetTest(unittest.TestCase):
                 "ended_at": self.now - 10,
             }
         )
+        status, _, empty = self.fetch(path, tag)
+        self.assertEqual(status, 304, "a data write within the TTL must keep the stable generation")
+        self.assertEqual(empty, b"")
+        self.server.respcache.invalidate_all()
         status, heads, _ = self.fetch(path, tag)
-        self.assertEqual(status, 200, "a data write did not retag the snapshot")
+        self.assertEqual(status, 200, "an invalidated write did not retag the snapshot")
         self.assertTrue(heads.get("etag") and heads.get("etag") != tag)
 
 
@@ -3013,13 +3028,20 @@ class RunSectionTest(unittest.TestCase):
         self.plan_path.write_text(json.dumps(plan), encoding="utf-8")
         stamp = time.time() + 5
         os.utime(self.plan_path, (stamp, stamp))
+        status, _, empty = self.fetch("/api/snapshot?ws=all", snap_tag)
+        self.assertEqual(status, 304, "a plan edit within the TTL must keep the stable generation")
+        self.assertEqual(empty, b"")
+        status, _, rempty = self.fetch("/api/runs?limit=10", runs_tag)
+        self.assertEqual(status, 304, "a plan edit within the TTL must keep the stable runs generation")
+        self.assertEqual(rempty, b"")
+        self.server.respcache.invalidate_all()
         status, snap_new, body = self.fetch("/api/snapshot?ws=all", snap_tag)
-        self.assertEqual(status, 200, "a plan edit should retag the snapshot")
+        self.assertEqual(status, 200, "an invalidated plan edit should retag the snapshot")
         self.assertNotEqual(snap_new.get("etag"), snap_tag, "snapshot tag ignored the plan edit")
         rows = {row["label"]: row for row in json.loads(body)["running"]}
         self.assertEqual(rows["ws9-a1-k1"]["section"], "Alpha2")
         status, runs_new, body = self.fetch("/api/runs?limit=10", runs_tag)
-        self.assertEqual(status, 200, "a plan edit should retag the runs list")
+        self.assertEqual(status, 200, "an invalidated plan edit should retag the runs list")
         self.assertNotEqual(runs_new.get("etag"), runs_tag, "runs tag ignored the plan edit")
         rows = {row["label"]: row for row in json.loads(body)["runs"]}
         self.assertEqual(rows["ws9-a1-k1"]["section"], "Alpha2")

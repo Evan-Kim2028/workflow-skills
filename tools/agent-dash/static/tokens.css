@@ -64,6 +64,9 @@
   --s6: #43b34d;  /* glm green ................... 6.73:1 */
   --s7: #9b8cf2;  /* dagster violet .............. 6.41:1 */
   --s8: #f06666;  /* eighth series red ........... ~6.2:1 */
+  --s9: #c08a4e;  /* codex bronze (ninth series, est. ~5.5:1; glyph+word carry it) */
+  --s10: #5cc8dc;  /* Command Code cyan (tenth series; glyph+word carry it, contrast not yet measured) */
+  --s11: #a6d608;  /* Beam lime (eleventh series; glyph+word carry it) */
   --other: #6b7484;  /* unassigned / unknown, with label */
 
   /* ---- Usage-by-phase entity colours (Okabe-Ito-inspired, told apart
@@ -197,7 +200,8 @@
 
   /* Validated light entity hues (unchanged): */
   --s1: #2a78d6; --s2: #eb6834; --s3: #1baf7a; --s4: #eda100;
-  --s5: #e87ba4; --s6: #008300; --s7: #6250d6; --s8: #e34948;
+  --s5: #e87ba4; --s6: #008300; --s7: #6250d6; --s8: #e34948; --s9: #8f5f23;
+  --s10: #0e7f93; --s11: #5a7d00;
   --other: #a8a69e;
   /* Usage-by-phase entity hues for light (same hues as dark, deeper shades). */
   --ph-planning: #2a78d6;

@@ -22,6 +22,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -75,6 +76,7 @@ KNOWN_ROOT_KEYS = {
     "claude_projects",
     "claude_sessions",
     "muse_sessions",
+    "codex_sessions",
     "grok_sessions",
     "grok_log",
     "cursor_home",
@@ -274,6 +276,7 @@ def collect_problems(
     _collect_orchestration(ctx)
     _collect_lifecycle(ctx)
     _collect_fleet(ctx)
+    _collect_labels(ctx)
     _collect_page(ctx)
     _collect_config(ctx)
     _collect_linear(ctx)
@@ -544,6 +547,7 @@ def _collect_dashboard(ctx) -> None:
     _check_slow_sources(ctx, sources)
     _check_dagster_closeouts(ctx, health)
     _check_health_roots(ctx)
+    _check_perf(ctx, health)
 
 
 def _check_slow_sources(ctx, sources: list) -> None:
@@ -572,6 +576,296 @@ def _check_slow_sources(ctx, sources: list) -> None:
             "python3 agent_dash.py status",
             key=str(name),
         )
+
+
+def _perf_budgets(ctx) -> dict:
+    """Performance budgets for the perf checks, or {} when absent.
+
+    Reads ``perf_budgets.json`` from the tool root (tests override the
+    root): endpoint warm latencies, CPU, lock, lag, and database
+    thresholds. A missing file skips the budget-driven checks instead
+    of failing them.
+    """
+    try:
+        path = Path(ctx.tool_root) / "perf_budgets.json"
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _check_perf(ctx, health: dict) -> None:
+    """Self-monitoring checks from the /api/health ``perf`` block.
+
+    ``server-cpu-bound`` (process CPU over 80% of a core for 5 min),
+    ``slow-endpoint`` (endpoint p95 over its budget), ``lock-contention``
+    (store lock wait p95 over 200 ms), ``source-lagging`` (lag over 3x
+    interval for 3 consecutive polls), ``db-growth`` (size and 90-day
+    projection). Each item names its fix; warn on breach, critical when
+    sustained or doubled. Without a perf block every check passes.
+    """
+    perf = (health or {}).get("perf") or {}
+    budgets = _perf_budgets(ctx)
+    _check_server_cpu(ctx, perf)
+    _check_slow_endpoints(ctx, perf, budgets)
+    _check_lock_contention(ctx, perf, budgets)
+    _check_source_lagging(ctx, perf, budgets)
+    _check_db_growth(ctx, budgets)
+
+
+def _check_server_cpu(ctx, perf: dict) -> None:
+    cpu = perf.get("cpu") or {} if isinstance(perf, dict) else {}
+    try:
+        pct_5m = None if cpu.get("pct_5m") is None else float(cpu.get("pct_5m"))
+        pct_1m = None if cpu.get("pct_1m") is None else float(cpu.get("pct_1m"))
+    except (TypeError, ValueError):
+        pct_5m = pct_1m = None
+    if pct_5m is None:
+        _check(ctx, "server-cpu", True, "no CPU samples yet")
+        return
+    if pct_5m <= 80.0:
+        _check(ctx, "server-cpu", True, f"process CPU {pct_5m:.0f}% of a core over 5 min")
+        return
+    sustained = pct_1m is not None and pct_1m > 80.0
+    _check(ctx, "server-cpu", False, f"process CPU {pct_5m:.0f}% over 5 min")
+    _add(
+        ctx, "server-cpu-bound", "critical" if sustained else "warn", "global", None,
+        "Dashboard server is CPU-bound",
+        f"process CPU {pct_5m:.0f}% of a core over 5 min"
+        + (f" (still {pct_1m:.0f}% over the last minute)" if pct_1m is not None else "")
+        + ": every open page refetch recomputes instead of hitting caches",
+        "python3 agent_dash.py status",
+        key="cpu",
+    )
+
+
+_ENDPOINT_BUDGET_PATH = {
+    "/api/state": "state",
+    "/api/snapshot": "snapshot",
+    "/api/workstreams": "workstreams",
+    "/api/runs": "runs",
+    "/api/usage": "usage",
+    "/api/concurrency": "concurrency",
+    "/api/project/phases": "project/phases",
+    "/api/health": "health",
+    "/api/plan": "plan",
+    "/api/doctor": "doctor",
+}
+
+_ENDPOINT_HINT = {
+    "/api/snapshot": "snapshot fold or cache churn (docs/perf.md: view_seq, incremental fold)",
+    "/api/workstreams": "workstream rollup or phase cache (docs/perf.md)",
+    "/api/runs": "run-row scan or plan-section annotation (docs/perf.md)",
+    "/api/state": "state cache or worker listing (docs/perf.md)",
+    "/api/project/phases": "phase classification cache (docs/perf.md)",
+    "/api/health": "usage model stats or doctor block (docs/perf.md)",
+}
+
+
+def _check_slow_endpoints(ctx, perf: dict, budgets: dict) -> None:
+    endpoints = perf.get("endpoints") if isinstance(perf, dict) else None
+    budget_table = budgets.get("endpoints") if isinstance(budgets, dict) else None
+    if not endpoints or not isinstance(budget_table, dict):
+        _check(ctx, "slow-endpoints", True, "no endpoint samples or budgets yet")
+        return
+    slow = []
+    for path, stats in endpoints.items():
+        key = _ENDPOINT_BUDGET_PATH.get(path)
+        if key is None or not isinstance(stats, dict):
+            continue
+        entry = budget_table.get(key) or {}
+        try:
+            budget = float(entry.get("warm_ms"))
+            p95 = None if stats.get("p95") is None else float(stats.get("p95"))
+        except (TypeError, ValueError):
+            continue
+        if p95 is None or p95 <= budget:
+            continue
+        slow.append((path, p95, budget, int(stats.get("count") or 0)))
+    if not slow:
+        _check(ctx, "slow-endpoints", True, "every endpoint p95 within budget")
+        return
+    _check(ctx, "slow-endpoints", False, f"slow: {', '.join(path for path, _, _, _ in slow)}")
+    for path, p95, budget, count in slow:
+        hint = _ENDPOINT_HINT.get(path, "docs/perf.md")
+        _add(
+            ctx, "slow-endpoint", "critical" if p95 > 2 * budget else "warn",
+            "global", None,
+            f"Endpoint {path} is slow",
+            f"{path} p95 {p95:.0f}ms over the {budget:g}ms budget ({count} requests in 10 min); profile hint: {hint}",
+            "python3 agent_dash.py status",
+            key=path,
+        )
+
+
+def _check_lock_contention(ctx, perf: dict, budgets: dict) -> None:
+    lock = perf.get("lock") if isinstance(perf, dict) else None
+    try:
+        threshold = float((budgets or {}).get("lock_wait_p95_ms", 200))
+    except (TypeError, ValueError):
+        threshold = 200.0
+    try:
+        wait_p95 = None if not isinstance(lock, dict) or lock.get("wait_p95_ms") is None else float(lock.get("wait_p95_ms"))
+    except (TypeError, ValueError):
+        wait_p95 = None
+    if wait_p95 is None:
+        _check(ctx, "lock", True, "no lock samples yet")
+        return
+    if wait_p95 <= threshold:
+        _check(ctx, "lock", True, f"store lock wait p95 {wait_p95:.0f}ms")
+        return
+    _check(ctx, "lock", False, f"store lock wait p95 {wait_p95:.0f}ms over {threshold:g}ms")
+    _add(
+        ctx, "lock-contention", "critical" if wait_p95 > 2 * threshold else "warn",
+        "global", None,
+        "Store lock is contended",
+        f"store lock wait p95 {wait_p95:.0f}ms over the {threshold:g}ms budget: readers queue behind a long hold; "
+        "move compute out of the lock and serve from the result caches (docs/perf.md)",
+        "python3 agent_dash.py status",
+        key="lock",
+    )
+
+
+def _check_source_lagging(ctx, perf: dict, budgets: dict) -> None:
+    sources = perf.get("sources") if isinstance(perf, dict) else None
+    try:
+        needed = int((budgets or {}).get("source_lag_polls", 3))
+    except (TypeError, ValueError):
+        needed = 3
+    if not isinstance(sources, dict):
+        _check(ctx, "source-lag", True, "no source poll samples yet")
+        return
+    lagging = []
+    for name, stats in sources.items():
+        if not isinstance(stats, dict):
+            continue
+        try:
+            breaches = int(stats.get("lag_breaches") or 0)
+        except (TypeError, ValueError):
+            continue
+        if breaches >= needed:
+            lagging.append((name, breaches, stats.get("lag_s")))
+    if not lagging:
+        _check(ctx, "source-lag", True, "no source lagging over 3x its interval")
+        return
+    _check(ctx, "source-lag", False, f"lagging: {', '.join(name for name, _, _ in lagging)}")
+    for name, breaches, lag_s in lagging:
+        lag_text = "unknown" if lag_s is None else f"{lag_s:.0f}s"
+        _add(
+            ctx, "source-lagging", "critical" if breaches >= 2 * needed else "warn",
+            "global", None,
+            f"Source {name} is lagging",
+            f"source {name!r} lag {lag_text} (over 3x its interval for {breaches} consecutive polls): "
+            "its scan overruns the interval; raise its budget or shrink its roots",
+            "python3 agent_dash.py status",
+            key=str(name),
+        )
+
+
+def _db_size_mb(store) -> float | None:
+    try:
+        path = Path(store.path)
+        if str(path) == ":memory:" or not path.is_file():
+            return None
+        total = path.stat().st_size
+        for suffix in ("-wal", "-shm"):
+            try:
+                total += Path(str(path) + suffix).stat().st_size
+            except OSError:
+                pass
+        return total / (1024 * 1024)
+    except Exception:
+        return None
+
+
+#: Hard limits used when perf_budgets.json does not override them:
+#: a database this large is critical on its own, and so is a state
+#: volume with less free space than the next write needs.
+DB_HARD_CAP_MB = 2048.0
+DB_MIN_FREE_GB = 5.0
+
+
+def _free_disk_gb(store) -> float | None:
+    """Free space on the volume holding the state database. Never raises."""
+    try:
+        return shutil.disk_usage(str(Path(store.path).parent)).free / (1024 * 1024 * 1024)
+    except Exception:
+        return None
+
+
+def _check_db_growth(ctx, budgets: dict) -> None:
+    """Warn on the soft budget or the 90-day projection; critical on the hard cap.
+
+    Soft (warn): size over ``db_warn_mb`` (500) or the projection over
+    ``db_crit_mb`` (1000). Hard (critical): size over ``db_hard_cap_mb``
+    (2048) or free space on the state volume under ``db_min_free_gb``
+    (5). All four keys are optional in perf_budgets.json.
+    """
+    store = ctx.store
+    if store is None:
+        _check(ctx, "db-growth", True, "no store")
+        return
+    try:
+        warn_mb = float((budgets or {}).get("db_warn_mb", 500))
+        crit_mb = float((budgets or {}).get("db_crit_mb", 1000))
+        hard_mb = float((budgets or {}).get("db_hard_cap_mb", DB_HARD_CAP_MB))
+        min_free_gb = float((budgets or {}).get("db_min_free_gb", DB_MIN_FREE_GB))
+    except (TypeError, ValueError):
+        warn_mb, crit_mb = 500.0, 1000.0
+        hard_mb, min_free_gb = DB_HARD_CAP_MB, DB_MIN_FREE_GB
+    size_mb = _db_size_mb(store)
+    if size_mb is None:
+        _check(ctx, "db-growth", True, "no database file")
+        return
+    try:
+        rows = store._conn.execute(
+            "SELECT CAST(ts / 86400 AS INTEGER) AS day, COUNT(*) AS n FROM usage_events"
+            " WHERE ts IS NOT NULL AND ts > ? GROUP BY day ORDER BY day",
+            (ctx.now - 7 * 86400,),
+        ).fetchall()
+        rolled = store._conn.execute(
+            "SELECT CAST(hour_ts / 86400 AS INTEGER) AS day, SUM(n_events) AS n FROM usage_rollup_1h"
+            " WHERE hour_ts > ? GROUP BY day ORDER BY day",
+            (int(ctx.now - 7 * 86400),),
+        ).fetchall()
+        if rolled:
+            merged: dict = {}
+            for row in list(rows) + list(rolled):
+                merged[row["day"]] = merged.get(row["day"], 0) + (row["n"] or 0)
+            rows = [{"day": day, "n": n} for day, n in sorted(merged.items())]
+        total_rows = store._conn.execute("SELECT COUNT(*) AS n FROM usage_events").fetchone()["n"] or 0
+        total_rows += store._conn.execute("SELECT COALESCE(SUM(n_events), 0) AS n FROM usage_rollup_1h").fetchone()["n"] or 0
+        run_rows = store._conn.execute("SELECT COUNT(*) AS n FROM runs").fetchone()["n"] or 0
+    except Exception:
+        _check(ctx, "db-growth", True, f"database {size_mb:.0f} MB (trend unreadable)")
+        return
+    span_days = max(1, len(rows))
+    rows_per_day = sum(row["n"] for row in rows) / span_days if rows else 0.0
+    denom = max(1, (total_rows or 0) + (run_rows or 0))
+    projected_mb = size_mb + 90.0 * rows_per_day * (size_mb / denom)
+    soft = size_mb > warn_mb or projected_mb > crit_mb
+    free_gb = _free_disk_gb(store)
+    over_cap = size_mb > hard_mb
+    low_disk = free_gb is not None and free_gb < min_free_gb
+    if not soft and not over_cap and not low_disk:
+        _check(ctx, "db-growth", True, f"database {size_mb:.0f} MB, +{rows_per_day:.0f} rows/day")
+        return
+    critical = over_cap or low_disk
+    reasons = []
+    if over_cap:
+        reasons.append(f"over the {hard_mb:.0f} MB hard cap")
+    if low_disk:
+        reasons.append(f"state volume has {free_gb:.1f} GB free (under {min_free_gb:.0f} GB)")
+    suffix = f"; critical: {', '.join(reasons)}" if critical else ""
+    _check(ctx, "db-growth", False, f"database {size_mb:.0f} MB, +{rows_per_day:.0f} rows/day")
+    _add(
+        ctx, "db-growth", "critical" if critical else "warn", "global", None,
+        "State database is growing past its budget",
+        f"database {size_mb:.0f} MB at +{rows_per_day:.0f} usage rows/day, "
+        f"projected {projected_mb:.0f} MB in 90 days: compact old usage rows hourly{suffix}",
+        "python3 agent_dash.py db rollup --dry-run",
+        key="db",
+    )
 
 
 def _check_dagster_closeouts(ctx, health: dict) -> None:
@@ -997,7 +1291,11 @@ def _db_file(ctx) -> Path | None:
 
 
 def _recent_models(db: Path, since: float | None = None) -> list[dict]:
-    """Models with usage rows (and their billed tokens), read-only."""
+    """Models with usage rows (and their billed tokens), read-only.
+
+    Rolled bundles rejoin with exact counts and token sums, so pricing
+    checks keep seeing old models after a rollup.
+    """
     try:
         conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
     except sqlite3.Error:
@@ -1011,6 +1309,21 @@ def _recent_models(db: Path, since: float | None = None) -> list[dict]:
                               + COALESCE(cache_read,0) + COALESCE(cache_write,0)) AS tokens
                    FROM usage_events GROUP BY model"""
             ).fetchall()
+            rolled = conn.execute(
+                """SELECT model AS model, SUM(n_events) AS rows,
+                          SUM(COALESCE(input_tokens,0) + COALESCE(output_tokens,0)
+                              + COALESCE(cache_read,0) + COALESCE(cache_write,0)) AS tokens
+                   FROM usage_rollup_1h GROUP BY model"""
+            ).fetchall()
+            if rolled:
+                merged: dict = {}
+                for row in list(rows) + list(rolled):
+                    entry = merged.setdefault(
+                        row["model"], {"model": row["model"], "rows": 0, "tokens": 0}
+                    )
+                    entry["rows"] += row["rows"] or 0
+                    entry["tokens"] += row["tokens"] or 0
+                rows = list(merged.values())
         else:
             rows = conn.execute(
                 """SELECT model AS model, COUNT(*) AS rows,
@@ -1019,6 +1332,22 @@ def _recent_models(db: Path, since: float | None = None) -> list[dict]:
                    FROM usage_events WHERE ts >= ? GROUP BY model""",
                 (float(since),),
             ).fetchall()
+            rolled = conn.execute(
+                """SELECT model AS model, SUM(n_events) AS rows,
+                          SUM(COALESCE(input_tokens,0) + COALESCE(output_tokens,0)
+                              + COALESCE(cache_read,0) + COALESCE(cache_write,0)) AS tokens
+                   FROM usage_rollup_1h WHERE hour_ts >= ? GROUP BY model""",
+                (int(float(since) // 1),),
+            ).fetchall()
+            if rolled:
+                merged = {}
+                for row in list(rows) + list(rolled):
+                    entry = merged.setdefault(
+                        row["model"], {"model": row["model"], "rows": 0, "tokens": 0}
+                    )
+                    entry["rows"] += row["rows"] or 0
+                    entry["tokens"] += row["tokens"] or 0
+                rows = list(merged.values())
         return [
             {"model": row["model"], "rows": row["rows"], "tokens": row["tokens"] or 0}
             for row in rows
@@ -3153,6 +3482,287 @@ def _collect_fleet(ctx) -> None:
         ctx, "fleet", count == 0,
         f"{len(ctx.processes)} live workers checked, {count} fleet problems" if count
         else f"{len(ctx.processes)} live workers checked, fleet clean",
+    )
+
+
+#: When the label guard landed (2026-10-19): runs started after this
+#: are ``critical`` when weakly labeled (the refusing entry points
+#: should have stopped them); older runs are ``warn`` legacy history.
+LABEL_GUARD_LANDED_AT = 1792440000.0
+
+
+def _labels_plan_tasks(ctx, workstreams: list) -> dict:
+    """``{ws: [plan task ids]}`` via the one plan resolver. Never raises."""
+    try:
+        from dash.phases import plan_tasks_for
+    except Exception:
+        return {ws: [] for ws in workstreams}
+    try:
+        return plan_tasks_for(workstreams)
+    except Exception:
+        return {ws: [] for ws in workstreams}
+
+
+def _labels_usage_tokens(ctx) -> dict:
+    """Billed tokens per run id, read-only. Never raises.
+
+    Rolled bundles rejoin with exact token sums per run.
+    """
+    db = _db_file(ctx)
+    if db is None or not db.is_file():
+        return {}
+    try:
+        conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    except sqlite3.Error:
+        return {}
+    try:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """SELECT run_id AS run_id,
+                      SUM(COALESCE(input_tokens,0) + COALESCE(output_tokens,0)
+                          + COALESCE(cache_read,0) + COALESCE(cache_write,0)) AS tokens
+               FROM usage_events GROUP BY run_id"""
+        ).fetchall()
+        out = {str(row["run_id"]): int(row["tokens"] or 0) for row in rows}
+        for row in conn.execute(
+            """SELECT run_id AS run_id,
+                      SUM(COALESCE(input_tokens,0) + COALESCE(output_tokens,0)
+                          + COALESCE(cache_read,0) + COALESCE(cache_write,0)) AS tokens
+               FROM usage_rollup_1h GROUP BY run_id"""
+        ).fetchall():
+            key = str(row["run_id"])
+            out[key] = out.get(key, 0) + int(row["tokens"] or 0)
+        return out
+    except sqlite3.Error:
+        return {}
+    finally:
+        conn.close()
+
+
+#: Sources that a guarded launch path creates: ``muse`` and ``glm``
+#: manifests, the ``grok`` family (grok CLI and cursor-agent manifests,
+#: which carry their labels through ``label make``). Interactive Claude
+#: sessions, Claude subagents, dashboard lead slices, Codex and the
+#: process, shell and Dagster sources have no guarded launch path, so
+#: the label check never governs them.
+GUARDED_LABEL_SOURCES = ("muse", "glm", "grok", "grok_cli", "cursor")
+
+#: A project-directory session label (``my-project-0e``, ``documents-a4``):
+#: a bare name with a two-hex suffix and no workstream or hub scope.
+_PROJECT_SESSION_LABEL = re.compile(r"^(?!ws\d|hub-)[a-z][a-z0-9-]*-[0-9a-f]{2}$")
+
+
+def _is_guarded_label_run(row: dict) -> bool:
+    """True when a guarded launch path created the run. Never raises.
+
+    Excludes dashboard lead slices (``slice_of`` set or an ``@`` in the
+    run id) and project-directory session labels even when the source
+    is guarded.
+    """
+    if str(row.get("source") or "") not in GUARDED_LABEL_SOURCES:
+        return False
+    if row.get("slice_of") not in (None, ""):
+        return False
+    if "@" in str(row.get("run_id") or ""):
+        return False
+    return not _PROJECT_SESSION_LABEL.match(str(row.get("label") or ""))
+
+
+def _labels_runs(ctx) -> list[dict]:
+    """Run rows with the fields classification needs. Never raises."""
+    db = _db_file(ctx)
+    if db is None or not db.is_file():
+        return []
+    try:
+        conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    except sqlite3.Error:
+        return []
+    try:
+        conn.row_factory = sqlite3.Row
+        return [
+            {
+                "run_id": row["run_id"],
+                "source": row["source"],
+                "label": row["label"],
+                "status": row["status"],
+                "parent_session_id": row["parent_session_id"],
+                "started_at": row["started_at"],
+                "workstream": row["workstream"],
+                "slice_of": row["slice_of"],
+            }
+            for row in conn.execute(
+                "SELECT run_id, source, label, status, parent_session_id,"
+                " started_at, workstream, slice_of FROM runs"
+            ).fetchall()
+        ]
+    except sqlite3.Error:
+        return []
+    finally:
+        conn.close()
+
+
+def _fmt_tokens(count: int) -> str:
+    if count >= 1_000_000_000:
+        return f"{count / 1_000_000_000:.2f}B"
+    if count >= 1_000_000:
+        return f"{count / 1_000_000:.1f}M"
+    if count >= 1_000:
+        return f"{count / 1_000:.0f}k"
+    return str(count)
+
+
+def _suggest_label(fix: str | None) -> str:
+    """Exact corrected label from a validator fix, best effort.
+
+    Pulls the ``use <label>`` suggestion so the doctor names something
+    the owner can paste. Falls back to the ``label make`` command shape.
+    """
+    import re as _re
+
+    match = _re.search(r"\buse ([a-z0-9][a-z0-9-]*)", str(fix or ""))
+    if match and "<" not in match.group(1):
+        return match.group(1)
+    return "python3 agent_dash.py label make --scope <wsN|hub> --mark plan --slug <slug>"
+
+
+def _collect_labels(ctx, plan_tasks=None, taskmap=None, rules=None) -> None:
+    """Backstop: every live-store run whose label is weak.
+
+    A run counts when its phase is ``unclassified`` or its label fails
+    :func:`dash.labels.check`. One problem per workstream with the run
+    count, billed tokens, and the exact corrected label per run family.
+    Only guarded-launch runs count (see :func:`_is_guarded_label_run`).
+    Severity is ``warn`` for legacy runs and ``critical`` for runs
+    started after the guard landed (refusing entry points should have
+    stopped those). ``plan_tasks``/``taskmap``/``rules`` override the
+    live lookups (tests inject fakes).
+    """
+    if ctx.store is None:
+        _check(ctx, "labels", True, "skipped, no store")
+        return
+    runs = [row for row in _labels_runs(ctx) if _is_guarded_label_run(row)]
+    if not runs:
+        _check(ctx, "labels", True, "no guarded-launch runs")
+        return
+    workstreams = sorted({str(row.get("workstream")) for row in runs if row.get("workstream")})
+    try:
+        if plan_tasks is None:
+            plan_tasks = _labels_plan_tasks(ctx, workstreams)
+        if taskmap is None:
+            try:
+                from dash.taskmatch import load_taskmap
+
+                taskmap = load_taskmap()
+            except Exception:
+                taskmap = {}
+        if rules is None:
+            try:
+                from dash import phases
+
+                rules, _digest, _version = phases.load_rules(local=phases.local_path(ctx.cfg))
+            except Exception:
+                rules = None
+        from dash import phases as _phases
+
+        by_phase = _phases.classify_runs(runs, taskmap=taskmap, plan_tasks=plan_tasks, rules=rules)
+    except Exception:
+        _check(ctx, "labels", True, "skipped, classification unavailable")
+        return
+    try:
+        from dash import labels as label_lib
+    except Exception:
+        _check(ctx, "labels", True, "skipped, label checker unavailable")
+        return
+    tokens = _labels_usage_tokens(ctx)
+    weak: dict[str, list[dict]] = {}
+    for row in runs:
+        label = row.get("label")
+        if not label:
+            continue
+        phase = by_phase.get(row.get("run_id"), ("unclassified", "none"))[0]
+        try:
+            verdict = label_lib.check(
+                str(label),
+                ws=row.get("workstream"),
+                plan_ids=(plan_tasks or {}).get(row.get("workstream"), []),
+                taskmap=taskmap,
+            )
+        except Exception:
+            verdict = {"ok": False}
+        if phase != "unclassified" and verdict.get("ok"):
+            continue
+        ws = row.get("workstream") if row.get("workstream") else None
+        weak.setdefault(ws or "", []).append(
+            {
+                "label": str(label),
+                "tokens": tokens.get(str(row.get("run_id")), 0),
+                "started_at": row.get("started_at"),
+                "fix": verdict.get("fix"),
+            }
+        )
+    if not weak:
+        _check(ctx, "labels", True, f"{len(runs)} runs checked, labels strong")
+        return
+    total_runs = sum(len(items) for items in weak.values())
+    for ws_key in sorted(weak):
+        members = weak[ws_key]
+        ws = ws_key or None
+        families: dict[str, dict] = {}
+        for item in members:
+            entry = families.setdefault(
+                item["label"], {"runs": 0, "tokens": 0, "newest": 0, "fix": None}
+            )
+            entry["runs"] += 1
+            entry["tokens"] += item["tokens"]
+            if entry["fix"] is None:
+                entry["fix"] = item.get("fix")
+            try:
+                stamp = float(item["started_at"] or 0)
+            except (TypeError, ValueError):
+                stamp = 0.0
+            entry["newest"] = max(entry["newest"], stamp)
+        fresh = any(entry["newest"] > LABEL_GUARD_LANDED_AT for entry in families.values())
+        severity = "critical" if fresh else "warn"
+        scope = f"ws:{ws}" if ws else "global"
+        total_tokens = sum(entry["tokens"] for entry in families.values())
+        ordered = sorted(families.items(), key=lambda kv: (-kv[1]["tokens"], kv[0]))
+        parts = []
+        for name, entry in ordered[:3]:
+            suggestion = _suggest_label(entry.get("fix"))
+            parts.append(
+                f"{name} x{entry['runs']}, {_fmt_tokens(entry['tokens'])} -> use {suggestion}"
+            )
+        detail = "; ".join(parts)
+        if len(ordered) > 3:
+            detail += f" (+{len(ordered) - 3} more)"
+        detail += (
+            ". New runs take a marked label (entry points refuse the rest); "
+            "map legacy families with anchored entries in phases.local.json "
+            "(see docs/problems/unlabeled-runs.md)"
+        )
+        top = ordered[0][0]
+        command = (
+            f"python3 agent_dash.py label check {top} --ws {ws}"
+            if ws
+            else f"python3 agent_dash.py label check {top}"
+        )
+        name = ws or "unassigned"
+        _add(
+            ctx,
+            "unlabeled-runs",
+            severity,
+            scope,
+            ws,
+            f"{name}: {len(members)} weakly labeled "
+            f"{'runs' if len(members) != 1 else 'run'} hold {_fmt_tokens(total_tokens)}",
+            detail,
+            command,
+        )
+    _check(
+        ctx,
+        "labels",
+        False,
+        f"{total_runs} weakly labeled runs in {len(weak)} scopes",
     )
 
 

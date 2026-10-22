@@ -90,6 +90,16 @@ class ClassifierTests(unittest.TestCase):
             with self.subTest(label=label):
                 self.assertEqual(self.classify(label)[0], phase)
 
+    def test_convention_accepts_hub_scope(self):
+        for label, phase in (
+            ("hub-plan-dash-gate", "planning"),
+            ("hub-exec-ops", "execution"),
+            ("hub-review-x", "review"),
+            ("hub-coord-y", "coordination"),
+        ):
+            with self.subTest(label=label):
+                self.assertEqual(self.classify(label), (phase, "convention"))
+
     def test_convention_beats_task(self):
         # ws1-rev-WS1.1 names a plan task but the explicit mark wins.
         self.assertEqual(
@@ -495,7 +505,7 @@ class EndpointTests(FoldCase):
         self.assertEqual(
             set(payload),
             {"scope", "since", "until", "day", "rules_hash", "rules_version",
-             "caption", "workstreams", "total", "unclassified_share"},
+             "caption", "workstreams", "total", "unclassified_share", "generated_at"},
         )
         row = [item for item in payload["workstreams"] if item["ws"] == "WS1"][0]
         self.assertEqual(set(row), {"ws", "name", "by_phase", "total", "days", "series"})

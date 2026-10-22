@@ -196,7 +196,7 @@ class SourceTest(unittest.TestCase):
         self.assertEqual(run["status"], "done")
         self.assertEqual(run["verdict"], "PASS")
         self.assertEqual(run["source"], "pi")
-        self.assertEqual(run["tier"], "pi")
+        self.assertEqual(run["tier"], "deepseek")
         self.assertEqual(run["model"], DEEPSEEK)
         self.assertAlmostEqual(run["started_at"], 1792000000.0)
         self.assertIn("out-ws15-exec-wire.md", run["out_path"])
@@ -450,5 +450,14 @@ class FixturePhasesTest(unittest.TestCase):
         self.assertEqual(exec_run["verdict"], "PASS")
 
 
+class ModelTierTest(unittest.TestCase):
+    def test_model_family_is_the_tier(self):
+        self.assertEqual(pi._model_tier("reflection/Beam-1.0-501B-A23B"), "beam")
+        self.assertEqual(pi._model_tier("river/zai-org/GLM-5.3-Flash"), "glm")
+        self.assertEqual(pi._model_tier("river/deepseek-ai/DeepSeek-V4.1-Flash-1017"), "deepseek")
+        self.assertEqual(pi._model_tier(None), "pi")
+
+
 if __name__ == "__main__":
     unittest.main()
+

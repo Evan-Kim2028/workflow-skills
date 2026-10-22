@@ -53,10 +53,12 @@ _QUOTA_WORDS = ("insufficient", "credit", "quota", "balance", "payment required"
 
 
 def tier_of(model: str | None) -> str:
-    """Live tile bucket for a pi model: deepseek for DeepSeek, glm for GLM."""
+    """Live tile bucket for a pi model: deepseek for DeepSeek, glm for GLM, beam for Reflection Beam."""
     text = (model or "").lower()
     if "glm" in text:
         return "glm"
+    if "beam" in text:
+        return "beam"
     return "deepseek"
 
 

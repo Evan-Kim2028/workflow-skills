@@ -49,11 +49,16 @@ class StoreTest(unittest.TestCase):
         self.store.set_offset("/tmp/a", 7, 10, 10, 1.0)
         self.assertEqual(self.store.get_offset("/tmp/a"), (7, 10))
         seq = self.store.data_seq
+        view = self.store.view_seq
         self.store.set_offset("/tmp/a", 7, 10, 12, 2.0)
         self.assertEqual(self.store.data_seq, seq)
         self.store.set_offset("/tmp/a", 8, 0, 4, 3.0)
         self.assertEqual(self.store.get_offset("/tmp/a"), (8, 0))
-        self.assertGreater(self.store.data_seq, seq)
+        # Read cursors are invisible to the page: they move the poll
+        # sequence (liveness) but never the data or view sequences, so
+        # an offset write alone keeps the snapshot cache hot.
+        self.assertEqual(self.store.data_seq, seq)
+        self.assertEqual(self.store.view_seq, view)
 
     def test_attribution_and_out_growing(self):
         self.store.upsert_run(
@@ -178,7 +183,7 @@ class StoreTest(unittest.TestCase):
         ).fetchone()["est_cost_usd"]
         self.assertAlmostEqual(stored, cost("claude-opus-5-5", 2000, 20, 0, 0))
         hours = self.store.query_usage("model", "hour", None, None)
-        self.assertEqual([(row["t"], row["key"], row["input"]) for row in hours], [(0, "opus", 2000), (3600, "opus", 1)])
+        self.assertEqual([(row["t"], row["key"], row["input"]) for row in hours], [(0, "opus@claude", 2000), (3600, "opus@claude", 1)])
         days = self.store.query_usage("model", "day", "WS1", None)
         self.assertEqual(len(days), 1)
         self.assertEqual(days[0]["input"], 2001)
@@ -237,7 +242,7 @@ class StoreTest(unittest.TestCase):
         self.assertEqual(snap["totals"]["cost_usd"], 0.0)
         self.assertIsNone(snap["recent"][0]["cost_usd"])
         buckets = self.store.query_usage("model", "hour", None, None)
-        self.assertEqual(buckets[0]["key"], "glm")
+        self.assertEqual(buckets[0]["key"], "glm@grok-cli")
         self.assertIsNone(buckets[0]["cost_usd"])
 
     def test_zero_token_unpriced_model_is_ignored(self):
@@ -340,7 +345,7 @@ class StoreTest(unittest.TestCase):
         snap = self.store.snapshot(now)
         self.assertEqual(
             set(snap),
-            {"now", "seq", "data_seq", "last_data_ts", "counts", "running", "recent", "recent_shown", "recent_total", "recent_limit", "recent_offset", "totals", "prev_24h", "totals_all_time", "last_activity", "by_workstream"},
+            {"now", "seq", "data_seq", "view_seq", "last_data_ts", "counts", "running", "recent", "recent_shown", "recent_total", "recent_limit", "recent_offset", "totals", "prev_24h", "totals_all_time", "last_activity", "by_workstream"},
         )
         self.assertEqual(snap["counts"]["live_agents"], 0)
         recent_ids = [run["run_id"] for run in snap["recent"]]
@@ -815,7 +820,7 @@ class StoreTest(unittest.TestCase):
         self.assertNotIn("caps", snap)
         counts = snap["counts"]
         self.assertEqual(counts["live_agents"], 1)
-        self.assertEqual(counts["live_by_tool"], {"grok": 1, "muse": 0, "glm": 0, "claude": 0, "deepseek": 0, "other": 0})
+        self.assertEqual(counts["live_by_tool"], {"grok": 1, "muse": 0, "glm": 0, "claude": 0, "deepseek": 0, "codex": 0, "beam": 0, "commandcode": 0, "other": 0})
         self.assertEqual(counts["finished_today"], 1)
         self.assertEqual(counts["finished_in_range"], 1)
         self.assertEqual(counts["finished_by_verdict"], {"ok": 1})
@@ -1861,7 +1866,7 @@ class SnapshotUsageTest(unittest.TestCase):
             snap = self.store.snapshot(self.now, ws, self.since, self.until, usage_group="model")
             self.assert_buckets_match_totals(snap, f"model/{ws}")
         scoped = self.store.snapshot(self.now, "WS1", self.since, self.until, usage_group="model")
-        self.assertEqual({cell["key"] for cell in scoped["usage"]}, {"sonnet"})
+        self.assertEqual({cell["key"] for cell in scoped["usage"]}, {"sonnet@muse"})
 
     def test_workstream_buckets_sum_to_totals(self):
         self.seed()

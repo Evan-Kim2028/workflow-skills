@@ -131,7 +131,11 @@ def _cache_key(store, scope: str, rules_hash: str, ignored) -> tuple:
         ignore_key = ignore_cache_key(ignored)
     except Exception:
         ignore_key = ()
-    return (scope, seq, rules_hash, ignore_key, _plans_stamp(), _taskmap_stamp())
+    try:
+        db_key = str(getattr(store, "path", None))
+    except Exception:
+        db_key = None
+    return (scope, seq, rules_hash, ignore_key, _plans_stamp(), _taskmap_stamp(), db_key)
 
 
 def _billed(event: dict) -> int:
@@ -263,8 +267,36 @@ def build_phases(store, scope: str = "24h", now: float | None = None, cfg=None, 
         )
         return bucket[phase]
 
+    from dash.store.usage import _merge_rolls
+
     for (owner_run, day), items in groups.items():
-        folded, cost, _unpriced = _fold_events(items, _table=table, _memo=memo)
+        live = [event for event in items if not event.get("_rolled")]
+        rolled = [event for event in items if event.get("_rolled")]
+        triples = []
+        if live:
+            triples.append(_fold_events(live, _table=table, _memo=memo))
+        if rolled:
+            # Rolled bundles merge with their stored sums and cost (see
+            # _bundle_triple): repricing summed tokens could cross a tier
+            # threshold the parts never touched, so the stored cost wins.
+            # _merge_rolls restores the fold invariant (unpriced if and
+            # only if the cost is None) that the cell math branches on.
+            for event in rolled:
+                tokens = {
+                    key: event.get(column)
+                    for key, column in (
+                        ("input", "input_tokens"),
+                        ("output", "output_tokens"),
+                        ("cache_read", "cache_read"),
+                        ("cache_write", "cache_write"),
+                        ("reasoning", "reasoning"),
+                    )
+                }
+                triples.append((tokens, event.get("cost_usd"), bool(event.get("unpriced"))))
+        if triples:
+            folded, cost, _unpriced = _merge_rolls(triples)
+        else:
+            folded, cost, _unpriced = _fold_events([], _table=table, _memo=memo)
         ws = owner_ws(owner_run)
         phase = owner_phase(owner_run)
         entry = cell(ws, phase)

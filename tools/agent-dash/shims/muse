@@ -1,0 +1,90 @@
+#!/bin/sh
+# label-guard shim for `muse` (agent-dash).
+#
+# Refuses `muse exec ... --prompt-file <dir>/<label>.md` when <label> fails
+# `dash.labels` strict check, then execs the real `muse` untouched.
+# Everything else (interactive TUI, `exec` with an inline prompt, flags)
+# passes straight through; any shim-side failure fails open to the real
+# binary. Install: copy or symlink this file to a directory that precedes
+# the real `muse` on PATH (the installer prints the exact line; it does
+# not edit your shell rc). Env overrides (tests, layouts without the
+# ~/.claude/tools symlink): LABEL_GUARD_REAL_MUSE, LABEL_GUARD_HOOK.
+#
+# Why a shim: `run_worker.*`, `launch_grok.sh` and `report start` already
+# refuse bad labels themselves, so a direct `muse exec --prompt-file`
+# from a CLI without a pre-tool hook (Codex, Muse) is the one unguarded
+# launcher path. Raw TSV appends (echo/printf/tee builtins) are NOT
+# covered by this shim; the per-CLI hooks cover those where they exist.
+
+set -u
+
+SELF_BASENAME="muse"
+
+self_path() {
+    case "$0" in
+        */*) printf '%s' "$0" ;;
+        *) command -v "$0" 2>/dev/null || printf '%s' "$0" ;;
+    esac
+}
+
+real_muse() {
+    if [ -n "${LABEL_GUARD_REAL_MUSE:-}" ]; then
+        printf '%s' "$LABEL_GUARD_REAL_MUSE"
+        return
+    fi
+    self="$(self_path)"
+    old_ifs="$IFS"
+    IFS=":"
+    for dir in $PATH; do
+        candidate="$dir/$SELF_BASENAME"
+        if [ -x "$candidate" ] && [ "$candidate" != "$self" ]; then
+            IFS="$old_ifs"
+            printf '%s' "$candidate"
+            return
+        fi
+    done
+    IFS="$old_ifs"
+    printf '%s' "$self"
+}
+
+guard_hook() {
+    if [ -n "${LABEL_GUARD_HOOK:-}" ]; then
+        printf '%s' "$LABEL_GUARD_HOOK"
+        return
+    fi
+    linked="$HOME/.claude/tools/agent-dash/scripts/label_guard_hook.py"
+    if [ -f "$linked" ]; then
+        printf '%s' "$linked"
+        return
+    fi
+    here="$(dirname "$0" 2>/dev/null || echo .)"
+    printf '%s' "$here/../scripts/label_guard_hook.py"
+}
+
+pass_through() {
+    real="$(real_muse)"
+    exec "$real" "$@"
+}
+
+if [ "${1:-}" != "exec" ]; then
+    pass_through "$@"
+fi
+
+GUARD="$(guard_hook)"
+if [ ! -f "$GUARD" ] || ! command -v python3 >/dev/null 2>&1; then
+    pass_through "$@"
+fi
+
+joined="$(python3 -c 'import shlex,sys; print(shlex.join(sys.argv[1:]))' "$SELF_BASENAME" "$@" 2>/dev/null)" || pass_through "$@"
+if [ -z "$joined" ]; then
+    pass_through "$@"
+fi
+if printf '%s' "$joined" | python3 -c 'import json,sys; print(json.dumps({"tool_name":"Bash","tool_input":{"command":sys.stdin.read()}}))' 2>/dev/null | python3 "$GUARD"; then
+    pass_through "$@"
+else
+    code=$?
+    if [ "$code" -eq 2 ]; then
+        exit 2
+    fi
+    pass_through "$@"
+fi

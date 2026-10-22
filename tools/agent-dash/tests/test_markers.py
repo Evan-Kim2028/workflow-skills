@@ -166,7 +166,7 @@ class MarkerCountsTests(unittest.TestCase):
             keys.update((point.get("models") or {}).keys())
         # Tokens with no recorded model honestly read as "model not
         # recorded": the marker rule never hides real usage.
-        self.assertIn("muse-unknown", keys)
+        self.assertIn("muse-unknown@muse", keys)
 
 
 class MarkerMergeTests(unittest.TestCase):

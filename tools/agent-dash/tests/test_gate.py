@@ -113,6 +113,14 @@ class GateSelectionTest(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("test_cursor.py", selected)
 
+    def test_nested_test_selects_dotted_module(self):
+        self._write("tests/perf/test_perf_budget.py")
+        self._commit_all()
+        self._write("tests/perf/test_perf_budget.py", "placeholder\n# touched\n")
+        code, selected, _err = self._gate("HEAD", "--list")
+        self.assertEqual(code, 0)
+        self.assertIn("perf/test_perf_budget.py", selected)
+
     def test_committed_diff_against_base(self):
         self._write("dash/doctor.py")
         self._commit_all("v1")

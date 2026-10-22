@@ -391,6 +391,24 @@ console.log("hover builders proof ok: " + seen.length + " strings compact");
         self.assertIn("state.snapSig", bodies["refreshSnapshot"])
         self.assertIn("state.snapSig", bodies["refreshAll"])
 
+    def test_quiet_tick_compares_view_seq_with_paced_refresh(self):
+        """The tick compares view_seq, not seq: offset cursors, heartbeats
+        and telemetry-only rewrites move seq without waking the page, and a
+        quiet refresh runs at most once per max(2 s, 3x the last snapshot
+        duration) with a trailing refresh so the latest tick always lands."""
+        script = inline_scripts()
+        bodies = dict(functions(script))
+        self.assertIn("stream", bodies, "stream is gone from the page")
+        self.assertIn("tickView", bodies, "no tick view helper")
+        self.assertIn("view_seq", bodies["tickView"], "the tick still compares seq")
+        self.assertIn("tickView", bodies["stream"], "the tick ignores the view sequence")
+        self.assertIn("wantQuietRefresh", bodies["stream"], "ticks refetch without pacing")
+        self.assertIn("snapMinInterval", script, "no adaptive snapshot interval")
+        self.assertIn("Math.max(2000", script, "the floor of the refresh interval moved")
+        self.assertIn("snapFinished", bodies["refreshSnapshot"], "snapshot refresh skips the trailing edge")
+        self.assertIn("takeSeq", bodies["refreshSnapshot"], "snapshot refresh drops view_seq")
+        self.assertIn("viewSeq", script, "the page never stores the visible sequence")
+
     def test_refresh_paths_read_one_snapshot_response(self):
         """Tiles and chart come from one snapshot response: refreshAll,
         refreshSnapshot (stream ticks) and warmTabs request usage_group with
@@ -1141,8 +1159,8 @@ console.log("hover builders proof ok: " + seen.length + " strings compact");
         self.assertIn("aria-hidden", bodies["tileSpark"], "the sparkline is not marked decorative")
 
     def test_stale_badge_reads_tick_freshness(self):
-        """The tick carries seq + freshness; the page badges stale when the
-        seq stays frozen for 3 poll intervals with an open SSE stream."""
+        """The tick carries view_seq + freshness; the page badges stale when
+        the view stays frozen for 3 poll intervals with an open SSE stream."""
         script = inline_scripts()
         bodies = dict(functions(script))
         page = (STATIC / "index.html").read_text()
@@ -1152,8 +1170,8 @@ console.log("hover builders proof ok: " + seen.length + " strings compact");
         self.assertIn("lastSeqChange", script, "the page never tracks seq age")
         self.assertIn("last_poll", script, "the tick freshness never reaches the page")
         self.assertIn("stream", bodies)
-        self.assertIn("d.seq", bodies["stream"], "the tick handler ignores the seq")
-        self.assertIn("refreshSnapshot", bodies["stream"], "a changed seq never refetches")
+        self.assertIn("tickView", bodies["stream"], "the tick handler ignores the view sequence")
+        self.assertIn("wantQuietRefresh", bodies["stream"], "a changed view never refetches")
 
     def test_finished_truncation_is_visible(self):
         """The Finished table names its truncation ("Newest 50 of N") from
@@ -1670,6 +1688,43 @@ setTimeout(function () {
         )
         self.assertEqual(proc.returncode, 0, proc.stderr or proc.stdout)
 
+    def test_planned_pick_from_plan_view_opens_its_plan(self):
+        """pickWs on a planned row opens that workstream's plan while the
+        view is Plan; from any other view it still opens the Planned shelf.
+        Source-level stubs: selectTab and selectView are recorded, not run."""
+        script = (
+            "const fs=require('fs');"
+            "globalThis.window=globalThis;"
+            "globalThis.document={addEventListener:function(){},getElementById:function(){return null;}};"
+            "eval(fs.readFileSync(process.argv[1],'utf8'));"
+            "eval(fs.readFileSync(process.argv[2],'utf8'));"
+            "const assert=require('assert');"
+            "globalThis.calls=[];"
+            "globalThis.selectView=function(v){calls.push(['view',v]);state.view=v;};"
+            "globalThis.selectTab=function(w){calls.push(['tab',w]);state.ws=String(w).toUpperCase();};"
+            "globalThis.isProjectView=function(){return ['project','planned','archive'].indexOf(state.view)>=0;};"
+            "globalThis.state={view:'plan',ws:'all',wss:[],wssAll:["
+            "{ws:'WS13',name:'Planned one',state:'planned'},"
+            "{ws:'WS4',name:'Live one',state:'active'},"
+            "{ws:'WS9',name:'Old one',state:'archived'}],bundles:[]};"
+            "function run(view,id,st){calls.length=0;state.view=view;pickWs(id,st);return calls.slice();}"
+            "assert.deepStrictEqual(run('plan','WS13','planned'),[['tab','WS13']]);"
+            "assert.strictEqual(state.view,'plan');"
+            "assert.deepStrictEqual(run('plan','ws13',undefined),[['tab','WS13']]);"
+            "assert.deepStrictEqual(run('plan','WS4','active'),[['tab','WS4']]);"
+            "assert.deepStrictEqual(run('plan','WS9','archived'),[['view','archive']]);"
+            "assert.deepStrictEqual(run('exec','WS13','planned'),[['view','planned']]);"
+            "assert.deepStrictEqual(run('project','WS13','planned'),[['view','planned']]);"
+            "assert.deepStrictEqual(run('planned','WS13','planned'),[]);"
+            "assert.deepStrictEqual(run('exec','WS4','active'),[['tab','WS4']]);"
+        )
+        proc = subprocess.run(
+            ["node", "-e", script, str(STATIC / "tabs.js"), str(STATIC / "core" / "switcher.js")],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr or proc.stdout)
+
     def test_tab_lifecycle_helpers(self):
         """Tabs keep active/paused/done states; absent or unknown reads as
         active, the same default the API uses."""
@@ -1964,6 +2019,111 @@ loadPlanSums().then(function () {
         self.assertEqual(proc.returncode, 0, proc.stderr or proc.stdout)
         self.assertIn("plan load proof ok", proc.stdout)
 
+    def test_lazy_plan_sums_gate_below_fold(self):
+        """maybeLoadPlanSums fetches at once when the program panel is on
+        screen, and defers to an IntersectionObserver when it sits below
+        the fold; scrolling it into view loads exactly once. The bars
+        render from the same loadPlanSums path either way, so nothing
+        visible changes."""
+        harness = r'''
+const fs = require("fs");
+const assert = require("assert");
+global.window = globalThis;
+global.innerHeight = 900;
+global.state = {wss: [{ws: "WS1", plan: true}]};
+global.shown = function (list) { return (list || []).filter(function (w) { return w.plan; }); };
+var apiCalls = 0;
+global.api = function () { apiCalls++; return Promise.resolve(null); };
+global.renderTabs = function () {};
+var panelTop = 100;
+var observers = [];
+global.document = {querySelectorAll: function () { return [{getBoundingClientRect: function () { return {bottom: panelTop + 400, top: panelTop}; }}]; }};
+global.IntersectionObserver = function (cb) { this.cb = cb; observers.push(this); };
+global.IntersectionObserver.prototype.observe = function () {};
+global.IntersectionObserver.prototype.disconnect = function () {};
+eval(fs.readFileSync(process.argv[2], "utf8"));
+assert.strictEqual(typeof maybeLoadPlanSums, "function");
+maybeLoadPlanSums().then(function () {
+  assert.strictEqual(apiCalls, 1, "a visible panel must load at once, got " + apiCalls);
+  apiCalls = 0;
+  panelTop = 1500;
+  return maybeLoadPlanSums();
+}).then(function () {
+  assert.strictEqual(apiCalls, 0, "a below-fold panel must defer, got " + apiCalls);
+  assert.strictEqual(observers.length, 1, "deferring must observe the panel");
+  observers[0].cb([{isIntersecting: true}]);
+  return new Promise(function (res) { setTimeout(res, 20); });
+}).then(function () {
+  assert.strictEqual(apiCalls, 1, "scrolling into view must load once, got " + apiCalls);
+  console.log("lazy plan proof ok");
+}).catch(function (e) { console.error("ASSERT: " + ((e && e.stack) || e)); process.exit(1); });
+'''
+        with tempfile.TemporaryDirectory() as tmp:
+            harness_path = Path(tmp) / "lazy_plan.js"
+            harness_path.write_text(harness, encoding="utf-8")
+            proc = subprocess.run(
+                ["node", str(harness_path), str(STATIC / "cards" / "ws-cards.js")],
+                capture_output=True,
+                text=True,
+            )
+        self.assertEqual(proc.returncode, 0, proc.stderr or proc.stdout)
+        self.assertIn("lazy plan proof ok", proc.stdout)
+
+    def test_nav_and_api_share_inflight(self):
+        """Concurrent identical GETs share one fetch (boot fires nav data
+        and nav chrome together), a nav load that just finished is reused
+        for two seconds (the landing flip and post-action refresh call
+        loadNav back to back), and actions force past that gate."""
+        harness = r'''
+const fs = require("fs");
+const assert = require("assert");
+global.window = globalThis;
+global.FIX = false;
+global.state = {bundles: [], wss: [], wssAll: [], project: {name: null}, actionsArchive: false};
+global.since = function () { return 123; };
+global.renderTabs = function () {};
+global.applyChrome = function () {};
+global.resolveLanding = function () {};
+var fetches = [];
+global.fetch = function (url, opts) {
+  fetches.push({url: url, inm: !!(opts && opts.headers && opts.headers["If-None-Match"])});
+  return Promise.resolve({ok: true, status: 200, headers: {get: function () { return "tag"; }}, json: function () { return Promise.resolve({bundles: [], workstreams: []}); }});
+};
+eval(fs.readFileSync(process.argv[2], "utf8"));
+assert.strictEqual(typeof loadNav, "function");
+Promise.all([api("/api/project", {}), api("/api/project", {})]).then(function () {
+  assert.strictEqual(fetches.length, 1, "concurrent identical GETs flew " + fetches.length + " fetches");
+  fetches = [];
+  return Promise.all([loadNav(), loadNav()]);
+}).then(function () {
+  var urls = fetches.map(function (f) { return f.url; }).sort();
+  assert.deepStrictEqual(urls, ["/api/bundles", "/api/project", "/api/workstreams?since=123", "/api/workstreams?since=123&state=all"].sort());
+  fetches = [];
+  return loadNav();
+}).then(function () {
+  assert.strictEqual(fetches.length, 0, "a just-finished nav must be reused, got " + fetches.length);
+  return loadNav(true);
+}).then(function () {
+  assert.strictEqual(fetches.length, 4, "a forced nav must refetch, got " + fetches.length);
+  fetches = [];
+  return api("/api/project", {});
+}).then(function () {
+  assert.strictEqual(fetches.length, 1, "a later call must revalidate");
+  assert.strictEqual(fetches[0].inm, true, "the revalidation must send If-None-Match");
+  console.log("nav share proof ok");
+}).catch(function (e) { console.error("ASSERT: " + ((e && e.stack) || e)); process.exit(1); });
+'''
+        with tempfile.TemporaryDirectory() as tmp:
+            harness_path = Path(tmp) / "nav_share.js"
+            harness_path.write_text(harness, encoding="utf-8")
+            proc = subprocess.run(
+                ["node", str(harness_path), str(STATIC / "core" / "api.js")],
+                capture_output=True,
+                text=True,
+            )
+        self.assertEqual(proc.returncode, 0, proc.stderr or proc.stdout)
+        self.assertIn("nav share proof ok", proc.stdout)
+
     def test_section_keys_have_no_volatile_values(self):
         """Section keys decide rebuilds: a key holding an unbucketed clock
         read, Math.random() or new Date() changes on every render and the
@@ -2238,7 +2398,9 @@ console.log("applySections proof ok");
         snap = bodies["refreshSnapshot"]
         self.assertIn("snapInflight", snap, "ticks no longer take one snapshot fetch at a time")
         self.assertIn("refreshBusy()", snap, "a tick still piles onto a running full refresh")
-        self.assertIn("refreshBusy()", bodies["stream"], "stream ticks ignore a running refresh")
+        self.assertIn("wantQuietRefresh", bodies["stream"], "stream ticks refetch without pacing")
+        self.assertIn("snapInflight", bodies["wantQuietRefresh"], "paced ticks ignore an in-flight fetch")
+        self.assertIn("refreshBusy()", bodies["wantQuietRefresh"], "paced ticks ignore a running refresh")
         self.assertIn("refreshBusy()", bodies["warmTabs"], "warmups still compete with the foreground burst")
         proj = bodies["refreshProject"]
         self.assertIn("projSig", proj, "project ticks lost their skip-when-unchanged gate")

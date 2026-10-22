@@ -11,9 +11,11 @@
 #   base defaults to origin/main. --list prints the selection without
 #   running anything. Run from anywhere; the script cds to tools/agent-dash.
 #
-# A changed tests/test_<x>.py selects test_<x> itself. Files matching no
-# table entry select the default tests with a warning. test_privacy_pin
-# and test_page_rules always run.
+# A changed tests/test_<x>.py selects test_<x> itself; a nested
+# tests/<dir>/test_<x>.py selects <dir>/test_<x>, which runs as the
+# tests.<dir>.test_<x> module with ADASH_PERF=1 (perf-gated suites skip
+# without it). Files matching no table entry select the default tests
+# with a warning. test_privacy_pin and test_page_rules always run.
 
 set -u
 
@@ -71,8 +73,8 @@ for path in (line.strip() for line in sys.stdin):
             hits.update(tests)
     base = os.path.basename(rel)
     if rel.startswith("tests/") and base.startswith("test_") and base.endswith(".py"):
-        name = base[:-3]
-        if os.path.isfile(os.path.join(tools, "tests", base)):
+        name = rel[len("tests/"):-len(".py")]
+        if os.path.isfile(os.path.join(tools, rel)):
             hits.add(name)
     if not hits:
         hits.update(default)
@@ -96,6 +98,25 @@ fi
 
 FAIL=0
 for t in $TESTS; do
+    case "$t" in
+        */*)
+            MOD="tests.$(printf '%s' "$t" | tr '/' '.')"
+            if [ ! -f "tests/$t.py" ]; then
+                echo "SKIP $t.py (no such test file; map entry stale)"
+                continue
+            fi
+            OUT=$(mktemp) || exit 2
+            if ADASH_PERF=1 python3 -m unittest "$MOD" >"$OUT" 2>&1; then
+                echo "PASS $t.py"
+            else
+                echo "FAIL $t.py"
+                tail -20 "$OUT"
+                FAIL=1
+            fi
+            rm -f "$OUT"
+            continue
+            ;;
+    esac
     if [ ! -f "tests/$t.py" ]; then
         echo "SKIP $t.py (no such test file; map entry stale)"
         continue

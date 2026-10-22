@@ -17,10 +17,12 @@
   var KEY_PREFIX = "agent-dash-unattributed:";
 
   /* The same -unknown rule static/models.js nameOf uses: a key ending
-     -unknown reads "model not recorded". Recorded-but-unknown ids read
-     Other, never unknown, so they stay listed. */
+     -unknown reads "model not recorded" (a series key counts when its
+     model half does: beam-unknown@pi is still unattributed).
+     Recorded-but-unknown ids read Other, never unknown, so they stay
+     listed. */
   function isUnattributed(key) {
-    return /-unknown$/.test(String(key == null ? "" : key));
+    return /-unknown(@|$)/.test(String(key == null ? "" : key));
   }
 
   /* Pure: the listed keys minus the unattributed ones. Lists simply

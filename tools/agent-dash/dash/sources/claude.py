@@ -18,7 +18,22 @@ stored.
 - ``roots.claude_projects``, ``roots.claude_sessions``
 - ``read_budgets.per_file`` (default 4 MiB), ``read_budgets.per_tick`` (8 MiB)
 - ``live_window_s`` (36 h), ``dir_scan_s`` (15), ``running_mtime_s`` (15 min)
+- ``main_running_mtime_s`` (3 min): a main session counts as writing
+  only inside this window; past it a main is running only with a live
+  child or an unanswered tool call (see ``decide_main_status``)
 - ``backfill_session``, or ``mode`` ``backfill`` with ``session_id``
+
+A main session that went quiet reads ``unknown`` while its transcript
+is recent (under an hour) and ``done`` after: the ``unknown`` status
+already means "not live, end unconfirmed" on every surface (no
+running badge, never a live agent, never a stale mismatch), so no
+page change is needed. Lead per-turn workstream numbers and launched
+lane labels are derived here from label-shaped text only (never
+stored); see :mod:`dash.lead_split`. Subagent spawn links (Agent
+tool_use id to parent turn, sidecar ``toolUseId``, parent tool result
+``agentId``) and the subagents' own signal votes are derived the same
+way: ids and workstream numbers only, never prompt text or tool
+arguments.
 """
 
 from __future__ import annotations
@@ -43,6 +58,13 @@ DIR_SCAN_S = 15
 DIR_LIST_CAP = 500
 SETTLED_CAP = 100000
 RUNNING_MTIME_S = 15 * 60
+#: A main transcript counts as still being written inside this window.
+MAIN_RUNNING_MTIME_S = 3 * 60
+#: Past the writing window a quiet main reads ``unknown`` (idle) while
+#: its transcript is this recent, ``done`` after.
+MAIN_IDLE_RECENT_S = 60 * 60
+#: Tail bytes scanned for an unanswered tool call (bounded, read-only).
+TAIL_SCAN_N = 8192
 MAX_LABEL = 200
 META_MAX = 64 * 1024
 JOURNAL_MAX = 256 * 1024
@@ -88,6 +110,12 @@ _meta_cache: dict = {}
 _journal_seen: dict = {}
 _dir_cache: dict = {}
 _settled: dict = {}
+_split_cursors: dict = {}
+_split_seeded: set = set()
+_split_maintained: dict = {}
+_split_pending: set = set()
+#: Seconds between per-session slice maintenance passes.
+SPLIT_MAINTAIN_S = 60.0
 
 
 def reset_state() -> None:
@@ -113,6 +141,10 @@ def reset_state() -> None:
     _journal_seen.clear()
     _dir_cache.clear()
     _settled.clear()
+    _split_cursors.clear()
+    _split_seeded.clear()
+    _split_maintained.clear()
+    _split_pending.clear()
 
 
 def tier_of(model: str | None) -> str | None:
@@ -183,6 +215,120 @@ def transcript_status(
     return "done"
 
 
+def decide_main_status(
+    *,
+    caught_up: bool,
+    mtime_age: float,
+    pid_dead: bool,
+    has_live_child: bool,
+    pending_tool: bool,
+    main_running_s: float = MAIN_RUNNING_MTIME_S,
+    running_s: float = RUNNING_MTIME_S,
+    idle_recent_s: float = MAIN_IDLE_RECENT_S,
+) -> str:
+    """A main session's status: running only on fresh evidence.
+
+    ``running`` while still catching up on the transcript, while the
+    transcript was written inside the short main window, while a child
+    (a running subagent, or a running worker run parented to this
+    session) is live, or while the last assistant turn left an
+    unanswered tool call (a long Bash, a background task) and the
+    transcript is younger than the old running bound. Otherwise the
+    session is idle (``unknown``: not live, end unconfirmed) while
+    recent, and ``done`` after. A known-dead pid is done outright.
+    ``unknown`` reuses the existing status every surface already
+    treats as not-running, so an idle session never shows the running
+    badge and is never counted as a live agent.
+    """
+    if not caught_up:
+        return "running"
+    if pid_dead:
+        return "done"
+    try:
+        age = float(mtime_age)
+    except (TypeError, ValueError):
+        age = float("inf")
+    if age <= float(main_running_s):
+        return "running"
+    if has_live_child:
+        return "running"
+    if pending_tool and age <= float(running_s):
+        return "running"
+    if age < float(idle_recent_s):
+        return "unknown"
+    return "done"
+
+
+def _tail_pending_tool(path: str) -> bool:
+    """True when the last assistant turn left an unanswered tool call.
+
+    Reads only the file tail (bounded): the tool_use ids of the last
+    assistant message, minus any tool_result for them on later lines.
+    Missing or unreadable files read as False, never an exception.
+    Only ids are compared; no text is kept.
+    """
+    st = _stat(path)
+    if st is None or st.st_size <= 0:
+        return False
+    n = min(st.st_size, TAIL_SCAN_N)
+    try:
+        with open(path, "rb") as fh:
+            if st.st_size > n:
+                fh.seek(st.st_size - n)
+            data = fh.read(n)
+    except OSError:
+        return False
+    lines = [line for line in data.split(b"\n") if line.strip()]
+    last_uses: list | None = None
+    last_index = -1
+    for index, line in enumerate(lines):
+        if not _is_assistant_line(line):
+            continue
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(rec, dict) or rec.get("type") != "assistant":
+            continue
+        msg = rec.get("message")
+        content = msg.get("content") if isinstance(msg, dict) else None
+        if not isinstance(content, list):
+            continue
+        last_uses = [
+            block.get("id")
+            for block in content
+            if isinstance(block, dict)
+            and block.get("type") == "tool_use"
+            and isinstance(block.get("id"), str)
+        ]
+        last_index = index
+    if not last_uses:
+        return False
+    answered = set()
+    for line in lines[last_index + 1 :]:
+        if b"tool_result" not in line:
+            continue
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        msg = rec.get("message") if isinstance(rec, dict) else None
+        content = msg.get("content") if isinstance(msg, dict) else None
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            target = block.get("tool_use_id")
+            if isinstance(target, str):
+                answered.add(target)
+            nested = block.get("content") if isinstance(block.get("content"), list) else []
+            for item in nested:
+                if isinstance(item, dict) and isinstance(item.get("tool_use_id"), str):
+                    answered.add(item["tool_use_id"])
+    return any(use not in answered for use in last_uses)
+
+
 def subagent_status(final: bool, fresh: bool) -> str:
     """Running only when the last event is not a result and the transcript
     was written inside ``running_mtime_s``.
@@ -229,8 +375,31 @@ def poll(store, cfg, now: float) -> None:
         left = _poll_registry(store, cfg, per_tick)
         _poll_transcripts(store, cfg, now, left, per_file)
         _refresh_inheritance(store, now)
+        _drain_slices(store, cfg, now)
     except Exception as exc:
         _log.warning("claude poll: %s", type(exc).__name__)
+
+
+def _drain_slices(store, cfg, now: float) -> None:
+    """Refresh slice rows for sessions ingested this poll, last.
+
+    Runs after the inherit refresh so slice maintenance reads the
+    settled session attribution, not the mid-poll guess. Throttled
+    per session (always in backfill). Never raises.
+    """
+    if not _split_pending:
+        return
+    pending = sorted(_split_pending)
+    _split_pending.clear()
+    try:
+        backfill = _backfill(cfg)
+    except Exception:
+        backfill = None
+    for session_id in pending:
+        try:
+            _maintain_slices(store, session_id, now, backfill)
+        except Exception as exc:
+            _log.warning("claude slices: %s", type(exc).__name__)
 
 
 def _refresh_inheritance(store, now: float) -> None:
@@ -410,6 +579,10 @@ def _poll_transcripts(store, cfg, now, left, per_file) -> None:
     window = float(cfg.get("live_window_s", LIVE_WINDOW_S))
     scan_s = float(cfg.get("dir_scan_s", DIR_SCAN_S))
     fresh_s = float(cfg.get("running_mtime_s", RUNNING_MTIME_S))
+    try:
+        main_running_s = float(cfg.get("main_running_mtime_s", MAIN_RUNNING_MTIME_S))
+    except (TypeError, ValueError):
+        main_running_s = float(MAIN_RUNNING_MTIME_S)
     backfill = _backfill(cfg)
     try:
         list_cap = int(cfg.get("dir_list_cap", DIR_LIST_CAP))
@@ -426,7 +599,15 @@ def _poll_transcripts(store, cfg, now, left, per_file) -> None:
                 left = _ingest_journal(store, target, now, fresh_s, left)
             else:
                 left = _ingest_jsonl(
-                    store, target, now, fresh_s, left, per_file, backfill, window
+                    store,
+                    target,
+                    now,
+                    fresh_s,
+                    left,
+                    per_file,
+                    backfill,
+                    window,
+                    main_running_s,
                 )
         except Exception as exc:
             _log.warning(
@@ -606,7 +787,350 @@ def _ingest_journal(store, target, now, fresh_s, left) -> int:
     return left
 
 
-def _ingest_jsonl(store, target, now, fresh_s, left, per_file, backfill, window) -> int:
+def _store_has_live_child(store, session_id: str) -> bool:
+    """A running child of ``session_id``, or False without the store hook."""
+    checker = getattr(store, "has_live_child", None)
+    if not callable(checker):
+        return False
+    try:
+        return bool(checker(session_id))
+    except Exception:
+        return False
+
+
+def _main_liveness(store, target, st, now, fresh, main_running_s):
+    """``(main_fresh, child, pending)`` for a main transcript.
+
+    The child (running subagent or parented worker run) and pending
+    (unanswered tool call) checks run only inside the ambiguous
+    window: past the short main window but inside the old running
+    bound. Outside it the mtime alone decides, so quiet and stale
+    files cost no extra I/O. ``None`` means "not consulted".
+    """
+    age = now - st.st_mtime
+    main_fresh = age <= main_running_s
+    if main_fresh or not fresh:
+        return main_fresh, None, None
+    child = _store_has_live_child(store, target.session_id)
+    if child:
+        return main_fresh, True, None
+    return main_fresh, False, _tail_pending_tool(target.path)
+
+
+def _assistant_msg_id(line: bytes):
+    """The assistant message id on one line, or None (never raises)."""
+    try:
+        rec = json.loads(line)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(rec, dict) or rec.get("type") != "assistant":
+        return None
+    msg = rec.get("message")
+    if not isinstance(msg, dict):
+        return None
+    mid = msg.get("id")
+    return str(mid) if isinstance(mid, str) and mid else None
+
+
+def _note_splits(store, target, lines):
+    """Per-turn workstream numbers and launched lane labels for a main.
+
+    Scans the just-read chunk in file order through the split cursor:
+    every assistant line advances the cursor (usage or not, so
+    text-only turns keep the topic), and lines carrying usage gain
+    their assignment. Returns ``({message_id: ws}, [launched labels],
+    {message_id: direct vote})``; workstream numbers only, never text.
+    The direct vote is the turn's own signal pick (None when the turn
+    carries no signal), which the spawn-link pass needs apart from the
+    inherited cursor assignment. Non-main targets read as empty. Never
+    raises: the poll stays exception-safe.
+    """
+    try:
+        if target.kind != "main" or not lines:
+            return {}, [], {}
+        from dash import lead_split
+
+        run_id = _run_id(target.kind, target.session_id, target.agent_id, target.wf_id)
+        cursor = _split_cursors.get(run_id)
+        if cursor is None:
+            seed = None
+            if run_id not in _split_seeded:
+                _split_seeded.add(run_id)
+                getter = getattr(store, "last_split_ws", None)
+                if callable(getter):
+                    try:
+                        seed = getter(target.session_id)
+                    except Exception:
+                        seed = None
+            cursor = lead_split.SplitCursor(seed)
+            _split_cursors[run_id] = cursor
+        splits: dict = {}
+        launches: list = []
+        directs: dict = {}
+        for line in lines:
+            order, found = lead_split.signals_in_line(line)
+            for label in found:
+                if label not in launches:
+                    launches.append(label)
+            if not _is_assistant_line(line):
+                continue
+            mid = _assistant_msg_id(line)
+            direct = lead_split.pick_turn(order)
+            assigned = cursor.observe(order)
+            if mid is None:
+                continue
+            if direct is not None:
+                directs[mid] = direct
+            if assigned is not None:
+                splits[mid] = assigned
+        return splits, launches, directs
+    except Exception as exc:
+        _log.warning("claude splits: %s", type(exc).__name__)
+        return {}, [], {}
+
+
+def _link_lanes(store, session_id: str, launches) -> None:
+    """Adopt parentless worker runs for labels this session launched."""
+    if not launches:
+        return
+    linker = getattr(store, "link_lane_run", None)
+    if not callable(linker):
+        return
+    for label in launches:
+        try:
+            linker(label, session_id)
+        except Exception as exc:
+            _log.warning("claude lane link: %s", type(exc).__name__)
+            return
+
+
+#: An ``agentId`` inside a parent tool result's metadata text. Only the
+#: id is ever kept; the surrounding text is not stored.
+_AGENT_ID_RE = re.compile(r"agentId:\s*([0-9A-Za-z_-]{5,80})")
+
+
+def _agent_uses_in_line(line: bytes) -> list:
+    """``[(tool_use_id, message_id)]`` for Agent spawns on one line.
+
+    Only assistant lines with a real Agent tool_use block match; ids
+    only, never text. Never raises.
+    """
+    try:
+        rec = json.loads(line)
+    except (json.JSONDecodeError, ValueError):
+        return []
+    if not isinstance(rec, dict) or rec.get("type") != "assistant":
+        return []
+    msg = rec.get("message")
+    if not isinstance(msg, dict):
+        return []
+    mid = msg.get("id")
+    if not isinstance(mid, str) or not mid:
+        return []
+    content = msg.get("content")
+    if not isinstance(content, list):
+        return []
+    return [
+        (block.get("id"), mid)
+        for block in content
+        if isinstance(block, dict)
+        and block.get("type") == "tool_use"
+        and block.get("name") == "Agent"
+        and isinstance(block.get("id"), str)
+        and block.get("id")
+    ]
+
+
+def _agent_links_in_line(line: bytes) -> list:
+    """``[(tool_use_id, agent_id)]`` for subagent launch results.
+
+    A parent tool result carries the spawned subagent's id as
+    ``agentId: <id>`` inside its metadata text; only the two ids are
+    kept. Never raises.
+    """
+    try:
+        rec = json.loads(line)
+    except (json.JSONDecodeError, ValueError):
+        return []
+    if not isinstance(rec, dict):
+        return []
+    msg = rec.get("message")
+    if not isinstance(msg, dict):
+        return []
+    content = msg.get("content")
+    if not isinstance(content, list):
+        return []
+    out = []
+    for block in content:
+        if (
+            not isinstance(block, dict)
+            or block.get("type") != "tool_result"
+            or not isinstance(block.get("tool_use_id"), str)
+        ):
+            continue
+        inner = block.get("content")
+        if isinstance(inner, str):
+            texts = [inner]
+        elif isinstance(inner, list):
+            texts = [
+                item.get("text")
+                for item in inner
+                if isinstance(item, dict) and isinstance(item.get("text"), str)
+            ]
+        else:
+            continue
+        for text in texts:
+            match = _AGENT_ID_RE.search(text)
+            if match:
+                out.append((block["tool_use_id"], match.group(1)))
+                break
+    return out
+
+
+def _note_spawns(store, target, lines, splits, directs) -> list:
+    """Link Agent spawns to their parent turn; re-resolve linked runs.
+
+    Main targets only. Every Agent tool_use id on the chunk gains its
+    spawning turn (message id, the turn's direct signal vote, the
+    cursor assignment at that turn); every tool result carrying an
+    agentId links the subagent run. Either side may arrive first; the
+    store joins whichever comes later, and linked runs re-resolve once
+    the link completes (retroactive attribution, no double counting:
+    usage rows are keyed by message id). Returns the tool use ids seen.
+    Ids and workstream numbers only, never text. Never raises.
+    """
+    if target.kind != "main" or not lines:
+        return []
+    uses: dict = {}
+    agents: dict = {}
+    for line in lines:
+        if b"tool_use" in line and b'"Agent"' in line:
+            for tool_use_id, mid in _agent_uses_in_line(line):
+                uses[tool_use_id] = mid
+        if b"tool_result" in line and b"agentId" in line:
+            for tool_use_id, agent_id in _agent_links_in_line(line):
+                agents[tool_use_id] = agent_id
+    if not uses and not agents:
+        return []
+    note_turn = getattr(store, "note_spawn_turn", None)
+    if note_turn is not None:
+        for tool_use_id, mid in uses.items():
+            try:
+                note_turn(
+                    tool_use_id,
+                    target.session_id,
+                    mid,
+                    (directs or {}).get(mid),
+                    (splits or {}).get(mid),
+                )
+            except Exception as exc:
+                _log.warning("claude spawn turn: %s", type(exc).__name__)
+    note_agent = getattr(store, "note_spawn_agent", None)
+    if note_agent is not None:
+        for tool_use_id, agent_id in agents.items():
+            try:
+                note_agent(
+                    _run_id("subagent", target.session_id, agent_id, None),
+                    tool_use_id,
+                )
+            except Exception as exc:
+                _log.warning("claude spawn agent: %s", type(exc).__name__)
+    refresher = getattr(store, "refresh_linked_subagents", None)
+    if refresher is not None:
+        try:
+            refresher(list(set(uses) | set(agents)))
+        except Exception as exc:
+            _log.warning("claude spawn refresh: %s", type(exc).__name__)
+    return sorted(set(uses) | set(agents))
+
+
+def _note_subagent(store, target, run_id, lines, start_offset, end_offset) -> None:
+    """Record a subagent chunk's spawn link and own-signal votes.
+
+    The sidecar's ``toolUseId`` links the run to its spawning turn;
+    every assistant line's label-shaped signals vote for the run's own
+    fallback (the parent-written prompt arrives as a user line and
+    never votes). Both writes are incremental and idempotent, so a
+    restart replays the same bytes to the same rows. Ids and workstream
+    numbers only, never text. Never raises.
+    """
+    try:
+        if target.kind != "subagent" or not lines:
+            return
+        from dash import lead_split
+
+        _label, _model, tool_use_id = _read_meta(_meta_path(target.path))
+        note_agent = getattr(store, "note_spawn_agent", None)
+        if note_agent is not None and tool_use_id:
+            try:
+                note_agent(run_id, tool_use_id)
+            except Exception as exc:
+                _log.warning("claude subagent link: %s", type(exc).__name__)
+        add_votes = getattr(store, "add_subagent_votes", None)
+        if add_votes is None:
+            return
+        ordered: list = []
+        for line in lines:
+            if not _is_assistant_line(line):
+                continue
+            order, _launches = lead_split.signals_in_line(line)
+            ordered.extend(order)
+        try:
+            add_votes(run_id, ordered, start_offset, end_offset)
+        except Exception as exc:
+            _log.warning("claude subagent votes: %s", type(exc).__name__)
+    except Exception as exc:
+        _log.warning("claude subagent: %s", type(exc).__name__)
+
+
+def _maintain_slices(store, session_id: str, now: float, backfill) -> None:
+    """Refresh one session's slice rows, throttled (always in backfill)."""
+    if not isinstance(session_id, str) or not session_id:
+        return
+    maintainer = getattr(store, "apply_lead_slices", None)
+    if not callable(maintainer):
+        return
+    try:
+        now = float(now)
+    except (TypeError, ValueError):
+        return
+    if not backfill:
+        last = _split_maintained.get(session_id)
+        if last is not None and now - last < SPLIT_MAINTAIN_S:
+            return
+    _split_maintained[session_id] = now
+    try:
+        maintainer(session_id)
+    except Exception as exc:
+        _log.warning("claude slices: %s", type(exc).__name__)
+
+
+def _ensure_split_rules(store, target) -> None:
+    """Rebuild one session's slices/votes when the rules changed.
+
+    Compares the stored per-session signal-rules marker and, on a
+    version mismatch, resets that session's split state (offsets,
+    per-turn workstreams, slice rows, subagent votes) so this ingest
+    replays the same bytes under the current rules. Drops the
+    in-memory split cursor so the replay reseeds from the rebuilt
+    rows. Non-main/subagent targets read as a no-op. Never raises.
+    """
+    try:
+        if target.kind not in ("main", "subagent"):
+            return
+        checker = getattr(store, "ensure_split_rules", None)
+        if not callable(checker):
+            return
+        if checker(target.session_id):
+            run_id = _run_id("main", target.session_id, "main", None)
+            _split_cursors.pop(run_id, None)
+            _split_seeded.discard(run_id)
+    except Exception as exc:
+        _log.warning("claude split rules: %s", type(exc).__name__)
+
+
+def _ingest_jsonl(store, target, now, fresh_s, left, per_file, backfill, window, main_running_s=None) -> int:
+    _ensure_split_rules(store, target)
     st = _stat(target.path)
     if st is None:
         _settled.pop(target.path, None)
@@ -621,6 +1145,11 @@ def _ingest_jsonl(store, target, now, fresh_s, left, per_file, backfill, window)
         offset = 0
         _discard.pop(target.path, None)
     fresh = now - st.st_mtime <= fresh_s
+    if main_running_s is None:
+        main_running_s = MAIN_RUNNING_MTIME_S
+    liveness = None
+    if target.kind == "main":
+        liveness = _main_liveness(store, target, st, now, fresh, main_running_s)
     run_id = _run_id(target.kind, target.session_id, target.agent_id, target.wf_id)
     saw_start = offset == 0 and not _discard.get(target.path)
     if saw_start:
@@ -634,18 +1163,18 @@ def _ingest_jsonl(store, target, now, fresh_s, left, per_file, backfill, window)
             and off is not None
             and off[1] >= st.st_size
         )
-        _emit_transcript_run(store, target, st, fresh, caught_up=caught)
+        _emit_transcript_run(store, target, st, fresh, caught_up=caught, liveness=liveness, main_running_s=main_running_s, now=now)
         return left
 
     if offset >= st.st_size and target.path not in _discard:
-        key = _settled_key(target, st, fresh)
+        key = _settled_key(target, st, fresh, liveness)
         if _settled.get(target.path) == key:
             return left
-        _emit_transcript_run(store, target, st, fresh, caught_up=True)
+        _emit_transcript_run(store, target, st, fresh, caught_up=True, liveness=liveness, main_running_s=main_running_s, now=now)
         _remember_settled(target.path, key)
         return left
     if left <= 0 or per_file <= 0:
-        _emit_transcript_run(store, target, st, fresh, caught_up=False)
+        _emit_transcript_run(store, target, st, fresh, caught_up=False, liveness=liveness, main_running_s=main_running_s, now=now)
         return left
 
     requested = min(per_file, left, st.st_size - offset)
@@ -664,7 +1193,7 @@ def _ingest_jsonl(store, target, now, fresh_s, left, per_file, backfill, window)
     lines, consumed = _consume(data, at_eof=at_eof, stale=stale)
     if consumed == 0:
         if at_eof:
-            _emit_transcript_run(store, target, st, fresh, caught_up=False)
+            _emit_transcript_run(store, target, st, fresh, caught_up=False, liveness=liveness, main_running_s=main_running_s, now=now)
             return left
         if requested >= per_file:
             _discard[target.path] = True
@@ -673,21 +1202,29 @@ def _ingest_jsonl(store, target, now, fresh_s, left, per_file, backfill, window)
             _set_offset(store, target.path, st, offset + len(data))
         # A short read is the tick budget ending mid-line. Leave the offset
         # so the next tick can take a full per-file window.
-        _emit_transcript_run(store, target, st, fresh, caught_up=False)
+        _emit_transcript_run(store, target, st, fresh, caught_up=False, liveness=liveness, main_running_s=main_running_s, now=now)
         return left
 
     rows = parse_assistant_lines(lines)
     _note_times(run_id, rows)
     _note_bundle_hint(run_id, lines)
-    _emit_usage(store, target, rows, now)
+    splits, launches, directs = _note_splits(store, target, lines)
     new_offset = offset + consumed
+    if target.kind == "subagent":
+        _note_subagent(store, target, run_id, lines, offset, new_offset)
+    _emit_usage(store, target, rows, now, splits)
+    _link_lanes(store, target.session_id, launches)
+    if target.kind == "main":
+        _note_spawns(store, target, lines, splits, directs)
     caught_up = new_offset >= st.st_size
     _set_offset(store, target.path, st, new_offset)
-    _emit_transcript_run(store, target, st, fresh, caught_up=caught_up)
+    _emit_transcript_run(store, target, st, fresh, caught_up=caught_up, liveness=liveness, main_running_s=main_running_s, now=now)
+    if target.kind == "main" and caught_up:
+        _split_pending.add(target.session_id)
     return left
 
 
-def _settled_key(target, st, fresh):
+def _settled_key(target, st, fresh, liveness=None):
     """Fingerprint covering every input of the caught-up emit.
 
     A file with the same key would emit the identical status, label, and
@@ -696,13 +1233,15 @@ def _settled_key(target, st, fresh):
     busy bit and journal ``done`` flags can flip without a file write, so
     they are part of the key too. The main-kind pid check reads the
     registry pid map: a dead pid closes the row even when the transcript
-    is untouched.
+    is untouched. ``liveness`` carries the main-kind
+    ``(main_fresh, child, pending)`` triple, so a child finishing or a
+    tool call answering without a file write still re-emits.
     """
     if target.kind == "main":
         busy = target.session_id in _busy
         pid = _pids.get(target.session_id)
         pid_alive = None if pid is None else bool(_pid_alive(pid))
-        extra = (busy, pid_alive)
+        extra = (busy, pid_alive, liveness)
     else:
         extra = (target.session_id, target.agent_id) in _finished
     return (st.st_ino, st.st_size, st.st_mtime_ns, bool(fresh), extra)
@@ -746,7 +1285,7 @@ def _discard_chunk(store, path, st, offset, left, per_file) -> int:
     return left
 
 
-def _emit_usage(store, target, rows, now) -> None:
+def _emit_usage(store, target, rows, now, splits=None) -> None:
     if not rows:
         return
     run_id = _run_id(target.kind, target.session_id, target.agent_id, target.wf_id)
@@ -754,12 +1293,14 @@ def _emit_usage(store, target, rows, now) -> None:
         ts = row.get("ts")
         if ts is None:
             ts = now
+        ws = (splits or {}).get(row["message_id"]) if isinstance(splits, dict) else None
         try:
             store.add_usage(
                 {
                     "ts": ts,
                     "session_id": target.session_id,
                     "run_id": run_id,
+                    "ws_split": ws,
                     "model": row.get("model") or "",
                     "tool": "claude",
                     "message_id": row["message_id"],
@@ -777,32 +1318,45 @@ def _emit_usage(store, target, rows, now) -> None:
             return
 
 
-def _emit_transcript_run(store, target, st, fresh, caught_up) -> None:
+def _emit_transcript_run(store, target, st, fresh, caught_up, liveness=None, main_running_s=None, now=None) -> None:
     run_id = _run_id(target.kind, target.session_id, target.agent_id, target.wf_id)
     meta_label = None
     meta_model = None
     if target.kind in ("subagent", "workflow"):
-        meta_label, meta_model = _read_meta(_meta_path(target.path))
+        meta_label, meta_model, _meta_tool_use = _read_meta(_meta_path(target.path))
     applied = _apply_label(run_id, meta_label, "meta")
     finished = (target.session_id, target.agent_id) in _finished
     if target.kind == "subagent":
         status = subagent_status(_tail_is_result(target.path), fresh)
+    elif target.kind == "main":
+        pid = _pids.get(target.session_id)
+        pid_dead = pid is not None and not _pid_alive(pid)
+        try:
+            moment = float(now)
+        except (TypeError, ValueError):
+            moment = float(st.st_mtime)
+        window = main_running_s or MAIN_RUNNING_MTIME_S
+        if liveness is None:
+            # No precomputed triple (direct callers, tests): the mtime
+            # window alone decides, with no child or pending evidence.
+            liveness = (moment - st.st_mtime <= window, None, None)
+        _main_fresh, child, pending = liveness
+        status = decide_main_status(
+            caught_up=caught_up,
+            mtime_age=moment - st.st_mtime,
+            pid_dead=pid_dead,
+            has_live_child=bool(child),
+            pending_tool=bool(pending),
+            main_running_s=window,
+        )
     else:
         status = transcript_status(
             caught_up=caught_up,
             fresh=fresh,
-            registry_busy=target.kind == "main" and target.session_id in _busy,
+            registry_busy=False,
             finished=finished,
         )
-        if target.kind == "main" and status == "running":
-            pid = _pids.get(target.session_id)
-            if pid is not None and not _pid_alive(pid):
-                status = "done"
-            elif not fresh:
-                # Busy registry or an unread tail is not liveness on its own:
-                # a stale transcript means the session is idle, not running.
-                status = "done"
-        elif target.kind == "workflow" and finished:
+        if target.kind == "workflow" and finished:
             status = "done"
         elif target.kind == "workflow" and status == "running" and not fresh:
             status = "done"
@@ -819,6 +1373,10 @@ def _emit_transcript_run(store, target, st, fresh, caught_up) -> None:
             sess_status = existing
         elif status == "running":
             sess_status = "running"
+        elif status == "unknown":
+            # Idle but attached: the registry vocabulary already has
+            # "idle" for this state, and the run row reads "unknown".
+            sess_status = "idle"
         else:
             sess_status = "done"
         _merge_session(
@@ -927,7 +1485,7 @@ def _note_times(run_id, rows) -> None:
 def _read_meta(path):
     st = _stat(path)
     if st is None or st.st_size <= 0 or st.st_size > META_MAX:
-        return None, None
+        return None, None, None
     cached = _meta_cache.get(path)
     stamp = (st.st_ino, st.st_mtime_ns, st.st_size)
     if cached and cached[0] == stamp:
@@ -936,18 +1494,20 @@ def _read_meta(path):
         with open(path, "rb") as fh:
             raw = fh.read(META_MAX)
     except OSError:
-        return None, None
+        return None, None, None
     try:
         rec = json.loads(raw)
     except json.JSONDecodeError:
-        return None, None
+        return None, None, None
     if not isinstance(rec, dict):
-        return None, None
+        return None, None, None
     desc = rec.get("description")
     model = rec.get("model")
+    tool_use = rec.get("toolUseId")
     found = (
         _clean_label(desc) if isinstance(desc, str) else None,
         model if isinstance(model, str) and model else None,
+        tool_use if isinstance(tool_use, str) and tool_use and len(tool_use) <= 128 else None,
     )
     _meta_cache[path] = (stamp, found)
     return found

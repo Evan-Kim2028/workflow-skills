@@ -148,7 +148,7 @@
   }
 
   function refreshAfterAction() {
-    var nav = (typeof loadNav === "function") ? loadNav() : Promise.resolve();
+    var nav = (typeof loadNav === "function") ? loadNav(true) : Promise.resolve();
     return nav.then(function () {
       if (typeof isProjectView === "function" && isProjectView()) {
         if (typeof refreshProject === "function") return refreshProject();

@@ -14,6 +14,7 @@ export const meta = {
 //   runner: "/abs/.claude/tools/agent-dash/scripts/run_worker.sh",
 //   dash: "/abs/.claude/tools/agent-dash/agent_dash.py",
 //   maxFixRounds: 2, defaultTier: "default", reviewTier: "default",
+//   tierCaps: {"composer": 7, "glm-flash": 5, "glm": 4}   optional; at most that many runs of a tier at once, the rest queue
 //   lanes: [{ task: "WS7.K1", slug: "kind-checker", tier: "default"|"auto", branch: "ws7/kind-checker",
 //             worktree: "/abs/<worktree>", brief: "what to build, files, stop rules", tests: "pytest a.py b.py",
 //             review: true, oneWay: true, reviewFocus: "one check" | ["check A", "check B"] }]
@@ -31,6 +32,23 @@ const LOWER = String(WS || '').toLowerCase()
 const MAX_FIX = A.maxFixRounds == null ? 2 : A.maxFixRounds
 const DEFAULT_TIER = A.defaultTier || 'default'
 const REVIEW_TIER = A.reviewTier || DEFAULT_TIER
+
+const CAPS = A.tierCaps || {}
+const SLOTS = {}
+async function withTier(tier, fn) {
+  const cap = CAPS[tier]
+  if (!cap) return fn()
+  const s = SLOTS[tier] || (SLOTS[tier] = { busy: 0, queue: [] })
+  if (s.busy >= cap) await new Promise((resolve) => s.queue.push(resolve))
+  else s.busy++
+  try {
+    return await fn()
+  } finally {
+    const next = s.queue.shift()
+    if (next) next()
+    else s.busy--
+  }
+}
 
 function focusOf(lane) {
   const raw = lane && lane.reviewFocus
@@ -96,7 +114,7 @@ const RUN = {
       },
     },
   },
-  required: ['status', 'verdict', 'summary', 'findings', 'commits', 'tier'],
+  required: ['status', 'verdict', 'summary', 'commits'],
 }
 
 function wrapperPrompt(o) {
@@ -157,11 +175,11 @@ function base(lane) { return `${LOWER}-${lane.task}-${lane.slug}` }
 function run(lane, kind, round, task, extra) {
   const label = kind === 'build' ? base(lane) : `${base(lane)}-${kind}${round}`
   const tier = kind === 'rev' ? REVIEW_TIER : (lane.tier || DEFAULT_TIER)
-  return agent(wrapperPrompt({
+  return withTier(tier, () => agent(wrapperPrompt({
     label, tier, task, workspace: lane.worktree,
     promptFile: `${A.runDir}/${label}.md`,
     setup: extra && extra.setup, after: extra && extra.after,
-  }), { label, phase: kind === 'build' ? 'Build' : 'Review', schema: RUN, model: 'haiku', effort: 'low' })
+  }), { label, phase: kind === 'build' ? 'Build' : 'Review', schema: RUN, model: 'haiku', effort: 'low' }))
 }
 
 const status = (lane, s) => `python3 ${A.dash} ws task ${WS} ${lane.task} ${s}`

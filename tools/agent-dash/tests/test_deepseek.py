@@ -19,6 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from dash.models import model_key, run_model_key
 from dash.pricing import band_for, cost, series_key, status
+from dash.store.util import TOOL_KEYS as LANES
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -422,7 +423,7 @@ class StorePricingTest(unittest.TestCase):
                         }
                     )
                 cells = store.query_usage("model", "hour", None, OFF_SUN_1537 - 3600, PEAK_MON_0200 + 7200)
-                flash = [cell for cell in cells if cell["key"] == "deepseek-flash"]
+                flash = [cell for cell in cells if cell["key"] == "deepseek-flash@grok-cli"]
                 self.assertTrue(flash)
                 bucket_cost = sum(cell["cost_usd"] for cell in flash)
                 self.assertEqual(_cents(bucket_cost), _cents(0.005493852 + 0.002746926))
@@ -487,7 +488,7 @@ class SnapshotAgreementTest(unittest.TestCase):
                 self.assertEqual(totals["tokens"]["cache_read"], 8192)
                 self.assertEqual(totals["tokens"]["output"], 10)
                 self.assertEqual(_cents(totals["cost_usd"]), _cents(hand))
-                cells = [cell for cell in usage["buckets"] if cell["key"] == "deepseek-flash"]
+                cells = [cell for cell in usage["buckets"] if cell["key"] == "deepseek-flash@grok-cli"]
                 self.assertTrue(cells)
                 self.assertEqual(_cents(sum(cell["cost_usd"] for cell in cells)), _cents(hand))
                 self.assertEqual(_cents(sum(cell["cost_usd"] for cell in cells)), _cents(totals["cost_usd"]))
@@ -511,7 +512,7 @@ class SnapshotAgreementTest(unittest.TestCase):
             conn.close()
 
 
-LANES = ("grok", "muse", "glm", "claude", "deepseek", "other")
+LANES = tuple(LANES)
 
 
 def _grok_run(store, run_id, model, start, end=None, status="done", label=None):
@@ -607,7 +608,8 @@ class ConcurrencySplitTest(unittest.TestCase):
                 # Overlap: two lanes with the right peaks.
                 self.assertEqual((by_t[b + 240]["glm"], by_t[b + 240]["deepseek"]), (1, 1))
                 self.assertEqual(
-                    by_t[b + 240]["models"], {"glm-5.3-flash": 1, "deepseek-flash": 1}
+                    by_t[b + 240]["models"],
+                    {"glm-5.3-flash@grok-cli": 1, "deepseek-flash@grok-cli": 1},
                 )
                 # DeepSeek-only stretch.
                 self.assertEqual((by_t[b + 600]["glm"], by_t[b + 600]["deepseek"]), (0, 1))
@@ -629,7 +631,10 @@ class ConcurrencySplitTest(unittest.TestCase):
                 points = self._points(store)
                 by_t = {point["t"]: point for point in points}
                 self.assertEqual(by_t[b + 180]["other"], 1)
-                self.assertEqual(by_t[b + 180]["models"], {"glm-5.3-flash": 1, "other": 1})
+                self.assertEqual(
+                    by_t[b + 180]["models"],
+                    {"glm-5.3-flash@grok-cli": 1, "other@grok-cli": 1},
+                )
                 self.assertEqual(by_t[b]["other"], 0)
                 self.assertEqual(by_t[b + 300]["other"], 0)
                 # The GLM lane still counts exactly its own run.
@@ -688,7 +693,8 @@ class ConcurrencyApiTest(unittest.TestCase):
                 last = points[-1]
                 self.assertEqual((last["glm"], last["deepseek"]), (1, 1))
                 self.assertEqual(
-                    last["models"], {"glm-5.3-flash": 1, "deepseek-flash": 1}
+                    last["models"],
+                    {"glm-5.3-flash@grok-cli": 1, "deepseek-flash@grok-cli": 1},
                 )
             finally:
                 server.stop.set()

@@ -529,5 +529,80 @@ class StateDirConfigTest(CliStateMixin, unittest.TestCase):
             os.environ.pop("AGENT_DASH_CONFIG", None)
 
 
+class PreflightTest(CliStateMixin, unittest.TestCase):
+    """restart/deploy preflight: the new build opens a copy of the live
+    database before the live server is signalled."""
+
+    def setUp(self):
+        self.bind_temp_state()
+        agent_dash.bind_state()
+
+    def test_missing_database_is_not_a_failure(self):
+        ok, message = agent_dash.preflight_db_open()
+        self.assertTrue(ok)
+        self.assertIn("no database", message)
+
+    def test_live_copy_opens_with_current_build(self):
+        from dash.store import Store
+
+        db = Path(self.tmp_state.name) / "dash.sqlite"
+        store = Store(db)
+        store.upsert_run({"run_id": "pre-r1", "source": "claude", "status": "done"})
+        store.close()
+        ok, message = agent_dash.preflight_db_open()
+        self.assertTrue(ok, message)
+        self.assertIn("opens", message)
+        # The copy is deleted; the live database still has its row.
+        leftovers = [
+            p.name
+            for p in Path(self.tmp_state.name).glob("adash-preflight-*")
+        ]
+        self.assertEqual(leftovers, [])
+        check = Store(db)
+        try:
+            self.assertIsNotNone(
+                check._conn.execute(
+                    "SELECT run_id FROM runs WHERE run_id='pre-r1'"
+                ).fetchone()
+            )
+        finally:
+            check.close()
+
+    def test_previous_schema_copy_opens_after_migration(self):
+        fixture = (
+            Path(__file__).resolve().parent / "fixtures" / "schema_prev.sql"
+        )
+        import sqlite3
+
+        db = Path(self.tmp_state.name) / "dash.sqlite"
+        conn = sqlite3.connect(str(db))
+        conn.executescript(fixture.read_text(encoding="utf-8"))
+        conn.commit()
+        conn.close()
+        ok, message = agent_dash.preflight_db_open()
+        self.assertTrue(ok, message)
+
+    def test_unreadable_database_refuses(self):
+        db = Path(self.tmp_state.name) / "dash.sqlite"
+        db.write_bytes(b"not a sqlite database")
+        ok, message = agent_dash.preflight_db_open()
+        self.assertFalse(ok)
+        self.assertIn("cannot open", message)
+
+    def test_restart_refuses_before_stopping_on_preflight_failure(self):
+        db = Path(self.tmp_state.name) / "dash.sqlite"
+        db.write_bytes(b"not a sqlite database")
+        stopped = []
+        real_stop = agent_dash.cmd_stop
+        agent_dash.cmd_stop = lambda argv=None: stopped.append(argv) or 0
+        try:
+            with io.StringIO() as buf, redirect_stdout(buf):
+                rc = agent_dash.cmd_restart([])
+        finally:
+            agent_dash.cmd_stop = real_stop
+        self.assertEqual(rc, 1)
+        self.assertEqual(stopped, [])
+
+
 if __name__ == "__main__":
     unittest.main()

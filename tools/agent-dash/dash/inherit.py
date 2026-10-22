@@ -130,8 +130,25 @@ def lead_cwd_hint(store, session_id: str) -> tuple[str | None, str | None]:
     )
 
 
-def resolve_child(store, session_id, parent_session_id, *, now=None) -> tuple:
-    """Rule (b): a helper with no workstream takes its parent's."""
+def resolve_child(store, session_id, parent_session_id, *, now=None, run_id=None) -> tuple:
+    """Rule (b): a helper with no workstream takes its parent's.
+
+    A Claude Agent subagent first tries its spawning turn: the
+    workstream of the main-session turn whose Agent tool call spawned
+    it, else the majority of its own signals, else the cursor value at
+    the spawn (all confidence ``inherited``). Anything still unresolved
+    falls through to the parent-session rule below, so existing
+    behaviour never regresses.
+    """
+    if isinstance(run_id, str) and run_id:
+        resolver = getattr(store, "resolve_subagent", None)
+        if callable(resolver):
+            try:
+                ws, conf = resolver(run_id)
+            except Exception:
+                ws, conf = None, None
+            if ws:
+                return ws, conf
     ws = parent_workstream(store, parent_session_id)
     if ws:
         return ws, attribution.INHERITED
@@ -149,10 +166,10 @@ def resolve_lead(store, session_id: str, *, now=None) -> tuple:
     )
 
 
-def resolve(store, label, session_id, parent_session_id, *, now=None) -> tuple:
+def resolve(store, label, session_id, parent_session_id, *, now=None, run_id=None) -> tuple:
     """Fill the gap left by the explicit rules: (b) then (c)."""
     if isinstance(parent_session_id, str) and parent_session_id.strip():
-        return resolve_child(store, session_id, parent_session_id, now=now)
+        return resolve_child(store, session_id, parent_session_id, now=now, run_id=run_id)
     return resolve_lead(store, session_id, now=now)
 
 
@@ -256,8 +273,13 @@ def refresh(store, now: float) -> int:
         elif isinstance(run.get("parent_session_id"), str) and run.get(
             "parent_session_id"
         ).strip():
-            ws = parent_workstream(store, run["parent_session_id"])
-            target = (ws, attribution.INHERITED) if ws else (None, None)
+            target = resolve_child(
+                store,
+                run.get("session_id"),
+                run["parent_session_id"],
+                now=moment,
+                run_id=rid,
+            )
         else:
             workers = lead_workers(store, run.get("session_id"), moment)
             cwd, hint = lead_cwd_hint(store, run.get("session_id"))

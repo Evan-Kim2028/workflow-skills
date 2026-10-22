@@ -10,7 +10,7 @@ import re
 from datetime import datetime
 
 
-TOOL_KEYS = ("grok", "muse", "glm", "claude", "deepseek", "other")
+TOOL_KEYS = ("grok", "muse", "glm", "claude", "deepseek", "codex", "beam", "commandcode", "other")
 
 
 FINISHED = ("done", "killed", "died_early")
@@ -66,6 +66,7 @@ RUN_COLS = (
     "err_bytes",
     "pid",
     "out_path",
+    "slice_of",
 )
 
 
@@ -85,6 +86,7 @@ RUN_INPUT = (
     "err_bytes",
     "pid",
     "out_path",
+    "slice_of",
 )
 
 
@@ -100,6 +102,16 @@ SESSION_COLS = (
     "ws_confidence",
     "ws_hint",
 )
+
+
+# view_seq advances only when a write changes a value the snapshot or
+# usage buckets expose. Per-poll telemetry (byte counters, growth
+# flags, pids) rides the data sequence instead: it still invalidates
+# content caches and retags ETags, but it does not wake an idle page.
+RUN_VIEW_IGNORE = ("out_bytes", "out_growing", "err_bytes", "pid")
+
+
+RUN_VIEW_COLS = tuple(col for col in RUN_COLS if col not in RUN_VIEW_IGNORE)
 
 
 WS_STATUSES = ("backlog", "todo", "doing", "review", "done", "cancelled")
@@ -189,6 +201,31 @@ def _billed_total(tokens: dict) -> int:
     return sum((tokens or {}).get(key) or 0 for key in BILLED_FIELDS)
 
 
+#: Tool lane for a pi/generic run, by model family. Cursor-family models
+#: count as ``grok`` (the Cursor tool lane); every other family counts as
+#: itself, and an unrecorded or unmapped model counts as ``other``.
+_FAMILY_TOOL = {
+    "beam": "beam",
+    "deepseek": "deepseek",
+    "glm": "glm",
+    "claude": "claude",
+    "codex": "codex",
+    "cursor": "grok",
+    "muse": "muse",
+}
+
+
+def _model_family(run: dict) -> str:
+    """Model family for a run, from the one derivation in ``dash.models``.
+
+    Lazy import: this module takes no dash imports at load.
+    """
+    from dash.models import model_key
+
+    hint = " ".join(str(run.get(name) or "") for name in ("tier", "source"))
+    return model_key(run.get("model"), hint)[0]
+
+
 def _tool_key(run: dict) -> str | None:
     source = run.get("source") or ""
     if source == "dagster":
@@ -200,8 +237,16 @@ def _tool_key(run: dict) -> str | None:
         return "muse"
     if source == "glm" or tier == "glm":
         return _grok_cli_key(run)
+    if source in ("codex", "codex-exec") or tier == "codex":
+        return "codex"
+    if source == "commandcode" or tier == "commandcode":
+        return "beam" if _model_family(run) == "beam" else "commandcode"
     if source.startswith("claude") or tier in ("opus", "sonnet", "haiku"):
         return "claude"
+    if source in ("pi", "generic"):
+        return _FAMILY_TOOL.get(_model_family(run), "other")
+    if _model_family(run) == "beam":
+        return "beam"
     return None
 
 
@@ -210,15 +255,15 @@ def _grok_cli_key(run: dict) -> str:
 
     The family comes from the one derivation in ``dash.models`` (lazy import:
     this module takes no dash imports at load): ``deepseek-*`` runs count as
-    ``deepseek``, ``glm-*`` and unrecorded models stay ``glm``, and any other
-    grok-hosted id (``mimo-*``, ``step-*``) counts as ``other``.
+    ``deepseek``, ``beam-*`` runs count as ``beam``, ``glm-*`` and unrecorded
+    models stay ``glm``, and any other grok-hosted id (``mimo-*``,
+    ``step-*``) counts as ``other``.
     """
-    from dash.models import model_key
-
-    hint = " ".join(str(run.get(name) or "") for name in ("tier", "source"))
-    fam, _key = model_key(run.get("model"), hint)
+    fam = _model_family(run)
     if fam == "deepseek":
         return "deepseek"
+    if fam == "beam":
+        return "beam"
     if fam == "other":
         return "other"
     return "glm"
@@ -233,9 +278,9 @@ def is_prod_job_run(run: dict) -> bool:
 
 
 def _is_counted_agent(run: dict) -> bool:
-    """Interactive Claude sessions and shell launch rows are not agents."""
+    """Interactive Claude and Codex lead sessions and shell launch rows are not agents."""
     source = run.get("source") or ""
-    if source in ("claude-main", "shell", "dagster", ""):
+    if source in ("claude-main", "codex", "shell", "dagster", ""):
         return False
     return _tool_key(run) in TOOL_KEYS
 

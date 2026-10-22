@@ -13,6 +13,8 @@ The Linear source (`dash/sources/linear.py`) is the one outbound network call. I
 | Path | Owner |
 |---|---|
 | `agent_dash.py` (CLI: `run`, `stop`, `restart`, `deploy`, `rollback`, `status`, `state`, `doctor`, `backfill --session <id>`, `reprice`, `reconcile`, `check`, `ws`, `ws linear` (`link`, `sync`, `unlink`, `status`, `update`, `comment`), `project`, `report`, `label`, `lead-profile`, `worktrees`, `lanes`; global `--project <id>` for `state`, `check`, `doctor`, `ws ...`, `status`) | core |
+| `dash/labels.py` (canonical labels: `make` builds `<scope>-<mark>-<slug>[-rN]`; `check` returns ok with phase and strong rule or a refusal with the exact fix; consulted by `report start`, the launchers, the label-guard hook, and the doctor) | core |
+| `scripts/label_guard_hook.py` (Claude Code PreToolUse hook: refuses worker launches with weak labels; installed by `scripts/install_hooks.sh --claude-label-guard`) | core |
 | `dash/state.py` (`GET /api/state`), `dash/doctor.py` (`doctor`), `dash/errors.py` (exit codes, messages) | cli |
 | `dash/dataroot.py` (data-root resolution: `data_root`, `state_dir`, `workstreams_dir`, `hub_dir`, `project_file`; the `Storage` seam, local only) | core |
 | `dash/project.py` (project descriptor: `project.json` read/validate, `project` CLI, `GET /api/project` payload) | core |
@@ -40,6 +42,8 @@ The Linear source (`dash/sources/linear.py`) is the one outbound network call. I
 | `tests/test_linear*.py` (Linear client, sync and poller tests) | linear |
 | `docs/linear.md` (Linear how-to) | linear |
 | `dash/attribution.py`, `map.example.json` (`map.local.json` replaces it) | core |
+| `dash/lead_split.py` (lead per-turn workstream signals and slice rules; labels only, never prompts) | core |
+| `dash/store/split.py` (slice rows, usage moves, lane linkage; caller holds the lock) | core |
 | `dash/pricing.py`, `catalog/prices.json` | core |
 | `dash/plans.py`, `plans.example.json` (`plans.local.json` replaces it) | core |
 | `dash/bundles.py`, `dash/planrender.py`, `SKILL-PLAN.md` | core |
@@ -52,6 +56,7 @@ The Linear source (`dash/sources/linear.py`) is the one outbound network call. I
 | `dash/sources/claude.py`, `dash/sources/manifests.py`, `dash/sources/generic.py` | src-ai |
 | `dash/sources/muse.py`, `dash/sources/grok_cli.py` | src-tools |
 | `dash/sources/cursor.py` | src-cursor |
+| `dash/sources/codex.py` | src-tools |
 | `static/index.html` (page shell, markup, CSS, script tags, wiring, boot, drawMain registry loop) | Claude (parent) |
 | `static/cards/tiles.js` (headline stat tiles) | Claude (parent) |
 | `static/cards/activity.js` + `activity.css` (Activity over time stack: one time filter bar over tokens, run-timeline and live-agents strips on a shared x axis) | Claude (parent) |
@@ -124,6 +129,20 @@ Enums. `source`: claude-main, claude-subagent, claude-workflow, muse, glm, grok 
 `verdict`: PASS, PARTIAL, BLOCKED, APPROVE, APPROVE_WITH_NITS, APPROVE_WITH_CHANGES, REQUEST_CHANGES, or null.
 `clock_source`: transcript, muse_log, manifest, mtime. Times are epoch seconds (float), UTC.
 `run_id` is stable: `<source>:<session-or-uuid>:<label-or-agent-id>`.
+A lead session working several workstreams gains per-workstream slice
+runs `claude-main:<sid>:main@WS<n>`, each linked to the primary via
+`slice_of` (null on every other row); the primary keeps its id and its
+remainder. Slice usage rows are moved out of the primary, never
+copied, so every token is counted once everywhere.
+A main session is `running` only on fresh evidence: a transcript write
+inside `main_running_mtime_s` (default 3 min), a live child (a running
+subagent or a running worker run parented to the session), or an
+unanswered tool call in the last assistant turn with the transcript
+younger than `running_mtime_s` (15 min). Otherwise it reads `unknown`
+(idle) while recent (under 60 min) and `done` after. `unknown` already
+means not-live on every surface (no running badge, never a live
+agent, never a stale mismatch), so idle sessions vanish from Running
+now without any page change.
 
 Workstream attribution happens in core (`attribution.py`, store binding in
 `dash/inherit.py`), not in sources: label via the map file, exact then regex
@@ -146,10 +165,61 @@ already read and keeps just the bundle id in the session's `ws_hint`).
 Otherwise the lead stays unassigned: a lead running several
 workstreams keeps none unless one share clears 60%. (d) Inference is
 recomputed each poll and may change; it never overwrites an explicit
-attribution. The page and reconcile count `inherited`/`inferred` runs
+attribution. An empty fresh resolution never clears a settled
+`inherited`/`inferred` value on write; only the refresh pass (with
+poll-now evidence) clears it. (e) A lead's usage splits per assistant
+turn across the workstreams it worked on (`dash/lead_split.py`, store
+binding in `dash/store/split.py`): one clear signal wins the turn,
+several go to the dominant one (ties break by first appearance), and a
+turn with none inherits the previous turn's workstream for at most 20
+turns, else stays with the session's primary. Slices appear only when
+a second workstream is material (5% of session tokens or 100k tokens);
+single-workstream sessions keep one row. A Claude Code Agent subagent
+(`claude-subagent:<sid>:<agent>`) takes the workstream of the main
+turn that spawned it (the assistant turn whose Agent tool_use id the
+subagent sidecar's `toolUseId`, or the parent tool result's `agentId`,
+links to): that turn's own signal wins; with none, the majority of the
+subagent's own signals wins; then the cursor value at the spawn (the
+same at-most-20-turn inheritance); else it stays unassigned. A
+subagent is one run, never sliced per turn, and its confidence is
+`inherited`; an explicit label workstream still wins outright. The
+spawn link and the vote counters live in `subagent_spawn` /
+`subagent_votes`, replayed from byte offsets, so a restart or a
+parent-turn-arrives-later pass converges to the same rows with every
+token still counted once. The page and reconcile count `inherited`/`inferred` runs
 like any workstream row, and every workstream row exposes
 `ws_confidence` (the distinct confidences behind it) so agents can see
 which rows are inferred.
+
+Per-turn signals count only TARGETING fields: the assistant record's
+`cwd`, tool-use path fields (`file_path`, `path`, `notebook_path`,
+glob/pattern paths, `file`, `filename`, `dir`, `directory`, `workdir`),
+and Bash `command` segments that are operands of a targeting action
+(`cd` / `git -C` into a `lor-wt-ws<N>-…` / `ws<N>/…` worktree or
+branch, `git worktree add`, `git checkout` / `switch`, `muse` /
+`cursor-agent` / `launch_grok` / `run_worker` / `agent_dash … report`
+launches via prompt-file path or label operand, `gh pr` branch
+operands, `ssh … <path>` operands, reads/writes under
+`workstreams/WS<N>/`, `agent_dash … ws … WS<N>`, test paths). Never
+counted (TEXT): assistant text blocks, `Agent`/`Task` `prompt` and
+`description`, `Write`/`Edit` `content` / `new_string` /
+`old_string`, heredoc bodies and quoted multi-line string literals in
+Bash (stripped before matching), `echo` / `printf` payloads, search
+patterns (`grep` / `rg` arguments, `ToolSearch` / `WebSearch` /
+codegraph `query`), `label make` / `label check` example commands,
+URLs and URL query strings, `Bash` `description`, and `tool_result`
+bodies (except the structured `agentId:` spawn linkage). When unsure
+whether an operand targets, it does not count. The same TARGETING /
+TEXT split applies to a subagent's own votes. `SIGNAL_RULES_VERSION`
+(`dash/lead_split.py`) is folded into the stored per-session marker
+(`meta` key `lead_signal_rules:<session-id>`): a version mismatch on
+the next ingest triggers a clean rebuild of that session (file offsets
+reset, per-turn `ws_split` nulled, slice rows moved back to the
+primary, slice runs and subagent votes cleared, then the same bytes
+replayed), so a rules change recomputes without a manual reset and
+conserves every token. A manual full re-read is the same shape:
+back up the state dir, `delete from file_offsets where path like
+'%<session id>%'`, then `backfill --session <id>`.
 
 ## HTTP API (all GET, JSON, 127.0.0.1 only)
 
@@ -159,10 +229,11 @@ ok, 1 check failed, 2 usage, 3 not found, 4 invalid data, 5
 unreachable (docs/integrate.md, For agents).
 
 `GET /` -> `static/index.html`.
+Every polled JSON endpoint answers conditional GETs: a 200 carries an `ETag`, and a matching `If-None-Match` returns `304` with an empty body (pinned per endpoint in `tests/test_etag.py`; `health`, `doctor`, and `reconcile` carry per-request clocks so only their ETag presence is pinned). JSON bodies over 8 KB are gzip-encoded with `Vary: Accept-Encoding`, keeping the same ETag. Below-the-fold plan sums load lazily (IntersectionObserver on the program panel; same renderer once visible), and concurrent identical GETs share one fetch.
 
 `GET /api/snapshot?ws=<WSn|all>&since=&until=&usage_group=<model|workstream|tool>&recent_limit=&recent_offset=`
 ```json
-{"now": 0, "seq": 0,
+{"now": 0, "seq": 0, "view_seq": 0,
  "counts": {"live_agents": 0, "live_by_tool": {"grok": 0, "muse": 0, "glm": 0, "claude": 0}, "prod_jobs": 0, "prod_jobs_finished": 0, "finished_today": 0, "finished_in_range": 0, "finished_by_verdict": {}},
  "running": [Run], "recent": [Run],
  "totals": {"tokens": {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0, "reasoning": 0}, "cost_usd": 0.0, "unpriced_runs": 0, "unpriced_tokens": 0, "unpriced_models": []},
@@ -174,8 +245,11 @@ unreachable (docs/integrate.md, For agents).
 ```
 `usage` is present only when `usage_group` is given: the hourly usage
 buckets for the same scope and window, computed under the same lock pass
-as `totals`, so the bucket token sum equals `totals` by construction. A
-bad `usage_group` is a 400. With `usage_group=workstream` the all-scope
+as `totals`, so the bucket token sum equals `totals` by construction. The
+per-run usage fold behind the rollup is incremental: every usage write
+bumps a per-run version (bulk rewrites bump an epoch), so a write to one
+run refolds only that run instead of all rows; the fold always equals a
+full rebuild. A bad `usage_group` is a 400. With `usage_group=workstream` the all-scope
 response folds ignored ids into one `"Other"` key, so the stacked chart
 still sums to the legend Total; the page paints it neutral
 (`var(--other)`), never an entity colour.
@@ -196,20 +270,23 @@ Each `by_workstream` row carries its own scope's `prev_24h`. The field is
 additive: no existing field changed, and the snapshot cache keys it with the
 same entry and invalidation as the rest. Retention caveat: when data older
 than the window is pruned, `prev_24h` reads as whatever the database holds.
+Bounded growth: usage rows older than `rollup_after_days` (default 14, off when non-positive) compact into `usage_rollup_1h`, one row per (run, hour, model, tool, ws_split) with exact token and cost totals per kind; aggregates over hour-aligned ranges are byte-identical before and after, and per-event detail older than N days degrades to hourly. Rows are deleted only in the same transaction as their rollup insert, after a verification query. The server also runs `PRAGMA optimize`/`ANALYZE` weekly and checkpoints the WAL on a bounded schedule. `python3 agent_dash.py db stats` prints size, row counts, rollup coverage, and the live/rolled time span; `db rollup --dry-run` reports what would roll; `db rollup [--days N] [--batch N]` compacts in small batches under a time budget per tick, idempotent and resumable against concurrent writers.
 One function (`Store._summarize_locked`) computes the all-scope counts and totals,
 every workstream row, and the `unassigned` row from the same run list, the same
 agent rule, and the same window. The `by_workstream` row for a workstream equals
 that workstream tab's `counts` and `totals`. `unassigned` carries runs with no
 workstream; it appears only when such runs exist. Row sums plus unassigned equal
 the all-scope numbers exactly (cost within 1e-6).
-`Run` = `{run_id, source, tier, model, label, workstream, ws_confidence, session_id, parent_session_id, status, verdict,
+`Run` = `{run_id, source, tier, model, label, workstream, ws_confidence, session_id, parent_session_id, slice_of, status, verdict,
 started_at, ended_at, elapsed_s, clock_source, out_bytes, out_growing, err_bytes, pid, rss_kb, tokens: {input, output, cache_read, cache_write}, cost_usd, context_tokens, section, section_index}`.
 Every run row in `running`, `recent`, and `GET /api/runs` carries its plan section: `section` is the name of the plan section holding the run's task (the `groups` entry in plan order whose tasks contain the mapped task id) and `section_index` its position in the plan, so tables group workstream → section → label without refetching plans. Runs that map to no task read `section: null` (`section_index: null`); the page shows them under "Unsectioned". The fields are additive and cached by plan mtime like the other plan caches; the snapshot and runs conditional ETags carry the plan stamp, so a plan edit retags even when no store write landed.
 `context_tokens` is the latest `grok-context` input for that run, or null. It is a context-window estimate. It is not part of `tokens`, totals, buckets, or cost. `elapsed_s` is null when `started_at` is null.
 `recent` = runs ended inside the window (one fixed 24 h by default, `since`/`until` narrow it), newest first, max 50. Production jobs (source `dagster`) are never in `recent`; they are the `counts.prod_jobs_finished` count. The page shows it as `Finished (24 h)`.
 `?recent_limit=&recent_offset=` pages that window (defaults 50 and 0, the historic shape): `recent` carries rows `[offset, offset+limit)` newest-first, `recent_shown` their count, and `recent_total` the true window total on every page, so later pages are fetchable without growing the default payload. The snapshot cache and the conditional ETag key both carry the page, and a bad value is a 400. The page pager reads `recent_total` (falling back to `counts.finished_in_range`) and fetches beyond the held 50 only.
 
-`GET /api/stream` -> SSE. Event `tick` every 2 s: `{"seq": n, "running": [Run], "sources": [{name, last_poll, lag_s}]}`; the page refetches snapshot when `seq` changes. `sources` mirrors the registry freshness so the page can show staleness per source.
+`GET /api/stream` -> SSE. Event `tick` every 2 s: `{"seq": n, "view_seq": m, "running": [Run], "sources": [{name, last_poll, lag_s}]}`; the page refetches snapshot when `view_seq` changes. `seq` is the store write clock (every write bumps it, including writes that change nothing a page shows: process samples, poll heartbeats, file offsets, unchanged re-upserts); `view_seq` bumps only when data the snapshot or usage buckets expose actually changes (old and new row values are compared on upsert; no-op upserts never bump it). `sources` mirrors the registry freshness so the page can show staleness per source. The client refreshes at most once per max(2 s, 3x the last snapshot duration), trailing edge, never while hidden or mid-flight.
+
+TTL coalescing (stale-while-revalidate) sits in front of the heavy reads (`snapshot`, `runs`, `concurrency`, `workstreams`, `project`, `project/phases`, `state`, `health`, `usage`, `reconcile`): a response computed within the last `ttl_s` (default 1.5 s, config `response_ttl_s`, per-endpoint overrides in `dash/respcache.py`) is served to every request with the same canonical key (endpoint plus normalised params plus viewer-relevant inputs), even when the store moved meanwhile. The freshness contract: a change shows within `ttl_s` plus one page tick, well inside the 5 s product rule. Window-pinned requests (explicit `since` AND `until`) use a 10 s TTL. Responses carry the true `generated_at` (a body field, fixed at compute) and an `X-AgentDash-Age-Ms` header per serve; ETags are content hashes of the cached generation, stable until the next recompute, so conditional requests still 304 within the window. Volatile clocks (`now`, `seq`, `data_seq`, `view_seq` on snapshot; `now`/`window` on state) ride fresh on every serve while the sums stay frozen. The read-only switch rides the `project`/`state` cache key, so toggling it retags at once. User-visible actions (archive/restore/state/bulk POSTs) invalidate the whole TTL explicitly, so a tap shows immediately. `response_ttl_s=0` disables the cache: every request recomputes on the legacy path, byte-identical to before.
 
 `GET /api/runs?ws=&since=&until=&limit=&include=` -> `{"runs": [Run]}` (Gantt input; workflow children collapsed into one row with `children: n`). Production (dagster) rows are left out by default; `?include=jobs` adds them back for tools that need them (anything else is a 400).
 
@@ -386,6 +463,7 @@ blended with real time; plain replay stays on real time with an optional
 
 `GET /api/health` -> `{"ok": true, "sources": [{name, last_poll, last_error, lag_s, last_duration_s, interval_s, stalled, state, started_at}], "slow_sources": 0, "dagster": {"skipped_closeouts": 0}, "pricing": {...}, "disconnects_1h": 0, "unpriced_models": [{"model", "rows", "tokens"}], "scratch_roots": [...], "run_dirs": [...], "warnings": [...], "build_id": "abc1234", "started_at": 0, "state_hash": "0123abcd"}`.
 Each source carries `state`: `starting`, `ok`, `slow`, `stalled`, or `error`, plus `started_at` (the collector process start). A source that never completed a poll — and recorded no failure — is `starting`, not stalled, until max(3x its interval, 90 s) after process start; `ok` stays true while starting, and neither reconcile nor doctor reports a starting source as stalled. Positive failure evidence (an error or a poll-budget overrun) still reports `error` immediately, even on the first poll. A poll that returned but took longer than 15 s is `slow` (counted in `slow_sources`, still ok). `dagster.skipped_closeouts` counts polls that saw a full active page and skipped the close-out pass.
+`perf` is the additive self-monitoring block: per-endpoint latency (count, p50, p95, max over the last 10 min; no parameter values except ws ids), per-source poll duration and lag, store lock wait and hold time (p95, max), single-flight hit ratio, incremental-cache hit ratios, thread count, and process CPU time delta. A request over 2 s also writes one slow-request log line (endpoint, ms, ws; never query bodies). Doctor reads it for `server-cpu-bound`, `slow-endpoint`, `lock-contention`, `source-lagging`, and `db-growth` (docs/problems/*.md).
 
 The Dagster poll backs off after ssh failures (timeouts or ssh errors, not GraphQL errors). The first failure keeps the normal 60 s interval; each further consecutive failure doubles the delay (120 s, 240 s) up to `dagster.max_backoff_s` (default 300). Inside the window the poll returns without ssh, `last_error` keeps the last failure, and the source stays `error`. `dagster.backoff_s` reports the current delay (0 when healthy) and `dagster.next_poll_in_s` the seconds until the next attempt (0 when none is pending). Any successful ssh call resets the back-off.
 `build_id` is the git short sha of the tool directory plus `-dirty` when the checkout had uncommitted changes at start (`"unknown"` outside git); `started_at` is the process start epoch. Both are captured once at start, never re-read per request. `run` refuses to start when the port answers with a different `build_id` (unless `--force-replace`); `deploy` health-gates the new release on it. `state_hash` is the short sha256 of the server's resolved state dir (never the path); `stop`, `restart`, and `deploy` compare it with the current state dir and refuse a foreign one unless `--yes-live` is passed.
@@ -632,6 +710,7 @@ last usage/sample), never left running.
 | `claude-subagent`, `claude-workflow` | Live only while the transcript was written within `running_mtime_s` and the last event is not a result. A quiet file is `done`, never left running. |
 | `muse`, `glm` | Live only while a live process matches pid, `[label:]`, prompt-file label, or session uuid (`process.match_agent`). A new row with no match opens as `unknown`, never `running`. |
 | `grok` (cursor-agent) | Live only while a live `cursor-agent` process carries the run's pid or `[label:]`. A chat whose process is gone is `done` (or `unknown` without a timestamp). |
+| `codex` / `codex-exec` | Codex CLI threads carry no pid the dashboard can match (the TUI pid is never recorded), so liveness is rollout growth: `running` only while the rollout file grew within 120 s. A quiet file is `done` when its latest turn completed (`task_complete`) else `unknown`; a new turn revives it. Reads `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl` (metadata only: ids, timestamps, model names, cwd, counts, originator, branch) plus `state_5.sqlite` `thread_spawn_edges` read-only as a parent-link fallback. Never read, stored, or logged: `base_instructions`, message content, task text, compaction history, prompts, argv, secrets, env. |
 | `shell` (exec) | Live only while the out file grew since the previous poll or a live label was sampled within `process_ttl_s` (30 s). Out growth and the live label are the evidence; rows carry no pid. |
 | `generic` (`generic.jsonl`, `agent_dash.py report`) | No pid. Live from `report start` until `report finish`; each `report usage` line is fresh evidence. A run with no line for longer than `STALE_IDLE_S` (6 h) is `stale running`: hidden from every view and reported by `check`. Long runs send `report usage` as a heartbeat. |
 | `manifests` (muse/glm/grok rows) | Same as the tool rows above: `running` only on out growth or a live label; otherwise `done`/`unknown`. A terminal row ends at the last time it was seen alive (usage event or process sample) or the out/err/report file mtime, whichever is later — never the start time. |
@@ -740,7 +819,7 @@ HTTP, still GET only, 127.0.0.1:
 - `GET /api/project/graph` returns `{nodes: [{id, title, state, progress, live_agents, milestone, depth}], edges: [{from, to, kind, status, condition}], cycles: [[id]], generated_at}`: the cross-workstream dependency graph, read-only over local bundles. `kind` is `dependency` (`depends_on`), `gate` (a gate task whose signal, title, or `dep_notes` text names another workstream), or `moved` (a deferred task's `moved_to`); `status` is `met`, `waiting`, or `stale` (stale per the `stale_gates` rule, met when the source is done/archived, the gate is done-like, or the gate is fresh and confirmed). Cycles are reported, never an error. Only ids, titles, states, counts, and plan condition texts cross the boundary — never paths or bodies.
 - `GET /api/project/burnup` returns `{"burnup": {days, day, first_recorded, workstreams, tasks, cost, tokens}}`: recorded tasks-done cumulative per workstream per UTC day from `history.jsonl` task moves (reverse moves decrement), plan totals from the one plan resolver (deferred tasks excluded), and cost/token burn per UTC day from the same day buckets `/api/usage?group=workstream&bucket=day` serves, so per-day sums equal the all-scope totals for the same days. Done work with no history is a labelled gap (`no history before <date>: N done tasks not dated`), never interpolated. Cached by history/plan file mtimes plus the store sequence. Only ids, counts, money, and dates cross this boundary. Ids on the project's `ignore_workstreams` list leave the task lanes (and the `workstreams` order) entirely; their cost/token cells fold into one `"Other"` series so the per-workstream burn still sums to the project line, and the ignore list joins the cache key.
 - `GET /bundle/<ID>/page.html` returns that file only. The resolved path has to stay inside the bundle directory.
-- `GET /api/project/phases?scope=24h|7d|all` returns `{"scope", "since", "until", "day": "UTC", "rules_hash", "rules_version", "caption", "workstreams": [{ws, name, by_phase: {planning|execution|review|coordination|unclassified: {tokens: {input, output, cache_read, cache_write, reasoning}, billed_tokens, cost_usd, unpriced_tokens, agents, runs, hours}}, total: {tokens, cost_usd}, days, series: {<phase>: {cost, tokens, cumulative_cost, cumulative_tokens}}}], "total": {tokens, cost_usd}, "unclassified_share"}`: planning versus execution. Each usage event joins its run, the run is classified by `dash/phases.py` (explicit `ws<N>-plan/exec/review/coord` marks, review affixes, plan task matches, label words, unmapped lead sessions, the pre-task planning window), and child-chat events fold onto their parent run like the snapshot. Cost uses the same catalog pricing with the same unpriced rule, so the all-scope total equals the sum of the kinds of work to the cent. A bad scope is a 400. Conditional GET: the ETag covers scope, data version, rules hash, ignore list, plan and taskmap stamps. Ids on the project's `ignore_workstreams` list fold into one `"Other"` row, like the burn-up. Only names and numbers cross this boundary: no prompts, no bodies, no paths. `GET /api/workstreams` and `GET /api/state` workstream rows carry a small lifetime `by_phase` (`{<phase>: {tokens, cost_usd}}`, all five kinds of work always present) for the management-table bar and the workstream-tab card; their caches key on the rules hash, so a rules edit retags.
+- `GET /api/project/phases?scope=24h|7d|all` returns `{"scope", "since", "until", "day": "UTC", "rules_hash", "rules_version", "caption", "workstreams": [{ws, name, by_phase: {planning|execution|review|coordination|unclassified: {tokens: {input, output, cache_read, cache_write, reasoning}, billed_tokens, cost_usd, unpriced_tokens, agents, runs, hours}}, total: {tokens, cost_usd}, days, series: {<phase>: {cost, tokens, cumulative_cost, cumulative_tokens}}}], "total": {tokens, cost_usd}, "unclassified_share"}`: planning versus execution. Each usage event joins its run, the run is classified by `dash/phases.py` (explicit `ws<N>-plan/exec/review/coord` marks, review affixes, plan task matches, label words, unmapped lead sessions, the pre-task planning window), and child-chat events fold onto their parent run like the snapshot. Cost uses the same catalog pricing with the same unpriced rule, so the all-scope total equals the sum of the kinds of work to the cent. A bad scope is a 400. Conditional GET: the ETag covers scope, data version, rules hash, ignore list, plan and taskmap stamps. Ids on the project's `ignore_workstreams` list fold into one `"Other"` row, like the burn-up. Only names and numbers cross this boundary: no prompts, no bodies, no paths. `GET /api/workstreams` and `GET /api/state` workstream rows carry a small lifetime `by_phase` (`{<phase>: {tokens, cost_usd}}`, all five kinds of work always present) for the management-table bar and the workstream-tab card; their caches key on the rules hash, so a rules edit retags. Classification itself is per-run cached on (rules hash, taskmap content, plan stamp, label, source, parent, start, task id, planning-window edge) and runs outside the store lock, so a write reclassifies only new or changed runs and never blocks writers; pricing folds token sums per price shape with identical totals. Concurrent identical cold requests (snapshot, workstreams, runs, concurrency, phases, state) share one computation (single-flight) instead of each recomputing.
 
 `static/vendor/mermaid.min.js` is mermaid 11.16.1. The plan page runs it on `pre.mermaid`. No CDN.
 

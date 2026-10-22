@@ -314,7 +314,7 @@ html{scroll-padding-top:calc(var(--pinned-h) + 10px)}
       if (window.__adPlanSumsKey !== planSetKey) {
         window.__adPlanSumsKey = planSetKey;
         var planBefore = Object.keys(planSum).length;
-        loadPlanSums().then(function () {
+        (typeof maybeLoadPlanSums === "function" ? maybeLoadPlanSums() : loadPlanSums()).then(function () {
           if (Object.keys(planSum).length !== planBefore) { delete secCache.program; delete secCache.cards; drawMain(); }
         });
       }
@@ -331,7 +331,7 @@ html{scroll-padding-top:calc(var(--pinned-h) + 10px)}
 
   setTimeout(warmTabs, 1500);
   setInterval(warmTabs, 45000);
-  setInterval(function () { if (document.hidden || !state.wss.length) return; loadPlanSums().then(function () { if ((state.view === "exec" && state.ws === "all") || isProjectView()) drawMain(); }); }, 30000);
+  setInterval(function () { if (document.hidden || !state.wss.length) return; (typeof maybeLoadPlanSums === "function" ? maybeLoadPlanSums() : loadPlanSums()).then(function () { if ((state.view === "exec" && state.ws === "all") || isProjectView()) drawMain(); }); }, 30000);
 
 
   document.getElementById("theme").addEventListener("click", function () {

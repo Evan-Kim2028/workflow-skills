@@ -215,7 +215,7 @@ class DagsterTests(unittest.TestCase):
         self.assertEqual(snap["counts"]["live_agents"], 0)
         self.assertEqual(snap["counts"]["prod_jobs"], 1)
         self.assertEqual(snap["counts"]["prod_jobs_finished"], 1)
-        self.assertEqual(snap["counts"]["live_by_tool"], {"grok": 0, "muse": 0, "glm": 0, "claude": 0, "deepseek": 0, "other": 0})
+        self.assertEqual(snap["counts"]["live_by_tool"], {"grok": 0, "muse": 0, "glm": 0, "claude": 0, "deepseek": 0, "codex": 0, "beam": 0, "commandcode": 0, "other": 0})
         self.assertEqual(snap["totals"]["tokens"], {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0, "reasoning": 0})
         self.assertEqual(snap["totals"]["cost_usd"], 0.0)
         self.assertEqual(self.store._conn.execute("SELECT COUNT(*) FROM usage_events").fetchone()[0], 0)

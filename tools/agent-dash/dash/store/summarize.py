@@ -8,7 +8,10 @@ runs under the facade lock.
 
 from __future__ import annotations
 
-from dash.models import run_model_key
+import copy as _copy
+
+from dash import perfmon as _perf
+from dash.models import HARNESS_NAMES, harness_of, run_model_key
 from dash.outcomes import outcome_class, outcome_reason
 
 from .runs import (_is_manifest_twin, _nearest_twin,
@@ -18,10 +21,10 @@ from .util import (BILLED_FIELDS, FINISHED, MERGE_WINDOW_S,
                  RANGE_S,
                  SAMPLE_FRESH_S, TOKEN_FIELDS,
                  TOOL_KEYS, UNASSIGNED, _active, _billed_total,
-                 _drop_launch_echoes, _elapsed, _epoch, _in_ws,
+                 _drop_launch_echoes, _elapsed, _epoch,
                  _is_counted_agent, _local_midnight, _money,
                  _tool_key, _ws_sort, _zeros,
-                 is_marker_run, is_prod_job_run)
+                 is_marker_run)
 
 
 class SummarizeMixin:
@@ -71,33 +74,8 @@ class SummarizeMixin:
                 shown_all, parents = self._shown_locked(now)
                 live_open, shadows = self._live_open_with_shadows_locked(now, shown_all)
                 shown_all = _annotate_lanes(shown_all, live_open | set(shadows))
-                scoped = [run for run in shown_all if _in_ws(run, ws)]
-                running = [
-                    run
-                    for run in scoped
-                    if run["status"] == "running"
-                    and run["run_id"] in live_open
-                    and not is_prod_job_run(run)
-                    and not is_marker_run(run)
-                ]
-                running.sort(key=lambda run: run["started_at"] or 0, reverse=True)
                 range_since = now - RANGE_S if since is None else float(since)
                 range_until = float(now if until is None else until)
-                recent_all = [
-                    run
-                    for run in scoped
-                    if not is_prod_job_run(run)
-                    and run["status"] != "running"
-                    and not is_marker_run(run)
-                    and run["ended_at"] is not None
-                    and range_since <= float(run["ended_at"]) <= range_until
-                ]
-                recent_all.sort(key=lambda run: run["ended_at"] or 0, reverse=True)
-                recent_total = len(recent_all)
-                # Paged window over the full newest-first list: the default
-                # page (offset 0, limit 50) is the historic shape, and the
-                # total stays true no matter which page is served.
-                recent = recent_all[recent_offset:recent_offset + recent_limit]
                 usage_once = self._usage_by_run()
                 roll = self._summarize_locked(
                     shown_all, parents, now, since, until, live_open, usage=usage_once
@@ -117,6 +95,20 @@ class SummarizeMixin:
                     totals = scope["totals"]
                     wanted = [roll["unassigned"]] if key == UNASSIGNED and roll["has_unassigned"] else roll["rows"]
                     by_ws = [row for row in wanted if row["ws"] == key]
+                # Running and recent ride the same grouped counting pass
+                # as every other scope number (one walk, not three): only
+                # the requested scope's lists sort here.
+                running = sorted(
+                    scope.get("running", []),
+                    key=lambda run: run["started_at"] or 0, reverse=True)
+                recent_all = sorted(
+                    scope.get("recent", []),
+                    key=lambda run: run["ended_at"] or 0, reverse=True)
+                recent_total = len(recent_all)
+                # Paged window over the full newest-first list: the default
+                # page (offset 0, limit 50) is the historic shape, and the
+                # total stays true no matter which page is served.
+                recent = recent_all[recent_offset:recent_offset + recent_limit]
                 scope_ws = None if ws in (None, "all") else ws
                 # Own dict for the additive field below: the snapshot cache
                 # keeps this payload, so it must not alias the roll.
@@ -134,6 +126,7 @@ class SummarizeMixin:
                     "now": now,
                     "seq": self._seq,
                     "data_seq": self._data_seq,
+                    "view_seq": self._view_seq,
                     "last_data_ts": self._last_data_ts,
                     "counts": counts,
                     "running": running,
@@ -147,7 +140,7 @@ class SummarizeMixin:
                     "totals_all_time": roll["all_time"][key]
                     if key in roll["all_time"]
                     else {"tokens": {field: 0 for field in TOKEN_FIELDS}, "cost_usd": 0.0},
-                    "last_activity": _last_activity(scope["runs"]),
+                    "last_activity": scope.get("last_activity"),
                     "by_workstream": by_ws,
                 }
                 if usage_group is not None:
@@ -238,7 +231,8 @@ class SummarizeMixin:
             Keyed by the request params plus the data sequence: reads with
             no data writes in between return the cached payload without
             recomputing, so idle ticks cost nothing. ``now``, ``seq``,
-            ``data_seq`` and ``last_data_ts`` refresh on a hit; run and
+            ``data_seq``, ``view_seq`` and ``last_data_ts`` refresh on a
+            hit; run and
             liveness lists are as fresh as the last data write, which the
             stale badge covers. (``seq`` alone is not a gate: polling
             bumps it every cycle via process samples and counts while no
@@ -257,10 +251,12 @@ class SummarizeMixin:
             with self._lock:
                 hit = self._snapshot_cache.get(key)
                 if hit is not None and hit[0] == self._data_seq:
+                    _perf.record_cache("snapshot", "hit")
                     payload = dict(hit[2])
                     payload["now"] = now
                     payload["seq"] = self._seq
                     payload["data_seq"] = self._data_seq
+                    payload["view_seq"] = self._view_seq
                     payload["last_data_ts"] = self._last_data_ts
                     return payload
             payload = self.snapshot(now, ws, since, until, usage_group=usage_group, recent_limit=recent_limit, recent_offset=recent_offset)
@@ -268,6 +264,7 @@ class SummarizeMixin:
                 if len(self._snapshot_cache) > 32:
                     self._snapshot_cache.clear()
                 self._snapshot_cache[key] = (self._data_seq, self._seq, dict(payload))
+                _perf.record_cache("snapshot", "miss")
             return payload
         def ws_rollup(self, now: float, since: float | None = None, until: float | None = None) -> dict:
             """One locked pass over the same run list: all-scope counts and totals,
@@ -275,14 +272,34 @@ class SummarizeMixin:
 
             Row ``ws`` equals ``snapshot(now, ws, since, until)`` counts and totals.
             The rows plus unassigned sum to the all-scope numbers exactly.
+            Served from a result cache keyed by the data sequence and a
+            one-minute quantum: reads with no data writes in between get a
+            copy without recomputing, so repeat archive loads cost a
+            deepcopy, not a full pass. Callers must not mutate the
+            result; the hit path copies before returning.
             """
+            key = (
+                self._data_seq,
+                None if since is None else int(float(since) // 60),
+                None if until is None else int(float(until) // 60),
+                int(float(now) // 60),
+            )
             with self._lock:
+                hit = self._rollup_cache.get(key)
+                if hit is not None:
+                    _perf.record_cache("rollup", "hit")
+                    return _copy.deepcopy(hit)
                 shown_all, parents = self._shown_locked(now)
                 live_open = self._live_open_ids_locked(now, shown_all)
                 usage_once = self._usage_by_run()
-                return self._summarize_locked(
+                roll = self._summarize_locked(
                     shown_all, parents, now, since, until, live_open, usage=usage_once
                 )
+                if len(self._rollup_cache) > 16:
+                    self._rollup_cache.clear()
+                self._rollup_cache[key] = roll
+                _perf.record_cache("rollup", "miss")
+                return _copy.deepcopy(roll)
         def reconcile_numbers(
             self,
             now: float,
@@ -482,15 +499,124 @@ class SummarizeMixin:
                 _duplicate_run_mismatches([dict(row) for row in self._all_runs()])
             )
             return mismatches
+        def _frag_key(self, row: dict, usage_v: int, rss_v, context_v, child_usage: tuple = ()) -> tuple:
+            """Identity of one cached finished-row view fragment.
+
+            Covers every input :meth:`_run_view` reads for a static row:
+            the run write version (every ``_write_run`` bumps it), the
+            folded usage version (post-fold, so refolds line up), the
+            live workstream/confidence (the inherit refresh writes those
+            directly), the current rss/context lookups, the epoch (merges,
+            deletes, reassigns), and the children's usage versions for
+            rollup parents (a child's write moves its tokens onto the
+            parent). Two equal keys mean ``_run_view`` would return an
+            equal dict, so the cached copy is exact.
+            """
+            run_id = row["run_id"]
+            return (
+                self._run_epoch,
+                run_id,
+                self._run_versions.get(run_id, 0),
+                usage_v,
+                row.get("workstream"),
+                row.get("ws_confidence"),
+                rss_v,
+                context_v,
+                child_usage,
+            )
+
+        def _cached_view(self, row, now: float, usage: dict, rss_pair: tuple,
+                         usage_versions: dict, context: dict, stalled_map: dict,
+                         children_of: dict | None = None) -> dict:
+            """One run view, reusing the cached fragment for static rows.
+
+            Open rows (and rows with no end time, whose elapsed clock
+            ticks with ``now``) always recompute: their elapsed time,
+            stalled flag, and liveness move with the clock. Ended rows
+            are pure functions of the fragment key, so they recompute
+            only when the key moved. Copies on a hit: the cache owns
+            the stored dict (and its tokens), callers get their own.
+            """
+            status = row.get("status")
+            if status in ("running", "queued") or row.get("ended_at") is None:
+                return self._run_view(
+                    row, now, usage, rss_pair, context, stalled_map.get(row["run_id"]))
+            run_id = row["run_id"]
+            by_run, by_pid = rss_pair
+            rss_v = by_run.get(run_id)
+            if rss_v is None and row.get("pid") is not None:
+                rss_v = by_pid.get(row["pid"])
+            context_v = context.get(run_id)
+            usage_v = usage_versions.get(run_id, 0)
+            child_usage: tuple = ()
+            if children_of:
+                kids = children_of.get(run_id)
+                if kids:
+                    child_usage = tuple(
+                        sorted((kid, usage_versions.get(kid, 0)) for kid in kids)
+                    )
+            key = self._frag_key(row, usage_v, rss_v, context_v, child_usage)
+            hit = self._view_frags.get(run_id)
+            if hit is not None and hit[0] == key:
+                view = dict(hit[1])
+                tokens = hit[1].get("tokens")
+                if isinstance(tokens, dict):
+                    view["tokens"] = dict(tokens)
+                return view
+            view = self._run_view(
+                row, now, usage, rss_pair, context, stalled_map.get(run_id))
+            if len(self._view_frags) > 40000:
+                self._view_frags.clear()
+            self._view_frags[run_id] = (key, view)
+            view = dict(view)
+            tokens = view.get("tokens")
+            if isinstance(tokens, dict):
+                view["tokens"] = dict(tokens)
+            return view
+
+        def _open_evidence_locked(self, rows: list) -> tuple[dict, dict, dict]:
+            """One shared liveness-evidence pass for a top-level call.
+
+            ``(usage_max, sample_max, pid_starts)`` over the open rows,
+            computed once and passed to the live-open set and the
+            stalled map, instead of each issuing the same GROUP BYs.
+            Caller holds the lock.
+            """
+            open_rows = [
+                row for row in rows if (row.get("status") in ("running", "queued"))
+            ]
+            if not open_rows:
+                return {}, {}, {}
+            return (
+                self._usage_max_locked([row["run_id"] for row in open_rows]),
+                self._sample_max_locked(open_rows),
+                self._pid_start_locked([row.get("pid") for row in open_rows]),
+            )
+
         def _shown_locked(self, now: float) -> tuple[list, dict]:
             """All run views with child chats folded away and launch echoes dropped. Caller holds the lock."""
             raw, usage, parents = self._scoped_usage()
             context = self._context_by_run()
             rss = self._rss_maps(now)
-            bare = [dict(row) for row in raw]
-            stalled = self._stalled_locked(now, bare)
+            # raw rows are already fresh dicts (built in _scoped_usage)
+            # and no evidence consumer mutates them, so no second copy.
+            # Stalled rows never read process sightings, so only the
+            # usage evidence is shared here; the sample GROUP BY stays
+            # out of this path entirely.
+            usage_max = self._usage_max_locked(
+                [row["run_id"] for row in raw
+                 if row.get("status") in ("running", "queued")]
+            )
+            stalled = self._stalled_locked(now, raw, None, usage_max)
+            usage_versions = dict(self._usage_fold_versions)
+            children_of: dict = {}
+            for child, parent in parents.items():
+                children_of.setdefault(parent, []).append(child)
             views = [
-                self._run_view(row, now, usage, rss, context, stalled.get(row["run_id"]))
+                self._cached_view(
+                    row, now, usage, rss, usage_versions, context, stalled,
+                    children_of,
+                )
                 for row in raw
             ]
             shown = _drop_launch_echoes([view for view in views if view["run_id"] not in parents])
@@ -524,26 +650,11 @@ class SummarizeMixin:
             buckets: dict[str, list] = {}
             for cell in cells:
                 buckets.setdefault(cell["key"], []).append(cell)
-            scopes: dict[str, dict] = {}
-            scopes["all"] = _scope_numbers(
-                shown_all, parents, usage, now, since, until, range_since, range_until,
-                [cell for group in buckets.values() for cell in group],
-                live_open,
-                stalled,
-            )
-            workstreams = sorted({run.get("workstream") or UNASSIGNED for run in shown_all}, key=_ws_sort)
-            if UNASSIGNED not in workstreams:
-                workstreams.append(UNASSIGNED)
-            for ws in workstreams:
-                members = [run for run in shown_all if (run.get("workstream") or UNASSIGNED) == ws]
-                scopes[ws] = _scope_numbers(
-                    members, parents, usage, now, since, until, range_since, range_until,
-                    buckets.get(ws, []),
-                    live_open,
-                    stalled,
-                )
-            # The 24 hours immediately before the window, per scope, with the
-            # same bucket sums and the same agent rule as the windowed
+            # One partition plus one counting pass for every scope: the
+            # per-workstream member filters and the per-scope
+            # ``_agent_counts`` walks used to cost O(scopes x runs).
+            # The 24 hours immediately before the window, per scope, with
+            # the same bucket sums and the same agent rule as the windowed
             # numbers, so a delta compares like with like. Tokens and cost
             # come from the same hourly cells over the earlier window (same
             # priced-cost fallback, so the same unpriced rule); finished is
@@ -551,19 +662,72 @@ class SummarizeMixin:
             # point-in-time overlap at the window start, not a peak.
             prev_since = range_since - RANGE_S
             prev_until = range_since
+            live_at_start = _live_at_point_ids(shown_all, parents, prev_until, now)
+            members_by_ws: dict[str, list] = {}
+            for run in shown_all:
+                members_by_ws.setdefault(run.get("workstream") or UNASSIGNED, []).append(run)
+            if UNASSIGNED not in members_by_ws:
+                members_by_ws[UNASSIGNED] = []
+            workstreams = sorted(members_by_ws, key=_ws_sort)
+            if UNASSIGNED not in workstreams:
+                workstreams.append(UNASSIGNED)
+            all_counts, counts_by_ws = _counts_many(
+                shown_all, members_by_ws, parents, usage, now,
+                range_since, range_until, prev_since, prev_until,
+                live_open, stalled, live_at_start,
+            )
+            scopes: dict[str, dict] = {}
+            all_cells = [cell for group in buckets.values() for cell in group]
+            for ws in workstreams:
+                summed = _sum_cells(buckets.get(ws, []))
+                counts = counts_by_ws[ws]
+                scopes[ws] = {
+                    "runs": members_by_ws[ws],
+                    "counts": counts["counts"],
+                    "totals": {
+                        "tokens": summed["tokens"],
+                        "cost_usd": summed["cost_usd"],
+                        "unpriced_runs": counts["unpriced_runs"],
+                    },
+                    "last_activity": counts["last_activity"],
+                    "ws_confidence": counts["ws_confidence"],
+                    "running": counts["running"],
+                    "recent": counts["recent"],
+                }
+            summed_all = _sum_cells(all_cells)
+            scopes["all"] = {
+                "runs": shown_all,
+                "counts": all_counts["counts"],
+                "totals": {
+                    "tokens": summed_all["tokens"],
+                    "cost_usd": summed_all["cost_usd"],
+                    "unpriced_runs": all_counts["unpriced_runs"],
+                },
+                "last_activity": all_counts["last_activity"],
+                "ws_confidence": all_counts["ws_confidence"],
+                "running": all_counts["running"],
+                "recent": all_counts["recent"],
+            }
             prev_cells = self._query_usage_locked("workstream", "hour", None, prev_since, prev_until)
             prev_buckets: dict[str, list] = {}
             for cell in prev_cells:
                 prev_buckets.setdefault(cell["key"], []).append(cell)
-            live_at_start = _live_at_point_ids(shown_all, parents, prev_until, now)
-            scopes["all"]["prev_24h"] = _prev_24h(
-                shown_all, parents, now, prev_since, prev_until, prev_cells, live_open, live_at_start,
-            )
+            prev_all = _sum_cells(prev_cells)
+            scopes["all"]["prev_24h"] = {
+                "tokens": _billed_total(prev_all["tokens"]),
+                "cost_usd": prev_all["cost_usd"],
+                "finished": all_counts["prev_finished"],
+                "live_agents": all_counts["point_live"],
+            }
             for ws in workstreams:
-                members = [run for run in shown_all if (run.get("workstream") or UNASSIGNED) == ws]
-                scopes[ws]["prev_24h"] = _prev_24h(
-                    members, parents, now, prev_since, prev_until, prev_buckets.get(ws, []), live_open, live_at_start,
-                )
+                prev_summed = _sum_cells(prev_buckets.get(ws, []))
+                counts = counts_by_ws[ws]
+                scopes[ws]["prev_24h"] = {
+                    "tokens": _billed_total(prev_summed["tokens"]),
+                    "cost_usd": prev_summed["cost_usd"],
+                    "finished": counts["prev_finished"],
+                    "live_agents": counts["point_live"],
+                }
             # All-time tokens and cost per scope from the same bucket cells with no
             # window, summed by the same helper as the windowed numbers.
             everything = self._query_usage_locked("workstream", "hour", None, None, None)
@@ -617,7 +781,7 @@ class SummarizeMixin:
             outcome_row = dict(data)
             if stalled:
                 outcome_row["stalled"] = stalled
-            cls = outcome_class(outcome_row)
+            cls, reason = _outcome_cached(outcome_row)
             present = data["run_id"] in usage
             folded, cost, _unpriced = usage.get(data["run_id"], (_zeros(), 0.0, False))
             by_run, by_pid = rss
@@ -630,20 +794,24 @@ class SummarizeMixin:
             else:
                 tokens = {key: 0 for key in BILLED_FIELDS}
                 cost_usd = 0.0
+            harness = harness_of(data)
             return {
                 "run_id": data["run_id"],
                 "source": data.get("source"),
                 "tier": data.get("tier"),
+                "harness": harness,
+                "harness_name": HARNESS_NAMES.get(harness, harness),
                 "model": data.get("model"),
                 "label": data.get("label"),
                 "workstream": data.get("workstream"),
                 "ws_confidence": data.get("ws_confidence"),
                 "session_id": data.get("session_id"),
                 "parent_session_id": data.get("parent_session_id"),
+                "slice_of": data.get("slice_of"),
                 "status": data.get("status"),
                 "verdict": data.get("verdict"),
                 "outcome_class": cls,
-                "outcome_reason": outcome_reason(outcome_row, cls),
+                "outcome_reason": reason,
                 "stalled": stalled if stalled else False,
                 "started_at": data.get("started_at"),
                 "ended_at": data.get("ended_at"),
@@ -658,6 +826,49 @@ class SummarizeMixin:
                 "cost_usd": cost_usd,
                 "context_tokens": None if not context or data["run_id"] not in context else context[data["run_id"]],
             }
+
+
+#: Memoized (outcome_class, outcome_reason) by the only inputs that
+#: decide them: status, verdict, whether the end is confirmed, and the
+#: stalled flag. The stalled *age* (a float) feeds only the live-stalled
+#: reason sentence, so rows carrying a live stall bypass the memo and
+#: compute fresh; every other row's pair is a pure function of the key.
+#: Bounded: cleared when full, never unbounded across a long-lived server.
+_OUTCOME_MEMO: dict = {}
+
+
+def _outcome_cached(outcome_row: dict) -> tuple:
+    """``(outcome_class, outcome_reason)`` for a run row, memoized.
+
+    Pure wrapper over :func:`dash.outcomes.outcome_class` and
+    :func:`dash.outcomes.outcome_reason`: equal keys mean both helpers
+    would return equal values, so the cached pair is exact. Live
+    stalled rows (whose reason names the stall age) always recompute.
+    """
+    status = outcome_row.get("status")
+    stalled = outcome_row.get("stalled")
+    try:
+        if stalled and status in ("running", "queued") and outcome_row.get("ended_at") is None:
+            cls = outcome_class(outcome_row)
+            return cls, outcome_reason(outcome_row, cls)
+        key = (
+            status,
+            outcome_row.get("verdict"),
+            outcome_row.get("ended_at") is None,
+            bool(stalled),
+        )
+        hash(key)
+    except Exception:
+        cls = outcome_class(outcome_row)
+        return cls, outcome_reason(outcome_row, cls)
+    hit = _OUTCOME_MEMO.get(key)
+    if hit is None:
+        if len(_OUTCOME_MEMO) > 8192:
+            _OUTCOME_MEMO.clear()
+        cls = outcome_class(outcome_row)
+        hit = (cls, outcome_reason(outcome_row, cls))
+        _OUTCOME_MEMO[key] = hit
+    return hit
 
 
 def _duplicate_run_mismatches(runs: list, window_s: float = MERGE_WINDOW_S) -> list:
@@ -726,6 +937,184 @@ def _run_overlaps_window(run: dict, since: float, until: float, now: float) -> b
     if (run.get("ended_at") if run.get("ended_at") is not None else now) < since:
         return False
     return (run.get("started_at") or 0) <= until
+
+
+def _counts_many(shown_all: list, members_by_ws: dict, parents: dict, usage: dict,
+                 now: float,
+                 range_since: float, range_until: float,
+                 prev_since: float, prev_until: float,
+                 live_open=None, stalled=None, live_at_start: set | None = None) -> tuple:
+    """One counting pass for the all-scope plus every workstream scope.
+
+    Replaces ``O(scopes)`` ``_agent_counts`` walks (each over its own
+    member list, plus a second full walk per scope for the previous
+    window) with a single walk over ``shown_all`` accumulating into
+    per-scope buckets. Predicates mirror :func:`_agent_counts`
+    exactly, including the previous window's finished count (the only
+    ``_prev_24h`` field that needs the run list) and the point-live
+    dedup (same lane rule as :func:`_point_live_count`); every other
+    ``prev_24h`` field comes from bucket cells as before.
+
+    Returns ``(all_entry, by_ws)`` where each entry reads
+    ``{"counts", "unpriced_runs", "prev_finished", "point_live"}`` and
+    ``counts`` has exactly the :func:`_agent_counts` shape.
+    """
+    today = _local_midnight(now)
+    stalled_ids = set(stalled or ())
+    live_at_start = live_at_start or set()
+
+    def _fresh_acc():
+        return {
+            "live_by": {key: 0 for key in TOOL_KEYS},
+            "live_by_model": {},
+            "seen": set(),
+            "point_seen": set(),
+            "live_n": 0,
+            "stalled_n": 0,
+            "prod_jobs": 0,
+            "prod_jobs_finished": 0,
+            "finished_today": 0,
+            "finished_range": 0,
+            "by_verdict": {},
+            "unpriced": 0,
+            "prev_finished": 0,
+            "point_live": 0,
+            "last": 0,
+            "conf": set(),
+            "running": [],
+            "recent": [],
+        }
+
+    accs: dict = {}
+    all_acc = _fresh_acc()
+
+    for run in shown_all:
+        run_id = run["run_id"]
+        # Last-activity and confidence cover every row, children
+        # included, exactly like _last_activity and _ws_row: update
+        # before the parents skip below.
+        ended_stamp = run.get("ended_at")
+        started_stamp = run.get("started_at")
+        conf_value = run.get("ws_confidence")
+        ws = run.get("workstream") or UNASSIGNED
+        acc = accs.get(ws)
+        if acc is None:
+            acc = _fresh_acc()
+            accs[ws] = acc
+        for target in (all_acc, acc):
+            if ended_stamp and ended_stamp > target["last"]:
+                target["last"] = ended_stamp
+            if started_stamp and started_stamp > target["last"]:
+                target["last"] = started_stamp
+            if conf_value:
+                target["conf"].add(conf_value)
+        if run_id in parents:
+            continue
+        status = run.get("status")
+        not_prod = run.get("source") != "dagster"
+        for target in (all_acc, acc):
+            if run.get("source") == "dagster" and status in ("running", "queued"):
+                if live_open is None or run_id in live_open:
+                    target["prod_jobs"] += 1
+            if (
+                run.get("source") == "dagster"
+                and status != "running"
+                and ended_stamp is not None
+                and range_since <= float(ended_stamp) <= range_until
+            ):
+                target["prod_jobs_finished"] += 1
+            # The page lists ride no agent-rule gate: any live non-job
+            # non-marker open row runs, any ended non-job non-marker row
+            # in the window is recent, exactly like the old filters.
+            if status == "running":
+                live_ok = live_open is None or run_id in live_open
+                running_marker = is_marker_run(run) if live_ok else False
+                if live_ok and not_prod and not running_marker:
+                    target["running"].append(run)
+                if not _is_counted_agent(run):
+                    continue
+                if not live_ok:
+                    continue
+                if run_id in stalled_ids:
+                    target["stalled_n"] += 1
+                    continue
+                tool = _tool_key(run)
+                key = (tool, run.get("label") or run_id)
+                if key in target["seen"]:
+                    continue
+                target["seen"].add(key)
+                if running_marker:
+                    target["live_by"][tool] += 1
+                    target["live_n"] += 1
+                    continue
+                target["live_by"][tool] += 1
+                model = run_model_key(run)
+                target["live_by_model"][model] = target["live_by_model"].get(model, 0) + 1
+                target["live_n"] += 1
+                continue
+            marker = is_marker_run(run)
+            if (
+                ended_stamp is not None
+                and not_prod
+                and not marker
+                and range_since <= float(ended_stamp) <= range_until
+            ):
+                target["recent"].append(run)
+            if not _is_counted_agent(run):
+                continue
+            if marker:
+                continue
+            if status not in FINISHED or ended_stamp is None:
+                continue
+            ended = float(ended_stamp)
+            if today <= ended <= now:
+                target["finished_today"] += 1
+            if range_since <= ended <= range_until:
+                target["finished_range"] += 1
+                cls = outcome_class(run)
+                target["by_verdict"][cls] = target["by_verdict"].get(cls, 0) + 1
+            if prev_since <= ended <= prev_until:
+                target["prev_finished"] += 1
+        if (
+            _run_overlaps_window(run, range_since, range_until, now)
+            and _usage_unpriced(usage.get(run_id))
+        ):
+            all_acc["unpriced"] += 1
+            acc["unpriced"] += 1
+        if run_id in live_at_start:
+            for target in (all_acc, acc):
+                lane = (_tool_key(run), run.get("label") or run_id)
+                if lane not in target["point_seen"]:
+                    target["point_seen"].add(lane)
+                    target["point_live"] += 1
+
+    def _entry(target):
+        return {
+            "counts": {
+                "live_agents": target["live_n"],
+                "live_by_tool": target["live_by"],
+                "live_by_model": target["live_by_model"],
+                "stalled": target["stalled_n"],
+                "prod_jobs": target["prod_jobs"],
+                "prod_jobs_finished": target["prod_jobs_finished"],
+                "finished_today": target["finished_today"],
+                "finished_in_range": target["finished_range"],
+                "finished_by_verdict": target["by_verdict"],
+            },
+            "unpriced_runs": target["unpriced"],
+            "prev_finished": target["prev_finished"],
+            "point_live": target["point_live"],
+            "last_activity": target["last"] or None,
+            "ws_confidence": sorted(target["conf"]),
+            "running": target["running"],
+            "recent": target["recent"],
+        }
+
+    by_ws = {}
+    for ws in members_by_ws:
+        target = accs.get(ws)
+        by_ws[ws] = _entry(target) if target is not None else _entry(_fresh_acc())
+    return _entry(all_acc), by_ws
 
 
 def _scope_numbers(
@@ -876,6 +1265,20 @@ def _point_live_count(members: list, live_ids: set) -> int:
 
 
 def _ws_row(ws: str, scope: dict, all_time: dict | None = None) -> dict:
+    if "last_activity" in scope:
+        last_activity = scope["last_activity"]
+    else:
+        last_activity = _last_activity(scope["runs"])
+    if "ws_confidence" in scope:
+        ws_confidence = scope["ws_confidence"]
+    else:
+        ws_confidence = sorted(
+            {
+                run.get("ws_confidence")
+                for run in scope["runs"]
+                if run.get("ws_confidence")
+            }
+        )
     row = {
         "ws": ws,
         "live_agents": scope["counts"]["live_agents"],
@@ -884,14 +1287,8 @@ def _ws_row(ws: str, scope: dict, all_time: dict | None = None) -> dict:
         "tokens": _billed_total(scope["totals"]["tokens"]),
         "cost_usd": scope["totals"]["cost_usd"],
         "prev_24h": dict(scope.get("prev_24h") or _zero_prev()),
-        "last_activity": _last_activity(scope["runs"]),
-        "ws_confidence": sorted(
-            {
-                run.get("ws_confidence")
-                for run in scope["runs"]
-                if run.get("ws_confidence")
-            }
-        ),
+        "last_activity": last_activity,
+        "ws_confidence": ws_confidence,
     }
     if all_time is not None:
         row["tokens_all_time"] = _billed_total(all_time["tokens"])
