@@ -112,6 +112,13 @@ CMD_LAUNCH_GOOD = CMD_LAUNCH_BAD.replace("ws6-gaps", "ws6-plan-gaps")
 CMD_PROMPT_GOOD = 'cmd -p "[label: ws6-plan-gaps]\\nlist the routes" -m reflection/beam:free --output-format json'
 CMD_PROMPT_BAD = 'cmd -p "list the routes" -m reflection/beam:free --output-format json'
 
+PI_LAUNCH_BAD = "nohup python3 scripts/launch_pi.py ws15-gaps /repo /x/prompt.md /x/pi > /x/l.log 2>&1 &"
+PI_LAUNCH_GOOD = PI_LAUNCH_BAD.replace("ws15-gaps", "ws15-exec-gaps")
+PI_LAUNCH_MODEL = (
+    "python3 tools/agent-dash/scripts/launch_pi.py ws15-exec-gaps /repo /x/prompt.md /x/pi "
+    "--model river/deepseek-ai/DeepSeek-V4.1-Flash"
+)
+
 
 class CommandCodePayloadTests(unittest.TestCase):
     """Command Code launches: launch_cmd.py positional label and the headless -p prompt prefix."""
@@ -140,6 +147,24 @@ class CommandCodePayloadTests(unittest.TestCase):
 
     def test_interactive_cmd_without_p_passes(self):
         self.assertEqual(run_hook(self.payload("cmd --version")), (0, ""))
+
+
+class PiPayloadTests(unittest.TestCase):
+    """pi launches: launch_pi.py positional label, before and after --model."""
+
+    def payload(self, command):
+        return {"tool_name": "Bash", "tool_input": {"command": command}}
+
+    def test_launcher_with_an_exec_label_passes(self):
+        self.assertEqual(run_hook(self.payload(PI_LAUNCH_GOOD)), (0, ""))
+
+    def test_launcher_with_a_weak_label_refused(self):
+        code, err = run_hook(self.payload(PI_LAUNCH_BAD))
+        self.assertEqual(code, 2)
+        self.assertIn("ws15-plan-gaps", err)
+
+    def test_launcher_with_a_trailing_model_flag_passes(self):
+        self.assertEqual(run_hook(self.payload(PI_LAUNCH_MODEL)), (0, ""))
 
 
 class ShimTests(unittest.TestCase):

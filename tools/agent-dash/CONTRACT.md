@@ -113,8 +113,8 @@ store.set_ws_counts(list)     # rows: ws, name, backlog, todo, doing, review, do
 A source may also expose `health_extra() -> dict`, merged into `/api/health` under its own name (Dagster reports `skipped_closeouts` this way).
 Sources must be incremental (byte offsets), budget-bounded, and exception-safe (log, never crash the loop). Directory listings are cached by (inode, mtime) with a per-pass cap on fresh listings, so repeat polls over a quiet tree cost stats, not walks. Dead offset rows (absolute paths that no longer exist) are pruned a batch per reconcile tick with one VACUUM per pass; only the newest 3 `*.bak-*` stay in the state dir.
 
-Enums. `source`: claude-main, claude-subagent, claude-workflow, muse, glm, grok (cursor-agent), shell, generic.
-`tier`: opus, sonnet, haiku, muse, glm, grok. The generic source passes its tier through and defaults to `generic` (from the model name when it holds a known family). `status`: running, done, killed, died_early, unknown.
+Enums. `source`: claude-main, claude-subagent, claude-workflow, muse, glm, grok (cursor-agent), pi, shell, generic.
+`tier`: opus, sonnet, haiku, muse, glm, grok, pi. The generic source passes its tier through and defaults to `generic` (from the model name when it holds a known family). `status`: running, done, killed, died_early, unknown.
 `verdict`: PASS, PARTIAL, BLOCKED, APPROVE, APPROVE_WITH_NITS, APPROVE_WITH_CHANGES, REQUEST_CHANGES, or null.
 `clock_source`: transcript, muse_log, manifest, mtime. Times are epoch seconds (float), UTC.
 `run_id` is stable: `<source>:<session-or-uuid>:<label-or-agent-id>`.

@@ -48,6 +48,24 @@ The `commandcode` source reads those rows and the session files under
 `~/.commandcode/projects`. Unlabelled Command Code sessions show as runs with
 no label. Throttled attempts show as `died_early` with verdict `QUOTA`.
 
+### pi workers (`launch_pi.py`)
+
+`scripts/launch_pi.py <label> <workspace> <prompt-file> <outdir> [--model M]`
+runs one headless `pi` (`@mariozechner/pi-coding-agent`) worker on the
+River AI provider, defaulting to
+`river/deepseek-ai/DeepSeek-V4.1-Flash-1017` (use
+`--model river/zai-org/GLM-5.3-Flash` for GLM). `outdir` is any folder the
+dashboard scans, such as a scratchpad `pi/` folder. It writes
+`pi-sessions.tsv` (label, session id, start epoch, model),
+`stream-<label>.ndjson`, `out-<label>.md`, `err-<label>.log`, and
+`running/<label>` while the run is live, and appends `generic.jsonl`
+start/usage/finish lines (run id `pi:<session>:<label>`). The `pi` source
+reads the manifest and a `pi/` folder beside it, takes status and verdict
+from the files, and reads liveness from the live `node .../pi-coding-agent`
+process. Quota/credit exhaustion finishes `died_early` with verdict
+`BLOCKED` and writes `QUOTA` naming the model and label. See
+[docs/integrate.md](docs/integrate.md).
+
 ## Config
 
 Zero config runs. `config.local.json` deep-merges over `config.example.json`. The full tables are in [configuration](../../docs/configuration.md).

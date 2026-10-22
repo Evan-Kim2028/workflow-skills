@@ -156,6 +156,11 @@
       "test_poll_budgets",
       "perf/test_perf_budget"
     ],
+    "dash/sources/pi.py": [
+      "test_pi",
+      "test_poll_budgets",
+      "perf/test_perf_budget"
+    ],
     "dash/sources/dagster.py": [
       "test_dagster",
       "test_poll_budgets",
@@ -263,6 +268,10 @@
     ],
     "scripts/launch_cmd.py": [
       "test_commandcode",
+      "test_label_guard_clis"
+    ],
+    "scripts/launch_pi.py": [
+      "test_pi",
       "test_label_guard_clis"
     ],
     "scripts/launch_grok.sh": [

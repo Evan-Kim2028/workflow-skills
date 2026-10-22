@@ -8,6 +8,8 @@ merely mentions a launcher) passes untouched:
 - ``muse exec ... --prompt-file <dir>/<label>.md`` (label = basename)
 - ``launch_grok.sh <label> ...``
 - ``launch_cmd.py <label> <workspace> <prompt-file> <outdir>``
+- ``launch_pi.py <label> <workspace> <prompt-file> <outdir>`` (pi, the
+  ``@mariozechner/pi-coding-agent`` CLI)
 - ``cmd -p "<prompt>"`` (Command Code headless): the prompt must start with
   ``[label: <label>]``; a prompt without that prefix is refused
 - ``run_worker.sh|run_worker.py <tier> <label> ...``
@@ -49,7 +51,7 @@ if str(ROOT) not in sys.path:
 
 TSV_NAMES = ("muse-sessions.tsv", "cursor-sessions.tsv")
 _WRAPPERS = {"nohup", "sudo", "env", "setsid", "nice"}
-_LAUNCHERS = {"launch_grok.sh", "launch_cmd.py", "run_worker.sh", "run_worker.py"}
+_LAUNCHERS = {"launch_grok.sh", "launch_cmd.py", "launch_pi.py", "run_worker.sh", "run_worker.py"}
 _COMMANDCODE_BINARIES = ("cmd", "commandcode")
 
 #: Command Code headless prompt label prefix, ``[label: <label>]``.
@@ -184,7 +186,7 @@ def _label_from_argv(argv: list[str]) -> str | None:
         return _label_from_cmd(items[1:])
     if base in _LAUNCHERS:
         rest = _nonflags(items[1:])
-        if base in ("launch_grok.sh", "launch_cmd.py"):
+        if base in ("launch_grok.sh", "launch_cmd.py", "launch_pi.py"):
             return rest[0] if rest else None
         return rest[1] if len(rest) >= 2 else None
     if base in ("python", "python3") and len(items) > 1:
@@ -193,6 +195,9 @@ def _label_from_argv(argv: list[str]) -> str | None:
             rest = _nonflags(items[2:])
             return rest[1] if len(rest) >= 2 else None
         if inner == "launch_cmd.py":
+            rest = _nonflags(items[2:])
+            return rest[0] if rest else None
+        if inner == "launch_pi.py":
             rest = _nonflags(items[2:])
             return rest[0] if rest else None
         if inner == "agent_dash.py":
