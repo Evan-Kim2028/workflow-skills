@@ -1,35 +1,39 @@
 /* Model families. One place maps a run or a model id to its family (hue) and model (shade of that hue).
-   dash/models.py holds the same rules for the server-side counts. A Grok CLI
+   dash/models.py holds the same rules for the server-side counts. Any id
+   containing beam reads as Beam (beam-<ver>, else beam) whichever harness
+   ran it, before the Command Code free-id check. A Grok CLI
    run with a recorded-but-unknown model id (mimo-*, step-*) reads as Other;
    only an empty id reads as glm-unknown. Codex ids (gpt-*, codex-*,
    gpt-reserve) read as Codex under their id; an empty id with a codex
    tier or source reads as codex-unknown. */
 (function (global) {
   "use strict";
-  var FAMS = ["claude", "cursor", "muse", "glm", "deepseek", "codex", "commandcode", "dagster", "other"];
+  var FAMS = ["claude", "cursor", "muse", "glm", "deepseek", "beam", "codex", "commandcode", "dagster", "other"];
   var FAM = {
     claude: {name: "Claude", hue: "--s1", order: ["opus", "fable", "sonnet", "haiku"]},
     cursor: {name: "Cursor", hue: "--s4", order: ["grok-4.7", "composer-2.5"]},
     muse: {name: "muse", hue: "--s5", order: ["muse-spark-1.3", "muse-wonder-1.0"]},
     glm: {name: "GLM", hue: "--s6", order: ["glm-5.3", "glm-5.3-flash"]},
     deepseek: {name: "DeepSeek", hue: "--s8", order: ["deepseek-flash", "deepseek-v4-pro"]},
+    beam: {name: "Beam", hue: "--s11", order: ["beam-1.0", "beam"]},
     codex: {name: "Codex", hue: "--s9", order: ["gpt-6.1-sol", "gpt-6-luna"]},
-    commandcode: {name: "Command Code", hue: "--s10", order: ["reflection/beam:free", "minimax/minimax-m3.1-flash:free", "ornith/ornith-1.5-122b:free", "poolside/laguna-s-2.1-free", "stealth/glyph-cluster:free"]},
+    commandcode: {name: "Command Code", hue: "--s10", order: ["minimax/minimax-m3.1-flash:free", "ornith/ornith-1.5-122b:free", "poolside/laguna-s-2.1-free", "stealth/glyph-cluster:free"]},
     dagster: {name: "Dagster", hue: "--s7", order: []},
     other: {name: "Other", hue: "--other", order: ["other"]}
   };
-  var WORD = {grok: "Grok", composer: "Composer", glm: "GLM", flash: "Flash", spark: "Spark", wonder: "Wonder", muse: "muse", opus: "Opus", fable: "Fable", sonnet: "Sonnet", haiku: "Haiku", other: "Other", deepseek: "DeepSeek", pro: "Pro", codex: "Codex", gpt: "GPT", sol: "Sol", luna: "Luna", astra: "Astra", terra: "Terra", reserve: "Reserve", auto: "Auto", review: "Review"};
+  var WORD = {grok: "Grok", composer: "Composer", glm: "GLM", flash: "Flash", beam: "Beam", spark: "Spark", wonder: "Wonder", muse: "muse", opus: "Opus", fable: "Fable", sonnet: "Sonnet", haiku: "Haiku", other: "Other", deepseek: "DeepSeek", pro: "Pro", codex: "Codex", gpt: "GPT", sol: "Sol", luna: "Luna", astra: "Astra", terra: "Terra", reserve: "Reserve", auto: "Auto", review: "Review"};
 
   var COMMANDCODE_FREE = ["reflection/beam:free", "minimax/minimax-m3.1-flash:free", "ornith/ornith-1.5-122b:free", "poolside/laguna-s-2.1-free", "stealth/glyph-cluster:free"];
 
   function keyOf(model, hint) {
     var m = String(model || "").toLowerCase(), h = String(hint || "").toLowerCase(), v;
-    if (/commandcode/.test(h) || COMMANDCODE_FREE.indexOf(m) >= 0) return ["commandcode", m || "commandcode-unknown"];
     if (/^dagster:/.test(m) || /dagster/.test(h)) {
       var job = /^dagster:/.test(m) ? m.slice(8) : m;
       return ["dagster", "dagster:" + (job || "job")];
     }
-    v = /^(claude|cursor|muse|glm|codex)-unknown$/.exec(m);
+    if (/beam/.test(m) || (/beam/.test(h) && !m)) { v = /beam[-_ ]?(\d+(?:\.\d+)?)/.exec(m); return ["beam", m ? "beam" + (v ? "-" + v[1] : "") : "beam-unknown"]; }
+    if (/commandcode/.test(h) || COMMANDCODE_FREE.indexOf(m) >= 0) return ["commandcode", m || "commandcode-unknown"];
+    v = /^(beam|claude|cursor|muse|glm|codex)-unknown$/.exec(m);
     if (v) return [v[1], m];
     if (/composer/.test(m)) { v = /composer[-_ ]?(\d+(?:\.\d+)?)/.exec(m); return ["cursor", "composer" + (v ? "-" + v[1] : "")]; }
     if (/grok/.test(m)) { v = /grok[-_ ]?(\d+(?:\.\d+)?)/.exec(m); return ["cursor", "grok" + (v ? "-" + v[1] : "")]; }

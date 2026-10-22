@@ -305,6 +305,18 @@ def _agent_processes():
         return None
 
 
+def _model_tier(model):
+    """Model family for a pi run: beam, glm or deepseek; the harness stays in ``source``."""
+    text = (model or "").lower()
+    if "beam" in text:
+        return "beam"
+    if "glm" in text:
+        return "glm"
+    if "deepseek" in text:
+        return "deepseek"
+    return NAME
+
+
 def _upsert_run(store, row, processes, seen):
     label = row["label"]
     pad = row["pad"]
@@ -315,7 +327,7 @@ def _upsert_run(store, row, processes, seen):
     run = {
         "run_id": "pi:%s:%s" % (sid, label),
         "source": NAME,
-        "tier": NAME,
+        "tier": _model_tier(row.get("model")),
         "session_id": sid,
         "label": label,
         "out_path": out_path,

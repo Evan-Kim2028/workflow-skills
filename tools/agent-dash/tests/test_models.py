@@ -1,14 +1,19 @@
 import os
 
 os.environ["AGENT_DASH_IGNORE_LOCAL"] = "1"
+import subprocess
 import sys
 import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+STATIC = Path(__file__).resolve().parents[1] / "static"
+
 from dash.models import model_key, run_model_key
+from dash.projectfeed import _tool_key as _feed_tool_key
 from dash.store import _drop_launch_echoes
+from dash.store.util import _tool_key
 
 
 class ModelKeyTest(unittest.TestCase):
@@ -37,6 +42,74 @@ class ModelKeyTest(unittest.TestCase):
         self.assertEqual(run_model_key({"model": None, "tier": "grok", "source": "grok"}), "cursor-unknown")
         self.assertEqual(run_model_key({"model": "", "tier": "muse"}), "muse-unknown")
         self.assertEqual(run_model_key({"model": None, "tier": "haiku"}), "haiku")
+
+
+class BeamFamilyTest(unittest.TestCase):
+    def test_beam_ids_map_to_beam(self):
+        cases = {
+            ("reflection/beam:free", "pi pi"): ("beam", "beam"),
+            ("reflection/Beam-1.0-501B-A23B", "pi pi"): ("beam", "beam-1.0"),
+            ("reflection/Beam-1.0-501B-A23B:xhigh", "generic beam"): ("beam", "beam-1.0"),
+            ("reflection-beam", "glm glm"): ("beam", "beam"),
+            ("reflection/beam:free", "commandcode commandcode"): ("beam", "beam"),
+            ("", "beam"): ("beam", "beam-unknown"),
+        }
+        for (model, hint), want in cases.items():
+            self.assertEqual(model_key(model, hint), want, (model, hint))
+            self.assertEqual(
+                run_model_key({"model": model or None, "tier": hint.split()[0], "source": hint.split()[-1]}),
+                want[1],
+                (model, hint),
+            )
+
+    def test_tool_key_for_beam_pi_generic_and_commandcode_rows(self):
+        for run in (
+            {"source": "pi", "tier": "pi", "model": "reflection/beam:free"},
+            {"source": "pi", "tier": "pi", "model": "reflection/Beam-1.0-501B-A23B"},
+            {"source": "generic", "tier": "beam", "model": "reflection/Beam-1.0-501B-A23B:xhigh"},
+            {"source": "glm", "tier": "glm", "model": "reflection-beam"},
+            {"source": "commandcode", "tier": "commandcode", "model": "reflection/beam:free"},
+        ):
+            self.assertEqual(_tool_key(run), "beam", run)
+            self.assertEqual(_feed_tool_key(run), "beam", run)
+        both = {"source": "commandcode", "tier": "commandcode", "model": "minimax/minimax-m3.1-flash:free"}
+        self.assertEqual(_tool_key(both), "commandcode")
+        self.assertEqual(_feed_tool_key(both), "commandcode")
+        deepseek = {"source": "pi", "tier": "deepseek", "model": "river/deepseek-ai/DeepSeek-V4.1-Flash-1017"}
+        self.assertEqual(_tool_key(deepseek), "deepseek")
+        self.assertEqual(_feed_tool_key(deepseek), "deepseek")
+
+
+class BeamJsTests(unittest.TestCase):
+    def test_models_js_beam_family(self):
+        script = (
+            "const fs=require('fs');"
+            "global.window=globalThis;"
+            "eval(fs.readFileSync(process.argv[1],'utf8'));"
+            "const assert=require('assert');"
+            "const keyOf=window.ADM.keyOf;"
+            "assert.deepStrictEqual(keyOf('reflection/beam:free','pi pi'),['beam','beam']);"
+            "assert.deepStrictEqual(keyOf('reflection/Beam-1.0-501B-A23B','pi pi'),['beam','beam-1.0']);"
+            "assert.deepStrictEqual(keyOf('reflection/Beam-1.0-501B-A23B:xhigh','generic beam'),['beam','beam-1.0']);"
+            "assert.deepStrictEqual(keyOf('reflection-beam','glm glm'),['beam','beam']);"
+            "assert.deepStrictEqual(keyOf('reflection/beam:free','commandcode commandcode'),['beam','beam']);"
+            "assert.deepStrictEqual(keyOf('','beam'),['beam','beam-unknown']);"
+            "assert.deepStrictEqual(keyOf('','commandcode'),['commandcode','commandcode-unknown']);"
+            "assert.strictEqual(window.ADM.nameOf('beam-1.0'),'Beam 1.0');"
+            "assert.strictEqual(window.ADM.nameOf('beam'),'Beam');"
+            "assert.strictEqual(window.ADM.famOf('beam-1.0'),'beam');"
+            "assert.strictEqual(window.ADM.FAMS.indexOf('beam'),window.ADM.FAMS.indexOf('deepseek')+1);"
+            "assert.strictEqual(window.ADM.FAM.commandcode.order.indexOf('reflection/beam:free'),-1);"
+            "assert.strictEqual(window.ADM.FAM.beam.hue,'--s11');"
+            "console.log('models beam family proof ok');"
+        )
+        proc = subprocess.run(
+            ["node", "-e", script, str(STATIC / "models.js")],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr or proc.stdout)
+        self.assertIn("models beam family proof ok", proc.stdout)
 
 
 class LaunchEchoTest(unittest.TestCase):

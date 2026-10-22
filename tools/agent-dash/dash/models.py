@@ -1,18 +1,22 @@
 """Model families and model keys.
 
 The same rules live in ``static/models.js``. A run maps to a family (claude,
-cursor, muse, glm, deepseek, codex, dagster) and a model key such as
-``grok-4.7`` or ``composer-2.5``. DeepSeek ids map to ``deepseek-flash``
-(including the legacy ``deepseek-v4-flash`` and
-``deepseek-v4-flash-vision-exp`` aliases) or ``deepseek-v4-pro``. Codex ids
-(``gpt-*``, ``codex-*``, ``gpt-reserve``) map to the ``codex`` family under
-their lowercased id. A run whose model id was never recorded gets
+cursor, muse, glm, deepseek, beam, codex, commandcode, dagster) and a model
+key such as ``grok-4.7`` or ``composer-2.5``. DeepSeek ids map to
+``deepseek-flash`` (including the legacy ``deepseek-v4-flash`` and
+``deepseek-v4-flash-vision-exp`` aliases) or ``deepseek-v4-pro``. Any model
+id containing ``beam`` (case-insensitive) maps to the ``beam`` family under
+``beam-<ver>`` when the id carries a version (``reflection/Beam-1.0`` reads
+``beam-1.0``) else ``beam``, whichever harness ran it. Codex ids (``gpt-*``,
+``codex-*``, ``gpt-reserve``) map to the ``codex`` family under their
+lowercased id. A run whose model id was never recorded gets
 ``<family>-unknown``. A Grok CLI run whose model id is recorded but matches
 no known family (``mimo-*``, ``step-*``, or any other grok-hosted id) maps
 to ``other``: only an empty id falls back to ``glm-unknown``. A Dagster job
 keeps the job name after ``dagster:``. A Command Code run (tier or source
-``commandcode``, or one of the five free ids) maps to the ``commandcode``
-family under its id, and an empty id reads as ``commandcode-unknown``.
+``commandcode``, or one of the free ids) maps to the ``commandcode`` family
+under its id, and an empty id reads as ``commandcode-unknown`` (a Beam id
+under Command Code still reads as ``beam``).
 """
 
 from __future__ import annotations
@@ -46,6 +50,10 @@ def model_key(model: str | None, hint: str | None = None) -> tuple[str, str]:
     if "dagster" in h or m.startswith("dagster:"):
         job = m[len("dagster:") :] if m.startswith("dagster:") else m
         return "dagster", "dagster:" + (job or "job")
+    if "beam" in m or (not m and "beam" in h):
+        if not m:
+            return "beam", "beam-unknown"
+        return "beam", "beam" + _ver(r"beam[-_ ]?(\d+(?:\.\d+)?)", m)
     if "commandcode" in h or m in COMMANDCODE_FREE:
         return "commandcode", m or "commandcode-unknown"
     if "composer" in m:

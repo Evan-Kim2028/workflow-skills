@@ -19,6 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from dash.models import model_key, run_model_key
 from dash.pricing import band_for, cost, series_key, status
+from dash.store.util import TOOL_KEYS as LANES
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -511,7 +512,7 @@ class SnapshotAgreementTest(unittest.TestCase):
             conn.close()
 
 
-LANES = ("grok", "muse", "glm", "claude", "deepseek", "other")
+LANES = tuple(LANES)
 
 
 def _grok_run(store, run_id, model, start, end=None, status="done", label=None):

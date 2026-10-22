@@ -711,7 +711,7 @@
        active, and turn done at their done moment; unblocking a dependent
        flashes its arrows for about 600 ms. Live refresh stays frozen while
        the replay owns the card; Esc or Live rebuilds the live map. */
-    var RP_FAM = {opus: "var(--s1)", haiku: "var(--s2)", sonnet: "var(--s3)", grok: "var(--s4)", muse: "var(--s5)", glm: "var(--s6)", other: "var(--other)"};
+    var RP_FAM = {opus: "var(--s1)", haiku: "var(--s2)", sonnet: "var(--s3)", grok: "var(--s4)", muse: "var(--s5)", glm: "var(--s6)", beam: "var(--s11)", other: "var(--other)"};
     var RP_REDUCED = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
     var RP = {on: false, playing: false, loading: false, tasks: {}, prevDone: {}, savedCss: {}, elapsed: 0, duration: 15, raf: null, compress: false, warp: null, tlRuns: [], tl: null, groups: {}, clip: false};
     var replayBtn = el("button", {class: "planbtn", title: "Play this workstream's history as a sped-up animation", text: "Replay"});

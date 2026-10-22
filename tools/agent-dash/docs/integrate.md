@@ -295,7 +295,7 @@ ws4-WS4.1-notes-index	550e8400-e29b-41d4-a716-446655440000	1700000000	demo-model
 
 Status comes from the files: growing output means running, a SIGTERM trace in the err file means killed, an empty out file with a real error means died early, else done. The verdict comes from the first matching line of the out file (next section). Tokens do not travel this path; pair it with a `report usage` line or `generic.jsonl` usage lines. The shipped scratch glob is `$HOME/agent-scratch/*`, one directory deep; add deeper paths to `roots.scratchpads` and restart. Manifest rows prove liveness through out-file growth or a live sample of a shipped worker binary: a custom binary whose out file stays quiet reads `done` while it lives, and registering the folder does not revive it. When your binary is not one of the shipped launchers, report liveness with `report start` / `report usage` heartbeats / `report finish` instead of relying on the manifest alone.
 
-The live-agents tile counts the `grok`, `muse`, `glm`, `deepseek`, `other`, and `claude` buckets. Grok CLI runs split by model family: `deepseek-*` counts as DeepSeek, `glm-*` as GLM, anything else as Other. A generic run shows in the running table, on its task chip, and in tokens and cost either way; set `--tier` to the closest bucket only when the tile must count it.
+The live-agents tile counts the `grok`, `muse`, `glm`, `deepseek`, `beam`, `commandcode`, `codex`, `other`, and `claude` buckets. Grok CLI runs split by model family: `deepseek-*` counts as DeepSeek, `beam-*` as Beam, `glm-*` as GLM, anything else as Other. A generic run shows in the running table, on its task chip, and in tokens and cost either way; set `--tier` to the closest bucket only when the tile must count it.
 
 ### pi workers
 
