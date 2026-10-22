@@ -668,6 +668,59 @@ console.log("hover builders proof ok: " + seen.length + " strings compact");
             self.assertEqual(exec_hit, expected, f"index.html verified guard drifts on {label!r}")
             self.assertEqual(plan_hit, expected, f"plan.js verified guard drifts on {label!r}")
 
+    def test_canonical_label_rule_agrees_on_pages(self):
+        """A canonical ws<N>-<mark>-<slug>[-rK] label maps to the same plan
+        task in dash/taskmatch.py and in both page taskOf copies."""
+        import json as _json
+        import sys as _sys
+
+        _sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+        from dash import taskmatch
+
+        taskmap = {"WS4": {"ws4-exec-pinned": "WS4.zzz"}}
+        ids = {
+            "WS4": ["WS4.classify", "WS4.Fixtures", "WS4.classify-fixtures", "WS4.zzz"],
+            "WS5": ["WS5.classify"],
+            "WS7": ["WS7.LANDING"],
+        }
+        samples = [
+            ("WS4", "ws4-exec-classify", "WS4.classify"),
+            ("WS4", "ws4-review-classify-r2", "WS4.classify"),
+            ("WS4", "ws4-exec-fixtures-x", "WS4.Fixtures"),
+            ("WS4", "ws4-exec-FIXTURES", "WS4.Fixtures"),
+            ("WS4", "ws4-exec-classify-fixtures-r2", "WS4.classify-fixtures"),
+            ("WS4", "ws4-exec-missing", None),
+            ("WS4", "ws4-exec-pinned", "WS4.zzz"),
+            ("WS4", "ws5-exec-classify", None),
+            ("WS5", "ws4-exec-classify", None),
+            ("WS7", "ws7-exec-landing", "WS7.LANDING"),
+        ]
+        for ws, label, expected in samples:
+            self.assertEqual(
+                taskmatch.task_of(label, ws, taskmap, ids.get(ws, [])),
+                expected,
+                f"server canonical rule drifts on {label!r}",
+            )
+        harness = (
+            "var TASKMAP=" + _json.dumps(taskmap) + ";"
+            "var IDS=" + _json.dumps(ids) + ";"
+            "function planTaskIds(ws){return IDS[ws]||[];}"
+            "function taskmapGet(){return TASKMAP;}"
+            + _extract_taskof(STATIC / "index.html", "taskOfExec")
+            + _extract_taskof(STATIC / "plan.js", "taskOfPlan")
+            + "var SAMPLES=" + _json.dumps([[ws, label] for ws, label, _ in samples]) + ";"
+            "var OUT=SAMPLES.map(function(s){"
+            "return [taskOfExec({label:s[1]},s[0]),taskOfPlan({label:s[1]},s[0],IDS[s[0]]||[])];});"
+            "console.log(JSON.stringify(OUT));"
+        )
+        proc = subprocess.run(["node", "-e", harness], capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 0, proc.stderr or proc.stdout)
+        rows = _json.loads(proc.stdout)
+        self.assertEqual(len(rows), len(samples))
+        for (ws, label, expected), (exec_hit, plan_hit) in zip(samples, rows):
+            self.assertEqual(exec_hit, expected, f"plan-progress taskOf drifts on {label!r}")
+            self.assertEqual(plan_hit, expected, f"plan.js taskOf drifts on {label!r}")
+
     def test_plan_map_layout_helpers(self):
         """The plan card's layout helpers behave like dash/maplayout.py:
         shortChipLabel strips the WS prefix and caps at 14 chars, layoutOf
@@ -807,6 +860,43 @@ console.log("hover builders proof ok: " + seen.length + " strings compact");
             "Each tile is a section of the plan",
         ):
             self.assertIn(kept, card, f"plan-progress.js lost {kept!r}")
+
+    def test_linear_header_renders_no_anchor_without_a_url(self):
+        """linearHeader renders the Linear anchor only for a non-empty url;
+        a null url keeps the sync-age text and never emits href="null"."""
+        card = (STATIC / "cards" / "plan-progress.js").read_text()
+        start = card.index("function linearHeader(")
+        depth = 0
+        end = None
+        for i in range(card.index("{", start), len(card)):
+            if card[i] == "{":
+                depth += 1
+            elif card[i] == "}":
+                depth -= 1
+                if depth == 0:
+                    end = i + 1
+                    break
+        self.assertIsNotNone(end, "linearHeader body did not close")
+        script = (
+            "const assert=require('assert');"
+            "var state={wss:[]};"
+            "function el(tag,attrs){return {tag:tag,attrs:attrs||{}};}"
+            "function fmtDate(x){return 'date';}"
+            "function fmtDur(x){return '2m';}"
+            + card[start:end] + ";"
+            "var out=linearHeader({ws:'WS9',linear:{url:null,synced_at:null}},100);"
+            "assert.strictEqual(out.length,1);assert.strictEqual(out[0].tag,'span');"
+            "out=linearHeader({ws:'WS9',linear:{url:null,synced_at:50}},100);"
+            "assert.strictEqual(out.length,1);assert.strictEqual(out[0].attrs.class,'linear-sync');"
+            "out=linearHeader({ws:'WS9',linear:{url:'',synced_at:50}},100);"
+            "assert.ok(out.every(function(n){return n.tag!=='a';}));"
+            "out=linearHeader({ws:'WS9',linear:{url:'https://linear.app/x/project/y',synced_at:50}},100);"
+            "assert.strictEqual(out.length,2);assert.strictEqual(out[0].tag,'a');"
+            "assert.strictEqual(out[0].attrs.href,'https://linear.app/x/project/y');"
+            "assert.deepStrictEqual(linearHeader({ws:'WS9'},1),[]);"
+        )
+        proc = subprocess.run(["node", "-e", script], capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 0, proc.stderr or proc.stdout)
 
     def test_plan_legend_is_always_visible(self):
         """The map legend is an always-visible list under the intro line,
@@ -3205,7 +3295,7 @@ class FinalPolishTests(unittest.TestCase):
             "var window = {};\n"
             "eval(fs.readFileSync(process.argv[2], 'utf8'));\n"
             "assert.strictEqual(window.AD.fmtDur(90), '1m 30s');\n"
-            "assert.strictEqual(window.AD.fmtDur(579599), '160h 59m');\n"
+            "assert.strictEqual(window.AD.fmtDur(579599), '6d 16h');\n"
             "assert.strictEqual(window.AD.fmtDur(359.6), '5m 59s');\n"
             "console.log('fmtDur proof ok');\n"
         )
@@ -3219,6 +3309,26 @@ class FinalPolishTests(unittest.TestCase):
             )
         self.assertEqual(proc.returncode, 0, proc.stderr or proc.stdout)
         self.assertIn("fmtDur proof ok", proc.stdout)
+
+    def test_fmt_durations_read_in_days_and_years(self):
+        """Below 48h the hour form is unchanged; from 48h durations read in
+        days ("2d 3h", then whole days to 14d) and from 365d in years."""
+        script = (
+            "const fs=require('fs');"
+            "const src=fs.readFileSync(process.argv[1],'utf8').replace('})(window);','})(global);');"
+            "eval(src);"
+            "const want=[[0,'0s'],[90,'1m 30s'],[359.6,'5m 59s'],[3599,'59m 59s'],"
+            "[172799,'47h 59m'],[172800,'2d 0h'],[183610,'2d 3h'],[579599,'6d 16h'],"
+            "[7200,'2h 0m'],[120,'2m 0s'],[1209599,'13d 23h'],[1209600,'14d'],[1227600,'14d'],[31535999,'364d'],"
+            "[31536000,'1y'],[34560000,'1y 35d'],[-5,'0s'],[NaN,'\\u2013'],[null,'\\u2013'],[undefined,'\\u2013']];"
+            "for (const [v,w] of want) { const got=AD.fmtDur(v); if (got!==w) { console.error(String(v)+' -> '+got+' want '+w); process.exit(1); } }"
+        )
+        proc = subprocess.run(
+            ["node", "-e", script, str(STATIC / "format.js")],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr or proc.stdout)
 
     def test_archive_confirm_never_uses_window_confirm(self):
         """The archive confirm is an inline popover, never window.confirm:
@@ -3323,8 +3433,8 @@ class FinalPolishTests(unittest.TestCase):
         )
         self.assertEqual(
             [ident for _, ident in both],
-            ["tiles", "running", "plan", "activity", "finished"],
-            "exec order drifted: want the activity stack between plan and finished",
+            ["tiles", "running", "plan", "linear", "activity", "finished"],
+            "exec order drifted: want the Linear card and the activity stack between plan and finished",
         )
         for gone in ('"tokens"', '"gantt"', '"conc"', '"progress"'):
             self.assertNotIn(
@@ -4296,6 +4406,219 @@ class TableColumnTests(unittest.TestCase):
             for m in re.finditer(r'\[\s*"([A-Za-z? ]+)",\s*"(c-[a-z]+)"\s*\]', path.read_text()):
                 self.assertIn(m.group(2), COLUMN_MODIFIERS,
                               f"{path.name} pairs a header with a non-column class: {m.group(0)[:80]}")
+
+
+    def test_linear_link_and_sync_age_follow_page_rules(self):
+        """The plan header Linear link is a real external link with an
+        accessible name, the sync age is a muted line with the exact time
+        in its title, both hide in clip mode, the new CSS uses tokens only,
+        and the code names no doctor or health state and formats nothing
+        with toFixed or toLocaleString."""
+        import json as _json
+        src = (STATIC / "cards" / "plan-progress.js").read_text()
+        body = dict(functions(src))["linearHeader"]
+        for needle in ('el("a"', 'class: "linear-link"', 'target: "_blank"', 'rel: "noopener"', '"aria-label": "Open "', 'class: "linear-sync"'):
+            self.assertIn(needle, body, f"linearHeader lost {needle}")
+        for word in ("doctor", "health"):
+            self.assertNotIn(word, body.lower(), f"linearHeader carries a {word!r} word")
+        for bad in (".toFixed(", "toLocaleString"):
+            self.assertNotIn(bad, body, f"linearHeader formats with {bad}")
+        css = (STATIC / "cards" / "plan-progress.css").read_text()
+        clip = [line for line in css.splitlines() if "body.clip #exec-progress .linear-link" in line]
+        self.assertTrue(clip, "the Linear link is not hidden in clip mode")
+        self.assertIn("body.clip #exec-progress .linear-sync", clip[0])
+        self.assertIn("display:none", clip[0])
+        tokens = (STATIC / "tokens.css").read_text()
+        for name in set(re.findall(r"var\((--[\w-]+)\)", "\n".join(l for l in css.splitlines() if "linear-" in l))):
+            self.assertIn(f"{name}:", tokens, f"{name} is not a tokens.css token")
+        ws = (STATIC / "cards" / "ws-cards.js").read_text()
+        self.assertIn('class: "linear-link"', ws, "the Where-we-are row has no Linear link")
+        self.assertIn("planLinear[w.ws]", ws, "the Where-we-are row reads no linear field")
+        harness = (
+            "const fs=require('fs');const assert=require('assert');"
+            "globalThis.window=globalThis;"
+            "globalThis.location={search:'',pathname:'/'};"
+            "function fakeNode(tag){"
+            " var n={tag:tag,attrs:{},kids:[],textContent:'',_on:{},"
+            "  setAttribute:function(k,v){this.attrs[k]=v;},"
+            "  appendChild:function(c){this.kids.push(c);return c;},"
+            "  addEventListener:function(t,f){this._on[t]=f;}};"
+            " return n;}"
+            "globalThis.document={createElement:fakeNode,getElementById:function(){return null;},querySelector:function(){return null;}};"
+            "eval(fs.readFileSync(process.argv[1],'utf8'));"
+            "eval(fs.readFileSync(process.argv[2],'utf8'));"
+            "var fmtDur=AD.fmtDur,fmtDate=AD.fmtDate;"
+            "var state={wss:[{ws:'WS1',name:'Identity'}]};"
+            "eval(" + _json.dumps(body) + ");"
+            "assert.deepStrictEqual(linearHeader({ws:'WS1'},1761999960),[]);"
+            "var a=linearHeader({ws:'WS1',linear:{url:'https://linear.app/example/project/notes-cutover',synced_at:1761999720}},1761999960);"
+            "assert.strictEqual(a.length,2);"
+            "assert.strictEqual(a[0].tag,'a');"
+            "assert.strictEqual(a[0].attrs.target,'_blank');"
+            "assert.strictEqual(a[0].attrs.rel,'noopener');"
+            "assert.strictEqual(a[0].attrs['aria-label'],'Open Identity in Linear');"
+            "assert.strictEqual(a[0].attrs.href,'https://linear.app/example/project/notes-cutover');"
+            "assert.strictEqual(a[1].textContent,'synced 4m 0s ago');"
+            "assert.strictEqual(a[1].attrs.title,AD.fmtDate(1761999720));"
+            "var n=linearHeader({ws:'WS1',linear:{url:'https://linear.app/x',synced_at:null}},1761999960);"
+            "assert.strictEqual(n[1].textContent,'not synced yet');"
+        )
+        proc = subprocess.run(
+            ["node", "-e", harness, str(STATIC / "format.js"), str(STATIC / "core" / "el.js")],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr or proc.stdout)
+
+
+class LinearCardRulesTests(unittest.TestCase):
+    """The Linear card: chart on the shared axes(), real links, tooltips without raw numbers, glyph plus word states, tokens only."""
+
+    def setUp(self):
+        self.js = (STATIC / "cards" / "linear.js").read_text()
+        self.css = (STATIC / "cards" / "linear.css").read_text()
+        self.registry = (STATIC / "cards" / "registry.js").read_text()
+        self.page = (STATIC / "index.html").read_text()
+
+    def test_chart_uses_shared_axes_helper(self):
+        self.assertIn("axes(svg, {", self.js)
+        self.assertIn("yFmt: fmtN", self.js)
+        self.assertIn("yTitle:", self.js)
+        self.assertIn('"Status changes by source. "', self.js)
+
+    def test_legend_pairs_swatch_glyph_and_word(self):
+        self.assertIn('list.className = "lin-legend"', self.js)
+        self.assertIn('SOURCE[key].glyph + " " + SOURCE[key].word', self.js)
+        self.assertIn('glyph: "■", word: "Local"', self.js)
+        self.assertIn('glyph: "◆", word: "Linear"', self.js)
+        self.assertIn('sw.setAttribute("aria-hidden", "true")', self.js)
+
+    def test_tooltips_use_compact_numbers_only(self):
+        tips = re.findall(r"tipOn\(mark, [^\n]+", self.js)
+        self.assertTrue(tips, "the bars carry no tooltip")
+        for line in tips:
+            self.assertNotRegex(line, r'v: "\s*\+|String\(|toFixed', line)
+        self.assertIn('v: fmtN(n) + " changes"', self.js)
+        self.assertIn("showTip(ev, title, rows)", self.js)
+        self.assertIn('node.addEventListener("focus"', self.js)
+
+    def test_bars_are_keyboard_reachable(self):
+        self.assertIn('tabindex: "0"', self.js)
+
+    def test_linear_links_open_in_new_tab_with_label(self):
+        self.assertIn('target: "_blank", rel: "noopener"', self.js)
+        self.assertGreaterEqual(self.js.count('"aria-label": "Open '), 2)
+        self.assertIn('text: "Linear ↗"', self.js)
+        self.assertIn(r"/^https:\/\//", self.js)
+
+    def test_sync_state_is_glyph_plus_word(self):
+        for glyph, word in (("✓", "Synced"), ("◔", "Queued"), ("⚠", "Sync error")):
+            self.assertIn('glyph: "%s", word: "%s"' % (glyph, word), self.js)
+        self.assertIn('class: "lin-state"', self.js)
+        self.assertIn(".lin-state{font-weight:650}", self.css)
+
+    def test_sign_in_word_never_shows_a_token(self):
+        self.assertIn("Signed in (browser)", self.js)
+        self.assertIn("Not signed in", self.js)
+        self.assertNotIn("access_token", self.js)
+
+    def test_colours_come_from_tokens_only(self):
+        for name, text in (("linear.js", self.js), ("linear.css", self.css)):
+            self.assertIsNone(re.search(r"#[0-9a-fA-F]{3,8}\b", text), name + " hard-codes a hex colour")
+            self.assertIsNone(re.search(r"\brgba?\(", text), name + " hard-codes an rgb colour")
+        self.assertIn("var(--s7)", self.js)
+        self.assertIn("var(--muted)", self.js)
+
+    def test_bars_are_named_images_and_status_lookup_uses_own_keys(self):
+        self.assertIn('role: "img"', self.js)
+        self.assertIn('"aria-label": d.label + ", " + SOURCE[key].word + ": " + fmtN(n) + " changes"', self.js)
+        self.assertIn("Object.prototype.hasOwnProperty.call(STATUS_WORD, row.from)", self.js)
+        self.assertNotIn("STATUS_WORD[row.from] ||", self.js)
+        self.assertNotIn("STATUS_WORD[row.to] ||", self.js)
+
+
+    def test_no_number_formatting_outside_the_helpers(self):
+        self.assertNotIn("toFixed(", self.js)
+        self.assertNotIn("toLocaleString(", self.js)
+
+    def test_card_hides_when_empty_and_filters_on_workstream_tabs(self):
+        self.assertIn("if (!data || !data.workstreams || !data.workstreams.length) return null;", self.js)
+        self.assertIn("linFilter(data.workstreams, state.ws)", self.js)
+        self.assertIn('if (!ws || ws === "all") return all;', self.js)
+
+    def test_registry_line_is_scope_both(self):
+        self.assertRegex(self.registry, r'\{id: "linear", order: \d+, scope: "both"')
+
+    def test_page_loads_card_assets(self):
+        self.assertIn('href="/static/cards/linear.css"', self.page)
+        self.assertIn('src="/static/cards/linear.js"', self.page)
+        self.assertLess(self.page.index("/static/cards/linear.js"), self.page.index("/static/cards/registry.js"))
+
+    def test_recent_changes_use_shared_disclosure(self):
+        self.assertIn('discloseRows(recentAll, "linear-recent", "changes")', self.js)
+        self.assertIn("discloseButton(info,", self.js)
+        self.assertIn("discloseRedraw(LIN_SEC", self.js)
+
+    def test_section_key_has_no_clock_or_randomness(self):
+        key_line = [line for line in self.js.splitlines() if "keyOf([linSeq" in line]
+        self.assertEqual(len(key_line), 1)
+        self.assertNotIn("Date", key_line[0])
+        self.assertNotIn("Math.random", key_line[0])
+
+    def test_links_use_the_link_colour_token_with_aa_contrast(self):
+        """Linear links take --accent (never --accent-ink, which is the text-on-fill ink and vanishes on the card) pulled toward --ink so they clear 4.5:1 on the card in both themes."""
+        rule = re.search(r"\.lin-link\{[^}]*\}", self.css)
+        self.assertIsNotNone(rule, "linear.css lost the .lin-link rule")
+        self.assertNotIn("--accent-ink", rule.group(0))
+        self.assertIn("color-mix(in srgb,var(--accent) 85%,var(--ink))", rule.group(0))
+        tokens = (STATIC / "tokens.css").read_text()
+
+        def var(block, name):
+            m = re.search(block + r"\s*\{([^}]*)\}", tokens, re.S)
+            self.assertIsNotNone(m, f"tokens.css lost {block}")
+            m2 = re.search(re.escape(name) + r":\s*(#[0-9a-fA-F]{6})", m.group(1))
+            self.assertIsNotNone(m2, f"tokens.css lost {name} in {block}")
+            return m2.group(1)
+
+        def mix(a, b, p):
+            a, b = a.lstrip("#"), b.lstrip("#")
+            return "#" + "".join("%02x" % round(int(a[i:i + 2], 16) * p + int(b[i:i + 2], 16) * (1 - p)) for i in (0, 2, 4))
+
+        for theme, block in (("dark", r":root"), ("light", r':root\[data-theme="light"\]')):
+            link = mix(var(block, "--accent"), var(block, "--ink"), 0.85)
+            card = var(block, "--card")
+            ratio = _ratio(link, card)
+            self.assertGreaterEqual(ratio, 4.5, f"{theme} Linear link contrast {ratio:.2f} on the card")
+
+    def test_count_axis_ticks_are_integers(self):
+        """The count chart's y ticks land on whole numbers for every max: linScale picks a tick count that divides the niceMax ceiling."""
+        charts = (STATIC / "core" / "charts.js").read_text()
+        nice = re.search(r"  function niceMax\(v\)[^\n]*\n", charts)
+        self.assertIsNotNone(nice, "core/charts.js lost niceMax")
+        start = self.js.index("  function linScale(")
+        end = self.js.index("\n  }\n", start) + len("\n  }\n")
+        script = (
+            "const assert=require('assert');"
+            + nice.group(0)
+            + self.js[start:end]
+            + "for(var max=0;max<=5000;max++){"
+            "var sc=linScale(max);var n=sc.yTicks;"
+            "assert.ok(Number.isInteger(sc.yMax),'yMax not integer at '+max);"
+            "assert.ok(Number.isInteger(n)&&n>0,'tick count not integer at '+max);"
+            "assert.strictEqual(sc.yMax%n,0,'fractional tick at max '+max+': '+sc.yMax+'/'+n);"
+            "}"
+            "assert.strictEqual(linScale(5).yTicks,5);assert.strictEqual(linScale(3).yMax,5);"
+        )
+        proc = subprocess.run(["node", "-e", script], capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 0, proc.stderr or proc.stdout)
+        self.assertIn("yTicks: scale.yTicks", self.js)
+
+    def test_count_chart_stays_at_one_to_one_on_phones(self):
+        """The chart renders at its own pixel width (linWidth), so its 11 px axis text is not scaled down on a 390 px phone."""
+        self.assertIn("function linWidth(", self.js)
+        self.assertIn("width: W, height: H", self.js)
+        self.assertNotIn("width:100%;height:auto;display:block;max-height", self.css)
+        self.assertIn(".lin-svg{max-width:100%", self.css)
 
 
 if __name__ == "__main__":

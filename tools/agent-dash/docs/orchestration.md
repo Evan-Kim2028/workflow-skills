@@ -57,6 +57,18 @@ Tails measured ran 0.6–5.6 h and were fix rounds, not first-pass work. The
 fix is Principle 8: bound fix rounds, then split or reassign the slow lane
 instead of holding the wave.
 
+## Throughput rules
+
+The twelve principles say what must hold; the throughput rules say how the
+lead keeps it holding. A lead refills the wave on every worker completion,
+runs every wait on a background watcher, and groups production steps by area
+so independent areas run in parallel while each area stays serial. Each
+production batch carries one approval row and one rollback line. Work is
+committed and pushed per task, and the tracker is updated in the same step as
+each event. These rules have no measurements yet; each has a check that names
+an observable. The short form, T1 to T5, is in the
+[workstream-orchestration skill](../../../skills/workstream-orchestration/SKILL.md#throughput-rules).
+
 ## The principles
 
 ### 1. Keep the ready queue empty

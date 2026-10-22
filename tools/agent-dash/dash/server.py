@@ -83,15 +83,19 @@ def _plan_extra_cached(ws: str, body: dict) -> dict:
 
 
 def _plan_map_cached(ws: str, body: dict) -> dict:
-    """``{"layout", "map_warnings"}`` cached by plan mtime."""
-    from dash import maplayout
+    """``{"layout", "map_warnings"}`` cached by plan mtime and linear.json stamp.
+
+    The layout's chip tooltips carry Linear identifiers, so a link edit
+    must miss the cache even when plan.json is untouched.
+    """
+    from dash import linear, maplayout
     from dash.bundles import bundle_dir
 
     mtime = None
     try:
         path = bundle_dir(ws)
         if path is not None:
-            mtime = (path / "plan.json").stat().st_mtime_ns
+            mtime = ((path / "plan.json").stat().st_mtime_ns, linear.stamp(ws))
     except OSError:
         mtime = None
     if mtime is not None:
@@ -356,6 +360,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._approvals(query)
             elif path == "/api/decisions":
                 self._decisions()
+            elif path == "/api/linear":
+                self._linear()
             elif path == "/api/risks":
                 self._risks()
             elif path == "/api/project/feed":
@@ -1196,6 +1202,12 @@ class Handler(BaseHTTPRequestHandler):
         """``GET /api/decisions``: hub decisions, newest first, read-only."""
         from dash.decisions import decisions_payload, resolve_hub_dir
         self._json(200, decisions_payload(resolve_hub_dir(self.server.cfg)))
+
+    def _linear(self):
+        """``GET /api/linear``: the Linear card payload, read-only, cached by bundle stamps. Never a token."""
+        from dash.linearview import cached
+        self._json(200, cached(time.time()))
+
     def _risks(self):
         """``GET /api/risks``: computed risks first, then hub file rows."""
         from dash.decisions import risks_payload

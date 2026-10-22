@@ -11,6 +11,7 @@ import fcntl
 import json
 import os
 import re
+import shlex
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -75,6 +76,11 @@ WS_USAGE = """agent-dash workstream bundles
   python3 agent_dash.py ws gates <ID> [--json]
   python3 agent_dash.py ws deferred [<ID>] [--json]
   python3 agent_dash.py ws layout <ID> [--json]
+  python3 agent_dash.py ws linear <link|sync|status|unlink> <ID> [--team KEY] [--json]
+  python3 agent_dash.py ws linear comment <ID> <TASK-ID> <TEXT...>
+  python3 agent_dash.py ws linear update <ID> [--health on-track|at-risk|off-track] [--dry-run]
+  python3 agent_dash.py ws linear login
+  python3 agent_dash.py ws linear logout
 
 Status is todo, wip, pr, prog, done, or deferred. deferred may set --moved-to and --note.
 Workstream state is planned, active, paused, done, archived, or dropped (default active).
@@ -300,9 +306,12 @@ def load_bundle_api(ws: str) -> dict | None:
     }
 
 
-def _view_groups(value) -> list:
+def _view_groups(value, links: dict | None = None) -> list:
+    """Plan groups as the dashboard view carries them. ``links`` maps task id
+    to its Linear ``{identifier, url}``; a task with an entry gains ``linear``."""
     if not isinstance(value, list):
         return []
+    links = links or {}
     groups = []
     for item in value:
         if not isinstance(item, dict):
@@ -338,6 +347,8 @@ def _view_groups(value) -> list:
                 row["fresh_hours"] = fresh
             if isinstance(task.get("received_as"), str):
                 row["received_as"] = task.get("received_as")
+            if isinstance(row["id"], str) and row["id"] in links:
+                row["linear"] = links[row["id"]]
             tasks.append(row)
         groups.append({"id": item.get("id"), "col": item.get("col"), "title": item.get("title"), "tasks": tasks})
     return groups
@@ -415,13 +426,16 @@ def plans_map_stamps() -> tuple:
 
 
 def plans_stamp(root: Path | None = None) -> tuple:
-    """``(mtime_ns, size)`` of every bundle ``plan.json`` and ``bundle.json``.
+    """``(mtime_ns, size)`` of every bundle ``plan.json``, ``bundle.json`` and
+    ``linear.json``.
 
     The workstream-row cache keys on this: row progress reads the plans
     and fallback rows read bundle titles (lifecycle state rides the
     caller's metadata map), so a bundle edit retags precisely and
     untouched bundles never re-read.
     """
+    from dash import linear
+
     base = Path(root) if root is not None else workstreams_root()
     try:
         children = sorted(
@@ -432,7 +446,7 @@ def plans_stamp(root: Path | None = None) -> tuple:
     except OSError:
         return ()
     stamps = [
-        (_file_stamp(child / "plan.json"), _file_stamp(child / "bundle.json"))
+        (_file_stamp(child / "plan.json"), _file_stamp(child / "bundle.json"), linear.stamp(child.name, base))
         for child in children
     ]
     try:
@@ -452,11 +466,14 @@ def bundle_plan_view(ws: str) -> dict | None:
     """
     import copy
 
+    from dash import linear
+
     path = bundle_dir(ws)
     if path is None:
         return None
     base = str(path.parent)
     stamps = tuple(_file_stamp(path / name) for name in ("plan.json", "bundle.json", "approvals.json", "START-PROMPT.md"))
+    stamps += (linear.stamp(ws),)
     lock = _plan_view_lock()
     with lock:
         hit = _PLAN_VIEW_CACHE.get((base, ws))
@@ -476,7 +493,7 @@ def bundle_plan_view(ws: str) -> dict | None:
     for item in narrative.get("phases") or []:
         if isinstance(item, dict):
             phases.append({"name": item.get("name"), "goal": item.get("goal"), "gate": item.get("gate")})
-    groups = _view_groups(dag.get("groups"))
+    groups = _view_groups(dag.get("groups"), linear.task_links(ws))
     view = {
         "ws": ws,
         "cols": cols,
@@ -488,6 +505,9 @@ def bundle_plan_view(ws: str) -> dict | None:
         "start_prompt": start_prompt_text(ws),
         "issues": validate_bundle(ws),
     }
+    page_link = linear.page_link(ws)
+    if page_link is not None:
+        view["linear"] = page_link
     with lock:
         if len(_PLAN_VIEW_CACHE) > 256:
             _PLAN_VIEW_CACHE.clear()
@@ -641,8 +661,67 @@ def _template_start_prompt(ws: str, title: str) -> str:
     )
 
 
+def _stable_tool_dir(tool_dir: Path) -> Path:
+    """The tool directory, written through ``releases/CURRENT`` when it is a release.
+
+    A deployed tool runs from ``<X>/releases/<sha>/tools/agent-dash`` (or from a
+    flat ``<X>/releases/<sha>``). When ``<X>/releases/CURRENT`` resolves to that
+    same release, the path goes through the stable link so it survives the next
+    deploy. Any other directory keeps its own path.
+    """
+    tool_dir = Path(tool_dir)
+    candidates = []
+    if tool_dir.parent.name == "tools" and len(tool_dir.parents) >= 2:
+        release = tool_dir.parents[1]
+        candidates.append((release, tool_dir.relative_to(release)))
+    candidates.append((tool_dir, Path(".")))
+    for release, rel in candidates:
+        current = release.parent / "CURRENT"
+        if release.parent.name != "releases" or not current.exists():
+            continue
+        if os.path.realpath(current) == os.path.realpath(release):
+            return current / rel
+    return tool_dir
+
+
+def linear_start_section(ws: str, root: Path | None = None) -> str:
+    """The generated Linear section appended to the start prompt of a linked bundle.
+
+    It names the running tool's ``agent_dash.py`` by absolute path, so the
+    commands work from any cwd. It is generated, never written into START-PROMPT.md.
+    """
+    from dash import linear
+
+    page = linear.page_link(ws, root) or {}
+    url = page.get("url") or "not synced yet; run the status command below"
+    tool = shlex.quote(str(_stable_tool_dir(Path(__file__).resolve().parents[1]) / "agent_dash.py"))
+    py = f"python3 {tool}"
+    return "\n".join(
+        [
+            "## Linear",
+            "",
+            f"Project: {url}",
+            "Status syncs both ways within a minute; the plan owns titles, descriptions and the tracker section.",
+            "",
+            "Your duties for this workstream:",
+            f"1. Change task status only with `{py} ws task {ws} <task-id> <status>`.",
+            f"2. After each worker verdict, post one line with `{py} ws linear comment {ws} <task-id> \"<verdict> <PR link>\"`.",
+            f"3. Put the `Fixes ...` line from `{py} ws trains {ws}` in every train PR body.",
+            f"4. Post `{py} ws linear update {ws}` before standup, or rely on `tracker.update.daily_hour` when it is set. Add `--health at-risk` or `--health off-track` when the workstream is at risk.",
+            f"5. At the start of each session, check `{py} ws linear status {ws}` and `{py} doctor`.",
+            "6. Read issues with a Linear MCP tool when one is available. Never edit issue titles or descriptions in Linear.",
+            f"7. Approvals labelled `approval` are decided by the owner in Linear or with `{py} ws approve {ws} <item-id> approved|denied`.",
+            "",
+        ]
+    )
+
+
 def start_prompt_text(ws: str, root: Path | None = None) -> str | None:
-    """Text of START-PROMPT.md, or None when the bundle has no such file."""
+    """Text of START-PROMPT.md, or None when the bundle has no such file.
+
+    A Linear-linked bundle gets the generated Linear section appended; an
+    unlinked bundle gets the file text unchanged.
+    """
     path = bundle_dir(ws, root)
     if path is None:
         return None
@@ -655,7 +734,13 @@ def start_prompt_text(ws: str, root: Path | None = None) -> str | None:
         return None
     if not text.strip():
         return None
-    return text
+    from dash import linear
+
+    if not linear.is_linked(ws, root):
+        return text
+    if not text.endswith("\n"):
+        text += "\n"
+    return text + "\n" + linear_start_section(ws, root)
 
 
 def cmd_new(ws: str, title: str, root: Path | None = None, state: str = "active") -> int:
@@ -1039,7 +1124,20 @@ def set_approval(
     conditions: str | None,
     note: str | None,
     root: Path | None = None,
+    origin: str = "local",
 ) -> int:
+    """Set one approval item's status and write approvals.json.
+
+    ``origin="local"`` (the owner's ``ws approve``) records the change in the
+    Linear outbox while the bundle ``.lock`` is held, so a concurrent pull
+    either sees the row or has not read the old value yet. ``origin="linear"``
+    (a pull) writes nothing and returns ``errors.SKIPPED_PENDING`` when a local
+    row for the item is still in the outbox; the local decision wins and
+    reaches Linear on the next flush. Decisions made with ``origin="linear"``
+    record ``decided_by="linear"``, others ``"owner"``.
+    """
+    from dash import linear
+
     if not _ITEM.match(item_id):
         print(f"bad approval id {item_id!r}: use letters, digits, _, ., - (max 64 chars)", flush=True)
         return errors.USAGE
@@ -1052,6 +1150,8 @@ def set_approval(
         return errors.NOT_FOUND
     file = path / "approvals.json"
     with _bundle_lock(path):
+        if origin == "linear" and linear.has_pending(ws, "approval", item_id, root):
+            return errors.SKIPPED_PENDING
         if file.is_file():
             data = _read_json(file)
             if not isinstance(data, dict):
@@ -1096,7 +1196,7 @@ def set_approval(
                 found["note"] = note
         if status in ("approved", "denied"):
             data["decided_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-            data["decided_by"] = "owner"
+            data["decided_by"] = "linear" if origin == "linear" else "owner"
         else:
             data.setdefault("decided_at", None)
             data.setdefault("decided_by", None)
@@ -1107,6 +1207,8 @@ def set_approval(
             "items": items,
         }
         _atomic_write(file, json.dumps(payload, indent=2, ensure_ascii=False) + "\n")
+        if origin == "local":
+            linear.enqueue(ws, "approval", item_id, root=root)
     print(f"{ws} {item_id} {status}")
     return 0
 
@@ -1472,7 +1574,19 @@ def set_task(
     note: str | None,
     root: Path | None = None,
     force: bool = False,
+    origin: str = "local",
 ) -> int:
+    """Set one task's status in plan.json and append history.
+
+    ``origin="local"`` (the owner's ``ws task``) records the change in the
+    Linear outbox while the bundle ``.lock`` is held, so a concurrent pull
+    either sees the row or has not read the old value yet. ``origin="linear"``
+    (a pull) writes nothing, appends no history and prints nothing, and
+    returns ``errors.SKIPPED_PENDING`` when a local row for the task is still
+    in the outbox; the local status wins and reaches Linear on the next flush.
+    """
+    from dash import linear
+
     if status not in STATUSES:
         print(f"unknown status {status!r}. Use one of: {', '.join(STATUSES)}", flush=True)
         for key in STATUSES:
@@ -1493,6 +1607,8 @@ def set_task(
         return errors.NOT_FOUND
     plan_path = path / "plan.json"
     with _bundle_lock(path):
+        if origin == "linear" and linear.has_pending(ws, "task", task_id, root):
+            return errors.SKIPPED_PENDING
         data = _read_json(plan_path)
         if not isinstance(data, dict):
             print(errors.plan_unreadable(ws), flush=True)
@@ -1530,8 +1646,10 @@ def set_task(
             print(errors.task_not_found(ws, task_id, known), flush=True)
             return errors.NOT_FOUND
         _atomic_write(plan_path, json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+        if origin == "local":
+            linear.enqueue(ws, "task", task_id, root=root)
     if old_status != status:
-        append_history(ws, task_id, old_status, status, root=root)
+        append_history(ws, task_id, old_status, status, root=root, by=origin if origin != "local" else None)
     print(f"{ws} {task_id} {status}")
     return 0
 
@@ -1543,8 +1661,11 @@ def append_history(
     to_status: str,
     root: Path | None = None,
     now: float | None = None,
+    by: str | None = None,
 ) -> None:
     """Append one ``{ts, task, from, to}`` line to the bundle's history file.
+
+    ``by`` names the writer when it is not the local owner (``"linear"``).
 
     The plan write above stays temp-file-plus-replace; a history line is a
     single append, flushed and fsynced so one line is atomic. A failed
@@ -1559,6 +1680,8 @@ def append_history(
     row: dict = {"ts": _time.time() if now is None else now, "task": task_id, "to": to_status}
     if isinstance(from_status, str) and from_status:
         row["from"] = from_status
+    if by is not None:
+        row["by"] = by
     try:
         with open(path / "history.jsonl", "a", encoding="utf-8") as handle:
             handle.write(json.dumps(row, ensure_ascii=False) + "\n")
@@ -1588,6 +1711,7 @@ def set_train(
     gate: str | None = None,
     note: str | None = None,
     root: Path | None = None,
+    origin: str = "local",
 ) -> int:
     if not isinstance(train_id, str) or not _TRAIN_ID.match(train_id):
         print(f"bad train id {train_id!r}: use letters, digits, ., _, - (max 40 chars)", flush=True)
@@ -1719,29 +1843,38 @@ def print_trains(ws: str, root: Path | None = None, json_mode: bool = False) -> 
     if rows is False:
         _say(errors.plan_unreadable(ws), json_mode)
         return errors.INVALID_DATA
+    from dash import linear
+
+    linked = linear.is_linked(ws, root)
+    if linked:
+        from dash import linear_sync
+
+        for item in rows:
+            item["linear_refs"] = linear_sync.train_refs(ws, item, root)
     if json_mode:
         errors.emit_json({"ws": ws, "trains": rows})
         return 0
     if not rows:
         print("(no trains)")
         return 0
-    print("TRAIN\tSTATUS\tBRANCH\tPR\tMEMBERS\tSHARED")
+    header = "TRAIN\tSTATUS\tBRANCH\tPR\tMEMBERS\tSHARED"
+    header += "\tLINEAR" if linked else ""
+    print(header)
     for item in rows:
         members = item.get("members") or []
         member_text = ",".join(f"{member}({dag_status.get(member, '?')})" for member in members) or "-"
         shared = item.get("shared_files") or []
-        print(
-            "\t".join(
-                [
-                    _cell(item.get("id")),
-                    _cell(item.get("status")),
-                    _cell(item.get("branch") or "-"),
-                    _cell(item.get("pr") if item.get("pr") is not None else "-"),
-                    _cell(member_text),
-                    str(len(shared)),
-                ]
-            )
-        )
+        cells = [
+            _cell(item.get("id")),
+            _cell(item.get("status")),
+            _cell(item.get("branch") or "-"),
+            _cell(item.get("pr") if item.get("pr") is not None else "-"),
+            _cell(member_text),
+            str(len(shared)),
+        ]
+        if linked:
+            cells.append(_cell(item.get("linear_refs") or "-"))
+        print("\t".join(cells))
     return 0
 
 
@@ -2117,6 +2250,127 @@ def print_deferred(ws: str | None, json_mode: bool = False) -> int:
     return 0
 
 
+LINEAR_SUBCOMMANDS = ("link", "sync", "status", "unlink", "comment", "update")
+LINEAR_COMMENT_LIMIT_HINT = "Run: python3 agent_dash.py ws linear comment <ID> <TASK-ID> <TEXT...>"
+
+
+def _cmd_linear_auth(args: list[str], team: str | None) -> int:
+    """``ws linear login`` and ``ws linear logout``: the account sign-in, no flags and no workstream id."""
+    from dash import linear_auth
+
+    sub, rest = args[0], args[1:]
+    if team is not None or rest:
+        print(f"ws linear {sub} takes no arguments. Run: python3 agent_dash.py ws linear {sub}", flush=True)
+        return errors.USAGE
+    if sub == "logout":
+        return linear_auth.logout()
+    return linear_auth.login()
+
+
+def _cmd_linear_comment(args: list[str]) -> int:
+    """``ws linear comment <WS> <TASK-ID> <TEXT...>``: queue one comment on the task's Linear issue. ``args`` starts with ``comment``."""
+    from dash import linear
+
+    if len(args) < 4:
+        print(f"ws linear comment needs a workstream id, a task id and text. {LINEAR_COMMENT_LIMIT_HINT}", flush=True)
+        return errors.USAGE
+    text_args = args[3:]
+    if text_args[:1] == ["--"]:
+        text_args = text_args[1:]
+    ws, task_id, text = args[1], args[2], " ".join(text_args)
+    path = bundle_dir(ws)
+    if path is None:
+        print(errors.bundle_not_found(ws), flush=True)
+        return errors.NOT_FOUND
+    if not linear.is_linked(ws):
+        print(f"{ws} is not linked to Linear. Run: python3 agent_dash.py ws linear link {ws} --team ENG", flush=True)
+        return errors.USAGE
+    plan = _read_json(path / "plan.json")
+    known = _dag_task_ids(plan) if isinstance(plan, dict) else set()
+    if task_id not in known:
+        print(errors.task_not_found(ws, task_id, len(known)), flush=True)
+        return errors.NOT_FOUND
+    try:
+        linear.enqueue_comment(ws, task_id, text)
+    except ValueError as exc:
+        print(f"comment not queued: {exc}. {LINEAR_COMMENT_LIMIT_HINT}", flush=True)
+        return errors.USAGE
+    print(f"queued comment for {task_id}; it posts on the next sync", flush=True)
+    return errors.OK
+
+
+def _cmd_linear_update(args: list[str]) -> int:
+    """``ws linear update <WS> [--health on-track|at-risk|off-track] [--dry-run]``: one standup update to Linear."""
+    from dash import linear_update
+
+    health: str | None = None
+    dry_run = False
+    rest: list[str] = []
+    pos = 0
+    while pos < len(args):
+        arg = args[pos]
+        if arg == "--dry-run":
+            dry_run = True
+        elif arg == "--health":
+            if pos + 1 >= len(args) or args[pos + 1].startswith("-"):
+                print("--health needs on-track, at-risk or off-track. Run: python3 agent_dash.py ws linear update <ID> --health on-track", flush=True)
+                return errors.USAGE
+            health = args[pos + 1]
+            pos += 1
+        elif arg.startswith("-"):
+            print(f"unknown flag {arg!r} for ws linear update. Run: python3 agent_dash.py ws linear update <ID> [--health on-track] [--dry-run]", flush=True)
+            return errors.USAGE
+        else:
+            rest.append(arg)
+        pos += 1
+    if len(rest) != 1:
+        print("ws linear update needs one workstream id. Run: python3 agent_dash.py ws linear update <ID> [--dry-run]", flush=True)
+        return errors.USAGE
+    return linear_update.post(rest[0], health=health, dry_run=dry_run)
+
+
+def _cmd_linear(rest: list[str], json_mode: bool = False) -> int:
+    """``ws linear <link|sync|status|unlink> <WS> [--team KEY]``: Linear mirror of one bundle."""
+    args = list(rest)
+    if args[:1] == ["comment"]:
+        return _cmd_linear_comment(args)
+    team: str | None = None
+    if "--team" in args:
+        pos = args.index("--team")
+        if pos + 1 >= len(args) or args[pos + 1].startswith("-"):
+            print("--team needs a Linear team key, e.g. --team ENG. Run: python3 agent_dash.py ws linear link <ID> --team ENG", flush=True)
+            return errors.USAGE
+        team = args[pos + 1]
+        del args[pos:pos + 2]
+    if not args:
+        print(WS_USAGE, end="", flush=True)
+        return errors.USAGE
+    if args[0] in ("login", "logout"):
+        return _cmd_linear_auth(args, team)
+    sub = args[0]
+    if sub == "update":
+        if team is not None:
+            print("--team applies to link only. Run: python3 agent_dash.py ws linear update <ID>", flush=True)
+            return errors.USAGE
+        return _cmd_linear_update(args[1:])
+    if sub not in LINEAR_SUBCOMMANDS:
+        print(f"unknown linear subcommand {sub!r}. Use one of: {', '.join(LINEAR_SUBCOMMANDS)}. Run: python3 agent_dash.py ws linear status <ID>", flush=True)
+        return errors.USAGE
+    if len(args) != 2:
+        print(f"ws linear {sub} needs one workstream id. Run: python3 agent_dash.py ws linear {sub} <ID>", flush=True)
+        return errors.USAGE
+    ws = args[1]
+    if sub == "link" and not team:
+        print(f"team required to link. Run: python3 agent_dash.py ws linear link {ws} --team ENG", flush=True)
+        return errors.USAGE
+    if sub != "link" and team is not None:
+        print(f"--team applies to link only. Run: python3 agent_dash.py ws linear {sub} {ws}", flush=True)
+        return errors.USAGE
+    from dash import linear_sync
+
+    return linear_sync.run(sub, ws, team_key=team, json_mode=json_mode)
+
+
 def cmd_ws(argv: list[str]) -> int:
     if not argv or argv[0] in ("-h", "--help"):
         print(WS_USAGE, end="")
@@ -2127,7 +2381,7 @@ def cmd_ws(argv: list[str]) -> int:
     if rest[:1] == ["--json"]:
         json_mode = True
         rest = rest[1:]
-    elif rest[-1:] == ["--json"]:
+    elif rest[-1:] == ["--json"] and not (cmd == "linear" and rest[:1] == ["comment"]):
         json_mode = True
         rest = rest[:-1]
     if cmd == "list":
@@ -2283,6 +2537,8 @@ def cmd_ws(argv: list[str]) -> int:
             print(WS_USAGE, end="", flush=True)
             return errors.USAGE
         return print_trains(rest[0], json_mode=json_mode)
+    if cmd == "linear":
+        return _cmd_linear(rest, json_mode=json_mode)
     if cmd == "approve":
         if len(rest) < 3:
             print(WS_USAGE, end="", flush=True)

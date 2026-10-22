@@ -871,6 +871,41 @@ def _approvals():
     }
 
 
+def _linear(now):
+    """Fixture mirror of GET /api/linear: two linked workstreams, a status
+    mix by source over 24 h and 7 d, recent moves (one by Linear, one
+    local), one synced and one queued with a sync error, pending decisions
+    with an identifier and link, and a signed-in browser session."""
+    def move(ago, task, title, frm, to, by):
+        row = {"ts": now - ago, "task": task, "title": title, "from": frm, "to": to, "by": by}
+        return row
+    ws4 = {
+        "ws": "WS4", "title": "Notes cutover", "url": "https://linear.app/example/project/notes-cutover",
+        "synced_at": now - 240, "last_error": None, "outbox": 0, "last_update_at": now - 3600,
+        "changes_24h": {"local": 5, "linear": 2}, "changes_7d": {"local": 14, "linear": 6},
+        "recent": [
+            move(300, "WS4.a", "Draft the cutover checklist", "todo", "wip", "local"),
+            move(1800, "WS4.b", "Confirm the rollback window", "wip", "pr", "linear"),
+            move(5400, "WS4.c", "Freeze the notes schema", "pr", "done", "local"),
+        ],
+        "pending_approvals": [
+            {"id": "P-cutover", "step": "Approve the cutover window", "identifier": "ENG-9",
+             "url": "https://linear.app/example/issue/ENG-9"},
+        ],
+    }
+    ws9 = {
+        "ws": "WS9", "title": "Relay", "url": "https://linear.app/example/project/relay",
+        "synced_at": now - 4200, "last_error": "timed out", "outbox": 3, "last_update_at": None,
+        "changes_24h": {"local": 3, "linear": 1}, "changes_7d": {"local": 8, "linear": 2},
+        "recent": [
+            move(7200, "WS9.a", "Start the relay consumer", "todo", "wip", "local"),
+            move(86000, "WS9.b", "Stage the relay schema", "wip", "done", "linear"),
+        ],
+        "pending_approvals": [],
+    }
+    return {"signed_in": "oauth", "workstreams": [ws4, ws9], "_note": NOTE}
+
+
 def _decisions():
     """Fixture mirror of GET /api/decisions: newest-first rows with status
     pills, one http(s) link (renders as an anchor), one plain-text link,
@@ -972,6 +1007,13 @@ def _clean_groups(groups):
     ]
 
 
+LINEAR_WS1 = {"url": "https://linear.app/example/project/notes-cutover", "synced_at": NOW - 240}
+LINEAR_TASKS = {
+    "0": {"identifier": "PD-1", "url": "https://linear.app/example/issue/PD-1"},
+    "2": {"identifier": "PD-3", "url": "https://linear.app/example/issue/PD-3"},
+}
+
+
 def _plans():
     """Fixture plan views. WS1 resolves from its bundle (bundle wins over the
     plans map), so the plan view and the execution map agree on one source."""
@@ -1016,6 +1058,12 @@ def _plans():
         # The offline page consumes the same server-computed map layout as
         # the live page (dash/maplayout.py); the map falls back to today's
         # behaviour when these keys are absent.
+        if ws == "WS1":
+            doc["linear"] = dict(LINEAR_WS1)
+            for group in doc["groups"]:
+                for task in group["tasks"]:
+                    if task["id"] in LINEAR_TASKS:
+                        task["linear"] = dict(LINEAR_TASKS[task["id"]])
         layout_view = {key: doc[key] for key in ("ws", "cols", "groups", "edges", "phases", "trains")}
         doc["layout"] = maplayout_mod.layout(layout_view)
         doc["map_warnings"] = maplayout_mod.map_warnings(layout_view)
@@ -1554,6 +1602,7 @@ def main():
         "archive.json": _archive(NOW, plans),
         "approvals.json": _approvals(),
         "decisions.json": _decisions(),
+        "linear.json": _linear(NOW),
         "project/feed.json": _feed(NOW),
         "reconcile.json": _reconcile(runs, NOW),
         "graph.json": _graph(runs, plans),

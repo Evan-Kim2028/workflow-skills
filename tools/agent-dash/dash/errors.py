@@ -26,6 +26,9 @@ NOT_FOUND = 3
 INVALID_DATA = 4
 UNREACHABLE = 5
 
+# Returned by a Linear-origin bundle write skipped because a local write for the same key is still in the outbox. Internal only: never a CLI exit code.
+SKIPPED_PENDING = 6
+
 CODES = {
     OK: "ok",
     CHECK_FAILED: "check_failed",

@@ -64,6 +64,8 @@ python3 agent_dash.py ws task WS4 WS4.1 deferred --moved-to WS6 --note "waits on
 
 `pr` is an open pull request. `prog` is merged and waiting on a prod step. `done` is finished. `todo` is not started. Deferred tasks stay on the map and drop out of the counts. The write is a temp file plus replace, so a crash does not leave a half-written plan.
 
+When the workstream is linked to Linear, the same command also queues the change for Linear. See [docs/linear.md](docs/linear.md).
+
 Every status change also appends one `{ts, task, from, to}` line to `history.jsonl` in the bundle (a single flushed append, so one line is atomic; no change writes no line). That file is the recorded history `GET /api/replay` prefers over inferred times: the replay plays real transitions once they exist instead of guessing them from run labels.
 
 Run `ws render` again only when the prose or the drawings change. Status edits do not need a render. The page reads `plan.json` live.
@@ -125,6 +127,37 @@ python3 agent_dash.py ws trains WS4
 `ws train` creates the train when it is missing (`--title` is required then). `--add` moves a task out of any other train and says so. The write is a temp file plus replace, like `ws task`. `ws trains` prints a table: train, status, branch, PR, members with each member's task status, and the shared-files count.
 
 Re-cut the trains as member diffs land: per member `git diff --name-only origin/main...<branch>`, intersect the lists into `shared_files`, set the `gate` to the tests for those files, and move the train status with `ws train`. Set `pr` when the train PR opens and `merged` after it lands. `ws validate` checks the schema, the member cap, and the naming rule on train titles and notes.
+
+## Linear tracker
+
+`plan.json` may carry an optional top-level `tracker` object. It holds the non-engineer text and dates that the Linear project shows. Every field is optional. The sync pushes it only for a linked bundle (see [docs/linear.md](docs/linear.md)).
+
+```json
+"tracker": {
+  "summary": "Move the notes read path to Postgres, one table at a time.",
+  "description": "Markdown for non-engineers: purpose, why now, what done looks like.",
+  "lead": "Alex Rivera",
+  "labels": ["Infrastructure"],
+  "issue_labels": ["Infrastructure"],
+  "priority": 2,
+  "start_date": "2026-10-21",
+  "target_date": null,
+  "links": [{"title": "Dashboard", "url": "http://127.0.0.1:8765/?ws=WS4&view=exec"}],
+  "milestones": {"Read path": {"description": "What this section delivers and its gate.", "target_date": null}},
+  "update": {"health": "onTrack", "daily_hour": 9}
+}
+```
+
+- `summary` is one line, at most 255 characters. `description` is Markdown.
+- `lead` is the name of a Linear user.
+- `labels` are project labels, created when missing. `issue_labels` are added to every task issue and are never removed by the sync.
+- `priority` uses Linear's scale: 0 none, 1 urgent, 2 high, 3 medium, 4 low. Task priorities are derived from the plan (critical path high, ready now medium, other open tasks low), so they are not stored here.
+- `start_date` and `target_date` are `YYYY-MM-DD`, or `null`.
+- `links` is a list of `{title, url}`. The sync appends new links and does not remove old ones.
+- `milestones` is keyed by DAG column name. Each entry has a plain-language `description` and a `target_date`.
+- `update.health` is the default standup health: `onTrack`, `atRisk`, or `offTrack`. `update.daily_hour` is the local hour (0 to 23) for the automatic daily standup update. See `ws linear update` in [docs/linear.md](docs/linear.md).
+
+The project status follows `bundle.json` `state`, so do not put a status in `tracker`. Name things in the text fields by a short phrase first, as in the rest of the plan.
 
 ## Approvals
 

@@ -15,7 +15,11 @@
           "id": "0",
           "title": "Upstream freeze signal is in",
           "status": "done",
-          "kind": "gate"
+          "kind": "gate",
+          "linear": {
+            "identifier": "PD-1",
+            "url": "https://linear.app/example/issue/PD-1"
+          }
         },
         {
           "id": "1",
@@ -28,7 +32,11 @@
           "status": "pr",
           "deps": [
             "1"
-          ]
+          ],
+          "linear": {
+            "identifier": "PD-3",
+            "url": "https://linear.app/example/issue/PD-3"
+          }
         },
         {
           "id": "3",
@@ -98,6 +106,10 @@
     "pct": 40
   },
   "_note": "Seeded example plan for the fixture preview.",
+  "linear": {
+    "url": "https://linear.app/example/project/notes-cutover",
+    "synced_at": 1761999720
+  },
   "layout": {
     "ws": "WS1",
     "density": "comfortable",
@@ -152,7 +164,7 @@
           {
             "id": "0",
             "label": "0",
-            "tooltip": "0 \u00b7 Upstream freeze signal is in \u00b7 done \u00b7 gate",
+            "tooltip": "0 \u00b7 Upstream freeze signal is in \u00b7 done \u00b7 gate \u00b7 PD-1",
             "status": "done",
             "kind": "gate",
             "train": null,
@@ -170,7 +182,7 @@
           {
             "id": "2",
             "label": "2",
-            "tooltip": "2 \u00b7 Land the read route \u00b7 pr \u00b7 waits on 1",
+            "tooltip": "2 \u00b7 Land the read route \u00b7 pr \u00b7 waits on 1 \u00b7 PD-3",
             "status": "pr",
             "kind": "task",
             "train": "T2",

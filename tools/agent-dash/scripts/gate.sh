@@ -146,7 +146,7 @@ if command -v node >/dev/null 2>&1; then
     done
     case " $CHANGED " in
         *"tools/agent-dash/static/index.html"*)
-            PAGE_TMP=$(mktemp) || exit 2
+            PAGE_TMP="$(mktemp -d)/page.js" || exit 2
             python3 -c '
 import re, sys
 text = open("static/index.html", encoding="utf-8").read()
@@ -159,7 +159,7 @@ sys.stdout.write("\n".join(scripts))
                 echo "FAIL node <page script>"
                 FAIL=1
             fi
-            rm -f "$PAGE_TMP"
+            rm -rf "$(dirname "$PAGE_TMP")"
             ;;
     esac
 else

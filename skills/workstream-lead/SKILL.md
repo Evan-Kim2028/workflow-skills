@@ -44,6 +44,14 @@ At each milestone run `agent_dash.py lead-profile` on the lead session: a LOW-DE
 
 Run the wave with the `ws-wave` Workflow tool: `scriptPath` is `tools/agent-dash/workflows/ws-wave.js` and the args are in the brief. Tiers come from the worker registry: `default`, a named tier, or `auto` for failover by availability. Each step is a low-effort Haiku wrapper around `scripts/run_worker.sh`. A lane may set `reviewFocus` (checks with evidence) and `oneWay: true` (irreversible lanes, still reviewed). Approved lanes move to `pr` via `ws task`.
 
+## Throughput
+
+The full rules are T1 to T5 in the [orchestration skill](../workstream-orchestration/SKILL.md#throughput-rules). Keep three habits:
+
+- **Refill on every completion.** Read that one report, move its status, launch the next ready batch, then read the next report.
+- **Wait in the background.** Each deploy, soak, or watch runs under one watcher; the lead thread never sleeps.
+- **Batch production by area.** One approved batch per area per window, with one rollback line each; independent areas run in parallel.
+
 ## Production steps
 
 - Act only on items marked `approved` in `approvals.json`, and follow their conditions. Run one production step at a time across all workstreams that share the slot.
@@ -78,6 +86,17 @@ Production updates go out fastest when every merge is small in CI time, not in s
   - `done` when it is merged and live.
 
   `prog` never means "in progress".
+
+  When the workstream is linked to Linear, these commands do not change. Linear follows within a minute. See [Linear as a task backend](../../tools/agent-dash/docs/linear.md).
+
+## Linear
+
+If the workstream is linked to Linear (`ws linear link`), keep the Linear side current with the protocol in [Agents and Linear](../../tools/agent-dash/docs/linear.md#agents-and-linear):
+
+- Change status with `ws task` as usual. Linear follows within a minute.
+- Post one standup update before each standup with `ws linear update <ID>` (`--dry-run` to preview). Or set `tracker.update.daily_hour` so the dashboard posts one each day. Both are described in [Standup updates](../../tools/agent-dash/docs/linear.md#standup-updates).
+- Put the `Fixes ENG-…` line from `ws trains <ID>` in each train PR body.
+- Never edit issue titles or descriptions in Linear. The plan owns them.
 
 ## Hand-off
 

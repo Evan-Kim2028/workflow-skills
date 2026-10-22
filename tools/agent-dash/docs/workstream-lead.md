@@ -108,6 +108,10 @@ Each time a wave workflow returns, the lead:
 
 A workflow cannot receive messages from other sessions or wait out multi-day windows. Those stay with the lead.
 
+### Throughput
+
+The lead keeps work flowing: it refills the wave on every completion, runs waits on a background watcher, and groups production steps by area so independent areas run in parallel. Each production batch has one approval row and one rollback line. Commit and push per task, and post results to the tracker as they land. The rules, with their checks, are T1 to T5 in the [orchestration skill](../../../skills/workstream-orchestration/SKILL.md#throughput-rules).
+
 ## 6. Watch it
 
 - The Plan page is at `http://127.0.0.1:8765/plan?ws=WS4`.

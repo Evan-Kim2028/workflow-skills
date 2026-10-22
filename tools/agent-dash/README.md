@@ -29,6 +29,8 @@ python3 ~/.claude/tools/agent-dash/agent_dash.py reprice
 python3 ~/.claude/tools/agent-dash/agent_dash.py reconcile
 python3 ~/.claude/tools/agent-dash/agent_dash.py backfill --session <id>
 python3 ~/.claude/tools/agent-dash/agent_dash.py report start --label ws4-WS4.1-slug --model <model> --session <id>
+python3 ~/.claude/tools/agent-dash/agent_dash.py label make --scope ws11 --mark plan --slug scout-10-partition-cold
+python3 ~/.claude/tools/agent-dash/agent_dash.py label check ws11-plan-scout-10-partition-cold
 python3 ~/.claude/tools/agent-dash/agent_dash.py ws list
 python3 ~/.claude/tools/agent-dash/agent_dash.py project list
 ```
@@ -55,7 +57,11 @@ runs one headless `pi` (`@mariozechner/pi-coding-agent`) worker on the
 River AI provider, defaulting to
 `river/deepseek-ai/DeepSeek-V4.1-Flash-1017` (use
 `--model river/zai-org/GLM-5.3-Flash` for GLM). `outdir` is any folder the
-dashboard scans, such as a scratchpad `pi/` folder. It writes
+dashboard scans, such as a scratchpad `pi/` folder. The label is validated
+with `dash/labels.py` (the module behind `agent_dash.py label check`) and
+refused with the exact fix on a weak one, and a prompt without one gets a
+`[label: <label>]` first line in the copied
+`<outdir>/prompt-<label>.md`, so the original is never modified. It writes
 `pi-sessions.tsv` (label, session id, start epoch, model),
 `stream-<label>.ndjson`, `out-<label>.md`, `err-<label>.log`, and
 `running/<label>` while the run is live, and appends `generic.jsonl`

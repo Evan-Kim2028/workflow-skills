@@ -313,6 +313,24 @@
     ],
     "workflows/*": [
       "test_ws_wave"
+    ],
+    "dash/worktrees.py": [
+      "test_worktrees"
+    ],
+    "dash/linear.py": [
+      "test_linear",
+      "test_linear_sync"
+    ],
+    "dash/linear_client.py": [
+      "test_linear_client"
+    ],
+    "dash/linear_sync.py": [
+      "test_linear_sync",
+      "test_ws_cli"
+    ],
+    "dash/sources/linear.py": [
+      "test_linear_source",
+      "test_poll_budgets"
     ]
   }
 }

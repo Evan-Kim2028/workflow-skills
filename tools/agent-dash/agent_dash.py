@@ -29,6 +29,7 @@ from dash.sources.generic import default_run_id as generic_run_id
 from dash.sources.generic import tier_of as generic_tier_of
 from dash.sources.process import reconcile_running
 from dash.store import Store
+from dash.worktrees import cmd_worktrees
 
 ROOT = Path(__file__).resolve().parent
 STATE_DIR = Path.home() / ".local" / "share" / "agent-dash"
@@ -39,6 +40,7 @@ HOST = "127.0.0.1"
 PORT = 8765
 RECONCILE_INTERVAL_S = 60
 PRUNE_INTERVAL_S = 60
+CHILD_START_S = 20.0
 BACKUP_KEEP = 3
 URL = f"http://{HOST}:{PORT}/"
 
@@ -113,6 +115,8 @@ USAGE = """agent-dash: local read-only execution dashboard
   python3 agent_dash.py project open <id> [--json]
   python3 agent_dash.py project remove <id> [--json]
   python3 agent_dash.py lead-profile <session-id|--ws ID> [--json]
+  python3 agent_dash.py worktrees reap --repo <path> [--apply] [--skip <path-or-branch>] [--min-age <dur>] [--json]
+  python3 agent_dash.py lanes live [--json]
 
 Agents working on a project pass --project <id> (or set the env) for
 state, check, doctor, ws ..., status: it sets the data root, state
@@ -385,6 +389,8 @@ def main(argv: list[str] | None = None) -> int:
             return guard
     if cmd == "run":
         return cmd_run(args[1:])
+    if cmd == "serve":
+        return cmd_serve(args[1:])
     if cmd == "stop":
         return cmd_stop(args[1:])
     if cmd == "restart":
@@ -425,6 +431,10 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_label(args[1:])
     if cmd == "lead-profile":
         return cmd_lead_profile(args[1:])
+    if cmd == "worktrees":
+        return cmd_worktrees(args[1:])
+    if cmd == "lanes":
+        return cmd_lanes(args[1:])
     print(USAGE, end="", file=sys.stderr)
     return 2
 
@@ -472,21 +482,56 @@ def cmd_run(argv: list[str] | None = None) -> int:
         os.nice(10)
     except OSError:
         pass
-    child = os.fork()
-    if child > 0:
-        return _wait_for_child()
-    os.setsid()
-    try:
-        _redirect_stdio()
-        logging.basicConfig(
-            level=logging.INFO,
-            format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    child = _spawn_child()
+    return _wait_for_child(child.pid)
+
+
+def _spawn_child() -> subprocess.Popen:
+    """Start the dashboard server as ``agent_dash.py serve`` in its own session.
+
+    A fresh interpreter, not ``os.fork()``: this process has run the
+    health probes, whose proxy lookup starts CoreFoundation threads on
+    macOS. A child forked from it can die with SIGSEGV before exec, or
+    abort on its first CoreFoundation call. stdout and stderr go to the log.
+    """
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    env = dict(os.environ, AGENT_DASH_PORT=str(_port()))
+    with open(LOGFILE, "ab") as log:
+        return subprocess.Popen(
+            [sys.executable, str(Path(__file__).resolve()), "serve"],
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+            close_fds=True,
         )
+
+
+def cmd_serve(argv: list[str] | None = None) -> int:
+    """Run the dashboard server in this process; the child ``cmd_run`` spawns.
+
+    Logs a start line, then either a normal return or the exception (any
+    ``BaseException``, ``SystemExit`` included), so a failed start always
+    leaves a trace in agent-dash.log. Returns the child's exit status.
+    """
+    if argv:
+        print(USAGE, end="", file=sys.stderr)
+        return 2
+    bind_state()
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
+    status = 1
+    try:
+        logging.info("agent-dash child %d starting _serve", os.getpid())
         _serve()
-    except Exception:
+        logging.info("agent-dash child %d _serve returned", os.getpid())
+        status = 0
+    except BaseException:
         logging.exception("agent-dash exited")
-        os._exit(1)
-    os._exit(0)
+    return status
 
 
 def cmd_stop(argv: list[str] | None = None) -> int:
@@ -1434,6 +1479,85 @@ def cmd_lead_profile(argv: list[str]) -> int:
     return 0
 
 
+def cmd_lanes(argv: list[str] | None = None) -> int:
+    """List distinct live lanes, one per run, not per process.
+
+    ``lanes live`` groups the dashboard live-worker listing by run
+    identity (muse session uuid, bracket label, prompt-file label) so a
+    run spawning several worker processes counts once. Tiers cover
+    muse, cursor-agent as grok, the grok CLI as glm, and Claude
+    subagents as claude when visible. The listing reuses
+    ``live_worker_processes``, the same source the dashboard uses for
+    its live set, so both agree. ``--json`` emits machine JSON.
+    """
+    rest = list(argv or [])
+    if not rest or rest[0] != "live":
+        print(USAGE, end="", file=sys.stderr)
+        return 2
+    rest = rest[1:]
+    json_mode = False
+    for flag in rest:
+        if flag == "--json":
+            json_mode = True
+        else:
+            print(USAGE, end="", file=sys.stderr)
+            return 2
+    from dash import lanes as lanes_lib
+    from dash.sources.process import live_worker_processes
+
+    try:
+        processes = live_worker_processes()
+    except Exception as exc:
+        message = "lanes live failed: %s" % (exc,)
+        if json_mode:
+            errors.emit_json({"error": message, "code": "unavailable"})
+        else:
+            print(message, file=sys.stderr)
+        return 1
+    if processes is None:
+        processes = []
+    lanes = lanes_lib.group_live_processes(processes)
+    total = len(processes)
+    if json_mode:
+        errors.emit_json({"count": len(lanes), "processes": total, "lanes": lanes})
+        return 0
+    print("live lanes: %d (from %d processes)" % (len(lanes), total))
+    if lanes:
+        width_label = max([len(str(lane.get("label") or "-")) for lane in lanes] + [5])
+        width_tier = max([len(str(lane.get("tier") or "-")) for lane in lanes] + [4])
+        print(
+            "%s %s %s %s %s %s"
+            % (
+                "label".ljust(width_label),
+                "tier".ljust(width_tier),
+                "pid".rjust(8),
+                "elapsed".rjust(10),
+                "prompt".ljust(12),
+                "procs".rjust(5),
+            )
+        )
+        for lane in lanes:
+            label = str(lane.get("label") or "-")
+            tier = str(lane.get("tier") or "-")
+            pid = lane.get("pid")
+            pid_text = str(pid) if isinstance(pid, int) else "-"
+            elapsed = lanes_lib.format_elapsed(lane.get("elapsed_s"))
+            prompt = str(lane.get("prompt_label") or "-")
+            procs = int(lane.get("processes") or 0)
+            print(
+                "%s %s %s %s %s %s"
+                % (
+                    label.ljust(width_label),
+                    tier.ljust(width_tier),
+                    pid_text.rjust(8),
+                    elapsed.rjust(10),
+                    prompt.ljust(12),
+                    str(procs).rjust(5),
+                )
+            )
+    return 0
+
+
 def cmd_check(argv: list[str]) -> int:
     """Ask a running dashboard for GET /api/reconcile, print the table, exit 1 on any mismatch."""
     url = _base_url()
@@ -1781,6 +1905,183 @@ def _report_flags(argv: list[str]) -> dict:
     return flags
 
 
+def _label_plan_ids(ws_filter: str | None = None) -> dict:
+    """Plan task ids per workstream, best effort. Never raises."""
+    found: dict[str, list[str]] = {}
+    try:
+        root = dataroot.workstreams_dir()
+    except Exception:
+        return found
+    try:
+        if ws_filter:
+            targets = [str(ws_filter).upper()]
+        else:
+            targets = [entry.name for entry in root.iterdir() if entry.is_dir()]
+    except OSError:
+        return found
+    for target in targets:
+        ws_id = str(target).upper()
+        try:
+            data = json.loads((root / target / "plan.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        try:
+            from dash.taskmatch import plan_task_ids
+
+            groups = data.get("dag", {}).get("groups") if isinstance(data, dict) else None
+            found[ws_id] = [str(item) for item in plan_task_ids(groups)]
+        except Exception:
+            continue
+    return found
+
+
+def _label_taskmap() -> dict:
+    """Resolved label-to-task map, or empty when unreadable. Never raises."""
+    try:
+        from dash.taskmatch import load_taskmap
+
+        table = load_taskmap()
+    except Exception:
+        return {}
+    return table if isinstance(table, dict) else {}
+
+
+def _label_collision_warning(
+    label: str, scope: str | None, plans: dict, taskmap: dict
+) -> str | None:
+    """Plan-task collision for a label the strict check accepted.
+
+    Only the label's own workstream is consulted: a run attributes
+    inside its own scope, so task ids from other workstreams are never
+    a collision. Returns the warning line, or None when quiet.
+    """
+    text = str(label or "")
+    scope_id = str(scope or "").upper()
+    if scope_id == "HUB":
+        return None
+    if not scope_id:
+        head, dash, _rest = text.partition("-")
+        if dash and re.fullmatch(r"ws[1-9][0-9]*|hub", head.lower()):
+            scope_id = head.upper()
+    if not scope_id or scope_id == "HUB":
+        return None
+    ids = [str(item) for item in (plans.get(scope_id) or []) if str(item)]
+    if not ids:
+        return None
+    lowered = text.casefold()
+    for ident in ids:
+        if ident.casefold() == lowered:
+            return (
+                f"warning: label equals plan task {ident} ({scope_id}); "
+                f"the run will attribute to that task"
+            )
+    try:
+        from dash.phases import resolve_task
+    except Exception:
+        return None
+    try:
+        hit = resolve_task(text, scope_id, taskmap, ids)
+    except Exception:
+        return None
+    if hit is not None and str(hit) in set(ids):
+        return (
+            f"warning: label collides with plan task {hit} ({scope_id}); "
+            f"the run will attribute to that task"
+        )
+    return None
+
+
+def cmd_label(argv: list[str]) -> int:
+    """Build or check a canonical run label (``dash/labels.py``).
+
+    ``label make`` prints the label. ``label check`` exits 0 when the
+    label is strong (printing phase and rule, plus any conflict
+    warning), 2 when refused (printing the one-line fix). A label that
+    names a plan task of its own workstream gains the collision
+    warning even when the strict verdict stays quiet.
+    """
+    from dash import labels as label_lib
+
+    if not argv or argv[0] not in ("make", "check"):
+        print(
+            "usage: python3 agent_dash.py label make --scope <wsN|hub> "
+            "--mark <plan|exec|review|coord> --slug <slug> [--round N] "
+            "or python3 agent_dash.py label check <label> [--ws <WS>]",
+            file=sys.stderr,
+        )
+        return 2
+    if argv[0] == "make":
+        flags = _report_flags(argv[1:])
+        if not flags.get("scope") or not flags.get("mark") or not flags.get("slug"):
+            print(
+                "label make needs --scope, --mark, and --slug. Run: python3 agent_dash.py "
+                "label make --scope ws11 --mark plan --slug scout-10-partition-cold --round 1",
+                file=sys.stderr,
+            )
+            return 2
+        try:
+            print(
+                label_lib.make(
+                    flags.get("scope", ""),
+                    flags.get("mark", ""),
+                    flags.get("slug", ""),
+                    flags.get("round"),
+                )
+            )
+        except ValueError as exc:
+            print(f"label make failed: {exc}", file=sys.stderr)
+            return 2
+        return 0
+    rest = argv[1:]
+    flags = _report_flags(rest)
+    label = flags.get("label")
+    if label is None:
+        skip_next = False
+        for token in rest:
+            if skip_next:
+                skip_next = False
+                continue
+            if token.startswith("--"):
+                skip_next = True
+                continue
+            label = token
+            break
+    if label is None:
+        print(
+            "label check needs a label. Run: python3 agent_dash.py label check <label> [--ws <WS>]",
+            file=sys.stderr,
+        )
+        return 2
+    verdict = label_lib.check(label, ws=flags.get("ws"))
+    if not verdict["ok"]:
+        print(f"label refused: {verdict['fix']}", file=sys.stderr)
+        return 2
+    print(f"ok: {label} -> {verdict['phase']} via {verdict['rule']}")
+    if verdict.get("warning"):
+        print(verdict["warning"])
+        return 0
+    scope = str(verdict.get("scope") or "").upper()
+    warning = _label_collision_warning(
+        label, scope or None, _label_plan_ids(scope or None), _label_taskmap()
+    )
+    if warning:
+        print(warning)
+    return 0
+
+
+def _report_flags(argv: list[str]) -> dict:
+    flags: dict[str, str] = {}
+    index = 0
+    while index < len(argv):
+        token = argv[index]
+        if token.startswith("--") and index + 1 < len(argv) and not argv[index + 1].startswith("--"):
+            flags[token[2:]] = argv[index + 1]
+            index += 2
+        else:
+            index += 1
+    return flags
+
+
 def _report_int(value, default: int) -> int:
     try:
         number = int(value) if value is not None else default
@@ -1925,7 +2226,7 @@ def _listener_pid(port: int) -> int | None:
 
 
 def _serves_dashboard(pid: int) -> bool:
-    """True when ``pid``'s command line is the dashboard server process."""
+    """True when ``pid``'s command line is the dashboard server (``run`` or the spawned ``serve``)."""
     try:
         proc = subprocess.run(
             ["ps", "-p", str(pid), "-o", "command="],
@@ -1937,7 +2238,7 @@ def _serves_dashboard(pid: int) -> bool:
     except (OSError, subprocess.TimeoutExpired):
         return False
     text = proc.stdout or ""
-    return "agent_dash.py" in text and re.search(r"\brun\b", text) is not None
+    return "agent_dash.py" in text and re.search(r"\b(run|serve)\b", text) is not None
 
 
 def _dashboard_on_port() -> tuple[int | None, dict | None]:
@@ -2138,27 +2439,39 @@ def _serve() -> None:
         _release_pidfile(os.getpid())
 
 
-def _wait_for_child() -> int:
-    deadline = time.time() + 3
+def _wait_for_child(child: int) -> int:
+    """Wait for the spawned dashboard ``child`` to record its pidfile, or to exit.
+
+    The child writes the pidfile only after its store, sources and server
+    are up, which can take longer than a few seconds on a loaded machine.
+    A child that exits first has failed and is reported at once; a child
+    still starting gets ``CHILD_START_S`` seconds before the start counts
+    as failed. The pidfile names ``child`` itself, so no ``ps`` probe is
+    needed (a slow probe would read as a failed start).
+    """
+    deadline = time.time() + CHILD_START_S
     while time.time() < deadline:
-        pid = live_pid()
-        if pid:
-            _print_running(pid)
+        if read_pid() == child and pid_exists(child):
+            _print_running(child)
             return 0
+        try:
+            reaped, status = os.waitpid(child, os.WNOHANG)
+        except ChildProcessError:
+            print(f"failed to start: the dashboard process was already reaped (log: {LOGFILE})", file=sys.stderr)
+            return 1
+        if reaped == child:
+            print(f"failed to start: the dashboard process exited ({_how_ended(status)}; log: {LOGFILE})", file=sys.stderr)
+            return 1
         time.sleep(0.05)
-    print("failed to start", file=sys.stderr)
+    print(f"failed to start: no pidfile after {CHILD_START_S:g} s (log: {LOGFILE})", file=sys.stderr)
     return 1
 
 
-def _redirect_stdio() -> None:
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
-    log = os.open(LOGFILE, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
-    devnull = os.open(os.devnull, os.O_RDONLY)
-    os.dup2(devnull, 0)
-    os.dup2(log, 1)
-    os.dup2(log, 2)
-    os.close(devnull)
-    os.close(log)
+def _how_ended(status: int) -> str:
+    """Words for a ``waitpid`` status: the exit code or the signal."""
+    if os.WIFSIGNALED(status):
+        return f"signal {signal.Signals(os.WTERMSIG(status)).name}"
+    return f"exit code {os.WEXITSTATUS(status)}"
 
 
 def _print_running(pid: int, build: dict | None = None) -> None:

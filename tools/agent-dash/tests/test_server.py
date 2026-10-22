@@ -3047,5 +3047,62 @@ class RunSectionTest(unittest.TestCase):
         self.assertEqual(rows["ws9-a1-k1"]["section"], "Alpha2")
 
 
+class LinearApiTest(unittest.TestCase):
+    """``GET /api/linear``: read-only, linked workstreams only, no token in the body."""
+    def setUp(self):
+        from dash import linearview
+
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.wsroot = os.path.join(self.tmp.name, "ws")
+        for ws, linked in (("WS4", True), ("WS9", False)):
+            dest = os.path.join(self.wsroot, ws)
+            os.makedirs(dest)
+            with open(os.path.join(dest, "bundle.json"), "w") as fh:
+                json.dump({"id": ws, "title": "Probe " + ws, "order": int(ws[2:])}, fh)
+            with open(os.path.join(dest, "plan.json"), "w") as fh:
+                json.dump({"dag": {"groups": []}}, fh)
+            if linked:
+                with open(os.path.join(dest, "linear.json"), "w") as fh:
+                    json.dump({"project": {"name": "Notes", "url": "https://linear.app/example/project/notes"},
+                               "tasks": {}, "approvals": {}, "synced_at": time.time(), "last_error": None,
+                               "access_token": "lin_api_SECRET_TOKEN_123"}, fh)
+        with open(os.path.join(self.wsroot, "WS4", "history.jsonl"), "w") as fh:
+            fh.write(json.dumps({"ts": time.time() - 60, "task": "WS4.a", "from": "todo", "to": "wip", "by": "linear"}) + "\n")
+        self._env = mock.patch.dict(os.environ, {"AGENT_DASH_WORKSTREAMS": self.wsroot})
+        self._env.start()
+        self.addCleanup(self._env.stop)
+        self._status = mock.patch("dash.linearview.linear_auth.status", return_value={"method": "key", "issuer": None, "expires_at": None})
+        self._status.start()
+        self.addCleanup(self._status.stop)
+        linearview._CACHE.update({"key": None, "at": 0.0, "body": None})
+        self.store = Store(Path(self.tmp.name) / "dash.sqlite")
+        self.addCleanup(self.store.close)
+        server, thread = start(self.store)
+        self.addCleanup(stop, server, thread)
+        self.port = server.server_address[1]
+
+    def test_route_lists_linked_workstreams_only(self):
+        status, ctype, body = get(self.port, "/api/linear")
+        self.assertEqual(status, 200)
+        self.assertIn("json", ctype)
+        payload = json.loads(body)
+        self.assertEqual(payload["signed_in"], "key")
+        self.assertEqual([row["ws"] for row in payload["workstreams"]], ["WS4"])
+        row = payload["workstreams"][0]
+        self.assertEqual(row["changes_24h"], {"local": 0, "linear": 1})
+        self.assertEqual(row["url"], "https://linear.app/example/project/notes")
+        self.assertNotIn("lin_api_SECRET_TOKEN_123", body.decode("utf-8"))
+
+    def test_route_is_read_only(self):
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=3)
+        try:
+            conn.request("POST", "/api/linear", body=b"{}", headers={"Content-Type": "application/json"})
+            status = conn.getresponse().status
+        finally:
+            conn.close()
+        self.assertNotEqual(status, 200)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1,0 +1,93 @@
+{
+  "signed_in": "oauth",
+  "workstreams": [
+    {
+      "ws": "WS4",
+      "title": "Notes cutover",
+      "url": "https://linear.app/example/project/notes-cutover",
+      "synced_at": 1761999720,
+      "last_error": null,
+      "outbox": 0,
+      "last_update_at": 1761996360,
+      "changes_24h": {
+        "local": 5,
+        "linear": 2
+      },
+      "changes_7d": {
+        "local": 14,
+        "linear": 6
+      },
+      "recent": [
+        {
+          "ts": 1761999660,
+          "task": "WS4.a",
+          "title": "Draft the cutover checklist",
+          "from": "todo",
+          "to": "wip",
+          "by": "local"
+        },
+        {
+          "ts": 1761998160,
+          "task": "WS4.b",
+          "title": "Confirm the rollback window",
+          "from": "wip",
+          "to": "pr",
+          "by": "linear"
+        },
+        {
+          "ts": 1761994560,
+          "task": "WS4.c",
+          "title": "Freeze the notes schema",
+          "from": "pr",
+          "to": "done",
+          "by": "local"
+        }
+      ],
+      "pending_approvals": [
+        {
+          "id": "P-cutover",
+          "step": "Approve the cutover window",
+          "identifier": "ENG-9",
+          "url": "https://linear.app/example/issue/ENG-9"
+        }
+      ]
+    },
+    {
+      "ws": "WS9",
+      "title": "Relay",
+      "url": "https://linear.app/example/project/relay",
+      "synced_at": 1761995760,
+      "last_error": "timed out",
+      "outbox": 3,
+      "last_update_at": null,
+      "changes_24h": {
+        "local": 3,
+        "linear": 1
+      },
+      "changes_7d": {
+        "local": 8,
+        "linear": 2
+      },
+      "recent": [
+        {
+          "ts": 1761992760,
+          "task": "WS9.a",
+          "title": "Start the relay consumer",
+          "from": "todo",
+          "to": "wip",
+          "by": "local"
+        },
+        {
+          "ts": 1761913960,
+          "task": "WS9.b",
+          "title": "Stage the relay schema",
+          "from": "wip",
+          "to": "done",
+          "by": "linear"
+        }
+      ],
+      "pending_approvals": []
+    }
+  ],
+  "_note": "Seeded synthetic data for the offline preview. Seed 1. No local sessions are read."
+}

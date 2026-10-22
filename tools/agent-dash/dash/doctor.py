@@ -70,6 +70,7 @@ KNOWN_TOP_KEYS = {
     "dagster",
     "caps",
     "doctor",
+    "linear",
 }
 KNOWN_ROOT_KEYS = {
     "claude_projects",
@@ -278,6 +279,7 @@ def collect_problems(
     _collect_labels(ctx)
     _collect_page(ctx)
     _collect_config(ctx)
+    _collect_linear(ctx)
     _collect_checkout(ctx)
     _collect_build(ctx)
     _collect_python(ctx)
@@ -1522,6 +1524,85 @@ def _collect_config(ctx) -> None:
         _check(ctx, "config", True, "config files parse, no unknown keys")
 
 
+LINEAR_OUTBOX_MAX_ROWS = 50
+LINEAR_STALE_S = 600.0
+
+
+def _linear_epoch(value):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _collect_linear(ctx) -> None:
+    """Linear sync health for linked bundles: sign-in, last sync error, outbox backlog.
+
+    Emits nothing when no bundle is linked. Without a credential, only the sign-in problem
+    is reported. With the read-only switch on, the poller is off by design, so
+    the outbox backlog is not reported.
+    """
+    from dash import linear, linear_auth
+    from dash.actions import actions_enabled
+    from dash.bundles import list_bundles
+
+    try:
+        linked = sorted(item["id"] for item in list_bundles() if linear.is_linked(item["id"]))
+    except Exception as exc:
+        _check(ctx, "linear", False, f"bundle list failed: {exc}")
+        return
+    if not linked:
+        return
+    problems = []
+    if linear_auth.credential() is None:
+        problems.append(f"not signed in to Linear; linked: {', '.join(linked)}")
+        _add(
+            ctx, "linear-key-missing", "warn", "global", None,
+            "Not signed in to Linear",
+            problems[-1],
+            "python3 agent_dash.py ws linear login",
+            key="linear-key-missing",
+        )
+        _check(ctx, "linear", False, problems[-1])
+        return
+    poller_on = actions_enabled(ctx.cfg)
+    for ws in linked:
+        state = linear.sync_state(ws) or {}
+        synced_at = _linear_epoch(state.get("synced_at"))
+        stale = synced_at is None or ctx.now - synced_at > LINEAR_STALE_S
+        if state.get("last_error") and stale:
+            problems.append(f"{ws}: sync failing: {state['last_error']}")
+            _add(
+                ctx, "linear-sync-failing", "warn", f"ws:{ws}", ws,
+                f"Linear sync failing for {ws}",
+                _clip_text(f"last error: {state['last_error']}"),
+                f"python3 agent_dash.py ws linear status {ws}",
+                key=ws,
+            )
+        rows = linear.read_outbox(ws)
+        if not rows or not poller_on:
+            continue
+        oldest = _linear_epoch(rows[0].get("ts"))
+        aged = oldest is not None and ctx.now - oldest > LINEAR_STALE_S
+        if aged or len(rows) > LINEAR_OUTBOX_MAX_ROWS:
+            problems.append(f"{ws}: outbox {len(rows)} row(s)")
+            _add(
+                ctx, "linear-outbox-backlog", "warn", f"ws:{ws}", ws,
+                f"Linear outbox backlog for {ws}",
+                f"{len(rows)} pending row(s); oldest is {'older than 10 minutes' if aged else 'recent'}",
+                f"python3 agent_dash.py ws linear sync {ws}",
+                key=ws,
+            )
+    if problems:
+        _check(ctx, "linear", False, "; ".join(problems))
+    else:
+        _check(ctx, "linear", True, f"{len(linked)} linked bundle(s) synced")
+
+
+def _clip_text(text) -> str:
+    return str(text).replace("\n", " ").strip()[:200]
+
+
 def _collect_checkout(ctx) -> None:
     try:
         proc = subprocess.run(
@@ -2311,14 +2392,20 @@ def _orch_done_moment(state: dict, tid: str) -> float | None:
     return best
 
 
+#: History moves that mean a task has started (dep-jump): wip, pr, prog, done.
+_DEP_JUMP_START_TO = ("wip", "pr", "prog", "done")
+
+
 def _orch_dep_jumps(ctx, ws: str, state: dict) -> int:
     """Tasks that started before a dependency finished (warn recent, info old)."""
     from dash import orchestrate
 
+    from dash.taskmatch import label_mark
+
     by_id = state["by_id"]
     starts: dict[str, float] = {}
     for row in state["history"]:
-        if not isinstance(row, dict):
+        if not isinstance(row, dict) or row.get("to") not in _DEP_JUMP_START_TO:
             continue
         task = row.get("task")
         if not isinstance(task, str) or task not in by_id:
@@ -2331,6 +2418,8 @@ def _orch_dep_jumps(ctx, ws: str, state: dict) -> int:
             starts[task] = stamp
     for tid, rows in state["by_task"].items():
         for run in rows:
+            if label_mark(run.get("label")) not in (None, "exec"):
+                continue
             try:
                 stamp = float(run.get("started_at"))
             except (TypeError, ValueError):

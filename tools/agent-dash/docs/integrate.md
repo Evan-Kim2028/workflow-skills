@@ -592,6 +592,8 @@ Every `ws task` move is also appended to the bundle's `history.jsonl`; the progr
 
 Who writes what (one writer per file): the lead owns the bundle (`plan.json` via `ws task`/`ws train`, `approvals.json` via `ws approve`); workers own their branches and their report lines; the dashboard never writes sources. Read-only on every source; labels only, never prompts or secrets.
 
+Linked workstreams: `ws task`, `ws train`, and `ws approve` also queue writes for Linear. See [Linear as a task backend](linear.md).
+
 ## 7. Troubleshooting
 
 | Symptom | Likely cause | Command |
