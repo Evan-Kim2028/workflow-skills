@@ -69,6 +69,12 @@ class Store:
                 cur[key] = value
         self.sessions[row["session_id"]] = cur
 
+    def running_tool_runs(self):
+        return [dict(row) for row in self.runs.values() if row.get("status") == "running"]
+
+    def last_activity(self, run_id, started_at):
+        return started_at
+
     def add_usage(self, row):
         self.add_calls += 1
         self.usage[(row["tool"], row["session_id"], row["message_id"])] = dict(row)
@@ -315,6 +321,57 @@ class PollTest(Fixture):
         session_file(self.project_dir() / (SID_LIVE + ".jsonl"), SID_LIVE, "/x", [])
         self.poll()
         self.assertIn("commandcode:%s:ws6-plan-early" % SID_LIVE, self.store.runs)
+    def test_orphaned_live_only_attempt_closes_on_the_next_poll(self):
+        run_id = "commandcode:%s:ws6-plan-gone" % SID_DEAD
+        self.store.runs[run_id] = {
+            "run_id": run_id,
+            "source": "commandcode",
+            "tier": "commandcode",
+            "session_id": SID_DEAD,
+            "label": "ws6-plan-gone",
+            "status": "running",
+            "pid": 999999999,
+            "started_at": 1792000000.0,
+        }
+        (self.pad / "running").mkdir()
+        self.poll()
+        run = self.store.runs[run_id]
+        self.assertEqual(run["status"], "died_early")
+        self.assertEqual(run["ended_at"], 1792000000.0)
+
+    def test_live_only_orphan_closes_when_the_tsv_row_has_another_session(self):
+        self.write_tsv([["ws6-plan-retry2", "reflection/beam:free", SID_OK, 1792000000, 1792000100, 10, 2, "ok"]])
+        orphan_id = "commandcode:%s:ws6-plan-retry2" % SID_DEAD
+        self.store.runs[orphan_id] = {
+            "run_id": orphan_id,
+            "source": "commandcode",
+            "tier": "commandcode",
+            "session_id": SID_DEAD,
+            "label": "ws6-plan-retry2",
+            "status": "running",
+            "pid": 999999999,
+            "started_at": 1791999900.0,
+        }
+        self.poll()
+        self.assertEqual(self.store.runs["commandcode:%s:ws6-plan-retry2" % SID_OK]["status"], "done")
+        self.assertEqual(self.store.runs[orphan_id]["status"], "died_early")
+
+    def test_backfill_scoped_poll_does_not_close_other_sessions(self):
+        run_id = "commandcode:%s:ws6-plan-gone" % SID_DEAD
+        self.store.runs[run_id] = {
+            "run_id": run_id,
+            "source": "commandcode",
+            "tier": "commandcode",
+            "session_id": SID_DEAD,
+            "label": "ws6-plan-gone",
+            "status": "running",
+            "pid": 999999999,
+            "started_at": 1792000000.0,
+        }
+        cfg = dict(self.cfg(), backfill_session="someone-else")
+        cc.poll(self.store, cfg, 1_800_000_000.0)
+        self.assertIsNone(cc.last_error)
+        self.assertEqual(self.store.runs[run_id]["status"], "running")
 
     def test_unlabelled_session_is_a_run_with_no_label(self):
         session_file(

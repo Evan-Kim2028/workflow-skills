@@ -97,6 +97,7 @@ def _poll(store, cfg, now):
     seen = _seen(store)
     for sid, row in attempts.items():
         _upsert_attempt(store, sid, row, seen)
+    _close_vanished(store, attempts, now, only)
 
     index = _session_index(projects)
     for sid, path in index.items():
@@ -426,6 +427,84 @@ def _upsert_attempt(store, sid, row, seen):
     if verdict:
         run["verdict"] = verdict
     _emit_run(store, run, sid, label, row["started"], seen)
+
+
+def _close_vanished(store, attempts, now, only):
+    """End stored running attempts the scan no longer sees.
+
+    A live-only attempt (a ``running/<label>`` file, no TSV row yet)
+    whose running file is removed without a TSV row landing — a launch
+    that died before reporting — would otherwise stay ``running`` with
+    a dead pid forever: no later poll re-emits its run id. Close it
+    here under the source's own rule for a finished attempt with no TSV
+    row (``died_early``), stamping the end at the last store evidence.
+    A backfill-scoped poll (``only``) cannot see other sessions' pads,
+    so it must not close anything.
+    """
+    if only is not None:
+        return
+    listing = getattr(store, "running_tool_runs", None)
+    if not callable(listing):
+        return
+    try:
+        open_rows = listing()
+    except Exception:
+        return
+    try:
+        emitted = {
+            "commandcode:%s:%s" % (sid, row["label"]) for sid, row in attempts.items()
+        }
+    except Exception:
+        return
+    for row in open_rows or ():
+        if not isinstance(row, dict):
+            continue
+        if row.get("source") != NAME or row.get("status") != "running":
+            continue
+        run_id = row.get("run_id")
+        if not run_id or run_id in emitted:
+            continue
+        if _pid_alive(row.get("pid")):
+            continue
+        ended = _last_seen(store, run_id, row.get("started_at"))
+        if ended is None:
+            try:
+                ended = float(now)
+            except (TypeError, ValueError):
+                return
+        try:
+            store.upsert_run(
+                {
+                    "run_id": run_id,
+                    "status": "died_early",
+                    "ended_at": ended,
+                    "pid": None,
+                }
+            )
+        except Exception:
+            _fail("run")
+
+
+def _pid_alive(pid):
+    """Whether ``pid`` names a live process; a missing pid is not alive."""
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return False
+    return _alive(pid)
+
+
+def _last_seen(store, run_id, started_at):
+    """Last store evidence for a run, falling back to its start."""
+    latest = getattr(store, "last_activity", None)
+    if callable(latest):
+        try:
+            found = latest(run_id, started_at)
+        except Exception:
+            found = None
+        if found is not None:
+            return found
+    return started_at
 
 
 def _tsv_status(status):

@@ -45,9 +45,20 @@ class QueriesMixin:
             with self._lock:
                 return self._one("SELECT * FROM runs WHERE run_id=?", (run_id,))
         def running_tool_runs(self) -> list:
+            """Stored rows still marked running for the reconcile-covered sources.
+
+            ``pi`` rows join ``grok``/``muse``/``glm`` here: a pi launch
+            whose running file vanished before its TSV row named the
+            session id (or whose outdir dropped out of the scan) is never
+            re-emitted, so only the reconcile pass can end it.
+            ``commandcode`` rows ride along for the commandcode poll's
+            own vanished-attempt close-out; the reconcile pass still
+            skips them (no argv or comm identifies a Command Code
+            process, so liveness is the running file alone).
+            """
             with self._lock:
                 rows = self._conn.execute(
-                    "SELECT * FROM runs WHERE status='running' AND source IN ('grok','muse','glm')"
+                    "SELECT * FROM runs WHERE status='running' AND source IN ('grok','muse','glm','pi','commandcode')"
                 ).fetchall()
             return [dict(row) for row in rows]
         def unknown_tool_runs(self) -> list:

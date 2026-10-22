@@ -254,7 +254,13 @@ def _tsv_row(row, pad):
 
 
 def _live_rows(pad):
-    """Live launches in one outdir: ``running/<label>`` plus the stream session id."""
+    """Live launches in one outdir: ``running/<label>`` plus the stream session id.
+
+    A launch with no session id yet (the stream has not recorded its
+    ``session`` event) is skipped until the next poll: emitting it now
+    would key the run ``pi:<label>:<label>`` and orphan that row the
+    moment the stream or the TSV row names the real session.
+    """
     rdir = os.path.join(pad, RUNNING)
     try:
         names = os.listdir(rdir)
@@ -266,6 +272,9 @@ def _live_rows(pad):
         pid, model = _read_running(path)
         if pid is None:
             continue
+        sid = _stream_session(pad, label)
+        if sid is None:
+            continue
         try:
             started = os.stat(path).st_mtime
         except OSError:
@@ -273,7 +282,7 @@ def _live_rows(pad):
         out.append(
             {
                 "label": label,
-                "sid": _stream_session(pad, label),
+                "sid": sid,
                 "model": model,
                 "started": started,
                 "pad": pad,

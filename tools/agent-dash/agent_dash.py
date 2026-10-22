@@ -1332,7 +1332,7 @@ def cmd_db(argv: list[str] | None = None) -> int:
 
 
 def cmd_reconcile() -> int:
-    """Mark grok, muse, and glm rows whose process is gone.
+    """Mark grok, muse, glm, and pi rows whose process is gone.
 
     ``AGENT_DASH_DB`` selects the database. The default is the configured state dir.
     """

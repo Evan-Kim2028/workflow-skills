@@ -438,7 +438,7 @@ def apply_liveness(store, run: dict, source: str, processes) -> None:
 
 
 def reconcile_running(store, now: float, processes=None) -> int:
-    """End grok, muse, and glm rows still marked running after the process is gone.
+    """End grok, muse, glm, and pi rows still marked running after the process is gone.
 
     A muse row still marked unknown is adopted when a live process matches
     its prompt-file label or session uuid, and closed (``done`` with
@@ -451,7 +451,10 @@ def reconcile_running(store, now: float, processes=None) -> int:
     Orphan muse usage is moved onto the labeled run and the orphan row is
     deleted. A missing muse start is filled from the earliest usage event,
     and a finished end that sits before the latest usage event is raised to
-    it. Returns how many rows were ended because the process was gone.
+    it. Command Code rows are skipped here (no argv or comm identifies a
+    Command Code process): their own poll closes vanished attempts from
+    the running file alone. Returns how many rows were ended because the
+    process was gone.
     """
     if processes is None:
         processes = live_agent_processes(now)
@@ -524,14 +527,17 @@ def reconcile_running(store, now: float, processes=None) -> int:
 
 
 def _close_stale_claude_shell(store, now: float) -> int:
-    """Close lead-session and shell rows the sources no longer see.
+    """Close lead-session, shell, and generic rows the sources no longer see.
 
     Transcripts that aged out of the live window and deleted scratch dirs
     never get re-emitted, so a dead pid or an idle bound would linger
-    forever. The store's stale check (dead pid via the shared helper, or no
-    source evidence over the bound) names them; this closes them in the DB
-    with ``ended_at`` at the last DB evidence. Dagster rows are left to the
-    Dagster poll's by-id close-out.
+    forever; a generic run whose writer never appends a terminal line is
+    likewise never re-polled. The store's stale check (dead pid via the
+    shared helper, or no source evidence over the bound) names them; this
+    closes them in the DB with ``ended_at`` at the last DB evidence.
+    Dagster rows are left to the Dagster poll's by-id close-out, and
+    worker-harness rows (muse, glm, grok, pi, commandcode) to their own
+    polls and the reconcile pass above.
     """
     stale_fn = getattr(store, "stale_running", None)
     if not callable(stale_fn):
@@ -546,6 +552,7 @@ def _close_stale_claude_shell(store, now: float) -> int:
             "claude-main",
             "claude-subagent",
             "claude-workflow",
+            "generic",
             "shell",
         ):
             continue
