@@ -25,14 +25,12 @@ import time
 
 FREE_MODELS = [
     "reflection/beam:free",
-    "minimax/minimax-m3.1-flash:free",
-    "ornith/ornith-1.5-122b:free",
     "poolside/laguna-s-2.1-free",
     "stealth/glyph-cluster:free",
 ]
 COOLDOWN_S = 15 * 60
 MAX_ATTEMPTS = 8
-THROTTLE = re.compile(r"429|rate.?limit|too many requests|quota|throttl|capacity|overloaded|insufficient|credits|503", re.I)
+THROTTLE = re.compile(r"429|rate.?limit|too many requests|quota|throttl|capacity|overloaded|insufficient|credits|503|today's limit|no longer available", re.I)
 
 
 def locked(path, fn):
@@ -70,7 +68,17 @@ def pick(outdir, label):
     return locked(cd_path, _pick)
 
 
-def cool(outdir, model):
+RESETS = re.compile(r"Resets in (?:(\d+)h)?\s*(?:(\d+)m)?", re.I)
+
+
+def cooldown_for(text):
+    m = RESETS.search(text or "")
+    if m and (m.group(1) or m.group(2)):
+        return int(m.group(1) or 0) * 3600 + int(m.group(2) or 0) * 60 + 60
+    return COOLDOWN_S
+
+
+def cool(outdir, model, seconds=COOLDOWN_S):
     cd_path = os.path.join(outdir, "cooldown.json")
 
     def _cool():
@@ -78,7 +86,7 @@ def cool(outdir, model):
             cd = json.load(open(cd_path))
         except Exception:
             cd = {}
-        cd[model] = time.time() + COOLDOWN_S
+        cd[model] = time.time() + seconds
         json.dump(cd, open(cd_path, "w"))
 
     locked(cd_path, _cool)
@@ -144,7 +152,7 @@ def main():
             with open(os.path.join(outdir, f"out-{label}.md"), "w") as f:
                 f.write(f"<!-- model: {model} attempt {attempt} -->\n{text}\n")
             return 0
-        cool(outdir, model)
+        cool(outdir, model, cooldown_for(err_tail[-600:]))
     with open(os.path.join(outdir, f"out-{label}.md"), "w") as f:
         f.write(f"BLOCKED: every free model failed or throttled after {MAX_ATTEMPTS} attempts; see err-{label}.log\n")
     return 1
