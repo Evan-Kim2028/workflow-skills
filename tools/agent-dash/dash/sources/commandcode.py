@@ -115,7 +115,7 @@ def _outdirs(root, only=None):
     running folder exists from the first launch, before any attempt has
     finished, so a launch shows before its TSV row lands. Checked: the root
     itself, then ``<enc>/<session>/scratchpad`` and each folder under it.
-    The root may be an encoded-cwd folder (``/private/tmp/claude-501/*``)
+    The root may be an encoded-cwd folder (``<tmpdir>/claude-<uid>/*``)
     or the folder above one; both are walked.
     """
     found = []

@@ -1,4 +1,4 @@
-{"type":"session","version":3,"id":"01a16401-9955-70cd-bf8c-19944db4f20c","timestamp":"2026-10-22T14:26:28.821Z","cwd":"/private/tmp/claude-501/-Users-evandekim-Documents-projects-lake-of-rage/f2f3614d-8b3e-4a7e-a452-b7be86d60884/scratchpad"}
+{"type":"session","version":3,"id":"01a16401-9955-70cd-bf8c-19944db4f20c","timestamp":"2026-10-22T14:26:28.821Z","cwd":"/tmp/scratchpad"}
 {"type":"agent_start"}
 {"type":"turn_start"}
 {"type":"message_start","message":{"role":"user","content":[{"type":"text","text":"Run 'echo hi' with bash, then reply DONE."}],"timestamp":1792679188837}}

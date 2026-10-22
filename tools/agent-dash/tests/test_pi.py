@@ -281,7 +281,7 @@ class SourceTest(unittest.TestCase):
 class ProcessLivenessTest(unittest.TestCase):
     def test_pi_label_from_prompt_path(self):
         argv = (
-            "424242 node /Users/x/node_modules/@mariozechner/pi-coding-agent/dist/cli.js "
+            "424242 node /opt/x/node_modules/@mariozechner/pi-coding-agent/dist/cli.js "
             "-p --mode json --session-dir /tmp/s --model river/deepseek-ai/DeepSeek-V4.1-Flash "
             "@/tmp/pi/ws15-exec-wire.md Do the task"
         )

@@ -117,7 +117,7 @@ class Fixture(unittest.TestCase):
         self.tmp = Path(self._tmp.name)
         self.scratch = self.tmp / "scratch"
         self.projects = self.tmp / "projects"
-        self.pad = self.scratch / "-users-evandekim-x" / SID_OK / "scratchpad" / "cmd"
+        self.pad = self.scratch / "-home-someone-x" / SID_OK / "scratchpad" / "cmd"
         self.pad.mkdir(parents=True)
         self.store = Store()
 
@@ -138,7 +138,7 @@ class Fixture(unittest.TestCase):
         text = HEADER + "".join("\t".join(str(x) for x in row) + "\n" for row in rows)
         (self.pad / "cmd-sessions.tsv").write_text(text, encoding="utf-8")
 
-    def project_dir(self, cwd_name="users-evandekim-documents-projects-lake-of-rage"):
+    def project_dir(self, cwd_name="home-someone-projects-demo-repo"):
         path = self.projects / cwd_name
         path.mkdir(parents=True, exist_ok=True)
         return path
@@ -192,7 +192,7 @@ class PollTest(Fixture):
         session_file(
             self.project_dir() / (SID_OK + ".jsonl"),
             SID_OK,
-            "/Users/evandekim/Documents/projects/lake-of-rage",
+            "/home/someone/projects/demo-repo",
             [assistant("a1", "reflection/beam:free", 19482, 7168, 114, "2026-10-22T00:57:05.000Z"), assistant("a2", "reflection/beam:free", 25099, 19456, 67, "2026-10-22T00:57:09.000Z")],
         )
         self.poll()
@@ -228,7 +228,7 @@ class PollTest(Fixture):
     def test_root_may_be_the_encoded_cwd_folder(self):
         self.write_tsv([["ws6-plan-enc", "reflection/beam:free", SID_OK, 1792000000, 1792000100, 10, 2, "ok"]])
         cfg = self.cfg()
-        cfg["roots"]["scratchpads"] = [str(self.scratch / "-Users-evandekim-x")]
+        cfg["roots"]["scratchpads"] = [str(self.scratch / "-home-someone-x")]
         cc.poll(self.store, cfg, 1_800_000_000.0)
         self.assertIn("commandcode:%s:ws6-plan-enc" % SID_OK, self.store.runs)
 
@@ -278,9 +278,9 @@ class PollTest(Fixture):
 
     def test_unlabelled_session_is_a_run_with_no_label(self):
         session_file(
-            self.project_dir("users-evandekim-documents-projects-traded") / (SID_INTERACTIVE + ".jsonl"),
+            self.project_dir("home-someone-projects-other-repo") / (SID_INTERACTIVE + ".jsonl"),
             SID_INTERACTIVE,
-            "/Users/evandekim/Documents/projects/traded",
+            "/home/someone/projects/other-repo",
             [assistant("i1", "reflection/beam:free", 30000, 29000, 400, "2026-10-21T14:51:32.000Z")],
         )
         self.poll()
