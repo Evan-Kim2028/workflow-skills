@@ -58,6 +58,8 @@ class GenericUnitTests(unittest.TestCase):
         self.assertEqual(generic.tier_of("glm-5.3"), "glm")
         self.assertEqual(generic.tier_of("grok-4.7-high"), "grok")
         self.assertEqual(generic.tier_of("claude-opus-5-5"), "opus")
+        self.assertEqual(generic.tier_of("reflection/Beam-1.0-501B-A23B:xhigh"), "beam")
+        self.assertEqual(generic.tier_of("reflection-beam"), "beam")
         self.assertEqual(generic.tier_of("some-other-model"), "generic")
         self.assertEqual(generic.tier_of(None), "generic")
 

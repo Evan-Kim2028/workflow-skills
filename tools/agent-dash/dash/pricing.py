@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import threading
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -94,6 +95,8 @@ def series_key(model: str | None) -> str:
     if fam:
         return fam
     text = (model or "").lower()
+    if "beam" in text:
+        return "beam"
     if text in _COMMANDCODE_FREE:
         return "commandcode"
     for name in ("grok", "muse", "glm", "deepseek", "codex"):
@@ -435,11 +438,28 @@ _index_memo: dict = {}
 _INDEX_LIMIT = 16
 
 
+#: Effort suffix a harness appends to a catalog id (pi logs
+#: ``reflection/Beam-1.0-501B-A23B:xhigh``). The lookup strips one on an
+#: exact miss and retries the bare id, so one row prices every effort level.
+_EFFORT_SUFFIX = re.compile(r":(xhigh|high|medium|low)$", re.IGNORECASE)
+
+
+def _bare_id(model) -> str | None:
+    if not isinstance(model, str):
+        return None
+    bare = _EFFORT_SUFFIX.sub("", model)
+    return bare if bare != model else None
+
+
 def _lookup(model, table):
     if not model:
         return None
     if isinstance(table, dict):
-        return table.get(model)
+        hit = table.get(model)
+        if hit is None:
+            bare = _bare_id(model)
+            hit = table.get(bare) if bare is not None else None
+        return hit
     memo = _index_memo.get(id(table))
     if memo is None or memo[0] is not table:
         index: dict = {}
@@ -451,9 +471,17 @@ def _lookup(model, table):
             _index_memo[id(table)] = (table, index)
         memo = (table, index)
     try:
-        return memo[1].get(model)
+        hit = memo[1].get(model)
     except TypeError:
         return None
+    if hit is None:
+        bare = _bare_id(model)
+        if bare is not None:
+            try:
+                hit = memo[1].get(bare)
+            except TypeError:
+                hit = None
+    return hit
 
 
 def _prompt_len(row, input_tokens, cache_read, cache_write) -> int:

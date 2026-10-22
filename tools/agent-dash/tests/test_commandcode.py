@@ -324,6 +324,11 @@ class FreeModelPricingTest(unittest.TestCase):
 
     def test_families_and_series(self):
         for model in FREE:
+            if "beam" in model:
+                self.assertEqual(model_key(model, "commandcode"), ("beam", "beam"))
+                self.assertEqual(model_key(model, ""), ("beam", "beam"), model)
+                self.assertEqual(pricing.series_key(model), "beam")
+                continue
             self.assertEqual(model_key(model, "commandcode")[0], "commandcode")
             self.assertEqual(model_key(model, "")[0], "commandcode", model)
             self.assertEqual(pricing.series_key(model), "commandcode")

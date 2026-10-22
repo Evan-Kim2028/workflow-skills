@@ -279,6 +279,40 @@ class CatalogTest(unittest.TestCase):
         self.assertEqual(by_model["muse-wonder-full-1.0"]["confidence"], "unknown")
 
 
+class BeamPricingTest(unittest.TestCase):
+    def test_beam_and_free_ids_price_at_zero(self):
+        for model in (
+            "reflection/beam:free",
+            "minimax/minimax-m3.1-flash:free",
+            "ornith/ornith-1.5-122b:free",
+            "poolside/laguna-s-2.1-free",
+            "stealth/glyph-cluster:free",
+            "reflection/Beam-1.0-501B-A23B",
+            "reflection/Beam-1.0-501B-A23B:xhigh",
+            "reflection/Beam-1.0-501B-A23B:high",
+            "Beam-1.0-501B-A23B",
+            "reflection-beam",
+            "reflection-beam:xhigh",
+        ):
+            info = status(model)
+            self.assertTrue(info["priced"], model)
+            self.assertEqual(info["billing_mode"], "free", model)
+            self.assertEqual(cost(model, 1_000_000, 500_000, 250_000, 0), 0.0, model)
+
+    def test_beam_series_and_effort_suffix_fallback(self):
+        from dash.pricing import series_key
+
+        for model in (
+            "reflection/beam:free",
+            "reflection/Beam-1.0-501B-A23B",
+            "reflection/Beam-1.0-501B-A23B:xhigh",
+            "reflection-beam",
+        ):
+            self.assertEqual(series_key(model), "beam", model)
+        self.assertIsNone(cost("someprovider/new-model:xhigh", 1000, 100, 0, 0))
+        self.assertFalse(status("someprovider/new-model:xhigh")["priced"])
+
+
 class RepriceTest(unittest.TestCase):
     def test_migrate_adds_split_columns(self):
         with tempfile.TemporaryDirectory() as tmp:

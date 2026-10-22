@@ -56,7 +56,7 @@ def tier_of(model: str | None) -> str:
     if not model or not isinstance(model, str):
         return "generic"
     text = model.lower()
-    for name in ("opus", "sonnet", "haiku", "muse", "glm", "grok"):
+    for name in ("beam", "opus", "sonnet", "haiku", "muse", "glm", "grok"):
         if name in text:
             return name
     return "generic"
