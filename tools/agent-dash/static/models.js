@@ -77,7 +77,7 @@
   }
   function nameOf(key) {
     if (/^dagster:/.test(key)) return key.slice(8) || "job";
-    if (famOf(key) === "commandcode") return key;
+    if (famOf(key) === "commandcode") return key.slice(key.lastIndexOf("/") + 1);
     if (/-unknown$/.test(key)) return "model not recorded";
     if (key === "deepseek-flash") return "DeepSeek V4.1 Flash";
     if (key === "deepseek-v4-pro") return "DeepSeek V4 Pro";
