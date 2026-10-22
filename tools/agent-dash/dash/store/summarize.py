@@ -11,7 +11,7 @@ from __future__ import annotations
 import copy as _copy
 
 from dash import perfmon as _perf
-from dash.models import run_model_key
+from dash.models import HARNESS_NAMES, harness_of, run_model_key
 from dash.outcomes import outcome_class, outcome_reason
 
 from .runs import (_is_manifest_twin, _nearest_twin,
@@ -794,10 +794,13 @@ class SummarizeMixin:
             else:
                 tokens = {key: 0 for key in BILLED_FIELDS}
                 cost_usd = 0.0
+            harness = harness_of(data)
             return {
                 "run_id": data["run_id"],
                 "source": data.get("source"),
                 "tier": data.get("tier"),
+                "harness": harness,
+                "harness_name": HARNESS_NAMES.get(harness, harness),
                 "model": data.get("model"),
                 "label": data.get("label"),
                 "workstream": data.get("workstream"),

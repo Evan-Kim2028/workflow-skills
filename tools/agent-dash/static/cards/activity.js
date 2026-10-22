@@ -322,7 +322,7 @@
     });
     (loaded.usage || []).forEach(function (b) {
       if (!(b.t + 3600 > range.from && b.t < range.to)) return;
-      var k = state.groupBy === "model" ? modelKey(b.key) : null;
+      var k = state.groupBy === "model" ? String(b.key || "other") : null;
       if (k && AdUnatt.isUnattributed(k))
         tokens += (b.input || 0) + (b.output || 0) + (b.cache_read || 0) + (b.cache_write || 0);
     });
@@ -634,8 +634,10 @@
     var byModel = state.groupBy === "model";
     var showU = AdUnatt.shown(actScope());
     var hours = {}, keys = {};
-    B.forEach(function (b) { var k = state.groupBy === "model" ? modelKey(b.key) : (b.key || "unassigned"); var tot = (b.input || 0) + (b.output || 0) + (b.cache_read || 0) + (b.cache_write || 0); hours[b.t] = hours[b.t] || {}; hours[b.t][k] = (hours[b.t][k] || 0) + tot; keys[k] = 1; });
-    var allKs = byModel ? ADM.sortKeys(Object.keys(keys)) : Object.keys(keys).sort();
+    /* Model-grouped cells arrive as model@harness series keys; the stack
+       splits harnesses of one model instead of folding them together. */
+    B.forEach(function (b) { var k = state.groupBy === "model" ? String(b.key || "other") : (b.key || "unassigned"); var tot = (b.input || 0) + (b.output || 0) + (b.cache_read || 0) + (b.cache_write || 0); hours[b.t] = hours[b.t] || {}; hours[b.t][k] = (hours[b.t][k] || 0) + tot; keys[k] = 1; });
+    var allKs = byModel ? ADM.sortSeries(Object.keys(keys)) : Object.keys(keys).sort();
     /* Runs without a recorded model stay out of the model lists by
        default; the stacked total keeps them as one muted Unattributed
        segment, so the bars still sum to the legend Total. */
@@ -656,14 +658,15 @@
     var ltotal = el("span", {class: "ltotal", title: "Tokens in the selected range, input + output + cache read + cache write.", "data-legend-total": String(grand), "data-chart-sum": String(grand)}, [el("b", {text: "Total " + fmtN(grand)}), document.createTextNode(" \u00B7 " + fmtN(ts.length ? grand / ts.length : 0) + "/h avg \u00B7 peak " + fmtN(max) + "/h")]);
     lg.appendChild(ltotal);
     if (byModel) {
-      var famTot = {};
-      allKs.forEach(function (k) { var f = ADM.famOf(k); famTot[f] = (famTot[f] || 0) + (keyTot[k] || 0); });
-      ADM.FAMS.forEach(function (f) {
-        if (!famTot[f]) return;
-        var sp = el("span", {class: "lentry", "data-key": f, "data-v": String(famTot[f]), title: actLegendTip(ADM.FAM[f].name, famTot[f])});
-        var sw = el("i", {class: "sw"}); sw.style.background = ADM.famColor(f); sp.appendChild(sw);
-        sp.appendChild(el("span", {class: "lname", text: ADM.FAM[f].name}));
-        sp.appendChild(el("span", {class: "lv", text: fmtN(famTot[f])}));
+      /* One entry per model@harness series in family order: the word
+         names the model and the harness, the shade names the harness
+         within its family hue. */
+      allKs.forEach(function (k) {
+        if (!keyTot[k]) return;
+        var sp = el("span", {class: "lentry", "data-key": k, "data-v": String(keyTot[k]), title: actLegendTip(ADM.seriesName(k), keyTot[k])});
+        var sw = el("i", {class: "sw"}); sw.style.background = ADM.seriesColor(k, allKs); sp.appendChild(sw);
+        sp.appendChild(el("span", {class: "lname", text: ADM.seriesName(k)}));
+        sp.appendChild(el("span", {class: "lv", text: fmtN(keyTot[k])}));
         lg.appendChild(sp);
       });
       if (hideU && hiddenTotal > 0) {
@@ -703,7 +706,7 @@
       var dks = ks.slice();
       if (hideU && hourHidden(t) > 0) dks.push("unattributed");
       function segVal(k) { return k === "unattributed" ? hourHidden(t) : (hours[t][k] || 0); }
-      function segFill(k) { return k === "unattributed" ? "var(--muted)" : colorOf(k, state.groupBy); }
+      function segFill(k) { return k === "unattributed" ? "var(--muted)" : (byModel ? ADM.seriesColor(k, allKs) : colorOf(k, state.groupBy)); }
       var order = [];
       dks.forEach(function (k, ki) { if (segVal(k)) order.push(ki); });
       var topKi = order.length ? order[order.length - 1] : -1;
@@ -734,7 +737,7 @@
       var hourTot = tots[t];
       var hit = s("rect", {x: x - 1, y: T, width: bw + 2, height: ph, fill: "transparent", "data-t": String(t), "data-v": String(hourTot)});
       hit.addEventListener("mousemove", function (ev) {
-        showTip(ev, fmtDate(t), [{k: "Total", v: fmtN(hourTot), c: "var(--ink)"}].concat(dks.filter(function (k) { return segVal(k); }).map(function (k) { return {k: k === "unattributed" ? "Unattributed" : (byModel ? fullName(k) : k), v: fmtN(segVal(k)), c: segFill(k)}; })));
+        showTip(ev, fmtDate(t), [{k: "Total", v: fmtN(hourTot), c: "var(--ink)"}].concat(dks.filter(function (k) { return segVal(k); }).map(function (k) { return {k: k === "unattributed" ? "Unattributed" : (byModel ? ADM.seriesName(k) : k), v: fmtN(segVal(k)), c: segFill(k)}; })));
         var root = svg.parentNode && svg.parentNode.parentNode;
         if (root && root.actCrossMove) root.actCrossMove(t + 1800);
       });
@@ -836,14 +839,16 @@
       var runs = byFam[f], lane = {fam: f, runs: runs, dense: false, subs: [], rows: null, dims: null, h: 0};
       if (expanded[f]) {
         var byM = {}, y = 0;
-        runs.forEach(function (r) { var k = tierKey(r); (byM[k] = byM[k] || []).push(r); });
-        /* One row per model: rows without a recorded model stay undrawn
-           by default, while the lane count above still includes them. */
-        var mks = ADM.sortKeys(Object.keys(byM));
+        /* One row per model plus harness: the same model under two
+           harnesses draws two rows, "Beam 1.0 · pi" beside
+           "Beam 1.0 · Grok Build". Rows without a recorded model stay
+           undrawn by default, while the lane count above includes them. */
+        runs.forEach(function (r) { var k = tierKey(r) + "@" + ADM.harnessOf(r); (byM[k] = byM[k] || []).push(r); });
+        var mks = ADM.sortSeries(Object.keys(byM));
         if (!AdUnatt.shown(actScope())) mks = AdUnatt.filterKnown(mks);
         mks.forEach(function (k) {
           var mrows = packRows(byM[k], 20), dd = actLaneDims(mrows.length);
-          lane.subs.push({name: fullName(k), runs: byM[k], rows: mrows, dims: dd, y: y});
+          lane.subs.push({name: ADM.seriesName(k), runs: byM[k], rows: mrows, dims: dd, y: y});
           y += 16 + dd.h + 6;
         });
         lane.h = y;
@@ -955,7 +960,7 @@
         lane.rows.forEach(function (row) {
           row.runs.forEach(function (r) {
             var e = barEndpoints(r);
-            actDrawBar(svg, r, X(e.a), X(e.b), ry2, ddz.rowH, fullName(tierKey(r)), now, e.clip);
+            actDrawBar(svg, r, X(e.a), X(e.b), ry2, ddz.rowH, fullName(tierKey(r)) + " \u00B7 " + ADM.harnessName(ADM.harnessOf(r)), now, e.clip);
           });
           ry2 += ddz.rowH + ddz.rowGap;
         });
@@ -1170,7 +1175,7 @@
   function actConcFams(keys) {
     var fams = [];
     (keys || []).forEach(function (k) {
-      var f = ADM.famOf(k);
+      var f = ADM.seriesFam(k);
       if (fams.indexOf(f) < 0) fams.push(f);
     });
     return ADM.FAMS.filter(function (f) { return fams.indexOf(f) >= 0; });
@@ -1188,8 +1193,8 @@
     var from = range.from, to = range.to;
     P = P || (loaded.conc || []).filter(function (p) { return p.t >= from - 60 && p.t <= to; });
     seen = seen || {};
-    var all = ADM.sortKeys(Object.keys(seen).length ? Object.keys(seen) : Object.keys((function () { var o = {}; P.forEach(function (p) { var m = actMods(p); for (var k in m) if (m[k]) o[k] = 1; }); return o; })()));
-    function famKeys(f) { return all.filter(function (k) { return ADM.famOf(k) === f; }); }
+    var all = ADM.sortSeries(Object.keys(seen).length ? Object.keys(seen) : Object.keys((function () { var o = {}; P.forEach(function (p) { var m = actMods(p); for (var k in m) if (m[k]) o[k] = 1; }); return o; })()));
+    function famKeys(f) { return all.filter(function (k) { return ADM.seriesFam(k) === f; }); }
     var ks = famKeys(fam);
     var series = P.map(function (p) { var m = actMods(p), sum = 0; ks.forEach(function (k) { sum += m[k] || 0; }); return sum; });
     var peak = 0;
@@ -1206,7 +1211,7 @@
        counts them instead of reading empty. */
     var dispKs = AdUnatt.shown(actScope()) ? ks : AdUnatt.filterKnown(ks);
     var hidKs = ks.length - dispKs.length;
-    head.appendChild(el("span", {class: "conc-models", text: dispKs.length ? dispKs.map(function (k) { return ADM.nameOf(k); }).join(", ") + (hidKs ? " · +" + fmtN(hidKs) + " unattributed" : "") : (ks.length ? "+" + fmtN(ks.length) + " unattributed" : "no models seen")}));
+    head.appendChild(el("span", {class: "conc-models", text: dispKs.length ? dispKs.map(function (k) { return ADM.seriesName(k); }).join(", ") + (hidKs ? " · +" + fmtN(hidKs) + " unattributed" : "") : (ks.length ? "+" + fmtN(ks.length) + " unattributed" : "no models seen")}));
     head.appendChild(el("span", {class: "conc-pk", text: "pk " + peak}));
     wrap.appendChild(head);
     var W = g.W, L = g.L, R = g.R, H = withX ? 112 : 72, T = 20, Bm = withX ? 36 : 10, pw = g.pw, ph = H - T - Bm;
@@ -1241,14 +1246,14 @@
       var m = actMods(best), rows = [];
       var showCU = AdUnatt.shown(actScope());
       actConcFams(all).forEach(function (f) {
-        var fks = all.filter(function (k) { return ADM.famOf(k) === f; });
+        var fks = all.filter(function (k) { return ADM.seriesFam(k) === f; });
         var tot = fks.reduce(function (a, k) { return a + (m[k] || 0); }, 0);
         rows.push({k: ADM.FAM[f].name, v: fmtN(tot), c: ADM.famColor(f)});
         var hid = 0;
         fks.forEach(function (k) {
           if (!m[k]) return;
           if (!showCU && AdUnatt.isUnattributed(k)) { hid += m[k]; return; }
-          rows.push({k: "\u2003" + ADM.nameOf(k), v: fmtN(m[k]), c: ADM.colorOf(k)});
+          rows.push({k: "\u2003" + ADM.seriesName(k), v: fmtN(m[k]), c: ADM.seriesColor(k, all)});
         });
         if (hid) rows.push({k: "\u2003Unattributed", v: fmtN(hid), c: "var(--muted)"});
       });

@@ -9,7 +9,11 @@ id containing ``beam`` (case-insensitive) maps to the ``beam`` family under
 ``beam-<ver>`` when the id carries a version (``reflection/Beam-1.0`` reads
 ``beam-1.0``) else ``beam``, whichever harness ran it. Codex ids (``gpt-*``,
 ``codex-*``, ``gpt-reserve``) map to the ``codex`` family under their
-lowercased id. A run whose model id was never recorded gets
+lowercased id. ``harness_of`` reads the runner (``pi``, ``commandcode``,
+``grok-cli`` for a ``glm`` source, ...) from the source (and the tier when
+the source is generic); run views carry it as ``harness`` beside the model,
+the way they carry ``outcome_class``. A run whose model id was never
+recorded gets
 ``<family>-unknown``. A Grok CLI run whose model id is recorded but matches
 no known family (``mimo-*``, ``step-*``, or any other grok-hosted id) maps
 to ``other``: only an empty id falls back to ``glm-unknown``. A Dagster job
@@ -88,3 +92,54 @@ def run_model_key(run: dict) -> str:
     """Model key for a run row."""
     hint = " ".join(str(run.get(name) or "") for name in ("tier", "source"))
     return model_key(run.get("model"), hint)[1]
+
+
+#: Harness display names. ``harness_of`` reads the runner from a run row;
+#: the page mirrors it as ``ADM.harnessOf``.
+HARNESS_NAMES = {
+    "claude": "Claude Code",
+    "muse": "muse",
+    "cursor": "Cursor",
+    "grok-cli": "Grok Build",
+    "pi": "pi",
+    "commandcode": "Command Code",
+    "codex": "Codex",
+    "dagster": "dagster",
+    "generic": "generic",
+}
+
+
+def harness_of(run: dict) -> str:
+    """Harness that ran a run, from its source (and its tier when generic).
+
+    ``claude-*`` reads ``claude``, ``muse`` reads ``muse``, ``grok`` and
+    ``cursor`` read ``cursor``, a ``glm`` source reads ``grok-cli``, ``pi``
+    reads ``pi``, ``commandcode`` reads ``commandcode``, ``codex*`` reads
+    ``codex``, ``dagster`` reads ``dagster`` and ``generic`` reads
+    ``generic``; anything else reads back the source string. A generic
+    run's tier is the closest harness bucket the reporter chose, so the
+    same mapping reads it (a ``beam`` tier still means the generic
+    harness running a Beam model).
+    """
+    source = str(run.get("source") or "")
+    tier = str(run.get("tier") or "")
+    key = (tier if source == "generic" else source).lower()
+    if key.startswith("claude") or key in ("opus", "sonnet", "haiku", "fable"):
+        return "claude"
+    if key == "muse":
+        return "muse"
+    if key in ("grok", "cursor", "composer"):
+        return "cursor"
+    if key == "glm":
+        return "grok-cli"
+    if key == "pi":
+        return "pi"
+    if key == "commandcode":
+        return "commandcode"
+    if key.startswith("codex"):
+        return "codex"
+    if key == "dagster":
+        return "dagster"
+    if key == "generic":
+        return "generic"
+    return source or "generic"

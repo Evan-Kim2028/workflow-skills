@@ -12,7 +12,7 @@ import os as _os
 
 from dash import perfmon as _perf
 from dash.attribution import clean_label
-from dash.models import model_key
+from dash.models import harness_of, model_key
 from dash.pricing import _band_cached
 from dash.pricing import _lookup as _price_lookup
 from dash.pricing import _prompt_len as _price_prompt_len
@@ -232,6 +232,7 @@ class UsageMixin:
                     continue
                 if group == "model":
                     key = model_key(row["model"], row["tool"])[1]
+                    key = "%s@%s" % (key, harness_of({"source": row["tool"]}))
                 elif group == "family":
                     key = series_key(row["model"])
                 elif group == "workstream":

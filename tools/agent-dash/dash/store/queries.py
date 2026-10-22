@@ -10,7 +10,7 @@ from __future__ import annotations
 from bisect import bisect_right
 
 from dash.attribution import clean_label
-from dash.models import run_model_key
+from dash.models import harness_of, run_model_key
 
 from .runs import _parent_map
 from .summarize import _scope_tab
@@ -319,9 +319,11 @@ class QueriesMixin:
                 start = run.get("started_at")
                 if start is None:
                     continue
-                lane = lanes.get((key, run_model_key(run)))
+                model = run_model_key(run)
+                series = "%s@%s" % (model, harness_of(run))
+                lane = lanes.get((key, series))
                 if lane is None:
-                    lane = lanes[(key, run_model_key(run))] = ([], [], [])
+                    lane = lanes[(key, series)] = ([], [], [])
                 if run.get("status") == "running":
                     if run["run_id"] in stall_end:
                         lane[0].append(start)
@@ -347,13 +349,13 @@ class QueriesMixin:
                     break
                 live = t <= now
                 point = {"t": t, **{key: 0 for key in TOOL_KEYS}, "models": {}}
-                for (key, model), (starts, ends, open_starts) in lanes.items():
+                for (key, series), (starts, ends, open_starts) in lanes.items():
                     active = bisect_right(starts, t) - bisect_right(ends, t)
                     if live:
                         active += bisect_right(open_starts, t)
                     if active:
                         point[key] += active
-                        point["models"][model] = point["models"].get(model, 0) + active
+                        point["models"][series] = point["models"].get(series, 0) + active
                 points.append(point)
             return points
         def query_sessions(self) -> list:

@@ -183,7 +183,7 @@ class StoreTest(unittest.TestCase):
         ).fetchone()["est_cost_usd"]
         self.assertAlmostEqual(stored, cost("claude-opus-5-5", 2000, 20, 0, 0))
         hours = self.store.query_usage("model", "hour", None, None)
-        self.assertEqual([(row["t"], row["key"], row["input"]) for row in hours], [(0, "opus", 2000), (3600, "opus", 1)])
+        self.assertEqual([(row["t"], row["key"], row["input"]) for row in hours], [(0, "opus@claude", 2000), (3600, "opus@claude", 1)])
         days = self.store.query_usage("model", "day", "WS1", None)
         self.assertEqual(len(days), 1)
         self.assertEqual(days[0]["input"], 2001)
@@ -242,7 +242,7 @@ class StoreTest(unittest.TestCase):
         self.assertEqual(snap["totals"]["cost_usd"], 0.0)
         self.assertIsNone(snap["recent"][0]["cost_usd"])
         buckets = self.store.query_usage("model", "hour", None, None)
-        self.assertEqual(buckets[0]["key"], "glm")
+        self.assertEqual(buckets[0]["key"], "glm@grok-cli")
         self.assertIsNone(buckets[0]["cost_usd"])
 
     def test_zero_token_unpriced_model_is_ignored(self):
@@ -1866,7 +1866,7 @@ class SnapshotUsageTest(unittest.TestCase):
             snap = self.store.snapshot(self.now, ws, self.since, self.until, usage_group="model")
             self.assert_buckets_match_totals(snap, f"model/{ws}")
         scoped = self.store.snapshot(self.now, "WS1", self.since, self.until, usage_group="model")
-        self.assertEqual({cell["key"] for cell in scoped["usage"]}, {"sonnet"})
+        self.assertEqual({cell["key"] for cell in scoped["usage"]}, {"sonnet@muse"})
 
     def test_workstream_buckets_sum_to_totals(self):
         self.seed()
