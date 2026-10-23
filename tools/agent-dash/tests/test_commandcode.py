@@ -238,6 +238,15 @@ class PollTest(Fixture):
         cc.poll(self.store, cfg, 1_800_000_000.0)
         self.assertIn("commandcode:%s:ws6-plan-enc" % SID_OK, self.store.runs)
 
+    def test_attempt_links_to_lead_session_from_pad(self):
+        # The cmd outdir under a session scratchpad names the lead
+        # session that launched the worker.
+        self.write_tsv([["ws6-plan-pad", "reflection/beam:free", SID_OK, 1792000000, 1792000100, 10, 2, "ok"]])
+        self.project_dir()
+        self.poll()
+        run = self.store.runs["commandcode:%s:ws6-plan-pad" % SID_OK]
+        self.assertEqual(run["parent_session_id"], SID_OK)
+
     def test_failed_row_is_died_early_without_verdict(self):
         self.write_tsv([["ws6-plan-bad", "poolside/laguna-s-2.1-free", "-", 1792000000, 1792000003, 0, 0, "failed rc=1"]])
         self.poll()

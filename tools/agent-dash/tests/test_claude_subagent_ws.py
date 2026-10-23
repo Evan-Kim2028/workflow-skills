@@ -30,6 +30,7 @@ import datetime
 import json
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -521,6 +522,145 @@ class SpawnLinkTests(unittest.TestCase):
             if "@WS" in row["run_id"]
         ]
         self.assertEqual(sliced, [])
+
+
+class LeadWorkerInferenceTests(unittest.TestCase):
+    """A lead session takes the plurality workstream of its labelled workers.
+
+    Voters are worker-harness runs linked by ``parent_session_id``
+    (muse/glm/grok/pi/commandcode/generic) over the attribution
+    window; hub-prefixed lanes and unattributed rows never vote, and
+    subagent rows inherit from the session instead of voting for it.
+    """
+
+    LEAD = "lead-ws6-0000-0000-0000-000000000000"
+
+    def setUp(self):
+        claude.reset_state()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.store = Store(Path(self.tmp.name) / "dash.sqlite")
+
+    def tearDown(self):
+        self.store.close()
+        self.tmp.cleanup()
+        claude.reset_state()
+
+    def _worker(self, tag, label, age_s, source="muse", parent=None):
+        now = time.time()
+        self.store.upsert_run(
+            {
+                "run_id": f"{source}:{tag}:{label}",
+                "source": source,
+                "session_id": tag,
+                "parent_session_id": parent if parent is not None else self.LEAD,
+                "label": label,
+                "status": "done",
+                "started_at": now - age_s,
+                "ended_at": now - age_s + 10,
+            }
+        )
+
+    def _session(self, sid=None):
+        return self.store._one(
+            "SELECT * FROM sessions WHERE session_id=?", (sid or self.LEAD,)
+        )
+
+    def test_day_old_labelled_children_attribute_the_lead(self):
+        # Seven ws6 workers launched ~21 h ago: inside the window, a
+        # unanimous plurality, so the lead reads WS6 inferred.
+        for index in range(7):
+            self._worker(f"ws6-{index}", f"ws6-exec-task-{index}", 21 * 3600)
+        self.store.upsert_session(
+            {"session_id": self.LEAD, "tool": "claude", "status": "busy"}
+        )
+        session = self._session()
+        self.assertEqual(session["workstream"], "WS6")
+        self.assertEqual(session["ws_confidence"], "inferred")
+
+    def test_hub_children_do_not_vote(self):
+        # Three ws6 workers plus three hub lanes carrying WS9: the hub
+        # rows are cross-cutting orchestration, so the lead still reads
+        # WS6 instead of deadlocking on a tie.
+        for index in range(3):
+            self._worker(f"ws6-{index}", f"ws6-exec-task-{index}", 100)
+        now = time.time()
+        for index in range(3):
+            self.store._conn.execute(
+                "INSERT INTO runs (run_id, source, session_id,"
+                " parent_session_id, label, workstream, ws_confidence,"
+                " status, started_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    f"muse:hub-{index}:hub-exec-thing-{index}",
+                    "muse",
+                    f"hub-{index}",
+                    self.LEAD,
+                    f"hub-exec-thing-{index}",
+                    "WS9",
+                    "inherited",
+                    "done",
+                    now - 100,
+                ),
+            )
+        self.store._conn.commit()
+        self.store.upsert_session(
+            {"session_id": self.LEAD, "tool": "claude", "status": "busy"}
+        )
+        session = self._session()
+        self.assertEqual(session["workstream"], "WS6")
+        self.assertEqual(session["ws_confidence"], "inferred")
+
+    def test_subagent_children_do_not_vote(self):
+        # Three ws4 subagents alone leave the lead unassigned: they
+        # inherit from the session, so their votes would be circular.
+        for index in range(3):
+            self._worker(
+                f"sub-{index}",
+                f"ws4-task-{index}",
+                100,
+                source="claude-subagent",
+            )
+        self.store.upsert_session(
+            {"session_id": self.LEAD, "tool": "claude", "status": "busy"}
+        )
+        session = self._session()
+        self.assertIsNone(session["workstream"])
+        self.assertIsNone(session["ws_confidence"])
+
+    def test_subagent_inherits_session_workstream_unless_labelled(self):
+        for index in range(3):
+            self._worker(f"ws6-{index}", f"ws6-exec-task-{index}", 100)
+        self.store.upsert_session(
+            {"session_id": self.LEAD, "tool": "claude", "status": "busy"}
+        )
+        self.assertEqual(self._session()["workstream"], "WS6")
+        self.store.upsert_run(
+            {
+                "run_id": f"claude-subagent:{self.LEAD}:aaa",
+                "source": "claude-subagent",
+                "session_id": self.LEAD,
+                "parent_session_id": self.LEAD,
+                "label": "helper",
+                "status": "running",
+                "started_at": time.time(),
+            }
+        )
+        plain = self.store.get_run(f"claude-subagent:{self.LEAD}:aaa")
+        self.assertEqual(plain["workstream"], "WS6")
+        self.assertEqual(plain["ws_confidence"], "inherited")
+        self.store.upsert_run(
+            {
+                "run_id": f"claude-subagent:{self.LEAD}:bbb",
+                "source": "claude-subagent",
+                "session_id": self.LEAD,
+                "parent_session_id": self.LEAD,
+                "label": "ws7-review-thing",
+                "status": "running",
+                "started_at": time.time(),
+            }
+        )
+        labelled = self.store.get_run(f"claude-subagent:{self.LEAD}:bbb")
+        self.assertEqual(labelled["workstream"], "WS7")
+        self.assertEqual(labelled["ws_confidence"], "regex")
 
 
 if __name__ == "__main__":

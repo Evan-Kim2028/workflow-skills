@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -45,8 +46,14 @@ if str(ROOT) not in sys.path:
 
 from dash import labels as label_lib  # noqa: E402
 from dash.sources import pi as pi_source  # noqa: E402
+from dash.sources.manifests import parent_session_from_pad  # noqa: E402
 
 DEFAULT_MODEL = "river/deepseek-ai/DeepSeek-V4.1-Flash-1017"
+
+_UUID = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
 
 #: Quota/credit exhaustion markers in an assistant ``errorMessage``.
 _QUOTA_WORDS = ("insufficient", "credit", "quota", "balance", "payment required")
@@ -163,6 +170,28 @@ def register_run_dir(run_dir: Path) -> None:
         pass
 
 
+def parent_session_of(outdir) -> str | None:
+    """Lead Claude session that launched this worker, or None.
+
+    The outdir under a session scratchpad encodes it
+    (``.../<session>/scratchpad/pi``); otherwise the launcher's own
+    session env (``CLAUDE_SESSION_ID``, else ``CLAUDE_CODE_SESSION_ID``)
+    names the launching session. Only a uuid-shaped value is ever
+    returned, so a stray env value never misattributes the run.
+    """
+    try:
+        parent = parent_session_from_pad(str(outdir))
+    except Exception:
+        parent = None
+    if parent:
+        return parent
+    for env in ("CLAUDE_SESSION_ID", "CLAUDE_CODE_SESSION_ID"):
+        value = (os.environ.get(env) or "").strip()
+        if value and _UUID.match(value):
+            return value
+    return None
+
+
 def report_lines(state: Path, lines) -> None:
     """Append generic.jsonl lines. Best effort; never stores prompts."""
     try:
@@ -259,6 +288,7 @@ def main(argv=None):
         verdict = verdict_of(text)
         status = "done" if rc == 0 and text.strip() else "died_early"
 
+    parent = parent_session_of(out)
     lines = [
         {
             "type": "run",
@@ -267,6 +297,7 @@ def main(argv=None):
             "model": model,
             "tier": tier_of(model),
             "session_id": sid,
+            "parent_session_id": parent,
             "status": "running",
             "started_at": float(started),
         }
@@ -296,6 +327,7 @@ def main(argv=None):
             "model": model,
             "tier": tier_of(model),
             "session_id": sid,
+            "parent_session_id": parent,
             "status": status,
             "verdict": verdict,
             "ended_at": float(ended),

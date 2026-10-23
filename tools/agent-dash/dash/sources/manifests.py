@@ -672,6 +672,28 @@ def _load_tsv(path, left):
     return rows, left
 
 
+def parent_session_from_pad(pad) -> str | None:
+    """Lead Claude session owning a worker outdir, or None.
+
+    Worker outdirs live under a session scratchpad
+    (``<tmp>/claude-<uid>/<project>/<session>/scratchpad/<harness>/``):
+    the uuid directory above ``scratchpad`` is the lead session that
+    launched the worker. Anything else (a flat run dir, the state dir)
+    has no parent. Only path segments are inspected, never file
+    contents.
+    """
+    if not isinstance(pad, str) or not pad:
+        return None
+    try:
+        parts = os.path.abspath(pad).split(os.sep)
+    except (OSError, ValueError):
+        return None
+    for index in range(len(parts) - 1, 0, -1):
+        if parts[index] == "scratchpad" and _UUID.match(parts[index - 1]):
+            return parts[index - 1]
+    return None
+
+
 def _scratchpads(root, now, backfill, scan_s):
     key = (root, backfill or "")
     hit = _scan_cache.get(key)

@@ -470,11 +470,13 @@ class RunningMixin:
                 except Exception:
                     alive = False
                 dead_pid = not alive
-                if alive and not _proc_is_ours(run, pid_start):
-                    # The pid is alive but belongs to a newer process: the
-                    # run's agent is gone. This reads stale (and closes
-                    # through the normal path) instead of hiding behind a
-                    # recycled pid.
+                if alive and not _proc_is_ours(
+                    run, pid_start, _session_evidence(run, usage_max, sample_max)
+                ):
+                    # The pid is alive but started after the session's
+                    # latest action: the run's agent is gone. This reads
+                    # stale (and closes through the normal path) instead
+                    # of hiding behind a recycled pid.
                     reused_pid = True
             stamps = []
             started = run.get("started_at")
@@ -495,6 +497,16 @@ class RunningMixin:
                 return f"pid {pid} is a newer process, not the run's agent (pid reused)"
             if dead_pid:
                 if last is not None and now - last <= stale_grace_s(source):
+                    return None
+                if (
+                    source == "claude-main"
+                    and last is not None
+                    and now - last <= _lead_fresh_s()
+                ):
+                    # A dead registry pid with fresh session evidence is
+                    # a rolled CLI, not a dead session: the registry
+                    # lags the restart while the transcript is ground
+                    # truth, so this stays open until writing stops.
                     return None
                 return f"dead pid {pid}"
             if last is None:
@@ -637,19 +649,63 @@ def _int_pid(pid):
         return None
 
 
-def _proc_is_ours(run: dict, pid_start) -> bool:
-    """True when the process start (when known) fits the run's start.
+def _lead_fresh_s() -> float:
+    """Fresh-evidence bound for a lead session, in seconds.
 
-    Unknown starts never veto: without both clocks there is nothing to
-    compare, exactly as before.
+    Mirrors the transcript window the claude source uses to call a
+    main session still-writing. A lead with newer evidence than this
+    is alive no matter what its registry pid says.
+    """
+    try:
+        from dash.sources.claude import MAIN_RUNNING_MTIME_S
+
+        return float(MAIN_RUNNING_MTIME_S)
+    except (ImportError, TypeError, ValueError):
+        return 180.0
+
+
+def _session_evidence(run: dict, usage_max: dict, sample_max: dict):
+    """Latest session-authored evidence for a run, or None.
+
+    The run start, its usage events, and its run-linked process
+    samples: everything proving the session itself acted. Bare pid
+    sightings (``pid:<pid>``) are process evidence, not session
+    evidence, so they never count here.
+    """
+    stamps = []
+    started = run.get("started_at")
+    if isinstance(started, (int, float)) and not isinstance(started, bool):
+        stamps.append(float(started))
+    run_id = run.get("run_id")
+    hit = (usage_max or {}).get(run_id)
+    if hit is not None:
+        stamps.append(float(hit))
+    hit = (sample_max or {}).get(run_id)
+    if hit is not None:
+        stamps.append(float(hit))
+    return max(stamps) if stamps else None
+
+
+def _proc_is_ours(run: dict, pid_start, evidence=None) -> bool:
+    """True when the process start fits the run's latest evidence.
+
+    A process that was already running when the session last acted
+    cannot be newer than the run's agent: CLI restarts roll the
+    process while a long-lived lead session continues, so the start
+    clock alone would misread the current process as recycled. Without
+    evidence (or without a process start) there is nothing to compare
+    and the process reads as ours, exactly as before.
     """
     if pid_start is None:
         return True
+    if evidence is None:
+        evidence = _session_evidence(run, {}, {})
+        if evidence is None:
+            return True
     try:
-        started = float(run.get("started_at"))
+        return proc_started_ok(pid_start, float(evidence))
     except (TypeError, ValueError):
         return True
-    return proc_started_ok(pid_start, started)
 
 
 def _is_idle_lead(run: dict, now: float, usage_max: dict, sample_max: dict, check, pid_start=None) -> bool:
@@ -678,7 +734,7 @@ def _is_idle_lead(run: dict, now: float, usage_max: dict, sample_max: dict, chec
         alive = False
     if not alive:
         return False
-    if not _proc_is_ours(run, pid_start):
+    if not _proc_is_ours(run, pid_start, _session_evidence(run, usage_max, sample_max)):
         return False
     run_id = run.get("run_id")
     stamps = []

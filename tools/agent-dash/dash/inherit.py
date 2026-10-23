@@ -91,20 +91,36 @@ def parent_workstream(store, parent_session_id: str) -> str | None:
     return ws if isinstance(ws, str) and ws.strip() else None
 
 
+#: Worker sources whose labelled runs evidence a lead's workstream.
+#: Claude subagent and workflow rows are excluded: they inherit the
+#: lead's own workstream, so counting their votes would be circular.
+LEAD_WORKER_SOURCES = ("muse", "glm", "grok", "pi", "commandcode", "generic")
+
+
 def lead_workers(store, session_id: str, now: float) -> list:
-    """Workstreams of attributed workers a lead launched in the window."""
+    """Workstreams of attributed workers a lead launched in the window.
+
+    Only labelled worker runs vote (muse/glm/grok/pi/commandcode/
+    generic with a resolved workstream): hub-prefixed lanes are
+    cross-cutting orchestration, not workstream evidence, and
+    unattributed rows carry no vote.
+    """
     if not isinstance(session_id, str) or not session_id.strip():
         return []
     try:
         since = float(now) - attribution.WORKER_WINDOW_S
     except (TypeError, ValueError):
         return []
+    marks = ",".join("?" for _ in LEAD_WORKER_SOURCES)
     try:
         rows = store._conn.execute(
-            """SELECT workstream FROM runs
+            f"""SELECT workstream FROM runs
                WHERE parent_session_id=? AND workstream IS NOT NULL AND workstream != ''
+                 AND workstream != 'unassigned'
+                 AND source IN ({marks})
+                 AND (label IS NULL OR label NOT LIKE 'hub-%')
                  AND started_at IS NOT NULL AND started_at >= ?""",
-            (session_id.strip(), since),
+            (session_id.strip(), *LEAD_WORKER_SOURCES, since),
         ).fetchall()
     except Exception:
         return []
