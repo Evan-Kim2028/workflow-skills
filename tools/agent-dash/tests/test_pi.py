@@ -316,6 +316,66 @@ class SourceTest(unittest.TestCase):
         self.assertEqual(run["status"], "running")
         self.assertEqual(run["pid"], 424242)
 
+    def test_stored_died_early_with_live_launcher_returns_to_running(self):
+        label = "ws15-exec-revive"
+        self.write_tsv([[label, SID, 1792000000, DEEPSEEK]])
+        (self.pad / "running").mkdir()
+        (self.pad / "running" / label).write_text("%d\t%s" % (os.getpid(), DEEPSEEK), encoding="utf-8")
+        (self.pad / ("stream-%s.ndjson" % label)).write_bytes(FIXTURE.read_bytes())
+        self.store.runs[self.run_id(label)] = {
+            "run_id": self.run_id(label),
+            "source": "pi",
+            "label": label,
+            "session_id": SID,
+            "status": "died_early",
+            "pid": None,
+            "started_at": 1792000000.0,
+            "ended_at": 1792000100.0,
+        }
+        original = pi._agent_processes
+        pi._agent_processes = lambda: [
+            {
+                "pid": os.getpid(),
+                "comm": "python3",
+                "started_at": 1791999900.0,
+                "label": label,
+                "launcher": "pi",
+                "model": DEEPSEEK,
+                "session_id": None,
+            }
+        ]
+        try:
+            self.poll()
+        finally:
+            pi._agent_processes = original
+        run = self.store.runs[self.run_id(label)]
+        self.assertEqual(run["status"], "running")
+        self.assertEqual(run["pid"], os.getpid())
+
+    def test_dead_launcher_closes_a_running_row_as_died_early(self):
+        label = "ws15-exec-dead"
+        self.write_tsv([[label, SID, 1792000000, DEEPSEEK]])
+        (self.pad / "running").mkdir()
+        (self.pad / "running" / label).write_text("999999999\t%s" % DEEPSEEK, encoding="utf-8")
+        (self.pad / ("err-%s.log" % label)).write_text("boom rc=1\n", encoding="utf-8")
+        self.store.runs[self.run_id(label)] = {
+            "run_id": self.run_id(label),
+            "source": "pi",
+            "label": label,
+            "session_id": SID,
+            "status": "running",
+            "pid": 999999999,
+            "started_at": 1792000000.0,
+        }
+        original = pi._agent_processes
+        pi._agent_processes = lambda: []
+        try:
+            self.poll()
+        finally:
+            pi._agent_processes = original
+        run = self.store.runs[self.run_id(label)]
+        self.assertEqual(run["status"], "died_early")
+
     def test_cmd_outdir_running_files_are_not_pi_runs(self):
         cmd = self.scratch / "enc2" / SID / "scratchpad" / "cmd"
         cmd.mkdir(parents=True)

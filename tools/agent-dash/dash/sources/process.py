@@ -5,6 +5,13 @@ token only. A run is running when that pid is still that tool's process,
 or when a live process of that tool carries ``[label: <label>]``. A muse
 run is also live when a live muse process has ``--prompt-file`` ending in
 ``/<label>.md``, or ``--session-id`` equal to the run's session uuid.
+A pi or Command Code run is also live when its launcher is: a
+``python3`` process whose argv runs ``scripts/launch_pi.py`` (source
+``pi``) or ``scripts/launch_cmd.py`` (source ``commandcode``) with the
+run's label as the first positional argument. The pi CLI rewrites its
+process title, so the worker itself carries no label and no cli path;
+the launcher pid is the same pid the ``running/<label>`` file and the
+run row already record.
 The command line is read only to extract those tokens; argv is not stored.
 The one exception is the worker's ``--model`` flag value, which is recorded
 as the sample and live-row ``model`` so a source can fill a run whose model
@@ -28,12 +35,17 @@ _COMM = set(COMMS)
 # Grok. pi ships as a node script (``node .../pi-coding-agent/dist/cli.js``):
 # a node row only counts as a pi worker when its argv carries the pi cli path
 # and a worker label (see ``pi_worker_label_from_args``), so unrelated node
-# processes never match.
+# processes never match. A ``python3`` row only counts when its argv runs
+# one of the launchers (see ``launcher_source_from_args``): the pi CLI
+# rewrites its process title, so the launcher is the only labelled pi
+# process, and Command Code rewrites its title too, so its launcher is
+# the only Command Code process at all.
 SOURCE_COMMS = {
     "grok": frozenset({"cursor-agent"}),
     "muse": frozenset({"muse", "muse-bin"}),
     "glm": frozenset({"grok"}),
-    "pi": frozenset({"node", "pi"}),
+    "pi": frozenset({"node", "pi", "python3"}),
+    "commandcode": frozenset({"python3"}),
 }
 _LABEL = re.compile(r"\[label:\s*([^\]]+?)\]")
 _RUN_WORKER = re.compile(r"(?:^|\s)\S*run_worker\.py(\s.*)?$")
@@ -44,6 +56,8 @@ _SESSION = re.compile(r"--session-id(?:=|\s+)(" + _UUID + r")")
 _PROMPT = re.compile(r"--prompt-file(?:=|\s+)(\S+)")
 _MODEL = re.compile(r"--model(?:=|\s+)(\S+)")
 _PI_CLI = re.compile(r"pi-coding-agent")
+_LAUNCH_PI = re.compile(r"(?:^|\s)\S*launch_pi\.py(?:\s|$)")
+_LAUNCH_CMD = re.compile(r"(?:^|\s)\S*launch_cmd\.py(?:\s|$)")
 _PI_PROMPT = re.compile(r"@?([^\s'\"]*/([^\s'\"/]+?)\.md)")
 _MODEL_OK = re.compile(r"^[^\s'\";|&<>]{1,200}$")
 _REASONING_EFFORT = re.compile(r"--reasoning-effort(?:=|\s+)(\S+)")
@@ -54,13 +68,21 @@ _UUID_OK = re.compile(r"^" + _UUID + r"$")
 def poll(store, cfg, now: float) -> None:
     del cfg
     table = _ps()
-    matched = [row for row in table if row["comm"] in _COMM]
+    tokens = _tokens_by_pid()
+    matched = [
+        row
+        for row in table
+        if row["comm"] in _COMM
+        or (
+            _canon_comm(row["comm"]) == "python3"
+            and tokens.get(row["pid"], {}).get("launcher") in ("pi", "commandcode")
+        )
+    ]
     matched_pids = {row["pid"] for row in matched}
     parents = [row for row in matched if row["ppid"] not in matched_pids]
     kids, rss = _children(table)
-    tokens = _tokens_by_pid()
     for parent in parents:
-        label = label_from_pid(parent["pid"])
+        label = label_from_pid(parent["pid"]) or tokens.get(parent["pid"], {}).get("label")
         store.add_process_sample(
             {
                 "ts": now,
@@ -76,15 +98,19 @@ def poll(store, cfg, now: float) -> None:
 
 
 def live_agent_processes(now: float | None = None) -> list[dict]:
-    """Live grok, muse, glm, and pi processes.
+    """Live grok, muse, glm, pi, and Command Code processes.
 
     Each row is ``pid``, ``comm``, ``started_at``, ``label``, ``model``,
+    ``launcher`` (``pi``/``commandcode`` for a launcher row, else None),
     and (for muse processes) ``prompt_label`` and ``session_id``. The
     command line is read only to extract the bracket label, the
     ``--prompt-file`` label, ``--session-id``, the pi prompt-path label,
-    and the ``--model`` flag value. The path and the rest of argv are not
-    returned. A ``node`` row is emitted only when its argv names the pi
-    cli and a worker label: plain node processes never appear.
+    the launcher label, and the ``--model`` flag value. The path and the
+    rest of argv are not returned. A ``node`` row is emitted only when
+    its argv names the pi cli and a worker label: plain node processes
+    never appear. A ``python3`` row is emitted only when its argv runs
+    ``scripts/launch_pi.py`` or ``scripts/launch_cmd.py`` with a worker
+    label: plain python3 processes never appear.
     """
     now = time.time() if now is None else float(now)
     tokens = _tokens_by_pid()
@@ -96,10 +122,17 @@ def live_agent_processes(now: float | None = None) -> list[dict]:
         if row["comm"] not in wanted:
             continue
         token = tokens.get(row["pid"], {})
-        pi = row["comm"] in pi_comms and token.get("pi")
-        if row["comm"] in pi_comms and not pi:
-            # A ``node`` row that is not a labelled pi worker is not ours.
-            continue
+        launcher = token.get("launcher")
+        if row["comm"] == "python3":
+            if launcher not in ("pi", "commandcode"):
+                # A ``python3`` row that is not a labelled launcher is not ours.
+                continue
+        else:
+            launcher = None
+            pi = row["comm"] in pi_comms and token.get("pi")
+            if row["comm"] in pi_comms and not pi:
+                # A ``node`` row that is not a labelled pi worker is not ours.
+                continue
         muse = row["comm"] in muse_comms
         prompt_label = token.get("prompt_label") if muse else None
         label = token.get("label")
@@ -113,6 +146,7 @@ def live_agent_processes(now: float | None = None) -> list[dict]:
                 "label": label,
                 "model": token.get("model"),
                 "reasoning_effort": token.get("reasoning_effort"),
+                "launcher": launcher,
                 "prompt_label": prompt_label,
                 "session_id": token.get("session_id") if muse else None,
             }
@@ -212,24 +246,43 @@ def run_worker_label_from_args(text: str) -> str | None:
     return label
 
 
+def _comm_ok(source: str, proc: dict) -> bool:
+    """Whether a live row's comm can vouch for a run of ``source``.
+
+    A ``python3`` row is a launcher, never a bare interpreter: it only
+    vouches when its argv ran that source's launcher (see
+    ``launcher_source_from_args``), so a pi launcher never keeps a
+    Command Code run alive and vice versa.
+    """
+    comm = _canon_comm(proc.get("comm"))
+    comms = SOURCE_COMMS.get(source)
+    if not comms or comm not in comms:
+        return False
+    if comm == "python3":
+        return proc.get("launcher") == source
+    return True
+
+
 def match_agent(source: str, pid, label, processes: list[dict], session_id=None, started_at=None):
     """The live process for this run.
 
     Match by pid first, then by a muse ``--session-id`` uuid, then by
     ``[label: ...]`` or by a muse ``--prompt-file`` whose path ends in
-    ``/<label>.md``. The label leg is weak: callers give a newer row with
-    the same label the process (see ``_vetoed``). Every leg is guarded by
-    ``started_at`` when known: a process that started well after the run
-    did is a reused pid (or a relaunched same-label twin), not the run's
-    agent, so it never vouches the old row alive.
+    ``/<label>.md``. A launcher row (``python3``) also matches by its
+    pid — the launcher pid is the pid the run row records — or by its
+    label, but only for the source whose launcher it runs. The label leg
+    is weak: callers give a newer row with the same label the process
+    (see ``_vetoed``). Every leg is guarded by ``started_at`` when known:
+    a process that started well after the run did is a reused pid (or a
+    relaunched same-label twin), not the run's agent, so it never vouches
+    the old row alive.
     """
-    comms = SOURCE_COMMS.get(source)
-    if not comms:
+    if not SOURCE_COMMS.get(source):
         return None
     number = _pid(pid)
     if number is not None:
         for row in processes:
-            if row["pid"] == number and _canon_comm(row.get("comm")) in comms:
+            if row["pid"] == number and _comm_ok(source, row):
                 return _checked(row, started_at)
     sid = session_id if isinstance(session_id, str) and _UUID_OK.match(session_id) else None
     if sid and source == "muse":
@@ -237,7 +290,7 @@ def match_agent(source: str, pid, label, processes: list[dict], session_id=None,
         for row in processes:
             got = row.get("session_id")
             if (
-                _canon_comm(row.get("comm")) in comms
+                _comm_ok(source, row)
                 and isinstance(got, str)
                 and got.lower() == want
             ):
@@ -247,7 +300,7 @@ def match_agent(source: str, pid, label, processes: list[dict], session_id=None,
     text = label if isinstance(label, str) and label else None
     if text:
         for row in processes:
-            if _canon_comm(row.get("comm")) not in comms:
+            if not _comm_ok(source, row):
                 continue
             if row.get("label") == text:
                 checked = _checked(row, started_at)
@@ -438,7 +491,7 @@ def apply_liveness(store, run: dict, source: str, processes) -> None:
 
 
 def reconcile_running(store, now: float, processes=None) -> int:
-    """End grok, muse, glm, and pi rows still marked running after the process is gone.
+    """End grok, muse, glm, pi, and Command Code rows still marked running after the process is gone.
 
     A muse row still marked unknown is adopted when a live process matches
     its prompt-file label or session uuid, and closed (``done`` with
@@ -451,10 +504,11 @@ def reconcile_running(store, now: float, processes=None) -> int:
     Orphan muse usage is moved onto the labeled run and the orphan row is
     deleted. A missing muse start is filled from the earliest usage event,
     and a finished end that sits before the latest usage event is raised to
-    it. Command Code rows are skipped here (no argv or comm identifies a
-    Command Code process): their own poll closes vanished attempts from
-    the running file alone. Returns how many rows were ended because the
-    process was gone.
+    it. Pi and Command Code rows match their launcher (a ``python3``
+    ``launch_pi.py``/``launch_cmd.py`` process with the run's label), so a
+    live launcher keeps them ``running`` here too; their own polls still
+    close vanished attempts from the running file alone. Returns how many
+    rows were ended because the process was gone.
     """
     if processes is None:
         processes = live_agent_processes(now)
@@ -620,6 +674,8 @@ def _canon_comm(comm) -> str:
     """Map versioned ``muse-bin-<ver>`` names to ``muse-bin``."""
     if isinstance(comm, str) and (comm == "muse-bin" or comm.startswith("muse-bin-")):
         return "muse-bin"
+    if isinstance(comm, str) and comm.lower() in ("python", "python3"):
+        return "python3"
     return comm
 
 
@@ -676,11 +732,13 @@ def _run_worker_labels() -> dict:
 
 
 def _tokens_by_pid() -> dict:
-    """Pid -> label, prompt-file label, session uuid, and ``--model`` value.
+    """Pid -> label, prompt-file label, session uuid, launcher, and ``--model`` value.
 
     The command line is read only to extract those tokens. The prompt path
     and the rest of argv are discarded and never returned. A pi worker's
-    label comes from the ``<label>.md`` prompt path it was handed.
+    label comes from the ``<label>.md`` prompt path it was handed; a
+    launcher's label is its first positional argument, with ``launcher``
+    naming the source whose script it runs.
     """
     try:
         proc = subprocess.run(
@@ -706,7 +764,14 @@ def _tokens_by_pid() -> dict:
             # A pi launch carries the label only in its prompt path; use it
             # for the other consumers that read the single "label" slot.
             label = pi_label
-        if not label and not session_id and not prompt_label and not model and not effort and not pi_label:
+        launcher = launcher_source_from_args(line)
+        launcher_label = launcher_label_from_args(line) if launcher else None
+        if launcher and not launcher_label:
+            # A launcher-shaped argv without a valid label is not ours.
+            launcher = None
+        if not label and launcher_label:
+            label = launcher_label
+        if not label and not session_id and not prompt_label and not model and not effort and not pi_label and not launcher:
             continue
         pid = _pid(line.strip().split(None, 1)[0] if line.strip() else None)
         if pid is not None:
@@ -717,6 +782,7 @@ def _tokens_by_pid() -> dict:
                 "model": model,
                 "reasoning_effort": effort,
                 "pi": pi_label is not None,
+                "launcher": launcher,
             }
     return found
 
@@ -794,6 +860,44 @@ def session_id_from_args(text: str) -> str | None:
     if not match:
         return None
     return match.group(1)
+
+
+def launcher_source_from_args(text: str) -> str | None:
+    """Which launcher's argv this is: ``pi``, ``commandcode``, or None.
+
+    ``scripts/launch_pi.py`` and ``scripts/launch_cmd.py`` run one
+    labelled worker as ``<script> <label> <workspace> <prompt> <outdir>``.
+    Returns only the source; the label and the rest of argv are read by
+    ``launcher_label_from_args`` and discarded.
+    """
+    if not text:
+        return None
+    if _LAUNCH_PI.search(text):
+        return "pi"
+    if _LAUNCH_CMD.search(text):
+        return "commandcode"
+    return None
+
+
+def launcher_label_from_args(text: str) -> str | None:
+    """Label of a live launcher launch, or None.
+
+    The label is the first positional argument after the launcher
+    script. Returns only the label; the workspace, prompt file, outdir,
+    and the rest of argv are discarded.
+    """
+    if not text:
+        return None
+    match = _LAUNCH_PI.search(text) or _LAUNCH_CMD.search(text)
+    if not match:
+        return None
+    rest = text[match.end() :].split()
+    if not rest:
+        return None
+    label = rest[0].strip("'\"")
+    if not _LABEL_OK.fullmatch(label):
+        return None
+    return label
 
 
 def pi_worker_label_from_args(text: str) -> str | None:

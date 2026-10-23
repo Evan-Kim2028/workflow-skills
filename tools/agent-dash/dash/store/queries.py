@@ -52,9 +52,9 @@ class QueriesMixin:
             session id (or whose outdir dropped out of the scan) is never
             re-emitted, so only the reconcile pass can end it.
             ``commandcode`` rows ride along for the commandcode poll's
-            own vanished-attempt close-out; the reconcile pass still
-            skips them (no argv or comm identifies a Command Code
-            process, so liveness is the running file alone).
+            own vanished-attempt close-out, and the reconcile pass also
+            checks them now that a live ``launch_cmd.py`` launcher
+            identifies a Command Code process.
             """
             with self._lock:
                 rows = self._conn.execute(

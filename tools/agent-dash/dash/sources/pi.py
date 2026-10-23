@@ -14,11 +14,12 @@ assistant ``message_end`` events (``usage.input`` is the cache miss,
 stream. The stream is byte-cursored per file so a tick reads only bytes
 appended since the last one.
 
-Liveness is the pi process itself: a live ``node .../pi-coding-agent/
-dist/cli.js`` whose prompt path carries ``<label>.md`` (see
-``dash.sources.process.live_agent_processes``), recorded as a process
-sample for the run. The ``running/<label>`` pid file backs it up when
-the process listing is unavailable.
+Liveness is the launcher: a live ``python3 .../scripts/launch_pi.py``
+with the run's label (see ``dash.sources.process.live_agent_processes``),
+recorded as a process sample for the run. The pi CLI rewrites its
+process title, so the worker itself carries no label and is not used.
+The ``running/<label>`` pid file backs the launcher up when the process
+listing is unavailable.
 
 Verdict comes from the first line of ``out-<label>.md``. A run whose err
 or out log shows quota/credit exhaustion finishes ``died_early`` with

@@ -265,6 +265,29 @@ class PollTest(Fixture):
         self.assertEqual(run["model"], "stealth/glyph-cluster:free")
         self.assertEqual(self.store.tokens(SID_LIVE)["input"], 900)
 
+    def test_stored_died_early_with_live_launcher_returns_to_running(self):
+        (self.pad / "running").mkdir()
+        (self.pad / "running" / "ws6-plan-revive").write_text(
+            "%d\treflection/beam:free" % os.getpid(), encoding="utf-8"
+        )
+        stream(self.pad / "stream-ws6-plan-revive-1.ndjson", SID_LIVE)
+        run_id = "commandcode:%s:ws6-plan-revive" % SID_LIVE
+        self.store.runs[run_id] = {
+            "run_id": run_id,
+            "source": "commandcode",
+            "tier": "commandcode",
+            "session_id": SID_LIVE,
+            "label": "ws6-plan-revive",
+            "status": "died_early",
+            "pid": None,
+            "started_at": 1792000000.0,
+            "ended_at": 1792000100.0,
+        }
+        self.poll()
+        run = self.store.runs[run_id]
+        self.assertEqual(run["status"], "running")
+        self.assertEqual(run["pid"], os.getpid())
+
     def test_dead_launch_without_a_row_is_died_early(self):
         proc = subprocess.Popen(["true"])
         proc.wait()
