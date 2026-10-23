@@ -141,9 +141,11 @@ def _outdirs(root, only=None):
     An outdir holds ``cmd-sessions.tsv`` or a ``running/`` folder. The
     running folder exists from the first launch, before any attempt has
     finished, so a launch shows before its TSV row lands. Checked: the root
-    itself, then ``<enc>/<session>/scratchpad`` and each folder under it.
-    The root may be an encoded-cwd folder (``<tmpdir>/claude-<uid>/*``)
-    or the folder above one; both are walked. A bare ``running/`` folder
+    itself, the ``cmd/`` child of the root or of an encoded-cwd folder,
+    then ``<enc>/<session>/scratchpad`` and each folder under it. The root
+    may be an encoded-cwd folder (``<tmpdir>/claude-<uid>/*``), the folder
+    above one, or a registered run folder (a session scratchpad); all are
+    walked. A bare ``running/`` folder
     is not enough: the pi launcher keeps its own ``running/`` folder, so
     a manifest-less outdir must also carry Command Code evidence (the
     ``cooldown.json`` marker or a ``stream-<label>-<n>.ndjson`` attempt
@@ -166,6 +168,8 @@ def _outdirs(root, only=None):
         return found
     take(root)
     for enc in [root] + _subdirs(root):
+        if only is None:
+            take(os.path.join(enc, "cmd"))
         for sess in _subdirs(enc):
             if only is not None and os.path.basename(sess) != only:
                 continue

@@ -231,6 +231,26 @@ class PollTest(Fixture):
         self.assertEqual(throttled["ended_at"], 1792000010)
         self.assertEqual(self.store.runs["commandcode:%s:ws6-plan-retry" % SID_OK]["status"], "done")
 
+    def test_registered_scratchpad_root_finds_its_cmd_outdir(self):
+        # A lead registers its session scratchpad as a run folder; the
+        # Command Code outdir is the direct cmd/ child. No configured
+        # scratch root covers it, so only the registry can find it.
+        self.write_tsv([["ws16-exec-cmd-registered", "reflection/beam:free", SID_OK, 1792000000, 1792000100, 10, 2, "ok"]])
+        cfg = self.cfg()
+        empty = self.tmp / "elsewhere"
+        empty.mkdir()
+        cfg["roots"]["scratchpads"] = [str(empty)]
+        state = self.tmp / "state"
+        state.mkdir()
+        cfg["state_dir"] = str(state)
+        (state / "run-dirs.txt").write_text(str(self.pad.parent) + "\n", encoding="utf-8")
+        cc.poll(self.store, cfg, 1_800_000_000.0)
+        self.assertIsNone(cc.last_error)
+        run = self.store.runs["commandcode:%s:ws16-exec-cmd-registered" % SID_OK]
+        self.assertEqual(run["label"], "ws16-exec-cmd-registered")
+        self.assertEqual(run["status"], "done")
+        self.assertEqual(run["started_at"], 1792000000)
+
     def test_root_may_be_the_encoded_cwd_folder(self):
         self.write_tsv([["ws6-plan-enc", "reflection/beam:free", SID_OK, 1792000000, 1792000100, 10, 2, "ok"]])
         cfg = self.cfg()
