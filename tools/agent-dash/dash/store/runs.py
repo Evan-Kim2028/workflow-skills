@@ -130,6 +130,17 @@ class RunsMixin:
                     confidence = existing.get("ws_confidence")
                 merged["workstream"] = workstream
                 merged["ws_confidence"] = confidence
+                if merged.get("tier") == merged.get("source") and merged.get("source") in (
+                    "pi",
+                    "generic",
+                ):
+                    # The tier still names the source: the row was
+                    # inserted model-less and the model arrived later
+                    # (backfill, re-ingest). Retier from the model
+                    # family so pi rows do not read as their own bucket.
+                    fixed = _family_tier(merged.get("source"), merged.get("model"))
+                    if fixed:
+                        merged["tier"] = fixed
                 if "out_bytes" in row:
                     old = (existing or {}).get("out_bytes") or 0
                     new = row.get("out_bytes") or 0
@@ -589,6 +600,33 @@ class RunsMixin:
                 if self.reassign_run(src_id, dst_id):
                     moved += 1
             return moved
+        def repair_stale_tiers(self) -> int:
+            """Retier pi/generic runs whose tier still names the source.
+
+            One-time healing for rows inserted model-less (tier fell
+            back to the source name) and later given a model without a
+            tier update: the family tier comes from the model, so the
+            rows stop reading as their own ``pi`` bucket. Idempotent:
+            a second pass finds nothing to change. Returns how many
+            rows changed.
+            """
+            with self._lock:
+                rows = [
+                    dict(row)
+                    for row in self._conn.execute(
+                        "SELECT run_id, source, tier, model FROM runs "
+                        "WHERE source IN ('pi', 'generic') AND tier = source "
+                        "AND model IS NOT NULL AND model != ''"
+                    ).fetchall()
+                ]
+            changed = 0
+            for row in rows:
+                fixed = _family_tier(row.get("source"), row.get("model"))
+                if not fixed:
+                    continue
+                self.upsert_run({"run_id": row["run_id"], "tier": fixed})
+                changed += 1
+            return changed
         def repair_muse_clocks(self) -> int:
             """Fill a missing muse start from the earliest usage event.
 
@@ -936,6 +974,36 @@ def commandcode_orphan_pairs(runs: list) -> list:
             if src_id and src_id != dst:
                 pairs.append((src_id, dst))
     return pairs
+
+
+def _family_tier(source, model) -> str | None:
+    """Family tier for a run whose tier still names its source.
+
+    pi and generic runs tier by model family (beam/glm/deepseek);
+    generic additionally takes the source's own tier names (opus,
+    muse, ...) through a lazy import, the same pattern as
+    ``dash.store.running``. Returns None when the model implies no
+    better tier, so callers keep the old value. The family branch
+    mirrors ``dash.sources.pi._model_tier`` (kept local so the store
+    never imports a source at module level).
+    """
+    text = model.lower() if isinstance(model, str) else ""
+    if not text:
+        return None
+    if source in ("pi", "generic"):
+        # pi mirrors dash.sources.pi._model_tier exactly (beam, then
+        # glm, then deepseek); generic takes the same families first
+        # (tier_of does not know deepseek) and falls back to its own
+        # tier names below.
+        for name in ("beam", "glm", "deepseek"):
+            if name in text:
+                return name
+    if source == "generic":
+        from dash.sources.generic import tier_of
+
+        tier = tier_of(model)
+        return tier if tier != "generic" else None
+    return None
 
 
 def _commandcode_orphan(row: dict) -> bool:

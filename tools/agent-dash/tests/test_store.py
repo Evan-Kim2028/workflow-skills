@@ -2747,6 +2747,98 @@ class BackfillToolModelsTest(unittest.TestCase):
         self.assertIsNone(self.store.get_run("codex:s:codex-9")["model"])
 
 
+class StaleTierTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.store = memory(Path(self.tmp.name))
+        self.now = time.time()
+
+    def tearDown(self):
+        self.store.close()
+        self.tmp.cleanup()
+
+    def add_run(self, source, run_id, tier, model=None):
+        row = {
+            "run_id": run_id,
+            "source": source,
+            "tier": tier,
+            "label": "ws6-tier",
+            "session_id": "s",
+            "status": "done",
+            "started_at": self.now - 100,
+            "ended_at": self.now - 50,
+        }
+        if model is not None:
+            row["model"] = model
+        self.store.upsert_run(row)
+
+    def add_usage(self, source, run_id, model):
+        self.store.add_usage(
+            {
+                "ts": self.now - 10,
+                "session_id": "s",
+                "run_id": run_id,
+                "model": model,
+                "tool": source,
+                "message_id": "m-%s" % run_id,
+                "input": 10,
+                "output": 5,
+                "cache_read": 0,
+                "cache_write": 0,
+                "reasoning": 0,
+            }
+        )
+
+    def test_backfilled_model_retunes_pi_tier(self):
+        self.add_run("pi", "pi:s:ws6-tier", "pi")
+        self.add_usage("pi", "pi:s:ws6-tier", "reflection/Beam-1.0-501B-A23B")
+        self.assertEqual(self.store.backfill_tool_models("pi", self.now), 1)
+        run = self.store.get_run("pi:s:ws6-tier")
+        self.assertEqual(run["model"], "reflection/Beam-1.0-501B-A23B")
+        self.assertEqual(run["tier"], "beam")
+
+    def test_upserted_model_retunes_pi_tier(self):
+        self.add_run("pi", "pi:s:ws6-tier", "pi")
+        self.store.upsert_run(
+            {"run_id": "pi:s:ws6-tier", "model": "river/deepseek-ai/DeepSeek-V4.1-Flash-1017"}
+        )
+        self.assertEqual(self.store.get_run("pi:s:ws6-tier")["tier"], "deepseek")
+
+    def test_generic_tier_follows_model_family(self):
+        self.add_run("generic", "generic:ws6-tier", "generic", model="reflection/beam:free")
+        self.assertEqual(self.store.get_run("generic:ws6-tier")["tier"], "beam")
+        self.add_run("generic", "generic:gpt", "generic", model="gpt-6.1-sol")
+        self.assertEqual(self.store.get_run("generic:gpt")["tier"], "generic")
+
+    def test_unknown_model_keeps_source_tier(self):
+        self.add_run("pi", "pi:s:ws6-tier", "pi", model="mystery-model-9")
+        self.assertEqual(self.store.get_run("pi:s:ws6-tier")["tier"], "pi")
+
+    def test_other_sources_keep_source_tier(self):
+        self.add_run("muse", "muse:s:ws6-tier", "muse", model="muse-spark-1.3-contributor")
+        self.assertEqual(self.store.get_run("muse:s:ws6-tier")["tier"], "muse")
+
+    def test_repair_stale_tiers_is_idempotent(self):
+        # Rows written before the upsert-time fix existed: seed them
+        # with raw SQL so no retier fires on the way in.
+        for run_id, source, model in (
+            ("pi:s:beam", "pi", "reflection/Beam-1.0-501B-A23B"),
+            ("generic:ds", "generic", "deepseek-flash"),
+            ("pi:s:mystery", "pi", "mystery-model-9"),
+        ):
+            self.store._conn.execute(
+                "INSERT INTO runs(run_id, source, tier, model, label, session_id, status)"
+                " VALUES(?, ?, ?, ?, ?, ?, ?)",
+                (run_id, source, source, model, "ws6-tier", "s", "done"),
+            )
+        self.store._conn.commit()
+        self.assertEqual(self.store.repair_stale_tiers(), 2)
+        self.assertEqual(self.store.get_run("pi:s:beam")["tier"], "beam")
+        self.assertEqual(self.store.get_run("generic:ds")["tier"], "deepseek")
+        self.assertEqual(self.store.get_run("pi:s:mystery")["tier"], "pi")
+        self.assertEqual(self.store.repair_stale_tiers(), 0)
+
+
 class RepairCommandcodeOrphansTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

@@ -597,6 +597,21 @@ class ModelTierTest(unittest.TestCase):
         self.assertEqual(pi._model_tier("river/deepseek-ai/DeepSeek-V4.1-Flash-1017"), "deepseek")
         self.assertEqual(pi._model_tier(None), "pi")
 
+    def test_store_family_tier_matches_source(self):
+        from dash.store.runs import _family_tier
+
+        for model, tier in (
+            ("reflection/Beam-1.0-501B-A23B", "beam"),
+            ("reflection/beam:free", "beam"),
+            ("river/zai-org/GLM-5.3-Flash", "glm"),
+            ("river/deepseek-ai/DeepSeek-V4.1-Flash-1017", "deepseek"),
+            ("deepseek-ai/DeepSeek-V4.1-Flash", "deepseek"),
+        ):
+            self.assertEqual(_family_tier("pi", model), tier)
+            self.assertEqual(_family_tier("pi", model), pi._model_tier(model))
+        self.assertIsNone(_family_tier("pi", "mystery-model-9"))
+        self.assertIsNone(_family_tier("pi", None))
+
 
 if __name__ == "__main__":
     unittest.main()

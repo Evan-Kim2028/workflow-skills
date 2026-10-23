@@ -2471,6 +2471,13 @@ def _serve() -> None:
 
     cfg = load_cfg()
     store = Store(DBFILE)
+    try:
+        stale = store.repair_stale_tiers()
+    except Exception:
+        logging.getLogger("agent_dash.tiers").exception("stale tier repair failed")
+    else:
+        if stale:
+            logging.getLogger("agent_dash.tiers").info("retiered %d run(s) from stale source tiers", stale)
     registry = Registry()
     server = DashServer(store, registry, HOST, _port(), cfg=cfg)
     server.doctor = DoctorScheduler(store, registry, cfg, build=server.build)
