@@ -12,7 +12,16 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from dash.pricing import cost, family, health_block, load, reprice, status
+from dash.pricing import (
+    catalog_sig,
+    cost,
+    family,
+    health_block,
+    load,
+    reprice,
+    reprice_null_costs,
+    status,
+)
 from dash.store import Store
 
 GROK = "grok-4.7[context=500k,reasoning_effort=high,fast=false]"
@@ -401,6 +410,215 @@ class RepriceTest(unittest.TestCase):
                     [dict(item) for item in store._conn.execute("SELECT * FROM usage_events")]
                 )
                 self.assertNotIn(prompt, dumped)
+            finally:
+                store.close()
+
+
+class NullCostRepriceTest(unittest.TestCase):
+    TABLE = [
+        {
+            "model": "no-such-model-xyz",
+            "input": 2,
+            "output": 3,
+            "cache_read": 1,
+            "cache_write_5m": None,
+            "cache_write_1h": None,
+            "reasoning": None,
+            "billing_mode": "api",
+            "confidence": "test",
+            "provider": "test",
+        }
+    ]
+
+    def _add_null(self, store, mid, model="no-such-model-xyz"):
+        store.add_usage(
+            {
+                "ts": 1_700_000_000.0,
+                "session_id": "s",
+                "run_id": "generic:s:%s" % mid,
+                "model": model,
+                "tool": "generic",
+                "message_id": mid,
+                "input": 1000,
+                "output": 500,
+                "cache_read": 0,
+                "cache_write": 0,
+                "reasoning": 0,
+            }
+        )
+        row = store._conn.execute(
+            "SELECT est_cost_usd FROM usage_events WHERE message_id=?", (mid,)
+        ).fetchone()
+        self.assertIsNone(row["est_cost_usd"])
+
+    def test_null_cost_pass_prices_with_current_table(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "dash.sqlite")
+            try:
+                self._add_null(store, "m1")
+                report = reprice_null_costs(store, table=self.TABLE)
+                self.assertEqual(report["read"], 1)
+                self.assertEqual(report["priced"], 1)
+                self.assertFalse(report["truncated"])
+                row = store._conn.execute(
+                    "SELECT est_cost_usd FROM usage_events WHERE message_id='m1'"
+                ).fetchone()
+                self.assertAlmostEqual(row["est_cost_usd"], (1000 * 2 + 500 * 3) / 1_000_000)
+                again = reprice_null_costs(store, table=self.TABLE)
+                self.assertEqual(again["read"], 0)
+            finally:
+                store.close()
+
+    def test_null_cost_pass_is_bounded(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "dash.sqlite")
+            try:
+                for mid in ("m1", "m2", "m3"):
+                    self._add_null(store, mid)
+                report = reprice_null_costs(store, limit=2)
+                self.assertEqual(report["read"], 2)
+                self.assertEqual(report["priced"], 0)
+                self.assertTrue(report["truncated"])
+                self.assertEqual(report["still_null"], 2)
+                filled = reprice_null_costs(store, limit=2, table=self.TABLE)
+                self.assertEqual(filled["read"], 2)
+                self.assertEqual(filled["priced"], 2)
+                self.assertTrue(filled["truncated"])
+                drained = reprice_null_costs(store, table=self.TABLE)
+                self.assertEqual(drained["read"], 1)
+                self.assertEqual(drained["priced"], 1)
+                self.assertFalse(drained["truncated"])
+            finally:
+                store.close()
+
+    def test_reprice_dry_run_writes_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "dash.sqlite")
+            try:
+                store.add_usage(
+                    {
+                        "ts": 1_700_000_000.0,
+                        "session_id": "s",
+                        "run_id": "generic:s:m1",
+                        "model": "claude-fable-5-1",
+                        "tool": "generic",
+                        "message_id": "m1",
+                        "input": 10,
+                        "output": 5,
+                        "cache_read": 0,
+                        "cache_write": 0,
+                        "reasoning": 0,
+                    }
+                )
+                store._conn.execute("UPDATE usage_events SET est_cost_usd=NULL")
+                store._conn.commit()
+                summary = reprice(store, None, dry_run=True)
+                self.assertTrue(summary["dry_run"])
+                row = store._conn.execute(
+                    "SELECT est_cost_usd FROM usage_events WHERE message_id='m1'"
+                ).fetchone()
+                self.assertIsNone(row["est_cost_usd"])
+                live = reprice(store, None)
+                self.assertFalse(live["dry_run"])
+                row = store._conn.execute(
+                    "SELECT est_cost_usd FROM usage_events WHERE message_id='m1'"
+                ).fetchone()
+                self.assertIsNotNone(row["est_cost_usd"])
+            finally:
+                store.close()
+
+    def test_catalog_sig_tracks_file_changes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "prices.json"
+            path.write_text('{"models": []}', encoding="utf-8")
+            first = catalog_sig(path)
+            self.assertIsNotNone(first)
+            path.write_text('{"models": [{"model": "x"}]}', encoding="utf-8")
+            self.assertNotEqual(catalog_sig(path), first)
+            self.assertIsNone(catalog_sig(Path(tmp) / "missing.json"))
+
+
+class RepriceCliTest(unittest.TestCase):
+    def _run_main(self, state_dir, args):
+        import io
+        from contextlib import redirect_stdout
+
+        from agent_dash import main
+
+        old_state = os.environ.get("AGENT_DASH_STATE_DIR")
+        old_ws = os.environ.get("AGENT_DASH_WORKSTREAMS")
+        os.environ["AGENT_DASH_STATE_DIR"] = str(state_dir)
+        os.environ["AGENT_DASH_WORKSTREAMS"] = str(state_dir)
+        try:
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                code = main(args)
+        finally:
+            if old_state is None:
+                os.environ.pop("AGENT_DASH_STATE_DIR", None)
+            else:
+                os.environ["AGENT_DASH_STATE_DIR"] = old_state
+            if old_ws is None:
+                os.environ.pop("AGENT_DASH_WORKSTREAMS", None)
+            else:
+                os.environ["AGENT_DASH_WORKSTREAMS"] = old_ws
+        return code, buf.getvalue()
+
+    def test_reprice_help_prints_usage_without_writing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for flag in ("--help", "-h"):
+                code, out = self._run_main(tmp, ["reprice", flag])
+                self.assertEqual(code, 0)
+                self.assertIn("--dry-run", out)
+            self.assertFalse((Path(tmp) / "dash.sqlite").exists())
+
+    def test_reprice_rejects_unknown_flags_without_writing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            code, _out = self._run_main(tmp, ["reprice", "--bogus"])
+            self.assertEqual(code, 2)
+            self.assertFalse((Path(tmp) / "dash.sqlite").exists())
+
+    def test_reprice_dry_run_leaves_costs_null(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "dash.sqlite")
+            try:
+                store.add_usage(
+                    {
+                        "ts": 1_700_000_000.0,
+                        "session_id": "s",
+                        "run_id": "generic:s:m1",
+                        "model": "claude-fable-5-1",
+                        "tool": "generic",
+                        "message_id": "m1",
+                        "input": 10,
+                        "output": 5,
+                        "cache_read": 0,
+                        "cache_write": 0,
+                        "reasoning": 0,
+                    }
+                )
+                store._conn.execute("UPDATE usage_events SET est_cost_usd=NULL")
+                store._conn.commit()
+            finally:
+                store.close()
+            code, _out = self._run_main(tmp, ["reprice", "--dry-run"])
+            self.assertEqual(code, 0)
+            store = Store(Path(tmp) / "dash.sqlite")
+            try:
+                row = store._conn.execute(
+                    "SELECT est_cost_usd FROM usage_events WHERE message_id='m1'"
+                ).fetchone()
+                self.assertIsNone(row["est_cost_usd"])
+            finally:
+                store.close()
+            code, _out = self._run_main(tmp, ["reprice"])
+            self.assertEqual(code, 0)
+            store = Store(Path(tmp) / "dash.sqlite")
+            try:
+                row = store._conn.execute(
+                    "SELECT est_cost_usd FROM usage_events WHERE message_id='m1'"
+                ).fetchone()
+                self.assertIsNotNone(row["est_cost_usd"])
             finally:
                 store.close()
 

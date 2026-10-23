@@ -337,6 +337,15 @@ class DoctorFilesTest(unittest.TestCase):
         pricing = next(item for item in result["checks"] if item["name"] == "pricing")
         self.assertTrue(pricing["ok"])
 
+    def test_effort_suffixed_model_priced_by_bare_id_is_not_unpriced(self):
+        cfg = self._cfg()
+        self._add_fake_usage("reflection/Beam-1.0-501B-A23B:xhigh", 10)
+        with mock.patch("dash.doctor._home_scratch", return_value=str(self.home / "agent-scratch")):
+            result = run_doctor(cfg, "http://127.0.0.1:1")
+        self.assertFalse([item for item in result["problems"] if item["code"] == "unpriced-model"])
+        pricing = next(item for item in result["checks"] if item["name"] == "pricing")
+        self.assertTrue(pricing["ok"])
+
     def test_config_parses_and_flags_unknown_keys(self):
         cfg = self._cfg()
         bad = self.root / "bad.json"

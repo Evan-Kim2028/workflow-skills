@@ -77,7 +77,7 @@ USAGE = """agent-dash: local read-only execution dashboard
   python3 agent_dash.py rollback
   python3 agent_dash.py status [--json] [--repair]
   python3 agent_dash.py backfill --session <id>
-  python3 agent_dash.py reprice
+  python3 agent_dash.py reprice [--dry-run]
   python3 agent_dash.py reconcile
   python3 agent_dash.py db stats|rollup [--dry-run] [--days N] [--batch N]
   python3 agent_dash.py runs prune-markers [--dry-run] [--yes]
@@ -416,7 +416,7 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         return cmd_backfill(session)
     if cmd == "reprice":
-        return cmd_reprice()
+        return cmd_reprice(args[1:])
     if cmd == "reconcile":
         return cmd_reconcile()
     if cmd == "db":
@@ -1247,11 +1247,29 @@ def cmd_backfill(session_id: str) -> int:
     return 0
 
 
-def cmd_reprice() -> int:
+REPRICE_USAGE = """usage: python3 agent_dash.py reprice [--dry-run]
+
+Recompute est_cost_usd for every usage row (rereading Claude cache
+splits where the 5m/1h split is empty). With --dry-run the summary is
+computed but nothing is written."""
+
+
+def cmd_reprice(argv: list[str] | None = None) -> int:
+    args = list(argv or [])
+    if any(flag in ("-h", "--help") for flag in args):
+        print(REPRICE_USAGE)
+        return 0
+    dry_run = False
+    for flag in args:
+        if flag == "--dry-run":
+            dry_run = True
+        else:
+            print(REPRICE_USAGE, file=sys.stderr)
+            return 2
     cfg = bind_state()
     store = Store(DBFILE)
     try:
-        summary = reprice_usage(store, _claude_projects(cfg))
+        summary = reprice_usage(store, _claude_projects(cfg), dry_run=dry_run)
     finally:
         store.close()
     print(json.dumps(summary, indent=2))
@@ -2270,6 +2288,68 @@ def reconcile_if_due(store, now: float, last: float | None, interval: float = RE
     return now
 
 
+NULL_REPRICE_INTERVAL_S = 60
+
+
+def reprice_if_due(store, now: float, last: float | None, interval: float = NULL_REPRICE_INTERVAL_S) -> float:
+    """Reprice NULL-cost usage rows once per price-catalog change.
+
+    Costs are written once at ingest, so rows ingested before a catalog
+    edit keep NULL costs until ``reprice`` runs. When the catalog file's
+    signature (mtime + size) differs from the one recorded in ``meta``,
+    one bounded pass prices NULL-cost rows with the current catalog, off
+    the request path on the collector tick. A pass that fills its batch
+    leaves the signature unmarked so the next tick continues; a drained
+    pass records it. Never raises.
+    """
+    if last is not None and now - last < interval:
+        return last
+    log = logging.getLogger("agent_dash.reprice")
+    try:
+        from dash.pricing import CATALOG_SIG_KEY, catalog_sig, reprice_null_costs
+
+        sig = catalog_sig()
+        if sig is None:
+            return now
+        with store._lock:
+            store._conn.execute(
+                "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)"
+            )
+            try:
+                store._conn.commit()
+            except Exception:
+                pass
+            row = store._conn.execute(
+                "SELECT value FROM meta WHERE key=?", (CATALOG_SIG_KEY,)
+            ).fetchone()
+            if row and row["value"] == sig:
+                return now
+        report = reprice_null_costs(store)
+        if report.get("truncated"):
+            log.info(
+                "catalog changed: repriced %d NULL-cost row(s), more remain",
+                report.get("priced"),
+            )
+            return now
+        with store._lock:
+            store._conn.execute(
+                "INSERT INTO meta(key, value) VALUES(?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (CATALOG_SIG_KEY, sig),
+            )
+            try:
+                store._conn.commit()
+            except Exception:
+                pass
+        if report.get("read"):
+            log.info(
+                "catalog changed: repriced %d NULL-cost row(s)", report.get("priced")
+            )
+    except Exception:
+        log.exception("catalog reprice pass failed")
+    return now
+
+
 ROLLUP_INTERVAL_S = 300
 
 
@@ -2411,6 +2491,7 @@ def _serve() -> None:
         last_reconcile = None
         last_prune = None
         last_rollup = None
+        last_reprice = None
         while not stop.wait(0.25):
             now = time.time()
             try:
@@ -2418,6 +2499,7 @@ def _serve() -> None:
                 last_reconcile = reconcile_if_due(store, now, last_reconcile)
                 last_prune = prune_if_due(store, STATE_DIR, now, last_prune)
                 last_rollup = rollup_if_due(store, cfg, now, last_rollup)
+                last_reprice = reprice_if_due(store, now, last_reprice)
             except Exception:
                 logging.exception("collector tick failed")
         server.stop.set()
