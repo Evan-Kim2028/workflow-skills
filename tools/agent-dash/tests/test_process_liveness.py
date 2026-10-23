@@ -556,7 +556,118 @@ class ReconcilePiTests(unittest.TestCase):
         self.assertEqual(row["status"], "running")
         self.assertEqual(row["pid"], 7)
 
-    def test_reconcile_skips_commandcode_rows_for_the_source_close_out(self):
+    def test_reconcile_keeps_a_launcher_matched_pi_run_running(self):
+        store = Store(
+            {
+                "pi:s1:ws15-exec-live": {
+                    "run_id": "pi:s1:ws15-exec-live",
+                    "source": "pi",
+                    "label": "ws15-exec-live",
+                    "status": "running",
+                    "pid": 424242,
+                    "started_at": 90,
+                }
+            }
+        )
+        procs = [
+            {
+                "pid": 424242,
+                "comm": "python3",
+                "started_at": 95.0,
+                "label": "ws15-exec-live",
+                "launcher": "pi",
+            }
+        ]
+        ended = process.reconcile_running(store, 200, procs)
+        self.assertEqual(ended, 0)
+        row = store.get_run("pi:s1:ws15-exec-live")
+        self.assertEqual(row["status"], "running")
+        self.assertEqual(row["pid"], 424242)
+
+    def test_reconcile_keeps_a_label_matched_pi_launcher_running(self):
+        store = Store(
+            {
+                "pi:s1:ws15-exec-live": {
+                    "run_id": "pi:s1:ws15-exec-live",
+                    "source": "pi",
+                    "label": "ws15-exec-live",
+                    "status": "running",
+                    "pid": None,
+                    "started_at": 90,
+                }
+            }
+        )
+        procs = [
+            {
+                "pid": 424242,
+                "comm": "python3",
+                "started_at": 95.0,
+                "label": "ws15-exec-live",
+                "launcher": "pi",
+            }
+        ]
+        ended = process.reconcile_running(store, 200, procs)
+        self.assertEqual(ended, 0)
+        row = store.get_run("pi:s1:ws15-exec-live")
+        self.assertEqual(row["status"], "running")
+        self.assertEqual(row["pid"], 424242)
+
+    def test_commandcode_launcher_does_not_vouch_a_pi_run(self):
+        store = Store(
+            {
+                "pi:s1:ws15-exec-live": {
+                    "run_id": "pi:s1:ws15-exec-live",
+                    "source": "pi",
+                    "label": "ws15-exec-live",
+                    "status": "running",
+                    "pid": None,
+                    "started_at": 90,
+                }
+            }
+        )
+        procs = [
+            {
+                "pid": 424242,
+                "comm": "python3",
+                "started_at": 95.0,
+                "label": "ws15-exec-live",
+                "launcher": "commandcode",
+            }
+        ]
+        ended = process.reconcile_running(store, 200, procs)
+        self.assertEqual(ended, 1)
+        row = store.get_run("pi:s1:ws15-exec-live")
+        self.assertEqual(row["status"], "died_early")
+
+    def test_reconcile_keeps_a_launcher_matched_commandcode_run_running(self):
+        store = Store(
+            {
+                "commandcode:s:ws6-plan-live": {
+                    "run_id": "commandcode:s:ws6-plan-live",
+                    "source": "commandcode",
+                    "label": "ws6-plan-live",
+                    "status": "running",
+                    "pid": 424242,
+                    "started_at": 50,
+                }
+            }
+        )
+        procs = [
+            {
+                "pid": 424242,
+                "comm": "python3",
+                "started_at": 55.0,
+                "label": "ws6-plan-live",
+                "launcher": "commandcode",
+            }
+        ]
+        ended = process.reconcile_running(store, 200, procs)
+        self.assertEqual(ended, 0)
+        row = store.get_run("commandcode:s:ws6-plan-live")
+        self.assertEqual(row["status"], "running")
+        self.assertEqual(row["pid"], 424242)
+
+    def test_reconcile_closes_a_vanished_commandcode_row_as_died_early(self):
         store = Store(
             {
                 "commandcode:s:ws6-plan-gone": {
@@ -570,8 +681,36 @@ class ReconcilePiTests(unittest.TestCase):
             }
         )
         ended = process.reconcile_running(store, 200, [])
-        self.assertEqual(ended, 0)
-        self.assertEqual(store.get_run("commandcode:s:ws6-plan-gone")["status"], "running")
+        self.assertEqual(ended, 1)
+        row = store.get_run("commandcode:s:ws6-plan-gone")
+        self.assertEqual(row["status"], "died_early")
+        self.assertIsNone(row.get("pid"))
+
+    def test_pi_launcher_does_not_vouch_a_commandcode_run(self):
+        store = Store(
+            {
+                "commandcode:s:ws6-plan-live": {
+                    "run_id": "commandcode:s:ws6-plan-live",
+                    "source": "commandcode",
+                    "label": "ws6-plan-live",
+                    "status": "running",
+                    "pid": None,
+                    "started_at": 50,
+                }
+            }
+        )
+        procs = [
+            {
+                "pid": 424242,
+                "comm": "python3",
+                "started_at": 55.0,
+                "label": "ws6-plan-live",
+                "launcher": "pi",
+            }
+        ]
+        ended = process.reconcile_running(store, 200, procs)
+        self.assertEqual(ended, 1)
+        self.assertEqual(store.get_run("commandcode:s:ws6-plan-live")["status"], "died_early")
 
 
 class StaleStore(Store):
@@ -880,6 +1019,192 @@ class QuotaAndPidFileTests(unittest.TestCase):
             self.assertIsNone(liveness.read_pid_file(junk))
             self.assertIsNone(liveness.read_pid_file(os.path.join(tmp, "missing.pid")))
             self.assertIsNone(liveness.read_pid_file(None))
+
+
+class LauncherParsingTests(unittest.TestCase):
+    PI_ARGV = (
+        "424242 python3 /opt/tools/agent-dash/scripts/launch_pi.py "
+        "ws15-exec-wire /ws /tmp/prompt-ws15-exec-wire.md /out/pi "
+        "--model river/deepseek-ai/DeepSeek-V4.1-Flash"
+    )
+    CMD_ARGV = (
+        "424243 python3 /opt/tools/agent-dash/scripts/launch_cmd.py "
+        "ws6-plan-wire /ws /tmp/prompt-ws6-plan-wire.md /out/cmd"
+    )
+
+    def test_pi_launcher_source_and_label(self):
+        self.assertEqual(process.launcher_source_from_args(self.PI_ARGV), "pi")
+        self.assertEqual(process.launcher_label_from_args(self.PI_ARGV), "ws15-exec-wire")
+
+    def test_cmd_launcher_source_and_label(self):
+        self.assertEqual(process.launcher_source_from_args(self.CMD_ARGV), "commandcode")
+        self.assertEqual(process.launcher_label_from_args(self.CMD_ARGV), "ws6-plan-wire")
+
+    def test_plain_python3_is_not_a_launcher(self):
+        argv = "999 python3 /opt/tools/run_worker.py default ws8-x /ws /tmp/x.md /runs 540"
+        self.assertIsNone(process.launcher_source_from_args(argv))
+        self.assertIsNone(process.launcher_label_from_args(argv))
+        self.assertIsNone(process.launcher_source_from_args("999 python3 -c 'print(1)'"))
+        self.assertIsNone(process.launcher_label_from_args(""))
+        self.assertIsNone(process.launcher_label_from_args(None))
+
+    def test_launcher_without_a_label_is_none(self):
+        self.assertIsNone(
+            process.launcher_label_from_args("999 python3 /opt/tools/scripts/launch_pi.py")
+        )
+
+    def test_bad_launcher_labels_are_rejected(self):
+        self.assertIsNone(
+            process.launcher_label_from_args("1 python3 /x/launch_pi.py ../evil /w /p /o")
+        )
+        self.assertIsNone(
+            process.launcher_label_from_args("1 python3 /x/launch_cmd.py ../evil /w /p /o")
+        )
+        self.assertIsNone(
+            process.launcher_source_from_args("1 python3 /x/launch_pi_py_bak ws1-x /w /p /o")
+        )
+
+    def test_returns_only_the_label(self):
+        label = process.launcher_label_from_args(self.PI_ARGV)
+        self.assertNotIn("launch_pi", label)
+        self.assertNotIn("/ws", label)
+        self.assertNotIn("DeepSeek", label)
+
+
+class LauncherRowTests(unittest.TestCase):
+    def live_rows(self, ps_rows, tokens_by_pid, now=1000.0):
+        keep_ps, keep_tokens = process._ps, process._tokens_by_pid
+        process._ps = lambda: ps_rows
+        process._tokens_by_pid = lambda: tokens_by_pid
+        try:
+            return process.live_agent_processes(now=now)
+        finally:
+            process._ps, process._tokens_by_pid = keep_ps, keep_tokens
+
+    def launcher_token(self, label, launcher):
+        return {
+            "label": label,
+            "session_id": None,
+            "prompt_label": None,
+            "model": None,
+            "reasoning_effort": None,
+            "pi": False,
+            "launcher": launcher,
+        }
+
+    def test_pi_launcher_row_is_emitted_with_its_label(self):
+        rows = self.live_rows(
+            [{"pid": 7, "ppid": 1, "pgid": 7, "rss_kb": 10, "elapsed_s": 5.0, "comm": "python3"}],
+            {7: self.launcher_token("ws15-exec-wire", "pi")},
+        )
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["pid"], 7)
+        self.assertEqual(rows[0]["comm"], "python3")
+        self.assertEqual(rows[0]["label"], "ws15-exec-wire")
+        self.assertEqual(rows[0]["launcher"], "pi")
+        import json
+
+        self.assertNotIn("scratchpad", json.dumps(rows[0]))
+
+    def test_cmd_launcher_row_is_emitted_with_its_label(self):
+        rows = self.live_rows(
+            [{"pid": 9, "ppid": 1, "pgid": 9, "rss_kb": 10, "elapsed_s": 5.0, "comm": "python3"}],
+            {9: self.launcher_token("ws6-plan-wire", "commandcode")},
+        )
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["launcher"], "commandcode")
+        self.assertEqual(rows[0]["label"], "ws6-plan-wire")
+
+    def test_plain_python3_without_a_launcher_token_is_not_emitted(self):
+        rows = self.live_rows(
+            [{"pid": 9, "ppid": 1, "pgid": 9, "rss_kb": 10, "elapsed_s": 5.0, "comm": "python3"}],
+            {},
+        )
+        self.assertEqual(rows, [])
+
+    def test_match_agent_accepts_the_launcher_row_for_its_source(self):
+        procs = [
+            {
+                "pid": 7,
+                "comm": "python3",
+                "started_at": 90,
+                "label": "ws15-exec-wire",
+                "launcher": "pi",
+            }
+        ]
+        got = process.match_agent("pi", 7, None, procs)
+        self.assertIsNotNone(got)
+        self.assertEqual(got["pid"], 7)
+        got = process.match_agent("pi", None, "ws15-exec-wire", procs)
+        self.assertIsNotNone(got)
+        self.assertIsNone(process.match_agent("commandcode", 7, None, procs))
+        self.assertIsNone(process.match_agent("commandcode", None, "ws15-exec-wire", procs))
+
+    def test_match_agent_accepts_a_commandcode_launcher(self):
+        procs = [
+            {
+                "pid": 9,
+                "comm": "python3",
+                "started_at": 90,
+                "label": "ws6-plan-wire",
+                "launcher": "commandcode",
+            }
+        ]
+        self.assertIsNotNone(process.match_agent("commandcode", 9, None, procs))
+        self.assertIsNotNone(process.match_agent("commandcode", None, "ws6-plan-wire", procs))
+        self.assertIsNone(process.match_agent("pi", 9, None, procs))
+        self.assertIsNone(process.match_agent("muse", 9, "ws6-plan-wire", procs))
+
+    def test_live_launcher_revives_a_stored_died_early_pi_row(self):
+        run_id = "pi:s1:ws15-exec-wire"
+        store = Store(
+            {
+                run_id: {
+                    "run_id": run_id,
+                    "source": "pi",
+                    "session_id": "s1",
+                    "label": "ws15-exec-wire",
+                    "status": "died_early",
+                    "pid": None,
+                    "started_at": 90,
+                    "ended_at": 120,
+                }
+            }
+        )
+        procs = [
+            {
+                "pid": 424242,
+                "comm": "python3",
+                "started_at": 95.0,
+                "label": "ws15-exec-wire",
+                "launcher": "pi",
+            }
+        ]
+        run = {"run_id": run_id, "label": "ws15-exec-wire", "pid": 424242, "started_at": 90}
+        process.apply_liveness(store, run, "pi", procs)
+        self.assertEqual(run["status"], "running")
+        self.assertEqual(run["pid"], 424242)
+        self.assertIsNone(run["ended_at"])
+
+    def test_dead_launcher_keeps_a_stored_died_early_pi_row_closed(self):
+        run_id = "pi:s1:ws15-exec-gone"
+        store = Store(
+            {
+                run_id: {
+                    "run_id": run_id,
+                    "source": "pi",
+                    "session_id": "s1",
+                    "label": "ws15-exec-gone",
+                    "status": "died_early",
+                    "pid": None,
+                    "started_at": 90,
+                    "ended_at": 120,
+                }
+            }
+        )
+        run = {"run_id": run_id, "label": "ws15-exec-gone", "pid": None, "started_at": 90}
+        process.apply_liveness(store, run, "pi", [])
+        self.assertNotEqual(run.get("status"), "running")
 
 
 if __name__ == "__main__":
