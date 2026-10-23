@@ -11,7 +11,7 @@ from __future__ import annotations
 import time as _time
 
 from dash import inherit as _inherit
-from dash.attribution import attribute, clean_label
+from dash.attribution import attribute, clean_label, is_hub_label
 from dash.liveness import PROCESS_GONE_GRACE_S
 
 from .running import _annotate_lanes
@@ -68,11 +68,14 @@ class RunsMixin:
                     and confidence is None
                     and existing
                     and existing.get("ws_confidence") in ("inherited", "inferred")
+                    and not is_hub_label(merged.get("label"))
                 ):
                     # No evidence right now is not evidence of absence: a
                     # settled inference survives the write, and the inherit
                     # refresh (with poll-now evidence) remains the sole
-                    # clearer. Explicit attributions always overwrite.
+                    # clearer. Explicit attributions always overwrite. Hub
+                    # labels are exempt: inherited work never survives on
+                    # hub-scoped work.
                     workstream = existing.get("workstream")
                     confidence = existing.get("ws_confidence")
                 merged["workstream"] = workstream
@@ -121,11 +124,14 @@ class RunsMixin:
                     and confidence is None
                     and existing
                     and existing.get("ws_confidence") in ("inherited", "inferred")
+                    and not is_hub_label(merged.get("label"))
                 ):
                     # No evidence right now is not evidence of absence: a
                     # settled inference survives the write, and the inherit
                     # refresh (with poll-now evidence) remains the sole
-                    # clearer. Explicit attributions always overwrite.
+                    # clearer. Explicit attributions always overwrite. Hub
+                    # labels are exempt: inherited work never survives on
+                    # hub-scoped work.
                     workstream = existing.get("workstream")
                     confidence = existing.get("ws_confidence")
                 merged["workstream"] = workstream

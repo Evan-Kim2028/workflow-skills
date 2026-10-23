@@ -3809,6 +3809,70 @@ class StoreInheritanceTest(unittest.TestCase):
         self.assertEqual(run["workstream"], "WS7")
         self.assertEqual(run["ws_confidence"], "inherited")
 
+    def test_hub_run_does_not_inherit_parent_session_workstream(self):
+        self.store.upsert_session(
+            {"session_id": "lead-hub", "tool": "claude", "label": "ws16-worker", "status": "busy"}
+        )
+        self.assertEqual(self._session("lead-hub")["workstream"], "WS16")
+        self.store.upsert_session(
+            {
+                "session_id": "hub-child",
+                "tool": "muse",
+                "label": "hub-exec-dash-accounting",
+                "parent_session_id": "lead-hub",
+                "status": "busy",
+            }
+        )
+        self.store.upsert_run(
+            {
+                "run_id": "muse:hub-child:hub-exec-dash-accounting",
+                "source": "muse",
+                "tier": "muse",
+                "session_id": "hub-child",
+                "parent_session_id": "lead-hub",
+                "label": "hub-exec-dash-accounting",
+                "status": "done",
+                "started_at": 10,
+            }
+        )
+        session = self._session("hub-child")
+        self.assertIsNone(session["workstream"])
+        self.assertIsNone(session["ws_confidence"])
+        run = self.store.get_run("muse:hub-child:hub-exec-dash-accounting")
+        self.assertIsNone(run["workstream"])
+        self.assertIsNone(run["ws_confidence"])
+
+    def test_refresh_clears_stale_hub_inheritance(self):
+        # Rows attributed before the hub exemption existed.
+        self.store._conn.execute(
+            "INSERT INTO runs(run_id, label, session_id, parent_session_id,"
+            " workstream, ws_confidence, status)"
+            " VALUES(?, ?, ?, ?, ?, ?, ?)",
+            (
+                "muse:hub-old:hub-exec-dash-x",
+                "hub-exec-dash-x",
+                "hub-old",
+                "lead-hub",
+                "WS16",
+                "inherited",
+                "done",
+            ),
+        )
+        self.store._conn.execute(
+            "INSERT INTO sessions(session_id, label, parent_session_id,"
+            " workstream, ws_confidence, status)"
+            " VALUES(?, ?, ?, ?, ?, ?)",
+            ("hub-old", "hub-exec-dash-x", "lead-hub", "WS16", "inherited", "done"),
+        )
+        self.store._conn.commit()
+        self.assertEqual(self.store.refresh_workstream_inheritance(time.time()), 2)
+        run = self.store.get_run("muse:hub-old:hub-exec-dash-x")
+        self.assertIsNone(run["workstream"])
+        self.assertIsNone(run["ws_confidence"])
+        session = self._session("hub-old")
+        self.assertIsNone(session["workstream"])
+        self.assertIsNone(session["ws_confidence"])
+
     def test_lead_session_infers_dominant_workers(self):
         now = time.time()
         for index in range(3):
