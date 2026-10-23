@@ -11,7 +11,7 @@ dashboard scans for `cmd-sessions.tsv` (a scratchpad `cmd/` folder works).
 Writes:
   <outdir>/out-<label>.md          final text of the successful attempt
   <outdir>/stream-<label>-<n>.ndjson  raw event stream per attempt
-  <outdir>/cmd-sessions.tsv        label, model, session_id, start, end, in, out, status
+  <outdir>/cmd-sessions.tsv        label, model, session_id, start, end, in, out, status, tier
   <outdir>/cooldown.json           model -> epoch until which it is skipped
   <outdir>/running/<label>         "<pid>\\t<model>" while an attempt is live
 """
@@ -29,6 +29,9 @@ FREE_MODELS = [
     "stealth/glyph-cluster:free",
 ]
 COOLDOWN_S = 15 * 60
+#: Registry tier recorded in the manifest's last cell (source stays
+#: ``commandcode``; the tier names the lane the launch used).
+TIER = "commandcode"
 MAX_ATTEMPTS = 8
 THROTTLE = re.compile(r"429|rate.?limit|too many requests|quota|throttl|capacity|overloaded|insufficient|credits|503|today's limit|no longer available", re.I)
 
@@ -99,7 +102,10 @@ def record(outdir, row):
         new = not os.path.exists(path)
         with open(path, "a") as f:
             if new:
-                f.write("label\tmodel\tsession_id\tstarted_epoch\tended_epoch\tinput_tokens\toutput_tokens\tstatus\n")
+                f.write(
+                    "label\tmodel\tsession_id\tstarted_epoch\tended_epoch\tinput_tokens"
+                    "\toutput_tokens\tstatus\ttier\n"
+                )
             f.write("\t".join(str(x) for x in row) + "\n")
 
     locked(path, _rec)
@@ -147,7 +153,8 @@ def main():
         ok = result and result.get("subtype") == "success" and len(text.strip()) > 40
         status = "ok" if ok else ("throttled" if THROTTLE.search(tail + err_tail) else f"failed rc={rc}")
         record(outdir, [label, model, (result or {}).get("sessionId", "-"), start, int(time.time()),
-                        usage.get("inputTokens", 0), usage.get("outputTokens", 0), status])
+                        usage.get("inputTokens", 0), usage.get("outputTokens", 0), status,
+                        TIER])
         if ok:
             with open(os.path.join(outdir, f"out-{label}.md"), "w") as f:
                 f.write(f"<!-- model: {model} attempt {attempt} -->\n{text}\n")

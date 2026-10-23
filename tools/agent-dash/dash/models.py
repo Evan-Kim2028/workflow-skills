@@ -100,6 +100,7 @@ HARNESS_NAMES = {
     "claude": "Claude Code",
     "muse": "muse",
     "cursor": "Cursor",
+    "grok": "Grok Build",
     "grok-cli": "Grok Build",
     "pi": "pi",
     "commandcode": "Command Code",
@@ -109,8 +110,18 @@ HARNESS_NAMES = {
 }
 
 
+#: Harness keys this module answers for; anything else is a raw source.
+_HARNESS_KEYS = frozenset(
+    ("claude", "muse", "cursor", "composer", "grok", "grok-cli", "pi", "commandcode", "dagster", "generic")
+) | frozenset(HARNESS_NAMES)
+
+
 def harness_of(run: dict) -> str:
     """Harness that ran a run, from its source (and its tier when generic).
+
+    A recorded ``harness`` on the row wins: the launcher knows which CLI it
+    started, and Grok Build records ``grok`` so no GLM-source run can read
+    as anything but Grok Build (or as a raw source string).
 
     ``claude-*`` reads ``claude``, ``muse`` reads ``muse``, ``grok`` and
     ``cursor`` read ``cursor``, a ``glm`` source reads ``grok-cli``, ``pi``
@@ -121,6 +132,9 @@ def harness_of(run: dict) -> str:
     same mapping reads it (a ``beam`` tier still means the generic
     harness running a Beam model).
     """
+    recorded = str(run.get("harness") or "").strip().lower()
+    if recorded in _HARNESS_KEYS:
+        return "grok-cli" if recorded == "grok" else recorded
     source = str(run.get("source") or "")
     tier = str(run.get("tier") or "")
     key = (tier if source == "generic" else source).lower()
@@ -130,6 +144,8 @@ def harness_of(run: dict) -> str:
         return "muse"
     if key in ("grok", "cursor", "composer"):
         return "cursor"
+    if key == "grok-cli":
+        return "grok-cli"
     if key == "glm":
         return "grok-cli"
     if key == "pi":

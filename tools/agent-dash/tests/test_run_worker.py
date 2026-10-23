@@ -31,14 +31,16 @@ def registry():
 class Launch:
     def __init__(self, alive=False, quota_on=0, report="PASS\nbuilt it\n"):
         self.cmds = []
+        self.envs = []
         self.alive = alive
         self.quota_on = quota_on
         self.report = report
         self.n = 0
 
-    def spawn(self, cmd, out_path, err_path):
+    def spawn(self, cmd, out_path, err_path, env=None):
         self.n += 1
         self.cmds.append(list(cmd))
+        self.envs.append(dict(env or {}))
         out_path = Path(out_path)
         err_path = Path(err_path)
         out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -105,19 +107,35 @@ class RunWorkerTests(unittest.TestCase):
     def pgrep(self, pattern):
         return self.counts.get(pattern, 0)
 
-    def test_example_lists_the_four_workers(self):
+    def test_example_lists_the_launch_tiers(self):
         data = registry()
         self.assertEqual(data["default"], "muse")
-        self.assertEqual(data["auto_order"], ["muse", "grok", "glm", "glm-flash"])
-        self.assertEqual(set(data["workers"]), {"muse", "grok", "glm", "glm-flash"})
+        self.assertEqual(data["auto_order"], ["muse", "grok", "deepseek-flash", "glm-flash", "glm"])
+        self.assertEqual(
+            set(data["workers"]),
+            {"muse", "grok", "deepseek-flash", "glm-flash", "glm", "pi-deepseek", "pi-beam"},
+        )
         kinds = {name: row["kind"] for name, row in data["workers"].items()}
         self.assertEqual(kinds["muse"], "muse")
         self.assertEqual(kinds["grok"], "cursor")
         self.assertEqual(kinds["glm"], "grok-build")
         self.assertEqual(kinds["glm-flash"], "grok-build")
-        for row in data["workers"].values():
+        self.assertEqual(kinds["deepseek-flash"], "grok-build")
+        self.assertEqual(kinds["pi-deepseek"], "pi")
+        self.assertEqual(kinds["pi-beam"], "pi")
+        caps = {name: row["cap"] for name, row in data["workers"].items()}
+        self.assertEqual(caps["deepseek-flash"], 5)
+        self.assertEqual(caps["glm-flash"], 5)
+        self.assertEqual(caps["glm"], 2)
+        self.assertEqual(caps["pi-deepseek"], 12)
+        self.assertEqual(caps["pi-beam"], 5)
+        for name, row in data["workers"].items():
             self.assertIn("[", row["pgrep"])
             self.assertTrue(row["enabled"])
+            self.assertEqual(row["manifest"], "pi-sessions.tsv" if row["kind"] == "pi" else row["manifest"])
+        # Every Grok Build tier cools on the GLM request-limit wording too.
+        for name in ("deepseek-flash", "glm", "glm-flash"):
+            self.assertIn("rate limit reached for requests", data["workers"][name]["quota_patterns"])
 
     def test_default_launches_muse_and_writes_the_manifest(self):
         self.counts = {}
@@ -134,7 +152,7 @@ class RunWorkerTests(unittest.TestCase):
         self.assertIn(str(self.prompt), cmd)
         self.assertIn("muse-spark-1.3-contributor", cmd)
         row = (self.run_dir / "muse-sessions.tsv").read_text(encoding="utf-8").strip()
-        self.assertEqual(row, "ws1-plan-lane-1\t%s\t1700000000\tmuse-spark-1.3-contributor" % SID)
+        self.assertEqual(row, "ws1-plan-lane-1\t%s\t1700000000\tmuse-spark-1.3-contributor\tmuse\tmuse" % SID)
         self.assertEqual((self.run_dir / "ws1-plan-lane-1.tier").read_text(encoding="utf-8").strip(), "muse")
 
     def test_auto_skips_a_worker_at_its_cap(self):
@@ -147,7 +165,8 @@ class RunWorkerTests(unittest.TestCase):
         self.assertEqual(launch.cmds[0][4], registry()["workers"]["grok"]["model"])
         text = (self.run_dir / "cursor-sessions.tsv").read_text(encoding="utf-8").strip()
         self.assertEqual(
-            text, "ws1-plan-lane-1\t-\t1700000000\t%s" % registry()["workers"]["grok"]["model"]
+            text,
+            "ws1-plan-lane-1\t-\t1700000000\t%s\tgrok\tcursor" % registry()["workers"]["grok"]["model"],
         )
 
     def test_weak_label_refuses_before_launch(self):
@@ -226,7 +245,7 @@ class RunWorkerTests(unittest.TestCase):
         self.assertIn("bypassPermissions", cmd)
         self.assertIn("plain", cmd)
         row = (self.run_dir / "glm-sessions.tsv").read_text(encoding="utf-8").strip().split("\t")
-        self.assertEqual(row, ["ws1-plan-lane-1", SID, "1700000000", "glm-5.3"])
+        self.assertEqual(row, ["ws1-plan-lane-1", SID, "1700000000", "glm-5.3", "glm", "grok-cli"])
 
     def test_sparse_grok_build_worker_lands_in_glm_manifest_with_model(self):
         # A grok-build tier without manifest/columns wiring (like a bare
@@ -250,7 +269,9 @@ class RunWorkerTests(unittest.TestCase):
         self.assertEqual(cmd[cmd.index("-m") + 1], "deepseek-flash")
         self.assertFalse((self.run_dir / "sessions.tsv").exists())
         row = (self.run_dir / "glm-sessions.tsv").read_text(encoding="utf-8").strip().split("\t")
-        self.assertEqual(row, ["ws1-plan-lane-1", SID, "1700000000", "deepseek-flash"])
+        self.assertEqual(
+            row, ["ws1-plan-lane-1", SID, "1700000000", "deepseek-flash", "deepseek-flash", "grok-cli"]
+        )
 
     def test_quota_on_auto_relaunches_the_next_tier(self):
         self.counts = {}
@@ -302,12 +323,107 @@ class RunWorkerTests(unittest.TestCase):
             os.waitpid(pid, os.WNOHANG)
         self.assertEqual(out.read_text(encoding="utf-8"), "PASS\n")
 
+    def test_pi_tier_launches_launch_pi_with_tier_and_records_it(self):
+        # One launcher for every tier: a pi registry tier runs launch_pi.py
+        # in the run folder's pi/ outdir and records its tier name, so the
+        # dashboard reads pi-deepseek instead of the bare harness "pi".
+        self.counts = {}
+        launch = Launch()
+        code, line = self.go("pi-deepseek", launch)
+        self.assertEqual(code, 0)
+        self.assertIn("STATUS: done", line)
+        self.assertIn("tier=pi-deepseek", line)
+        cmd = launch.cmds[0]
+        self.assertEqual(cmd[0], "python3")
+        self.assertTrue(cmd[1].endswith("launch_pi.py"))
+        self.assertEqual(cmd[5], str(self.run_dir / "pi"))
+        self.assertEqual(cmd[cmd.index("--model") + 1], registry()["workers"]["pi-deepseek"]["model"])
+        self.assertEqual(cmd[cmd.index("--tier") + 1], "pi-deepseek")
+        self.assertEqual(launch.envs[0], {})
+        row = (self.run_dir / "pi-sessions.tsv").read_text(encoding="utf-8").splitlines()[-1].split("\t")
+        self.assertEqual(
+            row[:4],
+            ["ws1-plan-lane-1", SID, "1700000000", registry()["workers"]["pi-deepseek"]["model"]],
+        )
+        self.assertEqual(row[4], "pi-deepseek")
+
+    def test_standby_env_file_switches_the_credential_without_reading_it(self):
+        # A pi tier that declares standby_env_file launches on the standby
+        # credential: the tier records <tier>-standby, the env file path goes
+        # to the launcher as a variable, and its contents never travel.
+        data = registry()
+        data["workers"]["pi-deepseek"]["standby_env_file"] = "~/.config/pi/standby.env"
+        self.reg.write_text(json.dumps(data), encoding="utf-8")
+        self.counts = {}
+        launch = Launch()
+        code, line = self.go("pi-deepseek", launch)
+        self.assertEqual(code, 0)
+        self.assertIn("tier=pi-deepseek-standby", line)
+        env_path = os.path.expanduser("~/.config/pi/standby.env")
+        self.assertEqual(launch.envs[0], {"AGENT_DASH_PI_ENV_FILE": env_path})
+        tier = (self.run_dir / "ws1-plan-lane-1.tier").read_text(encoding="utf-8").strip()
+        self.assertEqual(tier, "pi-deepseek-standby")
+        row = (self.run_dir / "pi-sessions.tsv").read_text(encoding="utf-8").splitlines()[-1].split("\t")
+        self.assertEqual(row[4], "pi-deepseek-standby")
+
+    def test_meta_file_records_tier_harness_and_paths(self):
+        self.counts = {}
+        launch = Launch()
+        self.go("glm-flash", launch)
+        meta = json.loads((self.run_dir / "ws1-plan-lane-1.meta.json").read_text(encoding="utf-8"))
+        self.assertEqual(meta["tier"], "glm-flash")
+        self.assertEqual(meta["harness"], "grok-cli")
+        self.assertEqual(meta["model"], "glm-5.3-flash")
+        self.assertEqual(meta["label"], "ws1-plan-lane-1")
+        self.assertEqual(meta["pid"], 4001)
+        self.assertTrue(meta["out_path"].endswith("out-ws1-plan-lane-1.md"))
+        self.assertTrue(meta["err_path"].endswith("err-ws1-plan-lane-1.log"))
+
+    def test_grok_build_harness_is_grok_in_the_meta_file(self):
+        self.counts = {}
+        launch = Launch()
+        self.go("deepseek-flash", launch)
+        meta = json.loads((self.run_dir / "ws1-plan-lane-1.meta.json").read_text(encoding="utf-8"))
+        self.assertEqual(meta["harness"], "grok-cli")
+        self.assertEqual(meta["tier"], "deepseek-flash")
+
+    def test_request_rate_limit_wording_cools_the_tier(self):
+        # GLM says "Rate limit reached for requests"; that is a quota hit,
+        # not a done run, even when the out file has text.
+        self.counts = {}
+
+        class RateLimited(Launch):
+            def spawn(self, cmd, out_path, err_path, env=None):
+                pid = super().spawn(cmd, out_path, err_path, env)
+                Path(err_path).write_text("Rate limit reached for requests\n", encoding="utf-8")
+                Path(out_path).write_text("partial text\n", encoding="utf-8")
+                return pid
+
+        launch = RateLimited()
+        code, line = self.go("glm", launch)
+        self.assertEqual(code, 0)
+        self.assertIn("STATUS: failed", line)
+        self.assertIn("reason=quota", line)
+        cooled = json.loads((self.state / "worker-cooldowns.json").read_text(encoding="utf-8"))
+        self.assertEqual(cooled["glm"], NOW + 30 * 60)
+
+    def test_auto_skips_a_cooling_tier_for_the_next_one(self):
+        (self.state / "worker-cooldowns.json").write_text(
+            json.dumps({"deepseek-flash": NOW + 600}), encoding="utf-8"
+        )
+        self.counts = {"[m]use-bin|[m]use exec": 25, "[c]ursor-agent": 25}
+        launch = Launch()
+        code, line = self.go("auto", launch)
+        self.assertEqual(code, 0)
+        self.assertIn("tier=glm-flash", line)
+
     def test_none_available_when_every_worker_is_at_cap(self):
         self.counts = {
             "[m]use-bin|[m]use exec": 25,
             "[c]ursor-agent": 25,
-            "-m [g]lm-5.3($| )": 5,
+            "-m [g]lm-5.3($| )": 2,
             "-m [g]lm-5.3-flash": 5,
+            "-m [d]eepseek-flash": 5,
         }
         launch = Launch()
         code, line = self.go("auto", launch)

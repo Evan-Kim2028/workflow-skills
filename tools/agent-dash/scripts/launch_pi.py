@@ -12,7 +12,7 @@ modified). ``stdin`` is closed: pi hangs otherwise.
 
 Writes, in ``outdir``:
 
-  <outdir>/pi-sessions.tsv          label, session_id, start epoch, model
+  <outdir>/pi-sessions.tsv          label, session_id, start epoch, model, tier
   <outdir>/stream-<label>.ndjson    raw NDJSON event stream
   <outdir>/out-<label>.md           final assistant text
   <outdir>/err-<label>.log          stderr
@@ -27,6 +27,16 @@ credit/quota/balance, or HTTP 402/429) finishes ``died_early`` with
 verdict ``BLOCKED`` and writes ``QUOTA`` naming the model and label, so
 the lead knows to swap the API key. ``outdir`` is registered in
 ``run-dirs.txt`` like ``run_worker.py`` does.
+
+The manifest's fifth cell is the tier: ``run_worker.py`` (``kind: pi``)
+passes the registry tier name with ``--tier``, so a DeepSeek run reads
+``pi-deepseek`` and a Beam run ``pi-beam`` instead of the bare harness
+name. Without ``--tier`` the tier comes from the model family.
+
+``AGENT_DASH_PI_ENV_FILE`` names an env file to source before the run:
+``run_worker.py`` sets it for a tier that declares ``standby_env_file``, so
+a rate-limited primary credential switches to the standby one. Only the
+path travels through this script; no key is read, logged, or printed.
 """
 from __future__ import annotations
 
@@ -49,6 +59,7 @@ from dash.sources import pi as pi_source  # noqa: E402
 from dash.sources.manifests import parent_session_from_pad  # noqa: E402
 
 DEFAULT_MODEL = "river/deepseek-ai/DeepSeek-V4.1-Flash-1017"
+USAGE = "usage: launch_pi.py <label> <workspace> <prompt_file> <outdir> [--model M] [--tier T]"
 
 _UUID = re.compile(
     r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
@@ -60,13 +71,18 @@ _QUOTA_WORDS = ("insufficient", "credit", "quota", "balance", "payment required"
 
 
 def tier_of(model: str | None) -> str:
-    """Live tile bucket for a pi model: deepseek for DeepSeek, glm for GLM, beam for Reflection Beam."""
+    """Tier for a pi model: deepseek for DeepSeek, glm for GLM, beam for Reflection Beam.
+
+    ``run_worker.py`` passes the registry tier (``pi-deepseek``, ``pi-beam``)
+    and that wins; this is the fallback for a direct launch.
+    """
     text = (model or "").lower()
     if "glm" in text:
         return "glm"
     if "beam" in text:
         return "beam"
     return "deepseek"
+
 
 
 def validate_label(label: str) -> str | None:
@@ -222,17 +238,24 @@ def build_argv(label, workspace, prompt_file, outdir, model):
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     model = DEFAULT_MODEL
-    if "--model" in argv:
-        at = argv.index("--model")
+    tier = None
+    for flag in ("--model", "--tier"):
+        if flag not in argv:
+            continue
+        at = argv.index(flag)
         if at + 1 >= len(argv):
-            print("usage: launch_pi.py <label> <workspace> <prompt_file> <outdir> [--model M]", file=sys.stderr)
+            print(USAGE, file=sys.stderr)
             return 2
-        model = argv[at + 1]
+        if flag == "--model":
+            model = argv[at + 1]
+        else:
+            tier = argv[at + 1].strip() or None
         del argv[at : at + 2]
     if len(argv) != 4:
-        print("usage: launch_pi.py <label> <workspace> <prompt_file> <outdir> [--model M]", file=sys.stderr)
+        print(USAGE, file=sys.stderr)
         return 2
     label, workspace, prompt_file, outdir = argv
+    tier = tier or tier_of(model)
     fix = validate_label(label)
     if fix is not None:
         print(f"label refused: {fix}", file=sys.stderr)
@@ -276,10 +299,11 @@ def main(argv=None):
     ended = int(time.time())
 
     (out / f"out-{label}.md").write_text(text if text.strip() else "", encoding="utf-8")
-    with open(out / "pi-sessions.tsv", "a", encoding="utf-8") as fh:
-        if (out / "pi-sessions.tsv").stat().st_size == 0:
-            fh.write("label\tsession_id\tstarted_epoch\tmodel\n")
-        fh.write(f"{label}\t{sid}\t{started}\t{model}\n")
+    manifest = out / "pi-sessions.tsv"
+    with open(manifest, "a", encoding="utf-8") as fh:
+        if manifest.stat().st_size == 0:
+            fh.write("label\tsession_id\tstarted_epoch\tmodel\ttier\n")
+        fh.write(f"{label}\t{sid}\t{started}\t{model}\t{tier}\n")
 
     if quota:
         (out / "QUOTA").write_text(f"model\t{model}\nlabel\t{label}\n", encoding="utf-8")
@@ -295,7 +319,8 @@ def main(argv=None):
             "label": label,
             "run_id": f"pi:{sid}:{label}",
             "model": model,
-            "tier": tier_of(model),
+            "tier": tier,
+            "harness": "pi",
             "session_id": sid,
             "parent_session_id": parent,
             "status": "running",
@@ -325,7 +350,8 @@ def main(argv=None):
             "label": label,
             "run_id": f"pi:{sid}:{label}",
             "model": model,
-            "tier": tier_of(model),
+            "tier": tier,
+            "harness": "pi",
             "session_id": sid,
             "parent_session_id": parent,
             "status": status,

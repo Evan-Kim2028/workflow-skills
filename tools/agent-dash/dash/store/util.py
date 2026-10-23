@@ -212,6 +212,7 @@ _FAMILY_TOOL = {
     "codex": "codex",
     "cursor": "grok",
     "muse": "muse",
+    "commandcode": "commandcode",
 }
 
 
@@ -235,7 +236,7 @@ def _tool_key(run: dict) -> str | None:
         return "grok"
     if source == "muse" or tier == "muse":
         return "muse"
-    if source == "glm" or tier == "glm":
+    if source == "glm" or tier in GROK_BUILD_TIERS:
         return _grok_cli_key(run)
     if source in ("codex", "codex-exec") or tier == "codex":
         return "codex"
@@ -248,6 +249,14 @@ def _tool_key(run: dict) -> str | None:
     if _model_family(run) == "beam":
         return "beam"
     return None
+
+
+#: Registry tier names launched through the Grok Build CLI. A row carrying
+#: one is a Grok Build run whatever family its model belongs to, so the
+#: per-harness totals count it under the tool that actually ran it.
+GROK_BUILD_TIERS = frozenset(
+    ("deepseek-flash", "glm-flash", "glm", "beam", "reflection-beam")
+)
 
 
 def _grok_cli_key(run: dict) -> str:
@@ -331,6 +340,14 @@ def is_marker_run(run: dict) -> bool:
 
 
 WORKER_SOURCES = frozenset({"muse", "glm", "grok"})
+
+#: Sources whose live process rows appear as labelled launcher processes.
+#: ``pi`` and ``commandcode`` launch through ``scripts/launch_pi.py`` and
+#: ``scripts/launch_cmd.py``, which the process source reports with the
+#: worker label, so a running row on one of these sources is the worker a
+#: live launcher means. Kept apart from ``WORKER_SOURCES`` (marker and
+#: adoption rules) so those stay ``muse``/``glm``/``grok`` only.
+LIVE_WORKER_SOURCES = WORKER_SOURCES | {"pi", "commandcode"}
 
 
 WRAPPER_SOURCES = frozenset({"claude-workflow"})

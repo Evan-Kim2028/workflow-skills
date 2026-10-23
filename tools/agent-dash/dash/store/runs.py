@@ -985,25 +985,28 @@ def commandcode_orphan_pairs(runs: list) -> list:
 def _family_tier(source, model) -> str | None:
     """Family tier for a run whose tier still names its source.
 
-    pi and generic runs tier by model family (beam/glm/deepseek);
-    generic additionally takes the source's own tier names (opus,
-    muse, ...) through a lazy import, the same pattern as
-    ``dash.store.running``. Returns None when the model implies no
-    better tier, so callers keep the old value. The family branch
-    mirrors ``dash.sources.pi._model_tier`` (kept local so the store
-    never imports a source at module level).
+    pi runs take the registry tier that names their model family
+    (``pi-deepseek``, ``pi-beam``, ``pi-glm``), which is what
+    ``run_worker.py`` records, so a healed row reads the same tier a
+    fresh launch does; generic runs take the bare family. generic
+    additionally takes the source's own tier names (opus, muse, ...)
+    through a lazy import, the same pattern as ``dash.store.running``.
+    Returns None when the model implies no better tier, so callers keep
+    the old value. The family branch mirrors
+    ``dash.sources.pi._model_tier`` (kept local so the store never
+    imports a source at module level).
     """
     text = model.lower() if isinstance(model, str) else ""
     if not text:
         return None
     if source in ("pi", "generic"):
-        # pi mirrors dash.sources.pi._model_tier exactly (beam, then
-        # glm, then deepseek); generic takes the same families first
-        # (tier_of does not know deepseek) and falls back to its own
-        # tier names below.
-        for name in ("beam", "glm", "deepseek"):
+        # pi mirrors dash.sources.pi._model_tier's families (beam, glm,
+        # deepseek), spelled as the registry names them; generic takes
+        # the same families first (tier_of does not know deepseek) and
+        # falls back to its own tier names below.
+        for name in ("deepseek", "beam", "glm"):
             if name in text:
-                return name
+                return "pi-" + name if source == "pi" else name
     if source == "generic":
         from dash.sources.generic import tier_of
 

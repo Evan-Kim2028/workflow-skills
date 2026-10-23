@@ -510,6 +510,54 @@ class GrokRunDirEvidenceTests(unittest.TestCase):
             self.assertNotIn("status", prev)
             self.assertNotIn("verdict", prev)
 
+    def test_tier_column_names_the_registry_tier(self):
+        # The launcher records the registry tier in the manifest's fifth
+        # cell, so a DeepSeek Flash run reads tier deepseek-flash (never the
+        # glm default) and carries the Grok Build harness with the model
+        # verbatim.
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg, _scratch = self.tree(
+                tmp,
+                "label\tuuid\tepoch\tmodel\ttier\n"
+                "ws16-review-dsflash\t%s\t1792153370\tdeepseek-flash\tdeepseek-flash\n"
+                "ws16-review-glmflash\t%s\t1792153380\tglm-5.3-flash\tglm-flash\n"
+                "ws16-review-glm\t%s\t1792153390\tglm-5.3\tglm\n" % (SID, OTHER, HUB),
+            )
+            store = Store()
+            self.poll(store, cfg, 1792154000)
+            ds = store.runs["glm:%s:ws16-review-dsflash" % SID]
+            self.assertEqual(ds["tier"], "deepseek-flash")
+            self.assertEqual(ds["harness"], "grok")
+            self.assertEqual(ds["model"], "deepseek-flash")
+            self.assertEqual(store.runs["glm:%s:ws16-review-glmflash" % OTHER]["tier"], "glm-flash")
+            self.assertEqual(store.runs["glm:%s:ws16-review-glm" % HUB]["tier"], "glm")
+
+    def test_older_rows_fall_back_to_the_model_tier_map(self):
+        # Rows written before the tier column read their tier from the
+        # model, and a DeepSeek model never reads as glm.
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg, _scratch = self.tree(
+                tmp,
+                "label\tuuid\tepoch\tmodel\n"
+                "ws16-review-ds\t%s\t1792153370\tdeepseek-flash\n"
+                "ws16-review-g\t%s\t1792153380\tglm-5.3\n" % (SID, OTHER),
+            )
+            store = Store()
+            self.poll(store, cfg, 1792154000)
+            self.assertEqual(store.runs["glm:%s:ws16-review-ds" % SID]["tier"], "deepseek-flash")
+            self.assertEqual(store.runs["glm:%s:ws16-review-g" % OTHER]["tier"], "glm")
+
+    def test_meta_file_names_the_tier_and_wins_over_the_model_map(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg, _scratch = self.tree(
+                tmp,
+                "label\tuuid\tepoch\tmodel\n"
+                "ws16-exec-meta\t%s\t1792153370\tdeepseek-flash\n" % SID,
+            )
+            store = Store()
+            self.poll(store, cfg, 1792154000)
+            self.assertEqual(store.runs["glm:%s:ws16-exec-meta" % SID]["tier"], "deepseek-flash")
+
     @unittest.skipUnless(os.environ.get("AGENT_DASH_SMOKE") == "1", "set AGENT_DASH_SMOKE=1 to read a local glm usage file")
     def test_smoke_real_usage_json(self):
         sessions = os.environ.get("AGENT_DASH_SMOKE_GROK_SESSIONS")

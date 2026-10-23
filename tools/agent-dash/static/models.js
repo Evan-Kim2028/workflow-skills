@@ -27,15 +27,20 @@
   /* Harness display names. harnessOf reads the runner from a run row
      (dash/models.py harness_of mirrors it); a run view carrying harness
      wins, so server and page never disagree. */
-  var HARNESS = {claude: "Claude Code", muse: "muse", cursor: "Cursor", "grok-cli": "Grok Build", pi: "pi", commandcode: "Command Code", codex: "Codex", dagster: "dagster", generic: "generic"};
+  var HARNESS = {claude: "Claude Code", muse: "muse", cursor: "Cursor", grok: "Grok Build", "grok-cli": "Grok Build", pi: "pi", commandcode: "Command Code", codex: "Codex", dagster: "dagster", generic: "generic"};
+  var HARNESS_KEYS = {claude: 1, muse: 1, cursor: 1, composer: 1, grok: 1, "grok-cli": 1, pi: 1, commandcode: 1, dagster: 1, generic: 1};
   function harnessOf(r) {
     r = r || {};
-    if (r.harness) return r.harness;
+    /* The launcher records the CLI it started ("grok" for Grok Build), so a
+       recorded harness wins outright and never reads as a raw source. */
+    var recorded = String(r.harness || "").toLowerCase();
+    if (HARNESS_KEYS[recorded]) return recorded === "grok" ? "grok-cli" : recorded;
     var source = String(r.source || ""), tier = String(r.tier || "");
     var key = (source === "generic" ? tier : source).toLowerCase();
     if (/^claude/.test(key) || /^(opus|sonnet|haiku|fable)$/.test(key)) return "claude";
     if (key === "muse") return "muse";
     if (key === "grok" || key === "cursor" || key === "composer") return "cursor";
+    if (key === "grok-cli") return "grok-cli";
     if (key === "glm") return "grok-cli";
     if (key === "pi") return "pi";
     if (key === "commandcode") return "commandcode";

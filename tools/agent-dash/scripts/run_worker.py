@@ -7,6 +7,22 @@ A fast doctor preflight (dashboard reachable, run dir visible, tier model
 priced and policy-compliant) runs before launching; a failure prints the
 problem and its fix and exits 1 without launching. --no-preflight skips it.
 
+Every kind writes its manifest row with the tier it was launched under, so
+the dashboard reads the registry tier name (``deepseek-flash``) instead of
+guessing one from the model id; the row layout stays ``label, session_id,
+epoch, model`` for the sources that parse it positionally, and a
+``<run-dir>/<label>.meta.json`` beside it records tier, harness, model,
+label, and pid for every launcher to read.
+
+A quota/rate-limit failure (any ``quota_patterns`` match in the logs, e.g.
+GLM's ``Rate limit reached for requests``) cools the tier down instead of
+reporting a silent ``done``, and ``auto``/``default`` skip a cooling tier.
+A ``pi`` tier whose registry entry names ``standby_env_file`` relabels the
+launch as ``<name>-standby`` (its own tier and cooldown) and runs the
+launcher with ``AGENT_DASH_PI_ENV_FILE`` set to that path, so the launcher
+sources the standby credential instead of the primary one. The path is
+only passed through; no key is ever read or printed here.
+
 Prints one line:
 STATUS: running|done|failed out=<report> err=<stderr> tier=<name> [reason=...]
 """
@@ -32,17 +48,34 @@ RUN_RULE = (
     "A run that ends without the report is a failed run."
 )
 LABEL_OK = re.compile(r"^[\w.+-]{1,80}$")
-KINDS = ("muse", "cursor", "grok-build")
+KINDS = ("muse", "cursor", "grok-build", "pi")
 READ_LIMIT = 262144
 #: The dashboard can take several seconds to answer right after a deploy
 #: restart (cold caches, polls holding the store lock), so the preflight
 #: budget is generous; a timeout below warns instead of refusing.
 PREFLIGHT_TIMEOUT_S = 10.0
+STANDBY_SUFFIX = "-standby"
+
+#: Harness that runs each launch kind. The dashboard row, the meta file, and
+#: the registry all name it the way ``dash.models.harness_of`` does, so a
+#: Grok Build run reads grok-cli (displayed "Grok Build") and never "other".
+HARNESS_BY_KIND = {
+    "muse": "muse",
+    "cursor": "cursor",
+    "grok-build": "grok-cli",
+    "pi": "pi",
+}
 
 
 def dashboard_url() -> str:
     """Dashboard base URL for the launch preflight. Env wins."""
     return os.environ.get("AGENT_DASH_URL", "http://127.0.0.1:8765").rstrip("/") or "http://127.0.0.1:8765"
+
+
+def harness_of(worker) -> str:
+    """Harness name for a registry worker entry, or its kind."""
+    kind = str((worker or {}).get("kind") or "")
+    return HARNESS_BY_KIND.get(kind, kind or "generic")
 
 
 def preflight_target(registry, requested: str, ctx):
@@ -84,8 +117,12 @@ def run_preflight(registry, requested: str, ctx) -> int | None:
         return None
     worker = (registry.get("workers") or {}).get(target) or {}
     problem = preflight_for_launch(
-        target, worker, str(ctx["run_dir"]), str(state_dir()),
-        url=dashboard_url(), timeout_s=PREFLIGHT_TIMEOUT_S,
+        launch_worker(target, worker, ctx),
+        worker,
+        str(ctx["run_dir"]),
+        str(state_dir()),
+        url=dashboard_url(),
+        timeout_s=PREFLIGHT_TIMEOUT_S,
     )
     if problem is None:
         return None
@@ -208,61 +245,158 @@ def pick_initial(ctx):
     return name, None
 
 
+def worker_at(name):
+    """Registry name behind a launch name: a standby name reads its base tier.
+
+    ``<tier>-standby`` names the same registry entry as ``<tier>``; only a
+    ``pi`` entry that declares ``standby_env_file`` is ever launched this
+    way, so the standby name always reads the same model, flags, and cap.
+    """
+    text = str(name or "")
+    if text.endswith(STANDBY_SUFFIX) and len(text) > len(STANDBY_SUFFIX):
+        return text[: -len(STANDBY_SUFFIX)]
+    return text
+
+
+def worker_for(ctx, name):
+    """Registry entry for a launch name, standby names included."""
+    return (ctx["registry"].get("workers") or {}).get(worker_at(name)) or {}
+
+
 def launch(ctx, name, tried) -> int:
-    worker = (ctx["registry"].get("workers") or {}).get(name) or {}
+    worker = worker_for(ctx, name)
+    tier = launch_worker(name, worker, ctx)
     session_id = "-" if worker.get("kind") == "cursor" else ctx["hooks"]["uuid"]()
-    ctx["tier_path"].write_text(name + "\n", encoding="utf-8")
-    append_manifest(worker, ctx["run_dir"], ctx["label"], session_id, ctx["hooks"]["now"](), worker.get("model") or "")
-    cmd = command(worker, ctx["label"], ctx["workspace"], ctx["prompt"], session_id)
+    ctx["tier_path"].write_text(tier + "\n", encoding="utf-8")
+    append_manifest(
+        worker,
+        ctx["run_dir"],
+        ctx["label"],
+        session_id,
+        ctx["hooks"]["now"](),
+        worker.get("model") or "",
+        tier=tier,
+        harness=harness_of(worker),
+    )
+    cmd = command(
+        worker, ctx["label"], ctx["workspace"], ctx["prompt"], session_id, ctx["run_dir"], tier
+    )
     try:
-        pid = ctx["hooks"]["spawn"](cmd, ctx["out"], ctx["err"])
+        pid = ctx["hooks"]["spawn"](cmd, ctx["out"], ctx["err"], env=launch_env(worker))
     except OSError:
         ctx["tier_path"].unlink(missing_ok=True)
-        emit("failed", ctx["out"], ctx["err"], name, "spawn")
+        emit("failed", ctx["out"], ctx["err"], tier, "spawn")
         return 2
     ctx["pid_path"].write_text(str(int(pid)) + "\n", encoding="utf-8")
-    return observe(ctx, name, tried)
+    write_meta(ctx, tier, worker, pid)
+    return observe(ctx, tier, tried)
 
 
-def observe(ctx, name, tried) -> int:
+def launch_worker(name, worker, ctx=None) -> str:
+    """Tier a launch records: the registry name, or its standby relabel.
+
+    A ``pi`` tier with ``standby_env_file`` launches on the standby
+    credential and records itself as ``<tier>-standby``, so a primary
+    rate-limit cooldown never blocks the standby run (and vice versa).
+    Every other tier records its registry name unchanged, which is what
+    the dashboard shows for a Grok Build run.
+    """
+    if standby_file(worker) and str((worker or {}).get("kind") or "") == "pi":
+        return name + STANDBY_SUFFIX
+    return name
+
+
+def standby_file(worker):
+    """The registry's ``standby_env_file`` path, or None. Never read, only passed."""
+    value = (worker or {}).get("standby_env_file")
+    if not isinstance(value, str) or not value.strip():
+        return None
+    return os.path.expanduser(value.strip())
+
+
+def launch_env(worker):
+    """Extra env for the child launcher: the standby file, when declared."""
+    path = standby_file(worker)
+    if path is None or str((worker or {}).get("kind") or "") != "pi":
+        return None
+    return {"AGENT_DASH_PI_ENV_FILE": path}
+
+
+def write_meta(ctx, tier, worker, pid) -> None:
+    """``<label>.meta.json``: tier, harness, model, label, pid, and out/err paths.
+
+    Written for every launch so a reader never has to guess a tier from a
+    model id. Best effort: a failed write never breaks a launch.
+    """
+    meta = {
+        "label": ctx["label"],
+        "tier": tier,
+        "harness": harness_of(worker),
+        "model": worker.get("model") or "",
+        "pid": int(pid),
+        "out_path": str(ctx["out"]),
+        "err_path": str(ctx["err"]),
+        "started_at": int(ctx["hooks"]["now"]()),
+    }
+    path = Path(ctx["run_dir"]) / f"{ctx['label']}.meta.json"
+    tmp = path.with_suffix(".json.tmp")
+    try:
+        tmp.write_text(json.dumps(meta, sort_keys=True) + "\n", encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError:
+        return
+
+
+def observe(ctx, tier, tried) -> int:
+    name = worker_at(tier)
     worker = (ctx["registry"].get("workers") or {}).get(name) or {}
     pid = read_pid(ctx["pid_path"])
     if pid and still_running(pid, ctx["max_wait"], ctx["hooks"]):
-        emit("running", ctx["out"], ctx["err"], name)
+        emit("running", ctx["out"], ctx["err"], tier)
         return 0
     result = outcome(worker, ctx["out"], ctx["err"])
     if result != "quota":
         if result == "done":
-            emit("done", ctx["out"], ctx["err"], name)
+            emit("done", ctx["out"], ctx["err"], tier)
         else:
-            emit("failed", ctx["out"], ctx["err"], name, "empty-report")
+            emit("failed", ctx["out"], ctx["err"], tier, "empty-report")
         return 0
-    note_quota(ctx, name)
+    note_quota(ctx, tier)
     if ctx["requested"] not in ("auto", "default"):
-        emit("failed", ctx["out"], ctx["err"], name, "quota")
+        emit("failed", ctx["out"], ctx["err"], tier, "quota")
         return 0
-    tried.add(name)
+    tried.add(tier)
     nxt = eligible(ctx, tried)
     if not nxt:
-        emit("failed", ctx["out"], ctx["err"], name, "quota")
+        emit("failed", ctx["out"], ctx["err"], tier, "quota")
         return 0
-    archive(ctx["run_dir"], ctx["label"], name)
+    archive(ctx["run_dir"], ctx["label"], tier)
     return launch(ctx, nxt, tried)
 
 
 def eligible(ctx, skip):
+    """First ``auto_order`` tier under its cap and not cooling, or None.
+
+    ``skip`` holds launch names already tried this call (standby names
+    included). A cooling tier is passed over in favour of the next one:
+    the whole point of a quota cooldown is to stop relaunching into the
+    limit. A ``pi`` tier whose next launch would use its standby
+    credential is judged under the standby name and the standby tier's
+    cooldown, since that is the attempt that would actually run.
+    """
     registry = ctx["registry"]
     now = ctx["hooks"]["now"]()
     workers = registry.get("workers") or {}
     for name in registry.get("auto_order") or []:
-        if name in skip:
-            continue
         worker = workers.get(name)
         if not isinstance(worker, dict) or not worker.get("enabled", True):
             continue
         if worker.get("kind") not in KINDS:
             continue
-        if cooling(ctx["cooldowns"], name, now):
+        launch_name = launch_worker(name, worker, ctx)
+        if name in skip or launch_name in skip:
+            continue
+        if cooling(ctx["cooldowns"], launch_name, now):
             continue
         try:
             cap = int(worker.get("cap"))
@@ -272,7 +406,7 @@ def eligible(ctx, skip):
         count = ctx["hooks"]["pgrep"](pattern) if pattern else 0
         if count >= cap:
             continue
-        return name
+        return launch_name
     return None
 
 
@@ -282,6 +416,12 @@ def note_quota(ctx, name):
 
 
 def outcome(worker, out_path, err_path):
+    """``quota``, ``done``, or ``empty`` for a finished worker's logs.
+
+    A quota/rate-limit hit always wins, even when the out file has text:
+    a run that reported ``Rate limit reached for requests`` did not do the
+    task, and counting it as ``done`` hides the limit.
+    """
     if quota_hit(worker, out_path, err_path):
         return "quota"
     try:
@@ -308,7 +448,14 @@ def quota_hit(worker, out_path, err_path) -> bool:
     return False
 
 
-def command(worker, label, workspace, prompt_file, session_id):
+def command(worker, label, workspace, prompt_file, session_id, run_dir=None, tier=None):
+    """The exact argv for one worker launch.
+
+    ``pi`` runs ``launch_pi.py`` with the run folder's ``pi/`` outdir, so a
+    pi tier launches through the one launcher every other tier uses and
+    the pi source finds its manifest, stream, and out files where it
+    already looks for them.
+    """
     kind = worker.get("kind")
     model = str(worker.get("model") or "")
     extra = [str(arg) for arg in (worker.get("extra_args") or [])]
@@ -328,6 +475,20 @@ def command(worker, label, workspace, prompt_file, session_id):
         ]
     if kind == "cursor":
         return [str(ROOT / "scripts" / "launch_grok.sh"), label, workspace, prompt_file, model]
+    if kind == "pi":
+        return [
+            "python3",
+            str(ROOT / "scripts" / "launch_pi.py"),
+            label,
+            workspace,
+            prompt_file,
+            str(Path(run_dir or Path(prompt_file).parent) / "pi"),
+            "--model",
+            model,
+            "--tier",
+            str(tier or worker.get("tier") or ""),
+            *extra,
+        ]
     text = Path(prompt_file).read_text(encoding="utf-8")
     if text and not text.endswith("\n"):
         text += "\n"
@@ -357,10 +518,19 @@ MANIFEST_BY_KIND = {
     "muse": ("muse-sessions.tsv", ["label", "session_id", "epoch", "model"]),
     "cursor": ("cursor-sessions.tsv", ["label", "session_id", "epoch", "model"]),
     "grok-build": ("glm-sessions.tsv", ["label", "session_id", "epoch", "model"]),
+    "pi": ("pi-sessions.tsv", ["label", "session_id", "epoch", "model"]),
 }
 
 
-def append_manifest(worker, run_dir, label, session_id, epoch, model):
+def append_manifest(worker, run_dir, label, session_id, epoch, model, tier="", harness=""):
+    """Append one manifest row in the worker's declared column order.
+
+    The declared columns are written first, exactly as before, and only
+    then ``tier`` and ``harness`` when the caller passes them. Sources read
+    the leading columns positionally, so a newer row never breaks an older
+    reader, and the dashboard takes the tier from the row instead of
+    guessing it from the model id.
+    """
     # Defense in depth: no manifest row for a weak label. ``run()``
     # refuses first; this raises on any direct misuse.
     from dash import labels as label_lib
@@ -372,14 +542,19 @@ def append_manifest(worker, run_dir, label, session_id, epoch, model):
         worker.get("kind") or "", ("sessions.tsv", ["label", "session_id", "epoch"])
     )
     name = str(worker.get("manifest") or default_name)
-    cols = worker.get("columns") or default_cols
+    cols = [str(col) for col in (worker.get("columns") or default_cols)]
     values = {
         "label": label,
         "session_id": session_id,
         "session": session_id,
         "epoch": str(int(epoch)),
         "model": str(model or ""),
+        "tier": str(tier or ""),
+        "harness": str(harness or ""),
     }
+    for extra in ("tier", "harness"):
+        if values[extra] and extra not in cols:
+            cols.append(extra)
     line = "\t".join(str(values.get(col, "")) for col in cols)
     path = Path(run_dir) / name
     prefix = ""
@@ -388,6 +563,7 @@ def append_manifest(worker, run_dir, label, session_id, epoch, model):
             fh.seek(-1, os.SEEK_END)
             if fh.read(1) != b"\n":
                 prefix = "\n"
+    path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as fh:
         fh.write(prefix + line + "\n")
 
@@ -533,7 +709,17 @@ def pgrep_count(pattern: str) -> int:
     return len([line for line in proc.stdout.splitlines() if line.strip()])
 
 
-def default_spawn(cmd, out_path, err_path):
+def spawn_env(extra=None):
+    """Parent env plus a launcher's extra variables (a standby env-file path)."""
+    if not extra:
+        return None
+    env = dict(os.environ)
+    env.update({str(key): str(value) for key, value in extra.items()})
+    return env
+
+
+def default_spawn(cmd, out_path, err_path, env=None):
+    """Start one worker detached. ``env`` names extra variables, not a full env."""
     out_path = Path(out_path)
     err_path = Path(err_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -544,6 +730,7 @@ def default_spawn(cmd, out_path, err_path):
             stdout=out,
             stderr=err,
             start_new_session=True,
+            env=spawn_env(env),
         )
     return proc.pid
 

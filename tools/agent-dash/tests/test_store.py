@@ -2460,6 +2460,36 @@ class LaneAndUnseenTest(unittest.TestCase):
         wrapper = [run for run in runs if run["source"] == "claude-workflow"][0]
         self.assertTrue(wrapper.get("lane_shadow"))
 
+    def test_unseen_worker_counts_a_live_pi_launcher_as_seen(self):
+        # scripts/launch_pi.py reports its worker label, so a running pi row
+        # on that label is the worker the launcher means: not a mismatch.
+        now = time.time()
+        self.store.upsert_run(
+            {
+                "run_id": "pi:sid9:ws9-WS9.9-pi",
+                "source": "pi",
+                "tier": "pi-deepseek",
+                "label": "ws9-WS9.9-pi",
+                "status": "running",
+                "started_at": now - 600,
+                "ended_at": None,
+                "clock_source": "manifest",
+            }
+        )
+        procs = [
+            {
+                "pid": 4246,
+                "comm": "python3",
+                "started_at": now - 600,
+                "label": "ws9-WS9.9-pi",
+                "launcher": "pi",
+                "prompt_label": None,
+                "session_id": None,
+            }
+        ]
+        report = self.store.reconcile_numbers(now, None, None, processes=procs)
+        self.assertNotIn("unseen worker", "\n".join(report["mismatches"]))
+
     def test_unseen_worker_mismatch(self):
         now = time.time()
         self._lane(now)
@@ -2877,14 +2907,15 @@ class StaleTierTest(unittest.TestCase):
         self.assertEqual(self.store.backfill_tool_models("pi", self.now), 1)
         run = self.store.get_run("pi:s:ws6-tier")
         self.assertEqual(run["model"], "reflection/Beam-1.0-501B-A23B")
-        self.assertEqual(run["tier"], "beam")
+        # The registry tier a launch records, spelled the same way.
+        self.assertEqual(run["tier"], "pi-beam")
 
     def test_upserted_model_retunes_pi_tier(self):
         self.add_run("pi", "pi:s:ws6-tier", "pi")
         self.store.upsert_run(
             {"run_id": "pi:s:ws6-tier", "model": "river/deepseek-ai/DeepSeek-V4.1-Flash-1017"}
         )
-        self.assertEqual(self.store.get_run("pi:s:ws6-tier")["tier"], "deepseek")
+        self.assertEqual(self.store.get_run("pi:s:ws6-tier")["tier"], "pi-deepseek")
 
     def test_generic_tier_follows_model_family(self):
         self.add_run("generic", "generic:ws6-tier", "generic", model="reflection/beam:free")
@@ -2915,7 +2946,7 @@ class StaleTierTest(unittest.TestCase):
             )
         self.store._conn.commit()
         self.assertEqual(self.store.repair_stale_tiers(), 2)
-        self.assertEqual(self.store.get_run("pi:s:beam")["tier"], "beam")
+        self.assertEqual(self.store.get_run("pi:s:beam")["tier"], "pi-beam")
         self.assertEqual(self.store.get_run("generic:ds")["tier"], "deepseek")
         self.assertEqual(self.store.get_run("pi:s:mystery")["tier"], "pi")
         self.assertEqual(self.store.repair_stale_tiers(), 0)
@@ -2988,6 +3019,65 @@ class RepairCommandcodeOrphansTest(unittest.TestCase):
         self.add_run("commandcode:s:ws6-cc", label="ws6-cc")
         self.add_usage("commandcode:s:ws6-cc", "m1")
         self.assertEqual(self.store.repair_commandcode_orphans(), 0)
+
+
+class RepairStaleTiersTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.store = memory(Path(self.tmp.name))
+
+    def tearDown(self):
+        self.store.close()
+        self.tmp.cleanup()
+
+    def add(self, run_id, source, tier, model=None):
+        row = {
+            "run_id": run_id,
+            "source": source,
+            "tier": tier,
+            "label": run_id.split(":")[-1],
+            "status": "done",
+            "started_at": 1792000000.0,
+            "ended_at": 1792000100.0,
+        }
+        if model is not None:
+            row["model"] = model
+        self.store.upsert_run(row)
+
+    def test_ingest_tiers_a_model_less_pi_row_from_its_family(self):
+        # The model arrives after the row was inserted, so ingest retiers it
+        # to the registry tier a launch records (never the bare ``pi``).
+        for run_id, model, want in (
+            ("pi:s:ws1-ds", "river/deepseek-ai/DeepSeek-V4.1-Flash-1017", "pi-deepseek"),
+            ("pi:s:ws1-beam", "reflection/Beam-1.0-501B-A23B", "pi-beam"),
+        ):
+            self.add(run_id, "pi", "pi")
+            self.store.upsert_run({"run_id": run_id, "model": model})
+            self.assertEqual(self.store.get_run(run_id)["tier"], want)
+
+    def test_repair_heals_rows_that_still_name_the_source(self):
+        # Rows written before the ingest retier existed: a direct write, the
+        # way an older build left them, then the startup backstop heals them.
+        for run_id, source, model in (
+            ("pi:s:ws1-ds", "pi", "river/deepseek-ai/DeepSeek-V4.1-Flash-1017"),
+            ("generic:s:ws1-glm", "generic", "river/zai-org/GLM-5.3-Flash"),
+        ):
+            self.add(run_id, source, source, model)
+            with self.store._lock:
+                self.store._conn.execute(
+                    "UPDATE runs SET tier=? WHERE run_id=?", (source, run_id)
+                )
+                self.store._conn.commit()
+        self.assertEqual(self.store.repair_stale_tiers(), 2)
+        self.assertEqual(self.store.get_run("pi:s:ws1-ds")["tier"], "pi-deepseek")
+        self.assertEqual(self.store.get_run("generic:s:ws1-glm")["tier"], "glm")
+        # Idempotent: nothing left to heal.
+        self.assertEqual(self.store.repair_stale_tiers(), 0)
+
+    def test_a_recorded_tier_is_never_healed(self):
+        self.add("pi:s:ws1-recorded", "pi", "pi-deepseek", "river/deepseek-ai/DeepSeek-V4.1-Flash-1017")
+        self.assertEqual(self.store.repair_stale_tiers(), 0)
+        self.assertEqual(self.store.get_run("pi:s:ws1-recorded")["tier"], "pi-deepseek")
 
 
 class MergeGrokManifestsTest(unittest.TestCase):

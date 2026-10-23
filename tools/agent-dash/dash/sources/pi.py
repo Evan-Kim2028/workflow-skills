@@ -56,10 +56,12 @@ TOOL = "pi"
 MANIFEST = "pi-sessions.tsv"
 RUNNING = "running"
 TSV_CAP = 1024 * 1024
+META_CAP = 64 * 1024
 VERDICT_BYTES = 4096
 DIRECTORY = "pi"
 
 _tsv_cache: dict = {}
+_meta_cache: dict = {}
 _verdict_cache: dict = {}
 _last_write: dict = {}
 last_error = None
@@ -158,7 +160,11 @@ def _seen(store):
 
 
 def parse_rows(text):
-    """Session rows from ``pi-sessions.tsv`` (label, session_id, start, model)."""
+    """Session rows from ``pi-sessions.tsv``: label, session_id, start, model, tier.
+
+    The optional fifth cell is the tier the launcher recorded (``pi-deepseek``,
+    ``pi-beam``); older rows have none and fall back to the model family.
+    """
     rows = []
     for raw in (text or "").splitlines():
         line = raw.strip("\r\n").lstrip("\ufeff")
@@ -173,12 +179,14 @@ def parse_rows(text):
             continue
         sid = parts[1].strip()
         model = parts[3].strip() if len(parts) > 3 and parts[3].strip() else None
+        tier = parts[4].strip() if len(parts) > 4 and parts[4].strip() else None
         rows.append(
             {
                 "label": label,
                 "sid": None if sid in ("", "-") else sid,
                 "started": started,
                 "model": model,
+                "tier": tier,
             }
         )
     return rows
@@ -248,6 +256,8 @@ def _tsv_row(row, pad):
         "sid": row["sid"],
         "model": row["model"],
         "started": row["started"],
+        "tier": row.get("tier"),
+        "meta": _read_meta(pad, row["label"]),
         "pad": pad,
         "live": False,
         "live_pid": None,
@@ -365,6 +375,41 @@ def _model_tier(model):
     return NAME
 
 
+def _tier_of(row):
+    """Tier for one manifest row: the recorded tier, then the meta file, then the model.
+
+    ``run_worker.py`` records the registry tier it launched (``pi-deepseek``,
+    ``pi-beam``) as a fifth cell and in ``<label>.meta.json``. Both beat the
+    model-family guess, which is what keeps a pi run off the ``pi`` bucket.
+    """
+    for value in (row.get("tier"), (row.get("meta") or {}).get("tier")):
+        text = str(value or "").strip()
+        if text:
+            return text
+    return _model_tier(row.get("model"))
+
+
+def _read_meta(pad, label):
+    """``<label>.meta.json`` from ``run_worker.py``, or {}. Never raises."""
+    path = os.path.join(pad, "%s.meta.json" % label)
+    try:
+        st = os.stat(path)
+    except OSError:
+        return {}
+    sig = (st.st_size, st.st_mtime_ns)
+    hit = _meta_cache.get(path)
+    if hit and hit[0] == sig:
+        return hit[1]
+    try:
+        with open(path, "rb") as fh:
+            data = json.loads(fh.read(META_CAP).decode("utf-8", "replace"))
+    except (OSError, ValueError):
+        return {}
+    meta = data if isinstance(data, dict) else {}
+    _meta_cache[path] = (sig, meta)
+    return meta
+
+
 def _upsert_run(store, row, processes, seen):
     label = row["label"]
     pad = row["pad"]
@@ -375,7 +420,7 @@ def _upsert_run(store, row, processes, seen):
     run = {
         "run_id": "pi:%s:%s" % (sid, label),
         "source": NAME,
-        "tier": _model_tier(row.get("model")),
+        "tier": _tier_of(row),
         "session_id": sid,
         "label": label,
         "out_path": out_path,

@@ -619,6 +619,47 @@ class FixturePhasesTest(unittest.TestCase):
         self.assertEqual(exec_run["verdict"], "PASS")
 
 
+class PiTierColumnTest(SourceTest):
+    """The recorded tier beats the model family, so no pi run lands in ``pi``."""
+
+    def write_tiered(self, rows):
+        text = "label\tsession_id\tstarted_epoch\tmodel\ttier\n" + "".join(
+            "\t".join(str(x) for x in row) + "\n" for row in rows
+        )
+        (self.pad / "pi-sessions.tsv").write_text(text, encoding="utf-8")
+
+    def test_recorded_tier_is_the_run_tier(self):
+        self.write_tiered(
+            [
+                ["ws16-exec-ds", SID, 1792000000, "river/deepseek-ai/DeepSeek-V4.1-Flash-1017", "pi-deepseek"],
+                ["ws16-exec-beam", "beam-sid", 1792000001, "reflection/Beam-1.0-501B-A23B", "pi-beam"],
+            ]
+        )
+        (self.pad / "out-ws16-exec-ds.md").write_text("PASS\nok\n", encoding="utf-8")
+        (self.pad / "out-ws16-exec-beam.md").write_text("PASS\nok\n", encoding="utf-8")
+        self.poll()
+        ds = self.store.runs[self.run_id("ws16-exec-ds")]
+        beam = self.store.runs["pi:beam-sid:ws16-exec-beam"]
+        self.assertEqual(ds["tier"], "pi-deepseek")
+        self.assertEqual(beam["tier"], "pi-beam")
+        self.assertEqual(ds["model"], "river/deepseek-ai/DeepSeek-V4.1-Flash-1017")
+        self.assertEqual(beam["model"], "reflection/Beam-1.0-501B-A23B")
+
+    def test_meta_file_supplies_the_tier_when_the_row_has_none(self):
+        self.write_tsv([["ws16-exec-meta", SID, 1792000000, DEEPSEEK_ID]])
+        (self.pad / "ws16-exec-meta.meta.json").write_text(
+            '{"tier": "pi-deepseek", "harness": "pi", "model": "%s"}' % DEEPSEEK_ID,
+            encoding="utf-8",
+        )
+        self.poll()
+        self.assertEqual(self.store.runs[self.run_id("ws16-exec-meta")]["tier"], "pi-deepseek")
+
+    def test_old_rows_still_read_the_model_family(self):
+        self.write_tsv([["ws16-exec-old", SID, 1792000000, DEEPSEEK_ID]])
+        self.poll()
+        self.assertEqual(self.store.runs[self.run_id("ws16-exec-old")]["tier"], "deepseek")
+
+
 class ModelTierTest(unittest.TestCase):
     def test_model_family_is_the_tier(self):
         self.assertEqual(pi._model_tier("reflection/Beam-1.0-501B-A23B"), "beam")
@@ -629,17 +670,25 @@ class ModelTierTest(unittest.TestCase):
     def test_store_family_tier_matches_source(self):
         from dash.store.runs import _family_tier
 
+        # A healed pi row takes the registry tier its launch would record
+        # (``pi-beam``), so healing and a fresh launch agree.
         for model, tier in (
-            ("reflection/Beam-1.0-501B-A23B", "beam"),
-            ("reflection/beam:free", "beam"),
-            ("river/zai-org/GLM-5.3-Flash", "glm"),
-            ("river/deepseek-ai/DeepSeek-V4.1-Flash-1017", "deepseek"),
-            ("deepseek-ai/DeepSeek-V4.1-Flash", "deepseek"),
+            ("reflection/Beam-1.0-501B-A23B", "pi-beam"),
+            ("reflection/beam:free", "pi-beam"),
+            ("river/zai-org/GLM-5.3-Flash", "pi-glm"),
+            ("river/deepseek-ai/DeepSeek-V4.1-Flash-1017", "pi-deepseek"),
+            ("deepseek-ai/DeepSeek-V4.1-Flash", "pi-deepseek"),
         ):
             self.assertEqual(_family_tier("pi", model), tier)
-            self.assertEqual(_family_tier("pi", model), pi._model_tier(model))
+            self.assertEqual(_family_tier("pi", model)[3:], pi._model_tier(model))
+        self.assertEqual(_family_tier("generic", "river/zai-org/GLM-5.3-Flash"), "glm")
         self.assertIsNone(_family_tier("pi", "mystery-model-9"))
         self.assertIsNone(_family_tier("pi", None))
+
+    def test_tier_of_prefers_the_recorded_tier(self):
+        self.assertEqual(pi._tier_of({"tier": "pi-beam", "model": DEEPSEEK}), "pi-beam")
+        self.assertEqual(pi._tier_of({"meta": {"tier": "pi-deepseek"}, "model": GLM}), "pi-deepseek")
+        self.assertEqual(pi._tier_of({"model": DEEPSEEK}), "deepseek")
 
 
 if __name__ == "__main__":

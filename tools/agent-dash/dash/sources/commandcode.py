@@ -229,6 +229,7 @@ def parse_rows(text):
         if not label or started is None:
             continue
         sid = parts[2].strip()
+        tier = parts[8].strip() if len(parts) > 8 and parts[8].strip() else None
         rows.append(
             {
                 "label": label,
@@ -239,6 +240,7 @@ def parse_rows(text):
                 "input": _int(parts[5]),
                 "output": _int(parts[6]),
                 "status": parts[7].strip(),
+                "tier": tier,
             }
         )
     return rows
@@ -281,6 +283,7 @@ def _tsv_attempt(row, pad):
         "input": row["input"],
         "output": row["output"],
         "status_raw": row["status"],
+        "tier": row.get("tier"),
         "tsv": True,
         "live": False,
         "live_pid": None,
@@ -437,7 +440,8 @@ def _upsert_attempt(store, sid, row, seen):
     run = {
         "run_id": "commandcode:%s:%s" % (sid, label),
         "source": NAME,
-        "tier": NAME,
+        "tier": row.get("tier") or "commandcode",
+        "harness": "commandcode",
         "session_id": sid,
         "label": label,
         "status": status,

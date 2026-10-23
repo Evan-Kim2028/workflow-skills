@@ -22,6 +22,14 @@ those log rows are rewritten to zero so the turn totals are the only ledger.
 synthetic offset keys (``grok_cli:seen:*``, ``grok_cli:auth:*``,
 ``grok_cli:sup:*``) are bookkeeping, not files.
 
+The dashboard tier is the registry tier name the launcher recorded, never a
+guess from the model id: ``run_worker.py`` writes it as the fifth manifest
+cell and in ``<label>.meta.json``, so a DeepSeek Flash row reads tier
+``deepseek-flash`` and a GLM row ``glm`` or ``glm-flash``. Rows older than
+that column fall back to a model-to-tier map. The harness is always ``grok``
+(the Grok Build CLI), and the model is stored verbatim, so every model shows
+up under its own name instead of folding into ``glm``/``other``.
+
 DeepSeek V4.1 Flash (model id ``deepseek-flash``, run through the same CLI)
 shares the ``usage.json`` shape: ``inputTokens`` includes
 ``cachedReadTokens`` (``totalTokens`` equals ``inputTokens`` plus
@@ -84,6 +92,7 @@ def _poll(store, cfg, now):
                 continue
             for row in _parse_manifest(text):
                 row["parent_session_id"] = parent
+                row["pad"] = pad
                 if _keep_latest(manifests, row):
                     pads[row["session_id"]] = pad
 
@@ -335,15 +344,16 @@ def _add_usage(store, row):
 
 def _upsert_run(store, row, model, pid, processes=None, pad=None, is_latest=True, now=None):
     sid = row["session_id"]
+    chosen = model or row.get("model") or None
     run = {
         "run_id": _run_id(row),
         "source": "glm",
-        "tier": "glm",
+        "tier": _tier_of(row, chosen),
+        "harness": "grok",
         "session_id": sid,
     }
     if row.get("label"):
         run["label"] = row["label"]
-    chosen = model or row.get("model") or None
     if chosen:
         run["model"] = chosen
     parent = row.get("parent_session_id")
@@ -456,6 +466,11 @@ def _label(sid, row):
 
 
 def _parse_manifest(text):
+    """Rows from ``glm-sessions.tsv``: label, uuid, started, model, then tier.
+
+    The fifth cell is the registry tier the launch recorded. Older rows stop
+    at the model; they get their tier from the meta file or the model map.
+    """
     rows = []
     for raw in text.splitlines():
         line = raw.strip()
@@ -475,10 +490,67 @@ def _parse_manifest(text):
             except ValueError:
                 started = None
         model = parts[3].strip() if len(parts) > 3 else ""
+        tier = parts[4].strip() if len(parts) > 4 and parts[4].strip() else None
         rows.append(
-            {"label": label, "session_id": sid, "started_at": started, "model": model or None}
+            {
+                "label": label,
+                "session_id": sid,
+                "started_at": started,
+                "model": model or None,
+                "tier": tier,
+            }
         )
     return rows
+
+
+#: Fallback tier per model id, for rows written before the tier column.
+MODEL_TIERS = {
+    "deepseek-flash": "deepseek-flash",
+    "glm-5.3": "glm",
+    "glm-5.3-flash": "glm-flash",
+    "reflection-beam": "beam",
+}
+
+
+def _tier_of(row, model=None):
+    """Registry tier for a run: recorded tier, meta file, then the model map.
+
+    ``row["tier"]`` comes from the manifest's fifth cell and
+    ``row["meta_tier"]`` from ``<label>.meta.json``; both are the registry
+    name the launch used. The map is the only guess, and it never returns
+    ``glm`` for a DeepSeek model.
+    """
+    for value in (row.get("tier"), row.get("meta_tier")):
+        text = str(value or "").strip()
+        if text:
+            return text
+    key = str(model or row.get("model") or "").strip().lower()
+    if key in MODEL_TIERS:
+        return MODEL_TIERS[key]
+    for known, tier in MODEL_TIERS.items():
+        if key.endswith("/" + known):
+            return tier
+    if "deepseek" in key:
+        return "deepseek-flash"
+    if "beam" in key:
+        return "beam"
+    if "glm" in key:
+        return "glm-flash" if "flash" in key else "glm"
+    return TOOL
+
+
+def _read_meta_tier(pad, label):
+    """The tier in ``<label>.meta.json`` beside the manifest, or None."""
+    if not pad or not label:
+        return None
+    path = os.path.join(pad, "%s.meta.json" % label)
+    try:
+        with open(path, "rb") as fh:
+            data = json.loads(fh.read(64 * 1024).decode("utf-8", "replace"))
+    except (OSError, ValueError):
+        return None
+    tier = data.get("tier") if isinstance(data, dict) else None
+    return str(tier).strip() or None if tier is not None else None
 
 
 def _keep_latest(manifests, row):

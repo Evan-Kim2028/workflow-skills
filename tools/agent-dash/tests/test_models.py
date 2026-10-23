@@ -79,6 +79,29 @@ class BeamFamilyTest(unittest.TestCase):
         self.assertEqual(_tool_key(deepseek), "deepseek")
         self.assertEqual(_feed_tool_key(deepseek), "deepseek")
 
+    def test_grok_build_tiers_count_under_their_model_family(self):
+        # A Grok Build run carries source glm plus its registry tier. The
+        # per-harness totals count it under the family its model belongs to
+        # (deepseek / glm / beam), never dropping it into "other".
+        rows = {
+            ("deepseek-flash", "deepseek-flash"): "deepseek",
+            ("glm-flash", "glm-5.3-flash"): "glm",
+            ("glm", "glm-5.3"): "glm",
+            ("beam", "reflection-beam"): "beam",
+        }
+        for (tier, model), want in rows.items():
+            run = {"source": "glm", "tier": tier, "model": model}
+            self.assertEqual(_tool_key(run), want, run)
+            self.assertEqual(_feed_tool_key(run), want, run)
+        # A row with no tier column but a DeepSeek model still counts as deepseek.
+        legacy = {"source": "glm", "tier": "glm", "model": "deepseek-flash"}
+        self.assertEqual(_tool_key(legacy), "deepseek")
+        self.assertEqual(_feed_tool_key(legacy), "deepseek")
+        # A recorded pi tier is a pi run, counted by model family.
+        pi_ds = {"source": "pi", "tier": "pi-deepseek", "model": "river/deepseek-ai/DeepSeek-V4.1-Flash-1017"}
+        self.assertEqual(_tool_key(pi_ds), "deepseek")
+        self.assertEqual(_tool_key({"source": "pi", "tier": "pi-beam", "model": "reflection/Beam-1.0-501B-A23B"}), "beam")
+
 
 class HarnessTest(unittest.TestCase):
     def test_harness_of_reads_source_and_generic_tier(self):
@@ -100,12 +123,25 @@ class HarnessTest(unittest.TestCase):
             ("generic", "opus"): "claude",
             ("generic", "glm"): "grok-cli",
             ("weird", ""): "weird",
+            # Grok Build runs record harness "grok", never "other".
+            ("glm", "deepseek-flash"): "grok-cli",
+            ("glm", "glm-flash"): "grok-cli",
         }
         for (source, tier), want in cases.items():
             self.assertEqual(harness_of({"source": source, "tier": tier}), want, (source, tier))
         self.assertEqual(HARNESS_NAMES["grok-cli"], "Grok Build")
         self.assertEqual(HARNESS_NAMES["commandcode"], "Command Code")
         self.assertEqual(HARNESS_NAMES["pi"], "pi")
+
+    def test_recorded_harness_wins_and_grok_reads_grok_build(self):
+        for harness in ("grok", "grok-cli"):
+            run = {"source": "glm", "tier": "deepseek-flash", "model": "deepseek-flash", "harness": harness}
+            self.assertEqual(harness_of(run), "grok-cli")
+        self.assertEqual(HARNESS_NAMES["grok"], "Grok Build")
+        # A recorded harness on a pi row keeps the pi harness (the launcher
+        # knows the CLI it started) and a junk value never wins.
+        self.assertEqual(harness_of({"source": "pi", "tier": "pi-beam", "harness": "pi"}), "pi")
+        self.assertEqual(harness_of({"source": "glm", "tier": "glm", "harness": "other"}), "grok-cli")
 
     def test_beam_runs_report_pi_harness_with_beam_model(self):
         run = {"source": "pi", "tier": "beam", "model": "reflection/Beam-1.0-501B-A23B:xhigh"}
@@ -129,6 +165,10 @@ class BeamJsTests(unittest.TestCase):
             "assert.strictEqual(ADM.harnessOf({source:'generic',tier:'grok'}),'cursor');"
             "assert.strictEqual(ADM.harnessOf({source:'codex-exec',tier:'codex'}),'codex');"
             "assert.strictEqual(ADM.harnessOf({source:'weird',tier:''}),'weird');"
+            "assert.strictEqual(ADM.harnessOf({source:'glm',tier:'deepseek-flash',harness:'grok'}),'grok-cli');"
+            "assert.strictEqual(ADM.harnessOf({source:'glm',tier:'deepseek-flash',model:'deepseek-flash'}),'grok-cli');"
+            "assert.strictEqual(ADM.harnessOf({source:'glm',tier:'glm',harness:'other'}),'grok-cli');"
+            "assert.strictEqual(ADM.harnessName('grok'),'Grok Build');"
             "assert.strictEqual(ADM.harnessName('grok-cli'),'Grok Build');"
             "assert.strictEqual(ADM.harnessName('pi'),'pi');"
             "assert.strictEqual(ADM.seriesName('beam-1.0@pi'),'Beam 1.0 \\u00B7 pi');"
