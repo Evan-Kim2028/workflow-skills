@@ -60,7 +60,7 @@ def _dump(store):
 class ManifestUnitTests(unittest.TestCase):
     def test_parent_session_from_pad(self):
         sid = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
-        base = os.path.join(os.sep, "tmp", "claude-501", "-proj", sid, "scratchpad")
+        base = os.path.join(os.sep, "tmp", "claude-1000", "-proj", sid, "scratchpad")
         self.assertEqual(
             manifests.parent_session_from_pad(os.path.join(base, "pi")), sid
         )

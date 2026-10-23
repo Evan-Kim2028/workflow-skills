@@ -150,7 +150,7 @@ class LauncherHelperTest(unittest.TestCase):
 
     def test_parent_session_of_prefers_pad_then_env(self):
         sid = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
-        pad = os.path.join(os.sep, "tmp", "claude-501", "-x", sid, "scratchpad", "pi")
+        pad = os.path.join(os.sep, "tmp", "claude-1000", "-x", sid, "scratchpad", "pi")
         self.assertEqual(launch.parent_session_of(pad), sid)
         old = dict(os.environ)
         try:
