@@ -341,6 +341,14 @@ def is_marker_run(run: dict) -> bool:
 
 WORKER_SOURCES = frozenset({"muse", "glm", "grok"})
 
+#: Sources whose live process rows appear as labelled launcher processes.
+#: ``pi`` and ``commandcode`` launch through ``scripts/launch_pi.py`` and
+#: ``scripts/launch_cmd.py``, which the process source reports with the
+#: worker label, so a running row on one of these sources is the worker a
+#: live launcher means. Kept apart from ``WORKER_SOURCES`` (marker and
+#: adoption rules) so those stay ``muse``/``glm``/``grok`` only.
+LIVE_WORKER_SOURCES = WORKER_SOURCES | {"pi", "commandcode"}
+
 
 WRAPPER_SOURCES = frozenset({"claude-workflow"})
 

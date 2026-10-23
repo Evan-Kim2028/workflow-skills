@@ -20,7 +20,7 @@ from dash.liveness import (DAGSTER_ACTIVE_FRESH_S,
                       sibling_err_path,
                       stale_grace_s,)
 
-from .util import (WORKER_SOURCES, WRAPPER_SOURCES)
+from .util import (LIVE_WORKER_SOURCES, WORKER_SOURCES, WRAPPER_SOURCES)
 
 
 class RunningMixin:
@@ -593,7 +593,7 @@ class RunningMixin:
             for run in shown_all:
                 if (
                     run.get("status") in ("running", "queued")
-                    and run.get("source") in WORKER_SOURCES
+                    and run.get("source") in LIVE_WORKER_SOURCES
                     and run.get("label")
                 ):
                     have.add(run["label"])
