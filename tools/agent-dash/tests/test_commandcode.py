@@ -430,6 +430,68 @@ class PollTest(Fixture):
         self.assertNotIn(SID_DEAD, self.store.sessions)
 
 
+class LateLabelRepairTest(unittest.TestCase):
+    """Usage filed before the manifest links the label moves to the labeled run.
+
+    End to end against the real store: a session file is consumed with
+    no TSV row (orphan ``commandcode:<sid>:<sid>``), then the manifest
+    row lands and the next poll must leave one labeled run holding all
+    events.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmp.name)
+        self.scratch = self.tmp / "scratch"
+        self.projects = self.tmp / "projects"
+        self.pad = self.scratch / "-home-someone-x" / SID_OK / "scratchpad" / "cmd"
+        self.pad.mkdir(parents=True)
+        from dash.store import Store as RealStore
+
+        self.store = RealStore(self.tmp / "dash.sqlite")
+
+    def tearDown(self):
+        self.store.close()
+        self._tmp.cleanup()
+
+    def cfg(self):
+        return {
+            "roots": {"scratchpads": [str(self.scratch)], "commandcode_projects": str(self.projects)},
+            "read_budgets": {"per_file": 4 * 1024 * 1024, "per_tick": 8 * 1024 * 1024},
+        }
+
+    def test_pre_link_usage_moves_to_labeled_run(self):
+        path = self.projects / "home-someone-projects-demo-repo"
+        path.mkdir(parents=True)
+        session_file(
+            path / (SID_OK + ".jsonl"),
+            SID_OK,
+            "/home/someone/projects/demo-repo",
+            [
+                assistant("i1", "reflection/beam:free", 30000, 29000, 400, "2026-10-21T14:51:32.000Z"),
+                assistant("i2", "reflection/beam:free", 31000, 30000, 410, "2026-10-21T14:52:00.000Z"),
+            ],
+        )
+        cc.poll(self.store, self.cfg(), 1_800_000_000.0)
+        self.assertIsNone(cc.last_error)
+        orphan = "commandcode:%s:%s" % (SID_OK, SID_OK)
+        self.assertIsNotNone(self.store.get_run(orphan))
+        BEFORE = HEADER + "ws6-plan-cc\treflection/beam:free\t%s\t1791999900\t1792000000\t100\t20\tok\n" % SID_OK
+        (self.pad / "cmd-sessions.tsv").write_text(BEFORE, encoding="utf-8")
+        cc.poll(self.store, self.cfg(), 1_800_000_100.0)
+        self.assertIsNone(cc.last_error)
+        labeled = "commandcode:%s:ws6-plan-cc" % SID_OK
+        self.assertIsNone(self.store.get_run(orphan))
+        self.assertIsNotNone(self.store.get_run(labeled))
+        run_ids = {
+            row["run_id"]
+            for row in self.store._conn.execute(
+                "SELECT run_id FROM usage_events WHERE session_id=?", (SID_OK,)
+            ).fetchall()
+        }
+        self.assertEqual(run_ids, {labeled})
+
+
 class FreeModelPricingTest(unittest.TestCase):
     def test_five_free_models_price_at_zero(self):
         for model in FREE:

@@ -107,6 +107,25 @@ def _poll(store, cfg, now):
     for sid, row in attempts.items():
         if row["tsv"] and sid not in index:
             _add_tsv_fallback(store, sid, row, now, seen)
+    _repair(store)
+
+
+def _repair(store):
+    """Fold pre-link orphan usage onto the labeled run, once it exists.
+
+    Events that arrive before the manifest links the label are filed
+    under ``commandcode:<sid>:<sid>``; when the TSV row names the
+    label, this moves that usage onto ``commandcode:<sid>:<label>``
+    and deletes the empty orphan run. Same pattern as the muse orphan
+    repair. A store without the repair (older tests) is skipped.
+    """
+    repair = getattr(store, "repair_commandcode_orphans", None)
+    if not callable(repair):
+        return
+    try:
+        repair()
+    except Exception:
+        _fail("orphan")
 
 
 def _outdirs(root, only=None):

@@ -570,6 +570,25 @@ class RunsMixin:
                 if self.reassign_run(src_id, dst_id):
                     moved += 1
             return moved
+        def repair_commandcode_orphans(self) -> int:
+            """Move orphan Command Code usage onto the labeled run and delete the orphan.
+
+            Usage that arrives before the manifest links the label is
+            filed under ``commandcode:<sid>:<sid>``; once the TSV row
+            names the label, the usage belongs on
+            ``commandcode:<sid>:<label>``. Same pattern as
+            :meth:`repair_muse_orphans`.
+            """
+            with self._lock:
+                rows = [
+                    dict(row)
+                    for row in self._conn.execute("SELECT * FROM runs WHERE source='commandcode'").fetchall()
+                ]
+            moved = 0
+            for src_id, dst_id in commandcode_orphan_pairs(rows):
+                if self.reassign_run(src_id, dst_id):
+                    moved += 1
+            return moved
         def repair_muse_clocks(self) -> int:
             """Fill a missing muse start from the earliest usage event.
 
@@ -880,6 +899,54 @@ def _muse_orphan(row: dict) -> bool:
         return False
     parts = rid.split(":")
     if len(parts) != 3 or parts[0] != "muse":
+        return False
+    return parts[1].lower() == sid.lower() and parts[2].lower() == sid.lower()
+
+
+def commandcode_orphan_pairs(runs: list) -> list:
+    """Return ``(orphan_run_id, labeled_run_id)`` for Command Code sessions that have both.
+
+    An orphan is an unlabeled ``commandcode:<sid>:<sid>`` row: usage
+    that arrived before the manifest linked the label. The labeled side
+    is the latest sibling that has a label.
+    """
+    groups: dict = {}
+    for row in runs:
+        source = row.get("source")
+        if source not in (None, "commandcode"):
+            rid = row.get("run_id")
+            if not (isinstance(rid, str) and rid.startswith("commandcode:")):
+                continue
+        sid = row.get("session_id")
+        if not isinstance(sid, str) or not sid:
+            continue
+        groups.setdefault(sid.lower(), []).append(row)
+    pairs = []
+    for group in groups.values():
+        labeled = [row for row in group if row.get("label")]
+        orphans = [row for row in group if _commandcode_orphan(row)]
+        if not labeled or not orphans:
+            continue
+        labeled.sort(key=lambda row: row.get("started_at") or 0, reverse=True)
+        dst = labeled[0].get("run_id")
+        if not dst:
+            continue
+        for src in orphans:
+            src_id = src.get("run_id")
+            if src_id and src_id != dst:
+                pairs.append((src_id, dst))
+    return pairs
+
+
+def _commandcode_orphan(row: dict) -> bool:
+    if row.get("label"):
+        return False
+    sid = row.get("session_id")
+    rid = row.get("run_id")
+    if not isinstance(sid, str) or not isinstance(rid, str):
+        return False
+    parts = rid.split(":")
+    if len(parts) != 3 or parts[0] != "commandcode":
         return False
     return parts[1].lower() == sid.lower() and parts[2].lower() == sid.lower()
 

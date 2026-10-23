@@ -45,6 +45,7 @@ from .running import (
 )
 from .runs import (
     RunsMixin,
+    _commandcode_orphan,
     _fold_manifest_patch,
     _is_manifest_twin,
     _merge_usage,
@@ -52,6 +53,7 @@ from .runs import (
     _nearest_twin,
     _parent_map,
     _rollup_usage,
+    commandcode_orphan_pairs,
     muse_orphan_pairs,
 )
 from .summarize import (
@@ -138,6 +140,7 @@ __all__ = [
     "WORKER_SOURCES",
     "WRAPPER_SOURCES",
     "is_prod_job_run",
+    "commandcode_orphan_pairs",
     "muse_orphan_pairs",
     "_ESTIMATE_TOOL",
     "_WF",
@@ -169,6 +172,7 @@ __all__ = [
     "_nearest_twin",
     "_overlap",
     "_duplicate_run_mismatches",
+    "_commandcode_orphan",
     "_muse_orphan",
     "_parent_map",
     "_rollup_usage",

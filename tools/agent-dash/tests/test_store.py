@@ -2663,6 +2663,75 @@ class BackfillGrokModelsTest(unittest.TestCase):
         self.assertEqual(self.store.backfill_grok_models(self.now), 0)
 
 
+class RepairCommandcodeOrphansTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.store = memory(Path(self.tmp.name))
+        self.now = time.time()
+
+    def tearDown(self):
+        self.store.close()
+        self.tmp.cleanup()
+
+    def add_run(self, run_id, label=None):
+        row = {
+            "run_id": run_id,
+            "source": "commandcode",
+            "tier": "commandcode",
+            "session_id": "s",
+            "status": "done",
+            "started_at": self.now - 100,
+            "ended_at": self.now - 50,
+        }
+        if label is not None:
+            row["label"] = label
+        self.store.upsert_run(row)
+
+    def add_usage(self, run_id, message):
+        self.store.add_usage(
+            {
+                "ts": self.now - 10,
+                "session_id": "s",
+                "run_id": run_id,
+                "model": "reflection/beam:free",
+                "tool": "commandcode",
+                "message_id": message,
+                "input": 10,
+                "output": 5,
+                "cache_read": 0,
+                "cache_write": 0,
+                "reasoning": 0,
+            }
+        )
+
+    def usage_run_ids(self):
+        return {
+            row["run_id"]
+            for row in self.store._conn.execute("SELECT run_id FROM usage_events").fetchall()
+        }
+
+    def test_pre_link_usage_moves_to_labeled_run(self):
+        self.add_run("commandcode:s:ws6-cc", label="ws6-cc")
+        self.add_run("commandcode:s:s")
+        self.add_usage("commandcode:s:s", "m1")
+        self.add_usage("commandcode:s:s", "m2")
+        self.assertEqual(self.store.repair_commandcode_orphans(), 1)
+        self.assertIsNone(self.store.get_run("commandcode:s:s"))
+        self.assertIsNotNone(self.store.get_run("commandcode:s:ws6-cc"))
+        self.assertEqual(self.usage_run_ids(), {"commandcode:s:ws6-cc"})
+
+    def test_orphan_without_labeled_sibling_stays(self):
+        self.add_run("commandcode:s:s")
+        self.add_usage("commandcode:s:s", "m1")
+        self.assertEqual(self.store.repair_commandcode_orphans(), 0)
+        self.assertIsNotNone(self.store.get_run("commandcode:s:s"))
+
+    def test_labeled_run_without_orphan_is_untouched(self):
+        self.add_run("commandcode:s:ws6-cc", label="ws6-cc")
+        self.add_usage("commandcode:s:ws6-cc", "m1")
+        self.assertEqual(self.store.repair_commandcode_orphans(), 0)
+
+
 class MergeGrokManifestsTest(unittest.TestCase):
     LABEL = "ws6-c11-coverage"
     CHAT_UUID = "c11c11c1-1c11-4c11-8c11-c11c11c11c11"
