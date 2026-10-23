@@ -1361,9 +1361,10 @@ def _recent_models(db: Path, since: float | None = None) -> list[dict]:
 
 def _collect_pricing(ctx) -> None:
     from dash.pricing import catalog as load_catalog
+    from dash.pricing import status as price_status
 
     try:
-        rows = {row["model"]: row for row in load_catalog()}
+        table = load_catalog()
     except Exception as exc:
         _check(ctx, "pricing", False, f"catalog unreadable: {exc}")
         _add(
@@ -1385,15 +1386,19 @@ def _collect_pricing(ctx) -> None:
                 models.append(
                     {"model": item["model"], "rows": item.get("rows") or 0, "tokens": item.get("tokens") or 0}
                 )
+    # One source of truth with ingest: pricing.status() applies the same
+    # effort-suffix fallback as the cost path, so a model priced under its
+    # bare id (``reflection/Beam-1.0-501B-A23B``) is not flagged for its
+    # suffixed usage (``...:xhigh``).
     missing = [
         item
         for item in models
         if item.get("model")
         and int(item.get("tokens") or 0) > 0
-        and (item["model"] not in rows or rows[item["model"]].get("input") is None or rows[item["model"]].get("output") is None)
+        and not price_status(item["model"], table)["priced"]
     ]
     if not missing:
-        _check(ctx, "pricing", True, f"{len(rows)} price rows, {len(models)} models on record priced")
+        _check(ctx, "pricing", True, f"{len(table)} price rows, {len(models)} models on record priced")
         return
     names = [str(item["model"]) for item in missing]
     _check(ctx, "pricing", False, f"unpriced models: {', '.join(names)}")

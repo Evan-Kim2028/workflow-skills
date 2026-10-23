@@ -357,22 +357,25 @@ def cost(
 
 
 def health_block(stats: list[dict]) -> dict:
-    rows = {row["model"]: row for row in catalog()}
+    table = catalog()
     seen = set()
     models = []
     for stat in stats:
         model = stat.get("model")
         seen.add(model)
-        models.append(_health_row(model, rows.get(model), stat))
-    for model, row in rows.items():
-        if model not in seen:
-            models.append(_health_row(model, row, None))
+        models.append(_health_row(model, _lookup(model, table), stat))
+    for row in table:
+        if row.get("model") not in seen:
+            models.append(_health_row(row.get("model"), row, None))
     models.sort(key=lambda item: (-item["rows"], item["model"] or ""))
     return {"models": models}
 
 
-def reprice(store, projects_root: str | None) -> dict:
-    """Recompute est_cost_usd. Reread Claude usage only where the 5m/1h split is empty."""
+def reprice(store, projects_root: str | None, *, dry_run: bool = False) -> dict:
+    """Recompute est_cost_usd. Reread Claude usage only where the 5m/1h split is empty.
+
+    With ``dry_run`` the summary is computed but nothing is written.
+    """
     events = store.usage_events_for_cost()
     before = _tally((event["model"], event["est_cost_usd"]) for event in events)
     needed: dict[str, set] = {}
@@ -422,12 +425,96 @@ def reprice(store, projects_root: str | None) -> dict:
             (est, five, one, event["tool"], event["session_id"], event["message_id"])
         )
         after_pairs.append((event["model"], est))
-    store.write_costs(updates)
+    if not dry_run:
+        store.write_costs(updates)
     return {
         "models": _compare(before, _tally(after_pairs)),
         "splits_needed": sum(len(ids) for ids in needed.values()),
         "splits_filled": len(found),
         "splits_still_missing": still_missing,
+        "dry_run": bool(dry_run),
+    }
+
+
+#: How many NULL-cost usage rows one catalog-change pass reprices at
+#: most. A pass that fills the batch leaves the catalog signature
+#: unmarked, so the next tick continues; a drained pass marks it done.
+NULL_REPRICE_LIMIT = 5000
+
+#: Meta key holding the catalog signature the NULL-cost pass consumed.
+CATALOG_SIG_KEY = "catalog_prices_sig"
+
+
+def catalog_sig(path: Path | None = None) -> str | None:
+    """``"mtime:size"`` for the price catalog, or None when unreadable.
+
+    The server reprices NULL-cost usage rows once per signature, so a
+    catalog edit (new model rows) heals rows ingested before it without
+    rescanning priced history on every tick.
+    """
+    target = Path(path) if path is not None else DEFAULT_PATH
+    try:
+        st = target.stat()
+    except OSError:
+        return None
+    return "%d:%d" % (st.st_mtime_ns, st.st_size)
+
+
+def reprice_null_costs(store, limit: int = NULL_REPRICE_LIMIT, table=None) -> dict:
+    """Price NULL-cost usage rows with the current catalog, bounded.
+
+    Only rows whose ``est_cost_usd`` is still NULL are read (estimate
+    tool rows never price). Returns how many rows were read, priced,
+    written, and left unpriced, plus whether the batch filled up
+    (``truncated``: more NULL rows remain for the next pass). Rows that
+    still have no price keep their NULL cost: a missing rate never
+    becomes zero.
+    """
+    resolved = catalog() if table is None else table
+    events = store.usage_events_missing_cost(limit)
+    updates = []
+    priced_ts = []
+    for event in events:
+        est = cost(
+            event["model"],
+            event["input_tokens"],
+            event["output_tokens"],
+            event["cache_read"],
+            event["cache_write"],
+            resolved,
+            cache_write_5m=event["cache_write_5m"],
+            cache_write_1h=event["cache_write_1h"],
+            reasoning=event["reasoning"],
+            ts=event.get("ts"),
+        )
+        if est is None:
+            continue
+        updates.append(
+            (
+                est,
+                event["cache_write_5m"],
+                event["cache_write_1h"],
+                event["tool"],
+                event["session_id"],
+                event["message_id"],
+            )
+        )
+        priced_ts.append(event.get("ts"))
+    if updates:
+        hours = set()
+        for ts in priced_ts:
+            if ts is not None:
+                try:
+                    hours.add(int(float(ts) // 3600) * 3600)
+                except (TypeError, ValueError, OverflowError):
+                    pass
+        store.write_costs(updates, hours=hours)
+    return {
+        "read": len(events),
+        "priced": len(updates),
+        "written": len(updates),
+        "still_null": len(events) - len(updates),
+        "truncated": len(events) >= max(int(limit), 1),
     }
 
 

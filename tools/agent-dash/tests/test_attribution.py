@@ -18,6 +18,7 @@ from dash.attribution import (
     dominant_workstream,
     infer_from_cwd,
     is_explicit,
+    is_hub_label,
     resolve_lead,
     ws_from_bundle_path,
 )
@@ -192,6 +193,54 @@ class ResolveLeadTest(unittest.TestCase):
     def test_nothing_qualifies(self):
         self.assertEqual(resolve_lead([], "/repo/main", None), (None, None))
         self.assertEqual(resolve_lead(["WS7", "WS1"], "/repo/main", "nope"), (None, None))
+
+
+class HubScopeTest(unittest.TestCase):
+    def test_is_hub_label(self):
+        self.assertTrue(is_hub_label("hub-exec-dash-accounting"))
+        self.assertTrue(is_hub_label("hub-plan-perf-snapshot"))
+        self.assertTrue(is_hub_label("HUB-EXEC-X"))
+        self.assertFalse(is_hub_label("ws16-exec-x"))
+        self.assertFalse(is_hub_label("hubris"))
+        self.assertFalse(is_hub_label(None))
+        self.assertFalse(is_hub_label(""))
+
+    def test_hub_label_never_inherits_parent_workstream(self):
+        self.assertEqual(
+            attribute("hub-exec-dash-accounting", "s", parent_session_id="p", parent_workstream="WS16"),
+            (None, None),
+        )
+        self.assertEqual(attribute("hub-exec-x", "s"), (None, None))
+        self.assertEqual(attribute("hub-exec-x"), (None, None))
+
+    def test_hub_label_ignores_session_map_without_entry(self):
+        self.assertEqual(
+            attribute("hub-exec-x", "s", parent_session_id="p1"),
+            (None, None),
+        )
+
+    def test_explicit_map_entry_still_applies_to_hub(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "map.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "exact": {"hub-exec-pinned": "WS9"},
+                        "regex": [["^(hub-exec-matched)$", "WS9"]],
+                        "sessions": {"s1": "WS9", "p1": "WS9"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            self.assertEqual(attribute("hub-exec-pinned", path=path), ("WS9", "label"))
+            self.assertEqual(attribute("hub-exec-matched", path=path), ("WS9", "regex"))
+            self.assertEqual(
+                attribute("hub-exec-other", "s1", path=path), ("WS9", "session-default")
+            )
+            self.assertEqual(
+                attribute("hub-exec-other", "s2", parent_session_id="p1", path=path),
+                ("WS9", "session-default"),
+            )
 
 
 if __name__ == "__main__":

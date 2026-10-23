@@ -67,6 +67,10 @@ def poll(store, cfg, now: float) -> None:
         _poll(store, cfg or {}, float(now))
     except Exception as exc:
         _log.warning("generic poll: %s", type(exc).__name__)
+    # After (not inside) the read: _poll returns early on a quiet
+    # file, and a restart with quiet files is exactly when a
+    # still-NULL run needs its model filled from usage.
+    _repair(store, now)
 
 
 def _poll(store, cfg: dict, now: float) -> None:
@@ -117,6 +121,17 @@ def _poll(store, cfg: dict, now: float) -> None:
         store.set_offset(key, int(st.st_ino), start + consumed, int(st.st_size), float(st.st_mtime))
     except Exception:
         _log.warning("generic offset")
+
+
+def _repair(store, now: float) -> None:
+    """Fill NULL run models from usage. Unknown stores keep the old behavior."""
+    backfill = getattr(store, "backfill_tool_models", None)
+    if not callable(backfill):
+        return
+    try:
+        backfill(NAME, now)
+    except Exception:
+        _log.warning("generic backfill")
 
 
 def _apply_line(store, raw: bytes, line_at: int, now: float) -> None:

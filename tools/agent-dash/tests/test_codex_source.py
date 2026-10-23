@@ -567,5 +567,42 @@ class CodexPricingTest(unittest.TestCase):
             self.assertIsNone(cost(model, 1_000_000, 500_000, 900_000, 0), model)
 
 
+class BackfillPostPollTest(CodexCase):
+    """A quiet file after a restart still teaches the run its model.
+
+    The model cache is process-local, so after a restart nothing
+    re-reads a finished thread even though its usage names the model.
+    The poll repair fills the NULL run model from usage.
+    """
+
+    def test_quiet_file_after_restart_fills_model_from_usage(self):
+        from dash.store import Store as RealStore
+
+        with tempfile.TemporaryDirectory() as root:
+            now = T0 + 600
+            lines = [
+                meta(TID, T0),
+                turn(TURN_A, "gpt-6.1-sol", T0 + 1),
+                usage(TID, TURN_A, "resp-1", T0 + 2, 1000, 100, 10, 0),
+                task("task_complete", TURN_A, T0 + 5),
+            ]
+            write_rollout(root, "rollout-x-%s.jsonl" % TID, lines, mtime=T0 - 9000)
+            store = RealStore(os.path.join(root, "dash.sqlite"))
+            try:
+                run_id = "codex:%s:codex-01a15609" % TID
+                poll(store, root, now)
+                self.assertIsNone(codex.last_error)
+                self.assertEqual(store.get_run(run_id)["model"], "gpt-6.1-sol")
+                # A row written before model capture existed, then a restart.
+                store._conn.execute("UPDATE runs SET model=NULL WHERE run_id=?", (run_id,))
+                store._conn.commit()
+                codex.reset_state()
+                poll(store, root, now + 3600)
+                self.assertIsNone(codex.last_error)
+                self.assertEqual(store.get_run(run_id)["model"], "gpt-6.1-sol")
+            finally:
+                store.close()
+
+
 if __name__ == "__main__":
     unittest.main()

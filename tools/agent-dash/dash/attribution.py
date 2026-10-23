@@ -40,6 +40,17 @@ _WS_SEGMENT = re.compile(r"(?:^|[/_.\-])ws(\d+)(?:[/_.\-]|$)", re.IGNORECASE)
 #: A workstream id: a bundle directory name or the TOOLS scope.
 _WS_ID = re.compile(r"^(WS\d+|TOOLS)$")
 
+#: Hub scope: cross-workstream work (dashboard tooling, hub ops). A
+#: hub label never lands on a numbered workstream through inheritance
+#: or inference; only an explicit map entry still applies.
+_HUB_RE = re.compile(r"^hub(?:[-_]|$)", re.IGNORECASE)
+
+
+def is_hub_label(label) -> bool:
+    """True when the label is hub-scoped (``hub-<mark>-...``)."""
+    text = clean_label(label)
+    return text is not None and _HUB_RE.match(text) is not None
+
 _lock = threading.Lock()
 _cache: dict = {}
 _group = re.compile(r"\{(\d+)\}")
@@ -90,6 +101,16 @@ def attribute(
                 continue
             if workstream:
                 return workstream, "regex"
+    if is_hub_label(text):
+        # Hub-scoped work never inherits a numbered workstream and is
+        # never inferred onto one: only an explicit session-map entry
+        # still applies.
+        for key in (parent_session_id, session_id):
+            if isinstance(key, str) and key.strip():
+                mapped = rules["sessions"].get(key.strip())
+                if mapped:
+                    return mapped, "session-default"
+        return None, None
     if isinstance(parent_session_id, str) and parent_session_id.strip():
         if isinstance(parent_workstream, str) and parent_workstream.strip():
             return parent_workstream.strip(), INHERITED

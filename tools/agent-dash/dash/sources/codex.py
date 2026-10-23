@@ -138,6 +138,7 @@ def _poll(store, cfg, now):
             budget = _ingest(store, cfg, path, budget, per_file, now)
         except Exception:
             _fail("ingest")
+    _repair(store, now)
 
 
 def _rollouts(root, only):
@@ -248,6 +249,23 @@ def _refresh_run(store, cfg, path, st, now):
         store.upsert_session(session)
     except Exception:
         _fail("session")
+
+
+def _repair(store, now):
+    """Fill NULL run models from usage.
+
+    A restart clears the process-local model cache, so a quiet file
+    never re-teaches a run its model even though its usage names it.
+    Unknown stores keep the old behavior.
+    """
+    backfill = getattr(store, "backfill_tool_models", None)
+    if not callable(backfill):
+        return
+    for source in (LEAD_SOURCE, WORKER_SOURCE):
+        try:
+            backfill(source, now)
+        except Exception:
+            _fail("backfill")
 
 
 def _turn_done(cfg, path, tid):

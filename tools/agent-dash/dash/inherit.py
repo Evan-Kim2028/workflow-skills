@@ -4,6 +4,8 @@ Pure rules live in :mod:`dash.attribution`; this module binds them to the
 store. Every function assumes the caller holds ``store._lock`` and talks
 to ``store._conn`` directly, so the per-poll upsert path pays one indexed
 lookup and quiet rows converge on the throttled refresh pass instead.
+Hub-scoped labels are exempt everywhere: only an explicit map entry may
+place hub work on a numbered workstream.
 """
 
 from __future__ import annotations
@@ -167,7 +169,14 @@ def resolve_lead(store, session_id: str, *, now=None) -> tuple:
 
 
 def resolve(store, label, session_id, parent_session_id, *, now=None, run_id=None) -> tuple:
-    """Fill the gap left by the explicit rules: (b) then (c)."""
+    """Fill the gap left by the explicit rules: (b) then (c).
+
+    Hub-scoped labels never resolve: no explicit map entry matched
+    (the caller checks those first), and neither inheritance nor
+    inference may place hub work on a numbered workstream.
+    """
+    if attribution.is_hub_label(label):
+        return None, None
     if isinstance(parent_session_id, str) and parent_session_id.strip():
         return resolve_child(store, session_id, parent_session_id, now=now, run_id=run_id)
     return resolve_lead(store, session_id, now=now)
@@ -228,6 +237,8 @@ def refresh(store, now: float) -> int:
         explicit, conf = attribution.attribute(session.get("label"), sid)
         if explicit is not None:
             target = (explicit, conf)
+        elif attribution.is_hub_label(session.get("label")):
+            target = (None, None)
         else:
             workers = lead_workers(store, sid, moment)
             target = attribution.resolve_lead(
@@ -270,6 +281,8 @@ def refresh(store, now: float) -> int:
         )
         if explicit is not None:
             target = (explicit, conf)
+        elif attribution.is_hub_label(run.get("label")):
+            target = (None, None)
         elif isinstance(run.get("parent_session_id"), str) and run.get(
             "parent_session_id"
         ).strip():

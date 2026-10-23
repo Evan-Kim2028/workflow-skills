@@ -11,7 +11,7 @@ from __future__ import annotations
 import time as _time
 
 from dash import inherit as _inherit
-from dash.attribution import attribute, clean_label
+from dash.attribution import attribute, clean_label, is_hub_label
 from dash.liveness import PROCESS_GONE_GRACE_S
 
 from .running import _annotate_lanes
@@ -68,11 +68,14 @@ class RunsMixin:
                     and confidence is None
                     and existing
                     and existing.get("ws_confidence") in ("inherited", "inferred")
+                    and not is_hub_label(merged.get("label"))
                 ):
                     # No evidence right now is not evidence of absence: a
                     # settled inference survives the write, and the inherit
                     # refresh (with poll-now evidence) remains the sole
-                    # clearer. Explicit attributions always overwrite.
+                    # clearer. Explicit attributions always overwrite. Hub
+                    # labels are exempt: inherited work never survives on
+                    # hub-scoped work.
                     workstream = existing.get("workstream")
                     confidence = existing.get("ws_confidence")
                 merged["workstream"] = workstream
@@ -121,15 +124,29 @@ class RunsMixin:
                     and confidence is None
                     and existing
                     and existing.get("ws_confidence") in ("inherited", "inferred")
+                    and not is_hub_label(merged.get("label"))
                 ):
                     # No evidence right now is not evidence of absence: a
                     # settled inference survives the write, and the inherit
                     # refresh (with poll-now evidence) remains the sole
-                    # clearer. Explicit attributions always overwrite.
+                    # clearer. Explicit attributions always overwrite. Hub
+                    # labels are exempt: inherited work never survives on
+                    # hub-scoped work.
                     workstream = existing.get("workstream")
                     confidence = existing.get("ws_confidence")
                 merged["workstream"] = workstream
                 merged["ws_confidence"] = confidence
+                if merged.get("tier") == merged.get("source") and merged.get("source") in (
+                    "pi",
+                    "generic",
+                ):
+                    # The tier still names the source: the row was
+                    # inserted model-less and the model arrived later
+                    # (backfill, re-ingest). Retier from the model
+                    # family so pi rows do not read as their own bucket.
+                    fixed = _family_tier(merged.get("source"), merged.get("model"))
+                    if fixed:
+                        merged["tier"] = fixed
                 if "out_bytes" in row:
                     old = (existing or {}).get("out_bytes") or 0
                     new = row.get("out_bytes") or 0
@@ -570,6 +587,52 @@ class RunsMixin:
                 if self.reassign_run(src_id, dst_id):
                     moved += 1
             return moved
+        def repair_commandcode_orphans(self) -> int:
+            """Move orphan Command Code usage onto the labeled run and delete the orphan.
+
+            Usage that arrives before the manifest links the label is
+            filed under ``commandcode:<sid>:<sid>``; once the TSV row
+            names the label, the usage belongs on
+            ``commandcode:<sid>:<label>``. Same pattern as
+            :meth:`repair_muse_orphans`.
+            """
+            with self._lock:
+                rows = [
+                    dict(row)
+                    for row in self._conn.execute("SELECT * FROM runs WHERE source='commandcode'").fetchall()
+                ]
+            moved = 0
+            for src_id, dst_id in commandcode_orphan_pairs(rows):
+                if self.reassign_run(src_id, dst_id):
+                    moved += 1
+            return moved
+        def repair_stale_tiers(self) -> int:
+            """Retier pi/generic runs whose tier still names the source.
+
+            One-time healing for rows inserted model-less (tier fell
+            back to the source name) and later given a model without a
+            tier update: the family tier comes from the model, so the
+            rows stop reading as their own ``pi`` bucket. Idempotent:
+            a second pass finds nothing to change. Returns how many
+            rows changed.
+            """
+            with self._lock:
+                rows = [
+                    dict(row)
+                    for row in self._conn.execute(
+                        "SELECT run_id, source, tier, model FROM runs "
+                        "WHERE source IN ('pi', 'generic') AND tier = source "
+                        "AND model IS NOT NULL AND model != ''"
+                    ).fetchall()
+                ]
+            changed = 0
+            for row in rows:
+                fixed = _family_tier(row.get("source"), row.get("model"))
+                if not fixed:
+                    continue
+                self.upsert_run({"run_id": row["run_id"], "tier": fixed})
+                changed += 1
+            return changed
         def repair_muse_clocks(self) -> int:
             """Fill a missing muse start from the earliest usage event.
 
@@ -880,6 +943,84 @@ def _muse_orphan(row: dict) -> bool:
         return False
     parts = rid.split(":")
     if len(parts) != 3 or parts[0] != "muse":
+        return False
+    return parts[1].lower() == sid.lower() and parts[2].lower() == sid.lower()
+
+
+def commandcode_orphan_pairs(runs: list) -> list:
+    """Return ``(orphan_run_id, labeled_run_id)`` for Command Code sessions that have both.
+
+    An orphan is an unlabeled ``commandcode:<sid>:<sid>`` row: usage
+    that arrived before the manifest linked the label. The labeled side
+    is the latest sibling that has a label.
+    """
+    groups: dict = {}
+    for row in runs:
+        source = row.get("source")
+        if source not in (None, "commandcode"):
+            rid = row.get("run_id")
+            if not (isinstance(rid, str) and rid.startswith("commandcode:")):
+                continue
+        sid = row.get("session_id")
+        if not isinstance(sid, str) or not sid:
+            continue
+        groups.setdefault(sid.lower(), []).append(row)
+    pairs = []
+    for group in groups.values():
+        labeled = [row for row in group if row.get("label")]
+        orphans = [row for row in group if _commandcode_orphan(row)]
+        if not labeled or not orphans:
+            continue
+        labeled.sort(key=lambda row: row.get("started_at") or 0, reverse=True)
+        dst = labeled[0].get("run_id")
+        if not dst:
+            continue
+        for src in orphans:
+            src_id = src.get("run_id")
+            if src_id and src_id != dst:
+                pairs.append((src_id, dst))
+    return pairs
+
+
+def _family_tier(source, model) -> str | None:
+    """Family tier for a run whose tier still names its source.
+
+    pi and generic runs tier by model family (beam/glm/deepseek);
+    generic additionally takes the source's own tier names (opus,
+    muse, ...) through a lazy import, the same pattern as
+    ``dash.store.running``. Returns None when the model implies no
+    better tier, so callers keep the old value. The family branch
+    mirrors ``dash.sources.pi._model_tier`` (kept local so the store
+    never imports a source at module level).
+    """
+    text = model.lower() if isinstance(model, str) else ""
+    if not text:
+        return None
+    if source in ("pi", "generic"):
+        # pi mirrors dash.sources.pi._model_tier exactly (beam, then
+        # glm, then deepseek); generic takes the same families first
+        # (tier_of does not know deepseek) and falls back to its own
+        # tier names below.
+        for name in ("beam", "glm", "deepseek"):
+            if name in text:
+                return name
+    if source == "generic":
+        from dash.sources.generic import tier_of
+
+        tier = tier_of(model)
+        return tier if tier != "generic" else None
+    return None
+
+
+def _commandcode_orphan(row: dict) -> bool:
+    if row.get("label"):
+        return False
+    sid = row.get("session_id")
+    rid = row.get("run_id")
+    if not isinstance(sid, str) or not isinstance(rid, str):
+        return False
+    parts = rid.split(":")
+    if len(parts) != 3 or parts[0] != "commandcode":
         return False
     return parts[1].lower() == sid.lower() and parts[2].lower() == sid.lower()
 

@@ -2663,6 +2663,251 @@ class BackfillGrokModelsTest(unittest.TestCase):
         self.assertEqual(self.store.backfill_grok_models(self.now), 0)
 
 
+class BackfillToolModelsTest(unittest.TestCase):
+    """backfill_tool_models fills NULL run models from usage for every tool source."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.store = memory(Path(self.tmp.name))
+        self.now = time.time()
+
+    def tearDown(self):
+        self.store.close()
+        self.tmp.cleanup()
+
+    def seed(self, source, run_id, usage_model="gpt-6.1-sol", run_model=None):
+        row = {
+            "run_id": run_id,
+            "source": source,
+            "tier": source,
+            "label": "ws6-fill",
+            "session_id": "s",
+            "status": "done",
+            "started_at": self.now - 100,
+            "ended_at": self.now - 50,
+        }
+        if run_model is not None:
+            row["model"] = run_model
+        self.store.upsert_run(row)
+        self.store.add_usage(
+            {
+                "ts": self.now - 10,
+                "session_id": "s",
+                "run_id": run_id,
+                "model": usage_model,
+                "tool": source,
+                "message_id": "m-%s" % run_id,
+                "input": 10,
+                "output": 5,
+                "cache_read": 0,
+                "cache_write": 0,
+                "reasoning": 0,
+            }
+        )
+
+    def filled(self, source, run_id):
+        self.assertEqual(self.store.backfill_tool_models(source, self.now), 1)
+        self.assertEqual(self.store.get_run(run_id)["model"], "gpt-6.1-sol")
+
+    def test_codex_lead(self):
+        self.seed("codex", "codex:s:codex-1")
+        self.filled("codex", "codex:s:codex-1")
+
+    def test_codex_worker(self):
+        self.seed("codex-exec", "codex:s:codex-2")
+        self.filled("codex-exec", "codex:s:codex-2")
+
+    def test_commandcode(self):
+        self.seed("commandcode", "commandcode:s:ws6-fill", usage_model="reflection/beam:free")
+        self.assertEqual(self.store.backfill_tool_models("commandcode", self.now), 1)
+        self.assertEqual(
+            self.store.get_run("commandcode:s:ws6-fill")["model"], "reflection/beam:free"
+        )
+
+    def test_generic(self):
+        self.seed("generic", "generic:ws6-fill")
+        self.filled("generic", "generic:ws6-fill")
+
+    def test_known_model_is_untouched(self):
+        self.seed("codex", "codex:s:codex-1", run_model="gpt-6.1-sol")
+        self.assertEqual(self.store.backfill_tool_models("codex", self.now), 0)
+
+    def test_no_usage_stays_null(self):
+        self.store.upsert_run(
+            {
+                "run_id": "codex:s:codex-9",
+                "source": "codex",
+                "tier": "codex",
+                "label": "ws6-fill",
+                "session_id": "s",
+                "status": "done",
+            }
+        )
+        self.assertEqual(self.store.backfill_tool_models("codex", self.now), 0)
+        self.assertIsNone(self.store.get_run("codex:s:codex-9")["model"])
+
+
+class StaleTierTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.store = memory(Path(self.tmp.name))
+        self.now = time.time()
+
+    def tearDown(self):
+        self.store.close()
+        self.tmp.cleanup()
+
+    def add_run(self, source, run_id, tier, model=None):
+        row = {
+            "run_id": run_id,
+            "source": source,
+            "tier": tier,
+            "label": "ws6-tier",
+            "session_id": "s",
+            "status": "done",
+            "started_at": self.now - 100,
+            "ended_at": self.now - 50,
+        }
+        if model is not None:
+            row["model"] = model
+        self.store.upsert_run(row)
+
+    def add_usage(self, source, run_id, model):
+        self.store.add_usage(
+            {
+                "ts": self.now - 10,
+                "session_id": "s",
+                "run_id": run_id,
+                "model": model,
+                "tool": source,
+                "message_id": "m-%s" % run_id,
+                "input": 10,
+                "output": 5,
+                "cache_read": 0,
+                "cache_write": 0,
+                "reasoning": 0,
+            }
+        )
+
+    def test_backfilled_model_retunes_pi_tier(self):
+        self.add_run("pi", "pi:s:ws6-tier", "pi")
+        self.add_usage("pi", "pi:s:ws6-tier", "reflection/Beam-1.0-501B-A23B")
+        self.assertEqual(self.store.backfill_tool_models("pi", self.now), 1)
+        run = self.store.get_run("pi:s:ws6-tier")
+        self.assertEqual(run["model"], "reflection/Beam-1.0-501B-A23B")
+        self.assertEqual(run["tier"], "beam")
+
+    def test_upserted_model_retunes_pi_tier(self):
+        self.add_run("pi", "pi:s:ws6-tier", "pi")
+        self.store.upsert_run(
+            {"run_id": "pi:s:ws6-tier", "model": "river/deepseek-ai/DeepSeek-V4.1-Flash-1017"}
+        )
+        self.assertEqual(self.store.get_run("pi:s:ws6-tier")["tier"], "deepseek")
+
+    def test_generic_tier_follows_model_family(self):
+        self.add_run("generic", "generic:ws6-tier", "generic", model="reflection/beam:free")
+        self.assertEqual(self.store.get_run("generic:ws6-tier")["tier"], "beam")
+        self.add_run("generic", "generic:gpt", "generic", model="gpt-6.1-sol")
+        self.assertEqual(self.store.get_run("generic:gpt")["tier"], "generic")
+
+    def test_unknown_model_keeps_source_tier(self):
+        self.add_run("pi", "pi:s:ws6-tier", "pi", model="mystery-model-9")
+        self.assertEqual(self.store.get_run("pi:s:ws6-tier")["tier"], "pi")
+
+    def test_other_sources_keep_source_tier(self):
+        self.add_run("muse", "muse:s:ws6-tier", "muse", model="muse-spark-1.3-contributor")
+        self.assertEqual(self.store.get_run("muse:s:ws6-tier")["tier"], "muse")
+
+    def test_repair_stale_tiers_is_idempotent(self):
+        # Rows written before the upsert-time fix existed: seed them
+        # with raw SQL so no retier fires on the way in.
+        for run_id, source, model in (
+            ("pi:s:beam", "pi", "reflection/Beam-1.0-501B-A23B"),
+            ("generic:ds", "generic", "deepseek-flash"),
+            ("pi:s:mystery", "pi", "mystery-model-9"),
+        ):
+            self.store._conn.execute(
+                "INSERT INTO runs(run_id, source, tier, model, label, session_id, status)"
+                " VALUES(?, ?, ?, ?, ?, ?, ?)",
+                (run_id, source, source, model, "ws6-tier", "s", "done"),
+            )
+        self.store._conn.commit()
+        self.assertEqual(self.store.repair_stale_tiers(), 2)
+        self.assertEqual(self.store.get_run("pi:s:beam")["tier"], "beam")
+        self.assertEqual(self.store.get_run("generic:ds")["tier"], "deepseek")
+        self.assertEqual(self.store.get_run("pi:s:mystery")["tier"], "pi")
+        self.assertEqual(self.store.repair_stale_tiers(), 0)
+
+
+class RepairCommandcodeOrphansTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.store = memory(Path(self.tmp.name))
+        self.now = time.time()
+
+    def tearDown(self):
+        self.store.close()
+        self.tmp.cleanup()
+
+    def add_run(self, run_id, label=None):
+        row = {
+            "run_id": run_id,
+            "source": "commandcode",
+            "tier": "commandcode",
+            "session_id": "s",
+            "status": "done",
+            "started_at": self.now - 100,
+            "ended_at": self.now - 50,
+        }
+        if label is not None:
+            row["label"] = label
+        self.store.upsert_run(row)
+
+    def add_usage(self, run_id, message):
+        self.store.add_usage(
+            {
+                "ts": self.now - 10,
+                "session_id": "s",
+                "run_id": run_id,
+                "model": "reflection/beam:free",
+                "tool": "commandcode",
+                "message_id": message,
+                "input": 10,
+                "output": 5,
+                "cache_read": 0,
+                "cache_write": 0,
+                "reasoning": 0,
+            }
+        )
+
+    def usage_run_ids(self):
+        return {
+            row["run_id"]
+            for row in self.store._conn.execute("SELECT run_id FROM usage_events").fetchall()
+        }
+
+    def test_pre_link_usage_moves_to_labeled_run(self):
+        self.add_run("commandcode:s:ws6-cc", label="ws6-cc")
+        self.add_run("commandcode:s:s")
+        self.add_usage("commandcode:s:s", "m1")
+        self.add_usage("commandcode:s:s", "m2")
+        self.assertEqual(self.store.repair_commandcode_orphans(), 1)
+        self.assertIsNone(self.store.get_run("commandcode:s:s"))
+        self.assertIsNotNone(self.store.get_run("commandcode:s:ws6-cc"))
+        self.assertEqual(self.usage_run_ids(), {"commandcode:s:ws6-cc"})
+
+    def test_orphan_without_labeled_sibling_stays(self):
+        self.add_run("commandcode:s:s")
+        self.add_usage("commandcode:s:s", "m1")
+        self.assertEqual(self.store.repair_commandcode_orphans(), 0)
+        self.assertIsNotNone(self.store.get_run("commandcode:s:s"))
+
+    def test_labeled_run_without_orphan_is_untouched(self):
+        self.add_run("commandcode:s:ws6-cc", label="ws6-cc")
+        self.add_usage("commandcode:s:ws6-cc", "m1")
+        self.assertEqual(self.store.repair_commandcode_orphans(), 0)
+
+
 class MergeGrokManifestsTest(unittest.TestCase):
     LABEL = "ws6-c11-coverage"
     CHAT_UUID = "c11c11c1-1c11-4c11-8c11-c11c11c11c11"
@@ -3563,6 +3808,70 @@ class StoreInheritanceTest(unittest.TestCase):
         run = self.store.get_run("claude-subagent:lead-1:aaa")
         self.assertEqual(run["workstream"], "WS7")
         self.assertEqual(run["ws_confidence"], "inherited")
+
+    def test_hub_run_does_not_inherit_parent_session_workstream(self):
+        self.store.upsert_session(
+            {"session_id": "lead-hub", "tool": "claude", "label": "ws16-worker", "status": "busy"}
+        )
+        self.assertEqual(self._session("lead-hub")["workstream"], "WS16")
+        self.store.upsert_session(
+            {
+                "session_id": "hub-child",
+                "tool": "muse",
+                "label": "hub-exec-dash-accounting",
+                "parent_session_id": "lead-hub",
+                "status": "busy",
+            }
+        )
+        self.store.upsert_run(
+            {
+                "run_id": "muse:hub-child:hub-exec-dash-accounting",
+                "source": "muse",
+                "tier": "muse",
+                "session_id": "hub-child",
+                "parent_session_id": "lead-hub",
+                "label": "hub-exec-dash-accounting",
+                "status": "done",
+                "started_at": 10,
+            }
+        )
+        session = self._session("hub-child")
+        self.assertIsNone(session["workstream"])
+        self.assertIsNone(session["ws_confidence"])
+        run = self.store.get_run("muse:hub-child:hub-exec-dash-accounting")
+        self.assertIsNone(run["workstream"])
+        self.assertIsNone(run["ws_confidence"])
+
+    def test_refresh_clears_stale_hub_inheritance(self):
+        # Rows attributed before the hub exemption existed.
+        self.store._conn.execute(
+            "INSERT INTO runs(run_id, label, session_id, parent_session_id,"
+            " workstream, ws_confidence, status)"
+            " VALUES(?, ?, ?, ?, ?, ?, ?)",
+            (
+                "muse:hub-old:hub-exec-dash-x",
+                "hub-exec-dash-x",
+                "hub-old",
+                "lead-hub",
+                "WS16",
+                "inherited",
+                "done",
+            ),
+        )
+        self.store._conn.execute(
+            "INSERT INTO sessions(session_id, label, parent_session_id,"
+            " workstream, ws_confidence, status)"
+            " VALUES(?, ?, ?, ?, ?, ?)",
+            ("hub-old", "hub-exec-dash-x", "lead-hub", "WS16", "inherited", "done"),
+        )
+        self.store._conn.commit()
+        self.assertEqual(self.store.refresh_workstream_inheritance(time.time()), 2)
+        run = self.store.get_run("muse:hub-old:hub-exec-dash-x")
+        self.assertIsNone(run["workstream"])
+        self.assertIsNone(run["ws_confidence"])
+        session = self._session("hub-old")
+        self.assertIsNone(session["workstream"])
+        self.assertIsNone(session["ws_confidence"])
 
     def test_lead_session_infers_dominant_workers(self):
         now = time.time()

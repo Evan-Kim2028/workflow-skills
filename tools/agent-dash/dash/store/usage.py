@@ -448,7 +448,30 @@ class UsageMixin:
                        FROM usage_events"""
                 ).fetchall()
             return [dict(row) for row in rows]
-        def write_costs(self, updates: list) -> None:
+        def usage_events_missing_cost(self, limit: int = 5000) -> list[dict]:
+            """Up to ``limit`` usage rows whose cost is still NULL.
+
+            Estimate-tool rows never price, so they are excluded. The
+            catalog-change pass prices these with the current catalog
+            instead of rescanning priced history.
+            """
+            try:
+                bound = max(int(limit), 1)
+            except (TypeError, ValueError):
+                bound = 5000
+            with self._lock:
+                rows = self._conn.execute(
+                    """SELECT tool, session_id, message_id, model,
+                              input_tokens, output_tokens, cache_read, cache_write,
+                              cache_write_5m, cache_write_1h, reasoning, est_cost_usd, ts
+                       FROM usage_events
+                       WHERE est_cost_usd IS NULL AND COALESCE(tool, '') != ?
+                       ORDER BY ts IS NULL, ts
+                       LIMIT ?""",
+                    (_ESTIMATE_TOOL, bound),
+                ).fetchall()
+            return [dict(row) for row in rows]
+        def write_costs(self, updates: list, hours=None) -> None:
             with self._lock:
                 self._conn.execute("BEGIN IMMEDIATE")
                 try:
@@ -460,12 +483,13 @@ class UsageMixin:
                            WHERE tool=? AND session_id=? AND message_id=?""",
                         updates,
                     )
-                    hours = {
-                        _hour(row["ts"])
-                        for row in self._conn.execute(
-                            "SELECT ts FROM usage_events WHERE ts IS NOT NULL"
-                        )
-                    }
+                    if hours is None:
+                        hours = {
+                            _hour(row["ts"])
+                            for row in self._conn.execute(
+                                "SELECT ts FROM usage_events WHERE ts IS NOT NULL"
+                            )
+                        }
                     for hour in hours:
                         self._rebuild_hour(hour)
                     self._conn.execute("COMMIT")
