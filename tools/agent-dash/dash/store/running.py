@@ -9,11 +9,15 @@ it and never take it.
 from __future__ import annotations
 
 from dash.liveness import (DAGSTER_ACTIVE_FRESH_S,
+                      REAP_IDLE_S,
                       STALE_IDLE_S,
                       STALLED_AFTER_S,
                       STALLED_SOURCES,
+                      dead_run_patch,
                       pid_alive as _pid_alive,
                       proc_started_ok,
+                      row_shows_quota,
+                      sibling_err_path,
                       stale_grace_s,)
 
 from .util import (WORKER_SOURCES, WRAPPER_SOURCES)
@@ -73,6 +77,106 @@ class RunningMixin:
                     "SELECT * FROM runs WHERE source='dagster' AND status IN ('running','queued')"
                 ).fetchall()
             return [dict(row) for row in rows]
+        def reap_dead_runs(self, now: float, idle_s: float | None = None, sources=None) -> list:
+            """Close running rows whose process died without writing a finish.
+
+            A row still marked ``running``/``queued`` whose stored pid is
+            gone and whose last evidence (usage heartbeats, process
+            samples, out/err file mtimes) is older than ``idle_s``
+            (``REAP_IDLE_S``, 10 minutes, config ``reaper.idle_minutes``)
+            is closed in place: ``died_early`` with verdict ``DEAD``
+            (``ended_at`` at the last activity), or verdict ``QUOTA`` when
+            the logs match a rate/quota limit — a Grok Build run killed by
+            a provider rate limit never writes a finish line, so the
+            failure reason comes from its err log. The record comes from
+            ``dash.liveness.dead_run_patch``, which the source reconcile
+            pass and the stale close write too, so every orphan closes
+            the same way. A row whose pid is
+            alive is never touched, and neither are Dagster rows (their
+            close-out follows the active set), slices (they follow their
+            primary), or rows with no pid at all. One lock hold covers
+            the liveness checks, the file stats, and the writes, so a
+            poll cannot revive a row between the check and the close.
+            Returns one ``{run_id, source, label, verdict, idle_s}`` dict
+            per reaped row.
+            """
+            import os as _os
+
+            now = float(now)
+            if idle_s is None:
+                idle_s = REAP_IDLE_S
+            idle_s = float(idle_s)
+            wanted_sources = set(sources or ())
+            with self._lock:
+                rows = [
+                    dict(row)
+                    for row in self._conn.execute(
+                        "SELECT * FROM runs WHERE status IN ('running','queued') "
+                        "AND pid IS NOT NULL AND slice_of IS NULL AND source != 'dagster'"
+                    ).fetchall()
+                ]
+                if wanted_sources:
+                    rows = [row for row in rows if (row.get("source") or "") in wanted_sources]
+                if not rows:
+                    return []
+                usage_max = self._usage_max_locked([row["run_id"] for row in rows])
+                sample_max = self._sample_max_locked(rows)
+                reaped = []
+                for row in rows:
+                    pid = _int_pid(row.get("pid"))
+                    if pid is None:
+                        continue
+                    try:
+                        if _pid_alive(pid):
+                            continue
+                    except Exception:
+                        continue
+                    stamps = []
+                    started = row.get("started_at")
+                    if isinstance(started, (int, float)) and not isinstance(started, bool):
+                        stamps.append(float(started))
+                    hit = usage_max.get(row["run_id"])
+                    if hit is not None:
+                        stamps.append(float(hit))
+                    hit = sample_max.get(row["run_id"])
+                    if hit is not None:
+                        stamps.append(float(hit))
+                    hit = sample_max.get(f"pid:{pid}")
+                    if hit is not None:
+                        stamps.append(float(hit))
+                    log_paths = [path for path in (row.get("out_path"), sibling_err_path(row.get("out_path"))) if path]
+                    for path in log_paths:
+                        try:
+                            stamps.append(float(_os.stat(path).st_mtime))
+                        except OSError:
+                            continue
+                    if not stamps:
+                        continue
+                    last = max(stamps)
+                    quiet = now - last
+                    if quiet < idle_s:
+                        continue
+                    merged = dict(row)
+                    merged.update(
+                        dead_run_patch(
+                            row, last, quota=row_shows_quota(row)
+                        )
+                    )
+                    self._write_run(merged)
+                    self._seq += 1
+                    self._data_seq += 1
+                    self._note_data_write()
+                    self._note_view_write()
+                    reaped.append(
+                        {
+                            "run_id": row["run_id"],
+                            "source": row.get("source"),
+                            "label": row.get("label"),
+                            "verdict": merged["verdict"],
+                            "idle_s": round(quiet, 1),
+                        }
+                    )
+                return reaped
         def stale_running(self, now: float, pid_alive_fn=None) -> list:
             """Running rows with no liveness evidence, each with a reason.
 

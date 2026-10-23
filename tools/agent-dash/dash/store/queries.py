@@ -201,7 +201,8 @@ class QueriesMixin:
                 stalled = self._stalled_locked(now, shown_all, None, _umax, _smax)
                 roll = self._summarize_locked(shown_all, parents, now, since, until, live_open)
                 mismatches = self._mismatches_locked(
-                    roll, shown_all, now, lambda ws: _scope_tab(roll, ws), processes
+                    roll, shown_all, now, lambda ws: _scope_tab(roll, ws), processes,
+                    evidence=(_umax, _smax, _pstarts),
                 )
                 by_source: dict[str, int] = {}
                 for run in shown_all:

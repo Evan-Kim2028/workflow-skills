@@ -1629,7 +1629,12 @@ class ProcessParseTest(unittest.TestCase):
                 process_poll(store, {}, 1_700_000_000.0)
                 rows = store._conn.execute("SELECT * FROM process_samples").fetchall()
                 for row in rows:
-                    self.assertIn(row["comm"], {"cursor-agent", "claude", "grok", "muse", "muse-bin", "python3"})
+                    # COMMS in dash/sources/process.py: pi ships as a node
+                    # script and a launcher, so node/pi/python3 rows are workers.
+                    self.assertIn(
+                        row["comm"],
+                        {"cursor-agent", "claude", "grok", "muse", "muse-bin", "node", "pi", "python3"},
+                    )
                     for value in row:
                         if isinstance(value, str):
                             if len(value) > 80 or "\n" in value or "[label:" in value:

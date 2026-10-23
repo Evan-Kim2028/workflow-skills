@@ -34,7 +34,10 @@ RUN_RULE = (
 LABEL_OK = re.compile(r"^[\w.+-]{1,80}$")
 KINDS = ("muse", "cursor", "grok-build")
 READ_LIMIT = 262144
-PREFLIGHT_TIMEOUT_S = 3.0
+#: The dashboard can take several seconds to answer right after a deploy
+#: restart (cold caches, polls holding the store lock), so the preflight
+#: budget is generous; a timeout below warns instead of refusing.
+PREFLIGHT_TIMEOUT_S = 10.0
 
 
 def dashboard_url() -> str:
@@ -67,7 +70,12 @@ def run_preflight(registry, requested: str, ctx) -> int | None:
 
     Checks the dashboard answers, the run dir will be visible to it, and
     the tier's model is priced and policy-compliant. A failure prints the
-    problem and its fix and stops before anything launches.
+    problem and its fix and stops before anything launches. The dashboard
+    leg is advisory: a slow or restarting dashboard (the endpoint can
+    take seconds right after a deploy) prints a warning and the launch
+    proceeds, because the dashboard collects evidence either way; every
+    other problem (invisible run dir, unpriced or policy-breaking tier)
+    still refuses.
     """
     from dash.doctor import preflight_for_launch
 
@@ -80,6 +88,13 @@ def run_preflight(registry, requested: str, ctx) -> int | None:
         url=dashboard_url(), timeout_s=PREFLIGHT_TIMEOUT_S,
     )
     if problem is None:
+        return None
+    if problem.get("code") == "dashboard-down":
+        print(
+            f"preflight warning (dashboard-down): {problem['title']}. "
+            f"{problem['detail']}. Launching anyway; the dashboard collects this run when it answers.",
+            file=sys.stderr,
+        )
         return None
     print(
         f"preflight ({problem['code']}): {problem['title']}. "

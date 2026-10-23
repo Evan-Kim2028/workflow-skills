@@ -523,7 +523,54 @@ class ReconcilePiTests(unittest.TestCase):
         self.assertEqual(ended, 1)
         row = store.get_run("pi:ws15-exec-gone:ws15-exec-gone")
         self.assertEqual(row["status"], "died_early")
+        self.assertEqual(row["verdict"], "DEAD")
         self.assertIsNone(row.get("pid"))
+
+    def test_reconcile_close_marks_a_rate_limit_as_quota(self):
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "out-pi-quota.md"
+            out.write_text("partial\n", encoding="utf-8")
+            err = Path(tmp) / "err-pi-quota.log"
+            err.write_text("Error: 429 Rate limit reached for requests\n", encoding="utf-8")
+            store = Store(
+                {
+                    "pi:s:pi-quota": {
+                        "run_id": "pi:s:pi-quota",
+                        "source": "pi",
+                        "label": "pi-quota",
+                        "status": "running",
+                        "pid": 424242,
+                        "started_at": 50,
+                        "out_path": str(out),
+                    }
+                }
+            )
+            ended = process.reconcile_running(store, 200, [])
+            self.assertEqual(ended, 1)
+            row = store.get_run("pi:s:pi-quota")
+            self.assertEqual(row["status"], "died_early")
+            self.assertEqual(row["verdict"], "QUOTA")
+
+    def test_reconcile_close_keeps_an_existing_verdict(self):
+        store = Store(
+            {
+                "pi:s:pi-partial": {
+                    "run_id": "pi:s:pi-partial",
+                    "source": "pi",
+                    "label": "pi-partial",
+                    "status": "running",
+                    "pid": 424242,
+                    "started_at": 50,
+                    "verdict": "PARTIAL",
+                }
+            }
+        )
+        ended = process.reconcile_running(store, 200, [])
+        self.assertEqual(ended, 1)
+        self.assertEqual(store.get_run("pi:s:pi-partial")["verdict"], "PARTIAL")
 
     def test_reconcile_keeps_a_label_matched_pi_run_running(self):
         store = Store(
@@ -740,6 +787,7 @@ class StaleGenericTests(unittest.TestCase):
         self.assertEqual(ended, 1)
         row = store.get_run("generic:s:ws15-plan-pcdedup")
         self.assertEqual(row["status"], "died_early")
+        self.assertEqual(row["verdict"], "IDLE")
 
     def test_generic_row_with_fresh_stale_evidence_is_left_alone(self):
         store = StaleStore()

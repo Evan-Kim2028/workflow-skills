@@ -71,6 +71,7 @@ KNOWN_TOP_KEYS = {
     "caps",
     "doctor",
     "linear",
+    "reaper",
 }
 KNOWN_ROOT_KEYS = {
     "claude_projects",

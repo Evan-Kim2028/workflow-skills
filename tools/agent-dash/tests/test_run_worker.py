@@ -453,14 +453,15 @@ class PreflightTests(unittest.TestCase):
         data["workers"] = workers
         self.reg.write_text(json.dumps(data), encoding="utf-8")
 
-    def test_preflight_blocks_when_dashboard_down(self):
+    def test_preflight_down_warns_and_launches(self):
         os.environ["AGENT_DASH_URL"] = "http://127.0.0.1:1"
         self.counts = {}
-        code, _out, err, launch = self.launch("default")
-        self.assertEqual(code, 1)
-        self.assertEqual(launch.cmds, [])
-        self.assertIn("preflight (dashboard-down)", err)
-        self.assertIn("python3 agent_dash.py run", err)
+        code, out, err, launch = self.launch("default")
+        self.assertEqual(code, 0)
+        self.assertEqual(len(launch.cmds), 1)
+        self.assertIn("preflight warning (dashboard-down)", err)
+        self.assertIn("Launching anyway", err)
+        self.assertIn("STATUS: done", out)
 
     def test_no_preflight_skips_the_gate(self):
         os.environ["AGENT_DASH_URL"] = "http://127.0.0.1:1"

@@ -331,7 +331,11 @@ class SummarizeMixin:
 
             with self._lock:
                 shown_all, parents = self._shown_locked(now)
-                live_open = self._live_open_ids_locked(now, shown_all)
+                # One evidence pass shared by the live-open set below and
+                # the stale leg inside _mismatches_locked (same open rows,
+                # same GROUP BYs, computed once).
+                _umax, _smax, _pstarts = self._open_evidence_locked(shown_all)
+                live_open = self._live_open_ids_locked(now, shown_all, None, _umax, _smax, _pstarts)
                 usage_once = self._usage_by_run()
                 roll = self._summarize_locked(
                     shown_all, parents, now, since, until, live_open, usage=usage_once
@@ -343,6 +347,7 @@ class SummarizeMixin:
                     now,
                     lambda ws: _scope_tab(roll, ws),
                     processes,
+                    evidence=(_umax, _smax, _pstarts),
                 )
                 all_counts = roll["all"]["counts"]
                 all_totals = roll["all"]["totals"]
@@ -392,7 +397,7 @@ class SummarizeMixin:
                         )
                     )
                 return payload
-        def _mismatches_locked(self, roll: dict, shown_all: list, now: float, tab_of, processes=None) -> list:
+        def _mismatches_locked(self, roll: dict, shown_all: list, now: float, tab_of, processes=None, evidence=None) -> list:
             """Every violated invariant for one rollup. Caller holds the lock.
 
             ``tab_of(ws)`` returns ``(counts, totals, all_time)`` from the same
@@ -403,7 +408,10 @@ class SummarizeMixin:
             sums (tokens to the token, cost to the cent), per-row tabs,
             all-time sums, unpriced models, stale running, unseen workers,
             then duplicate runs. ``processes`` is the live worker listing for
-            the ``unseen worker`` check (``[]`` for none).
+            the ``unseen worker`` check (``[]`` for none). ``evidence`` is the
+            caller's shared liveness pass ``(usage_max, sample_max,
+            pid_starts)`` over ``shown_all``; the stale leg reuses it instead
+            of issuing the same GROUP BYs again.
             """
             everything = list(roll["rows"]) + [roll["unassigned"]]
             all_counts = roll["all"]["counts"]
@@ -492,7 +500,12 @@ class SummarizeMixin:
                 mismatches.append(
                     f"unpriced model: {entry['model']} ({entry['tokens']} tokens in {hours:g} h)"
                 )
-            for run, reason in self._stale_locked(now, shown_all):
+            for run, reason in self._stale_locked(
+                now, shown_all, None,
+                usage_max=None if evidence is None else evidence[0],
+                sample_max=None if evidence is None else evidence[1],
+                pid_starts=None if evidence is None else evidence[2],
+            ):
                 mismatches.append(f"stale running: {run.get('run_id')} ({reason})")
             mismatches.extend(self._unseen_workers_locked(now, shown_all, processes or []))
             mismatches.extend(

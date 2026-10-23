@@ -266,6 +266,29 @@ def run_gate(release: Path | str) -> tuple[bool, str]:
     return True, f"gate passed ({' + '.join(GATE_TESTS)})"
 
 
+def reap_stale_rows(state_dir: Path | str) -> int:
+    """Close dead running rows in the live store before the gate runs.
+
+    The gate's reconcile check fails on ``stale running`` mismatches, and
+    workers that died without writing a finish (a provider rate limit, a
+    killed launcher) leave exactly those rows behind. One reap pass here
+    closes them (verdict ``DEAD``/``QUOTA``) so the gate judges the new
+    release, not the wreckage. A missing database or any failure returns
+    -1 and never blocks the deploy: the reaper is a helper, not a gate.
+    """
+    db = Path(state_dir) / "dash.sqlite"
+    if not db.is_file():
+        return -1
+    try:
+        from dash.store import Store
+
+        with Store(db) as store:
+            reaped = store.reap_dead_runs(time.time())
+            return len(reaped)
+    except Exception:
+        return -1
+
+
 def fetch_health(url: str, timeout_s: float = 5.0) -> dict | None:
     """GET ``url/api/health`` as a dict, or None when unreachable."""
     try:
@@ -372,10 +395,12 @@ def deploy(
     except DeployError as exc:
         return False, str(exc)
     prev = current_release(state_dir)
+    reaped = reap_stale_rows(state_dir)
+    reap_note = f"; reaped {reaped} dead run(s)" if reaped > 0 else ""
     ok, reason = run_gate(release)
     if not ok:
         recovered = _recover(state_dir, prev, url, health_timeout_s, yes_live)
-        return False, f"gate failed for {sha}: {reason}; {recovered}"
+        return False, f"gate failed for {sha}: {reason}{reap_note}; {recovered}"
     set_current(state_dir, release)
     ok, reason = restart_release(tool_dir_of(release), yes_live)
     if not ok:

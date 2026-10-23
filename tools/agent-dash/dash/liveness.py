@@ -61,6 +61,14 @@ STALLED_SOURCES = ("muse", "glm", "grok", "generic", "cursor")
 # a relaunched twin's process onto the dead row.
 PROC_START_SKEW_S = 5 * 60
 
+# The dead-run reaper (dash/store/running.py ``reap_dead_runs``) closes a
+# running row whose pid is gone only after its out/err logs and usage
+# evidence have been quiet this long. Ten minutes is far above the 4 s
+# dead-pid grace the stale check uses (which only reports, never closes)
+# and far below the 6 h stale bound: a real worker writes within minutes,
+# so a quiet hour-old dead pid is safe to close.
+REAP_IDLE_S = 10 * 60
+
 
 def proc_started_ok(proc_started, run_started, skew_s: float = PROC_START_SKEW_S) -> bool:
     """True when a matched process could belong to the run.
@@ -185,6 +193,70 @@ def read_pid_file(path):
         return int(text)
     except (TypeError, ValueError):
         return None
+
+
+def sibling_err_path(out_path):
+    """The err log next to an out file, when the names follow the launcher.
+
+    ``run_worker.py`` writes ``out-<label>.md`` and ``err-<label>.log``
+    side by side, so ``out-<label>.md`` maps to ``err-<label>.log`` in
+    the same directory. Anything else (a session path, a bare name)
+    returns None: the reaper then judges quietness on the out file and
+    the usage evidence alone. Pure string work; no filesystem access.
+    """
+    if not out_path or not isinstance(out_path, str):
+        return None
+    from pathlib import Path as _Path
+
+    path = _Path(out_path)
+    name = path.name
+    if not (name.startswith("out-") and name.endswith(".md")):
+        return None
+    label = name[len("out-"):-len(".md")]
+    if not label:
+        return None
+    return str(path.with_name("err-%s.log" % label))
+
+
+def row_shows_quota(run) -> bool:
+    """True when the row's out or err log tail names a rate/quota limit.
+
+    The same check serves every closer: the reaper, the source reconcile
+    pass, and the stale close. Unreadable files never count as evidence.
+    """
+    for path in ((run or {}).get("out_path"), sibling_err_path((run or {}).get("out_path"))):
+        if not path:
+            continue
+        try:
+            if file_shows_quota(path):
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def dead_run_patch(run, ended_at, *, status="died_early", verdict=None, quota=False):
+    """The one close record for a running row whose process is gone.
+
+    A dead row can be proven gone by a live-process listing (the source
+    reconcile pass) or by its stored pid plus quiet logs (the reaper).
+    Both write this record, so the outcome cannot diverge: pid cleared,
+    ``ended_at`` at the last evidence, status ``died_early`` (or
+    ``unknown`` for an anonymous row), and a verdict only when the row
+    has none yet — ``QUOTA`` when the logs show a rate limit, else the
+    caller's reason (``DEAD`` by default, ``IDLE`` for the stale close).
+    An existing verdict and an anonymous row's missing one are kept as
+    they are.
+    """
+    patch = {
+        "run_id": run["run_id"],
+        "status": status,
+        "ended_at": ended_at,
+        "pid": None,
+    }
+    if status == "died_early" and not run.get("verdict"):
+        patch["verdict"] = verdict or ("QUOTA" if quota else "DEAD")
+    return patch
 
 
 def pid_alive(pid) -> bool:

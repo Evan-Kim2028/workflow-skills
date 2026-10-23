@@ -25,7 +25,12 @@ import re
 import subprocess
 import time
 
-from dash.liveness import PROCESS_GONE_GRACE_S, proc_started_ok
+from dash.liveness import (
+    PROCESS_GONE_GRACE_S,
+    dead_run_patch,
+    proc_started_ok,
+    row_shows_quota,
+)
 
 NAME = "process"
 INTERVAL_S = 5
@@ -562,14 +567,16 @@ def reconcile_running(store, now: float, processes=None) -> int:
             if labeled and row.get("parent_session_id") != labeled:
                 _link_shadow(store, row, labeled, now)
             continue
-        patch = {
-            "run_id": row["run_id"],
-            # Vanished without a finish line: died_early reads died (red),
-            # never done (green). Anonymous rows stay unknown.
-            "status": "died_early" if row.get("label") or row.get("verdict") else "unknown",
-            "ended_at": _last_activity(store, row["run_id"], row.get("started_at")) or float(now),
-            "pid": None,
-        }
+        # Vanished without a finish line: died_early reads died (red),
+        # never done (green). Anonymous rows stay unknown. The record is
+        # the reaper's (dead_run_patch), so a rate-limit log still closes
+        # QUOTA even when the process listing reports the end first.
+        patch = dead_run_patch(
+            row,
+            _last_activity(store, row["run_id"], row.get("started_at")) or float(now),
+            status="died_early" if row.get("label") or row.get("verdict") else "unknown",
+            quota=row_shows_quota(row),
+        )
         if labeled:
             patch["parent_session_id"] = labeled
         store.upsert_run(patch)
@@ -613,17 +620,15 @@ def _close_stale_claude_shell(store, now: float) -> int:
         if run.get("status") != "running":
             continue
         anon = not run.get("label") and not run.get("verdict")
-        patch = {
-            "run_id": run["run_id"],
-            # Idle closes ended without a verdict: died_early reads died
-            # (red). The IDLE verdict names the reason in tooltips.
-            "status": "unknown" if anon else "died_early",
-            "ended_at": _last_activity(store, run["run_id"], run.get("started_at"))
-            or float(now),
-            "pid": None,
-        }
-        if not anon and not run.get("verdict"):
-            patch["verdict"] = "IDLE"
+        # Idle closes ended without a verdict: died_early reads died
+        # (red). The IDLE verdict names the reason in tooltips. Same close
+        # record as the reaper and the reconcile close (dead_run_patch).
+        patch = dead_run_patch(
+            run,
+            _last_activity(store, run["run_id"], run.get("started_at")) or float(now),
+            status="unknown" if anon else "died_early",
+            verdict="IDLE",
+        )
         store.upsert_run(patch)
         ended += 1
     return ended
