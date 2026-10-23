@@ -170,7 +170,7 @@
     if (r.ended_at == null) return st === "running" ? "run" : "unk";
     if (st === "killed" || st === "died_early") return "died";
     if (st === "unknown") return "unk";
-    if (v === "FAILURE" || v === "FAIL" || v === "UNRESOLVED" || v === "QUOTA" || v === "IDLE") return "died";
+    if (v === "FAILURE" || v === "FAIL" || v === "UNRESOLVED" || v === "QUOTA" || v === "IDLE" || v === "DEAD") return "died";
     if (v === "CANCELED") return "cancelled";
     if (v === "BLOCKED" || v === "REQUEST_CHANGES" || v === "FIX") return "blocked";
     if (v === "PARTIAL" || v === "APPROVE_WITH_CHANGES") return "part";
@@ -186,6 +186,7 @@
       if (r.status === "killed") return "terminated: SIGTERM trace in the err log";
       if (v === "QUOTA") return "quota/rate limit ended the run";
       if (v === "IDLE") return "closed idle: no output, session never finished";
+      if (v === "DEAD") return "process gone: pid exited and the logs went quiet";
       if (v === "FAILURE" || v === "FAIL") return "reported FAILURE";
       if (v === "UNRESOLVED") return "ended unresolved";
       return "process exited without a verdict";

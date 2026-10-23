@@ -73,6 +73,11 @@ QUOTA_VERDICT = "QUOTA"
 # never finished.
 IDLE_VERDICT = "IDLE"
 
+# Verdict written by the dead-process reaper (dash/store/running.py,
+# dash/sources/reaper.py): the pid exited and the out/err logs stayed
+# quiet, so the run ended without ever writing a finish line.
+DEAD_VERDICT = "DEAD"
+
 # Terminal statuses: the session is over, whatever the verdict says.
 OPEN_STATUSES = ("running", "queued")
 FINISHED_STATUSES = ("done", "finished")
@@ -108,7 +113,7 @@ def _class_of(run) -> str:
         return "unk"
     if isinstance(verdict, str):
         upper = verdict.upper()
-        if upper in DIED_VERDICTS or upper in (QUOTA_VERDICT, IDLE_VERDICT):
+        if upper in DIED_VERDICTS or upper in (QUOTA_VERDICT, IDLE_VERDICT, DEAD_VERDICT):
             return "died"
         if upper == "CANCELED":
             return "cancelled"
@@ -150,6 +155,8 @@ def _reason_of(run, outcome: str) -> str | None:
             return "quota/rate limit ended the run"
         if upper == IDLE_VERDICT:
             return "closed idle: no output, session never finished"
+        if upper == DEAD_VERDICT:
+            return "process gone: pid exited and the logs went quiet"
         if upper in ("FAILURE", "FAIL"):
             return "reported FAILURE"
         if upper == "UNRESOLVED":

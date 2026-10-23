@@ -52,6 +52,7 @@ CASES = [
     (("died_early", None, True, False), "died"),
     (("died_early", "QUOTA", True, False), "died"),
     (("died_early", "IDLE", True, False), "died"),
+    (("died_early", "DEAD", True, False), "died"),
     # Deaths by verdict.
     (("finished", "FAILURE", True, False), "died"),
     (("done", "FAIL", True, False), "died"),
@@ -75,6 +76,7 @@ REASONS = [
     ({"status": "killed", "verdict": None, "ended_at": 1.0}, "died", "SIGTERM"),
     ({"status": "died_early", "verdict": "QUOTA", "ended_at": 1.0}, "died", "quota"),
     ({"status": "died_early", "verdict": "IDLE", "ended_at": 1.0}, "died", "idle"),
+    ({"status": "died_early", "verdict": "DEAD", "ended_at": 1.0}, "died", "process gone"),
     ({"status": "died_early", "verdict": None, "ended_at": 1.0}, "died", "without a verdict"),
     ({"status": "finished", "verdict": "FAILURE", "ended_at": 1.0}, "died", "FAILURE"),
     ({"status": "running", "verdict": None, "ended_at": None, "stalled": 7200.0}, "stalled", "no output for 2.0h"),

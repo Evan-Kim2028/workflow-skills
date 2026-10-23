@@ -37,6 +37,7 @@
       "test_planrender",
       "test_errors"
     ],
+    "dash/deploy.py": ["test_deploy"],
     "dash/doctor.py": [
       "test_doctor",
       "test_state",
@@ -69,6 +70,7 @@
       "test_ws_cli",
       "test_bundles_api"
     ],
+    "dash/outcomes.py": ["test_outcomes", "test_server"],
     "dash/perfmon.py": [
       "test_perfmon",
       "test_doctor",
@@ -192,6 +194,7 @@
       "test_poll_budgets",
       "perf/test_perf_budget"
     ],
+    "dash/sources/reaper.py": ["test_reaper", "test_poll_budgets"],
     "dash/sources/process.py": [
       "test_process_liveness",
       "test_store",
