@@ -13,9 +13,10 @@ from dash.liveness import (DAGSTER_ACTIVE_FRESH_S,
                       STALE_IDLE_S,
                       STALLED_AFTER_S,
                       STALLED_SOURCES,
-                      file_shows_quota,
+                      dead_run_patch,
                       pid_alive as _pid_alive,
                       proc_started_ok,
+                      row_shows_quota,
                       sibling_err_path,
                       stale_grace_s,)
 
@@ -87,7 +88,10 @@ class RunningMixin:
             (``ended_at`` at the last activity), or verdict ``QUOTA`` when
             the logs match a rate/quota limit — a Grok Build run killed by
             a provider rate limit never writes a finish line, so the
-            failure reason comes from its err log. A row whose pid is
+            failure reason comes from its err log. The record comes from
+            ``dash.liveness.dead_run_patch``, which the source reconcile
+            pass and the stale close write too, so every orphan closes
+            the same way. A row whose pid is
             alive is never touched, and neither are Dagster rows (their
             close-out follows the active set), slices (they follow their
             primary), or rows with no pid at all. One lock hold covers
@@ -152,14 +156,12 @@ class RunningMixin:
                     quiet = now - last
                     if quiet < idle_s:
                         continue
-                    quota = any(
-                        _path_shows_quota_safe(path) for path in log_paths
-                    )
                     merged = dict(row)
-                    merged["status"] = "died_early"
-                    merged["verdict"] = "QUOTA" if quota else "DEAD"
-                    merged["ended_at"] = last
-                    merged["pid"] = None
+                    merged.update(
+                        dead_run_patch(
+                            row, last, quota=row_shows_quota(row)
+                        )
+                    )
                     self._write_run(merged)
                     self._seq += 1
                     self._data_seq += 1
@@ -633,14 +635,6 @@ def _int_pid(pid):
         return int(pid)
     except (TypeError, ValueError):
         return None
-
-
-def _path_shows_quota_safe(path) -> bool:
-    """Quota/rate-limit evidence in ``path``'s tail. Unreadable reads False."""
-    try:
-        return file_shows_quota(path)
-    except Exception:
-        return False
 
 
 def _proc_is_ours(run: dict, pid_start) -> bool:

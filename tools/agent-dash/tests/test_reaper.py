@@ -128,6 +128,25 @@ class ReaperStoreTests(unittest.TestCase):
         self.assertEqual(row["status"], "died_early")
         self.assertEqual(row["verdict"], "QUOTA")
 
+    def test_existing_verdict_is_kept(self):
+        self.store.upsert_run(
+            {
+                "run_id": "pi:s5:ws14-partial",
+                "source": "pi",
+                "label": "ws14-partial",
+                "status": "running",
+                "pid": 424242,
+                "started_at": OLD,
+                "verdict": "PARTIAL",
+                "out_path": self._out_file("ws14-partial", QUIET),
+            }
+        )
+        reaped = self.store.reap_dead_runs(NOW)
+        self.assertEqual([entry["run_id"] for entry in reaped], ["pi:s5:ws14-partial"])
+        row = self.store.get_run("pi:s5:ws14-partial")
+        self.assertEqual(row["status"], "died_early")
+        self.assertEqual(row["verdict"], "PARTIAL")
+
     def test_dagster_rows_and_slices_are_skipped(self):
         self._run("dagster:abc", "nightly", source="dagster")
         self._run("muse:s6:lane", "lane", slice_of="muse:s5:lead")

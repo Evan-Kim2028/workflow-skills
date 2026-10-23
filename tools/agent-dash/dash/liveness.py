@@ -218,6 +218,47 @@ def sibling_err_path(out_path):
     return str(path.with_name("err-%s.log" % label))
 
 
+def row_shows_quota(run) -> bool:
+    """True when the row's out or err log tail names a rate/quota limit.
+
+    The same check serves every closer: the reaper, the source reconcile
+    pass, and the stale close. Unreadable files never count as evidence.
+    """
+    for path in ((run or {}).get("out_path"), sibling_err_path((run or {}).get("out_path"))):
+        if not path:
+            continue
+        try:
+            if file_shows_quota(path):
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def dead_run_patch(run, ended_at, *, status="died_early", verdict=None, quota=False):
+    """The one close record for a running row whose process is gone.
+
+    A dead row can be proven gone by a live-process listing (the source
+    reconcile pass) or by its stored pid plus quiet logs (the reaper).
+    Both write this record, so the outcome cannot diverge: pid cleared,
+    ``ended_at`` at the last evidence, status ``died_early`` (or
+    ``unknown`` for an anonymous row), and a verdict only when the row
+    has none yet — ``QUOTA`` when the logs show a rate limit, else the
+    caller's reason (``DEAD`` by default, ``IDLE`` for the stale close).
+    An existing verdict and an anonymous row's missing one are kept as
+    they are.
+    """
+    patch = {
+        "run_id": run["run_id"],
+        "status": status,
+        "ended_at": ended_at,
+        "pid": None,
+    }
+    if status == "died_early" and not run.get("verdict"):
+        patch["verdict"] = verdict or ("QUOTA" if quota else "DEAD")
+    return patch
+
+
 def pid_alive(pid) -> bool:
     """True while the process runs. Reaps our own exited child first."""
     try:
