@@ -6,8 +6,11 @@ No prompts, no argv, no secrets. Labels only.
 Run line (status shown in the run list and on the plan map)::
 
     {"type": "run", "label": "ws4-WS4.1-notes-index", "status": "running",
-     "model": "my-model", "tier": "generic", "session_id": "abc",
-     "started_at": 1700000000.0}
+     "model": "my-model", "tier": "generic", "harness": "generic",
+     "session_id": "abc", "started_at": 1700000000.0}
+
+``harness`` is optional and names the CLI that ran (``grok`` for Grok Build,
+``pi``, ``commandcode``); a recorded harness wins over the source guess.
 
 Usage line (tokens and cost for the run above)::
 
@@ -189,6 +192,9 @@ def _run_row(obj: dict, now: float) -> dict | None:
         row["model"] = model
     if tier is not None:
         row["tier"] = tier
+    harness = _text(obj.get("harness"), 64)
+    if harness is not None:
+        row["harness"] = harness
     if verdict is not None:
         row["verdict"] = verdict
     started = _num(obj.get("started_at"), None)

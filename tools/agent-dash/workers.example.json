@@ -1,6 +1,6 @@
 {
   "default": "muse",
-  "auto_order": ["muse", "grok", "glm", "glm-flash"],
+  "auto_order": ["muse", "grok", "deepseek-flash", "glm-flash", "glm"],
   "cooldown_minutes": 30,
   "workers": {
     "muse": {
@@ -27,16 +27,28 @@
       "quota_patterns": ["rate limit", "quota", "429", "usage limit"],
       "cost_rank": 4
     },
+    "deepseek-flash": {
+      "enabled": true,
+      "kind": "grok-build",
+      "model": "deepseek-flash",
+      "extra_args": [],
+      "cap": 5,
+      "pgrep": "-m [d]eepseek-flash",
+      "manifest": "glm-sessions.tsv",
+      "columns": ["label", "session_id", "epoch", "model"],
+      "quota_patterns": ["rate limit", "quota", "429", "usage limit", "rate limit reached for requests"],
+      "cost_rank": 2
+    },
     "glm": {
       "enabled": true,
       "kind": "grok-build",
       "model": "glm-5.3",
       "extra_args": [],
-      "cap": 5,
+      "cap": 2,
       "pgrep": "-m [g]lm-5.3($| )",
       "manifest": "glm-sessions.tsv",
       "columns": ["label", "session_id", "epoch", "model"],
-      "quota_patterns": ["rate limit", "quota", "429", "usage limit"],
+      "quota_patterns": ["rate limit", "quota", "429", "usage limit", "rate limit reached for requests"],
       "cost_rank": 3
     },
     "glm-flash": {
@@ -48,8 +60,32 @@
       "pgrep": "-m [g]lm-5.3-flash",
       "manifest": "glm-sessions.tsv",
       "columns": ["label", "session_id", "epoch", "model"],
-      "quota_patterns": ["rate limit", "quota", "429", "usage limit"],
+      "quota_patterns": ["rate limit", "quota", "429", "usage limit", "rate limit reached for requests"],
       "cost_rank": 2
+    },
+    "pi-deepseek": {
+      "enabled": true,
+      "kind": "pi",
+      "model": "river/deepseek-ai/DeepSeek-V4.1-Flash-1017",
+      "extra_args": [],
+      "cap": 12,
+      "pgrep": "[l]aunch_pi.py.*--model river/deepseek-ai/DeepSeek-V4.1-Flash-1017",
+      "manifest": "pi-sessions.tsv",
+      "columns": ["label", "session_id", "epoch", "model"],
+      "quota_patterns": ["rate limit", "quota", "429", "usage limit", "insufficient credits"],
+      "cost_rank": 2
+    },
+    "pi-beam": {
+      "enabled": true,
+      "kind": "pi",
+      "model": "reflection/Beam-1.0-501B-A23B",
+      "extra_args": [],
+      "cap": 5,
+      "pgrep": "[l]aunch_pi.py.*--model reflection/Beam-1.0-501B-A23B",
+      "manifest": "pi-sessions.tsv",
+      "columns": ["label", "session_id", "epoch", "model"],
+      "quota_patterns": ["rate limit", "quota", "429", "usage limit", "insufficient credits"],
+      "cost_rank": 3
     }
   }
 }

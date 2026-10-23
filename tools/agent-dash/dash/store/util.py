@@ -212,6 +212,7 @@ _FAMILY_TOOL = {
     "codex": "codex",
     "cursor": "grok",
     "muse": "muse",
+    "commandcode": "commandcode",
 }
 
 
@@ -235,7 +236,7 @@ def _tool_key(run: dict) -> str | None:
         return "grok"
     if source == "muse" or tier == "muse":
         return "muse"
-    if source == "glm" or tier == "glm":
+    if source == "glm" or tier in GROK_BUILD_TIERS:
         return _grok_cli_key(run)
     if source in ("codex", "codex-exec") or tier == "codex":
         return "codex"
@@ -248,6 +249,14 @@ def _tool_key(run: dict) -> str | None:
     if _model_family(run) == "beam":
         return "beam"
     return None
+
+
+#: Registry tier names launched through the Grok Build CLI. A row carrying
+#: one is a Grok Build run whatever family its model belongs to, so the
+#: per-harness totals count it under the tool that actually ran it.
+GROK_BUILD_TIERS = frozenset(
+    ("deepseek-flash", "glm-flash", "glm", "beam", "reflection-beam")
+)
 
 
 def _grok_cli_key(run: dict) -> str:

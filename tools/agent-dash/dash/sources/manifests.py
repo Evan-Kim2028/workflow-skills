@@ -121,12 +121,14 @@ def parse_manifest_text(text: str) -> list[dict]:
         sid = parts[1].strip()
         session_uuid = None if sid in {"", "-"} else sid
         model = parts[3].strip() if len(parts) > 3 and parts[3].strip() else None
+        tier = parts[4].strip() if len(parts) > 4 and parts[4].strip() else None
         rows.append(
             {
                 "label": label,
                 "session_uuid": session_uuid,
                 "started_at": started,
                 "model": model,
+                "tier": tier,
             }
         )
     return rows
@@ -320,7 +322,9 @@ def _emit_manifest(
     report_path = os.path.join(base, f"report-{label}.md")
     run_id = _run_id(source, directory, row["session_uuid"], parent, label, row["started_at"])
     model = row["model"]
-    tier = tier_of(model) or default_tier
+    # The recorded tier (fifth cell) is what run_worker launched; the model
+    # map and the directory default are fallbacks for older rows.
+    tier = row.get("tier") or tier_of(model) or default_tier
     pid_file = _pid_file_for(scratch, base, label)
     quota_hit = _quota_hit_for(source, err_path, out_path)
     superseded = _superseded(store, source, run_id, label, row["started_at"])
