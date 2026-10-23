@@ -2663,6 +2663,90 @@ class BackfillGrokModelsTest(unittest.TestCase):
         self.assertEqual(self.store.backfill_grok_models(self.now), 0)
 
 
+class BackfillToolModelsTest(unittest.TestCase):
+    """backfill_tool_models fills NULL run models from usage for every tool source."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.store = memory(Path(self.tmp.name))
+        self.now = time.time()
+
+    def tearDown(self):
+        self.store.close()
+        self.tmp.cleanup()
+
+    def seed(self, source, run_id, usage_model="gpt-6.1-sol", run_model=None):
+        row = {
+            "run_id": run_id,
+            "source": source,
+            "tier": source,
+            "label": "ws6-fill",
+            "session_id": "s",
+            "status": "done",
+            "started_at": self.now - 100,
+            "ended_at": self.now - 50,
+        }
+        if run_model is not None:
+            row["model"] = run_model
+        self.store.upsert_run(row)
+        self.store.add_usage(
+            {
+                "ts": self.now - 10,
+                "session_id": "s",
+                "run_id": run_id,
+                "model": usage_model,
+                "tool": source,
+                "message_id": "m-%s" % run_id,
+                "input": 10,
+                "output": 5,
+                "cache_read": 0,
+                "cache_write": 0,
+                "reasoning": 0,
+            }
+        )
+
+    def filled(self, source, run_id):
+        self.assertEqual(self.store.backfill_tool_models(source, self.now), 1)
+        self.assertEqual(self.store.get_run(run_id)["model"], "gpt-6.1-sol")
+
+    def test_codex_lead(self):
+        self.seed("codex", "codex:s:codex-1")
+        self.filled("codex", "codex:s:codex-1")
+
+    def test_codex_worker(self):
+        self.seed("codex-exec", "codex:s:codex-2")
+        self.filled("codex-exec", "codex:s:codex-2")
+
+    def test_commandcode(self):
+        self.seed("commandcode", "commandcode:s:ws6-fill", usage_model="reflection/beam:free")
+        self.assertEqual(self.store.backfill_tool_models("commandcode", self.now), 1)
+        self.assertEqual(
+            self.store.get_run("commandcode:s:ws6-fill")["model"], "reflection/beam:free"
+        )
+
+    def test_generic(self):
+        self.seed("generic", "generic:ws6-fill")
+        self.filled("generic", "generic:ws6-fill")
+
+    def test_known_model_is_untouched(self):
+        self.seed("codex", "codex:s:codex-1", run_model="gpt-6.1-sol")
+        self.assertEqual(self.store.backfill_tool_models("codex", self.now), 0)
+
+    def test_no_usage_stays_null(self):
+        self.store.upsert_run(
+            {
+                "run_id": "codex:s:codex-9",
+                "source": "codex",
+                "tier": "codex",
+                "label": "ws6-fill",
+                "session_id": "s",
+                "status": "done",
+            }
+        )
+        self.assertEqual(self.store.backfill_tool_models("codex", self.now), 0)
+        self.assertIsNone(self.store.get_run("codex:s:codex-9")["model"])
+
+
 class RepairCommandcodeOrphansTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
