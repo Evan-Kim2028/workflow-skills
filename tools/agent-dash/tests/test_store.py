@@ -1899,6 +1899,88 @@ class SnapshotUsageTest(unittest.TestCase):
 class StaleRunningTest(unittest.TestCase):
     """One stale row is excluded from every view at once."""
 
+    def test_lead_session_newer_cli_pid_is_not_reuse(self):
+        # A process that was already running when the session last
+        # acted cannot be newer than the run's agent: CLI restarts roll
+        # the process while a long-lived lead session continues, so the
+        # session start alone would misread the current process as
+        # recycled.
+        now = self.now
+        lead_id = "claude-main:lead-9:main"
+        self.store.upsert_run(
+            {
+                "run_id": lead_id,
+                "source": "claude-main",
+                "session_id": "lead-9",
+                "label": "proj-ef",
+                "status": "running",
+                "pid": os.getpid(),
+                "started_at": now - 7200,
+            }
+        )
+        self.store._conn.execute(
+            "INSERT INTO usage_events"
+            " (tool, session_id, message_id, ts, run_id)"
+            " VALUES (?, ?, ?, ?, ?)",
+            ("claude", "lead-9", "m-recent", now - 180, lead_id),
+        )
+        self.store._conn.execute(
+            "INSERT INTO process_samples"
+            " (ts, pid, comm, rss_kb, elapsed_s, label, run_id)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (now, os.getpid(), "claude", 10, 35 * 60.0, None, lead_id),
+        )
+        self.store._conn.commit()
+        self.assertEqual(self.store.stale_running(now), [])
+
+    def test_lead_dead_pid_with_fresh_evidence_stays_open(self):
+        # A dead registry pid is a rolled CLI, not a dead session,
+        # while the session keeps emitting evidence: the row stays
+        # open until writing stops.
+        now = self.now
+        lead_id = "claude-main:lead-10:main"
+        self.store.upsert_run(
+            {
+                "run_id": lead_id,
+                "source": "claude-main",
+                "session_id": "lead-10",
+                "label": "proj-ef",
+                "status": "running",
+                "pid": 999999,
+                "started_at": now - 7200,
+            }
+        )
+        self.store._conn.execute(
+            "INSERT INTO usage_events"
+            " (tool, session_id, message_id, ts, run_id)"
+            " VALUES (?, ?, ?, ?, ?)",
+            ("claude", "lead-10", "m-fresh", now - 30, lead_id),
+        )
+        self.store._conn.commit()
+        self.assertEqual(self.store.stale_running(now), [])
+        old_id = "claude-main:lead-11:main"
+        self.store.upsert_run(
+            {
+                "run_id": old_id,
+                "source": "claude-main",
+                "session_id": "lead-11",
+                "label": "proj-ef",
+                "status": "running",
+                "pid": 999999,
+                "started_at": now - 7200,
+            }
+        )
+        self.store._conn.execute(
+            "INSERT INTO usage_events"
+            " (tool, session_id, message_id, ts, run_id)"
+            " VALUES (?, ?, ?, ?, ?)",
+            ("claude", "lead-11", "m-old", now - 3600, old_id),
+        )
+        self.store._conn.commit()
+        stale = self.store.stale_running(now)
+        self.assertEqual([run["run_id"] for run, _reason in stale], [old_id])
+        self.assertIn("dead pid", stale[0][1])
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.store = memory(Path(self.tmp.name))
@@ -3878,11 +3960,11 @@ class StoreInheritanceTest(unittest.TestCase):
         for index in range(3):
             self.store.upsert_run(
                 {
-                    "run_id": f"claude-subagent:lead-2:w{index}",
-                    "source": "claude-subagent",
-                    "session_id": "lead-2",
+                    "run_id": f"muse:lead-2-s{index}:ws4-exec-task-{index}",
+                    "source": "muse",
+                    "session_id": f"lead-2-s{index}",
                     "parent_session_id": "lead-2",
-                    "label": f"ws4-task-{index}",
+                    "label": f"ws4-exec-task-{index}",
                     "status": "done",
                     "started_at": now - 100,
                     "ended_at": now - 50,
@@ -3900,11 +3982,11 @@ class StoreInheritanceTest(unittest.TestCase):
         for index in range(3):
             self.store.upsert_run(
                 {
-                    "run_id": f"claude-subagent:lead-3:w{index}",
-                    "source": "claude-subagent",
-                    "session_id": "lead-3",
+                    "run_id": f"muse:lead-3-s{index}:ws4-exec-task-{index}",
+                    "source": "muse",
+                    "session_id": f"lead-3-s{index}",
                     "parent_session_id": "lead-3",
-                    "label": f"ws4-task-{index}",
+                    "label": f"ws4-exec-task-{index}",
                     "status": "done",
                     "started_at": now - 100,
                     "ended_at": now - 50,

@@ -444,6 +444,9 @@ def _upsert_attempt(store, sid, row, seen):
         "ended_at": ended,
         "clock_source": "manifest",
     }
+    parent = _manifests.parent_session_from_pad(row.get("pad"))
+    if parent:
+        run["parent_session_id"] = parent
     if row["model"]:
         run["model"] = row["model"]
     if row["started"] is not None:

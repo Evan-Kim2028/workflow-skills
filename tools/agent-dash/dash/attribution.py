@@ -31,8 +31,10 @@ INFERRED = "inferred"
 DOMINANT_SHARE = 0.6
 #: Fewest attributed workers needed before the dominant share counts.
 DOMINANT_MIN_RUNS = 3
-#: Lookback for "the workers it launched" (seconds).
-WORKER_WINDOW_S = 6 * 3600
+#: Lookback for "the workers it launched" (seconds). A lead session is
+#: evidenced by the workers it launched while its own transcript is
+#: live, so this matches the transcript live window.
+WORKER_WINDOW_S = 36 * 3600
 
 #: A branch prefix or worktree path segment naming a workstream,
 #: e.g. ``ws2/notes`` or ``train-ws2-x``. ``wt-w2`` must not match.

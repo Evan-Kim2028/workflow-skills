@@ -374,7 +374,10 @@ class ClaudePollTests(unittest.TestCase):
         self.assertEqual(run["status"], "running")
         self.assertEqual(run["pid"], live_pid)
 
-    def test_registry_busy_with_dead_pid_closes(self):
+    def test_registry_dead_pid_with_fresh_transcript_stays_running(self):
+        # A dead registry pid must not close a session that is still
+        # writing: the registry goes stale across CLI restarts while the
+        # transcript is ground truth.
         cfg, projects, sessions = _cfg(self.tmp.name, running_mtime_s=60)
         _write(
             os.path.join(projects, "enc", f"{SID}.jsonl"),
@@ -397,9 +400,71 @@ class ClaudePollTests(unittest.TestCase):
         )
         claude.poll(self.store, cfg, NOW)
         run = self.store.runs[f"claude-main:{SID}:main"]
+        self.assertEqual(run["status"], "running")
+        self.assertIsNone(run.get("pid"))
+        self.assertIsNone(run.get("ended_at"))
+
+    def test_registry_busy_with_dead_pid_and_stale_transcript_closes(self):
+        cfg, projects, sessions = _cfg(self.tmp.name, running_mtime_s=60)
+        _write(
+            os.path.join(projects, "enc", f"{SID}.jsonl"),
+            _line("m1", 1),
+            NOW - 3600,
+        )
+        _write(
+            os.path.join(sessions, "43.json"),
+            json.dumps(
+                {
+                    "pid": 999999,
+                    "sessionId": SID,
+                    "cwd": "/tmp/example",
+                    "startedAt": 1_700_000_000_000,
+                    "status": "busy",
+                    "name": "example-session",
+                }
+            ),
+            NOW,
+        )
+        claude.poll(self.store, cfg, NOW)
+        run = self.store.runs[f"claude-main:{SID}:main"]
         self.assertEqual(run["status"], "done")
         self.assertIsNone(run.get("pid"))
         self.assertIsNotNone(run.get("ended_at"))
+
+    def test_reopened_main_clears_idle_verdict(self):
+        # A stale close (done, then a later verdict/ended set by the
+        # liveness sweep) must not linger once the transcript resumes:
+        # the reopened row reads running with no end evidence.
+        cfg, projects, sessions = _cfg(self.tmp.name, running_mtime_s=60)
+        path = os.path.join(projects, "enc", f"{SID}.jsonl")
+        _write(path, _line("m1", 1), NOW - 3600)
+        _write(
+            os.path.join(sessions, "43.json"),
+            json.dumps(
+                {
+                    "pid": 999999,
+                    "sessionId": SID,
+                    "cwd": "/tmp/example",
+                    "startedAt": 1_700_000_000_000,
+                    "status": "busy",
+                    "name": "example-session",
+                }
+            ),
+            NOW,
+        )
+        claude.poll(self.store, cfg, NOW)
+        run_id = f"claude-main:{SID}:main"
+        self.assertEqual(self.store.runs[run_id]["status"], "done")
+        self.store.runs[run_id]["verdict"] = "IDLE"
+        claude._runs[run_id]["verdict"] = "IDLE"
+        with open(path, "ab") as fh:
+            fh.write(_line("m2", 2))
+        os.utime(path, (NOW, NOW))
+        claude.poll(self.store, cfg, NOW)
+        run = self.store.runs[run_id]
+        self.assertEqual(run["status"], "running")
+        self.assertIsNone(run.get("ended_at"))
+        self.assertIsNone(run.get("verdict"))
 
     def test_registry_busy_with_stale_transcript_is_not_running(self):
         cfg, projects, sessions = _cfg(self.tmp.name, running_mtime_s=60)

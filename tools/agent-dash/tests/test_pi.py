@@ -148,6 +148,26 @@ class LauncherHelperTest(unittest.TestCase):
         self.assertEqual(launch.verdict_of("BLOCKED: no key"), "BLOCKED")
         self.assertEqual(launch.verdict_of("nothing here"), "PARTIAL")
 
+    def test_parent_session_of_prefers_pad_then_env(self):
+        sid = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+        pad = os.path.join(os.sep, "tmp", "claude-1000", "-x", sid, "scratchpad", "pi")
+        self.assertEqual(launch.parent_session_of(pad), sid)
+        old = dict(os.environ)
+        try:
+            os.environ.pop("CLAUDE_SESSION_ID", None)
+            os.environ.pop("CLAUDE_CODE_SESSION_ID", None)
+            self.assertIsNone(launch.parent_session_of("/tmp/flat"))
+            os.environ["CLAUDE_CODE_SESSION_ID"] = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+            self.assertEqual(
+                launch.parent_session_of("/tmp/flat"),
+                "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+            )
+            os.environ["CLAUDE_CODE_SESSION_ID"] = "not-a-session"
+            self.assertIsNone(launch.parent_session_of("/tmp/flat"))
+        finally:
+            os.environ.clear()
+            os.environ.update(old)
+
     def test_stream_errors_and_session_id(self):
         raw = FIXTURE.read_bytes()
         self.assertEqual(launch.session_id_of(raw), SID)
@@ -200,6 +220,15 @@ class SourceTest(unittest.TestCase):
         self.assertEqual(run["model"], DEEPSEEK)
         self.assertAlmostEqual(run["started_at"], 1792000000.0)
         self.assertIn("out-ws15-exec-wire.md", run["out_path"])
+
+    def test_run_links_to_lead_session_from_pad(self):
+        # The pi outdir under a session scratchpad names the lead
+        # session that launched the worker.
+        self.write_tsv([["ws15-exec-wire", SID, 1792000000, DEEPSEEK]])
+        (self.pad / "out-ws15-exec-wire.md").write_text("PASS\nDid the thing.\n", encoding="utf-8")
+        self.poll()
+        run = self.store.runs[self.run_id("ws15-exec-wire")]
+        self.assertEqual(run["parent_session_id"], SID)
 
     def test_live_running_row_reads_session_from_stream(self):
         self.write_tsv([["ws15-plan-wire", SID, 1792000000, GLM]])

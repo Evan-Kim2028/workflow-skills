@@ -380,6 +380,9 @@ def _upsert_run(store, row, processes, seen):
         "label": label,
         "out_path": out_path,
     }
+    parent = _manifests.parent_session_from_pad(pad)
+    if parent:
+        run["parent_session_id"] = parent
     if row.get("model"):
         run["model"] = row["model"]
     if row.get("started") is not None:

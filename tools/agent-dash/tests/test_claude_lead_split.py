@@ -228,8 +228,15 @@ class MainStatusTests(unittest.TestCase):
                    has_live_child=False, pending_tool=False),
             "running",
         )
+        # A just-written transcript wins over a dead registry pid.
         self.assertEqual(
             decide(caught_up=True, mtime_age=60, pid_dead=True,
+                   has_live_child=False, pending_tool=False),
+            "running",
+        )
+        # A dead pid still closes a quiet session.
+        self.assertEqual(
+            decide(caught_up=True, mtime_age=720, pid_dead=True,
                    has_live_child=False, pending_tool=False),
             "done",
         )

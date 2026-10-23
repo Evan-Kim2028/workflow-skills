@@ -38,6 +38,7 @@ arguments.
 
 from __future__ import annotations
 
+import glob
 import json
 import logging
 import os
@@ -233,23 +234,25 @@ def decide_main_status(
     (a running subagent, or a running worker run parented to this
     session) is live, or while the last assistant turn left an
     unanswered tool call (a long Bash, a background task) and the
-    transcript is younger than the old running bound. Otherwise the
+    transcript is younger than the old running bound. A just-written
+    transcript wins over a dead registry pid: the registry file goes
+    stale across CLI restarts while the transcript is ground truth, so
+    a dead pid closes the row only once writing stopped. Otherwise the
     session is idle (``unknown``: not live, end unconfirmed) while
-    recent, and ``done`` after. A known-dead pid is done outright.
-    ``unknown`` reuses the existing status every surface already
-    treats as not-running, so an idle session never shows the running
-    badge and is never counted as a live agent.
+    recent, and ``done`` after. ``unknown`` reuses the existing status
+    every surface already treats as not-running, so an idle session
+    never shows the running badge and is never counted as a live agent.
     """
     if not caught_up:
         return "running"
-    if pid_dead:
-        return "done"
     try:
         age = float(mtime_age)
     except (TypeError, ValueError):
         age = float("inf")
     if age <= float(main_running_s):
         return "running"
+    if pid_dead:
+        return "done"
     if has_live_child:
         return "running"
     if pending_tool and age <= float(running_s):
@@ -372,7 +375,7 @@ def poll(store, cfg, now: float) -> None:
             cfg = {}
         now = float(now)
         per_file, per_tick = _budgets(cfg)
-        left = _poll_registry(store, cfg, per_tick)
+        left = _poll_registry(store, cfg, per_tick, now)
         _poll_transcripts(store, cfg, now, left, per_file)
         _refresh_inheritance(store, now)
         _drain_slices(store, cfg, now)
@@ -413,7 +416,36 @@ def _refresh_inheritance(store, now: float) -> None:
         _log.warning("claude inherit refresh: %s", type(exc).__name__)
 
 
-def _poll_registry(store, cfg, left) -> int:
+def _transcript_fresh(cfg, session_id: str, now) -> bool:
+    """True when the session transcript was written inside the main window.
+
+    Bounds the registry dead-pid close-out: a stale registry pid must
+    not end a session that is still writing. One glob plus one stat;
+    missing or unreadable files read as not fresh, exactly as before.
+    """
+    try:
+        moment = float(now)
+    except (TypeError, ValueError):
+        return False
+    if not isinstance(session_id, str) or not _UUID.match(session_id):
+        return False
+    try:
+        window = float((cfg or {}).get("main_running_mtime_s", MAIN_RUNNING_MTIME_S))
+    except (TypeError, ValueError):
+        window = float(MAIN_RUNNING_MTIME_S)
+    root = _root(cfg or {}, "claude_projects", "projects", _default_projects())
+    try:
+        hits = glob.glob(os.path.join(glob.escape(root), "*", glob.escape(session_id) + ".jsonl"))
+    except (OSError, TypeError):
+        return False
+    for hit in hits:
+        st = _stat(hit)
+        if st is not None and moment - st.st_mtime <= window:
+            return True
+    return False
+
+
+def _poll_registry(store, cfg, left, now=None) -> int:
     root = _root(cfg, "claude_sessions", "sessions", _default_sessions())
     busy: set = set()
     pids: dict = {}
@@ -468,18 +500,28 @@ def _poll_registry(store, cfg, left) -> int:
         pid = rec.get("pid")
         if isinstance(pid, int) and not isinstance(pid, bool) and pid > 0:
             pids[sid] = pid
+            pid_alive = _pid_alive(pid)
         else:
             pid = None
+            pid_alive = False
         cwd = rec.get("cwd") if isinstance(rec.get("cwd"), str) else None
         if cwd and len(cwd) > 1024:
             cwd = cwd[:1024]
         label = _clean_label(rec.get("name")) if isinstance(rec.get("name"), str) else None
         started = _epoch_number(rec.get("startedAt"))
         run_id = f"claude-main:{sid}:main"
-        if status == "busy" and pid is not None and not _pid_alive(pid):
+        if (
+            status == "busy"
+            and pid is not None
+            and not pid_alive
+            and not _transcript_fresh(cfg, sid, now)
+        ):
             # Dead pid: the registry still says busy but the process is gone.
             # Close the row at the last evidence (transcript usage or the
-            # registry file mtime) instead of leaving it running.
+            # registry file mtime) instead of leaving it running. A
+            # still-writing transcript means the registry is stale (the
+            # CLI rolled its process), so the transcript logic below
+            # decides instead of this close-out.
             ended = _last_ts.get(run_id) or st.st_mtime
             try:
                 ended = max(float(ended), float(st.st_mtime))
@@ -539,7 +581,7 @@ def _poll_registry(store, cfg, left) -> int:
                     "parent_session_id": None,
                     "status": "running",
                     "label": label,
-                    "pid": pids.get(sid),
+                    "pid": pid if pid_alive else None,
                     "started_at": started,
                     "clock_source": "mtime",
                 },
@@ -1412,7 +1454,9 @@ def _emit_transcript_run(store, target, st, fresh, caught_up, liveness=None, mai
         patch["ended_at"] = _last_ts.get(run_id, st.st_mtime)
         _emit_run(store, patch, force_status=status)
     else:
-        _emit_run(store, patch, force_status=status, clear=("ended_at",))
+        # A reopened row stops carrying its close-out verdict: the
+        # verdict names how the run ended, and this one did not.
+        _emit_run(store, patch, force_status=status, clear=("ended_at", "verdict"))
 
 
 def _note_bundle_hint(run_id, lines) -> None:
