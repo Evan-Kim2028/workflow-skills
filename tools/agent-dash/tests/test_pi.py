@@ -670,15 +670,18 @@ class ModelTierTest(unittest.TestCase):
     def test_store_family_tier_matches_source(self):
         from dash.store.runs import _family_tier
 
+        # A healed pi row takes the registry tier its launch would record
+        # (``pi-beam``), so healing and a fresh launch agree.
         for model, tier in (
-            ("reflection/Beam-1.0-501B-A23B", "beam"),
-            ("reflection/beam:free", "beam"),
-            ("river/zai-org/GLM-5.3-Flash", "glm"),
-            ("river/deepseek-ai/DeepSeek-V4.1-Flash-1017", "deepseek"),
-            ("deepseek-ai/DeepSeek-V4.1-Flash", "deepseek"),
+            ("reflection/Beam-1.0-501B-A23B", "pi-beam"),
+            ("reflection/beam:free", "pi-beam"),
+            ("river/zai-org/GLM-5.3-Flash", "pi-glm"),
+            ("river/deepseek-ai/DeepSeek-V4.1-Flash-1017", "pi-deepseek"),
+            ("deepseek-ai/DeepSeek-V4.1-Flash", "pi-deepseek"),
         ):
             self.assertEqual(_family_tier("pi", model), tier)
-            self.assertEqual(_family_tier("pi", model), pi._model_tier(model))
+            self.assertEqual(_family_tier("pi", model)[3:], pi._model_tier(model))
+        self.assertEqual(_family_tier("generic", "river/zai-org/GLM-5.3-Flash"), "glm")
         self.assertIsNone(_family_tier("pi", "mystery-model-9"))
         self.assertIsNone(_family_tier("pi", None))
 
