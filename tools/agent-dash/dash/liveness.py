@@ -28,7 +28,7 @@ DAGSTER_ACTIVE_FRESH_S = 300
 # Sources whose running rows carry a pid. Shell rows carry no pid; their
 # liveness is out-file growth or a live label (see manifests.classify_status)
 # plus the idle bound above.
-PID_SOURCES = ("claude-main", "muse", "grok", "glm", "shell")
+PID_SOURCES = ("claude-main", "muse", "grok", "glm", "shell", "codex")
 
 # A run whose process vanished is closed only after the process has been
 # gone this long: a quiet session file never closes a muse/glm/grok run
@@ -52,7 +52,7 @@ STALLED_AFTER_S = 30 * 60
 
 # Sources whose quiet-but-alive rows read stalled. Everything else keeps
 # the old rules (idle leads hide, Dagster follows its active set).
-STALLED_SOURCES = ("muse", "glm", "grok", "generic", "cursor")
+STALLED_SOURCES = ("muse", "glm", "grok", "generic", "cursor", "codex")
 
 # A process sample may only vouch for a run it could have produced: the
 # process must have started no later than this after the run did, or the
@@ -99,6 +99,8 @@ SOURCE_INTERVAL_S = {
     "claude-subagent": 2.0,
     "claude-workflow": 2.0,
     "shell": 2.0,
+    "codex": 2.0,
+    "pi": 2.0,
     "dagster": 60.0,
 }
 

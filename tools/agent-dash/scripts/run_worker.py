@@ -48,7 +48,7 @@ RUN_RULE = (
     "A run that ends without the report is a failed run."
 )
 LABEL_OK = re.compile(r"^[\w.+-]{1,80}$")
-KINDS = ("muse", "cursor", "grok-build", "pi")
+KINDS = ("muse", "cursor", "grok-build", "pi", "codex")
 READ_LIMIT = 262144
 #: The dashboard can take several seconds to answer right after a deploy
 #: restart (cold caches, polls holding the store lock), so the preflight
@@ -64,6 +64,7 @@ HARNESS_BY_KIND = {
     "cursor": "cursor",
     "grok-build": "grok-cli",
     "pi": "pi",
+    "codex": "codex",
 }
 
 
@@ -355,6 +356,8 @@ def observe(ctx, tier, tried) -> int:
         emit("running", ctx["out"], ctx["err"], tier)
         return 0
     result = outcome(worker, ctx["out"], ctx["err"])
+    if result != "quota" and quota_file_hit(ctx):
+        result = "quota"
     if result != "quota":
         if result == "done":
             emit("done", ctx["out"], ctx["err"], tier)
@@ -432,6 +435,45 @@ def outcome(worker, out_path, err_path):
     return "empty"
 
 
+def quota_file_hit(ctx) -> bool:
+    """True when a launcher QUOTA marker names this label from this attempt.
+
+    ``launch_pi.py`` writes a shared ``QUOTA`` file (``model`` and
+    ``label`` lines) and ``launch_codex.py`` writes ``QUOTA-<label>``:
+    both land beside the launcher's outdir, which the log-pattern scan
+    cannot see when the worker's quota error never reaches the report
+    tails (an empty report with a quota marker is a quota hit, not an
+    empty report). Only a marker naming this label and written after
+    this attempt's tier file counts, so a previous attempt's marker (or
+    another label sharing the outdir) never cools this launch.
+    """
+    label = ctx.get("label") or ""
+    try:
+        tier_mtime = Path(ctx["tier_path"]).stat().st_mtime
+    except OSError:
+        return False
+    base = Path(ctx["run_dir"])
+    candidates = [
+        base / "QUOTA",
+        base / "pi" / "QUOTA",
+        base / f"QUOTA-{label}",
+        base / "pi" / f"QUOTA-{label}",
+        base / "codex" / f"QUOTA-{label}",
+    ]
+    for path in candidates:
+        try:
+            if path.stat().st_mtime < tier_mtime:
+                continue
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for raw in text.splitlines():
+            parts = raw.strip().split("\t")
+            if len(parts) == 2 and parts[0].strip() == "label" and parts[1].strip() == label:
+                return True
+    return False
+
+
 def quota_hit(worker, out_path, err_path) -> bool:
     patterns = worker.get("quota_patterns") or []
     if not patterns:
@@ -454,7 +496,11 @@ def command(worker, label, workspace, prompt_file, session_id, run_dir=None, tie
     ``pi`` runs ``launch_pi.py`` with the run folder's ``pi/`` outdir, so a
     pi tier launches through the one launcher every other tier uses and
     the pi source finds its manifest, stream, and out files where it
-    already looks for them.
+    already looks for them. ``codex`` runs ``launch_codex.py`` (headless
+    ``codex exec``) in the run folder itself, so the manifests source
+    finds its ``codex-sessions.tsv`` row beside ``out-<label>.md``; the
+    launcher's one summary line goes to stderr, never stdout, so the
+    report file it writes is never clobbered.
     """
     kind = worker.get("kind")
     model = str(worker.get("model") or "")
@@ -483,6 +529,20 @@ def command(worker, label, workspace, prompt_file, session_id, run_dir=None, tie
             workspace,
             prompt_file,
             str(Path(run_dir or Path(prompt_file).parent) / "pi"),
+            "--model",
+            model,
+            "--tier",
+            str(tier or worker.get("tier") or ""),
+            *extra,
+        ]
+    if kind == "codex":
+        return [
+            "python3",
+            str(ROOT / "scripts" / "launch_codex.py"),
+            label,
+            workspace,
+            prompt_file,
+            str(run_dir or Path(prompt_file).parent),
             "--model",
             model,
             "--tier",
@@ -519,6 +579,7 @@ MANIFEST_BY_KIND = {
     "cursor": ("cursor-sessions.tsv", ["label", "session_id", "epoch", "model"]),
     "grok-build": ("glm-sessions.tsv", ["label", "session_id", "epoch", "model"]),
     "pi": ("pi-sessions.tsv", ["label", "session_id", "epoch", "model"]),
+    "codex": ("codex-sessions.tsv", ["label", "session_id", "epoch", "model"]),
 }
 
 

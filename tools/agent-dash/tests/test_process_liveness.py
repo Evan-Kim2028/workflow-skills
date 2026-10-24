@@ -1079,6 +1079,11 @@ class LauncherParsingTests(unittest.TestCase):
         "424243 python3 /opt/tools/agent-dash/scripts/launch_cmd.py "
         "ws6-plan-wire /ws /tmp/prompt-ws6-plan-wire.md /out/cmd"
     )
+    CODEX_ARGV = (
+        "424244 python3 /opt/tools/agent-dash/scripts/launch_codex.py "
+        "ws11-plan-wire /ws /tmp/prompt-ws11-plan-wire.md /out "
+        "--model gpt-6-luna --tier codex-luna --reasoning-effort xhigh"
+    )
 
     def test_pi_launcher_source_and_label(self):
         self.assertEqual(process.launcher_source_from_args(self.PI_ARGV), "pi")
@@ -1087,6 +1092,17 @@ class LauncherParsingTests(unittest.TestCase):
     def test_cmd_launcher_source_and_label(self):
         self.assertEqual(process.launcher_source_from_args(self.CMD_ARGV), "commandcode")
         self.assertEqual(process.launcher_label_from_args(self.CMD_ARGV), "ws6-plan-wire")
+
+    def test_codex_launcher_source_and_label(self):
+        self.assertEqual(process.launcher_source_from_args(self.CODEX_ARGV), "codex")
+        self.assertEqual(process.launcher_label_from_args(self.CODEX_ARGV), "ws11-plan-wire")
+
+    def test_codex_effort_from_dash_c_flag(self):
+        self.assertEqual(
+            process.reasoning_effort_from_args('codex exec -c model_reasoning_effort="xhigh" -m gpt-6-luna'),
+            "xhigh",
+        )
+        self.assertIsNone(process.reasoning_effort_from_args("codex exec -m gpt-6-luna"))
 
     def test_plain_python3_is_not_a_launcher(self):
         argv = "999 python3 /opt/tools/run_worker.py default ws8-x /ws /tmp/x.md /runs 540"

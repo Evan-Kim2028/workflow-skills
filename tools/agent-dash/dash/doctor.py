@@ -93,6 +93,8 @@ MANIFEST_NAMES = (
     "glm-sessions.tsv",
     "grok-sessions.tsv",
     "cursor-sessions.tsv",
+    "codex-sessions.tsv",
+    "pi-sessions.tsv",
 )
 RUN_DIRS_NAMES = ("run-dirs.txt", "run-dirs.json", "run_dirs.json")
 SOURCE_STALE_S = 900.0
@@ -118,6 +120,7 @@ def doctor_cfg(cfg: dict | None) -> dict:
         "phase_slip_days": 7.0,
         "model_policy": {
             "muse_reasoning_effort": policy.get("muse_reasoning_effort", "xhigh"),
+            "codex_reasoning_effort": policy.get("codex_reasoning_effort", "xhigh"),
             "grok_require_bracketed_500k": policy.get("grok_require_bracketed_500k", True),
         },
     }
@@ -3286,7 +3289,8 @@ def model_policy_reason(kind: str | None, model: str | None, reasoning_effort: s
 
     Read-only and argv-blind: it judges already-extracted flag values and
     reports the worker label, never the rest of argv. ``muse`` workers
-    require ``--reasoning-effort xhigh`` (or the configured level);
+    require ``--reasoning-effort xhigh`` (or the configured level), and
+    ``codex`` workers require the matching ``model_reasoning_effort``;
     ``cursor`` workers running a ``grok-4.7`` model must use the bracketed
     500k form, never a bare ``grok-4.7-high`` or a ``-fast`` id.
     """
@@ -3296,6 +3300,14 @@ def model_policy_reason(kind: str | None, model: str | None, reasoning_effort: s
         if (reasoning_effort or "") != want:
             return (
                 f"muse worker needs --reasoning-effort {want} "
+                f"(got {reasoning_effort or 'none'})"
+            )
+        return None
+    if kind == "codex":
+        want = str(policy.get("codex_reasoning_effort", "xhigh") or "xhigh")
+        if (reasoning_effort or "") != want:
+            return (
+                f"codex worker needs model_reasoning_effort {want} "
                 f"(got {reasoning_effort or 'none'})"
             )
         return None
@@ -3318,13 +3330,15 @@ def model_policy_reason(kind: str | None, model: str | None, reasoning_effort: s
 
 
 def _comm_kind(comm: str | None) -> str | None:
-    """Worker kind for a process comm: muse, cursor, grok-build, or None."""
+    """Worker kind for a process comm: muse, cursor, grok-build, codex, or None."""
     if comm in ("muse", "muse-bin") or (isinstance(comm, str) and comm.startswith("muse-bin-")):
         return "muse"
     if comm == "cursor-agent":
         return "cursor"
     if comm == "grok":
         return "grok-build"
+    if comm == "codex":
+        return "codex"
     return None
 
 
