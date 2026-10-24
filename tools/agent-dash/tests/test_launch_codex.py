@@ -1,3 +1,4 @@
+from unittest import mock
 """Tests for scripts/launch_codex.py: stream parsing, usage ledger, argv.
 
 Synthetic fixtures only: a fabricated ``--json`` event stream, no live
@@ -106,6 +107,14 @@ class ArgvTests(unittest.TestCase):
         self.assertEqual(argv[-1], "-")
         # The prompt travels on stdin, never in argv.
         self.assertNotIn("do the task", " ".join(argv))
+
+    def test_sandbox_env_override(self):
+        with mock.patch.dict(os.environ, {"AGENT_DASH_CODEX_SANDBOX": "danger-full-access"}):
+            argv = launch.build_argv("codex", "/ws", Path("/o.md"), "gpt-6-luna", "xhigh")
+        self.assertEqual(argv[argv.index("-s") + 1], "danger-full-access")
+        with mock.patch.dict(os.environ, {"AGENT_DASH_CODEX_SANDBOX": "bogus"}):
+            argv = launch.build_argv("codex", "/ws", Path("/o.md"), "gpt-6-luna", "xhigh")
+        self.assertEqual(argv[argv.index("-s") + 1], "workspace-write")
 
     def test_label_prefix(self):
         self.assertEqual(

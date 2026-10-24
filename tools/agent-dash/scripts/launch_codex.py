@@ -207,6 +207,20 @@ def codex_binary() -> str | None:
     return None
 
 
+CODEX_SANDBOX_ENV = "AGENT_DASH_CODEX_SANDBOX"
+CODEX_SANDBOXES = ("read-only", "workspace-write", "danger-full-access")
+
+
+def codex_sandbox() -> str:
+    """Sandbox mode for headless runs: ``AGENT_DASH_CODEX_SANDBOX`` or workspace-write.
+
+    Workers that create git worktrees, commit, or ssh to hosts need
+    ``danger-full-access``; an unknown value falls back to the default.
+    """
+    value = (os.environ.get(CODEX_SANDBOX_ENV) or "").strip()
+    return value if value in CODEX_SANDBOXES else "workspace-write"
+
+
 def build_argv(binary, workspace, out_path, model, effort):
     """The exact headless codex command line (prompt travels on stdin)."""
     return [
@@ -221,7 +235,7 @@ def build_argv(binary, workspace, out_path, model, effort):
         "-C",
         str(workspace),
         "-s",
-        "workspace-write",
+        codex_sandbox(),
         "-c",
         'approval_policy="never"',
         "--skip-git-repo-check",
