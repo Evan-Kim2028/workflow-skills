@@ -10,8 +10,13 @@ merely mentions a launcher) passes untouched:
 - ``launch_cmd.py <label> <workspace> <prompt-file> <outdir>``
 - ``launch_pi.py <label> <workspace> <prompt-file> <outdir>`` (pi, the
   ``@mariozechner/pi-coding-agent`` CLI)
+- ``launch_codex.py <label> <workspace> <prompt-file> <outdir>`` (Codex,
+  headless ``codex exec``)
 - ``cmd -p "<prompt>"`` (Command Code headless): the prompt must start with
   ``[label: <label>]``; a prompt without that prefix is refused
+- ``codex exec [options] "<prompt>"`` (Codex headless): the prompt must
+  start with ``[label: <label>]``; a stdin (``-``), subcommand, or
+  flag-only launch is not checkable and passes
 - ``run_worker.sh|run_worker.py <tier> <label> ...``
 - ``agent_dash.py report start --label <label>``
 - appends to ``muse-sessions.tsv`` / ``cursor-sessions.tsv`` (first column)
@@ -49,9 +54,9 @@ ROOT = HERE.parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-TSV_NAMES = ("muse-sessions.tsv", "cursor-sessions.tsv")
+TSV_NAMES = ("muse-sessions.tsv", "cursor-sessions.tsv", "codex-sessions.tsv", "pi-sessions.tsv")
 _WRAPPERS = {"nohup", "sudo", "env", "setsid", "nice"}
-_LAUNCHERS = {"launch_grok.sh", "launch_cmd.py", "launch_pi.py", "run_worker.sh", "run_worker.py"}
+_LAUNCHERS = {"launch_grok.sh", "launch_cmd.py", "launch_pi.py", "launch_codex.py", "run_worker.sh", "run_worker.py"}
 _COMMANDCODE_BINARIES = ("cmd", "commandcode")
 
 #: Command Code headless prompt label prefix, ``[label: <label>]``.
@@ -184,9 +189,11 @@ def _label_from_argv(argv: list[str]) -> str | None:
         return name[:-3] if name.endswith(".md") else None
     if base in _COMMANDCODE_BINARIES:
         return _label_from_cmd(items[1:])
+    if base == "codex":
+        return _label_from_codex_exec(items[1:])
     if base in _LAUNCHERS:
         rest = _nonflags(items[1:])
-        if base in ("launch_grok.sh", "launch_cmd.py", "launch_pi.py"):
+        if base in ("launch_grok.sh", "launch_cmd.py", "launch_pi.py", "launch_codex.py"):
             return rest[0] if rest else None
         return rest[1] if len(rest) >= 2 else None
     if base in ("python", "python3") and len(items) > 1:
@@ -198,6 +205,9 @@ def _label_from_argv(argv: list[str]) -> str | None:
             rest = _nonflags(items[2:])
             return rest[0] if rest else None
         if inner == "launch_pi.py":
+            rest = _nonflags(items[2:])
+            return rest[0] if rest else None
+        if inner == "launch_codex.py":
             rest = _nonflags(items[2:])
             return rest[0] if rest else None
         if inner == "agent_dash.py":
@@ -221,6 +231,63 @@ def _label_from_cmd(argv: list[str]) -> str | None:
     if at + 1 >= len(argv):
         return None
     prompt = argv[at + 1]
+    found = _CMD_LABEL.match(prompt)
+    if found:
+        return found.group(1)
+    if _CMD_EXPANSION_RE.search(prompt):
+        return None
+    return ""
+
+
+#: ``codex exec`` flags that take a value (skipped with it when hunting
+#: the positional PROMPT). Anything else starting with ``-`` is a
+#: boolean flag and skipped alone.
+_CODEX_VALUE_FLAGS = frozenset({
+    "-c", "--config", "-i", "--image", "-m", "--model", "--local-provider",
+    "-p", "--profile", "-s", "--sandbox", "-C", "--cd", "--add-dir",
+    "--thread-source", "--cyber-access-program",
+    "--output-schema", "--color", "-o", "--output-last-message",
+    "--enable", "--disable",
+})
+#: ``codex exec`` subcommands: a fresh worker launch takes a PROMPT, not one of these.
+_CODEX_SUBCOMMANDS = frozenset({"resume", "fork", "review", "help"})
+
+
+def _label_from_codex_exec(argv: list[str]) -> str | None:
+    """Codex headless launch: the positional PROMPT's ``[label: ...]`` prefix.
+
+    ``codex exec`` with no PROMPT (stdin ``-``, a subcommand, or flags
+    only) is not a checkable launch and passes. A prompt that opens with
+    a shell expansion fails open. Any other prompt with no prefix yields
+    an empty label, which the strict check refuses. The blessed path is
+    ``scripts/launch_codex.py`` (argv label, checked like the other
+    launchers); this covers a raw ``codex exec`` the same way ``-p`` is
+    covered for Command Code.
+    """
+    if not argv or argv[0] != "exec":
+        return None
+    rest = _strip_redirects(argv[1:])
+    index = 0
+    prompt: str | None = None
+    while index < len(rest):
+        token = rest[index]
+        if index == 0 and token in _CODEX_SUBCOMMANDS:
+            return None
+        if token == "-":
+            # Stdin prompt: unknowable on its own, but a later positional
+            # PROMPT is still checkable, so keep scanning.
+            index += 1
+            continue
+        if not token.startswith("-"):
+            prompt = token
+            break
+        name = token.split("=", 1)[0]
+        if "=" in token or name not in _CODEX_VALUE_FLAGS:
+            index += 1
+            continue
+        index += 2
+    if prompt is None:
+        return None
     found = _CMD_LABEL.match(prompt)
     if found:
         return found.group(1)

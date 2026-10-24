@@ -110,10 +110,11 @@ class RunWorkerTests(unittest.TestCase):
     def test_example_lists_the_launch_tiers(self):
         data = registry()
         self.assertEqual(data["default"], "muse")
-        self.assertEqual(data["auto_order"], ["muse", "grok", "deepseek-flash", "glm-flash", "glm"])
+        self.assertEqual(data["auto_order"], ["muse", "glm-flash", "codex-luna", "pi-deepseek-flash"])
         self.assertEqual(
             set(data["workers"]),
-            {"muse", "grok", "deepseek-flash", "glm-flash", "glm", "pi-deepseek", "pi-beam"},
+            {"muse", "grok", "deepseek-flash", "glm-flash", "glm", "pi-deepseek", "pi-beam",
+             "codex-luna", "pi-deepseek-flash"},
         )
         kinds = {name: row["kind"] for name, row in data["workers"].items()}
         self.assertEqual(kinds["muse"], "muse")
@@ -123,12 +124,22 @@ class RunWorkerTests(unittest.TestCase):
         self.assertEqual(kinds["deepseek-flash"], "grok-build")
         self.assertEqual(kinds["pi-deepseek"], "pi")
         self.assertEqual(kinds["pi-beam"], "pi")
+        self.assertEqual(kinds["codex-luna"], "codex")
+        self.assertEqual(kinds["pi-deepseek-flash"], "pi")
         caps = {name: row["cap"] for name, row in data["workers"].items()}
         self.assertEqual(caps["deepseek-flash"], 5)
         self.assertEqual(caps["glm-flash"], 5)
         self.assertEqual(caps["glm"], 2)
         self.assertEqual(caps["pi-deepseek"], 12)
         self.assertEqual(caps["pi-beam"], 5)
+        self.assertEqual(caps["codex-luna"], 3)
+        self.assertEqual(caps["pi-deepseek-flash"], 5)
+        manifests = {name: row["manifest"] for name, row in data["workers"].items()}
+        self.assertEqual(manifests["codex-luna"], "codex-sessions.tsv")
+        self.assertEqual(manifests["pi-deepseek-flash"], "pi-sessions.tsv")
+        tiers = {name: row["pgrep"] for name, row in data["workers"].items()}
+        self.assertIn("--tier codex-luna", tiers["codex-luna"])
+        self.assertIn("--tier pi-deepseek-flash", tiers["pi-deepseek-flash"])
         for name, row in data["workers"].items():
             self.assertIn("[", row["pgrep"])
             self.assertTrue(row["enabled"])
@@ -160,13 +171,12 @@ class RunWorkerTests(unittest.TestCase):
         launch = Launch()
         code, line = self.go("auto", launch)
         self.assertEqual(code, 0)
-        self.assertIn("tier=grok", line)
-        self.assertTrue(launch.cmds[0][0].endswith("launch_grok.sh"))
-        self.assertEqual(launch.cmds[0][4], registry()["workers"]["grok"]["model"])
-        text = (self.run_dir / "cursor-sessions.tsv").read_text(encoding="utf-8").strip()
+        self.assertIn("tier=glm-flash", line)
+        self.assertEqual(launch.cmds[0][0], "grok")
+        self.assertEqual(launch.cmds[0][launch.cmds[0].index("-m") + 1], "glm-5.3-flash")
+        row = (self.run_dir / "glm-sessions.tsv").read_text(encoding="utf-8").strip().split("\t")
         self.assertEqual(
-            text,
-            "ws1-plan-lane-1\t-\t1700000000\t%s\tgrok\tcursor" % registry()["workers"]["grok"]["model"],
+            row, ["ws1-plan-lane-1", SID, "1700000000", "glm-5.3-flash", "glm-flash", "grok-cli"]
         )
 
     def test_weak_label_refuses_before_launch(self):
@@ -228,7 +238,7 @@ class RunWorkerTests(unittest.TestCase):
         )
         launch = Launch()
         _code, line = self.go("auto", launch)
-        self.assertIn("tier=grok", line)
+        self.assertIn("tier=glm-flash", line)
         self.assertEqual(len(launch.cmds), 1)
 
     def test_glm_appends_the_run_rule_and_logs_the_model(self):
@@ -279,14 +289,49 @@ class RunWorkerTests(unittest.TestCase):
         code, line = self.go("auto", launch)
         self.assertEqual(code, 0)
         self.assertIn("STATUS: done", line)
-        self.assertIn("tier=grok", line)
+        self.assertIn("tier=glm-flash", line)
         self.assertEqual(len(launch.cmds), 2)
         self.assertEqual(launch.cmds[0][0], "muse")
-        self.assertTrue(launch.cmds[1][0].endswith("launch_grok.sh"))
+        self.assertEqual(launch.cmds[1][0], "grok")
+        self.assertEqual(launch.cmds[1][launch.cmds[1].index("-m") + 1], "glm-5.3-flash")
         archived = (self.run_dir / "err-ws1-plan-lane-1.muse.log").read_text(encoding="utf-8")
         self.assertIn("429", archived)
         cooled = json.loads((self.state / "worker-cooldowns.json").read_text(encoding="utf-8"))
         self.assertEqual(cooled["muse"], NOW + 30 * 60)
+
+    def test_quota_falls_back_through_the_owner_chain(self):
+        # muse and glm-flash both rate-limited: auto walks the fallback
+        # order down to codex-luna (muse -> glm-flash -> codex-luna).
+        self.counts = {}
+
+        class TwiceLimited(Launch):
+            def spawn(self, cmd, out_path, err_path, env=None):
+                self.n += 1
+                self.cmds.append(list(cmd))
+                out_path = Path(out_path)
+                err_path = Path(err_path)
+                out_path.parent.mkdir(parents=True, exist_ok=True)
+                if self.n <= 2:
+                    err_path.write_text("HTTP 429 rate limit\n", encoding="utf-8")
+                    out_path.write_text("", encoding="utf-8")
+                else:
+                    err_path.write_text("", encoding="utf-8")
+                    out_path.write_text(self.report, encoding="utf-8")
+                return 4000 + self.n
+
+        launch = TwiceLimited()
+        code, line = self.go("auto", launch)
+        self.assertEqual(code, 0)
+        self.assertIn("STATUS: done", line)
+        self.assertIn("tier=codex-luna", line)
+        self.assertEqual(len(launch.cmds), 3)
+        self.assertEqual(launch.cmds[0][0], "muse")
+        self.assertEqual(launch.cmds[1][0], "grok")
+        self.assertTrue(launch.cmds[2][1].endswith("launch_codex.py"))
+        cooled = json.loads((self.state / "worker-cooldowns.json").read_text(encoding="utf-8"))
+        self.assertEqual(cooled["muse"], NOW + 30 * 60)
+        self.assertEqual(cooled["glm-flash"], NOW + 30 * 60)
+        self.assertNotIn("codex-luna", cooled)
 
     def test_named_tier_quota_does_not_relaunch(self):
         self.counts = {}
@@ -366,6 +411,79 @@ class RunWorkerTests(unittest.TestCase):
         row = (self.run_dir / "pi-sessions.tsv").read_text(encoding="utf-8").splitlines()[-1].split("\t")
         self.assertEqual(row[4], "pi-deepseek-standby")
 
+    def test_codex_tier_launches_launch_codex_with_tier_and_records_it(self):
+        # A codex registry tier runs launch_codex.py in the run folder
+        # itself (so the manifests source finds the codex-sessions.tsv
+        # row beside out-<label>.md) and records its tier name.
+        self.counts = {}
+        launch = Launch()
+        code, line = self.go("codex-luna", launch)
+        self.assertEqual(code, 0)
+        self.assertIn("STATUS: done", line)
+        self.assertIn("tier=codex-luna", line)
+        cmd = launch.cmds[0]
+        self.assertEqual(cmd[0], "python3")
+        self.assertTrue(cmd[1].endswith("launch_codex.py"))
+        self.assertEqual(cmd[5], str(self.run_dir))
+        self.assertEqual(cmd[cmd.index("--model") + 1], "gpt-6-luna")
+        self.assertEqual(cmd[cmd.index("--tier") + 1], "codex-luna")
+        self.assertEqual(cmd[cmd.index("--reasoning-effort") + 1], "xhigh")
+        self.assertEqual(launch.envs[0], {})
+        row = (self.run_dir / "codex-sessions.tsv").read_text(encoding="utf-8").splitlines()[-1].split("\t")
+        self.assertEqual(
+            row[:4],
+            ["ws1-plan-lane-1", SID, "1700000000", "gpt-6-luna"],
+        )
+        self.assertEqual(row[4], "codex-luna")
+        self.assertEqual(row[5], "codex")
+
+    def test_codex_harness_is_codex_in_the_meta_file(self):
+        self.counts = {}
+        launch = Launch()
+        self.go("codex-luna", launch)
+        meta = json.loads((self.run_dir / "ws1-plan-lane-1.meta.json").read_text(encoding="utf-8"))
+        self.assertEqual(meta["harness"], "codex")
+        self.assertEqual(meta["tier"], "codex-luna")
+        self.assertEqual(meta["model"], "gpt-6-luna")
+
+    def test_quota_marker_file_cools_the_tier(self):
+        # A launcher QUOTA marker naming this label is a quota hit even
+        # when the report tails show no quota wording (empty report).
+        self.counts = {}
+
+        class Marked(Launch):
+            def spawn(self, cmd, out_path, err_path, env=None):
+                pid = super().spawn(cmd, out_path, err_path, env)
+                Path(out_path).write_text("", encoding="utf-8")
+                quota = self_run_dir / "QUOTA-ws1-plan-lane-1"
+                quota.write_text("model\tgpt-6-luna\nlabel\tws1-plan-lane-1\n", encoding="utf-8")
+                return pid
+
+        self_run_dir = self.run_dir
+        launch = Marked()
+        code, line = self.go("codex-luna", launch)
+        self.assertEqual(code, 0)
+        self.assertIn("STATUS: failed", line)
+        self.assertIn("reason=quota", line)
+        cooled = json.loads((self.state / "worker-cooldowns.json").read_text(encoding="utf-8"))
+        self.assertEqual(cooled["codex-luna"], NOW + 30 * 60)
+
+    def test_stale_quota_marker_does_not_cool_the_tier(self):
+        # A QUOTA marker older than this attempt's tier file belongs to a
+        # previous attempt and never cools the relaunch.
+        self.counts = {}
+        stale = self.run_dir / "pi" / "QUOTA"
+        stale.parent.mkdir(parents=True, exist_ok=True)
+        stale.write_text("model\triver/deepseek-ai/DeepSeek-V4.1-Flash-1017\nlabel\tws1-plan-lane-1\n", encoding="utf-8")
+        old = time.time() - 3600
+        os.utime(stale, (old, old))
+        launch = Launch()
+        code, line = self.go("pi-deepseek-flash", launch)
+        self.assertEqual(code, 0)
+        self.assertIn("STATUS: done", line)
+        self.assertIn("tier=pi-deepseek-flash", line)
+        self.assertFalse((self.state / "worker-cooldowns.json").exists())
+
     def test_meta_file_records_tier_harness_and_paths(self):
         self.counts = {}
         launch = Launch()
@@ -409,21 +527,20 @@ class RunWorkerTests(unittest.TestCase):
 
     def test_auto_skips_a_cooling_tier_for_the_next_one(self):
         (self.state / "worker-cooldowns.json").write_text(
-            json.dumps({"deepseek-flash": NOW + 600}), encoding="utf-8"
+            json.dumps({"muse": NOW + 600, "glm-flash": NOW + 600}), encoding="utf-8"
         )
-        self.counts = {"[m]use-bin|[m]use exec": 25, "[c]ursor-agent": 25}
+        self.counts = {}
         launch = Launch()
         code, line = self.go("auto", launch)
         self.assertEqual(code, 0)
-        self.assertIn("tier=glm-flash", line)
+        self.assertIn("tier=codex-luna", line)
 
     def test_none_available_when_every_worker_is_at_cap(self):
         self.counts = {
             "[m]use-bin|[m]use exec": 25,
-            "[c]ursor-agent": 25,
-            "-m [g]lm-5.3($| )": 2,
             "-m [g]lm-5.3-flash": 5,
-            "-m [d]eepseek-flash": 5,
+            "[l]aunch_codex.py.*--tier codex-luna": 3,
+            "[l]aunch_pi.py.*--tier pi-deepseek-flash": 5,
         }
         launch = Launch()
         code, line = self.go("auto", launch)
@@ -594,6 +711,32 @@ class PreflightTests(unittest.TestCase):
         self.assertIn("STATUS: done", out)
         self.assertIn("tier=muse", out)
         self.assertEqual(len(launch.cmds), 1)
+
+    def test_preflight_passes_for_codex_and_pi_tiers(self):
+        # gpt-6-luna and the DeepSeek V4.1 Flash pi id are priced, and the
+        # codex tier carries the xhigh effort the policy requires.
+        self.counts = {}
+        code, out, _err, launch = self.launch("codex-luna", label="ws1-plan-codex")
+        self.assertEqual(code, 0)
+        self.assertIn("STATUS: done", out)
+        self.assertIn("tier=codex-luna", out)
+        self.assertEqual(len(launch.cmds), 1)
+        code, out, _err, launch = self.launch("pi-deepseek-flash", label="ws1-plan-pi")
+        self.assertEqual(code, 0)
+        self.assertIn("STATUS: done", out)
+        self.assertIn("tier=pi-deepseek-flash", out)
+
+    def test_preflight_blocks_codex_policy_breach(self):
+        workers = registry()["workers"]
+        workers["codex-luna"] = dict(
+            workers["codex-luna"], extra_args=["--reasoning-effort", "low"]
+        )
+        self._write_registry(workers)
+        self.counts = {}
+        code, _out, err, launch = self.launch("codex-luna")
+        self.assertEqual(code, 1)
+        self.assertEqual(launch.cmds, [])
+        self.assertIn("preflight (model-policy)", err)
 
     def test_preflight_blocks_unpriced_model(self):
         workers = registry()["workers"]

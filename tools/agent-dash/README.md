@@ -72,6 +72,33 @@ process. Quota/credit exhaustion finishes `died_early` with verdict
 `BLOCKED` and writes `QUOTA` naming the model and label. See
 [docs/integrate.md](docs/integrate.md).
 
+### Codex workers (`launch_codex.py`)
+
+`scripts/launch_codex.py <label> <workspace> <prompt-file> <outdir> [--model M] [--reasoning-effort E] [--tier T]`
+runs one headless `codex exec --ephemeral --json` worker (default model
+`gpt-6-luna`, effort `xhigh`) with workspace-write sandboxing and no
+approval prompts, so it can edit the workspace and run shell
+non-interactively. `--ephemeral` keeps the thread out of
+`~/.codex/sessions`, so the rollout collector never double-counts it:
+the only dashboard rows come from here. The label is validated with
+`dash/labels.py` and a prompt without one gets a `[label: <label>]`
+first line in the copied `<outdir>/prompt-<label>.md`. It writes
+`codex-sessions.tsv` (label, session id, start epoch, model, tier),
+`stream-<label>.jsonl` (raw `--json` events), `out-<label>.md`
+(the final message via `-o`), `err-<label>.log`, `running/<label>`
+while the run is live, and `QUOTA-<label>` on rate-limit/quota
+exhaustion, and appends `generic.jsonl` start/usage/finish lines (run id
+`codex:<session>:<label>`) parsed from the stream's `turn.completed`
+usage, so tokens land on the labelled run exactly once.
+
+`scripts/run_worker.py` launches the `codex-luna` (kind `codex`, cap 3)
+and `pi-deepseek-flash` (kind `pi`, `river/deepseek-ai/DeepSeek-V4.1-Flash-1017`,
+cap 5) registry tiers through these launchers, and the `auto` fallback
+order is `muse` -> `glm-flash` -> `codex-luna` -> `pi-deepseek-flash`:
+a tier that hits its quota patterns (or whose launcher writes its
+`QUOTA` marker) cools down for `cooldown_minutes` and the next tier
+takes the launch.
+
 ## Config
 
 Zero config runs. `config.local.json` deep-merges over `config.example.json`. The full tables are in [configuration](../../docs/configuration.md).

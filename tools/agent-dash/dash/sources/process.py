@@ -5,9 +5,10 @@ token only. A run is running when that pid is still that tool's process,
 or when a live process of that tool carries ``[label: <label>]``. A muse
 run is also live when a live muse process has ``--prompt-file`` ending in
 ``/<label>.md``, or ``--session-id`` equal to the run's session uuid.
-A pi or Command Code run is also live when its launcher is: a
+A pi, Command Code, or Codex run is also live when its launcher is: a
 ``python3`` process whose argv runs ``scripts/launch_pi.py`` (source
-``pi``) or ``scripts/launch_cmd.py`` (source ``commandcode``) with the
+``pi``), ``scripts/launch_cmd.py`` (source ``commandcode``), or
+``scripts/launch_codex.py`` (source ``codex``) with the
 run's label as the first positional argument. The pi CLI rewrites its
 process title, so the worker itself carries no label and no cli path;
 the launcher pid is the same pid the ``running/<label>`` file and the
@@ -51,6 +52,7 @@ SOURCE_COMMS = {
     "glm": frozenset({"grok"}),
     "pi": frozenset({"node", "pi", "python3"}),
     "commandcode": frozenset({"python3"}),
+    "codex": frozenset({"python3"}),
 }
 _LABEL = re.compile(r"\[label:\s*([^\]]+?)\]")
 _RUN_WORKER = re.compile(r"(?:^|\s)\S*run_worker\.py(\s.*)?$")
@@ -63,6 +65,8 @@ _MODEL = re.compile(r"--model(?:=|\s+)(\S+)")
 _PI_CLI = re.compile(r"pi-coding-agent")
 _LAUNCH_PI = re.compile(r"(?:^|\s)\S*launch_pi\.py(?:\s|$)")
 _LAUNCH_CMD = re.compile(r"(?:^|\s)\S*launch_cmd\.py(?:\s|$)")
+_LAUNCH_CODEX = re.compile(r"(?:^|\s)\S*launch_codex\.py(?:\s|$)")
+_CODEX_EFFORT = re.compile(r"-c\s+model_reasoning_effort=(\S+)")
 _PI_PROMPT = re.compile(r"@?([^\s'\"]*/([^\s'\"/]+?)\.md)")
 _MODEL_OK = re.compile(r"^[^\s'\";|&<>]{1,200}$")
 _REASONING_EFFORT = re.compile(r"--reasoning-effort(?:=|\s+)(\S+)")
@@ -80,7 +84,7 @@ def poll(store, cfg, now: float) -> None:
         if row["comm"] in _COMM
         or (
             _canon_comm(row["comm"]) == "python3"
-            and tokens.get(row["pid"], {}).get("launcher") in ("pi", "commandcode")
+            and tokens.get(row["pid"], {}).get("launcher") in ("pi", "commandcode", "codex")
         )
     ]
     matched_pids = {row["pid"] for row in matched}
@@ -103,7 +107,7 @@ def poll(store, cfg, now: float) -> None:
 
 
 def live_agent_processes(now: float | None = None) -> list[dict]:
-    """Live grok, muse, glm, pi, and Command Code processes.
+    """Live grok, muse, glm, pi, Command Code, and Codex processes.
 
     Each row is ``pid``, ``comm``, ``started_at``, ``label``, ``model``,
     ``launcher`` (``pi``/``commandcode`` for a launcher row, else None),
@@ -114,7 +118,8 @@ def live_agent_processes(now: float | None = None) -> list[dict]:
     rest of argv are not returned. A ``node`` row is emitted only when
     its argv names the pi cli and a worker label: plain node processes
     never appear. A ``python3`` row is emitted only when its argv runs
-    ``scripts/launch_pi.py`` or ``scripts/launch_cmd.py`` with a worker
+    ``scripts/launch_pi.py``, ``scripts/launch_cmd.py``, or
+    ``scripts/launch_codex.py`` with a worker
     label: plain python3 processes never appear.
     """
     now = time.time() if now is None else float(now)
@@ -129,7 +134,7 @@ def live_agent_processes(now: float | None = None) -> list[dict]:
         token = tokens.get(row["pid"], {})
         launcher = token.get("launcher")
         if row["comm"] == "python3":
-            if launcher not in ("pi", "commandcode"):
+            if launcher not in ("pi", "commandcode", "codex"):
                 # A ``python3`` row that is not a labelled launcher is not ours.
                 continue
         else:
@@ -509,8 +514,9 @@ def reconcile_running(store, now: float, processes=None) -> int:
     Orphan muse usage is moved onto the labeled run and the orphan row is
     deleted. A missing muse start is filled from the earliest usage event,
     and a finished end that sits before the latest usage event is raised to
-    it. Pi and Command Code rows match their launcher (a ``python3``
-    ``launch_pi.py``/``launch_cmd.py`` process with the run's label), so a
+    it. Pi, Command Code, and Codex rows match their launcher (a
+    ``python3`` ``launch_pi.py``/``launch_cmd.py``/``launch_codex.py``
+    process with the run's label), so a
     live launcher keeps them ``running`` here too; their own polls still
     close vanished attempts from the running file alone. Returns how many
     rows were ended because the process was gone.
@@ -868,11 +874,12 @@ def session_id_from_args(text: str) -> str | None:
 
 
 def launcher_source_from_args(text: str) -> str | None:
-    """Which launcher's argv this is: ``pi``, ``commandcode``, or None.
+    """Which launcher's argv this is: ``pi``, ``commandcode``, ``codex``, or None.
 
-    ``scripts/launch_pi.py`` and ``scripts/launch_cmd.py`` run one
-    labelled worker as ``<script> <label> <workspace> <prompt> <outdir>``.
-    Returns only the source; the label and the rest of argv are read by
+    ``scripts/launch_pi.py``, ``scripts/launch_cmd.py``, and
+    ``scripts/launch_codex.py`` run one labelled worker as
+    ``<script> <label> <workspace> <prompt> <outdir>``. Returns only the
+    source; the label and the rest of argv are read by
     ``launcher_label_from_args`` and discarded.
     """
     if not text:
@@ -881,6 +888,8 @@ def launcher_source_from_args(text: str) -> str | None:
         return "pi"
     if _LAUNCH_CMD.search(text):
         return "commandcode"
+    if _LAUNCH_CODEX.search(text):
+        return "codex"
     return None
 
 
@@ -893,7 +902,7 @@ def launcher_label_from_args(text: str) -> str | None:
     """
     if not text:
         return None
-    match = _LAUNCH_PI.search(text) or _LAUNCH_CMD.search(text)
+    match = _LAUNCH_PI.search(text) or _LAUNCH_CMD.search(text) or _LAUNCH_CODEX.search(text)
     if not match:
         return None
     rest = text[match.end() :].split()
@@ -942,11 +951,14 @@ def model_from_args(text: str) -> str | None:
 def reasoning_effort_from_args(text: str) -> str | None:
     """The muse ``--reasoning-effort <level>`` (or ``--reasoning-effort=<level>``) token.
 
-    Returns only that one value; every other argument is discarded. This
-    feeds the model-policy doctor check, which reports the worker label
-    and never the rest of argv.
+    Codex passes its effort as ``-c model_reasoning_effort=<level>``,
+    which is accepted too. Returns only that one value; every other
+    argument is discarded. This feeds the model-policy doctor check,
+    which reports the worker label and never the rest of argv.
     """
     match = _REASONING_EFFORT.search(text or "")
+    if match is None:
+        match = _CODEX_EFFORT.search(text or "")
     if not match:
         return None
     value = match.group(1).strip("'\"")

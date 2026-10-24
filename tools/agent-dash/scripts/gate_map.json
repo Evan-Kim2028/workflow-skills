@@ -277,6 +277,11 @@
       "test_pi",
       "test_label_guard_clis"
     ],
+    "scripts/launch_codex.py": [
+      "test_launch_codex",
+      "test_label_guard_clis",
+      "test_run_worker"
+    ],
     "scripts/launch_grok.sh": [
       "test_ws_wave",
       "test_labels"

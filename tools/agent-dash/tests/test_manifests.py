@@ -830,6 +830,89 @@ class ManifestQuotaAndSupersedeTests(unittest.TestCase):
         self.assertEqual(row["verdict"], "QUOTA")
 
 
+class ManifestCodexTests(unittest.TestCase):
+    def setUp(self):
+        manifests.reset_state()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.store = MemStore()
+        self.root = self.tmp.name
+        self.scratch = os.path.join(self.root, "enc", PARENT, "scratchpad")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+        manifests.reset_state()
+
+    def _cfg(self, **extra):
+        cfg = {
+            "scratch_root": self.root,
+            # Isolate from the machine's registered run folders (see above).
+            "state_dir": os.path.join(self.root, "state"),
+            "dir_scan_s": 0,
+            "live_window_s": 36 * 3600,
+            "read_budgets": {"per_file": 1024 * 1024, "per_tick": 1024 * 1024},
+        }
+        cfg.update(extra)
+        return cfg
+
+    def test_codex_manifest_is_scanned(self):
+        self.assertIn(("codex-sessions.tsv", "codex", "codex", "codex"), manifests._MANIFESTS)
+
+    def test_tier_of_maps_gpt_models_to_codex(self):
+        self.assertEqual(manifests.tier_of("gpt-6-luna"), "codex")
+        self.assertEqual(manifests.tier_of("gpt-6.1-sol"), "codex")
+        self.assertEqual(manifests.tier_of("muse-spark-1.3-contributor"), "muse")
+        self.assertIsNone(manifests.tier_of(None))
+
+    def test_poll_codex_row_reads_pass_and_model(self):
+        sid = "01a16401-9955-70cd-bf8c-19944db4f20c"
+        _write(
+            os.path.join(self.scratch, "codex-sessions.tsv"),
+            f"pass-poll\t{sid}\t1700000002\tgpt-6-luna\tcodex-luna\n",
+            NOW,
+        )
+        _write(os.path.join(self.scratch, "codex", "out-pass-poll.md"), "PASS\nbuilt it\n", NOW)
+        _write(os.path.join(self.scratch, "codex", "err-pass-poll.log"), "", NOW)
+        manifests.poll(self.store, self._cfg(), NOW)
+        row = self.store.runs[f"codex:{sid}:pass-poll"]
+        self.assertEqual(row["source"], "codex")
+        # The recorded tier (fifth cell) is what run_worker launched.
+        self.assertEqual(row["tier"], "codex-luna")
+        self.assertEqual(row["model"], "gpt-6-luna")
+        self.assertEqual(row["status"], "done")
+        self.assertEqual(row["verdict"], "PASS")
+        # Without a recorded tier the model family names the tier.
+        manifests.reset_state()
+        self.store = MemStore()
+        _write(
+            os.path.join(self.scratch, "codex-sessions.tsv"),
+            f"pass-poll\t{sid}\t1700000002\tgpt-6-luna\tcodex-luna\n"
+            f"bare-poll\t{sid}\t1700000003\tgpt-6-luna\n",
+            NOW,
+        )
+        _write(os.path.join(self.scratch, "codex", "out-bare-poll.md"), "PASS\nbare\n", NOW)
+        _write(os.path.join(self.scratch, "codex", "err-bare-poll.log"), "", NOW)
+        manifests.poll(self.store, self._cfg(), NOW)
+        self.assertEqual(self.store.runs[f"codex:{sid}:bare-poll"]["tier"], "codex")
+
+    def test_poll_codex_quota_err_marks_row_died(self):
+        sid = "01a16401-9955-70cd-bf8c-19944db4f20d"
+        _write(
+            os.path.join(self.scratch, "codex-sessions.tsv"),
+            f"quota-poll\t{sid}\t1700000002\tgpt-6-luna\tcodex-luna\n",
+            NOW,
+        )
+        _write(os.path.join(self.scratch, "codex", "out-quota-poll.md"), "working\n", NOW)
+        _write(
+            os.path.join(self.scratch, "codex", "err-quota-poll.log"),
+            "error 429 rate limit exceeded\n",
+            NOW,
+        )
+        manifests.poll(self.store, self._cfg(), NOW)
+        row = self.store.runs[f"codex:{sid}:quota-poll"]
+        self.assertEqual(row["status"], "died_early")
+        self.assertEqual(row["verdict"], "QUOTA")
+
+
 class ManifestSmokeTests(unittest.TestCase):
     @unittest.skipUnless(os.environ.get("AGENT_DASH_SMOKE") == "1", "set AGENT_DASH_SMOKE=1 to read a local scratchpad")
     def test_manifest_parses(self):

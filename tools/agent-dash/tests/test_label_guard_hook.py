@@ -41,6 +41,16 @@ GROK_GOOD = (
     "< /dev/null > /pad/cursor/out-ws12-plan-notes.md 2> /pad/cursor/err-ws12-plan-notes.log &"
 )
 GROK_BAD = "nohup ~/.claude/tools/agent-dash/scripts/launch_grok.sh ws12-notes /repo /pad/cursor/ws12-notes.md &"
+CODEX_GOOD = (
+    "python3 ~/.claude/tools/agent-dash/scripts/launch_codex.py ws11-plan-foo /repo "
+    "/pad/ws11-plan-foo.md /runs --model gpt-6-luna --tier codex-luna --reasoning-effort xhigh"
+)
+CODEX_BAD = "python3 scripts/launch_codex.py ws11-visuals /repo /pad/ws11-visuals.md /runs"
+CODEX_EXEC_GOOD = (
+    'codex exec --ephemeral --json -m gpt-6-luna -C /repo -o /runs/out-ws11-plan-foo.md - '
+    '"[label: ws11-plan-foo] do the task"'
+)
+CODEX_EXEC_BAD = 'codex exec -m gpt-6-luna "do the task with no label"'
 
 
 def payload(command, tool="Bash"):
@@ -57,6 +67,22 @@ class ExtractTests(unittest.TestCase):
     def test_grok_launcher(self):
         self.assertEqual(hook.extract_labels(GROK_GOOD), ["ws12-plan-notes"])
         self.assertEqual(hook.extract_labels(GROK_BAD), ["ws12-notes"])
+
+    def test_codex_launcher(self):
+        self.assertEqual(hook.extract_labels(CODEX_GOOD), ["ws11-plan-foo"])
+        self.assertEqual(hook.extract_labels(CODEX_BAD), ["ws11-visuals"])
+
+    def test_codex_exec_prompt(self):
+        self.assertEqual(hook.extract_labels(CODEX_EXEC_GOOD), ["ws11-plan-foo"])
+        self.assertEqual(hook.extract_labels(CODEX_EXEC_BAD), [""])
+        # Stdin, subcommand, and flag-only launches are not checkable.
+        self.assertEqual(
+            hook.extract_labels('codex exec --json -m gpt-6-luna - < /tmp/prompt.md'), []
+        )
+        self.assertEqual(hook.extract_labels("codex exec resume --last"), [])
+        self.assertEqual(hook.extract_labels("codex exec --json"), [])
+        # A shell expansion in the prompt fails open.
+        self.assertEqual(hook.extract_labels('codex exec "$PROMPT"'), [])
 
     def test_run_worker_shapes(self):
         self.assertEqual(
@@ -80,6 +106,14 @@ class ExtractTests(unittest.TestCase):
         )
         self.assertEqual(
             hook.extract_labels("printf 'ws11-plan-x\\t-\\t1\\n' >> /pad/cursor-sessions.tsv"),
+            ["ws11-plan-x"],
+        )
+        self.assertEqual(
+            hook.extract_labels("echo 'ws11-plan-x' >> /pad/codex-sessions.tsv"),
+            ["ws11-plan-x"],
+        )
+        self.assertEqual(
+            hook.extract_labels("echo 'ws11-plan-x' >> /pad/pi-sessions.tsv"),
             ["ws11-plan-x"],
         )
         # Headers and compound lines fail open.
@@ -223,11 +257,16 @@ class JudgeTests(unittest.TestCase):
     def test_valid_launch_passes(self):
         self.assertEqual(hook.judge(MUSE_GOOD), (0, ""))
         self.assertEqual(hook.judge(GROK_GOOD), (0, ""))
+        self.assertEqual(hook.judge(CODEX_GOOD), (0, ""))
+        self.assertEqual(hook.judge(CODEX_EXEC_GOOD), (0, ""))
 
     def test_invalid_launch_refuses_with_fix(self):
         code, err = hook.judge(MUSE_BAD)
         self.assertEqual(code, 2)
         self.assertIn("use ws11-plan-visuals", err)
+        code, err = hook.judge(CODEX_EXEC_BAD)
+        self.assertEqual(code, 2)
+        self.assertIn("label", err)
 
     def test_benign_passes(self):
         self.assertEqual(hook.judge("grep 'muse exec' notes.md"), (0, ""))

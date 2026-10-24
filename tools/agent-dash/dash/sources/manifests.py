@@ -51,6 +51,7 @@ _MANIFESTS = (
     ("glm-sessions.tsv", "glm", "glm", "glm"),
     ("grok-sessions.tsv", "grok", "grok", "grok"),
     ("cursor-sessions.tsv", "grok", "cursor", "grok"),
+    ("codex-sessions.tsv", "codex", "codex", "codex"),
 )
 _UUID = re.compile(
     r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
@@ -93,9 +94,9 @@ def tier_of(model: str | None) -> str | None:
     if not model or not isinstance(model, str):
         return None
     text = model.lower()
-    for name in ("opus", "sonnet", "haiku", "muse", "glm", "grok"):
+    for name in ("opus", "sonnet", "haiku", "muse", "glm", "grok", "codex", "gpt"):
         if name in text:
-            return name
+            return "codex" if name in ("codex", "gpt") else name
     return None
 
 
@@ -268,13 +269,14 @@ def _pid_file_for(scratch, base, label):
 
 
 def _quota_hit_for(source, err_path, out_path) -> bool:
-    """True when a grok-build run's logs show a quota/rate-limit failure.
+    """True when a grok-build or codex run's logs show a quota/rate-limit failure.
 
-    Only grok-build rows (sources ``glm``/``grok``) are scanned: other
-    families never print these patterns, and the scan stays bounded to one
-    small tail read per log. Errors read as False, never an exception.
+    Only grok-build rows (sources ``glm``/``grok``) and codex rows
+    (source ``codex``) are scanned: other families never print these
+    patterns, and the scan stays bounded to one small tail read per log.
+    Errors read as False, never an exception.
     """
-    if source not in ("glm", "grok"):
+    if source not in ("glm", "grok", "codex"):
         return False
     try:
         if err_path and file_shows_quota(err_path):
