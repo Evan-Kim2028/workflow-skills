@@ -29,11 +29,13 @@ STATUS: running|done|failed out=<report> err=<stderr> tier=<name> [reason=...]
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import re
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 from pathlib import Path
@@ -414,8 +416,35 @@ def eligible(ctx, skip):
 
 
 def note_quota(ctx, name):
-    ctx["cooldowns"][name] = ctx["hooks"]["now"]() + ctx["minutes"] * 60
-    write_cooldowns(cooldown_path(), ctx["cooldowns"])
+    path = cooldown_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = _cooldown_lock_path(path)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(lock_path, "a+") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            cooldowns = read_cooldowns(path)
+            cooldowns[name] = ctx["hooks"]["now"]() + ctx["minutes"] * 60
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_file = tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=str(path.parent),
+                prefix=path.name + ".",
+                suffix=".tmp",
+                delete=False,
+            )
+            try:
+                tmp_file.write(json.dumps(cooldowns, sort_keys=True) + "\n")
+                tmp_file.flush()
+                os.fsync(tmp_file.fileno())
+                tmp_path = Path(tmp_file.name)
+            finally:
+                tmp_file.close()
+            os.replace(tmp_path, path)
+            ctx["cooldowns"] = cooldowns
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
 def outcome(worker, out_path, err_path):
@@ -708,11 +737,35 @@ def read_cooldowns(path: Path) -> dict:
     return found
 
 
+def _cooldown_lock_path(path: Path) -> Path:
+    return path.with_suffix(path.suffix + ".lock")
+
+
 def write_cooldowns(path: Path, data: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(data, sort_keys=True) + "\n", encoding="utf-8")
-    os.replace(tmp, path)
+    lock_path = _cooldown_lock_path(path)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(lock_path, "a+") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            tmp_file = tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=str(path.parent),
+                prefix=path.name + ".",
+                suffix=".tmp",
+                delete=False,
+            )
+            try:
+                tmp_file.write(json.dumps(data, sort_keys=True) + "\n")
+                tmp_file.flush()
+                os.fsync(tmp_file.fileno())
+                tmp_path = Path(tmp_file.name)
+            finally:
+                tmp_file.close()
+            os.replace(tmp_path, path)
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
 def _minutes(registry) -> float:
