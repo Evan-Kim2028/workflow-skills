@@ -759,5 +759,59 @@ class PreflightTests(unittest.TestCase):
         self.assertIn("preflight (model-policy)", err)
 
 
+class CooldownRaceTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.state = self.root / "state"
+        self.state.mkdir()
+        self.env = {
+            "AGENT_DASH_WORKERS": os.environ.get("AGENT_DASH_WORKERS"),
+            "AGENT_DASH_STATE_DIR": os.environ.get("AGENT_DASH_STATE_DIR"),
+        }
+        os.environ["AGENT_DASH_WORKERS"] = str(self.root / "workers.json")
+        os.environ["AGENT_DASH_STATE_DIR"] = str(self.state)
+
+    def tearDown(self):
+        for key, value in self.env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        self.tmp.cleanup()
+
+    def test_concurrent_cooldown_writes_do_not_race(self):
+        import threading
+
+        path = runner.cooldown_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        errors = []
+
+        def writer(name):
+            try:
+                ctx = {
+                    "hooks": {"now": lambda: NOW},
+                    "minutes": 30,
+                    "cooldowns": {},
+                }
+                runner.note_quota(ctx, name)
+            except Exception as exc:
+                errors.append(exc)
+
+        threads = []
+        for i in range(20):
+            t = threading.Thread(target=writer, args=(f"tier-{i}",))
+            threads.append(t)
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        self.assertEqual(errors, [])
+        data = runner.read_cooldowns(path)
+        for i in range(20):
+            self.assertIn(f"tier-{i}", data)
+
+
 if __name__ == "__main__":
     unittest.main()
