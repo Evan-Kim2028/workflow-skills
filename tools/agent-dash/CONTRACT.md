@@ -430,8 +430,9 @@ page all read the same body, so the plan view and the execution map agree.
 `progress.done` counts done tasks, `progress.total` counts every task except
 deferred, `pct` rounds half up. Unknown task statuses are ignored. Tasks in
 groups whose `phase` is `planning` are excluded from `done`/`total`/`counts`/
-`pct` and reported under `progress.planning` as `{done, total, pct}` with the
-same rounding (zeros when none). Orchestration (waves, critical path, ready
+`pct` and, when at least one planning task exists, reported under
+`progress.planning` as `{done, total, pct}` with the same rounding. The
+`planning` key is present only then. Orchestration (waves, critical path, ready
 queue, max parallel) ignores planning tasks and treats deps on them as
 satisfied. The page never computes % done itself; it reads `progress.pct`,
 `progress.done`, and `progress.total`.

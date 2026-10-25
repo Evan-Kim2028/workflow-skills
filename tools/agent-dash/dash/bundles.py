@@ -2075,19 +2075,14 @@ def print_waves(ws: str, json_mode: bool = False) -> int:
         print(f"best span {len(path)} tasks vs actual {actual_span:.0f}s wall clock")
     else:
         print(f"best span {len(path)} tasks vs actual unknown")
-    try:
-        from dash import plans as _plans
-
-        _groups = body.get("groups") if isinstance(body, dict) else None
-        if not isinstance(_groups, list):
-            _dag = body.get("dag") if isinstance(body, dict) else None
-            if isinstance(_dag, dict):
-                _groups = _dag.get("groups")
-        _planning = _plans.plan_progress(_groups or []).get("planning") or {}
-        if int(_planning.get("total") or 0) > 0:
-            print(f"planning: {_planning['done']}/{_planning['total']} tasks (not counted)")
-    except Exception:
-        pass
+    _groups = body.get("groups") if isinstance(body, dict) else None
+    if not isinstance(_groups, list):
+        _dag = body.get("dag") if isinstance(body, dict) else None
+        if isinstance(_dag, dict):
+            _groups = _dag.get("groups")
+    _planning = plan_progress(_groups or []).get("planning")
+    if _planning and int(_planning.get("total") or 0) > 0:
+        print(f"planning: {_planning['done']}/{_planning['total']} tasks (not counted)")
     return 0
 
 

@@ -21,9 +21,11 @@ def plan_progress(groups) -> dict:
 
     Tasks in groups whose ``phase`` is ``"planning"`` are excluded from the
     execution counts (they never count toward progress, waves, or the ready
-    queue) and are reported separately under ``planning`` as
-    ``{"done", "total", "pct"}`` with the same rounding (zeros when no
-    planning group exists).
+    queue) and, when at least one planning task exists, are reported
+    separately under ``planning`` as ``{"done", "total", "pct"}`` with the
+    same rounding. The ``planning`` key is present only when a planning
+    group has at least one task, so plans without planning groups return
+    exactly ``{"done", "total", "counts", "pct"}``.
     """
     counts = {key: 0 for key in PROGRESS_STATUSES}
     planning_counts = {key: 0 for key in PROGRESS_STATUSES}
@@ -41,13 +43,15 @@ def plan_progress(groups) -> dict:
     planning_total = sum(planning_counts[key] for key in ("todo", "wip", "pr", "prog", "done"))
     planning_done = planning_counts["done"]
     planning_pct = int(math.floor(100 * planning_done / planning_total + 0.5)) if planning_total else 0
-    return {
+    result = {
         "done": done,
         "total": total,
         "counts": counts,
         "pct": pct,
-        "planning": {"done": planning_done, "total": planning_total, "pct": planning_pct},
     }
+    if planning_total > 0:
+        result["planning"] = {"done": planning_done, "total": planning_total, "pct": planning_pct}
+    return result
 
 
 class PlanNotFound(Exception):
