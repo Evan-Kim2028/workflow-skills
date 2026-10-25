@@ -350,7 +350,10 @@ def _view_groups(value, links: dict | None = None) -> list:
             if isinstance(row["id"], str) and row["id"] in links:
                 row["linear"] = links[row["id"]]
             tasks.append(row)
-        groups.append({"id": item.get("id"), "col": item.get("col"), "title": item.get("title"), "tasks": tasks})
+        group_row = {"id": item.get("id"), "col": item.get("col"), "title": item.get("title"), "tasks": tasks}
+        if isinstance(item.get("phase"), str):
+            group_row["phase"] = item.get("phase")
+        groups.append(group_row)
     return groups
 
 
@@ -825,6 +828,9 @@ def _validate_dag(issues: list[str], dag) -> None:
         if not isinstance(col, int) or isinstance(col, bool) or col < 0 or (cols and col >= len(cols)):
             issues.append(f"plan.json: section {gid} col is outside dag.cols")
         _require_str(issues, "plan.json", group.get("title"), f"section {gid} title")
+        if "phase" in group and group.get("phase") is not None:
+            if group.get("phase") not in ("planning", "execution"):
+                issues.append(f'plan.json: group {gid} phase {group.get("phase")} is not "planning" or "execution"')
         tasks = group.get("tasks")
         if not isinstance(tasks, list):
             issues.append(f"plan.json: section {gid} tasks must be a list")
@@ -2069,6 +2075,14 @@ def print_waves(ws: str, json_mode: bool = False) -> int:
         print(f"best span {len(path)} tasks vs actual {actual_span:.0f}s wall clock")
     else:
         print(f"best span {len(path)} tasks vs actual unknown")
+    _groups = body.get("groups") if isinstance(body, dict) else None
+    if not isinstance(_groups, list):
+        _dag = body.get("dag") if isinstance(body, dict) else None
+        if isinstance(_dag, dict):
+            _groups = _dag.get("groups")
+    _planning = plan_progress(_groups or []).get("planning")
+    if _planning and int(_planning.get("total") or 0) > 0:
+        print(f"planning: {_planning['done']}/{_planning['total']} tasks (not counted)")
     return 0
 
 

@@ -418,7 +418,7 @@ confirm/toast/archive screenshots; run it, don't fold it into `check
 (plus an `issues` list, the `ws validate` findings, empty when clean; a bad
 plan still serves 200 with its issues named, so bad states are never drawn
 as tasks; the page does not show the issues, which `ws validate` and this field carry):
-`{"ws": "WS7", "cols": [..], "groups": [{id, col, title, tasks: [{id, title, status, deps, kind, dep_notes}]}], "edges": [[a, b]], "phases": [{name, goal, gate}], "progress": {"done": 0, "total": 0, "counts": {todo, wip, pr, prog, done, deferred}, "pct": 0}, "ready": ["WS7.2"], "critical_path": ["WS7.1", "WS7.2"], "max_parallel": 3, "layout": {...}, "map_warnings": [{code, severity, title, detail, fix}]}`.
+`{"ws": "WS7", "cols": [..], "groups": [{id, col, title, phase, tasks: [{id, title, status, deps, kind, dep_notes}]}], "edges": [[a, b]], "phases": [{name, goal, gate}], "progress": {"done": 0, "total": 0, "counts": {todo, wip, pr, prog, done, deferred}, "pct": 0, "planning": {"done": 0, "total": 0, "pct": 0}}, "ready": ["WS7.2"], "critical_path": ["WS7.1", "WS7.2"], "max_parallel": 3, "layout": {...}, "map_warnings": [{code, severity, title, detail, fix}]}`.
 On a linked workstream (`linear.json` in the bundle) the body adds optional `linear` objects: top-level `linear: {url, synced_at}` (`synced_at` is null until the first sync), and `linear: {identifier, url}` on each task row. Both are absent when the bundle is not linked. See [docs/linear.md](docs/linear.md).
 `ready` is the todo-with-satisfied-deps task ids ranked by critical-path impact, `critical_path` is the longest dep chain, and `max_parallel` is the widest dependency wave; all three come from `dash/orchestrate.py` with no store reads, cached by `plan.json` mtime.
 `layout` is the computed map layout from `dash/maplayout.py` (density, per-section collapse state, columns, chip labels, arrows mode, train tags, sections line), and `map_warnings` is the MAP101–MAP111 lint for that plan; both are cached by `plan.json` mtime like the orchestration fields. The page consumes `layout`; `ws layout <ID>` prints the same object without touching the page.
@@ -428,9 +428,14 @@ One resolver (`dash.bundles.resolve_plan`) picks the plan file: a bundle's
 `plan.json` wins over the plans-map file. `/api/plan`, `/api/bundle`, and the
 page all read the same body, so the plan view and the execution map agree.
 `progress.done` counts done tasks, `progress.total` counts every task except
-deferred, `pct` rounds half up. Unknown task statuses are ignored. The page
-never computes % done itself; it reads `progress.pct`, `progress.done`, and
-`progress.total`.
+deferred, `pct` rounds half up. Unknown task statuses are ignored. Tasks in
+groups whose `phase` is `planning` are excluded from `done`/`total`/`counts`/
+`pct` and, when at least one planning task exists, reported under
+`progress.planning` as `{done, total, pct}` with the same rounding. The
+`planning` key is present only then. Orchestration (waves, critical path, ready
+queue, max parallel) ignores planning tasks and treats deps on them as
+satisfied. The page never computes % done itself; it reads `progress.pct`,
+`progress.done`, and `progress.total`.
 
 `GET /api/replay?ws=<ID>` -> one timeline for a sped-up playback of the
 workstream's history:
@@ -756,7 +761,7 @@ Each bundle:
 | File | Role |
 |---|---|
 | `bundle.json` | `{id, title, short, order, kind}`. `kind` is `program` or `workstream`. The id matches the directory name. Lifecycle fields are additive: `state` (`planned`, `active`, `paused`, `done`, `archived`, `dropped`; default `active` when absent), `state_changed_at` (epoch or null), `archived_at` (epoch or null), `summary` (object frozen by `ws archive`, or null), `depends_on` (workstream ids that must exist; never `OVERVIEW`), `milestone` (phase-name string or null). `ws validate` rejects a bad value (exit 4) with the next command. |
-| `plan.json` | Decision record: `dag`, `decisions`, `motivation`, `agent_friendly`, `narrative`. Task status is `todo`, `pr`, `prog`, `done`, or `deferred`. `deferred` may set `moved_to`, `note`, and `received_as`. A task may carry `deps`, `dep_notes` (conditions keyed by dep id), `kind` (`task` or `gate`; see SKILL-PLAN.md), and `files` (declared footprints); a gate may carry `signal`, `confirmed_at`, and `fresh_hours`. `ws validate` rejects a bad `kind`, a `dep_notes` key that is not one of the task's `deps`, a bad `files`/`signal`/`confirmed_at`/`fresh_hours`/`received_as`, and a bare number citation. A `program` bundle may hold only `narrative`. |
+| `plan.json` | Decision record: `dag`, `decisions`, `motivation`, `agent_friendly`, `narrative`. Task status is `todo`, `pr`, `prog`, `done`, or `deferred`. `deferred` may set `moved_to`, `note`, and `received_as`. A task may carry `deps`, `dep_notes` (conditions keyed by dep id), `kind` (`task` or `gate`; see SKILL-PLAN.md), and `files` (declared footprints); a gate may carry `signal`, `confirmed_at`, and `fresh_hours`. A DAG group may carry `phase` (`planning` or `execution`, default `execution`); every task in a planning group is a planning task. `ws validate` rejects a bad `kind`, a `dep_notes` key that is not one of the task's `deps`, a bad `files`/`signal`/`confirmed_at`/`fresh_hours`/`received_as`, and a bare number citation. A `program` bundle may hold only `narrative`. |
 | `page.html` | Plan-view fragment. Generated for bundles that have `visuals.html` and `layout.json`. |
 | `approvals.json` | Optional. `{ws, decided_at, decided_by, items: [{id, step, status, reversible, conditions}]}`. `status` is `pending`, `approved`, or `denied`. `reversible` is a boolean. `decided_at` is an ISO-8601 UTC string or null. |
 | `visuals.html` | Hand-made sections keyed by h2 title. |

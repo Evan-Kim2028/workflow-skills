@@ -18,18 +18,40 @@ def plan_progress(groups) -> dict:
     ``done`` counts merged tasks, ``total`` counts every task except deferred,
     ``counts`` tallies each known status (unknown statuses are ignored), and
     ``pct`` rounds half up like the page used to.
+
+    Tasks in groups whose ``phase`` is ``"planning"`` are excluded from the
+    execution counts (they never count toward progress, waves, or the ready
+    queue) and, when at least one planning task exists, are reported
+    separately under ``planning`` as ``{"done", "total", "pct"}`` with the
+    same rounding. The ``planning`` key is present only when a planning
+    group has at least one task, so plans without planning groups return
+    exactly ``{"done", "total", "counts", "pct"}``.
     """
     counts = {key: 0 for key in PROGRESS_STATUSES}
+    planning_counts = {key: 0 for key in PROGRESS_STATUSES}
     for group in groups or []:
         tasks = group.get("tasks") if isinstance(group, dict) else None
+        is_planning = isinstance(group, dict) and group.get("phase") == "planning"
+        target = planning_counts if is_planning else counts
         for task in tasks or []:
             status = task.get("status") if isinstance(task, dict) else None
-            if status in counts:
-                counts[status] += 1
+            if status in target:
+                target[status] += 1
     total = sum(counts[key] for key in ("todo", "wip", "pr", "prog", "done"))
     done = counts["done"]
     pct = int(math.floor(100 * done / total + 0.5)) if total else 0
-    return {"done": done, "total": total, "counts": counts, "pct": pct}
+    planning_total = sum(planning_counts[key] for key in ("todo", "wip", "pr", "prog", "done"))
+    planning_done = planning_counts["done"]
+    planning_pct = int(math.floor(100 * planning_done / planning_total + 0.5)) if planning_total else 0
+    result = {
+        "done": done,
+        "total": total,
+        "counts": counts,
+        "pct": pct,
+    }
+    if planning_total > 0:
+        result["planning"] = {"done": planning_done, "total": planning_total, "pct": planning_pct}
+    return result
 
 
 class PlanNotFound(Exception):
@@ -144,14 +166,15 @@ def _groups(value) -> list:
                     key: value for key, value in notes.items() if isinstance(key, str) and isinstance(value, str)
                 }
             tasks.append(row)
-        groups.append(
-            {
-                "id": item.get("id"),
-                "col": item.get("col"),
-                "title": item.get("title"),
-                "tasks": tasks,
-            }
-        )
+        row_group = {
+            "id": item.get("id"),
+            "col": item.get("col"),
+            "title": item.get("title"),
+            "tasks": tasks,
+        }
+        if isinstance(item.get("phase"), str):
+            row_group["phase"] = item.get("phase")
+        groups.append(row_group)
     return groups
 
 
