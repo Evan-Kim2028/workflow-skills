@@ -71,6 +71,25 @@ def pick(outdir, label):
     return locked(cd_path, _pick)
 
 
+#: A final reply this short that matches THROTTLE is a quota notice, not a report.
+THROTTLE_NOTICE_MAX = 200
+
+
+def attempt_succeeded(result, text):
+    """True when a ``cmd -p`` attempt finished with a usable report.
+
+    A ``success`` result with any non-empty final text counts, however short
+    ("PASS", a one-line verdict). Empty text, or a short reply that reads as a
+    throttle or quota notice, does not, so the launcher rotates models.
+    """
+    if not result or result.get("subtype") != "success":
+        return False
+    body = (text or "").strip()
+    if not body:
+        return False
+    return not (len(body) <= THROTTLE_NOTICE_MAX and THROTTLE.search(body))
+
+
 RESETS = re.compile(r"Resets in (?:(\d+)h)?\s*(?:(\d+)m)?", re.I)
 
 
@@ -150,7 +169,7 @@ def main():
         err_tail = open(os.path.join(outdir, f"err-{label}.log"), errors="replace").read()[-2000:]
         usage = (result or {}).get("usage") or {}
         text = (result or {}).get("finalText") or ""
-        ok = result and result.get("subtype") == "success" and len(text.strip()) > 40
+        ok = attempt_succeeded(result, text)
         status = "ok" if ok else ("throttled" if THROTTLE.search(tail + err_tail) else f"failed rc={rc}")
         record(outdir, [label, model, (result or {}).get("sessionId", "-"), start, int(time.time()),
                         usage.get("inputTokens", 0), usage.get("outputTokens", 0), status,
