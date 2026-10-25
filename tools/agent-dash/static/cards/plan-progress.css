@@ -66,6 +66,8 @@
 .dnode.g-done h4::after{content:" \2713";color:var(--good)}
 .dnode.g-now{border-color:var(--s1);box-shadow:0 0 0 3px color-mix(in srgb,var(--s1) 22%,transparent),0 6px 18px -8px color-mix(in srgb,var(--s1) 60%,transparent);animation:glow 2.4s ease-in-out infinite}
 .dnode.g-ready{border-style:dashed;border-color:var(--ink-2)}
+.dnode.is-planning{opacity:.75;border-style:dashed;border-color:var(--muted)}
+.planning-tag{display:inline-block;font:700 10px var(--mono);letter-spacing:.03em;padding:1px 6px;border-radius:999px;margin:0 0 4px;color:var(--muted);border:1px dashed var(--muted)}
 .gtag{float:right;font:700 10px var(--mono);letter-spacing:.03em;padding:2px 6px;border-radius:999px;margin-left:6px}
 .gtag.now{background:var(--accent,var(--s1));color:var(--accent-ink,#fff)}
 :root[data-theme="light"] .gtag.now{color:#fff;background:var(--accent-fill,var(--accent,var(--s1)))}

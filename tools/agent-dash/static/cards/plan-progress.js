@@ -265,6 +265,8 @@
     }
     var taskById = {};
     plan.groups.forEach(function (g) { (g.tasks || []).forEach(function (t) { taskById[t.id] = t; }); });
+    var planningIds = {};
+    (plan.groups || []).forEach(function (g) { if (g && g.phase === "planning") (g.tasks || []).forEach(function (t) { if (t && t.id != null) planningIds[t.id] = 1; }); });
     /* Chips the layout folds away (hidden done chips, deferred chips) stay
        out of the arrow router until their expander opens. */
     var foldedIds = {};
@@ -392,8 +394,9 @@
     function buildTile(g) {
       var cnt = groupCounts(g);
       var liveTotal = (g.tasks || []).length - (cnt.moved || 0) - (cnt.deferred || 0);
-      var n = el("div", {class: "dnode " + (liveTotal && cnt.done === liveTotal ? "s-done" : (cnt.done + cnt.prog + cnt.pr ? "s-prog" : ""))});
+      var n = el("div", {class: "dnode " + (liveTotal && cnt.done === liveTotal ? "s-done" : (cnt.done + cnt.prog + cnt.pr ? "s-prog" : "")) + (g && g.phase === "planning" ? " is-planning" : "")});
       n.appendChild(el("h4", {text: g.title}));
+      if (g && g.phase === "planning") n.appendChild(el("span", {class: "planning-tag", text: "Planning"}));
       var gr = 0, gv = 0; (g.tasks || []).forEach(function (t) { var a = att[t.id]; if (a) { gr += a.runs; gv += a.reviews; } });
       var left = liveTotal - cnt.done;
       n.appendChild(el("div", {class: "m", title: planSecTip(cnt, gr, gv)}, [el("b", {text: cnt.done + " of " + liveTotal}), " done" + (left ? " · " + left + " to go" : "")]));
@@ -428,7 +431,7 @@
       n.appendChild(ch);
       nodes[g.id] = n;
       gs[g.id] = {done: liveTotal > 0 && cnt.done === liveTotal, started: cnt.done + cnt.wip + cnt.prog + cnt.pr > 0, active: gLive > 0 || cnt.wip + cnt.prog + cnt.pr > 0, col: g.col, cnt: cnt, live: gLive, title: g.title};
-      if (cols[g.col]) { colStat[g.col] = colStat[g.col] || {done: 0, tot: 0, now: false}; colStat[g.col].done += cnt.done; colStat[g.col].tot += liveTotal; }
+      if (cols[g.col] && !(g && g.phase === "planning")) { colStat[g.col] = colStat[g.col] || {done: 0, tot: 0, now: false}; colStat[g.col].done += cnt.done; colStat[g.col].tot += liveTotal; }
       return n;
     }
     /* Slim tile for an all-done section when columns overflow: title, ✓N/N and
@@ -438,7 +441,7 @@
       var liveTotal = (g.tasks || []).length - (cnt.moved || 0) - (cnt.deferred || 0);
       var lg = LGroup[g.id] || {};
       var sum = lg.slim_summary || {done: cnt.done, total: liveTotal};
-      var b = el("button", {class: "slim-tile", title: (g.title || g.id) + " · all done (" + sum.done + " of " + sum.total + "); click to expand the chips in place"}, [el("b", {text: g.title || g.id}), el("span", {text: "✓" + sum.done + "/" + sum.total})]);
+      var b = el("button", {class: "slim-tile" + (g && g.phase === "planning" ? " is-planning" : ""), title: (g.title || g.id) + " · all done (" + sum.done + " of " + sum.total + "); click to expand the chips in place"}, [el("b", {text: g.title || g.id}), (g && g.phase === "planning" ? el("span", {class: "planning-tag", text: "Planning"}) : null), el("span", {text: "✓" + sum.done + "/" + sum.total})]);
       var mini = el("div", {class: "mini"}); var f = el("span"); f.style.width = "100%"; f.style.background = "var(--good)"; f.style.display = "block"; mini.appendChild(f); b.appendChild(mini);
       b.addEventListener("click", function (ev) {
         ev.stopPropagation();
@@ -448,7 +451,7 @@
       });
       nodes[g.id] = b;
       gs[g.id] = {done: true, started: true, active: false, col: g.col, cnt: cnt, live: 0, title: g.title};
-      if (cols[g.col]) { colStat[g.col] = colStat[g.col] || {done: 0, tot: 0, now: false}; colStat[g.col].done += cnt.done; colStat[g.col].tot += liveTotal; }
+      if (cols[g.col] && !(g && g.phase === "planning")) { colStat[g.col] = colStat[g.col] || {done: 0, tot: 0, now: false}; colStat[g.col].done += cnt.done; colStat[g.col].tot += liveTotal; }
       return b;
     }
     /* Status pill per section tile: where it stands and why. Skips slim tiles
@@ -500,7 +503,19 @@
       dag.appendChild(rail);
     }
     plan.groups.forEach(function (g) { paintStage(g); });
-    cols.forEach(function (d, i) { var cs = colStat[i]; if (!cs) return; var mb = el("div", {class: "colbar", title: planColbarTip(cs.done, cs.tot)}); var f = el("i"); f.style.width = (cs.tot ? 100 * cs.done / cs.tot : 0) + "%"; mb.appendChild(f); d.insertBefore(mb, d.children[1]); if (cs.now) d.classList.add("c-now"); });
+    cols.forEach(function (d, i) {
+      var colGroups = (plan.groups || []).filter(function (g) { return g && g.col === i && !foldedIdx[i]; });
+      var allPlanning = colGroups.length > 0 && colGroups.every(function (g) { return g.phase === "planning"; });
+      if (allPlanning && d) {
+        var dh = d.querySelector(".dcolh");
+        if (dh) dh.textContent = (plan.cols[i] || "") + " · planning · not counted";
+      }
+      var cs = colStat[i]; if (!cs) return;
+      var mb = el("div", {class: "colbar", title: planColbarTip(cs.done, cs.tot)});
+      var f = el("i"); f.style.width = (cs.tot ? 100 * cs.done / cs.tot : 0) + "%"; mb.appendChild(f);
+      d.insertBefore(mb, d.children[1]);
+      if (cs.now) d.classList.add("c-now");
+    });
     /* Overall progress comes from the server progress object, never recomputed here. */
     var pprog = plan.progress || {done: 0, total: 0, counts: {}, pct: 0};
     pprog.counts = pprog.counts || {};
@@ -758,7 +773,7 @@
     function rpTotal() { return (plan.progress && plan.progress.total) || 0; }
     function rpDoneAt(T) {
       var ids = Object.keys(RP.tasks), n = 0;
-      ids.forEach(function (id) { var t = RP.tasks[id]; if (t && t.status !== "deferred" && t.done_at != null && t.done_at <= T) n++; });
+      ids.forEach(function (id) { if (planningIds[id]) return; var t = RP.tasks[id]; if (t && t.status !== "deferred" && t.done_at != null && t.done_at <= T) n++; });
       return n;
     }
     /* ONE playhead time source for the map and the run timeline: both paint
@@ -904,6 +919,7 @@
       plan.groups.forEach(function (g) {
         var tot = 0, n = 0;
         g.tasks.forEach(function (t) {
+          if (planningIds[t.id]) return;
           if (t.status === "deferred" || t.status === "moved") return;
           var rt = RP.tasks[t.id];
           if (!rt) return;
@@ -918,6 +934,7 @@
         if (!els) return;
         var tot = 0, n = 0, wip = 0, liveN = 0, lastAct = -1, started = false;
         g.tasks.forEach(function (t) {
+          if (planningIds[t.id]) return;
           if (t.status === "deferred" || t.status === "moved") return;
           var rt = RP.tasks[t.id];
           if (!rt) return;

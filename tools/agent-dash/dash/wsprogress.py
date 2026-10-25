@@ -310,6 +310,17 @@ def build_wsprogress(store, ws: str, now: float | None = None) -> dict:
     _source, body = resolve_plan(ws)
     if not isinstance(body, dict):
         raise ReplayNotFound(ws)
+    planning_ids = set()
+    _groups = body.get("groups") if isinstance(body, dict) else None
+    if not isinstance(_groups, list):
+        _dag = body.get("dag") if isinstance(body, dict) else None
+        if isinstance(_dag, dict):
+            _groups = _dag.get("groups")
+    for _g in _groups or []:
+        if isinstance(_g, dict) and _g.get("phase") == "planning":
+            for _t in _g.get("tasks") or []:
+                if isinstance(_t, dict) and _t.get("id") not in (None, ""):
+                    planning_ids.add(str(_t["id"]))
     progress = body.get("progress") if isinstance(body, dict) else None
     if not isinstance(progress, dict):
         raise ReplayNotFound(ws)
@@ -326,6 +337,7 @@ def build_wsprogress(store, ws: str, now: float | None = None) -> dict:
         (item["done_at"], tid)
         for tid, item in tasks.items()
         if isinstance(item, dict) and item.get("done_at") is not None
+        and tid not in planning_ids
     )
     observed = int(replay.get("observed") or 0)
     inferred = int(replay.get("inferred") or 0)
@@ -337,6 +349,8 @@ def build_wsprogress(store, ws: str, now: float | None = None) -> dict:
         task = row.get("task")
         to = row.get("to")
         if not isinstance(task, str) or not isinstance(to, str):
+            continue
+        if task in planning_ids:
             continue
         chains.setdefault(task, []).append((float(row["ts"]), to))
         if to in ("prog", "pr", "done"):

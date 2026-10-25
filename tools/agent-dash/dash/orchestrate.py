@@ -75,6 +75,62 @@ def _groups_of(body: dict) -> list:
     return []
 
 
+def execution_body(body: dict) -> dict:
+    """A shallow copy of ``body`` with planning groups excluded.
+
+    Planning groups (``phase == "planning"``) are dropped from both the top-
+    level ``groups`` list and ``dag.groups``, and task ``deps`` lose any id
+    that belongs to a planning task, so those deps count as satisfied.
+    ``plan_tasks`` itself is unchanged; callers that schedule use this copy.
+    """
+    if not isinstance(body, dict):
+        return body
+    planning_ids: set[str] = set()
+    for group in _groups_of(body):
+        if isinstance(group, dict) and group.get("phase") == "planning":
+            for task in group.get("tasks") or []:
+                if isinstance(task, dict) and task.get("id") not in (None, ""):
+                    planning_ids.add(str(task["id"]))
+    out = dict(body)
+
+    def _filter(groups):
+        new_groups = []
+        for group in groups or []:
+            if not isinstance(group, dict):
+                new_groups.append(group)
+                continue
+            if group.get("phase") == "planning":
+                continue
+            new_group = dict(group)
+            tasks = group.get("tasks")
+            if isinstance(tasks, list):
+                new_tasks = []
+                for task in tasks:
+                    if not isinstance(task, dict):
+                        new_tasks.append(task)
+                        continue
+                    new_task = dict(task)
+                    raw = new_task.get("deps")
+                    if isinstance(raw, list):
+                        new_task["deps"] = [
+                            dep for dep in raw
+                            if not (isinstance(dep, str) and dep in planning_ids)
+                        ]
+                    new_tasks.append(new_task)
+                new_group["tasks"] = new_tasks
+            new_groups.append(new_group)
+        return new_groups
+
+    if isinstance(out.get("groups"), list):
+        out["groups"] = _filter(out["groups"])
+    dag = out.get("dag")
+    if isinstance(dag, dict) and isinstance(dag.get("groups"), list):
+        new_dag = dict(dag)
+        new_dag["groups"] = _filter(new_dag["groups"])
+        out["dag"] = new_dag
+    return out
+
+
 def plan_tasks(body: dict) -> tuple[dict, dict, list]:
     """(by_id, deps, order) for a plan body.
 
@@ -182,6 +238,7 @@ def ready_queue(body: dict, live_by_task: dict | None = None) -> list[dict]:
     task that names it. Each row carries what the task unblocks, its
     train, and the live run label when ``live_by_task`` maps it.
     """
+    body = execution_body(body)
     by_id, deps, _order = plan_tasks(body)
     stats = downstream_stats(by_id, deps)
     live = live_by_task or {}
@@ -214,6 +271,7 @@ def stalled_tasks(body: dict, live_by_task: dict | None = None) -> list[dict]:
     elsewhere; either way the lead should look. ``live_by_task`` maps task
     id to a live run label (empty or None means no live worker).
     """
+    body = execution_body(body)
     live = live_by_task or {}
     rows = []
     by_id, _deps, _order = plan_tasks(body)
@@ -236,6 +294,7 @@ def dep_jumps(body: dict, starts: dict, dones: dict) -> list[dict]:
     Pure: callers build the maps from history.jsonl, run starts, or
     replay moments.
     """
+    body = execution_body(body)
     by_id, deps, _order = plan_tasks(body)
     rows = []
     for tid in by_id:
@@ -318,6 +377,7 @@ def critical_path(body: dict, durations: dict | None = None) -> list[str]:
     plan order. Downstream-first: the path reads from the binding root to
     the last task it unblocks.
     """
+    body = execution_body(body)
     by_id, deps, _order = plan_tasks(body)
     if not by_id:
         return []
@@ -389,6 +449,7 @@ def overlaps(body: dict, only_ids: list[str] | set[str] | None = None) -> list[d
     compares every pair. Each row names both tasks and the witnessing
     glob pairs. Pure on declared footprints; inferred diffs join later.
     """
+    body = execution_body(body)
     by_id, _deps, order = plan_tasks(body)
     members = [tid for tid in order if only_ids is None or tid in only_ids]
     rows = []
@@ -414,6 +475,7 @@ def waves(body: dict) -> list[list[str]]:
     a declared file. Without ``files`` footprints a level is one wave.
     Done tasks keep their level so the shape stays stable as work lands.
     """
+    body = execution_body(body)
     by_id, deps, _order = plan_tasks(body)
     level: dict[str, int] = {}
     for tid in _topo_order(by_id, deps):
@@ -451,6 +513,7 @@ def max_parallel(body: dict) -> int:
 
 def plan_extra(body: dict, durations: dict | None = None) -> dict:
     """The ``/api/plan`` orchestration fields: ready, critical path, width."""
+    body = execution_body(body)
     ready = [row["id"] for row in ready_queue(body)]
     path = critical_path(body, durations)
     return {"ready": ready, "critical_path": path, "max_parallel": max_parallel(body)}
@@ -481,6 +544,7 @@ def stale_gates(body: dict, now: float | None = None) -> list[dict]:
     lists the sorted tasks that name the gate in ``deps``.
     """
     moment = time.time() if now is None else now
+    body = execution_body(body)
     by_id, deps, order = plan_tasks(body)
     downstream = _dependents_map(by_id, deps)
     rows = []
@@ -529,7 +593,8 @@ def deferred_ledger(bodies: dict[str, dict]) -> list[dict]:
     """
     rows = []
     for ws in sorted(bodies):
-        by_id, _deps, order = plan_tasks(bodies[ws])
+        body = execution_body(bodies[ws])
+        by_id, _deps, order = plan_tasks(body)
         for tid in order:
             task = by_id[tid]
             if task.get("status") != "deferred":
@@ -538,7 +603,8 @@ def deferred_ledger(bodies: dict[str, dict]) -> list[dict]:
             received_as = task.get("received_as") if isinstance(task.get("received_as"), str) else None
             received = None
             if moved and moved in bodies:
-                target_ids, _target_deps, _target_order = plan_tasks(bodies[moved])
+                target_body = execution_body(bodies[moved])
+                target_ids, _target_deps, _target_order = plan_tasks(target_body)
                 if received_as and received_as in target_ids:
                     received = received_as
                 else:
@@ -803,6 +869,7 @@ def inferred_overlaps(
     """
     from dash import taskmatch
 
+    body = execution_body(body)
     by_id, _deps, _order = plan_tasks(body)
     ws = body.get("ws") if isinstance(body.get("ws"), str) else None
     if ws is None and isinstance(body.get("workstream"), str):
@@ -1153,6 +1220,7 @@ def _idle_ready_share(store, ws: str | None, start: float, end: float, now: floa
         return None
     if not isinstance(body, dict):
         return None
+    body = execution_body(body)
     by_id, deps, _order = plan_tasks(body)
     done_at: dict[str, float | None] = {}
     for tid in by_id:

@@ -108,6 +108,25 @@ def progress_block(ws: str) -> str:
     return f'<div id="plan-progress" class="plan-progress" data-plan-progress data-ws="{esc(ws)}"></div>'
 
 
+def planning_block(data: dict) -> str:
+    groups = ((data.get("dag") or {}).get("groups") or []) if isinstance(data, dict) else []
+    parts = []
+    for group in groups:
+        if not isinstance(group, dict) or group.get("phase") != "planning":
+            continue
+        title = group.get("title")
+        tasks_html = "".join(
+            f'<div class="planning-task"><span class="planning-title">{esc(task.get("title"))}</span> '
+            f'<span class="planning-status">{esc(task.get("status"))}</span>'
+            + (f' <span class="planning-note">{esc(task.get("note"))}</span>' if isinstance(task.get("note"), str) and task.get("note") else "")
+            + "</div>"
+            for task in (group.get("tasks") or [])
+            if isinstance(task, dict)
+        )
+        parts.append(f'<div class="planning-group"><h3>{esc(title)}</h3>{tasks_html}</div>')
+    return "".join(parts)
+
+
 def agent_block(agent: dict) -> str:
     agent = agent or {}
     requirements = "".join(
@@ -178,6 +197,12 @@ def build(ws: str, data: dict, fragments: dict, layout: dict) -> str:
         lead=esc(narrative.get("end_state")),
     )
     body += sec(
+        f"{prefix}-planning",
+        "Planning",
+        "Planning",
+        planning_block(data),
+    )
+    body += sec(
         f"{prefix}-plan",
         "Plan",
         layout.get("plan_title") or "Plan",
@@ -185,11 +210,20 @@ def build(ws: str, data: dict, fragments: dict, layout: dict) -> str:
     )
     has_tasks = any((g.get("tasks") or []) for g in ((data.get("dag") or {}).get("groups") or []) if isinstance(g, dict))
     if has_tasks:
+        from dash import plans as _plans
+
+        _groups = ((data.get("dag") or {}).get("groups") or [])
+        _progress = _plans.plan_progress(_groups)
+        _progress_html = f'<p class="plan-progress-execution">Execution: {_progress["pct"]}%</p>'
+        if (_progress.get("planning") or {}).get("total", 0) > 0:
+            _p = _progress["planning"]
+            _progress_html += f'<p class="plan-progress-planning">Planning: {_p["done"]}/{_p["total"]} done (not counted)</p>'
+        _progress_html += progress_block(ws)
         body += sec(
             f"{prefix}-progress",
             "Progress",
             f"Where {ws} is",
-            progress_block(ws),
+            _progress_html,
             lead="A summary of the live plan. The full task map, with agents working on it now, is on the Execution view.",
         )
     body += sec(
