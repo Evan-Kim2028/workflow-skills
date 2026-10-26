@@ -155,6 +155,7 @@ class WsGcTest(unittest.TestCase):
         self.repos: list[Path] = []
         pr_patcher = mock.patch.object(wsgc, "pr_merged", return_value=False)
         pr_patcher.start()
+        self.pr_patcher = pr_patcher
         self.addCleanup(pr_patcher.stop)
         fetch_patcher = mock.patch.object(wsgc, "fetch_repo")
         self.fetch_mock = fetch_patcher.start()
@@ -505,6 +506,210 @@ class WsGcTest(unittest.TestCase):
         self.assertTrue(Path(path).exists())
         self.assertNotIn("warning", out.getvalue())
         self.assertIn("warning", err.getvalue())
+
+    def squash_merge_into_main(self, repo, branch):
+        """Squash-merge ``branch`` into main and move origin/main.
+
+        The branch tip stays off origin/main, like a GitHub squash
+        merge whose remote branch was deleted.
+        """
+        git(repo, "checkout", "main")
+        git(repo, "merge", "--squash", branch)
+        git(repo, "commit", "-m", "squash merge " + branch)
+        git(repo, "update-ref", "refs/remotes/origin/main", "HEAD")
+
+    def test_squash_merged_pr_removed(self):
+        """A squash-merged branch with a deleted remote is removed via its merged PR."""
+        repo = self._repo()
+        ws = "WS110"
+        make_bundle(ws, repo, [("T1", "train/ws110-one", [ws + ".1"])])
+        path = add_lane(repo, "ws110-one", "train/ws110-one")
+        commit_in(path, "lane.txt")
+        self.squash_merge_into_main(repo, "train/ws110-one")
+        with mock.patch.object(wsgc, "pr_merged", return_value=True):
+            _bundle_dir, _repos, preview = wsgc.collect(ws, fetch=False)
+            self.assertEqual(len(preview), 1)
+            self.assertEqual(preview[0]["action"], "remove")
+            self.assertIn("pull request merged", preview[0]["reason"])
+            self.assertEqual(cmd_ws(["gc", ws]), 0)
+        self.assertFalse(Path(path).exists())
+        # The tip is not an ancestor, so ``git branch -d`` refuses and
+        # the branch stays while the worktree goes.
+        self.assertNotEqual(git(repo, "branch", "--list", "train/ws110-one"), "")
+        rows = log_rows(ws)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["action"], "remove")
+        self.assertIn("removed worktree", rows[0]["reason"])
+        self.assertIn("refused", rows[0]["reason"])
+
+    def test_gh_failure_keeps(self):
+        """When the gh merge check cannot run, the worktree is kept fail-closed."""
+        repo = self._repo()
+        ws = "WS111"
+        make_bundle(ws, repo, [("T1", "train/ws111-one", [ws + ".1"])])
+        path = add_lane(repo, "ws111-one", "train/ws111-one")
+        commit_in(path, "lane.txt")
+        with mock.patch.object(wsgc, "pr_merged", return_value=None):
+            self.assertEqual(cmd_ws(["gc", ws]), 0)
+        self.assertTrue(Path(path).exists())
+        self.assertNotEqual(git(repo, "branch", "--list", "train/ws111-one"), "")
+        rows = log_rows(ws)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["action"], "keep")
+        self.assertEqual(rows[0]["reason"], "merge check did not run; kept")
+        with mock.patch.object(wsgc.shutil, "which", return_value=None):
+            self.assertIsNone(wsgc._gh_merged_head_shas(str(repo), "train/ws111-one"))
+
+    def test_pr_merged_sha_logic(self):
+        """pr_merged counts only merged PRs whose head contains the local tip."""
+        repo = self._repo()
+        git(repo, "checkout", "-b", "feature/sha")
+        (repo / "feat.txt").write_text("v1\n", encoding="utf-8")
+        git(repo, "add", ".")
+        git(repo, "commit", "-m", "feat v1")
+        tip = git(repo, "rev-parse", "feature/sha")
+        git(repo, "checkout", "-b", "feature/sha-child")
+        (repo / "child.txt").write_text("child\n", encoding="utf-8")
+        git(repo, "add", ".")
+        git(repo, "commit", "-m", "child commit")
+        child = git(repo, "rev-parse", "feature/sha-child")
+        git(repo, "checkout", "feature/sha")
+        bindir = self.case / "fakebin-sha"
+        bindir.mkdir(parents=True, exist_ok=True)
+        gh = bindir / "gh"
+        gh.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, os, sys\n"
+            "print(json.dumps([{\"number\": 7, \"headRefOid\": os.environ.get(\"GH_HEAD_SHA\", \"\")}]))\n",
+            encoding="utf-8",
+        )
+        gh.chmod(0o755)
+        real_pr = self.pr_patcher.temp_original
+        self.pr_patcher.stop()
+        try:
+            env = dict(os.environ, PATH=str(bindir) + ":" + os.environ.get("PATH", ""))
+            with mock.patch.dict(os.environ, env):
+                with mock.patch.dict(os.environ, {"GH_HEAD_SHA": tip}):
+                    self.assertTrue(real_pr(str(repo), "feature/sha"))
+                with mock.patch.dict(os.environ, {"GH_HEAD_SHA": child}):
+                    self.assertTrue(real_pr(str(repo), "feature/sha"))
+                with mock.patch.dict(os.environ, {"GH_HEAD_SHA": "0" * 40}):
+                    self.assertFalse(real_pr(str(repo), "feature/sha"))
+        finally:
+            self.pr_patcher.start()
+        faildir = self.case / "fakebin-fail"
+        faildir.mkdir(parents=True, exist_ok=True)
+        failgh = faildir / "gh"
+        failgh.write_text("#!/usr/bin/env python3\nimport sys\nsys.exit(1)\n", encoding="utf-8")
+        failgh.chmod(0o755)
+        self.pr_patcher.stop()
+        try:
+            env = dict(os.environ, PATH=str(faildir) + ":" + os.environ.get("PATH", ""))
+            with mock.patch.dict(os.environ, env):
+                self.assertIsNone(real_pr(str(repo), "feature/sha"))
+        finally:
+            self.pr_patcher.start()
+
+    def test_content_equal_fallback_removes(self):
+        """A squash merge without PR proof is removed when contents match origin/main."""
+        repo = self._repo()
+        ws = "WS112"
+        make_bundle(ws, repo, [("T1", "train/ws112-one", [ws + ".1"])])
+        path = add_lane(repo, "ws112-one", "train/ws112-one")
+        commit_in(path, "lane.txt")
+        self.squash_merge_into_main(repo, "train/ws112-one")
+        _bundle_dir, _repos, preview = wsgc.collect(ws, fetch=False)
+        self.assertEqual(len(preview), 1)
+        self.assertEqual(preview[0]["action"], "remove")
+        self.assertIn("branch content matches", preview[0]["reason"])
+        self.assertEqual(cmd_ws(["gc", ws]), 0)
+        self.assertFalse(Path(path).exists())
+        rows = log_rows(ws)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["action"], "remove")
+
+    def test_nested_worktrees_removed(self):
+        """Nested doctor worktrees under .worktrees/ are force-removed with the parent."""
+        repo = self._repo()
+        ws = "WS113"
+        make_bundle(ws, repo, [("T1", "train/ws113-one", [ws + ".1"])])
+        path = add_lane(repo, "ws113-one", "train/ws113-one")
+        (Path(path) / ".gitignore").write_text(".worktrees/\n", encoding="utf-8")
+        commit_in(path, "lane.txt")
+        merge_into_main(repo, "train/ws113-one")
+        self.assertEqual(bundles.set_task(ws, ws + ".1", "done", None, None), 0)
+        nested = Path(path) / ".worktrees" / "doctor-one"
+        git(repo, "worktree", "add", str(nested), "-b", "nested/doctor-one")
+        self.assertEqual(cmd_ws(["gc", ws]), 0)
+        self.assertFalse(Path(path).exists())
+        self.assertFalse(nested.exists())
+        listed = subprocess.run(
+            ["git", "-C", str(repo), "worktree", "list", "--porcelain"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        self.assertNotIn(str(nested), listed.stdout)
+        rows = log_rows(ws)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["action"], "remove")
+
+    def test_nested_worktree_failure_keeps(self):
+        """The parent is kept when a nested worktree removal fails."""
+        repo = self._repo()
+        ws = "WS114"
+        make_bundle(ws, repo, [("T1", "train/ws114-one", [ws + ".1"])])
+        path = add_lane(repo, "ws114-one", "train/ws114-one")
+        (Path(path) / ".gitignore").write_text(".worktrees/\n", encoding="utf-8")
+        commit_in(path, "lane.txt")
+        merge_into_main(repo, "train/ws114-one")
+        self.assertEqual(bundles.set_task(ws, ws + ".1", "done", None, None), 0)
+        ghost = str(Path(path) / ".worktrees" / "ghost")
+        with mock.patch.object(wsgc, "_nested_worktrees", return_value=[ghost]):
+            self.assertEqual(cmd_ws(["gc", ws]), 0)
+        self.assertTrue(Path(path).exists())
+        rows = log_rows(ws)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["action"], "keep")
+        self.assertIn("nested worktree remove refused", rows[0]["reason"])
+        self.assertIn("kept", rows[0]["reason"])
+
+    def test_regenerable_allowlist_entries(self):
+        """Every new allowlist entry is deleted first and the worktree removed."""
+        entries = [
+            ("parquet", "*.parquet\n", "api/tests/fixtures/pkmn_card_language_map.parquet"),
+            ("agent-results", "data/agent-results/\n", "data/agent-results/summary.json"),
+            ("sqlite", "*.sqlite\n", "data/state/session.sqlite"),
+            ("worktrees-file", ".worktrees/\n", ".worktrees/scratch.txt"),
+            ("venv", ".venv/\n", ".venv/bin/python"),
+            ("node-modules", "node_modules/\n", "node_modules/pkg/index.js"),
+            ("pytest-cache", ".pytest_cache/\n", ".pytest_cache/CACHEDIR.TAG"),
+            ("pycache", "__pycache__/\n", "pkg/__pycache__/mod.pyc"),
+            ("ruff", ".ruff_cache/\n", ".ruff_cache/CACHEDIR.TAG"),
+            ("mypy", ".mypy_cache/\n", ".mypy_cache/3.13/base.meta.json"),
+        ]
+        for index, (suffix, ignore, rel) in enumerate(entries):
+            with self.subTest(entry=suffix):
+                repo = self._repo()
+                ws = "WS%d" % (120 + index)
+                slug = "ws%d-one" % (120 + index)
+                branch = "train/ws%d-one" % (120 + index)
+                make_bundle(ws, repo, [("T1", branch, [ws + ".1"])])
+                path = add_lane(repo, slug, branch)
+                (Path(path) / ".gitignore").write_text(ignore, encoding="utf-8")
+                commit_in(path, "lane.txt")
+                merge_into_main(repo, branch)
+                self.assertEqual(bundles.set_task(ws, ws + ".1", "done", None, None), 0)
+                target = Path(path) / rel
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text("generated\n", encoding="utf-8")
+                self.assertEqual(cmd_ws(["gc", ws]), 0)
+                self.assertFalse(Path(path).exists(), "allowlist entry kept the worktree: " + suffix)
+                self.assertEqual(git(repo, "branch", "--list", branch), "")
+                rows = log_rows(ws)
+                self.assertEqual(len(rows), 1)
+                self.assertEqual(rows[0]["action"], "remove")
 
     def test_branch_delete_refusal_reported(self):
         """A refused ``git branch -d`` is reported on the row, never raised."""
