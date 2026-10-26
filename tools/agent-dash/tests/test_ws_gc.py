@@ -1,10 +1,16 @@
 """Automatic worktree cleanup for workstream lanes: temp git repos prove every case.
 
-Covers the six required cases on throwaway repos: a merged branch is
-removed, dirty and unpushed worktrees are kept, the main checkout is
-never touched, a ``ws task done`` status move triggers the gc,
-``--no-gc`` skips it, and ``--dry-run`` removes nothing. Never touches
-the live checkout.
+Covers the required cases on throwaway repos under one directory per
+test (no shared-temp globs, no home directory, no network: ``fetch``,
+``resolve_repos`` and ``pr_merged`` are patched out): a merged branch
+is removed, dirty, unpushed, ignored-file, and live-process worktrees
+are kept, an allowlisted ``.venv`` alone is deleted first and the
+worktree removed, a failed process scan keeps the worktree, the main
+checkout is never touched, a ``ws task done`` status move triggers the
+gc, a failing gc hook keeps the status change at exit 0 with the
+warning off stdout under ``--json``, a refused ``git branch -d`` is
+reported not raised, ``--no-gc`` skips the hook, and ``--dry-run``
+removes nothing and never fetches. Never touches the live checkout.
 """
 import os
 
@@ -13,7 +19,10 @@ os.environ.setdefault(
     "AGENT_DASH_WORKSTREAMS",
     os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "fixtures", "bundles"),
 )
+import contextlib
+import io
 import json
+import signal
 import subprocess
 import sys
 import tempfile
@@ -42,15 +51,31 @@ def git(repo, *args):
     return proc.stdout.strip()
 
 
-def make_repo():
-    """Temp repo on main with one commit and a local origin/main ref."""
-    repo = Path(tempfile.mkdtemp(prefix="dash-gc-src-"))
+def make_repo(parent):
+    """Temp repo under ``parent`` on main with one commit and a local origin/main ref."""
+    repo = Path(tempfile.mkdtemp(prefix="dash-gc-src-", dir=str(parent)))
     git(repo, "init", "-b", "main")
     (repo / "base.txt").write_text("base\n", encoding="utf-8")
     git(repo, "add", ".")
     git(repo, "commit", "-m", "base commit")
     git(repo, "update-ref", "refs/remotes/origin/main", "HEAD")
     return repo
+
+
+def fake_resolve_repos(ws, bundle_dir, repo_names):
+    """Only the bundle's own absolute ``repos`` entries. No home dir, no network."""
+    repos: list[str] = []
+    if bundle_dir is not None:
+        try:
+            meta = json.loads((bundle_dir / "bundle.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            meta = {}
+        entries = meta.get("repos") if isinstance(meta, dict) else None
+        if isinstance(entries, list):
+            for entry in entries:
+                if isinstance(entry, str) and os.path.isabs(entry):
+                    repos.append(os.path.realpath(entry))
+    return sorted(set(repos))
 
 
 def lane_path(repo, slug):
@@ -123,10 +148,20 @@ class WsGcTest(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.old = os.environ.get("AGENT_DASH_WORKSTREAMS")
         os.environ["AGENT_DASH_WORKSTREAMS"] = self.tmp.name
+        # One directory per test: every repo and lane path lives under it,
+        # so cleanup is just dropping the directory. No globs, no rm -rf.
+        self.case = Path(self.tmp.name) / self._testMethodName
+        self.case.mkdir(parents=True, exist_ok=True)
         self.repos: list[Path] = []
-        patcher = mock.patch.object(wsgc, "pr_merged", return_value=False)
-        patcher.start()
-        self.addCleanup(patcher.stop)
+        pr_patcher = mock.patch.object(wsgc, "pr_merged", return_value=False)
+        pr_patcher.start()
+        self.addCleanup(pr_patcher.stop)
+        fetch_patcher = mock.patch.object(wsgc, "fetch_repo")
+        self.fetch_mock = fetch_patcher.start()
+        self.addCleanup(fetch_patcher.stop)
+        resolve_patcher = mock.patch.object(wsgc, "resolve_repos", side_effect=fake_resolve_repos)
+        resolve_patcher.start()
+        self.addCleanup(resolve_patcher.stop)
         self.addCleanup(self._cleanup)
 
     def tearDown(self):
@@ -138,6 +173,8 @@ class WsGcTest(unittest.TestCase):
 
     def _cleanup(self):
         for repo in self.repos:
+            if not Path(repo).is_dir():
+                continue
             try:
                 listed = subprocess.run(
                     ["git", "-C", str(repo), "worktree", "list", "--porcelain"],
@@ -154,14 +191,9 @@ class WsGcTest(unittest.TestCase):
                     )
             except (OSError, subprocess.TimeoutExpired):
                 pass
-            subprocess.run(["rm", "-rf", str(repo)], check=False, timeout=30)
-            for child in repo.parent.glob("lor-wt-*"):
-                subprocess.run(["rm", "-rf", str(child)], check=False, timeout=30)
-            for child in repo.parent.glob("ws9*-plain"):
-                subprocess.run(["rm", "-rf", str(child)], check=False, timeout=30)
 
     def _repo(self):
-        repo = make_repo()
+        repo = make_repo(self.case)
         self.repos.append(repo)
         return repo
 
@@ -258,7 +290,7 @@ class WsGcTest(unittest.TestCase):
         self.assertEqual(by_path[os.path.realpath(first)]["action"], "remove")
 
     def test_dry_run_removes_nothing(self):
-        """``--dry-run`` lists the worktree, removes nothing, and logs nothing."""
+        """``--dry-run`` lists the worktree, removes nothing, fetches nothing, logs nothing."""
         repo = self._repo()
         ws = "WS95"
         make_bundle(ws, repo, [("T1", "train/ws95-one", [ws + ".1"])])
@@ -269,6 +301,10 @@ class WsGcTest(unittest.TestCase):
         self.assertEqual(cmd_ws(["gc", ws, "--dry-run"]), 0)
         self.assertTrue(Path(path).exists())
         self.assertNotEqual(git(repo, "branch", "--list", "train/ws95-one"), "")
+        self.fetch_mock.assert_not_called()
+        live, removable = wsgc.dry_run_summary(ws)
+        self.assertEqual((live, removable), (1, 1))
+        self.fetch_mock.assert_not_called()
         root = Path(self.tmp.name)
         self.assertFalse((root / ws / "worktree-gc.log").exists())
 
@@ -292,6 +328,127 @@ class WsGcTest(unittest.TestCase):
         self.assertTrue(Path(plain).exists())
         rows = log_rows(ws)
         self.assertTrue(any(row["action"] == "keep" and "slug convention" in row["reason"] for row in rows))
+
+    def test_ignored_nonallowlisted_kept(self):
+        """An ignored file outside the allowlist keeps the worktree."""
+        repo = self._repo()
+        ws = "WS97"
+        make_bundle(ws, repo, [("T1", "train/ws97-one", [ws + ".1"])])
+        path = add_lane(repo, "ws97-one", "train/ws97-one")
+        (Path(path) / ".gitignore").write_text("*.key\n", encoding="utf-8")
+        commit_in(path, "lane.txt")
+        merge_into_main(repo, "train/ws97-one")
+        self.assertEqual(bundles.set_task(ws, ws + ".1", "done", None, None), 0)
+        (Path(path) / "secret.key").write_text("s3cr3t\n", encoding="utf-8")
+        self.assertEqual(cmd_ws(["gc", ws]), 0)
+        self.assertTrue(Path(path).exists())
+        self.assertNotEqual(git(repo, "branch", "--list", "train/ws97-one"), "")
+        rows = log_rows(ws)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["action"], "keep")
+        self.assertIn("ignored files present", rows[0]["reason"])
+        self.assertIn("secret.key", rows[0]["reason"])
+
+    def test_allowlisted_venv_only_removed(self):
+        """An ignored ``.venv`` alone does not keep the worktree; it is deleted first."""
+        repo = self._repo()
+        ws = "WS98"
+        make_bundle(ws, repo, [("T1", "train/ws98-one", [ws + ".1"])])
+        path = add_lane(repo, "ws98-one", "train/ws98-one")
+        (Path(path) / ".gitignore").write_text(".venv/\n", encoding="utf-8")
+        commit_in(path, "lane.txt")
+        merge_into_main(repo, "train/ws98-one")
+        self.assertEqual(bundles.set_task(ws, ws + ".1", "done", None, None), 0)
+        venv_bin = Path(path) / ".venv" / "bin"
+        venv_bin.mkdir(parents=True)
+        (venv_bin / "python").write_text("binary\n", encoding="utf-8")
+        self.assertEqual(cmd_ws(["gc", ws]), 0)
+        self.assertFalse(Path(path).exists())
+        self.assertEqual(git(repo, "branch", "--list", "train/ws98-one"), "")
+        rows = log_rows(ws)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["action"], "remove")
+
+    def test_live_process_kept(self):
+        """A process sitting in the worktree keeps it."""
+        repo = self._repo()
+        ws = "WS99"
+        make_bundle(ws, repo, [("T1", "train/ws99-one", [ws + ".1"])])
+        path = add_lane(repo, "ws99-one", "train/ws99-one")
+        commit_in(path, "lane.txt")
+        merge_into_main(repo, "train/ws99-one")
+        self.assertEqual(bundles.set_task(ws, ws + ".1", "done", None, None), 0)
+        proc = subprocess.Popen(["sleep", "60"], cwd=str(path))
+        try:
+            self.assertEqual(cmd_ws(["gc", ws]), 0)
+            self.assertTrue(Path(path).exists())
+            self.assertNotEqual(git(repo, "branch", "--list", "train/ws99-one"), "")
+            rows = log_rows(ws)
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["action"], "keep")
+            self.assertIn("live worker", rows[0]["reason"])
+        finally:
+            os.kill(proc.pid, signal.SIGKILL)
+            proc.wait(timeout=30)
+
+    def test_process_check_failure_kept(self):
+        """When the process scan cannot run, the worktree is kept, not removed."""
+        repo = self._repo()
+        ws = "WS100"
+        make_bundle(ws, repo, [("T1", "train/ws100-one", [ws + ".1"])])
+        path = add_lane(repo, "ws100-one", "train/ws100-one")
+        commit_in(path, "lane.txt")
+        merge_into_main(repo, "train/ws100-one")
+        self.assertEqual(bundles.set_task(ws, ws + ".1", "done", None, None), 0)
+        with mock.patch.object(wsgc, "snapshot_processes", return_value=None):
+            self.assertEqual(cmd_ws(["gc", ws]), 0)
+        self.assertTrue(Path(path).exists())
+        self.assertNotEqual(git(repo, "branch", "--list", "train/ws100-one"), "")
+        rows = log_rows(ws)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["action"], "keep")
+        self.assertEqual(rows[0]["reason"], wsgc.LIVE_CHECK_FAILED)
+
+    def test_task_gc_failure_keeps_status(self):
+        """A failing gc hook keeps the status change at exit 0, warning off stdout under --json."""
+        repo = self._repo()
+        ws = "WS101"
+        make_bundle(ws, repo, [("T1", "train/ws101-one", [ws + ".1"])])
+        path = add_lane(repo, "ws101-one", "train/ws101-one")
+        commit_in(path, "lane.txt")
+        merge_into_main(repo, "train/ws101-one")
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(wsgc, "gc_after_task", side_effect=RuntimeError("boom")):
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                code = cmd_ws(["task", ws, ws + ".1", "done", "--json"])
+        self.assertEqual(code, 0)
+        self.assertEqual(wsgc.task_statuses(ws).get(ws + ".1"), "done")
+        self.assertTrue(Path(path).exists())
+        self.assertNotIn("warning", out.getvalue())
+        self.assertIn("warning", err.getvalue())
+
+    def test_branch_delete_refusal_reported(self):
+        """A refused ``git branch -d`` is reported on the row, never raised."""
+        repo = self._repo()
+        ws = "WS102"
+        make_bundle(ws, repo, [("T1", "train/ws102-one", [ws + ".1"])])
+        path = add_lane(repo, "ws102-one", "train/ws102-one")
+        commit_in(path, "lane.txt")
+        # Advance origin/main past main without moving main: the branch
+        # counts as merged, but ``git branch -d`` still refuses it.
+        git(repo, "checkout", "--detach")
+        git(repo, "merge", "--no-ff", "train/ws102-one", "-m", "merge train/ws102-one")
+        git(repo, "update-ref", "refs/remotes/origin/main", "HEAD")
+        git(repo, "checkout", "main")
+        self.assertEqual(bundles.set_task(ws, ws + ".1", "done", None, None), 0)
+        self.assertEqual(cmd_ws(["gc", ws]), 0)
+        self.assertFalse(Path(path).exists())
+        self.assertNotEqual(git(repo, "branch", "--list", "train/ws102-one"), "")
+        rows = log_rows(ws)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["action"], "remove")
+        self.assertIn("removed worktree", rows[0]["reason"])
+        self.assertIn("refused", rows[0]["reason"])
 
 
 if __name__ == "__main__":

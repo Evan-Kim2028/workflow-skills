@@ -2488,7 +2488,7 @@ def cmd_ws(argv: list[str]) -> int:
             live, removable = _wsgc.dry_run_summary(rest[0])
             errors.emit_human(f"worktrees: {live} live, {removable} removable", json_mode)
         except Exception as exc:
-            print(f"warning: worktree gc dry-run did not finish: {exc}", flush=True)
+            _say(f"warning: worktree gc dry-run did not finish: {exc}", json_mode)
         return 0
     if cmd == "task":
         if len(rest) < 3:
@@ -2526,7 +2526,7 @@ def cmd_ws(argv: list[str]) -> int:
                     live, removable = _wsgc.gc_after_task(rest[0])
                     errors.emit_human(f"worktrees: {live} live, {removable} removable", json_mode)
                 except Exception as exc:
-                    print(f"warning: worktree gc did not finish: {exc}; status change kept", flush=True)
+                    _say(f"warning: worktree gc did not finish: {exc}; status change kept", json_mode)
         return code
     if cmd == "gc":
         # --json is stripped into json_mode by the dispatcher above.

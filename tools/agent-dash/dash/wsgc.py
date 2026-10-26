@@ -13,11 +13,15 @@ into ``origin/main``, OR the branch's pull request is merged. Safety
 gates (all required): the main checkout is never touched; a path that
 does not match the workstream's slug convention is never touched; dirty
 worktrees are kept; branches with commits on no remote are kept unless
-merged; worktrees a live worker is using are kept. Removal uses
-``git worktree remove`` without ``--force`` followed by ``git worktree
-prune``; the local branch goes only via ``git branch -d`` (never
-``-D``), and only when merged. Every removal and every keep appends one
-line to ``<bundle>/worktree-gc.log``.
+merged; worktrees a live worker is using are kept; a worktree is kept
+when the live-process check itself cannot run. Ignored files keep a
+worktree too, except regenerable ones (``.venv/``, ``node_modules/``,
+caches, ``dist/``, ``build/``, ``*.egg-info/``), which are deleted
+first. Removal uses ``git worktree remove`` without ``--force``
+followed by ``git worktree prune``; the local branch goes only via
+``git branch -d`` (never ``-D``), and only when merged. Every removal
+and every keep appends one line to ``<bundle>/worktree-gc.log`` right
+after its own decision (nothing is logged on a dry run).
 
 Repos to scan come from every repo the bundle names (lane ``repo``
 fields in ``docs/execution-plan.json`` resolved under
@@ -40,26 +44,39 @@ from pathlib import Path
 
 from dash import errors
 
-WSGC_USAGE = """agent-dash workstream worktree cleanup
+FINISHED_TASK_STATUSES = ("prog", "done", "dropped", "deferred")
 
-  python3 agent_dash.py ws gc <ID> [--dry-run] [--json]
+REGENERABLE_IGNORED = (
+    ".venv/",
+    "node_modules/",
+    "__pycache__/",
+    ".pytest_cache/",
+    ".ruff_cache/",
+    ".mypy_cache/",
+    ".pyright/",
+    "dist/",
+    "build/",
+    "*.egg-info/",
+)
+"""Ignored paths that never keep a worktree; they are deleted first.
 
-Removes finished lane worktrees for one workstream. Finished means every
-task mapped to the branch is prog, done, dropped or deferred, or the
-branch is merged into origin/main, or its pull request is merged.
-Dry-run by default? No: without --dry-run it removes; --dry-run only
-lists what would go. Every removal and every keep is appended to
-<bundle>/worktree-gc.log (nothing is logged on a dry run).
+Every entry is a directory name (``*.egg-info/`` matches any
+``<name>.egg-info`` directory). A match at any depth counts: tool
+caches, environments and build outputs are regenerable wherever they
+sit. Anything ignored that matches none of these keeps the worktree.
 """
 
-FINISHED_TASK_STATUSES = ("prog", "done", "dropped", "deferred")
+_REGENERABLE_NAMES = frozenset(
+    entry[:-1] for entry in REGENERABLE_IGNORED if entry.endswith("/") and "*" not in entry
+)
+
+LIVE_CHECK_FAILED = "live-process check did not run; kept"
 GC_TRIGGER_STATUSES = ("prog", "done", "dropped")
 
 GIT_TIMEOUT_S = 30
 GH_TIMEOUT_S = 15
 PS_TIMEOUT_S = 10
 FETCH_TIMEOUT_S = 60
-MAX_PIDS = 4096
 
 
 def ws_number(ws: str) -> str:
@@ -444,8 +461,68 @@ def has_unpushed(repo: str, branch: str) -> bool:
         return True
 
 
+def _ignored_is_regenerable(rel: str) -> bool:
+    """True when an ignored path is a regenerable cache, env, or build output."""
+    parts = [part for part in rel.replace("\\", "/").split("/") if part not in ("", ".")]
+    for part in parts:
+        if part in _REGENERABLE_NAMES or part.endswith(".egg-info"):
+            return True
+    return False
+
+
+def _ignored_paths(path: str) -> list[str] | None:
+    """Ignored paths in the worktree, or None when the scan cannot run."""
+    try:
+        proc = subprocess.run(
+            ["git", "-C", path, "status", "--porcelain=v1", "--ignored=matching", "--untracked-files=all"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=GIT_TIMEOUT_S,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return None
+    found: list[str] = []
+    for line in (proc.stdout or "").splitlines():
+        if line.startswith("!!"):
+            rel = line[2:].strip()
+            if rel:
+                found.append(rel)
+    return found
+
+
+def _remove_regenerable(path: str, ignored: list[str]) -> None:
+    """Delete allowlisted ignored dirs so plain ``git worktree remove`` succeeds.
+
+    Only the outermost allowlisted directory of each ignored path goes;
+    anything outside the worktree is never touched. Never raises.
+    """
+    base = os.path.realpath(path)
+    targets: dict[str, None] = {}
+    for rel in ignored:
+        parts = [part for part in rel.replace("\\", "/").split("/") if part not in ("", ".")]
+        for index, part in enumerate(parts):
+            if part in _REGENERABLE_NAMES or part.endswith(".egg-info"):
+                targets[os.path.join(base, *parts[: index + 1])] = None
+                break
+    for target in targets:
+        try:
+            real = os.path.realpath(target)
+            if real != base and real.startswith(base + os.sep) and not os.path.islink(real):
+                shutil.rmtree(real, ignore_errors=True)
+        except OSError:
+            continue
+
+
 def is_dirty(path: str) -> tuple[bool, str]:
-    """(dirty, reason) from ``git status`` including untracked files."""
+    """(dirty, reason) from ``git status`` including untracked and ignored files.
+
+    Ignored files keep the worktree unless every one of them is a
+    regenerable cache, environment, or build output (see
+    :data:`REGENERABLE_IGNORED`).
+    """
     try:
         proc = subprocess.run(
             ["git", "-C", path, "status", "--porcelain=v1", "--untracked-files=all"],
@@ -460,76 +537,13 @@ def is_dirty(path: str) -> tuple[bool, str]:
         return True, "dirty worktree: git status failed"
     if (proc.stdout or "").strip():
         return True, "dirty, kept"
+    ignored = _ignored_paths(path)
+    if ignored is None:
+        return True, "dirty worktree: ignored-file scan did not finish"
+    foreign = [rel for rel in ignored if not _ignored_is_regenerable(rel)]
+    if foreign:
+        return True, "dirty, kept: ignored files present (" + foreign[0] + ")"
     return False, ""
-
-
-def _iter_pids() -> list[int]:
-    """Bounded pid list without /proc. Never raises."""
-    try:
-        entries = os.listdir("/proc")
-        pids = [int(name) for name in entries if name.isdigit()]
-        if pids:
-            return pids[:MAX_PIDS]
-    except OSError:
-        pass
-    try:
-        proc = subprocess.run(
-            ["ps", "-eo", "pid="],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=PS_TIMEOUT_S,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return []
-    if proc.returncode != 0:
-        return []
-    out: list[int] = []
-    for token in (proc.stdout or "").split():
-        try:
-            out.append(int(token))
-        except ValueError:
-            continue
-        if len(out) >= MAX_PIDS:
-            break
-    return out
-
-
-def _cwd_table(pids: list[int]) -> dict[int, str]:
-    """Pid to cwd map in as few calls as possible. Never raises."""
-    if os.path.isdir("/proc/1"):
-        table: dict[int, str] = {}
-        for pid in pids:
-            try:
-                table[pid] = os.path.realpath(os.readlink("/proc/" + str(pid) + "/cwd"))
-            except OSError:
-                continue
-        return table
-    try:
-        proc = subprocess.run(
-            ["lsof", "-d", "cwd", "-n", "-Fpn"],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=PS_TIMEOUT_S,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return {}
-    if proc.returncode != 0:
-        return {}
-    table = {}
-    pid = -1
-    for line in (proc.stdout or "").splitlines():
-        if line.startswith("p"):
-            try:
-                pid = int(line[1:])
-            except ValueError:
-                pid = -1
-        elif line.startswith("n") and pid > 0:
-            candidate = line[1:].strip()
-            if candidate:
-                table[pid] = os.path.realpath(candidate)
-    return table
 
 
 def _pid_alive(pid: int) -> bool:
@@ -542,29 +556,34 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
-def snapshot_processes() -> dict:
+def snapshot_processes() -> dict | None:
     """One process snapshot for the whole gc run: argv lines plus cwd map.
 
-    A single ``ps`` pass and a single cwd pass serve every worktree, so
-    a busy laptop pays the scan once instead of once per worktree.
-    Never raises.
+    A single pid pass, a single cwd pass, and a single command pass
+    serve every worktree, so a busy laptop pays the scan once instead
+    of once per worktree. Returns None when the scan cannot run, so
+    callers fail closed and keep the worktree. Never raises.
     """
+    from dash import worktrees as _worktrees
+
     try:
-        ps_proc = subprocess.run(
-            ["ps", "-axo", "pid,command"],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=PS_TIMEOUT_S,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        ps_proc = None
-    argv_lines = (ps_proc.stdout or "").splitlines()[1:] if ps_proc is not None and ps_proc.returncode == 0 else []
-    try:
-        cwds = _cwd_table(_iter_pids())
+        pids = _worktrees._proc_pids()
     except Exception:
-        cwds = {}
-    return {"argv": argv_lines, "cwds": cwds}
+        return None
+    if not pids:
+        return None
+    try:
+        cwds = _worktrees._cwd_table(pids)
+    except Exception:
+        cwds = None
+    try:
+        commands = _worktrees._command_table(pids)
+    except Exception:
+        commands = {}
+    if not cwds and not commands:
+        return None
+    argv_lines = [str(pid) + " " + cmd for pid, cmd in sorted(commands.items()) if cmd]
+    return {"argv": argv_lines, "cwds": dict(cwds or {})}
 
 
 def _pid_of_argv_line(line: str) -> tuple[int | None, str]:
@@ -580,11 +599,15 @@ def live_user_of(path: str, snap: dict | None = None) -> str:
     """Reason when a live process uses ``path``, else an empty string.
 
     Any running process whose cwd or argv contains the worktree path
-    blocks the gc. Argv is scanned with ``pgrep -fl <path>`` plus a
-    ``/proc``-free ``ps -axo pid,command`` pass; cwd comes from the
-    shared snapshot (``/proc`` when present, else one ``lsof`` pass).
-    Pass the run's :func:`snapshot_processes` result as ``snap`` to
-    reuse it; without one, a fresh snapshot is taken. Never raises.
+    blocks the gc. Argv is scanned with ``pgrep -fl <path>`` plus the
+    shared snapshot's command table; cwd comes from the shared snapshot
+    (``/proc`` when present, else one ``lsof`` pass from the reaper's
+    guards in :mod:`dash.worktrees`). Pass the run's
+    :func:`snapshot_processes` result as ``snap`` to reuse it; without
+    one, a fresh snapshot is taken. When the check itself cannot run --
+    ``pgrep``/``ps``/``lsof`` missing, timed out, or ``ps`` exiting
+    non-zero (``pgrep`` exit 1, no match, is normal) -- the worktree is
+    kept with :data:`LIVE_CHECK_FAILED`. Never raises.
     """
     mine = os.getpid()
     target = os.path.realpath(path)
@@ -598,23 +621,27 @@ def live_user_of(path: str, snap: dict | None = None) -> str:
             timeout=PS_TIMEOUT_S,
         )
     except (OSError, subprocess.TimeoutExpired):
-        proc = None
-    if proc is not None and proc.returncode == 0:
+        return LIVE_CHECK_FAILED
+    if proc.returncode == 0:
         for line in (proc.stdout or "").splitlines():
             pid, tail = _pid_of_argv_line(line)
             if pid is None or pid == mine or not _pid_alive(pid):
                 continue
             if any(needle in line for needle in needles):
                 return f"live worker holds the worktree (pid {pid}): {tail[:120]}"
+    elif proc.returncode != 1:
+        return LIVE_CHECK_FAILED
     try:
-        argv_lines: list[str] = list((snap or {}).get("argv") or [])
-        cwds: dict = dict((snap or {}).get("cwds") or {})
         if snap is None:
-            fresh = snapshot_processes()
-            argv_lines = fresh["argv"]
-            cwds = fresh["cwds"]
+            snap = snapshot_processes()
+            if snap is None:
+                return LIVE_CHECK_FAILED
+        elif snap.get("failed"):
+            return LIVE_CHECK_FAILED
+        argv_lines: list[str] = list(snap.get("argv") or [])
+        cwds: dict = dict(snap.get("cwds") or {})
     except Exception:
-        return ""
+        return LIVE_CHECK_FAILED
     for line in argv_lines:
         pid, tail = _pid_of_argv_line(line)
         if pid is None or pid == mine or not tail:
@@ -665,7 +692,7 @@ def decide(
         return row
     busy = live_user_of(path, snap)
     if busy:
-        row["reason"] = busy + "; kept"
+        row["reason"] = busy if busy == LIVE_CHECK_FAILED else busy + "; kept"
         return row
     key = branch.strip().lower()
     if key not in merged_cache:
@@ -701,11 +728,15 @@ def decide(
     return row
 
 
-def collect(ws: str, root: Path | None = None) -> tuple[Path | None, list[str], list[dict]]:
+def collect(
+    ws: str, root: Path | None = None, fetch: bool = True
+) -> tuple[Path | None, list[str], list[dict]]:
     """Bundle dir, scanned repos, and one decision row per worktree.
 
     Only worktrees whose branch belongs to the workstream produce rows;
-    unrelated worktrees are skipped silently and never logged.
+    unrelated worktrees are skipped silently and never logged. Pass
+    ``fetch=False`` for read-only callers (``--dry-run``, ``ws render``):
+    no ``git fetch`` runs, so nothing touches the network.
     """
     from dash import bundles as _bundles
     from dash import worktrees as _worktrees
@@ -717,9 +748,12 @@ def collect(ws: str, root: Path | None = None) -> tuple[Path | None, list[str], 
     repos = resolve_repos(ws, bundle_dir, repo_names)
     statuses = task_statuses(ws, root)
     snap = snapshot_processes()
+    if snap is None:
+        snap = {"failed": True, "argv": [], "cwds": {}}
     rows: list[dict] = []
     for repo in repos:
-        fetch_repo(repo)
+        if fetch:
+            fetch_repo(repo)
         top = _toplevel(repo)
         if top is None:
             continue
@@ -735,7 +769,17 @@ def collect(ws: str, root: Path | None = None) -> tuple[Path | None, list[str], 
 
 
 def remove_worktree(repo_top: str, path: str) -> tuple[bool, str]:
-    """``git worktree remove`` without force. Reports ok plus detail."""
+    """``git worktree remove`` without force. Reports ok plus detail.
+
+    Allowlisted ignored directories are deleted first: plain
+    ``git worktree remove`` sometimes refuses untracked-but-ignored
+    content, and these paths are regenerable.
+    """
+    ignored = _ignored_paths(path)
+    if ignored:
+        allowlisted = [rel for rel in ignored if _ignored_is_regenerable(rel)]
+        if allowlisted:
+            _remove_regenerable(path, allowlisted)
     proc = _run_git(repo_top, "worktree", "remove", path)
     if proc is None:
         return False, "git worktree remove did not finish"
@@ -788,8 +832,12 @@ def append_log(bundle_dir: Path, rows: list[dict], now: float | None = None) -> 
         print(f"worktree gc log not recorded: {exc}", file=sys.stderr)
 
 
-def apply_rows(rows: list[dict], dry_run: bool) -> list[dict]:
-    """Remove approved worktrees (and merged branches) unless dry-run."""
+def apply_rows(rows: list[dict], dry_run: bool, bundle_dir: Path | None = None) -> list[dict]:
+    """Remove approved worktrees (and merged branches) unless dry-run.
+
+    Every non-dry-run row is appended to ``<bundle>/worktree-gc.log``
+    right after its own decision; dry runs log nothing.
+    """
     if dry_run:
         for row in rows:
             if row.get("action") == "remove":
@@ -799,23 +847,27 @@ def apply_rows(rows: list[dict], dry_run: bool) -> list[dict]:
     for row in rows:
         if row.get("action") == "remove":
             by_repo.setdefault(str(row.get("repo", "")), []).append(row)
+        elif bundle_dir is not None:
+            append_log(bundle_dir, [row])
     for repo_top, repo_rows in by_repo.items():
         for row in repo_rows:
             ok, detail = remove_worktree(repo_top, str(row["path"]))
             if not ok:
                 row["action"] = "keep"
                 row["reason"] = detail
-                continue
-            branch = str(row.get("branch", ""))
-            merged, _why = merged_by_git(repo_top, branch)
-            if merged:
-                good, gone = delete_branch(repo_top, branch)
-                if good:
-                    row["reason"] = "removed worktree and deleted branch"
-                else:
-                    row["reason"] = "removed worktree; " + gone
             else:
-                row["reason"] = str(row.get("reason", "")) + "; removed worktree; branch kept (unmerged)"
+                branch = str(row.get("branch", ""))
+                merged, _why = merged_by_git(repo_top, branch)
+                if merged:
+                    good, gone = delete_branch(repo_top, branch)
+                    if good:
+                        row["reason"] = "removed worktree and deleted branch"
+                    else:
+                        row["reason"] = "removed worktree; " + gone
+                else:
+                    row["reason"] = str(row.get("reason", "")) + "; removed worktree; branch kept (unmerged)"
+            if bundle_dir is not None:
+                append_log(bundle_dir, [row])
     return rows
 
 
@@ -858,7 +910,7 @@ def cmd_gc(ws: str, dry_run: bool = False, json_mode: bool = False, root: Path |
         else:
             print(message, flush=True)
         return errors.NOT_FOUND
-    bundle_dir, repos, rows = collect(ws, root)
+    bundle_dir, repos, rows = collect(ws, root, fetch=not dry_run)
     if bundle_dir is None:
         message = errors.bundle_not_found(ws)
         if json_mode:
@@ -866,9 +918,7 @@ def cmd_gc(ws: str, dry_run: bool = False, json_mode: bool = False, root: Path |
         else:
             print(message, flush=True)
         return errors.NOT_FOUND
-    rows = apply_rows(rows, dry_run)
-    if not dry_run:
-        append_log(bundle_dir, rows)
+    rows = apply_rows(rows, dry_run, bundle_dir)
     live, removable = summarize(rows)
     if json_mode:
         errors.emit_json(
@@ -902,12 +952,11 @@ def gc_after_task(ws: str, root: Path | None = None) -> tuple[int, int]:
     if bundle_dir is None:
         raise ValueError(errors.bundle_not_found(ws))
     _dir, _repos, rows = collect(ws, root)
-    rows = apply_rows(rows, False)
-    append_log(bundle_dir, rows)
+    rows = apply_rows(rows, False, bundle_dir)
     return summarize(rows)
 
 
 def dry_run_summary(ws: str, root: Path | None = None) -> tuple[int, int]:
-    """``(live, removable)`` counts without removing or logging. Raises on failure."""
-    _dir, _repos, rows = collect(ws, root)
+    """``(live, removable)`` counts without removing, fetching, or logging. Raises on failure."""
+    _dir, _repos, rows = collect(ws, root, fetch=False)
     return summarize(rows)
