@@ -128,10 +128,13 @@
   }
 
   /* Pick a row (mouse click or Enter in the popover). Archived rows open
-     the Archive view. Planned rows open the Planned view, except from the
-     Plan view: there the picked workstream's own plan opens (its plan
-     bundle exists before it starts), and the view stays Plan. The rest
-     open their execution tab. */
+     the Archive view and select the row. Planned rows open the Planned
+     view and select the row, except from the Plan view: there the picked
+     workstream's own plan opens (its plan bundle exists before it
+     starts), and the view stays Plan. The rest open their execution tab.
+     selectTab is a no-op when the row is already selected, and selectView
+     is a no-op when already in the view, so picking from the target view
+     still moves the selection. */
   function pickWs(id, st) {
     closeSwitcher();
     var up = String(id).toUpperCase();
@@ -140,8 +143,10 @@
     var want = (st || (found && found.state) || "active");
     if (want === "archived") {
       if (state.view !== "archive") selectView("archive");
+      selectTab(up);
     } else if (want === "planned" && state.view !== "plan") {
       if (state.view !== "planned") selectView("planned");
+      selectTab(up);
     } else {
       if (typeof isProjectView === "function" && isProjectView()) selectView("exec");
       selectTab(up);

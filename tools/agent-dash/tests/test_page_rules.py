@@ -1690,8 +1690,10 @@ setTimeout(function () {
 
     def test_planned_pick_from_plan_view_opens_its_plan(self):
         """pickWs on a planned row opens that workstream's plan while the
-        view is Plan; from any other view it still opens the Planned shelf.
-        Source-level stubs: selectTab and selectView are recorded, not run."""
+        view is Plan; from any other view it opens the Planned shelf and
+        selects the row (archived rows likewise select into the Archive
+        view). Source-level stubs: selectTab and selectView are recorded,
+        not run."""
         script = (
             "const fs=require('fs');"
             "globalThis.window=globalThis;"
@@ -1712,10 +1714,11 @@ setTimeout(function () {
             "assert.strictEqual(state.view,'plan');"
             "assert.deepStrictEqual(run('plan','ws13',undefined),[['tab','WS13']]);"
             "assert.deepStrictEqual(run('plan','WS4','active'),[['tab','WS4']]);"
-            "assert.deepStrictEqual(run('plan','WS9','archived'),[['view','archive']]);"
-            "assert.deepStrictEqual(run('exec','WS13','planned'),[['view','planned']]);"
-            "assert.deepStrictEqual(run('project','WS13','planned'),[['view','planned']]);"
-            "assert.deepStrictEqual(run('planned','WS13','planned'),[]);"
+            "assert.deepStrictEqual(run('plan','WS9','archived'),[['view','archive'],['tab','WS9']]);"
+            "assert.deepStrictEqual(run('exec','WS13','planned'),[['view','planned'],['tab','WS13']]);"
+            "assert.deepStrictEqual(run('project','WS13','planned'),[['view','planned'],['tab','WS13']]);"
+            "assert.deepStrictEqual(run('planned','WS13','planned'),[['tab','WS13']]);"
+            "assert.deepStrictEqual(run('archive','WS9','archived'),[['tab','WS9']]);"
             "assert.deepStrictEqual(run('exec','WS4','active'),[['tab','WS4']]);"
         )
         proc = subprocess.run(
