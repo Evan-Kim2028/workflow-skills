@@ -166,6 +166,18 @@ class SandboxResolutionTests(unittest.TestCase):
         self.assertEqual(mode, "danger-full-access")
         self.assertIn("config", source)
 
+    def test_table_keys_do_not_count_as_top_level(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            self._write_config(tmp, '[profiles.full]\nsandbox_mode = "danger-full-access"\n')
+            env = {"CODEX_HOME": tmp}
+            with mock.patch.dict(os.environ, env, clear=False):
+                os.environ.pop("AGENT_DASH_CODEX_SANDBOX", None)
+                mode, source = launch.codex_sandbox_with_source()
+        self.assertEqual(mode, "workspace-write")
+        self.assertEqual(source, "default")
+
     def test_invalid_config_falls_back_to_default(self):
         import tempfile
 

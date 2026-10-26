@@ -222,14 +222,16 @@ def codex_config_path() -> Path:
 def codex_config_value(path, key: str) -> str | None:
     """One top-level string value from a Codex ``config.toml``, or None.
 
-    A small ``key = "value"`` scan, not a TOML parser: enough for the
-    launcher's flat keys (``sandbox_mode``, ``model``,
+    A small ``key = "value"`` scan, not a TOML parser: only keys before
+    the first ``[table]`` header count, so a profile's ``sandbox_mode``
+    never leaks into the default. Enough for the launcher's flat keys (``sandbox_mode``, ``model``,
     ``model_reasoning_effort``) without a new dependency.
     """
     try:
         text = Path(path).read_text(encoding="utf-8")
     except OSError:
         return None
+    text = re.split(r"^\s*\[", text, maxsplit=1, flags=re.M)[0]
     for quote in ('"', "'"):
         match = re.search(rf'^{re.escape(key)}\s*=\s*{quote}([^"\']*){quote}', text, re.M)
         if match:

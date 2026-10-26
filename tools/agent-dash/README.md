@@ -94,7 +94,10 @@ usage, so tokens land on the labelled run exactly once.
 Sandbox: the effective `-s` mode resolves as
 `AGENT_DASH_CODEX_SANDBOX`, else the `sandbox_mode` from the Codex
 config (`$CODEX_HOME/config.toml` or `~/.codex/config.toml`) when it
-is a valid mode, else `workspace-write`. Worker runs that create git
+is a valid mode (top-level keys only), else `workspace-write`. The
+config fallback mirrors what an interactive `codex` run on the same
+machine would use, so a headless worker never gets more access than
+the owner already configured. Worker runs that create git
 worktrees, commit, ssh to hosts, or use the network need
 `danger-full-access`: under `workspace-write` they end BLOCKED at the
 first git/ssh step (`Operation not permitted`), and the stderr summary
