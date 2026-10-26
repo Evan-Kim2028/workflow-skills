@@ -145,6 +145,8 @@ Production updates go out fastest when every merge is small in CI time, not in s
 
   `prog` never means "in progress".
 
+  Lanes' worktrees are removed automatically by `ws gc` when their task reaches prog/done or their branch merges; leads never `rm -rf` a worktree. `ws task` to prog, done or dropped runs the gc for that workstream (`--no-gc` skips it), and `ws render` ends with a dry-run summary (`worktrees: N live, M removable`).
+
 ### Merge trains on the dashboard
 
 The plan's `trains` list is the only source of truth. It is provisional at planning time; the lead re-cuts it as member diffs land. The schema is one object per train: `id` (machine key, unique), `title` (plain phrase, leads), optional `branch` (starts with `train/`), `members` (task ids, at most 8, each in one train at most), `status`, optional `pr`, `shared_files`, `gate`, and `note`.

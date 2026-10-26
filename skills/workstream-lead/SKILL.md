@@ -121,4 +121,5 @@ python3 tools/agent-dash/agent_dash.py ws archive <ID>
 
 - **Name things, not numbers:** in anything written for the owner, put a short phrase first; the number can follow in parentheses.
 - **Use the repo's local scoped tests and merge tool.** Never wait on remote CI to prove a change.
+- **Never `rm -rf` a worktree.** Lanes' worktrees are removed automatically by `ws gc` when their task reaches prog/done or their branch merges; the lead only merges.
 - **The owner's instructions in the session win** over the brief when they differ.
