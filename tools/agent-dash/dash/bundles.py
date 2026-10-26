@@ -63,7 +63,8 @@ WS_USAGE = """agent-dash workstream bundles
   python3 agent_dash.py ws restore <ID>
   python3 agent_dash.py ws validate <ID>
   python3 agent_dash.py ws render <ID>
-  python3 agent_dash.py ws task <ID> <task-id> <status> [--moved-to WSn] [--note "..."] [--force]
+  python3 agent_dash.py ws task <ID> <task-id> <status> [--moved-to WSn] [--note "..."] [--force] [--no-gc]
+  python3 agent_dash.py ws gc <ID> [--dry-run] [--json]
   python3 agent_dash.py ws train <ID> <train-id> [--title T] [--branch B] [--status S] [--add id,id] [--remove id,id] [--pr N] [--shared f1,f2] [--gate "..."] [--note "..."]
   python3 agent_dash.py ws trains <ID> [--json]
   python3 agent_dash.py ws plan <ID> [--json]
@@ -83,6 +84,7 @@ WS_USAGE = """agent-dash workstream bundles
   python3 agent_dash.py ws linear logout
 
 Status is todo, wip, pr, prog, done, or deferred. deferred may set --moved-to and --note.
+`ws task` to prog, done or dropped runs the finished-lane worktree gc afterwards (best effort; --no-gc skips it). `ws gc` removes finished lane worktrees itself; --dry-run only lists them.
 Workstream state is planned, active, paused, done, archived, or dropped (default active).
 `ws plan` lists the bundle's tasks (ids, titles, status, deps). `--json` prints
 machine JSON to stdout; with it, human text goes to stderr.
@@ -2480,6 +2482,13 @@ def cmd_ws(argv: list[str]) -> int:
             _say(f"render failed for {rest[0]}: {exc}. Run: python3 agent_dash.py ws validate {rest[0]}", json_mode)
             return errors.INVALID_DATA
         print(f"wrote {path / 'page.html'}")
+        try:
+            from dash import wsgc as _wsgc
+
+            live, removable = _wsgc.dry_run_summary(rest[0])
+            errors.emit_human(f"worktrees: {live} live, {removable} removable", json_mode)
+        except Exception as exc:
+            _say(f"warning: worktree gc dry-run did not finish: {exc}", json_mode)
         return 0
     if cmd == "task":
         if len(rest) < 3:
@@ -2488,6 +2497,7 @@ def cmd_ws(argv: list[str]) -> int:
         moved = None
         note = None
         force = False
+        no_gc = False
         flags = rest[3:]
         index = 0
         while index < len(flags):
@@ -2501,10 +2511,38 @@ def cmd_ws(argv: list[str]) -> int:
             elif flag == "--force":
                 force = True
                 index += 1
+            elif flag == "--no-gc":
+                no_gc = True
+                index += 1
             else:
                 print(WS_USAGE, end="", flush=True)
                 return 2
-        return set_task(rest[0], rest[1], rest[2], moved, note, force=force)
+        code = set_task(rest[0], rest[1], rest[2], moved, note, force=force)
+        if code == 0 and not no_gc:
+            from dash import wsgc as _wsgc
+
+            if rest[2] in _wsgc.GC_TRIGGER_STATUSES:
+                try:
+                    live, removable = _wsgc.gc_after_task(rest[0])
+                    errors.emit_human(f"worktrees: {live} live, {removable} removable", json_mode)
+                except Exception as exc:
+                    _say(f"warning: worktree gc did not finish: {exc}; status change kept", json_mode)
+        return code
+    if cmd == "gc":
+        # --json is stripped into json_mode by the dispatcher above.
+        if not rest or rest[0].startswith("-"):
+            print(WS_USAGE, end="", flush=True)
+            return errors.USAGE
+        dry_run = False
+        for flag in rest[1:]:
+            if flag == "--dry-run":
+                dry_run = True
+            else:
+                print(WS_USAGE, end="", flush=True)
+                return errors.USAGE
+        from dash import wsgc as _wsgc
+
+        return _wsgc.cmd_gc(rest[0], dry_run=dry_run, json_mode=json_mode)
     if cmd == "train":
         if len(rest) < 2:
             print(WS_USAGE, end="", flush=True)
