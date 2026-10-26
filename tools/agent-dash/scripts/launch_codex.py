@@ -2,6 +2,7 @@
 """Run one Codex (``codex exec``) headless worker.
 
 Usage: launch_codex.py <label> <workspace> <prompt_file> <outdir> [--model M] [--reasoning-effort E] [--tier T]
+       launch_codex.py --doctor [--check]
 
 Runs one labelled ``codex exec --ephemeral --json`` worker on the given
 model (default ``gpt-6-luna``) with the given reasoning effort (default
@@ -211,17 +212,82 @@ CODEX_SANDBOX_ENV = "AGENT_DASH_CODEX_SANDBOX"
 CODEX_SANDBOXES = ("read-only", "workspace-write", "danger-full-access")
 
 
-def codex_sandbox() -> str:
-    """Sandbox mode for headless runs: ``AGENT_DASH_CODEX_SANDBOX`` or workspace-write.
+def codex_config_path() -> Path:
+    """The Codex config file: ``$CODEX_HOME/config.toml`` or ``~/.codex/config.toml``."""
+    home = (os.environ.get("CODEX_HOME") or "").strip()
+    base = Path(home).expanduser() if home else Path.home()
+    return (base / "config.toml") if home else (base / ".codex" / "config.toml")
 
-    Workers that create git worktrees, commit, or ssh to hosts need
-    ``danger-full-access``; an unknown value falls back to the default.
+
+def codex_config_value(path, key: str) -> str | None:
+    """One top-level string value from a Codex ``config.toml``, or None.
+
+    A small ``key = "value"`` scan, not a TOML parser: only keys before
+    the first ``[table]`` header count, so a profile's ``sandbox_mode``
+    never leaks into the default. Enough for the launcher's flat keys (``sandbox_mode``, ``model``,
+    ``model_reasoning_effort``) without a new dependency.
     """
-    value = (os.environ.get(CODEX_SANDBOX_ENV) or "").strip()
-    return value if value in CODEX_SANDBOXES else "workspace-write"
+    try:
+        text = Path(path).read_text(encoding="utf-8")
+    except OSError:
+        return None
+    text = re.split(r"^\s*\[", text, maxsplit=1, flags=re.M)[0]
+    for quote in ('"', "'"):
+        match = re.search(rf'^{re.escape(key)}\s*=\s*{quote}([^"\']*){quote}', text, re.M)
+        if match:
+            return match.group(1).strip()
+    return None
 
 
-def build_argv(binary, workspace, out_path, model, effort):
+def codex_sandbox_with_source() -> tuple:
+    """Effective sandbox mode and where it came from.
+
+    Order: ``AGENT_DASH_CODEX_SANDBOX`` wins; else the ``sandbox_mode``
+    from the Codex config when it is a valid mode; else
+    ``workspace-write``. An unknown value at any level falls through to
+    the next one.
+    """
+    env_value = (os.environ.get(CODEX_SANDBOX_ENV) or "").strip()
+    if env_value in CODEX_SANDBOXES:
+        return env_value, f"env {CODEX_SANDBOX_ENV}"
+    path = codex_config_path()
+    config_value = codex_config_value(path, "sandbox_mode")
+    if config_value in CODEX_SANDBOXES:
+        return config_value, f"config {path}"
+    return "workspace-write", "default"
+
+
+def codex_sandbox() -> str:
+    """Sandbox mode for headless runs (see ``codex_sandbox_with_source``)."""
+    mode, _ = codex_sandbox_with_source()
+    return mode
+
+
+#: Markers that a workspace-write run was fenced in by its sandbox.
+_SANDBOX_DENIED_WORDS = (
+    "operation not permitted",
+    "network is unreachable",
+    "temporary failure",
+    "could not resolve host",
+    "failed to connect",
+    "connection refused",
+    "connection timed out",
+    "ssh:",
+)
+
+SANDBOX_HINT = (
+    "hint: workspace-write sandbox blocks git worktrees, commits, ssh and "
+    "network; retry with AGENT_DASH_CODEX_SANDBOX=danger-full-access"
+)
+
+
+def sandbox_hint_needed(text: str) -> bool:
+    """True when ``text`` looks like a sandbox denial under workspace-write."""
+    low = (text or "").lower()
+    return any(word in low for word in _SANDBOX_DENIED_WORDS)
+
+
+def build_argv(binary, workspace, out_path, model, effort, sandbox=None):
     """The exact headless codex command line (prompt travels on stdin)."""
     return [
         binary,
@@ -235,7 +301,7 @@ def build_argv(binary, workspace, out_path, model, effort):
         "-C",
         str(workspace),
         "-s",
-        codex_sandbox(),
+        sandbox or codex_sandbox(),
         "-c",
         'approval_policy="never"',
         "--skip-git-repo-check",
@@ -243,6 +309,53 @@ def build_argv(binary, workspace, out_path, model, effort):
         str(out_path),
         "-",
     ]
+
+
+def codex_version(binary: str) -> str:
+    """One-line ``codex --version`` output, or ``unknown``."""
+    try:
+        proc = subprocess.run(
+            [binary, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return "unknown"
+    line = (proc.stdout or proc.stderr or "").strip().splitlines()
+    return line[0].strip() if line and line[0].strip() else "unknown"
+
+
+def doctor_lines() -> list:
+    """Human-readable launcher checks. Prints only: never calls a model."""
+    binary = codex_binary()
+    path = codex_config_path()
+    sandbox, source = codex_sandbox_with_source()
+    try:
+        found = path.is_file()
+    except OSError:
+        found = False
+    lines = [
+        f"codex: {binary or 'not found on PATH'}",
+        f"version: {codex_version(binary) if binary else 'unknown'}",
+        f"model: {DEFAULT_MODEL}",
+        f"effort: {DEFAULT_EFFORT}",
+        f"config: {path} ({'found' if found else 'missing'})",
+        f"sandbox: {sandbox} (source: {source})",
+    ]
+    if sandbox == "workspace-write":
+        lines.append(
+            "warning: workspace-write sandbox blocks git worktrees, commits, "
+            "ssh and network; set AGENT_DASH_CODEX_SANDBOX=danger-full-access "
+            "for worker runs that need them."
+        )
+    return lines
+
+
+def run_doctor() -> int:
+    """Print the launcher checks and exit 0."""
+    print("\n".join(doctor_lines()))
+    return 0
 
 
 def usage_row(entry: dict) -> dict:
@@ -283,6 +396,8 @@ def usage_row(entry: dict) -> dict:
 
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
+    if any(token in ("--doctor", "--check", "doctor", "check") for token in argv):
+        return run_doctor()
     model = DEFAULT_MODEL
     effort = DEFAULT_EFFORT
     tier = None
@@ -341,6 +456,7 @@ def main(argv=None):
     final_path = out / f"out-{label}.md"
     stream = out / f"stream-{label}.jsonl"
     err = out / f"err-{label}.log"
+    sandbox, sandbox_source = codex_sandbox_with_source()
     started = int(time.time())
     run_id = f"running/{label}"
     (out / run_id).write_text(f"{os.getpid()}\t{model}", encoding="utf-8")
@@ -350,10 +466,13 @@ def main(argv=None):
         except OSError:
             pass
     with open(stream, "w") as so, open(err, "a") as se:
-        se.write(f"--- codex launch label {label} model {model} at {started}\n")
+        se.write(
+            f"--- codex launch label {label} model {model} "
+            f"sandbox {sandbox} (source: {sandbox_source}) at {started}\n"
+        )
         se.flush()
         rc = subprocess.run(
-            build_argv(binary, workspace, final_path, model, effort),
+            build_argv(binary, workspace, final_path, model, effort, sandbox),
             cwd=str(Path(workspace).expanduser()),
             input=prompt_bytes,
             stdout=so,
@@ -444,7 +563,22 @@ def main(argv=None):
         }
     )
     report_lines(state_dir(), lines)
-    print(f"launched codex {label} model {model} status {status} verdict {verdict}", file=sys.stderr)
+    print(
+        f"launched codex {label} model {model} sandbox {sandbox} "
+        f"(source: {sandbox_source}) status {status} verdict {verdict}",
+        file=sys.stderr,
+    )
+    if (
+        sandbox == "workspace-write"
+        and status != "done"
+        and sandbox_hint_needed(err_text + "\n" + raw.decode("utf-8", "replace"))
+    ):
+        try:
+            with open(err, "a", encoding="utf-8") as fh:
+                fh.write(SANDBOX_HINT + "\n")
+        except OSError:
+            pass
+        print(SANDBOX_HINT, file=sys.stderr)
     return 0 if status == "done" and rc == 0 else 1
 
 

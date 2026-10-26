@@ -95,7 +95,13 @@ class VerdictTests(unittest.TestCase):
 
 class ArgvTests(unittest.TestCase):
     def test_headless_command_line(self):
-        argv = launch.build_argv("codex", "/ws", Path("/out/report.md"), "gpt-6-luna", "xhigh")
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            env = {"CODEX_HOME": tmp}
+            with mock.patch.dict(os.environ, env, clear=False):
+                os.environ.pop("AGENT_DASH_CODEX_SANDBOX", None)
+                argv = launch.build_argv("codex", "/ws", Path("/out/report.md"), "gpt-6-luna", "xhigh")
         self.assertEqual(argv[:3], ["codex", "exec", "--ephemeral"])
         self.assertIn("--json", argv)
         self.assertEqual(argv[argv.index("-m") + 1], "gpt-6-luna")
@@ -112,8 +118,12 @@ class ArgvTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {"AGENT_DASH_CODEX_SANDBOX": "danger-full-access"}):
             argv = launch.build_argv("codex", "/ws", Path("/o.md"), "gpt-6-luna", "xhigh")
         self.assertEqual(argv[argv.index("-s") + 1], "danger-full-access")
-        with mock.patch.dict(os.environ, {"AGENT_DASH_CODEX_SANDBOX": "bogus"}):
-            argv = launch.build_argv("codex", "/ws", Path("/o.md"), "gpt-6-luna", "xhigh")
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            env = {"AGENT_DASH_CODEX_SANDBOX": "bogus", "CODEX_HOME": tmp}
+            with mock.patch.dict(os.environ, env, clear=False):
+                argv = launch.build_argv("codex", "/ws", Path("/o.md"), "gpt-6-luna", "xhigh")
         self.assertEqual(argv[argv.index("-s") + 1], "workspace-write")
 
     def test_label_prefix(self):
@@ -125,6 +135,146 @@ class ArgvTests(unittest.TestCase):
             launch.ensure_label_prefix("[label: ws1-plan-x]\ndo it\n", "ws1-plan-x"),
             "[label: ws1-plan-x]\ndo it\n",
         )
+
+
+class SandboxResolutionTests(unittest.TestCase):
+    def _write_config(self, directory, body):
+        path = Path(directory) / "config.toml"
+        path.write_text(body, encoding="utf-8")
+        return path
+
+    def test_env_wins_over_config(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            self._write_config(tmp, 'sandbox_mode = "read-only"\n')
+            env = {"AGENT_DASH_CODEX_SANDBOX": "danger-full-access", "CODEX_HOME": tmp}
+            with mock.patch.dict(os.environ, env, clear=False):
+                mode, source = launch.codex_sandbox_with_source()
+        self.assertEqual(mode, "danger-full-access")
+        self.assertIn("env", source)
+
+    def test_config_mode_used_when_env_absent(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            self._write_config(tmp, 'sandbox_mode = "danger-full-access"\n')
+            env = {"CODEX_HOME": tmp}
+            with mock.patch.dict(os.environ, env, clear=False):
+                os.environ.pop("AGENT_DASH_CODEX_SANDBOX", None)
+                mode, source = launch.codex_sandbox_with_source()
+        self.assertEqual(mode, "danger-full-access")
+        self.assertIn("config", source)
+
+    def test_table_keys_do_not_count_as_top_level(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            self._write_config(tmp, '[profiles.full]\nsandbox_mode = "danger-full-access"\n')
+            env = {"CODEX_HOME": tmp}
+            with mock.patch.dict(os.environ, env, clear=False):
+                os.environ.pop("AGENT_DASH_CODEX_SANDBOX", None)
+                mode, source = launch.codex_sandbox_with_source()
+        self.assertEqual(mode, "workspace-write")
+        self.assertEqual(source, "default")
+
+    def test_invalid_config_falls_back_to_default(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            self._write_config(tmp, 'sandbox_mode = "bogus"\n')
+            env = {"CODEX_HOME": tmp}
+            with mock.patch.dict(os.environ, env, clear=False):
+                os.environ.pop("AGENT_DASH_CODEX_SANDBOX", None)
+                mode, source = launch.codex_sandbox_with_source()
+        self.assertEqual(mode, "workspace-write")
+        self.assertEqual(source, "default")
+
+    def test_missing_config_falls_back_to_default(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            env = {"CODEX_HOME": tmp}
+            with mock.patch.dict(os.environ, env, clear=False):
+                os.environ.pop("AGENT_DASH_CODEX_SANDBOX", None)
+                mode, source = launch.codex_sandbox_with_source()
+        self.assertEqual(mode, "workspace-write")
+        self.assertEqual(source, "default")
+
+    def test_invalid_env_falls_through_to_config(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            self._write_config(tmp, 'sandbox_mode = "read-only"\n')
+            env = {"AGENT_DASH_CODEX_SANDBOX": "bogus", "CODEX_HOME": tmp}
+            with mock.patch.dict(os.environ, env, clear=False):
+                mode, source = launch.codex_sandbox_with_source()
+        self.assertEqual(mode, "read-only")
+        self.assertIn("config", source)
+
+    def test_argv_carries_resolved_sandbox(self):
+        argv = launch.build_argv(
+            "codex", "/ws", Path("/o.md"), "gpt-6-luna", "xhigh", "danger-full-access"
+        )
+        self.assertEqual(argv[argv.index("-s") + 1], "danger-full-access")
+
+
+class SandboxHintTests(unittest.TestCase):
+    def test_operation_not_permitted_triggers_hint(self):
+        self.assertTrue(launch.sandbox_hint_needed("Operation not permitted"))
+        self.assertTrue(launch.sandbox_hint_needed("ssh: connect to host failed"))
+        self.assertTrue(launch.sandbox_hint_needed("Could not resolve host example.com"))
+        self.assertTrue(launch.sandbox_hint_needed("Network is unreachable"))
+
+    def test_clean_output_needs_no_hint(self):
+        self.assertFalse(launch.sandbox_hint_needed("PASS\nbuilt it"))
+        self.assertFalse(launch.sandbox_hint_needed(""))
+
+
+class DoctorTests(unittest.TestCase):
+    def test_doctor_exits_zero_without_a_model(self):
+        import contextlib
+        import io
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            code = launch.main(["--doctor"])
+        self.assertEqual(code, 0)
+        out = buf.getvalue()
+        for needle in ("codex:", "version:", "model:", "effort:", "config:", "sandbox:"):
+            self.assertIn(needle, out)
+
+    def test_check_alias_matches_doctor(self):
+        import contextlib
+        import io
+
+        for flag in ("--check", "doctor", "check"):
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                code = launch.main([flag])
+            self.assertEqual(code, 0)
+            self.assertIn("sandbox:", buf.getvalue())
+
+    def test_doctor_warns_under_workspace_write(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            env = {"CODEX_HOME": tmp}
+            with mock.patch.dict(os.environ, env, clear=False):
+                os.environ.pop("AGENT_DASH_CODEX_SANDBOX", None)
+                lines = launch.doctor_lines()
+        self.assertTrue(any(line.startswith("sandbox: workspace-write") for line in lines))
+        self.assertTrue(any("warning:" in line for line in lines))
+
+    def test_doctor_names_env_source(self):
+        with mock.patch.dict(
+            os.environ, {"AGENT_DASH_CODEX_SANDBOX": "danger-full-access"}, clear=False
+        ):
+            lines = launch.doctor_lines()
+        self.assertTrue(
+            any("danger-full-access" in line and "env" in line for line in lines)
+        )
+        self.assertFalse(any("warning:" in line for line in lines))
 
 
 class MainTests(unittest.TestCase):
