@@ -313,8 +313,8 @@ def _cwd_table(pids: list[int]) -> dict[int, str] | None:
     return table
 
 
-def _command_table(pids: list[int]) -> dict[int, str]:
-    """Pid to command line map. Empty when no source answers. Never raises."""
+def _command_table(pids: list[int]) -> dict[int, str] | None:
+    """Pid to command line map. None when the source fails; never raises."""
     if _has_procfs():
         table = {}
         for pid in pids:
@@ -334,9 +334,9 @@ def _command_table(pids: list[int]) -> dict[int, str]:
             timeout=PS_TIMEOUT_S,
         )
     except (OSError, subprocess.TimeoutExpired):
-        return {}
+        return None
     if proc.returncode != 0:
-        return {}
+        return None
     table = {}
     for line in (proc.stdout or "").splitlines()[1:]:
         head, _, tail = line.strip().partition(" ")
@@ -361,8 +361,8 @@ def busy_map(paths: list[str]) -> dict[str, str]:
     try:
         commands = _command_table(pids)
     except Exception:
-        commands = {}
-    if cwds is None and not commands:
+        commands = None
+    if cwds is None or commands is None:
         return {path: "process scan could not run here" for path in paths}
     busy: dict[str, str] = {}
     for pid in pids:

@@ -33,7 +33,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from dash import bundles, wsgc
+from dash import bundles, worktrees, wsgc
 from dash.bundles import cmd_ws
 
 GIT_IDENTITY = ["-c", "user.name=agent-dash-test", "-c", "user.email=agent-dash-test@example.invalid"]
@@ -196,6 +196,17 @@ class WsGcTest(unittest.TestCase):
         repo = make_repo(self.case)
         self.repos.append(repo)
         return repo
+
+    def _finished_lane(self, ws):
+        """Create one clean, merged, finished lane eligible for gc."""
+        repo = self._repo()
+        branch = "train/" + ws.lower() + "-one"
+        make_bundle(ws, repo, [("T1", branch, [ws + ".1"])])
+        path = add_lane(repo, ws.lower() + "-one", branch)
+        commit_in(path, "lane.txt")
+        merge_into_main(repo, branch)
+        self.assertEqual(bundles.set_task(ws, ws + ".1", "done", None, None), 0)
+        return repo, path, branch
 
     def test_merged_branch_removed(self):
         """A finished, merged lane worktree is removed and its branch deleted."""
@@ -408,6 +419,51 @@ class WsGcTest(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["action"], "keep")
         self.assertEqual(rows[0]["reason"], wsgc.LIVE_CHECK_FAILED)
+
+    def test_cwd_source_failure_kept(self):
+        """A failed cwd scan keeps the worktree even when the command scan works."""
+        ws = "WS103"
+        repo, path, branch = self._finished_lane(ws)
+        pid = 123456
+        with mock.patch.object(worktrees, "_proc_pids", return_value=[pid]), \
+                mock.patch.object(worktrees, "_cwd_table", return_value=None), \
+                mock.patch.object(worktrees, "_command_table", return_value={pid: "sleep 60"}):
+            self.assertEqual(cmd_ws(["gc", ws]), 0)
+        self.assertTrue(Path(path).exists())
+        self.assertNotEqual(git(repo, "branch", "--list", branch), "")
+        rows = log_rows(ws)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["action"], "keep")
+        self.assertEqual(rows[0]["reason"], wsgc.LIVE_CHECK_FAILED)
+
+    def test_command_source_failure_kept(self):
+        """A failed command scan keeps the worktree even when cwd scanning works."""
+        ws = "WS104"
+        repo, path, branch = self._finished_lane(ws)
+        pid = 123456
+        with mock.patch.object(worktrees, "_proc_pids", return_value=[pid]), \
+                mock.patch.object(worktrees, "_cwd_table", return_value={pid: str(path)}), \
+                mock.patch.object(worktrees, "_command_table", return_value=None):
+            self.assertEqual(cmd_ws(["gc", ws]), 0)
+        self.assertTrue(Path(path).exists())
+        self.assertNotEqual(git(repo, "branch", "--list", branch), "")
+        rows = log_rows(ws)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["action"], "keep")
+        self.assertEqual(rows[0]["reason"], wsgc.LIVE_CHECK_FAILED)
+
+    def test_empty_successful_process_tables_do_not_block_gc(self):
+        """Successful empty cwd and command scans allow normal gc decisions."""
+        ws = "WS105"
+        _repo, path, _branch = self._finished_lane(ws)
+        with mock.patch.object(worktrees, "_proc_pids", return_value=[123456]), \
+                mock.patch.object(worktrees, "_cwd_table", return_value={}), \
+                mock.patch.object(worktrees, "_command_table", return_value={}):
+            self.assertEqual(cmd_ws(["gc", ws]), 0)
+        self.assertFalse(Path(path).exists())
+        rows = log_rows(ws)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["action"], "remove")
 
     def test_task_gc_failure_keeps_status(self):
         """A failing gc hook keeps the status change at exit 0, warning off stdout under --json."""

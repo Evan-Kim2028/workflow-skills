@@ -133,7 +133,7 @@ def bundle_branches(ws: str, root: Path | None = None) -> tuple[set[str], dict[s
     lane and train branches from ``docs/execution-plan.json``.
     ``branch_tasks`` maps each branch to its member task ids.
     ``repo_names`` holds the lane ``repo`` fields (short names like
-    ``lake-of-rage``), which :func:`resolve_repos` maps to checkouts.
+    ``my-repo``), which :func:`resolve_repos` maps to checkouts.
     """
     from dash import bundles as _bundles
 
@@ -579,8 +579,8 @@ def snapshot_processes() -> dict | None:
     try:
         commands = _worktrees._command_table(pids)
     except Exception:
-        commands = {}
-    if not cwds and not commands:
+        commands = None
+    if cwds is None or commands is None:
         return None
     argv_lines = [str(pid) + " " + cmd for pid, cmd in sorted(commands.items()) if cmd]
     return {"argv": argv_lines, "cwds": dict(cwds or {})}
