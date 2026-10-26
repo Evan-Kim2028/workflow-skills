@@ -9,15 +9,27 @@ bundle names -- a train's ``branch`` in ``plan.json``, a lane's
 
 A worktree is finished when every task mapped to its branch has status
 ``prog``, ``done``, ``dropped`` or ``deferred``, OR its branch is merged
-into ``origin/main``, OR the branch's pull request is merged. Safety
-gates (all required): the main checkout is never touched; a path that
-does not match the workstream's slug convention is never touched; dirty
+into ``origin/<default>``, OR the branch's pull request is merged. A
+branch counts as merged when ANY of: its tip is an ancestor of
+``origin/<default>``; ``gh`` reports a merged pull request for the
+branch whose head SHA equals the local tip (or contains it, so
+squash-merges whose tips never become ancestors still count); or every
+file the branch changed since its merge-base has identical content on
+``origin/<default>``. When the ``gh`` merge check itself cannot run the
+worktree is kept (``merge check did not run; kept``). Safety gates (all
+required): the main checkout is never touched; a path that does not
+match the workstream's slug convention is never touched; dirty
 worktrees are kept; branches with commits on no remote are kept unless
 merged; worktrees a live worker is using are kept; a worktree is kept
 when the live-process check itself cannot run. Ignored files keep a
 worktree too, except regenerable ones (``.venv/``, ``node_modules/``,
-caches, ``dist/``, ``build/``, ``*.egg-info/``), which are deleted
-first. Removal uses ``git worktree remove`` without ``--force``
+caches, ``dist/``, ``build/``, ``*.egg-info/``,
+``*/tests/fixtures/*.parquet`` test fixtures, ``data/agent-results/``,
+``data/state/*.sqlite``, ``.worktrees/`` nested doctor worktrees), which
+are deleted first. Nested worktrees registered under a lane's
+``.worktrees/`` directory are removed with ``git worktree remove
+--force`` before the parent; the parent is kept when a nested removal
+fails. Removal uses ``git worktree remove`` without ``--force``
 followed by ``git worktree prune``; the local branch goes only via
 ``git branch -d`` (never ``-D``), and only when merged. Every removal
 and every keep appends one line to ``<bundle>/worktree-gc.log`` right
@@ -73,18 +85,32 @@ REGENERABLE_IGNORED = (
     ".DS_Store",
     ".uv-cache/",
     ".codegraph/",
+    ".worktrees/",
+    "data/agent-results/",
+    "data/state/*.sqlite",
+    "*/tests/fixtures/*.parquet",
 )
 """Ignored paths that never keep a worktree; they are deleted first.
 
 Directory entries end in ``/``; entries without it match ignored file
-names. Patterns match a path component at any depth, so tool caches,
-environments, build outputs, and generated files are regenerable
-wherever they sit. Anything ignored that matches none of these keeps
-the worktree.
+names. Single-component patterns match a path component at any depth,
+so tool caches, environments, build outputs, and generated files are
+regenerable wherever they sit. Entries containing ``/`` match whole
+paths instead: ``data/agent-results/`` covers that subtree at any
+depth, ``data/state/*.sqlite`` covers sqlite files directly under a
+``data/state`` directory, and ``*/tests/fixtures/*.parquet`` covers
+generated test fixtures under any ``tests/fixtures`` directory. Only
+gitignored paths are ever considered. Anything ignored that matches
+none of these keeps the worktree.
 """
 
-_REGENERABLE_DIR_PATTERNS = tuple(entry[:-1] for entry in REGENERABLE_IGNORED if entry.endswith("/"))
-_REGENERABLE_FILE_PATTERNS = tuple(entry for entry in REGENERABLE_IGNORED if not entry.endswith("/"))
+_REGENERABLE_DIR_PATTERNS = tuple(
+    entry[:-1] for entry in REGENERABLE_IGNORED if entry.endswith("/") and "/" not in entry[:-1]
+)
+_REGENERABLE_FILE_PATTERNS = tuple(
+    entry for entry in REGENERABLE_IGNORED if not entry.endswith("/") and "/" not in entry
+)
+_REGENERABLE_PATH_PATTERNS = tuple(entry for entry in REGENERABLE_IGNORED if "/" in entry)
 
 LIVE_CHECK_FAILED = "live-process check did not run; kept"
 GC_TRIGGER_STATUSES = ("prog", "done", "dropped")
@@ -410,41 +436,89 @@ def task_statuses(ws: str, root: Path | None = None) -> dict[str, str]:
     return statuses
 
 
-def merged_by_git(repo: str, branch: str) -> tuple[bool, str]:
-    """True when ``branch`` is merged into ``origin/main``.
+def _default_origin_ref(repo: str) -> str:
+    """``origin/<default>`` ref name, falling back to ``origin/main``.
 
-    Either proof counts: the tip is an ancestor of ``origin/main``, or
-    ``git branch -r --contains`` names ``origin/main``. Runs after
-    :func:`fetch_repo`.
+    Reads ``refs/remotes/origin/HEAD`` first so repos whose default
+    branch is not ``main`` still resolve; verifies the candidate
+    exists before returning it.
     """
-    tip_proc = _run_git(repo, "rev-parse", "--verify", branch)
-    if tip_proc is None or tip_proc.returncode != 0:
+    proc = _run_git(repo, "symbolic-ref", "refs/remotes/origin/HEAD")
+    if proc is not None and proc.returncode == 0:
+        ref = (proc.stdout or "").strip()
+        if ref.startswith("refs/remotes/"):
+            candidate = ref[len("refs/remotes/"):]
+            verify = _run_git(repo, "rev-parse", "--verify", candidate)
+            if verify is not None and verify.returncode == 0:
+                return candidate
+    for candidate in ("origin/main", "origin/master"):
+        verify = _run_git(repo, "rev-parse", "--verify", candidate)
+        if verify is not None and verify.returncode == 0:
+            return candidate
+    return "origin/main"
+
+
+def _branch_tip(repo: str, branch: str) -> str | None:
+    """Branch tip sha, or None when the branch is gone or git cannot run."""
+    proc = _run_git(repo, "rev-parse", "--verify", branch)
+    if proc is None or proc.returncode != 0:
+        return None
+    tip = (proc.stdout or "").strip()
+    return tip or None
+
+
+def _is_ancestor(repo: str, tip: str, ref: str) -> bool:
+    """True when ``tip`` is an ancestor of ``ref``. Errors read as False."""
+    proc = _run_git(repo, "merge-base", "--is-ancestor", tip, ref)
+    return proc is not None and proc.returncode == 0
+
+
+def merged_by_git(repo: str, branch: str) -> tuple[bool, str]:
+    """True when ``branch`` is merged into ``origin/<default>``.
+
+    Either proof counts: the tip is an ancestor of the default remote
+    ref, or ``git branch -r --contains`` names it. Pure git: never
+    touches ``gh``. Runs after :func:`fetch_repo`.
+    """
+    ref = _default_origin_ref(repo)
+    tip = _branch_tip(repo, branch)
+    if tip is None:
         return False, "branch is gone from the repo"
-    tip = (tip_proc.stdout or "").strip()
-    if not tip:
-        return False, "branch is gone from the repo"
-    ancestor = _run_git(repo, "merge-base", "--is-ancestor", tip, "origin/main")
-    if ancestor is not None and ancestor.returncode == 0:
-        return True, "merged into origin/main"
+    if _is_ancestor(repo, tip, ref):
+        return True, "merged into " + ref
     contains = _run_git(repo, "branch", "-r", "--contains", branch)
     if contains is not None and contains.returncode == 0:
         remotes = (contains.stdout or "").split()
-        if any("origin/main" in item for item in remotes):
-            return True, "merged into origin/main"
-    return False, "tip is not an ancestor of origin/main (unmerged)"
+        if any(ref in item for item in remotes):
+            return True, "merged into " + ref
+    return False, "tip is not an ancestor of " + ref + " (unmerged)"
 
 
-def pr_merged(repo: str, branch: str) -> bool:
-    """True when ``gh`` reports a merged pull request for ``branch``.
+def _gh_merged_head_shas(repo: str, branch: str) -> list[str] | None:
+    """Head SHAs of merged PRs for ``branch``. None when gh cannot answer.
 
-    Silently False when ``gh`` is missing, the lookup fails, or the
-    pull request is not merged.
+    Runs ``gh pr list --state merged --head <branch>`` inside the repo
+    (equivalent to ``-R <repo>`` there) and returns the ``headRefOid``
+    values. None means ``gh`` is missing, errored, or gave unusable
+    output -- the caller must fail closed, never treat it as unmerged.
     """
     if shutil.which("gh") is None:
-        return False
+        return None
     try:
         proc = subprocess.run(
-            ["gh", "pr", "view", branch, "--json", "state"],
+            [
+                "gh",
+                "pr",
+                "list",
+                "--state",
+                "merged",
+                "--head",
+                branch,
+                "--json",
+                "headRefOid,number",
+                "--limit",
+                "10",
+            ],
             check=False,
             capture_output=True,
             text=True,
@@ -452,18 +526,114 @@ def pr_merged(repo: str, branch: str) -> bool:
             cwd=repo,
         )
     except (OSError, subprocess.TimeoutExpired):
-        return False
+        return None
     if proc.returncode != 0:
-        return False
+        return None
     try:
-        payload = json.loads(proc.stdout or "")
+        payload = json.loads(proc.stdout or "[]")
     except ValueError:
+        return None
+    if not isinstance(payload, list):
+        return None
+    shas: list[str] = []
+    for item in payload:
+        if isinstance(item, dict):
+            sha = item.get("headRefOid")
+            if isinstance(sha, str) and sha.strip():
+                shas.append(sha.strip())
+    return shas
+
+
+def pr_merged(repo: str, branch: str) -> bool | None:
+    """True when ``gh`` proves a squash-merge for ``branch``.
+
+    A merged pull request counts only when its head SHA equals the
+    local tip, or the local tip is an ancestor of that head (the local
+    checkout sat behind the merged head). False when ``gh`` answers
+    but no merged PR matches. None when ``gh`` is missing, errors, or
+    answers unusably -- callers fail closed on None and keep the
+    worktree with ``merge check did not run; kept``.
+    """
+    tip = _branch_tip(repo, branch)
+    if tip is None:
         return False
-    if isinstance(payload, dict):
-        return payload.get("state") == "MERGED"
-    if isinstance(payload, list):
-        return any(isinstance(item, dict) and item.get("state") == "MERGED" for item in payload)
+    shas = _gh_merged_head_shas(repo, branch)
+    if shas is None:
+        return None
+    for sha in shas:
+        if sha == tip:
+            return True
+        if _is_ancestor(repo, tip, sha):
+            return True
     return False
+
+
+def content_merged(repo: str, branch: str, origin_ref: str | None = None) -> bool:
+    """True when every file the branch changed matches ``origin/<default>``.
+
+    Finds the merge-base of the branch tip and the remote ref, lists
+    the files changed since that base, and checks
+    ``git diff --quiet <tip> <ref> -- <files>``. A squash merge
+    replays the same file contents under a new commit, so identical
+    contents prove the branch's work already landed even though its
+    tip never becomes an ancestor. Empty diffs and any git error read
+    as False (fail closed).
+    """
+    ref = origin_ref or _default_origin_ref(repo)
+    tip = _branch_tip(repo, branch)
+    if tip is None:
+        return False
+    verify = _run_git(repo, "rev-parse", "--verify", ref)
+    if verify is None or verify.returncode != 0:
+        return False
+    base_proc = _run_git(repo, "merge-base", tip, ref)
+    if base_proc is None or base_proc.returncode != 0:
+        return False
+    base = (base_proc.stdout or "").strip().splitlines()
+    base_sha = base[0].strip() if base else ""
+    if not base_sha:
+        return False
+    files_proc = _run_git(repo, "diff", "--name-only", base_sha, tip, "--")
+    if files_proc is None or files_proc.returncode != 0:
+        return False
+    files = [line for line in (files_proc.stdout or "").splitlines() if line.strip()]
+    if not files:
+        return False
+    diff_proc = _run_git(repo, "diff", "--quiet", tip, ref, "--", *files)
+    if diff_proc is None:
+        return False
+    return diff_proc.returncode == 0
+
+
+def is_merged(repo: str, branch: str) -> tuple[bool, str, bool]:
+    """Full merged verdict: ``(merged, reason, gh_failed)``.
+
+    ``merged`` is True when ANY of the proofs holds: the tip is an
+    ancestor of ``origin/<default>``, ``gh`` ties the tip to a merged
+    pull request, or the branch's changed files are content-identical
+    on ``origin/<default>``. ``gh_failed`` is True only when ``gh``
+    could not answer and no other proof held, so callers keep the
+    worktree with ``merge check did not run; kept``.
+    """
+    ref = _default_origin_ref(repo)
+    tip = _branch_tip(repo, branch)
+    if tip is None:
+        return False, "branch is gone from the repo", False
+    if _is_ancestor(repo, tip, ref):
+        return True, "merged into " + ref, False
+    contains = _run_git(repo, "branch", "-r", "--contains", branch)
+    if contains is not None and contains.returncode == 0:
+        remotes = (contains.stdout or "").split()
+        if any(ref in item for item in remotes):
+            return True, "merged into " + ref, False
+    pr = pr_merged(repo, branch)
+    if pr is True:
+        return True, "pull request merged for " + branch, False
+    if content_merged(repo, branch, ref):
+        return True, "branch content matches " + ref, pr is None
+    if pr is None:
+        return False, "merge check did not run; kept", True
+    return False, "tip is not an ancestor of " + ref + " (unmerged)", False
 
 
 def has_unpushed(repo: str, branch: str) -> bool:
@@ -494,9 +664,37 @@ def _regenerable_component_index(rel: str) -> int | None:
     return None
 
 
+def _path_pattern_candidates(pattern: str) -> set[str]:
+    """Match candidates for a slash-containing allowlist entry at any depth."""
+    text = pattern.strip("/")
+    options = {text, "*/" + text.lstrip("/")}
+    if text.startswith("*/"):
+        options.add(text[2:])
+    return options
+
+
 def _ignored_is_regenerable(rel: str) -> bool:
     """True when an ignored path is a regenerable cache, env, or build output."""
-    return _regenerable_component_index(rel) is not None
+    if _regenerable_component_index(rel) is not None:
+        return True
+    normalized = rel.replace("\\", "/")
+    stripped = normalized.strip("/")
+    if not stripped:
+        return False
+    for pattern in _REGENERABLE_PATH_PATTERNS:
+        if pattern.endswith("/"):
+            base = pattern.strip("/")
+            prefixes = {base, "*/" + base.lstrip("/")}
+            if base.startswith("*/"):
+                prefixes.add(base[2:])
+            for prefix in prefixes:
+                if stripped == prefix or fnmatch.fnmatchcase(stripped, prefix + "/*"):
+                    return True
+        else:
+            for candidate in _path_pattern_candidates(pattern):
+                if fnmatch.fnmatchcase(stripped, candidate):
+                    return True
+    return False
 
 
 def _ignored_paths(path: str) -> list[str] | None:
@@ -522,21 +720,74 @@ def _ignored_paths(path: str) -> list[str] | None:
     return found
 
 
+def _removal_target(base: str, rel: str) -> str | None:
+    """Absolute path to delete for one ignored ``rel``, or None.
+
+    Path-scoped allowlist entries resolve to their own span, never to a
+    broader ancestor: ``data/agent-results/...`` deletes the
+    ``agent-results`` subtree, ``data/state/*.sqlite`` and
+    ``tests/fixtures/*.parquet`` delete just the file. Everything else
+    deletes its outermost allowlisted component. Stays inside ``base``.
+    """
+    parts = [part for part in rel.replace("\\", "/").split("/") if part not in ("", ".")]
+    if not parts:
+        return None
+    for index in range(len(parts) - 1):
+        if parts[index] == "data" and parts[index + 1] == "agent-results":
+            target = os.path.abspath(os.path.join(base, *parts[: index + 2]))
+            return target if target.startswith(base + os.sep) else None
+    if parts[-1].endswith(".sqlite"):
+        for index in range(len(parts) - 1):
+            if parts[index] == "data" and parts[index + 1] == "state" and len(parts) > index + 2:
+                target = os.path.abspath(os.path.join(base, *parts))
+                return target if target.startswith(base + os.sep) else None
+    if parts[-1].endswith(".parquet"):
+        for index in range(len(parts) - 1):
+            if parts[index] == "tests" and parts[index + 1] == "fixtures" and len(parts) > index + 2:
+                target = os.path.abspath(os.path.join(base, *parts))
+                return target if target.startswith(base + os.sep) else None
+    index = _regenerable_component_index(rel)
+    if index is not None:
+        target = os.path.abspath(os.path.join(base, *parts[: index + 1]))
+        return target if target.startswith(base + os.sep) else None
+    return None
+
+
+def _nested_worktrees(repo_top: str, parent_path: str) -> list[str]:
+    """Nested worktrees registered under ``parent_path/.worktrees/``.
+
+    Deepest first so children go before parents. Empty when the
+    worktree list cannot run (callers fail closed on the parent).
+    """
+    proc = _run_git(repo_top, "worktree", "list", "--porcelain")
+    if proc is None or proc.returncode != 0:
+        return []
+    parent = os.path.realpath(parent_path)
+    prefix = parent + os.sep + ".worktrees" + os.sep
+    found: list[str] = []
+    for line in (proc.stdout or "").splitlines():
+        if line.startswith("worktree "):
+            candidate = os.path.realpath(line[len("worktree "):].strip())
+            if candidate.startswith(prefix):
+                found.append(candidate)
+    found.sort(key=len, reverse=True)
+    return found
+
+
 def _remove_regenerable(path: str, ignored: list[str]) -> None:
     """Delete allowlisted ignored paths so plain ``git worktree remove`` succeeds.
 
-    Only the outermost allowlisted path component of each ignored path
-    goes; anything outside the worktree is never touched. Never raises.
+    Only the allowlisted span of each ignored path goes (see
+    :func:`_removal_target`); anything outside the worktree is never
+    touched. ``.worktrees/`` leftovers delete here only after nested
+    worktrees were removed through git. Never raises.
     """
     base = os.path.realpath(path)
     targets: dict[str, None] = {}
     for rel in ignored:
-        parts = [part for part in rel.replace("\\", "/").split("/") if part not in ("", ".")]
-        index = _regenerable_component_index(rel)
-        if index is not None and parts:
-            target = os.path.abspath(os.path.join(base, *parts[: index + 1]))
-            if target.startswith(base + os.sep):
-                targets[target] = None
+        target = _removal_target(base, rel)
+        if target is not None:
+            targets[target] = None
     for target in targets:
         try:
             # Do not follow symlinks in a path leading to the matched
@@ -704,11 +955,19 @@ def decide(
     entry: dict,
     branch_tasks: dict[str, set[str]],
     statuses: dict[str, str],
-    merged_cache: dict[str, tuple[bool, str]],
-    pr_cache: dict[str, bool],
+    merged_cache: dict[str, tuple[bool, str, bool]],
+    pr_cache: dict[str, bool | None] | None = None,
     snap: dict | None = None,
 ) -> dict:
-    """One decision row for a worktree entry. Keeps on any doubt."""
+    """One decision row for a worktree entry. Keeps on any doubt.
+
+    Merge proof comes first: a branch merged by ancestor, by a
+    SHA-verified merged pull request, or by content equality skips the
+    unpushed gate, so squash-merges with deleted remotes are removed.
+    A ``gh`` check that cannot run keeps the worktree (``merge check
+    did not run; kept``) unless the bundle's finished tasks already
+    prove the lane done.
+    """
     path = entry.get("path", "")
     branch = entry.get("branch")
     row = {"repo": repo_top, "path": path, "branch": branch or "-", "action": "keep", "reason": ""}
@@ -736,11 +995,8 @@ def decide(
         return row
     key = branch.strip().lower()
     if key not in merged_cache:
-        merged_cache[key] = merged_by_git(repo_top, branch)
-    merged, merge_why = merged_cache[key]
-    if not merged and has_unpushed(repo_top, branch):
-        row["reason"] = "unpushed, kept"
-        return row
+        merged_cache[key] = is_merged(repo_top, branch)
+    merged, merge_why, gh_failed = merged_cache[key]
     mapped = sorted(branch_tasks.get(key, set()))
     if mapped:
         waiting = [tid for tid in mapped if statuses.get(tid, "todo") not in FINISHED_TASK_STATUSES]
@@ -748,15 +1004,17 @@ def decide(
     else:
         waiting = []
         tasks_done = False
-    if key not in pr_cache:
-        pr_cache[key] = pr_merged(repo_top, branch) if not merged else False
-    pull_done = pr_cache[key]
+    if not merged:
+        if gh_failed and not tasks_done:
+            row["reason"] = merge_why
+            return row
+        if has_unpushed(repo_top, branch):
+            row["reason"] = "unpushed, kept"
+            return row
     if tasks_done:
         why = "tasks finished (" + ",".join(mapped) + ")"
     elif merged:
         why = merge_why
-    elif pull_done:
-        why = "pull request merged for " + branch
     else:
         if mapped:
             row["reason"] = "waiting on tasks (" + ",".join(waiting) + "); kept"
@@ -797,8 +1055,8 @@ def collect(
         top = _toplevel(repo)
         if top is None:
             continue
-        merged_cache: dict[str, tuple[bool, str]] = {}
-        pr_cache: dict[str, bool] = {}
+        merged_cache: dict[str, tuple[bool, str, bool]] = {}
+        pr_cache: dict[str, bool | None] = {}
         for entry in _worktrees.list_worktrees(top):
             branch = entry.get("branch")
             if not belongs_to_ws(ws, branch, named):
@@ -811,10 +1069,22 @@ def collect(
 def remove_worktree(repo_top: str, path: str) -> tuple[bool, str]:
     """``git worktree remove`` without force. Reports ok plus detail.
 
-    Allowlisted ignored directories are deleted first: plain
+    Nested worktrees registered under ``.worktrees/`` go first via
+    ``git worktree remove --force``; the parent is kept when one
+    refuses. Allowlisted ignored paths are deleted next: plain
     ``git worktree remove`` sometimes refuses untracked-but-ignored
-    content, and these paths are regenerable.
+    content, and these paths are regenerable. Only gitignored paths
+    are ever deleted.
     """
+    for nested in _nested_worktrees(repo_top, path):
+        proc = _run_git(repo_top, "worktree", "remove", "--force", nested)
+        if proc is None:
+            return False, "nested worktree remove did not finish (" + nested + "); kept"
+        if proc.returncode != 0:
+            detail = (proc.stderr or "").strip().splitlines()
+            return False, "nested worktree remove refused (" + nested + "): " + (
+                detail[0] if detail else "unknown error"
+            ) + "; kept"
     ignored = _ignored_paths(path)
     if ignored:
         allowlisted = [rel for rel in ignored if _ignored_is_regenerable(rel)]
@@ -889,6 +1159,7 @@ def apply_rows(rows: list[dict], dry_run: bool, bundle_dir: Path | None = None) 
             by_repo.setdefault(str(row.get("repo", "")), []).append(row)
         elif bundle_dir is not None:
             append_log(bundle_dir, [row])
+    merged_verdicts: dict[str, dict[str, tuple[bool, str, bool]]] = {}
     for repo_top, repo_rows in by_repo.items():
         for row in repo_rows:
             ok, detail = remove_worktree(repo_top, str(row["path"]))
@@ -897,7 +1168,10 @@ def apply_rows(rows: list[dict], dry_run: bool, bundle_dir: Path | None = None) 
                 row["reason"] = detail
             else:
                 branch = str(row.get("branch", ""))
-                merged, _why = merged_by_git(repo_top, branch)
+                cache = merged_verdicts.setdefault(repo_top, {})
+                if branch not in cache:
+                    cache[branch] = is_merged(repo_top, branch)
+                merged, _why, _gh_failed = cache[branch]
                 if merged:
                     good, gone = delete_branch(repo_top, branch)
                     if good:
