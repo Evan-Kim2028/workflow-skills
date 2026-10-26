@@ -4,7 +4,7 @@ Covers the required cases on throwaway repos under one directory per
 test (no shared-temp globs, no home directory, no network: ``fetch``,
 ``resolve_repos`` and ``pr_merged`` are patched out): a merged branch
 is removed, dirty, unpushed, ignored-file, and live-process worktrees
-are kept, an allowlisted ``.venv`` alone is deleted first and the
+are kept, allowlisted generated output is deleted first and the
 worktree removed, a failed process scan keeps the worktree, the main
 checkout is never touched, a ``ws task done`` status move triggers the
 gc, a failing gc hook keeps the status change at exit 0 with the
@@ -340,17 +340,17 @@ class WsGcTest(unittest.TestCase):
         rows = log_rows(ws)
         self.assertTrue(any(row["action"] == "keep" and "slug convention" in row["reason"] for row in rows))
 
-    def test_ignored_nonallowlisted_kept(self):
-        """An ignored file outside the allowlist keeps the worktree."""
+    def test_ignored_secret_env_kept(self):
+        """An ignored ``secret.env`` outside the allowlist keeps the worktree."""
         repo = self._repo()
         ws = "WS97"
         make_bundle(ws, repo, [("T1", "train/ws97-one", [ws + ".1"])])
         path = add_lane(repo, "ws97-one", "train/ws97-one")
-        (Path(path) / ".gitignore").write_text("*.key\n", encoding="utf-8")
+        (Path(path) / ".gitignore").write_text("secret.env\n", encoding="utf-8")
         commit_in(path, "lane.txt")
         merge_into_main(repo, "train/ws97-one")
         self.assertEqual(bundles.set_task(ws, ws + ".1", "done", None, None), 0)
-        (Path(path) / "secret.key").write_text("s3cr3t\n", encoding="utf-8")
+        (Path(path) / "secret.env").write_text("s3cr3t\n", encoding="utf-8")
         self.assertEqual(cmd_ws(["gc", ws]), 0)
         self.assertTrue(Path(path).exists())
         self.assertNotEqual(git(repo, "branch", "--list", "train/ws97-one"), "")
@@ -358,7 +358,30 @@ class WsGcTest(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["action"], "keep")
         self.assertIn("ignored files present", rows[0]["reason"])
-        self.assertIn("secret.key", rows[0]["reason"])
+        self.assertIn("secret.env", rows[0]["reason"])
+
+    def test_nested_benchmarks_and_venv_removed(self):
+        """Nested benchmark output and a venv are deleted before removing the worktree."""
+        repo = self._repo()
+        ws = "WS106"
+        make_bundle(ws, repo, [("T1", "train/ws106-one", [ws + ".1"])])
+        path = add_lane(repo, "ws106-one", "train/ws106-one")
+        (Path(path) / ".gitignore").write_text(".benchmarks/\n.venv/\n", encoding="utf-8")
+        commit_in(path, "lane.txt")
+        merge_into_main(repo, "train/ws106-one")
+        self.assertEqual(bundles.set_task(ws, ws + ".1", "done", None, None), 0)
+        benchmark = Path(path) / "api" / ".benchmarks" / "x.json"
+        benchmark.parent.mkdir(parents=True)
+        benchmark.write_text("{}\n", encoding="utf-8")
+        venv_bin = Path(path) / ".venv" / "bin"
+        venv_bin.mkdir(parents=True)
+        (venv_bin / "python").write_text("binary\n", encoding="utf-8")
+        self.assertEqual(cmd_ws(["gc", ws]), 0)
+        self.assertFalse(Path(path).exists())
+        self.assertEqual(git(repo, "branch", "--list", "train/ws106-one"), "")
+        rows = log_rows(ws)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["action"], "remove")
 
     def test_allowlisted_venv_only_removed(self):
         """An ignored ``.venv`` alone does not keep the worktree; it is deleted first."""
