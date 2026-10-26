@@ -91,6 +91,35 @@ exhaustion, and appends `generic.jsonl` start/usage/finish lines (run id
 `codex:<session>:<label>`) parsed from the stream's `turn.completed`
 usage, so tokens land on the labelled run exactly once.
 
+Sandbox: the effective `-s` mode resolves as
+`AGENT_DASH_CODEX_SANDBOX`, else the `sandbox_mode` from the Codex
+config (`$CODEX_HOME/config.toml` or `~/.codex/config.toml`) when it
+is a valid mode, else `workspace-write`. Worker runs that create git
+worktrees, commit, ssh to hosts, or use the network need
+`danger-full-access`: under `workspace-write` they end BLOCKED at the
+first git/ssh step (`Operation not permitted`), and the stderr summary
+gains a one-line hint naming
+`AGENT_DASH_CODEX_SANDBOX=danger-full-access`. The launch header in
+`err-<label>.log` and the one-line stderr summary both name the
+effective mode and its source (`env`, `config`, or `default`).
+`launch_codex.py --doctor` (alias `--check`) prints the binary path
+and version, default model and effort, effective sandbox and source,
+and the config path read, with a warning under `workspace-write`; it
+never calls a model and exits 0.
+
+Smoke a Codex worker before real work with ten checks, all read-only
+except the worker's own run folder: repo fetch/log, language imports,
+one scoped test file, CodeGraph CLI, a database probe, an API probe,
+label check, plan validation, auth status, git identity and hooks. A
+run that fails the fetch, database, API, or auth checks with
+`Operation not permitted` or connection errors is fenced in by
+`workspace-write`; rerun with `danger-full-access`.
+
+A Codex run shows on the dashboard as one run row
+(`codex:<session>:<label>`), one usage row per assistant turn, and a
+finish line with the verdict; `parent_session_id` links it to the lead
+session that launched it.
+
 `scripts/run_worker.py` launches the `codex-luna` (kind `codex`, cap 3)
 and `pi-deepseek-flash` (kind `pi`, `river/deepseek-ai/DeepSeek-V4.1-Flash-1017`,
 cap 5) registry tiers through these launchers, and the `auto` fallback
