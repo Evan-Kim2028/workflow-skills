@@ -32,6 +32,7 @@ by the prefix convention under ``~/Documents/projects/``.
 
 from __future__ import annotations
 
+import fnmatch
 import json
 import os
 import re
@@ -57,18 +58,33 @@ REGENERABLE_IGNORED = (
     "dist/",
     "build/",
     "*.egg-info/",
+    ".benchmarks/",
+    ".hypothesis/",
+    ".coverage",
+    ".coverage.*",
+    "htmlcov/",
+    ".tox/",
+    ".nox/",
+    ".cache/",
+    ".turbo/",
+    ".next/",
+    "coverage/",
+    "*.pyc",
+    ".DS_Store",
+    ".uv-cache/",
+    ".codegraph/",
 )
 """Ignored paths that never keep a worktree; they are deleted first.
 
-Every entry is a directory name (``*.egg-info/`` matches any
-``<name>.egg-info`` directory). A match at any depth counts: tool
-caches, environments and build outputs are regenerable wherever they
-sit. Anything ignored that matches none of these keeps the worktree.
+Directory entries end in ``/``; entries without it match ignored file
+names. Patterns match a path component at any depth, so tool caches,
+environments, build outputs, and generated files are regenerable
+wherever they sit. Anything ignored that matches none of these keeps
+the worktree.
 """
 
-_REGENERABLE_NAMES = frozenset(
-    entry[:-1] for entry in REGENERABLE_IGNORED if entry.endswith("/") and "*" not in entry
-)
+_REGENERABLE_DIR_PATTERNS = tuple(entry[:-1] for entry in REGENERABLE_IGNORED if entry.endswith("/"))
+_REGENERABLE_FILE_PATTERNS = tuple(entry for entry in REGENERABLE_IGNORED if not entry.endswith("/"))
 
 LIVE_CHECK_FAILED = "live-process check did not run; kept"
 GC_TRIGGER_STATUSES = ("prog", "done", "dropped")
@@ -461,13 +477,26 @@ def has_unpushed(repo: str, branch: str) -> bool:
         return True
 
 
+def _regenerable_component_index(rel: str) -> int | None:
+    """Index of the first allowlisted component, respecting file/dir rules."""
+    normalized = rel.replace("\\", "/")
+    is_directory = normalized.endswith("/")
+    parts = [part for part in normalized.split("/") if part not in ("", ".")]
+    for index, part in enumerate(parts):
+        is_dir_component = index < len(parts) - 1 or is_directory
+        if is_dir_component:
+            if any(fnmatch.fnmatchcase(part, pattern) for pattern in _REGENERABLE_DIR_PATTERNS):
+                return index
+            if part.endswith(".egg-info"):
+                return index
+        elif any(fnmatch.fnmatchcase(part, pattern) for pattern in _REGENERABLE_FILE_PATTERNS):
+            return index
+    return None
+
+
 def _ignored_is_regenerable(rel: str) -> bool:
     """True when an ignored path is a regenerable cache, env, or build output."""
-    parts = [part for part in rel.replace("\\", "/").split("/") if part not in ("", ".")]
-    for part in parts:
-        if part in _REGENERABLE_NAMES or part.endswith(".egg-info"):
-            return True
-    return False
+    return _regenerable_component_index(rel) is not None
 
 
 def _ignored_paths(path: str) -> list[str] | None:
@@ -494,24 +523,35 @@ def _ignored_paths(path: str) -> list[str] | None:
 
 
 def _remove_regenerable(path: str, ignored: list[str]) -> None:
-    """Delete allowlisted ignored dirs so plain ``git worktree remove`` succeeds.
+    """Delete allowlisted ignored paths so plain ``git worktree remove`` succeeds.
 
-    Only the outermost allowlisted directory of each ignored path goes;
-    anything outside the worktree is never touched. Never raises.
+    Only the outermost allowlisted path component of each ignored path
+    goes; anything outside the worktree is never touched. Never raises.
     """
     base = os.path.realpath(path)
     targets: dict[str, None] = {}
     for rel in ignored:
         parts = [part for part in rel.replace("\\", "/").split("/") if part not in ("", ".")]
-        for index, part in enumerate(parts):
-            if part in _REGENERABLE_NAMES or part.endswith(".egg-info"):
-                targets[os.path.join(base, *parts[: index + 1])] = None
-                break
+        index = _regenerable_component_index(rel)
+        if index is not None and parts:
+            target = os.path.abspath(os.path.join(base, *parts[: index + 1]))
+            if target.startswith(base + os.sep):
+                targets[target] = None
     for target in targets:
         try:
-            real = os.path.realpath(target)
-            if real != base and real.startswith(base + os.sep) and not os.path.islink(real):
-                shutil.rmtree(real, ignore_errors=True)
+            # Do not follow symlinks in a path leading to the matched
+            # component. A matched symlink itself can be unlinked safely.
+            relative = os.path.relpath(target, base)
+            ancestors = Path(base)
+            for component in Path(relative).parts[:-1]:
+                ancestors = ancestors / component
+                if ancestors.is_symlink():
+                    break
+            else:
+                if os.path.islink(target) or os.path.isfile(target):
+                    os.unlink(target)
+                elif os.path.isdir(target):
+                    shutil.rmtree(target, ignore_errors=True)
         except OSError:
             continue
 
