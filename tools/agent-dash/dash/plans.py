@@ -102,6 +102,7 @@ def load(ws: str, path: Path | None = None) -> dict:
         "edges": _edges(dag.get("edges")),
         "phases": _phases(narrative.get("phases")),
         "trains": _trains(data.get("trains")),
+        "frame": sanitized_frame(data.get("frame")),
         "progress": plan_progress(groups),
     }
 
@@ -174,6 +175,8 @@ def _groups(value) -> list:
         }
         if isinstance(item.get("phase"), str):
             row_group["phase"] = item.get("phase")
+        if isinstance(item.get("objective"), str):
+            row_group["objective"] = item.get("objective")
         groups.append(row_group)
     return groups
 
@@ -197,6 +200,58 @@ def _phases(value) -> list:
             continue
         phases.append({"name": item.get("name"), "goal": item.get("goal"), "gate": item.get("gate")})
     return phases
+
+
+def sanitized_frame(value) -> dict | None:
+    """Plan-view shape for the optional top-level ``frame`` (before/after,
+    focus, scope, objectives, path). Unknown keys are dropped, like other
+    fields. Returns None when the bundle has no frame object, so old
+    bundles keep working and the page renders its no-frame hint."""
+    if not isinstance(value, dict):
+        return None
+    frame: dict = {}
+    for key in ("before", "after", "focus"):
+        if isinstance(value.get(key), str):
+            frame[key] = value.get(key)
+    for key in ("scope_in", "scope_out"):
+        if isinstance(value.get(key), list):
+            frame[key] = [item for item in value.get(key) if isinstance(item, str)]
+    objectives = value.get("objectives")
+    if isinstance(objectives, list):
+        rows = []
+        for item in objectives:
+            if not isinstance(item, dict):
+                continue
+            row: dict = {}
+            for key in ("id", "title", "before", "after", "measure"):
+                if isinstance(item.get(key), str):
+                    row[key] = item.get(key)
+            if isinstance(item.get("sections"), list):
+                row["sections"] = [entry for entry in item.get("sections") if isinstance(entry, str)]
+            rows.append(row)
+        frame["objectives"] = rows
+    path = value.get("path")
+    if isinstance(path, dict):
+        prow: dict = {}
+        if isinstance(path.get("choice"), str):
+            prow["choice"] = path.get("choice")
+        for key in ("why", "tradeoffs"):
+            if isinstance(path.get(key), list):
+                prow[key] = [item for item in path.get(key) if isinstance(item, str)]
+        alternatives = path.get("alternatives")
+        if isinstance(alternatives, list):
+            rows = []
+            for item in alternatives:
+                if not isinstance(item, dict):
+                    continue
+                arow: dict = {}
+                for key in ("option", "verdict", "why", "revisit_when"):
+                    if isinstance(item.get(key), str):
+                        arow[key] = item.get(key)
+                rows.append(arow)
+            prow["alternatives"] = rows
+        frame["path"] = prow
+    return frame
 
 
 def _trains(value) -> list:

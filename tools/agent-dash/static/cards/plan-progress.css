@@ -206,6 +206,11 @@ body.clip #main{zoom:.92}
 .fanin{font:700 9.5px var(--mono);color:var(--ink-2);border:1px solid var(--grid);border-radius:4px;padding:0 3px;margin-left:2px}
 /* Solo-train caption: single-member trains render no tag. */
 .trcap{font:11.5px var(--mono);color:var(--muted)}
+/* Objective chip: which objective a section serves (O1, O2). On tiles it
+   sits under the section title; in the legend it leads the progress. */
+.obj-chip{display:inline-block;font:600 10.5px var(--mono);color:var(--accent-ink,var(--accent));border:1px solid var(--accent);border-radius:999px;padding:2px 7px;margin:2px 4px 4px 0;white-space:nowrap}
+.dnode .obj-chip{margin-top:0}
+.map-legend .obj-chip.sample{pointer-events:none;margin:0}
 /* Always-visible legend row right under the intro line: labelled mini-groups
    (Task status, Agent family, Edges), colour plus symbol plus word. Wraps on
    phones; tokens only, so both themes follow. */

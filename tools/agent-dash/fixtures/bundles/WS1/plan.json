@@ -1,5 +1,40 @@
 {
   "workstream": "WS1",
+  "frame": {
+    "before": "Three readers answer the same question, and p95 read latency sits at 900 ms.",
+    "after": "Clients call one route with p95 latency under 200 ms.",
+    "focus": "Optimise for one read contract, trading away per-client shortcuts.",
+    "scope_in": ["The shared read route", "The contract test", "Retiring the two old readers"],
+    "scope_out": ["Write latency (owned by the storage team)", "Client migrations (each client team migrates on its own schedule)"],
+    "objectives": [
+      {
+        "id": "O1",
+        "title": "One read route",
+        "before": "3 readers",
+        "after": "1 route",
+        "measure": "The sample set loads against one route.",
+        "sections": ["start"]
+      },
+      {
+        "id": "O2",
+        "title": "No legacy readers",
+        "before": "2 legacy readers live",
+        "after": "0 legacy readers",
+        "measure": "The old routes return 410 Gone.",
+        "sections": ["retire"]
+      }
+    ],
+    "path": {
+      "choice": "Keep one route and retire the other two behind a contract test.",
+      "why": ["One contract is easier to test than three readers.", "The sample set already covers the route."],
+      "tradeoffs": ["Client teams migrate on their own schedule."],
+      "alternatives": [
+        {"option": "Do nothing", "verdict": "rejected", "why": "The three readers keep drifting apart.", "revisit_when": "Never; drift only grows."},
+        {"option": "Keep one route and retire the other two", "verdict": "chosen", "why": "One contract, proven by the sample set.", "revisit_when": ""},
+        {"option": "Add a compatibility shim first", "verdict": "later", "why": "A shim doubles the surface to test.", "revisit_when": "Revisit when a client cannot migrate to the route."}
+      ]
+    }
+  },
   "decisions": [
     {
       "id": "D1",
@@ -45,17 +80,25 @@
       {
         "id": "start",
         "col": 0,
-        "title": "First group",
+        "title": "Agree the contract",
+        "objective": "O1",
         "tasks": [
           {"id": "0", "title": "Upstream freeze signal is in", "status": "done", "kind": "gate"},
           {"id": "1", "title": "Agree the contract", "status": "todo"},
-          {"id": "2", "title": "Land the read route", "status": "pr", "deps": ["1"]},
-          {"id": "3", "title": "Retire the old readers", "status": "wip", "deps": ["2", "0"], "dep_notes": {"0": "retire the readers only after the freeze signal"}},
           {"id": "4", "title": "Freeze the old contract", "status": "done"}
+        ]
+      },
+      {
+        "id": "retire",
+        "col": 1,
+        "title": "Retire the old readers",
+        "tasks": [
+          {"id": "2", "title": "Land the read route", "status": "pr", "deps": ["1"]},
+          {"id": "3", "title": "Retire the old readers", "status": "wip", "deps": ["2", "0"], "dep_notes": {"0": "retire the readers only after the freeze signal"}}
         ]
       }
     ],
-    "edges": []
+    "edges": [["start", "retire"]]
   },
   "trains": [
     {

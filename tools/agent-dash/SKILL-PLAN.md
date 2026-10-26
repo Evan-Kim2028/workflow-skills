@@ -12,7 +12,20 @@ That writes `bundle.json`, a template `plan.json`, `layout.json`, an empty `visu
 
 `START-PROMPT.md` is the paste-ready prompt that starts this workstream's lead in a fresh session. Edit it so it names the kickoff brief and the done criteria. The bundle API and the plan API return that text as `start_prompt`. A missing file is null.
 
-Fill `plan.json` before you render. The shape is the decision record: `dag`, `decisions`, `motivation`, `agent_friendly`, `narrative`. Task status is `todo`, `wip`, `pr`, `prog`, `done`, or `deferred`. `wip` is work on a branch; `pr` is approved or open. A deferred task can set `moved_to` to a workstream id and a `note`. Keep done tasks in the dag so the map shows progress.
+Fill `plan.json` before you render. The shape is the decision record: `frame`, `dag`, `decisions`, `motivation`, `agent_friendly`, `narrative`. Task status is `todo`, `wip`, `pr`, `prog`, `done`, or `deferred`. `wip` is work on a branch; `pr` is approved or open. A deferred task can set `moved_to` to a workstream id and a `note`. Keep done tasks in the dag so the map shows progress. Each section (a `dag.groups` entry) may carry `objective: "O1"` as an alternative to listing the section under an objective's `sections`; either form is accepted, and when both are present they must agree.
+
+## Plan frame
+
+Write the frame before anything else, in this order:
+
+1. Write `frame.before` and `frame.after` first, each one sentence with the number that matters. If you cannot name the number, the plan is not ready.
+2. Write `focus` (what you optimise for and what you trade away) and the scope lists; put real owners or reasons on every out-of-scope item.
+3. Name 2 to 5 objectives as before → after pairs with a measure. Then build dag sections so every section serves exactly one objective.
+4. Write `path`: the choice, why, trade-offs, and at least three alternatives including doing nothing, each with a verdict and when to revisit.
+5. Draw one architecture diagram (before and after, same scale, new parts accented) and one chart that proves the after claim. Put them first in `why_visual`.
+6. Keep prose short: the frame carries the argument; decisions, motivation detail and wave tables are reference material.
+
+The plan page reads, top down: the Before → After band with focus and scope chips; the architecture drawing and the supporting chart; "How the work maps to the goal" (one row per objective, with section chips that link to the Execution view); "Why this path" (choice, why, trade-offs, the alternatives table with the chosen row highlighted); then the existing page from end state onward. Decisions, motivation detail and wave/window tables sit collapsed behind disclosures. `ws validate` reports the frame lint as PLAN201–PLAN206 warnings (exit stays 0): missing sentences, long or numberless sentences, orphan sections, objectives with no section, unknown section ids, and thin or choiceless alternatives. The naming rule applies to every `frame` string.
 
 `dag.cols` is the column titles, left to right. Each section (a `dag.groups` entry) has `id`, `col`, `title`, and `tasks`. Each task has `id`, `title`, and `status`. A task may carry `deps` (task ids it waits on) and `dep_notes` (a map from one of its dep ids to the short condition on that edge, e.g. "run only after the export"). A task that is an outside signal or condition rather than work in this workstream carries `"kind": "gate"` (default `"task"`); the map draws it as a diamond. Edges are pairs of section ids and mean "this section waits on that one". A section may carry `"phase": "planning"`; put research, review, and frozen-design groups there so they show on the map but never count toward progress, waves, critical path, the ready queue, or progress-over-time.
 

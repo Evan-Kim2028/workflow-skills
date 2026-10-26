@@ -17,7 +17,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from dash import errors, maplayout
-from dash.plans import PlanNotFound, configured
+from dash.plans import PlanNotFound, configured, sanitized_frame
 from dash.plans import load as load_plan
 from dash.plans import plan_progress
 
@@ -296,6 +296,7 @@ def load_bundle_api(ws: str) -> dict | None:
         return None
     plan = dict(plan)
     plan["trains"] = sanitized_trains(plan.get("trains"))
+    plan["frame"] = sanitized_frame(plan.get("frame"))
     dag = plan.get("dag") if isinstance(plan.get("dag"), dict) else {}
     approvals = approvals_for(ws)
     return {
@@ -355,6 +356,8 @@ def _view_groups(value, links: dict | None = None) -> list:
         group_row = {"id": item.get("id"), "col": item.get("col"), "title": item.get("title"), "tasks": tasks}
         if isinstance(item.get("phase"), str):
             group_row["phase"] = item.get("phase")
+        if isinstance(item.get("objective"), str):
+            group_row["objective"] = item.get("objective")
         groups.append(group_row)
     return groups
 
@@ -506,6 +509,7 @@ def bundle_plan_view(ws: str) -> dict | None:
         "edges": edges,
         "phases": phases,
         "trains": sanitized_trains(data.get("trains")),
+        "frame": sanitized_frame(data.get("frame")),
         "progress": plan_progress(groups),
         "start_prompt": start_prompt_text(ws),
         "issues": validate_bundle(ws),
@@ -569,6 +573,35 @@ def _bundle_lock(path: Path):
 def _template_plan(ws: str) -> dict:
     return {
         "workstream": ws,
+        "frame": {
+            # Fill the frame first: ws validate flags every TODO below as a
+            # PLAN201-PLAN206 warning until the sentences carry numbers and
+            # the sections map to objectives.
+            "before": "TODO: one sentence on what is true today, with the number that hurts.",
+            "after": "TODO: one sentence on what will be true when done, with the number that proves it.",
+            "focus": "TODO: the one thing this workstream optimises for, and what it trades away.",
+            "scope_in": ["TODO: one in-scope item"],
+            "scope_out": ["TODO: one out-of-scope item, with its owner or reason"],
+            "objectives": [
+                {
+                    "id": "O1",
+                    "title": "TODO: two to five words",
+                    "before": "TODO: today's value",
+                    "after": "TODO: target value",
+                    "measure": "TODO: the query, probe, or test that proves it",
+                    "sections": [],
+                }
+            ],
+            "path": {
+                "choice": "TODO: the approach chosen, in one sentence.",
+                "why": ["TODO: one reason this path wins"],
+                "tradeoffs": ["TODO: one thing we accept or give up"],
+                "alternatives": [
+                    {"option": "Do nothing", "verdict": "rejected", "why": "TODO: why not", "revisit_when": ""},
+                    {"option": "TODO: the alternative", "verdict": "later", "why": "TODO", "revisit_when": "TODO"},
+                ],
+            },
+        },
         "decisions": [
             {
                 "id": "D1",
@@ -1347,6 +1380,228 @@ def _validate_trains(issues: list[str], plan: dict) -> None:
             if isinstance(text, str):
                 for hit in naming_issues(text):
                     issues.append(f"plan.json: train {tid} {key}: bare citation {hit.token}")
+
+
+def _plan_warn(code: str, title: str, detail: str, fix: str) -> dict:
+    return {"code": code, "severity": "info", "title": title, "detail": detail, "fix": fix}
+
+
+def _frame_sentence_warnings(frame: dict) -> list[dict]:
+    """PLAN201 (missing) and PLAN202 (too long or no digit) for the frame's
+    before/after sentences. Warnings, never errors: old bundles keep working."""
+    found: list[dict] = []
+    for key in ("before", "after"):
+        text = frame.get(key)
+        if not isinstance(text, str) or not text.strip():
+            found.append(
+                _plan_warn(
+                    "PLAN201",
+                    f"Plan frame.{key} is missing",
+                    f"frame.{key} is empty; every new plan starts with one before and one after sentence",
+                    f"Write frame.{key} first, one sentence with the number that matters",
+                )
+            )
+            continue
+        words = len(text.split())
+        if words > 40:
+            found.append(
+                _plan_warn(
+                    "PLAN202",
+                    f"Plan frame.{key} runs {words} words",
+                    f"frame.{key} has {words} words (bar: one sentence of at most 40)",
+                    f"Cut frame.{key} to one sentence of at most 40 words",
+                )
+            )
+        if not any(char.isdigit() for char in text):
+            found.append(
+                _plan_warn(
+                    "PLAN202",
+                    f"Plan frame.{key} names no number",
+                    f"frame.{key} carries no digit; every before/after needs the number that hurts or proves",
+                    f"Put the number that matters into frame.{key}",
+                )
+            )
+    return found
+
+
+def plan_frame_warnings_for_plan(plan: dict, ws: str = "") -> list[dict]:
+    """Layer C lint dicts (PLAN201 to PLAN206) for a bundle's frame.
+
+    Warnings, never errors: a strange plan still renders. Every entry
+    carries the machine ``code``, ``severity`` info, a human ``title``
+    naming the section before any id, the ``detail`` with actual-vs-
+    threshold numbers, and the one-line ``fix``. Deterministic: plan
+    order throughout.
+    """
+    found: list[dict] = []
+    frame = plan.get("frame") if isinstance(plan, dict) else None
+    if not isinstance(frame, dict) or not frame:
+        return [
+            _plan_warn(
+                "PLAN201",
+                "Plan has no before/after frame",
+                "frame is missing; every new plan starts with one before and one after sentence",
+                "Write frame.before and frame.after first, each one sentence with the number that matters",
+            )
+        ]
+    found.extend(_frame_sentence_warnings(frame))
+    dag = plan.get("dag") if isinstance(plan.get("dag"), dict) else {}
+    groups = [group for group in dag.get("groups") or [] if isinstance(group, dict)]
+    group_ids = {str(group.get("id")) for group in groups if isinstance(group.get("id"), str)}
+    objectives = frame.get("objectives")
+    if not isinstance(objectives, list) or not 2 <= len(objectives) <= 5:
+        actual = len(objectives) if isinstance(objectives, list) else 0
+        found.append(
+            _plan_warn(
+                "PLAN204",
+                f"Plan names {actual} objectives",
+                f"{actual} objectives (bar: 2 to 5); every objective names at least one dag group id",
+                "Name 2 to 5 objectives as before/after pairs, then build dag sections so every section serves exactly one",
+            )
+        )
+        valid_objectives: list[dict] = []
+    else:
+        valid_objectives = [item for item in objectives if isinstance(item, dict)]
+        for item in objectives:
+            if not isinstance(item, dict):
+                found.append(
+                    _plan_warn(
+                        "PLAN204",
+                        "Plan objective is not an object",
+                        "an objectives entry is not an object; every objective names at least one dag group id",
+                        "Write the objective as an object with id, title, before, after, measure, and sections",
+                    )
+                )
+    objective_ids = {str(item.get("id")) for item in valid_objectives if isinstance(item.get("id"), str)}
+    claimed: dict[str, set[str]] = {}
+    for item in valid_objectives:
+        oid = str(item.get("id")) if isinstance(item.get("id"), str) else ""
+        sections = item.get("sections")
+        if not isinstance(sections, list):
+            sections = []
+        for entry in sections:
+            if isinstance(entry, str):
+                claimed.setdefault(entry, set()).add(oid)
+    for group in groups:
+        gid = group.get("id")
+        if not isinstance(gid, str) or group.get("phase") == "planning":
+            continue
+        owners = set(claimed.get(gid, set()))
+        objective = group.get("objective")
+        if isinstance(objective, str):
+            owners.add(objective)
+        if not owners:
+            title = group.get("title") if isinstance(group.get("title"), str) else gid
+            found.append(
+                _plan_warn(
+                    "PLAN203",
+                    f'"{title}" section maps to no objective ({gid})',
+                    f"section {gid} serves no objective; every section outside a planning group maps to exactly one objective",
+                    f"List {gid} under an objective's sections or set its objective field",
+                )
+            )
+        elif len(owners) > 1:
+            title = group.get("title") if isinstance(group.get("title"), str) else gid
+            names = ", ".join(sorted(owners))
+            found.append(
+                _plan_warn(
+                    "PLAN203",
+                    f'"{title}" section maps to {len(owners)} objectives ({gid})',
+                    f"section {gid} serves {names}; every section outside a planning group maps to exactly one objective",
+                    f"Keep {gid} under one objective so the map chip is unambiguous",
+                )
+            )
+    for item in valid_objectives:
+        oid = item.get("id") if isinstance(item.get("id"), str) else ""
+        sections = item.get("sections") if isinstance(item.get("sections"), list) else []
+        listed = [entry for entry in sections if isinstance(entry, str)]
+        if not any(entry in group_ids for entry in listed):
+            title = item.get("title") if isinstance(item.get("title"), str) else oid
+            found.append(
+                _plan_warn(
+                    "PLAN204",
+                    f'Objective {oid} ("{title}") names no section',
+                    f"{oid} lists {len(listed)} dag sections, 0 of them a dag group id",
+                    f"Point {oid or 'the objective'} at its sections or drop it",
+                )
+            )
+        for entry in listed:
+            if entry not in group_ids:
+                found.append(
+                    _plan_warn(
+                        "PLAN205",
+                        f'Objective {oid or "?"} names unknown section "{entry}"',
+                        f'"{entry}" is not a dag.groups id in {ws or "this plan"}',
+                        f"Point {oid or 'the objective'} at a real section id",
+                    )
+                )
+    for group in groups:
+        gid = group.get("id")
+        objective = group.get("objective")
+        if isinstance(gid, str) and isinstance(objective, str) and objective not in objective_ids:
+            title = group.get("title") if isinstance(group.get("title"), str) else gid
+            found.append(
+                _plan_warn(
+                    "PLAN205",
+                    f'"{title}" section points at unknown objective "{objective}" ({gid})',
+                    f'"{objective}" is not an objective id in {ws or "this plan"}',
+                    f"Point {gid} at a real objective id or list it under an objective's sections",
+                )
+            )
+    path = frame.get("path")
+    alternatives = path.get("alternatives") if isinstance(path, dict) else None
+    if not isinstance(alternatives, list) or len(alternatives) < 3:
+        actual = len(alternatives) if isinstance(alternatives, list) else 0
+        found.append(
+            _plan_warn(
+                "PLAN206",
+                f"Plan lists {actual} alternatives",
+                f"{actual} path alternatives (bar: at least 3, one of them Do nothing)",
+                'List at least 3 alternatives including "Do nothing", with exactly one chosen',
+            )
+        )
+    else:
+        rows = [item for item in alternatives if isinstance(item, dict)]
+        options = [str(item.get("option", "")).strip().lower().replace("\u2019", "'") for item in rows]
+        if "do nothing" not in options and "keep today's approach" not in options:
+            found.append(
+                _plan_warn(
+                    "PLAN206",
+                    "Path alternatives skip doing nothing",
+                    f"{len(rows)} alternatives with no Do nothing row; the baseline is what the choice beats",
+                    'Add a "Do nothing" alternative with its verdict and revisit-when',
+                )
+            )
+        chosen = [item for item in rows if str(item.get("verdict", "")).strip().lower() == "chosen"]
+        if len(chosen) != 1:
+            found.append(
+                _plan_warn(
+                    "PLAN206",
+                    f"Path marks {len(chosen)} alternatives chosen",
+                    f"{len(chosen)} chosen rows (bar: exactly 1); the table must say which path this is",
+                    "Mark exactly one alternative chosen and the rest rejected, later, or partial",
+                )
+            )
+    return found
+
+
+def plan_frame_warnings(ws: str, root: Path | None = None) -> list[dict]:
+    """PLAN201 to PLAN206 warnings for a bundle's plan.
+
+    Warnings, never errors: empty when the plan is missing or unreadable,
+    so callers keep their own not-found and invalid-plan paths.
+    """
+    path = bundle_dir(ws, root)
+    if path is None:
+        return []
+    plan = _read_json(path / "plan.json")
+    if not isinstance(plan, dict):
+        return []
+    try:
+        return plan_frame_warnings_for_plan(plan, ws)
+    except Exception as exc:
+        _map_unavailable(exc)
+        return []
 
 
 def _validate_lifecycle(issues: list[str], ws: str, meta: dict, root: Path | None = None) -> None:
@@ -2444,7 +2699,7 @@ def cmd_ws(argv: list[str]) -> int:
             _say(errors.bundle_not_found(ws), json_mode)
             return errors.NOT_FOUND
         issues = validate_bundle(ws)
-        warnings = plan_map_warnings(ws)
+        warnings = plan_map_warnings(ws) + plan_frame_warnings(ws)
         if json_mode:
             errors.emit_json({"ws": ws, "ok": not issues, "issues": issues, "warnings": warnings})
             return errors.INVALID_DATA if issues else errors.OK

@@ -1,9 +1,12 @@
 """Render a plan bundle's page.html from plan.json, visuals.html, and layout.json.
 
-Section order is fixed: Why, End state, Plan, Progress, Agent-friendly, Reference.
+Section order with a frame is fixed: the Before/After band (in the header),
+then Architecture, then How the work maps to the goal, then Why this path,
+then the existing page from End state onward. Without a frame the page
+renders as it always did, plus one muted hint line under the thesis.
 The Progress section is a placeholder. The plan page fills it from the live plan.
-There is no decisions section on the plan tab: plan-level decisions stay in
-the CLI and the API, never on the page.
+Plan-level decisions stay collapsed in a disclosure at the end of the page;
+the live decision record stays in the CLI and the API.
 """
 
 from __future__ import annotations
@@ -156,16 +159,198 @@ def _piece(value, fragments: dict) -> str:
     return "" if value is None else str(value)
 
 
+def _has_frame(data: dict) -> bool:
+    """A frame counts when it names both sentences; a partial frame renders
+    the no-frame page (plus the hint) and the validator flags what is missing."""
+    frame = data.get("frame") if isinstance(data, dict) else None
+    if not isinstance(frame, dict):
+        return False
+    return all(isinstance(frame.get(key), str) and frame.get(key).strip() for key in ("before", "after"))
+
+
+def frame_band(frame: dict) -> str:
+    """The header replacement: Before → After, focus, and scope chip rows."""
+    scope_in = [item for item in frame.get("scope_in") or [] if isinstance(item, str) and item.strip()]
+    scope_out = [item for item in frame.get("scope_out") or [] if isinstance(item, str) and item.strip()]
+    chips = "".join(f'<span class="scope-chip in">{esc(item)}</span>' for item in scope_in[:7])
+    chips_out = "".join(f'<span class="scope-chip out">{esc(item)}</span>' for item in scope_out[:7])
+    focus = f'<p class="focus-line">{esc(frame.get("focus"))}</p>' if isinstance(frame.get("focus"), str) and frame.get("focus").strip() else ""
+    return (
+        '<div class="ba-band" data-frame-band>'
+        f'<div class="ba-cell before"><span class="ba-cap">Before</span><p>{esc(frame.get("before"))}</p></div>'
+        '<div class="ba-arrow" aria-hidden="true">→</div>'
+        f'<div class="ba-cell after"><span class="ba-cap">After</span><p>{esc(frame.get("after"))}</p></div>'
+        "</div>"
+        f"{focus}"
+        '<div class="scope-row"><span class="scope-cap">In scope</span>'
+        f"{chips or '<span class=\"scope-none\">—</span>'}</div>"
+        '<div class="scope-row"><span class="scope-cap">Out of scope</span>'
+        f"{chips_out or '<span class=\"scope-none\">—</span>'}</div>"
+    )
+
+
+def _objective_groups(frame: dict, groups) -> dict:
+    """Objective id to the dag groups that serve it, in plan order.
+
+    A group serves the objective named by its own ``objective`` field, the
+    objectives that list it under ``sections``, or both (which must agree;
+    the validator flags a group claimed twice)."""
+    order = [group for group in groups or [] if isinstance(group, dict) and isinstance(group.get("id"), str)]
+    by_id = {group["id"]: group for group in order}
+    out: dict = {}
+    for item in frame.get("objectives") or []:
+        if isinstance(item, dict) and isinstance(item.get("id"), str):
+            out[item["id"]] = []
+    for item in frame.get("objectives") or []:
+        if not isinstance(item, dict) or not isinstance(item.get("id"), str):
+            continue
+        for entry in item.get("sections") or []:
+            if isinstance(entry, str) and entry in by_id and by_id[entry] not in out[item["id"]]:
+                out[item["id"]].append(by_id[entry])
+    for group in order:
+        oid = group.get("objective")
+        if isinstance(oid, str) and oid in out and group not in out[oid]:
+            out[oid].append(group)
+    return out
+
+
+def _section_progress(group: dict) -> tuple:
+    """``(done, total)`` for one section, excluding deferred and planning tasks."""
+    done = total = 0
+    if isinstance(group.get("phase"), str) and group.get("phase") == "planning":
+        return (0, 0)
+    for task in group.get("tasks") or []:
+        if not isinstance(task, dict):
+            continue
+        status = task.get("status")
+        if status == "deferred":
+            continue
+        if status in ("todo", "wip", "pr", "prog", "done"):
+            total += 1
+            if status == "done":
+                done += 1
+    return (done, total)
+
+
+def objectives_block(ws: str, frame: dict, groups) -> str:
+    """One card per objective: title, before → after, measure, and the dag
+    sections that serve it as chips linking to the Execution view."""
+    mapping = _objective_groups(frame, groups)
+    cards = []
+    for item in frame.get("objectives") or []:
+        if not isinstance(item, dict) or not isinstance(item.get("id"), str):
+            continue
+        oid = item["id"]
+        served = mapping.get(oid, [])
+        done = sum(_section_progress(group)[0] for group in served)
+        total = sum(_section_progress(group)[1] for group in served)
+        chips = []
+        for group in served:
+            gid = group.get("id")
+            title = group.get("title") if isinstance(group.get("title"), str) and group.get("title") else gid
+            sdone, stotal = _section_progress(group)
+            progress = "planning · not counted" if stotal == 0 and group.get("phase") == "planning" else f"{sdone} of {stotal} done"
+            chips.append(
+                f'<a class="obj-chip" href="/?ws={esc(ws)}&amp;view=exec#sec-{esc(gid)}"'
+                f' title="{esc(title)} · {esc(progress)}">'
+                f"<b>{esc(title)}</b><span>{esc(progress)}</span></a>"
+            )
+        cards.append(
+            f'<div class="obj-card" data-objective="{esc(oid)}">'
+            f'<h3><span class="obj-id">{esc(oid)}</span> {esc(item.get("title"))}</h3>'
+            f'<p class="obj-ba"><span class="bef">{esc(item.get("before"))}</span>'
+            '<span class="obj-arrow" aria-hidden="true">→</span>'
+            f'<span class="aft">{esc(item.get("after"))}</span></p>'
+            + (f'<p class="obj-measure">Proven by {esc(item.get("measure"))}</p>' if isinstance(item.get("measure"), str) and item.get("measure").strip() else "")
+            + (f'<p class="obj-prog">{done} of {total} done</p>' if total else "")
+            + (f'<div class="obj-chips">{"".join(chips)}</div>' if chips else "")
+            + "</div>"
+        )
+    if not cards:
+        return ""
+    return f'<div class="obj-grid">{"".join(cards)}</div>'
+
+
+_VERDICT_BADGE = {
+    "chosen": ("p-target", "Chosen"),
+    "rejected": ("p-del", "Rejected"),
+    "later": ("p-ret", "Later"),
+    "partial": ("p-out", "Partial"),
+}
+
+
+def path_block(path: dict) -> str:
+    """The choice, why, trade-offs, and the alternatives table with exactly
+    one chosen row highlighted (the validator flags any other count)."""
+    path = path or {}
+    why = "".join(f"<li>{esc(item)}</li>" for item in path.get("why") or [] if isinstance(item, str))
+    tradeoffs = "".join(f"<li>{esc(item)}</li>" for item in path.get("tradeoffs") or [] if isinstance(item, str))
+    rows = []
+    for item in path.get("alternatives") or []:
+        if not isinstance(item, dict):
+            continue
+        verdict = str(item.get("verdict", "")).strip().lower()
+        css, label = _VERDICT_BADGE.get(verdict, ("p-unk", str(item.get("verdict") or "undecided")))
+        rows.append(
+            f'<tr class="{"chosen" if verdict == "chosen" else ""}">'
+            f"<td>{esc(item.get('option'))}</td>"
+            f'<td><span class="pill {css}">{esc(label)}</span></td>'
+            f"<td>{esc(item.get('why'))}</td>"
+            f"<td>{esc(item.get('revisit_when'))}</td></tr>"
+        )
+    table = (
+        '<div class="scroll"><table class="tbl stk alt-table">'
+        "<thead><tr><th>Option</th><th>Verdict</th><th>Why</th><th>Revisit when</th></tr></thead>"
+        f"<tbody>{''.join(rows)}</tbody></table></div>" if rows else ""
+    )
+    return (
+        (f'<p class="lead2">{esc(path.get("choice"))}</p>' if isinstance(path.get("choice"), str) and path.get("choice").strip() else "")
+        + (f"<h3 class=\"sh\">Why this wins</h3><ul>{why}</ul>" if why else "")
+        + (f"<h3 class=\"sh\">What we accept</h3><ul>{tradeoffs}</ul>" if tradeoffs else "")
+        + (f"<h3 class=\"sh\">Alternatives</h3>{table}" if table else "")
+    )
+
+
+def decisions_block(decisions) -> str:
+    """The decision list, collapsed behind a disclosure: reference material,
+    not part of the argument above."""
+    rows = [item for item in decisions or [] if isinstance(item, dict)]
+    if not rows:
+        return ""
+    body = "".join(
+        f'<div class="dec-row"><p class="dec-q"><span class="mono">{esc(item.get("id"))}</span> {esc(item.get("question"))}</p>'
+        f'<p class="dtext">{esc(item.get("decision"))}</p>'
+        + (f'<p class="why">{esc(item.get("why"))}</p>' if isinstance(item.get("why"), str) and item.get("why").strip() else "")
+        + "</div>"
+        for item in rows
+    )
+    return more("Decisions", f"{len(rows)} decided, in detail", body)
+
+
 def build(ws: str, data: dict, fragments: dict, layout: dict) -> str:
     narrative = data.get("narrative") if isinstance(data.get("narrative"), dict) else {}
-    anchors = [
-        ("why", "Why"),
-        ("end", "End state"),
-        ("plan", "Plan"),
-        ("progress", "Progress"),
-        ("agent", "Agent-friendly"),
-        ("ref", "Reference"),
-    ]
+    frame = data.get("frame") if isinstance(data.get("frame"), dict) else None
+    framed = _has_frame(data) and frame is not None
+    if framed:
+        anchors = [
+            ("arch", "Architecture"),
+            ("objectives", "Objectives"),
+            ("path", "Why this path"),
+            ("end", "End state"),
+            ("plan", "Plan"),
+            ("progress", "Progress"),
+            ("agent", "Agent-friendly"),
+            ("ref", "Reference"),
+        ]
+    else:
+        anchors = [
+            ("why", "Why"),
+            ("end", "End state"),
+            ("plan", "Plan"),
+            ("progress", "Progress"),
+            ("agent", "Agent-friendly"),
+            ("ref", "Reference"),
+        ]
     jump = '<nav class="jump" aria-label="On this page">' + "".join(
         f'<a href="#{ws.lower()}-{anchor}">{label}</a>' for anchor, label in anchors
     ) + "</nav>"
@@ -182,18 +367,70 @@ def build(ws: str, data: dict, fragments: dict, layout: dict) -> str:
         for title, hint in (layout.get("ref_sections") or [])
         if isinstance(title, str)
     )
+    if framed:
+        assert frame is not None
+        header = "<header>" + frame_band(frame) + "</header>"
+    elif "</header>" in header:
+        header = header.replace(
+            "</header>",
+            '<p class="frame-hint">This plan has no before/after frame yet (see SKILL-PLAN.md, Plan frame).</p></header>',
+            1,
+        )
+    else:
+        header += '<p class="frame-hint">This plan has no before/after frame yet (see SKILL-PLAN.md, Plan frame).</p>'
     body = header
-    body += sec(
-        f"{prefix}-why",
-        "Why",
-        layout.get("why_title") or "Why",
-        _piece(layout.get("why_visual"), fragments) + why_block(data.get("motivation") or {}),
-    )
+    end_rest = layout.get("end_body")
+    if framed:
+        assert frame is not None
+        # Layout slots stay as they are; only the order changes: the first
+        # why_visual drawing (the before/after architecture diagram) leads,
+        # then one supporting chart (the second why_visual, or the first
+        # end_body drawing, which the End state section then skips).
+        why_visual = list(layout.get("why_visual") or [])
+        end_body = list(layout.get("end_body") or [])
+        arch_pieces: list = []
+        if why_visual:
+            arch_pieces.append(why_visual[0])
+        if len(why_visual) > 1:
+            arch_pieces.append(why_visual[1])
+            end_rest = end_body
+        elif end_body:
+            arch_pieces.append(end_body[0])
+            end_rest = end_body[1:]
+        else:
+            end_rest = end_body
+        body += sec(
+            f"{prefix}-arch",
+            "Why",
+            "Architecture",
+            _piece(arch_pieces, fragments),
+        )
+        groups = ((data.get("dag") or {}).get("groups") or [])
+        body += sec(
+            f"{prefix}-objectives",
+            "Goal",
+            "How the work maps to the goal",
+            objectives_block(ws, frame, groups),
+        )
+        body += sec(
+            f"{prefix}-path",
+            "Why",
+            "Why this path",
+            path_block(frame.get("path") if isinstance(frame.get("path"), dict) else {})
+            + why_block(data.get("motivation") or {}),
+        )
+    else:
+        body += sec(
+            f"{prefix}-why",
+            "Why",
+            layout.get("why_title") or "Why",
+            _piece(layout.get("why_visual"), fragments) + why_block(data.get("motivation") or {}),
+        )
     body += sec(
         f"{prefix}-end",
         "End state",
         layout.get("end_title") or "End state",
-        _piece(layout.get("end_body"), fragments),
+        _piece(end_rest, fragments),
         lead=esc(narrative.get("end_state")),
     )
     body += sec(
@@ -232,6 +469,8 @@ def build(ws: str, data: dict, fragments: dict, layout: dict) -> str:
         layout.get("agent_title") or "Agent-friendly",
         _piece(layout.get("agent_visual"), fragments) + agent_block(data.get("agent_friendly") or {}),
     )
+    if framed:
+        ref_body += decisions_block(data.get("decisions"))
     body += sec(f"{prefix}-ref", "Reference", "Details", ref_body)
     return f'<div id="panel-{prefix}" role="tabpanel">\n{body}</div>\n'
 
