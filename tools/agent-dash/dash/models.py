@@ -185,10 +185,13 @@ def model_name(key: str | None) -> str:
         return s[len("dagster:") :] or "job"
     if s.endswith("-unknown"):
         return "model not recorded"
-    if s == "deepseek-flash":
-        return "DeepSeek V4.1 Flash"
-    if s == "deepseek-v4-pro":
-        return "DeepSeek V4 Pro"
+    if "deepseek" in s.lower():
+        # Legacy DeepSeek aliases take the key they group under, as in models.js.
+        dk = model_key(s)[1]
+        if dk == "deepseek-flash":
+            return "DeepSeek V4.1 Flash"
+        if dk == "deepseek-v4-pro":
+            return "DeepSeek V4 Pro"
     parts = [w for w in _clean_id(s).split("-") if w]
     words = [_title_word(w) for w in parts]
     if len(parts) > 1 and parts[0].lower() == "gpt" and parts[1][:1].isdigit():
@@ -203,6 +206,8 @@ def full_name(key: str | None) -> str:
     family word, else family plus name."""
     s = str(key or "")
     name = model_name(s)
+    if not name:
+        return "model not recorded"
     fam = _FAM_NAMES.get(model_key(s)[0], "Other")
     if name == fam or name.startswith(fam + " "):
         return name

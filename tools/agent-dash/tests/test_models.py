@@ -267,6 +267,16 @@ class DisplayNameTest(unittest.TestCase):
         "reflection/Beam-1.0-501B-A23B:xhigh": "Beam 1.0",
         "gpt-reserve": "GPT Reserve",
         "other": "Other",
+        "": "",
+        "codex-unknown": "model not recorded",
+        "glm-unknown": "model not recorded",
+        "dagster:some_job": "some_job",
+        "mimo-v2": "Mimo V2",
+        "foo/bar-9:free": "Bar 9",
+        "deepseek-v4-flash": "DeepSeek V4.1 Flash",
+        "deepseek-v4-flash-vision-exp": "DeepSeek V4.1 Flash",
+        "river/deepseek-ai/DeepSeek-V4.1-Flash-1017": "DeepSeek V4.1 Flash",
+        "river/zai-org/GLM-5.3-Flash": "GLM 5.3 Flash",
     }
 
     full_table = {
@@ -277,6 +287,16 @@ class DisplayNameTest(unittest.TestCase):
         "grok-4.7": "Cursor · Grok 4.7",
         "haiku": "Claude · Haiku",
         "beam": "Beam",
+        "": "model not recorded",
+        "codex-unknown": "Codex · model not recorded",
+        "glm-unknown": "GLM · model not recorded",
+        "dagster:some_job": "Dagster · some_job",
+        "mimo-v2": "Other · Mimo V2",
+        "foo/bar-9:free": "Other · Bar 9",
+        "deepseek-v4-flash": "DeepSeek V4.1 Flash",
+        "deepseek-v4-flash-vision-exp": "DeepSeek V4.1 Flash",
+        "river/deepseek-ai/DeepSeek-V4.1-Flash-1017": "DeepSeek V4.1 Flash",
+        "river/zai-org/GLM-5.3-Flash": "GLM 5.3 Flash",
     }
 
     def test_models_js_display_names(self):

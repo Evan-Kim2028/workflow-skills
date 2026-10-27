@@ -109,8 +109,13 @@
   function nameOf(key) {
     if (/^dagster:/.test(key)) return String(key).slice(8) || "job";
     if (/-unknown$/.test(key)) return "model not recorded";
-    if (key === "deepseek-flash") return "DeepSeek V4.1 Flash";
-    if (key === "deepseek-v4-pro") return "DeepSeek V4 Pro";
+    /* Legacy DeepSeek aliases (deepseek-v4-flash, ...-vision-exp) take the
+       key they group under, so the cell and the legend agree. */
+    if (/deepseek/i.test(key)) {
+      var dk = keyOf(key)[1];
+      if (dk === "deepseek-flash") return "DeepSeek V4.1 Flash";
+      if (dk === "deepseek-v4-pro") return "DeepSeek V4 Pro";
+    }
     var parts = cleanId(key).split("-").filter(function (w) { return w !== ""; });
     var words = parts.map(titleWord);
     if (parts.length > 1 && parts[0].toLowerCase() === "gpt" && /^\d/.test(parts[1])) {
@@ -126,6 +131,7 @@
   function fullName(x) {
     var k = String(x == null ? "" : x);
     var n = nameOf(k), f = FAM[famOf(k)].name;
+    if (!n) return "model not recorded";
     return (n === f || n.indexOf(f + " ") === 0) ? n : f + " \u00B7 " + n;
   }
   function famOf(key) { return keyOf(key)[0]; }
