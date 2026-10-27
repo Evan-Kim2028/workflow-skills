@@ -188,6 +188,77 @@ class ReaperStoreTests(unittest.TestCase):
         self.assertEqual(self.store.get_run("pi:s10:a")["status"], "running")
 
 
+class PidlessGenericReapTests(unittest.TestCase):
+    """Rows the retired launcher shims left running with no pid.
+
+    Shapes copied from the six WS19 Command Code rows that read running
+    for hours: source generic, harness commandcode, no pid, a stored
+    ``ended_at`` from a ``failed`` line an older reader stored as running
+    (or no end at all), and usage heartbeats only at the end of the run.
+    """
+
+    def setUp(self):
+        self.store = Store(":memory:")
+
+    def tearDown(self):
+        self.store.close()
+
+    def _cmd(self, run_id, label, status="running", started=OLD, ended=None, tier="commandcode-deepseek", source="generic", verdict=None):
+        row = {
+            "run_id": run_id,
+            "source": source,
+            "label": label,
+            "status": status,
+            "tier": tier,
+            "model": "deepseek/deepseek-v4.1-flash",
+            "started_at": started,
+        }
+        if ended is not None:
+            row["ended_at"] = ended
+        if verdict is not None:
+            row["verdict"] = verdict
+        self.store.upsert_run(row)
+
+    def test_running_row_with_an_end_closes_at_that_end(self):
+        self._cmd("cmd:23f1:ws19-review-v-write", "ws19-review-v-write", started=NOW - 600, ended=NOW - 3600, verdict="BLOCKED")
+        reaped = self.store.reap_dead_runs(NOW)
+        self.assertEqual([entry["run_id"] for entry in reaped], ["cmd:23f1:ws19-review-v-write"])
+        row = self.store.get_run("cmd:23f1:ws19-review-v-write")
+        self.assertEqual(row["status"], "died_early")
+        self.assertEqual(row["ended_at"], NOW - 3600)
+        self.assertEqual(row["verdict"], "BLOCKED")
+
+    def test_quiet_headless_row_with_no_pid_closes_at_last_evidence(self):
+        self._cmd("cmd:24cb:ws19-review-b-ccpsa-r2", "ws19-review-b-ccpsa-r2", started=NOW - 2 * 3600)
+        self.store.add_usage(
+            {
+                "ts": NOW - 3600,
+                "session_id": "24cb",
+                "run_id": "cmd:24cb:ws19-review-b-ccpsa-r2",
+                "model": "deepseek/deepseek-v4.1-flash",
+                "tool": "commandcode",
+                "message_id": "24cb-1",
+                "input": 10,
+                "output": 5,
+            }
+        )
+        self.assertEqual(len(self.store.reap_dead_runs(NOW)), 1)
+        row = self.store.get_run("cmd:24cb:ws19-review-b-ccpsa-r2")
+        self.assertEqual(row["status"], "died_early")
+        self.assertEqual(row["ended_at"], NOW - 3600)
+        self.assertEqual(row["verdict"], "DEAD")
+
+    def test_fresh_headless_row_with_no_pid_stays_running(self):
+        self._cmd("cmd:aaaa:fresh", "fresh", started=NOW - 5 * 60)
+        self.assertEqual(self.store.reap_dead_runs(NOW), [])
+        self.assertEqual(self.store.get_run("cmd:aaaa:fresh")["status"], "running")
+
+    def test_pidless_rows_of_other_sources_and_tiers_are_kept(self):
+        self._cmd("shell:s7:x", "x", source="shell", tier="shell")
+        self._cmd("generic:abc:plain", "plain", tier="generic")
+        self.assertEqual(self.store.reap_dead_runs(NOW), [])
+
+
 class SiblingErrTests(unittest.TestCase):
     def test_launcher_names_map(self):
         self.assertEqual(

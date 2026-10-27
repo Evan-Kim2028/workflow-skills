@@ -9,12 +9,14 @@ it and never take it.
 from __future__ import annotations
 
 from dash.liveness import (DAGSTER_ACTIVE_FRESH_S,
+                      PIDLESS_REAP_IDLE_S,
                       REAP_IDLE_S,
                       STALE_IDLE_S,
                       STALLED_AFTER_S,
                       STALLED_SOURCES,
                       dead_run_patch,
                       pid_alive as _pid_alive,
+                      pidless_reapable,
                       proc_started_ok,
                       row_shows_quota,
                       sibling_err_path,
@@ -94,7 +96,11 @@ class RunningMixin:
             the same way. A row whose pid is
             alive is never touched, and neither are Dagster rows (their
             close-out follows the active set), slices (they follow their
-            primary), or rows with no pid at all. One lock hold covers
+            primary), or rows with no pid at all, except pid-less generic rows of
+            headless Command Code and Pi workers (``pidless_reapable``): one
+            with a recorded end closes at that end, one with no end after
+            ``PIDLESS_REAP_IDLE_S`` without evidence closes at its last
+            evidence. One lock hold covers
             the liveness checks, the file stats, and the writes, so a
             poll cannot revive a row between the check and the close.
             Returns one ``{run_id, source, label, verdict, idle_s}`` dict
@@ -115,13 +121,51 @@ class RunningMixin:
                         "AND pid IS NOT NULL AND slice_of IS NULL AND source != 'dagster'"
                     ).fetchall()
                 ]
+                pidless = [
+                    dict(row)
+                    for row in self._conn.execute(
+                        "SELECT * FROM runs WHERE status IN ('running','queued') "
+                        "AND pid IS NULL AND slice_of IS NULL AND source = 'generic'"
+                    ).fetchall()
+                ]
+                pidless = [row for row in pidless if pidless_reapable(row)]
                 if wanted_sources:
                     rows = [row for row in rows if (row.get("source") or "") in wanted_sources]
-                if not rows:
+                    pidless = [row for row in pidless if (row.get("source") or "") in wanted_sources]
+                if not rows and not pidless:
                     return []
-                usage_max = self._usage_max_locked([row["run_id"] for row in rows])
-                sample_max = self._sample_max_locked(rows)
+                usage_max = self._usage_max_locked([row["run_id"] for row in rows + pidless])
+                sample_max = self._sample_max_locked(rows + pidless)
                 reaped = []
+                for row in pidless:
+                    ended = row.get("ended_at")
+                    if isinstance(ended, (int, float)) and not isinstance(ended, bool):
+                        last = float(ended)
+                    else:
+                        stamps = [
+                            float(stamp)
+                            for stamp in (row.get("started_at"), usage_max.get(row["run_id"]), sample_max.get(row["run_id"]))
+                            if isinstance(stamp, (int, float)) and not isinstance(stamp, bool)
+                        ]
+                        if not stamps or now - max(stamps) < PIDLESS_REAP_IDLE_S:
+                            continue
+                        last = max(stamps)
+                    merged = dict(row)
+                    merged.update(dead_run_patch(row, last))
+                    self._write_run(merged)
+                    self._seq += 1
+                    self._data_seq += 1
+                    self._note_data_write()
+                    self._note_view_write()
+                    reaped.append(
+                        {
+                            "run_id": row["run_id"],
+                            "source": row.get("source"),
+                            "label": row.get("label"),
+                            "verdict": merged.get("verdict"),
+                            "idle_s": round(now - last, 1),
+                        }
+                    )
                 for row in rows:
                     pid = _int_pid(row.get("pid"))
                     if pid is None:
