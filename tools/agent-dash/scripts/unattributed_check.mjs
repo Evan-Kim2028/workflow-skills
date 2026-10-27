@@ -239,7 +239,9 @@ async function apiSnapshot() {
   for (const b of snap.usage || []) {
     const v = billed(b);
     buckets += v;
-    if (String(b.key || "").endsWith("-unknown")) hiddenBuckets += v;
+    /* The core/unattributed.js rule: a model@harness series key counts
+       when its model half is -unknown (muse-unknown@muse is unattributed). */
+    if (/-unknown(@|$)/.test(String(b.key || ""))) hiddenBuckets += v;
   }
   return { snap, tokens, buckets, hiddenBuckets };
 }
@@ -248,12 +250,12 @@ const READ = `(function () {
   function texts(sel) {
     return Array.prototype.map.call(document.querySelectorAll(sel), function (e) { return e.textContent; }).join(" | ");
   }
-  var tile = document.querySelector('#exec-tiles [data-tile="tokens"]');
-  var cost = document.querySelector('#exec-tiles [data-tile="cost"]');
+  var tile = document.querySelector('#x-pulse [data-kpi="tokens"]');
+  var cost = document.querySelector('#x-pulse [data-kpi="cost"]');
   var ltotal = document.querySelector("#exec-tokens .ltotal");
   var unatt = document.querySelector('#exec-tokens [data-key="unattributed"]');
   return {
-    listed: texts("#exec-tiles .xline") + " || " + texts("#exec-tokens .tok-legend") + " || " + texts(".conc-models") + " || " + texts(".tl-model-label"),
+    listed: texts("#x-pulse .x") + " || " + texts("#exec-tokens .tok-legend") + " || " + texts(".conc-models") + " || " + texts(".tl-model-label"),
     bodyUnknown: (document.body.textContent || "").indexOf("model not recorded") >= 0,
     tileTokens: tile && tile.getAttribute("data-tokens"),
     tileCost: cost && cost.getAttribute("data-cost-usd"),
@@ -372,7 +374,7 @@ async function main() {
     await cdp.send("Runtime.enable");
     await cdp.send("Page.enable");
     await cdp.send("Page.navigate", { url: `${URL}/?view=exec&ws=all` });
-    await waitFor(cdp, `!!document.querySelector("#exec-tiles .unatt-btn")`, "tiles control");
+    await waitFor(cdp, `!!document.querySelector("#x-pulse .pulse-unatt .unatt-btn")`, "pulse strip control");
     await waitFor(cdp, `!!document.querySelector("#exec-activity .unatt-btn")`, "activity control");
     await waitFor(cdp, `!!document.querySelector("#exec-tokens .ltotal")`, "token legend");
 
@@ -406,8 +408,8 @@ async function main() {
     eq(before.hiddenBuckets, 154, "API hidden bucket sum");
 
     /* Toggle on: honest entries appear with a dashed outline, totals identical. */
-    await evaluate(cdp, `document.querySelector(".tiles-unatt .unatt-btn").click()`);
-    await waitFor(cdp, `!!document.querySelector('.tiles-unatt .unatt-btn[aria-pressed="true"]')`, "toggle on");
+    await evaluate(cdp, `document.querySelector(".pulse-unatt .unatt-btn").click()`);
+    await waitFor(cdp, `!!document.querySelector('.pulse-unatt .unatt-btn[aria-pressed="true"]')`, "toggle on");
     const shown = await evaluate(cdp, READ);
     ok(shown.listed.indexOf("model not recorded") >= 0, `unknown model not listed after Show: ${shown.listed.slice(0, 300)}`);
     eq(shown.btns.length, 2, "two toggle buttons after Show");
@@ -420,13 +422,13 @@ async function main() {
 
     /* Reload in the same tab: the choice persists for the session. */
     await cdp.send("Page.reload");
-    await waitFor(cdp, `!!document.querySelector('.tiles-unatt .unatt-btn[aria-pressed="true"]')`, "toggle persists");
+    await waitFor(cdp, `!!document.querySelector('.pulse-unatt .unatt-btn[aria-pressed="true"]')`, "toggle persists");
     const kept = await evaluate(cdp, READ);
     ok(kept.listed.indexOf("model not recorded") >= 0, "unknown model listing lost across reload");
 
     /* Toggle off again: the note returns. */
-    await evaluate(cdp, `document.querySelector(".tiles-unatt .unatt-btn").click()`);
-    await waitFor(cdp, `!!document.querySelector('.tiles-unatt .unatt-btn[aria-pressed="false"]')`, "toggle off");
+    await evaluate(cdp, `document.querySelector(".pulse-unatt .unatt-btn").click()`);
+    await waitFor(cdp, `!!document.querySelector('.pulse-unatt .unatt-btn[aria-pressed="false"]')`, "toggle off");
     const hidden = await evaluate(cdp, READ);
     ok(hidden.listed.indexOf("model not recorded") < 0, "unknown model listing lingers after Hide");
     eq(hidden.notes.length, 2, "notes missing after Hide");

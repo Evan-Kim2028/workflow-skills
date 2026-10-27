@@ -1971,10 +1971,10 @@ setTimeout(function () {
         )
         for marker in ("__adPlanSumsKey", "planBefore", "loadPlanSums"):
             self.assertIn(marker, draw, f"drawMain lost its one-shot plan-load guard: {marker}")
-        self.assertIn("delete secCache.program", draw)
+        self.assertIn("delete secCache.cards", draw)
         self.assertLess(
             draw.index("planBefore"),
-            draw.index("delete secCache.program"),
+            draw.index("delete secCache.cards"),
             "the section-cache delete is not gated on the load adding plan data",
         )
         cards = (STATIC / "cards" / "ws-cards.js").read_text()
@@ -3433,12 +3433,14 @@ class FinalPolishTests(unittest.TestCase):
 
     def test_exec_section_order_activity_stack(self):
         """One Activity over time card replaces the separate chart
-        sections: on both exec scopes the registry order is ... plan,
-        activity, finished, the planning-versus-execution stacked bars
-        follow, and progress over time is the third strip inside the
-        stack (no standalone progress section anywhere). The sidenav
-        derives its order from the DOM, so no pin there; the page
-        comment and DESIGN.md name the same order."""
+        sections: on both exec scopes the registry order is ... running,
+        plan, activity, finished, the planning-versus-execution
+        stacked bars follow, and progress over time is the third strip
+        inside the stack (no standalone progress section anywhere). The
+        pulse KPI strip owns the overview numbers, so tiles stay on
+        workstream tabs only; the pulse card leads the overview. The
+        sidenav derives its order from the DOM, so no pin there; the
+        page comment and DESIGN.md name the same order."""
         registry = (STATIC / "cards" / "registry.js").read_text()
         entries = re.findall(
             r'\{id:\s*"([^"]+)",\s*order:\s*(\d+),\s*scope:\s*"([^"]+)"', registry
@@ -3449,8 +3451,8 @@ class FinalPolishTests(unittest.TestCase):
         )
         self.assertEqual(
             [ident for _, ident in both],
-            ["tiles", "running", "plan", "linear", "activity", "finished"],
-            "exec order drifted: want the Linear card and the activity stack between plan and finished",
+            ["running", "plan", "activity", "finished"],
+            "exec order drifted: want running, plan, the activity stack, finished",
         )
         for gone in ('"tokens"', '"gantt"', '"conc"', '"progress"'):
             self.assertNotIn(
@@ -3463,7 +3465,21 @@ class FinalPolishTests(unittest.TestCase):
         ws = [ident for _, ident in sorted(by_scope.get("workstream", []))]
         self.assertEqual(ws[-1], "phases-ws", "the workstream usage card is not the last workstream section")
         ov = [ident for _, ident in sorted(by_scope.get("overview", []))]
-        self.assertEqual(ov[-1], "phases-all", "the overall usage card is not the last section")
+        self.assertEqual(
+            ov,
+            ["pulse", "wherego", "aggregate", "cards", "phases-all", "manage"],
+            "overview order drifted: want pulse first, then wherego, aggregate, cards, usage, and the folded manage section last",
+        )
+        both_ids = [ident for _, ident in both]
+        self.assertEqual(
+            [ident for ident in ["pulse", "wherego", "aggregate", "running", "plan", "activity", "cards", "finished", "phases-all", "manage"]
+             if ident in ov or ident in both_ids],
+            ["pulse", "wherego", "aggregate", "running", "plan", "activity", "cards", "finished", "phases-all", "manage"],
+            "overview render drifted: want pulse, wherego, running, plan, activity, cards, finished, usage, then the folded manage section last",
+        )
+        ws_only = [ident for _, ident in sorted(by_scope.get("workstream", []))]
+        self.assertEqual(ws_only[0], "wshead", "the workstream heading is not the first workstream section")
+        self.assertEqual(ws_only[1], "tiles", "tiles no longer follow the workstream heading")
         orders = {ident: int(order) for ident, order, _scope in entries}
         self.assertGreater(orders["phases-ws"], orders["finished"], "the workstream usage card sits before Finished")
         stack = (STATIC / "cards" / "activity.js").read_text()
@@ -3473,7 +3489,7 @@ class FinalPolishTests(unittest.TestCase):
         self.assertNotIn('"exec-progress"', stack, "the strip reuses the plan map card id")
         self.assertIn("actProgKey(", registry, "the activity section key lost the progress payload")
         page = (STATIC / "index.html").read_text()
-        self.assertIn("plan, activity, finished", page)
+        self.assertIn("plan, activity). The running", page)
         self.assertIn("progress-over-time", page)
         self.assertNotIn("charts last on workstream tabs", page)
         self.assertIn('<script src="/static/cards/activity.js"></script>', page)
@@ -4562,13 +4578,12 @@ class LinearCardRulesTests(unittest.TestCase):
         self.assertIn("linFilter(data.workstreams, state.ws)", self.js)
         self.assertIn('if (!ws || ws === "all") return all;', self.js)
 
-    def test_registry_line_is_scope_both(self):
-        self.assertRegex(self.registry, r'\{id: "linear", order: \d+, scope: "both"')
+    def test_registry_no_longer_registers_the_card(self):
+        self.assertNotIn('id: "linear"', self.registry, "the Linear card is back on the Execution views")
 
-    def test_page_loads_card_assets(self):
-        self.assertIn('href="/static/cards/linear.css"', self.page)
-        self.assertIn('src="/static/cards/linear.js"', self.page)
-        self.assertLess(self.page.index("/static/cards/linear.js"), self.page.index("/static/cards/registry.js"))
+    def test_page_no_longer_loads_card_assets(self):
+        self.assertNotIn("/static/cards/linear.css", self.page)
+        self.assertNotIn("/static/cards/linear.js", self.page)
 
     def test_recent_changes_use_shared_disclosure(self):
         self.assertIn('discloseRows(recentAll, "linear-recent", "changes")', self.js)

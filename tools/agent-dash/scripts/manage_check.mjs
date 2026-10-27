@@ -146,10 +146,17 @@ async function main() {
       await sleep(400);
     }
   }
+  /* The management table sits in the closed "Manage workstreams (N)"
+     disclosure on the overview: open it before the table assertions. */
+  async function openManage() {
+    await waitFor(`!!document.querySelector('.mg-disclose > .disclose-btn')`);
+    await ev(`(function(){var b=document.querySelector('.mg-disclose > .disclose-btn');if(b&&b.getAttribute('aria-expanded')==='false')b.click();})()`);
+  }
 
   await send("Page.enable");
   await send("Runtime.enable");
   await send("Page.navigate", { url: `${URL}/?view=exec&ws=all` });
+  await openManage();
   check("current table shows the top 5 by default", await waitFor(
     `document.querySelectorAll('[data-mg-rows] tr').length === 5`), "want the top-5 default");
   await ev(`(function(){var bs=document.querySelectorAll('[data-mg-more] button');for(var i=0;i<bs.length;i++){if(/Show all/.test(bs[i].textContent)){bs[i].click();break;}}})()`);
@@ -172,6 +179,7 @@ async function main() {
   await key("press", "Enter");
   check("enter picks the hot row", await waitFor(`location.href.indexOf('ws=${firstWs}')>=0`, 8000), `picked ${firstWs}`);
   await send("Page.navigate", { url: `${URL}/?view=exec&ws=all` });
+  await openManage();
   await waitFor(`document.querySelectorAll('[data-mg-rows] tr').length >= 13`);
 
   // Pin one workstream from the switcher.
@@ -215,6 +223,7 @@ async function main() {
   // Phone: bar height and no sideways page scroll.
   await send("Emulation.setDeviceMetricsOverride", { width: 390, height: 844, deviceScaleFactor: 1, mobile: true });
   await send("Page.navigate", { url: `${URL}/?view=exec&ws=all` });
+  await openManage();
   await waitFor(`document.querySelectorAll('[data-mg-rows] tr').length >= 13`);
   const phoneH = await text(`Math.round(document.querySelector('.topbar').getBoundingClientRect().height)`);
   const sideways = await text(`document.documentElement.scrollWidth - document.documentElement.clientWidth`);
@@ -229,11 +238,13 @@ async function main() {
   }
   await send("Emulation.setDeviceMetricsOverride", { width: 1440, height: 1000, deviceScaleFactor: 1, mobile: false });
   await send("Page.navigate", { url: `${URL}/?view=exec&ws=all` });
+  await openManage();
   await waitFor(`document.querySelectorAll('[data-mg-rows] tr').length >= 39`, 30000);
   const bar40 = await text(`Math.round(document.querySelector('.topbar').getBoundingClientRect().height)`);
   check("pinned bar is at most 48px on desktop (40 workstreams)", bar40 <= 48, `got ${bar40}px`);
   await send("Emulation.setDeviceMetricsOverride", { width: 390, height: 844, deviceScaleFactor: 1, mobile: true });
   await send("Page.navigate", { url: `${URL}/?view=exec&ws=all` });
+  await openManage();
   await waitFor(`document.querySelectorAll('[data-mg-rows] tr').length >= 39`, 30000);
   const phone40 = await text(`Math.round(document.querySelector('.topbar').getBoundingClientRect().height)`);
   check("pinned bar is at most 44px on phones (40 workstreams)", phone40 <= 44, `got ${phone40}px`);

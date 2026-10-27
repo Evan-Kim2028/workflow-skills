@@ -102,6 +102,9 @@ await cappedList("running-now",
   `#exec-running .runmore`);
 const runBtnCtl = await text(`(function(){var b=document.querySelector('#exec-running .runmore');return b&&b.getAttribute('aria-controls');})()`);
 check("running button controls rows", runBtnCtl === "exec-running-rows", String(runBtnCtl));
+await waitFor(`!!document.querySelector('.mg-disclose > .disclose-btn')`);
+await ev(`(function(){var b=document.querySelector('.mg-disclose > .disclose-btn');if(b&&b.getAttribute('aria-expanded')==='false')b.click();})()`);
+await waitFor(`document.querySelectorAll('[data-mg-rows] tr').length > 0`);
 await cappedList("manage-current",
   `document.querySelectorAll('[data-mg-rows] tr').length`,
   `[data-mg-more] .disclose-btn`);
@@ -113,18 +116,19 @@ await cappedList("where-we-are",
 await cappedList("phase-usage",
   `document.querySelectorAll('#phase-usage-list .ph-row').length`,
   `.phase-usage .disclose-btn`);
-const tilesCap = await text(`(function(){var x=document.querySelector('#exec-tiles');return x?x.textContent:'';})()`);
-if (tilesCap.indexOf("partial") >= 0) {
-  check("tile caption names pass/partial/blocked/died",
-    tilesCap.indexOf("pass") >= 0 && tilesCap.indexOf("blocked") >= 0 && tilesCap.indexOf("died") >= 0, tilesCap.slice(0, 160));
-}
-const swatches = await text(`(function(){var out={};document.querySelectorAll('#exec-runs .legend span').forEach(function(s){var t=s.textContent.trim();var sw=s.querySelector('.sw');if(sw&&/blocked|died/.test(t))out[t]=getComputedStyle(sw).backgroundColor;});return JSON.stringify(out);})()`);
-console.log(`info  timeline swatches: ${swatches}`);
+/* The overview's pulse KPI strip owns the numbers now (the tiles stay on
+   workstream tabs): the Finished KPI always states its 24 h window, so
+   the check asserts on that cell rather than skipping when it is absent. */
+const finCap = await text(`(function(){var x=document.querySelector('#x-pulse [data-kpi="finished"]');return x?x.textContent:'';})()`);
+check("pulse finished KPI names its 24 h verdict window", /\(24 h\)|none in 24 h/.test(finCap || ""), String(finCap).slice(0, 160));
+/* The run timeline legend is gone from the overview (the activity stack
+   replaced it); the verdict colours now live on the pulse Finished bar,
+   one span per verdict titled with its label. */
+const swatches = await text(`(function(){var out={};document.querySelectorAll('#x-pulse [data-kpi="finished"] .pulse-stack span').forEach(function(s){var t=s.getAttribute('title')||'';var m=/blocked|died/.exec(t);if(m)out[m[0]]=getComputedStyle(s).backgroundColor;});return JSON.stringify(out);})()`);
+console.log(`info  verdict swatches: ${swatches}`);
 try {
   const sw = JSON.parse(swatches);
-  const keys = Object.keys(sw);
-  const b = sw[keys.find((k) => k.indexOf("blocked") >= 0)], d = sw[keys.find((k) => k.indexOf("died") >= 0)];
-  check("blocked and died swatches differ", b && d && b !== d, `${b} vs ${d}`);
+  check("blocked and died swatches differ", !!sw.blocked && !!sw.died && sw.blocked !== sw.died, `${sw.blocked} vs ${sw.died}`);
 } catch { check("blocked and died swatches differ", false, swatches); }
 
 // ---- WS9 tab: plan progress without the strip ----

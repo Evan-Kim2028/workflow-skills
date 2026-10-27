@@ -661,7 +661,7 @@
       /* One entry per model@harness series in family order: the word
          names the model and the harness, the shade names the harness
          within its family hue. */
-      allKs.forEach(function (k) {
+      ks.forEach(function (k) {
         if (!keyTot[k]) return;
         var sp = el("span", {class: "lentry", "data-key": k, "data-v": String(keyTot[k]), title: actLegendTip(ADM.seriesName(k), keyTot[k])});
         var sw = el("i", {class: "sw"}); sw.style.background = ADM.seriesColor(k, allKs); sp.appendChild(sw);

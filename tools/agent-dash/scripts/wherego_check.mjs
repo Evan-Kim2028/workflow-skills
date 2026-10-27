@@ -397,7 +397,7 @@ async function main() {
       if (legend.some((l) => l.tag !== "BUTTON")) fail("legend items are not real <button>s");
       const order = await evaluate(cdp, orderExpr);
       const i = order.indexOf("wherego");
-      eq(JSON.stringify(order.slice(i - 1, i + 1)), JSON.stringify(["tiles", "wherego"]), `card sits right below the tiles (order: ${order.join(",")})`);
+      eq(JSON.stringify(order.slice(i - 1, i + 1)), JSON.stringify(["pulse", "wherego"]), `card sits right below pulse, where the tiles used to be (order: ${order.join(",")})`);
     });
 
     check("cost pill rebuilds only this section", async () => {

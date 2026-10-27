@@ -251,11 +251,18 @@ function readDomExpression(ws) {
     var s = window.__adSettled || "";
     var parts = String(s).split("|");
     if (parts[0] !== ${JSON.stringify(ws)} || parts[1] !== ${JSON.stringify(String(WINDOW_HOURS))}) return null;
-    var tile = document.querySelector('#exec-tiles [data-tile="tokens"]');
+    /* The pulse KPI strip owns the overview numbers (tiles stay on
+       workstream tabs only), so the overview tab reads its KPI cells. */
+    var onOverview = ${JSON.stringify(ws)} === "all";
+    var tile = onOverview
+      ? document.querySelector('#x-pulse [data-kpi="tokens"]')
+      : document.querySelector('#exec-tiles [data-tile="tokens"]');
     if (!tile) return null;
     if (tile.getAttribute("data-ws") !== ${JSON.stringify(ws)}) return {bleed: tile.getAttribute("data-ws")};
     if (tile.getAttribute("data-hours") !== ${JSON.stringify(String(WINDOW_HOURS))}) return null;
-    var cost = document.querySelector('#exec-tiles [data-tile="cost"]');
+    var cost = onOverview
+      ? document.querySelector('#x-pulse [data-kpi="cost"]')
+      : document.querySelector('#exec-tiles [data-tile="cost"]');
     var lg = document.querySelector('#exec-activity .ltotal');
     var emptyChart = !lg && !!document.querySelector('#exec-activity .empty');
     if (!lg && !emptyChart) return null;
@@ -579,7 +586,9 @@ async function main() {
             growthReads++;
           }
           if (tileTok === 0) {
-            // Zero with context: "0 in 24 h" plus the last run and all-time line.
+            // Zero with context: "0 in 24 h" and the last-run/all-time
+            // line, on the tiles (workstream tabs) and the pulse KPI cell
+            // (overview) alike.
             const text = (dom.tile.text || "").replace(/\s+/g, " ");
             const allTimeTok = billed(snapAfter.totals_all_time.tokens);
             if (!text.includes(`0 in ${hours} h`)) {

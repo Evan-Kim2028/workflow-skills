@@ -9,6 +9,7 @@
 <link rel="stylesheet" href="/static/plan.css">
 <link rel="stylesheet" href="/static/cards/plan-progress.css">
 <link rel="stylesheet" href="/static/cards/tiles.css">
+<link rel="stylesheet" href="/static/cards/pulse.css">
 <link rel="stylesheet" href="/static/cards/wherego.css">
 <link rel="stylesheet" href="/static/cards/timeline.css">
 <link rel="stylesheet" href="/static/cards/aggregate.css">
@@ -19,7 +20,6 @@
 <link rel="stylesheet" href="/static/cards/planned.css">
 <link rel="stylesheet" href="/static/cards/archive.css">
 <link rel="stylesheet" href="/static/cards/decisions.css">
-<link rel="stylesheet" href="/static/cards/linear.css">
 <link rel="stylesheet" href="/static/cards/depgraph.css">
 <link rel="stylesheet" href="/static/cards/burnup.css">
 <link rel="stylesheet" href="/static/cards/phases.css">
@@ -169,7 +169,6 @@ button:focus-visible,#overall-btn:focus-visible,#ws-switcher:focus-visible,a:foc
 .copy-modal textarea{width:100%;min-height:200px;font:12px var(--mono);background:var(--surface-2);color:var(--ink);border:1px solid var(--ring);border-radius:8px;padding:8px}
 
 
-/* working-now pills: moved to static/cards/plan-progress.css */
 
 /* Slim pinned row: the only chrome that stays on screen while scrolling
    (project name, Overall, selected chip, Workstreams switcher, pins).
@@ -240,6 +239,7 @@ html{scroll-padding-top:calc(var(--pinned-h) + 10px)}
 <script src="/static/core/manage.js"></script>
 <script src="/static/plan.js"></script>
 <script src="/static/cards/tiles.js"></script>
+<script src="/static/cards/pulse.js"></script>
 <script src="/static/cards/wherego.js"></script>
 <script src="/static/cards/timeline.js"></script>
 <script src="/static/cards/aggregate.js"></script>
@@ -255,7 +255,6 @@ html{scroll-padding-top:calc(var(--pinned-h) + 10px)}
 <script src="/static/cards/burnup.js"></script>
 <script src="/static/cards/phases.js"></script>
 <script src="/static/cards/progress.js"></script>
-<script src="/static/cards/linear.js"></script>
 <script src="/static/cards/registry.js"></script>
 <script>
 (function () {
@@ -283,7 +282,7 @@ html{scroll-padding-top:calc(var(--pinned-h) + 10px)}
   /* One plan-sum load per workstream set. A tiny or brand-new dashboard
      keeps planSum empty (no plans yet), so re-arming the load on every
      drawMain while planSum is empty re-renders forever: each load settles
-     empty, deletes the program section and draws again, which re-arms the
+     empty, redraws the overview cards and draws again, which re-arms the
      next load. The key below marks the set done even when nothing came
      back; only a changed set, or a load that actually added plan data,
      draws again. */
@@ -299,14 +298,15 @@ html{scroll-padding-top:calc(var(--pinned-h) + 10px)}
       applySections(m, projectSpecs(snap));
       return;
     }
-    /* Cards run in registry order (static/cards/registry.js): program,
-       tiles, running, cards, plan, activity, finished, then the
-       planning-versus-execution stacked bars last. The activity card
-       holds the tokens, run-timeline, progress-over-time and live-agents
-       strips on one shared x axis (plan, activity, finished). The
-       running/tiles specs key on state.snapError so a failed scope reads
-       "request failed" instead of zeros; the finished spec subtitles its
-       table with finishedSub(snap) ("Newest N of M"). */
+    /* Cards run in registry order (static/cards/registry.js): pulse,
+       running, plan, activity, cards, finished, the planning-versus-execution
+       stacked bars, then the management table in a closed disclosure last.
+       The activity card holds the tokens, run-timeline,
+       progress-over-time and live-agents strips on one shared x axis
+       (plan, activity). The running/pulse specs key on
+       state.snapError so a failed scope reads "request failed" instead
+       of zeros; the finished spec subtitles its table with
+       finishedSub(snap) ("Newest N of M"). */
     var forOverview = state.ws === "all";
     var specs = [];
     AdPage.cardRegistry.slice().sort(function (a, b) { return a.order - b.order; }).forEach(function (card) {
@@ -320,7 +320,7 @@ html{scroll-padding-top:calc(var(--pinned-h) + 10px)}
         window.__adPlanSumsKey = planSetKey;
         var planBefore = Object.keys(planSum).length;
         (typeof maybeLoadPlanSums === "function" ? maybeLoadPlanSums() : loadPlanSums()).then(function () {
-          if (Object.keys(planSum).length !== planBefore) { delete secCache.program; delete secCache.cards; drawMain(); }
+          if (Object.keys(planSum).length !== planBefore) { delete secCache.cards; drawMain(); }
         });
       }
     }

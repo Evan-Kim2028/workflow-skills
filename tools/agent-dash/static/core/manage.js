@@ -10,6 +10,8 @@
    Start. The workstream tab heading carries the same primary action as a
    split button with the remaining actions in its menu, and Project home
    and Planned rows reuse the primary through primaryFor.
+   On the overview the table sits last inside a closed disclosure
+   ("Manage workstreams (N)", manageDisclosureSpec).
    The table shows the first 5 matching rows by default with the shared
    disclosure control below it ("Show all N workstreams" / "Show top 5
    workstreams", per-filter state in sessionStorage, default collapsed);
@@ -26,7 +28,7 @@
    Start toast (active has no way back to planned). In read-only mode
    every action button becomes a copy-command button, as archive does.
    Exports (on window.AdManage, also kept as plain globals): primaryFor,
-   runDescriptor, manageSpec, wsHeaderSpec, keysPop, toastUndo,
+   runDescriptor, manageSpec, manageDisclosureSpec, wsHeaderSpec, keysPop, toastUndo,
    openConfirm, manageEnabled, reverseOf.
    Needs: el, state, ADT, apiPost, loadNav, refreshAll, refreshProject,
    isProjectView, selectTab, openPlan, showToast, fmtN, fmtUsd, fmtDate,
@@ -783,7 +785,7 @@
     });
     var key = (typeof keyOf === "function" ? keyOf([sig, manageEnabled()]) : String(sig.length));
     return ["manage", key, function () {
-      var wrap = el("div", {class: "card mg-wrap", "data-nav": "Manage", "data-manage": "1"});
+      var wrap = el("div", {class: "card mg-wrap", "data-manage": "1"});
       wrap.appendChild(el("h2", {text: "Workstreams"}));
       wrap.appendChild(el("p", {class: "sub", text: "Start, pause, resume, finish, archive — one row at a time or in bulk. Changes apply immediately, with Undo."}));
       var bar = el("div", {class: "mg-toolbar"});
@@ -846,6 +848,34 @@
       paintBulk();
       return wrap;
     }, ""];
+  }
+
+  /* The management table is the last overview section, inside a closed
+     disclosure titled "Manage workstreams (N)". Open state lives in the
+     shared disclosure store under one name, and the table renders only
+     while open, so a collapsed section costs nothing. */
+  var MANAGE_DISCLOSE = "manage-workstreams";
+  var MANAGE_BODY_ID = "mg-disclose-body";
+  function manageDisclosureSpec() {
+    var open = readDisclosed(MANAGE_DISCLOSE);
+    var n = tableRowsUnfiltered().length;
+    var inner = open ? manageSpec() : null;
+    var key = keyOf([open, n, inner ? inner[1] : null]);
+    return ["manage", key, function () {
+      var wrap = el("div", {class: "mg-disclose", "data-nav": "Manage"});
+      var head = el("button", {type: "button", class: "disclose-btn", "aria-expanded": open ? "true" : "false",
+        "aria-controls": MANAGE_BODY_ID, text: "Manage workstreams (" + n + ")"});
+      head.addEventListener("click", function () {
+        writeDisclosed(MANAGE_DISCLOSE, !readDisclosed(MANAGE_DISCLOSE));
+        discloseRedraw("manage", MANAGE_BODY_ID)();
+      });
+      wrap.appendChild(head);
+      var body = el("div", {id: MANAGE_BODY_ID});
+      if (open) body.appendChild(inner[2]());
+      else body.hidden = true;
+      wrap.appendChild(body);
+      return wrap;
+    }, "margin-top:14px"];
   }
 
   /* The workstream tab heading cluster: state pill plus the primary as
@@ -943,6 +973,7 @@
   AdM.manage.primaryFor = primaryFor;
   AdM.manage.runDescriptor = runDescriptor;
   AdM.manage.manageSpec = manageSpec;
+  AdM.manage.manageDisclosureSpec = manageDisclosureSpec;
   AdM.manage.wsHeaderSpec = wsHeaderSpec;
   AdM.manage.keysPop = keysPop;
   AdM.manage.toastUndo = toastUndo;
@@ -954,6 +985,7 @@
   global.primaryFor = primaryFor;
   global.runDescriptor = runDescriptor;
   global.manageSpec = manageSpec;
+  global.manageDisclosureSpec = manageDisclosureSpec;
   global.wsHeaderSpec = wsHeaderSpec;
   global.keysPop = keysPop;
   global.toastUndo = toastUndo;

@@ -59,11 +59,11 @@
      gating: load at once, exactly as before. */
   var planIO = null, planWanted = false;
   /* After a deferred load lands, redraw only when it added plan data,
-     mirroring the overview one-shot: the section cache keys the program
-     panel on planSum, so without the delete the bars stay skeleton. */
+     mirroring the overview one-shot: the section cache keys the overview
+     cards on planSum, so without the delete the bars stay skeleton. */
   function planSumsSettled(before) {
     if (Object.keys(planSum).length !== before) {
-      try { delete secCache.program; delete secCache.cards; } catch (e) {}
+      try { delete secCache.cards; } catch (e) {}
       if (typeof drawMain === "function") drawMain();
     }
   }
