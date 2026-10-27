@@ -12,7 +12,10 @@
    one muted band at the bottom). Undated done tasks render as a flat
    muted baseline band labelled once in the legend, never a banner.
    Hover lifts a band with a tooltip; click opens that workstream's exec
-   tab. Both payloads cached per minute with the stamp-in-key pattern.
+   tab. Progress is not fetched here: it comes from the shared
+   AdPage.loadWsProgress (activity.js), one request per plan stamp shared
+   with the Activity strip. Burn-up and usage refetch at most once per
+   minute (their stamps carry the minute bucket).
    Why not reuse burnup.js drawing: its frame assumes UTC-day slots with
    its own tabs, gap band, UTC-day ticks and first-seen colorOf mapping;
    this card needs a shared linear axis across daily and hourly sources,
@@ -124,10 +127,13 @@
 
   function aggModeIs() { return aggMode; }
 
-  /* Stamps behind the section key: plan sums for progress, the ws id set
-     for burnup/usage, each plus a loaded flag so arrivals redraw once.
-     All three payloads refetch at most once per minute (the key carries
-     the minute bucket; the conditional-GET layer 304s when unchanged). */
+  /* Stamps behind the section key. Progress keys on the plan stamp and
+     shares one fetch with the Activity strip. Burn-up and usage key on
+     the workstream id set plus the minute bucket, so each refetches at
+     most once per minute while the page is open. Each payload records its
+     stamp on success and on failure, so a failed fetch retries on the next
+     minute and never on every redraw. */
+  function aggMinute() { return Math.floor(Date.now() / 60000); }
   function aggProgStamp() {
     try { if (typeof actProgStamp === "function") return actProgStamp("all"); } catch (e) {}
     try {
@@ -143,6 +149,8 @@
     try { return ((state.wss || []).map(function (w) { return w.ws; }).sort().join(",")); }
     catch (e) { return ""; }
   }
+  function aggBurnStamp() { return aggWsStamp() + "|" + aggMinute(); }
+  function aggUsageStamp() { return aggWsStamp() + "|" + aggMinute(); }
   function aggProgKey() {
     var c = (typeof state !== "undefined") && state.aggProg;
     var ok = (c && c.stamp === aggProgStamp() && c.data) ? "1" : "0";
@@ -150,29 +158,32 @@
   }
   function aggBurnKey() {
     var c = (typeof state !== "undefined") && state.aggBurn;
-    var ok = (c && c.stamp === aggWsStamp() && c.data) ? "1" : "0";
-    return aggWsStamp() + "|" + ok;
+    var stamp = aggBurnStamp();
+    var ok = (c && c.stamp === stamp && c.data) ? "1" : "0";
+    return stamp + "|" + ok;
   }
   function aggUsageKey() {
     var c = (typeof state !== "undefined") && state.aggUsage;
-    var ok = (c && c.stamp === aggWsStamp() && c.data) ? "1" : "0";
-    return aggWsStamp() + "|" + ok;
+    var stamp = aggUsageStamp();
+    var ok = (c && c.stamp === stamp && c.data) ? "1" : "0";
+    return stamp + "|" + ok;
   }
+  function aggFailed(e) { return String((e && e.message) || e || "fetch failed"); }
   function aggEnsureProg(stamp) {
     var c = state.aggProg;
     if (c && c.stamp === stamp) return;
     if (aggProgInflight === stamp) return;
     aggProgInflight = stamp;
-    api("/api/ws/progress", {ws: "all"}).then(function (j) {
+    global.AdPage.loadWsProgress("all", stamp).then(function (data) {
       aggProgInflight = null;
       if (state.ws !== "all" || state.view !== "exec") return;
-      state.aggProg = {stamp: stamp, data: (j && j.wsprogress) || null, error: null};
+      state.aggProg = {stamp: stamp, data: data, error: data ? null : "no progress payload"};
       try { delete secCache.aggregate; } catch (e) {}
       drawMain();
     }, function (e) {
       aggProgInflight = null;
       if (state.ws !== "all" || state.view !== "exec") return;
-      state.aggProg = {stamp: stamp, data: null, error: String((e && e.message) || e || "fetch failed")};
+      state.aggProg = {stamp: stamp, data: null, error: aggFailed(e)};
       try { delete secCache.aggregate; } catch (e2) {}
       drawMain();
     });
@@ -185,13 +196,14 @@
     api("/api/project/burnup", {}).then(function (j) {
       aggBurnInflight = null;
       if (state.ws !== "all" || state.view !== "exec") return;
-      state.aggBurn = {stamp: stamp, data: (j && j.burnup) || null, error: null};
+      var data = (j && j.burnup) || null;
+      state.aggBurn = {stamp: stamp, data: data, error: data ? null : "no burn-up payload"};
       try { delete secCache.aggregate; } catch (e) {}
       drawMain();
     }, function (e) {
       aggBurnInflight = null;
       if (state.ws !== "all" || state.view !== "exec") return;
-      state.aggBurn = {stamp: stamp, data: null, error: String((e && e.message) || e || "fetch failed")};
+      state.aggBurn = {stamp: stamp, data: null, error: aggFailed(e)};
       try { delete secCache.aggregate; } catch (e2) {}
       drawMain();
     });
@@ -210,7 +222,7 @@
     }, function (e) {
       aggUsageInflight = null;
       if (state.ws !== "all" || state.view !== "exec") return;
-      state.aggUsage = {stamp: stamp, data: null, error: String((e && e.message) || e || "fetch failed")};
+      state.aggUsage = {stamp: stamp, data: null, error: aggFailed(e)};
       try { delete secCache.aggregate; } catch (e2) {}
       drawMain();
     });
@@ -347,10 +359,10 @@
     /* Legend values carry each workstream's undated share too, so the
        legend total agrees with the headline; flat-zero series stay out
        of the legend (the Total covers them), as on the burn-up card. */
-    var legOrder = order.filter(function (ws) {
-      return (lastOf[ws] || 0) + ((byWs[ws] && +byWs[ws].undated) || 0) > 0;
-    });
-    aggLegend(host, legOrder, function (ws) { return (lastOf[ws] || 0) + ((byWs[ws] && +byWs[ws].undated) || 0); }, fmtN, "tasks", undLabel);
+    var legVal = function (ws) { return (lastOf[ws] || 0) + ((byWs[ws] && +byWs[ws].undated) || 0); };
+    var legOrder = order.filter(function (ws) { return legVal(ws) > 0; })
+      .sort(function (a, z) { return legVal(z) - legVal(a); });
+    aggLegend(host, legOrder, legVal, fmtN, "tasks", undLabel);
     var H = 230, T = 10, Bm = 34, ph = H - T - Bm;
     var X = function (t) { return g.L + g.pw * (t - dom.t0) / Math.max(1, dom.t1 - dom.t0); };
     var ticks = timeTicks(dom.t0, dom.t1, X, Math.max(2, Math.floor(g.pw / 120)));
@@ -392,7 +404,6 @@
     });
     var topLine = cumTop.map(function (v, i) { return aggR1(xs[i]) + "," + aggR1(Y(v)); }).join(" L");
     if (topLine) svg.appendChild(s("polyline", {points: topLine, fill: "none", stroke: "var(--ink)", "stroke-width": "1.6", "data-top": String(cumTop.length ? cumTop[cumTop.length - 1] : 0)}));
-    (p.points || []).forEach(function () {});
     if ((p.points || []).length > 1) {
       var lp = (p.points || []).filter(function (pt) { return pt.t >= dom.t0 && pt.t <= dom.t1; }).map(function (pt) {
         return aggR1(X(pt.t)) + "," + aggR1(Y(undated + (+pt.done || 0)));
@@ -541,10 +552,9 @@
     var c = el("div", {class: "card agg", id: "exec-aggregate", "data-nav": "Aggregate"});
     c.appendChild(el("h2", {text: "Aggregated progress"}));
     c.appendChild(el("p", {class: "sub", text: "Program totals plus accumulated activity across workstreams on one shared time axis."}));
-    var ps = aggProgStamp(), ws = aggWsStamp();
-    aggEnsureProg(ps);
-    aggEnsureBurn(ws);
-    aggEnsureUsage(ws);
+    aggEnsureProg(aggProgStamp());
+    aggEnsureBurn(aggBurnStamp());
+    aggEnsureUsage(aggUsageStamp());
     var prog = state.aggProg, burn = state.aggBurn, usage = state.aggUsage;
     var bad = (prog && prog.error) || (burn && burn.error) || (usage && usage.error);
     var missing = !(prog && prog.data) || !(burn && burn.data) || !(usage && usage.data);

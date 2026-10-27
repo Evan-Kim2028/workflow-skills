@@ -109,6 +109,97 @@ console.log("wscolor ok");
             )
         self.assertEqual(proc.returncode, 0, proc.stderr or proc.stdout)
 
+    def _run_fetch_harness(self, mode):
+        harness = r"""
+const fs = require("fs");
+const assert = require("assert");
+const MODE = "__MODE__";
+global.window = globalThis;
+global.AdPage = {};
+function node() {
+  const target = {};
+  const proxy = new Proxy(target, {
+    get(t, k) {
+      if (k in t || typeof k === "symbol") return t[k];
+      return (t[k] = () => proxy);
+    },
+    set(t, k, v) { t[k] = v; return true; },
+  });
+  return proxy;
+}
+global.el = () => node();
+["s", "axes", "timeTicks", "fmtN", "fmtUsd", "showTip", "hideTip", "keyOf", "colorOf", "niceMax", "go", "drawMain"].forEach(function (k) {
+  global[k] = () => node();
+});
+global.CW = () => 800;
+global.secCache = {};
+global.state = {ws: "all", view: "exec", wss: []};
+let now = 0;
+Date.now = () => now;
+const calls = {};
+global.api = function (path) {
+  calls[path] = (calls[path] || 0) + 1;
+  if (path === "/api/ws/progress") return Promise.resolve({wsprogress: {ws: "all", total: 1, done: 0, points: []}});
+  if (MODE === "fail") return Promise.reject(new Error("boom"));
+  if (path === "/api/project/burnup") return Promise.resolve({burnup: {days: [], tasks: {by_workstream: {}, project: []}}});
+  return Promise.resolve({buckets: []});
+};
+eval(fs.readFileSync(process.argv[2], "utf8"));
+eval(fs.readFileSync(process.argv[3], "utf8"));
+const tick = () => new Promise((r) => setTimeout(r, 0));
+async function settle() { await tick(); await tick(); await tick(); }
+(async function main() {
+  assert.strictEqual(typeof AdPage.loadWsProgress, "function", "loadWsProgress missing");
+  // Activity and Aggregate share one progress fetch per plan stamp.
+  const stamp = AdPage.actProgStamp("all");
+  AdPage.loadWsProgress("all", stamp);
+  AdPage.loadWsProgress("all", stamp);
+  await settle();
+  assert.strictEqual(calls["/api/ws/progress"], 1, "progress fetched more than once for one stamp");
+  if (MODE === "ok") {
+    // Three minute rolls with redraws in between: one burn-up and one usage fetch per minute.
+    for (let m = 0; m < 3; m++) {
+      now = m * 60000 + 1000;
+      aggregateCard();
+      aggregateCard();
+      await settle();
+      aggregateCard();
+      aggregateCard();
+    }
+    assert.strictEqual(calls["/api/project/burnup"], 3, "burn-up refetch count " + calls["/api/project/burnup"]);
+    assert.strictEqual(calls["/api/usage"], 3, "usage refetch count " + calls["/api/usage"]);
+    assert.strictEqual(calls["/api/ws/progress"], 1, "progress must stay on the plan stamp");
+  } else {
+    // Failing burn-up and usage: one attempt per minute, never per redraw.
+    for (let m = 0; m < 3; m++) {
+      now = m * 60000 + 1000;
+      for (let i = 0; i < 4; i++) aggregateCard();
+      await settle();
+    }
+    assert.strictEqual(calls["/api/project/burnup"], 3, "burn-up attempts " + calls["/api/project/burnup"]);
+    assert.strictEqual(calls["/api/usage"], 3, "usage attempts " + calls["/api/usage"]);
+  }
+  console.log("aggregate fetch guards ok (" + MODE + ")");
+})().catch(function (e) { console.error(e); process.exit(1); });
+""".replace("__MODE__", mode)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "fetch.js"
+            path.write_text(harness, encoding="utf-8")
+            proc = subprocess.run(
+                ["node", str(path), str(CARDS / "activity.js"), str(CARDS / "aggregate.js")],
+                capture_output=True,
+                text=True,
+            )
+        return proc
+
+    def test_fetch_guards_refresh_per_minute_node(self):
+        proc = self._run_fetch_harness("ok")
+        self.assertEqual(proc.returncode, 0, proc.stderr or proc.stdout)
+
+    def test_fetch_guards_failure_retries_per_minute_node(self):
+        proc = self._run_fetch_harness("fail")
+        self.assertEqual(proc.returncode, 0, proc.stderr or proc.stdout)
+
     def test_wiring(self):
         reg = (STATIC / "cards" / "registry.js").read_text(encoding="utf-8")
         self.assertIn('{id: "aggregate", order: 24, scope: "overview"', reg)
