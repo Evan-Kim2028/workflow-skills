@@ -1692,8 +1692,10 @@ setTimeout(function () {
         """pickWs on a planned row opens that workstream's plan while the
         view is Plan; from any other view it opens the Planned shelf and
         selects the row (archived rows likewise select into the Archive
-        view). Source-level stubs: selectTab and selectView are recorded,
-        not run."""
+        view). A planned row with activity (first agent started, state not
+        yet flipped) opens like an active row: from Execution it stays on
+        Execution. Source-level stubs: selectTab and selectView are
+        recorded, not run."""
         script = (
             "const fs=require('fs');"
             "globalThis.window=globalThis;"
@@ -1707,6 +1709,7 @@ setTimeout(function () {
             "globalThis.isProjectView=function(){return ['project','planned','archive'].indexOf(state.view)>=0;};"
             "globalThis.state={view:'plan',ws:'all',wss:[],wssAll:["
             "{ws:'WS13',name:'Planned one',state:'planned'},"
+            "{ws:'WS20',name:'Started one',state:'planned',live_agents:3},"
             "{ws:'WS4',name:'Live one',state:'active'},"
             "{ws:'WS9',name:'Old one',state:'archived'}],bundles:[]};"
             "function run(view,id,st){calls.length=0;state.view=view;pickWs(id,st);return calls.slice();}"
@@ -1720,6 +1723,11 @@ setTimeout(function () {
             "assert.deepStrictEqual(run('planned','WS13','planned'),[['tab','WS13']]);"
             "assert.deepStrictEqual(run('archive','WS9','archived'),[['tab','WS9']]);"
             "assert.deepStrictEqual(run('exec','WS4','active'),[['tab','WS4']]);"
+            "assert.deepStrictEqual(run('exec','WS20','planned'),[['tab','WS20']]);"
+            "assert.strictEqual(state.view,'exec');"
+            "assert.deepStrictEqual(run('planned','WS20','planned'),[['view','exec'],['tab','WS20']]);"
+            "assert.deepStrictEqual(run('plan','WS20','planned'),[['tab','WS20']]);"
+            "assert.strictEqual(state.view,'plan');"
         )
         proc = subprocess.run(
             ["node", "-e", script, str(STATIC / "tabs.js"), str(STATIC / "core" / "switcher.js")],
@@ -1751,6 +1759,11 @@ setTimeout(function () {
             "assert.strictEqual(T.isTabState('planned'),false);"
             "assert.strictEqual(T.isTabState('archived'),false);"
             "assert.strictEqual(T.isTabState('dropped'),false);"
+            "assert.strictEqual(T.hasActivity({state:'planned'}),false);"
+            "assert.strictEqual(T.hasActivity(null),false);"
+            "assert.strictEqual(T.hasActivity({live_agents:2}),true);"
+            "assert.strictEqual(T.hasActivity({last_activity:1793111331}),true);"
+            "assert.strictEqual(T.hasActivity({tokens:0,cost_usd:0,finished_in_range:0}),false);"
         )
         proc = subprocess.run(
             ["node", "-e", script, str(STATIC / "tabs.js")],

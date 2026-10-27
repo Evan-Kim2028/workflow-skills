@@ -28,6 +28,12 @@
   function isTabState(state) {
     return state === "active" || state === "paused" || state === "done";
   }
+  /* A row has activity when any run, token, or live-agent evidence exists.
+     Planned rows with activity are the first-agent case: the state file
+     still says planned, but work already started. */
+  function hasActivity(w) {
+    return !!(w && (w.live_agents || w.last_activity || w.tokens || w.cost_usd || w.finished_in_range || w.finished_today));
+  }
 
   function normMode(mode) {
     return mode === "active" || mode === "completed" ? mode : "all";
@@ -192,6 +198,7 @@
     TAB_STATES: TAB_STATES,
     wsStateOf: wsStateOf,
     isTabState: isTabState,
+    hasActivity: hasActivity,
     isCompleted: isCompleted,
     normMode: normMode,
     applyOrder: applyOrder,

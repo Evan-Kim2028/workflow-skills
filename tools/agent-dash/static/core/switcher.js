@@ -82,7 +82,7 @@
       if (seen[key] || key === "UNASSIGNED") return;
       seen[key] = 1;
       rows.push({ws: w.ws, name: titleOf(w.ws, w.name), progress: w.progress || null,
-        state: ADT.wsStateOf(w), live: w.live_agents || 0,
+        state: ADT.wsStateOf(w), live: w.live_agents || 0, ran: ADT.hasActivity(w),
         allowed: w.allowed_actions || []});
     });
     (state.bundles || []).forEach(function (b) {
@@ -91,7 +91,7 @@
       if (seen[key]) return;
       seen[key] = 1;
       rows.push({ws: b.id, name: b.title || "", progress: (typeof progressFor === "function" ? progressFor(b.id) : null),
-        state: b.state || "active", live: 0, allowed: []});
+        state: b.state || "active", live: 0, ran: false, allowed: []});
     });
     rows = rows.filter(function (r) { return r.state !== "dropped"; });
     return rows;
@@ -131,7 +131,9 @@
      the Archive view and select the row. Planned rows open the Planned
      view and select the row, except from the Plan view: there the picked
      workstream's own plan opens (its plan bundle exists before it
-     starts), and the view stays Plan. The rest open their execution tab.
+     starts), and the view stays Plan. A planned row with activity (its
+     first agent started, state not yet flipped) is running work, so it
+     opens like an active row. The rest open their execution tab.
      selectTab is a no-op when the row is already selected, and selectView
      is a no-op when already in the view, so picking from the target view
      still moves the selection. */
@@ -144,7 +146,7 @@
     if (want === "archived") {
       if (state.view !== "archive") selectView("archive");
       selectTab(up);
-    } else if (want === "planned" && state.view !== "plan") {
+    } else if (want === "planned" && state.view !== "plan" && !(found && found.ran)) {
       if (state.view !== "planned") selectView("planned");
       selectTab(up);
     } else {

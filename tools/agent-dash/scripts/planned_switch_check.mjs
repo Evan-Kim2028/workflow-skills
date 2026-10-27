@@ -7,12 +7,15 @@
  * synthetic bundles -- never the owner's real bundles or :8765) holding
  * two active, two planned and one archived workstream, then drives the
  * live page in headless Chrome over the DevTools protocol (stdlib only):
- * from ?ws=WS1&view=planned the switcher picks WS8 (planned) and the URL
- * becomes ?ws=WS8&view=planned with the chip following; picking WS9 from
+ * from ?ws=WS1&view=planned the switcher picks WS88 (planned) and the URL
+ * becomes ?ws=WS88&view=planned with the chip following; picking WS89 from
  * inside the Planned view (the old silent no-op) moves to
- * ?ws=WS9&view=planned without a reload; switching back to WS8 works the
- * same way; the Planned list "Plan WS8" button opens ?ws=WS8&view=plan;
+ * ?ws=WS89&view=planned without a reload; switching back to WS88 works the
+ * same way; the Planned list "Plan WS88" button opens ?ws=WS88&view=plan;
  * the switcher picks the archived WS14 into ?ws=WS14&view=archive.
+ * The planned ids sit far above any real workstream: live-agent counts come
+ * from the machine process table, which the temp server cannot isolate, so
+ * a real ws8 agent would otherwise give the synthetic WS8 activity.
  * Zero console errors throughout.
  *
  * Usage: node scripts/planned_switch_check.mjs [--keep]   (keeps the temp dirs)
@@ -67,8 +70,8 @@ function freePort() {
 async function main() {
   cli("ws", "new", "WS1", "Lane WS1");
   cli("ws", "new", "WS2", "Lane WS2");
-  cli("ws", "new", "WS8", "Lane WS8", "--state", "planned");
-  cli("ws", "new", "WS9", "Lane WS9", "--state", "planned");
+  cli("ws", "new", "WS88", "Lane WS88", "--state", "planned");
+  cli("ws", "new", "WS89", "Lane WS89", "--state", "planned");
   cli("ws", "new", "WS14", "Lane WS14");
   {
     const planPath = path.join(wsDir, "WS14", "plan.json");
@@ -175,8 +178,8 @@ async function main() {
   check("planned view settles with two planned rows",
     await waitFor(`document.querySelectorAll('#planned-ready-rows tr').length === 2`), "readiness table");
   check("planned list offers both plan buttons",
-    await waitFor(`Array.prototype.some.call(document.querySelectorAll('button'),function(b){return b.textContent==='Plan WS8';})`
-      + ` && Array.prototype.some.call(document.querySelectorAll('button'),function(b){return b.textContent==='Plan WS9';})`));
+    await waitFor(`Array.prototype.some.call(document.querySelectorAll('button'),function(b){return b.textContent==='Plan WS88';})`
+      + ` && Array.prototype.some.call(document.querySelectorAll('button'),function(b){return b.textContent==='Plan WS89';})`));
 
   // Header switcher: planned row from outside the Planned-path no-op.
   await ev(`window.__mark='stay'`);
@@ -184,45 +187,45 @@ async function main() {
     await ev(`document.querySelector('#ws-switcher').click()`);
     return waitFor(`!!document.getElementById('ws-switcher-pop')`, 8000);
   })());
-  const plannedLabel = await text(`(document.querySelector('.ws-row[data-ws="WS8"]')||{}).getAttribute ? document.querySelector('.ws-row[data-ws="WS8"]').getAttribute('aria-label') : ''`);
-  check("switcher lists WS8 as planned", /Planned/.test(plannedLabel || ""), plannedLabel);
-  await ev(`document.querySelector('.ws-row[data-ws="WS8"]').click()`);
-  check("picking planned WS8 moves the URL to ?ws=WS8&view=planned",
-    await waitFor(`location.href.indexOf('ws=WS8')>=0 && ${viewIs("planned")}`, 8000), "header pick");
-  check("selection chip follows to WS8",
+  const plannedLabel = await text(`(document.querySelector('.ws-row[data-ws="WS88"]')||{}).getAttribute ? document.querySelector('.ws-row[data-ws="WS88"]').getAttribute('aria-label') : ''`);
+  check("switcher lists WS88 as planned", /Planned/.test(plannedLabel || ""), plannedLabel);
+  await ev(`document.querySelector('.ws-row[data-ws="WS88"]').click()`);
+  check("picking planned WS88 moves the URL to ?ws=WS88&view=planned",
+    await waitFor(`location.href.indexOf('ws=WS88')>=0 && ${viewIs("planned")}`, 8000), "header pick");
+  check("selection chip follows to WS88",
     await waitFor(`(document.querySelector('#selected-chip')||{}).textContent
-      && document.querySelector('#selected-chip').textContent.indexOf('WS8')>=0`, 8000));
-  check("planned list resettles on WS8", await waitPlannedSettled(2));
+      && document.querySelector('#selected-chip').textContent.indexOf('WS88')>=0`, 8000));
+  check("planned list resettles on WS88", await waitPlannedSettled(2));
   check("no reload on the switch", await text(`window.__mark==='stay'`));
 
   // The reported no-op: picking another planned row while already in the
   // Planned view must move the selection without a reload.
   await ev(`window.__mark='stay'`);
-  check("switcher reopens in planned view", await pickFromSwitcher("WS9"));
-  check("picking planned WS9 from the planned view moves to ?ws=WS9&view=planned",
-    await waitFor(`location.href.indexOf('ws=WS9')>=0 && ${viewIs("planned")}`, 8000));
-  check("selection chip follows to WS9",
-    await waitFor(`document.querySelector('#selected-chip').textContent.indexOf('WS9')>=0`, 8000));
-  check("planned list resettles on WS9", await waitPlannedSettled(2));
+  check("switcher reopens in planned view", await pickFromSwitcher("WS89"));
+  check("picking planned WS89 from the planned view moves to ?ws=WS89&view=planned",
+    await waitFor(`location.href.indexOf('ws=WS89')>=0 && ${viewIs("planned")}`, 8000));
+  check("selection chip follows to WS89",
+    await waitFor(`document.querySelector('#selected-chip').textContent.indexOf('WS89')>=0`, 8000));
+  check("planned list resettles on WS89", await waitPlannedSettled(2));
   check("no reload switching planned to planned", await text(`window.__mark==='stay'`));
 
   // And back again.
   await ev(`window.__mark='stay'`);
-  check("switching back to WS8 works", await pickFromSwitcher("WS8"));
-  check("back at ?ws=WS8&view=planned",
-    await waitFor(`location.href.indexOf('ws=WS8')>=0 && ${viewIs("planned")}`, 8000));
-  check("planned list resettles back on WS8", await waitPlannedSettled(2));
+  check("switching back to WS88 works", await pickFromSwitcher("WS88"));
+  check("back at ?ws=WS88&view=planned",
+    await waitFor(`location.href.indexOf('ws=WS88')>=0 && ${viewIs("planned")}`, 8000));
+  check("planned list resettles back on WS88", await waitPlannedSettled(2));
   check("no reload switching back", await text(`window.__mark==='stay'`));
 
   // Planned list: its Plan button opens that workstream's plan view. The
   // list only carries the buttons once the post-pick refresh resettles,
   // so confirm one is present before clicking (a loading skeleton has none).
   check("plan button present after resettle",
-    await waitFor(`Array.prototype.some.call(document.querySelectorAll('button'),function(b){return b.textContent==='Plan WS8';})`, 8000));
-  await ev(`(function(){var bs=Array.prototype.slice.call(document.querySelectorAll('button'));for(var i=0;i<bs.length;i++){if(bs[i].textContent==='Plan WS8'){bs[i].click();break;}}})()`);
-  check("planned list opens WS8 plan view",
-    await waitFor(`location.href.indexOf('ws=WS8')>=0 && ${viewIs("plan")}`, 8000));
-  check("plan view shows the WS8 bundle",
+    await waitFor(`Array.prototype.some.call(document.querySelectorAll('button'),function(b){return b.textContent==='Plan WS88';})`, 8000));
+  await ev(`(function(){var bs=Array.prototype.slice.call(document.querySelectorAll('button'));for(var i=0;i<bs.length;i++){if(bs[i].textContent==='Plan WS88'){bs[i].click();break;}}})()`);
+  check("planned list opens WS88 plan view",
+    await waitFor(`location.href.indexOf('ws=WS88')>=0 && ${viewIs("plan")}`, 8000));
+  check("plan view shows the WS88 bundle",
     await waitFor(`!!document.querySelector('#plan-body') && !document.querySelector('#plan-view').hidden
       && document.querySelector('#plan-body').textContent.trim().length>0`, 15000));
 

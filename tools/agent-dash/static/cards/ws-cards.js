@@ -123,12 +123,6 @@
     ((state.snap && state.snap.by_workstream) || []).forEach(function (r) { if (r.ws === id) hit = r; });
     return hit;
   }
-  /* A row has activity when any run, token, or live-agent evidence exists.
-     Planned rows with activity are the first-agent case: the state file
-     still says planned, but work already started. */
-  function hasActivity(w) {
-    return !!(w && (w.live_agents || w.last_activity || w.tokens || w.cost_usd || w.finished_in_range || w.finished_today));
-  }
   function firstRunAt(ws) {
     var best = null;
     ((state.runs) || []).forEach(function (r) {
@@ -163,7 +157,7 @@
     if (only) rows = rows.filter(function (w) {
       var st = ADT.wsStateOf(w);
       if (only.indexOf(st) >= 0) return true;
-      if (st === "planned" && only.indexOf("active") >= 0 && hasActivity(w)) return true;
+      if (st === "planned" && only.indexOf("active") >= 0 && ADT.hasActivity(w)) return true;
       return false;
     });
     /* The overall hero sums every row in the panel, never the capped
@@ -196,7 +190,7 @@
       idline.appendChild(el("span", {text: w.name || ""}));
       name.appendChild(idline);
       name.appendChild(el("span", {class: "prog-pill " + st[0], text: st[1]}));
-      if (ADT.wsStateOf(w) === "planned" && hasActivity(w)) {
+      if (ADT.wsStateOf(w) === "planned" && ADT.hasActivity(w)) {
         var first = firstRunAt(w.ws) || w.last_activity;
         if (first) name.appendChild(el("span", {class: "prog-hint", text: "first agent started " + fmtDate(first), title: "Runs exist but the bundle state is still planned — activate with: python3 agent_dash.py ws state " + w.ws + " active"}));
       }
