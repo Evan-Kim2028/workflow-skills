@@ -46,6 +46,7 @@
     {id: "tiles", order: 20, scope: "both", spec: function (state, snap) {
       return ["tiles", keyOf([snap.counts, snap.totals, snap.totals_all_time, snap.last_activity, state.ws, state.snapError]), function () { return tiles(snap); }, state.ws === "all" ? "margin-top:14px" : ""];
     }},
+    {id: "wherego", order: 22, scope: "overview", spec: function (state, snap) { return typeof wheregoSpec === "function" ? wheregoSpec(state, snap) : null; }},
     {id: "running", order: 30, scope: "both", spec: function (state, snap) {
       return ["running", keyOf((snap.running || []).map(function (r) { return [runRow(r), r.section, r.section_index]; })), function () { return runsTable("Running now", "Grouped workstream \u2192 section \u2192 agent; freshest first when collapsed. Click a row for details. Output \u25B2 means the out file grew since the last poll.", snap.running || [], state.snapError ? "request failed" : "Nothing running."); }, "margin-top:14px"];
     }},
