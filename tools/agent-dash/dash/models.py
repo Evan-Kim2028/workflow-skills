@@ -20,7 +20,10 @@ to ``other``: only an empty id falls back to ``glm-unknown``. A Dagster job
 keeps the job name after ``dagster:``. A Command Code run (tier or source
 ``commandcode``, or one of the free ids) maps to the ``commandcode`` family
 under its id, and an empty id reads as ``commandcode-unknown`` (a Beam id
-under Command Code still reads as ``beam``).
+under Command Code still reads as ``beam``). Display strings live apart
+from keys: ``model_name``/``full_name`` mirror ``nameOf``/``fullName`` in
+``static/models.js`` exactly, so charts, counts and pricing (which match
+on keys) never shift when a name is normalised.
 """
 
 from __future__ import annotations
@@ -92,6 +95,123 @@ def run_model_key(run: dict) -> str:
     """Model key for a run row."""
     hint = " ".join(str(run.get(name) or "") for name in ("tier", "source"))
     return model_key(run.get("model"), hint)[1]
+
+
+#: Display words for model-id tokens. ``model_name`` extends these with a
+#: generic capitalize fallback instead of special-casing each id, the way
+#: ``static/models.js`` extends its ``WORD`` map.
+_WORD = {
+    "grok": "Grok",
+    "composer": "Composer",
+    "glm": "GLM",
+    "flash": "Flash",
+    "beam": "Beam",
+    "spark": "Spark",
+    "wonder": "Wonder",
+    "muse": "muse",
+    "opus": "Opus",
+    "fable": "Fable",
+    "sonnet": "Sonnet",
+    "haiku": "Haiku",
+    "other": "Other",
+    "deepseek": "DeepSeek",
+    "pro": "Pro",
+    "codex": "Codex",
+    "gpt": "GPT",
+    "sol": "Sol",
+    "luna": "Luna",
+    "astra": "Astra",
+    "terra": "Terra",
+    "reserve": "Reserve",
+    "auto": "Auto",
+    "review": "Review",
+    "claude": "Claude",
+    "minimax": "MiniMax",
+    "ornith": "Ornith",
+    "laguna": "Laguna",
+    "glyph": "Glyph",
+    "cluster": "Cluster",
+    "s": "S",
+}
+
+_FAM_NAMES = {
+    "claude": "Claude",
+    "cursor": "Cursor",
+    "muse": "muse",
+    "glm": "GLM",
+    "deepseek": "DeepSeek",
+    "beam": "Beam",
+    "codex": "Codex",
+    "commandcode": "Command Code",
+    "dagster": "Dagster",
+    "other": "Other",
+}
+
+
+def _clean_id(key: str | None) -> str:
+    """Strip provider prefixes, free/contributor tails, bracketed launcher
+    options, parameter-count tails and build numbers from a model key or
+    raw id, mirroring ``cleanId`` in ``static/models.js``."""
+    s = str(key or "")
+    s = re.sub(r"\[.*\]$", "", s)
+    s = re.sub(r":[^/]*$", "", s)
+    s = re.sub(r"-(free|contributor)$", "", s, flags=re.IGNORECASE)
+    if "/" in s:
+        s = s[s.rindex("/") + 1 :]
+    s = re.sub(r"-\d+[bmkBKM](-.*)?$", "", s)
+    s = re.sub(r"-\d{3,}$", "", s)
+    s = re.sub(r"-(\d)-(\d)$", r"-\1.\2", s)
+    return s
+
+
+def _title_word(word: str) -> str:
+    low = word.lower()
+    if low in _WORD:
+        return _WORD[low]
+    if word[:1].isalpha():
+        return word[0].upper() + word[1:]
+    return word
+
+
+def model_name(key: str | None) -> str:
+    """Display name for a model key or a raw model id.
+
+    Mirrors ``nameOf`` in ``static/models.js`` exactly: ``keyOf`` keys
+    never change (grouping, hues and pricing still match on them); only
+    the rendered string is normalised here.
+    """
+    s = str(key or "")
+    if s.startswith("dagster:"):
+        return s[len("dagster:") :] or "job"
+    if s.endswith("-unknown"):
+        return "model not recorded"
+    if "deepseek" in s.lower():
+        # Legacy DeepSeek aliases take the key they group under, as in models.js.
+        dk = model_key(s)[1]
+        if dk == "deepseek-flash":
+            return "DeepSeek V4.1 Flash"
+        if dk == "deepseek-v4-pro":
+            return "DeepSeek V4 Pro"
+    parts = [w for w in _clean_id(s).split("-") if w]
+    words = [_title_word(w) for w in parts]
+    if len(parts) > 1 and parts[0].lower() == "gpt" and parts[1][:1].isdigit():
+        rest = " " + " ".join(words[2:]) if len(words) > 2 else ""
+        return "GPT-" + words[1] + rest
+    return " ".join(words)
+
+
+def full_name(key: str | None) -> str:
+    """Family-aware display name, mirroring ``fullName`` in
+    ``static/models.js``: the bare name when it already opens with the
+    family word, else family plus name."""
+    s = str(key or "")
+    name = model_name(s)
+    if not name:
+        return "model not recorded"
+    fam = _FAM_NAMES.get(model_key(s)[0], "Other")
+    if name == fam or name.startswith(fam + " "):
+        return name
+    return fam + " · " + name
 
 
 #: Harness display names. ``harness_of`` reads the runner from a run row;

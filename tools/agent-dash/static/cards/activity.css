@@ -27,6 +27,11 @@
 /* Strips share one left margin and plot width (see actGeo), so strip
    titles sit above each svg and the x labels draw once at the bottom. */
 #exec-activity .act-strips{display:grid;gap:6px}
+/* Grid items default to min-width:auto and refuse to shrink below their
+   content width: with usage rendered the strips (560-wide chart floor)
+   spill the card sideways on phones. Let them shrink; the svg scales
+   down through its max-width and the legends already wrap. */
+#exec-activity .act-strip{min-width:0}
 #exec-activity .act-strip h3{font-size:13px;font-weight:700;margin:10px 0 2px;color:var(--ink)}
 #exec-activity .act-strip svg{height:auto;max-width:100%}
 #exec-activity .act-cross{stroke:var(--ink-2);stroke-width:1;stroke-dasharray:3 3;pointer-events:none}

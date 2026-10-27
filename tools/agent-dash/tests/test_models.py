@@ -10,7 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 STATIC = Path(__file__).resolve().parents[1] / "static"
 
-from dash.models import HARNESS_NAMES, harness_of, model_key, run_model_key
+from dash.models import HARNESS_NAMES, full_name, harness_of, model_key, model_name, run_model_key
 from dash.projectfeed import _tool_key as _feed_tool_key
 from dash.store import _drop_launch_echoes
 from dash.store.util import _tool_key
@@ -212,8 +212,8 @@ class BeamJsTests(unittest.TestCase):
             "assert.deepStrictEqual(keyOf('','commandcode'),['commandcode','commandcode-unknown']);"
             "assert.strictEqual(window.ADM.nameOf('beam-1.0'),'Beam 1.0');"
             "assert.strictEqual(window.ADM.nameOf('beam'),'Beam');"
-            "assert.strictEqual(window.ADM.nameOf('poolside/laguna-s-2.1-free'),'laguna-s-2.1-free');"
-            "assert.strictEqual(window.ADM.nameOf('stealth/glyph-cluster:free'),'glyph-cluster:free');"
+            "assert.strictEqual(window.ADM.nameOf('poolside/laguna-s-2.1-free'),'Laguna S 2.1');"
+            "assert.strictEqual(window.ADM.nameOf('stealth/glyph-cluster:free'),'Glyph Cluster');"
             "assert.strictEqual(window.ADM.famOf('beam-1.0'),'beam');"
             "assert.strictEqual(window.ADM.FAMS.indexOf('beam'),window.ADM.FAMS.indexOf('deepseek')+1);"
             "assert.strictEqual(window.ADM.FAM.commandcode.order.indexOf('reflection/beam:free'),-1);"
@@ -227,6 +227,114 @@ class BeamJsTests(unittest.TestCase):
         )
         self.assertEqual(proc.returncode, 0, proc.stderr or proc.stdout)
         self.assertIn("models beam family proof ok", proc.stdout)
+
+
+class DisplayNameTest(unittest.TestCase):
+    """Every live model id reads as the short display name, in JS and Python.
+
+    ``keyOf``/``model_key`` keys are pinned elsewhere and must not move;
+    this table pins only the rendered strings, so the server mirror
+    (``dash/models.py``) cannot drift from ``static/models.js``.
+    """
+
+    table = {
+        "claude-haiku-5-5": "Claude Haiku 5.5",
+        "claude-opus-5-5": "Claude Opus 5.5",
+        "claude-fable-5-1": "Claude Fable 5.1",
+        "muse-spark-1.3-contributor": "muse Spark 1.3",
+        "reflection/Beam-1.0-501B-A23B": "Beam 1.0",
+        "gpt-6-luna": "GPT-6 Luna",
+        "gpt-6.1-sol": "GPT-6.1 Sol",
+        "deepseek/deepseek-v4.1-flash": "DeepSeek V4.1 Flash",
+        "deepseek/deepseek-v4-pro": "DeepSeek V4 Pro",
+        "minimax/minimax-m3.1-flash:free": "MiniMax M3.1 Flash",
+        "ornith/ornith-1.5-122b:free": "Ornith 1.5",
+        "poolside/laguna-s-2.1-free": "Laguna S 2.1",
+        "stealth/glyph-cluster:free": "Glyph Cluster",
+        "grok-4.7[context=500k,reasoning_effort=high,fast=false]": "Grok 4.7",
+        "composer-2.5": "Composer 2.5",
+        "glm-5.3-flash": "GLM 5.3 Flash",
+        "deepseek-flash": "DeepSeek V4.1 Flash",
+        "deepseek-v4-pro": "DeepSeek V4 Pro",
+        "grok-4.7": "Grok 4.7",
+        "beam-1.0": "Beam 1.0",
+        "beam": "Beam",
+        "haiku": "Haiku",
+        "muse-spark-1.3": "muse Spark 1.3",
+        "muse-wonder-1.0": "muse Wonder 1.0",
+        "reflection/beam:free": "Beam",
+        "river/deepseek-ai/DeepSeek-V4.1-Flash-1017": "DeepSeek V4.1 Flash",
+        "reflection/Beam-1.0-501B-A23B:xhigh": "Beam 1.0",
+        "gpt-reserve": "GPT Reserve",
+        "other": "Other",
+        "": "",
+        "codex-unknown": "model not recorded",
+        "glm-unknown": "model not recorded",
+        "dagster:some_job": "some_job",
+        "mimo-v2": "Mimo V2",
+        "foo/bar-9:free": "Bar 9",
+        "deepseek-v4-flash": "DeepSeek V4.1 Flash",
+        "deepseek-v4-flash-vision-exp": "DeepSeek V4.1 Flash",
+        "river/deepseek-ai/DeepSeek-V4.1-Flash-1017": "DeepSeek V4.1 Flash",
+        "river/zai-org/GLM-5.3-Flash": "GLM 5.3 Flash",
+    }
+
+    full_table = {
+        "claude-haiku-5-5": "Claude Haiku 5.5",
+        "reflection/Beam-1.0-501B-A23B": "Beam 1.0",
+        "deepseek/deepseek-v4.1-flash": "DeepSeek V4.1 Flash",
+        "minimax/minimax-m3.1-flash:free": "Command Code · MiniMax M3.1 Flash",
+        "grok-4.7": "Cursor · Grok 4.7",
+        "haiku": "Claude · Haiku",
+        "beam": "Beam",
+        "": "model not recorded",
+        "codex-unknown": "Codex · model not recorded",
+        "glm-unknown": "GLM · model not recorded",
+        "dagster:some_job": "Dagster · some_job",
+        "mimo-v2": "Other · Mimo V2",
+        "foo/bar-9:free": "Other · Bar 9",
+        "deepseek-v4-flash": "DeepSeek V4.1 Flash",
+        "deepseek-v4-flash-vision-exp": "DeepSeek V4.1 Flash",
+        "river/deepseek-ai/DeepSeek-V4.1-Flash-1017": "DeepSeek V4.1 Flash",
+        "river/zai-org/GLM-5.3-Flash": "GLM 5.3 Flash",
+    }
+
+    def test_models_js_display_names(self):
+        import json
+
+        script = (
+            "const fs=require('fs');"
+            "global.window=globalThis;"
+            "eval(fs.readFileSync(process.argv[1],'utf8'));"
+            "const assert=require('assert');"
+            "const table=JSON.parse(process.argv[2]);"
+            "for (const [id, want] of Object.entries(table)) {"
+            "  assert.strictEqual(window.ADM.nameOf(id), want, id);"
+            "}"
+            "const full=JSON.parse(process.argv[3]);"
+            "for (const [id, want] of Object.entries(full)) {"
+            "  assert.strictEqual(window.ADM.fullName(id), want, id);"
+            "}"
+            "assert.strictEqual(window.ADM.seriesName('deepseek-flash@commandcode'),'DeepSeek V4.1 Flash \\u00B7 Command Code');"
+            "assert.strictEqual(window.ADM.seriesName('minimax/minimax-m3.1-flash:free@commandcode'),'MiniMax M3.1 Flash \\u00B7 Command Code');"
+            "assert.strictEqual(window.ADM.seriesName('beam-1.0@pi'),'Beam 1.0 \\u00B7 pi');"
+            "assert.strictEqual(window.ADM.nameOf('muse-unknown'),'model not recorded');"
+            "console.log('models display names proof ok');"
+        )
+        proc = subprocess.run(
+            ["node", "-e", script, str(STATIC / "models.js"), json.dumps(self.table), json.dumps(self.full_table)],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr or proc.stdout)
+        self.assertIn("models display names proof ok", proc.stdout)
+
+    def test_models_py_display_names(self):
+        for model_id, want in self.table.items():
+            self.assertEqual(model_name(model_id), want, model_id)
+        for model_id, want in self.full_table.items():
+            self.assertEqual(full_name(model_id), want, model_id)
+        self.assertEqual(model_name("muse-unknown"), "model not recorded")
 
 
 class LaunchEchoTest(unittest.TestCase):

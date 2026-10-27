@@ -27,20 +27,34 @@ tr.clk:focus-visible {
   outline: 2px solid var(--accent, var(--s1));
   outline-offset: -2px;
 }
+/* The model cell never stretches its column: the name truncates with an
+   ellipsis inside the cell (raw id stays in the title tooltip) while the
+   swatch and harness word keep their width. */
 .tier {
   display: inline-flex;
   align-items: center;
   gap: 7px;
   font: 600 12px var(--mono);
   white-space: nowrap;
+  max-width: 100%;
+  min-width: 0;
+  overflow: hidden;
 }
-.tier .mfam-n {
-  color: var(--ink);
-  font-weight: 700;
+.tier .sw {
+  flex: none;
 }
 .tier .mmod-n {
+  color: var(--ink);
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+.tier .mhar-n {
   color: var(--muted);
   font-weight: 500;
+  flex: none;
 }
 .st {
   display: inline-flex;
@@ -238,11 +252,15 @@ td .sec {
   .hidephone {
     display: none !important;
   }
-  /* Phones: the model cell wraps instead of forcing a wide Model column;
+  /* Phones: the harness word hides so the model name survives, and the
+     name keeps its ellipsis instead of forcing a wide Model column;
      tables keep scrolling inside their own container as today. */
   table.dt .tier {
-    flex-wrap: wrap;
-    row-gap: 2px;
+    flex-wrap: nowrap;
+    max-width: 100%;
+  }
+  table.dt .tier .mhar-n {
+    display: none;
   }
 }
 @media (prefers-reduced-motion: reduce) {

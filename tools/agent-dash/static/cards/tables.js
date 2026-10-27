@@ -93,7 +93,7 @@
     var why = (typeof ADM !== "undefined" && ADM.outcomeReason) ? ADM.outcomeReason(r, oc) : null;
     var state = o ? o[1] + " " + o[2] + (why ? " \u2014 " + why : "") : ((r.status || "unknown") + (r.verdict ? " \u00B7 " + r.verdict : ""));
     return [
-      {k: "Model", v: fullName(tierKey(r)) + " \u00B7 " + runHarnessWord(r)},
+      {k: "Model", v: fullName(r.model || tierKey(r)) + " \u00B7 " + runHarnessWord(r)},
       {k: "Elapsed", v: fmtDur(r.elapsed_s)},
       {k: "Tokens", v: fmtN(tokTotal(t))},
       {k: "Status", v: state}
@@ -337,7 +337,10 @@
       onmousemove: function (ev) { showTip(ev, r.label || r.run_id, tipRows(r)); },
       onmouseleave: function () { hideTip(); }});
     tr.appendChild(el("td", {class: "c-label"}, [el("span", {class: "lbl", text: r.label || r.run_id})]));
-    var tier = el("span", {class: "tier", title: r.model || ""}); var sw = el("i", {class: "sw"}); sw.style.background = colorOf(k); tier.appendChild(sw); tier.appendChild(el("span", {class: "mfam-n", text: ADM.FAM[ADM.famOf(k)].name})); tier.appendChild(el("span", {class: "mmod-n", text: modelName(k)})); tier.appendChild(el("span", {class: "mhar-n", text: " \u00B7 " + runHarnessWord(r)}));
+    /* One name span: ADM.nameOf already folds the family in (DeepSeek V4.1
+       Flash, Claude Haiku 5.5), so no separate family word that repeats
+       the model's first word. The raw id stays in the title tooltip. */
+    var tier = el("span", {class: "tier", title: r.model || ""}); var sw = el("i", {class: "sw"}); sw.style.background = colorOf(k); tier.appendChild(sw); tier.appendChild(el("span", {class: "mmod-n", text: ADM.nameOf(r.model || k)})); tier.appendChild(el("span", {class: "mhar-n", text: " \u00B7 " + runHarnessWord(r)}));
     tr.appendChild(el("td", {class: "c-text"}, [tier]));
     if (showWs) tr.appendChild(el("td", {class: "c-text"}, [el("span", {class: "ws", text: r.workstream || "–"})]));
     tr.appendChild(el("td", {class: "c-num hidephone", text: fmtDur(r.elapsed_s)}));
@@ -361,7 +364,7 @@
       onkeydown: function (ev) { if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); openRun(r); } },
       onmousemove: function (ev) { showTip(ev, r.label || r.run_id, tipRows(r)); },
       onmouseleave: function () { hideTip(); }});
-    var tier = el("span", {class: "tier", title: r.model || ""}); var sw = el("i", {class: "sw"}); sw.style.background = colorOf(k); tier.appendChild(sw); tier.appendChild(el("span", {class: "mfam-n", text: ADM.FAM[ADM.famOf(k)].name})); tier.appendChild(el("span", {class: "mmod-n", text: modelName(k)})); tier.appendChild(el("span", {class: "mhar-n", text: " \u00B7 " + runHarnessWord(r)}));
+    var tier = el("span", {class: "tier", title: r.model || ""}); var sw = el("i", {class: "sw"}); sw.style.background = colorOf(k); tier.appendChild(sw); tier.appendChild(el("span", {class: "mmod-n", text: ADM.nameOf(r.model || k)})); tier.appendChild(el("span", {class: "mhar-n", text: " \u00B7 " + runHarnessWord(r)}));
     tr.appendChild(el("td", {class: "c-text"}, [tier]));
     tr.appendChild(el("td", {class: "c-label"}, [el("span", {class: "lbl", text: r.label || r.run_id})]));
     tr.appendChild(el("td", {class: "c-text"}, [el("span", {class: "ws", text: r.workstream || "–"})]));

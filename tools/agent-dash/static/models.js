@@ -23,7 +23,7 @@
     dagster: {name: "Dagster", hue: "--s7", order: []},
     other: {name: "Other", hue: "--other", order: ["other"]}
   };
-  var WORD = {grok: "Grok", composer: "Composer", glm: "GLM", flash: "Flash", beam: "Beam", spark: "Spark", wonder: "Wonder", muse: "muse", opus: "Opus", fable: "Fable", sonnet: "Sonnet", haiku: "Haiku", other: "Other", deepseek: "DeepSeek", pro: "Pro", codex: "Codex", gpt: "GPT", sol: "Sol", luna: "Luna", astra: "Astra", terra: "Terra", reserve: "Reserve", auto: "Auto", review: "Review"};
+  var WORD = {grok: "Grok", composer: "Composer", glm: "GLM", flash: "Flash", beam: "Beam", spark: "Spark", wonder: "Wonder", muse: "muse", opus: "Opus", fable: "Fable", sonnet: "Sonnet", haiku: "Haiku", other: "Other", deepseek: "DeepSeek", pro: "Pro", codex: "Codex", gpt: "GPT", sol: "Sol", luna: "Luna", astra: "Astra", terra: "Terra", reserve: "Reserve", auto: "Auto", review: "Review", claude: "Claude", minimax: "MiniMax", ornith: "Ornith", laguna: "Laguna", glyph: "Glyph", cluster: "Cluster", s: "S"};
   /* Harness display names. harnessOf reads the runner from a run row
      (dash/models.py harness_of mirrors it); a run view carrying harness
      wins, so server and page never disagree. */
@@ -80,13 +80,59 @@
     if (/claude/.test(h)) return ["claude", "claude-unknown"];
     return ["other", "other"];
   }
+  /* Display names: one owner for every model string on the page. nameOf
+     takes a model key OR a raw model id (commandcode keys are raw ids)
+     and returns the short display: provider prefixes, :free/-free/
+     -contributor tails, bracketed launcher options, parameter-count
+     tails (-501B-A23B, -122b) and build numbers are stripped, a trailing
+     Claude -5-5 reads as 5.5, then words title-case with version tokens
+     kept (DeepSeek V4.1 Flash, Beam 1.0, GPT-6 Luna, Laguna S 2.1).
+     keyOf keys never change: grouping, hues and pricing still match on
+     them; only the rendered string is normalised here. */
+  function cleanId(key) {
+    var s = String(key == null ? "" : key);
+    s = s.replace(/\[.*\]$/, "");
+    s = s.replace(/:[^\/]*$/, "");
+    s = s.replace(/-(free|contributor)$/i, "");
+    if (s.indexOf("/") >= 0) s = s.slice(s.lastIndexOf("/") + 1);
+    s = s.replace(/-\d+[bmkBKM](-.*)?$/, "");
+    s = s.replace(/-\d{3,}$/, "");
+    s = s.replace(/-(\d)-(\d)$/, "-$1.$2");
+    return s;
+  }
+  function titleWord(w) {
+    var l = w.toLowerCase();
+    if (WORD[l]) return WORD[l];
+    if (/^[a-z]/i.test(w)) return w.charAt(0).toUpperCase() + w.slice(1);
+    return w;
+  }
   function nameOf(key) {
-    if (/^dagster:/.test(key)) return key.slice(8) || "job";
-    if (famOf(key) === "commandcode") return key.slice(key.lastIndexOf("/") + 1);
+    if (/^dagster:/.test(key)) return String(key).slice(8) || "job";
     if (/-unknown$/.test(key)) return "model not recorded";
-    if (key === "deepseek-flash") return "DeepSeek V4.1 Flash";
-    if (key === "deepseek-v4-pro") return "DeepSeek V4 Pro";
-    return key.split("-").map(function (w) { return WORD[w] || w; }).join(" ");
+    /* Legacy DeepSeek aliases (deepseek-v4-flash, ...-vision-exp) take the
+       key they group under, so the cell and the legend agree. */
+    if (/deepseek/i.test(key)) {
+      var dk = keyOf(key)[1];
+      if (dk === "deepseek-flash") return "DeepSeek V4.1 Flash";
+      if (dk === "deepseek-v4-pro") return "DeepSeek V4 Pro";
+    }
+    var parts = cleanId(key).split("-").filter(function (w) { return w !== ""; });
+    var words = parts.map(titleWord);
+    if (parts.length > 1 && parts[0].toLowerCase() === "gpt" && /^\d/.test(parts[1])) {
+      return "GPT-" + words[1] + (words.length > 2 ? " " + words.slice(2).join(" ") : "");
+    }
+    return words.join(" ");
+  }
+  /* Family-aware display: the bare name when it already opens with the
+     family word (DeepSeek V4.1 Flash), else family plus name (Cursor ·
+     Grok 4.7). Takes a key or a raw id like nameOf, so run rows show the
+     recorded version (Claude Haiku 5.5) while legends keep working from
+     keys alone. */
+  function fullName(x) {
+    var k = String(x == null ? "" : x);
+    var n = nameOf(k), f = FAM[famOf(k)].name;
+    if (!n) return "model not recorded";
+    return (n === f || n.indexOf(f + " ") === 0) ? n : f + " \u00B7 " + n;
   }
   function famOf(key) { return keyOf(key)[0]; }
   function shadeIndex(fam, key) {
@@ -204,5 +250,5 @@
     if (o === "unk") return "no verdict recorded";
     return null;
   }
-  global.ADM = {FAMS: FAMS, FAM: FAM, HARNESS: HARNESS, info: info, keyOf: keyOf, nameOf: nameOf, famOf: famOf, colorOf: colorOf, colorAt: colorAt, famColor: famColor, sortKeys: sortKeys, harnessOf: harnessOf, harnessName: harnessName, splitSeries: splitSeries, seriesName: seriesName, seriesFam: seriesFam, seriesColor: seriesColor, sortSeries: sortSeries, OUTCOME: OUTCOME, outcomeOf: outcomeOf, outcomeReason: outcomeReason};
+  global.ADM = {FAMS: FAMS, FAM: FAM, HARNESS: HARNESS, info: info, keyOf: keyOf, nameOf: nameOf, fullName: fullName, famOf: famOf, colorOf: colorOf, colorAt: colorAt, famColor: famColor, sortKeys: sortKeys, harnessOf: harnessOf, harnessName: harnessName, splitSeries: splitSeries, seriesName: seriesName, seriesFam: seriesFam, seriesColor: seriesColor, sortSeries: sortSeries, OUTCOME: OUTCOME, outcomeOf: outcomeOf, outcomeReason: outcomeReason};
 })(window);

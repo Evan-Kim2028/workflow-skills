@@ -960,7 +960,7 @@
         lane.rows.forEach(function (row) {
           row.runs.forEach(function (r) {
             var e = barEndpoints(r);
-            actDrawBar(svg, r, X(e.a), X(e.b), ry2, ddz.rowH, fullName(tierKey(r)) + " \u00B7 " + ADM.harnessName(ADM.harnessOf(r)), now, e.clip);
+            actDrawBar(svg, r, X(e.a), X(e.b), ry2, ddz.rowH, fullName(r.model || tierKey(r)) + " \u00B7 " + ADM.harnessName(ADM.harnessOf(r)), now, e.clip);
           });
           ry2 += ddz.rowH + ddz.rowGap;
         });

@@ -15,7 +15,10 @@
   var FIX = Q.has("fixtures");
   /* Models: family = hue, model = shade of it (static/models.js). Keys look like grok-4.7, composer-2.5, glm-5.3-flash, haiku. */
   function modelName(k) { return ADM.nameOf(k); }
-  function fullName(k) { var f = ADM.FAM[ADM.famOf(k)].name, n = ADM.nameOf(k); return n.indexOf(f + " ") === 0 ? n : f + " \u00B7 " + n; }
+  /* Family-aware display lives in static/models.js (ADM.fullName) next to
+     nameOf so both stay in one place; run rows pass their raw model id
+     so the recorded version shows (Claude Haiku 5.5). */
+  function fullName(x) { return ADM.fullName(x); }
   var WSCOL = ["--s1", "--s2", "--s3", "--s4", "--s5", "--s6", "--s7"];
   var wsColor = {};
   function cssv(n) { return getComputedStyle(document.documentElement).getPropertyValue(n).trim(); }
