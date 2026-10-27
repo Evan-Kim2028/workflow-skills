@@ -4,10 +4,11 @@ Each module in this package that defines NAME, INTERVAL_S, and poll(store, cfg, 
 is polled on its interval. A failing poll is recorded for /api/health and does not
 stop the loop.
 
-Every source runs in its own watchdog thread with a join timeout
-(``POLL_BUDGET_S``, 25 s by default, ``poll_budget_s`` in cfg): a hung
-transcript scan or ssh call can no longer stall the other sources behind
-it. When a poll overruns, the tick moves on, the source is flagged
+Every source runs in its own watchdog thread with a shared join budget
+(``POLL_BUDGET_S``, 25 s by default, ``poll_budget_s`` in cfg): the tick
+starts every due source first and then joins within one sweep budget, so
+a hung transcript scan or ssh call can no longer stall the other sources
+behind it. When a poll overruns, the tick moves on, the source is flagged
 (``timed_out``, ``last_error``), and its ``last_poll`` is left alone so
 ``lag_s`` keeps growing until it finishes. A source whose previous poll
 is still running is skipped, never stacked.
@@ -75,6 +76,15 @@ class Registry:
 
     def tick(self, store, cfg, now: float, force: bool = False, stop=None) -> None:
         budget = _budget(cfg)
+        # Two phases: start every due source first, then join. A slow
+        # source used to hold the sweep for its whole join budget while
+        # every source behind it waited, so one hung scan stalled all the
+        # 2 s sources behind it. The budget is now shared across the
+        # sweep's joins instead of per source: fast sources still finish
+        # inside the tick, and an overrun is flagged without blocking the
+        # rest. Completion (and its timeout flag) is recorded by
+        # ``_run_poll`` itself, so nothing is lost by moving on.
+        started: list = []
         for source in self.sources:
             if stop is not None and stop.is_set():
                 return
@@ -98,21 +108,26 @@ class Registry:
                 state["thread"] = worker
                 state["poll_start"] = now
             worker.start()
-            if force:
+            started.append((source, worker))
+        if force:
+            for _source, worker in started:
                 worker.join()
-                overran = False
-            else:
-                deadline = time.monotonic() + budget
-                while worker.is_alive() and time.monotonic() < deadline:
-                    if stop is not None and stop.is_set():
-                        break
-                    worker.join(min(0.25, max(0.0, deadline - time.monotonic())))
-                overran = worker.is_alive() and not (
-                    stop is not None and stop.is_set()
-                )
+            return
+        deadline = time.monotonic() + budget
+        for source, worker in started:
+            if stop is not None and stop.is_set():
+                return
+            while worker.is_alive() and time.monotonic() < deadline:
+                if stop is not None and stop.is_set():
+                    break
+                worker.join(min(0.25, max(0.0, deadline - time.monotonic())))
+            overran = worker.is_alive() and not (
+                stop is not None and stop.is_set()
+            )
             if not overran:
                 continue
             with self._lock:
+                state = self.state.setdefault(source.NAME, _new_state())
                 state["timed_out"] = True
                 state["last_error"] = (
                     f"TimeoutError: poll exceeded {budget:g}s budget"
