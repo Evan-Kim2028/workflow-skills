@@ -293,7 +293,7 @@ const FIT_STATE = `(function(){
     dag: rect(dag),
     dagScroll: rect(scr),
     legend: rect(card.querySelector('.map-legend')),
-    strips: ['.working-now', '.trlegend', '.alegend', '.phases-line', '.pbig'].map(function (s) {
+    strips: ['.trlegend', '.alegend', '.phases-line', '.pbig'].map(function (s) {
       return { sel: s, r: rect(card.querySelector(s)) };
     }),
     dnodes: card.querySelectorAll('.dnode,.slim-tile').length,
