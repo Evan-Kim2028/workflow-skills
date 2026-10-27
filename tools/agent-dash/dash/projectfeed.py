@@ -118,6 +118,19 @@ def _tool_key(run: dict) -> str | None:
     if source == "muse" or tier == "muse":
         return "muse"
     if source == "glm" or tier == "glm":
+        from dash.models import model_key
+
+        hint = " ".join(str(run.get(name) or "") for name in ("tier", "source"))
+        try:
+            key = model_key(run.get("model"), hint)[1]
+        except Exception:
+            key = ""
+        # Grok Build runs count as grok (the Grok lane), never glm: keeps
+        # the feed beside the cursor-agent Grok runs. Mirrors the store.
+        if isinstance(key, str) and key.startswith("grok"):
+            return "grok"
+        if str(run.get("tier") or "").strip().lower() == "grok-build-47":
+            return "grok"
         fam = _model_family(run)
         if fam == "deepseek":
             return "deepseek"
