@@ -556,6 +556,78 @@ class LiveRunEvidenceTest(unittest.TestCase):
             self.assertEqual(cc._stream_session(str(pad), "ws6-x"), SID_LIVE)
             self.assertIsNone(cc._stream_session(str(pad), "ws6-missing"))
 
+    def test_pi_outdir_with_numeric_label_tail_is_not_a_cmd_outdir(self):
+        # A pi label ending in a number writes a pi stream shaped exactly
+        # like a cmd attempt stream (stream-<label>-<n>.ndjson). The pi
+        # manifest still rules it out: without this guard the stale
+        # running file plus the numeric stream mint a phantom
+        # commandcode:<pi-sid>:<label> died_early row for a live pi run.
+        with tempfile.TemporaryDirectory() as tmp:
+            pad = Path(tmp) / "enc" / "sess" / "scratchpad" / "pi"
+            pad.mkdir(parents=True)
+            (pad / "running").mkdir()
+            (pad / "running" / "ws6-plan-dbt-ci").write_text(
+                "%d\triver/deepseek-ai/DeepSeek-V4.1-Flash-1017" % os.getpid(),
+                encoding="utf-8",
+            )
+            stream(pad / "stream-ws6-plan-dbt-ci-7043.ndjson", SID_LIVE)
+            (pad / "pi-sessions.tsv").write_text(
+                "label\tsession_id\tstarted_epoch\tmodel\n"
+                "ws6-plan-dbt-ci-7043\t%s\t1792000000\triver/deepseek-ai/DeepSeek-V4.1-Flash-1017\n" % SID_LIVE,
+                encoding="utf-8",
+            )
+            self.assertFalse(cc._looks_like_cmd_dir(str(pad)))
+            self.assertEqual(cc._outdirs(tmp, None), [])
+
+
+class LiveOutdirShapeTest(Fixture):
+    """Fixture shaped like a real session cmd outdir (WS19 layout).
+
+    A ``cmd/`` child of a session scratchpad holding ``cmd-sessions.tsv``
+    rows with per-model manifest tiers, a ``cooldown.json`` marker, a
+    live ``running/<label>`` file and its ``stream-<label>-1.ndjson``:
+    the finished rows read their tier from the manifest cell and the
+    live attempt shows as running.
+    """
+
+    DS = "deepseek/deepseek-v4.1-flash"
+
+    def write_live_dir(self):
+        header = HEADER.rstrip("\n") + "\ttier\n"
+        rows = [
+            ["ws19-plan-x", "reflection/beam:free", SID_OK, 1793065906, 1793066250, 100, 5, "ok", "commandcode"],
+            ["ws19-review-y", self.DS, SID_THROTTLED, 1793114019, 1793114137, 741810, 10247, "failed rc=5", "commandcode-deepseek"],
+            ["ws19-plan-z", "reflection/beam:free", SID_DEAD, 1793065906, 1793066015, 0, 0, "throttled", "commandcode"],
+        ]
+        text = header + "".join("\t".join(str(x) for x in row) + "\n" for row in rows)
+        (self.pad / "cmd-sessions.tsv").write_text(text, encoding="utf-8")
+        (self.pad / "cooldown.json").write_text('{"reflection/beam:free": 1793145691.0}', encoding="utf-8")
+        (self.pad / "running").mkdir()
+        (self.pad / "running" / "ws19-review-live").write_text(
+            "%d\t%s" % (os.getpid(), self.DS), encoding="utf-8"
+        )
+        stream(self.pad / "stream-ws19-review-live-1.ndjson", SID_LIVE)
+
+    def test_live_shaped_outdir_is_discovered(self):
+        self.write_live_dir()
+        self.assertEqual(cc._outdirs(str(self.scratch), None), [str(self.pad)])
+
+    def test_rows_keep_their_manifest_tiers_and_live_is_running(self):
+        self.write_live_dir()
+        self.poll()
+        beam = self.store.runs["commandcode:%s:ws19-plan-x" % SID_OK]
+        self.assertEqual(beam["status"], "done")
+        self.assertEqual(beam["tier"], "commandcode")
+        failed = self.store.runs["commandcode:%s:ws19-review-y" % SID_THROTTLED]
+        self.assertEqual(failed["status"], "died_early")
+        self.assertEqual(failed["tier"], "commandcode-deepseek")
+        quota = self.store.runs["commandcode:%s:ws19-plan-z" % SID_DEAD]
+        self.assertEqual((quota["status"], quota["verdict"]), ("died_early", "QUOTA"))
+        live = self.store.runs["commandcode:%s:ws19-review-live" % SID_LIVE]
+        self.assertEqual(live["status"], "running")
+        self.assertEqual(live["tier"], "commandcode")
+        self.assertEqual(live["model"], self.DS)
+
 
 if __name__ == "__main__":
     unittest.main()
