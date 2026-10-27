@@ -91,6 +91,7 @@ KNOWN_ROOT_KEYS = {
 MANIFEST_NAMES = (
     "muse-sessions.tsv",
     "glm-sessions.tsv",
+    "grok-build-sessions.tsv",
     "grok-sessions.tsv",
     "cursor-sessions.tsv",
     "codex-sessions.tsv",

@@ -542,6 +542,60 @@ class ManifestPollTests(unittest.TestCase):
         self.assertEqual(glm["ended_at"], NOW)
         self.assertNotIn(SECRET, _dump(self.store))
 
+    def test_poll_reads_grok_build_tsv_in_registered_flat_run_dir(self):
+        # A grok-build-47 launch writes grok-build-sessions.tsv (registry
+        # manifest override) instead of glm-sessions.tsv, with the pid
+        # file, meta file, and logs beside it. The flat run-dir scan must
+        # read that name, keep the recorded tier, and take the finished
+        # verdict from the out file.
+        label = "ws19-exec-grokbuild-visible-gfix"
+        rundir = os.path.join(self.root, "runs", "ws19grokb")
+        _write(
+            os.path.join(rundir, "grok-build-sessions.tsv"),
+            f"{label}\t{GLM}\t1700000002\tgrok-4.7\tgrok-build-47\tgrok-cli\n",
+            NOW,
+        )
+        _write(
+            os.path.join(rundir, f"out-{label}.md"),
+            "PASS\nsynthetic report body\n",
+            NOW,
+        )
+        _write(
+            os.path.join(rundir, f"err-{label}.log"),
+            "",
+            NOW,
+        )
+        _write(os.path.join(rundir, f"{label}.pid"), "987654321\n", NOW)
+        _write(
+            os.path.join(rundir, f"{label}.meta.json"),
+            json.dumps(
+                {
+                    "err_path": os.path.join(rundir, f"err-{label}.log"),
+                    "harness": "grok-cli",
+                    "label": label,
+                    "model": "grok-4.7",
+                    "out_path": os.path.join(rundir, f"out-{label}.md"),
+                    "pid": 987654321,
+                    "started_at": 1700000002,
+                    "tier": "grok-build-47",
+                }
+            ),
+            NOW,
+        )
+        state = os.path.join(self.root, "state")
+        os.makedirs(state)
+        with open(os.path.join(state, "run-dirs.txt"), "w") as fh:
+            fh.write(rundir + "\n")
+        manifests.poll(self.store, self._cfg(state_dir=state), NOW)
+        run = self.store.runs[f"glm:{GLM}:{label}"]
+        self.assertEqual(run["source"], "glm")
+        self.assertEqual(run["tier"], "grok-build-47")
+        self.assertEqual(run["model"], "grok-4.7")
+        self.assertEqual(run["label"], label)
+        self.assertEqual(run["status"], "done")
+        self.assertEqual(run["verdict"], "PASS")
+        self.assertEqual(run["ended_at"], NOW)
+
     def test_poll_prefers_last_seen_alive_over_file_mtime(self):
         rundir = os.path.join(self.root, "runs", "ws9b")
         _write(
