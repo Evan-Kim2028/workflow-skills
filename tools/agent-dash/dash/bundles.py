@@ -1604,6 +1604,194 @@ def plan_frame_warnings(ws: str, root: Path | None = None) -> list[dict]:
         return []
 
 
+_SCOPE_NEGATION = re.compile(
+    r"(?:\bno\b|\bnot\b|\bnever\b|n't\b|\bwithout\b|\bavoid\b|instead of)\s*[^.;!]{0,40}$",
+    re.IGNORECASE,
+)
+_SCOPE_CI_GATE = re.compile(r"(?:lor-ci-local\.sh|ci-local\.sh)")
+_SCOPE_FULL = re.compile(r"--full(?![-\w])")
+_SCOPE_VALIDATE_SH = re.compile(r"\bscripts/validate\.sh\b")
+_SCOPE_PRECOMMIT_ALL = re.compile(r"\bpre-commit\s+run\s+--all-files\b")
+_SCOPE_GH_RUN = re.compile(r"\bgh\s+(?:workflow\s+run|run\s+rerun)\b")
+_SCOPE_PATH_HINT = re.compile(r"[/.]|\.py$|\.mjs$|\.[jt]s$|\.sh$|<[^>]*>")
+
+
+def _scope_negated(text: str, idx: int) -> bool:
+    """True when a negation word (no, never, without, ...) opens the same clause.
+
+    Plans that say "(no lor-ci-local.sh, never the machine lock)" describe
+    the scoped gate; they do not run the full suite, so they stay quiet.
+    """
+    return bool(_SCOPE_NEGATION.search(text[max(0, idx - 60):idx]))
+
+
+def _scope_bare_pytest(text: str) -> str | None:
+    """The offending bare-pytest segment, or None when every pytest names a target.
+
+    A pytest with an explicit file or directory argument (or a `<...>`
+    placeholder the lead re-cuts from member diffs) is scoped. Bare flags
+    only (`pytest -x -q`) still run the whole suite.
+    """
+    cleaned = text.replace("`", " ")
+    for segment in re.split(r"[;&|\n]", cleaned):
+        for match in re.finditer(r"(?:\s*(?:uv\s+run|python3?\s+-m)\s+)?pytest\b", segment):
+            if _scope_negated(segment, match.start()):
+                continue
+            rest = segment[match.end():]
+            if re.match(r"\s*(?:$|[)&|])", rest):
+                return segment.strip()
+            tokens = [tok for tok in rest.split() if not tok.startswith("-")]
+            tokens = [tok for tok in tokens if "=" not in tok or "/" in tok]
+            if not tokens or not any(_SCOPE_PATH_HINT.search(tok) for tok in tokens):
+                return segment.strip()
+    return None
+
+
+def _scope_has_target(text: str) -> bool:
+    """True when the string already names what the suite runs.
+
+    A pytest with a file, directory, or `<...>` placeholder target, or a
+    `lor-ci-local.sh` / `ci-local.sh` invocation with arguments, is a scoped
+    gate; a bare "pytest" mentioned beside it ("pytest runs only the list")
+    is description, not a second run.
+    """
+    cleaned = text.replace("`", " ")
+    for segment in re.split(r"[;&|\n]", cleaned):
+        for match in re.finditer(r"(?:\s*(?:uv\s+run|python3?\s+-m)\s+)?pytest\b", segment):
+            tokens = [tok for tok in segment[match.end():].split() if not tok.startswith("-")]
+            if any(_SCOPE_PATH_HINT.search(tok) for tok in tokens):
+                return True
+    for match in _SCOPE_CI_GATE.finditer(text):
+        after = text[match.end():]
+        if after.startswith(":"):
+            continue
+        if re.match(r"\s*(?:$|[,;)&|`])", after):
+            continue
+        return True
+    return False
+
+
+def _scope_full_suite_hit(text: str) -> str | None:
+    """The offending full-suite token in a probe/gate string, or None.
+
+    Catches bare pytest, `--full`, an argument-free `lor-ci-local.sh` /
+    `ci-local.sh`, `scripts/validate.sh`, `pre-commit run --all-files`,
+    and `gh workflow run` / `gh run rerun`. Mentions inside a negated
+    clause ("no ..."), file:line citations ("lor-ci-local.sh:206-227"),
+    and scoped invocations with arguments ("--train-files <list>")
+    are not hits.
+    """
+    if _scope_has_target(text):
+        return None
+    bare = _scope_bare_pytest(text)
+    if bare is not None:
+        return bare
+    for match in _SCOPE_CI_GATE.finditer(text):
+        after = text[match.end():]
+        if after.startswith(":"):
+            continue
+        if not re.match(r"\s*(?:$|[,;)&|`])", after):
+            continue
+        if _scope_negated(text, match.start()):
+            continue
+        return match.group(0)
+    for pattern in (_SCOPE_FULL, _SCOPE_VALIDATE_SH, _SCOPE_PRECOMMIT_ALL, _SCOPE_GH_RUN):
+        match = pattern.search(text)
+        if match and not _scope_negated(text, match.start()):
+            return match.group(0)
+    return None
+
+
+def plan_scope_warnings_for_plan(plan: dict, ws: str = "") -> list[dict]:
+    """Layer C lint dicts (PLAN207) for full-suite gates in a bundle's plan.
+
+    Scans every task `acceptance`/`probe` string and every train `gate`:
+    a plan never contains a full-suite gate. Warnings, never errors: a
+    strange plan still renders. Same dict shape as PLAN201-PLAN206 and
+    the MAP warnings (code, severity, title, detail with actual-vs-bar,
+    one-line fix).
+    """
+    found: list[dict] = []
+    if not isinstance(plan, dict):
+        return found
+    dag = plan.get("dag") if isinstance(plan.get("dag"), dict) else {}
+    groups = dag.get("groups") if isinstance(dag.get("groups"), list) else []
+    for group in groups:
+        if not isinstance(group, dict):
+            continue
+        for task in group.get("tasks") or []:
+            if not isinstance(task, dict):
+                continue
+            tid = task.get("id") if isinstance(task.get("id"), str) else ""
+            title = task.get("title") if isinstance(task.get("title"), str) else tid
+            acceptance = task.get("acceptance")
+            texts: list[str] = []
+            if isinstance(acceptance, str):
+                texts.append(acceptance)
+            elif isinstance(acceptance, dict):
+                for key in ("probe", "gate", "command", "check"):
+                    value = acceptance.get(key)
+                    if isinstance(value, str):
+                        texts.append(value)
+            for text in texts:
+                hit = _scope_full_suite_hit(text)
+                if hit is None:
+                    continue
+                found.append(
+                    _plan_warn(
+                        "PLAN207",
+                        f'"{title}" task probe runs the whole suite ({tid})',
+                        f"probe runs {hit!r} with no test-file target "
+                        f"(bar: one explicit test file per lane); a plan never holds a full-suite gate",
+                        f"Point the {tid or 'task'} probe at its explicit test files, "
+                        f"e.g. pytest path/to/test_x.py",
+                    )
+                )
+                break
+    trains = plan.get("trains") if isinstance(plan.get("trains"), list) else []
+    for train in trains:
+        if not isinstance(train, dict):
+            continue
+        gate = train.get("gate")
+        if not isinstance(gate, str):
+            continue
+        hit = _scope_full_suite_hit(gate)
+        if hit is None:
+            continue
+        tid = train.get("id") if isinstance(train.get("id"), str) else ""
+        title = train.get("title") if isinstance(train.get("title"), str) else tid
+        found.append(
+            _plan_warn(
+                "PLAN207",
+                f'Train {tid} ("{title}") gate runs the whole suite',
+                f"gate runs {hit!r} with no test-file target "
+                f"(bar: the tests for files two or more members both touch); a plan never holds a full-suite gate",
+                f"Set the {tid or 'train'} gate to those tests, "
+                f"e.g. pytest path/to/test_x.py path/to/test_y.py",
+            )
+        )
+    return found
+
+
+def plan_scope_warnings(ws: str, root: Path | None = None) -> list[dict]:
+    """PLAN207 warnings for a bundle's plan.
+
+    Warnings, never errors: empty when the plan is missing or unreadable,
+    so callers keep their own not-found and invalid-plan paths.
+    """
+    path = bundle_dir(ws, root)
+    if path is None:
+        return []
+    plan = _read_json(path / "plan.json")
+    if not isinstance(plan, dict):
+        return []
+    try:
+        return plan_scope_warnings_for_plan(plan, ws)
+    except Exception as exc:
+        _map_unavailable(exc)
+        return []
+
+
 def _validate_lifecycle(issues: list[str], ws: str, meta: dict, root: Path | None = None) -> None:
     """Additive bundle.json lifecycle fields: state, stamps, summary, deps, milestone."""
     from dash.lifecycle import STATES
@@ -2699,7 +2887,7 @@ def cmd_ws(argv: list[str]) -> int:
             _say(errors.bundle_not_found(ws), json_mode)
             return errors.NOT_FOUND
         issues = validate_bundle(ws)
-        warnings = plan_map_warnings(ws) + plan_frame_warnings(ws)
+        warnings = plan_map_warnings(ws) + plan_frame_warnings(ws) + plan_scope_warnings(ws)
         if json_mode:
             errors.emit_json({"ws": ws, "ok": not issues, "issues": issues, "warnings": warnings})
             return errors.INVALID_DATA if issues else errors.OK

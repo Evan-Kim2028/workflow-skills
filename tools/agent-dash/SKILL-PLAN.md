@@ -50,6 +50,14 @@ Open `http://127.0.0.1:8765/plan?ws=WS4`. Overview is first, then bundles in ord
 
 `fixtures/bundles/` in this repo is a tiny OVERVIEW plus one workstream, for tests. Point `AGENT_DASH_WORKSTREAMS` at that directory when you want the plan page to render with no private data.
 
+## Worktrees and test scope in a plan
+
+Every lane runs in its own worktree and is removed when its task finishes. Write the plan so that holds:
+
+- One worktree per lane, created from origin/main. When a lane's task reaches `prog` or `done`, or is dropped, its worktree goes too: `ws task` already runs worktree gc on each of those moves, so removing is the default, not a chore. Leads also run `ws gc <WS>` at each milestone and before closeout; `ws gc <WS> --dry-run` lists what would go first.
+- Acceptance probes name explicit test files, one lane's files per probe. A train `gate` names the tests for the files two or more members both touch, re-cut from member diffs as they land.
+- A plan never contains a full-suite gate: no bare `pytest`, no `--full`, no argument-free `lor-ci-local.sh` / `ci-local.sh`, no `scripts/validate.sh`, no `pre-commit run --all-files`, no `gh workflow run` / `gh run rerun`. `ws validate` flags any of them as a PLAN207 warning (exit stays 0) naming the task or train and the fix.
+
 ## Map checklist
 
 The plan-progress map stays readable when the plan follows these nine rules. Run `ws layout <ID>` before kickoff and aim for zero MAP warnings. `ws validate` reports the same MAP101–MAP111 codes as warnings (exit stays 0); each names its threshold, the actual number, and the fix.
