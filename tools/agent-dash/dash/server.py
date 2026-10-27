@@ -198,6 +198,13 @@ def _with_run_sections(body: dict) -> dict:
 class DashServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
+    # A dashboard page load fires ~45 requests (scripts, CSS, APIs) in one
+    # burst; the socketserver default backlog of 5 overflows while the one
+    # accept thread stalls behind a fold, and the kernel RSTs the excess
+    # connections (page scripts die with ERR_CONNECTION_RESET, so the
+    # inline script throws on the first missing global and the body never
+    # renders). 128 absorbs the whole burst.
+    request_queue_size = 128
 
     def __init__(self, store, registry, host="127.0.0.1", port=8765, index_path=None, stream_interval=2.0, cfg=None, build=None):
         from dash.singleflight import SingleFlight
