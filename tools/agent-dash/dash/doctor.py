@@ -567,16 +567,32 @@ def _check_slow_sources(ctx, sources: list) -> None:
         except (TypeError, ValueError):
             continue
         if source.get("state") == "slow" or duration > SLOW_AFTER_S:
-            slow.append((source.get("name"), duration))
+            try:
+                lag = float(source.get("lag_s") or 0)
+            except (TypeError, ValueError):
+                lag = 0.0
+            slow.append((source.get("name"), duration, lag))
     if not slow:
         _check(ctx, "slow-sources", True, "no source poll over the slow threshold")
         return
-    _check(ctx, "slow-sources", False, f"slow: {', '.join(str(name) for name, _ in slow)}")
-    for name, duration in slow:
+    _check(ctx, "slow-sources", False, f"slow: {', '.join(str(name) for name, _, _ in slow)}")
+    for name, duration, lag in slow:
+        if duration > SLOW_AFTER_S:
+            detail = (
+                f"source {name!r} last poll took {duration:.1f}s "
+                f"(over {SLOW_AFTER_S:g}s) but returned"
+            )
+        else:
+            # A "slow" source with a fast last poll has a poll still
+            # running: working through load, not stopped.
+            detail = (
+                f"source {name!r} poll still running "
+                f"(last completed poll {lag:.0f}s ago)"
+            )
         _add(
             ctx, "source-slow", "warn", "global", None,
             f"Source {name} is slow",
-            f"source {name!r} last poll took {duration:.1f}s (over {SLOW_AFTER_S:g}s) but returned",
+            detail,
             "python3 agent_dash.py status",
             key=str(name),
         )

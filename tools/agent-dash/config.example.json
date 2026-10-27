@@ -27,7 +27,10 @@
   "dagster": {
     "ssh_host": "",
     "graphql_url": "http://127.0.0.1:3000/graphql",
-    "enabled": true
+    "enabled": true,
+    "ssh_timeout_s": 20,
+    "stale_error_after_s": 600,
+    "control_path": ""
   },
   "reaper": {
     "idle_minutes": 10

@@ -121,6 +121,23 @@
   },
   {
    "provider": "cursor",
+   "model": "grok-4.7",
+   "input": 2,
+   "output": 6,
+   "cache_read": 0.5,
+   "cache_write_5m": null,
+   "cache_write_1h": null,
+   "reasoning": null,
+   "long_context": null,
+   "input_includes_cache_read": false,
+   "billing_mode": "plan-included",
+   "price_scope": "Cursor row Grok 4.7 (256k, not Fast); the bare id is the standard model, the effort level does not change the rate; input over 256k per request bills 2x, not applied to per-run totals; these rates apply after the weekly pool",
+   "source_url": "https://cursor.com/docs/models-and-pricing",
+   "retrieved_at": "2026-10-17",
+   "confidence": "inferred"
+  },
+  {
+   "provider": "cursor",
    "model": "grok-4.7-high",
    "input": 2,
    "output": 6,

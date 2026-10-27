@@ -3,12 +3,24 @@
 Off until ``dagster.ssh_host`` is set. One ssh and one GraphQL call per poll. Tags other than the allowlist are
 dropped before anything is written. A failed call records last_error and
 leaves stored rows alone.
+
+The remote call is the slow part: a fresh ssh handshake alone costs
+seconds (more over a jump host), and the webserver sometimes stalls
+past the local sweep budget. Each ssh call is therefore bounded by
+``dagster.ssh_timeout_s`` (default 20 s, capped by the sweep budget),
+connections reuse one dashboard-owned multiplex socket, and close-out
+lookups stop at the poll deadline and resume next poll. A fetch that
+eats its whole timeout is remote latency, not a hard failure: the poll
+keeps the cached rows and marks itself stale instead of erroring. Only
+a fast failure (refused, auth, bad response) or a stale run past
+``dagster.stale_error_after_s`` surfaces as an error.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import subprocess
 import time
@@ -19,6 +31,10 @@ SURFACE_ERROR = True
 
 DEFAULT_URL = "http://127.0.0.1:3000/graphql"
 DEFAULT_MAX_BACKOFF_S = 300.0
+DEFAULT_SSH_TIMEOUT_S = 20.0
+SSH_BUDGET_MARGIN_S = 5.0
+DEFAULT_STALE_ERROR_AFTER_S = 600.0
+CONTROL_PERSIST_S = 600
 WINDOW_S = 2 * 3600
 TAG_KEYS = ("dagster/partition", "lor/ops_wave", "lor/slot_class", "lor/claim_gib")
 
@@ -88,6 +104,15 @@ query DagsterRunsById($ids: [String!]) {
 
 log = logging.getLogger("agent_dash.dagster")
 last_error = None
+# Wall (`now`) timestamp of the last fully successful poll, or None before
+# the first success. Powers the ``stale`` health flag: while fetches time
+# out, the stored rows are the cached result and the source is stale
+# rather than failed.
+last_success_ts = None
+# Wall (`now`) timestamp when the current stale run began, or None while
+# fresh. Past ``dagster.stale_error_after_s`` the stale run escalates to
+# an error so a permanently dead remote stays visible.
+stale_since_ts = None
 # Close-outs skipped because the active page was full (ACTIVE_LIMIT).
 # Surfaced on /api/health as ``dagster.skipped_closeouts``.
 skipped_closeouts = 0
@@ -106,15 +131,25 @@ def health_extra() -> dict:
 
     ``backoff_s`` is the current delay after failures (0 when healthy) and
     ``next_poll_in_s`` the seconds until the next ssh attempt (0 when none is
-    pending).
+    pending). ``stale`` is true while fetches time out and the stored rows
+    are the last good result; ``last_success_age_s`` says how old that
+    result is (None before the first success).
     """
     remaining = 0.0
     if _next_attempt is not None:
         remaining = max(0.0, _next_attempt - _clock())
+    age = None
+    if last_success_ts is not None:
+        try:
+            age = round(max(0.0, time.time() - float(last_success_ts)), 1)
+        except (TypeError, ValueError):
+            age = None
     return {
         "skipped_closeouts": skipped_closeouts,
         "backoff_s": _backoff_s,
         "next_poll_in_s": round(remaining, 1),
+        "stale": stale_since_ts is not None,
+        "last_success_age_s": age,
     }
 
 
@@ -125,6 +160,112 @@ def _max_backoff(cfg: dict) -> float:
     except (TypeError, ValueError):
         return DEFAULT_MAX_BACKOFF_S
     return value if value > 0 else DEFAULT_MAX_BACKOFF_S
+
+
+def _ssh_timeout_s(cfg: dict) -> float:
+    """Wall cap for one ssh call. ``dagster.ssh_timeout_s`` wins."""
+    block = cfg.get("dagster") if isinstance(cfg.get("dagster"), dict) else {}
+    try:
+        value = float(block.get("ssh_timeout_s", DEFAULT_SSH_TIMEOUT_S))
+    except (TypeError, ValueError):
+        return DEFAULT_SSH_TIMEOUT_S
+    return value if value > 0 else DEFAULT_SSH_TIMEOUT_S
+
+
+def _stale_error_after_s(cfg: dict) -> float:
+    """How long a stale run may last before it escalates to an error."""
+    block = cfg.get("dagster") if isinstance(cfg.get("dagster"), dict) else {}
+    try:
+        value = float(block.get("stale_error_after_s", DEFAULT_STALE_ERROR_AFTER_S))
+    except (TypeError, ValueError):
+        return DEFAULT_STALE_ERROR_AFTER_S
+    return value if value > 0 else DEFAULT_STALE_ERROR_AFTER_S
+
+
+def _sweep_budget_s(cfg: dict) -> float:
+    """The registry's shared join budget, so one ssh call cannot eat it all."""
+    try:
+        from dash.sources import POLL_BUDGET_S
+    except Exception:
+        POLL_BUDGET_S = 25.0
+    try:
+        value = float((cfg or {}).get("poll_budget_s", POLL_BUDGET_S))
+    except (TypeError, ValueError):
+        return POLL_BUDGET_S
+    return value if value > 0 else POLL_BUDGET_S
+
+
+def _fetch_allowance_s(cfg: dict) -> float:
+    """Seconds one ssh fetch may take: the configured ssh timeout, capped
+    so the whole poll (fetch plus close-outs) still fits the sweep budget."""
+    budget = _sweep_budget_s(cfg)
+    cap = max(2.0, budget - SSH_BUDGET_MARGIN_S)
+    return max(2.0, min(_ssh_timeout_s(cfg), cap))
+
+
+def _control_path(cfg: dict) -> str | None:
+    """Dashboard-owned ssh multiplex socket pattern, or None for plain ssh.
+
+    ``dagster.control_path`` names it outright. Otherwise
+    ``<state_dir>/ssh-cm/%h_%p_%r`` persists one master across polls (and
+    across the back-off gaps), so only the first poll after a cold start
+    pays the handshake. A missing/unmakable directory falls back to
+    plain ssh rather than failing the poll.
+    """
+    block = cfg.get("dagster") if isinstance(cfg.get("dagster"), dict) else {}
+    explicit = block.get("control_path")
+    if isinstance(explicit, str) and explicit.strip():
+        return explicit.strip()
+    state_dir = (cfg or {}).get("state_dir")
+    if not isinstance(state_dir, str) or not state_dir.strip():
+        state_dir = os.path.join(os.path.expanduser("~"), ".local", "share", "agent-dash")
+    directory = os.path.join(state_dir, "ssh-cm")
+    try:
+        os.makedirs(directory, exist_ok=True)
+    except OSError:
+        return None
+    return os.path.join(directory, "%h_%p_%r")
+
+
+def _is_slow_timeout(err: str | None, elapsed: float, timeout: float) -> bool:
+    """True when the fetch ate (nearly) its whole timeout: remote latency,
+    not a fast failure. An instant error string with no wait behind it
+    stays on the error path even when it names a timeout."""
+    if not err or "timed out" not in err:
+        return False
+    try:
+        limit = max(0.0, float(timeout) - 1.0)
+    except (TypeError, ValueError):
+        return False
+    return elapsed >= limit
+
+
+def _mark_stale(cfg: dict, now: float) -> None:
+    """Record a timed-out fetch: keep the cached rows, no error — unless
+    the stale run outlasts its grace, when it escalates so a dead remote
+    stays visible. Back-off still applies so a struggling remote is not
+    hammered."""
+    global last_error, stale_since_ts
+    if stale_since_ts is None:
+        stale_since_ts = now
+    _record_failure(cfg)
+    if now - stale_since_ts > _stale_error_after_s(cfg):
+        last_error = _clip(f"stale: no successful dagster poll for {int(now - stale_since_ts)}s")
+        log.warning("dagster: %s", last_error)
+    else:
+        last_error = None
+        log.warning(
+            "dagster: fetch timed out; serving cached rows (stale since %s)",
+            int(stale_since_ts),
+        )
+
+
+def _mark_fresh(now: float) -> None:
+    """A fully successful poll clears any stale run."""
+    global last_error, last_success_ts, stale_since_ts
+    last_error = None
+    last_success_ts = now
+    stale_since_ts = None
 
 
 def _record_success() -> None:
@@ -153,21 +294,35 @@ def poll(store, cfg, now: float) -> None:
         log.warning("dagster: %s", last_error)
 
 
-def ssh_argv(host: str, url: str) -> list[str]:
-    return [
+def ssh_argv(host: str, url: str, curl_timeout_s: int = 20, control_path: str | None = None) -> list[str]:
+    argv = [
         "ssh",
         "-o",
         "ConnectTimeout=5",
         "-o",
         "BatchMode=yes",
-        host,
-        remote_command(url),
     ]
+    if control_path:
+        argv += [
+            "-o",
+            "ControlMaster=auto",
+            "-o",
+            "ControlPath=" + control_path,
+            "-o",
+            f"ControlPersist={CONTROL_PERSIST_S}",
+        ]
+    argv += [host, remote_command(url, curl_timeout_s)]
+    return argv
 
 
-def remote_command(url: str) -> str:
+def remote_command(url: str, curl_timeout_s: int = 20) -> str:
+    try:
+        limit = int(curl_timeout_s)
+    except (TypeError, ValueError):
+        limit = 20
+    limit = max(5, limit)
     return (
-        'curl -s -m 20 -X POST -H "Content-Type: application/json" '
+        f'curl -s -m {limit} -X POST -H "Content-Type: application/json" '
         + url
         + " --data-binary @-"
     )
@@ -196,16 +351,26 @@ def _poll(store, cfg: dict, now: float) -> None:
     global last_error, skipped_closeouts
     settings = _settings(cfg)
     if settings is None:
-        last_error = None
+        _mark_fresh(now)
         _record_success()
         return
     host, url = settings
     if _next_attempt is not None and _clock() < _next_attempt:
         # Inside the back-off window: no ssh. last_error stays as the last failure.
         return
+    allowance = _fetch_allowance_s(cfg)
+    mux = _control_path(cfg)
+    curl_timeout = max(5, int(allowance - 5))
     body = json.dumps({"query": QUERY, "variables": {"since": now - WINDOW_S}}).encode("utf-8")
-    text, err = _ssh(host, url, body)
+    fetch_start = _clock()
+    text, err = _ssh(host, url, body, timeout_s=allowance, curl_timeout_s=curl_timeout, control_path=mux)
+    elapsed = _clock() - fetch_start
     if err:
+        if _is_slow_timeout(err, elapsed, allowance):
+            # Remote latency, not a hard failure: keep the cached rows
+            # and mark the source stale instead of erroring.
+            _mark_stale(cfg, now)
+            return
         last_error = _clip(err)
         log.warning("dagster: %s", last_error)
         _record_failure(cfg)
@@ -230,12 +395,15 @@ def _poll(store, cfg: dict, now: float) -> None:
     active_ids = sorted({rid for rid in active_ids if isinstance(rid, str)})
     full_page = len(active_raw) >= ACTIVE_LIMIT
     _remember_active(store, active_ids, now, full_page)
-    last_error = None
+    _mark_fresh(now)
     if full_page:
         skipped_closeouts += 1
         log.warning("dagster: active page full (%d); skipping close-out", len(active_raw))
         return
-    _close_absent(store, host, url, active_ids, now)
+    # Close-outs share what's left of the allowance: chunks that do not
+    # fit defer to the next poll instead of blowing the sweep budget.
+    deadline = _clock() + max(0.0, allowance - elapsed - 1.0)
+    _close_absent(store, host, url, active_ids, now, control_path=mux, fetch_timeout_s=allowance, deadline=deadline)
 
 
 def _settings(cfg: dict):
@@ -252,13 +420,25 @@ def _settings(cfg: dict):
     return host, url
 
 
-def _ssh(host: str, url: str, body: bytes):
+def _ssh(
+    host: str,
+    url: str,
+    body: bytes,
+    timeout_s: float = DEFAULT_SSH_TIMEOUT_S,
+    curl_timeout_s: int = 20,
+    control_path: str | None = None,
+):
+    try:
+        limit = float(timeout_s)
+    except (TypeError, ValueError):
+        limit = DEFAULT_SSH_TIMEOUT_S
+    limit = limit if limit > 0 else DEFAULT_SSH_TIMEOUT_S
     try:
         proc = subprocess.run(
-            ssh_argv(host, url),
+            ssh_argv(host, url, curl_timeout_s, control_path),
             input=body,
             capture_output=True,
-            timeout=30,
+            timeout=limit,
             check=False,
         )
     except subprocess.TimeoutExpired:
@@ -324,7 +504,16 @@ def _remember_active(store, active_ids: list, now: float, full_page: bool) -> No
         log.warning("dagster state: %s", type(exc).__name__)
 
 
-def _close_absent(store, host: str, url: str, active_ids: list, now: float) -> None:
+def _close_absent(
+    store,
+    host: str,
+    url: str,
+    active_ids: list,
+    now: float,
+    control_path: str | None = None,
+    fetch_timeout_s: float = DEFAULT_SSH_TIMEOUT_S,
+    deadline: float | None = None,
+) -> None:
     getter = getattr(store, "dagster_open_runs", None)
     if not callable(getter):
         return
@@ -344,6 +533,15 @@ def _close_absent(store, host: str, url: str, active_ids: list, now: float) -> N
     by_id = {}
     fetched = set()
     for index in range(0, len(missing), BY_ID_BATCH):
+        if deadline is not None and _clock() >= deadline - 2.0:
+            # Out of poll budget: the rest keep their open rows and the
+            # next poll picks them up from the top.
+            log.warning(
+                "dagster: close-out deferred (%d of %d remaining)",
+                len(missing) - index,
+                len(missing),
+            )
+            break
         chunk = missing[index:index + BY_ID_BATCH]
         ids = []
         for row in chunk:
@@ -352,7 +550,7 @@ def _close_absent(store, host: str, url: str, active_ids: list, now: float) -> N
             if short:
                 ids.append(short)
         try:
-            found = _fetch_by_id(host, url, ids)
+            found = _fetch_by_id(host, url, ids, timeout_s=fetch_timeout_s, control_path=control_path)
         except Exception as exc:
             log.warning("dagster by-id: %s", type(exc).__name__)
             continue
@@ -375,12 +573,29 @@ def _close_absent(store, host: str, url: str, active_ids: list, now: float) -> N
         _close_unknown(store, row, now)
 
 
-def _fetch_by_id(host: str, url: str, ids: list) -> dict:
+def _fetch_by_id(
+    host: str,
+    url: str,
+    ids: list,
+    timeout_s: float = DEFAULT_SSH_TIMEOUT_S,
+    control_path: str | None = None,
+) -> dict:
     """Read-only fetch of runs by id. Returns runId -> raw run."""
     if not ids:
         return {}
     body = json.dumps({"query": QUERY_BY_ID, "variables": {"ids": list(ids)}}).encode("utf-8")
-    text, err = _ssh(host, url, body)
+    try:
+        limit = float(timeout_s)
+    except (TypeError, ValueError):
+        limit = DEFAULT_SSH_TIMEOUT_S
+    text, err = _ssh(
+        host,
+        url,
+        body,
+        timeout_s=limit if limit > 0 else DEFAULT_SSH_TIMEOUT_S,
+        curl_timeout_s=max(5, int((limit if limit > 0 else DEFAULT_SSH_TIMEOUT_S) - 5)),
+        control_path=control_path,
+    )
     if err:
         raise ValueError(_clip(err))
     try:

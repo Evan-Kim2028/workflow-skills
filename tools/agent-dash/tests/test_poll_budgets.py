@@ -177,6 +177,68 @@ class WatchdogTests(unittest.TestCase):
         self.assertEqual(body["sources"][0]["last_error"], "RuntimeError: boom")
         self.assertEqual(body["sources"][0]["lag_s"], 2)
 
+    def test_in_flight_poll_is_slow_not_stalled(self):
+        # A 2 s source whose second poll is still running at lag 7 s is
+        # working, not stopped: it reads slow (ok), never stalled, with
+        # no error and no stall message. Past its stall limit the same
+        # running poll reads stalled (wedged), keeping restart advice.
+        class _Blocking:
+            NAME = "blocking"
+            INTERVAL_S = 2
+
+            def __init__(self):
+                self.calls = 0
+                self.entered = threading.Event()
+                self.release = threading.Event()
+
+            def poll(self, store, cfg, now):
+                self.calls += 1
+                if self.calls == 2:
+                    self.entered.set()
+                    self.release.wait(30)
+
+        store = MemStore()
+        source = _Blocking()
+        registry = Registry([source])
+        # A mature dashboard (past the startup window): lag judges at once.
+        registry._born = NOW - 3600
+        registry.tick(store, {}, NOW, force=True)
+        self.assertEqual(source.calls, 1)
+        ticker = threading.Thread(
+            target=registry.tick, args=(store, {}, NOW + 2), daemon=True
+        )
+        ticker.start()
+        try:
+            self.assertTrue(source.entered.wait(10))
+            # Lag 7 s is past 3x the 2 s interval, but the poll is only
+            # 5 s in: slow, not stalled.
+            body = registry.health(NOW + 7)
+            self.assertTrue(body["ok"])
+            entry = body["sources"][0]
+            self.assertEqual(entry["state"], "slow")
+            self.assertFalse(entry["stalled"])
+            self.assertIsNone(entry["last_error"])
+            self.assertEqual(body["slow_sources"], 1)
+            self.assertEqual(registry.stalled_messages(NOW + 7), [])
+            # At lag 9 s the same poll is 7 s in, past the limit: wedged.
+            body = registry.health(NOW + 9)
+            self.assertFalse(body["ok"])
+            entry = body["sources"][0]
+            self.assertEqual(entry["state"], "stalled")
+            self.assertTrue(entry["stalled"])
+            self.assertEqual(
+                registry.stalled_messages(NOW + 9),
+                ["source stalled: blocking (last ok poll 9 s ago)"],
+            )
+        finally:
+            source.release.set()
+            ticker.join(10)
+        self.assertFalse(ticker.is_alive())
+        registry.tick(store, {}, NOW + 10, force=True)
+        body = registry.health(NOW + 10)
+        self.assertTrue(body["ok"])
+        self.assertEqual(body["sources"][0]["state"], "ok")
+
 
 class RestartGraceTests(unittest.TestCase):
     """The first poll cycle after a restart is "starting", never stalled."""
