@@ -90,12 +90,6 @@
 @keyframes livering{0%{box-shadow:0 0 0 0 color-mix(in srgb,var(--s1) 55%,transparent)}100%{box-shadow:0 0 0 8px transparent}}
 @media (prefers-reduced-motion: reduce){.dnode.g-now,.dedges path.flow,.chip.changed,.chip.live{animation:none}.pbig-bar span,.colbar i{transition:none}}
 
-.working-now{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin:6px 0 10px}
-.working-now>b{font:700 12px var(--mono);color:var(--s1);margin-right:4px}
-.wn-pill{display:inline-flex;align-items:center;gap:6px;font:12px var(--mono);padding:3px 10px 3px 6px;border-radius:999px;border:1px solid color-mix(in srgb,var(--s1) 45%,var(--ring));background:color-mix(in srgb,var(--s1) 10%,var(--surface))}
-.wn-pill i{width:8px;height:8px;border-radius:50%;animation:livering 1.8s ease-out infinite}
-.wn-pill .wn-id{font-weight:700;color:var(--ink)}.wn-pill .wn-sec{color:var(--accent);font-size:11px}.wn-pill .wn-slug{color:var(--ink-2)}.wn-pill .wn-tok{color:var(--muted);font-size:11px}
-
 /* plan map focus-on-hover */
 .dag.focus .dnode{opacity:.32;transition:opacity .2s ease}
 .dag.focus .dnode.f-self,.dag.focus .dnode.f-up,.dag.focus .dnode.f-down{opacity:1}

@@ -281,25 +281,6 @@
       mleg.appendChild(legGroup("Objectives", oitems));
     }
     c.appendChild(mleg);
-    var workingIds = Object.keys(live);
-    /* Section per working task, next to the label: the plan section
-       holding the task (task -> section title), so the strip reads
-       workstream -> section -> label like the run tables. */
-    var secOf = {};
-    (plan.groups || []).forEach(function (g) { ((g.tasks) || []).forEach(function (t) { if (t && t.id != null) secOf[t.id] = g.title || g.id; }); });
-    if (workingIds.length) {
-      var wn = el("div", {class: "working-now"}, [el("b", {text: "\u25CF Working now (" + nLive + ")"})]);
-      workingIds.forEach(function (tid) { live[tid].forEach(function (r) {
-        var slug = String(r.label || "").replace(new RegExp("^" + plan.ws.toLowerCase() + "[-._]?", "i"), "").replace(tid, "").replace(/^[-._]+/, "");
-        var sec = secOf[tid] || r.section || null;
-        var pill = el("button", {class: "wn-pill", title: (r.label || "") + " \u00B7 " + fullName(tierKey(r)) + " \u00B7 " + fmtDur(r.elapsed_s)}, [el("i"), el("span", {class: "wn-id", text: tid}), sec ? el("span", {class: "wn-sec", text: sec}) : null, el("span", {class: "wn-slug", text: slug}), el("span", {class: "wn-tok", text: tokTotal(r.tokens) ? fmtN(tokTotal(r.tokens)) + " \u00B7 " + cachedPct(r.tokens) + "% cached" : (r.context_tokens ? "~" + fmtN(r.context_tokens) + " \u00B7 live" : "")})]);
-        pill.firstChild.style.background = colorOf(tierKey(r));
-        pill.addEventListener("click", function () { openRun(r); });
-        wn.appendChild(pill);
-      }); });
-      c.appendChild(wn);
-    }
-    /* No unmapped strip: running agents with no task stay out of the map. */
     var gs = {}, colStat = {};
     /* Server-computed map layout (dash/maplayout.py, carried on /api/plan):
        density, per-section collapse state, slim columns, chip labels, arrows
@@ -1480,8 +1461,6 @@
         RP.savedCss[tid] = chipEl[tid].style.cssText;
         chipEl[tid].classList.remove("live", "just", "changed");
       });
-      /* Live snapshot rows would lie during a historical playback. */
-      Array.prototype.forEach.call(c.querySelectorAll(".working-now"), function (node) { node.style.display = "none"; });
       /* The live count-up animation would fight the replay percent. */
       (window.__adCountUp || []).forEach(function (h) { clearInterval(h); });
       try { clearTask(true); } catch (e) {}

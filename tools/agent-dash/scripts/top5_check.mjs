@@ -132,8 +132,8 @@ await send("Page.navigate", { url: `${BASE}/?view=exec&ws=WS9` });
 check("ws9 plan card loads", await waitFor(`!!document.querySelector('#exec-progress')`));
 check("no 'not mapped to a task' on ws9", await text(`document.body.textContent.indexOf('not mapped to a task')<0`));
 const headline = await text(`(function(){var h=document.querySelector('#exec-progress h2');return h?h.textContent:'';})()`);
-const workingPills = await text(`document.querySelectorAll('#exec-progress .wn-pill').length`);
-if (workingPills > 0) check("ws9 headline names agents working", /agent/.test(headline), `${headline} pills=${workingPills}`);
+const workingChips = await text(`document.querySelectorAll('#exec-progress .chip.live').length`);
+if (workingChips > 0) check("ws9 headline names agents working", /agent/.test(headline), `${headline} live chips=${workingChips}`);
 else console.log(`info  ws9 has no mapped live agents (headline: ${headline})`);
 check("ws9 map legend works", await text(`!!document.querySelector('#exec-progress .map-legend')`));
 
