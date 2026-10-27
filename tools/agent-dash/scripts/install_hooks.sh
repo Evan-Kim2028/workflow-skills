@@ -25,6 +25,14 @@
 #     execs the live checkout hook). Takes effect in new muse sessions;
 #     a hook approval step may be required (the installer says so).
 #
+#   sh tools/agent-dash/scripts/install_hooks.sh --claude-lead-guard
+#     once per machine: installs the Claude Code lead-guard hooks that
+#     keep a workstream lead wakeable and refilling
+#     (scripts/lead_guard_hook.py, configured in ~/.claude/settings.json
+#     as a PreToolUse hook with matcher AskUserQuestion and a Stop hook
+#     with no matcher, each "timeout": 10). Idempotent: re-running keeps
+#     one entry per hook and never touches other settings.
+#
 #   sh tools/agent-dash/scripts/install_hooks.sh --codex-shim
 #     once per machine: copies the `muse` label-guard shim to
 #     ~/.local/share/agent-dash/bin/muse and prints the PATH line that
@@ -36,8 +44,9 @@
 #     no Codex config; enabling the PATH line is the owner's step.
 #
 #   sh tools/agent-dash/scripts/install_hooks.sh --uninstall
-#     removes the grok hook file, the muse plugin, and the shim copy.
-#     Config backups (*.bak-*) are left in place.
+#     removes the grok hook file, the muse plugin, the shim copy, and
+#     the lead-guard entries from ~/.claude/settings.json (other settings
+#     entries stay). Config backups (*.bak-*) are left in place.
 #
 # The pre-push install refuses to overwrite a foreign hook (one without
 # the marker below); remove or merge that hook by hand first.
@@ -102,6 +111,70 @@ except OSError as exc:
     print("install_hooks: cannot write %s (%s)" % (settings_path, exc), file=sys.stderr)
     sys.exit(1)
 print("install_hooks: label-guard hook installed in %s (backup %s)" % (settings_path, backup))
+EOF
+    exit $?
+fi
+
+if [ "${1:-}" = "--claude-lead-guard" ]; then
+    HERE="$(cd "$(dirname "$0")" && pwd)"
+    if [ -f "$HOME/.claude/tools/agent-dash/scripts/lead_guard_hook.py" ]; then
+        GUARD="$HOME/.claude/tools/agent-dash/scripts/lead_guard_hook.py"
+    else
+        GUARD="$HERE/lead_guard_hook.py"
+    fi
+    [ -f "$GUARD" ] || { echo "install_hooks: no lead-guard hook at $GUARD" >&2; exit 2; }
+    /usr/bin/python3 - "$GUARD" "$HOME/.claude/settings.json" <<'EOF'
+import json, sys, time, os
+guard, settings_path = sys.argv[1], sys.argv[2]
+pre_entry = {"matcher": "AskUserQuestion",
+             "hooks": [{"type": "command", "command": "python3 %s" % guard, "timeout": 10}]}
+stop_entry = {"hooks": [{"type": "command", "command": "python3 %s" % guard, "timeout": 10}]}
+try:
+    text = open(settings_path, encoding="utf-8").read() if os.path.isfile(settings_path) else "{}"
+    settings = json.loads(text)
+except (OSError, ValueError) as exc:
+    print("install_hooks: %s does not parse (%s); fix it by hand" % (settings_path, exc), file=sys.stderr)
+    sys.exit(1)
+if not isinstance(settings, dict):
+    print("install_hooks: %s is not an object; fix it by hand" % settings_path, file=sys.stderr)
+    sys.exit(1)
+hooks = settings.get("hooks")
+if not isinstance(hooks, dict):
+    hooks = {}
+    settings["hooks"] = hooks
+changed = False
+pre = hooks.get("PreToolUse")
+if not isinstance(pre, list):
+    pre = []
+    hooks["PreToolUse"] = pre
+if not any(guard in json.dumps(item) and (item.get("matcher") if isinstance(item, dict) else None) == "AskUserQuestion" for item in pre if isinstance(item, dict)):
+    pre.append(pre_entry)
+    changed = True
+stop = hooks.get("Stop")
+if not isinstance(stop, list):
+    stop = []
+    hooks["Stop"] = stop
+if not any(guard in json.dumps(item) for item in stop):
+    stop.append(stop_entry)
+    changed = True
+if not changed:
+    print("install_hooks: lead-guard hook already installed in %s" % settings_path)
+    sys.exit(0)
+backup = "%s.bak-%d" % (settings_path, int(time.time()))
+try:
+    with open(backup, "w", encoding="utf-8") as fh:
+        fh.write(text)
+except OSError as exc:
+    print("install_hooks: cannot back up %s (%s)" % (settings_path, exc), file=sys.stderr)
+    sys.exit(1)
+try:
+    with open(settings_path, "w", encoding="utf-8") as fh:
+        json.dump(settings, fh, indent=2, sort_keys=True)
+        fh.write("\n")
+except OSError as exc:
+    print("install_hooks: cannot write %s (%s)" % (settings_path, exc), file=sys.stderr)
+    sys.exit(1)
+print("install_hooks: lead-guard hook installed in %s (backup %s)" % (settings_path, backup))
 EOF
     exit $?
 fi
@@ -186,6 +259,45 @@ fi
 if [ "${1:-}" = "--uninstall" ]; then
     GFILE="$HOME/.grok/hooks/label-guard.json"
     [ -f "$GFILE" ] && rm -f "$GFILE" && echo "install_hooks: removed $GFILE"
+    SFILE_SETTINGS="$HOME/.claude/settings.json"
+    if [ -f "$SFILE_SETTINGS" ]; then
+        /usr/bin/python3 - "$SFILE_SETTINGS" <<'EOF'
+import json, sys
+settings_path = sys.argv[1]
+try:
+    with open(settings_path, encoding="utf-8") as fh:
+        settings = json.load(fh)
+except (OSError, ValueError) as exc:
+    print("install_hooks: %s does not parse (%s); left alone" % (settings_path, exc), file=sys.stderr)
+    sys.exit(0)
+hooks = settings.get("hooks")
+if not isinstance(hooks, dict):
+    sys.exit(0)
+changed = False
+for key in ("PreToolUse", "Stop"):
+    entries = hooks.get(key)
+    if not isinstance(entries, list):
+        continue
+    kept = [item for item in entries if "lead_guard_hook.py" not in json.dumps(item)]
+    if len(kept) != len(entries):
+        changed = True
+        if kept:
+            hooks[key] = kept
+        else:
+            del hooks[key]
+if changed:
+    try:
+        with open(settings_path, "w", encoding="utf-8") as fh:
+            json.dump(settings, fh, indent=2, sort_keys=True)
+            fh.write("\n")
+    except OSError as exc:
+        print("install_hooks: cannot write %s (%s)" % (settings_path, exc), file=sys.stderr)
+        sys.exit(1)
+    print("install_hooks: removed lead-guard entries from %s" % settings_path)
+else:
+    print("install_hooks: no lead-guard entries in %s" % settings_path)
+EOF
+    fi
     if command -v muse >/dev/null 2>&1 && muse plugins list --json 2>/dev/null | grep -q '"label-guard"'; then
         muse plugins remove label-guard 2>&1 | head -n 3 || echo "install_hooks: muse plugin remove failed" >&2
     fi
@@ -196,7 +308,7 @@ if [ "${1:-}" = "--uninstall" ]; then
 fi
 
 if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
-    echo "usage: sh tools/agent-dash/scripts/install_hooks.sh [--claude-label-guard|--grok-label-guard|--muse-label-guard|--codex-shim|--uninstall]"
+    echo "usage: sh tools/agent-dash/scripts/install_hooks.sh [--claude-label-guard|--claude-lead-guard|--grok-label-guard|--muse-label-guard|--codex-shim|--uninstall]"
     exit 0
 fi
 
