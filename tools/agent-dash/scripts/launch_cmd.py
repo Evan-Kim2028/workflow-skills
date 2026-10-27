@@ -4,10 +4,13 @@
 Usage: launch_cmd.py <label> <workspace> <prompt_file> <outdir>
 
 Picks the free model with the fewest live runs that is not cooling down, runs
-`cmd -p` with NDJSON output, and on a throttle/quota/empty failure puts that
-model on a cooldown and retries on the next one. The prompt gets a
-`[label: <label>]` first line when it lacks one. Outdir is any directory the
-dashboard scans for `cmd-sessions.tsv` (a scratchpad `cmd/` folder works).
+``cmd -p`` with NDJSON output, and on a throttle/quota/empty failure puts that
+model on a cooldown and retries on the next one. ``CMD_PIN_MODEL`` pins one
+model (no rotation). The prompt gets a ``[label: <label>]`` first line when
+it lacks one. Outdir is any directory the dashboard scans for
+``cmd-sessions.tsv`` (a scratchpad ``cmd/`` folder works); it is registered
+in ``run-dirs.txt`` like ``run_worker.py`` does, so the dashboard finds it
+without any ``roots.scratchpads`` edit.
 Writes:
   <outdir>/out-<label>.md          final text of the successful attempt
   <outdir>/stream-<label>-<n>.ndjson  raw event stream per attempt
@@ -22,18 +25,56 @@ import re
 import subprocess
 import sys
 import time
+from pathlib import Path
 
+HERE = Path(__file__).resolve()
+ROOT = HERE.parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+#: Free models in preference order: the DeepSeek non-fast flash build
+#: first, then its siblings, then Beam, then the other free lanes.
 FREE_MODELS = [
+    "deepseek/deepseek-v4.1-flash",
+    "deepseek/deepseek-v4-pro",
+    "deepseek/deepseek-v4-flash",
     "reflection/beam:free",
     "poolside/laguna-s-2.1-free",
     "stealth/glyph-cluster:free",
 ]
 COOLDOWN_S = 15 * 60
-#: Registry tier recorded in the manifest's last cell (source stays
-#: ``commandcode``; the tier names the lane the launch used).
+#: Fallback tier when the model names no lane below.
 TIER = "commandcode"
 MAX_ATTEMPTS = 8
 THROTTLE = re.compile(r"429|rate.?limit|too many requests|quota|throttl|capacity|overloaded|insufficient|credits|503|today's limit|no longer available", re.I)
+
+
+def dash_tier(model: str | None) -> str:
+    """Registry tier for a Command Code model: the lane the launch used."""
+    text = (model or "").lower()
+    if text.startswith("reflection/"):
+        return "commandcode-beam"
+    if text.startswith("deepseek/"):
+        return "commandcode-deepseek"
+    return TIER
+
+
+def state_dir() -> Path:
+    """Dashboard state dir: ``AGENT_DASH_STATE_DIR``, else the default."""
+    env = (os.environ.get("AGENT_DASH_STATE_DIR") or "").strip()
+    if env:
+        return Path(os.path.expanduser(env))
+    return Path.home() / ".local" / "share" / "agent-dash"
+
+
+def register_run_dir(run_dir: Path) -> None:
+    """Best effort: registration must never break a launch."""
+    try:
+        from dash.rundirs import register_run_dir as register
+
+        register(state_dir(), run_dir)
+    except Exception:
+        pass
 
 
 def locked(path, fn):
@@ -61,10 +102,12 @@ def pick(outdir, label):
                 live[model.strip()] = live.get(model.strip(), 0) + 1
             except Exception:
                 os.unlink(os.path.join(rdir, name))
-        ready = [m for m in FREE_MODELS if cd.get(m, 0) <= now]
+        pinned = (os.environ.get("CMD_PIN_MODEL") or "").strip()
+        pool = [pinned] if pinned else list(FREE_MODELS)
+        ready = [m for m in pool if cd.get(m, 0) <= now]
         if not ready:
             return None, min(cd.values()) - now
-        model = min(ready, key=lambda m: (live[m], FREE_MODELS.index(m)))
+        model = min(ready, key=lambda m: pool.index(m))
         open(os.path.join(rdir, label), "w").write(f"{os.getpid()}\t{model}")
         return model, 0
 
@@ -138,6 +181,8 @@ def main():
     prompt = open(prompt_file).read()
     if not prompt.startswith(f"[label: {label}]"):
         prompt = f"[label: {label}]\n" + prompt
+    os.makedirs(outdir, exist_ok=True)
+    register_run_dir(Path(outdir))
     for attempt in range(1, MAX_ATTEMPTS + 1):
         model, wait = pick(outdir, label)
         if model is None:
@@ -149,7 +194,7 @@ def main():
             se.write(f"--- attempt {attempt} model {model} at {start}\n")
             se.flush()
             rc = subprocess.run(
-                ["cmd", "-p", prompt, "-m", model, "--output-format", "json", "--max-turns", "120",
+                ["cmd", "-p", prompt, "-m", model, "--output-format", "json", "--max-turns", "200", "--effort", "high",
                  "--yolo", "-t", "--skip-onboarding", "--no-auto-update"],
                 cwd=workspace, stdout=so, stderr=se, stdin=subprocess.DEVNULL,
             ).returncode
@@ -173,7 +218,7 @@ def main():
         status = "ok" if ok else ("throttled" if THROTTLE.search(tail + err_tail) else f"failed rc={rc}")
         record(outdir, [label, model, (result or {}).get("sessionId", "-"), start, int(time.time()),
                         usage.get("inputTokens", 0), usage.get("outputTokens", 0), status,
-                        TIER])
+                        dash_tier(model)])
         if ok:
             with open(os.path.join(outdir, f"out-{label}.md"), "w") as f:
                 f.write(f"<!-- model: {model} attempt {attempt} -->\n{text}\n")

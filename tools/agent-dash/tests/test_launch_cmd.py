@@ -7,7 +7,9 @@ import os
 
 os.environ["AGENT_DASH_IGNORE_LOCAL"] = "1"
 
+import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -18,6 +20,57 @@ launch = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(launch)
 
 SUCCESS = {"type": "result", "subtype": "success"}
+
+
+class TierTests(unittest.TestCase):
+    def test_deepseek_models_map_to_deepseek_tier(self):
+        self.assertEqual(launch.dash_tier("deepseek/deepseek-v4.1-flash"), "commandcode-deepseek")
+        self.assertEqual(launch.dash_tier("deepseek/deepseek-v4-pro"), "commandcode-deepseek")
+
+    def test_beam_model_maps_to_beam_tier(self):
+        self.assertEqual(launch.dash_tier("reflection/beam:free"), "commandcode-beam")
+
+    def test_other_models_fall_back_to_commandcode(self):
+        self.assertEqual(launch.dash_tier("poolside/laguna-s-2.1-free"), "commandcode")
+        self.assertEqual(launch.dash_tier(None), "commandcode")
+
+
+class PickTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.outdir = os.path.join(self._tmp.name, "cmd")
+        os.makedirs(self.outdir)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_first_pick_is_the_deepseek_flash_build(self):
+        model, _wait = launch.pick(self.outdir, "ws6-plan-pick")
+        self.assertEqual(model, "deepseek/deepseek-v4.1-flash")
+
+    def test_pin_model_skips_rotation(self):
+        with unittest.mock.patch.dict(os.environ, {"CMD_PIN_MODEL": "reflection/beam:free"}):
+            model, _wait = launch.pick(self.outdir, "ws6-plan-pin")
+        self.assertEqual(model, "reflection/beam:free")
+
+    def test_cooled_model_is_skipped(self):
+        launch.cool(self.outdir, "deepseek/deepseek-v4.1-flash")
+        model, _wait = launch.pick(self.outdir, "ws6-plan-cool")
+        self.assertEqual(model, "deepseek/deepseek-v4-pro")
+
+    def test_record_writes_the_model_tier_cell(self):
+        launch.record(self.outdir, ["ws6-plan-rec", "deepseek/deepseek-v4.1-flash",
+                                    "sid-1", 1792000000, 1792000100, 10, 2, "ok",
+                                    launch.dash_tier("deepseek/deepseek-v4.1-flash")])
+        text = open(os.path.join(self.outdir, "cmd-sessions.tsv"), encoding="utf-8").read()
+        self.assertTrue(text.rstrip("\n").endswith("\tcommandcode-deepseek"))
+
+    def test_main_registers_the_outdir(self):
+        state = os.path.join(self._tmp.name, "state")
+        with unittest.mock.patch.dict(os.environ, {"AGENT_DASH_STATE_DIR": state}):
+            launch.register_run_dir(Path(self.outdir))
+        registered = open(os.path.join(state, "run-dirs.txt"), encoding="utf-8").read()
+        self.assertIn(self.outdir, registered)
 
 
 class AttemptSucceededTests(unittest.TestCase):
