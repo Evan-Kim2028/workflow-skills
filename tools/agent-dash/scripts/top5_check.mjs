@@ -102,6 +102,9 @@ await cappedList("running-now",
   `#exec-running .runmore`);
 const runBtnCtl = await text(`(function(){var b=document.querySelector('#exec-running .runmore');return b&&b.getAttribute('aria-controls');})()`);
 check("running button controls rows", runBtnCtl === "exec-running-rows", String(runBtnCtl));
+await waitFor(`!!document.querySelector('.mg-disclose > .disclose-btn')`);
+await ev(`(function(){var b=document.querySelector('.mg-disclose > .disclose-btn');if(b&&b.getAttribute('aria-expanded')==='false')b.click();})()`);
+await waitFor(`document.querySelectorAll('[data-mg-rows] tr').length > 0`);
 await cappedList("manage-current",
   `document.querySelectorAll('[data-mg-rows] tr').length`,
   `[data-mg-more] .disclose-btn`);

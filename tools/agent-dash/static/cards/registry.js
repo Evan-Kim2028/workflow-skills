@@ -38,21 +38,11 @@
       if (typeof pulseSpec !== "function") return null;
       return pulseSpec(state, snap);
     }},
-    /* The Current management table used to lead the overview; it now
-       follows the live rows, plan map and activity stack (static/core/manage.js). */
-    {id: "manage", order: 70, scope: "overview", spec: function (state, snap) {
-      if (typeof manageSpec !== "function") return null;
-      return manageSpec();
-    }},
     /* The workstream tab heading cluster: state pill plus the primary
        action as a split button with the rest in its menu. */
     {id: "wshead", order: 5, scope: "workstream", spec: function (state, snap) {
       if (typeof wsHeaderSpec !== "function") return null;
       return wsHeaderSpec();
-    }},
-    {id: "program", order: 72, scope: "overview", spec: function (state, snap) {
-      if (!state.wss.length) return null;
-      return ["program", keyOf([state.wss.map(function (w) { return [w.ws, w.running, w.name, w.state]; }), planSum, planPrompt]), function () { return programPanel(["active", "paused", "done"]); }, ""];
     }},
     /* The pulse KPI strip owns the overview numbers now, so the tiles
        stay on workstream tabs only (same renderer, unchanged). */
@@ -81,7 +71,6 @@
        inside one card (exec-activity) on one shared x axis with one time
        filter. The progress strip reads its own payload (see
        static/cards/activity.js actProgKey), so the key carries it. */
-    {id: "linear", order: 76, scope: "both", spec: function (state, snap) { return typeof linearSpec === "function" ? linearSpec(state, snap) : null; }},
     {id: "activity", order: 60, scope: "both", spec: function (state, snap) {
       return ["activity", keyOf([state.usage, state.groupBy, (state.runs || []).map(runRow), expanded, state.conc, AdPage.actRangeKey(state.ws), AdPage.actProgKey(), Math.floor(Date.now() / 60000)]), function () { return activityCard(); }, "margin-top:14px"];
     }},
@@ -126,6 +115,12 @@
     {id: "phases-all", order: 100, scope: "overview", spec: function (state, snap) {
       if (typeof phaseUsageAllSpec !== "function") return null;
       return phaseUsageAllSpec(state, snap);
+    }},
+    /* The workstream management table folds into a closed disclosure as the
+       last overview section (static/core/manage.js manageDisclosureSpec). */
+    {id: "manage", order: 101, scope: "overview", spec: function (state, snap) {
+      if (typeof manageDisclosureSpec !== "function") return null;
+      return manageDisclosureSpec();
     }}
   ];
 })(window);

@@ -334,11 +334,14 @@
     if (hit && (hit.data || hit.nodata || hit.error) && Math.floor((hit.at || 0) / 60000) === pulseMinute()) return;
     if (pulseProgInflight[ws]) return;
     pulseProgInflight[ws] = true;
-    api("/api/ws/progress", {ws: ws}).then(function (j) {
+    /* The shared loader (activity.js) memoises per workstream and minute
+       stamp, so this card and any other reader of the same scope share one
+       request; a rejection reaches the handler below with the same status. */
+    AdPage.loadWsProgress(ws, pulseMinute()).then(function (data) {
       delete pulseProgInflight[ws];
       if (typeof state === "undefined") return;
       state.pulseProg = state.pulseProg || {};
-      state.pulseProg[ws] = {data: (j && (j.wsprogress || j)) || null, at: Date.now()};
+      state.pulseProg[ws] = {data: data || null, at: Date.now()};
       pulseFillDetail(ws);
     }, function (err) {
       delete pulseProgInflight[ws];

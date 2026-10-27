@@ -299,6 +299,8 @@ async function main() {
             /* Cards land as their fetches resolve: wait for the management
                and running tables (always seeded) before measuring, and
                require the finished table too (two seeded done rows). */
+            await waitFor(cdp, "!!document.querySelector('.mg-disclose > .disclose-btn')", 20000);
+            await ev(cdp, "(function(){var b=document.querySelector('.mg-disclose > .disclose-btn');if(b&&b.getAttribute('aria-expanded')==='false')b.click();})()");
             await waitFor(cdp, "document.querySelector('[data-manage] table')", 20000);
             await waitFor(cdp, "document.querySelector('#exec-running table')", 20000);
             check(`@${width} ${route} renders the finished table`,

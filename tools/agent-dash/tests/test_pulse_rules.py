@@ -119,6 +119,9 @@ global.api = (path) => {
   counts[path === "/api/usage" ? "usage" : "progress"]++;
   return Promise.reject(new Error("500"));
 };
+/* The shared loader lives in activity.js, which this harness does not load:
+   stub it with the same request it makes (one api call per call here). */
+A.loadWsProgress = (ws) => api("/api/ws/progress", {ws}).then((j) => (j && j.wsprogress) || null);
 let draws = 0;
 global.drawMain = () => { draws++; A.pulseEnsure(); A.pulseProgEnsure("WS1"); };
 const flush = () => new Promise((r) => setTimeout(r, 5));
