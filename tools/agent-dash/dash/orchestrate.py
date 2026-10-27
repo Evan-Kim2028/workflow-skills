@@ -236,7 +236,8 @@ def ready_queue(body: dict, live_by_task: dict | None = None) -> list[dict]:
     Rank is longest downstream chain first, then transitive dependent
     count, then task id. Gates count as deps: a todo gate blocks every
     task that names it. Each row carries what the task unblocks, its
-    train, and the live run label when ``live_by_task`` maps it.
+    train, its kind (``task`` or ``gate``), and the live run label when
+    ``live_by_task`` maps it.
     """
     body = execution_body(body)
     by_id, deps, _order = plan_tasks(body)
@@ -257,6 +258,7 @@ def ready_queue(body: dict, live_by_task: dict | None = None) -> list[dict]:
                 "dependents": stat["dependents"],
                 "unblocks": stat["unblocks"],
                 "train": train_of(body, tid),
+                "kind": task.get("kind") or "task",
                 "live_run": live.get(tid),
             }
         )

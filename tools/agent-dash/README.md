@@ -131,6 +131,13 @@ a tier that hits its quota patterns (or whose launcher writes its
 `QUOTA` marker) cools down for `cooldown_minutes` and the next tier
 takes the launch.
 
+## Hooks
+
+Two opt-in Claude Code hooks, installed per machine with `sh tools/agent-dash/scripts/install_hooks.sh`:
+
+- `--claude-label-guard` refuses worker launches with weak labels (PreToolUse, matcher `Bash`).
+- `--claude-lead-guard` keeps a workstream lead wakeable and refilling (`scripts/lead_guard_hook.py`, PreToolUse matcher `AskUserQuestion` plus a Stop hook, each `"timeout": 10`). It refuses AskUserQuestion while the lead has a pending background task (ask in plain text instead), and refuses to end the turn while ready tasks or live unwatched workers remain. Non-lead sessions always pass. `AGENT_DASH_LEAD_GUARD=off` disables both checks.
+
 ## Config
 
 Zero config runs. `config.local.json` deep-merges over `config.example.json`. The full tables are in [configuration](../../docs/configuration.md).

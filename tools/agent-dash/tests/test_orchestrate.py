@@ -55,6 +55,7 @@ class ReadyQueueTest(unittest.TestCase):
         )
         ready = orch.ready_queue(body)
         self.assertEqual([row["id"] for row in ready], ["WS9.0", "WS9.2"])
+        self.assertEqual([row["kind"] for row in ready], ["gate", "task"])
 
     def test_rank_is_chain_then_dependents(self):
         body = _body(
