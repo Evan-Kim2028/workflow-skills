@@ -1165,6 +1165,12 @@ class Handler(BaseHTTPRequestHandler):
         if ws in (".", "..") or not _WS.match(ws):
             raise ValueError("bad ws")
         store = self.server.store
+        if ws == "all":
+            def compute_all():
+                return {"wsprogress": wsprogress.build_project_progress(store)}
+
+            if self._ttl_serve("ws/progress", {"ws": "all"}, compute_all):
+                return
         try:
             key = wsprogress.project_cache_key(store) if ws == "all" else wsprogress.cache_key(store, ws)
         except Exception:

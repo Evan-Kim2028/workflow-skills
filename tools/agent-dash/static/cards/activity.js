@@ -1009,15 +1009,34 @@
     var loaded = (c && c.scope === scope && c.data) ? "1" : "0";
     return scope + "|" + actProgStamp(scope) + "|" + loaded;
   }
+  /* Shared /api/ws/progress loader for both the Activity strip and the
+     Aggregate card. One request per scope and plan stamp: the in-flight
+     promise is memoised per scope and reused while the stamp holds, so
+     the all-scope build (9-15 s uncached) runs once for both cards. The
+     resolved value is the payload (null when the response carries none);
+     a rejection propagates to every caller of that stamp, so a failure
+     is retried only when the stamp moves. */
+  var wsProgShared = {};
+  function loadWsProgress(scope, stamp) {
+    var c = wsProgShared[scope];
+    if (c && c.stamp === stamp) return c.promise;
+    var entry = {stamp: stamp, data: null, promise: null};
+    entry.promise = api("/api/ws/progress", {ws: scope}).then(function (j) {
+      entry.data = (j && j.wsprogress) || null;
+      return entry.data;
+    });
+    wsProgShared[scope] = entry;
+    return entry.promise;
+  }
   function actProgEnsure(scope, stamp) {
     var c = state.actProg;
     if (c && c.scope === scope && c.stamp === stamp) return;
     if (actProgInflight === scope + "|" + stamp) return;
     actProgInflight = scope + "|" + stamp;
-    api("/api/ws/progress", {ws: scope}).then(function (j) {
+    loadWsProgress(scope, stamp).then(function (data) {
       actProgInflight = null;
       if (actScope() !== scope || state.view !== "exec") return;
-      state.actProg = {scope: scope, stamp: stamp, data: (j && j.wsprogress) || null};
+      state.actProg = {scope: scope, stamp: stamp, data: data};
       try { delete secCache.activity; } catch (e) {}
       drawMain();
     }, function () {
@@ -1297,6 +1316,7 @@
   AdPage.actProgStrip = actProgStrip;
   AdPage.actProgKey = actProgKey;
   AdPage.actProgStamp = actProgStamp;
+  AdPage.loadWsProgress = loadWsProgress;
   AdPage.actProgY = actProgY;
   AdPage.actProgClip = actProgClip;
   AdPage.actProgHas = actProgHas;

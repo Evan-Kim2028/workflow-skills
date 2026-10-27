@@ -423,6 +423,26 @@ class ProjectTotalTests(ProgressCase):
         self.assertIn("plan_not_found", body.decode("utf-8"))
 
 
+    def test_project_total_endpoint_shares_one_build_per_ttl(self):
+        self._two()
+        real = wsprogress.build_project_progress
+        builds = []
+
+        def counting(store, now=None):
+            builds.append(1)
+            return real(store, now)
+
+        wsprogress.build_project_progress = counting
+        self.addCleanup(setattr, wsprogress, "build_project_progress", real)
+        port = EndpointTests._serve(self)
+        first = EndpointTests._get(self, port, "/api/ws/progress?ws=all")
+        second = EndpointTests._get(self, port, "/api/ws/progress?ws=all")
+        self.assertEqual(first[0], 200)
+        self.assertEqual(second[0], 200)
+        self.assertEqual(first[1], second[1])
+        self.assertEqual(len(builds), 1, "concurrent clients must share one build per TTL")
+
+
 class CardWiringTests(unittest.TestCase):
     def _card(self):
         return (ROOT / "static" / "cards" / "progress.js").read_text(encoding="utf-8")
