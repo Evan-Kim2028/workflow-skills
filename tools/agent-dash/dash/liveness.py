@@ -70,6 +70,30 @@ PROC_START_SKEW_S = 5 * 60
 REAP_IDLE_S = 10 * 60
 
 
+# A pid-less row from a launcher shim (source ``generic``, a headless
+# harness) has no process to test, so the dead-pid reaper never sees it.
+# One whose end was recorded (a ``failed`` line an older reader stored as
+# running) is closed at that end; one with no end closes after this long
+# without a start, usage heartbeat or process sample. Thirty minutes is
+# the stalled bound: far above a healthy turn gap, far below the 6 h
+# stale bound the owner saw these rows reach.
+PIDLESS_REAP_IDLE_S = STALLED_AFTER_S
+
+# Tier prefixes of generic rows from headless workers that exit on their
+# own, so a quiet row without a pid is a dead run, not an idle session.
+# The runs table stores the tier, not the harness: the shims wrote
+# ``commandcode`` and ``commandcode-deepseek``.
+PIDLESS_REAP_TIERS = ("commandcode", "pi")
+
+
+def pidless_reapable(run) -> bool:
+    """True for a pid-less generic row from a headless Command Code or Pi worker."""
+    if (run.get("source") or "") != "generic" or run.get("pid") is not None:
+        return False
+    tier = str(run.get("tier") or "").lower()
+    return any(tier == name or tier.startswith(name + "-") for name in PIDLESS_REAP_TIERS)
+
+
 def proc_started_ok(proc_started, run_started, skew_s: float = PROC_START_SKEW_S) -> bool:
     """True when a matched process could belong to the run.
 
