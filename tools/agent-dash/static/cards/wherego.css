@@ -1,0 +1,25 @@
+/* Where-it-goes stacked bar (static/cards/wherego.js). One card with the
+   three-way toggle above a single 24-hour stacked chart, plus a wrapping
+   legend that answers "where it goes" with share and total per key. */
+#exec-wherego .wg-head{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:4px}
+#exec-wherego .wg-head h2{margin:0}
+#exec-wherego .wg-head .seg-ctl{margin-left:auto}
+#exec-wherego svg{height:auto;max-width:100%}
+#exec-wherego .wg-legend{align-items:baseline}
+#exec-wherego .wg-legend button.lentry{background:none;border:0;padding:2px 4px;border-radius:6px;font:inherit;color:inherit;cursor:pointer;display:inline-flex;align-items:center;gap:6px}
+#exec-wherego .wg-legend button.lentry:hover{background:var(--surface-2)}
+#exec-wherego .wg-legend button.lentry:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+#exec-wherego .wg-legend button.lentry[aria-pressed="true"]{background:var(--surface-2);box-shadow:inset 0 0 0 1px var(--ring-strong)}
+#exec-wherego .wg-legend .lname{color:var(--ink-2)}
+#exec-wherego .wg-legend .lv{font-variant-numeric:tabular-nums;text-align:right;font-weight:700;color:var(--ink);white-space:nowrap}
+#exec-wherego .wg-seg{cursor:pointer}
+#exec-wherego .wg-seg:focus-visible{outline:2px solid var(--accent);outline-offset:-2px}
+#exec-wherego .wg-seg[data-dim="1"]{opacity:.22}
+#exec-wherego .empty{margin-top:8px}
+@media (max-width:700px){
+  #exec-wherego .wg-head .seg-ctl{margin-left:0;width:100%}
+  #exec-wherego .wg-head .seg-ctl button{flex:1;padding:5px 6px;font-size:11.5px}
+}
+@media (prefers-reduced-motion:reduce){
+  #exec-wherego .wg-seg{transition:none}
+}
