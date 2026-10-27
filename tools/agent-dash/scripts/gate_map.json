@@ -289,6 +289,9 @@
     "scripts/page_check.mjs": [
       "test_page_rules"
     ],
+    "scripts/pulse_check.mjs": [
+      "test_pulse_rules"
+    ],
     "scripts/page_settle_check.mjs": [
       "test_page_rules"
     ],

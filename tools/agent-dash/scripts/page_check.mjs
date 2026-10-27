@@ -251,11 +251,20 @@ function readDomExpression(ws) {
     var s = window.__adSettled || "";
     var parts = String(s).split("|");
     if (parts[0] !== ${JSON.stringify(ws)} || parts[1] !== ${JSON.stringify(String(WINDOW_HOURS))}) return null;
-    var tile = document.querySelector('#exec-tiles [data-tile="tokens"]');
+    /* The pulse KPI strip owns the overview numbers (tiles stay on
+       workstream tabs only), so the overview tab reads its KPI cells. */
+    var onOverview = ${JSON.stringify(ws)} === "all";
+    var tile = onOverview
+      ? document.querySelector('#x-pulse [data-kpi="tokens"]')
+      : document.querySelector('#exec-tiles [data-tile="tokens"]');
     if (!tile) return null;
-    if (tile.getAttribute("data-ws") !== ${JSON.stringify(ws)}) return {bleed: tile.getAttribute("data-ws")};
-    if (tile.getAttribute("data-hours") !== ${JSON.stringify(String(WINDOW_HOURS))}) return null;
-    var cost = document.querySelector('#exec-tiles [data-tile="cost"]');
+    if (!onOverview) {
+      if (tile.getAttribute("data-ws") !== ${JSON.stringify(ws)}) return {bleed: tile.getAttribute("data-ws")};
+      if (tile.getAttribute("data-hours") !== ${JSON.stringify(String(WINDOW_HOURS))}) return null;
+    }
+    var cost = onOverview
+      ? document.querySelector('#x-pulse [data-kpi="cost"]')
+      : document.querySelector('#exec-tiles [data-tile="cost"]');
     var lg = document.querySelector('#exec-activity .ltotal');
     var emptyChart = !lg && !!document.querySelector('#exec-activity .empty');
     if (!lg && !emptyChart) return null;
@@ -579,20 +588,24 @@ async function main() {
             growthReads++;
           }
           if (tileTok === 0) {
-            // Zero with context: "0 in 24 h" plus the last run and all-time line.
+            // Zero with context: "0 in 24 h" (both tiles and the pulse
+            // strip say it); the last-run/all-time tertiary line is the
+            // tiles' own contract on workstream tabs.
             const text = (dom.tile.text || "").replace(/\s+/g, " ");
             const allTimeTok = billed(snapAfter.totals_all_time.tokens);
             if (!text.includes(`0 in ${hours} h`)) {
               fail(`zero tile does not say "0 in ${hours} h": ${text.slice(0, 120)}`);
               continue;
             }
-            if (allTimeTok > 0 && !/last run .* all time/.test(text)) {
-              fail(`zero tile names no last run or all-time total: ${text.slice(0, 160)}`);
-              continue;
-            }
-            if (allTimeTok === 0 && snapAfter.last_activity !== null && snapAfter.last_activity !== undefined) {
-              fail(`tile shows no all-time tokens but the scope has activity`);
-              continue;
+            if (ws !== "all") {
+              if (allTimeTok > 0 && !/last run .* all time/.test(text)) {
+                fail(`zero tile names no last run or all-time total: ${text.slice(0, 160)}`);
+                continue;
+              }
+              if (allTimeTok === 0 && snapAfter.last_activity !== null && snapAfter.last_activity !== undefined) {
+                fail(`tile shows no all-time tokens but the scope has activity`);
+                continue;
+              }
             }
           }
           if (ws === "all" && dom.cards && dom.cards.length) {

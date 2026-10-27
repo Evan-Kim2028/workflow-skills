@@ -3433,12 +3433,14 @@ class FinalPolishTests(unittest.TestCase):
 
     def test_exec_section_order_activity_stack(self):
         """One Activity over time card replaces the separate chart
-        sections: on both exec scopes the registry order is ... plan,
-        activity, finished, the planning-versus-execution stacked bars
-        follow, and progress over time is the third strip inside the
-        stack (no standalone progress section anywhere). The sidenav
-        derives its order from the DOM, so no pin there; the page
-        comment and DESIGN.md name the same order."""
+        sections: on both exec scopes the registry order is ... running,
+        plan, activity, linear, finished, the planning-versus-execution
+        stacked bars follow, and progress over time is the third strip
+        inside the stack (no standalone progress section anywhere). The
+        pulse KPI strip owns the overview numbers, so tiles stay on
+        workstream tabs only; the pulse card leads the overview. The
+        sidenav derives its order from the DOM, so no pin there; the
+        page comment and DESIGN.md name the same order."""
         registry = (STATIC / "cards" / "registry.js").read_text()
         entries = re.findall(
             r'\{id:\s*"([^"]+)",\s*order:\s*(\d+),\s*scope:\s*"([^"]+)"', registry
@@ -3449,8 +3451,8 @@ class FinalPolishTests(unittest.TestCase):
         )
         self.assertEqual(
             [ident for _, ident in both],
-            ["tiles", "running", "plan", "linear", "activity", "finished"],
-            "exec order drifted: want the Linear card and the activity stack between plan and finished",
+            ["running", "plan", "activity", "linear", "finished"],
+            "exec order drifted: want running, plan, the activity stack, Linear, finished",
         )
         for gone in ('"tokens"', '"gantt"', '"conc"', '"progress"'):
             self.assertNotIn(
@@ -3463,7 +3465,21 @@ class FinalPolishTests(unittest.TestCase):
         ws = [ident for _, ident in sorted(by_scope.get("workstream", []))]
         self.assertEqual(ws[-1], "phases-ws", "the workstream usage card is not the last workstream section")
         ov = [ident for _, ident in sorted(by_scope.get("overview", []))]
-        self.assertEqual(ov[-1], "phases-all", "the overall usage card is not the last section")
+        self.assertEqual(
+            ov,
+            ["pulse", "manage", "program", "cards", "phases-all"],
+            "overview order drifted: want pulse first, then manage, program, cards, usage last",
+        )
+        both_ids = [ident for _, ident in both]
+        self.assertEqual(
+            [ident for ident in ["pulse", "running", "plan", "activity", "manage", "program", "cards", "linear", "finished", "phases-all"]
+             if ident in ov or ident in both_ids],
+            ["pulse", "running", "plan", "activity", "manage", "program", "cards", "linear", "finished", "phases-all"],
+            "overview render drifted: want pulse, running, plan, activity, then manage, program, cards, linear, finished, usage last",
+        )
+        ws_only = [ident for _, ident in sorted(by_scope.get("workstream", []))]
+        self.assertEqual(ws_only[0], "wshead", "the workstream heading is not the first workstream section")
+        self.assertEqual(ws_only[1], "tiles", "tiles no longer follow the workstream heading")
         orders = {ident: int(order) for ident, order, _scope in entries}
         self.assertGreater(orders["phases-ws"], orders["finished"], "the workstream usage card sits before Finished")
         stack = (STATIC / "cards" / "activity.js").read_text()
@@ -3473,7 +3489,7 @@ class FinalPolishTests(unittest.TestCase):
         self.assertNotIn('"exec-progress"', stack, "the strip reuses the plan map card id")
         self.assertIn("actProgKey(", registry, "the activity section key lost the progress payload")
         page = (STATIC / "index.html").read_text()
-        self.assertIn("plan, activity, finished", page)
+        self.assertIn("plan, activity, manage", page)
         self.assertIn("progress-over-time", page)
         self.assertNotIn("charts last on workstream tabs", page)
         self.assertIn('<script src="/static/cards/activity.js"></script>', page)
