@@ -187,6 +187,15 @@ class CatalogTest(unittest.TestCase):
             self.assertEqual(bare["confidence"], "inferred")
             self.assertTrue(status(model)["priced"])
 
+        grok47 = rows["grok-4.7"]
+        high = rows["grok-4.7-high"]
+        self.assertEqual(
+            (grok47["input"], grok47["output"], grok47["cache_read"]),
+            (high["input"], high["output"], high["cache_read"]),
+        )
+        self.assertEqual(grok47["billing_mode"], "plan-included")
+        self.assertTrue(status("grok-4.7")["priced"])
+
         for model in (
             "muse-wonder-full-1.0",
             "<synthetic>",

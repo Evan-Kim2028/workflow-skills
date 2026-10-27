@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import re
 import subprocess
+import threading
 import time
 
 from dash.liveness import (
@@ -54,6 +55,40 @@ SOURCE_COMMS = {
     "commandcode": frozenset({"python3"}),
     "codex": frozenset({"python3"}),
 }
+#: Seconds one process listing serves every liveness reader. The 2 s
+#: sources each used to fork ``ps`` twice per poll (one table, one argv
+#: dump) and regex every process; one shared listing per window cuts
+#: that per-tick fork storm to ~1. Staleness stays far under the
+#: ``process_ttl_s`` (30 s) liveness consumers already tolerate, and
+#: ``fresh=True`` bypasses the cache when truth is needed.
+LISTING_TTL_S = 5.0
+_listing_lock = threading.Lock()
+_listing_at = 0.0
+_listing_rows: list = []
+
+
+def reset_listing_cache() -> None:
+    """Drop the shared process listing. Tests use this between cases."""
+    global _listing_at, _listing_rows
+    with _listing_lock:
+        _listing_at = 0.0
+        _listing_rows = []
+
+
+def _listing_hit():
+    with _listing_lock:
+        if _listing_at and time.monotonic() - _listing_at < LISTING_TTL_S:
+            return [dict(row) for row in _listing_rows]
+    return None
+
+
+def _listing_store(rows: list) -> None:
+    global _listing_at, _listing_rows
+    with _listing_lock:
+        _listing_at = time.monotonic()
+        _listing_rows = [dict(row) for row in rows]
+
+
 _LABEL = re.compile(r"\[label:\s*([^\]]+?)\]")
 _RUN_WORKER = re.compile(r"(?:^|\s)\S*run_worker\.py(\s.*)?$")
 _LINE = re.compile(r"^\s*(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\S+)\s+(\S+)\s*$")
@@ -106,7 +141,7 @@ def poll(store, cfg, now: float) -> None:
         )
 
 
-def live_agent_processes(now: float | None = None) -> list[dict]:
+def live_agent_processes(now: float | None = None, *, fresh: bool = False) -> list[dict]:
     """Live grok, muse, glm, pi, Command Code, and Codex processes.
 
     Each row is ``pid``, ``comm``, ``started_at``, ``label``, ``model``,
@@ -121,8 +156,17 @@ def live_agent_processes(now: float | None = None) -> list[dict]:
     ``scripts/launch_pi.py``, ``scripts/launch_cmd.py``, or
     ``scripts/launch_codex.py`` with a worker
     label: plain python3 processes never appear.
+
+    The listing is shared for ``LISTING_TTL_S`` across callers (one fork
+    storm per window instead of one per source poll); ``fresh=True``
+    recomputes. ``now`` only dates ``started_at`` and never gates the
+    cache.
     """
     now = time.time() if now is None else float(now)
+    if not fresh:
+        hit = _listing_hit()
+        if hit is not None:
+            return hit
     tokens = _tokens_by_pid()
     rows = []
     wanted = set().union(*SOURCE_COMMS.values())
@@ -161,6 +205,7 @@ def live_agent_processes(now: float | None = None) -> list[dict]:
                 "session_id": token.get("session_id") if muse else None,
             }
         )
+    _listing_store(rows)
     return rows
 
 

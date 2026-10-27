@@ -1,10 +1,13 @@
 """Tests for muse liveness in dash/sources/process.py. Fake process rows only."""
 import importlib.util
 import os
+import sys
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
 
 
 def load(name):
@@ -217,16 +220,49 @@ class ModelFromArgsTests(unittest.TestCase):
         process._tokens_by_pid = lambda: {
             7: {"label": "ws7-x", "session_id": None, "prompt_label": None, "model": "grok-4.7-high"}
         }
+        process.reset_listing_cache()
         try:
             rows = process.live_agent_processes(now=100.0)
         finally:
             process._ps, process._tokens_by_pid = keep_ps, keep_tokens
+            process.reset_listing_cache()
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["model"], "grok-4.7-high")
         import json
 
         self.assertNotIn("/work/tree", json.dumps(rows[0]))
         self.assertNotIn("[label:", json.dumps(rows[0]))
+
+    def test_listing_is_shared_within_ttl(self):
+        # One ps fork storm per window, not one per source poll: repeat
+        # readers share the listing until the TTL lapses, and fresh=True
+        # recomputes. The cache is reset on exit so later cases see truth.
+        keep_ps, keep_tokens = process._ps, process._tokens_by_pid
+        calls = {"n": 0}
+
+        def fake_ps():
+            calls["n"] += 1
+            return [
+                {"pid": 7, "ppid": 1, "pgid": 7, "rss_kb": 10, "elapsed_s": 5.0,
+                 "comm": "cursor-agent"}
+            ]
+
+        process._ps = fake_ps
+        process._tokens_by_pid = lambda: {
+            7: {"label": "ws7-x", "session_id": None, "prompt_label": None, "model": "grok-4.7-high"}
+        }
+        process.reset_listing_cache()
+        try:
+            first = process.live_agent_processes(now=100.0)
+            second = process.live_agent_processes(now=101.0)
+            self.assertEqual(calls["n"], 1)
+            self.assertEqual(first, second)
+            third = process.live_agent_processes(now=102.0, fresh=True)
+            self.assertEqual(calls["n"], 2)
+            self.assertEqual(len(third), 1)
+        finally:
+            process._ps, process._tokens_by_pid = keep_ps, keep_tokens
+            process.reset_listing_cache()
 
 
 class VetoTests(unittest.TestCase):
@@ -1140,10 +1176,12 @@ class LauncherRowTests(unittest.TestCase):
         keep_ps, keep_tokens = process._ps, process._tokens_by_pid
         process._ps = lambda: ps_rows
         process._tokens_by_pid = lambda: tokens_by_pid
+        process.reset_listing_cache()
         try:
             return process.live_agent_processes(now=now)
         finally:
             process._ps, process._tokens_by_pid = keep_ps, keep_tokens
+            process.reset_listing_cache()
 
     def launcher_token(self, label, launcher):
         return {

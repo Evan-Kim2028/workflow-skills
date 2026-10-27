@@ -1,7 +1,9 @@
 # source-stalled: collector source stopped polling
 
 A source has no successful poll for more than three of its intervals
-(`lag_s` keeps growing on `/api/health`).
+(`lag_s` keeps growing on `/api/health`). A source with a poll still
+running reads `slow`, not stalled: restart only a source that stays
+`stalled` with no poll in flight.
 
 ## Why it matters
 

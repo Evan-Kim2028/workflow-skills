@@ -349,6 +349,40 @@ def startup_complete(sources, states, born: float, now: float) -> bool:
     return now - born > startup_threshold_s(sources)
 
 
+def _poll_in_flight(state: dict, now: float, source) -> bool:
+    """True when a poll is provably running and still inside its stall limit.
+
+    The tick skips a source whose previous poll thread is still alive, so
+    under load a healthy-but-slow poll reads as silence on ``last_poll``.
+    That is not a stall (a stopped collector): it is a poll at work, and
+    it reports ``slow`` so neither the page nor the doctor prescribes a
+    restart for it. Past the limit the poll is wedged and ``stalled``
+    still applies, so a hung scan keeps its restart advice. Uses the
+    ``poll_start`` the tick records when it starts the worker thread.
+    """
+    thread = state.get("thread")
+    if thread is None:
+        return False
+    try:
+        alive = thread.is_alive()
+    except Exception:
+        return False
+    if not alive:
+        return False
+    try:
+        limit = STALL_FACTOR * float(getattr(source, "INTERVAL_S", 0) or 0)
+    except (TypeError, ValueError):
+        return True
+    start = state.get("poll_start")
+    if start is None:
+        return True
+    try:
+        age = float(now) - float(start)
+    except (TypeError, ValueError):
+        return True
+    return age <= limit
+
+
 def source_state(source, state: dict, now: float, born: float, *, startup: bool | None = None) -> str:
     """One of ``starting``, ``error``, ``stalled``, ``slow``, ``ok``.
 
@@ -358,9 +392,11 @@ def source_state(source, state: dict, now: float, born: float, *, startup: bool 
     :func:`startup_complete` is not yet true), a source that already
     polled reads ``starting`` too instead of ``stalled``-by-lag. Positive
     failure evidence (an error or a budget overrun) still reports
-    ``error`` immediately, even on the first poll. A poll that returned
-    but took longer than ``SLOW_AFTER_S`` is ``slow``: surfaced, but
-    still ok.
+    ``error`` immediately, even on the first poll. A poll that is still
+    running inside its stall limit reports ``slow``: working, degraded,
+    still ok — only a poll silent past its limit (or with no poll at
+    all) reads ``stalled``. A poll that returned but took longer than
+    ``SLOW_AFTER_S`` is ``slow``: surfaced, but still ok.
     """
     if state.get("last_error") or state.get("timed_out"):
         return "error"
@@ -369,6 +405,8 @@ def source_state(source, state: dict, now: float, born: float, *, startup: bool 
             return "starting"
     elif startup:
         return "starting"
+    if _poll_in_flight(state, now, source):
+        return "slow"
     if _is_stalled(source, state, now, born):
         return "stalled"
     try:

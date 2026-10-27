@@ -8,9 +8,14 @@ os.environ.setdefault(
 )
 
 import json
+import sys
 import tempfile
 import unittest
 from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 from dash.sources import Registry
 from dash.sources import dagster
@@ -45,10 +50,12 @@ def _reset_backoff():
     dagster._fail_streak = 0
     dagster._backoff_s = 0.0
     dagster._next_attempt = None
+    dagster.last_success_ts = None
+    dagster.stale_since_ts = None
 
 
 def _failing_ssh(calls):
-    def fake(host, url, payload):
+    def fake(host, url, payload, *args, **kwargs):
         calls.append(1)
         return None, "ssh timed out"
 
@@ -90,7 +97,7 @@ class DagsterTests(unittest.TestCase):
     def _feed(self, active, recent=None, cfg=None):
         body = {}
 
-        def fake(host, url, payload):
+        def fake(host, url, payload, *args, **kwargs):
             body["host"] = host
             body["url"] = url
             body["payload"] = json.loads(payload)
@@ -353,7 +360,7 @@ class DagsterTests(unittest.TestCase):
     def _feed_with_by_id(self, active, recent, by_id_map, now=NOW):
         calls = []
 
-        def fake(host, url, payload):
+        def fake(host, url, payload, *args, **kwargs):
             body = json.loads(payload)
             calls.append(body["query"])
             if "DagsterRunsById" in body["query"]:
@@ -491,26 +498,18 @@ class DagsterTests(unittest.TestCase):
         self.assertEqual(body["dagster"]["skipped_closeouts"], 2)
 
     def test_slow_poll_is_slow_not_error(self):
-        import time as time_mod
-        from unittest import mock
-
+        # The old clock mock exhausted after two monotonic calls (every
+        # lock acquire takes two), so the duration was astronomical and
+        # this never passed. Seed the finished duration directly: the
+        # verdict and doctor handling are what this pins.
         from dash.doctor import collect_problems
 
-        real = time_mod.monotonic
-        calls = {"n": 0}
-
-        def fake_clock():
-            calls["n"] += 1
-            if calls["n"] <= 2:
-                return 1000.0 + (16.0 if calls["n"] == 2 else 0.0)
-            return real()
-
         self._feed([], [])
-        with mock.patch("dash.sources.time.monotonic", side_effect=fake_clock):
-            registry = Registry([dagster])
-            registry._born = NOW - 3600
-            registry.tick(self.store, CFG, NOW, force=True)
-            body = registry.health(NOW)
+        registry = Registry([dagster])
+        registry._born = NOW - 3600
+        registry.tick(self.store, CFG, NOW, force=True)
+        registry.state["dagster"]["last_duration_s"] = 16.0
+        body = registry.health(NOW)
         entry = body["sources"][0]
         self.assertGreater(entry["last_duration_s"], 15.0)
         self.assertEqual(entry["state"], "slow")
@@ -621,6 +620,128 @@ class DagsterTests(unittest.TestCase):
         body = Registry([dagster]).health(NOW)
         self.assertEqual(body["dagster"]["backoff_s"], 0.0)
         self.assertEqual(body["dagster"]["next_poll_in_s"], 0.0)
+
+    def test_slow_timeout_marks_stale_not_error(self):
+        # A fetch that eats its whole ssh timeout is remote latency, not
+        # a hard failure: the poll keeps the cached rows, returns inside
+        # the sweep budget, and marks itself stale instead of erroring.
+        self.store.upsert_run(
+            {
+                "run_id": "dagster:aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+                "source": "dagster",
+                "model": "catalog_load_job",
+                "label": "ws1-kept",
+                "status": "running",
+                "started_at": NOW - 50,
+                "clock_source": "dagster",
+            }
+        )
+
+        def slow(host, url, payload, *args, **kwargs):
+            # Burn the whole timeout on the patched clock without a real
+            # 20 s sleep.
+            self.clock[0] += 5.0
+            return None, "ssh timed out"
+
+        dagster._ssh = slow
+        cfg = {"dagster": dict(CFG["dagster"], ssh_timeout_s=2.0)}
+        dagster.poll(self.store, cfg, NOW)
+        row = self.store.get_run("dagster:aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+        self.assertEqual(row["status"], "running")
+        self.assertEqual(row["label"], "ws1-kept")
+        self.assertIsNone(dagster.last_error)
+        extra = dagster.health_extra()
+        self.assertTrue(extra["stale"])
+        self.assertIsNone(extra["last_success_age_s"])
+        registry = Registry([dagster])
+        registry.tick(self.store, cfg, NOW, force=True)
+        body = registry.health(NOW)
+        self.assertTrue(body["ok"])
+        self.assertTrue(body["dagster"]["stale"])
+
+    def test_instant_timeout_string_still_errors(self):
+        # A timeout string with no wait behind it is a fast failure, not
+        # remote latency: it keeps the error path (and the back-off).
+        dagster._ssh = lambda *args, **kwargs: (None, "ssh timed out")
+        dagster.poll(self.store, CFG, NOW)
+        self.assertEqual(dagster.last_error, "ssh timed out")
+
+    def test_stale_escalates_to_error_after_grace(self):
+        # A stale run past stale_error_after_s surfaces as an error so a
+        # permanently dead remote stays visible.
+        def slow(host, url, payload, *args, **kwargs):
+            self.clock[0] += 5.0
+            return None, "ssh timed out"
+
+        dagster._ssh = slow
+        cfg = {
+            "dagster": dict(CFG["dagster"], ssh_timeout_s=2.0, stale_error_after_s=100.0),
+        }
+        dagster.poll(self.store, cfg, NOW)
+        self.assertIsNone(dagster.last_error)
+        self.clock[0] = NOW + 200.0
+        registry = Registry([dagster])
+        registry.tick(self.store, cfg, NOW + 200.0, force=True)
+        self.assertIn("stale", dagster.last_error)
+        body = registry.health(NOW + 200.0)
+        self.assertFalse(body["ok"])
+        self.assertEqual(body["sources"][0]["state"], "error")
+
+    def test_close_outs_defer_past_deadline(self):
+        # More missing runs than fit the poll deadline: the first chunk
+        # closes, the rest defer to the next poll instead of stacking
+        # another slow ssh call onto this one.
+        ids = ["%08x-0000-4000-8000-%012x" % (i, i) for i in range(60)]
+        for rid in ids:
+            self.store.upsert_run(
+                {
+                    "run_id": "dagster:" + rid,
+                    "source": "dagster",
+                    "model": "test_job_bulk",
+                    "label": "test_job_bulk",
+                    "status": "running",
+                    "started_at": NOW - 5000,
+                    "clock_source": "dagster",
+                }
+            )
+        by_id_map = {
+            rid: _run(rid, "test_job_bulk", "SUCCESS", endTime=NOW - 60) for rid in ids
+        }
+        calls = []
+
+        def fake(host, url, payload, *args, **kwargs):
+            body = json.loads(payload)
+            calls.append(body["query"])
+            if "DagsterRunsById" in body["query"]:
+                # Each by-id chunk burns the rest of the allowance.
+                self.clock[0] += 30.0
+                wanted = body["variables"]["ids"]
+                results = [by_id_map[i] for i in wanted if i in by_id_map]
+                return (
+                    json.dumps({"data": {"byId": {"__typename": "Runs", "results": results}}}),
+                    None,
+                )
+            return _payload([], []), None
+
+        dagster._ssh = fake
+        dagster.poll(self.store, CFG, NOW)
+        self.assertEqual(len(calls), 2)
+        closed = [
+            rid
+            for rid in ids
+            if (self.store.get_run("dagster:" + rid) or {}).get("status") == "finished"
+        ]
+        self.assertEqual(len(closed), 50)
+        self.clock[0] = NOW
+        dagster.poll(self.store, CFG, NOW + 61.0)
+        self.assertEqual(len(calls), 4)
+        closed = [
+            rid
+            for rid in ids
+            if (self.store.get_run("dagster:" + rid) or {}).get("status") == "finished"
+        ]
+        self.assertEqual(len(closed), 60)
+        self.assertIsNone(dagster.last_error)
 
     def test_unknown_run_closes_as_finished_unknown(self):
         gone_id = "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee"
