@@ -258,10 +258,8 @@ function readDomExpression(ws) {
       ? document.querySelector('#x-pulse [data-kpi="tokens"]')
       : document.querySelector('#exec-tiles [data-tile="tokens"]');
     if (!tile) return null;
-    if (!onOverview) {
-      if (tile.getAttribute("data-ws") !== ${JSON.stringify(ws)}) return {bleed: tile.getAttribute("data-ws")};
-      if (tile.getAttribute("data-hours") !== ${JSON.stringify(String(WINDOW_HOURS))}) return null;
-    }
+    if (tile.getAttribute("data-ws") !== ${JSON.stringify(ws)}) return {bleed: tile.getAttribute("data-ws")};
+    if (tile.getAttribute("data-hours") !== ${JSON.stringify(String(WINDOW_HOURS))}) return null;
     var cost = onOverview
       ? document.querySelector('#x-pulse [data-kpi="cost"]')
       : document.querySelector('#exec-tiles [data-tile="cost"]');
@@ -588,24 +586,22 @@ async function main() {
             growthReads++;
           }
           if (tileTok === 0) {
-            // Zero with context: "0 in 24 h" (both tiles and the pulse
-            // strip say it); the last-run/all-time tertiary line is the
-            // tiles' own contract on workstream tabs.
+            // Zero with context: "0 in 24 h" and the last-run/all-time
+            // line, on the tiles (workstream tabs) and the pulse KPI cell
+            // (overview) alike.
             const text = (dom.tile.text || "").replace(/\s+/g, " ");
             const allTimeTok = billed(snapAfter.totals_all_time.tokens);
             if (!text.includes(`0 in ${hours} h`)) {
               fail(`zero tile does not say "0 in ${hours} h": ${text.slice(0, 120)}`);
               continue;
             }
-            if (ws !== "all") {
-              if (allTimeTok > 0 && !/last run .* all time/.test(text)) {
-                fail(`zero tile names no last run or all-time total: ${text.slice(0, 160)}`);
-                continue;
-              }
-              if (allTimeTok === 0 && snapAfter.last_activity !== null && snapAfter.last_activity !== undefined) {
-                fail(`tile shows no all-time tokens but the scope has activity`);
-                continue;
-              }
+            if (allTimeTok > 0 && !/last run .* all time/.test(text)) {
+              fail(`zero tile names no last run or all-time total: ${text.slice(0, 160)}`);
+              continue;
+            }
+            if (allTimeTok === 0 && snapAfter.last_activity !== null && snapAfter.last_activity !== undefined) {
+              fail(`tile shows no all-time tokens but the scope has activity`);
+              continue;
             }
           }
           if (ws === "all" && dom.cards && dom.cards.length) {

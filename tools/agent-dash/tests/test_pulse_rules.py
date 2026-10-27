@@ -98,7 +98,50 @@ old[0] = 500;
 assert.strictEqual(A.momentumFor({live_agents: 0, last_activity: now - 20 * 3600}, old, [], now), "idle");
 /* idle is the fallthrough: live agents with zero tokens anywhere. */
 assert.strictEqual(A.momentumFor({live_agents: 1, last_activity: now - 60}, zeros(), [], now), "idle");
+/* idle, not slowing: no live agents and the rate fell below half the base. */
+assert.strictEqual(A.momentumFor({live_agents: 0, last_activity: now - 60}, slow, [], now), "idle", "stopped workstream read slowing");
+/* idle: no live agents and no recent tokens against a nonzero base. */
+assert.strictEqual(A.momentumFor({live_agents: 0, last_activity: now - 3600}, baseOnly(100), [], now), "idle", "stopped workstream read slowing at zero recent");
 console.log("momentum classes ok");
+''')
+
+    def test_failed_fetch_retries_once_per_minute(self):
+        """A rejecting api (usage and workstream progress) runs at most
+        once per minute stamp, even though drawMain calls the ensure
+        again at once after each failure; the next minute retries."""
+        self._run(r'''
+const counts = {usage: 0, progress: 0};
+let nowMs = 1700000000000 - (1700000000000 % 60000) + 5000;
+Date.now = () => nowMs;
+global.state = {view: "exec", ws: "all", wss: []};
+global.secCache = {pulse: 1};
+global.api = (path) => {
+  counts[path === "/api/usage" ? "usage" : "progress"]++;
+  return Promise.reject(new Error("500"));
+};
+let draws = 0;
+global.drawMain = () => { draws++; A.pulseEnsure(); A.pulseProgEnsure("WS1"); };
+const flush = () => new Promise((r) => setTimeout(r, 5));
+(async () => {
+  A.pulseEnsure();
+  A.pulseProgEnsure("WS1");
+  await flush();
+  assert.strictEqual(counts.usage, 1, "usage refetched inside the failed minute");
+  assert.strictEqual(counts.progress, 1, "progress refetched inside the failed minute");
+  assert.ok(draws >= 1, "failure did not redraw the section");
+  A.pulseEnsure();
+  A.pulseProgEnsure("WS1");
+  await flush();
+  assert.strictEqual(counts.usage, 1, "same-minute redraw refetched usage");
+  assert.strictEqual(counts.progress, 1, "same-minute redraw refetched progress");
+  nowMs += 60000;
+  A.pulseEnsure();
+  A.pulseProgEnsure("WS1");
+  await flush();
+  assert.strictEqual(counts.usage, 2, "next minute did not retry usage");
+  assert.strictEqual(counts.progress, 2, "next minute did not retry progress");
+  console.log("failed fetch retry ok");
+})().catch((e) => { console.error(e); process.exit(1); });
 ''')
 
     def test_current_hour_fraction_floor(self):

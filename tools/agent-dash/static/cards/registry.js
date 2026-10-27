@@ -57,7 +57,7 @@
     /* The pulse KPI strip owns the overview numbers now, so the tiles
        stay on workstream tabs only (same renderer, unchanged). */
     {id: "tiles", order: 20, scope: "workstream", spec: function (state, snap) {
-      return ["tiles", keyOf([snap.counts, snap.totals, snap.totals_all_time, snap.last_activity, state.ws, state.snapError]), function () { return tiles(snap); }, state.ws === "all" ? "margin-top:14px" : ""];
+      return ["tiles", keyOf([snap.counts, snap.totals, snap.totals_all_time, snap.last_activity, state.ws, state.snapError]), function () { return tiles(snap); }, ""];
     }},
     {id: "wherego", order: 22, scope: "overview", spec: function (state, snap) { return typeof wheregoSpec === "function" ? wheregoSpec(state, snap) : null; }},
     {id: "aggregate", order: 24, scope: "overview", spec: function (state, snap) {

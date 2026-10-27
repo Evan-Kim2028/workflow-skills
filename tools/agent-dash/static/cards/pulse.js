@@ -21,7 +21,8 @@
    timeTicks, CW, progStep, progPctFmt, progStepRows, progMileRows,
    progTakeaway, progBest, progBestElapsed, openPlan, planLinear
    (plain globals read at call time);
-   window.AdPage/ADM/ADC, AdPage.wsColor, DashNav, secCache, drawMain,
+   window.AdPage/ADM/ADC, AdPage.wsColor, AdUnatt (the unattributed
+   toggle and note, core/unattributed.js), DashNav, secCache, drawMain,
    state. */
 (function (global) {
   "use strict";
@@ -51,10 +52,13 @@
      recent / (RECENT_H * base).
      stuck: live agents and (any running row stalled, or silent past
      STUCK_IDLE_S, or nothing recent against a nonzero base).
-     slowing: not stuck, base > 0, ratio < SLOW_RATIO.
+     slowing: live agents, not stuck, base > 0, ratio < SLOW_RATIO. A
+     workstream with no live agents has stopped, it is not slowing, so
+     it never reads slowing.
      moving: not stuck, recent > 0 and ratio >= SLOW_RATIO
      (or base == 0 with recent > 0: a fresh start).
-     idle: everything else (no live agents and no tokens in the window). */
+     idle: everything else: no live agents and no recent tokens, or live
+     agents with no tokens at all. */
   function momentumFor(wsRow, buckets, running, now) {
     wsRow = wsRow || {};
     buckets = buckets || [];
@@ -98,7 +102,7 @@
       if (running[i] && running[i].stalled) { anyStalled = true; break; }
     }
     if (live > 0 && (anyStalled || idleFor > PULSE.STUCK_IDLE_S || (recent <= 0 && base > 0))) return "stuck";
-    if (base > 0 && ratio < PULSE.SLOW_RATIO) return "slowing";
+    if (live > 0 && base > 0 && ratio < PULSE.SLOW_RATIO) return "slowing";
     if (recent > 0 && (base === 0 || ratio >= PULSE.SLOW_RATIO)) return "moving";
     return "idle";
   }
@@ -214,7 +218,8 @@
   function pulseChip(cur, prev, word, title) {
     var cls, symbol, value;
     if (!(prev > 0)) {
-      if (cur > 0) { cls = "new"; symbol = "\u25B2"; value = "new"; }
+      /* A zero prior window is genuinely new; a missing one (NaN) reads flat. */
+      if (cur > 0 && prev === 0) { cls = "new"; symbol = "\u25B2"; value = "new"; }
       else { cls = "flat"; symbol = "\u25C6"; value = "flat"; }
     } else {
       var pc = 100 * (cur - prev) / prev;
@@ -236,10 +241,13 @@
   /* Per-workstream hour buckets for the momentum chart, fetched once a
      minute like the activity progress payload (actProgKey): the section
      key below carries the payload stamp, so the arrival redraws the
-     section once. A failed fetch marks state.pulseFailed and the card
-     says "request failed" instead of drawing zeros. */
+     section once. A failed fetch marks state.pulseFailed (the card says
+     "request failed" instead of drawing zeros) and stamps
+     state.pulseFailedMin with the failing minute, so the retry waits for
+     the next minute: drawMain calls pulseEnsure again at once. */
   var pulseInflight = false;
   function pulseSince(nowS) { return Math.floor(nowS - PULSE.WINDOW_H * 3600); }
+  function pulseMinute() { return Math.floor(Date.now() / 60000); }
   function pulseWsKey() {
     var p = (typeof state !== "undefined" && state.pulseUsage) || null;
     return "pulse|" + (p ? Math.floor(p.since / 60) : 0) + "|" + (p && p.buckets ? "1" : "0") + "|" + Math.floor(Date.now() / 60000);
@@ -249,6 +257,7 @@
     var nowS = Date.now() / 1000, want = pulseSince(nowS);
     var p = state.pulseUsage;
     if (p && p.buckets && Math.abs(p.since - want) < 120 && (Date.now() - (p.at || 0)) < 60000) return;
+    if (state.pulseFailedMin === pulseMinute()) return;
     if (pulseInflight) return;
     pulseInflight = true;
     api("/api/usage", {group: "workstream", bucket: "hour", since: want}).then(function (j) {
@@ -256,11 +265,13 @@
       if (typeof state === "undefined" || (state.view === "exec" && state.ws !== "all")) return;
       state.pulseUsage = {since: want, buckets: (j && j.buckets) || [], at: Date.now()};
       state.pulseFailed = false;
+      state.pulseFailedMin = null;
       try { delete secCache.pulse; } catch (e) {}
       if (typeof drawMain === "function") drawMain();
     }, function () {
       pulseInflight = false;
       if (typeof state === "undefined") return;
+      state.pulseFailedMin = pulseMinute();
       if (!state.pulseUsage) state.pulseFailed = true;
       try { delete secCache.pulse; } catch (e) {}
       if (typeof drawMain === "function") drawMain();
@@ -273,7 +284,6 @@
      re-renders. Pulse renders on the overview only, so the scope is
      always "all". Guarded: private mode falls back to closed. */
   var PULSE_ROWS_KEY = "agent-dash-pulse:v1:rows:all";
-  var PULSE_PROG_TTL_MS = 60000;
   function pulseOpenRows() {
     try {
       var raw = window.sessionStorage.getItem(PULSE_ROWS_KEY);
@@ -319,7 +329,9 @@
   function pulseProgEnsure(ws) {
     if (!ws || typeof state === "undefined" || typeof api !== "function") return;
     var hit = pulseProgGet(ws);
-    if (hit && hit.data && (Date.now() - (hit.at || 0)) < PULSE_PROG_TTL_MS) return;
+    /* Settled (payload, no-plan or failed) for this minute: a failure
+       retries only in the next minute, never on every redraw. */
+    if (hit && (hit.data || hit.nodata || hit.error) && Math.floor((hit.at || 0) / 60000) === pulseMinute()) return;
     if (pulseProgInflight[ws]) return;
     pulseProgInflight[ws] = true;
     api("/api/ws/progress", {ws: ws}).then(function (j) {
@@ -337,7 +349,9 @@
          rejects with a bare Error("404"), so the message counts too. */
       var noPlan = err && (err.status === 404 || err.code === "plan_not_found" ||
         String((err && err.message) || "") === "404");
-      if (!state.pulseProg[ws]) state.pulseProg[ws] = noPlan ? {nodata: true, at: Date.now()} : {error: true, at: Date.now()};
+      var cur = state.pulseProg[ws];
+      if (cur && cur.data) cur.at = Date.now();
+      else state.pulseProg[ws] = noPlan ? {nodata: true, at: Date.now()} : {error: true, at: Date.now()};
       pulseFillDetail(ws);
     });
   }
@@ -523,14 +537,21 @@
     kpis.appendChild(pulseKpi("Agents running", fmtKpi(liveNow), null, agentExtra, {"data-kpi": "live", "data-live": String(liveNow)}));
     var tokExtra = [];
     if (tokChip.node) tokExtra.push(tokChip.node);
+    /* A zero window still names the last run and the all-time total
+       (the tiles' zero contract, on the pulse cell). */
+    if (!allTok) {
+      var lastTxt = "";
+      try { if (snap.last_activity) lastTxt = "last run " + ago(nowS, snap.last_activity) + " \u00B7 "; } catch (e) { lastTxt = ""; }
+      tokExtra.push(el("div", {class: "x", text: lastTxt + fmtKpi(allTimeTok) + " all time"}));
+    }
     tokExtra.push(hasPayload
       ? pulseBars(hourTot, peak, true, "Hourly tokens across all workstreams, oldest first; the lighter bar is the current partial hour")
       : el("div", {class: "skel", "aria-hidden": "true"}));
     kpis.appendChild(pulseKpi("Tokens (24 h)", allTok ? fmtKpi(allTok) : "0 in 24 h", null, tokExtra,
-      {"data-kpi": "tokens", "data-tokens": String(allTok), "data-tokens-all-time": String(allTimeTok), "data-delta": tokChip.cls}));
+      {"data-kpi": "tokens", "data-ws": "all", "data-hours": String(PULSE.WINDOW_H), "data-tokens": String(allTok), "data-tokens-all-time": String(allTimeTok), "data-delta": tokChip.cls}));
     var costExtra = [];
     if (costChip.node) costExtra.push(costChip.node);
-    kpis.appendChild(pulseKpi("Est. cost (24 h)", fmtMoney(cost), null, costExtra, {"data-kpi": "cost", "data-cost-usd": String(cost), "data-cost-all-time": String(allTimeCost), "data-delta": costChip.cls}));
+    kpis.appendChild(pulseKpi("Est. cost (24 h)", fmtMoney(cost), null, costExtra, {"data-kpi": "cost", "data-ws": "all", "data-hours": String(PULSE.WINDOW_H), "data-cost-usd": String(cost), "data-cost-all-time": String(allTimeCost), "data-delta": costChip.cls}));
     var finExtraEls = [];
     if (finBar) finExtraEls.push(finBar);
     var finBits = [];
@@ -543,6 +564,24 @@
     finExtraEls.push(el("div", {class: "x", text: finBits.length ? finBits.join(" \u00B7 ") + " (24 h)" : "none in 24 h"}));
     kpis.appendChild(pulseKpi("Finished (24 h)", fmtKpi(finNow), null, finExtraEls, {"data-kpi": "finished", "data-finished": String(finNow)}));
     c.appendChild(kpis);
+    /* The unattributed control the tiles carry on workstream tabs: the
+       same button (AdUnatt.toggleButton, shared flag per scope) and the
+       same muted note, here on the overview's pulse strip. */
+    if (typeof AdUnatt !== "undefined") {
+      var unattN = cn.unattributed || null;
+      var hidRuns = unattN && unattN.runs != null ? (+unattN.runs || 0) : 0;
+      var hidTok = unattN && unattN.tokens != null ? (+unattN.tokens || 0) : null;
+      var showU = AdUnatt.shown("all");
+      if (showU || hidRuns > 0 || (hidTok || 0) > 0) {
+        var urow = el("div", {class: "pulse-unatt"});
+        if (!showU && (hidRuns > 0 || (hidTok || 0) > 0)) {
+          var tnote = AdUnatt.noteText(hidRuns, hidTok, fmtKpi);
+          urow.appendChild(el("span", {class: "unatt-note", style: "color:var(--muted);font-size:12px", text: tnote, title: tnote, "data-unatt-runs": String(hidRuns), "data-unatt-tokens": hidTok == null ? "n/a" : String(hidTok)}));
+        }
+        urow.appendChild(AdUnatt.toggleButton("all"));
+        c.appendChild(urow);
+      }
+    }
 
     /* Momentum chart: one row per non-archived workstream, slowest
        first. Done rows stay only with live agents or windowed tokens;
@@ -605,7 +644,7 @@
     grid.appendChild(head);
     var openSet = pulseOpenRows();
     rows.forEach(function (r) {
-      var item = el("div", {class: "pulse-item", "data-pulse-item": r.w.ws});
+      var item = el("div", {class: "pulse-item", role: "listitem", "data-pulse-item": r.w.ws});
       item.appendChild(pulseRow(r, rowMax, nowS));
       if (openSet.indexOf(r.w.ws) >= 0) {
         var det = el("div", {class: "pulse-detail", role: "region", "aria-label": r.w.ws + " detail", "data-pulse-detail": r.w.ws});
@@ -891,7 +930,6 @@
     var row = el("button", {
       type: "button",
       class: "pulse-row m-" + r.cls,
-      role: "listitem",
       "aria-label": w.ws + " " + (w.name || "") + ", " + m.word + ", " + r.live + " live agents" + (open ? ", expanded" : ""),
       "aria-expanded": open ? "true" : "false",
       "data-ws": w.ws,
@@ -910,8 +948,7 @@
     row.appendChild(el("span", {
       class: "pulse-glyph",
       text: m.glyph,
-      title: w.ws + " is " + m.word,
-      "aria-label": w.ws + " is " + m.word
+      title: w.ws + " is " + m.word
     }));
     var idc = el("span", {class: "pulse-cell id"});
     idc.appendChild(el("b", {text: w.ws, title: w.ws + (w.name ? " " + w.name : "")}));
@@ -1000,7 +1037,8 @@
       keyOf([snap.counts, snap.totals, snap.prev_24h, snap.last_activity,
         (state.wss || []).map(function (w) { return [w.ws, w.live_agents, w.tokens, w.last_activity, w.state, w.name, w.by_phase]; }),
         (snap.running || []).map(function (r) { return [r.run_id, r.workstream, r.stalled, r.label, r.elapsed_s, r.tokens, r.model]; }),
-        planSum, pulseWsKey(), pulseOpenKey(), pulseProgStamps(), st.snapError]),
+        planSum, pulseWsKey(), pulseOpenKey(), pulseProgStamps(), st.snapError,
+        typeof AdUnatt !== "undefined" ? AdUnatt.shown("all") : false]),
       function () { return pulseCard(snap); }, ""];
   }
 
