@@ -11,7 +11,9 @@ text instead of freezing the session (a question tool-call blocks the
 whole session, and worker completions cannot wake it).
 
 Rule 2 (Stop): a lead with nothing pending, no ready task, and no live
-unwatched worker may end its turn (exit 0). A lead that still has
+unwatched worker may end its turn (exit 0). Gate tasks (an outside
+signal no worker can start) never count as ready, and only labels
+launched inside the lead window name workstreams or live workers. A lead that still has
 something to do gets exit 2 naming up to 8 ready task ids with titles
 and up to 8 live labels, so it launches, watches, or parks them instead
 of sitting idle with nothing that will wake it.
@@ -121,6 +123,10 @@ _STOPPED_RE = re.compile(r"Successfully stopped task:\s*([A-Za-z0-9_-]+)")
 _TASK_ID_RE = re.compile(r"<task-id>\s*([A-Za-z0-9_-]+)\s*</task-id>")
 _TOOL_USE_ID_RE = re.compile(r"<tool-use-id>\s*([A-Za-z0-9_-]+)\s*</tool-use-id>")
 _WS_LABEL_RE = re.compile(r"^ws(\d+)-", re.IGNORECASE)
+#: A usable run label. Launch detection also returns shell fragments
+#: (``$L``, ``and``, ``2>``) for launches it cannot resolve; those still
+#: make the session a lead but never name a workstream or match ``ps``.
+_LABEL_SHAPE_RE = re.compile(r"^(?:ws\d+|hub)-[A-Za-z0-9._-]+$", re.IGNORECASE)
 
 
 def _env_int(name: str, default: int) -> int:
@@ -179,8 +185,7 @@ class Facts:
     """Everything one transcript pass yields for both rules."""
 
     def __init__(self) -> None:
-        self.launches: list[tuple[float | None, str | None]] = []
-        self.labels: list[str] = []
+        self.launches: list[tuple[float | None, list[str]]] = []
         self.starts: dict[str, float | None] = {}
         self.started_by: dict[str, str] = {}
         self.bg_tool_uses: dict[str, float | None] = {}
@@ -214,12 +219,13 @@ def _handle_assistant(record: dict, facts: Facts, ts: float | None) -> None:
             except Exception:
                 labels = []
             if labels:
-                facts.launches.append((ts, labels[0] if labels else None))
-                facts.labels.extend(label for label in labels if label)
+                facts.launches.append(
+                    (ts, [label for label in labels if label and _LABEL_SHAPE_RE.match(label)])
+                )
             if input_.get("run_in_background") is True and isinstance(tool_use_id, str):
                 facts.bg_tool_uses[tool_use_id] = ts
         elif name in _AGENT_TOOLS and isinstance(tool_use_id, str):
-            facts.launches.append((ts, None))
+            facts.launches.append((ts, []))
             facts.agent_starts[tool_use_id] = ts
         elif name == "ScheduleWakeup":
             try:
@@ -308,11 +314,25 @@ def workstreams(labels: list[str]) -> list[str]:
 
 def is_lead(facts: Facts, now: float, window_s: float = LEAD_WINDOW_S) -> bool:
     """True when the session launched a worker inside the lead window."""
-    for ts, _label in facts.launches:
+    for ts, _labels in facts.launches:
         age_ts = now if ts is None else ts
         if now - age_ts <= window_s:
             return True
     return False
+
+
+def recent_labels(facts: Facts, now: float, window_s: float = LEAD_WINDOW_S) -> list[str]:
+    """Labels of worker launches inside the lead window, in launch order.
+
+    Older launches in a long transcript name workstreams the session no
+    longer leads, so they never drive the ready lookup or the live check.
+    """
+    out: list[str] = []
+    for ts, labels in facts.launches:
+        age_ts = now if ts is None else ts
+        if now - age_ts <= window_s:
+            out.extend(label for label in labels if label not in out)
+    return out
 
 
 def pending_tasks(
@@ -453,20 +473,22 @@ def check_stop(payload: dict) -> tuple[int, str]:
         return 0, ""
     if pending_tasks(facts, now, max_age_s) or live_wakeups(facts, now):
         return 0, ""
+    labels = recent_labels(facts, now, window_s)
     ready: list[tuple[str, dict]] = []
-    for ws in workstreams(facts.labels):
+    for ws in workstreams(labels):
         try:
             rows = get_ready_tasks(ws)
         except Exception:
             rows = []
         for row in rows:
-            if not row.get("live_run"):
-                ready.append((ws, row))
+            if row.get("live_run") or row.get("kind") == "gate":
+                continue
+            ready.append((ws, row))
     try:
         snapshot = list_processes()
     except Exception:
         snapshot = ""
-    alive = live_labels(facts.labels, snapshot or "")
+    alive = live_labels(labels, snapshot or "")
     if not ready and not alive:
         return 0, ""
     bits = []

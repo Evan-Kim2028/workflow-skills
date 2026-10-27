@@ -298,6 +298,54 @@ class StopTests(Base):
         self.assertEqual(code, 2)
         self.assertIn("WS11.1", err)
 
+    def test_ready_gate_does_not_count(self):
+        path = write_transcript(
+            self.tmp.name,
+            [
+                au("toolu_l1", "Bash", {"command": MUSE_LAUNCH}),
+                ures("toolu_l1", "done"),
+            ],
+        )
+        hook.get_ready_tasks = lambda ws: [
+            {"id": "WS11.g", "title": "Outside signal", "kind": "gate", "live_run": None}
+        ]
+        self.assertEqual(hook.check_stop(json.loads(stop_payload(path))), (0, ""))
+
+    def test_launch_outside_window_names_no_workstream(self):
+        old = old_iso(20)
+        path = write_transcript(
+            self.tmp.name,
+            [
+                au("toolu_l0", "Bash", {"command": MUSE_LAUNCH}, ts=old),
+                ures("toolu_l0", "done", ts=old),
+                au("toolu_h1", "Bash", {"command": HUB_LAUNCH}),
+                ures("toolu_h1", "done"),
+            ],
+        )
+        facts = hook.scan_transcript(path)
+        self.assertEqual(hook.recent_labels(facts, time.time()), ["hub-coord-foo"])
+
+        def boom(ws):
+            raise AssertionError("an old launch must not drive the ready lookup")
+
+        hook.get_ready_tasks = boom
+        hook.list_processes = lambda: "  123 python3 scripts/launch_codex.py ws11-plan-foo /repo /pad/x.md /runs\n"
+        self.assertEqual(hook.check_stop(json.loads(stop_payload(path))), (0, ""))
+
+    def test_unresolved_label_fragment_never_matches_ps(self):
+        path = write_transcript(
+            self.tmp.name,
+            [
+                au("toolu_l1", "Bash", {"command": MUSE_LAUNCH.replace("ws11-plan-foo", "$L")}),
+                ures("toolu_l1", "done"),
+            ],
+        )
+        facts = hook.scan_transcript(path)
+        self.assertTrue(hook.is_lead(facts, time.time()))
+        self.assertEqual(hook.recent_labels(facts, time.time()), [])
+        hook.list_processes = lambda: "  123 /bin/zsh -c echo $L and 2> /dev/null\n"
+        self.assertEqual(hook.check_stop(json.loads(stop_payload(path))), (0, ""))
+
     def test_ready_task_with_live_run_does_not_count(self):
         path = write_transcript(
             self.tmp.name,
@@ -358,7 +406,7 @@ class StopTests(Base):
         )
         facts = hook.scan_transcript(path)
         self.assertTrue(hook.is_lead(facts, time.time()))
-        self.assertEqual(hook.workstreams(facts.labels), [])
+        self.assertEqual(hook.workstreams(hook.recent_labels(facts, time.time())), [])
 
         def boom(ws):
             raise AssertionError("ready lookup must not run for hub-only leads")
