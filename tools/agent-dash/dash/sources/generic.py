@@ -42,6 +42,11 @@ MODEL_MAX = 200
 
 STATUSES = ("running", "done", "killed", "died_early", "unknown")
 
+#: Launcher spellings that mean the run finished without a report. They
+#: must not fall through to the default ``running``: a finished attempt
+#: whose final line says ``failed`` would otherwise read live forever.
+FAILED_STATUSES = ("failed", "failure")
+
 _log = logging.getLogger("agent_dash.generic")
 
 
@@ -172,7 +177,9 @@ def _run_row(obj: dict, now: float) -> dict | None:
     if tier is None and model is not None:
         tier = tier_of(model)
     status = obj.get("status")
-    if status not in STATUSES:
+    if isinstance(status, str) and status.strip().lower() in FAILED_STATUSES:
+        status = "died_early"
+    elif status not in STATUSES:
         status = "running"
     verdict = obj.get("verdict")
     verdict = verdict.strip() if isinstance(verdict, str) and verdict.strip() else None

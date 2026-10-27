@@ -2490,6 +2490,59 @@ class LaneAndUnseenTest(unittest.TestCase):
         report = self.store.reconcile_numbers(now, None, None, processes=procs)
         self.assertNotIn("unseen worker", "\n".join(report["mismatches"]))
 
+    def test_unseen_worker_counts_live_codex_and_generic_rows_as_seen(self):
+        # scripts/launch_codex.py reports its worker label the same way
+        # the pi launcher does, and every launcher reports its labelled
+        # runs to generic.jsonl: a running codex or generic row on the
+        # label is the worker the live launcher means, not a mismatch.
+        now = time.time()
+        self.store.upsert_run(
+            {
+                "run_id": "codex:sid9:ws9-WS9.9-codex",
+                "source": "codex",
+                "tier": "codex",
+                "label": "ws9-WS9.9-codex",
+                "status": "running",
+                "started_at": now - 600,
+                "ended_at": None,
+                "clock_source": "manifest",
+            }
+        )
+        self.store.upsert_run(
+            {
+                "run_id": "cmd:sid9:ws9-WS9.9-cmd",
+                "source": "generic",
+                "tier": "commandcode-deepseek",
+                "label": "ws9-WS9.9-cmd",
+                "status": "running",
+                "started_at": now - 600,
+                "ended_at": None,
+                "clock_source": "manifest",
+            }
+        )
+        procs = [
+            {
+                "pid": 4246,
+                "comm": "python3",
+                "started_at": now - 600,
+                "label": "ws9-WS9.9-codex",
+                "launcher": "codex",
+                "prompt_label": None,
+                "session_id": None,
+            },
+            {
+                "pid": 4247,
+                "comm": "python3",
+                "started_at": now - 600,
+                "label": "ws9-WS9.9-cmd",
+                "launcher": "commandcode",
+                "prompt_label": None,
+                "session_id": None,
+            },
+        ]
+        report = self.store.reconcile_numbers(now, None, None, processes=procs)
+        self.assertNotIn("unseen worker", "\n".join(report["mismatches"]))
+
     def test_unseen_worker_mismatch(self):
         now = time.time()
         self._lane(now)

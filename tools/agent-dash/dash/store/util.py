@@ -345,9 +345,13 @@ WORKER_SOURCES = frozenset({"muse", "glm", "grok"})
 #: ``pi`` and ``commandcode`` launch through ``scripts/launch_pi.py`` and
 #: ``scripts/launch_cmd.py``, which the process source reports with the
 #: worker label, so a running row on one of these sources is the worker a
-#: live launcher means. Kept apart from ``WORKER_SOURCES`` (marker and
-#: adoption rules) so those stay ``muse``/``glm``/``grok`` only.
-LIVE_WORKER_SOURCES = WORKER_SOURCES | {"pi", "commandcode"}
+#: live launcher means. ``codex`` joins them: ``scripts/launch_codex.py``
+#: is the same shape (a live launcher process carrying the worker label).
+#: ``generic`` joins them too: the launchers report their labelled runs
+#: there, so a running generic row on the label is the worker, not a
+#: missing one. Kept apart from ``WORKER_SOURCES`` (marker and adoption
+#: rules) so those stay ``muse``/``glm``/``grok`` only.
+LIVE_WORKER_SOURCES = WORKER_SOURCES | {"pi", "commandcode", "codex", "generic"}
 
 
 WRAPPER_SOURCES = frozenset({"claude-workflow"})
