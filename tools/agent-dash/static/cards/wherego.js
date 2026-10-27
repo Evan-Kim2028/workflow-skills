@@ -5,8 +5,8 @@
    the persisted toggle (guarded, per browser).
    Exports (on window.AdPage, also kept as plain globals): wheregoSpec
    (the registry entry point), wheregoCard, wheregoMode, plus the pure
-   helpers sharesOf (folding shares, node-tested), wheregoVal and
-   wheregoHours (window math, node-tested).
+   helpers sharesOf (folding shares, node-tested), perHourOf (folded
+   per-hour sums), wheregoVal and wheregoHours (window math, node-tested).
    Needs: el, s, CW, axes, timeTicks, fmtN, fmtUsd, fmtDate, fmtPct,
    niceMax, tokTotal, keyOf, since, api, showTip, hideTip, drawMain,
    secCache, state, ADM, colorOf, DashNav (plain globals). */
@@ -64,6 +64,25 @@
     return out;
   }
 
+  /* Per-hour sums keyed by the folded share key: a raw key the fold kept
+     maps to itself, any other raw key lands in Other, so every legend
+     row's bar segments add up to that row's total. Pure. */
+  function perHourOf(buckets, metric, shares) {
+    var keep = {};
+    shares.forEach(function (r) { keep[r.key] = true; });
+    var perHour = {};
+    (buckets || []).forEach(function (b) {
+      if (!b || !isFinite(+b.t)) return;
+      var v = wheregoVal(b, metric);
+      if (!(v > 0)) return;
+      var k = b.key == null || b.key === "" ? "unassigned" : String(b.key);
+      if (!Object.prototype.hasOwnProperty.call(keep, k)) k = "Other";
+      perHour[+b.t] = perHour[+b.t] || Object.create(null);
+      perHour[+b.t][k] = (perHour[+b.t][k] || 0) + v;
+    });
+    return perHour;
+  }
+
   /* The 24 hourly bars for the fixed window: 23 complete hours plus the
      current partial hour, oldest first. Stale data (everything older than
      a day, e.g. fixtures) anchors on the newest data hour instead of the
@@ -109,6 +128,7 @@
     var c = null;
     try { c = state.wherego; } catch (e) {}
     if (c && c.stamp === stamp && c.modes && c.modes[mode]) return;
+    if (c && c.failed === mode + "|" + stamp) return;
     if (wheregoInflight === mode + "|" + stamp) return;
     wheregoInflight = mode + "|" + stamp;
     api("/api/usage", {group: wheregoGroup(mode), bucket: "hour", since: since()}).then(function (j) {
@@ -280,18 +300,11 @@
     var nowS = Date.now() / 1000, maxT = 0;
     data.forEach(function (b) { if (b && isFinite(+b.t) && +b.t > maxT) maxT = +b.t; });
     var win = wheregoHours(nowS, maxT);
-    var perHour = {}, inWin = [];
-    data.forEach(function (b) {
-      if (!b || !isFinite(+b.t)) return;
-      if (!(+b.t + HOUR > win.t0 && +b.t < win.t1)) return;
-      inWin.push(b);
-      var v = wheregoVal(b, metric);
-      if (!(v > 0)) return;
-      var k = b.key == null || b.key === "" ? "unassigned" : String(b.key);
-      perHour[+b.t] = perHour[+b.t] || {};
-      perHour[+b.t][k] = (perHour[+b.t][k] || 0) + v;
+    var inWin = data.filter(function (b) {
+      return b && isFinite(+b.t) && +b.t + HOUR > win.t0 && +b.t < win.t1;
     });
     var shares = sharesOf(inWin, metric);
+    var perHour = perHourOf(inWin, metric, shares);
     if (!shares.length) {
       card.appendChild(el("div", {class: "empty", text: "No usage in this window."}));
       return card;
@@ -333,8 +346,9 @@
         showTip(ev, name + " · " + fmtDate(t), wheregoSegRows(name, fmtDate(t), v, metric, hourTot ? v / hourTot : 0));
       });
       rect.addEventListener("mouseleave", hideTip);
-      rect.addEventListener("focus", function (ev) {
-        showTip(ev, name + " · " + fmtDate(t), wheregoSegRows(name, fmtDate(t), v, metric, hourTot ? v / hourTot : 0));
+      rect.addEventListener("focus", function () {
+        var box = rect.getBoundingClientRect();
+        showTip({clientX: box.left + box.width / 2, clientY: box.top}, name + " · " + fmtDate(t), wheregoSegRows(name, fmtDate(t), v, metric, hourTot ? v / hourTot : 0));
       });
       rect.addEventListener("blur", hideTip);
       if (wheregoGroup(mode) !== "model" && k !== "Other" && k !== "unassigned" && k !== "unattributed") {
@@ -355,6 +369,7 @@
 
   var AdPage = (global.AdPage = global.AdPage || {});
   AdPage.sharesOf = sharesOf;
+  AdPage.perHourOf = perHourOf;
   AdPage.wheregoVal = wheregoVal;
   AdPage.wheregoHours = wheregoHours;
   AdPage.wheregoMode = wheregoMode;

@@ -104,6 +104,66 @@ console.log("wherego node proof ok");
         self.assertIn("wherego node proof ok", proc.stdout)
 
 
+class PerHourFoldTests(unittest.TestCase):
+    """Folded keys must reach the bars: every legend row sums to its bar segments."""
+
+    HARNESS = r"""
+const fs = require("fs");
+const assert = require("assert");
+var window = {};
+eval(fs.readFileSync(process.argv.slice(1)[0], "utf8"));
+var sharesOf = window.AdPage.sharesOf;
+var perHourOf = window.AdPage.perHourOf;
+function b(t, key, v) { return {t: t, key: key, input: v, output: 0, cache_read: 0, cache_write: 0, cost_usd: 0}; }
+var H = 3600, h0 = 1700000000 - (1700000000 % H), h1 = h0 + H, h2 = h1 + H;
+var rows = [
+  b(h0, "WS20", 6000), b(h1, "WS20", 6000), b(h2, "WS20", 6000),
+  b(h0, "WS21", 2000), b(h1, "WS21", 2000), b(h2, "WS21", 2000),
+  b(h0, "WS23", 50), b(h1, "WS23", 20), b(h2, "WS24", 30),
+  b(h0, "WS24", 10), b(h1, "unassigned", 120)
+];
+var shares = sharesOf(rows, "tokens");
+var keys = shares.map(function (r) { return r.key; });
+assert.ok(keys.indexOf("Other") >= 0, JSON.stringify(shares));
+assert.ok(keys.indexOf("WS23") < 0 && keys.indexOf("WS24") < 0, JSON.stringify(shares));
+var perHour = perHourOf(rows, "tokens", shares);
+var grand = 0;
+shares.forEach(function (r) {
+  var sum = 0;
+  [h0, h1, h2].forEach(function (t) { sum += (perHour[t] && perHour[t][r.key]) || 0; });
+  assert.strictEqual(sum, r.total, r.key + " bar segments " + sum + " != legend " + r.total);
+  grand += r.total;
+});
+// Other carries both folded keys: 50 + 20 + 30 + 10.
+var other = 0;
+[h0, h1, h2].forEach(function (t) { other += (perHour[t].Other) || 0; });
+assert.strictEqual(other, 110);
+// Each hour's segments add up to that hour's raw total, nothing dropped.
+[h0, h1, h2].forEach(function (t) {
+  var raw = rows.filter(function (r) { return r.t === t; }).reduce(function (a, r) { return a + r.input; }, 0);
+  var bars = 0;
+  shares.forEach(function (r) { bars += (perHour[t][r.key]) || 0; });
+  assert.strictEqual(bars, raw, "hour " + t + " bars " + bars + " != raw " + raw);
+});
+assert.strictEqual(grand, rows.reduce(function (a, r) { return a + r.input; }, 0));
+console.log("perhour fold proof ok");
+"""
+
+    def test_folded_keys_sum_into_other_bars(self):
+        proc = subprocess.run(
+            ["node", "-e", self.HARNESS, str(STATIC / "cards" / "wherego.js")],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr or proc.stdout)
+        self.assertIn("perhour fold proof ok", proc.stdout)
+
+    def test_card_reads_folded_per_hour(self):
+        bodies = dict(functions((STATIC / "cards" / "wherego.js").read_text()))
+        self.assertIn("perHourOf(", bodies["wheregoCard"], "the card must sum through the fold")
+        self.assertNotIn("perHour[+b.t][k]", bodies["wheregoCard"], "raw-key sums bypass the fold")
+
+
 class WsColorsTests(unittest.TestCase):
     """The shared map is stable, muted where it must be, collision-free."""
 
