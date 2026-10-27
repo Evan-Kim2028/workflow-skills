@@ -295,6 +295,55 @@ class MainTests(unittest.TestCase):
     def test_bad_argc_is_usage(self):
         self.assertEqual(launch.main(["only-a-label"]), 2)
 
+    def test_quota_words_in_a_successful_review_are_not_quota(self):
+        # A PASS review that mentions counts like 1,429 or the word
+        # "credit" must not flag quota: QUOTA fires only when the run
+        # actually failed (rc != 0 or empty text).
+        import json
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            prompt = os.path.join(tmp, "prompt.md")
+            with open(prompt, "w", encoding="utf-8") as fh:
+                fh.write("do the task\n")
+            outdir = os.path.join(tmp, "out")
+            os.makedirs(outdir)
+            label = "ws19-exec-quota-probe"
+            review = "PASS\nshipped fixtures worth 1,429 credits\n"
+            stream_lines = [
+                {"type": "thread.started", "thread_id": "01a16401-9955-70cd-bf8c-19944db4f20c"},
+                {
+                    "type": "item.completed",
+                    "item": {"id": "item_0", "type": "agent_message", "text": review},
+                },
+            ]
+
+            def fake_run(argv, **kwargs):
+                out_path = argv[argv.index("-o") + 1]
+                with open(out_path, "w", encoding="utf-8") as fh:
+                    fh.write(review)
+                so = kwargs.get("stdout")
+                if so is not None:
+                    for obj in stream_lines:
+                        so.write(json.dumps(obj) + "\n")
+                completed = mock.Mock()
+                completed.returncode = 0
+                return completed
+
+            env = {"AGENT_DASH_STATE_DIR": os.path.join(tmp, "state")}
+            with mock.patch.dict(os.environ, env, clear=False):
+                with mock.patch.object(launch, "codex_binary", return_value="/bin/true"):
+                    with mock.patch.object(launch.subprocess, "run", side_effect=fake_run):
+                        code = launch.main([label, tmp, prompt, outdir])
+            self.assertEqual(code, 0)
+            self.assertFalse(os.path.exists(os.path.join(outdir, "QUOTA-" + label)))
+            tsv = open(os.path.join(outdir, "codex-sessions.tsv"), encoding="utf-8").read()
+            self.assertIn(label, tsv)
+            generic = open(
+                os.path.join(tmp, "state", "generic.jsonl"), encoding="utf-8"
+            ).read()
+            self.assertIn('"verdict":"PASS"', generic.replace(" ", ""))
+
 
 if __name__ == "__main__":
     unittest.main()
