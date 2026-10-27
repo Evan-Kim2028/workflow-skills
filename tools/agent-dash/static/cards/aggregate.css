@@ -1,0 +1,26 @@
+/* Aggregate card styles: two panels side by side, stacked on phones. */
+#exec-aggregate .agg-grid{display:grid;grid-template-columns:1fr 1fr;gap:14px;min-width:0}
+#exec-aggregate .agg-panel{min-width:0}
+#exec-aggregate .agg-panel h3{font-size:13px;margin:0 0 6px;font-weight:700}
+#exec-aggregate .agg-headline{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;margin:2px 0 8px;font-size:13px}
+#exec-aggregate .agg-headline b{font-size:14px}
+#exec-aggregate .agg-deferred{color:var(--muted);font-size:12px}
+#exec-aggregate .agg-bar{display:flex;height:10px;border-radius:5px;overflow:hidden;background:var(--raised);margin:0 0 8px}
+#exec-aggregate .agg-bar span{display:block;height:100%}
+#exec-aggregate .agg-legend{align-items:baseline}
+#exec-aggregate .agg-legend .lentry .lv{font-variant-numeric:tabular-nums;min-width:3.4em;text-align:right;font-weight:700;color:var(--ink)}
+#exec-aggregate .agg-legend .agg-undated .lname{color:var(--muted)}
+#exec-aggregate .agg-right-head{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap}
+#exec-aggregate .agg-right-head h3{margin:0}
+#exec-aggregate .agg-toggle{margin:0 0 8px}
+#exec-aggregate svg{height:auto;max-width:100%}
+#exec-aggregate .agg-band{cursor:pointer;transition:filter .16s ease,transform .16s ease;stroke:var(--surface);stroke-width:.5}
+#exec-aggregate .agg-band:hover,#exec-aggregate .agg-band:focus-visible{filter:brightness(1.25)}
+#exec-aggregate .agg-toplab{font:700 11px var(--mono);fill:var(--ink);font-variant-numeric:tabular-nums}
+#exec-aggregate .empty.err{color:var(--muted);border-style:dashed}
+@media (max-width:700px){
+  #exec-aggregate .agg-grid{grid-template-columns:minmax(0,1fr)}
+}
+@media (prefers-reduced-motion:reduce){
+  #exec-aggregate .agg-band{transition:none}
+}
