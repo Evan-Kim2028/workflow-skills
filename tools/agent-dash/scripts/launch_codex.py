@@ -508,7 +508,8 @@ def main(argv=None):
             fh.write("label\tsession_id\tstarted_epoch\tmodel\ttier\n")
         fh.write(f"{label}\t{sid}\t{started}\t{model}\t{tier}\n")
 
-    if quota_hit(err_text) or quota_hit(raw.decode("utf-8", "replace")):
+    failed = rc != 0 or not text.strip()
+    if failed and (quota_hit(err_text) or quota_hit(raw.decode("utf-8", "replace"))):
         (out / f"QUOTA-{label}").write_text(f"model\t{model}\nlabel\t{label}\n", encoding="utf-8")
         verdict, status = "BLOCKED", "died_early"
     else:

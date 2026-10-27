@@ -149,7 +149,9 @@ def _outdirs(root, only=None):
     is not enough: the pi launcher keeps its own ``running/`` folder, so
     a manifest-less outdir must also carry Command Code evidence (the
     ``cooldown.json`` marker or a ``stream-<label>-<n>.ndjson`` attempt
-    stream, never the pi ``stream-<label>.ndjson`` shape).
+    stream, never the pi ``stream-<label>.ndjson`` shape), and a folder
+    holding ``pi-sessions.tsv`` is never a cmd outdir (a numeric label
+    tail can make a pi stream match the attempt shape).
     """
     found = []
     seen = set()
@@ -186,11 +188,19 @@ def _looks_like_cmd_dir(path):
     ``out-``/``err-`` files and ``running/`` are shared with the pi
     launcher, so they do not count: only the ``cooldown.json`` marker or a
     ``stream-<label>-<n>.ndjson`` attempt stream (never the pi
-    ``stream-<label>.ndjson`` shape).
+    ``stream-<label>.ndjson`` shape). A folder holding the pi manifest is
+    a pi outdir even when one of its labels ends in a number (whose pi
+    stream then matches the attempt shape): the pi source owns those runs,
+    and reading them here would mint phantom ``commandcode:`` rows for
+    live pi attempts.
     """
     try:
         names = os.listdir(path)
     except OSError:
+        return False
+    if MANIFEST in names:
+        return True
+    if "pi-sessions.tsv" in names:
         return False
     if "cooldown.json" in names:
         return True

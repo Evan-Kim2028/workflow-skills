@@ -99,6 +99,29 @@ class WatchdogTests(unittest.TestCase):
         body = registry.health(NOW + 1)
         self.assertFalse(body["ok"])
 
+    def test_sweep_budget_is_shared_not_per_source(self):
+        # Three hung sources behind one another: the old per-source join
+        # cost one budget each (~3 s here). The tick now starts every due
+        # source first and joins within one sweep budget, so the whole
+        # sweep stays near a single budget and the fast source behind
+        # them is still polled fresh inside the tick.
+        store = MemStore()
+        slows = [_Slow(), _Slow(), _Slow()]
+        for index, slow in enumerate(slows):
+            slow.NAME = "slow-%d" % index
+        fast = _Fast()
+        registry = Registry(slows + [fast])
+        start = time.monotonic()
+        registry.tick(store, {"poll_budget_s": 1.0}, NOW, force=False)
+        elapsed = time.monotonic() - start
+        self.assertLess(elapsed, 2.0)
+        self.assertEqual(fast.n, 1)
+        self.assertEqual(registry.state["fast"]["last_poll"], NOW)
+        for slow in slows:
+            state = registry.state[slow.NAME]
+            self.assertTrue(state["timed_out"])
+            self.assertIsNone(state["last_poll"])
+
     def test_lag_beyond_three_intervals_is_a_stall(self):
         store = MemStore()
         fast = _Fast()

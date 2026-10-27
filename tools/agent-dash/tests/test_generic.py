@@ -141,6 +141,22 @@ class GenericUnitTests(unittest.TestCase):
         self.assertEqual(row["verdict"], "PASS")
         self.assertIsNotNone(row.get("ended_at"))
 
+    def test_failed_status_reads_died_early_not_running(self):
+        # A launcher final line reporting "failed" means the attempt is
+        # over: it must not fall through to the default running status,
+        # which would pin a finished run as live forever.
+        for status in ("failed", "failure", " failed "):
+            row = generic._run_row(
+                {"type": "run", "label": "ws4-WS4.1-demo", "status": status},
+                NOW,
+            )
+            self.assertEqual(row["status"], "died_early", status)
+        row = generic._run_row(
+            {"type": "run", "label": "ws4-WS4.1-demo", "status": "mystery"},
+            NOW,
+        )
+        self.assertEqual(row["status"], "running")
+
     def test_end_to_end_with_real_store(self):
         from dash.store import Store
 
