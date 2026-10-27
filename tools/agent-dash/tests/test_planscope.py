@@ -109,7 +109,7 @@ class PlanScopeWarningTests(unittest.TestCase):
     def test_citation_and_dbt_full_refresh_stay_quiet(self):
         plan = scope_plan(probe="see scripts/lor-ci-local.sh:206-227 for the gate shape")
         self.assertEqual(self.codes(plan), [])
-        plan = scope_plan(probe="one --full-refresh of traded_listings_pg per its model header")
+        plan = scope_plan(probe="one --full-refresh of orders_mart per its model header")
         self.assertEqual(self.codes(plan), [])
 
     def test_warning_shape_matches_plan20x(self):
