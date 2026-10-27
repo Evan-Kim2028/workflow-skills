@@ -558,6 +558,70 @@ class GrokRunDirEvidenceTests(unittest.TestCase):
             self.poll(store, cfg, 1792154000)
             self.assertEqual(store.runs["glm:%s:ws16-exec-meta" % SID]["tier"], "deepseek-flash")
 
+    def test_grok_build_sessions_tsv_in_child_dir_registers_run(self):
+        # A grok-build-47 launch writes grok-build-sessions.tsv (not
+        # glm-sessions.tsv) into a grokb/ child of the pad, with the pid
+        # file, meta file, and logs beside it. The source must read that
+        # name or the run stays invisible (unseen-worker).
+        label = "ws19-exec-grokbuild-visible-gfix"
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg, scratch = self.tree(tmp, "# no glm rows\n")
+            grokb = os.path.join(scratch, "grokb")
+            os.makedirs(grokb)
+            with open(os.path.join(grokb, "grok-build-sessions.tsv"), "w") as fh:
+                fh.write(
+                    "%s\t%s\t1793121772\tgrok-4.7\tgrok-build-47\tgrok-cli\n"
+                    % (label, SID)
+                )
+            with open(os.path.join(grokb, label + ".pid"), "w") as fh:
+                fh.write("987654321\n")
+            meta = {
+                "err_path": os.path.join(grokb, "err-%s.log" % label),
+                "harness": "grok-cli",
+                "label": label,
+                "model": "grok-4.7",
+                "out_path": os.path.join(grokb, "out-%s.md" % label),
+                "pid": 987654321,
+                "started_at": 1793121772,
+                "tier": "grok-build-47",
+            }
+            with open(os.path.join(grokb, label + ".meta.json"), "w") as fh:
+                json.dump(meta, fh)
+            store = Store()
+            self.poll(store, cfg, 1793122000)
+            run = store.runs["glm:%s:%s" % (SID, label)]
+            self.assertEqual(run["source"], "glm")
+            self.assertEqual(run["tier"], "grok-build-47")
+            self.assertEqual(run["model"], "grok-4.7")
+            self.assertEqual(run["harness"], "grok")
+            self.assertEqual(run["label"], label)
+            self.assertEqual(run["parent_session_id"], HUB)
+            self.assertEqual(run["pid"], 987654321)
+            self.assertNotIn("status", run)
+
+    def test_grok_build_tsv_quota_err_closes_as_died(self):
+        # The quota close-out applies to grok-build rows too: same child
+        # dir layout, rate-limit text in the err log.
+        label = "ws19-exec-grokbuild-quota-gfix"
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg, scratch = self.tree(tmp, "# no glm rows\n")
+            grokb = os.path.join(scratch, "grokb")
+            os.makedirs(grokb)
+            with open(os.path.join(grokb, "grok-build-sessions.tsv"), "w") as fh:
+                fh.write(
+                    "%s\t%s\t1793121772\tgrok-4.7\tgrok-build-47\tgrok-cli\n"
+                    % (label, SID)
+                )
+            with open(os.path.join(grokb, "err-%s.log" % label), "w") as fh:
+                fh.write("grok failed\nRate limit reached for requests\n")
+            store = Store()
+            self.poll(store, cfg, 1793122000)
+            run = store.runs["glm:%s:%s" % (SID, label)]
+            self.assertEqual(run["tier"], "grok-build-47")
+            self.assertEqual(run["status"], "died_early")
+            self.assertEqual(run["verdict"], "QUOTA")
+            self.assertNotIn("pid", run)
+
     @unittest.skipUnless(os.environ.get("AGENT_DASH_SMOKE") == "1", "set AGENT_DASH_SMOKE=1 to read a local glm usage file")
     def test_smoke_real_usage_json(self):
         sessions = os.environ.get("AGENT_DASH_SMOKE_GROK_SESSIONS")

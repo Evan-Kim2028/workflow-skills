@@ -1,6 +1,7 @@
 """GLM source for sessions launched through the grok CLI.
 
-Manifest rows (``glm-sessions.tsv``: label, uuid, started epoch, model) become
+Manifest rows (``glm-sessions.tsv`` and ``grok-build-sessions.tsv``: label,
+uuid, started epoch, model, then tier and harness) become
 runs ``glm:<uuid>:<label>``. Token rows prefer ``usage.json`` under
 ``~/.grok/sessions/<encoded-cwd>/<uuid>/``. ``inputTokens`` already includes
 ``cachedReadTokens``; both are stored raw. Per-turn objects are the additive
@@ -62,6 +63,12 @@ PER_FILE_DEFAULT = 4 * 1024 * 1024
 PER_TICK_DEFAULT = 8 * 1024 * 1024
 
 TOOL = "glm"
+#: Manifest names this source reads. Registry tiers launched through
+#: ``run_worker.py`` under kind ``grok-build`` record their rows in
+#: ``grok-build-sessions.tsv`` (the worker entry's own ``manifest`` name)
+#: instead of ``glm-sessions.tsv``; both live in the pad or in a lead
+#: child folder such as ``grokb/``, and both become ``glm`` runs.
+MANIFESTS = ("glm-sessions.tsv", "grok-build-sessions.tsv")
 last_error = None
 
 
@@ -85,16 +92,17 @@ def _poll(store, cfg, now):
     manifests = {}
     pads = {}
     for scratch in _scratch_roots(cfg):
-        for pad, parent in _manifest_dirs(scratch, "glm-sessions.tsv", only):
-            path = os.path.join(pad, "glm-sessions.tsv")
-            text, budget = _read_small(path, budget, per_file)
-            if text is None:
-                continue
-            for row in _parse_manifest(text):
-                row["parent_session_id"] = parent
-                row["pad"] = pad
-                if _keep_latest(manifests, row):
-                    pads[row["session_id"]] = pad
+        for filename in MANIFESTS:
+            for pad, parent in _manifest_dirs(scratch, filename, only):
+                path = os.path.join(pad, filename)
+                text, budget = _read_small(path, budget, per_file)
+                if text is None:
+                    continue
+                for row in _parse_manifest(text):
+                    row["parent_session_id"] = parent
+                    row["pad"] = pad
+                    if _keep_latest(manifests, row):
+                        pads[row["session_id"]] = pad
 
     latest = _latest_per_label(manifests)
     for row in manifests.values():
@@ -466,7 +474,7 @@ def _label(sid, row):
 
 
 def _parse_manifest(text):
-    """Rows from ``glm-sessions.tsv``: label, uuid, started, model, then tier.
+    """Rows from ``glm-sessions.tsv`` / ``grok-build-sessions.tsv``: label, uuid, started, model, then tier.
 
     The fifth cell is the registry tier the launch recorded. Older rows stop
     at the model; they get their tier from the meta file or the model map.

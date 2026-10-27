@@ -46,9 +46,16 @@ TSV_CAP = 1024 * 1024
 PROCESS_TTL_S = 30
 
 # filename, source, directory, default tier
+# ``grok-build-sessions.tsv`` is the registry manifest name a
+# ``grok-build`` worker entry declares (e.g. ``grok-build-47``): those rows
+# are Grok CLI runs too, so they read source ``glm`` and merge with the
+# ``grok_cli`` source's row on ``glm:<session>:<label>``. In a registered
+# flat run folder the out/err/pid files sit beside the TSV, which is how
+# finished runs keep their recorded tier and out-file verdict.
 _MANIFESTS = (
     ("muse-sessions.tsv", "muse", "muse", "muse"),
     ("glm-sessions.tsv", "glm", "glm", "glm"),
+    ("grok-build-sessions.tsv", "glm", "glm", "glm"),
     ("grok-sessions.tsv", "grok", "grok", "grok"),
     ("cursor-sessions.tsv", "grok", "cursor", "grok"),
     ("codex-sessions.tsv", "codex", "codex", "codex"),
