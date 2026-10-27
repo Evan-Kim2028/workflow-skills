@@ -121,6 +121,44 @@ class ManifestUnitTests(unittest.TestCase):
         self.assertIsNone(manifests.verdict_of("The model said hello\n"))
         self.assertIsNone(manifests.verdict_of("VERDICT:APPROVE\n"))
 
+    def test_verdict_grok_style_mid_text(self):
+        # Grok reports end narration with ".PASS" or "**PASS**" mid-line.
+        # The anchored contract stays the default; grok-style parsing is
+        # opt-in per row so other harnesses never inherit it.
+        mid = (
+            "I'll mirror the era rewrite in the ball branch, then commit."
+            "The new test failed first, then passed after the fix."
+            "I'll commit with hooks and push.PASS\n"
+        )
+        bold = (
+            "I'll confirm the two fix sites by line accurately.**PASS**\n"
+            "\nBranch `train/ws19-x` at `abc123`, working tree clean.\n"
+        )
+        self.assertIsNone(manifests.verdict_of(mid))
+        self.assertIsNone(manifests.verdict_of(bold))
+        self.assertEqual(manifests.verdict_of(mid, grok_style=True), "PASS")
+        self.assertEqual(manifests.verdict_of(bold, grok_style=True), "PASS")
+        self.assertEqual(
+            manifests.verdict_of(
+                "The sweep is done, one gap left open.PARTIAL\n", grok_style=True
+            ),
+            "PARTIAL",
+        )
+        self.assertEqual(
+            manifests.verdict_of("No key, cannot proceed.**BLOCKED**\n", grok_style=True),
+            "BLOCKED",
+        )
+        # Quoted review/gate remarks are not verdicts, and plain narration
+        # without a verdict token stays None even in grok style.
+        self.assertIsNone(
+            manifests.verdict_of(
+                "lor-doctor review: `REVIEW PASS (3 findings)`\n", grok_style=True
+            )
+        )
+        self.assertIsNone(
+            manifests.verdict_of("The model said hello\n", grok_style=True)
+        )
+
     def test_classify_matrix(self):
         base = dict(err_has_sigterm=False, err_nonempty=False, err_known=True)
         self.assertEqual(
@@ -595,6 +633,109 @@ class ManifestPollTests(unittest.TestCase):
         self.assertEqual(run["status"], "done")
         self.assertEqual(run["verdict"], "PASS")
         self.assertEqual(run["ended_at"], NOW)
+
+    def test_poll_reads_grok_build_tsv_in_pad_child_dir(self):
+        # A grok-build-47 launch writes grok-build-sessions.tsv into a
+        # grokb/ child of the session pad (not the pad top, not a
+        # registered flat run dir), with the pid file, meta file, and
+        # logs beside it. The pad scan must read that name, keep the
+        # recorded tier, and take the finished verdict from the out file.
+        label = "ws19-exec-grokbuild-nested-gfix"
+        grokb = os.path.join(self.scratch, "grokb")
+        _write(
+            os.path.join(grokb, "grok-build-sessions.tsv"),
+            f"{label}\t{GLM}\t1700000002\tgrok-4.7\tgrok-build-47\tgrok-cli\n",
+            NOW,
+        )
+        _write(
+            os.path.join(grokb, f"out-{label}.md"),
+            "PASS\nsynthetic report body\n",
+            NOW,
+        )
+        _write(os.path.join(grokb, f"err-{label}.log"), "", NOW)
+        _write(os.path.join(grokb, f"{label}.pid"), "987654321\n", NOW)
+        _write(
+            os.path.join(grokb, f"{label}.meta.json"),
+            json.dumps(
+                {
+                    "err_path": os.path.join(grokb, f"err-{label}.log"),
+                    "harness": "grok-cli",
+                    "label": label,
+                    "model": "grok-4.7",
+                    "out_path": os.path.join(grokb, f"out-{label}.md"),
+                    "pid": 987654321,
+                    "started_at": 1700000002,
+                    "tier": "grok-build-47",
+                }
+            ),
+            NOW,
+        )
+        manifests.poll(self.store, self._cfg(), NOW)
+        run = self.store.runs[f"glm:{GLM}:{label}"]
+        self.assertEqual(run["source"], "glm")
+        self.assertEqual(run["tier"], "grok-build-47")
+        self.assertEqual(run["model"], "grok-4.7")
+        self.assertEqual(run["label"], label)
+        self.assertEqual(run["parent_session_id"], PARENT)
+        self.assertEqual(run["status"], "done")
+        self.assertEqual(run["verdict"], "PASS")
+        self.assertEqual(run["ended_at"], NOW)
+
+    def test_poll_grok_style_verdict_from_pad_child_dir(self):
+        # Grok reports put the verdict mid-text after narration
+        # (".PASS", "**PASS**"), never on its own line. The nested
+        # grokb/ row must still finish PASS, while a muse report with
+        # the same shape keeps its anchored contract (no verdict).
+        glabel = "ws19-exec-grokbuild-midtext-gfix"
+        grokb = os.path.join(self.scratch, "grokb")
+        _write(
+            os.path.join(grokb, "grok-build-sessions.tsv"),
+            f"{glabel}\t{GLM}\t1700000002\tgrok-4.7\tgrok-build-47\tgrok-cli\n",
+            NOW,
+        )
+        _write(
+            os.path.join(grokb, f"out-{glabel}.md"),
+            "I fixed the sweep and mirrored the era rewrite. "
+            "The new test failed first, then passed after the fix."
+            "I'll commit with hooks and push.PASS\n",
+            NOW,
+        )
+        _write(os.path.join(grokb, f"err-{glabel}.log"), "", NOW)
+        mlabel = "ws19-exec-muse-midtext-gfix"
+        _write(
+            os.path.join(self.scratch, "muse-sessions.tsv"),
+            f"{mlabel}\t{MUSE}\t1700000002\n",
+            NOW,
+        )
+        _write(
+            os.path.join(self.scratch, "muse", f"out-{mlabel}.md"),
+            "I fixed the sweep and mirrored the era rewrite.PASS\n",
+            NOW,
+        )
+        manifests.poll(self.store, self._cfg(), NOW)
+        grok_run = self.store.runs[f"glm:{GLM}:{glabel}"]
+        self.assertEqual(grok_run["status"], "done")
+        self.assertEqual(grok_run["verdict"], "PASS")
+        muse_run = self.store.runs[f"muse:{MUSE}:{mlabel}"]
+        self.assertIsNone(muse_run.get("verdict"))
+
+    def test_poll_duplicate_top_and_nested_row_keeps_file_evidence(self):
+        # The same run named by the pad-top TSV and the nested grokb/ TSV
+        # emits once, from the copy with the out file: the pad-top copy
+        # must not downgrade the nested copy's status and byte counts.
+        label = "ws19-exec-grokbuild-dual-gfix"
+        row = f"{label}\t{GLM}\t1700000002\tgrok-4.7\tgrok-build-47\tgrok-cli\n"
+        _write(os.path.join(self.scratch, "grok-build-sessions.tsv"), row, NOW)
+        grokb = os.path.join(self.scratch, "grokb")
+        _write(os.path.join(grokb, "grok-build-sessions.tsv"), row, NOW)
+        _write(os.path.join(grokb, f"out-{label}.md"), "PASS\nbody\n", NOW)
+        _write(os.path.join(grokb, f"err-{label}.log"), "", NOW)
+        manifests.poll(self.store, self._cfg(), NOW)
+        runs = [run for run in self.store.runs.values() if run["label"] == label]
+        self.assertEqual(len(runs), 1)
+        self.assertEqual(runs[0]["status"], "done")
+        self.assertEqual(runs[0]["verdict"], "PASS")
+        self.assertGreater(runs[0]["out_bytes"], 0)
 
     def test_poll_prefers_last_seen_alive_over_file_mtime(self):
         rundir = os.path.join(self.root, "runs", "ws9b")

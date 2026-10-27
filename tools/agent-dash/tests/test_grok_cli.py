@@ -409,6 +409,51 @@ class GrokCliTests(unittest.TestCase):
             run = store.runs["glm:%s:ws8-nested" % SID]
             self.assertEqual(run["parent_session_id"], HUB)
 
+    def test_grok_build_usage_model_aliases_to_launcher_model(self):
+        # Grok Build's usage.json reports primaryModelId "grok-4.7-build"
+        # while the launcher recorded "grok-4.7". The run and its usage
+        # rows keep the launcher id, so model charts read Grok 4.7 and
+        # the catalog prices the tokens instead of leaving them unpriced.
+        with tempfile.TemporaryDirectory() as tmp:
+            doc = {
+                "updatedAt": "2026-10-27T16:50:16.063454+00:00",
+                "session": {
+                    "inputTokens": 8263756,
+                    "cachedReadTokens": 7978240,
+                    "outputTokens": 67396,
+                    "cacheCreationTokens": 0,
+                    "reasoningTokens": 45139,
+                    "primaryModelId": "grok-4.7-build",
+                },
+                "turns": [
+                    {
+                        "turnNumber": 1,
+                        "endedAt": "2026-10-27T16:50:16.063454+00:00",
+                        "inputTokens": 8263756,
+                        "cachedReadTokens": 7978240,
+                        "outputTokens": 67396,
+                        "cacheCreationTokens": 0,
+                        "reasoningTokens": 45139,
+                        "primaryModelId": "grok-4.7-build",
+                    }
+                ],
+            }
+            cfg, _log, _usage, _other = self.tree(
+                tmp,
+                "ws19-review-grokbuild\t%s\t1793118662\tgrok-4.7\tgrok-build-47\tgrok-cli\n" % SID,
+                usage=doc,
+            )
+            store = Store()
+            self.poll(store, cfg, 1793122000)
+            run = store.runs["glm:%s:ws19-review-grokbuild" % SID]
+            self.assertEqual(run["model"], "grok-4.7")
+            self.assertEqual(run["tier"], "grok-build-47")
+            row = next(iter(store.usage.values()))
+            self.assertEqual(row["model"], "grok-4.7")
+            self.assertEqual(row["input"], 8263756 - 7978240)
+            self.assertEqual(row["cache_read"], 7978240)
+
+
 class GrokRunDirEvidenceTests(unittest.TestCase):
     def setUp(self):
         grok.last_error = None
@@ -546,6 +591,20 @@ class GrokRunDirEvidenceTests(unittest.TestCase):
             self.poll(store, cfg, 1792154000)
             self.assertEqual(store.runs["glm:%s:ws16-review-ds" % SID]["tier"], "deepseek-flash")
             self.assertEqual(store.runs["glm:%s:ws16-review-g" % OTHER]["tier"], "glm")
+
+    def test_tierless_grok_model_falls_back_to_grok_build_tier(self):
+        # A tier-less row for a grok-4.7 model is a Grok Build run, never glm.
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg, _scratch = self.tree(
+                tmp,
+                "label\tuuid\tepoch\tmodel\n"
+                "ws19-review-grok\t%s\t1793118662\tgrok-4.7\n" % SID,
+            )
+            store = Store()
+            self.poll(store, cfg, 1793122000)
+            self.assertEqual(
+                store.runs["glm:%s:ws19-review-grok" % SID]["tier"], "grok-build-47"
+            )
 
     def test_meta_file_names_the_tier_and_wins_over_the_model_map(self):
         with tempfile.TemporaryDirectory() as tmp:

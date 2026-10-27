@@ -11,6 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 STATIC = Path(__file__).resolve().parents[1] / "static"
 
 from dash.models import HARNESS_NAMES, full_name, harness_of, model_key, model_name, run_model_key
+from dash.pricing import cost
 from dash.projectfeed import _tool_key as _feed_tool_key
 from dash.store import _drop_launch_echoes
 from dash.store.util import _tool_key
@@ -82,12 +83,16 @@ class BeamFamilyTest(unittest.TestCase):
     def test_grok_build_tiers_count_under_their_model_family(self):
         # A Grok Build run carries source glm plus its registry tier. The
         # per-harness totals count it under the family its model belongs to
-        # (deepseek / glm / beam), never dropping it into "other".
+        # (deepseek / glm / beam), never dropping it into "other". A
+        # grok-4.7 run counts as grok (the Grok lane), never glm, so the
+        # pulse and tiles read it beside the cursor-agent Grok runs.
         rows = {
             ("deepseek-flash", "deepseek-flash"): "deepseek",
             ("glm-flash", "glm-5.3-flash"): "glm",
             ("glm", "glm-5.3"): "glm",
             ("beam", "reflection-beam"): "beam",
+            ("grok-build-47", "grok-4.7"): "grok",
+            ("grok-build-47", "grok-4.7-build"): "grok",
         }
         for (tier, model), want in rows.items():
             run = {"source": "glm", "tier": tier, "model": model}
@@ -101,6 +106,22 @@ class BeamFamilyTest(unittest.TestCase):
         pi_ds = {"source": "pi", "tier": "pi-deepseek", "model": "river/deepseek-ai/DeepSeek-V4.1-Flash-1017"}
         self.assertEqual(_tool_key(pi_ds), "deepseek")
         self.assertEqual(_tool_key({"source": "pi", "tier": "pi-beam", "model": "reflection/Beam-1.0-501B-A23B"}), "beam")
+
+    def test_cursor_agent_grok_reads_grok_4_7_everywhere(self):
+        # The cursor-agent Grok path (launch_grok.sh) records the bracketed
+        # 500k id or the short high id. Both group under the grok-4.7 model
+        # key, display Grok 4.7, price from the catalog, and count in the
+        # Grok lane beside the Grok Build runs.
+        for model in (
+            "grok-4.7[context=500k,reasoning_effort=high,fast=false]",
+            "grok-4.7-high",
+        ):
+            run = {"source": "grok", "tier": "grok", "model": model}
+            self.assertEqual(run_model_key(run), "grok-4.7", model)
+            self.assertEqual(model_name("grok-4.7"), "Grok 4.7")
+            self.assertIsNotNone(cost(model, 100000, 5000, 80000, 0), model)
+            self.assertEqual(_tool_key(run), "grok", model)
+            self.assertEqual(_feed_tool_key(run), "grok", model)
 
 
 class HarnessTest(unittest.TestCase):

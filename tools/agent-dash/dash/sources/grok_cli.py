@@ -191,9 +191,25 @@ def _apply_usage(store, path, row, budget, per_file, now, processes):
     return True, budget
 
 
+def _alias_model(model):
+    """Launcher model id for a usage-reported id.
+
+    The Grok Build CLI reports its session under an internal build id
+    (``grok-4.7-build``) while the launcher recorded the public id
+    (``grok-4.7``). Rows keep the public id, so model charts, display
+    names, and catalog pricing all read the run the way the launch did.
+    """
+    if not isinstance(model, str):
+        return model
+    if len(model) > 11 and model[:5].lower() == "grok-" and model[-6:].lower() == "-build":
+        return model[:-6]
+    return model
+
+
 def _usage_events(data):
     session = data.get("session") if isinstance(data.get("session"), dict) else {}
     fallback = session.get("primaryModelId") if isinstance(session.get("primaryModelId"), str) else None
+    fallback = _alias_model(fallback)
     updated = _epoch_any(data.get("updatedAt"))
     turns = data.get("turns") if isinstance(data.get("turns"), list) else []
     chosen = []
@@ -209,6 +225,7 @@ def _usage_events(data):
     events = []
     for mid, turn, ts in chosen:
         model = turn.get("primaryModelId") if isinstance(turn.get("primaryModelId"), str) else fallback
+        model = _alias_model(model)
         events.append(
             {
                 "message_id": mid,
@@ -512,11 +529,14 @@ def _parse_manifest(text):
 
 
 #: Fallback tier per model id, for rows written before the tier column.
+#: ``grok-4.7`` is a Grok Build run (registry tier ``grok-build-47``),
+#: never glm.
 MODEL_TIERS = {
     "deepseek-flash": "deepseek-flash",
     "glm-5.3": "glm",
     "glm-5.3-flash": "glm-flash",
     "reflection-beam": "beam",
+    "grok-4.7": "grok-build-47",
 }
 
 
@@ -532,7 +552,7 @@ def _tier_of(row, model=None):
         text = str(value or "").strip()
         if text:
             return text
-    key = str(model or row.get("model") or "").strip().lower()
+    key = _alias_model(str(model or row.get("model") or "").strip().lower())
     if key in MODEL_TIERS:
         return MODEL_TIERS[key]
     for known, tier in MODEL_TIERS.items():

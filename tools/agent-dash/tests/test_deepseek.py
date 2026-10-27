@@ -571,13 +571,18 @@ class GrokCliFamilyTest(unittest.TestCase):
             "deepseek",
         )
         # GLM ids, unrecorded models, and other families through the same
-        # CLI keep the GLM lane: existing GLM counts do not move.
-        for model in ("glm-5.3", "glm-5.3-flash", None, "", "grok-4.7"):
+        # CLI keep the GLM lane: existing GLM counts do not move. Grok
+        # models take the Grok lane, never glm.
+        for model in ("glm-5.3", "glm-5.3-flash", None, ""):
             self.assertEqual(
                 _tool_key({"source": "glm", "tier": "glm", "model": model}),
                 "glm",
                 repr(model),
             )
+        self.assertEqual(
+            _tool_key({"source": "glm", "tier": "glm", "model": "grok-4.7"}),
+            "grok",
+        )
         self.assertIsNone(_tool_key({"source": "dagster", "tier": "", "model": None}))
 
 

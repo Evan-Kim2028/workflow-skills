@@ -2,7 +2,11 @@
 
 Scans ``<scratch-root>/<encoded-cwd>/<session>/scratchpad``. A root that is
 already the encoded-cwd directory counts too: a uuid child with ``scratchpad/``
-is a session pad. Manifest rows become runs. Stdout, stderr, and report files are
+is a session pad. Manifest rows become runs. A manifest TSV nested one level
+under the pad (a lead child folder such as ``grokb/``) reads too, with the
+pid file and the logs beside it the way a flat run folder holds them; when
+the pad top and a child name the same run, the copy with the newer out file
+wins. Stdout, stderr, and report files are
 opened only by constructed name (``out-<label>.md``, ``err-<label>.log``,
 ``report-<label>.md``) inside ``muse/``, ``glm/``, ``grok/``, and ``cursor/``.
 ``exec/`` has no manifest; each ``out-`` / ``err-`` / ``report-`` file there
@@ -64,6 +68,14 @@ _UUID = re.compile(
     r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
 )
 _VERDICT_RE = re.compile(r"^(PASS|PARTIAL|BLOCKED|VERDICT: (\w+))")
+#: Mid-text Grok verdict: the token opens on a sentence-ish boundary and
+#: closes on one, so ``.PASS``, ``**PASS**`` and ``verdict: PARTIAL``
+#: match while lowercase prose, hyphenated words, and backticked output
+#: never do.
+_GROK_VERDICT_RE = re.compile(
+    r"(?:^|(?<=[.!?;:\s(\[\"']))\*{0,2}(PASS|PARTIAL|BLOCKED)\*{0,2}(?=$|[\s.!?,;:)\]\"'])"
+)
+_GROK_WORD_RE = re.compile(r"[A-Za-z]+$")
 _OUT_RE = re.compile(r"^out-(.+)\.md$")
 _ERR_RE = re.compile(r"^err-(.+)\.log$")
 _REPORT_RE = re.compile(r"^report-(.+)\.md$")
@@ -95,6 +107,36 @@ def _children_dirs(path, cap):
 
     entries, _listed = list_dir_cached(path, _dir_cache, cap=cap)
     return entries
+
+
+def _nested_tsv_dirs(scratch) -> list:
+    """Single-level child dirs of a session pad (their paths).
+
+    A lead child folder (``grokb/``) holds its own manifest TSV with the
+    logs beside it. Only the TSV check in ``poll`` opens a child: listing
+    names here never reads file contents, and children without a TSV are
+    skipped there, so prompt nests and nested checkouts stay unread.
+    ``None`` (deferred listing) reads as no nested dirs.
+    """
+    try:
+        entries = _children_dirs(scratch, [DIR_LIST_CAP])
+    except Exception:
+        return []
+    if not entries:
+        return []
+    found = []
+    for _name, ent_path, is_file, is_dir in entries:
+        if is_file or not is_dir:
+            continue
+        # A nested checkout is a worktree, never a lead child folder:
+        # nothing under one is opened.
+        try:
+            if os.path.exists(os.path.join(ent_path, ".git")):
+                continue
+        except (OSError, ValueError):
+            continue
+        found.append(ent_path)
+    return found
 
 
 def tier_of(model: str | None) -> str | None:
@@ -142,14 +184,63 @@ def parse_manifest_text(text: str) -> list[dict]:
     return rows
 
 
-def verdict_of(text: str) -> str | None:
-    """First line matching the contract verdict pattern."""
+def verdict_of(text: str, grok_style: bool = False) -> str | None:
+    """First verdict in the text.
+
+    The anchored contract pattern wins wherever it appears; with
+    ``grok_style`` a second pass accepts a Grok-style mid-text verdict
+    (``.PASS``, ``**PASS**`` after narration). Other harnesses keep the
+    anchored contract only, so their narration never gains a verdict.
+    """
     if not text:
         return None
-    for line in text.splitlines():
+    lines = text.splitlines()
+    for line in lines:
         found = _verdict_line(line)
         if found:
             return found
+    if grok_style:
+        for line in lines:
+            found = _grok_verdict_line(line)
+            if found:
+                return found
+    return None
+
+
+def _is_grok_row(source, tier, model) -> bool:
+    """True when the row's report comes from a Grok model.
+
+    The rambling mid-text verdict is a property of Grok reports (Grok
+    Build and cursor-agent alike), so the check reads the model key,
+    with the grok tiers covering a report whose model was never recorded.
+    """
+    from dash.models import model_key
+
+    try:
+        hint = " ".join(str(value or "") for value in (tier, source))
+        key = model_key(model, hint)[1]
+    except Exception:
+        key = ""
+    if isinstance(key, str) and key.startswith("grok"):
+        return True
+    return str(tier or "").strip().lower() in ("grok", "grok-build-47")
+
+
+def _grok_verdict_line(line: str):
+    """Mid-text verdict token on one line, or None.
+
+    An uppercase word directly before the token (``REVIEW PASS``,
+    ``GATE PASS``) quotes another check's remark, never this run's
+    verdict, so it is skipped.
+    """
+    if not line:
+        return None
+    for match in _GROK_VERDICT_RE.finditer(line):
+        head = line[: match.start(1)].rstrip(" *")
+        word = _GROK_WORD_RE.search(head)
+        if word and len(word.group(0)) > 1 and word.group(0).isupper():
+            continue
+        return match.group(1)
     return None
 
 
@@ -206,6 +297,7 @@ def poll(store, cfg, now: float) -> None:
             except OSError:
                 flat.add(scratch)
         pending = []
+        nested_rows = False
         for parent, scratch in pads:
             try:
                 is_flat = os.path.realpath(scratch) in flat
@@ -222,6 +314,44 @@ def poll(store, cfg, now: float) -> None:
                     continue
                 for row in rows:
                     pending.append((parent, scratch, source, directory, default_tier, row, is_flat))
+            if not is_flat:
+                # A lead child folder (e.g. ``grokb/``) holds its own
+                # manifest TSV with the pid file and the logs beside it,
+                # the way a flat run folder does. Children without a TSV
+                # are never opened, so prompt nests and worktree checkouts
+                # stay out.
+                for child in _nested_tsv_dirs(scratch):
+                    for filename, source, directory, default_tier in _MANIFESTS:
+                        path = os.path.join(child, filename)
+                        if not _is_file(path):
+                            continue
+                        try:
+                            rows, left = _load_tsv(path, left)
+                        except OSError as exc:
+                            _log.warning("manifests tsv %s: %s", filename, type(exc).__name__)
+                            continue
+                        for row in rows:
+                            pending.append((parent, child, source, directory, default_tier, row, True))
+                            nested_rows = True
+        if nested_rows:
+            # One row wins per run id: the copy with the newer out file,
+            # so a pad-top row never downgrades the nested copy's file
+            # evidence (status, verdict, byte counts) when both name the
+            # same run. Ties keep pad-top order, the behavior before
+            # nested rows existed. Pads without nested rows skip this, so
+            # their emit order is exactly what it was.
+            winners: dict = {}
+            for item in pending:
+                _parent, _scratch, _source, _directory, _tier, _row, _flat = item
+                rid = _run_id(
+                    _source, _directory, _row["session_uuid"], _parent, _row["label"], _row["started_at"]
+                )
+                prev = winners.get(rid)
+                if prev is None or _out_mtime(item[1], item[3], item[5]["label"]) > _out_mtime(
+                    prev[1], prev[3], prev[5]["label"]
+                ):
+                    winners[rid] = item
+            pending = list(winners.values())
         pending.sort(key=lambda item: -_out_mtime(item[1], item[3], item[5]["label"]))
         for parent, scratch, source, directory, default_tier, row, is_flat in pending:
             try:
@@ -450,11 +580,14 @@ def _emit_files(
 
     verdict = None
     out_settled = out_st is None or out_bytes == 0
+    grok_style = _is_grok_row(source, tier, model)
     if out_st is not None and out_bytes > 0:
-        verdict, out_settled, left = _cached_verdict(out_path, out_st, left, per_file)
+        verdict, out_settled, left = _cached_verdict(
+            out_path, out_st, left, per_file, grok_style=grok_style
+        )
     if verdict is None and out_settled and report_st is not None and report_st.st_size > 0:
         report_verdict, report_settled, left = _cached_verdict(
-            report_path, report_st, left, per_file
+            report_path, report_st, left, per_file, grok_style=grok_style
         )
         if report_settled or report_verdict:
             verdict = report_verdict
@@ -556,9 +689,10 @@ def _emit_files(
     return left
 
 
-def _cached_verdict(path, st, left, per_file):
+def _cached_verdict(path, st, left, per_file, grok_style: bool = False):
     stamp = (st.st_ino, st.st_size, st.st_mtime_ns)
-    cached = _text_cache.get(("v", path))
+    slot = ("v", path, grok_style)
+    cached = _text_cache.get(slot)
     if cached and cached[0] == stamp:
         return cached[1], True, left
     cap = min(SCAN_CAP, per_file)
@@ -570,9 +704,9 @@ def _cached_verdict(path, st, left, per_file):
         _log.warning("manifests read: %s", type(exc).__name__)
         return None, False, left
     left -= n
-    verdict, settled = _scan_verdict(data, st.st_size, cap)
+    verdict, settled = _scan_verdict(data, st.st_size, cap, grok_style=grok_style)
     if settled:
-        _text_cache[("v", path)] = (stamp, verdict)
+        _text_cache[slot] = (stamp, verdict)
     return verdict, settled, left
 
 
@@ -595,7 +729,7 @@ def _cached_err(path, st, left, per_file):
     return sig, nonempty, settled, left
 
 
-def _scan_verdict(data: bytes, size: int, cap: int):
+def _scan_verdict(data: bytes, size: int, cap: int, grok_style: bool = False):
     if not data and size > 0:
         return None, False
     saw_all = len(data) >= size
@@ -607,10 +741,10 @@ def _scan_verdict(data: bytes, size: int, cap: int):
         if nl < 0:
             if saw_all or hit_cap:
                 text = data.decode("utf-8", "replace")
-                return verdict_of(text), True
+                return verdict_of(text, grok_style=grok_style), True
             return None, False
         text = data[:nl].decode("utf-8", "replace")
-    found = verdict_of(text)
+    found = verdict_of(text, grok_style=grok_style)
     if found:
         return found, True
     settled = saw_all or hit_cap or (data.endswith(b"\n") and saw_all)
