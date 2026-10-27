@@ -9,7 +9,7 @@
     {
       "id": "start",
       "col": 0,
-      "title": "First group",
+      "title": "Agree the contract",
       "tasks": [
         {
           "id": "0",
@@ -26,6 +26,18 @@
           "title": "Agree the contract",
           "status": "todo"
         },
+        {
+          "id": "4",
+          "title": "Freeze the old contract",
+          "status": "done"
+        }
+      ]
+    },
+    {
+      "id": "retire",
+      "col": 1,
+      "title": "Retire the old readers",
+      "tasks": [
         {
           "id": "2",
           "title": "Land the read route",
@@ -49,16 +61,16 @@
           "dep_notes": {
             "0": "retire the readers only after the freeze signal"
           }
-        },
-        {
-          "id": "4",
-          "title": "Freeze the old contract",
-          "status": "done"
         }
       ]
     }
   ],
-  "edges": [],
+  "edges": [
+    [
+      "start",
+      "retire"
+    ]
+  ],
   "phases": [
     {
       "name": "Shape",
@@ -118,7 +130,7 @@
     "deferred_tasks": 0,
     "total_tasks": 5,
     "task_edges": 3,
-    "group_edges": 0,
+    "group_edges": 1,
     "columns": [
       {
         "index": 0,
@@ -127,18 +139,20 @@
         "groups": [
           "start"
         ],
-        "tasks": 5,
-        "live_tasks": 5,
-        "visible_chips": 5
+        "tasks": 3,
+        "live_tasks": 3,
+        "visible_chips": 3
       },
       {
         "index": 1,
         "title": "Build",
         "state": "full",
-        "groups": [],
-        "tasks": 0,
-        "live_tasks": 0,
-        "visible_chips": 0
+        "groups": [
+          "retire"
+        ],
+        "tasks": 2,
+        "live_tasks": 2,
+        "visible_chips": 2
       },
       {
         "index": 2,
@@ -154,11 +168,11 @@
     "groups": [
       {
         "id": "start",
-        "title": "First group",
+        "title": "Agree the contract",
         "col": 0,
         "column": "Shape",
         "state": "open",
-        "live_tasks": 5,
+        "live_tasks": 3,
         "deferred_tasks": 0,
         "chips": [
           {
@@ -180,6 +194,31 @@
             "fan_in": 0
           },
           {
+            "id": "4",
+            "label": "4",
+            "tooltip": "4 \u00b7 Freeze the old contract \u00b7 done",
+            "status": "done",
+            "kind": "task",
+            "train": null,
+            "fan_in": 0
+          }
+        ],
+        "shown_done": 1,
+        "hidden_done": 0,
+        "hidden_done_ids": [],
+        "more_token": null,
+        "deferred_token": null
+      },
+      {
+        "id": "retire",
+        "title": "Retire the old readers",
+        "col": 1,
+        "column": "Build",
+        "state": "open",
+        "live_tasks": 2,
+        "deferred_tasks": 0,
+        "chips": [
+          {
             "id": "2",
             "label": "2",
             "tooltip": "2 \u00b7 Land the read route \u00b7 pr \u00b7 waits on 1 \u00b7 PD-3",
@@ -196,18 +235,9 @@
             "kind": "task",
             "train": "T2",
             "fan_in": 0
-          },
-          {
-            "id": "4",
-            "label": "4",
-            "tooltip": "4 \u00b7 Freeze the old contract \u00b7 done",
-            "status": "done",
-            "kind": "task",
-            "train": null,
-            "fan_in": 0
           }
         ],
-        "shown_done": 1,
+        "shown_done": 0,
         "hidden_done": 0,
         "hidden_done_ids": [],
         "more_token": null,
@@ -221,7 +251,7 @@
     "arrows": {
       "mode": "all",
       "task_edges": 3,
-      "group_edges": 0,
+      "group_edges": 1,
       "reason": "3 task deps: arrows all",
       "fan_in": []
     },
@@ -243,11 +273,11 @@
       "tallest": {
         "column": 0,
         "title": "Shape",
-        "tasks": 5
+        "tasks": 3
       },
       "shortest": {
-        "column": 1,
-        "title": "Build",
+        "column": 2,
+        "title": "Prove",
         "tasks": 0
       },
       "ratio": null

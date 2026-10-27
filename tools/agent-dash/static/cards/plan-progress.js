@@ -191,6 +191,44 @@
     function attText(a) { return planAttText(a); }
     var nLive = Object.keys(live).reduce(function (a, k) { return a + live[k].length; }, 0);
     var c = el("div", {class: "card", id: "exec-progress", "data-nav": "Plan progress"}, [el("div", {style: "display:flex;align-items:baseline;gap:10px;flex-wrap:wrap"}, [el("h2", {text: plan.ws + " plan progress" + (nLive ? " · " + nLive + " agent" + (nLive > 1 ? "s" : "") + " working" : "")}), (plan.start_prompt ? copyBtn(plan.start_prompt) : null), el("a", {class: "planbtn", href: planUrl(plan.ws), onclick: function (ev) { ev.preventDefault(); openPlan(plan.ws); }, text: "Open the " + plan.ws + " plan"})].concat(linearHeader(plan, now))), el("p", {class: "sub", text: "Each tile is a section of the plan; sections run in parallel unless an arrow says one waits on another. The pill says where it stands; hover a tile's progress line for the counts, or a chip for what it waits on and unblocks."})]);
+    /* Objective map from the plan frame: title per objective id, the
+       sections serving each one (the group objective field or the
+       objective sections list), and live per-objective progress. Planning
+       tasks never count, exactly as in the progress counts. Without a
+       frame every helper below stays empty. */
+    var frameObjs = ((plan.frame && plan.frame.objectives) || []).filter(function (o) { return o && o.id != null; });
+    var objTitleOf = {};
+    var objSections = {};
+    frameObjs.forEach(function (o) {
+      objTitleOf[o.id] = o.title || o.id;
+      var seen = objSections[o.id] = {};
+      ((o.sections) || []).forEach(function (gid) { if (typeof gid === "string") seen[gid] = 1; });
+    });
+    (plan.groups || []).forEach(function (g) {
+      if (!g || typeof g.objective !== "string" || !objSections[g.objective]) return;
+      objSections[g.objective][g.id] = 1;
+    });
+    var planningIds = {};
+    (plan.groups || []).forEach(function (g) { if (g && g.phase === "planning") (g.tasks || []).forEach(function (t) { if (t && t.id != null) planningIds[t.id] = 1; }); });
+    function groupObjectiveIds(g) {
+      var out = [];
+      Object.keys(objSections).forEach(function (oid) { if (g && objSections[oid][g.id]) out.push(oid); });
+      return out;
+    }
+    function objProgress(oid) {
+      var done = 0, total = 0;
+      (plan.groups || []).forEach(function (g) {
+        if (!g || !objSections[oid] || !objSections[oid][g.id]) return;
+        (g.tasks || []).forEach(function (t) {
+          if (!t || t.id == null || planningIds[t.id]) return;
+          var st = t.status || "todo";
+          if (st === "deferred") return;
+          total++;
+          if (st === "done") done++;
+        });
+      });
+      return {done: done, total: total};
+    }
     /* Always-visible legend, right under the intro line (above the map).
        The old compact row
        lived below the progress bar and the chip rows, and only with a
@@ -228,6 +266,20 @@
     mleg.appendChild(legGroup("Task status", legData.status.map(legStatus)));
     if (legData.families.length) mleg.appendChild(legGroup("Agent family", legData.families.map(legFam)));
     mleg.appendChild(legGroup("Edges", legData.edges.map(legEdge)));
+    /* Objectives row: every objective id, its title and its live progress
+       (done tasks across its sections, scoped exactly like the progress
+       counts). Reads the frame the plan API carries; without one the
+       legend stays as it always was. */
+    if (frameObjs.length) {
+      var oitems = frameObjs.map(function (o) {
+        var p = objProgress(o.id);
+        var label = o.id + " " + (o.title || "") + " · " + p.done + " of " + p.total + " done";
+        return el("span", {class: "mleg-item", role: "listitem", title: label},
+          [el("span", {class: "obj-chip sample", "aria-hidden": "true", text: o.id}),
+           document.createTextNode(o.id + " " + p.done + "/" + p.total)]);
+      });
+      mleg.appendChild(legGroup("Objectives", oitems));
+    }
     c.appendChild(mleg);
     var workingIds = Object.keys(live);
     /* Section per working task, next to the label: the plan section
@@ -265,8 +317,8 @@
     }
     var taskById = {};
     plan.groups.forEach(function (g) { (g.tasks || []).forEach(function (t) { taskById[t.id] = t; }); });
-    var planningIds = {};
-    (plan.groups || []).forEach(function (g) { if (g && g.phase === "planning") (g.tasks || []).forEach(function (t) { if (t && t.id != null) planningIds[t.id] = 1; }); });
+    /* planningIds is built with the objective helpers above, so the legend
+       and the tile chips can read it before the map mounts. */
     /* Chips the layout folds away (hidden done chips, deferred chips) stay
        out of the arrow router until their expander opens. */
     var foldedIds = {};
@@ -396,6 +448,11 @@
       var liveTotal = (g.tasks || []).length - (cnt.moved || 0) - (cnt.deferred || 0);
       var n = el("div", {class: "dnode " + (liveTotal && cnt.done === liveTotal ? "s-done" : (cnt.done + cnt.prog + cnt.pr ? "s-prog" : "")) + (g && g.phase === "planning" ? " is-planning" : "")});
       n.appendChild(el("h4", {text: g.title}));
+      /* Objective chip: which objective this section serves. Hovering shows
+         the objective title; without a frame the tile stays as it was. */
+      groupObjectiveIds(g).forEach(function (oid) {
+        n.appendChild(el("span", {class: "obj-chip", title: objTitleOf[oid] || oid, text: oid}));
+      });
       if (g && g.phase === "planning") n.appendChild(el("span", {class: "planning-tag", text: "Planning"}));
       var gr = 0, gv = 0; (g.tasks || []).forEach(function (t) { var a = att[t.id]; if (a) { gr += a.runs; gv += a.reviews; } });
       var left = liveTotal - cnt.done;

@@ -19,20 +19,6 @@
       "inferred": false,
       "runs": []
     },
-    "2": {
-      "status": "pr",
-      "first_active": null,
-      "done_at": null,
-      "inferred": false,
-      "runs": []
-    },
-    "3": {
-      "status": "wip",
-      "first_active": null,
-      "done_at": null,
-      "inferred": false,
-      "runs": []
-    },
     "4": {
       "status": "done",
       "first_active": 1761978360,
@@ -645,6 +631,20 @@
           "clock": "transcript"
         }
       ]
+    },
+    "2": {
+      "status": "pr",
+      "first_active": null,
+      "done_at": null,
+      "inferred": false,
+      "runs": []
+    },
+    "3": {
+      "status": "wip",
+      "first_active": null,
+      "done_at": null,
+      "inferred": false,
+      "runs": []
     }
   },
   "events": [

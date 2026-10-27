@@ -80,6 +80,7 @@ Size work so waves fan out. Detail and evidence: [orchestration principles](../.
 - **Use workers for the heavy lifting.** Research, drafting, reviews, and patches go to sub-agents; the planner thread decides, unifies, and draws.
 - **Don't keep the owner waiting.** If something can start safely, ship it with a note to the lead rather than chaining one more improvement in front of the owner's start.
 - **Keep bundles private.** Only the tool and the skills are public.
+- **Scoped tests and worktrees in every plan.** Acceptance probes and train gates name explicit test files, never a full-suite gate (`ws validate` flags one as PLAN207); one worktree per lane, removed when its task finishes (`ws gc` at milestones).
 
 ### If you are on Claude Code
 
