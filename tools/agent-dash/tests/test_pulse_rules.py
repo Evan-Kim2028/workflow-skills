@@ -3,7 +3,10 @@
 The classifier (momentumFor) and the bucket folder (pulseHourly) are pure
 functions on window.AdPage, node-driven with no DOM, one fixture per
 class: stuck, slowing, moving, idle, fresh start, plus the ratio
-boundary and the current-hour fraction floor. A second node pass pins
+boundary and the current-hour fraction floor. The drill-down helpers
+are pure too: the phase colour map (pulsePhaseColor/pulsePhaseShares),
+the runs-per-hour fold (pulseFoldRuns) and the milestone tick
+placement (pulseMileTicks). A second node pass pins
 the spec contract: overview-only, section name "pulse".
 """
 import subprocess
@@ -132,6 +135,74 @@ assert.strictEqual(got[1], 0, "missing hours read 0");
 assert.deepStrictEqual(A.pulseHourly(cells, "WS9", H), new Array(24).fill(0), "unknown workstream reads flat");
 assert.deepStrictEqual(A.pulseHourly(null, "WS1", H), new Array(24).fill(0), "no payload reads flat");
 console.log("hourly folder ok");
+''')
+
+    def test_phase_colour_map_stable(self):
+        """The drill-down phase strip paints the same --ph-* tokens as
+        the usage by-phase card: all five phases pinned, unknown reads
+        unclassified, shares in phase order summing to 1."""
+        self._run(r'''
+const phases = ["planning", "execution", "review", "coordination", "unclassified"];
+phases.forEach((ph) => {
+  assert.strictEqual(A.pulsePhaseColor(ph), "var(--ph-" + ph + ")", ph + " colour drifted");
+});
+assert.strictEqual(A.pulsePhaseColor("bogus"), "var(--ph-unclassified)", "unknown phase colour drifted");
+assert.strictEqual(A.pulsePhaseColor(undefined), "var(--ph-unclassified)", "missing phase colour drifted");
+const shares = A.pulsePhaseShares({planning: {tokens: 30}, execution: {tokens: 70}, review: {tokens: 0}});
+assert.deepStrictEqual(shares.cells.map((c) => c.phase), phases, "shares leave phase order");
+assert.strictEqual(shares.total, 100, "shares total");
+assert.ok(Math.abs(shares.cells[0].share - 0.3) < 1e-9 && Math.abs(shares.cells[1].share - 0.7) < 1e-9, "shares split 30/70");
+const empty = A.pulsePhaseShares({});
+assert.strictEqual(empty.total, 0, "empty by_phase total");
+assert.ok(empty.cells.every((c) => c.share === 0), "empty by_phase shares read 0");
+console.log("phase colours ok");
+''')
+
+    def test_fold_runs_cumulative(self):
+        """runs_per_hour rows fold into ascending per-hour buckets:
+        duplicate hours sum, off-hour stamps floor to the hour, junk
+        rows drop, the total covers every bar."""
+        self._run(r'''
+const H = 1700000000 - (1700000000 % 3600);
+const folded = A.pulseFoldRuns([
+  {t: H - 3600 + 5, n: 2},
+  {t: H - 3600 + 3500, n: 3},
+  {t: H, n: 1},
+  {t: "junk", n: 9},
+  {t: H, n: 0},
+  null,
+]);
+assert.deepStrictEqual(folded.hours, [H - 3600, H], "hours ascend");
+assert.deepStrictEqual(folded.counts, [5, 1], "duplicate hours sum");
+assert.strictEqual(folded.total, 6, "total covers every bar");
+assert.deepStrictEqual(A.pulseFoldRuns([]), {hours: [], counts: [], total: 0}, "empty fold");
+assert.deepStrictEqual(A.pulseFoldRuns(null), {hours: [], counts: [], total: 0}, "missing fold");
+console.log("fold ok");
+''')
+
+    def test_milestone_tick_placement(self):
+        """One tick per milestone on the x axis: reached marks keep
+        their first-cross time and draw filled, unreached marks
+        (t null) sit at the axis end hollow — including the unreached
+        100 % — and reached marks outside the window clamp inside."""
+        self._run(r'''
+const ticks = A.pulseMileTicks([
+  {pct: 20, t: 100, done: 2, elapsed: 5, reached: true},
+  {pct: 40, t: 150, done: 4, elapsed: 9, reached: true},
+  {pct: 60, t: null, done: 6, elapsed: null, reached: false},
+  {pct: 80, t: null, done: 8, elapsed: null, reached: false},
+  {pct: 100, t: null, done: 10, elapsed: null, reached: false},
+], 50, 200);
+assert.strictEqual(ticks.length, 5, "one tick per milestone");
+assert.deepStrictEqual(ticks.map((m) => m.pct), [20, 40, 60, 80, 100], "milestone order kept");
+assert.strictEqual(ticks[0].t, 100, "reached mark keeps its time");
+assert.strictEqual(ticks[0].hollow, false, "reached mark draws filled");
+assert.strictEqual(ticks[4].t, 200, "unreached 100 % sits at the axis end");
+assert.strictEqual(ticks[4].hollow, true, "unreached 100 % draws hollow");
+assert.ok(ticks.slice(2).every((m) => m.t === 200 && m.hollow), "every unreached mark sits hollow at the end");
+const clamped = A.pulseMileTicks([{pct: 20, t: 9999, done: 2, elapsed: 1, reached: true}], 50, 200);
+assert.strictEqual(clamped[0].t, 200, "reached mark past the window clamps inside");
+console.log("milestones ok");
 ''')
 
     def test_pulse_spec_contract(self):

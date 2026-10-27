@@ -3467,15 +3467,15 @@ class FinalPolishTests(unittest.TestCase):
         ov = [ident for _, ident in sorted(by_scope.get("overview", []))]
         self.assertEqual(
             ov,
-            ["pulse", "manage", "program", "cards", "phases-all"],
-            "overview order drifted: want pulse first, then manage, program, cards, usage last",
+            ["pulse", "wherego", "manage", "program", "cards", "phases-all"],
+            "overview order drifted: want pulse first, then wherego, manage, program, cards, usage last",
         )
         both_ids = [ident for _, ident in both]
         self.assertEqual(
-            [ident for ident in ["pulse", "running", "plan", "activity", "manage", "program", "cards", "linear", "finished", "phases-all"]
+            [ident for ident in ["pulse", "wherego", "running", "plan", "activity", "manage", "program", "cards", "linear", "finished", "phases-all"]
              if ident in ov or ident in both_ids],
-            ["pulse", "running", "plan", "activity", "manage", "program", "cards", "linear", "finished", "phases-all"],
-            "overview render drifted: want pulse, running, plan, activity, then manage, program, cards, linear, finished, usage last",
+            ["pulse", "wherego", "running", "plan", "activity", "manage", "program", "cards", "linear", "finished", "phases-all"],
+            "overview render drifted: want pulse, wherego, running, plan, activity, then manage, program, cards, linear, finished, usage last",
         )
         ws_only = [ident for _, ident in sorted(by_scope.get("workstream", []))]
         self.assertEqual(ws_only[0], "wshead", "the workstream heading is not the first workstream section")

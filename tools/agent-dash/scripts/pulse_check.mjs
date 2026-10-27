@@ -4,14 +4,20 @@
  * Stands up a TEMP dashboard server (temp state dir, temp workstreams,
  * port 8906, never the live :8765 or the real data root) seeded with
  * three workstreams — WS1 live but gone quiet (stuck), WS2 live and
- * fresh (moving), WS3 quiet with old tokens (idle) — then drives the
+ * fresh (moving) with a ten-task plan (seven done, one undated),
+ * WS3 quiet with old tokens (idle) — then drives the
  * Execution view over the DevTools protocol (stdlib only: global
  * fetch and WebSocket, child_process, no npm installs) and asserts:
  *   - the pulse section is the first [data-sec] on ws=all, with five
  *     KPI cells and three momentum rows ordered stuck, moving, idle;
  *   - no pulse section renders on a workstream tab;
+ *   - drill-down: expanding WS2 survives drawMain() (open set in the
+ *     spec key), the panel paints the progress chart (five milestone
+ *     ticks, two hollow), runs bars, five task-count cells, the
+ *     actions line, the live-agents table and the API's gap footnote;
+ *     the plan-less WS1 panel reads empty, never failed;
  *   - zero console errors throughout, and no horizontal page overflow
- *     at 390 px in either theme.
+ *     at 390 px with two rows expanded.
  *
  * The server child is killed by PID on the way out (never pkill).
  * Exit 0 when every assertion holds, 1 on any mismatch, 2 when Chrome
@@ -217,6 +223,12 @@ for ws, st in (("WS1", "active"), ("WS2", "active"), ("WS3", "planned")):
     d = Path(wsroot) / ws
     d.mkdir(parents=True, exist_ok=True)
     (d / "bundle.json").write_text(json.dumps({"id": ws, "title": "Pulse %s" % ws, "kind": "workstream", "state": st}))
+tasks = [{"id": "WS2.%d" % i, "title": "Pulse task %d" % i, "status": "done" if i <= 7 else "todo"} for i in range(1, 11)]
+plan = {"dag": {"cols": ["Build"], "groups": [{"id": "g", "col": 0, "title": "Build", "tasks": tasks}], "edges": []}, "narrative": {"phases": []}}
+ws2dir = Path(wsroot) / "WS2"
+(ws2dir / "plan.json").write_text(json.dumps(plan))
+hist = [{"ts": now - 20 * 3600 + i * 3 * 3600, "task": "WS2.%d" % i, "from": "todo", "to": "done"} for i in range(1, 7)]
+(ws2dir / "history.jsonl").write_text("\\n".join(json.dumps(r) for r in hist) + "\\n")
 seed = Store(Path(state) / "dash.sqlite")
 seed.upsert_run({
     "run_id": "pulse-check:ws1-live",
@@ -287,6 +299,32 @@ function fail(message) {
 function eq(actual, expected, what) {
   if (actual !== expected) fail(`${what}: want ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`);
 }
+
+/* Drill-down panel snapshot for one workstream: chart ticks and bars,
+   task-count cells, live-agent rows, actions line, gap footnote. */
+const detailState = `(function(ws){
+  var det = document.querySelector('[data-pulse-detail="' + ws + '"]');
+  if (!det) return {open: false};
+  var svg = det.querySelector('svg[data-strip="pulse-prog"]');
+  var miles = svg ? Array.prototype.map.call(svg.querySelectorAll('[data-milestone]'), function(m){
+    return {pct: m.getAttribute('data-milestone'), fill: m.getAttribute('fill')}; }) : null;
+  var bars = svg ? svg.querySelectorAll('rect[data-t]').length : 0;
+  var counts = Array.prototype.map.call(det.querySelectorAll('.pulse-count'), function(c){
+    return [c.getAttribute('data-count'), c.getAttribute('data-v')]; });
+  var agents = Array.prototype.map.call(det.querySelectorAll('.pulse-agent-t tr'), function(tr, i){
+    return i ? tr.textContent : null; }).filter(Boolean);
+  var acts = det.querySelector('.pulse-actions');
+  var muted = det.querySelector('.pulse-prog .pulse-muted');
+  return {open: true, miles, bars, counts, agents,
+    actions: acts ? acts.textContent : null,
+    muted: muted ? muted.textContent : null,
+    gap: (det.querySelector('.pulse-gap') || {}).textContent || null,
+    phase: !!det.querySelector('.pulse-phase .pulse-stack, .pulse-phase .pulse-muted'),
+    legend: det.querySelectorAll('.pulse-legend .lentry').length,
+    chev: (document.querySelector('[data-pulse-row="' + ws + '"]') || {}).textContent || null,
+    expanded: document.querySelector('[data-pulse-row="' + ws + '"]') ?
+      document.querySelector('[data-pulse-row="' + ws + '"]').getAttribute('aria-expanded') : null};
+})`;
 
 /* Pulse section snapshot: first section id, KPI cells, momentum rows. */
 const pulseState = `(function(){
@@ -423,11 +461,51 @@ async function main() {
       if (secs.indexOf("tiles") < 0) fail(`tiles left the workstream tab (full: ${secs.join(",")})`);
     });
 
+    check("drill-down: expand survives drawMain", async () => {
+      await cdp.send("Page.navigate", { url: `${URL}/?view=exec&ws=all` });
+      await waitForLoad(cdp);
+      await waitFor(cdp, `(${pulseState}) && ${pulseState}.rows && ${pulseState}.rows.length === 3`, "pulse rows before expand");
+      await evaluate(cdp, `document.querySelector('[data-pulse-row="WS2"]').click()`);
+      await waitFor(cdp, `(${detailState})("WS2").open === true`, "WS2 detail panel");
+      await evaluate(cdp, `drawMain()`);
+      const st = await waitFor(cdp, `(${detailState})("WS2").open === true && (${detailState})("WS2")`, "WS2 detail after drawMain");
+      eq(st.expanded, "true", "row keeps aria-expanded through a re-render");
+      if (!st.chev || st.chev.indexOf("▾") < 0) fail("open row misses its expanded chevron");
+    });
+
+    check("drill-down: WS2 panel chart, strip and agents", async () => {
+      const st = await waitFor(cdp, `(${detailState})("WS2").miles && (${detailState})("WS2")`, "WS2 progress chart");
+      eq(JSON.stringify(st.miles.map((m) => m.pct)), JSON.stringify(["20", "40", "60", "80", "100"]), `five milestone ticks (got ${JSON.stringify(st.miles)})`);
+      eq(st.miles.filter((m) => m.fill === "var(--surface)").length, 2, `two hollow unreached ticks (got ${JSON.stringify(st.miles)})`);
+      if (!(st.bars >= 1)) fail(`no runs-per-hour bars behind the step line (bars ${st.bars})`);
+      eq(JSON.stringify(st.counts.map((c) => c[0])), JSON.stringify(["todo", "wip", "pr", "done", "deferred"]), "five task-count cells");
+      eq(st.counts.filter((c) => c[0] === "done")[0][1], "7", "seven done tasks from the seeded plan");
+      if (!st.actions || st.actions.indexOf("Open workstream") < 0 || st.actions.indexOf("Plan") < 0) {
+        fail(`actions line misses Open workstream / Plan (got ${st.actions})`);
+      }
+      if (!st.agents.some((a) => a.indexOf("ws2-live") >= 0)) fail(`live-agents table misses ws2-live (got ${st.agents.join(" | ")})`);
+      if (!st.phase) fail("tokens-by-phase strip missing");
+      const prog = await (await fetch(`${URL}/api/ws/progress?ws=WS2`)).json();
+      const wantGap = prog && prog.wsprogress && prog.wsprogress.gap;
+      if (wantGap && st.gap !== wantGap) fail(`gap footnote mismatch: want ${JSON.stringify(wantGap)}, got ${JSON.stringify(st.gap)}`);
+    });
+
+    check("drill-down: plan-less row reads empty, not failed", async () => {
+      /* WS3 has no bundle plan and is outside the example plans map
+         (WS1/WS2/WS7), so /api/ws/progress answers 404. */
+      await evaluate(cdp, `document.querySelector('[data-pulse-row="WS3"]').click()`);
+      const st = await waitFor(cdp, `(${detailState})("WS3").open === true && ((${detailState})("WS3").muted || (${detailState})("WS3").miles) && (${detailState})("WS3")`, "WS3 detail panel");
+      eq(st.miles, null, "no chart without a plan");
+      eq(st.muted, "No plan progress yet.", `plan-less row reads empty (got ${JSON.stringify(st.muted)})`);
+      eq(JSON.stringify(st.agents), "[]", "no live agents on the quiet row");
+    });
+
     check("no horizontal overflow at 390 px", async () => {
       await cdp.send("Emulation.setDeviceMetricsOverride", { width: 390, height: 844, deviceScaleFactor: 1, mobile: true });
       await cdp.send("Page.navigate", { url: `${URL}/?view=exec&ws=all` });
       await waitForLoad(cdp);
       await waitFor(cdp, `(${pulseState}) && ${pulseState}.rows && ${pulseState}.rows.length === 3`, "pulse rows at 390 px");
+      await waitFor(cdp, `(${detailState})("WS2").open === true && (${detailState})("WS3").open === true`, "both drill-down panels survive the reload");
       const sideways = await evaluate(cdp, `document.documentElement.scrollWidth - document.documentElement.clientWidth`);
       if (sideways > 1) fail(`page scrolls sideways at 390 px: overflow ${sideways}px`);
     });

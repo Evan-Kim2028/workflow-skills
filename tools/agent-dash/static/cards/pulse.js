@@ -5,16 +5,24 @@
    workstream, slowest first). No text about state anywhere except the
    momentum glyphs' own title/aria-label text: no banners, toasts or
    notification rows.
-   Reads: state.wss (rows from /api/workstreams), state.snap (counts,
-   totals, prev_24h, running, by_workstream), state.pulseUsage (the
-   per-workstream hour buckets fetched below, cached per minute).
+   Reads: state.wss (rows from /api/workstreams, each with by_phase),
+   state.snap (counts, totals, prev_24h, running, by_workstream),
+   state.pulseUsage (the per-workstream hour buckets fetched below,
+   cached per minute), state.pulseProg (per-workstream /api/ws/progress
+   payloads, fetched lazily on first expand, cached per minute).
    Exports (on window.AdPage, also kept as plain globals): pulseSpec,
    pulseCard, momentumFor (pure classifier, node-tested), PULSE (the one
    thresholds object), pulseHourly (pure bucket folder, node-tested),
-   pulseWsKey, pulseEnsure.
-   Needs: el, api, keyOf, tokTotal, fmtN, fmtUsd, ago, niceMax, planSum,
-   progressFor, shown, showTip, hideTip (plain globals read at call time);
-   window.AdPage/ADM/ADC, DashNav, secCache, drawMain, state. */
+   pulsePhaseColor, pulsePhaseShares, pulseFoldRuns, pulseMileTicks
+   (pure drill-down helpers, node-tested), pulseWsKey, pulseEnsure,
+   pulseProgEnsure, pulseOpenRows, pulseRowOpen.
+   Needs: el, s, api, keyOf, tokTotal, fmtN, fmtUsd, fmtDur, fmtDate,
+   ago, niceMax, planSum, progressFor, shown, showTip, hideTip, axes,
+   timeTicks, CW, progStep, progPctFmt, progStepRows, progMileRows,
+   progTakeaway, progBest, progBestElapsed, openPlan, planLinear
+   (plain globals read at call time);
+   window.AdPage/ADM/ADC, AdPage.wsColor, DashNav, secCache, drawMain,
+   state. */
 (function (global) {
   "use strict";
 
@@ -121,6 +129,65 @@
     return out;
   }
 
+  /* Drill-down band colours: the same --ph-* design tokens the usage
+     by-phase card paints (static/cards/phases.js PHASE_COLOR), pinned
+     here so the detail strip and that card never drift apart. Pure:
+     no DOM, no state. */
+  var PULSE_PHASES = ["planning", "execution", "review", "coordination", "unclassified"];
+  function pulsePhaseColor(phase) {
+    return "var(--ph-" + (PULSE_PHASES.indexOf(phase) >= 0 ? phase : "unclassified") + ")";
+  }
+
+  /* Pure shares for the tokens-by-phase stacked bar: [{phase, value,
+     share}] in PULSE_PHASES order over the by_phase row's token
+     counts ({phase: {tokens}}); zero-total reads every share 0. */
+  function pulsePhaseShares(byPhase) {
+    var cells = PULSE_PHASES.map(function (ph) {
+      var cell = (byPhase || {})[ph] || {};
+      var v = +cell.tokens || 0;
+      return {phase: ph, value: isFinite(v) && v > 0 ? v : 0, share: 0};
+    });
+    var total = 0, i;
+    for (i = 0; i < cells.length; i++) total += cells[i].value;
+    if (total > 0) for (i = 0; i < cells.length; i++) cells[i].share = cells[i].value / total;
+    return {cells: cells, total: total};
+  }
+
+  /* Pure fold of runs_per_hour rows ([{t, n}]) into per-hour buckets:
+     duplicate hours sum, hours sort ascending, {hours, counts, total}.
+     The chart draws one faint bar per bucket on its own scale. */
+  function pulseFoldRuns(rows) {
+    var byH = {}, i;
+    (rows || []).forEach(function (r) {
+      if (!r) return;
+      var t = +r.t, n = +r.n;
+      if (!isFinite(t) || !(n > 0)) return;
+      var h = Math.floor(t / 3600) * 3600;
+      byH[h] = (byH[h] || 0) + n;
+    });
+    var hours = Object.keys(byH).map(Number).sort(function (a, b) { return a - b; });
+    var counts = hours.map(function (h) { return byH[h]; });
+    var total = 0;
+    for (i = 0; i < counts.length; i++) total += counts[i];
+    return {hours: hours, counts: counts, total: total};
+  }
+
+  /* Pure milestone tick placement for the detail chart: one tick per
+     20/40/60/80/100 % mark on the x axis. Reached marks sit at their
+     first-cross time (clamped into [from, to]) and draw filled;
+     unreached marks (t null) sit at the axis end and draw hollow, so
+     the unreached 100 % always reads as one hollow tick at the right. */
+  function pulseMileTicks(milestones, from, to) {
+    from = +from; to = +to;
+    if (!isFinite(from) || !isFinite(to) || !(to > from)) { from = 0; to = 1; }
+    return (milestones || []).map(function (m) {
+      m = m || {};
+      var reached = !!m.reached && isFinite(+m.t);
+      var t = reached ? Math.max(from, Math.min(to, +m.t)) : to;
+      return {pct: m.pct, t: t, done: +m.done || 0, elapsed: +m.elapsed || 0, reached: reached, hollow: !reached};
+    });
+  }
+
   /* Tool (live_by_tool key) to entity family, the same mapping the tiles
      use so the KPI bar and the agent dots agree. */
   var TOOL_FAM = {grok: "cursor", muse: "muse", glm: "glm", claude: "claude", deepseek: "deepseek", beam: "beam", codex: "codex", commandcode: "commandcode", other: "other"};
@@ -198,6 +265,92 @@
       try { delete secCache.pulse; } catch (e) {}
       if (typeof drawMain === "function") drawMain();
     });
+  }
+
+  /* Drill-down open rows: the set of expanded workstream ids, kept in
+     sessionStorage per scope like the disclosure helper (Running now),
+     so several rows may stay open at once and expands survive
+     re-renders. Pulse renders on the overview only, so the scope is
+     always "all". Guarded: private mode falls back to closed. */
+  var PULSE_ROWS_KEY = "agent-dash-pulse:v1:rows:all";
+  var PULSE_PROG_TTL_MS = 60000;
+  function pulseOpenRows() {
+    try {
+      var raw = window.sessionStorage.getItem(PULSE_ROWS_KEY);
+      if (!raw) return [];
+      var list = JSON.parse(raw);
+      return Array.isArray(list) ? list.filter(function (w) { return typeof w === "string" && w; }) : [];
+    } catch (e) { return []; }
+  }
+  function pulseRowOpen(ws) { return pulseOpenRows().indexOf(ws) >= 0; }
+  function pulseSetRow(ws, open) {
+    var rows = pulseOpenRows(), i = rows.indexOf(ws);
+    if (open && i < 0) rows.push(ws);
+    else if (!open && i >= 0) rows.splice(i, 1);
+    try {
+      if (rows.length) window.sessionStorage.setItem(PULSE_ROWS_KEY, JSON.stringify(rows));
+      else window.sessionStorage.removeItem(PULSE_ROWS_KEY);
+    } catch (e) {}
+  }
+  /* Spec-key half of the open set: sorted ids joined, so an expand or
+     collapse rebuilds the section once and stream ticks keep it. */
+  function pulseOpenKey() { return pulseOpenRows().slice().sort().join(","); }
+
+  /* Per-workstream progress payloads, fetched lazily on first expand
+     and cached per minute (state.pulseProg[ws] = {data|error, at}).
+     Arrival fills open panels in place (no focus steal); the spec key
+     below carries the stamps so stream ticks keep the panels too. */
+  var pulseProgInflight = {};
+  function pulseProgGet(ws) {
+    try {
+      var c = state.pulseProg || {};
+      return c[ws] || null;
+    } catch (e) { return null; }
+  }
+  function pulseProgStamps() {
+    var c = null;
+    try { c = state.pulseProg || {}; } catch (e) { c = {}; }
+    return Object.keys(c).sort().map(function (ws) {
+      var at = 0;
+      try { at = Math.floor(((c[ws] && c[ws].at) || 0) / 60000); } catch (e) { at = 0; }
+      return ws + "@" + at;
+    }).join(",");
+  }
+  function pulseProgEnsure(ws) {
+    if (!ws || typeof state === "undefined" || typeof api !== "function") return;
+    var hit = pulseProgGet(ws);
+    if (hit && hit.data && (Date.now() - (hit.at || 0)) < PULSE_PROG_TTL_MS) return;
+    if (pulseProgInflight[ws]) return;
+    pulseProgInflight[ws] = true;
+    api("/api/ws/progress", {ws: ws}).then(function (j) {
+      delete pulseProgInflight[ws];
+      if (typeof state === "undefined") return;
+      state.pulseProg = state.pulseProg || {};
+      state.pulseProg[ws] = {data: (j && (j.wsprogress || j)) || null, at: Date.now()};
+      pulseFillDetail(ws);
+    }, function (err) {
+      delete pulseProgInflight[ws];
+      if (typeof state === "undefined") return;
+      state.pulseProg = state.pulseProg || {};
+      /* A 404 is a workstream with no plan (the server says so), not a
+         broken fetch: the panel reads empty, never failed. GET api()
+         rejects with a bare Error("404"), so the message counts too. */
+      var noPlan = err && (err.status === 404 || err.code === "plan_not_found" ||
+        String((err && err.message) || "") === "404");
+      if (!state.pulseProg[ws]) state.pulseProg[ws] = noPlan ? {nodata: true, at: Date.now()} : {error: true, at: Date.now()};
+      pulseFillDetail(ws);
+    });
+  }
+  /* In-place fill after the lazy fetch lands: rebuilds only the open
+     panel's body, so the row button keeps focus and nothing scrolls. */
+  function pulseFillDetail(ws) {
+    try {
+      var host = document.querySelector('[data-pulse-detail="' + ws + '"]');
+      if (!host) return;
+      var body = pulseDetailBody(ws);
+      host.innerHTML = "";
+      if (body) host.appendChild(body);
+    } catch (e) {}
   }
 
   function wsStateOf(w) {
@@ -446,12 +599,22 @@
     var scroll = el("div", {class: "pulse-scroll"});
     var grid = el("div", {class: "pulse-grid", role: "list", "aria-label": takeaway});
     var head = el("div", {class: "pulse-row pulse-head", "aria-hidden": "true"});
-    ["", "", "Workstream", "Plan", "Tokens / h", "Agents", "Active"].forEach(function (t) {
+    ["", "", "", "Workstream", "Plan", "Tokens / h", "Agents", "Active"].forEach(function (t) {
       head.appendChild(el("span", {class: "pulse-cell h", text: t}));
     });
     grid.appendChild(head);
+    var openSet = pulseOpenRows();
     rows.forEach(function (r) {
-      grid.appendChild(pulseRow(r, rowMax, nowS));
+      var item = el("div", {class: "pulse-item", "data-pulse-item": r.w.ws});
+      item.appendChild(pulseRow(r, rowMax, nowS));
+      if (openSet.indexOf(r.w.ws) >= 0) {
+        var det = el("div", {class: "pulse-detail", role: "region", "aria-label": r.w.ws + " detail", "data-pulse-detail": r.w.ws});
+        var body = pulseDetailBody(r.w.ws, snap);
+        if (body) det.appendChild(body);
+        item.appendChild(det);
+        pulseProgEnsure(r.w.ws);
+      }
+      grid.appendChild(item);
     });
     if (!rows.length) grid.appendChild(el("div", {class: "pulse-empty", text: "No open workstreams in the last 24 h."}));
     scroll.appendChild(grid);
@@ -459,16 +622,288 @@
     return c;
   }
 
+  /* Workstream colour for the drill-down panels: the shared wscolors
+     helper (static/core/wscolors.js) with the old pulse blue fallback. */
+  function pulseWsColor(ws) {
+    try {
+      if (global.AdPage && typeof AdPage.wsColor === "function") return AdPage.wsColor(ws, (typeof state !== "undefined") ? state : null);
+    } catch (e) {}
+    return "var(--s1)";
+  }
+  function pulseFmtDate(t) {
+    try { return fmtDate(t); } catch (e) { return String(t); }
+  }
+  function pulseFmtDur(s) {
+    try { return fmtDur(s); } catch (e) { return String(s); }
+  }
+  function pulseFmtModel(r) {
+    try {
+      if (typeof fullName === "function") return fullName(r.model || (typeof tierKey === "function" ? tierKey(r) : ""));
+    } catch (e) {}
+    return r.model || "";
+  }
+  function pulseTokOf(r) {
+    try {
+      if (typeof tokTotal === "function") return tokTotal(r.tokens || {});
+    } catch (e) {}
+    var t = r.tokens || {};
+    return (+t.input || 0) + (+t.output || 0) + (+t.cache_read || 0) + (+t.cache_write || 0);
+  }
+
+  /* The workstream row plus its live runs for a detail panel, from the
+     page workstream list and the snapshot (override for render, page
+     state for the in-place fill). Null when the row is gone. */
+  function pulseDetailContext(ws, snap) {
+    var w = null, i, list = [];
+    try { list = (typeof state !== "undefined" && state.wss) || []; } catch (e) { list = []; }
+    for (i = 0; i < list.length; i++) {
+      if (list[i] && list[i].ws === ws) { w = list[i]; break; }
+    }
+    if (!w) return null;
+    var runs = [];
+    try { runs = ((snap && snap.running) || (state.snap && state.snap.running)) || []; } catch (e) { runs = []; }
+    var mine = runs.filter(function (r) { return r && (r.workstream || r.ws) === ws; });
+    return {w: w, running: mine};
+  }
+
+  /* 1. Actions line: Open workstream (the old row-click target),
+     Plan, and the Linear link when the plan carries one (the same
+     planLinear lookup the workstream cards use). */
+  function pulseDetailActions(w) {
+    var acts = el("div", {class: "pulse-actions"});
+    var bo = el("button", {type: "button", text: "Open workstream"});
+    bo.addEventListener("click", function () {
+      if (window.DashNav && typeof DashNav.openExec === "function") DashNav.openExec(w.ws);
+    });
+    acts.appendChild(bo);
+    var bp = el("button", {type: "button", text: "Plan"});
+    bp.addEventListener("click", function () {
+      try { if (typeof openPlan === "function") openPlan(w.ws); } catch (e) {}
+    });
+    acts.appendChild(bp);
+    var lk = null;
+    try { lk = (typeof planLinear !== "undefined" && planLinear && planLinear[w.ws]) || null; } catch (e) { lk = null; }
+    if (lk && lk.url) acts.appendChild(el("a", {class: "linear-link", href: lk.url, target: "_blank", rel: "noopener", "aria-label": "Open " + (w.name || w.ws) + " in Linear", text: "Linear \u2197"}));
+    return acts;
+  }
+
+  /* Percent of tasks to a y pixel on a 0-100% plot (the actProgY rule,
+     local so the panel never depends on the activity card loading). */
+  function pulsePctY(pct, T, ph) {
+    var v = Math.max(0, Math.min(100, +pct || 0));
+    return T + ph - v / 100 * ph;
+  }
+  function pulseR1(x) { return Math.round(x * 10) / 10; }
+
+  /* 2. Progress over time for one workstream: done as a step line in
+     the workstream colour, milestones as ticks on the x axis (reached
+     filled, unreached hollow at the axis end), runs_per_hour as faint
+     bars behind on their own scale. A gap string reads as one muted
+     footnote under the chart. Not separable from the burn-up card:
+     that card paints project UTC-day buckets from /api/project/burnup
+     with its own tabs and legend, while this paints one workstream's
+     /api/ws/progress step points — so the smaller chart below reuses
+     only the shared drawing pair (axes/timeTicks) and the progress
+     step helpers (progStep and friends). */
+  function pulseProgChart(ws, p) {
+    var host = el("div", {class: "pulse-prog-chart"});
+    var total = Math.max(1, (p && p.total) || 0);
+    var pts = (p && p.points) || [];
+    if (!p || !(p.total > 0) || !pts.length) {
+      host.appendChild(el("div", {class: "pulse-muted", text: "No plan progress yet."}));
+      return host;
+    }
+    var nowS = Date.now() / 1000;
+    var from = +p.start || pts[0].t;
+    var to = Math.max(+p.now || 0, +p.end || 0, nowS, from + 1);
+    var W = 640, H = 220, L = 46, R = 8, T = 10, Bm = 52;
+    try { if (typeof CW === "function") W = Math.max(560, CW()); } catch (e) {}
+    var pw = W - L - R, ph = H - T - Bm;
+    var X = function (t) { return L + pw * ((+t - from) / Math.max(1, to - from)); };
+    var Y = function (pct) { return pulsePctY(pct, T, ph); };
+    var color = pulseWsColor(ws);
+    var takeaway = ws + " progress over time";
+    try {
+      if (typeof progTakeaway === "function") takeaway = progTakeaway(p.done, p.total, p.pct || 0, (typeof progBest === "function" ? progBest(p) : null), (typeof progBestElapsed === "function" ? progBestElapsed(p) : null), p.runs_total || 0);
+    } catch (e) {}
+    var svg = s("svg", {viewBox: "0 0 " + W + " " + H, width: W, height: H, style: "display:block;max-width:100%", role: "img", "data-strip": "pulse-prog", "data-ws": ws, "aria-label": takeaway});
+    /* Runs bars first (behind): one faint bar per folded hour on its
+       own scale, peak named in the Accessible takeaway above. */
+    var fold = pulseFoldRuns(p.runs_per_hour);
+    var runPeak = 0, i;
+    for (i = 0; i < fold.counts.length; i++) { if (fold.counts[i] > runPeak) runPeak = fold.counts[i]; }
+    if (runPeak > 0) {
+      var bw = 3;
+      if (fold.hours.length > 1) bw = Math.max(2, Math.min(28, (X(fold.hours[1]) - X(fold.hours[0])) - 2));
+      else bw = Math.max(2, Math.min(28, pw / 24 - 2));
+      fold.hours.forEach(function (h, hi) {
+        var bh = ph * fold.counts[hi] / runPeak;
+        var bar = s("rect", {x: pulseR1(X(h) - bw / 2), y: pulseR1(T + ph - bh), width: pulseR1(bw), height: Math.max(pulseR1(bh), 0.4), fill: "var(--s2)", opacity: ".22", "data-t": String(h), "data-v": String(fold.counts[hi])});
+        bar.addEventListener("mousemove", function (ev) {
+          try {
+            if (typeof showTip === "function" && typeof progBarRows === "function") showTip(ev, pulseFmtDate(h), progBarRows(fold.counts[hi]));
+          } catch (e) {}
+        });
+        bar.addEventListener("mouseleave", function () { try { if (typeof hideTip === "function") hideTip(); } catch (e) {} });
+        svg.appendChild(bar);
+      });
+    }
+    var doneOf = function (pt) { return (+pt.done || 0) / total * 100; };
+    if (typeof progStep === "function") {
+      var line = progStep({L: L}, X, Y, pts, doneOf);
+      var first = pts[0], last = pts[pts.length - 1];
+      svg.appendChild(s("path", {d: line + " L" + pulseR1(X(last.t)) + "," + pulseR1(T + ph) + " L" + pulseR1(X(first.t)) + "," + pulseR1(T + ph) + " Z", fill: color, opacity: ".12"}));
+      svg.appendChild(s("path", {d: line, fill: "none", stroke: color, "stroke-width": "2.5"}));
+    }
+    pts.forEach(function (pt) {
+      var dot = s("circle", {cx: pulseR1(X(pt.t)), cy: pulseR1(Y(doneOf(pt))), r: "2.6", fill: color, "data-t": String(pt.t), "data-v": String(pt.done)});
+      dot.addEventListener("mousemove", function (ev) {
+        try { if (typeof showTip === "function" && typeof progStepRows === "function") showTip(ev, pulseFmtDate(pt.t), progStepRows(pt.done, total, pt.prog || 0)); } catch (e) {}
+      });
+      dot.addEventListener("mouseleave", function () { try { if (typeof hideTip === "function") hideTip(); } catch (e) {} });
+      svg.appendChild(dot);
+    });
+    /* Milestone ticks on the x axis: reached ones filled at their
+       first-cross time, unreached ones hollow at the axis end. */
+    var ticks = pulseMileTicks(p.milestones, from, to);
+    var yb = T + ph;
+    ticks.forEach(function (m) {
+      var x = pulseR1(X(m.t));
+      svg.appendChild(s("line", {x1: x, x2: x, y1: yb, y2: yb + 6, stroke: m.reached ? color : "var(--muted)", "stroke-width": "2"}));
+      var dot = s("circle", {cx: x, cy: yb + 11, r: "4", fill: m.reached ? color : "var(--surface)", stroke: m.reached ? color : "var(--muted)", "stroke-width": "1.5", "data-milestone": String(m.pct), "data-t": String(Math.round(m.t)), "data-v": String(m.done)});
+      if (m.reached) dot.addEventListener("mousemove", function (ev) {
+        try { if (typeof showTip === "function" && typeof progMileRows === "function") showTip(ev, pulseFmtDate(m.t) + " — " + m.pct + "% first reached", progMileRows(m.done, total, m.elapsed)); } catch (e) {}
+      });
+      dot.addEventListener("mouseleave", function () { try { if (typeof hideTip === "function") hideTip(); } catch (e) {} });
+      svg.appendChild(dot);
+      var lab = s("text", {x: Math.min(x + 7, L + pw - 4), y: yb + 15, class: "plab"});
+      lab.textContent = m.pct + "%";
+      svg.appendChild(lab);
+    });
+    try {
+      if (typeof axes === "function" && typeof timeTicks === "function") {
+        var xt = timeTicks(from, to, X, Math.max(2, Math.floor(pw / 150)));
+        var yFmt = (typeof progPctFmt === "function") ? progPctFmt : function (v) { return Math.round(v) + "%"; };
+        var axg = axes(svg, {L: L, T: T, pw: pw, ph: ph, yMax: 100, yTicks: 4, yFmt: yFmt, xTicks: xt, yTitle: "% of tasks", xTitle: "time"});
+        svg.insertBefore(axg, svg.firstChild);
+      }
+    } catch (e) {}
+    host.appendChild(svg);
+    if (p.gap) host.appendChild(el("p", {class: "pulse-gap", text: p.gap}));
+    return host;
+  }
+
+  /* 3. Three-part strip: tokens by phase (one stacked bar with legend),
+     task counts as number cells, live agents as a compact table. */
+  function pulseDetailStrip(w, running, prog) {
+    var strip = el("div", {class: "pulse-strip"});
+    /* Tokens by phase from the /api/workstreams row's by_phase. */
+    var phw = el("div", {class: "pulse-phase"});
+    phw.appendChild(el("h4", {text: "Tokens by phase"}));
+    var shares = pulsePhaseShares(w.by_phase);
+    if (shares.total > 0) {
+      var segs = shares.cells.map(function (c) {
+        var word = c.phase === "unclassified" ? "unclassified" : c.phase;
+        return [pulsePhaseColor(c.phase), c.value, word + " " + fmtKpi(c.value)];
+      });
+      phw.appendChild(pulseStack(segs, shares.total, "Lifetime tokens by kind of work: " + segs.map(function (sg) { return sg[2]; }).join(", ")));
+      var lg = el("div", {class: "pulse-legend"});
+      shares.cells.forEach(function (c) {
+        if (!(c.value > 0)) return;
+        var sw = el("i", {class: "sw"});
+        sw.style.background = pulsePhaseColor(c.phase);
+        lg.appendChild(el("span", {class: "lentry", "data-key": c.phase, "data-v": String(c.value), title: c.phase + " " + fmtKpi(c.value) + " tokens"}, [sw, el("span", {class: "lname", text: c.phase}), el("span", {class: "lv", text: fmtKpi(c.value)})]));
+      });
+      phw.appendChild(lg);
+    } else {
+      phw.appendChild(el("div", {class: "pulse-muted", text: "no tokens yet"}));
+    }
+    strip.appendChild(phw);
+    /* Task counts from the progress payload (plan statuses), falling
+       back to the plan progress the row already carries. */
+    var counts = (prog && prog.counts) || null;
+    if (!counts) {
+      try {
+        var pr = (typeof progressFor === "function") ? progressFor(w.ws) : null;
+        counts = (pr && pr.counts) || {};
+      } catch (e) { counts = {}; }
+    }
+    var ctw = el("div", {class: "pulse-counts"});
+    ctw.appendChild(el("h4", {text: "Tasks"}));
+    var cells = el("div", {class: "pulse-count-cells"});
+    [["todo", "To do"], ["wip", "Doing"], ["pr", "In review"], ["done", "Done"], ["deferred", "Deferred"]].forEach(function (kv) {
+      var n = (counts && +counts[kv[0]]) || 0;
+      cells.appendChild(el("div", {class: "pulse-count", "data-count": kv[0], "data-v": String(n)}, [
+        el("b", {text: fmtKpi(n)}),
+        el("span", {text: kv[1]})
+      ]));
+    });
+    ctw.appendChild(cells);
+    strip.appendChild(ctw);
+    /* Live agents from the snapshot's running rows for this workstream. */
+    var agw = el("div", {class: "pulse-agents"});
+    agw.appendChild(el("h4", {text: "Live agents (" + running.length + ")"}));
+    if (!running.length) {
+      agw.appendChild(el("div", {class: "pulse-muted", text: "no live agents"}));
+    } else {
+      var table = el("table", {class: "pulse-agent-t", "aria-label": "Live agents on " + w.ws});
+      var head = el("tr", {});
+      ["", "Label", "Model", "Elapsed", "Tokens"].forEach(function (t) {
+        head.appendChild(el("th", {text: t}));
+      });
+      table.appendChild(head);
+      running.forEach(function (r) {
+        var tr = (r && r.stalled) ? el("tr", {class: "is-stalled"}) : el("tr", {});
+        var dotc = el("td", {class: "c-dot"});
+        if (r && r.stalled) dotc.appendChild(el("span", {class: "pulse-stall", title: "stalled"}));
+        tr.appendChild(dotc);
+        tr.appendChild(el("td", {class: "c-label", text: (r && (r.label || r.run_id)) || ""}));
+        tr.appendChild(el("td", {class: "c-model", text: pulseFmtModel(r || {})}));
+        tr.appendChild(el("td", {class: "c-num", text: pulseFmtDur((r && r.elapsed_s) || 0)}));
+        tr.appendChild(el("td", {class: "c-num", text: fmtKpi(pulseTokOf(r || {}))}));
+        table.appendChild(tr);
+      });
+      agw.appendChild(table);
+    }
+    strip.appendChild(agw);
+    return strip;
+  }
+
+  function pulseDetailBody(ws, snap) {
+    var ctx = pulseDetailContext(ws, snap);
+    if (!ctx) return null;
+    var body = el("div", {class: "pulse-detail-body"});
+    body.appendChild(pulseDetailActions(ctx.w));
+    var hit = pulseProgGet(ws);
+    var chartHost = el("div", {class: "pulse-prog"});
+    if (hit && hit.data) chartHost.appendChild(pulseProgChart(ws, hit.data));
+    else if (hit && hit.nodata) chartHost.appendChild(el("div", {class: "pulse-muted", text: "No plan progress yet."}));
+    else if (hit && hit.error) chartHost.appendChild(el("div", {class: "pulse-muted", text: "request failed"}));
+    else chartHost.appendChild(el("div", {class: "skel", "aria-hidden": "true"}));
+    body.appendChild(chartHost);
+    body.appendChild(pulseDetailStrip(ctx.w, ctx.running, hit && hit.data));
+    return body;
+  }
+
   function pulseRow(r, rowMax, nowS) {
     var w = r.w, m = MOMENT[r.cls];
+    var open = pulseRowOpen(w.ws);
     var row = el("button", {
       type: "button",
       class: "pulse-row m-" + r.cls,
       role: "listitem",
-      "aria-label": w.ws + " " + (w.name || "") + ", " + m.word + ", " + r.live + " live agents",
+      "aria-label": w.ws + " " + (w.name || "") + ", " + m.word + ", " + r.live + " live agents" + (open ? ", expanded" : ""),
+      "aria-expanded": open ? "true" : "false",
       "data-ws": w.ws,
-      "data-m": r.cls
+      "data-m": r.cls,
+      "data-pulse-row": w.ws
     });
+    row.appendChild(el("span", {
+      class: "pulse-chev",
+      text: open ? "\u25BE" : "\u25B8",
+      "aria-hidden": "true",
+      title: open ? "Collapse " + w.ws + " detail" : "Expand " + w.ws + " detail"
+    }));
     var rail = el("span", {class: "pulse-cell rail"});
     rail.style.background = m.color;
     row.appendChild(rail);
@@ -535,23 +970,37 @@
       else if (idleFor > PULSE.WARN_IDLE_S) ageCls += " warn";
     }
     row.appendChild(el("span", {class: ageCls, text: ageS || "\u2014"}));
+    /* Row click (Enter/Space fire click on the real button) toggles
+       the in-place detail panel; opening the workstream tab moved to
+       the panel's own Open workstream action. The open set lives in
+       the spec key, so the redraw below (and every stream tick) keeps
+       the panel; focus returns to the rebuilt row. */
     row.addEventListener("click", function () {
-      if (window.DashNav && typeof DashNav.openExec === "function") DashNav.openExec(w.ws);
+      pulseSetRow(w.ws, !pulseRowOpen(w.ws));
+      try { delete secCache.pulse; } catch (e) {}
+      try { if (typeof drawMain === "function") drawMain(); } catch (e2) {}
+      try {
+        var next = document.querySelector('[data-pulse-row="' + w.ws + '"]');
+        if (next && next.focus) next.focus();
+      } catch (e3) {}
     });
     return row;
   }
 
-  /* Overview-only spec. The key carries the payload stamp, so the usage
-     fetch landing redraws this section once; pulseEnsure (same tick path
-     as the activity progress payload) starts the fetch. */
+  /* Overview-only spec. The key carries the payload stamp (so the
+     usage fetch landing redraws this section once), the open-row set
+     (so expands survive stream ticks the way Running now does) and
+     the per-workstream progress stamps (so a lazy arrival keeps its
+     panel); pulseEnsure (same tick path as the activity progress
+     payload) starts the usage fetch. */
   function pulseSpec(st, snap) {
     if (!st || st.ws !== "all") return null;
     if (typeof pulseEnsure === "function") pulseEnsure();
     return ["pulse",
       keyOf([snap.counts, snap.totals, snap.prev_24h, snap.last_activity,
-        (state.wss || []).map(function (w) { return [w.ws, w.live_agents, w.tokens, w.last_activity, w.state, w.name]; }),
-        (snap.running || []).map(function (r) { return [r.run_id, r.workstream, r.stalled, r.label]; }),
-        planSum, pulseWsKey(), st.snapError]),
+        (state.wss || []).map(function (w) { return [w.ws, w.live_agents, w.tokens, w.last_activity, w.state, w.name, w.by_phase]; }),
+        (snap.running || []).map(function (r) { return [r.run_id, r.workstream, r.stalled, r.label, r.elapsed_s, r.tokens, r.model]; }),
+        planSum, pulseWsKey(), pulseOpenKey(), pulseProgStamps(), st.snapError]),
       function () { return pulseCard(snap); }, ""];
   }
 
@@ -559,15 +1008,29 @@
   AdPage.PULSE = PULSE;
   AdPage.momentumFor = momentumFor;
   AdPage.pulseHourly = pulseHourly;
+  AdPage.pulsePhaseColor = pulsePhaseColor;
+  AdPage.pulsePhaseShares = pulsePhaseShares;
+  AdPage.pulseFoldRuns = pulseFoldRuns;
+  AdPage.pulseMileTicks = pulseMileTicks;
   AdPage.pulseWsKey = pulseWsKey;
   AdPage.pulseEnsure = pulseEnsure;
+  AdPage.pulseProgEnsure = pulseProgEnsure;
+  AdPage.pulseOpenRows = pulseOpenRows;
+  AdPage.pulseRowOpen = pulseRowOpen;
   AdPage.pulseSpec = pulseSpec;
   AdPage.pulseCard = pulseCard;
   global.PULSE = PULSE;
   global.momentumFor = momentumFor;
   global.pulseHourly = pulseHourly;
+  global.pulsePhaseColor = pulsePhaseColor;
+  global.pulsePhaseShares = pulsePhaseShares;
+  global.pulseFoldRuns = pulseFoldRuns;
+  global.pulseMileTicks = pulseMileTicks;
   global.pulseWsKey = pulseWsKey;
   global.pulseEnsure = pulseEnsure;
+  global.pulseProgEnsure = pulseProgEnsure;
+  global.pulseOpenRows = pulseOpenRows;
+  global.pulseRowOpen = pulseRowOpen;
   global.pulseSpec = pulseSpec;
   global.pulseCard = pulseCard;
   AdPage.cards = AdPage.cards || {};

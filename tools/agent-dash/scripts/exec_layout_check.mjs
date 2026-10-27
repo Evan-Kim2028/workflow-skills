@@ -360,12 +360,12 @@ async function main() {
     const sectionOrder = `Array.prototype.map.call(
       document.querySelectorAll('#main [data-sec]'), function(s){ return s.getAttribute('data-sec'); })`;
 
-    check("overview order: pulse leads, running, activity, manage, program, cards, finished, usage last", async () => {
+    check("overview order: pulse leads, wherego, running, activity, manage, program, cards, finished, usage last", async () => {
       await cdp.send("Page.navigate", { url: `${URL}/?view=exec&ws=all` });
       await waitForLoad(cdp);
       await waitFor(cdp, `(${runningState}) && ${runningState}.h2.indexOf('· 12') >= 0`, "running card with 12 agents");
       const order = await evaluate(cdp, sectionOrder);
-      eq(JSON.stringify(order), JSON.stringify(["pulse", "running", "activity", "manage", "program", "cards", "finished", "phases-all"]),
+      eq(JSON.stringify(order), JSON.stringify(["pulse", "wherego", "running", "activity", "manage", "program", "cards", "finished", "phases-all"]),
         `overview order (full: ${order.join(",")})`);
       const nav = await evaluate(cdp, `document.querySelector('#exec-activity') ? document.querySelector('#exec-activity').getAttribute('data-nav') : null`);
       eq(nav, "Activity over time", "stack data-nav label");

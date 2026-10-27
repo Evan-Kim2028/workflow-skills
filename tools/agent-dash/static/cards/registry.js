@@ -29,7 +29,11 @@
   AdPage.cardRegistry = [
     /* The overview pulse leads the overview: KPI strip over the
        workstream momentum chart (static/cards/pulse.js), slowest row
-       first. The lifecycle table it displaced drops below the fold. */
+       first. Each momentum row expands in place (chevron, Enter/Space)
+       into a detail panel — actions line, progress over time, tokens
+       by phase, task counts, live agents — with no new registry entry:
+       it all lives in pulse. The lifecycle table it displaced drops
+       below the fold. */
     {id: "pulse", order: 1, scope: "overview", spec: function (state, snap) {
       if (typeof pulseSpec !== "function") return null;
       return pulseSpec(state, snap);
