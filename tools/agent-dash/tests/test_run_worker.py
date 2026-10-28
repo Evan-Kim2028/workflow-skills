@@ -603,6 +603,18 @@ class RunWorkerTests(unittest.TestCase):
         self.assertNotIn("tier=muse", buf.getvalue())
         self.assertNotEqual(launch.cmds[0][0], "muse")
 
+    def test_eligible_never_offers_an_excluded_tier_on_a_later_observe(self):
+        reg = registry()
+        ctx = {
+            "registry": reg,
+            "hooks": {"now": lambda: NOW, "pgrep": lambda pattern: 0},
+            "cooldowns": {},
+            "minutes": 1,
+            "exclude": {"muse"},
+        }
+        self.assertNotEqual(runner.eligible(ctx, set()), "muse")
+        self.assertIsNotNone(runner.eligible(ctx, set()))
+
     def test_zero_wait_detaches_and_later_call_observes(self):
         launch = Launch(alive=True)
         code, line = self.go("muse", launch, label="ws1-exec-lane-1")

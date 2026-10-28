@@ -2028,8 +2028,13 @@ def set_task(
     root: Path | None = None,
     force: bool = False,
     origin: str = "local",
+    expect=None,
 ) -> int:
     """Set one task's status in plan.json and append history.
+
+    ``expect`` (a collection of statuses) makes the write conditional: under the
+    bundle lock, a task whose current status is not in it is left alone and the
+    call returns ``errors.CONFLICT``.
 
     ``origin="local"`` (the owner's ``ws task``) records the change in the
     Linear outbox while the bundle ``.lock`` is held, so a concurrent pull
@@ -2082,6 +2087,9 @@ def set_task(
                 known += 1
                 if task.get("id") == task_id:
                     old_status = task.get("status") if isinstance(task.get("status"), str) else None
+                    if expect is not None and old_status not in expect:
+                        print(f"{ws} {task_id} is {old_status}, not {status}", flush=True)
+                        return errors.CONFLICT
                     if not force and old_status in ("done", "deferred") and status in ("wip", "pr"):
                         print(f"refusing to move {ws} {task_id} from {old_status} to {status} (use --force)", flush=True)
                         return errors.USAGE

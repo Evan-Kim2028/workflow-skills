@@ -138,12 +138,15 @@ class DispatchTestCase(unittest.TestCase):
         prompts.mkdir(exist_ok=True)
         (prompts / f"{tid}.md").write_text(front + f"do {tid}\n", encoding="utf-8")
 
-    def set_status(self, tid, status):
+    def set_status(self, tid, status, expect=None):
         plan = self.read_plan()
         for task in plan["dag"]["groups"][0]["tasks"]:
             if task["id"] == tid:
+                if expect is not None and task["status"] not in expect:
+                    return False
                 task["status"] = status
         self.write_plan(plan)
+        return True
 
     def dispatcher(self, launcher=None):
         return dispatch.Dispatcher(
@@ -448,6 +451,182 @@ class FormatTests(unittest.TestCase):
             {"seq": 4, "type": "finished", "task": "WS9.A", "label": "ws9-exec-a", "verdict": "PASS", "tier": None}
         )
         self.assertEqual(line, "#4 finished WS9.A ws9-exec-a verdict=PASS")
+
+
+class Fatal(BaseException):
+    """Escapes the loop's ``except Exception`` the way a crash in the loop itself would."""
+
+
+class ReviewFixTests(DispatchTestCase):
+    def build(self, runs=lambda: [], set_status=None, launcher=None):
+        return dispatch.Dispatcher(
+            WS,
+            self.bundle,
+            launcher=launcher or self.worker,
+            alive=lambda pid: pid in self.worker.alive_pids,
+            runs=runs,
+            set_status=set_status or self.set_status,
+            load_body=self.read_plan,
+            now=self.clock,
+        )
+
+    def test_once_refuses_to_tick_while_the_daemon_holds_the_lock(self):
+        lock = dispatch.Lock(self.bundle)
+        self.assertTrue(lock.acquire())
+        calls = []
+        real = dispatch.default_launcher
+        dispatch.default_launcher = lambda argv: calls.append(list(argv)) or "STATUS: running out=x err=y tier=muse"
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                code = dispatch.cmd_dispatch(["once", WS])
+        finally:
+            dispatch.default_launcher = real
+            lock.release()
+        self.assertEqual(code, 4)
+        self.assertEqual(calls, [], "a second dispatcher must not launch while the daemon owns the workstream")
+
+    def test_dashboard_unreachable_holds_launches_because_live_runs_are_unknown(self):
+        disp = self.build(runs=lambda: None)
+        result = disp.tick()
+        self.assertEqual(result["launched"], 0)
+        self.assertEqual(self.worker.argvs, [], "unknown live runs must not be treated as none")
+        errors = [e for e in self.events() if e["type"] == "error"]
+        self.assertEqual([e["phase"] for e in errors], ["dashboard"])
+
+    def test_pass_moves_the_task_even_when_its_wip_write_failed(self):
+        def flaky(tid, status, expect=None):
+            if status == "wip":
+                raise RuntimeError("bundle busy")
+            self.set_status(tid, status)
+
+        disp = self.build(set_status=flaky)
+        disp.tick()
+        self.worker.finish(LABEL_A, "PASS\nok\n")
+        disp.tick()
+        disp.tick()
+        self.assertEqual(self.status_of("WS9.A"), "pr")
+        launched = [e["label"] for e in self.events() if e["type"] == "launched" and e["task"] == "WS9.A"]
+        self.assertEqual(launched, [LABEL_A], "a passed task is never relaunched")
+
+    def test_stale_run_dir_from_lost_state_is_not_observed_as_this_round(self):
+        run_dir = self.bundle / "runs" / LABEL_A
+        run_dir.mkdir(parents=True)
+        (run_dir / f"{LABEL_A}.tier").write_text("muse\n", encoding="utf-8")
+        (run_dir / f"{LABEL_A}.pid").write_text("4999\n", encoding="utf-8")
+        (run_dir / f"out-{LABEL_A}.md").write_text("PASS\nold round\n", encoding="utf-8")
+        self.build().tick()
+        self.assertEqual(self.worker.launches_for(LABEL_A), [], "the old round's report must not be reused")
+        self.assertEqual(len(self.worker.launches_for("ws9-exec-a-r1")), 1)
+        self.assertEqual(self.status_of("WS9.A"), "wip")
+
+    def test_live_run_dir_from_lost_state_is_adopted_not_relaunched(self):
+        run_dir = self.bundle / "runs" / LABEL_A
+        run_dir.mkdir(parents=True)
+        (run_dir / f"{LABEL_A}.tier").write_text("muse\n", encoding="utf-8")
+        (run_dir / f"{LABEL_A}.pid").write_text("5001\n", encoding="utf-8")
+        self.worker.alive_pids.add(5001)
+        self.build().tick()
+        self.assertEqual(self.worker.launches_for(LABEL_A), [])
+        self.assertEqual(self.worker.launches_for("ws9-exec-a-r1"), [], "the live run is adopted, not doubled")
+        self.assertEqual(self.status_of("WS9.A"), "wip")
+
+    def test_torn_inbox_line_does_not_swallow_the_next_event(self):
+        self.bundle.mkdir(parents=True, exist_ok=True)
+        (self.bundle / "inbox.jsonl").write_text(
+            '{"seq": 1, "type": "idle", "task": null, "label": null}\n{"seq": 2, "type": "lau', encoding="utf-8"
+        )
+        self.build().emit("stopped")
+        self.assertEqual([e["type"] for e in self.events(after=1)], ["stopped"])
+
+    def test_wait_without_a_timeout_gives_up_after_the_default(self):
+        self.assertEqual(dispatch.WAIT_TIMEOUT_S, 1800)
+        clock = Clock()
+        code, events = dispatch.wait_for_events(self.bundle, after=0, clock=clock, sleep=clock.advance)
+        self.assertEqual((code, events), (3, []))
+        self.assertGreaterEqual(clock.t - 1_000_000.0, dispatch.WAIT_TIMEOUT_S)
+        self.assertLess(clock.t - 1_000_000.0, dispatch.WAIT_TIMEOUT_S + 2)
+
+    def test_a_crash_outside_the_task_loop_still_leaves_error_and_stopped_events(self):
+        disp = self.build()
+
+        def crash(*args, **kwargs):
+            raise Fatal("loop died")
+
+        disp.tick = crash
+        lock = dispatch.Lock(self.bundle)
+        self.assertTrue(lock.acquire())
+        with self.assertRaises(Fatal):
+            disp.loop(lock, poll_s=0)
+        types = self.types()
+        self.assertIn("error", types)
+        self.assertEqual(types[-1], "stopped")
+        self.assertTrue(lock.acquire(), "the lock is released after a crash")
+        lock.release()
+
+    def test_retry_waits_for_a_fixed_config_when_dispatch_json_breaks_mid_run(self):
+        self.build().tick()
+        (self.bundle / "dispatch.json").write_text("{not json", encoding="utf-8")
+        self.worker.finish(LABEL_A, "")
+        self.build().tick()
+        self.assertEqual(self.worker.launches_for("ws9-exec-a-r1"), [], "a broken config holds the retry")
+        self.assertEqual(self.build().status_summary()["tasks"]["WS9.A"]["status"], "retry-pending")
+        self.assertNotIn("needs-lead", self.types(), "the task is not stranded or handed to the lead")
+        self.write_config(slots=2)
+        self.build().tick()
+        self.assertEqual(len(self.worker.launches_for("ws9-exec-a-r1")), 1, "the retry goes out on the stored workspace")
+
+    def test_a_state_file_that_is_not_an_object_does_not_stop_startup(self):
+        (self.bundle / "dispatch-state.json").write_text("[1]\n", encoding="utf-8")
+        disp = self.build()
+        disp.tick()
+        self.assertEqual(self.status_of("WS9.A"), "wip", "startup survives a damaged state file and launches")
+
+    def test_a_retry_keeps_its_exclusion_on_every_observation(self):
+        disp = self.build()
+        disp.tick()
+        self.worker.finish(LABEL_A, "")
+        disp.tick()
+        retry_label = "ws9-exec-a-r1"
+        self.worker.finish(retry_label, "")
+        self.build().tick()
+        argvs = self.worker.launches_for(retry_label)
+        self.assertGreaterEqual(len(argvs), 2, "one launch and one observation")
+        for argv in argvs:
+            self.assertIn("--exclude=muse", argv)
+
+    def test_a_reused_pid_is_not_taken_for_the_dispatcher(self):
+        (self.bundle / "dispatch.pid").write_text(f"{os.getpid()}\n", encoding="utf-8")
+        self.assertIsNone(dispatch.live_pid(self.bundle))
+        killed = []
+        real = dispatch.os.kill
+        dispatch.os.kill = lambda pid, sig: killed.append((pid, sig))
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                dispatch._stop(WS, self.bundle)
+        finally:
+            dispatch.os.kill = real
+        self.assertEqual([sig for _pid, sig in killed if sig != 0], [], "stop never signals a process that is not this workstream's dispatcher")
+
+    def test_expected_status_guards_the_plan_write(self):
+        seen = []
+
+        def record(tid, status, expect=None):
+            seen.append((tid, status, expect))
+            return True
+
+        disp = self.build(set_status=record)
+        disp.tick()
+        self.worker.finish(LABEL_A, "PASS\nok\n")
+        disp.tick()
+        self.assertIn(("WS9.A", "pr", ("wip", "todo")), seen)
+
+    def test_verdict_accepts_a_verdict_label_prefix(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "out.md"
+            path.write_text("Verdict: PASS\nall good\n", encoding="utf-8")
+            self.assertEqual(dispatch.verdict_of(path), "PASS")
+            path.write_text("Verdict: nothing useful\n", encoding="utf-8")
+            self.assertEqual(dispatch.verdict_of(path), "NONE")
 
 
 if __name__ == "__main__":

@@ -400,6 +400,7 @@ def eligible(ctx, skip):
     registry = ctx["registry"]
     now = ctx["hooks"]["now"]()
     workers = registry.get("workers") or {}
+    skip = set(skip) | set(ctx.get("exclude") or ())
     for name in registry.get("auto_order") or []:
         worker = workers.get(name)
         if not isinstance(worker, dict) or not worker.get("enabled", True):

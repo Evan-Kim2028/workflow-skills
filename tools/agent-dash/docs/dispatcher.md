@@ -48,9 +48,11 @@ python3 agent_dash.py dispatch run <WS>
 - `pause` and `resume` set `paused` in `dispatch.json`. A paused dispatcher still
   observes finishes and merge waves; it launches nothing.
 - `wait` prints events past the cursor, advances the cursor, and exits 0. It exits 3
-  on timeout with no events. This is the lead's one background watcher.
+  on timeout with no events. The default timeout is 1800 s, so a watcher never blocks
+  forever. This is the lead's one background watcher.
 - `once --dry-run` decides one tick and prints what it would launch, with no side
-  effects. `once` without `--dry-run` runs one real tick.
+  effects. `once` without `--dry-run` runs one real tick under the same pidfile lock
+  as `run`, and exits 4 when a dispatcher already owns the workstream.
 
 ## Loop
 
@@ -59,7 +61,9 @@ Each tick, and immediately when a tracked worker's pid exits, the dispatcher:
 1. Observes finished runs. A PASS on a write task moves it to `pr`; a PASS on a
    read task moves it to `done`. PARTIAL or BLOCKED leaves it `wip` and emits
    `needs-lead`. No verdict (empty report, early death) relaunches once on `auto`
-   excluding the failed tier (`retried`); a second miss emits `needs-lead`.
+   excluding the failed tier (`retried`); a second miss emits `needs-lead`. While
+   paused, or while `dispatch.json` is broken, a due retry waits as `retry-pending`
+   and goes out once the config is fixed or the pause lifts.
 2. Counts live runs (its own plus the dashboard's for the workstream) against `slots`.
 3. Launches ready tasks in `ready_queue` order, skipping gates and tasks with a live
    run. A ready task with no prompt emits `needs-prompt` once. A launched task moves
@@ -74,13 +78,20 @@ Events carry `seq`, `ts`, `type`, `ws`, `task` and `label`, plus type fields:
 (phase, reason). An error in one task is logged once and the loop goes on.
 
 Restart: state is reloaded from `dispatch-state.json`. Runs whose pid is still alive
-are adopted, and a task with a live run is never relaunched.
+are adopted, and a task with a live run is never relaunched. A run directory with no
+state record is claimed the same way: a live one is adopted, and a finished one from
+an earlier round is skipped, so an old report never counts as this launch.
+
+If the dashboard run list cannot be read, live runs are unknown, so the dispatcher
+launches nothing and emits one `error` (phase `dashboard`) until it answers again.
+A crash in the loop writes an `error` (phase `fatal`) and a `stopped` event with
+`reason=crash` before the process exits.
 
 ## How a lead uses it
 
 1. Write `prompts/<task-id>.md` for each task that is ready or about to be.
 2. `dispatch start <WS>` (once per workstream, idempotent).
-3. Arm one background `dispatch wait <WS> --timeout 900` and end the turn.
+3. Arm one background `dispatch wait <WS>` (default timeout 1800 s) and end the turn.
 4. When it exits 0, act on each event: read the `finished` report, decide on
    `needs-lead` and `merge-wave`, write the next prompts, then re-arm `wait`.
    Exit 3 means nothing happened; re-arm.
