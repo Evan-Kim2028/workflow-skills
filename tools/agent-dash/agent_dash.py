@@ -105,6 +105,7 @@ USAGE = """agent-dash: local read-only execution dashboard
   python3 agent_dash.py ws task <ID> <task-id> <status> [--moved-to WSn] [--note "..."] [--force] [--no-gc]
   python3 agent_dash.py ws gc <ID> [--dry-run] [--json]
   python3 agent_dash.py ws train <ID> <train-id> [--title T] [--branch B] [--status S] [--add id,id] [--remove id,id] [--pr N] [--shared f1,f2] [--gate "..."] [--note "..."]
+  python3 agent_dash.py dispatch start|stop|pause|resume|status|wait|once <ID> [...]   keep a workstream's slots full (docs/dispatcher.md)
   python3 agent_dash.py ws trains <ID> [--json]
   python3 agent_dash.py project init <name> [--data-root DIR]
   python3 agent_dash.py project show [--json]
@@ -408,6 +409,10 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_doctor(args[1:])
     if cmd == "ws":
         return cmd_ws(args[1:])
+    if cmd == "dispatch":
+        from dash.dispatch import cmd_dispatch
+
+        return cmd_dispatch(args[1:])
     if cmd == "project":
         return cmd_project(args[1:])
     if cmd == "backfill":

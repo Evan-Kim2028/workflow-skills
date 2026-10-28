@@ -1,7 +1,12 @@
 #!/usr/bin/env python3
 """Launch one registry worker and wait. A second call for the same label only waits.
 
-Usage: run_worker.py <tier|default|auto> <label> <workspace> <prompt-file> <run-dir> [max-wait] [--no-preflight]
+Usage: run_worker.py <tier|default|auto> <label> <workspace> <prompt-file> <run-dir> [max-wait] [--no-preflight] [--exclude=<tier>]...
+
+A max-wait of 0 launches and returns at once: STATUS is ``running`` while the
+worker lives, and a later call for the same label observes it (the dispatcher
+uses this to detach). ``--exclude=<tier>`` (repeatable) keeps an ``auto``
+launch off a tier, so a retry after an early death lands on another one.
 
 A fast doctor preflight (dashboard reachable, run dir visible, tier model
 priced and policy-compliant) runs before launching; a failure prints the
@@ -92,7 +97,7 @@ def preflight_target(registry, requested: str, ctx):
     if requested == "default":
         name = registry.get("default")
     elif requested == "auto":
-        name = eligible(ctx, set())
+        name = eligible(ctx, set(ctx.get("exclude") or ()))
     else:
         name = requested
     worker = workers.get(name) if isinstance(name, str) else None
@@ -156,6 +161,8 @@ def run(argv, spawn=None, pgrep=None, sleep=None, now=None, alive=None, new_uuid
     argv = list(argv)
     no_preflight = "--no-preflight" in argv
     argv = [token for token in argv if token != "--no-preflight"]
+    exclude = [token[len("--exclude="):] for token in argv if token.startswith("--exclude=")]
+    argv = [token for token in argv if not token.startswith("--exclude=")]
     if len(argv) < 5:
         print(
             "usage: run_worker.py <tier|default|auto> <label> <workspace> <prompt-file> <run-dir> [max-wait] [--no-preflight]",
@@ -216,6 +223,7 @@ def run(argv, spawn=None, pgrep=None, sleep=None, now=None, alive=None, new_uuid
         "hooks": hooks,
         "cooldowns": read_cooldowns(cooldown_path()),
         "minutes": _minutes(registry),
+        "exclude": set(exclude),
     }
     if tier_path.is_file():
         stored = tier_path.read_text(encoding="utf-8").strip() or requested
@@ -229,14 +237,14 @@ def run(argv, spawn=None, pgrep=None, sleep=None, now=None, alive=None, new_uuid
         code = 0 if reason == "none-available" else 2
         emit("failed", out, err, requested, reason)
         return code
-    return launch(ctx, name, set())
+    return launch(ctx, name, set(exclude))
 
 
 def pick_initial(ctx):
     requested = ctx["requested"]
     registry = ctx["registry"]
     if requested == "auto":
-        name = eligible(ctx, set())
+        name = eligible(ctx, set(ctx.get("exclude") or ()))
         return (name, None) if name else (None, "none-available")
     workers = registry.get("workers") or {}
     name = registry.get("default") if requested == "default" else requested
