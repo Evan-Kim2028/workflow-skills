@@ -4361,7 +4361,7 @@ console.log("activity tick spans ok");
         allow-list; DESIGN.md states the term."""
         word = re.compile(r"phase", re.IGNORECASE)
         allow = [
-            re.compile(r"\.phases\b"),
+            re.compile(r"\.phases?\b"),
             re.compile(r"phases_line"),
             re.compile(r"['\"]phases['\"]"),
             re.compile(r"\bphases:"),
