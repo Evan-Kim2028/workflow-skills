@@ -173,18 +173,21 @@ def resolve_child(store, session_id, parent_session_id, *, now=None, run_id=None
     return None, None
 
 
-def resolve_lead(store, session_id: str, *, now=None) -> tuple:
+def resolve_lead(store, session_id: str, *, now=None, branches=None) -> tuple:
     """Rule (c): a lead's own workstream from workers, cwd, or writes."""
     moment = time.time() if now is None else float(now)
     workers = lead_workers(store, session_id, moment)
     cwd, hint = lead_cwd_hint(store, session_id)
-    branches = train_branches()
+    branches = branches if isinstance(branches, dict) else train_branches()
     return attribution.resolve_lead(
         workers, cwd, hint, train_branches=branches,
     )
 
 
-def resolve(store, label, session_id, parent_session_id, *, now=None, run_id=None) -> tuple:
+def resolve(
+    store, label, session_id, parent_session_id, *, now=None, run_id=None,
+    branches=None,
+) -> tuple:
     """Fill the gap left by the explicit rules: (b) then (c).
 
     Hub-scoped labels never resolve: no explicit map entry matched
@@ -195,7 +198,7 @@ def resolve(store, label, session_id, parent_session_id, *, now=None, run_id=Non
         return None, None
     if isinstance(parent_session_id, str) and parent_session_id.strip():
         return resolve_child(store, session_id, parent_session_id, now=now, run_id=run_id)
-    return resolve_lead(store, session_id, now=now)
+    return resolve_lead(store, session_id, now=now, branches=branches)
 
 
 def _throttled(store, now: float) -> bool:
@@ -222,7 +225,7 @@ def _throttled(store, now: float) -> bool:
     return False
 
 
-def refresh(store, now: float) -> int:
+def refresh(store, now: float, *, rules=None, branches=None) -> int:
     """Recompute inherited/inferred rows; never touch explicit ones.
 
     Sessions first so child runs inherit the fresh lead value in the
@@ -245,12 +248,12 @@ def refresh(store, now: float) -> int:
         ]
     except Exception:
         return 0
-    branches = train_branches()
+    branches = branches if isinstance(branches, dict) else train_branches()
     for session in sessions:
         sid = session.get("session_id")
         if not sid:
             continue
-        explicit, conf = attribution.attribute(session.get("label"), sid)
+        explicit, conf = attribution.attribute(session.get("label"), sid, rules=rules)
         if explicit is not None:
             target = (explicit, conf)
         elif attribution.is_hub_label(session.get("label")):
@@ -294,6 +297,7 @@ def refresh(store, now: float) -> int:
             run.get("label"),
             run.get("session_id"),
             parent_session_id=run.get("parent_session_id"),
+            rules=rules,
         )
         if explicit is not None:
             target = (explicit, conf)

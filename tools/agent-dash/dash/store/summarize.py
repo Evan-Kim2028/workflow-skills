@@ -70,9 +70,13 @@ class SummarizeMixin:
                 raise ValueError("bad limit")
             if isinstance(recent_offset, bool) or not isinstance(recent_offset, int) or recent_offset < 0:
                 raise ValueError("bad recent_offset")
+            probes = self._probe_liveness(file_mtimes=True)
+            check = self._probe_checker(probes)
             with self._lock:
-                shown_all, parents = self._shown_locked(now)
-                live_open, shadows = self._live_open_with_shadows_locked(now, shown_all)
+                shown_all, parents = self._shown_locked(now, probes)
+                live_open, shadows = self._live_open_with_shadows_locked(
+                    now, shown_all, check
+                )
                 shown_all = _annotate_lanes(shown_all, live_open | set(shadows))
                 range_since = now - RANGE_S if since is None else float(since)
                 range_until = float(now if until is None else until)
@@ -284,13 +288,15 @@ class SummarizeMixin:
                 None if until is None else int(float(until) // 60),
                 int(float(now) // 60),
             )
+            probes = self._probe_liveness(file_mtimes=True)
+            check = self._probe_checker(probes)
             with self._lock:
                 hit = self._rollup_cache.get(key)
                 if hit is not None:
                     _perf.record_cache("rollup", "hit")
                     return _copy.deepcopy(hit)
-                shown_all, parents = self._shown_locked(now)
-                live_open = self._live_open_ids_locked(now, shown_all)
+                shown_all, parents = self._shown_locked(now, probes)
+                live_open = self._live_open_ids_locked(now, shown_all, check)
                 usage_once = self._usage_by_run()
                 roll = self._summarize_locked(
                     shown_all, parents, now, since, until, live_open, usage=usage_once
@@ -329,13 +335,17 @@ class SummarizeMixin:
             from dash.workstates import archived_aggregate as _archived_aggregate
             from dash.workstates import check_archived_identity as _check_archived
 
+            probes = self._probe_liveness(file_mtimes=True)
+            check = self._probe_checker(probes)
             with self._lock:
-                shown_all, parents = self._shown_locked(now)
+                shown_all, parents = self._shown_locked(now, probes)
                 # One evidence pass shared by the live-open set below and
                 # the stale leg inside _mismatches_locked (same open rows,
                 # same GROUP BYs, computed once).
                 _umax, _smax, _pstarts = self._open_evidence_locked(shown_all)
-                live_open = self._live_open_ids_locked(now, shown_all, None, _umax, _smax, _pstarts)
+                live_open = self._live_open_ids_locked(
+                    now, shown_all, check, _umax, _smax, _pstarts
+                )
                 usage_once = self._usage_by_run()
                 roll = self._summarize_locked(
                     shown_all, parents, now, since, until, live_open, usage=usage_once
@@ -348,6 +358,7 @@ class SummarizeMixin:
                     lambda ws: _scope_tab(roll, ws),
                     processes,
                     evidence=(_umax, _smax, _pstarts),
+                    liveness=probes,
                 )
                 all_counts = roll["all"]["counts"]
                 all_totals = roll["all"]["totals"]
@@ -397,7 +408,10 @@ class SummarizeMixin:
                         )
                     )
                 return payload
-        def _mismatches_locked(self, roll: dict, shown_all: list, now: float, tab_of, processes=None, evidence=None) -> list:
+        def _mismatches_locked(
+            self, roll: dict, shown_all: list, now: float, tab_of,
+            processes=None, evidence=None, liveness=None,
+        ) -> list:
             """Every violated invariant for one rollup. Caller holds the lock.
 
             ``tab_of(ws)`` returns ``(counts, totals, all_time)`` from the same
@@ -500,8 +514,9 @@ class SummarizeMixin:
                 mismatches.append(
                     f"unpriced model: {entry['model']} ({entry['tokens']} tokens in {hours:g} h)"
                 )
+            checker = self._probe_checker(liveness) if liveness is not None else None
             for run, reason in self._stale_locked(
-                now, shown_all, None,
+                now, shown_all, checker,
                 usage_max=None if evidence is None else evidence[0],
                 sample_max=None if evidence is None else evidence[1],
                 pid_starts=None if evidence is None else evidence[2],
@@ -606,7 +621,7 @@ class SummarizeMixin:
                 self._pid_start_locked([row.get("pid") for row in open_rows]),
             )
 
-        def _shown_locked(self, now: float) -> tuple[list, dict]:
+        def _shown_locked(self, now: float, liveness=None) -> tuple[list, dict]:
             """All run views with child chats folded away and launch echoes dropped. Caller holds the lock."""
             raw, usage, parents = self._scoped_usage()
             context = self._context_by_run()
@@ -620,7 +635,11 @@ class SummarizeMixin:
                 [row["run_id"] for row in raw
                  if row.get("status") in ("running", "queued")]
             )
-            stalled = self._stalled_locked(now, raw, None, usage_max)
+            checker = self._probe_checker(liveness) if liveness is not None else None
+            file_mtimes = liveness.get("mtimes") if liveness is not None else None
+            stalled = self._stalled_locked(
+                now, raw, checker, usage_max, file_mtimes=file_mtimes
+            )
             usage_versions = dict(self._usage_fold_versions)
             children_of: dict = {}
             for child, parent in parents.items():

@@ -78,6 +78,7 @@ def attribute(
     path: Path | None = None,
     parent_session_id: str | None = None,
     parent_workstream: str | None = None,
+    rules: dict | None = None,
 ) -> tuple[str | None, str | None]:
     """Return (workstream, confidence).
 
@@ -87,7 +88,7 @@ def attribute(
     session's resolved workstream, marked ``inherited``; without one it
     falls back to its parent's session mapping, marked session-default.
     """
-    rules = _rules(path)
+    rules = rules if isinstance(rules, dict) else _rules(path)
     text = clean_label(label)
     if text:
         exact = rules["exact"].get(text)
@@ -123,6 +124,15 @@ def attribute(
     if mapped:
         return mapped, "session-default"
     return None, None
+
+
+def rules_snapshot(path: Path | None = None) -> dict:
+    """Load and return the current attribution rules.
+
+    Store callers use this before taking the store lock, then pass the
+    immutable-by-convention snapshot to :func:`attribute` while locked.
+    """
+    return _rules(path)
 
 
 def dominant_workstream(

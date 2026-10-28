@@ -30,6 +30,8 @@ ROOT = Path(__file__).resolve().parents[1]
 # returns 503 and the caller can retry.
 STATE_STORE_LOCK_TIMEOUT_S = 2.0
 STATE_BUILD_TIMEOUT_S = 5.0
+STORE_LOCK_WATCHDOG_AFTER_S = 10.0
+HEALTH_STORE_REFRESH_S = 5.0
 
 
 def _with_store_lock_timeout(store, fn):
@@ -309,6 +311,12 @@ class DashServer(ThreadingHTTPServer):
         self.index_path = Path(index_path) if index_path is not None else INDEX_PATH
         self.stream_interval = stream_interval
         self.stop = threading.Event()
+        self._health_store_snapshot = {"usage_models": [], "unpriced_models": []}
+        self._health_store_thread = None
+        try:
+            self._health_store_snapshot = _health_store_snapshot(store, bounded=True)
+        except Exception:
+            pass
         self._disconnects: deque = deque()
         self._disconnects_lock = threading.Lock()
         super().__init__((host, port), Handler)
@@ -359,6 +367,33 @@ class DashServer(ThreadingHTTPServer):
             thread.start()
         except Exception:
             pass
+
+    def start_health_refresh(self) -> None:
+        """Refresh health's store-backed fields off the request path.
+
+        A collector can be wedged on the store lock. Keep serving the last
+        complete health snapshot while this daemon waits for a bounded lock
+        acquisition; /api/health never waits on the store.
+        """
+        if self._health_store_thread is not None and self._health_store_thread.is_alive():
+            return
+
+        def refresh():
+            while not self.stop.wait(HEALTH_STORE_REFRESH_S):
+                try:
+                    current = _health_store_snapshot(self.store, bounded=True)
+                except Exception:
+                    continue
+                self._health_store_snapshot = current
+
+        self._health_store_thread = threading.Thread(
+            target=refresh, name="dash-health-refresh", daemon=True
+        )
+        self._health_store_thread.start()
+
+    def health_store_snapshot(self) -> dict:
+        """Return the latest immutable health fields without taking Store._lock."""
+        return self._health_store_snapshot
 
     def note_disconnect(self) -> None:
         """Record a client that went away mid-response. Never raises."""
@@ -568,12 +603,12 @@ class Handler(BaseHTTPRequestHandler):
             )
 
     def _health(self):
-        def compute():
-            return _health_body(self.server, time.time(), self._doctor_block)
-
-        if self._ttl_serve("health", {}, compute):
+        body = _health_body(self.server, time.time(), self._doctor_block)
+        raw = json.dumps(body, separators=(",", ":"), allow_nan=False).encode()
+        etag = _content_etag(raw)
+        if self._not_modified(etag):
             return
-        self._json(200, _health_body(self.server, time.time(), self._doctor_block))
+        self._send_body(200, raw, "application/json; charset=utf-8", etag=etag)
 
     def _project(self):
         from dash import project as project_mod
@@ -593,7 +628,7 @@ class Handler(BaseHTTPRequestHandler):
     def _doctor_block(self, now: float) -> dict:
         """The ``doctor`` block for ``/api/health``: summary plus generation time."""
         try:
-            payload = self.server.store.doctor_latest(now)
+            payload = self.server.store._doctor_health_snapshot
         except Exception:
             return {"summary": {"critical": 0, "warn": 0, "info": 0, "regressed": 0}, "generated_at": None}
         return {
@@ -1618,6 +1653,18 @@ def _record_http(server, parsed, elapsed_ms: float) -> None:
         pass
 
 
+def _health_store_snapshot(store, *, bounded: bool = False) -> dict:
+    """Read health fields as one generation, outside every HTTP request."""
+    def read():
+        now = time.time()
+        return {
+            "usage_models": store.usage_model_stats(),
+            "unpriced_models": store.unpriced_models(now, now - 86400, now),
+        }
+
+    return _with_store_lock_timeout(store, read) if bounded else read()
+
+
 def _health_body(server, now: float, doctor_block) -> dict:
     """The ``GET /api/health`` payload: reachability plus self-monitoring.
 
@@ -1629,14 +1676,27 @@ def _health_body(server, now: float, doctor_block) -> dict:
     summary (``Handler._doctor_block`` on the live path).
     """
     body = _health_with_live(server.registry, now, server.cfg)
-    body["pricing"] = health_block(server.store.usage_model_stats())
+    try:
+        store_health = server.health_store_snapshot()
+    except Exception:
+        store_health = getattr(server, "_health_store_snapshot", {}) or {}
+    body["pricing"] = health_block(store_health.get("usage_models") or [])
     body["disconnects_1h"] = server.disconnects_1h()
-    unpriced = server.store.unpriced_models(now, now - 86400, now)
+    unpriced = store_health.get("unpriced_models") or []
     if unpriced:
         body["ok"] = False
         body["unpriced_models"] = unpriced
     body["doctor"] = doctor_block(now)
     if int((body["doctor"].get("summary") or {}).get("critical", 0)) > 0:
+        body["ok"] = False
+    lock = getattr(getattr(server, "store", None), "_lock", None)
+    diagnostics = getattr(lock, "diagnostics", None)
+    try:
+        store_lock = diagnostics(STORE_LOCK_WATCHDOG_AFTER_S) if callable(diagnostics) else {"held": False}
+    except Exception:
+        store_lock = {"held": False}
+    body["store_lock"] = store_lock
+    if store_lock.get("held"):
         body["ok"] = False
     build = getattr(server, "build", None) or {}
     body["build_id"] = build.get("build_id", "unknown")

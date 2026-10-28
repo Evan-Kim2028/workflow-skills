@@ -24,21 +24,36 @@ from .util import (_ESTIMATE_TOOL, MERGE_WINDOW_S, RUN_COLS,
 
 
 class RunsMixin:
+        def _refresh_attribution_snapshot(self) -> None:
+            """Refresh map and bundle inputs before entering store critical sections."""
+            from dash.attribution import rules_snapshot
+
+            self._attribution_rules = rules_snapshot()
+            self._train_branches = _inherit.train_branches()
+
         def _attribute_locked(self, label, session_id, parent_session_id, run_id=None):
             """Explicit attribution, else workstream inheritance (caller holds the lock)."""
             workstream, confidence = attribute(
                 label,
                 session_id,
                 parent_session_id=parent_session_id,
+                rules=getattr(self, "_attribution_rules", None),
             )
             if workstream is not None:
                 return workstream, confidence
-            return _inherit.resolve(self, label, session_id, parent_session_id, run_id=run_id)
+            return _inherit.resolve(
+                self, label, session_id, parent_session_id, run_id=run_id,
+                branches=getattr(self, "_train_branches", None),
+            )
 
         def refresh_workstream_inheritance(self, now: float) -> int:
             """Recompute inherited/inferred rows; never touch explicit ones."""
+            self._refresh_attribution_snapshot()
             with self._lock:
-                changed = _inherit.refresh(self, now)
+                changed = _inherit.refresh(
+                    self, now, rules=self._attribution_rules,
+                    branches=self._train_branches,
+                )
                 if changed:
                     self._seq += 1
                     self._data_seq += 1
@@ -50,6 +65,7 @@ class RunsMixin:
             session_id = row.get("session_id")
             if not session_id:
                 raise ValueError("session_id required")
+            self._refresh_attribution_snapshot()
             with self._lock:
                 existing = self._one("SELECT * FROM sessions WHERE session_id=?", (session_id,))
                 merged = dict(existing or {})
@@ -91,6 +107,7 @@ class RunsMixin:
             run_id = row.get("run_id")
             if not run_id:
                 raise ValueError("run_id required")
+            self._refresh_attribution_snapshot()
             with self._lock:
                 if isinstance(run_id, str) and _manifest_family(run_id) is not None:
                     target = self._resolve_alias_locked(run_id)
@@ -768,6 +785,8 @@ class RunsMixin:
             stale row the snapshot hides never shows as an open bar here. Production
             (dagster) rows are left out unless ``include_jobs`` is set; lead and
             shell rows stay in."""
+            probes = self._probe_liveness(file_mtimes=True)
+            check = self._probe_checker(probes)
             with self._lock:
                 raw, usage, parents = self._scoped_usage()
                 context = self._context_by_run()
@@ -776,8 +795,10 @@ class RunsMixin:
                 # only read them, so no second copy.
                 usage_max, sample_max, pid_starts = self._open_evidence_locked(raw)
                 live_open, shadows = self._live_open_with_shadows_locked(
-                    now, raw, None, usage_max, sample_max, pid_starts)
-                stalled = self._stalled_locked(now, raw, None, usage_max, sample_max)
+                    now, raw, check, usage_max, sample_max, pid_starts)
+                stalled = self._stalled_locked(
+                    now, raw, check, usage_max, sample_max, probes["mtimes"]
+                )
                 usage_versions = dict(self._usage_fold_versions)
                 children_of: dict = {}
                 for child, parent in parents.items():

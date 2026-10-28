@@ -197,7 +197,8 @@ last `response_ttl_s` (default 1.5 s) regardless of store movement,
 single-flight with stale-while-revalidate (hard 5 s max staleness),
 explicit POST invalidation, 10 s pinned windows, `response_ttl_s=0`
 disables. The `/api/health` `perf` block carries per-endpoint TTL
-`hits`/`stale`/`recomputes`/`waits`/`hit_ratio`.
+`hits`/`stale`/`recomputes`/`waits`/`hit_ratio`; `/api/health` itself
+is uncached so its store-lock watchdog is sampled on every request.
 
 Cheaper cold path (payload-identical, proven by
 tests/test_ttl.py counts-equivalence + fragment properties and the

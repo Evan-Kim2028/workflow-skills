@@ -468,9 +468,11 @@ class MuseTests(unittest.TestCase):
             with open(path, "wb") as fh:
                 fh.write(blob)
             store = Boom()
-            err = self.poll(store, self.cfg(sessions, scratch), 1792153000, quiet=False)
-            self.assertIn("usage failed", err)
-            self.assertNotIn("UNIQUEPROMPT", err)
+            with self.assertLogs("agent_dash.muse", level="WARNING") as logs:
+                self.poll(store, self.cfg(sessions, scratch), 1792153000, quiet=False)
+            messages = "\n".join(record.getMessage() for record in logs.records)
+            self.assertIn("usage failed", messages)
+            self.assertNotIn("UNIQUEPROMPT", messages)
             self.assertEqual(summed(store)["input"], 2)
             self.assertIn(("muse", SID, "b"), store.usage)
             self.assertNotIn(("muse", SID, "a"), store.usage)

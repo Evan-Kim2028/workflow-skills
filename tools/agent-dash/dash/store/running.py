@@ -26,6 +26,81 @@ from .util import (LIVE_WORKER_SOURCES, WORKER_SOURCES, WRAPPER_SOURCES)
 
 
 class RunningMixin:
+        def _probe_liveness(
+            self, rows=None, pid_alive_fn=None, *, file_mtimes=False, quota=False
+        ) -> dict:
+            """Run PID and filesystem probes after releasing the store lock."""
+            import os as _os
+
+            if rows is None:
+                with self._lock:
+                    rows = [
+                        dict(row)
+                        for row in self._conn.execute(
+                            "SELECT * FROM runs WHERE status IN ('running','queued')"
+                        ).fetchall()
+                    ]
+            rows = [dict(row) for row in (rows or [])]
+            check = pid_alive_fn or _pid_alive
+            pids = sorted({int(pid) for row in rows if (pid := _int_pid(row.get("pid"))) is not None})
+            alive = {}
+            for pid in pids:
+                try:
+                    alive[pid] = bool(check(pid))
+                except Exception:
+                    # A failed probe is not proof that the process died.
+                    # In particular, do not let a transient permission or
+                    # process-table error reap a row.
+                    alive[pid] = True
+
+            paths = set()
+            if file_mtimes:
+                for row in rows:
+                    if file_mtimes != "all" and (row.get("source") or "") not in STALLED_SOURCES:
+                        continue
+                    out_path = row.get("out_path")
+                    if isinstance(out_path, str) and out_path:
+                        paths.add(out_path)
+                    if file_mtimes == "all":
+                        err_path = sibling_err_path(out_path)
+                        if err_path:
+                            paths.add(err_path)
+            mtimes = {}
+            for path in paths:
+                try:
+                    mtimes[path] = float(_os.stat(path).st_mtime)
+                except OSError:
+                    mtimes[path] = None
+
+            quotas = {}
+            if quota:
+                for row in rows:
+                    try:
+                        quotas[row.get("run_id")] = row_shows_quota(row)
+                    except Exception:
+                        quotas[row.get("run_id")] = False
+
+            identities = {
+                row.get("run_id"): (
+                    row.get("status"), row.get("pid"), row.get("started_at"),
+                    row.get("out_path"), row.get("out_bytes"), row.get("err_bytes"),
+                )
+                for row in rows
+            }
+            return {"alive": alive, "mtimes": mtimes, "quota": quotas, "identities": identities}
+
+        @staticmethod
+        def _probe_checker(probes):
+            """A pure lookup safe to call while the store lock is held."""
+            alive = (probes or {}).get("alive", {})
+
+            def check(pid):
+                value = alive.get(_int_pid(pid))
+                # A row added after the probe is unknown, not proven dead.
+                return True if value is None else value
+
+            return check
+
         def set_dagster_active(self, run_ids, now: float, full_page: bool = False) -> None:
             """Remember the latest successful Dagster active set for stale checks."""
             import json as _json
@@ -100,14 +175,12 @@ class RunningMixin:
             headless Command Code and Pi workers (``pidless_reapable``): one
             with a recorded end closes at that end, one with no end after
             ``PIDLESS_REAP_IDLE_S`` without evidence closes at its last
-            evidence. One lock hold covers
-            the liveness checks, the file stats, and the writes, so a
-            poll cannot revive a row between the check and the close.
+            evidence. Process checks, file stats, and quota reads happen
+            outside the store lock. The final write rechecks the row identity
+            so a concurrent poll can revive it while those probes run.
             Returns one ``{run_id, source, label, verdict, idle_s}`` dict
             per reaped row.
             """
-            import os as _os
-
             now = float(now)
             if idle_s is None:
                 idle_s = REAP_IDLE_S
@@ -132,8 +205,41 @@ class RunningMixin:
                 if wanted_sources:
                     rows = [row for row in rows if (row.get("source") or "") in wanted_sources]
                     pidless = [row for row in pidless if (row.get("source") or "") in wanted_sources]
-                if not rows and not pidless:
-                    return []
+            if not rows and not pidless:
+                return []
+            probes = self._probe_liveness(rows + pidless, file_mtimes="all", quota=True)
+
+            with self._lock:
+                rows = [
+                    dict(row)
+                    for row in self._conn.execute(
+                        "SELECT * FROM runs WHERE status IN ('running','queued') "
+                        "AND pid IS NOT NULL AND slice_of IS NULL AND source != 'dagster'"
+                    ).fetchall()
+                ]
+                pidless = [
+                    dict(row)
+                    for row in self._conn.execute(
+                        "SELECT * FROM runs WHERE status IN ('running','queued') "
+                        "AND pid IS NULL AND slice_of IS NULL AND source = 'generic'"
+                    ).fetchall()
+                ]
+                rows = [
+                    row for row in rows
+                    if (not wanted_sources or (row.get("source") or "") in wanted_sources)
+                    and probes["identities"].get(row.get("run_id")) == (
+                        row.get("status"), row.get("pid"), row.get("started_at"),
+                        row.get("out_path"), row.get("out_bytes"), row.get("err_bytes"),
+                    )
+                ]
+                pidless = [
+                    row for row in pidless
+                    if (not wanted_sources or (row.get("source") or "") in wanted_sources)
+                    and probes["identities"].get(row.get("run_id")) == (
+                        row.get("status"), row.get("pid"), row.get("started_at"),
+                        row.get("out_path"), row.get("out_bytes"), row.get("err_bytes"),
+                    )
+                ]
                 usage_max = self._usage_max_locked([row["run_id"] for row in rows + pidless])
                 sample_max = self._sample_max_locked(rows + pidless)
                 reaped = []
@@ -170,10 +276,7 @@ class RunningMixin:
                     pid = _int_pid(row.get("pid"))
                     if pid is None:
                         continue
-                    try:
-                        if _pid_alive(pid):
-                            continue
-                    except Exception:
+                    if probes["alive"].get(pid, True):
                         continue
                     stamps = []
                     started = row.get("started_at")
@@ -189,11 +292,10 @@ class RunningMixin:
                     if hit is not None:
                         stamps.append(float(hit))
                     log_paths = [path for path in (row.get("out_path"), sibling_err_path(row.get("out_path"))) if path]
-                    for path in log_paths:
-                        try:
-                            stamps.append(float(_os.stat(path).st_mtime))
-                        except OSError:
-                            continue
+                    stamps.extend(
+                        stamp for stamp in (probes["mtimes"].get(path) for path in log_paths)
+                        if stamp is not None
+                    )
                     if not stamps:
                         continue
                     last = max(stamps)
@@ -203,7 +305,7 @@ class RunningMixin:
                     merged = dict(row)
                     merged.update(
                         dead_run_patch(
-                            row, last, quota=row_shows_quota(row)
+                            row, last, quota=probes["quota"].get(row.get("run_id"), False)
                         )
                     )
                     self._write_run(merged)
@@ -240,7 +342,11 @@ class RunningMixin:
                         "SELECT * FROM runs WHERE status IN ('running','queued')"
                     ).fetchall()
                 ]
-                return self._stale_locked(now, rows, pid_alive_fn=pid_alive_fn)
+            probes = self._probe_liveness(rows, pid_alive_fn, file_mtimes=False)
+            with self._lock:
+                return self._stale_locked(
+                    now, rows, pid_alive_fn=self._probe_checker(probes)
+                )
         def _stale_locked(self, now: float, rows: list, pid_alive_fn=None, usage_max=None, sample_max=None, pid_starts=None) -> list:
             """Stale subset of ``rows``. Caller holds the lock.
 
@@ -325,7 +431,10 @@ class RunningMixin:
                     pid_starts.get(_int_pid(row.get("pid"))),
                 )
             ]
-        def _stalled_locked(self, now: float, rows: list, pid_alive_fn=None, usage_max=None, sample_max=None) -> dict:
+        def _stalled_locked(
+            self, now: float, rows: list, pid_alive_fn=None, usage_max=None,
+            sample_max=None, file_mtimes=None,
+        ) -> dict:
             """Open worker rows stuck on a live process, by run id to idle seconds.
 
             A ``STALLED_SOURCES`` row whose pid is still alive but whose
@@ -373,11 +482,15 @@ class RunningMixin:
                 if hit is not None:
                     stamps.append(float(hit))
                 out_path = row.get("out_path")
-                if isinstance(out_path, str) and out_path:
+                if isinstance(out_path, str) and out_path and file_mtimes is None:
                     try:
                         stamps.append(float(_os.stat(out_path).st_mtime))
                     except OSError:
                         pass
+                elif isinstance(out_path, str) and out_path:
+                    stamp = file_mtimes.get(out_path)
+                    if stamp is not None:
+                        stamps.append(float(stamp))
                 if not stamps:
                     continue
                 idle = now - max(stamps)

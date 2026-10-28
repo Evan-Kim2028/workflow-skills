@@ -1986,6 +1986,106 @@ class StaleRunningTest(unittest.TestCase):
         self.store = memory(Path(self.tmp.name))
         self.now = time.time()
 
+    def test_slow_pid_probe_does_not_hold_store_lock(self):
+        import threading
+        from unittest import mock
+
+        run_id = "muse:session:ws5-probe"
+        self.store.upsert_run(
+            {
+                "run_id": run_id,
+                "source": "muse",
+                "tier": "muse",
+                "label": "ws5-probe",
+                "status": "running",
+                "pid": 987654321,
+                "started_at": self.now - 60,
+            }
+        )
+        entered = threading.Event()
+        release = threading.Event()
+        done = threading.Event()
+        errors = []
+
+        def slow_probe(_pid):
+            entered.set()
+            if not release.wait(2):
+                raise TimeoutError("test PID probe was not released")
+            return True
+
+        def query():
+            try:
+                self.store.query_runs(self.now, None, None, None, 20)
+            except Exception as exc:
+                errors.append(exc)
+            finally:
+                done.set()
+
+        with mock.patch("dash.store.running._pid_alive", side_effect=slow_probe):
+            worker = threading.Thread(target=query, name="blocked-pid-probe")
+            worker.start()
+            self.assertTrue(entered.wait(1), "query never reached the slow PID probe")
+            try:
+                started = time.monotonic()
+                self.assertIsNotNone(self.store.get_run(run_id))
+                self.assertLess(time.monotonic() - started, 0.5)
+            finally:
+                release.set()
+            worker.join(2)
+        self.assertTrue(done.is_set(), "query thread hung after the probe was released")
+        self.assertEqual(errors, [])
+
+    def test_slow_quota_file_probe_does_not_hold_store_lock(self):
+        import threading
+        from unittest import mock
+
+        run_id = "muse:session:ws5-quota-probe"
+        self.store.upsert_run(
+            {
+                "run_id": run_id,
+                "source": "muse",
+                "tier": "muse",
+                "label": "ws5-quota-probe",
+                "status": "running",
+                "pid": 987654322,
+                "started_at": self.now - 3600,
+            }
+        )
+        entered = threading.Event()
+        release = threading.Event()
+        done = threading.Event()
+        errors = []
+
+        def slow_read(_row):
+            entered.set()
+            if not release.wait(2):
+                raise TimeoutError("test quota read was not released")
+            return False
+
+        def reap():
+            try:
+                self.store.reap_dead_runs(self.now, idle_s=30)
+            except Exception as exc:
+                errors.append(exc)
+            finally:
+                done.set()
+
+        with mock.patch("dash.store.running._pid_alive", return_value=False), mock.patch(
+            "dash.store.running.row_shows_quota", side_effect=slow_read
+        ):
+            worker = threading.Thread(target=reap, name="blocked-quota-read")
+            worker.start()
+            self.assertTrue(entered.wait(1), "reaper never reached the quota file probe")
+            try:
+                started = time.monotonic()
+                self.assertIsNotNone(self.store.get_run(run_id))
+                self.assertLess(time.monotonic() - started, 0.5)
+            finally:
+                release.set()
+            worker.join(2)
+        self.assertTrue(done.is_set(), "reaper hung after the file probe was released")
+        self.assertEqual(errors, [])
+
     def tearDown(self):
         self.store.close()
         self.tmp.cleanup()
