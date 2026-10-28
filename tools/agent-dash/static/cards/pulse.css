@@ -1,6 +1,6 @@
-/* Overview pulse card: KPI strip over the workstream momentum chart.
-   Every colour below is a design token (tokens.css): verdict/state hues
-   are the same ones the tiles, program panel and Finished table use. */
+/* Overview pulse card: KPI strip with hourly token bars. Every colour
+   below is a design token (tokens.css): verdict/state hues are the same
+   ones the tiles, program panel and Finished table use. */
 .pulse .pulse-h{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap}
 .pulse .pulse-h h2{font-size:var(--fs-h2);margin:0;font-weight:700}
 .pulse .pulse-h .sub{font-size:var(--fs-sub);color:var(--ink-2);margin:0 0 12px}
@@ -20,86 +20,11 @@
 .pulse-stack span:first-child{border-top-left-radius:5px;border-bottom-left-radius:5px}
 .pulse-stack span:last-child{border-top-right-radius:5px;border-bottom-right-radius:5px}
 .pulse-bars{display:flex;align-items:flex-end;gap:2px;height:34px;margin-top:8px}
-.pulse-bar{flex:1 1 0;min-width:2px;background:var(--s4);border-radius:2px 2px 0 0;opacity:.85}
+.pulse-bar{flex:1 1 0;min-width:2px;background:var(--s4);border-radius:2px 2px 0;opacity:.85}
 .pulse-bar.cur{opacity:.45;background:repeating-linear-gradient(45deg,var(--s4),var(--s4) 2px,transparent 2px,transparent 4px)}
 .pulse-kpi .skel{height:34px;margin-top:8px}
-.pulse-mom-h h3{font-size:var(--fs-h2);margin:6px 0 8px;font-weight:700}
 .pulse-failed{color:var(--muted);font-size:13px;padding:8px 0}
-/* One grid so columns align: the rail, glyph, workstream, plan bar,
-   token sparkline, agent dots and age cells sit in the same columns in
-   every row. Wide grids scroll inside the card, never the page. */
-.pulse-scroll{overflow-x:auto}
-.pulse-grid{min-width:680px}
-.pulse-row{display:grid;grid-template-columns:18px 4px 20px minmax(140px,1.2fr) minmax(150px,1.3fr) minmax(120px,1fr) minmax(96px,.7fr) 62px;align-items:center}
-.pulse-chev{display:flex;align-items:center;justify-content:center;color:var(--muted);font-size:13px;padding:7px 0;border-bottom:1px solid var(--grid)}
-.pulse-row.pulse-head .pulse-chev{border-bottom:1px solid var(--axis);padding-top:0}
-.pulse-row[aria-expanded="true"] .pulse-chev{color:var(--ink-2)}
-/* In-place drill-down panel under an expanded row: actions line,
-   progress-over-time chart, then the three-part strip. */
-.pulse-item{border-bottom:1px solid var(--grid)}
-.pulse-item>.pulse-row .pulse-cell,.pulse-item>.pulse-row .pulse-glyph,.pulse-item>.pulse-row .pulse-chev{border-bottom:0}
-.pulse-detail{padding:2px 0 14px 22px}
-.pulse-detail-body{display:grid;gap:12px}
-.pulse-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
-.pulse-actions button{font:600 12.5px var(--font);border:1px solid var(--ring);border-radius:999px;padding:4px 12px;background:var(--surface);color:var(--ink);cursor:pointer}
-.pulse-actions button:hover{border-color:var(--accent)}
-.pulse-actions .linear-link{font-size:12.5px}
-.pulse-prog .skel{height:180px}
-.pulse-prog-chart svg text{font-size:11px;fill:var(--muted)}
-.pulse-gap{color:var(--muted);font-size:12.5px;margin:6px 0 0}
-.pulse-muted{color:var(--muted);font-size:13px;padding:6px 0}
-.pulse-strip{display:grid;gap:14px;grid-template-columns:1.2fr 1fr 1.4fr}
-.pulse-strip h4{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.05em;color:var(--muted);margin:0 0 8px}
-.pulse-legend{display:flex;flex-wrap:wrap;gap:4px 12px;margin-top:8px}
-.pulse-legend .lentry{display:inline-flex;align-items:center;gap:5px;font-size:12px;color:var(--ink-2)}
-.pulse-legend .sw{width:9px;height:9px;border-radius:3px;background:var(--other)}
-.pulse-legend .lv{font-family:var(--mono);font-variant-numeric:var(--tnum,tabular-nums)}
-.pulse-count-cells{display:grid;grid-template-columns:repeat(5,1fr);gap:6px}
-.pulse-count{background:var(--surface-2);border-radius:8px;padding:6px 4px;text-align:center}
-.pulse-count b{display:block;font-size:16px;font-variant-numeric:var(--tnum,tabular-nums)}
-.pulse-count span{font-size:11px;color:var(--ink-2)}
-.pulse-agent-t{border-collapse:collapse;width:100%;font-size:12.5px}
-.pulse-agent-t th{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.05em;color:var(--muted);text-align:left;padding:2px 8px 4px 0}
-.pulse-agent-t td{padding:3px 8px 3px 0;border-top:1px solid var(--grid);vertical-align:middle}
-.pulse-agent-t .c-num{font-family:var(--mono);font-variant-numeric:var(--tnum,tabular-nums);white-space:nowrap}
-.pulse-agent-t .c-dot{width:14px}
-.pulse-agent-t tr.is-stalled td{color:var(--muted)}
-.pulse-stall{display:inline-block;width:9px;height:9px;border-radius:50%;background:var(--critical)}
-button.pulse-row{width:100%;box-sizing:border-box;background:none;border:0;padding:0;font:inherit;color:inherit;text-align:left;cursor:pointer}
-button.pulse-row:focus-visible{outline:2px solid var(--accent);outline-offset:-2px;border-radius:6px}
-.pulse-cell{display:flex;align-items:center;gap:6px;min-width:0;padding:7px 8px 7px 0;border-bottom:1px solid var(--grid);font-size:13px}
-.pulse-row.pulse-head .pulse-cell{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.05em;color:var(--muted);border-bottom:1px solid var(--axis);padding-top:0}
-.pulse-cell.rail{width:4px;padding:0;margin:7px 8px 7px 0;border-radius:2px;justify-self:start;align-self:stretch;min-height:20px}
-.pulse-glyph{display:flex;align-items:center;font-weight:700;font-size:14px;padding:7px 0;border-bottom:1px solid var(--grid)}
-.pulse-row.pulse-head .pulse-glyph{border-bottom:1px solid var(--axis);padding-top:0}
-.m-stuck .pulse-glyph{color:var(--critical)}
-.m-slowing .pulse-glyph{color:var(--warning)}
-.m-moving .pulse-glyph{color:var(--good)}
-.m-idle .pulse-glyph{color:var(--muted)}
-.pulse-cell.id{flex-wrap:wrap;row-gap:2px}
-.pulse-cell.id b{font-size:13px}
-.pulse-cell.id .nm{color:var(--ink-2);font-size:12.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:100%}
-.pulse-cell.prog{gap:8px}
-.pulse-pbar{display:flex;flex:1 1 auto;height:10px;border-radius:5px;overflow:hidden;background:var(--surface-2);min-width:60px}
-.pulse-pbar span{display:block;height:100%}
-.pulse-pct{font:12px var(--mono);color:var(--ink-2);font-variant-numeric:var(--tnum,tabular-nums)}
-.pulse-noprog{color:var(--muted)}
-.pulse-cell.spark{padding-right:12px}
-.pulse-cell.spark .pulse-bars{flex:1 1 auto;height:26px;margin-top:0}
-.pulse-cell.spark .pulse-bar{background:var(--s1)}
-.pulse-cell.spark .pulse-bar.cur{background:repeating-linear-gradient(45deg,var(--s1),var(--s1) 2px,transparent 2px,transparent 4px)}
-.pulse-cell.agents{flex-wrap:wrap;row-gap:4px}
-.pulse-dot{width:9px;height:9px;border-radius:50%;flex:none}
-.pulse-dot.stalled{box-shadow:0 0 0 2px var(--critical)}
-.pulse-more{font:11px var(--mono);color:var(--ink-2)}
-.pulse-none{color:var(--muted)}
-.pulse-cell.age{justify-content:flex-end;font:12px var(--mono);color:var(--muted);font-variant-numeric:var(--tnum,tabular-nums)}
-.pulse-cell.age.warn{color:var(--warning-ink)}
-.pulse-cell.age.crit{color:var(--critical-ink)}
-.pulse-empty{padding:14px 0;color:var(--muted);font-size:13px}
-.pulse-rows .skel{height:22px}
 @media (max-width:700px){
-.pulse-strip{grid-template-columns:1fr}
 .pulse .pulse-kpis{grid-template-columns:1fr 1fr}
 .pulse-kpi .v{font-size:26px}
 /* Long delta chips (a big prior-day swing) must not push the 2-up
@@ -108,6 +33,6 @@ button.pulse-row:focus-visible{outline:2px solid var(--accent);outline-offset:-2
 .pulse-kpi .delta{display:block;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 }
 @media (prefers-reduced-motion: reduce){
-.pulse-kpi .skel,.pulse-rows .skel{animation-duration:.001ms}
+.pulse-kpi .skel{animation-duration:.001ms}
 }
 .pulse-unatt{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:0 0 8px}
