@@ -182,15 +182,15 @@ The project status follows `bundle.json` `state`, so do not put a status in `tra
 
 ## Approvals
 
-The lead records a pending decision before asking the owner to take it. The owner sets the status. The lead reads that status before any production step.
+The lead records each production decision and its rollback before running the step. The lead sets the status; an owner `denied` overrides it. The lead reads that status before any production step.
 
 ```
 python3 agent_dash.py ws approve WS4 cutover pending --step "Ship the read path" --reversible no --conditions "The sample set loads."
-python3 agent_dash.py ws approve WS4 cutover approved --note "Owner signed off."
+python3 agent_dash.py ws approve WS4 cutover approved --note "Lead decided: sample set checked; rollback: revert the read path."
 python3 agent_dash.py ws approvals WS4
 ```
 
-`pending` adds or reopens an item. `approved` and `denied` are the owner's answer. `reversible` is `yes` or `no`. `no` is one-way. The write is a temp file plus replace.
+`pending` adds or reopens an item. `approved` is the lead's decision with its basis; `denied` is the owner's override. `reversible` is `yes` or `no`. `no` is one-way. The write is a temp file plus replace.
 
 `approvals.json` is optional. `ws validate` checks it when the file is there: `ws`, `decided_at`, `decided_by`, and `items` of `id`, `step`, `status` (`pending`, `approved`, `denied`), `reversible` (true or false), and `conditions`. The naming rule applies to that file too.
 

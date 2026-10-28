@@ -50,9 +50,9 @@ Then write `KICKOFF.md`, a self-contained brief for a fresh lead session. It mus
 - who to coordinate with;
 - the done criteria.
 
-## 3. Owner approvals
+## 3. Production approvals
 
-List every production step in `approvals.json`. The owner approves or denies each one, and the lead reads it before acting.
+List every production step in `approvals.json` with its rollback. The lead decides each one before running it and logs the decision. The owner can deny an item in the session at any time, and a denied item does not run.
 
 ```bash
 python3 ~/.claude/tools/agent-dash/agent_dash.py ws approve WS4 notes-cutover pending --step "Publish the notes index" --reversible no --conditions "The index file is on disk."

@@ -573,7 +573,7 @@ python3 tools/agent-dash/agent_dash.py ws approve WS4 notes-cutover pending --st
 python3 tools/agent-dash/agent_dash.py ws approvals WS4
 ```
 
-The lead records `pending`; the owner answers `approved` or `denied`. The lead reads `ws approvals` before the step and runs one production step at a time.
+The lead records each production step with its rollback and decides it (`approved`, with the basis). An owner `denied` overrides it. The lead reads `ws approvals` before the step and runs one production step at a time.
 
 Orchestrate from the plan instead of re-reading it. Each takes `--json` (machine JSON on stdout, human text on stderr) and exits 0 ok, 2 usage, 3 not found, or 4 invalid data:
 

@@ -1,6 +1,6 @@
 ---
 name: workstream-lead
-description: Run a planned workstream end to end as its lead session on any agent harness. Read the bundle's kickoff brief, run each wave of parallel sub-agents to done, move task status so the dashboard tracks it, act only on approved production steps, coordinate with other leads, and hand off cleanly. Use when a session is told "you are the WS<n> lead", is given a START-PROMPT, or picks up a workstream mid-flight.
+description: Run a planned workstream end to end as its lead session on any agent harness. Read the bundle's kickoff brief, run each wave of parallel sub-agents to done, move task status so the dashboard tracks it, decide and log each production step with its rollback, coordinate with other leads, and hand off cleanly. Use when a session is told "you are the WS<n> lead", is given a START-PROMPT, or picks up a workstream mid-flight.
 ---
 
 # Workstream lead
@@ -9,14 +9,14 @@ The lead plans, decides, verifies, and reports. Workers do everything else. Rela
 
 ## Start (or resume)
 
-1. Read `~/.local/share/agent-dash/workstreams/<ID>/KICKOFF.md` (or `AGENT_DASH_WORKSTREAMS`), including any addendum, then `approvals.json` and `docs/`.
+1. Read `~/.local/share/agent-dash/workstreams/<ID>/KICKOFF.md` (or `AGENT_DASH_WORKSTREAMS`), including any addendum, then `approvals.json` (the production decision log) and `docs/`.
 2. Activate the workstream at kickoff: `python3 tools/agent-dash/agent_dash.py ws state <ID> active`. A `planned` bundle has no tab; it appears on the dashboard once active.
 3. Check reality before acting:
    - `python3 tools/agent-dash/agent_dash.py doctor --ws <ID>` (fix or note what it lists);
    - `plan.json` statuses;
    - open PRs and `git log origin/main`;
    - live workers on the dashboard.
-4. Message the other leads named in the brief for shared files and the production slot. Messages that change production load need the owner's approval, unless `approvals.json` already grants direct coordination.
+4. Message the other leads named in the brief for shared files and the production slot. Messages that change production load are decided by the lead and logged in `decisions.tsv` with their rollback; the lead does not wait for an answer.
 
 ## Each wave
 
@@ -35,8 +35,8 @@ Execution follows the [orchestration loop](../workstream-orchestration/SKILL.md#
 
 - **Delegate every multi-step job.** The lead plans, decides, verifies, and reports; workers do everything else. Any read of more than one or two files, any run longer than a few minutes, any wait goes to a worker.
 - **Never foreground-wait.** Waits go to one background watcher per run or a cheap worker returning one verdict. Never sleep in the lead thread.
-- **Never kill to rescope.** A killed run leaves no report and its cost is lost. Let it finish, or launch a separate run; after 2 failed attempts at the same task, mark that task BLOCKED with measurements and replan it. BLOCKED parks that one task, never the workstream, so every other lane keeps running.
-- **Never ask while workers run.** Never call AskUserQuestion while workers run: ask in plain text, keep refilling every other lane, and end the turn with watchers armed. The lead guard hook enforces this.
+- **Never kill to rescope.** A killed run leaves no report and its cost is lost. Let it finish, or launch a separate run; attempt limits count per failure class: retry once a fix for that class has landed, and a third failure of the same class replans that task (smaller, or another route). A blocked task parks that one task, never the workstream, so every other lane keeps running.
+- **Never ask the owner.** Never call AskUserQuestion, and never ask in plain text. Log the question as a decision with its basis and rollback, keep refilling every other lane, and end the turn with watchers armed. The lead guard hook enforces this.
 - **Move status as events happen.** `wip` on launch, `pr` on open, `done` on merged-and-live — in the same step, not at end of day.
 
 At each milestone run `agent_dash.py lead-profile` on the lead session: a LOW-DELEGATION or over-limit flag gets a re-brief or a fresh successor, not a continuation.
@@ -55,8 +55,9 @@ The full rules are T1 to T5 in the [orchestration skill](../workstream-orchestra
 
 ## Production steps
 
-- Act only on items marked `approved` in `approvals.json`, and follow their conditions. Run one production step at a time across all workstreams that share the slot.
-- For a new production step, record it as pending: `ws approve <ID> <id> pending --step ... --reversible ... --conditions ...`. Ask the owner in your session, record their answer with `ws approve`, and only then act.
+- Record each production step in `approvals.json` before running it: `ws approve <ID> <id> approved --step ... --reversible ... --conditions ... --note "<basis; rollback>"`. Follow its conditions. Run one production step at a time across all workstreams that share the slot.
+- A reversible step runs once its conditions hold. An irreversible step (`--reversible no`) runs only after a dry run and a named verification signal, with its rollback written down. If the agent cannot do a step, put one line in `reports/<ID>/owner-queue.md` and keep the rest of the workstream moving.
+- An owner `denied` item in `approvals.json`, or an instruction the owner gives in the session, overrides the lead's decision.
 - Waits (deploys, soaks, shadow windows) go to a background watcher or a cheap worker that returns one verdict. Never sleep in the lead thread.
 
 ## Labels, logging, tokens
@@ -105,7 +106,7 @@ At about 250K context, or at a milestone, run `doctor --ws <ID>` once more, then
 
 ## Completion: closing report, then archive
 
-When the plan is done, write `docs/closing-report.md` in the bundle and, after owner review, run `ws archive` (archiving is manual; nothing auto-archives). The report is short:
+When the plan is done, write `docs/closing-report.md` in the bundle and run `ws archive` (archiving is manual; nothing auto-archives). The report is short:
 
 - What shipped (the lanes and trains that landed, with links to the plan view and the merged PRs).
 - Decisions (the decision ids from `plan.json` that still bind, each with its one-line why).

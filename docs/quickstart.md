@@ -111,7 +111,7 @@ python3 ~/.claude/tools/agent-dash/agent_dash.py ws list
 
 `render` prints `wrote` and a path ending in `page.html`. `validate` prints `OK WS4`. `list` includes a line `WS4`, then `workstream`, then the title `Notes index`.
 
-Record one owner decision (the lead reads these before any production step):
+Record a production decision (the lead logs each one with its rollback before it runs the step):
 
 ```bash
 python3 ~/.claude/tools/agent-dash/agent_dash.py ws approve WS4 notes-cutover pending --step "Publish the notes index" --reversible no --conditions "The index file is on disk."
