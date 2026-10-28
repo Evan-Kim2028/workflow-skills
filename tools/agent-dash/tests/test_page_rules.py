@@ -3552,9 +3552,10 @@ const A = window.AdPage;
 assert.deepStrictEqual(A.actClampRange(1000, 1100, 0, 10000), {from: 900, to: 1200});
 assert.deepStrictEqual(A.actClampRange(-100, 50000, 0, 3600), {from: 0, to: 3600});
 assert.deepStrictEqual(A.actClampRange(10, 5, 0, 10000), {from: 0, to: 300});
-/* presets: hour presets follow now (live), All covers the loaded window. */
+/* presets: hour and 7 d presets follow now (live), All covers the loaded window. */
 assert.deepStrictEqual(A.actPresetRange("hour", 100000, 0), {from: 96400, to: 100000, live: true, preset: "hour"});
 assert.deepStrictEqual(A.actPresetRange("6h", 100000, 0), {from: 78400, to: 100000, live: true, preset: "6h"});
+assert.deepStrictEqual(A.actPresetRange("7d", 1000000, 0), {from: 395200, to: 1000000, live: true, preset: "7d"});
 assert.deepStrictEqual(A.actPresetRange("all", 100000, 20000), {from: 20000, to: 100000, live: false, preset: "all"});
 /* pixel<->time: linear, clamped, round-trips. */
 assert.strictEqual(A.actTimeToX(50, 0, 100, 150, 800), 550);

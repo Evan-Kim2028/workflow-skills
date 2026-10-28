@@ -5,7 +5,7 @@
    shared x axis (time) with ONE time filter. The filter sits on top of
    the tile as a horizontal range bar on the time axis: a track covering
    the loaded window with two draggable handles and a draggable middle,
-   quick presets (Last hour, 6 h, 24 h, All), a Reset button, the
+   quick presets (Last hour, 6 h, 24 h, 7 d, All), a Reset button, the
    selected range label, and a tokens-per-hour sparkline inside the bar
    showing where to brush. A brush zooms all four strips to the same
    domain at once; x labels draw once at the bottom of the stack (plus
@@ -41,7 +41,7 @@
   var ACT_KEY_STEP = 5 * 60;
   var ACT_KEY_BIG = 3600;
   var ACT_WIDE_HOURS = 7 * 24;
-  var ACT_PRESETS = [["hour", "Last hour", 3600], ["6h", "6 h", 6 * 3600], ["24h", "24 h", 24 * 3600], ["all", "All", 0]];
+  var ACT_PRESETS = [["hour", "Last hour", 3600], ["6h", "6 h", 6 * 3600], ["24h", "24 h", 24 * 3600], ["7d", "7 d", 7 * 24 * 3600], ["all", "All", 0]];
 
   /* Clamp an absolute selection into [lo, hi]: ordered, inside, at least
      a minimum span wide (the span shrinks to the window when the window
@@ -64,8 +64,10 @@
     return {from: Math.round(from), to: Math.round(to)};
   }
 
-  /* A preset name to an absolute range at now. Hour presets follow now on
-     ticks (live); All covers the loaded window as an absolute range. */
+  /* A preset name to an absolute range at now. The hour and 7 d presets
+     follow now on ticks (live); All commits the last seven days as an
+     absolute range (the draw path clamps to loaded data until the wide
+     top-up lands). */
   function actPresetRange(preset, now, loadT0) {
     now = Math.round(+now); loadT0 = Math.round(+loadT0);
     if (!isFinite(now)) now = Math.round(Date.now() / 1000);
@@ -222,8 +224,8 @@
   function actWideKey() { return actScope() + "|" + groupFor(); }
   /* Wider fetch for older data: quantized to the 30 s grid the server
      keys (and tags) on, conditional-GET friendly through api(), merged
-     into state.actWide on arrival. Runs on preset commits and on first
-     draw of a stored range only, never per pixel of drag. */
+     into state.actWide on arrival. Runs when a committed or drawn range
+     reaches past loaded data, never per pixel of drag. */
   var actWideInflight = {};
   function actEnsureWide(from) {
     var nowS = Date.now() / 1000;
@@ -250,9 +252,10 @@
   }
 
   /* The effective draw range: live presets follow now every draw (the
-     live chip says so); an absolute brush is clamped to the loaded
-     window for drawing while the committed range stays put, and a brush
-     reaching past loaded data tops the window up in the background.
+     live chip says so), topping the window up in the background while
+     the span reaches past loaded data; an absolute brush is clamped to
+     the loaded window for drawing while the committed range stays put,
+     and a brush reaching past loaded data tops the window up too.
      Ticks and polls never rewrite the committed range. */
   function actEffective(ws, loaded, now) {
     var r = actRanges[ws];
@@ -268,7 +271,11 @@
       }
       r = actRanges[ws];
     }
-    if (r.live) return actPresetRange(r.preset || "24h", now, loaded.t0);
+    if (r.live) {
+      var lr = actPresetRange(r.preset || "24h", now, loaded.t0);
+      if (lr.from < loaded.t0 - 1) actEnsureWide(lr.from);
+      return lr;
+    }
     return actClampRange(r.from, Math.min(r.to, now), loaded.t0, now);
   }
   function actCommit() {
@@ -285,9 +292,12 @@
   function actSetPreset(preset) {
     var ws = actScope(), now = Date.now() / 1000, loaded = actLoaded();
     if (preset === "all") {
+      /* Commit the full seven-day span up front: the wide fetch above is
+         async, so snapshotting actLoaded().t0 here would freeze the
+         24 h window instead. The draw path clamps to loaded data until
+         the top-up lands and redraws. */
       actEnsureWide(now - ACT_WIDE_HOURS * 3600);
-      loaded = actLoaded();
-      actRanges[ws] = {from: loaded.t0, to: now, live: false, preset: "all"};
+      actRanges[ws] = {from: now - ACT_WIDE_HOURS * 3600, to: now, live: false, preset: "all"};
     } else {
       actRanges[ws] = actPresetRange(preset, now, loaded.t0);
     }
@@ -358,7 +368,7 @@
     var bar = el("div", {class: "act-controls", role: "group", "aria-label": "Time range"});
     ACT_PRESETS.forEach(function (p) {
       var active = r.live ? r.preset === p[0] : p[0] === "all" && r.preset === "all";
-      var b = el("button", {type: "button", "aria-pressed": String(!!active), title: p[0] === "all" ? "Everything loaded, up to seven days" : "The last " + p[1].toLowerCase() + ", following now"}, [p[1]]);
+      var b = el("button", {type: "button", "aria-pressed": String(!!active), title: p[0] === "all" ? "Everything loaded, up to seven days" : p[0] === "7d" ? "The last seven days, following now" : "The last " + p[1].toLowerCase() + ", following now"}, [p[1]]);
       b.addEventListener("click", (function (name) { return function () { actSetPreset(name); }; })(p[0]));
       bar.appendChild(b);
     });
