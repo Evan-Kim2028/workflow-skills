@@ -153,8 +153,10 @@
   /* The selection per scope: a live preset ({live, preset}) or an
      absolute brush ({from, to}). Committed ranges persist per scope in
      sessionStorage (guarded: private mode never breaks the page) and in
-     the URL query (?from=<ms>&to=<ms>) so a view can be shared. A shared
-     URL wins over storage on first draw; ticks never touch either. */
+     the URL query so a view can be shared: an absolute brush as
+     ?from=<ms>&to=<ms>, a live preset as act=<preset> (the default 24 h
+     view leaves the URL bare). A shared URL wins over storage on first
+     draw; ticks never touch either. */
   var actRanges = {};
   function actKey(ws) { return "agent-dash-activity:" + (ws || "all"); }
   function actScope() { return (typeof state !== "undefined" && state.ws) || "all"; }
@@ -178,6 +180,11 @@
   function actReadUrl() {
     try {
       var q = new URLSearchParams(location.search);
+      var name = q.get("act");
+      for (var i = 0; name && i < ACT_PRESETS.length; i++) {
+        if (ACT_PRESETS[i][0] === name && ACT_PRESETS[i][2] > 0)
+          return {preset: name, live: true, from: 0, to: 0};
+      }
       if (!q.has("from") || !q.has("to")) return null;
       var f = +q.get("from") / 1000, t = +q.get("to") / 1000;
       if (isFinite(f) && isFinite(t) && t > f) return {from: f, to: t, live: false, preset: null};
@@ -187,8 +194,14 @@
   function actWriteUrl(r) {
     try {
       var u = new URL(location.href);
-      if (r.live) { u.searchParams.delete("from"); u.searchParams.delete("to"); }
-      else { u.searchParams.set("from", String(Math.round(r.from * 1000))); u.searchParams.set("to", String(Math.round(r.to * 1000))); }
+      if (r.live) {
+        u.searchParams.delete("from"); u.searchParams.delete("to");
+        if (r.preset && r.preset !== "24h") u.searchParams.set("act", r.preset);
+        else u.searchParams.delete("act");
+      } else {
+        u.searchParams.delete("act");
+        u.searchParams.set("from", String(Math.round(r.from * 1000))); u.searchParams.set("to", String(Math.round(r.to * 1000)));
+      }
       var next = u.pathname + u.search + u.hash;
       if (next !== location.pathname + location.search + location.hash) history.replaceState(history.state, "", next);
     } catch (e) {}
