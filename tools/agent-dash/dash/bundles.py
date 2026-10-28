@@ -693,7 +693,9 @@ def _template_start_prompt(ws: str, title: str) -> str:
         f"Label each worker run `{lower}-<task-id>-<slug>`.\n"
         f"Move a task with `python3 agent_dash.py ws task {ws} <task-id> <status>`.\n"
         f"Keep the planned merge trains current with `python3 agent_dash.py ws train {ws} <train-id> --title ...`.\n"
-        f"Read `ws approvals {ws}` before any production step. Run one production step at a time.\n"
+        f"Record each production step in `ws approvals {ws}` with its rollback, decide it, log it, and run it. "
+        "Run one production step at a time. Never ask the owner: what you cannot do goes to "
+        f"reports/{ws}/owner-queue.md and the work continues.\n"
         "\n"
         f"The plan view for {ws} is on the local dashboard.\n"
     )
@@ -748,7 +750,7 @@ def linear_start_section(ws: str, root: Path | None = None) -> str:
             f"4. Post `{py} ws linear update {ws}` before standup, or rely on `tracker.update.daily_hour` when it is set. Add `--health at-risk` or `--health off-track` when the workstream is at risk.",
             f"5. At the start of each session, check `{py} ws linear status {ws}` and `{py} doctor`.",
             "6. Read issues with a Linear MCP tool when one is available. Never edit issue titles or descriptions in Linear.",
-            f"7. Approvals labelled `approval` are decided by the owner in Linear or with `{py} ws approve {ws} <item-id> approved|denied`.",
+            f"7. Approvals labelled `approval` do not block: record the decision with `{py} ws approve {ws} <item-id> approved|denied` and its rollback, then run the step. An owner answer in Linear or in the session overrides it.",
             "",
         ]
     )

@@ -1,6 +1,6 @@
 ---
 name: workstream-planner
-description: Plan a new project or workstream so sub-agents on any harness can execute it and the agent dashboard can track it. It creates the plan bundle (decision record, task DAG, visuals), the reviewed execution plan, the owner approvals list, the lead kickoff brief, and a paste-ready start prompt. Use for "plan a new workstream", "set up a new project", "add WS<n>", "write the kickoff", or turning a design doc into an executable plan.
+description: Plan a new project or workstream so sub-agents on any harness can execute it and the agent dashboard can track it. It creates the plan bundle (decision record, task DAG, visuals), the reviewed execution plan, the production decision list, the lead kickoff brief, and a paste-ready start prompt. Use for "plan a new workstream", "set up a new project", "add WS<n>", "write the kickoff", or turning a design doc into an executable plan.
 ---
 
 # Workstream planner
@@ -20,7 +20,7 @@ Tool: `tools/agent-dash/` in this repo (`~/.claude/tools/agent-dash/` after `./i
    - Then write `plan.json` as a decision record. Each decision gets alternatives with why-not, evidence (file:line), risk, and reversibility.
    - Add a motivation section: today, after, costs, and an honest "where it is not better".
    - Add an agent-friendly litmus, e.g. "one agent adds a lane in 5 or fewer files".
-   - Decisions are made from evidence plus a review, not by asking the owner. Ask the owner only about intent and approvals.
+   - Decisions are made from evidence plus a review, not by asking the owner. Intent comes from the owner's start prompt; anything it leaves open is decided here and logged with its rollback.
 3. **Task DAG, with task-level dependencies.**
    - Columns are phases, groups hold tasks `{id, title, status, deps, wave}`, and group edges mean "waits on".
    - **Every task carries `deps`**: the task ids that must be on main (or done, for a production step) before it can start. A task with nothing to wait on has `deps: []`.
@@ -36,7 +36,7 @@ Tool: `tools/agent-dash/` in this repo (`~/.claude/tools/agent-dash/` after `./i
    ```
    Every chart has x and y axes and compact numbers.
 5. **Execution plan.** Write `docs/execution-plan.md` and `.json`: the file-overlap matrix, waves of lanes that share no file or test file, per lane (worker tier, branch, worktree, brief, explicit test command, review checks, `oneWay` flags), per wave a start condition naming task ids, merge trains with local scoped test lists, the critical path, coordination points, and the remaining production steps with load, pool, and reversibility. Get an adversarial review, then refresh it from main before anyone starts.
-6. **Owner approvals.** Put every production step in `approvals.json` (`ws approve WS4 <id> pending --step ... --reversible yes|no --conditions ...`). Ask the owner once, grouped, and record the answers.
+6. **Production decisions.** Put every production step in `approvals.json` (`ws approve WS4 <id> pending --step ... --reversible yes|no --conditions ...`) with its rollback. The lead decides each one at run time and logs the answer; nothing waits on the owner.
 7. **Kickoff and start prompt.**
    - `KICKOFF.md` is self-contained: paths, waves, the wave call, run labels `ws4-<task>-<slug>`, `ws task` status moves, merge and test rules, coordination contacts, done criteria, the naming rule, and the worktree rule (a worktree whose task reached prog/done/dropped, or whose branch has merged, is removed at the next `ws gc` run (each `ws task` prog/done/dropped move triggers one; leads can run it by hand); leads never `rm -rf` a worktree).
    - `START-PROMPT.md` is the short paste-ready prompt that points a fresh session at the brief and the approvals.

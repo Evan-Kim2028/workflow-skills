@@ -6,16 +6,18 @@ rewrites on every approval step.
 
 ## Why it matters
 
-Production steps wait on an owner who may have missed the ask. Stale
-pendings rot into shadow decisions.
+A pending production step means the lead has not recorded its decision, so
+the step is stalled or running with no record. Stale pendings rot into
+shadow decisions.
 
 ## How to fix
 
-Ask the owner, then record the answer:
+Decide it now and log the decision with its rollback. If the agent cannot do
+the step, move the item to `reports/<WS>/owner-queue.md` instead:
 
 ```bash
 python3 agent_dash.py ws approvals WS4
-python3 agent_dash.py ws approve WS4 notes-cutover approved --note "owner said go in the session"
+python3 agent_dash.py ws approve WS4 notes-cutover approved --note "lead decided: <basis>; rollback: <command>"
 ```
 
 ## How to verify

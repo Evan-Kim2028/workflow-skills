@@ -85,7 +85,7 @@ observable. Numbered T1 to T5 so the measured numbering stays stable.
   any lead session.
 - **T3. Production in batches by area.** Group production steps by area: host,
   service, table family, or schedule. Run independent areas in parallel and
-  serialize only within an area. Each batch has one owner approval row, one
+  serialize only within an area. Each batch has one approval row, one
   rollback line, and a named verification signal, and lands in a quiet window.
   Check: every production step belongs to a batch with an area, an approval
   row, and a rollback line; no two batches touch the same area at once.
