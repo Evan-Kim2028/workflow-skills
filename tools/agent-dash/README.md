@@ -136,7 +136,7 @@ takes the launch.
 Two opt-in Claude Code hooks, installed per machine with `sh tools/agent-dash/scripts/install_hooks.sh`:
 
 - `--claude-label-guard` refuses worker launches with weak labels (PreToolUse, matcher `Bash`).
-- `--claude-lead-guard` keeps a workstream lead wakeable and refilling (`scripts/lead_guard_hook.py`, PreToolUse matcher `AskUserQuestion` plus a Stop hook, each `"timeout": 10`). It refuses AskUserQuestion while the lead has a pending background task (ask in plain text instead), and refuses to end the turn while ready tasks or live unwatched workers remain. Non-lead sessions always pass. `AGENT_DASH_LEAD_GUARD=off` disables both checks.
+- `--claude-lead-guard` keeps a workstream lead wakeable and refilling (`scripts/lead_guard_hook.py`, PreToolUse matcher `AskUserQuestion` plus a Stop hook, each `"timeout": 10`). It refuses AskUserQuestion in every session (the model decides per the Autonomy section of `~/.claude/CLAUDE.md` and logs the decision), refuses a lead's final message that asks the owner a question (once per stop), and refuses to end the turn while ready tasks or live unwatched workers remain. `AGENT_DASH_LEAD_GUARD=off` disables all checks.
 
 ## Config
 

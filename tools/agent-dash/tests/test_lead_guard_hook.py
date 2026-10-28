@@ -53,6 +53,14 @@ def au(tool_id, name, input_, ts=None):
     }
 
 
+def atext(text, ts=None):
+    return {
+        "type": "assistant",
+        "timestamp": ts or now_iso(),
+        "message": {"role": "assistant", "content": [{"type": "text", "text": text}]},
+    }
+
+
 def ures(tool_id, text, ts=None):
     return {
         "type": "user",
@@ -130,10 +138,12 @@ class Base(unittest.TestCase):
         self.addCleanup(setattr, hook, "list_processes", self.old_ps)
         hook.get_ready_tasks = lambda ws: []
         hook.list_processes = lambda: ""
-        for key in ("AGENT_DASH_LEAD_GUARD", "AGENT_DASH_LEAD_GUARD_MAX_AGE_S"):
+        for key in ("AGENT_DASH_LEAD_GUARD", "AGENT_DASH_LEAD_GUARD_MAX_AGE_S", "AGENT_DASH_STATE_DIR"):
             if key in os.environ:
                 old = os.environ.pop(key)
                 self.addCleanup(os.environ.__setitem__, key, old)
+        self.addCleanup(os.environ.pop, "AGENT_DASH_STATE_DIR", None)
+        os.environ["AGENT_DASH_STATE_DIR"] = self.tmp.name
 
     def run_hook(self, payload, env_extra=None):
         env = dict(os.environ)
@@ -151,7 +161,7 @@ class Base(unittest.TestCase):
 
 
 class AskTests(Base):
-    def test_non_lead_allowed(self):
+    def test_non_lead_refused_with_autonomy_message(self):
         path = write_transcript(
             self.tmp.name,
             [
@@ -160,107 +170,125 @@ class AskTests(Base):
             ],
         )
         code, err = self.run_hook(ask_payload(path))
-        self.assertEqual(code, 0, err)
-        self.assertEqual(hook.check_ask(json.loads(ask_payload(path))), (0, ""))
+        self.assertEqual(code, 2, err)
+        self.assertIn("Autonomy", err)
+        self.assertIn("decisions.tsv", err)
+        self.assertEqual(hook.check_ask(json.loads(ask_payload(path)))[0], 2)
 
-    def test_lead_pending_refused(self):
+    def test_pending_lead_refused(self):
         path = write_transcript(self.tmp.name, bg_launch())
         code, err = self.run_hook(ask_payload(path))
         self.assertEqual(code, 2)
-        self.assertIn("plain text", err)
+        self.assertIn("Autonomy", err)
         code2, err2 = hook.check_ask(json.loads(ask_payload(path)))
         self.assertEqual(code2, 2)
-        self.assertIn("plain text", err2)
+        self.assertIn("Autonomy", err2)
 
-    def test_lead_all_notified_allowed(self):
-        path = write_transcript(
-            self.tmp.name,
-            bg_launch() + [notify(task_id="bbg111aaa", tool_use_id="toolu_bg1")],
-        )
-        code, err = self.run_hook(ask_payload(path))
-        self.assertEqual(code, 0, err)
-
-    def test_auto_backgrounded_counts_as_pending(self):
+    def test_quiet_lead_and_missing_transcript_refused(self):
         path = write_transcript(
             self.tmp.name,
             [
-                au("toolu_f1", "Bash", {"command": MUSE_LAUNCH}),
-                ures(
-                    "toolu_f1",
-                    "Command did not complete within its 120s timeout and was "
-                    "moved to the background (ID: bautobg12). Output is being "
-                    "written to: /tmp/tasks/bautobg12.output.",
-                ),
+                au("toolu_l1", "Bash", {"command": MUSE_LAUNCH}),
+                ures("toolu_l1", "done"),
             ],
         )
+        self.assertEqual(hook.check_ask(json.loads(ask_payload(path)))[0], 2)
         self.assertEqual(
-            hook.check_ask(json.loads(ask_payload(path)))[0], 2
+            hook.check_ask({"hook_event_name": "PreToolUse", "tool_name": "AskUserQuestion"})[0],
+            2,
         )
 
-    def test_stopped_task_counts_as_finished(self):
-        path = write_transcript(
-            self.tmp.name,
-            bg_launch(task_id="bstop001a") + [ures("toolu_x", "Successfully stopped task: bstop001a")],
-        )
-        self.assertEqual(hook.check_ask(json.loads(ask_payload(path))), (0, ""))
+    def test_refusal_never_suggests_plain_text_question(self):
+        path = write_transcript(self.tmp.name, bg_launch())
+        _code, err = hook.check_ask(json.loads(ask_payload(path)))
+        self.assertNotIn("plain text", err.lower())
+        self.assertNotIn("ask the", err.lower())
 
-    def test_notification_tool_use_id_only(self):
-        path = write_transcript(
-            self.tmp.name, bg_launch() + [notify(tool_use_id="toolu_bg1")]
+    def test_refusal_is_logged_to_state_dir(self):
+        path = write_transcript(self.tmp.name, bg_launch())
+        state = os.path.join(self.tmp.name, "state")
+        os.makedirs(state)
+        code, _err = self.run_hook(
+            ask_payload(path), env_extra={"AGENT_DASH_STATE_DIR": state}
         )
-        self.assertEqual(hook.check_ask(json.loads(ask_payload(path))), (0, ""))
-
-    def test_notification_task_id_only(self):
-        path = write_transcript(
-            self.tmp.name, bg_launch() + [notify(task_id="bbg111aaa")]
-        )
-        self.assertEqual(hook.check_ask(json.loads(ask_payload(path))), (0, ""))
-
-    def test_start_older_than_max_age_ignored(self):
-        ts = old_iso(9)
-        path = write_transcript(
-            self.tmp.name,
-            [
-                au("toolu_o1", "Bash", {"command": MUSE_LAUNCH, "run_in_background": True}, ts=ts),
-                ures(
-                    "toolu_o1",
-                    "Command running in background with ID: boldstart1. Output "
-                    "is being written to: /tmp/tasks/boldstart1.output.",
-                    ts=ts,
-                ),
-            ],
-        )
-        # The 9 h old launch still marks the session a lead (12 h window),
-        # but the 9 h old start is past the 8 h max age: nothing pending.
-        self.assertTrue(
-            hook.is_lead(hook.scan_transcript(path), time.time())
-        )
-        self.assertEqual(hook.check_ask(json.loads(ask_payload(path))), (0, ""))
-
-    def test_agent_async_launch_is_pending(self):
-        path = write_transcript(
-            self.tmp.name,
-            [
-                au("toolu_a1", "Agent", {"prompt": "do the lane"}),
-                ures("toolu_a1", "Agent launched with ID: ag_7c2; running in the background."),
-            ],
-        )
-        code, err = hook.check_ask(json.loads(ask_payload(path)))
         self.assertEqual(code, 2)
-        self.assertIn("plain text", err)
-
-    def test_agent_finished_report_is_not_pending(self):
-        path = write_transcript(
-            self.tmp.name,
-            [
-                au("toolu_a2", "Agent", {"prompt": "do the lane"}),
-                ures("toolu_a2", "PASS. I updated the lane files and all scoped tests pass."),
-            ],
-        )
-        self.assertEqual(hook.check_ask(json.loads(ask_payload(path))), (0, ""))
+        with open(os.path.join(state, "lead-guard.log"), encoding="utf-8") as fh:
+            self.assertIn("AskUserQuestion refused", fh.read())
 
 
 class StopTests(Base):
+    def lead_then(self, final_text):
+        return write_transcript(
+            self.tmp.name,
+            [
+                au("toolu_l1", "Bash", {"command": MUSE_LAUNCH}),
+                ures("toolu_l1", "done"),
+                atext(final_text),
+            ],
+        )
+
+    def test_owner_question_refused_once_with_autonomy_reason(self):
+        path = self.lead_then("Lanes are green. Should I merge the train now?")
+        code, err = self.run_hook(stop_payload(path))
+        self.assertEqual(code, 2, err)
+        self.assertIn("Autonomy", err)
+        self.assertIn("decisions.tsv", err)
+        self.assertIn("owner-queue.md", err)
+        code2, _err2 = self.run_hook(stop_payload(path, active=True))
+        self.assertEqual(code2, 0)
+
+    def test_owner_question_refused_even_with_pending_work(self):
+        path = write_transcript(
+            self.tmp.name, bg_launch() + [atext("Do you want me to pick option B?")]
+        )
+        self.assertEqual(hook.check_stop(json.loads(stop_payload(path)))[0], 2)
+
+    def test_owner_cues_refused(self):
+        cues = [
+            "NEEDS-OWNER: sudo to restart the unit.",
+            "Two options; I will take the first. Let me know if you disagree.",
+            "I am waiting for your go-ahead on the migration.",
+            "The schema choice is your call.",
+            "Please approve the rollout plan before I continue.",
+            "Should I run the backfill tonight",
+            "Want me to proceed? Do you want the dry run first",
+        ]
+        for text in cues:
+            path = self.lead_then(text)
+            self.assertEqual(
+                hook.check_stop(json.loads(stop_payload(path)))[0], 2, text
+            )
+
+    def test_plain_final_report_allowed(self):
+        path = self.lead_then(
+            "All lanes PASS. Report at reports/WS11/final.md, decisions in decisions.tsv."
+        )
+        self.assertEqual(hook.check_stop(json.loads(stop_payload(path))), (0, ""))
+
+    def test_approved_word_in_report_allowed(self):
+        path = self.lead_then("Reviewer already approved PR 42; merged cleanly.")
+        self.assertEqual(hook.check_stop(json.loads(stop_payload(path))), (0, ""))
+
+    def test_question_from_earlier_turn_ignored(self):
+        path = write_transcript(
+            self.tmp.name,
+            [
+                au("toolu_l1", "Bash", {"command": MUSE_LAUNCH}),
+                ures("toolu_l1", "done"),
+                atext("Should I pick the old schema?"),
+                au("toolu_l2", "Bash", {"command": "ls"}),
+                ures("toolu_l2", "x"),
+                atext("Picked the new schema and recorded it. All green."),
+            ],
+        )
+        self.assertEqual(hook.check_stop(json.loads(stop_payload(path))), (0, ""))
+
+    def test_non_lead_question_allowed(self):
+        path = write_transcript(
+            self.tmp.name, [atext("Should I keep going with the refactor?")]
+        )
+        self.assertEqual(hook.check_stop(json.loads(stop_payload(path))), (0, ""))
+
     def test_stop_hook_active_allowed(self):
         path = write_transcript(self.tmp.name, bg_launch())
         code, err = self.run_hook(stop_payload(path, active=True))

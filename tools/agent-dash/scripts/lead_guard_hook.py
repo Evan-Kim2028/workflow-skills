@@ -1,22 +1,27 @@
 #!/usr/bin/env python3
 """Claude Code lead guard: keep a workstream lead wakeable and refilling.
 
-Two rules, dispatched on ``hook_event_name``. Both fail open: a non-lead
-session, a missing transcript, bad JSON, or any lookup failure exits 0
-silently. Own errors append one line to the state-dir log and exit 0.
+Two rules, dispatched on ``hook_event_name``. Both fail open: a missing
+transcript, bad JSON, or any lookup failure exits 0 silently. Own errors
+append one line to the state-dir log and exit 0.
 
-Rule 1 (PreToolUse, ``AskUserQuestion``): a lead with at least one
-pending background task gets exit 2, so the question is asked in plain
-text instead of freezing the session (a question tool-call blocks the
-whole session, and worker completions cannot wake it).
+Rule 1 (PreToolUse, ``AskUserQuestion``): every session gets exit 2. The
+owner never answers questions in these workflows, so the model is told to
+decide per the Autonomy section of ``~/.claude/CLAUDE.md``, record the
+judgement call, and continue. Each refusal is logged to ``lead-guard.log``.
 
-Rule 2 (Stop): a lead with nothing pending, no ready task, and no live
-unwatched worker may end its turn (exit 0). Gate tasks (an outside
-signal no worker can start) never count as ready, and only labels
-launched inside the lead window name workstreams or live workers. A lead that still has
-something to do gets exit 2 naming up to 8 ready task ids with titles
-and up to 8 live labels, so it launches, watches, or parks them instead
-of sitting idle with nothing that will wake it.
+Rule 2 (Stop): a lead whose last assistant text asks the owner something
+(ends with a question, or names NEEDS-OWNER, "should I", "do you want",
+"let me know if", "waiting for your", "your call", or "approve") gets
+exit 2 once, telling it to decide, log the decision, park only truly
+impossible items in ``reports/<WS>/owner-queue.md``, and keep the
+workstream moving. Otherwise a lead with nothing pending, no ready task,
+and no live unwatched worker may end its turn (exit 0). Gate tasks (an
+outside signal no worker can start) never count as ready, and only labels
+launched inside the lead window name workstreams or live workers. A lead
+that still has something to do gets exit 2 naming up to 8 ready task ids
+with titles and up to 8 live labels, so it launches, watches, or parks
+them instead of sitting idle with nothing that will wake it.
 
 A session is a lead when, within the last 12 h of its transcript, it
 launched at least one worker: a Bash command the label guard treats as
@@ -108,6 +113,8 @@ _ASYNC_HINTS = (
 _INTERESTING = (
     "tool_use",
     "tool_result",
+    '"type":"text"',
+    '"type": "text"',
     "task-notification",
     "task-id",
     "ScheduleWakeup",
@@ -193,6 +200,8 @@ class Facts:
         self.agent_results: dict[str, str] = {}
         self.finished: set[str] = set()
         self.wakeups: list[float] = []
+        #: Text of the assistant message after the last user record.
+        self.last_text = ""
 
 
 def _record_ts(record: dict) -> float | None:
@@ -204,6 +213,15 @@ def _handle_assistant(record: dict, facts: Facts, ts: float | None) -> None:
     content = message.get("content") if isinstance(message, dict) else None
     if not isinstance(content, list):
         return
+    texts = [
+        item["text"]
+        for item in content
+        if isinstance(item, dict)
+        and item.get("type") == "text"
+        and isinstance(item.get("text"), str)
+    ]
+    if texts:
+        facts.last_text = "\n".join(texts)
     for item in content:
         if not isinstance(item, dict) or item.get("type") != "tool_use":
             continue
@@ -239,6 +257,7 @@ def _handle_assistant(record: dict, facts: Facts, ts: float | None) -> None:
 def _handle_user(record: dict, facts: Facts, ts: float | None) -> None:
     message = record.get("message")
     content = message.get("content") if isinstance(message, dict) else None
+    facts.last_text = ""
     if not isinstance(content, list):
         return
     for item in content:
@@ -431,30 +450,43 @@ def live_labels(labels: list[str], snapshot: str) -> list[str]:
     return sorted(set(found))
 
 
+_OWNER_ASK_RE = re.compile(
+    r"NEEDS-OWNER|should i\b|do you want|let me know if|waiting for your"
+    r"|your call|\bapprove\b",
+    re.IGNORECASE,
+)
+
+
+def asks_owner(text: str) -> bool:
+    """True when a final message asks the owner something (question or cue)."""
+    stripped = text.strip().rstrip("*_`\"') \t")
+    if stripped.endswith("?"):
+        return True
+    return bool(_OWNER_ASK_RE.search(text))
+
+
 ASK_REFUSAL = (
-    "Workers are running and AskUserQuestion would freeze this session so "
-    "their completions cannot wake it. Ask the question in plain text in "
-    "your reply instead, park only the task that needs the answer as "
-    "BLOCKED with the question, keep every other lane running, and end "
-    "the turn with watchers armed."
+    "AskUserQuestion is refused: nobody answers questions in this workflow. "
+    "Decide it yourself per the Autonomy section of ~/.claude/CLAUDE.md: "
+    "take the reversible path, record the judgement call in the workstream's "
+    "decisions.tsv (what, why, evidence, rollback), and continue the work."
+)
+
+OWNER_QUESTION_REFUSAL = (
+    "Lead guard: your last message asks the owner a question, and the owner "
+    "does not answer questions in this workflow. Decide it per the Autonomy "
+    "section of ~/.claude/CLAUDE.md, record each judgement call in the "
+    "workstream's decisions.tsv (what, why, evidence, rollback), put only "
+    "truly impossible items (sudo, a missing credential, a paid upgrade, a "
+    "data loss with no rollback path) as one line in "
+    "reports/<WS>/owner-queue.md, and keep the workstream moving: launch the "
+    "ready tasks and arm watchers. Then end the turn again."
 )
 
 
 def check_ask(payload: dict) -> tuple[int, str]:
-    """Rule 1: refuse AskUserQuestion for a lead with pending tasks."""
-    transcript = payload.get("transcript_path")
-    if not isinstance(transcript, str) or not transcript:
-        return 0, ""
-    facts = scan_transcript(transcript)
-    if facts is None:
-        return 0, ""
-    now = time.time()
-    max_age_s = _env_int("AGENT_DASH_LEAD_GUARD_MAX_AGE_S", MAX_AGE_S)
-    window_s = _env_int("AGENT_DASH_LEAD_GUARD_LEAD_WINDOW_S", LEAD_WINDOW_S)
-    if not is_lead(facts, now, window_s):
-        return 0, ""
-    if not pending_tasks(facts, now, max_age_s):
-        return 0, ""
+    """Rule 1: refuse AskUserQuestion in every session and log the refusal."""
+    _log("AskUserQuestion refused (session %s)" % payload.get("session_id", "?"))
     return 2, ASK_REFUSAL + "\n"
 
 
@@ -471,6 +503,8 @@ def check_stop(payload: dict) -> tuple[int, str]:
     window_s = _env_int("AGENT_DASH_LEAD_GUARD_LEAD_WINDOW_S", LEAD_WINDOW_S)
     if not is_lead(facts, now, window_s):
         return 0, ""
+    if asks_owner(facts.last_text):
+        return 2, OWNER_QUESTION_REFUSAL + "\n"
     if pending_tasks(facts, now, max_age_s) or live_wakeups(facts, now):
         return 0, ""
     labels = recent_labels(facts, now, window_s)
@@ -504,9 +538,10 @@ def check_stop(payload: dict) -> tuple[int, str]:
     err += (
         "Before ending the turn, launch the ready tasks up to the tier "
         "caps, arm one background watcher per live worker, or mark each "
-        "ready task you cannot start as BLOCKED with the reason; a "
-        "question for the owner goes in plain text; if the owner told you "
-        "to stop, say so and end the turn again "
+        "ready task you cannot start as BLOCKED with the reason; never ask "
+        "the owner a question: decide per the Autonomy section of "
+        "~/.claude/CLAUDE.md and log the decision in decisions.tsv; if the "
+        "owner told you to stop, say so and end the turn again "
         "(this check fires once per stop)."
     )
     return 2, err + "\n"
