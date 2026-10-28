@@ -1,23 +1,17 @@
 #!/usr/bin/env node
-/* Pulse check: the overview pulse card leads, and momentum sorts stuck first.
+/* Pulse check: the overview pulse card leads with its KPI strip.
  *
  * Stands up a TEMP dashboard server (temp state dir, temp workstreams,
  * port 8906, never the live :8765 or the real data root) seeded with
- * three workstreams — WS1 live but gone quiet (stuck), WS2 live and
- * fresh (moving) with a ten-task plan (seven done, one undated),
- * WS3 quiet with old tokens (idle) — then drives the
- * Execution view over the DevTools protocol (stdlib only: global
- * fetch and WebSocket, child_process, no npm installs) and asserts:
+ * three workstreams — WS1 live, WS2 live and fresh, WS3 quiet with
+ * old tokens — then drives the Execution view over the DevTools
+ * protocol (stdlib only: global fetch and WebSocket, child_process,
+ * no npm installs) and asserts:
  *   - the pulse section is the first [data-sec] on ws=all, with five
- *     KPI cells and three momentum rows ordered stuck, moving, idle;
+ *     KPI cells, no momentum rows, and 24 hourly token bars;
  *   - no pulse section renders on a workstream tab;
- *   - drill-down: expanding WS2 survives drawMain() (open set in the
- *     spec key), the panel paints the progress chart (five milestone
- *     ticks, two hollow), runs bars, five task-count cells, the
- *     actions line, the live-agents table and the API's gap footnote;
- *     the plan-less WS1 panel reads empty, never failed;
  *   - zero console errors throughout, and no horizontal page overflow
- *     at 390 px with two rows expanded.
+ *     at 390 px.
  *
  * The server child is killed by PID on the way out (never pkill).
  * Exit 0 when every assertion holds, 1 on any mismatch, 2 when Chrome
@@ -203,10 +197,10 @@ async function waitFor(cdp, expression, what) {
   }
 }
 
-/* Three workstreams: WS1 live but quiet in the last 2 h (stuck),
-   WS2 live and fresh (moving), WS3 planned with old tokens only
-   (idle). Usage cells are hour-aligned so the pulse folder lands
-   them in the right buckets. */
+/* Three workstreams: WS1 live, WS2 live and fresh with a ten-task
+   plan (seven done), WS3 planned with old tokens only. Usage cells
+   are hour-aligned so the KPI hourly bars land them in the right
+   buckets. */
 const SERVER_PY = `import os, sys, time
 root, state, wsroot, port = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4])
 sys.path.insert(0, root)
@@ -300,46 +294,20 @@ function eq(actual, expected, what) {
   if (actual !== expected) fail(`${what}: want ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`);
 }
 
-/* Drill-down panel snapshot for one workstream: chart ticks and bars,
-   task-count cells, live-agent rows, actions line, gap footnote. */
-const detailState = `(function(ws){
-  var det = document.querySelector('[data-pulse-detail="' + ws + '"]');
-  if (!det) return {open: false};
-  var svg = det.querySelector('svg[data-strip="pulse-prog"]');
-  var miles = svg ? Array.prototype.map.call(svg.querySelectorAll('[data-milestone]'), function(m){
-    return {pct: m.getAttribute('data-milestone'), fill: m.getAttribute('fill')}; }) : null;
-  var bars = svg ? svg.querySelectorAll('rect[data-t]').length : 0;
-  var counts = Array.prototype.map.call(det.querySelectorAll('.pulse-count'), function(c){
-    return [c.getAttribute('data-count'), c.getAttribute('data-v')]; });
-  var agents = Array.prototype.map.call(det.querySelectorAll('.pulse-agent-t tr'), function(tr, i){
-    return i ? tr.textContent : null; }).filter(Boolean);
-  var acts = det.querySelector('.pulse-actions');
-  var muted = det.querySelector('.pulse-prog .pulse-muted');
-  return {open: true, miles, bars, counts, agents,
-    actions: acts ? acts.textContent : null,
-    muted: muted ? muted.textContent : null,
-    gap: (det.querySelector('.pulse-gap') || {}).textContent || null,
-    phase: !!det.querySelector('.pulse-phase .pulse-stack, .pulse-phase .pulse-muted'),
-    legend: det.querySelectorAll('.pulse-legend .lentry').length,
-    chev: (document.querySelector('[data-pulse-row="' + ws + '"]') || {}).textContent || null,
-    expanded: document.querySelector('[data-pulse-row="' + ws + '"]') ?
-      document.querySelector('[data-pulse-row="' + ws + '"]').getAttribute('aria-expanded') : null};
-})`;
-
-/* Pulse section snapshot: first section id, KPI cells, momentum rows. */
+/* Pulse section snapshot: first section id, KPI cells, hourly bars,
+   and the momentum leftovers that must all read zero/absent. */
 const pulseState = `(function(){
   var secs = Array.prototype.map.call(document.querySelectorAll('#main [data-sec]'), function(s){ return s.getAttribute('data-sec'); });
   var card = document.querySelector('#x-pulse');
   if (!card) return {secs};
   var kpis = Array.prototype.map.call(card.querySelectorAll('[data-kpi]'), function(k){ return k.getAttribute('data-kpi'); });
-  var rows = Array.prototype.map.call(card.querySelectorAll('.pulse-row[data-ws]'), function(r){
-    return {ws: r.getAttribute('data-ws'), m: r.getAttribute('data-m'), tag: r.tagName,
-      glyph: (r.querySelector('.pulse-glyph') || {}).textContent || null,
-      label: r.getAttribute('aria-label') || ''};
-  });
   var prog = card.querySelector('[data-kpi="in-progress"]');
   var liveEl = card.querySelector('[data-kpi="live"]');
-  return {secs, kpis, rows,
+  return {secs, kpis,
+    rows: card.querySelectorAll('.pulse-row[data-ws]').length,
+    bars: card.querySelectorAll('.pulse-bars .pulse-bar').length,
+    momHead: !!card.querySelector('.pulse-mom-h'),
+    detail: !!card.querySelector('[data-pulse-detail]'),
     active: prog ? prog.getAttribute('data-active') : null,
     planned: prog ? prog.getAttribute('data-planned') : null,
     live: liveEl ? liveEl.getAttribute('data-live') : null};
@@ -438,19 +406,18 @@ async function main() {
     await cdp.send("Page.enable");
     await cdp.send("Runtime.enable");
 
-    check("overview: pulse leads with five KPIs and stuck-first rows", async () => {
+    check("overview: pulse leads with five KPIs and no momentum rows", async () => {
       await cdp.send("Page.navigate", { url: `${URL}/?view=exec&ws=all` });
       await waitForLoad(cdp);
-      const st = await waitFor(cdp, `(${pulseState}) && ${pulseState}.rows && ${pulseState}.rows.length === 3 && (${pulseState})`, "pulse card with 3 momentum rows");
+      const st = await waitFor(cdp, `(${pulseState}) && ${pulseState}.kpis && ${pulseState}.kpis.length === 5 && (${pulseState})`, "pulse card with 5 KPI cells");
       eq(st.secs[0], "pulse", `pulse is the first section (full: ${st.secs.join(",")})`);
       eq(JSON.stringify(st.kpis), JSON.stringify(["in-progress", "live", "tokens", "cost", "finished"]), `five KPI cells (got ${st.kpis.join(",")})`);
-      eq(JSON.stringify(st.rows.map((r) => r.m)), JSON.stringify(["stuck", "moving", "idle"]), `momentum order (got ${st.rows.map((r) => r.ws + ":" + r.m).join(",")})`);
-      eq(st.rows[0].ws, "WS1", "the seeded quiet workstream sorts first");
+      eq(st.rows, 0, `momentum rows remain (got ${st.rows})`);
+      if (st.momHead) fail("the momentum heading remains on the pulse card");
+      if (st.detail) fail("a drill-down detail panel remains on the pulse card");
       eq(st.active, "2", "two active workstreams in progress");
       eq(st.planned, "1", "the planned workstream with old tokens counts");
       eq(st.live, "2", "two live agents");
-      if (st.rows.some((r) => r.tag !== "BUTTON")) fail("momentum rows are not real <button> elements");
-      if (st.rows.some((r) => !r.glyph || !r.label)) fail("a momentum row misses its glyph or accessible name");
     });
 
     check("workstream tab: no pulse section", async () => {
@@ -461,51 +428,18 @@ async function main() {
       if (secs.indexOf("tiles") < 0) fail(`tiles left the workstream tab (full: ${secs.join(",")})`);
     });
 
-    check("drill-down: expand survives drawMain", async () => {
+    check("tokens KPI paints 24 hourly bars", async () => {
       await cdp.send("Page.navigate", { url: `${URL}/?view=exec&ws=all` });
       await waitForLoad(cdp);
-      await waitFor(cdp, `(${pulseState}) && ${pulseState}.rows && ${pulseState}.rows.length === 3`, "pulse rows before expand");
-      await evaluate(cdp, `document.querySelector('[data-pulse-row="WS2"]').click()`);
-      await waitFor(cdp, `(${detailState})("WS2").open === true`, "WS2 detail panel");
-      await evaluate(cdp, `drawMain()`);
-      const st = await waitFor(cdp, `(${detailState})("WS2").open === true && (${detailState})("WS2")`, "WS2 detail after drawMain");
-      eq(st.expanded, "true", "row keeps aria-expanded through a re-render");
-      if (!st.chev || st.chev.indexOf("▾") < 0) fail("open row misses its expanded chevron");
-    });
-
-    check("drill-down: WS2 panel chart, strip and agents", async () => {
-      const st = await waitFor(cdp, `(${detailState})("WS2").miles && (${detailState})("WS2")`, "WS2 progress chart");
-      eq(JSON.stringify(st.miles.map((m) => m.pct)), JSON.stringify(["20", "40", "60", "80", "100"]), `five milestone ticks (got ${JSON.stringify(st.miles)})`);
-      eq(st.miles.filter((m) => m.fill === "var(--surface)").length, 2, `two hollow unreached ticks (got ${JSON.stringify(st.miles)})`);
-      if (!(st.bars >= 1)) fail(`no runs-per-hour bars behind the step line (bars ${st.bars})`);
-      eq(JSON.stringify(st.counts.map((c) => c[0])), JSON.stringify(["todo", "wip", "pr", "done", "deferred"]), "five task-count cells");
-      eq(st.counts.filter((c) => c[0] === "done")[0][1], "7", "seven done tasks from the seeded plan");
-      if (!st.actions || st.actions.indexOf("Open workstream") < 0 || st.actions.indexOf("Plan") < 0) {
-        fail(`actions line misses Open workstream / Plan (got ${st.actions})`);
-      }
-      if (!st.agents.some((a) => a.indexOf("ws2-live") >= 0)) fail(`live-agents table misses ws2-live (got ${st.agents.join(" | ")})`);
-      if (!st.phase) fail("tokens-by-phase strip missing");
-      const prog = await (await fetch(`${URL}/api/ws/progress?ws=WS2`)).json();
-      const wantGap = prog && prog.wsprogress && prog.wsprogress.gap;
-      if (wantGap && st.gap !== wantGap) fail(`gap footnote mismatch: want ${JSON.stringify(wantGap)}, got ${JSON.stringify(st.gap)}`);
-    });
-
-    check("drill-down: plan-less row reads empty, not failed", async () => {
-      /* WS3 has no bundle plan and is outside the example plans map
-         (WS1/WS2/WS7), so /api/ws/progress answers 404. */
-      await evaluate(cdp, `document.querySelector('[data-pulse-row="WS3"]').click()`);
-      const st = await waitFor(cdp, `(${detailState})("WS3").open === true && ((${detailState})("WS3").muted || (${detailState})("WS3").miles) && (${detailState})("WS3")`, "WS3 detail panel");
-      eq(st.miles, null, "no chart without a plan");
-      eq(st.muted, "No plan progress yet.", `plan-less row reads empty (got ${JSON.stringify(st.muted)})`);
-      eq(JSON.stringify(st.agents), "[]", "no live agents on the quiet row");
+      const st = await waitFor(cdp, `(${pulseState}) && ${pulseState}.bars === 24 && (${pulseState})`, "tokens KPI with 24 hourly bars");
+      eq(st.bars, 24, `hourly bars (got ${st.bars})`);
     });
 
     check("no horizontal overflow at 390 px", async () => {
       await cdp.send("Emulation.setDeviceMetricsOverride", { width: 390, height: 844, deviceScaleFactor: 1, mobile: true });
       await cdp.send("Page.navigate", { url: `${URL}/?view=exec&ws=all` });
       await waitForLoad(cdp);
-      await waitFor(cdp, `(${pulseState}) && ${pulseState}.rows && ${pulseState}.rows.length === 3`, "pulse rows at 390 px");
-      await waitFor(cdp, `(${detailState})("WS2").open === true && (${detailState})("WS3").open === true`, "both drill-down panels survive the reload");
+      await waitFor(cdp, `(${pulseState}) && ${pulseState}.kpis && ${pulseState}.kpis.length === 5`, "pulse KPIs at 390 px");
       const sideways = await evaluate(cdp, `document.documentElement.scrollWidth - document.documentElement.clientWidth`);
       if (sideways > 1) fail(`page scrolls sideways at 390 px: overflow ${sideways}px`);
     });
