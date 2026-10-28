@@ -110,6 +110,82 @@ class ServerTest(unittest.TestCase):
         finally:
             conn.close()
 
+    def test_state_lock_contention_returns_promptly_instead_of_hanging(self):
+        with mock.patch("dash.server.STATE_STORE_LOCK_TIMEOUT_S", 0.05):
+            with mock.patch("dash.server._live_workers", return_value=[]):
+                with self.store._lock:
+                    started = time.monotonic()
+                    status, _, body = get(self.port, "/api/state")
+                    elapsed = time.monotonic() - started
+        self.assertEqual(status, 503)
+        self.assertLess(elapsed, 1.5)
+        self.assertEqual(json.loads(body)["code"], "state_busy")
+        self.server.cfg["response_ttl_s"] = 0.01
+        status, _, _ = get(self.port, "/api/state")
+        self.assertEqual(status, 200)
+        time.sleep(0.03)
+        with mock.patch("dash.server.STATE_STORE_LOCK_TIMEOUT_S", 0.05):
+            with mock.patch("dash.server._live_workers", return_value=[]):
+                with self.store._lock:
+                    started = time.monotonic()
+                    status, _, _ = get(self.port, "/api/state")
+                    elapsed = time.monotonic() - started
+        self.assertEqual(status, 200)
+        self.assertLess(elapsed, 1.5)
+        status, _, _ = get(self.port, "/")
+        self.assertEqual(status, 200)
+
+    def test_state_builder_does_not_stack_after_a_timed_out_collection(self):
+        import dash.server as server_mod
+
+        gate = server_mod._StateBuildGate()
+        entered = threading.Event()
+        release = threading.Event()
+        calls = []
+
+        def stuck():
+            calls.append(True)
+            entered.set()
+            release.wait()
+            return {"ready": True}
+
+        try:
+            with self.assertRaises(TimeoutError):
+                gate.run(stuck, timeout=0.05)
+            self.assertTrue(entered.wait(1))
+            with self.assertRaises(TimeoutError):
+                gate.run(stuck, timeout=0.05)
+            self.assertEqual(len(calls), 1)
+        finally:
+            release.set()
+        self.assertEqual(gate.run(stuck, timeout=1), {"ready": True})
+        self.assertEqual(len(calls), 1)
+
+    def test_state_build_budget_applies_when_response_cache_is_disabled(self):
+        entered = threading.Event()
+        release = threading.Event()
+
+        def stuck_build(*args, **kwargs):
+            entered.set()
+            release.wait()
+            return {}
+
+        self.server.cfg["response_ttl_s"] = 0
+        try:
+            with mock.patch("dash.server.STATE_BUILD_TIMEOUT_S", 0.05):
+                with mock.patch("dash.state.build_state", side_effect=stuck_build):
+                    started = time.monotonic()
+                    status, _, body = get(self.port, "/api/state")
+                    elapsed = time.monotonic() - started
+            self.assertTrue(entered.wait(1))
+            self.assertEqual(status, 503)
+            self.assertLess(elapsed, 1.5)
+            self.assertEqual(json.loads(body)["code"], "state_busy")
+            status, _, _ = get(self.port, "/")
+            self.assertEqual(status, 200)
+        finally:
+            release.set()
+
     def test_problem_docs_serve_text_and_refuse_traversal(self):
         status, content_type, body = get(self.port, "/docs/problems/dep-cycle.md")
         self.assertEqual(status, 200)

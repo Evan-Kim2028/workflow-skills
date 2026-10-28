@@ -246,7 +246,7 @@ class ResponseCache:
         return None
 
     def get_or_compute(self, key: tuple, endpoint: str, ttl: float, compute,
-                       refresh=None):
+                       refresh=None, *, wait_timeout_s=None):
         """Serve-or-recompute one key under the SWR protocol.
 
         ``compute`` builds the payload dict (runs outside the lock);
@@ -314,7 +314,8 @@ class ResponseCache:
                     event_stale.generated_at, refresh, now, "stale",
                 )
             self._record(endpoint, "waits")
-            event.wait(30.0)
+            wait_s = 30.0 if wait_timeout_s is None else max(0.0, float(wait_timeout_s))
+            completed = event.wait(wait_s)
             with self._lock:
                 done = self._entries.get(key)
                 if done is not None and done.payload is not None and not done.computing:
@@ -323,7 +324,12 @@ class ResponseCache:
                     payload = None
             if payload is not None:
                 return self._serve_copy(payload, etag, generated, refresh, now, "fresh")
-            return self.get_or_compute(key, endpoint, ttl, compute, refresh)
+            if not completed and wait_timeout_s is not None:
+                raise TimeoutError("response cache computation exceeded its wait budget")
+            return self.get_or_compute(
+                key, endpoint, ttl, compute, refresh,
+                wait_timeout_s=wait_timeout_s,
+            )
         # This request computes (fresh, or expired past serving).
         try:
             fresh_payload = compute()

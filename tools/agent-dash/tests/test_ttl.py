@@ -292,6 +292,33 @@ class TtlTest(unittest.TestCase):
         self.assertEqual(len(calls), 1, "16 threads, one compute")
         self.assertTrue(all(item[0]["v"] == 1 for item in results))
 
+    def test_waiter_can_bound_a_cold_cache_compute_wait(self):
+        cache = respcache_mod.ResponseCache()
+        entered = threading.Event()
+        release = threading.Event()
+
+        def slow():
+            entered.set()
+            release.wait(5.0)
+            return {"v": 1}
+
+        worker = threading.Thread(
+            target=lambda: cache.get_or_compute(("cold",), "state", 30.0, slow)
+        )
+        worker.start()
+        self.assertTrue(entered.wait(1.0))
+        started = time.perf_counter()
+        try:
+            with self.assertRaises(TimeoutError):
+                cache.get_or_compute(
+                    ("cold",), "state", 30.0, slow, wait_timeout_s=0.05
+                )
+            self.assertLess(time.perf_counter() - started, 0.5)
+        finally:
+            release.set()
+            worker.join(2.0)
+        self.assertFalse(worker.is_alive())
+
     def test_hard_max_staleness_waits(self):
         cache = respcache_mod.ResponseCache()
         payload, _, _, _ = cache.get_or_compute(("s",), "usage", 60.0, lambda: {"v": 1})

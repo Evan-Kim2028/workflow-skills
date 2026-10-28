@@ -157,6 +157,13 @@ class GenericUnitTests(unittest.TestCase):
         )
         self.assertEqual(row["status"], "running")
 
+    def test_run_line_keeps_launcher_pid_for_dead_worker_reaping(self):
+        row = generic._run_row(
+            {"type": "run", "label": "ws4-WS4.1-demo", "status": "running", "pid": 4242},
+            NOW,
+        )
+        self.assertEqual(row["pid"], 4242)
+
     def test_end_to_end_with_real_store(self):
         from dash.store import Store
 
@@ -201,6 +208,57 @@ class GenericUnitTests(unittest.TestCase):
                 self.assertEqual(run["workstream"], "WS4")
                 usage = list(store._conn.execute("SELECT * FROM usage_events"))
                 self.assertEqual(len(usage), 1)
+        finally:
+            tmp.cleanup()
+
+    def test_running_launcher_record_is_live_in_workstream_and_clears_unseen(self):
+        from dash.store import Store
+
+        tmp = tempfile.TemporaryDirectory()
+        try:
+            state = Path(tmp.name) / "state"
+            state.mkdir()
+            label = "ws4-WS4.1-codex-live"
+            run_id = "codex:launch-session:" + label
+            (state / "generic.jsonl").write_text(
+                json.dumps(
+                    {
+                        "type": "run",
+                        "label": label,
+                        "run_id": run_id,
+                        "model": "gpt-6-luna",
+                        "tier": "codex",
+                        "session_id": "launch-session",
+                        "parent_session_id": "parent-session",
+                        "pid": os.getpid(),
+                        "status": "running",
+                        "started_at": NOW - 20,
+                    }
+                ) + "\n",
+                encoding="utf-8",
+            )
+            process = {
+                "pid": os.getpid(),
+                "comm": "python3",
+                "started_at": NOW - 20,
+                "label": label,
+            }
+            with Store(state / "dash.sqlite") as store:
+                generic.poll(store, {"state_dir": str(state)}, NOW)
+                view = store.state_view(NOW, processes=[process])
+                self.assertEqual(view["running_by_source"].get("generic"), 1)
+                self.assertTrue(
+                    any(row.get("ws") == "WS4" and row.get("live_agents") == 1
+                        for row in view["roll"]["rows"])
+                )
+                self.assertFalse(
+                    any("unseen worker" in item for item in view["mismatches"])
+                )
+                runs = store.query_runs(NOW, None, None, None, 20)
+                self.assertTrue(
+                    any(row["run_id"] == run_id and row["status"] == "running"
+                        and row["pid"] == os.getpid() for row in runs)
+                )
         finally:
             tmp.cleanup()
 

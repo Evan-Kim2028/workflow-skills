@@ -24,6 +24,86 @@ from dash.pricing import health_block
 
 ROOT = Path(__file__).resolve().parents[1]
 
+# A source collector can overrun its watchdog while holding the store lock.
+# State reads must not inherit that unbounded wait: with a cached response
+# _ttl_serve returns the last complete generation; on a cold cache the API
+# returns 503 and the caller can retry.
+STATE_STORE_LOCK_TIMEOUT_S = 2.0
+STATE_BUILD_TIMEOUT_S = 5.0
+
+
+def _with_store_lock_timeout(store, fn):
+    """Run a state read while holding the store lock, with a bounded wait."""
+    lock = getattr(store, "_lock", None)
+    acquire = getattr(lock, "acquire", None)
+    release = getattr(lock, "release", None)
+    if not callable(acquire) or not callable(release):
+        return fn()
+    try:
+        acquired = acquire(timeout=STATE_STORE_LOCK_TIMEOUT_S)
+    except TypeError:
+        # Test doubles and third-party stores may expose a non-standard lock.
+        return fn()
+    if not acquired:
+        raise TimeoutError("dashboard store is busy collecting state")
+    try:
+        return fn()
+    finally:
+        release()
+
+
+class _StateBuildGate:
+    """One bounded state build per server, including a build that gets stuck.
+
+    A timed-out Python thread cannot be cancelled safely. Keeping the one
+    in-flight job here prevents later requests from stacking more collectors
+    behind it; they can serve the last response-cache generation or return
+    503 on a cold cache.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._job = None
+
+    def run(self, fn, timeout=STATE_BUILD_TIMEOUT_S):
+        with self._lock:
+            job = self._job
+            if job is None:
+                job = {"event": threading.Event(), "started": time.monotonic()}
+                self._job = job
+
+                def work():
+                    try:
+                        job["result"] = fn()
+                    except BaseException as exc:  # shared with every waiter
+                        job["error"] = exc
+                    finally:
+                        job["event"].set()
+
+                worker = threading.Thread(target=work, name="dash-state", daemon=True)
+                job["thread"] = worker
+                worker.start()
+            elif job["event"].is_set():
+                self._job = None
+                return self._result(job)
+            remaining = max(0.0, float(timeout) - (time.monotonic() - job["started"]))
+            if remaining <= 0 and not job["event"].is_set():
+                raise TimeoutError("dashboard state collection exceeded its budget")
+
+        if not job["event"].wait(remaining):
+            raise TimeoutError("dashboard state collection exceeded its budget")
+        with self._lock:
+            if self._job is job:
+                self._job = None
+        return self._result(job)
+
+    @staticmethod
+    def _result(job):
+        error = job.get("error")
+        if error is not None:
+            raise error
+        return job.get("result")
+
 
 def state_dir_hash(state_dir) -> str:
     """Short opaque id for a state dir: sha256 of the resolved path.
@@ -217,6 +297,7 @@ class DashServer(ThreadingHTTPServer):
         # server used to stack a full fold per SSE tick behind the one
         # already running. Callers that mutate a shared result copy first.
         self.flight = SingleFlight()
+        self.state_builder = _StateBuildGate()
         # TTL response cache (stale-while-revalidate) in front of the
         # heavy reads: under write churn every request would otherwise
         # recompute cold. POST user actions invalidate it explicitly.
@@ -432,26 +513,11 @@ class Handler(BaseHTTPRequestHandler):
 
         now = time.time()
 
-        def compute():
-            return build_state(
+        def collect(processes=None):
+            if processes is None:
+                processes = _live_workers()
+            return _with_store_lock_timeout(
                 self.server.store,
-                self.server.registry,
-                self.server.cfg,
-                now=now,
-                processes=_live_workers(),
-                build=getattr(self.server, "build", None),
-            )
-
-        params = _ttl_viewer_params(self.server)
-        if self._ttl_serve("state", params, compute, _state_refresh):
-            return
-        processes = _live_workers()
-        etag = state_identity(self.server.store, self.server.cfg, processes, now)
-        if self._not_modified(etag):
-            return
-        if etag is not None:
-            payload = self.server.flight.do(
-                ("state", etag),
                 lambda: build_state(
                     self.server.store,
                     self.server.registry,
@@ -461,16 +527,45 @@ class Handler(BaseHTTPRequestHandler):
                     build=getattr(self.server, "build", None),
                 ),
             )
-        else:
-            payload = build_state(
-                self.server.store,
-                self.server.registry,
-                self.server.cfg,
-                now=now,
-                processes=processes,
-                build=getattr(self.server, "build", None),
+
+        def compute():
+            return self.server.state_builder.run(collect, timeout=STATE_BUILD_TIMEOUT_S)
+
+        params = _ttl_viewer_params(self.server)
+        try:
+            if self._ttl_serve(
+                "state", params, compute, _state_refresh,
+                propagate_error=True, wait_timeout_s=STATE_BUILD_TIMEOUT_S,
+            ):
+                return
+            client_etag = self._request_header("If-None-Match")
+
+            def collect_legacy():
+                processes = _live_workers()
+                etag = _with_store_lock_timeout(
+                    self.server.store,
+                    lambda: state_identity(self.server.store, self.server.cfg, processes, now),
+                )
+                if etag is not None and _etag_matches(client_etag, etag):
+                    return etag, None
+                payload = self.server.state_builder.run(
+                    lambda: collect(processes), timeout=STATE_BUILD_TIMEOUT_S
+                )
+                return etag, payload
+
+            etag, payload = collect_legacy()
+            if self._not_modified(etag):
+                return
+            self._json(200, payload, etag=etag)
+        except TimeoutError:
+            self._json(
+                503,
+                api_error(
+                    "dashboard state is temporarily unavailable",
+                    "state_busy",
+                    "The dashboard store is busy collecting data. Retry shortly.",
+                ),
             )
-        self._json(200, payload, etag=etag)
 
     def _health(self):
         def compute():
@@ -1315,7 +1410,10 @@ class Handler(BaseHTTPRequestHandler):
             if self.server.stop.wait(interval):
                 return
 
-    def _ttl_serve(self, endpoint: str, params: dict, compute, refresh=None) -> bool:
+    def _ttl_serve(
+        self, endpoint: str, params: dict, compute, refresh=None, *,
+        propagate_error=False, wait_timeout_s=None,
+    ) -> bool:
         """Serve one heavy endpoint through the TTL cache. True when sent.
 
         ``params`` is the normalised request dict (used for the TTL and
@@ -1334,8 +1432,12 @@ class Handler(BaseHTTPRequestHandler):
         key = _respcache_mod.canonical_key(endpoint, params, getattr(self, "headers", None))
         try:
             payload, etag, generated, _kind = self.server.respcache.get_or_compute(
-                key, endpoint, ttl, compute, refresh
+                key, endpoint, ttl, compute, refresh, wait_timeout_s=wait_timeout_s
             )
+        except TimeoutError:
+            if propagate_error:
+                raise
+            return False
         except Exception:
             return False
         now = time.time()

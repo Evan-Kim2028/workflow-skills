@@ -26,9 +26,11 @@ Writes, in ``outdir``:
   <outdir>/err-<label>.log         stderr
   <outdir>/running/<label>         "<pid>\\t<model>" while the run is live
   <outdir>/QUOTA-<label>           only on quota/rate-limit exhaustion
-  <state-dir>/generic.jsonl        one start, one usage per assistant
-                                   turn, one finish line (run id
-                                   ``codex:<session>:<label>``)
+  <state-dir>/generic.jsonl        a running record as soon as the
+                                   process starts, one usage per assistant
+                                   turn, one finish line. The stable run id
+                                   uses a launch UUID; the session id is
+                                   updated to Codex's thread id at finish.
 
 Rate-limit/quota exhaustion finishes ``died_early`` with verdict
 ``BLOCKED`` and writes ``QUOTA-<label>`` naming the model and label, so
@@ -458,8 +460,12 @@ def main(argv=None):
     err = out / f"err-{label}.log"
     sandbox, sandbox_source = codex_sandbox_with_source()
     started = int(time.time())
+    launch_pid = os.getpid()
     run_id = f"running/{label}"
-    (out / run_id).write_text(f"{os.getpid()}\t{model}", encoding="utf-8")
+    (out / run_id).write_text(f"{launch_pid}\t{model}", encoding="utf-8")
+    parent = parent_session_of(out)
+    launch_session = str(uuid.uuid4())
+    run_id_full = f"codex:{launch_session}:{label}"
     if final_path.exists():
         try:
             final_path.unlink()
@@ -471,13 +477,30 @@ def main(argv=None):
             f"sandbox {sandbox} (source: {sandbox_source}) at {started}\n"
         )
         se.flush()
-        rc = subprocess.run(
+        proc = subprocess.Popen(
             build_argv(binary, workspace, final_path, model, effort, sandbox),
             cwd=str(Path(workspace).expanduser()),
-            input=prompt_bytes,
+            stdin=subprocess.PIPE,
             stdout=so,
             stderr=se,
-        ).returncode
+        )
+        report_lines(
+            state_dir(),
+            [{
+                "type": "run",
+                "label": label,
+                "run_id": run_id_full,
+                "model": model,
+                "tier": tier,
+                "session_id": launch_session,
+                "parent_session_id": parent,
+                "pid": launch_pid,
+                "status": "running",
+                "started_at": float(started),
+            }],
+        )
+        proc.communicate(input=prompt_bytes)
+        rc = proc.returncode
     try:
         os.unlink(out / run_id)
     except FileNotFoundError:
@@ -486,7 +509,7 @@ def main(argv=None):
     raw = stream.read_bytes() if stream.exists() else b""
     err_text = err.read_text(encoding="utf-8", errors="replace")[-8192:] if err.exists() else ""
     parsed = parse_stream(raw)
-    sid = parsed["thread_id"] or str(uuid.uuid4())
+    sid = parsed["thread_id"] or launch_session
     text = ""
     if final_path.is_file():
         try:
@@ -516,21 +539,7 @@ def main(argv=None):
         verdict = verdict_of(text)
         status = "done" if rc == 0 and text.strip() else "died_early"
 
-    parent = parent_session_of(out)
-    run_id_full = f"codex:{sid}:{label}"
-    lines = [
-        {
-            "type": "run",
-            "label": label,
-            "run_id": run_id_full,
-            "model": model,
-            "tier": tier,
-            "session_id": sid,
-            "parent_session_id": parent,
-            "status": "running",
-            "started_at": float(started),
-        }
-    ]
+    lines = []
     for entry in parsed["usage"]:
         counts = usage_row(entry)
         lines.append(
@@ -558,6 +567,7 @@ def main(argv=None):
             "tier": tier,
             "session_id": sid,
             "parent_session_id": parent,
+            "pid": launch_pid,
             "status": status,
             "verdict": verdict,
             "ended_at": float(ended),

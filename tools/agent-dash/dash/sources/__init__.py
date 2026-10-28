@@ -29,6 +29,12 @@ import time
 
 log = logging.getLogger("agent_dash.sources")
 
+# Session and scratch trees accumulate directories across a long dashboard
+# process. Keep their cached listings bounded even when old paths never
+# disappear from the filesystem.
+DIR_CACHE_MAX_ENTRIES = 4096
+DIR_CACHE_MAX_ITEMS = 100_000
+
 POLL_BUDGET_S = 25.0
 STALL_FACTOR = 3.0
 # A source that has never completed a poll is "starting", not stalled,
@@ -450,6 +456,11 @@ def list_dir_cached(path: str, cache: dict, cap=None):
     key = (st.st_ino, st.st_mtime_ns)
     hit = cache.get(path)
     if hit is not None and hit[0] == key:
+        try:
+            cache.pop(path, None)
+            cache[path] = hit
+        except Exception:
+            pass
         return hit[1], False
     if cap is not None and cap[0] <= 0:
         return None, False
@@ -466,7 +477,19 @@ def list_dir_cached(path: str, cache: dict, cap=None):
     except OSError:
         return [], False
     entries.sort(key=lambda item: item[0])
-    cache[path] = (key, entries)
+    if len(entries) <= DIR_CACHE_MAX_ITEMS:
+        cache[path] = (key, entries)
+        cached_items = sum(
+            len(value[1]) for value in cache.values()
+            if isinstance(value, tuple) and len(value) == 2
+        )
+        while cache and (
+            len(cache) > DIR_CACHE_MAX_ENTRIES or cached_items > DIR_CACHE_MAX_ITEMS
+        ):
+            stale = next(iter(cache))
+            old = cache.pop(stale, None)
+            if isinstance(old, tuple) and len(old) == 2:
+                cached_items -= len(old[1])
     if cap is not None:
         cap[0] -= 1
     return entries, True
