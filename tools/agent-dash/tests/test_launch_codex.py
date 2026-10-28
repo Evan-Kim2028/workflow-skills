@@ -312,37 +312,66 @@ class MainTests(unittest.TestCase):
             review = "PASS\nshipped fixtures worth 1,429 credits\n"
             stream_lines = [
                 {"type": "thread.started", "thread_id": "01a16401-9955-70cd-bf8c-19944db4f20c"},
+                {"type": "turn.completed", "usage": {"input_tokens": 9, "cached_input_tokens": 2, "output_tokens": 3}},
                 {
                     "type": "item.completed",
                     "item": {"id": "item_0", "type": "agent_message", "text": review},
                 },
             ]
+            observed = {}
 
-            def fake_run(argv, **kwargs):
-                out_path = argv[argv.index("-o") + 1]
-                with open(out_path, "w", encoding="utf-8") as fh:
-                    fh.write(review)
-                so = kwargs.get("stdout")
-                if so is not None:
+            class FakeProc:
+                returncode = None
+
+                def __init__(self, argv, kwargs):
+                    self.argv = argv
+                    self.kwargs = kwargs
+
+                def communicate(self, input=None):
+                    observed["prompt"] = input
+                    generic_path = Path(tmp) / "state" / "generic.jsonl"
+                    records = [json.loads(line) for line in generic_path.read_text().splitlines()]
+                    observed["running_before_exit"] = records
+                    out_path = self.argv[self.argv.index("-o") + 1]
+                    with open(out_path, "w", encoding="utf-8") as fh:
+                        fh.write(review)
                     for obj in stream_lines:
-                        so.write(json.dumps(obj) + "\n")
-                completed = mock.Mock()
-                completed.returncode = 0
-                return completed
+                        self.kwargs["stdout"].write(json.dumps(obj) + "\n")
+                    self.returncode = 0
+
+            def fake_popen(argv, **kwargs):
+                return FakeProc(argv, kwargs)
 
             env = {"AGENT_DASH_STATE_DIR": os.path.join(tmp, "state")}
             with mock.patch.dict(os.environ, env, clear=False):
                 with mock.patch.object(launch, "codex_binary", return_value="/bin/true"):
-                    with mock.patch.object(launch.subprocess, "run", side_effect=fake_run):
-                        code = launch.main([label, tmp, prompt, outdir])
+                    with mock.patch.object(launch, "parent_session_of", return_value="01a16401-9955-70cd-bf8c-19944db4f20c"):
+                        with mock.patch.object(launch.subprocess, "Popen", side_effect=fake_popen):
+                            code = launch.main([label, tmp, prompt, outdir])
             self.assertEqual(code, 0)
             self.assertFalse(os.path.exists(os.path.join(outdir, "QUOTA-" + label)))
+            self.assertEqual(observed["prompt"], b"[label: " + label.encode() + b"]\ndo the task\n\n")
+            self.assertEqual(len(observed["running_before_exit"]), 1)
+            running = observed["running_before_exit"][0]
+            self.assertEqual(running["status"], "running")
+            self.assertEqual(running["label"], label)
+            self.assertEqual(running["model"], "gpt-6-luna")
+            self.assertEqual(running["tier"], "codex")
+            self.assertEqual(running["parent_session_id"], "01a16401-9955-70cd-bf8c-19944db4f20c")
+            self.assertTrue(running["session_id"])
+            self.assertEqual(running["pid"], os.getpid())
+            self.assertTrue(running["started_at"])
             tsv = open(os.path.join(outdir, "codex-sessions.tsv"), encoding="utf-8").read()
             self.assertIn(label, tsv)
             generic = open(
                 os.path.join(tmp, "state", "generic.jsonl"), encoding="utf-8"
             ).read()
             self.assertIn('"verdict":"PASS"', generic.replace(" ", ""))
+            records = [json.loads(line) for line in generic.splitlines()]
+            self.assertEqual([row["type"] for row in records], ["run", "usage", "run"])
+            self.assertEqual(records[-1]["status"], "done")
+            self.assertEqual(records[0]["run_id"], records[-1]["run_id"])
+            self.assertEqual(records[-1]["session_id"], "01a16401-9955-70cd-bf8c-19944db4f20c")
 
 
 if __name__ == "__main__":

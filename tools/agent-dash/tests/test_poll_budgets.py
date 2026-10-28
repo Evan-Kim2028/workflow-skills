@@ -62,6 +62,32 @@ class MemStore:
         self.usage[key] = row
 
 
+class DirectoryListingCacheTests(unittest.TestCase):
+    def test_directory_cache_is_bounded_lru(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = []
+            for name in ("a", "b", "c"):
+                path = Path(tmp) / name
+                path.mkdir()
+                paths.append(str(path))
+            cache = {}
+            old_limit = sources_pkg.DIR_CACHE_MAX_ENTRIES
+            sources_pkg.DIR_CACHE_MAX_ENTRIES = 2
+            try:
+                self.assertTrue(sources_pkg.list_dir_cached(paths[0], cache)[1])
+                self.assertTrue(sources_pkg.list_dir_cached(paths[1], cache)[1])
+                self.assertFalse(sources_pkg.list_dir_cached(paths[0], cache)[1])
+                self.assertTrue(sources_pkg.list_dir_cached(paths[2], cache)[1])
+                self.assertEqual(len(cache), 2)
+                self.assertIn(paths[0], cache)
+                self.assertNotIn(paths[1], cache)
+                self.assertFalse(sources_pkg.list_dir_cached(paths[0], cache)[1])
+                self.assertTrue(sources_pkg.list_dir_cached(paths[1], cache)[1])
+                self.assertLessEqual(len(cache), 2)
+            finally:
+                sources_pkg.DIR_CACHE_MAX_ENTRIES = old_limit
+
+
 class _Slow:
     NAME = "slow"
     INTERVAL_S = 2

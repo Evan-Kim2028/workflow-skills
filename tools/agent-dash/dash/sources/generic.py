@@ -190,6 +190,9 @@ def _run_row(obj: dict, now: float) -> dict | None:
         "status": status,
         "clock_source": "manifest",
     }
+    pid = _int(obj.get("pid"), None)
+    if pid is not None and pid > 0:
+        row["pid"] = pid
     if session_id is not None:
         row["session_id"] = session_id
     parent = _text(obj.get("parent_session_id"), 200)
