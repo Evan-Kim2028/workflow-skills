@@ -135,6 +135,37 @@ class ServerTest(unittest.TestCase):
         status, _, _ = get(self.port, "/")
         self.assertEqual(status, 200)
 
+    def test_health_answers_while_store_lock_is_held_and_reports_stack(self):
+        held = threading.Event()
+        release = threading.Event()
+
+        def hold_store_lock():
+            with self.store._lock:
+                held.set()
+                release.wait(2)
+
+        self.server.cfg["response_ttl_s"] = 0
+        self.server.respcache.invalidate_all()
+        holder = threading.Thread(target=hold_store_lock, name="health-lock-owner")
+        holder.start()
+        self.assertTrue(held.wait(1), "test lock holder did not start")
+        try:
+            with mock.patch("dash.server.STORE_LOCK_WATCHDOG_AFTER_S", 0):
+                started = time.monotonic()
+                status, _, body = get(self.port, "/api/health")
+                elapsed = time.monotonic() - started
+        finally:
+            release.set()
+            holder.join(2)
+        self.assertFalse(holder.is_alive(), "test lock holder did not exit")
+        self.assertEqual(status, 200)
+        self.assertLess(elapsed, 0.5)
+        health = json.loads(body)
+        self.assertTrue(health["store_lock"]["held"])
+        self.assertEqual(health["store_lock"]["holder_thread"], "health-lock-owner")
+        self.assertIn("hold_store_lock", health["store_lock"]["holder_stack"])
+        self.assertFalse(health["ok"])
+
     def test_state_builder_does_not_stack_after_a_timed_out_collection(self):
         import dash.server as server_mod
 
@@ -1835,12 +1866,8 @@ class DoctorApiTest(unittest.TestCase):
         self.assertEqual(health["doctor"]["summary"]["critical"], 1)
         self.assertFalse(health["ok"])
         self.store.doctor_snapshot([], time.time())
-        # A background write keeps the TTL generation within the window,
-        # then the invalidated entry recomputes.
-        status, _, body = get(self.port, "/api/health")
-        health = json.loads(body)
-        self.assertEqual(health["doctor"]["summary"]["critical"], 1)
-        self.server.respcache.invalidate_all()
+        # Health is intentionally uncached so lock diagnostics and doctor
+        # status reflect the latest store snapshot on every request.
         status, _, body = get(self.port, "/api/health")
         health = json.loads(body)
         self.assertEqual(health["doctor"]["summary"]["critical"], 0)

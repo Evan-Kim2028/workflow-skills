@@ -191,18 +191,22 @@ class QueriesMixin:
             """One locked pass for ``GET /api/state``: the rollup rows, the
             reconcile mismatches, the live running count by source, the board
             names, and the stale running rows. No nested snapshot calls."""
+            probes = self._probe_liveness(file_mtimes=True)
+            check = self._probe_checker(probes)
             with self._lock:
-                shown_all, parents = self._shown_locked(now)
+                shown_all, parents = self._shown_locked(now, probes)
                 # One evidence pass shared by the live-open set, the
                 # stalled map, and the stale list below (same run list,
                 # same GROUP BYs, computed once).
                 _umax, _smax, _pstarts = self._open_evidence_locked(shown_all)
-                live_open = self._live_open_ids_locked(now, shown_all, None, _umax, _smax, _pstarts)
-                stalled = self._stalled_locked(now, shown_all, None, _umax, _smax)
+                live_open = self._live_open_ids_locked(now, shown_all, check, _umax, _smax, _pstarts)
+                stalled = self._stalled_locked(
+                    now, shown_all, check, _umax, _smax, probes["mtimes"]
+                )
                 roll = self._summarize_locked(shown_all, parents, now, since, until, live_open)
                 mismatches = self._mismatches_locked(
                     roll, shown_all, now, lambda ws: _scope_tab(roll, ws), processes,
-                    evidence=(_umax, _smax, _pstarts),
+                    evidence=(_umax, _smax, _pstarts), liveness=probes,
                 )
                 by_source: dict[str, int] = {}
                 for run in shown_all:
@@ -239,7 +243,7 @@ class QueriesMixin:
                         "label": run.get("label"),
                         "reason": reason,
                     }
-                    for run, reason in self._stale_locked(now, shown_all, None, _umax, _smax, _pstarts)
+                    for run, reason in self._stale_locked(now, shown_all, check, _umax, _smax, _pstarts)
                 ]
                 return {
                     "roll": roll,
@@ -287,14 +291,18 @@ class QueriesMixin:
             span = max(0.0, now - since)
             if span / step > 5000:
                 step = span / 5000
+            probes = self._probe_liveness(file_mtimes=True)
+            check = self._probe_checker(probes)
             with self._lock:
                 runs = [dict(row) for row in self._all_runs()]
                 marker_ids = self._marker_run_ids_locked(
                     [run for run in runs if _is_counted_agent(run)]
                 )
                 _umax, _smax, _pstarts = self._open_evidence_locked(runs)
-                live_open = self._live_open_ids_locked(now, runs, None, _umax, _smax, _pstarts)
-                stalled = self._stalled_locked(now, runs, None, _umax, _smax)
+                live_open = self._live_open_ids_locked(now, runs, check, _umax, _smax, _pstarts)
+                stalled = self._stalled_locked(
+                    now, runs, check, _umax, _smax, probes["mtimes"]
+                )
                 # A stalled row is proven live activity, never a
                 # placeholder: its history stays in the lanes (truncated
                 # at the stall point below) even when it names no model.
@@ -448,12 +456,15 @@ class QueriesMixin:
                     hit = self._workstreams_cache.get(key)
                     if hit is not None:
                         return _copy.deepcopy(hit)
+            probes = self._probe_liveness(file_mtimes=True)
+            check = self._probe_checker(probes)
             with self._lock:
                 counts = [dict(row) for row in self._conn.execute("SELECT * FROM ws_counts").fetchall()]
-                shown_all, parents = self._shown_locked(now)
+                shown_all, parents = self._shown_locked(now, probes)
+                live_open = self._live_open_ids_locked(now, shown_all, check)
                 usage_once = self._usage_by_run()
                 roll = self._summarize_locked(
-                    shown_all, parents, now, since, until, usage=usage_once
+                    shown_all, parents, now, since, until, live_open, usage=usage_once
                 )
             # Lifetime usage split by phase for every row below. Outside
             # the lock (it takes it itself); a rules edit retags through

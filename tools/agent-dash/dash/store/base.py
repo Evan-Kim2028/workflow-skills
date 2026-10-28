@@ -25,6 +25,15 @@ class BaseMixin:
             self.path = Path(path)
             if str(self.path) != ":memory:":
                 self.path.parent.mkdir(parents=True, exist_ok=True)
+            # Attribution reads a map and may scan bundle plans. Load those
+            # snapshots before the store lock exists; locked write paths use
+            # these values and refresh them from public entry points outside
+            # the critical section.
+            from dash.attribution import rules_snapshot
+            from dash.inherit import train_branches
+
+            self._attribution_rules = rules_snapshot()
+            self._train_branches = train_branches()
             from dash import perfmon as _perfmon
 
             self._lock = _perfmon.TimedRLock()
@@ -227,21 +236,25 @@ class BaseMixin:
                         self._pruned_since_vacuum = 0
                     return 0
                 self._prune_after = rows[-1][0]
-                gone = [row[1] for row in rows if _offset_path_gone(row[1])]
-                if gone:
-                    self._conn.execute("BEGIN IMMEDIATE")
-                    try:
-                        self._conn.executemany(
-                            "DELETE FROM file_offsets WHERE path=?",
-                            [(path,) for path in gone],
-                        )
-                        self._conn.execute("COMMIT")
-                    except Exception:
-                        self._conn.execute("ROLLBACK")
-                        raise
-                    self._pruned_since_vacuum += len(gone)
-                    self._seq += 1
-                return len(gone)
+            # File existence checks may touch a mounted workspace. Never run
+            # them while holding the store lock.
+            gone = [row[1] for row in rows if _offset_path_gone(row[1])]
+            if not gone:
+                return 0
+            with self._lock:
+                self._conn.execute("BEGIN IMMEDIATE")
+                try:
+                    self._conn.executemany(
+                        "DELETE FROM file_offsets WHERE path=?",
+                        [(path,) for path in gone],
+                    )
+                    self._conn.execute("COMMIT")
+                except Exception:
+                    self._conn.execute("ROLLBACK")
+                    raise
+                self._pruned_since_vacuum += len(gone)
+                self._seq += 1
+            return len(gone)
         def _create(self) -> None:
             self._conn.executescript(
                 """
@@ -419,6 +432,9 @@ class BaseMixin:
             self._migrate_run_aliases()
             self._migrate_session_hint()
             self._migrate_doctor_items()
+            # /api/health reads this immutable pointer without taking the
+            # store lock. Doctor writes replace it after committing.
+            self._doctor_health_snapshot = self._doctor_latest_locked(_time.time(), None, None)
         def _migrate_lead_split(self) -> None:
             """Once: per-turn workstream numbers and slice links for lead splits.
 
@@ -646,7 +662,9 @@ class BaseMixin:
                 except Exception:
                     self._conn.execute("ROLLBACK")
                     raise
-                return self._doctor_latest_locked(now, None, None)
+                payload = self._doctor_latest_locked(now, None, None)
+                self._doctor_health_snapshot = payload
+                return payload
         def doctor_latest(
             self,
             now: float,

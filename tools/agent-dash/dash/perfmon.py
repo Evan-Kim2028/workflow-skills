@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import threading
 import time
+import sys
+import traceback
 
 WINDOW_S = 600.0
 MAX_SAMPLES = 5000
@@ -308,6 +310,10 @@ class TimedRLock:
         self._lock = threading.RLock()
         self._local = threading.local()
         self._monitor = monitor if monitor is not None else _MONITOR
+        self._meta_lock = threading.Lock()
+        self._owner_ident = None
+        self._owner_name = None
+        self._acquired_at = None
 
     def acquire(self, *args, **kwargs) -> bool:
         depth = getattr(self._local, "depth", 0)
@@ -318,13 +324,30 @@ class TimedRLock:
         wait = time.monotonic() - start
         self._local.depth = depth + 1
         if depth == 0:
-            self._local.entered = time.monotonic()
+            entered = time.monotonic()
+            self._local.entered = entered
             self._local.wait = wait
+            with self._meta_lock:
+                self._owner_ident = threading.get_ident()
+                self._owner_name = threading.current_thread().name
+                self._acquired_at = entered
         return result
 
     def release(self, *args, **kwargs) -> None:
-        self._lock.release(*args, **kwargs)
-        depth = getattr(self._local, "depth", 1) - 1
+        depth = getattr(self._local, "depth", 1)
+        if depth <= 1:
+            # Keep metadata serialized with the underlying release. A new
+            # owner can acquire the RLock immediately, but waits here before
+            # publishing its identity, so the old owner cannot clear it.
+            with self._meta_lock:
+                self._lock.release(*args, **kwargs)
+                if self._owner_ident == threading.get_ident():
+                    self._owner_ident = None
+                    self._owner_name = None
+                    self._acquired_at = None
+        else:
+            self._lock.release(*args, **kwargs)
+        depth -= 1
         self._local.depth = max(0, depth)
         if depth <= 0:
             try:
@@ -335,6 +358,37 @@ class TimedRLock:
             except Exception:
                 pass
             self._local.entered = None
+
+    def diagnostics(self, threshold_s: float = 10.0) -> dict:
+        """Describe a long-held lock without attempting to acquire it."""
+        try:
+            threshold = max(0.0, float(threshold_s))
+        except (TypeError, ValueError):
+            threshold = 10.0
+        with self._meta_lock:
+            owner = self._owner_ident
+            name = self._owner_name
+            acquired = self._acquired_at
+        if owner is None or acquired is None:
+            return {"held": False, "threshold_s": threshold}
+        held_for = max(0.0, time.monotonic() - acquired)
+        result = {
+            "held": held_for >= threshold,
+            "held_for_s": round(held_for, 3),
+            "threshold_s": threshold,
+            "holder_thread": name,
+            "holder_ident": owner,
+        }
+        if held_for < threshold:
+            return result
+        try:
+            frame = sys._current_frames().get(owner)
+            result["holder_stack"] = (
+                "".join(traceback.format_stack(frame, limit=40)) if frame is not None else None
+            )
+        except Exception:
+            result["holder_stack"] = None
+        return result
 
     def __enter__(self):
         self.acquire()
