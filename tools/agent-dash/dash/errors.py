@@ -29,6 +29,9 @@ UNREACHABLE = 5
 # Returned by a Linear-origin bundle write skipped because a local write for the same key is still in the outbox. Internal only: never a CLI exit code.
 SKIPPED_PENDING = 6
 
+# Returned by a status write whose expected current status no longer holds (a lead moved the task). Internal only: never a CLI exit code.
+CONFLICT = 7
+
 CODES = {
     OK: "ok",
     CHECK_FAILED: "check_failed",

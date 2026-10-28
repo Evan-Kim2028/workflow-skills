@@ -22,15 +22,18 @@ Full evidence: [orchestration principles](../../tools/agent-dash/docs/orchestrat
 One cycle, every cycle; the details live in the checklists below.
 
 1. `ws next` — list startable tasks, ranked by what they unblock.
-2. Launch every ready lane up to the worker caps in one wave. One writer per
-   file per wave; disjoint lanes only.
-3. One background watcher per run, then end the turn. Never wait in the lead.
-4. On each finish, before anything else: read only that report, move its
-   status (`ws task`), launch what it unblocked.
+2. Keep the slots full from the ready queue: the dispatcher launches every
+   ready task that has a prompt, up to `slots`. One writer per file per wave;
+   disjoint lanes only.
+3. One background `dispatch wait <WS>` per workstream, then end the turn. Never
+   wait in the lead and never one watcher per run.
+4. On each event, before anything else: read only that report, decide, and
+   write the prompts that the finish unblocked. The dispatcher moves status.
 5. `doctor --ws` each cycle — fix what it lists before the next launch.
 
 Small work is one wide wave. A wave whose start condition holds launches;
-wave numbers never gate it.
+wave numbers never gate it. The dispatcher's one event stream is in
+[the dispatcher doc](../../tools/agent-dash/docs/dispatcher.md).
 
 ## Principles (ordered by measured impact)
 
@@ -149,11 +152,11 @@ over-limit flag gets a re-brief or a successor, not a continuation.
 **Before a wave:** `ws next` lists the lanes; `ws waves` confirms the max
 parallelism; `ws overlap` is clean; every lane has numeric acceptance and a
 review tier; trains re-cut from member diffs (`ws deferred` shows nothing the
-wave assumed). Launch up to caps, one watcher per run.
+wave assumed). Write the prompts, `dispatch start`, then one `dispatch wait`.
 
-**After each finish:** read only that report → move status (`ws task`) →
-launch what it unblocked → then read the next report. Finished runs are
-picked up before any new launch.
+**After each event:** read only that finished report → decide → write the
+prompts it unblocked → re-arm `dispatch wait`. Finished runs are picked up
+before any new prompt.
 
 **End of day:** `doctor report --md`; deferred ledger reviewed (`ws deferred`
 names each receiving end); `state.md` current; tomorrow's ready set named.

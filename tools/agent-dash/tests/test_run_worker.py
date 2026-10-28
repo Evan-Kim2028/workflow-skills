@@ -586,6 +586,47 @@ class RunWorkerTests(unittest.TestCase):
         self.assertLessEqual(len(kept), MAX_ENTRIES)
 
 
+    def test_exclude_keeps_auto_off_the_failed_tier(self):
+        self.counts = {}
+        launch = Launch()
+        from io import StringIO
+        import contextlib
+
+        argv = ["auto", "ws1-exec-lane-1-r1", str(self.ws), str(self.prompt), str(self.run_dir), "0",
+                "--no-preflight", "--exclude=muse"]
+        buf = StringIO()
+        with contextlib.redirect_stdout(buf):
+            code = runner.run(argv, spawn=launch.spawn, pgrep=self.pgrep, sleep=lambda _s: None,
+                              now=lambda: NOW, alive=launch.is_alive, new_uuid=lambda: SID)
+        self.assertEqual(code, 0)
+        self.assertIn("tier=glm-flash", buf.getvalue())
+        self.assertNotIn("tier=muse", buf.getvalue())
+        self.assertNotEqual(launch.cmds[0][0], "muse")
+
+    def test_eligible_never_offers_an_excluded_tier_on_a_later_observe(self):
+        reg = registry()
+        ctx = {
+            "registry": reg,
+            "hooks": {"now": lambda: NOW, "pgrep": lambda pattern: 0},
+            "cooldowns": {},
+            "minutes": 1,
+            "exclude": {"muse"},
+        }
+        self.assertNotEqual(runner.eligible(ctx, set()), "muse")
+        self.assertIsNotNone(runner.eligible(ctx, set()))
+
+    def test_zero_wait_detaches_and_later_call_observes(self):
+        launch = Launch(alive=True)
+        code, line = self.go("muse", launch, label="ws1-exec-lane-1")
+        self.assertEqual(code, 0)
+        self.assertTrue(line.startswith("STATUS: running"), line)
+        self.assertEqual(len(launch.cmds), 1)
+        launch.alive = False
+        code, line = self.go("muse", launch, label="ws1-exec-lane-1")
+        self.assertEqual(len(launch.cmds), 1, "second call must observe, not relaunch")
+        self.assertTrue(line.startswith("STATUS: done"), line)
+
+
 class PreflightTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -811,7 +852,6 @@ class CooldownRaceTests(unittest.TestCase):
         data = runner.read_cooldowns(path)
         for i in range(20):
             self.assertIn(f"tier-{i}", data)
-
 
 if __name__ == "__main__":
     unittest.main()

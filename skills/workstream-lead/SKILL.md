@@ -20,7 +20,7 @@ The lead plans, decides, verifies, and reports. Workers do everything else. Rela
 
 ## Each wave
 
-Execution follows the [orchestration loop](../workstream-orchestration/SKILL.md#the-loop): `ws next`, launch every ready lane up to caps, one watcher per run, and on each finish read only that report, move status, and launch what it unblocked before anything else. The five rules below were the most violated in measured runs; treat them as hard stops, not advice.
+Execution follows the [orchestration loop](../workstream-orchestration/SKILL.md#the-loop). The dispatcher does the launching: write `prompts/<task-id>.md` for each ready task, run `agent_dash.py dispatch start <WS>` once, then arm one `dispatch wait <WS>` in the background. On each event read only that report, decide, and write the next prompts before anything else. The dispatcher moves tasks to `wip`, `pr` and `done` itself; see [the dispatcher doc](../../tools/agent-dash/docs/dispatcher.md). The five rules below were the most violated in measured runs; treat them as hard stops, not advice.
 
 1. Build the lane list from the execution plan. Lanes in one wave share no file or test file. Use explicit review checks for lanes that need them, and flag irreversible or production-adjacent lanes.
 2. Run one lane per sub-agent, in parallel. Each lane goes build, then review, then fix and re-review until approved or out of fix rounds.
@@ -34,7 +34,7 @@ Execution follows the [orchestration loop](../workstream-orchestration/SKILL.md#
 ### Five hard rules
 
 - **Delegate every multi-step job.** The lead plans, decides, verifies, and reports; workers do everything else. Any read of more than one or two files, any run longer than a few minutes, any wait goes to a worker.
-- **Never foreground-wait.** Waits go to one background watcher per run or a cheap worker returning one verdict. Never sleep in the lead thread.
+- **Never foreground-wait.** Waits go to the one background `dispatch wait` per workstream or a cheap worker returning one verdict. Never sleep in the lead thread, and never hand-launch or pgrep-watch a run the dispatcher owns.
 - **Never kill to rescope.** A killed run leaves no report and its cost is lost. Let it finish, or launch a separate run; attempt limits count per failure class: retry once a fix for that class has landed, and a third failure of the same class replans that task (smaller, or another route). A blocked task parks that one task, never the workstream, so every other lane keeps running.
 - **Never ask the owner.** Never call AskUserQuestion, and never ask in plain text. Log the question as a decision with its basis and rollback, keep refilling every other lane, and end the turn with watchers armed. The lead guard hook enforces this.
 - **Move status as events happen.** `wip` on launch, `pr` on open, `done` on merged-and-live — in the same step, not at end of day.
