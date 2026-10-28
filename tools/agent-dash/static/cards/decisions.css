@@ -19,3 +19,7 @@
 .dc-link{font-size:13px;overflow-wrap:anywhere}
 .dc-linktext{font-size:13px;color:var(--ink-2);overflow-wrap:anywhere}
 .dc-acts{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}
+
+/* Production decisions log table (static/cards/production-log.js). */
+.pl-table{width:100%;border-collapse:collapse;font-size:13px}
+.pl-table th,.pl-table td{text-align:left;padding:6px 8px;border-bottom:1px solid var(--line);vertical-align:top}

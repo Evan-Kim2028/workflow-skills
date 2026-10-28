@@ -109,7 +109,6 @@ def doctor_cfg(cfg: dict | None) -> dict:
     out = {
         "interval_s": 300.0,
         "stuck_hours": 6.0,
-        "approval_days": 3.0,
         "train_hours": 24.0,
         "idle_ready_minutes": 30.0,
         "long_tail_minutes": 60.0,
@@ -126,7 +125,7 @@ def doctor_cfg(cfg: dict | None) -> dict:
         },
     }
     for key in (
-        "interval_s", "stuck_hours", "approval_days", "train_hours",
+        "interval_s", "stuck_hours", "train_hours",
         "idle_ready_minutes", "long_tail_minutes", "recent_hours",
         "archive_nag_days", "active_idle_days", "phase_slip_days",
     ):
@@ -1900,7 +1899,7 @@ def _dep_cycle(deps: dict[str, list[str]]) -> list[str] | None:
 
 
 def _collect_bundles(ctx) -> None:
-    from dash.bundles import approvals_for, list_bundles, validate_bundle
+    from dash.bundles import list_bundles, validate_bundle
     from dash.taskmatch import load_taskmap, task_of
 
     try:
@@ -1913,7 +1912,7 @@ def _collect_bundles(ctx) -> None:
             f"bundle list failed: {exc}",
             "python3 agent_dash.py ws list",
         )
-        for name in ("workstream", "approvals", "trains"):
+        for name in ("workstream", "owner-queue", "trains"):
             _check(ctx, name, True, "skipped, bundle list failed")
         return
     failing: dict[str, list[str]] = {}
@@ -1961,10 +1960,10 @@ def _collect_bundles(ctx) -> None:
         f"{len(bundles)} workstreams checked, {hygiene} stuck or inconsistent tasks" if hygiene
         else f"{len(bundles)} workstreams, no stuck or inconsistent tasks",
     )
-    stale = _collect_approvals(ctx, approvals_for, bundles)
+    queued = _collect_owner_queue(ctx, bundles)
     _check(
-        ctx, "approvals", not stale,
-        f"{stale} pending approvals past their window" if stale else "no approval past its window",
+        ctx, "owner-queue", True,
+        f"{queued} workstreams with owner-queue items (info, never pages)" if queued else "owner queue empty",
     )
     stuck = _collect_trains(ctx, bundles)
     _check(
@@ -2071,46 +2070,26 @@ def _collect_workstream(ctx, ws: str, taskmap: dict, runs: list, live_ids: set, 
     return count
 
 
-def _collect_approvals(ctx, approvals_for, bundles) -> int:
-    """Pending approvals older than the window. Returns the problem count."""
-    from dash.bundles import bundle_dir
+def _collect_owner_queue(ctx, bundles) -> int:
+    """Owner-queue info items: one per workstream whose reports/<WS>/owner-queue.md holds lines. Never pages. Returns the workstream count."""
+    from dash.decisions import owner_queue_lines, resolve_hub_dir
 
-    limit_s = ctx.dcfg["approval_days"] * 86400
+    hub = resolve_hub_dir(ctx.cfg)
     count = 0
     for item in bundles:
         ws = item["id"]
-        try:
-            record = approvals_for(ws)
-        except Exception:
+        lines = owner_queue_lines(hub, ws)
+        if not lines:
             continue
-        if not isinstance(record, dict):
-            continue
-        pending = [
-            entry for entry in (record.get("items") or [])
-            if isinstance(entry, dict) and entry.get("status") == "pending"
-        ]
-        if not pending:
-            continue
-        path = bundle_dir(ws)
-        try:
-            mtime = (path / "approvals.json").stat().st_mtime if path is not None else None
-        except OSError:
-            mtime = None
-        if mtime is None or ctx.now - mtime <= limit_s:
-            continue
-        days = (ctx.now - mtime) / 86400
-        for entry in pending:
-            item_id = str(entry.get("id") or "")
-            label = _item_label(entry.get("step"), item_id)
-            _add(
-                ctx, "approval-stale", "warn", f"ws:{ws}", ws,
-                f"{label} approval has waited too long",
-                f"{label} approval in {ws} has been "
-                f"pending for {days:.1f} days (limit {ctx.dcfg['approval_days']:g} days)",
-                f"python3 agent_dash.py ws approvals {ws}",
-                key=item_id or slug(str(entry.get("step"))),
-            )
-            count += 1
+        count += 1
+        noun = "item" if len(lines) == 1 else "items"
+        _add(
+            ctx, "owner-queue", "info", f"ws:{ws}", ws,
+            f"{ws} has {len(lines)} owner-queue {noun}",
+            f"{len(lines)} {noun} an agent cannot do itself, in reports/{ws}/owner-queue.md: "
+            + "; ".join(lines[:3])[:300],
+            f"clear reports/{ws}/owner-queue.md once the owner has acted",
+        )
     return count
 
 

@@ -271,7 +271,7 @@ class WsCliTest(unittest.TestCase):
         self.assertEqual(data["items"][0]["status"], "pending")
         self.assertIs(data["items"][0]["reversible"], False)
         self.assertEqual(validate_bundle("WS9"), [])
-        self.assertEqual(cmd_ws(["approve", "WS9", "sample-load", "approved", "--note", "Owner signed off."]), 0)
+        self.assertEqual(cmd_ws(["approve", "WS9", "sample-load", "approved", "--note", "Owner signed off.", "--by", "owner"]), 0)
         data = json.loads((root / "approvals.json").read_text(encoding="utf-8"))
         self.assertEqual(data["items"][0]["status"], "approved")
         self.assertEqual(data["items"][0]["note"], "Owner signed off.")
@@ -918,18 +918,50 @@ class WsLinearCliTest(unittest.TestCase):
         self.assertEqual(last["task"], "WS9.2")
         self.assertEqual([row["key"] for row in self._outbox()], ["WS9.1"])
 
-    def test_set_approval_enqueues_when_linked(self):
+    def test_set_approval_queues_no_linear_issue_when_linked(self):
+        """Approvals are a decision log: a logged step never creates a Linear ask."""
         self._link_file()
         with contextlib.redirect_stdout(io.StringIO()):
             bundles.set_approval("WS9", "A1", "pending", "Deploy tier", True, "Prod window", None, root=self.root)
-        self.assertEqual([(row["kind"], row["key"]) for row in self._outbox()], [("approval", "A1")])
+            bundles.set_approval("WS9", "A1", "approved", "Deploy tier", True, "Prod window", None, root=self.root)
+        self.assertEqual(self._outbox(), [])
 
-    def test_decided_by_names_linear_only_for_linear_origin(self):
+    def test_rollback_and_decider_are_recorded_per_item(self):
+        self._link_file()
+        with contextlib.redirect_stdout(io.StringIO()):
+            rc = bundles.set_approval("WS9", "A1", "approved", "Deploy tier", True, "Prod window", None,
+                                      root=self.root, rollback="revert commit abc123", by="lead")
+        self.assertEqual(rc, 0)
+        data = json.loads((self.root / "WS9" / "approvals.json").read_text(encoding="utf-8"))
+        item = data["items"][0]
+        self.assertEqual(item["rollback"], "revert commit abc123")
+        self.assertEqual(item["decided_by"], "lead")
+        self.assertTrue(item["decided_at"])
+        self.assertEqual(data["decided_by"], "lead")
+
+    def test_pending_item_has_no_decider_or_time(self):
+        with contextlib.redirect_stdout(io.StringIO()):
+            bundles.set_approval("WS9", "A1", "pending", "Deploy tier", True, "Prod window", None, root=self.root)
+        item = json.loads((self.root / "WS9" / "approvals.json").read_text(encoding="utf-8"))["items"][0]
+        self.assertEqual(item["status"], "pending")
+        self.assertNotIn("decided_at", item)
+        self.assertNotIn("decided_by", item)
+
+    def test_ws_approve_flags_rollback_and_by(self):
+        self._link_file()
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(self._run(["approve", "WS9", "A1", "approved", "--step", "Deploy tier", "--reversible", "yes",
+                                        "--conditions", "Window open", "--rollback", "revert", "--by", "lead"])[0], 0)
+        item = json.loads((self.root / "WS9" / "approvals.json").read_text(encoding="utf-8"))["items"][0]
+        self.assertEqual(item["rollback"], "revert")
+        self.assertEqual(item["decided_by"], "lead")
+
+    def test_decided_by_defaults_to_lead_and_names_linear_for_linear_origin(self):
         self._link_file()
         with contextlib.redirect_stdout(io.StringIO()):
             bundles.set_approval("WS9", "A1", "approved", "Deploy tier", True, "Prod window", None, root=self.root)
         data = json.loads((self.root / "WS9" / "approvals.json").read_text(encoding="utf-8"))
-        self.assertEqual(data["decided_by"], "owner")
+        self.assertEqual(data["decided_by"], "lead")
         with contextlib.redirect_stdout(io.StringIO()):
             bundles.set_approval("WS9", "A2", "denied", "Canary", False, "", None, root=self.root, origin="linear")
         data = json.loads((self.root / "WS9" / "approvals.json").read_text(encoding="utf-8"))

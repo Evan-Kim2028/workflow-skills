@@ -86,6 +86,9 @@
     {id: "decisions", order: 58, scope: "project", spec: function (state, snap) {
       return decisionsSpec(state, snap);
     }},
+    {id: "production-log", order: 59, scope: "project", spec: function (state, snap) {
+      return productionLogSpec(state, snap);
+    }},
     /* Cross-workstream dependency graph: one file, one line per scope over
        the same spec (both views mount the exec-depgraph slot). */
     {id: "depgraph", order: 62, scope: "project", slot: "exec-depgraph", spec: function (state, snap) {

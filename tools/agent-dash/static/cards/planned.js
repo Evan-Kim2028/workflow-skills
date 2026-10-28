@@ -1,6 +1,6 @@
 /* Page card: Planned view (?view=planned).
    Start-readiness per planned workstream (depends-on, gate freshness with
-   stale markers, approvals pending, tasks, Ready pill), the "Gated but
+   stale markers, logged decisions, tasks, Ready pill), the "Gated but
    live" section for active workstreams held by an unmet owner/sign-off
    gate, and the slot mount point for the dependency chart.
    Gate freshness mirrors dash/orchestrate.py stale_gates: a gate is STALE
@@ -42,18 +42,18 @@
     });
     var unmetGates = gates.filter(function (t) { return t.status !== "done"; });
     var staleGates = unmetGates.filter(function (t) { return gateStale(t, nowS); });
-    var pending = 0;
+    /* Production decisions are logged, never waited on: only deps and gates hold a start. */
+    var decided = 0;
     (approvalsAll || []).forEach(function (b) {
       if (!b || b.ws !== row.ws) return;
-      (b.items || []).forEach(function (it) { if (it && it.status === "pending") pending++; });
+      (b.items || []).forEach(function (it) { if (it && (it.status === "approved" || it.status === "denied")) decided++; });
     });
     var pr = row.progress || {done: 0, total: 0};
-    var ready = !unmetDeps.length && !unmetGates.length && !pending;
-    var reason = ready ? "dependencies met, gates met, no approvals pending"
+    var ready = !unmetDeps.length && !unmetGates.length;
+    var reason = ready ? "dependencies met, gates met"
       : unmetDeps.length ? "waiting on " + unmetDeps.join(", ")
       : staleGates.length ? staleGates.length + " stale " + (staleGates.length === 1 ? "gate" : "gates")
-      : unmetGates.length ? unmetGates.length + " unmet " + (unmetGates.length === 1 ? "gate" : "gates")
-      : pending + " " + (pending === 1 ? "approval" : "approvals") + " pending";
+      : unmetGates.length + " unmet " + (unmetGates.length === 1 ? "gate" : "gates");
     var depText = deps.length ? deps.join(", ") : "none";
     if (unmetDeps.length) depText += " (" + unmetDeps.length + " unmet)";
     var gateText = gates.length
@@ -63,7 +63,7 @@
       depends: deps, unmetDeps: unmetDeps, depText: depText,
       gates: gates.length, unmetGates: unmetGates.length, staleGates: staleGates.length, gateText: gateText,
       gateTitle: gates.map(function (t) { return (t.id || "gate") + " — " + (t.status === "done" ? "\u2713 met" : gateStale(t, nowS) ? "STALE" : "waiting"); }).join("\n"),
-      pending: pending, done: pr.done || 0, total: pr.total || 0,
+      decided: decided, done: pr.done || 0, total: pr.total || 0,
       ready: ready, reason: reason,
       waitText: deps.length ? "waits on: " + deps.join(", ") : "waits on: nothing — " + reason
     };
@@ -117,7 +117,7 @@
   }
   function readinessTable() {
     var c = el("div", {class: "card pj-ready", "data-nav": "Start readiness"});
-    c.appendChild(secHead("Start readiness", "Can we start it? Dependencies, gates, and approvals per planned workstream."));
+    c.appendChild(secHead("Start readiness", "Can we start it? Dependencies and gates per planned workstream; logged decisions never block a start."));
     var rows = plannedShelfRows();
     if (!rows.length) {
       c.appendChild(el("p", {class: "pj-note", text: "No planned workstreams: every bundle has a tab."}));
@@ -134,7 +134,7 @@
       el("col", {class: "cw-tasks"}), el("col"), el("col", {class: "cw-actions"})]));
     var head = el("tr");
     /* Header cells carry the same .c-* class as their column's cells. */
-    [["WS", "c-label"], ["Depends on", "c-text"], ["Gates", "c-text"], ["Approvals", "c-text"],
+    [["WS", "c-label"], ["Depends on", "c-text"], ["Gates", "c-text"], ["Decisions", "c-text"],
       ["Tasks", "c-num"], ["Ready?", "c-text"], ["Action", "c-actions"]].forEach(function (pair) {
       head.appendChild(el("th", {scope: "col", class: pair[1], text: pair[0]}));
     });
@@ -151,7 +151,7 @@
       tr.appendChild(wsCell);
       tr.appendChild(el("td", {class: "c-text", text: r.depText, title: r.depText}));
       tr.appendChild(el("td", {class: "c-text", text: r.gateText, title: r.gateTitle || r.gateText}));
-      tr.appendChild(el("td", {class: "c-text", text: r.pending ? r.pending + " pending" : "none"}));
+      tr.appendChild(el("td", {class: "c-text", text: r.decided ? r.decided + " logged" : "none"}));
       tr.appendChild(el("td", {class: "c-num", text: r.done + "/" + r.total}));
       var readyCell = el("td", {class: "c-text"});
       readyCell.appendChild(el("span", {class: "pj-pill " + (r.ready ? "ok" : "wait"), text: r.ready ? "\u2713 Ready" : "\u25CB Not yet", title: r.reason}));

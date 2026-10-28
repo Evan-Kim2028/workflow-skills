@@ -175,12 +175,12 @@ python3 agent_dash.py ws render <ID>
 python3 agent_dash.py ws task <ID> <task-id> <status>
 python3 agent_dash.py ws train <ID> <train-id> [--title T] [--status S] [--add id,id]
 python3 agent_dash.py ws trains <ID>
-python3 agent_dash.py ws approve <ID> <item-id> pending --step "<step>" --reversible yes --conditions "<conditions>"
+python3 agent_dash.py ws approve <ID> <item-id> approved --step "<step>" --reversible yes --conditions "<conditions>" --rollback "<undo>" --by lead
 python3 agent_dash.py ws approvals
 python3 agent_dash.py ws approvals <ID>
 ```
 
-`ws task` status is `todo`, `wip`, `pr`, `prog`, `done`, or `deferred`. It accepts `--moved-to WSn` and `--note "..."` only with status `deferred`. `ws approve` status is `pending`, `approved`, or `denied`. `--reversible` is `yes` or `no`. `backfill` requires `--session`. With no subcommand, `agent_dash.py` starts the server, the same as `run`.
+`ws task` status is `todo`, `wip`, `pr`, `prog`, `done`, or `deferred`. It accepts `--moved-to WSn` and `--note "..."` only with status `deferred`. `ws approve` status is `approved` or `denied` (`pending` is accepted but nothing waits on it). `--reversible` is `yes` or `no`. `--rollback` is the one-line undo and `--by` names the decider (default `lead`). `backfill` requires `--session`. With no subcommand, `agent_dash.py` starts the server, the same as `run`.
 
 `reconcile` marks grok, muse, and glm rows whose process is gone. It prints `reconcile ended <count>`.
 

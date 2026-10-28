@@ -1,9 +1,8 @@
 """Payload for the Linear card on the Execution view (``GET /api/linear``).
 
 Pure read over the linked bundles: each linked workstream's ``linear.json``
-(sync state, project link, pending approval refs), its ``history.jsonl``
-(status moves, ``by: "linear"`` rows counted as Linear, the rest as local),
-its ``approvals.json`` (pending items) and ``plan.json`` (task titles). Never
+(sync state, project link), its ``history.jsonl`` (status moves, ``by: "linear"``
+rows counted as Linear, the rest as local) and ``plan.json`` (task titles). Never
 writes, never calls the network, never includes a token: the sign-in is the
 method word only (``oauth``, ``key`` or ``none``).
 """
@@ -114,25 +113,6 @@ def _recent(rows: list[dict], titles: dict[str, str]) -> list[dict]:
     return out
 
 
-def _pending(ws: str, link: dict, root: Path | None) -> list[dict]:
-    """Pending approvals with their Linear identifier and https url, from the link's approval refs."""
-    record = bundles.approvals_for(ws, root) or {}
-    refs = link.get("approvals") if isinstance(link.get("approvals"), dict) else {}
-    out = []
-    for item in record.get("items") or []:
-        if not isinstance(item, dict) or item.get("status") != "pending" or not isinstance(item.get("id"), str):
-            continue
-        ref = refs.get(item["id"]) if isinstance(refs.get(item["id"]), dict) else {}
-        identifier = ref.get("identifier") if isinstance(ref.get("identifier"), str) else None
-        out.append({
-            "id": item["id"],
-            "step": item.get("step") if isinstance(item.get("step"), str) else item["id"],
-            "identifier": identifier,
-            "url": linear._https_url(ref.get("url")),
-        })
-    return out
-
-
 def _workstream(bundle: dict, root: Path | None, now: float) -> dict | None:
     ws = bundle["id"]
     link = linear.read_link(ws, root)
@@ -152,7 +132,6 @@ def _workstream(bundle: dict, root: Path | None, now: float) -> dict | None:
         "outbox": int(state.get("outbox") or 0),
         "last_update_at": _finite(link.get("last_update_at")),
         "recent": _recent(rows, titles),
-        "pending_approvals": _pending(ws, link, root),
     }
     for key, window in WINDOWS:
         body[key] = _counts(rows, now, window)
@@ -178,7 +157,7 @@ def _cache_key(root: Path | None) -> tuple:
         if not linear.is_linked(ws, root):
             continue
         directory = bundles.bundle_dir(ws, root)
-        stamps = [bundles._file_stamp(directory / name) for name in ("history.jsonl", "approvals.json", "plan.json")] if directory else []
+        stamps = [bundles._file_stamp(directory / name) for name in ("history.jsonl", "plan.json")] if directory else []
         parts.append((ws, linear.stamp(ws, root), tuple(stamps)))
     return tuple(parts)
 

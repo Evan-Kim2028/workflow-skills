@@ -55,7 +55,7 @@ The full rules are T1 to T5 in the [orchestration skill](../workstream-orchestra
 
 ## Production steps
 
-- Record each production step in `approvals.json` before running it: `ws approve <ID> <id> approved --step ... --reversible ... --conditions ... --note "<basis; rollback>"`. Follow its conditions. Run one production step at a time across all workstreams that share the slot.
+- Record each production step in `approvals.json` before running it: `ws approve <ID> <id> approved --step ... --reversible ... --conditions ... --rollback "<undo>" --by lead`. Nothing waits on the owner; follow the step's conditions. Run one production step at a time across all workstreams that share the slot.
 - A reversible step runs once its conditions hold. An irreversible step (`--reversible no`) runs only after a dry run and a named verification signal, with its rollback written down. If the agent cannot do a step, put one line in `reports/<ID>/owner-queue.md` and keep the rest of the workstream moving.
 - An owner `denied` item in `approvals.json`, or an instruction the owner gives in the session, overrides the lead's decision.
 - Waits (deploys, soaks, shadow windows) go to a background watcher or a cheap worker that returns one verdict. Never sleep in the lead thread.

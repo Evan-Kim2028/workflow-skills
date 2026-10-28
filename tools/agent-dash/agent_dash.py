@@ -162,7 +162,6 @@ def default_cfg() -> dict:
         "doctor": {
             "interval_s": 300,
             "stuck_hours": 6,
-            "approval_days": 3,
             "train_hours": 24,
             "model_policy": {
                 "muse_reasoning_effort": "xhigh",

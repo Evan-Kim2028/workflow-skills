@@ -1893,11 +1893,14 @@ setTimeout(function () {
             "var r=readinessOf(ws9,PLAN9,APPROVALS,states,NOW);"
             "assert.strictEqual(r.ready,false);"
             "assert.ok(r.reason.indexOf('WS6')>=0,'reason names the blocking workstream: '+r.reason);"
-            "assert.strictEqual(r.pending,2);"
+            "assert.strictEqual(r.decided,0);"
+            "assert.strictEqual(r.pending,undefined);"
             "assert.strictEqual(r.gates,1);"
             "assert.strictEqual(r.staleGates,1);"
             "assert.strictEqual(r.done,0);"
             "assert.ok(r.waitText.indexOf('WS6')>=0);"
+            "var pendOnly=readinessOf({ws:'WSP',depends_on:[],progress:{done:0,total:1}},{groups:[]},[{ws:'WSP',items:[{id:'x',status:'pending'}]}],{WSP:'active'},NOW);"
+            "assert.strictEqual(pendOnly.ready,true,'a pending decision never blocks a start');"
             "var okRow={ws:'WSX',depends_on:[],progress:{done:1,total:1}};"
             "var rok=readinessOf(okRow,{groups:[]},[],{WSX:'planned'},NOW);"
             "assert.strictEqual(rok.ready,true);"
@@ -1923,6 +1926,53 @@ setTimeout(function () {
             text=True,
         )
         self.assertEqual(proc.returncode, 0, proc.stderr or proc.stdout)
+
+    def test_production_log_rows_on_fixtures(self):
+        """The Production decisions log flattens the approvals fixture: decided rows first, undecided rows last, no waiting state."""
+        import json as _json
+
+        fx = Path(__file__).resolve().parent.parent / "fixtures"
+        approvals = _json.loads((fx / "approvals.json").read_text())["approvals"]
+        harness = (
+            "const fs=require('fs');"
+            "globalThis.window=globalThis;"
+            "eval(fs.readFileSync(process.argv[1],'utf8'));"
+            "const assert=require('assert');"
+            "var A=" + _json.dumps(approvals) + ";"
+            "var rows=productionLogRows(A);"
+            "assert.strictEqual(rows.length,13);"
+            "assert.deepStrictEqual(Object.keys(rows[0]).sort(),['at','decidedBy','decision','id','rollback','step','ws']);"
+            "var sorted=sortProductionLog(rows);"
+            "var decided=sorted.filter(function(r){return r.decision==='approved'||r.decision==='denied';});"
+            "var logged=sorted.filter(function(r){return r.decision==='pending';});"
+            "assert.strictEqual(decided.length,9);"
+            "assert.strictEqual(logged.length,4);"
+            "assert.deepStrictEqual(sorted.slice(0,9).map(function(r){return r.decision==='pending';}),Array(9).fill(false));"
+            "assert.ok(logged.every(function(r){return r.decidedBy==='' && r.at===null;}));"
+            "assert.strictEqual(productionLogRows([{ws:'WSN',items:[{id:'a',step:'s',status:'pending'}]}])[0].decision,'pending');"
+            "var stamped=sortProductionLog([{decision:'approved',at:'2026-01-01T00:00:00Z'},{decision:'denied',at:'2026-03-01T00:00:00Z'},{decision:'approved',at:null}]);"
+            "assert.strictEqual(stamped[0].at,'2026-03-01T00:00:00Z');"
+            "assert.strictEqual(stamped[2].at,null);"
+            "console.log('ok');"
+        )
+        proc = subprocess.run(
+            ["node", "-e", harness, str(STATIC / "cards" / "production-log.js")],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr or proc.stdout)
+
+    def test_production_log_card_is_read_only_and_waits_on_nothing(self):
+        log_js = (STATIC / "cards" / "production-log.js").read_text()
+        page = (STATIC / "index.html").read_text()
+        reg = (STATIC / "cards" / "registry.js").read_text()
+        linear_js = (STATIC / "cards" / "linear.js").read_text()
+        self.assertIn("/static/cards/production-log.js", page)
+        self.assertIn('{id: "production-log", order: 59, scope: "project"', reg)
+        for token in ("Needs you", "Needs a decision", "Waiting on", "fetch(", "apiPost", "api(\"/api/approvals"):
+            self.assertNotIn(token, log_js, f"production-log.js names {token!r}")
+        self.assertNotIn("Waiting on a decision in Linear", linear_js)
+        self.assertNotIn("pending_approvals", linear_js)
 
     def _keyof_args(self, text):
         """Yield each keyOf(...) argument, honouring nesting and strings."""
@@ -4540,7 +4590,7 @@ class LinearCardRulesTests(unittest.TestCase):
 
     def test_linear_links_open_in_new_tab_with_label(self):
         self.assertIn('target: "_blank", rel: "noopener"', self.js)
-        self.assertGreaterEqual(self.js.count('"aria-label": "Open '), 2)
+        self.assertGreaterEqual(self.js.count('"aria-label": "Open '), 1)
         self.assertIn('text: "Linear ↗"', self.js)
         self.assertIn(r"/^https:\/\//", self.js)
 

@@ -61,7 +61,7 @@ Labels pin runs to workstreams and task chips. Verdicts are `PASS`, `PARTIAL`, `
 - **Add a workstream tab from a plan file.** Write the decision JSON (`dag` with `cols`, `groups[].tasks[{id,title,status}]`, `edges`) and add `"WSn": "<path>"` to `plans.local.json`. The tab appears on refresh.
 - **Add a workstream bundle.** `python3 agent_dash.py ws new WS4 "Read path"`, fill `plan.json`, then `ws render WS4` and `ws validate WS4`. Bundles live under `AGENT_DASH_WORKSTREAMS` and stay out of the repo.
 - **Move a task.** `python3 agent_dash.py ws task <ID> <task> <todo|wip|pr|prog|done|deferred>`. Status edits read live.
-- **Record a train or approval.** `ws train` / `ws trains`, `ws approve` / `ws approvals`. The lead reads approvals before any production step.
+- **Record a train or production decision.** `ws train` / `ws trains`, `ws approve` / `ws approvals`. Decisions are a read-only log on the project view; nothing waits on them.
 - **Link a workstream to Linear.** `python3 agent_dash.py ws linear link <ID> --team <KEY>`, with `LINEAR_API_KEY` set. See [Linear as a task backend](../../tools/agent-dash/docs/linear.md).
 - **Read the Linear card.** On a linked workstream the dashboard shows a Linear card: status changes by source over 24 hours and 7 days, one row per linked workstream (project link, sync age, sign-in method, queued changes), recent changes, and approvals waiting in Linear. It is hidden when no workstream is linked. The data comes from `GET /api/linear`, local and read-only. See [The Linear card](../../tools/agent-dash/docs/linear.md#the-linear-card).
 - **Map a label to a task.** Exact label or `/regex/` to task id under the workstream in `static/taskmap.local.json`. No restart.

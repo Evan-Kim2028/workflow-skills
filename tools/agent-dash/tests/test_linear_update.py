@@ -146,7 +146,6 @@ class BodyTest(UpdateTest):
                 "**Changed since the last update**",
                 "**In progress now**",
                 "**Next up**",
-                "**Needs a decision**",
             ],
         )
         self.assertTrue(body.startswith("Move the notes store to Postgres.\n\n**Progress:**"))
@@ -180,9 +179,11 @@ class BodyTest(UpdateTest):
         self.assertIn("**In progress now**\n- Wire the loader", body)
         self.assertIn("**Next up**\n- Write the docs", body)
 
-    def test_pending_approvals_are_listed_by_step(self):
+    def test_production_decisions_are_not_in_the_standup(self):
+        """Decisions are logged in the agent-dash log, never asked of the owner in the Linear update."""
         body = self._update()["body"]
-        self.assertIn("**Needs a decision**\n- Approve the production load", body)
+        self.assertNotIn("Needs a decision", body)
+        self.assertNotIn("Approve the production load", body)
         self.assertNotIn("Old gate", body)
 
     def test_empty_sections_say_so(self):
@@ -191,7 +192,7 @@ class BodyTest(UpdateTest):
         body = self._update()["body"]
         self.assertIn("**In progress now**\n- None.", body)
         self.assertIn("**Next up**\n- Nothing is ready.", body)
-        self.assertIn("**Needs a decision**\n- Nothing waits on a decision.", body)
+        self.assertNotIn("Needs a decision", body)
 
 
 class ChangedTest(UpdateTest):
@@ -244,7 +245,7 @@ class LimitTest(UpdateTest):
         tasks = [{"id": f"WS9.{200 + i}", "title": f"Ready {i}", "status": "todo", "deps": []} for i in range(7)]
         self.plan["dag"]["groups"][0]["tasks"] = tasks
         body = self._update()["body"]
-        section = body.split("**Next up**\n")[1].split("\n\n")[0]
+        section = body.split("**Next up**\n")[1].strip().split("\n\n")[0]
         self.assertEqual(section.count("\n") + 1, 5)
 
 
@@ -631,10 +632,8 @@ class StandupSafetyTest(UpdateTest):
 
     def test_plan_text_is_escaped_for_markdown(self):
         self.plan["dag"]["groups"][0]["tasks"][1]["title"] = "# Wire *the* @team\n- [loader](x) `code`"
-        self.approvals["items"][0]["step"] = "> Approve_the_load\n\n@here"
         body = self._update()["body"]
         self.assertIn(r"\# Wire \*the\* \@team - \[loader\]\(x\) \`code\`", body)
-        self.assertIn(r"- \> Approve\_the\_load \@here", body)
         self.assertNotRegex(body, r"(?<!\\)@")
 
 if __name__ == "__main__":

@@ -22,11 +22,10 @@
 .lin-link{font-size:13px;color:color-mix(in srgb,var(--accent) 85%,var(--ink));text-decoration:underline;text-underline-offset:2px}
 .lin-link.lin-off{color:var(--ink-2);text-decoration:none}
 .lin-h{font-size:13px;font-weight:700;margin:16px 0 6px;color:var(--ink-2)}
-.lin-recent-list,.lin-pending-list{list-style:none;margin:0;padding:0}
+.lin-recent-list{list-style:none;margin:0;padding:0}
 .lin-recent{padding:8px 0;border-bottom:1px solid var(--grid)}
 .lin-recent:last-child{border-bottom:0}
 .lin-recent-title{font-size:13px}
 .lin-recent-meta{font-size:12.5px;color:var(--muted);margin-top:2px}
-.lin-pending{display:flex;gap:10px;flex-wrap:wrap;align-items:baseline;padding:6px 0;font-size:13px}
 .lin-acts{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}
 .lin-card .pj-note{font-size:12.5px;color:var(--muted);margin:4px 0}

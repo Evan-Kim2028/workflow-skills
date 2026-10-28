@@ -252,6 +252,55 @@ def _approvals(path: Path, mtime: float) -> None:
     os.utime(target, (mtime, mtime))
 
 
+class OwnerQueueTest(unittest.TestCase):
+    """The owner queue is the one place agent-owned work reaches the owner: reports/<WS>/owner-queue.md under the hub."""
+
+    def setUp(self):
+        self.hub = Path(tempfile.mkdtemp())
+
+    def _write(self, ws, text):
+        target = self.hub / "reports" / ws / "owner-queue.md"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text, encoding="utf-8")
+
+    def test_path_is_under_the_hub_reports_dir(self):
+        self.assertEqual(dec.owner_queue_path(self.hub, "WS41"), self.hub / "reports" / "WS41" / "owner-queue.md")
+
+    def test_no_hub_or_bad_ws_has_no_path(self):
+        self.assertIsNone(dec.owner_queue_path(None, "WS41"))
+        self.assertIsNone(dec.owner_queue_path(self.hub, "../WS41"))
+        self.assertIsNone(dec.owner_queue_path(self.hub, ""))
+        self.assertIsNone(dec.owner_queue_path(self.hub, ".."))
+
+    def test_missing_file_is_empty(self):
+        self.assertEqual(dec.owner_queue_lines(self.hub, "WS41"), [])
+        self.assertEqual(dec.owner_queue_lines(None, "WS41"), [])
+
+    def test_empty_file_is_empty(self):
+        self._write("WS41", "\n   \n")
+        self.assertEqual(dec.owner_queue_lines(self.hub, "WS41"), [])
+
+    def test_blank_and_heading_lines_are_skipped(self):
+        self._write("WS41", "# Owner queue\n\n- sudo needed to restart the timer\n\n  - paid upgrade for the API key  \n")
+        self.assertEqual(
+            dec.owner_queue_lines(self.hub, "WS41"),
+            ["- sudo needed to restart the timer", "- paid upgrade for the API key"],
+        )
+
+    def test_long_lines_are_cut(self):
+        self._write("WS41", "x" * (dec.MAX_CELL + 50) + "\n")
+        lines = dec.owner_queue_lines(self.hub, "WS41")
+        self.assertEqual(len(lines), 1)
+        self.assertEqual(len(lines[0]), dec.MAX_CELL)
+
+    def test_oversized_file_is_ignored(self):
+        self._write("WS41", "a\n" * (dec.MAX_FILE_BYTES // 2 + 10))
+        self.assertEqual(dec.owner_queue_lines(self.hub, "WS41"), [])
+
+    def test_other_workstreams_do_not_leak(self):
+        self._write("WS41", "- one\n")
+        self.assertEqual(dec.owner_queue_lines(self.hub, "WS42"), [])
+
 class ComputedRisksTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -271,7 +320,7 @@ class ComputedRisksTest(unittest.TestCase):
         self.tmp.cleanup()
 
     def _cfg(self, **extra):
-        cfg = {"hub_dir": self.hub, "doctor": {"approval_days": 3.0}}
+        cfg = {"hub_dir": self.hub}
         cfg.update(extra)
         return cfg
 
@@ -298,23 +347,14 @@ class ComputedRisksTest(unittest.TestCase):
         self.assertIn("WS41", dep["title"])
         self.assertTrue(dep["title"].startswith("WS42"))
 
-    def test_stale_approvals(self):
+    def test_old_pending_approval_is_not_a_risk(self):
+        """A pending decision never pages: approvals are a log, not a risk."""
         self.assertEqual(cmd_ws(["new", "WS41", "Sample lane"]), 0)
         _approvals(self.root / "WS41", self.now - 10 * 86400)
         payload = dec.risks_payload(self.store, self._cfg(), self.now)
-        by_id = {risk["id"]: risk for risk in payload["risks"]}
-        risk = by_id.get("approvals:WS41")
-        self.assertIsNotNone(risk)
-        self.assertEqual(risk["severity"], "warn")
-        self.assertEqual(risk["source"], "approvals")
-        self.assertEqual(risk["ws"], "WS41")
-        self.assertTrue(risk["title"].startswith("WS41"))
-
-    def test_fresh_approvals_are_quiet(self):
-        self.assertEqual(cmd_ws(["new", "WS41", "Sample lane"]), 0)
-        _approvals(self.root / "WS41", self.now - 100)
-        payload = dec.risks_payload(self.store, self._cfg(), self.now)
         self.assertNotIn("approvals:WS41", {risk["id"] for risk in payload["risks"]})
+        self.assertEqual([risk for risk in payload["risks"] if risk.get("source") == "approvals"], [])
+
 
     def test_doctor_group_on_active_workstream(self):
         self.assertEqual(cmd_ws(["new", "WS41", "Sample lane"]), 0)

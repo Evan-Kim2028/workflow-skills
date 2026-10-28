@@ -71,8 +71,9 @@ class LinearViewTest(unittest.TestCase):
         self.assertEqual([w["ws"] for w in body["workstreams"]], ["WS4"])
         ws = body["workstreams"][0]
         for key in ("ws", "title", "url", "synced_at", "last_error", "outbox", "last_update_at",
-                    "changes_24h", "changes_7d", "recent", "pending_approvals"):
+                    "changes_24h", "changes_7d", "recent"):
             self.assertIn(key, ws)
+        self.assertNotIn("pending_approvals", ws)
         self.assertEqual(ws["title"], "Notes cutover")
         self.assertEqual(ws["url"], "https://linear.app/example/project/ws4")
         self.assertEqual(ws["synced_at"], NOW - 120)
@@ -92,10 +93,10 @@ class LinearViewTest(unittest.TestCase):
         self.assertEqual(recent[0]["from"], "todo")
         self.assertEqual(recent[0]["to"], "wip")
 
-    def test_pending_approvals_map_to_linear_identifier(self):
-        pending = linearview.build(NOW, self.root)["workstreams"][0]["pending_approvals"]
-        self.assertEqual(pending, [{"id": "P-1", "step": "Approve the window", "identifier": "ENG-9",
-                                    "url": "https://linear.app/example/issue/ENG-9"}])
+    def test_no_waiting_decisions_are_mirrored_from_linear(self):
+        """Approvals are not mirrored to Linear, so the Linear card never lists decisions waiting there."""
+        ws = linearview.build(NOW, self.root)["workstreams"][0]
+        self.assertNotIn("pending_approvals", ws)
 
     def test_signed_in_none_without_method(self):
         with mock.patch("dash.linearview.linear_auth.status", return_value={"method": None, "issuer": None, "expires_at": None}):

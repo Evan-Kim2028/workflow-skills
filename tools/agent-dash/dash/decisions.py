@@ -14,8 +14,7 @@ file means an empty list. Two cells never reach any payload:
 - a cell that looks like a local file path (``reports/x.md``). URLs
   (``scheme://...``) and prose with spaces are kept.
 
-Computed risks need no file at all: stale plan gates, pending approvals
-past the doctor ``approval_days`` window, critical/warn doctor groups on
+Computed risks need no file at all: stale plan gates, critical/warn doctor groups on
 active workstreams, and planned workstreams blocked by an unfinished
 dependency. Every served risk row carries
 ``{id, title, severity, source, ws, since}`` (file rows use source
@@ -403,8 +402,6 @@ def _computed_risks(store, cfg, moment: float, titles: dict) -> list:
     per_ws: dict = {ws: [] for ws in live}
     for ws in live:
         per_ws[ws].extend(_gate_risks(ws, meta, moment, titles))
-    for ws in live:
-        per_ws[ws].extend(_approval_risks(ws, meta, moment, cfg, titles))
     doctor_groups = _doctor_groups(store, moment)
     for ws in live:
         if state_of(ws, meta) != "active":
@@ -455,55 +452,38 @@ def _gate_risks(ws: str, meta: dict, moment: float, titles: dict) -> list:
     return risks
 
 
-def _approval_risks(ws: str, meta: dict, moment: float, cfg, titles: dict) -> list:
-    """One risk per workstream whose pending approvals passed the window."""
-    try:
-        from dash.bundles import approvals_for, bundle_dir
-    except Exception:
+OWNER_QUEUE_NAME = "owner-queue.md"
+
+
+def owner_queue_path(hub_dir, ws: str) -> Path | None:
+    """``<hub>/reports/<WS>/owner-queue.md``, or None without a hub or a usable workstream id."""
+    if hub_dir is None or not isinstance(ws, str) or not ws or "/" in ws or "\\" in ws or ws in (".", ".."):
+        return None
+    return Path(hub_dir) / "reports" / ws / OWNER_QUEUE_NAME
+
+
+def owner_queue_lines(hub_dir, ws: str) -> list:
+    """The owner-queue lines for one workstream: things an agent cannot do itself (sudo, a missing credential, a paid upgrade).
+
+    Blank lines and markdown headings are skipped. A missing, unreadable or
+    oversized file means no lines. Each line is cut to ``MAX_CELL`` chars.
+    """
+    path = owner_queue_path(hub_dir, ws)
+    if path is None:
         return []
     try:
-        record = approvals_for(ws)
-    except Exception:
+        if path.stat().st_size > MAX_FILE_BYTES:
+            return []
+        text = path.read_text(encoding="utf-8-sig")
+    except (OSError, UnicodeError):
         return []
-    if not isinstance(record, dict):
-        return []
-    pending = [
-        entry
-        for entry in (record.get("items") or [])
-        if isinstance(entry, dict) and entry.get("status") == "pending"
-    ]
-    if not pending:
-        return []
-    try:
-        path = bundle_dir(ws)
-        mtime = (path / "approvals.json").stat().st_mtime if path is not None else None
-    except OSError:
-        mtime = None
-    if mtime is None:
-        return []
-    limit_days = 3.0
-    try:
-        limit_days = float(((cfg or {}).get("doctor") or {}).get("approval_days", 3.0))
-    except (TypeError, ValueError):
-        pass
-    if moment - mtime <= limit_days * 86400:
-        return []
-    days = (moment - mtime) / 86400
-    count = len(pending)
-    noun = "approval" if count == 1 else "approvals"
-    return [
-        {
-            "id": f"approvals:{ws}",
-            "title": (
-                f"{_display(ws, titles)}: {count} {noun} pending "
-                f"{days:.1f} days (limit {limit_days:g} days)"
-            ),
-            "severity": "warn",
-            "source": "approvals",
-            "ws": ws,
-            "since": float(mtime),
-        }
-    ]
+    lines = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        lines.append(line[:MAX_CELL])
+    return lines
 
 
 def _doctor_groups(store, moment: float) -> dict:

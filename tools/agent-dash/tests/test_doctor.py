@@ -646,7 +646,8 @@ class WorkstreamHygieneTest(unittest.TestCase):
         bare = next(item for item in result["problems"] if item["code"] == "bare-citation")
         self.assertEqual(bare["scope"], "ws:WS9")
 
-    def test_approval_stale(self):
+    def test_old_pending_approval_never_pages(self):
+        """Approvals are a decision log: a pending item of any age raises no problem and no warning."""
         from dash.bundles import cmd_ws
 
         self._bundle()
@@ -655,14 +656,36 @@ class WorkstreamHygieneTest(unittest.TestCase):
                     "--reversible", "no", "--conditions", "File is on disk."]),
             0,
         )
-        old = self.now - 4 * 86400
+        old = self.now - 40 * 86400
         os.utime(self.wsroot / "WS9" / "approvals.json", (old, old))
         with mock.patch("time.time", return_value=self.now):
             result = self._collect()
-        found = [item for item in result["problems"] if item["code"] == "approval-stale"]
+        codes = [item["code"] for item in result["problems"]]
+        self.assertNotIn("approval-stale", codes)
+
+    def test_owner_queue_is_an_info_item_that_never_pages(self):
+        self._bundle()
+        hub = self.root / "hub"
+        (hub / "reports" / "WS9").mkdir(parents=True)
+        (hub / "reports" / "WS9" / "owner-queue.md").write_text("- sudo needed to restart the timer\n", encoding="utf-8")
+        self._cfg = lambda: _cfg(hub_dir=str(hub))
+        with mock.patch("time.time", return_value=self.now):
+            result = self._collect()
+        found = [item for item in result["problems"] if item["code"] == "owner-queue"]
         self.assertEqual(len(found), 1)
-        self.assertEqual(found[0]["id"], "approval-stale:ws:WS9:cutover")
-        self.assertIn("python3 agent_dash.py ws approvals WS9", found[0]["fix_command"])
+        self.assertEqual(found[0]["severity"], "info")
+        self.assertEqual(found[0]["scope"], "ws:WS9")
+        self.assertIn("1 item an agent cannot do itself", found[0]["detail"])
+        self.assertIn("sudo needed", found[0]["detail"])
+
+    def test_empty_owner_queue_raises_nothing(self):
+        self._bundle()
+        hub = self.root / "hub"
+        (hub / "reports" / "WS9").mkdir(parents=True)
+        (hub / "reports" / "WS9" / "owner-queue.md").write_text("# Owner queue\n", encoding="utf-8")
+        self._cfg = lambda: _cfg(hub_dir=str(hub))
+        result = self._collect()
+        self.assertEqual([item for item in result["problems"] if item["code"] == "owner-queue"], [])
 
     def test_train_stuck(self):
         self._bundle(

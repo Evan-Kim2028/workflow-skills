@@ -1,6 +1,6 @@
 # Linear as a task backend
 
-A workstream can keep its tasks in Linear. Linear then shows the same tasks, status, and approvals as the dashboard, and the phone and the cloud agents see them too. The plan in the bundle stays the source of truth for what each task is. Status and approvals sync both ways. The project details (summary, description, priorities, labels, dates, milestone text) come from the plan and are pushed one way, from the plan to Linear. The workstream can also post standup updates and receive comments from agents.
+A workstream can keep its tasks in Linear. Linear then shows the same tasks and status as the dashboard, and the phone and the cloud agents see them too. Production decisions are not mirrored: they live in the dashboard's decision log. The plan in the bundle stays the source of truth for what each task is. Task status syncs both ways. The project details (summary, description, priorities, labels, dates, milestone text) come from the plan and are pushed one way, from the plan to Linear. The workstream can also post standup updates and receive comments from agents.
 
 Local mode is the default. A workstream with no `linear.json` in its bundle behaves as it always has and makes no network call.
 
@@ -16,7 +16,7 @@ Local mode is the default. A workstream with no `linear.json` in its bundle beha
 
 ## What changes and what does not
 
-Agents and skills keep using the same commands: `ws task`, `ws train`, and `ws approve`. Nothing changes for them. In a linked workstream, each of those writes also queues a change for Linear. The next sync sends it. Agents report results with one more command, `ws linear comment`. See [Agents and Linear](#agents-and-linear).
+Agents and skills keep using the same commands: `ws task`, `ws train`, and `ws approve`. Nothing changes for them. In a linked workstream, `ws task` and `ws train` also queue a change for Linear. The next sync sends it. `ws approve` records the decision locally only. Agents report results with one more command, `ws linear comment`. See [Agents and Linear](#agents-and-linear).
 
 Status commands are unchanged when a workstream is linked. `ws task` still writes the bundle first. Linear receives the change within a minute.
 
@@ -59,8 +59,6 @@ A saved sign-in always wins over the key.
 - One issue per task, with the rendered spec as its description.
 - A `blocks` relation for each task dependency.
 - An "Awaiting prod" state on the team. It has the started type and the color `#a855f7`.
-- An `approval` label on the team.
-- One issue per pending approval in `approvals.json`.
 
 `link` prints the project URL. It also writes `linear.json` to the bundle, and it writes the workspace ids to `linear.json` in the data root.
 
@@ -74,7 +72,6 @@ A saved sign-in always wins over the key.
 | Task | Issue |
 | Task dependency | `blocks` relation |
 | Task spec: acceptance, files, test command, rollback, wave, size, train, dependency notes | Issue description, rendered from the plan |
-| Pending approval | Issue with the `approval` label |
 | Train | Not mirrored as a label. The train name appears in the description. |
 | `tracker` section of `plan.json` | Project summary, description, lead, labels, priority, dates, links, and milestone text |
 | Lifecycle state (`bundle.json`) | Project status |
@@ -132,7 +129,6 @@ Issue priorities are derived from the plan. They are not stored in the plan.
 - Tasks on the critical path are High (2).
 - Tasks that are ready now are Medium (3).
 - Other open tasks are Low (4).
-- Approval issues are High (2).
 - Done and deferred tasks keep their current priority.
 
 The metadata push runs only when the metadata changes. The sync keeps a hash of the `tracker` section, the lifecycle state, and the derived priorities in `linear.json` as `meta_hash`. A task status change does not trigger it, because that goes through the status path.
@@ -148,20 +144,14 @@ The metadata push runs only when the metadata changes. The sync keeps a hash of 
 | `done` | Done | completed |
 | `deferred` | Canceled | canceled |
 
-Approvals use the same issue states:
-
-| Approval | Linear state |
-|---|---|
-| `pending` | Todo |
-| `approved` | Done |
-| `denied` | Canceled |
+Approvals have no Linear issues. The decision log in `approvals.json` is local, and an approval issue created before this change is left alone in Linear: nothing reads it or writes it.
 
 When Linear holds a state name that the table does not list, the poller maps it by state type. For example, Backlog reads as `todo` and Duplicate reads as `deferred`.
 
 ## Daily flow
 
 - **Status changes from either side.** Run `ws task` in the terminal, or move the issue in Linear. Both reach the other side.
-- **Older CLIs and hand edits.** A status set by an older CLI without Linear support, or by hand-editing `plan.json` or `approvals.json`, is detected as drift and sent on the next sync.
+- **Older CLIs and hand edits.** A status set by an older CLI without Linear support, or by hand-editing `plan.json`, is detected as drift and sent on the next sync.
 - **The poller syncs every minute.** Each cycle sends queued local changes first, then pulls Linear changes. The poller runs inside the dashboard.
 - **Conflicts.** A local change that has not reached Linear yet wins; it is sent on the next sync. Otherwise the most recent change in Linear wins.
 - **Edit the spec in the plan.** Do not edit an issue title or description in Linear. Each push rewrites the description from `plan.json`, so a Linear edit to the description is lost. Status edits in Linear are kept. Labels that someone adds in Linear are kept too.
@@ -169,8 +159,7 @@ When Linear holds a state name that the table does not list, the poller maps it 
 - **Reopen from Linear.** Moving an issue back from Done or Canceled to an open state reopens the task locally. The next sync applies it.
 - **Tasks and dependencies removed from the plan.** The next push moves the task's issue to Canceled once, with the comment "Removed from the plan.", and stops tracking it. A `blocks` relation for a dependency the plan no longer lists is deleted.
 - **Deleted issues.** If an issue is deleted in Linear, its task is detached on the next sync. The record lists it under `detached` in the bundle's `linear.json`, and no later push recreates it. The task stays in the plan, but its status no longer syncs. `ws linear status` does not print the detached count; read the `detached` list in `linear.json`. A relink (`ws linear unlink`, then `ws linear link`) starts a new record and recreates the issue under the same id.
-- **Approve from Linear.** Move the approval issue to Done to approve it, or to Canceled to deny it. The next sync writes the answer to `approvals.json`. A lead does not wait on it: it logs its own decision first, and a Linear answer overrides that decision when it lands. Anyone with access to the Linear team can approve or deny by moving the issue, not only the owner. Keep approval issues in a team limited to people who may approve. A decision made in Linear is recorded in `approvals.json` with `decided_by` set to `linear`. A decision made in the terminal records `owner`.
-- **Approve from the terminal.** `ws approve` still works. It queues the change for Linear.
+- **Approvals stay local.** A lead logs each production step in `approvals.json` with `ws approve` before it runs, with its rollback. Nothing waits in Linear, and moving an old approval issue there changes nothing locally. A decision made in Linear is recorded in `approvals.json` with `decided_by` set to `linear`. A decision made in the terminal records `owner`.
 
 ## Agents and Linear
 
@@ -203,7 +192,6 @@ The body is plain markdown:
 3. What changed since the last update: task titles with the old and new status. A change that came from Linear is marked "(in Linear)". At most 10 lines, then "and K more".
 4. In progress now: task titles. At most 10.
 5. Next up: the first 5 tasks in the ready queue.
-6. Needs a decision: pending approvals, with their step text.
 
 The window for "what changed" starts at the last update. With no earlier update, it starts 24 hours back. A successful post records the time in `last_update_at` in `linear.json`.
 
@@ -218,7 +206,6 @@ The card shows, in this order:
 - A bar chart of status changes by source, local or Linear, over the last 24 hours and the last 7 days. It has axes and a legend. Each source has a glyph and a word.
 - One row per linked workstream: a "Linear" link to the project, the age of the last sync, the sign-in method (OAuth, key, or none), and the number of queued changes.
 - Recent changes: the last 5, with a control to show more.
-- Waiting on a decision in Linear: pending approvals, each with a link to its issue.
 
 Sync state is shown as a word with a symbol: synced, queued, or sync error. The dashboard never shows a token.
 
@@ -258,10 +245,10 @@ To link the workstream again later, run `ws linear link` again. It reuses the sa
 Only plan content leaves the machine:
 
 - task and milestone titles, and the rendered task specs;
-- task status and approval text;
+- task status;
 - the workstream and project names;
 - the `tracker` text (summary, description, milestone descriptions, links), the lead name, labels, dates, and derived priorities;
-- standup update bodies: task titles, status changes, counts, and pending approval steps;
+- standup update bodies: task titles, status changes, and counts;
 - comment text. Agents write it, so keep comments to a verdict and links.
 
 Nothing else is sent. Run labels, token counts, costs, prompts, and transcripts stay local. Paths appear only when the plan lists them as task files. The OAuth token and the API key are never written to a log or an error message. The token file is the only place the token is stored, with mode 0600.

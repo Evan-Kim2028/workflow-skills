@@ -627,19 +627,19 @@ class LinearE2ETest(unittest.TestCase):
 
 
 class LinkEndToEndTest(LinearE2ETest):
-    def test_link_creates_one_project_two_milestones_four_tasks_relations_and_one_approval(self) -> None:
+    def test_link_creates_one_project_two_milestones_four_tasks_and_relations_but_no_approval(self) -> None:
         self._link()
         counts = self.fake.counts()
         self.assertEqual(counts["projects"], 1)
         self.assertEqual(counts["milestones"], 2)
-        self.assertEqual(counts["issues"], 5)
+        self.assertEqual(counts["issues"], 4)
         self.assertEqual(counts["relations"], 3)
         self.assertEqual(counts["initiatives"], 1)
         self.assertEqual(counts["project_links"], 1)
 
         record = self._link_record()
         self.assertEqual(set(record["tasks"]), {"WS4.1", "WS4.2", "WS4.3", "WS4.4"})
-        self.assertEqual(set(record["approvals"]), {"A1"})
+        self.assertEqual(record["approvals"], {})
         expected = {
             (self._issue_id("WS4.1"), self._issue_id("WS4.2"), "blocks"),
             (self._issue_id("WS4.2"), self._issue_id("WS4.3"), "blocks"),
@@ -661,11 +661,7 @@ class LinkEndToEndTest(LinearE2ETest):
         self.assertIsNotNone(awaiting)
         self.assertEqual(awaiting["type"], "started")
         self.assertEqual(workspace["states"]["Awaiting prod"], awaiting["id"])
-        label_ids = [label["id"] for label in self.fake.labels.values() if label["name"] == "approval"]
-        self.assertEqual(label_ids, [workspace["approval_label"]])
-        approval = self.fake.issues[record["approvals"]["A1"]["id"]]
-        self.assertEqual(approval["labelIds"], label_ids)
-        self.assertEqual(self.fake.states[approval["stateId"]]["name"], "Todo")
+        self.assertTrue(workspace["approval_label"])
 
     def test_second_link_and_sync_create_nothing(self) -> None:
         self._link()
@@ -706,17 +702,6 @@ class SyncEndToEndTest(LinearE2ETest):
         self.assertEqual(last["by"], "linear")
         self.assertEqual(last["task"], "WS4.4")
         self.assertEqual(last["to"], "done")
-        self.assertEqual(linear.read_outbox(WS, self.root), [])
-
-    def test_approval_done_in_linear_becomes_approved(self) -> None:
-        self.fake.set_state(self._link_record()["approvals"]["A1"]["identifier"], "Done")
-        result = self._sync(now=self.now + 1)
-
-        self.assertIsNone(result["error"])
-        self.assertEqual(result["applied"], 1)
-        self.assertEqual(self._approval_status("A1"), "approved")
-        decided = json.loads((self.root / WS / "approvals.json").read_text(encoding="utf-8"))
-        self.assertEqual(decided["decided_by"], "linear")
         self.assertEqual(linear.read_outbox(WS, self.root), [])
 
     def test_rate_limit_sets_last_error_and_next_sync_recovers(self) -> None:
