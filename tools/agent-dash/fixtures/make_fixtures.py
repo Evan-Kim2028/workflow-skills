@@ -827,7 +827,7 @@ def _archive(now, plans):
 def _approvals():
     """Fixture mirror of GET /api/approvals?ws=all: the long-standing
     seeded blocks plus pending items on the planned lanes, so the
-    start-readiness table can count approvals pending per workstream."""
+    start-readiness table can count logged decisions per workstream."""
     return {
         "approvals": [
             {"ws": "WS1", "decided_at": "2026-04-02T15:00:00Z", "decided_by": "owner", "items": [
@@ -888,10 +888,6 @@ def _linear(now):
             move(1800, "WS4.b", "Confirm the rollback window", "wip", "pr", "linear"),
             move(5400, "WS4.c", "Freeze the notes schema", "pr", "done", "local"),
         ],
-        "pending_approvals": [
-            {"id": "P-cutover", "step": "Approve the cutover window", "identifier": "ENG-9",
-             "url": "https://linear.app/example/issue/ENG-9"},
-        ],
     }
     ws9 = {
         "ws": "WS9", "title": "Relay", "url": "https://linear.app/example/project/relay",
@@ -901,7 +897,6 @@ def _linear(now):
             move(7200, "WS9.a", "Start the relay consumer", "todo", "wip", "local"),
             move(86000, "WS9.b", "Stage the relay schema", "wip", "done", "linear"),
         ],
-        "pending_approvals": [],
     }
     return {"signed_in": "oauth", "workstreams": [ws4, ws9], "_note": NOTE}
 

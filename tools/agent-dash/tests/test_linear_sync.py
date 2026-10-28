@@ -286,7 +286,7 @@ class LinkTest(LinearSyncTest):
         self.assertIn("https://linear.app/project/", out)
 
         creates = self.fake.calls_named("create")
-        self.assertEqual([call[1] for call in creates], ["ENG-1", "ENG-2", "ENG-3", "ENG-4", "ENG-5"])
+        self.assertEqual([call[1] for call in creates], ["ENG-1", "ENG-2", "ENG-3", "ENG-4"])
         self.assertEqual(len(self.fake.calls_named("milestone")), 2)
         ids = {key: self._link_record()["tasks"][key]["id"] for key in ("WS9.1", "WS9.2", "WS9.3")}
         self.assertEqual(
@@ -296,7 +296,7 @@ class LinkTest(LinearSyncTest):
         record = self._link_record()
         self.assertEqual(sorted(record["relations"]), ["WS9.1>WS9.2", "WS9.2>WS9.3"])
         self.assertEqual(set(record["tasks"]), {"WS9.1", "WS9.2", "WS9.3", "WS9.4"})
-        self.assertEqual(set(record["approvals"]), {"A1"})
+        self.assertEqual(record["approvals"], {})
         self.assertEqual(record["linked_at"], self.now)
         self.assertEqual(record["synced_at"], self.now)
         self.assertIsNone(record["last_error"])
@@ -308,11 +308,10 @@ class LinkTest(LinearSyncTest):
         self.assertEqual(workspace["approval_label"], "label-approval")
         self.assertIn(("ensure_state", "Awaiting prod", "started", "#a855f7"), self.fake.calls)
 
-    def test_only_pending_approvals_get_issues_and_the_label(self):
+    def test_pending_approvals_get_no_linear_issue(self):
+        """Approvals are a local decision log: linking never asks the owner through Linear."""
         self._link()
-        approval_issue = self.fake.issues[linear.stable_id("approval", "WS9", "A1")]
-        self.assertEqual(approval_issue["labels"], ["label-approval"])
-        self.assertEqual(approval_issue["state_id"], "s-todo")
+        self.assertNotIn(linear.stable_id("approval", "WS9", "A1"), self.fake.issues)
         self.assertNotIn(linear.stable_id("approval", "WS9", "A2"), self.fake.issues)
 
     def test_deferred_task_gets_one_comment_at_creation(self):
@@ -467,11 +466,14 @@ class SyncTest(LinearSyncTest):
         self.assertEqual(task["note"], "canceled in Linear")
         self.assertEqual(linear.read_outbox("WS9", self.root), [])
 
-    def test_approval_done_maps_to_approved(self):
-        self.fake.linear_move(self._link_record()["approvals"]["A1"]["identifier"], "Done")
+    def test_legacy_approval_outbox_row_drains_without_a_linear_write(self):
+        """A row from before approvals stopped mirroring drains as a skip: its Linear issue, if any, is left alone."""
+        self._link()
+        linear.enqueue("WS9", "approval", "A1", root=self.root, now=self.now)
+        self.fake.calls.clear()
         result = self._sync(self.now + 1)
-        self.assertEqual(result["applied"], 1)
-        self.assertEqual(self._approval_status("A1"), "approved")
+        self.assertIsNone(result["error"])
+        self.assertEqual([call for call in self.fake.calls if call[0] == "state"], [])
         self.assertEqual(linear.read_outbox("WS9", self.root), [])
 
     def test_failed_sync_records_last_error_and_keeps_synced_at(self):
@@ -533,7 +535,7 @@ class UnlinkAndTrainsTest(LinearSyncTest):
         self.assertFalse((self.root / "WS9" / linear.LINK_FILE).exists())
         self.assertFalse((self.root / "WS9" / linear.OUTBOX_FILE).exists())
         self.assertIn("Kept in Linear", out.getvalue())
-        self.assertEqual(len(self.fake.issues), 5)
+        self.assertEqual(len(self.fake.issues), 4)
 
     def test_train_refs_lists_linked_members(self):
         self._link()
@@ -726,33 +728,6 @@ class LinearAtomicityTest(LinearSyncTest):
         self.assertEqual(len(self._history()), history_before)
         self.assertEqual(linear_sync._apply_task("WS9", self.root, "WS9.2", {"name": "In Progress", "type": "started"}), 0)
 
-    def test_skipped_approval_apply_counts_zero(self):
-        with self._quiet():
-            bundles.set_approval("WS9", "A1", "approved", None, None, None, None, root=self.root)
-        with self._quiet():
-            rc = bundles.set_approval("WS9", "A1", "denied", None, None, None, None, root=self.root, origin="linear")
-        self.assertEqual(rc, errors.SKIPPED_PENDING)
-        self.assertEqual(self._approval_status("A1"), "approved")
-        self.assertEqual(linear_sync._apply_approval("WS9", self.root, "A1", {"type": "canceled"}), 0)
-
-    def test_approval_decided_by_names_linear_for_linear_origin_writes(self):
-        with self._quiet():
-            bundles.set_approval("WS9", "A1", "approved", None, None, None, None, root=self.root)
-        data = json.loads((self.root / "WS9" / "approvals.json").read_text(encoding="utf-8"))
-        self.assertEqual(data["decided_by"], "owner")
-        self.assertEqual(linear.read_outbox("WS9", self.root)[-1]["key"], "A1")
-
-        self.fake.linear_move(self._ident("WS9.2"), "Done")
-        self.assertEqual(linear_sync._apply_task("WS9", self.root, "WS9.2", {"name": "Done", "type": "completed"}), 1)
-        self.assertEqual(self._history()[-1]["by"], "linear")
-
-        with self._quiet():
-            rc = bundles.set_approval("WS9", "A2", "denied", None, None, None, None, root=self.root, origin="linear")
-        self.assertEqual(rc, 0)
-        data = json.loads((self.root / "WS9" / "approvals.json").read_text(encoding="utf-8"))
-        self.assertEqual(data["decided_by"], "linear")
-        self.assertEqual(self._approval_status("A2"), "denied")
-
     def test_drain_keeps_row_appended_mid_flush_with_equal_timestamp(self):
         linear.enqueue("WS9", "task", "WS9.3", root=self.root, now=self.now)
         self.fake.on_state = lambda _issue_id: linear.enqueue("WS9", "task", "WS9.3", root=self.root, now=self.now)
@@ -930,12 +905,6 @@ class DriftTest(LinearSyncTest):
     def _state_calls(self) -> list[tuple]:
         return [call for call in self.fake.calls if call[0] == "state"]
 
-    def _set_approval_status(self, item_id: str, status: str) -> None:
-        path = self.root / "WS9" / "approvals.json"
-        data = json.loads(path.read_text(encoding="utf-8"))
-        next(item for item in data["items"] if item["id"] == item_id)["status"] = status
-        path.write_text(json.dumps(data), encoding="utf-8")
-
     def test_hand_edited_plan_status_reaches_linear_without_outbox_row(self):
         def set_pr(plan):
             next(t for g in plan["dag"]["groups"] for t in g["tasks"] if t["id"] == "WS9.3")["status"] = "pr"
@@ -974,8 +943,6 @@ class DriftTest(LinearSyncTest):
         record = self._link_record()
         for ref in record["tasks"].values():
             ref.pop("synced_status", None)
-        for ref in record["approvals"].values():
-            ref.pop("synced_status", None)
         linear.write_link("WS9", record, self.root)
         self.fake.calls.clear()
 
@@ -985,7 +952,6 @@ class DriftTest(LinearSyncTest):
         record = self._link_record()
         self.assertEqual(record["tasks"]["WS9.1"]["synced_status"], "todo")
         self.assertEqual(record["tasks"]["WS9.2"]["synced_status"], "wip")
-        self.assertEqual(record["approvals"]["A1"]["synced_status"], "pending")
 
     def test_pull_that_applies_a_linear_change_updates_synced_status(self):
         self.fake.linear_move(self._ident("WS9.2"), "Done")
@@ -1002,39 +968,6 @@ class DriftTest(LinearSyncTest):
         self.assertIsNone(result["error"])
         self.assertEqual(result["flushed"], 0)
         self.assertEqual(self._state_calls(), [])
-
-    def test_hand_edited_approval_reaches_linear_without_outbox_row(self):
-        self._set_approval_status("A1", "approved")
-        self.assertEqual(linear.read_outbox("WS9", self.root), [])
-        self.fake.calls.clear()
-
-        result = self._sync(self.now + 1)
-        self.assertIsNone(result["error"])
-        issue_id = linear.stable_id("approval", "WS9", "A1")
-        self.assertEqual(self._state_calls(), [("state", issue_id, "s-done")])
-        self.assertEqual(self._link_record()["approvals"]["A1"]["synced_status"], "approved")
-
-        self.fake.calls.clear()
-        self.assertIsNone(self._sync(self.now + 2)["error"])
-        self.assertEqual(self._state_calls(), [])
-
-    def test_approval_pull_updates_synced_status_and_next_cycle_is_quiet(self):
-        self.fake.linear_move(self._ident_approval("A1"), "Canceled")
-        self.fake.calls.clear()
-
-        result = self._sync(self.now + 1)
-        self.assertIsNone(result["error"])
-        self.assertEqual(result["applied"], 1)
-        self.assertEqual(self._approval_status("A1"), "denied")
-        self.assertEqual(self._link_record()["approvals"]["A1"]["synced_status"], "denied")
-
-        self.fake.calls.clear()
-        self.assertIsNone(self._sync(self.now + 2)["error"])
-        self.assertEqual(self._state_calls(), [])
-
-    def _ident_approval(self, item_id: str) -> str:
-        return self._link_record()["approvals"][item_id]["identifier"]
-
 
 class AgentCommentTest(LinearSyncTest):
     """Agent comments: every row posts in ts order, and none touches status or drift."""

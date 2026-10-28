@@ -1,7 +1,7 @@
 """Plain-language standup update for one linked workstream, posted to its Linear project.
 
 ``build_update`` renders the markdown body and health from the bundle files
-(plan, history, approvals, link). ``post`` sends it through the linked client
+(plan, history, link). ``post`` sends it through the linked client
 and records ``last_update_at`` in ``linear.json`` on success. ``due`` is the
 daily rule the poller checks after a successful sync; ``send_daily`` is the
 poller's entry point and reports failures as text instead of raising.
@@ -202,9 +202,6 @@ def build_update(ws: str, root: Path | None = None, now: float | None = None) ->
     in_progress = [f"- {_label(task['id'], task.get('title'), links)}" for task in wip[:IN_PROGRESS_LIMIT]] or ["- None."]
     in_progress = _more(in_progress, min(len(wip), IN_PROGRESS_LIMIT), len(wip))
     nxt = [f"- {_label(row['id'], row.get('title'), links)}" for row in orchestrate.ready_queue(plan)[:NEXT_LIMIT]] or ["- Nothing is ready."]
-    approvals = bundles.approvals_for(ws, root) or {}
-    pending = [item for item in approvals.get("items", []) if isinstance(item, dict) and item.get("status") == "pending"]
-    decisions = [f"- {_md(item.get('step') or item.get('id'))}" for item in pending] or ["- Nothing waits on a decision."]
     parts = [
         _md(_purpose(ws, plan, root)),
         f"**Progress:** {done} of {total} tasks done ({percent}%). In progress: {len(wip)}. "
@@ -212,7 +209,6 @@ def build_update(ws: str, root: Path | None = None, now: float | None = None) ->
         _section("Changed since the last update", _changed(_history_rows(ws, root), since, titles, links)),
         _section("In progress now", in_progress),
         _section("Next up", nxt),
-        _section("Needs a decision", decisions),
     ]
     plan_health = _health(_tracker_update(plan).get("health"))
     return {"body": "\n\n".join(parts) + "\n", "health": plan_health or DEFAULT_HEALTH}

@@ -70,7 +70,7 @@ Collectors find those TSV files under a scratch root: either the file sitting di
 
 ## Approvals
 
-An approval is a production step the lead decides and logs before it runs, with its rollback. The lead records it as `approved` with the basis, and reads `ws approvals` before the step. An owner can set `denied` at any time, and a denied item does not run. The Execution view lists pending items in a Needs-you card.
+An approval is a production step the lead decides and logs before it runs, with its rollback. The lead records it as `approved` with the basis, and reads `ws approvals` before the step. The log is read-only on the page and nothing waits on it. An owner can set `denied` at any time, and a denied item does not run. The project view's Production decisions log lists every logged step read-only, with its decider, rollback and time. Nothing waits on it.
 
 Each item has an id, a step sentence, a status, a reversible flag, and conditions. `reversible no` is one-way. The lead reads them with `ws approvals <ID>` before any production step.
 

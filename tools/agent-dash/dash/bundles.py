@@ -68,7 +68,7 @@ WS_USAGE = """agent-dash workstream bundles
   python3 agent_dash.py ws train <ID> <train-id> [--title T] [--branch B] [--status S] [--add id,id] [--remove id,id] [--pr N] [--shared f1,f2] [--gate "..."] [--note "..."]
   python3 agent_dash.py ws trains <ID> [--json]
   python3 agent_dash.py ws plan <ID> [--json]
-  python3 agent_dash.py ws approve <ID> <item-id> <approved|denied|pending> [--note "..."] [--step "..."] [--reversible yes|no] [--conditions "..."]
+  python3 agent_dash.py ws approve <ID> <item-id> <approved|denied|pending> [--note "..."] [--step "..."] [--reversible yes|no] [--conditions "..."] [--rollback "..."] [--by lead|owner]
   python3 agent_dash.py ws approvals [<ID>] [--json]
   python3 agent_dash.py ws validate <ID> [--json]
   python3 agent_dash.py ws next <ID> [--limit N] [--json]
@@ -90,7 +90,7 @@ Workstream state is planned, active, paused, done, archived, or dropped (default
 machine JSON to stdout; with it, human text goes to stderr.
 Exit codes: 0 ok, 1 check failed, 2 usage error, 3 not found, 4 invalid data.
 Train status is planned, assembling, gate, pr, merged, or dropped. A task belongs to at most one train.
-A new approval is `ws approve <ID> <item-id> pending --step "..." --reversible yes|no --conditions "..."`.
+Approvals are a production decision log, not a queue: the lead logs each step with `ws approve <ID> <item-id> approved --step "..." --reversible yes|no --conditions "..." --rollback "..." --by lead` before it runs. Nothing waits on the owner. `pending` is still accepted but nothing waits on it.
 Bundles are directories under AGENT_DASH_WORKSTREAMS.
 """
 
@@ -750,7 +750,7 @@ def linear_start_section(ws: str, root: Path | None = None) -> str:
             f"4. Post `{py} ws linear update {ws}` before standup, or rely on `tracker.update.daily_hour` when it is set. Add `--health at-risk` or `--health off-track` when the workstream is at risk.",
             f"5. At the start of each session, check `{py} ws linear status {ws}` and `{py} doctor`.",
             "6. Read issues with a Linear MCP tool when one is available. Never edit issue titles or descriptions in Linear.",
-            f"7. Approvals labelled `approval` do not block: record the decision with `{py} ws approve {ws} <item-id> approved|denied` and its rollback, then run the step. An owner answer in Linear or in the session overrides it.",
+            f"7. Production steps are not Linear issues and never wait on the owner: record each decision with `{py} ws approve {ws} <item-id> approved --step ... --reversible yes|no --conditions ... --rollback ... --by lead`, then run the step. An owner `denied` in the session overrides it.",
             "",
         ]
     )
@@ -1152,6 +1152,9 @@ def _validate_approvals(issues: list[str], ws: str, data) -> None:
             issues.append(f"approvals.json: item {item_id} conditions must be a string")
         if "note" in item and not isinstance(item.get("note"), str):
             issues.append(f"approvals.json: item {item_id} note must be a string")
+        for optional in ("rollback", "decided_at", "decided_by"):
+            if item.get(optional) is not None and not isinstance(item.get(optional), str):
+                issues.append(f"approvals.json: item {item_id} {optional} must be a string when set")
 
 
 def _cell(value) -> str:
@@ -1168,6 +1171,8 @@ def set_approval(
     note: str | None,
     root: Path | None = None,
     origin: str = "local",
+    rollback: str | None = None,
+    by: str | None = None,
 ) -> int:
     """Set one approval item's status and write approvals.json.
 
@@ -1175,9 +1180,11 @@ def set_approval(
     Linear outbox while the bundle ``.lock`` is held, so a concurrent pull
     either sees the row or has not read the old value yet. ``origin="linear"``
     (a pull) writes nothing and returns ``errors.SKIPPED_PENDING`` when a local
-    row for the item is still in the outbox; the local decision wins and
-    reaches Linear on the next flush. Decisions made with ``origin="linear"``
-    record ``decided_by="linear"``, others ``"owner"``.
+    row for the item is still in the outbox; the local decision wins. Decisions
+    made with ``origin="linear"`` record ``decided_by="linear"``; local ones
+    record ``by`` (default ``"lead"``). Each decided item carries its own
+    ``decided_at`` and ``decided_by``, and ``rollback`` is the one-line undo.
+    Local writes never queue a Linear issue: approvals are not mirrored.
     """
     from dash import linear
 
@@ -1210,6 +1217,7 @@ def set_approval(
             if isinstance(item, dict) and item.get("id") == item_id:
                 found = item
                 break
+        decider = "linear" if origin == "linear" else (str(by).strip() if by else "lead")
         if found is None:
             if step is None or not str(step).strip():
                 print(f"step required for a new approval. Run: python3 agent_dash.py ws approve {ws} {item_id} pending --step \"...\" --reversible yes|no --conditions \"...\"", flush=True)
@@ -1226,6 +1234,8 @@ def set_approval(
             }
             if note is not None:
                 found["note"] = note
+            if rollback is not None:
+                found["rollback"] = rollback
             items.append(found)
         else:
             found["status"] = status
@@ -1237,9 +1247,14 @@ def set_approval(
                 found["conditions"] = conditions
             if note is not None:
                 found["note"] = note
+            if rollback is not None:
+                found["rollback"] = rollback
         if status in ("approved", "denied"):
-            data["decided_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-            data["decided_by"] = "linear" if origin == "linear" else "owner"
+            stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            data["decided_at"] = stamp
+            data["decided_by"] = decider
+            found["decided_at"] = stamp
+            found["decided_by"] = decider
         else:
             data.setdefault("decided_at", None)
             data.setdefault("decided_by", None)
@@ -1250,8 +1265,6 @@ def set_approval(
             "items": items,
         }
         _atomic_write(file, json.dumps(payload, indent=2, ensure_ascii=False) + "\n")
-        if origin == "local":
-            linear.enqueue(ws, "approval", item_id, root=root)
     print(f"{ws} {item_id} {status}")
     return 0
 
@@ -3052,11 +3065,13 @@ def cmd_ws(argv: list[str]) -> int:
         reversible = None
         conditions = None
         note = None
+        rollback = None
+        by = None
         flags = rest[3:]
         index = 0
         while index < len(flags):
             flag = flags[index]
-            if flag in ("--step", "--reversible", "--conditions", "--note") and index + 1 < len(flags):
+            if flag in ("--step", "--reversible", "--conditions", "--note", "--rollback", "--by") and index + 1 < len(flags):
                 value = flags[index + 1]
                 if flag == "--step":
                     step = value
@@ -3067,13 +3082,17 @@ def cmd_ws(argv: list[str]) -> int:
                         return errors.USAGE
                 elif flag == "--conditions":
                     conditions = value
+                elif flag == "--rollback":
+                    rollback = value
+                elif flag == "--by":
+                    by = value
                 else:
                     note = value
                 index += 2
             else:
                 print(WS_USAGE, end="", flush=True)
                 return 2
-        return set_approval(rest[0], rest[1], rest[2], step, reversible, conditions, note)
+        return set_approval(rest[0], rest[1], rest[2], step, reversible, conditions, note, rollback=rollback, by=by)
     if cmd == "approvals":
         if len(rest) > 1:
             print(WS_USAGE, end="", flush=True)

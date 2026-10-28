@@ -21,7 +21,6 @@ from dash.linear import (
     page_link,
     read_link,
     read_outbox,
-    render_approval,
     render_issue,
     spec_hash,
     stable_id,
@@ -63,16 +62,6 @@ SAMPLE_TASK = {
     "phase": "A",
     "confidence": "medium",
 }
-
-SAMPLE_APPROVAL = {
-    "id": "deploy-gate",
-    "step": "Enable the new gate on prod",
-    "status": "pending",
-    "reversible": True,
-    "conditions": "only after the dry run passes",
-    "note": "owner asked for it",
-}
-
 
 def _bundle(root: Path, ws: str = "WS9") -> Path:
     bundle = root / ws
@@ -233,27 +222,6 @@ class RenderIssueTest(unittest.TestCase):
         task = {"id": "WS9.2", "title": "Dep", "deps": ["WS9.1"]}
         text = render_issue("WS9", task, None, None)["description"]
         self.assertIn("## Depends on\n\n- `WS9.1`\n", text)
-
-
-class RenderApprovalTest(unittest.TestCase):
-    def test_title_and_fields(self):
-        issue = render_approval("WS9", SAMPLE_APPROVAL)
-        self.assertEqual(issue["title"], "Approve: Enable the new gate on prod")
-        text = issue["description"]
-        self.assertIn("Approval `deploy-gate` for workstream WS9", text)
-        self.assertIn("- Reversible: yes", text)
-        self.assertIn("- Conditions: only after the dry run passes", text)
-        self.assertIn("## Note\n\nowner asked for it", text)
-
-    def test_irreversible_and_absent_fields(self):
-        item = {"id": "x", "step": "Drop table", "reversible": False, "conditions": ""}
-        text = render_approval("WS9", item)["description"]
-        self.assertIn("- Reversible: no", text)
-        self.assertNotIn("Conditions", text)
-        self.assertNotIn("## Note", text)
-
-    def test_deterministic(self):
-        self.assertEqual(render_approval("WS9", SAMPLE_APPROVAL), render_approval("WS9", dict(SAMPLE_APPROVAL)))
 
 
 class SpecHashTest(unittest.TestCase):

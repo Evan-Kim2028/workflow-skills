@@ -2,8 +2,8 @@
    One chart first: status changes by source (local vs Linear) for the last
    24 h and 7 days, stacked, on the shared axes() helper with a legend. Then
    one row per linked workstream (project link, sync age, sign-in word,
-   outbox count, sync state as glyph plus word), the recent status moves
-   (top 5, shared disclosure), and the decisions waiting in Linear.
+   outbox count, sync state as glyph plus word), and the recent status moves
+   (top 5, shared disclosure).
    Data: GET /api/linear (fixtures/linear.json in ?fixtures mode). The card
    filters to the selected workstream on a workstream tab and hides entirely
    when the list is empty or the endpoint fails. Read-only; links open in a
@@ -224,25 +224,12 @@
     return li;
   }
 
-  function linPendingRow(item, ws) {
-    var li = el("li", {class: "lin-pending"});
-    li.appendChild(el("span", {class: "lin-pending-step", text: item.step || item.id || ""}));
-    if (item.identifier && typeof item.url === "string" && /^https:\/\//.test(item.url)) {
-      li.appendChild(el("a", {class: "lin-link", href: item.url, target: "_blank", rel: "noopener",
-        "aria-label": "Open decision " + item.identifier + " for " + ws + " in Linear (opens in a new tab)",
-        text: item.identifier + " ↗"}));
-    } else if (item.identifier) {
-      li.appendChild(el("span", {class: "lin-link lin-off", text: item.identifier}));
-    }
-    return li;
-  }
-
   function linearCard() {
     var rows = linFilter(linPayload() && linPayload().workstreams, state.ws);
     var c = el("div", {class: "card lin-card", id: "exec-linear", "data-nav": "Linear"});
     var head = el("div", {class: "pj-head"});
     head.appendChild(el("h2", {text: "Linear"}));
-    head.appendChild(el("p", {class: "sub", text: "Status changes by source, sync state, and decisions waiting in Linear."}));
+    head.appendChild(el("p", {class: "sub", text: "Status changes by source and sync state."}));
     c.appendChild(head);
 
     var figure = el("figure", {class: "lin-figure"});
@@ -275,18 +262,6 @@
       }
     }
 
-    c.appendChild(el("h3", {class: "lin-h", text: "Waiting on a decision in Linear"}));
-    var pending = [];
-    rows.forEach(function (w) {
-      (w.pending_approvals || []).forEach(function (item) { pending.push({item: item, ws: w.ws}); });
-    });
-    if (!pending.length) {
-      c.appendChild(el("p", {class: "pj-note", text: "No decisions waiting in Linear."}));
-    } else {
-      var pList = el("ul", {class: "lin-pending-list", "aria-label": "Decisions waiting in Linear"});
-      pending.forEach(function (p) { pList.appendChild(linPendingRow(p.item, p.ws)); });
-      c.appendChild(pList);
-    }
     return c;
   }
 

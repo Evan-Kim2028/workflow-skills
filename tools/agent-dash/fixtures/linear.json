@@ -42,14 +42,6 @@
           "to": "done",
           "by": "local"
         }
-      ],
-      "pending_approvals": [
-        {
-          "id": "P-cutover",
-          "step": "Approve the cutover window",
-          "identifier": "ENG-9",
-          "url": "https://linear.app/example/issue/ENG-9"
-        }
       ]
     },
     {
@@ -85,8 +77,7 @@
           "to": "done",
           "by": "linear"
         }
-      ],
-      "pending_approvals": []
+      ]
     }
   ],
   "_note": "Seeded synthetic data for the offline preview. Seed 1. No local sessions are read."

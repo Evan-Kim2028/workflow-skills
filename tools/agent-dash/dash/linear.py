@@ -75,7 +75,6 @@ _RENDER_FOOTER = (
 
 _KEY_SHAPE = re.compile(r"[\x21-\x7e]+")
 
-_APPROVAL_FOOTER = "_Decision lives in the agent-dash approvals list; the approval state syncs both ways._"
 
 
 def api_key() -> str | None:
@@ -176,21 +175,6 @@ def render_issue(ws: str, task: dict, col: str | None, train: str | None) -> dic
 
     blocks.append(_RENDER_FOOTER)
     return {"title": title, "description": "\n\n".join(blocks) + "\n"}
-
-
-def render_approval(ws: str, item: dict) -> dict:
-    """{'title': 'Approve: <step>', 'description': markdown with id, reversible, conditions, note}."""
-    item_id = str(item.get("id") or "")
-    step = str(item.get("step") or item_id)
-    blocks = [f"Approval `{item_id}` for workstream {ws}"]
-    meta = [f"- Reversible: {'yes' if item.get('reversible') else 'no'}"]
-    if _present(item.get("conditions")):
-        meta.append(f"- Conditions: {item['conditions']}")
-    blocks.append("\n".join(meta))
-    if _present(item.get("note")):
-        blocks.append("## Note\n\n" + str(item["note"]))
-    blocks.append(_APPROVAL_FOOTER)
-    return {"title": f"Approve: {step}", "description": "\n\n".join(blocks) + "\n"}
 
 
 def spec_hash(rendered: list[dict]) -> str:
@@ -478,7 +462,6 @@ CLOSED_TASK_STATUSES = ("done", "deferred")
 PRIORITY_CRITICAL = 2
 PRIORITY_READY = 3
 PRIORITY_OTHER = 4
-APPROVAL_PRIORITY = 2
 
 _HEALTH_VALUES = ("onTrack", "atRisk", "offTrack")
 _DATE = re.compile(r"\d{4}-\d{2}-\d{2}")

@@ -446,7 +446,9 @@ class StartPromptLinearTest(unittest.TestCase):
         text = start_prompt_text("WS9")
         self.assertTrue(text.startswith(self.prompt + "\n## Linear\n"))
         self.assertIn("Project: https://linear.app/example/project/x", text)
-        self.assertIn("agent_dash.py ws approve WS9 <item-id> approved|denied", text)
+        self.assertIn("agent_dash.py ws approve WS9 <item-id> approved --step", text)
+        self.assertIn("--rollback", text)
+        self.assertIn("Production steps are not Linear issues and never wait on the owner", text)
         self.assertEqual((Path(self.tmp.name) / "WS9" / "START-PROMPT.md").read_text(encoding="utf-8"), self.prompt)
 
     def test_linked_prompt_without_https_project_url_still_has_section(self):

@@ -50,16 +50,16 @@ Then write `KICKOFF.md`, a self-contained brief for a fresh lead session. It mus
 - who to coordinate with;
 - the done criteria.
 
-## 3. Production approvals
+## 3. Production decisions
 
-List every production step in `approvals.json` with its rollback. The lead decides each one before running it and logs the decision. The owner can deny an item in the session at any time, and a denied item does not run.
+Approvals are a decision log, not a queue. The lead logs each production step in `approvals.json` with its rollback, decides it, and runs it. Nothing waits on the owner. The owner can deny an item in the session at any time, and a denied item does not run.
 
 ```bash
-python3 ~/.claude/tools/agent-dash/agent_dash.py ws approve WS4 notes-cutover pending --step "Publish the notes index" --reversible no --conditions "The index file is on disk."
+python3 ~/.claude/tools/agent-dash/agent_dash.py ws approve WS4 notes-cutover approved --step "Publish the notes index" --reversible no --conditions "The index file is on disk." --rollback "delete the index file" --by lead
 python3 ~/.claude/tools/agent-dash/agent_dash.py ws approvals WS4
 ```
 
-Pending items show in the dashboard's Start readiness table (Approvals column) and the Project home Planned shelf; the lead reads the full list with `ws approvals`.
+The project view's Production decisions log shows every logged step read-only: step, decided by, decision, rollback, and time. Anything the agent cannot do (sudo, a missing credential, a paid upgrade) goes to `reports/WS4/owner-queue.md`; the doctor reports it as an info item and never pages.
 
 ## 4. Execute each wave with the `ws-wave` workflow
 
