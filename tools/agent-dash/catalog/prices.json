@@ -289,6 +289,38 @@
   },
   {
      "provider": "openai",
+     "model": "gpt-6.1-terra",
+     "input": 1.0,
+     "output": 5.0,
+     "cache_read": 0.05,
+     "cache_write_5m": null,
+     "cache_write_1h": null,
+     "reasoning": null,
+     "long_context": {
+        "threshold": 272000,
+        "comparison": "gt",
+        "counts": [
+           "input",
+           "cache_read",
+           "cache_write"
+        ],
+        "input": 2.0,
+        "output": 7.5,
+        "cache_read": 0.1,
+        "cache_write_5m": null,
+        "cache_write_1h": null,
+        "reasoning": null
+     },
+     "input_includes_cache_read": false,
+     "billing_mode": "plan-included",
+     "price_scope": "standard short-context API list price (equivalent cost on a ChatGPT plan); fast, ultrafast, batch and flex tiers not modelled",
+     "source_url": "https://developers.openai.com/api/docs/pricing",
+     "retrieved_at": "2026-10-28",
+     "confidence": "published",
+     "input_note": "input is stored uncached at ingest (Codex usage input_tokens include cached_input_tokens)"
+  },
+  {
+     "provider": "openai",
      "model": "gpt-6-luna",
      "input": 0.1,
      "output": 0.5,
