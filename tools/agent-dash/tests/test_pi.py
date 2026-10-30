@@ -142,6 +142,50 @@ class LauncherHelperTest(unittest.TestCase):
         self.assertTrue(launch.quota_hit([{"error": "429 rate limit", "stop": "error"}]))
         self.assertFalse(launch.quota_hit([{"error": "connection reset", "stop": "error"}]))
 
+    def test_recovered_429_is_not_quota_and_counts_as_a_retry(self):
+        # River's per-account 429 mid-run: pi emits the error message_end,
+        # agent_end willRetry, auto_retry_start, then succeeds. The run
+        # did the task, so this is a retry, not quota exhaustion.
+        message = (
+            '429: {"message":"Account request rate limit exceeded for this model",'
+            '"type":"rate_limit_error","code":"account_rate"}'
+        )
+        events = [
+            {"error": message, "stop": "error"},
+            {"error": None, "stop": "toolUse"},
+            {"error": None, "stop": "stop"},
+        ]
+        self.assertFalse(launch.quota_hit(events))
+        self.assertEqual(launch.rate_limit_retries(events), 1)
+
+    def test_unrecovered_429_is_quota(self):
+        # Last assistant message_end: nothing follows, so quota.
+        self.assertTrue(
+            launch.quota_hit([{"error": "429: Account request rate limit exceeded for this model", "stop": "error"}])
+        )
+        # A 429 with no successful assistant message after it is unrecovered.
+        tail = [
+            {"error": None, "stop": "toolUse"},
+            {"error": "429: rate limit exceeded", "stop": "error"},
+        ]
+        self.assertTrue(launch.quota_hit(tail))
+        self.assertEqual(launch.rate_limit_retries(tail), 0)
+
+    def test_credit_exhaustion_is_quota_even_when_recovered(self):
+        recovered = [
+            {"error": "HTTP 402 payment required", "stop": "error"},
+            {"error": None, "stop": "stop"},
+        ]
+        self.assertTrue(launch.quota_hit(recovered))
+        self.assertTrue(
+            launch.quota_hit([{"error": None, "stop": "toolUse"}, {"error": "insufficient credits", "stop": "error"}])
+        )
+
+    def test_clean_run_has_no_quota_and_no_retries(self):
+        events = [{"error": None, "stop": "toolUse"}, {"error": None, "stop": "stop"}]
+        self.assertFalse(launch.quota_hit(events))
+        self.assertEqual(launch.rate_limit_retries(events), 0)
+
     def test_verdict_from_first_line(self):
         self.assertEqual(launch.verdict_of("PASS\nall good"), "PASS")
         self.assertEqual(launch.verdict_of("PARTIAL: x\nPASS later"), "PARTIAL")
@@ -168,13 +212,50 @@ class LauncherHelperTest(unittest.TestCase):
             os.environ.clear()
             os.environ.update(old)
 
-    def test_stream_errors_and_session_id(self):
+    def test_assistant_events_and_session_id(self):
         raw = FIXTURE.read_bytes()
         self.assertEqual(launch.session_id_of(raw), SID)
+        # The fixture's two assistant message_end events are both successes.
+        self.assertEqual([e["error"] for e in launch.assistant_events(raw)], [None, None])
         err = json.dumps(
             {"type": "message_end", "message": {"role": "assistant", "stopReason": "error", "errorMessage": "insufficient credit"}}
         ).encode() + b"\n"
-        self.assertEqual(launch.stream_errors(err)[0]["error"], "insufficient credit")
+        self.assertEqual(launch.assistant_events(err)[0]["error"], "insufficient credit")
+
+    def test_recovered_429_stream_is_not_quota_and_keeps_its_report(self):
+        # The real run shape from the 2026-10-30 streams: a message_end 429
+        # (rate_limit_error / account_rate), pi's auto-retry, then the run
+        # finishes with text. Status must read done, one retry recorded.
+        raw = b"".join(
+            json.dumps(obj).encode("utf-8") + b"\n"
+            for obj in (
+                {"type": "session", "id": SID},
+                {
+                    "type": "message_end",
+                    "message": {
+                        "role": "assistant",
+                        "content": [],
+                        "stopReason": "error",
+                        "errorMessage": (
+                            '429: {"message":"Account request rate limit exceeded for this model",'
+                            '"type":"rate_limit_error","code":"account_rate"}'
+                        ),
+                    },
+                },
+                {
+                    "type": "message_end",
+                    "message": {
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": "PASS\nreport body"}],
+                        "stopReason": "stop",
+                    },
+                },
+            )
+        )
+        events = launch.assistant_events(raw)
+        self.assertFalse(launch.quota_hit(events))
+        self.assertEqual(launch.rate_limit_retries(events), 1)
+        self.assertEqual(pi.final_text(raw), "PASS\nreport body")
 
 
 class SourceTest(unittest.TestCase):

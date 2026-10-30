@@ -23,10 +23,12 @@ Writes, in ``outdir``:
                                     ``pi:<session>:<label>``)
 
 Quota/credit exhaustion (an ``errorMessage`` naming insufficient
-credit/quota/balance, or HTTP 402/429) finishes ``died_early`` with
-verdict ``BLOCKED`` and writes ``QUOTA`` naming the model and label, so
-the lead knows to swap the API key. ``outdir`` is registered in
-``run-dirs.txt`` like ``run_worker.py`` does.
+credit/quota/balance, HTTP 402, or a rate-limit 429 the run never
+recovered from) finishes ``died_early`` with verdict ``BLOCKED`` and
+writes ``QUOTA`` naming the model and label, so the lead knows to swap
+the API key. A transient 429 pi auto-retried past is not quota: the
+summary line records it as ``rate_limit_retries=<n>``. ``outdir`` is
+registered in ``run-dirs.txt`` like ``run_worker.py`` does.
 
 The manifest's fifth cell is the tier: ``run_worker.py`` (``kind: pi``)
 passes the registry tier name with ``--tier``, so a DeepSeek run reads
@@ -69,6 +71,11 @@ _UUID = re.compile(
 #: Quota/credit exhaustion markers in an assistant ``errorMessage``.
 _QUOTA_WORDS = ("insufficient", "credit", "quota", "balance", "payment required")
 
+#: Rate-limit markers: River's transient per-account 429 lands as
+#: ``errorMessage`` "429: ... rate_limit_error ... account_rate". pi
+#: auto-retries these, so they are quota only when nothing recovers.
+_RATE_LIMIT_MARKERS = ("429", "rate limit", "rate_limit_error", "account_rate")
+
 
 def tier_of(model: str | None) -> str:
     """Tier for a pi model: deepseek for DeepSeek, glm for GLM, beam for Reflection Beam.
@@ -103,21 +110,63 @@ def ensure_label_prefix(prompt: str, label: str) -> str:
     return f"[label: {label}]\n{prompt}"
 
 
+def _event_text(ev) -> str:
+    """Lowercased error text of one assistant message_end summary."""
+    return (str(ev.get("error") or "") + " " + str(ev.get("stop") or "")).lower()
+
+
+def _credit_hit(text: str) -> bool:
+    """Insufficient credit/quota/balance or HTTP 402: never transient."""
+    return "402" in text or any(word in text for word in _QUOTA_WORDS)
+
+
+def _rate_limit_hit(text: str) -> bool:
+    return any(marker in text for marker in _RATE_LIMIT_MARKERS)
+
+
+def _recovered(events: list[dict], index: int) -> bool:
+    """A successful assistant message_end follows ``events[index]``."""
+    return any(not str(later.get("error") or "") for later in events[index + 1 :])
+
+
 def quota_hit(events) -> bool:
-    """True when any assistant event names quota/credit exhaustion."""
-    for ev in events:
-        message = str(ev.get("error") or "") + " " + str(ev.get("stop") or "")
-        low = message.lower()
-        if any(word in low for word in _QUOTA_WORDS):
+    """Quota/credit exhaustion from the ordered assistant message_end events.
+
+    Credit exhaustion (HTTP 402, insufficient credit/quota/balance,
+    payment required) is an immediate quota hit. A rate-limit 429 counts
+    only when the run never recovered: it is the last assistant
+    message_end, or no successful assistant message_end follows it, which
+    is the empty-final-text case. pi auto-retries a transient River 429
+    and finishes normally, so a 429 with a later successful message is a
+    retry (``rate_limit_retries``), not quota.
+    """
+    events = list(events)
+    for index, ev in enumerate(events):
+        text = _event_text(ev)
+        if _credit_hit(text):
             return True
-        for code in ("402", "429"):
-            if code in message:
-                return True
+        if _rate_limit_hit(text) and not _recovered(events, index):
+            return True
     return False
 
 
-def stream_errors(raw: bytes) -> list[dict]:
-    """Assistant events carrying a stopReason of error or an errorMessage."""
+def rate_limit_retries(events) -> int:
+    """Transient rate-limit 429s pi auto-retried past (recovered runs)."""
+    events = list(events)
+    return sum(
+        1
+        for index, ev in enumerate(events)
+        if _rate_limit_hit(_event_text(ev)) and _recovered(events, index)
+    )
+
+
+def assistant_events(raw: bytes) -> list[dict]:
+    """Every assistant ``message_end`` in stream order, errors included.
+
+    Each item is ``{"error": errorMessage-or-None, "stop": stopReason}``;
+    an empty ``error`` marks a successful message, the recovery signal
+    that separates a transient auto-retried 429 from quota exhaustion.
+    """
     out = []
     for line in (raw or b"").split(b"\n"):
         if not line.strip():
@@ -131,13 +180,12 @@ def stream_errors(raw: bytes) -> list[dict]:
         message = obj.get("message") if isinstance(obj.get("message"), dict) else {}
         if message.get("role") != "assistant":
             continue
-        if message.get("stopReason") == "error" or message.get("errorMessage"):
-            out.append(
-                {
-                    "error": message.get("errorMessage"),
-                    "stop": message.get("stopReason"),
-                }
-            )
+        out.append(
+            {
+                "error": message.get("errorMessage"),
+                "stop": message.get("stopReason"),
+            }
+        )
     return out
 
 
@@ -291,8 +339,9 @@ def main(argv=None):
         pass
 
     raw = stream.read_bytes() if stream.exists() else b""
-    errors = stream_errors(raw)
-    quota = quota_hit(errors)
+    assistant = assistant_events(raw)
+    quota = quota_hit(assistant)
+    retries = rate_limit_retries(assistant)
     sid = session_id_of(raw) or str(uuid.uuid4())
     events = pi_source.parse_stream(raw, sid)
     text = pi_source.final_text(raw)
@@ -360,7 +409,10 @@ def main(argv=None):
         }
     )
     report_lines(state_dir(), lines)
-    print(f"launched pi {label} model {model} status {status} verdict {verdict}")
+    print(
+        f"launched pi {label} model {model} status {status} verdict {verdict}"
+        f" rate_limit_retries={retries}"
+    )
     return 0 if status == "done" and rc == 0 else 1
 
 

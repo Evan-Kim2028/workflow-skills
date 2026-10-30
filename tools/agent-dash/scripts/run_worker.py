@@ -57,6 +57,12 @@ RUN_RULE = (
 LABEL_OK = re.compile(r"^[\w.+-]{1,80}$")
 KINDS = ("muse", "cursor", "grok-build", "pi", "codex")
 READ_LIMIT = 262144
+#: A finished report is at least this many bytes after stripping; below it
+#: the out file counts toward a quota hit in full. In a report at or above
+#: the threshold, only quota wording in the last REPORT_TAIL_BYTES counts,
+#: and only when the report carries no verdict line.
+REPORT_MIN_BYTES = 1500
+REPORT_TAIL_BYTES = 600
 #: The dashboard can take several seconds to answer right after a deploy
 #: restart (cold caches, polls holding the store lock), so the preflight
 #: budget is generous; a timeout below warns instead of refusing.
@@ -459,9 +465,14 @@ def note_quota(ctx, name):
 def outcome(worker, out_path, err_path):
     """``quota``, ``done``, or ``empty`` for a finished worker's logs.
 
-    A quota/rate-limit hit always wins, even when the out file has text:
-    a run that reported ``Rate limit reached for requests`` did not do the
-    task, and counting it as ``done`` hides the limit.
+    A quota/rate-limit hit always wins over ``done``: a run that ended on
+    ``Rate limit reached for requests`` did not do the task. The err log
+    is always scanned for the limit wording. The out file (the report)
+    counts toward a quota hit only when it does not look like a finished
+    report — it is short (under ``REPORT_MIN_BYTES`` after stripping), or
+    a match lands in its last ``REPORT_TAIL_BYTES`` with no verdict line
+    (PASS / PARTIAL / BLOCKED) opening the file — so a complete PASS
+    report that merely discusses rate limits stays ``done``.
     """
     if quota_hit(worker, out_path, err_path):
         return "quota"
@@ -512,11 +523,21 @@ def quota_file_hit(ctx) -> bool:
     return False
 
 
-def quota_hit(worker, out_path, err_path) -> bool:
-    patterns = worker.get("quota_patterns") or []
-    if not patterns:
-        return False
-    text = read_tail(err_path) + "\n" + read_tail(out_path)
+VERDICT_START_RE = re.compile(r"(?:^|[:.!?)])[ \t#>*`-]*(?:PASS|PARTIAL|BLOCKED)\b", re.MULTILINE)
+
+
+def _has_verdict_line(text) -> bool:
+    """True when a PASS / PARTIAL / BLOCKED verdict opens a line or follows a sentence end.
+
+    grok-build's plain output streams the worker's narration ahead of the
+    final report with no newline between them (``...commit on the
+    branch:PASS``), so the verdict may sit mid-file and mid-line. Markdown
+    markup (headings, bold, bullets, blockquotes, backticks) may precede it.
+    """
+    return bool(VERDICT_START_RE.search(text))
+
+
+def _text_matches(text, patterns) -> bool:
     for pattern in patterns:
         if not isinstance(pattern, str) or not pattern:
             continue
@@ -526,6 +547,33 @@ def quota_hit(worker, out_path, err_path) -> bool:
         except re.error:
             continue
     return False
+
+
+def quota_hit(worker, out_path, err_path) -> bool:
+    """True when a quota pattern hits the err log or an unfinished report.
+
+    The err log is always scanned. The out file is the final report, and
+    a finished report may legitimately discuss rate limits (a PASS report
+    about fixing 429 handling), so its text counts toward quota only when
+    it does not look finished: it is short (under ``REPORT_MIN_BYTES``
+    after stripping), or a match lands in its last ``REPORT_TAIL_BYTES``
+    while the report carries no verdict line. A real quota failure is limit
+    wording in stderr, or a short or truncated report that ends in it.
+    """
+    patterns = worker.get("quota_patterns") or []
+    if not patterns:
+        return False
+    if _text_matches(read_tail(err_path), patterns):
+        return True
+    out = read_tail(out_path)
+    stripped = out.strip()
+    if not stripped:
+        return False
+    if len(stripped) < REPORT_MIN_BYTES:
+        return _text_matches(out, patterns)
+    if _has_verdict_line(out):
+        return False
+    return _text_matches(out[-REPORT_TAIL_BYTES:], patterns)
 
 
 def command(worker, label, workspace, prompt_file, session_id, run_dir=None, tier=None):
