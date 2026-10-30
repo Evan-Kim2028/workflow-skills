@@ -572,6 +572,19 @@ class RunWorkerTests(unittest.TestCase):
         self.assertIn("tier=glm-flash", line)
         self.assertFalse((self.state / "worker-cooldowns.json").exists())
 
+    def test_glued_verdict_after_narration_stays_done(self):
+        # grok-build plain output runs the narration into the report with no
+        # newline ("...commit on the branch:PASS"); the verdict still counts.
+        self.counts = {}
+        body = "Let me read the quota scan and rate limit tests. " * 20
+        body += "Now commit on the branch:PASS\n\nFixed the 429 quota scan.\n"
+        body += "quota rate limit 429 notes\n" * 40
+        self.assertGreater(len(body.strip()), runner.REPORT_MIN_BYTES)
+        code, line = self.go("glm-flash", Launch(report=body))
+        self.assertEqual(code, 0)
+        self.assertIn("STATUS: done", line)
+        self.assertFalse((self.state / "worker-cooldowns.json").exists())
+
     def test_short_report_with_rate_limit_wording_is_quota(self):
         # "Rate limit reached for requests" as the whole out file is the
         # real failure shape: a short report that ends in the limit.

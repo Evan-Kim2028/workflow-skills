@@ -60,7 +60,7 @@ READ_LIMIT = 262144
 #: A finished report is at least this many bytes after stripping; below it
 #: the out file counts toward a quota hit in full. In a report at or above
 #: the threshold, only quota wording in the last REPORT_TAIL_BYTES counts,
-#: and only when no verdict line opens the file.
+#: and only when the report carries no verdict line.
 REPORT_MIN_BYTES = 1500
 REPORT_TAIL_BYTES = 600
 #: The dashboard can take several seconds to answer right after a deploy
@@ -523,26 +523,18 @@ def quota_file_hit(ctx) -> bool:
     return False
 
 
-VERDICT_RE = re.compile(r"\b(PASS|PARTIAL|BLOCKED)\b")
-LABEL_LINE_RE = re.compile(r"^\[label:.+\]$")
+VERDICT_START_RE = re.compile(r"(?:^|[:.!?)])[ \t#>*`-]*(?:PASS|PARTIAL|BLOCKED)\b", re.MULTILINE)
 
 
 def _has_verdict_line(text) -> bool:
-    """True when the report opens with a PASS / PARTIAL / BLOCKED verdict.
+    """True when a PASS / PARTIAL / BLOCKED verdict opens a line or follows a sentence end.
 
-    The first non-empty line decides, after skipping an optional
-    ``[label: ...]`` line and stripping markdown markup (headings, bold,
-    bullets, blockquotes, backticks) from its front.
+    grok-build's plain output streams the worker's narration ahead of the
+    final report with no newline between them (``...commit on the
+    branch:PASS``), so the verdict may sit mid-file and mid-line. Markdown
+    markup (headings, bold, bullets, blockquotes, backticks) may precede it.
     """
-    for raw in text.splitlines():
-        line = raw.strip()
-        if not line:
-            continue
-        if LABEL_LINE_RE.match(line):
-            continue
-        line = line.lstrip("#>*-` \t").strip()
-        return bool(VERDICT_RE.match(line))
-    return False
+    return bool(VERDICT_START_RE.search(text))
 
 
 def _text_matches(text, patterns) -> bool:
@@ -565,7 +557,7 @@ def quota_hit(worker, out_path, err_path) -> bool:
     about fixing 429 handling), so its text counts toward quota only when
     it does not look finished: it is short (under ``REPORT_MIN_BYTES``
     after stripping), or a match lands in its last ``REPORT_TAIL_BYTES``
-    while no verdict line opens the file. A real quota failure is limit
+    while the report carries no verdict line. A real quota failure is limit
     wording in stderr, or a short or truncated report that ends in it.
     """
     patterns = worker.get("quota_patterns") or []
