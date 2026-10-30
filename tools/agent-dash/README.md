@@ -68,9 +68,11 @@ refused with the exact fix on a weak one, and a prompt without one gets a
 start/usage/finish lines (run id `pi:<session>:<label>`). The `pi` source
 reads the manifest and a `pi/` folder beside it, takes status and verdict
 from the files, and reads liveness from the live `node .../pi-coding-agent`
-process. Quota/credit exhaustion finishes `died_early` with verdict
-`BLOCKED` and writes `QUOTA` naming the model and label. See
-[docs/integrate.md](docs/integrate.md).
+process. Quota/credit exhaustion (or a rate-limit 429 the run never
+recovered from) finishes `died_early` with verdict `BLOCKED` and writes
+`QUOTA` naming the model and label; a transient 429 pi auto-retried past
+is recorded as `rate_limit_retries=<n>` on the launcher's summary line.
+See [docs/integrate.md](docs/integrate.md).
 
 ### Codex workers (`launch_codex.py`)
 

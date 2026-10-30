@@ -484,6 +484,32 @@ class RunWorkerTests(unittest.TestCase):
         self.assertIn("tier=pi-deepseek-flash", line)
         self.assertFalse((self.state / "worker-cooldowns.json").exists())
 
+    def test_pi_summary_retry_line_never_reads_quota(self):
+        # For a pi tier the outer out file is launch_pi.py's summary line
+        # and the outer err log its stderr; pi's stream and stderr stay in
+        # the run folder's pi/ outdir. A recovered rate-limit retry
+        # recorded there as rate_limit_retries=<n> must not match the pi
+        # quota_patterns ("rate limit", "429", ...) and cool the tier.
+        self.counts = {}
+
+        class Retried(Launch):
+            def spawn(self, cmd, out_path, err_path, env=None):
+                pid = super().spawn(cmd, out_path, err_path, env)
+                Path(out_path).write_text(
+                    "launched pi ws1-plan-lane-1"
+                    " model river/deepseek-ai/DeepSeek-V4.1-Flash-1017"
+                    " status done verdict PASS rate_limit_retries=1\n",
+                    encoding="utf-8",
+                )
+                return pid
+
+        launch = Retried()
+        code, line = self.go("pi-deepseek-flash", launch)
+        self.assertEqual(code, 0)
+        self.assertIn("STATUS: done", line)
+        self.assertIn("tier=pi-deepseek-flash", line)
+        self.assertFalse((self.state / "worker-cooldowns.json").exists())
+
     def test_meta_file_records_tier_harness_and_paths(self):
         self.counts = {}
         launch = Launch()
