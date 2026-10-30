@@ -551,6 +551,95 @@ class RunWorkerTests(unittest.TestCase):
         cooled = json.loads((self.state / "worker-cooldowns.json").read_text(encoding="utf-8"))
         self.assertEqual(cooled["glm"], NOW + 30 * 60)
 
+    def test_finished_report_discussing_quota_stays_done(self):
+        # A complete PASS report may mention "rate limit", "quota" and
+        # "429" (a run about fixing 429 handling); that is a done run,
+        # never a quota cooldown (2026-10-30 false positive).
+        self.counts = {}
+        body = (
+            "PASS\n\n"
+            "## Report: fix 429 handling\n\n"
+            "The launcher retried on rate limit responses and treated the\n"
+            "quota wording in the report tails as a quota hit. The fix maps\n"
+            "HTTP 429 to a retry, so the tier no longer cools down.\n"
+        )
+        body += "notes line\n" * 200
+        self.assertGreater(len(body.strip()), runner.REPORT_MIN_BYTES)
+        launch = Launch(report=body)
+        code, line = self.go("glm-flash", launch)
+        self.assertEqual(code, 0)
+        self.assertIn("STATUS: done", line)
+        self.assertIn("tier=glm-flash", line)
+        self.assertFalse((self.state / "worker-cooldowns.json").exists())
+
+    def test_short_report_with_rate_limit_wording_is_quota(self):
+        # "Rate limit reached for requests" as the whole out file is the
+        # real failure shape: a short report that ends in the limit.
+        self.counts = {}
+
+        class RateLimited(Launch):
+            def spawn(self, cmd, out_path, err_path, env=None):
+                pid = super().spawn(cmd, out_path, err_path, env)
+                Path(err_path).write_text("", encoding="utf-8")
+                Path(out_path).write_text("Rate limit reached for requests\n", encoding="utf-8")
+                return pid
+
+        launch = RateLimited()
+        code, line = self.go("glm", launch)
+        self.assertEqual(code, 0)
+        self.assertIn("STATUS: failed", line)
+        self.assertIn("reason=quota", line)
+        cooled = json.loads((self.state / "worker-cooldowns.json").read_text(encoding="utf-8"))
+        self.assertEqual(cooled["glm"], NOW + 30 * 60)
+
+    def test_quota_wording_in_err_cools_even_behind_a_long_report(self):
+        # The err log is always scanned; a long finished report does not
+        # hide limit wording that landed in stderr.
+        self.counts = {}
+
+        class ErrLimited(Launch):
+            def spawn(self, cmd, out_path, err_path, env=None):
+                pid = super().spawn(cmd, out_path, err_path, env)
+                Path(err_path).write_text("Rate limit reached for requests\n", encoding="utf-8")
+                Path(out_path).write_text(
+                    "PASS\n\n" + "unrelated body text\n" * 200, encoding="utf-8"
+                )
+                return pid
+
+        launch = ErrLimited()
+        code, line = self.go("glm", launch)
+        self.assertEqual(code, 0)
+        self.assertIn("STATUS: failed", line)
+        self.assertIn("reason=quota", line)
+        cooled = json.loads((self.state / "worker-cooldowns.json").read_text(encoding="utf-8"))
+        self.assertEqual(cooled["glm"], NOW + 30 * 60)
+
+    def test_truncated_long_report_ending_in_quota_wording_is_quota(self):
+        # A long report with no verdict line that ends in the limit
+        # wording (match inside the last REPORT_TAIL_BYTES) is a run the
+        # limit cut off, so the tier cools.
+        self.counts = {}
+        body = "working on the task\n" * 200 + "Rate limit reached for requests\n"
+        self.assertGreaterEqual(len(body.strip()), runner.REPORT_MIN_BYTES)
+        self.assertLessEqual(
+            len(body) - body.index("Rate limit"), runner.REPORT_TAIL_BYTES
+        )
+
+        class Truncated(Launch):
+            def spawn(self, cmd, out_path, err_path, env=None):
+                pid = super().spawn(cmd, out_path, err_path, env)
+                Path(err_path).write_text("", encoding="utf-8")
+                Path(out_path).write_text(body, encoding="utf-8")
+                return pid
+
+        launch = Truncated()
+        code, line = self.go("glm", launch)
+        self.assertEqual(code, 0)
+        self.assertIn("STATUS: failed", line)
+        self.assertIn("reason=quota", line)
+        cooled = json.loads((self.state / "worker-cooldowns.json").read_text(encoding="utf-8"))
+        self.assertEqual(cooled["glm"], NOW + 30 * 60)
+
     def test_auto_skips_a_cooling_tier_for_the_next_one(self):
         (self.state / "worker-cooldowns.json").write_text(
             json.dumps({"muse": NOW + 600, "glm-flash": NOW + 600}), encoding="utf-8"
