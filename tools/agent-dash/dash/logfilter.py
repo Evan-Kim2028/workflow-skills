@@ -29,6 +29,7 @@ stdout, flushed per chunk). Exit 0 on success, including fallback.
 from __future__ import annotations
 
 import hashlib
+import os
 import re
 import subprocess
 import sys
@@ -230,8 +231,40 @@ class FilteredRun:
         return rc
 
 
-def start_filtered(argv, stream_path, *, cwd=None, stdin=None, stderr=None, env=None, warn=None, append: bool = False) -> FilteredRun:
-    """Start ``argv`` with stdout going through the filter into ``stream_path``."""
+class DetachedRun:
+    """A child whose stdout is read by a filter process that outlives the launcher.
+
+    The pipe's read end moves from the launcher to ``python3 dash/logfilter.py``
+    (its own session, so a signal to the launcher's group does not reach it).
+    If the launcher is killed, the filter keeps reading until the child closes
+    stdout, so the child's next write succeeds. Without this, the child's write
+    raised SIGPIPE and the child died, where the old file redirect let it run on.
+    Warnings go to the filter's stderr, which the launchers point at the err log.
+    """
+
+    def __init__(self, proc, filt, sink) -> None:
+        self.proc = proc
+        self.filter = filt
+        self._sink = sink
+        self.pump = None
+
+    def wait(self) -> int:
+        rc = self.proc.wait()
+        self.filter.wait()
+        try:
+            self._sink.close()
+        except Exception:
+            pass
+        return rc
+
+
+def start_filtered(argv, stream_path, *, cwd=None, stdin=None, stderr=None, env=None, warn=None, append: bool = False, detached: bool = False):
+    """Start ``argv`` with stdout going through the filter into ``stream_path``.
+
+    ``detached=True`` hands the pipe to a filter process that survives this
+    process (see DetachedRun). If that process cannot start, the in-process pump
+    is used instead, so the run still goes through the filter.
+    """
     sink = open(stream_path, "ab" if append else "wb")
     try:
         proc = subprocess.Popen(
@@ -245,6 +278,20 @@ def start_filtered(argv, stream_path, *, cwd=None, stdin=None, stderr=None, env=
     except BaseException:
         sink.close()
         raise
+    if detached:
+        try:
+            filt = subprocess.Popen(
+                [sys.executable, os.path.abspath(__file__)],
+                stdin=proc.stdout,
+                stdout=sink,
+                stderr=stderr,
+                start_new_session=True,
+            )
+        except OSError:
+            filt = None
+        if filt is not None:
+            proc.stdout.close()  # the filter now holds the only read end
+            return DetachedRun(proc, filt, sink)
     return FilteredRun(proc, sink, warn or _stderr_warn)
 
 

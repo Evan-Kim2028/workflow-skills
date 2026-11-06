@@ -229,8 +229,19 @@ base64 only, see the per-kind table).
 - **Stale running markers.** A `running/<label>` whose pid is gone is treated as a crashed launch and does not block (the plan reports it). Only a live pid blocks.
 - **Session files and totals.** Do not sum `session` rows into usage (they duplicate the stream).
 - **Pi `sessions/` directory** stays, empty, after reclaim. `_looks_like_pi_dir` still sees it.
-- **Launcher death.** The filter pump runs inside the launcher process. The child writes to a pipe instead of a file, so if the launcher is killed, the child's next write fails with SIGPIPE. Before this change a child kept writing to its file after its launcher died. A run whose launcher is killed now stops at its next write. Confirm this is acceptable before relying on it for long unattended runs.
+- **Launcher death (fixed).** The launchers (`launch_pi.py`, `launch_cmd.py`, `launch_codex.py`) now pass `detached=True`: the child's stdout pipe goes to a filter process in its own session (`dash/logfilter.py`), not to the launcher. If the launcher is killed, the filter keeps reading until the child closes stdout, so the child finishes as it did when it wrote to a file. Measured with a killed launcher (`SIGKILL` at 1.5 s, child writes 61 lines over 6 s): the old file redirect finished (61 lines); the in-process pump died at 15 lines with `BrokenPipeError`; the detached filter finished (61 lines). What a killed launcher still loses is its own bookkeeping (the TSV row, the usage lines, the verdict), exactly as before. The reaper marks those runs dead. If the filter cannot start, the launcher uses the in-process pump (the old failure mode) and says so in its err log.
 - **Uninstall while running.** `vlogs_install.sh --uninstall --purge` removes data. Under launchd it boots out the agent first. With `VLOGS_NO_LOAD=1` it cannot stop a running process. Do not purge a store that is running.
+
+## Roots
+
+With no `--root`, the archive scans the roots in `log_archive.roots` of the
+agent-dash local config (`<state>/config.local.json`, git-ignored). Without that
+key it scans the configured `hub_dir`. The repo names no project. To scan both
+hubs add, in that file:
+
+```json
+{"log_archive": {"roots": ["~/Documents/projects/<hub-one>-hub-state", "~/Documents/projects/<hub-two>-hub-state"]}}
+```
 
 ## Operate
 

@@ -486,6 +486,7 @@ def main(argv=None):
             stdin=subprocess.PIPE,
             stderr=se,
             warn=logfilter.warn_to(se),
+            detached=True,
         )
         proc = filtered.proc
         report_lines(

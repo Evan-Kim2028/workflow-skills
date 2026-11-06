@@ -355,6 +355,7 @@ def main(argv=None):
             stderr=se,
             stdin=subprocess.DEVNULL,
             warn=logfilter.warn_to(se),
+            detached=True,
         )
     try:
         os.unlink(out / run_id)

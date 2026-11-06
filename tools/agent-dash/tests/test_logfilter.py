@@ -128,6 +128,75 @@ class _Sink(io.BytesIO):
         super().flush()
 
 
+class DetachedRunTest(unittest.TestCase):
+    """detached=True: the filter outlives a killed launcher, so the child finishes."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = Path(self.tmp.name)
+
+    def _child(self, n: int, pause: float) -> list:
+        code = (
+            "import sys, time\n"
+            "for i in range(%d):\n"
+            "    sys.stdout.write('{\"n\":%%d}\\n' %% i); sys.stdout.flush(); time.sleep(%r)\n"
+            "sys.stdout.write('{\"type\":\"end\"}\\n'); sys.stdout.flush()\n"
+        ) % (n, pause)
+        return [sys.executable, "-c", code]
+
+    def test_filtered_and_exit_code_kept(self):
+        stream = self.dir / "d.ndjson"
+        raw = _line(B64 + "==") + b'{"type":"message_end"}\n'
+        code = "import sys; sys.stdout.buffer.write(%r)" % raw
+        rc = logfilter.run_filtered([sys.executable, "-c", code], stream, detached=True)
+        self.assertEqual(rc, 0)
+        got = stream.read_bytes()
+        self.assertIn(b"<img sha256=", got)
+        self.assertEqual(got.count(b"\n"), 2)
+        self.assertTrue(got.endswith(b'{"type":"message_end"}\n'))
+
+    def test_child_finishes_when_the_launcher_is_killed(self):
+        stream = self.dir / "killed.ndjson"
+        script = (
+            "import sys; sys.path.insert(0, %r)\n"
+            "from dash import logfilter\n"
+            "logfilter.run_filtered(%r, %r, detached=True)\n"
+        ) % (os.path.dirname(os.path.dirname(os.path.abspath(logfilter.__file__))), self._child(40, 0.05), str(stream))
+        launcher = subprocess.Popen([sys.executable, "-c", script])
+        deadline = time.time() + 5
+        while time.time() < deadline and not (stream.exists() and stream.stat().st_size > 0):
+            time.sleep(0.05)
+        launcher.kill()
+        launcher.wait()
+        deadline = time.time() + 15
+        data = b""
+        while time.time() < deadline:
+            data = stream.read_bytes()
+            if data.endswith(b'{"type":"end"}\n'):
+                break
+            time.sleep(0.1)
+        self.assertTrue(data.endswith(b'{"type":"end"}\n'), "child stopped after its launcher died: %r" % data[-60:])
+        self.assertEqual(data.count(b"\n"), 41)
+
+    def test_in_process_pump_still_stops_the_child_when_the_launcher_dies(self):
+        # The default (detached=False) keeps the old in-process behaviour; this documents why the launchers pass detached=True.
+        stream = self.dir / "pump.ndjson"
+        script = (
+            "import sys; sys.path.insert(0, %r)\n"
+            "from dash import logfilter\n"
+            "logfilter.run_filtered(%r, %r)\n"
+        ) % (os.path.dirname(os.path.dirname(os.path.abspath(logfilter.__file__))), self._child(40, 0.05), str(stream))
+        launcher = subprocess.Popen([sys.executable, "-c", script])
+        deadline = time.time() + 5
+        while time.time() < deadline and not (stream.exists() and stream.stat().st_size > 0):
+            time.sleep(0.05)
+        launcher.kill()
+        launcher.wait()
+        time.sleep(2.5)
+        self.assertFalse(stream.read_bytes().endswith(b'{"type":"end"}\n'))
+
+
 class PumpTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

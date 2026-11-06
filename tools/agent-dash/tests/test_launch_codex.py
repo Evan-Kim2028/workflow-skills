@@ -349,7 +349,12 @@ class MainTests(unittest.TestCase):
                     self.returncode = 0
                     return 0
 
+            real_popen = launch.subprocess.Popen
+
             def fake_popen(argv, **kwargs):
+                # The detached log filter is a real process; only the codex child is faked.
+                if str(argv[-1]).endswith("logfilter.py"):
+                    return real_popen(argv, **kwargs)
                 return FakeProc(argv, kwargs)
 
             env = {"AGENT_DASH_STATE_DIR": os.path.join(tmp, "state")}

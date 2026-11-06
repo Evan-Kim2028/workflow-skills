@@ -201,7 +201,7 @@ def main():
                  "--yolo", "-t", "--skip-onboarding", "--no-auto-update"],
                 stream,
                 cwd=workspace, stderr=se, stdin=subprocess.DEVNULL,
-                warn=logfilter.warn_to(se),
+                warn=logfilter.warn_to(se), detached=True,
             )
         try:
             os.unlink(os.path.join(outdir, "running", label))
