@@ -180,6 +180,46 @@ class GateSelectionTest(unittest.TestCase):
         # Only the always pair: no default fallback, so no WARN and no test_server.
         self.assertEqual(selected, ["test_page_rules.py", "test_privacy_pin.py"])
 
+    def test_unknown_files_map_to_their_own_test(self):
+        self._commit_all("empty base")
+        self._write("scripts/worker-watch.sh")
+        self._write("scripts/memcap.sh")
+        self._write("tests/fixtures/workers_launcher.json")
+        (self.repo / "install.sh").write_text("#!/bin/sh\n", encoding="utf-8")
+        self._commit_all("touch")
+        self._write("scripts/worker-watch.sh", "x\n")
+        self._write("scripts/memcap.sh", "x\n")
+        self._write("tests/fixtures/workers_launcher.json", "[]\n")
+        (self.repo / "install.sh").write_text("#!/bin/sh\n# x\n", encoding="utf-8")
+        code, selected, err = self._gate("HEAD", "--list")
+        self.assertEqual(code, 0)
+        self.assertNotIn("WARN", err)
+        self.assertEqual(
+            selected,
+            ["test_install.py", "test_page_rules.py", "test_privacy_pin.py", "test_run_worker.py", "test_worker_watch.py"],
+        )
+
+    def test_fixture_change_does_not_widen_to_other_fixture_suites(self):
+        self._commit_all("empty base")
+        self._write("tests/fixtures/workers_launcher.json")
+        self._commit_all("fixture")
+        self._write("tests/fixtures/workers_launcher.json", "[1]\n")
+        code, selected, err = self._gate("HEAD", "--list")
+        self.assertEqual(code, 0)
+        self.assertNotIn("test_migration.py", selected)
+        self.assertNotIn("test_fixtures.py", selected)
+        self.assertIn("test_run_worker.py", selected)
+        self.assertNotIn("WARN", err)
+
+    def test_new_fixture_without_a_map_entry_warns(self):
+        self._commit_all("empty base")
+        self._write("tests/fixtures/brand-new.bin")
+        self._commit_all("fixture")
+        self._write("tests/fixtures/brand-new.bin", "x\n")
+        code, _selected, err = self._gate("HEAD", "--list")
+        self.assertEqual(code, 0)
+        self.assertIn("WARN unmapped: tests/fixtures/brand-new.bin", err)
+
     def test_list_runs_nothing(self):
         # A broken test file must not explode --list: selection only.
         self._commit_all("empty base")

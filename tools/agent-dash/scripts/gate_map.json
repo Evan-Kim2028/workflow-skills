@@ -261,6 +261,9 @@
     "scripts/grok_stream_filter.py": [
       "test_grok_cli"
     ],
+    "install.sh": [
+      "test_install"
+    ],
     "scripts/install_hooks.sh": [
       "test_gate",
       "test_label_guard_hook",
@@ -334,9 +337,24 @@
       "test_view_seq",
       "test_etag"
     ],
-    "tests/fixtures/**": [
+    "tests/fixtures/schema_prev.sql": [
       "test_migration",
-      "test_fixtures"
+      "test_deploy"
+    ],
+    "tests/fixtures/map-WS*.json": [
+      "test_maplayout"
+    ],
+    "tests/fixtures/pi-stream.ndjson": [
+      "test_pi"
+    ],
+    "tests/fixtures/workers_launcher.json": [
+      "test_run_worker"
+    ],
+    "scripts/worker-watch.sh": [
+      "test_worker_watch"
+    ],
+    "scripts/memcap.sh": [
+      "test_install"
     ],
     "tests/live_guard.py": [
       "test_live_guard",
