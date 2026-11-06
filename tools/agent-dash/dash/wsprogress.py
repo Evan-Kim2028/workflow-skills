@@ -136,10 +136,16 @@ def build_project_progress(store, now: float | None = None) -> dict:
     if _CACHE.get("project-key") == key and "project-payload" in _CACHE:
         return _CACHE["project-payload"]
 
+    from dash.replay import REPLAY_LIMIT
+
+    # One store pass for every workstream: the query is the same for each
+    # (moment, no filter, same limit); only the per-workstream filter differs,
+    # and build_replay applies that per row. It was one full pass per workstream.
+    runs = store.query_runs(moment, None, None, None, REPLAY_LIMIT)
     parts = []
     for ws in project_ids():
         try:
-            part = build_wsprogress(store, ws, moment)
+            part = build_wsprogress(store, ws, moment, runs=runs)
         except ReplayNotFound:
             continue
         if (part.get("total") or 0) > 0:
@@ -287,7 +293,7 @@ def _pct(done: int, total: int) -> float:
     return round(done / total * 1000.0) / 10.0
 
 
-def build_wsprogress(store, ws: str, now: float | None = None) -> dict:
+def build_wsprogress(store, ws: str, now: float | None = None, runs: list | None = None) -> dict:
     """Progress-over-time payload for one workstream.
 
     Pure read path: plan file plus history file plus one store run pass.
@@ -328,7 +334,7 @@ def build_wsprogress(store, ws: str, now: float | None = None) -> dict:
         raise ReplayNotFound(ws)
     counts = dict(progress.get("counts") or {})
 
-    replay = build_replay(store, ws, moment)
+    replay = build_replay(store, ws, moment, runs=runs)
     tasks = replay.get("tasks") or {}
     done_times: list = sorted(
         (item["done_at"], tid)
