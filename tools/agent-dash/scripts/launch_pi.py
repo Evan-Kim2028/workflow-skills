@@ -256,6 +256,26 @@ def parent_session_of(outdir) -> str | None:
     return None
 
 
+def usage_line(ev, sid, label, model, ended):
+    """One generic.jsonl usage line for one assistant message (no prompt text)."""
+    return {
+        "type": "usage",
+        "session_id": sid,
+        "run_id": f"pi:{sid}:{label}",
+        "model": model,
+        "tool": "pi",
+        "message_id": ev["message_id"],
+        "ts": float(ended),
+        "input": ev["input"],
+        "output": ev["output"],
+        "cache_read": ev["cache_read"],
+        "cache_write": ev["cache_write"],
+        "cache_write_5m": ev["cache_write_5m"],
+        "cache_write_1h": ev["cache_write_1h"],
+        "reasoning": 0,
+    }
+
+
 def report_lines(state: Path, lines) -> None:
     """Append generic.jsonl lines. Best effort; never stores prompts."""
     try:
@@ -343,7 +363,7 @@ def main(argv=None):
     quota = quota_hit(assistant)
     retries = rate_limit_retries(assistant)
     sid = session_id_of(raw) or str(uuid.uuid4())
-    events = pi_source.parse_stream(raw, sid)
+    events = pi_source.parse_stream(raw, sid, default_model=model)
     text = pi_source.final_text(raw)
     ended = int(time.time())
 
@@ -377,22 +397,7 @@ def main(argv=None):
         }
     ]
     for ev in events:
-        lines.append(
-            {
-                "type": "usage",
-                "session_id": sid,
-                "run_id": f"pi:{sid}:{label}",
-                "model": model,
-                "tool": "pi",
-                "message_id": ev["message_id"],
-                "ts": float(ended),
-                "input": ev["input"],
-                "output": ev["output"],
-                "cache_read": ev["cache_read"],
-                "cache_write": ev["cache_write"],
-                "reasoning": 0,
-            }
-        )
+        lines.append(usage_line(ev, sid, label, model, ended))
     lines.append(
         {
             "type": "run",

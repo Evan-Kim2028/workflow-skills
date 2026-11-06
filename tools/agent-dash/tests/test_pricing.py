@@ -13,6 +13,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from dash.pricing import (
+    catalog,
     catalog_sig,
     cost,
     family,
@@ -295,6 +296,43 @@ class CatalogTest(unittest.TestCase):
         self.assertEqual(by_model[GROK]["billing_mode"], "plan-included")
         self.assertFalse(by_model["muse-wonder-full-1.0"]["priced"])
         self.assertEqual(by_model["muse-wonder-full-1.0"]["confidence"], "unknown")
+
+
+class PiAnthropicAndOpus5RowsTest(unittest.TestCase):
+    def test_prefixed_haiku_row_copies_the_bare_row(self):
+        rows = {row["model"]: row for row in load()}
+        bare, prefixed = rows["claude-haiku-5-5"], rows["anthropic/claude-haiku-5-5"]
+        for key in ("input", "output", "cache_read", "cache_write_5m", "cache_write_1h", "reasoning",
+                    "long_context", "input_includes_cache_read", "billing_mode", "price_scope"):
+            self.assertEqual(prefixed[key], bare[key], key)
+        self.assertEqual(prefixed["provider"], "anthropic")
+        self.assertEqual(prefixed["source_url"], "https://platform.claude.com/docs/en/about-claude/pricing")
+        self.assertEqual(prefixed["retrieved_at"], "2026-11-06")
+        self.assertEqual(prefixed["confidence"], "published")
+
+    def test_prefixed_haiku_prices_like_the_bare_row(self):
+        table = catalog()
+        for args in ((1_000_000, 0, 0, 0), (100_000, 500, 0, 0), (100_001, 0, 0, 0), (50_000, 0, 1_000, 40_000)):
+            self.assertEqual(
+                cost("anthropic/claude-haiku-5-5", *args, table, cache_write_5m=0, cache_write_1h=0),
+                cost("claude-haiku-5-5", *args, table, cache_write_5m=0, cache_write_1h=0),
+                args,
+            )
+        # Prompt over 100k uses the long-context rates (input 0.5).
+        self.assertAlmostEqual(cost("anthropic/claude-haiku-5-5", 100_001, 0, 0, 0), 0.0500005, places=9)
+
+    def test_opus_5_published_rates(self):
+        rows = {row["model"]: row for row in load()}
+        opus = rows["claude-opus-5"]
+        self.assertEqual((opus["input"], opus["output"], opus["cache_read"]), (5, 25, Decimal("0.5")))
+        self.assertEqual((opus["cache_write_5m"], opus["cache_write_1h"]), (Decimal("6.25"), 10))
+        self.assertIsNone(opus["long_context"])
+        self.assertEqual(opus["provider"], "anthropic")
+        self.assertEqual(opus["retrieved_at"], "2026-11-06")
+        self.assertEqual(opus["confidence"], "published")
+        self.assertAlmostEqual(cost("claude-opus-5", 0, 0, 0, 1_000_000, cache_write_5m=0, cache_write_1h=1_000_000), 10.0)
+        self.assertAlmostEqual(cost("claude-opus-5", 0, 0, 0, 1_000_000, cache_write_5m=1_000_000, cache_write_1h=0), 6.25)
+        self.assertIsNone(cost("claude-opus-5", 0, 0, 0, 1_000_000))
 
 
 class BeamPricingTest(unittest.TestCase):
