@@ -79,7 +79,7 @@ Lanes in one wave share no file or test file. Each lane goes build, then review,
 
 ### If you use muse
 
-`scripts/run_worker.sh <tier|default|auto> <label> <workspace> <prompt-file> <run-dir> [max-wait]` runs one worker and prints `STATUS: done|failed|running`. It appends the manifest row the collectors read.
+`scripts/run_worker.sh <tier|default|auto> <label> <workspace> <prompt-file> <run-dir> [max-wait]` runs one worker and prints `STATUS: done|failed|running`. It appends the manifest row the collectors read. The prompt file holds the task only: the launcher adds the `[label:]` line and the worker rules (already-present rules are not added twice); `--no-rules` launches the file as written.
 
 ## Rules
 

@@ -20,7 +20,7 @@ The lead plans, decides, verifies, and reports. Workers do everything else. Rela
 
 ## Each wave
 
-Execution follows the [orchestration loop](../workstream-orchestration/SKILL.md#the-loop). The dispatcher does the launching: write `prompts/<task-id>.md` for each ready task, run `agent_dash.py dispatch start <WS>` once, then arm one `dispatch wait <WS>` in the background. On each event read only that report, decide, and write the next prompts before anything else. The dispatcher moves tasks to `wip`, `pr` and `done` itself; see [the dispatcher doc](../../tools/agent-dash/docs/dispatcher.md). The five rules below were the most violated in measured runs; treat them as hard stops, not advice.
+Execution follows the [orchestration loop](../workstream-orchestration/SKILL.md#the-loop). The dispatcher does the launching: write `prompts/<task-id>.md` for each ready task (the task only: the launcher adds the label line and worker rules, and pasting them is harmless), run `agent_dash.py dispatch start <WS>` once, then arm one `dispatch wait <WS>` in the background. On each event read only that report, decide, and write the next prompts before anything else. The dispatcher moves tasks to `wip`, `pr` and `done` itself; see [the dispatcher doc](../../tools/agent-dash/docs/dispatcher.md). The five rules below were the most violated in measured runs; treat them as hard stops, not advice.
 
 1. Build the lane list from the execution plan. Lanes in one wave share no file or test file. Use explicit review checks for lanes that need them, and flag irreversible or production-adjacent lanes.
 2. Run one lane per sub-agent, in parallel. Each lane goes build, then review, then fix and re-review until approved or out of fix rounds.
