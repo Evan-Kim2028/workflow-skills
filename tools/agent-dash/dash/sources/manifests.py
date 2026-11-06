@@ -36,6 +36,7 @@ import re
 import stat
 
 from dash.liveness import file_shows_quota, read_pid_file
+from dash.sources import realpath_memo
 
 NAME = "manifests"
 INTERVAL_S = 2
@@ -1026,13 +1027,13 @@ def _flat_run_dirs(cfg, now, covered) -> list:
     have = set()
     for scratch in covered or []:
         try:
-            have.add(os.path.realpath(scratch))
+            have.add(realpath_memo(scratch))
         except OSError:
             have.add(scratch)
     found = []
     for rundir in rundirs:
         try:
-            real = os.path.realpath(rundir)
+            real = realpath_memo(rundir)
         except OSError:
             continue
         if real in have:
@@ -1134,9 +1135,9 @@ def _backfill(cfg):
 
 
 def _scratch_roots(cfg) -> list:
-    from dash.rundirs import scan_roots
+    from dash.sources import scan_roots_memo
 
-    return scan_roots(cfg)
+    return scan_roots_memo(cfg)
 
 
 def _scratch_root(cfg) -> str:

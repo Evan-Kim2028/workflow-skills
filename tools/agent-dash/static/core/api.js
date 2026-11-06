@@ -186,8 +186,10 @@
        Planned/Archive pill counts. Both are best-effort on older servers. */
     var projP = api("/api/project", {}).then(function (j) { state.project = (j && typeof j === "object") ? j : {name: null}; state.actionsArchive = !!(j && j.actions && j.actions.archive); }).catch(function () { state.project = {name: null}; state.actionsArchive = false; });
     var allP = api("/api/workstreams", {since: since(), state: "all"}).then(function (j) { state.wssAll = j.workstreams || []; }).catch(function () { state.wssAll = []; });
-    var healthP = api("/api/health", {}).then(function (j) { state.health = (j && typeof j === "object") ? j : null; }).catch(function () { state.health = null; });
-    navInflight = Promise.all([bundlesP, wsP, projP, allP, healthP]).then(function () { renderTabs(); applyChrome(); resolveLanding(); updateStale(); }).then(function () { navInflight = null; lastNavDone = Date.now(); }, function () { navInflight = null; });
+    /* Health only feeds the stale badge. It is not awaited here: a slow health
+       read must never hold a navigation (tab switch, workstream pick). */
+    api("/api/health", {}).then(function (j) { state.health = (j && typeof j === "object") ? j : null; updateStale(); }).catch(function () { state.health = null; });
+    navInflight = Promise.all([bundlesP, wsP, projP, allP]).then(function () { renderTabs(); applyChrome(); resolveLanding(); updateStale(); }).then(function () { navInflight = null; lastNavDone = Date.now(); }, function () { navInflight = null; });
     return navInflight;
   }
   /* First-load default view, once per page load: Project home when the
@@ -377,7 +379,8 @@
       if (delayed.length) {
         badge.textContent = "" + delayed.length + " source" + (delayed.length === 1 ? "" : "s") + " delayed";
         badge.title = delayed.map(function (s) {
-          var lag = s.lag_s == null ? "no recent poll" : "last poll " + Math.round(s.lag_s) + "s ago";
+          /* Hover text names the lag in words, never raw numbers (page rule). */
+          var lag = s.lag_s == null ? "no recent poll" : (s.lag_s < 60 ? "last poll a few seconds ago" : (s.lag_s < 3600 ? "last poll a few minutes ago" : "last poll over an hour ago"));
           return s.name + " · " + (s.last_error || lag);
         }).join("\n");
       } else {

@@ -46,6 +46,8 @@ from dash.liveness import file_shows_quota
 from dash.sources import grok_cli as _grok
 from dash.sources import manifests as _manifests
 from dash.sources import process as _process
+from dash.sources import realpath_memo
+from dash.sources import set_discovery_ttl, discovery_memo
 
 log = logging.getLogger("agent_dash.pi")
 
@@ -67,9 +69,13 @@ _last_write: dict = {}
 last_error = None
 
 
+#: Directory-walk reuse window (seconds), the shared ``dir_scan_s`` knob.
+DIR_SCAN_S = 15
+
 def poll(store, cfg, now):
     global last_error
     last_error = None
+    set_discovery_ttl((cfg or {}).get("dir_scan_s", DIR_SCAN_S))
     try:
         _poll(store, cfg or {}, float(now))
     except Exception:
@@ -91,6 +97,13 @@ def _poll(store, cfg, now):
 
 
 def _outdirs(root):
+    """Directory walk, reused for this poll thread's ``dir_scan_s`` window. See :func:`_outdirs_walk`."""
+    from dash.sources import discovery_memo
+
+    return list(discovery_memo((__name__, '_outdirs', root), lambda: _outdirs_walk(root)))
+
+
+def _outdirs_walk(root):
     """pi outdirs under one scratch root: the root, or ``<pad>/pi/``.
 
     A pi outdir holds ``pi-sessions.tsv`` or a ``running/`` folder. The
@@ -110,7 +123,7 @@ def _outdirs(root):
     def take(path):
         if not path:
             return
-        real = os.path.realpath(path)
+        real = realpath_memo(path)
         if real in seen:
             return
         if os.path.isfile(os.path.join(path, MANIFEST)) or (
@@ -136,20 +149,15 @@ def _outdirs(root):
     return found
 
 
+_dir_cache: dict = {}
+
+
 def _subdirs(path):
-    try:
-        entries = os.scandir(path)
-    except OSError:
-        return []
-    out = []
-    with entries:
-        for entry in entries:
-            try:
-                if entry.is_dir(follow_symlinks=False):
-                    out.append(entry.path)
-            except OSError:
-                continue
-    return out
+    """Child directories of ``path``, from the (inode, mtime) listing cache."""
+    from dash.sources import list_dir_cached
+
+    entries, _listed = list_dir_cached(path, _dir_cache)
+    return [full for _name, full, _is_file, is_dir in (entries or []) if is_dir]
 
 
 def _seen(store):

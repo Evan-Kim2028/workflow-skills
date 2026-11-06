@@ -51,6 +51,7 @@ from datetime import datetime
 
 from dash.liveness import file_shows_quota, read_pid_file
 from dash.sources.process import apply_liveness, live_agent_processes
+from dash.sources import set_discovery_ttl, discovery_memo
 
 log = logging.getLogger("agent_dash.grok_cli")
 
@@ -72,9 +73,13 @@ MANIFESTS = ("glm-sessions.tsv", "grok-build-sessions.tsv")
 last_error = None
 
 
+#: Directory-walk reuse window (seconds), the shared ``dir_scan_s`` knob.
+DIR_SCAN_S = 15
+
 def poll(store, cfg, now):
     global last_error
     last_error = None
+    set_discovery_ttl((cfg or {}).get("dir_scan_s", DIR_SCAN_S))
     try:
         _poll(store, cfg or {}, float(now))
     except Exception:
@@ -672,6 +677,13 @@ def _marked(store, key):
 
 
 def _manifest_dirs(root, filename, only=None):
+    """Directory walk, reused for this poll thread's ``dir_scan_s`` window. Yields the cached listing. See :func:`_manifest_dirs_walk`."""
+    from dash.sources import discovery_memo
+
+    yield from discovery_memo((__name__, '_manifest_dirs', root, filename, only), lambda: list(_manifest_dirs_walk(root, filename, only)))
+
+
+def _manifest_dirs_walk(root, filename, only=None):
     """Scratchpads that contain ``filename``.
 
     Lists ``<root>/<encoded-cwd>/<session>/`` and, when ``root`` is already
@@ -844,9 +856,9 @@ def _budgets(cfg):
 
 
 def _scratch_roots(cfg):
-    from dash.rundirs import scan_roots
+    from dash.sources import scan_roots_memo
 
-    return scan_roots(cfg)
+    return scan_roots_memo(cfg)
 
 
 def _only_session(cfg):
