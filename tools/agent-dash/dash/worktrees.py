@@ -385,17 +385,6 @@ def busy_map(paths: list[str]) -> dict[str, str]:
     return busy
 
 
-def worktree_in_use(path: str) -> tuple[bool, str]:
-    """True when a live process sits in the worktree or names it."""
-    found = busy_map([path])
-    reason = found.get(path, "")
-    if reason.startswith("process holds") or reason.startswith("worktree path"):
-        return True, reason
-    if reason:
-        return False, reason
-    return False, ""
-
-
 def main_branch_now(repo: str | Path) -> str | None:
     """Branch checked out in the main checkout, or None when unclear."""
     try:

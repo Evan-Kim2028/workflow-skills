@@ -3942,24 +3942,6 @@ def summarize(problems: list) -> dict:
     return out
 
 
-def filter_problems(problems: list, ws: str | None = None, min_severity: str | None = None) -> list:
-    """Workstream plus minimum-severity filter for CLI output."""
-    out = []
-    for item in problems or []:
-        if not isinstance(item, dict):
-            continue
-        if ws not in (None, "", "all"):
-            scope = str(item.get("scope") or "global")
-            if scope != "global" and scope != f"ws:{ws}" and item.get("ws") != ws:
-                continue
-        if min_severity in SEV_RANK:
-            rank = SEV_RANK.get(str(item.get("severity")), 9)
-            if rank > SEV_RANK[min_severity]:
-                continue
-        out.append(item)
-    return out
-
-
 def _group_size(item: dict) -> int:
     """Member count for digest sorting: full total, else shown rows."""
     try:

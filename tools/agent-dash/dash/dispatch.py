@@ -408,13 +408,6 @@ class Dispatcher:
         for key in [key for key in self.state["errors"] if key.startswith(prefix)]:
             del self.state["errors"][key]
 
-    def _plan_status(self, body, task_id: str):
-        for group in orchestrate._groups_of(body):
-            for task in (group.get("tasks") or []) if isinstance(group, dict) else []:
-                if isinstance(task, dict) and task.get("id") == task_id:
-                    return task.get("status")
-        return None
-
     def _move(self, task_id: str, status: str) -> None:
         """Set a task's status only while the plan still holds an expected status.
 

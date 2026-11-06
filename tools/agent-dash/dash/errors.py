@@ -124,14 +124,6 @@ def task_not_found(ws: str, task_id: str, known: int) -> str:
     )
 
 
-def unknown_status(status: str) -> str:
-    return (
-        f"unknown status {status!r}. "
-        f"Use one of: {', '.join(STATUSES)}. "
-        "Run: python3 agent_dash.py ws validate <ID> to check the plan first"
-    )
-
-
 def unknown_train_status(status: str) -> str:
     return (
         f"unknown train status {status!r}. "
