@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import time
 import urllib.request
 from pathlib import Path
@@ -687,12 +688,16 @@ def cmd_archive(argv: list[str], json_mode: bool = False) -> int:
     ws = argv[0]
     force = False
     note = None
+    keep_scratch = False
     flags = argv[1:]
     index = 0
     while index < len(flags):
         flag = flags[index]
         if flag == "--force":
             force = True
+            index += 1
+        elif flag == "--keep-scratch":
+            keep_scratch = True
             index += 1
         elif flag == "--note" and index + 1 < len(flags):
             note = flags[index + 1]
@@ -701,6 +706,15 @@ def cmd_archive(argv: list[str], json_mode: bool = False) -> int:
             print(WS_USAGE, end="", flush=True)
             return errors.USAGE
     code = archive_bundle(ws, force=force, note=note)
+    if code == errors.OK:
+        # Cleanup never fails the archive; its lines go to stderr in JSON mode.
+        cleanup_out = (lambda line: print(line, file=sys.stderr, flush=True)) if json_mode else print
+        try:
+            from dash.archivecleanup import cleanup_after_archive
+
+            cleanup_after_archive(ws, keep_scratch=keep_scratch, out=cleanup_out)
+        except Exception as exc:
+            cleanup_out(f"{ws}: post-archive cleanup failed ({exc.__class__.__name__}); archive kept")
     if json_mode and code == errors.OK:
         errors.emit_json({"ws": ws, "state": "archived", "ok": True})
     return code

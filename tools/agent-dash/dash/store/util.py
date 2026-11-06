@@ -43,7 +43,9 @@ TOKEN_FIELDS = ("input", "output", "cache_read", "cache_write", "reasoning")
 BILLED_FIELDS = ("input", "output", "cache_read", "cache_write")
 
 
-PRUNE_BATCH = 2000
+#: Offset rows checked per prune call (the prune tick runs once a minute). A
+#: 500k-row backlog drains in about 25 minutes at this size instead of 4 hours.
+PRUNE_BATCH = 20000
 
 
 RUN_COLS = (

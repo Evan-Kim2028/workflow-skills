@@ -186,7 +186,9 @@
        Planned/Archive pill counts. Both are best-effort on older servers. */
     var projP = api("/api/project", {}).then(function (j) { state.project = (j && typeof j === "object") ? j : {name: null}; state.actionsArchive = !!(j && j.actions && j.actions.archive); }).catch(function () { state.project = {name: null}; state.actionsArchive = false; });
     var allP = api("/api/workstreams", {since: since(), state: "all"}).then(function (j) { state.wssAll = j.workstreams || []; }).catch(function () { state.wssAll = []; });
-    navInflight = Promise.all([bundlesP, wsP, projP, allP]).then(function () { renderTabs(); applyChrome(); resolveLanding(); }).then(function () { navInflight = null; lastNavDone = Date.now(); }, function () { navInflight = null; });
+    /* The reuse gate is stamped before the render step: a render that throws
+       must not leave the gate unarmed (the nav data itself is complete). */
+    navInflight = Promise.all([bundlesP, wsP, projP, allP]).then(function () { navInflight = null; lastNavDone = Date.now(); }, function () { navInflight = null; }).then(function () { renderTabs(); applyChrome(); resolveLanding(); updateStale(); }).catch(function () {});
     return navInflight;
   }
   /* First-load default view, once per page load: Project home when the
@@ -230,7 +232,7 @@
     try {
       return snapSig(state.snap, RUN_CLOCKS) + "\u0000" + JSON.stringify([
         state.archive, state.approvals, state.bundles,
-        state.wss, state.project, state.plans
+        state.wss, state.wssAll, state.project, state.plans
       ]);
     } catch (e) { return null; }
   }
@@ -240,6 +242,7 @@
     var reqSince = since();
     var gen = ++execGen;
     refreshActive++;
+    refreshHealth();
     if (quiet) snapBegan();
     var finished = false;
     var jobs = [
@@ -358,14 +361,33 @@
     var badge = document.getElementById("stale-badge");
     var txt = document.getElementById("live-txt");
     if (!badge || !txt) return;
-    if (!state.lastSeqChange) { badge.hidden = true; return; }
     nowS = nowS || Date.now() / 1000;
-    var seqAge = nowS - state.lastSeqChange;
-    var pollAge = state.lastPoll == null ? 0 : nowS - state.lastPoll;
-    var stale = seqAge > STALE_AFTER_S && (state.lastPoll == null || pollAge > STALE_AFTER_S);
-    badge.hidden = !stale;
-    if (stale) txt.textContent = "stale";
-    else if (txt.textContent === "stale") txt.textContent = "live";
+    var stale = false;
+    if (state.lastSeqChange) {
+      var seqAge = nowS - state.lastSeqChange;
+      var pollAge = state.lastPoll == null ? 0 : nowS - state.lastPoll;
+      stale = seqAge > STALE_AFTER_S && (state.lastPoll == null || pollAge > STALE_AFTER_S);
+    }
+    var delayed = ((state.health && state.health.sources) || []).filter(function (s) {
+      return s && (s.state === "slow" || s.state === "error" || s.state === "stalled");
+    });
+    badge.hidden = !stale && !delayed.length;
+    if (stale) {
+      badge.textContent = "stale";
+      badge.title = "";
+      txt.textContent = "stale";
+    } else {
+      if (delayed.length) {
+        badge.textContent = "" + delayed.length + " source" + (delayed.length === 1 ? "" : "s") + " delayed";
+        badge.title = delayed.map(function (s) {
+          var lag = s.lag_s == null ? "no recent poll" : "last poll " + fmtDur(s.lag_s) + " ago";
+          return s.name + " · " + (s.last_error || lag);
+        }).join("\n");
+      } else {
+        badge.title = "";
+      }
+      if (txt.textContent === "stale") txt.textContent = "live";
+    }
   }
   /* Tiles and chart come from one snapshot response: totals and usage buckets
      are applied together or not at all, so they can never disagree. */
@@ -376,6 +398,38 @@
   var refreshActive = 0;
   function refreshBusy() { return refreshActive > 0; }
   function refreshDone() { if (refreshActive > 0) refreshActive--; }
+  /* Health only feeds the stale badge, so it is not part of loadNav: a slow
+     or hung /api/health must never hold a navigation or the first render.
+     It rides the existing refresh turns (boot, the 30 s interval, actions)
+     and runs at most once per 30 s. One request at a time: a tick that lands
+     while one is in flight is skipped. A request that never settles is
+     abandoned after HEALTH_TIMEOUT_MS so the badge keeps updating. */
+  var HEALTH_EVERY_MS = 30000, HEALTH_TIMEOUT_MS = 20000;
+  var healthInflight = false, healthLastAt = 0, healthSeq = 0;
+  function refreshHealth() {
+    if (healthInflight) return;
+    if (healthLastAt && Date.now() - healthLastAt < HEALTH_EVERY_MS) return;
+    healthInflight = true;
+    healthLastAt = Date.now();
+    var mine = ++healthSeq;
+    var timer = null;
+    var settle = function () {
+      clearTimeout(timer);
+      if (mine === healthSeq) healthInflight = false;
+    };
+    timer = setTimeout(settle, HEALTH_TIMEOUT_MS);
+    api("/api/health", {}).then(function (j) {
+      if (mine !== healthSeq) return;
+      settle();
+      state.health = (j && typeof j === "object") ? j : null;
+      updateStale();
+    }, function () {
+      if (mine !== healthSeq) return;
+      settle();
+      state.health = null;
+      updateStale();
+    });
+  }
   function refreshAll() {
     if (window.__adReplayOn) return Promise.resolve();
     var ws = state.ws;
@@ -383,6 +437,7 @@
     var gen = ++execGen;
     refreshActive++;
     var finished = false;
+    refreshHealth();
     var wsArg = ws === "all" ? {} : {ws: ws};
     var group = groupFor();
     var reqSince = since();
@@ -555,6 +610,7 @@
   AdPage.STALE_AFTER_S = STALE_AFTER_S;
   AdPage.updateStale = updateStale;
   AdPage.refreshAll = refreshAll;
+  AdPage.refreshHealth = refreshHealth;
   AdPage.refreshBusy = refreshBusy;
   AdPage.setLive = setLive;
   AdPage.stream = stream;
@@ -571,6 +627,7 @@
   global.apiPost = apiPost;
   global.approvalList = approvalList;
   global.loadNav = loadNav;
+  global.refreshHealth = refreshHealth;
   global.resolveLanding = resolveLanding;
   global.loadProjectPlans = loadProjectPlans;
   global.refreshProject = refreshProject;

@@ -19,6 +19,12 @@ from pathlib import Path
 from .util import (PRUNE_BATCH, RUN_COLS, SESSION_COLS,
                  _SEV_ORDER)
 
+#: The WAL is checkpointed and truncated once it passes this size (steady-state
+#: cap is this plus one checkpoint interval of writes), and the file is kept
+#: at most this large after a reset (``journal_size_limit``).
+WAL_CHECKPOINT_BYTES = 16 * 1024 * 1024
+WAL_SIZE_LIMIT_BYTES = 64 * 1024 * 1024
+
 
 class BaseMixin:
         def __init__(self, path: str | Path):
@@ -44,6 +50,15 @@ class BaseMixin:
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute("PRAGMA synchronous=NORMAL")
             self._conn.execute("PRAGMA busy_timeout=5000")
+            # Bound the WAL file: after a checkpoint resets the log, SQLite
+            # truncates it to this size instead of keeping its high-water mark.
+            self._conn.execute(f"PRAGMA journal_size_limit={WAL_SIZE_LIMIT_BYTES}")
+            # The default SQLite page cache is only 2 MiB. The dashboard's
+            # hot reads repeatedly touch the usage table and its indexes;
+            # retain a useful working set so aggregate requests don't churn
+            # through the same pages on every poll. This is a per-connection
+            # ceiling (64 MiB), not a preallocation.
+            self._conn.execute("PRAGMA cache_size=-65536")
             self._seq = 0
             self._data_seq = 0
             self._view_seq = 0
@@ -77,6 +92,8 @@ class BaseMixin:
             self._pruned_since_vacuum = 0
             self._prune_cycles = 0
             self._create()
+            # Reclaim the WAL a previous run left behind, before anything serves.
+            self.checkpoint_wal(threshold_bytes=0, mode="TRUNCATE")
         def close(self) -> None:
             with self._lock:
                 self._conn.close()
@@ -212,9 +229,14 @@ class BaseMixin:
             (keyset on rowid, wrapping at the end), so repeated calls at the
             reconcile cadence drain the table without a long pause. Returns
             the number of rows deleted. When a full pass completes and rows
-            were deleted along the way, one VACUUM reclaims the space.
-            A return of 0 means this batch was clean, not that the table is
-            drained; ``prune_cycles`` counts completed passes.
+            were deleted along the way, the freed pages are reused by later
+            inserts. No VACUUM runs here: a full VACUUM rewrites the whole
+            database under the store lock and stalls every reader. The
+            file shrinks only at a deliberate offline VACUUM (see
+            docs/perf.md). A return of 0 means this batch was clean, not that
+            the table is drained; ``prune_cycles`` counts completed passes.
+            The WAL is checkpointed at the end of a call when it has grown
+            past ``WAL_CHECKPOINT_BYTES``.
             """
             try:
                 limit = int(batch)
@@ -230,12 +252,14 @@ class BaseMixin:
                 if not rows:
                     self._prune_after = 0
                     self._prune_cycles += 1
-                    if self._pruned_since_vacuum > 0:
-                        self._conn.execute("VACUUM")
-                        self._conn.commit()
-                        self._pruned_since_vacuum = 0
-                    return 0
-                self._prune_after = rows[-1][0]
+                    self._pruned_since_vacuum = 0
+                    drained = True
+                else:
+                    self._prune_after = rows[-1][0]
+                    drained = False
+            if drained:
+                self.checkpoint_wal()
+                return 0
             # File existence checks may touch a mounted workspace. Never run
             # them while holding the store lock.
             gone = [row[1] for row in rows if _offset_path_gone(row[1])]
@@ -254,7 +278,38 @@ class BaseMixin:
                     raise
                 self._pruned_since_vacuum += len(gone)
                 self._seq += 1
+            self.checkpoint_wal()
             return len(gone)
+        def checkpoint_wal(self, threshold_bytes: int = WAL_CHECKPOINT_BYTES, mode: str = "PASSIVE") -> dict | None:
+            """Checkpoint the WAL once it passes ``threshold_bytes``.
+
+            Runs on its own short-lived connection and does NOT hold the store
+            lock: a checkpoint copies the whole log, and on a large WAL (the
+            live database carried 830 MB) doing it under the lock stalled every
+            endpoint for seconds. PASSIVE never blocks readers or writers and
+            does the copy incrementally; when a checkpoint completes, the
+            ``journal_size_limit`` set at connect truncates the file, so the
+            steady-state WAL stays at or under that limit. TRUNCATE is for
+            startup only (before the server serves). Returns None when no
+            checkpoint ran.
+            """
+            if str(self.path) == ":memory:":
+                return None
+            try:
+                size = os.path.getsize(str(self.path) + "-wal")
+            except OSError:
+                return None
+            if size < threshold_bytes:
+                return None
+            mode = mode if mode in ("PASSIVE", "TRUNCATE") else "PASSIVE"
+            conn = sqlite3.connect(str(self.path), timeout=0.2, isolation_level=None)
+            try:
+                conn.execute("PRAGMA busy_timeout=200")
+                busy, log_frames, done = conn.execute(f"PRAGMA wal_checkpoint({mode})").fetchone()
+            finally:
+                conn.close()
+            return {"wal_before": size, "mode": mode, "busy": busy, "log_frames": log_frames, "checkpointed": done}
+
         def _create(self) -> None:
             self._conn.executescript(
                 """

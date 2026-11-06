@@ -2190,6 +2190,131 @@ Promise.all([api("/api/project", {}), api("/api/project", {})]).then(function ()
         self.assertEqual(proc.returncode, 0, proc.stderr or proc.stdout)
         self.assertIn("nav share proof ok", proc.stdout)
 
+    def test_hung_health_does_not_hold_nav_and_badge_still_updates(self):
+        """Health feeds only the stale badge. A /api/health that never settles
+        must not hold loadNav, and when a health response does arrive the badge
+        updates. refreshHealth runs at most once per 30 s and never stacks."""
+        harness = r'''
+const fs = require("fs");
+const assert = require("assert");
+global.window = globalThis;
+global.FIX = false;
+global.state = {bundles: [], wss: [], wssAll: [], project: {name: null}, actionsArchive: false, lastSeqChange: 0, lastPoll: null};
+global.since = function () { return 123; };
+global.renderTabs = function () {};
+global.applyChrome = function () {};
+global.resolveLanding = function () {};
+var badges = {"stale-badge": {hidden: true, textContent: "", title: ""}, "live-txt": {textContent: "live"}};
+global.document = {getElementById: function (id) { return badges[id] || null; }};
+var healthUrls = [], healthResolvers = [];
+global.fetch = function (url, opts) {
+  var body = {bundles: [], workstreams: []};
+  if (url.indexOf("/api/health") === 0) {
+    healthUrls.push(url);
+    return new Promise(function (resolve) { healthResolvers.push(resolve); });
+  }
+  return Promise.resolve({ok: true, status: 200, headers: {get: function () { return "tag"; }}, json: function () { return Promise.resolve(body); }});
+};
+eval(fs.readFileSync(process.argv[2], "utf8"));
+var timeout = setTimeout(function () { console.error("ASSERT: loadNav held by a hung health request"); process.exit(1); }, 2000);
+loadNav().then(function () {
+  clearTimeout(timeout);
+  assert.strictEqual(healthUrls.length, 0, "loadNav must not fetch health");
+  assert.strictEqual(badges["stale-badge"].hidden, true);
+  refreshHealth();
+  refreshHealth();
+  assert.strictEqual(healthUrls.length, 1, "a tick while health is in flight must skip, got " + healthUrls.length);
+  healthResolvers[0]({ok: true, status: 200, headers: {get: function () { return "tag"; }}, json: function () { return Promise.resolve({sources: [{name: "poller", state: "error", last_error: "boom"}]}); }});
+  return new Promise(function (r) { setTimeout(r, 10); });
+}).then(function () {
+  assert.strictEqual(badges["stale-badge"].hidden, false, "badge must show the delayed source");
+  assert.strictEqual(badges["stale-badge"].textContent, "1 source delayed");
+  refreshHealth();
+  assert.strictEqual(healthUrls.length, 1, "health must not refetch within 30 s");
+  console.log("health isolation proof ok");
+  process.exit(0);
+}).catch(function (e) { console.error("ASSERT: " + ((e && e.stack) || e)); process.exit(1); });
+'''
+        with tempfile.TemporaryDirectory() as tmp:
+            harness_path = Path(tmp) / "health_iso.js"
+            harness_path.write_text(harness, encoding="utf-8")
+            proc = subprocess.run(
+                ["node", str(harness_path), str(STATIC / "core" / "api.js")],
+                capture_output=True,
+                text=True,
+            )
+        self.assertEqual(proc.returncode, 0, proc.stderr or proc.stdout)
+        self.assertIn("health isolation proof ok", proc.stdout)
+
+    def test_project_totals_skip_ignored_bundles(self):
+        """Project totals leave ignored bundles out of the comparison. /api/bundles
+        keeps them while /api/workstreams drops them, so without this the
+        Summary read Unavailable on every live project with an ignore list.
+        isIgnoredWs must agree with dash/project.py:is_ignored on every case,
+        and a bundle that is not ignored with no row still yields Unavailable."""
+        import sys
+
+        root = str(Path(__file__).resolve().parent.parent)
+        if root not in sys.path:
+            sys.path.insert(0, root)
+        from dash.project import is_ignored
+
+        entries = ["PLANNING", "tools", "WS0", "scratch*", "  Ops-* ", 42, ""]
+        ids = ["PLANNING", "planning", "TOOLS", "WS0", "WS01", "WS1", "scratch-1", "SCRATCH", "ops-9", "OPS", "WS2", "", None]
+        cases = [{"ws": w, "entries": entries, "expected": bool(is_ignored(w, entries))} for w in ids]
+        cases.append({"ws": "WS9", "entries": ["*"], "expected": True})
+        harness = r'''
+const fs = require("fs");
+const assert = require("assert");
+global.window = globalThis;
+global.state = {bundles: [], wssAll: [], project: {ignore_workstreams: []}};
+global.el = function () { return {}; };
+global.fmtN = String; global.fmtUsd = String; global.fmtDur = String;
+global.ADT = {wsStateOf: function () { return "active"; }};
+global.ADC = {billed: function () { return 0; }};
+eval(fs.readFileSync(process.argv[2], "utf8"));
+const C = window.AdPage.cards;
+const cases = JSON.parse(fs.readFileSync(process.argv[3], "utf8"));
+for (const c of cases) {
+  assert.strictEqual(C.isIgnoredWs(c.ws, c.entries), c.expected, "isIgnoredWs(" + JSON.stringify(c.ws) + ", " + JSON.stringify(c.entries) + ")");
+}
+function row(ws, n) { return {ws: ws, live_agents: n, finished_in_range: n, tokens: 10 * n, cost_usd: n, tokens_all_time: 100 * n, cost_usd_all_time: 2 * n}; }
+state.project = {ignore_workstreams: ["planning", "scratch*", "WS0"]};
+state.bundles = [
+  {id: "WS1", kind: "workstream"}, {id: "WS2", kind: "workstream"},
+  {id: "PLANNING", kind: "workstream"}, {id: "WS0", kind: "workstream"},
+  {id: "scratch-1", kind: "workstream"}, {id: "TOOLS", kind: "workstream"}
+];
+state.wssAll = [row("WS1", 1), row("WS2", 2), row("TOOLS", 4)];
+let t = C.projectTotals();
+assert.strictEqual(t.available, true, "ignored bundles without rows must not block totals: " + JSON.stringify(t));
+assert.strictEqual(t.workstreams, 3, "only non-ignored bundles count: " + JSON.stringify(t));
+assert.strictEqual(t.live_agents, 7, "sum of WS1, WS2, TOOLS rows");
+assert.strictEqual(t.cost_usd_all_time, 14, "all-time cost sums the matched rows");
+state.bundles.push({id: "WS9", kind: "workstream"});
+t = C.projectTotals();
+assert.strictEqual(t.available, false, "a non-ignored bundle with no row must stay Unavailable");
+assert.strictEqual(t.workstreams, 4);
+assert.strictEqual(t.loaded, 3);
+state.bundles = [{id: "WS1", kind: "workstream"}];
+state.wssAll = [];
+t = C.projectTotals();
+assert.strictEqual(t.available, false, "no rows at all stays Unavailable");
+console.log("project totals ignore proof ok");
+'''
+        with tempfile.TemporaryDirectory() as tmp:
+            harness_path = Path(tmp) / "project_totals.js"
+            cases_path = Path(tmp) / "cases.json"
+            harness_path.write_text(harness, encoding="utf-8")
+            cases_path.write_text(json.dumps(cases), encoding="utf-8")
+            proc = subprocess.run(
+                ["node", str(harness_path), str(STATIC / "cards" / "project-home.js"), str(cases_path)],
+                capture_output=True,
+                text=True,
+            )
+        self.assertEqual(proc.returncode, 0, proc.stderr or proc.stdout)
+        self.assertIn("project totals ignore proof ok", proc.stdout)
+
     def test_section_keys_have_no_volatile_values(self):
         """Section keys decide rebuilds: a key holding an unbucketed clock
         read, Math.random() or new Date() changes on every render and the

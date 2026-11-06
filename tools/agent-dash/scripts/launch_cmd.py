@@ -39,7 +39,7 @@ FREE_MODELS = [
     "deepseek/deepseek-v4-pro",
     "deepseek/deepseek-v4-flash",
     "reflection/beam:free",
-    "poolside/laguna-s-2.1-free",
+    "stealth/crouton-alpha",
     "stealth/glyph-cluster:free",
 ]
 COOLDOWN_S = 15 * 60
@@ -194,7 +194,7 @@ def main():
             se.write(f"--- attempt {attempt} model {model} at {start}\n")
             se.flush()
             rc = subprocess.run(
-                ["cmd", "-p", prompt, "-m", model, "--output-format", "json", "--max-turns", "200", "--effort", "high",
+                ["cmd", "-p", prompt, "-m", model, "--output-format", "json", "--max-turns", (os.environ.get("CMD_MAX_TURNS") or "1000").strip(), "--effort", "high",
                  "--yolo", "-t", "--skip-onboarding", "--no-auto-update"],
                 cwd=workspace, stdout=so, stderr=se, stdin=subprocess.DEVNULL,
             ).returncode
@@ -223,6 +223,10 @@ def main():
             with open(os.path.join(outdir, f"out-{label}.md"), "w") as f:
                 f.write(f"<!-- model: {model} attempt {attempt} -->\n{text}\n")
             return 0
+        if "maximum conversation turns" in err_tail[-600:]:
+            with open(os.path.join(outdir, f"out-{label}.md"), "w") as f:
+                f.write(f"<!-- model: {model} attempt {attempt} -->\nTURN-CAP: the run hit --max-turns; no retry, no cooldown. Check the worktree and the report file.\n{text}\n")
+            return 3
         cool(outdir, model, cooldown_for(err_tail[-600:]))
     with open(os.path.join(outdir, f"out-{label}.md"), "w") as f:
         f.write(f"BLOCKED: every free model failed or throttled after {MAX_ATTEMPTS} attempts; see err-{label}.log\n")

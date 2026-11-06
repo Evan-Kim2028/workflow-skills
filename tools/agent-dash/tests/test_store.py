@@ -4081,7 +4081,8 @@ class PruneOffsetsTest(unittest.TestCase):
         }
         self.assertEqual(paths, {live, "muse:fresh-scan"})
 
-    def test_prune_vacuums_once_per_pass(self):
+    def test_prune_drains_a_pass_without_vacuum(self):
+        # Stage 3: no VACUUM on the serving path (see tests/test_perf_stage3.py).
         live = os.path.join(self.tmp.name, "live.jsonl")
         with open(live, "w", encoding="utf-8") as fh:
             fh.write("{}\n")

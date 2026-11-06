@@ -134,6 +134,8 @@ class Fixture(unittest.TestCase):
         return {
             "roots": {"scratchpads": [str(self.scratch)], "commandcode_projects": str(self.projects)},
             "read_budgets": {"per_file": 4 * 1024 * 1024, "per_tick": 8 * 1024 * 1024},
+            # Per-poll discovery: these tests pin a moved row on the next poll.
+            "dir_scan_s": 0,
         }
 
     def poll(self, now=1_800_000_000.0):
@@ -487,6 +489,8 @@ class LateLabelRepairTest(unittest.TestCase):
         return {
             "roots": {"scratchpads": [str(self.scratch)], "commandcode_projects": str(self.projects)},
             "read_budgets": {"per_file": 4 * 1024 * 1024, "per_tick": 8 * 1024 * 1024},
+            # Per-poll discovery: these tests pin a moved row on the next poll.
+            "dir_scan_s": 0,
         }
 
     def test_pre_link_usage_moves_to_labeled_run(self):
