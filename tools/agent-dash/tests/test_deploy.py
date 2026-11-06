@@ -148,6 +148,9 @@ class CliStateMixin:
             agent_dash.PORT,
         )
         agent_dash.PORT = free_port()
+        # Guard: a case must never bind the live port or a non-temp state dir.
+        assert agent_dash.PORT != 8765
+        assert os.path.realpath(os.environ["AGENT_DASH_STATE_DIR"]).startswith(os.path.realpath(tempfile.gettempdir()))
         self.addCleanup(self.restore_temp_state)
 
     def restore_temp_state(self):
@@ -408,7 +411,9 @@ class DeployLibTest(unittest.TestCase):
         self.assertTrue(ok, message)
         self.assertEqual(seen, [git(self.repo, "rev-parse", "--short", self.sha2)])
 
-    def test_gate_failure_restarts_previous(self):
+    def test_gate_failure_leaves_the_dashboard_alone(self):
+        # A refused gate switches nothing, so it must not restart anything:
+        # restarting the running release here would bounce the live server.
         self._all_ok()
         self.assertTrue(deploy_lib.deploy(self.state, self.repo, ref=self.sha1, url="http://127.0.0.1:1")[0])
         self.assertTrue(deploy_lib.deploy(self.state, self.repo, ref=self.sha2, url="http://127.0.0.1:1")[0])
@@ -423,8 +428,9 @@ class DeployLibTest(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("gate failed", message)
         self.assertIn("gate boom", message)
+        self.assertIn("left as-is", message)
+        self.assertEqual(restarts, [])
         self.assertEqual(deploy_lib.current_release(self.state), prev)
-        self.assertIn(deploy_lib.tool_dir_of(prev), [tool for tool, _flag in restarts])
         first = deploy_lib.releases_dir(self.state) / self.sha1
         self.assertEqual(deploy_lib.previous_release(self.state), first)
 
@@ -634,10 +640,12 @@ class LocalFilesTest(unittest.TestCase):
         (self.tool / "config.local.json").write_text('{"a": 1}\n', encoding="utf-8")
         (self.tool / "workers.local.json").write_text('{"default": "local"}\n', encoding="utf-8")
         (self.tool / "static" / "taskmap.local.json").write_text("{}\n", encoding="utf-8")
+        # Clear every override a shell (or a trial) may export, so each
+        # case sees exactly the files it builds.
         env = mock.patch.dict(os.environ, {"AGENT_DASH_IGNORE_LOCAL": ""})
         env.start()
         self.addCleanup(env.stop)
-        for name in ("AGENT_DASH_WORKERS", "AGENT_DASH_MAP", "AGENT_DASH_PLANS", "AGENT_DASH_TASKMAP"):
+        for name in ("AGENT_DASH_WORKERS", "AGENT_DASH_MAP", "AGENT_DASH_PLANS", "AGENT_DASH_TASKMAP", deploy_lib.LOCAL_SOURCE_ENV):
             os.environ.pop(name, None)
 
     def _cleanup_repo(self):
@@ -723,6 +731,32 @@ class LocalFilesTest(unittest.TestCase):
         self.assertTrue(ok, message)
         self.assertTrue(seen["link"])
         self.assertIn("deployed", message)
+
+    def test_local_source_env_names_the_owner_checkout(self):
+        clean = make_repo(commits=1)
+        self.addCleanup(lambda: subprocess.run(["rm", "-rf", str(clean)], check=False, timeout=30))
+        self._all_ok()
+        with mock.patch.dict(os.environ, {deploy_lib.LOCAL_SOURCE_ENV: str(self.src)}):
+            ok, message = deploy_lib.deploy(self.state, clean, ref="HEAD", url="http://127.0.0.1:1")
+        self.assertTrue(ok, message)
+        release = deploy_lib.current_release(self.state)
+        self.assertTrue((deploy_lib.tool_dir_of(release) / "workers.local.json").is_symlink())
+
+    def test_rollback_relinks_the_previous_release(self):
+        # The previous release was built before the owner's files existed
+        # (the case that ran the example registry); rollback must link it.
+        self._all_ok()
+        for name in ("config.local.json", "workers.local.json", "static/taskmap.local.json"):
+            (self.tool / name).unlink()
+        self.assertTrue(deploy_lib.deploy(self.state, self.src, ref=self.sha1, url="http://127.0.0.1:1")[0])
+        first = deploy_lib.releases_dir(self.state) / self.sha1
+        self.assertFalse((first / "tools" / "agent-dash" / "workers.local.json").exists())
+        (self.tool / "workers.local.json").write_text('{"default": "local"}\n', encoding="utf-8")
+        self.assertTrue(deploy_lib.deploy(self.state, self.src, ref=self.sha2, url="http://127.0.0.1:1")[0])
+        ok, message = deploy_lib.rollback(self.state, url="http://127.0.0.1:1", source=self.src)
+        self.assertTrue(ok, message)
+        self.assertEqual(deploy_lib.current_release(self.state), first)
+        self.assertTrue((first / "tools" / "agent-dash" / "workers.local.json").is_symlink())
 
     def test_local_file_names_cover_every_layered_read(self):
         import re

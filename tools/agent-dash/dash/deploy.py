@@ -416,10 +416,37 @@ def _release_build(release: Path) -> str | None:
     return short if code == 0 and short else None
 
 
-def _recover(state_dir: Path | str, prev: Path | None, url: str | None, health_timeout_s: float, yes_live: bool = False) -> str:
+LOCAL_SOURCE_ENV = "AGENT_DASH_LOCAL_SOURCE"
+
+
+def _source(source: Path | str | None) -> Path:
+    """The checkout whose local files are linked into a release.
+
+    ``AGENT_DASH_LOCAL_SOURCE`` wins (a trial or a worktree deploy names
+    the checkout that holds the owner's files); else ``source``; else the
+    checkout running this code.
+    """
+    env = os.environ.get(LOCAL_SOURCE_ENV, "").strip()
+    if env:
+        return Path(os.path.expanduser(env))
+    return Path(source) if source is not None else Path(default_repo(TOOL_ROOT))
+
+
+def _recover(
+    state_dir: Path | str,
+    prev: Path | None,
+    url: str | None,
+    health_timeout_s: float,
+    yes_live: bool = False,
+    source: Path | str | None = None,
+) -> str:
     """Best-effort restart of the previous release after a failed deploy."""
     if prev is None:
         return "no previous release recorded; the dashboard was left as-is"
+    try:
+        link_local_files(prev, _source(source))
+    except DeployError as exc:
+        return f"automatic rollback to {prev} skipped: {exc}"
     set_current(state_dir, prev)
     ok, reason = restart_release(tool_dir_of(prev), yes_live)
     if not ok:
@@ -450,7 +477,7 @@ def deploy(
     state_dir = Path(state_dir)
     try:
         release, sha, expected = ensure_release(repo, ref, state_dir, worktree)
-        link_local_files(release, repo)
+        link_local_files(release, _source(repo))
     except DeployError as exc:
         return False, str(exc)
     prev = current_release(state_dir)
@@ -458,22 +485,23 @@ def deploy(
     reap_note = f"; reaped {reaped} dead run(s)" if reaped > 0 else ""
     ok, reason = run_gate(release)
     if not ok:
-        recovered = _recover(state_dir, prev, url, health_timeout_s, yes_live)
-        return False, f"gate failed for {sha}: {reason}{reap_note}; {recovered}"
+        # Nothing was switched yet, so nothing is restarted: a refused
+        # gate leaves the running dashboard exactly as it was.
+        return False, f"gate failed for {sha}: {reason}{reap_note}; the dashboard was left as-is"
     set_current(state_dir, release)
     ok, reason = restart_release(tool_dir_of(release), yes_live)
     if not ok:
-        recovered = _recover(state_dir, prev, url, health_timeout_s, yes_live)
+        recovered = _recover(state_dir, prev, url, health_timeout_s, yes_live, repo)
         return False, f"restart of {sha} failed: {reason}; {recovered}"
     if url is not None:
         ok, reason = wait_healthy(url, expected, timeout_s=health_timeout_s)
         if not ok:
-            recovered = _recover(state_dir, prev, url, health_timeout_s, yes_live)
+            recovered = _recover(state_dir, prev, url, health_timeout_s, yes_live, repo)
             return False, f"new release unhealthy: {reason}; {recovered}"
         wait_settled(url)
     ok, reason = run_check(tool_dir_of(release))
     if not ok:
-        recovered = _recover(state_dir, prev, url, health_timeout_s, yes_live)
+        recovered = _recover(state_dir, prev, url, health_timeout_s, yes_live, repo)
         return False, f"check failed on {sha}: {reason}; {recovered}"
     if prev is not None and prev != release:
         set_previous(state_dir, prev)
@@ -488,11 +516,14 @@ def rollback(
     url: str | None = None,
     health_timeout_s: float = 25.0,
     yes_live: bool = False,
+    source: Path | str | None = None,
 ) -> tuple[bool, str]:
     """Switch the dashboard back to the previous release manually.
 
     Returns ``(ok, message)``; failures swap the links back and name
     the reason. ``yes_live`` forwards ``--yes-live`` to the restart.
+    ``source`` is the checkout whose local files are (re)linked into
+    the previous release first; default is the checkout running this code.
     """
     state_dir = Path(state_dir)
     cur = current_release(state_dir)
@@ -504,6 +535,10 @@ def rollback(
         )
     if cur is not None and prev == cur:
         return False, f"previous release is already current ({prev}); nothing to roll back"
+    try:
+        link_local_files(prev, _source(source))
+    except DeployError as exc:
+        return False, str(exc)
     if cur is not None:
         set_previous(state_dir, cur)
     set_current(state_dir, prev)
