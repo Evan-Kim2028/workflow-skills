@@ -118,8 +118,26 @@
     return c;
   }
 
+  /* Mirrors dash/project.py:is_ignored: case-insensitive, an entry ending
+     in "*" matches by prefix, malformed entries never match. /api/workstreams
+     already drops ignored rows; /api/bundles does not, so the totals need
+     this to leave those bundles out of the comparison. */
+  function isIgnoredWs(ws, entries) {
+    if (typeof ws !== "string" || !ws.trim() || !entries || !entries.length) return false;
+    var upper = ws.trim().toUpperCase();
+    for (var i = 0; i < entries.length; i++) {
+      if (typeof entries[i] !== "string") continue;
+      var text = entries[i].trim().toUpperCase();
+      if (!text) continue;
+      if (text.charAt(text.length - 1) === "*") {
+        if (upper.indexOf(text.slice(0, -1)) === 0) return true;
+      } else if (upper === text) return true;
+    }
+    return false;
+  }
   function projectTotals() {
-    var bundles = (state.bundles || []).filter(function (b) { return b && b.kind === "workstream" && b.id; });
+    var ignored = (state.project && state.project.ignore_workstreams) || [];
+    var bundles = (state.bundles || []).filter(function (b) { return b && b.kind === "workstream" && b.id && !isIgnoredWs(String(b.id), ignored); });
     var rows = state.wssAll;
     if (!bundles.length || !Array.isArray(rows) || !rows.length) return {available: false, workstreams: bundles.length, loaded: 0};
     var byId = {};
@@ -464,7 +482,7 @@
     entries.forEach(function (e) { if (e.slot) bySlot[e.slot] = e; });
     specs.push(slotSection("exec-depgraph", bySlot["exec-depgraph"] || null));
     specs.push(["project-phases", keyOf([state.project]), function () { return phasesSection(state.project); }, ""]);
-    specs.push(["project-tiles", keyOf([snap && snap.totals, snap && snap.totals_all_time, state.wssAll, state.bundles, projectTotalsScope(), state.ws, state.snapError]), function () { return tilesSection(snap); }, ""]);
+    specs.push(["project-tiles", keyOf([snap && snap.totals, snap && snap.totals_all_time, state.wssAll, state.bundles, state.project && state.project.ignore_workstreams, projectTotalsScope(), state.ws, state.snapError]), function () { return tilesSection(snap); }, ""]);
     specs.push(["project-unassigned", keyOf([(state.wssAll || []).filter(function (w) { return w && String(w.ws).toLowerCase() === "unassigned"; }), projectTotalsScope()]), function () { return unassignedSection(); }, ""]);
     specs.push(["project-current", keyOf([(state.wss || []).map(function (w) { return [w.ws, w.live_agents, w.tokens, w.cost_usd]; }), planSum]), function () {
       var c = el("div", {class: "card pj-current", "data-nav": "Current"});
@@ -497,6 +515,8 @@
   var AdPage = (global.AdPage = global.AdPage || {});
   AdPage.cards = AdPage.cards || {};
   AdPage.cards.projectHome = projectHomeSpecs;
+  AdPage.cards.projectTotals = projectTotals;
+  AdPage.cards.isIgnoredWs = isIgnoredWs;
   AdPage.PROJECT_SLOTS = PROJECT_SLOTS;
   global.projectHomeSpecs = projectHomeSpecs;
   global.phProgAria = phProgAria;
