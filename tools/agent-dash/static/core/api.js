@@ -381,8 +381,6 @@
         badge.textContent = "" + delayed.length + " source" + (delayed.length === 1 ? "" : "s") + " delayed";
         badge.title = delayed.map(function (s) {
           var lag = s.lag_s == null ? "no recent poll" : "last poll " + fmtDur(s.lag_s) + " ago";
-||||||| bf05361
-          var lag = s.lag_s == null ? "no recent poll" : "last poll " + Math.round(s.lag_s) + "s ago";
           return s.name + " · " + (s.last_error || lag);
         }).join("\n");
       } else {
