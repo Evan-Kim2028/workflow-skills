@@ -12,6 +12,14 @@ A fast doctor preflight (dashboard reachable, run dir visible, tier model
 priced and policy-compliant) runs before launching; a failure prints the
 problem and its fix and exits 1 without launching. --no-preflight skips it.
 
+Before launching, the worker gets the assembled prompt, not the caller's
+file: the ``[label: <label>]`` line, then ``templates/worker-common.md``
+(the worker rules), then the caller's text. The caller's file is never
+changed; the assembled copy is ``<run-dir>/<label>.md``. Both pieces are
+idempotent: a prompt that already carries the rules marker (or the
+pre-marker rules heading) or a leading label line is not given them
+again. A missing template warns and launches without the rules.
+
 Every kind writes its manifest row with the tier it was launched under, so
 the dashboard reads the registry tier name (``deepseek-flash``) instead of
 guessing one from the model id; the row layout stays ``label, session_id,
@@ -68,6 +76,14 @@ REPORT_TAIL_BYTES = 600
 #: budget is generous; a timeout below warns instead of refusing.
 PREFLIGHT_TIMEOUT_S = 10.0
 STANDBY_SUFFIX = "-standby"
+#: Worker rules template, shipped in the repo and linked into ~/.claude/templates.
+RULES_TEMPLATE = ROOT / "templates" / "worker-common.md"
+#: Stable line that opens the template. A prompt carrying it already has the rules.
+RULES_MARKER = "<!-- agent-dash:worker-rules v1 -->"
+#: Prompts written before the marker existed carry the rules under the
+#: template's first heading; detection also accepts that line (see assemble_prompt).
+#: The first line of a caller's prompt when it names the run (``[label: x]``).
+LABEL_LINE = re.compile(r"\[label:[^\]\n]*\]")
 
 #: Harness that runs each launch kind. The dashboard row, the meta file, and
 #: the registry all name it the way ``dash.models.harness_of`` does, so a
@@ -238,12 +254,79 @@ def run(argv, spawn=None, pgrep=None, sleep=None, now=None, alive=None, new_uuid
         blocked = run_preflight(registry, requested, ctx)
         if blocked is not None:
             return blocked
+    prepare_prompt(ctx)
     name, reason = pick_initial(ctx)
     if not name:
         code = 0 if reason == "none-available" else 2
         emit("failed", out, err, requested, reason)
         return code
     return launch(ctx, name, set(exclude))
+
+
+def read_rules_template():
+    """``(template text, its first heading)``, or ``(None, None)`` when missing."""
+    try:
+        text = RULES_TEMPLATE.read_text(encoding="utf-8")
+    except OSError:
+        return None, None
+    heading = next((line for line in text.splitlines() if line.startswith("# ")), None)
+    return text, heading
+
+
+def assemble_prompt(text, label, template, heading):
+    """``(assembled prompt, notes)`` for one caller prompt.
+
+    Order: the label line, the worker rules template, the caller's text.
+    A caller that opens with a label line keeps it (a note says so when it
+    names another label), so the label stays the first line either way.
+    Rules are skipped when the text carries the marker or the template's
+    heading line. Applying this to its own output changes nothing.
+    """
+    notes = []
+    lines = text.split("\n")
+    first = next((i for i, line in enumerate(lines) if line.strip()), None)
+    if first is not None and LABEL_LINE.fullmatch(lines[first].strip()):
+        head = lines[first].strip()
+        if head != f"[label: {label}]":
+            notes.append(f"prompt opens with {head}; kept it instead of [label: {label}]")
+        rest = "\n".join(lines[first + 1 :])
+    else:
+        head = f"[label: {label}]"
+        rest = text
+    rest = rest.lstrip("\n")
+    parts = [head]
+    if template is None:
+        notes.append(f"worker rules template missing at {RULES_TEMPLATE}; launching without the rules")
+    else:
+        present = RULES_MARKER in text or (
+            heading is not None and any(line.rstrip() == heading for line in text.splitlines())
+        )
+        if not present:
+            parts.append(template.rstrip("\n"))
+    if rest.strip():
+        parts.append(rest.rstrip("\n"))
+    return "\n\n".join(parts) + "\n", notes
+
+
+def prepare_prompt(ctx) -> None:
+    """Point ``ctx["prompt"]`` at the assembled prompt in the run folder.
+
+    Every tier reads ``ctx["prompt"]`` (and a quota retry reuses it), so
+    this runs once before the first launch. The caller's file is only read.
+    The assembled copy is ``<label>.md`` because the dashboard matches a
+    live muse process by a ``--prompt-file`` ending in ``/<label>.md``.
+    """
+    source = Path(ctx["prompt"])
+    text = source.read_text(encoding="utf-8")
+    template, heading = read_rules_template()
+    assembled, notes = assemble_prompt(text, ctx["label"], template, heading)
+    for note in notes:
+        print(f"prompt warning: {note}", file=sys.stderr)
+    target = ctx["run_dir"] / f"{ctx['label']}.md"
+    if target.resolve() == source.resolve():
+        target = ctx["run_dir"] / f"{ctx['label']}.prompt.md"
+    target.write_text(assembled, encoding="utf-8")
+    ctx["prompt"] = str(target)
 
 
 def pick_initial(ctx):
