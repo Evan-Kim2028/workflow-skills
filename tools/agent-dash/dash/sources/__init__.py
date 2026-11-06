@@ -360,6 +360,17 @@ def backoff_gap(source, idle: int) -> float:
     return min(BACKOFF_MAX_S, interval * (2 ** min(steps, 16)))
 
 
+def fallback_enabled(source) -> bool:
+    """Whether a dormant source gets a full poll at the gap cap.
+
+    The default keeps that fallback, so a change no declared path shows is
+    still read within ``BACKOFF_MAX_S``. A source whose signals cover every
+    change it reads sets ``signal_fallback = False``: it then makes no poll
+    call (no walk, no offset query) until a signal moves.
+    """
+    return bool(getattr(source, "signal_fallback", True))
+
+
 def signal_token(source, cfg):
     """A cheap fingerprint of the source's wake signals (stats only).
 
@@ -396,7 +407,7 @@ def _due(source, state: dict, now: float, cfg) -> bool:
         return True
     if not declares_signals(source) or int(state.get("idle") or 0) < BACKOFF_AFTER:
         return now - last >= source.INTERVAL_S
-    if now - last >= backoff_gap(source, state["idle"]):
+    if fallback_enabled(source) and now - last >= backoff_gap(source, state["idle"]):
         return True
     sig_at = state.get("sig_at")
     if sig_at is not None and now - sig_at < source.INTERVAL_S:
@@ -563,6 +574,9 @@ def source_state(source, state: dict, now: float, born: float, *, startup: bool 
 def _is_stalled(source, state: dict, now: float, born: float) -> bool:
     limit = STALL_FACTOR * float(getattr(source, "INTERVAL_S", 0) or 0)
     if declares_signals(source) and int(state.get("idle") or 0) >= BACKOFF_AFTER:
+        if not fallback_enabled(source):
+            # Silent by design until a signal moves: never a stall.
+            return False
         # A dormant source is silent by design for up to the fallback gap.
         limit = BACKOFF_MAX_S + limit
     last = state.get("last_poll")

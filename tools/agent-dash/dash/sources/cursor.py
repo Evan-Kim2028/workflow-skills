@@ -238,6 +238,12 @@ def signal_paths(cfg):
     return paths
 
 
+#: No fallback poll while dormant: the signals above cover every change this
+#: source reads (new chat dirs, the billed-turn hook file, live cursor pids).
+#: A dormant cursor therefore never walks or queries offsets.
+signal_fallback = False
+
+
 def signal_extra(cfg):
     """Live cursor-agent pids: a resumed chat's process start wakes the source.
 

@@ -245,12 +245,18 @@ class CursorDormantTests(unittest.TestCase):
         self.assertIn(os.path.join(self.state, self.cursor.USAGE_FILE), paths)
 
     def test_dormant_cursor_enters_the_entry_point_only_on_the_gap(self):
-        """Dormant cursor makes no poll call (so no walk, no offset query)."""
+        """Dormant cursor makes no poll call (so no walk, no offset query).
+
+        Past the gap cap too: cursor has no fallback poll, its signals cover it.
+        """
         reg = Registry([self.cursor])
         store = CountingStore()
         run_ticks(reg, store, self.cfg, T0, T0 + 200)
         self.assertTrue(reg.state["cursor"]["idle"] >= S.BACKOFF_AFTER)
-        self.assertLess(len(self.polls), 20)
+        before = len(self.polls)
+        run_ticks(reg, store, self.cfg, T0 + 200.5, T0 + 1000)
+        self.assertEqual(len(self.polls), before)
+        self.assertFalse(S._is_stalled(self.cursor, reg.state["cursor"], T0 + 1000, T0))
 
     def test_hook_line_wakes_cursor(self):
         reg = Registry([self.cursor])
