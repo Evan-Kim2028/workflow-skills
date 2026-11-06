@@ -186,8 +186,10 @@
        Planned/Archive pill counts. Both are best-effort on older servers. */
     var projP = api("/api/project", {}).then(function (j) { state.project = (j && typeof j === "object") ? j : {name: null}; state.actionsArchive = !!(j && j.actions && j.actions.archive); }).catch(function () { state.project = {name: null}; state.actionsArchive = false; });
     var allP = api("/api/workstreams", {since: since(), state: "all"}).then(function (j) { state.wssAll = j.workstreams || []; }).catch(function () { state.wssAll = []; });
-    var healthP = api("/api/health", {}).then(function (j) { state.health = (j && typeof j === "object") ? j : null; }).catch(function () { state.health = null; });
-    navInflight = Promise.all([bundlesP, wsP, projP, allP, healthP]).then(function () { renderTabs(); applyChrome(); resolveLanding(); updateStale(); }).then(function () { navInflight = null; lastNavDone = Date.now(); }, function () { navInflight = null; });
+    /* Health only feeds the stale badge. It is not awaited here: a slow health
+       read must never hold a navigation (tab switch, workstream pick). */
+    api("/api/health", {}).then(function (j) { state.health = (j && typeof j === "object") ? j : null; updateStale(); }).catch(function () { state.health = null; });
+    navInflight = Promise.all([bundlesP, wsP, projP, allP]).then(function () { renderTabs(); applyChrome(); resolveLanding(); updateStale(); }).then(function () { navInflight = null; lastNavDone = Date.now(); }, function () { navInflight = null; });
     return navInflight;
   }
   /* First-load default view, once per page load: Project home when the
@@ -379,6 +381,8 @@
         badge.textContent = "" + delayed.length + " source" + (delayed.length === 1 ? "" : "s") + " delayed";
         badge.title = delayed.map(function (s) {
           var lag = s.lag_s == null ? "no recent poll" : "last poll " + fmtDur(s.lag_s) + " ago";
+||||||| bf05361
+          var lag = s.lag_s == null ? "no recent poll" : "last poll " + Math.round(s.lag_s) + "s ago";
           return s.name + " · " + (s.last_error || lag);
         }).join("\n");
       } else {

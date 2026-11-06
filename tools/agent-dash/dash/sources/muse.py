@@ -207,11 +207,23 @@ def _drain_files(store, files, key, budget, per_file, now, processes, manifests)
     return budget
 
 
+#: The muse clock repair scans every muse run row under the store lock. It is
+#: idempotent and only fixes rows a poll wrote a moment ago, so it runs at most
+#: this often instead of on every 2 s poll (docs/perf.md, stage 3).
+REPAIR_CLOCKS_EVERY_S = 30.0
+_last_clock_repair = [None]
+
+
 def _repair(store, now):
     for name, where in (("repair_muse_orphans", "orphan"), ("repair_muse_clocks", "clock")):
         fn = getattr(store, name, None)
         if not callable(fn):
             continue
+        if name == "repair_muse_clocks":
+            last = _last_clock_repair[0]
+            if last is not None and now - last < REPAIR_CLOCKS_EVERY_S:
+                continue
+            _last_clock_repair[0] = now
         try:
             fn()
         except Exception:
@@ -939,9 +951,9 @@ def _budgets(cfg):
 
 
 def _scratch_roots(cfg):
-    from dash.rundirs import scan_roots
+    from dash.sources import scan_roots_memo
 
-    return scan_roots(cfg)
+    return scan_roots_memo(cfg)
 
 
 def _only_session(cfg):

@@ -21,6 +21,7 @@ store.get_offset and store.set_offset.
 from __future__ import annotations
 
 import importlib
+import json
 import logging
 import os
 import pkgutil
@@ -236,10 +237,37 @@ class Registry:
             try:
                 from dash.rundirs import describe_roots
 
-                body.update(describe_roots(cfg, now=now, processes=processes))
+                body.update(_describe_roots_memo(cfg, now, processes))
             except Exception as exc:
                 log.warning("health roots: %s", type(exc).__name__)
         return body
+
+
+DESCRIBE_TTL_S = 15.0
+
+
+def _describe_roots_memo(cfg, now, processes) -> dict:
+    """``dash.rundirs.describe_roots`` for /api/health, reused for ``DESCRIBE_TTL_S``.
+
+    It reads the manifests of every registered folder outside the configured
+    roots (up to 1 MB each), so a health request paid that read per hit. The
+    warnings name labels that are live right now; a 15 s lag is fine for them.
+    """
+    from dash.rundirs import describe_roots
+
+    if isinstance(processes, str):
+        procs_key = processes
+    else:
+        procs_key = tuple(sorted(str(row.get("label")) for row in (processes or []) if isinstance(row, dict)))
+    key = (
+        "describe_roots",
+        json.dumps(cfg.get("roots"), sort_keys=True, default=str),
+        str(cfg.get("state_dir")),
+        os.environ.get("AGENT_DASH_STATE_DIR") or "",
+        procs_key,
+    )
+    value = memo_call(key, DESCRIBE_TTL_S, lambda: describe_roots(cfg, now=now, processes=processes))
+    return {k: (list(v) if isinstance(v, list) else v) for k, v in value.items()}
 
 
 def _perf_poll(source, duration: float) -> None:
@@ -430,6 +458,90 @@ def _is_stalled(source, state: dict, now: float, born: float) -> bool:
     if last is None:
         return now - born > max(limit, START_GRACE_S)
     return now - last > limit
+
+
+#: Shared memos for work that does not change within a few seconds. Directory
+#: discovery is deliberately NOT memoized: a negative result (no manifest yet)
+#: cached for a TTL hides the next poll's new file, which the source tests pin.
+#: Realpath answers are stable; the run-folder registry (``scan_roots``) only
+#: decides which folders to read, so a new registration appears within one TTL.
+REALPATH_TTL_S = 60.0
+SCAN_ROOTS_TTL_S = 10.0
+_MEMO: dict = {}
+_MEMO_LOCK = threading.Lock()
+_MEMO_MAX = 20000
+
+
+def memo_call(key, ttl_s: float, compute):
+    """``compute()`` at most once per ``ttl_s`` for ``key``. Bounded, thread-safe.
+
+    A miss recomputes outside the lock, so a slow walk never blocks another
+    source's memo. The table clears when it reaches ``_MEMO_MAX`` entries.
+    """
+    now = time.monotonic()
+    with _MEMO_LOCK:
+        hit = _MEMO.get(key)
+    if hit is not None and now - hit[0] < ttl_s:
+        return hit[1]
+    value = compute()
+    with _MEMO_LOCK:
+        if len(_MEMO) >= _MEMO_MAX:
+            _MEMO.clear()
+        _MEMO[key] = (time.monotonic(), value)
+    return value
+
+
+def realpath_memo(path):
+    """``os.path.realpath`` memoized for ``REALPATH_TTL_S``. Same result, fewer lstat walks."""
+    if not isinstance(path, str):
+        return os.path.realpath(path)
+    return memo_call(("realpath", path), REALPATH_TTL_S, lambda: os.path.realpath(path))
+
+
+_TLS = threading.local()
+
+
+def set_discovery_ttl(seconds) -> None:
+    """Set this thread's directory-discovery reuse window (``dir_scan_s``).
+
+    A source's poll sets it from its config at entry; the walkers that call
+    :func:`discovery_memo` reuse their last listing for that many seconds.
+    Zero (the default, and the source tests' setting) walks on every poll.
+    """
+    try:
+        _TLS.ttl = max(0.0, float(seconds))
+    except (TypeError, ValueError):
+        _TLS.ttl = 0.0
+
+
+def discovery_memo(key, compute):
+    """``compute()`` reused for this thread's discovery window (see :func:`set_discovery_ttl`).
+
+    Negative results are reused too, which is why a source keeps this at
+    its ``dir_scan_s`` knob (15 s in production) instead of a fixed TTL.
+    """
+    ttl = float(getattr(_TLS, "ttl", 0.0) or 0.0)
+    if ttl <= 0:
+        return compute()
+    return memo_call(key, ttl, compute)
+
+
+def scan_roots_memo(cfg) -> list:
+    """``dash.rundirs.scan_roots(cfg)``, reused for ``SCAN_ROOTS_TTL_S``.
+
+    The key is the roots config, the state dir and its env override, so a
+    config change is seen on the next call.
+    """
+    from dash.rundirs import scan_roots
+
+    cfg = cfg or {}
+    key = (
+        "scan_roots",
+        json.dumps(cfg.get("roots"), sort_keys=True, default=str),
+        str(cfg.get("state_dir")),
+        os.environ.get("AGENT_DASH_STATE_DIR") or "",
+    )
+    return list(memo_call(key, SCAN_ROOTS_TTL_S, lambda: scan_roots(cfg)))
 
 
 def list_dir_cached(path: str, cache: dict, cap=None):

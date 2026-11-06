@@ -877,19 +877,18 @@ class Handler(BaseHTTPRequestHandler):
         """
         from dash.workstates import all_bundle_meta, archive_cards, archived_aggregate
 
-        now = time.time()
-        meta = all_bundle_meta()
-        cards = archive_cards(meta)
-        card_ids = {card["id"] for card in cards}
-        roll = self.server.store.ws_rollup(now)
-        agg = archived_aggregate(roll["rows"], card_ids)
-        runs = sum(
-            len(roll["scopes"].get(ws, {}).get("runs", []))
-            for ws in card_ids if ws in roll["scopes"]
-        )
-        self._json(
-            200,
-            {
+        def compute():
+            now = time.time()
+            meta = all_bundle_meta()
+            cards = archive_cards(meta)
+            card_ids = {card["id"] for card in cards}
+            roll = self.server.store.ws_rollup(now)
+            agg = archived_aggregate(roll["rows"], card_ids)
+            runs = sum(
+                len(roll["scopes"].get(ws, {}).get("runs", []))
+                for ws in card_ids if ws in roll["scopes"]
+            )
+            return {
                 "archive": cards,
                 "totals": {
                     "workstreams": len(cards),
@@ -897,8 +896,11 @@ class Handler(BaseHTTPRequestHandler):
                     "cost_usd": agg["cost_usd_all_time"],
                     "runs": runs,
                 },
-            },
-        )
+            }
+
+        if self._ttl_serve("archive", {}, compute):
+            return
+        self._json(200, compute())
 
     def _workstream_action(self, action: str):
         """``POST /api/workstreams/archive|restore``: the page write actions.
@@ -1026,33 +1028,40 @@ class Handler(BaseHTTPRequestHandler):
         from dash import projectgraph
         from dash.bundles import list_bundles
         from dash.workstates import STATES, all_bundle_meta
-        now = time.time()
-        meta = all_bundle_meta()
-        rows = self.server.store.query_workstreams(
-            workstream_plan_ids(), None, None,
-            bundle_meta=meta, allowed_states=set(STATES),
-        )
-        live = {}
-        progress = {}
-        for row in rows:
-            ws = row.get("ws")
-            if not ws or ws == "unassigned":
-                continue
-            live[ws] = row.get("live_agents", 0) or 0
-            prog = _row_progress(ws)
-            if isinstance(prog, dict):
-                progress[ws] = prog
-        bundles = [item for item in list_bundles() if item.get("kind") == "workstream"]
-        plans: dict = {}
-        for item in bundles:
-            ws = item["id"]
-            try:
-                _source, body = resolve_plan(ws)
-            except Exception:
-                body = None
-            if isinstance(body, dict):
-                plans[ws] = body
-        self._json(200, projectgraph.build_graph(bundles, plans, live, progress, now))
+
+        def compute():
+            now = time.time()
+            meta = all_bundle_meta()
+            rows = self.server.store.query_workstreams(
+                workstream_plan_ids(), None, None,
+                bundle_meta=meta, allowed_states=set(STATES),
+            )
+            live = {}
+            progress = {}
+            for row in rows:
+                ws = row.get("ws")
+                if not ws or ws == "unassigned":
+                    continue
+                live[ws] = row.get("live_agents", 0) or 0
+                prog = _row_progress(ws)
+                if isinstance(prog, dict):
+                    progress[ws] = prog
+            bundles = [item for item in list_bundles() if item.get("kind") == "workstream"]
+            plans: dict = {}
+            for item in bundles:
+                ws = item["id"]
+                try:
+                    _source, body = resolve_plan(ws)
+                except Exception:
+                    body = None
+                if isinstance(body, dict):
+                    plans[ws] = body
+            return projectgraph.build_graph(bundles, plans, live, progress, now)
+
+        if self._ttl_serve("project/graph", {}, compute):
+            return
+        self._json(200, compute())
+
     def _project_timeline(self):
         """``GET /api/project/timeline``: one lane per workstream over time.
         Dates come only from recorded evidence (mapped runs, history
@@ -1364,7 +1373,13 @@ class Handler(BaseHTTPRequestHandler):
     def _risks(self):
         """``GET /api/risks``: computed risks first, then hub file rows."""
         from dash.decisions import risks_payload
-        self._json(200, risks_payload(self.server.store, self.server.cfg, time.time()))
+
+        def compute():
+            return risks_payload(self.server.store, self.server.cfg, time.time())
+
+        if self._ttl_serve("risks", {}, compute):
+            return
+        self._json(200, compute())
     def _feed(self, query):
         """``GET /api/project/feed``: newest-first what-changed events.
         Query ``limit`` caps the returned lines (default 50, max 200); a
@@ -1387,10 +1402,12 @@ class Handler(BaseHTTPRequestHandler):
             if limit < 1:
                 raise ValueError("bad limit")
             limit = min(limit, projectfeed.MAX_LIMIT)
-        self._json(
-            200,
-            projectfeed.collect_feed(None, self.server.store, time.time(), limit),
-        )
+        def compute():
+            return projectfeed.collect_feed(None, self.server.store, time.time(), limit)
+
+        if self._ttl_serve("project/feed", {"limit": limit}, compute):
+            return
+        self._json(200, compute())
 
     def _logs(self, path, query):
         """``GET /api/logs/search|facets``: opt-in log search over the local

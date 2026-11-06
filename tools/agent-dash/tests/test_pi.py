@@ -276,6 +276,8 @@ class SourceTest(unittest.TestCase):
         return {
             "roots": {"scratchpads": [str(self.scratch)]},
             "read_budgets": {"per_file": 4 * 1024 * 1024, "per_tick": 8 * 1024 * 1024},
+            # Per-poll discovery: these tests pin a row seen on the next poll.
+            "dir_scan_s": 0,
         }
 
     def poll(self, now=1_800_000_000.0):

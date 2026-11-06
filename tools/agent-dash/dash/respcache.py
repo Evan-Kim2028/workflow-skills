@@ -94,6 +94,11 @@ ENDPOINT_TTL: dict = {
     "health": None,
     "usage": None,
     "reconcile": None,
+    # Heavy reads (rebuilt from bundles and the store): coalesced like the rest.
+    "archive": None,
+    "risks": None,
+    "project/graph": None,
+    "project/feed": None,
 }
 
 #: Request headers that change GET content. None today: gzip varies the
