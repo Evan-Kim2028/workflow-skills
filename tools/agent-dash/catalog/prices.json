@@ -1026,6 +1026,23 @@
    "input_note": "input is the cache miss, cache_read the hit (pi usage.input/cacheRead); pi reports this id without the provider prefix"
   },
   {
+   "provider": "command-code/stealth",
+   "model": "stealth/crouton-alpha",
+   "input": 0,
+   "output": 0,
+   "cache_read": 0,
+   "cache_write_5m": 0,
+   "cache_write_1h": 0,
+   "reasoning": null,
+   "long_context": null,
+   "input_includes_cache_read": false,
+   "billing_mode": "free",
+   "price_scope": "Command Code's `cmd --list-models` labels stealth/crouton-alpha FREE and gives no separate rates. Cache rates of 0 are inferred from that label",
+   "source_url": "cmd --list-models (Command Code CLI)",
+   "retrieved_at": "2026-11-06",
+   "confidence": "inferred"
+  },
+  {
    "provider": "openrouter",
    "model": "openrouter/stealth/crouton-alpha",
    "input": 0,
