@@ -22,6 +22,12 @@ from dash.sources import Registry
 from dash.store import Store
 
 
+# Fleet checks read the live process table, pgrep and the real workers
+# registry when these are None. Every test gets empty fakes instead, so the
+# result never depends on what is running on the machine.
+QUIET_FLEET = {"argv_tokens": {}, "ppids": {}, "pgrep_counts": {}, "workers_registry": {"workers": {}}}
+
+
 def _cfg(**over):
     cfg = default_cfg()
     cfg.update(over)
@@ -40,6 +46,20 @@ def _stop_server(server, thread):
     server.shutdown()
     thread.join(3)
     server.server_close()
+
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from live_guard import Guard
+
+_GUARD = Guard()
+
+
+def setUpModule():
+    _GUARD.start()
+
+
+def tearDownModule():
+    _GUARD.stop()
 
 
 class DoctorDashboardTest(unittest.TestCase):
@@ -500,7 +520,7 @@ class WorkstreamHygieneTest(unittest.TestCase):
     def _collect(self, **over):
         from dash.doctor import collect_problems
 
-        params = {"health": self.health, "processes": []}
+        params = {"health": self.health, "processes": [], **QUIET_FLEET}
         params.update(over)
         with mock.patch("dash.doctor._home_scratch", return_value=str(self.root / "noscratch")):
             return collect_problems(self.store, self._cfg(), self.now, **params)
@@ -766,7 +786,7 @@ class LifecycleDoctorTest(unittest.TestCase):
     def _collect(self, cfg=None, **over):
         from dash.doctor import collect_problems
 
-        params = {"health": {"ok": True, "sources": []}, "processes": []}
+        params = {"health": {"ok": True, "sources": []}, "processes": [], **QUIET_FLEET}
         params.update(over)
         with mock.patch("dash.doctor._home_scratch", return_value=str(self.root / "noscratch")):
             return collect_problems(self.store, cfg or self._cfg(), self.now, **params)
@@ -1680,7 +1700,7 @@ class OrchestrationChecksTest(unittest.TestCase):
     def _collect(self, cfg=None, **over):
         from dash.doctor import collect_problems
 
-        params = {"health": self.health, "processes": []}
+        params = {"health": self.health, "processes": [], **QUIET_FLEET}
         params.update(over)
         with mock.patch("dash.doctor._home_scratch", return_value=str(self.root / "noscratch")):
             return collect_problems(self.store, cfg or self._cfg(), self.now, **params)
@@ -2100,7 +2120,7 @@ class GroupingTest(unittest.TestCase):
     def _collect(self, **over):
         from dash.doctor import collect_problems
 
-        params = {"health": self.health, "processes": []}
+        params = {"health": self.health, "processes": [], **QUIET_FLEET}
         params.update(over)
         with mock.patch("dash.doctor._home_scratch", return_value=str(self.root / "noscratch")):
             return collect_problems(self.store, self._cfg(), self.now, **params)
@@ -2312,7 +2332,7 @@ class DepJumpSeverityTest(unittest.TestCase):
         with mock.patch("dash.doctor._home_scratch", return_value=str(self.root / "noscratch")):
             return collect_problems(
                 self.store, self._cfg(), self.now,
-                health=self.health, processes=[])
+                health=self.health, processes=[], **QUIET_FLEET)
 
     def test_mixed_recent_and_old_is_warn(self):
         self._bundle()
@@ -2488,7 +2508,7 @@ class UnseenGraceTest(unittest.TestCase):
             return collect_problems(
                 self.store, cfg, self.now,
                 health={"ok": True, "sources": []},
-                registry=registry, processes=procs)
+                registry=registry, processes=procs, **QUIET_FLEET)
 
     def test_starting_registry_emits_no_unseen_worker(self):
         result = self._collect(self._registry(None))
@@ -2529,6 +2549,11 @@ class BuildChecksTest(unittest.TestCase):
 
         self.subprocess = subprocess
         self.tmp = tempfile.TemporaryDirectory()
+        # collect_problems reads bundles and runs even with no store. Point
+        # both roots at the temp dir so the test never walks the real state.
+        self._env = {k: os.environ.get(k) for k in ("AGENT_DASH_WORKSTREAMS", "AGENT_DASH_DATA_ROOT")}
+        os.environ["AGENT_DASH_WORKSTREAMS"] = str(Path(self.tmp.name) / "ws")
+        os.environ["AGENT_DASH_DATA_ROOT"] = self.tmp.name
         self.repo = Path(self.tmp.name) / "tool"
         self.repo.mkdir()
         self.git("init", "-b", "main")
@@ -2542,6 +2567,11 @@ class BuildChecksTest(unittest.TestCase):
         self.git("update-ref", "refs/remotes/origin/main", self.new)
 
     def tearDown(self):
+        for key, value in self._env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
         self.tmp.cleanup()
 
     def git(self, *args):
@@ -2561,10 +2591,16 @@ class BuildChecksTest(unittest.TestCase):
     def collect(self, health):
         from dash.doctor import collect_problems
 
-        return collect_problems(
-            None, default_cfg(), time.time(), url="http://127.0.0.1:1",
-            health=health, tool_root=self.repo,
-        )
+        # default_cfg() pins state_dir to the live default, which the run-dir
+        # registry and scratch scan would read. Use the temp tree instead.
+        cfg = default_cfg()
+        cfg["state_dir"] = str(Path(self.tmp.name) / "state")
+        cfg["roots"]["scratchpads"] = []
+        with mock.patch("dash.doctor._home_scratch", return_value=str(Path(self.tmp.name) / "noscratch")):
+            return collect_problems(
+                None, cfg, time.time(), url="http://127.0.0.1:1",
+                health=health, tool_root=self.repo,
+            )
 
     def test_dirty_build_is_a_warning(self):
         result = self.collect({"ok": True, "sources": [], "build_id": self.short(self.new) + "-dirty"})
@@ -2668,7 +2704,7 @@ class IgnoreListDoctorTest(unittest.TestCase):
         with mock.patch("dash.doctor._home_scratch", return_value=str(self.root / "noscratch")):
             return collect_problems(
                 self.store, self._cfg(), self.now,
-                health={"ok": True, "sources": []}, processes=[],
+                health={"ok": True, "sources": []}, processes=[], **QUIET_FLEET,
             )
 
     def _problems(self, result, code):
@@ -2791,7 +2827,7 @@ class LinearDoctorTest(unittest.TestCase):
             "dash.doctor._home_scratch", return_value=str(self.root / "noscratch")
         ):
             return collect_problems(
-                self.store, self._cfg(), self.NOW, health={"ok": True, "sources": []}, processes=[]
+                self.store, self._cfg(), self.NOW, health={"ok": True, "sources": []}, processes=[], **QUIET_FLEET
             )
 
     def _linear_items(self, result):

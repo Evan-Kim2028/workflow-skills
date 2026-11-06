@@ -17,6 +17,9 @@ GATE_SRC = HERE.parent / "scripts" / "gate.sh"
 MAP_SRC = HERE.parent / "scripts" / "gate_map.json"
 
 
+_TINY = "import unittest\n\n\nclass T(unittest.TestCase):\n%s\n"
+
+
 class GateSelectionTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -179,6 +182,122 @@ class GateSelectionTest(unittest.TestCase):
         self.assertNotIn("WARN", err)
         # Only the always pair: no default fallback, so no WARN and no test_server.
         self.assertEqual(selected, ["test_page_rules.py", "test_privacy_pin.py"])
+
+    def test_unknown_files_map_to_their_own_test(self):
+        self._commit_all("empty base")
+        self._write("scripts/worker-watch.sh")
+        self._write("scripts/memcap.sh")
+        self._write("tests/fixtures/workers_launcher.json")
+        (self.repo / "install.sh").write_text("#!/bin/sh\n", encoding="utf-8")
+        self._commit_all("touch")
+        self._write("scripts/worker-watch.sh", "x\n")
+        self._write("scripts/memcap.sh", "x\n")
+        self._write("tests/fixtures/workers_launcher.json", "[]\n")
+        (self.repo / "install.sh").write_text("#!/bin/sh\n# x\n", encoding="utf-8")
+        code, selected, err = self._gate("HEAD", "--list")
+        self.assertEqual(code, 0)
+        self.assertNotIn("WARN", err)
+        self.assertEqual(
+            selected,
+            ["test_install.py", "test_page_rules.py", "test_privacy_pin.py", "test_run_worker.py", "test_worker_watch.py"],
+        )
+
+    def test_fixture_change_does_not_widen_to_other_fixture_suites(self):
+        self._commit_all("empty base")
+        self._write("tests/fixtures/workers_launcher.json")
+        self._commit_all("fixture")
+        self._write("tests/fixtures/workers_launcher.json", "[1]\n")
+        code, selected, err = self._gate("HEAD", "--list")
+        self.assertEqual(code, 0)
+        self.assertNotIn("test_migration.py", selected)
+        self.assertNotIn("test_fixtures.py", selected)
+        self.assertIn("test_run_worker.py", selected)
+        self.assertNotIn("WARN", err)
+
+    def test_new_fixture_without_a_map_entry_warns(self):
+        self._commit_all("empty base")
+        self._write("tests/fixtures/brand-new.bin")
+        self._commit_all("fixture")
+        self._write("tests/fixtures/brand-new.bin", "x\n")
+        code, _selected, err = self._gate("HEAD", "--list")
+        self.assertEqual(code, 0)
+        self.assertIn("WARN unmapped: tests/fixtures/brand-new.bin", err)
+
+    def _wide_repo(self):
+        # a/x.py selects test_one (2 functions) and test_two (1); b/y.py selects test_three (1).
+        self._map_only({
+            "always": [], "default": ["test_default"],
+            "map": {"a/*.py": ["test_one", "test_two"], "b/*.py": ["test_three"]},
+        })
+        self._write("tests/test_one.py", _TINY % "    def test_a(self):\n        pass\n\n    def test_b(self):\n        pass\n")
+        self._write("tests/test_two.py", _TINY % "    def test_c(self):\n        pass\n")
+        self._write("tests/test_three.py", _TINY % "    def test_d(self):\n        pass\n")
+        self._write("a/x.py")
+        self._write("b/y.py")
+        self._commit_all("base")
+        self._write("a/x.py", "changed\n")
+        self._write("b/y.py", "changed\n")
+
+    def _gate_proc(self, *args, **env):
+        return subprocess.run(
+            ["sh", "scripts/gate.sh", *args],
+            cwd=self.tools, capture_output=True, text=True, timeout=120,
+            env={**os.environ, **env},
+        )
+
+    def test_wide_selection_stops_and_names_the_widening_file(self):
+        self._wide_repo()
+        proc = self._gate_proc("HEAD", GATE_MAX_TESTS="3")
+        self.assertEqual(proc.returncode, 3, proc.stderr)
+        self.assertIn("GATE STOPPED", proc.stdout)
+        self.assertNotIn("PASS", proc.stdout)
+        self.assertIn("WIDE selection: 3 suites, 4 test functions", proc.stderr)
+        # The culprit is listed first, with its suites and count.
+        culprit = proc.stderr.index("a/x.py -> 2 suites, 3 test functions")
+        self.assertLess(culprit, proc.stderr.index("b/y.py -> 1 suites, 1 test functions"))
+        self.assertIn("python3 -m unittest discover -s tests -p test_one.py", proc.stderr)
+
+    def test_suite_limit_alone_also_widens(self):
+        self._wide_repo()
+        proc = self._gate_proc("HEAD", "--list", GATE_MAX_SUITES="2")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("WIDE selection: 3 suites", proc.stderr)
+
+    def test_narrow_selection_is_not_stopped(self):
+        self._wide_repo()
+        proc = self._gate_proc("HEAD", "--list")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertNotIn("WIDE", proc.stderr)
+        self.assertEqual(proc.stdout.split(), ["test_one.py", "test_three.py", "test_two.py"])
+
+    def test_base_moved_on_is_not_selected(self):
+        # The base gained a commit this branch lacks: that file is not this branch's change.
+        self._map_only({
+            "always": [], "default": ["test_default"],
+            "map": {"a/*.py": ["test_one"], "b/*.py": ["test_three"]},
+        })
+        self._write("tests/test_three.py", _TINY % "    def test_d(self):\n        pass\n")
+        self._write("a/x.py")
+        self._write("b/y.py")
+        self._commit_all("base")
+        base_branch = self._git("rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
+        self._git("checkout", "-q", "-b", "feature")
+        self._git("checkout", "-q", base_branch)
+        self._write("a/x.py", "upstream\n")
+        self._commit_all("upstream")
+        self._git("checkout", "-q", "feature")
+        self._write("b/y.py", "mine\n")
+        proc = self._gate_proc(base_branch, "--list")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.split(), ["test_three.py"])
+
+    def test_force_runs_a_wide_selection(self):
+        self._wide_repo()
+        proc = self._gate_proc("HEAD", "--force", GATE_MAX_TESTS="3")
+        self.assertIn("running all of it (--force)", proc.stdout)
+        self.assertNotIn("GATE STOPPED", proc.stdout)
+        self.assertIn("PASS test_one.py", proc.stdout)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
 
     def test_list_runs_nothing(self):
         # A broken test file must not explode --list: selection only.
