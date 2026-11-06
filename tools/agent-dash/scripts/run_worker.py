@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Launch one registry worker and wait. A second call for the same label only waits.
 
-Usage: run_worker.py <tier|default|auto> <label> <workspace> <prompt-file> <run-dir> [max-wait] [--no-preflight] [--exclude=<tier>]...
+Usage: run_worker.py <tier|default|auto> <label> <workspace> <prompt-file> <run-dir> [max-wait] [--no-preflight] [--no-rules] [--exclude=<tier>]...
 
 A max-wait of 0 launches and returns at once: STATUS is ``running`` while the
 worker lives, and a later call for the same label observes it (the dispatcher
@@ -11,6 +11,16 @@ launch off a tier, so a retry after an early death lands on another one.
 A fast doctor preflight (dashboard reachable, run dir visible, tier model
 priced and policy-compliant) runs before launching; a failure prints the
 problem and its fix and exits 1 without launching. --no-preflight skips it.
+
+Before launching, the worker gets the assembled prompt, not the caller's
+file: the ``[label: <label>]`` line, then ``templates/worker-common.md``
+(the worker rules), then the caller's text. The caller's file is never
+changed; the assembled copy is ``<run-dir>/<label>.md``. Both pieces are
+idempotent: a prompt that already carries the rules marker (or the
+pre-marker rules heading) or a leading label line is not given them
+again. ``--no-rules`` launches the prompt file exactly as written. A
+missing template warns and launches without the rules. An assembled
+prompt above ``PROMPT_WARN_BYTES`` prints a size warning.
 
 Every kind writes its manifest row with the tier it was launched under, so
 the dashboard reads the registry tier name (``deepseek-flash``) instead of
@@ -68,6 +78,17 @@ REPORT_TAIL_BYTES = 600
 #: budget is generous; a timeout below warns instead of refusing.
 PREFLIGHT_TIMEOUT_S = 10.0
 STANDBY_SUFFIX = "-standby"
+#: Worker rules template, shipped in the repo and linked into ~/.claude/templates.
+RULES_TEMPLATE = ROOT / "templates" / "worker-common.md"
+#: Stable line that opens the template. A prompt carrying it already has the rules.
+RULES_MARKER = "<!-- agent-dash:worker-rules v1 -->"
+#: Prompts written before the marker existed carry the rules under the
+#: template's first heading; detection also accepts that line (see assemble_prompt).
+#: The first line of a caller's prompt when it names the run (``[label: x]``).
+LABEL_LINE = re.compile(r"\[label:[^\]\n]*\]")
+#: Assembled prompts above this print a warning: Haiku 5.5 bills about 5x past
+#: 100K tokens, and every turn re-reads the whole prompt.
+PROMPT_WARN_BYTES = 40 * 1024
 
 #: Harness that runs each launch kind. The dashboard row, the meta file, and
 #: the registry all name it the way ``dash.models.harness_of`` does, so a
@@ -167,6 +188,8 @@ def run(argv, spawn=None, pgrep=None, sleep=None, now=None, alive=None, new_uuid
     argv = list(argv)
     no_preflight = "--no-preflight" in argv
     argv = [token for token in argv if token != "--no-preflight"]
+    no_rules = "--no-rules" in argv
+    argv = [token for token in argv if token != "--no-rules"]
     exclude = [token[len("--exclude="):] for token in argv if token.startswith("--exclude=")]
     argv = [token for token in argv if not token.startswith("--exclude=")]
     if len(argv) < 5:
@@ -238,12 +261,90 @@ def run(argv, spawn=None, pgrep=None, sleep=None, now=None, alive=None, new_uuid
         blocked = run_preflight(registry, requested, ctx)
         if blocked is not None:
             return blocked
+    prepare_prompt(ctx, no_rules)
     name, reason = pick_initial(ctx)
     if not name:
         code = 0 if reason == "none-available" else 2
         emit("failed", out, err, requested, reason)
         return code
     return launch(ctx, name, set(exclude))
+
+
+def read_rules_template():
+    """``(template text, its first heading)``, or ``(None, None)`` when missing."""
+    try:
+        text = RULES_TEMPLATE.read_text(encoding="utf-8")
+    except OSError:
+        return None, None
+    heading = next((line for line in text.splitlines() if line.startswith("# ")), None)
+    return text, heading
+
+
+def assemble_prompt(text, label, template, heading):
+    """``(assembled prompt, notes)`` for one caller prompt.
+
+    Order: the label line, the worker rules template, the caller's text.
+    A caller that opens with a label line keeps it (a note says so when it
+    names another label), so the label stays the first line either way.
+    Rules are skipped when the text carries the marker or the template's
+    heading line. Applying this to its own output changes nothing.
+    """
+    notes = []
+    lines = text.split("\n")
+    first = next((i for i, line in enumerate(lines) if line.strip()), None)
+    if first is not None and LABEL_LINE.fullmatch(lines[first].strip()):
+        head = lines[first].strip()
+        if head != f"[label: {label}]":
+            notes.append(f"prompt opens with {head}; kept it instead of [label: {label}]")
+        rest = "\n".join(lines[first + 1 :])
+    else:
+        head = f"[label: {label}]"
+        rest = text
+    rest = rest.lstrip("\n")
+    parts = [head]
+    if template is None:
+        notes.append(f"worker rules template missing at {RULES_TEMPLATE}; launching without the rules")
+    else:
+        present = RULES_MARKER in text or (
+            heading is not None and any(line.rstrip() == heading for line in text.splitlines())
+        )
+        if not present:
+            parts.append(template.rstrip("\n"))
+    if rest.strip():
+        parts.append(rest.rstrip("\n"))
+    return "\n\n".join(parts) + "\n", notes
+
+
+def prepare_prompt(ctx, no_rules: bool) -> None:
+    """Point ``ctx["prompt"]`` at the assembled prompt in the run folder.
+
+    Every tier reads ``ctx["prompt"]`` (and a quota retry reuses it), so
+    this runs once before the first launch. The caller's file is only read.
+    The assembled copy is ``<label>.md`` because the dashboard matches a
+    live muse process by a ``--prompt-file`` ending in ``/<label>.md``.
+    """
+    source = Path(ctx["prompt"])
+    if no_rules:
+        print("prompt: --no-rules, launching the prompt file as written", file=sys.stderr)
+        return
+    text = source.read_text(encoding="utf-8")
+    template, heading = read_rules_template()
+    assembled, notes = assemble_prompt(text, ctx["label"], template, heading)
+    for note in notes:
+        print(f"prompt warning: {note}", file=sys.stderr)
+    target = ctx["run_dir"] / f"{ctx['label']}.md"
+    if target.resolve() == source.resolve():
+        target = ctx["run_dir"] / f"{ctx['label']}.prompt.md"
+    target.write_text(assembled, encoding="utf-8")
+    size = len(assembled.encode("utf-8"))
+    print(f"prompt: assembled {size} bytes -> {target}", file=sys.stderr)
+    if size > PROMPT_WARN_BYTES:
+        print(
+            f"prompt warning: assembled prompt is {size} bytes, over {PROMPT_WARN_BYTES}. "
+            "Haiku 5.5 bills about 5x past 100K tokens and each turn re-reads the prompt; trim the task text.",
+            file=sys.stderr,
+        )
+    ctx["prompt"] = str(target)
 
 
 def pick_initial(ctx):

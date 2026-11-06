@@ -152,7 +152,7 @@ over-limit flag gets a re-brief or a successor, not a continuation.
 **Before a wave:** `ws next` lists the lanes; `ws waves` confirms the max
 parallelism; `ws overlap` is clean; every lane has numeric acceptance and a
 review tier; trains re-cut from member diffs (`ws deferred` shows nothing the
-wave assumed). Write the prompts, `dispatch start`, then one `dispatch wait`.
+wave assumed). Write the prompts, `dispatch start`, then one `dispatch wait`. A prompt holds only the task; the launcher adds the label line and the worker rules (pasting them again is harmless).
 
 **After each event:** read only that finished report → decide → write the
 prompts it unblocked → re-arm `dispatch wait`. Finished runs are picked up

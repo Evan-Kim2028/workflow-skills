@@ -1,3 +1,4 @@
+<!-- agent-dash:worker-rules v1 -->
 # Worker rules (include in every muse and Haiku worker prompt)
 
 You are a worker, not an orchestrator. Do the task in this prompt and return.

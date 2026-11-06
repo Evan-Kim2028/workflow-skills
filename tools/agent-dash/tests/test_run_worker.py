@@ -238,7 +238,9 @@ class RunWorkerTests(unittest.TestCase):
         self.assertIn("--session-id", cmd)
         self.assertIn(SID, cmd)
         self.assertIn("--prompt-file", cmd)
-        self.assertIn(str(self.prompt), cmd)
+        # The muse gets the assembled copy, never the caller's file.
+        self.assertIn(str(self.run_dir / "ws1-plan-lane-1.md"), cmd)
+        self.assertNotIn(str(self.prompt), cmd)
         self.assertIn("muse-spark-1.3-contributor", cmd)
         row = (self.run_dir / "muse-sessions.tsv").read_text(encoding="utf-8").strip()
         self.assertEqual(row, "ws1-plan-lane-1\t%s\t1700000000\tmuse-spark-1.3-contributor\tmuse\tmuse" % SID)
@@ -326,7 +328,9 @@ class RunWorkerTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("tier=glm", line)
         cmd = launch.cmds[0]
-        self.assertEqual(cmd[:3], ["grok", "-p", "do the task\n\n" + runner.RUN_RULE])
+        self.assertEqual(cmd[:2], ["grok", "-p"])
+        self.assertTrue(cmd[2].startswith("[label: ws1-plan-lane-1]\n"))
+        self.assertTrue(cmd[2].endswith("do the task\n\n" + runner.RUN_RULE))
         self.assertIn("-m", cmd)
         self.assertEqual(cmd[cmd.index("-m") + 1], "glm-5.3")
         self.assertEqual(cmd[cmd.index("-s") + 1], SID)
@@ -1062,6 +1066,153 @@ class CooldownRaceTests(unittest.TestCase):
         data = runner.read_cooldowns(path)
         for i in range(20):
             self.assertIn(f"tier-{i}", data)
+
+RULES_HEADING = "# Worker rules (include in every muse and Haiku worker prompt)"
+TEMPLATE_TEXT = (
+    "<!-- agent-dash:worker-rules v1 -->\n"
+    + RULES_HEADING + "\n\nRules body.\n"
+)
+
+
+class PromptAssemblyTests(unittest.TestCase):
+    """Label line, then the rules template, then the caller's text; idempotent."""
+
+    def assemble(self, text, label="ws1-plan-x", template=TEMPLATE_TEXT, heading=RULES_HEADING):
+        return runner.assemble_prompt(text, label, template, heading)
+
+    def test_plain_prompt_gets_label_then_rules_then_text(self):
+        out, notes = self.assemble("do the task\n")
+        self.assertEqual(notes, [])
+        self.assertEqual(out, "[label: ws1-plan-x]\n\n" + TEMPLATE_TEXT.rstrip("\n") + "\n\ndo the task\n")
+
+    def test_assembling_its_own_output_changes_nothing(self):
+        once, _ = self.assemble("do the task\n")
+        twice, notes = self.assemble(once)
+        self.assertEqual(twice, once)
+        self.assertEqual(notes, [])
+
+    def test_marker_prompt_is_not_given_rules_again(self):
+        text = "[label: ws1-plan-x]\n" + TEMPLATE_TEXT + "\ndo it\n"
+        out, _ = self.assemble(text)
+        self.assertEqual(out.count(RULES_HEADING), 1)
+        self.assertEqual(out.count("agent-dash:worker-rules"), 1)
+
+    def test_pre_marker_pasted_rules_are_detected_by_heading(self):
+        # Prompts written before the marker carry the heading, not the marker.
+        pasted = RULES_HEADING + "\n\nAn old pasted block.\n\n## Task\ndo it\n"
+        out, _ = self.assemble(pasted)
+        self.assertEqual(out.count(RULES_HEADING), 1)
+        self.assertNotIn("agent-dash:worker-rules", out)
+        self.assertTrue(out.startswith("[label: ws1-plan-x]\n"))
+
+    def test_caller_label_line_stays_first_and_is_not_repeated(self):
+        out, notes = self.assemble("[label: ws1-plan-x]\ndo it\n")
+        self.assertEqual(out.count("[label:"), 1)
+        self.assertTrue(out.startswith("[label: ws1-plan-x]\n\n"))
+        self.assertEqual(notes, [])
+
+    def test_caller_label_for_another_run_is_kept_with_a_note(self):
+        out, notes = self.assemble("[label: other-run]\ndo it\n")
+        self.assertTrue(out.startswith("[label: other-run]\n"))
+        self.assertEqual(out.count("[label:"), 1)
+        self.assertEqual(len(notes), 1)
+        self.assertIn("other-run", notes[0])
+
+    def test_missing_template_warns_and_keeps_the_label_and_text(self):
+        out, notes = self.assemble("do it\n", template=None, heading=None)
+        self.assertEqual(out, "[label: ws1-plan-x]\n\ndo it\n")
+        self.assertTrue(any("template missing" in n for n in notes))
+
+    def test_read_rules_template_reads_the_repo_template(self):
+        text, heading = runner.read_rules_template()
+        self.assertIn(runner.RULES_MARKER, text)
+        self.assertEqual(heading, RULES_HEADING)
+
+    def test_shipped_template_carries_the_marker_once(self):
+        text, _ = runner.read_rules_template()
+        self.assertEqual(text.count(runner.RULES_MARKER), 1)
+        self.assertEqual(text.splitlines()[0], runner.RULES_MARKER)
+
+
+class PromptHandoffTests(unittest.TestCase):
+    """Every tier launches on the assembled prompt; the caller's file is untouched.
+
+    Borrows the fixture and runner helpers from RunWorkerTests without
+    inheriting its test methods (which would run twice).
+    """
+
+    tearDown = RunWorkerTests.tearDown
+    go = RunWorkerTests.go
+    pgrep = RunWorkerTests.pgrep
+
+    def setUp(self):
+        RunWorkerTests.setUp(self)
+        self.counts = {}
+        self.original = self.prompt.read_text(encoding="utf-8")
+
+    def assembled(self, label="ws1-plan-lane-1"):
+        return (self.run_dir / f"{label}.md").read_text(encoding="utf-8")
+
+    def check_tier(self, tier, launch):
+        code, line = self.go(tier, launch)
+        self.assertEqual(code, 0, line)
+        text = self.assembled()
+        self.assertTrue(text.startswith("[label: ws1-plan-lane-1]\n"))
+        self.assertIn(runner.RULES_MARKER, text)
+        self.assertTrue(text.endswith("do the task\n"))
+        self.assertEqual(self.prompt.read_text(encoding="utf-8"), self.original)
+        return launch.cmds[0], text
+
+    def test_muse_tier_reads_the_assembled_prompt(self):
+        cmd, _ = self.check_tier("muse", Launch())
+        self.assertEqual(cmd[cmd.index("--prompt-file") + 1], str(self.run_dir / "ws1-plan-lane-1.md"))
+
+    def test_grok_build_tier_sends_the_assembled_prompt(self):
+        cmd, text = self.check_tier("glm", Launch())
+        self.assertEqual(cmd[2], text + "\n" + runner.RUN_RULE)
+
+    def test_pi_tier_passes_the_assembled_prompt_to_its_launcher(self):
+        cmd, _ = self.check_tier("pi-deepseek", Launch())
+        self.assertIn(str(self.run_dir / "ws1-plan-lane-1.md"), cmd)
+
+    def test_codex_tier_passes_the_assembled_prompt_to_its_launcher(self):
+        cmd, _ = self.check_tier("codex-luna", Launch())
+        self.assertIn(str(self.run_dir / "ws1-plan-lane-1.md"), cmd)
+
+    def test_cursor_command_uses_the_prompt_it_is_given(self):
+        worker = {"kind": "cursor", "model": "m"}
+        cmd = runner.command(worker, "ws1-x", "/ws", "/run/ws1-x.md", "-", "/run", "cursor")
+        self.assertEqual(cmd[-2:], ["/run/ws1-x.md", "m"])
+
+    def test_no_rules_launches_the_caller_file_as_written(self):
+        from io import StringIO
+        import contextlib
+
+        launch = Launch()
+        argv = ["muse", "ws1-plan-norules", str(self.ws), str(self.prompt),
+                str(self.run_dir), "0", "--no-preflight", "--no-rules"]
+        with contextlib.redirect_stdout(StringIO()):
+            code = runner.run(argv, spawn=launch.spawn, pgrep=self.pgrep, sleep=lambda _s: None,
+                              now=lambda: NOW, alive=launch.is_alive, new_uuid=lambda: SID)
+        self.assertEqual(code, 0)
+        self.assertIn(str(self.prompt), launch.cmds[0])
+        self.assertFalse((self.run_dir / "ws1-plan-norules.md").exists())
+
+    def test_size_warning_above_the_threshold(self):
+        big = self.root / "big.md"
+        big.write_text("x" * (runner.PROMPT_WARN_BYTES + 10) + "\n", encoding="utf-8")
+        ctx = {"prompt": str(big), "label": "ws1-plan-big", "run_dir": self.run_dir}
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+        from io import StringIO
+        import contextlib
+
+        err = StringIO()
+        with contextlib.redirect_stderr(err):
+            runner.prepare_prompt(ctx, False)
+        self.assertIn("over", err.getvalue())
+        self.assertIn("assembled prompt is", err.getvalue())
+        self.assertEqual(Path(ctx["prompt"]).name, "ws1-plan-big.md")
+
 
 if __name__ == "__main__":
     unittest.main()
