@@ -685,10 +685,17 @@ class OpenRouterFreeAndGrokBuildTest(unittest.TestCase):
             # Cached-read tokens (nemotron :free logs 4.5M) price at the $0 rate, not None.
             self.assertEqual(cost(model, 263_283, 24_351, 4_516_880, 0, reasoning=0), 0.0, model)
 
+    def test_command_code_crouton_prices_at_zero_from_its_free_label(self):
+        rows = {row["model"]: row for row in load()}
+        row = rows["stealth/crouton-alpha"]
+        self.assertEqual(row["billing_mode"], "free")
+        self.assertIn("cmd --list-models", row["source_url"])
+        self.assertEqual(cost("stealth/crouton-alpha", 1_000, 500, 2_000, 3_000, reasoning=0), 0.0)
+
     def test_no_exact_rate_stays_unpriced(self):
-        """Command Code's crouton id, the -1019 ling id and muse-wonder-full-1.0
+        """The -1019 ling id and muse-wonder-full-1.0
         have no published rate for that exact id, so they get no $0 row."""
-        for model in ("stealth/crouton-alpha", "inclusionai/ling-3.1-flash-1019:free", "muse-wonder-full-1.0"):
+        for model in ("inclusionai/ling-3.1-flash-1019:free", "muse-wonder-full-1.0"):
             self.assertFalse(status(model)["priced"], model)
             self.assertIsNone(cost(model, 10, 10, 0, 0), model)
         self.assertIsNone(cost("inclusionai/ling-3.1-flash-1019:free", 1, 1, 0, 0))
