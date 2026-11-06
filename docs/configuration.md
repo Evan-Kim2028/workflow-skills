@@ -245,4 +245,4 @@ Workers come from a registry: [`../tools/agent-dash/workers.example.json`](../to
 
 ## Before you push
 
-`sh scripts/privacy_audit.sh` from the repo root fails when a tracked file contains a personal path, a private project name, or key material. Run it before you push. Plan bundles live under `~/.local/share/agent-dash/workstreams/` and stay out of this repository. Files named `*.local.json` are gitignored. Do not commit a session id, a home-directory path, or a token dump.
+`sh scripts/privacy_audit.sh` from the repo root fails when a tracked file contains a personal path, a private project name, or key material. Run it before you push. PR text is not a tracked file: check it with `sh scripts/privacy_check_text.sh <file>` before you post it. Plan bundles live under `~/.local/share/agent-dash/workstreams/` and stay out of this repository. Files named `*.local.json` are gitignored. Do not commit a session id, a home-directory path, or a token dump.

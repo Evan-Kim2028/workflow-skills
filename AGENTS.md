@@ -31,3 +31,4 @@ Agent instructions for this repo. Short on purpose; the skills carry the detail.
 - The live dashboard on 127.0.0.1:8765 runs from a clean release under `~/.local/share/agent-dash/releases/`, not from the mutable checkout. `restart` from the main checkout moves it back to the checkout. Use `deploy` to change live code and `restart` only to bounce the same release.
 - Static JS/CSS is served no-cache, so a deployed change shows on reload. Python changes need a deploy.
 - Trial servers use another port and a temp state dir, and are stopped by PID.
+- The repo is public. `sh scripts/privacy_audit.sh` reads tracked files only, so check PR titles, bodies and commit messages before posting: save the text to a file and run `sh scripts/privacy_check_text.sh <file>` (same patterns).
