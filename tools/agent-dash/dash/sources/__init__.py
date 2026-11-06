@@ -20,6 +20,7 @@ store.get_offset and store.set_offset.
 
 from __future__ import annotations
 
+import contextlib
 import importlib
 import json
 import logging
@@ -286,7 +287,9 @@ def _run_poll(registry: Registry, source, store, cfg, now: float, budget: float)
     """Poll one source and record the outcome. Always runs in a worker thread."""
     start = time.monotonic()
     try:
-        source.poll(store, cfg, now)
+        scope = getattr(store, "attribution_scope", None)
+        with (scope() if callable(scope) else contextlib.nullcontext()):
+            source.poll(store, cfg, now)
     except Exception as exc:
         duration = time.monotonic() - start
         with registry._lock:

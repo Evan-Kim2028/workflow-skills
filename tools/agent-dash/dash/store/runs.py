@@ -8,6 +8,8 @@ helpers assume it and never take it.
 
 from __future__ import annotations
 
+import contextlib
+import threading as _threading
 import time as _time
 
 from dash import inherit as _inherit
@@ -23,13 +25,40 @@ from .util import (_ESTIMATE_TOOL, MERGE_WINDOW_S, RUN_COLS,
                  is_marker_run, is_prod_job_run)
 
 
+# Per-thread poll scope: the attribution map and train branches are read once
+# per source poll instead of once per upsert (a poll upserts every chat, so the
+# per-upsert read cost ~200 ms of stats and JSON checks per tick).
+_ATTR_SCOPE = _threading.local()
+
+
 class RunsMixin:
+        @contextlib.contextmanager
+        def attribution_scope(self):
+            """Reuse one attribution snapshot for this thread's upserts until exit.
+
+            Rules are re-read on the next scope, so an edit to the map is
+            picked up at the next poll (the poll is the unit of freshness).
+            Thread-local: other threads (requests) read fresh as before.
+            """
+            prev = getattr(_ATTR_SCOPE, "snap", None)
+            _ATTR_SCOPE.snap = {}
+            try:
+                yield
+            finally:
+                _ATTR_SCOPE.snap = prev
+
         def _refresh_attribution_snapshot(self) -> None:
             """Refresh map and bundle inputs before entering store critical sections."""
             from dash.attribution import rules_snapshot
 
+            scope = getattr(_ATTR_SCOPE, "snap", None)
+            if scope is not None and id(self) in scope:
+                self._attribution_rules, self._train_branches = scope[id(self)]
+                return
             self._attribution_rules = rules_snapshot()
             self._train_branches = _inherit.train_branches()
+            if scope is not None:
+                scope[id(self)] = (self._attribution_rules, self._train_branches)
 
         def _attribute_locked(self, label, session_id, parent_session_id, run_id=None):
             """Explicit attribution, else workstream inheritance (caller holds the lock)."""
