@@ -1,9 +1,11 @@
 #!/bin/sh
-# Link every skill and tool in this repo into ~/.claude. Idempotent. A real directory is renamed, not deleted.
+# Link every skill and tool in this repo into ~/.claude. Idempotent. A real directory is moved to
+# ~/.local/share/agent-dash/backups/install/<skills|tools>/, not deleted.
 set -eu
 
 ROOT=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
 CLAUDE="${HOME}/.claude"
+BACKUP_ROOT="${HOME}/.local/share/agent-dash/backups/install"
 mkdir -p "$CLAUDE/skills" "$CLAUDE/tools"
 
 link_one() {
@@ -18,7 +20,10 @@ link_one() {
     rm "$dest"
     echo "replaced symlink $dest"
   elif [ -e "$dest" ]; then
-    bak="${dest}.bak-$(date +%s)"
+    # Backups go outside ~/.claude so they never sit beside live skills or tools.
+    bak_dir="${BACKUP_ROOT}/$(basename "$(dirname "$dest")")"
+    mkdir -p "$bak_dir"
+    bak="${bak_dir}/$(basename "$dest").bak-$(date +%s)"
     if [ -e "$bak" ]; then
       bak="${bak}-$$"
     fi
