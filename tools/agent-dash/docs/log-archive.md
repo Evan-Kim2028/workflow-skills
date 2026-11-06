@@ -191,11 +191,11 @@ run under `memcap 4096`, about 5 minutes; the run wrote nothing):
 | excluded (`catalog-confidence/*`) | 73 files |
 | skipped: running/ marker, no `--ws` | 132 files, 5.24 GB raw (80 of them, 5.08 GB, in `ja-catalog/runs` behind one dead-pid marker `hub-exec-identity-v11-shadow-gate-r2`) |
 | skipped: not idle | 32 files |
-| skipped: live launcher | 10 files |
+| skipped: live launcher | 10 files (the run that was writing this report) |
 | candidates | 896 files, raw 2.52 GB, stripped 2.47 GB, zstd -9 0.15 GB |
 | reclaimable (per tool) | **0.42 GB** |
 | by tool (keep, files, raw, reclaim) | cmd stripped 136, 1.18 GB, 0.01 GB; codex remove 186, 0.27 GB, 0.27 GB; pi stripped 287, 0.97 GB, 0.03 GB; pi-session remove 287, 0.11 GB, 0.11 GB |
-| assistant tokens (raw = stripped) | messages 37,984; input 37,518,224; output 19,345,988; cacheRead 2,524,412,632 |
+| assistant tokens (raw = stripped; stream kind, session rows not added) | messages 18,992; input 18,759,112; output 9,672,994; cacheRead 1,262,206,316 |
 
 Attribution of the change from the earlier 13.43 GB dry run: 13.43 minus 5.24
 GB refused by the marker rule minus about 5.7 GB excluded (catalog-confidence
