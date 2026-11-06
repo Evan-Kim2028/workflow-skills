@@ -44,7 +44,7 @@ import sqlite3
 import tempfile
 from collections import Counter
 from pathlib import Path
-from dash.sources import realpath_memo
+from dash.sources import SettledRows, realpath_memo
 
 log = logging.getLogger("agent_dash.cursor")
 
@@ -263,8 +263,7 @@ def _poll(store, cfg, now):
             if chat["uuid"] not in hooked and not _worth_tracking(chat, now):
                 continue
             if chat.get("label") or chat.get("pid") or chat.get("child_of") or chat["uuid"] in hooked:
-                _upsert(store, chat, now, chat.get("hook_model"))
-                _retire_shadow(store, chat)
+                _upsert_settled(store, chat, now)
             chosen.append(chat)
         pending = [chat for chat in chosen if not _db_fresh(store, chat)]
         _drain(store, pending, budget, per_file, tick_budget, now, tmp_root)
@@ -301,6 +300,26 @@ def _worth_tracking(chat, now):
     if isinstance(updated, int) and now - (updated / 1000.0) < RUNNING_WINDOW_S:
         return True
     return False
+
+
+# Finished chats are re-written at most every SettledRows window while their
+# inputs are unchanged; a running chat (pid) is written every tick.
+_SETTLED = SettledRows()
+_SETTLED_FIELDS = (
+    "uuid", "pid", "label", "updated_ms", "hook_model", "manifest_model",
+    "live_model", "child_of", "parent", "cwd", "transcript",
+)
+
+
+def _upsert_settled(store, chat, now):
+    key = _SETTLED.key(store, "cursor", chat["uuid"])
+    sig = tuple(chat.get(field) for field in _SETTLED_FIELDS)
+    live = _status(chat, now) == "running"
+    if not live and _SETTLED.skip(key, sig, now):
+        return
+    _upsert(store, chat, now, chat.get("hook_model"))
+    _retire_shadow(store, chat)
+    _SETTLED.settle(key, sig, now, live)
 
 
 def _drain(store, pending, budget, per_file, tick_budget, now, tmp_root):

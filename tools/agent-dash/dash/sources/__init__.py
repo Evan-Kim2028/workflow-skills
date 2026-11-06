@@ -474,6 +474,45 @@ _MEMO: dict = {}
 _MEMO_LOCK = threading.Lock()
 _MEMO_MAX = 20000
 
+# Finished rows are re-written at most once per this window while unchanged.
+SETTLED_RECHECK_S = 30.0
+
+
+class SettledRows:
+    """Skip re-writing finished rows whose inputs did not change.
+
+    A poll upserts every chat or manifest row on every 2 s tick, so finished
+    runs (most of the table) cost a full write path each time. A row marked
+    settled (finished, same input signature) is skipped until
+    ``recheck_s`` passes, so late fields still land within that window. A
+    live row is never settled, so it is written on every tick.
+    Keys are scoped to the store path, so two databases never share a memo.
+    """
+
+    def __init__(self, recheck_s: float = SETTLED_RECHECK_S):
+        self.recheck_s = float(recheck_s)
+        self._lock = threading.Lock()
+        self._seen: dict = {}
+
+    @staticmethod
+    def key(store, name, ident):
+        return (str(getattr(store, "path", "")), name, ident)
+
+    def skip(self, key, sig, now: float) -> bool:
+        with self._lock:
+            hit = self._seen.get(key)
+        return hit is not None and hit[0] == sig and 0 <= now - hit[1] < self.recheck_s
+
+    def settle(self, key, sig, now: float, live: bool) -> None:
+        with self._lock:
+            if live:
+                self._seen.pop(key, None)
+                return
+            if len(self._seen) > _MEMO_MAX:
+                self._seen.clear()
+            self._seen[key] = (sig, now)
+
+
 
 def memo_call(key, ttl_s: float, compute):
     """``compute()`` at most once per ``ttl_s`` for ``key``. Bounded, thread-safe.

@@ -38,7 +38,10 @@ import os
 import time
 from datetime import datetime, timedelta, timezone
 
+from dash.sources import SettledRows
 from dash.sources.process import apply_liveness, live_agent_processes
+
+_SETTLED = SettledRows()
 
 log = logging.getLogger("agent_dash.muse")
 
@@ -100,10 +103,17 @@ def _poll(store, cfg, now):
 
     for row in manifests.values():
         sid = row.get("session_id")
+        # Finished, unchanged rows are re-written at most every recheck window
+        # (no stat, no write); a running row is written every tick.
+        key = _SETTLED.key(store, "muse", sid)
+        sig = tuple(sorted((k, str(v)) for k, v in row.items()))
+        if _SETTLED.skip(key, sig, now):
+            continue
         path = _locate(sessions, sid)
         if not path and isinstance(sid, str):
             path = _locate(sessions, sid.lower())
-        _upsert_run(store, sid, manifests, None, None, False, None, processes, path)
+        status = _upsert_run(store, sid, manifests, None, None, False, None, processes, path)
+        _SETTLED.settle(key, sig, now, live=status in (None, "running"))
     _adopt_live_labels(store, manifests, processes)
 
     files = _candidate_files(store, sessions, manifests, now, fresh_hours, scan_s)
@@ -404,6 +414,7 @@ def _upsert_run(store, sid, manifests, muse_parent, model, have_log_start, log_t
         store.upsert_session(session)
     except Exception:
         _fail("session")
+    return run.get("status")
 
 
 def _adopt_live_labels(store, manifests, processes):
