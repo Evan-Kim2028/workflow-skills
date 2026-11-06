@@ -101,19 +101,22 @@ def _poll(store, cfg, now):
                 row["parent_session_id"] = parent
                 _keep_latest(manifests, row)
 
+    procs_sig = _processes_sig(processes)
     for row in manifests.values():
         sid = row.get("session_id")
-        # Finished, unchanged rows are re-written at most every recheck window
-        # (no stat, no write); a running row is written every tick.
+        # A row is settled when its manifest fields and the live-process
+        # listing are unchanged: no stat, no write until the recheck window.
+        # Any process start or exit changes the listing, so a new live run
+        # is picked up on the next tick, not after the window.
         key = _SETTLED.key(store, "muse", sid)
-        sig = tuple(sorted((k, str(v)) for k, v in row.items()))
+        sig = (tuple(sorted((k, str(v)) for k, v in row.items())), procs_sig)
         if _SETTLED.skip(key, sig, now):
             continue
         path = _locate(sessions, sid)
         if not path and isinstance(sid, str):
             path = _locate(sessions, sid.lower())
         status = _upsert_run(store, sid, manifests, None, None, False, None, processes, path)
-        _SETTLED.settle(key, sig, now, live=status in (None, "running"))
+        _SETTLED.settle(key, sig, now, live=status == "running")
     _adopt_live_labels(store, manifests, processes)
 
     files = _candidate_files(store, sessions, manifests, now, fresh_hours, scan_s)
@@ -438,6 +441,17 @@ def _adopt_live_labels(store, manifests, processes):
             continue
         _keep_latest(manifests, {"label": label, "session_id": sid, "started_at": None})
         _upsert_run(store, sid, manifests, None, None, False, None, processes)
+
+
+def _processes_sig(processes) -> tuple:
+    """Hashable identity of the live process listing (None means it failed)."""
+    if processes is None:
+        return ("none",)
+    return tuple(sorted(
+        (str(p.get("pid")), str(p.get("comm") or ""), str(p.get("label") or ""), str(p.get("started_at") or ""))
+        for p in processes
+        if isinstance(p, dict)
+    ))
 
 
 def _agent_processes():

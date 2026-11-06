@@ -52,6 +52,18 @@ class SettledRowsTest(unittest.TestCase):
         self.assertNotEqual(a, b)
 
 
+class MuseProcessSigTest(unittest.TestCase):
+    def test_signature_moves_with_the_live_listing(self):
+        from dash.sources import muse
+
+        base = [{"pid": 10, "comm": "muse", "started_at": 5.0, "label": "ws1-a"}]
+        same = [dict(base[0])]
+        started = base + [{"pid": 11, "comm": "muse", "started_at": 6.0, "label": "ws1-b"}]
+        self.assertEqual(muse._processes_sig(base), muse._processes_sig(same))
+        self.assertNotEqual(muse._processes_sig(base), muse._processes_sig(started))
+        self.assertNotEqual(muse._processes_sig(None), muse._processes_sig([]))
+
+
 class CursorSettledTest(unittest.TestCase):
     def test_finished_chat_written_once_then_skipped_then_live_written(self):
         from dash.sources import cursor
