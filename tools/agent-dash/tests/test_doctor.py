@@ -48,6 +48,19 @@ def _stop_server(server, thread):
     server.server_close()
 
 
+from live_guard import Guard
+
+_GUARD = Guard()
+
+
+def setUpModule():
+    _GUARD.start()
+
+
+def tearDownModule():
+    _GUARD.stop()
+
+
 class DoctorDashboardTest(unittest.TestCase):
     def setUp(self):
         # Isolate from machine-global ps state: the live listing is empty
@@ -2577,10 +2590,16 @@ class BuildChecksTest(unittest.TestCase):
     def collect(self, health):
         from dash.doctor import collect_problems
 
-        return collect_problems(
-            None, default_cfg(), time.time(), url="http://127.0.0.1:1",
-            health=health, tool_root=self.repo,
-        )
+        # default_cfg() pins state_dir to the live default, which the run-dir
+        # registry and scratch scan would read. Use the temp tree instead.
+        cfg = default_cfg()
+        cfg["state_dir"] = str(Path(self.tmp.name) / "state")
+        cfg["roots"]["scratchpads"] = []
+        with mock.patch("dash.doctor._home_scratch", return_value=str(Path(self.tmp.name) / "noscratch")):
+            return collect_problems(
+                None, cfg, time.time(), url="http://127.0.0.1:1",
+                health=health, tool_root=self.repo,
+            )
 
     def test_dirty_build_is_a_warning(self):
         result = self.collect({"ok": True, "sources": [], "build_id": self.short(self.new) + "-dirty"})

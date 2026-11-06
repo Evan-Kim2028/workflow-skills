@@ -47,6 +47,19 @@ def free_port():
             return port
 
 
+from live_guard import Guard
+
+_GUARD = Guard()
+
+
+def setUpModule():
+    _GUARD.start()
+
+
+def tearDownModule():
+    _GUARD.stop()
+
+
 class StubHealthHandler(http.server.BaseHTTPRequestHandler):
     payload = {"ok": True}
 

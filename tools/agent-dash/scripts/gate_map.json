@@ -338,6 +338,14 @@
       "test_migration",
       "test_fixtures"
     ],
+    "tests/live_guard.py": [
+      "test_live_guard",
+      "test_deploy",
+      "test_process_control",
+      "test_orchestrate",
+      "test_server",
+      "test_doctor"
+    ],
     "workers.example.json": [
       "test_run_worker"
     ],

@@ -21,12 +21,17 @@ from dash.plans import PlanNotFound, load as load_plan, mapping as plan_mapping
 from dash.server import DashServer, PLACEHOLDER, ROOT
 from dash.sources import Registry
 from dash.store import Store
+from live_guard import Guard
 
 
 _KEPT_PORT = os.environ.get("AGENT_DASH_PORT")
 
 
+_GUARD = Guard()
+
+
 def setUpModule():
+    _GUARD.start()
     # main() re-reads AGENT_DASH_PORT on every call, so a trial port
     # inherited from a deploy would clobber the in-process test ports.
     # The tests choose their own ports; the env override stays out.
@@ -38,6 +43,7 @@ def tearDownModule():
         os.environ.pop("AGENT_DASH_PORT", None)
     else:
         os.environ["AGENT_DASH_PORT"] = _KEPT_PORT
+    _GUARD.stop()
 
 
 def start(store, index=None, registry=None, interval=2.0):
@@ -856,6 +862,10 @@ class ReconcileEndpointTest(unittest.TestCase):
         state = Path(self.tmp.name) / "state"
         state.mkdir()
         (state / "run-dirs.txt").write_text(str(rundir) + "\n", encoding="utf-8")
+        # The env state dir outranks cfg, and the live guard sets it: pin it to this case's state.
+        pinned = mock.patch.dict(os.environ, {"AGENT_DASH_STATE_DIR": str(state)})
+        pinned.start()
+        self.addCleanup(pinned.stop)
         cfg = default_cfg()
         cfg["roots"]["scratchpads"] = []
         cfg["state_dir"] = str(state)

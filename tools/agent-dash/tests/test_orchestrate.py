@@ -29,6 +29,19 @@ def _task(tid, status="todo", deps=None, **extra):
     return row
 
 
+from live_guard import Guard
+
+_GUARD = Guard()
+
+
+def setUpModule():
+    _GUARD.start()
+
+
+def tearDownModule():
+    _GUARD.stop()
+
+
 class ReadyQueueTest(unittest.TestCase):
     def test_ready_needs_all_deps_done(self):
         body = _body(
