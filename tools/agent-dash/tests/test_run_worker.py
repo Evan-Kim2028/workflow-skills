@@ -1,5 +1,7 @@
 """Registry worker launcher. Fake processes only. No real agents."""
+import contextlib
 import importlib.util
+import io
 import json
 import os
 import tempfile
@@ -29,7 +31,19 @@ def without_scratch(env):
     return {k: v for k, v in dict(env or {}).items() if k != "AGENT_SCRATCH"}
 
 
+FIXTURE = HERE / "fixtures" / "workers_launcher.json"
+
+
 def registry():
+    """Launcher fixture: the tier names, caps and order these tests pin.
+
+    Kept apart from the shipped file so a registry change does not move
+    the launcher's behaviour tests; shipped_registry() reads the real one.
+    """
+    return json.loads(FIXTURE.read_text(encoding="utf-8"))
+
+
+def shipped_registry():
     return json.loads((ROOT / "workers.example.json").read_text(encoding="utf-8"))
 
 
@@ -115,45 +129,102 @@ class RunWorkerTests(unittest.TestCase):
         return self.counts.get(pattern, 0)
 
     def test_example_lists_the_launch_tiers(self):
-        data = registry()
-        self.assertEqual(data["default"], "muse")
-        self.assertEqual(data["auto_order"], ["muse", "glm-flash", "codex-luna", "pi-deepseek-flash"])
+        data = shipped_registry()
+        self.assertEqual(data["default"], "pi-anthropic-haiku")
+        self.assertEqual(data["auto_order"], ["pi-anthropic-haiku", "pi-deepseek-flash"])
         self.assertEqual(
             set(data["workers"]),
-            {"muse", "grok", "deepseek-flash", "glm-flash", "glm", "pi-deepseek", "pi-beam",
-             "codex-luna", "pi-deepseek-flash"},
+            {"pi-anthropic-haiku", "pi-deepseek-flash", "muse", "grok-build-47", "deepseek-flash",
+             "glm", "glm-flash", "pi-beam", "codex-luna"},
         )
         kinds = {name: row["kind"] for name, row in data["workers"].items()}
+        self.assertNotIn("cursor", kinds.values())  # retired; no tier may use it
+        self.assertTrue(set(kinds.values()) <= set(runner.KINDS))
         self.assertEqual(kinds["muse"], "muse")
-        self.assertEqual(kinds["grok"], "cursor")
+        self.assertEqual(kinds["grok-build-47"], "grok-build")
         self.assertEqual(kinds["glm"], "grok-build")
         self.assertEqual(kinds["glm-flash"], "grok-build")
         self.assertEqual(kinds["deepseek-flash"], "grok-build")
-        self.assertEqual(kinds["pi-deepseek"], "pi")
         self.assertEqual(kinds["pi-beam"], "pi")
+        self.assertEqual(kinds["pi-anthropic-haiku"], "pi")
         self.assertEqual(kinds["codex-luna"], "codex")
         self.assertEqual(kinds["pi-deepseek-flash"], "pi")
-        caps = {name: row["cap"] for name, row in data["workers"].items()}
-        self.assertEqual(caps["deepseek-flash"], 5)
-        self.assertEqual(caps["glm-flash"], 5)
-        self.assertEqual(caps["glm"], 2)
-        self.assertEqual(caps["pi-deepseek"], 12)
-        self.assertEqual(caps["pi-beam"], 5)
-        self.assertEqual(caps["codex-luna"], 3)
-        self.assertEqual(caps["pi-deepseek-flash"], 5)
         manifests = {name: row["manifest"] for name, row in data["workers"].items()}
         self.assertEqual(manifests["codex-luna"], "codex-sessions.tsv")
         self.assertEqual(manifests["pi-deepseek-flash"], "pi-sessions.tsv")
+        self.assertEqual(manifests["pi-anthropic-haiku"], "pi-sessions.tsv")
+        self.assertEqual(manifests["glm"], "glm-sessions.tsv")
         tiers = {name: row["pgrep"] for name, row in data["workers"].items()}
         self.assertIn("--tier codex-luna", tiers["codex-luna"])
         self.assertIn("--tier pi-deepseek-flash", tiers["pi-deepseek-flash"])
+        self.assertIn("--tier pi-anthropic-haiku", tiers["pi-anthropic-haiku"])
         for name, row in data["workers"].items():
             self.assertIn("[", row["pgrep"])
             self.assertTrue(row["enabled"])
-            self.assertEqual(row["manifest"], "pi-sessions.tsv" if row["kind"] == "pi" else row["manifest"])
+            self.assertIn("cap", row)
+            self.assertIn("quota_patterns", row)
+            self.assertIn("columns", row)
         # Every Grok Build tier cools on the GLM request-limit wording too.
-        for name in ("deepseek-flash", "glm", "glm-flash"):
+        for name in ("grok-build-47", "deepseek-flash", "glm", "glm-flash"):
             self.assertIn("rate limit reached for requests", data["workers"][name]["quota_patterns"])
+        for name in data["auto_order"]:
+            self.assertIn(name, data["workers"])
+            self.assertTrue(data["workers"][name]["enabled"])
+
+    def test_every_shipped_tier_is_priced_and_policy_clean(self):
+        from dash.doctor import effort_from_extra_args, model_policy_reason
+        from dash.pricing import status
+
+        for name, row in shipped_registry()["workers"].items():
+            self.assertTrue(status(row["model"])["priced"], name)
+            reason = model_policy_reason(row["kind"], row["model"], effort_from_extra_args(row), None)
+            self.assertIsNone(reason, name)
+
+    def _write_registry(self, workers):
+        data = registry()
+        data["workers"] = workers
+        self.reg.write_text(json.dumps(data), encoding="utf-8")
+
+    def _with_unpriced(self, names):
+        workers = registry()["workers"]
+        for name in names:
+            workers[name] = dict(workers[name], model="no-such-model-xyz")
+        self._write_registry(workers)
+
+    def test_auto_skips_an_unpriced_tier_for_the_next_one(self):
+        self._with_unpriced(["muse"])  # first in the fixture's auto_order
+        self.counts = {}
+        launch = Launch()
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            code, line = self.go("auto", launch)
+        self.assertEqual(code, 0)
+        self.assertIn("tier=glm-flash", line)
+        self.assertEqual(launch.cmds[0][0], "grok")
+        self.assertNotIn("muse", launch.cmds[0][0])
+        self.assertIn("skipping muse", err.getvalue())
+        self.assertIn("no catalog price", err.getvalue())
+
+    def test_auto_skips_every_unpriced_tier_then_reports_none_available(self):
+        self._with_unpriced(["muse", "glm-flash", "codex-luna", "pi-deepseek-flash"])
+        self.counts = {}
+        launch = Launch()
+        with contextlib.redirect_stderr(io.StringIO()):
+            code, line = self.go("auto", launch)
+        self.assertEqual(code, 0)
+        self.assertIn("reason=none-available", line)
+        self.assertEqual(launch.cmds, [])
+
+    def test_named_unpriced_tier_keeps_launching_without_preflight(self):
+        # Only auto skips unpriced tiers. A named tier still launches; the
+        # preflight is what refuses it (test_preflight_blocks_unpriced_model).
+        self._with_unpriced(["muse"])
+        self.counts = {}
+        launch = Launch()
+        code, line = self.go("muse", launch)
+        self.assertEqual(code, 0)
+        self.assertIn("tier=muse", line)
+        self.assertEqual(launch.cmds[0][0], "muse")
 
     def test_default_launches_muse_and_writes_the_manifest(self):
         self.counts = {}

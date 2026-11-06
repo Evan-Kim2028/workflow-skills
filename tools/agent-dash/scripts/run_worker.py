@@ -414,7 +414,10 @@ def observe(ctx, tier, tried) -> int:
 
 
 def eligible(ctx, skip):
-    """First ``auto_order`` tier under its cap and not cooling, or None.
+    """First ``auto_order`` tier under its cap, not cooling, and priced, or None.
+
+    A tier whose model has no catalog price is skipped with a stderr note;
+    an explicitly named tier is not affected (the preflight refuses it).
 
     ``skip`` holds launch names already tried this call (standby names
     included). A cooling tier is passed over in favour of the next one:
@@ -438,6 +441,12 @@ def eligible(ctx, skip):
             continue
         if cooling(ctx["cooldowns"], launch_name, now):
             continue
+        if not model_priced(worker):
+            print(
+                f"auto: skipping {launch_name}: model {worker.get('model')!r} has no catalog price",
+                file=sys.stderr,
+            )
+            continue
         try:
             cap = int(worker.get("cap"))
         except (TypeError, ValueError):
@@ -448,6 +457,19 @@ def eligible(ctx, skip):
             continue
         return launch_name
     return None
+
+
+def model_priced(worker) -> bool:
+    """True when the tier's model has a catalog rate. A missing or unknown model is unpriced."""
+    model = str((worker or {}).get("model") or "")
+    if not model:
+        return False
+    try:
+        from dash.pricing import status as price_status
+
+        return bool(price_status(model)["priced"])
+    except Exception:
+        return False
 
 
 def note_quota(ctx, name):
