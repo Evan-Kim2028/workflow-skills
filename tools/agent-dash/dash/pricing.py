@@ -531,10 +531,19 @@ _INDEX_LIMIT = 16
 _EFFORT_SUFFIX = re.compile(r":(xhigh|high|medium|low)$", re.IGNORECASE)
 
 
+#: Grok Build's internal id (``grok-4.7-build``) for the public ``grok-4.7``.
+#: Same rule as ``dash.sources.grok_cli._alias_model``: rows ingested before
+#: that alias landed still carry the build id, and they price at the public rate.
+_GROK_BUILD_SUFFIX = re.compile(r"^(grok-.+)-build$", re.IGNORECASE)
+
+
 def _bare_id(model) -> str | None:
     if not isinstance(model, str):
         return None
     bare = _EFFORT_SUFFIX.sub("", model)
+    build = _GROK_BUILD_SUFFIX.match(bare)
+    if build:
+        bare = build.group(1)
     return bare if bare != model else None
 
 

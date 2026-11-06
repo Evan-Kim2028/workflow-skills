@@ -670,5 +670,39 @@ class RepriceCliTest(unittest.TestCase):
                 store.close()
 
 
+class OpenRouterFreeAndGrokBuildTest(unittest.TestCase):
+    """OpenRouter's published $0 ids price; ids with no exact rate stay null."""
+
+    def test_openrouter_prefixed_free_ids_price_at_zero(self):
+        rows = {row["model"]: row for row in load()}
+        for model in ("openrouter/stealth/crouton-alpha", "openrouter/nvidia/nemotron-3.5-lightning:free"):
+            row = rows[model]
+            self.assertEqual(row["provider"], "openrouter")
+            self.assertEqual(row["source_url"], "https://openrouter.ai/api/v1/models")
+            self.assertEqual(row["retrieved_at"], "2026-11-06")
+            self.assertEqual(row["billing_mode"], "free")
+            self.assertTrue(status(model)["priced"], model)
+            # Cached-read tokens (nemotron :free logs 4.5M) price at the $0 rate, not None.
+            self.assertEqual(cost(model, 263_283, 24_351, 4_516_880, 0, reasoning=0), 0.0, model)
+
+    def test_no_exact_rate_stays_unpriced(self):
+        """Command Code's crouton id, the -1019 ling id and muse-wonder-full-1.0
+        have no published rate for that exact id, so they get no $0 row."""
+        for model in ("stealth/crouton-alpha", "inclusionai/ling-3.1-flash-1019:free", "muse-wonder-full-1.0"):
+            self.assertFalse(status(model)["priced"], model)
+            self.assertIsNone(cost(model, 10, 10, 0, 0), model)
+        self.assertIsNone(cost("inclusionai/ling-3.1-flash-1019:free", 1, 1, 0, 0))
+
+    def test_grok_build_id_prices_at_the_public_grok_rate(self):
+        plain = cost("grok-4.7", 1_000_000, 1_000_000, 1_000_000, 0)
+        self.assertAlmostEqual(plain, 8.5)
+        self.assertAlmostEqual(cost("grok-4.7-build", 1_000_000, 1_000_000, 1_000_000, 0), plain)
+        self.assertAlmostEqual(cost("grok-4.7-build:high", 1_000_000, 1_000_000, 1_000_000, 0), plain)
+        self.assertTrue(status("grok-4.7-build")["priced"])
+        # Only a real grok row is re-keyed: an unknown -build id stays null.
+        self.assertIsNone(cost("grok-9.9-build", 1, 1, 0, 0))
+        self.assertIsNone(cost("muse-wonder-full-1.0", 1, 1, 0, 0))
+
+
 if __name__ == "__main__":
     unittest.main()
