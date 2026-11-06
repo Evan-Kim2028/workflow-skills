@@ -1184,6 +1184,20 @@ class PromptHandoffTests(unittest.TestCase):
         cmd = runner.command(worker, "ws1-x", "/ws", "/run/ws1-x.md", "-", "/run", "cursor")
         self.assertEqual(cmd[-2:], ["/run/ws1-x.md", "m"])
 
+    def test_no_rules_launches_the_caller_file_as_written(self):
+        from io import StringIO
+        import contextlib
+
+        launch = Launch()
+        argv = ["muse", "ws1-plan-norules", str(self.ws), str(self.prompt),
+                str(self.run_dir), "0", "--no-preflight", "--no-rules"]
+        with contextlib.redirect_stdout(StringIO()):
+            code = runner.run(argv, spawn=launch.spawn, pgrep=self.pgrep, sleep=lambda _s: None,
+                              now=lambda: NOW, alive=launch.is_alive, new_uuid=lambda: SID)
+        self.assertEqual(code, 0)
+        self.assertIn(str(self.prompt), launch.cmds[0])
+        self.assertFalse((self.run_dir / "ws1-plan-norules.md").exists())
+
 
 
 if __name__ == "__main__":

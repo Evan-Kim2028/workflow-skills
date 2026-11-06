@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Launch one registry worker and wait. A second call for the same label only waits.
 
-Usage: run_worker.py <tier|default|auto> <label> <workspace> <prompt-file> <run-dir> [max-wait] [--no-preflight] [--exclude=<tier>]...
+Usage: run_worker.py <tier|default|auto> <label> <workspace> <prompt-file> <run-dir> [max-wait] [--no-preflight] [--no-rules] [--exclude=<tier>]...
 
 A max-wait of 0 launches and returns at once: STATUS is ``running`` while the
 worker lives, and a later call for the same label observes it (the dispatcher
@@ -18,7 +18,9 @@ file: the ``[label: <label>]`` line, then ``templates/worker-common.md``
 changed; the assembled copy is ``<run-dir>/<label>.md``. Both pieces are
 idempotent: a prompt that already carries the rules marker (or the
 pre-marker rules heading) or a leading label line is not given them
-again. A missing template warns and launches without the rules.
+again. ``--no-rules`` launches the prompt file exactly as written. A
+missing template warns and launches without the rules. An assembled
+prompt above ``PROMPT_WARN_BYTES`` prints a size warning.
 
 Every kind writes its manifest row with the tier it was launched under, so
 the dashboard reads the registry tier name (``deepseek-flash``) instead of
@@ -183,6 +185,8 @@ def run(argv, spawn=None, pgrep=None, sleep=None, now=None, alive=None, new_uuid
     argv = list(argv)
     no_preflight = "--no-preflight" in argv
     argv = [token for token in argv if token != "--no-preflight"]
+    no_rules = "--no-rules" in argv
+    argv = [token for token in argv if token != "--no-rules"]
     exclude = [token[len("--exclude="):] for token in argv if token.startswith("--exclude=")]
     argv = [token for token in argv if not token.startswith("--exclude=")]
     if len(argv) < 5:
@@ -254,7 +258,7 @@ def run(argv, spawn=None, pgrep=None, sleep=None, now=None, alive=None, new_uuid
         blocked = run_preflight(registry, requested, ctx)
         if blocked is not None:
             return blocked
-    prepare_prompt(ctx)
+    prepare_prompt(ctx, no_rules)
     name, reason = pick_initial(ctx)
     if not name:
         code = 0 if reason == "none-available" else 2
@@ -308,7 +312,7 @@ def assemble_prompt(text, label, template, heading):
     return "\n\n".join(parts) + "\n", notes
 
 
-def prepare_prompt(ctx) -> None:
+def prepare_prompt(ctx, no_rules: bool) -> None:
     """Point ``ctx["prompt"]`` at the assembled prompt in the run folder.
 
     Every tier reads ``ctx["prompt"]`` (and a quota retry reuses it), so
@@ -317,6 +321,9 @@ def prepare_prompt(ctx) -> None:
     live muse process by a ``--prompt-file`` ending in ``/<label>.md``.
     """
     source = Path(ctx["prompt"])
+    if no_rules:
+        print("prompt: --no-rules, launching the prompt file as written", file=sys.stderr)
+        return
     text = source.read_text(encoding="utf-8")
     template, heading = read_rules_template()
     assembled, notes = assemble_prompt(text, ctx["label"], template, heading)
