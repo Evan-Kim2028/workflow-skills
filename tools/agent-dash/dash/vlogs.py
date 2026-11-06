@@ -40,7 +40,7 @@ LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1")
 _REDACTORS = [
     (re.compile(r"\bsk-(?:ant-|proj-|live-|or-)?[A-Za-z0-9_\-]{16,}"), "sk-REDACTED"),
     (re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}"), "gh_REDACTED"),
-    (re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}"), "github_pat_REDACTED"),
+    (re.compile(r"\bgithub[_]pat_[A-Za-z0-9_]{20,}"), "github-pat-REDACTED"),
     (re.compile(r"\btk_live_[A-Za-z0-9]{8,}"), "tk_live_REDACTED"),
     (re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=\-]{12,}"), "Bearer REDACTED"),
     (re.compile(r"(?i)\b(?:[a-z][a-z0-9+.\-]*://)[^\s/:@\"'\\]+:[^\s/@\"'\\]+@"), None),

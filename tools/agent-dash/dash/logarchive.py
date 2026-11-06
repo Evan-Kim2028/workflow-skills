@@ -52,12 +52,30 @@ from pathlib import Path
 
 from dash import logfilter
 from dash import vlogs
+from dash.dataroot import hub_dir as _hub_dir
 from dash.dataroot import state_dir as _state_dir
 
-DEFAULT_ROOTS = (
-    "~/Documents/projects/lor-hub-state",
-    "~/Documents/projects/lake-of-rage-hub-state",
-)
+def default_roots() -> list[str]:
+    """Hub roots scanned when no ``--root`` is given.
+
+    Read from ``log_archive.roots`` in the agent-dash local config
+    (``<state>/config.local.json``, git-ignored), so the repo names no
+    project. Without it, the configured ``hub_dir`` is used.
+    """
+    roots: list[str] = []
+    try:
+        with open(os.path.join(_state_dir(), "config.local.json"), encoding="utf-8") as fh:
+            local = json.load(fh)
+        section = local.get("log_archive") if isinstance(local, dict) else None
+        if isinstance(section, dict) and isinstance(section.get("roots"), list):
+            roots = [str(r) for r in section["roots"] if isinstance(r, str) and r]
+    except (OSError, ValueError):
+        roots = []
+    if not roots:
+        hub = _hub_dir()
+        roots = [hub] if hub else []
+    return [os.path.expanduser(r) for r in roots]
+
 MIN_IDLE_HOURS = 3.0
 ZSTD_LEVEL = "-9"
 #: Largest message_end line whose body is kept for token parsing. Larger
@@ -1102,7 +1120,7 @@ def run(opts: dict, out=None, *, state: Path | None = None) -> int:
     """
     out = out or sys.stdout
     opts = dict(_DEFAULTS, **opts)
-    roots = opts["roots"] or list(DEFAULT_ROOTS)
+    roots = opts["roots"] or default_roots()
     root = archive_root(state)
     lock_fh = None
     if opts["apply"]:

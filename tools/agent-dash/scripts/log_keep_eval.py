@@ -41,10 +41,11 @@ HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
-HUBS = [
-    Path.home() / "Documents/projects/lor-hub-state",
-    Path.home() / "Documents/projects/lake-of-rage-hub-state",
-]
+def _hubs() -> list[Path]:
+    """The archive's default roots (``log_archive.roots`` in the local config)."""
+    from dash import logarchive as la
+
+    return [Path(r) for r in la.default_roots()]
 OPTIONS = ["control", "remove", "stub", "stripped"]
 BIG_STREAM = "catalog-confidence/dispatch-bundles/WS91/runs/ws91-exec-03/pi"
 
@@ -59,7 +60,7 @@ def pick_outdirs(limit: int, include_big: bool, kinds=("pi",), max_mb: float = 1
     for kind in kinds:
         mark = KIND_MARK[kind]
         found: list[Path] = []
-        for hub in HUBS:
+        for hub in _hubs():
             for dirpath, _dirnames, filenames in os.walk(hub):
                 if "/.git" not in dirpath and mark in filenames:
                     found.append(Path(dirpath))

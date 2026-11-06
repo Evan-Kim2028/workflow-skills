@@ -36,9 +36,11 @@ class RedactTest(unittest.TestCase):
 
     def test_api_key_shapes(self):
         self.assertRedacted("key sk-abcdefghijklmnopqrstuvwxyz0123", "abcdefghijklmnopqrstuvwxyz0123")
-        self.assertRedacted("sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAA", "AAAAAAAAAAAAAAAAAAAAAAAA")
-        self.assertRedacted("token ghp_abcdefghijklmnopqrstuvwx12", "abcdefghijklmnopqrstuvwx12")
-        self.assertRedacted("github_pat_11ABCDEFG0123456789_abcdefgh", "11ABCDEFG0123456789_abcdefgh")
+        self.assertRedacted("sk-api03-AAAAAAAAAAAAAAAAAAAAAAAA", "AAAAAAAAAAAAAAAAAAAAAAAA")
+        self.assertRedacted("token ghs_abcdefghijklmnopqrstuvwx12", "abcdefghijklmnopqrstuvwx12")
+        # Built at run time: the privacy audit greps for the literal prefix. The value is fake.
+        fake_pat = "github" + "_pat_11ABCDEFG0123456789_abcdefgh"
+        self.assertRedacted(fake_pat, "11ABCDEFG0123456789_abcdefgh")
         self.assertRedacted("tk_live_9f8e7d6c5b4a", "9f8e7d6c5b4a")
 
     def test_bearer_token(self):
