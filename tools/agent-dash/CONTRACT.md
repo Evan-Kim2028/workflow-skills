@@ -115,7 +115,7 @@ store.upsert_session(dict)    # keys: session_id, tool, cwd, started_at, status,
 store.upsert_run(dict)        # keys: run_id, source, tier, model, label, session_id, parent_session_id,
                               #       status, verdict, started_at, ended_at, clock_source, out_bytes, err_bytes, pid, out_path
 store.add_usage(dict)         # keys: ts, session_id, run_id, model, tool, message_id,
-                              #       input, output, cache_read, cache_write, reasoning   (upsert on tool+session_id+message_id, last wins)
+                              #       input, output, cache_read, cache_write, reasoning, cache_write_5m, cache_write_1h (last two optional)   (upsert on tool+session_id+message_id, last wins)
 store.add_process_sample(dict)# keys: ts, pid, comm, rss_kb, elapsed_s, label, run_id, model (the `--model` flag value only)
 store.set_ws_counts(list)     # rows: ws, name, backlog, todo, doing, review, done, cancelled
 ```
@@ -894,7 +894,10 @@ label through the map file, the same as every source.
 Usage line. `session_id`, `tool`, and `message_id` are required by the
 store (upsert on that triple, last wins). `run_id` should match the run
 so tokens join its workstream. `model` names the price row; a model with
-no input and output rate stays unpriced, never zero.
+no input and output rate stays unpriced, never zero. Optional
+`cache_write_5m` and `cache_write_1h` carry the write split (both absent is
+NULL: a model with two different write rates then stays unpriced). pi lines
+write both; pi's `cacheWrite1h` is the 1h part and the 5m part the remainder.
 
 ```json
 {"type": "usage", "session_id": "abc", "run_id": "generic:abc:ws4-WS4.1-notes-index",
