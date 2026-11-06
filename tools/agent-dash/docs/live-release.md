@@ -72,7 +72,7 @@ does not need the flag.
 ## Rollback
 
 ```bash
-python3 agent_dash.py rollback        # run from a terminal (see caveat)
+python3 agent_dash.py rollback --yes-live
 ```
 
 It switches `CURRENT` back to `PREVIOUS`, relinks that release's local
@@ -82,12 +82,8 @@ files, restarts it, waits for its build on `/api/health`, and runs
 
 Caveats, both found while trialling:
 
-- `rollback` takes no flags (`agent_dash.py` `cmd_rollback` rejects any
-  argument), so it cannot pass `--yes-live`. From a non-interactive
-  session on the live state dir the restart is refused, and the rollback
-  says so and keeps the current release. Until the flag is added, run it
-  from a terminal, or deploy the known-good commit instead:
-  `python3 agent_dash.py deploy --ref <known-good-sha> --yes-live`.
+- `rollback` needs `--yes-live` from a non-interactive session on the live
+  state dir, like `restart` and `deploy`.
 - Right after the cutover there is no `PREVIOUS` (step 2 moved the stale
   one away), so `rollback` says `no previous release recorded`. The way
   back to the pre-release state is a restart from the main checkout,
@@ -162,7 +158,6 @@ is a follow-up.
 
 ## Known limits (not fixed here)
 
-- `rollback` cannot pass `--yes-live` (above).
 - The gate base is `origin/main`, not the running release (above).
 - `dash/doctor.py` `_local_config_path` writes `config.local.json` in
   the tool dir. In a release with a linked source that writes through

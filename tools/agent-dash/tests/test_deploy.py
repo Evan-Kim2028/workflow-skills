@@ -776,5 +776,32 @@ class LocalFilesTest(unittest.TestCase):
             )
 
 
+class RollbackCliTest(unittest.TestCase):
+    """The rollback command forwards --yes-live so non-interactive sessions can use it."""
+
+    def _call(self, argv):
+        import agent_dash
+
+        with mock.patch.object(agent_dash, "bind_state"), mock.patch.object(
+            agent_dash.deploy_lib, "rollback", return_value=(True, "ok")
+        ) as rollback, mock.patch.object(agent_dash, "_base_url", return_value="http://127.0.0.1:1"):
+            return agent_dash.cmd_rollback(argv), rollback
+
+    def test_forwards_yes_live(self):
+        code, rollback = self._call(["--yes-live"])
+        self.assertEqual(code, 0)
+        self.assertTrue(rollback.call_args.kwargs["yes_live"])
+
+    def test_default_keeps_the_guard(self):
+        code, rollback = self._call([])
+        self.assertEqual(code, 0)
+        self.assertFalse(rollback.call_args.kwargs["yes_live"])
+
+    def test_unknown_argument_is_refused(self):
+        code, rollback = self._call(["--nope"])
+        self.assertEqual(code, 2)
+        rollback.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()
