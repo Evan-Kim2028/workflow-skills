@@ -96,7 +96,7 @@ USAGE = """agent-dash: local read-only execution dashboard
   python3 agent_dash.py ws list [--state S[,S...]|all] [--json]
   python3 agent_dash.py ws new <ID> "<title>" [--state planned|active]
   python3 agent_dash.py ws state <ID> <state> [--force] [--note "..."]
-  python3 agent_dash.py ws archive <ID> [--force] [--note "..."]
+  python3 agent_dash.py ws archive <ID> [--force] [--note "..."] [--keep-scratch]
   python3 agent_dash.py ws restore <ID>
   python3 agent_dash.py ws validate <ID> [--json]
   python3 agent_dash.py ws render <ID>
@@ -119,6 +119,8 @@ USAGE = """agent-dash: local read-only execution dashboard
   python3 agent_dash.py lead-profile <session-id|--ws ID> [--json]
   python3 agent_dash.py worktrees reap --repo <path> [--apply] [--skip <path-or-branch>] [--min-age <dur>] [--json]
   python3 agent_dash.py lanes live [--json]
+  python3 agent_dash.py scratch gc [--older-than-days 7] [--apply] [--json]
+  python3 agent_dash.py scratch status [--top N] [--json]
 
 Agents working on a project pass --project <id> (or set the env) for
 state, check, doctor, ws ..., status: it sets the data root, state
@@ -440,6 +442,10 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_worktrees(args[1:])
     if cmd == "lanes":
         return cmd_lanes(args[1:])
+    if cmd == "scratch":
+        from dash.scratchgc import cmd_scratch
+
+        return cmd_scratch(args[1:])
     print(USAGE, end="", file=sys.stderr)
     return 2
 

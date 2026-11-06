@@ -287,6 +287,7 @@ def collect_problems(
     _collect_checkout(ctx)
     _collect_build(ctx)
     _collect_python(ctx)
+    _collect_run_folders(ctx)
     _emit_grouped(ctx)
     return {"problems": ctx.problems, "checks": ctx.checks}
 
@@ -1758,6 +1759,26 @@ def _collect_python(ctx) -> None:
         f"python {'.'.join(str(n) for n in current)} is older than scripts/run_worker.py needs",
         "run the dashboard with a newer python3, then run: python3 agent_dash.py status",
     )
+
+
+def _collect_run_folders(ctx) -> None:
+    """Warn on hub run folders that hold an environment, a Postgres data dir, or big caches (read-only)."""
+    import hashlib
+
+    from dash.scratchhub import run_folder_findings
+
+    for item in run_folder_findings(ctx.cfg, ctx.now):
+        folder = item["folder"]
+        what = ", ".join(item["reasons"])
+        digest = hashlib.sha1(folder.encode("utf-8")).hexdigest()[:12]
+        _add(
+            ctx, "run-folder-scratch", "warn", "global", None,
+            f"Run folder holds scratch: {os.path.basename(folder)}",
+            f"{folder} holds {what}. Environments, databases, caches and images belong in "
+            "$AGENT_SCRATCH, not the hub run folder.",
+            "move it to $AGENT_SCRATCH (see tools/agent-dash/docs/dispatcher.md, Scratch)",
+            False, digest,
+        )
 
 
 def _runs_ro(ctx) -> list[dict]:

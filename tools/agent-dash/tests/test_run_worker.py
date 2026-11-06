@@ -24,6 +24,11 @@ def load():
 runner = load()
 
 
+def without_scratch(env):
+    """The launch env minus AGENT_SCRATCH (asserted separately)."""
+    return {k: v for k, v in dict(env or {}).items() if k != "AGENT_SCRATCH"}
+
+
 def registry():
     return json.loads((ROOT / "workers.example.json").read_text(encoding="utf-8"))
 
@@ -72,9 +77,11 @@ class RunWorkerTests(unittest.TestCase):
         self.env = {
             "AGENT_DASH_WORKERS": os.environ.get("AGENT_DASH_WORKERS"),
             "AGENT_DASH_STATE_DIR": os.environ.get("AGENT_DASH_STATE_DIR"),
+            "AGENT_DASH_SCRATCH_ROOT": os.environ.get("AGENT_DASH_SCRATCH_ROOT"),
         }
         os.environ["AGENT_DASH_WORKERS"] = str(self.reg)
         os.environ["AGENT_DASH_STATE_DIR"] = str(self.state)
+        os.environ["AGENT_DASH_SCRATCH_ROOT"] = str(self.root / "scratch")
 
     def tearDown(self):
         for key, value in self.env.items():
@@ -384,7 +391,7 @@ class RunWorkerTests(unittest.TestCase):
         self.assertEqual(cmd[5], str(self.run_dir / "pi"))
         self.assertEqual(cmd[cmd.index("--model") + 1], registry()["workers"]["pi-deepseek"]["model"])
         self.assertEqual(cmd[cmd.index("--tier") + 1], "pi-deepseek")
-        self.assertEqual(launch.envs[0], {})
+        self.assertEqual(without_scratch(launch.envs[0]), {})
         row = (self.run_dir / "pi-sessions.tsv").read_text(encoding="utf-8").splitlines()[-1].split("\t")
         self.assertEqual(
             row[:4],
@@ -405,7 +412,7 @@ class RunWorkerTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("tier=pi-deepseek-standby", line)
         env_path = os.path.expanduser("~/.config/pi/standby.env")
-        self.assertEqual(launch.envs[0], {"AGENT_DASH_PI_ENV_FILE": env_path})
+        self.assertEqual(without_scratch(launch.envs[0]), {"AGENT_DASH_PI_ENV_FILE": env_path})
         tier = (self.run_dir / "ws1-plan-lane-1.tier").read_text(encoding="utf-8").strip()
         self.assertEqual(tier, "pi-deepseek-standby")
         row = (self.run_dir / "pi-sessions.tsv").read_text(encoding="utf-8").splitlines()[-1].split("\t")
@@ -428,7 +435,7 @@ class RunWorkerTests(unittest.TestCase):
         self.assertEqual(cmd[cmd.index("--model") + 1], "gpt-6-luna")
         self.assertEqual(cmd[cmd.index("--tier") + 1], "codex-luna")
         self.assertEqual(cmd[cmd.index("--reasoning-effort") + 1], "xhigh")
-        self.assertEqual(launch.envs[0], {})
+        self.assertEqual(without_scratch(launch.envs[0]), {})
         row = (self.run_dir / "codex-sessions.tsv").read_text(encoding="utf-8").splitlines()[-1].split("\t")
         self.assertEqual(
             row[:4],
@@ -771,9 +778,11 @@ class PreflightTests(unittest.TestCase):
         self.env = {
             "AGENT_DASH_WORKERS": os.environ.get("AGENT_DASH_WORKERS"),
             "AGENT_DASH_STATE_DIR": os.environ.get("AGENT_DASH_STATE_DIR"),
+            "AGENT_DASH_SCRATCH_ROOT": os.environ.get("AGENT_DASH_SCRATCH_ROOT"),
         }
         os.environ["AGENT_DASH_WORKERS"] = str(self.reg)
         os.environ["AGENT_DASH_STATE_DIR"] = str(self.state)
+        os.environ["AGENT_DASH_SCRATCH_ROOT"] = str(self.root / "scratch")
         self.counts = {}
         from http.server import BaseHTTPRequestHandler, HTTPServer
 
@@ -937,9 +946,11 @@ class CooldownRaceTests(unittest.TestCase):
         self.env = {
             "AGENT_DASH_WORKERS": os.environ.get("AGENT_DASH_WORKERS"),
             "AGENT_DASH_STATE_DIR": os.environ.get("AGENT_DASH_STATE_DIR"),
+            "AGENT_DASH_SCRATCH_ROOT": os.environ.get("AGENT_DASH_SCRATCH_ROOT"),
         }
         os.environ["AGENT_DASH_WORKERS"] = str(self.root / "workers.json")
         os.environ["AGENT_DASH_STATE_DIR"] = str(self.state)
+        os.environ["AGENT_DASH_SCRATCH_ROOT"] = str(self.root / "scratch")
 
     def tearDown(self):
         for key, value in self.env.items():

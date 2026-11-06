@@ -59,7 +59,7 @@ WS_USAGE = """agent-dash workstream bundles
   python3 agent_dash.py ws list [--state S[,S...]|all]
   python3 agent_dash.py ws new <ID> "<title>" [--state planned|active|paused|done|archived|dropped]
   python3 agent_dash.py ws state <ID> <state> [--force] [--note "..."]
-  python3 agent_dash.py ws archive <ID> [--force] [--note "..."]
+  python3 agent_dash.py ws archive <ID> [--force] [--note "..."] [--keep-scratch]
   python3 agent_dash.py ws restore <ID>
   python3 agent_dash.py ws validate <ID>
   python3 agent_dash.py ws render <ID>
