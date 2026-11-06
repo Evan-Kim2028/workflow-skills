@@ -1361,6 +1361,13 @@ def _is_hot(chat, now):
     return isinstance(updated, int) and now - (updated / 1000.0) < RUNNING_WINDOW_S
 
 
+# (store, path) -> (inode, size, cursor) of the last chat observed fresh. A chat
+# whose stamp is unchanged was already consistent with its stored offset, so the
+# offset query is skipped (one query per chat per tick otherwise).
+_FRESH_SEEN: dict = {}
+_FRESH_SEEN_MAX = 20000
+
+
 def _db_fresh(store, chat):
     path = chat.get("store_path")
     if not path or not os.path.isfile(path):
@@ -1369,13 +1376,23 @@ def _db_fresh(store, chat):
         st = os.stat(path)
     except OSError:
         return True
+    cursor = _cursor_of(chat, st)
+    stamp = (int(st.st_ino), int(st.st_size), cursor)
+    memo_key = (str(getattr(store, "path", "")), path)
+    if _FRESH_SEEN.get(memo_key) == stamp:
+        return True
     rec = _offset(store, _abs(path))
     if not rec or rec[0] != int(st.st_ino):
         return False
     try:
-        return int(rec[1]) == _cursor_of(chat, st)
+        fresh = int(rec[1]) == cursor
     except (TypeError, ValueError):
         return False
+    if fresh:
+        if len(_FRESH_SEEN) > _FRESH_SEEN_MAX:
+            _FRESH_SEEN.clear()
+        _FRESH_SEEN[memo_key] = stamp
+    return fresh
 
 
 def _cursor_of(chat, st):
