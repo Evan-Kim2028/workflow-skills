@@ -65,10 +65,14 @@ class ContentKeyTest(unittest.TestCase):
         self.store.upsert_run(_run())
         self.assertNotEqual(self.store.content_key, before)
 
-    def test_ws_counts_write_moves_data_seq(self):
-        before = self.store.data_seq
+    def test_ws_counts_write_moves_counts_not_data(self):
+        # test_server pins that a counts write leaves the snapshot's data version
+        # alone; the state body names its boards from ws_counts, so the content
+        # key still moves (counts_seq), and the state cache invalidates.
+        data_before, content_before = self.store.data_seq, self.store.content_key
         self.store.set_ws_counts([{"ws": "WS1", "name": "one", "done": 2}])
-        self.assertGreater(self.store.data_seq, before)
+        self.assertEqual(self.store.data_seq, data_before)
+        self.assertNotEqual(self.store.content_key, content_before)
 
     def test_state_key_survives_cursor_churn_and_moves_on_rows(self):
         now = time.time()

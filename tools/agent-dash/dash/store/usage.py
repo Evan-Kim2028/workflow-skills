@@ -192,8 +192,7 @@ class UsageMixin:
                     self._conn.execute("ROLLBACK")
                     raise
                 self._seq += 1
-                self._data_seq += 1
-                self._note_data_write()
+                self._counts_seq += 1
         def query_usage(
             self,
             group: str,
