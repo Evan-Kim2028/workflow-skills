@@ -1049,8 +1049,10 @@ def _count(totals: Totals, e: Entry, m, *, keep: str | None = None) -> None:
     if raw_tok:
         bucket = totals.tokens_by_kind.setdefault(e.kind, {"messages": 0, "input": 0, "output": 0, "cache_read": 0})
         for key in ("messages", "input", "output", "cache_read"):
-            totals.tokens[key] += raw_tok.get(key, 0)
             bucket[key] += raw_tok.get(key, 0)
+            # A session file repeats the stream's assistant messages: never add it to the total.
+            if e.kind != "session":
+                totals.tokens[key] += raw_tok.get(key, 0)
     if getattr(m, "raw_tokens", None) is not None and m.raw_tokens != m.stripped_tokens:
         totals.tokens_match = False
     if keep:

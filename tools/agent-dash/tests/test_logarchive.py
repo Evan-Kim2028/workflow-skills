@@ -407,6 +407,20 @@ class PipelineTest(unittest.TestCase):
         self.assertFalse(opts["apply"])
 
 
+class TokenTotalTest(unittest.TestCase):
+    def test_session_rows_are_listed_by_kind_but_not_added_to_the_total(self):
+        totals = la.Totals()
+        counts = {"messages": 2, "input": 10, "output": 4, "cache_read": 7}
+        m = mock.Mock(raw_bytes=100, stripped_bytes=100, zst_bytes=10, replaced=0, raw_tokens=counts, stripped_tokens=counts)
+        for kind, tool in (("stream", "pi"), ("session", "pi-session")):
+            e = la.Entry(path="p", root="r", rel="p", ws="w", label="l", kind=kind, size=100,
+                         mtime_ns=0, mtime=0.0, outdir="o", tool=tool)
+            la._count(totals, e, m, keep=None)
+        self.assertEqual(totals.tokens, {"messages": 2, "input": 10, "output": 4, "cache_read": 7})
+        self.assertEqual(totals.tokens_by_kind["session"]["messages"], 2)
+        self.assertEqual(totals.tokens_by_kind["stream"]["messages"], 2)
+
+
 class ExcludeAndMarkerTest(unittest.TestCase):
     """--exclude GLOB against the root-relative path, and the hub-wide running/ refusal."""
 
