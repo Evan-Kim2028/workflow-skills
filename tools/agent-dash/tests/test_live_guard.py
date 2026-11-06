@@ -70,5 +70,18 @@ class LiveGuardTest(unittest.TestCase):
                 guard.stop()
 
 
+class GuardRestoresToolPortTest(unittest.TestCase):
+    def test_stop_resets_the_port_main_copied_into_the_module(self):
+        import agent_dash
+
+        guard = Guard()
+        guard.start()
+        try:
+            agent_dash.PORT = 54321
+        finally:
+            guard.stop()
+        self.assertEqual(agent_dash.PORT, LIVE_PORT)
+
+
 if __name__ == "__main__":
     unittest.main()
