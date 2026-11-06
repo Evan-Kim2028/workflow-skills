@@ -1,0 +1,94 @@
+{
+ "cold_diff_control_vs_remove": {
+  "run_rows_only_in_control": [
+   [
+    "pi:01a185ca-206c-758b-bea1-ca6ae9347038:ws19-plan-slab-ledger-r2",
+    "pi",
+    "died_early",
+    null,
+    "deepseek",
+    "river/deepseek-ai/DeepSeek-V4.1-Flash-1017",
+    "01a185ca-206c-758b-bea1-ca6ae9347038",
+    "ws19-plan-slab-ledger-r2"
+   ]
+  ],
+  "usage_rows_differ": false
+ },
+ "commandcode_crash_path": {
+  "cold_equal_to_before": {
+   "control": true,
+   "remove": false,
+   "stripped": true,
+   "stub": false
+  },
+  "fixture": "real cmd folder helius-burn-20261106/cmd, cmd-sessions.tsv removed, running/<label> pid 999999 (dead)",
+  "rows_before": {
+   "control": 19,
+   "remove": 19,
+   "stripped": 19,
+   "stub": 19
+  },
+  "rows_lost_on_cold": {
+   "control": [],
+   "remove": [
+    "commandcode:8ca40e97-baea-4f95-bda5-b12c8ff7dd55:hub-exec-helius-docs"
+   ],
+   "stripped": [],
+   "stub": [
+    "commandcode:8ca40e97-baea-4f95-bda5-b12c8ff7dd55:hub-exec-helius-docs"
+   ]
+  }
+ },
+ "decision": {
+  "cmd": "stripped",
+  "codex": "remove",
+  "other": "stripped",
+  "out": "stripped",
+  "pi": "stripped",
+  "pi-session": "remove"
+ },
+ "note": "The control's incremental column is not comparable (first poll not converged in the crash script); cold equality is the test.",
+ "options": {
+  "control": {
+   "baseline_digest": "fbe346d2435d9ffe",
+   "cold_equal": true,
+   "incremental_equal": true,
+   "raw_bytes": 1335997352,
+   "runs": 706,
+   "stream_bytes_left_at_path": 1335997352,
+   "tokens_equal": true,
+   "usage_rows": 46527
+  },
+  "remove": {
+   "baseline_digest": "fbe346d2435d9ffe",
+   "cold_equal": false,
+   "incremental_equal": true,
+   "raw_bytes": 1335997352,
+   "runs": 706,
+   "stream_bytes_left_at_path": 0,
+   "tokens_equal": true,
+   "usage_rows": 46527
+  },
+  "stripped": {
+   "baseline_digest": "fbe346d2435d9ffe",
+   "cold_equal": true,
+   "incremental_equal": true,
+   "raw_bytes": 1335997352,
+   "runs": 706,
+   "stream_bytes_left_at_path": 1321425017,
+   "tokens_equal": true,
+   "usage_rows": 46527
+  },
+  "stub": {
+   "baseline_digest": "fbe346d2435d9ffe",
+   "cold_equal": false,
+   "incremental_equal": true,
+   "raw_bytes": 1335997352,
+   "runs": 706,
+   "stream_bytes_left_at_path": 128661,
+   "tokens_equal": true,
+   "usage_rows": 46527
+  }
+ },
+ "what": "log_keep_eval.py --kinds cmd,codex,out --limit 8 --max-folder-mb 5 (real outdirs, real pollers: manifests, commandcode, pi, generic; roots isolated to empty dirs)"
+}

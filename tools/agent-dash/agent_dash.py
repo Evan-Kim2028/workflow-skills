@@ -119,6 +119,7 @@ USAGE = """agent-dash: local read-only execution dashboard
   python3 agent_dash.py lead-profile <session-id|--ws ID> [--json]
   python3 agent_dash.py worktrees reap --repo <path> [--apply] [--skip <path-or-branch>] [--min-age <dur>] [--json]
   python3 agent_dash.py lanes live [--json]
+  python3 agent_dash.py logs archive [--root P]... [--ws ID] [--exclude GLOB]... [--min-idle-hours 3] [--keep remove|stub|stripped] (default: per tool) [--apply]
   python3 agent_dash.py scratch gc [--older-than-days 7] [--apply] [--json]
   python3 agent_dash.py scratch status [--top N] [--json]
 
@@ -442,6 +443,13 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_worktrees(args[1:])
     if cmd == "lanes":
         return cmd_lanes(args[1:])
+    if cmd == "logs":
+        if len(args) < 2 or args[1] != "archive":
+            print(USAGE, end="", file=sys.stderr)
+            return 2
+        from dash import logarchive
+
+        return logarchive.main(args[2:])
     if cmd == "scratch":
         from dash.scratchgc import cmd_scratch
 
