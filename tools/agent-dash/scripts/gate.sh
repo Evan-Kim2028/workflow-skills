@@ -43,7 +43,8 @@ if ! COMMITTED=$(git diff --name-only "$BASE" -- 2>/dev/null); then
     echo "gate: unknown base ref '$BASE'" >&2
     exit 2
 fi
-UNTRACKED=$(git ls-files --others --exclude-standard 2>/dev/null)
+# Untracked *.bak* files are local backups, never a change to test.
+UNTRACKED=$(git ls-files --others --exclude-standard 2>/dev/null | awk '!/\.bak/')
 CHANGED=$(printf '%s\n%s\n' "$COMMITTED" "$UNTRACKED" | sed '/^[[:space:]]*$/d' | sort -u)
 
 WARN_FILE=$(mktemp) || exit 2
@@ -51,7 +52,28 @@ TEST_FILE=$(mktemp) || exit 2
 trap 'rm -f "$WARN_FILE" "$TEST_FILE"' EXIT INT TERM
 
 printf '%s\n' "$CHANGED" | python3 -c '
-import fnmatch, json, os, sys
+import json, os, re, sys
+
+def glob_match(pattern, path):
+    """`*` and `?` stay inside one path segment; `**` crosses directories.
+
+    fnmatch let `*` match `/`, so `dash/store*.py` selected store files and
+    `static/*` selected every static subdirectory by accident.
+    """
+    out, i = [], 0
+    while i < len(pattern):
+        if pattern.startswith("**/", i):
+            out.append("(?:.*/)?")
+            i += 3
+            continue
+        if pattern.startswith("**", i):
+            out.append(".*")
+            i += 2
+            continue
+        c = pattern[i]
+        out.append("[^/]*" if c == "*" else "[^/]" if c == "?" else re.escape(c))
+        i += 1
+    return re.match("".join(out) + "$", path) is not None
 
 tools = os.getcwd()
 with open("scripts/gate_map.json", encoding="utf-8") as fh:
@@ -69,7 +91,7 @@ for path in (line.strip() for line in sys.stdin):
     rel = path[len(prefix):] if path.startswith(prefix) else path
     hits = set()
     for pattern, tests in patterns.items():
-        if fnmatch.fnmatchcase(rel, pattern):
+        if glob_match(pattern, rel):
             hits.update(tests)
     base = os.path.basename(rel)
     if rel.startswith("tests/") and base.startswith("test_") and base.endswith(".py"):

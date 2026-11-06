@@ -22,21 +22,21 @@ Robustness audit items 1–3 and 5–11 are done on main:
 
 - Per-source watchdog + lag: a hung source no longer stalls the rest; `health` carries `last_duration_s` and `lag_s` (`dash/sources/__init__.py:48,125,193`, `Registry` at `:56`).
 - Bounded scans: tick budgets with skipped-by-budget counts (`dash/sources/cursor.py:306-324`).
-- Offset pruning + backup rotation: `Store.prune_offsets` (`dash/store.py:236`).
-- Snapshot cost: usage computed once per snapshot, not once per scope (`dash/store.py:1339,1437,1462`, cached via `_usage_by_run` at `:2730`).
-- Snapshot cache between writes + freshness surfacing: `snapshot_cached` (`dash/store.py:1390`) served per tick with `last_data_ts`/`last_poll` (`dash/server.py:293,459`); page shows a `stale` badge (`static/index.html:339,348`) and a request-failed banner (`static/index.html:727-736`).
+- Offset pruning + backup rotation: `Store.prune_offsets` (`dash/store/base.py:221`).
+- Snapshot cost: usage computed once per snapshot, not once per scope (`dash/store/summarize.py:83,300,349`, cached via `_usage_by_run` at `dash/store/usage.py:918`).
+- Snapshot cache between writes + freshness surfacing: `snapshot_cached` (`dash/store/summarize.py:223`) served per tick with `last_data_ts`/`last_poll` (`dash/server.py:293,459`); page shows a `stale` badge (`static/index.html:339,348`) and a request-failed banner (`static/index.html:727-736`).
 - Unpriced-model alert: `/api/health` lists `unpriced_models` (`dash/server.py:141-144`); missing catalog rows priced.
 - Truncation surfaced: finished-section subtitle reads "Newest N of M" from `finished_in_range` (`static/index.html:2281-2290`).
 - Disconnects silenced and counted: `disconnects_1h` on `/api/health` (`dash/server.py:79,140`), no tracebacks.
 - Plan-write locking: per-bundle `fcntl` lock across read-modify-write (`dash/bundles.py:383`; documented in `CONTRACT.md:348`).
 - Validate on read: `/api/plan` and `/api/bundle` attach `issues` instead of drawing bad states as tasks (`dash/bundles.py:264,340`, `validate_bundle` at `:1050`).
-- Unseen-worker check + safe restart: the reconcile check flags live-but-invisible workers (`dash/store.py:1553`); `restart`/`stop` wait for real exit so the next `run` can bind (`agent_dash.py:286,361`; see "Install and run" in `integrate.md`).
-- `process_samples(run_id)` index: `idx_samples_run` (`dash/store.py:2231`).
+- Unseen-worker check + safe restart: the reconcile check flags live-but-invisible workers (`dash/store/running.py:782`); `restart`/`stop` wait for real exit so the next `run` can bind (`agent_dash.py:286,361`; see "Install and run" in `integrate.md`).
+- `process_samples(run_id)` index: `idx_samples_run` (`dash/store/base.py:476`).
 
 Agent-friendly CLI items are done on main:
 
 - One-call state: `GET /api/state` (`dash/server.py:151`, handler `_state` at `:174`) via `state` (`agent_dash.py:441`).
-- Always-on doctor with history: `DoctorScheduler` runs the checks in a background thread (`dash/doctor.py:1474`, `run_once` at `:1507`) and persists each run in the `doctor_problems` table (`dash/store.py:2199`, writes at `:2428-2495`). `GET /api/doctor` serves the latest run and never checks inline (`dash/server.py:149,198`).
+- Always-on doctor with history: `DoctorScheduler` runs the checks in a background thread (`dash/doctor.py:1474`, `run_once` at `:1507`) and persists each run in the `doctor_problems` table (`dash/store/base.py:440`, writes at `dash/store/base.py:636-705`). `GET /api/doctor` serves the latest run and never checks inline (`dash/server.py:149,198`).
 - Doctor CLI: `doctor` (`agent_dash.py:507`), `doctor --fix` dry run and `--yes` apply of the safe fixes (`agent_dash.py:54,632,657`), `doctor report` digest (`agent_dash.py:55`, `dash/doctor.py:1903`).
 - Doctor in the launch path: `run_worker.py` runs a preflight before launching, unless `--no-preflight` (`scripts/run_worker.py:65,154`); `workflows/ws-wave.js` runs a doctor gate that stops the wave on a critical problem (`workflows/ws-wave.js:60-73`).
 - Problem pages: one page per problem code under `docs/problems/` (32 files).
@@ -53,8 +53,8 @@ Orchestration tooling is done on main:
 
 Run and attribution items are done on main:
 
-- Run aliases: a merged cursor row stays merged across restarts. `run_aliases` table (`dash/store.py:2194`), the merge writes alias to target (`:1150`), lookups follow the alias (`:1047-1053`), and existing databases gain the table on open (`:2255`).
-- Production jobs are a count, never a list, in the agent areas: `is_prod_job_run` (`dash/store.py:3262`) keeps them out of the running and recent lists (`:1323,1331,1811`); `counts.prod_jobs_finished` (`dash/store.py:1690-1720`); the page shows the counts (`static/index.html:766-767`).
+- Run aliases: a merged cursor row stays merged across restarts. `run_aliases` table (`dash/store/base.py:435`), the merge writes alias to target (`dash/store/runs.py:577`), lookups follow the alias (`dash/store/runs.py:418-424`), and existing databases gain the table on open (`dash/store/base.py:559`).
+- Production jobs are a count, never a list, in the agent areas: `is_prod_job_run` (`dash/store/util.py:295`) keeps them out of the running and recent lists (the snapshot path applies the same rule inline at `dash/store/summarize.py:1046`); `counts.prod_jobs_finished` (`dash/store/summarize.py:1363-1393`); the page shows the counts (`static/index.html:766-767`).
 - Generic reporting path: `agent_dash.py report` (`agent_dash.py:250` dispatch, `cmd_report` at `:937`) appends to `generic.jsonl`, read by the generic source (`dash/sources/generic.py:31,34`).
 - Workflow workers are visible wherever their run folder lives: registered run folders (`dash/rundirs.py:8` `run-dirs.txt`, `registered_run_dirs` at `:66`) are scanned with the configured roots (`:107-120`), and `/api/health` reports `scratch_roots`, `run_dirs`, and `warnings` (`dash/rundirs.py:157`; test `tests/test_server.py:470`).
 - Source tests no longer read the machine's run-folder registry: `_registry_configured` reads it only when a state dir is named (`dash/rundirs.py:142-155`).
@@ -75,7 +75,7 @@ Module split S-store is done: `dash/store.py` (~3.7k lines) is now the package `
 
 ## Phase 1 — module split (lands before the visual pass)
 
-The page is one large inline script and `dash/store.py` is one
+The page is one large inline script and `dash/store.py` was one
 ~3.7k-line file. Split both behind stable APIs first, moving code
 verbatim with zero behavior change, so later visual and store work has
 small files with one writer each. No DOM-id, `data-*`, API-shape, or
@@ -92,9 +92,9 @@ Dependencies: F-core before F-cards. After: none. Parallel: F-core and S-store r
 
 - **Startup grace.** Landed: a source that never completed a poll (and recorded no failure) reports `starting`, not stalled, until max(3x its interval, 90 s) after process start; `health.ok` stays true while starting and neither reconcile nor doctor flags it. Proof: `dash/sources/__init__.py:37` (`START_GRACE_S`), `:251` (`source_state`), `:237` (`has_completed_poll`, also used by the doctor scheduler at `dash/doctor.py:1605`), `tests/test_poll_budgets.py` (`RestartGraceTests`: slow first scan is starting-then-ok, grace boundaries, first-poll error still `error`), `tests/test_doctor.py` (starting source emits no `source-stalled`). Note: `dash/liveness.py:49` (`stale_grace_s`) is the dead-pid grace, not a startup grace; it does not cover this. After: none. Parallel: yes.
 - **Workstream inheritance for leads and helpers.** Goal: a lead session and its helper runs get the lead's workstream (inferred from the worktree path or bundle writes) instead of landing unassigned. Touch: `dash/attribution.py`, one source or matcher, `tests/test_attribution.py`. Accept: synthetic lead + helper fixtures attribute to the lead's workstream; existing label-regex behavior unchanged. After: none. Parallel: yes.
-- **Retention + checkpoint policy.** Goal: bound `runs`, `usage_events`, `usage_buckets`, `sessions`, and the seen-set beyond N days (default 90); checkpoint on idle; document the policy in `CONTRACT.md`. Touch: `dash/store.py` (or the `summarize` concern after Phase 1), `agent_dash.py`, `CONTRACT.md`, `tests/test_store.py`. Accept: time-travel test asserts old rows gone and DB size bounded; `check` green. After: Phase 1 if it touches snapshot paths (coordinate or land after). Parallel: yes, except against S-store. Status: no retention code on this branch yet.
+- **Retention + checkpoint policy.** Goal: bound `runs`, `usage_events`, `usage_buckets`, `sessions`, and the seen-set beyond N days (default 90); checkpoint on idle; document the policy in `CONTRACT.md`. Touch: `dash/store/summarize.py` (after Phase 1), `agent_dash.py`, `CONTRACT.md`, `tests/test_store.py`. Accept: time-travel test asserts old rows gone and DB size bounded; `check` green. After: Phase 1 if it touches snapshot paths (coordinate or land after). Parallel: yes, except against S-store. Status: no retention code on this branch yet.
 - **Dagster slowness visibility.** Landed: a poll that returns after more than 15 s reports state `slow` (counted in `health.slow_sources`, still ok) and doctor warns `source-slow` (`docs/problems/source-slow.md`); full-active-page close-out skips are counted in `health.dagster.skipped_closeouts` with a doctor warn `dagster-closeout-skipped` (`docs/problems/dagster-closeout-skipped.md`). Proof: `dash/sources/__init__.py:40` (`SLOW_AFTER_S`), `:194` (`slow_sources`), `dash/sources/dagster.py:94` (`health_extra`), `:181` (skip count), `dash/doctor.py:312,340` (warn checks), `tests/test_dagster.py` (full page counts skips in health, 16 s poll is slow-not-error, skips raise the doctor warn), `tests/test_doctor.py` (slow and closeout-skipped warn problems). After: none. Parallel: yes.
-- **Clock-skew and evidence-age invariants.** Goal: flag `ended_at < started_at`, future starts, usage far outside run bounds, per-source freshness drift, and run-count drops between polls. Touch: `dash/store.py` (or `summarize` concern), `agent_dash.py check`, one new test file. Accept: synthetic skewed fixtures fail `check` with named rows. After: Phase 1 preferred. Parallel: yes. Status: no skew checks on this branch yet.
+- **Clock-skew and evidence-age invariants.** Goal: flag `ended_at < started_at`, future starts, usage far outside run bounds, per-source freshness drift, and run-count drops between polls. Touch: `dash/store/summarize.py`, `agent_dash.py check`, one new test file. Accept: synthetic skewed fixtures fail `check` with named rows. After: Phase 1 preferred. Parallel: yes. Status: no skew checks on this branch yet.
 - **Privacy pin test.** Goal: a test asserting no prompt/argv/env/secret field appears in any endpoint payload. Touch: `tests/test_server.py` (or one new file). Accept: new test green; `sh scripts/privacy_audit.sh` from the repo root stays clean. After: none. Parallel: yes.
 
 ## Phase 3 — v2 visual build (after Phase 1; spec approval pending)
@@ -107,7 +107,7 @@ Builds [design-v2.md](design-v2.md).
 - **V-timeline.** Lanes by family with `N runs` labels; **draws every run in the window, never a sample** (parent review requirement); running bars reach the now-rule. Touch: timeline card file. Accept: fixture with more runs than any cap renders all of them; `check --page` green.
 - **V-rows + plan map.** Two-line where-we-are rows, ws-card meta split, always-visible plan legend row, arrows-on-focus chip tracing. Touch: ws-cards + plan-progress files. Accept: spec mockup parity by eyeball; `check --page` green.
 - **V-responsive.** Phone rules (no horizontal scroll, essential columns, 2-up tiles, stacked charts/maps, ≥36px targets), drawer focus contract, `aria-busy` + section min-heights. Touch: tables/drawer/shell files, tokens. Accept: `check --page` green; 390px eyeball check.
-- **`prev_24h` snapshot field.** Goal: `GET /api/snapshot` (and `/api/state` rollup) gains `prev_24h: {tokens, cost_usd, finished, live_agents}` — exact rolling values from 24 h ago so deltas match headlines to the digit and the live-agent delta survives retention changes. Touch: `dash/store.py` (or `summarize` concern), `dash/server.py`, `tests/test_server.py`. Accept: totals equal a recomputed rolling window on fixtures; sparkline tooltips label bucket vs rolling. After: retention (Phase 2) must not break it — land after or together. Parallel: yes, except against retention.
+- **`prev_24h` snapshot field.** Goal: `GET /api/snapshot` (and `/api/state` rollup) gains `prev_24h: {tokens, cost_usd, finished, live_agents}` — exact rolling values from 24 h ago so deltas match headlines to the digit and the live-agent delta survives retention changes. Touch: `dash/store/summarize.py`, `dash/server.py`, `tests/test_server.py`. Accept: totals equal a recomputed rolling window on fixtures; sparkline tooltips label bucket vs rolling. After: retention (Phase 2) must not break it — land after or together. Parallel: yes, except against retention.
 
 Dependencies: V-tokens before V-tiles/V-charts; `prev_24h` after retention. Parallel: V-timeline, V-rows, V-responsive run beside each other once V-tokens lands.
 
