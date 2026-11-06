@@ -87,6 +87,8 @@ option is applied to every stream and session file with the archive's own
 - **incremental**: the same store is polled to convergence before and after the change. Nothing may be re-counted.
 - **cold**: a fresh store, in a separate process, polled to convergence over the changed files. Must match the baseline.
 
+Result file: `docs/log-archive-keep-eval.json` (the 791 MB run).
+
 Compared: every run row (`run_id`, source, status, verdict, tier, model, session,
 label) and every usage row (tokens by run and message id). Wall-clock fields are
 excluded because `ended_at` for a running run follows the clock.

@@ -1,0 +1,138 @@
+{
+ "control": {
+  "after_totals": {
+   "cache_read": 144612264,
+   "cache_write": 1652191,
+   "input": 4786705,
+   "output": 1160199,
+   "runs": 115,
+   "usage_rows": 3393
+  },
+  "baseline": {
+   "digest": "6408be8459d5401e",
+   "runs": 115,
+   "usage_rows": 3393
+  },
+  "cold_equal": true,
+  "incremental_equal": true,
+  "mutate": {
+   "files": 310,
+   "raw_bytes": 1980644961,
+   "rounds_after": 2,
+   "rounds_before": 3,
+   "scratch_bytes_after": 1980644961
+  },
+  "statuses": {
+   "done": 115
+  },
+  "tokens_equal": true,
+  "verdicts": {
+   "BLOCKED": 2,
+   "None": 12,
+   "PARTIAL": 35,
+   "PASS": 66
+  }
+ },
+ "remove": {
+  "after_totals": {
+   "cache_read": 144612264,
+   "cache_write": 1652191,
+   "input": 4786705,
+   "output": 1160199,
+   "runs": 115,
+   "usage_rows": 3393
+  },
+  "baseline": {
+   "digest": "6408be8459d5401e",
+   "runs": 115,
+   "usage_rows": 3393
+  },
+  "cold_equal": true,
+  "incremental_equal": true,
+  "mutate": {
+   "files": 310,
+   "raw_bytes": 1980644961,
+   "rounds_after": 2,
+   "rounds_before": 3,
+   "scratch_bytes_after": 2220919
+  },
+  "statuses": {
+   "done": 115
+  },
+  "tokens_equal": true,
+  "verdicts": {
+   "BLOCKED": 2,
+   "None": 12,
+   "PARTIAL": 35,
+   "PASS": 66
+  }
+ },
+ "stripped": {
+  "after_totals": {
+   "cache_read": 144612264,
+   "cache_write": 1652191,
+   "input": 4786705,
+   "output": 1160199,
+   "runs": 115,
+   "usage_rows": 3393
+  },
+  "baseline": {
+   "digest": "6408be8459d5401e",
+   "runs": 115,
+   "usage_rows": 3393
+  },
+  "cold_equal": true,
+  "incremental_equal": true,
+  "mutate": {
+   "files": 310,
+   "raw_bytes": 1980644961,
+   "rounds_after": 2,
+   "rounds_before": 3,
+   "scratch_bytes_after": 1062025733
+  },
+  "statuses": {
+   "done": 115
+  },
+  "tokens_equal": true,
+  "verdicts": {
+   "BLOCKED": 2,
+   "None": 12,
+   "PARTIAL": 35,
+   "PASS": 66
+  }
+ },
+ "stub": {
+  "after_totals": {
+   "cache_read": 144612264,
+   "cache_write": 1652191,
+   "input": 4786705,
+   "output": 1160199,
+   "runs": 115,
+   "usage_rows": 3393
+  },
+  "baseline": {
+   "digest": "6408be8459d5401e",
+   "runs": 115,
+   "usage_rows": 3393
+  },
+  "cold_equal": true,
+  "incremental_equal": true,
+  "mutate": {
+   "files": 310,
+   "raw_bytes": 1980644961,
+   "rounds_after": 2,
+   "rounds_before": 3,
+   "scratch_bytes_after": 2317409
+  },
+  "statuses": {
+   "done": 115
+  },
+  "tokens_equal": true,
+  "verdicts": {
+   "BLOCKED": 2,
+   "None": 12,
+   "PARTIAL": 35,
+   "PASS": 66
+  }
+ }
+}
