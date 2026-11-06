@@ -18,6 +18,15 @@ Read-only on sources: the source repo is only read (``rev-parse``,
 ever written. Fetching is deliberately left out: deploy uses the ref
 as it currently resolves, so run ``git fetch`` first when the latest
 upstream commit is wanted.
+
+Gitignored local overrides (``LOCAL_FILES``: ``config.local.json``,
+``workers.local.json``, ``map.local.json``, ``plans.local.json``,
+``static/taskmap.local.json``) are not in git, so a clean release has
+none of them. ``link_local_files`` symlinks each one that exists in the
+source checkout into the release before the gate and before any
+restart, so the release reads the owner's files and a later local edit
+takes effect without a redeploy. Links, never copies; a missing source
+file is skipped.
 """
 
 from __future__ import annotations
@@ -41,6 +50,16 @@ GATE_TIMEOUT_S = 900.0
 RESTART_TIMEOUT_S = 150.0
 CHECK_TIMEOUT_S = 300.0
 HEALTH_POLL_S = 0.5
+# Gitignored local overrides read from the tool dir (see dash/locate.py
+# layered_path and agent_dash.py load_cfg). phases.local.json and the
+# state-dir config.local.json live in the state dir and need no link.
+LOCAL_FILES = (
+    "config.local.json",
+    "workers.local.json",
+    "map.local.json",
+    "plans.local.json",
+    "static/taskmap.local.json",
+)
 
 
 class DeployError(Exception):
@@ -207,6 +226,45 @@ def tool_dir_of(release: Path | str) -> Path:
     if (nested / "agent_dash.py").is_file():
         return nested
     return release
+
+
+def link_local_files(release: Path | str, source: Path | str) -> list[str]:
+    """Symlink each ``LOCAL_FILES`` entry from ``source`` into ``release``.
+
+    Returns the names linked. A source file that is missing is skipped;
+    a stale link is repointed, and a link whose source has gone is left
+    alone (never deleted, so a release never falls back to the example
+    registry by accident). A regular file already in the release raises
+    ``DeployError``: it would shadow the owner's file. Under
+    ``AGENT_DASH_IGNORE_LOCAL`` (tests) nothing is linked.
+    """
+    from dash.locate import ignore_local
+
+    if ignore_local():
+        return []
+    rel_tool = tool_dir_of(release).resolve()
+    src_tool = tool_dir_of(source).resolve()
+    if rel_tool == src_tool:
+        return []
+    linked = []
+    for name in LOCAL_FILES:
+        origin = src_tool / name
+        if not origin.is_file():
+            continue
+        dest = rel_tool / name
+        if dest.is_symlink():
+            if os.readlink(dest) == str(origin):
+                linked.append(name)
+                continue
+        elif dest.exists():
+            raise DeployError(
+                f"release file {dest} is a real file, not a link to {origin}. "
+                f"Move it aside and re-run: python3 agent_dash.py deploy"
+            )
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        _set_link(dest, origin)
+        linked.append(name)
+    return linked
 
 
 def _scrubbed_env() -> dict:
@@ -392,6 +450,7 @@ def deploy(
     state_dir = Path(state_dir)
     try:
         release, sha, expected = ensure_release(repo, ref, state_dir, worktree)
+        link_local_files(release, repo)
     except DeployError as exc:
         return False, str(exc)
     prev = current_release(state_dir)
