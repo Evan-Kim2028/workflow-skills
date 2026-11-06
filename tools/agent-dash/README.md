@@ -129,13 +129,11 @@ A Codex run shows on the dashboard as one run row
 finish line with the verdict; `parent_session_id` links it to the lead
 session that launched it.
 
-`scripts/run_worker.py` launches the `codex-luna` (kind `codex`, cap 3)
-and `pi-deepseek-flash` (kind `pi`, `river/deepseek-ai/DeepSeek-V4.1-Flash-1017`,
-cap 5) registry tiers through these launchers, and the `auto` fallback
-order is `muse` -> `glm-flash` -> `codex-luna` -> `pi-deepseek-flash`:
-a tier that hits its quota patterns (or whose launcher writes its
-`QUOTA` marker) cools down for `cooldown_minutes` and the next tier
-takes the launch.
+`scripts/run_worker.py` launches registry tiers through these launchers, such as
+`codex-luna` (kind `codex`) and `pi-deepseek-flash` (kind `pi`). `workers.example.json`
+is the single reference for tiers, caps, models and `auto_order`. `auto` skips a tier
+whose model has no catalog price. A tier that hits its quota patterns (or whose launcher
+writes its `QUOTA` marker) cools down for `cooldown_minutes` and the next tier takes the launch.
 
 ## Hooks
 

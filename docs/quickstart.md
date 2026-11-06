@@ -166,7 +166,7 @@ realpath ~/.claude/tools/agent-dash/scripts/run_worker.sh
 realpath ~/.claude/tools/agent-dash/agent_dash.py
 ```
 
-Create the scratch directory the collectors scan. The shipped config treats each directory directly under `$HOME/agent-scratch/` as a scratch root. `run_worker.sh` appends `muse-sessions.tsv` or `cursor-sessions.tsv` in the run directory, and the collectors read that file when it sits on a scratch root.
+Create the scratch directory the collectors scan. The shipped config treats each directory directly under `$HOME/agent-scratch/` as a scratch root. `run_worker.sh` appends `muse-sessions.tsv` (or another `<name>-sessions.tsv` manifest) in the run directory, and the collectors read that file when it sits on a scratch root.
 
 ```bash
 mkdir -p "$HOME/agent-scratch/notes"
