@@ -44,6 +44,12 @@ class BaseMixin:
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute("PRAGMA synchronous=NORMAL")
             self._conn.execute("PRAGMA busy_timeout=5000")
+            # The default SQLite page cache is only 2 MiB. The dashboard's
+            # hot reads repeatedly touch the usage table and its indexes;
+            # retain a useful working set so aggregate requests don't churn
+            # through the same pages on every poll. This is a per-connection
+            # ceiling (64 MiB), not a preallocation.
+            self._conn.execute("PRAGMA cache_size=-65536")
             self._seq = 0
             self._data_seq = 0
             self._view_seq = 0

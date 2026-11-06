@@ -186,7 +186,8 @@
        Planned/Archive pill counts. Both are best-effort on older servers. */
     var projP = api("/api/project", {}).then(function (j) { state.project = (j && typeof j === "object") ? j : {name: null}; state.actionsArchive = !!(j && j.actions && j.actions.archive); }).catch(function () { state.project = {name: null}; state.actionsArchive = false; });
     var allP = api("/api/workstreams", {since: since(), state: "all"}).then(function (j) { state.wssAll = j.workstreams || []; }).catch(function () { state.wssAll = []; });
-    navInflight = Promise.all([bundlesP, wsP, projP, allP]).then(function () { renderTabs(); applyChrome(); resolveLanding(); }).then(function () { navInflight = null; lastNavDone = Date.now(); }, function () { navInflight = null; });
+    var healthP = api("/api/health", {}).then(function (j) { state.health = (j && typeof j === "object") ? j : null; }).catch(function () { state.health = null; });
+    navInflight = Promise.all([bundlesP, wsP, projP, allP, healthP]).then(function () { renderTabs(); applyChrome(); resolveLanding(); updateStale(); }).then(function () { navInflight = null; lastNavDone = Date.now(); }, function () { navInflight = null; });
     return navInflight;
   }
   /* First-load default view, once per page load: Project home when the
@@ -230,7 +231,7 @@
     try {
       return snapSig(state.snap, RUN_CLOCKS) + "\u0000" + JSON.stringify([
         state.archive, state.approvals, state.bundles,
-        state.wss, state.project, state.plans
+        state.wss, state.wssAll, state.project, state.plans
       ]);
     } catch (e) { return null; }
   }
@@ -358,14 +359,32 @@
     var badge = document.getElementById("stale-badge");
     var txt = document.getElementById("live-txt");
     if (!badge || !txt) return;
-    if (!state.lastSeqChange) { badge.hidden = true; return; }
     nowS = nowS || Date.now() / 1000;
-    var seqAge = nowS - state.lastSeqChange;
-    var pollAge = state.lastPoll == null ? 0 : nowS - state.lastPoll;
-    var stale = seqAge > STALE_AFTER_S && (state.lastPoll == null || pollAge > STALE_AFTER_S);
-    badge.hidden = !stale;
-    if (stale) txt.textContent = "stale";
-    else if (txt.textContent === "stale") txt.textContent = "live";
+    var stale = false;
+    if (state.lastSeqChange) {
+      var seqAge = nowS - state.lastSeqChange;
+      var pollAge = state.lastPoll == null ? 0 : nowS - state.lastPoll;
+      stale = seqAge > STALE_AFTER_S && (state.lastPoll == null || pollAge > STALE_AFTER_S);
+    }
+    var delayed = ((state.health && state.health.sources) || []).filter(function (s) {
+      return s && (s.state === "slow" || s.state === "error" || s.state === "stalled");
+    });
+    badge.hidden = !stale && !delayed.length;
+    if (stale) {
+      badge.textContent = "stale";
+      txt.textContent = "stale";
+    } else {
+      if (delayed.length) {
+        badge.textContent = "" + delayed.length + " source" + (delayed.length === 1 ? "" : "s") + " delayed";
+        badge.title = delayed.map(function (s) {
+          var lag = s.lag_s == null ? "no recent poll" : "last poll " + Math.round(s.lag_s) + "s ago";
+          return s.name + " · " + (s.last_error || lag);
+        }).join("\n");
+      } else {
+        badge.title = "";
+      }
+      if (txt.textContent === "stale") txt.textContent = "live";
+    }
   }
   /* Tiles and chart come from one snapshot response: totals and usage buckets
      are applied together or not at all, so they can never disagree. */

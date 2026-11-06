@@ -817,10 +817,18 @@ class Handler(BaseHTTPRequestHandler):
             from dash.bundles import list_bundles as _list_bundles
 
             try:
-                kinds = {item.get("id"): item.get("kind") for item in (_list_bundles() or []) if isinstance(item, dict)}
+                bundles = [item for item in (_list_bundles() or []) if isinstance(item, dict)]
+                kinds = {item.get("id"): item.get("kind") for item in bundles}
+                titles = {item.get("id"): item.get("title") for item in bundles if item.get("title")}
             except Exception:
                 kinds = {}
+                titles = {}
             for row in rows:
+                # Legacy rollups may have an empty board name even though
+                # the bundle itself has a title. Project home uses these
+                # rows directly, so fall back to the canonical bundle title.
+                if not row.get("name"):
+                    row["name"] = titles.get(row.get("ws"), "")
                 if "progress" not in row:
                     row["progress"] = _row_progress(row.get("ws"))
                 # The page never offers an invalid button: every row names

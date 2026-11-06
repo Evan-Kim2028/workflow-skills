@@ -18,6 +18,15 @@
      "project" and a slot naming one of these renders inside it; the rest
      render as their own sections after the slots, in registry order. */
   var PROJECT_SLOTS = ["exec-burnup", "exec-phases", "exec-health", "exec-depgraph"];
+  var PROJECT_TOTALS_KEY = "agent-dash-project-total-scope";
+  function projectTotalsScope() {
+    try { return localStorage.getItem(PROJECT_TOTALS_KEY) === "all" ? "all" : "project"; }
+    catch (e) { return "project"; }
+  }
+  function setProjectTotalsScope(scope) {
+    try { localStorage.setItem(PROJECT_TOTALS_KEY, scope === "all" ? "all" : "project"); } catch (e) {}
+    if (typeof drawMain === "function" && state.view === "project") drawMain();
+  }
 
   /* Pure: the closing-report basename the archive payload exposes for one
      id, or null. The payload only ever carries the basename, never a path
@@ -109,15 +118,87 @@
     return c;
   }
 
-  /* The 24 h tiles, reused verbatim, plus the lifetime line (archived
-     work stays in the lifetime totals by construction). */
+  function projectTotals() {
+    var bundles = (state.bundles || []).filter(function (b) { return b && b.kind === "workstream" && b.id; });
+    var rows = state.wssAll;
+    if (!bundles.length || !Array.isArray(rows) || !rows.length) return {available: false, workstreams: bundles.length, loaded: 0};
+    var byId = {};
+    rows.forEach(function (w) { if (w && w.ws) byId[String(w.ws).toUpperCase()] = w; });
+    var picked = bundles.map(function (b) { return byId[String(b.id).toUpperCase()]; }).filter(Boolean);
+    /* A partial result would undercount the project while looking authoritative. */
+    if (picked.length !== bundles.length) return {available: false, workstreams: bundles.length, loaded: picked.length};
+    return picked.reduce(function (out, w) {
+      out.live_agents += +w.live_agents || 0;
+      out.finished_in_range += +w.finished_in_range || 0;
+      out.tokens += +w.tokens || 0;
+      out.cost_usd += +w.cost_usd || 0;
+      out.tokens_all_time += +w.tokens_all_time || 0;
+      out.cost_usd_all_time += +w.cost_usd_all_time || 0;
+      return out;
+    }, {available: true, workstreams: bundles.length, live_agents: 0, finished_in_range: 0, tokens: 0, cost_usd: 0, tokens_all_time: 0, cost_usd_all_time: 0});
+  }
+  function projectScopeTiles(totals) {
+    var grid = el("div", {class: "grid g-tiles pj-scope-tiles", "data-project-scope": "project"});
+    var metrics = totals.available ? [
+      ["Agents live now", fmtN(totals.live_agents), "Across configured workstreams"],
+      ["Agents finished (24 h)", fmtN(totals.finished_in_range), "Rolling 24 h"],
+      ["Tokens (24 h)", fmtN(totals.tokens), fmtN(totals.tokens_all_time) + " all time"],
+      ["Est. cost (24 h)", fmtUsd(totals.cost_usd), fmtUsd(totals.cost_usd_all_time) + " all time"]
+    ] : [["Project totals", "Unavailable", totals.workstreams ? "Loaded " + (totals.loaded || 0) + " of " + totals.workstreams + " configured workstreams" : "No configured workstreams are available"]];
+    metrics.forEach(function (m) {
+      var card = el("div", {class: "card tile pj-scope-tile"});
+      card.appendChild(el("div", {class: "l", text: m[0]}));
+      card.appendChild(el("div", {class: "v", text: m[1]}));
+      card.appendChild(el("div", {class: "x xline", text: m[2]}));
+      grid.appendChild(card);
+    });
+    return grid;
+  }
+  function projectScopeControl(scope) {
+    var wrap = el("div", {class: "pj-scope-control", role: "group", "aria-label": "Summary scope"});
+    [["project", "Project"], ["all", "All agents"]].forEach(function (entry) {
+      var b = el("button", {type: "button", "aria-pressed": String(scope === entry[0]), text: entry[1]});
+      b.addEventListener("click", function () { if (scope !== entry[0]) setProjectTotalsScope(entry[0]); });
+      wrap.appendChild(b);
+    });
+    return wrap;
+  }
+  /* Project mode sums exact configured bundle rows; All agents reuses the
+     existing dashboard-wide tiles, sparklines, and recent-run counts. */
   function tilesSection(snap) {
-    var c = el("div", {class: "card pj-tiles", "data-nav": "Last 24 hours"});
-    c.appendChild(secHead("Last 24 hours", "Rolling 24 h window, same fields as the execution tiles."));
-    c.appendChild(tiles(snap));
-    var all = (snap && snap.totals_all_time) || {};
-    var line = "Lifetime " + fmtN(ADC.billed(all.tokens || {})) + " tokens \u00B7 " + fmtUsd(all.cost_usd || 0) + " — archived work included";
-    c.appendChild(el("p", {class: "pj-note", text: line}));
+    var c = el("div", {class: "card pj-tiles", "data-nav": "Summary"});
+    var scope = projectTotalsScope();
+    var h = secHead("Summary", scope === "project" ? "Configured workstreams only." : "All dashboard agents, including unassigned activity.");
+    h.appendChild(projectScopeControl(scope));
+    c.appendChild(h);
+    if (scope === "project") c.appendChild(projectScopeTiles(projectTotals()));
+    else {
+      c.appendChild(tiles(snap));
+      var all = (snap && snap.totals_all_time) || {};
+      c.appendChild(el("p", {class: "pj-note", text: "All agents \u00b7 lifetime " + fmtN(ADC.billed(all.tokens || {})) + " tokens \u00b7 " + fmtUsd(all.cost_usd || 0) + "; archived work included"}));
+    }
+    return c;
+  }
+  function unassignedSection() {
+    var row = (state.wssAll || []).filter(function (w) { return w && String(w.ws).toLowerCase() === "unassigned"; })[0];
+    if (!row || (!(row.live_agents || 0) && !(row.finished_in_range || 0) && !(row.tokens || 0) && !(row.tokens_all_time || 0))) return null;
+    var c = el("div", {class: "card pj-unassigned", "data-nav": "Unassigned activity"});
+    c.appendChild(secHead("Unassigned activity", "Runs without a project workstream. Excluded from Project totals."));
+    var stats = el("div", {class: "pj-unassigned-stats"});
+    [
+      ["Live", fmtN(row.live_agents || 0)],
+      ["Finished (24 h)", fmtN(row.finished_in_range || 0)],
+      ["Tokens (24 h)", fmtN(row.tokens || 0)],
+      ["Cost (24 h)", fmtUsd(row.cost_usd || 0)],
+      ["Lifetime", fmtN(row.tokens_all_time || 0) + " tokens \u00b7 " + fmtUsd(row.cost_usd_all_time || 0)]
+    ].forEach(function (pair) {
+      var item = el("div", {class: "pj-unassigned-stat"});
+      item.appendChild(el("span", {class: "k", text: pair[0]}));
+      item.appendChild(el("b", {text: pair[1]}));
+      stats.appendChild(item);
+    });
+    c.appendChild(stats);
+    if (projectTotalsScope() === "all") c.appendChild(el("p", {class: "pj-note", text: "This activity is already included in All agents totals."}));
     return c;
   }
 
@@ -383,7 +464,8 @@
     entries.forEach(function (e) { if (e.slot) bySlot[e.slot] = e; });
     specs.push(slotSection("exec-depgraph", bySlot["exec-depgraph"] || null));
     specs.push(["project-phases", keyOf([state.project]), function () { return phasesSection(state.project); }, ""]);
-    specs.push(["project-tiles", keyOf([snap && snap.totals, snap && snap.totals_all_time, state.ws, state.snapError]), function () { return tilesSection(snap); }, ""]);
+    specs.push(["project-tiles", keyOf([snap && snap.totals, snap && snap.totals_all_time, state.wssAll, state.bundles, projectTotalsScope(), state.ws, state.snapError]), function () { return tilesSection(snap); }, ""]);
+    specs.push(["project-unassigned", keyOf([(state.wssAll || []).filter(function (w) { return w && String(w.ws).toLowerCase() === "unassigned"; }), projectTotalsScope()]), function () { return unassignedSection(); }, ""]);
     specs.push(["project-current", keyOf([(state.wss || []).map(function (w) { return [w.ws, w.live_agents, w.tokens, w.cost_usd]; }), planSum]), function () {
       var c = el("div", {class: "card pj-current", "data-nav": "Current"});
       c.appendChild(secHead("Current", "Active and paused workstreams — execution lives here."));
