@@ -93,4 +93,4 @@ Lanes in one wave share no file or test file. Each lane goes build, then review,
 4. One writer per file (`CONTRACT.md` ownership table). The page, the charts, and the design spec change together; backend modules are built against the contract.
 5. Name things, not numbers. Never cite a decision, task, PR, issue, or ADR by its number alone; lead with a brief phrase, number optional in parentheses.
 6. Charts carry axes, compact numbers, one y axis, a legend for two or more series, and a hover tooltip on every mark; `tests/test_page_rules.py` enforces it. Run it after every page change.
-7. Local scoped tests only: `python3 -m unittest discover -s tests -p 'test_<module>*.py'`. Never a whole suite for a one-module change.
+7. Local scoped tests only, from `tools/agent-dash`: `set -o pipefail; python3 -m unittest discover -s tests -p 'test_<module>.py'`. Never a whole suite for a one-module change; `sh scripts/gate.sh` stops and names the file when the selection is wide.

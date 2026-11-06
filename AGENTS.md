@@ -4,9 +4,12 @@ Agent instructions for this repo. Short on purpose; the skills carry the detail.
 
 ## Tests: scoped only
 
-- Run only the test files for the code you changed: `python3 -m pytest tools/agent-dash/tests/<file>.py` and `node tools/agent-dash/scripts/<check>.mjs`.
-- Never run the whole `tests/` directory, `pytest` with no path, or every check script.
-- The repo has no GitHub Actions; do not add a workflow that runs whole suites.
+- Run only the test modules for the code you changed: `python3 -m pytest tools/agent-dash/tests/<file>.py`, or from `tools/agent-dash`, `python3 -m unittest discover -s tests -p '<file>.py'` (the form the gate runs). Node checks: `node tools/agent-dash/scripts/<check>.mjs`.
+- The scoped gate, `sh tools/agent-dash/scripts/gate.sh [base]`, maps changed files to modules (`scripts/gate_map.json`). It stops before running anything when the selection is over 3 modules or 2000 test functions, and names the changed file that widened it. Run that file's tests directly, or pass `--force` on purpose.
+- Test modules that start, stop or read dashboard state import `tests/live_guard.py`. It moves the state dir, data root and port to temp values and refuses to run if the port or state dir still resolves to the live ones (8765, the default state dir).
+- Run several test modules in one process now and then (`cd tools/agent-dash/tests && python3 -m unittest test_a test_b`): state can leak between modules that pass alone.
+- When a test run is piped (`| tee`, `| tail`), run `set -o pipefail` first, or the pipe hides the failing exit status.
+- Never run the whole `tests/` directory, a bare `pytest`, every check script, or a `*ci-local.sh` script. The repo has no GitHub Actions; do not add a workflow that runs whole suites.
 - The pre-push hook runs `scripts/privacy_audit.sh` only.
 
 ## Worktrees: one per task, removed when it finishes
