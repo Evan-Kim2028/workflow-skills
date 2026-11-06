@@ -26,7 +26,7 @@ Bundle files, in the workstream bundle directory (`AGENT_DASH_WORKSTREAMS` honou
 | `inbox.jsonl` | dispatcher | append-only events, each with a monotonic `seq` |
 | `inbox.cursor` | `dispatch wait` | last seq printed |
 | `dispatch.pid`, `dispatch.lock`, `dispatch.log` | dispatcher | one dispatcher per workstream |
-| `runs/<label>/` | dispatcher | prompt copy, run_worker out and err files, pid |
+| `runs/<label>/` | dispatcher | prompt copy, run_worker out and err files, pid (durable; see Scratch) |
 | `reports/decisions.tsv` | dispatcher | one row per retry only |
 
 ## CLI
@@ -53,6 +53,45 @@ python3 agent_dash.py dispatch run <WS>
 - `once --dry-run` decides one tick and prints what it would launch, with no side
   effects. `once` without `--dry-run` runs one real tick under the same pidfile lock
   as `run`, and exits 4 when a dispatcher already owns the workstream.
+
+## Scratch: what goes where
+
+A run folder is durable record. Only prompts, reports, out and err files, and decisions stay in it.
+Anything that grows and can be rebuilt goes to the run's scratch folder, `$AGENT_SCRATCH`:
+
+| Goes in the run folder (`runs/<label>/`) | Goes in `$AGENT_SCRATCH` |
+|---|---|
+| prompt copy, `out-*.md`, `err-*.log`, `*.pid`, `*.meta.json` | Python environments (`.venv`, `venv`) |
+| the report and any decision file | local Postgres clusters and their data directories |
+| small notes the lead reads | decompressed caches and downloaded archives |
+| | downloaded or rendered images |
+
+`run_worker.py` creates the folder before every launch and exports `AGENT_SCRATCH` to every tier
+(muse, cursor, grok-build, pi, codex). The path is `~/.cache/agent-dash/scratch/<WS or hub>/<label>/`,
+or `$AGENT_DASH_SCRATCH_ROOT/<WS or hub>/<label>/` when that is set. The folder holds an owner marker
+(`.agent-scratch.json`) that names the label and the run folder; a folder without one is never
+removed.
+
+Reclaim scratch from finished runs:
+
+```
+python3 agent_dash.py scratch status            # total size and the largest folders
+python3 agent_dash.py scratch gc                # dry run: what would go, and what is kept and why
+python3 agent_dash.py scratch gc --apply        # remove finished runs' folders (default: 7 days idle)
+```
+
+`scratch gc` keeps a folder when any check cannot run or fails: a live launcher names its label, a
+run's `running/<label>` or `<label>.pid` names a live process, a process has a file open in it or has
+it as its cwd, the newest file is under the cutoff, or the folder has no owner marker. Each candidate
+is checked again just before removal.
+
+`ws archive <ID>` cleans up after a successful archive: it runs `logs archive --ws <ID> --apply` when
+that service is installed, then removes the workstream's scratch folders. Cleanup is refused, and the
+archive still succeeds, while the workstream has live runs. `--keep-scratch` skips the scratch removal.
+
+The doctor warns (`run-folder-scratch`) when a run folder under the hub root holds a Python
+environment, a Postgres data directory, or more than 200 MB of caches or images. It only reads.
+Move such content to `$AGENT_SCRATCH` and leave the folder with prompts, reports and decisions.
 
 ## Loop
 

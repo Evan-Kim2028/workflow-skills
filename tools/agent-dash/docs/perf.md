@@ -228,3 +228,256 @@ fill, `_parent_map`. The store lock is still held through compute;
 per-request Python over all rows remains the floor — if server CPU
 stays above target, a lock-free snapshot copy or row-column layout is
 next, not more key caching.
+
+## Stage 3 (2026-11-06): live-shaped copy, pollers running, probe-driven
+
+Owner report: "slow to load and not snappy across basically every function".
+This stage measures on a live-shaped copy (an SQLite `.backup` of the live
+database taken 10:51, 803 MB, with real sources polling this laptop's
+transcripts; Linear and Dagster off; `AGENT_DASH_READONLY=1`) and starts from
+the same frozen copy for every build, so before and after see the same data.
+
+### Probe
+
+`scripts/perf_probe.py` (stdlib, GET only). Per endpoint: first (cold) hit,
+then 20 warm hits, median, p95, bytes, gzip bytes. `--cpu-window 60` drives a
+page-like load (snapshot, workstreams and runs every 2 s) and reports server
+CPU from the server's own `perf.cpu.cpu_seconds`. `--state-dir` adds SQLite
+sizes. Re-run:
+
+```sh
+python3 scripts/perf_probe.py --base http://127.0.0.1:8897 --n 20 \
+  --cpu-window 60 --pid <server-pid> --state-dir <state-dir> --json out.json
+```
+
+### Before and after
+
+HEAD = `bf05361` (the branch base, with the committed live changes). After =
+this branch, same frozen data, same probe. Warm numbers for the endpoints
+marked (c) are cache hits: their cold compute is unchanged, see "Not done".
+
+| endpoint | HEAD cold / med / p95 ms | after cold / med / p95 ms |
+|---|---|---|
+| /api/health | 1085 / 639 / 1029 | 877 / **10 / 11** |
+| /api/state | 1941 / 3.5 / 9.8 | 1778 / 3.2 / 3.7 |
+| /api/snapshot | 717 / 1.1 / 1.5 | 514 / 1.1 / 1.5 |
+| /api/workstreams | 1258 / 25 / 29 | 947 / 18 / 23 |
+| /api/project/phases | 1929 / 0.6 / 0.7 | 1817 / 0.5 / 0.9 |
+| /api/project/graph | 2768 / 2233 / 3871 | 2633 / **0.8 / 1.1 (c)** |
+| /api/project/feed | 569 / 499 / 1079 | 540 / **0.5 / 0.7 (c)** |
+| /api/archive | 1012 / 940 / 1270 | 1026 / **0.5 / 0.7 (c)** |
+| /api/risks | 93 / 56 / 90 | 101 / **0.5 / 0.7 (c)** |
+| /api/runs | 539 / 4.4 / 4.7 | 523 / 3.6 / 4.0 |
+| /api/usage | 23 / 3.6 / 4.0 | 247 / 2.9 / 3.1 |
+| /api/sessions | 307 / 309 / 414 | 265 / 283 / 326 |
+| /api/concurrency | 369 / 2.6 / 3.1 | 333 / 1.9 / 2.2 |
+| /api/doctor | 8 / 7.5 / 8.5 | 26 / 25 / 32 (noisy run, see below) |
+| /api/ws/progress?ws=all | 21940 / 2.3 / 2.5 | 27428 / 2.5 / 3.2 (not fixed) |
+| /api/reconcile | 1308 / 0.5 / 0.7 | 1269 / 0.6 / 0.9 |
+
+Server CPU, 60 s page-like window: HEAD 142% and 122% of one core (two runs);
+after 111% (range 110–147% over five builds). Target 15%.
+Page (`page_check.mjs --perf`, first section drawn): HEAD 7.2 s and 5.1 s;
+after 3.8 s, 3.5 s and 4.6 s. Budget 1.5 s. Warm `/api/state` and the snapshot
+tick are 1–3 ms when the process is idle; under the pollers' load the
+snapshot tick p95 is ~1 s on both builds.
+`/api/doctor` warm median moved 8 → 25 ms in the last run only; the doctor
+block itself is unchanged, and the repeat run is within noise of HEAD-1 (19 ms).
+
+Live-shaped run notes: `/api/health` p95 fell from 2.2 s to 11 ms; `page_check`
+tile/legend parity is OK (`agent_dash.py check --page`); `check` reports one
+mismatch on this copy (`stale running`, a dead pid row from the frozen data;
+not caused by this branch, not investigated further).
+
+### Ranked causes (measured, not assumed)
+
+Sampled with an in-process stack sampler (5 ms, every thread; the sampler is
+a diagnostic wrapper that is not shipped) and cProfile on the copy:
+
+1. **Source pollers walk the scratch trees every 2 s.** Sources were ~80% of
+   sampled CPU (~1.4 cores). Largest items: `realpath` per candidate in
+   `pi`/`commandcode` outdir discovery, `rundirs._touched` (a scandir and a
+   stat per child of every registered run folder, through `scan_roots`, called
+   by six sources), `_subdirs` listings, grok `_manifest_dirs`, and
+   `attribution` map stats per run upsert. **Fixed in part** (see below).
+2. **`/api/health` re-read up to 1 MB of every registered run folder's
+   manifests per request** (`rundirs.describe_roots` through
+   `Registry.health`). **Fixed:** 15 s memo, 319 ms median → 10 ms.
+3. **`/api/ws/progress?ws=all` recomputes the whole store once per workstream**
+   (`build_wsprogress` → `build_replay` → `query_runs` → full `_scoped_usage`,
+   58 full passes for 30 workstreams, ~17 s offline on the copy). **Not fixed**
+   (see "Not done"): the `ws` filter applies per row before the lane and
+   workflow collapse, so a single pass grouped by workstream is not equal by
+   inspection.
+4. **`VACUUM` ran under the store lock** from `prune_offsets` once a pass
+   drained (4.6 s on a 780 MB copy with no contention; the profile attributes
+   92 s of prune time to the window, lock waits included). **Fixed:** no
+   VACUUM on the serving path.
+5. **WAL growth.** The live WAL was 830 MB with `wal_autocheckpoint` 1000:
+   a passive checkpoint cannot reset a log that a reader still holds, and the
+   WAL never shrank. **Fixed:** `journal_size_limit` 64 MB, a startup
+   TRUNCATE checkpoint, and an off-lock PASSIVE checkpoint once the WAL passes
+   16 MB (prune tick).
+6. **Navigation awaited `/api/health`** (base commit's `navInflight` Promise.all).
+   **Fixed:** health is fetched without being awaited; it only refreshes the
+   stale badge.
+7. **Expensive heavy reads recomputed on every request**: graph, archive, feed,
+   risks. **Fixed:** routed through the existing TTL coalescing (`ENDPOINT_TTL`
+   entries, `response_ttl_s`). Their warm numbers are now cache hits (c); cold
+   is unchanged. The payloads of these four gain a `generated_at` key, which
+   the other TTL-served endpoints already carry (additive).
+8. Dead offset rows: prune batch 2,000 → 20,000 (a 504k backlog drains in
+   tens of minutes, not hours). On this copy no offset path is gone (see
+   retention below), so nothing was pruned.
+
+Checked and ruled out: the store lock (p95 wait 1 ms, hold p95 0.6 ms on the
+copy: the bottleneck is GIL time, not the lock); the health-refresh thread
+(5 s, data-seq cached); the `cache_size` pragma (kept, one connection).
+
+### What changed (this branch)
+
+- `dash/store/base.py`: no VACUUM in `prune_offsets`; `journal_size_limit`;
+  `checkpoint_wal()` (off-lock PASSIVE; TRUNCATE only at startup); the WAL is
+  checkpointed at the end of each prune call past 16 MB.
+- `dash/store/util.py`: `PRUNE_BATCH` 2,000 → 20,000.
+- `static/core/api.js`: health is not awaited in navigation; the stale-badge
+  hover names lag in words (page rule).
+- `dash/sources/__init__.py`: shared memos: `realpath_memo` (60 s),
+  `scan_roots_memo` (10 s), `describe_roots` memo (15 s, used by
+  `Registry.health`), `discovery_memo` keyed by the source's `dir_scan_s`
+  (thread-local; 0 = per poll).
+- `dash/sources/pi.py`, `commandcode.py`, `grok_cli.py`: outdir and manifest
+  walks reuse their last listing for `dir_scan_s` (15 s default; same knob as
+  manifests and claude); `_subdirs` uses the (inode, mtime) listing cache.
+- `dash/sources/{grok_cli,muse,cursor,manifests}.py`: `scan_roots_memo`,
+  realpath memo.
+- `dash/sources/muse.py`: the clock repair (a full muse-run scan under the lock)
+  runs at most every 30 s instead of every poll (idempotent).
+- `dash/server.py`, `dash/respcache.py`: archive, risks, project/graph and
+  project/feed go through `_ttl_serve`; entries in `ENDPOINT_TTL`.
+- `scripts/perf_probe.py` (new): the probe. `scripts/gate_map.json`: maps it.
+- Tests: `tests/test_perf_stage3.py` (new, 7 tests: no VACUUM, freelist reuse,
+  checkpoint thresholds and modes, off-lock checkpoint, memo windows).
+  `tests/test_store.py`: `test_prune_vacuums_once_per_pass` renamed to
+  `test_prune_drains_a_pass_without_vacuum` (same assertions; the old name
+  described the removed behaviour). `tests/test_pi.py`, `tests/test_commandcode.py`:
+  two source fixtures set `dir_scan_s: 0`, because those tests pin a row seen on
+  the next poll (per-poll discovery is the contract they test; the knob exists
+  for this, muse's tests already use it).
+- `perf_budgets.json`: unchanged (no budget was raised or lowered).
+
+Kept on purpose: the `_seq` bump on cursor writes (`set_offset`).
+`tests/test_view_seq.py::test_offset_write_moves_seq_only` pins it. Its comment
+said the opposite; I briefly removed the bump, the pinned test caught it, and
+it is back. `/api/state` keys on `store.seq`, so every cursor advance still
+invalidates the state cache. That is the next lever for `/api/state` (see below).
+
+### Retention
+
+- `process_samples`: already bounded by `SAMPLE_KEEP_S` (48 h, pruned on each
+  insert). It holds ~700k rows at this sampling rate. Not reduced: the rows back
+  run liveness evidence, and a shorter window could change run status for
+  older runs, which the brief forbids.
+- `file_offsets`: 504k rows on the copy: 486k `<db>#b#<id>` blob markers (their
+  databases exist), 15k absolute paths (all exist), 2.5k relative cursor keys
+  (always kept). Nothing is prunable on this copy, so the prune change is proven
+  by unit tests, not by a copy run. Blob markers are not pruned: they are live
+  cursor state, and pruning them needs a per-blob liveness rule. Not done.
+- Token totals and run counts: checked offline on the frozen copy with the
+  new `Store` (startup checkpoint plus a full offset prune): 791,182 usage
+  events, input/output/cache/reasoning token sums, cost (15,684.11 USD), and
+  39,801 runs by status are identical before and after. Live-data comparison is
+  not possible while the sources keep writing.
+
+### Verification
+
+- `scripts/gate.sh train/dash-storage-perf --list` selects 23 files. The
+  worker rule stops a gate that selects more than 3 suites, so I ran the
+  explicit files for the changed modules instead. Widened by `dash/sources/*`
+  and `dash/store/*` mapping (the gate table lists every source suite).
+- Scoped suites, green except the pre-existing ones below: `test_store`,
+  `test_pi`, `test_commandcode`, `test_cursor`, `test_muse`, `test_manifests`,
+  `test_grok_cli`, `test_server`, `test_etag`, `test_ttl`, `test_perfmon`,
+  `test_state`, `test_view_seq`, `test_doctor`, `test_perf_stage2`,
+  `test_bundles_api`, `test_perf_stage3`, `test_poll_budgets`: 758 passed, 5
+  skipped, 1 failed (below).
+- `tests/test_page_rules.py` + `tests/test_privacy_pin.py`: 156 passed, 1
+  failed: `test_nav_and_api_share_inflight`, which also fails at HEAD. It
+  expects the nav fetch list to be exactly four calls; the base commit added
+  `/api/health` to nav (now not awaited, still fetched). `test_hover_text_has_no_raw_numbers`
+  was failing at HEAD and is fixed here. `test_plan_sections_term_rule`
+  (the known failure) passes in this environment.
+- `tests/test_server.py::StopRestartTest::test_stop_returns_1_while_the_port_is_bound`
+  fails at HEAD in this environment too (not caused here).
+- `ADASH_PERF=1 tests/perf/test_perf_budget.py`: 5 of 6 pass in the runs that
+  finished; `test_cold_and_warm_5x` returns 503 on `/api/state` cold (the store
+  lock's 5 s busy path while the warm thread holds the lock) in 3 of 4 full-file
+  runs on this branch, and passes 3 of 3 when run alone. HEAD passed the full
+  file 2 of 2. Measured cold `build_state` at 5x is 4.2–4.3 s on both trees, so
+  I do not have evidence of a slower compute. This is an open item, see below.
+- `agent_dash.py check --url … --page`: passes (tiles and legends match the API).
+- `page_check.mjs --perf`: first-draw budget fails on both trees (above).
+- `node --check static/core/api.js`: ok.
+
+### Not done, and why
+
+- **Server CPU 111% vs 15% target.** Most of it is per-poll file work in the
+  sources (per-file tails, muse and cursor discovery, attribution stats, the
+  process listing). Memoising discovery windows helped 142 → 111%, but the
+  remaining cost is spread across per-file reads. The next step is event-driven
+  or cadence-driven discovery for each source (manifests already does this with
+  `dir_scan_s`), and per-file stat caching in the tails. That is a source-by-source
+  change, not one more memo.
+- **Page first draw 3.5–4.6 s vs 1.5 s.** Requests queue behind source CPU (GIL).
+  It should follow the CPU work, but I did not measure that link directly.
+- **`/api/ws/progress?ws=all` cold 16–27 s.** Needs a single store pass for all
+  workstreams with the per-ws filter reproduced exactly. Not done: the
+  equivalence needs a property test, and I did not have time to write one.
+- **Cold `/api/state`, `/api/project/phases`, `/api/project/graph`,
+  `/api/workstreams` at 0.9–2.6 s.** Cold compute is unchanged. Warm is fine.
+  The `/api/state` cache key includes `store.seq`, which every cursor advance
+  bumps; a `view_seq` key would help warm hits, but the state body's
+  dependencies need auditing first.
+- **`/api/sessions` p95 ~280–330 ms** (budget 300). Not wrapped in the TTL.
+- **Doctor** runs every 300 s; each run takes seconds (lifecycle scans, `pgrep`).
+  Not profiled in isolation; its run time is not in the health block.
+- **File_offsets blob markers** (see retention): no pruning rule.
+
+### Cutover
+
+No schema change, no data migration. The steps:
+
+1. Ship this branch as a release, then restart the `serve` process once (Python
+   changes need a restart, `static/core/api.js` is live on reload). Restart
+   order: stop the old process by pid, then start the new one; health answers
+   within about a second of bind.
+2. One-time costs on the first start: the startup TRUNCATE checkpoint of the
+   existing WAL. Measured with a synthetic 1 GB WAL on this laptop (idle):
+   1.6 s. The live WAL was 830 MB, so expect about 1–2 s, measured on the
+   live database at cutover (`ls -l dash.sqlite-wal` before and after).
+3. Optional, not needed for correctness: an offline `VACUUM` to shrink the
+   803 MB file (the freed pages from pruned rows stay on the freelist and are
+   reused). Measured 4.6 s on the 780 MB copy with no load. Run it with the
+   server stopped (`sqlite3 dash.sqlite 'VACUUM;'`), never while serving.
+4. Rollback: redeploy the previous release. No schema change, no data format
+   change. Offsets pruned by the new prune would be re-created by the sources
+   on their next poll (none are pruned on this copy). The WAL pragmas are
+   harmless to an older build.
+5. Verify after cutover: `scripts/perf_probe.py` against the live port (GET
+   only), `agent_dash.py check --page`, and `ls -l dash.sqlite-wal` once an hour
+   (expect ≤ ~16 MB between checkpoints, ≤ 64 MB always).
+
+### Live incidents observed during this stage (for the owner)
+
+The live `serve` process (port 8765) was replaced twice on 2026-11-06: the old
+child (pid 74571) returned at 11:21:38 and pid 32715 started 1 s later; pid
+32715 returned at 12:00:27 and pid 64748 started 0.4 s later. Both replacements
+run from the main checkout path (`…/projects/workflow-skills/tools/agent-dash`).
+I did not signal the live process. My probe and perf runs used port 8897 with a
+temp state dir, and `tests/perf` runs in-process on a random port. My
+`tests/test_server.py` runs also ran around both times. Those tests isolate port
+and state dir, so I do not think they caused it, but this is not proven.
+`tests/test_deploy.py` and `tests/test_process_control.py` call `stop`, `restart`
+and `deploy`. I did not check whether each of those calls isolates the port, and
+I did not run either file. The owner should check other sessions and those two
+suites before the next run.

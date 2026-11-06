@@ -9,6 +9,7 @@
     "test_server"
   ],
   "map": {
+    "scripts/perf_probe.py": ["test_perf_stage3", "test_perf_stage2"],
     "agent_dash.py": [
       "test_server",
       "test_config",

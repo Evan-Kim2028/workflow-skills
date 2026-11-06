@@ -46,6 +46,8 @@ from dash.liveness import file_shows_quota
 from dash.sources import grok_cli as _grok
 from dash.sources import manifests as _manifests
 from dash.sources import process as _process
+from dash.sources import realpath_memo
+from dash.sources import set_discovery_ttl, discovery_memo
 
 log = logging.getLogger("agent_dash.pi")
 
@@ -67,9 +69,13 @@ _last_write: dict = {}
 last_error = None
 
 
+#: Directory-walk reuse window (seconds), the shared ``dir_scan_s`` knob.
+DIR_SCAN_S = 15
+
 def poll(store, cfg, now):
     global last_error
     last_error = None
+    set_discovery_ttl((cfg or {}).get("dir_scan_s", DIR_SCAN_S))
     try:
         _poll(store, cfg or {}, float(now))
     except Exception:
@@ -91,6 +97,13 @@ def _poll(store, cfg, now):
 
 
 def _outdirs(root):
+    """Directory walk, reused for this poll thread's ``dir_scan_s`` window. See :func:`_outdirs_walk`."""
+    from dash.sources import discovery_memo
+
+    return list(discovery_memo((__name__, '_outdirs', root), lambda: _outdirs_walk(root)))
+
+
+def _outdirs_walk(root):
     """pi outdirs under one scratch root: the root, or ``<pad>/pi/``.
 
     A pi outdir holds ``pi-sessions.tsv`` or a ``running/`` folder. The
@@ -110,7 +123,7 @@ def _outdirs(root):
     def take(path):
         if not path:
             return
-        real = os.path.realpath(path)
+        real = realpath_memo(path)
         if real in seen:
             return
         if os.path.isfile(os.path.join(path, MANIFEST)) or (
@@ -136,20 +149,15 @@ def _outdirs(root):
     return found
 
 
+_dir_cache: dict = {}
+
+
 def _subdirs(path):
-    try:
-        entries = os.scandir(path)
-    except OSError:
-        return []
-    out = []
-    with entries:
-        for entry in entries:
-            try:
-                if entry.is_dir(follow_symlinks=False):
-                    out.append(entry.path)
-            except OSError:
-                continue
-    return out
+    """Child directories of ``path``, from the (inode, mtime) listing cache."""
+    from dash.sources import list_dir_cached
+
+    entries, _listed = list_dir_cached(path, _dir_cache)
+    return [full for _name, full, _is_file, is_dir in (entries or []) if is_dir]
 
 
 def _seen(store):
@@ -509,12 +517,39 @@ def _verdict(out_path):
     return found
 
 
-def parse_stream(raw, fallback_sid):
+def write_split(usage, model):
+    """``(cache_write_5m, cache_write_1h)`` for one pi usage block.
+
+    pi reports ``cacheWrite1h`` beside ``cacheWrite``. When it is present
+    the 1h part is that value (clamped to the total) and the 5m part is the
+    remainder, so the two always sum to ``cacheWrite``. When it is absent
+    on an Anthropic model every write is 5m (``(total, 0)``): pi's own
+    ``usage.cost`` matched the 5m rate on those messages. Any other model
+    keeps ``(None, None)``, so its pricing reads exactly as before.
+    """
+    total = _num(usage.get("cacheWrite"))
+    raw = usage.get("cacheWrite1h")
+    if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+        one = min(max(int(raw), 0), total)
+        return total - one, one
+    if _is_anthropic(model):
+        return total, 0
+    return None, None
+
+
+def _is_anthropic(model):
+    return "claude" in str(model or "").lower()
+
+
+def parse_stream(raw, fallback_sid, default_model=None):
     """Assistant usage events from raw NDJSON bytes.
 
     Each ``message_end`` with an assistant message and a usage block is one
     event: ``input`` the cache miss, ``cacheRead`` the hit, ``cacheWrite``
-    the write, ``output`` the completion. ``message_id`` is
+    the write, ``output`` the completion, and ``cache_write_5m`` /
+    ``cache_write_1h`` the write split (see :func:`write_split`).
+    ``default_model`` is the launch model, used for the Anthropic rule
+    when the message names none. ``message_id`` is
     ``<session>-<index>`` where index counts assistant messages in order.
     """
     events = []
@@ -537,6 +572,7 @@ def parse_stream(raw, fallback_sid):
         sid = fallback_sid
         index += 1
         model = message.get("model") if isinstance(message.get("model"), str) else None
+        five, one = write_split(usage, model or default_model)
         events.append(
             {
                 "message_id": "%s-%d" % (sid, index),
@@ -546,6 +582,8 @@ def parse_stream(raw, fallback_sid):
                 "output": _num(usage.get("output")),
                 "cache_read": _num(usage.get("cacheRead")),
                 "cache_write": _num(usage.get("cacheWrite")),
+                "cache_write_5m": five,
+                "cache_write_1h": one,
             }
         )
     return events

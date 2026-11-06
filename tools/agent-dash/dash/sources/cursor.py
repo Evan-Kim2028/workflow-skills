@@ -44,6 +44,7 @@ import sqlite3
 import tempfile
 from collections import Counter
 from pathlib import Path
+from dash.sources import realpath_memo
 
 log = logging.getLogger("agent_dash.cursor")
 
@@ -1596,9 +1597,9 @@ def _home(cfg):
 
 
 def _scratch_roots(cfg):
-    from dash.rundirs import scan_roots
+    from dash.sources import scan_roots_memo
 
-    return scan_roots(cfg)
+    return scan_roots_memo(cfg)
 
 
 def _tmp_root(cfg):
@@ -1671,7 +1672,7 @@ def _file_size(path):
 
 
 def _abs(path):
-    return os.path.realpath(path)
+    return realpath_memo(path)
 
 
 def _blob_key(store_key, blob_id):

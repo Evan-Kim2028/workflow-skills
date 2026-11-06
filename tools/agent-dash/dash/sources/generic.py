@@ -242,8 +242,17 @@ def _usage_row(obj: dict, line_at: int, now: float) -> dict | None:
         "output": _int(obj.get("output"), 0),
         "cache_read": _int(obj.get("cache_read"), 0),
         "cache_write": _int(obj.get("cache_write"), 0),
+        "cache_write_5m": _opt_int(obj.get("cache_write_5m")),
+        "cache_write_1h": _opt_int(obj.get("cache_write_1h")),
         "reasoning": _int(obj.get("reasoning"), 0),
     }
+
+
+def _opt_int(value) -> int | None:
+    """A non-negative count, or None when the line does not carry the field."""
+    if value is None or isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
 
 
 def _path(cfg: dict) -> str | None:

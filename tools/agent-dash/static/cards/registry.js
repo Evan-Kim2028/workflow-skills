@@ -83,6 +83,11 @@
         return runsTable("Finished (24 h)", finishedSub(snap), page.rows, state.snapError ? "request failed" : (page.pending ? "Loading this page of finished agents…" : "Nothing finished in the last 24 h."), foot);
       }, "margin-top:14px"];
     }},
+    /* Log search (opt-in): one closed button until the owner opens it;
+       then a read-only search over archived agent logs (static/cards/log-search.js). */
+    {id: "logsearch", order: 96, scope: "project", spec: function (state, snap) {
+      return typeof logSearchSpec === "function" ? logSearchSpec(state, snap) : null;
+    }},
     {id: "decisions", order: 58, scope: "project", spec: function (state, snap) {
       return decisionsSpec(state, snap);
     }},

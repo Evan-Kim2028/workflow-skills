@@ -95,6 +95,15 @@ What the workflow does:
 
 Run labels are `ws4-WS4.1-notes-index`, then `-rev1` and `-fix1`. A label that holds the task id pins each attempt on the task chip, and `↻N` counts the attempts; the task map is the override for other labels. `defaultTier` and `reviewTier` default to `default`. Tiers are registry worker names, `default`, or `auto`, read from `workers.example.json`, `workers.local.json`, or `AGENT_DASH_WORKERS`.
 
+## Where files go
+
+Hub run folders are durable. Only prompts, reports, decisions and out or err files go there.
+Environments, local Postgres clusters, caches, downloads and images go in `$AGENT_SCRATCH`, which
+`run_worker.py` sets for each worker. Scratch is disposable: `scratch gc` removes it once a run is
+finished, and `ws archive <ID>` removes the workstream's scratch after the archive lands (refused while
+its runs are live; `--keep-scratch` skips it). `scratch status` shows how much is held. See
+[dispatcher.md](dispatcher.md#scratch-what-goes-where) for the rules and the doctor warning.
+
 ## 5. The lead's loop
 
 Each time a wave workflow returns, the lead:
