@@ -20,8 +20,12 @@ cd tools/agent-dash
 python3 agent_dash.py run      # binds 127.0.0.1:8765
 python3 agent_dash.py status
 python3 agent_dash.py restart  # stop, then run; waits for /api/health
+python3 agent_dash.py deploy --ref origin/main --yes-live   # live: gate, link, switch to a clean release, health-gate
+python3 agent_dash.py rollback                              # back to PREVIOUS; run from a terminal (no --yes-live yet)
 python3 agent_dash.py backfill --session <session-uuid>
 ```
+
+The live dashboard runs from a release (`<state>/releases/CURRENT`), built by `deploy`. Ship a change by merging, moving the main checkout to `origin/main`, then `deploy`. Use `deploy`, not `restart`, to change the live code: a plain `restart` from the main checkout runs the mutable checkout again. `--yes-live` is needed from a non-interactive session on the live state dir. The cutover, rollback and ship steps are in `tools/agent-dash/docs/live-release.md`.
 
 Never run stop or restart in tests without AGENT_DASH_STATE_DIR and AGENT_DASH_PORT.
 
