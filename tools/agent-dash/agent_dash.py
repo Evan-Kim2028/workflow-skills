@@ -119,6 +119,7 @@ USAGE = """agent-dash: local read-only execution dashboard
   python3 agent_dash.py lead-profile <session-id|--ws ID> [--json]
   python3 agent_dash.py worktrees reap --repo <path> [--apply] [--skip <path-or-branch>] [--min-age <dur>] [--json]
   python3 agent_dash.py lanes live [--json]
+  python3 agent_dash.py logs archive [--root P]... [--ws ID] [--min-idle-hours 3] [--keep remove|stub|stripped] [--apply]
 
 Agents working on a project pass --project <id> (or set the env) for
 state, check, doctor, ws ..., status: it sets the data root, state
@@ -440,6 +441,13 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_worktrees(args[1:])
     if cmd == "lanes":
         return cmd_lanes(args[1:])
+    if cmd == "logs":
+        if len(args) < 2 or args[1] != "archive":
+            print(USAGE, end="", file=sys.stderr)
+            return 2
+        from dash import logarchive
+
+        return logarchive.main(args[2:])
     print(USAGE, end="", file=sys.stderr)
     return 2
 

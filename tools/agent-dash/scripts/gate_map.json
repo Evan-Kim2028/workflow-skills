@@ -273,6 +273,25 @@
       "test_commandcode",
       "test_label_guard_clis"
     ],
+    "dash/logfilter.py": [
+      "test_logfilter",
+      "test_pi",
+      "test_launch_codex",
+      "test_commandcode"
+    ],
+    "dash/logarchive.py": [
+      "test_logarchive"
+    ],
+    "dash/vlogs.py": [
+      "test_vlogs",
+      "test_logarchive"
+    ],
+    "scripts/vlogs_install.sh": [
+      "test_vlogs"
+    ],
+    "scripts/log_keep_eval.py": [
+      "test_logarchive"
+    ],
     "scripts/launch_pi.py": [
       "test_pi",
       "test_label_guard_clis"

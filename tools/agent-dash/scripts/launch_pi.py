@@ -57,6 +57,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from dash import labels as label_lib  # noqa: E402
+from dash import logfilter  # noqa: E402
 from dash.sources import pi as pi_source  # noqa: E402
 from dash.sources.manifests import parent_session_from_pad  # noqa: E402
 
@@ -323,16 +324,18 @@ def main(argv=None):
     started = int(time.time())
     run_id = f"running/{label}"
     (out / run_id).write_text(f"{os.getpid()}\t{model}", encoding="utf-8")
-    with open(stream, "w") as so, open(err, "a") as se:
+    with open(err, "a") as se:
         se.write(f"--- pi launch label {label} model {model} at {started}\n")
         se.flush()
-        rc = subprocess.run(
+        # The event stream goes through the base64 filter; the child's exit code is kept.
+        rc = logfilter.run_filtered(
             build_argv(label, workspace, local_prompt, out, model),
+            stream,
             cwd=str(Path(workspace).expanduser()),
-            stdout=so,
             stderr=se,
             stdin=subprocess.DEVNULL,
-        ).returncode
+            warn=logfilter.warn_to(se),
+        )
     try:
         os.unlink(out / run_id)
     except FileNotFoundError:

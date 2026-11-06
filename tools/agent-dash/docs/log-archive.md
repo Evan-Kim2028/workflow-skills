@@ -1,0 +1,177 @@
+# Agent log archive
+
+Finished agent event streams are large mostly because of images: the same
+base64 PNG is repeated in `tool_execution_end`, `message_start`, `message_end`,
+`turn_end` and `agent_end`. This archive stops new logs from growing that way,
+moves finished logs into a stripped zstd copy, and makes their rows searchable in
+a loopback VictoriaLogs store. The dashboard itself is unchanged. The contract
+exception is in `CONTRACT.md` ("Log archive exception").
+
+## Pieces
+
+| Piece | Where | What |
+|---|---|---|
+| Base64 filter | `dash/logfilter.py` | Replaces runs of 2000+ base64 characters with `<img sha256=<16 hex> bytes=<n>>`. No quotes, so JSON stays valid. Line count and all other bytes are kept. Streaming: a run of 2000+ is hashed as it arrives, never held, so a 30 MB line costs about 64 KB of memory. Flushes per chunk. |
+| Launchers | `scripts/launch_pi.py`, `scripts/launch_codex.py`, `scripts/launch_cmd.py` | Child stdout goes through `start_filtered`/`run_filtered`. If the filter raises, the pump falls back to raw passthrough for the rest of the stream, the child keeps running, and its exit code is returned. Session-id capture, verdict and quota checks read the stripped stream, and they still match: base64 never carries those strings. |
+| Archive | `dash/logarchive.py`, `agent_dash.py logs archive` | Finds finished streams (idle 3 h, no open handle, no live launcher), measures them in one streaming pass, writes `log-archive/<mirror path>.zst`, ingests rows, verifies, reclaims. Manifest and lock make reruns idempotent. |
+| Store client | `dash/vlogs.py` | Loopback only. Redacts secret shapes before ingest. Rows over 1.8 MiB are truncated and flagged (the zstd copy keeps them whole). |
+| Service | `scripts/vlogs_install.sh` | VictoriaLogs v1.53.0, checksum-verified, launchd agent `com.agent-dash.vlogs`, 127.0.0.1:19428, flags as specified. `--uninstall`, `--purge`. |
+| Option test | `scripts/log_keep_eval.py` | Evidence for what stays at the original path (below). |
+
+## The archive pass, per file
+
+1. **measure** (one streaming pass): filter, count lines and assistant tokens on the raw and stripped bytes, write zstd -9 to a temp file, keep the stripped sha256.
+2. **verify the copy**: `zstd -d` of the copy must hash to the stripped sha256; raw and stripped line counts and token sums must be equal; no unparsed message lines.
+3. **ingest**: rows are read back from the zstd copy (never the raw file), redacted, truncated if over 1.8 MiB, posted with `Content-Type: application/stream+json`. Before posting, the store is asked how many rows the path already has: 0 means ingest; the expected count means done (skip the POST); anything else is an error that names the path and stops that file.
+4. **verify the store**: row count equals the line count; stored token sums (`unpack_json` over `_msg`) equal the sums over the rows sent.
+5. **reclaim** (`--apply` only): re-check size, mtime and open handles, then apply `--keep`.
+
+Per-file failures are recorded in the manifest (`status: error`) and do not stop the run. Exit codes: 0 ok, 1 failures or a dry run that planned nothing on real input, 2 bad options, 3 another run holds the lock, 5 store unreachable.
+
+Fields written to the store per row: `_time`, `_msg`, `ws` (`<hub>/<first segment>`), `label`, `type`, `kind` (`stream`, `out`, `session`, `ndjson`), `path` (mirror path). Streams are keyed by `ws,label`.
+
+## Measured on the real hub roots (dry run, read only)
+
+Run 2026-11-06, `python3 agent_dash.py logs archive` (defaults: both hub roots, 3 h idle), under `memcap.sh 4096`, about 5 minutes.
+
+| | Value |
+|---|---|
+| Files discovered | 1,128 (live: the count grows while agents run) |
+| Candidates (idle, no open handle, no live launcher) | 1,099 |
+| Skipped | 29 not idle |
+| Ignored (not a stream) | 2 (`runs.ndjson`, `silver_pop_report.ndjson`) |
+| Raw | 13.43 GB |
+| Stripped | 3.13 GB |
+| zstd -9 | 0.19 GB |
+| Reclaimable with `--keep remove` | 13.43 GB |
+
+The brief's raw (13.43 GB), stripped (3.13 GB) and zstd (0.18 GB, here 0.19 GB) figures reproduce. The VictoriaLogs disk figure (0.25 GB) was not measured in this pass.
+
+### Token regression reference
+
+A pi run writes two files with the same assistant messages: the stream (`message_end`) and pi's own `sessions/*.jsonl` (`message`). Summing both double counts. Reconciled by kind on the dry run:
+
+| kind | messages | input | output | cacheRead |
+|---|---:|---:|---:|---:|
+| stream | 26,474 | 462,007,585 | 15,315,238 | 1,907,280,308 |
+| out (claude `out.jsonl`) | 362 | 678 | 393,109 | 40,348,847 |
+| **stream + out** | **26,836** | **462,008,263** | **15,708,347** | **1,947,629,155** |
+| session (duplicates stream) | 26,474 | 462,007,585 | 15,315,238 | 1,907,280,308 |
+
+The reference (26,836 / 462,008,263 / 15,708,347 / 1,947,629,155) matches the
+stream plus out sum exactly. Raw and stripped totals were equal for every file.
+Session files are archived and searchable but are not summed into usage.
+
+## Real-store verification
+
+24-file corpus (real logs, copied to a temp hub root, old mtimes), applied against
+the real VictoriaLogs v1.53.0 on 127.0.0.1 with `--keep remove`:
+
+- 24 archived, 24 reclaimed, 0 errors. 809 MB raw, 22 MB stripped, 2.8 MB zstd.
+- Independent check (`recompute from the originals, zstd round trip, store count and sums`): 24 of 24 pass. Tokens: 1,333 messages, input 2,881,425, output 1,103,364, cacheRead 123,684,662, identical in raw, stripped, zstd and the store.
+- Real pi run (`launch_pi.py`, deepseek lane, one-word prompt, temp state): status `done`, verdict `PASS`, session id captured, usage 7,318 input / 3 output recorded. The filtered stream was 16 lines, all valid JSON. The archive pass archived its stream and session files with matching token sums.
+
+## What stays at the original path: option test
+
+Question: after a log is archived, what, if anything, stays at its path, and does
+any reader change? Test: `scripts/log_keep_eval.py`.
+
+Method. Real pi run folders are copied (read only) into a temp tree: 40 folders
+plus the 791 MB base64-heavy `ws91-exec-03` stream, 310 files, 1.98 GB. The real pi
+and generic pollers run on a fresh store with the folders registered. The
+generic ledger is narrowed to the fixture's labels and session ids (the full ledger
+re-upserts 2,000 runs every poll; the narrowing keeps the pi usage path). Each
+option is applied to every stream and session file with the archive's own
+`measure` and `reclaim`. Then:
+
+- **incremental**: the same store is polled to convergence before and after the change. Nothing may be re-counted.
+- **cold**: a fresh store, in a separate process, polled to convergence over the changed files. Must match the baseline.
+
+Compared: every run row (`run_id`, source, status, verdict, tier, model, session,
+label) and every usage row (tokens by run and message id). Wall-clock fields are
+excluded because `ended_at` for a running run follows the clock.
+
+| option | raw reclaimed | scratch bytes left | runs / usage rows | incremental equal | cold equal | tokens equal |
+|---|---:|---:|---:|:-:|:-:|:-:|
+| control (none) | 0 | 1,980,644,961 | 115 / 3,393 | yes | yes | yes |
+| **remove** | 1,978,424,042 | 2,220,919 | 115 / 3,393 | yes | yes | yes |
+| stub (pointer line) | 1,978,327,552 | 2,317,409 | 115 / 3,393 | yes | yes | yes |
+| stripped rewrite | 918,619,228 | 1,062,025,733 | 115 / 3,393 | yes | yes | yes |
+
+"Scratch bytes left" is what remains under the scratch tree (the stub and remove
+rows keep a few KB of directories and stubs; the difference from 1,978 MB is the
+reclaim). Each row is one option applied to the same fixture.
+
+Totals in the 115-run baseline: input 4,786,705, output 1,160,199, cacheRead
+144,612,264. Statuses: 115 done. Verdicts unchanged across options.
+(Run `python3 scripts/log_keep_eval.py --work <dir> --limit 40 --big` to reproduce;
+about 5 minutes.)
+
+Finding: no poller reads a finished run's stream or out-of-band stream bytes. The
+pi poller reads the TSV, `out-*.md`, `err-*.log`, the `running/` marker, and the
+`sessions/` directory's existence. Usage comes from `generic.jsonl`, which the
+launcher writes after the run. The commandcode poller reads only the first lines
+of a live stream (`run_start`), which the filter preserves.
+
+**Decision: `--keep remove`** (the default). It reclaims everything the stub and
+stripped options leave behind, and the readers are unaffected. The stub keeps 310
+tiny pointer files and the stripped option keeps 1.06 GB, which is what "reclaim
+the most" rules out. One consequence to plan for: tools that read a finished raw
+stream by path will now find nothing there. See caveats.
+
+## Corrections to the brief
+
+- `pi.py` does not tail stream bytes with a byte cursor. Its stream reads are
+  head-of-file session-id reads during a live run. The byte-cursor readers in this
+  repo are `grok_cli`, `commandcode` (command session files), `codex`, `muse`,
+  none of which read our stream files. `file_offsets` for stream paths is not used.
+- Pi's own session files (`<outdir>/sessions/*.jsonl`) are written by pi itself
+  (`--session-dir`), not through our pipe. They are archived by the same pass.
+- The VictoriaLogs content-type pitfall reproduces only for the urllib default. A
+  POST with no Content-Type (sent as `application/x-www-form-urlencoded`) returns
+  200 and stores zero rows. `application/json` and `application/stream+json` both
+  store the row. The client pins `application/stream+json`.
+- `POST /internal/force_flush` is a POST (GET returns 405).
+- NaN: a LogsQL `sum` over an empty set returns `NaN`. `_as_int` maps it to 0.
+
+## Caveats
+
+- **Irreversible for images.** Raw base64 image bytes are not kept anywhere once a
+  file is reclaimed. The zstd copy is stripped by design, and so is a stripped
+  rewrite. Non-image content is in the zstd copy and the store. Confirm before
+  `--apply`.
+- **Writers outside this worktree.** `lor-hub-state/catalog-confidence/tools/launch_b2_claude.py` (claude `out.jsonl`) and `tools/watch-pi-pid.py` write streams without the filter. Route them through `dash/logfilter.py` (`run_filtered`) in that repo. Not changed here.
+- **Readers outside this worktree.** `catalog-confidence/tools/visual-audit-method/method_gate.py` and `part_checks.py` read raw `out.jsonl` by path for tool calls. After `--apply`, they should read `log-archive/<mirror>.zst` (`zstd -dc`). The stripped copy keeps every tool call, so they still work from the copy.
+- **Stale running markers.** A `running/<label>` whose pid is gone is treated as a crashed launch and does not block (the plan reports it). Only a live pid blocks.
+- **Session files and totals.** Do not sum `session` rows into usage (they duplicate the stream).
+- **Pi `sessions/` directory** stays, empty, after reclaim. `_looks_like_pi_dir` still sees it.
+- **Launcher death.** The filter pump runs inside the launcher process. The child writes to a pipe instead of a file, so if the launcher is killed, the child's next write fails with SIGPIPE. Before this change a child kept writing to its file after its launcher died. A run whose launcher is killed now stops at its next write. Confirm this is acceptable before relying on it for long unattended runs.
+- **Uninstall while running.** `vlogs_install.sh --uninstall --purge` removes data. Under launchd it boots out the agent first. With `VLOGS_NO_LOAD=1` it cannot stop a running process. Do not purge a store that is running.
+
+## Operate
+
+```sh
+# install (once; idempotent)
+sh tools/agent-dash/scripts/vlogs_install.sh          # or ~/.claude/tools/agent-dash/scripts/vlogs_install.sh
+
+# dry run against the real roots (reads only, writes nothing)
+python3 ~/.claude/tools/agent-dash/agent_dash.py logs archive
+
+# apply (store must be up; takes a lock; resumable)
+python3 ~/.claude/tools/agent-dash/agent_dash.py logs archive --apply
+
+# one workstream (what a ws archive hook would call)
+python3 ~/.claude/tools/agent-dash/agent_dash.py logs archive --ws ws25-ja-quality --apply
+
+# read an archived log back
+zstd -dc ~/.local/share/agent-dash/log-archive/<mirror path>.zst | head
+
+# uninstall the store (keeps data), or purge it
+sh tools/agent-dash/scripts/vlogs_install.sh --uninstall
+sh tools/agent-dash/scripts/vlogs_install.sh --uninstall --purge
+```
+
+Manifest: `~/.local/share/agent-dash/log-archive/manifest.jsonl` (last record per
+path wins; statuses `measured`, `archived`, `reclaimed`, `error`). Lock:
+`log-archive/archive.lock`. A file archived and reclaimed is skipped on every
+rerun.

@@ -1,3 +1,4 @@
+import io
 from unittest import mock
 """Tests for scripts/launch_codex.py: stream parsing, usage ledger, argv.
 
@@ -320,24 +321,33 @@ class MainTests(unittest.TestCase):
             ]
             observed = {}
 
+            class _Sink(io.BytesIO):
+                # The launcher closes stdin after the prompt; keep the bytes readable.
+                def close(self):
+                    pass
+
             class FakeProc:
+                # Pipe contract: stdout is a pipe the filter drains, stdin takes the
+                # prompt, and wait() returns the exit code (launch_codex no longer
+                # hands the child a file as stdout).
                 returncode = None
 
                 def __init__(self, argv, kwargs):
                     self.argv = argv
                     self.kwargs = kwargs
+                    self.stdin = _Sink()
+                    self.stdout = io.BytesIO(b"".join((json.dumps(obj) + "\n").encode() for obj in stream_lines))
 
-                def communicate(self, input=None):
-                    observed["prompt"] = input
+                def wait(self):
+                    observed["prompt"] = self.stdin.getvalue()
                     generic_path = Path(tmp) / "state" / "generic.jsonl"
                     records = [json.loads(line) for line in generic_path.read_text().splitlines()]
                     observed["running_before_exit"] = records
                     out_path = self.argv[self.argv.index("-o") + 1]
                     with open(out_path, "w", encoding="utf-8") as fh:
                         fh.write(review)
-                    for obj in stream_lines:
-                        self.kwargs["stdout"].write(json.dumps(obj) + "\n")
                     self.returncode = 0
+                    return 0
 
             def fake_popen(argv, **kwargs):
                 return FakeProc(argv, kwargs)

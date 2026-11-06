@@ -32,6 +32,8 @@ ROOT = HERE.parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from dash import logfilter  # noqa: E402
+
 #: Free models in preference order: the DeepSeek non-fast flash build
 #: first, then its siblings, then Beam, then the other free lanes.
 FREE_MODELS = [
@@ -190,14 +192,17 @@ def main():
             continue
         stream = os.path.join(outdir, f"stream-{label}-{attempt}.ndjson")
         start = int(time.time())
-        with open(stream, "w") as so, open(os.path.join(outdir, f"err-{label}.log"), "a") as se:
+        with open(os.path.join(outdir, f"err-{label}.log"), "a") as se:
             se.write(f"--- attempt {attempt} model {model} at {start}\n")
             se.flush()
-            rc = subprocess.run(
+            # stdout goes through the base64 filter into the attempt's stream file.
+            rc = logfilter.run_filtered(
                 ["cmd", "-p", prompt, "-m", model, "--output-format", "json", "--max-turns", (os.environ.get("CMD_MAX_TURNS") or "1000").strip(), "--effort", "high",
                  "--yolo", "-t", "--skip-onboarding", "--no-auto-update"],
-                cwd=workspace, stdout=so, stderr=se, stdin=subprocess.DEVNULL,
-            ).returncode
+                stream,
+                cwd=workspace, stderr=se, stdin=subprocess.DEVNULL,
+                warn=logfilter.warn_to(se),
+            )
         try:
             os.unlink(os.path.join(outdir, "running", label))
         except FileNotFoundError:

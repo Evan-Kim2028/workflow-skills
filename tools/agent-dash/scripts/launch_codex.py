@@ -55,6 +55,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from dash import labels as label_lib  # noqa: E402
+from dash import logfilter  # noqa: E402
 from dash.sources.manifests import parent_session_from_pad  # noqa: E402
 
 DEFAULT_MODEL = "gpt-6-luna"
@@ -471,19 +472,22 @@ def main(argv=None):
             final_path.unlink()
         except OSError:
             pass
-    with open(stream, "w") as so, open(err, "a") as se:
+    with open(err, "a") as se:
         se.write(
             f"--- codex launch label {label} model {model} "
             f"sandbox {sandbox} (source: {sandbox_source}) at {started}\n"
         )
         se.flush()
-        proc = subprocess.Popen(
+        # stdout goes through the base64 filter into the stream file.
+        filtered = logfilter.start_filtered(
             build_argv(binary, workspace, final_path, model, effort, sandbox),
+            stream,
             cwd=str(Path(workspace).expanduser()),
             stdin=subprocess.PIPE,
-            stdout=so,
             stderr=se,
+            warn=logfilter.warn_to(se),
         )
+        proc = filtered.proc
         report_lines(
             state_dir(),
             [{
@@ -499,8 +503,12 @@ def main(argv=None):
                 "started_at": float(started),
             }],
         )
-        proc.communicate(input=prompt_bytes)
-        rc = proc.returncode
+        try:
+            proc.stdin.write(prompt_bytes)
+            proc.stdin.close()
+        except BrokenPipeError:
+            pass
+        rc = filtered.wait()
     try:
         os.unlink(out / run_id)
     except FileNotFoundError:
