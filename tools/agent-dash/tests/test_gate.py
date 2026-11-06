@@ -68,10 +68,10 @@ class GateSelectionTest(unittest.TestCase):
         )
 
     def test_store_change_selects_store_family(self):
-        self._write("dash/store.py")
+        self._write("dash/store/base.py")
         self._write("tests/test_store.py")
         self._commit_all()
-        self._write("dash/store.py", "placeholder\n# touched\n")
+        self._write("dash/store/base.py", "placeholder\n# touched\n")
         code, selected, _err = self._gate("HEAD", "--list")
         self.assertEqual(code, 0)
         for name in (
@@ -130,6 +130,55 @@ class GateSelectionTest(unittest.TestCase):
         self.assertEqual(code, 0)
         for name in ("test_doctor.py", "test_state.py", "test_errors.py"):
             self.assertIn(name, selected)
+
+    def _map_only(self, table):
+        import json
+
+        (self.tools / "scripts" / "gate_map.json").write_text(
+            json.dumps(table), encoding="utf-8"
+        )
+
+    def test_single_star_stays_in_one_segment(self):
+        self._map_only({"always": [], "default": ["test_default"], "map": {"a/*.py": ["test_one"]}})
+        self._commit_all("empty base")
+        self._write("a/b.py")
+        self._write("a/sub/c.py")
+        code, selected, err = self._gate("HEAD", "--list")
+        self.assertEqual(code, 0)
+        self.assertIn("test_one.py", selected)
+        # a/sub/c.py must not match a/*.py: it falls to the default with a warning.
+        self.assertIn("WARN unmapped: a/sub/c.py", err)
+        self.assertNotIn("WARN unmapped: a/b.py", err)
+
+    def test_double_star_crosses_directories(self):
+        self._map_only({"always": [], "default": ["test_default"], "map": {"fx/**": ["test_fx"]}})
+        self._commit_all("empty base")
+        self._write("fx/bundles/WS1/plan.json")
+        code, selected, err = self._gate("HEAD", "--list")
+        self.assertEqual(code, 0)
+        self.assertIn("test_fx.py", selected)
+        self.assertNotIn("WARN", err)
+
+    def test_static_subdirs_select_the_static_family(self):
+        self._commit_all("empty base")
+        for rel in ("static/cards/activity.css", "static/core/el.js", "static/vendor/mermaid.min.js", "static/format.js"):
+            self._write(rel)
+        code, selected, err = self._gate("HEAD", "--list")
+        self.assertEqual(code, 0)
+        for name in ("test_page_rules.py", "test_fixtures.py", "test_view_seq.py", "test_etag.py"):
+            self.assertIn(name, selected)
+        self.assertNotIn("WARN", err)
+
+    def test_untracked_bak_files_are_ignored(self):
+        self._commit_all("empty base")
+        self._write("dash/store/base.py.bak")
+        self._write("dash/store/base.py.bak.2026")
+        self._write("static/cards/x.js.bak")
+        code, selected, err = self._gate("HEAD", "--list")
+        self.assertEqual(code, 0)
+        self.assertNotIn("WARN", err)
+        # Only the always pair: no default fallback, so no WARN and no test_server.
+        self.assertEqual(selected, ["test_page_rules.py", "test_privacy_pin.py"])
 
     def test_list_runs_nothing(self):
         # A broken test file must not explode --list: selection only.

@@ -103,3 +103,31 @@ class InstallTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class MemcapRulesTest(unittest.TestCase):
+    """memcap.sh loads machine-specific refusals from outside the repo."""
+
+    SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "memcap.sh"
+
+    def _run(self, rules_body):
+        with tempfile.TemporaryDirectory() as tmp:
+            rules = Path(tmp) / "rules.sh"
+            if rules_body is not None:
+                rules.write_text(rules_body, encoding="utf-8")
+            env = dict(os.environ, AGENT_DASH_MEMCAP_RULES=str(rules))
+            return subprocess.run(
+                ["bash", str(self.SCRIPT), "64", "echo", "ran"],
+                capture_output=True, text=True, env=env, timeout=30,
+            )
+
+    def test_runs_when_no_rule_file_exists(self):
+        out = self._run(None)
+        self.assertEqual(out.returncode, 0)
+        self.assertIn("ran", out.stdout)
+
+    def test_a_rule_can_refuse_and_sees_the_command(self):
+        out = self._run('if [[ "$*" == *echo* ]]; then echo refused >&2; exit 2; fi\n')
+        self.assertEqual(out.returncode, 2)
+        self.assertIn("refused", out.stderr)
+        self.assertNotIn("ran", out.stdout)

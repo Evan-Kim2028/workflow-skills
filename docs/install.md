@@ -42,3 +42,7 @@ sh tools/agent-dash/scripts/install_hooks.sh --claude-label-guard --claude-lead-
 
 Skills under `~/.claude/skills` that are not symlinks into this repo are not moved
 by `install.sh`. Some come from third parties; see the owner's list before moving them.
+
+## Local memcap rules
+
+`scripts/memcap.sh` sources `~/.config/agent-dash/memcap-rules.sh` when it exists (override the path with `AGENT_DASH_MEMCAP_RULES`). The file sees the wrapped command in `$*` and may `exit` to refuse a run. Keep machine-specific paths there, not in this repo.

@@ -3,6 +3,9 @@
 # Usage: memcap.sh <max_mb> <command...>   Kills the whole process group past the cap; exit 137.
 set -u
 max_mb=$1; shift
+# Machine-specific refusals live outside this repo; a rule file may exit before the run starts.
+rules="${AGENT_DASH_MEMCAP_RULES:-$HOME/.config/agent-dash/memcap-rules.sh}"
+if [ -r "$rules" ]; then . "$rules"; fi
 set -m
 "$@" &
 pid=$!
