@@ -180,6 +180,52 @@ class RunWorkerTests(unittest.TestCase):
             reason = model_policy_reason(row["kind"], row["model"], effort_from_extra_args(row), None)
             self.assertIsNone(reason, name)
 
+    def _write_registry(self, workers):
+        data = registry()
+        data["workers"] = workers
+        self.reg.write_text(json.dumps(data), encoding="utf-8")
+
+    def _with_unpriced(self, names):
+        workers = registry()["workers"]
+        for name in names:
+            workers[name] = dict(workers[name], model="no-such-model-xyz")
+        self._write_registry(workers)
+
+    def test_auto_skips_an_unpriced_tier_for_the_next_one(self):
+        self._with_unpriced(["muse"])  # first in the fixture's auto_order
+        self.counts = {}
+        launch = Launch()
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            code, line = self.go("auto", launch)
+        self.assertEqual(code, 0)
+        self.assertIn("tier=glm-flash", line)
+        self.assertEqual(launch.cmds[0][0], "grok")
+        self.assertNotIn("muse", launch.cmds[0][0])
+        self.assertIn("skipping muse", err.getvalue())
+        self.assertIn("no catalog price", err.getvalue())
+
+    def test_auto_skips_every_unpriced_tier_then_reports_none_available(self):
+        self._with_unpriced(["muse", "glm-flash", "codex-luna", "pi-deepseek-flash"])
+        self.counts = {}
+        launch = Launch()
+        with contextlib.redirect_stderr(io.StringIO()):
+            code, line = self.go("auto", launch)
+        self.assertEqual(code, 0)
+        self.assertIn("reason=none-available", line)
+        self.assertEqual(launch.cmds, [])
+
+    def test_named_unpriced_tier_keeps_launching_without_preflight(self):
+        # Only auto skips unpriced tiers. A named tier still launches; the
+        # preflight is what refuses it (test_preflight_blocks_unpriced_model).
+        self._with_unpriced(["muse"])
+        self.counts = {}
+        launch = Launch()
+        code, line = self.go("muse", launch)
+        self.assertEqual(code, 0)
+        self.assertIn("tier=muse", line)
+        self.assertEqual(launch.cmds[0][0], "muse")
+
     def test_default_launches_muse_and_writes_the_manifest(self):
         self.counts = {}
         launch = Launch()
