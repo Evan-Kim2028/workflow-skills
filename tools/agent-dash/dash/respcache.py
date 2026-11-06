@@ -345,6 +345,7 @@ class ResponseCache:
         # not convoy on the store lock.
         ttl = effective_ttl(key, ttl)
         start_bg = False
+        skipped = False
         with self._lock:
             entry = self._entries.get(key)
             if entry is None:
@@ -376,7 +377,7 @@ class ResponseCache:
                             entry.event = threading.Event()
                             start_bg = True
                         else:
-                            self._record(endpoint, "bg_skipped")
+                            skipped = True
             elif entry.computing:
                 kind = "wait"
                 event = entry.event
@@ -391,6 +392,8 @@ class ResponseCache:
             return self._serve_copy(payload, etag, generated, refresh, now, "hit")
         if kind == "stale":
             self._record(endpoint, "stale")
+            if skipped:
+                self._record(endpoint, "bg_skipped")
             self._note_age(endpoint, now - generated)
             if start_bg:
                 self._record(endpoint, "background")
