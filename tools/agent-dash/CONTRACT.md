@@ -956,6 +956,8 @@ upstream commit is wanted. `run` refuses to start when the port
 answers with a different `build_id` (use `--force-replace` to restart
 it instead); `status` prints the running build.
 
+Before the gate, `deploy` links the gitignored local overrides from the source checkout into the release as symlinks: `config.local.json`, `workers.local.json`, `map.local.json`, `plans.local.json`, and `static/taskmap.local.json` (`dash/deploy.py` `LOCAL_FILES`). A missing source file is skipped, and a real file already in the release is refused. `rollback` and the automatic recovery link the target release the same way. `AGENT_DASH_LOCAL_SOURCE` names the source checkout; by default it is the checkout that runs the deploy. A refused gate restarts nothing, because nothing was switched. The cutover, rollback and ship steps are in `tools/agent-dash/docs/live-release.md`.
+
 Process control never orphans or mis-signals. The pidfile is written
 atomically and removed only by its owner: the exiting server, `stop`,
 and `restart` erase it only when it still names their own pid, so an
