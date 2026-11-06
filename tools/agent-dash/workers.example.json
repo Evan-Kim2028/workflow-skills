@@ -1,8 +1,32 @@
 {
-  "default": "muse",
-  "auto_order": ["muse", "glm-flash", "codex-luna", "pi-deepseek-flash"],
+  "default": "pi-anthropic-haiku",
+  "auto_order": ["pi-anthropic-haiku", "pi-deepseek-flash"],
   "cooldown_minutes": 30,
   "workers": {
+    "pi-anthropic-haiku": {
+      "enabled": true,
+      "kind": "pi",
+      "model": "anthropic/claude-haiku-5-5",
+      "extra_args": [],
+      "cap": 10,
+      "pgrep": "[l]aunch_pi.py.*--tier pi-anthropic-haiku",
+      "manifest": "pi-sessions.tsv",
+      "columns": ["label", "session_id", "epoch", "model"],
+      "quota_patterns": ["rate limit", "quota", "429", "usage limit", "insufficient credits"],
+      "cost_rank": 1
+    },
+    "pi-deepseek-flash": {
+      "enabled": true,
+      "kind": "pi",
+      "model": "river/deepseek-ai/DeepSeek-V4.1-Flash-1017",
+      "extra_args": [],
+      "cap": 5,
+      "pgrep": "[l]aunch_pi.py.*--tier pi-deepseek-flash",
+      "manifest": "pi-sessions.tsv",
+      "columns": ["label", "session_id", "epoch", "model"],
+      "quota_patterns": ["rate limit", "quota", "429", "usage limit", "insufficient credits"],
+      "cost_rank": 2
+    },
     "muse": {
       "enabled": true,
       "kind": "muse",
@@ -13,18 +37,18 @@
       "manifest": "muse-sessions.tsv",
       "columns": ["label", "session_id", "epoch", "model"],
       "quota_patterns": ["rate limit", "quota", "429", "usage limit"],
-      "cost_rank": 1
+      "cost_rank": 3
     },
-    "grok": {
+    "grok-build-47": {
       "enabled": true,
-      "kind": "cursor",
-      "model": "grok-4.7[context=500k,reasoning_effort=xhigh,fast=false]",
+      "kind": "grok-build",
+      "model": "grok-4.7",
       "extra_args": [],
       "cap": 25,
-      "pgrep": "[c]ursor-agent",
-      "manifest": "cursor-sessions.tsv",
+      "pgrep": "-m [g]rok-4.7($| )",
+      "manifest": "glm-sessions.tsv",
       "columns": ["label", "session_id", "epoch", "model"],
-      "quota_patterns": ["rate limit", "quota", "429", "usage limit"],
+      "quota_patterns": ["rate limit", "quota", "429", "usage limit", "rate limit reached for requests"],
       "cost_rank": 4
     },
     "deepseek-flash": {
@@ -63,18 +87,6 @@
       "quota_patterns": ["rate limit", "quota", "429", "usage limit", "rate limit reached for requests"],
       "cost_rank": 2
     },
-    "pi-deepseek": {
-      "enabled": true,
-      "kind": "pi",
-      "model": "river/deepseek-ai/DeepSeek-V4.1-Flash-1017",
-      "extra_args": [],
-      "cap": 12,
-      "pgrep": "[l]aunch_pi.py.*--model river/deepseek-ai/DeepSeek-V4.1-Flash-1017",
-      "manifest": "pi-sessions.tsv",
-      "columns": ["label", "session_id", "epoch", "model"],
-      "quota_patterns": ["rate limit", "quota", "429", "usage limit", "insufficient credits"],
-      "cost_rank": 2
-    },
     "pi-beam": {
       "enabled": true,
       "kind": "pi",
@@ -98,18 +110,6 @@
       "columns": ["label", "session_id", "epoch", "model"],
       "quota_patterns": ["rate limit", "quota", "429", "usage limit"],
       "cost_rank": 5
-    },
-    "pi-deepseek-flash": {
-      "enabled": true,
-      "kind": "pi",
-      "model": "river/deepseek-ai/DeepSeek-V4.1-Flash-1017",
-      "extra_args": [],
-      "cap": 5,
-      "pgrep": "[l]aunch_pi.py.*--tier pi-deepseek-flash",
-      "manifest": "pi-sessions.tsv",
-      "columns": ["label", "session_id", "epoch", "model"],
-      "quota_patterns": ["rate limit", "quota", "429", "usage limit", "insufficient credits"],
-      "cost_rank": 6
     }
   }
 }
