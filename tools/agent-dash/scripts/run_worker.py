@@ -86,6 +86,9 @@ RULES_MARKER = "<!-- agent-dash:worker-rules v1 -->"
 #: template's first heading; detection also accepts that line (see assemble_prompt).
 #: The first line of a caller's prompt when it names the run (``[label: x]``).
 LABEL_LINE = re.compile(r"\[label:[^\]\n]*\]")
+#: Assembled prompts above this print a warning: Haiku 5.5 bills about 5x past
+#: 100K tokens, and every turn re-reads the whole prompt.
+PROMPT_WARN_BYTES = 40 * 1024
 
 #: Harness that runs each launch kind. The dashboard row, the meta file, and
 #: the registry all name it the way ``dash.models.harness_of`` does, so a
@@ -333,6 +336,14 @@ def prepare_prompt(ctx, no_rules: bool) -> None:
     if target.resolve() == source.resolve():
         target = ctx["run_dir"] / f"{ctx['label']}.prompt.md"
     target.write_text(assembled, encoding="utf-8")
+    size = len(assembled.encode("utf-8"))
+    print(f"prompt: assembled {size} bytes -> {target}", file=sys.stderr)
+    if size > PROMPT_WARN_BYTES:
+        print(
+            f"prompt warning: assembled prompt is {size} bytes, over {PROMPT_WARN_BYTES}. "
+            "Haiku 5.5 bills about 5x past 100K tokens and each turn re-reads the prompt; trim the task text.",
+            file=sys.stderr,
+        )
     ctx["prompt"] = str(target)
 
 

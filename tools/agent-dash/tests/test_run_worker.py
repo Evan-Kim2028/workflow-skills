@@ -1198,6 +1198,20 @@ class PromptHandoffTests(unittest.TestCase):
         self.assertIn(str(self.prompt), launch.cmds[0])
         self.assertFalse((self.run_dir / "ws1-plan-norules.md").exists())
 
+    def test_size_warning_above_the_threshold(self):
+        big = self.root / "big.md"
+        big.write_text("x" * (runner.PROMPT_WARN_BYTES + 10) + "\n", encoding="utf-8")
+        ctx = {"prompt": str(big), "label": "ws1-plan-big", "run_dir": self.run_dir}
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+        from io import StringIO
+        import contextlib
+
+        err = StringIO()
+        with contextlib.redirect_stderr(err):
+            runner.prepare_prompt(ctx, False)
+        self.assertIn("over", err.getvalue())
+        self.assertIn("assembled prompt is", err.getvalue())
+        self.assertEqual(Path(ctx["prompt"]).name, "ws1-plan-big.md")
 
 
 if __name__ == "__main__":
