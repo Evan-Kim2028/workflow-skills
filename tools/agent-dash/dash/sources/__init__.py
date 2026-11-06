@@ -20,6 +20,7 @@ store.get_offset and store.set_offset.
 
 from __future__ import annotations
 
+import contextlib
 import importlib
 import json
 import logging
@@ -286,7 +287,9 @@ def _run_poll(registry: Registry, source, store, cfg, now: float, budget: float)
     """Poll one source and record the outcome. Always runs in a worker thread."""
     start = time.monotonic()
     try:
-        source.poll(store, cfg, now)
+        scope = getattr(store, "attribution_scope", None)
+        with (scope() if callable(scope) else contextlib.nullcontext()):
+            source.poll(store, cfg, now)
     except Exception as exc:
         duration = time.monotonic() - start
         with registry._lock:
@@ -470,6 +473,47 @@ SCAN_ROOTS_TTL_S = 10.0
 _MEMO: dict = {}
 _MEMO_LOCK = threading.Lock()
 _MEMO_MAX = 20000
+
+# Finished rows are re-checked (written only if their inputs changed) at most
+# once per this window. Each recheck runs the full write path, so the window
+# sets the steady CPU floor: 2 min keeps ~2k finished rows near 17 checks a tick.
+SETTLED_RECHECK_S = 120.0
+
+
+class SettledRows:
+    """Skip re-writing finished rows whose inputs did not change.
+
+    A poll upserts every chat or manifest row on every 2 s tick, so finished
+    runs (most of the table) cost a full write path each time. A row marked
+    settled (finished, same input signature) is skipped until
+    ``recheck_s`` passes, so late fields still land within that window. A
+    live row is never settled, so it is written on every tick.
+    Keys are scoped to the store path, so two databases never share a memo.
+    """
+
+    def __init__(self, recheck_s: float = SETTLED_RECHECK_S):
+        self.recheck_s = float(recheck_s)
+        self._lock = threading.Lock()
+        self._seen: dict = {}
+
+    @staticmethod
+    def key(store, name, ident):
+        return (str(getattr(store, "path", "")), name, ident)
+
+    def skip(self, key, sig, now: float) -> bool:
+        with self._lock:
+            hit = self._seen.get(key)
+        return hit is not None and hit[0] == sig and 0 <= now - hit[1] < self.recheck_s
+
+    def settle(self, key, sig, now: float, live: bool) -> None:
+        with self._lock:
+            if live:
+                self._seen.pop(key, None)
+                return
+            if len(self._seen) > _MEMO_MAX:
+                self._seen.clear()
+            self._seen[key] = (sig, now)
+
 
 
 def memo_call(key, ttl_s: float, compute):

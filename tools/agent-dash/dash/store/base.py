@@ -63,6 +63,8 @@ class BaseMixin:
             self._data_seq = 0
             self._view_seq = 0
             self._cursor_seq = 0
+            self._sample_seq = 0
+            self._counts_seq = 0
             self._last_data_ts: float | None = None
             self._snapshot_cache: dict = {}
             self._model_stats_cache = None
@@ -113,6 +115,22 @@ class BaseMixin:
         @property
         def cursor_seq(self) -> int:
             return self._cursor_seq
+        @property
+        def counts_seq(self) -> int:
+            """Moves on workstream board counts (the state body names boards from them)."""
+            return self._counts_seq
+        @property
+        def sample_seq(self) -> int:
+            """Moves on process samples (liveness evidence), not on cursors."""
+            return self._sample_seq
+        @property
+        def content_key(self) -> tuple:
+            """What the cached response bodies key on: rows and liveness evidence.
+
+            ``seq`` also moves on cursor advances and prunes, which change no
+            served byte, so keying on it made every idle poll a cache miss.
+            """
+            return (self._data_seq, self._sample_seq, self._counts_seq)
         @property
         def last_data_ts(self) -> float | None:
             return self._last_data_ts

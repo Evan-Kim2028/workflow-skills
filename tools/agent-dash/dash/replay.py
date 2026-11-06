@@ -186,8 +186,14 @@ def _final_done(
     return value
 
 
-def build_replay(store, ws: str, now: float | None = None) -> dict:
-    """One timeline for a workstream from a single store pass plus its plan."""
+def build_replay(store, ws: str, now: float | None = None, runs: list | None = None) -> dict:
+    """One timeline for a workstream from a single store pass plus its plan.
+
+    ``runs`` is the caller's ``query_runs(moment, None, None, None, REPLAY_LIMIT)``
+    result when it already has one (the project total shares one pass across
+    every workstream). Rows are read, never changed, so a shared list gives the
+    same timeline as a per-call query.
+    """
     moment = time.time() if now is None else now
     _source, body = resolve_plan(ws)
     if not isinstance(body, dict):
@@ -198,7 +204,8 @@ def build_replay(store, ws: str, now: float | None = None) -> dict:
     ids = taskmatch.plan_task_ids(body.get("groups"))
     taskmap = taskmatch.load_taskmap()
 
-    runs = store.query_runs(moment, None, None, None, REPLAY_LIMIT)
+    if runs is None:
+        runs = store.query_runs(moment, None, None, None, REPLAY_LIMIT)
     per_task: dict[str, list] = {tid: [] for tid in by_id}
     for run in runs:
         if not isinstance(run, dict) or run.get("source") == "dagster":

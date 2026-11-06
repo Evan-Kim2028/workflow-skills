@@ -38,7 +38,10 @@ import os
 import time
 from datetime import datetime, timedelta, timezone
 
+from dash.sources import SettledRows
 from dash.sources.process import apply_liveness, live_agent_processes
+
+_SETTLED = SettledRows()
 
 log = logging.getLogger("agent_dash.muse")
 
@@ -98,12 +101,22 @@ def _poll(store, cfg, now):
                 row["parent_session_id"] = parent
                 _keep_latest(manifests, row)
 
+    procs_sig = _processes_sig(processes)
     for row in manifests.values():
         sid = row.get("session_id")
+        # A row is settled when its manifest fields and the live-process
+        # listing are unchanged: no stat, no write until the recheck window.
+        # Any process start or exit changes the listing, so a new live run
+        # is picked up on the next tick, not after the window.
+        key = _SETTLED.key(store, "muse", sid)
+        sig = (tuple(sorted((k, str(v)) for k, v in row.items())), procs_sig)
+        if _SETTLED.skip(key, sig, now):
+            continue
         path = _locate(sessions, sid)
         if not path and isinstance(sid, str):
             path = _locate(sessions, sid.lower())
-        _upsert_run(store, sid, manifests, None, None, False, None, processes, path)
+        status = _upsert_run(store, sid, manifests, None, None, False, None, processes, path)
+        _SETTLED.settle(key, sig, now, live=status == "running")
     _adopt_live_labels(store, manifests, processes)
 
     files = _candidate_files(store, sessions, manifests, now, fresh_hours, scan_s)
@@ -186,6 +199,21 @@ def _split_priority(files, manifests, now, recent_s):
     return hot, cold
 
 
+#: Files found at end-of-file on their last tail, keyed by path and stamped with
+#: (inode, size, mtime). A file whose stamp is unchanged has no new bytes, so a
+#: tail would read nothing and write nothing: skip it on the stat alone.
+_TAILED: dict = {}
+_TAILED_MAX = 20000
+
+
+def _tail_stamp(path):
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return (int(st.st_ino), int(st.st_size), int(st.st_mtime_ns))
+
+
 def _drain_files(store, files, key, budget, per_file, now, processes, manifests):
     if not files or budget <= 0:
         return budget
@@ -195,9 +223,20 @@ def _drain_files(store, files, key, budget, per_file, now, processes, manifests)
     scanned = 0
     while scanned < n and budget > 0:
         path, sid, muse_parent = files[idx]
+        stamp = _tail_stamp(path)
+        if stamp is not None and _TAILED.get(path) == stamp:
+            idx = (idx + 1) % n
+            scanned += 1
+            continue
+        before = budget
         budget = _tail_file(
             store, path, sid, manifests, muse_parent, budget, per_file, now, processes
         )
+        if budget == before and stamp is not None:
+            # No bytes were read: the file was already consumed to its end.
+            if len(_TAILED) > _TAILED_MAX:
+                _TAILED.clear()
+            _TAILED[path] = stamp
         idx = (idx + 1) % n
         scanned += 1
     try:
@@ -404,6 +443,7 @@ def _upsert_run(store, sid, manifests, muse_parent, model, have_log_start, log_t
         store.upsert_session(session)
     except Exception:
         _fail("session")
+    return run.get("status")
 
 
 def _adopt_live_labels(store, manifests, processes):
@@ -427,6 +467,23 @@ def _adopt_live_labels(store, manifests, processes):
             continue
         _keep_latest(manifests, {"label": label, "session_id": sid, "started_at": None})
         _upsert_run(store, sid, manifests, None, None, False, None, processes)
+
+
+def _processes_sig(processes) -> tuple:
+    """Hashable identity of the live process listing (None means it failed).
+
+    ``started_at`` is left out: it is derived from ``ps`` elapsed time and
+    moves by a second on every listing, which would re-evaluate every row on
+    every tick. Pid, command and label name the process; a reused pid with the
+    same label is caught at the next recheck.
+    """
+    if processes is None:
+        return ("none",)
+    return tuple(sorted(
+        (str(p.get("pid")), str(p.get("comm") or ""), str(p.get("label") or ""))
+        for p in processes
+        if isinstance(p, dict)
+    ))
 
 
 def _agent_processes():

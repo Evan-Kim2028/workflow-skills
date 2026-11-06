@@ -481,3 +481,177 @@ and state dir, so I do not think they caused it, but this is not proven.
 and `deploy`. I did not check whether each of those calls isolates the port, and
 I did not run either file. The owner should check other sessions and those two
 suites before the next run.
+
+## Stage 4 (2026-11-06): poll cadence, content keys, shared state build
+
+Owner report unchanged. Same method as stage 3: a frozen live-shaped copy (one
+`sqlite3 .backup` of the live database, copied once to two temp state dirs),
+the same probe, Dagster off, `AGENT_DASH_READONLY=1`, each build on its own
+port. Base is `cc57a70` (the stage 3 branch base); head is `3c00db3`. Both
+builds ran from `git archive` snapshots, not the checkout.
+
+### Verdict
+
+Partial. Items 2 and 4 are landed and met. Items 1 and 3 are landed but short of target. Item 5 is not done. The targets not met:
+
+- Source poll CPU idle: 101% → 78% of one core (target 15%). Not met.
+- `/api/ws/progress?ws=all` cold: 12.3 s → 6.3 s on the copy (target under 1 s). Not met.
+- First section: 3.0–3.4 s both builds (target 1.5 s, budget 1.5 s). Not met, and not improved.
+- Cold `/api/state` 503: reproduced on base, not on head (see item 4). Met.
+
+### Where the CPU goes now (measured, idle window after the probe)
+
+Per source, CPU as a share of one core, 55–60 s window, same copy:
+
+| source | base | head | ms per poll base → head |
+|---|---|---|---|
+| muse | 27.6% | 15.5% | 585 → 334 |
+| cursor | 25.4% | 13.2% | 561 → 285 |
+| manifests | 14.4% | 13.4% | 318 → 288 (not changed) |
+| pi / commandcode / grok_cli | 8.3 / 6.8 / 6.8% | 8.4 / 7.2 / 6.8% | not changed |
+| codex / process | 5.6 / 4.1% | 6.4 / 4.3% | not changed |
+| **total sources** | **101.4%** | **77.7%** | |
+
+A fresh head server, 100 s after start and with no probe run, idles at 68%.
+An intermediate build (before the `counts_seq` and `ws=all` commits) read 43%
+in a quiet 60 s window with no probe run. The gap to 78% was not isolated; the
+laptop's load average was 8–12 during these runs. Treat the absolute figures as
+±15%.
+
+The remaining cost is not one hot function. Per-tick work that is still
+unconditional: discovery (`_discover`, `_attach_labels`, `_transcript`
+stats for ~1,200 cursor chats), `_candidate_files` (a `getmtime` per muse file),
+the manifest directory walk (its full scan every 15 s, 288 ms average), and the
+`ps` listing. Cutting those needs source-by-source cadence (a directory-change
+signal, not a re-walk), which this stage did not reach.
+
+### What changed (one commit each; see `git log` on `perf/dash-snappy-4`)
+
+1. **Attribution read once per poll** (`8cb7d9e`). `upsert_run` re-read the
+   attribution map and train branches on every call (~2.4k per cursor poll).
+   `Store.attribution_scope()` is thread-local and opened per source poll in
+   `_run_poll`. Request threads read fresh as before. Cursor 448 → 271 ms,
+   muse 434 → 266 ms in the profiler (same copy).
+2. **Settled rows skip** (`b9e85c9`, `0eb9b62`, `79cca91`). A finished cursor
+   chat or muse manifest row whose inputs are unchanged is written at most once
+   per 120 s (`SettledRows`). Live rows (cursor pid, muse `running`) are never
+   settled, so they write every tick. Muse rows with no evidence (791 of 809
+   per poll) were re-evaluated every tick; they settle now too. The window was
+   30 s first, which re-ran ~2k rows every few ticks; 120 s is the floor.
+3. **Muse signature and stat skip** (`d342dfa`). The process signature used
+   `started_at` from `ps` elapsed time, which moved by a second per listing, so
+   every muse row re-ran each tick (~1,660 misses). Signature is now pid,
+   command and label. A session file at end-of-file is skipped until its
+   (inode, size, mtime) changes.
+4. **Cursor freshness memo** (`59a0ea9`). One offset query per labelled chat per
+   tick was skipped while the chat's (inode, size, cursor) stamp is unchanged.
+5. **Content key for caches** (`f512195`, `1c6bbb5`). `/api/state`, the
+   wsprogress cache and the burn cache keyed on `store.seq`, which every cursor
+   advance and prune moves. They key on `Store.content_key` =
+   `(data_seq, sample_seq, counts_seq)`. `sample_seq` is new (process samples are
+   liveness evidence the state body reads). `counts_seq` moves on `ws_counts`
+   writes: the state body names boards from them, but the snapshot's data
+   version must not move (test_server pins it). `seq` itself is unchanged: the
+   stale badge and the SSE tick need it.
+   `/api/project/burnup` warm median 395 → 2.8 ms.
+6. **`ws=all` one store pass for replays** (`3c00db3`). `build_project_progress`
+   ran `query_runs` once per workstream (30 full passes). The replay query is
+   identical across workstreams (same moment, no filter, same limit), so it runs
+   once. Equivalence: `scripts/wsprogress_equiv.py --db <copy> --old-root <base>`
+   reports 31 of 31 outputs identical on the copy. Cold `ws=all` on the copy:
+   12.3 s → 6.3 s. Not under 1 s: the runs-started-per-hour query is still per
+   workstream. Sharing it changes WS2 and WS8, because the store attributes some
+   inherited runs by its own filter, so the shortcut is not exact. Next step:
+   one grouped store query that returns the attribution with each row.
+7. **Cold state 503** (`7686dbf`). See item 4 below.
+
+### Item 4: cold `/api/state` 503 (cause verified)
+
+Cause, from the code and a repro (`repro503`: fresh 5x seed per trial, `warm()`,
+cold GET immediately): the warm thread called `build_state` outside the shared
+build gate, so a cold request started a second full build. The two contended
+for the store lock; the loser's 2 s `STATE_STORE_LOCK_TIMEOUT_S` wait raised, and
+the request got 503. Base: the cold request returned 503 after 2.34 s on trial 0
+of 4 (the lock timeout). Head: 0 of 8 cold trials 503; 4.0–4.6 s each.
+
+Fixes: warm runs through the same gate (a request joins the one build), and
+`STATE_BUILD_TIMEOUT_S` is 10 s, not 5 s. The 5 s budget was below the 8 s cold
+5x endpoint budget in `perf_budgets.json`, so a legitimate 5–8 s build also 503ed.
+`test_state_build_budget_applies_when_response_cache_is_disabled` stays as it
+was; it patches the budget and still passes. No budget in `perf_budgets.json`
+was changed.
+
+Full-file `ADASH_PERF=1 tests/perf/test_perf_budget.py`, HEAD: 6 of 6 in three
+consecutive runs (107 s, 118 s, 136 s). Base: 6 of 6 once (112 s). The 503 in the
+docs (3 of 4 full-file runs) did not reproduce in these four runs.
+
+### Item 2: why `test_view_seq` pins what it pins
+
+`set_offset` bumps `_seq` on every real cursor advance because the stale badge
+and the SSE tick use `seq` to tell live from dead. `test_offset_write_moves_seq_only`
+pins that, and it still holds. The response caches were the problem, not
+`seq`. The pin is unchanged.
+
+### Item 5: first paint (not met)
+
+`page_check.mjs --perf`, first section drawn, budget 1500 ms, fresh server, 120 s
+warm-up, same copy, same ports:
+
+| build | first section, runs |
+|---|---|
+| base (`cc57a70`) | 1.8 s (first run); 3.0 s; 3.1 s |
+| head (`3c00db3`) | 3.4 s (load average 8); 7.3 s (load average 12); 7.6 s with the gated warm call reverted (load 12) |
+
+Bisect of the head-side commits at a lighter load: `8cb7d9e` 3.6 s, `b9e85c9` 4.1 s,
+`f512195` 3.2 s, `d342dfa` 2.3 s, `59a0ea9` 1.9 s (and a 13.5 s outlier on its first run).
+The 7–8 s head runs were at load average ~12; the later head run at load ~8 gave
+3.4 s. So the regression is not established, and I did not find a commit that
+causes one. The first section is still ~2–3× the budget on both builds, and I
+did not profile the first draw itself.
+
+The `state.wssAll` render signature (`projSig` in `static/core/api.js`) was not
+checked for extra re-renders, and `/api/state` (854 KB) and `/api/runs` (831 KB)
+were not cut. Both remain open.
+
+### Not done, and why
+
+- Source CPU target 15%: manifests and cursor discovery are per-tick walks (see
+  "Where the CPU goes"). Needs cadence or change signals per source.
+- `ws=all` under 1 s: the per-workstream runs-per-hour query (see item 3).
+- First section under 1.5 s and idle re-render count: not profiled (item 5).
+- `/api/state` and `/api/runs` payload size: not investigated.
+- `file_offsets` blob markers: still no pruning rule (stage 3, unchanged).
+
+### Probe, same copy, base vs head (cold / median / p95 ms)
+
+| endpoint | base | head |
+|---|---|---|
+| /api/health | 1407 / 19.7 / 24.9 | 1569 / 15.0 / 22.7 |
+| /api/state | 1848 / 3.0 / 3.3 | 1638 / 3.1 / 3.4 |
+| /api/snapshot | 1084 / 1.1 / 1.3 | 1986 / 1.7 / 2.3 |
+| /api/workstreams | 1836 / 13.7 / 27.5 | 1895 / 11.5 / 30.4 |
+| /api/project/phases | 2200 / 1.0 / 15.6 | 2287 / 0.5 / 0.7 |
+| /api/project/burnup | 453 / 394.7 / 646.1 | 366 / 2.8 / 409.8 |
+| /api/runs | 767 / 4.0 / 4.1 | 1015 / 3.7 / 3.9 |
+| /api/sessions | 865 / 624 / 644 | 833 / 606 / 1005 |
+| /api/doctor | 363 / 417 / 725 | 362 / 281 / 421 |
+| /api/ws/progress?ws=all | 23193 / 2.3 / 2.4 | 17814 / 1.9 / 2.4 |
+| /api/project/graph | 2324 / 0.8 / 0.8 | 2248 / 0.7 / 0.9 |
+
+Server CPU, 60 s page-like window (probe `cpu_pct_of_core`): base 117.6%, head
+113.6%. The page-like load (requests on top of the pollers) is the dominant
+part of that figure as well, so the window is not a source-only number.
+
+Token totals, run counts and cost: NOT verified on this stage. The probe
+compares response sizes only (`/api/usage` 451,963 bytes on both builds;
+`/api/runs` 831,091 vs 831,287 bytes, which moves with live running rows). The
+stage 3 offline check (791,182 usage events, 15,684.11 USD) was not repeated, so
+the prompt's "confirm the totals match" condition is open.
+
+### Cutover
+
+No schema change, no data migration. Python changes need a `serve` restart
+(`static/` is live on reload). The new content key and settle memos are in
+memory and rebuild on the first poll. Rollback: redeploy the previous release.
+Verify after cutover: `scripts/perf_probe.py` against the live port (GET only),
+and the source CPU share from `/api/health` once the process has run 2 minutes.

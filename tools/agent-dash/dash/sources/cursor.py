@@ -44,7 +44,7 @@ import sqlite3
 import tempfile
 from collections import Counter
 from pathlib import Path
-from dash.sources import realpath_memo
+from dash.sources import SettledRows, realpath_memo
 
 log = logging.getLogger("agent_dash.cursor")
 
@@ -263,8 +263,7 @@ def _poll(store, cfg, now):
             if chat["uuid"] not in hooked and not _worth_tracking(chat, now):
                 continue
             if chat.get("label") or chat.get("pid") or chat.get("child_of") or chat["uuid"] in hooked:
-                _upsert(store, chat, now, chat.get("hook_model"))
-                _retire_shadow(store, chat)
+                _upsert_settled(store, chat, now)
             chosen.append(chat)
         pending = [chat for chat in chosen if not _db_fresh(store, chat)]
         _drain(store, pending, budget, per_file, tick_budget, now, tmp_root)
@@ -301,6 +300,26 @@ def _worth_tracking(chat, now):
     if isinstance(updated, int) and now - (updated / 1000.0) < RUNNING_WINDOW_S:
         return True
     return False
+
+
+# Finished chats are re-written at most every SettledRows window while their
+# inputs are unchanged; a running chat (pid) is written every tick.
+_SETTLED = SettledRows()
+_SETTLED_FIELDS = (
+    "uuid", "pid", "label", "updated_ms", "hook_model", "manifest_model",
+    "live_model", "child_of", "parent", "cwd", "transcript",
+)
+
+
+def _upsert_settled(store, chat, now):
+    key = _SETTLED.key(store, "cursor", chat["uuid"])
+    sig = tuple(chat.get(field) for field in _SETTLED_FIELDS)
+    live = _status(chat, now) == "running"
+    if not live and _SETTLED.skip(key, sig, now):
+        return
+    _upsert(store, chat, now, chat.get("hook_model"))
+    _retire_shadow(store, chat)
+    _SETTLED.settle(key, sig, now, live)
 
 
 def _drain(store, pending, budget, per_file, tick_budget, now, tmp_root):
@@ -1342,6 +1361,13 @@ def _is_hot(chat, now):
     return isinstance(updated, int) and now - (updated / 1000.0) < RUNNING_WINDOW_S
 
 
+# (store, path) -> (inode, size, cursor) of the last chat observed fresh. A chat
+# whose stamp is unchanged was already consistent with its stored offset, so the
+# offset query is skipped (one query per chat per tick otherwise).
+_FRESH_SEEN: dict = {}
+_FRESH_SEEN_MAX = 20000
+
+
 def _db_fresh(store, chat):
     path = chat.get("store_path")
     if not path or not os.path.isfile(path):
@@ -1350,13 +1376,23 @@ def _db_fresh(store, chat):
         st = os.stat(path)
     except OSError:
         return True
+    cursor = _cursor_of(chat, st)
+    stamp = (int(st.st_ino), int(st.st_size), cursor)
+    memo_key = (str(getattr(store, "path", "")), path)
+    if _FRESH_SEEN.get(memo_key) == stamp:
+        return True
     rec = _offset(store, _abs(path))
     if not rec or rec[0] != int(st.st_ino):
         return False
     try:
-        return int(rec[1]) == _cursor_of(chat, st)
+        fresh = int(rec[1]) == cursor
     except (TypeError, ValueError):
         return False
+    if fresh:
+        if len(_FRESH_SEEN) > _FRESH_SEEN_MAX:
+            _FRESH_SEEN.clear()
+        _FRESH_SEEN[memo_key] = stamp
+    return fresh
 
 
 def _cursor_of(chat, st):

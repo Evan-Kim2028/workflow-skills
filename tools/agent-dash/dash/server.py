@@ -29,7 +29,10 @@ ROOT = Path(__file__).resolve().parents[1]
 # _ttl_serve returns the last complete generation; on a cold cache the API
 # returns 503 and the caller can retry.
 STATE_STORE_LOCK_TIMEOUT_S = 2.0
-STATE_BUILD_TIMEOUT_S = 5.0
+# Budget for one state build, counted from its start. It was 5 s, below the
+# 8 s cold 5x endpoint budget (perf_budgets.json), so a legitimate 5-8 s build
+# returned 503. 10 s keeps the stuck-build bound (tests patch it) inside that.
+STATE_BUILD_TIMEOUT_S = 10.0
 STORE_LOCK_WATCHDOG_AFTER_S = 10.0
 HEALTH_STORE_REFRESH_S = 5.0
 
@@ -68,6 +71,12 @@ class _StateBuildGate:
         self._job = None
 
     def run(self, fn, timeout=STATE_BUILD_TIMEOUT_S):
+        """Run ``fn`` once for everyone who asks while it is in flight.
+
+        The first caller starts the build; later callers join it and wait for
+        the same job. A waiter gives up after ``timeout`` from the job's start
+        (a stuck build still 503s); the build itself is never cancelled.
+        """
         with self._lock:
             job = self._job
             if job is None:
@@ -337,10 +346,20 @@ class DashServer(ThreadingHTTPServer):
 
                 now = time.time()
                 processes = _live_workers()
-                build_state(
-                    self.store, self.registry, self.cfg,
-                    now=now, processes=processes, build=self.build,
-                )
+
+                # Through the shared build gate, not beside it: a request that
+                # arrives while this runs joins this build instead of starting a
+                # second full build that then contends for the store lock.
+                def collect_warm():
+                    return _with_store_lock_timeout(
+                        self.store,
+                        lambda: build_state(
+                            self.store, self.registry, self.cfg,
+                            now=now, processes=processes, build=self.build,
+                        ),
+                    )
+
+                self.state_builder.run(collect_warm, timeout=STATE_BUILD_TIMEOUT_S)
                 store = self.store
                 store.snapshot_cached(now, "all")
                 # Page-shaped entries: the first load fetches the all-scope

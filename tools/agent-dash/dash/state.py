@@ -190,8 +190,7 @@ def _state_key(store, processes, cfg, now: float, doctor_generated) -> tuple | N
     if not path or path == ":memory:":
         return None
     try:
-        seq = store.seq
-        data_seq = store.data_seq
+        content = store.content_key
     except Exception:
         return None
     try:
@@ -208,8 +207,7 @@ def _state_key(store, processes, cfg, now: float, doctor_generated) -> tuple | N
         phases_digest = None
     return (
         path,
-        seq,
-        data_seq,
+        content,
         _workers_key(processes),
         _files_fingerprint(cfg),
         _actions_flag(cfg),

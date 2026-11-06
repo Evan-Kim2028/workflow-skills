@@ -167,6 +167,7 @@ class UsageMixin:
                     self._conn.execute("ROLLBACK")
                     raise
                 self._seq += 1
+                self._sample_seq += 1
         def set_ws_counts(self, rows: list) -> None:
             clean = []
             for row in rows:
@@ -191,6 +192,7 @@ class UsageMixin:
                     self._conn.execute("ROLLBACK")
                     raise
                 self._seq += 1
+                self._counts_seq += 1
         def query_usage(
             self,
             group: str,

@@ -89,12 +89,9 @@ def _ignored_now() -> list[str]:
 
 
 def _cache_key(store, root: Path, ids: list[str], ignored=None):
-    seq = getattr(store, "seq", None)
-    if seq is None:
-        seq = getattr(store, "_seq", 0)
-    data_seq = getattr(store, "data_seq", None)
-    if data_seq is None:
-        data_seq = getattr(store, "_data_seq", 0)
+    content = getattr(store, "content_key", None)
+    if content is None:
+        content = (getattr(store, "data_seq", 0), getattr(store, "seq", 0))
     if ignored is None:
         ignored = _ignored_now()
     try:
@@ -103,7 +100,7 @@ def _cache_key(store, root: Path, ids: list[str], ignored=None):
         ignore_key = ignore_cache_key(ignored)
     except Exception:
         ignore_key = ()
-    return (str(root), tuple(_history_mtimes(root, ids)), seq, data_seq, ignore_key)
+    return (str(root), tuple(_history_mtimes(root, ids)), content, ignore_key)
 
 
 def _bundle_ids() -> tuple[Path, list[str]]:
