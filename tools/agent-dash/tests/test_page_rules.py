@@ -2190,6 +2190,62 @@ Promise.all([api("/api/project", {}), api("/api/project", {})]).then(function ()
         self.assertEqual(proc.returncode, 0, proc.stderr or proc.stdout)
         self.assertIn("nav share proof ok", proc.stdout)
 
+    def test_hung_health_does_not_hold_nav_and_badge_still_updates(self):
+        """Health feeds only the stale badge. A /api/health that never settles
+        must not hold loadNav, and when a health response does arrive the badge
+        updates. refreshHealth runs at most once per 30 s and never stacks."""
+        harness = r'''
+const fs = require("fs");
+const assert = require("assert");
+global.window = globalThis;
+global.FIX = false;
+global.state = {bundles: [], wss: [], wssAll: [], project: {name: null}, actionsArchive: false, lastSeqChange: 0, lastPoll: null};
+global.since = function () { return 123; };
+global.renderTabs = function () {};
+global.applyChrome = function () {};
+global.resolveLanding = function () {};
+var badges = {"stale-badge": {hidden: true, textContent: "", title: ""}, "live-txt": {textContent: "live"}};
+global.document = {getElementById: function (id) { return badges[id] || null; }};
+var healthUrls = [], healthResolvers = [];
+global.fetch = function (url, opts) {
+  var body = {bundles: [], workstreams: []};
+  if (url.indexOf("/api/health") === 0) {
+    healthUrls.push(url);
+    return new Promise(function (resolve) { healthResolvers.push(resolve); });
+  }
+  return Promise.resolve({ok: true, status: 200, headers: {get: function () { return "tag"; }}, json: function () { return Promise.resolve(body); }});
+};
+eval(fs.readFileSync(process.argv[2], "utf8"));
+var timeout = setTimeout(function () { console.error("ASSERT: loadNav held by a hung health request"); process.exit(1); }, 2000);
+loadNav().then(function () {
+  clearTimeout(timeout);
+  assert.strictEqual(healthUrls.length, 0, "loadNav must not fetch health");
+  assert.strictEqual(badges["stale-badge"].hidden, true);
+  refreshHealth();
+  refreshHealth();
+  assert.strictEqual(healthUrls.length, 1, "a tick while health is in flight must skip, got " + healthUrls.length);
+  healthResolvers[0]({ok: true, status: 200, headers: {get: function () { return "tag"; }}, json: function () { return Promise.resolve({sources: [{name: "poller", state: "error", last_error: "boom"}]}); }});
+  return new Promise(function (r) { setTimeout(r, 10); });
+}).then(function () {
+  assert.strictEqual(badges["stale-badge"].hidden, false, "badge must show the delayed source");
+  assert.strictEqual(badges["stale-badge"].textContent, "1 source delayed");
+  refreshHealth();
+  assert.strictEqual(healthUrls.length, 1, "health must not refetch within 30 s");
+  console.log("health isolation proof ok");
+  process.exit(0);
+}).catch(function (e) { console.error("ASSERT: " + ((e && e.stack) || e)); process.exit(1); });
+'''
+        with tempfile.TemporaryDirectory() as tmp:
+            harness_path = Path(tmp) / "health_iso.js"
+            harness_path.write_text(harness, encoding="utf-8")
+            proc = subprocess.run(
+                ["node", str(harness_path), str(STATIC / "core" / "api.js")],
+                capture_output=True,
+                text=True,
+            )
+        self.assertEqual(proc.returncode, 0, proc.stderr or proc.stdout)
+        self.assertIn("health isolation proof ok", proc.stdout)
+
     def test_project_totals_skip_ignored_bundles(self):
         """Project totals leave ignored bundles out of the comparison. /api/bundles
         keeps them while /api/workstreams drops them, so without this the
