@@ -21,7 +21,7 @@ python3 agent_dash.py run      # binds 127.0.0.1:8765
 python3 agent_dash.py status
 python3 agent_dash.py restart  # stop, then run; waits for /api/health
 python3 agent_dash.py deploy --ref origin/main --yes-live   # live: gate, link, switch to a clean release, health-gate
-python3 agent_dash.py rollback                              # back to PREVIOUS; run from a terminal (no --yes-live yet)
+python3 agent_dash.py rollback --yes-live                # back to PREVIOUS; from an agent shell, same as deploy
 python3 agent_dash.py backfill --session <session-uuid>
 ```
 

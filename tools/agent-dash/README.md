@@ -23,6 +23,8 @@ The script symlinks this directory to `~/.claude/tools/agent-dash` and each skil
 python3 ~/.claude/tools/agent-dash/agent_dash.py run
 python3 ~/.claude/tools/agent-dash/agent_dash.py status
 python3 ~/.claude/tools/agent-dash/agent_dash.py restart
+python3 ~/.claude/tools/agent-dash/agent_dash.py deploy --ref origin/main --yes-live
+python3 ~/.claude/tools/agent-dash/agent_dash.py rollback --yes-live
 python3 ~/.claude/tools/agent-dash/agent_dash.py check
 python3 ~/.claude/tools/agent-dash/agent_dash.py doctor
 python3 ~/.claude/tools/agent-dash/agent_dash.py reprice
@@ -36,6 +38,8 @@ python3 ~/.claude/tools/agent-dash/agent_dash.py project list
 ```
 
 `run` prints `running`, a pid, and `url http://127.0.0.1:8765/`.
+
+The live server runs from a release of `origin/main`. `deploy` builds it, gates it, and switches to it; `restart` from the main checkout runs the checkout again. See [docs/live-release.md](docs/live-release.md). Agents in a shell pass `--yes-live` to `stop`, `restart`, `deploy`, and `rollback`.
 
 ### Command Code workers (`cmd`)
 

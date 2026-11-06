@@ -18,5 +18,7 @@ Agent instructions for this repo. Short on purpose; the skills carry the detail.
 
 ## Shipping
 
-- Squash-merge PRs; after a merge the lead moves the main checkout to the new origin/main (`git checkout --detach origin/main`).
-- Static JS/CSS changes are live on reload (served no-cache); Python changes need the `agent_dash.py serve` process restarted.
+- Squash-merge the PR. Then ship in three steps: move the main checkout (`git checkout --detach origin/main`), deploy from `tools/agent-dash` (`python3 agent_dash.py deploy --ref origin/main --yes-live`), and verify (`status`, `check`, and `/api/health`: `build_id` is the new short sha with no `-dirty`). Full runbook: [docs/live-release.md](tools/agent-dash/docs/live-release.md).
+- The live dashboard on 127.0.0.1:8765 runs from a clean release under `~/.local/share/agent-dash/releases/`, not from the mutable checkout. `restart` from the main checkout moves it back to the checkout. Use `deploy` to change live code and `restart` only to bounce the same release.
+- Static JS/CSS is served no-cache, so a deployed change shows on reload. Python changes need a deploy.
+- Trial servers use another port and a temp state dir, and are stopped by PID.
