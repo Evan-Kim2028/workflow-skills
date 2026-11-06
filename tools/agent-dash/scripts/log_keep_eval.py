@@ -45,7 +45,10 @@ def _hubs() -> list[Path]:
     """The archive's default roots (``log_archive.roots`` in the local config)."""
     from dash import logarchive as la
 
-    return [Path(r) for r in la.default_roots()]
+    roots = la.default_roots()
+    if not roots:
+        raise SystemExit("set log_archive.roots in <state>/config.local.json (the eval picks run folders from those hubs)")
+    return [Path(r) for r in roots]
 OPTIONS = ["control", "remove", "stub", "stripped"]
 BIG_STREAM = "catalog-confidence/dispatch-bundles/WS91/runs/ws91-exec-03/pi"
 

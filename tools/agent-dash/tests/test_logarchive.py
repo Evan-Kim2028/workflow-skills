@@ -407,6 +407,27 @@ class PipelineTest(unittest.TestCase):
         self.assertFalse(opts["apply"])
 
 
+class DefaultRootsTest(unittest.TestCase):
+    """No --root and no log_archive.roots means no roots: never a guessed hub."""
+
+    def test_roots_come_only_from_the_local_config(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.dict(os.environ, {"AGENT_DASH_STATE_DIR": tmp}):
+                self.assertEqual(la.default_roots(), [])
+                Path(tmp, "config.local.json").write_text(json.dumps({"hub_dir": "/elsewhere"}))
+                self.assertEqual(la.default_roots(), [])
+                Path(tmp, "config.local.json").write_text(json.dumps({"log_archive": {"roots": ["/a/hub-one", 3, ""]}}))
+                self.assertEqual(la.default_roots(), ["/a/hub-one"])
+
+    def test_run_refuses_with_no_roots(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.dict(os.environ, {"AGENT_DASH_STATE_DIR": tmp}):
+                err = io.StringIO()
+                with mock.patch("sys.stderr", err):
+                    self.assertEqual(la.run({"roots": []}, out=io.StringIO(), state=Path(tmp)), 2)
+                self.assertIn("no hub roots", err.getvalue())
+
+
 class TokenTotalTest(unittest.TestCase):
     def test_session_rows_are_listed_by_kind_but_not_added_to_the_total(self):
         totals = la.Totals()

@@ -235,9 +235,11 @@ base64 only, see the per-kind table).
 ## Roots
 
 With no `--root`, the archive scans the roots in `log_archive.roots` of the
-agent-dash local config (`<state>/config.local.json`, git-ignored). Without that
-key it scans the configured `hub_dir`. The repo names no project. To scan both
-hubs add, in that file:
+agent-dash local config (`<state>/config.local.json`, git-ignored). The repo
+names no project, and there is no fallback: with no `log_archive.roots` the
+command refuses (exit 2), so `ws archive` cleanup archives nothing until the key
+is set. (`hub_dir` is not used: it can name a project that is not a log hub.)
+To scan both hubs add, in that file:
 
 ```json
 {"log_archive": {"roots": ["~/Documents/projects/<hub-one>-hub-state", "~/Documents/projects/<hub-two>-hub-state"]}}
