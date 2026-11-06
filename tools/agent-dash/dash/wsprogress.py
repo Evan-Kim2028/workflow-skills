@@ -64,13 +64,10 @@ def _bundle_mtimes(ws: str) -> tuple:
 
 def cache_key(store, ws: str) -> tuple:
     """Current cache key (history/plan mtimes plus the store sequence)."""
-    seq = getattr(store, "seq", None)
-    if seq is None:
-        seq = getattr(store, "_seq", 0)
-    data_seq = getattr(store, "data_seq", None)
-    if data_seq is None:
-        data_seq = getattr(store, "_data_seq", 0)
-    return (ws, _bundle_mtimes(ws), seq, data_seq)
+    content = getattr(store, "content_key", None)
+    if content is None:
+        content = (getattr(store, "data_seq", 0), getattr(store, "seq", 0))
+    return (ws, _bundle_mtimes(ws), content)
 
 
 def clear_cache() -> None:
