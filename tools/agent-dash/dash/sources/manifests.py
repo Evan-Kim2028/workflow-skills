@@ -44,7 +44,7 @@ INTERVAL_S = 2
 FILE_BUDGET = 4 * 1024 * 1024
 TICK_BUDGET = 8 * 1024 * 1024
 LIVE_WINDOW_S = 36 * 3600
-DIR_SCAN_S = 15
+DIR_SCAN_S = 3
 SCAN_CAP = 64 * 1024
 ERR_TAIL = 8 * 1024
 TSV_CAP = 1024 * 1024
@@ -65,6 +65,7 @@ _MANIFESTS = (
     ("cursor-sessions.tsv", "grok", "cursor", "grok"),
     ("codex-sessions.tsv", "codex", "codex", "codex"),
 )
+MANIFEST_NAMES = tuple(dict.fromkeys(entry[0] for entry in _MANIFESTS))
 _UUID = re.compile(
     r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
 )
@@ -90,6 +91,10 @@ _text_cache: dict = {}
 _runs: dict = {}
 _emit_sig: dict = {}
 _dir_cache: dict = {}
+#: folder -> (stamp, state): see ``_folder_state``. Re-checked only when the
+#: folder's own (inode, mtime) changes, so a settled folder costs one stat.
+_folder_cache: dict = {}
+FOLDER_CACHE_MAX = 20000
 DIR_LIST_CAP = 500
 
 
@@ -100,6 +105,46 @@ def reset_state() -> None:
     _runs.clear()
     _emit_sig.clear()
     _dir_cache.clear()
+    _folder_cache.clear()
+
+
+def _folder_stamp(path):
+    """(inode, mtime_ns) of a directory, or None when it is not one."""
+    st = _stat(path)
+    if st is None or not stat.S_ISDIR(st.st_mode):
+        return None
+    return (st.st_ino, st.st_mtime_ns)
+
+
+def _folder_state(folder):
+    """(manifest TSV names present, is_nested_checkout) for one folder.
+
+    A file or folder appears, disappears or is renamed only by changing its
+    directory's mtime, so the answer is recomputed only when that stamp moves.
+    An in-place rewrite of a TSV leaves the stamp alone; ``_load_tsv`` stats
+    the TSV itself on every poll for that. ``None`` when ``folder`` is not a
+    directory. Stamp first: a change racing the checks makes the next call
+    recheck.
+    """
+    stamp = _folder_stamp(folder)
+    if stamp is None:
+        _folder_cache.pop(folder, None)
+        return None
+    hit = _folder_cache.get(folder)
+    if hit is not None and hit[0] == stamp:
+        return hit[1]
+    present = frozenset(
+        name for name in MANIFEST_NAMES if _is_file(os.path.join(folder, name))
+    )
+    try:
+        checkout = os.path.exists(os.path.join(folder, ".git"))
+    except (OSError, ValueError):
+        checkout = True
+    state = (present, checkout)
+    if len(_folder_cache) >= FOLDER_CACHE_MAX:
+        _folder_cache.clear()
+    _folder_cache[folder] = (stamp, state)
+    return state
 
 
 def _children_dirs(path, cap):
@@ -131,10 +176,8 @@ def _nested_tsv_dirs(scratch) -> list:
             continue
         # A nested checkout is a worktree, never a lead child folder:
         # nothing under one is opened.
-        try:
-            if os.path.exists(os.path.join(ent_path, ".git")):
-                continue
-        except (OSError, ValueError):
+        state = _folder_state(ent_path)
+        if state is None or state[1]:
             continue
         found.append(ent_path)
     return found
@@ -304,10 +347,11 @@ def poll(store, cfg, now: float) -> None:
                 is_flat = os.path.realpath(scratch) in flat
             except OSError:
                 is_flat = scratch in flat
+            present = (_folder_state(scratch) or (frozenset(), False))[0]
             for filename, source, directory, default_tier in _MANIFESTS:
-                path = os.path.join(scratch, filename)
-                if not _is_file(path):
+                if filename not in present:
                     continue
+                path = os.path.join(scratch, filename)
                 try:
                     rows, left = _load_tsv(path, left)
                 except OSError as exc:
@@ -322,10 +366,11 @@ def poll(store, cfg, now: float) -> None:
                 # are never opened, so prompt nests and worktree checkouts
                 # stay out.
                 for child in _nested_tsv_dirs(scratch):
+                    child_present = (_folder_state(child) or (frozenset(), False))[0]
                     for filename, source, directory, default_tier in _MANIFESTS:
-                        path = os.path.join(child, filename)
-                        if not _is_file(path):
+                        if filename not in child_present:
                             continue
+                        path = os.path.join(child, filename)
                         try:
                             rows, left = _load_tsv(path, left)
                         except OSError as exc:
@@ -1038,12 +1083,8 @@ def _flat_run_dirs(cfg, now, covered) -> list:
             continue
         if real in have:
             continue
-        tsv_here = False
-        for filename, _source, _directory, _tier in _MANIFESTS:
-            if _is_file(os.path.join(rundir, filename)):
-                tsv_here = True
-                break
-        if not tsv_here:
+        state = _folder_state(rundir)
+        if not state or not state[0]:
             continue
         have.add(real)
         found.append((None, rundir))
