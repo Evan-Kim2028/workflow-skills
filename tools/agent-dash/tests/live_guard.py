@@ -91,6 +91,11 @@ class Guard:
             raise AssertionError("live_guard: test would use the live state dir %s" % LIVE_STATE)
 
     def stop(self):
+        # main() copies AGENT_DASH_PORT into agent_dash.PORT, so restoring the
+        # env alone leaves another module reading this module's temp port.
+        tool = sys.modules.get("agent_dash")
+        if tool is not None:
+            tool.PORT = LIVE_PORT
         if self._saved is not None:
             for key, value in self._saved.items():
                 if value is None:

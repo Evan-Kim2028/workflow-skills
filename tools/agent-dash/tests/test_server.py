@@ -717,7 +717,11 @@ class PlanAndBackfillTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "config.json"
             path.write_text(json.dumps({"host": "bad-host", "caps": {"grok": 3}}), encoding="utf-8")
-            cfg = load_cfg(path)
+            import agent_dash
+
+            with mock.patch.dict(os.environ), mock.patch.object(agent_dash, "PORT", 8765):
+                os.environ.pop("AGENT_DASH_PORT", None)
+                cfg = load_cfg(path)
         self.assertEqual(cfg["host"], "127.0.0.1")
         self.assertEqual(cfg["port"], 8765)
         self.assertNotIn("caps", cfg)
