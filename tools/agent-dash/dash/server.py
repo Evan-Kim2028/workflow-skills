@@ -1537,7 +1537,7 @@ class Handler(BaseHTTPRequestHandler):
         raw = json.dumps(payload, separators=(",", ":"), allow_nan=False).encode()
         if etag is None:
             etag = _content_etag(raw)
-            self.server.respcache.store_etag(key, etag)
+            self.server.respcache.store_etag(key, etag, generated)
         try:
             age_ms = max(0, int((now - float(generated or now)) * 1000))
         except (TypeError, ValueError):
