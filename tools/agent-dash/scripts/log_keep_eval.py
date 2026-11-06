@@ -49,32 +49,39 @@ OPTIONS = ["control", "remove", "stub", "stripped"]
 BIG_STREAM = "catalog-confidence/dispatch-bundles/WS91/runs/ws91-exec-03/pi"
 
 
-def pick_outdirs(limit: int, include_big: bool) -> list[Path]:
-    """pi outdirs (``pi-sessions.tsv`` beside the streams) with small streams."""
-    found: list[Path] = []
-    for hub in HUBS:
-        for dirpath, _dirnames, filenames in os.walk(hub):
-            if "pi-sessions.tsv" in filenames:
-                found.append(Path(dirpath))
-    small = []
-    for d in sorted(found):
-        streams = [p for p in d.glob("stream-*.ndjson")]
-        if streams and max(p.stat().st_size for p in streams) < 100 * 2**20:
-            small.append(d)
-    picked = small[:limit]
-    if include_big:
+#: Outdir marker per kind: the manifest (or, for out.jsonl, the stream itself).
+KIND_MARK = {"pi": "pi-sessions.tsv", "cmd": "cmd-sessions.tsv", "codex": "codex-sessions.tsv", "out": "out.jsonl"}
+
+
+def pick_outdirs(limit: int, include_big: bool, kinds=("pi",), max_mb: float = 100) -> list[Path]:
+    """Real outdirs per kind (see KIND_MARK), small ones only, up to ``limit`` per kind."""
+    picked: list[Path] = []
+    for kind in kinds:
+        mark = KIND_MARK[kind]
+        found: list[Path] = []
+        for hub in HUBS:
+            for dirpath, _dirnames, filenames in os.walk(hub):
+                if "/.git" not in dirpath and mark in filenames:
+                    found.append(Path(dirpath))
+        small = []
+        for d in sorted(found):
+            size = sum(p.stat().st_size for p in d.iterdir() if p.is_file())
+            if size < max_mb * 2**20:
+                small.append(d)
+        picked.extend(d for d in small[:limit] if d not in picked)
+    if include_big and "pi" in kinds:
         big = Path.home() / "Documents/projects/lor-hub-state" / BIG_STREAM
         if big.is_dir() and big not in picked:
             picked.append(big)
     return picked
 
 
-def build(fixture: Path, limit: int, include_big: bool) -> dict:
+def build(fixture: Path, limit: int, include_big: bool, kinds=("pi",), max_mb: float = 100) -> dict:
     if fixture.exists():
         shutil.rmtree(fixture)
     (fixture / "scratch").mkdir(parents=True)
     (fixture / "state").mkdir()
-    outdirs = pick_outdirs(limit, include_big)
+    outdirs = pick_outdirs(limit, include_big, kinds, max_mb)
     mapping = []
     for src in outdirs:
         rel = str(src).replace(str(Path.home()) + "/", "").replace("/", "__")
@@ -101,13 +108,22 @@ def _copy_generic(dst: Path, mapping: list) -> None:
         return
     labels, sids = set(), set()
     for item in mapping:
-        for tsv in Path(item["src"]).glob("pi-sessions.tsv"):
-            for line in tsv.read_text(encoding="utf-8", errors="replace").splitlines()[1:]:
-                cells = line.split("\t")
-                if cells and cells[0]:
-                    labels.add(cells[0])
-                if len(cells) > 1 and cells[1]:
-                    sids.add(cells[1])
+        for name in KIND_MARK.values():
+            if name == "out.jsonl":
+                continue
+            for tsv in Path(item["src"]).glob(name):
+                lines = tsv.read_text(encoding="utf-8", errors="replace").splitlines()
+                if not lines:
+                    continue
+                head = lines[0].split("\t")
+                li = head.index("label") if "label" in head else 0
+                si = head.index("session_id") if "session_id" in head else 1
+                for line in lines[1:]:
+                    cells = line.split("\t")
+                    if len(cells) > li and cells[li]:
+                        labels.add(cells[li])
+                    if len(cells) > si and cells[si]:
+                        sids.add(cells[si])
     kept = 0
     with open(src, "r", encoding="utf-8", errors="replace") as fin, open(dst, "w", encoding="utf-8") as fout:
         for line in fin:
@@ -132,7 +148,7 @@ def _prepare(base: Path) -> None:
     for n, e in enumerate(entries):
         zst = zdir / ("%05d.zst" % n)
         m = la.measure(e.path, str(zst))
-        rows.append({"name": e.path.split("/scratch/", 1)[-1], "sha": m.stripped_sha256, "lines": m.stripped_lines, "size": e.size})
+        rows.append({"name": os.path.relpath(e.path, base / "scratch"), "sha": m.stripped_sha256, "lines": m.stripped_lines, "size": e.size})
     (base / "measured.json").write_text(json.dumps(rows))
 
 
@@ -151,6 +167,12 @@ def _cfg(state: Path) -> dict:
     cfg["state_dir"] = str(state)
     cfg["data_root"] = str(state)
     cfg["roots"]["scratchpads"] = []
+    # Isolate from live roots (~/.commandcode, ~/.claude, ...): an empty root
+    # per key, so every poll reads only the fixture and the run is repeatable.
+    empty = state / "empty-roots"
+    empty.mkdir(parents=True, exist_ok=True)
+    for key in list(cfg["roots"]):
+        cfg["roots"][key] = str(empty / key)
     return cfg
 
 
@@ -163,13 +185,15 @@ def _register(state: Path, meta: dict, work: Path) -> None:
 
 
 def _poll(state: Path) -> None:
-    from dash.sources import generic, pi
+    from dash.sources import commandcode, generic, manifests, pi
     from dash.store import Store
 
     cfg = _cfg(state)
     store = Store(state / "dash.sqlite")
     try:
         now = time.time()
+        manifests.poll(store, cfg, now)
+        commandcode.poll(store, cfg, now)
         pi.poll(store, cfg, now)
         generic.poll(store, cfg, now)
     finally:
@@ -220,12 +244,13 @@ def _mutate(work: Path, option: str) -> dict:
         raise SystemExit("fixture changed: %d measured, %d found" % (len(measured), len(entries)))
     zdir = work / "zst"
     for n, e in enumerate(entries):
-        if e.path.split("/scratch/", 1)[-1] != measured[n]["name"]:
+        if os.path.relpath(e.path, work / "scratch") != measured[n]["name"]:
             raise SystemExit("entry order changed at %d: %s" % (n, e.path))
         zst = zdir / ("%05d.zst" % n)
         rec = {"stripped_sha256": measured[n]["sha"], "stripped_lines": measured[n]["lines"]}
         la.reclaim(e, zst, option, rec)
-    remaining = sum(p.stat().st_size for p in (work / "scratch").rglob("*") if p.is_file())
+    # Stream bytes still at their original paths (stubs and stripped rewrites included).
+    remaining = sum(os.path.getsize(e.path) for e in entries if os.path.exists(e.path))
     return {"files": len(entries), "raw_bytes": bytes_before, "scratch_bytes_after": remaining}
 
 
@@ -297,14 +322,20 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--work", required=True)
     parser.add_argument("--limit", type=int, default=60)
     parser.add_argument("--big", action="store_true", help="include the 791 MB base64-heavy pi stream")
+    parser.add_argument("--kinds", default="pi", help="comma list from: pi,cmd,codex,out (default pi)")
+    parser.add_argument("--max-folder-mb", type=float, default=100, help="skip run folders larger than this")
     parser.add_argument("--option", choices=OPTIONS, action="append")
     parser.add_argument("--json-out")
     ns = parser.parse_args(argv)
     work = Path(ns.work).resolve()
     work.mkdir(parents=True, exist_ok=True)
     fixture = work / "fixture"
-    meta = build(fixture, ns.limit, ns.big)
-    print("fixture: %d pi run folders" % len(meta["outdirs"]))
+    kinds = [k for k in ns.kinds.split(",") if k]
+    bad = [k for k in kinds if k not in KIND_MARK]
+    if bad:
+        parser.error("unknown kind(s): %s" % ", ".join(bad))
+    meta = build(fixture, ns.limit, ns.big, kinds, ns.max_folder_mb)
+    print("fixture: %d run folders (%s)" % (len(meta["outdirs"]), ",".join(kinds)))
     results = {}
     for option in ns.option or OPTIONS:
         run = work / ("run-" + option)

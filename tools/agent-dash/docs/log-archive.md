@@ -16,7 +16,7 @@ exception is in `CONTRACT.md` ("Log archive exception").
 | Archive | `dash/logarchive.py`, `agent_dash.py logs archive` | Finds finished streams (idle 3 h, no open handle, no live launcher), measures them in one streaming pass, writes `log-archive/<mirror path>.zst`, ingests rows, verifies, reclaims. Manifest and lock make reruns idempotent. |
 | Store client | `dash/vlogs.py` | Loopback only. Redacts secret shapes before ingest. Rows over 1.8 MiB are truncated and flagged (the zstd copy keeps them whole). |
 | Service | `scripts/vlogs_install.sh` | VictoriaLogs v1.53.0, checksum-verified, launchd agent `com.agent-dash.vlogs`, 127.0.0.1:19428, flags as specified. `--uninstall`, `--purge`. |
-| Option test | `scripts/log_keep_eval.py` | Evidence for what stays at the original path (below). |
+| Option test | `scripts/log_keep_eval.py` | Evidence for what stays at the original path (below and "Per-kind decision"). |
 
 ## The archive pass, per file
 
@@ -43,7 +43,7 @@ Run 2026-11-06, `python3 agent_dash.py logs archive` (defaults: both hub roots, 
 | Raw | 13.43 GB |
 | Stripped | 3.13 GB |
 | zstd -9 | 0.19 GB |
-| Reclaimable with `--keep remove` | 13.43 GB |
+| Reclaimable with `--keep remove` for every tool (the first run; per-tool defaults are below) | 13.43 GB |
 
 The brief's raw (13.43 GB), stripped (3.13 GB) and zstd (0.18 GB, here 0.19 GB) figures reproduce. The VictoriaLogs disk figure (0.25 GB) was not measured in this pass.
 
@@ -115,11 +115,46 @@ pi poller reads the TSV, `out-*.md`, `err-*.log`, the `running/` marker, and the
 launcher writes after the run. The commandcode poller reads only the first lines
 of a live stream (`run_start`), which the filter preserves.
 
-**Decision: `--keep remove`** (the default). It reclaims everything the stub and
-stripped options leave behind, and the readers are unaffected. The stub keeps 310
-tiny pointer files and the stripped option keeps 1.06 GB, which is what "reclaim
-the most" rules out. One consequence to plan for: tools that read a finished raw
-stream by path will now find nothing there. See caveats.
+### Per-kind decision (`--keep` default is per tool)
+
+The first option test used only pi and generic pollers, so it could not decide
+for the other kinds. A second run (`--kinds cmd,codex,out --limit 8 --max-folder-mb 5`,
+real folders, real `manifests`, `commandcode`, `pi` and `generic` pollers, roots
+isolated to empty directories so live data cannot move the result) and two
+targeted checks decide the rest. Full numbers: `docs/log-archive-keep-eval-kinds.json`.
+
+| tool (stream or file) | keep | why, measured |
+|---|---|---|
+| `pi` (`stream-<label>.ndjson`) | **stripped** | A real pi outdir with no manifest row (`ws19/pi`, stream + `sessions/` + prompt, no `pi-sessions.tsv`) is a run only the stream identifies. On a fresh store, `remove` and `stub` drop its run row (`pi:01a185ca…:ws19-plan-slab-ledger-r2`); `stripped` keeps it. pi.poll reads the stream's `session` event on this path. |
+| `cmd` (`stream-<label>-<n>.ndjson`) | **stripped** | commandcode.poll reads `run_start` from the stream for a launch with no manifest row. Crash-path check (real cmd folder, manifest removed, dead `running/` pid): `remove` and `stub` lose the `died_early` row on a cold rebuild; `stripped` is equal to the baseline. |
+| `codex` (`stream-<label>.jsonl`) | **remove** | No poller reads it. The launcher reads it once, at finish, and writes `codex-sessions.tsv` and `generic.jsonl`. Cold rebuild identical under `remove` and `stub`; `codex.py` reads `~/.codex` rollouts, not this file. |
+| `pi-session` (`sessions/*.jsonl`) | **remove** | Duplicates the stream's assistant messages (see the token reference). No poller reads the contents, only that `sessions/` exists, and the empty directory stays. The first option test (40 pi folders) was identical under `remove`, cold and incremental. |
+| `out` (`out.jsonl`, claude runs) | **stripped** | Nothing in this repo reads it, but `catalog-confidence`'s `method_gate.py` and `part_checks.py` read tool calls from the raw path. `stripped` keeps every tool call at the path and removes only the base64. Its reclaim is the base64 only. |
+| `other` (other `*.ndjson`) | **stripped** | Unknown readers. Conservative. |
+
+Option results on the 8-per-kind fixture (23 folders, 370 files, 706 runs, 46,527 usage rows):
+
+| option | incremental equal | cold equal | tokens equal | stream bytes left at path |
+|---|:-:|:-:|:-:|---:|
+| control | yes | yes | yes | 1,335,997,352 |
+| remove | yes | **no** (the ws19 pi run) | yes | 0 |
+| stub | yes | **no** (the ws19 pi run) | yes | 128,661 |
+| stripped | yes | yes | yes | 1,321,425,017 |
+
+The "no" rows are the reason for the per-tool table. The earlier pi-only test
+(`scripts/log_keep_eval.py` without `--kinds`, 791 MB stream included) had no
+folder of this shape, so it did not show it. Its result file is still
+`docs/log-archive-keep-eval.json`.
+
+**Cost of the table.** `stripped` keeps the base64-free part of pi and cmd
+streams at their paths. On the real roots that is about 3.1 GB of the 13.4 GB
+raw (`stripped` column of the dry run). Choosing `remove` for pi and cmd would
+reclaim it, and would lose a fresh-store rebuild of no-manifest launches and the
+crash-path rows. That trade is the owner's; `--keep remove` overrides it for a run.
+
+Note on the stripped rewrite: it changes the file in place, so the manifest
+records the rewritten size and mtime. The next pass skips the file (it does not
+re-archive the stripped copy every three hours).
 
 ## Corrections to the brief
 

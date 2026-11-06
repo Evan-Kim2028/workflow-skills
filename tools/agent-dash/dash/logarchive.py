@@ -64,7 +64,21 @@ ZSTD_LEVEL = "-9"
 PARSE_CAP = 64 * 2**20
 READ_CHUNK = 1 << 20
 KEEP_CHOICES = ("remove", "stub", "stripped")
-DEFAULT_KEEP = "remove"
+#: What stays at the original path, per tool. Set from the option test in
+#: docs/log-archive.md ("Per-kind decision"). ``stripped`` where a poller or
+#: an outside reader needs the file: a fresh-store rebuild or a crashed launch
+#: loses run rows under ``remove`` and ``stub`` (measured). ``remove`` only
+#: where nothing reads the file after its launcher has finished.
+KEEP_BY_TOOL = {
+    "pi": "stripped",        # pi.poll: session id from the stream on the crash path (cold rebuild loses a run)
+    "cmd": "stripped",       # commandcode.poll: run_start in the stream on the crash path (run row lost)
+    "codex": "remove",       # no reader of stream-<label>.jsonl after the launcher's own finish
+    "pi-session": "remove",  # pi sessions/*.jsonl duplicate the stream; no reader of the contents
+    "out": "stripped",       # out.jsonl: readers outside this repo read tool calls by path
+    "other": "stripped",     # unknown ndjson: keep the readable copy at the path
+}
+#: None means per tool (``KEEP_BY_TOOL``); a ``--keep`` value overrides every tool.
+DEFAULT_KEEP = None
 SKIP_DIR_NAMES = {".git", "node_modules", ".venv", "__pycache__"}
 #: The event type that carries assistant usage, per kind. Stream files
 #: (pi stdout) use ``message_end``; pi's own session files use ``message``.
@@ -100,6 +114,7 @@ class Entry:
     mtime_ns: int
     mtime: float
     outdir: str
+    tool: str = "other"   # key into KEEP_BY_TOOL
 
 
 def projects_root() -> Path:
@@ -138,6 +153,47 @@ def _label(name: str, kind: str, parent: str) -> str:
             base = base[: -len(ext)]
             break
     return base
+
+
+_CMD_STREAM_RE = re.compile(r"^stream-(.+)-(\d+)\.ndjson$")
+
+
+def tool_of(name: str, kind: str, outdir: str) -> str:
+    """Which tool wrote the file: the key into ``KEEP_BY_TOOL``.
+
+    A manifest beside the stream decides first (``cmd-sessions.tsv`` is Command
+    Code, ``pi-sessions.tsv`` is pi). Without one, the name decides: ``.jsonl``
+    is codex, ``stream-<label>-<n>.ndjson`` is Command Code, else pi.
+    """
+    if kind == "session":
+        return "pi-session"
+    if kind == "out":
+        return "out"
+    if kind == "stream":
+        if name.endswith(".jsonl"):
+            return "codex"
+        if os.path.isfile(os.path.join(outdir, "cmd-sessions.tsv")):
+            return "cmd"
+        if os.path.isfile(os.path.join(outdir, "pi-sessions.tsv")):
+            return "pi"
+        return "cmd" if _CMD_STREAM_RE.match(name) else "pi"
+    return "other"
+
+
+def keep_for(entry: "Entry", override: str | None = None) -> str:
+    """What reclaim leaves at the path: the ``--keep`` override, else the tool's default."""
+    return override or KEEP_BY_TOOL.get(entry.tool, "stripped")
+
+
+def reclaim_bytes(entry: Entry, m, keep: str) -> int:
+    """Bytes that leave the original path under ``keep``.
+
+    ``remove`` and ``stub`` give back the whole file; ``stripped`` gives back only
+    the base64 that the rewrite removed.
+    """
+    if keep == "stripped":
+        return max(0, m.raw_bytes - m.stripped_bytes)
+    return entry.size
 
 
 def _stream_kind_of(path: str) -> str | None:
@@ -199,6 +255,7 @@ def discover(roots, *, ws: str | None = None) -> tuple[list[Entry], dict]:
                         mtime_ns=st.st_mtime_ns,
                         mtime=st.st_mtime,
                         outdir=outdir,
+                        tool=tool_of(name, kind, outdir),
                     )
                 )
     entries.sort(key=lambda e: e.path)
@@ -805,6 +862,8 @@ class Totals:
     stripped: int = 0
     zst: int = 0
     reclaimable: int = 0
+    #: Per tool: files, raw bytes, bytes reclaimed, and the keep applied.
+    by_tool: dict = field(default_factory=dict)
     rows: int = 0
     replaced: int = 0
     truncated: int = 0
@@ -853,7 +912,7 @@ def process(
             continue
         if not apply:
             m = measure(e.path, None, token_type(e.kind))
-            _count(totals, e, m, reclaimable=True)
+            _count(totals, e, m, keep=keep_for(e, keep))
             results["planned"] += 1
             print("  would archive %s  raw %s  stripped %s  lines %d  replaced %d" % (e.rel, _fmt(m.raw_bytes), _fmt(m.stripped_bytes), m.stripped_lines, m.replaced), file=out)
             continue
@@ -892,11 +951,17 @@ def process(
             rec = dict(rec, status="archived", vl_rows=ing["vl_rows"], vl_tokens=ing["vl_tokens"], truncated=ing["truncated"], redactions=ing["redactions"], ingest=ing["status"])
             manifest.write(rec)
             results["archived"] += 1
-            _count(totals, e, _Measured(rec), reclaimable=False)
-            reclaim(e, zst, keep, rec)
-            manifest.write(dict(rec, status="reclaimed", keep=keep))
+            k = keep_for(e, keep)
+            _count(totals, e, _Measured(rec), keep=k)
+            reclaim(e, zst, k, rec)
+            done_rec = dict(rec, status="reclaimed", keep=k)
+            if k != "remove" and os.path.exists(e.path):
+                # The file was rewritten in place: record its new identity so the next
+                # pass skips it instead of archiving the stripped copy again.
+                st = os.stat(e.path)
+                done_rec.update(size=st.st_size, mtime_ns=st.st_mtime_ns)
+            manifest.write(done_rec)
             results["reclaimed"] += 1
-            totals.reclaimable += e.size
             print("  archived %s  raw %s -> zst %s  rows %d (%s)  reclaimed" % (e.rel, _fmt(e.size), _fmt(rec["zst_bytes"]), rec["vl_rows"], ing["status"]), file=out)
         except Exception as exc:  # one file never stops the run; the manifest keeps the reason
             results["errors"] += 1
@@ -929,7 +994,8 @@ def _verify_measure(m: Measure) -> None:
         raise ArchiveError("token totals differ: raw %s stripped %s" % (m.raw_tokens, m.stripped_tokens))
 
 
-def _count(totals: Totals, e: Entry, m, *, reclaimable: bool) -> None:
+def _count(totals: Totals, e: Entry, m, *, keep: str | None = None) -> None:
+    """Add one file to the totals. ``keep`` is the resolved keep (None: not reclaimed)."""
     totals.files += 1
     totals.raw += m.raw_bytes
     totals.stripped += m.stripped_bytes
@@ -943,8 +1009,14 @@ def _count(totals: Totals, e: Entry, m, *, reclaimable: bool) -> None:
             bucket[key] += raw_tok.get(key, 0)
     if getattr(m, "raw_tokens", None) is not None and m.raw_tokens != m.stripped_tokens:
         totals.tokens_match = False
-    if reclaimable:
-        totals.reclaimable += e.size
+    if keep:
+        gone = reclaim_bytes(e, m, keep)
+        totals.reclaimable += gone
+        row = totals.by_tool.setdefault(e.tool, {"files": 0, "raw": 0, "reclaim": 0, "keep": keep})
+        row["files"] += 1
+        row["raw"] += m.raw_bytes
+        row["reclaim"] += gone
+        row["keep"] = keep if row["keep"] == keep else "mixed"
 
 
 def print_totals(totals: Totals, plans: list[Plan], out) -> None:
@@ -965,6 +1037,9 @@ def print_totals(totals: Totals, plans: list[Plan], out) -> None:
     print("  stripped   %s  (%d bytes)" % (_fmt(totals.stripped), totals.stripped), file=out)
     print("  zstd -9    %s  (%d bytes)" % (_fmt(totals.zst), totals.zst), file=out)
     print("  reclaimable %s  (%d bytes)" % (_fmt(totals.reclaimable), totals.reclaimable), file=out)
+    for tool in sorted(totals.by_tool):
+        row = totals.by_tool[tool]
+        print("  tool %-11s keep %-8s files %5d  raw %s  reclaim %s" % (tool, row["keep"], row["files"], _fmt(row["raw"]), _fmt(row["reclaim"])), file=out)
     t = totals.tokens
     print(
         "assistant tokens (raw, stripped equal: %s): messages %d  input %d  output %d  cacheRead %d"
@@ -1022,7 +1097,7 @@ def run(opts: dict, out=None, *, state: Path | None = None) -> int:
                 print("VictoriaLogs is not reachable at %s; start it: sh scripts/vlogs_install.sh" % opts["url"], file=sys.stderr)
                 return 5
         entries, skipped_meta = discover(roots, ws=opts["ws"])
-        print("mode: %s   keep: %s   min-idle: %g h   roots: %d" % ("apply" if opts["apply"] else "dry-run", opts["keep"], opts["min_idle"], len(roots)), file=out)
+        print("mode: %s   keep: %s   min-idle: %g h   roots: %d" % ("apply" if opts["apply"] else "dry-run", opts["keep"] or "per tool", opts["min_idle"], len(roots)), file=out)
         plans = plan_entries(entries, min_idle_hours=opts["min_idle"], now=time.time())
         for key, count in sorted(skipped_meta.items()):
             print("ignored %s: %d files" % (key, count), file=out)

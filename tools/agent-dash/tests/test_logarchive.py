@@ -18,6 +18,7 @@ import http.server
 import io
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -404,6 +405,72 @@ class PipelineTest(unittest.TestCase):
         self.assertEqual(opts["min_idle"], 2.0)
         self.assertEqual(opts["keep"], "stub")
         self.assertFalse(opts["apply"])
+
+
+class KeepByToolTest(unittest.TestCase):
+    """Per-tool keep: classification, defaults, the override, and a stripped rewrite that stays done."""
+
+    def test_tool_of_names_each_kind(self):
+        self.assertEqual(la.tool_of("stream-a.ndjson", "stream", "/x/pi"), "pi")
+        self.assertEqual(la.tool_of("stream-a-1.ndjson", "stream", "/x/cmd"), "cmd")
+        self.assertEqual(la.tool_of("stream-a-1.ndjson", "stream", "/x/pi"), "cmd")
+        self.assertEqual(la.tool_of("stream-a.ndjson", "stream", "/x/pi-n"), "pi")
+        self.assertEqual(la.tool_of("stream-a-7.ndjson", "stream", "/x/y"), "cmd")
+        self.assertEqual(la.tool_of("stream-a.jsonl", "stream", "/x/codex"), "codex")
+        self.assertEqual(la.tool_of("s.jsonl", "session", "/x/pi"), "pi-session")
+        self.assertEqual(la.tool_of("out.jsonl", "out", "/x/claude"), "out")
+        self.assertEqual(la.tool_of("notes.ndjson", "ndjson", "/x"), "other")
+
+    def test_defaults_are_per_tool_and_override_wins(self):
+        def entry(tool):
+            return la.Entry(path="p", root="r", rel="p", ws="w", label="l", kind="stream", size=1,
+                            mtime_ns=0, mtime=0.0, outdir="o", tool=tool)
+        self.assertEqual(la.DEFAULT_KEEP, None)
+        self.assertEqual(la.keep_for(entry("pi")), "stripped")
+        self.assertEqual(la.keep_for(entry("cmd")), "stripped")
+        self.assertEqual(la.keep_for(entry("codex")), "remove")
+        self.assertEqual(la.keep_for(entry("pi-session")), "remove")
+        self.assertEqual(la.keep_for(entry("out")), "stripped")
+        self.assertEqual(la.keep_for(entry("pi"), "remove"), "remove")
+
+    def test_stripped_reclaims_only_the_base64_bytes(self):
+        e = la.Entry(path="p", root="r", rel="p", ws="w", label="l", kind="stream", size=1000,
+                     mtime_ns=0, mtime=0.0, outdir="o", tool="pi")
+        m = mock.Mock(raw_bytes=1000, stripped_bytes=300)
+        self.assertEqual(la.reclaim_bytes(e, m, "stripped"), 700)
+        self.assertEqual(la.reclaim_bytes(e, m, "remove"), 1000)
+
+    def test_cmd_stream_stays_stripped_and_the_next_pass_skips_it(self):
+        base = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, base, True)
+        hub = base / "hub" / "lor-hub-state"
+        stream = hub / "cmd" / "stream-hub-exec-x-1.ndjson"
+        stream.parent.mkdir(parents=True)
+        stream.write_bytes(_stream_bytes())
+        (stream.parent / "cmd-sessions.tsv").write_text("label\n")
+        old = time.time() - 10 * 3600
+        os.utime(stream, (old, old))
+        state = base / "state"
+        with mock.patch.dict(os.environ, {"AGENT_DASH_STATE_DIR": str(state)}), _FakeStore() as fs:
+            root = la.archive_root(state)
+            root.mkdir(parents=True, exist_ok=True)
+            entries, _ = la.discover([str(hub)])
+            self.assertEqual(entries[0].tool, "cmd")
+            plans = la.plan_entries(entries, min_idle_hours=3, now=time.time())
+            totals, results = la.process(plans, apply=True, keep=None, client=vlogs.VLogsClient(fs.url),
+                                         root=root, limit=None, out=io.StringIO())
+            self.assertEqual(results["reclaimed"], 1)
+            self.assertTrue(stream.exists())
+            self.assertIn(b"<img sha256=", stream.read_bytes())
+            self.assertEqual(totals.by_tool["cmd"]["keep"], "stripped")
+            posts = fs.server.posts
+            entries, _ = la.discover([str(hub)])
+            plans = la.plan_entries(entries, min_idle_hours=0, now=time.time() + 4 * 3600)
+            totals, results = la.process(plans, apply=True, keep=None, client=vlogs.VLogsClient(fs.url),
+                                         root=root, limit=None, out=io.StringIO())
+            self.assertEqual(fs.server.posts, posts)
+            self.assertEqual(results["done"], 1)
+            self.assertEqual(results["reclaimed"], 0)
 
 
 class CliWiringTest(unittest.TestCase):
