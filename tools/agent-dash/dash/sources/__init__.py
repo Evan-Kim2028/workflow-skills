@@ -474,8 +474,10 @@ _MEMO: dict = {}
 _MEMO_LOCK = threading.Lock()
 _MEMO_MAX = 20000
 
-# Finished rows are re-written at most once per this window while unchanged.
-SETTLED_RECHECK_S = 30.0
+# Finished rows are re-checked (written only if their inputs changed) at most
+# once per this window. Each recheck runs the full write path, so the window
+# sets the steady CPU floor: 2 min keeps ~2k finished rows near 17 checks a tick.
+SETTLED_RECHECK_S = 120.0
 
 
 class SettledRows:
