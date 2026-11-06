@@ -37,6 +37,7 @@ one workstream and returns the same exit codes).
 from __future__ import annotations
 
 import fcntl
+import fnmatch
 import hashlib
 import json
 import os
@@ -208,8 +209,13 @@ def _stream_kind_of(path: str) -> str | None:
     return "stream" if SNIFF_RE.match(head) else None
 
 
-def discover(roots, *, ws: str | None = None) -> tuple[list[Entry], dict]:
-    """All candidate stream files under ``roots``, plus a count of what was skipped."""
+def discover(roots, *, ws: str | None = None, exclude=()) -> tuple[list[Entry], dict]:
+    """All candidate stream files under ``roots``, plus a count of what was skipped.
+
+    ``exclude`` is a list of glob patterns matched (``fnmatch``, ``*`` crosses
+    ``/``) against each path relative to its root, e.g. ``catalog-confidence/*``.
+    Excluded files are counted as ``excluded`` and never stat'ed further.
+    """
     entries: list[Entry] = []
     skipped: dict = {}
     for root in roots:
@@ -226,6 +232,10 @@ def discover(roots, *, ws: str | None = None) -> tuple[list[Entry], dict]:
                 if kind is None:
                     continue
                 path = os.path.join(dirpath, name)
+                rel_root = os.path.relpath(path, root)
+                if exclude and any(fnmatch.fnmatchcase(rel_root, g) for g in exclude):
+                    skipped["excluded"] = skipped.get("excluded", 0) + 1
+                    continue
                 try:
                     st = os.stat(path)
                 except OSError:
@@ -343,8 +353,21 @@ class Plan:
     stale_marker: bool = False
 
 
-def plan_entries(entries, *, min_idle_hours: float, now: float) -> list[Plan]:
-    """Idle, open-handle and launcher checks. Pure except for lsof and pid probes."""
+def _has_marker(outdir: str) -> bool:
+    try:
+        return bool(os.listdir(os.path.join(outdir, "running")))
+    except OSError:
+        return False
+
+
+def plan_entries(entries, *, min_idle_hours: float, now: float, ws_scoped: bool = True) -> list[Plan]:
+    """Idle, open-handle and launcher checks. Pure except for lsof and pid probes.
+
+    With ``ws_scoped`` False (a hub-wide pass, no ``--ws``), a folder that has
+    any ``running/`` marker is skipped, live or stale: a whole-hub pass must not
+    reclaim a launch whose state it cannot judge. ``--ws`` names the folder and
+    lifts that refusal. A live launcher is refused in both modes (launcher_block).
+    """
     open_set = open_paths([e.path for e in entries]) if entries else set()
     plans = []
     cutoff = now - min_idle_hours * 3600.0
@@ -360,6 +383,9 @@ def plan_entries(entries, *, min_idle_hours: float, now: float) -> list[Plan]:
             plans.append(Plan(e, "skip", block))
             continue
         stale = os.path.isdir(os.path.join(e.outdir, "running"))
+        if stale and not ws_scoped and _has_marker(e.outdir):
+            plans.append(Plan(e, "skip", "running/ marker (pass --ws to reclaim)"))
+            continue
         plans.append(Plan(e, "candidate", "", stale_marker=stale))
     return plans
 
@@ -1096,9 +1122,9 @@ def run(opts: dict, out=None, *, state: Path | None = None) -> int:
             if not client.healthy():
                 print("VictoriaLogs is not reachable at %s; start it: sh scripts/vlogs_install.sh" % opts["url"], file=sys.stderr)
                 return 5
-        entries, skipped_meta = discover(roots, ws=opts["ws"])
+        entries, skipped_meta = discover(roots, ws=opts["ws"], exclude=opts["exclude"])
         print("mode: %s   keep: %s   min-idle: %g h   roots: %d" % ("apply" if opts["apply"] else "dry-run", opts["keep"] or "per tool", opts["min_idle"], len(roots)), file=out)
-        plans = plan_entries(entries, min_idle_hours=opts["min_idle"], now=time.time())
+        plans = plan_entries(entries, min_idle_hours=opts["min_idle"], now=time.time(), ws_scoped=opts["ws"] is not None)
         for key, count in sorted(skipped_meta.items()):
             print("ignored %s: %d files" % (key, count), file=out)
         totals, results = process(
@@ -1124,23 +1150,25 @@ def run(opts: dict, out=None, *, state: Path | None = None) -> int:
             lock_fh.close()
 
 
-_DEFAULTS = {"roots": [], "ws": None, "min_idle": MIN_IDLE_HOURS, "apply": False, "keep": DEFAULT_KEEP, "url": vlogs.DEFAULT_URL, "limit": None}
+_DEFAULTS = {"roots": [], "ws": None, "min_idle": MIN_IDLE_HOURS, "apply": False, "keep": DEFAULT_KEEP, "url": vlogs.DEFAULT_URL, "limit": None, "exclude": ()}
 
 
 def parse_args(args: list[str]):
-    opts = dict(_DEFAULTS, roots=[])
+    opts = dict(_DEFAULTS, roots=[], exclude=[])
     i = 0
     while i < len(args):
         a = args[i]
         if a in ("--apply",):
             opts["apply"] = True
-        elif a in ("--root", "--ws", "--min-idle-hours", "--keep", "--vlogs-url", "--limit"):
+        elif a in ("--root", "--ws", "--min-idle-hours", "--keep", "--vlogs-url", "--limit", "--exclude"):
             if i + 1 >= len(args):
                 return "%s needs a value" % a
             val = args[i + 1]
             i += 1
             if a == "--root":
                 opts["roots"].append(val)
+            elif a == "--exclude":
+                opts["exclude"].append(val)
             elif a == "--ws":
                 opts["ws"] = val
             elif a == "--min-idle-hours":

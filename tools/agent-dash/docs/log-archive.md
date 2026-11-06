@@ -156,6 +156,53 @@ Note on the stripped rewrite: it changes the file in place, so the manifest
 records the rewritten size and mtime. The next pass skips the file (it does not
 re-archive the stripped copy every three hours).
 
+## Exclusions and refusals
+
+Checks before any file is reclaimed, in order. Each row says whether the check
+already existed or was added for this change.
+
+| check | applies | status |
+|---|---|---|
+| not idle (mtime younger than `--min-idle-hours`, default 3) | every mode | existing |
+| open handle (`lsof` on the file) | every mode | existing |
+| live launcher: a `running/<label>` whose pid is alive, or a live `pid` file | every mode | existing (`launcher_block`) |
+| `running/` marker with a dead pid (a crashed launch) | hub-wide pass only (no `--ws`) | **added**: refused. With `--ws` it is allowed. Before this change it was reclaimable (reported as stale) |
+| `--exclude GLOB` (repeatable) | every mode | **added**: `fnmatch` against the path relative to the root; `*` crosses `/`. Counted as `excluded` |
+
+The live-process refusal covers the case the brief names; the dead-pid marker
+case was not covered before and is refused now in a hub-wide pass. A folder
+with one stale marker blocks every stream in it until the owner passes `--ws`
+for that workstream.
+
+Exclusion used for the catalog-confidence folder (it is active, and
+`method_gate.py`, `part_checks.py` and `evidence/audit/method-followup/tools/*.py`
+read `out.jsonl` by path):
+
+```sh
+python3 ~/.claude/tools/agent-dash/agent_dash.py logs archive --exclude 'catalog-confidence/*'
+```
+
+Dry run on the real roots (read only, `AGENT_DASH_STATE_DIR` set to a temp dir,
+run under `memcap 4096`, about 5 minutes; the run wrote nothing):
+
+| | value |
+|---|---|
+| files discovered | 1,070 (live: grows while agents run) |
+| excluded (`catalog-confidence/*`) | 73 files |
+| skipped: running/ marker, no `--ws` | 132 files, 5.24 GB raw (80 of them, 5.08 GB, in `ja-catalog/runs` behind one dead-pid marker `hub-exec-identity-v11-shadow-gate-r2`) |
+| skipped: not idle | 32 files |
+| skipped: live launcher | 10 files |
+| candidates | 896 files, raw 2.52 GB, stripped 2.47 GB, zstd -9 0.15 GB |
+| reclaimable (per tool) | **0.42 GB** |
+| by tool (keep, files, raw, reclaim) | cmd stripped 136, 1.18 GB, 0.01 GB; codex remove 186, 0.27 GB, 0.27 GB; pi stripped 287, 0.97 GB, 0.03 GB; pi-session remove 287, 0.11 GB, 0.11 GB |
+| assistant tokens (raw = stripped) | messages 37,984; input 37,518,224; output 19,345,988; cacheRead 2,524,412,632 |
+
+Attribution of the change from the earlier 13.43 GB dry run: 13.43 minus 5.24
+GB refused by the marker rule minus about 5.7 GB excluded (catalog-confidence
+pi streams, out.jsonl and session files) is 2.5 GB. The rest of the reclaim
+under the default is small because pi and cmd streams are `stripped` (the
+base64 only, see the per-kind table).
+
 ## Corrections to the brief
 
 - `pi.py` does not tail stream bytes with a byte cursor. Its stream reads are
@@ -196,6 +243,9 @@ python3 ~/.claude/tools/agent-dash/agent_dash.py logs archive
 
 # apply (store must be up; takes a lock; resumable)
 python3 ~/.claude/tools/agent-dash/agent_dash.py logs archive --apply
+
+# hub-wide, leaving catalog-confidence alone (read only without --apply)
+python3 ~/.claude/tools/agent-dash/agent_dash.py logs archive --exclude 'catalog-confidence/*'
 
 # one workstream (what a ws archive hook would call)
 python3 ~/.claude/tools/agent-dash/agent_dash.py logs archive --ws ws25-ja-quality --apply

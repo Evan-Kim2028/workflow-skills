@@ -407,6 +407,52 @@ class PipelineTest(unittest.TestCase):
         self.assertFalse(opts["apply"])
 
 
+class ExcludeAndMarkerTest(unittest.TestCase):
+    """--exclude GLOB against the root-relative path, and the hub-wide running/ refusal."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        # discover() resolves its root; resolve here too (/var is /private/var on macOS).
+        self.hub = Path(os.path.realpath(self.tmp.name)) / "lor-hub-state"
+        for rel in ("catalog-confidence/runs/a/out.jsonl", "pi/stream-b.ndjson", "ws9/pi/stream-c.ndjson"):
+            p = self.hub / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_bytes(_stream_bytes())
+
+    def test_exclude_glob_is_matched_against_the_root_relative_path(self):
+        entries, skipped = la.discover([str(self.hub)], exclude=["catalog-confidence/*"])
+        rels = sorted(os.path.relpath(e.path, self.hub) for e in entries)
+        self.assertEqual(rels, ["pi/stream-b.ndjson", "ws9/pi/stream-c.ndjson"])
+        self.assertEqual(skipped.get("excluded"), 1)
+
+    def test_no_exclude_keeps_everything(self):
+        entries, skipped = la.discover([str(self.hub)])
+        self.assertEqual(len(entries), 3)
+        self.assertNotIn("excluded", skipped)
+
+    def test_hub_wide_pass_refuses_a_folder_with_a_running_marker(self):
+        outdir = self.hub / "pi"
+        (outdir / "running").mkdir()
+        (outdir / "running" / "b").write_text("999999\tm\n")  # dead pid: stale, not live
+        old = time.time() - 10 * 3600
+        for e in la.discover([str(self.hub)])[0]:
+            os.utime(e.path, (old, old))
+        entries, _ = la.discover([str(self.hub)])
+        now = time.time()
+        wide = {os.path.relpath(p.entry.path, self.hub): p for p in la.plan_entries(entries, min_idle_hours=3, now=now, ws_scoped=False)}
+        self.assertEqual(wide["pi/stream-b.ndjson"].action, "skip")
+        self.assertIn("running/ marker", wide["pi/stream-b.ndjson"].reason)
+        self.assertEqual(wide["ws9/pi/stream-c.ndjson"].action, "candidate")
+        scoped = {os.path.relpath(p.entry.path, self.hub): p for p in la.plan_entries(entries, min_idle_hours=3, now=now, ws_scoped=True)}
+        self.assertEqual(scoped["pi/stream-b.ndjson"].action, "candidate")
+
+    def test_argument_parsing_collects_repeatable_exclude(self):
+        opts = la.parse_args(["--exclude", "a/*", "--exclude", "b/*", "--ws", "WS1"])
+        self.assertEqual(opts["exclude"], ["a/*", "b/*"])
+        self.assertEqual(opts["ws"], "WS1")
+
+
 class KeepByToolTest(unittest.TestCase):
     """Per-tool keep: classification, defaults, the override, and a stripped rewrite that stays done."""
 
