@@ -774,6 +774,120 @@ class ModelTierTest(unittest.TestCase):
         self.assertEqual(pi._tier_of({"model": DEEPSEEK}), "deepseek")
 
 
+class CacheWriteSplitTest(unittest.TestCase):
+    """pi's cacheWrite1h becomes the 1h part; the 5m part is the remainder."""
+
+    def test_present_field_splits_and_remainder_is_5m(self):
+        self.assertEqual(pi.write_split({"cacheWrite": 1000, "cacheWrite1h": 300}, "claude-haiku-5-5"), (700, 300))
+        self.assertEqual(pi.write_split({"cacheWrite": 1000, "cacheWrite1h": 0}, DEEPSEEK_ID), (1000, 0))
+
+    def test_one_hour_part_is_clamped_to_the_total(self):
+        self.assertEqual(pi.write_split({"cacheWrite": 40, "cacheWrite1h": 90}, "claude-haiku-5-5"), (0, 40))
+        self.assertEqual(pi.write_split({"cacheWrite": 40, "cacheWrite1h": -5}, "claude-haiku-5-5"), (40, 0))
+
+    def test_absent_field_on_anthropic_is_all_5m(self):
+        self.assertEqual(pi.write_split({"cacheWrite": 5000}, "claude-haiku-5-5"), (5000, 0))
+        self.assertEqual(pi.write_split({"cacheWrite": 0}, "anthropic/claude-haiku-5-5"), (0, 0))
+
+    def test_absent_field_off_anthropic_keeps_no_split(self):
+        for model in (DEEPSEEK_ID, GLM_ID, "reflection/Beam-1.0-501B-A23B", None):
+            self.assertEqual(pi.write_split({"cacheWrite": 5000}, model), (None, None), model)
+
+    def test_non_numeric_field_counts_as_absent(self):
+        self.assertEqual(pi.write_split({"cacheWrite": 7, "cacheWrite1h": "3"}, "claude-haiku-5-5"), (7, 0))
+        self.assertEqual(pi.write_split({"cacheWrite": 7, "cacheWrite1h": True}, DEEPSEEK_ID), (None, None))
+
+    def test_parse_stream_events_carry_the_split(self):
+        lines = [
+            {"type": "message_end", "timestamp": 1_792_000_000_000, "message": {
+                "role": "assistant", "model": "claude-haiku-5-5",
+                "usage": {"input": 1, "output": 2, "cacheRead": 3, "cacheWrite": 100, "cacheWrite1h": 40}}},
+            {"type": "message_end", "timestamp": 1_792_000_001_000, "message": {
+                "role": "assistant", "model": "claude-haiku-5-5",
+                "usage": {"input": 1, "output": 2, "cacheRead": 0, "cacheWrite": 100}}},
+        ]
+        raw = b"\n".join(json.dumps(line).encode() for line in lines) + b"\n"
+        first, second = pi.parse_stream(raw, SID, default_model="anthropic/claude-haiku-5-5")
+        self.assertEqual((first["cache_write"], first["cache_write_5m"], first["cache_write_1h"]), (100, 60, 40))
+        self.assertEqual((second["cache_write_5m"], second["cache_write_1h"]), (100, 0))
+
+    def test_default_model_decides_when_the_message_names_none(self):
+        raw = json.dumps({"type": "message_end", "message": {
+            "role": "assistant", "usage": {"input": 1, "cacheWrite": 9}}}).encode() + b"\n"
+        self.assertEqual(pi.parse_stream(raw, SID)[0]["cache_write_5m"], None)
+        self.assertEqual(pi.parse_stream(raw, SID, default_model="anthropic/claude-haiku-5-5")[0]["cache_write_5m"], 9)
+
+
+class CacheWriteChainTest(unittest.TestCase):
+    """parse_stream -> usage line -> generic reader -> store -> cost, on a real store."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.db = str(Path(self._tmp.name) / "dash.sqlite")
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_split_reaches_the_stored_cost(self):
+        from dash.sources import generic
+        from dash.store import Store
+
+        def msg(index, usage):
+            return json.dumps({"type": "message_end", "timestamp": 1_792_000_000_000 + index, "message": {
+                "role": "assistant", "model": "claude-haiku-5-5", "usage": usage}}).encode()
+
+        raw = b"\n".join([
+            msg(1, {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 50_000, "cacheWrite1h": 20_000}),
+            msg(2, {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 50_000}),
+        ]) + b"\n"
+        events = pi.parse_stream(raw, SID, default_model="anthropic/claude-haiku-5-5")
+        store = Store(self.db)
+        try:
+            for index, ev in enumerate(events):
+                line = launch.usage_line(ev, SID, "ws1-exec-x", "anthropic/claude-haiku-5-5", 1_792_000_100.0)
+                row = generic._usage_row(json.loads(json.dumps(line)), index, 1_792_000_100.0)
+                store.add_usage(row)
+            costs = dict(store._conn.execute("SELECT message_id, est_cost_usd FROM usage_events").fetchall())
+        finally:
+            store.close()
+        # 30k at the 5m rate (0.125) + 20k at the 1h rate (0.2), then 50k all at 5m.
+        self.assertAlmostEqual(costs[f"{SID}-1"], 0.00775, places=9)
+        self.assertAlmostEqual(costs[f"{SID}-2"], 0.00625, places=9)
+
+
+class NonAnthropicPricingUnchangedTest(unittest.TestCase):
+    """DeepSeek, GLM and Beam rows have no 5m/1h split to gain: their cost is unchanged."""
+
+    MODELS = (
+        DEEPSEEK,
+        DEEPSEEK_ID,
+        GLM,
+        GLM_ID,
+        "reflection/Beam-1.0-501B-A23B",
+        "reflection/Beam-1.0-501B-A23B:xhigh",
+        "reflection-beam",
+    )
+
+    def test_cost_with_the_split_equals_cost_without_it(self):
+        table = pricing.catalog()
+        for model in self.MODELS:
+            for cache_write in (0, 1, 5000, 123_457):
+                before = pricing.cost(model, 1000, 200, 300, cache_write, table)
+                split = pi.write_split({"cacheWrite": cache_write, "cacheWrite1h": 0}, model)
+                after = pricing.cost(model, 1000, 200, 300, cache_write, table, cache_write_5m=split[0], cache_write_1h=split[1])
+                self.assertEqual(before, after, (model, cache_write))
+
+    def test_absent_field_leaves_the_pi_event_unsplit(self):
+        for model in self.MODELS:
+            self.assertEqual(pi.write_split({"cacheWrite": 5000}, model), (None, None), model)
+
+    def test_writes_on_a_rateless_write_class_stay_unpriced(self):
+        # DeepSeek publishes no cache-write rate: a write is unpriced, with or without the split.
+        self.assertIsNone(pricing.cost(DEEPSEEK_ID, 10, 10, 0, 5000))
+        self.assertIsNone(pricing.cost(DEEPSEEK_ID, 10, 10, 0, 5000, cache_write_5m=5000, cache_write_1h=0))
+        self.assertEqual(pricing.cost("reflection/Beam-1.0-501B-A23B", 10, 10, 0, 0), 0.0)
+
+
 if __name__ == "__main__":
     unittest.main()
 

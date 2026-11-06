@@ -13,6 +13,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from dash.pricing import (
+    catalog,
     catalog_sig,
     cost,
     family,
@@ -295,6 +296,43 @@ class CatalogTest(unittest.TestCase):
         self.assertEqual(by_model[GROK]["billing_mode"], "plan-included")
         self.assertFalse(by_model["muse-wonder-full-1.0"]["priced"])
         self.assertEqual(by_model["muse-wonder-full-1.0"]["confidence"], "unknown")
+
+
+class PiAnthropicAndOpus5RowsTest(unittest.TestCase):
+    def test_prefixed_haiku_row_copies_the_bare_row(self):
+        rows = {row["model"]: row for row in load()}
+        bare, prefixed = rows["claude-haiku-5-5"], rows["anthropic/claude-haiku-5-5"]
+        for key in ("input", "output", "cache_read", "cache_write_5m", "cache_write_1h", "reasoning",
+                    "long_context", "input_includes_cache_read", "billing_mode", "price_scope"):
+            self.assertEqual(prefixed[key], bare[key], key)
+        self.assertEqual(prefixed["provider"], "anthropic")
+        self.assertEqual(prefixed["source_url"], "https://platform.claude.com/docs/en/about-claude/pricing")
+        self.assertEqual(prefixed["retrieved_at"], "2026-11-06")
+        self.assertEqual(prefixed["confidence"], "published")
+
+    def test_prefixed_haiku_prices_like_the_bare_row(self):
+        table = catalog()
+        for args in ((1_000_000, 0, 0, 0), (100_000, 500, 0, 0), (100_001, 0, 0, 0), (50_000, 0, 1_000, 40_000)):
+            self.assertEqual(
+                cost("anthropic/claude-haiku-5-5", *args, table, cache_write_5m=0, cache_write_1h=0),
+                cost("claude-haiku-5-5", *args, table, cache_write_5m=0, cache_write_1h=0),
+                args,
+            )
+        # Prompt over 100k uses the long-context rates (input 0.5).
+        self.assertAlmostEqual(cost("anthropic/claude-haiku-5-5", 100_001, 0, 0, 0), 0.0500005, places=9)
+
+    def test_opus_5_published_rates(self):
+        rows = {row["model"]: row for row in load()}
+        opus = rows["claude-opus-5"]
+        self.assertEqual((opus["input"], opus["output"], opus["cache_read"]), (5, 25, Decimal("0.5")))
+        self.assertEqual((opus["cache_write_5m"], opus["cache_write_1h"]), (Decimal("6.25"), 10))
+        self.assertIsNone(opus["long_context"])
+        self.assertEqual(opus["provider"], "anthropic")
+        self.assertEqual(opus["retrieved_at"], "2026-11-06")
+        self.assertEqual(opus["confidence"], "published")
+        self.assertAlmostEqual(cost("claude-opus-5", 0, 0, 0, 1_000_000, cache_write_5m=0, cache_write_1h=1_000_000), 10.0)
+        self.assertAlmostEqual(cost("claude-opus-5", 0, 0, 0, 1_000_000, cache_write_5m=1_000_000, cache_write_1h=0), 6.25)
+        self.assertIsNone(cost("claude-opus-5", 0, 0, 0, 1_000_000))
 
 
 class BeamPricingTest(unittest.TestCase):
@@ -630,6 +668,47 @@ class RepriceCliTest(unittest.TestCase):
                 self.assertIsNotNone(row["est_cost_usd"])
             finally:
                 store.close()
+
+
+class OpenRouterFreeAndGrokBuildTest(unittest.TestCase):
+    """OpenRouter's published $0 ids price; ids with no exact rate stay null."""
+
+    def test_openrouter_prefixed_free_ids_price_at_zero(self):
+        rows = {row["model"]: row for row in load()}
+        for model in ("openrouter/stealth/crouton-alpha", "openrouter/nvidia/nemotron-3.5-lightning:free"):
+            row = rows[model]
+            self.assertEqual(row["provider"], "openrouter")
+            self.assertEqual(row["source_url"], "https://openrouter.ai/api/v1/models")
+            self.assertEqual(row["retrieved_at"], "2026-11-06")
+            self.assertEqual(row["billing_mode"], "free")
+            self.assertTrue(status(model)["priced"], model)
+            # Cached-read tokens (nemotron :free logs 4.5M) price at the $0 rate, not None.
+            self.assertEqual(cost(model, 263_283, 24_351, 4_516_880, 0, reasoning=0), 0.0, model)
+
+    def test_command_code_crouton_prices_at_zero_from_its_free_label(self):
+        rows = {row["model"]: row for row in load()}
+        row = rows["stealth/crouton-alpha"]
+        self.assertEqual(row["billing_mode"], "free")
+        self.assertIn("cmd --list-models", row["source_url"])
+        self.assertEqual(cost("stealth/crouton-alpha", 1_000, 500, 2_000, 3_000, reasoning=0), 0.0)
+
+    def test_no_exact_rate_stays_unpriced(self):
+        """The -1019 ling id and muse-wonder-full-1.0
+        have no published rate for that exact id, so they get no $0 row."""
+        for model in ("inclusionai/ling-3.1-flash-1019:free", "muse-wonder-full-1.0"):
+            self.assertFalse(status(model)["priced"], model)
+            self.assertIsNone(cost(model, 10, 10, 0, 0), model)
+        self.assertIsNone(cost("inclusionai/ling-3.1-flash-1019:free", 1, 1, 0, 0))
+
+    def test_grok_build_id_prices_at_the_public_grok_rate(self):
+        plain = cost("grok-4.7", 1_000_000, 1_000_000, 1_000_000, 0)
+        self.assertAlmostEqual(plain, 8.5)
+        self.assertAlmostEqual(cost("grok-4.7-build", 1_000_000, 1_000_000, 1_000_000, 0), plain)
+        self.assertAlmostEqual(cost("grok-4.7-build:high", 1_000_000, 1_000_000, 1_000_000, 0), plain)
+        self.assertTrue(status("grok-4.7-build")["priced"])
+        # Only a real grok row is re-keyed: an unknown -build id stays null.
+        self.assertIsNone(cost("grok-9.9-build", 1, 1, 0, 0))
+        self.assertIsNone(cost("muse-wonder-full-1.0", 1, 1, 0, 0))
 
 
 if __name__ == "__main__":

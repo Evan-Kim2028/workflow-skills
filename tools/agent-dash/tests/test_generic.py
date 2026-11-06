@@ -339,5 +339,26 @@ class ReportCliTests(unittest.TestCase):
         self.assertEqual(agent_dash.cmd_report(["--run-dir"]), 2)
 
 
+class UsageSplitTests(unittest.TestCase):
+    """The optional 5m/1h write split survives the reader; absent means None."""
+
+    def test_split_fields_pass_through(self):
+        row = generic._usage_row(
+            {"session_id": "s", "tool": "pi", "message_id": "m", "input": 1, "cache_write": 9,
+             "cache_write_5m": 6, "cache_write_1h": 3},
+            1, NOW,
+        )
+        self.assertEqual((row["cache_write"], row["cache_write_5m"], row["cache_write_1h"]), (9, 6, 3))
+
+    def test_absent_or_bad_split_is_none_not_zero(self):
+        row = generic._usage_row({"session_id": "s", "tool": "pi", "message_id": "m", "cache_write": 9}, 1, NOW)
+        self.assertIsNone(row["cache_write_5m"])
+        self.assertIsNone(row["cache_write_1h"])
+        bad = generic._usage_row(
+            {"session_id": "s", "message_id": "m", "cache_write_5m": -1, "cache_write_1h": True}, 1, NOW)
+        self.assertIsNone(bad["cache_write_5m"])
+        self.assertIsNone(bad["cache_write_1h"])
+
+
 if __name__ == "__main__":
     unittest.main()
