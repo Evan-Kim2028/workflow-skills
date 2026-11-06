@@ -2,7 +2,7 @@
 
 Local execution dashboard, read-only except the page archive action. One Python 3 process (stdlib only), binds 127.0.0.1:8765.
 Code is this directory. `install.sh` links it to `~/.claude/tools/agent-dash`. State: `~/.local/share/agent-dash/` (dash.sqlite WAL, pidfile, log).
-Never writes to any source, never signals agent processes, never stores prompt bodies or argv.
+Never writes to any source, never signals agent processes, never stores prompt bodies or argv. One opt-in, read-only exception serves archived log text: the log search view (see "Log search exception" below).
 Lifecycle controls from the page (`POST /api/workstreams/archive`, `POST /api/workstreams/restore`, `POST /api/workstreams/state`, `POST /api/workstreams/bulk`) are the only writes the dashboard performs, and they exist so a workstream can move through its lifecycle without a terminal round-trip: they write only bundle lifecycle fields (`state`, `state_changed_at`, `archived_at`, the frozen `summary.json`) through the same `dash/lifecycle.py` functions the CLI uses, never sources, plan content, or approvals, and they stay local-only (Host/Origin plus `X-AgentDash-Action: 1`) with a read-only switch (`AGENT_DASH_READONLY=1`, config `readonly: true`).
 The one argv value ever kept is the worker's `--model` flag value, recorded on process samples and live-process rows so a run whose model is otherwise unknown can be named. Model ids, labels, token counts, and the session `ws_hint` (a workstream id derived from a bundle tool-use path, never served by any endpoint) are the only worker-derived strings in the store.
 
@@ -70,6 +70,9 @@ The Linear source (`dash/sources/linear.py`) is the one outbound network call. I
 | `dash/projectgraph.py` (pure cross-workstream graph builder for `GET /api/project/graph`: nodes, depends_on/gate/moved edges, cycles, depths) | depgraph |
 | `static/cards/depgraph.js` + `depgraph.css` (dependency graph card on `?view=project` and `?view=planned`, `exec-depgraph` slot on both) | depgraph |
 | `static/cards/archive.js` + `archive.css` (Archive shelf `?view=archive`: frozen summary cards, lifetime totals, read-only plan banner style) | Claude (parent) |
+| `dash/logsearch.py` (`GET /api/logs/search`, `GET /api/logs/facets`: read-only LogsQL proxy to the local VictoriaLogs store; opt-in, see Log search exception) | logsearch |
+| `static/cards/log-search.js` + `log-search.css` (Log search card on `?view=project`, scope `project`, unslotted: one button until opened, then search over archived logs) | logsearch |
+| `tests/test_logsearch.py` (quoting, limits, time window, down and empty states, snippet caps, card no-load rule; real-store class runs when `AGENT_DASH_VLOGS_BIN` names a binary) | logsearch |
 | `static/cards/decisions.js` + `decisions.css` (read-only decisions mirror on the Project home, scope `project`, unslotted: reads `GET /api/decisions`, hides entirely when the endpoint is absent or `source.present` is false) | feed |
 | `dash/projectfeed.py` (pure feed builder for `GET /api/project/feed`: page API only, no card) | feed |
 | `dash/projecttimeline.py` (pure timeline builder + project reader + the `/api/project/timeline` collector: page API only, no card) | core |
@@ -659,6 +662,18 @@ Current is the management table: one row per non-archived, non-dropped workstrea
 The dashboard stays read-only under the switch: every action button becomes a copy-command button (`python3 agent_dash.py ws state <ID> <state>`, `ws archive`, `ws restore`) with a confirmation toast; they never write. Closing reports are basename-only on every payload; Report links open the plan view.
 
 Card registry scopes are `overview`, `workstream`, `both` (the exec tabs), plus `project` (Project home slots `exec-burnup`, `exec-phases`, `exec-health`, `exec-depgraph`) and `planned` (Planned slot `exec-depgraph`). A slotted entry mounts inside its named slot; an unslotted entry renders as its own section after the slots in registry order. A chart needed on both views adds one registry line per scope over the same spec function: still one file plus registry lines, no routing edits. The live example is the dependency graph: `depgraph.js` registers `depgraph` (scope `project`) and `depgraph-plan` (scope `planned`), both slotted `exec-depgraph` over the one `depGraphSpec`, fed by `GET /api/project/graph`.
+
+## Log search exception (opt-in, read-only)
+
+Owner decision: archived agent logs are searchable. The rule above (no prompt bodies or argv stored or shown) still holds for `dash.sqlite`, the sources, and every other endpoint. This section is the one exception.
+
+- `GET /api/logs/search` and `GET /api/logs/facets` (`dash/logsearch.py`) forward LogsQL to the local VictoriaLogs store that the log archive fills (`scripts/vlogs_install.sh`, `dash/logarchive.py`, `dash/vlogs.py`). Those rows hold the prompt and tool text of finished runs, redacted for secret shapes before ingest, so these two endpoints can return that text. No other endpoint does.
+- The store URL comes from `AGENT_DASH_VLOGS_URL`, default `http://127.0.0.1:19428`. A non-loopback URL is refused and answered as `down`. Nothing is written: no `dash.sqlite` rows, no files.
+- `q` is literal text. It becomes one quoted, case-insensitive phrase filter `i("...")` on `_msg`; `\` and `"` are escaped and control characters become spaces. `ws`, `label` and `type` are exact quoted matches. No other user text reaches LogsQL.
+- Every query carries a time window (default the last 30 days), a 2 s server-side `timeout`, and a limit (default 100, max 500). Results are newest first with `ts`, `ws`, `label`, `type`, `path` (the archived file's relative path), a `snippet` of at most 500 characters around the first match, and `text`, the event capped at 2000 characters for the detail pane.
+- A down or empty store answers HTTP 200 with `status` `down` (or zero results) and `install: "sh scripts/vlogs_install.sh"`. The connect budget is 300 ms. Bad parameters are 400.
+- The card (`static/cards/log-search.js`, scope `project`, unslotted) renders one button until the owner opens it. Only then does it fetch facets and results. Typing is debounced (250 ms); a new search aborts the one in flight. `/api/state`, `/api/health`, the SSE tick, polling and page load never call these endpoints. Results and the selected event render through `textContent` only.
+- `tests/test_privacy_pin.py` is unchanged. Its sweep seeds dashboard sources and never seeds VictoriaLogs, and it does not list these two paths, because they are the one place archived log text is served by design. `tests/test_logsearch.py` pins the rest of this section.
 
 ## One number, one truth
 

@@ -1,0 +1,30 @@
+/* Log search card (static/cards/log-search.js). Opt-in and read-only.
+   Token-first; status is never colour alone (the empty states are words). */
+.ls-card .ls-open{border:1px solid var(--ring);background:var(--surface);border-radius:var(--r-pill);padding:6px 14px;font-size:13px;font-weight:650;color:var(--ink-2);cursor:pointer}
+.ls-card .ls-open:focus-visible,.ls-card .ls-row:focus-visible,.ls-card .ls-close:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.ls-note{font-size:12.5px;color:var(--muted);margin:8px 0 0}
+.ls-form{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin:4px 0 8px}
+.ls-q{flex:1 1 240px;min-width:0;border:1px solid var(--ring);background:var(--surface);color:var(--ink);border-radius:var(--r-pill);padding:6px 12px;font-size:13px}
+.ls-sel{border:1px solid var(--ring);background:var(--surface);color:var(--ink-2);border-radius:var(--r-pill);padding:5px 10px;font-size:12.5px;max-width:220px}
+.ls-status{font-size:12.5px;color:var(--muted);margin:4px 0 10px;min-height:1.2em}
+.ls-list{list-style:none;margin:0;padding:0}
+.ls-item{border-bottom:1px solid var(--grid)}
+.ls-item:last-child{border-bottom:0}
+.ls-row{display:block;width:100%;text-align:left;background:none;border:0;padding:8px 6px;color:var(--ink);cursor:pointer;border-radius:6px}
+.ls-row:hover{background:var(--surface-2)}
+.ls-row[aria-pressed="true"]{background:var(--surface-2)}
+.ls-meta{display:flex;gap:6px;flex-wrap:wrap;align-items:center;font-size:12px;color:var(--muted)}
+.ls-when{font-variant-numeric:tabular-nums}
+.ls-chip{font:700 11.5px var(--mono);color:var(--ink-2);background:var(--surface-2);border-radius:var(--r-pill);padding:1px 8px}
+.ls-path{display:block;font:11.5px var(--mono);color:var(--muted);overflow-wrap:anywhere;margin-top:2px}
+.ls-snip{display:block;font-size:13px;color:var(--ink-2);margin-top:4px;white-space:pre-wrap;overflow-wrap:anywhere}
+.ls-acts{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}
+.ls-detail{margin-top:12px;border-top:1px solid var(--line);padding-top:10px}
+.ls-detail-head{font-size:12.5px;color:var(--muted);margin:0 0 4px}
+.ls-text{font:12px/1.45 var(--mono);color:var(--ink);white-space:pre-wrap;overflow-wrap:anywhere;max-height:360px;overflow:auto;background:var(--surface-2);border-radius:8px;padding:10px;margin:0}
+.ls-close{margin-top:8px;border:1px solid var(--ring);background:var(--surface);border-radius:var(--r-pill);padding:4px 12px;font-size:12.5px;color:var(--ink-2);cursor:pointer}
+.ls-empty{border:1px dashed var(--ring-strong,var(--ring));border-radius:10px;padding:14px;font-size:13px;color:var(--ink-2)}
+.ls-empty p{margin:0 0 8px}
+.ls-empty-note{color:var(--muted);font-size:12.5px}
+.ls-cmd{margin:0;background:var(--surface-2);border-radius:6px;padding:8px 10px;overflow-x:auto}
+.ls-cmd code{font:12.5px var(--mono);color:var(--ink)}

@@ -489,6 +489,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._risks()
             elif path == "/api/project/feed":
                 self._feed(query)
+            elif path.startswith("/api/logs/"):
+                self._logs(path, query)
             elif path.startswith("/bundle/"):
                 self._bundle_page(path)
             elif path == "/api/health":
@@ -1389,6 +1391,18 @@ class Handler(BaseHTTPRequestHandler):
             200,
             projectfeed.collect_feed(None, self.server.store, time.time(), limit),
         )
+
+    def _logs(self, path, query):
+        """``GET /api/logs/search|facets``: opt-in log search over the local
+        VictoriaLogs store (``dash.logsearch``). Read-only, loopback only,
+        never reads dash.sqlite; the page calls it only after the card opens."""
+        from dash import logsearch
+        params = {name: _one(query, name) for name in logsearch.PARAMS}
+        out = logsearch.handle(path, params, time.time())
+        if out is None:
+            self._json(404, api_error("not found", "not_found", "Try GET /api/logs/search."))
+            return
+        self._json(out[0], out[1])
 
     def _bundles(self):
         self._json(200, {"bundles": list_bundles()})
