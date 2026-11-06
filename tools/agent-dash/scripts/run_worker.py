@@ -298,8 +298,9 @@ def launch(ctx, name, tried) -> int:
     cmd = command(
         worker, ctx["label"], ctx["workspace"], ctx["prompt"], session_id, ctx["run_dir"], tier
     )
+    scratch = ensure_scratch(ctx)
     try:
-        pid = ctx["hooks"]["spawn"](cmd, ctx["out"], ctx["err"], env=launch_env(worker))
+        pid = ctx["hooks"]["spawn"](cmd, ctx["out"], ctx["err"], env=launch_env(worker, scratch))
     except OSError:
         ctx["tier_path"].unlink(missing_ok=True)
         emit("failed", ctx["out"], ctx["err"], tier, "spawn")
@@ -331,12 +332,31 @@ def standby_file(worker):
     return os.path.expanduser(value.strip())
 
 
-def launch_env(worker):
-    """Extra env for the child launcher: the standby file, when declared."""
+def ensure_scratch(ctx) -> str:
+    """The run's ``$AGENT_SCRATCH`` folder, created before the launch.
+
+    A folder that cannot be created still yields its path, so the worker
+    gets the same variable; the warning says the folder is missing.
+    """
+    from dash import scratchdir
+
+    try:
+        return str(scratchdir.ensure(ctx["label"], ctx["run_dir"]))
+    except (OSError, ValueError) as exc:
+        print(f"scratch warning: {exc}", file=sys.stderr)
+        return str(scratchdir.scratch_path(ctx["label"]))
+
+
+def launch_env(worker, scratch=None):
+    """Extra env for the child launcher: ``AGENT_SCRATCH`` for every tier,
+    and the standby file for a ``pi`` tier that declares one."""
+    env = {}
     path = standby_file(worker)
-    if path is None or str((worker or {}).get("kind") or "") != "pi":
-        return None
-    return {"AGENT_DASH_PI_ENV_FILE": path}
+    if path is not None and str((worker or {}).get("kind") or "") == "pi":
+        env["AGENT_DASH_PI_ENV_FILE"] = path
+    if scratch:
+        env["AGENT_SCRATCH"] = str(scratch)
+    return env or None
 
 
 def write_meta(ctx, tier, worker, pid) -> None:
