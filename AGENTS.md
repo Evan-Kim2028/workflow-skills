@@ -10,7 +10,7 @@ Agent instructions for this repo. Short on purpose; the skills carry the detail.
 - Run several test modules in one process now and then (`cd tools/agent-dash/tests && python3 -m unittest test_a test_b`): state can leak between modules that pass alone.
 - When a test run is piped (`| tee`, `| tail`), run `set -o pipefail` first, or the pipe hides the failing exit status.
 - Never run the whole `tests/` directory, a bare `pytest`, every check script, or a `*ci-local.sh` script. The repo has no GitHub Actions; do not add a workflow that runs whole suites.
-- The pre-push hook runs `scripts/privacy_audit.sh` only.
+- The repo's pre-push hook (`.githooks/`) runs `scripts/privacy_audit.sh` only. The opt-in `scripts/install_hooks.sh` pre-push gate runs `scripts/gate.sh` instead, once per checkout.
 
 ## Worktrees: one per task, removed when it finishes
 
