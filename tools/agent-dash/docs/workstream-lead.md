@@ -95,6 +95,12 @@ What the workflow does:
 
 Run labels are `ws4-WS4.1-notes-index`, then `-rev1` and `-fix1`. A label that holds the task id pins each attempt on the task chip, and `↻N` counts the attempts; the task map is the override for other labels. `defaultTier` and `reviewTier` default to `default`. Tiers are registry worker names, `default`, or `auto`, read from `workers.example.json`, `workers.local.json`, or `AGENT_DASH_WORKERS`.
 
+## Prompts
+
+A worker prompt holds the task. `run_worker.py` builds the prompt the worker reads: the `[label: <label>]` line, then `templates/worker-common.md` (the worker rules), then your text. You do not paste the rules or the label line; if you do, nothing is added twice. The assembled copy is `runs/<label>/<label>.md`; your file is never changed. Size is printed on each launch, with a warning above 40 KB.
+
+A special run that must not get the rules runs `run_worker.py` with `--no-rules`, which launches the file as written.
+
 ## Where files go
 
 Hub run folders are durable. Only prompts, reports, decisions and out or err files go there.

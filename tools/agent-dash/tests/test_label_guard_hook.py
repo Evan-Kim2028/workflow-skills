@@ -243,6 +243,56 @@ class TsvAppendShapesTests(unittest.TestCase):
         )
 
 
+class PromptAndVariableLaunchTests(unittest.TestCase):
+    """Prompt heredocs and shell-variable labels never refuse a launch.
+
+    A heredoc only carries a label when it appends to a sessions TSV
+    (a real `>`/`>>` into the TSV). A prompt heredoc whose command line
+    merely names a TSV, and a launch whose label is `$VAR`, are not labels
+    we can read: they pass. Literal bad labels are still refused.
+    """
+
+    def setUp(self):
+        self.old = os.environ.get("AGENT_DASH_WORKSTREAMS")
+        os.environ["AGENT_DASH_WORKSTREAMS"] = "/nonexistent-ws-dir-for-tests"
+
+    def tearDown(self):
+        if self.old is None:
+            os.environ.pop("AGENT_DASH_WORKSTREAMS", None)
+        else:
+            os.environ["AGENT_DASH_WORKSTREAMS"] = self.old
+
+    def test_prompt_heredoc_naming_a_tsv_is_not_a_label(self):
+        command = "cat > /pad/muse-sessions.tsv-notes.md <<'EOF'\nand the scope of this prompt\nEOF"
+        self.assertEqual(hook.extract_labels(command), [])
+        self.assertEqual(hook.judge(command)[0], 0)
+
+    def test_prompt_heredoc_with_label_word_passes(self):
+        command = "cat > /pad/ws13-muse-sessions.tsv.md <<'EOF'\nlabel and scope: plan\nEOF"
+        self.assertEqual(hook.judge(command)[0], 0)
+
+    def test_tsv_append_heredoc_still_reads_its_label(self):
+        command = "cat >> /pad/muse-sessions.tsv <<EOF\nand\ts\t1\nEOF"
+        self.assertEqual(hook.extract_labels(command), ["and"])
+        self.assertEqual(hook.judge(command)[0], 2)
+
+    def test_variable_label_passes(self):
+        for command in (
+            "scripts/run_worker.sh muse $L /repo /p.md /runs",
+            "scripts/run_worker.sh muse ${L} /repo /p.md /runs",
+        ):
+            with self.subTest(command=command):
+                self.assertEqual(hook.extract_labels(command), [])
+                self.assertEqual(hook.judge(command)[0], 0)
+
+    def test_literal_bad_label_is_still_refused(self):
+        command = "scripts/run_worker.sh muse 'bad label!' /repo /p.md /runs"
+        self.assertEqual(hook.extract_labels(command), ["bad label!"])
+        code, message = hook.judge(command)
+        self.assertEqual(code, 2)
+        self.assertIn("label refused", message)
+
+
 class JudgeTests(unittest.TestCase):
     def setUp(self):
         self.old = os.environ.get("AGENT_DASH_WORKSTREAMS")

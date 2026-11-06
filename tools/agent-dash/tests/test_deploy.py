@@ -65,6 +65,20 @@ def free_port():
     return port
 
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from live_guard import Guard
+
+_GUARD = Guard()
+
+
+def setUpModule():
+    _GUARD.start()
+
+
+def tearDownModule():
+    _GUARD.stop()
+
+
 class StubHealthHandler(http.server.BaseHTTPRequestHandler):
     payload = {"ok": True}
 
@@ -148,6 +162,9 @@ class CliStateMixin:
             agent_dash.PORT,
         )
         agent_dash.PORT = free_port()
+        # Guard: a case must never bind the live port or a non-temp state dir.
+        assert agent_dash.PORT != 8765
+        assert os.path.realpath(os.environ["AGENT_DASH_STATE_DIR"]).startswith(os.path.realpath(tempfile.gettempdir()))
         self.addCleanup(self.restore_temp_state)
 
     def restore_temp_state(self):
@@ -408,7 +425,9 @@ class DeployLibTest(unittest.TestCase):
         self.assertTrue(ok, message)
         self.assertEqual(seen, [git(self.repo, "rev-parse", "--short", self.sha2)])
 
-    def test_gate_failure_restarts_previous(self):
+    def test_gate_failure_leaves_the_dashboard_alone(self):
+        # A refused gate switches nothing, so it must not restart anything:
+        # restarting the running release here would bounce the live server.
         self._all_ok()
         self.assertTrue(deploy_lib.deploy(self.state, self.repo, ref=self.sha1, url="http://127.0.0.1:1")[0])
         self.assertTrue(deploy_lib.deploy(self.state, self.repo, ref=self.sha2, url="http://127.0.0.1:1")[0])
@@ -423,8 +442,9 @@ class DeployLibTest(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("gate failed", message)
         self.assertIn("gate boom", message)
+        self.assertIn("left as-is", message)
+        self.assertEqual(restarts, [])
         self.assertEqual(deploy_lib.current_release(self.state), prev)
-        self.assertIn(deploy_lib.tool_dir_of(prev), [tool for tool, _flag in restarts])
         first = deploy_lib.releases_dir(self.state) / self.sha1
         self.assertEqual(deploy_lib.previous_release(self.state), first)
 
@@ -602,6 +622,199 @@ class PreflightTest(CliStateMixin, unittest.TestCase):
             agent_dash.cmd_stop = real_stop
         self.assertEqual(rc, 1)
         self.assertEqual(stopped, [])
+
+
+class LocalFilesTest(unittest.TestCase):
+    """Gitignored local overrides are linked into releases, never copied.
+
+    The source is a git checkout (like the owner's main checkout) whose
+    tracked tree has the tool and a gitignore covering ``*.local.json``.
+    The local files live untracked in it, so a clean release lacks them.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.state = Path(self.tmp.name) / "state"
+        self.state.mkdir()
+        self.src = Path(self.tmp.name) / "owner-checkout"
+        self.src.mkdir()
+        git(self.src, "init", "-b", "main")
+        self.tool = self.src / "tools" / "agent-dash"
+        (self.tool / "static").mkdir(parents=True)
+        (self.tool / "agent_dash.py").write_text("# stub\n", encoding="utf-8")
+        (self.src / ".gitignore").write_text("*.local.json\n", encoding="utf-8")
+        git(self.src, "add", ".")
+        git(self.src, "commit", "-m", "one")
+        (self.tool / "agent_dash.py").write_text("# stub 2\n", encoding="utf-8")
+        git(self.src, "commit", "-am", "two")
+        self.sha1 = git(self.src, "rev-parse", "HEAD~1")
+        self.sha2 = git(self.src, "rev-parse", "HEAD")
+        self.addCleanup(self._cleanup_repo)
+        (self.tool / "config.local.json").write_text('{"a": 1}\n', encoding="utf-8")
+        (self.tool / "workers.local.json").write_text('{"default": "local"}\n', encoding="utf-8")
+        (self.tool / "static" / "taskmap.local.json").write_text("{}\n", encoding="utf-8")
+        # Clear every override a shell (or a trial) may export, so each
+        # case sees exactly the files it builds.
+        env = mock.patch.dict(os.environ, {"AGENT_DASH_IGNORE_LOCAL": ""})
+        env.start()
+        self.addCleanup(env.stop)
+        for name in ("AGENT_DASH_WORKERS", "AGENT_DASH_MAP", "AGENT_DASH_PLANS", "AGENT_DASH_TASKMAP", deploy_lib.LOCAL_SOURCE_ENV):
+            os.environ.pop(name, None)
+
+    def _cleanup_repo(self):
+        git(self.src, "worktree", "prune")
+
+    def _release(self, sha=None):
+        release, _sha, _build = deploy_lib.ensure_release(self.src, sha or self.sha2, self.state)
+        return release
+
+    def _all_ok(self, gate=None):
+        patches = [
+            mock.patch.object(deploy_lib, "run_gate", side_effect=gate or (lambda release: (True, ""))),
+            mock.patch.object(deploy_lib, "restart_release", return_value=(True, "")),
+            mock.patch.object(deploy_lib, "wait_healthy", return_value=(True, "")),
+            mock.patch.object(deploy_lib, "wait_settled", return_value=(True, "")),
+            mock.patch.object(deploy_lib, "run_check", return_value=(True, "")),
+        ]
+        for patch in patches:
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def test_links_existing_local_files_and_skips_missing(self):
+        release = self._release()
+        linked = deploy_lib.link_local_files(release, self.src)
+        self.assertEqual(linked, ["config.local.json", "workers.local.json", "static/taskmap.local.json"])
+        dest = release / "tools" / "agent-dash" / "workers.local.json"
+        self.assertTrue(dest.is_symlink())
+        self.assertEqual(os.readlink(dest), str((self.tool / "workers.local.json").resolve()))
+        self.assertFalse((release / "tools" / "agent-dash" / "map.local.json").exists())
+        self.assertEqual(git(release, "status", "--porcelain"), "")
+
+    def test_local_edit_takes_effect_through_the_link(self):
+        release = self._release()
+        deploy_lib.link_local_files(release, self.src)
+        (self.tool / "workers.local.json").write_text('{"default": "edited"}\n', encoding="utf-8")
+        dest = release / "tools" / "agent-dash" / "workers.local.json"
+        self.assertEqual(dest.read_text(encoding="utf-8"), '{"default": "edited"}\n')
+
+    def test_relink_repoints_stale_link_and_keeps_link_when_source_gone(self):
+        release = self._release()
+        dest = release / "tools" / "agent-dash" / "workers.local.json"
+        other = Path(self.tmp.name) / "old.json"
+        other.write_text("{}", encoding="utf-8")
+        dest.symlink_to(other)
+        deploy_lib.link_local_files(release, self.src)
+        self.assertEqual(os.readlink(dest), str((self.tool / "workers.local.json").resolve()))
+        (self.tool / "workers.local.json").unlink()
+        self.assertEqual(deploy_lib.link_local_files(release, self.src), ["config.local.json", "static/taskmap.local.json"])
+        self.assertTrue(dest.is_symlink())
+
+    def test_regular_file_in_release_is_refused(self):
+        release = self._release()
+        (release / "tools" / "agent-dash" / "workers.local.json").write_text("{}", encoding="utf-8")
+        with self.assertRaises(DeployError) as ctx:
+            deploy_lib.link_local_files(release, self.src)
+        self.assertIn("real file", str(ctx.exception))
+
+    def test_ignore_local_and_same_checkout_link_nothing(self):
+        release = self._release()
+        with mock.patch.dict(os.environ, {"AGENT_DASH_IGNORE_LOCAL": "1"}):
+            self.assertEqual(deploy_lib.link_local_files(release, self.src), [])
+        self.assertEqual(deploy_lib.link_local_files(release, release), [])
+        self.assertFalse((release / "tools" / "agent-dash" / "workers.local.json").exists())
+
+    def test_release_registry_reads_the_local_file(self):
+        from dash.locate import layered_path
+
+        release = self._release()
+        tool = deploy_lib.tool_dir_of(release)
+        deploy_lib.link_local_files(release, self.src)
+        self.assertEqual(layered_path("workers", "AGENT_DASH_WORKERS", tool), tool / "workers.local.json")
+        self.assertIsNone(layered_path("map", "AGENT_DASH_MAP", tool))
+
+    def test_deploy_links_before_the_gate_runs(self):
+        seen = {}
+
+        def gate(release):
+            seen["link"] = (deploy_lib.tool_dir_of(release) / "workers.local.json").is_symlink()
+            return True, ""
+
+        self._all_ok(gate)
+        ok, message = deploy_lib.deploy(self.state, self.src, ref=self.sha2, url="http://127.0.0.1:1")
+        self.assertTrue(ok, message)
+        self.assertTrue(seen["link"])
+        self.assertIn("deployed", message)
+
+    def test_local_source_env_names_the_owner_checkout(self):
+        clean = make_repo(commits=1)
+        self.addCleanup(lambda: subprocess.run(["rm", "-rf", str(clean)], check=False, timeout=30))
+        self._all_ok()
+        with mock.patch.dict(os.environ, {deploy_lib.LOCAL_SOURCE_ENV: str(self.src)}):
+            ok, message = deploy_lib.deploy(self.state, clean, ref="HEAD", url="http://127.0.0.1:1")
+        self.assertTrue(ok, message)
+        release = deploy_lib.current_release(self.state)
+        self.assertTrue((deploy_lib.tool_dir_of(release) / "workers.local.json").is_symlink())
+
+    def test_rollback_relinks_the_previous_release(self):
+        # The previous release was built before the owner's files existed
+        # (the case that ran the example registry); rollback must link it.
+        self._all_ok()
+        for name in ("config.local.json", "workers.local.json", "static/taskmap.local.json"):
+            (self.tool / name).unlink()
+        self.assertTrue(deploy_lib.deploy(self.state, self.src, ref=self.sha1, url="http://127.0.0.1:1")[0])
+        first = deploy_lib.releases_dir(self.state) / self.sha1
+        self.assertFalse((first / "tools" / "agent-dash" / "workers.local.json").exists())
+        (self.tool / "workers.local.json").write_text('{"default": "local"}\n', encoding="utf-8")
+        self.assertTrue(deploy_lib.deploy(self.state, self.src, ref=self.sha2, url="http://127.0.0.1:1")[0])
+        ok, message = deploy_lib.rollback(self.state, url="http://127.0.0.1:1", source=self.src)
+        self.assertTrue(ok, message)
+        self.assertEqual(deploy_lib.current_release(self.state), first)
+        self.assertTrue((first / "tools" / "agent-dash" / "workers.local.json").is_symlink())
+
+    def test_local_file_names_cover_every_layered_read(self):
+        import re
+
+        stems = set()
+        for path in (Path(deploy_lib.TOOL_ROOT) / "dash").glob("*.py"):
+            stems.update(re.findall(r'layered_path\(\s*"(\w+)"', path.read_text(encoding="utf-8")))
+        for path in (Path(deploy_lib.TOOL_ROOT) / "scripts").glob("*.py"):
+            stems.update(re.findall(r'layered_path\(\s*"(\w+)"', path.read_text(encoding="utf-8")))
+        self.assertTrue(stems, "no layered_path call sites found")
+        covered = set(deploy_lib.LOCAL_FILES)
+        expected = {f"{stem}.local.json" for stem in stems} | {"config.local.json"}
+        for name in expected:
+            self.assertTrue(
+                name in covered or f"static/{name}" in covered,
+                f"{name} is read by the code but not linked into releases",
+            )
+
+
+class RollbackCliTest(unittest.TestCase):
+    """The rollback command forwards --yes-live so non-interactive sessions can use it."""
+
+    def _call(self, argv):
+        import agent_dash
+
+        with mock.patch.object(agent_dash, "bind_state"), mock.patch.object(
+            agent_dash.deploy_lib, "rollback", return_value=(True, "ok")
+        ) as rollback, mock.patch.object(agent_dash, "_base_url", return_value="http://127.0.0.1:1"):
+            return agent_dash.cmd_rollback(argv), rollback
+
+    def test_forwards_yes_live(self):
+        code, rollback = self._call(["--yes-live"])
+        self.assertEqual(code, 0)
+        self.assertTrue(rollback.call_args.kwargs["yes_live"])
+
+    def test_default_keeps_the_guard(self):
+        code, rollback = self._call([])
+        self.assertEqual(code, 0)
+        self.assertFalse(rollback.call_args.kwargs["yes_live"])
+
+    def test_unknown_argument_is_refused(self):
+        code, rollback = self._call(["--nope"])
+        self.assertEqual(code, 2)
+        rollback.assert_not_called()
 
 
 if __name__ == "__main__":

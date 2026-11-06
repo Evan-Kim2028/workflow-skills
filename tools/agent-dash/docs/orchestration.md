@@ -152,7 +152,7 @@ an observable. The short form, T1 to T5, is in the
 - *Evidence:* lanes without numbers ended in chat haggling ("close enough,
   mark it done") instead of a check, and near-misses shipped as done.
 - *Example:* brief says "listing query p95 ≤ 80 ms with 10% tolerance,
-  probe `scripts/probe_list.sh`"; reviewer reports 75.6 ms → done, no debate.
+  probe `<the lane's probe command>`"; reviewer reports 75.6 ms → done, no debate.
 - *Check:* `ws validate` fails a lane brief without acceptance; review
   verdicts cite the measured number.
 - *Fix:* add the number before launch; a lane already running gets its

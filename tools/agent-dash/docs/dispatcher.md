@@ -61,7 +61,7 @@ Anything that grows and can be rebuilt goes to the run's scratch folder, `$AGENT
 
 | Goes in the run folder (`runs/<label>/`) | Goes in `$AGENT_SCRATCH` |
 |---|---|
-| prompt copy, `out-*.md`, `err-*.log`, `*.pid`, `*.meta.json` | Python environments (`.venv`, `venv`) |
+| prompt copy, assembled prompt `<label>.md`, `out-*.md`, `err-*.log`, `*.pid`, `*.meta.json` | Python environments (`.venv`, `venv`) |
 | the report and any decision file | local Postgres clusters and their data directories |
 | small notes the lead reads | decompressed caches and downloaded archives |
 | | downloaded or rendered images |
@@ -128,7 +128,7 @@ A crash in the loop writes an `error` (phase `fatal`) and a `stopped` event with
 
 ## How a lead uses it
 
-1. Write `prompts/<task-id>.md` for each task that is ready or about to be.
+1. Write `prompts/<task-id>.md` for each task that is ready or about to be. The prompt holds the task only: `run_worker.py` adds the `[label: <label>]` line and the worker rules (`templates/worker-common.md`) before launch. Pasting either by hand is harmless; they are not added twice.
 2. `dispatch start <WS>` (once per workstream, idempotent).
 3. Arm one background `dispatch wait <WS>` (default timeout 1800 s) and end the turn.
 4. When it exits 0, act on each event: read the `finished` report, decide on

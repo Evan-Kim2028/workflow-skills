@@ -384,8 +384,9 @@ def _has_tsv_redirect(segment: str) -> bool:
         after = segment[match.end():].strip()
         if after.startswith("&"):
             continue  # fd duplication (`2>&1`), not a file target
-        first = after.split()[0] if after.split() else ""
-        if any(name in first for name in TSV_NAMES):
+        first = (after.split()[0] if after.split() else "").strip("\"'")
+        # The target must end in the TSV name: `muse-sessions.tsv.md` is a prompt file.
+        if any(first.endswith(name) for name in TSV_NAMES):
             return True
     return False
 
@@ -446,7 +447,13 @@ def extract_labels(command: str) -> list[str]:
             continue
         label = _label_from_argv(argv)
         if label is not None:
-            found.append(label)
+            # A launch whose label is a shell expansion (`$L`, `${L}`,
+            # `$(...)`) is unknowable here: fail open with a log line,
+            # as the TSV branches do. Literal labels are still checked.
+            if _CMD_EXPANSION_RE.search(label):
+                _uncertain(text, "launch label is a shell expansion")
+            else:
+                found.append(label)
             continue
         if "<<<" in argv and (_has_tsv_redirect(text) or pipe_tee):
             # Here-string: `... <<< '<label>\t...' >> <tsv>`
@@ -460,7 +467,9 @@ def extract_labels(command: str) -> list[str]:
             if label is not None:
                 found.append(label)
             continue
-        if "<<" in text and any(name in text.lower() for name in TSV_NAMES):
+        if "<<" in text and _has_tsv_redirect(text):
+            # Only a heredoc that appends to a sessions TSV carries a label
+            # in its body. A prompt heredoc that merely names a TSV does not.
             heredoc_tsv = True
             continue
         label = _label_from_tsv_append(text, argv)

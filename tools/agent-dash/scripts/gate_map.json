@@ -1,5 +1,5 @@
 {
-  "_comment": "Changed-file to test-file table for scripts/gate.sh. Keys are paths relative to tools/agent-dash; shell fnmatch globs (*, ?, no / special-casing). A changed file collects the union of every pattern it matches. tests/test_<name>.py must exist for test_<name>; tests/<dir>/test_<name>.py must exist for <dir>/test_<name> (runs as tests.<dir>.test_<name> with ADASH_PERF=1). test_gate covers gate.sh and gate_map.json themselves.",
+  "_comment": "Changed-file to test-file table for scripts/gate.sh. Keys are paths relative to tools/agent-dash. Globs: * and ? match within one path segment (never /); ** matches across directories (dash/store/*.py is the store package, not nested dirs). Keys written as dir/** are the ones that need nested files. A changed file collects the union of every pattern it matches. tests/test_<name>.py must exist for test_<name>; tests/<dir>/test_<name>.py must exist for <dir>/test_<name> (runs as tests.<dir>.test_<name> with ADASH_PERF=1). test_gate covers gate.sh and gate_map.json themselves.",
   "always": [
     "test_privacy_pin",
     "test_page_rules"
@@ -20,7 +20,7 @@
       "test_deploy",
       "test_rollup"
     ],
-    "catalog/*": [
+    "catalog/**": [
       "test_pricing",
       "test_phases",
       "test_labels"
@@ -207,7 +207,7 @@
       "test_server",
       "perf/test_perf_budget"
     ],
-    "dash/store*.py": [
+    "dash/store/*.py": [
       "test_store",
       "test_server",
       "test_state",
@@ -230,7 +230,7 @@
       "test_server",
       "test_page_rules"
     ],
-    "fixtures/*": [
+    "fixtures/**": [
       "test_fixtures",
       "test_page_rules"
     ],
@@ -246,7 +246,7 @@
       "test_server",
       "test_ws_cli"
     ],
-    "plugins/*": [
+    "plugins/**": [
       "test_label_guard_clis"
     ],
     "scripts/cursor_usage_hook.py": [
@@ -260,6 +260,9 @@
     ],
     "scripts/grok_stream_filter.py": [
       "test_grok_cli"
+    ],
+    "install.sh": [
+      "test_install"
     ],
     "scripts/install_hooks.sh": [
       "test_gate",
@@ -326,7 +329,7 @@
     "scripts/schema_snapshot.py": [
       "test_migration"
     ],
-    "shims/*": [
+    "shims/**": [
       "test_label_guard_clis"
     ],
     "static/*": [
@@ -335,14 +338,55 @@
       "test_view_seq",
       "test_etag"
     ],
-    "tests/fixtures/*": [
+    "static/cards/**": [
+      "test_page_rules",
+      "test_fixtures",
+      "test_view_seq",
+      "test_etag"
+    ],
+    "static/core/**": [
+      "test_page_rules",
+      "test_fixtures",
+      "test_view_seq",
+      "test_etag"
+    ],
+    "static/vendor/**": [
+      "test_page_rules",
+      "test_fixtures",
+      "test_view_seq",
+      "test_etag"
+    ],
+    "tests/fixtures/schema_prev.sql": [
       "test_migration",
-      "test_fixtures"
+      "test_deploy"
+    ],
+    "tests/fixtures/map-WS*.json": [
+      "test_maplayout"
+    ],
+    "tests/fixtures/pi-stream.ndjson": [
+      "test_pi"
+    ],
+    "tests/fixtures/workers_launcher.json": [
+      "test_run_worker"
+    ],
+    "scripts/worker-watch.sh": [
+      "test_worker_watch"
+    ],
+    "scripts/memcap.sh": [
+      "test_install"
+    ],
+    "tests/live_guard.py": [
+      "test_live_guard",
+      "test_deploy",
+      "test_process_control",
+      "test_orchestrate",
+      "test_server",
+      "test_doctor"
     ],
     "workers.example.json": [
       "test_run_worker"
     ],
-    "workflows/*": [
+    "workflows/**": [
       "test_ws_wave"
     ],
     "dash/worktrees.py": [

@@ -22,7 +22,7 @@ The dashboard workstream is one local page that tracks many agents working in pa
 python3 tools/agent-dash/agent_dash.py run
 ```
 
-Open http://127.0.0.1:8765 . The ten-minute path with sample data is [docs/quickstart.md](docs/quickstart.md).
+Open http://127.0.0.1:8765 . The ten-minute path with sample data is [docs/quickstart.md](docs/quickstart.md). What `install.sh` links, and which hooks to install, is in [docs/install.md](docs/install.md).
 
 ## Scope work well
 

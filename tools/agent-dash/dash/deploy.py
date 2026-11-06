@@ -18,6 +18,15 @@ Read-only on sources: the source repo is only read (``rev-parse``,
 ever written. Fetching is deliberately left out: deploy uses the ref
 as it currently resolves, so run ``git fetch`` first when the latest
 upstream commit is wanted.
+
+Gitignored local overrides (``LOCAL_FILES``: ``config.local.json``,
+``workers.local.json``, ``map.local.json``, ``plans.local.json``,
+``static/taskmap.local.json``) are not in git, so a clean release has
+none of them. ``link_local_files`` symlinks each one that exists in the
+source checkout into the release before the gate and before any
+restart, so the release reads the owner's files and a later local edit
+takes effect without a redeploy. Links, never copies; a missing source
+file is skipped.
 """
 
 from __future__ import annotations
@@ -41,6 +50,16 @@ GATE_TIMEOUT_S = 900.0
 RESTART_TIMEOUT_S = 150.0
 CHECK_TIMEOUT_S = 300.0
 HEALTH_POLL_S = 0.5
+# Gitignored local overrides read from the tool dir (see dash/locate.py
+# layered_path and agent_dash.py load_cfg). phases.local.json and the
+# state-dir config.local.json live in the state dir and need no link.
+LOCAL_FILES = (
+    "config.local.json",
+    "workers.local.json",
+    "map.local.json",
+    "plans.local.json",
+    "static/taskmap.local.json",
+)
 
 
 class DeployError(Exception):
@@ -209,6 +228,45 @@ def tool_dir_of(release: Path | str) -> Path:
     return release
 
 
+def link_local_files(release: Path | str, source: Path | str) -> list[str]:
+    """Symlink each ``LOCAL_FILES`` entry from ``source`` into ``release``.
+
+    Returns the names linked. A source file that is missing is skipped;
+    a stale link is repointed, and a link whose source has gone is left
+    alone (never deleted, so a release never falls back to the example
+    registry by accident). A regular file already in the release raises
+    ``DeployError``: it would shadow the owner's file. Under
+    ``AGENT_DASH_IGNORE_LOCAL`` (tests) nothing is linked.
+    """
+    from dash.locate import ignore_local
+
+    if ignore_local():
+        return []
+    rel_tool = tool_dir_of(release).resolve()
+    src_tool = tool_dir_of(source).resolve()
+    if rel_tool == src_tool:
+        return []
+    linked = []
+    for name in LOCAL_FILES:
+        origin = src_tool / name
+        if not origin.is_file():
+            continue
+        dest = rel_tool / name
+        if dest.is_symlink():
+            if os.readlink(dest) == str(origin):
+                linked.append(name)
+                continue
+        elif dest.exists():
+            raise DeployError(
+                f"release file {dest} is a real file, not a link to {origin}. "
+                f"Move it aside and re-run: python3 agent_dash.py deploy"
+            )
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        _set_link(dest, origin)
+        linked.append(name)
+    return linked
+
+
 def _scrubbed_env() -> dict:
     """The inherited env minus ``AGENT_DASH_PORT``.
 
@@ -358,10 +416,37 @@ def _release_build(release: Path) -> str | None:
     return short if code == 0 and short else None
 
 
-def _recover(state_dir: Path | str, prev: Path | None, url: str | None, health_timeout_s: float, yes_live: bool = False) -> str:
+LOCAL_SOURCE_ENV = "AGENT_DASH_LOCAL_SOURCE"
+
+
+def _source(source: Path | str | None) -> Path:
+    """The checkout whose local files are linked into a release.
+
+    ``AGENT_DASH_LOCAL_SOURCE`` wins (a trial or a worktree deploy names
+    the checkout that holds the owner's files); else ``source``; else the
+    checkout running this code.
+    """
+    env = os.environ.get(LOCAL_SOURCE_ENV, "").strip()
+    if env:
+        return Path(os.path.expanduser(env))
+    return Path(source) if source is not None else Path(default_repo(TOOL_ROOT))
+
+
+def _recover(
+    state_dir: Path | str,
+    prev: Path | None,
+    url: str | None,
+    health_timeout_s: float,
+    yes_live: bool = False,
+    source: Path | str | None = None,
+) -> str:
     """Best-effort restart of the previous release after a failed deploy."""
     if prev is None:
         return "no previous release recorded; the dashboard was left as-is"
+    try:
+        link_local_files(prev, _source(source))
+    except DeployError as exc:
+        return f"automatic rollback to {prev} skipped: {exc}"
     set_current(state_dir, prev)
     ok, reason = restart_release(tool_dir_of(prev), yes_live)
     if not ok:
@@ -392,6 +477,7 @@ def deploy(
     state_dir = Path(state_dir)
     try:
         release, sha, expected = ensure_release(repo, ref, state_dir, worktree)
+        link_local_files(release, _source(repo))
     except DeployError as exc:
         return False, str(exc)
     prev = current_release(state_dir)
@@ -399,22 +485,23 @@ def deploy(
     reap_note = f"; reaped {reaped} dead run(s)" if reaped > 0 else ""
     ok, reason = run_gate(release)
     if not ok:
-        recovered = _recover(state_dir, prev, url, health_timeout_s, yes_live)
-        return False, f"gate failed for {sha}: {reason}{reap_note}; {recovered}"
+        # Nothing was switched yet, so nothing is restarted: a refused
+        # gate leaves the running dashboard exactly as it was.
+        return False, f"gate failed for {sha}: {reason}{reap_note}; the dashboard was left as-is"
     set_current(state_dir, release)
     ok, reason = restart_release(tool_dir_of(release), yes_live)
     if not ok:
-        recovered = _recover(state_dir, prev, url, health_timeout_s, yes_live)
+        recovered = _recover(state_dir, prev, url, health_timeout_s, yes_live, repo)
         return False, f"restart of {sha} failed: {reason}; {recovered}"
     if url is not None:
         ok, reason = wait_healthy(url, expected, timeout_s=health_timeout_s)
         if not ok:
-            recovered = _recover(state_dir, prev, url, health_timeout_s, yes_live)
+            recovered = _recover(state_dir, prev, url, health_timeout_s, yes_live, repo)
             return False, f"new release unhealthy: {reason}; {recovered}"
         wait_settled(url)
     ok, reason = run_check(tool_dir_of(release))
     if not ok:
-        recovered = _recover(state_dir, prev, url, health_timeout_s, yes_live)
+        recovered = _recover(state_dir, prev, url, health_timeout_s, yes_live, repo)
         return False, f"check failed on {sha}: {reason}; {recovered}"
     if prev is not None and prev != release:
         set_previous(state_dir, prev)
@@ -429,11 +516,14 @@ def rollback(
     url: str | None = None,
     health_timeout_s: float = 25.0,
     yes_live: bool = False,
+    source: Path | str | None = None,
 ) -> tuple[bool, str]:
     """Switch the dashboard back to the previous release manually.
 
     Returns ``(ok, message)``; failures swap the links back and name
     the reason. ``yes_live`` forwards ``--yes-live`` to the restart.
+    ``source`` is the checkout whose local files are (re)linked into
+    the previous release first; default is the checkout running this code.
     """
     state_dir = Path(state_dir)
     cur = current_release(state_dir)
@@ -445,6 +535,10 @@ def rollback(
         )
     if cur is not None and prev == cur:
         return False, f"previous release is already current ({prev}); nothing to roll back"
+    try:
+        link_local_files(prev, _source(source))
+    except DeployError as exc:
+        return False, str(exc)
     if cur is not None:
         set_previous(state_dir, cur)
     set_current(state_dir, prev)

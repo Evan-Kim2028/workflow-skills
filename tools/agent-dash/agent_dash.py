@@ -74,7 +74,7 @@ USAGE = """agent-dash: local read-only execution dashboard
   python3 agent_dash.py stop [--yes-live]
   python3 agent_dash.py restart [--yes-live]
   python3 agent_dash.py deploy [--ref origin/main] [--worktree DIR] [--yes-live]
-  python3 agent_dash.py rollback
+  python3 agent_dash.py rollback [--yes-live]
   python3 agent_dash.py status [--json] [--repair]
   python3 agent_dash.py backfill --session <id>
   python3 agent_dash.py reprice [--dry-run]
@@ -676,26 +676,24 @@ def _gone(pid: int) -> bool:
 
 
 def _port_free() -> bool:
-    """True when nothing holds the dashboard address anymore.
+    """True when the dashboard address can be bound again.
 
-    A refused connection means free. A timeout means something holds
-    the bind without accepting (a full backlog): the next ``run``
-    could not bind it either, so that counts as still bound.
+    Probes with a bind, not a connect: a connect probe fills a listener's
+    backlog and then reads a reset as "free". ``SO_REUSEADDR`` matches the
+    server (``dash/server.py``), so TIME_WAIT leftovers do not count as
+    held, while any live listener does. The next ``run`` could bind it too.
     """
-    import errno
     import socket
 
     sock = socket.socket()
-    sock.settimeout(1)
     try:
-        sock.connect((HOST, _port()))
-    except OSError as exc:
-        if isinstance(exc, socket.timeout) or getattr(exc, "errno", None) == errno.ETIMEDOUT:
-            return False
-        return True
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind((HOST, _port()))
+    except OSError:
+        return False
     finally:
         sock.close()
-    return False
+    return True
 
 
 def _probe_health(timeout_s: float = 2.0) -> dict | None:
@@ -746,11 +744,13 @@ def cmd_deploy(argv: list[str]) -> int:
 
 def cmd_rollback(argv: list[str]) -> int:
     """Switch the dashboard back to the previous release manually."""
-    if list(argv or []):
+    args = list(argv or [])
+    yes_live = "--yes-live" in args
+    if [arg for arg in args if arg != "--yes-live"]:
         print(USAGE, end="", file=sys.stderr)
         return 2
     bind_state()
-    ok, message = deploy_lib.rollback(STATE_DIR, url=_base_url())
+    ok, message = deploy_lib.rollback(STATE_DIR, url=_base_url(), yes_live=yes_live)
     print(message, file=sys.stdout if ok else sys.stderr)
     return 0 if ok else 1
 
