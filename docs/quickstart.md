@@ -174,7 +174,7 @@ mkdir -p "$HOME/agent-scratch/notes"
 
 If you already replaced `roots.scratchpads` in `config.local.json`, include this directory in that list and restart the dashboard. A directory created under the shipped glob is picked up on the next poll.
 
-Write a markdown file of worker rules and pass its absolute path as `template`. This repository does not ship that file. The workflow inserts the file into each worker prompt.
+Pass the absolute path of the worker rules, `tools/agent-dash/templates/worker-common.md` in this repository (install.sh links it to `~/.claude/templates/worker-common.md`), as `template`. The workflow inserts it into each worker prompt. `run_worker.py` sees the rules marker and does not add them again.
 
 Call the Workflow tool with `scriptPath` set to the absolute path of `ws-wave.js` and `args` set to:
 
@@ -183,7 +183,7 @@ Call the Workflow tool with `scriptPath` set to the absolute path of `ws-wave.js
   "ws": "WS4",
   "repo": "/absolute/path/to/your-repo",
   "runDir": "/absolute/path/to/agent-scratch/notes",
-  "template": "/absolute/path/to/worker-rules.md",
+  "template": "/absolute/path/to/tools/agent-dash/templates/worker-common.md",
   "runner": "/absolute/path/to/run_worker.sh",
   "dash": "/absolute/path/to/agent_dash.py",
   "maxFixRounds": 2,
