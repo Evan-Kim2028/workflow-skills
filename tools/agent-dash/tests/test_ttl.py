@@ -373,6 +373,32 @@ class TtlTest(unittest.TestCase):
         self.assertEqual(payload["v"], 2, "the next read sees the refreshed generation")
         self.assertEqual(cache.stats()["usage"]["background"], 1)
 
+    def test_window_roll_serves_previous_cell_without_waiting(self):
+        cache = respcache_mod.ResponseCache()
+        key = lambda since: respcache_mod.canonical_key("usage", {"since": since}, None)
+        cache.get_or_compute(key(3000), "usage", 0.05, lambda: {"v": 1})
+        time.sleep(0.1)
+        release = threading.Event()
+
+        def slow():
+            release.wait(5.0)
+            return {"v": 2}
+
+        started = time.perf_counter()
+        payload, _, _, kind = cache.get_or_compute(key(3030), "usage", 0.05, slow)
+        self.assertLess(time.perf_counter() - started, 0.5, "a rolled window does not wait")
+        self.assertEqual(kind, "stale")
+        self.assertEqual(payload["v"], 1)
+        release.set()
+        deadline = time.time() + 5.0
+        while time.time() < deadline:
+            payload, _, _, _ = cache.get_or_compute(key(3030), "usage", 0.05, slow)
+            if payload["v"] == 2:
+                break
+            time.sleep(0.02)
+        self.assertEqual(payload["v"], 2)
+        self.assertEqual(cache.stats()["usage"]["background"], 1, "one refresh for the rolled cell")
+
     def test_background_refreshes_are_capped(self):
         cache = respcache_mod.ResponseCache()
         keys = [("k", i) for i in range(respcache_mod.BG_MAX + 3)]

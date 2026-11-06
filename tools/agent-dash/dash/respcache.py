@@ -186,6 +186,27 @@ def canonical_key(endpoint: str, params: dict, headers=None) -> tuple:
     return (endpoint, tuple(items), viewer)
 
 
+def _sliding_family(key: tuple):
+    """``(family, cell)`` for a sliding-window key (``since`` without ``until``).
+
+    The page's ``since`` rolls onto a new 30 s cell every half minute, so
+    each roll is a new key. ``family`` is the key with ``since`` removed;
+    ``cell`` is the grid cell. None for every other key.
+    """
+    try:
+        endpoint, items, viewer = key
+        names = dict(items)
+        if "since" not in names or "until" in names:
+            return None
+        cell = names["since"]
+        if not isinstance(cell, int):
+            return None
+        family = (endpoint, tuple(item for item in items if item[0] != "since"), viewer)
+        return family, cell
+    except Exception:
+        return None
+
+
 class _Entry:
     __slots__ = ("payload", "etag", "generated_at", "computing", "event", "last_read")
 
@@ -204,6 +225,8 @@ class ResponseCache:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._entries: dict = {}
+        #: family -> (cell, key) of the newest sliding-window key (see _sliding_family).
+        self._families: dict = {}
         self._stats: dict = {}
         self._bg_slots = threading.BoundedSemaphore(BG_MAX)
 
@@ -351,8 +374,10 @@ class ResponseCache:
             if entry is None:
                 if len(self._entries) > 512:
                     self._entries.clear()
+                    self._families.clear()
                 entry = _Entry()
                 self._entries[key] = entry
+                self._adopt_neighbour(key, entry, now)
             idle = (now - entry.last_read) > IDLE_S if entry.last_read else True
             entry.last_read = now
             if entry.payload is not None:
@@ -443,6 +468,31 @@ class ResponseCache:
                 return self._serve_copy(fallback, fetag, fgen, refresh, time.time(), "stale")
             raise
         return self._serve_copy(fresh_payload, None, generated_at, refresh, generated_at, "fresh")
+
+    def _adopt_neighbour(self, key: tuple, entry: _Entry, now: float) -> None:
+        """Seed a new sliding-window key from the previous cell's generation.
+
+        Caller holds the lock. The adopted generation keeps its own
+        (older) ``generated_at``, so it reads as expired: the reader gets
+        it at once and one background refresh runs for the new cell. The
+        served window's edge may sit up to one more 30 s cell back than an
+        exact ``since``; the grid already tolerates that skew within a cell.
+        """
+        found = _sliding_family(key)
+        if found is None:
+            return
+        family, cell = found
+        prev = self._families.get(family)
+        self._families[family] = (cell, key)
+        if prev is None or cell - prev[0] != 1:
+            return
+        neighbour = self._entries.get(prev[1])
+        if neighbour is None or neighbour.payload is None:
+            return
+        entry.payload = neighbour.payload
+        entry.etag = neighbour.etag
+        entry.generated_at = neighbour.generated_at
+        entry.last_read = now  # read now, so not idle: it refreshes in background
 
     def _serve_copy(self, payload, etag, generated_at, refresh, now, kind):
         if refresh is not None and isinstance(payload, dict):
