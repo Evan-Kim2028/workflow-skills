@@ -445,6 +445,16 @@ class VerdictAndParseTests(unittest.TestCase):
         self.assertEqual(dispatch.build_label("WS9", "WS9.A", 1), "ws9-exec-a-r1")
 
 
+class WorkerArgvTests(unittest.TestCase):
+    """The dispatcher hands its prompt copy to run_worker.py, which assembles it."""
+
+    def test_launch_goes_through_run_worker_with_the_prompt_copy(self):
+        argv = dispatch.worker_argv("ws9-exec-a", "auto", "/ws", "/bundle/runs/ws9-exec-a/prompt.md", "/bundle/runs/ws9-exec-a", 0)
+        self.assertEqual(Path(argv[1]).name, "run_worker.py")
+        self.assertEqual(argv[2:4], ["auto", "ws9-exec-a"])
+        self.assertEqual(argv[5], "/bundle/runs/ws9-exec-a/prompt.md")
+
+
 class FormatTests(unittest.TestCase):
     def test_format_event_is_one_compact_line(self):
         line = dispatch.format_event(
