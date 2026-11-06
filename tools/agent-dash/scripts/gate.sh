@@ -7,9 +7,15 @@
 # page script, and the repo privacy audit. Prints a one-line verdict per
 # file and a final PASS/FAIL.
 #
-# Usage: sh scripts/gate.sh [base] [--list]
+# Usage: sh scripts/gate.sh [base] [--list] [--force]
 #   base defaults to origin/main. --list prints the selection without
 #   running anything. Run from anywhere; the script cds to tools/agent-dash.
+#
+# Wide selection: when the selection has more than 3 suites or more than
+# 2000 test functions (GATE_MAX_SUITES / GATE_MAX_TESTS override), the gate
+# prints the changed files that widened it, most test functions first, and
+# stops before running anything (exit 3). Run those files' tests directly,
+# or pass --force to run the whole selection anyway.
 #
 # A changed tests/test_<x>.py selects test_<x> itself; a nested
 # tests/<dir>/test_<x>.py selects <dir>/test_<x>, which runs as the
@@ -24,12 +30,14 @@ MAP="$TOOLS_DIR/scripts/gate_map.json"
 AUDIT="$TOOLS_DIR/../../scripts/privacy_audit.sh"
 BASE="origin/main"
 LIST_ONLY=0
+FORCE=0
 
 for arg in "$@"; do
     case "$arg" in
         --list) LIST_ONLY=1 ;;
+        --force) FORCE=1 ;;
         -h|--help)
-            echo "usage: sh scripts/gate.sh [base] [--list]"
+            echo "usage: sh scripts/gate.sh [base] [--list] [--force]"
             exit 0
             ;;
         --*) echo "gate: unknown flag '$arg'" >&2; exit 2 ;;
@@ -39,7 +47,10 @@ done
 
 cd "$TOOLS_DIR" || exit 2
 
-if ! COMMITTED=$(git diff --name-only "$BASE" -- 2>/dev/null); then
+# Diff against the merge-base, not the base tip: a base that moved on must not
+# put its own commits into this branch's selection.
+MERGE_BASE=$(git merge-base "$BASE" HEAD 2>/dev/null) || MERGE_BASE="$BASE"
+if ! COMMITTED=$(git diff --name-only "$MERGE_BASE" -- 2>/dev/null); then
     echo "gate: unknown base ref '$BASE'" >&2
     exit 2
 fi
@@ -84,6 +95,7 @@ default = table.get("default", ["test_page_rules", "test_server"])
 
 selected = set(always)
 warned = []
+per_file = []
 for path in (line.strip() for line in sys.stdin):
     if not path:
         continue
@@ -102,10 +114,38 @@ for path in (line.strip() for line in sys.stdin):
         hits.update(default)
         warned.append(rel)
     selected.update(hits)
+    per_file.append((rel, sorted(hits - set(always))))
+
+def count_tests(name):
+    try:
+        with open(os.path.join(tools, "tests", name + ".py"), encoding="utf-8", errors="replace") as fh:
+            return len(re.findall(r"^\s*def test", fh.read(), re.M))
+    except OSError:
+        return 0
+
+max_suites = int(os.environ.get("GATE_MAX_SUITES", "3"))
+max_tests = int(os.environ.get("GATE_MAX_TESTS", "2000"))
+counts = {name: count_tests(name) for name in selected}
+n_tests = sum(counts.values())
+wide = len(selected) > max_suites or n_tests > max_tests
 for name in sorted(selected):
     print("TEST " + name)
+print("TOTAL %d %d" % (len(selected), n_tests))
+print("WIDE %d" % (1 if wide else 0))
 for rel in warned:
     print("WARN unmapped: " + rel, file=sys.stderr)
+if wide:
+    print("gate: WIDE selection: %d suites, %d test functions (limits %d suites, %d test functions)" % (len(selected), n_tests, max_suites, max_tests), file=sys.stderr)
+    print("gate: changed files that widened it, most test functions first:", file=sys.stderr)
+    ranked = sorted(
+        ((sum(counts.get(n, 0) for n in names), rel, names) for rel, names in per_file if names),
+        reverse=True,
+    )
+    for total, rel, names in ranked[:8]:
+        print("gate:   %s -> %d suites, %d test functions (%s)" % (rel, len(names), total, ", ".join(names)), file=sys.stderr)
+    if ranked:
+        hints = ["python3 -m unittest tests.%s" % n.replace("/", ".") if "/" in n else "python3 -m unittest discover -s tests -p %s.py" % n for n in ranked[0][2]]
+        print("gate: run the tests of the top-ranked file directly: " + " && ".join(hints), file=sys.stderr)
 ' >"$TEST_FILE" 2>"$WARN_FILE"
 
 TESTS=$(grep '^TEST ' "$TEST_FILE" | cut -d' ' -f2 | sort -u)
@@ -116,6 +156,14 @@ if [ "$LIST_ONLY" -eq 1 ]; then
         echo "$t.py"
     done
     exit 0
+fi
+
+if [ "$(awk '$1=="WIDE"{print $2}' "$TEST_FILE")" = "1" ]; then
+    if [ "$FORCE" -eq 0 ]; then
+        echo "GATE STOPPED: wide selection, nothing run. Run the tests of the top-ranked file above, or pass --force."
+        exit 3
+    fi
+    echo "gate: wide selection, running all of it (--force)"
 fi
 
 FAIL=0
