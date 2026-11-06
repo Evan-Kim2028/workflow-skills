@@ -5,6 +5,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+import sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from live_guard import KEYS, LIVE_PORT, LIVE_STATE, Guard
 
 

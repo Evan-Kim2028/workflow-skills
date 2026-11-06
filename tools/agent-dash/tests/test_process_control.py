@@ -47,6 +47,7 @@ def free_port():
             return port
 
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 from live_guard import Guard
 
 _GUARD = Guard()

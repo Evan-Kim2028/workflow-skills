@@ -29,6 +29,7 @@ def _task(tid, status="todo", deps=None, **extra):
     return row
 
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 from live_guard import Guard
 
 _GUARD = Guard()

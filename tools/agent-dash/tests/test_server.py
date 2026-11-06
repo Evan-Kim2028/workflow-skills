@@ -21,6 +21,7 @@ from dash.plans import PlanNotFound, load as load_plan, mapping as plan_mapping
 from dash.server import DashServer, PLACEHOLDER, ROOT
 from dash.sources import Registry
 from dash.store import Store
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 from live_guard import Guard
 
 

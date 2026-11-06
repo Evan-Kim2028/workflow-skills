@@ -48,6 +48,7 @@ def _stop_server(server, thread):
     server.server_close()
 
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 from live_guard import Guard
 
 _GUARD = Guard()
