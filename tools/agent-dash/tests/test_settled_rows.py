@@ -62,6 +62,37 @@ class MuseProcessSigTest(unittest.TestCase):
         self.assertEqual(muse._processes_sig(base), muse._processes_sig(same))
         self.assertNotEqual(muse._processes_sig(base), muse._processes_sig(started))
         self.assertNotEqual(muse._processes_sig(None), muse._processes_sig([]))
+        jitter = [{"pid": 10, "comm": "muse", "started_at": 5.9, "label": "ws1-a"}]
+        self.assertEqual(muse._processes_sig(base), muse._processes_sig(jitter))
+
+
+class MuseTailStampTest(unittest.TestCase):
+    def test_unchanged_file_is_not_retailed_until_it_changes(self):
+        from dash.sources import muse
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = Path(tmp.name) / "session.jsonl"
+        path.write_text("{}\n")
+        calls = []
+
+        def fake_tail(store, p, sid, manifests, parent, budget, per_file, now, processes):
+            calls.append(p)
+            return budget  # reads nothing: the file is at its end
+
+        real = muse._tail_file
+        muse._tail_file = fake_tail
+        self.addCleanup(setattr, muse, "_tail_file", real)
+        muse._TAILED.clear()
+        store = Store(Path(tmp.name) / "dash.sqlite")
+        self.addCleanup(store.close)
+        files = [(str(path), "s1", None)]
+        muse._drain_files(store, files, "muse:test", 10**6, 10**6, 1.0, None, {})
+        muse._drain_files(store, files, "muse:test", 10**6, 10**6, 2.0, None, {})
+        self.assertEqual(len(calls), 1)
+        path.write_text("{}\n{}\n")
+        muse._drain_files(store, files, "muse:test", 10**6, 10**6, 3.0, None, {})
+        self.assertEqual(len(calls), 2)
 
 
 class CursorSettledTest(unittest.TestCase):

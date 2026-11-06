@@ -199,6 +199,21 @@ def _split_priority(files, manifests, now, recent_s):
     return hot, cold
 
 
+#: Files found at end-of-file on their last tail, keyed by path and stamped with
+#: (inode, size, mtime). A file whose stamp is unchanged has no new bytes, so a
+#: tail would read nothing and write nothing: skip it on the stat alone.
+_TAILED: dict = {}
+_TAILED_MAX = 20000
+
+
+def _tail_stamp(path):
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return (int(st.st_ino), int(st.st_size), int(st.st_mtime_ns))
+
+
 def _drain_files(store, files, key, budget, per_file, now, processes, manifests):
     if not files or budget <= 0:
         return budget
@@ -208,9 +223,20 @@ def _drain_files(store, files, key, budget, per_file, now, processes, manifests)
     scanned = 0
     while scanned < n and budget > 0:
         path, sid, muse_parent = files[idx]
+        stamp = _tail_stamp(path)
+        if stamp is not None and _TAILED.get(path) == stamp:
+            idx = (idx + 1) % n
+            scanned += 1
+            continue
+        before = budget
         budget = _tail_file(
             store, path, sid, manifests, muse_parent, budget, per_file, now, processes
         )
+        if budget == before and stamp is not None:
+            # No bytes were read: the file was already consumed to its end.
+            if len(_TAILED) > _TAILED_MAX:
+                _TAILED.clear()
+            _TAILED[path] = stamp
         idx = (idx + 1) % n
         scanned += 1
     try:
@@ -444,11 +470,17 @@ def _adopt_live_labels(store, manifests, processes):
 
 
 def _processes_sig(processes) -> tuple:
-    """Hashable identity of the live process listing (None means it failed)."""
+    """Hashable identity of the live process listing (None means it failed).
+
+    ``started_at`` is left out: it is derived from ``ps`` elapsed time and
+    moves by a second on every listing, which would re-evaluate every row on
+    every tick. Pid, command and label name the process; a reused pid with the
+    same label is caught at the next recheck.
+    """
     if processes is None:
         return ("none",)
     return tuple(sorted(
-        (str(p.get("pid")), str(p.get("comm") or ""), str(p.get("label") or ""), str(p.get("started_at") or ""))
+        (str(p.get("pid")), str(p.get("comm") or ""), str(p.get("label") or ""))
         for p in processes
         if isinstance(p, dict)
     ))
