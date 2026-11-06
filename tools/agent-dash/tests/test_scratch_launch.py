@@ -113,10 +113,10 @@ class ScratchLaunchTests(unittest.TestCase):
     def test_pi_standby_keeps_its_credential_var_and_scratch(self):
         data = dict(self.registry)
         data["workers"] = json.loads(json.dumps(self.registry["workers"]))
-        data["workers"]["pi-deepseek"]["standby_env_file"] = "~/.config/pi/standby.env"
+        data["workers"]["pi-deepseek-flash"]["standby_env_file"] = "~/.config/pi/standby.env"
         self.reg.write_text(json.dumps(data), encoding="utf-8")
         spawn = FakeSpawn()
-        code, line = self.launch("pi-deepseek", "ws1-plan-standby", spawn)
+        code, line = self.launch("pi-deepseek-flash", "ws1-plan-standby", spawn)
         self.assertEqual(code, 0)
         env = spawn.envs[0]
         self.assertEqual(env["AGENT_DASH_PI_ENV_FILE"], os.path.expanduser("~/.config/pi/standby.env"))
