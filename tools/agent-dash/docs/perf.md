@@ -820,9 +820,10 @@ vs new. `ws=all` cold: 6.8 s -> 1.0 s on the copy (idle machine, no profiler).
 | server CPU, 40 s page-like window | 105% of a core | 76% of a core |
 | `page_check --perf` first section (one sample each) | 5 302 ms | 2 138 ms |
 
-The snapshot warm p95 rose: a refresh now lands on about 1 in 5 warm reads
-(period 5 s, compute 1-1.8 s), where before it was a stale serve on 1.5 s
-ttl. It is the cost of the 5 s bound, not a regression in tick latency.
+The snapshot warm p95 rose in this sample (1.7 to 11.8 ms, median still 1-3 ms).
+Not diagnosed: the probe's warm loop overlaps the 5 s refresh cycle, and one run
+is not enough to attribute it. Tick p95, the number that matters for the page,
+fell from 1 809 ms to 33 ms.
 
 ### Freshness bound (per endpoint, `/api/health` `perf.ttl` on head)
 
