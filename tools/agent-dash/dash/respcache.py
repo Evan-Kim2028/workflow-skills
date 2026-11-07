@@ -274,6 +274,8 @@ class ResponseCache:
                 "hit_ratio": ((hits + stale) / serves) if serves else 0.0,
                 "max_age_ms": bucket.get("max_age_ms", 0.0),
                 "over_max": bucket.get("over_max", 0),
+                "compute_last_ms": bucket.get("compute_last_ms", 0.0),
+                "compute_max_ms": bucket.get("compute_max_ms", 0.0),
             }
         return out
 
@@ -319,6 +321,7 @@ class ResponseCache:
         ``(None, None)`` after clearing the flag, so waiters and the next
         reader retry instead of hanging. Runs outside the lock.
         """
+        started = time.perf_counter()
         try:
             fresh = compute()
         except Exception:
@@ -339,7 +342,19 @@ class ResponseCache:
             if entry.event is not None:
                 entry.event.set()
         self._record(endpoint, "recomputes")
+        self._note_compute(endpoint, (time.perf_counter() - started) * 1000.0)
         return fresh, generated_at
+
+    def _note_compute(self, endpoint: str, ms: float) -> None:
+        """Track the slowest and last compute time per endpoint (stats only)."""
+        try:
+            with self._lock:
+                bucket = self._stats.setdefault(endpoint, {})
+                bucket["compute_last_ms"] = round(ms, 1)
+                if ms > bucket.get("compute_max_ms", 0.0):
+                    bucket["compute_max_ms"] = round(ms, 1)
+        except Exception:
+            pass
 
     def _background(self, endpoint: str, entry: _Entry, compute) -> None:
         """Body of one background refresh thread. Never raises."""
