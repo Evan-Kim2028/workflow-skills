@@ -301,12 +301,17 @@ if __name__ == "__main__":
 
 
 class HealthStoreRefreshTests(unittest.TestCase):
-    def test_due_on_first_check_key_change_and_max_age_only(self):
+    def test_due_on_first_check_and_by_key_and_age(self):
         from dash import server as V
 
         due = V.health_store_refresh_due
+        lo, hi = V.HEALTH_STORE_MIN_AGE_S, V.HEALTH_STORE_MAX_AGE_S
         self.assertTrue(due((1, 1, 1), None, None, 0.0))
-        self.assertFalse(due((1, 1, 1), (1, 1, 1), 0.0, 5.0))
-        self.assertTrue(due((2, 1, 1), (1, 1, 1), 0.0, 5.0))
-        self.assertFalse(due((1, 1, 1), (1, 1, 1), 0.0, V.HEALTH_STORE_MAX_AGE_S - 0.1))
-        self.assertTrue(due((1, 1, 1), (1, 1, 1), 0.0, V.HEALTH_STORE_MAX_AGE_S))
+        # Unchanged key: only the max age triggers a recompute.
+        self.assertFalse(due((1, 1, 1), (1, 1, 1), 0.0, hi - 0.1))
+        self.assertTrue(due((1, 1, 1), (1, 1, 1), 0.0, hi))
+        # Moved key (live writer): the min age bounds the recompute rate.
+        self.assertFalse(due((2, 1, 1), (1, 1, 1), 0.0, lo - 0.1))
+        self.assertTrue(due((2, 1, 1), (1, 1, 1), 0.0, lo))
+        self.assertLess(lo, hi)
+

@@ -36,8 +36,11 @@ STATE_BUILD_TIMEOUT_S = 10.0
 STORE_LOCK_WATCHDOG_AFTER_S = 10.0
 HEALTH_STORE_REFRESH_S = 5.0
 #: The health store fields (usage model stats, unpriced models) are recomputed
-#: only when the store's content key moves, or once this long after the last
-#: recompute (the unpriced-model window slides with the clock).
+#: at most every ``HEALTH_STORE_MIN_AGE_S`` and only when the store's content
+#: key moved; with no store change, at most every ``HEALTH_STORE_MAX_AGE_S``
+#: (the unpriced-model window slides with the clock). A live writer moves the
+#: key on every poll, so the minimum age is what bounds the cost there.
+HEALTH_STORE_MIN_AGE_S = 30.0
 HEALTH_STORE_MAX_AGE_S = 60.0
 
 
@@ -1730,9 +1733,12 @@ def health_store_refresh_due(key, last_key, last_at, mono) -> bool:
     True on the first check, when the content key moved, or once
     ``HEALTH_STORE_MAX_AGE_S`` has passed since the last recompute.
     """
-    if last_at is None or key != last_key:
+    if last_at is None:
         return True
-    return mono - last_at >= HEALTH_STORE_MAX_AGE_S
+    age = mono - last_at
+    if key != last_key:
+        return age >= HEALTH_STORE_MIN_AGE_S
+    return age >= HEALTH_STORE_MAX_AGE_S
 
 
 def _health_store_snapshot(store, *, bounded: bool = False) -> dict:
