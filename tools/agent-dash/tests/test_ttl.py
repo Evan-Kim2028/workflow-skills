@@ -332,7 +332,7 @@ class TtlTest(unittest.TestCase):
             worker.join(2.0)
         self.assertFalse(worker.is_alive())
 
-    def test_idle_entry_recomputes_inline(self):
+    def test_idle_entry_serves_recent_generation_and_refreshes(self):
         cache = respcache_mod.ResponseCache()
         cache.get_or_compute(("s",), "usage", 0.05, lambda: {"v": 1})
         with cache._lock:
@@ -345,10 +345,28 @@ class TtlTest(unittest.TestCase):
             calls.append(1)
             return {"v": 2}
 
-        _, _, _, kind = cache.get_or_compute(("s",), "usage", 0.05, compute)
-        self.assertEqual(kind, "fresh", "an idle entry is computed by its reader")
-        self.assertEqual(calls, [1], "no background refresh for an idle entry")
+        payload, _, _, kind = cache.get_or_compute(("s",), "usage", 0.05, compute)
+        self.assertEqual(kind, "stale", "an idle key serves its recent generation at once")
+        self.assertEqual(payload["v"], 1)
+        deadline = time.time() + 5.0
+        while time.time() < deadline and cache.stats()["usage"]["recomputes"] < 2:
+            time.sleep(0.01)
+        self.assertEqual(calls, [1], "one background refresh for the reader")
+
+    def test_idle_entry_older_than_max_age_recomputes_inline(self):
+        cache = respcache_mod.ResponseCache()
+        cache.get_or_compute(("s",), "usage", 0.05, lambda: {"v": 1})
+        with cache._lock:
+            entry = cache._entries[("s",)]
+            entry.generated_at -= respcache_mod.IDLE_MAX_AGE_S + 1.0
+            entry.last_read -= respcache_mod.IDLE_S + 1.0
+        _, _, _, kind = cache.get_or_compute(("s",), "usage", 0.05, lambda: {"v": 2})
+        self.assertEqual(kind, "fresh", "too old to serve after a pause: the reader computes")
         self.assertEqual(cache.stats()["usage"]["background"], 0)
+
+    def test_idle_gap_follows_measured_compute(self):
+        self.assertEqual(respcache_mod.idle_gap_s(0.5), respcache_mod.IDLE_S)
+        self.assertEqual(respcache_mod.idle_gap_s(25.0), 250.0)
 
     def test_expired_entry_serves_stale_and_refreshes_in_background(self):
         cache = respcache_mod.ResponseCache()

@@ -26,10 +26,11 @@ Semantics (see CONTRACT.md, docs/perf.md):
 - Sliding window roll (``since`` without ``until``): a new 30 s cell adopts
   the previous cell's generation, so the roll serves at once and refreshes
   in the background like any expired entry.
-- Idle (no reader for ``IDLE_S``) with an expired generation: the next
-  reader computes inline, so a tab opened after a pause never sees data
-  older than its own recompute. Idle entries never refresh in the
-  background.
+- Idle (no reader for ``idle_gap_s``, at least ``IDLE_S``) with an
+  expired generation no older than ``IDLE_MAX_AGE_S``: the reader gets it
+  at once with its age, and one refresh starts. Older than that, the
+  reader computes inline. A pause therefore never costs a cold compute
+  wait for a key that has a recent generation.
 - First-ever request (no previous result): single-flight, waiters
   block like ``dash.singleflight`` (there is nothing to serve).
 - Window-pinned requests (explicit ``since`` AND ``until``) use a
@@ -66,9 +67,15 @@ DEFAULT_TTL_S = 1.5
 #: is counted in the ``max_age_ms``/``over_max`` stats, so the bound is measured.
 MAX_STALE_S = 5.0
 
-#: An entry no reader has touched for this long is idle: its next reader
-#: computes inline and no background refresh runs for it.
+#: A key no reader has touched for this long is idle. The gap scales with
+#: the key's measured compute (``idle_gap_s``): a 25 s compute is idle after
+#: 250 s, not 30 s, so a pause does not turn it cold.
 IDLE_S = 30.0
+
+#: An idle key's last generation is still served (with its age, and one
+#: background refresh starts) for up to this long. Older than this, the
+#: reader computes inline: nothing older than two minutes goes to a person.
+IDLE_MAX_AGE_S = 120.0
 
 #: At most this many background refreshes run at once across all keys.
 BG_MAX = 4
@@ -250,6 +257,15 @@ class _Entry:
 def max_age_for(endpoint: str) -> float:
     """Freshness ceiling for one endpoint (seconds)."""
     return ENDPOINT_MAX_AGE_S.get(endpoint, MAX_STALE_S)
+
+
+def idle_gap_s(compute_s: float) -> float:
+    """Idle threshold for one key: ``max(IDLE_S, 10 x its last compute)``."""
+    try:
+        scaled = REFRESH_PERIOD_X * max(0.0, float(compute_s))
+    except (TypeError, ValueError):
+        scaled = 0.0
+    return max(IDLE_S, scaled)
 
 
 def refresh_period(ttl: float, compute_s: float, max_age: float) -> float:
@@ -460,7 +476,7 @@ class ResponseCache:
                 entry = _Entry()
                 self._entries[key] = entry
                 self._adopt_neighbour(key, entry, now)
-            idle = (now - entry.last_read) > IDLE_S if entry.last_read else True
+            idle = (now - entry.last_read) > idle_gap_s(entry.compute_s) if entry.last_read else True
             entry.last_read = now
             if entry.payload is not None:
                 age = now - entry.generated_at
@@ -468,15 +484,16 @@ class ResponseCache:
                 if age <= period:
                     kind = "hit"
                     payload, etag, generated = entry.payload, entry.etag, entry.generated_at
-                elif idle and not entry.computing:
-                    # Nothing recent to trust: this reader computes inline.
+                elif idle and age > IDLE_MAX_AGE_S and not entry.computing:
+                    # Too old to serve after a pause: this reader computes inline.
                     entry.computing = True
                     entry.event = threading.Event()
                     kind = "compute"
                     payload = None
                 else:
-                    # Expired: serve the previous generation now. Start
-                    # one background refresh unless one is already running.
+                    # Expired (or idle but recent): serve the previous
+                    # generation now, with its age. Start one background
+                    # refresh unless one is already running.
                     kind = "stale"
                     payload, etag, generated = entry.payload, entry.etag, entry.generated_at
                     if not entry.computing:
