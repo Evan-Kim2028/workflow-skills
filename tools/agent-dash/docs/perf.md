@@ -655,3 +655,141 @@ No schema change, no data migration. Python changes need a `serve` restart
 memory and rebuild on the first poll. Rollback: redeploy the previous release.
 Verify after cutover: `scripts/perf_probe.py` against the live port (GET only),
 and the source CPU share from `/api/health` once the process has run 2 minutes.
+
+## Stage 5 (2026-11-06): doctor cost, store lock holds, dead code
+
+Base is `5a0eeb2` (the branch before this stage; it already holds the earlier
+poll-backoff commits, so "old" below is that build, not `origin/main`). Head is
+the last commit of `perf/poll-backoff`. Both builds ran from `git archive`
+snapshots. Trials used `sqlite3 .backup` copies in `/tmp`, free ports and temp
+state dirs.
+
+### Verdict
+
+Partial. The doctor cost target is met. The steady-state CPU target (15%) is
+not met on this laptop (load average ~10 during the runs): the head build idles
+at 21–22% of a core over 5 minutes, the base at 28–30%. Moving the pollers to a
+separate process was measured and not built (below).
+
+### Doctor (`collect_problems`, same copy, same `now`)
+
+Copy: 40,485 runs, 11,485 sessions, 812,029 usage events, 38 workstreams.
+
+| run | base | head |
+|---|---|---|
+| cold, wall | 30.2 s | 6.0 s |
+| warm (2nd and later), CPU | 31.2 s | 3.3 s (wall 3.5 s) |
+| `task_of` (`_base_task`) calls | 2,240,438 | 464,752 |
+| store lock holds per run | 121 holds, 14.8 s total, max 275 ms | 5 holds, 0.43 s total, max 221 ms |
+
+At one doctor run per 300 s, the warm figure is about 11% of a core before and
+about 1% after. The problem lists match exactly at two `now` values
+(`1794000000`, `1794020000`): 438 problems each, zero differing lines.
+
+What changed (head):
+
+- `taskmatch.task_resolver`: one `task_of(label)` per workstream, memoized per
+  label. `doctor` shares one resolver per workstream between the bundle-hygiene
+  and orchestration passes.
+- `taskmatch._plan_probe`: one regex search rejects labels that contain no plan
+  text, so the Python scan over plan ids runs only for labels that can match.
+  The scan itself is unchanged, so results are the same.
+- `doctor._ReadMemo`: one collect shares `query_sessions`, `query_runs` and the
+  live-run base of `query_concurrency`. Before, each live workstream's lead
+  profile re-read all sessions and runs (17 times per run).
+- `orchestrate.lead_profile(idle_share=False)` from the doctor: the idle-ready
+  replay is skipped, because the doctor reads only the LOW-DELEGATION and
+  CONTEXT flags.
+- `query_concurrency(until=...)`, `_ws_resolver`, a label-verdict memo in
+  `_collect_labels`, and a `SequenceMatcher` bound check in `deferred_ledger`
+  (a candidate that cannot reach `TITLE_SIMILARITY` is skipped; the chosen match
+  is unchanged).
+
+Lock: the doctor still holds the store lock for about 0.2 s in each of two
+calls (`query_sessions`, `query_runs`), because those methods hold the lock for
+their whole body. Splitting them is a store change this stage did not make.
+
+### Side by side (same copy, 30+ minutes, both builds polling the same sources)
+
+Cut time T0 = `sqlite3 .backup` of the live database. Both servers started from
+copies taken at T0.
+
+| check | base | head | result |
+|---|---|---|---|
+| usage rows with ts < T0 | 812,029 | 812,029 | same |
+| digest of those rows (tool, session, message, ts, run, model, tokens, cost) | 5918ba67040af903 | 5918ba67040af903 | same |
+| tokens before T0 | 157,849,635,164 | same | same |
+| cost before T0 (USD) | 16,289.797856 | same | same |
+| runs by status x verdict, started before T0 | identical | identical | same |
+| runs by status x verdict, all | identical | identical | same |
+| per-workstream cost before T0 (39 groups) | identical | identical | same |
+| usage rows, all (after T0 ingest) | 812,675 | 812,676 | +1 row after T0 |
+| per-workstream cost, all | WS32 $202.282591 | WS32 $202.283020 | one post-cut row |
+
+No difference exists in rows before T0. The only differences come from rows
+ingested after T0.
+
+### Live behavior (head vs base, same host)
+
+- Dormant source wakes (`generic`, the only source this check could drive
+  without touching real data: its drop file lives in the temp state dir). A run
+  line appended to the file was in the database after 1.02 s (head) and 1.81 s
+  (base). One probe each; the other dormant sources were not driven live.
+- Live worker status: the `process` source lag was 2.2–2.9 s on both builds
+  (interval 5 s). No live worker was started for this check.
+- `grok_cli` lag at sample time: 4 s (head) and 291 s (base). Both builds read
+  the same files. The head build's last poll was recent and the base build's was
+  not; this stage did not change grok polling, so treat it as timing, not a fix.
+
+### CPU, and what it is
+
+Process CPU from `/api/health` `perf.cpu` (same host, load average ~10):
+
+| window | base | head |
+|---|---|---|
+| 60 s (`cpu_seconds` delta) | 19.7% | 20.3% |
+| 300 s (`cpu_seconds` delta) | 28.5% | 21.1% |
+| `pct_5m` at 33 min (includes start-up catch-up) | 30.4% | 21.6% |
+| `cpu_seconds` since start (33 min) | 351 s | 261 s |
+
+Per source, the perf block exports poll counts and wall-time percentiles, not
+CPU. Same 10-minute window, base / head:
+
+| source | polls | p95 poll s (base / head) |
+|---|---|---|
+| claude | 60 / 60 | 0.299 / 0.230 |
+| codex | 60 / 60 | 0.350 / 0.291 |
+| commandcode | 60 / 60 | 0.373 / 0.254 |
+| muse | 60 / 60 | 0.399 / 0.399 |
+| manifests | 60 / 60 | 0.302 / 0.160 |
+| pi | 60 / 60 | 0.249 / 0.121 |
+| process | 60 / 60 | 0.159 / 0.140 |
+| generic | 20 / 20 | 0.087 / 0.038 |
+| grok_cli | 11 / 12 | 7.120 / 4.270 |
+| cursor | 4 / 4 | 8.640 / 8.536 |
+| dagster | 19 / 19 | 2.213 / 2.524 |
+| hub, reaper, linear | 19 / 19 each | 0.6, 0.6, 0.002 / 0.6, 0.6, 0.008 |
+
+Per-source CPU was not measured separately in this stage. The perf block would
+need a summed-duration counter to give it; that is a follow-up.
+
+### Pollers on versus off (measured before this stage, not built)
+
+Same copy, response cache disabled. `/api/snapshot` 4.4 ms (pollers on) vs
+2.8 ms (off), median. `/api/project/graph` 1147 ms vs 950 ms. Idle CPU 14.9%
+vs 0.8%. Moving the pollers to their own process would not buy enough read
+latency to justify it, so it is not built.
+
+### Dead code removed
+
+Each had only its definition, checked across the repo (`*.py`, `*.mjs`, `*.js`,
+`*.sh`, `*.md`, tests):
+`dash/sources/manifests.py:_scratch_root`, `dash/sources/grok_cli.py:_read_meta_tier`,
+`dash/sources/process.py:_labels_by_pid`, `dash/store/running.py:get_dagster_active`.
+
+### Not done
+
+- Per-source CPU (see above).
+- Lock holds of `query_sessions` and `query_runs` (about 0.2 s each).
+- The 15% steady-state target on a quiet host (this laptop was loaded).
+- Live dormancy checks for sources other than `generic`.
