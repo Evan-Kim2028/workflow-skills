@@ -249,9 +249,13 @@ class TtlTest(unittest.TestCase):
 
         def slow():
             calls.append(1)
-            release.wait(5.0)
+            if len(calls) > 1:
+                release.wait(5.0)
             return {"n": len(calls)}
 
+        # The first compute is instant: its measured time sets the refresh
+        # period (ttl, or 10x compute capped at 5 s), so a slow first
+        # compute would make this key's period longer than the test waits.
         payload, etag, _, kind = cache.get_or_compute(("k",), "snapshot", 0.05, slow)
         self.assertEqual(kind, "fresh")
         first_tag = etag or cache.cached_etag(("k",))
@@ -722,6 +726,30 @@ class CountsEquivalenceTest(unittest.TestCase):
                 self.assertEqual(
                     _billed_total(prev_summed["tokens"]), legacy_prev["tokens"]
                 )
+
+
+class RefreshPeriodTest(unittest.TestCase):
+    """Refresh period scales with measured compute, within the ceilings."""
+
+    def test_cheap_key_keeps_ttl(self):
+        self.assertEqual(respcache_mod.refresh_period(1.5, 0.01, 5.0), 1.5)
+
+    def test_expensive_live_key_is_capped_at_five_seconds(self):
+        self.assertEqual(respcache_mod.refresh_period(1.5, 3.0, respcache_mod.MAX_STALE_S), 5.0)
+
+    def test_planning_key_waits_ten_computes(self):
+        ceiling = respcache_mod.max_age_for("ws/progress")
+        self.assertEqual(respcache_mod.refresh_period(1.5, 2.5, ceiling), 25.0)
+        self.assertEqual(respcache_mod.refresh_period(1.5, 25.0, ceiling), ceiling)
+
+    def test_budget_skips_planning_refreshes_past_half_a_core(self):
+        cache = respcache_mod.ResponseCache()
+        now = time.time()
+        with cache._lock:
+            ok = [cache._bg_budget_ok("ws/progress", 10.0, now) for _ in range(4)]
+            live = cache._bg_budget_ok("snapshot", 10.0, now)
+        self.assertEqual(ok, [True, True, True, False])
+        self.assertTrue(live, "live keys are exempt from the global budget")
 
 
 if __name__ == "__main__":
