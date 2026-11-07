@@ -115,6 +115,22 @@ def _step_at(points: list, moment: float) -> tuple:
     return done, prog
 
 
+def _run_rows(store, moment: float, wss: list) -> list:
+    """``[replay rows, rows for each ws in wss]`` from one shared pass.
+
+    The replay rows are the unfiltered ``REPLAY_LIMIT`` query; each ws is
+    ``RUNS_LIMIT`` with its own filter, exactly ``query_runs`` per call.
+    Stores without ``query_runs_many`` fall back to one call per filter.
+    """
+    from dash.replay import REPLAY_LIMIT
+
+    queries = [(None, REPLAY_LIMIT)] + [(ws, RUNS_LIMIT) for ws in wss]
+    many = getattr(store, "query_runs_many", None)
+    if many is not None:
+        return many(moment, queries)
+    return [store.query_runs(moment, ws, None, None, limit) for ws, limit in queries]
+
+
 def build_project_progress(store, now: float | None = None) -> dict:
     """Progress-over-time payload for the project total (``ws=all``).
 
@@ -136,16 +152,14 @@ def build_project_progress(store, now: float | None = None) -> dict:
     if _CACHE.get("project-key") == key and "project-payload" in _CACHE:
         return _CACHE["project-payload"]
 
-    from dash.replay import REPLAY_LIMIT
-
-    # One store pass for every workstream: the query is the same for each
-    # (moment, no filter, same limit); only the per-workstream filter differs,
-    # and build_replay applies that per row. It was one full pass per workstream.
-    runs = store.query_runs(moment, None, None, None, REPLAY_LIMIT)
+    wss = project_ids()
+    # One shared preparation for the unfiltered replay rows and every
+    # workstream's run rows (identical to one query_runs per workstream).
+    runs, *ws_rows = _run_rows(store, moment, wss)
     parts = []
-    for ws in project_ids():
+    for ws, rows in zip(wss, ws_rows):
         try:
-            part = build_wsprogress(store, ws, moment, runs=runs)
+            part = build_wsprogress(store, ws, moment, runs=runs, ws_runs=rows)
         except ReplayNotFound:
             continue
         if (part.get("total") or 0) > 0:
@@ -293,7 +307,8 @@ def _pct(done: int, total: int) -> float:
     return round(done / total * 1000.0) / 10.0
 
 
-def build_wsprogress(store, ws: str, now: float | None = None, runs: list | None = None) -> dict:
+def build_wsprogress(store, ws: str, now: float | None = None, runs: list | None = None,
+                     ws_runs: list | None = None) -> dict:
     """Progress-over-time payload for one workstream.
 
     Pure read path: plan file plus history file plus one store run pass.
@@ -361,10 +376,11 @@ def build_wsprogress(store, ws: str, now: float | None = None, runs: list | None
     for states in chains.values():
         states.sort(key=lambda item: item[0])
 
-    runs = store.query_runs(moment, ws, None, None, RUNS_LIMIT)
+    if ws_runs is None:
+        ws_runs = store.query_runs(moment, ws, None, None, RUNS_LIMIT)
     run_starts: list[float] = []
     undated_runs = 0
-    for run in runs:
+    for run in ws_runs:
         if not isinstance(run, dict) or run.get("source") == "dagster":
             continue
         start = run.get("started_at")

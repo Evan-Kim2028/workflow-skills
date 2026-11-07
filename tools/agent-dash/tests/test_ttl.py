@@ -249,9 +249,13 @@ class TtlTest(unittest.TestCase):
 
         def slow():
             calls.append(1)
-            release.wait(5.0)
+            if len(calls) > 1:
+                release.wait(5.0)
             return {"n": len(calls)}
 
+        # The first compute is instant: its measured time sets the refresh
+        # period (ttl, or 10x compute capped at 5 s), so a slow first
+        # compute would make this key's period longer than the test waits.
         payload, etag, _, kind = cache.get_or_compute(("k",), "snapshot", 0.05, slow)
         self.assertEqual(kind, "fresh")
         first_tag = etag or cache.cached_etag(("k",))
@@ -328,7 +332,7 @@ class TtlTest(unittest.TestCase):
             worker.join(2.0)
         self.assertFalse(worker.is_alive())
 
-    def test_idle_entry_recomputes_inline(self):
+    def test_idle_entry_serves_recent_generation_and_refreshes(self):
         cache = respcache_mod.ResponseCache()
         cache.get_or_compute(("s",), "usage", 0.05, lambda: {"v": 1})
         with cache._lock:
@@ -341,10 +345,28 @@ class TtlTest(unittest.TestCase):
             calls.append(1)
             return {"v": 2}
 
-        _, _, _, kind = cache.get_or_compute(("s",), "usage", 0.05, compute)
-        self.assertEqual(kind, "fresh", "an idle entry is computed by its reader")
-        self.assertEqual(calls, [1], "no background refresh for an idle entry")
+        payload, _, _, kind = cache.get_or_compute(("s",), "usage", 0.05, compute)
+        self.assertEqual(kind, "stale", "an idle key serves its recent generation at once")
+        self.assertEqual(payload["v"], 1)
+        deadline = time.time() + 5.0
+        while time.time() < deadline and cache.stats()["usage"]["recomputes"] < 2:
+            time.sleep(0.01)
+        self.assertEqual(calls, [1], "one background refresh for the reader")
+
+    def test_idle_entry_older_than_max_age_recomputes_inline(self):
+        cache = respcache_mod.ResponseCache()
+        cache.get_or_compute(("s",), "usage", 0.05, lambda: {"v": 1})
+        with cache._lock:
+            entry = cache._entries[("s",)]
+            entry.generated_at -= respcache_mod.IDLE_MAX_AGE_S + 1.0
+            entry.last_read -= respcache_mod.IDLE_S + 1.0
+        _, _, _, kind = cache.get_or_compute(("s",), "usage", 0.05, lambda: {"v": 2})
+        self.assertEqual(kind, "fresh", "too old to serve after a pause: the reader computes")
         self.assertEqual(cache.stats()["usage"]["background"], 0)
+
+    def test_idle_gap_follows_measured_compute(self):
+        self.assertEqual(respcache_mod.idle_gap_s(0.5), respcache_mod.IDLE_S)
+        self.assertEqual(respcache_mod.idle_gap_s(25.0), 250.0)
 
     def test_expired_entry_serves_stale_and_refreshes_in_background(self):
         cache = respcache_mod.ResponseCache()
@@ -722,6 +744,30 @@ class CountsEquivalenceTest(unittest.TestCase):
                 self.assertEqual(
                     _billed_total(prev_summed["tokens"]), legacy_prev["tokens"]
                 )
+
+
+class RefreshPeriodTest(unittest.TestCase):
+    """Refresh period scales with measured compute, within the ceilings."""
+
+    def test_cheap_key_keeps_ttl(self):
+        self.assertEqual(respcache_mod.refresh_period(1.5, 0.01, 5.0), 1.5)
+
+    def test_expensive_live_key_is_capped_at_five_seconds(self):
+        self.assertEqual(respcache_mod.refresh_period(1.5, 3.0, respcache_mod.MAX_STALE_S), 5.0)
+
+    def test_planning_key_waits_ten_computes(self):
+        ceiling = respcache_mod.max_age_for("ws/progress")
+        self.assertEqual(respcache_mod.refresh_period(1.5, 2.5, ceiling), 25.0)
+        self.assertEqual(respcache_mod.refresh_period(1.5, 25.0, ceiling), ceiling)
+
+    def test_budget_skips_planning_refreshes_past_half_a_core(self):
+        cache = respcache_mod.ResponseCache()
+        now = time.time()
+        with cache._lock:
+            ok = [cache._bg_budget_ok("ws/progress", 10.0, now) for _ in range(4)]
+            live = cache._bg_budget_ok("snapshot", 10.0, now)
+        self.assertEqual(ok, [True, True, True, False])
+        self.assertTrue(live, "live keys are exempt from the global budget")
 
 
 if __name__ == "__main__":

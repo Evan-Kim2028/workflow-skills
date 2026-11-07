@@ -26,10 +26,11 @@ Semantics (see CONTRACT.md, docs/perf.md):
 - Sliding window roll (``since`` without ``until``): a new 30 s cell adopts
   the previous cell's generation, so the roll serves at once and refreshes
   in the background like any expired entry.
-- Idle (no reader for ``IDLE_S``) with an expired generation: the next
-  reader computes inline, so a tab opened after a pause never sees data
-  older than its own recompute. Idle entries never refresh in the
-  background.
+- Idle (no reader for ``idle_gap_s``, at least ``IDLE_S``) with an
+  expired generation no older than ``IDLE_MAX_AGE_S``: the reader gets it
+  at once with its age, and one refresh starts. Older than that, the
+  reader computes inline. A pause therefore never costs a cold compute
+  wait for a key that has a recent generation.
 - First-ever request (no previous result): single-flight, waiters
   block like ``dash.singleflight`` (there is nothing to serve).
 - Window-pinned requests (explicit ``since`` AND ``until``) use a
@@ -66,12 +67,40 @@ DEFAULT_TTL_S = 1.5
 #: is counted in the ``max_age_ms``/``over_max`` stats, so the bound is measured.
 MAX_STALE_S = 5.0
 
-#: An entry no reader has touched for this long is idle: its next reader
-#: computes inline and no background refresh runs for it.
+#: A key no reader has touched for this long is idle. The gap scales with
+#: the key's measured compute (``idle_gap_s``): a 25 s compute is idle after
+#: 250 s, not 30 s, so a pause does not turn it cold.
 IDLE_S = 30.0
+
+#: An idle key's last generation is still served (with its age, and one
+#: background refresh starts) for up to this long. Older than this, the
+#: reader computes inline: nothing older than two minutes goes to a person.
+IDLE_MAX_AGE_S = 120.0
 
 #: At most this many background refreshes run at once across all keys.
 BG_MAX = 4
+
+#: A key's refresh period is at least this many times its last compute
+#: time, so one key's background recomputes take at most 1/10 of a core.
+#: The period is clamped to the endpoint's freshness ceiling (below) and
+#: never falls under the TTL.
+REFRESH_PERIOD_X = 10.0
+
+#: Freshness ceiling per endpoint: the served age bound is the refresh
+#: period plus one compute. Endpoints not listed use MAX_STALE_S, the
+#: product rule for live status, so their period is capped at 5 s and the
+#: 10% share yields to freshness there (their computes are kept short).
+#: Planning series, which the page refetches only when a plan stamp moves,
+#: may age longer.
+ENDPOINT_MAX_AGE_S: dict = {
+    "ws/progress": 60.0,
+}
+
+#: Global background budget for ceilings above MAX_STALE_S: compute
+#: seconds started in a rolling BG_WINDOW_S, at most BG_BUDGET_S (half a
+#: core). Live keys are exempt, so this never delays a 5 s refresh.
+BG_WINDOW_S = 60.0
+BG_BUDGET_S = 30.0
 
 #: TTL for window-pinned requests (explicit since AND until): a fixed
 #: window's sums move only on writes, never with the clock.
@@ -211,7 +240,8 @@ def _sliding_family(key: tuple):
 
 
 class _Entry:
-    __slots__ = ("payload", "etag", "generated_at", "computing", "event", "last_read")
+    __slots__ = ("payload", "etag", "generated_at", "computing", "event", "last_read",
+                 "compute_s")
 
     def __init__(self):
         self.payload = None
@@ -220,6 +250,36 @@ class _Entry:
         self.computing = False
         self.event = None
         self.last_read = 0.0
+        #: Wall seconds of the last compute for this key (0 until one ran).
+        self.compute_s = 0.0
+
+
+def max_age_for(endpoint: str) -> float:
+    """Freshness ceiling for one endpoint (seconds)."""
+    return ENDPOINT_MAX_AGE_S.get(endpoint, MAX_STALE_S)
+
+
+def idle_gap_s(compute_s: float) -> float:
+    """Idle threshold for one key: ``max(IDLE_S, 10 x its last compute)``."""
+    try:
+        scaled = REFRESH_PERIOD_X * max(0.0, float(compute_s))
+    except (TypeError, ValueError):
+        scaled = 0.0
+    return max(IDLE_S, scaled)
+
+
+def refresh_period(ttl: float, compute_s: float, max_age: float) -> float:
+    """Age after which a served generation is due a background refresh.
+
+    ``max(ttl, min(REFRESH_PERIOD_X * compute_s, max_age))``: cheap keys
+    keep the TTL, expensive keys wait ten computes, and no key waits past
+    its freshness ceiling. Pure function of its inputs.
+    """
+    try:
+        scaled = min(REFRESH_PERIOD_X * max(0.0, float(compute_s)), float(max_age))
+    except (TypeError, ValueError):
+        scaled = 0.0
+    return max(float(ttl), scaled)
 
 
 class ResponseCache:
@@ -232,6 +292,8 @@ class ResponseCache:
         self._families: dict = {}
         self._stats: dict = {}
         self._bg_slots = threading.BoundedSemaphore(BG_MAX)
+        #: (start time, estimated compute seconds) of recent background refreshes.
+        self._bg_log: list = []
 
     def _record(self, endpoint: str, outcome: str) -> None:
         try:
@@ -339,13 +401,15 @@ class ResponseCache:
                 fresh["generated_at"] = generated_at
             except Exception:
                 pass
+        elapsed_s = time.perf_counter() - started
         with self._lock:
             self._publish(entry, fresh, generated_at)
+            entry.compute_s = elapsed_s
             entry.computing = False
             if entry.event is not None:
                 entry.event.set()
         self._record(endpoint, "recomputes")
-        self._note_compute(endpoint, (time.perf_counter() - started) * 1000.0)
+        self._note_compute(endpoint, elapsed_s * 1000.0)
         return fresh, generated_at
 
     def _note_compute(self, endpoint: str, ms: float) -> None:
@@ -358,6 +422,22 @@ class ResponseCache:
                     bucket["compute_max_ms"] = round(ms, 1)
         except Exception:
             pass
+
+    def _bg_budget_ok(self, endpoint: str, est_s: float, now: float) -> bool:
+        """Global budget for non-live keys. Caller holds the lock.
+
+        Live keys (ceiling MAX_STALE_S) are exempt. Others start a refresh
+        only while the compute seconds started in the last BG_WINDOW_S,
+        plus this one, stay within BG_BUDGET_S.
+        """
+        if max_age_for(endpoint) <= MAX_STALE_S:
+            return True
+        self._bg_log = [item for item in self._bg_log if now - item[0] <= BG_WINDOW_S]
+        spent = sum(item[1] for item in self._bg_log)
+        if spent + est_s > BG_BUDGET_S:
+            return False
+        self._bg_log.append((now, est_s))
+        return True
 
     def _background(self, endpoint: str, entry: _Entry, compute) -> None:
         """Body of one background refresh thread. Never raises."""
@@ -396,26 +476,30 @@ class ResponseCache:
                 entry = _Entry()
                 self._entries[key] = entry
                 self._adopt_neighbour(key, entry, now)
-            idle = (now - entry.last_read) > IDLE_S if entry.last_read else True
+            idle = (now - entry.last_read) > idle_gap_s(entry.compute_s) if entry.last_read else True
             entry.last_read = now
             if entry.payload is not None:
                 age = now - entry.generated_at
-                if age <= ttl:
+                period = refresh_period(ttl, entry.compute_s, max_age_for(endpoint))
+                if age <= period:
                     kind = "hit"
                     payload, etag, generated = entry.payload, entry.etag, entry.generated_at
-                elif idle and not entry.computing:
-                    # Nothing recent to trust: this reader computes inline.
+                elif idle and age > IDLE_MAX_AGE_S and not entry.computing:
+                    # Too old to serve after a pause: this reader computes inline.
                     entry.computing = True
                     entry.event = threading.Event()
                     kind = "compute"
                     payload = None
                 else:
-                    # Expired: serve the previous generation now. Start
-                    # one background refresh unless one is already running.
+                    # Expired (or idle but recent): serve the previous
+                    # generation now, with its age. Start one background
+                    # refresh unless one is already running.
                     kind = "stale"
                     payload, etag, generated = entry.payload, entry.etag, entry.generated_at
                     if not entry.computing:
-                        if self._bg_slots.acquire(blocking=False):
+                        if not self._bg_budget_ok(endpoint, entry.compute_s, now):
+                            skipped = True
+                        elif self._bg_slots.acquire(blocking=False):
                             entry.computing = True
                             entry.event = threading.Event()
                             start_bg = True

@@ -814,6 +814,26 @@ class RunsMixin:
             stale row the snapshot hides never shows as an open bar here. Production
             (dagster) rows are left out unless ``include_jobs`` is set; lead and
             shell rows stay in."""
+            return self._runs_select(
+                self._runs_prep(now), now, ws, since, until, limit, include_jobs)
+
+        def query_runs_many(self, now: float, queries: list, include_jobs: bool = False) -> list:
+            """Several ``query_runs`` filters off one shared preparation.
+
+            ``queries`` is a list of ``(ws, limit)``; the result is the same
+            list of row lists ``query_runs(now, ws, None, None, limit)``
+            returns one by one. Liveness, the usage fold, open evidence and
+            the parent map are ws-independent, so they run once: one pass
+            per workstream was the whole cost of ``ws=all`` progress.
+            """
+            prep = self._runs_prep(now)
+            return [
+                self._runs_select(prep, now, ws, None, None, limit, include_jobs)
+                for ws, limit in queries
+            ]
+
+        def _runs_prep(self, now: float) -> tuple:
+            """The ws-independent part of ``query_runs``: one shared snapshot."""
             probes = self._probe_liveness(file_mtimes=True)
             check = self._probe_checker(probes)
             with self._lock:
@@ -832,7 +852,16 @@ class RunsMixin:
                 children_of: dict = {}
                 for child, parent in parents.items():
                     children_of.setdefault(parent, []).append(child)
-                live_or_shadow = live_open | set(shadows)
+            live_or_shadow = live_open | set(shadows)
+            return (raw, usage, parents, context, rss, stalled, usage_versions,
+                    children_of, live_or_shadow)
+
+        def _runs_select(self, prep: tuple, now: float, ws, since, until, limit: int,
+                         include_jobs: bool) -> list:
+            """One ws filter over a ``_runs_prep`` snapshot (the old query body)."""
+            (raw, usage, parents, context, rss, stalled, usage_versions,
+             children_of, live_or_shadow) = prep
+            with self._lock:
                 rows = []
                 for row in raw:
                     # Cheap raw-row gates first: views are only built for
