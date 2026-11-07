@@ -470,20 +470,6 @@ def _row_progress(resolve_plan, ws: str):
     return dict(progress) if isinstance(progress, dict) else None
 
 
-def _doctor_problems(store, now: float) -> list:
-    """The persisted doctor run: the same list (same ids) as ``GET /api/doctor``.
-
-    Never runs checks inline; the background doctor owns the data. Each
-    entry keeps the legacy ``message`` and ``command`` keys so older
-    readers keep working alongside the new ``id`` shape.
-    """
-    try:
-        payload = store.doctor_latest(now)
-    except Exception:
-        return []
-    return _problems_from_payload(payload)
-
-
 def _problems_from_payload(payload) -> list:
     """Problem entries from an already-fetched doctor payload."""
     if not isinstance(payload, dict):

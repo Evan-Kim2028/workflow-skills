@@ -23,6 +23,8 @@ The script symlinks this directory to `~/.claude/tools/agent-dash` and each skil
 python3 ~/.claude/tools/agent-dash/agent_dash.py run
 python3 ~/.claude/tools/agent-dash/agent_dash.py status
 python3 ~/.claude/tools/agent-dash/agent_dash.py restart
+python3 ~/.claude/tools/agent-dash/agent_dash.py deploy --ref origin/main --yes-live
+python3 ~/.claude/tools/agent-dash/agent_dash.py rollback --yes-live
 python3 ~/.claude/tools/agent-dash/agent_dash.py check
 python3 ~/.claude/tools/agent-dash/agent_dash.py doctor
 python3 ~/.claude/tools/agent-dash/agent_dash.py reprice
@@ -36,6 +38,8 @@ python3 ~/.claude/tools/agent-dash/agent_dash.py project list
 ```
 
 `run` prints `running`, a pid, and `url http://127.0.0.1:8765/`.
+
+The live server runs from a release of `origin/main`. `deploy` builds it, gates it, and switches to it; `restart` from the main checkout runs the checkout again. See [docs/live-release.md](docs/live-release.md). Agents in a shell pass `--yes-live` to `stop`, `restart`, `deploy`, and `rollback`.
 
 ### Command Code workers (`cmd`)
 
@@ -125,13 +129,11 @@ A Codex run shows on the dashboard as one run row
 finish line with the verdict; `parent_session_id` links it to the lead
 session that launched it.
 
-`scripts/run_worker.py` launches the `codex-luna` (kind `codex`, cap 3)
-and `pi-deepseek-flash` (kind `pi`, `river/deepseek-ai/DeepSeek-V4.1-Flash-1017`,
-cap 5) registry tiers through these launchers, and the `auto` fallback
-order is `muse` -> `glm-flash` -> `codex-luna` -> `pi-deepseek-flash`:
-a tier that hits its quota patterns (or whose launcher writes its
-`QUOTA` marker) cools down for `cooldown_minutes` and the next tier
-takes the launch.
+`scripts/run_worker.py` launches registry tiers through these launchers, such as
+`codex-luna` (kind `codex`) and `pi-deepseek-flash` (kind `pi`). `workers.example.json`
+is the single reference for tiers, caps, models and `auto_order`. `auto` skips a tier
+whose model has no catalog price. A tier that hits its quota patterns (or whose launcher
+writes its `QUOTA` marker) cools down for `cooldown_minutes` and the next tier takes the launch.
 
 ## Hooks
 
