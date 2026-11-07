@@ -774,3 +774,140 @@ Verification: `tests/test_ttl.py` (19), `test_page_rules.py`, `test_privacy_pin.
 `test_server.py`, `test_etag.py` (289 passed with `test_ttl`, under memcap 4096);
 `scripts/page_check.mjs --url <head>` (desktop and phone pins, one tile matches
 the API); `ADASH_PERF=1` perf budgets (6 passed).
+
+## Stage 7 (2026-11-06): bounded background refresh, shared ws=all pass, idle serve
+
+Scope: `dash/respcache.py`, `dash/store/runs.py` (`query_runs` split),
+`dash/wsprogress.py`, tests (`test_ttl.py`), CONTRACT.md. Budgets unchanged.
+Commits on `perf/first-paint-2`: refresh period, ws=all pass, idle serve.
+
+### What changed
+
+- **Refresh period scales with compute.** A served generation is due a
+  background refresh after `max(ttl, min(10 x last compute, ceiling))`. Ceiling
+  5 s for live endpoints (the product rule wins over the 10% share, see below)
+  and 60 s for `ws/progress`. A global budget caps non-live background compute
+  at 30 s per rolling 60 s.
+- **`/api/ws/progress?ws=all`: one shared run preparation.** Before, the
+  project total called `query_runs` once per workstream (30 full passes, 7.8 s
+  of a 9.8 s profile). `query_runs` is now `_runs_prep` (liveness, usage fold,
+  open evidence, parent map: ws-independent, once) plus `_runs_select` (the
+  per-filter rows, the same code as before). `query_runs_many` returns one list
+  per filter. The per-workstream attribution (`_in_ws`) and the collapse and
+  launch-echo steps still run per filter, so WS2 and WS8 inherited runs come
+  out as before.
+- **Idle keys serve their recent generation.** An idle key (no reader for
+  `max(30 s, 10 x compute)`) serves its last generation with its visible age and
+  starts one refresh, while the generation is at most 120 s old. Older than
+  that, its reader computes inline.
+
+### Equivalence (`scripts/wsprogress_equiv.py`, backup copy, same `now`)
+
+31 keys (30 workstreams and the `ws=all` total): identical JSON, old (origin/main)
+vs new. `ws=all` cold: 6.8 s -> 1.0 s on the copy (idle machine, no profiler).
+
+### Before and after (same copy, `perf_probe.py --n 10 --cpu-window 40`, load 9-11)
+
+| measure | origin/main | this stage |
+|---|---|---|
+| `/api/ws/progress?ws=all` cold | 21 540 ms | 2 387 ms (warm med 2.2 / 2.4 ms) |
+| `/api/state` cold | 2 827 ms | 1 640 ms (warm med 2.9 / 9.4 ms) |
+| `/api/workstreams` cold | 1 953 ms | 1 307 ms (warm med 13.2 / 4.0 ms) |
+| `/api/snapshot` warm p95 | 1.7 ms | 11.8 ms (median 1.3 / 2.8 ms) |
+| tick p95 under page-like load, snapshot | 1 809 ms | 33 ms |
+| tick p95 under page-like load, workstreams | 2 729 ms | 93 ms |
+| tick p95 under page-like load, runs | 1 209 ms | 6 ms |
+| server CPU, 40 s page-like window | 105% of a core | 76% of a core |
+| `page_check --perf` first section (one sample each) | 5 302 ms | 2 138 ms |
+
+The snapshot warm p95 rose: a refresh now lands on about 1 in 5 warm reads
+(period 5 s, compute 1-1.8 s), where before it was a stale serve on 1.5 s
+ttl. It is the cost of the 5 s bound, not a regression in tick latency.
+
+### Freshness bound (per endpoint, `/api/health` `perf.ttl` on head)
+
+| endpoint | ceiling | bound: period + compute | compute last / max ms |
+|---|---|---|---|
+| snapshot, runs, concurrency, state, workstreams, graph, reconcile | 5 s | 5 s + compute | 1 115 / 1 115 (snapshot) |
+| ws/progress?ws=all | 60 s | min(10 x compute, 60 s) + compute | 2 381 / 2 381 |
+
+`over_max` counts on head (7-8 per live key) come from idle reads after the
+probe's pauses: those serves carry their visible age (up to 20 s) by design.
+Under a steady reader they stay within the bound.
+
+### Steady-state CPU: what remains
+
+With a page-like reader, live keys refresh every 5 s: snapshot (1.1 s compute),
+workstreams (1.8 s), runs (0.4 s), about 74% of a core over five minutes. The
+10% share would need compute under 0.5 s per live key at a 5 s period. The
+product rule keeps live status at 5 s, so the remaining CPU is live compute,
+not background waste. Cutting it is a compute change (workstreams and state
+rebuild per call), not a scheduling one.
+
+### First draw, idle re-renders, clicks
+
+- First section after a pause: 2.1 s on head (one sample, load 11), not under
+  1 s. Measured causes: the draw waits on `refreshAll`'s `Promise.all`, which
+  includes `loadNav()` (four requests, `/api/workstreams` cold 1.3 s), and on the
+  snapshot, runs, concurrency and approvals fetches, each on the six Chrome
+  connections the SSE stream shares.
+- Idle re-renders: 13 per 30 s on head in one sample, but the copy's pollers
+  were writing: `view_seq` changed 7 times (base) and 10 times (head) in 30 s.
+  The idle budget needs a copy with the pollers off. Not measured as a pass.
+- Clicks: not measured; the click path is unchanged.
+
+### Shell and progressive draw (not done)
+
+`refreshAll` still draws once, after every request in its `Promise.all`. A
+per-section draw needs loading states in about eight card files (tiles, activity,
+planned, production-log, plan-progress, tables and the ws cards), each reading
+`runs`, `conc`, `approvals` or `plan` directly. Taking `loadNav()` out of the
+gate also needs a redraw when workstreams land, plus a check that the landing
+flip still holds. Both are look-visible and were not validated in this pass.
+
+### Startup warm (partly in place)
+
+`server.py` already runs a `dash-warm` thread at startup that precomputes the
+default all-scope snapshot, the 24 h windows and both workstream scopes into the
+store caches. No new keys were added: the page's since-cell and group keys
+depend on client state, so a warm of keys it may not ask for is wasted CPU.
+
+### Keep-alive (measured, left out)
+
+The server is HTTP/1.0. A tiny endpoint (`/api/project`) answers in a 0.5 ms
+median including the new connection, so connection setup is a fraction of a
+millisecond per request. The first-draw cost is compute and queueing, not
+connect cost. Keep-alive would need Content-Length on every path plus idle
+timeouts on threaded handlers, for no measured gain. Not implemented.
+
+### Payload trimming (not done)
+
+Sizes on the copy: `/api/state` 606 KB, `/api/runs?limit=5000` 830 KB,
+`/api/concurrency` 279 KB, `/api/sessions` 2.6 MB (not on the first view).
+No field-to-consumer map was made, so no field was removed.
+
+### Verification
+
+- `test_ttl` (25, including the new period, budget and idle-serve tests);
+  `test_page_rules`, `test_privacy_pin`, `test_server`, `test_etag`,
+  `test_wsprogress`, `test_planning_phase` (326 together, one process, memcap 4096).
+- Gate-selected suites for `dash/store/runs.py` (run directly, the gate stopped on
+  its 12-suite width): `test_doctor`, `test_migration`,
+  `test_no_cold_fold_on_request_path`, `test_orchestrate`, `test_perfmon`,
+  `test_poll_budgets`, `test_rollup`, `test_state`, `test_store`, `test_view_seq`,
+  plus the two above: 455 tests, OK.
+- `ADASH_PERF=1 tests/perf/test_perf_budget.py`: 6 passed. No budget changed.
+- `scripts/page_check.mjs --url <head>`: both views, desktop and phone pins, tiles
+  and legends match the API.
+
+### Targets
+
+| target | result |
+|---|---|
+| first section under 1 s after a pause | not met: 2.1 s (one sample) |
+| page settle under 2 s | not measured |
+| under 3 idle re-renders per 30 s | not measured as a pass (copy churn) |
+| clicks under 100 ms | not measured |
+| `ws=all` under 2 s cold | met on the copy (1.0 s); 2.4 s through the loaded server |
+| a 25 s compute does not re-run every few seconds | met: `ws/progress` period is 10 x compute, capped at 60 s |
+| served age bound stated per endpoint | done (above) |
