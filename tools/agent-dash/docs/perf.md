@@ -655,3 +655,122 @@ No schema change, no data migration. Python changes need a `serve` restart
 memory and rebuild on the first poll. Rollback: redeploy the previous release.
 Verify after cutover: `scripts/perf_probe.py` against the live port (GET only),
 and the source CPU share from `/api/health` once the process has run 2 minutes.
+
+## Stage 6 (2026-11-06): first paint, stale-while-revalidate reads, one fix
+
+Scope: `dash/respcache.py` (SWR), its tests, CONTRACT.md. Not done here: the
+page's first-draw gate, payload shrink, keep-alive (see "Not done").
+
+### What changed (commits on perf/first-paint)
+
+- `respcache`: a reader gets the previous generation at once once any exists;
+  one background refresh per key; at most 4 refreshes at once; only a
+  first-ever request, or an entry idle for 30 s, computes inline.
+- Fixed a self-deadlock in the WIP: `bg_skipped` was recorded while holding the
+  non-reentrant lock (`tests/test_ttl.py` hung on the capped-refresh test).
+- Sliding `since` roll: a new 30 s cell adopts the previous cell's generation,
+  so the roll no longer waits (the 1 in ~7 reads that were 1.4-2.4 s).
+- Compute-time stats per endpoint in `/api/health` `perf.ttl`
+  (`compute_last_ms`, `compute_max_ms`), and served-age stats were already there.
+
+### Reads every 4 s under live writes (`cadence.py`, 90 s, same writer rate)
+
+Writers: one `Store` upsert and usage row per 1.5 s per copy. Both copies from
+the same `sqlite3 .backup`, both builds on their own port. Load average 7-9.
+
+| endpoint | base p50 / p95 ms | head p50 / p95 ms | bytes |
+|---|---|---|---|
+| `/api/snapshot?usage_group=model` | 778 / 1510 | 18.6 / 796 | 105 KB / 98 KB |
+| `/api/workstreams` | 1254 / 2593 | 71.7 / 1424 | 21 KB |
+| `/api/project/graph` | 1763 / 3087 | 1.0 / 1.6 | 64 KB |
+| `/api/state` | 1368 / 2094 | 3.6 / 15.7 | 711 KB |
+
+A second base run gave 612 / 1646, 832 / 2244, 2173 / 4005, 1757 / 2085 ms.
+Head p50s: graph 1 ms, state 4 ms, snapshot 13-19 ms, workstreams 40-72 ms
+(single-digit ms for snapshot in the quieter first run). p95 is not
+single-digit: the tail is compute time under GIL contention, not waits (see below).
+
+### Freshness bound, measured (`/api/health` `perf.ttl`)
+
+| endpoint | compute last / max ms | max served age ms | over 5 s |
+|---|---|---|---|
+| snapshot | 273-3235 / 7501 | 11143 | 6 |
+| workstreams | 1383-3857 / 9645 | 12214 | 11 |
+| project/graph | 2385-5194 / 11934 | 13223 | 11 |
+| state | 1281-1788 / 4693 | 5906 | 2 |
+| ws/progress?ws=all | 23063 / 28649 | 489777 | 2 |
+
+So the bound is TTL + compute + one tick, not TTL + one tick. The 5 s rule holds
+only while a heavy compute finishes in ~3.5 s. Not met under this load.
+
+### First draw (`timeline.mjs`, Chrome CDP, fetch and parse hooks)
+
+| build, state | first `[data-sec]` ms |
+|---|---|
+| base, writers on | 4134, 5812 |
+| head, writers on | 5304, 5610 |
+| base, writers off, after pause | 6554, 1228 |
+| head, writers off, after pause | 7536, 8169 |
+| base, `page_check --perf`, after pause | 7708 |
+| head, `page_check --perf`, warm (right after a settle run) | 231 |
+
+Timeline finding (head, after pause): nothing draws until the `Promise.all` in
+`refreshAll` (snapshot, runs, concurrency, nav, approvals) and the nav
+requests have all returned. Their responses are queued behind each other on
+Chrome's six connections, one of which the SSE stream holds. The page waits for
+the slowest, and after a pause that is a cold compute per key (idle rule), with
+`/api/project` (nav) at 4.8 s, `/api/workstreams` at 7.5 s and `/api/snapshot`
+at 4.5 s in the same run. Server-side warm hits are 1-70 ms, so the first draw
+is compute, queueing and machine load, not payload alone. Head and base first
+draws are not distinguishable at this load (machine load 7-9 on 15 cores,
+other agents' workers running): I did not claim a first-draw win.
+
+### Idle re-renders (writers off)
+
+`page_check.mjs --perf`, head, warm: 2 idle re-renders per 30 s (budget under 3,
+pass). `page_settle_check.mjs` reports "never settled" for the exec view on both
+builds; that is not from this change (same on base).
+
+### Ranked causes still open (measured)
+
+1. `/api/ws/progress?ws=all`: 23-29 s compute, refreshed in the background on
+   every read past its TTL. It holds the GIL most of the time, so every other
+   read's tail is queued behind it. Fix: a set-based runs-started-per-hour query
+   and an incremental build. Largest single item left.
+2. Cold computes after a pause (idle rule): 1-8 s per key on this laptop. Fix:
+   cheaper computes (the state and workstreams paths rebuild per call).
+3. Payloads the first draw waits on: `/api/runs?limit=5000` 472 KB,
+   `/api/approvals?ws=all` 272 KB, `/api/concurrency` 254 KB, `/api/state` 711 KB.
+   Not cut in this stage.
+4. Page gate: `refreshAll` draws only after all six requests (see timeline).
+   Progressive draw needs per-section data guards and was not done.
+
+### Not done, and why
+
+- Shell first and per-section progressive draw: needs placeholders for
+  sections whose data is still in flight, a look-visible change; deferred.
+- HTTP/1.1 keep-alive: the server is `protocol_version = "HTTP/1.0"` with
+  `ThreadingHTTPServer`, so every request is a new connection. Keep-alive needs
+  Content-Length on every response path (including 304, errors and the
+  `/api/stream` SSE, which must close), plus per-connection timeouts for idle
+  sockets held by threaded handlers. It is a real gain for the six-connection
+  queue, but the timeline shows the queue is dominated by compute time. Left for
+  a follow-up with a test per path.
+- Payload split (`limit`/`fields` and details endpoint): the first view's fields
+  are not yet mapped to consumers, so no cut was made without a regression check.
+- `ws/progress` rewrite: item 1 above.
+
+### Targets
+
+| target | result |
+|---|---|
+| first section under 1 s | not met after a pause (6-8 s); 231 ms warm |
+| page settle under 2 s | not measured as a pass (settle check "never settled" on both) |
+| under 3 idle re-renders per 30 s | met (2) on head, warm |
+| clicks within 100 ms | not measured in this stage |
+| `/api/state`, `/api/health` budgets | `ADASH_PERF=1 tests/perf/test_perf_budget.py`: 6 passed |
+
+Verification: `tests/test_ttl.py` (19), `test_page_rules.py`, `test_privacy_pin.py`,
+`test_server.py`, `test_etag.py` (289 passed with `test_ttl`, under memcap 4096);
+`scripts/page_check.mjs --url <head>` (desktop and phone pins, one tile matches
+the API); `ADASH_PERF=1` perf budgets (6 passed).
