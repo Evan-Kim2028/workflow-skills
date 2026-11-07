@@ -1923,7 +1923,7 @@ def _dep_cycle(deps: dict[str, list[str]]) -> list[str] | None:
 
 def _collect_bundles(ctx) -> None:
     from dash.bundles import list_bundles, validate_bundle
-    from dash.taskmatch import load_taskmap, task_of
+    from dash.taskmatch import load_taskmap
 
     try:
         bundles = list_bundles()
@@ -2627,7 +2627,6 @@ def _orch_review_spiral(ctx, ws: str, state: dict) -> int:
 
 def _orch_ghost_runs(ctx, ws: str, state: dict) -> int:
     """Recent runs mapping to no plan task (info, one per workstream)."""
-    from dash.taskmatch import task_of
 
     recent_s = float(ctx.dcfg["recent_hours"]) * 3600
     cutoff = ctx.now - recent_s
