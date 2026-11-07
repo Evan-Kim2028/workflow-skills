@@ -1181,11 +1181,6 @@ def _scratch_roots(cfg) -> list:
     return scan_roots_memo(cfg)
 
 
-def _scratch_root(cfg) -> str:
-    found = _scratch_roots(cfg)
-    return found[0] if found else ""
-
-
 def _verdict_line(line: str):
     if line.startswith("\ufeff"):
         line = line.lstrip("\ufeff")

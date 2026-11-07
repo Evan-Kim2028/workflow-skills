@@ -607,20 +607,6 @@ def _tier_of(row, model=None):
     return TOOL
 
 
-def _read_meta_tier(pad, label):
-    """The tier in ``<label>.meta.json`` beside the manifest, or None."""
-    if not pad or not label:
-        return None
-    path = os.path.join(pad, "%s.meta.json" % label)
-    try:
-        with open(path, "rb") as fh:
-            data = json.loads(fh.read(64 * 1024).decode("utf-8", "replace"))
-    except (OSError, ValueError):
-        return None
-    tier = data.get("tier") if isinstance(data, dict) else None
-    return str(tier).strip() or None if tier is not None else None
-
-
 def _keep_latest(manifests, row):
     """Keep the newest row per session id. True when ``row`` was kept."""
     prev = manifests.get(row["session_id"])

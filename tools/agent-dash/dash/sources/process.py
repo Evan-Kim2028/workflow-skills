@@ -754,11 +754,6 @@ def _uuid_from_run_id(run_id) -> str | None:
     return None
 
 
-def _labels_by_pid() -> dict:
-    """Pid -> label token. The rest of the command line is discarded."""
-    return {pid: token["label"] for pid, token in _tokens_by_pid().items() if token.get("label")}
-
-
 def _run_worker_labels() -> dict:
     """Pid -> argv label for live ``run_worker.py`` launches.
 
