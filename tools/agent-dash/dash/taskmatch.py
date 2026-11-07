@@ -45,6 +45,7 @@ _RULE_RX_LIMIT = 4096
 #: plan order with empty ids dropped, so the substring scan lowercases once.
 _PLAN_INDEX: dict = {}
 _PLAN_INDEX_LIMIT = 256
+_PLAN_PROBE: dict = {}
 
 
 def load_taskmap(root: Path | None = None) -> dict:
@@ -85,6 +86,37 @@ def task_of(label: str | None, ws: str | None, taskmap: dict | None = None, plan
     if hit is not None and (not plan_ids or hit in plan_ids):
         return hit
     return _canonical_label_task(label, ws, plan_ids) or hit
+
+
+def task_resolver(ws: str | None, taskmap: dict | None = None, plan_ids: list[str] | tuple = ()):
+    """A ``task_of(label)`` bound to one workstream's map and plan ids.
+
+    Answers are memoized per label for the life of the resolver. The map
+    and plan ids are fixed for it, so no answer changes; the memo only
+    skips rescanning the plan for a label that repeats across runs (every
+    retry of one base label, and every unowned run seen per workstream).
+    """
+    memo: dict = {}
+    table = (taskmap or {}).get(ws) if isinstance(taskmap, dict) else None
+    # Without a map table or a built-in rule for this workstream, a label
+    # can only resolve through the plan scan or the canonical rule. Both
+    # are probed here, so a label neither one can match skips task_of.
+    plain = not table and ws not in ("WS1", "WS2", "WS7")
+    probe = _plan_probe(plan_ids) if plan_ids else None
+
+    def resolve(label):
+        if label in memo:
+            return memo[label]
+        canon = _CANONICAL_LABEL.match(label or "")
+        if plain and (probe is None or probe.search((label or "").lower()) is None) \
+                and (canon is None or str(ws or "").upper() != f"WS{canon.group(1)}"):
+            hit = None
+        else:
+            hit = task_of(label, ws, taskmap, plan_ids)
+        memo[label] = hit
+        return hit
+
+    return resolve
 
 
 _CANONICAL_LABEL = re.compile(r"^ws(\d+)-(?:plan|exec|review|coord)-(.+?)(?:-r\d+)?$", re.IGNORECASE)
@@ -160,7 +192,8 @@ def _base_task(label: str | None, ws: str | None, taskmap: dict | None = None, p
     if plan_ids:
         lower = lab.lower()
         best = None
-        for text, low in _plan_index(plan_ids):
+        probe = _plan_probe(plan_ids)
+        for text, low in (_plan_index(plan_ids) if probe is not None and probe.search(lower) else ()):
             start = lower.find(low)
             if start < 0:
                 continue
@@ -211,6 +244,34 @@ def _plan_index(plan_ids) -> tuple:
                 _PLAN_INDEX.clear()
             _PLAN_INDEX[key] = index
     return index
+
+
+def _plan_probe(plan_ids):
+    """One regex matching when any plan text occurs in a label; None without plan texts.
+
+    The plan scan below only matches a text that occurs in the label, so a
+    label this probe rejects can match nothing. One C-level search replaces
+    a Python ``find`` per plan id for the (common) labels with no plan text.
+    """
+    try:
+        key = tuple(plan_ids)
+        with _RULE_RX_LOCK:
+            hit = _PLAN_PROBE.get(key)
+    except TypeError:
+        key, hit = None, None
+    if hit is not None:
+        return hit
+    index = _plan_index(plan_ids)
+    if not index:
+        return None
+    lows = sorted({low for _text, low in index}, key=len, reverse=True)
+    hit = re.compile("|".join(re.escape(low) for low in lows))
+    if key is not None:
+        with _RULE_RX_LOCK:
+            if len(_PLAN_PROBE) >= _PLAN_INDEX_LIMIT:
+                _PLAN_PROBE.clear()
+            _PLAN_PROBE[key] = hit
+    return hit
 
 
 def task_of_verified(label: str | None, ws: str | None, taskmap: dict | None = None, plan_ids: list[str] | tuple = ()) -> str | None:

@@ -114,23 +114,6 @@ class RunningMixin:
                     "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                     (payload,),
                 )
-        def get_dagster_active(self):
-            """Latest successful active set, or None when no poll has succeeded."""
-            import json as _json
-
-            with self._lock:
-                row = self._conn.execute(
-                    "SELECT value FROM meta WHERE key='dagster_active'"
-                ).fetchone()
-            if not row or not row["value"]:
-                return None
-            try:
-                data = _json.loads(row["value"])
-            except (TypeError, ValueError):
-                return None
-            if not isinstance(data, dict):
-                return None
-            return data
         def note_dagster_seen(self, run_ids, now: float) -> None:
             """Record when each active Dagster run was last seen (for close-out)."""
             if not run_ids:

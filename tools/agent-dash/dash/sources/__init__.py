@@ -48,6 +48,15 @@ START_GRACE_S = 90.0
 # health and doctor, but still ok (unlike an over-budget timeout).
 SLOW_AFTER_S = 15.0
 
+# Dormant backoff. A source that declares ``signal_paths`` and found nothing
+# new (no data-changing write, not busy) for ``BACKOFF_AFTER`` polls in a row
+# stops polling at its interval: the gap doubles up to ``BACKOFF_MAX_S``.
+# Between polls the runner only stats the declared paths (once per interval)
+# and polls at once when the token changes. The gap cap is also the fallback
+# poll, so a change no signal path can show is still read within that window.
+BACKOFF_AFTER = 3
+BACKOFF_MAX_S = 300.0
+
 
 def _budget(cfg) -> float:
     try:
@@ -67,6 +76,9 @@ def _new_state() -> dict:
         "skip": False,
         "thread": None,
         "poll_start": None,
+        "idle": 0,
+        "sig": None,
+        "sig_at": None,
     }
 
 
@@ -104,9 +116,11 @@ class Registry:
                 state["thread"] = None
                 if state.get("skip"):
                     continue
-                last = state["last_poll"]
-                if not force and last is not None and now - last < source.INTERVAL_S:
+                if not force and not _due(source, state, now, cfg):
                     continue
+                if declares_signals(source):
+                    state["sig"] = signal_token(source, cfg)
+                    state["sig_at"] = now
                 worker = threading.Thread(
                     target=_run_poll,
                     args=(self, source, store, cfg, now, budget),
@@ -286,6 +300,8 @@ def _perf_poll(source, duration: float) -> None:
 def _run_poll(registry: Registry, source, store, cfg, now: float, budget: float) -> None:
     """Poll one source and record the outcome. Always runs in a worker thread."""
     start = time.monotonic()
+    counter = getattr(store, "write_count", None)
+    writes0 = counter() if callable(counter) else None
     try:
         scope = getattr(store, "attribution_scope", None)
         with (scope() if callable(scope) else contextlib.nullcontext()):
@@ -300,6 +316,7 @@ def _run_poll(registry: Registry, source, store, cfg, now: float, budget: float)
             if duration <= budget:
                 state["timed_out"] = False
         log.warning("source %s: %s", source.NAME, state["last_error"])
+        _note_outcome(registry, source, None, failed=True)
         _perf_poll(source, duration)
     else:
         duration = time.monotonic() - start
@@ -315,7 +332,106 @@ def _run_poll(registry: Registry, source, store, cfg, now: float, budget: float)
                     f"TimeoutError: poll took {duration:.1f}s, over {budget:g}s budget"
                 )
                 log.warning("source %s: %s", source.NAME, state["last_error"])
+            timed_out = state["timed_out"]
+        new_rows = None
+        if writes0 is not None and callable(counter):
+            new_rows = counter() - writes0
+        _note_outcome(registry, source, new_rows, failed=timed_out)
         _perf_poll(source, duration)
+
+
+def declares_signals(source) -> bool:
+    """True when a source names its wake signal paths (``signal_paths``).
+
+    Only these sources can go dormant. Every other source keeps its
+    interval cadence, unchanged.
+    """
+    return getattr(source, "signal_paths", None) is not None
+
+
+def backoff_gap(source, idle: int) -> float:
+    """Seconds between polls of a dormant source after ``idle`` empty polls.
+
+    Starts at ``BACKOFF_AFTER`` polls: the gap is the interval, doubled per
+    further empty poll, capped at ``BACKOFF_MAX_S``.
+    """
+    interval = max(_interval_s(source), 1.0)
+    steps = max(0, int(idle) - BACKOFF_AFTER + 1)
+    return min(BACKOFF_MAX_S, interval * (2 ** min(steps, 16)))
+
+
+def fallback_enabled(source) -> bool:
+    """Whether a dormant source gets a full poll at the gap cap.
+
+    The default keeps that fallback, so a change no declared path shows is
+    still read within ``BACKOFF_MAX_S``. A source whose signals cover every
+    change it reads sets ``signal_fallback = False``: it then makes no poll
+    call (no walk, no offset query) until a signal moves.
+    """
+    return bool(getattr(source, "signal_fallback", True))
+
+
+def signal_token(source, cfg):
+    """A cheap fingerprint of the source's wake signals (stats only).
+
+    One entry per declared path: inode, mtime and size, or ``None`` when the
+    path is missing. A source may add ``signal_extra(cfg)`` for a value that
+    is not a file (for example a live-process set); it joins the token.
+    """
+    paths_fn = getattr(source, "signal_paths", None)
+    try:
+        paths = paths_fn(cfg) if callable(paths_fn) else paths_fn
+    except Exception:
+        paths = ()
+    token = []
+    for path in paths or ():
+        try:
+            st = os.stat(path)
+        except (OSError, TypeError, ValueError):
+            token.append((path, None))
+            continue
+        token.append((path, st.st_ino, st.st_mtime_ns, st.st_size))
+    extra = getattr(source, "signal_extra", None)
+    if callable(extra):
+        try:
+            token.append(("extra", extra(cfg)))
+        except Exception:
+            token.append(("extra", None))
+    return tuple(token)
+
+
+def _due(source, state: dict, now: float, cfg) -> bool:
+    """Whether a source's next poll is due (interval, or dormant backoff)."""
+    last = state.get("last_poll")
+    if last is None:
+        return True
+    if not declares_signals(source) or int(state.get("idle") or 0) < BACKOFF_AFTER:
+        return now - last >= source.INTERVAL_S
+    if fallback_enabled(source) and now - last >= backoff_gap(source, state["idle"]):
+        return True
+    sig_at = state.get("sig_at")
+    if sig_at is not None and now - sig_at < source.INTERVAL_S:
+        return False
+    state["sig_at"] = now
+    return signal_token(source, cfg) != state.get("sig")
+
+
+def _note_outcome(registry, source, new_rows, *, failed: bool) -> None:
+    """Advance or reset a source's idle count after one poll.
+
+    A poll that wrote a row, was busy (``last_active``), failed or timed out
+    resets the count. A poll with no store write counter (``new_rows`` None)
+    never backs off, so a store without one keeps the old cadence.
+    """
+    if not declares_signals(source):
+        return
+    busy = bool(getattr(source, "last_active", False))
+    with registry._lock:
+        state = registry.state.setdefault(source.NAME, _new_state())
+        if failed or new_rows is None or new_rows > 0 or busy:
+            state["idle"] = 0
+        else:
+            state["idle"] = int(state.get("idle") or 0) + 1
 
 
 def has_completed_poll(state: dict) -> bool:
@@ -457,6 +573,12 @@ def source_state(source, state: dict, now: float, born: float, *, startup: bool 
 
 def _is_stalled(source, state: dict, now: float, born: float) -> bool:
     limit = STALL_FACTOR * float(getattr(source, "INTERVAL_S", 0) or 0)
+    if declares_signals(source) and int(state.get("idle") or 0) >= BACKOFF_AFTER:
+        if not fallback_enabled(source):
+            # Silent by design until a signal moves: never a stall.
+            return False
+        # A dormant source is silent by design for up to the fallback gap.
+        limit = BACKOFF_MAX_S + limit
     last = state.get("last_poll")
     if last is None:
         return now - born > max(limit, START_GRACE_S)

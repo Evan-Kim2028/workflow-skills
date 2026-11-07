@@ -70,6 +70,16 @@ def tier_of(model: str | None) -> str:
     return "generic"
 
 
+def signal_paths(cfg) -> list:
+    """Wake signal for the dormant backoff: the generic drop file itself.
+
+    Every new run or usage line appends to it, so its stat is the signal.
+    Run status changes only come from these lines, so the source is never busy.
+    """
+    path = _path(cfg or {})
+    return [path] if path else []
+
+
 def poll(store, cfg, now: float) -> None:
     try:
         _poll(store, cfg or {}, float(now))

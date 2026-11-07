@@ -270,6 +270,8 @@ def collect_problems(
         _bundles=None,
         _taskmap=None,
         _live_ids=None,
+        _read_memo=None,
+        _resolvers={},
     )
     ctx._ignored = list(_ignored_entries or [])
     _collect_dashboard(ctx)
@@ -1921,7 +1923,7 @@ def _dep_cycle(deps: dict[str, list[str]]) -> list[str] | None:
 
 def _collect_bundles(ctx) -> None:
     from dash.bundles import list_bundles, validate_bundle
-    from dash.taskmatch import load_taskmap, task_of
+    from dash.taskmatch import load_taskmap
 
     try:
         bundles = list_bundles()
@@ -1995,11 +1997,10 @@ def _collect_bundles(ctx) -> None:
 
 def _collect_workstream(ctx, ws: str, taskmap: dict, runs: list, live_ids: set, stuck_hours: float) -> int:
     """Task hygiene for one bundle. Returns the problem count."""
-    from dash.taskmatch import task_of
-
     tasks, plan_ids, mtime, history, error = _bundle_task_map(ws)
     if error or tasks is None:
         return 0
+    task_of = _ws_resolver(ctx, ws, taskmap, plan_ids)
     status_of = {tid: info["status"] for tid, info in tasks.items()}
     by_task: dict[str, list[dict]] = {}
     for run in runs:
@@ -2007,7 +2008,7 @@ def _collect_workstream(ctx, ws: str, taskmap: dict, runs: list, live_ids: set, 
         if not label:
             continue
         try:
-            task = task_of(label, ws, taskmap, plan_ids)
+            task = task_of(label)
         except Exception:
             task = None
         if task and task in tasks:
@@ -2016,7 +2017,7 @@ def _collect_workstream(ctx, ws: str, taskmap: dict, runs: list, live_ids: set, 
     for proc in ctx.processes or []:
         if isinstance(proc, dict) and proc.get("label"):
             try:
-                task = task_of(proc["label"], ws, taskmap, plan_ids)
+                task = task_of(proc["label"])
             except Exception:
                 task = None
             if task and task in tasks:
@@ -2278,11 +2279,10 @@ def _orch_ws_state(ctx, ws: str, body: dict, title: str, taskmap: dict,
     the plan body is already loaded by the caller.
     """
     from dash import orchestrate
-    from dash.taskmatch import task_of
-
     by_id, _deps, order = orchestrate.plan_tasks(body)
     if not by_id:
         return None
+    task_of = _ws_resolver(ctx, ws, taskmap, order)
     by_task: dict[str, list] = {}
     for run in runs:
         if not isinstance(run, dict):
@@ -2291,7 +2291,7 @@ def _orch_ws_state(ctx, ws: str, body: dict, title: str, taskmap: dict,
         if owner and owner != ws:
             continue
         try:
-            tid = task_of(run.get("label") or "", ws, taskmap, order)
+            tid = task_of(run.get("label") or "")
         except Exception:
             tid = None
         if isinstance(tid, str) and tid in by_id:
@@ -2320,7 +2320,7 @@ def _orch_ws_state(ctx, ws: str, body: dict, title: str, taskmap: dict,
         if not isinstance(proc, dict) or not proc.get("label"):
             continue
         try:
-            tid = task_of(str(proc["label"]), ws, taskmap, order)
+            tid = task_of(str(proc["label"]))
         except Exception:
             tid = None
         if isinstance(tid, str) and tid in by_id:
@@ -2349,7 +2349,7 @@ def _orch_ws_state(ctx, ws: str, body: dict, title: str, taskmap: dict,
         "by_task": by_task, "ws_runs": ws_runs, "live_map": live_map,
         "live_labels": live_labels, "proc_tasks": proc_tasks,
         "history": history, "plan_change": plan_change,
-        "taskmap": taskmap, "live_ids": live_ids,
+        "taskmap": taskmap, "live_ids": live_ids, "task_of": task_of,
     }
 
 
@@ -2627,7 +2627,6 @@ def _orch_review_spiral(ctx, ws: str, state: dict) -> int:
 
 def _orch_ghost_runs(ctx, ws: str, state: dict) -> int:
     """Recent runs mapping to no plan task (info, one per workstream)."""
-    from dash.taskmatch import task_of
 
     recent_s = float(ctx.dcfg["recent_hours"]) * 3600
     cutoff = ctx.now - recent_s
@@ -2650,7 +2649,7 @@ def _orch_ghost_runs(ctx, ws: str, state: dict) -> int:
     ghosts = []
     for run in window:
         try:
-            tid = task_of(run.get("label") or "", ws, state["taskmap"], state["order"])
+            tid = state["task_of"](run.get("label") or "")
         except Exception:
             tid = None
         if not isinstance(tid, str) or tid not in by_id:
@@ -2675,6 +2674,55 @@ def _orch_ghost_runs(ctx, ws: str, state: dict) -> int:
     return 1
 
 
+def _ws_resolver(ctx, ws: str, taskmap: dict, plan_ids) -> object:
+    """The label-to-task resolver for one workstream, shared within a collect.
+
+    Keyed by workstream and plan ids, so the bundle-hygiene and orchestration
+    passes (same map, same ids) reuse one memo instead of resolving each
+    label twice.
+    """
+    from dash.taskmatch import task_resolver
+
+    cache = ctx._resolvers
+    key = (ws, tuple(plan_ids))
+    if key not in cache:
+        cache[key] = task_resolver(ws, taskmap, plan_ids)
+    return cache[key]
+
+
+class _ReadMemo:
+    """One collect's read-through view of the store for the lead profiles.
+
+    Identical calls inside one :func:`collect_problems` run share one
+    answer, so each live workstream's profile stops re-reading every
+    session and run. The memo lives only for that run; callers only read
+    the rows it returns.
+    """
+
+    _METHODS = frozenset(("query_sessions", "query_runs"))
+
+    def __init__(self, store):
+        self._store = store
+        self._memo: dict = {}
+
+    def _once(self, name, *args, **kwargs):
+        key = (name, args, tuple(sorted(kwargs.items())))
+        if key not in self._memo:
+            self._memo[key] = getattr(self._store, name)(*args, **kwargs)
+        return self._memo[key]
+
+    def query_concurrency(self, now, ws, since, step, until=None):
+        """Every workstream's grid shares one live-run base for ``now``."""
+        base = self._once("_concurrency_base", now)
+        return self._store.query_concurrency(now, ws, since, step, until=until, base=base)
+
+    def __getattr__(self, name):
+        attr = getattr(self._store, name)
+        if name not in self._METHODS:
+            return attr
+        return lambda *args, **kwargs: self._once(name, *args, **kwargs)
+
+
 def _orch_lead(ctx, ws: str, state: dict) -> int:
     """A live lead flagged LOW-DELEGATION or CONTEXT>250k (warn)."""
     if ctx.store is None:
@@ -2683,8 +2731,10 @@ def _orch_lead(ctx, ws: str, state: dict) -> int:
         return 0
     from dash import orchestrate
 
+    if getattr(ctx, "_read_memo", None) is None:
+        ctx._read_memo = _ReadMemo(ctx.store)
     try:
-        profile = orchestrate.lead_profile(ctx.store, ws=ws, now=ctx.now)
+        profile = orchestrate.lead_profile(ctx._read_memo, ws=ws, now=ctx.now, idle_share=False)
     except Exception:
         return 0
     if not isinstance(profile, dict):
@@ -3712,20 +3762,26 @@ def _collect_labels(ctx, plan_tasks=None, taskmap=None, rules=None) -> None:
         return
     tokens = _labels_usage_tokens(ctx)
     weak: dict[str, list[dict]] = {}
+    verdicts: dict = {}
     for row in runs:
         label = row.get("label")
         if not label:
             continue
         phase = by_phase.get(row.get("run_id"), ("unclassified", "none"))[0]
-        try:
-            verdict = label_lib.check(
-                str(label),
-                ws=row.get("workstream"),
-                plan_ids=(plan_tasks or {}).get(row.get("workstream"), []),
-                taskmap=taskmap,
-            )
-        except Exception:
-            verdict = {"ok": False}
+        # A verdict depends only on the label text and its workstream;
+        # retries repeat the same label, so each pair is checked once.
+        vkey = (str(label), row.get("workstream"))
+        if vkey not in verdicts:
+            try:
+                verdicts[vkey] = label_lib.check(
+                    str(label),
+                    ws=row.get("workstream"),
+                    plan_ids=(plan_tasks or {}).get(row.get("workstream"), []),
+                    taskmap=taskmap,
+                )
+            except Exception:
+                verdicts[vkey] = {"ok": False}
+        verdict = verdicts[vkey]
         if phase != "unclassified" and verdict.get("ok"):
             continue
         ws = row.get("workstream") if row.get("workstream") else None

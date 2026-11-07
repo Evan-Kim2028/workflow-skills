@@ -286,11 +286,12 @@ class QueriesMixin:
                 ).fetchall():
                     out.add(row["run_id"])
             return out
-        def query_concurrency(self, now: float, ws: str | None, since: float, step: float) -> list:
-            step = float(step) if step and step >= 1 else 60.0
-            span = max(0.0, now - since)
-            if span / step > 5000:
-                step = span / 5000
+        def _concurrency_base(self, now: float) -> tuple:
+            """Counted agent rows live at ``now`` (before any workstream filter).
+
+            Returns ``(runs, stall_end)``. Depends on ``now`` and the liveness
+            probes only, so one collect can share it across workstreams.
+            """
             probes = self._probe_liveness(file_mtimes=True)
             check = self._probe_checker(probes)
             with self._lock:
@@ -323,6 +324,22 @@ class QueriesMixin:
                 for run_id, idle in stalled.items()
                 if isinstance(idle, (int, float))
             }
+            return runs, stall_end
+
+        def query_concurrency(self, now: float, ws: str | None, since: float, step: float,
+                              until: float | None = None, base: tuple | None = None) -> list:
+            """Lane counts on the grid ``since + k*step``, up to ``now``.
+
+            ``until`` (optional) stops the grid there: a caller that keeps only
+            points inside a window gets the same points without the rest.
+            ``base`` (optional) is a ``_concurrency_base(now)`` result the caller
+            already holds for this ``now``.
+            """
+            step = float(step) if step and step >= 1 else 60.0
+            span = max(0.0, now - since)
+            if span / step > 5000:
+                step = span / 5000
+            runs, stall_end = base if base is not None else self._concurrency_base(now)
             if ws and ws != "all":
                 runs = [run for run in runs if run["workstream"] == ws]
             # Sweep-line over start/end events: one bisect per (tool, model)
@@ -365,7 +382,7 @@ class QueriesMixin:
             count = int(span / step) + 1
             for index in range(count):
                 t = since + index * step
-                if t > now + 1e-6:
+                if t > now + 1e-6 or (until is not None and t > until):
                     break
                 live = t <= now
                 point = {"t": t, **{key: 0 for key in TOOL_KEYS}, "models": {}}

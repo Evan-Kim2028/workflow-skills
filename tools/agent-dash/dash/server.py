@@ -35,6 +35,13 @@ STATE_STORE_LOCK_TIMEOUT_S = 2.0
 STATE_BUILD_TIMEOUT_S = 10.0
 STORE_LOCK_WATCHDOG_AFTER_S = 10.0
 HEALTH_STORE_REFRESH_S = 5.0
+#: The health store fields (usage model stats, unpriced models) are recomputed
+#: at most every ``HEALTH_STORE_MIN_AGE_S`` and only when the store's content
+#: key moved; with no store change, at most every ``HEALTH_STORE_MAX_AGE_S``
+#: (the unpriced-model window slides with the clock). A live writer moves the
+#: key on every poll, so the minimum age is what bounds the cost there.
+HEALTH_STORE_MIN_AGE_S = 30.0
+HEALTH_STORE_MAX_AGE_S = 60.0
 
 
 def _with_store_lock_timeout(store, fn):
@@ -398,12 +405,21 @@ class DashServer(ThreadingHTTPServer):
             return
 
         def refresh():
+            last_key = None
+            last_at = None
             while not self.stop.wait(HEALTH_STORE_REFRESH_S):
                 try:
+                    # Read the key first: a write landing after it only
+                    # makes the next check recompute once more.
+                    key = self.store.content_key
+                    mono = time.monotonic()
+                    if not health_store_refresh_due(key, last_key, last_at, mono):
+                        continue
                     current = _health_store_snapshot(self.store, bounded=True)
                 except Exception:
                     continue
                 self._health_store_snapshot = current
+                last_key, last_at = key, mono
 
         self._health_store_thread = threading.Thread(
             target=refresh, name="dash-health-refresh", daemon=True
@@ -1709,6 +1725,20 @@ def _record_http(server, parsed, elapsed_ms: float) -> None:
             )
     except Exception:
         pass
+
+
+def health_store_refresh_due(key, last_key, last_at, mono) -> bool:
+    """Whether the health store fields need a recompute on this check.
+
+    True on the first check, when the content key moved, or once
+    ``HEALTH_STORE_MAX_AGE_S`` has passed since the last recompute.
+    """
+    if last_at is None:
+        return True
+    age = mono - last_at
+    if key != last_key:
+        return age >= HEALTH_STORE_MIN_AGE_S
+    return age >= HEALTH_STORE_MAX_AGE_S
 
 
 def _health_store_snapshot(store, *, bounded: bool = False) -> dict:

@@ -85,6 +85,12 @@ _MODEL_COUNTS = {}
 _META_CACHE = {}
 _DB_FP = {}
 _dir_cache: dict = {}
+# Chat bucket dirs (``chats/<md5(cwd)>``) the last discovery walk saw. The wake
+# signal stats them, so a new chat in a known bucket is seen without a walk.
+_BUCKET_DIRS: set = set()
+# True while a chat has a live cursor-agent process (set by each poll). A
+# busy source is never dormant: its status flips on process exit, not on a file.
+last_active = False
 META_CACHE_CAP = 20000
 DIR_LIST_CAP = 500
 _LIVE_PIDS = None
@@ -217,7 +223,41 @@ def open_store(path, tmp_root, budget, tick_budget):
     return con, None, budget, "ok"
 
 
+def signal_paths(cfg):
+    """Wake signals for the dormant backoff: stats only, no walk.
+
+    The chats root (a new bucket), each bucket the last discovery saw (a new
+    chat in it), and the stop-hook usage file (every billed turn appends a
+    line). A live process set comes from :func:`signal_extra`.
+    """
+    paths = [os.path.join(_home(cfg), "chats")]
+    paths.extend(sorted(_BUCKET_DIRS))
+    usage = _usage_path(cfg)
+    if usage:
+        paths.append(usage)
+    return paths
+
+
+#: No fallback poll while dormant: the signals above cover every change this
+#: source reads (new chat dirs, the billed-turn hook file, live cursor pids).
+#: A dormant cursor therefore never walks or queries offsets.
+signal_fallback = False
+
+
+def signal_extra(cfg):
+    """Live cursor-agent pids: a resumed chat's process start wakes the source.
+
+    Reads the process source's shared listing (cached a few seconds), so it
+    adds no extra ``ps`` per wake check. ``None`` when the listing failed.
+    """
+    del cfg
+    pids = live_cursor_pids()
+    return None if pids is None else frozenset(pids)
+
+
 def _poll(store, cfg, now):
+    global last_active
+    last_active = False
     per_file, budget = _budgets(cfg)
     tick_budget = budget
     if budget <= 0:
@@ -268,6 +308,7 @@ def _poll(store, cfg, now):
         pending = [chat for chat in chosen if not _db_fresh(store, chat)]
         _drain(store, pending, budget, per_file, tick_budget, now, tmp_root)
         _restore_parent_pids(store, chats, now)
+        last_active = bool(_LIVE_PIDS) or any(chat.get("pid") for chat in chats)
     finally:
         _LIVE_PIDS = None
 
@@ -921,16 +962,19 @@ def _discover(home, budget, per_file):
     root = os.path.join(home, "chats")
     found = []
     if not os.path.isdir(root):
+        _BUCKET_DIRS.clear()
         return found, budget
     try:
         buckets = os.scandir(root)
     except OSError:
         return found, budget
+    seen_buckets = set()
     with buckets:
         for bucket in buckets:
             try:
                 if not bucket.is_dir(follow_symlinks=False):
                     continue
+                seen_buckets.add(bucket.path)
                 chats = os.scandir(bucket.path)
             except OSError:
                 continue
@@ -962,6 +1006,8 @@ def _discover(home, budget, per_file):
                             "pid": None,
                         }
                     )
+    _BUCKET_DIRS.clear()
+    _BUCKET_DIRS.update(seen_buckets)
     if budget > 0:
         _drop_gone(found)
     return found, budget

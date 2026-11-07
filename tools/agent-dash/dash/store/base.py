@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import os
 import sqlite3
+import threading
 import time as _time
 
 from pathlib import Path
@@ -24,6 +25,12 @@ from .util import (PRUNE_BATCH, RUN_COLS, SESSION_COLS,
 #: at most this large after a reset (``journal_size_limit``).
 WAL_CHECKPOINT_BYTES = 16 * 1024 * 1024
 WAL_SIZE_LIMIT_BYTES = 64 * 1024 * 1024
+
+#: Per-thread count of data-changing writes (every ``_note_data_write``).
+#: The source runner reads it around one poll to tell a poll that wrote
+#: rows from one that found nothing new (dormant backoff). Other threads'
+#: writes never leak into it.
+_WRITES = threading.local()
 
 
 class BaseMixin:
@@ -134,9 +141,18 @@ class BaseMixin:
         @property
         def last_data_ts(self) -> float | None:
             return self._last_data_ts
-        def _note_data_write(self) -> None:
-            """Stamp the last data-changing write. Caller holds the lock."""
+        def _note_data_write(self, counted: bool = True) -> None:
+            """Stamp the last data-changing write. Caller holds the lock.
+
+            ``counted=False`` is for cursor advances, which stamp time but
+            are not new rows: the source runner's backoff must not see them.
+            """
             self._last_data_ts = _time.time()
+            if counted:
+                _WRITES.n = getattr(_WRITES, "n", 0) + 1
+        def write_count(self) -> int:
+            """Data-changing writes made by the calling thread so far."""
+            return getattr(_WRITES, "n", 0)
         def _bump_usage_run(self, run_id) -> None:
             """Mark one run's usage fold stale. Caller holds the lock.
 
@@ -235,7 +251,7 @@ class BaseMixin:
                     # treat an advancing scan cursor as progress.
                     self._seq += 1
                     self._cursor_seq += 1
-                    self._note_data_write()
+                    self._note_data_write(counted=False)
         def prune_offsets(self, batch: int = PRUNE_BATCH) -> int:
             """Delete up to ``batch`` offset rows whose path no longer exists.
 

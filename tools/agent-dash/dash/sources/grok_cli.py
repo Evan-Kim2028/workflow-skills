@@ -76,6 +76,35 @@ last_error = None
 #: Directory-walk reuse window (seconds), the shared ``dir_scan_s`` knob.
 DIR_SCAN_S = 15
 
+#: Pad dirs (and their manifest TSV paths) the last poll's walk found. The
+#: wake signal stats them, so a new or appended manifest wakes the source
+#: without a walk. Replaced on every poll.
+_KNOWN_PADS: set = set()
+#: True while a grok (GLM CLI) process is alive, or the listing failed: its
+#: run status flips on process exit, which no file shows. Set by each poll.
+last_active = False
+
+
+def signal_paths(cfg):
+    """Wake signals for the dormant backoff: stats only, no walk."""
+    paths = [_root(cfg or {}, "grok_sessions", "glm_sessions", default=DEFAULT_SESSIONS)]
+    paths.append(_root(cfg or {}, "grok_log", "unified_log", "unified", default=DEFAULT_LOG))
+    paths.extend(_scratch_roots(cfg or {}))
+    for pad in sorted(_KNOWN_PADS):
+        paths.append(pad)
+        paths.extend(os.path.join(pad, filename) for filename in MANIFESTS)
+    return paths
+
+
+def signal_extra(cfg):
+    """Live ``grok`` process pids (the GLM CLI binary); a start wakes the source."""
+    del cfg
+    rows = _agent_processes()
+    if rows is None:
+        return None
+    return frozenset(row["pid"] for row in rows if row.get("comm") == "grok")
+
+
 def poll(store, cfg, now):
     global last_error
     last_error = None
@@ -88,17 +117,22 @@ def poll(store, cfg, now):
 
 
 def _poll(store, cfg, now):
+    global last_active, _KNOWN_PADS
+    last_active = False
     per_file, budget = _budgets(cfg)
     sessions = _root(cfg, "grok_sessions", "glm_sessions", default=DEFAULT_SESSIONS)
     log_path = _root(cfg, "grok_log", "unified_log", "unified", default=DEFAULT_LOG)
     only = _only_session(cfg)
     processes = _agent_processes()
+    last_active = processes is None or any(row.get("comm") == "grok" for row in processes)
 
     manifests = {}
     pads = {}
+    known = set()
     for scratch in _scratch_roots(cfg):
         for filename in MANIFESTS:
             for pad, parent in _manifest_dirs(scratch, filename, only):
+                known.add(pad)
                 path = os.path.join(pad, filename)
                 text, budget = _read_small(path, budget, per_file)
                 if text is None:
@@ -109,6 +143,7 @@ def _poll(store, cfg, now):
                     if _keep_latest(manifests, row):
                         pads[row["session_id"]] = pad
 
+    _KNOWN_PADS = known
     latest = _latest_per_label(manifests)
     for row in manifests.values():
         _upsert_run(store, row, None, None, processes, pads.get(row["session_id"]), row["session_id"] in latest, now)
@@ -570,20 +605,6 @@ def _tier_of(row, model=None):
     if "glm" in key:
         return "glm-flash" if "flash" in key else "glm"
     return TOOL
-
-
-def _read_meta_tier(pad, label):
-    """The tier in ``<label>.meta.json`` beside the manifest, or None."""
-    if not pad or not label:
-        return None
-    path = os.path.join(pad, "%s.meta.json" % label)
-    try:
-        with open(path, "rb") as fh:
-            data = json.loads(fh.read(64 * 1024).decode("utf-8", "replace"))
-    except (OSError, ValueError):
-        return None
-    tier = data.get("tier") if isinstance(data, dict) else None
-    return str(tier).strip() or None if tier is not None else None
 
 
 def _keep_latest(manifests, row):
