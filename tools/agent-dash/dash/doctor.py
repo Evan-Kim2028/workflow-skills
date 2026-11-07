@@ -271,6 +271,7 @@ def collect_problems(
         _taskmap=None,
         _live_ids=None,
         _read_memo=None,
+        _resolvers={},
     )
     ctx._ignored = list(_ignored_entries or [])
     _collect_dashboard(ctx)
@@ -1996,12 +1997,10 @@ def _collect_bundles(ctx) -> None:
 
 def _collect_workstream(ctx, ws: str, taskmap: dict, runs: list, live_ids: set, stuck_hours: float) -> int:
     """Task hygiene for one bundle. Returns the problem count."""
-    from dash.taskmatch import task_resolver
-
     tasks, plan_ids, mtime, history, error = _bundle_task_map(ws)
     if error or tasks is None:
         return 0
-    task_of = task_resolver(ws, taskmap, plan_ids)
+    task_of = _ws_resolver(ctx, ws, taskmap, plan_ids)
     status_of = {tid: info["status"] for tid, info in tasks.items()}
     by_task: dict[str, list[dict]] = {}
     for run in runs:
@@ -2280,12 +2279,10 @@ def _orch_ws_state(ctx, ws: str, body: dict, title: str, taskmap: dict,
     the plan body is already loaded by the caller.
     """
     from dash import orchestrate
-    from dash.taskmatch import task_resolver
-
     by_id, _deps, order = orchestrate.plan_tasks(body)
     if not by_id:
         return None
-    task_of = task_resolver(ws, taskmap, order)
+    task_of = _ws_resolver(ctx, ws, taskmap, order)
     by_task: dict[str, list] = {}
     for run in runs:
         if not isinstance(run, dict):
@@ -2676,6 +2673,22 @@ def _orch_ghost_runs(ctx, ws: str, state: dict) -> int:
             f"({share * 100:.0f}% >= {float(ctx.dcfg['ghost_share']) * 100:.0f}%)",
         )
     return 1
+
+
+def _ws_resolver(ctx, ws: str, taskmap: dict, plan_ids) -> object:
+    """The label-to-task resolver for one workstream, shared within a collect.
+
+    Keyed by workstream and plan ids, so the bundle-hygiene and orchestration
+    passes (same map, same ids) reuse one memo instead of resolving each
+    label twice.
+    """
+    from dash.taskmatch import task_resolver
+
+    cache = ctx._resolvers
+    key = (ws, tuple(plan_ids))
+    if key not in cache:
+        cache[key] = task_resolver(ws, taskmap, plan_ids)
+    return cache[key]
 
 
 class _ReadMemo:

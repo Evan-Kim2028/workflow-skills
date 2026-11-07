@@ -286,7 +286,13 @@ class QueriesMixin:
                 ).fetchall():
                     out.add(row["run_id"])
             return out
-        def query_concurrency(self, now: float, ws: str | None, since: float, step: float) -> list:
+        def query_concurrency(self, now: float, ws: str | None, since: float, step: float,
+                              until: float | None = None) -> list:
+            """Lane counts on the grid ``since + k*step``, up to ``now``.
+
+            ``until`` (optional) stops the grid there: a caller that keeps only
+            points inside a window gets the same points without the rest.
+            """
             step = float(step) if step and step >= 1 else 60.0
             span = max(0.0, now - since)
             if span / step > 5000:
@@ -365,7 +371,7 @@ class QueriesMixin:
             count = int(span / step) + 1
             for index in range(count):
                 t = since + index * step
-                if t > now + 1e-6:
+                if t > now + 1e-6 or (until is not None and t > until):
                     break
                 live = t <= now
                 point = {"t": t, **{key: 0 for key in TOOL_KEYS}, "models": {}}

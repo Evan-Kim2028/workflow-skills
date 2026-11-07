@@ -45,6 +45,7 @@ _RULE_RX_LIMIT = 4096
 #: plan order with empty ids dropped, so the substring scan lowercases once.
 _PLAN_INDEX: dict = {}
 _PLAN_INDEX_LIMIT = 256
+_PLAN_PROBE: dict = {}
 
 
 def load_taskmap(root: Path | None = None) -> dict:
@@ -180,7 +181,8 @@ def _base_task(label: str | None, ws: str | None, taskmap: dict | None = None, p
     if plan_ids:
         lower = lab.lower()
         best = None
-        for text, low in _plan_index(plan_ids):
+        probe = _plan_probe(plan_ids)
+        for text, low in (_plan_index(plan_ids) if probe is not None and probe.search(lower) else ()):
             start = lower.find(low)
             if start < 0:
                 continue
@@ -231,6 +233,34 @@ def _plan_index(plan_ids) -> tuple:
                 _PLAN_INDEX.clear()
             _PLAN_INDEX[key] = index
     return index
+
+
+def _plan_probe(plan_ids):
+    """One regex matching when any plan text occurs in a label; None without plan texts.
+
+    The plan scan below only matches a text that occurs in the label, so a
+    label this probe rejects can match nothing. One C-level search replaces
+    a Python ``find`` per plan id for the (common) labels with no plan text.
+    """
+    try:
+        key = tuple(plan_ids)
+        with _RULE_RX_LOCK:
+            hit = _PLAN_PROBE.get(key)
+    except TypeError:
+        key, hit = None, None
+    if hit is not None:
+        return hit
+    index = _plan_index(plan_ids)
+    if not index:
+        return None
+    lows = sorted({low for _text, low in index}, key=len, reverse=True)
+    hit = re.compile("|".join(re.escape(low) for low in lows))
+    if key is not None:
+        with _RULE_RX_LOCK:
+            if len(_PLAN_PROBE) >= _PLAN_INDEX_LIMIT:
+                _PLAN_PROBE.clear()
+            _PLAN_PROBE[key] = hit
+    return hit
 
 
 def task_of_verified(label: str | None, ws: str | None, taskmap: dict | None = None, plan_ids: list[str] | tuple = ()) -> str | None:

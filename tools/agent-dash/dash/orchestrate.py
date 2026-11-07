@@ -1234,7 +1234,7 @@ def _idle_ready_share(store, ws: str | None, start: float, end: float, now: floa
             done_at[tid] = None
     cands = [tid for tid in by_id if by_id[tid].get("status") != "deferred"]
     try:
-        points = store.query_concurrency(now, ws, start, 60.0)
+        points = store.query_concurrency(now, ws, start, 60.0, until=end)
     except Exception:
         return None
     points = [point for point in points if isinstance(point, dict)]
