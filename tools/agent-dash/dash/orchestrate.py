@@ -614,7 +614,13 @@ def deferred_ledger(bodies: dict[str, dict]) -> list[dict]:
                     best: str | None = None
                     best_score = 0.0
                     for cand, cand_task in target_ids.items():
-                        score = _title_similarity(mine, str(cand_task.get("title") or ""))
+                        # Only a score >= TITLE_SIMILARITY can be the match, and
+                        # quick_ratio() bounds ratio() from above, so a candidate
+                        # its bounds rule out can never change ``best``.
+                        matcher = SequenceMatcher(None, mine.lower(), str(cand_task.get("title") or "").lower())
+                        if matcher.real_quick_ratio() < TITLE_SIMILARITY or matcher.quick_ratio() < TITLE_SIMILARITY:
+                            continue
+                        score = matcher.ratio()
                         if score > best_score:
                             best_score = score
                             best = cand
@@ -985,7 +991,8 @@ def _muse_tool_calls(session_uuid: str, roots: list[str] | None = None) -> tuple
     return None, None
 
 
-def lead_profile(store, session_id: str | None = None, ws: str | None = None, now: float | None = None) -> dict | None:
+def lead_profile(store, session_id: str | None = None, ws: str | None = None, now: float | None = None,
+                 idle_share: bool = True) -> dict | None:
     """A lead session's delegation profile: every worker it launched.
 
     ``session_id`` profiles one lead session: every run whose
@@ -1120,7 +1127,12 @@ def lead_profile(store, session_id: str | None = None, ws: str | None = None, no
     except (TypeError, ValueError):
         tokens = 0
 
-    idle_share = _idle_ready_share(store, lead_ws, lead_start, window_end, moment)
+    # The idle-ready share replays the whole session window, so callers
+    # that only read LOW-DELEGATION or CONTEXT flags skip it.
+    if idle_share:
+        idle_share = _idle_ready_share(store, lead_ws, lead_start, window_end, moment)
+    else:
+        idle_share = None
 
     from dash.bundles import resolve_plan
 

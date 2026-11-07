@@ -97,11 +97,22 @@ def task_resolver(ws: str | None, taskmap: dict | None = None, plan_ids: list[st
     retry of one base label, and every unowned run seen per workstream).
     """
     memo: dict = {}
+    table = (taskmap or {}).get(ws) if isinstance(taskmap, dict) else None
+    # Without a map table or a built-in rule for this workstream, a label
+    # can only resolve through the plan scan or the canonical rule. Both
+    # are probed here, so a label neither one can match skips task_of.
+    plain = not table and ws not in ("WS1", "WS2", "WS7")
+    probe = _plan_probe(plan_ids) if plan_ids else None
 
     def resolve(label):
         if label in memo:
             return memo[label]
-        hit = task_of(label, ws, taskmap, plan_ids)
+        canon = _CANONICAL_LABEL.match(label or "")
+        if plain and (probe is None or probe.search((label or "").lower()) is None) \
+                and (canon is None or str(ws or "").upper() != f"WS{canon.group(1)}"):
+            hit = None
+        else:
+            hit = task_of(label, ws, taskmap, plan_ids)
         memo[label] = hit
         return hit
 

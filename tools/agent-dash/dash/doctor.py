@@ -2700,24 +2700,28 @@ class _ReadMemo:
     the rows it returns.
     """
 
-    _METHODS = frozenset(("query_sessions", "query_runs", "query_concurrency"))
+    _METHODS = frozenset(("query_sessions", "query_runs"))
 
     def __init__(self, store):
         self._store = store
         self._memo: dict = {}
 
+    def _once(self, name, *args, **kwargs):
+        key = (name, args, tuple(sorted(kwargs.items())))
+        if key not in self._memo:
+            self._memo[key] = getattr(self._store, name)(*args, **kwargs)
+        return self._memo[key]
+
+    def query_concurrency(self, now, ws, since, step, until=None):
+        """Every workstream's grid shares one live-run base for ``now``."""
+        base = self._once("_concurrency_base", now)
+        return self._store.query_concurrency(now, ws, since, step, until=until, base=base)
+
     def __getattr__(self, name):
         attr = getattr(self._store, name)
         if name not in self._METHODS:
             return attr
-
-        def call(*args, **kwargs):
-            key = (name, args, tuple(sorted(kwargs.items())))
-            if key not in self._memo:
-                self._memo[key] = attr(*args, **kwargs)
-            return self._memo[key]
-
-        return call
+        return lambda *args, **kwargs: self._once(name, *args, **kwargs)
 
 
 def _orch_lead(ctx, ws: str, state: dict) -> int:
@@ -2731,7 +2735,7 @@ def _orch_lead(ctx, ws: str, state: dict) -> int:
     if getattr(ctx, "_read_memo", None) is None:
         ctx._read_memo = _ReadMemo(ctx.store)
     try:
-        profile = orchestrate.lead_profile(ctx._read_memo, ws=ws, now=ctx.now)
+        profile = orchestrate.lead_profile(ctx._read_memo, ws=ws, now=ctx.now, idle_share=False)
     except Exception:
         return 0
     if not isinstance(profile, dict):
@@ -3759,20 +3763,26 @@ def _collect_labels(ctx, plan_tasks=None, taskmap=None, rules=None) -> None:
         return
     tokens = _labels_usage_tokens(ctx)
     weak: dict[str, list[dict]] = {}
+    verdicts: dict = {}
     for row in runs:
         label = row.get("label")
         if not label:
             continue
         phase = by_phase.get(row.get("run_id"), ("unclassified", "none"))[0]
-        try:
-            verdict = label_lib.check(
-                str(label),
-                ws=row.get("workstream"),
-                plan_ids=(plan_tasks or {}).get(row.get("workstream"), []),
-                taskmap=taskmap,
-            )
-        except Exception:
-            verdict = {"ok": False}
+        # A verdict depends only on the label text and its workstream;
+        # retries repeat the same label, so each pair is checked once.
+        vkey = (str(label), row.get("workstream"))
+        if vkey not in verdicts:
+            try:
+                verdicts[vkey] = label_lib.check(
+                    str(label),
+                    ws=row.get("workstream"),
+                    plan_ids=(plan_tasks or {}).get(row.get("workstream"), []),
+                    taskmap=taskmap,
+                )
+            except Exception:
+                verdicts[vkey] = {"ok": False}
+        verdict = verdicts[vkey]
         if phase != "unclassified" and verdict.get("ok"):
             continue
         ws = row.get("workstream") if row.get("workstream") else None
