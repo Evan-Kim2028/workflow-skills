@@ -270,6 +270,7 @@ def collect_problems(
         _bundles=None,
         _taskmap=None,
         _live_ids=None,
+        _read_memo=None,
     )
     ctx._ignored = list(_ignored_entries or [])
     _collect_dashboard(ctx)
@@ -1995,11 +1996,12 @@ def _collect_bundles(ctx) -> None:
 
 def _collect_workstream(ctx, ws: str, taskmap: dict, runs: list, live_ids: set, stuck_hours: float) -> int:
     """Task hygiene for one bundle. Returns the problem count."""
-    from dash.taskmatch import task_of
+    from dash.taskmatch import task_resolver
 
     tasks, plan_ids, mtime, history, error = _bundle_task_map(ws)
     if error or tasks is None:
         return 0
+    task_of = task_resolver(ws, taskmap, plan_ids)
     status_of = {tid: info["status"] for tid, info in tasks.items()}
     by_task: dict[str, list[dict]] = {}
     for run in runs:
@@ -2007,7 +2009,7 @@ def _collect_workstream(ctx, ws: str, taskmap: dict, runs: list, live_ids: set, 
         if not label:
             continue
         try:
-            task = task_of(label, ws, taskmap, plan_ids)
+            task = task_of(label)
         except Exception:
             task = None
         if task and task in tasks:
@@ -2016,7 +2018,7 @@ def _collect_workstream(ctx, ws: str, taskmap: dict, runs: list, live_ids: set, 
     for proc in ctx.processes or []:
         if isinstance(proc, dict) and proc.get("label"):
             try:
-                task = task_of(proc["label"], ws, taskmap, plan_ids)
+                task = task_of(proc["label"])
             except Exception:
                 task = None
             if task and task in tasks:
@@ -2278,11 +2280,12 @@ def _orch_ws_state(ctx, ws: str, body: dict, title: str, taskmap: dict,
     the plan body is already loaded by the caller.
     """
     from dash import orchestrate
-    from dash.taskmatch import task_of
+    from dash.taskmatch import task_resolver
 
     by_id, _deps, order = orchestrate.plan_tasks(body)
     if not by_id:
         return None
+    task_of = task_resolver(ws, taskmap, order)
     by_task: dict[str, list] = {}
     for run in runs:
         if not isinstance(run, dict):
@@ -2291,7 +2294,7 @@ def _orch_ws_state(ctx, ws: str, body: dict, title: str, taskmap: dict,
         if owner and owner != ws:
             continue
         try:
-            tid = task_of(run.get("label") or "", ws, taskmap, order)
+            tid = task_of(run.get("label") or "")
         except Exception:
             tid = None
         if isinstance(tid, str) and tid in by_id:
@@ -2320,7 +2323,7 @@ def _orch_ws_state(ctx, ws: str, body: dict, title: str, taskmap: dict,
         if not isinstance(proc, dict) or not proc.get("label"):
             continue
         try:
-            tid = task_of(str(proc["label"]), ws, taskmap, order)
+            tid = task_of(str(proc["label"]))
         except Exception:
             tid = None
         if isinstance(tid, str) and tid in by_id:
@@ -2349,7 +2352,7 @@ def _orch_ws_state(ctx, ws: str, body: dict, title: str, taskmap: dict,
         "by_task": by_task, "ws_runs": ws_runs, "live_map": live_map,
         "live_labels": live_labels, "proc_tasks": proc_tasks,
         "history": history, "plan_change": plan_change,
-        "taskmap": taskmap, "live_ids": live_ids,
+        "taskmap": taskmap, "live_ids": live_ids, "task_of": task_of,
     }
 
 
@@ -2650,7 +2653,7 @@ def _orch_ghost_runs(ctx, ws: str, state: dict) -> int:
     ghosts = []
     for run in window:
         try:
-            tid = task_of(run.get("label") or "", ws, state["taskmap"], state["order"])
+            tid = state["task_of"](run.get("label") or "")
         except Exception:
             tid = None
         if not isinstance(tid, str) or tid not in by_id:
@@ -2675,6 +2678,35 @@ def _orch_ghost_runs(ctx, ws: str, state: dict) -> int:
     return 1
 
 
+class _ReadMemo:
+    """One collect's read-through view of the store for the lead profiles.
+
+    Identical calls inside one :func:`collect_problems` run share one
+    answer, so each live workstream's profile stops re-reading every
+    session and run. The memo lives only for that run; callers only read
+    the rows it returns.
+    """
+
+    _METHODS = frozenset(("query_sessions", "query_runs", "query_concurrency"))
+
+    def __init__(self, store):
+        self._store = store
+        self._memo: dict = {}
+
+    def __getattr__(self, name):
+        attr = getattr(self._store, name)
+        if name not in self._METHODS:
+            return attr
+
+        def call(*args, **kwargs):
+            key = (name, args, tuple(sorted(kwargs.items())))
+            if key not in self._memo:
+                self._memo[key] = attr(*args, **kwargs)
+            return self._memo[key]
+
+        return call
+
+
 def _orch_lead(ctx, ws: str, state: dict) -> int:
     """A live lead flagged LOW-DELEGATION or CONTEXT>250k (warn)."""
     if ctx.store is None:
@@ -2683,8 +2715,10 @@ def _orch_lead(ctx, ws: str, state: dict) -> int:
         return 0
     from dash import orchestrate
 
+    if getattr(ctx, "_read_memo", None) is None:
+        ctx._read_memo = _ReadMemo(ctx.store)
     try:
-        profile = orchestrate.lead_profile(ctx.store, ws=ws, now=ctx.now)
+        profile = orchestrate.lead_profile(ctx._read_memo, ws=ws, now=ctx.now)
     except Exception:
         return 0
     if not isinstance(profile, dict):

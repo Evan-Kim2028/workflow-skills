@@ -87,6 +87,26 @@ def task_of(label: str | None, ws: str | None, taskmap: dict | None = None, plan
     return _canonical_label_task(label, ws, plan_ids) or hit
 
 
+def task_resolver(ws: str | None, taskmap: dict | None = None, plan_ids: list[str] | tuple = ()):
+    """A ``task_of(label)`` bound to one workstream's map and plan ids.
+
+    Answers are memoized per label for the life of the resolver. The map
+    and plan ids are fixed for it, so no answer changes; the memo only
+    skips rescanning the plan for a label that repeats across runs (every
+    retry of one base label, and every unowned run seen per workstream).
+    """
+    memo: dict = {}
+
+    def resolve(label):
+        if label in memo:
+            return memo[label]
+        hit = task_of(label, ws, taskmap, plan_ids)
+        memo[label] = hit
+        return hit
+
+    return resolve
+
+
 _CANONICAL_LABEL = re.compile(r"^ws(\d+)-(?:plan|exec|review|coord)-(.+?)(?:-r\d+)?$", re.IGNORECASE)
 _LABEL_MARK = re.compile(r"^ws\d+-(plan|exec|review|coord)-", re.IGNORECASE)
 
