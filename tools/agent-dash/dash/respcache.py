@@ -23,6 +23,9 @@ Semantics (see CONTRACT.md, docs/perf.md):
   run at once, extra expiries are served stale and retried on the next
   read). A page that polls is always the reader that starts the refresh,
   so it never pays a recompute inline.
+- Sliding window roll (``since`` without ``until``): a new 30 s cell adopts
+  the previous cell's generation, so the roll serves at once and refreshes
+  in the background like any expired entry.
 - Idle (no reader for ``IDLE_S``) with an expired generation: the next
   reader computes inline, so a tab opened after a pause never sees data
   older than its own recompute. Idle entries never refresh in the
