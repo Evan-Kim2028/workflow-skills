@@ -930,6 +930,7 @@ def cmd_status(argv: list[str] | None = None) -> int:
 
 def _status_pidfile_less(pid: int, health: dict, json_mode: bool, repair: bool) -> int:
     """Report a dashboard the pidfile does not name; repair rewrites it."""
+    health = health or {}
     info = {
         "build_id": health.get("build_id") or "unknown",
         "started_at": health.get("started_at"),
@@ -2179,7 +2180,7 @@ def is_dash(pid: int) -> bool:
             check=False,
             capture_output=True,
             text=True,
-            timeout=2,
+            timeout=10,
         )
     except (OSError, subprocess.TimeoutExpired):
         return False
@@ -2270,7 +2271,7 @@ def _serves_dashboard(pid: int) -> bool:
             check=False,
             capture_output=True,
             text=True,
-            timeout=2,
+            timeout=10,
         )
     except (OSError, subprocess.TimeoutExpired):
         return False
@@ -2281,17 +2282,18 @@ def _serves_dashboard(pid: int) -> bool:
 def _dashboard_on_port() -> tuple[int | None, dict | None]:
     """``(pid, health)`` for the dashboard answering the configured port.
 
-    The port must answer ``/api/health`` and its listener's command
-    line must be the dashboard server. ``(None, None)`` otherwise; this
-    is how ``status``/``stop``/``restart`` find a dashboard whose
-    pidfile is missing or stale.
+    The listener's command line must be the dashboard server. The port
+    holder decides, not the health answer: a busy server can miss the
+    probe's deadline while it is very much alive, and treating that as
+    "not running" lets ``stop`` report success and ``run`` hit a bound
+    port. ``health`` is ``None`` when the server did not answer in time.
+    ``(None, None)`` otherwise; this is how ``status``/``stop``/``restart``
+    find a dashboard whose pidfile is missing or stale.
     """
-    health = _probe_health()
-    if not isinstance(health, dict):
-        return None, None
     pid = _listener_pid(_port())
     if pid is not None and pid_exists(pid) and _serves_dashboard(pid):
-        return pid, health
+        health = _probe_health()
+        return pid, (health if isinstance(health, dict) else None)
     return None, None
 
 
