@@ -473,27 +473,6 @@ def _is_ancestor(repo: str, tip: str, ref: str) -> bool:
     return proc is not None and proc.returncode == 0
 
 
-def merged_by_git(repo: str, branch: str) -> tuple[bool, str]:
-    """True when ``branch`` is merged into ``origin/<default>``.
-
-    Either proof counts: the tip is an ancestor of the default remote
-    ref, or ``git branch -r --contains`` names it. Pure git: never
-    touches ``gh``. Runs after :func:`fetch_repo`.
-    """
-    ref = _default_origin_ref(repo)
-    tip = _branch_tip(repo, branch)
-    if tip is None:
-        return False, "branch is gone from the repo"
-    if _is_ancestor(repo, tip, ref):
-        return True, "merged into " + ref
-    contains = _run_git(repo, "branch", "-r", "--contains", branch)
-    if contains is not None and contains.returncode == 0:
-        remotes = (contains.stdout or "").split()
-        if any(ref in item for item in remotes):
-            return True, "merged into " + ref
-    return False, "tip is not an ancestor of " + ref + " (unmerged)"
-
-
 def _gh_merged_head_shas(repo: str, branch: str) -> list[str] | None:
     """Head SHAs of merged PRs for ``branch``. None when gh cannot answer.
 

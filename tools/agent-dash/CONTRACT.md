@@ -867,7 +867,7 @@ Run labels for a task are `ws<N>-<task-id>-<slug>`. `SKILL-PLAN.md` is the short
   "workers": {
     "<name>": {
       "enabled": true,
-      "kind": "muse | cursor | grok-build | pi | codex",
+      "kind": "muse | grok-build | pi | codex",
       "model": "<model id>",
       "extra_args": [],
       "cap": 25,
@@ -881,7 +881,7 @@ Run labels for a task are `ws<N>-<task-id>-<slug>`. `SKILL-PLAN.md` is the short
 }
 ```
 
-`kind` selects the launch, not the model string. `muse` runs `muse exec` with `--model`, `--workspace`, `--prompt-file`, `--session-id`, then `extra_args`. `cursor` runs `scripts/launch_grok.sh` so billed tokens are logged. `grok-build` runs `grok -p` with the prompt, a run rule appended, `-m`, `-s`, `--permission-mode bypassPermissions`, `--cwd`, and `--output-format plain`. `pi` runs `scripts/launch_pi.py` with the run folder's `pi/` outdir, `--model`, and `--tier <registry name>`, so one launcher starts every tier. `codex` runs `scripts/launch_codex.py` (headless `codex exec --ephemeral --json`) in the run folder itself with `--model`, `--tier <registry name>`, and `--reasoning-effort`, so the manifests source finds `codex-sessions.tsv` beside `out-<label>.md`. `columns` is the manifest row. `glm-sessions.tsv` uses `label`, `session_id`, `epoch`, `model`; `manifests.py` and `grok_cli.py` read that shape. `cost_rank` is a lower-is-cheaper hint. `auto` follows `auto_order`, not `cost_rank`.
+`kind` selects the launch, not the model string. `muse` runs `muse exec` with `--model`, `--workspace`, `--prompt-file`, `--session-id`, then `extra_args`. `cursor` is retired: no shipped tier uses it, and its launch path (`scripts/launch_grok.sh`) remains in code only. `grok-build` runs `grok -p` with the prompt, a run rule appended, `-m`, `-s`, `--permission-mode bypassPermissions`, `--cwd`, and `--output-format plain`. `pi` runs `scripts/launch_pi.py` with the run folder's `pi/` outdir, `--model`, and `--tier <registry name>`, so one launcher starts every tier. `codex` runs `scripts/launch_codex.py` (headless `codex exec --ephemeral --json`) in the run folder itself with `--model`, `--tier <registry name>`, and `--reasoning-effort`, so the manifests source finds `codex-sessions.tsv` beside `out-<label>.md`. `columns` is the manifest row. `glm-sessions.tsv` uses `label`, `session_id`, `epoch`, `model`; `manifests.py` and `grok_cli.py` read that shape. `cost_rank` is a lower-is-cheaper hint. `auto` follows `auto_order`, not `cost_rank`.
 
 Every launch writes the manifest row plus `<run-dir>/<label>.meta.json` (`label`, `tier`, `harness`, `model`, `pid`, `out_path`, `err_path`, `started_at`), and appends `tier` (and `harness` when the launcher knows it) after the declared columns. Sources read the declared columns positionally and take the tier from the fifth cell, then the meta file, then a model map, so a newer row never breaks an older reader and a Grok Build run reads the registry tier it launched under (`deepseek-flash`, `glm-flash`, `glm`) with harness `grok`, never `other`, and its model verbatim. `pi` rows record `pi-deepseek`/`pi-beam` for the same reason.
 
