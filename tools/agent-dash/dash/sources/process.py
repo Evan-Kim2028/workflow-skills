@@ -126,7 +126,8 @@ def poll(store, cfg, now: float) -> None:
     parents = [row for row in matched if row["ppid"] not in matched_pids]
     kids, rss = _children(table)
     for parent in parents:
-        label = label_from_pid(parent["pid"]) or tokens.get(parent["pid"], {}).get("label")
+        token = tokens.get(parent["pid"], {})
+        label = token.get("direct") or token.get("label")
         store.add_process_sample(
             {
                 "ts": now,
@@ -813,6 +814,9 @@ def _tokens_by_pid() -> dict:
         label = label_from_args(line)
         session_id = session_id_from_args(line)
         prompt_label = prompt_label_from_args(line)
+        # The pid's own label from its argv (the value a per-pid ``ps`` read
+        # would give), before the pi and launcher fallbacks below.
+        direct = label or prompt_label
         model = model_from_args(line)
         effort = reasoning_effort_from_args(line)
         pi_label = pi_worker_label_from_args(line)
@@ -833,6 +837,7 @@ def _tokens_by_pid() -> dict:
         if pid is not None:
             found[pid] = {
                 "label": label,
+                "direct": direct,
                 "session_id": session_id,
                 "prompt_label": prompt_label,
                 "model": model,
