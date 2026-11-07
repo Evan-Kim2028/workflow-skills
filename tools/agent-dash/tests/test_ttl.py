@@ -176,9 +176,18 @@ class TtlTest(unittest.TestCase):
         self.assertEqual(status, 200)
         tag = heads.get("ETag")
         time.sleep(0.15)
+        # SWR: the expired generation is served at once (same bytes, so a
+        # conditional GET is a 304) while one background refresh runs.
         status, heads2, _ = self._get("/api/concurrency?since=1", tag)
-        self.assertEqual(status, 200, "an expired generation recomputes")
-        self.assertNotEqual(heads2.get("ETag"), tag)
+        self.assertEqual(status, 304, "an expired generation is served, not waited on")
+        deadline = time.time() + 5.0
+        while time.time() < deadline:
+            time.sleep(0.05)
+            status, heads3, _ = self._get("/api/concurrency?since=1", tag)
+            if status == 200:
+                break
+        self.assertEqual(status, 200, "the background refresh shows a new generation")
+        self.assertNotEqual(heads3.get("ETag"), tag)
 
     def test_zero_disables(self):
         self.cfg["response_ttl_s"] = 0
@@ -240,9 +249,13 @@ class TtlTest(unittest.TestCase):
 
         def slow():
             calls.append(1)
-            release.wait(5.0)
+            if len(calls) > 1:
+                release.wait(5.0)
             return {"n": len(calls)}
 
+        # The first compute is instant: its measured time sets the refresh
+        # period (ttl, or 10x compute capped at 5 s), so a slow first
+        # compute would make this key's period longer than the test waits.
         payload, etag, _, kind = cache.get_or_compute(("k",), "snapshot", 0.05, slow)
         self.assertEqual(kind, "fresh")
         first_tag = etag or cache.cached_etag(("k",))
@@ -319,33 +332,115 @@ class TtlTest(unittest.TestCase):
             worker.join(2.0)
         self.assertFalse(worker.is_alive())
 
-    def test_hard_max_staleness_waits(self):
+    def test_idle_entry_serves_recent_generation_and_refreshes(self):
         cache = respcache_mod.ResponseCache()
-        payload, _, _, _ = cache.get_or_compute(("s",), "usage", 60.0, lambda: {"v": 1})
-        self.assertEqual(payload["v"], 1, "compute result served (plus generated_at)")
+        cache.get_or_compute(("s",), "usage", 0.05, lambda: {"v": 1})
         with cache._lock:
             entry = cache._entries[("s",)]
             entry.generated_at -= 10.0
+            entry.last_read -= respcache_mod.IDLE_S + 1.0
+        calls = []
+
+        def compute():
+            calls.append(1)
+            return {"v": 2}
+
+        payload, _, _, kind = cache.get_or_compute(("s",), "usage", 0.05, compute)
+        self.assertEqual(kind, "stale", "an idle key serves its recent generation at once")
+        self.assertEqual(payload["v"], 1)
+        deadline = time.time() + 5.0
+        while time.time() < deadline and cache.stats()["usage"]["recomputes"] < 2:
+            time.sleep(0.01)
+        self.assertEqual(calls, [1], "one background refresh for the reader")
+
+    def test_idle_entry_older_than_max_age_recomputes_inline(self):
+        cache = respcache_mod.ResponseCache()
+        cache.get_or_compute(("s",), "usage", 0.05, lambda: {"v": 1})
+        with cache._lock:
+            entry = cache._entries[("s",)]
+            entry.generated_at -= respcache_mod.IDLE_MAX_AGE_S + 1.0
+            entry.last_read -= respcache_mod.IDLE_S + 1.0
+        _, _, _, kind = cache.get_or_compute(("s",), "usage", 0.05, lambda: {"v": 2})
+        self.assertEqual(kind, "fresh", "too old to serve after a pause: the reader computes")
+        self.assertEqual(cache.stats()["usage"]["background"], 0)
+
+    def test_idle_gap_follows_measured_compute(self):
+        self.assertEqual(respcache_mod.idle_gap_s(0.5), respcache_mod.IDLE_S)
+        self.assertEqual(respcache_mod.idle_gap_s(25.0), 250.0)
+
+    def test_expired_entry_serves_stale_and_refreshes_in_background(self):
+        cache = respcache_mod.ResponseCache()
+        cache.get_or_compute(("s",), "usage", 0.05, lambda: {"v": 1})
+        with cache._lock:
+            entry = cache._entries[("s",)]
+            entry.generated_at -= 0.5
         release = threading.Event()
 
         def slow():
             release.wait(5.0)
             return {"v": 2}
 
-        bg: list = []
-        worker = threading.Thread(
-            target=lambda: bg.append(cache.get_or_compute(("s",), "usage", 0.05, slow))
-        )
-        worker.start()
-        time.sleep(0.15)
         started = time.perf_counter()
-        _, _, _, kind = cache.get_or_compute(("s",), "usage", 0.05, slow)
-        elapsed = time.perf_counter() - started
+        payload, _, _, kind = cache.get_or_compute(("s",), "usage", 0.05, slow)
+        self.assertLess(time.perf_counter() - started, 0.5, "the expired reader does not wait")
+        self.assertEqual(kind, "stale")
+        self.assertEqual(payload["v"], 1)
         release.set()
-        worker.join(5.0)
-        self.assertEqual(kind, "fresh", "past max staleness, readers wait for the recompute")
-        self.assertGreaterEqual(elapsed, 0.1)
-        self.assertTrue(bg and bg[0][0]["v"] == 2)
+        deadline = time.time() + 5.0
+        while time.time() < deadline:
+            payload, _, _, kind = cache.get_or_compute(("s",), "usage", 0.05, slow)
+            if payload["v"] == 2:
+                break
+            time.sleep(0.02)
+        self.assertEqual(payload["v"], 2, "the next read sees the refreshed generation")
+        self.assertEqual(cache.stats()["usage"]["background"], 1)
+
+    def test_window_roll_serves_previous_cell_without_waiting(self):
+        cache = respcache_mod.ResponseCache()
+        key = lambda since: respcache_mod.canonical_key("usage", {"since": since}, None)
+        cache.get_or_compute(key(3000), "usage", 0.05, lambda: {"v": 1})
+        time.sleep(0.1)
+        release = threading.Event()
+
+        def slow():
+            release.wait(5.0)
+            return {"v": 2}
+
+        started = time.perf_counter()
+        payload, _, _, kind = cache.get_or_compute(key(3030), "usage", 0.05, slow)
+        self.assertLess(time.perf_counter() - started, 0.5, "a rolled window does not wait")
+        self.assertEqual(kind, "stale")
+        self.assertEqual(payload["v"], 1)
+        release.set()
+        deadline = time.time() + 5.0
+        while time.time() < deadline:
+            payload, _, _, _ = cache.get_or_compute(key(3030), "usage", 0.05, slow)
+            if payload["v"] == 2:
+                break
+            time.sleep(0.02)
+        self.assertEqual(payload["v"], 2)
+        self.assertEqual(cache.stats()["usage"]["background"], 1, "one refresh for the rolled cell")
+
+    def test_background_refreshes_are_capped(self):
+        cache = respcache_mod.ResponseCache()
+        keys = [("k", i) for i in range(respcache_mod.BG_MAX + 3)]
+        for key in keys:
+            cache.get_or_compute(key, "usage", 0.05, lambda: {"v": 1})
+        with cache._lock:
+            for key in keys:
+                cache._entries[key].generated_at -= 0.5
+        release = threading.Event()
+
+        def slow():
+            release.wait(5.0)
+            return {"v": 2}
+
+        for key in keys:
+            cache.get_or_compute(key, "usage", 0.05, slow)
+        stats = cache.stats()["usage"]
+        release.set()
+        self.assertEqual(stats["background"], respcache_mod.BG_MAX, "never more refreshes than the cap")
+        self.assertEqual(stats["bg_skipped"], 3)
 
     def test_key_quantizes_windows(self):
         key = lambda params: respcache_mod.canonical_key("snapshot", params, None)
@@ -649,6 +744,30 @@ class CountsEquivalenceTest(unittest.TestCase):
                 self.assertEqual(
                     _billed_total(prev_summed["tokens"]), legacy_prev["tokens"]
                 )
+
+
+class RefreshPeriodTest(unittest.TestCase):
+    """Refresh period scales with measured compute, within the ceilings."""
+
+    def test_cheap_key_keeps_ttl(self):
+        self.assertEqual(respcache_mod.refresh_period(1.5, 0.01, 5.0), 1.5)
+
+    def test_expensive_live_key_is_capped_at_five_seconds(self):
+        self.assertEqual(respcache_mod.refresh_period(1.5, 3.0, respcache_mod.MAX_STALE_S), 5.0)
+
+    def test_planning_key_waits_ten_computes(self):
+        ceiling = respcache_mod.max_age_for("ws/progress")
+        self.assertEqual(respcache_mod.refresh_period(1.5, 2.5, ceiling), 25.0)
+        self.assertEqual(respcache_mod.refresh_period(1.5, 25.0, ceiling), ceiling)
+
+    def test_budget_skips_planning_refreshes_past_half_a_core(self):
+        cache = respcache_mod.ResponseCache()
+        now = time.time()
+        with cache._lock:
+            ok = [cache._bg_budget_ok("ws/progress", 10.0, now) for _ in range(4)]
+            live = cache._bg_budget_ok("snapshot", 10.0, now)
+        self.assertEqual(ok, [True, True, True, False])
+        self.assertTrue(live, "live keys are exempt from the global budget")
 
 
 if __name__ == "__main__":

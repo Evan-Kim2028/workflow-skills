@@ -78,14 +78,14 @@ Each item has an id, a step sentence, a status, a reversible flag, and condition
 
 ## The worker registry
 
-Workers come from a registry: `tools/agent-dash/workers.example.json`, replaced on one machine by a gitignored `workers.local.json` (or `AGENT_DASH_WORKERS`). Each worker has a kind (muse, cursor-agent or Grok Build CLI), a model, a concurrency cap and quota patterns. A lane asks for `default` (the registry default), a worker name, or `auto`. `auto` takes the first worker in `auto_order` that is under its cap and not cooling down; when a run fails on a quota error, that worker cools down and an `auto` or `default` lane relaunches on the next one.
+Workers come from a registry: `tools/agent-dash/workers.example.json`, replaced on one machine by a gitignored `workers.local.json` (or `AGENT_DASH_WORKERS`). Each worker has a kind (muse, pi, codex or grok-build), a model, a concurrency cap and quota patterns. The shipped file is the reference for the tiers; `cursor` is retired and no shipped tier uses it. A lane asks for `default` (the registry default), a worker name, or `auto`. `auto` takes the first worker in `auto_order` that is under its cap, not cooling down and whose model is priced in `catalog/prices.json` (an unpriced tier is skipped with a note); when a run fails on a quota error, that worker cools down and an `auto` or `default` lane relaunches on the next one.
 
 `ws-wave` reads `defaultTier` and `reviewTier`. Both default to `default`, the registry default worker. `reviewTier` falls back to `defaultTier` when you omit it. A lane's own `tier` overrides the build tier. The review tier stays `reviewTier`. A tier is a registry worker name, `default`, or `auto`.
 
 `run_worker.sh` runs `run_worker.py`, which reads the worker registry (`workers.example.json`, replaced by `workers.local.json` or `AGENT_DASH_WORKERS`).
 
 - A `muse` worker runs `muse exec` with its model and records a session id in `muse-sessions.tsv`.
-- A `cursor` worker runs `launch_grok.sh`, which runs `cursor-agent` and appends one billed usage line.
+- A `pi` or `codex` worker runs `launch_pi.py` or `launch_codex.py` and writes its manifest row and generic usage lines.
 - A `grok-build` worker runs the Grok CLI with the prompt plus the run rule.
 
 An unknown tier fails with `unknown-tier`. A disabled worker fails with `disabled`.

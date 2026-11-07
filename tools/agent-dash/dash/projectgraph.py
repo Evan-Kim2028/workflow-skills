@@ -377,8 +377,3 @@ def compute_depths(ids: list[str], edges: list[dict]) -> dict[str, int]:
     for ws in sorted(ids):
         visit(ws)
     return {ws: depth.get(ws, 0) for ws in ids}
-
-
-def structure_key(mtimes: dict[str, tuple]) -> tuple:
-    """Hashable cache key for the graph structure: sorted id/mtime pairs."""
-    return tuple(sorted((ws, times) for ws, times in mtimes.items()))

@@ -31,7 +31,7 @@ moves it), and both paths match after each ship.
 (`dash/bundles.py` `_stable_tool_dir`), so those commands run the
 release CLI. The worker launcher still runs the main checkout.
 
-## Cutover (parent, once; restarts the live server, needs owner go-ahead)
+## Cutover (already done on the live machine; kept for a rebuild, restarts the live server, needs owner go-ahead)
 
 1. Main checkout at `origin/main`:
    ```bash

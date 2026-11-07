@@ -138,10 +138,6 @@ def _cache_key(store, scope: str, rules_hash: str, ignored) -> tuple:
     return (scope, seq, rules_hash, ignore_key, _plans_stamp(), _taskmap_stamp(), db_key)
 
 
-def _billed(event: dict) -> int:
-    return sum(int(event.get(part) or 0) for part in ("input", "output", "cache_read", "cache_write"))
-
-
 def _overlap_hours(run: dict, since: float | None, until: float, now: float) -> float:
     """Run hours inside ``[since, until]`` (open runs end now)."""
     try:

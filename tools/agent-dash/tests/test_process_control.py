@@ -701,5 +701,33 @@ class WaitForChildTest(unittest.TestCase):
         self.assertGreaterEqual(agent_dash.CHILD_START_S, 20.0)
 
 
+class DetectionUnderLoadTest(unittest.TestCase):
+    """A busy server that misses the health deadline is still the running server."""
+
+    def test_listener_is_found_when_health_does_not_answer(self):
+        import agent_dash
+
+        with mock.patch.object(agent_dash, "_listener_pid", return_value=4242), mock.patch.object(
+            agent_dash, "pid_exists", return_value=True
+        ), mock.patch.object(agent_dash, "_serves_dashboard", return_value=True), mock.patch.object(
+            agent_dash, "_probe_health", return_value=None
+        ):
+            self.assertEqual(agent_dash._dashboard_on_port(), (4242, None))
+
+    def test_a_port_held_by_something_else_is_not_the_dashboard(self):
+        import agent_dash
+
+        with mock.patch.object(agent_dash, "_listener_pid", return_value=4242), mock.patch.object(
+            agent_dash, "pid_exists", return_value=True
+        ), mock.patch.object(agent_dash, "_serves_dashboard", return_value=False):
+            self.assertEqual(agent_dash._dashboard_on_port(), (None, None))
+
+    def test_free_port_is_not_the_dashboard(self):
+        import agent_dash
+
+        with mock.patch.object(agent_dash, "_listener_pid", return_value=None):
+            self.assertEqual(agent_dash._dashboard_on_port(), (None, None))
+
+
 if __name__ == "__main__":
     unittest.main()

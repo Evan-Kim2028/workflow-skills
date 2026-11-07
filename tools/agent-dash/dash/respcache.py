@@ -17,13 +17,22 @@ Semantics (see CONTRACT.md, docs/perf.md):
   the viewer slot is empty by construction (``_VIEWER_HEADERS`` names
   the set; add a header there the day content varies by one).
 - Fresh (age <= ttl): serve immediately.
-- Expired, previous result exists: the first request recomputes
-  (single-flight); concurrent requests during the recompute get the
-  previous result instead of waiting (stale-while-revalidate), unless
-  it is older than the hard max staleness (5 s), in which case they
-  wait for the recompute.
+- Expired, previous result exists: every request gets that result at
+  once (stale-while-revalidate, no wait), and one background refresh
+  per key runs (single-flight per key; at most ``BG_MAX`` refreshes
+  run at once, extra expiries are served stale and retried on the next
+  read). A page that polls is always the reader that starts the refresh,
+  so it never pays a recompute inline.
+- Sliding window roll (``since`` without ``until``): a new 30 s cell adopts
+  the previous cell's generation, so the roll serves at once and refreshes
+  in the background like any expired entry.
+- Idle (no reader for ``idle_gap_s``, at least ``IDLE_S``) with an
+  expired generation no older than ``IDLE_MAX_AGE_S``: the reader gets it
+  at once with its age, and one refresh starts. Older than that, the
+  reader computes inline. A pause therefore never costs a cold compute
+  wait for a key that has a recent generation.
 - First-ever request (no previous result): single-flight, waiters
-  block like ``dash.singleflight`` (there is nothing stale to serve).
+  block like ``dash.singleflight`` (there is nothing to serve).
 - Window-pinned requests (explicit ``since`` AND ``until``) use a
   longer TTL (10 s): a fixed window's sums move only on writes.
 - ``response_ttl_s=0`` disables the cache: every request recomputes
@@ -53,9 +62,45 @@ import time
 #: Default TTL seconds when the config carries no ``response_ttl_s``.
 DEFAULT_TTL_S = 1.5
 
-#: Hard cap: a cached generation older than this is never served stale.
-#: Expired readers past this age wait for the recompute instead.
+#: Freshness contract bound (product rule: a change shows within 5 s).
+#: Served age is compute time plus one page tick; a serve older than this
+#: is counted in the ``max_age_ms``/``over_max`` stats, so the bound is measured.
 MAX_STALE_S = 5.0
+
+#: A key no reader has touched for this long is idle. The gap scales with
+#: the key's measured compute (``idle_gap_s``): a 25 s compute is idle after
+#: 250 s, not 30 s, so a pause does not turn it cold.
+IDLE_S = 30.0
+
+#: An idle key's last generation is still served (with its age, and one
+#: background refresh starts) for up to this long. Older than this, the
+#: reader computes inline: nothing older than two minutes goes to a person.
+IDLE_MAX_AGE_S = 120.0
+
+#: At most this many background refreshes run at once across all keys.
+BG_MAX = 4
+
+#: A key's refresh period is at least this many times its last compute
+#: time, so one key's background recomputes take at most 1/10 of a core.
+#: The period is clamped to the endpoint's freshness ceiling (below) and
+#: never falls under the TTL.
+REFRESH_PERIOD_X = 10.0
+
+#: Freshness ceiling per endpoint: the served age bound is the refresh
+#: period plus one compute. Endpoints not listed use MAX_STALE_S, the
+#: product rule for live status, so their period is capped at 5 s and the
+#: 10% share yields to freshness there (their computes are kept short).
+#: Planning series, which the page refetches only when a plan stamp moves,
+#: may age longer.
+ENDPOINT_MAX_AGE_S: dict = {
+    "ws/progress": 60.0,
+}
+
+#: Global background budget for ceilings above MAX_STALE_S: compute
+#: seconds started in a rolling BG_WINDOW_S, at most BG_BUDGET_S (half a
+#: core). Live keys are exempt, so this never delays a 5 s refresh.
+BG_WINDOW_S = 60.0
+BG_BUDGET_S = 30.0
 
 #: TTL for window-pinned requests (explicit since AND until): a fixed
 #: window's sums move only on writes, never with the clock.
@@ -173,8 +218,30 @@ def canonical_key(endpoint: str, params: dict, headers=None) -> tuple:
     return (endpoint, tuple(items), viewer)
 
 
+def _sliding_family(key: tuple):
+    """``(family, cell)`` for a sliding-window key (``since`` without ``until``).
+
+    The page's ``since`` rolls onto a new 30 s cell every half minute, so
+    each roll is a new key. ``family`` is the key with ``since`` removed;
+    ``cell`` is the grid cell. None for every other key.
+    """
+    try:
+        endpoint, items, viewer = key
+        names = dict(items)
+        if "since" not in names or "until" in names:
+            return None
+        cell = names["since"]
+        if not isinstance(cell, int):
+            return None
+        family = (endpoint, tuple(item for item in items if item[0] != "since"), viewer)
+        return family, cell
+    except Exception:
+        return None
+
+
 class _Entry:
-    __slots__ = ("payload", "etag", "generated_at", "computing", "event")
+    __slots__ = ("payload", "etag", "generated_at", "computing", "event", "last_read",
+                 "compute_s")
 
     def __init__(self):
         self.payload = None
@@ -182,6 +249,37 @@ class _Entry:
         self.generated_at = 0.0
         self.computing = False
         self.event = None
+        self.last_read = 0.0
+        #: Wall seconds of the last compute for this key (0 until one ran).
+        self.compute_s = 0.0
+
+
+def max_age_for(endpoint: str) -> float:
+    """Freshness ceiling for one endpoint (seconds)."""
+    return ENDPOINT_MAX_AGE_S.get(endpoint, MAX_STALE_S)
+
+
+def idle_gap_s(compute_s: float) -> float:
+    """Idle threshold for one key: ``max(IDLE_S, 10 x its last compute)``."""
+    try:
+        scaled = REFRESH_PERIOD_X * max(0.0, float(compute_s))
+    except (TypeError, ValueError):
+        scaled = 0.0
+    return max(IDLE_S, scaled)
+
+
+def refresh_period(ttl: float, compute_s: float, max_age: float) -> float:
+    """Age after which a served generation is due a background refresh.
+
+    ``max(ttl, min(REFRESH_PERIOD_X * compute_s, max_age))``: cheap keys
+    keep the TTL, expensive keys wait ten computes, and no key waits past
+    its freshness ceiling. Pure function of its inputs.
+    """
+    try:
+        scaled = min(REFRESH_PERIOD_X * max(0.0, float(compute_s)), float(max_age))
+    except (TypeError, ValueError):
+        scaled = 0.0
+    return max(float(ttl), scaled)
 
 
 class ResponseCache:
@@ -190,7 +288,12 @@ class ResponseCache:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._entries: dict = {}
+        #: family -> (cell, key) of the newest sliding-window key (see _sliding_family).
+        self._families: dict = {}
         self._stats: dict = {}
+        self._bg_slots = threading.BoundedSemaphore(BG_MAX)
+        #: (start time, estimated compute seconds) of recent background refreshes.
+        self._bg_log: list = []
 
     def _record(self, endpoint: str, outcome: str) -> None:
         try:
@@ -200,8 +303,21 @@ class ResponseCache:
         except Exception:
             pass
 
+    def _note_age(self, endpoint: str, age_s: float) -> None:
+        """Track the largest served age and how often it passed MAX_STALE_S."""
+        try:
+            age_ms = max(0.0, age_s) * 1000.0
+            with self._lock:
+                bucket = self._stats.setdefault(endpoint, {})
+                if age_ms > bucket.get("max_age_ms", 0.0):
+                    bucket["max_age_ms"] = round(age_ms, 1)
+                if age_s > MAX_STALE_S:
+                    bucket["over_max"] = bucket.get("over_max", 0) + 1
+        except Exception:
+            pass
+
     def stats(self) -> dict:
-        """Per-endpoint ``{hits, stale, recomputes, waits, hit_ratio}``."""
+        """Per-endpoint counts, hit ratio and the served-age bound."""
         try:
             with self._lock:
                 table = {name: dict(bucket) for name, bucket in self._stats.items()}
@@ -217,8 +333,14 @@ class ResponseCache:
                 "hits": hits,
                 "stale": stale,
                 "recomputes": recomputes,
+                "background": bucket.get("background", 0),
+                "bg_skipped": bucket.get("bg_skipped", 0),
                 "waits": bucket.get("waits", 0),
                 "hit_ratio": ((hits + stale) / serves) if serves else 0.0,
+                "max_age_ms": bucket.get("max_age_ms", 0.0),
+                "over_max": bucket.get("over_max", 0),
+                "compute_last_ms": bucket.get("compute_last_ms", 0.0),
+                "compute_max_ms": bucket.get("compute_max_ms", 0.0),
             }
         return out
 
@@ -250,74 +372,173 @@ class ResponseCache:
             pass
         return None
 
+    def _publish(self, entry: _Entry, payload, generated_at: float) -> None:
+        """Install a new generation (caller holds the lock). Resets the ETag:
+        the old one names the old bytes."""
+        entry.payload = payload
+        entry.generated_at = generated_at
+        entry.etag = None
+
+    def _run_compute(self, endpoint: str, entry: _Entry, compute):
+        """Run ``compute`` for ``entry`` and clear its computing flag.
+
+        Returns ``(payload, generated_at)`` on success. On failure returns
+        ``(None, None)`` after clearing the flag, so waiters and the next
+        reader retry instead of hanging. Runs outside the lock.
+        """
+        started = time.perf_counter()
+        try:
+            fresh = compute()
+        except Exception:
+            with self._lock:
+                entry.computing = False
+                if entry.event is not None:
+                    entry.event.set()
+            raise
+        generated_at = time.time()
+        if isinstance(fresh, dict) and "generated_at" not in fresh:
+            try:
+                fresh["generated_at"] = generated_at
+            except Exception:
+                pass
+        elapsed_s = time.perf_counter() - started
+        with self._lock:
+            self._publish(entry, fresh, generated_at)
+            entry.compute_s = elapsed_s
+            entry.computing = False
+            if entry.event is not None:
+                entry.event.set()
+        self._record(endpoint, "recomputes")
+        self._note_compute(endpoint, elapsed_s * 1000.0)
+        return fresh, generated_at
+
+    def _note_compute(self, endpoint: str, ms: float) -> None:
+        """Track the slowest and last compute time per endpoint (stats only)."""
+        try:
+            with self._lock:
+                bucket = self._stats.setdefault(endpoint, {})
+                bucket["compute_last_ms"] = round(ms, 1)
+                if ms > bucket.get("compute_max_ms", 0.0):
+                    bucket["compute_max_ms"] = round(ms, 1)
+        except Exception:
+            pass
+
+    def _bg_budget_ok(self, endpoint: str, est_s: float, now: float) -> bool:
+        """Global budget for non-live keys. Caller holds the lock.
+
+        Live keys (ceiling MAX_STALE_S) are exempt. Others start a refresh
+        only while the compute seconds started in the last BG_WINDOW_S,
+        plus this one, stay within BG_BUDGET_S.
+        """
+        if max_age_for(endpoint) <= MAX_STALE_S:
+            return True
+        self._bg_log = [item for item in self._bg_log if now - item[0] <= BG_WINDOW_S]
+        spent = sum(item[1] for item in self._bg_log)
+        if spent + est_s > BG_BUDGET_S:
+            return False
+        self._bg_log.append((now, est_s))
+        return True
+
+    def _background(self, endpoint: str, entry: _Entry, compute) -> None:
+        """Body of one background refresh thread. Never raises."""
+        try:
+            self._run_compute(endpoint, entry, compute)
+        except Exception:
+            self._record(endpoint, "bg_failed")
+        finally:
+            self._bg_slots.release()
+
     def get_or_compute(self, key: tuple, endpoint: str, ttl: float, compute,
                        refresh=None, *, wait_timeout_s=None):
         """Serve-or-recompute one key under the SWR protocol.
 
-        ``compute`` builds the payload dict (runs outside the lock);
+        ``compute`` builds the payload dict (runs outside the lock; on a
+        background thread when this call only starts a refresh);
         ``refresh(payload, now)`` optionally refreshes volatile clock
         fields on the served copy (the stored generation keeps its
         ETag). Returns ``(payload, etag, generated_at, kind)`` where
-        kind is ``hit``, ``stale``, or ``fresh``. Raises only when
-        ``compute`` raises AND no servable generation exists; when a
-        servable generation exists a compute failure serves it stale.
+        kind is ``hit`` (fresh), ``stale`` (served while a refresh runs
+        or was started), or ``fresh`` (computed or awaited here). Raises
+        only when ``compute`` raises AND no servable generation exists.
         """
         now = time.time()
         # Nominal ttl, desynchronised per key so aligned expiries do
         # not convoy on the store lock.
         ttl = effective_ttl(key, ttl)
+        start_bg = False
+        skipped = False
         with self._lock:
             entry = self._entries.get(key)
             if entry is None:
                 if len(self._entries) > 512:
                     self._entries.clear()
+                    self._families.clear()
                 entry = _Entry()
                 self._entries[key] = entry
-            if entry.payload is not None and not entry.computing:
+                self._adopt_neighbour(key, entry, now)
+            idle = (now - entry.last_read) > idle_gap_s(entry.compute_s) if entry.last_read else True
+            entry.last_read = now
+            if entry.payload is not None:
                 age = now - entry.generated_at
-                if age <= ttl:
+                period = refresh_period(ttl, entry.compute_s, max_age_for(endpoint))
+                if age <= period:
+                    kind = "hit"
                     payload, etag, generated = entry.payload, entry.etag, entry.generated_at
-                    fresh = True
-                elif age <= MAX_STALE_S:
-                    payload, etag, generated = entry.payload, entry.etag, entry.generated_at
-                    fresh = False
-                else:
+                elif idle and age > IDLE_MAX_AGE_S and not entry.computing:
+                    # Too old to serve after a pause: this reader computes inline.
+                    entry.computing = True
+                    entry.event = threading.Event()
+                    kind = "compute"
                     payload = None
-                    fresh = False
-                if payload is None:
-                    fresh = False
-            else:
-                payload = None
-                fresh = False
-            if payload is not None and fresh:
-                kind = "hit"
-            elif payload is not None:
-                # Expired but servable: this request recomputes while
-                # serving the previous generation (SWR). Only one
-                # request becomes the computer; concurrent arrivals see
-                # ``computing`` below and serve stale without waiting.
-                entry.computing = True
-                entry.event = threading.Event()
-                kind = "stale-then-recompute"
+                else:
+                    # Expired (or idle but recent): serve the previous
+                    # generation now, with its age. Start one background
+                    # refresh unless one is already running.
+                    kind = "stale"
+                    payload, etag, generated = entry.payload, entry.etag, entry.generated_at
+                    if not entry.computing:
+                        if not self._bg_budget_ok(endpoint, entry.compute_s, now):
+                            skipped = True
+                        elif self._bg_slots.acquire(blocking=False):
+                            entry.computing = True
+                            entry.event = threading.Event()
+                            start_bg = True
+                        else:
+                            skipped = True
             elif entry.computing:
+                kind = "wait"
                 event = entry.event
-                event_stale = entry
-                kind = "wait-or-stale"
+                payload = None
             else:
                 entry.computing = True
                 entry.event = threading.Event()
                 kind = "compute"
+                payload = None
         if kind == "hit":
             self._record(endpoint, "hits")
             return self._serve_copy(payload, etag, generated, refresh, now, "hit")
-        if kind == "wait-or-stale":
-            age = now - event_stale.generated_at
-            if event_stale.payload is not None and age <= MAX_STALE_S:
-                self._record(endpoint, "stale")
-                return self._serve_copy(
-                    event_stale.payload, event_stale.etag,
-                    event_stale.generated_at, refresh, now, "stale",
+        if kind == "stale":
+            self._record(endpoint, "stale")
+            if skipped:
+                self._record(endpoint, "bg_skipped")
+            self._note_age(endpoint, now - generated)
+            if start_bg:
+                self._record(endpoint, "background")
+                thread = threading.Thread(
+                    target=self._background, args=(endpoint, entry, compute),
+                    name=f"respcache-{endpoint}", daemon=True,
                 )
+                try:
+                    thread.start()
+                except Exception:
+                    # Could not start: release the slot and the flag, serve stale.
+                    self._bg_slots.release()
+                    with self._lock:
+                        entry.computing = False
+                        if entry.event is not None:
+                            entry.event.set()
+            return self._serve_copy(payload, etag, generated, refresh, now, "stale")
+        if kind == "wait":
             self._record(endpoint, "waits")
             wait_s = 30.0 if wait_timeout_s is None else max(0.0, float(wait_timeout_s))
             completed = event.wait(wait_s)
@@ -335,37 +556,45 @@ class ResponseCache:
                 key, endpoint, ttl, compute, refresh,
                 wait_timeout_s=wait_timeout_s,
             )
-        # This request computes (fresh, or expired past serving).
+        # kind == "compute": this request computes (first-ever or idle).
         try:
-            fresh_payload = compute()
+            fresh_payload, generated_at = self._run_compute(endpoint, entry, compute)
         except Exception:
             with self._lock:
-                entry.computing = False
-                if entry.event is not None:
-                    entry.event.set()
                 fallback = entry.payload
                 fetag = entry.etag
                 fgen = entry.generated_at
             if fallback is not None:
                 self._record(endpoint, "stale")
+                self._note_age(endpoint, time.time() - fgen)
                 return self._serve_copy(fallback, fetag, fgen, refresh, time.time(), "stale")
             raise
-        generated_at = time.time()
-        if isinstance(fresh_payload, dict) and "generated_at" not in fresh_payload:
-            try:
-                fresh_payload["generated_at"] = generated_at
-            except Exception:
-                pass
-        self._record(endpoint, "recomputes")
-        with self._lock:
-            entry.payload = fresh_payload
-            entry.generated_at = generated_at
-            # ETag is set by the caller via ``store`` (it hashes the
-            # served bytes); when absent, ``serve`` hashes here.
-            entry.computing = False
-            if entry.event is not None:
-                entry.event.set()
         return self._serve_copy(fresh_payload, None, generated_at, refresh, generated_at, "fresh")
+
+    def _adopt_neighbour(self, key: tuple, entry: _Entry, now: float) -> None:
+        """Seed a new sliding-window key from the previous cell's generation.
+
+        Caller holds the lock. The adopted generation keeps its own
+        (older) ``generated_at``, so it reads as expired: the reader gets
+        it at once and one background refresh runs for the new cell. The
+        served window's edge may sit up to one more 30 s cell back than an
+        exact ``since``; the grid already tolerates that skew within a cell.
+        """
+        found = _sliding_family(key)
+        if found is None:
+            return
+        family, cell = found
+        prev = self._families.get(family)
+        self._families[family] = (cell, key)
+        if prev is None or cell - prev[0] != 1:
+            return
+        neighbour = self._entries.get(prev[1])
+        if neighbour is None or neighbour.payload is None:
+            return
+        entry.payload = neighbour.payload
+        entry.etag = neighbour.etag
+        entry.generated_at = neighbour.generated_at
+        entry.last_read = now  # read now, so not idle: it refreshes in background
 
     def _serve_copy(self, payload, etag, generated_at, refresh, now, kind):
         if refresh is not None and isinstance(payload, dict):
@@ -377,14 +606,19 @@ class ResponseCache:
             payload = dict(payload)
         return (payload, etag, generated_at, kind)
 
-    def store_etag(self, key: tuple, etag) -> None:
-        """Record the served-bytes ETag for a generation (stable 304s)."""
+    def store_etag(self, key: tuple, etag, generated=None) -> None:
+        """Record the served-bytes ETag for a generation (stable 304s).
+
+        ``generated`` names the generation the bytes came from; a newer
+        generation published meanwhile keeps its own (unset) ETag.
+        """
         try:
             with self._lock:
                 entry = self._entries.get(key)
-                if entry is not None and entry.payload is not None:
-                    entry.etag = etag
+                if entry is None or entry.payload is None:
+                    return
+                if generated is not None and entry.generated_at != generated:
+                    return
+                entry.etag = etag
         except Exception:
             pass
-
-

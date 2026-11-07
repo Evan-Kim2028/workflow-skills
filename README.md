@@ -35,6 +35,13 @@ Open http://127.0.0.1:8765 . The ten-minute path with sample data is [docs/quick
 
 The lead loop is [Running a workstream end to end](tools/agent-dash/docs/workstream-lead.md).
 
+## Agents and maintainers
+
+- Rules for agents working in this repo (tests, worktrees, shipping, privacy): [AGENTS.md](AGENTS.md).
+- The live dashboard runs from a release of `origin/main`: [live-release](tools/agent-dash/docs/live-release.md).
+- Worker prompts, scratch, and logs: the "Worker prompts, scratch, logs" section of AGENTS.md.
+- Worker tiers: [workers.example.json](tools/agent-dash/workers.example.json) is the reference.
+
 ## Links
 
 - [docs/quickstart.md](docs/quickstart.md)
@@ -44,3 +51,5 @@ The lead loop is [Running a workstream end to end](tools/agent-dash/docs/workstr
 - [Run DeepSeek through Grok Build](tools/agent-dash/docs/integrate.md#run-deepseek-through-grok-build) ([config](docs/configuration.md#grok-configdeepseekexampletoml), [key-free template](tools/agent-dash/catalog/grok-config.deepseek.example.toml))
 - [tools/agent-dash/docs/linear.md](tools/agent-dash/docs/linear.md)
 - [tools/agent-dash/CONTRACT.md](tools/agent-dash/CONTRACT.md)
+- [tools/agent-dash/docs/live-release.md](tools/agent-dash/docs/live-release.md)
+- [tools/agent-dash/docs/log-archive.md](tools/agent-dash/docs/log-archive.md)
