@@ -145,5 +145,43 @@ class CanonicalLabelTask(unittest.TestCase):
 
 
 
+class TaskResolverTests(unittest.TestCase):
+    """``task_resolver`` answers exactly what ``task_of`` answers, memoized per label."""
+
+    PLAN = ["WS11.key-adopt", "WS11.gold", "WS11.gold-retire", "WS2.Alpha", "T-rename", "WS7.A1"]
+    TABLE = {"WS11": {"legacy run": "WS11.gold", "/^nightly-.*/": "WS11.key-adopt"}}
+    LABELS = [
+        "", "ws11-exec-key-adopt", "ws11-exec-gold-retire-r2", "ws11-plan-gold",
+        "ws11-exec-unknown-slug", "WS11 key-adopt retry", "legacy run", "nightly-7",
+        "ws2-exec-alpha", "WS2 alpha 3", "ws7-gate-a1", "ws7-exec-a1-x", "t-rename",
+        "t-rename2", "ws5-exec-gold", "rename of T-rename", "ws99-exec-plain",
+    ]
+
+    def test_resolver_matches_task_of_for_every_label_and_workstream(self):
+        from dash.taskmatch import task_of, task_resolver
+
+        for ws in ("WS11", "WS2", "WS7", "WS5", None):
+            resolve = task_resolver(ws, self.TABLE, self.PLAN)
+            for label in self.LABELS:
+                with self.subTest(ws=ws, label=label):
+                    self.assertEqual(resolve(label), task_of(label, ws, self.TABLE, self.PLAN))
+                    self.assertEqual(resolve(label), task_of(label, ws, self.TABLE, self.PLAN))
+
+    def test_resolver_without_plan_ids_matches_task_of(self):
+        from dash.taskmatch import task_of, task_resolver
+
+        resolve = task_resolver("WS11", None, ())
+        for label in self.LABELS:
+            self.assertEqual(resolve(label), task_of(label, "WS11", None, ()))
+
+    def test_plan_probe_rejects_only_labels_without_a_plan_text(self):
+        from dash.taskmatch import _plan_probe
+
+        probe = _plan_probe(self.PLAN)
+        self.assertIsNotNone(probe.search("run for ws11.key-adopt now"))
+        self.assertIsNone(probe.search("ws99-exec-plain"))
+        self.assertIsNone(_plan_probe(()))
+
+
 if __name__ == "__main__":
     unittest.main()
