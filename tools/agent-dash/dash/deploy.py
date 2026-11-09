@@ -535,6 +535,17 @@ def deploy(
         wait_settled(url)
         # Workers die during the restart window; reap again so a transient
         # dead-pid row does not fail the health gate on the new release.
+        # Force immediate reap (idle_s=0) so a worker that died seconds ago
+        # does not report stale running during the new release's check.
+        try:
+            from dash.store import Store as _Store
+            import time as _time
+            _db = Path(state_dir) / "dash.sqlite"
+            if _db.is_file():
+                with _Store(_db) as _store:
+                    _store.reap_dead_runs(_time.time(), idle_s=0)
+        except Exception:
+            pass
         reap_stale_rows(state_dir)
     ok, reason = run_check(tool_dir_of(release))
     if not ok:
