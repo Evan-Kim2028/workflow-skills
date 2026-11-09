@@ -209,7 +209,10 @@ class PlanRenderTests(unittest.TestCase):
         (root / "visuals.html").write_text("<header><p class=\"thesis\">t</p></header>\n")
         page = planrender.render(root)
         self.assertIn("Planning", page)
-        self.assertIn("not counted", page)
+        self.assertIn("Plan task", page)
+        self.assertNotIn("not counted", page)
+        self.assertNotIn('id="ws9-progress"', page)
+        self.assertNotIn("data-plan-progress", page)
 
 
 if __name__ == "__main__":

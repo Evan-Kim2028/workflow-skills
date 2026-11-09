@@ -583,57 +583,6 @@
 .plan-view .plan-tab[aria-selected="true"] { color:var(--fg); border-bottom-color:var(--s1); }
 .plan-view .plan-main { min-width:0; }
 
-.plan-view .plan-progress { margin-top:8px; }
-.plan-view .plan-progress .pp-legend { display:flex; flex-wrap:wrap; gap:8px 14px; font-size:12.5px; color:var(--fg2); margin:0 0 10px; }
-.plan-view .plan-progress .pp-legend > span { display:inline-flex; align-items:center; gap:6px; }
-.plan-view .plan-progress .pp-sum { font:12.5px var(--f-mono); color:var(--fg2); margin:0 0 8px; }
-.plan-view .plan-progress .pp-scroll { overflow-x:auto; border:1px solid var(--line); border-radius:10px; background:var(--surface-2); }
-.plan-view .plan-progress .pp-dag { position:relative; min-width:1000px; display:grid; gap:30px; padding:14px; }
-.plan-view .plan-progress .pp-edges { position:absolute; left:0; top:0; pointer-events:none; }
-.plan-view .plan-progress .pp-edges path { fill:none; stroke:var(--fg3); stroke-width:1.4; opacity:.7; }
-.plan-view .plan-progress .pp-col { display:flex; flex-direction:column; gap:12px; position:relative; z-index:1; min-width:0; }
-.plan-view .plan-progress .pp-colh { font-size:12px; font-weight:700; color:var(--fg2); text-transform:uppercase; letter-spacing:.04em; }
-.plan-view .plan-progress .pp-node { background:var(--surface); border:1.5px solid var(--line); border-radius:10px; padding:8px 10px; }
-.plan-view .plan-progress .pp-node.s-done { border-color:var(--good); }
-.plan-view .plan-progress .pp-node.s-prog { border-color:var(--s5); }
-.plan-view .plan-progress .pp-node.s-live { border-color:var(--s1); box-shadow:0 0 0 2px color-mix(in srgb, var(--s1) 25%, transparent); }
-.plan-view .plan-progress .pp-node h4 { margin:0 0 2px; font-size:13px; }
-.plan-view .plan-progress .pp-node .m { font-size:11.5px; color:var(--fg3); margin-bottom:6px; }
-.plan-view .plan-progress .pp-live { font-size:12px; color:var(--s1); margin-bottom:4px; }
-.plan-view .plan-progress .pp-mini { display:flex; height:5px; border-radius:3px; overflow:hidden; background:var(--line); margin-bottom:6px; }
-.plan-view .plan-progress .pp-mini span { display:block; height:100%; }
-.plan-view .plan-progress .pp-chips { display:flex; flex-wrap:wrap; gap:4px; }
-.plan-view .plan-progress .pp-chip { font:11px var(--f-mono); padding:2px 6px; border-radius:5px; border:1.5px dashed var(--line); color:var(--fg3); display:inline-flex; align-items:center; gap:3px; background:transparent; }
-.plan-view .plan-progress .pp-chip::before { font-size:10px; line-height:1; }
-.plan-view .plan-progress .pp-chip.done { border-style:solid; border-color:var(--good); color:var(--good-ink); background:color-mix(in srgb, var(--good) 14%, transparent); }
-.plan-view .plan-progress .pp-chip.done::before { content:"\2713"; }
-.plan-view .plan-progress .pp-chip.pr { border-style:solid; border-color:var(--warning); color:var(--fg); background:color-mix(in srgb, var(--warning) 22%, transparent); }
-.plan-view .plan-progress .pp-chip.pr::before { content:"\29D7"; }
-.plan-view .plan-progress .pp-chip.prog { border-style:solid; border-color:var(--s5); color:var(--fg); background:color-mix(in srgb, var(--s5) 20%, transparent); }
-.plan-view .plan-progress .pp-chip.prog::before { content:"\21E1"; }
-.plan-view .plan-progress .pp-chip.deferred { border-style:dotted; opacity:.6; }
-.plan-view .plan-progress .pp-chip.deferred::before { content:"\21B7"; }
-.plan-view .plan-progress .pp-chip.live { border-style:solid; border-color:var(--s1); background:var(--s1); color:#fff; box-shadow:0 0 0 3px color-mix(in srgb, var(--s1) 30%, transparent); animation:pp-pulse 1.6s infinite; }
-.plan-view .plan-progress .pp-chip.live::before { content:"\25CF"; }
-.plan-view .plan-progress .pp-chip .ag { display:inline-block; min-width:14px; height:14px; line-height:14px; text-align:center; border-radius:7px; font:700 10px var(--f-mono); color:#fff; margin-left:2px; padding:0 3px; }
-.plan-view .plan-progress .pp-chip.just { outline:2.5px solid var(--good); outline-offset:1px; }
-@keyframes pp-pulse { 50% { opacity:.45; } }
-@media (prefers-reduced-motion: reduce) {
-  .plan-view .plan-progress .pp-chip.live { animation:none; }
-}
-
-.pp-sum{display:grid;gap:8px;max-width:760px}
-.pp-bar{display:flex;height:10px;border-radius:5px;overflow:hidden;background:var(--grid, var(--line))}
-.pp-bar span{display:block;height:100%;transition:width .6s cubic-bezier(.2,.8,.2,1)}
-.pp-bar span+span{margin-left:2px}
-.pp-nums{font:12.5px var(--mono, ui-monospace, monospace);color:var(--muted, var(--fg3))}
-.pp-go{justify-self:start;font:600 13px inherit;padding:6px 12px;border-radius:999px;border:1px solid var(--s1, var(--accent));color:var(--s1, var(--accent));background:transparent;cursor:pointer}
-.pp-go:hover,.pp-go:focus-visible{background:color-mix(in srgb,var(--s1, var(--accent)) 12%,transparent)}
-@media (prefers-reduced-motion: reduce){.pp-bar span{transition:none}}
-
-.pp-actions{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
-.pp-actions .copybtn{margin-left:0}
-
 /* plan frame: before/after band, focus, scope, objectives, path */
 .plan-view .ba-band { display: grid; grid-template-columns: minmax(0,1fr) auto minmax(0,1fr); gap: 10px; align-items: stretch; margin: 14px 0 4px; }
 .plan-view .ba-cell { border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; background: var(--surface); min-width: 0; }

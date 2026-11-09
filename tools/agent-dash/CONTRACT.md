@@ -793,7 +793,7 @@ Each bundle:
 | `layout.json` | Which visual sections land in Why, End state, Plan, Agent-friendly, and Reference. |
 | `START-PROMPT.md` | Optional. Paste-ready prompt that starts this workstream's lead. `ws new` writes a template. |
 
-`dash/planrender.py` `render(bundle_dir)` writes `page.html` in this order: Approvals, Why, End state, Plan, Progress, Agent-friendly, Reference. There is no Decided section on the plan tab (removed on owner request); plan-level decisions stay in the CLI and the API. Approvals is an empty `data-plan-approvals` node. Progress is an empty `data-plan-progress` node. The page fills both from the live bundle. Deferred tasks stay on the map and leave the counts.
+`dash/planrender.py` `render(bundle_dir)` writes `page.html` in this order: Approvals, Why, End state, Plan, Agent-friendly, Reference. There is no Decided section on the plan tab (removed on owner request); plan-level decisions stay in the CLI and the API. There is no Progress section on the plan tab either (removed on owner request); execution progress lives on the Execution view only. Approvals is an empty `data-plan-approvals` node. Deferred tasks stay on the map and leave the counts.
 
 ```
 python3 agent_dash.py ws list [--state S[,S...]|all] [--json]

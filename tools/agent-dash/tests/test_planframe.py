@@ -232,8 +232,10 @@ class PlanFrameRenderTests(unittest.TestCase):
              "reversible": True, "review_needed": "The sample set loads."}
         ]
         page = self.render_frame(plan)
-        anchors = ["ws9-arch", "ws9-objectives", "ws9-path", "ws9-end", "ws9-plan", "ws9-progress", "ws9-agent", "ws9-ref"]
+        anchors = ["ws9-arch", "ws9-objectives", "ws9-path", "ws9-end", "ws9-plan", "ws9-agent", "ws9-ref"]
         self.assertTrue(all(f'id="{anchor}"' in page for anchor in anchors))
+        self.assertNotIn('id="ws9-progress"', page)
+        self.assertNotIn('data-plan-progress', page)
         order = [page.index(f'id="{anchor}"') for anchor in anchors]
         self.assertEqual(order, sorted(order))
         self.assertNotIn('id="ws9-why"', page)
@@ -255,13 +257,13 @@ class PlanFrameRenderTests(unittest.TestCase):
         page = self.render_frame(plan)
         self.assertNotIn("data-frame-band", page)
         self.assertIn("This plan has no before/after frame yet", page)
-        order = [page.index(f'id="ws9-{anchor}"') for anchor in ("why", "end", "plan", "progress", "agent")]
+        order = [page.index(f'id="ws9-{anchor}"') for anchor in ("why", "end", "plan", "agent")]
         self.assertEqual(order, sorted(order))
         self.assertLess(page.index("Why"), page.index("End state"))
 
     def test_fixture_page_order(self):
         page = render(FIXTURES / "WS1")
-        order = [page.index(f'id="ws1-{anchor}"') for anchor in ("arch", "objectives", "path", "end", "plan", "progress", "agent", "ref")]
+        order = [page.index(f'id="ws1-{anchor}"') for anchor in ("arch", "objectives", "path", "end", "plan", "agent", "ref")]
         self.assertEqual(order, sorted(order))
         self.assertIn("data-frame-band", page)
         self.assertEqual(page.count('<tr class="chosen">'), 1)
