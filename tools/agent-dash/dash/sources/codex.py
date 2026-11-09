@@ -97,7 +97,7 @@ _SCANNED = set()
 _FILE_TID = {}
 _SQLITE = {}
 _ROLLOUTS_CACHE: dict = {}
-_ROLLOUTS_TTL_S = 15.0
+_ROLLOUTS_TTL_S = 60.0
 
 last_error = None
 

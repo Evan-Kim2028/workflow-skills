@@ -85,7 +85,7 @@ _KNOWN_PADS: set = set()
 last_active = False
 _DEFAULT_SESSIONS = DEFAULT_SESSIONS
 _SESSION_INDEX_CACHE: dict = {}
-_SESSION_INDEX_TTL_S = 15.0
+_SESSION_INDEX_TTL_S = 60.0
 
 
 def signal_paths(cfg):
