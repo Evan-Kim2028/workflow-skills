@@ -57,6 +57,8 @@ _FRESH = {}
 _LOCATE = {}
 _LOCATE_MISS = {}
 _LOCATE_MISS_TTL = 60.0
+_INDEX_BY_ROOT: dict = {}
+_INDEX_TTL_S = 30.0
 _dir_cache: dict = {}
 DIR_LIST_CAP = 500
 last_error = None
@@ -67,6 +69,7 @@ def reset_state() -> None:
     _FRESH.clear()
     _LOCATE.clear()
     _LOCATE_MISS.clear()
+    _INDEX_BY_ROOT.clear()
     _dir_cache.clear()
 
 
@@ -786,6 +789,59 @@ def _recent_days(root, now):
     return days
 
 
+def _session_index(root, now):
+    """sid(lower) -> session.jsonl path, built with one bounded walk per TTL.
+
+    The old ``glob`` per sid walked the whole sessions tree 800+ times per
+    poll (0.6s on the live tree). One walk per 30s plus dict lookup is the
+    incremental alternative: a hit costs one ``isfile``; a miss costs one
+    walk per TTL, not per sid. Falls back to the direct recent-days stat
+    for an sid the walk has not yet seen (a fresh session).
+    """
+    entry = _INDEX_BY_ROOT.get(root)
+    if entry is not None and now - entry[0] < _INDEX_TTL_S:
+        return entry[1]
+    found = {}
+    try:
+        years = os.listdir(root)
+    except OSError:
+        _INDEX_BY_ROOT[root] = (now, found)
+        return found
+    for year in years:
+        ypath = os.path.join(root, year)
+        try:
+            if not os.path.isdir(ypath):
+                continue
+            months = os.listdir(ypath)
+        except OSError:
+            continue
+        for month in months:
+            mpath = os.path.join(ypath, month)
+            try:
+                if not os.path.isdir(mpath):
+                    continue
+                days = os.listdir(mpath)
+            except OSError:
+                continue
+            for day in days:
+                dpath = os.path.join(mpath, day)
+                try:
+                    if not os.path.isdir(dpath):
+                        continue
+                    sids = os.listdir(dpath)
+                except OSError:
+                    continue
+                for sidl in sids:
+                    path = os.path.join(dpath, sidl, "session.jsonl")
+                    try:
+                        if os.path.isfile(path):
+                            found[sidl.lower()] = path
+                    except OSError:
+                        continue
+    _INDEX_BY_ROOT[root] = (now, found)
+    return found
+
+
 def _locate(root, sid, now=None):
     if not root or not sid:
         return None
@@ -798,19 +854,57 @@ def _locate(root, sid, now=None):
     miss = _LOCATE_MISS.get(key)
     if miss is not None and now - miss < _LOCATE_MISS_TTL:
         return None
+    try:
+        line = sid.lower()
+    except AttributeError:
+        line = sid
+    # Fast path: recent days are a stat per day, no walk at all.
+    for day in _recent_days(root, now):
+        direct = os.path.join(day, sid, "session.jsonl")
+        try:
+            if os.path.isfile(direct):
+                _LOCATE[key] = direct
+                _LOCATE_MISS.pop(key, None)
+                return direct
+        except OSError:
+            continue
+        try:
+            if line != sid:
+                lower_path = os.path.join(day, line, "session.jsonl")
+                if os.path.isfile(lower_path):
+                    _LOCATE[key] = lower_path
+                    _LOCATE_MISS.pop(key, None)
+                    return lower_path
+        except OSError:
+            continue
+    # Slow path: one bounded walk per TTL, then dict lookup.
+    try:
+        index = _session_index(root, now)
+    except OSError:
+        index = {}
+    try:
+        found = index.get(line)  # type: ignore[attr-defined]
+    except AttributeError:
+        found = index.get(sid)  # type: ignore[index]
+    if found and os.path.isfile(found):
+        _LOCATE[key] = found
+        _LOCATE_MISS.pop(key, None)
+        return found
+    # Keep a bounded glob fallback for a case-variant sid the walk missed
+    # (e.g. a session newer than the walk but older than 3 days).
     pattern = os.path.join(root, "*", "*", "*", sid, "session.jsonl")
     try:
         hits = glob.glob(pattern)
     except OSError:
-        return None
-    if not hits:
-        _LOCATE.pop(key, None)
-        _LOCATE_MISS[key] = now
-        return None
-    _LOCATE_MISS.pop(key, None)
-    hits.sort(key=lambda p: os.path.getmtime(p) if os.path.isfile(p) else 0, reverse=True)
-    _LOCATE[key] = hits[0]
-    return hits[0]
+        hits = []
+    if hits:
+        hits.sort(key=lambda p: os.path.getmtime(p) if os.path.isfile(p) else 0, reverse=True)
+        _LOCATE[key] = hits[0]
+        _LOCATE_MISS.pop(key, None)
+        return hits[0]
+    _LOCATE.pop(key, None)
+    _LOCATE_MISS[key] = now
+    return None
 
 
 def _children(session_dir, root):

@@ -83,6 +83,9 @@ _KNOWN_PADS: set = set()
 #: True while a grok (GLM CLI) process is alive, or the listing failed: its
 #: run status flips on process exit, which no file shows. Set by each poll.
 last_active = False
+_DEFAULT_SESSIONS = DEFAULT_SESSIONS
+_SESSION_INDEX_CACHE: dict = {}
+_SESSION_INDEX_TTL_S = 15.0
 
 
 def signal_paths(cfg):
@@ -148,7 +151,7 @@ def _poll(store, cfg, now):
     for row in manifests.values():
         _upsert_run(store, row, None, None, processes, pads.get(row["session_id"]), row["session_id"] in latest, now)
 
-    index = _session_index(sessions)
+    index = _session_index(sessions, now)
     authoritative = set()
     for sid, row in manifests.items():
         sdir = index.get(sid)
@@ -666,14 +669,21 @@ def _quota_ended_at(paths, now):
     return latest if latest is not None else now
 
 
-def _session_index(root):
-    """Map uuid -> session directory. Lists encoded-cwd and uuid names only."""
-    found = {}
+def _session_index(root, now=None):
+    """Map uuid -> session directory, one bounded walk per 15s."""
     if not root or not os.path.isdir(root):
-        return found
+        return {}
+    key = root
+    if now is not None:
+        hit = _SESSION_INDEX_CACHE.get(key)
+        if hit is not None and now - hit[0] < _SESSION_INDEX_TTL_S:
+            return dict(hit[1])
+    found = {}
     try:
         encoded = os.scandir(root)
     except OSError:
+        if now is not None:
+            _SESSION_INDEX_CACHE[key] = (now, dict(found))
         return found
     with encoded:
         for enc in encoded:
@@ -690,6 +700,8 @@ def _session_index(root):
                             found[kid.name] = kid.path
                     except OSError:
                         continue
+    if now is not None:
+        _SESSION_INDEX_CACHE[key] = (now, dict(found))
     return found
 
 

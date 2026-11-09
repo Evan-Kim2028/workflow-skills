@@ -69,6 +69,8 @@ _STREAM = re.compile(r"^stream-(.+)-(\d+)\.ndjson$")
 _tsv_cache: dict = {}
 _verdict_cache: dict = {}
 _last_write: dict = {}
+_session_index_cache: dict = {}
+_SESSION_INDEX_TTL_S = 15.0
 last_error = None
 
 
@@ -105,7 +107,7 @@ def _poll(store, cfg, now):
         _upsert_attempt(store, sid, row, seen)
     _close_vanished(store, attempts, now, only)
 
-    index = _session_index(projects)
+    index = _session_index(projects, now)
     for sid, path in index.items():
         budget = _consume(store, path, attempts.get(sid), budget, per_file, now, seen)
         if budget <= 0:
@@ -614,11 +616,20 @@ def _emit_run(store, run, sid, label, started, seen):
     seen[run["run_id"]] = sig
 
 
-def _session_index(root):
-    """Map session id -> jsonl path under ``<root>/<encoded-cwd>/``."""
-    found = {}
+def _session_index(root, now=None):
+    """Map session id -> jsonl path, one bounded walk per 15s.
+
+    The projects tree is 348 MB across encoded-cwd dirs; a walk every poll
+    costs a scandir per encoded dir even when nothing changed. The same
+    15s memo as every outdir scan bounds it."""
     if not root or not os.path.isdir(root):
-        return found
+        return {}
+    key = root
+    if now is not None:
+        hit = _session_index_cache.get(key)
+        if hit is not None and now - hit[0] < _SESSION_INDEX_TTL_S:
+            return dict(hit[1])
+    found = {}
     try:
         encoded = os.scandir(root)
     except OSError:
@@ -641,6 +652,8 @@ def _session_index(root):
                             found[name[: -len(".jsonl")]] = entry.path
                     except OSError:
                         continue
+    if now is not None:
+        _session_index_cache[key] = (now, dict(found))
     return found
 
 
