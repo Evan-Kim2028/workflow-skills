@@ -96,6 +96,8 @@ _EMITTED = {}
 _SCANNED = set()
 _FILE_TID = {}
 _SQLITE = {}
+_ROLLOUTS_CACHE: dict = {}
+_ROLLOUTS_TTL_S = 15.0
 
 last_error = None
 
@@ -113,6 +115,7 @@ def reset_state() -> None:
     _SCANNED.clear()
     _FILE_TID.clear()
     _SQLITE.clear()
+    _ROLLOUTS_CACHE.clear()
 
 
 def poll(store, cfg, now):
@@ -131,7 +134,7 @@ def _poll(store, cfg, now):
     only = _only_session(cfg)
     if budget <= 0:
         return
-    for path in _rollouts(root, only):
+    for path in _rollouts(root, only, now):
         if budget <= 0:
             break
         try:
@@ -141,10 +144,20 @@ def _poll(store, cfg, now):
     _repair(store, now)
 
 
-def _rollouts(root, only):
-    """Rollout files oldest-first so parents upsert before their subagents."""
+def _rollouts(root, only, now=None):
+    """Rollout files oldest-first, cached for bounded directory walks.
+
+    The sessions tree holds 250+ rollouts (largest 440 MB). A walk every 2s
+    costs a stat per file even when nothing changed. The walk is reused for
+    ``_ROLLOUTS_TTL_S`` via (inode,mtime) memo; a new rollout appears within
+    one TTL, same bound as every other outdir scan. When ``now`` is None the
+    cache is ignored (tests)."""
     if not root or not os.path.isdir(root):
-        return
+        return []
+    if now is not None:
+        hit = _ROLLOUTS_CACHE.get((root, only))
+        if hit is not None and now - hit[0] < _ROLLOUTS_TTL_S:
+            return list(hit[1])
     found = []
     for dirpath, _dirnames, filenames in os.walk(root, followlinks=False):
         for name in filenames:
@@ -154,6 +167,8 @@ def _rollouts(root, only):
                 continue
             found.append(os.path.join(dirpath, name))
     found.sort()
+    if now is not None:
+        _ROLLOUTS_CACHE[(root, only)] = (now, list(found))
     return found
 
 

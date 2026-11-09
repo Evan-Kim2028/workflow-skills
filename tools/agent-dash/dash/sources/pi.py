@@ -66,6 +66,7 @@ _tsv_cache: dict = {}
 _meta_cache: dict = {}
 _verdict_cache: dict = {}
 _last_write: dict = {}
+_session_cache: dict = {}
 last_error = None
 
 
@@ -343,13 +344,26 @@ def _stream_path(pad, label):
 
 
 def _stream_session(pad, label):
-    """Session id from the stream's ``session`` event, or None."""
+    """Session id from the stream's ``session`` event, or None.
+
+    The head is cached on (inode, size, mtime): an unchanged stream is not
+    re-opened on every poll. A growing stream keeps its head in place, so
+    the cache stays valid while the tail is appended."""
     path = _stream_path(pad, label)
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    sig = (st.st_ino, st.st_size, getattr(st, "st_mtime_ns", None))
+    hit = _session_cache.get(path)
+    if hit is not None and hit[0] == sig:
+        return hit[1]
     try:
         with open(path, "rb") as fh:
             head = fh.read(8192)
     except OSError:
         return None
+    out = None
     for line in head.split(b"\n")[:8]:
         if b'"session"' not in line:
             continue
@@ -360,8 +374,12 @@ def _stream_session(pad, label):
         if isinstance(obj, dict) and obj.get("type") == "session":
             sid = obj.get("id")
             if isinstance(sid, str) and sid:
-                return sid
-    return None
+                out = sid
+                break
+    if len(_session_cache) > 20000:
+        _session_cache.clear()
+    _session_cache[path] = (sig, out)
+    return out
 
 
 def _agent_processes():

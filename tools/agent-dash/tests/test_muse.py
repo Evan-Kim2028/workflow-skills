@@ -139,6 +139,8 @@ class MuseTests(unittest.TestCase):
     def setUp(self):
         muse._FRESH.clear()
         muse._LOCATE.clear()
+        muse._INDEX_BY_ROOT.clear()
+        muse._LOCATE_MISS.clear()
         muse.last_error = None
         self._live = muse.live_agent_processes
         muse.live_agent_processes = lambda now=None: []
@@ -807,11 +809,57 @@ class MuseTests(unittest.TestCase):
             fh.write("ws7-notes\t%s\t1792152010\n" % sid)
         return sessions, scratch, path
 
+    def test_ember_model_completed(self):
+        # Ember session fixture: model_completed carries muse-ember-1.0.
+        with tempfile.TemporaryDirectory() as tmp:
+            sessions, scratch, path = self._one_session(tmp, SID)
+            with open(path, "wb") as fh:
+                fh.write(mc(SID, "a", input=1200, output=300, cached=800, model="muse-ember-1.0"))
+                fh.write(mc(SID, "b", input=600, output=150, cached=400, model="muse-ember-1.0"))
+            store = Store()
+            cfg = self.cfg(sessions, scratch)
+            self.poll(store, cfg, 1792153000)
+            # Usage rows carry the ember id through _parse_line unchanged.
+            self.assertEqual(store.usage[("muse", SID, "a")]["model"], "muse-ember-1.0")
+            self.assertEqual(store.usage[("muse", SID, "b")]["model"], "muse-ember-1.0")
+            # Uncached input = input_tokens - max(cached, cache_read).
+            self.assertEqual(store.usage[("muse", SID, "a")]["input"], 400)
+            # Run model is the ember id; cost/pricing then reads the catalog row.
+            run = store.runs["muse:%s:ws7-notes" % SID]
+            self.assertEqual(run["model"], "muse-ember-1.0")
+            # Incremental: a second poll adds nothing once at EOF.
+            saved_n = store.usage_n
+            self.poll(store, cfg, 1792153002)
+            self.assertEqual(store.usage_n, saved_n)
+
+    def test_ember_session_index_bounded_walk(self):
+        # _locate falls back to a single walk per TTL, not a glob per sid.
+        with tempfile.TemporaryDirectory() as tmp:
+            sessions = os.path.join(tmp, "sessions")
+            os.makedirs(sessions)
+            # Older than the 3-day recent window, so the index walk is required.
+            p = os.path.join(sessions, "2026", "10", "16", SID, "session.jsonl")
+            os.makedirs(os.path.dirname(p))
+            with open(p, "wb") as fh:
+                fh.write(mc(SID, "a", input=1, output=1, model="muse-ember-1.0"))
+            now = 1794255645.0
+            # Direct locate builds the index (poll with no manifest skips locate).
+            self.assertEqual(muse._locate(sessions, SID, now), p)
+            # First locate populated the index; second locate within TTL must not walk.
+            hit = muse._INDEX_BY_ROOT.get(sessions)
+            self.assertIsNotNone(hit)
+            self.assertIn(SID.lower(), hit[1])
+            self.assertEqual(muse._locate(sessions, SID, now + 1.0), p)
+            # After TTL the index rebuilds but still finds the same path.
+            self.assertEqual(muse._locate(sessions, SID, now + 31.0), p)
+
 
 class ManifestDirsTests(unittest.TestCase):
     def setUp(self):
         muse._FRESH.clear()
         muse._LOCATE.clear()
+        muse._INDEX_BY_ROOT.clear()
+        muse._LOCATE_MISS.clear()
 
     def _pad(self, root, enc, hub, label="ws2-x", sid=SID):
         pad = os.path.join(root, enc, hub, "scratchpad")

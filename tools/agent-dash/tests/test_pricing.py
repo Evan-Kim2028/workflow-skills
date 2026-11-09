@@ -700,6 +700,21 @@ class OpenRouterFreeAndGrokBuildTest(unittest.TestCase):
             self.assertIsNone(cost(model, 10, 10, 0, 0), model)
         self.assertIsNone(cost("inclusionai/ling-3.1-flash-1019:free", 1, 1, 0, 0))
 
+    def test_ember_prices_at_zero_free(self):
+        rows = {row["model"]: row for row in load()}
+        for model in ("muse-ember-1.0", "meta/muse-ember-1.0"):
+            row = rows[model]
+            self.assertEqual(row["provider"], "meta" if "meta/" not in model else "command-code/meta", model)
+            self.assertEqual(row["input"], 0, model)
+            self.assertEqual(row["output"], 0, model)
+            self.assertEqual(row["cache_read"], 0, model)
+            self.assertEqual(row["billing_mode"], "free", model)
+            self.assertEqual(row["confidence"], "unknown", model)
+            # Free allotment: priced at $0, never unpriced, so health does not flag it.
+            self.assertTrue(status(model)["priced"], model)
+            self.assertEqual(cost(model, 1_000_000, 500_000, 2_000_000, 100_000, reasoning=0), 0.0, model)
+            self.assertEqual(cost(model, 0, 0, 0, 0, reasoning=0), 0.0, model)
+
     def test_grok_build_id_prices_at_the_public_grok_rate(self):
         plain = cost("grok-4.7", 1_000_000, 1_000_000, 1_000_000, 0)
         self.assertAlmostEqual(plain, 8.5)
