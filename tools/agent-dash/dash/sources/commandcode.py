@@ -70,7 +70,7 @@ _tsv_cache: dict = {}
 _verdict_cache: dict = {}
 _last_write: dict = {}
 _session_index_cache: dict = {}
-_SESSION_INDEX_TTL_S = 15.0
+_SESSION_INDEX_TTL_S = 60.0
 last_error = None
 
 

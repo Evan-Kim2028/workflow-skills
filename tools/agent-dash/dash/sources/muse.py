@@ -58,7 +58,7 @@ _LOCATE = {}
 _LOCATE_MISS = {}
 _LOCATE_MISS_TTL = 60.0
 _INDEX_BY_ROOT: dict = {}
-_INDEX_TTL_S = 30.0
+_INDEX_TTL_S = 900.0
 _dir_cache: dict = {}
 DIR_LIST_CAP = 500
 last_error = None
@@ -252,7 +252,7 @@ def _drain_files(store, files, key, budget, per_file, now, processes, manifests)
 #: The muse clock repair scans every muse run row under the store lock. It is
 #: idempotent and only fixes rows a poll wrote a moment ago, so it runs at most
 #: this often instead of on every 2 s poll (docs/perf.md, stage 3).
-REPAIR_CLOCKS_EVERY_S = 30.0
+REPAIR_CLOCKS_EVERY_S = 120.0
 _last_clock_repair = [None]
 
 
