@@ -182,31 +182,6 @@
     }).catch(function () { return []; });
   }
 
-  /* The live map under the summary: the Execution tab's own planCard
-     (static/cards/plan-progress.js), never a second copy. planCard reads
-     the shared page state for the run-to-task map and the run-count
-     badges, so this tab lends it its plan and runs and puts the
-     Execution tab's values back before returning; everything it closes
-     over runs synchronously, so the restore cannot race its timers.
-     Replay stays off here: its exit path rebuilds the Execution view. */
-  function drawMap(host, plan, snap, runs, id) {
-    var mount = host.querySelector("[data-plan-map]");
-    if (!mount) {
-      mount = el("div", {class: "plan-live-map", "data-plan-map": "", "data-ws": id});
-      host.appendChild(mount);
-    }
-    mount.innerHTML = "";
-    if (!plan || typeof planCard !== "function") return;
-    var gs = (typeof state !== "undefined" && state) ? state : null;
-    var prevPlan = gs ? gs.plan : null, prevRuns = gs ? gs.runs : null;
-    var card = null;
-    if (gs) { gs.plan = plan; gs.runs = runs || []; }
-    try { card = planCard(plan, snap, {replay: false}); }
-    catch (e) { card = null; }
-    if (gs) { gs.plan = prevPlan; gs.runs = prevRuns; }
-    if (card) mount.appendChild(card);
-  }
-
   function fetchPage(id) {
     var url = FIX ? "../fixtures/bundles/" + encodeURIComponent(id) + "/page.html" : "/bundle/" + encodeURIComponent(id) + "/page.html";
     return fetch(url, {cache: "no-store"}).then(function (response) {
@@ -333,34 +308,9 @@
     if (hit.html) {
       captureMermaid(main);
       ensureMermaid(runMermaid);
-      var host = main.querySelector("[data-plan-progress]");
-      if (host && hit.bundle) drawSummary(host, dagOf(hit.bundle, id), hit.snap || {running: [], recent: []}, id, hit.bundle && hit.bundle.start_prompt, hit.bundle && hit.bundle.progress);
-      if (host) drawMap(host, hit.plan, hit.snap || {running: [], recent: []}, hit.runs || [], id);
       drawTrains(main, id, hit.bundle);
     }
     stampSectionIds(main);
-  }
-
-  /* The progress summary stays on top; the live task-chip map mounts below
-     it through drawMap (the Execution tab's own renderer, replay off).
-     Overall progress comes from the server progress object, never recomputed here. */
-  function drawSummary(host, dag, snap, id, startPrompt, progress) {
-    var pr = progress || {done: 0, total: 0, counts: {}, pct: 0};
-    var c = pr.counts || {};
-    var tot = pr.total || 0, live = ((snap && snap.running) || []).length;
-    host.innerHTML = "";
-    var wrap = el("div", {class: "pp-sum"});
-    var bar = el("div", {class: "pp-bar", role: "img", "aria-label": (pr.done || 0) + " of " + tot + " tasks done"});
-    [["done", "var(--good)"], ["prog", "var(--s5)"], ["pr", "var(--warning)"]].forEach(function (p) { if (!c[p[0]] || !tot) return; var sp = el("span"); sp.style.width = (100 * c[p[0]] / tot) + "%"; sp.style.background = p[1]; bar.appendChild(sp); });
-    wrap.appendChild(bar);
-    var pct = pr.pct || 0;
-    wrap.appendChild(el("div", {class: "pp-nums", text: pct + "% done \u00B7 " + c.done + " of " + tot + " tasks \u00B7 " + (c.wip ? c.wip + " in progress \u00B7 " : "") + c.prog + " waiting on prod \u00B7 " + c.pr + " waiting to merge \u00B7 " + c.todo + " not started" + (c.deferred ? " \u00B7 " + c.deferred + " deferred" : "") + (live ? " \u00B7 " + live + " running now" : "")}));
-    var btn = el("button", {class: "pp-go", text: "Open live progress \u2192"});
-    btn.addEventListener("click", function () { if (window.DashNav) window.DashNav.openExec(id); });
-    var row = el("div", {class: "pp-actions"}); row.appendChild(btn);
-    if (startPrompt && window.DashCopyBtn) row.appendChild(window.DashCopyBtn(startPrompt));
-    wrap.appendChild(row);
-    host.appendChild(wrap);
   }
 
   function refreshProgress(id) {
@@ -376,9 +326,6 @@
       if (window.DashCache) window.DashCache.snap[id] = parts[2];
       var main = document.getElementById("plan-body");
       if (!main) return;
-      var host = main.querySelector("[data-plan-progress]");
-      if (host && parts[1]) drawSummary(host, dagOf(parts[1], id), parts[2] || {running: [], recent: []}, id, parts[1] && parts[1].start_prompt, parts[1] && parts[1].progress);
-      if (host) drawMap(host, parts[3], parts[2] || {running: [], recent: []}, parts[4] || [], id);
       drawTrains(main, id, parts[1]);
       stampSectionIds(main);
     }).catch(function () {});
@@ -458,9 +405,10 @@
     if (old && old.parentNode) old.parentNode.removeChild(old);
     if (!main || !bundle) return;
     var sec = buildTrains(id, bundle);
-    var host = main.querySelector("[data-plan-progress]");
-    var anchor = host && host.closest ? host.closest("section") : null;
-    if (anchor && anchor.parentNode) anchor.parentNode.insertBefore(sec, anchor.nextSibling);
+    /* Progress used to sit between Plan and Agent-friendly; with it gone the
+       trains keep that slot by landing just before the Agent-friendly section. */
+    var anchor = document.getElementById(String(id).toLowerCase() + "-agent");
+    if (anchor && anchor.parentNode === main) main.insertBefore(sec, anchor);
     else main.appendChild(sec);
   }
 

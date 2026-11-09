@@ -71,18 +71,21 @@ class PlanRenderTest(unittest.TestCase):
         self.assertIn("A single contract replaces three readers.", page)
         self.assertNotIn(">old thesis<", page)
         self.assertNotIn('class="figs"', page)
-        self.assertIn('data-plan-progress', page)
+        self.assertNotIn('data-plan-progress', page)
+        self.assertNotIn('plan-progress-execution', page)
         self.assertNotIn('data-plan-approvals', page)
         self.assertNotIn("wsp-figs", page)
         self.assertNotIn("<script", page)
-        order = [page.index(f'id="ws9-{anchor}"') for anchor in ("why", "end", "plan", "progress", "agent")]
+        order = [page.index(f'id="ws9-{anchor}"') for anchor in ("why", "end", "plan", "agent")]
         self.assertNotIn('id="ws9-decided"', page)
         self.assertNotIn("Decisions, made by review", page)
         self.assertNotIn("dec-grid", page)
         self.assertNotIn('id="ws9-ref"', page)
+        self.assertNotIn('id="ws9-progress"', page)
+        self.assertNotIn(">Progress<", page)
         self.assertEqual(order, sorted(order))
         self.assertLess(page.index("Why"), page.index("End state"))
-        self.assertLess(page.index("End state"), page.index("Progress"))
+        self.assertLess(page.index("End state"), page.index("Two steps"))
         self.assertTrue((root / "page.html").is_file())
         self.assertFalse((root / "page.html.tmp").exists())
 
@@ -106,7 +109,7 @@ class PlanRenderTest(unittest.TestCase):
         self.assertIn("Three readers answer the same question", page)
         self.assertIn("Clients call one route", page)
         self.assertIn("Three readers become one route.", page)
-        self.assertIn('data-plan-progress', page)
+        self.assertNotIn('data-plan-progress', page)
         overview = render(root / "OVERVIEW")
         self.assertIn("One program, one read path.", overview)
 

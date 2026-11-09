@@ -4,7 +4,7 @@ Section order with a frame is fixed: the Before/After band (in the header),
 then Architecture, then How the work maps to the goal, then Why this path,
 then the existing page from End state onward. Without a frame the page
 renders as it always did, plus one muted hint line under the thesis.
-The Progress section is a placeholder. The plan page fills it from the live plan.
+Execution progress lives on the Execution view only; the plan page carries no Progress section.
 Plan-level decisions stay collapsed in a disclosure at the end of the page;
 the live decision record stays in the CLI and the API.
 """
@@ -43,7 +43,7 @@ def _empty(html_text: str) -> bool:
 
 def sec(anchor: str, eyebrow: str, title: str, body: str, lead: str | None = None) -> str:
     """One page section; an empty section (no lead and no visible body) renders nothing."""
-    if not lead and _empty(body) and "data-plan-progress" not in (body or ""):
+    if not lead and _empty(body):
         return ""
     lead_html = f'<p class="lead2">{lead}</p>' if lead else ""
     return (
@@ -105,10 +105,6 @@ def phases_block(phases) -> str:
         if isinstance(phase, dict)
     )
     return f'<div class="p1-flow">{steps}</div>'
-
-
-def progress_block(ws: str) -> str:
-    return f'<div id="plan-progress" class="plan-progress" data-plan-progress data-ws="{esc(ws)}"></div>'
 
 
 def planning_block(data: dict) -> str:
@@ -338,7 +334,6 @@ def build(ws: str, data: dict, fragments: dict, layout: dict) -> str:
             ("path", "Why this path"),
             ("end", "End state"),
             ("plan", "Plan"),
-            ("progress", "Progress"),
             ("agent", "Agent-friendly"),
             ("ref", "Reference"),
         ]
@@ -347,7 +342,6 @@ def build(ws: str, data: dict, fragments: dict, layout: dict) -> str:
             ("why", "Why"),
             ("end", "End state"),
             ("plan", "Plan"),
-            ("progress", "Progress"),
             ("agent", "Agent-friendly"),
             ("ref", "Reference"),
         ]
@@ -445,24 +439,6 @@ def build(ws: str, data: dict, fragments: dict, layout: dict) -> str:
         layout.get("plan_title") or "Plan",
         phases_block(narrative.get("phases")) + _piece(layout.get("plan_extra"), fragments),
     )
-    has_tasks = any((g.get("tasks") or []) for g in ((data.get("dag") or {}).get("groups") or []) if isinstance(g, dict))
-    if has_tasks:
-        from dash import plans as _plans
-
-        _groups = ((data.get("dag") or {}).get("groups") or [])
-        _progress = _plans.plan_progress(_groups)
-        _progress_html = f'<p class="plan-progress-execution">Execution: {_progress["pct"]}%</p>'
-        if (_progress.get("planning") or {}).get("total", 0) > 0:
-            _p = _progress["planning"]
-            _progress_html += f'<p class="plan-progress-planning">Planning: {_p["done"]}/{_p["total"]} done (not counted)</p>'
-        _progress_html += progress_block(ws)
-        body += sec(
-            f"{prefix}-progress",
-            "Progress",
-            f"Where {ws} is",
-            _progress_html,
-            lead="A summary of the live plan. The full task map, with agents working on it now, is on the Execution view.",
-        )
     body += sec(
         f"{prefix}-agent",
         "Agent-friendly",
