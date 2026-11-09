@@ -55,8 +55,8 @@ class CodexBoundedTest(unittest.TestCase):
                 fh.write("{}\n")
             second = codex._rollouts(root, None, now + 1.0)
             self.assertEqual(second, first)
-            # After TTL the new file is visible.
-            third = codex._rollouts(root, None, now + 16.0)
+            # After TTL the new file is visible (60s per bounded-walk TTL).
+            third = codex._rollouts(root, None, now + 61.0)
             self.assertIn(p2, third)
             # Direct tests (now=None) always walk.
             fourth = codex._rollouts(root, None)
@@ -82,7 +82,7 @@ class CommandCodeBoundedTest(unittest.TestCase):
                 fh.write("{}\n")
             second = cc._session_index(tmp, now + 1.0)
             self.assertNotIn(sid2, second)
-            third = cc._session_index(tmp, now + 16.0)
+            third = cc._session_index(tmp, now + 61.0)
             self.assertIn(sid2, third)
 
 class GrokBoundedTest(unittest.TestCase):
@@ -101,7 +101,7 @@ class GrokBoundedTest(unittest.TestCase):
             os.makedirs(os.path.join(enc, "22222222-2222-4222-8222-222222222222"))
             second = grok._session_index(tmp, now + 1.0)
             self.assertNotIn("22222222-2222-4222-8222-222222222222", second)
-            third = grok._session_index(tmp, now + 16.0)
+            third = grok._session_index(tmp, now + 61.0)
             self.assertIn("22222222-2222-4222-8222-222222222222", third)
 
 class PiSessionCacheTest(unittest.TestCase):

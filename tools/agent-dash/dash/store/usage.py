@@ -30,6 +30,99 @@ from .util import (_ESTIMATE_TOOL, RANGE_S, SAMPLE_KEEP_S,
 
 
 class UsageMixin:
+        def add_usage_batch(self, rows: list) -> None:
+            """Batch insert usage rows in one transaction per poll.
+
+            Each row is the same dict ``add_usage`` accepts. Empty lists are a
+            no-op. The batch holds the store lock once and does one
+            ``BEGIN IMMEDIATE``/``COMMIT`` for all rows plus the hourly bucket
+            rebuilds, instead of one transaction per row. Duplicate
+            ``(tool, session_id, message_id)`` rows keep last-wins, matching
+            the single-row path.
+            """
+            if not rows:
+                return
+            with self._lock:
+                self._conn.execute("BEGIN IMMEDIATE")
+                try:
+                    for row in rows:
+                        tool = row.get("tool")
+                        session_id = row.get("session_id")
+                        message_id = row.get("message_id")
+                        if tool is None or session_id is None or message_id is None:
+                            continue
+                        tool, session_id, message_id = str(tool), str(session_id), str(message_id)
+                        values = {key: _opt_int(row, key) for key in TOKEN_FIELDS}
+                        write_5m = _opt_int(row, "cache_write_5m")
+                        write_1h = _opt_int(row, "cache_write_1h")
+                        from dash.lead_split import clean_ws as _clean_ws
+                        ws_split = _clean_ws(row.get("ws_split"))
+                        model = row.get("model")
+                        ts = row.get("ts")
+                        run_id = row.get("run_id")
+                        est = None if tool == _ESTIMATE_TOOL else price_cost(
+                            model,
+                            values["input"],
+                            values["output"],
+                            values["cache_read"],
+                            values["cache_write"],
+                            cache_write_5m=write_5m,
+                            cache_write_1h=write_1h,
+                            reasoning=values["reasoning"],
+                            ts=ts,
+                        )
+                        if isinstance(run_id, str) and _manifest_family(run_id) is not None:
+                            run_id = self._resolve_alias_locked(run_id)
+                        self._conn.execute(
+                            """INSERT INTO usage_events(
+                                   tool, session_id, message_id, ts, run_id, model,
+                                   input_tokens, output_tokens, cache_read, cache_write,
+                                   cache_write_5m, cache_write_1h, reasoning, est_cost_usd, ws_split)
+                               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                               ON CONFLICT(tool, session_id, message_id) DO UPDATE SET
+                                 ts=excluded.ts, run_id=excluded.run_id, model=excluded.model,
+                                 input_tokens=excluded.input_tokens, output_tokens=excluded.output_tokens,
+                                 cache_read=excluded.cache_read, cache_write=excluded.cache_write,
+                                 cache_write_5m=excluded.cache_write_5m, cache_write_1h=excluded.cache_write_1h,
+                                 reasoning=excluded.reasoning, est_cost_usd=excluded.est_cost_usd,
+                                 ws_split=COALESCE(excluded.ws_split, usage_events.ws_split)""",
+                            (
+                                tool,
+                                session_id,
+                                message_id,
+                                ts,
+                                run_id,
+                                model,
+                                values["input"],
+                                values["output"],
+                                values["cache_read"],
+                                values["cache_write"],
+                                write_5m,
+                                write_1h,
+                                values["reasoning"],
+                                est,
+                                ws_split,
+                            ),
+                        )
+                        if isinstance(run_id, str):
+                            self._bump_usage_run(run_id)
+                        hours = set()
+                        if ts is not None:
+                            hours.add(_hour(ts))
+                        for hour in hours:
+                            self._rebuild_hour(hour)
+                    self._conn.execute("COMMIT")
+                except Exception:
+                    try:
+                        self._conn.execute("ROLLBACK")
+                    except Exception:
+                        pass
+                    raise
+                self._seq += 1
+                self._data_seq += 1
+                self._note_data_write()
+                self._note_view_write()
+
         def add_usage(self, row: dict) -> None:
             tool = row.get("tool")
             session_id = row.get("session_id")
