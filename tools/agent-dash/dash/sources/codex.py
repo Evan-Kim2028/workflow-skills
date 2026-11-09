@@ -96,6 +96,7 @@ _EMITTED = {}
 _SCANNED = set()
 _FILE_TID = {}
 _SQLITE = {}
+_SQLITE_CON: dict = {}
 _ROLLOUTS_CACHE: dict = {}
 _ROLLOUTS_TTL_S = 60.0
 
@@ -115,6 +116,12 @@ def reset_state() -> None:
     _SCANNED.clear()
     _FILE_TID.clear()
     _SQLITE.clear()
+    for _c in list(_SQLITE_CON.values()):
+        try:
+            _c.close()
+        except Exception:
+            pass
+    _SQLITE_CON.clear()
     _ROLLOUTS_CACHE.clear()
 
 
@@ -676,35 +683,53 @@ def _sqlite_parent(cfg, tid, session_id):
 
     Opened read-only; any failure (WAL lock, missing db) silently yields
     nothing so the sqlite cross-check never breaks the rollout ledger.
-    The outcome is cached per process: the edges table only grows.
+    The outcome is cached per process including None (with a TTL), so a
+    quiet thread does not re-open ``state_5.sqlite`` on every 2 s poll.
     """
     if tid in _SQLITE:
-        return _SQLITE[tid]
+        hit = _SQLITE[tid]
+        # _SQLITE values may be None (cached miss) or (parent, ts) after TTL
+        if isinstance(hit, tuple) and len(hit) == 2:
+            parent, cached_at = hit
+            try:
+                import time as _time
+
+                if _time.time() - float(cached_at) < 60.0:
+                    return parent
+            except Exception:
+                pass
+            del _SQLITE[tid]
+        else:
+            # legacy cache entry without TTL (tests): still valid
+            return hit
     db = _root(cfg, "codex_db", default=DEFAULT_DB)
-    try:
-        uri = "file:" + db + "?mode=ro&immutable=1"
-        con = sqlite3.connect(uri, uri=True, timeout=2.0)
-    except Exception:
-        return None
-    try:
+    # cache per-db connection for the process; edges only grows
+    import time as _time_mod
+
+    con = _SQLITE_CON.get(db)
+    if con is None:
+        try:
+            uri = "file:" + db + "?mode=ro&immutable=1"
+            con = sqlite3.connect(uri, uri=True, timeout=2.0)
+            _SQLITE_CON[db] = con
+        except Exception:
+            con = None
+    if con is not None:
         try:
             row = con.execute(
                 "SELECT parent_thread_id FROM thread_spawn_edges WHERE child_thread_id=? LIMIT 1",
                 (tid,),
             ).fetchone()
+            if row and isinstance(row[0], str) and row[0]:
+                parent = row[0]
+                _SQLITE[tid] = (parent, _time_mod.time())
+                return parent
         except sqlite3.Error:
-            return None
-        if row and isinstance(row[0], str) and row[0]:
-            _SQLITE[tid] = row[0]
-            return row[0]
-    finally:
-        try:
-            con.close()
-        except Exception:
             pass
     if isinstance(session_id, str) and session_id and session_id != tid:
-        _SQLITE[tid] = session_id
+        _SQLITE[tid] = (session_id, _time_mod.time())
         return session_id
+    _SQLITE[tid] = (None, _time_mod.time())
     return None
 
 

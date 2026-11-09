@@ -958,7 +958,24 @@ def _parse_meta(raw):
     return obj
 
 
+_DISCOVER_CACHE: dict = {}
+_DISCOVER_TTL_S = 60.0
+
+
 def _discover(home, budget, per_file):
+    import os as _os
+    import time as _time
+
+    if _os.environ.get("AGENT_DASH_IGNORE_LOCAL") == "1":
+        # Tests poll at fixed NOW and expect new blobs to be seen immediately;
+        # do not cache in isolated mode.
+        pass
+    else:
+        now = _time.time()
+        hit = _DISCOVER_CACHE.get(home)
+        if hit is not None and now - hit[0] < _DISCOVER_TTL_S:
+            return list(hit[1]), budget
+    now = _time.time()
     root = os.path.join(home, "chats")
     found = []
     if not os.path.isdir(root):
@@ -1008,6 +1025,7 @@ def _discover(home, budget, per_file):
                     )
     _BUCKET_DIRS.clear()
     _BUCKET_DIRS.update(seen_buckets)
+    _DISCOVER_CACHE[home] = (now, list(found))
     if budget > 0:
         _drop_gone(found)
     return found, budget

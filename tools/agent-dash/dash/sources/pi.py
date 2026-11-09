@@ -67,6 +67,7 @@ _meta_cache: dict = {}
 _verdict_cache: dict = {}
 _last_write: dict = {}
 _session_cache: dict = {}
+_quota_cache: dict = {}
 last_error = None
 
 
@@ -497,21 +498,49 @@ def _process_apply(store, run, processes):
 
 
 def _quota(pad, label, out_path, err_path, sid) -> bool:
-    """True when the QUOTA marker or a quota log names this run's failure."""
-    if os.path.isfile(os.path.join(pad, "QUOTA")):
-        try:
-            with open(os.path.join(pad, "QUOTA"), "r", encoding="utf-8") as fh:
-                text = fh.read(4096)
-        except OSError:
-            text = ""
-        if not text.strip() or label in text or sid in text:
+    """True when the QUOTA marker or a quota log names this run's failure.
+
+    Cached on (path, size, mtime_ns) so a quiet run does not re-open and
+    regex-scan its logs every 2 s across 140+ live runs.
+    """
+    quota_path = os.path.join(pad, "QUOTA")
+    try:
+        st = os.stat(quota_path)
+        sig = (st.st_size, st.st_mtime_ns)
+        hit = _quota_cache.get(quota_path)
+        if hit is not None and hit[0] == sig:
+            cached_text = hit[1]
+        else:
+            try:
+                with open(quota_path, "r", encoding="utf-8") as fh:
+                    cached_text = fh.read(4096)
+            except OSError:
+                cached_text = ""
+            _quota_cache[quota_path] = (sig, cached_text)
+        if not cached_text.strip() or (isinstance(label, str) and label in cached_text) or (isinstance(sid, str) and sid in cached_text):
             return True
+    except OSError:
+        pass
     for path in (err_path, out_path):
-        try:
-            if path and file_shows_quota(path):
-                return True
-        except Exception:
+        if not path:
             continue
+        try:
+            st = os.stat(path)
+        except OSError:
+            continue
+        sig = (st.st_size, st.st_mtime_ns)
+        hit = _quota_cache.get(path)
+        if hit is not None and hit[0] == sig:
+            if hit[1]:
+                return True
+            continue
+        try:
+            hit_result = file_shows_quota(path)
+        except Exception:
+            hit_result = False
+        _quota_cache[path] = (sig, hit_result)
+        if hit_result:
+            return True
     return False
 
 

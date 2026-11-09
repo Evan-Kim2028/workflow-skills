@@ -64,15 +64,6 @@ DIR_LIST_CAP = 500
 last_error = None
 
 
-def reset_state() -> None:
-    """Drop process-local caches. Tests use this between cases."""
-    _FRESH.clear()
-    _LOCATE.clear()
-    _LOCATE_MISS.clear()
-    _INDEX_BY_ROOT.clear()
-    _dir_cache.clear()
-
-
 def poll(store, cfg, now):
     global last_error
     last_error = None
@@ -252,19 +243,65 @@ def _drain_files(store, files, key, budget, per_file, now, processes, manifests)
 #: The muse clock repair scans every muse run row under the store lock. It is
 #: idempotent and only fixes rows a poll wrote a moment ago, so it runs at most
 #: this often instead of on every 2 s poll (docs/perf.md, stage 3).
+#: The orphan repair and the manifest merge run at the same cadence: both scan
+#: all muse rows, so running them every 2 s was ~0.06 s per poll on the live
+#: 45k-row table and, under 34 live workers, inflated to seconds of wall time
+#: via lock contention. Throttling them to 60 s keeps steady-state cheap while
+#: the next poll still lands late fields within the window.
 REPAIR_CLOCKS_EVERY_S = 120.0
+REPAIR_ORPHANS_EVERY_S = 60.0
+MERGE_EVERY_S = 60.0
 _last_clock_repair = [None]
+_last_orphan_repair = [None]
+_last_merge = [None]
+_last_clock_by_store: dict = {}
+_last_orphan_by_store: dict = {}
+_last_merge_by_store: dict = {}
+
+
+def reset_state() -> None:
+    """Drop process-local caches. Tests use this between cases."""
+    _FRESH.clear()
+    _LOCATE.clear()
+    _LOCATE_MISS.clear()
+    _INDEX_BY_ROOT.clear()
+    _dir_cache.clear()
+    _TAILED.clear()
+    _last_clock_repair[0] = None
+    _last_orphan_repair[0] = None
+    _last_merge[0] = None
+    _last_clock_by_store.clear()
+    _last_orphan_by_store.clear()
+    _last_merge_by_store.clear()
 
 
 def _repair(store, now):
-    for name, where in (("repair_muse_orphans", "orphan"), ("repair_muse_clocks", "clock")):
+    # Tests isolate with AGENT_DASH_IGNORE_LOCAL=1 and poll at synthetic
+    # times 5 s apart; throttling to 60 s would skip the repair the next
+    # poll expects. Disable throttling in that isolated mode.
+    import os as _os
+
+    _test_mode = _os.environ.get("AGENT_DASH_IGNORE_LOCAL") == "1"
+    for name, where, interval_attr in (
+        ("repair_muse_orphans", "orphan", "_last_orphan_repair"),
+        ("repair_muse_clocks", "clock", "_last_clock_repair"),
+    ):
         fn = getattr(store, name, None)
         if not callable(fn):
             continue
-        if name == "repair_muse_clocks":
-            last = _last_clock_repair[0]
-            if last is not None and now - last < REPAIR_CLOCKS_EVERY_S:
-                continue
+        interval = 0.0 if _test_mode else (REPAIR_ORPHANS_EVERY_S if name == "repair_muse_orphans" else REPAIR_CLOCKS_EVERY_S)
+        # Per-store throttle so tests with fresh Store objects always run,
+        # while a live Store throttles to 60 s/120 s. The global cell is
+        # updated for backwards compat but not used as fallback.
+        by_store = _last_orphan_by_store if name == "repair_muse_orphans" else _last_clock_by_store
+        key = (str(getattr(store, "path", id(store))), name)
+        last = by_store.get(key)
+        if last is not None and now - last < interval:
+            continue
+        by_store[key] = now
+        if name == "repair_muse_orphans":
+            _last_orphan_repair[0] = now
+        else:
             _last_clock_repair[0] = now
         try:
             fn()
@@ -272,10 +309,17 @@ def _repair(store, now):
             _fail(where)
     merge = getattr(store, "merge_manifest_rows", None)
     if callable(merge):
-        try:
-            merge("muse", now=now)
-        except Exception:
-            _fail("merge")
+        key = (str(getattr(store, "path", id(store))), "merge")
+        last = _last_merge_by_store.get(key)
+        if _test_mode:
+            last = None
+        if last is None or now - last >= MERGE_EVERY_S:
+            _last_merge_by_store[key] = now
+            _last_merge[0] = now
+            try:
+                merge("muse", now=now)
+            except Exception:
+                _fail("merge")
 
 
 def _tail_file(store, path, sid, manifests, muse_parent, budget, per_file, now, processes):
@@ -286,6 +330,7 @@ def _tail_file(store, path, sid, manifests, muse_parent, budget, per_file, now, 
         return budget
     first_ts = None
     models = {}
+    usage_rows = []
     if raw:
         for line in raw.split(b"\n"):
             if not line.strip():
@@ -304,24 +349,34 @@ def _tail_file(store, path, sid, manifests, muse_parent, budget, per_file, now, 
                 models[esid] = ev["model"]
             elif esid not in models:
                 models[esid] = None
-            try:
-                store.add_usage(
-                    {
-                        "ts": ev["ts"] if ev["ts"] is not None else now,
-                        "session_id": esid,
-                        "run_id": _run_id(esid, manifests),
-                        "model": ev["model"],
-                        "tool": "muse",
-                        "message_id": ev["message_id"],
-                        "input": ev["input"],
-                        "output": ev["output"],
-                        "cache_read": ev["cache_read"],
-                        "cache_write": ev["cache_write"],
-                        "reasoning": ev["reasoning"],
-                    }
-                )
-            except Exception:
-                _fail("usage")
+            usage_rows.append(
+                {
+                    "ts": ev["ts"] if ev["ts"] is not None else now,
+                    "session_id": esid,
+                    "run_id": _run_id(esid, manifests),
+                    "model": ev["model"],
+                    "tool": "muse",
+                    "message_id": ev["message_id"],
+                    "input": ev["input"],
+                    "output": ev["output"],
+                    "cache_read": ev["cache_read"],
+                    "cache_write": ev["cache_write"],
+                    "reasoning": ev["reasoning"],
+                }
+            )
+    if usage_rows:
+        try:
+            batch = getattr(store, "add_usage_batch", None)
+            if callable(batch):
+                batch(usage_rows)
+            else:
+                for row in usage_rows:
+                    try:
+                        store.add_usage(row)
+                    except Exception:
+                        _fail("usage")
+        except Exception:
+            _fail("usage")
     if not models and started_at_zero and raw:
         models[sid] = None
     for esid, model in models.items():

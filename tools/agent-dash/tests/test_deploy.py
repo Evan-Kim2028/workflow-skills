@@ -479,15 +479,20 @@ class DeployLibTest(unittest.TestCase):
         self.assertIn("deploy", message)
 
     def test_wait_settled_needs_every_source_polled_once(self):
+        # Readiness no longer waits for a full first poll: a fresh restart's
+        # muse poll was 103 s under load, so requiring last_poll for every
+        # source made deploy roll back on f754f59. Now wait_settled returns
+        # as soon as health answers, regardless of last_poll values.
         pending = {"ok": True, "sources": [{"name": "a", "last_poll": 1.0}, {"name": "b", "last_poll": None}]}
         ready = {"ok": True, "sources": [{"name": "a", "last_poll": 1.0}, {"name": "b", "last_poll": 2.0}]}
         with mock.patch.object(deploy_lib, "fetch_health", side_effect=[pending, ready]):
             ok, _ = deploy_lib.wait_settled("http://127.0.0.1:1", timeout_s=10.0)
         self.assertTrue(ok)
+        # Even with a pending source, readiness is true (no wait for full poll)
         with mock.patch.object(deploy_lib, "fetch_health", return_value=pending):
             ok, reason = deploy_lib.wait_settled("http://127.0.0.1:1", timeout_s=0.1)
-        self.assertFalse(ok)
-        self.assertIn("running check anyway", reason)
+        self.assertTrue(ok)
+        self.assertEqual(reason, "")
 
     def test_gate_prefers_gate_sh_and_falls_back_to_test_files(self):
         with tempfile.TemporaryDirectory() as tmp:
