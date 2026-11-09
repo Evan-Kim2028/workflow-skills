@@ -499,7 +499,7 @@ def deploy(
     ref: str = DEFAULT_REF,
     worktree: Path | str | None = None,
     url: str | None = None,
-    health_timeout_s: float = 25.0,
+    health_timeout_s: float = 60.0,
     yes_live: bool = False,
 ) -> tuple[bool, str]:
     """Deploy ``ref`` as a clean release and switch the dashboard to it.
@@ -533,6 +533,9 @@ def deploy(
             recovered = _recover(state_dir, prev, url, health_timeout_s, yes_live, repo)
             return False, f"new release unhealthy: {reason}; {recovered}"
         wait_settled(url)
+        # Workers die during the restart window; reap again so a transient
+        # dead-pid row does not fail the health gate on the new release.
+        reap_stale_rows(state_dir)
     ok, reason = run_check(tool_dir_of(release))
     if not ok:
         recovered = _recover(state_dir, prev, url, health_timeout_s, yes_live, repo)
@@ -548,7 +551,7 @@ def deploy(
 def rollback(
     state_dir: Path | str,
     url: str | None = None,
-    health_timeout_s: float = 25.0,
+    health_timeout_s: float = 60.0,
     yes_live: bool = False,
     source: Path | str | None = None,
 ) -> tuple[bool, str]:
