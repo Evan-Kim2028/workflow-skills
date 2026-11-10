@@ -422,6 +422,20 @@
       if (mine !== healthSeq) return;
       settle();
       state.health = (j && typeof j === "object") ? j : null;
+      /* A deploy swaps the static assets under an open tab, and no-cache
+         only stops a cached copy: the tab keeps running the JS it loaded.
+         The first health response records the build; a later one naming a
+         different build reloads the page once so the tab runs the deployed
+         code. A missing build id never reloads. */
+      var build = (j && typeof j === "object" && j.build_id) ? String(j.build_id) : "";
+      if (build) {
+        if (!window.__adBuild) window.__adBuild = build;
+        else if (build !== window.__adBuild) {
+          window.__adBuild = build;
+          location.reload();
+          return;
+        }
+      }
       updateStale();
     }, function () {
       if (mine !== healthSeq) return;
