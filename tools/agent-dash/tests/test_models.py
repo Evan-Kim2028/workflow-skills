@@ -341,6 +341,7 @@ class DisplayNameTest(unittest.TestCase):
         "claude-haiku-5-5": "Claude Haiku 5.5",
         "claude-opus-5-5": "Claude Opus 5.5",
         "claude-fable-5-1": "Claude Fable 5.1",
+        "muse": "muse Spark 1.3",
         "muse-spark-1.3-contributor": "muse Spark 1.3",
         "reflection/Beam-1.0-501B-A23B": "Beam 1.0",
         "gpt-6-luna": "GPT-6 Luna",
