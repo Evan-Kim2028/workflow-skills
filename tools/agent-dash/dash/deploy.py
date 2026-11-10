@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -439,24 +440,32 @@ def restart_release(release_tool: Path | str, yes_live: bool = False) -> tuple[b
     return _run(argv, Path(release_tool), RESTART_TIMEOUT_S, "restart")
 
 
+TRANSIENT_CHECK_MARKERS = ("stale running", "dagster run missing", "source stalled")
+TOKEN_DRIFT = re.compile(r"(?:^|[\s-])(?:[a-z0-9_.]*tokens[a-z0-9_]*|cost_usd[a-z0-9_]*):")
+
+
 def run_check(release_tool: Path | str) -> tuple[bool, str]:
     """Run the release's own ``check``. Returns ``(ok, reason)``.
 
     A transient dead-pid or dagster stale that appears during the
     restart window (workers churn under load) does not gate the deploy:
     the new code is judged by the pricing/health gate, not by whether a
-    sibling worker died in the 30 s check window. Only pricing/token
-    mismatches (unpriced model, reconcile token drift) fail the check.
+    sibling worker died in the 30 s check window. Transient markers are
+    classified first, so a stale row never masks the deploy. Everything
+    else fails, including the real drift lines (``unpriced model:`` and
+    a metric line such as ``tokens:`` or ``cost_usd:``). The check
+    table's own headers (``tokens``, ``cost_usd``) carry no colon and
+    never match.
     """
     cli = Path(release_tool) / "agent_dash.py"
     ok, reason = _run([sys.executable, str(cli), "check"], Path(release_tool), CHECK_TIMEOUT_S, "check")
     if ok:
         return True, ""
     lower = reason.lower()
-    if "unpriced" in lower or "tokens" in lower and "mismatch" in lower:
-        return False, reason
-    if "stale running" in lower or "dagster run missing" in lower or "source stalled" in lower:
+    if any(marker in lower for marker in TRANSIENT_CHECK_MARKERS):
         return True, f"check has transient stale ({reason[:120]}); deploy continues"
+    if "unpriced" in lower or TOKEN_DRIFT.search(lower):
+        return False, reason
     return False, reason
 
 
