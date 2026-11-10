@@ -67,6 +67,28 @@ class MusePlaceholderTest(unittest.TestCase):
         self.assertEqual(_feed_tool_key(run), "muse")
 
 
+class MuseEmberTest(unittest.TestCase):
+    """Muse Ember is a free catalog model; it must not read as muse-unknown."""
+
+    def test_ember_id_maps_to_its_own_key(self):
+        self.assertEqual(model_key("muse-ember-1.0"), ("muse", "muse-ember-1.0"))
+        self.assertEqual(
+            run_model_key({"model": "muse-ember-1.0", "tier": "muse", "source": "muse"}),
+            "muse-ember-1.0",
+        )
+
+    def test_ember_id_displays_as_ember(self):
+        self.assertEqual(model_name("muse-ember-1.0"), "muse Ember 1.0")
+
+    def test_ember_id_prices_at_zero(self):
+        self.assertEqual(cost("muse-ember-1.0", 1_000_000, 1_000_000, 0, 0), 0)
+
+    def test_ember_run_counts_in_the_muse_lane(self):
+        run = {"model": "muse-ember-1.0", "tier": "muse", "source": "muse"}
+        self.assertEqual(_tool_key(run), "muse")
+        self.assertEqual(_feed_tool_key(run), "muse")
+
+
 class BeamFamilyTest(unittest.TestCase):
     def test_beam_ids_map_to_beam(self):
         cases = {
@@ -343,6 +365,7 @@ class DisplayNameTest(unittest.TestCase):
         "claude-fable-5-1": "Claude Fable 5.1",
         "muse": "muse Spark 1.3",
         "muse-spark-1.3-contributor": "muse Spark 1.3",
+        "muse-ember-1.0": "muse Ember 1.0",
         "reflection/Beam-1.0-501B-A23B": "Beam 1.0",
         "gpt-6-luna": "GPT-6 Luna",
         "gpt-6.1-sol": "GPT-6.1 Sol",

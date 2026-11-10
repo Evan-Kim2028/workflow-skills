@@ -78,6 +78,9 @@
     /* The muse CLI records the bare id "muse"; it bills as the contributor
        model. Mirrors the exact-id branch in dash/models.py. */
     if (m === "muse") return ["muse", "muse-spark-1.3-contributor"];
+    /* Muse Ember is a free model with its own catalog row; the generic muse
+       regex would read it as muse-unknown. Mirrors dash/models.py. */
+    if (/muse-ember/.test(m)) return ["muse", "muse-ember-1.0"];
     if (/muse/.test(m)) { v = /muse-(spark|wonder)(?:-full)?-(\d+(?:\.\d+)?)/.exec(m); return ["muse", v ? "muse-" + v[1] + "-" + v[2] : "muse-unknown"]; }
     if (/codex/.test(h) || m === "codex-unknown") return ["codex", m || "codex-unknown"];
     if (/^gpt-/.test(m) || m === "gpt-reserve" || /^codex-/.test(m)) return ["codex", m];
