@@ -170,14 +170,28 @@ class BaseMixin:
             runs, so every usage write names its run here. Bulk
             rewrites that cannot name runs bump
             ``_usage_fold_epoch`` instead and refold everything once.
+
+            The disk cache keys each fold on the run's max usage rowid,
+            so a new event invalidates its own entry. Only an in-place
+            rewrite (merge, rollup, cost fill) keeps the rowid, so only
+            that case drops the entry. Dropping on every write emptied
+            the cache and made the next full build rescan every run.
             """
             if run_id is None:
                 return
             if not isinstance(run_id, str):
                 run_id = str(run_id)
             self._usage_run_versions[run_id] = self._usage_run_versions.get(run_id, 0) + 1
-            # An in-place rewrite (merge, rollup) keeps the rowid, so
-            # the disk cache cannot see it. Drop the entry.
+            cached = self._usage_fold_cache.get(run_id)
+            if cached is None:
+                return
+            mark = self._conn.execute(
+                """SELECT MAX(rowid) AS mark FROM usage_events
+                   WHERE run_id=? AND COALESCE(tool, '') != 'grok-context'""",
+                (run_id,),
+            ).fetchone()["mark"]
+            if mark is not None and mark != cached[0]:
+                return
             self._usage_fold_cache.pop(run_id, None)
         def _bump_run_version(self, run_id) -> None:
             """Mark one run's cached view fragment stale. Caller holds the lock.
