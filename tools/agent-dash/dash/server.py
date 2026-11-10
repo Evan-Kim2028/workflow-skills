@@ -532,6 +532,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._health()
             elif path == "/api/doctor":
                 self._doctor(query)
+            elif path == "/api/flow":
+                self._flow()
             elif path == "/api/state":
                 self._state()
             elif path == "/api/project":
@@ -601,7 +603,7 @@ class Handler(BaseHTTPRequestHandler):
             )
 
         def compute():
-            return self.server.state_builder.run(collect, timeout=STATE_BUILD_TIMEOUT_S)
+            return self._state_payload()
 
         params = _ttl_viewer_params(self.server)
         try:
@@ -638,6 +640,68 @@ class Handler(BaseHTTPRequestHandler):
                     "The dashboard store is busy collecting data. Retry shortly.",
                 ),
             )
+
+    def _state_payload(self):
+        """The ``/api/state`` body from the shared state build.
+
+        ``/api/state`` and ``/api/flow`` read the same payload, so the
+        flow card never pays a second collection: ``build_state`` serves
+        its one-entry cache when nothing moved.
+        """
+        from dash.state import build_state
+
+        now = time.time()
+
+        def collect(processes=None):
+            if processes is None:
+                processes = _live_workers()
+            return _with_store_lock_timeout(
+                self.server.store,
+                lambda: build_state(
+                    self.server.store,
+                    self.server.registry,
+                    self.server.cfg,
+                    now=now,
+                    processes=processes,
+                    build=getattr(self.server, "build", None),
+                ),
+            )
+
+        return self.server.state_builder.run(collect, timeout=STATE_BUILD_TIMEOUT_S)
+
+    def _flow(self):
+        """``GET /api/flow``: queue counts and blockers from the cached state and doctor payloads.
+
+        Read-only and cheap: it folds the ``/api/state`` body and the
+        latest persisted doctor run, never a plan rescan or a check. The
+        response rides the shared TTL cache, so its ETag and 304 behave
+        like every other heavy read.
+        """
+        from dash import flowview
+
+        def compute():
+            doctor = self.server.store.doctor_latest(time.time())
+            return flowview.build_flow(self._state_payload(), doctor)
+
+        if self._ttl_serve("flow", {}, compute):
+            return
+        try:
+            payload = compute()
+        except TimeoutError:
+            self._json(
+                503,
+                api_error(
+                    "dashboard state is temporarily unavailable",
+                    "state_busy",
+                    "The dashboard store is busy collecting data. Retry shortly.",
+                ),
+            )
+            return
+        raw = json.dumps(payload, separators=(",", ":"), allow_nan=False).encode()
+        etag = _content_etag(raw)
+        if self._not_modified(etag):
+            return
+        self._send_body(200, raw, "application/json; charset=utf-8", etag=etag)
 
     def _health(self):
         body = _health_body(self.server, time.time(), self._doctor_block)

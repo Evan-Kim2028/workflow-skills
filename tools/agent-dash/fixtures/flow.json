@@ -1,0 +1,74 @@
+{
+  "generated_at": 1762300000.0,
+  "queues": [
+    {"key": "todo", "label": "Todo", "count": 8},
+    {"key": "wip", "label": "In progress", "count": 6},
+    {"key": "pr", "label": "Waiting to merge", "count": 3},
+    {"key": "prog", "label": "On prod", "count": 1},
+    {"key": "deferred", "label": "Deferred", "count": 3}
+  ],
+  "blockers": [
+    {
+      "code": "stuck-task",
+      "ws": "WS33",
+      "severity": "critical",
+      "count": 2,
+      "title": "Task WS33.2 is stuck in wip with no live agent",
+      "command": "python3 agent_dash.py doctor --ws WS33",
+      "next": "python3 agent_dash.py ws next WS33"
+    },
+    {
+      "code": "unpriced-model",
+      "ws": null,
+      "severity": "warn",
+      "count": 3,
+      "title": "Model mystery-9 has usage but no price",
+      "command": "python3 agent_dash.py doctor",
+      "next": null
+    },
+    {
+      "code": "orphan-worker",
+      "ws": "WS35",
+      "severity": "warn",
+      "count": 1,
+      "title": "Worker on WS35 has no live process",
+      "command": "python3 agent_dash.py doctor --ws WS35",
+      "next": "python3 agent_dash.py ws next WS35"
+    }
+  ],
+  "workstreams": [
+    {
+      "id": "WS33",
+      "title": "Serving cutover",
+      "counts": {"todo": 4, "wip": 2, "pr": 1, "prog": 1, "deferred": 1},
+      "total": 14,
+      "done": 6,
+      "pct": 43
+    },
+    {
+      "id": "WS34",
+      "title": "Price coverage",
+      "counts": {"todo": 3, "wip": 1, "pr": 0, "prog": 0, "deferred": 0},
+      "total": 6,
+      "done": 2,
+      "pct": 33
+    },
+    {
+      "id": "WS35",
+      "title": "Workflow skills",
+      "counts": {"todo": 1, "wip": 3, "pr": 2, "prog": 0, "deferred": 2},
+      "total": 15,
+      "done": 9,
+      "pct": 60
+    }
+  ],
+  "totals": {
+    "workstreams": 3,
+    "tasks": 35,
+    "done": 17,
+    "pct": 49,
+    "blockers": 3,
+    "blocked_tasks": 6
+  },
+  "empty": false
+}
