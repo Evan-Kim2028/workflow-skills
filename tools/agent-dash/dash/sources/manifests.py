@@ -96,6 +96,12 @@ _dir_cache: dict = {}
 _folder_cache: dict = {}
 FOLDER_CACHE_MAX = 20000
 DIR_LIST_CAP = 500
+#: (roots tuple, time bucket) -> [(root realpath, path, realpath)]: see
+#: ``_flat_run_dirs``. A bundle root's children are listed once per bucket;
+#: a manual run folder is only ever checked at its own path.
+_flat_cache: dict = {}
+FLAT_CACHE_MAX = 64
+FLAT_SCAN_S = DIR_SCAN_S
 
 
 def reset_state() -> None:
@@ -106,6 +112,7 @@ def reset_state() -> None:
     _emit_sig.clear()
     _dir_cache.clear()
     _folder_cache.clear()
+    _flat_cache.clear()
 
 
 def _folder_stamp(path):
@@ -1058,50 +1065,126 @@ def _flat_run_dirs(cfg, now, covered) -> list:
     ``out-``/``err-``/``report-`` files sit in the folder itself, not in a
     ``<session>/scratchpad/<tool>/`` tree, so ``_scratchpads`` never lists
     it. Roots are the manual registry plus the bundle run roots
-    (``<workstreams>/<ID>/runs``). A root is a pad when it holds a TSV
-    itself; its immediate child folders are pads when they hold one, which
-    is how a bundle root covers ``runs/<label>``. Nothing deeper is
-    listed. Returned pads carry ``parent`` None; ``_emit_manifest`` reads
+    (``<workstreams>/<ID>/runs``). A manual root is a pad when it holds a
+    TSV itself; it is never child-scanned, because a registered run folder
+    is flat. A bundle root is a pad when it holds a TSV itself, and its
+    immediate child folders are pads when they hold one, which is how a
+    bundle root covers ``runs/<label>``. Nothing deeper is listed. The
+    scan is cached for ``FLAT_SCAN_S`` keyed by the roots tuple, so a
+    quiet tree costs no listing; a new bundle run shows up when the bucket
+    advances. Returned pads carry ``parent`` None; ``_emit_manifest`` reads
     the flat layout for them. Folders already covered by ``covered``
     scratch pads are skipped.
     """
-    from dash.rundirs import _registry_configured, run_dirs
+    from dash.rundirs import _registry_configured, bundle_run_roots, registered_run_dirs
 
     if not _registry_configured(cfg):
         return []
     try:
-        roots = run_dirs(cfg=cfg, now=now)
+        manual = registered_run_dirs(cfg=cfg, now=now)
     except (OSError, ValueError):
+        manual = []
+    try:
+        bundles = bundle_run_roots(cfg)
+    except (OSError, ValueError):
+        bundles = []
+    roots = _flat_roots(manual, bundles)
+    if not roots:
         return []
-    have = set()
+    bucket = int(float(now) // FLAT_SCAN_S)
+    key = (roots, bucket)
+    candidates = _flat_cache.get(key)
+    if candidates is None:
+        candidates = _scan_flat_roots(roots)
+        if len(_flat_cache) >= FLAT_CACHE_MAX:
+            _flat_cache.clear()
+        _flat_cache[key] = candidates
+    covered_reals = set()
     for scratch in covered or []:
         try:
-            have.add(realpath_memo(scratch))
+            covered_reals.add(realpath_memo(scratch))
         except OSError:
-            have.add(scratch)
+            covered_reals.add(scratch)
+    have = set(covered_reals)
     found = []
-    for root in roots:
+    for root_real, path, real in candidates:
+        if root_real in covered_reals or real in have:
+            continue
+        have.add(real)
+        found.append((None, path))
+    return found
+
+
+def _flat_roots(manual, bundles) -> tuple:
+    """``(path, is_bundle)`` per run root, manual first, deduped by real path.
+
+    A path in both lists is a bundle root: it keeps the manual position but
+    gets the one-level child scan, so a bundle root registered by hand still
+    covers its ``runs/<label>`` children.
+    """
+    bundle_reals = set()
+    for path in bundles or []:
+        try:
+            bundle_reals.add(realpath_memo(path))
+        except OSError:
+            bundle_reals.add(path)
+    out = []
+    seen = set()
+    for path in manual or []:
+        try:
+            real = realpath_memo(path)
+        except OSError:
+            real = path
+        if real in seen:
+            continue
+        seen.add(real)
+        out.append((path, real in bundle_reals))
+    for path in bundles or []:
+        try:
+            real = realpath_memo(path)
+        except OSError:
+            real = path
+        if real in seen:
+            continue
+        seen.add(real)
+        out.append((path, True))
+    return tuple(out)
+
+
+def _scan_flat_roots(roots) -> list:
+    """``(root realpath, path, realpath)`` for every flat pad under ``roots``.
+
+    A manual root is checked at its own path only. A bundle root is checked
+    at its own path and one level down, so ``runs/<label>`` is found. A
+    symlinked child is skipped by the listing, and nothing outside a root
+    is read.
+    """
+    found = []
+    seen = set()
+    for root, is_bundle in roots:
         try:
             real = realpath_memo(root)
         except OSError:
             continue
-        if real in have:
+        if real in seen:
             continue
         state = _folder_state(root)
         if state is None:
             continue
         if state[0]:
-            have.add(real)
-            found.append((None, root))
+            seen.add(real)
+            found.append((real, root, real))
+        if not is_bundle:
+            continue
         for child in _flat_child_dirs(root):
             try:
                 child_real = realpath_memo(child)
             except OSError:
                 continue
-            if child_real in have:
+            if child_real in seen:
                 continue
-            have.add(child_real)
-            found.append((None, child))
+            seen.add(child_real)
+            found.append((real, child, child_real))
     return found
 
 

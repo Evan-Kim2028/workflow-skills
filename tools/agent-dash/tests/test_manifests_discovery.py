@@ -241,6 +241,62 @@ class BundleRunRootTests(unittest.TestCase):
         manifests.poll(self.store, self._cfg(), NOW)
         self.assertEqual(self.emitted, [])
 
+    def test_manual_root_is_not_child_scanned(self):
+        flat = os.path.join(self.root, "manual-run")
+        _write(os.path.join(flat, "muse-sessions.tsv"), f"manual-alpha\t{MUSE}\t1700000000\n")
+        _write(os.path.join(flat, "out-manual-alpha.md"), "PASS\n")
+        child = os.path.join(flat, "nested")
+        _write(os.path.join(child, "glm-sessions.tsv"), f"nested-beta\t{GLM}\t1700000001\n")
+        rundirs.register_run_dir(self.state, flat)
+        with mock.patch.object(
+            manifests, "_flat_child_dirs", wraps=manifests._flat_child_dirs
+        ) as child_dirs:
+            manifests.poll(self.store, self._cfg(), NOW)
+        self.assertIn("manual-alpha", self.emitted)
+        self.assertNotIn("nested-beta", self.emitted)
+        self.assertEqual(child_dirs.call_args_list, [])
+
+    def test_only_bundle_roots_are_child_scanned(self):
+        manual = os.path.join(self.root, "manual-run")
+        _write(os.path.join(manual, "muse-sessions.tsv"), f"manual-alpha\t{MUSE}\t1700000000\n")
+        rundirs.register_run_dir(self.state, manual)
+        bundle = self._run_folder("WS1", "runs")
+        run = os.path.join(bundle, "ws1-exec-gamma")
+        _write(os.path.join(run, "muse-sessions.tsv"), f"ws1-exec-gamma\t{MUSE}\t1700000000\n")
+        with mock.patch.object(
+            manifests, "_flat_child_dirs", wraps=manifests._flat_child_dirs
+        ) as child_dirs:
+            manifests.poll(self.store, self._cfg(), NOW)
+        called = [call.args[0] for call in child_dirs.call_args_list]
+        self.assertIn(os.path.realpath(bundle), called)
+        self.assertNotIn(os.path.realpath(manual), called)
+        self.assertIn("manual-alpha", self.emitted)
+        self.assertIn("ws1-exec-gamma", self.emitted)
+
+    def test_new_bundle_run_appears_after_the_cache_bucket_advances(self):
+        bundle = self._run_folder("WS1", "runs")
+        first = os.path.join(bundle, "ws1-exec-one")
+        _write(os.path.join(first, "muse-sessions.tsv"), f"ws1-exec-one\t{MUSE}\t1700000000\n")
+        manifests.poll(self.store, self._cfg(), NOW)
+        self.assertIn("ws1-exec-one", self.emitted)
+        second = os.path.join(bundle, "ws1-exec-two")
+        _write(os.path.join(second, "muse-sessions.tsv"), f"ws1-exec-two\t{GLM}\t1700000001\n")
+        manifests.poll(self.store, self._cfg(), NOW)
+        self.assertNotIn("ws1-exec-two", self.emitted)
+        later = NOW + manifests.FLAT_SCAN_S
+        self.assertNotEqual(int(later // manifests.FLAT_SCAN_S), int(NOW // manifests.FLAT_SCAN_S))
+        manifests.poll(self.store, self._cfg(), later)
+        self.assertIn("ws1-exec-two", self.emitted)
+
+    def test_reset_state_clears_the_flat_cache(self):
+        bundle = self._run_folder("WS1", "runs")
+        run = os.path.join(bundle, "ws1-exec-one")
+        _write(os.path.join(run, "muse-sessions.tsv"), f"ws1-exec-one\t{MUSE}\t1700000000\n")
+        manifests.poll(self.store, self._cfg(), NOW)
+        self.assertTrue(manifests._flat_cache)
+        manifests.reset_state()
+        self.assertEqual(manifests._flat_cache, {})
+
 
 if __name__ == "__main__":
     unittest.main()
