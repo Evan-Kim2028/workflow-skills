@@ -75,6 +75,9 @@
        the model name, so the served id names the family. Mirrors
        is_kimi_alias in dash/models.py. */
     if (/kimik31|kimi-k3(?:\.1)?/.test(m)) return ["kimi", "kimi-k3.1"];
+    /* The muse CLI records the bare id "muse"; it bills as the contributor
+       model. Mirrors the exact-id branch in dash/models.py. */
+    if (m === "muse") return ["muse", "muse-spark-1.3-contributor"];
     if (/muse/.test(m)) { v = /muse-(spark|wonder)(?:-full)?-(\d+(?:\.\d+)?)/.exec(m); return ["muse", v ? "muse-" + v[1] + "-" + v[2] : "muse-unknown"]; }
     if (/codex/.test(h) || m === "codex-unknown") return ["codex", m || "codex-unknown"];
     if (/^gpt-/.test(m) || m === "gpt-reserve" || /^codex-/.test(m)) return ["codex", m];
@@ -128,6 +131,8 @@
       if (dk === "deepseek-v4-pro") return "DeepSeek V4 Pro";
     }
     if (/kimik31|kimi-k3(?:\.1)?/i.test(key)) return "Kimi K3.1";
+    /* The bare muse placeholder id displays as the model it bills as. */
+    if (key === "muse") return "muse Spark 1.3";
     var parts = cleanId(key).split("-").filter(function (w) { return w !== ""; });
     var words = parts.map(titleWord);
     if (parts.length > 1 && parts[0].toLowerCase() === "gpt" && /^\d/.test(parts[1])) {

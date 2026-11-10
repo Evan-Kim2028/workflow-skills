@@ -45,6 +45,28 @@ class ModelKeyTest(unittest.TestCase):
         self.assertEqual(run_model_key({"model": None, "tier": "haiku"}), "haiku")
 
 
+class MusePlaceholderTest(unittest.TestCase):
+    """The muse CLI records the bare id ``muse``; it bills as the contributor model."""
+
+    def test_bare_muse_id_maps_to_the_contributor_key(self):
+        self.assertEqual(model_key("muse"), ("muse", "muse-spark-1.3-contributor"))
+        self.assertEqual(
+            run_model_key({"model": "muse", "tier": "muse", "source": "muse"}),
+            "muse-spark-1.3-contributor",
+        )
+
+    def test_bare_muse_id_displays_as_spark(self):
+        self.assertEqual(model_name("muse"), "muse Spark 1.3")
+
+    def test_bare_muse_id_prices_at_the_contributor_rate(self):
+        self.assertAlmostEqual(cost("muse", 1_000_000, 1_000_000, 0, 0), 0.3)
+
+    def test_bare_muse_run_counts_in_the_muse_lane(self):
+        run = {"model": "muse", "tier": "muse", "source": "muse"}
+        self.assertEqual(_tool_key(run), "muse")
+        self.assertEqual(_feed_tool_key(run), "muse")
+
+
 class BeamFamilyTest(unittest.TestCase):
     def test_beam_ids_map_to_beam(self):
         cases = {
@@ -319,6 +341,7 @@ class DisplayNameTest(unittest.TestCase):
         "claude-haiku-5-5": "Claude Haiku 5.5",
         "claude-opus-5-5": "Claude Opus 5.5",
         "claude-fable-5-1": "Claude Fable 5.1",
+        "muse": "muse Spark 1.3",
         "muse-spark-1.3-contributor": "muse Spark 1.3",
         "reflection/Beam-1.0-501B-A23B": "Beam 1.0",
         "gpt-6-luna": "GPT-6 Luna",
