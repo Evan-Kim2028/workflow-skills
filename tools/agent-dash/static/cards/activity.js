@@ -345,7 +345,7 @@
     });
     (loaded.usage || []).forEach(function (b) {
       if (!(b.t + 3600 > range.from && b.t < range.to)) return;
-      var k = state.groupBy === "model" ? String(b.key || "other") : null;
+      var k = groupFor() === "model" ? String(b.key || "other") : null;
       if (k && AdUnatt.isUnattributed(k))
         tokens += (b.input || 0) + (b.output || 0) + (b.cache_read || 0) + (b.cache_write || 0);
     });
@@ -654,12 +654,15 @@
       else wrap.appendChild(el("div", {class: "empty", text: "No usage in this window."}));
       return {node: wrap, hasData: false};
     }
-    var byModel = state.groupBy === "model";
+    /* The loaded buckets follow the effective grouping, not the toggle:
+       a workstream tab always fetches model-grouped usage. */
+    var group = groupFor();
+    var byModel = group === "model";
     var showU = AdUnatt.shown(actScope());
     var hours = {}, keys = {};
     /* Model-grouped cells arrive as model@harness series keys; the stack
        splits harnesses of one model instead of folding them together. */
-    B.forEach(function (b) { var k = state.groupBy === "model" ? String(b.key || "other") : (b.key || "unassigned"); var tot = (b.input || 0) + (b.output || 0) + (b.cache_read || 0) + (b.cache_write || 0); hours[b.t] = hours[b.t] || {}; hours[b.t][k] = (hours[b.t][k] || 0) + tot; keys[k] = 1; });
+    B.forEach(function (b) { var k = group === "model" ? String(b.key || "other") : (b.key || "unassigned"); var tot = (b.input || 0) + (b.output || 0) + (b.cache_read || 0) + (b.cache_write || 0); hours[b.t] = hours[b.t] || {}; hours[b.t][k] = (hours[b.t][k] || 0) + tot; keys[k] = 1; });
     var allKs = byModel ? ADM.sortSeries(Object.keys(keys)) : Object.keys(keys).sort();
     /* Runs without a recorded model stay out of the model lists by
        default; the stacked total keeps them as one muted Unattributed
@@ -703,7 +706,7 @@
       ks.forEach(function (k) {
         if (!keyTot[k]) return;
         var sp = el("span", {class: "lentry", "data-key": k, "data-v": String(keyTot[k]), title: actLegendTip(k, keyTot[k])});
-        var sw = el("i", {class: "sw"}); sw.style.background = colorOf(k, state.groupBy); sp.appendChild(sw);
+        var sw = el("i", {class: "sw"}); sw.style.background = colorOf(k, group); sp.appendChild(sw);
         sp.appendChild(el("span", {class: "lname", text: k}));
         sp.appendChild(el("span", {class: "lv", text: fmtN(keyTot[k])}));
         lg.appendChild(sp);
@@ -729,7 +732,7 @@
       var dks = ks.slice();
       if (hideU && hourHidden(t) > 0) dks.push("unattributed");
       function segVal(k) { return k === "unattributed" ? hourHidden(t) : (hours[t][k] || 0); }
-      function segFill(k) { return k === "unattributed" ? "var(--muted)" : (byModel ? ADM.seriesColor(k, allKs) : colorOf(k, state.groupBy)); }
+      function segFill(k) { return k === "unattributed" ? "var(--muted)" : (byModel ? ADM.seriesColor(k, allKs) : colorOf(k, group)); }
       var order = [];
       dks.forEach(function (k, ki) { if (segVal(k)) order.push(ki); });
       var topKi = order.length ? order[order.length - 1] : -1;
