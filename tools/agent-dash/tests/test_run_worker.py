@@ -1214,5 +1214,129 @@ class PromptHandoffTests(unittest.TestCase):
         self.assertEqual(Path(ctx["prompt"]).name, "ws1-plan-big.md")
 
 
+class AdmissionTests(unittest.TestCase):
+    """Global launch-count and prompt-size admission. Temp state, fake processes.
+
+    Borrows the fixture and runner helpers from RunWorkerTests without
+    inheriting its test methods (which would run twice).
+    """
+
+    go = RunWorkerTests.go
+    pgrep = RunWorkerTests.pgrep
+
+    def setUp(self):
+        RunWorkerTests.setUp(self)
+        self.counts = {}
+        self.saved_admission_env = {key: os.environ.pop(key, None) for key in runner.ADMISSION_ENV.values()}
+
+    def tearDown(self):
+        for key, value in self.saved_admission_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        RunWorkerTests.tearDown(self)
+
+    def admit(self, **block):
+        data = registry()
+        data["admission"] = block
+        self.reg.write_text(json.dumps(data), encoding="utf-8")
+
+    def lease_file(self, label="ws1-plan-lane-1"):
+        return self.run_dir / f"{label}{runner.LEASE_SUFFIX}"
+
+    def test_cap_refuses_the_next_launch(self):
+        self.admit(max_active_runs=1)
+        first = Launch(alive=True)
+        code, line = self.go("muse", first, label="ws1-exec-lane-1")
+        self.assertEqual(code, 0)
+        self.assertIn("STATUS: running", line)
+        self.assertEqual(len(first.cmds), 1)
+        second = Launch()
+        code, line = self.go("muse", second, label="ws1-exec-lane-2")
+        self.assertEqual(code, 0)
+        self.assertIn("STATUS: failed", line)
+        self.assertIn("reason=capacity", line)
+        self.assertEqual(second.cmds, [])
+        self.assertFalse((self.run_dir / "ws1-exec-lane-2.tier").exists())
+        self.assertFalse(self.lease_file("ws1-exec-lane-2").exists())
+
+    def test_cap_releases_after_a_waited_run(self):
+        self.admit(max_active_runs=1)
+        first = Launch()
+        code, line = self.go("muse", first, label="ws1-exec-lane-1", max_wait="540")
+        self.assertEqual(code, 0)
+        self.assertIn("STATUS: done", line)
+        self.assertFalse(self.lease_file("ws1-exec-lane-1").exists())
+        second = Launch()
+        code, line = self.go("muse", second, label="ws1-exec-lane-2", max_wait="540")
+        self.assertEqual(code, 0)
+        self.assertIn("STATUS: done", line)
+        self.assertEqual(len(second.cmds), 1)
+
+    def test_prompt_over_cap_refuses(self):
+        self.admit(max_prompt_bytes=64)
+        launch = Launch()
+        code, line = self.go("muse", launch)
+        self.assertEqual(code, 2)
+        self.assertIn("STATUS: failed", line)
+        self.assertIn("reason=prompt-budget", line)
+        self.assertEqual(launch.cmds, [])
+        self.assertFalse((self.run_dir / "ws1-plan-lane-1.tier").exists())
+
+    def test_disabled_config_preserves_the_launch(self):
+        launch = Launch()
+        code, line = self.go("muse", launch)
+        self.assertEqual(code, 0)
+        self.assertIn("STATUS: done", line)
+        self.assertEqual(len(launch.cmds), 1)
+        self.assertFalse(self.lease_file().exists())
+        self.assertFalse((self.state / "admission.json").exists())
+        self.admit(max_active_runs=0, max_prompt_bytes=0)
+        launch = Launch()
+        code, line = self.go("muse", launch, label="ws1-exec-lane-2")
+        self.assertEqual(code, 0)
+        self.assertIn("STATUS: done", line)
+        self.assertEqual(len(launch.cmds), 1)
+        self.assertFalse(self.lease_file("ws1-exec-lane-2").exists())
+        self.assertFalse((self.state / "admission.json").exists())
+
+    def test_lease_file_is_written_for_a_detached_run(self):
+        self.admit(max_active_runs=2, lease_ttl_s=120)
+        launch = Launch(alive=True)
+        code, line = self.go("muse", launch)
+        self.assertEqual(code, 0)
+        self.assertIn("STATUS: running", line)
+        body = json.loads(self.lease_file().read_text(encoding="utf-8"))
+        self.assertEqual(body["owner"], "run_worker:ws1-plan-lane-1")
+        self.assertEqual(body["tier"], "muse")
+        self.assertEqual(body["ttl_s"], 120)
+        self.assertTrue(body["lease_id"])
+        state = json.loads((self.state / "admission.json").read_text(encoding="utf-8"))
+        self.assertIn(body["lease_id"], state["leases"])
+
+    def test_environment_override_wins_over_the_registry_block(self):
+        self.admit(max_active_runs=5)
+        os.environ["AGENT_DASH_ADMISSION_MAX_ACTIVE_RUNS"] = "1"
+        first = Launch(alive=True)
+        self.go("muse", first, label="ws1-exec-lane-1")
+        second = Launch()
+        _code, line = self.go("muse", second, label="ws1-exec-lane-2")
+        self.assertIn("reason=capacity", line)
+        self.assertEqual(second.cmds, [])
+
+    def test_no_live_state_is_touched(self):
+        live = Path.home() / ".local" / "share" / "agent-dash" / "admission.json"
+        existed = live.exists()
+        before = live.read_bytes() if existed else None
+        self.admit(max_active_runs=1)
+        launch = Launch(alive=True)
+        self.go("muse", launch)
+        self.assertTrue((self.state / "admission.json").exists())
+        self.assertEqual(live.exists(), existed)
+        if existed:
+            self.assertEqual(live.read_bytes(), before)
+
+
 if __name__ == "__main__":
     unittest.main()

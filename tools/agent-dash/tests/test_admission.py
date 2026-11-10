@@ -234,6 +234,16 @@ class AdmissionTest(unittest.TestCase):
         self.assertTrue(second["ok"])
         self.assertEqual(second["active"], 1)
 
+    def test_capacity_lease_releases_by_its_owner_token(self):
+        """A launcher's lease is released from its owner token alone, no pid needed."""
+        owner = "run_worker:ws35-exec-lane-1"
+        first = self.store.admit_capacity(owner, "", "ws35-exec-lane-1", max_concurrent=1)
+        self.assertTrue(first["ok"])
+        blocked = self.store.admit_capacity("run_worker:other", "", "t", max_concurrent=1)
+        self.assertEqual(blocked["reason"], "capacity")
+        self.assertTrue(self.store.release(first["lease_id"], owner)["released"])
+        self.assertTrue(self.store.admit_capacity("run_worker:other", "", "t", max_concurrent=1)["ok"])
+
     def test_capacity_only_lease_expires_and_reaps(self):
         first = self.store.admit_capacity("a", "WS35", "t", max_concurrent=1, ttl_s=10, now=1000.0)
         self.assertTrue(first["ok"])
