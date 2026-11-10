@@ -72,6 +72,7 @@ def _new_state() -> dict:
         "last_ok": None,
         "last_error": None,
         "last_duration_s": None,
+        "next_due": None,
         "timed_out": False,
         "skip": False,
         "thread": None,
@@ -313,6 +314,7 @@ def _run_poll(registry: Registry, source, store, cfg, now: float, budget: float)
             state["last_poll"] = now
             state["last_error"] = _short(exc)
             state["last_duration_s"] = duration
+            _set_next_due(source, state, now, duration)
             if duration <= budget:
                 state["timed_out"] = False
         log.warning("source %s: %s", source.NAME, state["last_error"])
@@ -326,6 +328,7 @@ def _run_poll(registry: Registry, source, store, cfg, now: float, budget: float)
             state["last_ok"] = now
             state["last_error"] = _surfaced(source)
             state["last_duration_s"] = duration
+            _set_next_due(source, state, now, duration)
             state["timed_out"] = duration > budget
             if state["timed_out"]:
                 state["last_error"] = (
@@ -400,12 +403,31 @@ def signal_token(source, cfg):
     return tuple(token)
 
 
+def _set_next_due(source, state: dict, now: float, duration: float) -> None:
+    """Earliest next start for a source without signals: twice its own duration.
+
+    A poll that outlasts its interval is due again the moment it returns, so
+    a heavy source ran back to back and contended on the store lock. The
+    delay is measured from the poll start (``now``), so a source gets at
+    least its own duration of quiet between starts. Signal-backed sources
+    keep their signal and dormant-backoff cadence.
+    """
+    if declares_signals(source):
+        return
+    state["next_due"] = now + max(_interval_s(source), duration * 2.0)
+
+
 def _due(source, state: dict, now: float, cfg) -> bool:
     """Whether a source's next poll is due (interval, or dormant backoff)."""
     last = state.get("last_poll")
     if last is None:
         return True
-    if not declares_signals(source) or int(state.get("idle") or 0) < BACKOFF_AFTER:
+    if not declares_signals(source):
+        next_due = state.get("next_due")
+        if next_due is not None:
+            return now >= next_due
+        return now - last >= source.INTERVAL_S
+    if int(state.get("idle") or 0) < BACKOFF_AFTER:
         return now - last >= source.INTERVAL_S
     if fallback_enabled(source) and now - last >= backoff_gap(source, state["idle"]):
         return True
