@@ -39,7 +39,10 @@ process = importlib.util.module_from_spec(SPEC3)
 SPEC3.loader.exec_module(process)
 
 FIXTURE = HERE / "fixtures" / "pi-stream.ndjson"
+MORPH_FIXTURE = HERE / "fixtures" / "pi-stream-morph.ndjson"
 SID = "01a16401-9955-70cd-bf8c-19944db4f20c"
+MORPH = "morph/morph-dsv41flash-1017"
+MORPH_SID = "01a1c3b9-4c18-7517-af98-8caad17525f4"
 DEEPSEEK = "river/deepseek-ai/DeepSeek-V4.1-Flash"
 GLM = "river/zai-org/GLM-5.3-Flash"
 DEEPSEEK_ID = "deepseek-ai/DeepSeek-V4.1-Flash"
@@ -389,12 +392,67 @@ class SourceTest(unittest.TestCase):
         run = self.store.runs[self.run_id("ws15-exec-fail")]
         self.assertEqual(run["status"], "died_early")
 
-    def test_pi_source_never_emits_usage(self):
+    def test_source_emits_usage_from_the_stream(self):
         self.write_tsv([["ws15-exec-u", SID, 1792000000, DEEPSEEK]])
         (self.pad / "out-ws15-exec-u.md").write_text("PASS\n", encoding="utf-8")
         (self.pad / "stream-ws15-exec-u.ndjson").write_bytes(FIXTURE.read_bytes())
         self.poll()
-        self.assertEqual(self.store.usage, {})
+        rows = list(self.store.usage.values())
+        self.assertEqual(len(rows), 2)
+        self.assertEqual((rows[0]["input"], rows[0]["cache_read"], rows[0]["output"]), (1900, 0, 38))
+        self.assertEqual(rows[0]["run_id"], self.run_id("ws15-exec-u"))
+        self.assertEqual(rows[0]["tool"], "pi")
+        self.assertEqual(rows[0]["message_id"], f"{SID}-1")
+
+    def test_stream_is_read_once_per_byte_cursor(self):
+        self.write_tsv([["ws15-exec-once", SID, 1792000000, DEEPSEEK]])
+        (self.pad / "out-ws15-exec-once.md").write_text("PASS\n", encoding="utf-8")
+        (self.pad / "stream-ws15-exec-once.ndjson").write_bytes(FIXTURE.read_bytes())
+        self.poll()
+        first = dict(self.store.usage)
+        self.poll(now=1_800_000_002.0)
+        self.assertEqual(self.store.usage, first)
+
+    def test_chunked_reads_keep_the_full_stream_message_ids(self):
+        # A stream read in two chunks must number its messages as the
+        # launcher's full-stream read does, or the second chunk overwrites
+        # the first chunk's rows.
+        self.write_tsv([["ws15-exec-chunk", SID, 1792000000, MORPH]])
+        (self.pad / "out-ws15-exec-chunk.md").write_text("PASS\n", encoding="utf-8")
+        (self.pad / "stream-ws15-exec-chunk.ndjson").write_bytes(MORPH_FIXTURE.read_bytes())
+        cfg = self.cfg()
+        cfg["read_budgets"] = {"per_file": 500, "per_tick": 500}
+        pi.poll(self.store, cfg, 1_800_000_000.0)
+        pi.poll(self.store, cfg, 1_800_000_002.0)
+        ids = sorted(row["message_id"] for row in self.store.usage.values())
+        self.assertEqual(ids, [f"{MORPH_SID}-1", f"{MORPH_SID}-2"])
+
+    def test_split_layout_reads_the_stream_in_pi(self):
+        # run_worker.py writes the manifest in the run folder while
+        # launch_pi.py writes the stream in <run_dir>/pi/.
+        run_dir = self.tmp / "runs" / "ws15-exec-split"
+        (run_dir / "pi").mkdir(parents=True)
+        (run_dir / "pi-sessions.tsv").write_text(
+            HEADER + f"ws15-exec-split\t{SID}\t1792000000\t{MORPH}\n", encoding="utf-8"
+        )
+        (run_dir / "pi" / "stream-ws15-exec-split.ndjson").write_bytes(MORPH_FIXTURE.read_bytes())
+        (run_dir / "pi" / "out-ws15-exec-split.md").write_text("PASS\n", encoding="utf-8")
+        pi.poll(
+            self.store,
+            {"roots": {"scratchpads": [str(self.tmp / "runs")]}, "read_budgets": {}},
+            1_800_000_000.0,
+        )
+        self.assertIsNone(pi.last_error)
+        run = self.store.runs[self.run_id("ws15-exec-split")]
+        self.assertEqual(run["status"], "done")
+        self.assertEqual(run["verdict"], "PASS")
+        rows = list(self.store.usage.values())
+        self.assertEqual(len(rows), 2)
+        self.assertEqual((rows[0]["input"], rows[0]["cache_read"], rows[0]["output"]), (645, 59392, 209))
+        self.assertEqual(rows[0]["run_id"], self.run_id("ws15-exec-split"))
+        self.assertEqual(rows[0]["session_id"], MORPH_SID)
+        # pi reports the served id without the provider prefix.
+        self.assertEqual(rows[0]["model"], "morph-dsv41flash-1017")
 
     def test_parse_rows_skips_header_and_short_rows(self):
         self.write_tsv([["ws15-exec-a", SID, 1792000000, DEEPSEEK]])
@@ -748,6 +806,8 @@ class ModelTierTest(unittest.TestCase):
         self.assertEqual(pi._model_tier("reflection/Beam-1.0-501B-A23B"), "beam")
         self.assertEqual(pi._model_tier("river/zai-org/GLM-5.3-Flash"), "glm")
         self.assertEqual(pi._model_tier("river/deepseek-ai/DeepSeek-V4.1-Flash-1017"), "deepseek")
+        self.assertEqual(pi._model_tier(MORPH), "deepseek")
+        self.assertEqual(pi._model_tier("morph/morph-dsv41flash"), "deepseek")
         self.assertEqual(pi._model_tier(None), "pi")
 
     def test_store_family_tier_matches_source(self):
@@ -761,6 +821,8 @@ class ModelTierTest(unittest.TestCase):
             ("river/zai-org/GLM-5.3-Flash", "pi-glm"),
             ("river/deepseek-ai/DeepSeek-V4.1-Flash-1017", "pi-deepseek"),
             ("deepseek-ai/DeepSeek-V4.1-Flash", "pi-deepseek"),
+            (MORPH, "pi-deepseek"),
+            ("morph-dsv41flash-1017", "pi-deepseek"),
         ):
             self.assertEqual(_family_tier("pi", model), tier)
             self.assertEqual(_family_tier("pi", model)[3:], pi._model_tier(model))
@@ -853,6 +915,37 @@ class CacheWriteChainTest(unittest.TestCase):
         # 30k at the 5m rate (0.125) + 20k at the 1h rate (0.2), then 50k all at 5m.
         self.assertAlmostEqual(costs[f"{SID}-1"], 0.00775, places=9)
         self.assertAlmostEqual(costs[f"{SID}-2"], 0.00625, places=9)
+
+
+class StreamCostTest(unittest.TestCase):
+    """The split layout's stream prices a Morph DeepSeek run end to end."""
+
+    def test_split_layout_run_has_tokens_and_cost(self):
+        from dash.store import Store
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        run_dir = Path(tmp.name) / "runs" / "ws15-exec-morph"
+        (run_dir / "pi").mkdir(parents=True)
+        (run_dir / "pi-sessions.tsv").write_text(
+            HEADER + f"ws15-exec-morph\t{SID}\t1792000000\t{MORPH}\n", encoding="utf-8"
+        )
+        (run_dir / "pi" / "stream-ws15-exec-morph.ndjson").write_bytes(MORPH_FIXTURE.read_bytes())
+        (run_dir / "pi" / "out-ws15-exec-morph.md").write_text("PASS\n", encoding="utf-8")
+        store = Store(Path(tmp.name) / "dash.sqlite")
+        self.addCleanup(store.close)
+        pi._tsv_cache.clear()
+        pi.poll(
+            store,
+            {"roots": {"scratchpads": [str(Path(tmp.name) / "runs")]}, "read_budgets": {}},
+            1_800_000_000.0,
+        )
+        runs = {r["run_id"]: r for r in store.query_runs(1_800_000_000.0, "WS15", None, None, 100)}
+        run = runs[f"pi:{SID}:ws15-exec-morph"]
+        self.assertGreater(run["tokens"]["output"], 0)
+        self.assertGreater(run["tokens"]["cache_read"], 0)
+        self.assertGreater(run["cost_usd"], 0)
+        self.assertEqual(run["model"], MORPH)
 
 
 class NonAnthropicPricingUnchangedTest(unittest.TestCase):

@@ -369,6 +369,20 @@ class BeamPricingTest(unittest.TestCase):
         self.assertFalse(status("someprovider/new-model:xhigh")["priced"])
 
 
+class ThinkingSuffixPricingTest(unittest.TestCase):
+    def test_effort_suffix_prices_like_bare_id(self):
+        """Every pi thinking level prices as its bare id, not as None."""
+        model = "morph/morph-dsv41flash-1017"
+        args = (1_000_000, 500_000, 250_000, 0)
+        bare = cost(model, *args)
+        self.assertIsNotNone(bare)
+        for level in ("off", "minimal", "low", "medium", "high", "xhigh", "max"):
+            with self.subTest(level=level):
+                suffixed = f"{model}:{level}"
+                self.assertEqual(cost(suffixed, *args), bare)
+                self.assertTrue(status(suffixed)["priced"])
+
+
 class RepriceTest(unittest.TestCase):
     def test_migrate_adds_split_columns(self):
         with tempfile.TemporaryDirectory() as tmp:

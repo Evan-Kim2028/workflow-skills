@@ -1083,8 +1083,10 @@ def _family_tier(source, model) -> str | None:
         # deepseek), spelled as the registry names them; generic takes
         # the same families first (tier_of does not know deepseek) and
         # falls back to its own tier names below.
+        from dash.models import is_deepseek_alias
+
         for name in ("deepseek", "beam", "glm"):
-            if name in text:
+            if name in text or (name == "deepseek" and is_deepseek_alias(text)):
                 return "pi-" + name if source == "pi" else name
     if source == "generic":
         from dash.sources.generic import tier_of

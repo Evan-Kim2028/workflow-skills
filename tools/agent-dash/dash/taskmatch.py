@@ -299,4 +299,8 @@ def run_family(run: dict) -> str:
         return source
     if source.startswith("claude"):
         return "other"
+    from dash.models import is_deepseek_alias
+
+    if is_deepseek_alias(run.get("model")):
+        return "deepseek"
     return "other"
