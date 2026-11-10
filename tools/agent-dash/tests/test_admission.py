@@ -165,18 +165,101 @@ class AdmissionTest(unittest.TestCase):
     def test_snapshot_reports_version_and_leases(self):
         lease = self.claim("a", ["src/mod.py"])
         body = self.store.snapshot()
-        self.assertEqual(body["version"], 1)
+        self.assertEqual(body["version"], 2)
         self.assertEqual(body["count"], 1)
         self.assertEqual(body["leases"][0]["lease_id"], lease["lease_id"])
         self.assertEqual(body["leases"][0]["files"], ["src/mod.py"])
         self.assertEqual(body["leases"][0]["ws"], "WS35")
 
+    def test_claim_root_scopes_declaration_to_that_workspace(self):
+        worktree = self.root / "worktrees" / "task-a"
+        worktree.mkdir(parents=True)
+        scoped = self.store.claim("a", "WS35", "task", ["src/mod.py"], root=worktree)
+        self.assertTrue(scoped["ok"])
+        self.assertEqual(self.store.active()[0]["files"], ["src/mod.py"])
+        same_file = self.store.claim("b", "WS35", "task", ["./src//mod.py"], root=worktree)
+        self.assertEqual(same_file["reason"], "conflict")
+        self.assertEqual(same_file["conflicts"][0]["files"], ["src/mod.py"])
+        other_root = self.root / "worktrees" / "task-b"
+        other_root.mkdir(parents=True)
+        disjoint = self.store.claim("c", "WS35", "task", ["src/mod.py"], root=other_root)
+        self.assertTrue(disjoint["ok"])
+        self.assertEqual(len(self.store.active()), 2)
+
+    def test_root_claim_collides_with_the_same_file_declared_from_cwd(self):
+        worktree = self.root / "worktrees" / "task-a"
+        worktree.mkdir(parents=True)
+        self.assertTrue(self.store.claim("a", "WS35", "task", ["src/mod.py"], root=worktree)["ok"])
+        same_file = self.claim("b", ["worktrees/task-a/src/mod.py"])
+        self.assertEqual(same_file["reason"], "conflict")
+        self.assertEqual(same_file["conflicts"][0]["files"], ["src/mod.py"])
+
+    def test_claim_root_refuses_escape_from_that_workspace(self):
+        worktree = self.root / "worktrees" / "task-a"
+        worktree.mkdir(parents=True)
+        refused = self.store.claim("a", "WS35", "task", ["../task-b/src/mod.py"], root=worktree)
+        self.assertEqual(refused["reason"], "invalid")
+        self.assertEqual(self.store.active(), [])
+
+    def test_admit_launch_root_scopes_declaration(self):
+        worktree = self.root / "worktrees" / "task-a"
+        worktree.mkdir(parents=True)
+        first = self.store.admit_launch("a", "WS35", "t", ["src/mod.py"], max_concurrent=5, root=worktree)
+        self.assertTrue(first["ok"])
+        second = self.store.admit_launch("b", "WS35", "t", ["worktrees/task-a/src/mod.py"], max_concurrent=5)
+        self.assertEqual(second["reason"], "conflict")
+        third = self.store.admit_launch("c", "WS35", "t", ["src/mod.py"], max_concurrent=5)
+        self.assertTrue(third["ok"])
+
+    def test_capacity_only_admission_counts_against_the_cap(self):
+        first = self.store.admit_capacity("a", "WS35", "t", max_concurrent=2)
+        self.assertTrue(first["ok"])
+        self.assertEqual(first["active"], 1)
+        self.assertEqual(self.store.active()[0]["files"], [])
+        second = self.store.admit_launch("b", "WS35", "t", ["src/one.py"], max_concurrent=2)
+        self.assertTrue(second["ok"])
+        third = self.store.admit_capacity("c", "WS35", "t", max_concurrent=2)
+        self.assertFalse(third["ok"])
+        self.assertEqual(third["reason"], "capacity")
+        self.assertEqual(third["active"], 2)
+        self.assertEqual(len(self.store.active()), 2)
+
+    def test_capacity_only_lease_releases_its_slot(self):
+        first = self.store.admit_capacity("a", "WS35", "t", max_concurrent=1)
+        self.assertTrue(first["ok"])
+        self.assertEqual(self.store.admit_capacity("b", "WS35", "t", max_concurrent=1)["reason"], "capacity")
+        self.assertEqual(self.store.release(first["lease_id"], "b")["reason"], "owner")
+        self.assertTrue(self.store.release(first["lease_id"], "a")["released"])
+        second = self.store.admit_capacity("b", "WS35", "t", max_concurrent=1)
+        self.assertTrue(second["ok"])
+        self.assertEqual(second["active"], 1)
+
+    def test_capacity_only_lease_expires_and_reaps(self):
+        first = self.store.admit_capacity("a", "WS35", "t", max_concurrent=1, ttl_s=10, now=1000.0)
+        self.assertTrue(first["ok"])
+        self.assertEqual(self.store.admit_capacity("b", "WS35", "t", max_concurrent=1, now=1005.0)["reason"], "capacity")
+        second = self.store.admit_capacity("b", "WS35", "t", max_concurrent=1, now=1011.0)
+        self.assertTrue(second["ok"])
+        self.assertEqual(len(self.store.active(now=1011.0)), 1)
+
+    def test_empty_declaration_is_refused_but_capacity_only_is_allowed(self):
+        self.assertEqual(self.claim("a", [])["reason"], "invalid")
+        self.assertEqual(self.store.admit_launch("a", "WS35", "t", [], max_concurrent=5)["reason"], "invalid")
+        self.assertEqual(self.store.active(), [])
+        self.assertTrue(self.store.admit_capacity("a", "WS35", "t", max_concurrent=5)["ok"])
+
     def test_state_file_is_versioned_and_atomic(self):
         self.claim("a", ["src/mod.py"])
         state = json.loads((self.state_dir / "admission.json").read_text())
-        self.assertEqual(state["version"], 1)
+        self.assertEqual(state["version"], 2)
         self.assertEqual(len(state["leases"]), 1)
         self.assertEqual([name for name in os.listdir(self.state_dir) if name.endswith(".tmp")], [])
+
+    def test_older_state_version_is_refused(self):
+        self.state_dir.mkdir(parents=True, exist_ok=True)
+        (self.state_dir / "admission.json").write_text(json.dumps({"version": 1, "leases": {}}))
+        with self.assertRaises(LeaseError):
+            self.store.active()
 
 
 if __name__ == "__main__":

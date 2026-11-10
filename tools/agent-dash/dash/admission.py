@@ -11,6 +11,10 @@ Design constraints:
   ``a/../a/b.py`` are one file. Absolute paths, paths that escape the root and
   glob syntax are refused, because a lease that silently covers a pattern is a
   lease nobody can reason about.
+* The lease identity is the absolute real path, and the relative name is only
+  what the dashboard shows. Two worktrees that each declare ``src/mod.py`` are
+  two files, and a declaration made relative to a worktree collides with the
+  same file declared by its full path from the repository root.
 * Every read-modify-write runs under ``fcntl.flock`` on ``admission.lock`` and
   lands through a temp file plus ``os.replace``. A crash never leaves a
   half-written ``admission.json``, and two claimers never both win.
@@ -38,7 +42,7 @@ import uuid
 STATE_ENV = "AGENT_DASH_STATE_DIR"
 STATE_FILE = "admission.json"
 LOCK_FILE = "admission.lock"
-STATE_VERSION = 1
+STATE_VERSION = 2
 DEFAULT_TTL_S = 900
 
 _GLOB_RE = re.compile(r"[*?\[\]{}]")
@@ -82,8 +86,13 @@ def canonical_path(path, root) -> str:
     return rel.replace(os.sep, "/")
 
 
-def canonical_files(files, root) -> list[str]:
-    """Canonicalize a declaration, dropping duplicates and keeping order.
+def canonical_entries(files, root) -> list[tuple[str, str]]:
+    """Canonicalize a declaration into ``(absolute, root-relative)`` pairs.
+
+    The absolute real path is the lease identity, so two worktrees that each
+    declare ``src/mod.py`` are two files and never collide. The relative path
+    is what a human reads in the dashboard. Duplicates are dropped by
+    identity and order is kept.
 
     A bare string is one path. An empty declaration is refused: a lease that
     covers nothing would admit every launcher.
@@ -94,10 +103,18 @@ def canonical_files(files, root) -> list[str]:
         items = list(files or [])
     if not items:
         raise LeaseError("empty file declaration")
-    seen: dict[str, None] = {}
+    root_real = os.path.realpath(os.path.expanduser(str(root)))
+    seen: dict[str, tuple[str, str]] = {}
     for item in items:
-        seen.setdefault(canonical_path(item, root), None)
-    return list(seen)
+        rel = canonical_path(item, root_real)
+        absolute = os.path.realpath(os.path.join(root_real, rel))
+        seen.setdefault(absolute, (absolute, rel))
+    return list(seen.values())
+
+
+def canonical_files(files, root) -> list[str]:
+    """The root-relative names of a declaration, in declaration order."""
+    return [rel for _, rel in canonical_entries(files, root)]
 
 
 def _pid_alive(pid):
@@ -189,27 +206,30 @@ class LeaseStore:
         return gone
 
     @staticmethod
-    def _conflicts(leases: dict, files: list[str], now: float) -> list[dict]:
-        wanted = set(files)
+    def _conflicts(leases: dict, paths: list[str], now: float) -> list[dict]:
+        wanted = set(paths)
         found = []
         for lease_id, lease in leases.items():
             if not LeaseStore._is_live(lease, now):
                 continue
-            overlap = sorted(wanted.intersection(lease.get("files") or []))
+            held = lease.get("paths") or []
+            overlap = wanted.intersection(held)
             if overlap:
+                names = [rel for absolute, rel in zip(held, lease.get("files") or []) if absolute in overlap]
                 found.append(
                     {
                         "lease_id": lease_id,
                         "owner": lease.get("owner"),
                         "ws": lease.get("ws"),
                         "task": lease.get("task"),
-                        "files": overlap,
+                        "files": names,
                     }
                 )
         return sorted(found, key=lambda item: item["lease_id"])
 
-    def _claim_locked(self, state, owner, ws, task, files, ttl_s, now) -> dict:
-        conflicts = self._conflicts(state["leases"], files, now)
+    def _claim_locked(self, state, owner, ws, task, entries, ttl_s, now) -> dict:
+        paths = [absolute for absolute, _ in entries]
+        conflicts = self._conflicts(state["leases"], paths, now)
         if conflicts:
             return {"ok": False, "reason": "conflict", "lease_id": None, "conflicts": conflicts}
         lease_id = uuid.uuid4().hex
@@ -218,30 +238,32 @@ class LeaseStore:
             "pid": os.getpid(),
             "ws": ws,
             "task": task,
-            "files": list(files),
+            "files": [rel for _, rel in entries],
+            "paths": paths,
             "created_at": now,
             "heartbeat_at": now,
             "expires_at": now + float(ttl_s),
         }
         return {"ok": True, "reason": "ok", "lease_id": lease_id, "conflicts": []}
 
-    def claim(self, owner, ws, task, files, ttl_s=DEFAULT_TTL_S, now=None) -> dict:
+    def claim(self, owner, ws, task, files, ttl_s=DEFAULT_TTL_S, now=None, root=None) -> dict:
         """Take a lease over ``files`` or report the leases that block it.
 
-        ``files`` are canonicalized against the current working directory, so
-        a caller declares paths the way it would type them. A declaration that
-        cannot be canonicalized is refused with ``reason: invalid`` rather
-        than raising, so a launcher can report it and stop.
+        ``files`` are canonicalized against ``root`` when given, else against
+        the current working directory, so a caller declares paths the way it
+        would type them. A declaration that cannot be canonicalized is refused
+        with ``reason: invalid`` rather than raising, so a launcher can report
+        it and stop.
         """
         now = time.time() if now is None else float(now)
         try:
-            canonical = canonical_files(files, os.getcwd())
+            entries = canonical_entries(files, os.getcwd() if root is None else root)
         except LeaseError as exc:
             return {"ok": False, "reason": "invalid", "lease_id": None, "conflicts": [], "error": str(exc)}
         with self._locked():
             state = self._read()
             self._reap_locked(state, now)
-            result = self._claim_locked(state, owner, ws, task, canonical, ttl_s, now)
+            result = self._claim_locked(state, owner, ws, task, entries, ttl_s, now)
             self._write(state)
         return result
 
@@ -315,16 +337,27 @@ class LeaseStore:
         leases = self.active(now=now)
         return {"version": STATE_VERSION, "now": now, "count": len(leases), "leases": leases}
 
-    def admit_launch(self, owner, ws, task, files, max_concurrent, ttl_s=DEFAULT_TTL_S, now=None) -> dict:
+    def _admit_locked(self, state, owner, ws, task, entries, max_concurrent, ttl_s, now) -> dict:
+        live = len(state["leases"])
+        if max_concurrent is not None and live >= int(max_concurrent):
+            return {"ok": False, "reason": "capacity", "lease_id": None, "conflicts": [], "active": live}
+        result = self._claim_locked(state, owner, ws, task, entries, ttl_s, now)
+        result["active"] = live + (1 if result["ok"] else 0)
+        return result
+
+    def admit_launch(
+        self, owner, ws, task, files, max_concurrent, ttl_s=DEFAULT_TTL_S, now=None, root=None
+    ) -> dict:
         """Capacity and conflict check plus the claim, under one lock.
 
-        ``max_concurrent`` caps live leases across every owner. A cap of
-        ``None`` means no cap. The reason is stable: ``ok``, ``capacity``,
-        ``conflict`` or ``invalid``.
+        ``files`` are canonicalized against ``root`` when given, else against
+        the current working directory. ``max_concurrent`` caps live leases
+        across every owner. A cap of ``None`` means no cap. The reason is
+        stable: ``ok``, ``capacity``, ``conflict`` or ``invalid``.
         """
         now = time.time() if now is None else float(now)
         try:
-            canonical = canonical_files(files, os.getcwd())
+            entries = canonical_entries(files, os.getcwd() if root is None else root)
         except LeaseError as exc:
             return {
                 "ok": False,
@@ -337,17 +370,22 @@ class LeaseStore:
         with self._locked():
             state = self._read()
             self._reap_locked(state, now)
-            live = len(state["leases"])
-            if max_concurrent is not None and live >= int(max_concurrent):
-                self._write(state)
-                return {
-                    "ok": False,
-                    "reason": "capacity",
-                    "lease_id": None,
-                    "conflicts": [],
-                    "active": live,
-                }
-            result = self._claim_locked(state, owner, ws, task, canonical, ttl_s, now)
+            result = self._admit_locked(state, owner, ws, task, entries, max_concurrent, ttl_s, now)
             self._write(state)
-        result["active"] = live + (1 if result["ok"] else 0)
+        return result
+
+    def admit_capacity(self, owner, ws, task, max_concurrent, ttl_s=DEFAULT_TTL_S, now=None) -> dict:
+        """Take a launch-count lease that covers no file, under the same lock.
+
+        A capacity-only lease is how a launcher that owns no file still counts
+        against ``max_concurrent``. It shares the lock, the cap, the TTL, the
+        owner token and the release and reap rules with :meth:`admit_launch`,
+        and returns the same stable reasons: ``ok`` or ``capacity``.
+        """
+        now = time.time() if now is None else float(now)
+        with self._locked():
+            state = self._read()
+            self._reap_locked(state, now)
+            result = self._admit_locked(state, owner, ws, task, [], max_concurrent, ttl_s, now)
+            self._write(state)
         return result
