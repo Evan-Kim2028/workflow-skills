@@ -136,6 +136,41 @@ class MorphCatalogTest(unittest.TestCase):
         )
 
 
+class MorphKimiTest(unittest.TestCase):
+    """Morph serves Kimi K3.1 under morph-kimik31*; it is a first-class family."""
+
+    MODELS = ("morph/morph-kimik31", "morph-kimik31")
+
+    def test_morph_kimi_rows_are_published(self):
+        from dash.pricing import load
+
+        rows = {row["model"]: row for row in load()}
+        for model in self.MODELS:
+            row = rows[model]
+            self.assertEqual(row["provider"], "morph", model)
+            self.assertEqual((float(row["input"]), float(row["output"]), float(row["cache_read"])), (2.5, 14.0, 0.29), model)
+            self.assertTrue(status(model)["priced"], model)
+
+    def test_morph_kimi_cost(self):
+        for model in self.MODELS:
+            self.assertAlmostEqual(cost(model, 1_000_000, 1_000_000, 0, 0), 16.5, places=9)
+
+    def test_morph_kimi_ids_map_to_the_kimi_family(self):
+        from dash.models import model_name
+
+        for model in self.MODELS:
+            self.assertEqual(model_key(model), ("kimi", "kimi-k3.1"), model)
+            self.assertEqual(model_name(model), "Kimi K3.1", model)
+        self.assertEqual(
+            run_model_key({"model": self.MODELS[0], "tier": "pi-kimi", "source": "pi"}),
+            "kimi-k3.1",
+        )
+
+    def test_grok_build_kimi_rows_take_the_kimi_tier(self):
+        self.assertEqual(grok._tier_of({"model": "morph/morph-kimik31"}), "kimi-k3.1")
+        self.assertEqual(grok._tier_of({"model": "morph/morph-kimik31:low"}), "kimi-k3.1")
+
+
 class BandTest(unittest.TestCase):
     def test_utc_edges_on_a_weekday(self):
         cases = [

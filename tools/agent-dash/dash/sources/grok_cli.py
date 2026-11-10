@@ -50,6 +50,7 @@ import zlib
 from datetime import datetime
 
 from dash.liveness import file_shows_quota, read_pid_file
+from dash.models import is_kimi_alias
 from dash.sources.process import apply_liveness, live_agent_processes
 from dash.sources import set_discovery_ttl, discovery_memo
 
@@ -576,6 +577,8 @@ def _parse_manifest(text):
 #: never glm.
 MODEL_TIERS = {
     "deepseek-flash": "deepseek-flash",
+    "morph/morph-kimik31": "kimi-k3.1",
+    "morph-kimik31": "kimi-k3.1",
     "glm-5.3": "glm",
     "glm-5.3-flash": "glm-flash",
     "reflection-beam": "beam",
@@ -603,6 +606,8 @@ def _tier_of(row, model=None):
             return tier
     if "deepseek" in key:
         return "deepseek-flash"
+    if is_kimi_alias(key):
+        return "kimi-k3.1"
     if "beam" in key:
         return "beam"
     if "glm" in key:

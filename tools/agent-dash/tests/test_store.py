@@ -823,7 +823,7 @@ class StoreTest(unittest.TestCase):
         self.assertNotIn("caps", snap)
         counts = snap["counts"]
         self.assertEqual(counts["live_agents"], 1)
-        self.assertEqual(counts["live_by_tool"], {"grok": 1, "muse": 0, "glm": 0, "claude": 0, "deepseek": 0, "codex": 0, "beam": 0, "commandcode": 0, "other": 0})
+        self.assertEqual(counts["live_by_tool"], {"grok": 1, "muse": 0, "glm": 0, "claude": 0, "deepseek": 0, "kimi": 0, "codex": 0, "beam": 0, "commandcode": 0, "other": 0})
         self.assertEqual(counts["finished_today"], 1)
         self.assertEqual(counts["finished_in_range"], 1)
         self.assertEqual(counts["finished_by_verdict"], {"ok": 1})
@@ -4812,6 +4812,14 @@ class UsageFoldCacheTest(unittest.TestCase):
         second = store._usage_by_run_uncached()
         self.assertIn("bundle-r1", second)
         self.assertEqual(first["bundle-r1"], second["bundle-r1"])
+
+
+class FamilyTierTest(unittest.TestCase):
+    def test_kimi_model_takes_the_kimi_family(self):
+        from dash.store.runs import _family_tier
+
+        self.assertEqual(_family_tier("pi", "morph/morph-kimik31"), "pi-kimi")
+        self.assertEqual(_family_tier("generic", "morph/morph-kimik31"), "kimi")
 
 
 if __name__ == "__main__":

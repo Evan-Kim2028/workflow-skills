@@ -1065,7 +1065,7 @@ def _family_tier(source, model) -> str | None:
     """Family tier for a run whose tier still names its source.
 
     pi runs take the registry tier that names their model family
-    (``pi-deepseek``, ``pi-beam``, ``pi-glm``), which is what
+    (``pi-deepseek``, ``pi-beam``, ``pi-glm``, ``pi-kimi``), which is what
     ``run_worker.py`` records, so a healed row reads the same tier a
     fresh launch does; generic runs take the bare family. generic
     additionally takes the source's own tier names (opus, muse, ...)
@@ -1080,13 +1080,17 @@ def _family_tier(source, model) -> str | None:
         return None
     if source in ("pi", "generic"):
         # pi mirrors dash.sources.pi._model_tier's families (beam, glm,
-        # deepseek), spelled as the registry names them; generic takes
+        # deepseek, kimi), spelled as the registry names them; generic takes
         # the same families first (tier_of does not know deepseek) and
         # falls back to its own tier names below.
-        from dash.models import is_deepseek_alias
+        from dash.models import is_deepseek_alias, is_kimi_alias
 
-        for name in ("deepseek", "beam", "glm"):
-            if name in text or (name == "deepseek" and is_deepseek_alias(text)):
+        for name in ("deepseek", "beam", "glm", "kimi"):
+            if (
+                name in text
+                or (name == "deepseek" and is_deepseek_alias(text))
+                or (name == "kimi" and is_kimi_alias(text))
+            ):
                 return "pi-" + name if source == "pi" else name
     if source == "generic":
         from dash.sources.generic import tier_of

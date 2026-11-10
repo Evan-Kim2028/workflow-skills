@@ -58,7 +58,7 @@ import os
 import re
 
 from dash.liveness import file_shows_quota
-from dash.models import is_deepseek_alias
+from dash.models import is_deepseek_alias, is_kimi_alias
 from dash.sources import grok_cli as _grok
 from dash.sources import manifests as _manifests
 from dash.sources import process as _process
@@ -422,7 +422,7 @@ def _agent_processes():
 
 
 def _model_tier(model):
-    """Model family for a pi run: beam, glm or deepseek; the harness stays in ``source``."""
+    """Model family for a pi run: beam, glm, deepseek or kimi; the harness stays in ``source``."""
     text = (model or "").lower()
     if "beam" in text:
         return "beam"
@@ -430,6 +430,8 @@ def _model_tier(model):
         return "glm"
     if "deepseek" in text or is_deepseek_alias(text):
         return "deepseek"
+    if is_kimi_alias(text):
+        return "kimi"
     return NAME
 
 

@@ -11,8 +11,8 @@ The input row shape is the dashboard listing from
 optional ``model``. No argv is read here. The grouping key prefers a
 muse session uuid, then a bracket label, then a prompt-file label.
 Rows with none of those are skipped because no run can be named.
-Tiers cover muse, cursor-agent as grok, the grok CLI as glm or
-deepseek, Claude processes as claude or an opus sonnet haiku tier from
+Tiers cover muse, cursor-agent as grok, the grok CLI as glm, deepseek
+or kimi, Claude processes as claude or an opus sonnet haiku tier from
 the model, and anything else by model family with generic fallback.
 """
 
@@ -22,7 +22,7 @@ import math
 import re
 import time
 
-from dash.models import is_deepseek_alias
+from dash.models import is_deepseek_alias, is_kimi_alias
 
 _UUID = r"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}"
 _UUID_RE = re.compile(r"^" + _UUID + r"$")
@@ -55,6 +55,8 @@ def _model_tier(model) -> str | None:
     # instead of a second copy of the rule here.
     if is_deepseek_alias(model) or "deepseek" in text:
         return "deepseek"
+    if is_kimi_alias(model):
+        return "kimi"
     for name in ("muse", "glm", "grok"):
         if name in text:
             return name
@@ -79,8 +81,8 @@ def tier_for_process(row: dict) -> str:
         return "grok"
     if comm == "grok":
         hint = _model_tier(model)
-        if hint == "deepseek":
-            return "deepseek"
+        if hint in ("deepseek", "kimi"):
+            return hint
         return "glm"
     if comm == "claude":
         hint = _model_tier(model)
@@ -88,7 +90,7 @@ def tier_for_process(row: dict) -> str:
             return hint
         return "claude"
     hint = _model_tier(model)
-    if hint in ("muse", "glm", "grok", "opus", "sonnet", "haiku", "deepseek"):
+    if hint in ("muse", "glm", "grok", "opus", "sonnet", "haiku", "deepseek", "kimi"):
         return hint
     return "generic"
 
