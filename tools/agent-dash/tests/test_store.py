@@ -4599,6 +4599,75 @@ class UsageFoldCacheTest(unittest.TestCase):
         self.assertEqual(folds["cache-r2"][0]["input"], 107)
         self.assertEqual(folds["cache-r1"][0]["input"], 100)
 
+    def test_new_event_keeps_other_runs_cached(self):
+        self.seed(self.store, "cache-r1", "cache-m1")
+        self.seed(self.store, "cache-r2", "cache-m2")
+        self.store._usage_by_run_uncached()
+        self.assertIn("cache-r1", self.store._usage_fold_cache)
+        self.assertIn("cache-r2", self.store._usage_fold_cache)
+        self.store.add_usage(
+            {
+                "ts": 1001.0,
+                "session_id": "sess-cache-r2",
+                "run_id": "cache-r2",
+                "model": "claude-sonnet-5-5",
+                "tool": "muse",
+                "message_id": "cache-m3",
+                "input": 7,
+                "output": 3,
+                "cache_read": 0,
+                "cache_write": 0,
+            }
+        )
+        self.assertIn("cache-r1", self.store._usage_fold_cache)
+        self.assertIn("cache-r2", self.store._usage_fold_cache)
+        calls = []
+        real = usage_mod._fold_events
+
+        def spy(events, *args, **kwargs):
+            calls.append(sorted({row["run_id"] for row in events}))
+            return real(events, *args, **kwargs)
+
+        with mock.patch.object(usage_mod, "_fold_events", spy):
+            folds = self.store._usage_by_run_uncached()
+        self.assertEqual(calls, [["cache-r2"]])
+        self.assertEqual(folds["cache-r2"][0]["input"], 107)
+        self.assertEqual(folds["cache-r1"][0]["input"], 100)
+
+    def test_in_place_rewrite_drops_cached_fold(self):
+        self.seed(self.store, "cache-r1", "cache-m1")
+        self.store._usage_by_run_uncached()
+        self.assertIn("cache-r1", self.store._usage_fold_cache)
+        self.store.add_usage(
+            {
+                "ts": 1000.0,
+                "session_id": "sess-cache-r1",
+                "run_id": "cache-r1",
+                "model": "claude-sonnet-5-5",
+                "tool": "muse",
+                "message_id": "cache-m1",
+                "input": 250,
+                "output": 50,
+                "cache_read": 0,
+                "cache_write": 0,
+            }
+        )
+        self.assertNotIn("cache-r1", self.store._usage_fold_cache)
+        folds = self.store._usage_by_run_uncached()
+        self.assertEqual(folds["cache-r1"][0]["input"], 250)
+
+    def test_merge_drops_cached_folds(self):
+        self.seed(self.store, "cache-r1", "cache-m1")
+        self.seed(self.store, "cache-r2", "cache-m2")
+        self.store._usage_by_run_uncached()
+        self.assertIn("cache-r1", self.store._usage_fold_cache)
+        self.assertIn("cache-r2", self.store._usage_fold_cache)
+        self.assertTrue(self.store.reassign_run("cache-r1", "cache-r2"))
+        self.assertNotIn("cache-r1", self.store._usage_fold_cache)
+        self.assertNotIn("cache-r2", self.store._usage_fold_cache)
+        folds = self.store._usage_by_run_uncached()
+        self.assertEqual(folds["cache-r2"][0]["input"], 200)
+
     def test_corrupt_cache_falls_back(self):
         self.seed(self.store)
         expected = self.store._usage_by_run_uncached()
