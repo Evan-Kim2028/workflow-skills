@@ -61,6 +61,15 @@ LEAD_TOOL_CALLS_MANY = 60
 #: Context tokens above which a lead session is flagged CONTEXT>250k.
 CONTEXT_TOKENS_FLAG = 250_000
 
+#: Version of the task contract ``task_contract_issues`` enforces.
+CONTRACT_VERSION = 1
+
+#: Task kinds that must declare a file footprint.
+WRITE_KINDS = ("task",)
+
+#: Acceptance keys every version-1 contract carries as non-empty strings.
+CONTRACT_ACCEPTANCE_KEYS = ("metric", "threshold", "tolerance")
+
 
 def _groups_of(body: dict) -> list:
     """The task groups of either plan shape (API body or raw plan.json)."""
@@ -230,13 +239,219 @@ def _dep_satisfied(by_id: dict, dep: str) -> bool:
     return isinstance(task, dict) and task.get("status") in SATISFIED_STATUSES
 
 
+_SCOPE_NEGATION = re.compile(
+    r"(?:\bno\b|\bnot\b|\bnever\b|n't\b|\bwithout\b|\bavoid\b|instead of)\s*[^.;!]{0,40}$",
+    re.IGNORECASE,
+)
+_SCOPE_CI_GATE = re.compile(r"(?:lor-ci-local\.sh|ci-local\.sh)")
+_SCOPE_FULL = re.compile(r"--full(?![-\w])")
+_SCOPE_VALIDATE_SH = re.compile(r"\bscripts/validate\.sh\b")
+_SCOPE_PRECOMMIT_ALL = re.compile(r"\bpre-commit\s+run\s+--all-files\b")
+_SCOPE_GH_RUN = re.compile(r"\bgh\s+(?:workflow\s+run|run\s+rerun)\b")
+_SCOPE_PATH_HINT = re.compile(r"[/.]|\.py$|\.mjs$|\.[jt]s$|\.sh$|<[^>]*>")
+_SCOPE_GLOB = re.compile(r"[*?\[\]{}]")
+
+
+def _scope_negated(text: str, idx: int) -> bool:
+    """True when a negation word (no, never, without, ...) opens the same clause.
+
+    Plans that say "(no lor-ci-local.sh, never the machine lock)" describe
+    the scoped gate; they do not run the full suite, so they stay quiet.
+    """
+    return bool(_SCOPE_NEGATION.search(text[max(0, idx - 60):idx]))
+
+
+def _scope_bare_pytest(text: str) -> str | None:
+    """The offending bare-pytest segment, or None when every pytest names a target.
+
+    A pytest with an explicit file or directory argument (or a ``<...>``
+    placeholder the lead re-cuts from member diffs) is scoped. Bare flags
+    only (``pytest -x -q``) still run the whole suite.
+    """
+    cleaned = text.replace("`", " ")
+    for segment in re.split(r"[;&|\n]", cleaned):
+        for match in re.finditer(r"(?:\s*(?:uv\s+run|python3?\s+-m)\s+)?pytest\b", segment):
+            if _scope_negated(segment, match.start()):
+                continue
+            rest = segment[match.end():]
+            if re.match(r"\s*(?:$|[)&|])", rest):
+                return segment.strip()
+            tokens = [tok for tok in rest.split() if not tok.startswith("-")]
+            tokens = [tok for tok in tokens if "=" not in tok or "/" in tok]
+            if not tokens or not any(_SCOPE_PATH_HINT.search(tok) for tok in tokens):
+                return segment.strip()
+    return None
+
+
+def _scope_has_target(text: str) -> bool:
+    """True when the string already names what the suite runs.
+
+    A pytest with a file, directory, or ``<...>`` placeholder target, or a
+    ``lor-ci-local.sh`` / ``ci-local.sh`` invocation with arguments, is a
+    scoped gate; a bare "pytest" mentioned beside it ("pytest runs only the
+    list") is description, not a second run.
+    """
+    cleaned = text.replace("`", " ")
+    for segment in re.split(r"[;&|\n]", cleaned):
+        for match in re.finditer(r"(?:\s*(?:uv\s+run|python3?\s+-m)\s+)?pytest\b", segment):
+            tokens = [tok for tok in segment[match.end():].split() if not tok.startswith("-")]
+            if any(_SCOPE_PATH_HINT.search(tok) for tok in tokens):
+                return True
+    for match in _SCOPE_CI_GATE.finditer(text):
+        after = text[match.end():]
+        if after.startswith(":"):
+            continue
+        if re.match(r"\s*(?:$|[,;)&|`])", after):
+            continue
+        return True
+    return False
+
+
+def full_suite_probe_hit(text: str) -> str | None:
+    """The offending full-suite token in a probe/gate string, or None.
+
+    Catches bare pytest, ``--full``, an argument-free ``lor-ci-local.sh`` /
+    ``ci-local.sh``, ``scripts/validate.sh``, ``pre-commit run --all-files``,
+    and ``gh workflow run`` / ``gh run rerun``. Mentions inside a negated
+    clause ("no ..."), file:line citations ("lor-ci-local.sh:206-227"),
+    and scoped invocations with arguments ("--train-files <list>")
+    are not hits.
+    """
+    if _scope_has_target(text):
+        return None
+    bare = _scope_bare_pytest(text)
+    if bare is not None:
+        return bare
+    for match in _SCOPE_CI_GATE.finditer(text):
+        after = text[match.end():]
+        if after.startswith(":"):
+            continue
+        if not re.match(r"\s*(?:$|[,;)&|`])", after):
+            continue
+        if _scope_negated(text, match.start()):
+            continue
+        return match.group(0)
+    for pattern in (_SCOPE_FULL, _SCOPE_VALIDATE_SH, _SCOPE_PRECOMMIT_ALL, _SCOPE_GH_RUN):
+        match = pattern.search(text)
+        if match and not _scope_negated(text, match.start()):
+            return match.group(0)
+    return None
+
+
+def _contract_path_issue(value: str) -> str | None:
+    """Why ``value`` is not a plain relative path, or None when it is."""
+    if not value.strip():
+        return "is empty"
+    if value.startswith("/") or re.match(r"^[A-Za-z]:[\\/]", value):
+        return "is absolute"
+    if ".." in Path(value).parts:
+        return "contains .."
+    if _SCOPE_GLOB.search(value):
+        return "uses glob syntax"
+    return None
+
+
+def _contract_files_issues(files) -> list[str]:
+    """Problems with a write task's ``files`` list (plain relative paths)."""
+    if not isinstance(files, list) or not files:
+        return ["files must be a non-empty list of relative paths"]
+    issues: list[str] = []
+    for item in files:
+        if not isinstance(item, str):
+            issues.append("files entries must be strings")
+            continue
+        why = _contract_path_issue(item)
+        if why is not None:
+            issues.append(f"files entry {item!r} {why}")
+    return issues
+
+
+def _contract_probe_issues(probe) -> list[str]:
+    """Problems with an acceptance ``probe`` (a string or list of strings)."""
+    if isinstance(probe, str):
+        probes = [probe]
+    elif isinstance(probe, list) and probe:
+        probes = probe
+    else:
+        return ["acceptance.probe must be a non-empty string or list of strings"]
+    issues: list[str] = []
+    for item in probes:
+        if not isinstance(item, str) or not item.strip():
+            issues.append("acceptance.probe entries must be non-empty strings")
+            continue
+        hit = full_suite_probe_hit(item)
+        if hit is not None:
+            issues.append(
+                f"acceptance.probe runs the whole suite ({hit!r}); name explicit test files"
+            )
+    return issues
+
+
+def task_contract_issues(task: dict) -> list[str]:
+    """Contract problems for one task; an empty list means it may run.
+
+    A task with no ``contract_version`` is legacy and always passes. Version
+    1 requires a non-empty ``acceptance`` object (metric, threshold,
+    tolerance, probe, optional relative ``cwd``) and, for write tasks, a
+    non-empty ``files`` list of plain relative paths. Unknown versions are
+    errors. Pure and dependency-free, so the CLI, the validator and the
+    ready queue share one answer.
+    """
+    if not isinstance(task, dict):
+        return ["task must be an object"]
+    version = task.get("contract_version")
+    if version is None:
+        return []
+    if isinstance(version, bool) or version != CONTRACT_VERSION:
+        return [f"unknown contract_version {version!r} (expected {CONTRACT_VERSION})"]
+    issues: list[str] = []
+    acceptance = task.get("acceptance")
+    if not isinstance(acceptance, dict) or not acceptance:
+        issues.append("acceptance must be a non-empty object")
+    else:
+        for key in CONTRACT_ACCEPTANCE_KEYS:
+            value = acceptance.get(key)
+            if not isinstance(value, str) or not value.strip():
+                issues.append(f"acceptance.{key} must be a non-empty string")
+        issues.extend(_contract_probe_issues(acceptance.get("probe")))
+        if "cwd" in acceptance:
+            cwd = acceptance.get("cwd")
+            if not isinstance(cwd, str):
+                issues.append("acceptance.cwd must be a relative path string")
+            else:
+                why = _contract_path_issue(cwd)
+                if why is not None:
+                    issues.append(f"acceptance.cwd {cwd!r} {why}")
+    if (task.get("kind") or "task") in WRITE_KINDS:
+        issues.extend(_contract_files_issues(task.get("files")))
+    return issues
+
+
+def contract_blocked(body: dict) -> list[dict]:
+    """Tasks whose contract issues keep them out of the ready queue.
+
+    Rows carry ``id``, ``title`` and ``issues``, sorted by task id, so
+    ``ws next`` and dispatch can report why a task is not ready. Legacy
+    tasks never appear here.
+    """
+    by_id, _deps, _order = plan_tasks(execution_body(body))
+    rows = []
+    for tid, task in by_id.items():
+        issues = task_contract_issues(task)
+        if issues:
+            rows.append({"id": tid, "title": task.get("title"), "issues": issues})
+    rows.sort(key=lambda row: row["id"])
+    return rows
+
+
 def ready_queue(body: dict, live_by_task: dict | None = None) -> list[dict]:
     """Ready tasks (status todo, every dep satisfied) ranked by impact.
 
     Rank is longest downstream chain first, then transitive dependent
     count, then task id. Gates count as deps: a todo gate blocks every
-    task that names it. Each row carries what the task unblocks, its
-    train, its kind (``task`` or ``gate``), and the live run label when
+    task that names it. A task with contract issues is not ready; see
+    ``contract_blocked`` for why. Each row carries what the task unblocks,
+    its train, its kind (``task`` or ``gate``), and the live run label when
     ``live_by_task`` maps it.
     """
     body = execution_body(body)
@@ -246,6 +461,8 @@ def ready_queue(body: dict, live_by_task: dict | None = None) -> list[dict]:
     rows = []
     for tid, task in by_id.items():
         if task.get("status") != "todo":
+            continue
+        if task_contract_issues(task):
             continue
         if not all(_dep_satisfied(by_id, dep) for dep in deps.get(tid, [])):
             continue
