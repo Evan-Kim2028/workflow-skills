@@ -3642,15 +3642,15 @@ class FinalPolishTests(unittest.TestCase):
         ov = [ident for _, ident in sorted(by_scope.get("overview", []))]
         self.assertEqual(
             ov,
-            ["pulse", "wherego", "aggregate", "cards", "phases-all", "manage"],
-            "overview order drifted: want pulse first, then wherego, aggregate, cards, usage, and the folded manage section last",
+            ["pulse", "wherego", "aggregate", "flow", "cards", "phases-all", "manage"],
+            "overview order drifted: want pulse first, then wherego, aggregate, the flow card, cards, usage, and the folded manage section last",
         )
         both_ids = [ident for _, ident in both]
         self.assertEqual(
-            [ident for ident in ["pulse", "wherego", "aggregate", "running", "plan", "activity", "cards", "finished", "phases-all", "manage"]
+            [ident for ident in ["pulse", "wherego", "aggregate", "flow", "running", "plan", "activity", "cards", "finished", "phases-all", "manage"]
              if ident in ov or ident in both_ids],
-            ["pulse", "wherego", "aggregate", "running", "plan", "activity", "cards", "finished", "phases-all", "manage"],
-            "overview render drifted: want pulse, wherego, running, plan, activity, cards, finished, usage, then the folded manage section last",
+            ["pulse", "wherego", "aggregate", "flow", "running", "plan", "activity", "cards", "finished", "phases-all", "manage"],
+            "overview render drifted: want pulse, wherego, flow, running, plan, activity, cards, finished, usage, then the folded manage section last",
         )
         ws_only = [ident for _, ident in sorted(by_scope.get("workstream", []))]
         self.assertEqual(ws_only[0], "wshead", "the workstream heading is not the first workstream section")
@@ -4826,6 +4826,93 @@ class LinearCardRulesTests(unittest.TestCase):
         self.assertIn("width: W, height: H", self.js)
         self.assertNotIn("width:100%;height:auto;display:block;max-height", self.css)
         self.assertIn(".lin-svg{max-width:100%", self.css)
+
+
+class FlowCardRules(unittest.TestCase):
+    """The Execution flow card: one section on both scopes, axes, no tile row."""
+
+    def setUp(self):
+        self.js = (STATIC / "cards" / "flow.js").read_text()
+        self.css = (STATIC / "cards" / "flow.css").read_text()
+        self.reg = (STATIC / "cards" / "registry.js").read_text()
+        self.page = (STATIC / "index.html").read_text()
+
+    def test_flow_card_is_registered_for_both_scopes(self):
+        entries = re.findall(r'\{id: "flow", order: \d+, scope: "(\w+)"', self.reg)
+        self.assertEqual(sorted(entries), ["overview", "workstream"])
+        self.assertEqual(self.reg.count('id: "flow"'), 2)
+        self.assertIn("flowSpec(state, snap)", self.reg)
+
+    def test_flow_card_loads_on_the_shell(self):
+        self.assertIn('/static/cards/flow.js', self.page)
+        self.assertIn('/static/cards/flow.css', self.page)
+
+    def test_flow_chart_has_axes(self):
+        bodies = dict(functions(self.js))
+        self.assertIn("flowBar", bodies)
+        self.assertIn("axes(", bodies["flowBar"])
+        self.assertIn("xTitle", bodies["flowBar"])
+        self.assertIn("xTicks", bodies["flowBar"])
+
+    def test_flow_adds_no_tile_row(self):
+        self.assertEqual(self.reg.count('id: "tiles"'), 1, "the flow card added a second tile row")
+        self.assertNotIn('"tiles"', self.js, "flow.js renders a tile row")
+        self.assertNotIn("tile", self.js.lower())
+
+    def test_flow_commands_are_copyable(self):
+        self.assertIn("copyCmd(", self.js)
+        self.assertIn('el("button"', self.js)
+        self.assertIn("flowCommand", self.js)
+
+    def test_flow_empty_state_is_named(self):
+        self.assertIn("No active workstreams", self.js)
+        self.assertIn("Execution flow is unavailable", self.js)
+
+    def test_flow_phone_rules(self):
+        self.assertIn("@media (max-width:640px)", self.css)
+        self.assertIn("overflow-x:auto", self.css)
+        self.assertIn(".fl-cmd{width:100%", self.css)
+
+    def test_flow_pure_helpers_run_in_node(self):
+        """The card's scope and command helpers are pure and node-driven."""
+        harness = r'''
+const fs = require("fs");
+const assert = require("assert");
+var window = {};
+global.fmtN = function (n) { return String(n); };
+eval(fs.readFileSync(process.argv[2], "utf8"));
+["flowQueues", "flowBlockers", "flowCommand", "flowTakeaway"].forEach(function (n) {
+  assert.strictEqual(typeof window[n], "function", n + " is not a plain global");
+});
+var payload = {
+  queues: [{key: "todo", label: "Todo", count: 8}, {key: "wip", label: "In progress", count: 6}],
+  workstreams: [{id: "WS33", counts: {todo: 4, wip: 2}}],
+  blockers: [{code: "a", ws: "WS33", next: "n1", command: "c1"},
+             {code: "b", ws: null, command: "c2", next: null}]
+};
+var all = window.flowQueues(payload, "all");
+assert.deepStrictEqual(all.map(function (r) { return r.count; }), [8, 6]);
+assert.strictEqual(all[0].color, "var(--muted)");
+assert.deepStrictEqual(window.flowQueues(payload, "WS33").map(function (r) { return r.count; }), [4, 2]);
+assert.deepStrictEqual(window.flowQueues(payload, "WS99").map(function (r) { return r.count; }), [0, 0]);
+assert.deepStrictEqual(window.flowBlockers(payload, "all").map(function (b) { return b.code; }), ["a", "b"]);
+assert.deepStrictEqual(window.flowBlockers(payload, "WS33").map(function (b) { return b.code; }), ["a"]);
+assert.strictEqual(window.flowCommand(payload.blockers[0]), "n1");
+assert.strictEqual(window.flowCommand(payload.blockers[1]), "c2");
+assert.strictEqual(window.flowCommand(null), "");
+assert.strictEqual(window.flowTakeaway(all, 14), "14 tasks in flight: 8 todo, 6 in progress.");
+assert.strictEqual(window.flowTakeaway([], 0), "No tasks in any queue.");
+console.log("flow helpers ok");
+'''
+        with tempfile.TemporaryDirectory() as tmp:
+            harness_path = Path(tmp) / "flow_helpers.js"
+            harness_path.write_text(harness, encoding="utf-8")
+            proc = subprocess.run(
+                ["node", str(harness_path), str(STATIC / "cards" / "flow.js")],
+                capture_output=True,
+                text=True,
+            )
+        self.assertEqual(proc.returncode, 0, proc.stderr or proc.stdout)
 
 
 if __name__ == "__main__":
