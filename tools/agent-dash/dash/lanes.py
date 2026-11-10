@@ -22,6 +22,8 @@ import math
 import re
 import time
 
+from dash.models import is_deepseek_alias
+
 _UUID = r"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}"
 _UUID_RE = re.compile(r"^" + _UUID + r"$")
 
@@ -48,7 +50,12 @@ def _model_tier(model) -> str | None:
     for name in ("opus", "sonnet", "haiku"):
         if name in text:
             return name
-    for name in ("muse", "glm", "grok", "deepseek"):
+    # The Morph-served DeepSeek ids hide the model name behind a provider
+    # prefix, so the family predicate is shared with ``models.model_key``
+    # instead of a second copy of the rule here.
+    if is_deepseek_alias(model) or "deepseek" in text:
+        return "deepseek"
+    for name in ("muse", "glm", "grok"):
         if name in text:
             return name
     return None

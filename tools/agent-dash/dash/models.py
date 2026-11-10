@@ -57,6 +57,19 @@ def is_deepseek_alias(model: str | None) -> bool:
     return bool(_DEEPSEEK_ALIAS.search(str(model or "")))
 
 
+#: Thinking level a harness appends to a model id (``...:xhigh``). One rule
+#: for pricing and display: strip a trailing ``:<level>``. ``dash.pricing``
+#: and ``_clean_id`` both call ``strip_thinking_suffix``, so a new level is
+#: added here once.
+THINKING_LEVELS = ("off", "minimal", "low", "medium", "high", "xhigh", "max")
+_THINKING_SUFFIX = re.compile(r":(?:" + "|".join(THINKING_LEVELS) + r")$", re.IGNORECASE)
+
+
+def strip_thinking_suffix(model: str | None) -> str:
+    """Strip one trailing ``:<thinking level>`` from a model id."""
+    return _THINKING_SUFFIX.sub("", str(model or ""))
+
+
 def _ver(pattern: str, text: str) -> str:
     match = re.search(pattern, text)
     return "-" + match.group(1) if match else ""
@@ -166,7 +179,8 @@ def _clean_id(key: str | None) -> str:
     raw id, mirroring ``cleanId`` in ``static/models.js``."""
     s = str(key or "")
     s = re.sub(r"\[.*\]$", "", s)
-    s = re.sub(r":[^/]*$", "", s)
+    s = strip_thinking_suffix(s)
+    s = re.sub(r":(free|contributor)$", "", s, flags=re.IGNORECASE)
     s = re.sub(r"-(free|contributor)$", "", s, flags=re.IGNORECASE)
     if "/" in s:
         s = s[s.rindex("/") + 1 :]

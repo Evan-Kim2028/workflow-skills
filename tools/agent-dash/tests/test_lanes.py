@@ -218,6 +218,28 @@ class TierTests(unittest.TestCase):
         lanes = lanes_lib.group_live_processes(rows, now=2000.0)
         self.assertEqual(lanes[0]["tier"], "deepseek")
 
+    def test_morph_pi_row_lands_in_deepseek_lane(self):
+        """A live Morph pi row reads as deepseek, with or without a suffix."""
+        for model in (
+            "morph/morph-dsv41flash-1017",
+            "morph/morph-dsv41flash-1017:low",
+            "morph/morph-dsv41flash-1017:max",
+        ):
+            with self.subTest(model=model):
+                rows = [
+                    {
+                        "pid": 901,
+                        "comm": "pi",
+                        "started_at": 1000.0,
+                        "label": "ws33-dash-pi-cost",
+                        "prompt_label": None,
+                        "session_id": None,
+                        "model": model,
+                    }
+                ]
+                lanes = lanes_lib.group_live_processes(rows, now=2000.0)
+                self.assertEqual(lanes[0]["tier"], "deepseek")
+
     def test_format_elapsed(self):
         """Durations use the compact dashboard shape."""
         self.assertEqual(lanes_lib.format_elapsed(45), "45s")

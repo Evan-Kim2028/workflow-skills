@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 
-from dash.models import is_deepseek_alias
+from dash.models import is_deepseek_alias, strip_thinking_suffix
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_PATH = ROOT / "catalog" / "prices.json"
@@ -529,12 +529,6 @@ _index_memo: dict = {}
 _INDEX_LIMIT = 16
 
 
-#: Effort suffix a harness appends to a catalog id (pi logs
-#: ``reflection/Beam-1.0-501B-A23B:xhigh``). The lookup strips one on an
-#: exact miss and retries the bare id, so one row prices every effort level.
-_EFFORT_SUFFIX = re.compile(r":(xhigh|high|medium|low)$", re.IGNORECASE)
-
-
 #: Grok Build's internal id (``grok-4.7-build``) for the public ``grok-4.7``.
 #: Same rule as ``dash.sources.grok_cli._alias_model``: rows ingested before
 #: that alias landed still carry the build id, and they price at the public rate.
@@ -544,7 +538,10 @@ _GROK_BUILD_SUFFIX = re.compile(r"^(grok-.+)-build$", re.IGNORECASE)
 def _bare_id(model) -> str | None:
     if not isinstance(model, str):
         return None
-    bare = _EFFORT_SUFFIX.sub("", model)
+    # One rule for every thinking level (``:off`` .. ``:max``), shared with
+    # ``models._clean_id``: the lookup strips one on an exact miss and retries
+    # the bare id, so one row prices every effort level.
+    bare = strip_thinking_suffix(model)
     build = _GROK_BUILD_SUFFIX.match(bare)
     if build:
         bare = build.group(1)

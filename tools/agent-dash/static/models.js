@@ -95,7 +95,10 @@
   function cleanId(key) {
     var s = String(key == null ? "" : key);
     s = s.replace(/\[.*\]$/, "");
-    s = s.replace(/:[^\/]*$/, "");
+    /* One rule for every thinking level, mirroring strip_thinking_suffix
+       in dash/models.py: :off :minimal :low :medium :high :xhigh :max. */
+    s = s.replace(/:(off|minimal|low|medium|high|xhigh|max)$/i, "");
+    s = s.replace(/:(free|contributor)$/i, "");
     s = s.replace(/-(free|contributor)$/i, "");
     if (s.indexOf("/") >= 0) s = s.slice(s.lastIndexOf("/") + 1);
     s = s.replace(/-\d+[bmkBKM](-.*)?$/, "");
