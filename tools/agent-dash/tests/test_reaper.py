@@ -17,7 +17,7 @@ from unittest import mock
 os.environ["AGENT_DASH_IGNORE_LOCAL"] = "1"
 
 from dash import deploy as deploy_lib
-from dash.liveness import REAP_IDLE_S, sibling_err_path
+from dash.liveness import REAP_IDLE_S, pidless_reapable, sibling_err_path
 from dash.store import Store
 
 HERE = Path(__file__).resolve().parent
@@ -253,10 +253,34 @@ class PidlessGenericReapTests(unittest.TestCase):
         self.assertEqual(self.store.reap_dead_runs(NOW), [])
         self.assertEqual(self.store.get_run("cmd:aaaa:fresh")["status"], "running")
 
-    def test_pidless_rows_of_other_sources_and_tiers_are_kept(self):
+    def test_pidless_rows_of_other_sources_are_kept(self):
         self._cmd("shell:s7:x", "x", source="shell", tier="shell")
-        self._cmd("generic:abc:plain", "plain", tier="generic")
         self.assertEqual(self.store.reap_dead_runs(NOW), [])
+        self.assertEqual(self.store.get_run("shell:s7:x")["status"], "running")
+
+    def test_pidless_generic_row_with_a_deepseek_tier_is_reaped(self):
+        self._cmd("generic:dd01:ws33-exec-a", "ws33-exec-a", tier="deepseek")
+        reaped = self.store.reap_dead_runs(NOW)
+        self.assertEqual([entry["run_id"] for entry in reaped], ["generic:dd01:ws33-exec-a"])
+        row = self.store.get_run("generic:dd01:ws33-exec-a")
+        self.assertEqual(row["status"], "died_early")
+        self.assertEqual(row["verdict"], "DEAD")
+
+    def test_pidless_generic_rows_of_every_headless_tier_are_reaped(self):
+        for tier in ("kimi", "glm", "generic", "beam", "grok"):
+            self._cmd("generic:%s:lane" % tier, "lane-%s" % tier, tier=tier)
+        reaped = self.store.reap_dead_runs(NOW)
+        self.assertEqual(
+            sorted(entry["run_id"] for entry in reaped),
+            sorted("generic:%s:lane" % tier for tier in ("kimi", "glm", "generic", "beam", "grok")),
+        )
+
+    def test_pidless_generic_row_with_a_pid_is_not_reapable(self):
+        self.assertFalse(pidless_reapable({"source": "generic", "tier": "deepseek", "pid": 424242}))
+
+    def test_pidless_row_of_a_non_generic_source_is_not_reapable(self):
+        self.assertFalse(pidless_reapable({"source": "shell", "tier": "shell", "pid": None}))
+        self.assertFalse(pidless_reapable({"source": "muse", "tier": "muse", "pid": None}))
 
 
 class SiblingErrTests(unittest.TestCase):
