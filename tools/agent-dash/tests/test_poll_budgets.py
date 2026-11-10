@@ -266,6 +266,77 @@ class WatchdogTests(unittest.TestCase):
         self.assertEqual(body["sources"][0]["state"], "ok")
 
 
+class AdaptiveIntervalTests(unittest.TestCase):
+    """A source slower than its interval waits twice its own duration."""
+
+    class _SlowPoll:
+        NAME = "slow-poll"
+        INTERVAL_S = 0.02
+
+        def __init__(self, fail=False):
+            self.fail = fail
+            self.calls = 0
+
+        def poll(self, store, cfg, now):
+            self.calls += 1
+            time.sleep(0.05)
+            if self.fail:
+                raise RuntimeError("boom")
+
+    def test_first_poll_is_due(self):
+        source = self._SlowPoll()
+        registry = Registry([source])
+        self.assertTrue(sources_pkg._due(source, registry.state["slow-poll"], NOW, {}))
+
+    def test_slow_source_is_not_due_before_next_due(self):
+        store = MemStore()
+        source = self._SlowPoll()
+        registry = Registry([source])
+        registry.tick(store, {}, NOW, force=True)
+        state = registry.state["slow-poll"]
+        self.assertGreaterEqual(state["next_due"], NOW + 0.1)
+        self.assertFalse(sources_pkg._due(source, state, NOW + 0.05, {}))
+        self.assertTrue(sources_pkg._due(source, state, state["next_due"], {}))
+        registry.tick(store, {}, NOW + 0.05)
+        self.assertEqual(source.calls, 1)
+
+    def test_fast_source_still_polls_at_its_interval(self):
+        store = MemStore()
+        fast = _Fast()
+        registry = Registry([fast])
+        registry.tick(store, {}, NOW, force=True)
+        state = registry.state["fast"]
+        self.assertFalse(sources_pkg._due(fast, state, NOW + 1, {}))
+        self.assertTrue(sources_pkg._due(fast, state, NOW + 2, {}))
+        registry.tick(store, {}, NOW + 2)
+        self.assertEqual(fast.n, 2)
+
+    def test_signal_source_ignores_next_due(self):
+        class _Signalled:
+            NAME = "signalled"
+            INTERVAL_S = 2
+            signal_paths = ()
+
+            def poll(self, store, cfg, now):
+                pass
+
+        source = _Signalled()
+        registry = Registry([source])
+        state = registry.state["signalled"]
+        state.update(last_poll=NOW, next_due=NOW + 1000)
+        self.assertTrue(sources_pkg._due(source, state, NOW + 2, {}))
+
+    def test_error_also_sets_the_delay(self):
+        store = MemStore()
+        source = self._SlowPoll(fail=True)
+        registry = Registry([source])
+        registry.tick(store, {}, NOW, force=True)
+        state = registry.state["slow-poll"]
+        self.assertEqual(state["last_error"], "RuntimeError: boom")
+        self.assertGreaterEqual(state["next_due"], NOW + 0.1)
+        self.assertFalse(sources_pkg._due(source, state, NOW + 0.05, {}))
+
+
 class RestartGraceTests(unittest.TestCase):
     """The first poll cycle after a restart is "starting", never stalled."""
 
