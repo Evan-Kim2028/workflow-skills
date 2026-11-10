@@ -338,6 +338,14 @@ class WsTrainCliTest(unittest.TestCase):
         self.assertIn("ws train", prompt)
         self.assertEqual(validate_bundle("WS4"), [])
 
+    def test_template_task_carries_a_v1_contract(self):
+        self.assertEqual(cmd_ws(["new", "WS4", "Sample"]), 0)
+        task = _plan(self.root, "WS4")["dag"]["groups"][0]["tasks"][0]
+        self.assertEqual(task["contract_version"], 1)
+        self.assertEqual(task["acceptance"]["probe"], "pytest path/to/test_x.py")
+        self.assertEqual(task["files"], ["path/to/file.py"])
+        self.assertEqual(validate_bundle("WS4"), [])
+
     def test_create_needs_title(self):
         self.assertEqual(cmd_ws(["new", "WS4", "Sample"]), 0)
         self.assertEqual(cmd_ws(["train", "WS4", "T1"]), 2)
@@ -561,6 +569,18 @@ class OrchestrateCliTest(unittest.TestCase):
         self.assertEqual(cmd_ws(["next", "WS9", "--limit", "1"]), 0)
         limited = self._json(["next", "WS9", "--limit", "1", "--json"])
         self.assertEqual(len(limited["ready"]), 1)
+
+    def test_next_reports_contract_blocked_tasks(self):
+        plan_path = self.root / "WS9" / "plan.json"
+        plan = json.loads(plan_path.read_text(encoding="utf-8"))
+        for task in plan["dag"]["groups"][0]["tasks"]:
+            if task["id"] == "WS9.2":
+                task["contract_version"] = 1
+        plan_path.write_text(json.dumps(plan), encoding="utf-8")
+        payload = self._json(["next", "WS9", "--json"])
+        self.assertEqual([row["id"] for row in payload["ready"]], ["WS9.0"])
+        self.assertEqual([row["id"] for row in payload["contract_blocked"]], ["WS9.2"])
+        self.assertTrue(payload["contract_blocked"][0]["issues"])
 
     def test_next_exit_codes(self):
         self.assertEqual(cmd_ws(["next", "NOPE"]), 3)
