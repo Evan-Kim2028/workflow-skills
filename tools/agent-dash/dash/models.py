@@ -7,7 +7,8 @@ model key such as ``grok-4.7`` or ``composer-2.5``. DeepSeek ids map to
 ``deepseek-v4-flash-vision-exp`` aliases) or ``deepseek-v4-pro``. Morph-served
 Kimi K3.1 ids (``morph/morph-kimik31``, ``kimi-k3.1``) map to ``kimi-k3.1``.
 The bare ``muse`` id (the muse CLI's placeholder model string) maps to
-``muse-spark-1.3-contributor``, the rate those runs bill at. Any model
+``muse-spark-1.3-contributor``, the rate those runs bill at. A ``muse-ember``
+id maps to ``muse-ember-1.0``, the free model the catalog prices at $0. Any model
 id containing ``beam`` (case-insensitive) maps to the ``beam`` family under
 ``beam-<ver>`` when the id carries a version (``reflection/Beam-1.0`` reads
 ``beam-1.0``) else ``beam``, whichever harness ran it. Codex ids (``gpt-*``,
@@ -116,6 +117,8 @@ def model_key(model: str | None, hint: str | None = None) -> tuple[str, str]:
         return "kimi", "kimi-k3.1"
     if m == "muse":
         return "muse", "muse-spark-1.3-contributor"
+    if "muse-ember" in m:
+        return "muse", "muse-ember-1.0"
     if "muse" in m:
         match = re.search(r"muse-(spark|wonder)(?:-full)?-(\d+(?:\.\d+)?)", m)
         return "muse", f"muse-{match.group(1)}-{match.group(2)}" if match else "muse-unknown"
