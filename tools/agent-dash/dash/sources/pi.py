@@ -21,6 +21,14 @@ The stream's own ``session`` event names the pi session; usage rows use
 that id (the launcher's ``generic.jsonl`` lines use it too, so the two
 readers upsert the same row instead of counting it twice).
 
+The stream's session id is also the run's id, even when the run-folder
+manifest carries a pre-generated one: ``run_worker.py`` writes a session
+id before pi starts, pi picks its own, and the launcher records that in
+``<run_dir>/pi/pi-sessions.tsv``. Keying the run by the stream id makes
+the run-folder row and the launcher's ``pi/`` row one run, and matches the
+``generic.jsonl`` usage rows. A pre-generated row already in the store is
+folded onto the stream run on the next poll (see :func:`_reassign_twin`).
+
 Liveness is the launcher: a live ``python3 .../scripts/launch_pi.py``
 with the run's label (see ``dash.sources.process.live_agent_processes``),
 recorded as a process sample for the run. The pi CLI rewrites its
@@ -463,7 +471,8 @@ def _read_meta(pad, label):
 def _upsert_run(store, row, processes, seen, budget=0, per_file=0, now=None):
     label = row["label"]
     pad = row["pad"]
-    sid = row.get("sid") or _stream_session(pad, label) or label
+    stream_sid = _stream_session(pad, label)
+    sid = stream_sid or row.get("sid") or label
     out_path = _first_file(pad, "out-%s.md" % label)
     err_path = _first_file(pad, "err-%s.log" % label)
     quota = _quota(pad, label, out_path, err_path, sid)
@@ -511,7 +520,47 @@ def _upsert_run(store, row, processes, seen, budget=0, per_file=0, now=None):
     _process_apply(store, run, processes)
     budget = _apply_stream(store, run, pad, label, budget, per_file, now)
     _emit_run(store, run, seen)
+    if stream_sid and row.get("sid") and row["sid"] != stream_sid:
+        # After the emit: the stream run exists, so the fold can move the
+        # pre-generated row on this poll instead of the next one.
+        _reassign_twin(store, row["sid"], stream_sid, label)
     return budget
+
+
+def _reassign_twin(store, old_sid, new_sid, label):
+    """Fold a pre-generated run-folder row onto the stream's run.
+
+    ``run_worker.py`` records a session id before pi starts; pi picks its
+    own and the stream records it. The run-folder row and the launcher's
+    ``pi/`` row are one launch, so a stored row keyed by the pre-generated
+    id is moved onto the stream run instead of listed as a tokenless twin.
+    The pair is remembered per store so a quiet run costs no query after
+    the first fold; a fold that cannot run yet (the stream run has not been
+    written) is retried on the next poll.
+    """
+    src = "pi:%s:%s" % (old_sid, label)
+    dst = "pi:%s:%s" % (new_sid, label)
+    try:
+        done = store.__dict__.setdefault("_pi_reassigned", set())
+    except AttributeError:
+        done = None
+    if done is not None and (src, dst) in done:
+        return
+    reassign = getattr(store, "reassign_run", None)
+    if not callable(reassign):
+        return
+    get_run = getattr(store, "get_run", None)
+    try:
+        if callable(get_run) and get_run(src) is None:
+            if done is not None:
+                done.add((src, dst))
+            return
+        moved = reassign(src, dst)
+    except Exception:
+        _fail("reassign")
+        return
+    if moved and done is not None:
+        done.add((src, dst))
 
 
 def _first_file(pad, name):
@@ -538,7 +587,7 @@ def _apply_stream(store, run, pad, label, budget, per_file, now):
         return budget
     key = "pi:stream:" + path
     try:
-        raw, budget, _started = _grok._read_chunk(store, path, key, budget, per_file)
+        raw, budget, started = _grok._read_chunk(store, path, key, budget, per_file)
     except Exception:
         _fail("stream")
         return budget
@@ -552,7 +601,10 @@ def _apply_stream(store, run, pad, label, budget, per_file, now):
         return budget
     index_key = "pi:stream-index:" + path
     rec = _offset(store, index_key)
-    start_index = int(rec[1]) if rec and rec[0] == st.st_ino else 0
+    # A read that starts at byte 0 (first poll, or a cursor reset) numbers
+    # its messages from 1 again, so a re-read upserts the same rows instead
+    # of minting new ids and double counting the run.
+    start_index = int(rec[1]) if rec and rec[0] == st.st_ino and not started else 0
     events = parse_stream(raw, stream_sid, default_model=model, start_index=start_index)
     for ev in events:
         _add_usage(
