@@ -86,17 +86,17 @@ class BlockerGrouping(unittest.TestCase):
         self.assertEqual(len(flow["blockers"]), 2)
         first = flow["blockers"][0]
         self.assertEqual((first["code"], first["ws"]), ("stuck-task", "WS33"))
-        self.assertEqual(first["count"], 3)
+        self.assertEqual(first["count"], 2)
         self.assertEqual(first["severity"], "critical")
         self.assertEqual(first["title"], "Task WS33.1 is stuck")
         self.assertEqual(flow["totals"]["blockers"], 2)
-        self.assertEqual(flow["totals"]["blocked_tasks"], 4)
+        self.assertEqual(flow["totals"]["blocked_tasks"], 3)
 
     def test_blockers_sort_worst_then_largest(self):
         doctor = {"problems": [
-            problem("info-code", "WS1", "info", 9),
-            problem("warn-small", "WS2", "warn", 1),
-            problem("warn-big", "WS3", "warn", 5),
+            problem("info-code", "WS1", "info", 1, items_total=9),
+            problem("warn-small", "WS2", "warn", 1, items_total=1),
+            problem("warn-big", "WS3", "warn", 1, items_total=5),
             problem("crit", "WS4", "critical", 1),
         ]}
         flow = flowview.build_flow(None, doctor)
@@ -106,6 +106,28 @@ class BlockerGrouping(unittest.TestCase):
         doctor = {"problems": [problem("stuck-task", "WS33", "warn", 1, items_total=7)]}
         flow = flowview.build_flow(None, doctor)
         self.assertEqual(flow["blockers"][0]["count"], 7)
+
+    def test_poll_count_without_items_counts_one(self):
+        doctor = {"problems": [problem("stuck-task", "WS33", "warn", 5276)]}
+        flow = flowview.build_flow(None, doctor)
+        self.assertEqual(flow["blockers"][0]["count"], 1)
+        self.assertEqual(flow["totals"]["blocked_tasks"], 1)
+
+    def test_grouped_problem_counts_its_items(self):
+        doctor = {"problems": [problem("stuck-task", "WS33", "warn", 5276, items_total=48)]}
+        flow = flowview.build_flow(None, doctor)
+        self.assertEqual(flow["blockers"][0]["count"], 48)
+
+    def test_blocked_tasks_sums_item_counts(self):
+        doctor = {"problems": [
+            problem("stuck-task", "WS33", "warn", 5276),
+            problem("dep-jump", "WS34", "warn", 12, items_total=48),
+            problem("orphan-worker", "WS35", "info", 3, items_total=2),
+        ]}
+        flow = flowview.build_flow(None, doctor)
+        self.assertEqual([b["count"] for b in flow["blockers"]], [48, 1, 2])
+        self.assertEqual(flow["totals"]["blockers"], 3)
+        self.assertEqual(flow["totals"]["blocked_tasks"], 51)
 
     def test_unknown_severity_reads_as_warn(self):
         doctor = {"problems": [problem("odd", "WS1", "bogus", 1)]}
@@ -166,7 +188,7 @@ class Fixtures(unittest.TestCase):
         ]}
         doctor = {"generated_at": fixture["generated_at"], "problems": [
             {"code": b["code"], "ws": b["ws"], "severity": b["severity"],
-             "count": b["count"], "title": b["title"]}
+             "count": 1, "items_total": b["count"], "title": b["title"]}
             for b in fixture["blockers"]
         ]}
         self.assertEqual(flowview.build_flow(state, doctor), fixture)

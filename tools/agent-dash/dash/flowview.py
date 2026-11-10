@@ -94,7 +94,13 @@ def _workstreams(state) -> list:
 
 
 def _blockers(doctor) -> list:
-    """Doctor problems grouped by (code, workstream), worst severity first."""
+    """Doctor problems grouped by (code, workstream), worst severity first.
+
+    A group's ``count`` is the number of blocked items: the problem's
+    ``items_total`` when it has members, else one for the problem itself.
+    The problem's ``count`` is poll occurrences, not items, so it is never
+    read here.
+    """
     groups: dict = {}
     for item in (doctor or {}).get("problems") or []:
         if not isinstance(item, dict):
@@ -107,7 +113,7 @@ def _blockers(doctor) -> list:
         severity = str(item.get("severity") or "warn")
         if severity not in SEVERITY_RANK:
             severity = "warn"
-        count = _int(item.get("items_total") if item.get("items_total") is not None else item.get("count"))
+        count = _int(item.get("items_total"))
         if count <= 0:
             count = 1
         group = groups.get((code, ws))
