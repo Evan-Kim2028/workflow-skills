@@ -369,6 +369,14 @@ class BeamPricingTest(unittest.TestCase):
         self.assertFalse(status("someprovider/new-model:xhigh")["priced"])
 
 
+class KimiSeriesTest(unittest.TestCase):
+    def test_kimi_ids_bucket_under_kimi(self):
+        from dash.pricing import series_key
+
+        self.assertEqual(series_key("morph/morph-kimik31"), "kimi")
+        self.assertEqual(series_key("morph/morph-kimik31:low"), "kimi")
+
+
 class ThinkingSuffixPricingTest(unittest.TestCase):
     def test_effort_suffix_prices_like_bare_id(self):
         """Every pi thinking level prices as its bare id, not as None."""

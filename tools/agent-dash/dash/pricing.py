@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 
-from dash.models import is_deepseek_alias, strip_thinking_suffix
+from dash.models import is_deepseek_alias, is_kimi_alias, strip_thinking_suffix
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_PATH = ROOT / "catalog" / "prices.json"
@@ -99,6 +99,8 @@ def series_key(model: str | None) -> str:
     text = (model or "").lower()
     if is_deepseek_alias(text):
         return "deepseek"
+    if is_kimi_alias(text) or "kimi" in text:
+        return "kimi"
     if "beam" in text:
         return "beam"
     if text in _COMMANDCODE_FREE:
