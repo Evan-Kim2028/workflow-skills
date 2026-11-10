@@ -12,6 +12,12 @@ scratch roots (see ``scan_roots``). Entries that no longer exist are
 skipped; entries untouched for ``PRUNE_AFTER_S`` (14 days) are dropped
 from the file. The file never holds prompts, argv, or secrets: paths
 only.
+
+Workstream bundles keep their run folders under ``<workstreams>/<ID>/runs``.
+``bundle_run_roots`` discovers those roots from the configured workstreams
+dir, so a lead needs no ``run-dirs.txt`` entry for them. ``run_dirs``
+composes the manual registry with the bundle roots; ``registered_run_dirs``
+stays manual-only.
 """
 
 from __future__ import annotations
@@ -22,6 +28,10 @@ from pathlib import Path
 FILE_NAME = "run-dirs.txt"
 MAX_ENTRIES = 256
 PRUNE_AFTER_S = 14 * 86400
+BUNDLE_RUNS_NAME = "runs"
+
+#: Bundle-root scan cache: workstreams dir -> (signature, roots).
+_BUNDLE_CACHE: dict[str, tuple[int, tuple]] = {}
 
 
 def state_dir_of(cfg: dict | None = None) -> Path:
@@ -98,12 +108,93 @@ def registered_run_dirs(state_dir=None, cfg=None, now=None) -> list:
         return []
 
 
+def bundle_run_roots(cfg=None) -> list:
+    """Existing ``<workstreams>/<ID>/runs`` folders, resolved and sorted.
+
+    A workstream bundle keeps its run folders under ``runs/``, so the
+    bundle root covers every run folder a lead puts there without a
+    ``run-dirs.txt`` entry. Only folders that exist are returned; nothing
+    is created. A ``runs`` folder whose real path leaves the workstreams
+    root (a symlink escape) is skipped. The scan is cached by the
+    workstreams dir signature and rescanned when that signature moves.
+    """
+    from dash import dataroot as _dataroot
+
+    try:
+        root = os.path.realpath(str(_dataroot.workstreams_dir(cfg)))
+    except (OSError, ValueError):
+        return []
+    if not os.path.isdir(root):
+        return []
+    signature = _bundle_signature(root)
+    if signature is None:
+        return []
+    hit = _BUNDLE_CACHE.get(root)
+    if hit is not None and hit[0] == signature:
+        return list(hit[1])
+    found = []
+    seen = set()
+    try:
+        with os.scandir(root) as kids:
+            for kid in kids:
+                try:
+                    if not kid.is_dir():
+                        continue
+                except OSError:
+                    continue
+                runs = os.path.join(kid.path, BUNDLE_RUNS_NAME)
+                try:
+                    real = os.path.realpath(runs)
+                except OSError:
+                    continue
+                if not os.path.isdir(real) or not _under(real, root):
+                    continue
+                if real in seen:
+                    continue
+                seen.add(real)
+                found.append(real)
+    except OSError:
+        return []
+    found.sort()
+    _BUNDLE_CACHE[root] = (signature, tuple(found))
+    return list(found)
+
+
+def run_dirs(cfg=None, now=None) -> list:
+    """Registered run folders plus bundle run roots, deduped.
+
+    Registered folders keep their order first; bundle roots follow, sorted.
+    A bundle root already registered is not repeated. ``registered_run_dirs``
+    stays manual-only so a caller that wants just the registry keeps it.
+    """
+    try:
+        registered = registered_run_dirs(cfg=cfg, now=now)
+    except (OSError, ValueError):
+        registered = []
+    try:
+        bundles = bundle_run_roots(cfg)
+    except (OSError, ValueError):
+        bundles = []
+    out = list(registered)
+    seen = set()
+    for path in out:
+        seen.add(_real(path))
+    for path in bundles:
+        real = _real(path)
+        if real in seen:
+            continue
+        seen.add(real)
+        out.append(path)
+    return out
+
+
 def scan_roots(cfg) -> list:
-    """Configured scratch roots plus registered run folders, deduped.
+    """Configured scratch roots plus run folders, deduped.
 
     Sources that read manifest files iterate this instead of only the
     configured ``roots.scratchpads``, so a run folder shows up wherever
-    the lead put it. Order is stable: configured roots first.
+    the lead put it. Order is stable: configured roots first, then the
+    manual registry, then bundle run roots.
     """
     from dash.locate import scratch_roots
 
@@ -112,7 +203,7 @@ def scan_roots(cfg) -> list:
     except (OSError, ValueError):
         roots = []
     try:
-        extra = registered_run_dirs(cfg=cfg) if _registry_configured(cfg) else []
+        extra = run_dirs(cfg=cfg) if _registry_configured(cfg) else []
     except (OSError, ValueError):
         extra = []
     seen = set()
@@ -153,11 +244,13 @@ def describe_roots(cfg, now=None, processes="auto") -> dict:
     """Scratch-root visibility report for ``/api/health``.
 
     Returns ``scratch_roots`` (the configured, resolved list),
-    ``run_dirs`` (the registered, existing folders), and ``warnings``:
-    one entry per registered folder outside the configured roots that
-    holds a manifest for a currently live worker. A local config that
-    sets ``roots.scratchpads`` without the run folder a lead chose shows
-    up here instead of silently dropping those workers.
+    ``run_dirs`` (the registered folders plus bundle run roots), and
+    ``warnings``: one entry per manually registered folder outside the
+    configured roots and the bundle roots that holds a manifest for a
+    currently live worker. A local config that sets ``roots.scratchpads``
+    without the run folder a lead chose shows up here instead of silently
+    dropping those workers. Bundle roots are discovered, not chosen, so
+    they never warn.
     """
     from dash.locate import scratch_roots
 
@@ -166,13 +259,17 @@ def describe_roots(cfg, now=None, processes="auto") -> dict:
     except (OSError, ValueError):
         roots = []
     try:
-        reg = registered_run_dirs(cfg=cfg, now=now)
+        reg = run_dirs(cfg=cfg, now=now)
     except (OSError, ValueError):
         reg = []
+    try:
+        covered = roots + bundle_run_roots(cfg)
+    except (OSError, ValueError):
+        covered = roots
     live = _live_labels(processes)
     warnings = []
     for rundir in reg:
-        if _covered(rundir, roots):
+        if _covered(rundir, covered):
             continue
         labels = _manifest_labels(rundir)
         if not labels:
@@ -261,6 +358,42 @@ def _manifest_labels(rundir: str) -> list:
             if label and "/" not in label and "\\" not in label and not label.startswith("."):
                 labels.append(label[:200])
     return labels
+
+
+def _bundle_signature(root: str):
+    """Newest mtime_ns of the workstreams dir and its children, or None.
+
+    A bundle dir appearing moves the root's mtime; a ``runs`` folder
+    appearing inside an existing bundle moves that child's mtime. The
+    newest of the two covers both, so the cache never serves a stale list.
+    """
+    try:
+        latest = os.stat(root).st_mtime_ns
+    except OSError:
+        return None
+    try:
+        with os.scandir(root) as kids:
+            for kid in kids:
+                try:
+                    stamp = kid.stat(follow_symlinks=False).st_mtime_ns
+                except OSError:
+                    continue
+                if stamp > latest:
+                    latest = stamp
+    except OSError:
+        return None
+    return latest
+
+
+def _under(path: str, root: str) -> bool:
+    return path == root or path.startswith(root + os.sep)
+
+
+def _real(path: str) -> str:
+    try:
+        return os.path.realpath(path)
+    except OSError:
+        return path
 
 
 def _touched(path: str) -> float:
