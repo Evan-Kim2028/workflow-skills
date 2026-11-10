@@ -2260,6 +2260,78 @@ loadNav().then(function () {
         self.assertEqual(proc.returncode, 0, proc.stderr or proc.stdout)
         self.assertIn("health isolation proof ok", proc.stdout)
 
+    def test_health_reloads_an_open_tab_on_build_change(self):
+        """A deploy swaps the static assets under an open tab, and no-cache
+        only stops a cached copy: the tab keeps running the JS it loaded.
+        refreshHealth records the first build id and reloads once when a
+        later health response names a different one. A missing or unchanged
+        build id never reloads."""
+        script = inline_scripts()
+        bodies = dict(functions(script))
+        self.assertIn("refreshHealth", bodies)
+        self.assertIn("build_id", bodies["refreshHealth"], "health never reads the build id")
+        self.assertIn("location.reload", bodies["refreshHealth"], "a build change never reloads the tab")
+        self.assertIn("__adBuild", bodies["refreshHealth"], "the reload is not guarded by a stored build id")
+        harness = r'''
+const fs = require("fs");
+const assert = require("assert");
+global.window = globalThis;
+global.FIX = false;
+global.state = {bundles: [], wss: [], wssAll: [], project: {name: null}, actionsArchive: false, lastSeqChange: 0, lastPoll: null};
+global.since = function () { return 123; };
+global.renderTabs = function () {};
+global.applyChrome = function () {};
+global.resolveLanding = function () {};
+var badges = {"stale-badge": {hidden: true, textContent: "", title: ""}, "live-txt": {textContent: "live"}};
+global.document = {getElementById: function (id) { return badges[id] || null; }};
+var reloads = 0;
+global.location = {reload: function () { reloads++; }};
+var clock = 1000000;
+Date.now = function () { return clock; };
+var payloads = [];
+global.fetch = function (url) {
+  var body = payloads.shift() || {};
+  return Promise.resolve({ok: true, status: 200, headers: {get: function () { return "tag"; }}, json: function () { return Promise.resolve(body); }});
+};
+eval(fs.readFileSync(process.argv[2], "utf8"));
+function tick(payload) {
+  payloads.push(payload);
+  clock += 31000;
+  refreshHealth();
+  return new Promise(function (r) { setTimeout(r, 10); });
+}
+tick({ok: true}).then(function () {
+  assert.strictEqual(reloads, 0, "a health response with no build id must not reload");
+  assert.strictEqual(window.__adBuild, undefined, "a missing build id must not be stored");
+  return tick({ok: true, build_id: "aaa"});
+}).then(function () {
+  assert.strictEqual(reloads, 0, "the first build id must be recorded, not reloaded");
+  assert.strictEqual(window.__adBuild, "aaa");
+  return tick({ok: true, build_id: "aaa"});
+}).then(function () {
+  assert.strictEqual(reloads, 0, "an unchanged build id must not reload");
+  return tick({ok: true, build_id: "bbb"});
+}).then(function () {
+  assert.strictEqual(reloads, 1, "a changed build id must reload the tab once");
+  assert.strictEqual(window.__adBuild, "bbb", "the new build id must be stored before the reload");
+  return tick({ok: true});
+}).then(function () {
+  assert.strictEqual(reloads, 1, "a later response with no build id must not reload");
+  console.log("build reload proof ok");
+  process.exit(0);
+}).catch(function (e) { console.error("ASSERT: " + ((e && e.stack) || e)); process.exit(1); });
+'''
+        with tempfile.TemporaryDirectory() as tmp:
+            harness_path = Path(tmp) / "build_reload.js"
+            harness_path.write_text(harness, encoding="utf-8")
+            proc = subprocess.run(
+                ["node", str(harness_path), str(STATIC / "core" / "api.js")],
+                capture_output=True,
+                text=True,
+            )
+        self.assertEqual(proc.returncode, 0, proc.stderr or proc.stdout)
+        self.assertIn("build reload proof ok", proc.stdout)
+
     def test_project_totals_skip_ignored_bundles(self):
         """Project totals leave ignored bundles out of the comparison. /api/bundles
         keeps them while /api/workstreams drops them, so without this the
