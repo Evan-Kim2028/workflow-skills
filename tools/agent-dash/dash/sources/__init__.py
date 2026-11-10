@@ -601,6 +601,13 @@ def _is_stalled(source, state: dict, now: float, born: float) -> bool:
             return False
         # A dormant source is silent by design for up to the fallback gap.
         limit = BACKOFF_MAX_S + limit
+    if not declares_signals(source):
+        next_due = state.get("next_due")
+        if next_due is not None and now < next_due:
+            # Waiting for its own adaptive next start (twice its last
+            # duration), not silent: a slow source is not stalled while
+            # it is backed off. Past ``next_due`` the limit applies again.
+            return False
     last = state.get("last_poll")
     if last is None:
         return now - born > max(limit, START_GRACE_S)
