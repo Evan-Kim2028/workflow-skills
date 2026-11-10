@@ -24,6 +24,7 @@ loader, clock) is injected, so tests never start a worker.
 
 from __future__ import annotations
 
+import contextlib
 import fcntl
 import json
 import os
@@ -35,8 +36,10 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+from dash import evidence
 from dash import labels as label_lib
 from dash import orchestrate
+from dash.admission import LeaseStore
 from dash.liveness import pid_alive as system_alive
 from dash.liveness import read_pid_file as _read_pid_file
 
@@ -332,7 +335,20 @@ class Lock:
 class Dispatcher:
     """One workstream's dispatch loop state and one tick of its logic."""
 
-    def __init__(self, ws, bundle, *, launcher=None, alive=None, runs=None, set_status=None, load_body=None, now=None):
+    def __init__(
+        self,
+        ws,
+        bundle,
+        *,
+        launcher=None,
+        alive=None,
+        runs=None,
+        set_status=None,
+        load_body=None,
+        now=None,
+        leases=None,
+        verify_timeout_s=300,
+    ):
         self.ws = ws
         self.bundle = Path(bundle)
         self.launcher = launcher or default_launcher
@@ -341,6 +357,8 @@ class Dispatcher:
         self.set_status = set_status or default_set_status(ws)
         self.load_body = load_body or default_load_body(ws)
         self.now = now or time.time
+        self.leases = leases or LeaseStore()
+        self.verify_timeout_s = verify_timeout_s
         self.dry = False
         self.dry_events: list[dict] = []
         self.stopping = False
@@ -352,6 +370,7 @@ class Dispatcher:
             "tasks": {},
             "needs_prompt": [],
             "errors": {},
+            "admission": {},
             "pr_since": {},
             "merge_key": None,
             "idle_key": None,
@@ -407,6 +426,117 @@ class Dispatcher:
         prefix = f"{task}|{phase}|"
         for key in [key for key in self.state["errors"] if key.startswith(prefix)]:
             del self.state["errors"][key]
+
+    def _task_of(self, task_id: str) -> dict:
+        """The plan task behind an id, or ``{}`` when the plan cannot be read."""
+        try:
+            by_id, _deps, _order = orchestrate.plan_tasks(self.load_body())
+        except Exception:
+            return {}
+        return by_id.get(task_id) or {}
+
+    def _lease_owner(self, task_id: str, label: str) -> str:
+        return f"dispatch:{self.ws}:{task_id}:{label}"
+
+    def _claim_lease(self, task_id: str, task: dict, workspace, label: str):
+        """A held lease, ``None`` when the task declares no files, or ``False`` when blocked.
+
+        The lease is rooted at the task workspace, so a declaration is read the
+        way the worker reads it. A stale lease from a previous dispatcher
+        process carries the same owner token and is dropped first, so a restart
+        adopts its own run instead of blocking on itself.
+        """
+        files = task.get("files") or []
+        if not files:
+            return None
+        owner = self._lease_owner(task_id, label)
+        _best_effort(lambda: self.leases.release_owner(owner))
+        result = self.leases.claim(owner, self.ws, task_id, files, root=workspace, now=self.now())
+        if not result.get("ok"):
+            self._admission_blocked(task_id, result)
+            return False
+        self.state["admission"].pop(task_id, None)
+        return {"lease_id": result["lease_id"], "lease_owner": owner}
+
+    def _admission_blocked(self, task_id: str, result: dict) -> None:
+        """One event per distinct block, so a held file does not spam the inbox."""
+        signature = json.dumps(
+            {"reason": result.get("reason"), "conflicts": result.get("conflicts"), "error": result.get("error")},
+            sort_keys=True,
+        )
+        if self.state["admission"].get(task_id) == signature:
+            return
+        self.state["admission"][task_id] = signature
+        self.emit(
+            "admission-blocked",
+            task=task_id,
+            reason=result.get("reason"),
+            conflicts=result.get("conflicts") or [],
+            error=result.get("error"),
+        )
+
+    def _renew_lease(self, task: dict) -> None:
+        lease_id = task.get("lease_id")
+        owner = task.get("lease_owner")
+        if not lease_id or not owner:
+            return
+        _best_effort(lambda: self.leases.renew(lease_id, owner, now=self.now()))
+
+    def _release_lease(self, task: dict) -> None:
+        lease_id = task.get("lease_id")
+        owner = task.get("lease_owner")
+        if not lease_id or not owner:
+            return
+        _best_effort(lambda: self.leases.release(lease_id, owner))
+        task.pop("lease_id", None)
+        task.pop("lease_owner", None)
+
+    def _release_capacity_lease(self, task: dict) -> None:
+        """Drop the launch-count lease run_worker wrote for this run, then its file."""
+        path = Path(task["run_dir"]) / f"{task['label']}.admission-lease"
+        try:
+            body = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return
+        if isinstance(body, dict) and body.get("lease_id") and body.get("owner"):
+            _best_effort(lambda: self.leases.release(body["lease_id"], body["owner"]))
+        with contextlib.suppress(OSError):
+            path.unlink()
+
+    def _verify_pass(self, task_id: str, task: dict) -> bool:
+        """Run a contract task's acceptance probe before its PASS may advance.
+
+        A legacy task has no contract and keeps its old PASS behavior. A
+        contract task advances only on a receipt that is ok and still matches
+        the contract, the probe and the current clean tree.
+        """
+        plan_task = self._task_of(task_id)
+        if plan_task.get("contract_version") is None:
+            return True
+        workspace = task.get("workspace")
+        receipt = evidence.verify_task(plan_task, workspace, timeout_s=self.verify_timeout_s, now=self.now())
+        reason = receipt.get("reason") if not receipt.get("ok") else "stale-receipt"
+        if receipt.get("ok") and evidence.receipt_valid(receipt, plan_task, workspace):
+            try:
+                evidence.write_receipt(receipt)
+                return True
+            except OSError:
+                reason = "receipt-write-failed"
+        self.emit(
+            "verification",
+            task=task_id,
+            label=task.get("label"),
+            ok=False,
+            reason=reason,
+            contract_hash=receipt.get("contract_hash"),
+            tree=receipt.get("tree"),
+            probe_hash=receipt.get("probe_hash"),
+            exit_code=receipt.get("exit_code"),
+            duration_s=receipt.get("duration_s"),
+        )
+        self._release_lease(task)
+        self._move_needs_lead(task_id, task, "verification-failed")
+        return False
 
     def _move(self, task_id: str, status: str) -> None:
         """Set a task's status only while the plan still holds an expected status.
@@ -580,6 +710,9 @@ class Dispatcher:
         if self.dry:
             self.emit("would-launch", task=task_id, label=label, tier=tier, kind=kind, workspace=str(workspace))
             return "ok"
+        lease = self._claim_lease(task_id, self._task_of(task_id), workspace, label)
+        if lease is False:
+            return "blocked"
         run_dir = self.bundle / "runs" / label
         run_dir.mkdir(parents=True, exist_ok=True)
         prompt_copy = run_dir / "prompt.md"
@@ -600,17 +733,23 @@ class Dispatcher:
             "overdue": False,
             "exclude": exclude,
         }
-        if live_pid is not None:
-            record["tier"] = (run_dir / f"{label}.tier").read_text(encoding="utf-8").strip() or tier
-        else:
-            prompt_copy.write_text(body if body.endswith("\n") else body + "\n", encoding="utf-8")
-            status = parse_status(self.launcher(worker_argv(label, tier, workspace, prompt_copy, run_dir, 0, exclude)))
-            if read_pid_file(run_dir / f"{label}.pid") is None:
-                if status["reason"] == "none-available":
-                    return "none-available"
-                raise RuntimeError(f"launch of {label} did not start: {status['reason']}")
-            record["tier"] = status["tier"]
-            record["out"] = status["out"] or record["out"]
+        record.update(lease or {})
+        try:
+            if live_pid is not None:
+                record["tier"] = (run_dir / f"{label}.tier").read_text(encoding="utf-8").strip() or tier
+            else:
+                prompt_copy.write_text(body if body.endswith("\n") else body + "\n", encoding="utf-8")
+                status = parse_status(self.launcher(worker_argv(label, tier, workspace, prompt_copy, run_dir, 0, exclude)))
+                if read_pid_file(run_dir / f"{label}.pid") is None:
+                    if status["reason"] == "none-available":
+                        self._release_lease(record)
+                        return "none-available"
+                    raise RuntimeError(f"launch of {label} did not start: {status['reason']}")
+                record["tier"] = status["tier"]
+                record["out"] = status["out"] or record["out"]
+        except BaseException:
+            self._release_lease(record)
+            raise
         self.state["tasks"][task_id] = record
         self._clear_errors(task_id)
         self.persist()
@@ -650,6 +789,7 @@ class Dispatcher:
         run_dir = Path(task["run_dir"])
         pid = read_pid_file(run_dir / f"{task['label']}.pid")
         if pid is not None and self.alive(pid):
+            self._renew_lease(task)
             if not task.get("overdue") and now - task["started"] > task["max_wait"]:
                 task["overdue"] = True
                 self.emit("needs-lead", task=task_id, label=task["label"], reason="overdue", max_wait=task["max_wait"])
@@ -657,8 +797,10 @@ class Dispatcher:
         argv = worker_argv(task["label"], task["requested"], task["workspace"], task["prompt"], run_dir, 0, task.get("exclude") or [])
         status = parse_status(self.launcher(argv))
         if status["state"] == "running":
+            self._renew_lease(task)
             task["tier"] = status["tier"] or task["tier"]
             return
+        self._release_capacity_lease(task)
         out = status["out"] or task["out"]
         verdict = verdict_of(out) if status["state"] == "done" else "NONE"
         tier = status["tier"] or task["tier"]
@@ -673,19 +815,25 @@ class Dispatcher:
         )
         task["status"] = "finished"
         if verdict == "PASS":
+            if not self._verify_pass(task_id, task):
+                return
             target = "pr" if task["kind"] == "write" else "done"
+            self._release_lease(task)
             self._move(task_id, target)
             task["status"] = target
             return
         if verdict in VERDICTS:
+            self._release_lease(task)
             self._move_needs_lead(task_id, task, verdict)
             return
         if task["attempt"] < 2:
+            self._release_lease(task)
             task["status"] = "retry-pending"
             task["retry_from"] = tier
             if not cfg["paused"]:
                 self._try_retry(task_id, task, tier, cfg)
             return
+        self._release_lease(task)
         self._move_needs_lead(task_id, task, "no-verdict-twice")
 
     def _move_needs_lead(self, task_id: str, task: dict, reason: str) -> None:

@@ -16,7 +16,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 os.environ["AGENT_DASH_IGNORE_LOCAL"] = "1"
 
-from dash import dispatch  # noqa: E402
+from dash import dispatch, evidence  # noqa: E402
+from dash.admission import LeaseStore  # noqa: E402
 
 WS = "WS9"
 LABEL_A = "ws9-exec-a"
@@ -102,6 +103,9 @@ class DispatchTestCase(unittest.TestCase):
         self.workspace.mkdir()
         self.env = os.environ.get("AGENT_DASH_WORKSTREAMS")
         os.environ["AGENT_DASH_WORKSTREAMS"] = str(self.root / "bundles")
+        self.state_env = os.environ.get("AGENT_DASH_STATE_DIR")
+        self.state_dir = self.root / "state"
+        os.environ["AGENT_DASH_STATE_DIR"] = str(self.state_dir)
         self.clock = Clock()
         self.worker = FakeWorker()
         self.write_plan(plan_body())
@@ -114,6 +118,10 @@ class DispatchTestCase(unittest.TestCase):
             os.environ.pop("AGENT_DASH_WORKSTREAMS", None)
         else:
             os.environ["AGENT_DASH_WORKSTREAMS"] = self.env
+        if self.state_env is None:
+            os.environ.pop("AGENT_DASH_STATE_DIR", None)
+        else:
+            os.environ["AGENT_DASH_STATE_DIR"] = self.state_env
         self.tmp.cleanup()
 
     def write_plan(self, body):
@@ -148,7 +156,7 @@ class DispatchTestCase(unittest.TestCase):
         self.write_plan(plan)
         return True
 
-    def dispatcher(self, launcher=None):
+    def dispatcher(self, launcher=None, verify_timeout_s=300):
         return dispatch.Dispatcher(
             WS,
             self.bundle,
@@ -158,7 +166,44 @@ class DispatchTestCase(unittest.TestCase):
             set_status=self.set_status,
             load_body=self.read_plan,
             now=self.clock,
+            verify_timeout_s=verify_timeout_s,
         )
+
+    def lease_store(self):
+        return LeaseStore(self.state_dir)
+
+    def git_workspace(self):
+        """Turn the task workspace into a clean git repo with one commit."""
+        import subprocess
+
+        def git(*args):
+            return subprocess.run(["git", "-C", str(self.workspace), *args], capture_output=True, text=True, check=True)
+
+        git("init", "-q")
+        git("config", "user.email", "t@example.com")
+        git("config", "user.name", "T")
+        (self.workspace / "a.txt").write_text("one\n", encoding="utf-8")
+        git("add", "a.txt")
+        git("commit", "-q", "-m", "one")
+        return self.workspace
+
+    def contract_plan(self, tid, probe=None, files=None, cwd=None):
+        """Give one plan task a version-1 contract."""
+        plan = self.read_plan()
+        for task in plan["dag"]["groups"][0]["tasks"]:
+            if task["id"] != tid:
+                continue
+            task["contract_version"] = 1
+            task["acceptance"] = {
+                "metric": "tests",
+                "threshold": "pass",
+                "tolerance": "0",
+                "probe": probe or f"{sys.executable} -c 'pass'",
+            }
+            if cwd:
+                task["acceptance"]["cwd"] = cwd
+            task["files"] = files or ["src/mod.py"]
+        self.write_plan(plan)
 
     def events(self, after=0):
         return dispatch.read_events(self.bundle, after)
@@ -637,6 +682,149 @@ class ReviewFixTests(DispatchTestCase):
             self.assertEqual(dispatch.verdict_of(path), "PASS")
             path.write_text("Verdict: nothing useful\n", encoding="utf-8")
             self.assertEqual(dispatch.verdict_of(path), "NONE")
+
+
+class AdmissionTests(DispatchTestCase):
+    def test_file_conflict_blocks_the_launch_once_per_task(self):
+        self.contract_plan("WS9.A", files=["src/mod.py"])
+        self.contract_plan("WS9.B", files=["src/mod.py"])
+        held = self.lease_store().claim("other", WS, "WS9.X", ["src/mod.py"], root=self.workspace, now=self.clock())
+        self.assertTrue(held["ok"])
+        disp = self.dispatcher()
+        self.assertEqual(disp.tick()["launched"], 1, "only the task with no declared files launches")
+        self.assertEqual(self.status_of("WS9.A"), "todo")
+        blocked = [e for e in self.events() if e["type"] == "admission-blocked"]
+        self.assertEqual({e["task"] for e in blocked}, {"WS9.A", "WS9.B"})
+        self.assertEqual({e["reason"] for e in blocked}, {"conflict"})
+        disp.tick()
+        self.assertEqual(len([e for e in self.events() if e["type"] == "admission-blocked"]), 2, "one event per task, not per tick")
+
+    def test_invalid_declaration_blocks_the_launch(self):
+        plan = self.read_plan()
+        plan["dag"]["groups"][0]["tasks"][0]["files"] = ["../escape.py"]
+        self.write_plan(plan)
+        disp = self.dispatcher()
+        self.assertEqual(disp.tick()["launched"], 2, "the other two tasks still launch")
+        self.assertEqual(self.status_of("WS9.A"), "todo")
+        blocked = [e for e in self.events() if e["type"] == "admission-blocked"]
+        self.assertEqual([(e["task"], e["reason"]) for e in blocked], [("WS9.A", "invalid")])
+
+    def test_disjoint_launches_claim_and_release(self):
+        self.git_workspace()
+        self.contract_plan("WS9.A", files=["src/a.py"])
+        self.contract_plan("WS9.B", files=["src/b.py"])
+        disp = self.dispatcher()
+        disp.tick()
+        active = self.lease_store().active(now=self.clock())
+        self.assertEqual({row["task"] for row in active}, {"WS9.A", "WS9.B"})
+        self.worker.finish(LABEL_A, "PASS\nok\n")
+        self.worker.finish(LABEL_B, "PASS\nok\n")
+        disp.tick()
+        self.assertEqual(self.lease_store().active(now=self.clock()), [])
+
+    def test_lease_is_renewed_on_each_live_observation(self):
+        self.contract_plan("WS9.A", files=["src/a.py"])
+        disp = self.dispatcher()
+        disp.tick()
+        first = self.lease_store().active(now=self.clock())[0]["expires_at"]
+        self.clock.advance(100)
+        disp.tick()
+        second = self.lease_store().active(now=self.clock())[0]["expires_at"]
+        self.assertGreater(second, first)
+
+    def test_capacity_lease_is_released_when_the_run_finishes(self):
+        disp = self.dispatcher()
+        disp.tick()
+        store = self.lease_store()
+        cap = store.admit_capacity("run-owner", WS, "WS9.A", max_concurrent=5, now=self.clock())
+        path = self.bundle / "runs" / LABEL_A / f"{LABEL_A}.admission-lease"
+        path.write_text(json.dumps({"lease_id": cap["lease_id"], "owner": "run-owner"}), encoding="utf-8")
+        self.worker.finish(LABEL_A, "PASS\nok\n")
+        disp.tick()
+        self.assertEqual(store.active(now=self.clock()), [])
+        self.assertFalse(path.exists())
+
+
+class VerificationTests(DispatchTestCase):
+    def setUp(self):
+        super().setUp()
+        self.git_workspace()
+
+    def test_contract_pass_with_a_valid_receipt_advances(self):
+        self.contract_plan("WS9.A")
+        disp = self.dispatcher()
+        disp.tick()
+        self.worker.finish(LABEL_A, "PASS\nok\n")
+        disp.tick()
+        self.assertEqual(self.status_of("WS9.A"), "pr")
+        receipt = evidence.load_receipt({"id": "WS9.A"})
+        self.assertTrue(receipt["ok"])
+        self.assertEqual(receipt["reason"], "ok")
+        self.assertNotIn("stdout", receipt)
+        self.assertNotIn("stderr", receipt)
+        self.assertNotIn("needs-lead", self.types())
+
+    def test_failed_probe_does_not_advance(self):
+        self.contract_plan("WS9.A", probe=f"{sys.executable} -c 'raise SystemExit(3)'")
+        disp = self.dispatcher()
+        disp.tick()
+        self.worker.finish(LABEL_A, "PASS\nok\n")
+        disp.tick()
+        self.assertEqual(self.status_of("WS9.A"), "wip")
+        lead = [e for e in self.events() if e["type"] == "needs-lead"]
+        self.assertEqual([(e["task"], e["reason"]) for e in lead], [("WS9.A", "verification-failed")])
+        verification = [e for e in self.events() if e["type"] == "verification"]
+        self.assertEqual(verification[0]["reason"], "probe-failed")
+        self.assertEqual(verification[0]["exit_code"], 3)
+        self.assertIsNone(evidence.load_receipt({"id": "WS9.A"}))
+
+    def test_timeout_does_not_advance(self):
+        self.contract_plan("WS9.A", probe=f"{sys.executable} -c 'import time; time.sleep(5)'")
+        disp = self.dispatcher(verify_timeout_s=0.2)
+        disp.tick()
+        self.worker.finish(LABEL_A, "PASS\nok\n")
+        disp.tick()
+        self.assertEqual(self.status_of("WS9.A"), "wip")
+        verification = [e for e in self.events() if e["type"] == "verification"]
+        self.assertEqual(verification[0]["reason"], "timeout")
+
+    def test_dirty_tree_does_not_advance(self):
+        self.contract_plan("WS9.A")
+        disp = self.dispatcher()
+        disp.tick()
+        (self.workspace / "untracked.txt").write_text("x\n", encoding="utf-8")
+        self.worker.finish(LABEL_A, "PASS\nok\n")
+        disp.tick()
+        self.assertEqual(self.status_of("WS9.A"), "wip")
+        verification = [e for e in self.events() if e["type"] == "verification"]
+        self.assertEqual(verification[0]["reason"], "dirty-tree")
+
+    def test_amended_tree_does_not_advance(self):
+        self.contract_plan("WS9.A")
+        plan = self.read_plan()
+        task = plan["dag"]["groups"][0]["tasks"][0]
+        task["acceptance"]["probe"] = [
+            f"{sys.executable} -c \"open('amend.txt','w').write('x')\"",
+            "git add amend.txt",
+            "git commit --amend --no-edit",
+        ]
+        self.write_plan(plan)
+        disp = self.dispatcher()
+        disp.tick()
+        self.worker.finish(LABEL_A, "PASS\nok\n")
+        disp.tick()
+        self.assertEqual(self.status_of("WS9.A"), "wip")
+        verification = [e for e in self.events() if e["type"] == "verification"]
+        self.assertEqual(verification[0]["reason"], "stale-receipt")
+
+    def test_legacy_pass_still_advances_without_a_receipt(self):
+        disp = self.dispatcher()
+        disp.tick()
+        self.worker.finish(LABEL_A, "PASS\nok\n")
+        disp.tick()
+        self.assertEqual(self.status_of("WS9.A"), "pr")
+        self.assertIsNone(evidence.load_receipt({"id": "WS9.A"}))
+        self.assertNotIn("verification", self.types())
 
 
 if __name__ == "__main__":
