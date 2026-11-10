@@ -8,7 +8,9 @@ assume it and never take it.
 
 from __future__ import annotations
 
+import json as _json
 import os as _os
+import time as _time
 
 from dash import perfmon as _perf
 from dash.attribution import clean_label
@@ -27,6 +29,15 @@ from dash.pricing import status as price_status
 from .util import (_ESTIMATE_TOOL, RANGE_S, SAMPLE_KEEP_S,
                  TOKEN_FIELDS, UNASSIGNED, WS_STATUSES,
                  _hour, _manifest_family, _money, _opt_int, _same)
+
+#: Per-run event folds cached beside the database. The file is rewritten
+#: at most once per interval, and a dirty set larger than the cap falls
+#: back to one full scan instead of chunked refolds.
+_USAGE_FOLD_CACHE_VERSION = 1
+_USAGE_FOLD_CACHE_SAVE_S = 60.0
+_USAGE_FOLD_CACHE_DIRTY_MAX = 2000
+_USAGE_FOLD_CACHE_CHUNK = 500
+_USAGE_FOLD_TOKEN_KEYS = ("input", "output", "cache_read", "cache_write", "reasoning")
 
 
 class UsageMixin:
@@ -596,6 +607,10 @@ class UsageMixin:
                 self._note_data_write()
                 self._note_view_write()
                 self._usage_fold_epoch += 1
+                # Cost and cache-write fills rewrite rows in place, so the
+                # rowid key cannot see them. Refold everything once.
+                self._usage_fold_cache.clear()
+                self._drop_usage_fold_cache_file()
         def _hours_for_run(self, run_id: str) -> set[int]:
             rows = self._conn.execute(
                 "SELECT ts FROM usage_events WHERE run_id=? AND ts IS NOT NULL", (run_id,)
@@ -1075,34 +1090,162 @@ class UsageMixin:
                         self._usage_folds.pop(run_id, None)
                         continue
                     self._usage_folds[run_id] = _merge_rolls(triples)
+        def _load_usage_fold_cache(self) -> None:
+            """Load the per-run fold cache beside the database.
+
+            A missing, corrupt, or differently versioned file is ignored:
+            the next uncached build refolds and rewrites it. The catalog
+            signature guards costs priced under an older rate table.
+            """
+            path = self._usage_fold_cache_path
+            if path is None:
+                return
+            try:
+                with open(path, "r", encoding="utf-8") as handle:
+                    payload = _json.load(handle)
+            except (OSError, ValueError):
+                return
+            if not isinstance(payload, dict) or payload.get("version") != _USAGE_FOLD_CACHE_VERSION:
+                return
+            from dash.pricing import catalog_sig as _catalog_sig
+
+            if payload.get("catalog") != _catalog_sig():
+                return
+            runs = payload.get("runs")
+            if not isinstance(runs, dict):
+                return
+            cache: dict = {}
+            for run_id, entry in runs.items():
+                if not isinstance(run_id, str) or not isinstance(entry, dict):
+                    return
+                rowid = entry.get("rowid")
+                fold = _fold_from_cache(entry.get("fold"))
+                if not isinstance(rowid, int) or isinstance(rowid, bool) or fold is None:
+                    return
+                cache[run_id] = (rowid, fold)
+            self._usage_fold_cache = cache
+
+        def _save_usage_fold_cache_locked(self) -> None:
+            """Write the per-run fold cache atomically, at most once a minute.
+
+            Caller holds the lock. Bundles are never stored: they are
+            merged fresh on every build. Only token sums, cost, and the
+            unpriced flag leave memory.
+            """
+            path = self._usage_fold_cache_path
+            if path is None:
+                return
+            now = _time.time()
+            if now - self._usage_fold_cache_saved < _USAGE_FOLD_CACHE_SAVE_S:
+                return
+            from dash.pricing import catalog_sig as _catalog_sig
+
+            payload = {
+                "version": _USAGE_FOLD_CACHE_VERSION,
+                "catalog": _catalog_sig(),
+                "runs": {
+                    run_id: {"rowid": rowid, "fold": _fold_to_cache(triple)}
+                    for run_id, (rowid, triple) in self._usage_fold_cache.items()
+                },
+            }
+            tmp = path.with_name(path.name + ".tmp")
+            try:
+                with open(tmp, "w", encoding="utf-8") as handle:
+                    _json.dump(payload, handle, separators=(",", ":"))
+                _os.replace(tmp, path)
+            except OSError:
+                try:
+                    _os.unlink(tmp)
+                except OSError:
+                    pass
+                return
+            self._usage_fold_cache_saved = now
+
+        def _drop_usage_fold_cache_file(self) -> None:
+            """Forget the disk cache after an in-place rewrite. Caller holds the lock."""
+            path = self._usage_fold_cache_path
+            if path is None:
+                return
+            try:
+                _os.unlink(path)
+            except OSError:
+                pass
+            self._usage_fold_cache_saved = 0.0
+
         def _usage_by_run_uncached(self) -> dict:
-            rows = self._conn.execute(
-                """SELECT run_id, model, input_tokens, output_tokens, cache_read, cache_write,
-                          cache_write_5m, cache_write_1h, reasoning, ts
-                   FROM usage_events WHERE run_id IS NOT NULL AND COALESCE(tool, '') != 'grok-context'"""
-            ).fetchall()
-            grouped: dict = {}
-            for row in rows:
-                grouped.setdefault(row["run_id"], []).append(row)
-            # One catalog read and one price memo per scan; _fold_events
-            # prices per price shape instead of per event, so repeated
-            # shapes share one Decimal computation with no change in
-            # output. This keeps the single scan linear in rows, not in
-            # pricing.
+            """Fold every run's usage, reusing cached folds by max rowid.
+
+            The max rowid per run is the cache key: a run whose newest
+            event rowid matches its cached entry reuses that fold, and
+            only new or changed runs are refetched (500 ids per query).
+            A large dirty set falls back to one full scan. Bundles are
+            merged fresh for every run, cached or not.
+            """
             from dash.pricing import catalog as _catalog
 
             table = _catalog()
             memo: dict = {}
+            marks = {
+                row["run_id"]: int(row["max_rowid"])
+                for row in self._conn.execute(
+                    """SELECT run_id, MAX(rowid) AS max_rowid FROM usage_events
+                       WHERE run_id IS NOT NULL AND COALESCE(tool, '') != 'grok-context'
+                       GROUP BY run_id"""
+                ).fetchall()
+            }
+            cached = self._usage_fold_cache
+            dirty = [
+                run_id
+                for run_id, mark in marks.items()
+                if cached.get(run_id, (None, None))[0] != mark
+            ]
+            event_folds: dict = {}
+            if len(dirty) > _USAGE_FOLD_CACHE_DIRTY_MAX:
+                rows = self._conn.execute(
+                    """SELECT run_id, model, input_tokens, output_tokens, cache_read, cache_write,
+                              cache_write_5m, cache_write_1h, reasoning, ts
+                       FROM usage_events WHERE run_id IS NOT NULL AND COALESCE(tool, '') != 'grok-context'"""
+                ).fetchall()
+                grouped: dict = {}
+                for row in rows:
+                    grouped.setdefault(row["run_id"], []).append(row)
+                for run_id, events in grouped.items():
+                    event_folds[run_id] = _fold_events(events, _table=table, _memo=memo)
+            else:
+                for run_id, mark in marks.items():
+                    if cached.get(run_id, (None, None))[0] == mark:
+                        event_folds[run_id] = cached[run_id][1]
+                for pos in range(0, len(dirty), _USAGE_FOLD_CACHE_CHUNK):
+                    chunk = dirty[pos:pos + _USAGE_FOLD_CACHE_CHUNK]
+                    placeholders = ",".join("?" for _ in chunk)
+                    rows = self._conn.execute(
+                        """SELECT run_id, model, input_tokens, output_tokens, cache_read, cache_write,
+                                  cache_write_5m, cache_write_1h, reasoning, ts
+                           FROM usage_events WHERE run_id IN (%s) AND COALESCE(tool, '') != 'grok-context'"""
+                        % placeholders,
+                        chunk,
+                    ).fetchall()
+                    grouped = {}
+                    for row in rows:
+                        grouped.setdefault(row["run_id"], []).append(row)
+                    for run_id in chunk:
+                        events = grouped.get(run_id)
+                        if events:
+                            event_folds[run_id] = _fold_events(events, _table=table, _memo=memo)
             out = {}
             bundles = self._rollup_bundles_locked()
-            for run_id, events in grouped.items():
-                triples = [_fold_events(events, _table=table, _memo=memo)]
+            for run_id, fold in event_folds.items():
+                triples = [fold]
                 triples.extend(_bundle_triple(bundle) for bundle in bundles.get(run_id, []))
                 out[run_id] = _merge_rolls(triples)
             for run_id, run_bundles in bundles.items():
                 if run_id in out:
                     continue
                 out[run_id] = _merge_rolls([_bundle_triple(bundle) for bundle in run_bundles])
+            self._usage_fold_cache = {
+                run_id: (marks[run_id], fold) for run_id, fold in event_folds.items()
+            }
+            self._save_usage_fold_cache_locked()
             return out
         def phase_events(
             self,
@@ -1327,6 +1470,43 @@ class UsageMixin:
                     continue
                 latest[row["run_id"]] = int(row["input_tokens"])
             return latest
+
+
+def _fold_to_cache(triple: tuple) -> dict:
+    """A fold triple as JSON-safe cache data."""
+    folded, cost, unpriced = triple
+    return {
+        "tokens": {key: folded.get(key) for key in _USAGE_FOLD_TOKEN_KEYS},
+        "cost": cost,
+        "unpriced": bool(unpriced),
+    }
+
+
+def _fold_from_cache(payload) -> tuple | None:
+    """A cached fold triple, or None when the payload is malformed."""
+    if not isinstance(payload, dict):
+        return None
+    tokens = payload.get("tokens")
+    if not isinstance(tokens, dict):
+        return None
+    folded = {}
+    for key in _USAGE_FOLD_TOKEN_KEYS:
+        value = tokens.get(key)
+        if value is None:
+            folded[key] = None
+        elif isinstance(value, int) and not isinstance(value, bool):
+            folded[key] = value
+        else:
+            return None
+    cost = payload.get("cost")
+    if cost is not None:
+        if not isinstance(cost, (int, float)) or isinstance(cost, bool):
+            return None
+        cost = float(cost)
+    unpriced = payload.get("unpriced")
+    if not isinstance(unpriced, bool):
+        return None
+    return folded, cost, unpriced
 
 
 def _fold_events(events: list, _table=None, _memo: dict | None = None) -> tuple[dict, float | None, bool]:

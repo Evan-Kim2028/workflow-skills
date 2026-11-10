@@ -81,6 +81,16 @@ class BaseMixin:
             self._usage_run_versions: dict = {}
             self._usage_fold_epoch = 0
             self._usage_fold_built_epoch = -1
+            # Per-run event folds survive restarts: the JSON beside the
+            # database keys each fold on the run's max usage rowid, so a
+            # restart refolds only runs that changed. ``:memory:`` keeps
+            # no file.
+            self._usage_fold_cache: dict = {}
+            self._usage_fold_cache_path = (
+                None if str(self.path) == ":memory:" else Path(str(self.path) + ".usage-fold.json")
+            )
+            self._usage_fold_cache_saved = 0.0
+            self._load_usage_fold_cache()
             # Per-run view-fragment versions, mirroring the usage fold:
             # ``_run_versions[run_id]`` bumps on every run write through
             # ``_write_run``; ``_run_epoch`` bumps on structural changes
@@ -166,6 +176,9 @@ class BaseMixin:
             if not isinstance(run_id, str):
                 run_id = str(run_id)
             self._usage_run_versions[run_id] = self._usage_run_versions.get(run_id, 0) + 1
+            # An in-place rewrite (merge, rollup) keeps the rowid, so
+            # the disk cache cannot see it. Drop the entry.
+            self._usage_fold_cache.pop(run_id, None)
         def _bump_run_version(self, run_id) -> None:
             """Mark one run's cached view fragment stale. Caller holds the lock.
 

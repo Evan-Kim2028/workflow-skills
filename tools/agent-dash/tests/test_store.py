@@ -2,6 +2,7 @@ import os
 
 os.environ["AGENT_DASH_IGNORE_LOCAL"] = "1"
 os.environ.setdefault("AGENT_DASH_WORKSTREAMS", os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "fixtures", "bundles"))
+import json
 import os
 import sqlite3
 import sys
@@ -9,6 +10,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -16,6 +18,7 @@ from dash.pricing import cost
 from dash.sources.hub import poll as hub_poll
 from dash.sources.process import apply_liveness, label_from_args, parse_etime, parse_ps, poll as process_poll, reconcile_running
 from dash.store import Store
+from dash.store import usage as usage_mod
 
 HUB = "00000000-0000-0000-0000-000000000001"
 
@@ -4487,6 +4490,152 @@ class WorkstreamScopeStoreTest(unittest.TestCase):
         )
         self.assertTrue(any(item.startswith("archived tokens:") for item in bad), bad)
         self.assertTrue(any("tokens_all_time" in item for item in bad), bad)
+
+
+class UsageFoldCacheTest(unittest.TestCase):
+    """Per-run usage folds survive a restart, keyed on the max event rowid."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = Path(self.tmp.name) / "dash.sqlite"
+        self.store = Store(self.path)
+
+    def tearDown(self):
+        self.store.close()
+        self.tmp.cleanup()
+
+    def cache_path(self) -> Path:
+        return Path(str(self.path) + ".usage-fold.json")
+
+    def seed(self, store, run_id="cache-r1", message="cache-m1", ts=1000.0):
+        store.upsert_run(
+            {
+                "run_id": run_id,
+                "source": "muse",
+                "tier": "muse",
+                "label": "ws1-cache",
+                "session_id": f"sess-{run_id}",
+                "status": "done",
+                "started_at": ts - 10,
+                "ended_at": ts,
+            }
+        )
+        store.add_usage(
+            {
+                "ts": ts,
+                "session_id": f"sess-{run_id}",
+                "run_id": run_id,
+                "model": "claude-sonnet-5-5",
+                "tool": "muse",
+                "message_id": message,
+                "input": 100,
+                "output": 50,
+                "cache_read": 0,
+                "cache_write": 0,
+            }
+        )
+
+    def reopen(self) -> Store:
+        self.store.close()
+        self.store = Store(self.path)
+        return self.store
+
+    def test_cache_file_written(self):
+        self.seed(self.store)
+        self.store._usage_by_run_uncached()
+        self.assertTrue(self.cache_path().exists())
+        payload = json.loads(self.cache_path().read_text(encoding="utf-8"))
+        self.assertEqual(payload["version"], 1)
+        entry = payload["runs"]["cache-r1"]
+        self.assertIsInstance(entry["rowid"], int)
+        self.assertEqual(entry["fold"]["tokens"]["input"], 100)
+        self.assertIsInstance(entry["fold"]["cost"], float)
+
+    def test_reopen_reuses_folds_without_refolding(self):
+        self.seed(self.store)
+        first = self.store._usage_by_run_uncached()
+        store = self.reopen()
+        calls = []
+        real = usage_mod._fold_events
+
+        def spy(events, *args, **kwargs):
+            calls.append([row["run_id"] for row in events])
+            return real(events, *args, **kwargs)
+
+        with mock.patch.object(usage_mod, "_fold_events", spy):
+            second = store._usage_by_run_uncached()
+        self.assertEqual(calls, [])
+        self.assertEqual(first, second)
+
+    def test_new_event_refolds_only_that_run(self):
+        self.seed(self.store, "cache-r1", "cache-m1")
+        self.seed(self.store, "cache-r2", "cache-m2")
+        self.store._usage_by_run_uncached()
+        store = self.reopen()
+        store.add_usage(
+            {
+                "ts": 1001.0,
+                "session_id": "sess-cache-r2",
+                "run_id": "cache-r2",
+                "model": "claude-sonnet-5-5",
+                "tool": "muse",
+                "message_id": "cache-m3",
+                "input": 7,
+                "output": 3,
+                "cache_read": 0,
+                "cache_write": 0,
+            }
+        )
+        calls = []
+        real = usage_mod._fold_events
+
+        def spy(events, *args, **kwargs):
+            calls.append(sorted({row["run_id"] for row in events}))
+            return real(events, *args, **kwargs)
+
+        with mock.patch.object(usage_mod, "_fold_events", spy):
+            folds = store._usage_by_run_uncached()
+        self.assertEqual(calls, [["cache-r2"]])
+        self.assertEqual(folds["cache-r2"][0]["input"], 107)
+        self.assertEqual(folds["cache-r1"][0]["input"], 100)
+
+    def test_corrupt_cache_falls_back(self):
+        self.seed(self.store)
+        expected = self.store._usage_by_run_uncached()
+        self.reopen()
+        self.cache_path().write_text("{not json", encoding="utf-8")
+        store = self.reopen()
+        self.assertEqual(store._usage_by_run_uncached(), expected)
+        payload = json.loads(self.cache_path().read_text(encoding="utf-8"))
+        self.assertEqual(payload["version"], 1)
+        self.assertIn("cache-r1", payload["runs"])
+
+    def test_memory_store_writes_no_cache_file(self):
+        store = Store(":memory:")
+        try:
+            self.assertIsNone(store._usage_fold_cache_path)
+            self.seed(store)
+            store._usage_by_run_uncached()
+            self.assertEqual(list(Path(self.tmp.name).glob("*.usage-fold.json")), [])
+        finally:
+            store.close()
+
+    def test_bundle_only_run_survives_cache(self):
+        self.seed(self.store)
+        self.store._conn.execute(
+            """INSERT INTO usage_rollup_1h(
+                   run_id, hour_ts, model, tool, ws_split, n_events,
+                   input_tokens, output_tokens, cache_read, cache_write,
+                   reasoning, missing, unpriced, cost_usd)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            ("bundle-r1", 0, "claude-sonnet-5-5", "muse", "", 2, 100, 50, 0, 0, None, 0, 0, 0.5),
+        )
+        first = self.store._usage_by_run_uncached()
+        self.assertIn("bundle-r1", first)
+        store = self.reopen()
+        second = store._usage_by_run_uncached()
+        self.assertIn("bundle-r1", second)
+        self.assertEqual(first["bundle-r1"], second["bundle-r1"])
 
 
 if __name__ == "__main__":
