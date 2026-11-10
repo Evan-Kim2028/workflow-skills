@@ -33,7 +33,6 @@ import contextlib
 import fcntl
 import json
 import os
-import posixpath
 import re
 import tempfile
 import time
@@ -46,7 +45,6 @@ STATE_VERSION = 2
 DEFAULT_TTL_S = 900
 
 _GLOB_RE = re.compile(r"[*?\[\]{}]")
-_LEASE_FIELDS = ("owner", "pid", "ws", "task", "files", "created_at", "heartbeat_at", "expires_at")
 
 
 class LeaseError(ValueError):
