@@ -22,6 +22,17 @@ again. ``--no-rules`` launches the prompt file exactly as written. A
 missing template warns and launches without the rules. An assembled
 prompt above ``PROMPT_WARN_BYTES`` prints a size warning.
 
+Admission is optional and off unless the registry's ``admission`` block (or
+an ``AGENT_DASH_ADMISSION_*`` variable) sets it. ``max_active_runs`` caps
+live launches across every tier through ``dash.admission.LeaseStore``, and
+the granted lease id lands in ``<run-dir>/<label>.admission-lease`` for the
+dispatcher to release. A waited run releases its own lease when the process
+exits; a detached run keeps it until the dispatcher releases it or the TTL
+reaps it, so the cap is honest about a run that is still alive and never
+claims to know a run's token cost. ``max_prompt_bytes`` refuses an assembled
+prompt over the cap. A refusal prints the usual STATUS line with
+``reason=capacity`` or ``reason=prompt-budget`` and launches nothing.
+
 Every kind writes its manifest row with the tier it was launched under, so
 the dashboard reads the registry tier name (``deepseek-flash``) instead of
 guessing one from the model id; the row layout stays ``label, session_id,
@@ -89,6 +100,16 @@ LABEL_LINE = re.compile(r"\[label:[^\]\n]*\]")
 #: Assembled prompts above this print a warning: Haiku 5.5 bills about 5x past
 #: 100K tokens, and every turn re-reads the whole prompt.
 PROMPT_WARN_BYTES = 40 * 1024
+#: Admission keys and the environment variable that overrides each one.
+ADMISSION_ENV = {
+    "max_active_runs": "AGENT_DASH_ADMISSION_MAX_ACTIVE_RUNS",
+    "max_prompt_bytes": "AGENT_DASH_ADMISSION_MAX_PROMPT_BYTES",
+    "lease_ttl_s": "AGENT_DASH_ADMISSION_LEASE_TTL_S",
+}
+#: A launch-count lease outlives a launcher that dies without releasing it.
+DEFAULT_LEASE_TTL_S = 900
+#: Beside the run's other artifacts, so the dispatcher can release the lease.
+LEASE_SUFFIX = ".admission-lease"
 
 #: Harness that runs each launch kind. The dashboard row, the meta file, and
 #: the registry all name it the way ``dash.models.harness_of`` does, so a
@@ -253,6 +274,7 @@ def run(argv, spawn=None, pgrep=None, sleep=None, now=None, alive=None, new_uuid
         "cooldowns": read_cooldowns(cooldown_path()),
         "minutes": _minutes(registry),
         "exclude": set(exclude),
+        "admission": admission_config(registry),
     }
     if tier_path.is_file():
         stored = tier_path.read_text(encoding="utf-8").strip() or requested
@@ -262,12 +284,22 @@ def run(argv, spawn=None, pgrep=None, sleep=None, now=None, alive=None, new_uuid
         if blocked is not None:
             return blocked
     prepare_prompt(ctx, no_rules)
+    if prompt_over_budget(ctx) is not None:
+        emit("failed", out, err, requested, "prompt-budget")
+        return 2
     name, reason = pick_initial(ctx)
     if not name:
         code = 0 if reason == "none-available" else 2
         emit("failed", out, err, requested, reason)
         return code
-    return launch(ctx, name, set(exclude))
+    lease = admit_run(ctx, name)
+    if lease is not None and not lease.get("ok"):
+        emit("failed", out, err, requested, lease.get("reason") or "capacity")
+        return 0
+    try:
+        return launch(ctx, name, set(exclude))
+    finally:
+        release_finished(ctx, lease)
 
 
 def read_rules_template():
@@ -345,6 +377,141 @@ def prepare_prompt(ctx, no_rules: bool) -> None:
             file=sys.stderr,
         )
     ctx["prompt"] = str(target)
+
+
+def _positive_int(value):
+    """A positive int, or None for absent, zero, negative and unparsable values."""
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number > 0 else None
+
+
+def admission_config(registry) -> dict:
+    """The registry's ``admission`` block, normalized. An environment variable wins.
+
+    ``max_active_runs`` caps live launches across every tier and
+    ``max_prompt_bytes`` caps the assembled prompt file; both are disabled
+    when absent or 0. ``lease_ttl_s`` defaults to ``DEFAULT_LEASE_TTL_S``.
+    The prompt cap counts bytes, not tokens: it bounds what the launcher
+    hands a worker, and no tokenizer is consulted.
+    """
+    block = (registry or {}).get("admission")
+    block = block if isinstance(block, dict) else {}
+    config = {}
+    for key, env in ADMISSION_ENV.items():
+        raw = os.environ.get(env)
+        if raw is None or not str(raw).strip():
+            raw = block.get(key)
+        config[key] = _positive_int(raw)
+    if config["lease_ttl_s"] is None:
+        config["lease_ttl_s"] = DEFAULT_LEASE_TTL_S
+    return config
+
+
+def admission_owner(label) -> str:
+    """The lease owner token for one run. Deterministic, so a release needs no file."""
+    return f"run_worker:{label}"
+
+
+def lease_path(ctx) -> Path:
+    return Path(ctx["run_dir"]) / f"{ctx['label']}{LEASE_SUFFIX}"
+
+
+def admit_run(ctx, tier):
+    """Take the global launch-count lease, or report why the launch is refused.
+
+    Returns None when ``max_active_runs`` is disabled, else the
+    ``LeaseStore.admit_capacity`` result. A granted lease is written to
+    ``<run-dir>/<label>.admission-lease`` so the dispatcher can release it
+    when the run finishes; the TTL is the backstop for a launcher that dies
+    without releasing.
+    """
+    cap = ctx["admission"]["max_active_runs"]
+    if cap is None:
+        return None
+    from dash.admission import LeaseStore
+
+    result = LeaseStore(state_dir()).admit_capacity(
+        admission_owner(ctx["label"]),
+        "",
+        ctx["label"],
+        cap,
+        ttl_s=ctx["admission"]["lease_ttl_s"],
+        now=ctx["hooks"]["now"](),
+    )
+    if result.get("ok"):
+        write_lease_file(ctx, result["lease_id"], tier)
+    return result
+
+
+def write_lease_file(ctx, lease_id, tier) -> None:
+    """Record the lease beside the run's artifacts. Best effort."""
+    body = {
+        "lease_id": lease_id,
+        "owner": admission_owner(ctx["label"]),
+        "tier": str(tier or ""),
+        "ttl_s": ctx["admission"]["lease_ttl_s"],
+        "created_at": int(ctx["hooks"]["now"]()),
+    }
+    path = lease_path(ctx)
+    tmp = path.with_name(path.name + ".tmp")
+    try:
+        tmp.write_text(json.dumps(body, sort_keys=True) + "\n", encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError:
+        return
+
+
+def release_lease(ctx, lease) -> bool:
+    """Drop a granted launch-count lease and its file. Idempotent."""
+    if not lease or not lease.get("ok"):
+        return False
+    from dash.admission import LeaseStore
+
+    result = LeaseStore(state_dir()).release(lease["lease_id"], admission_owner(ctx["label"]))
+    if result.get("ok"):
+        lease_path(ctx).unlink(missing_ok=True)
+    return bool(result.get("ok"))
+
+
+def release_finished(ctx, lease) -> None:
+    """Release the lease once the run is over; leave a live run to its TTL.
+
+    A waited run that exited releases at once. A detached run, or one still
+    alive when the wait expired, keeps its lease: the dispatcher releases it
+    when it observes the finish, and the TTL reaps a launcher that never does.
+    """
+    if not lease or not lease.get("ok"):
+        return
+    pid = read_pid(ctx["pid_path"])
+    if pid and ctx["hooks"]["alive"](pid):
+        print(
+            f"admission: lease {lease['lease_id']} held for the live run; "
+            f"the dispatcher releases it, or it expires in {ctx['admission']['lease_ttl_s']}s",
+            file=sys.stderr,
+        )
+        return
+    release_lease(ctx, lease)
+
+
+def prompt_over_budget(ctx):
+    """The prompt size when it exceeds ``max_prompt_bytes``, else None."""
+    cap = ctx["admission"]["max_prompt_bytes"]
+    if cap is None:
+        return None
+    try:
+        size = Path(ctx["prompt"]).stat().st_size
+    except OSError:
+        return None
+    if size <= cap:
+        return None
+    print(
+        f"prompt refused: {size} bytes is over the {cap}-byte admission cap; trim the task text",
+        file=sys.stderr,
+    )
+    return size
 
 
 def pick_initial(ctx):

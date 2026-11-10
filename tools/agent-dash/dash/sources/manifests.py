@@ -1052,21 +1052,25 @@ def _out_mtime(scratch, directory, label) -> float:
 
 
 def _flat_run_dirs(cfg, now, covered) -> list:
-    """Registered run folders that hold a manifest TSV directly.
+    """Run folders that hold a manifest TSV directly.
 
     A ``run_worker.py`` run folder is flat: the TSV and the
     ``out-``/``err-``/``report-`` files sit in the folder itself, not in a
     ``<session>/scratchpad/<tool>/`` tree, so ``_scratchpads`` never lists
-    it. Returned pads carry ``parent`` None; ``_emit_manifest`` reads the
-    flat layout for them. Folders already covered by ``covered`` scratch
-    pads are skipped.
+    it. Roots are the manual registry plus the bundle run roots
+    (``<workstreams>/<ID>/runs``). A root is a pad when it holds a TSV
+    itself; its immediate child folders are pads when they hold one, which
+    is how a bundle root covers ``runs/<label>``. Nothing deeper is
+    listed. Returned pads carry ``parent`` None; ``_emit_manifest`` reads
+    the flat layout for them. Folders already covered by ``covered``
+    scratch pads are skipped.
     """
-    from dash.rundirs import _registry_configured, registered_run_dirs, state_dir_of
+    from dash.rundirs import _registry_configured, run_dirs
 
     if not _registry_configured(cfg):
         return []
     try:
-        rundirs = registered_run_dirs(state_dir_of(cfg), now=now)
+        roots = run_dirs(cfg=cfg, now=now)
     except (OSError, ValueError):
         return []
     have = set()
@@ -1076,18 +1080,54 @@ def _flat_run_dirs(cfg, now, covered) -> list:
         except OSError:
             have.add(scratch)
     found = []
-    for rundir in rundirs:
+    for root in roots:
         try:
-            real = realpath_memo(rundir)
+            real = realpath_memo(root)
         except OSError:
             continue
         if real in have:
             continue
-        state = _folder_state(rundir)
-        if not state or not state[0]:
+        state = _folder_state(root)
+        if state is None:
             continue
-        have.add(real)
-        found.append((None, rundir))
+        if state[0]:
+            have.add(real)
+            found.append((None, root))
+        for child in _flat_child_dirs(root):
+            try:
+                child_real = realpath_memo(child)
+            except OSError:
+                continue
+            if child_real in have:
+                continue
+            have.add(child_real)
+            found.append((None, child))
+    return found
+
+
+def _flat_child_dirs(root) -> list:
+    """Immediate child folders of a run root that hold a manifest TSV.
+
+    A bundle run root (``<workstreams>/<ID>/runs``) keeps one folder per
+    run, so its run folders are its children. Only one level is listed,
+    and the listing is ``lstat``-based, so a symlinked child is skipped
+    and nothing outside the root is read. ``None`` (deferred listing)
+    reads as no children.
+    """
+    try:
+        entries = _children_dirs(root, [DIR_LIST_CAP])
+    except Exception:
+        return []
+    if not entries:
+        return []
+    found = []
+    for _name, ent_path, is_file, is_dir in entries:
+        if is_file or not is_dir:
+            continue
+        state = _folder_state(ent_path)
+        if state is None or not state[0]:
+            continue
+        found.append(ent_path)
     return found
 
 

@@ -3222,5 +3222,95 @@ class LinearApiTest(unittest.TestCase):
         self.assertNotEqual(status, 200)
 
 
+class FlowApiTest(unittest.TestCase):
+    """``GET /api/flow``: the queue/blocker fold over the cached state and doctor payloads."""
+
+    STATE = {"workstreams": [
+        {"id": "WS33", "title": "Serving cutover",
+         "progress": {"counts": {"todo": 2, "wip": 1, "pr": 0, "prog": 0, "done": 3, "deferred": 0},
+                      "total": 6, "done": 3}},
+    ]}
+
+    def setUp(self):
+        self._live_patch = mock.patch("dash.server._live_workers", return_value=[])
+        self._live_patch.start()
+        self.addCleanup(self._live_patch.stop)
+        self.tmp = tempfile.TemporaryDirectory()
+        self.store = Store(Path(self.tmp.name) / "dash.sqlite")
+        self.now = time.time()
+        self.store.doctor_snapshot(
+            [
+                {
+                    "id": "stuck-task:ws:WS33:WS33.1", "code": "stuck-task",
+                    "severity": "warn", "scope": "ws:WS33", "ws": "WS33",
+                    "title": "Task WS33.1 is stuck in wip with no live agent",
+                    "detail": "task WS33.1 in WS33 has status wip with no live agent",
+                    "fix_command": "python3 agent_dash.py ws plan WS33",
+                    "safe_auto": False,
+                },
+            ],
+            self.now,
+        )
+        self.server, self.thread = start(self.store)
+        self.port = self.server.server_address[1]
+
+    def tearDown(self):
+        stop(self.server, self.thread)
+        self.store.close()
+        self.tmp.cleanup()
+
+    def test_flow_shape(self):
+        with mock.patch("dash.server.Handler._state_payload", return_value=self.STATE):
+            status, ctype, body = get(self.port, "/api/flow")
+        self.assertEqual(status, 200)
+        self.assertIn("json", ctype)
+        payload = json.loads(body)
+        self.assertEqual(set(payload), {"generated_at", "queues", "blockers", "workstreams", "totals", "empty"})
+        self.assertEqual([q["key"] for q in payload["queues"]], ["todo", "wip", "pr", "prog", "deferred"])
+        self.assertEqual([q["count"] for q in payload["queues"]], [2, 1, 0, 0, 0])
+        self.assertEqual(payload["totals"]["tasks"], 6)
+        self.assertEqual(payload["totals"]["done"], 3)
+        self.assertEqual(payload["totals"]["pct"], 50)
+        self.assertFalse(payload["empty"])
+        self.assertEqual(len(payload["blockers"]), 1)
+        blocker = payload["blockers"][0]
+        self.assertEqual(blocker["code"], "stuck-task")
+        self.assertEqual(blocker["ws"], "WS33")
+        self.assertEqual(blocker["command"], "python3 agent_dash.py doctor --ws WS33")
+        self.assertEqual(blocker["next"], "python3 agent_dash.py ws next WS33")
+        self.assertNotIn("ws plan", body.decode("utf-8"))
+
+    def test_flow_is_read_only(self):
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=3)
+        try:
+            conn.request("POST", "/api/flow", body=b"{}", headers={"Content-Type": "application/json"})
+            response = conn.getresponse()
+            status = response.status
+            payload = json.loads(response.read())
+        finally:
+            conn.close()
+        self.assertEqual(status, 405)
+        self.assertEqual(payload["code"], "method_not_allowed")
+
+    def test_flow_etag_304(self):
+        with mock.patch("dash.server.Handler._state_payload", return_value=self.STATE):
+            status, heads, _body = geth(self.port, "/api/flow")
+            self.assertEqual(status, 200)
+            etag = heads.get("etag")
+            self.assertTrue(etag, "no ETag on /api/flow")
+            again, _heads, body = geth(self.port, "/api/flow", {"If-None-Match": etag})
+        self.assertEqual(again, 304)
+        self.assertEqual(body, b"")
+
+    def test_flow_error_path(self):
+        with mock.patch("dash.flowview.build_flow", side_effect=ValueError("bad flow")):
+            status, _ctype, body = get(self.port, "/api/flow")
+        self.assertEqual(status, 400)
+        payload = json.loads(body)
+        self.assertEqual(payload["error"], "bad flow")
+        self.assertEqual(payload["code"], "bad_request")
+        self.assertIn("hint", payload)
+
+
 if __name__ == "__main__":
     unittest.main()

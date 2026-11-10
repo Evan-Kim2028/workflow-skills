@@ -28,6 +28,9 @@
     "config.example.json": [
       "test_config"
     ],
+    "dash/admission.py": [
+      "test_admission"
+    ],
     "dash/attribution.py": [
       "test_attribution"
     ],
@@ -49,6 +52,12 @@
     ],
     "dash/errors.py": [
       "test_errors"
+    ],
+    "dash/evidence.py": [
+      "test_evidence"
+    ],
+    "dash/flowview.py": [
+      "test_flowview"
     ],
     "dash/labels.py": [
       "test_labels",
@@ -119,7 +128,8 @@
     ],
     "dash/rundirs.py": [
       "test_server",
-      "test_config"
+      "test_config",
+      "test_rundirs"
     ],
     "dash/server.py": [
       "test_server",
@@ -187,6 +197,7 @@
     ],
     "dash/sources/manifests.py": [
       "test_manifests",
+      "test_manifests_discovery",
       "test_poll_budgets",
       "perf/test_perf_budget"
     ],
@@ -374,6 +385,9 @@
     ],
     "scripts/memcap.sh": [
       "test_install"
+    ],
+    "tests/test_control_plane_e2e.py": [
+      "test_control_plane_e2e"
     ],
     "tests/live_guard.py": [
       "test_live_guard",

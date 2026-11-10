@@ -16,7 +16,7 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-from dash import errors, maplayout
+from dash import errors, maplayout, orchestrate
 from dash.plans import PlanNotFound, configured, sanitized_frame
 from dash.plans import load as load_plan
 from dash.plans import plan_progress
@@ -350,6 +350,12 @@ def _view_groups(value, links: dict | None = None) -> list:
                 row["fresh_hours"] = fresh
             if isinstance(task.get("received_as"), str):
                 row["received_as"] = task.get("received_as")
+            version = task.get("contract_version")
+            if isinstance(version, int) and not isinstance(version, bool):
+                row["contract_version"] = version
+            acceptance = task.get("acceptance")
+            if isinstance(acceptance, dict):
+                row["acceptance"] = dict(acceptance)
             if isinstance(row["id"], str) and row["id"] in links:
                 row["linear"] = links[row["id"]]
             tasks.append(row)
@@ -647,7 +653,23 @@ def _template_plan(ws: str) -> dict:
                     "id": "start",
                     "col": 0,
                     "title": "First section",
-                    "tasks": [{"id": f"{ws}.1", "title": "First task", "status": "todo", "deps": []}],
+                    "tasks": [
+                        {
+                            "id": f"{ws}.1",
+                            "title": "First task",
+                            "status": "todo",
+                            "deps": [],
+                            "contract_version": 1,
+                            "acceptance": {
+                                "metric": "TODO: the number this task moves",
+                                "threshold": "TODO: the value that proves it",
+                                "tolerance": "TODO: how far off still counts",
+                                "probe": "pytest path/to/test_x.py",
+                                "cwd": ".",
+                            },
+                            "files": ["path/to/file.py"],
+                        }
+                    ],
                 }
             ],
             "edges": [],
@@ -912,6 +934,8 @@ def _validate_dag(issues: list[str], dag) -> None:
                     issues.append(f"plan.json: task {tid} fresh_hours must be a number greater than 0")
             if "received_as" in task and (not isinstance(task.get("received_as"), str) or not task.get("received_as").strip()):
                 issues.append(f"plan.json: task {tid} received_as must be a non-empty string")
+            for issue in orchestrate.task_contract_issues(task):
+                issues.append(f"plan.json: task {tid} {issue}")
     for group in groups:
         for task in (group.get("tasks") if isinstance(group, dict) and isinstance(group.get("tasks"), list) else []):
             if not isinstance(task, dict):
@@ -1619,102 +1643,7 @@ def plan_frame_warnings(ws: str, root: Path | None = None) -> list[dict]:
         return []
 
 
-_SCOPE_NEGATION = re.compile(
-    r"(?:\bno\b|\bnot\b|\bnever\b|n't\b|\bwithout\b|\bavoid\b|instead of)\s*[^.;!]{0,40}$",
-    re.IGNORECASE,
-)
-_SCOPE_CI_GATE = re.compile(r"(?:lor-ci-local\.sh|ci-local\.sh)")
-_SCOPE_FULL = re.compile(r"--full(?![-\w])")
-_SCOPE_VALIDATE_SH = re.compile(r"\bscripts/validate\.sh\b")
-_SCOPE_PRECOMMIT_ALL = re.compile(r"\bpre-commit\s+run\s+--all-files\b")
-_SCOPE_GH_RUN = re.compile(r"\bgh\s+(?:workflow\s+run|run\s+rerun)\b")
-_SCOPE_PATH_HINT = re.compile(r"[/.]|\.py$|\.mjs$|\.[jt]s$|\.sh$|<[^>]*>")
-
-
-def _scope_negated(text: str, idx: int) -> bool:
-    """True when a negation word (no, never, without, ...) opens the same clause.
-
-    Plans that say "(no lor-ci-local.sh, never the machine lock)" describe
-    the scoped gate; they do not run the full suite, so they stay quiet.
-    """
-    return bool(_SCOPE_NEGATION.search(text[max(0, idx - 60):idx]))
-
-
-def _scope_bare_pytest(text: str) -> str | None:
-    """The offending bare-pytest segment, or None when every pytest names a target.
-
-    A pytest with an explicit file or directory argument (or a `<...>`
-    placeholder the lead re-cuts from member diffs) is scoped. Bare flags
-    only (`pytest -x -q`) still run the whole suite.
-    """
-    cleaned = text.replace("`", " ")
-    for segment in re.split(r"[;&|\n]", cleaned):
-        for match in re.finditer(r"(?:\s*(?:uv\s+run|python3?\s+-m)\s+)?pytest\b", segment):
-            if _scope_negated(segment, match.start()):
-                continue
-            rest = segment[match.end():]
-            if re.match(r"\s*(?:$|[)&|])", rest):
-                return segment.strip()
-            tokens = [tok for tok in rest.split() if not tok.startswith("-")]
-            tokens = [tok for tok in tokens if "=" not in tok or "/" in tok]
-            if not tokens or not any(_SCOPE_PATH_HINT.search(tok) for tok in tokens):
-                return segment.strip()
-    return None
-
-
-def _scope_has_target(text: str) -> bool:
-    """True when the string already names what the suite runs.
-
-    A pytest with a file, directory, or `<...>` placeholder target, or a
-    `lor-ci-local.sh` / `ci-local.sh` invocation with arguments, is a scoped
-    gate; a bare "pytest" mentioned beside it ("pytest runs only the list")
-    is description, not a second run.
-    """
-    cleaned = text.replace("`", " ")
-    for segment in re.split(r"[;&|\n]", cleaned):
-        for match in re.finditer(r"(?:\s*(?:uv\s+run|python3?\s+-m)\s+)?pytest\b", segment):
-            tokens = [tok for tok in segment[match.end():].split() if not tok.startswith("-")]
-            if any(_SCOPE_PATH_HINT.search(tok) for tok in tokens):
-                return True
-    for match in _SCOPE_CI_GATE.finditer(text):
-        after = text[match.end():]
-        if after.startswith(":"):
-            continue
-        if re.match(r"\s*(?:$|[,;)&|`])", after):
-            continue
-        return True
-    return False
-
-
-def _scope_full_suite_hit(text: str) -> str | None:
-    """The offending full-suite token in a probe/gate string, or None.
-
-    Catches bare pytest, `--full`, an argument-free `lor-ci-local.sh` /
-    `ci-local.sh`, `scripts/validate.sh`, `pre-commit run --all-files`,
-    and `gh workflow run` / `gh run rerun`. Mentions inside a negated
-    clause ("no ..."), file:line citations ("lor-ci-local.sh:206-227"),
-    and scoped invocations with arguments ("--train-files <list>")
-    are not hits.
-    """
-    if _scope_has_target(text):
-        return None
-    bare = _scope_bare_pytest(text)
-    if bare is not None:
-        return bare
-    for match in _SCOPE_CI_GATE.finditer(text):
-        after = text[match.end():]
-        if after.startswith(":"):
-            continue
-        if not re.match(r"\s*(?:$|[,;)&|`])", after):
-            continue
-        if _scope_negated(text, match.start()):
-            continue
-        return match.group(0)
-    for pattern in (_SCOPE_FULL, _SCOPE_VALIDATE_SH, _SCOPE_PRECOMMIT_ALL, _SCOPE_GH_RUN):
-        match = pattern.search(text)
-        if match and not _scope_negated(text, match.start()):
-            return match.group(0)
-    return None
+_scope_full_suite_hit = orchestrate.full_suite_probe_hit
 
 
 def plan_scope_warnings_for_plan(plan: dict, ws: str = "") -> list[dict]:
@@ -2470,8 +2399,18 @@ def print_next(ws: str, limit: int | None = None, json_mode: bool = False) -> in
             if tid not in dones:
                 dones[tid] = ts
     jumps = orchestrate.dep_jumps(body, starts, dones)
+    blocked = orchestrate.contract_blocked(body)
     if json_mode:
-        errors.emit_json({"ws": ws, "ready": ready, "stalled": stalled, "dep_jumps": jumps, "live": live_source})
+        errors.emit_json(
+            {
+                "ws": ws,
+                "ready": ready,
+                "stalled": stalled,
+                "dep_jumps": jumps,
+                "contract_blocked": blocked,
+                "live": live_source,
+            }
+        )
         return 0
     print(f"ready in {ws} ({len(ready)}):")
     for row in ready:
@@ -2489,6 +2428,10 @@ def print_next(ws: str, limit: int | None = None, json_mode: bool = False) -> in
         print(f"dep-jump ({len(jumps)} started before a dep finished):")
         for row in jumps:
             print(f"  {row['task']} started before {row['dep']} finished")
+    if blocked:
+        print(f"contract-blocked ({len(blocked)} todo tasks with contract issues):")
+        for row in blocked:
+            print(f"  {row['id']} {row['title']}: {'; '.join(row['issues'])}")
     if live_source == "unreachable":
         print(f"(live run data unavailable: dashboard unreachable at {_dash_url()})")
     return 0

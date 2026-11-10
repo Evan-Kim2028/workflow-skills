@@ -24,6 +24,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from dash import rundirs  # noqa: E402
 from dash.sources import manifests  # noqa: E402
 
 PARENT = "cccccccc-cccc-cccc-cccc-cccccccccccc"
@@ -90,9 +91,17 @@ class FolderDiscoveryTests(unittest.TestCase):
         # Layout the walk expects: <root>/<encoded>/<session uuid>/scratchpad.
         self.scratch = os.path.join(self.root, "enc", PARENT, "scratchpad")
         os.makedirs(self.scratch)
+        # Bundle run roots are discovered from the workstreams dir, so point
+        # it at the temp tree: the machine's real bundles stay unread.
+        self._ws_env = os.environ.get("AGENT_DASH_WORKSTREAMS")
+        os.environ["AGENT_DASH_WORKSTREAMS"] = os.path.join(self.root, "workstreams")
         self.store = MemStore()
 
     def tearDown(self):
+        if self._ws_env is None:
+            os.environ.pop("AGENT_DASH_WORKSTREAMS", None)
+        else:
+            os.environ["AGENT_DASH_WORKSTREAMS"] = self._ws_env
         manifests._emit_manifest = self._orig_emit
         manifests.reset_state()
         self.tmp.cleanup()
@@ -151,6 +160,86 @@ class FolderDiscoveryTests(unittest.TestCase):
 
     def test_missing_folder_has_no_state(self):
         self.assertIsNone(manifests._folder_state(os.path.join(self.root, "nope")))
+
+
+ENV_KEYS = ("AGENT_DASH_STATE_DIR", "AGENT_DASH_WORKSTREAMS", "AGENT_DASH_DATA_ROOT")
+
+
+class BundleRunRootTests(unittest.TestCase):
+    """A run folder under a bundle's ``runs/`` is ingested without registration."""
+
+    def setUp(self):
+        manifests.reset_state()
+        rundirs._BUNDLE_CACHE.clear()
+        self.emitted = []
+        self._orig_emit = manifests._emit_manifest
+
+        def record(store, parent, scratch, source, directory, default_tier, row, *a, **k):
+            self.emitted.append(row["label"])
+            return self._orig_emit(store, parent, scratch, source, directory, default_tier, row, *a, **k)
+
+        manifests._emit_manifest = record
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = self.tmp.name
+        self.state = os.path.join(self.root, "state")
+        self.ws = os.path.join(self.root, "workstreams")
+        os.makedirs(self.ws)
+        self.env = {key: os.environ.get(key) for key in ENV_KEYS}
+        os.environ["AGENT_DASH_WORKSTREAMS"] = self.ws
+        self.store = MemStore()
+
+    def tearDown(self):
+        for key, value in self.env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        rundirs._BUNDLE_CACHE.clear()
+        manifests._emit_manifest = self._orig_emit
+        manifests.reset_state()
+        self.tmp.cleanup()
+
+    def _cfg(self):
+        return {
+            "state_dir": self.state,
+            "roots": {"scratchpads": [os.path.join(self.root, "scratch")]},
+            "dir_scan_s": 0,
+            "live_window_s": 36 * 3600,
+            "read_budgets": {"per_file": 1024 * 1024, "per_tick": 1024 * 1024},
+        }
+
+    def _run_folder(self, *parts) -> str:
+        return os.path.join(self.ws, *parts)
+
+    def test_run_folder_under_a_bundle_root_is_ingested(self):
+        run = self._run_folder("WS1", "runs", "ws1-exec-alpha")
+        _write(os.path.join(run, "muse-sessions.tsv"), f"ws1-exec-alpha\t{MUSE}\t1700000000\n")
+        _write(os.path.join(run, "out-ws1-exec-alpha.md"), "PASS\n")
+        _write(os.path.join(run, "err-ws1-exec-alpha.log"), "")
+        manifests.poll(self.store, self._cfg(), NOW)
+        self.assertIn("ws1-exec-alpha", self.emitted)
+        self.assertEqual(self.store.runs["muse:" + MUSE + ":ws1-exec-alpha"]["verdict"], "PASS")
+
+    def test_bundle_root_holding_a_tsv_is_ingested(self):
+        run = self._run_folder("WS1", "runs")
+        _write(os.path.join(run, "muse-sessions.tsv"), f"ws1-exec-beta\t{MUSE}\t1700000000\n")
+        _write(os.path.join(run, "out-ws1-exec-beta.md"), "PASS\n")
+        manifests.poll(self.store, self._cfg(), NOW)
+        self.assertIn("ws1-exec-beta", self.emitted)
+
+    def test_registered_flat_folder_still_ingested(self):
+        flat = os.path.join(self.root, "manual-run")
+        _write(os.path.join(flat, "muse-sessions.tsv"), f"manual-alpha\t{MUSE}\t1700000000\n")
+        _write(os.path.join(flat, "out-manual-alpha.md"), "PASS\n")
+        rundirs.register_run_dir(self.state, flat)
+        manifests.poll(self.store, self._cfg(), NOW)
+        self.assertIn("manual-alpha", self.emitted)
+
+    def test_bundle_root_without_a_tsv_is_ignored(self):
+        run = self._run_folder("WS1", "runs", "empty-run")
+        _write(os.path.join(run, "out-empty-run.md"), "PASS\n")
+        manifests.poll(self.store, self._cfg(), NOW)
+        self.assertEqual(self.emitted, [])
 
 
 if __name__ == "__main__":

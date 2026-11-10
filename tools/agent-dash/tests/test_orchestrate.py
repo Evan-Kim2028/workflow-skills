@@ -531,3 +531,94 @@ class WorktreeGitTest(unittest.TestCase):
             self.assertEqual(files, ["b.py"])
             self.assertIsNone(orch.branch_files(root, "train/missing"))
             self.assertEqual(orch.enclosing_worktree(root / "muse" / "out-x.md"), root)
+
+
+def _contract_task(tid, **extra):
+    row = _task(
+        tid,
+        contract_version=1,
+        acceptance={
+            "metric": "ready tasks per wave",
+            "threshold": ">= 3",
+            "tolerance": "0",
+            "probe": "pytest tests/test_orchestrate.py",
+        },
+        files=["dash/orchestrate.py"],
+    )
+    row.update(extra)
+    return row
+
+
+class TaskContractTest(unittest.TestCase):
+    def test_legacy_task_has_no_issues(self):
+        self.assertEqual(orch.task_contract_issues(_task("WS9.1")), [])
+
+    def test_valid_v1_task_has_no_issues(self):
+        self.assertEqual(orch.task_contract_issues(_contract_task("WS9.1")), [])
+
+    def test_missing_acceptance_and_files(self):
+        issues = orch.task_contract_issues(_task("WS9.1", contract_version=1))
+        self.assertTrue(any("acceptance" in issue for issue in issues), issues)
+        self.assertTrue(any("files" in issue for issue in issues), issues)
+
+    def test_unknown_version_is_an_error(self):
+        issues = orch.task_contract_issues(_task("WS9.1", contract_version=2))
+        self.assertEqual(len(issues), 1)
+        self.assertIn("unknown contract_version", issues[0])
+
+    def test_absolute_glob_parent_and_empty_files(self):
+        for bad in ("/etc/passwd", "dash/*.py", "../outside.py", ""):
+            issues = orch.task_contract_issues(_contract_task("WS9.1", files=[bad]))
+            self.assertTrue(issues, bad)
+
+    def test_full_suite_probe_is_invalid(self):
+        for probe in (
+            "pytest",
+            "python3 -m pytest -q",
+            "scripts/validate.sh",
+            "pre-commit run --all-files",
+            "scripts/lor-ci-local.sh",
+        ):
+            task = _contract_task("WS9.1")
+            task["acceptance"]["probe"] = probe
+            issues = orch.task_contract_issues(task)
+            self.assertTrue(any("whole suite" in issue for issue in issues), probe)
+
+    def test_scoped_probe_is_valid(self):
+        task = _contract_task("WS9.1")
+        task["acceptance"]["probe"] = "pytest tests/test_orchestrate.py"
+        self.assertEqual(orch.task_contract_issues(task), [])
+
+    def test_gate_needs_no_files(self):
+        task = _contract_task("WS9.0", kind="gate")
+        del task["files"]
+        self.assertEqual(orch.task_contract_issues(task), [])
+
+    def test_absolute_cwd_is_invalid(self):
+        task = _contract_task("WS9.1")
+        task["acceptance"]["cwd"] = "/tmp"
+        self.assertTrue(any("cwd" in issue for issue in orch.task_contract_issues(task)))
+
+
+class ReadyQueueContractTest(unittest.TestCase):
+    def test_legacy_task_stays_ready(self):
+        body = _body([_task("WS9.1")])
+        self.assertEqual([row["id"] for row in orch.ready_queue(body)], ["WS9.1"])
+
+    def test_valid_v1_task_is_ready(self):
+        body = _body([_contract_task("WS9.1")])
+        self.assertEqual([row["id"] for row in orch.ready_queue(body)], ["WS9.1"])
+
+    def test_contract_issue_blocks_ready(self):
+        body = _body([_task("WS9.1", contract_version=1), _task("WS9.2")])
+        self.assertEqual([row["id"] for row in orch.ready_queue(body)], ["WS9.2"])
+
+    def test_contract_blocked_reports_issues(self):
+        body = _body([_task("WS9.1", contract_version=1), _task("WS9.2")])
+        blocked = orch.contract_blocked(body)
+        self.assertEqual([row["id"] for row in blocked], ["WS9.1"])
+        self.assertEqual(blocked[0]["title"], "Task WS9.1")
+        self.assertTrue(blocked[0]["issues"])
+
+    def test_contract_blocked_ignores_legacy(self):
+        self.assertEqual(orch.contract_blocked(_body([_task("WS9.1")])), [])

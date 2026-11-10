@@ -1,0 +1,21 @@
+{
+  "generated_at": null,
+  "queues": [
+    {"key": "todo", "label": "Todo", "count": 0},
+    {"key": "wip", "label": "In progress", "count": 0},
+    {"key": "pr", "label": "Waiting to merge", "count": 0},
+    {"key": "prog", "label": "On prod", "count": 0},
+    {"key": "deferred", "label": "Deferred", "count": 0}
+  ],
+  "blockers": [],
+  "workstreams": [],
+  "totals": {
+    "workstreams": 0,
+    "tasks": 0,
+    "done": 0,
+    "pct": 0,
+    "blockers": 0,
+    "blocked_tasks": 0
+  },
+  "empty": true
+}

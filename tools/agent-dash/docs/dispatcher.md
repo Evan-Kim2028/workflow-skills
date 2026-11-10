@@ -12,9 +12,12 @@ Code:
 
 - `dash/dispatch.py`: the loop (`Dispatcher.tick`), state, inbox, wait cursor,
   pidfile lock and the `dispatch` CLI (`cmd_dispatch`).
+- `dash/admission.py`: the execution leases a launch takes over its declared files.
+- `dash/evidence.py`: the acceptance probe and the receipt a contract PASS must earn.
 - `scripts/run_worker.py`: launches a tier. A max-wait of `0` launches and returns;
   `--exclude=<tier>` keeps `auto` off a tier (used for the one retry).
 - `tests/test_dispatch.py`: loop cases with a fake launcher and fake clock.
+- `tests/test_control_plane_e2e.py`: the whole chain, lease to receipt to `pr`.
 
 Bundle files, in the workstream bundle directory (`AGENT_DASH_WORKSTREAMS` honoured):
 
@@ -98,7 +101,8 @@ Move such content to `$AGENT_SCRATCH` and leave the folder with prompts, reports
 Each tick, and immediately when a tracked worker's pid exits, the dispatcher:
 
 1. Observes finished runs. A PASS on a write task moves it to `pr`; a PASS on a
-   read task moves it to `done`. PARTIAL or BLOCKED leaves it `wip` and emits
+   read task moves it to `done`. A contract task's PASS is verified first (see
+   Contract verification). PARTIAL or BLOCKED leaves it `wip` and emits
    `needs-lead`. No verdict (empty report, early death) relaunches once on `auto`
    excluding the failed tier (`retried`); a second miss emits `needs-lead`. While
    paused, or while `dispatch.json` is broken, a due retry waits as `retry-pending`
@@ -114,7 +118,52 @@ Each tick, and immediately when a tracked worker's pid exits, the dispatcher:
 Events carry `seq`, `ts`, `type`, `ws`, `task` and `label`, plus type fields:
 `launched`, `finished` (verdict, out, tier, duration_s), `retried`, `needs-prompt`,
 `needs-lead` (reason), `merge-wave` (tasks), `idle` (todo), `stopped`, `error`
-(phase, reason). An error in one task is logged once and the loop goes on.
+(phase, reason), `admission-blocked` (reason, conflicts, error) and `verification`
+(ok, reason, contract_hash, tree, probe_hash, exit_code, duration_s). An error in
+one task is logged once and the loop goes on.
+
+## File leases and launch admission
+
+A task that declares `files` takes an execution lease over them before its worker
+starts (`dash/admission.py`). The lease is rooted at the task workspace, so a
+declaration is read the way the worker reads it, and its identity is the absolute
+real path: two worktrees that each declare `src/mod.py` are two files. A path is
+canonicalized before it is compared, so `./a/b.py`, `a//b.py` and `a/../a/b.py`
+are one file; an absolute path, a `~` path, a glob or a path that escapes the
+workspace is refused as `invalid`.
+
+A second task that declares a held file is not launched. It stays `todo` and the
+dispatcher emits one `admission-blocked` event per distinct block, with the
+conflicting lease's owner, workstream, task and file names. The event repeats only
+when the block changes, so a held file never spams the inbox. The lease is renewed
+on every live observation, released when the run finishes, fails or is handed to
+the lead, and reaped when its pid is provably dead or its TTL expires. A restarted
+dispatcher drops its own stale owner token first, so it adopts its own run instead
+of blocking on itself.
+
+`run_worker.py` also takes a capacity lease that covers no file, so a launcher that
+owns no file still counts against `max_concurrent`. The dispatcher releases that
+lease when the run finishes, reading the `runs/<label>/<label>.admission-lease`
+file the launcher wrote, then deletes the file.
+
+## Contract verification
+
+A task with `contract_version` set carries an acceptance probe. Its PASS is a claim
+until the probe runs against the committed tree (`dash/evidence.py`). The dispatcher
+runs each probe without a shell, in `acceptance.cwd` (relative to the workspace),
+under one bounded timeout, and writes a receipt to `receipts/<task>.json` only when
+the probe exits 0 and the receipt still matches the contract hash, the probe hash
+and the current clean tree hash.
+
+A failed probe, a timeout, a dirty worktree, a missing tree or an amended commit
+does not advance the task. It stays `wip`, the lease is released, a `verification`
+event names the reason (`probe-failed`, `timeout`, `dirty-tree`, `stale-receipt`,
+`no-git-tree`, `missing-cwd`, `bad-probe`, `probe-not-runnable`) and the task goes
+to `needs-lead` with `reason: verification-failed`. A receipt carries hashes of
+stdout and stderr, never their text, and never the environment or the prompt.
+
+A task with no `contract_version` is legacy: it has no probe, gets no receipt, and
+its PASS advances exactly as before.
 
 Restart: state is reloaded from `dispatch-state.json`. Runs whose pid is still alive
 are adopted, and a task with a live run is never relaunched. A run directory with no
