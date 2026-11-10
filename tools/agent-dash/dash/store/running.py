@@ -154,11 +154,11 @@ class RunningMixin:
             the same way. A row whose pid is
             alive is never touched, and neither are Dagster rows (their
             close-out follows the active set), slices (they follow their
-            primary), or rows with no pid at all, except pid-less generic rows of
-            headless Command Code and Pi workers (``pidless_reapable``): one
-            with a recorded end closes at that end, one with no end after
-            ``PIDLESS_REAP_IDLE_S`` without evidence closes at its last
-            evidence. Process checks, file stats, and quota reads happen
+            primary), or rows with no pid at all, except pid-less generic rows
+            of any headless tier (``pidless_reapable``, which does not filter
+            on tier): one with a recorded end closes at that end, one with no
+            end after ``PIDLESS_REAP_IDLE_S`` without evidence closes at its
+            last evidence. Process checks, file stats, and quota reads happen
             outside the store lock. The final write rechecks the row identity
             so a concurrent poll can revive it while those probes run.
             Returns one ``{run_id, source, label, verdict, idle_s}`` dict
