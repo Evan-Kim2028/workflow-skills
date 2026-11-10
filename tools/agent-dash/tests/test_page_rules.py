@@ -3980,6 +3980,48 @@ console.log("activity tick spans ok");
         self.assertIn("act-live", src, "no live chip for following presets")
         self.assertIn("Reset", src, "no Reset button")
 
+    def test_activity_all_preset_loads_full_history(self):
+        """The All preset asks for full history (since=0) instead of the
+        seven-day top-up, and the wide payload's window start is the
+        earliest timestamp it returned, so the axis begins at the first
+        data point rather than 1970."""
+        bodies = dict(functions(inline_scripts()))
+        self.assertIn("actSetPreset", bodies)
+        preset = bodies["actSetPreset"]
+        self.assertIn("actEnsureWide(0, true)", preset, "All no longer asks for full history")
+        self.assertIn("from: 0", preset, "All no longer commits an open start")
+        self.assertIn("actEnsureWide", bodies)
+        wide = bodies["actEnsureWide"]
+        self.assertIn("allTime", wide, "actEnsureWide lost its all-time flag")
+        self.assertIn("actWideSince(", wide, "the wide window start is not the earliest returned timestamp")
+        harness = r'''
+const fs = require("fs");
+const assert = require("assert");
+var window = {};
+eval(fs.readFileSync(process.argv[2], "utf8"));
+const A = window.AdPage;
+assert.strictEqual(typeof A.actWideSince, "function", "AdPage.actWideSince is not exported");
+assert.strictEqual(typeof window.actWideSince, "function", "actWideSince is not a plain global");
+/* the earliest timestamp wins across all three payloads. */
+assert.strictEqual(A.actWideSince([{t: 300}, {t: 100}], [{started_at: 200}], [{t: 400}]), 100);
+assert.strictEqual(A.actWideSince([{t: 300}], [{started_at: 50}], [{t: 400}]), 50);
+assert.strictEqual(A.actWideSince([{t: 300}], [{started_at: 200}], [{t: 70}]), 70);
+/* empty payloads fall back to 0, and zero timestamps never win. */
+assert.strictEqual(A.actWideSince([], [], []), 0);
+assert.strictEqual(A.actWideSince(null, null, null), 0);
+assert.strictEqual(A.actWideSince([{t: 0}], [{started_at: 0}], [{t: 0}]), 0);
+console.log("activity all-time wide since ok");
+'''
+        with tempfile.TemporaryDirectory() as tmp:
+            harness_path = Path(tmp) / "act_wide_since.js"
+            harness_path.write_text(harness, encoding="utf-8")
+            proc = subprocess.run(
+                ["node", str(harness_path), str(STATIC / "cards" / "activity.js")],
+                capture_output=True,
+                text=True,
+            )
+        self.assertEqual(proc.returncode, 0, proc.stderr or proc.stdout)
+
     def test_activity_shares_one_axis(self):
         """One card, one x axis, one filter: exec-activity carries the
         Activity over time nav label with the brush bar on top, the four

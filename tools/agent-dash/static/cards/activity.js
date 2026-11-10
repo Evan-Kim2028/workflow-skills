@@ -21,7 +21,8 @@
    Date.now for the rolling window.
    Exports (on window.AdPage, also kept as plain globals): activityCard
    plus the pure range helpers actClampRange, actPresetRange, actTimeToX,
-   actXToTime, actDragHandle, actDragMove and actTickStep (node-tested),
+   actXToTime, actDragHandle, actDragMove, actTickStep and actWideSince
+   (node-tested),
    the pure strip-family helper actConcFams (node-tested), and the pure
    progress-strip helpers actProgY, actProgClip and actProgHas
    (node-tested).
@@ -35,8 +36,8 @@
   "use strict";
 
   /* Brushes never collapse below five minutes; arrow keys move a handle
-     five minutes, Shift+arrows one hour; the All preset loads at most
-     seven days of older data through the since/until endpoints. */
+     five minutes, Shift+arrows one hour; the All preset loads full
+     history through the since/until endpoints. */
   var ACT_MIN_SPAN = 5 * 60;
   var ACT_KEY_STEP = 5 * 60;
   var ACT_KEY_BIG = 3600;
@@ -65,9 +66,9 @@
   }
 
   /* A preset name to an absolute range at now. The hour and 7 d presets
-     follow now on ticks (live); All commits the last seven days as an
-     absolute range (the draw path clamps to loaded data until the wide
-     top-up lands). */
+     follow now on ticks (live); All covers the loaded window as an
+     absolute range (the draw path clamps to loaded data until the
+     full-history top-up lands). */
   function actPresetRange(preset, now, loadT0) {
     now = Math.round(+now); loadT0 = Math.round(+loadT0);
     if (!isFinite(now)) now = Math.round(Date.now() / 1000);
@@ -225,7 +226,8 @@
     var now = Date.now() / 1000, t1 = now, t0 = since();
     var usage = state.usage || [], runs = state.runs || [], conc = state.conc || [];
     var wide = state.actWide;
-    if (wide && wide.key === actWideKey() && wide.since < t0) {
+    if (wide && wide.key === actWideKey() && wide.since < t0 &&
+        ((wide.usage || []).length || (wide.runs || []).length || (wide.conc || []).length)) {
       var cut = Math.floor(t0 / 3600) * 3600;
       usage = (wide.usage || []).filter(function (b) { return b.t < cut; }).concat(usage);
       runs = (wide.runs || []).filter(function (r) { return (r.started_at || 0) < t0; }).concat(runs);
@@ -235,17 +237,29 @@
     return {t0: t0, t1: t1, usage: usage, runs: runs, conc: conc};
   }
   function actWideKey() { return actScope() + "|" + groupFor(); }
+  /* Earliest timestamp across the wide payload's usage buckets, runs and
+     concurrency points; 0 when the payload is empty. Pure. */
+  function actWideSince(usage, runs, conc) {
+    var lo = 0;
+    function take(t) { if (t > 0 && (!lo || t < lo)) lo = t; }
+    (usage || []).forEach(function (b) { take(b.t); });
+    (runs || []).forEach(function (r) { take(r.started_at); });
+    (conc || []).forEach(function (p) { take(p.t); });
+    return lo;
+  }
   /* Wider fetch for older data: quantized to the 30 s grid the server
      keys (and tags) on, conditional-GET friendly through api(), merged
      into state.actWide on arrival. Runs when a committed or drawn range
-     reaches past loaded data, never per pixel of drag. */
+     reaches past loaded data, never per pixel of drag. allTime asks for
+     since=0 and records the earliest returned timestamp as the window
+     start, so the axis begins at the first data point, not 1970. */
   var actWideInflight = {};
-  function actEnsureWide(from) {
+  function actEnsureWide(from, allTime) {
     var nowS = Date.now() / 1000;
-    var want = Math.max(actQuant(from), actQuant(nowS - ACT_WIDE_HOURS * 3600));
+    var want = allTime ? 0 : Math.max(actQuant(from), actQuant(nowS - ACT_WIDE_HOURS * 3600));
     var key = actWideKey();
     var have = state.actWide;
-    if (have && have.key === key && have.since <= want + 1) return;
+    if (have && have.key === key && (allTime ? have.all : have.since <= want + 1)) return;
     if (actWideInflight[key]) return;
     actWideInflight[key] = true;
     var me = actScope();
@@ -258,8 +272,7 @@
     ]).then(function (parts) {
       delete actWideInflight[key];
       if (actScope() !== me || state.view !== "exec") return;
-      if (!parts[0].length && !parts[1].length && !parts[2].length) return;
-      state.actWide = {key: key, since: want, usage: parts[0], runs: parts[1], conc: parts[2]};
+      state.actWide = {key: key, since: actWideSince(parts[0], parts[1], parts[2]), all: !!allTime, usage: parts[0], runs: parts[1], conc: parts[2]};
       drawMain();
     });
   }
@@ -276,7 +289,7 @@
       r = actReadUrl() || actReadStored(ws);
       if (r && !r.live) {
         actRanges[ws] = {from: r.from, to: r.to, live: false, preset: r.preset || null};
-        if (r.from < loaded.t0 - 1) actEnsureWide(r.from);
+        if (r.from < loaded.t0 - 1) actEnsureWide(r.from, r.preset === "all");
       } else if (r && r.live) {
         actRanges[ws] = {preset: r.preset || "24h", live: true, from: 0, to: 0};
       } else {
@@ -298,19 +311,19 @@
     actWriteUrl(r);
     if (!r.live) {
       var loaded = actLoaded();
-      if (r.from < loaded.t0 - 1) actEnsureWide(r.from);
+      if (r.from < loaded.t0 - 1) actEnsureWide(r.from, r.preset === "all");
     }
     drawMain();
   }
   function actSetPreset(preset) {
     var ws = actScope(), now = Date.now() / 1000, loaded = actLoaded();
     if (preset === "all") {
-      /* Commit the full seven-day span up front: the wide fetch above is
-         async, so snapshotting actLoaded().t0 here would freeze the
-         24 h window instead. The draw path clamps to loaded data until
-         the top-up lands and redraws. */
-      actEnsureWide(now - ACT_WIDE_HOURS * 3600);
-      actRanges[ws] = {from: now - ACT_WIDE_HOURS * 3600, to: now, live: false, preset: "all"};
+      /* Commit full history up front: the wide fetch above is async, so
+         snapshotting actLoaded().t0 here would freeze the 24 h window
+         instead. The draw path clamps to loaded data until the
+         full-history top-up lands and redraws. */
+      actEnsureWide(0, true);
+      actRanges[ws] = {from: 0, to: now, live: false, preset: "all"};
     } else {
       actRanges[ws] = actPresetRange(preset, now, loaded.t0);
     }
@@ -381,7 +394,7 @@
     var bar = el("div", {class: "act-controls", role: "group", "aria-label": "Time range"});
     ACT_PRESETS.forEach(function (p) {
       var active = r.live ? r.preset === p[0] : p[0] === "all" && r.preset === "all";
-      var b = el("button", {type: "button", "aria-pressed": String(!!active), title: p[0] === "all" ? "Everything loaded, up to seven days" : p[0] === "7d" ? "The last seven days, following now" : "The last " + p[1].toLowerCase() + ", following now"}, [p[1]]);
+      var b = el("button", {type: "button", "aria-pressed": String(!!active), title: p[0] === "all" ? "Full history, from the first recorded activity" : p[0] === "7d" ? "The last seven days, following now" : "The last " + p[1].toLowerCase() + ", following now"}, [p[1]]);
       b.addEventListener("click", (function (name) { return function () { actSetPreset(name); }; })(p[0]));
       bar.appendChild(b);
     });
@@ -1333,6 +1346,7 @@
   AdPage.actBrush = actBrush;
   AdPage.actClampRange = actClampRange;
   AdPage.actPresetRange = actPresetRange;
+  AdPage.actWideSince = actWideSince;
   AdPage.actTimeToX = actTimeToX;
   AdPage.actXToTime = actXToTime;
   AdPage.actDragHandle = actDragHandle;
@@ -1360,6 +1374,7 @@
   global.actBrush = actBrush;
   global.actClampRange = actClampRange;
   global.actPresetRange = actPresetRange;
+  global.actWideSince = actWideSince;
   global.actTimeToX = actTimeToX;
   global.actXToTime = actXToTime;
   global.actDragHandle = actDragHandle;
