@@ -66,7 +66,10 @@
     if (/composer/.test(m)) { v = /composer[-_ ]?(\d+(?:\.\d+)?)/.exec(m); return ["cursor", "composer" + (v ? "-" + v[1] : "")]; }
     if (/grok/.test(m)) { v = /grok[-_ ]?(\d+(?:\.\d+)?)/.exec(m); return ["cursor", "grok" + (v ? "-" + v[1] : "")]; }
     if (/glm/.test(m)) { v = /glm[-_ ]?(\d+(?:\.\d+)?)/.exec(m); return ["glm", "glm" + (v ? "-" + v[1] : "") + (/flash/.test(m) ? "-flash" : "")]; }
-    if (/deepseek/.test(m)) { return ["deepseek", /pro/.test(m) ? "deepseek-v4-pro" : "deepseek-flash"]; }
+    /* Morph serves DeepSeek V4.1 Flash under morph-dsv41flash*; the provider
+       prefix hides the model name, so the served id names the family.
+       Mirrors is_deepseek_alias in dash/models.py. */
+    if (/deepseek|dsv41flash/.test(m)) { return ["deepseek", /pro/.test(m) ? "deepseek-v4-pro" : "deepseek-flash"]; }
     if (/muse/.test(m)) { v = /muse-(spark|wonder)(?:-full)?-(\d+(?:\.\d+)?)/.exec(m); return ["muse", v ? "muse-" + v[1] + "-" + v[2] : "muse-unknown"]; }
     if (/codex/.test(h) || m === "codex-unknown") return ["codex", m || "codex-unknown"];
     if (/^gpt-/.test(m) || m === "gpt-reserve" || /^codex-/.test(m)) return ["codex", m];
@@ -111,7 +114,7 @@
     if (/-unknown$/.test(key)) return "model not recorded";
     /* Legacy DeepSeek aliases (deepseek-v4-flash, ...-vision-exp) take the
        key they group under, so the cell and the legend agree. */
-    if (/deepseek/i.test(key)) {
+    if (/deepseek|dsv41flash/i.test(key)) {
       var dk = keyOf(key)[1];
       if (dk === "deepseek-flash") return "DeepSeek V4.1 Flash";
       if (dk === "deepseek-v4-pro") return "DeepSeek V4 Pro";

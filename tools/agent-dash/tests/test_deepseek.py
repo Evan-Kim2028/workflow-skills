@@ -93,6 +93,49 @@ class CatalogTest(unittest.TestCase):
             self.assertEqual(info["provider"], "deepseek", model)
 
 
+class MorphCatalogTest(unittest.TestCase):
+    """Morph serves DeepSeek V4.1 Flash under morph-dsv41flash*."""
+
+    MODELS = ("morph/morph-dsv41flash-1017", "morph/morph-dsv41flash")
+    #: pi reports the served id without the provider prefix, so the catalog
+    #: carries both spellings like the River rows do.
+    BARE = ("morph-dsv41flash-1017", "morph-dsv41flash")
+
+    def test_morph_rows_are_published(self):
+        from dash.pricing import load
+
+        rows = {row["model"]: row for row in load()}
+        for model in self.MODELS + self.BARE:
+            row = rows[model]
+            self.assertEqual(row["provider"], "morph", model)
+            self.assertEqual(float(row["input"]), 0.12, model)
+            self.assertEqual(float(row["output"]), 0.80, model)
+            self.assertEqual(float(row["cache_read"]), 0.008, model)
+            self.assertEqual(row["source_url"], "https://morphllm.com/pricing", model)
+            self.assertEqual(row["confidence"], "published", model)
+            self.assertTrue(status(model)["priced"], model)
+
+    def test_morph_cost_uses_the_cache_hit_rate(self):
+        for model in self.MODELS + self.BARE:
+            self.assertAlmostEqual(
+                cost(model, 645, 209, 59392, 0),
+                (645 * 0.12 + 209 * 0.80 + 59392 * 0.008) / 1_000_000,
+                places=12,
+            )
+
+    def test_morph_ids_map_to_the_deepseek_family(self):
+        from dash.models import model_name
+
+        for model in self.MODELS + self.BARE:
+            self.assertEqual(model_key(model), ("deepseek", "deepseek-flash"), model)
+            self.assertEqual(series_key(model), "deepseek", model)
+            self.assertEqual(model_name(model), "DeepSeek V4.1 Flash", model)
+        self.assertEqual(
+            run_model_key({"model": self.MODELS[0], "tier": "pi-deepseek-flash", "source": "pi"}),
+            "deepseek-flash",
+        )
+
+
 class BandTest(unittest.TestCase):
     def test_utc_edges_on_a_weekday(self):
         cases = [

@@ -397,7 +397,7 @@ Any later line that matches also counts, but the first one wins. `PARTIAL`, `BLO
 
 ## 5. Tokens and cost
 
-A usage record carries `input`, `output`, `cache_read`, `cache_write`, and `reasoning`. Billed Grok lines live in `cursor-usage.jsonl` (the stop hook appends them). Generic lines live in `generic.jsonl` (the `report usage` helper appends them). Claude, muse, and GLM usage comes from their own session logs. Rates live in `tools/agent-dash/catalog/prices.json` as USD per million tokens. The lookup is an exact string match on `model`.
+A usage record carries `input`, `output`, `cache_read`, `cache_write`, and `reasoning`. Billed Grok lines live in `cursor-usage.jsonl` (the stop hook appends them). Generic lines live in `generic.jsonl` (the `report usage` helper appends them). Claude, muse, and GLM usage comes from their own session logs. pi usage comes from the run's `stream-<label>.ndjson` `message_end` events (the source byte-cursors the stream, so a finished run backfills from offset 0), with `generic.jsonl` as the launcher's second copy. Rates live in `tools/agent-dash/catalog/prices.json` as USD per million tokens. The lookup is an exact string match on `model`.
 
 Add a model by appending a row:
 
@@ -432,6 +432,26 @@ its `training_and_sampling` list is fine-tuning pricing, not API pricing.
 `input` is the cache miss and `cache_read` the hit. To re-price, rewrite
 the river rows from the feed, update `retrieved_at`, then run
 `python3 agent_dash.py reprice` and `python3 -m unittest tests.test_pi`.
+
+### pi workers (Morph)
+
+A pi tier can launch DeepSeek V4.1 Flash through Morph
+(`morph/morph-dsv41flash-1017`, `morph/morph-dsv41flash`). Morph's stream
+reports `cost` 0, so the catalog prices the run: `provider` `morph`,
+confidence `published`, from https://morphllm.com/pricing (retrieved
+2026-11-10), USD per 1M tokens, flat with no time bands:
+
+| model | input (miss) | cache_read (hit) | output |
+|---|---|---|---|
+| `morph-dsv41flash-1017` | 0.12 | 0.008 | 0.80 |
+| `morph-dsv41flash` | 0.12 | 0.008 | 0.80 |
+
+Both spellings have a row: `morph/<id>` (the launcher's model) and the
+bare `<id>` (what pi writes in its `message_end` usage). The pi source
+reads those events itself, so a run whose launcher died before writing
+`generic.jsonl` still gets tokens and cost. `morph-dsv41flash*` maps to
+the `deepseek` family and the display name `DeepSeek V4.1 Flash`
+(`dash/models.py` `is_deepseek_alias`, mirrored in `static/models.js`).
 
 ### DeepSeek V4.1 Flash (time-aware standard API prices)
 

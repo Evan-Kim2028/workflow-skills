@@ -14,6 +14,13 @@ assistant ``message_end`` events (``usage.input`` is the cache miss,
 stream. The stream is byte-cursored per file so a tick reads only bytes
 appended since the last one.
 
+``run_worker.py`` writes its manifest row in the run folder while
+``launch_pi.py`` writes the stream, out and err files in ``<run_dir>/pi/``,
+so a row's stream is looked up beside the manifest and then in ``pi/``.
+The stream's own ``session`` event names the pi session; usage rows use
+that id (the launcher's ``generic.jsonl`` lines use it too, so the two
+readers upsert the same row instead of counting it twice).
+
 Liveness is the launcher: a live ``python3 .../scripts/launch_pi.py``
 with the run's label (see ``dash.sources.process.live_agent_processes``),
 recorded as a process sample for the run. The pi CLI rewrites its
@@ -43,6 +50,7 @@ import os
 import re
 
 from dash.liveness import file_shows_quota
+from dash.models import is_deepseek_alias
 from dash.sources import grok_cli as _grok
 from dash.sources import manifests as _manifests
 from dash.sources import process as _process
@@ -94,8 +102,9 @@ def _poll(store, cfg, now):
                 rows[_row_key(live)] = live
     processes = _agent_processes()
     seen = _seen(store)
+    per_file, budget = _grok._budgets(cfg)
     for row in rows.values():
-        _upsert_run(store, row, processes, seen)
+        budget = _upsert_run(store, row, processes, seen, budget, per_file, now)
 
 
 def _outdirs(root):
@@ -344,13 +353,27 @@ def _stream_path(pad, label):
     return os.path.join(pad, "stream-%s.ndjson" % label)
 
 
+def _stream_file(pad, label):
+    """The run's stream: beside the manifest, else in the launcher's ``pi/``.
+
+    ``run_worker.py`` records its manifest row in the run folder while
+    ``launch_pi.py`` writes the stream in ``<run_dir>/pi/``, so a row read
+    from the run folder still finds its stream one level down.
+    """
+    path = _stream_path(pad, label)
+    if os.path.isfile(path):
+        return path
+    alt = os.path.join(pad, DIRECTORY, "stream-%s.ndjson" % label)
+    return alt if os.path.isfile(alt) else path
+
+
 def _stream_session(pad, label):
     """Session id from the stream's ``session`` event, or None.
 
     The head is cached on (inode, size, mtime): an unchanged stream is not
     re-opened on every poll. A growing stream keeps its head in place, so
     the cache stays valid while the tail is appended."""
-    path = _stream_path(pad, label)
+    path = _stream_file(pad, label)
     try:
         st = os.stat(path)
     except OSError:
@@ -397,7 +420,7 @@ def _model_tier(model):
         return "beam"
     if "glm" in text:
         return "glm"
-    if "deepseek" in text:
+    if "deepseek" in text or is_deepseek_alias(text):
         return "deepseek"
     return NAME
 
@@ -437,12 +460,12 @@ def _read_meta(pad, label):
     return meta
 
 
-def _upsert_run(store, row, processes, seen):
+def _upsert_run(store, row, processes, seen, budget=0, per_file=0, now=None):
     label = row["label"]
     pad = row["pad"]
     sid = row.get("sid") or _stream_session(pad, label) or label
-    out_path = os.path.join(pad, "out-%s.md" % label)
-    err_path = os.path.join(pad, "err-%s.log" % label)
+    out_path = _first_file(pad, "out-%s.md" % label)
+    err_path = _first_file(pad, "err-%s.log" % label)
     quota = _quota(pad, label, out_path, err_path, sid)
     run = {
         "run_id": "pi:%s:%s" % (sid, label),
@@ -486,7 +509,97 @@ def _upsert_run(store, row, processes, seen):
             else:
                 run["status"] = "unknown"
     _process_apply(store, run, processes)
+    budget = _apply_stream(store, run, pad, label, budget, per_file, now)
     _emit_run(store, run, seen)
+    return budget
+
+
+def _first_file(pad, name):
+    """``pad/name``, else the launcher's ``pad/pi/name`` (the split layout)."""
+    path = os.path.join(pad, name)
+    if os.path.isfile(path):
+        return path
+    alt = os.path.join(pad, DIRECTORY, name)
+    return alt if os.path.isfile(alt) else path
+
+
+def _apply_stream(store, run, pad, label, budget, per_file, now):
+    """Emit usage from the run's stream, byte-cursored per file.
+
+    The stream is the authoritative ledger: ``launch_pi.py`` writes its
+    ``generic.jsonl`` lines only after the child exits, so a launcher that
+    dies first leaves the run tokenless. Reading the stream here fills
+    that gap and backfills finished runs from offset 0 on the first poll.
+    Usage rows carry the stream's session id (the launcher's lines do too),
+    so a run with both readers upserts one row instead of two.
+    """
+    path = _stream_file(pad, label)
+    if not os.path.isfile(path):
+        return budget
+    key = "pi:stream:" + path
+    try:
+        raw, budget, _started = _grok._read_chunk(store, path, key, budget, per_file)
+    except Exception:
+        _fail("stream")
+        return budget
+    if not raw:
+        return budget
+    stream_sid = _stream_session(pad, label) or run.get("session_id")
+    model = run.get("model")
+    try:
+        st = os.stat(path)
+    except OSError:
+        return budget
+    index_key = "pi:stream-index:" + path
+    rec = _offset(store, index_key)
+    start_index = int(rec[1]) if rec and rec[0] == st.st_ino else 0
+    events = parse_stream(raw, stream_sid, default_model=model, start_index=start_index)
+    for ev in events:
+        _add_usage(
+            store,
+            {
+                "ts": ev["ts"] if ev["ts"] is not None else now,
+                "session_id": stream_sid,
+                "run_id": run["run_id"],
+                "model": ev["model"] or model,
+                "tool": TOOL,
+                "message_id": ev["message_id"],
+                "input": ev["input"],
+                "output": ev["output"],
+                "cache_read": ev["cache_read"],
+                "cache_write": ev["cache_write"],
+                "cache_write_5m": ev["cache_write_5m"],
+                "cache_write_1h": ev["cache_write_1h"],
+                "reasoning": 0,
+            },
+        )
+    if events:
+        try:
+            store.set_offset(index_key, st.st_ino, start_index + len(events), 0, 0)
+        except Exception:
+            _fail("stream-index")
+    return budget
+
+
+def _offset(store, key):
+    try:
+        rec = store.get_offset(key)
+    except Exception:
+        return None
+    if not rec:
+        return None
+    try:
+        rec[0], rec[1]
+    except (TypeError, IndexError):
+        return None
+    return rec
+
+
+def _add_usage(store, row):
+    try:
+        store.add_usage(row)
+    except Exception:
+        _fail("usage")
 
 
 def _process_apply(store, run, processes):
@@ -588,7 +701,7 @@ def _is_anthropic(model):
     return "claude" in str(model or "").lower()
 
 
-def parse_stream(raw, fallback_sid, default_model=None):
+def parse_stream(raw, fallback_sid, default_model=None, start_index=0):
     """Assistant usage events from raw NDJSON bytes.
 
     Each ``message_end`` with an assistant message and a usage block is one
@@ -597,10 +710,12 @@ def parse_stream(raw, fallback_sid, default_model=None):
     ``cache_write_1h`` the write split (see :func:`write_split`).
     ``default_model`` is the launch model, used for the Anthropic rule
     when the message names none. ``message_id`` is
-    ``<session>-<index>`` where index counts assistant messages in order.
+    ``<session>-<index>`` where index counts assistant messages in order;
+    ``start_index`` continues that count when a stream is read in chunks,
+    so the ids match the launcher's full-stream read.
     """
     events = []
-    index = 0
+    index = int(start_index or 0)
     for line in raw.split(b"\n"):
         if not line.strip():
             continue

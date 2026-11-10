@@ -45,6 +45,18 @@ COMMANDCODE_FREE = frozenset(
 )
 
 
+#: Morph-served DeepSeek V4.1 Flash ids (``morph/morph-dsv41flash-1017``).
+#: The provider prefix hides the model name, so the family rule matches the
+#: served id itself. ``dash.pricing.series_key`` and the pi source reuse this
+#: one predicate, so the chart family, the tier and the price row agree.
+_DEEPSEEK_ALIAS = re.compile(r"dsv41flash", re.IGNORECASE)
+
+
+def is_deepseek_alias(model: str | None) -> bool:
+    """True for a provider-prefixed DeepSeek V4.1 Flash id (Morph)."""
+    return bool(_DEEPSEEK_ALIAS.search(str(model or "")))
+
+
 def _ver(pattern: str, text: str) -> str:
     match = re.search(pattern, text)
     return "-" + match.group(1) if match else ""
@@ -69,7 +81,7 @@ def model_key(model: str | None, hint: str | None = None) -> tuple[str, str]:
         return "cursor", "grok" + _ver(r"grok[-_ ]?(\d+(?:\.\d+)?)", m)
     if "glm" in m:
         return "glm", "glm" + _ver(r"glm[-_ ]?(\d+(?:\.\d+)?)", m) + ("-flash" if "flash" in m else "")
-    if "deepseek" in m:
+    if "deepseek" in m or is_deepseek_alias(m):
         if "pro" in m:
             return "deepseek", "deepseek-v4-pro"
         return "deepseek", "deepseek-flash"
@@ -185,7 +197,7 @@ def model_name(key: str | None) -> str:
         return s[len("dagster:") :] or "job"
     if s.endswith("-unknown"):
         return "model not recorded"
-    if "deepseek" in s.lower():
+    if "deepseek" in s.lower() or is_deepseek_alias(s):
         # Legacy DeepSeek aliases take the key they group under, as in models.js.
         dk = model_key(s)[1]
         if dk == "deepseek-flash":
