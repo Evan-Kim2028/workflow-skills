@@ -443,13 +443,16 @@ class SourceTest(unittest.TestCase):
             1_800_000_000.0,
         )
         self.assertIsNone(pi.last_error)
-        run = self.store.runs[self.run_id("ws15-exec-split")]
+        # The stream's session id is the run id, not the run-folder's
+        # pre-generated one: the run-folder row and the pi/ row are one run.
+        self.assertEqual(list(self.store.runs), [self.run_id("ws15-exec-split", MORPH_SID)])
+        run = self.store.runs[self.run_id("ws15-exec-split", MORPH_SID)]
         self.assertEqual(run["status"], "done")
         self.assertEqual(run["verdict"], "PASS")
         rows = list(self.store.usage.values())
         self.assertEqual(len(rows), 2)
         self.assertEqual((rows[0]["input"], rows[0]["cache_read"], rows[0]["output"]), (645, 59392, 209))
-        self.assertEqual(rows[0]["run_id"], self.run_id("ws15-exec-split"))
+        self.assertEqual(rows[0]["run_id"], self.run_id("ws15-exec-split", MORPH_SID))
         self.assertEqual(rows[0]["session_id"], MORPH_SID)
         # pi reports the served id without the provider prefix.
         self.assertEqual(rows[0]["model"], "morph-dsv41flash-1017")
@@ -941,11 +944,66 @@ class StreamCostTest(unittest.TestCase):
             1_800_000_000.0,
         )
         runs = {r["run_id"]: r for r in store.query_runs(1_800_000_000.0, "WS15", None, None, 100)}
-        run = runs[f"pi:{SID}:ws15-exec-morph"]
+        run = runs[f"pi:{MORPH_SID}:ws15-exec-morph"]
         self.assertGreater(run["tokens"]["output"], 0)
         self.assertGreater(run["tokens"]["cache_read"], 0)
         self.assertGreater(run["cost_usd"], 0)
         self.assertEqual(run["model"], MORPH)
+
+    def test_pre_generated_twin_folds_into_the_stream_run(self):
+        # run_worker.py records a session id before pi starts; pi picks its
+        # own and the launcher records it in <run_dir>/pi/pi-sessions.tsv.
+        # The store must list one run, carrying the stream's tokens and cost,
+        # and a re-read from offset 0 must not double count.
+        from dash.store import Store
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        label = "ws15-exec-twin"
+        run_dir = Path(tmp.name) / "runs" / label
+        (run_dir / "pi").mkdir(parents=True)
+        (run_dir / "pi-sessions.tsv").write_text(
+            HEADER + f"{label}\t{SID}\t1792000000\t{MORPH}\n", encoding="utf-8"
+        )
+        (run_dir / "pi" / "pi-sessions.tsv").write_text(
+            HEADER + f"{label}\t{MORPH_SID}\t1792000000\t{MORPH}\n", encoding="utf-8"
+        )
+        stream = run_dir / "pi" / f"stream-{label}.ndjson"
+        stream.write_bytes(MORPH_FIXTURE.read_bytes())
+        (run_dir / "pi" / f"out-{label}.md").write_text("PASS\n", encoding="utf-8")
+        store = Store(Path(tmp.name) / "dash.sqlite")
+        self.addCleanup(store.close)
+        # The pre-generated row the old poll left behind: listed, tokenless.
+        store.upsert_run(
+            {
+                "run_id": f"pi:{SID}:{label}",
+                "source": "pi",
+                "label": label,
+                "session_id": SID,
+                "status": "done",
+                "started_at": 1792000000.0,
+            }
+        )
+        pi._tsv_cache.clear()
+        cfg = {"roots": {"scratchpads": [str(Path(tmp.name) / "runs")]}, "read_budgets": {}}
+        pi.poll(store, cfg, 1_800_000_000.0)
+        runs = {r["run_id"]: r for r in store.query_runs(1_800_000_000.0, "WS15", None, None, 100)}
+        self.assertEqual(list(runs), [f"pi:{MORPH_SID}:{label}"])
+        run = runs[f"pi:{MORPH_SID}:{label}"]
+        self.assertGreater(run["tokens"]["output"], 0)
+        self.assertGreater(run["cost_usd"], 0)
+        self.assertIsNone(store.get_run(f"pi:{SID}:{label}"))
+        first = dict(run["tokens"])
+        first_cost = run["cost_usd"]
+        # Re-read the stream from offset 0: the same message ids upsert, so
+        # the run's tokens and cost do not grow.
+        st = stream.stat()
+        store.set_offset("pi:stream:" + str(stream), st.st_ino, 0, 0, 0)
+        pi.poll(store, cfg, 1_800_000_002.0)
+        runs = {r["run_id"]: r for r in store.query_runs(1_800_000_002.0, "WS15", None, None, 100)}
+        self.assertEqual(list(runs), [f"pi:{MORPH_SID}:{label}"])
+        self.assertEqual(runs[f"pi:{MORPH_SID}:{label}"]["tokens"], first)
+        self.assertEqual(runs[f"pi:{MORPH_SID}:{label}"]["cost_usd"], first_cost)
 
 
 class NonAnthropicPricingUnchangedTest(unittest.TestCase):
