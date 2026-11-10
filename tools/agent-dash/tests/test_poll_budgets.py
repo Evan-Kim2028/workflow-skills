@@ -337,6 +337,78 @@ class AdaptiveIntervalTests(unittest.TestCase):
         self.assertFalse(sources_pkg._due(source, state, NOW + 0.05, {}))
 
 
+class BackedOffStallTests(unittest.TestCase):
+    """A source waiting for its adaptive next start is not stalled."""
+
+    class _SlowPoll:
+        NAME = "slow-poll"
+        INTERVAL_S = 2
+
+        def poll(self, store, cfg, now):
+            time.sleep(0.05)
+
+    def _registry(self, source):
+        registry = Registry([source])
+        # A mature dashboard (past the startup window): lag judges at once.
+        registry._born = NOW - 3600
+        return registry
+
+    def test_future_next_due_is_not_stalled(self):
+        source = self._SlowPoll()
+        registry = self._registry(source)
+        registry.state["slow-poll"].update(
+            last_poll=NOW, last_ok=NOW, next_due=NOW + 60
+        )
+        # Lag 7 s is past 3x the 2 s interval, but the source is backed off
+        # until NOW + 60: waiting, not silent.
+        body = registry.health(NOW + 7)
+        self.assertTrue(body["ok"])
+        entry = body["sources"][0]
+        self.assertEqual(entry["state"], "ok")
+        self.assertFalse(entry["stalled"])
+        self.assertEqual(registry.stalled_messages(NOW + 7), [])
+
+    def test_past_next_due_without_a_poll_is_stalled(self):
+        source = self._SlowPoll()
+        registry = self._registry(source)
+        registry.state["slow-poll"].update(
+            last_poll=NOW, last_ok=NOW, next_due=NOW + 60
+        )
+        body = registry.health(NOW + 61)
+        self.assertFalse(body["ok"])
+        entry = body["sources"][0]
+        self.assertEqual(entry["state"], "stalled")
+        self.assertTrue(entry["stalled"])
+        self.assertEqual(
+            registry.stalled_messages(NOW + 61),
+            ["source stalled: slow-poll (last ok poll 61 s ago)"],
+        )
+
+    def test_signal_source_is_unchanged(self):
+        class _Signalled:
+            NAME = "signalled"
+            INTERVAL_S = 2
+            signal_paths = ()
+
+            def poll(self, store, cfg, now):
+                pass
+
+        source = _Signalled()
+        registry = self._registry(source)
+        # A next_due on a signal source is ignored: the interval limit holds.
+        registry.state["signalled"].update(
+            last_poll=NOW, last_ok=NOW, next_due=NOW + 60
+        )
+        body = registry.health(NOW + 7)
+        self.assertFalse(body["ok"])
+        self.assertEqual(body["sources"][0]["state"], "stalled")
+        # Dormant with the fallback gap: silent by design, still ok.
+        registry.state["signalled"].update(idle=sources_pkg.BACKOFF_AFTER)
+        body = registry.health(NOW + 7)
+        self.assertTrue(body["ok"])
+        self.assertEqual(body["sources"][0]["state"], "ok")
+
+
 class RestartGraceTests(unittest.TestCase):
     """The first poll cycle after a restart is "starting", never stalled."""
 
