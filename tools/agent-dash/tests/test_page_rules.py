@@ -458,6 +458,20 @@ console.log("hover builders proof ok: " + seen.length + " strings compact");
         self.assertIn("state.groupBy =", body)
         self.assertIn("refreshSnapshot", body)
 
+    def test_token_chart_uses_effective_grouping(self):
+        """A workstream tab always fetches model-grouped usage, so the chart
+        and the hidden-token note read the effective group, not the all-tab
+        toggle left over from another tab."""
+        script = inline_scripts()
+        bodies = dict(functions(script))
+        self.assertIn("actTokenStrip", bodies)
+        tok = bodies["actTokenStrip"]
+        self.assertIn("groupFor()", tok, "the token chart ignores the effective grouping")
+        self.assertNotIn("var byModel = state.groupBy", tok, "the token chart reads the raw toggle")
+        self.assertIn("actHidden", bodies)
+        self.assertIn("groupFor()", bodies["actHidden"], "the hidden-token note ignores the effective grouping")
+        self.assertNotIn("state.groupBy", bodies["actHidden"], "the hidden-token note reads the raw toggle")
+
     def test_cache_key_and_stale_guard(self):
         script = (
             "const fs=require('fs');"
