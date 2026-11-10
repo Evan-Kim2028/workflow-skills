@@ -531,6 +531,71 @@ class DeployLibTest(unittest.TestCase):
                 self.assertNotIn("AGENT_DASH_PORT", call.kwargs["env"])
 
 
+class RunCheckClassificationTest(unittest.TestCase):
+    """``run_check`` separates transient stale rows from real drift.
+
+    The check table always prints ``tokens`` and ``cost_usd`` headers, so
+    a substring test on those words classified every failure as a token
+    mismatch and blocked the deploy on a transient stale row.
+    """
+
+    TABLE = (
+        "reconcile 24h window (since 1 until 2)\n"
+        "workstream live fin tokens cost_usd all_time\n"
+        " WS1 0 1 1234 0.50 9999\n"
+        "rows sum tokens 1234\n"
+        "all-time tokens 9999 cost_usd 0.50\n"
+    )
+
+    def _check(self, output):
+        with mock.patch.object(deploy_lib, "_run", return_value=(False, output)):
+            return deploy_lib.run_check("/tmp/tool-x")
+
+    def test_stale_running_with_token_table_passes(self):
+        ok, reason = self._check(
+            self.TABLE + "MISMATCHES:\n  - stale running: run-abc (no source evidence for 7 h)\n"
+        )
+        self.assertTrue(ok, reason)
+        self.assertIn("transient stale", reason)
+
+    def test_dagster_run_missing_passes(self):
+        ok, reason = self._check(
+            self.TABLE + "MISMATCHES:\n  - dagster run missing: run-def (not in the active set)\n"
+        )
+        self.assertTrue(ok, reason)
+
+    def test_source_stalled_passes(self):
+        ok, reason = self._check(
+            self.TABLE + "MISMATCHES:\n  - source stalled: dagster (last ok poll 400 s ago)\n"
+        )
+        self.assertTrue(ok, reason)
+
+    def test_real_token_mismatch_fails(self):
+        ok, reason = self._check(
+            self.TABLE + "MISMATCHES:\n  - tokens: workstream rows sum to 1234, overview shows 1200\n"
+        )
+        self.assertFalse(ok)
+        self.assertIn("tokens: workstream rows sum", reason)
+
+    def test_real_cost_mismatch_fails(self):
+        ok, reason = self._check(
+            self.TABLE + "MISMATCHES:\n  - cost_usd: workstream rows sum to 0.500000, overview shows 0.400000\n"
+        )
+        self.assertFalse(ok)
+
+    def test_unpriced_model_fails(self):
+        ok, reason = self._check(
+            self.TABLE + "MISMATCHES:\n  - unpriced model: someprovider/new-model (500 tokens in 24 h)\n"
+        )
+        self.assertFalse(ok)
+        self.assertIn("unpriced", reason)
+
+    def test_generic_failure_fails(self):
+        ok, reason = self._check("check failed: exit 2")
+        self.assertFalse(ok)
+        self.assertIn("exit 2", reason)
+
+
 class StateDirConfigTest(CliStateMixin, unittest.TestCase):
     def setUp(self):
         self.bind_temp_state()
