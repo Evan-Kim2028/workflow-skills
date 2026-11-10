@@ -74,6 +74,7 @@ class BaseMixin:
             self._counts_seq = 0
             self._last_data_ts: float | None = None
             self._snapshot_cache: dict = {}
+            self._reconcile_cache: dict = {}
             self._model_stats_cache = None
             self._workstreams_cache: dict = {}
             self._usage_folds: dict = {}

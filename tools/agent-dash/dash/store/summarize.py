@@ -27,6 +27,23 @@ from .util import (BILLED_FIELDS, FINISHED, MERGE_WINDOW_S,
                  is_marker_run)
 
 
+def _processes_signature(processes) -> tuple | None:
+    """Stable identity of a live worker listing, or None.
+
+    Covers every field the unseen-worker check reads: label, pid, process
+    age, and comm. A listing that differs in any of them can change the
+    mismatch list, so it must miss the cache.
+    """
+    if processes is None:
+        return None
+    rows = [
+        (proc.get("label"), proc.get("pid"), proc.get("started_at"), proc.get("comm"))
+        for proc in processes
+        if isinstance(proc, dict)
+    ]
+    return tuple(sorted(rows, key=lambda item: tuple(str(part) for part in item)))
+
+
 class SummarizeMixin:
         def snapshot(
             self,
@@ -335,9 +352,19 @@ class SummarizeMixin:
             from dash.workstates import archived_aggregate as _archived_aggregate
             from dash.workstates import check_archived_identity as _check_archived
 
+            with self._lock:
+                key = self._reconcile_key(now, since, until, processes, archived_ws)
+                hit = self._reconcile_cache.get(key)
+                if hit is not None:
+                    _perf.record_cache("reconcile", "hit")
+                    payload = _copy.deepcopy(hit)
+                    payload["now"] = now
+                    return payload
+
             probes = self._probe_liveness(file_mtimes=True)
             check = self._probe_checker(probes)
             with self._lock:
+                key = self._reconcile_key(now, since, until, processes, archived_ws)
                 shown_all, parents = self._shown_locked(now, probes)
                 # One evidence pass shared by the live-open set below and
                 # the stale leg inside _mismatches_locked (same open rows,
@@ -407,7 +434,28 @@ class SummarizeMixin:
                             all_time["all"]["cost_usd"],
                         )
                     )
+                if len(self._reconcile_cache) >= 8:
+                    self._reconcile_cache.clear()
+                self._reconcile_cache[key] = _copy.deepcopy(payload)
+                _perf.record_cache("reconcile", "miss")
                 return payload
+        def _reconcile_key(self, now, since, until, processes, archived_ws) -> tuple:
+            """Cache identity for one reconcile roll. Caller holds the lock.
+
+            ``_data_seq`` gates every data write. The window edges and
+            ``now`` quantize to a 30 s grid for the key only, the same
+            staleness bound the snapshot cache accepts. The process
+            signature is the sorted listing identity, or None when the
+            caller passed no listing.
+            """
+            return (
+                self._data_seq,
+                None if since is None else int(float(since) // 30),
+                None if until is None else int(float(until) // 30),
+                int(float(now) // 30),
+                tuple(sorted(archived_ws or ())),
+                _processes_signature(processes),
+            )
         def _mismatches_locked(
             self, roll: dict, shown_all: list, now: float, tab_of,
             processes=None, evidence=None, liveness=None,

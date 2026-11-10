@@ -1225,6 +1225,113 @@ class ReconcileTest(unittest.TestCase):
         self.assertEqual(mine["unassigned"]["live_agents"], 1)
 
 
+class ReconcileCacheTest(unittest.TestCase):
+    """The reconcile roll cache: one compute per data version and 30 s bucket."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.store = memory(Path(self.tmp.name))
+        self.now = 1_761_999_960.0
+        self.since = self.now - 12 * 3600
+        self.until = self.now
+        self.store.upsert_run(
+            {
+                "run_id": "muse:a:ws1-a",
+                "source": "muse",
+                "tier": "muse",
+                "model": "claude-sonnet-5-5",
+                "label": "ws1-a",
+                "session_id": "s-a",
+                "status": "done",
+                "started_at": self.now - 5000,
+                "ended_at": self.now - 4000,
+            }
+        )
+        self.store.add_usage(
+            {
+                "ts": self.now - 4100,
+                "session_id": "s-a",
+                "run_id": "muse:a:ws1-a",
+                "model": "claude-sonnet-5-5",
+                "tool": "muse",
+                "message_id": "m1",
+                "input": 100,
+                "output": 50,
+                "cache_read": 0,
+                "cache_write": 0,
+            }
+        )
+
+    def tearDown(self):
+        self.store.close()
+        self.tmp.cleanup()
+
+    def _reconcile(self, now=None, **kwargs):
+        return self.store.reconcile_numbers(
+            self.now if now is None else now, self.since, self.until, **kwargs
+        )
+
+    def _spy(self):
+        spy = mock.MagicMock(side_effect=self.store._summarize_locked)
+        self.store._summarize_locked = spy
+        self.addCleanup(lambda: delattr(self.store, "_summarize_locked"))
+        return spy
+
+    def test_same_bucket_serves_cached_payload(self):
+        spy = self._spy()
+        first = self._reconcile(processes=[])
+        second = self._reconcile(self.now + 5, processes=[])
+        self.assertEqual(spy.call_count, 1)
+        self.assertEqual(second["now"], self.now + 5)
+        self.assertEqual(second["since"], first["since"])
+        self.assertEqual(second["all"], first["all"])
+        self.assertEqual(second["mismatches"], first["mismatches"])
+
+    def test_data_write_misses(self):
+        spy = self._spy()
+        self._reconcile(processes=[])
+        self.store.upsert_run(
+            {
+                "run_id": "muse:b:ws1-b",
+                "source": "muse",
+                "tier": "muse",
+                "model": "claude-sonnet-5-5",
+                "label": "ws1-b",
+                "session_id": "s-b",
+                "status": "done",
+                "started_at": self.now - 3000,
+                "ended_at": self.now - 2000,
+            }
+        )
+        self._reconcile(processes=[])
+        self.assertEqual(spy.call_count, 2)
+
+    def test_process_signature_misses(self):
+        spy = self._spy()
+        self._reconcile(processes=None)
+        self._reconcile(processes=None)
+        self._reconcile(processes=[])
+        self._reconcile(
+            processes=[{"label": "ws9-x", "pid": 4242, "started_at": self.now - 10}]
+        )
+        self.assertEqual(spy.call_count, 3)
+
+    def test_archived_set_misses(self):
+        spy = self._spy()
+        self._reconcile(processes=[], archived_ws=None)
+        self._reconcile(processes=[], archived_ws={"WS1"})
+        self.assertEqual(spy.call_count, 2)
+
+    def test_caller_mutation_does_not_poison_cache(self):
+        first = self._reconcile(processes=[])
+        first["all"]["live_agents"] = 999
+        first["mismatches"].append("bogus")
+        second = self._reconcile(processes=[])
+        self.assertIsNot(first, second)
+        self.assertNotEqual(second["all"]["live_agents"], 999)
+        self.assertNotIn("bogus", second["mismatches"])
+
+
 class Prev24hTest(unittest.TestCase):
     """Snapshot prev_24h: the 24 h before the window, like with like.
 
