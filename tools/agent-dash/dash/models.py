@@ -180,7 +180,7 @@ def _clean_id(key: str | None) -> str:
     s = str(key or "")
     s = re.sub(r"\[.*\]$", "", s)
     s = strip_thinking_suffix(s)
-    s = re.sub(r":(free|contributor)$", "", s, flags=re.IGNORECASE)
+    s = re.sub(r":[^/]*$", "", s)
     s = re.sub(r"-(free|contributor)$", "", s, flags=re.IGNORECASE)
     if "/" in s:
         s = s[s.rindex("/") + 1 :]
