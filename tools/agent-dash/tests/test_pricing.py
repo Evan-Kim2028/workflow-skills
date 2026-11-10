@@ -205,6 +205,29 @@ class CatalogTest(unittest.TestCase):
             self.assertEqual(rows[model]["confidence"], "unknown")
             self.assertFalse(status(model)["priced"])
 
+    def test_muse_placeholder_row_prices_at_the_contributor_rate(self):
+        """The muse CLI records the bare id ``muse``; its runs bill at the
+        muse-spark-1.3-contributor rate, so the row prices them instead of
+        leaving their tokens unpriced."""
+        rows = {row["model"]: row for row in load()}
+        row = rows["muse"]
+        self.assertEqual(row["provider"], "meta")
+        self.assertEqual(
+            (float(row["input"]), float(row["output"]), float(row["cache_read"])),
+            (0.10, 0.20, 0.002),
+        )
+        self.assertIsNone(row["cache_write_5m"])
+        self.assertIsNone(row["cache_write_1h"])
+        self.assertIsNone(row["reasoning"])
+        self.assertIsNone(row["long_context"])
+        self.assertFalse(row["input_includes_cache_read"])
+        self.assertEqual(row["billing_mode"], "api")
+        self.assertEqual(row["confidence"], "published")
+        self.assertEqual(row["retrieved_at"], "2026-11-10")
+        self.assertEqual(row["source_url"], "https://dev.meta.ai/docs/pricing-rate-limits")
+        self.assertTrue(status("muse")["priced"])
+        self.assertAlmostEqual(cost("muse", 1_000_000, 1_000_000, 0, 0), 0.3)
+
     def test_composer_fast_rate_is_published(self):
         """Cursor publishes Composer 2.5 (Fast) per-million rates: 3/15/0.5,
         no cache-write rate. The row prices token traffic, never zeroes it."""
