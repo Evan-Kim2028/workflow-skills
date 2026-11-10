@@ -49,6 +49,10 @@ The Linear source (`dash/sources/linear.py`) is the one outbound network call. I
 | `dash/pricing.py`, `catalog/prices.json` | core |
 | `dash/plans.py`, `plans.example.json` (`plans.local.json` replaces it) | core |
 | `dash/bundles.py`, `dash/planrender.py`, `SKILL-PLAN.md` | core |
+| `dash/admission.py` (race-safe execution leases: canonical file declarations, `admission.json` plus `admission.lock` under the state dir, claim/renew/release/reap, `admit_launch` capacity and conflict under one lock) | core |
+| `dash/evidence.py` (committed-tree evidence: contract and probe hashes, clean-tree check, bounded probe run, `receipts/<task>.json`; hashes only, never output text) | core |
+| `dash/flowview.py` (`GET /api/flow`: queue counts and blockers folded from the cached state and doctor payloads) | core |
+| `tests/test_admission.py`, `tests/test_evidence.py`, `tests/test_flowview.py`, `tests/test_control_plane_e2e.py` | core |
 | `scripts/cursor_usage_hook.py` | src-cursor |
 | `dash/sources/__init__.py` (registry, scheduler) | core |
 | `dash/rundirs.py` (run-folder registration, `run-dirs.txt`) | core |
@@ -560,6 +564,20 @@ renamed.
 `python3 agent_dash.py state [--json]` prints the same payload.
 `doctor` additionally reports each health `warnings` entry as a
 `run-dir-outside-roots` problem.
+
+`GET /api/flow` -> the execution-flow card, folded from the cached
+`/api/state` body and the latest persisted doctor run (`dash/flowview.py`):
+```json
+{"generated_at": 0,
+ "queues": [{"key": "todo", "label": "Todo", "count": 0}],
+ "blockers": [{"code": "", "ws": null, "severity": "warn", "count": 1, "title": "", "command": "python3 agent_dash.py doctor", "next": null}],
+ "workstreams": [{"id": "WS7", "title": "", "counts": {"todo": 0, "wip": 0, "pr": 0, "prog": 0, "deferred": 0}, "total": 0, "done": 0, "pct": 0}],
+ "totals": {"workstreams": 0, "tasks": 0, "done": 0, "pct": 0, "blockers": 0, "blocked_tasks": 0},
+ "empty": true}
+```
+`queues` is the fixed order `todo`, `wip`, `pr`, `prog`, `deferred`; `done` is a total, not a queue. `blockers` groups doctor problems by (code, workstream), worst severity first, and its `command`/`next` are generated from the workstream id, never copied from a stored fix string; an id that is not a plain `[A-Za-z0-9_.-]` token falls back to the project-wide command. The endpoint never rescans a plan and never runs a check, and it rides the shared TTL cache like every other heavy read.
+
+Control-plane state files, all under the state dir (`$AGENT_DASH_STATE_DIR`, default `~/.local/share/agent-dash`): `admission.json` (live execution leases, rewritten atomically under `admission.lock`), `receipts/<task>.json` (one acceptance receipt per contract task), and the dispatcher's own bundle files (`dispatch-state.json`, `inbox.jsonl`, `inbox.cursor`, `runs/<label>/`). A lease records the owner token, pid, workstream, task, the declared files and their absolute identities, and its expiry; a receipt records the task id, the contract hash, the probe hash, the git tree hash, the exit code, the duration and the sha256 of stdout and stderr. Privacy boundary: neither file carries prompt text, argv, environment values or raw probe output, and no endpoint serves either file. The flow payload carries names, counts and generated commands only.
 
 `GET /api/project` -> the project descriptor plus the computed roll-up:
 ```json

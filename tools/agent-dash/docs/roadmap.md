@@ -51,6 +51,14 @@ Orchestration tooling is done on main:
 - `/api/plan` carries `ready`, `critical_path`, and `max_parallel` (`dash/server.py:49` calls `orchestrate.plan_extra`, defined at `dash/orchestrate.py:430`; cache note at `dash/server.py:34`).
 - Workstream-orchestration skill: `skills/workstream-orchestration/SKILL.md` (principles in [orchestration.md](orchestration.md)).
 
+The control plane is landed on this branch:
+
+- File leases: a launch takes a race-safe lease over its declared files, and a second task on a held file is admission-blocked (`dash/admission.py`, `tests/test_admission.py`).
+- Contract verification: a contract task's PASS runs its acceptance probe against the committed tree and earns a receipt that an amended commit or a dirty worktree invalidates (`dash/evidence.py`, `tests/test_evidence.py`).
+- Launch admission and verification in the dispatcher: claim, renew, release, capacity-lease release, `admission-blocked` and `verification` events (`dash/dispatch.py`, `tests/test_dispatch.py`).
+- Flow projection: `GET /api/flow` folds the cached state and doctor payloads into queue counts and blockers (`dash/flowview.py`, `tests/test_flowview.py`).
+- End to end: lease, PASS, probe, receipt, `pr` and the flow projection in one test, plus the refusals (`tests/test_control_plane_e2e.py`). Contract: [control-plane.md](control-plane.md).
+
 Run and attribution items are done on main:
 
 - Run aliases: a merged cursor row stays merged across restarts. `run_aliases` table (`dash/store/base.py:435`), the merge writes alias to target (`dash/store/runs.py:577`), lookups follow the alias (`dash/store/runs.py:418-424`), and existing databases gain the table on open (`dash/store/base.py:559`).
@@ -121,6 +129,11 @@ Dependencies: V-tokens before V-tiles/V-charts; `prev_24h` after retention. Para
 ## Done: calm switcher + management table (branch `feat/dash-manage`)
 
 Owner feedback was a cluttered tab bar with no archive control in reach. The tab strip is gone: the pinned bar holds the project name, `Overall`, the selected chip, one `Workstreams (N)` switcher button (searchable, state-grouped, up to three viewer-local pins, `/` to open). Current leads with a management table (state pill, progress, live agents, last activity, depends-on, row actions; state chips, search, bulk Archive done / Pause / Resume / Mark done with one confirm and one Undo), and `POST /api/workstreams/state|bulk` plus `allowed_actions` on `GET /api/state` back it. Dropping is terminal and says so. Program bundles like OVERVIEW expose no actions.
+
+## Control plane follow-ups (not landed)
+
+- **Exact provider-token telemetry.** Goal: replace the estimated per-run token counts with the provider's own usage numbers, so a run's cost is exact rather than inferred from stream heuristics. Touch: the tier launchers (`scripts/launch_pi.py`, `scripts/launch_codex.py`, `scripts/launch_grok.sh`), the source that folds their usage, one test file. Accept: a recorded provider response and the stored run agree to the token, and an unknown provider field degrades to the current estimate rather than zero. After: none. Parallel: yes.
+- **Autonomous merge and deploy.** Goal: let the dispatcher act on its own `merge-wave` event — group the ready branches, run the scoped gate, merge through `scripts/lor_merge.py`, and watch the deploy — instead of handing the wave to the lead. Touch: `dash/dispatch.py`, a merge adapter, `tests/test_dispatch.py`, one new test file. Accept: a dry run on a temp repo plans the same merge the lead would, a red gate merges nothing, and every action is one event. After: the control plane (landed). Parallel: no, it changes the dispatcher loop.
 
 ## Decisions needed (owner)
 
