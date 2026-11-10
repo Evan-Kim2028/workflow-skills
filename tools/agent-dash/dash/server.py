@@ -342,10 +342,11 @@ class DashServer(ThreadingHTTPServer):
 
         The first ``/api/state`` otherwise pays the full usage fold, a
         dozen plan reads plus validations, and a ``ps`` storm (~0.8 s on a
-        large database). Warming at startup moves that work to process
-        start so the first request serves warm (~ms). Opt-in: tests and
-        CLIs construct ``DashServer`` without it; the serve path calls it.
-        Never raises.
+        large database); the first ``/api/runs`` and ``/api/reconcile``
+        each pay a cold fold of their own. Warming at startup moves that
+        work to process start so the first request serves warm (~ms).
+        Opt-in: tests and CLIs construct ``DashServer`` without it; the
+        serve path calls it. Never raises.
         """
         def _fill():
             try:
@@ -375,6 +376,17 @@ class DashServer(ThreadingHTTPServer):
                 # effect even when the seq already moved on).
                 since = now - 24 * 3600
                 store.snapshot_cached(now, "all", since, None, usage_group="model")
+                # The first /api/runs and /api/reconcile otherwise pay a cold
+                # fold each (p95 3.7 s and 5.9 s). Separate try blocks: one
+                # failing read must not skip the other or the workstream warm.
+                try:
+                    store.query_runs(now, None, None, None, 50)
+                except Exception:
+                    pass
+                try:
+                    store.reconcile_numbers(now, since, None, processes=processes)
+                except Exception:
+                    pass
                 try:
                     from dash.bundles import workstream_plan_ids
                     from dash.workstates import STATES, all_bundle_meta

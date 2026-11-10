@@ -17,6 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import agent_dash
 from agent_dash import default_cfg, is_dash, load_cfg, main, reconcile_if_due, run_backfill
+from dash import server as server_mod
 from dash.plans import PlanNotFound, load as load_plan, mapping as plan_mapping
 from dash.server import DashServer, PLACEHOLDER, ROOT
 from dash.sources import Registry
@@ -471,6 +472,86 @@ class ServerTest(unittest.TestCase):
         for key in ("now", "data_seq", "last_data_ts", "last_poll", "sources"):
             self.assertIn(key, data, f"tick payload misses freshness field {key}")
         conn.close()
+
+
+class _InlineThread:
+    """Run a warm thread's target on the calling thread, so a test can assert
+    on the whole path without racing a daemon."""
+
+    def __init__(self, target=None, name=None, daemon=None, **kwargs):
+        self._target = target
+
+    def start(self):
+        self._target()
+
+    def join(self, timeout=None):
+        return None
+
+
+class _InlineThreading:
+    """The real threading module with only ``Thread`` swapped for the inline
+    one; the warm path also builds ``Event`` and ``Lock`` objects."""
+
+    Thread = _InlineThread
+
+    def __getattr__(self, name):
+        return getattr(threading, name)
+
+
+class WarmPathTest(unittest.TestCase):
+    """The startup warm fills the run and reconcile caches, and one failing
+    read never skips the rest of the path."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.store = Store(Path(self.tmp.name) / "dash.sqlite")
+        self.server = DashServer(
+            self.store, Registry([]), "127.0.0.1", 0,
+            index_path=Path(self.tmp.name) / "missing.json", cfg=default_cfg(),
+        )
+
+    def tearDown(self):
+        self.server.server_close()
+        self.tmp.cleanup()
+
+    def _warm(self, runs=None, reconcile=None):
+        calls = []
+
+        def spy(name, real, override):
+            def call(*args, **kwargs):
+                calls.append((name, args, kwargs))
+                if override is not None:
+                    raise override
+                return real(*args, **kwargs)
+            return call
+
+        with mock.patch("dash.server._live_workers", return_value=[]), \
+                mock.patch.object(self.store, "query_runs", spy("runs", self.store.query_runs, runs)), \
+                mock.patch.object(self.store, "reconcile_numbers", spy("reconcile", self.store.reconcile_numbers, reconcile)), \
+                mock.patch.object(self.store, "query_workstreams", spy("workstreams", self.store.query_workstreams, None)), \
+                mock.patch.object(server_mod, "threading", _InlineThreading()):
+            self.server.warm()
+        return calls
+
+    def test_warm_fills_run_and_reconcile_caches(self):
+        calls = self._warm()
+        names = [name for name, _, _ in calls]
+        self.assertIn("runs", names)
+        self.assertIn("reconcile", names)
+        runs = next(args for name, args, _ in calls if name == "runs")
+        self.assertEqual(runs[1:], (None, None, None, 50))
+        reconcile = next(kwargs for name, _, kwargs in calls if name == "reconcile")
+        self.assertEqual(reconcile["processes"], [])
+        self.assertIn("workstreams", names)
+
+    def test_warm_survives_a_failing_run_or_reconcile_read(self):
+        for failing in ("runs", "reconcile"):
+            with self.subTest(failing=failing):
+                calls = self._warm(**{failing: RuntimeError("boom")})
+                names = [name for name, _, _ in calls]
+                self.assertIn("runs", names)
+                self.assertIn("reconcile", names)
+                self.assertIn("workstreams", names)
 
 
 class ProjectEndpointTest(unittest.TestCase):
