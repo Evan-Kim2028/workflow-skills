@@ -92,6 +92,7 @@ def parse_iso(value) -> float | None:
 _FAMILY_TOOL = {
     "beam": "beam",
     "deepseek": "deepseek",
+    "kimi": "kimi",
     "glm": "glm",
     "claude": "claude",
     "codex": "codex",
@@ -134,6 +135,8 @@ def _tool_key(run: dict) -> str | None:
         fam = _model_family(run)
         if fam == "deepseek":
             return "deepseek"
+        if fam == "kimi":
+            return "kimi"
         if fam == "beam":
             return "beam"
         if fam == "other":

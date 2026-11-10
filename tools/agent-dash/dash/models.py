@@ -1,10 +1,12 @@
 """Model families and model keys.
 
 The same rules live in ``static/models.js``. A run maps to a family (claude,
-cursor, muse, glm, deepseek, beam, codex, commandcode, dagster) and a model
-key such as ``grok-4.7`` or ``composer-2.5``. DeepSeek ids map to
+cursor, muse, glm, deepseek, kimi, beam, codex, commandcode, dagster) and a
+model key such as ``grok-4.7`` or ``composer-2.5``. DeepSeek ids map to
 ``deepseek-flash`` (including the legacy ``deepseek-v4-flash`` and
-``deepseek-v4-flash-vision-exp`` aliases) or ``deepseek-v4-pro``. Any model
+``deepseek-v4-flash-vision-exp`` aliases) or ``deepseek-v4-pro``. Morph-served
+Kimi K3.1 ids (``morph/morph-kimik31``, ``kimi-k3.1``) map to ``kimi-k3.1``.
+Any model
 id containing ``beam`` (case-insensitive) maps to the ``beam`` family under
 ``beam-<ver>`` when the id carries a version (``reflection/Beam-1.0`` reads
 ``beam-1.0``) else ``beam``, whichever harness ran it. Codex ids (``gpt-*``,
@@ -57,6 +59,17 @@ def is_deepseek_alias(model: str | None) -> bool:
     return bool(_DEEPSEEK_ALIAS.search(str(model or "")))
 
 
+#: Morph-served Kimi K3.1 ids (``morph/morph-kimik31``, ``kimi-k3.1``,
+#: ``kimi-k3``). The provider prefix hides the model name, so the family
+#: rule matches the served id itself, the way the DeepSeek alias does.
+_KIMI_ALIAS = re.compile(r"kimik31|kimi-k3(?:\.1)?", re.IGNORECASE)
+
+
+def is_kimi_alias(model: str | None) -> bool:
+    """True for a Morph-served Kimi K3.1 id."""
+    return bool(_KIMI_ALIAS.search(str(model or "")))
+
+
 #: Thinking level a harness appends to a model id (``...:xhigh``). One rule
 #: for pricing and display: strip a trailing ``:<level>``. ``dash.pricing``
 #: and ``_clean_id`` both call ``strip_thinking_suffix``, so a new level is
@@ -98,6 +111,8 @@ def model_key(model: str | None, hint: str | None = None) -> tuple[str, str]:
         if "pro" in m:
             return "deepseek", "deepseek-v4-pro"
         return "deepseek", "deepseek-flash"
+    if is_kimi_alias(m):
+        return "kimi", "kimi-k3.1"
     if "muse" in m:
         match = re.search(r"muse-(spark|wonder)(?:-full)?-(\d+(?:\.\d+)?)", m)
         return "muse", f"muse-{match.group(1)}-{match.group(2)}" if match else "muse-unknown"
@@ -140,6 +155,7 @@ _WORD = {
     "haiku": "Haiku",
     "other": "Other",
     "deepseek": "DeepSeek",
+    "kimi": "Kimi",
     "pro": "Pro",
     "codex": "Codex",
     "gpt": "GPT",
@@ -165,6 +181,7 @@ _FAM_NAMES = {
     "muse": "muse",
     "glm": "GLM",
     "deepseek": "DeepSeek",
+    "kimi": "Kimi",
     "beam": "Beam",
     "codex": "Codex",
     "commandcode": "Command Code",
@@ -218,6 +235,8 @@ def model_name(key: str | None) -> str:
             return "DeepSeek V4.1 Flash"
         if dk == "deepseek-v4-pro":
             return "DeepSeek V4 Pro"
+    if is_kimi_alias(s):
+        return "Kimi K3.1"
     parts = [w for w in _clean_id(s).split("-") if w]
     words = [_title_word(w) for w in parts]
     if len(parts) > 1 and parts[0].lower() == "gpt" and parts[1][:1].isdigit():

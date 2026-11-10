@@ -14,7 +14,7 @@ from dash.models import HARNESS_NAMES, full_name, harness_of, model_key, model_n
 from dash.pricing import cost
 from dash.projectfeed import _tool_key as _feed_tool_key
 from dash.store import _drop_launch_echoes
-from dash.store.util import _tool_key
+from dash.store.util import TOOL_KEYS, _tool_key
 
 
 class ModelKeyTest(unittest.TestCase):
@@ -122,6 +122,63 @@ class BeamFamilyTest(unittest.TestCase):
             self.assertIsNotNone(cost(model, 100000, 5000, 80000, 0), model)
             self.assertEqual(_tool_key(run), "grok", model)
             self.assertEqual(_feed_tool_key(run), "grok", model)
+
+
+class KimiFamilyTest(unittest.TestCase):
+    """Morph serves Kimi K3.1 under morph-kimik31*; it is a first-class family."""
+
+    MODELS = ("morph/morph-kimik31", "morph/morph-kimik31:low", "morph-kimik31", "kimi-k3.1", "kimi-k3")
+
+    def test_kimi_ids_map_to_the_kimi_family(self):
+        for model in self.MODELS:
+            self.assertEqual(model_key(model), ("kimi", "kimi-k3.1"), model)
+            self.assertEqual(model_name(model), "Kimi K3.1", model)
+            self.assertEqual(full_name(model), "Kimi K3.1", model)
+
+    def test_kimi_tool_lane_in_pi_and_grok_build(self):
+        self.assertIn("kimi", TOOL_KEYS)
+        for run in (
+            {"source": "pi", "tier": "pi-kimi", "model": "morph/morph-kimik31"},
+            {"source": "pi", "tier": "pi", "model": "morph/morph-kimik31:low"},
+            {"source": "glm", "tier": "kimi-k3.1", "model": "morph/morph-kimik31"},
+            {"source": "glm", "tier": "glm", "model": "morph/morph-kimik31"},
+        ):
+            self.assertEqual(_tool_key(run), "kimi", run)
+            self.assertEqual(_feed_tool_key(run), "kimi", run)
+
+    def test_kimi_harness_stays_pi_and_grok_build(self):
+        self.assertEqual(harness_of({"source": "pi", "tier": "pi-kimi", "model": "morph/morph-kimik31"}), "pi")
+        self.assertEqual(harness_of({"source": "glm", "tier": "kimi-k3.1", "model": "morph/morph-kimik31"}), "grok-cli")
+
+    def test_kimi_prices_from_the_morph_catalog(self):
+        self.assertAlmostEqual(cost("morph/morph-kimik31", 1_000_000, 1_000_000, 0, 0), 16.5, places=9)
+
+    def test_models_js_kimi_family(self):
+        script = (
+            "const fs=require('fs');"
+            "global.window=globalThis;"
+            "eval(fs.readFileSync(process.argv[1],'utf8'));"
+            "const assert=require('assert');"
+            "const ADM=window.ADM;"
+            "assert.deepStrictEqual(ADM.keyOf('morph/morph-kimik31'),['kimi','kimi-k3.1']);"
+            "assert.deepStrictEqual(ADM.keyOf('morph/morph-kimik31:low'),['kimi','kimi-k3.1']);"
+            "assert.deepStrictEqual(ADM.keyOf('kimi-k3'),['kimi','kimi-k3.1']);"
+            "assert.strictEqual(ADM.nameOf('morph/morph-kimik31'),'Kimi K3.1');"
+            "assert.strictEqual(ADM.nameOf('kimi-k3.1'),'Kimi K3.1');"
+            "assert.strictEqual(ADM.fullName('morph/morph-kimik31'),'Kimi K3.1');"
+            "assert.strictEqual(ADM.famOf('kimi-k3.1'),'kimi');"
+            "assert.strictEqual(ADM.FAM.kimi.hue,'--s12');"
+            "assert.deepStrictEqual(ADM.FAM.kimi.order,['kimi-k3.1']);"
+            "assert.strictEqual(ADM.FAMS.indexOf('kimi'),ADM.FAMS.indexOf('beam')+1);"
+            "console.log('models kimi family proof ok');"
+        )
+        proc = subprocess.run(
+            ["node", "-e", script, str(STATIC / "models.js")],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr or proc.stdout)
+        self.assertIn("models kimi family proof ok", proc.stdout)
 
 
 class HarnessTest(unittest.TestCase):

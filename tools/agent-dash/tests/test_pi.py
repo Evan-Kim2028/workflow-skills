@@ -811,6 +811,9 @@ class ModelTierTest(unittest.TestCase):
         self.assertEqual(pi._model_tier("river/deepseek-ai/DeepSeek-V4.1-Flash-1017"), "deepseek")
         self.assertEqual(pi._model_tier(MORPH), "deepseek")
         self.assertEqual(pi._model_tier("morph/morph-dsv41flash"), "deepseek")
+        self.assertEqual(pi._model_tier("morph/morph-kimik31"), "kimi")
+        self.assertEqual(pi._model_tier("morph/morph-kimik31:low"), "kimi")
+        self.assertEqual(pi._model_tier("kimi-k3.1"), "kimi")
         self.assertEqual(pi._model_tier(None), "pi")
 
     def test_store_family_tier_matches_source(self):
@@ -834,6 +837,7 @@ class ModelTierTest(unittest.TestCase):
         self.assertIsNone(_family_tier("pi", None))
 
     def test_tier_of_prefers_the_recorded_tier(self):
+        self.assertEqual(pi._tier_of({"tier": "pi-kimi", "model": "morph/morph-kimik31"}), "pi-kimi")
         self.assertEqual(pi._tier_of({"tier": "pi-beam", "model": DEEPSEEK}), "pi-beam")
         self.assertEqual(pi._tier_of({"meta": {"tier": "pi-deepseek"}, "model": GLM}), "pi-deepseek")
         self.assertEqual(pi._tier_of({"model": DEEPSEEK}), "deepseek")

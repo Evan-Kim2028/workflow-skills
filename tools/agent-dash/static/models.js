@@ -10,7 +10,7 @@
    tier when the source is generic; a run view carrying harness wins. */
 (function (global) {
   "use strict";
-  var FAMS = ["claude", "cursor", "muse", "glm", "deepseek", "beam", "codex", "commandcode", "dagster", "other"];
+  var FAMS = ["claude", "cursor", "muse", "glm", "deepseek", "beam", "kimi", "codex", "commandcode", "dagster", "other"];
   var FAM = {
     claude: {name: "Claude", hue: "--s1", order: ["opus", "fable", "sonnet", "haiku"]},
     cursor: {name: "Cursor", hue: "--s4", order: ["grok-4.7", "composer-2.5"]},
@@ -18,12 +18,13 @@
     glm: {name: "GLM", hue: "--s6", order: ["glm-5.3", "glm-5.3-flash"]},
     deepseek: {name: "DeepSeek", hue: "--s8", order: ["deepseek-flash", "deepseek-v4-pro"]},
     beam: {name: "Beam", hue: "--s11", order: ["beam-1.0", "beam"]},
+    kimi: {name: "Kimi", hue: "--s12", order: ["kimi-k3.1"]},
     codex: {name: "Codex", hue: "--s9", order: ["gpt-6.1-sol", "gpt-6-luna"]},
     commandcode: {name: "Command Code", hue: "--s10", order: ["minimax/minimax-m3.1-flash:free", "ornith/ornith-1.5-122b:free", "poolside/laguna-s-2.1-free", "stealth/glyph-cluster:free"]},
     dagster: {name: "Dagster", hue: "--s7", order: []},
     other: {name: "Other", hue: "--other", order: ["other"]}
   };
-  var WORD = {grok: "Grok", composer: "Composer", glm: "GLM", flash: "Flash", beam: "Beam", spark: "Spark", wonder: "Wonder", muse: "muse", opus: "Opus", fable: "Fable", sonnet: "Sonnet", haiku: "Haiku", other: "Other", deepseek: "DeepSeek", pro: "Pro", codex: "Codex", gpt: "GPT", sol: "Sol", luna: "Luna", astra: "Astra", terra: "Terra", reserve: "Reserve", auto: "Auto", review: "Review", claude: "Claude", minimax: "MiniMax", ornith: "Ornith", laguna: "Laguna", glyph: "Glyph", cluster: "Cluster", s: "S"};
+  var WORD = {grok: "Grok", composer: "Composer", glm: "GLM", flash: "Flash", beam: "Beam", spark: "Spark", wonder: "Wonder", muse: "muse", opus: "Opus", fable: "Fable", sonnet: "Sonnet", haiku: "Haiku", other: "Other", deepseek: "DeepSeek", kimi: "Kimi", pro: "Pro", codex: "Codex", gpt: "GPT", sol: "Sol", luna: "Luna", astra: "Astra", terra: "Terra", reserve: "Reserve", auto: "Auto", review: "Review", claude: "Claude", minimax: "MiniMax", ornith: "Ornith", laguna: "Laguna", glyph: "Glyph", cluster: "Cluster", s: "S"};
   /* Harness display names. harnessOf reads the runner from a run row
      (dash/models.py harness_of mirrors it); a run view carrying harness
      wins, so server and page never disagree. */
@@ -70,6 +71,10 @@
        prefix hides the model name, so the served id names the family.
        Mirrors is_deepseek_alias in dash/models.py. */
     if (/deepseek|dsv41flash/.test(m)) { return ["deepseek", /pro/.test(m) ? "deepseek-v4-pro" : "deepseek-flash"]; }
+    /* Morph serves Kimi K3.1 under morph-kimik31*; the provider prefix hides
+       the model name, so the served id names the family. Mirrors
+       is_kimi_alias in dash/models.py. */
+    if (/kimik31|kimi-k3(?:\.1)?/.test(m)) return ["kimi", "kimi-k3.1"];
     if (/muse/.test(m)) { v = /muse-(spark|wonder)(?:-full)?-(\d+(?:\.\d+)?)/.exec(m); return ["muse", v ? "muse-" + v[1] + "-" + v[2] : "muse-unknown"]; }
     if (/codex/.test(h) || m === "codex-unknown") return ["codex", m || "codex-unknown"];
     if (/^gpt-/.test(m) || m === "gpt-reserve" || /^codex-/.test(m)) return ["codex", m];
@@ -122,6 +127,7 @@
       if (dk === "deepseek-flash") return "DeepSeek V4.1 Flash";
       if (dk === "deepseek-v4-pro") return "DeepSeek V4 Pro";
     }
+    if (/kimik31|kimi-k3(?:\.1)?/i.test(key)) return "Kimi K3.1";
     var parts = cleanId(key).split("-").filter(function (w) { return w !== ""; });
     var words = parts.map(titleWord);
     if (parts.length > 1 && parts[0].toLowerCase() === "gpt" && /^\d/.test(parts[1])) {

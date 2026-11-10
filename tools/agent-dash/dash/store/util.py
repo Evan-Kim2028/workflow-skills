@@ -10,7 +10,7 @@ import re
 from datetime import datetime
 
 
-TOOL_KEYS = ("grok", "muse", "glm", "claude", "deepseek", "codex", "beam", "commandcode", "other")
+TOOL_KEYS = ("grok", "muse", "glm", "claude", "deepseek", "kimi", "codex", "beam", "commandcode", "other")
 
 
 FINISHED = ("done", "killed", "died_early")
@@ -209,6 +209,7 @@ def _billed_total(tokens: dict) -> int:
 _FAMILY_TOOL = {
     "beam": "beam",
     "deepseek": "deepseek",
+    "kimi": "kimi",
     "glm": "glm",
     "claude": "claude",
     "codex": "codex",
@@ -257,7 +258,7 @@ def _tool_key(run: dict) -> str | None:
 #: one is a Grok Build run whatever family its model belongs to, so the
 #: per-harness totals count it under the tool that actually ran it.
 GROK_BUILD_TIERS = frozenset(
-    ("deepseek-flash", "glm-flash", "glm", "beam", "reflection-beam", "grok-build-47")
+    ("deepseek-flash", "glm-flash", "glm", "beam", "reflection-beam", "grok-build-47", "kimi-k3.1")
 )
 
 
@@ -267,8 +268,9 @@ def _grok_cli_key(run: dict) -> str:
     The family comes from the one derivation in ``dash.models`` (lazy import:
     this module takes no dash imports at load): ``grok-*`` runs count as
     ``grok`` (the Grok lane, beside the cursor-agent Grok runs),
-    ``deepseek-*`` runs count as ``deepseek``, ``beam-*`` runs count as
-    ``beam``, ``glm-*`` and unrecorded models stay ``glm``, and any other
+    ``deepseek-*`` runs count as ``deepseek``, ``kimi-*`` runs count as
+    ``kimi``, ``beam-*`` runs count as ``beam``, ``glm-*`` and unrecorded
+    models stay ``glm``, and any other
     grok-hosted id (``mimo-*``, ``step-*``) counts as ``other``.
     """
     from dash.models import model_key
@@ -285,6 +287,8 @@ def _grok_cli_key(run: dict) -> str:
     fam = _model_family(run)
     if fam == "deepseek":
         return "deepseek"
+    if fam == "kimi":
+        return "kimi"
     if fam == "beam":
         return "beam"
     if fam == "other":
