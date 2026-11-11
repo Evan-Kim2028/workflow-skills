@@ -34,17 +34,20 @@
 #     one entry per hook and never touches other settings.
 #
 #   sh tools/agent-dash/scripts/install_hooks.sh --codex-shim
-#     once per machine: copies the `muse` label-guard shim to
-#     ~/.local/share/agent-dash/bin/muse and prints the PATH line that
-#     puts it first. Codex documents no user-configurable pre-exec hook
-#     surface in its installed docs/--help, so the shim (which refuses
-#     `muse exec --prompt-file <bad-label>.md` before execing the real
-#     binary) is the structural guard there. Raw TSV appends from Codex
-#     stay unguarded: the residual gap. This flag edits no shell rc and
-#     no Codex config; enabling the PATH line is the owner's step.
+#     once per machine: copies the `muse` label-guard shim and the `cg`
+#     worktree-aware codegraph shim to ~/.local/share/agent-dash/bin/ and
+#     prints the PATH line that puts them first. Codex documents no
+#     user-configurable pre-exec hook surface in its installed docs/--help,
+#     so the muse shim (which refuses `muse exec --prompt-file
+#     <bad-label>.md` before execing the real binary) is the structural
+#     guard there. Raw TSV appends from Codex stay unguarded: the residual
+#     gap. The cg shim runs read subcommands against the main checkout's
+#     index from a worktree and refuses index writes there. This flag edits
+#     no shell rc and no Codex config; enabling the PATH line is the owner's
+#     step.
 #
 #   sh tools/agent-dash/scripts/install_hooks.sh --uninstall
-#     removes the grok hook file, the muse plugin, the shim copy, and
+#     removes the grok hook file, the muse plugin, the shim copies, and
 #     the lead-guard entries from ~/.claude/settings.json (other settings
 #     entries stay). Config backups (*.bak-*) are left in place.
 #
@@ -238,21 +241,28 @@ fi
 
 if [ "${1:-}" = "--codex-shim" ]; then
     HERE="$(cd "$(dirname "$0")" && pwd)"
-    SRC="$HERE/../shims/muse"
-    [ -f "$SRC" ] || { echo "install_hooks: no shim at $SRC" >&2; exit 2; }
     DESTDIR="$HOME/.local/share/agent-dash/bin"
-    DEST="$DESTDIR/muse"
     mkdir -p "$DESTDIR" || { echo "install_hooks: cannot create $DESTDIR" >&2; exit 1; }
-    if [ -f "$DEST" ] && cmp -s "$SRC" "$DEST"; then
-        echo "install_hooks: codex shim already installed at $DEST"
-    else
-        cp "$SRC" "$DEST" || { echo "install_hooks: cannot write $DEST" >&2; exit 1; }
-        chmod +x "$DEST"
-        echo "install_hooks: muse label-guard shim installed at $DEST"
-    fi
-    echo "install_hooks: to enable, put it first on PATH in new shells:"
+    for name in muse cg; do
+        SRC="$HERE/../shims/$name"
+        DEST="$DESTDIR/$name"
+        [ -f "$SRC" ] || { echo "install_hooks: no shim at $SRC" >&2; exit 2; }
+        if [ -f "$DEST" ] && cmp -s "$SRC" "$DEST"; then
+            chmod +x "$DEST"
+            echo "install_hooks: $name shim already installed at $DEST"
+        else
+            TMP="$DEST.tmp.$$"
+            cp "$SRC" "$TMP" || { echo "install_hooks: cannot write $DEST" >&2; rm -f "$TMP"; exit 1; }
+            chmod +x "$TMP"
+            # Atomic rename: a concurrent worker never execs a half copy.
+            mv "$TMP" "$DEST" || { echo "install_hooks: cannot write $DEST" >&2; rm -f "$TMP"; exit 1; }
+            echo "install_hooks: $name shim installed at $DEST"
+        fi
+    done
+    echo "install_hooks: to enable, put them first on PATH in new shells:"
     echo "install_hooks:   export PATH=\"$DESTDIR:\$PATH\""
     echo "install_hooks: then verify with: PATH=\"$DESTDIR:\$PATH\" command -v muse"
+    echo "install_hooks: and:               PATH=\"$DESTDIR:\$PATH\" command -v cg"
     exit 0
 fi
 
@@ -301,8 +311,10 @@ EOF
     if command -v muse >/dev/null 2>&1 && muse plugins list --json 2>/dev/null | grep -q '"label-guard"'; then
         muse plugins remove label-guard 2>&1 | head -n 3 || echo "install_hooks: muse plugin remove failed" >&2
     fi
-    SFILE="$HOME/.local/share/agent-dash/bin/muse"
-    [ -f "$SFILE" ] && rm -f "$SFILE" && echo "install_hooks: removed $SFILE"
+    for name in muse cg; do
+        SFILE="$HOME/.local/share/agent-dash/bin/$name"
+        [ -f "$SFILE" ] && rm -f "$SFILE" && echo "install_hooks: removed $SFILE"
+    done
     echo "install_hooks: uninstall done (backups *.bak-* left in place)"
     exit 0
 fi

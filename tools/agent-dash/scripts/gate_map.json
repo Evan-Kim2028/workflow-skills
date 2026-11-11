@@ -278,7 +278,8 @@
     "scripts/install_hooks.sh": [
       "test_gate",
       "test_label_guard_hook",
-      "test_label_guard_clis"
+      "test_label_guard_clis",
+      "test_cg_shim"
     ],
     "scripts/label_guard_hook.py": [
       "test_label_guard_hook",
@@ -342,6 +343,9 @@
     ],
     "shims/**": [
       "test_label_guard_clis"
+    ],
+    "shims/cg": [
+      "test_cg_shim"
     ],
     "static/*": [
       "test_page_rules",
