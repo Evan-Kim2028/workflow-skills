@@ -289,6 +289,12 @@
       "test_label_guard_hook",
       "test_label_guard_clis"
     ],
+    "scripts/laptop_janitor.py": [
+      "test_laptop_janitor"
+    ],
+    "docs/laptop-janitor.md": [
+      "test_page_rules"
+    ],
     "scripts/launch_cmd.py": [
       "test_commandcode",
       "test_label_guard_clis"
