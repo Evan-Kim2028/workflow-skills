@@ -687,9 +687,10 @@ function analyzeParsed(
   const noTargets = p.targets.length === 0;
 
   if (pipedIn && noTargets) {
-    // A search over a pipe: content pipes are fine, file listings are not.
+    // A search over a pipe: content pipes are fine. A plain grep reading a
+    // file listing only filters names; `xargs grep` over it searches contents.
     const src = pipeSource(prevChain);
-    if (src.kind === "listing") {
+    if (src.kind === "listing" && label.startsWith("xargs ")) {
       if (baseName(commandWords(src.words)[0] ?? "") === "find" && findDocsOnly(src.words)) {
         return { search: false };
       }
