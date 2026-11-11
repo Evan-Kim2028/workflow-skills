@@ -50,6 +50,9 @@ DEFAULTS = {
     "tier": "auto",
     "workspace": None,
     "paused": False,
+    "retry_tier": "same",
+    "retry_wait_s": 90,
+    "quota_retries": 8,
     "merge_wave": {"min_ready": 3, "max_age_min": 60},
 }
 DEFAULT_MAX_WAIT = 3600
@@ -220,6 +223,15 @@ def load_config(bundle: Path) -> dict:
         cfg["merge_wave"] = {"min_ready": int(merge["min_ready"]), "max_age_min": float(merge["max_age_min"])}
     except (TypeError, ValueError) as exc:
         raise ValueError(f"dispatch.json has a non-numeric slots or merge_wave: {exc}") from exc
+    if cfg["retry_tier"] not in ("same", "auto"):
+        raise ValueError(f"dispatch.json has a bad retry_tier {cfg['retry_tier']!r}: use same or auto")
+    try:
+        cfg["retry_wait_s"] = float(cfg["retry_wait_s"])
+        cfg["quota_retries"] = int(cfg["quota_retries"])
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"dispatch.json has a non-numeric retry_wait_s or quota_retries: {exc}") from exc
+    if cfg["retry_wait_s"] < 0 or cfg["quota_retries"] < 0:
+        raise ValueError("dispatch.json retry_wait_s and quota_retries must be non-negative")
     return cfg
 
 
@@ -599,7 +611,9 @@ class Dispatcher:
                 break
             if task.get("status") != "retry-pending":
                 continue
-            outcome = self._try_retry(tid, task, task.get("retry_from") or task.get("tier") or cfg["tier"], cfg)
+            outcome = self._try_retry(
+                tid, task, task.get("retry_from") or task.get("tier") or cfg["tier"], cfg, task.get("retry_reason") or "no-verdict"
+            )
             if outcome == "none-available":
                 break
             if outcome == "ok":
@@ -683,8 +697,14 @@ class Dispatcher:
                 return rnd, label, pid
             rnd += 1
 
-    def launch(self, task_id: str, cfg: dict, retry_from=None) -> str:
-        """Launch one task's worker. Returns ``ok``, ``none-available`` or ``failed``."""
+    def launch(self, task_id: str, cfg: dict, retry_from=None, retry_reason="no-verdict") -> str:
+        """Launch one task's worker. Returns ``ok``, ``none-available`` or ``failed``.
+
+        A retry relaunches on the tier the task ran on (``retry_tier: same``,
+        the default) with no ``--exclude``, or on ``auto`` excluding the
+        failed tier (``retry_tier: auto``). A quota retry never consumes the
+        one no-verdict retry: its attempt number is unchanged.
+        """
         meta, body = parse_prompt(self.prompt_path(task_id).read_text(encoding="utf-8"))
         kind = meta.get("kind") or "write"
         if kind not in KINDS:
@@ -699,14 +719,24 @@ class Dispatcher:
         except ValueError as exc:
             raise ValueError(f"prompt max_wait {meta.get('max_wait')!r} is not a number") from exc
         launches = int(prev.get("launches") or 0)
-        attempt = int(prev.get("attempt") or 0) + 1 if retry_from else 1
+        if retry_from and retry_reason == "quota":
+            attempt = int(prev.get("attempt") or 0) or 1
+        elif retry_from:
+            attempt = int(prev.get("attempt") or 0) + 1
+        else:
+            attempt = 1
         rnd, label, live_pid = self._claim_round(task_id, launches)
         verdict = label_lib.check(label, ws=self.ws)
         if not verdict["ok"]:
             raise ValueError(f"bad label {label}: {verdict['fix']}")
-        exclude = [retry_from] if retry_from else []
-        if retry_from:
+        if retry_from and cfg.get("retry_tier", "same") == "auto":
             tier = "auto"
+            exclude = [retry_from]
+        elif retry_from:
+            tier = retry_from or tier
+            exclude = []
+        else:
+            exclude = []
         if self.dry:
             self.emit("would-launch", task=task_id, label=label, tier=tier, kind=kind, workspace=str(workspace))
             return "ok"
@@ -721,6 +751,7 @@ class Dispatcher:
             "tier": tier,
             "requested": tier,
             "attempt": attempt,
+            "quota_retries": int(prev.get("quota_retries") or 0) + (1 if (retry_from and retry_reason == "quota") else 0),
             "launches": rnd + 1,
             "kind": kind,
             "workspace": str(workspace),
@@ -759,19 +790,28 @@ class Dispatcher:
             self._error(task_id, "status", f"could not mark wip: {exc}")
         self.emit("launched", task=task_id, label=label, tier=record["tier"], attempt=attempt, kind=kind, adopted=live_pid is not None)
         if retry_from:
-            self.emit("retried", task=task_id, label=label, from_tier=retry_from, to_tier=record["tier"], reason="no-verdict")
-            self._decision_row(task_id, label, retry_from, record["tier"])
+            self.emit("retried", task=task_id, label=label, from_tier=retry_from, to_tier=record["tier"], reason=retry_reason)
+            self._decision_row(task_id, label, retry_from, record["tier"], retry_reason, cfg.get("retry_tier", "same"))
         return "ok"
 
-    def _decision_row(self, task_id: str, label: str, from_tier: str, to_tier: str) -> None:
+    def _decision_row(self, task_id: str, label: str, from_tier: str, to_tier: str, reason: str, mode: str) -> None:
         path = self.bundle / "reports" / "decisions.tsv"
         path.parent.mkdir(parents=True, exist_ok=True)
         if not path.is_file():
             path.write_text("ts\tdecision\twhy\tevidence\n", encoding="utf-8")
+        if mode == "auto":
+            decision = f"retry {task_id} as {label} on auto, excluding {from_tier} (now {to_tier})"
+        else:
+            decision = f"retry {task_id} as {label} on {to_tier}, same tier (was {from_tier})"
+        why = (
+            "run ended on a quota/rate-limit hit; waiting out the cooldown before relaunching"
+            if reason == "quota"
+            else "run ended with no PASS/PARTIAL/BLOCKED verdict"
+        )
         row = [
             _now_iso(self.now()),
-            f"retry {task_id} as {label} on auto, excluding {from_tier} (now {to_tier})",
-            "first attempt ended with no PASS/PARTIAL/BLOCKED verdict",
+            decision,
+            why,
             str(self.bundle / "runs" / label),
         ]
         with path.open("a", encoding="utf-8") as fh:
@@ -826,12 +866,26 @@ class Dispatcher:
             self._release_lease(task)
             self._move_needs_lead(task_id, task, verdict)
             return
+        if status["reason"] == "quota":
+            self._release_lease(task)
+            if int(task.get("quota_retries") or 0) >= int(cfg.get("quota_retries", 8)):
+                self._move_needs_lead(task_id, task, "rate-limited")
+                return
+            task["status"] = "retry-pending"
+            task["retry_from"] = tier
+            task["retry_reason"] = "quota"
+            task["retry_after"] = now + float(cfg.get("retry_wait_s", 90))
+            if not cfg["paused"]:
+                self._try_retry(task_id, task, tier, cfg, "quota")
+            return
         if task["attempt"] < 2:
             self._release_lease(task)
             task["status"] = "retry-pending"
             task["retry_from"] = tier
+            task["retry_reason"] = "no-verdict"
+            task.pop("retry_after", None)
             if not cfg["paused"]:
-                self._try_retry(task_id, task, tier, cfg)
+                self._try_retry(task_id, task, tier, cfg, "no-verdict")
             return
         self._release_lease(task)
         self._move_needs_lead(task_id, task, "no-verdict-twice")
@@ -840,10 +894,18 @@ class Dispatcher:
         task["status"] = "needs-lead"
         self.emit("needs-lead", task=task_id, label=task["label"], reason=reason)
 
-    def _try_retry(self, task_id: str, task: dict, failed_tier: str, cfg: dict) -> str:
-        """Relaunch a no-verdict task on another tier. A failed relaunch becomes needs-lead."""
+    def _try_retry(self, task_id: str, task: dict, failed_tier: str, cfg: dict, reason: str = "no-verdict") -> str:
+        """Relaunch a no-verdict task: same tier by default, ``auto`` excluding
+        the failed tier when ``retry_tier`` is ``auto``. A quota retry waits
+        out ``retry_wait_s`` first (``"waiting"``, slot left free) and never
+        consumes the one no-verdict retry. A failed relaunch becomes needs-lead.
+        """
+        if reason == "quota":
+            wait_until = task.get("retry_after")
+            if wait_until is not None and self.now() < wait_until:
+                return "waiting"
         try:
-            outcome = self.launch(task_id, cfg, retry_from=failed_tier)
+            outcome = self.launch(task_id, cfg, retry_from=failed_tier, retry_reason=reason)
         except Exception as exc:
             self._error(task_id, "retry", str(exc))
             outcome = "failed"
