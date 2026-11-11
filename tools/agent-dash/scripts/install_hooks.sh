@@ -46,10 +46,21 @@
 #     no shell rc and no Codex config; enabling the PATH line is the owner's
 #     step.
 #
+#   sh tools/agent-dash/scripts/install_hooks.sh --pi-cg-gate
+#     once per machine: installs the pi extension that blocks recursive or
+#     multi-file code search until CodeGraph has run once in the session
+#     (plugins/pi-cg-gate/ copied to <agent dir>/extensions/cg-gate/). The
+#     agent dir is PI_CODING_AGENT_DIR, default ~/.pi/agent. Idempotent:
+#     a re-run with identical files changes nothing, and the destination
+#     directory is kept in place while each changed file is replaced by an
+#     atomic rename (temp file in the same directory). Takes effect in new
+#     pi sessions.
+#
 #   sh tools/agent-dash/scripts/install_hooks.sh --uninstall
-#     removes the grok hook file, the muse plugin, the shim copies, and
-#     the lead-guard entries from ~/.claude/settings.json (other settings
-#     entries stay). Config backups (*.bak-*) are left in place.
+#     removes the grok hook file, the muse plugin, the shim copies, the pi
+#     cg-gate extension, and the lead-guard entries from
+#     ~/.claude/settings.json (other settings entries stay). Config backups
+#     (*.bak-*) are left in place.
 #
 # The pre-push install refuses to overwrite a foreign hook (one without
 # the marker below); remove or merge that hook by hand first.
@@ -266,6 +277,53 @@ if [ "${1:-}" = "--codex-shim" ]; then
     exit 0
 fi
 
+if [ "${1:-}" = "--pi-cg-gate" ]; then
+    HERE="$(cd "$(dirname "$0")" && pwd)"
+    SRC="$HERE/../plugins/pi-cg-gate"
+    [ -f "$SRC/index.ts" ] || { echo "install_hooks: no pi cg-gate extension at $SRC" >&2; exit 2; }
+    AGENT_DIR="${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}"
+    EXTDIR="$AGENT_DIR/extensions"
+    DEST="$EXTDIR/cg-gate"
+    # Keep DEST in place: a concurrent pi session must always find the
+    # directory, and a failed update must never leave it missing.
+    mkdir -p "$DEST" || { echo "install_hooks: cannot create $DEST" >&2; exit 1; }
+    changed=0
+    for SRC_FILE in "$SRC"/*; do
+        [ -f "$SRC_FILE" ] || continue
+        NAME=$(basename "$SRC_FILE")
+        TARGET="$DEST/$NAME"
+        if [ -f "$TARGET" ] && cmp -s "$SRC_FILE" "$TARGET"; then
+            continue
+        fi
+        TMP="$DEST/.$NAME.tmp.$$"
+        cp "$SRC_FILE" "$TMP" || {
+            echo "install_hooks: cannot write $TARGET" >&2
+            rm -f "$TMP"
+            exit 1
+        }
+        # Atomic rename inside the destination directory: a reader sees the
+        # old file or the new one, never a half copy.
+        if ! mv "$TMP" "$TARGET"; then
+            echo "install_hooks: cannot write $TARGET" >&2
+            rm -f "$TMP"
+            exit 1
+        fi
+        changed=1
+    done
+    # Drop files this version no longer ships.
+    for DEST_FILE in "$DEST"/*; do
+        [ -f "$DEST_FILE" ] || continue
+        NAME=$(basename "$DEST_FILE")
+        [ -f "$SRC/$NAME" ] || rm -f "$DEST_FILE"
+    done
+    if [ "$changed" -eq 1 ]; then
+        echo "install_hooks: pi cg-gate extension installed at $DEST (takes effect in new pi sessions)"
+    else
+        echo "install_hooks: pi cg-gate extension already installed at $DEST"
+    fi
+    exit 0
+fi
+
 if [ "${1:-}" = "--uninstall" ]; then
     GFILE="$HOME/.grok/hooks/label-guard.json"
     [ -f "$GFILE" ] && rm -f "$GFILE" && echo "install_hooks: removed $GFILE"
@@ -315,12 +373,14 @@ EOF
         SFILE="$HOME/.local/share/agent-dash/bin/$name"
         [ -f "$SFILE" ] && rm -f "$SFILE" && echo "install_hooks: removed $SFILE"
     done
+    PI_EXT="${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}/extensions/cg-gate"
+    [ -d "$PI_EXT" ] && rm -rf "$PI_EXT" && echo "install_hooks: removed $PI_EXT"
     echo "install_hooks: uninstall done (backups *.bak-* left in place)"
     exit 0
 fi
 
 if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
-    echo "usage: sh tools/agent-dash/scripts/install_hooks.sh [--claude-label-guard|--claude-lead-guard|--grok-label-guard|--muse-label-guard|--codex-shim|--uninstall]"
+    echo "usage: sh tools/agent-dash/scripts/install_hooks.sh [--claude-label-guard|--claude-lead-guard|--grok-label-guard|--muse-label-guard|--codex-shim|--pi-cg-gate|--uninstall]"
     exit 0
 fi
 

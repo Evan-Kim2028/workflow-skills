@@ -257,6 +257,9 @@
       "test_server",
       "test_ws_cli"
     ],
+    "plugins/pi-cg-gate/**": [
+      "test_pi_cg_gate"
+    ],
     "plugins/**": [
       "test_label_guard_clis"
     ],
@@ -279,7 +282,8 @@
       "test_gate",
       "test_label_guard_hook",
       "test_label_guard_clis",
-      "test_cg_shim"
+      "test_cg_shim",
+      "test_pi_cg_gate"
     ],
     "scripts/label_guard_hook.py": [
       "test_label_guard_hook",
