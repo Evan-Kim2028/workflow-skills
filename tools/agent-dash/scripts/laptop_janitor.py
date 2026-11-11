@@ -43,6 +43,9 @@ DEFAULTS = {
     "sweeper_budget_seconds": 1200,
     "pg_min_age_hours": 24,
     "tmp_min_age_days": 2,
+    "session_min_age_days": 7,
+    "tmp_age_scan_max_entries": 200000,
+    "snapshot_max_age_seconds": 120,
     "worktree_min_idle_days": 3,
     "scratch_min_age_days": 3,
     "tmp_protect_globs": [],
@@ -165,6 +168,9 @@ CONFIG_TYPES = {
     "sweeper_budget_seconds": float,
     "pg_min_age_hours": float,
     "tmp_min_age_days": float,
+    "session_min_age_days": float,
+    "tmp_age_scan_max_entries": int,
+    "snapshot_max_age_seconds": float,
     "worktree_min_idle_days": float,
     "scratch_min_age_days": float,
     "tmp_protect_globs": "strlist",
@@ -273,17 +279,75 @@ def parse_ps(text):
     return out
 
 
-class Snapshot:
-    """One process snapshot for the whole run."""
+PRIVATE_PREFIXES = ("/private/tmp", "/private/var", "/private/etc")
+SHORT_PREFIXES = ("/tmp", "/var", "/etc")
 
-    def __init__(self, ok=True, procs=None, cwds=None, error=""):
+
+def _short_long_forms(path):
+    """The path plus its other /private-prefixed or short form."""
+    out = [path]
+    for long_prefix, short_prefix in zip(PRIVATE_PREFIXES, SHORT_PREFIXES):
+        if path == long_prefix or path.startswith(long_prefix + os.sep):
+            out.append(short_prefix + path[len(long_prefix):])
+        if path == short_prefix or path.startswith(short_prefix + os.sep):
+            out.append("/private" + path)
+    return out
+
+
+def path_forms(path):
+    """Every form of ``path`` a process may use: as given, real, short, long."""
+    forms = []
+    for base in (path, os.path.realpath(path)):
+        for form in _short_long_forms(base):
+            if form and form not in forms:
+                forms.append(form)
+    return forms
+
+
+class Snapshot:
+    """One process snapshot for the whole run.
+
+    The first lookup builds two cheap indexes: every ancestor directory of
+    every process working directory (all path forms), and one joined string
+    of all arguments. The common call (no ignored PIDs) is then a set lookup
+    plus a substring test instead of a loop over every process.
+    """
+
+    def __init__(self, ok=True, procs=None, cwds=None, error="", own_pid=None):
         self.ok = ok
         self.procs = procs or {}
         self.cwds = cwds or {}
         self.error = error
+        self.own_pid = os.getpid() if own_pid is None else own_pid
+        self._dirs = None
+        self._args = ""
 
     def children(self, pid):
         return [p for p, proc in self.procs.items() if proc.get("ppid") == pid]
+
+    def index(self):
+        """(set of ancestor dirs of every cwd, joined arguments)."""
+        if self._dirs is None:
+            dirs = set()
+            args = []
+            for pid, proc in self.procs.items():
+                if pid == self.own_pid:
+                    continue
+                args.append(proc.get("args") or "")
+                cwd = self.cwds.get(pid)
+                if not cwd:
+                    continue
+                for form in path_forms(cwd):
+                    cur = form
+                    while True:
+                        dirs.add(cur)
+                        parent = os.path.dirname(cur)
+                        if parent == cur:
+                            break
+                        cur = parent
+            self._dirs = dirs
+            self._args = "\n".join(args)
+        return self._dirs, self._args
 
 
 def take_snapshot(timeout=60):
@@ -326,7 +390,17 @@ def path_in_use(snapshot, path, ignore_pids=None):
     if not snapshot.ok:
         return True, "snapshot-failed"
     ignore = set(ignore_pids or ())
-    ignore.add(os.getpid())
+    own = os.getpid()
+    ignore.add(own)
+    forms = path_forms(path)
+    if not (ignore - {own}):
+        dirs, args_blob = snapshot.index()
+        for form in forms:
+            if form in dirs:
+                return True, "cwd"
+            if form in args_blob:
+                return True, "args"
+        return False, ""
     real = os.path.realpath(path)
     for pid, proc in snapshot.procs.items():
         if pid in ignore:
@@ -336,11 +410,13 @@ def path_in_use(snapshot, path, ignore_pids=None):
             rcwd = os.path.realpath(cwd)
             if rcwd == real or rcwd.startswith(real + os.sep):
                 return True, "cwd-of-%d" % pid
+            for form in _short_long_forms(cwd) + _short_long_forms(rcwd):
+                if form in forms:
+                    return True, "cwd-of-%d" % pid
         args = proc.get("args") or ""
-        if path and path in args:
-            return True, "args-of-%d" % pid
-        if real != path and real in args:
-            return True, "args-of-%d" % pid
+        for form in forms:
+            if form in args:
+                return True, "args-of-%d" % pid
     return False, ""
 
 
@@ -436,14 +512,20 @@ class Janitor:
         snapshot=None,
         now=None,
         config_file=None,
+        scheduled=False,
+        snapshot_factory=None,
     ):
         self.cfg = cfg
         self.state_dir = state
         self.log_dir = logs
         self.config_file = config_file or config_path()
         self.apply = bool(apply)
+        self.scheduled = bool(scheduled)
         self.snapshot = snapshot
+        self._snapshot_injected = snapshot is not None
+        self.snapshot_factory = snapshot_factory or take_snapshot
         self.now_fn = now or time.time
+        self.snapshot_ts = self.now_fn() if snapshot is not None else None
         self.start_ts = self.now_fn()
         self.removed = 0
         self.kept = 0
@@ -482,6 +564,29 @@ class Janitor:
 
     def now(self):
         return self.now_fn()
+
+    def _take_snapshot(self):
+        snap = self.snapshot_factory()
+        self.snapshot = snap
+        self.snapshot_ts = self.now()
+        if not snap.ok:
+            self.write({"type": "snapshot", "ok": False, "error": snap.error})
+        return snap
+
+    def current_snapshot(self):
+        """The process snapshot, refreshed when the janitor's own is stale.
+
+        A snapshot injected by a test is never replaced. A failed refresh
+        returns the failed snapshot, so everything counts as in use.
+        """
+        if self.snapshot is None:
+            return self._take_snapshot()
+        if self._snapshot_injected:
+            return self.snapshot
+        max_age = float(self.cfg.get("snapshot_max_age_seconds", 120))
+        if self.snapshot_ts is None or self.now() - self.snapshot_ts > max_age:
+            return self._take_snapshot()
+        return self.snapshot
 
     def open_log(self):
         try:
@@ -544,6 +649,10 @@ class Janitor:
         self.actions.append(rec)
         self.write(rec)
         size_note = "" if size is None else ", %d B" % size
+        if self.scheduled:
+            # launchd appends stdout to launchd.log without limit; per-item
+            # lines belong only in this run's jsonl.
+            return
         print(
             "  %s %-9s %s  (%s%s)"
             % (
@@ -615,7 +724,7 @@ class Janitor:
         return inside(root, path)
 
     def in_use(self, path, ignore_pids=None):
-        return path_in_use(self.snapshot, path, ignore_pids=ignore_pids)
+        return path_in_use(self.current_snapshot(), path, ignore_pids=ignore_pids)
 
     def _remove_path(self, path):
         if os.path.islink(path):
@@ -650,70 +759,61 @@ class Janitor:
             return None
         return st.st_size
 
-    def _newest_mtime(self, path, cutoff, depth=3, limit=2000):
-        """Newest mtime at or under ``path``; stops once something is newer.
+    def _scan_tmp_tree(self, path, cutoff, limit):
+        """Walk the whole tree without following symlinks, collecting pid files.
 
-        Returns None when part of the tree could not be read: an unevaluated
-        guard keeps the entry.
+        Stops early only when something newer than ``cutoff`` is found. At
+        ``limit`` entries it stops and reports truncation, so the entry is
+        kept rather than judged on a partial view. Returns
+        ``(newest, truncated, pidfiles, readable)``; ``newest`` is None when
+        part of the tree could not be read.
         """
         newest = None
-        stack = [(path, 0)]
+        pidfiles = []
         seen = 0
+        stack = [path]
         while stack:
-            cur, level = stack.pop()
+            cur = stack.pop()
             seen += 1
             if seen > limit:
-                break
+                return (newest if newest is not None else 0.0), True, pidfiles, True
             try:
                 st = os.lstat(cur)
             except OSError:
-                return None
+                return None, False, pidfiles, False
             if newest is None or st.st_mtime > newest:
                 newest = st.st_mtime
             if st.st_mtime > cutoff:
-                return st.st_mtime
-            if stat.S_ISDIR(st.st_mode) and level < depth:
+                return st.st_mtime, False, pidfiles, True
+            if stat.S_ISDIR(st.st_mode):
                 try:
                     with os.scandir(cur) as entries:
                         for entry in entries:
-                            stack.append((entry.path, level + 1))
+                            if entry.name == "postmaster.pid":
+                                pidfiles.append(entry.path)
+                            stack.append(entry.path)
                 except OSError:
-                    return None
-        return newest if newest is not None else 0.0
+                    return None, False, pidfiles, False
+        return (newest if newest is not None else 0.0), False, pidfiles, True
 
-    def _live_postmaster_pid(self, path, depth=3):
-        """Return (pid, ok). ok is False when the tree could not be read."""
-        stack = [(path, 0)]
-        while stack:
-            cur, level = stack.pop()
+    def _live_postmaster_pid(self, pidfiles):
+        """Return (pid, ok) for the first live postmaster.pid in ``pidfiles``."""
+        for pidfile in pidfiles:
+            if os.path.islink(pidfile) or not os.path.isfile(pidfile):
+                continue
             try:
-                st = os.lstat(cur)
+                with open(pidfile, "r", encoding="utf-8", errors="replace") as fh:
+                    first = fh.readline().strip()
             except OSError:
                 return None, False
-            if not stat.S_ISDIR(st.st_mode):
-                continue
-            pidfile = os.path.join(cur, "postmaster.pid")
-            if os.path.isfile(pidfile) and not os.path.islink(pidfile):
-                try:
-                    with open(pidfile, "r", encoding="utf-8", errors="replace") as fh:
-                        first = fh.readline().strip()
-                except OSError:
-                    return None, False
-                if first.isdigit() and self.pid_alive(int(first)):
-                    return int(first), True
-            if level < depth:
-                try:
-                    with os.scandir(cur) as entries:
-                        for entry in entries:
-                            stack.append((entry.path, level + 1))
-                except OSError:
-                    return None, False
+            if first.isdigit() and self.pid_alive(int(first)):
+                return int(first), True
         return None, True
 
     # -- sweeper: postgres --------------------------------------------------
 
     def _has_client_backend(self, postmaster_pid):
-        snapshot = self.snapshot
+        snapshot = self.current_snapshot()
         if snapshot is None or not snapshot.ok:
             return True
         for pid, proc in snapshot.procs.items():
@@ -761,10 +861,7 @@ class Janitor:
         return False
 
     def sweep_postgres(self):
-        snapshot = self.snapshot
-        if snapshot is None:
-            snapshot = take_snapshot()
-            self.snapshot = snapshot
+        snapshot = self.current_snapshot()
         if not snapshot.ok:
             self.write(
                 {"type": "snapshot", "ok": False, "error": snapshot.error}
@@ -814,7 +911,7 @@ class Janitor:
     # -- sweeper: tmp -------------------------------------------------------
 
     def _tmp_entries(self, root):
-        """Yield (root, entry). The claude-<uid> container yields sessions."""
+        """Yield (root, entry, is_session). The claude-<uid> container yields sessions."""
         try:
             names = sorted(os.listdir(root))
         except OSError:
@@ -843,26 +940,31 @@ class Janitor:
                     for session in sessions:
                         session_path = os.path.join(project_path, session)
                         if os.path.isdir(session_path) and not os.path.islink(session_path):
-                            yield root, session_path
+                            yield root, session_path, True
                 continue
-            yield root, path
+            yield root, path, False
 
     def sweep_tmp(self):
         days = float(self.cfg["tmp_min_age_days"])
+        session_days = float(self.cfg["session_min_age_days"])
         cutoff = self.now() - days * 86400
+        session_cutoff = self.now() - session_days * 86400
         for root in self.tmp_roots:
             if self.expired():
                 self._timed_out("tmp")
                 return
             if not os.path.isdir(root):
                 continue
-            for entry_root, path in self._tmp_entries(root):
+            for entry_root, path, is_session in self._tmp_entries(root):
                 if self.expired():
                     self._timed_out("tmp")
                     return
-                self._consider_tmp_entry(entry_root, path, cutoff)
+                if is_session:
+                    self._consider_tmp_entry(entry_root, path, session_cutoff, session_days)
+                else:
+                    self._consider_tmp_entry(entry_root, path, cutoff, days)
 
-    def _consider_tmp_entry(self, root, path, cutoff):
+    def _consider_tmp_entry(self, root, path, cutoff, days):
         name = os.path.basename(path)
         try:
             st = os.lstat(path)
@@ -887,9 +989,20 @@ class Janitor:
         if is_dir and os.path.lexists(os.path.join(path, ".git")):
             self.keep("tmp", "git-repo", path)
             return
-        if is_dir:
-            live, readable = self._live_postmaster_pid(path)
-            if not readable:
+        limit = int(self.cfg.get("tmp_age_scan_max_entries", 200000))
+        newest, truncated, pidfiles, readable = self._scan_tmp_tree(path, cutoff, limit)
+        if not readable or newest is None:
+            self.keep("tmp", "unreadable-age", path)
+            return
+        if truncated:
+            self.keep("tmp", "age-scan-truncated", path)
+            return
+        if newest > cutoff:
+            self.keep("tmp", "too-new", path)
+            return
+        if pidfiles:
+            live, ok = self._live_postmaster_pid(pidfiles)
+            if not ok:
                 self.keep("tmp", "unreadable-postmaster-scan", path)
                 return
             if live:
@@ -898,13 +1011,6 @@ class Janitor:
         used, why = self.in_use(path)
         if used:
             self.keep("tmp", "in-use:" + why, path)
-            return
-        newest = self._newest_mtime(path, cutoff)
-        if newest is None:
-            self.keep("tmp", "unreadable-age", path)
-            return
-        if newest > cutoff:
-            self.keep("tmp", "too-new", path)
             return
         if not self.still_inside(root, path):
             self.keep("tmp", "escaped-root", path)
@@ -916,7 +1022,7 @@ class Janitor:
             except OSError as exc:
                 self.error("tmp", "cannot remove %s: %s" % (path, exc))
                 return
-        self.removed_item("tmp", path, "older-than-%gd" % float(self.cfg["tmp_min_age_days"]), size)
+        self.removed_item("tmp", path, "older-than-%gd" % float(days), size)
 
     # -- sweeper: worktrees -------------------------------------------------
 
@@ -993,7 +1099,7 @@ class Janitor:
             if not isinstance(action, dict) or action.get("decision") != "candidate":
                 continue
             path = action.get("path")
-            sha = action.get("HEAD") or action.get("sha") or ""
+            sha = action.get("HEAD") or ""
             if not path or not sha:
                 self.error("worktrees", "manager candidate without path or head: %r" % (action,))
                 continue
@@ -1181,7 +1287,9 @@ class Janitor:
             self.keep("worktrees", "unreadable-commit-time", path)
             return
         newest = int(out.strip())
-        for name in ("HEAD", "index", "logs/HEAD"):
+        # `index` is deliberately not part of the idle signal: any `git status`
+        # rewrites it, and status scans over every worktree run daily.
+        for name in ("HEAD", "logs/HEAD"):
             try:
                 newest = max(newest, os.stat(os.path.join(admin, name)).st_mtime)
             except OSError:
@@ -1415,16 +1523,17 @@ class Janitor:
                     "count": count,
                 }
             )
-            print(
-                "  %s %-9s %d folder(s) under %s  (%s)"
-                % (
-                    "remove" if self.apply else "would remove",
-                    "scratch",
-                    count,
-                    report.get("root", ""),
-                    "older-than-%gd" % days,
+            if not self.scheduled:
+                print(
+                    "  %s %-9s %d folder(s) under %s  (%s)"
+                    % (
+                        "remove" if self.apply else "would remove",
+                        "scratch",
+                        count,
+                        report.get("root", ""),
+                        "older-than-%gd" % days,
+                    )
                 )
-            )
         if kept:
             self.count_kept("scratch", "gc-kept", kept)
         if report.get("failed"):
@@ -1451,6 +1560,9 @@ class Janitor:
         try:
             ended = float(last.get("ended_at"))
         except (TypeError, ValueError):
+            return True
+        if ended > self.now():
+            # A clock set back or a corrupt file must not stop every later run.
             return True
         return self.now() - ended >= float(self.cfg["interval_days"]) * 86400
 
@@ -1515,7 +1627,7 @@ class Janitor:
             }
         )
         if self.snapshot is None:
-            self.snapshot = take_snapshot()
+            self.snapshot = self.current_snapshot()
         if not self.snapshot.ok:
             self.write(
                 {"type": "snapshot", "ok": False, "error": self.snapshot.error}
@@ -1532,7 +1644,8 @@ class Janitor:
                 func = funcs.get(name)
                 if func is None:
                     continue
-                print("%s sweeper (%s)" % (name, mode))
+                if not self.scheduled:
+                    print("%s sweeper (%s)" % (name, mode))
                 self.deadline = time.monotonic() + float(
                     self.cfg["sweeper_budget_seconds"]
                 )
@@ -1644,6 +1757,7 @@ def cmd_run(cfg, args):
         log_dir(),
         apply=bool(args.apply or args.scheduled),
         config_file=config_path(),
+        scheduled=bool(args.scheduled),
     )
     if args.scheduled and not jan.due():
         print("JANITOR: not due")
@@ -1682,6 +1796,10 @@ def _state_summary(cfg):
         if ended is None:
             due_in = 0.0
             last_end = None
+        elif ended > time.time():
+            # A future ended_at (clock set back) counts as due.
+            last_end = iso(ended)
+            due_in = 0.0
         else:
             last_end = iso(ended)
             due_in = max(0.0, interval * 86400 - (time.time() - ended))

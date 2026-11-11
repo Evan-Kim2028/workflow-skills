@@ -6,6 +6,7 @@ launchctl, no network, no gh.
 """
 
 import fcntl
+import io
 import json
 import os
 import plistlib
@@ -15,6 +16,7 @@ import sys
 import tempfile
 import time
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -49,10 +51,10 @@ class JanitorCase(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def janitor(self, cfg=None, apply=False, snapshot=None):
+    def janitor(self, cfg=None, apply=False, snapshot=None, scheduled=False):
         full = dict(lj.DEFAULTS)
         full.update(cfg or {})
-        return lj.Janitor(
+        jan = lj.Janitor(
             full,
             str(self.state),
             str(self.logs),
@@ -60,6 +62,8 @@ class JanitorCase(unittest.TestCase):
             snapshot=snapshot if snapshot is not None else fake_snapshot(),
             now=lambda: self.now,
         )
+        jan.scheduled = scheduled
+        return jan
 
     def mkdir(self, path, age_days=0.0):
         path = Path(path)
@@ -163,7 +167,7 @@ class TmpSweeperTests(JanitorCase):
         jan = self.janitor_for_tmp(apply=True, snapshot=snap)
         jan.sweep_tmp()
         self.assertTrue(busy.exists())
-        self.assertTrue(any(k.startswith("in-use:cwd-of-") for k in jan.keep_counts["tmp"]))
+        self.assertTrue(any(k.startswith("in-use:cwd") for k in jan.keep_counts["tmp"]))
 
     def test_in_use_by_args_kept(self):
         busy = self.mkdir(self.root / "busy-args", age_days=5)
@@ -174,7 +178,7 @@ class TmpSweeperTests(JanitorCase):
         jan = self.janitor_for_tmp(apply=True, snapshot=snap)
         jan.sweep_tmp()
         self.assertTrue(busy.exists())
-        self.assertTrue(any(k.startswith("in-use:args-of-") for k in jan.keep_counts["tmp"]))
+        self.assertTrue(any(k.startswith("in-use:args") for k in jan.keep_counts["tmp"]))
 
     def test_snapshot_failure_keeps_everything(self):
         old = self.mkdir(self.root / "old", age_days=30)
@@ -199,7 +203,7 @@ class TmpSweeperTests(JanitorCase):
     def test_claude_container_sessions(self):
         container = self.mkdir(self.root / ("claude-%d" % os.getuid()))
         project = self.mkdir(container / "-Users-someone-projects-app")
-        old = self.mkdir(project / "session-old", age_days=6)
+        old = self.mkdir(project / "session-old", age_days=8)
         new = self.mkdir(project / "session-new")
         jan = self.janitor_for_tmp(apply=True)
         jan.sweep_tmp()
@@ -208,6 +212,78 @@ class TmpSweeperTests(JanitorCase):
         self.assertFalse(old.exists())
         self.assertTrue(new.exists())
         self.assertEqual(jan.removed, 1)
+
+    def test_session_folders_use_the_session_age(self):
+        container = self.mkdir(self.root / ("claude-%d" % os.getuid()))
+        project = self.mkdir(container / "-Users-someone-projects-app")
+        quiet = self.mkdir(project / "session-quiet", age_days=5)
+        stale = self.mkdir(project / "session-stale", age_days=8)
+        jan = self.janitor_for_tmp(apply=True)
+        jan.sweep_tmp()
+        self.assertTrue(quiet.exists(), "a quiet session newer than 7 days is kept")
+        self.assertFalse(stale.exists(), "a session older than 7 days is removed")
+        self.assertIn("too-new", jan.keep_counts["tmp"])
+
+    def test_new_file_deeper_than_three_levels_keeps_folder(self):
+        old = self.mkdir(self.root / "deep", age_days=8)
+        deep = old.joinpath(*["d%d" % i for i in range(6)])
+        self.mkdir(deep, age_days=8)
+        self.mkdir(old, age_days=8)
+        # The only new thing in the tree sits at depth 6.
+        self.write(deep / "payload.txt", "live")
+        jan = self.janitor_for_tmp(apply=True)
+        jan.sweep_tmp()
+        self.assertTrue(old.exists())
+        self.assertIn("too-new", jan.keep_counts["tmp"])
+
+    def test_age_scan_truncation_keeps_folder(self):
+        old = self.mkdir(self.root / "many")
+        for i in range(10):
+            self.write(old / ("f%02d" % i), "x")
+        self.mkdir(old, age_days=8)
+        jan = self.janitor_for_tmp(apply=True)
+        jan.cfg["tmp_age_scan_max_entries"] = 5
+        jan.sweep_tmp()
+        self.assertTrue(old.exists())
+        self.assertIn("age-scan-truncated", jan.keep_counts["tmp"])
+
+    def test_live_postmaster_at_depth_five_keeps_folder(self):
+        live = self.root / "pg-deep"
+        pidfile = live.joinpath(*["d%d" % i for i in range(5)]) / "postmaster.pid"
+        self.write(pidfile, "5252\n")
+        self.mkdir(live, age_days=8)
+        jan = self.janitor_for_tmp(apply=True)
+        jan.pid_alive = lambda pid: pid == 5252
+        jan.sweep_tmp()
+        self.assertTrue(live.exists())
+        self.assertIn("live-postgres:5252", jan.keep_counts["tmp"])
+
+    def test_scheduled_keeps_per_item_lines_out_of_stdout(self):
+        old = self.mkdir(self.root / "sched-old", age_days=5)
+        protected = self.mkdir(self.root / "com.sched-keep", age_days=5)
+        jan = self.janitor_for_tmp(apply=True)
+        jan.scheduled = True
+        jan.open_log()
+        buf = io.StringIO()
+        try:
+            with redirect_stdout(buf):
+                jan.sweep_tmp()
+                jan.flush_keeps("tmp")
+        finally:
+            jan.log.close()
+            jan.log = None
+        self.assertFalse(old.exists())
+        self.assertTrue(protected.exists())
+        self.assertNotIn(str(old), buf.getvalue())
+        self.assertIn("kept     tmp", buf.getvalue())
+        logged = [
+            json.loads(line)
+            for line in Path(jan.log_path).read_text(encoding="utf-8").splitlines()
+            if line
+        ]
+        actions = [r for r in logged if r.get("type") == "action"]
+        self.assertEqual(len(actions), 1)
+        self.assertEqual(actions[0]["target"], str(old))
 
 
 # --- postgres --------------------------------------------------------------
@@ -492,6 +568,105 @@ class WorktreeSweeperTests(GitRepoCase):
         self.assertTrue(os.path.isdir(wt))
         self.assertIn("recent", jan.keep_counts["worktrees"])
 
+    def admin_dir(self, path):
+        admin = self.git("rev-parse", "--git-dir", cwd=path).stdout.strip()
+        if not os.path.isabs(admin):
+            admin = os.path.join(path, admin)
+        return admin
+
+    def test_index_rewrite_does_not_make_worktree_recent(self):
+        wt = self.add_worktree("feat/index", days_ago=10)
+        self.merge_branch("feat/index", squash=True)
+        # A status scan a minute ago rewrote the index; HEAD and logs/HEAD
+        # are still ten days old.
+        os.utime(os.path.join(self.admin_dir(wt), "index"), None)
+        jan = self.janitor_for_worktrees(apply=True)
+        jan.sweep_worktrees()
+        self.assertFalse(os.path.exists(wt))
+
+    def test_recent_reflog_keeps_worktree(self):
+        wt = self.add_worktree("feat/reflog", days_ago=10)
+        self.merge_branch("feat/reflog", squash=True)
+        os.utime(os.path.join(self.admin_dir(wt), "logs", "HEAD"), None)
+        jan = self.janitor_for_worktrees(apply=True)
+        jan.sweep_worktrees()
+        self.assertTrue(os.path.isdir(wt))
+        self.assertIn("recent", jan.keep_counts["worktrees"])
+
+    def make_manager(self, actions):
+        """A fake workspace-manager: plan prints JSON, closeout records argv."""
+        bindir = self.base / "bin"
+        bindir.mkdir(exist_ok=True)
+        exe = bindir / "wm"
+        plan = self.base / "plan.json"
+        plan.write_text(json.dumps({"actions": actions}), encoding="utf-8")
+        record = self.base / "closeout.jsonl"
+        exe.write_text(
+            "\n".join(
+                [
+                    "#!" + sys.executable,
+                    "import json, sys",
+                    "if sys.argv[1] == 'plan':",
+                    "    print(json.dumps({'plan': %r}))" % str(plan),
+                    "else:",
+                    "    open(%r, 'a').write(json.dumps(sys.argv[1:]) + '\\n')" % str(record),
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        os.chmod(exe, 0o755)
+        return str(exe), record
+
+    def test_part_a_uses_the_plan_path_head_and_decision_keys(self):
+        exe, record = self.make_manager(
+            [
+                {
+                    "path": "/tmp/wt-candidate",
+                    "HEAD": "a" * 40,
+                    "decision": "candidate",
+                },
+                {
+                    "path": "/tmp/wt-protected",
+                    "HEAD": "b" * 40,
+                    "decision": "protect",
+                },
+            ]
+        )
+        jan = self.janitor(
+            cfg={
+                "worktree_manager_cmd": exe,
+                "repos": [],
+                "repo_roots": [],
+            },
+            apply=False,
+        )
+        jan.sweep_worktrees()
+        calls = [
+            json.loads(line)
+            for line in record.read_text(encoding="utf-8").splitlines()
+            if line
+        ]
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(
+            calls[0],
+            ["closeout", "--worktree", "/tmp/wt-candidate", "--expected-head", "a" * 40],
+        )
+        self.assertEqual(jan.removed, 1)
+
+    def test_part_a_does_not_treat_an_unknown_sha_key_as_the_head(self):
+        exe, record = self.make_manager(
+            [{"path": "/tmp/wt-sha-only", "sha": "c" * 40, "decision": "candidate"}]
+        )
+        jan = self.janitor(
+            cfg={"worktree_manager_cmd": exe, "repos": [], "repo_roots": []},
+            apply=False,
+        )
+        jan.sweep_worktrees()
+        self.assertFalse(record.exists())
+        self.assertEqual(jan.errors, 1)
+        self.assertEqual(jan.removed, 0)
+
     def test_in_use_worktree_kept(self):
         wt = self.add_worktree("feat/busy", days_ago=10)
         self.merge_branch("feat/busy", squash=True)
@@ -616,6 +791,103 @@ class CombinedDryRunTests(GitRepoCase):
         self.assertEqual(summary["mode"], "dry-run")
 
 
+# --- snapshot and path forms ----------------------------------------------
+
+
+class SnapshotTests(JanitorCase):
+    def test_args_short_form_of_long_path_is_in_use(self):
+        snap = fake_snapshot(
+            procs={51: {"ppid": 1, "etime": 10, "args": "app -D /var/folders/a/T/x/data"}},
+            cwds={},
+        )
+        used, why = lj.path_in_use(snap, "/private/var/folders/a/T/x")
+        self.assertTrue(used)
+        self.assertTrue(why.startswith("args"))
+
+    def test_args_long_form_of_short_path_is_in_use(self):
+        snap = fake_snapshot(
+            procs={52: {"ppid": 1, "etime": 10, "args": "app -D /private/tmp/x/data"}},
+            cwds={},
+        )
+        used, why = lj.path_in_use(snap, "/tmp/x")
+        self.assertTrue(used)
+        self.assertTrue(why.startswith("args"))
+
+    def test_cwd_short_form_of_long_path_is_in_use(self):
+        snap = fake_snapshot(
+            procs={53: {"ppid": 1, "etime": 10, "args": "sleep 1"}},
+            cwds={53: "/var/folders/a/T/x"},
+        )
+        used, why = lj.path_in_use(snap, "/private/var/folders/a/T/x")
+        self.assertTrue(used)
+        self.assertTrue(why.startswith("cwd"))
+
+    def test_cwd_long_form_of_short_path_is_in_use(self):
+        snap = fake_snapshot(
+            procs={54: {"ppid": 1, "etime": 10, "args": "sleep 1"}},
+            cwds={54: "/private/var/folders/a/T/x"},
+        )
+        used, why = lj.path_in_use(snap, "/var/folders/a/T/x")
+        self.assertTrue(used)
+        self.assertTrue(why.startswith("cwd"))
+
+    def test_ignored_pids_use_the_per_process_loop(self):
+        snap = fake_snapshot(
+            procs={
+                61: {"ppid": 1, "etime": 10, "args": "postgres -D /tmp/x"},
+                62: {"ppid": 1, "etime": 10, "args": "postgres -D /tmp/x"},
+            },
+            cwds={},
+        )
+        used, why = lj.path_in_use(snap, "/tmp/x", ignore_pids=[61])
+        self.assertTrue(used)
+        self.assertEqual(why, "args-of-62")
+        unused, _ = lj.path_in_use(snap, "/tmp/x", ignore_pids=[61, 62])
+        self.assertFalse(unused)
+
+    def test_stale_own_snapshot_is_refreshed(self):
+        taken = []
+
+        def factory():
+            taken.append(self.now)
+            return fake_snapshot(ok=True)
+
+        jan = lj.Janitor(
+            dict(lj.DEFAULTS),
+            str(self.state),
+            str(self.logs),
+            now=lambda: self.now,
+            snapshot_factory=factory,
+        )
+        self.assertTrue(jan.current_snapshot().ok)
+        self.assertEqual(len(taken), 1)
+        self.now += 60
+        jan.current_snapshot()
+        self.assertEqual(len(taken), 1, "a 60 s old snapshot is still fresh")
+        self.now += 120
+        jan.current_snapshot()
+        self.assertEqual(len(taken), 2, "a snapshot past 120 s is replaced")
+
+    def test_injected_snapshot_is_never_replaced(self):
+        snap = fake_snapshot()
+        jan = self.janitor(snapshot=snap)
+        jan.snapshot_factory = lambda: self.fail("injected snapshot was replaced")
+        self.now += 100000
+        self.assertIs(jan.current_snapshot(), snap)
+
+    def test_failed_refresh_counts_everything_as_in_use(self):
+        jan = lj.Janitor(
+            dict(lj.DEFAULTS),
+            str(self.state),
+            str(self.logs),
+            now=lambda: self.now,
+            snapshot_factory=lambda: fake_snapshot(ok=False, error="boom"),
+        )
+        used, why = jan.in_use(str(self.base / "x"))
+        self.assertTrue(used)
+        self.assertEqual(why, "snapshot-failed")
+
+
 # --- scheduling, lock, config, plist --------------------------------------
 
 
@@ -730,6 +1002,14 @@ class CliCase(JanitorCase):
         )
         self.assertEqual(data["StandardOutPath"], data["StandardErrorPath"])
         self.assertTrue(data["StandardOutPath"].endswith("launchd.log"))
+
+    def test_future_ended_at_is_due(self):
+        self.state.mkdir(parents=True, exist_ok=True)
+        (self.state / "last-run.json").write_text(
+            json.dumps({"ended_at": self.now + 3600}), encoding="utf-8"
+        )
+        jan = self.janitor()
+        self.assertTrue(jan.due())
 
     def test_status_json(self):
         self.write_last_run(days_ago=1)

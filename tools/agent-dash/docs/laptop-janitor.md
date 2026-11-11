@@ -29,7 +29,11 @@ laptop_janitor.py print-plist
   changes nothing except writing its own log.
 - `run --scheduled` is the `launchd` entry point. When not due it prints
   `not due` and exits 0 without sweeping or writing a log. When due it behaves
-  as `run --apply`.
+  as `run --apply`, except that stdout carries only the per-sweeper kept line,
+  error lines and the summary: per-item removal lines go to the run's `.jsonl`
+  log only, because `launchd` appends stdout to `launchd.log` without limit.
+  A `last-run.json` whose `ended_at` is in the future (clock set back, bad
+  file) counts as due.
 - Sweepers run in this order: `postgres`, `tmp`, `worktrees`, `scratch`.
   `--only` and `--skip` take comma lists of those names.
 - `--json` prints a JSON report before the summary line.
@@ -82,6 +86,9 @@ silently using defaults.
   "sweeper_budget_seconds": 1200,
   "pg_min_age_hours": 24,
   "tmp_min_age_days": 2,
+  "session_min_age_days": 7,
+  "tmp_age_scan_max_entries": 200000,
+  "snapshot_max_age_seconds": 120,
   "worktree_min_idle_days": 3,
   "scratch_min_age_days": 3,
   "tmp_protect_globs": [],
@@ -100,12 +107,30 @@ running out of time never stops the others.
 
 ## Shared guard: the process snapshot
 
-Once per run the janitor takes `ps -axo pid=,ppid=,etime=,args=` and every
-process's working directory (`lsof -a -d cwd -Fpn`, 60 s timeout). A path is
-**in use** when any live process other than the janitor itself has its working
-directory inside the path, or names the path (as given or as its real path) in
-its arguments. If either command fails or times out, every path counts as in
-use for that run and the reason is logged.
+Once per run, and again whenever the janitor's own snapshot is older than
+`snapshot_max_age_seconds` (default 120) at the moment a guard needs it, the
+janitor takes `ps -axo pid=,ppid=,etime=,args=` and every process's working
+directory (`lsof -a -d cwd -Fpn`, 60 s timeout). A snapshot injected by a test
+is never replaced. A failed refresh returns the failed snapshot, so every path
+counts as in use.
+
+On first use the snapshot builds two indexes: the set of every ancestor
+directory of every working directory, and one joined string of every argument.
+Both carry every form of the path (see below), so the common call (no ignored
+PIDs beyond the janitor's own) is a set lookup plus a substring test rather
+than a loop over every process. Calls that pass `ignore_pids` keep the
+per-process loop.
+
+A path is **in use** when any live process other than the janitor itself has
+its working directory inside the path, or names the path in its arguments.
+Every form of the path is compared: the path as given, its real path, and for
+paths under `/private/tmp`, `/private/var` or `/private/etc` also the form
+without `/private` (and the reverse for paths under `/tmp`, `/var`, `/etc`).
+macOS processes usually name the short form (`TMPDIR` has no `/private`), so a
+folder held by such a process must not look free.
+
+If either command fails or times out, every path counts as in use for that run
+and the reason is logged.
 
 Right before each removal the janitor also re-checks that the target's resolved
 path is still inside the root it was found under. A symlink entry is checked
@@ -143,16 +168,21 @@ run continues.
 
 Removes old top-level entries from the user temp dir and `/private/tmp`.
 
-The age of an entry is the newest modification time among the entry and a
-bounded walk inside it (depth 3, at most 2000 entries, stopping at the first
-thing newer than the cutoff). An entry is removed when that age is at least
-`tmp_min_age_days`.
+The age of an entry is the newest modification time among the entry and the
+whole tree inside it. The walk never follows symlinks and stops early only at
+the first thing newer than the cutoff or at `tmp_age_scan_max_entries`
+(default 200000) entries; an entry cut off at that limit is kept with reason
+`age-scan-truncated` rather than judged on a partial view. An entry is removed
+when that age is at least `tmp_min_age_days`.
 
 `<temp>/claude-<uid>` is a container: each `<project>/<session>` folder two
-levels down is treated as its own entry with the same rule, and neither the
-container nor the project folders are ever removed.
+levels down is treated as its own entry with the same rule except the age,
+which is `session_min_age_days` (default 7) instead of `tmp_min_age_days`: a
+session can be alive and quiet for days without naming its folder in any
+process arguments. Neither the container nor the project folders are ever
+removed.
 
-An entry is kept, with a reason, when it:
+Guards run cheapest first. An entry is kept, with a reason, when it:
 
 - is not owned by the current user (`other-owner`);
 - is a socket or FIFO (`socket-or-fifo`);
@@ -160,10 +190,13 @@ An entry is kept, with a reason, when it:
   `TemporaryItems`, `tmux-*`, `ssh-*`, `*.sock`, `launchd-*`, plus
   `tmp_protect_globs`;
 - is, or has at its top level, a git repository or worktree (`git-repo`);
-- contains a `postmaster.pid` (searched to depth 3) whose PID is alive
-  (`live-postgres`);
+- is older than the cutoff only on a partial view (`age-scan-truncated`);
+- has something newer than the cutoff (`too-new`);
+- holds a `postmaster.pid`, found at any depth during the same walk, whose PID
+  is alive (`live-postgres`);
 - is in use per the process snapshot (`in-use`);
-- has something newer than the cutoff (`too-new`).
+- escapes its root on re-check (`escaped-root`);
+- could not be walked (`unreadable-age`).
 
 Folders are removed with `shutil.rmtree` and an error handler that fixes
 read-only permissions once and retries; a failure is an error line.
@@ -179,9 +212,11 @@ When `worktree_manager_cmd` (default `workspace-manager`) is on the PATH the
 janitor runs `<cmd> plan`, reads the plan file named by the `plan` key of its
 JSON output, and for each action whose `decision` is `candidate` runs
 `<cmd> closeout --worktree <path> --expected-head <sha>`, adding `--apply` only
-when the janitor itself is applying. The tool is a black box: its result is
-logged. If the command is missing or its output is not the expected JSON, that
-is logged and part A is skipped.
+when the janitor itself is applying. The action keys it reads are exactly
+`path` (worktree path), `HEAD` (head sha) and `decision`; a `candidate` without
+both `path` and `HEAD` is an error line, not a guess. The tool is a black box:
+its result is logged. If the command is missing or its output is not the
+expected JSON, that is logged and part A is skipped.
 
 ### Part B: squash-merged worktrees
 
@@ -209,10 +244,12 @@ A worktree is removed only when **all** of these hold:
 4. its git admin dir holds no `MERGE_HEAD`, `REBASE_HEAD`, `CHERRY_PICK_HEAD`,
    `REVERT_HEAD`, `BISECT_LOG`, `rebase-merge` or `rebase-apply`;
 5. it is idle: the newest of the HEAD commit time and the modification times
-   of `HEAD`, `index` and `logs/HEAD` in its admin dir is at least
-   `worktree_min_idle_days` old. The timestamps are read before running
-   `git status`, because status refreshes the index and would otherwise make
-   every worktree look active forever;
+   of `HEAD` and `logs/HEAD` in its admin dir is at least
+   `worktree_min_idle_days` old. The index is deliberately not part of the
+   idle signal: any `git status` rewrites it, and other tools run status scans
+   over every worktree daily, so an index-based signal keeps everything
+   `recent` forever. Uncommitted work is covered by guard 3. The timestamps
+   are read before running `git status`;
 6. it is not in use per the process snapshot;
 7. its branch tip is merged, by any one of: the tip is an ancestor of
    `origin/<default branch>`; `gh` is on the PATH and
