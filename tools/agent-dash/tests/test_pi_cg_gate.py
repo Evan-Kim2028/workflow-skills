@@ -16,6 +16,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -80,8 +81,50 @@ COMMANDS = [
     ("cat package.json", False),
 ]
 
+# Every exact input quoted in the review, plus the small local fixes. Each row
+# failed before the fix; the name in the comment is the review finding.
+REGRESSIONS = [
+    # finding 5: heredoc bodies are file content, not commands
+    ("cat > /tmp/example.py <<'PY'\ngrep -rn foo .\nPY", False),
+    ("cat > /tmp/example.py <<PY\ngrep -rn foo .\nPY", False),
+    ("cat > /tmp/example.py <<-PY\n\tgrep -rn foo .\n\tPY", False),
+    # finding 6: value-taking options, extensionless file, rg types, git grep
+    ("grep -C 2 -n foo src/app.py", False),
+    ("grep -m 1 -n foo docs/design.md", False),
+    ("grep -n foo Makefile", False),
+    ("rg -t md foo", False),
+    ("git grep -A 2 foo -- src/app.py", False),
+    # finding 2: a later cg does not excuse an earlier search
+    ('rg foo; cg explore "foo"', True),
+    ("cg --help; rg foo", True),
+    # finding 3: negations and directory targets are not docs-only
+    ("rg -g '!*.md' foo .", True),
+    ("find . -type f ! -name '*.md' | xargs grep foo", True),
+    ("find . -name '*.md' -prune -o -type f -print | xargs grep foo", True),
+    ("rg foo src/v1.2/", True),
+    ("find . -name '*.py' | sort | xargs grep foo", True),
+    # finding 4: grouping and git global options
+    ("(cd src && grep -rn foo .)", True),
+    ("{ grep -rn foo .; }", True),
+    ("git -C src grep -n foo", True),
+    # deliberately not caught: nested shells and command substitution
+    ("bash -lc 'rg foo'", False),
+    ('echo "$(rg foo)"', False),
+]
+
+# runsCodeGraph is the "actually ran a query" test used for result marking.
+CODEGRAPH_CALLS = [
+    ('cg explore "foo"', True),
+    ("codegraph node foo", True),
+    ("cg --help", False),
+    ("cg --where", False),
+    ("cg", False),
+    ("rg foo", False),
+]
+
 RULE_SCRIPT = r"""
-import { gateDecision, runsCodeGraph, searchIntent, blockReason, shellTokens }
+import { gateDecision, runsCodeGraph, searchIntent, blockReason, shellTokens,
+         stripHeredocs, mentionsCodeGraph }
   from %(rule)s;
 import { readFileSync } from "node:fs";
 const spec = JSON.parse(readFileSync(process.argv[2], "utf8"));
@@ -90,7 +133,20 @@ for (const [command, expected] of spec.commands) {
   const decision = gateDecision(command, false);
   if (decision.block !== expected) {
     failures++;
-    console.log(`FAIL expected ${expected ? "BLOCK" : "ALLOW"} ${command} -> ${decision.block ? "BLOCK" : "ALLOW"}`);
+    console.log(`FAIL expected ${expected ? "BLOCK" : "ALLOW"} ${JSON.stringify(command)} -> ${decision.block ? "BLOCK" : "ALLOW"}`);
+  }
+}
+for (const [command, expected] of spec.regressions) {
+  const decision = gateDecision(command, false);
+  if (decision.block !== expected) {
+    failures++;
+    console.log(`FAIL regression expected ${expected ? "BLOCK" : "ALLOW"} ${JSON.stringify(command)} -> ${decision.block ? "BLOCK" : "ALLOW"}`);
+  }
+}
+for (const [command, expected] of spec.codeGraphCalls) {
+  if (runsCodeGraph(command) !== expected) {
+    failures++;
+    console.log(`FAIL runsCodeGraph(${JSON.stringify(command)}) expected ${expected}`);
   }
 }
 for (const command of spec.afterCg) {
@@ -123,6 +179,15 @@ if (tokens.join("|") !== "grep|-rn|a | b|.") {
   failures++;
   console.log(`FAIL shellTokens: ${JSON.stringify(tokens)}`);
 }
+const heredoc = "cat > /tmp/x.py <<'PY'\ngrep -rn foo .\nPY\n";
+if (stripHeredocs(heredoc).includes("grep")) {
+  failures++;
+  console.log("FAIL heredoc body not stripped");
+}
+if (!mentionsCodeGraph('cg --help') || runsCodeGraph('cg --help')) {
+  failures++;
+  console.log("FAIL cg --help should be mentioned but not a work call");
+}
 console.log(`failures=${failures}`);
 process.exit(failures === 0 ? 0 : 1);
 """
@@ -133,7 +198,12 @@ import { pathToFileURL } from "node:url";
 const spec = JSON.parse(readFileSync(process.argv[2], "utf8"));
 const mod = await import(pathToFileURL(spec.extension).href + "?v=" + Date.now());
 const handlers = {};
-const pi = { on(name, fn) { (handlers[name] ||= []).push(fn); } };
+const pi = {
+  on(name, fn) {
+    if (spec.failResultHook && name === "tool_result") throw new Error("no tool_result");
+    (handlers[name] ||= []).push(fn);
+  },
+};
 mod.default(pi);
 const out = [];
 for (const step of spec.steps) {
@@ -192,6 +262,8 @@ class SearchRuleTest(unittest.TestCase):
                 "spec.json",
                 {
                     "commands": COMMANDS,
+                    "regressions": REGRESSIONS,
+                    "codeGraphCalls": CODEGRAPH_CALLS,
                     "afterCg": ['grep -rn "merge policy" .', "rg foo", "git grep -n foo"],
                     "cgCommands": [
                         'cg explore "merge policy"',
@@ -220,11 +292,15 @@ class HandlerTest(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def run_steps(self, steps, cg=None, extra_env=None):
+    def run_steps(self, steps, cg=None, extra_env=None, fail_result_hook=False):
         spec = write_json(
             self.dir,
             "scenario.json",
-            {"extension": str(EXTENSION), "steps": steps},
+            {
+                "extension": str(EXTENSION),
+                "steps": steps,
+                "failResultHook": fail_result_hook,
+            },
         )
         env = {**os.environ, "PI_CG_GATE_CG": cg or self.ok}
         env.pop("PI_CG_GATE", None)
@@ -239,6 +315,28 @@ class HandlerTest(unittest.TestCase):
 
     def bash(self, command):
         return {"kind": "tool_call", "event": {"toolName": "bash", "input": {"command": command}}}
+
+    def bash_result(self, command, is_error=False):
+        return {
+            "kind": "tool_result",
+            "event": {
+                "toolName": "bash",
+                "toolCallId": "call-1",
+                "input": {"command": command},
+                "isError": is_error,
+            },
+        }
+
+    def mcp_result(self, is_error=False):
+        return {
+            "kind": "tool_result",
+            "event": {
+                "toolName": "mcp__codegraph__explore",
+                "toolCallId": "call-2",
+                "input": {},
+                "isError": is_error,
+            },
+        }
 
     def prompt(self, base="BASE PROMPT"):
         return {"kind": "before_agent_start", "event": {"systemPrompt": base}}
@@ -294,16 +392,84 @@ class HandlerTest(unittest.TestCase):
             [
                 self.session(),
                 {"kind": "tool_call", "event": {"toolName": "mcp__codegraph__explore", "input": {}}},
+                self.mcp_result(),
                 self.bash("rg foo"),
             ]
         )
-        self.assertEqual(out, [None, None, None])
+        self.assertEqual(out, [None, None, None, None])
+
+    def test_failed_mcp_call_does_not_open_gate(self):
+        out = self.run_steps(
+            [
+                self.session(),
+                {"kind": "tool_call", "event": {"toolName": "mcp__codegraph__explore", "input": {}}},
+                self.mcp_result(is_error=True),
+                self.bash("rg foo"),
+            ]
+        )
+        self.assertTrue(out[3]["block"])
 
     def test_cg_bash_command_counts_as_use(self):
         out = self.run_steps(
-            [self.session(), self.bash('cg explore "merge policy"'), self.bash("rg foo")]
+            [
+                self.session(),
+                self.bash('cg explore "merge policy"'),
+                self.bash_result('cg explore "merge policy"'),
+                self.bash("rg foo"),
+            ]
+        )
+        self.assertEqual(out, [None, None, None, None])
+
+    def test_cg_help_does_not_open_gate(self):
+        out = self.run_steps(
+            [
+                self.session(),
+                self.bash("cg --help"),
+                self.bash_result("cg --help"),
+                self.bash("rg foo"),
+            ]
+        )
+        self.assertTrue(out[3]["block"])
+
+    def test_failed_cg_call_does_not_open_gate(self):
+        out = self.run_steps(
+            [
+                self.session(),
+                self.bash('cg explore "merge policy"'),
+                self.bash_result('cg explore "merge policy"', is_error=True),
+                self.bash("rg foo"),
+            ]
+        )
+        self.assertTrue(out[3]["block"])
+
+    def test_missing_result_hook_falls_back_to_the_call(self):
+        out = self.run_steps(
+            [self.session(), self.bash('cg explore "merge policy"'), self.bash("rg foo")],
+            fail_result_hook=True,
         )
         self.assertEqual(out, [None, None, None])
+
+    def test_probe_ignoring_sigterm_settles_and_leaves_no_child(self):
+        pidfile = os.path.join(self.dir, "cg.pid")
+        stubborn = fake_cg(
+            self.dir,
+            "cg-stubborn",
+            'trap "" TERM\necho $$ > "$CG_PIDFILE"\nwhile :; do sleep 1; done',
+        )
+        started = time.monotonic()
+        out = self.run_steps(
+            [self.session(), self.bash("rg foo"), self.prompt()],
+            cg=stubborn,
+            extra_env={"CG_PIDFILE": pidfile},
+        )
+        elapsed = time.monotonic() - started
+        self.assertLess(elapsed, 7.0, f"probe took {elapsed:.1f}s")
+        # The gate is inactive when the probe does not settle in time.
+        self.assertEqual(out, [None, None, None])
+        self.assertTrue(os.path.exists(pidfile), "probe child never started")
+        pid = int(Path(pidfile).read_text().strip())
+        with self.assertRaises(ProcessLookupError):
+            os.kill(pid, 0)
 
     def test_non_bash_tool_is_never_blocked(self):
         out = self.run_steps(
@@ -398,10 +564,42 @@ class InstallerTest(unittest.TestCase):
             self.assertEqual(dest.read_bytes(), (PLUGIN / "index.ts").read_bytes())
             leftovers = [
                 p.name
-                for p in (agent / "extensions").iterdir()
-                if p.name.startswith(".cg-gate.")
+                for p in (agent / "extensions" / "cg-gate").iterdir()
+                if ".tmp." in p.name
             ]
             self.assertEqual(leftovers, [])
+
+    def test_update_keeps_destination_directory_in_place(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            agent = home / "agent"
+            self.assertEqual(
+                self.run_installer(home, "--pi-cg-gate", agent_dir=agent).returncode, 0
+            )
+            dest = agent / "extensions" / "cg-gate"
+            inode = dest.stat().st_ino
+            (dest / "index.ts").write_text("stale\n", encoding="utf-8")
+            proc = self.run_installer(home, "--pi-cg-gate", agent_dir=agent)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            # The directory is never moved away and back: a reader always finds it.
+            self.assertEqual(dest.stat().st_ino, inode)
+            self.assertEqual(
+                (dest / "index.ts").read_bytes(), (PLUGIN / "index.ts").read_bytes()
+            )
+
+    def test_update_removes_files_no_longer_shipped(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            agent = home / "agent"
+            self.assertEqual(
+                self.run_installer(home, "--pi-cg-gate", agent_dir=agent).returncode, 0
+            )
+            dest = agent / "extensions" / "cg-gate"
+            (dest / "stale.ts").write_text("old\n", encoding="utf-8")
+            proc = self.run_installer(home, "--pi-cg-gate", agent_dir=agent)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertFalse((dest / "stale.ts").exists())
+            self.assertTrue((dest / "index.ts").is_file())
 
     def test_uninstall_removes_extension(self):
         with tempfile.TemporaryDirectory() as tmp:

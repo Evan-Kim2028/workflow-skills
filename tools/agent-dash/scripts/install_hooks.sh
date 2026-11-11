@@ -50,9 +50,11 @@
 #     once per machine: installs the pi extension that blocks recursive or
 #     multi-file code search until CodeGraph has run once in the session
 #     (plugins/pi-cg-gate/ copied to <agent dir>/extensions/cg-gate/). The
-#     agent dir is PI_CODING_AGENT_DIR, default ~/.pi/agent. Idempotent and
-#     atomic: a re-run with identical files changes nothing, and a changed
-#     copy is swapped in whole. Takes effect in new pi sessions.
+#     agent dir is PI_CODING_AGENT_DIR, default ~/.pi/agent. Idempotent:
+#     a re-run with identical files changes nothing, and the destination
+#     directory is kept in place while each changed file is replaced by an
+#     atomic rename (temp file in the same directory). Takes effect in new
+#     pi sessions.
 #
 #   sh tools/agent-dash/scripts/install_hooks.sh --uninstall
 #     removes the grok hook file, the muse plugin, the shim copies, the pi
@@ -282,28 +284,43 @@ if [ "${1:-}" = "--pi-cg-gate" ]; then
     AGENT_DIR="${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}"
     EXTDIR="$AGENT_DIR/extensions"
     DEST="$EXTDIR/cg-gate"
-    mkdir -p "$EXTDIR" || { echo "install_hooks: cannot create $EXTDIR" >&2; exit 1; }
-    if [ -d "$DEST" ] && diff -r "$SRC" "$DEST" >/dev/null 2>&1; then
+    # Keep DEST in place: a concurrent pi session must always find the
+    # directory, and a failed update must never leave it missing.
+    mkdir -p "$DEST" || { echo "install_hooks: cannot create $DEST" >&2; exit 1; }
+    changed=0
+    for SRC_FILE in "$SRC"/*; do
+        [ -f "$SRC_FILE" ] || continue
+        NAME=$(basename "$SRC_FILE")
+        TARGET="$DEST/$NAME"
+        if [ -f "$TARGET" ] && cmp -s "$SRC_FILE" "$TARGET"; then
+            continue
+        fi
+        TMP="$DEST/.$NAME.tmp.$$"
+        cp "$SRC_FILE" "$TMP" || {
+            echo "install_hooks: cannot write $TARGET" >&2
+            rm -f "$TMP"
+            exit 1
+        }
+        # Atomic rename inside the destination directory: a reader sees the
+        # old file or the new one, never a half copy.
+        if ! mv "$TMP" "$TARGET"; then
+            echo "install_hooks: cannot write $TARGET" >&2
+            rm -f "$TMP"
+            exit 1
+        fi
+        changed=1
+    done
+    # Drop files this version no longer ships.
+    for DEST_FILE in "$DEST"/*; do
+        [ -f "$DEST_FILE" ] || continue
+        NAME=$(basename "$DEST_FILE")
+        [ -f "$SRC/$NAME" ] || rm -f "$DEST_FILE"
+    done
+    if [ "$changed" -eq 1 ]; then
+        echo "install_hooks: pi cg-gate extension installed at $DEST (takes effect in new pi sessions)"
+    else
         echo "install_hooks: pi cg-gate extension already installed at $DEST"
-        exit 0
     fi
-    TMP="$EXTDIR/.cg-gate.tmp.$$"
-    OLD="$EXTDIR/.cg-gate.old.$$"
-    rm -rf "$TMP" "$OLD"
-    mkdir -p "$TMP" || { echo "install_hooks: cannot create $TMP" >&2; exit 1; }
-    cp -R "$SRC/." "$TMP/" || { echo "install_hooks: cannot copy $SRC" >&2; rm -rf "$TMP"; exit 1; }
-    # Swap the whole directory: a concurrent pi session never loads a half copy.
-    if [ -d "$DEST" ]; then
-        mv "$DEST" "$OLD" || { echo "install_hooks: cannot move $DEST" >&2; rm -rf "$TMP"; exit 1; }
-    fi
-    if ! mv "$TMP" "$DEST"; then
-        echo "install_hooks: cannot install $DEST" >&2
-        [ -d "$OLD" ] && mv "$OLD" "$DEST"
-        rm -rf "$TMP"
-        exit 1
-    fi
-    rm -rf "$OLD"
-    echo "install_hooks: pi cg-gate extension installed at $DEST (takes effect in new pi sessions)"
     exit 0
 fi
 

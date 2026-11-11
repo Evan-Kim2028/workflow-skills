@@ -61,6 +61,13 @@ session has run `cg` (or the `codegraph` MCP tool) once, appends a two-line
 `PI_CG_GATE=off` to disable it, and `PI_CG_GATE_CG` to point at a different
 `cg` binary. Re-running the installer is idempotent; `--uninstall` removes it.
 
+This gate is a nudge toward CodeGraph, not a security boundary: it deliberately
+allows nested shells (`bash -lc 'rg foo'`), command substitution, and anything
+it cannot confidently classify, because a missed search costs nothing while a
+wrongly blocked command costs a worker a turn. Its state (the CodeGraph-used
+flag and the three-block valve) lives in one extension runtime and is not
+persisted, so a resume or reload starts fresh with the gate closed again.
+
 ## Other skill folders
 
 Skills under `~/.claude/skills` that are not symlinks into this repo are not moved
