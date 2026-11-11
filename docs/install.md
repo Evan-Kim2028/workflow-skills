@@ -48,6 +48,19 @@ subcommands run against the main checkout's index when the current worktree
 has none, index writes (`init`, `index`, `sync`, `uninit`) are refused in a
 worktree, and `cg --where` prints the index it would use.
 
+## pi extension: cg-gate
+
+`sh tools/agent-dash/scripts/install_hooks.sh --pi-cg-gate` copies
+`plugins/pi-cg-gate/` to `<agent dir>/extensions/cg-gate/`, where pi
+auto-discovers it (`PI_CODING_AGENT_DIR`, default `~/.pi/agent`). The
+extension is active only when `cg --where` exits 0 in the session's working
+directory, so it does nothing where there is no CodeGraph index. Where it is
+active it blocks a recursive or multi-file code search in `bash` until the
+session has run `cg` (or the `codegraph` MCP tool) once, appends a two-line
+`cg`-first rule to the system prompt, and opens after three blocks. Set
+`PI_CG_GATE=off` to disable it, and `PI_CG_GATE_CG` to point at a different
+`cg` binary. Re-running the installer is idempotent; `--uninstall` removes it.
+
 ## Other skill folders
 
 Skills under `~/.claude/skills` that are not symlinks into this repo are not moved
