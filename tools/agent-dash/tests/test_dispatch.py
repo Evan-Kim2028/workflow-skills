@@ -43,6 +43,7 @@ class FakeWorker:
         self.alive_pids = set()
         self.pids = {}
         self.reports = {}
+        self.reasons = {}
         self.next_pid = 5000
 
     def __call__(self, argv):
@@ -71,11 +72,14 @@ class FakeWorker:
         err.write_text("", encoding="utf-8")
         if report.strip():
             return f"STATUS: done out={out} err={err} tier={tier}"
-        return f"STATUS: failed out={out} err={err} tier={tier} reason=empty-report"
+        reason = self.reasons.get(label, "empty-report")
+        return f"STATUS: failed out={out} err={err} tier={tier} reason={reason}"
 
-    def finish(self, label, report=None):
+    def finish(self, label, report=None, reason=None):
         if report is not None:
             self.reports[label] = report
+        if reason is not None:
+            self.reasons[label] = reason
         self.alive_pids.discard(self.pids[label])
 
     def launches_for(self, label):
@@ -319,7 +323,33 @@ class OutcomeTests(DispatchTestCase):
         lead = [e for e in self.events() if e["type"] == "needs-lead"]
         self.assertEqual([(e["task"], e["reason"]) for e in lead], [("WS9.A", "PARTIAL")])
 
-    def test_no_verdict_retries_once_on_another_tier_then_needs_lead(self):
+    def test_no_verdict_retries_once_on_the_same_tier_then_needs_lead(self):
+        disp = self.dispatcher()
+        disp.tick()
+        self.worker.finish(LABEL_A, "")
+        disp.tick()
+        retry_label = "ws9-exec-a-r1"
+        retry = self.worker.launches_for(retry_label)
+        self.assertEqual(len(retry), 1)
+        self.assertEqual(retry[0][2], "muse", "same-tier retry relaunches on the tier the task ran on")
+        self.assertTrue(all(not arg.startswith("--exclude=") for arg in retry[0]))
+        self.assertIn("retried", self.types())
+        retried = [e for e in self.events() if e["type"] == "retried"][0]
+        self.assertEqual((retried["from_tier"], retried["to_tier"], retried["reason"]), ("muse", "muse", "no-verdict"))
+        rows = (self.bundle / "reports" / "decisions.tsv").read_text(encoding="utf-8").splitlines()
+        self.assertEqual(len(rows), 2, "header plus one retry row")
+        self.assertIn("same tier", rows[1])
+        self.assertNotIn("excluding", rows[1])
+        self.worker.finish(retry_label, "")
+        disp.tick()
+        launched = [e["label"] for e in self.events() if e["type"] == "launched"]
+        self.assertEqual(launched.count(retry_label), 1, "the retry is launched once, never a third time")
+        lead = [e for e in self.events() if e["type"] == "needs-lead"]
+        self.assertEqual([(e["task"], e["reason"]) for e in lead], [("WS9.A", "no-verdict-twice")])
+        self.assertEqual(self.types().count("finished"), 2)
+
+    def test_retry_tier_auto_keeps_the_old_excluding_behaviour(self):
+        self.write_config(slots=2, retry_tier="auto")
         disp = self.dispatcher()
         disp.tick()
         self.worker.finish(LABEL_A, "")
@@ -329,18 +359,90 @@ class OutcomeTests(DispatchTestCase):
         self.assertEqual(len(retry), 1)
         self.assertIn("--exclude=muse", retry[0])
         self.assertEqual(retry[0][2], "auto")
-        self.assertIn("retried", self.types())
         retried = [e for e in self.events() if e["type"] == "retried"][0]
-        self.assertEqual((retried["from_tier"], retried["to_tier"]), ("muse", "glm-flash"))
+        self.assertEqual((retried["from_tier"], retried["to_tier"], retried["reason"]), ("muse", "glm-flash", "no-verdict"))
         rows = (self.bundle / "reports" / "decisions.tsv").read_text(encoding="utf-8").splitlines()
-        self.assertEqual(len(rows), 2, "header plus one retry row")
+        self.assertIn("on auto, excluding muse", rows[1])
+
+    def test_quota_death_waits_then_relaunches_same_tier_without_counting(self):
+        self.write_config(slots=2, retry_wait_s=90)
+        disp = self.dispatcher()
+        disp.tick()
+        self.worker.finish(LABEL_A, "", reason="quota")
+        self.worker.finish(LABEL_B, "PASS\nok\n")
+        disp.tick()
+        retry_label = "ws9-exec-a-r1"
+        self.assertEqual(self.worker.launches_for(retry_label), [], "a quota death waits out the cooldown first")
+        self.assertEqual(disp.status_summary()["tasks"]["WS9.A"]["status"], "retry-pending")
+        self.assertNotIn("needs-lead", self.types())
+        self.assertEqual(self.status_of("WS9.C"), "wip", "the waiting retry leaves its slot free")
+        self.clock.advance(89)
+        disp.tick()
+        self.assertEqual(self.worker.launches_for(retry_label), [])
+        self.clock.advance(1)
+        disp.tick()
+        retry = self.worker.launches_for(retry_label)
+        self.assertEqual(len(retry), 1)
+        self.assertEqual(retry[0][2], "muse")
+        self.assertTrue(all(not arg.startswith("--exclude=") for arg in retry[0]))
+        retried = [e for e in self.events() if e["type"] == "retried"][0]
+        self.assertEqual((retried["from_tier"], retried["to_tier"], retried["reason"]), ("muse", "muse", "quota"))
+        rows = (self.bundle / "reports" / "decisions.tsv").read_text(encoding="utf-8").splitlines()
+        self.assertIn("same tier", rows[1])
         self.worker.finish(retry_label, "")
         disp.tick()
-        launched = [e["label"] for e in self.events() if e["type"] == "launched"]
-        self.assertEqual(launched.count(retry_label), 1, "the retry is launched once, never a third time")
+        retry2 = self.worker.launches_for("ws9-exec-a-r2")
+        self.assertEqual(len(retry2), 1, "the quota retry did not consume the one no-verdict retry")
+        self.worker.finish("ws9-exec-a-r2", "")
+        disp.tick()
         lead = [e for e in self.events() if e["type"] == "needs-lead"]
         self.assertEqual([(e["task"], e["reason"]) for e in lead], [("WS9.A", "no-verdict-twice")])
-        self.assertEqual(self.types().count("finished"), 2)
+
+    def test_quota_retries_exhausted_hands_to_the_lead_as_rate_limited(self):
+        self.write_config(slots=2, retry_wait_s=5, quota_retries=1)
+        disp = self.dispatcher()
+        disp.tick()
+        self.worker.finish(LABEL_A, "", reason="quota")
+        self.worker.finish(LABEL_B, "PASS\nok\n")
+        disp.tick()
+        self.assertEqual(self.worker.launches_for("ws9-exec-a-r1"), [])
+        self.clock.advance(5)
+        disp.tick()
+        self.assertEqual(len(self.worker.launches_for("ws9-exec-a-r1")), 1)
+        self.worker.finish("ws9-exec-a-r1", "", reason="quota")
+        disp.tick()
+        self.assertEqual(self.worker.launches_for("ws9-exec-a-r2"), [], "no further quota relaunch past the budget")
+        lead = [e for e in self.events() if e["type"] == "needs-lead"]
+        self.assertEqual([(e["task"], e["reason"]) for e in lead], [("WS9.A", "rate-limited")])
+
+    def test_bad_retry_config_pauses_and_reports(self):
+        for bad in ({"retry_tier": "sometimes"}, {"retry_wait_s": "soon"}, {"retry_wait_s": -1}, {"quota_retries": -2}):
+            self.write_config(slots=2, **bad)
+            self.dispatcher().tick()
+            self.assertEqual(self.worker.argvs, [], f"{bad} must hold launches")
+        errors = [e for e in self.events() if e["type"] == "error" and e.get("phase") == "config"]
+        reasons = {e["reason"] for e in errors}
+        self.assertEqual(len(errors), 3, "the two negative values share one message and dedup")
+        self.assertTrue(any("retry_tier" in reason for reason in reasons))
+        self.assertTrue(any("non-numeric retry_wait_s or quota_retries" in reason for reason in reasons))
+        self.assertTrue(any("non-negative" in reason for reason in reasons))
+
+    def test_restart_mid_quota_wait_still_honours_the_wait(self):
+        self.write_config(slots=3, retry_wait_s=90)
+        self.dispatcher().tick()
+        self.worker.finish(LABEL_A, "", reason="quota")
+        self.dispatcher().tick()
+        retry_label = "ws9-exec-a-r1"
+        self.assertEqual(self.dispatcher().tick()["launched"], 0)
+        self.assertEqual(self.worker.launches_for(retry_label), [], "a restart does not skip the cooldown")
+        self.assertEqual(self.dispatcher().status_summary()["tasks"]["WS9.A"]["status"], "retry-pending")
+        self.clock.advance(90)
+        restarted = self.dispatcher()
+        self.assertEqual(restarted.tick()["launched"], 1)
+        retry = self.worker.launches_for(retry_label)
+        self.assertEqual(len(retry), 1)
+        self.assertEqual(retry[0][2], "muse")
+        self.assertTrue(all(not arg.startswith("--exclude=") for arg in retry[0]))
 
     def test_overdue_run_flags_the_lead_once_and_is_not_killed(self):
         self.write_prompt("WS9.A", front="---\nmax_wait: 10\n---\n")
@@ -637,6 +739,7 @@ class ReviewFixTests(DispatchTestCase):
         self.assertEqual(self.status_of("WS9.A"), "wip", "startup survives a damaged state file and launches")
 
     def test_a_retry_keeps_its_exclusion_on_every_observation(self):
+        self.write_config(slots=2, retry_tier="auto")
         disp = self.build()
         disp.tick()
         self.worker.finish(LABEL_A, "")
@@ -648,6 +751,20 @@ class ReviewFixTests(DispatchTestCase):
         self.assertGreaterEqual(len(argvs), 2, "one launch and one observation")
         for argv in argvs:
             self.assertIn("--exclude=muse", argv)
+
+    def test_a_same_tier_retry_passes_no_exclude_on_launch_or_observation(self):
+        disp = self.build()
+        disp.tick()
+        self.worker.finish(LABEL_A, "")
+        disp.tick()
+        retry_label = "ws9-exec-a-r1"
+        self.worker.finish(retry_label, "")
+        self.build().tick()
+        argvs = self.worker.launches_for(retry_label)
+        self.assertGreaterEqual(len(argvs), 2, "one launch and one observation")
+        for argv in argvs:
+            self.assertTrue(all(not arg.startswith("--exclude=") for arg in argv))
+            self.assertEqual(argv[2], "muse")
 
     def test_a_reused_pid_is_not_taken_for_the_dispatcher(self):
         (self.bundle / "dispatch.pid").write_text(f"{os.getpid()}\n", encoding="utf-8")

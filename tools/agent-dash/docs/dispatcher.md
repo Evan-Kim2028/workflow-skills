@@ -15,7 +15,8 @@ Code:
 - `dash/admission.py`: the execution leases a launch takes over its declared files.
 - `dash/evidence.py`: the acceptance probe and the receipt a contract PASS must earn.
 - `scripts/run_worker.py`: launches a tier. A max-wait of `0` launches and returns;
-  `--exclude=<tier>` keeps `auto` off a tier (used for the one retry).
+  `--exclude=<tier>` keeps `auto` off a tier (used for a retry only when
+  `retry_tier` is `auto`).
 - `tests/test_dispatch.py`: loop cases with a fake launcher and fake clock.
 - `tests/test_control_plane_e2e.py`: the whole chain, lease to receipt to `pr`.
 
@@ -24,7 +25,7 @@ Bundle files, in the workstream bundle directory (`AGENT_DASH_WORKSTREAMS` honou
 | File | Owner | What it holds |
 |---|---|---|
 | `prompts/<task-id>.md` | lead | worker prompt; optional front matter `tier`, `workspace`, `kind: write\|read`, `max_wait` (seconds) |
-| `dispatch.json` | lead | `slots`, `tier` (default `auto`), `workspace`, `paused`, `merge_wave: {min_ready, max_age_min}` |
+| `dispatch.json` | lead | `slots`, `tier` (default `auto`), `workspace`, `paused`, `merge_wave: {min_ready, max_age_min}`, `retry_tier: same\|auto` (default `same`), `retry_wait_s` (default `90`), `quota_retries` (default `8`) |
 | `dispatch-state.json` | dispatcher | pid, heartbeat, per-task run state; written atomically |
 | `inbox.jsonl` | dispatcher | append-only events, each with a monotonic `seq` |
 | `inbox.cursor` | `dispatch wait` | last seq printed |
@@ -103,10 +104,18 @@ Each tick, and immediately when a tracked worker's pid exits, the dispatcher:
 1. Observes finished runs. A PASS on a write task moves it to `pr`; a PASS on a
    read task moves it to `done`. A contract task's PASS is verified first (see
    Contract verification). PARTIAL or BLOCKED leaves it `wip` and emits
-   `needs-lead`. No verdict (empty report, early death) relaunches once on `auto`
-   excluding the failed tier (`retried`); a second miss emits `needs-lead`. While
-   paused, or while `dispatch.json` is broken, a due retry waits as `retry-pending`
-   and goes out once the config is fixed or the pause lifts.
+   `needs-lead`. No verdict (empty report, early death) relaunches once on the
+   tier the task ran on (`retried`, carrying the real `from_tier`, `to_tier`
+   and `reason`); a second miss emits `needs-lead` (`no-verdict-twice`). With
+   `retry_tier: auto` the retry relaunches on `auto` excluding the failed tier
+   instead. A run that dies on a quota/rate-limit hit (`reason=quota`) is not a
+   no-verdict retry: it waits `retry_wait_s` seconds as `retry-pending` (its slot
+   stays free), then relaunches like any other retry, up to `quota_retries` times
+   before it emits `needs-lead` (`rate-limited`). A quota retry never consumes
+   the one no-verdict retry. While paused, while
+   `dispatch.json` is broken, or while a quota cooldown is still running, a due
+   retry waits as `retry-pending` and goes out once the config is fixed, the
+   pause lifts, or the cooldown ends.
 2. Counts live runs (its own plus the dashboard's for the workstream) against `slots`.
 3. Launches ready tasks in `ready_queue` order, skipping gates and tasks with a live
    run. A ready task with no prompt emits `needs-prompt` once. A launched task moves
@@ -194,5 +203,9 @@ set a `needs-lead` task back to `todo` only after you rewrite its prompt.
   front matter, or the launch fails with a `no workspace` error event.
 - `max_wait` only flags a run as `needs-lead` (`reason: overdue`). It never kills it.
 - Gate tasks (`kind: gate`) are never launched.
-- A retry is the only automatic relaunch; the tier registry's quota fallback inside
-  `run_worker.py` still applies to every launch.
+- Retries are the only automatic relaunches: one no-verdict retry per task (then
+  `no-verdict-twice`), plus up to `quota_retries` relaunches per task for quota
+  deaths spaced `retry_wait_s` seconds apart (then `rate-limited`).
+  `retry_tier: auto` moves every retry to `auto`, excluding the failed tier.
+  The tier registry's quota fallback inside `run_worker.py` still applies to
+  every launch.

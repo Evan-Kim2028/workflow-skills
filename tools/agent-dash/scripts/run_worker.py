@@ -6,7 +6,7 @@ Usage: run_worker.py <tier|default|auto> <label> <workspace> <prompt-file> <run-
 A max-wait of 0 launches and returns at once: STATUS is ``running`` while the
 worker lives, and a later call for the same label observes it (the dispatcher
 uses this to detach). ``--exclude=<tier>`` (repeatable) keeps an ``auto``
-launch off a tier, so a retry after an early death lands on another one.
+launch off a tier, so an `auto` retry after an early death lands on another one.
 
 A fast doctor preflight (dashboard reachable, run dir visible, tier model
 priced and policy-compliant) runs before launching; a failure prints the
