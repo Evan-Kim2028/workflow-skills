@@ -257,6 +257,9 @@
       "test_server",
       "test_ws_cli"
     ],
+    "plugins/pi-cg-gate/**": [
+      "test_pi_cg_gate"
+    ],
     "plugins/**": [
       "test_label_guard_clis"
     ],
@@ -278,7 +281,9 @@
     "scripts/install_hooks.sh": [
       "test_gate",
       "test_label_guard_hook",
-      "test_label_guard_clis"
+      "test_label_guard_clis",
+      "test_cg_shim",
+      "test_pi_cg_gate"
     ],
     "scripts/label_guard_hook.py": [
       "test_label_guard_hook",
@@ -342,6 +347,9 @@
     ],
     "shims/**": [
       "test_label_guard_clis"
+    ],
+    "shims/cg": [
+      "test_cg_shim"
     ],
     "static/*": [
       "test_page_rules",

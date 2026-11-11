@@ -1,0 +1,378 @@
+#!/usr/bin/env python3
+"""cg - worktree-aware wrapper for the `codegraph` CLI (agent-dash).
+
+A worktree has no CodeGraph index of its own. Rather than print "not
+available" and exit 0 (which sends a worker back to grep), `cg` finds the
+index in the repo's main checkout and runs read subcommands there, with
+`-p <main>` replacing any path the caller gave. Index-writing subcommands
+are refused in a worktree: a worktree is never indexed.
+
+A linked worktree is recognised from git (its git dir differs from the
+common git dir). There, only the worktree's own top level can supply a
+local index; the ancestor search never reaches into the main checkout or
+an unrelated outer repository. `--` ends option parsing: every token
+after it is passed through untouched.
+
+Install: copy or symlink this file to a directory that precedes the real
+`codegraph` on PATH (scripts/install_hooks.sh --codex-shim prints the
+exact line; it does not edit your shell rc). Tests point CG_REAL_CODEGRAPH
+at a fake binary.
+
+Exit codes:
+  0/real  the real binary's own status (read/pass-through)
+  2       index-writing subcommand in a worktree, or a shim-side refusal
+  3       no CodeGraph index for the start directory or its main checkout
+  127     no `codegraph` binary (CG_REAL_CODEGRAPH unset and not on PATH)
+"""
+import os
+import shutil
+import subprocess
+import sys
+
+# Subcommands that accept `-p/--path` and only read the index.
+READ_SUBCOMMANDS = {
+    "affected",
+    "callees",
+    "callers",
+    "context",
+    "explore",
+    "files",
+    "impact",
+    "node",
+    "query",
+}
+# Subcommands that write or remove the index.
+WRITE_SUBCOMMANDS = {"index", "init", "sync", "uninit"}
+PASS_THROUGH_FLAGS = {"--help", "-h", "--version", "-V"}
+
+INDEX_DB_NAME = "codegraph.db"
+
+
+def real_binary():
+    """The real codegraph binary: CG_REAL_CODEGRAPH, else the first on PATH."""
+    override = os.environ.get("CG_REAL_CODEGRAPH")
+    if override:
+        if os.sep not in override and not os.path.exists(override):
+            found = shutil.which(override)
+            if found:
+                return found
+        return override
+    return shutil.which("codegraph")
+
+
+def has_index(root):
+    """True when root/.codegraph holds a real index.
+
+    Only `codegraph.db` itself counts. A sidecar `codegraph.db-wal`, or the
+    `.gitignore` a failed `codegraph init` leaves in a worktree, is not an
+    index and must not shadow the main checkout's.
+    """
+    return os.path.isfile(os.path.join(root, ".codegraph", INDEX_DB_NAME))
+
+
+def git_info(start):
+    """(top level, git dir, common git dir) as real paths, or None.
+
+    A linked worktree has separate per-worktree and common git dirs; a
+    normal checkout, a bare repo and a submodule have the same path twice.
+    """
+    try:
+        proc = subprocess.run(
+            [
+                "git",
+                "-C",
+                start,
+                "rev-parse",
+                "--path-format=absolute",
+                "--show-toplevel",
+                "--git-dir",
+                "--git-common-dir",
+            ],
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        return None
+    if proc.returncode != 0:
+        return None
+    lines = proc.stdout.splitlines()
+    if len(lines) < 3:
+        return None
+    top, git_dir, common = (os.path.realpath(line) for line in lines[:3])
+    return top, git_dir, common
+
+
+def is_linked_worktree(info):
+    return info is not None and info[1] != info[2]
+
+
+def nearest_index_root(start):
+    """The nearest ancestor of start that holds a CodeGraph index."""
+    path = os.path.realpath(start)
+    while True:
+        if has_index(path):
+            return path
+        parent = os.path.dirname(path)
+        if parent == path:
+            return None
+        path = parent
+
+
+def local_index_root(start, info):
+    """The index root the caller may use locally.
+
+    Inside a repository the search stops at its top level: a linked
+    worktree may use only its own top level, never an ancestor outside it.
+    Outside git, fall back to the nearest indexed ancestor.
+    """
+    if info is None:
+        return nearest_index_root(start)
+    top = info[0]
+    if is_linked_worktree(info):
+        return top if has_index(top) else None
+    path = os.path.realpath(start)
+    while True:
+        if has_index(path):
+            return path
+        if path == top:
+            return None
+        parent = os.path.dirname(path)
+        if parent == path:
+            return None
+        path = parent
+
+
+def main_checkout(info):
+    """The main checkout of info's repo when it holds an index, else None."""
+    if info is None:
+        return None
+    common = info[2]
+    # A linked worktree's common git dir is <main>/.git. A bare repo or a
+    # submodule has another shape; leave those alone.
+    if os.path.basename(common) != ".git":
+        return None
+    main = os.path.dirname(common)
+    return main if has_index(main) else None
+
+
+def split_delimiter(args):
+    """(tokens before the first `--`, tokens from it onward)."""
+    for i, arg in enumerate(args):
+        if arg == "--":
+            return list(args[:i]), list(args[i:])
+    return list(args), []
+
+
+def attached_path_value(arg):
+    """The value of a Commander attached short path option, `-pVALUE`."""
+    if arg.startswith("-p") and not arg.startswith("--") and len(arg) > 2:
+        return arg[2:]
+    return None
+
+
+def path_option_width(args, i):
+    """How many tokens the path option at args[i] spans; 0 when it is none."""
+    arg = args[i]
+    if arg in ("-p", "--path"):
+        return 2
+    if arg.startswith("--path=") or attached_path_value(arg) is not None:
+        return 1
+    return 0
+
+
+def path_argument(args):
+    """The value of -p/--path/--path=/-pVALUE before `--`, or None.
+
+    Nothing after `--` is read as an option or as a path.
+    """
+    segment, _ = split_delimiter(args)
+    for i, arg in enumerate(segment):
+        if arg in ("-p", "--path"):
+            return segment[i + 1] if i + 1 < len(segment) else None
+        if arg.startswith("--path="):
+            return arg[len("--path="):]
+        attached = attached_path_value(arg)
+        if attached is not None:
+            return attached
+    return None
+
+
+def strip_path_arguments(segment):
+    """Drop every path option from the tokens before `--`."""
+    kept = []
+    i = 0
+    while i < len(segment):
+        width = path_option_width(segment, i)
+        if width:
+            i += width
+            continue
+        kept.append(segment[i])
+        i += 1
+    return kept
+
+
+def first_positional(segment):
+    """The first non-option token before `--`, skipping path option values."""
+    i = 0
+    while i < len(segment):
+        width = path_option_width(segment, i)
+        if width:
+            i += width
+            continue
+        if not segment[i].startswith("-"):
+            return segment[i]
+        i += 1
+    return None
+
+
+def subcommand(args):
+    """The likely subcommand, preferring a recognisable name before `--`.
+
+    Option arity is not knowable here, so a first positional that is not a
+    known subcommand (for example the `5` in `--max-files 5 explore q`) is
+    not trusted. Any recognised subcommand name before `--` then decides,
+    a read name first.
+    """
+    segment, _ = split_delimiter(args)
+    first = first_positional(segment)
+    if first in READ_SUBCOMMANDS or first in WRITE_SUBCOMMANDS:
+        return first
+    names = [
+        arg
+        for arg in segment
+        if arg in READ_SUBCOMMANDS or arg in WRITE_SUBCOMMANDS
+    ]
+    for name in names:
+        if name in READ_SUBCOMMANDS:
+            return name
+    return names[0] if names else first
+
+
+def count_path_options(args):
+    """How many path options appear before `--`."""
+    segment, _ = split_delimiter(args)
+    count = 0
+    i = 0
+    while i < len(segment):
+        width = path_option_width(segment, i)
+        if width:
+            count += 1
+            i += width
+        else:
+            i += 1
+    return count
+
+
+def redirected_args(args, main, sub):
+    """args with every caller path replaced by one `-p <main>`.
+
+    The option goes after a leading subcommand, otherwise immediately
+    before the recognised subcommand, and always before `--`. Tokens after
+    `--` are preserved byte-for-byte.
+    """
+    segment, tail = split_delimiter(args)
+    kept = strip_path_arguments(segment)
+    first = first_positional(kept)
+    if sub is None or first == sub:
+        if first is None:
+            result = ["-p", main] + kept
+        else:
+            at = kept.index(first)
+            result = kept[: at + 1] + ["-p", main] + kept[at + 1:]
+    else:
+        at = kept.index(sub) if sub in kept else len(kept)
+        result = kept[:at] + ["-p", main] + kept[at:]
+    return result + tail
+
+
+def exec_real(binary, args):
+    """Replace this process with the real binary, keeping stdio and status."""
+    try:
+        os.execv(binary, [binary] + args)
+    except OSError as exc:
+        sys.stderr.write("cg: cannot run %s: %s\n" % (binary, exc))
+        return 127
+    return 127
+
+
+def resolve_root(start):
+    """The index root for start: local index, else the main checkout's."""
+    info = git_info(start)
+    return local_index_root(start, info) or main_checkout(info)
+
+
+def main(argv):
+    args = argv[1:]
+
+    if args and args[0] == "--where":
+        start = path_argument(args[1:]) or os.getcwd()
+        root = resolve_root(start)
+        if root:
+            print(root)
+            return 0
+        sys.stderr.write(
+            "cg: no CodeGraph index for %s or its main checkout\n"
+            % os.path.realpath(start)
+        )
+        return 3
+
+    binary = real_binary()
+    if not binary:
+        sys.stderr.write(
+            "cg: no codegraph binary (set CG_REAL_CODEGRAPH or put codegraph on PATH)\n"
+        )
+        return 127
+
+    # --help, --version and a bare `cg` never need an index. Flags after
+    # `--` are literals, not flags.
+    segment, _ = split_delimiter(args)
+    if not args or any(arg in PASS_THROUGH_FLAGS for arg in segment):
+        return exec_real(binary, args)
+
+    start = path_argument(args) or os.getcwd()
+    info = git_info(start)
+    sub = subcommand(args)
+
+    # In a linked worktree the refusal comes before any index lookup, so a
+    # nested or self-indexed worktree cannot slip an index-writing command
+    # through to the main checkout's index.
+    if is_linked_worktree(info) and sub in WRITE_SUBCOMMANDS:
+        main = main_checkout(info)
+        sys.stderr.write(
+            "cg: refusing to %s in a worktree; a worktree is never indexed. "
+            "Use the main checkout at %s.\n" % (sub, main or info[0])
+        )
+        return 2
+
+    if local_index_root(start, info):
+        return exec_real(binary, args)
+
+    main = main_checkout(info)
+    if main:
+        if sub in READ_SUBCOMMANDS:
+            redirected = redirected_args(args, main, sub)
+            if count_path_options(redirected) != 1:
+                sys.stderr.write(
+                    "cg: internal error: redirected argv has %d path options\n"
+                    % count_path_options(redirected)
+                )
+                return 2
+            sys.stderr.write(
+                "cg: using the index at %s; this worktree has no index. "
+                "Read files from your own worktree where your branch differs.\n"
+                % main
+            )
+            return exec_real(binary, redirected)
+        # Unknown subcommands (status, daemon, install, ...) pass through
+        # unchanged rather than guessing.
+        return exec_real(binary, args)
+
+    sys.stderr.write(
+        "cg: no CodeGraph index for %s or its main checkout\n"
+        % os.path.realpath(start)
+    )
+    return 3
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

@@ -34,19 +34,33 @@
 #     one entry per hook and never touches other settings.
 #
 #   sh tools/agent-dash/scripts/install_hooks.sh --codex-shim
-#     once per machine: copies the `muse` label-guard shim to
-#     ~/.local/share/agent-dash/bin/muse and prints the PATH line that
-#     puts it first. Codex documents no user-configurable pre-exec hook
-#     surface in its installed docs/--help, so the shim (which refuses
-#     `muse exec --prompt-file <bad-label>.md` before execing the real
-#     binary) is the structural guard there. Raw TSV appends from Codex
-#     stay unguarded: the residual gap. This flag edits no shell rc and
-#     no Codex config; enabling the PATH line is the owner's step.
+#     once per machine: copies the `muse` label-guard shim and the `cg`
+#     worktree-aware codegraph shim to ~/.local/share/agent-dash/bin/ and
+#     prints the PATH line that puts them first. Codex documents no
+#     user-configurable pre-exec hook surface in its installed docs/--help,
+#     so the muse shim (which refuses `muse exec --prompt-file
+#     <bad-label>.md` before execing the real binary) is the structural
+#     guard there. Raw TSV appends from Codex stay unguarded: the residual
+#     gap. The cg shim runs read subcommands against the main checkout's
+#     index from a worktree and refuses index writes there. This flag edits
+#     no shell rc and no Codex config; enabling the PATH line is the owner's
+#     step.
+#
+#   sh tools/agent-dash/scripts/install_hooks.sh --pi-cg-gate
+#     once per machine: installs the pi extension that blocks recursive or
+#     multi-file code search until CodeGraph has run once in the session
+#     (plugins/pi-cg-gate/ copied to <agent dir>/extensions/cg-gate/). The
+#     agent dir is PI_CODING_AGENT_DIR, default ~/.pi/agent. Idempotent:
+#     a re-run with identical files changes nothing, and the destination
+#     directory is kept in place while each changed file is replaced by an
+#     atomic rename (temp file in the same directory). Takes effect in new
+#     pi sessions.
 #
 #   sh tools/agent-dash/scripts/install_hooks.sh --uninstall
-#     removes the grok hook file, the muse plugin, the shim copy, and
-#     the lead-guard entries from ~/.claude/settings.json (other settings
-#     entries stay). Config backups (*.bak-*) are left in place.
+#     removes the grok hook file, the muse plugin, the shim copies, the pi
+#     cg-gate extension, and the lead-guard entries from
+#     ~/.claude/settings.json (other settings entries stay). Config backups
+#     (*.bak-*) are left in place.
 #
 # The pre-push install refuses to overwrite a foreign hook (one without
 # the marker below); remove or merge that hook by hand first.
@@ -238,21 +252,75 @@ fi
 
 if [ "${1:-}" = "--codex-shim" ]; then
     HERE="$(cd "$(dirname "$0")" && pwd)"
-    SRC="$HERE/../shims/muse"
-    [ -f "$SRC" ] || { echo "install_hooks: no shim at $SRC" >&2; exit 2; }
     DESTDIR="$HOME/.local/share/agent-dash/bin"
-    DEST="$DESTDIR/muse"
     mkdir -p "$DESTDIR" || { echo "install_hooks: cannot create $DESTDIR" >&2; exit 1; }
-    if [ -f "$DEST" ] && cmp -s "$SRC" "$DEST"; then
-        echo "install_hooks: codex shim already installed at $DEST"
-    else
-        cp "$SRC" "$DEST" || { echo "install_hooks: cannot write $DEST" >&2; exit 1; }
-        chmod +x "$DEST"
-        echo "install_hooks: muse label-guard shim installed at $DEST"
-    fi
-    echo "install_hooks: to enable, put it first on PATH in new shells:"
+    for name in muse cg; do
+        SRC="$HERE/../shims/$name"
+        DEST="$DESTDIR/$name"
+        [ -f "$SRC" ] || { echo "install_hooks: no shim at $SRC" >&2; exit 2; }
+        if [ -f "$DEST" ] && cmp -s "$SRC" "$DEST"; then
+            chmod +x "$DEST"
+            echo "install_hooks: $name shim already installed at $DEST"
+        else
+            TMP="$DEST.tmp.$$"
+            cp "$SRC" "$TMP" || { echo "install_hooks: cannot write $DEST" >&2; rm -f "$TMP"; exit 1; }
+            chmod +x "$TMP"
+            # Atomic rename: a concurrent worker never execs a half copy.
+            mv "$TMP" "$DEST" || { echo "install_hooks: cannot write $DEST" >&2; rm -f "$TMP"; exit 1; }
+            echo "install_hooks: $name shim installed at $DEST"
+        fi
+    done
+    echo "install_hooks: to enable, put them first on PATH in new shells:"
     echo "install_hooks:   export PATH=\"$DESTDIR:\$PATH\""
     echo "install_hooks: then verify with: PATH=\"$DESTDIR:\$PATH\" command -v muse"
+    echo "install_hooks: and:               PATH=\"$DESTDIR:\$PATH\" command -v cg"
+    exit 0
+fi
+
+if [ "${1:-}" = "--pi-cg-gate" ]; then
+    HERE="$(cd "$(dirname "$0")" && pwd)"
+    SRC="$HERE/../plugins/pi-cg-gate"
+    [ -f "$SRC/index.ts" ] || { echo "install_hooks: no pi cg-gate extension at $SRC" >&2; exit 2; }
+    AGENT_DIR="${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}"
+    EXTDIR="$AGENT_DIR/extensions"
+    DEST="$EXTDIR/cg-gate"
+    # Keep DEST in place: a concurrent pi session must always find the
+    # directory, and a failed update must never leave it missing.
+    mkdir -p "$DEST" || { echo "install_hooks: cannot create $DEST" >&2; exit 1; }
+    changed=0
+    for SRC_FILE in "$SRC"/*; do
+        [ -f "$SRC_FILE" ] || continue
+        NAME=$(basename "$SRC_FILE")
+        TARGET="$DEST/$NAME"
+        if [ -f "$TARGET" ] && cmp -s "$SRC_FILE" "$TARGET"; then
+            continue
+        fi
+        TMP="$DEST/.$NAME.tmp.$$"
+        cp "$SRC_FILE" "$TMP" || {
+            echo "install_hooks: cannot write $TARGET" >&2
+            rm -f "$TMP"
+            exit 1
+        }
+        # Atomic rename inside the destination directory: a reader sees the
+        # old file or the new one, never a half copy.
+        if ! mv "$TMP" "$TARGET"; then
+            echo "install_hooks: cannot write $TARGET" >&2
+            rm -f "$TMP"
+            exit 1
+        fi
+        changed=1
+    done
+    # Drop files this version no longer ships.
+    for DEST_FILE in "$DEST"/*; do
+        [ -f "$DEST_FILE" ] || continue
+        NAME=$(basename "$DEST_FILE")
+        [ -f "$SRC/$NAME" ] || rm -f "$DEST_FILE"
+    done
+    if [ "$changed" -eq 1 ]; then
+        echo "install_hooks: pi cg-gate extension installed at $DEST (takes effect in new pi sessions)"
+    else
+        echo "install_hooks: pi cg-gate extension already installed at $DEST"
+    fi
     exit 0
 fi
 
@@ -301,14 +369,18 @@ EOF
     if command -v muse >/dev/null 2>&1 && muse plugins list --json 2>/dev/null | grep -q '"label-guard"'; then
         muse plugins remove label-guard 2>&1 | head -n 3 || echo "install_hooks: muse plugin remove failed" >&2
     fi
-    SFILE="$HOME/.local/share/agent-dash/bin/muse"
-    [ -f "$SFILE" ] && rm -f "$SFILE" && echo "install_hooks: removed $SFILE"
+    for name in muse cg; do
+        SFILE="$HOME/.local/share/agent-dash/bin/$name"
+        [ -f "$SFILE" ] && rm -f "$SFILE" && echo "install_hooks: removed $SFILE"
+    done
+    PI_EXT="${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}/extensions/cg-gate"
+    [ -d "$PI_EXT" ] && rm -rf "$PI_EXT" && echo "install_hooks: removed $PI_EXT"
     echo "install_hooks: uninstall done (backups *.bak-* left in place)"
     exit 0
 fi
 
 if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
-    echo "usage: sh tools/agent-dash/scripts/install_hooks.sh [--claude-label-guard|--claude-lead-guard|--grok-label-guard|--muse-label-guard|--codex-shim|--uninstall]"
+    echo "usage: sh tools/agent-dash/scripts/install_hooks.sh [--claude-label-guard|--claude-lead-guard|--grok-label-guard|--muse-label-guard|--codex-shim|--pi-cg-gate|--uninstall]"
     exit 0
 fi
 

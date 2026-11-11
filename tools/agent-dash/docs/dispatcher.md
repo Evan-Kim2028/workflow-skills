@@ -25,7 +25,7 @@ Bundle files, in the workstream bundle directory (`AGENT_DASH_WORKSTREAMS` honou
 | File | Owner | What it holds |
 |---|---|---|
 | `prompts/<task-id>.md` | lead | worker prompt; optional front matter `tier`, `workspace`, `kind: write\|read`, `max_wait` (seconds) |
-| `dispatch.json` | lead | `slots`, `tier` (default `auto`), `workspace`, `paused`, `merge_wave: {min_ready, max_age_min}`, `retry_tier: same\|auto` (default `same`), `retry_wait_s` (default `90`), `quota_retries` (default `8`) |
+| `dispatch.json` | lead | `slots`, `tier` (default `auto`), `workspace`, `paused`, `merge_wave: {min_ready, max_age_min}`, `retry_tier: same\|auto` (default `same`), `retry_wait_s` (default `90`), `quota_retries` (default `8`), `probe_timeout_s` (default `90`) |
 | `dispatch-state.json` | dispatcher | pid, heartbeat, per-task run state; written atomically |
 | `inbox.jsonl` | dispatcher | append-only events, each with a monotonic `seq` |
 | `inbox.cursor` | `dispatch wait` | last seq printed |
@@ -124,6 +124,14 @@ Each tick, and immediately when a tracked worker's pid exits, the dispatcher:
    `max_age_min`. It never merges.
 5. Emits `idle` once when nothing is ready, nothing is live and todo work remains.
 
+## Provider faults: a wait, not a failed attempt
+
+A run whose logs carry a provider fault (HTTP 5xx, a connection error, a 400/404 naming the model or variant, a 401/403 from the provider, "overloaded") and no verdict is `reason=provider`: it spends no retry and stays on its own tier.
+Its tier goes unhealthy with one `tier-unhealthy` event; its tasks return to `retry-pending` for `retry_wait_s`, and nothing launches on that tier until a probe passes.
+The probe runs the tier's own launcher with a one-step, tool-using prompt under `probe_timeout_s`; a PASS report carrying the tool's output is a pass.
+A pass emits one `tier-recovered` event and relaunches the waiting tasks on the same tier; a fail probes again after `retry_wait_s`.
+A real task failure still spends the one no-verdict retry.
+
 Events carry `seq`, `ts`, `type`, `ws`, `task` and `label`, plus type fields:
 `launched`, `finished` (verdict, out, tier, duration_s), `retried`, `needs-prompt`,
 `needs-lead` (reason), `merge-wave` (tasks), `idle` (todo), `stopped`, `error`
@@ -204,8 +212,10 @@ set a `needs-lead` task back to `todo` only after you rewrite its prompt.
 - `max_wait` only flags a run as `needs-lead` (`reason: overdue`). It never kills it.
 - Gate tasks (`kind: gate`) are never launched.
 - Retries are the only automatic relaunches: one no-verdict retry per task (then
-  `no-verdict-twice`), plus up to `quota_retries` relaunches per task for quota
-  deaths spaced `retry_wait_s` seconds apart (then `rate-limited`).
-  `retry_tier: auto` moves every retry to `auto`, excluding the failed tier.
+  `no-verdict-twice`), up to `quota_retries` relaunches per task for quota deaths
+  spaced `retry_wait_s` seconds apart (then `rate-limited`), and provider-fault
+  relaunches that spend neither budget but wait for the tier's health probe.
+  `retry_tier: auto` moves every retry to `auto`, excluding the failed tier,
+  except a provider retry, which always stays on its tier.
   The tier registry's quota fallback inside `run_worker.py` still applies to
   every launch.
