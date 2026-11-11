@@ -50,7 +50,6 @@ COMMANDS = [
     ("git grep -n foo", True),
     ('find . -name \'*.py\' | grep -n "merge"', False),
     ("find . -type f | grep foo", False),
-    ("ls scripts | grep test", False),
     ("find . -name '*.py' | xargs grep -n foo", True),
     ("grep -rn foo . | head", True),
     ("cd src && rg foo", True),
@@ -104,6 +103,7 @@ REGRESSIONS = [
     ("find . -name '*.md' -prune -o -type f -print | xargs grep foo", True),
     ("rg foo src/v1.2/", True),
     ("find . -name '*.py' | sort | xargs grep foo", True),
+    ("ls scripts | grep test", False),
     # finding 4: grouping and git global options
     ("(cd src && grep -rn foo .)", True),
     ("{ grep -rn foo .; }", True),
