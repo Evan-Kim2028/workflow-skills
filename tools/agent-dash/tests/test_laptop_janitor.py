@@ -581,6 +581,40 @@ class GitRepoCase(JanitorCase):
             self.git("merge", "--ff-only", branch, cwd=self.repo)
         self.git("push", "-q", "origin", "main", cwd=self.repo)
 
+    def merge_into_batch(self, branch, batch="batch/one", days_ago=5):
+        """Merge ``branch`` into a batch branch with a merge commit."""
+        self.git("checkout", "-q", "-B", batch, "main", cwd=self.repo)
+        self.git(
+            "merge", "--no-ff", "-q", "-m", "merge " + branch, branch, cwd=self.repo
+        )
+        head = self.git("rev-parse", "HEAD", cwd=self.repo).stdout.strip()
+        self.git("checkout", "-q", "main", cwd=self.repo)
+        return head
+
+    def squash_batch(self, batch="batch/one", days_ago=5):
+        """Land the batch branch on main as one squash commit."""
+        self.git("merge", "--squash", batch, cwd=self.repo)
+        self.commit(self.repo, "squash " + batch, days_ago=days_ago)
+        self.git("push", "-q", "origin", "main", cwd=self.repo)
+
+    def removal_reasons(self, jan):
+        return [
+            a.get("reason")
+            for a in jan.actions
+            if a.get("sweeper") == "worktrees" and a.get("verb") == "remove"
+        ]
+
+    def removal_reason_for(self, jan, path):
+        real = os.path.realpath(path)
+        for action in jan.actions:
+            if action.get("sweeper") != "worktrees":
+                continue
+            if action.get("verb") != "remove":
+                continue
+            if os.path.realpath(action.get("target") or "") == real:
+                return action.get("reason")
+        return None
+
     def janitor_for_worktrees(self, apply=True, snapshot=None, extra=None):
         cfg = {"repos": [self.repo], "worktree_manager_cmd": "janitor-test-no-such-tool"}
         cfg.update(extra or {})
@@ -617,7 +651,7 @@ class WorktreeSweeperTests(GitRepoCase):
     def test_unmerged_worktree_kept(self):
         wt = self.add_worktree("feat/unmerged", days_ago=10)
         jan = self.janitor_for_worktrees(apply=True)
-        jan.pr_merged_heads = lambda repo, branch, base: []
+        jan._fetch_merged_pr_heads = lambda repo, base: []
         jan.sweep_worktrees()
         self.assertTrue(os.path.isdir(wt))
         self.assertIn("unmerged", jan.keep_counts["worktrees"])
@@ -890,7 +924,7 @@ class WorktreeSweeperTests(GitRepoCase):
     def test_merged_pr_lookup_with_different_head_kept(self):
         wt = self.add_worktree("feat/pr-other", days_ago=10)
         jan = self.janitor_for_worktrees(apply=True)
-        jan.pr_merged_heads = lambda repo, branch, base: ["0" * 40]
+        jan._fetch_merged_pr_heads = lambda repo, base: ["0" * 40]
         jan.sweep_worktrees()
         self.assertTrue(os.path.isdir(wt))
 
@@ -898,7 +932,7 @@ class WorktreeSweeperTests(GitRepoCase):
         wt = self.add_worktree("feat/pr-match", days_ago=10)
         tip = self.git("rev-parse", "HEAD", cwd=wt).stdout.strip()
         jan = self.janitor_for_worktrees(apply=True)
-        jan.pr_merged_heads = lambda repo, branch, base: [tip]
+        jan._fetch_merged_pr_heads = lambda repo, base: [tip]
         jan.sweep_worktrees()
         self.assertFalse(os.path.exists(wt))
 
@@ -917,12 +951,15 @@ class WorktreeSweeperTests(GitRepoCase):
         old_path = os.environ.get("PATH", "")
         os.environ["PATH"] = str(bindir) + os.pathsep + old_path
         try:
-            jan.pr_merged_heads(self.repo, "feat/base", "main")
+            jan.merged_pr_heads(self.repo, "main")
         finally:
             os.environ["PATH"] = old_path
         args = json.loads(record.read_text(encoding="utf-8"))
         self.assertIn("--base", args)
         self.assertEqual(args[args.index("--base") + 1], "main")
+        self.assertIn("--limit", args)
+        self.assertEqual(args[args.index("--limit") + 1], "300")
+        self.assertNotIn("--head", args)
 
     def test_head_moved_during_merge_proof_kept(self):
         wt = self.add_worktree("feat/moved", days_ago=10)
@@ -1010,6 +1047,154 @@ class WorktreeSweeperTests(GitRepoCase):
         self.assertTrue(os.path.isdir(wt))
         self.assertFalse((self.state / "recovery.jsonl").exists())
         self.assertEqual(jan.removed, 1)
+
+
+# --- merge proofs: batch branches and identical changes --------------------
+
+
+class MergedBatchProofTests(GitRepoCase):
+    """A batch branch merged into main as one squash commit."""
+
+    def test_branch_merged_into_a_merged_batch_head_removed(self):
+        wt = self.add_worktree("feat/batch-a", days_ago=10)
+        head = self.merge_into_batch("feat/batch-a")
+        self.squash_batch()
+        jan = self.janitor_for_worktrees(apply=True)
+        jan._fetch_merged_pr_heads = lambda repo, base: [head]
+        jan.sweep_worktrees()
+        self.assertFalse(os.path.exists(wt))
+        self.assertEqual(self.removal_reasons(jan), ["in-merged-pull-request"])
+
+    def test_batch_head_not_present_locally_kept(self):
+        wt = self.add_worktree("feat/absent-head", days_ago=10)
+        self.git("push", "-q", "origin", "feat/absent-head", cwd=self.repo)
+        other = str(self.base / "other")
+        self.git("clone", "-q", self.origin, other, cwd=str(self.base))
+        self.git("checkout", "-q", "-B", "batch/absent", "origin/main", cwd=other)
+        self.git(
+            "merge", "--no-ff", "-q", "-m", "merge", "origin/feat/absent-head", cwd=other
+        )
+        head = self.git("rev-parse", "HEAD", cwd=other).stdout.strip()
+        # The main repo never fetched that commit, and the janitor must not.
+        probe = self.git("cat-file", "-e", head + "^{commit}", cwd=self.repo, check=False)
+        self.assertNotEqual(probe.returncode, 0)
+        jan = self.janitor_for_worktrees(apply=True)
+        jan._fetch_merged_pr_heads = lambda repo, base: [head]
+        jan.sweep_worktrees()
+        self.assertTrue(os.path.isdir(wt))
+        self.assertIn("unmerged", jan.keep_counts["worktrees"])
+
+    def test_tip_equal_to_a_merged_head_uses_merged_pull_request(self):
+        wt = self.add_worktree("feat/equal-head", days_ago=10)
+        tip = self.git("rev-parse", "HEAD", cwd=wt).stdout.strip()
+        jan = self.janitor_for_worktrees(apply=True)
+        jan._fetch_merged_pr_heads = lambda repo, base: [tip]
+        jan.sweep_worktrees()
+        self.assertFalse(os.path.exists(wt))
+        self.assertEqual(self.removal_reasons(jan), ["merged-pull-request"])
+
+    def test_extra_commit_after_the_batch_merge_kept(self):
+        wt = self.add_worktree("feat/extra", days_ago=10)
+        head = self.merge_into_batch("feat/extra")
+        self.squash_batch()
+        Path(wt, "extra.txt").write_text("extra\n", encoding="utf-8")
+        self.git("add", ".", cwd=wt)
+        self.commit(wt, "extra", days_ago=10)
+        self.age_admin(wt, 10)
+        jan = self.janitor_for_worktrees(apply=True)
+        jan._fetch_merged_pr_heads = lambda repo, base: [head]
+        jan.sweep_worktrees()
+        self.assertTrue(os.path.isdir(wt))
+        self.assertIn("unmerged", jan.keep_counts["worktrees"])
+
+    def test_changes_present_on_default_removed(self):
+        wt = self.add_worktree("feat/part", days_ago=10)
+        other = self.add_worktree("feat/other", commit=False, days_ago=10)
+        Path(other, "other.txt").write_text("other\n", encoding="utf-8")
+        self.git("add", ".", cwd=other)
+        self.commit(other, "other", days_ago=10)
+        self.age_admin(other, 10)
+        self.merge_into_batch("feat/part")
+        self.git("checkout", "-q", "batch/one", cwd=self.repo)
+        self.git("merge", "--no-ff", "-q", "-m", "merge other", "feat/other", cwd=self.repo)
+        self.git("checkout", "-q", "main", cwd=self.repo)
+        self.squash_batch()
+        jan = self.janitor_for_worktrees(apply=True)
+        jan._fetch_merged_pr_heads = lambda repo, base: []
+        jan.sweep_worktrees()
+        self.assertFalse(os.path.exists(wt))
+        self.assertEqual(
+            self.removal_reason_for(jan, wt), "changes-present-on-default"
+        )
+
+    def test_one_changed_file_differing_kept(self):
+        wt = self.add_worktree("feat/part2", days_ago=10)
+        Path(wt, "extra.txt").write_text("one\n", encoding="utf-8")
+        self.git("add", ".", cwd=wt)
+        self.commit(wt, "extra", days_ago=10)
+        self.merge_into_batch("feat/part2")
+        self.squash_batch()
+        Path(wt, "extra.txt").write_text("two\n", encoding="utf-8")
+        self.git("add", ".", cwd=wt)
+        self.commit(wt, "extra again", days_ago=10)
+        self.age_admin(wt, 10)
+        jan = self.janitor_for_worktrees(apply=True)
+        jan._fetch_merged_pr_heads = lambda repo, base: []
+        jan.sweep_worktrees()
+        self.assertTrue(os.path.isdir(wt))
+        self.assertIn("unmerged", jan.keep_counts["worktrees"])
+
+    def test_empty_changed_set_kept(self):
+        wt = self.add_worktree("feat/empty", days_ago=10)
+        self.git("commit", "-q", "--allow-empty", "-m", "nothing", cwd=wt, days_ago=10)
+        self.age_admin(wt, 10)
+        jan = self.janitor_for_worktrees(apply=True)
+        jan._fetch_merged_pr_heads = lambda repo, base: []
+        jan.sweep_worktrees()
+        self.assertTrue(os.path.isdir(wt))
+        self.assertIn("unmerged", jan.keep_counts["worktrees"])
+
+    def test_deleted_file_absent_on_default_counts_as_identical(self):
+        self.write_main("gone.txt", "gone\n")
+        self.git("add", ".", cwd=self.repo)
+        self.commit(self.repo, "add gone", days_ago=20)
+        self.git("push", "-q", "origin", "main", cwd=self.repo)
+        wt = self.add_worktree("feat/del", days_ago=10)
+        self.git("rm", "-q", "gone.txt", cwd=wt)
+        self.commit(wt, "delete gone", days_ago=10)
+        self.age_admin(wt, 10)
+        other = self.add_worktree("feat/other2", commit=False, days_ago=10)
+        Path(other, "other.txt").write_text("other\n", encoding="utf-8")
+        self.git("add", ".", cwd=other)
+        self.commit(other, "other", days_ago=10)
+        self.age_admin(other, 10)
+        self.merge_into_batch("feat/del")
+        self.git("checkout", "-q", "batch/one", cwd=self.repo)
+        self.git("merge", "--no-ff", "-q", "-m", "merge other", "feat/other2", cwd=self.repo)
+        self.git("checkout", "-q", "main", cwd=self.repo)
+        self.squash_batch()
+        jan = self.janitor_for_worktrees(apply=True)
+        jan._fetch_merged_pr_heads = lambda repo, base: []
+        jan.sweep_worktrees()
+        self.assertFalse(os.path.exists(wt))
+        self.assertEqual(
+            self.removal_reason_for(jan, wt), "changes-present-on-default"
+        )
+
+    def test_merged_list_fetched_once_per_repo(self):
+        self.add_worktree("feat/one", days_ago=10)
+        self.add_worktree("feat/two", days_ago=10)
+        jan = self.janitor_for_worktrees(apply=False)
+        calls = []
+
+        def fetch(repo, base):
+            calls.append((repo, base))
+            return []
+
+        jan._fetch_merged_pr_heads = fetch
+        jan.sweep_worktrees()
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][1], "main")
 
 
 # --- combined dry run ------------------------------------------------------

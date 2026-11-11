@@ -104,6 +104,7 @@ silently using defaults.
   "tmp_age_scan_max_entries": 200000,
   "snapshot_max_age_seconds": 120,
   "worktree_min_idle_days": 3,
+  "merged_pr_lookback": 300,
   "scratch_min_age_days": 3,
   "tmp_protect_globs": [],
   "postgres_extra_roots": [],
@@ -295,14 +296,32 @@ A worktree is removed only when **all** of these hold:
    `recent` forever. Uncommitted work is covered by guard 3. The timestamps
    are read before running `git status`;
 6. it is not in use per the process snapshot;
-7. its branch tip is merged, by any one of: the tip is an ancestor of
-   `origin/<default branch>`; `gh` is on the PATH and
-   `gh pr list --state merged --head <branch> --base <default branch> --json
-   headRefOid --limit 20` (30 s) returns a pull request whose `headRefOid`
-   equals the tip; or the squash test passes (`git commit-tree <tip>^{tree} -p
-   <merge-base>` then `git cherry origin/<default> <temp>` prints a line
-   starting with `-`). A branch name alone is never proof, and a pull request
-   into any other base does not count.
+7. its branch tip is merged, by any one of these proofs, tried in order:
+   the tip is an ancestor of `origin/<default branch>`; the tip equals the
+   head of a pull request merged into the default branch; the tip is an
+   ancestor of such a head; the squash test passes (`git commit-tree
+   <tip>^{tree} -p <merge-base>` then `git cherry origin/<default> <temp>`
+   prints a line starting with `-`); or every file the branch changed is
+   already identical on the default branch. A branch name alone is never
+   proof, and a pull request into any other base does not count.
+
+The merged pull request heads come from one call per repo per run:
+`gh pr list --state merged --base <default branch> --json headRefOid --limit
+<merged_pr_lookback>` (default 300, 60 s). The list is cached for that repo,
+so a repo with many worktrees still makes one call. Without `gh`, or when the
+call fails, the list is empty and those two proofs never pass. A head that is
+not present locally is skipped, never fetched: the janitor only runs
+`git cat-file -e <head>^{commit}` and then `git merge-base --is-ancestor <tip>
+<head>`. The reason strings are `merged-pull-request` when the tip equals a
+head and `in-merged-pull-request` when it is an ancestor of one.
+
+The last proof covers a branch that was merged into a batch branch with a
+merge commit, where the batch branch then reached the default branch as one
+squash commit. The changed set is `git diff --name-only -z --no-renames
+<merge-base> <tip>`; the proof passes only when that set is not empty and, for
+every path in it, `git rev-parse <tip>:<path>` equals `git rev-parse
+origin/<default>:<path>`, or the path is absent on both. Any difference, or
+any git error, fails it. The reason string is `changes-present-on-default`.
 
 Immediately before the archive ref is written, the janitor re-reads the
 worktree's HEAD (`git -C <path> rev-parse HEAD`) and keeps it with reason

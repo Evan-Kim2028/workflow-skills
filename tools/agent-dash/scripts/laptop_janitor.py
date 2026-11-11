@@ -48,6 +48,7 @@ DEFAULTS = {
     "tmp_age_scan_max_entries": 200000,
     "snapshot_max_age_seconds": 120,
     "worktree_min_idle_days": 3,
+    "merged_pr_lookback": 300,
     "scratch_min_age_days": 3,
     "tmp_protect_globs": [],
     "postgres_extra_roots": [],
@@ -174,6 +175,7 @@ CONFIG_TYPES = {
     "tmp_age_scan_max_entries": int,
     "snapshot_max_age_seconds": float,
     "worktree_min_idle_days": float,
+    "merged_pr_lookback": int,
     "scratch_min_age_days": float,
     "tmp_protect_globs": "strlist",
     "postgres_extra_roots": "strlist",
@@ -608,6 +610,8 @@ class Janitor:
             os.path.expanduser(p) for p in cfg.get("worktree_protect_globs") or []
         ]
         self.worktree_ignorable_globs = list(cfg.get("worktree_ignorable_globs") or [])
+        # Merged pull request heads, fetched once per repo per run.
+        self._merged_heads = {}
 
         # Injectable guards: tests replace these.
         self.owner_ok = lambda st: st.st_uid == os.getuid()
@@ -1549,11 +1553,18 @@ class Janitor:
             return ""
         return ref
 
-    def pr_merged_heads(self, repo, branch, base):
-        """Head shas of merged pull requests for ``branch`` into ``base``."""
+    def merged_pr_heads(self, repo, base):
+        """Head shas of pull requests merged into ``base``, once per repo."""
+        if repo not in self._merged_heads:
+            self._merged_heads[repo] = self._fetch_merged_pr_heads(repo, base)
+        return self._merged_heads[repo]
+
+    def _fetch_merged_pr_heads(self, repo, base):
+        """One ``gh pr list`` call for the whole repo; empty on any failure."""
         gh = shutil.which("gh")
         if not gh:
             return []
+        limit = int(self.cfg.get("merged_pr_lookback") or 0)
         rc, out, err = self._run(
             [
                 gh,
@@ -1561,17 +1572,15 @@ class Janitor:
                 "list",
                 "--state",
                 "merged",
-                "--head",
-                branch,
                 "--base",
                 base,
                 "--json",
                 "headRefOid",
                 "--limit",
-                "20",
+                str(limit),
             ],
             cwd=repo,
-            timeout=30,
+            timeout=60,
         )
         if rc != 0:
             self.write(
@@ -1579,7 +1588,7 @@ class Janitor:
                     "type": "warn",
                     "sweeper": "worktrees",
                     "repo": repo,
-                    "message": "gh pr list failed for %s: rc=%s" % (branch, rc),
+                    "message": "gh pr list failed for base %s: rc=%s" % (base, rc),
                 }
             )
             return []
@@ -1591,6 +1600,67 @@ class Janitor:
             return []
         return [item.get("headRefOid") or "" for item in data if isinstance(item, dict)]
 
+    def _in_merged_pull_request(self, repo, tip, heads):
+        """True when ``tip`` is a merged head or an ancestor of one."""
+        for head in heads:
+            if not head:
+                continue
+            if head == tip:
+                continue
+            rc, out, err = self._run(
+                ["git", "-C", repo, "cat-file", "-e", head + "^{commit}"], timeout=60
+            )
+            if rc != 0:
+                # The head is not present locally; never fetch it.
+                continue
+            rc, out, err = self._run(
+                ["git", "-C", repo, "merge-base", "--is-ancestor", tip, head],
+                timeout=60,
+            )
+            if rc == 0:
+                return True
+        return False
+
+    def _changes_present_on_default(self, repo, tip, upstream):
+        """True when every file the branch changed is identical upstream."""
+        rc, out, err = self._run(
+            ["git", "-C", repo, "merge-base", tip, upstream], timeout=60
+        )
+        if rc != 0 or not out.strip():
+            return False
+        merge_base = out.strip()
+        rc, out, err = self._run(
+            [
+                "git",
+                "-C",
+                repo,
+                "diff",
+                "--name-only",
+                "-z",
+                "--no-renames",
+                merge_base,
+                tip,
+            ],
+            timeout=120,
+        )
+        if rc != 0:
+            return False
+        paths = [p for p in out.split("\0") if p]
+        if not paths:
+            return False
+        for path in paths:
+            rc, out, err = self._run(
+                ["git", "-C", repo, "rev-parse", tip + ":" + path], timeout=60
+            )
+            tip_blob = out.strip() if rc == 0 else ""
+            rc, out, err = self._run(
+                ["git", "-C", repo, "rev-parse", upstream + ":" + path], timeout=60
+            )
+            default_blob = out.strip() if rc == 0 else ""
+            if tip_blob != default_blob:
+                return False
+        return True
+
     def _merged_how(self, repo, path, branch, default, tip):
         upstream = "origin/" + default
         rc, out, err = self._run(
@@ -1599,8 +1669,11 @@ class Janitor:
         )
         if rc == 0:
             return "ancestor-of-" + default
-        if tip in self.pr_merged_heads(repo, branch, default):
+        heads = self.merged_pr_heads(repo, default)
+        if tip in heads:
             return "merged-pull-request"
+        if self._in_merged_pull_request(repo, tip, heads):
+            return "in-merged-pull-request"
         rc, out, err = self._run(
             ["git", "-C", repo, "merge-base", tip, upstream], timeout=60
         )
@@ -1631,6 +1704,8 @@ class Janitor:
             line.lstrip().startswith("-") for line in out.splitlines() if line.strip()
         ):
             return "squash-merged"
+        if self._changes_present_on_default(repo, tip, upstream):
+            return "changes-present-on-default"
         return ""
 
     # -- sweeper: scratch ---------------------------------------------------
