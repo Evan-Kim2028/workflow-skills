@@ -158,6 +158,40 @@ class TmpSweeperTests(JanitorCase):
         self.assertFalse(dead.exists())
         self.assertIn("live-postgres:4242", jan.keep_counts["tmp"])
 
+    def test_unreadable_postmaster_pid_keeps_folder(self):
+        stamp = self.now - 8 * 86400
+        link_dir = self.mkdir(self.root / "pg-link", age_days=8)
+        target = self.write(self.base / "target.pid", "4242\n", age_days=8)
+        link = link_dir / "postmaster.pid"
+        os.symlink(str(target), str(link))
+        os.utime(link, (stamp, stamp), follow_symlinks=False)
+        os.utime(link_dir, (stamp, stamp))
+        text_dir = self.mkdir(self.root / "pg-text", age_days=8)
+        self.write(text_dir / "postmaster.pid", "not-a-pid\n", age_days=8)
+        os.utime(text_dir, (stamp, stamp))
+        empty_dir = self.mkdir(self.root / "pg-empty", age_days=8)
+        self.write(empty_dir / "postmaster.pid", "", age_days=8)
+        os.utime(empty_dir, (stamp, stamp))
+        jan = self.janitor_for_tmp(apply=True)
+        jan.pid_alive = lambda pid: False
+        jan.sweep_tmp()
+        for name in ("pg-link", "pg-text", "pg-empty"):
+            self.assertTrue((self.root / name).exists(), name)
+        self.assertIn("unreadable-postmaster-pid", jan.keep_counts["tmp"])
+
+    def test_entry_changed_during_scan_kept(self):
+        old = self.mkdir(self.root / "old", age_days=5)
+        jan = self.janitor_for_tmp(apply=True)
+
+        def touch_and_free(path, ignore_pids=None):
+            os.utime(path, None)
+            return False, ""
+
+        jan.in_use = touch_and_free
+        jan.sweep_tmp()
+        self.assertTrue(old.exists())
+        self.assertIn("changed-during-scan", jan.keep_counts["tmp"])
+
     def test_in_use_by_cwd_kept(self):
         busy = self.mkdir(self.root / "busy", age_days=5)
         snap = fake_snapshot(
@@ -343,6 +377,55 @@ class PostgresSweeperTests(JanitorCase):
         jan.sweep_postgres()
         self.assertEqual(len(self.stopped), 1)
 
+    def test_numbered_helper_is_not_a_client(self):
+        jan = self.janitor_for_pg(children={101: "postgres: io worker 3"})
+        jan.sweep_postgres()
+        self.assertEqual(len(self.stopped), 1)
+
+    def test_client_whose_user_starts_with_a_helper_name_is_a_client(self):
+        jan = self.janitor_for_pg(
+            children={101: "postgres: archiver accounting 127.0.0.1(5000) idle"}
+        )
+        jan.sweep_postgres()
+        self.assertEqual(self.stopped, [])
+        self.assertIn("client-backend", jan.keep_counts["postgres"])
+
+    def test_fallback_does_not_signal_a_reused_pid(self):
+        jan = self.janitor_for_pg()
+        jan.stop_postgres = jan._stop_postgres
+        jan.pid_alive = lambda pid: False
+        jan._run = lambda argv, **kw: (0, "python3 something\n", "")
+        real_which = lj.shutil.which
+        real_kill = lj.os.kill
+        killed = []
+        lj.shutil.which = lambda name: None
+        lj.os.kill = lambda pid, sig: killed.append((pid, sig))
+        try:
+            ok = jan._stop_postgres(str(self.datadir), 100)
+        finally:
+            lj.shutil.which = real_which
+            lj.os.kill = real_kill
+        self.assertTrue(ok)
+        self.assertEqual(killed, [])
+
+    def test_fallback_signals_the_same_postmaster(self):
+        jan = self.janitor_for_pg()
+        jan.stop_postgres = jan._stop_postgres
+        jan.pid_alive = lambda pid: False
+        jan._run = lambda argv, **kw: (0, "postgres -D %s\n" % self.datadir, "")
+        real_which = lj.shutil.which
+        real_kill = lj.os.kill
+        killed = []
+        lj.shutil.which = lambda name: None
+        lj.os.kill = lambda pid, sig: killed.append((pid, sig))
+        try:
+            ok = jan._stop_postgres(str(self.datadir), 100)
+        finally:
+            lj.shutil.which = real_which
+            lj.os.kill = real_kill
+        self.assertTrue(ok)
+        self.assertEqual(killed, [(100, lj.signal.SIGINT)])
+
     def test_outside_disposable_roots_kept(self):
         outside = self.mkdir(self.base / "elsewhere" / "pgdata")
         jan = self.janitor_for_pg(datadir=outside)
@@ -463,7 +546,10 @@ class GitRepoCase(JanitorCase):
     def janitor_for_worktrees(self, apply=True, snapshot=None, extra=None):
         cfg = {"repos": [self.repo], "worktree_manager_cmd": "janitor-test-no-such-tool"}
         cfg.update(extra or {})
-        return self.janitor(cfg=cfg, apply=apply, snapshot=snapshot)
+        jan = self.janitor(cfg=cfg, apply=apply, snapshot=snapshot)
+        # The pre-removal recheck takes a fresh snapshot; keep it fake.
+        jan.snapshot_factory = lambda: fake_snapshot()
+        return jan
 
 
 class WorktreeSweeperTests(GitRepoCase):
@@ -493,7 +579,7 @@ class WorktreeSweeperTests(GitRepoCase):
     def test_unmerged_worktree_kept(self):
         wt = self.add_worktree("feat/unmerged", days_ago=10)
         jan = self.janitor_for_worktrees(apply=True)
-        jan.pr_merged_heads = lambda repo, branch: []
+        jan.pr_merged_heads = lambda repo, branch, base: []
         jan.sweep_worktrees()
         self.assertTrue(os.path.isdir(wt))
         self.assertIn("unmerged", jan.keep_counts["worktrees"])
@@ -715,7 +801,7 @@ class WorktreeSweeperTests(GitRepoCase):
     def test_merged_pr_lookup_with_different_head_kept(self):
         wt = self.add_worktree("feat/pr-other", days_ago=10)
         jan = self.janitor_for_worktrees(apply=True)
-        jan.pr_merged_heads = lambda repo, branch: ["0" * 40]
+        jan.pr_merged_heads = lambda repo, branch, base: ["0" * 40]
         jan.sweep_worktrees()
         self.assertTrue(os.path.isdir(wt))
 
@@ -723,9 +809,93 @@ class WorktreeSweeperTests(GitRepoCase):
         wt = self.add_worktree("feat/pr-match", days_ago=10)
         tip = self.git("rev-parse", "HEAD", cwd=wt).stdout.strip()
         jan = self.janitor_for_worktrees(apply=True)
-        jan.pr_merged_heads = lambda repo, branch: [tip]
+        jan.pr_merged_heads = lambda repo, branch, base: [tip]
         jan.sweep_worktrees()
         self.assertFalse(os.path.exists(wt))
+
+    def test_pr_lookup_passes_the_default_branch_as_base(self):
+        bindir = self.base / "bin"
+        bindir.mkdir()
+        record = self.base / "gh-args.json"
+        gh = bindir / "gh"
+        gh.write_text(
+            "#!%s\nimport json, sys\nopen(%r, 'w').write(json.dumps(sys.argv[1:]))\nprint('[]')\n"
+            % (sys.executable, str(record)),
+            encoding="utf-8",
+        )
+        os.chmod(gh, 0o755)
+        jan = self.janitor_for_worktrees(apply=False)
+        old_path = os.environ.get("PATH", "")
+        os.environ["PATH"] = str(bindir) + os.pathsep + old_path
+        try:
+            jan.pr_merged_heads(self.repo, "feat/base", "main")
+        finally:
+            os.environ["PATH"] = old_path
+        args = json.loads(record.read_text(encoding="utf-8"))
+        self.assertIn("--base", args)
+        self.assertEqual(args[args.index("--base") + 1], "main")
+
+    def test_head_moved_during_merge_proof_kept(self):
+        wt = self.add_worktree("feat/moved", days_ago=10)
+        self.merge_branch("feat/moved", squash=True)
+        jan = self.janitor_for_worktrees(apply=True)
+
+        def proof(repo, path, branch, default, tip):
+            Path(path, "late.txt").write_text("late\n", encoding="utf-8")
+            self.git("add", ".", cwd=path)
+            self.commit(path, "late", days_ago=10)
+            return "squash-merged"
+
+        jan._merged_how = proof
+        jan.sweep_worktrees()
+        self.assertTrue(os.path.isdir(wt))
+        self.assertIn("head-moved", jan.keep_counts["worktrees"])
+
+    def test_in_use_at_recheck_kept(self):
+        wt = self.add_worktree("feat/late-busy", days_ago=10)
+        self.merge_branch("feat/late-busy", squash=True)
+        jan = self.janitor_for_worktrees(apply=True)
+        busy = fake_snapshot(
+            procs={888: {"ppid": 1, "etime": 10, "args": "sleep 1"}},
+            cwds={888: wt},
+        )
+        jan.snapshot_factory = lambda: busy
+        jan.sweep_worktrees()
+        self.assertTrue(os.path.isdir(wt))
+        self.assertTrue(any(k.startswith("in-use:") for k in jan.keep_counts["worktrees"]))
+
+    def test_fetch_failure_keeps_everything(self):
+        wt = self.add_worktree("feat/fetchfail", days_ago=10)
+        self.merge_branch("feat/fetchfail", squash=True)
+        self.git("remote", "set-url", "origin", str(self.base / "gone.git"), cwd=self.repo)
+        jan = self.janitor_for_worktrees(apply=True)
+        jan.sweep_worktrees()
+        self.assertTrue(os.path.isdir(wt))
+        self.assertIn("fetch-failed", jan.keep_counts["worktrees"])
+
+    def test_repo_without_origin_is_skipped(self):
+        wt = self.add_worktree("feat/noorigin", days_ago=10)
+        self.git("remote", "remove", "origin", cwd=self.repo)
+        jan = self.janitor_for_worktrees(apply=True)
+        jan.open_log()
+        try:
+            jan.sweep_worktrees()
+        finally:
+            jan.log.close()
+            jan.log = None
+        self.assertTrue(os.path.isdir(wt))
+        self.assertEqual(jan.errors, 0)
+        lines = [
+            json.loads(line)
+            for line in Path(jan.log_path).read_text(encoding="utf-8").splitlines()
+            if line
+        ]
+        self.assertTrue(
+            any(
+                r.get("type") == "skip" and r.get("reason") == "no origin remote"
+                for r in lines
+            )
+        )
 
     def test_repo_discovery_one_and_two_levels(self):
         (self.base / "root").mkdir()
@@ -888,6 +1058,33 @@ class SnapshotTests(JanitorCase):
         self.assertEqual(why, "snapshot-failed")
 
 
+class TakeSnapshotTests(unittest.TestCase):
+    def run_with(self, ps_out, lsof_out, lsof_rc):
+        real = lj.subprocess.run
+
+        def fake(argv, **kw):
+            if argv[0] == "ps":
+                return subprocess.CompletedProcess(argv, 0, ps_out, "")
+            return subprocess.CompletedProcess(argv, lsof_rc, lsof_out, "")
+
+        lj.subprocess.run = fake
+        try:
+            return lj.take_snapshot()
+        finally:
+            lj.subprocess.run = real
+
+    def test_snapshot_without_the_janitors_own_cwd_is_failed(self):
+        # A nonzero lsof exit with empty output must not look like a clean scan.
+        snap = self.run_with("  1   0 00:01 init\n", "", 1)
+        self.assertFalse(snap.ok)
+
+    def test_snapshot_ok_when_own_cwd_listed_despite_nonzero_exit(self):
+        own = os.getpid()
+        snap = self.run_with("  1   0 00:01 init\n", "p%d\nn/tmp\n" % own, 1)
+        self.assertTrue(snap.ok)
+        self.assertEqual(snap.cwds[own], "/tmp")
+
+
 # --- scheduling, lock, config, plist --------------------------------------
 
 
@@ -936,11 +1133,18 @@ class CliCase(JanitorCase):
 
     def test_scheduled_due_runs_and_records_last_run(self):
         self.write_last_run(days_ago=10)
-        res = self.cli("run", "--scheduled", "--skip", "postgres,tmp,worktrees,scratch")
+        cfg = json.dumps(
+            {
+                "repos": [],
+                "repo_roots": [],
+                "worktree_manager_cmd": "janitor-test-no-such-tool",
+            }
+        )
+        res = self.cli("run", "--scheduled", "--only", "worktrees", env=self.env(cfg))
         self.assertEqual(res.returncode, 0, res.stderr)
         self.assertIn("JANITOR: mode=apply", res.stdout)
         data = json.loads((self.state / "last-run.json").read_text(encoding="utf-8"))
-        self.assertGreater(data["ended_at"], self.now - 60)
+        self.assertGreater(data["sweepers"]["worktrees"]["ended_at"], self.now - 60)
         self.assertEqual(len(self.log_files()), 1)
 
     def test_held_lock_exits_zero(self):
@@ -1010,6 +1214,75 @@ class CliCase(JanitorCase):
         )
         jan = self.janitor()
         self.assertTrue(jan.due())
+
+    def test_non_finite_ended_at_is_due(self):
+        self.state.mkdir(parents=True, exist_ok=True)
+        for value in (float("nan"), float("inf")):
+            (self.state / "last-run.json").write_text(
+                json.dumps({"ended_at": value}), encoding="utf-8"
+            )
+            jan = self.janitor()
+            self.assertTrue(jan.due(), value)
+
+    def test_only_one_sweeper_marks_only_that_sweeper(self):
+        jan = self.janitor(apply=True)
+        jan.run(only=["tmp"], sweepers={"tmp": lambda: None})
+        data = json.loads((self.state / "last-run.json").read_text(encoding="utf-8"))
+        self.assertIn("tmp", data["sweepers"])
+        self.assertNotIn("postgres", data["sweepers"])
+
+    def test_raising_sweeper_is_not_recorded(self):
+        jan = self.janitor(apply=True)
+
+        def boom():
+            raise RuntimeError("x")
+
+        jan.run(only=["tmp"], sweepers={"tmp": boom})
+        self.assertFalse((self.state / "last-run.json").exists())
+
+    def test_timed_out_sweeper_is_not_recorded(self):
+        jan = self.janitor(apply=True)
+
+        def slow():
+            jan._timed_out("tmp")
+
+        jan.run(only=["tmp"], sweepers={"tmp": slow})
+        self.assertFalse((self.state / "last-run.json").exists())
+
+    def test_dry_run_writes_no_sweeper_entry(self):
+        jan = self.janitor(apply=False)
+        jan.run(only=["tmp"], sweepers={"tmp": lambda: None})
+        self.assertFalse((self.state / "last-run.json").exists())
+
+    def test_scheduled_runs_only_due_sweepers(self):
+        self.state.mkdir(parents=True, exist_ok=True)
+        (self.state / "last-run.json").write_text(
+            json.dumps(
+                {
+                    "sweepers": {
+                        "postgres": {"ended_at": self.now - 1 * 86400},
+                        "tmp": {"ended_at": self.now - 10 * 86400},
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        jan = self.janitor()
+        self.assertEqual(jan.due_sweepers(), ["tmp", "worktrees", "scratch"])
+
+    def test_old_format_means_every_sweeper_ran_then(self):
+        self.write_last_run(days_ago=1)
+        jan = self.janitor()
+        self.assertEqual(jan.due_sweepers(), [])
+
+    def test_status_shows_each_sweeper(self):
+        self.write_last_run(days_ago=1)
+        res = self.cli("status", "--json")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        data = json.loads(res.stdout)
+        self.assertIn("sweeper_state", data)
+        self.assertFalse(data["sweeper_state"]["tmp"]["due"])
+        self.assertIn("last_run", data["sweeper_state"]["tmp"])
 
     def test_status_json(self):
         self.write_last_run(days_ago=1)

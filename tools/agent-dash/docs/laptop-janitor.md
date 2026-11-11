@@ -27,13 +27,14 @@ laptop_janitor.py print-plist
 - `run` is a dry run unless `--apply` is given. It prints every planned action
   (sweeper, target, size when cheap, reason) and the kept count per reason, and
   changes nothing except writing its own log.
-- `run --scheduled` is the `launchd` entry point. When not due it prints
-  `not due` and exits 0 without sweeping or writing a log. When due it behaves
-  as `run --apply`, except that stdout carries only the per-sweeper kept line,
-  error lines and the summary: per-item removal lines go to the run's `.jsonl`
-  log only, because `launchd` appends stdout to `launchd.log` without limit.
-  A `last-run.json` whose `ended_at` is in the future (clock set back, bad
-  file) counts as due.
+- `run --scheduled` is the `launchd` entry point. It runs exactly the
+  sweepers that are due (see below) and prints `JANITOR: not due` and exits 0
+  only when none is. When it runs it behaves as `run --apply`, except that
+  stdout carries only the per-sweeper kept line, error lines and the summary:
+  per-item removal lines go to the run's `.jsonl` log only, because `launchd`
+  appends stdout to `launchd.log` without limit. A sweeper whose `ended_at` is
+  in the future (clock set back, bad file) or is not a finite number counts as
+  due.
 - Sweepers run in this order: `postgres`, `tmp`, `worktrees`, `scratch`.
   `--only` and `--skip` take comma lists of those names.
 - `--json` prints a JSON report before the summary line.
@@ -52,18 +53,31 @@ laptop_janitor.py print-plist
 | --- | --- |
 | `~/.local/state/laptop-janitor/` | state dir (`LAPTOP_JANITOR_STATE`) |
 | `.../lock` | `flock(LOCK_EX\|LOCK_NB)` for the whole run |
-| `.../last-run.json` | written atomically after an applied run |
+| `.../last-run.json` | one entry per sweeper, written atomically |
 | `.../recovery.jsonl` | one line per removed worktree |
 | `~/Library/Logs/laptop-janitor/` | run logs (`LAPTOP_JANITOR_LOGS`) |
 | `~/.config/laptop-janitor/config.json` | optional config (`LAPTOP_JANITOR_CONFIG`) |
 
 A second run while the lock is held prints `already running` and exits 0.
 
-`last-run.json` is written with a temp file plus `os.replace` only after an
-applied run has given every sweeper its turn. A run that is killed, loses
-power, or aborts on an interrupt writes nothing, so the next scheduled tick or
-the next login sees it as due and runs again. Every action is idempotent, so a
-repeat after a partial run is safe.
+`last-run.json` holds one entry per sweeper:
+
+```json
+{"sweepers": {"tmp": {"ended_at": 1700000000, "removed": 2, "kept": 9, "errors": 0}}}
+```
+
+A sweeper's entry is written with a temp file plus `os.replace` as soon as that
+sweeper finishes, in apply mode only, and only when it finished without raising
+and without running out of its budget. A sweeper that raised or timed out keeps
+its previous entry, so the next scheduled tick runs it again. A run that is
+killed, loses power, or aborts on an interrupt writes nothing for the sweepers
+it did not finish, so the next tick or the next login sees them as due. Every
+action is idempotent, so a repeat after a partial run is safe.
+
+A sweeper is due when it has no entry, its `ended_at` is missing, non-finite or
+in the future, or it is older than `interval_days`. `run --scheduled` runs
+exactly the due sweepers. A `last-run.json` in the old single-timestamp format
+(`{"ended_at": ...}`) is read as "every sweeper last ran at that time".
 
 The three-day cadence lives in `last-run.json` (`interval_days`, default 3),
 not in `launchd`. A reboot, a sleep through the 04:40 slot or a missed day only
@@ -130,7 +144,11 @@ macOS processes usually name the short form (`TMPDIR` has no `/private`), so a
 folder held by such a process must not look free.
 
 If either command fails or times out, every path counts as in use for that run
-and the reason is logged.
+and the reason is logged. The snapshot is also failed when the parsed working
+directories do not include the janitor's own PID: the janitor always has a
+working directory, so a scan that does not list it did not work. The `lsof`
+exit code alone is not used, because `lsof` can exit nonzero while still
+listing processes.
 
 Right before each removal the janitor also re-checks that the target's resolved
 path is still inside the root it was found under. A symlink entry is checked
@@ -156,11 +174,17 @@ has a client backend (`client-backend`), or when the snapshot names its data
 dir (`in-use`). A client backend is a child of the postmaster whose title
 starts with `postgres:` and is not one of `checkpointer`, `background writer`,
 `walwriter`, `autovacuum launcher`, `logical replication launcher`, `archiver`,
-`stats collector`, `startup`, `walsummarizer`, `io worker`. An unknown title
-counts as a client.
+`stats collector`, `startup`, `walsummarizer`, `io worker`. A helper matches
+only when the title is the helper name exactly, or the helper name followed by
+a space and digits only (`io worker 3`); a prefix match would take a client
+whose database user starts with a helper name (`archiver accounting ...`) for
+a helper. An unknown title counts as a client.
 
 The stop is `pg_ctl -D <dir> stop -m fast -w -t 30` when `pg_ctl` is on the
 PATH, otherwise `SIGINT` to the postmaster followed by up to 30 s of waiting.
+Before the signal the janitor reads that one PID's command line again
+(`ps -o args= -p <pid>`) and signals only if it is still a `postgres` process
+with the same `-D` value; otherwise the server is reported as already gone.
 It never sends `SIGKILL`. A server that does not stop is an error line and the
 run continues.
 
@@ -193,8 +217,12 @@ Guards run cheapest first. An entry is kept, with a reason, when it:
 - is older than the cutoff only on a partial view (`age-scan-truncated`);
 - has something newer than the cutoff (`too-new`);
 - holds a `postmaster.pid`, found at any depth during the same walk, whose PID
-  is alive (`live-postgres`);
+  is alive (`live-postgres`), or that cannot be read as a regular file with a
+  numeric first line (`unreadable-postmaster-pid`); only a numeric PID that is
+  not alive counts as no server;
 - is in use per the process snapshot (`in-use`);
+- changed between the first `lstat` and the removal: device, inode or
+  modification time differ (`changed-during-scan`);
 - escapes its root on re-check (`escaped-root`);
 - could not be walked (`unreadable-age`).
 
@@ -228,7 +256,10 @@ discovered one or two levels under each `repo_roots` entry, taking every folder
 that contains a `.git` **directory**.
 
 For each repo the janitor runs `git fetch origin --quiet` (60 s, no terminal
-prompt; a failure is logged and the sweep continues with the refs it has), then
+prompt). A repo with no `origin` remote is skipped with one log line, not an
+error. When the fetch fails, nothing is removed from that repo in this run:
+every otherwise-eligible worktree is kept with reason `fetch-failed`, because
+stale refs are not proof of a merge. Then it runs
 `git worktree list --porcelain`.
 
 A worktree is removed only when **all** of these hold:
@@ -253,11 +284,19 @@ A worktree is removed only when **all** of these hold:
 6. it is not in use per the process snapshot;
 7. its branch tip is merged, by any one of: the tip is an ancestor of
    `origin/<default branch>`; `gh` is on the PATH and
-   `gh pr list --state merged --head <branch> --json headRefOid --limit 20`
-   (30 s) returns a pull request whose `headRefOid` equals the tip; or the
-   squash test passes (`git commit-tree <tip>^{tree} -p <merge-base>` then
-   `git cherry origin/<default> <temp>` prints a line starting with `-`).
-   A branch name alone is never proof.
+   `gh pr list --state merged --head <branch> --base <default branch> --json
+   headRefOid --limit 20` (30 s) returns a pull request whose `headRefOid`
+   equals the tip; or the squash test passes (`git commit-tree <tip>^{tree} -p
+   <merge-base>` then `git cherry origin/<default> <temp>` prints a line
+   starting with `-`). A branch name alone is never proof, and a pull request
+   into any other base does not count.
+
+Immediately before the archive ref is written, the janitor re-reads the
+worktree's HEAD (`git -C <path> rev-parse HEAD`) and keeps it with reason
+`head-moved` unless it equals the tip the merge proof used, then takes a new
+process snapshot (not the cached one) and keeps it if it is now in use. The
+merge proof and the `gh` call can take a long time, during which an agent can
+start working there or commit.
 
 To remove, the janitor writes `refs/workspace-archive/janitor/<UTC
 stamp>/<branch>` to the tip, appends `{repo, path, branch, sha, archive_ref,

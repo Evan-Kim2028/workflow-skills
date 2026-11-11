@@ -24,6 +24,7 @@ import argparse
 import fcntl
 import fnmatch
 import json
+import math
 import os
 import plistlib
 import shlex
@@ -372,11 +373,17 @@ def take_snapshot(timeout=60):
         )
     except (OSError, subprocess.SubprocessError) as exc:
         return Snapshot(ok=False, error="lsof failed: %s" % exc)
-    if lsof.returncode != 0:
-        # lsof exits 1 when no process is listed; that is not a failure.
-        if lsof.stdout.strip():
-            return Snapshot(ok=False, error="lsof exited %s" % lsof.returncode)
-    return Snapshot(ok=True, procs=parse_ps(ps.stdout), cwds=parse_lsof_cwds(lsof.stdout))
+    cwds = parse_lsof_cwds(lsof.stdout)
+    # The exit code alone is not a signal: lsof can exit nonzero while still
+    # listing processes. The janitor always has a working directory, so a
+    # scan that does not list it did not work and must not look empty.
+    if os.getpid() not in cwds:
+        return Snapshot(
+            ok=False,
+            error="lsof listed no working directory for the janitor (exit %s)"
+            % lsof.returncode,
+        )
+    return Snapshot(ok=True, procs=parse_ps(ps.stdout), cwds=cwds)
 
 
 def path_in_use(snapshot, path, ignore_pids=None):
@@ -434,6 +441,24 @@ def _arg_value(argv, flag):
         if item.startswith(flag + "="):
             return item[len(flag) + 1:]
     return None
+
+
+def _is_helper_title(title):
+    """True when a postgres child title is a known helper, not a client.
+
+    A helper matches only when the title is the helper name exactly, or the
+    helper name followed by a space and digits only (``io worker 3``). A
+    prefix match would take a client whose database user starts with a helper
+    name (``archiver accounting ...``) for a helper.
+    """
+    for helper in POSTGRES_HELPERS:
+        if title == helper:
+            return True
+        if title.startswith(helper + " "):
+            rest = title[len(helper) + 1:]
+            if rest.isdigit():
+                return True
+    return False
 
 
 def _pid_alive(pid):
@@ -499,6 +524,31 @@ def _glob_match(name, patterns):
     return ""
 
 
+def read_last_run(state):
+    """The last-run.json contents as ``{"sweepers": {name: entry}}``.
+
+    A file in the old single-timestamp format is read as "every sweeper last
+    ran at that time". A missing or unreadable file means no sweeper has run.
+    """
+    path = os.path.join(state, "last-run.json")
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return {"sweepers": {}}
+    if not isinstance(data, dict):
+        return {"sweepers": {}}
+    sweepers = data.get("sweepers")
+    if isinstance(sweepers, dict):
+        clean = {k: v for k, v in sweepers.items() if isinstance(v, dict)}
+        return {"sweepers": clean}
+    if "ended_at" in data:
+        return {
+            "sweepers": {name: {"ended_at": data.get("ended_at")} for name in SWEEPERS}
+        }
+    return {"sweepers": {}}
+
+
 # --- the janitor -----------------------------------------------------------
 
 
@@ -538,6 +588,7 @@ class Janitor:
         self.raised = False
         self.deadline = None
         self._timeout_logged = set()
+        self.timed_out = set()
         self.log = None
         self.log_path = ""
 
@@ -690,6 +741,7 @@ class Janitor:
         return True
 
     def _timed_out(self, name):
+        self.timed_out.add(name)
         message = "%s sweeper ran out of its %ss budget" % (
             name,
             self.cfg.get("sweeper_budget_seconds"),
@@ -797,17 +849,26 @@ class Janitor:
         return (newest if newest is not None else 0.0), False, pidfiles, True
 
     def _live_postmaster_pid(self, pidfiles):
-        """Return (pid, ok) for the first live postmaster.pid in ``pidfiles``."""
+        """Return (pid, ok) for the first live postmaster.pid in ``pidfiles``.
+
+        ``ok`` is False when any pid file cannot be read as a regular file
+        with a numeric first line. An unreadable pid file must keep the entry:
+        it is never proof that no server is running. Only a numeric PID that
+        is not alive counts as no server.
+        """
         for pidfile in pidfiles:
             if os.path.islink(pidfile) or not os.path.isfile(pidfile):
-                continue
+                return None, False
             try:
                 with open(pidfile, "r", encoding="utf-8", errors="replace") as fh:
                     first = fh.readline().strip()
             except OSError:
                 return None, False
-            if first.isdigit() and self.pid_alive(int(first)):
-                return int(first), True
+            if not first.isdigit():
+                return None, False
+            pid = int(first)
+            if self.pid_alive(pid):
+                return pid, True
         return None, True
 
     # -- sweeper: postgres --------------------------------------------------
@@ -825,7 +886,7 @@ class Janitor:
                 title = args.split("postgres:", 1)[1].strip().lower()
             if not title:
                 return True
-            if any(title == h or title.startswith(h) for h in POSTGRES_HELPERS):
+            if _is_helper_title(title):
                 continue
             return True
         return False
@@ -848,6 +909,28 @@ class Janitor:
                 }
             )
             return False
+        # The PID came from a snapshot that may be minutes old. Read this one
+        # process again and signal only if it is still the same postmaster.
+        rc, out, err = self._run(["ps", "-o", "args=", "-p", str(pid)], timeout=15)
+        argv = _split_args((out or "").strip())
+        value = _arg_value(argv, "-D") if argv else None
+        same = (
+            rc == 0
+            and argv
+            and os.path.basename(argv[0]) == "postgres"
+            and value is not None
+            and (value == datadir or os.path.realpath(value) == datadir)
+        )
+        if not same:
+            self.write(
+                {
+                    "type": "stop-skipped",
+                    "target": datadir,
+                    "pid": pid,
+                    "reason": "already gone",
+                }
+            )
+            return True
         try:
             os.kill(pid, signal.SIGINT)
         except OSError as exc:
@@ -1003,7 +1086,7 @@ class Janitor:
         if pidfiles:
             live, ok = self._live_postmaster_pid(pidfiles)
             if not ok:
-                self.keep("tmp", "unreadable-postmaster-scan", path)
+                self.keep("tmp", "unreadable-postmaster-pid", path)
                 return
             if live:
                 self.keep("tmp", "live-postgres:%d" % live, path)
@@ -1011,6 +1094,20 @@ class Janitor:
         used, why = self.in_use(path)
         if used:
             self.keep("tmp", "in-use:" + why, path)
+            return
+        # The folder can be replaced or written to between the first lstat and
+        # the removal. Re-stat it and keep it unless it is the same object.
+        try:
+            again = os.lstat(path)
+        except OSError:
+            self.keep("tmp", "changed-during-scan", path)
+            return
+        if (again.st_dev, again.st_ino, again.st_mtime) != (
+            st.st_dev,
+            st.st_ino,
+            st.st_mtime,
+        ):
+            self.keep("tmp", "changed-during-scan", path)
             return
         if not self.still_inside(root, path):
             self.keep("tmp", "escaped-root", path)
@@ -1206,17 +1303,34 @@ class Janitor:
     def _sweep_repo(self, repo):
         default = self._default_branch(repo)
         rc, out, err = self._run(
+            ["git", "-C", repo, "remote", "get-url", "origin"], timeout=30
+        )
+        if rc != 0:
+            # No origin: nothing to compare against, so skip the repo quietly.
+            self.write(
+                {
+                    "type": "skip",
+                    "sweeper": "worktrees",
+                    "repo": repo,
+                    "reason": "no origin remote",
+                }
+            )
+            return
+        rc, out, err = self._run(
             ["git", "-C", repo, "fetch", "origin", "--quiet"],
             timeout=60,
             env={"GIT_TERMINAL_PROMPT": "0"},
         )
-        if rc != 0:
+        fetch_failed = rc != 0
+        if fetch_failed:
+            # Stale refs are not proof of a merge: remove nothing from this
+            # repo in this run.
             self.write(
                 {
                     "type": "warn",
                     "sweeper": "worktrees",
                     "repo": repo,
-                    "message": "fetch failed rc=%s; using local refs" % rc,
+                    "message": "fetch failed rc=%s; removing nothing from this repo" % rc,
                     "stderr": (err or "").strip()[-300:],
                 }
             )
@@ -1231,8 +1345,8 @@ class Janitor:
             if self.expired():
                 self._timed_out("worktrees")
                 return
-            self._consider_worktree(repo, entry, default, main_path)
-        if self.apply:
+            self._consider_worktree(repo, entry, default, main_path, fetch_failed)
+        if self.apply and not fetch_failed:
             rc, out, err = self._run(["git", "-C", repo, "worktree", "prune"], timeout=60)
             if rc != 0:
                 self.error("worktrees", "worktree prune failed in %s: %s" % (repo, (err or "").strip()))
@@ -1243,7 +1357,7 @@ class Janitor:
                 return pattern
         return ""
 
-    def _consider_worktree(self, repo, entry, default, main_path):
+    def _consider_worktree(self, repo, entry, default, main_path, fetch_failed=False):
         path = entry.get("path") or ""
         if not path:
             return
@@ -1323,6 +1437,9 @@ class Janitor:
         if used:
             self.keep("worktrees", "in-use:" + why, path)
             return
+        if fetch_failed:
+            self.keep("worktrees", "fetch-failed", path)
+            return
         tip = entry.get("head") or ""
         if not tip:
             self.keep("worktrees", "unreadable-head", path)
@@ -1333,6 +1450,17 @@ class Janitor:
             return
         if not self.apply:
             self.removed_item("worktrees", path, how)
+            return
+        # The merge proof and the gh call can take a long time. Re-read the
+        # head and take a fresh process snapshot right before archiving.
+        rc, out, err = self._run(["git", "-C", path, "rev-parse", "HEAD"], timeout=60)
+        if rc != 0 or out.strip() != tip:
+            self.keep("worktrees", "head-moved", path)
+            return
+        fresh = self._take_snapshot()
+        used, why = path_in_use(fresh, path)
+        if used:
+            self.keep("worktrees", "in-use:" + why, path)
             return
         archive_ref = self._archive_worktree(repo, path, branch, tip)
         if not archive_ref:
@@ -1381,8 +1509,8 @@ class Janitor:
             return ""
         return ref
 
-    def pr_merged_heads(self, repo, branch):
-        """Head shas of merged pull requests for ``branch`` (empty without gh)."""
+    def pr_merged_heads(self, repo, branch, base):
+        """Head shas of merged pull requests for ``branch`` into ``base``."""
         gh = shutil.which("gh")
         if not gh:
             return []
@@ -1395,6 +1523,8 @@ class Janitor:
                 "merged",
                 "--head",
                 branch,
+                "--base",
+                base,
                 "--json",
                 "headRefOid",
                 "--limit",
@@ -1429,7 +1559,7 @@ class Janitor:
         )
         if rc == 0:
             return "ancestor-of-" + default
-        if tip in self.pr_merged_heads(repo, branch):
+        if tip in self.pr_merged_heads(repo, branch, default):
             return "merged-pull-request"
         rc, out, err = self._run(
             ["git", "-C", repo, "merge-base", tip, upstream], timeout=60
@@ -1542,41 +1672,52 @@ class Janitor:
 
     # -- scheduling and state ----------------------------------------------
 
-    def last_run(self):
-        path = os.path.join(self.state_dir, "last-run.json")
-        try:
-            with open(path, "r", encoding="utf-8") as fh:
-                data = json.load(fh)
-        except (OSError, ValueError):
-            return None
-        if not isinstance(data, dict):
-            return None
-        return data
+    def last_runs(self):
+        """Map sweeper name -> its last-run entry."""
+        return read_last_run(self.state_dir)["sweepers"]
+
+    def due_sweepers(self, only=None, skip=None):
+        """The sweepers that are due, in run order.
+
+        A sweeper is due when it has no entry, its ``ended_at`` is missing,
+        non-finite or in the future, or it is older than ``interval_days``.
+        """
+        only = set(only or [])
+        skip = set(skip or [])
+        last = self.last_runs()
+        interval = float(self.cfg["interval_days"]) * 86400
+        now = self.now()
+        due = []
+        for name in SWEEPERS:
+            if only and name not in only:
+                continue
+            if name in skip:
+                continue
+            entry = last.get(name)
+            if not entry:
+                due.append(name)
+                continue
+            try:
+                ended = float(entry.get("ended_at"))
+            except (TypeError, ValueError):
+                due.append(name)
+                continue
+            if not math.isfinite(ended) or ended > now or now - ended >= interval:
+                due.append(name)
+        return due
 
     def due(self):
-        last = self.last_run()
-        if not last:
-            return True
-        try:
-            ended = float(last.get("ended_at"))
-        except (TypeError, ValueError):
-            return True
-        if ended > self.now():
-            # A clock set back or a corrupt file must not stop every later run.
-            return True
-        return self.now() - ended >= float(self.cfg["interval_days"]) * 86400
+        return bool(self.due_sweepers())
 
-    def _write_last_run(self, end_ts):
-        payload = {
-            "started_at": self.start_ts,
+    def _write_sweeper_entry(self, name, end_ts):
+        """Record one finished sweeper in last-run.json, atomically."""
+        data = read_last_run(self.state_dir)
+        per = self.per.get(name, {})
+        data["sweepers"][name] = {
             "ended_at": end_ts,
-            "start": iso(self.start_ts),
-            "end": iso(end_ts),
-            "removed": self.removed,
-            "kept": self.kept,
-            "errors": self.errors,
-            "freed_bytes": self.freed_bytes,
-            "sweepers": {name: dict(self.per.get(name, {})) for name in SWEEPERS},
+            "removed": int(per.get("removed", 0)),
+            "kept": int(per.get("kept", 0)),
+            "errors": int(per.get("errors", 0)),
         }
         try:
             os.makedirs(self.state_dir, exist_ok=True)
@@ -1584,7 +1725,7 @@ class Janitor:
                 self.state_dir, ".last-run.%d.tmp" % os.getpid()
             )
             with open(tmp, "w", encoding="utf-8") as fh:
-                fh.write(json.dumps(payload, indent=1, sort_keys=True) + "\n")
+                fh.write(json.dumps(data, indent=1, sort_keys=True) + "\n")
                 fh.flush()
                 os.fsync(fh.fileno())
             os.replace(tmp, os.path.join(self.state_dir, "last-run.json"))
@@ -1649,21 +1790,25 @@ class Janitor:
                 self.deadline = time.monotonic() + float(
                     self.cfg["sweeper_budget_seconds"]
                 )
+                ok = True
                 try:
                     func()
                 except Exception as exc:  # one sweeper never stops the others
+                    ok = False
                     self.raised = True
                     self.error(name, "sweeper raised: %r" % (exc,))
                 finally:
                     self.flush_keeps(name)
+                # Only a sweeper that finished cleanly inside its budget counts
+                # as done; a raised or timed-out one must run again next tick.
+                if self.apply and ok and name not in self.timed_out:
+                    self._write_sweeper_entry(name, self.now())
         except BaseException as exc:  # interrupted: no last-run, next tick reruns
             aborted = True
             self.write({"type": "aborted", "error": repr(exc)})
             print("JANITOR: aborted: %r" % (exc,), file=sys.stderr)
         self.deadline = None
         end_ts = self.now()
-        if self.apply and not aborted:
-            self._write_last_run(end_ts)
         self.write(
             {
                 "type": "summary",
@@ -1759,15 +1904,20 @@ def cmd_run(cfg, args):
         config_file=config_path(),
         scheduled=bool(args.scheduled),
     )
-    if args.scheduled and not jan.due():
-        print("JANITOR: not due")
-        return 0
+    if args.scheduled:
+        due = jan.due_sweepers(only=_name_list(args.only), skip=_name_list(args.skip))
+        if not due:
+            print("JANITOR: not due")
+            return 0
+        only = due
+    else:
+        only = _name_list(args.only)
     lock = acquire_lock(state_dir())
     if lock is None:
         print("already running")
         return 0
     try:
-        rc = jan.run(only=_name_list(args.only), skip=_name_list(args.skip))
+        rc = jan.run(only=only, skip=_name_list(args.skip))
     finally:
         release_lock(lock)
     if args.json:
@@ -1777,32 +1927,38 @@ def cmd_run(cfg, args):
 
 
 def _state_summary(cfg):
-    last = None
-    path = os.path.join(state_dir(), "last-run.json")
-    try:
-        with open(path, "r", encoding="utf-8") as fh:
-            last = json.load(fh)
-    except (OSError, ValueError):
-        last = None
+    last = read_last_run(state_dir())["sweepers"]
     interval = float(cfg["interval_days"])
-    if not last:
-        due_in = 0.0
-        last_end = None
-    else:
+    now = time.time()
+    per = {}
+    any_due = False
+    for name in SWEEPERS:
+        entry = last.get(name)
+        if not entry:
+            per[name] = {"last_run": None, "due": True, "due_in_hours": 0.0}
+            any_due = True
+            continue
         try:
-            ended = float(last.get("ended_at"))
+            ended = float(entry.get("ended_at"))
         except (TypeError, ValueError):
             ended = None
-        if ended is None:
-            due_in = 0.0
-            last_end = None
-        elif ended > time.time():
-            # A future ended_at (clock set back) counts as due.
-            last_end = iso(ended)
-            due_in = 0.0
-        else:
-            last_end = iso(ended)
-            due_in = max(0.0, interval * 86400 - (time.time() - ended))
+        if ended is None or not math.isfinite(ended) or ended > now:
+            # A missing, non-finite or future ended_at counts as due.
+            per[name] = {
+                "last_run": iso(ended) if ended is not None and math.isfinite(ended) else None,
+                "due": True,
+                "due_in_hours": 0.0,
+            }
+            any_due = True
+            continue
+        due_in = max(0.0, interval * 86400 - (now - ended))
+        per[name] = {
+            "last_run": iso(ended),
+            "due": due_in <= 0,
+            "due_in_hours": round(due_in / 3600.0, 2),
+        }
+        if due_in <= 0:
+            any_due = True
     try:
         logs = len(
             [
@@ -1818,13 +1974,12 @@ def _state_summary(cfg):
         "log_dir": log_dir(),
         "config": config_path(),
         "config_exists": os.path.exists(config_path()),
-        "last_run_end": last_end,
-        "due": last is None or due_in <= 0,
-        "due_in_hours": round(due_in / 3600.0, 2),
+        "due": any_due,
         "interval_days": interval,
         "lock_held": lock_held(state_dir()),
         "log_files": logs,
         "sweepers": SWEEPERS,
+        "sweeper_state": per,
     }
 
 
@@ -1839,19 +1994,16 @@ def cmd_status(cfg, args):
         "config:    %s (%s)"
         % (data["config"], "present" if data["config_exists"] else "all defaults")
     )
-    if data["last_run_end"]:
-        print(
-            "last run:  %s (every %gd)"
-            % (data["last_run_end"], data["interval_days"])
-        )
-    else:
-        print("last run:  never")
-    print(
-        "due:       %s%s"
-        % ("yes" if data["due"] else "no", "" if data["due"] else " (in %.1fh)" % data["due_in_hours"])
-    )
+    print("interval:  %gd" % data["interval_days"])
+    for name in data["sweepers"]:
+        state = data["sweeper_state"][name]
+        if state["last_run"]:
+            when = "due now" if state["due"] else "next in %.1fh" % state["due_in_hours"]
+            print("  %-9s last %s, %s" % (name, state["last_run"], when))
+        else:
+            print("  %-9s never, due now" % name)
+    print("due:       %s" % ("yes" if data["due"] else "no"))
     print("lock:      %s" % ("held" if data["lock_held"] else "free"))
-    print("sweepers:  %s" % ", ".join(data["sweepers"]))
     return 0
 
 
