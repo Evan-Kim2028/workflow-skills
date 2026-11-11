@@ -277,13 +277,16 @@ expected JSON, that is logged and part A is skipped.
 The reviewed tool only recognises branches that are ancestors of the main
 branch, so squash-merged worktrees pile up. Part B handles those.
 
-Repos come from `repos` (main checkout paths). When that is empty they are
+Repos come from the union of `repos` (main checkout paths) and every folder
 discovered one or two levels under each `repo_roots` entry, taking every folder
-that contains a `.git` **directory**.
+that contains a `.git` **directory**. Both lists are always used: naming a repo
+in `repos` does not stop the roots from being scanned. A configured entry that
+does not exist is one `warn` log line naming it.
 
-A configured repo root or repo that exists but cannot be listed is an error
-line naming the path, the OS error and the fix: grant the program that runs the
-janitor (`sys.executable`, `/usr/bin/python3` under launchd) Full Disk Access,
+A configured repo root or repo, or a child folder of a readable root, that
+exists but cannot be listed is an error line naming the path, the OS error and
+the fix: grant the program that runs the janitor (`sys.executable`,
+`/usr/bin/python3` under launchd) Full Disk Access,
 or run `run --apply --only worktrees` from a terminal. macOS privacy protection
 silently denies a launchd-started program any read of the user's Documents
 folder, and taking that denial for "no repos here" was how a sweep finished in
@@ -298,7 +301,13 @@ For each repo the janitor runs `git fetch origin --quiet` (60 s, no terminal
 prompt). A repo with no `origin` remote is skipped with one log line, not an
 error. When the fetch fails, nothing is removed from that repo in this run:
 every otherwise-eligible worktree is kept with reason `fetch-failed`, because
-stale refs are not proof of a merge. Then it runs
+stale refs are not proof of a merge. After a successful fetch the default
+branch is the one the remote names, from `git ls-remote --symref origin HEAD`
+(30 s): the local `refs/remotes/origin/HEAD` can be stale and is not trusted.
+If that call fails, or names a branch this clone has no `origin/<branch>` ref
+for, nothing is removed from that repo in this run and every eligible worktree
+is kept with the same `fetch-failed` reason, with its own warn log line, since
+comparing against a branch we could not confirm proves nothing. Then it runs
 `git worktree list --porcelain`.
 
 A worktree is removed only when **all** of these hold:
@@ -349,9 +358,13 @@ The last proof covers a branch that was merged into a batch branch with a
 merge commit, where the batch branch then reached the default branch as one
 squash commit. The changed set is `git diff --name-only -z --no-renames
 <merge-base> <tip>`. It is checked in chunks of at most 200 paths with one
-`git diff --quiet <tip> origin/<default> -- <paths>` per chunk: exit 0 means
-those paths are identical on both sides (including a path absent on both),
-exit 1 means they differ, and anything else fails the proof. The proof passes
+`git --literal-pathspecs -C <repo> diff --quiet <tip> origin/<default> --
+<paths>` per chunk: exit 0 means those paths are identical on both sides
+(including a path absent on both), exit 1 means they differ, and anything else
+fails the proof. `--literal-pathspecs` matters: without it a changed file
+named `[a]` or starting with `:(` is matched as a pattern, so a branch that
+only added `[a]` passed when an unrelated file `a` was identical on both
+sides. The proof passes
 only when the changed set is not empty and every chunk is identical; a single
 difference, or any git error, fails it. The reason string is
 `changes-present-on-default`. One call per chunk replaces two `git rev-parse`

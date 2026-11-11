@@ -1342,38 +1342,49 @@ class Janitor:
             "worktrees", "cannot list %s: %s; %s" % (path, exc, UNREADABLE_ROOT_HINT)
         )
 
+    def _missing_configured_path(self, path):
+        self.write(
+            {
+                "type": "warn",
+                "sweeper": "worktrees",
+                "path": path,
+                "message": "configured repo or repo root does not exist: %s" % path,
+            }
+        )
+
     def _worktree_repos(self):
         """Repos to sweep, recording whether the scan could be completed.
 
-        A configured repo root or repo that exists but cannot be listed is an
-        error line: macOS privacy protection denies a launchd-started program
-        any read of some folders, and taking a denied `listdir` for "no
-        repos" would report the worktree sweep as done for days. Sets
-        ``repo_scan_complete`` and ``repo_scan_configured``.
+        ``repos`` and ``repo_roots`` are both used: the union of the named
+        checkouts and the repos discovered under the roots. A configured entry
+        that does not exist is one warn line naming it. A configured repo root
+        or repo, or a child of a readable root, that exists but cannot be
+        listed is an error line: macOS privacy protection denies a
+        launchd-started program any read of some folders, and taking a denied
+        `listdir` for "no repos" would report the worktree sweep as done for
+        days. Sets ``repo_scan_complete`` and ``repo_scan_configured``.
         """
         repos = []
         complete = True
         configured = list(self.cfg.get("repos") or [])
-        self.repo_scan_configured = bool(configured) or bool(
-            self.cfg.get("repo_roots") or []
-        )
-        if configured:
-            for path in configured:
-                path = os.path.realpath(os.path.expanduser(path))
-                if not os.path.isdir(path):
-                    continue
-                try:
-                    os.listdir(path)
-                except OSError as exc:
-                    self._unreadable_repo_path(path, exc)
-                    complete = False
-                    continue
-                repos.append(path)
-            self.repo_scan_complete = complete
-            return sorted(set(repos))
-        for root in self.cfg.get("repo_roots") or []:
+        roots = list(self.cfg.get("repo_roots") or [])
+        self.repo_scan_configured = bool(configured) or bool(roots)
+        for path in configured:
+            path = os.path.realpath(os.path.expanduser(path))
+            if not os.path.isdir(path):
+                self._missing_configured_path(path)
+                continue
+            try:
+                os.listdir(path)
+            except OSError as exc:
+                self._unreadable_repo_path(path, exc)
+                complete = False
+                continue
+            repos.append(path)
+        for root in roots:
             root = os.path.realpath(os.path.expanduser(root))
             if not os.path.isdir(root):
+                self._missing_configured_path(root)
                 continue
             try:
                 children = sorted(os.listdir(root))
@@ -1389,7 +1400,9 @@ class Janitor:
                     repos.append(child_path)
                 try:
                     grandchildren = sorted(os.listdir(child_path))
-                except OSError:
+                except OSError as exc:
+                    self._unreadable_repo_path(child_path, exc)
+                    complete = False
                     continue
                 for grandchild in grandchildren:
                     grandchild_path = os.path.join(child_path, grandchild)
@@ -1400,21 +1413,38 @@ class Janitor:
         self.repo_scan_complete = complete
         return sorted(set(repos))
 
-    def _default_branch(self, repo):
+    def _remote_default_branch(self, repo):
+        """The default branch the remote names, or "" when it cannot be had.
+
+        The local ``refs/remotes/origin/HEAD`` can be stale, so the answer comes
+        from the remote itself after a successful fetch. A branch the remote
+        names but this clone has no ``origin/<branch>`` ref for is unknown too:
+        comparing against a ref we cannot read proves nothing.
+        """
         rc, out, err = self._run(
-            ["git", "-C", repo, "symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"],
+            ["git", "-C", repo, "ls-remote", "--symref", "origin", "HEAD"],
+            timeout=30,
+            env={"GIT_TERMINAL_PROMPT": "0"},
+        )
+        if rc != 0:
+            return ""
+        branch = ""
+        for line in out.splitlines():
+            fields = line.split()
+            if len(fields) < 3 or fields[0] != "ref:" or fields[2] != "HEAD":
+                continue
+            if fields[1].startswith("refs/heads/"):
+                branch = fields[1][len("refs/heads/"):]
+                break
+        if not branch:
+            return ""
+        rc, out, err = self._run(
+            ["git", "-C", repo, "rev-parse", "--verify", "--quiet", "origin/" + branch],
             timeout=30,
         )
-        if rc == 0 and out.strip().startswith("refs/remotes/origin/"):
-            return out.strip()[len("refs/remotes/origin/"):]
-        for candidate in ("main", "master"):
-            rc, out, err = self._run(
-                ["git", "-C", repo, "rev-parse", "--verify", "--quiet", "origin/" + candidate],
-                timeout=30,
-            )
-            if rc == 0:
-                return candidate
-        return "main"
+        if rc != 0:
+            return ""
+        return branch
 
     @staticmethod
     def _parse_worktrees(text):
@@ -1441,7 +1471,6 @@ class Janitor:
         return entries
 
     def _sweep_repo(self, repo):
-        default = self._default_branch(repo)
         rc, out, err = self._run(
             ["git", "-C", repo, "remote", "get-url", "origin"], timeout=30
         )
@@ -1474,6 +1503,26 @@ class Janitor:
                     "stderr": (err or "").strip()[-300:],
                 }
             )
+        default = ""
+        branch_unknown = False
+        if not fetch_failed:
+            default = self._remote_default_branch(repo)
+            if not default:
+                # Every proof compares against origin/<default>; without the
+                # remote's answer a proof could pass against the wrong branch.
+                branch_unknown = True
+                self.write(
+                    {
+                        "type": "warn",
+                        "sweeper": "worktrees",
+                        "repo": repo,
+                        "message": (
+                            "cannot determine the remote default branch "
+                            "(git ls-remote --symref origin HEAD); "
+                            "removing nothing from this repo"
+                        ),
+                    }
+                )
         rc, out, err = self._run(
             ["git", "-C", repo, "worktree", "list", "--porcelain"], timeout=60
         )
@@ -1485,8 +1534,10 @@ class Janitor:
             if self.expired():
                 self._timed_out("worktrees")
                 return
-            self._consider_worktree(repo, entry, default, main_path, fetch_failed)
-        if self.apply and not fetch_failed:
+            self._consider_worktree(
+                repo, entry, default, main_path, fetch_failed or branch_unknown
+            )
+        if self.apply and not fetch_failed and not branch_unknown:
             rc, out, err = self._run(["git", "-C", repo, "worktree", "prune"], timeout=60)
             if rc != 0:
                 self.error("worktrees", "worktree prune failed in %s: %s" % (repo, (err or "").strip()))
@@ -1766,8 +1817,22 @@ class Janitor:
         # (git error, timeout) fails the proof.
         for start in range(0, len(paths), CHANGES_PROOF_CHUNK):
             chunk = paths[start:start + CHANGES_PROOF_CHUNK]
+            # --literal-pathspecs: a changed file named `[a]` or starting
+            # with `:(` is a literal path, not a pathspec pattern. Without it
+            # `[a]` matches an unrelated file `a` and the proof passes.
             rc, out, err = self._run(
-                ["git", "-C", repo, "diff", "--quiet", tip, upstream, "--"] + chunk,
+                [
+                    "git",
+                    "--literal-pathspecs",
+                    "-C",
+                    repo,
+                    "diff",
+                    "--quiet",
+                    tip,
+                    upstream,
+                    "--",
+                ]
+                + chunk,
                 timeout=120,
             )
             if rc != 0:

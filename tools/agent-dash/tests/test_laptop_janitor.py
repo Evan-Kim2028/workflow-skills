@@ -1124,6 +1124,71 @@ class WorktreeSweeperTests(GitRepoCase):
         self.assertTrue(os.path.isdir(wt))
         self.assertIn("fetch-failed", jan.keep_counts["worktrees"])
 
+    def test_remote_default_branch_wins_over_a_stale_local_origin_head(self):
+        wt = self.add_worktree("feat/trunk", commit=False, days_ago=10)
+        Path(wt, "work.txt").write_text("trunk work\n", encoding="utf-8")
+        self.git("add", ".", cwd=wt)
+        self.commit(wt, "work on feat/trunk", days_ago=10)
+        self.age_admin(wt, 10)
+        # The branch lands on the remote's default branch, which is `trunk`;
+        # local refs/remotes/origin/HEAD is stale and still says `main`.
+        self.git("checkout", "-q", "-B", "trunk", "main", cwd=self.repo)
+        self.git("merge", "--squash", "feat/trunk", cwd=self.repo)
+        self.commit(self.repo, "squash feat/trunk", days_ago=5)
+        self.git("push", "-q", "origin", "trunk", cwd=self.repo)
+        self.git("checkout", "-q", "main", cwd=self.repo)
+        self.git("symbolic-ref", "HEAD", "refs/heads/trunk", cwd=self.origin)
+        self.git(
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/main",
+            cwd=self.repo,
+        )
+        jan = self.janitor_for_worktrees(apply=True)
+        jan._fetch_merged_pr_heads = lambda repo, base: []
+        jan.sweep_worktrees()
+        self.assertFalse(os.path.exists(wt))
+        self.assertEqual(self.removal_reasons(jan), ["squash-merged"])
+
+    def test_default_branch_lookup_failure_keeps_everything(self):
+        wt = self.add_worktree("feat/nobranch", days_ago=10)
+        self.merge_branch("feat/nobranch", squash=True)
+        jan = self.janitor_for_worktrees(apply=True)
+        jan._remote_default_branch = lambda repo: ""
+        jan.open_log()
+        try:
+            jan.sweep_worktrees()
+        finally:
+            jan.log.close()
+            jan.log = None
+        self.assertTrue(os.path.isdir(wt))
+        self.assertIn("fetch-failed", jan.keep_counts["worktrees"])
+        records = [
+            json.loads(line)
+            for line in Path(jan.log_path).read_text(encoding="utf-8").splitlines()
+            if line
+        ]
+        self.assertTrue(
+            any(
+                r.get("type") == "warn"
+                and "default branch" in (r.get("message") or "")
+                for r in records
+            )
+        )
+
+    def test_default_branch_named_without_a_local_ref_is_unknown(self):
+        jan = self.janitor_for_worktrees(apply=False)
+
+        def fake_run(argv, **kw):
+            if "ls-remote" in argv:
+                return 0, "ref: refs/heads/trunk\tHEAD\n", ""
+            if "rev-parse" in argv:
+                return 1, "", ""
+            self.fail("unexpected git call: %r" % (argv,))
+
+        jan._run = fake_run
+        self.assertEqual(jan._remote_default_branch(self.repo), "")
+
     def test_repo_without_origin_is_skipped(self):
         wt = self.add_worktree("feat/noorigin", days_ago=10)
         self.git("remote", "remove", "origin", cwd=self.repo)
@@ -1163,6 +1228,45 @@ class WorktreeSweeperTests(GitRepoCase):
         self.assertIn(os.path.realpath(str(one)), repos)
         self.assertIn(os.path.realpath(str(two)), repos)
         self.assertNotIn(os.path.realpath(str(plain)), repos)
+
+    def test_repos_and_repo_roots_are_both_scanned(self):
+        (self.base / "root").mkdir()
+        named = Path(self.base / "named")
+        named.mkdir()
+        self.git("init", "-b", "main", str(named), cwd=str(self.base))
+        discovered = Path(self.base / "root" / "discovered")
+        discovered.mkdir()
+        self.git("init", "-b", "main", str(discovered), cwd=str(self.base))
+        jan = self.janitor(
+            cfg={"repos": [str(named)], "repo_roots": [str(self.base / "root")]}
+        )
+        repos = jan._worktree_repos()
+        self.assertIn(os.path.realpath(str(named)), repos)
+        self.assertIn(os.path.realpath(str(discovered)), repos)
+
+    def test_missing_configured_repo_or_root_is_one_warning_naming_it(self):
+        missing_repo = self.base / "gone-repo"
+        missing_root = self.base / "gone-root"
+        jan = self.janitor(
+            cfg={"repos": [str(missing_repo)], "repo_roots": [str(missing_root)]}
+        )
+        jan.open_log()
+        try:
+            jan._worktree_repos()
+        finally:
+            jan.log.close()
+            jan.log = None
+        records = [
+            json.loads(line)
+            for line in Path(jan.log_path).read_text(encoding="utf-8").splitlines()
+            if line
+        ]
+        warnings = [r for r in records if r.get("type") == "warn"]
+        self.assertEqual(len(warnings), 2)
+        self.assertEqual(jan.errors, 0)
+        text = json.dumps(warnings)
+        self.assertIn(str(missing_repo), text)
+        self.assertIn(str(missing_root), text)
 
     def test_unreadable_repo_root_is_an_error_and_keeps_the_sweep_due(self):
         locked = self.base / "locked-root"
@@ -1210,6 +1314,36 @@ class WorktreeSweeperTests(GitRepoCase):
         )
         jan.run(only=["worktrees"])
         self.assertEqual(jan.errors, 1)
+        self.assertIn("worktrees", jan.unfinished)
+        self.assertFalse((self.state / "last-run.json").exists())
+
+    def test_unreadable_child_of_a_readable_root_is_an_error_too(self):
+        root = self.base / "root-with-locked-child"
+        locked = root / "locked-child"
+        locked.mkdir(parents=True)
+        locked.chmod(0o000)
+        self.addCleanup(_restore_mode, locked)
+        jan = self.janitor(
+            cfg={
+                "repos": [],
+                "repo_roots": [str(root)],
+                "worktree_manager_cmd": "janitor-test-no-such-tool",
+            },
+            apply=True,
+        )
+        jan.run(only=["worktrees"])
+        self.assertEqual(jan.errors, 1)
+        records = [
+            json.loads(line)
+            for line in Path(jan.log_path).read_text(encoding="utf-8").splitlines()
+            if line
+        ]
+        errors = [r for r in records if r.get("type") == "error"]
+        self.assertEqual(len(errors), 1)
+        message = errors[0]["message"]
+        self.assertIn(str(locked), message)
+        self.assertIn(lj.UNREADABLE_ROOT_HINT, message)
+        self.assertIn("Full Disk Access", message)
         self.assertIn("worktrees", jan.unfinished)
         self.assertFalse((self.state / "last-run.json").exists())
 
@@ -1388,6 +1522,25 @@ class MergedBatchProofTests(GitRepoCase):
         self.assertEqual(
             self.removal_reason_for(jan, wt), "changes-present-on-default"
         )
+
+    def test_file_name_that_looks_like_a_pathspec_pattern_is_matched_literally(self):
+        # `a` is identical on both sides, so a pathspec pattern `[a]` matches
+        # it and the changed file `[a]` would go unnoticed without
+        # --literal-pathspecs.
+        self.write_main("a", "same on both sides\n")
+        self.git("add", ".", cwd=self.repo)
+        self.commit(self.repo, "add a", days_ago=20)
+        self.git("push", "-q", "origin", "main", cwd=self.repo)
+        wt = self.add_worktree("feat/bracket", commit=False, days_ago=10)
+        Path(wt, "[a]").write_text("only on the branch\n", encoding="utf-8")
+        self.git("add", ".", cwd=wt)
+        self.commit(wt, "add bracket file", days_ago=10)
+        self.age_admin(wt, 10)
+        jan = self.janitor_for_worktrees(apply=True)
+        jan._fetch_merged_pr_heads = lambda repo, base: []
+        jan.sweep_worktrees()
+        self.assertTrue(os.path.isdir(wt))
+        self.assertIn("unmerged", jan.keep_counts["worktrees"])
 
     def test_merged_list_fetched_once_per_repo(self):
         self.add_worktree("feat/one", days_ago=10)
