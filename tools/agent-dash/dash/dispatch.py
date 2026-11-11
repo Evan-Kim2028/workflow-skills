@@ -53,6 +53,7 @@ DEFAULTS = {
     "retry_tier": "same",
     "retry_wait_s": 90,
     "quota_retries": 8,
+    "probe_timeout_s": 90,
     "merge_wave": {"min_ready": 3, "max_age_min": 60},
 }
 DEFAULT_MAX_WAIT = 3600
@@ -61,6 +62,18 @@ NUDGE_S = 1
 WAIT_TIMEOUT_S = 1800
 KINDS = ("write", "read")
 VERDICTS = ("PASS", "PARTIAL", "BLOCKED")
+#: A tier health probe is a one-step, tool-using request: the worker must call
+#: the bash tool and put its output in the report. A plain completion passes
+#: while a tool-using session fails (the 2026-11-11 DeepSeek incident), so the
+#: probe only passes when the tool output is in the report.
+PROBE_MARKER = "dispatcher tier health probe"
+PROBE_PROMPT = (
+    f"{PROBE_MARKER}. Call the bash tool exactly once to run `echo probe-ok`, "
+    "then write a report whose first line is PASS and whose second line is the "
+    "tool's output. Do not answer from memory.\n"
+)
+PROBE_OUTPUT = "probe-ok"
+STANDBY_SUFFIX = "-standby"
 _STATUS_RE = re.compile(r"^STATUS: (\S+)")
 _TIER_RE = re.compile(r"\btier=(\S+)")
 _REASON_RE = re.compile(r"\breason=(\S+)")
@@ -119,6 +132,15 @@ def task_slug(ws: str, task_id: str) -> str:
     """Task id without its workstream prefix, for the label slug."""
     stripped = re.sub(rf"^{re.escape(ws)}[.\-_]?", "", task_id, flags=re.IGNORECASE)
     return stripped or task_id
+
+
+def probe_report_ok(out_path) -> bool:
+    """True when a probe report is a PASS that carries the tool's output."""
+    try:
+        text = Path(out_path).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    return verdict_of(out_path) == "PASS" and PROBE_OUTPUT in text
 
 
 def build_label(ws: str, task_id: str, launches: int) -> str:
@@ -228,10 +250,13 @@ def load_config(bundle: Path) -> dict:
     try:
         cfg["retry_wait_s"] = float(cfg["retry_wait_s"])
         cfg["quota_retries"] = int(cfg["quota_retries"])
+        cfg["probe_timeout_s"] = int(cfg["probe_timeout_s"])
     except (TypeError, ValueError) as exc:
-        raise ValueError(f"dispatch.json has a non-numeric retry_wait_s or quota_retries: {exc}") from exc
+        raise ValueError(f"dispatch.json has a non-numeric retry_wait_s, quota_retries or probe_timeout_s: {exc}") from exc
     if cfg["retry_wait_s"] < 0 or cfg["quota_retries"] < 0:
         raise ValueError("dispatch.json retry_wait_s and quota_retries must be non-negative")
+    if not 1 <= cfg["probe_timeout_s"] <= 150:
+        raise ValueError("dispatch.json probe_timeout_s must be between 1 and 150 seconds")
     return cfg
 
 
@@ -380,6 +405,7 @@ class Dispatcher:
             "started": None,
             "heartbeat": None,
             "tasks": {},
+            "tiers": {},
             "needs_prompt": [],
             "errors": {},
             "admission": {},
@@ -606,6 +632,8 @@ class Dispatcher:
         launchable = [row for row in queue if row.get("kind") != "gate" and not row.get("live_run")]
         launched = 0
         paused = bool(cfg["paused"]) or config_error is not None or dashboard_down
+        if not dry_run and not paused:
+            self._probe_tiers(now, cfg)
         for tid, task in sorted(self.state["tasks"].items()):
             if capacity <= 0 or paused:
                 break
@@ -616,6 +644,8 @@ class Dispatcher:
             )
             if outcome == "none-available":
                 break
+            if outcome == "tier-unhealthy":
+                continue
             if outcome == "ok":
                 launched += 1
                 capacity -= 1
@@ -639,6 +669,8 @@ class Dispatcher:
                 continue
             if outcome == "none-available":
                 break
+            if outcome == "tier-unhealthy":
+                continue
             if outcome == "ok":
                 launched += 1
                 capacity -= 1
@@ -719,7 +751,7 @@ class Dispatcher:
         except ValueError as exc:
             raise ValueError(f"prompt max_wait {meta.get('max_wait')!r} is not a number") from exc
         launches = int(prev.get("launches") or 0)
-        if retry_from and retry_reason == "quota":
+        if retry_from and retry_reason in ("quota", "provider"):
             attempt = int(prev.get("attempt") or 0) or 1
         elif retry_from:
             attempt = int(prev.get("attempt") or 0) + 1
@@ -729,7 +761,10 @@ class Dispatcher:
         verdict = label_lib.check(label, ws=self.ws)
         if not verdict["ok"]:
             raise ValueError(f"bad label {label}: {verdict['fix']}")
-        if retry_from and cfg.get("retry_tier", "same") == "auto":
+        if retry_from and retry_reason == "provider":
+            tier = retry_from or tier
+            exclude = []
+        elif retry_from and cfg.get("retry_tier", "same") == "auto":
             tier = "auto"
             exclude = [retry_from]
         elif retry_from:
@@ -737,6 +772,11 @@ class Dispatcher:
             exclude = []
         else:
             exclude = []
+        unhealthy = sorted(name for name, info in (self.state.get("tiers") or {}).items() if not info.get("healthy", True))
+        if tier in unhealthy:
+            return "tier-unhealthy"
+        if tier in ("auto", "default") and unhealthy:
+            exclude = list(dict.fromkeys([*exclude, *unhealthy]))
         if self.dry:
             self.emit("would-launch", task=task_id, label=label, tier=tier, kind=kind, workspace=str(workspace))
             return "ok"
@@ -799,13 +839,15 @@ class Dispatcher:
         path.parent.mkdir(parents=True, exist_ok=True)
         if not path.is_file():
             path.write_text("ts\tdecision\twhy\tevidence\n", encoding="utf-8")
-        if mode == "auto":
+        if mode == "auto" and reason != "provider":
             decision = f"retry {task_id} as {label} on auto, excluding {from_tier} (now {to_tier})"
         else:
             decision = f"retry {task_id} as {label} on {to_tier}, same tier (was {from_tier})"
         why = (
             "run ended on a quota/rate-limit hit; waiting out the cooldown before relaunching"
             if reason == "quota"
+            else "run ended on a provider fault; waiting for the tier health probe before relaunching"
+            if reason == "provider"
             else "run ended with no PASS/PARTIAL/BLOCKED verdict"
         )
         row = [
@@ -866,6 +908,16 @@ class Dispatcher:
             self._release_lease(task)
             self._move_needs_lead(task_id, task, verdict)
             return
+        if status["reason"] == "provider":
+            self._release_lease(task)
+            task["status"] = "retry-pending"
+            task["retry_from"] = tier
+            task["retry_reason"] = "provider"
+            task["retry_after"] = now + float(cfg.get("retry_wait_s", 90))
+            self._mark_unhealthy(tier, now, cfg)
+            if not cfg["paused"]:
+                self._try_retry(task_id, task, tier, cfg, "provider")
+            return
         if status["reason"] == "quota":
             self._release_lease(task)
             if int(task.get("quota_retries") or 0) >= int(cfg.get("quota_retries", 8)):
@@ -894,13 +946,99 @@ class Dispatcher:
         task["status"] = "needs-lead"
         self.emit("needs-lead", task=task_id, label=task["label"], reason=reason)
 
+    def _mark_unhealthy(self, tier: str, now: float, cfg: dict, reason: str = "provider") -> None:
+        """Take a tier out of service and emit one event per outage, not per task."""
+        tiers = self.state.setdefault("tiers", {})
+        info = tiers.get(tier)
+        if info and not info.get("healthy", True):
+            return
+        tiers[tier] = {
+            "healthy": False,
+            "since": now,
+            "probe_after": now + float(cfg.get("retry_wait_s", 90)),
+            "reason": reason,
+            "probes": 0,
+        }
+        self.emit("tier-unhealthy", tier=tier, reason=reason)
+
+    def _mark_healthy(self, tier: str, now: float) -> None:
+        """Put a tier back after a passing probe and emit one recovery event."""
+        info = (self.state.get("tiers") or {}).get(tier)
+        if not info or info.get("healthy", True):
+            return
+        info["healthy"] = True
+        info["recovered"] = now
+        self.emit("tier-recovered", tier=tier, probes=int(info.get("probes") or 0))
+        for task in self.state["tasks"].values():
+            if (
+                task.get("status") == "retry-pending"
+                and task.get("retry_reason") == "provider"
+                and task.get("retry_from") == tier
+            ):
+                task["retry_after"] = now
+
+    def _probe_tiers(self, now: float, cfg: dict) -> None:
+        """Probe each unhealthy tier when its backoff is due; resume on success."""
+        for tier, info in list((self.state.get("tiers") or {}).items()):
+            if info.get("healthy", True):
+                continue
+            if now < float(info.get("probe_after") or 0):
+                continue
+            info["probes"] = int(info.get("probes") or 0) + 1
+            if self._probe_tier(tier, cfg, info["probes"]):
+                self._mark_healthy(tier, now)
+            else:
+                info["probe_after"] = now + float(cfg.get("retry_wait_s", 90))
+
+    def _probe_tier(self, tier: str, cfg: dict, probe: int) -> bool:
+        """Run one tool-using probe on the tier's own launcher; True on a PASS report.
+
+        The prompt must call the bash tool and put its output in the report, so
+        a plain completion that cannot use tools fails the probe. The launch is
+        bounded by ``probe_timeout_s``; a probe still running at the deadline is
+        stopped by its pid. A probe is never launched on another tier.
+        """
+        workspace = cfg.get("workspace")
+        if not workspace:
+            for task in self.state["tasks"].values():
+                if task.get("retry_from") == tier and task.get("workspace"):
+                    workspace = task["workspace"]
+                    break
+        if not workspace:
+            return False
+        label = label_lib.make(self.ws.lower(), "coord", f"probe-{tier}", round=probe)
+        run_dir = self.bundle / "runs" / label
+        run_dir.mkdir(parents=True, exist_ok=True)
+        prompt = run_dir / "prompt.md"
+        prompt.write_text(PROBE_PROMPT, encoding="utf-8")
+        timeout = int(cfg.get("probe_timeout_s", 90))
+        requested = tier.removesuffix(STANDBY_SUFFIX)
+        try:
+            status = parse_status(self.launcher(worker_argv(label, requested, workspace, prompt, run_dir, timeout)))
+        except Exception:
+            status = {"state": "failed", "reason": "probe-launch", "out": "", "tier": tier}
+        out = status.get("out") or str(run_dir / f"out-{label}.md")
+        if status.get("state") == "done" and probe_report_ok(out):
+            return True
+        self._stop_probe(run_dir, label)
+        return False
+
+    def _stop_probe(self, run_dir: Path, label: str) -> None:
+        """Stop a probe that outlived its deadline, by pid only."""
+        pid = read_pid_file(run_dir / f"{label}.pid")
+        if pid is None or not self.alive(pid):
+            return
+        with contextlib.suppress(OSError):
+            os.kill(pid, signal.SIGTERM)
+
     def _try_retry(self, task_id: str, task: dict, failed_tier: str, cfg: dict, reason: str = "no-verdict") -> str:
         """Relaunch a no-verdict task: same tier by default, ``auto`` excluding
-        the failed tier when ``retry_tier`` is ``auto``. A quota retry waits
-        out ``retry_wait_s`` first (``"waiting"``, slot left free) and never
-        consumes the one no-verdict retry. A failed relaunch becomes needs-lead.
+        the failed tier when ``retry_tier`` is ``auto``. A quota or provider
+        retry waits out ``retry_wait_s`` first (``"waiting"``, slot left free)
+        and never consumes the one no-verdict retry. A provider retry also
+        waits for its tier's health probe. A failed relaunch becomes needs-lead.
         """
-        if reason == "quota":
+        if reason in ("quota", "provider"):
             wait_until = task.get("retry_after")
             if wait_until is not None and self.now() < wait_until:
                 return "waiting"
@@ -923,6 +1061,10 @@ class Dispatcher:
             "heartbeat": self.state.get("heartbeat"),
             "heartbeat_age_s": None if not self.state.get("heartbeat") else round(self.now() - self.state["heartbeat"]),
             "slots_used": len(running),
+            "tiers": {
+                name: {"healthy": bool(info.get("healthy", True)), "since": info.get("since"), "probes": info.get("probes")}
+                for name, info in (self.state.get("tiers") or {}).items()
+            },
             "tasks": {tid: {k: t.get(k) for k in ("label", "tier", "attempt", "status", "run_dir", "out")} for tid, t in tasks.items()},
             "last_seq": last_seq(self.inbox_path),
             "paused": self._paused(),
@@ -1076,6 +1218,9 @@ def cmd_dispatch(argv: list[str]) -> int:
                   f"{' (paused)' if summary['paused'] else ''}")
             age = "-" if summary["heartbeat_age_s"] is None else f"{summary['heartbeat_age_s']}s"
             print(f"  heartbeat age {age}  slots used {summary['slots_used']}  last seq {summary['last_seq']}")
+            for name, info in sorted(summary["tiers"].items()):
+                if not info["healthy"]:
+                    print(f"  tier {name} unhealthy since {info['since']} probes={info['probes']}")
             for tid, task in sorted(summary["tasks"].items()):
                 print(f"  {tid} [{task.get('status')}] {task.get('label')} tier={task.get('tier')} attempt={task.get('attempt')}")
         return 0

@@ -45,17 +45,38 @@ class FakeWorker:
         self.reports = {}
         self.reasons = {}
         self.next_pid = 5000
+        self.probe_ok = True
+        self.probe_error = "connection refused"
+        self.probe_report = None
 
     def __call__(self, argv):
         self.argvs.append(list(argv))
         label = argv[3]
         run_dir = Path(argv[6])
+        prompt = Path(argv[5])
         tier_file = run_dir / f"{label}.tier"
         out = run_dir / f"out-{label}.md"
         err = run_dir / f"err-{label}.log"
+        try:
+            probe = dispatch.PROBE_MARKER in prompt.read_text(encoding="utf-8")
+        except OSError:
+            probe = False
+        if probe:
+            run_dir.mkdir(parents=True, exist_ok=True)
+            tier = argv[2]
+            if self.probe_ok:
+                out.write_text(self.probe_report or f"PASS\n{dispatch.PROBE_OUTPUT}\n", encoding="utf-8")
+                err.write_text("", encoding="utf-8")
+                return f"STATUS: done out={out} err={err} tier={tier}"
+            out.write_text("", encoding="utf-8")
+            err.write_text(self.probe_error + "\n", encoding="utf-8")
+            return f"STATUS: failed out={out} err={err} tier={tier} reason=provider"
         if not tier_file.exists():
             run_dir.mkdir(parents=True, exist_ok=True)
-            tier = "glm-flash" if "--exclude=muse" in argv else "muse"
+            if argv[2] not in ("auto", "default"):
+                tier = argv[2]
+            else:
+                tier = "glm-flash" if "--exclude=muse" in argv else "muse"
             self.next_pid += 1
             pid = self.next_pid
             self.pids[label] = pid
@@ -424,8 +445,18 @@ class OutcomeTests(DispatchTestCase):
         reasons = {e["reason"] for e in errors}
         self.assertEqual(len(errors), 3, "the two negative values share one message and dedup")
         self.assertTrue(any("retry_tier" in reason for reason in reasons))
-        self.assertTrue(any("non-numeric retry_wait_s or quota_retries" in reason for reason in reasons))
+        self.assertTrue(any("non-numeric retry_wait_s, quota_retries or probe_timeout_s" in reason for reason in reasons))
         self.assertTrue(any("non-negative" in reason for reason in reasons))
+
+    def test_bad_probe_timeout_pauses_and_reports(self):
+        for bad in ({"probe_timeout_s": 0}, {"probe_timeout_s": 200}, {"probe_timeout_s": "soon"}):
+            self.write_config(slots=2, **bad)
+            self.dispatcher().tick()
+            self.assertEqual(self.worker.argvs, [], f"{bad} must hold launches")
+        errors = [e for e in self.events() if e["type"] == "error" and e.get("phase") == "config"]
+        reasons = {e["reason"] for e in errors}
+        self.assertTrue(any("between 1 and 150" in reason for reason in reasons))
+        self.assertTrue(any("non-numeric retry_wait_s, quota_retries or probe_timeout_s" in reason for reason in reasons))
 
     def test_restart_mid_quota_wait_still_honours_the_wait(self):
         self.write_config(slots=3, retry_wait_s=90)
@@ -465,6 +496,135 @@ class OutcomeTests(DispatchTestCase):
         self.assertEqual(errors[0]["task"], "WS9.A")
         self.assertEqual(len(self.worker.launches_for(LABEL_B)), 1)
         self.assertEqual(self.status_of("WS9.B"), "wip")
+
+
+class ProviderHealthTests(DispatchTestCase):
+    """A provider fault is a wait: no retry is spent and the tier is probed."""
+
+    TIER = "deepseek-flash"
+
+    def seven_tasks(self):
+        ids = [f"WS9.{n}" for n in range(1, 8)]
+        tasks = [{"id": tid, "title": tid, "status": "todo", "deps": []} for tid in ids]
+        self.write_plan({"dag": {"groups": [{"id": "G1", "tasks": tasks}]}})
+        for tid in ids:
+            self.write_prompt(tid, front=f"---\ntier: {self.TIER}\n---\n")
+        return ids
+
+    def one_task(self, tid="WS9.A"):
+        self.write_plan({"dag": {"groups": [{"id": "G1", "tasks": [{"id": tid, "title": tid, "status": "todo", "deps": []}]}]}})
+        self.write_prompt(tid)
+
+    def test_seven_provider_deaths_spend_no_retry_and_launch_nothing(self):
+        ids = self.seven_tasks()
+        self.write_config(slots=7, retry_wait_s=60)
+        disp = self.dispatcher()
+        self.assertEqual(disp.tick()["launched"], 7)
+        for tid in ids:
+            label = dispatch.build_label(WS, tid, 0)
+            self.assertEqual(self.worker.pids[label] > 0, True)
+            self.worker.finish(label, "", reason="provider")
+        disp.tick()
+        for tid in ids:
+            task = disp.state["tasks"][tid]
+            self.assertEqual(task["status"], "retry-pending")
+            self.assertEqual(task["attempt"], 1, "a provider death never spends the retry")
+            self.assertEqual(task["retry_reason"], "provider")
+            self.assertEqual(task["retry_from"], self.TIER)
+            self.assertEqual(self.worker.launches_for(dispatch.build_label(WS, tid, 1)), [])
+        self.assertNotIn("needs-lead", self.types())
+        self.assertEqual(self.types().count("tier-unhealthy"), 1, "one event per outage, not per task")
+        self.assertEqual(self.status_of("WS9.1"), "wip", "the waiting task is not moved")
+
+    def test_nothing_launches_on_the_tier_until_a_probe_passes(self):
+        ids = self.seven_tasks()
+        self.write_config(slots=1, retry_wait_s=60)
+        self.worker.probe_ok = False
+        disp = self.dispatcher()
+        self.assertEqual(disp.tick()["launched"], 1)
+        self.worker.finish(dispatch.build_label(WS, ids[0], 0), "", reason="provider")
+        disp.tick()
+        self.clock.advance(60)
+        disp.tick()
+        self.assertEqual(self.worker.launches_for(dispatch.build_label(WS, ids[0], 1)), [], "a failed probe keeps the tier down")
+        self.assertEqual(self.worker.launches_for(dispatch.build_label(WS, ids[1], 0)), [], "ready work waits too")
+        down = [e for e in self.events() if e["type"] == "tier-unhealthy"]
+        self.assertEqual(len(down), 1)
+        self.assertNotIn("tier-recovered", self.types())
+
+    def test_passing_probe_recovers_and_resumes_the_same_tier(self):
+        ids = self.seven_tasks()
+        self.write_config(slots=1, retry_wait_s=60)
+        disp = self.dispatcher()
+        self.assertEqual(disp.tick()["launched"], 1)
+        self.worker.finish(dispatch.build_label(WS, ids[0], 0), "", reason="provider")
+        disp.tick()
+        self.assertEqual(self.worker.launches_for(dispatch.build_label(WS, ids[0], 1)), [])
+        self.clock.advance(60)
+        disp.tick()
+        retry = self.worker.launches_for(dispatch.build_label(WS, ids[0], 1))
+        self.assertEqual(len(retry), 1)
+        self.assertEqual(retry[0][2], self.TIER, "resumes on the same tier")
+        self.assertTrue(all(not arg.startswith("--exclude=") for arg in retry[0]))
+        recovered = [e for e in self.events() if e["type"] == "tier-recovered"]
+        self.assertEqual(len(recovered), 1)
+        probes = [argv for argv in self.worker.argvs if dispatch.PROBE_MARKER in Path(argv[5]).read_text(encoding="utf-8")]
+        self.assertEqual(len(probes), 1)
+        self.assertEqual(probes[0][2], self.TIER, "the probe uses the tier's own launcher")
+
+    def test_provider_retry_stays_on_the_tier_even_with_retry_tier_auto(self):
+        self.write_config(slots=1, retry_tier="auto", retry_wait_s=30)
+        self.one_task()
+        disp = self.dispatcher()
+        disp.tick()
+        self.worker.finish(LABEL_A, "", reason="provider")
+        disp.tick()
+        self.clock.advance(30)
+        disp.tick()
+        retry = self.worker.launches_for("ws9-exec-a-r1")
+        self.assertEqual(len(retry), 1)
+        self.assertEqual(retry[0][2], "muse", "never falls back to another tier")
+        self.assertTrue(all(not arg.startswith("--exclude=") for arg in retry[0]))
+        retried = [e for e in self.events() if e["type"] == "retried"][0]
+        self.assertEqual((retried["from_tier"], retried["to_tier"], retried["reason"]), ("muse", "muse", "provider"))
+
+    def test_a_real_failure_after_a_provider_wait_still_spends_the_retry(self):
+        self.write_config(slots=1, retry_wait_s=30)
+        self.one_task()
+        disp = self.dispatcher()
+        disp.tick()
+        self.worker.finish(LABEL_A, "", reason="provider")
+        disp.tick()
+        self.clock.advance(30)
+        disp.tick()
+        self.worker.finish("ws9-exec-a-r1", "", reason="empty-report")
+        disp.tick()
+        self.assertEqual(disp.state["tasks"]["WS9.A"]["attempt"], 2, "the one no-verdict retry was still available")
+        self.assertEqual(len(self.worker.launches_for("ws9-exec-a-r2")), 1)
+        self.worker.finish("ws9-exec-a-r2", "", reason="empty-report")
+        disp.tick()
+        lead = [e for e in self.events() if e["type"] == "needs-lead"]
+        self.assertEqual([(e["task"], e["reason"]) for e in lead], [("WS9.A", "no-verdict-twice")])
+
+    def test_a_plain_pass_without_the_tool_output_does_not_recover(self):
+        self.write_config(slots=1, retry_wait_s=30)
+        self.one_task()
+        self.worker.probe_report = "PASS\nI did not call a tool\n"
+        disp = self.dispatcher()
+        disp.tick()
+        self.worker.finish(LABEL_A, "", reason="provider")
+        disp.tick()
+        self.clock.advance(30)
+        disp.tick()
+        self.assertNotIn("tier-recovered", self.types(), "a completion that never used a tool is not a pass")
+        self.assertEqual(self.worker.launches_for("ws9-exec-a-r1"), [])
+
+    def test_probe_is_held_while_paused(self):
+        self.write_config(slots=2, retry_wait_s=30, paused=True)
+        disp = self.dispatcher()
+        disp.tick()
+        self.assertEqual(self.worker.argvs, [])
+        self.assertEqual([e for e in self.events() if e["type"] == "tier-recovered"], [])
 
 
 class MergeAndIdleTests(DispatchTestCase):

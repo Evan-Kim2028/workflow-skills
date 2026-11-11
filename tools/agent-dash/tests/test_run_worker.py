@@ -1338,5 +1338,61 @@ class AdmissionTests(unittest.TestCase):
             self.assertEqual(live.read_bytes(), before)
 
 
+class ProviderClassifierTests(unittest.TestCase):
+    """One test per provider pattern, plus the exact 2026-11-11 incident string."""
+
+    def test_table_lists_every_pattern(self):
+        self.assertEqual(
+            [name for name, _pattern in runner.PROVIDER_PATTERNS],
+            ["http-5xx", "http-5xx", "connection", "connection", "model-variant", "model-variant", "auth", "auth", "overloaded"],
+        )
+
+    def test_http_5xx(self):
+        self.assertEqual(runner.classify_provider("upstream said HTTP 503"), "http-5xx")
+        self.assertEqual(runner.classify_provider("502 Bad Gateway"), "http-5xx")
+
+    def test_connection_error(self):
+        self.assertEqual(runner.classify_provider("connect ECONNREFUSED 10.0.0.1:443"), "connection")
+        self.assertEqual(runner.classify_provider("connection reset by peer"), "connection")
+
+    def test_model_variant_400_and_404(self):
+        self.assertEqual(runner.classify_provider("HTTP 400: unknown model 'x'"), "model-variant")
+        self.assertEqual(runner.classify_provider("404 model not found"), "model-variant")
+
+    def test_exact_incident_string(self):
+        text = "Signed model 'morph-dsv41flash-1017' is not a declared variant of 'morph-dsv41flash'"
+        self.assertEqual(runner.classify_provider(text), "model-variant")
+
+    def test_auth_401_and_403(self):
+        self.assertEqual(runner.classify_provider("HTTP 401 Unauthorized"), "auth")
+        self.assertEqual(runner.classify_provider("403 Forbidden: invalid api key"), "auth")
+        self.assertEqual(runner.classify_provider("provider returned HTTP 401"), "auth")
+
+    def test_overloaded(self):
+        self.assertEqual(runner.classify_provider("Overloaded"), "overloaded")
+
+    def test_a_prompt_error_is_not_a_provider_fault(self):
+        self.assertIsNone(runner.classify_provider("400 invalid request: prompt is too long"))
+        self.assertIsNone(runner.classify_provider("the test failed: expected 5, got 3"))
+
+    def test_provider_hit_ignores_a_finished_report(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "out.md"
+            err = Path(tmp) / "err.log"
+            out.write_text("PASS\nfixed the 503 handling\n", encoding="utf-8")
+            err.write_text("HTTP 503 Service Unavailable\n", encoding="utf-8")
+            self.assertFalse(runner.provider_hit(out, err), "a worker that reported ran the task")
+            out.write_text("", encoding="utf-8")
+            self.assertTrue(runner.provider_hit(out, err))
+
+    def test_outcome_reports_provider_before_empty(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "out.md"
+            err = Path(tmp) / "err.log"
+            out.write_text("", encoding="utf-8")
+            err.write_text("connection refused\n", encoding="utf-8")
+            self.assertEqual(runner.outcome({}, out, err), "provider")
+
+
 if __name__ == "__main__":
     unittest.main()

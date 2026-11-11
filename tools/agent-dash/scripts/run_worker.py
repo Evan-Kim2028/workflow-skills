@@ -43,6 +43,10 @@ label, and pid for every launcher to read.
 A quota/rate-limit failure (any ``quota_patterns`` match in the logs, e.g.
 GLM's ``Rate limit reached for requests``) cools the tier down instead of
 reporting a silent ``done``, and ``auto``/``default`` skip a cooling tier.
+A provider fault (HTTP 5xx, a connection error, a 400/404 naming the model or
+variant, a 401/403 from the provider, "overloaded") reports
+``reason=provider`` and is never retried on another tier here: the provider
+is down, so the dispatcher waits and probes the same tier.
 A ``pi`` tier whose registry entry names ``standby_env_file`` relabels the
 launch as ``<name>-standby`` (its own tier and cooldown) and runs the
 launcher with ``AGENT_DASH_PI_ENV_FILE`` set to that path, so the launcher
@@ -84,6 +88,21 @@ READ_LIMIT = 262144
 #: and only when the report carries no verdict line.
 REPORT_MIN_BYTES = 1500
 REPORT_TAIL_BYTES = 600
+#: Provider-side failures that are not about the prompt: the provider is down,
+#: rejecting its own model mapping, or refusing the credential. Ordered
+#: ``(name, regex)``; the first match names the cause. A worker that produced
+#: a verdict line ran the task, so it is never reclassified (see provider_hit).
+PROVIDER_PATTERNS = (
+    ("http-5xx", r"\bHTTP[/ ]?5\d\d\b"),
+    ("http-5xx", r"\b5\d\d (?:Internal Server Error|Bad Gateway|Service Unavailable|Gateway Timeout)\b"),
+    ("connection", r"\b(?:ECONNREFUSED|ECONNRESET|ETIMEDOUT|ENOTFOUND|EAI_AGAIN)\b"),
+    ("connection", r"\bconnection (?:refused|reset|error|timed out|closed)\b"),
+    ("model-variant", r"\b(?:400|404)\b[^\n]{0,160}\b(?:model|variant)\b"),
+    ("model-variant", r"is not a declared variant of"),
+    ("auth", r"\bHTTP[/ ]?(?:401|403)\b"),
+    ("auth", r"\b(?:401|403)\b[^\n]{0,120}\b(?:unauthori[sz]ed|forbidden|invalid api key|authentication|permission)\b"),
+    ("overloaded", r"\boverloaded\b"),
+)
 #: The dashboard can take several seconds to answer right after a deploy
 #: restart (cold caches, polls holding the store lock), so the preflight
 #: budget is generous; a timeout below warns instead of refusing.
@@ -662,6 +681,9 @@ def observe(ctx, tier, tried) -> int:
     result = outcome(worker, ctx["out"], ctx["err"])
     if result != "quota" and quota_file_hit(ctx):
         result = "quota"
+    if result == "provider":
+        emit("failed", ctx["out"], ctx["err"], tier, "provider")
+        return 0
     if result != "quota":
         if result == "done":
             emit("done", ctx["out"], ctx["err"], tier)
@@ -772,8 +794,33 @@ def note_quota(ctx, name):
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
+def classify_provider(text):
+    """The first ``PROVIDER_PATTERNS`` name that matches ``text``, or None."""
+    for name, pattern in PROVIDER_PATTERNS:
+        try:
+            if re.search(pattern, text, re.IGNORECASE):
+                return name
+        except re.error:
+            continue
+    return None
+
+
+def provider_hit(out_path, err_path) -> bool:
+    """True when a finished worker died on a provider fault, not on the task.
+
+    A report that opens with a verdict line means the worker ran and
+    reported, so its stderr is never reclassified: a task failure that
+    mentions a connection error stays a task failure. With no verdict,
+    the err log and the report tail are scanned for the provider table.
+    """
+    out = read_tail(out_path)
+    if _has_verdict_line(out):
+        return False
+    return classify_provider(read_tail(err_path)) is not None or classify_provider(out) is not None
+
+
 def outcome(worker, out_path, err_path):
-    """``quota``, ``done``, or ``empty`` for a finished worker's logs.
+    """``quota``, ``provider``, ``done``, or ``empty`` for a finished worker's logs.
 
     A quota/rate-limit hit always wins over ``done``: a run that ended on
     ``Rate limit reached for requests`` did not do the task. The err log
@@ -782,10 +829,13 @@ def outcome(worker, out_path, err_path):
     report — it is short (under ``REPORT_MIN_BYTES`` after stripping), or
     a match lands in its last ``REPORT_TAIL_BYTES`` with no verdict line
     (PASS / PARTIAL / BLOCKED) opening the file — so a complete PASS
-    report that merely discusses rate limits stays ``done``.
+    report that merely discusses rate limits stays ``done``. A provider
+    fault is a wait too, and is checked only when quota did not match.
     """
     if quota_hit(worker, out_path, err_path):
         return "quota"
+    if provider_hit(out_path, err_path):
+        return "provider"
     try:
         if Path(out_path).is_file() and Path(out_path).stat().st_size > 0:
             return "done"
