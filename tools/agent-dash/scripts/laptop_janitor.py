@@ -21,6 +21,7 @@ docs/laptop-janitor.md for the sweepers, the guards and the undo.
 from __future__ import annotations
 
 import argparse
+import errno
 import fcntl
 import fnmatch
 import json
@@ -106,6 +107,16 @@ POSTGRES_HELPERS = [
 ]
 
 LOG_KEEP = 30
+
+# Paths per ``git diff --quiet`` call in the changes-present proof. One call
+# per batch instead of two ``git rev-parse`` calls per changed path: with a
+# few hundred worktrees the per-path form took the whole sweeper budget.
+CHANGES_PROOF_CHUNK = 200
+
+UNREADABLE_ROOT_HINT = (
+    "grant the program that runs the janitor (%s) Full Disk Access, "
+    'or run "run --apply --only worktrees" from a terminal' % sys.executable
+)
 
 
 class ConfigError(Exception):
@@ -553,6 +564,46 @@ def read_last_run(state):
     return {"sweepers": {}}
 
 
+def newest_log_errors(logs):
+    """Error lines per sweeper in the newest ``run-*.jsonl``.
+
+    Returns ``{sweeper: {"errors": n, "last_error": message}}``. A missing or
+    unreadable log dir, or a log with no error line, gives ``{}``.
+    """
+    try:
+        names = sorted(
+            name
+            for name in os.listdir(logs)
+            if name.startswith("run-") and name.endswith(".jsonl")
+        )
+    except OSError:
+        return {}
+    if not names:
+        return {}
+    out = {}
+    try:
+        with open(
+            os.path.join(logs, names[-1]), "r", encoding="utf-8", errors="replace"
+        ) as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(rec, dict) or rec.get("type") != "error":
+                    continue
+                name = rec.get("sweeper") or "?"
+                entry = out.setdefault(name, {"errors": 0, "last_error": ""})
+                entry["errors"] += 1
+                entry["last_error"] = rec.get("message") or ""
+    except OSError:
+        return {}
+    return out
+
+
 # --- the janitor -----------------------------------------------------------
 
 
@@ -593,6 +644,13 @@ class Janitor:
         self.deadline = None
         self._timeout_logged = set()
         self.timed_out = set()
+        # Sweepers that did not finish for this run, so their last-run entry
+        # must not be written. Same mechanism as a budget timeout.
+        self.unfinished = set()
+        # Set by _worktree_repos: whether the repo scan could be completed and
+        # whether any repo root or repo list was configured at all.
+        self.repo_scan_complete = True
+        self.repo_scan_configured = False
         self.log = None
         self.log_path = ""
 
@@ -749,12 +807,27 @@ class Janitor:
 
     def _timed_out(self, name):
         self.timed_out.add(name)
+        self.unfinished.add(name)
         message = "%s sweeper ran out of its %ss budget" % (
             name,
             self.cfg.get("sweeper_budget_seconds"),
         )
         self.write({"type": "timeout", "sweeper": name, "message": message})
         self.error(name, message)
+
+    def _unfinished(self, name, reason):
+        """Mark a sweeper as not finished: no last-run entry for it.
+
+        The budget timeout marks its sweeper the same way. Used by a worktree
+        sweep that could not read a repo root or found no repository, so
+        `status` keeps it due and a later run retries it.
+        """
+        if name in self.unfinished:
+            return
+        self.unfinished.add(name)
+        self.write({"type": "incomplete", "sweeper": name, "reason": reason})
+        if not self.scheduled:
+            print("  incomplete %-9s %s" % (name, reason))
 
     def _run(self, argv, cwd=None, timeout=60, env=None):
         real_env = dict(os.environ)
@@ -1145,6 +1218,12 @@ class Janitor:
             try:
                 self._remove_path(path)
             except OSError as exc:
+                if exc.errno in (errno.EPERM, errno.EACCES):
+                    # The OS refuses to delete some service-owned temp
+                    # folders. That is a permanent fact about the entry, not
+                    # a failure to retry every run; report it as kept.
+                    self.keep("tmp", "not-permitted", path)
+                    return
                 self.error("tmp", "cannot remove %s: %s" % (path, exc))
                 return
         self.removed_item("tmp", path, "older-than-%gd" % float(days), size)
@@ -1160,7 +1239,12 @@ class Janitor:
         if self.expired():
             self._timed_out("worktrees")
             return
-        for repo in self._worktree_repos():
+        repos = self._worktree_repos()
+        if not self.repo_scan_complete:
+            self._unfinished("worktrees", "a repo root or repo could not be read")
+        elif self.repo_scan_configured and not repos:
+            self._unfinished("worktrees", "no repository found")
+        for repo in repos:
             if self.expired():
                 self._timed_out("worktrees")
                 return
@@ -1253,14 +1337,39 @@ class Janitor:
                 continue
             self.removed_item("worktrees", path, "manager-closeout", verb="closeout")
 
+    def _unreadable_repo_path(self, path, exc):
+        self.error(
+            "worktrees", "cannot list %s: %s; %s" % (path, exc, UNREADABLE_ROOT_HINT)
+        )
+
     def _worktree_repos(self):
+        """Repos to sweep, recording whether the scan could be completed.
+
+        A configured repo root or repo that exists but cannot be listed is an
+        error line: macOS privacy protection denies a launchd-started program
+        any read of some folders, and taking a denied `listdir` for "no
+        repos" would report the worktree sweep as done for days. Sets
+        ``repo_scan_complete`` and ``repo_scan_configured``.
+        """
         repos = []
+        complete = True
         configured = list(self.cfg.get("repos") or [])
+        self.repo_scan_configured = bool(configured) or bool(
+            self.cfg.get("repo_roots") or []
+        )
         if configured:
             for path in configured:
                 path = os.path.realpath(os.path.expanduser(path))
-                if os.path.isdir(path):
-                    repos.append(path)
+                if not os.path.isdir(path):
+                    continue
+                try:
+                    os.listdir(path)
+                except OSError as exc:
+                    self._unreadable_repo_path(path, exc)
+                    complete = False
+                    continue
+                repos.append(path)
+            self.repo_scan_complete = complete
             return sorted(set(repos))
         for root in self.cfg.get("repo_roots") or []:
             root = os.path.realpath(os.path.expanduser(root))
@@ -1268,7 +1377,9 @@ class Janitor:
                 continue
             try:
                 children = sorted(os.listdir(root))
-            except OSError:
+            except OSError as exc:
+                self._unreadable_repo_path(root, exc)
+                complete = False
                 continue
             for child in children:
                 child_path = os.path.join(root, child)
@@ -1286,6 +1397,7 @@ class Janitor:
                         continue
                     if os.path.isdir(os.path.join(grandchild_path, ".git")):
                         repos.append(grandchild_path)
+        self.repo_scan_complete = complete
         return sorted(set(repos))
 
     def _default_branch(self, repo):
@@ -1648,16 +1760,17 @@ class Janitor:
         paths = [p for p in out.split("\0") if p]
         if not paths:
             return False
-        for path in paths:
+        # One `git diff --quiet` per chunk instead of two `git rev-parse`
+        # calls per path. Exit 0 means identical for those paths (including a
+        # path absent on both sides), 1 means they differ, and anything else
+        # (git error, timeout) fails the proof.
+        for start in range(0, len(paths), CHANGES_PROOF_CHUNK):
+            chunk = paths[start:start + CHANGES_PROOF_CHUNK]
             rc, out, err = self._run(
-                ["git", "-C", repo, "rev-parse", tip + ":" + path], timeout=60
+                ["git", "-C", repo, "diff", "--quiet", tip, upstream, "--"] + chunk,
+                timeout=120,
             )
-            tip_blob = out.strip() if rc == 0 else ""
-            rc, out, err = self._run(
-                ["git", "-C", repo, "rev-parse", upstream + ":" + path], timeout=60
-            )
-            default_blob = out.strip() if rc == 0 else ""
-            if tip_blob != default_blob:
+            if rc != 0:
                 return False
         return True
 
@@ -1915,8 +2028,9 @@ class Janitor:
                 finally:
                     self.flush_keeps(name)
                 # Only a sweeper that finished cleanly inside its budget counts
-                # as done; a raised or timed-out one must run again next tick.
-                if self.apply and ok and name not in self.timed_out:
+                # as done; a raised, timed-out or incomplete one must run
+                # again next tick.
+                if self.apply and ok and name not in self.unfinished:
                     self._write_sweeper_entry(name, self.now())
         except BaseException as exc:  # interrupted: no last-run, next tick reruns
             aborted = True
@@ -1955,6 +2069,7 @@ class Janitor:
             "freed_bytes": self.freed_bytes,
             "sweepers": {name: dict(self.per.get(name, {})) for name in SWEEPERS},
             "keep_reasons": {name: dict(groups) for name, groups in self.keep_counts.items()},
+            "unfinished": sorted(self.unfinished),
             "actions": self.actions,
             "log": self.log_path,
         }
@@ -2093,6 +2208,7 @@ def _state_summary(cfg):
         "interval_days": interval,
         "lock_held": lock_held(state_dir()),
         "log_files": logs,
+        "log_errors": newest_log_errors(log_dir()),
         "sweepers": SWEEPERS,
         "sweeper_state": per,
     }
@@ -2119,6 +2235,13 @@ def cmd_status(cfg, args):
             print("  %-9s never, due now" % name)
     print("due:       %s" % ("yes" if data["due"] else "no"))
     print("lock:      %s" % ("held" if data["lock_held"] else "free"))
+    errors = data.get("log_errors") or {}
+    worktree_errors = errors.get("worktrees")
+    if worktree_errors:
+        print(
+            "worktrees  %d error(s) in the newest run, last: %s"
+            % (worktree_errors["errors"], worktree_errors["last_error"])
+        )
     return 0
 
 
@@ -2132,7 +2255,20 @@ def launchd_plist_text():
         "LowPriorityIO": True,
         "Nice": 10,
         "EnvironmentVariables": {
-            "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+            # The reviewed worktree tool lives in ~/.local/bin, which launchd
+            # does not put on PATH. Expanded at install time; nothing
+            # machine-specific lives in the source.
+            "PATH": ":".join(
+                [os.path.expanduser("~/.local/bin")]
+                + [
+                    "/opt/homebrew/bin",
+                    "/usr/local/bin",
+                    "/usr/bin",
+                    "/bin",
+                    "/usr/sbin",
+                    "/sbin",
+                ]
+            )
         },
         "StandardOutPath": os.path.join(log_dir(), "launchd.log"),
         "StandardErrorPath": os.path.join(log_dir(), "launchd.log"),
