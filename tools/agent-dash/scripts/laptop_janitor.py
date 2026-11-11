@@ -54,6 +54,7 @@ DEFAULTS = {
     "repos": [],
     "repo_roots": ["~/Documents/projects"],
     "worktree_protect_globs": ["~/.local/share/agent-dash/releases/*"],
+    "worktree_ignorable_globs": [],
     "worktree_manager_cmd": "workspace-manager",
     "agent_dash_cmd": "~/.claude/tools/agent-dash/agent_dash.py",
 }
@@ -179,6 +180,7 @@ CONFIG_TYPES = {
     "repos": "strlist",
     "repo_roots": "strlist",
     "worktree_protect_globs": "strlist",
+    "worktree_ignorable_globs": "strlist",
     "worktree_manager_cmd": str,
     "agent_dash_cmd": str,
 }
@@ -605,6 +607,7 @@ class Janitor:
         self.worktree_protect_globs = [
             os.path.expanduser(p) for p in cfg.get("worktree_protect_globs") or []
         ]
+        self.worktree_ignorable_globs = list(cfg.get("worktree_ignorable_globs") or [])
 
         # Injectable guards: tests replace these.
         self.owner_ok = lambda st: st.st_uid == os.getuid()
@@ -914,13 +917,34 @@ class Janitor:
         rc, out, err = self._run(["ps", "-o", "args=", "-p", str(pid)], timeout=15)
         argv = _split_args((out or "").strip())
         value = _arg_value(argv, "-D") if argv else None
-        same = (
+        same = False
+        if (
             rc == 0
             and argv
             and os.path.basename(argv[0]) == "postgres"
             and value is not None
-            and (value == datadir or os.path.realpath(value) == datadir)
-        )
+        ):
+            if os.path.isabs(value):
+                same = os.path.realpath(value) == os.path.realpath(datadir)
+            else:
+                # A relative -D is relative to that process's working
+                # directory, not the janitor's. Resolve it from a fresh
+                # snapshot; if the cwd is unknown, do not signal.
+                snapshot = self.current_snapshot()
+                cwd = snapshot.cwds.get(pid) if snapshot.ok else None
+                if not cwd:
+                    self.write(
+                        {
+                            "type": "stop-failed",
+                            "target": datadir,
+                            "pid": pid,
+                            "reason": "unresolvable-data-dir",
+                        }
+                    )
+                    return False
+                same = os.path.realpath(os.path.join(cwd, value)) == os.path.realpath(
+                    datadir
+                )
         if not same:
             self.write(
                 {
@@ -1351,6 +1375,19 @@ class Janitor:
             if rc != 0:
                 self.error("worktrees", "worktree prune failed in %s: %s" % (repo, (err or "").strip()))
 
+    def _ignorable_ignored(self, rel):
+        """True when an ignored entry's worktree-relative path matches a glob.
+
+        Git may report an ignored directory as one entry (`!! some/dir/`).
+        The trailing slash is dropped before matching, so a glob matches such
+        an entry only when it matches the directory path itself; a glob for
+        files inside the directory does not cover the directory entry.
+        """
+        for pattern in self.worktree_ignorable_globs:
+            if fnmatch.fnmatchcase(rel, pattern):
+                return True
+        return False
+
     def _protected_worktree(self, path):
         for pattern in self.worktree_protect_globs:
             if fnmatch.fnmatch(path, pattern) or fnmatch.fnmatch(os.path.realpath(path), pattern):
@@ -1422,8 +1459,11 @@ class Janitor:
             if not line.strip():
                 continue
             if line.startswith("!! "):
-                tail = line[3:].strip().rstrip("/").split("/")[-1]
+                rel = line[3:].strip().rstrip("/")
+                tail = rel.split("/")[-1]
                 if tail in ALLOWED_IGNORED:
+                    continue
+                if self._ignorable_ignored(rel):
                     continue
                 self.keep("worktrees", "ignored-entry:" + tail, path)
                 return

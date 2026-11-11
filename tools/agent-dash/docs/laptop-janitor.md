@@ -110,10 +110,18 @@ silently using defaults.
   "repos": [],
   "repo_roots": ["~/Documents/projects"],
   "worktree_protect_globs": ["~/.local/share/agent-dash/releases/*"],
+  "worktree_ignorable_globs": [],
   "worktree_manager_cmd": "workspace-manager",
   "agent_dash_cmd": "~/.claude/tools/agent-dash/agent_dash.py"
 }
 ```
+
+`worktree_ignorable_globs` names extra ignored paths a machine's build or
+`test` run recreates, so they do not keep a worktree. Each entry is a glob
+matched with `fnmatch.fnmatchcase` against the ignored path relative to the
+worktree root, for example `["tests/fixtures/generated", "*.log"]`. List only
+files a build or test run recreates: they are deleted with the worktree and
+are not in the archive ref.
 
 Each sweeper runs inside its own `try/except` with a wall-clock budget
 (`sweeper_budget_seconds`, checked between actions). One sweeper failing or
@@ -270,8 +278,13 @@ A worktree is removed only when **all** of these hold:
    `~/.local/share/agent-dash/releases/*`);
 3. `git status --porcelain --ignored` lists nothing except ignored entries
    (`!!`) whose last path component is one of `.venv`, `node_modules`,
-   `__pycache__`, `.pytest_cache`, `.mypy_cache`, `.ruff_cache`, `.next`; any
-   modified, staged, untracked or other ignored entry keeps it;
+   `__pycache__`, `.pytest_cache`, `.mypy_cache`, `.ruff_cache`, `.next`, or
+   whose worktree-relative path (trailing `/` removed) matches one of
+   `worktree_ignorable_globs`; any modified, staged, untracked or other
+   ignored entry keeps it. Git may report an ignored directory as one entry
+   (`!! some/dir/`): a glob matches it only when it matches the directory
+   path itself, so a glob for files inside the directory does not cover the
+   directory entry;
 4. its git admin dir holds no `MERGE_HEAD`, `REBASE_HEAD`, `CHERRY_PICK_HEAD`,
    `REVERT_HEAD`, `BISECT_LOG`, `rebase-merge` or `rebase-apply`;
 5. it is idle: the newest of the HEAD commit time and the modification times

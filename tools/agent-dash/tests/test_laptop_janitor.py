@@ -426,6 +426,44 @@ class PostgresSweeperTests(JanitorCase):
         self.assertTrue(ok)
         self.assertEqual(killed, [(100, lj.signal.SIGINT)])
 
+    def test_fallback_resolves_relative_datadir_from_process_cwd(self):
+        rel = self.mkdir(self.base / "rel-pg")
+        jan = self.janitor_for_pg(datadir="rel-pg", cwd=str(self.base))
+        jan.stop_postgres = jan._stop_postgres
+        jan.pid_alive = lambda pid: False
+        jan._run = lambda argv, **kw: (0, "postgres -D rel-pg\n", "")
+        real_which = lj.shutil.which
+        real_kill = lj.os.kill
+        killed = []
+        lj.shutil.which = lambda name: None
+        lj.os.kill = lambda pid, sig: killed.append((pid, sig))
+        try:
+            ok = jan._stop_postgres(os.path.realpath(str(rel)), 100)
+        finally:
+            lj.shutil.which = real_which
+            lj.os.kill = real_kill
+        self.assertTrue(ok)
+        self.assertEqual(killed, [(100, lj.signal.SIGINT)])
+
+    def test_fallback_relative_datadir_without_cwd_is_not_gone(self):
+        rel = self.mkdir(self.base / "rel-pg")
+        jan = self.janitor_for_pg(datadir="rel-pg")
+        jan.stop_postgres = jan._stop_postgres
+        jan.pid_alive = lambda pid: False
+        jan._run = lambda argv, **kw: (0, "postgres -D rel-pg\n", "")
+        real_which = lj.shutil.which
+        real_kill = lj.os.kill
+        killed = []
+        lj.shutil.which = lambda name: None
+        lj.os.kill = lambda pid, sig: killed.append((pid, sig))
+        try:
+            ok = jan._stop_postgres(os.path.realpath(str(rel)), 100)
+        finally:
+            lj.shutil.which = real_which
+            lj.os.kill = real_kill
+        self.assertFalse(ok)
+        self.assertEqual(killed, [])
+
     def test_outside_disposable_roots_kept(self):
         outside = self.mkdir(self.base / "elsewhere" / "pgdata")
         jan = self.janitor_for_pg(datadir=outside)
@@ -631,6 +669,57 @@ class WorktreeSweeperTests(GitRepoCase):
         jan = self.janitor_for_worktrees(apply=True)
         jan.sweep_worktrees()
         self.assertFalse(os.path.exists(wt))
+
+    def test_ignorable_glob_lets_matching_ignored_file_go(self):
+        wt = self.add_worktree("feat/ignorable", days_ago=10)
+        Path(wt, ".gitignore").write_text("*.log\n", encoding="utf-8")
+        self.git("add", ".", cwd=wt)
+        self.commit(wt, "ignore", days_ago=10)
+        self.merge_branch("feat/ignorable", squash=True)
+        Path(wt, "build.log").write_text("x\n", encoding="utf-8")
+        self.age_admin(wt, 10)
+        jan = self.janitor_for_worktrees(
+            apply=True, extra={"worktree_ignorable_globs": ["*.log"]}
+        )
+        jan.sweep_worktrees()
+        self.assertFalse(os.path.exists(wt))
+
+    def test_ignorable_glob_does_not_cover_an_unmatched_ignored_file(self):
+        wt = self.add_worktree("feat/ignorable-other", days_ago=10)
+        Path(wt, ".gitignore").write_text("*.log\n", encoding="utf-8")
+        self.git("add", ".", cwd=wt)
+        self.commit(wt, "ignore", days_ago=10)
+        self.merge_branch("feat/ignorable-other", squash=True)
+        Path(wt, "build.log").write_text("x\n", encoding="utf-8")
+        self.age_admin(wt, 10)
+        jan = self.janitor_for_worktrees(
+            apply=True, extra={"worktree_ignorable_globs": ["*.tmp"]}
+        )
+        jan.sweep_worktrees()
+        self.assertTrue(os.path.isdir(wt))
+        self.assertIn("ignored-entry:build.log", jan.keep_counts["worktrees"])
+
+    def test_ignorable_glob_for_files_does_not_cover_an_ignored_directory(self):
+        wt = self.add_worktree("feat/ignorable-dir", days_ago=10)
+        Path(wt, ".gitignore").write_text("tests/fixtures/generated/\n", encoding="utf-8")
+        Path(wt, "tests").mkdir()
+        Path(wt, "tests", "README.md").write_text("tests\n", encoding="utf-8")
+        Path(wt, "tests", "fixtures").mkdir()
+        Path(wt, "tests", "fixtures", "README.md").write_text("fixtures\n", encoding="utf-8")
+        self.git("add", ".", cwd=wt)
+        self.commit(wt, "ignore", days_ago=10)
+        self.merge_branch("feat/ignorable-dir", squash=True)
+        generated = Path(wt, "tests", "fixtures", "generated")
+        generated.mkdir(parents=True)
+        (generated / "data.bin").write_text("x", encoding="utf-8")
+        self.age_admin(wt, 10)
+        jan = self.janitor_for_worktrees(
+            apply=True,
+            extra={"worktree_ignorable_globs": ["tests/fixtures/generated/*"]},
+        )
+        jan.sweep_worktrees()
+        self.assertTrue(os.path.isdir(wt))
+        self.assertIn("ignored-entry:generated", jan.keep_counts["worktrees"])
 
     def test_merge_state_kept(self):
         wt = self.add_worktree("feat/merging", days_ago=10)
@@ -1320,6 +1409,10 @@ class HelperTests(unittest.TestCase):
             self.assertEqual(cfg["tmp_min_age_days"], 2)
             with open(path, "w", encoding="utf-8") as fh:
                 json.dump({"nope": 1}, fh)
+            with self.assertRaises(lj.ConfigError):
+                lj.load_config(path)
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump({"worktree_ignorable_globs": "*.log"}, fh)
             with self.assertRaises(lj.ConfigError):
                 lj.load_config(path)
         finally:
