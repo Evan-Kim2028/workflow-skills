@@ -64,10 +64,10 @@ You are a worker, not an orchestrator. Do the task in this prompt and return.
 - Code search: CodeGraph first. Use the `codegraph` MCP tool
   (`codegraph_explore`) when your tool has it, else the `cg` CLI:
   `cg explore "<question>"`, `cg node <symbol|file>`, `cg callers <symbol>`,
-  `cg impact <symbol>`. `cg` works from a worktree and reads the main
-  checkout's index; run it before any grep over source code. Grep and Read
-  are for non-code text or confirming one detail. Never run `cg init` in a
-  worktree.
+  `cg impact <symbol>`; without `cg` on PATH, run
+  `codegraph <subcommand> -p <main checkout>`. `cg` works from a worktree and
+  reads the main checkout's index; run it before any grep over source code.
+  Grep and Read are for non-code text or one detail; never run `cg init` in a worktree.
 - Labels: build every run label with `python3 ~/.claude/tools/agent-dash/agent_dash.py label make ...`, never hand-write one; hooks refuse bad ones.
 - Finish: after the report is written and committed, print it as your final
   message and exit at once. Do not idle or wait for input. The parent's

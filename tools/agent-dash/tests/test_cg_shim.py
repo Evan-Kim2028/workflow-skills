@@ -81,6 +81,45 @@ class CgShimTest(unittest.TestCase):
         self.worktree_sub = self.worktree / "sub dir"
         self.worktree_sub.mkdir()
 
+        # A second worktree nested under its indexed main checkout. The old
+        # ancestor search found the main index from here and skipped the
+        # write refusal.
+        self.nested = self.main / "nested worktree"
+        subprocess.run(
+            ["git", "worktree", "add", "--detach", str(self.nested), "HEAD"],
+            cwd=self.main,
+            check=True,
+            capture_output=True,
+            timeout=30,
+        )
+
+        # A worktree under an unrelated indexed repository. The ancestor
+        # search must not pick that repository's index.
+        self.outer = base / "outer repo"
+        self.outer.mkdir()
+        subprocess.run(
+            ["git", "init"], cwd=self.outer, check=True, capture_output=True, timeout=30
+        )
+        (self.outer / ".codegraph").mkdir()
+        (self.outer / ".codegraph" / "codegraph.db").write_bytes(b"outer db")
+        self.outer_wt = self.outer / "linked worktree"
+        subprocess.run(
+            ["git", "worktree", "add", "--detach", str(self.outer_wt), "HEAD"],
+            cwd=self.main,
+            check=True,
+            capture_output=True,
+            timeout=30,
+        )
+
+        # A symlinked spelling of the linked worktree.
+        self.worktree_link = base / "worktree link"
+        self.worktree_link.symlink_to(self.worktree, target_is_directory=True)
+
+        # A directory whose only codegraph file is a WAL sidecar.
+        self.wal_only = base / "wal only"
+        (self.wal_only / ".codegraph").mkdir(parents=True)
+        (self.wal_only / ".codegraph" / "codegraph.db-wal").write_bytes(b"wal")
+
         self.no_index = base / "no index repo"
         self.no_index.mkdir()
         subprocess.run(
@@ -180,6 +219,130 @@ class CgShimTest(unittest.TestCase):
                 self.assertIn(str(self.main), proc.stderr)
                 self.assertEqual(self.calls(), [])
 
+    def test_nested_worktree_write_refused_before_index_lookup(self):
+        for args in (("sync",), ("uninit", "-f"), ("init",), ("index",)):
+            with self.subTest(args=args):
+                proc = self.run_cg(*args, cwd=self.nested)
+                self.assertEqual(proc.returncode, 2, proc.stderr)
+                self.assertIn("worktree is never indexed", proc.stderr)
+                self.assertIn(str(self.main), proc.stderr)
+                self.assertEqual(self.calls(), [])
+
+    def test_nested_worktree_read_redirects_to_main(self):
+        proc = self.run_cg("explore", "needle", cwd=self.nested)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("using the index at", proc.stderr)
+        self.assertEqual(
+            self.calls()[0]["argv"],
+            ["explore", "-p", str(self.main.resolve()), "needle"],
+        )
+
+    def test_worktree_under_unrelated_index_uses_its_own_main(self):
+        proc = self.run_cg("explore", "needle", cwd=self.outer_wt)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        argv = self.calls()[0]["argv"]
+        self.assertEqual(argv, ["explore", "-p", str(self.main.resolve()), "needle"])
+        self.assertNotIn(str(self.outer.resolve()), argv)
+
+    def test_symlinked_worktree_is_still_a_worktree(self):
+        proc = self.run_cg("sync", cwd=self.worktree_link)
+        self.assertEqual(proc.returncode, 2, proc.stderr)
+        self.assertEqual(self.calls(), [])
+        proc = self.run_cg("explore", "needle", cwd=self.worktree_link)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(
+            self.calls()[0]["argv"],
+            ["explore", "-p", str(self.main.resolve()), "needle"],
+        )
+
+    def test_self_indexed_worktree_still_refuses_writes(self):
+        (self.worktree / ".codegraph" / "codegraph.db").write_bytes(b"wt db")
+        proc = self.run_cg("index", cwd=self.worktree)
+        self.assertEqual(proc.returncode, 2, proc.stderr)
+        self.assertEqual(self.calls(), [])
+
+    def test_attached_short_path_after_subcommand_is_replaced(self):
+        proc = self.run_cg(
+            "explore", "-p" + str(self.worktree), "lor_merge", cwd=self.worktree
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(
+            self.calls()[0]["argv"],
+            ["explore", "-p", str(self.main.resolve()), "lor_merge"],
+        )
+
+    def test_attached_short_path_before_subcommand_is_replaced(self):
+        proc = self.run_cg(
+            "-p" + str(self.worktree), "explore", "lor_merge", cwd=self.worktree
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(
+            self.calls()[0]["argv"],
+            ["explore", "-p", str(self.main.resolve()), "lor_merge"],
+        )
+
+    def test_double_dash_path_literal_is_preserved(self):
+        proc = self.run_cg("query", "--", "--path=literal", cwd=self.worktree)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(
+            self.calls()[0]["argv"],
+            ["query", "-p", str(self.main.resolve()), "--", "--path=literal"],
+        )
+
+    def test_double_dash_short_p_is_preserved(self):
+        proc = self.run_cg("explore", "--", "-p", "literal", cwd=self.worktree)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(
+            self.calls()[0]["argv"],
+            ["explore", "-p", str(self.main.resolve()), "--", "-p", "literal"],
+        )
+
+    def test_double_dash_path_separated_is_preserved(self):
+        proc = self.run_cg("explore", "--", "--path", "literal", cwd=self.worktree)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(
+            self.calls()[0]["argv"],
+            ["explore", "-p", str(self.main.resolve()), "--", "--path", "literal"],
+        )
+
+    def test_option_value_before_subcommand_is_not_the_subcommand(self):
+        proc = self.run_cg("--max-files", "5", "explore", "q", cwd=self.worktree)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("using the index at", proc.stderr)
+        self.assertEqual(
+            self.calls()[0]["argv"],
+            ["--max-files", "5", "-p", str(self.main.resolve()), "explore", "q"],
+        )
+
+    def test_wal_sidecar_alone_is_not_an_index(self):
+        proc = self.run_cg("--where", cwd=self.wal_only)
+        self.assertEqual(proc.returncode, 3, proc.stderr)
+        self.assertEqual(proc.stdout, "")
+        proc = self.run_cg("explore", "needle", cwd=self.wal_only)
+        self.assertEqual(proc.returncode, 3, proc.stderr)
+        self.assertEqual(self.calls(), [])
+
+    def test_missing_git_degrades_to_no_index(self):
+        empty = Path(self.tmp.name) / "empty path"
+        empty.mkdir()
+        env = {**os.environ, "PATH": str(empty)}
+        proc = subprocess.run(
+            [sys.executable, str(SHIM), "explore", "needle"],
+            cwd=str(self.worktree),
+            input="",
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env={
+                **env,
+                "CG_REAL_CODEGRAPH": str(self.fake),
+                "CG_FAKE_RECORD": str(self.record),
+            },
+        )
+        self.assertEqual(proc.returncode, 3, proc.stderr)
+        self.assertIn("no CodeGraph index", proc.stderr)
+        self.assertEqual(self.calls(), [])
+
     def test_no_index_anywhere_exits_three(self):
         proc = self.run_cg("explore", "lor_merge", cwd=self.no_index)
         self.assertEqual(proc.returncode, 3)
@@ -258,17 +421,23 @@ class CgShimTest(unittest.TestCase):
 class InstallerTest(unittest.TestCase):
     """--codex-shim installs the cg shim beside muse, editing no shell rc."""
 
+    def run_installer(self, home, *args):
+        # A PATH without the real muse keeps --uninstall from touching the
+        # host's muse plugin list; every command the script needs is in
+        # /usr/bin or /bin.
+        env = {**os.environ, "HOME": str(home), "PATH": "/usr/bin:/bin"}
+        return subprocess.run(
+            ["sh", str(INSTALLER), *args],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env=env,
+        )
+
     def test_installs_cg_without_shell_rc_edits(self):
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp)
-            env = {**os.environ, "HOME": str(home)}
-            proc = subprocess.run(
-                ["sh", str(INSTALLER), "--codex-shim"],
-                capture_output=True,
-                text=True,
-                timeout=60,
-                env=env,
-            )
+            proc = self.run_installer(home, "--codex-shim")
             self.assertEqual(proc.returncode, 0, proc.stderr)
             dest = home / ".local/share/agent-dash/bin/cg"
             self.assertTrue(dest.is_file())
@@ -277,6 +446,50 @@ class InstallerTest(unittest.TestCase):
             self.assertIn("PATH", proc.stdout)
             self.assertFalse((home / ".zshrc").exists())
             self.assertFalse((home / ".bashrc").exists())
+
+    def test_installs_muse_byte_for_byte_and_executable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            proc = self.run_installer(home, "--codex-shim")
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            dest = home / ".local/share/agent-dash/bin/muse"
+            self.assertTrue(dest.is_file())
+            self.assertTrue(os.access(dest, os.X_OK))
+            self.assertEqual(dest.read_bytes(), (ROOT / "shims" / "muse").read_bytes())
+
+    def test_install_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            first = self.run_installer(home, "--codex-shim")
+            self.assertEqual(first.returncode, 0, first.stderr)
+            dest = home / ".local/share/agent-dash/bin/cg"
+            before = dest.read_bytes()
+            second = self.run_installer(home, "--codex-shim")
+            self.assertEqual(second.returncode, 0, second.stderr)
+            self.assertIn("already installed", second.stdout)
+            self.assertEqual(dest.read_bytes(), before)
+
+    def test_identical_non_executable_copy_is_made_executable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            self.assertEqual(self.run_installer(home, "--codex-shim").returncode, 0)
+            dest = home / ".local/share/agent-dash/bin/cg"
+            dest.chmod(0o644)
+            proc = self.run_installer(home, "--codex-shim")
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertTrue(os.access(dest, os.X_OK))
+
+    def test_uninstall_removes_both_shims(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            self.assertEqual(self.run_installer(home, "--codex-shim").returncode, 0)
+            bindir = home / ".local/share/agent-dash/bin"
+            self.assertTrue((bindir / "cg").is_file())
+            self.assertTrue((bindir / "muse").is_file())
+            proc = self.run_installer(home, "--uninstall")
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertFalse((bindir / "cg").exists())
+            self.assertFalse((bindir / "muse").exists())
 
 
 if __name__ == "__main__":

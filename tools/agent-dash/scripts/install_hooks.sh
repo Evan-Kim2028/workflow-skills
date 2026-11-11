@@ -248,10 +248,14 @@ if [ "${1:-}" = "--codex-shim" ]; then
         DEST="$DESTDIR/$name"
         [ -f "$SRC" ] || { echo "install_hooks: no shim at $SRC" >&2; exit 2; }
         if [ -f "$DEST" ] && cmp -s "$SRC" "$DEST"; then
+            chmod +x "$DEST"
             echo "install_hooks: $name shim already installed at $DEST"
         else
-            cp "$SRC" "$DEST" || { echo "install_hooks: cannot write $DEST" >&2; exit 1; }
-            chmod +x "$DEST"
+            TMP="$DEST.tmp.$$"
+            cp "$SRC" "$TMP" || { echo "install_hooks: cannot write $DEST" >&2; rm -f "$TMP"; exit 1; }
+            chmod +x "$TMP"
+            # Atomic rename: a concurrent worker never execs a half copy.
+            mv "$TMP" "$DEST" || { echo "install_hooks: cannot write $DEST" >&2; rm -f "$TMP"; exit 1; }
             echo "install_hooks: $name shim installed at $DEST"
         fi
     done
