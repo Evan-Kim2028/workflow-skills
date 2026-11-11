@@ -60,22 +60,51 @@ class JanitorCase(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def janitor(self, cfg=None, apply=False, snapshot=None, scheduled=False):
+    def janitor(
+        self, cfg=None, apply=False, snapshot=None, scheduled=False, snapshot_factory=None
+    ):
         full = dict(lj.DEFAULTS)
+        # Inert by default: nothing a test janitor could act on may live
+        # outside this case's temp dir. A test that needs a real behavior
+        # overrides exactly that one key in cfg.
+        full.update(
+            {
+                "repos": [],
+                "repo_roots": [str(self.base / "repo-roots")],
+                "worktree_manager_cmd": "",
+                "agent_dash_cmd": "",
+                "postgres_extra_roots": [],
+            }
+        )
         full.update(cfg or {})
+        if snapshot_factory is not None:
+            injected = None
+        else:
+            injected = snapshot if snapshot is not None else fake_snapshot()
         jan = lj.Janitor(
             full,
             str(self.state),
             str(self.logs),
             apply=apply,
-            snapshot=snapshot if snapshot is not None else fake_snapshot(),
+            snapshot=injected,
             now=lambda: self.now,
+            snapshot_factory=snapshot_factory,
         )
         jan.scheduled = scheduled
         # Never point a test janitor at the machine's real temp roots: a test
         # that reaches sweep_tmp() must only ever see this case's temp dir.
         jan.tmp_roots = [str(self.base / "tmp-roots")]
         jan.claude_container = str(self.base / "tmp-roots" / ("claude-%d" % os.getuid()))
+        jan.disposable_roots = [str(self.base / "disposable-roots")]
+        for path in jan.tmp_roots + jan.disposable_roots + [jan.claude_container]:
+            os.makedirs(path, exist_ok=True)
+
+        def _no_stop_postgres(datadir, pid):
+            raise AssertionError(
+                "test janitor tried to stop postgres at %s (pid %s)" % (datadir, pid)
+            )
+
+        jan.stop_postgres = _no_stop_postgres
         return jan
 
     def mkdir(self, path, age_days=0.0):
@@ -95,6 +124,42 @@ class JanitorCase(unittest.TestCase):
             stamp = self.now - age_days * 86400
             os.utime(path, (stamp, stamp))
         return path
+
+
+# --- inert by default ------------------------------------------------------
+
+
+class InertJanitorTests(JanitorCase):
+    """The helper's default janitor must not be able to touch the machine."""
+
+    def test_default_janitor_can_only_act_inside_the_case_temp_dir(self):
+        jan = self.janitor(apply=True)
+        base = os.path.realpath(str(self.base))
+
+        def inside_case(path):
+            real = os.path.realpath(path)
+            return real == base or real.startswith(base + os.sep)
+
+        self.assertTrue(jan.tmp_roots)
+        for root in jan.tmp_roots:
+            self.assertTrue(inside_case(root), root)
+        self.assertTrue(jan.disposable_roots)
+        for root in jan.disposable_roots:
+            self.assertTrue(inside_case(root), root)
+        self.assertTrue(inside_case(jan.claude_container), jan.claude_container)
+        self.assertEqual(jan.cfg.get("repos"), [])
+        for repo in jan._worktree_repos():
+            self.assertTrue(inside_case(repo), repo)
+        self.assertIsNone(jan._manager_cmd())
+        self.assertEqual(jan.cfg.get("agent_dash_cmd"), "")
+        self.assertFalse(
+            os.path.isfile(os.path.expanduser(jan.cfg.get("agent_dash_cmd") or ""))
+        )
+
+        rc = jan.run()
+        self.assertEqual(rc, 0)
+        self.assertEqual(jan.removed, 0)
+        self.assertEqual(jan.actions, [])
 
 
 # --- tmp -------------------------------------------------------------------
@@ -1484,13 +1549,7 @@ class SnapshotTests(JanitorCase):
             taken.append(self.now)
             return fake_snapshot(ok=True)
 
-        jan = lj.Janitor(
-            dict(lj.DEFAULTS),
-            str(self.state),
-            str(self.logs),
-            now=lambda: self.now,
-            snapshot_factory=factory,
-        )
+        jan = self.janitor(snapshot_factory=factory)
         self.assertTrue(jan.current_snapshot().ok)
         self.assertEqual(len(taken), 1)
         self.now += 60
@@ -1508,12 +1567,8 @@ class SnapshotTests(JanitorCase):
         self.assertIs(jan.current_snapshot(), snap)
 
     def test_failed_refresh_counts_everything_as_in_use(self):
-        jan = lj.Janitor(
-            dict(lj.DEFAULTS),
-            str(self.state),
-            str(self.logs),
-            now=lambda: self.now,
-            snapshot_factory=lambda: fake_snapshot(ok=False, error="boom"),
+        jan = self.janitor(
+            snapshot_factory=lambda: fake_snapshot(ok=False, error="boom")
         )
         used, why = jan.in_use(str(self.base / "x"))
         self.assertTrue(used)
@@ -1553,8 +1608,19 @@ class TakeSnapshotTests(unittest.TestCase):
 class CliCase(JanitorCase):
     def env(self, config=None):
         cfg = self.base / "config.json"
-        if config is not None:
-            cfg.write_text(config, encoding="utf-8")
+        if config is None:
+            # Inert defaults: no repo roots, no manager, no scratch tool, so a
+            # CLI run can only ever act inside this case's temp dir.
+            config = json.dumps(
+                {
+                    "repos": [],
+                    "repo_roots": [],
+                    "worktree_manager_cmd": "",
+                    "agent_dash_cmd": "",
+                    "postgres_extra_roots": [],
+                }
+            )
+        cfg.write_text(config, encoding="utf-8")
         return {
             "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
             "HOME": str(self.base / "home"),
