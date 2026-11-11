@@ -38,6 +38,16 @@ Hooks live in `~/.claude/settings.json` and are wired by
 sh tools/agent-dash/scripts/install_hooks.sh --claude-label-guard --claude-lead-guard
 ```
 
+## Shims
+
+`sh tools/agent-dash/scripts/install_hooks.sh --codex-shim` copies the `muse`
+label-guard shim and the `cg` codegraph shim to
+`~/.local/share/agent-dash/bin/` and prints the PATH line; it edits no shell
+rc. `cg` is a worktree-aware wrapper for the `codegraph` CLI: read
+subcommands run against the main checkout's index when the current worktree
+has none, index writes (`init`, `index`, `sync`, `uninit`) are refused in a
+worktree, and `cg --where` prints the index it would use.
+
 ## Other skill folders
 
 Skills under `~/.claude/skills` that are not symlinks into this repo are not moved

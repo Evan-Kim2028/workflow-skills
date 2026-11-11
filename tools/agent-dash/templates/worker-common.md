@@ -62,12 +62,12 @@ You are a worker, not an orchestrator. Do the task in this prompt and return.
   return it; the parent posts. State any compute or prod-load change a
   recommendation implies.
 - Code search: CodeGraph first. Use the `codegraph` MCP tool
-  (`codegraph_explore`) when your tool has it, else the CLI from the repo's
-  main checkout: `codegraph explore "<question>"`, `codegraph node <symbol>`,
-  `codegraph callers <symbol>`, `codegraph impact <symbol>`. Grep and Read
-  are for non-code text or confirming one detail. Worktrees have no index of
-  their own: query the main checkout, then read the worktree file. Never run
-  `codegraph init` in a worktree.
+  (`codegraph_explore`) when your tool has it, else the `cg` CLI:
+  `cg explore "<question>"`, `cg node <symbol|file>`, `cg callers <symbol>`,
+  `cg impact <symbol>`. `cg` works from a worktree and reads the main
+  checkout's index; run it before any grep over source code. Grep and Read
+  are for non-code text or confirming one detail. Never run `cg init` in a
+  worktree.
 - Labels: build every run label with `python3 ~/.claude/tools/agent-dash/agent_dash.py label make ...`, never hand-write one; hooks refuse bad ones.
 - Finish: after the report is written and committed, print it as your final
   message and exit at once. Do not idle or wait for input. The parent's

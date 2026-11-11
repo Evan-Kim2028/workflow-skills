@@ -1,0 +1,246 @@
+#!/usr/bin/env python3
+"""cg - worktree-aware wrapper for the `codegraph` CLI (agent-dash).
+
+A worktree has no CodeGraph index of its own. Rather than print "not
+available" and exit 0 (which sends a worker back to grep), `cg` finds the
+index in the repo's main checkout and runs read subcommands there, with
+`-p <main>` replacing any path the caller gave. Index-writing subcommands
+are refused in a worktree: a worktree is never indexed.
+
+Install: copy or symlink this file to a directory that precedes the real
+`codegraph` on PATH (scripts/install_hooks.sh --codex-shim prints the
+exact line; it does not edit your shell rc). Tests point CG_REAL_CODEGRAPH
+at a fake binary.
+
+Exit codes:
+  0/real  the real binary's own status (read/pass-through)
+  2       index-writing subcommand in a worktree, or a shim-side refusal
+  3       no CodeGraph index for the start directory or its main checkout
+  127     no `codegraph` binary (CG_REAL_CODEGRAPH unset and not on PATH)
+"""
+import os
+import shutil
+import subprocess
+import sys
+
+# Subcommands that accept `-p/--path` and only read the index.
+READ_SUBCOMMANDS = {
+    "affected",
+    "callees",
+    "callers",
+    "context",
+    "explore",
+    "files",
+    "impact",
+    "node",
+    "query",
+}
+# Subcommands that write or remove the index.
+WRITE_SUBCOMMANDS = {"index", "init", "sync", "uninit"}
+PASS_THROUGH_FLAGS = {"--help", "-h", "--version", "-V"}
+
+INDEX_DB_NAMES = ("codegraph.db", "codegraph.db-wal")
+
+
+def real_binary():
+    """The real codegraph binary: CG_REAL_CODEGRAPH, else the first on PATH."""
+    override = os.environ.get("CG_REAL_CODEGRAPH")
+    if override:
+        if os.sep not in override and not os.path.exists(override):
+            found = shutil.which(override)
+            if found:
+                return found
+        return override
+    return shutil.which("codegraph")
+
+
+def has_index(root):
+    """True when root/.codegraph holds a real index, not just a .gitignore.
+
+    `codegraph init` in a worktree leaves a `.codegraph/` with only a
+    .gitignore behind; that is not an index and must not shadow the main
+    checkout's.
+    """
+    cg_dir = os.path.join(root, ".codegraph")
+    if not os.path.isdir(cg_dir):
+        return False
+    for name in INDEX_DB_NAMES:
+        if os.path.isfile(os.path.join(cg_dir, name)):
+            return True
+    return False
+
+
+def nearest_index_root(start):
+    """The nearest ancestor of start that holds a CodeGraph index."""
+    path = os.path.abspath(start)
+    while True:
+        if has_index(path):
+            return path
+        parent = os.path.dirname(path)
+        if parent == path:
+            return None
+        path = parent
+
+
+def main_checkout(start):
+    """The main checkout of start's repo when it holds an index, else None."""
+    try:
+        proc = subprocess.run(
+            [
+                "git",
+                "-C",
+                start,
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-common-dir",
+            ],
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        return None
+    if proc.returncode != 0:
+        return None
+    common = proc.stdout.strip()
+    if not common:
+        return None
+    if not os.path.isabs(common):
+        common = os.path.join(start, common)
+    common = os.path.abspath(common)
+    # A linked worktree's common git dir is <main>/.git. A bare repo or a
+    # submodule has another shape; leave those alone.
+    if os.path.basename(common) != ".git":
+        return None
+    main = os.path.dirname(common)
+    return main if has_index(main) else None
+
+
+def path_argument(args):
+    """The value of -p/--path/--path= in args, or None."""
+    for i, arg in enumerate(args):
+        if arg in ("-p", "--path"):
+            if i + 1 < len(args):
+                return args[i + 1]
+        elif arg.startswith("--path="):
+            return arg[len("--path="):]
+    return None
+
+
+def strip_path_arguments(args):
+    """Drop -p <dir>, --path <dir> and --path=<dir> from args."""
+    kept = []
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg in ("-p", "--path"):
+            i += 2
+            continue
+        if arg.startswith("--path="):
+            i += 1
+            continue
+        kept.append(arg)
+        i += 1
+    return kept
+
+
+def subcommand(args):
+    """The first non-option argument, skipping path option values."""
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg in ("-p", "--path"):
+            i += 2
+            continue
+        if arg.startswith("--path="):
+            i += 1
+            continue
+        if not arg.startswith("-"):
+            return arg
+        i += 1
+    return None
+
+
+def redirected_args(args, main):
+    """args with every caller path replaced by `-p <main>` after the subcommand."""
+    kept = strip_path_arguments(args)
+    for i, arg in enumerate(kept):
+        if not arg.startswith("-"):
+            return kept[: i + 1] + ["-p", main] + kept[i + 1:]
+    return ["-p", main] + kept
+
+
+def exec_real(binary, args):
+    """Replace this process with the real binary, keeping stdio and status."""
+    try:
+        os.execv(binary, [binary] + args)
+    except OSError as exc:
+        sys.stderr.write("cg: cannot run %s: %s\n" % (binary, exc))
+        return 127
+    return 127
+
+
+def resolve_root(start):
+    """The index root for start: nearest index, else the main checkout's."""
+    return nearest_index_root(start) or main_checkout(start)
+
+
+def main(argv):
+    args = argv[1:]
+
+    if args and args[0] == "--where":
+        start = path_argument(args[1:]) or os.getcwd()
+        root = resolve_root(start)
+        if root:
+            print(root)
+            return 0
+        sys.stderr.write(
+            "cg: no CodeGraph index for %s or its main checkout\n"
+            % os.path.abspath(start)
+        )
+        return 3
+
+    binary = real_binary()
+    if not binary:
+        sys.stderr.write(
+            "cg: no codegraph binary (set CG_REAL_CODEGRAPH or put codegraph on PATH)\n"
+        )
+        return 127
+
+    # --help, --version and a bare `cg` never need an index.
+    if not args or any(arg in PASS_THROUGH_FLAGS for arg in args):
+        return exec_real(binary, args)
+
+    start = path_argument(args) or os.getcwd()
+    local_root = nearest_index_root(start)
+    if local_root:
+        return exec_real(binary, args)
+
+    main = main_checkout(start)
+    if main:
+        sub = subcommand(args)
+        if sub in WRITE_SUBCOMMANDS:
+            sys.stderr.write(
+                "cg: refusing to %s in a worktree; a worktree is never indexed. "
+                "Use the main checkout at %s.\n" % (sub, main)
+            )
+            return 2
+        if sub in READ_SUBCOMMANDS:
+            sys.stderr.write(
+                "cg: using the index at %s; this worktree has no index. "
+                "Read files from your own worktree where your branch differs.\n"
+                % main
+            )
+            return exec_real(binary, redirected_args(args, main))
+        # Unknown subcommands (status, daemon, install, ...) pass through
+        # unchanged rather than guessing.
+        return exec_real(binary, args)
+
+    sys.stderr.write(
+        "cg: no CodeGraph index for %s or its main checkout\n"
+        % os.path.abspath(start)
+    )
+    return 3
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
