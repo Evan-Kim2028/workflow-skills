@@ -5,6 +5,7 @@ the in-use guard, temp dirs for everything else. No real Postgres, no
 launchctl, no network, no gh.
 """
 
+import errno
 import fcntl
 import io
 import json
@@ -36,6 +37,14 @@ GIT_IDENTITY = {
 }
 
 
+def _restore_mode(path):
+    """Let the temp dir cleanup remove a folder a test made unreadable."""
+    try:
+        path.chmod(0o700)
+    except OSError:
+        pass
+
+
 def fake_snapshot(procs=None, cwds=None, ok=True, error=""):
     return lj.Snapshot(ok=ok, procs=procs or {}, cwds=cwds or {}, error=error)
 
@@ -51,18 +60,51 @@ class JanitorCase(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def janitor(self, cfg=None, apply=False, snapshot=None, scheduled=False):
+    def janitor(
+        self, cfg=None, apply=False, snapshot=None, scheduled=False, snapshot_factory=None
+    ):
         full = dict(lj.DEFAULTS)
+        # Inert by default: nothing a test janitor could act on may live
+        # outside this case's temp dir. A test that needs a real behavior
+        # overrides exactly that one key in cfg.
+        full.update(
+            {
+                "repos": [],
+                "repo_roots": [str(self.base / "repo-roots")],
+                "worktree_manager_cmd": "",
+                "agent_dash_cmd": "",
+                "postgres_extra_roots": [],
+            }
+        )
         full.update(cfg or {})
+        if snapshot_factory is not None:
+            injected = None
+        else:
+            injected = snapshot if snapshot is not None else fake_snapshot()
         jan = lj.Janitor(
             full,
             str(self.state),
             str(self.logs),
             apply=apply,
-            snapshot=snapshot if snapshot is not None else fake_snapshot(),
+            snapshot=injected,
             now=lambda: self.now,
+            snapshot_factory=snapshot_factory,
         )
         jan.scheduled = scheduled
+        # Never point a test janitor at the machine's real temp roots: a test
+        # that reaches sweep_tmp() must only ever see this case's temp dir.
+        jan.tmp_roots = [str(self.base / "tmp-roots")]
+        jan.claude_container = str(self.base / "tmp-roots" / ("claude-%d" % os.getuid()))
+        jan.disposable_roots = [str(self.base / "disposable-roots")]
+        for path in jan.tmp_roots + jan.disposable_roots + [jan.claude_container]:
+            os.makedirs(path, exist_ok=True)
+
+        def _no_stop_postgres(datadir, pid):
+            raise AssertionError(
+                "test janitor tried to stop postgres at %s (pid %s)" % (datadir, pid)
+            )
+
+        jan.stop_postgres = _no_stop_postgres
         return jan
 
     def mkdir(self, path, age_days=0.0):
@@ -82,6 +124,42 @@ class JanitorCase(unittest.TestCase):
             stamp = self.now - age_days * 86400
             os.utime(path, (stamp, stamp))
         return path
+
+
+# --- inert by default ------------------------------------------------------
+
+
+class InertJanitorTests(JanitorCase):
+    """The helper's default janitor must not be able to touch the machine."""
+
+    def test_default_janitor_can_only_act_inside_the_case_temp_dir(self):
+        jan = self.janitor(apply=True)
+        base = os.path.realpath(str(self.base))
+
+        def inside_case(path):
+            real = os.path.realpath(path)
+            return real == base or real.startswith(base + os.sep)
+
+        self.assertTrue(jan.tmp_roots)
+        for root in jan.tmp_roots:
+            self.assertTrue(inside_case(root), root)
+        self.assertTrue(jan.disposable_roots)
+        for root in jan.disposable_roots:
+            self.assertTrue(inside_case(root), root)
+        self.assertTrue(inside_case(jan.claude_container), jan.claude_container)
+        self.assertEqual(jan.cfg.get("repos"), [])
+        for repo in jan._worktree_repos():
+            self.assertTrue(inside_case(repo), repo)
+        self.assertIsNone(jan._manager_cmd())
+        self.assertEqual(jan.cfg.get("agent_dash_cmd"), "")
+        self.assertFalse(
+            os.path.isfile(os.path.expanduser(jan.cfg.get("agent_dash_cmd") or ""))
+        )
+
+        rc = jan.run()
+        self.assertEqual(rc, 0)
+        self.assertEqual(jan.removed, 0)
+        self.assertEqual(jan.actions, [])
 
 
 # --- tmp -------------------------------------------------------------------
@@ -291,6 +369,53 @@ class TmpSweeperTests(JanitorCase):
         jan.sweep_tmp()
         self.assertTrue(live.exists())
         self.assertIn("live-postgres:5252", jan.keep_counts["tmp"])
+
+    def test_removal_refused_by_the_os_is_kept_not_an_error(self):
+        old = self.mkdir(self.root / "service-folder")
+        old_child = self.write(old / "child.txt", "x")
+        self.mkdir(old, age_days=5)
+        jan = self.janitor_for_tmp(apply=True)
+
+        def refuse(path):
+            # Part of the folder is already gone when the OS refuses.
+            try:
+                os.unlink(str(old_child))
+            except OSError:
+                pass
+            raise OSError(errno.EPERM, "Operation not permitted", path)
+
+        jan._remove_path = refuse
+        jan.sweep_tmp()
+        self.assertTrue(old.exists())
+        self.assertEqual(jan.errors, 0)
+        self.assertEqual(jan.removed, 0)
+        self.assertEqual(jan.keep_counts["tmp"].get("not-permitted"), 1)
+
+    def test_removal_refused_by_access_is_kept_not_an_error(self):
+        old = self.mkdir(self.root / "denied-folder", age_days=5)
+        jan = self.janitor_for_tmp(apply=True)
+
+        def refuse(path):
+            raise OSError(errno.EACCES, "Permission denied", path)
+
+        jan._remove_path = refuse
+        jan.sweep_tmp()
+        self.assertTrue(old.exists())
+        self.assertEqual(jan.errors, 0)
+        self.assertEqual(jan.keep_counts["tmp"].get("not-permitted"), 1)
+
+    def test_other_removal_failure_is_still_an_error(self):
+        old = self.mkdir(self.root / "broken-folder", age_days=5)
+        jan = self.janitor_for_tmp(apply=True)
+
+        def refuse(path):
+            raise OSError(errno.EIO, "Input/output error", path)
+
+        jan._remove_path = refuse
+        jan.sweep_tmp()
+        self.assertTrue(old.exists())
+        self.assertEqual(jan.errors, 1)
+        self.assertNotIn("not-permitted", jan.keep_counts.get("tmp", {}))
 
     def test_scheduled_keeps_per_item_lines_out_of_stdout(self):
         old = self.mkdir(self.root / "sched-old", age_days=5)
@@ -581,6 +706,40 @@ class GitRepoCase(JanitorCase):
             self.git("merge", "--ff-only", branch, cwd=self.repo)
         self.git("push", "-q", "origin", "main", cwd=self.repo)
 
+    def merge_into_batch(self, branch, batch="batch/one", days_ago=5):
+        """Merge ``branch`` into a batch branch with a merge commit."""
+        self.git("checkout", "-q", "-B", batch, "main", cwd=self.repo)
+        self.git(
+            "merge", "--no-ff", "-q", "-m", "merge " + branch, branch, cwd=self.repo
+        )
+        head = self.git("rev-parse", "HEAD", cwd=self.repo).stdout.strip()
+        self.git("checkout", "-q", "main", cwd=self.repo)
+        return head
+
+    def squash_batch(self, batch="batch/one", days_ago=5):
+        """Land the batch branch on main as one squash commit."""
+        self.git("merge", "--squash", batch, cwd=self.repo)
+        self.commit(self.repo, "squash " + batch, days_ago=days_ago)
+        self.git("push", "-q", "origin", "main", cwd=self.repo)
+
+    def removal_reasons(self, jan):
+        return [
+            a.get("reason")
+            for a in jan.actions
+            if a.get("sweeper") == "worktrees" and a.get("verb") == "remove"
+        ]
+
+    def removal_reason_for(self, jan, path):
+        real = os.path.realpath(path)
+        for action in jan.actions:
+            if action.get("sweeper") != "worktrees":
+                continue
+            if action.get("verb") != "remove":
+                continue
+            if os.path.realpath(action.get("target") or "") == real:
+                return action.get("reason")
+        return None
+
     def janitor_for_worktrees(self, apply=True, snapshot=None, extra=None):
         cfg = {"repos": [self.repo], "worktree_manager_cmd": "janitor-test-no-such-tool"}
         cfg.update(extra or {})
@@ -617,7 +776,7 @@ class WorktreeSweeperTests(GitRepoCase):
     def test_unmerged_worktree_kept(self):
         wt = self.add_worktree("feat/unmerged", days_ago=10)
         jan = self.janitor_for_worktrees(apply=True)
-        jan.pr_merged_heads = lambda repo, branch, base: []
+        jan._fetch_merged_pr_heads = lambda repo, base: []
         jan.sweep_worktrees()
         self.assertTrue(os.path.isdir(wt))
         self.assertIn("unmerged", jan.keep_counts["worktrees"])
@@ -890,7 +1049,7 @@ class WorktreeSweeperTests(GitRepoCase):
     def test_merged_pr_lookup_with_different_head_kept(self):
         wt = self.add_worktree("feat/pr-other", days_ago=10)
         jan = self.janitor_for_worktrees(apply=True)
-        jan.pr_merged_heads = lambda repo, branch, base: ["0" * 40]
+        jan._fetch_merged_pr_heads = lambda repo, base: ["0" * 40]
         jan.sweep_worktrees()
         self.assertTrue(os.path.isdir(wt))
 
@@ -898,7 +1057,7 @@ class WorktreeSweeperTests(GitRepoCase):
         wt = self.add_worktree("feat/pr-match", days_ago=10)
         tip = self.git("rev-parse", "HEAD", cwd=wt).stdout.strip()
         jan = self.janitor_for_worktrees(apply=True)
-        jan.pr_merged_heads = lambda repo, branch, base: [tip]
+        jan._fetch_merged_pr_heads = lambda repo, base: [tip]
         jan.sweep_worktrees()
         self.assertFalse(os.path.exists(wt))
 
@@ -917,12 +1076,15 @@ class WorktreeSweeperTests(GitRepoCase):
         old_path = os.environ.get("PATH", "")
         os.environ["PATH"] = str(bindir) + os.pathsep + old_path
         try:
-            jan.pr_merged_heads(self.repo, "feat/base", "main")
+            jan.merged_pr_heads(self.repo, "main")
         finally:
             os.environ["PATH"] = old_path
         args = json.loads(record.read_text(encoding="utf-8"))
         self.assertIn("--base", args)
         self.assertEqual(args[args.index("--base") + 1], "main")
+        self.assertIn("--limit", args)
+        self.assertEqual(args[args.index("--limit") + 1], "300")
+        self.assertNotIn("--head", args)
 
     def test_head_moved_during_merge_proof_kept(self):
         wt = self.add_worktree("feat/moved", days_ago=10)
@@ -961,6 +1123,71 @@ class WorktreeSweeperTests(GitRepoCase):
         jan.sweep_worktrees()
         self.assertTrue(os.path.isdir(wt))
         self.assertIn("fetch-failed", jan.keep_counts["worktrees"])
+
+    def test_remote_default_branch_wins_over_a_stale_local_origin_head(self):
+        wt = self.add_worktree("feat/trunk", commit=False, days_ago=10)
+        Path(wt, "work.txt").write_text("trunk work\n", encoding="utf-8")
+        self.git("add", ".", cwd=wt)
+        self.commit(wt, "work on feat/trunk", days_ago=10)
+        self.age_admin(wt, 10)
+        # The branch lands on the remote's default branch, which is `trunk`;
+        # local refs/remotes/origin/HEAD is stale and still says `main`.
+        self.git("checkout", "-q", "-B", "trunk", "main", cwd=self.repo)
+        self.git("merge", "--squash", "feat/trunk", cwd=self.repo)
+        self.commit(self.repo, "squash feat/trunk", days_ago=5)
+        self.git("push", "-q", "origin", "trunk", cwd=self.repo)
+        self.git("checkout", "-q", "main", cwd=self.repo)
+        self.git("symbolic-ref", "HEAD", "refs/heads/trunk", cwd=self.origin)
+        self.git(
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/main",
+            cwd=self.repo,
+        )
+        jan = self.janitor_for_worktrees(apply=True)
+        jan._fetch_merged_pr_heads = lambda repo, base: []
+        jan.sweep_worktrees()
+        self.assertFalse(os.path.exists(wt))
+        self.assertEqual(self.removal_reasons(jan), ["squash-merged"])
+
+    def test_default_branch_lookup_failure_keeps_everything(self):
+        wt = self.add_worktree("feat/nobranch", days_ago=10)
+        self.merge_branch("feat/nobranch", squash=True)
+        jan = self.janitor_for_worktrees(apply=True)
+        jan._remote_default_branch = lambda repo: ""
+        jan.open_log()
+        try:
+            jan.sweep_worktrees()
+        finally:
+            jan.log.close()
+            jan.log = None
+        self.assertTrue(os.path.isdir(wt))
+        self.assertIn("fetch-failed", jan.keep_counts["worktrees"])
+        records = [
+            json.loads(line)
+            for line in Path(jan.log_path).read_text(encoding="utf-8").splitlines()
+            if line
+        ]
+        self.assertTrue(
+            any(
+                r.get("type") == "warn"
+                and "default branch" in (r.get("message") or "")
+                for r in records
+            )
+        )
+
+    def test_default_branch_named_without_a_local_ref_is_unknown(self):
+        jan = self.janitor_for_worktrees(apply=False)
+
+        def fake_run(argv, **kw):
+            if "ls-remote" in argv:
+                return 0, "ref: refs/heads/trunk\tHEAD\n", ""
+            if "rev-parse" in argv:
+                return 1, "", ""
+            self.fail("unexpected git call: %r" % (argv,))
+
+        jan._run = fake_run
+        self.assertEqual(jan._remote_default_branch(self.repo), "")
 
     def test_repo_without_origin_is_skipped(self):
         wt = self.add_worktree("feat/noorigin", days_ago=10)
@@ -1002,6 +1229,158 @@ class WorktreeSweeperTests(GitRepoCase):
         self.assertIn(os.path.realpath(str(two)), repos)
         self.assertNotIn(os.path.realpath(str(plain)), repos)
 
+    def test_repos_and_repo_roots_are_both_scanned(self):
+        (self.base / "root").mkdir()
+        named = Path(self.base / "named")
+        named.mkdir()
+        self.git("init", "-b", "main", str(named), cwd=str(self.base))
+        discovered = Path(self.base / "root" / "discovered")
+        discovered.mkdir()
+        self.git("init", "-b", "main", str(discovered), cwd=str(self.base))
+        jan = self.janitor(
+            cfg={"repos": [str(named)], "repo_roots": [str(self.base / "root")]}
+        )
+        repos = jan._worktree_repos()
+        self.assertIn(os.path.realpath(str(named)), repos)
+        self.assertIn(os.path.realpath(str(discovered)), repos)
+
+    def test_missing_configured_repo_or_root_is_one_warning_naming_it(self):
+        missing_repo = self.base / "gone-repo"
+        missing_root = self.base / "gone-root"
+        jan = self.janitor(
+            cfg={"repos": [str(missing_repo)], "repo_roots": [str(missing_root)]}
+        )
+        jan.open_log()
+        try:
+            jan._worktree_repos()
+        finally:
+            jan.log.close()
+            jan.log = None
+        records = [
+            json.loads(line)
+            for line in Path(jan.log_path).read_text(encoding="utf-8").splitlines()
+            if line
+        ]
+        warnings = [r for r in records if r.get("type") == "warn"]
+        self.assertEqual(len(warnings), 2)
+        self.assertEqual(jan.errors, 0)
+        text = json.dumps(warnings)
+        self.assertIn(str(missing_repo), text)
+        self.assertIn(str(missing_root), text)
+
+    def test_unreadable_repo_root_is_an_error_and_keeps_the_sweep_due(self):
+        locked = self.base / "locked-root"
+        locked.mkdir()
+        locked.chmod(0o000)
+        self.addCleanup(_restore_mode, locked)
+        jan = self.janitor(
+            cfg={
+                "repos": [],
+                "repo_roots": [str(locked)],
+                "worktree_manager_cmd": "janitor-test-no-such-tool",
+            },
+            apply=True,
+        )
+        rc = jan.run(only=["worktrees"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(jan.errors, 1)
+        records = [
+            json.loads(line)
+            for line in Path(jan.log_path).read_text(encoding="utf-8").splitlines()
+            if line
+        ]
+        errors = [r for r in records if r.get("type") == "error"]
+        self.assertEqual(len(errors), 1)
+        message = errors[0]["message"]
+        self.assertIn(str(locked), message)
+        self.assertIn("Errno", message)
+        self.assertIn(lj.UNREADABLE_ROOT_HINT, message)
+        self.assertIn("Full Disk Access", message)
+        self.assertIn("worktrees", jan.unfinished)
+        self.assertFalse((self.state / "last-run.json").exists())
+
+    def test_unreadable_configured_repo_is_an_error_and_keeps_the_sweep_due(self):
+        locked = self.base / "locked-repo"
+        locked.mkdir()
+        locked.chmod(0o000)
+        self.addCleanup(_restore_mode, locked)
+        jan = self.janitor(
+            cfg={
+                "repos": [str(locked)],
+                "repo_roots": [],
+                "worktree_manager_cmd": "janitor-test-no-such-tool",
+            },
+            apply=True,
+        )
+        jan.run(only=["worktrees"])
+        self.assertEqual(jan.errors, 1)
+        self.assertIn("worktrees", jan.unfinished)
+        self.assertFalse((self.state / "last-run.json").exists())
+
+    def test_unreadable_child_of_a_readable_root_is_an_error_too(self):
+        root = self.base / "root-with-locked-child"
+        locked = root / "locked-child"
+        locked.mkdir(parents=True)
+        locked.chmod(0o000)
+        self.addCleanup(_restore_mode, locked)
+        jan = self.janitor(
+            cfg={
+                "repos": [],
+                "repo_roots": [str(root)],
+                "worktree_manager_cmd": "janitor-test-no-such-tool",
+            },
+            apply=True,
+        )
+        jan.run(only=["worktrees"])
+        self.assertEqual(jan.errors, 1)
+        records = [
+            json.loads(line)
+            for line in Path(jan.log_path).read_text(encoding="utf-8").splitlines()
+            if line
+        ]
+        errors = [r for r in records if r.get("type") == "error"]
+        self.assertEqual(len(errors), 1)
+        message = errors[0]["message"]
+        self.assertIn(str(locked), message)
+        self.assertIn(lj.UNREADABLE_ROOT_HINT, message)
+        self.assertIn("Full Disk Access", message)
+        self.assertIn("worktrees", jan.unfinished)
+        self.assertFalse((self.state / "last-run.json").exists())
+
+    def test_root_without_repos_keeps_the_sweep_due(self):
+        empty = self.base / "empty-root"
+        empty.mkdir()
+        jan = self.janitor(
+            cfg={
+                "repos": [],
+                "repo_roots": [str(empty)],
+                "worktree_manager_cmd": "janitor-test-no-such-tool",
+            },
+            apply=True,
+        )
+        jan.run(only=["worktrees"])
+        self.assertEqual(jan.errors, 0)
+        self.assertIn("worktrees", jan.unfinished)
+        self.assertFalse((self.state / "last-run.json").exists())
+
+    def test_tmp_sweeper_entry_is_unaffected_by_an_incomplete_worktree_sweep(self):
+        locked = self.base / "locked-root"
+        locked.mkdir()
+        locked.chmod(0o000)
+        self.addCleanup(_restore_mode, locked)
+        jan = self.janitor(
+            cfg={
+                "repos": [],
+                "repo_roots": [str(locked)],
+                "worktree_manager_cmd": "janitor-test-no-such-tool",
+            },
+            apply=True,
+        )
+        jan.run(only=["tmp", "worktrees"])
+        data = json.loads((self.state / "last-run.json").read_text(encoding="utf-8"))
+        self.assertIn("tmp", data["sweepers"])
+        self.assertNotIn("worktrees", data["sweepers"])
+
     def test_dry_run_removes_nothing(self):
         wt = self.add_worktree("feat/dry", days_ago=10)
         self.merge_branch("feat/dry", squash=True)
@@ -1010,6 +1389,218 @@ class WorktreeSweeperTests(GitRepoCase):
         self.assertTrue(os.path.isdir(wt))
         self.assertFalse((self.state / "recovery.jsonl").exists())
         self.assertEqual(jan.removed, 1)
+
+
+# --- merge proofs: batch branches and identical changes --------------------
+
+
+class MergedBatchProofTests(GitRepoCase):
+    """A batch branch merged into main as one squash commit."""
+
+    def test_branch_merged_into_a_merged_batch_head_removed(self):
+        wt = self.add_worktree("feat/batch-a", days_ago=10)
+        head = self.merge_into_batch("feat/batch-a")
+        self.squash_batch()
+        jan = self.janitor_for_worktrees(apply=True)
+        jan._fetch_merged_pr_heads = lambda repo, base: [head]
+        jan.sweep_worktrees()
+        self.assertFalse(os.path.exists(wt))
+        self.assertEqual(self.removal_reasons(jan), ["in-merged-pull-request"])
+
+    def test_batch_head_not_present_locally_kept(self):
+        wt = self.add_worktree("feat/absent-head", days_ago=10)
+        self.git("push", "-q", "origin", "feat/absent-head", cwd=self.repo)
+        other = str(self.base / "other")
+        self.git("clone", "-q", self.origin, other, cwd=str(self.base))
+        self.git("checkout", "-q", "-B", "batch/absent", "origin/main", cwd=other)
+        self.git(
+            "merge", "--no-ff", "-q", "-m", "merge", "origin/feat/absent-head", cwd=other
+        )
+        head = self.git("rev-parse", "HEAD", cwd=other).stdout.strip()
+        # The main repo never fetched that commit, and the janitor must not.
+        probe = self.git("cat-file", "-e", head + "^{commit}", cwd=self.repo, check=False)
+        self.assertNotEqual(probe.returncode, 0)
+        jan = self.janitor_for_worktrees(apply=True)
+        jan._fetch_merged_pr_heads = lambda repo, base: [head]
+        jan.sweep_worktrees()
+        self.assertTrue(os.path.isdir(wt))
+        self.assertIn("unmerged", jan.keep_counts["worktrees"])
+
+    def test_tip_equal_to_a_merged_head_uses_merged_pull_request(self):
+        wt = self.add_worktree("feat/equal-head", days_ago=10)
+        tip = self.git("rev-parse", "HEAD", cwd=wt).stdout.strip()
+        jan = self.janitor_for_worktrees(apply=True)
+        jan._fetch_merged_pr_heads = lambda repo, base: [tip]
+        jan.sweep_worktrees()
+        self.assertFalse(os.path.exists(wt))
+        self.assertEqual(self.removal_reasons(jan), ["merged-pull-request"])
+
+    def test_extra_commit_after_the_batch_merge_kept(self):
+        wt = self.add_worktree("feat/extra", days_ago=10)
+        head = self.merge_into_batch("feat/extra")
+        self.squash_batch()
+        Path(wt, "extra.txt").write_text("extra\n", encoding="utf-8")
+        self.git("add", ".", cwd=wt)
+        self.commit(wt, "extra", days_ago=10)
+        self.age_admin(wt, 10)
+        jan = self.janitor_for_worktrees(apply=True)
+        jan._fetch_merged_pr_heads = lambda repo, base: [head]
+        jan.sweep_worktrees()
+        self.assertTrue(os.path.isdir(wt))
+        self.assertIn("unmerged", jan.keep_counts["worktrees"])
+
+    def test_changes_present_on_default_removed(self):
+        wt = self.add_worktree("feat/part", days_ago=10)
+        other = self.add_worktree("feat/other", commit=False, days_ago=10)
+        Path(other, "other.txt").write_text("other\n", encoding="utf-8")
+        self.git("add", ".", cwd=other)
+        self.commit(other, "other", days_ago=10)
+        self.age_admin(other, 10)
+        self.merge_into_batch("feat/part")
+        self.git("checkout", "-q", "batch/one", cwd=self.repo)
+        self.git("merge", "--no-ff", "-q", "-m", "merge other", "feat/other", cwd=self.repo)
+        self.git("checkout", "-q", "main", cwd=self.repo)
+        self.squash_batch()
+        jan = self.janitor_for_worktrees(apply=True)
+        jan._fetch_merged_pr_heads = lambda repo, base: []
+        jan.sweep_worktrees()
+        self.assertFalse(os.path.exists(wt))
+        self.assertEqual(
+            self.removal_reason_for(jan, wt), "changes-present-on-default"
+        )
+
+    def test_one_changed_file_differing_kept(self):
+        wt = self.add_worktree("feat/part2", days_ago=10)
+        Path(wt, "extra.txt").write_text("one\n", encoding="utf-8")
+        self.git("add", ".", cwd=wt)
+        self.commit(wt, "extra", days_ago=10)
+        self.merge_into_batch("feat/part2")
+        self.squash_batch()
+        Path(wt, "extra.txt").write_text("two\n", encoding="utf-8")
+        self.git("add", ".", cwd=wt)
+        self.commit(wt, "extra again", days_ago=10)
+        self.age_admin(wt, 10)
+        jan = self.janitor_for_worktrees(apply=True)
+        jan._fetch_merged_pr_heads = lambda repo, base: []
+        jan.sweep_worktrees()
+        self.assertTrue(os.path.isdir(wt))
+        self.assertIn("unmerged", jan.keep_counts["worktrees"])
+
+    def test_empty_changed_set_kept(self):
+        wt = self.add_worktree("feat/empty", days_ago=10)
+        self.git("commit", "-q", "--allow-empty", "-m", "nothing", cwd=wt, days_ago=10)
+        self.age_admin(wt, 10)
+        jan = self.janitor_for_worktrees(apply=True)
+        jan._fetch_merged_pr_heads = lambda repo, base: []
+        jan.sweep_worktrees()
+        self.assertTrue(os.path.isdir(wt))
+        self.assertIn("unmerged", jan.keep_counts["worktrees"])
+
+    def test_deleted_file_absent_on_default_counts_as_identical(self):
+        self.write_main("gone.txt", "gone\n")
+        self.git("add", ".", cwd=self.repo)
+        self.commit(self.repo, "add gone", days_ago=20)
+        self.git("push", "-q", "origin", "main", cwd=self.repo)
+        wt = self.add_worktree("feat/del", days_ago=10)
+        self.git("rm", "-q", "gone.txt", cwd=wt)
+        self.commit(wt, "delete gone", days_ago=10)
+        self.age_admin(wt, 10)
+        other = self.add_worktree("feat/other2", commit=False, days_ago=10)
+        Path(other, "other.txt").write_text("other\n", encoding="utf-8")
+        self.git("add", ".", cwd=other)
+        self.commit(other, "other", days_ago=10)
+        self.age_admin(other, 10)
+        self.merge_into_batch("feat/del")
+        self.git("checkout", "-q", "batch/one", cwd=self.repo)
+        self.git("merge", "--no-ff", "-q", "-m", "merge other", "feat/other2", cwd=self.repo)
+        self.git("checkout", "-q", "main", cwd=self.repo)
+        self.squash_batch()
+        jan = self.janitor_for_worktrees(apply=True)
+        jan._fetch_merged_pr_heads = lambda repo, base: []
+        jan.sweep_worktrees()
+        self.assertFalse(os.path.exists(wt))
+        self.assertEqual(
+            self.removal_reason_for(jan, wt), "changes-present-on-default"
+        )
+
+    def test_file_name_that_looks_like_a_pathspec_pattern_is_matched_literally(self):
+        # `a` is identical on both sides, so a pathspec pattern `[a]` matches
+        # it and the changed file `[a]` would go unnoticed without
+        # --literal-pathspecs.
+        self.write_main("a", "same on both sides\n")
+        self.git("add", ".", cwd=self.repo)
+        self.commit(self.repo, "add a", days_ago=20)
+        self.git("push", "-q", "origin", "main", cwd=self.repo)
+        wt = self.add_worktree("feat/bracket", commit=False, days_ago=10)
+        Path(wt, "[a]").write_text("only on the branch\n", encoding="utf-8")
+        self.git("add", ".", cwd=wt)
+        self.commit(wt, "add bracket file", days_ago=10)
+        self.age_admin(wt, 10)
+        jan = self.janitor_for_worktrees(apply=True)
+        jan._fetch_merged_pr_heads = lambda repo, base: []
+        jan.sweep_worktrees()
+        self.assertTrue(os.path.isdir(wt))
+        self.assertIn("unmerged", jan.keep_counts["worktrees"])
+
+    def test_merged_list_fetched_once_per_repo(self):
+        self.add_worktree("feat/one", days_ago=10)
+        self.add_worktree("feat/two", days_ago=10)
+        jan = self.janitor_for_worktrees(apply=False)
+        calls = []
+
+        def fetch(repo, base):
+            calls.append((repo, base))
+            return []
+
+        jan._fetch_merged_pr_heads = fetch
+        jan.sweep_worktrees()
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][1], "main")
+
+    def test_more_than_one_chunk_of_changed_files_with_the_last_chunk_differing(self):
+        wt = self.add_worktree("feat/many", days_ago=10)
+        count = lj.CHANGES_PROOF_CHUNK + 5
+        for i in range(count):
+            Path(wt, "f%03d.txt" % i).write_text("v1\n", encoding="utf-8")
+        self.git("add", ".", cwd=wt)
+        self.commit(wt, "many files", days_ago=10)
+        self.age_admin(wt, 10)
+        other = self.add_worktree("feat/other-many", commit=False, days_ago=10)
+        Path(other, "other.txt").write_text("other\n", encoding="utf-8")
+        self.git("add", ".", cwd=other)
+        self.commit(other, "other", days_ago=10)
+        self.age_admin(other, 10)
+        self.merge_into_batch("feat/many")
+        self.git("checkout", "-q", "batch/one", cwd=self.repo)
+        self.git(
+            "merge", "--no-ff", "-q", "-m", "merge other", "feat/other-many", cwd=self.repo
+        )
+        self.git("checkout", "-q", "main", cwd=self.repo)
+        self.squash_batch()
+        # Only the file in the last chunk differs from the default branch.
+        self.write_main("f%03d.txt" % (count - 1), "v2\n")
+        self.git("add", ".", cwd=self.repo)
+        self.commit(self.repo, "change last file")
+        self.git("push", "-q", "origin", "main", cwd=self.repo)
+        jan = self.janitor_for_worktrees(apply=True)
+        jan._fetch_merged_pr_heads = lambda repo, base: []
+        chunks = []
+        real_run = jan._run
+
+        def counting(argv, **kw):
+            if "--quiet" in argv and "diff" in argv:
+                chunks.append(len(argv) - argv.index("--") - 1)
+            return real_run(argv, **kw)
+
+        jan._run = counting
+        jan.sweep_worktrees()
+        self.assertTrue(os.path.isdir(wt))
+        self.assertIn("unmerged", jan.keep_counts["worktrees"])
+        # 206 changed paths on this branch (work.txt plus the 205 files) go in
+        # two calls; the second worktree in the repo adds its own one-path call.
+        self.assertIn(lj.CHANGES_PROOF_CHUNK, chunks)
+        self.assertIn(count - lj.CHANGES_PROOF_CHUNK + 1, chunks)
+        self.assertEqual(max(chunks), lj.CHANGES_PROOF_CHUNK)
 
 
 # --- combined dry run ------------------------------------------------------
@@ -1111,13 +1702,7 @@ class SnapshotTests(JanitorCase):
             taken.append(self.now)
             return fake_snapshot(ok=True)
 
-        jan = lj.Janitor(
-            dict(lj.DEFAULTS),
-            str(self.state),
-            str(self.logs),
-            now=lambda: self.now,
-            snapshot_factory=factory,
-        )
+        jan = self.janitor(snapshot_factory=factory)
         self.assertTrue(jan.current_snapshot().ok)
         self.assertEqual(len(taken), 1)
         self.now += 60
@@ -1135,12 +1720,8 @@ class SnapshotTests(JanitorCase):
         self.assertIs(jan.current_snapshot(), snap)
 
     def test_failed_refresh_counts_everything_as_in_use(self):
-        jan = lj.Janitor(
-            dict(lj.DEFAULTS),
-            str(self.state),
-            str(self.logs),
-            now=lambda: self.now,
-            snapshot_factory=lambda: fake_snapshot(ok=False, error="boom"),
+        jan = self.janitor(
+            snapshot_factory=lambda: fake_snapshot(ok=False, error="boom")
         )
         used, why = jan.in_use(str(self.base / "x"))
         self.assertTrue(used)
@@ -1180,8 +1761,19 @@ class TakeSnapshotTests(unittest.TestCase):
 class CliCase(JanitorCase):
     def env(self, config=None):
         cfg = self.base / "config.json"
-        if config is not None:
-            cfg.write_text(config, encoding="utf-8")
+        if config is None:
+            # Inert defaults: no repo roots, no manager, no scratch tool, so a
+            # CLI run can only ever act inside this case's temp dir.
+            config = json.dumps(
+                {
+                    "repos": [],
+                    "repo_roots": [],
+                    "worktree_manager_cmd": "",
+                    "agent_dash_cmd": "",
+                    "postgres_extra_roots": [],
+                }
+            )
+        cfg.write_text(config, encoding="utf-8")
         return {
             "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
             "HOME": str(self.base / "home"),
@@ -1289,10 +1881,12 @@ class CliCase(JanitorCase):
         )
         self.assertEqual(args[2:], ["run", "--scheduled"])
         self.assertEqual(res.stdout.count("com.agent-dash.laptop-janitor"), 1)
-        self.assertIn(
-            "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
-            data["EnvironmentVariables"]["PATH"],
-        )
+        path_entries = data["EnvironmentVariables"]["PATH"].split(":")
+        self.assertEqual(path_entries[0], os.path.join(env["HOME"], ".local", "bin"))
+        self.assertIn("/opt/homebrew/bin", path_entries)
+        self.assertIn("/usr/bin", path_entries)
+        self.assertIn("/bin", path_entries)
+        self.assertNotIn("~", data["EnvironmentVariables"]["PATH"])
         self.assertEqual(data["StandardOutPath"], data["StandardErrorPath"])
         self.assertTrue(data["StandardOutPath"].endswith("launchd.log"))
 
@@ -1381,6 +1975,61 @@ class CliCase(JanitorCase):
         self.assertFalse(data["due"])
         self.assertEqual(data["sweepers"], lj.SWEEPERS)
         self.assertIn("lock_held", data)
+
+    def write_run_log(self, name, records):
+        self.logs.mkdir(parents=True, exist_ok=True)
+        (self.logs / name).write_text(
+            "".join(json.dumps(r, sort_keys=True) + "\n" for r in records),
+            encoding="utf-8",
+        )
+
+    def test_status_reports_worktree_errors_from_the_newest_run(self):
+        self.write_last_run(days_ago=1)
+        self.write_run_log(
+            "run-20200101T000000Z.jsonl",
+            [
+                {"type": "error", "sweeper": "worktrees", "message": "old one"},
+                {"type": "error", "sweeper": "worktrees", "message": "old two"},
+                {"type": "error", "sweeper": "worktrees", "message": "old three"},
+            ],
+        )
+        self.write_run_log(
+            "run-20200102T000000Z.jsonl",
+            [
+                {
+                    "type": "error",
+                    "sweeper": "worktrees",
+                    "message": "cannot list /redacted/root: [Errno 1] Operation not permitted",
+                },
+                {"type": "error", "sweeper": "tmp", "message": "other"},
+                {
+                    "type": "error",
+                    "sweeper": "worktrees",
+                    "message": "cannot list /redacted/other: denied",
+                },
+                {"type": "summary", "mode": "apply"},
+            ],
+        )
+        res = self.cli("status", "--json")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        data = json.loads(res.stdout)
+        self.assertEqual(data["log_errors"]["worktrees"]["errors"], 2)
+        self.assertEqual(
+            data["log_errors"]["worktrees"]["last_error"],
+            "cannot list /redacted/other: denied",
+        )
+        self.assertEqual(data["log_errors"]["tmp"]["errors"], 1)
+        text = self.cli("status")
+        self.assertEqual(text.returncode, 0, text.stderr)
+        self.assertIn("worktrees  2 error(s) in the newest run", text.stdout)
+        self.assertIn("cannot list /redacted/other: denied", text.stdout)
+
+    def test_status_without_worktree_errors_has_no_worktree_error_line(self):
+        self.write_last_run(days_ago=1)
+        res = self.cli("status")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(json.loads(self.cli("status", "--json").stdout)["log_errors"], {})
+        self.assertNotIn("in the newest run", res.stdout)
 
 
 # --- small parsing helpers -------------------------------------------------

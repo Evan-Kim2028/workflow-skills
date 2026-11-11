@@ -67,9 +67,14 @@ A second run while the lock is held prints `already running` and exits 0.
 ```
 
 A sweeper's entry is written with a temp file plus `os.replace` as soon as that
-sweeper finishes, in apply mode only, and only when it finished without raising
-and without running out of its budget. A sweeper that raised or timed out keeps
-its previous entry, so the next scheduled tick runs it again. A run that is
+sweeper finishes, in apply mode only, and only when it finished without raising,
+without running out of its budget, and without marking itself incomplete. A
+sweeper that raised, timed out or was incomplete keeps its previous entry, so
+the next scheduled tick runs it again. The `worktrees` sweeper is incomplete
+when a configured repo root or repo exists but cannot be listed (macOS privacy
+protection denies a launchd-started program any read of some folders), or when
+repo roots or repos are configured and none was found: a sweep that could not
+see the repos must not look done for three days. A run that is
 killed, loses power, or aborts on an interrupt writes nothing for the sweepers
 it did not finish, so the next tick or the next login sees them as due. Every
 action is idempotent, so a repeat after a partial run is safe.
@@ -86,6 +91,12 @@ delays the run until the next load or the next daily tick.
 Each run appends to `run-<UTC stamp>.jsonl`: one JSON object per run start, per
 kept item, per action, per error, per kept group and one summary. The newest 30
 files are kept.
+
+`status` reads the newest `run-*.jsonl` too and counts its `error` lines per
+sweeper. When the newest run has `worktrees` errors it prints one line with the
+count and the last message (the same data is `log_errors` in `status --json`),
+which is how a sweep that could not read a repo root, or could not delete a
+temp entry, shows up after a scheduled run from launchd.
 
 ## Config
 
@@ -104,6 +115,7 @@ silently using defaults.
   "tmp_age_scan_max_entries": 200000,
   "snapshot_max_age_seconds": 120,
   "worktree_min_idle_days": 3,
+  "merged_pr_lookback": 300,
   "scratch_min_age_days": 3,
   "tmp_protect_globs": [],
   "postgres_extra_roots": [],
@@ -232,10 +244,16 @@ Guards run cheapest first. An entry is kept, with a reason, when it:
 - changed between the first `lstat` and the removal: device, inode or
   modification time differ (`changed-during-scan`);
 - escapes its root on re-check (`escaped-root`);
-- could not be walked (`unreadable-age`).
+- could not be walked (`unreadable-age`);
+- is refused by the OS at removal with `EPERM` or `EACCES` (`not-permitted`).
 
 Folders are removed with `shutil.rmtree` and an error handler that fixes
-read-only permissions once and retries; a failure is an error line.
+read-only permissions once and retries. A refusal with `EPERM` or `EACCES`
+(the OS will not let any program delete this entry, e.g. a service-owned temp
+folder) keeps the entry with reason `not-permitted` and is not an error, so the
+same 15 entries do not count as 15 errors on every run. Any other failure is
+an error line. This includes a folder that was partly deleted before the
+refusal: it is reported as kept with `not-permitted`.
 
 ## Sweeper: worktrees
 
@@ -259,15 +277,37 @@ expected JSON, that is logged and part A is skipped.
 The reviewed tool only recognises branches that are ancestors of the main
 branch, so squash-merged worktrees pile up. Part B handles those.
 
-Repos come from `repos` (main checkout paths). When that is empty they are
+Repos come from the union of `repos` (main checkout paths) and every folder
 discovered one or two levels under each `repo_roots` entry, taking every folder
-that contains a `.git` **directory**.
+that contains a `.git` **directory**. Both lists are always used: naming a repo
+in `repos` does not stop the roots from being scanned. A configured entry that
+does not exist is one `warn` log line naming it.
+
+A configured repo root or repo, or a child folder of a readable root, that
+exists but cannot be listed is an error line naming the path, the OS error and
+the fix: grant the program that runs the janitor (`sys.executable`,
+`/usr/bin/python3` under launchd) Full Disk Access,
+or run `run --apply --only worktrees` from a terminal. macOS privacy protection
+silently denies a launchd-started program any read of the user's Documents
+folder, and taking that denial for "no repos here" was how a sweep finished in
+0.05 s with nothing removed. When any root was unreadable, or when repos or
+roots were configured and no repository was found, the `worktrees` sweeper is
+incomplete for that run and gets no `last-run.json` entry, so `status` shows it
+due and the next run retries it; repos it could read are still swept. A config
+with no `repos` and no `repo_roots` has nothing to sweep and still counts as
+finished.
 
 For each repo the janitor runs `git fetch origin --quiet` (60 s, no terminal
 prompt). A repo with no `origin` remote is skipped with one log line, not an
 error. When the fetch fails, nothing is removed from that repo in this run:
 every otherwise-eligible worktree is kept with reason `fetch-failed`, because
-stale refs are not proof of a merge. Then it runs
+stale refs are not proof of a merge. After a successful fetch the default
+branch is the one the remote names, from `git ls-remote --symref origin HEAD`
+(30 s): the local `refs/remotes/origin/HEAD` can be stale and is not trusted.
+If that call fails, or names a branch this clone has no `origin/<branch>` ref
+for, nothing is removed from that repo in this run and every eligible worktree
+is kept with the same `fetch-failed` reason, with its own warn log line, since
+comparing against a branch we could not confirm proves nothing. Then it runs
 `git worktree list --porcelain`.
 
 A worktree is removed only when **all** of these hold:
@@ -295,14 +335,41 @@ A worktree is removed only when **all** of these hold:
    `recent` forever. Uncommitted work is covered by guard 3. The timestamps
    are read before running `git status`;
 6. it is not in use per the process snapshot;
-7. its branch tip is merged, by any one of: the tip is an ancestor of
-   `origin/<default branch>`; `gh` is on the PATH and
-   `gh pr list --state merged --head <branch> --base <default branch> --json
-   headRefOid --limit 20` (30 s) returns a pull request whose `headRefOid`
-   equals the tip; or the squash test passes (`git commit-tree <tip>^{tree} -p
-   <merge-base>` then `git cherry origin/<default> <temp>` prints a line
-   starting with `-`). A branch name alone is never proof, and a pull request
-   into any other base does not count.
+7. its branch tip is merged, by any one of these proofs, tried in order:
+   the tip is an ancestor of `origin/<default branch>`; the tip equals the
+   head of a pull request merged into the default branch; the tip is an
+   ancestor of such a head; the squash test passes (`git commit-tree
+   <tip>^{tree} -p <merge-base>` then `git cherry origin/<default> <temp>`
+   prints a line starting with `-`); or every file the branch changed is
+   already identical on the default branch. A branch name alone is never
+   proof, and a pull request into any other base does not count.
+
+The merged pull request heads come from one call per repo per run:
+`gh pr list --state merged --base <default branch> --json headRefOid --limit
+<merged_pr_lookback>` (default 300, 60 s). The list is cached for that repo,
+so a repo with many worktrees still makes one call. Without `gh`, or when the
+call fails, the list is empty and those two proofs never pass. A head that is
+not present locally is skipped, never fetched: the janitor only runs
+`git cat-file -e <head>^{commit}` and then `git merge-base --is-ancestor <tip>
+<head>`. The reason strings are `merged-pull-request` when the tip equals a
+head and `in-merged-pull-request` when it is an ancestor of one.
+
+The last proof covers a branch that was merged into a batch branch with a
+merge commit, where the batch branch then reached the default branch as one
+squash commit. The changed set is `git diff --name-only -z --no-renames
+<merge-base> <tip>`. It is checked in chunks of at most 200 paths with one
+`git --literal-pathspecs -C <repo> diff --quiet <tip> origin/<default> --
+<paths>` per chunk: exit 0 means those paths are identical on both sides
+(including a path absent on both), exit 1 means they differ, and anything else
+fails the proof. `--literal-pathspecs` matters: without it a changed file
+named `[a]` or starting with `:(` is matched as a pattern, so a branch that
+only added `[a]` passed when an unrelated file `a` was identical on both
+sides. The proof passes
+only when the changed set is not empty and every chunk is identical; a single
+difference, or any git error, fails it. The reason string is
+`changes-present-on-default`. One call per chunk replaces two `git rev-parse`
+calls per changed file, which on a machine with about 300 worktrees took the
+sweeper's whole budget.
 
 Immediately before the archive ref is written, the janitor re-reads the
 worktree's HEAD (`git -C <path> rev-parse HEAD`) and keeps it with reason
@@ -362,7 +429,11 @@ and `launchctl bootstrap gui/<uid> <plist>`.
 The plist runs `/usr/bin/python3 <installed script> run --scheduled` with
 `RunAtLoad` true and a daily `StartCalendarInterval` at 04:40, as a background
 process with low-priority IO and `Nice` 10. `print-plist` prints the exact text
-for review.
+for review. Its `PATH` starts with `os.path.expanduser("~/.local/bin")`, because
+`workspace-manager` is installed there and launchd starts the program with no
+shell profile; the rest is `/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:\
+/usr/sbin:/sbin`. The home directory is expanded at install time, so nothing
+machine-specific is in the source.
 
 `uninstall --apply` boots the agent out and removes the plist and the installed
 script. The state dir and logs are left alone; remove
