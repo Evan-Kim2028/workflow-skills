@@ -565,7 +565,7 @@ renamed.
 `doctor` additionally reports each health `warnings` entry as a
 `run-dir-outside-roots` problem.
 
-`GET /api/flow` -> the execution-flow card, folded from the cached
+`GET /api/flow` -> the execution-flow projection, folded from the cached
 `/api/state` body and the latest persisted doctor run (`dash/flowview.py`):
 ```json
 {"generated_at": 0,

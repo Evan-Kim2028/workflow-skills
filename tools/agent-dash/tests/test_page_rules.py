@@ -3728,15 +3728,15 @@ class FinalPolishTests(unittest.TestCase):
         ov = [ident for _, ident in sorted(by_scope.get("overview", []))]
         self.assertEqual(
             ov,
-            ["pulse", "wherego", "aggregate", "flow", "cards", "phases-all", "manage"],
-            "overview order drifted: want pulse first, then wherego, aggregate, the flow card, cards, usage, and the folded manage section last",
+            ["pulse", "wherego", "aggregate", "cards", "phases-all", "manage"],
+            "overview order drifted: want pulse first, then wherego, aggregate, cards, usage, and the folded manage section last",
         )
         both_ids = [ident for _, ident in both]
         self.assertEqual(
-            [ident for ident in ["pulse", "wherego", "aggregate", "flow", "running", "plan", "activity", "cards", "finished", "phases-all", "manage"]
+            [ident for ident in ["pulse", "wherego", "aggregate", "running", "plan", "activity", "cards", "finished", "phases-all", "manage"]
              if ident in ov or ident in both_ids],
-            ["pulse", "wherego", "aggregate", "flow", "running", "plan", "activity", "cards", "finished", "phases-all", "manage"],
-            "overview render drifted: want pulse, wherego, flow, running, plan, activity, cards, finished, usage, then the folded manage section last",
+            ["pulse", "wherego", "aggregate", "running", "plan", "activity", "cards", "finished", "phases-all", "manage"],
+            "overview render drifted: want pulse, wherego, running, plan, activity, cards, finished, usage, then the folded manage section last",
         )
         ws_only = [ident for _, ident in sorted(by_scope.get("workstream", []))]
         self.assertEqual(ws_only[0], "wshead", "the workstream heading is not the first workstream section")
@@ -4956,91 +4956,150 @@ class LinearCardRulesTests(unittest.TestCase):
         self.assertIn(".lin-svg{max-width:100%", self.css)
 
 
-class FlowCardRules(unittest.TestCase):
-    """The Execution flow card: one section on both scopes, axes, no tile row."""
+class ExecutionFlowCardRemoved(unittest.TestCase):
+    """The Execution flow card is gone from both scopes; the server keeps /api/flow."""
 
     def setUp(self):
-        self.js = (STATIC / "cards" / "flow.js").read_text()
-        self.css = (STATIC / "cards" / "flow.css").read_text()
         self.reg = (STATIC / "cards" / "registry.js").read_text()
         self.page = (STATIC / "index.html").read_text()
 
-    def test_flow_card_is_registered_for_both_scopes(self):
-        entries = re.findall(r'\{id: "flow", order: \d+, scope: "(\w+)"', self.reg)
-        self.assertEqual(sorted(entries), ["overview", "workstream"])
-        self.assertEqual(self.reg.count('id: "flow"'), 2)
-        self.assertIn("flowSpec(state, snap)", self.reg)
+    def test_no_flow_card_is_registered(self):
+        self.assertNotIn('id: "flow"', self.reg)
+        self.assertNotIn("flowSpec", self.reg)
 
-    def test_flow_card_loads_on_the_shell(self):
-        self.assertIn('/static/cards/flow.js', self.page)
-        self.assertIn('/static/cards/flow.css', self.page)
+    def test_flow_assets_are_gone(self):
+        self.assertFalse((STATIC / "cards" / "flow.js").exists(), "static/cards/flow.js is back")
+        self.assertFalse((STATIC / "cards" / "flow.css").exists(), "static/cards/flow.css is back")
+        self.assertNotIn("/static/cards/flow.js", self.page)
+        self.assertNotIn("/static/cards/flow.css", self.page)
 
-    def test_flow_chart_has_axes(self):
+    def test_server_flow_projection_stays(self):
+        """The card went, the endpoint did not: the CLI and the control-plane e2e read it."""
+        self.assertTrue((STATIC.parent / "dash" / "flowview.py").exists())
+        self.assertIn("/api/flow", (STATIC.parent / "dash" / "server.py").read_text())
+
+
+class LiveExecRefreshRules(unittest.TestCase):
+    """A workstream Execution tab refreshes its plan, runs, concurrency and
+    approvals on the live path, not only on a reload or a tab switch."""
+
+    def setUp(self):
+        self.js = (STATIC / "core" / "api.js").read_text()
+
+    def test_quiet_path_fetches_the_workstream_payloads(self):
         bodies = dict(functions(self.js))
-        self.assertIn("flowBar", bodies)
-        self.assertIn("axes(", bodies["flowBar"])
-        self.assertIn("xTitle", bodies["flowBar"])
-        self.assertIn("xTicks", bodies["flowBar"])
+        self.assertIn("refreshSnapshot", bodies)
+        body = bodies["refreshSnapshot"]
+        for path in ("/api/snapshot", "/api/plan", "/api/runs", "/api/concurrency", "/api/approvals"):
+            self.assertIn(path, body, f"refreshSnapshot no longer refreshes {path}")
+        self.assertIn("execSig(", body, "the quiet path lost its change signature")
+        self.assertIn("ADC.applies(key, state)", body, "the quiet path lost its stale-response guard")
 
-    def test_flow_adds_no_tile_row(self):
-        self.assertEqual(self.reg.count('id: "tiles"'), 1, "the flow card added a second tile row")
-        self.assertNotIn('"tiles"', self.js, "flow.js renders a tile row")
-        self.assertNotIn("tile", self.js.lower())
+    def test_plan_refresh_is_throttled_and_tick_driven(self):
+        bodies = dict(functions(self.js))
+        self.assertIn("PLAN_EVERY_MS = 5000", self.js)
+        self.assertIn("execPlanDue", bodies)
+        self.assertIn("tabHidden()", bodies["execPlanDue"])
+        self.assertIn("refreshBusy()", bodies["execPlanDue"])
+        self.assertIn("__adReplayOn", bodies["execPlanDue"])
+        self.assertIn("FIX", bodies["execPlanDue"])
+        self.assertIn("execPlanDue()", bodies["stream"], "the tick never asks for a plan refresh")
 
-    def test_flow_commands_are_copyable(self):
-        self.assertIn("copyCmd(", self.js)
-        self.assertIn('el("button"', self.js)
-        self.assertIn("flowCommand", self.js)
-
-    def test_flow_empty_state_is_named(self):
-        self.assertIn("No active workstreams", self.js)
-        self.assertIn("Execution flow is unavailable", self.js)
-
-    def test_flow_phone_rules(self):
-        self.assertIn("@media (max-width:640px)", self.css)
-        self.assertIn("overflow-x:auto", self.css)
-        self.assertIn(".fl-cmd{width:100%", self.css)
-
-    def test_flow_pure_helpers_run_in_node(self):
-        """The card's scope and command helpers are pure and node-driven."""
-        harness = r'''
+    def test_quiet_path_refreshes_plan_and_skips_identical_redraws(self):
+        """Node drives api.js with a fake fetch: the plan lands, an identical
+        turn does not redraw, and a changed plan does."""
+        harness = r"""
 const fs = require("fs");
 const assert = require("assert");
 var window = {};
-global.fmtN = function (n) { return String(n); };
-eval(fs.readFileSync(process.argv[2], "utf8"));
-["flowQueues", "flowBlockers", "flowCommand", "flowTakeaway"].forEach(function (n) {
-  assert.strictEqual(typeof window[n], "function", n + " is not a plain global");
-});
-var payload = {
-  queues: [{key: "todo", label: "Todo", count: 8}, {key: "wip", label: "In progress", count: 6}],
-  workstreams: [{id: "WS33", counts: {todo: 4, wip: 2}}],
-  blockers: [{code: "a", ws: "WS33", next: "n1", command: "c1"},
-             {code: "b", ws: null, command: "c2", next: null}]
+global.window = window;
+global.FIX = false;
+global.document = {hidden: false, getElementById: function () { return null; }};
+var now = 1000000;
+Date.now = function () { return now; };
+var currentKey = "WS33|model";
+global.state = {view: "exec", ws: "WS33", groupBy: "model", snap: null, runs: [], conc: [],
+  plan: null, approvals: [], seq: 1, viewSeq: 1, snapSig: null, execSig: null,
+  lastSeqChange: 0, lastPoll: 0, health: null, snapError: null};
+global.since = function () { return 0; };
+global.groupFor = function () { return "model"; };
+global.reqKey = function () { return currentKey; };
+global.execCache = {};
+global.setCache = function (k, b) { b.at = Date.now(); b.key = k; global.execCache[k] = b; };
+global.ADC = {TTL_MS: 30000, applies: function (k) { return k === currentKey; },
+  key: function (a, b) { return a + "|" + b; }, fresh: function () { return false; },
+  currentKey: function () { return currentKey; }};
+var draws = 0;
+global.drawMain = function () { draws++; };
+global.renderTabs = function () {};
+global.applyChrome = function () {};
+global.projectLanding = function () { return null; };
+global.isProjectView = function () { return false; };
+global.planSum = {}; global.planPrompt = {}; global.planProg = function () { return {}; };
+var calls = [];
+var planState = "wip";
+function resp(body) {
+  return Promise.resolve({status: 200, ok: true,
+    headers: {get: function () { return null; }},
+    json: function () { return Promise.resolve(JSON.parse(JSON.stringify(body))); }});
+}
+global.fetch = function (url) {
+  calls.push(url);
+  var path = url.split("?")[0];
+  if (path === "/api/snapshot") return resp({seq: 2, view_seq: 2, counts: {}, totals: {}, running: [], recent: [], usage: []});
+  if (path === "/api/runs") return resp({runs: [{run_id: "r1"}]});
+  if (path === "/api/concurrency") return resp({points: [{t: 1, n: 1}]});
+  if (path === "/api/plan") return resp({groups: [{id: "t1", state: planState}], progress: {done: 0, total: 1, pct: 0}});
+  if (path === "/api/approvals") return resp({ws: "WS33", items: []});
+  return Promise.reject(new Error("unexpected " + url));
 };
-var all = window.flowQueues(payload, "all");
-assert.deepStrictEqual(all.map(function (r) { return r.count; }), [8, 6]);
-assert.strictEqual(all[0].color, "var(--muted)");
-assert.deepStrictEqual(window.flowQueues(payload, "WS33").map(function (r) { return r.count; }), [4, 2]);
-assert.deepStrictEqual(window.flowQueues(payload, "WS99").map(function (r) { return r.count; }), [0, 0]);
-assert.deepStrictEqual(window.flowBlockers(payload, "all").map(function (b) { return b.code; }), ["a", "b"]);
-assert.deepStrictEqual(window.flowBlockers(payload, "WS33").map(function (b) { return b.code; }), ["a"]);
-assert.strictEqual(window.flowCommand(payload.blockers[0]), "n1");
-assert.strictEqual(window.flowCommand(payload.blockers[1]), "c2");
-assert.strictEqual(window.flowCommand(null), "");
-assert.strictEqual(window.flowTakeaway(all, 14), "14 tasks in flight: 8 todo, 6 in progress.");
-assert.strictEqual(window.flowTakeaway([], 0), "No tasks in any queue.");
-console.log("flow helpers ok");
-'''
+eval(fs.readFileSync(process.argv[2], "utf8"));
+function settle() { return new Promise(function (r) { setTimeout(r, 30); }); }
+(async function () {
+  /* Boot runs a full refresh first, so the exec cache entry exists. */
+  global.setCache("WS33|model", {snap: null, runs: [], usage: [], conc: [], plan: null, seq: 1, viewSeq: 1, approvals: []});
+  window.AdPage.refreshSnapshot();
+  await settle();
+  ["/api/snapshot", "/api/plan", "/api/runs", "/api/concurrency", "/api/approvals"].forEach(function (p) {
+    assert.ok(calls.some(function (u) { return u.split("?")[0] === p; }), "quiet path never fetched " + p);
+  });
+  assert.strictEqual(global.state.plan.groups[0].state, "wip", "the plan did not land in state");
+  assert.strictEqual(global.state.runs.length, 1, "the run list did not land in state");
+  assert.strictEqual(global.state.conc.length, 1, "the concurrency series did not land in state");
+  assert.strictEqual(draws, 1, "the first quiet refresh did not draw");
+  assert.ok(global.execCache["WS33|model"].plan, "the exec cache entry lost the plan");
+  assert.strictEqual(window.AdPage.execPlanDue(), false, "the plan clock did not restart after a refresh");
+  now += window.AdPage.PLAN_EVERY_MS + 1;
+  assert.strictEqual(window.AdPage.execPlanDue(), true, "the plan clock never comes due");
+  window.AdPage.refreshSnapshot();
+  await settle();
+  assert.strictEqual(draws, 1, "an identical quiet refresh redrew the page");
+  planState = "done";
+  window.AdPage.refreshSnapshot();
+  await settle();
+  assert.strictEqual(global.state.plan.groups[0].state, "done", "a plan change did not land");
+  assert.strictEqual(draws, 2, "a plan change did not redraw the page");
+  currentKey = "all|model";
+  global.state.ws = "all";
+  calls.length = 0;
+  window.AdPage.refreshSnapshot();
+  await settle();
+  assert.deepStrictEqual(calls.map(function (u) { return u.split("?")[0]; }), ["/api/snapshot"],
+    "the overview quiet path fetched workstream-only payloads");
+  assert.strictEqual(window.AdPage.execPlanDue(), false, "the overview asked for a plan refresh");
+  console.log("live exec refresh ok");
+})().catch(function (e) { console.error(e && e.stack || e); process.exit(1); });
+"""
         with tempfile.TemporaryDirectory() as tmp:
-            harness_path = Path(tmp) / "flow_helpers.js"
+            harness_path = Path(tmp) / "live_exec_refresh.js"
             harness_path.write_text(harness, encoding="utf-8")
             proc = subprocess.run(
-                ["node", str(harness_path), str(STATIC / "cards" / "flow.js")],
+                ["node", str(harness_path), str(STATIC / "core" / "api.js")],
                 capture_output=True,
                 text=True,
             )
         self.assertEqual(proc.returncode, 0, proc.stderr or proc.stdout)
+        self.assertIn("live exec refresh ok", proc.stdout)
 
 
 if __name__ == "__main__":

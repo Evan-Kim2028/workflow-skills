@@ -52,16 +52,6 @@
       if (state.ws !== "all") return null;
       return aggregateSpec(state, snap);
     }},
-    /* Execution flow: where the work sits and what blocks it, one card
-       over one spec on both scopes (static/cards/flow.js). It is its own
-       section, never a new tile row: the pulse KPI strip keeps the
-       overview numbers. */
-    {id: "flow", order: 26, scope: "overview", spec: function (state, snap) {
-      return typeof flowSpec === "function" ? flowSpec(state, snap) : null;
-    }},
-    {id: "flow", order: 26, scope: "workstream", spec: function (state, snap) {
-      return typeof flowSpec === "function" ? flowSpec(state, snap) : null;
-    }},
     {id: "running", order: 30, scope: "both", spec: function (state, snap) {
       return ["running", keyOf((snap.running || []).map(function (r) { return [runRow(r), r.section, r.section_index]; })), function () { return runsTable("Running now", "Grouped workstream \u2192 section \u2192 agent; freshest first when collapsed. Click a row for details. Output \u25B2 means the out file grew since the last poll.", snap.running || [], state.snapError ? "request failed" : "Nothing running."); }, "margin-top:14px"];
     }},

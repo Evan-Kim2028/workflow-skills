@@ -8,7 +8,8 @@
    warmTabs (background per-tab warmup); showSnapError,
    clearSnapError, renderErrBanner (loud fetch failures); STALE_AFTER_S,
    updateStale (tick-freshness badge); refreshAll, setLive, stream,
-   refreshSnapshot (the one-response refresh paths).
+   refreshSnapshot (the one-response refresh paths), execSig, execPlanDue,
+   PLAN_EVERY_MS (the quiet workstream-tab refresh).
    Needs: FIX from el.js; WINDOW_HOURS, state, since, wsParam, groupFor,
    reqKey, getCache, setCache, execCache from the state/cache files;
    window.ADC; renderTabs, applyChrome, projectLanding, isProjectView from
@@ -74,6 +75,16 @@
     if (!j || typeof j !== "object") return null;
     try {
       return JSON.stringify(j, function (k, v) { return (SNAP_CLOCKS[k] || (extra && extra[k])) ? 0 : v; });
+    } catch (e) { return null; }
+  }
+  /* Live exec signature: the snapshot plus the four responses a
+     workstream tab renders from (plan, runs, concurrency, approvals).
+     None of them move view_seq, so the quiet path compares this whole set
+     and redraws only when one of them actually changed. The cache key
+     leads so a tab switch always reads as a change. */
+  function execSig(key, snap, plan, runs, conc, approvals) {
+    try {
+      return String(key) + "\u0000" + snapSig(snap) + "\u0000" + JSON.stringify([plan, runs, conc, approvals]);
     } catch (e) { return null; }
   }
   function api(path, params) {
@@ -484,6 +495,7 @@
       state.conc = parts[2];
       state.plan = parts[4];
       state.approvals = parts[5];
+      state.execSig = execSig(key, state.snap, state.plan, state.runs, state.conc, state.approvals);
       setCache(key, {snap: state.snap, runs: state.runs, usage: state.usage, conc: state.conc, plan: state.plan, seq: state.seq, viewSeq: curView(), approvals: state.approvals});
       if (state.snap && window.DashCache) window.DashCache.snap[ws] = state.snap;
       renderTabs();
@@ -532,6 +544,18 @@
      refresh runs at the edge, so the latest change always lands. */
   var snapLastMs = 0, snapCoolUntil = 0, snapTrailTimer = null, lastTickView = null, snapStartT = 0;
   function snapMinInterval() { return Math.max(2000, 3 * (snapLastMs || 0)); }
+  /* A plan change (a task moving todo -> wip -> pr -> done in the bundle)
+     rewrites the plan, not the run store, so view_seq never moves and no
+     tick would ever refetch it. On a workstream Execution tab the tick
+     therefore refreshes on a clock too: at most one quiet refresh every
+     PLAN_EVERY_MS, one in flight at a time, never while hidden. */
+  var PLAN_EVERY_MS = 5000, planLastAt = 0;
+  function planDue(now) { return !planLastAt || (now - planLastAt) >= PLAN_EVERY_MS; }
+  function execPlanDue() {
+    if (FIX || state.view !== "exec" || state.ws === "all") return false;
+    if (tabHidden() || refreshBusy() || window.__adReplayOn) return false;
+    return planDue(Date.now());
+  }
   function wantQuietRefresh() {
     if (snapInflight || refreshBusy()) return;
     var wait = snapCoolUntil - Date.now();
@@ -560,6 +584,7 @@
         if (state.lastSeqChange === 0) state.lastSeqChange = nowS;
         lastTickView = tickView(d);
         if (lastTickView !== curView()) { state.lastSeqChange = nowS; wantQuietRefresh(); }
+        else if (execPlanDue()) wantQuietRefresh();
         else updateStale(nowS);
       } catch (e) {}
       setLive(true);
@@ -574,7 +599,13 @@
      the full refresh already running, carries a newer seq. */
   var snapInflight = false;
   /* Stream ticks refresh through the same one-response path: the snapshot
-     carries the usage buckets, and totals plus buckets apply together. */
+     carries the usage buckets, and totals plus buckets apply together.
+     On a workstream tab the snapshot alone is not the whole page: task
+     status and plan progress live in /api/plan, the run list and activity
+     strips in /api/runs and /api/concurrency, and the approvals roll-up in
+     /api/approvals. They ride the same quiet turn (cheap, server-cached)
+     and the combined signature decides whether the page redraws, so an
+     unchanged set costs fetches only and the page never flickers. */
   function refreshSnapshot() {
     if (window.__adReplayOn) return;
     if (tabHidden()) return;
@@ -582,23 +613,46 @@
     snapInflight = true;
     snapBegan();
     var ws = state.ws, key = reqKey();
-    api("/api/snapshot", {ws: ws, since: since(), usage_group: groupFor()}).then(function (j) {
+    var reqSince = since();
+    var live = ws !== "all";
+    var wsArg = live ? {ws: ws} : {};
+    if (live) planLastAt = Date.now();
+    Promise.all([
+      api("/api/snapshot", {ws: ws, since: reqSince, usage_group: groupFor()}),
+      live ? api("/api/runs", Object.assign({since: reqSince, limit: 5000}, wsArg)).then(function (j) { return j.runs || []; }).catch(function () { return null; }) : Promise.resolve(null),
+      live ? api("/api/concurrency", Object.assign({since: reqSince, step: 60}, wsArg)).then(function (j) { return j.points || []; }).catch(function () { return null; }) : Promise.resolve(null),
+      live ? api("/api/plan", {ws: ws}).then(function (j) { return j && j.groups ? j : null; }).catch(function () { return null; }) : Promise.resolve(null),
+      live ? api("/api/approvals", {ws: ws}).then(approvalList).catch(function () { return null; }) : Promise.resolve(null)
+    ]).then(function (parts) {
       snapInflight = false;
       snapFinished();
       if (!ADC.applies(key, state)) return;
+      var j = parts[0];
       clearSnapError();
-      var sig = snapSig(j);
-      if (sig !== null && sig === state.snapSig) {
+      /* A failed plan/approvals/runs fetch keeps the last known payload
+         instead of blanking the section it feeds. */
+      if (live) {
+        if (parts[1]) state.runs = parts[1];
+        if (parts[2]) state.conc = parts[2];
+        if (parts[3]) state.plan = parts[3];
+        if (parts[4]) state.approvals = parts[4];
+      }
+      var sig = execSig(key, j, state.plan, state.runs, state.conc, state.approvals);
+      if (sig !== null && sig === state.execSig) {
         takeSeq(j);
         updateStale();
         return;
       }
-      state.snapSig = sig;
+      state.execSig = sig;
+      state.snapSig = snapSig(j);
       takeSeq(j);
       state.snap = j;
       state.usage = Array.isArray(j.usage) ? j.usage : [];
       var hit = execCache[key];
-      if (hit) { hit.snap = j; hit.usage = state.usage; }
+      if (hit) {
+        hit.snap = j; hit.usage = state.usage;
+        if (live) { hit.runs = state.runs; hit.conc = state.conc; hit.plan = state.plan; hit.approvals = state.approvals; }
+      }
       if (window.DashCache) window.DashCache.snap[ws] = j;
       if (state.view === "exec") drawMain();
       updateStale();
@@ -634,6 +688,9 @@
   AdPage.takeSeq = takeSeq;
   AdPage.snapMinInterval = snapMinInterval;
   AdPage.wantQuietRefresh = wantQuietRefresh;
+  AdPage.execSig = execSig;
+  AdPage.execPlanDue = execPlanDue;
+  AdPage.PLAN_EVERY_MS = PLAN_EVERY_MS;
   global.FIXMAP = FIXMAP;
   global.tabHidden = tabHidden;
   global.snapSig = snapSig;
@@ -663,4 +720,6 @@
   global.takeSeq = takeSeq;
   global.snapMinInterval = snapMinInterval;
   global.wantQuietRefresh = wantQuietRefresh;
+  global.execSig = execSig;
+  global.execPlanDue = execPlanDue;
 })(window);
