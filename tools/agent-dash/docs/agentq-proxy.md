@@ -17,7 +17,10 @@ the proxy and never reach the client.
 Windows are rolling 60 s. A request's cost is estimated before it is sent:
 prompt tokens are body characters / 4, output is the mean of the model's recent
 completions capped at `max_tokens`, and the Kimi uncached estimate counts only
-the text beyond the longest prefix the same job sent last time. Real usage from
+the text beyond the longest prefix any recent request shared with it (Morph's
+prompt cache is shared, so the match is across jobs). Requests with no job id or
+the literal `none` are anonymous: they share the store under a digest of their
+first blocks, and only Kimi requests touch it. Real usage from
 the response replaces the estimate.
 
 ## Admission and lanes
@@ -29,7 +32,10 @@ the response replaces the estimate.
   `X-Agentq-Job` header. The lookup is read-only and cached for 2 s. A missing
   database, table or row means `normal`.
 - Urgent may hold at most 50 % of a budget while normal or backlog work waits.
-  Backlog runs only when no urgent or normal work is queued. A normal ticket
+  Blocking is per budget: a ticket that does not fit closes its budget for the
+  rest of the pass, and later tickets on that budget wait in order, while tickets
+  on other budgets still run. Backlog runs only on budgets that no waiting urgent
+  or normal ticket is blocked on. A normal ticket
   queued longer than `aging_s` (15 min) moves to urgent.
 
 ## Learning the edge
@@ -130,8 +136,8 @@ error, a client that left, a timeout, a truncated stream).
   requests finish for up to `drain_s` (20 s), cancels what remains, and exits.
 - The learned state is written by the maintenance loop (about every 0.2 s when
   it changed), off the request path, not on every 429.
-- Prefix memory: each job keeps 8-byte digests of 1024-character blocks, not its
-  prompt. The uncached estimate is accurate to one block (about 256 tokens).
+- Prefix memory: each job (or anonymous session) keeps 8-byte digests of
+  1024-character blocks, not its prompt. The uncached estimate is accurate to one block (about 256 tokens).
 - Large request bodies (over 256 KiB) are parsed in a worker thread.
 
 ## Missing key
