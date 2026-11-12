@@ -17,8 +17,8 @@ Each command ends with one `ANSWER:` line. Exit codes: 0 ok, 1 negative fact
 
 ```
 agentq submit PROMPT_FILE [--kind read|write|review] [--urgent|--backlog]
-              [--workspace PATH] [--tier T] [--label L] [--res light|tests|ssh]
-              [--max-runtime SECONDS]
+              [--workspace PATH] [--in-place] [--tier T] [--label L]
+              [--res light|tests|ssh] [--max-runtime SECONDS]
 agentq wait [ID ...|--mine] [--timeout S]        # default 1800 s
 agentq escalate [ID|--mine]                      # no argument: this session's open jobs
 agentq ls [--mine|--all] [--json]
@@ -75,7 +75,29 @@ Typical use from a harness: `agentq submit prompt.md --kind review`, then
 - A held job records why it waits in `jobs.detail` (for example
   `hold tests: memory free 31% < 35%`). `logs/broker.log` gets one line each time
   that reason changes.
-- One write job per workspace at a time; a second waits.
+- Auto worktrees: a `write` job whose workspace is the main checkout of a git
+  repo (with an `origin` remote) gets its own worktree when it launches, not when
+  it is submitted. The worktree is `<root>/<repo>/agentq-<job id>` on a new branch
+  `agentq/<job id>` from `origin/main` (fetched first; if the fetch fails, the
+  local `origin/main` ref is used and the log says so). The job's `workspace`
+  becomes that path and `orig_workspace` keeps the checkout. The worker's prompt
+  starts with one line that names the worktree and says not to edit the checkout.
+  `ls` and `result` show the worktree, and the finish log line carries its path
+  and branch. Worktrees are not removed automatically: the lead merges or discards
+  each branch and removes the worktree.
+- Opt out per job with `--in-place`; a workspace that is a linked worktree, a
+  folder that is not a git repo, or a repo with no `origin` remote is used as
+  given. `broker.json` `"auto_worktree": {"enabled": false}` turns the step off, and
+  `"root"` moves the worktree folder (default `~/Documents/worktrees`). Only the
+  main checkout's own folder is used: a subfolder of a checkout is not a main
+  checkout and runs in place.
+- A failed worktree creation (git error, no `origin/main`, path taken) leaves the
+  job queued with `detail` `auto-worktree failed: <error>` and retries it 60 s
+  later. The third failure fails the job with `auto-worktree failed after 3 tries`.
+  It never falls back to writing in the checkout.
+- One write job per workspace at a time; a second waits. Auto worktrees have a
+  unique path, so they run in parallel with each other and with in-place jobs on
+  the checkout, which still wait for one another.
 - A pool or tier cap that is full (run_worker reports `reason=none-available`) is
   a wait, not a failure: the job stays queued, no attempt is counted, and it
   retries 20 s later. One `capacity-wait` event is logged per refusal streak.
@@ -126,7 +148,7 @@ Under `$AGENTQ_HOME` (default `~/.local/state/agentq`):
 | Path | What it is |
 |---|---|
 | `agentq.db` | SQLite store: `jobs`, `events`. `proxy_minutes` belongs to the proxy |
-| `broker.json` | optional slot and tier ceilings, and the `adaptive` admission settings (see above) |
+| `broker.json` | optional slot and tier ceilings, the `adaptive` admission settings and the `auto_worktree` settings (see above) |
 | `broker.pid` | the daemon's flock'd pidfile |
 | `jobs/<id>/prompt.md` | the submitted prompt |
 | `jobs/<id>/runs/<n>/` | the run folder of each launch (run_worker's files live here) |

@@ -972,5 +972,220 @@ class AdaptiveAdmissionTests(ProcessCleanup):
         self.assertEqual(log_path.read_text().count("hold pi-deepseek-flash"), 2)
 
 
+
+def git(cwd, *args):
+    """Run git in ``cwd`` with a throwaway identity; fail the test on a non-zero exit."""
+    return subprocess.run(
+        ["git", "-c", "user.name=agentq-test", "-c", "user.email=agentq-test@example.invalid", *args],
+        cwd=str(cwd), capture_output=True, text=True, check=True,
+    ).stdout.strip()
+
+
+def write_auto_config(home, **auto):
+    import json
+
+    home = Path(home)
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "broker.json").write_text(json.dumps({"auto_worktree": auto}), encoding="utf-8")
+
+
+class AutoWorktreeTests(ProcessCleanup):
+    """Write jobs on a main checkout get their own worktree at launch (a real temp git repo)."""
+
+    def setUp(self):
+        super().setUp()
+        self.root = self.tmp / "worktrees"
+        self.main = self.make_repo()
+        write_auto_config(self.home, root=str(self.root))
+
+    def make_repo(self):
+        origin = self.tmp / "origin.git"
+        seed = self.tmp / "seed"
+        main = self.tmp / "workflow-skills"
+        git(self.tmp, "init", "-q", "--bare", "-b", "main", str(origin))
+        git(self.tmp, "init", "-q", "-b", "main", str(seed))
+        (seed / "README.md").write_text("seed\n", encoding="utf-8")
+        git(seed, "add", "README.md")
+        git(seed, "commit", "-q", "-m", "seed")
+        git(seed, "remote", "add", "origin", str(origin))
+        git(seed, "push", "-q", "origin", "main")
+        git(self.tmp, "clone", "-q", str(origin), str(main))
+        return main
+
+    def submit_write(self, workspace=None, *extra, label=None):
+        args = ["--kind", "write", *extra]
+        if workspace is not None:
+            args += ["--workspace", str(workspace)]
+        return submit(self.env, self.prompt, *args, label=label)
+
+    def expected_path(self, job_id):
+        return self.root / "workflow-skills" / f"agentq-{job_id}"
+
+    def test_write_on_main_checkout_gets_a_worktree_and_launches(self):
+        job_id = self.submit_write(self.main, label="w-main")
+        launcher = self.fake(live_s=30)
+        launched = make_broker(self.home, launcher).tick()
+        self.assertEqual(launched, [job_id])
+        job = row(self.home, job_id)
+        path = self.expected_path(job_id)
+        self.assertEqual(job["workspace"], str(path))
+        self.assertEqual(job["orig_workspace"], str(self.main))
+        self.assertEqual(git(path, "rev-parse", "--abbrev-ref", "HEAD"), f"agentq/{job_id}")
+        self.assertEqual(git(self.main, "status", "--porcelain"), "")
+        self.assertIn(f"auto-worktree {job_id} {path}", (self.home / "logs" / "broker.log").read_text())
+        self.assertEqual(launcher.calls[0]["id"], job_id)
+
+    def test_two_write_jobs_on_the_main_checkout_launch_in_parallel(self):
+        first = self.submit_write(self.main, label="w1")
+        second = self.submit_write(self.main, label="w2")
+        launched = make_broker(self.home, self.fake(live_s=30)).tick()
+        self.assertEqual(launched, [first, second])
+        self.assertNotEqual(row(self.home, first)["workspace"], row(self.home, second)["workspace"])
+
+    def test_auto_worktree_is_not_blocked_by_an_in_place_write_on_the_checkout(self):
+        in_place = self.submit_write(self.main, "--in-place", label="ip")
+        auto = self.submit_write(self.main, label="auto")
+        second_in_place = self.submit_write(self.main, "--in-place", label="ip2")
+        launched = make_broker(self.home, self.fake(live_s=30)).tick()
+        self.assertEqual(launched, [in_place, auto])
+        self.assertEqual(row(self.home, second_in_place)["state"], "queued")
+        self.assertEqual(row(self.home, second_in_place)["detail"], "hold light: workspace busy")
+
+    def test_linked_worktree_workspace_is_untouched(self):
+        linked = self.tmp / "linked"
+        git(self.main, "worktree", "add", "-q", "-b", "feat-linked", str(linked), "origin/main")
+        job_id = self.submit_write(linked, label="linked")
+        self.assertEqual(make_broker(self.home, self.fake(live_s=30)).tick(), [job_id])
+        job = row(self.home, job_id)
+        self.assertEqual(job["workspace"], str(linked))
+        self.assertIsNone(job["orig_workspace"])
+
+    def test_non_git_workspace_is_untouched(self):
+        folder = self.tmp / "hub-state"
+        folder.mkdir()
+        job_id = self.submit_write(folder, label="plain")
+        self.assertEqual(make_broker(self.home, self.fake(live_s=30)).tick(), [job_id])
+        job = row(self.home, job_id)
+        self.assertEqual(job["workspace"], str(folder))
+        self.assertIsNone(job["orig_workspace"])
+
+    def test_in_place_flag_keeps_the_checkout(self):
+        job_id = self.submit_write(self.main, "--in-place", label="ip")
+        self.assertEqual(make_broker(self.home, self.fake(live_s=30)).tick(), [job_id])
+        job = row(self.home, job_id)
+        self.assertEqual(job["workspace"], str(self.main))
+        self.assertIsNone(job["orig_workspace"])
+        self.assertEqual(job["in_place"], 1)
+
+    def test_read_jobs_on_the_checkout_are_untouched(self):
+        job_id = submit(self.env, self.prompt, "--workspace", str(self.main), label="read")
+        self.assertEqual(make_broker(self.home, self.fake(live_s=30)).tick(), [job_id])
+        self.assertIsNone(row(self.home, job_id)["orig_workspace"])
+
+    def test_disabled_config_keeps_the_checkout(self):
+        write_auto_config(self.home, enabled=False, root=str(self.root))
+        job_id = self.submit_write(self.main, label="off")
+        self.assertEqual(make_broker(self.home, self.fake(live_s=30)).tick(), [job_id])
+        job = row(self.home, job_id)
+        self.assertEqual(job["workspace"], str(self.main))
+        self.assertIsNone(job["orig_workspace"])
+
+    def test_worktree_creation_failure_retries_then_fails_without_writing_in_place(self):
+        blocker = self.tmp / "blocker"
+        blocker.write_text("a file, not a folder\n", encoding="utf-8")
+        write_auto_config(self.home, root=str(blocker))
+        job_id = self.submit_write(self.main, label="fails")
+        launcher = self.fake(live_s=30)
+        clock = Clock(1000.0)
+        broker = make_broker(self.home, launcher, clock=clock)
+
+        self.assertEqual(broker.tick(), [])
+        job = row(self.home, job_id)
+        self.assertEqual(job["state"], "queued")
+        self.assertTrue(job["detail"].startswith("auto-worktree failed: "), job["detail"])
+        self.assertEqual(job["not_before"], 1060.0)
+        self.assertEqual(job["workspace"], str(self.main))
+
+        clock.t = 1061.0
+        self.assertEqual(broker.tick(), [])
+        self.assertEqual(row(self.home, job_id)["state"], "queued")
+
+        clock.t = 1122.0
+        self.assertEqual(broker.tick(), [])
+        job = row(self.home, job_id)
+        self.assertEqual(job["state"], "failed")
+        self.assertTrue(job["detail"].startswith("auto-worktree failed after 3 tries: "), job["detail"])
+        self.assertEqual(launcher.calls, [])
+
+    def test_a_retry_after_the_fault_clears_launches_in_a_worktree(self):
+        blocker = self.tmp / "blocker"
+        blocker.write_text("x\n", encoding="utf-8")
+        write_auto_config(self.home, root=str(blocker))
+        job_id = self.submit_write(self.main, label="later")
+        clock = Clock(1000.0)
+        broker = make_broker(self.home, self.fake(live_s=30), clock=clock)
+        self.assertEqual(broker.tick(), [])
+        write_auto_config(self.home, root=str(self.root))
+        clock.t = 1061.0
+        self.assertEqual(broker.tick(), [job_id])
+        job = row(self.home, job_id)
+        self.assertEqual(job["workspace"], str(self.expected_path(job_id)))
+        self.assertIsNone(job["detail"])
+
+    def test_worker_prompt_copy_starts_with_the_worktree_line(self):
+        job_id = self.submit_write(self.main, label="prompted")
+        seen = {}
+        worker = self.fake(live_s=30)
+
+        def recording(job, run_dir, env):
+            seen["prompt"] = Path(job["prompt_path"]).read_text(encoding="utf-8")
+            seen["path"] = job["prompt_path"]
+            return worker(job, run_dir, env)
+
+        make_broker(self.home, recording).tick()
+        path = self.expected_path(job_id)
+        expected_line = (
+            f"You are working in a fresh worktree {path} on branch agentq/{job_id}, created from "
+            f"origin/main for this job. Commit your work on this branch; do not edit {self.main}."
+        )
+        self.assertEqual(seen["prompt"], expected_line + "\n\nDo the thing.\n")
+        self.assertNotEqual(seen["path"], row(self.home, job_id)["prompt_path"])
+        self.assertEqual(Path(row(self.home, job_id)["prompt_path"]).read_text(encoding="utf-8"), "Do the thing.\n")
+
+    def test_finish_log_and_result_show_the_worktree_and_branch(self):
+        job_id = self.submit_write(self.main, label="done")
+        broker = make_broker(self.home, self.fake(live_s=0))
+        broker.tick()
+        broker.tick()
+        job = row(self.home, job_id)
+        self.assertEqual(job["state"], "done")
+        note = f"worktree {job['workspace']} branch agentq/{job_id}"
+        self.assertIn(f"{job_id} finish verdict PASS; {note}", (self.home / "logs" / "broker.log").read_text())
+        code, out = run_cli(self.env, ["result", job_id])
+        self.assertEqual(code, 0)
+        self.assertIn(f"{note} (from {self.main})", out)
+        code, out = run_cli(self.env, ["ls", "--mine"])
+        self.assertIn(f"worktree {job['workspace']}", out)
+
+    def test_submit_records_in_place_as_zero_by_default(self):
+        job_id = self.submit_write(self.main, label="default")
+        self.assertEqual(row(self.home, job_id)["in_place"], 0)
+
+
+class SchemaUpgradeTests(ProcessCleanup):
+    def test_a_version_one_store_gains_the_worktree_columns(self):
+        conn = db.connect(self.home)
+        conn.execute("ALTER TABLE jobs DROP COLUMN orig_workspace")
+        conn.execute("ALTER TABLE jobs DROP COLUMN in_place")
+        conn.execute("PRAGMA user_version = 1")
+        conn.close()
+        conn = db.connect(self.home)
+        columns = {r[1] for r in conn.execute("PRAGMA table_info(jobs)")}
+        self.assertIn("orig_workspace", columns)
+        self.assertIn("in_place", columns)
+        self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], db.SCHEMA_VERSION)
+        conn.close()
+
+
 if __name__ == "__main__":
     unittest.main()
