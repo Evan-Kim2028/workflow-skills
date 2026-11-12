@@ -49,8 +49,10 @@ A source that fails shows as null or empty in the JSON and is named under
   counts in full on the day it last ran.
 
 - Billed % is minute usage over the Morph limit: total pool 10M tokens,
-  DeepSeek output 70k, Kimi uncached 24,290. Values above 100% are the
-  proxy overshooting a limit within a minute; the y-axis grows to fit them.
+  DeepSeek uncached input 400k, Kimi uncached 24,290. The main capacity chart
+  plots only the enforced limits (total pool and DeepSeek uncached input).
+  Values above 100% are the proxy overshooting a limit within a minute; the
+  y-axis grows to fit them.
 - A queue worker is a launch_pi process whose environment has
   `AGENTQ_JOB=<12 hex>`. Every other launch_pi process counts as direct.
 
@@ -59,4 +61,4 @@ A source that fails shows as null or empty in the JSON and is named under
 - 24 h aggregates to 5-minute buckets and 7 d to 30-minute buckets: counts are summed, the p95 wait is the worst minute, the % of limit is the mean over the bucket's minutes, and worker samples are averaged.
 - The token chart stacks cache read, uncached input and output per interval, with the running total as a line on the right axis.
 - The total pool % uses tokens admitted in each UTC minute (`proxy_calib.billed`) where that row exists, and falls back to completion-minute totals from `proxy_minutes` otherwise.
-- DeepSeek output is measured against the stated 70k per minute. Morph has not enforced that per-minute output limit, so values above 100% are marked as such rather than as rejections. Kimi uncached is an estimate computed by the proxy, not Morph's own tally.
+- DeepSeek output is a plain count per minute (activity row). Its stated 70k per minute is not enforced by Morph, so it is not charted as a % of limit. Kimi uncached is an estimate computed by the proxy, not Morph's own tally.
