@@ -633,7 +633,7 @@ class Governor:
                     self._admit(head, now)
                     continue
                 blocker, guard_only = found
-                blocker.saturated = True
+                blocker.saturated = blocker.saturated or not guard_only
                 (urgent_guarded if guard_only else blocked).add(blocker.name)
                 index += 1
 
