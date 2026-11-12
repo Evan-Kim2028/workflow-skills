@@ -17,11 +17,14 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from agentq.proxy import (
+    BLOCK_CHARS,
     DEFAULT_CONFIG,
     EX_CONFIG,
     Client,
+    Entry,
     Governor,
     Proxy,
+    body_snippet,
     load_key,
     main,
     merge_config,
@@ -30,6 +33,7 @@ from agentq.proxy import (
     prepare_body,
     prepare_body_async,
     read_request,
+    tokens_for_chars,
 )
 
 KEY = "SECRET-KEY-123"
@@ -274,6 +278,18 @@ class PassthroughTest(ProxyCase):
         self.assertEqual(len(self.fake.requests), 2)
         self.assertIn("retry", self.events())
 
+    async def test_429_body_is_logged_as_one_truncated_line(self) -> None:
+        self.fake.script = [{"status": 429, "body": 'Limit: 70000 output tokens/minute.\n"quoted" ' + "x" * 500}]
+        await self.post(self.chat(MODEL_OUT), job="job-429")
+        logged = [fields for event, fields in self.logs if event == "upstream_429"]
+        self.assertEqual(len(logged), 1)
+        self.assertEqual(logged[0]["job"], "job-429")
+        self.assertEqual(logged[0]["attempt"], 1)
+        self.assertTrue(logged[0]["body"].startswith("Limit: 70000 output tokens/minute. "))
+        self.assertLessEqual(len(logged[0]["body"]), 300)
+        self.assertNotIn("\n", logged[0]["body"])
+        self.assertNotIn('"', logged[0]["body"])
+
 
 class LearningTest(ProxyCase):
     async def test_target_shrinks_and_stated_limit_is_adopted(self) -> None:
@@ -503,6 +519,98 @@ class BackoffTest(unittest.TestCase):
         self.assertEqual(list(gov.queues["normal"]), [backing_off])
 
 
+class PerBudgetQueueTest(unittest.TestCase):
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.gov = Governor(Path(tmp.name), config_with(), log=quiet)
+
+    def occupy(self, budget: str, amount: int, lane: str = "normal") -> None:
+        self.gov.budgets[budget].entries.append(Entry(at=self.gov.clock(), amount=amount, lane=lane))
+
+    def queue(self, *tickets) -> None:
+        for ticket in tickets:
+            self.gov.enqueue(ticket)
+
+    def test_blocked_kimi_does_not_stop_deepseek_behind_it(self) -> None:
+        self.occupy("uncached", 23_000)
+        kimi = make_ticket(self.gov, job="kimi-a", model=MODEL_KIMI, text="A" * 4096)
+        deepseek = make_ticket(self.gov, job="ds-a", model=MODEL_OUT, text="x", max_tokens=8)
+        self.queue(kimi, deepseek)
+        self.gov.pump()
+        self.assertTrue(deepseek.holds)
+        self.assertFalse(kimi.holds)
+        self.assertEqual(list(self.gov.queues["normal"]), [kimi])
+        self.assertTrue(self.gov.budgets["uncached"].saturated)
+
+    def test_urgent_guard_block_does_not_hold_normal_on_the_same_budget(self) -> None:
+        self.gov.budgets["output"].limit = 1000
+        self.gov.budgets["output"].target = 1.0
+        self.occupy("output", 500, lane="urgent")
+        urgent = make_ticket(self.gov, job="urgent-next", model=MODEL_OUT, text="x", max_tokens=100, lane="urgent")
+        normal = make_ticket(self.gov, job="normal-x", model=MODEL_OUT, text="x", max_tokens=100)
+        self.queue(urgent, normal)
+        self.gov.pump()
+        self.assertFalse(urgent.holds)
+        self.assertTrue(normal.holds)
+        self.assertEqual(list(self.gov.queues["urgent"]), [urgent])
+
+    def test_second_kimi_waits_behind_blocked_kimi_even_if_it_fits(self) -> None:
+        self.occupy("uncached", 23_000)
+        big = make_ticket(self.gov, job="kimi-big", model=MODEL_KIMI, text="A" * 4096)
+        small = make_ticket(self.gov, job="kimi-small", model=MODEL_KIMI, text="x" * 40)
+        self.queue(big, small)
+        self.gov.pump()
+        self.assertFalse(small.holds)
+        self.assertEqual(list(self.gov.queues["normal"]), [big, small])
+
+    def test_urgent_blocked_on_total_keeps_normal_needing_total_queued(self) -> None:
+        self.occupy("total", 9_499_950)
+        urgent = make_ticket(self.gov, job="urgent-ds", model=MODEL_OUT, text="x" * 400, max_tokens=8, lane="urgent")
+        normal = make_ticket(self.gov, job="normal-ds", model=MODEL_OUT, text="x" * 400, max_tokens=8)
+        self.queue(urgent)
+        self.queue(normal)
+        self.gov.pump()
+        self.assertFalse(urgent.holds)
+        self.assertFalse(normal.holds)
+        self.assertEqual(list(self.gov.queues["urgent"]), [urgent])
+        self.assertEqual(list(self.gov.queues["normal"]), [normal])
+
+    def test_backlog_runs_when_waiting_normal_is_blocked_on_another_budget(self) -> None:
+        self.occupy("uncached", 23_000)
+        waiting = make_ticket(self.gov, job="kimi-n", model=MODEL_KIMI, text="A" * 4096)
+        backlog = make_ticket(self.gov, job="ds-b", model=MODEL_OUT, text="x", max_tokens=8, lane="backlog")
+        self.queue(waiting)
+        self.queue(backlog)
+        self.gov.pump()
+        self.assertTrue(backlog.holds)
+        self.assertEqual(list(self.gov.queues["normal"]), [waiting])
+
+    def test_backlog_held_when_it_shares_the_blocked_budget(self) -> None:
+        self.occupy("uncached", 23_000)
+        waiting = make_ticket(self.gov, job="kimi-n", model=MODEL_KIMI, text="A" * 4096)
+        backlog = make_ticket(self.gov, job="kimi-b", model=MODEL_KIMI, text="x" * 40, lane="backlog")
+        self.queue(waiting)
+        self.queue(backlog)
+        self.gov.pump()
+        self.assertFalse(backlog.holds)
+        self.assertEqual(list(self.gov.queues["backlog"]), [backlog])
+
+    def test_backing_off_ticket_holds_its_budgets_against_backlog(self) -> None:
+        waiting = make_ticket(self.gov, job="ds-n", model=MODEL_OUT, text="x", max_tokens=8)
+        waiting.not_before = self.gov.clock() + 100.0
+        backlog = make_ticket(self.gov, job="ds-b", model=MODEL_OUT, text="x", max_tokens=8, lane="backlog")
+        self.queue(waiting)
+        self.queue(backlog)
+        self.gov.pump()
+        self.assertFalse(backlog.holds)
+        self.assertEqual(list(self.gov.queues["backlog"]), [backlog])
+
+    def test_body_snippet_is_one_line_and_capped(self) -> None:
+        self.assertEqual(body_snippet(b'ab\n"cd\'', limit=300), "ab  cd ")
+        self.assertEqual(len(body_snippet(b"x" * 500)), 300)
+
+
 class HygieneTest(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
@@ -608,8 +716,34 @@ class EstimateTest(unittest.TestCase):
         self.assertEqual(first.estimates["uncached"], 1024)
         second = make_ticket(self.gov, job="job-k", model=MODEL_KIMI, text="A" * 4096 + "B" * 400)
         self.assertEqual(second.estimates["uncached"], 100)
-        other = make_ticket(self.gov, job="job-other", model=MODEL_KIMI, text="A" * 4096 + "B" * 400)
-        self.assertEqual(other.estimates["uncached"], 1124)
+        other = make_ticket(self.gov, job="job-other", model=MODEL_KIMI, text="A" * 4096 + "C" * 400)
+        self.assertEqual(other.estimates["uncached"], 100)
+        identical = make_ticket(self.gov, job="job-other", model=MODEL_KIMI, text="A" * 4096 + "B" * 400)
+        self.assertEqual(identical.estimates["uncached"], 0)
+
+    def test_interleaved_anonymous_sessions_extend_their_own_entries(self) -> None:
+        system = "S" * (BLOCK_CHARS * 20)
+        estimates = []
+        for turn in (1, 2, 3):
+            for session in ("A", "B"):
+                text = system + session * (1000 * turn)
+                ticket = make_ticket(self.gov, job="none", model=MODEL_KIMI, text=text)
+                estimates.append((session, turn, ticket.estimates["uncached"]))
+        suffix = tokens_for_chars(1000)
+        self.assertEqual(estimates[0], ("A", 1, tokens_for_chars(len(system) + 1000)))
+        for session, turn, estimate in estimates[1:]:
+            self.assertEqual(estimate, suffix, (session, turn))
+        self.assertEqual(sum(key.startswith("anon:") for key in self.gov.prefixes), 2)
+
+    def test_deepseek_traffic_leaves_prefix_store_empty(self) -> None:
+        make_ticket(self.gov, job="job-ds", model=MODEL_OUT, text="D" * 4096)
+        make_ticket(self.gov, job="none", model=MODEL_OUT, text="D" * 4096)
+        self.assertEqual(len(self.gov.prefixes), 0)
+
+    def test_anonymous_jobs_never_read_the_lane_database(self) -> None:
+        make_db(self.gov.home, {"none": "urgent"})
+        self.assertEqual(self.gov.lane_for("none"), "normal")
+        self.assertEqual(self.gov.lane_for(""), "normal")
 
     def test_output_estimate_is_capped_by_max_tokens(self) -> None:
         ticket = make_ticket(self.gov, job="j", max_tokens=300)

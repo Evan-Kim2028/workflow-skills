@@ -49,7 +49,7 @@ DEFAULT_CONFIG = {
     "start_target": 0.95,
     "target_floor": 0.6,
     "target_cut": 0.97,
-    "target_step_up": 0.005,
+    "target_step_up": 0.02,
     "default_output_tokens": 800,
     "give_up_s": 240.0,
     "retry_floor_s": 1.0,
@@ -69,6 +69,7 @@ SATURATION_WAIT_S = 2.0
 LANE_CACHE_S = 2.0
 LANE_CACHE_MAX = 10_000
 PREFIX_STORE_JOBS = 64
+ANONYMOUS_JOBS = frozenset({"", "none"})
 BLOCK_CHARS = 1024
 LARGE_BODY = 256 * 1024
 MAINTAIN_S = 0.2
@@ -214,6 +215,32 @@ def prefix_blocks(text: str) -> tuple[bytes, ...]:
         hashlib.blake2b(text[start : start + BLOCK_CHARS].encode("utf-8", "replace"), digest_size=8).digest()
         for start in range(0, len(text), BLOCK_CHARS)
     )
+
+
+def is_anonymous(job: str) -> bool:
+    """A request with no job id, or the literal "none" that pi sends when agentq did not launch it."""
+    return job in ANONYMOUS_JOBS
+
+
+def body_snippet(raw: bytes, limit: int = 300) -> str:
+    """The first characters of an upstream error body, on one line with no quotes."""
+    text = raw.decode("utf-8", "replace")[:limit]
+    return text.translate(str.maketrans({"\n": " ", "\r": " ", '"': " ", "'": " "}))
+
+
+def anonymous_key(blocks: tuple[bytes, ...]) -> str:
+    """The prefix store key for an anonymous request: a digest of all its blocks."""
+    return "anon:" + hashlib.sha1(b"".join(blocks)).hexdigest()
+
+
+def _common_blocks(previous: tuple[bytes, ...], blocks: tuple[bytes, ...]) -> int:
+    """How many leading whole blocks two prompts share."""
+    common = 0
+    for old, new in zip(previous, blocks):
+        if old != new:
+            break
+        common += 1
+    return common
 
 
 def percentile(sorted_values: list[float], fraction: float) -> float:
@@ -459,7 +486,7 @@ class Governor:
         self.errors[kind] = self.errors.get(kind, 0) + 1
 
     def lane_for(self, job: str) -> str:
-        if not job:
+        if is_anonymous(job):
             return "normal"
         now = self.clock()
         cached = self.lane_cache.get(job)
@@ -480,28 +507,36 @@ class Governor:
         return max(estimate, 1)
 
     def uncached_estimate(self, job: str, length: int, blocks: tuple[bytes, ...]) -> int:
-        """Tokens beyond the longest prefix this job sent last time, at block granularity.
+        """Tokens beyond the longest prefix any stored entry shares with this request.
 
-        Blocks are compared whole, so the shared prefix can be short by up to one block
-        (BLOCK_CHARS, about 256 tokens). An unknown job counts the whole prompt.
+        Morph's prompt cache is shared across requests, so every stored entry is a candidate, not
+        only this job's. Blocks are compared whole, so a partial most-recent block is not matched
+        and the shared prefix can be short by up to one block (BLOCK_CHARS, about 256 tokens).
+
+        An entry that this request extends (the same full blocks, and a longer prompt) is the same
+        conversation grown, so it is replaced when the request is anonymous and its shared length is
+        taken as the whole stored length, which can overcount by one block. Among candidates, an
+        extension beats a plain shared prefix, and ties go to the least recently stored entry.
+        Named jobs are keyed by job id. Anonymous requests are keyed by a digest of all their blocks
+        and so do not collide across sessions. An empty store counts the whole prompt.
         """
-        if not job:
-            return tokens_for_chars(length)
-        previous = self.prefixes.get(job)
-        shared = 0
-        if previous is not None:
-            previous_length, previous_blocks = previous
-            common = 0
-            for old, new in zip(previous_blocks, blocks):
-                if old != new:
-                    break
-                common += 1
-            shared = min(common * BLOCK_CHARS, previous_length, length)
-        self.prefixes[job] = (length, blocks)
-        self.prefixes.move_to_end(job)
+        best_key: str | None = None
+        best = (False, 0)
+        for key, (previous_length, previous_blocks) in self.prefixes.items():
+            common = _common_blocks(previous_blocks, blocks)
+            extends = length > previous_length and common >= previous_length // BLOCK_CHARS
+            shared = previous_length if extends else min(common * BLOCK_CHARS, previous_length, length)
+            if (extends, shared) > best:
+                best_key, best = key, (extends, shared)
+        anonymous = is_anonymous(job)
+        if anonymous and best[0] and best_key is not None:
+            del self.prefixes[best_key]
+        key = anonymous_key(blocks) if anonymous else job
+        self.prefixes[key] = (length, blocks)
+        self.prefixes.move_to_end(key)
         while len(self.prefixes) > PREFIX_STORE_JOBS:
             self.prefixes.popitem(last=False)
-        return tokens_for_chars(length - shared)
+        return tokens_for_chars(length - best[1])
 
     def make_ticket(
         self,
@@ -516,7 +551,10 @@ class Governor:
     ) -> Ticket:
         prompt = tokens_for_chars(length)
         output = self.output_estimate(model, max_tokens)
-        uncached = self.uncached_estimate(job, length, blocks)
+        uncached_budget = self.budgets.get("uncached")
+        uncached = 0
+        if uncached_budget is not None and uncached_budget.applies(model):
+            uncached = self.uncached_estimate(job, length, blocks)
         estimates = {
             b.name: estimate_for(b.name, prompt, output, uncached)
             for b in self.budgets.values()
@@ -560,48 +598,63 @@ class Governor:
     def pump(self) -> None:
         """Admit every queued ticket that fits, urgent first, FIFO within a lane.
 
-        A ticket backing off after a 429 is skipped, so it does not hold up the tickets behind it.
-        A ticket that does not fit stops its lane, which keeps the order.
+        Blocking is per budget. A ticket that does not fit marks its blocking budget as blocked for
+        the rest of this call, and every later ticket that touches a blocked budget waits, so order
+        holds on each budget without stalling tickets that use other budgets. A ticket backing off
+        after a 429 blocks nothing, and while it waits its budgets stay closed to backlog.
+        Backlog runs only on budgets that no waiting urgent or normal ticket is blocked on.
+
+        A block caused only by the urgent share guard closes its budget for the rest of the urgent
+        lane. Normal and backlog tickets still use that budget, which is what the guard intends.
         """
         now = self.clock()
         self.promote_aged(now)
         for budget in self.budgets.values():
             budget.saturated = False
         lower_waiting = bool(self.queues["normal"] or self.queues["backlog"])
-        urgent_or_normal = bool(self.queues["urgent"] or self.queues["normal"])
+        blocked: set[str] = set()
+        urgent_guarded: set[str] = set()
         for lane in LANES:
-            if lane == "backlog" and urgent_or_normal:
-                break
+            if lane == "backlog":
+                for waiting in (*self.queues["urgent"], *self.queues["normal"]):
+                    if waiting.not_before > now:
+                        blocked.update(waiting.estimates)
             queue = self.queues[lane]
             index = 0
             while index < len(queue):
                 head = queue[index]
-                if head.not_before > now:
+                closed = blocked | urgent_guarded if lane == "urgent" else blocked
+                if head.not_before > now or not closed.isdisjoint(head.estimates):
                     index += 1
                     continue
-                blocker = self._blocker(head, now, lower_waiting)
-                if blocker is not None:
-                    blocker.saturated = True
-                    break
-                del queue[index]
-                self._admit(head, now)
+                found = self._blocker(head, now, lower_waiting)
+                if found is None:
+                    del queue[index]
+                    self._admit(head, now)
+                    continue
+                blocker, guard_only = found
+                blocker.saturated = blocker.saturated or not guard_only
+                (urgent_guarded if guard_only else blocked).add(blocker.name)
+                index += 1
 
-    def _blocker(self, ticket: Ticket, now: float, lower_waiting: bool) -> Budget | None:
-        """Return the first budget that cannot take this ticket now, or None when it fits everywhere.
+    def _blocker(self, ticket: Ticket, now: float, lower_waiting: bool) -> tuple[Budget, bool] | None:
+        """Return (budget, guard_only) for the first budget that refuses this ticket now, or None.
 
-        A budget with no charges in the window always admits one request, even an oversized one,
-        so a large request cannot wait forever.
+        guard_only is True when the budget has room and only the urgent share guard refuses: urgent
+        tickets may hold at most half of a budget while lower lanes wait. A budget with no charges
+        in the window always admits one request, even an oversized one, so a large request cannot
+        wait forever.
         """
         for name, estimate in ticket.estimates.items():
             budget = self.budgets[name]
             cap = budget.cap()
             used = budget.used(now, self.window)
             if used > 0 and used + estimate > cap:
-                return budget
+                return budget, False
             if ticket.lane == "urgent" and lower_waiting:
                 urgent_used = budget.used(now, self.window, lane="urgent")
                 if urgent_used > 0 and urgent_used + estimate > 0.5 * cap:
-                    return budget
+                    return budget, True
         return None
 
     def _admit(self, ticket: Ticket, now: float) -> None:
@@ -1277,6 +1330,13 @@ class Proxy:
                     raw = await read_all(upstream.reader, upstream.headers, MAX_429_BODY, idle_s)
                     upstream.close()
                     upstream = None
+                    gov.log(
+                        "upstream_429",
+                        job=ticket.job,
+                        model=ticket.model,
+                        attempt=ticket.attempts + 1,
+                        body=body_snippet(raw),
+                    )
                     gov.release(ticket)
                     gov.learn_from_429(ticket, raw.decode("utf-8", "replace"))
                     now = gov.clock()
