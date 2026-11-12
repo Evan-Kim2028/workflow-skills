@@ -237,7 +237,44 @@ def run_preflight(registry, requested: str, ctx) -> int | None:
     return 1
 
 
+class LaunchTiming:
+    """Seconds spent in each launch phase, for diagnosing a slow launch.
+
+    Written to ``<run-dir>/launch-timing.json`` only when ``AGENTQ_JOB`` is set
+    (a broker launch), so a slow phase shows up in the run folder next time.
+    """
+
+    def __init__(self, clock=time.monotonic):
+        self._clock = clock
+        self._last = clock()
+        self.phases: dict[str, float] = {}
+        self.run_dir: Path | None = None
+
+    def lap(self, phase: str) -> None:
+        now = self._clock()
+        self.phases[phase] = round(now - self._last, 3)
+        self._last = now
+
+    def write(self) -> None:
+        job = os.environ.get("AGENTQ_JOB")
+        if not job or self.run_dir is None or not self.run_dir.is_dir():
+            return
+        doc = {"job": job, "phases_s": self.phases, "total_s": round(sum(self.phases.values()), 3)}
+        try:
+            (self.run_dir / "launch-timing.json").write_text(json.dumps(doc, indent=2) + "\n", encoding="utf-8")
+        except OSError:
+            pass
+
+
 def run(argv, spawn=None, pgrep=None, sleep=None, now=None, alive=None, new_uuid=None) -> int:
+    timing = LaunchTiming()
+    try:
+        return _run(argv, timing, spawn, pgrep, sleep, now, alive, new_uuid)
+    finally:
+        timing.write()
+
+
+def _run(argv, timing, spawn=None, pgrep=None, sleep=None, now=None, alive=None, new_uuid=None) -> int:
     hooks = {
         "spawn": spawn or default_spawn,
         "pgrep": pgrep or pgrep_count,
@@ -284,6 +321,8 @@ def run(argv, spawn=None, pgrep=None, sleep=None, now=None, alive=None, new_uuid
     elif verdict.get("warning"):
         print(verdict["warning"], file=sys.stderr)
     run_path = Path(run_dir)
+    timing.run_dir = run_path
+    timing.lap("label")
     out = run_path / f"out-{label}.md"
     err = run_path / f"err-{label}.log"
     if not os.path.isdir(workspace) or not os.path.isfile(prompt_file):
@@ -315,7 +354,9 @@ def run(argv, spawn=None, pgrep=None, sleep=None, now=None, alive=None, new_uuid
         "minutes": _minutes(registry),
         "exclude": set(exclude),
         "admission": admission_config(registry),
+        "timing": timing,
     }
+    timing.lap("registry")
     if tier_path.is_file():
         stored = tier_path.read_text(encoding="utf-8").strip() or requested
         return observe(ctx, stored, set())
@@ -323,10 +364,12 @@ def run(argv, spawn=None, pgrep=None, sleep=None, now=None, alive=None, new_uuid
         blocked = run_preflight(registry, requested, ctx)
         if blocked is not None:
             return blocked
+    timing.lap("preflight")
     prepare_prompt(ctx, no_rules)
     if prompt_over_budget(ctx) is not None:
         emit("failed", out, err, requested, "prompt-budget")
         return 2
+    timing.lap("prompt")
     ctx["queued"] = direct_queue(registry, ctx["hooks"]["now"]())
     name, reason = pick_initial(ctx)
     if not name:
@@ -334,6 +377,7 @@ def run(argv, spawn=None, pgrep=None, sleep=None, now=None, alive=None, new_uuid
         emit("failed", out, err, requested, reason)
         return code
     lease = admit_run(ctx, name)
+    timing.lap("caps")
     if lease is not None and not lease.get("ok"):
         emit("failed", out, err, requested, lease.get("reason") or "capacity")
         return 0
@@ -666,8 +710,10 @@ def launch(ctx, name, tried) -> int:
         ctx["tier_path"].unlink(missing_ok=True)
         emit("failed", ctx["out"], ctx["err"], tier, "spawn")
         return 2
+    ctx["timing"].lap("spawn")
     ctx["pid_path"].write_text(str(int(pid)) + "\n", encoding="utf-8")
     write_meta(ctx, tier, worker, pid)
+    ctx["timing"].lap("pid-file")
     return observe(ctx, tier, tried)
 
 
