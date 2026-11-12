@@ -20,6 +20,7 @@ from agentq.proxy import (
     BLOCK_CHARS,
     DEFAULT_CONFIG,
     EX_CONFIG,
+    PREFIX_STORE_JOBS,
     PROXY_MINUTES_DDL,
     ROW_WAIT_SAMPLES,
     Client,
@@ -46,6 +47,11 @@ from agentq.proxy import (
 )
 
 KEY = "SECRET-KEY-123"
+USAGE_5000_PROMPT_1000_CACHED_100_OUT = {
+    "prompt_tokens": 5000,
+    "completion_tokens": 100,
+    "prompt_tokens_details": {"cached_tokens": 1000},
+}
 MODEL_OUT = "morph-dsv41flash-1017"
 MODEL_KIMI = "morph-kimik31"
 PLIST = Path(__file__).resolve().parents[1] / "agentq" / "launchd" / "com.agentq.proxy.plist"
@@ -274,6 +280,8 @@ class PassthroughTest(ProxyCase):
         body = json.loads(text)
         self.assertEqual(body["budgets"]["output"]["limit"], 70_000)
         self.assertEqual(body["budgets"]["uncached"]["limit"], 24_290)
+        self.assertEqual(body["budgets"]["uncached_ds"]["limit"], 400_000)
+        self.assertEqual(body["budgets"]["uncached_ds"]["limit_type"], "uncached")
         self.assertEqual(set(body["budgets"]["total"]["queued"]), {"urgent", "normal", "backlog"})
         self.assertEqual(body["errors"], {})
 
@@ -746,10 +754,22 @@ class EstimateTest(unittest.TestCase):
             self.assertEqual(estimate, suffix, (session, turn))
         self.assertEqual(sum(key.startswith("anon:") for key in self.gov.prefixes), 2)
 
-    def test_deepseek_traffic_leaves_prefix_store_empty(self) -> None:
-        make_ticket(self.gov, job="job-ds", model=MODEL_OUT, text="D" * 4096)
-        make_ticket(self.gov, job="none", model=MODEL_OUT, text="D" * 4096)
-        self.assertEqual(len(self.gov.prefixes), 0)
+    def test_deepseek_traffic_shares_the_prefix_store_and_gets_an_uncached_estimate(self) -> None:
+        first = make_ticket(self.gov, job="job-ds", model=MODEL_OUT, text="D" * 4096)
+        self.assertEqual(set(first.estimates), {"total", "output", "uncached_ds"})
+        self.assertEqual(first.estimates["uncached_ds"], 1024)
+        second = make_ticket(self.gov, job="job-ds", model=MODEL_OUT, text="D" * 4096 + "E" * 400)
+        self.assertEqual(second.estimates["uncached_ds"], 100)
+        self.assertEqual(set(self.gov.prefixes), {"job-ds"})
+
+    def test_prefix_store_holds_256_jobs_and_a_lookup_stays_cheap(self) -> None:
+        shared = "S" * (BLOCK_CHARS * 200)
+        started = time.perf_counter()
+        for index in range(PREFIX_STORE_JOBS + 44):
+            make_ticket(self.gov, job=f"job-{index}", model=MODEL_OUT, text=shared + str(index) * 300)
+        per_lookup = (time.perf_counter() - started) / (PREFIX_STORE_JOBS + 44)
+        self.assertEqual(len(self.gov.prefixes), PREFIX_STORE_JOBS)
+        self.assertLess(per_lookup, 0.02, f"{per_lookup * 1000:.2f} ms per lookup with 256 stored entries")
 
     def test_anonymous_jobs_never_read_the_lane_database(self) -> None:
         make_db(self.gov.home, {"none": "urgent"})
@@ -765,6 +785,125 @@ class EstimateTest(unittest.TestCase):
         self.assertEqual(parse_stated_limit("Limit: 70000 output tokens/minute."), ("output", 70_000))
         self.assertEqual(parse_stated_limit("Limit: 24290 uncached input tokens/minute."), ("uncached", 24_290))
         self.assertIsNone(parse_stated_limit('{"code":"service_overloaded"}'))
+
+
+class PerModelUncachedTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.home = Path(self.tmp.name) / "agentq"
+        self.events: list[tuple[str, dict]] = []
+        self.gov = Governor(self.home, config_with(), log=lambda event, **fields: self.events.append((event, fields)))
+
+    def admit(self, ticket) -> None:
+        self.gov.enqueue(ticket)
+        self.gov.pump()
+        self.assertTrue(ticket.holds)
+
+    def test_alternating_stated_limits_leave_each_model_budget_at_its_own_limit(self) -> None:
+        deepseek = make_ticket(self.gov, job="ds", model=MODEL_OUT, text="x", max_tokens=8)
+        kimi = make_ticket(self.gov, job="kimi", model=MODEL_KIMI, text="x", max_tokens=8)
+        for _ in range(3):
+            self.gov.learn_from_429(deepseek, "Limit: 400000 uncached input tokens/minute.")
+            self.gov.learn_from_429(kimi, "Limit: 24290 uncached input tokens/minute.")
+        self.assertEqual(self.gov.budgets["uncached_ds"].limit, 400_000)
+        self.assertEqual(self.gov.budgets["uncached"].limit, 24_290)
+        self.assertNotIn("limit_adopted", [event for event, _ in self.events])
+
+    def test_deepseek_body_never_rewrites_kimi_and_kimi_body_never_rewrites_deepseek(self) -> None:
+        deepseek = make_ticket(self.gov, job="ds", model=MODEL_OUT, text="x", max_tokens=8)
+        kimi = make_ticket(self.gov, job="kimi", model=MODEL_KIMI, text="x", max_tokens=8)
+        self.gov.learn_from_429(deepseek, "Limit: 380000 uncached input tokens/minute.")
+        self.assertEqual(self.gov.budgets["uncached"].limit, 24_290)
+        self.gov.learn_from_429(kimi, "Limit: 22000 uncached input tokens/minute.")
+        self.assertEqual(self.gov.budgets["uncached"].limit, 22_000)
+        self.assertEqual(self.gov.budgets["uncached_ds"].limit, 380_000)
+        adopted = [(fields["budget"], fields["new"]) for event, fields in self.events if event == "limit_adopted"]
+        self.assertEqual(adopted, [("uncached_ds", 380_000), ("uncached", 22_000)])
+
+    def test_stated_limit_type_with_no_budget_for_the_model_is_not_adopted(self) -> None:
+        kimi = make_ticket(self.gov, job="kimi", model=MODEL_KIMI, text="x", max_tokens=8)
+        self.gov.learn_from_429(kimi, "Limit: 60000 output tokens/minute.")
+        self.assertEqual(self.gov.budgets["output"].limit, 70_000)
+        self.assertLess(self.gov.budgets["uncached"].target, 0.98)
+        calib = [fields for event, fields in self.events if event == "calib"]
+        self.assertEqual(calib[0]["limit_type"], "output")
+        self.assertIsNone(calib[0]["budget"])
+
+    def test_deepseek_ticket_is_charged_to_its_uncached_budget_total_and_output(self) -> None:
+        ticket = make_ticket(self.gov, job="ds", model=MODEL_OUT, text="x" * 4096, max_tokens=8)
+        self.assertEqual(set(ticket.estimates), {"total", "output", "uncached_ds"})
+        self.admit(ticket)
+        self.gov.finish_ok(ticket, USAGE_5000_PROMPT_1000_CACHED_100_OUT)
+        now = self.gov.clock()
+        self.assertEqual(self.gov.budgets["uncached_ds"].used(now, self.gov.window), 4000)
+        self.assertEqual(self.gov.budgets["total"].used(now, self.gov.window), 5100)
+        self.assertEqual(self.gov.budgets["output"].used(now, self.gov.window), 100)
+        self.assertEqual(self.gov.budgets["uncached"].used(now, self.gov.window), 0)
+
+    def test_kimi_ticket_is_charged_to_its_uncached_budget_and_total_only(self) -> None:
+        ticket = make_ticket(self.gov, job="kimi", model=MODEL_KIMI, text="x" * 4096, max_tokens=8)
+        self.assertEqual(set(ticket.estimates), {"total", "uncached"})
+        self.admit(ticket)
+        self.gov.finish_ok(ticket, USAGE_5000_PROMPT_1000_CACHED_100_OUT)
+        now = self.gov.clock()
+        self.assertEqual(self.gov.budgets["uncached"].used(now, self.gov.window), 4000)
+        self.assertEqual(self.gov.budgets["total"].used(now, self.gov.window), 5100)
+        self.assertEqual(self.gov.budgets["uncached_ds"].used(now, self.gov.window), 0)
+
+    def test_429_names_the_budget_it_applied_to_in_the_calib_log(self) -> None:
+        deepseek = make_ticket(self.gov, job="ds", model=MODEL_OUT, text="x", max_tokens=8)
+        self.gov.learn_from_429(deepseek, "Limit: 400000 uncached input tokens/minute.")
+        calib = [fields for event, fields in self.events if event == "calib"]
+        self.assertEqual(calib[0]["budget"], "uncached_ds")
+        self.assertEqual(calib[0]["limit_type"], "uncached")
+
+    def test_status_lists_the_new_budget_with_its_limit_type(self) -> None:
+        budgets = self.gov.status()["budgets"]
+        self.assertEqual(budgets["uncached_ds"]["limit"], 400_000)
+        self.assertEqual(budgets["uncached_ds"]["limit_type"], "uncached")
+        self.assertEqual(budgets["uncached"]["limit_type"], "uncached")
+        self.assertEqual(budgets["total"]["limit_type"], "total")
+
+    def test_new_budget_follows_the_global_window_default_and_per_budget_overrides_apply(self) -> None:
+        global_calendar = Governor(self.home, config_with(window_mode="calendar"), log=quiet)
+        self.assertEqual(global_calendar.budgets["uncached_ds"].window_mode, "calendar")
+        owner = Governor(self.home, config_with(budgets={"total": {"window_mode": "calendar"}}), log=quiet)
+        self.assertEqual(owner.budgets["total"].window_mode, "calendar")
+        self.assertEqual(owner.budgets["total"].limit, 10_000_000)
+        self.assertEqual(owner.budgets["uncached_ds"].window_mode, "rolling")
+        self.assertEqual(owner.budgets["uncached_ds"].limit, 400_000)
+
+    def test_unknown_limit_type_is_refused_at_start(self) -> None:
+        with self.assertRaises(ValueError):
+            Governor(self.home, config_with(budgets={"bogus": {"limit": 1, "limit_type": "tokens_per_day"}}), log=quiet)
+
+
+class OldStateWithoutDeepSeekUncachedTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.home = Path(self.tmp.name) / "agentq"
+        self.home.mkdir(parents=True)
+
+    def test_state_file_from_before_uncached_ds_loads_and_keeps_kimi_limit(self) -> None:
+        old = {
+            "saved_at": time.time(),
+            "budgets": {
+                "total": {"limit": 10_000_000, "target_frac": 0.9, "window_used": 0},
+                "output": {"limit": 70_000, "target_frac": 0.8, "window_used": 0},
+                "uncached": {"limit": 23_000, "target_frac": 0.85, "window_used": 0},
+            },
+        }
+        (self.home / "proxy_state.json").write_text(json.dumps(old))
+        gov = Governor(self.home, config_with(start_target=0.98), log=quiet)
+        self.assertEqual(gov.budgets["uncached"].limit, 23_000)
+        self.assertAlmostEqual(gov.budgets["uncached"].target, 0.85)
+        self.assertEqual(gov.budgets["uncached_ds"].limit, 400_000)
+        self.assertEqual(gov.budgets["uncached_ds"].target, 0.98)
+        gov.save_state()
+        saved = json.loads((self.home / "proxy_state.json").read_text())["budgets"]
+        self.assertEqual(saved["uncached_ds"]["limit"], 400_000)
 
 
 class TargetCeilingTest(unittest.TestCase):

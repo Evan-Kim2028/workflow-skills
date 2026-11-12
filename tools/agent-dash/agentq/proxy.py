@@ -77,16 +77,17 @@ DEFAULT_CONFIG = {
     "charge_basis": "billed",
     "calendar_jitter_s": 1.5,
     "budgets": {
-        "total": {"limit": 10_000_000},
-        "output": {"limit": 70_000, "model_prefix": "morph-dsv41flash"},
-        "uncached": {"limit": 24_290, "model": "morph-kimik31"},
+        "total": {"limit_type": "total", "limit": 10_000_000},
+        "output": {"limit_type": "output", "limit": 70_000, "model_prefix": "morph-dsv41flash"},
+        "uncached": {"limit_type": "uncached", "limit": 24_290, "model": "morph-kimik31"},
+        "uncached_ds": {"limit_type": "uncached", "limit": 400_000, "model_prefix": "morph-dsv41flash"},
     },
 }
 
 SATURATION_WAIT_S = 2.0
 LANE_CACHE_S = 2.0
 LANE_CACHE_MAX = 10_000
-PREFIX_STORE_JOBS = 64
+PREFIX_STORE_JOBS = 256
 ANONYMOUS_JOBS = frozenset({"", "none"})
 BLOCK_CHARS = 1024
 LARGE_BODY = 256 * 1024
@@ -126,6 +127,7 @@ LIMIT_PATTERNS = (
     ("uncached", re.compile(r"Limit:\s*(\d+)\s+uncached input tokens/minute")),
     ("total", re.compile(r"Limit:\s*(\d+)\s+tokens/minute")),
 )
+LIMIT_TYPES = tuple(name for name, _ in LIMIT_PATTERNS)
 
 PROXY_JOBS_DDL = """
 CREATE TABLE IF NOT EXISTS proxy_jobs (
@@ -283,11 +285,16 @@ def tokens_for_chars(chars: int) -> int:
 
 
 def prefix_blocks(text: str) -> tuple[bytes, ...]:
-    """Fixed-size block digests of a prompt. A job keeps these instead of the prompt text."""
-    return tuple(
-        hashlib.blake2b(text[start : start + BLOCK_CHARS].encode("utf-8", "replace"), digest_size=8).digest()
-        for start in range(0, len(text), BLOCK_CHARS)
-    )
+    """Cumulative digests of a prompt's fixed-size blocks: entry k digests the first k+1 blocks. A job keeps
+    these instead of the prompt text, and two prompts share their first k+1 blocks exactly when entry k
+    matches, so a shared prefix is found with one comparison per probe."""
+    chain = b""
+    digests = []
+    for start in range(0, len(text), BLOCK_CHARS):
+        piece = text[start : start + BLOCK_CHARS].encode("utf-8", "replace")
+        chain = hashlib.blake2b(chain + piece, digest_size=8).digest()
+        digests.append(chain)
+    return tuple(digests)
 
 
 def is_anonymous(job: str) -> bool:
@@ -307,13 +314,16 @@ def anonymous_key(blocks: tuple[bytes, ...]) -> str:
 
 
 def _common_blocks(previous: tuple[bytes, ...], blocks: tuple[bytes, ...]) -> int:
-    """How many leading whole blocks two prompts share."""
-    common = 0
-    for old, new in zip(previous, blocks):
-        if old != new:
-            break
-        common += 1
-    return common
+    """How many leading whole blocks two prompts share. Entries are cumulative, so entry k matches exactly
+    when the first k+1 blocks match. That is monotone, and a binary search finds the boundary in log steps."""
+    low, high = 0, min(len(previous), len(blocks))
+    while low < high:
+        middle = (low + high + 1) // 2
+        if previous[middle - 1] == blocks[middle - 1]:
+            low = middle
+        else:
+            high = middle - 1
+    return low
 
 
 def percentile(sorted_values: list[float], fraction: float) -> float:
@@ -352,20 +362,20 @@ def _as_int(value: object) -> int:
         return 0
 
 
-def estimate_for(budget_name: str, prompt: int, output: int, uncached: int) -> int:
+def estimate_for(limit_type: str, prompt: int, output: int, uncached: int) -> int:
     """Token cost a request is expected to add to one budget before its real usage arrives."""
-    if budget_name == "output":
+    if limit_type == "output":
         return output
-    if budget_name == "uncached":
+    if limit_type == "uncached":
         return uncached
     return prompt + output
 
 
-def reserved_for(budget_name: str, prompt: int, requested: int, uncached: int) -> int:
+def reserved_for(limit_type: str, prompt: int, requested: int, uncached: int) -> int:
     """Charge for a reservation: the requested max_tokens counts in full, as if Morph held it for the minute."""
-    if budget_name == "output":
+    if limit_type == "output":
         return requested
-    if budget_name == "uncached":
+    if limit_type == "uncached":
         return uncached
     return prompt + requested
 
@@ -538,11 +548,16 @@ class Entry:
 
 @dataclass(eq=False)
 class Budget:
-    """A rolling-window token budget with a learned limit and a target fraction of it."""
+    """A rolling-window token budget with a learned limit and a target fraction of it.
+
+    limit_type says which Morph limit this budget tracks (total, output or uncached). A stated limit
+    is only ever adopted by a budget with the same limit_type that applies to the refused model.
+    """
 
     name: str
     limit: int
     target: float
+    limit_type: str = "total"
     model_prefix: str | None = None
     model: str | None = None
     hold_s: float = 600.0
@@ -648,10 +663,14 @@ class Governor:
                 raise ValueError(f"budget {name}: window_mode must be one of {WINDOW_MODES}, not {window_mode!r}")
             if charge_basis not in CHARGE_BASES:
                 raise ValueError(f"budget {name}: charge_basis must be one of {CHARGE_BASES}, not {charge_basis!r}")
+            limit_type = spec.get("limit_type", name)
+            if limit_type not in LIMIT_TYPES:
+                raise ValueError(f"budget {name}: limit_type must be one of {LIMIT_TYPES}, not {limit_type!r}")
             self.budgets[name] = Budget(
                 name=name,
                 limit=int(spec["limit"]),
                 target=float(config["start_target"]),
+                limit_type=limit_type,
                 model_prefix=spec.get("model_prefix"),
                 model=spec.get("model"),
                 hold_s=hold_s,
@@ -817,18 +836,16 @@ class Governor:
         prompt = tokens_for_chars(length)
         requested = _as_int(max_tokens)
         output = self.output_estimate(model, max_tokens)
-        uncached_budget = self.budgets.get("uncached")
+        applicable = [b for b in self.budgets.values() if b.applies(model)]
         uncached = 0
-        if uncached_budget is not None and uncached_budget.applies(model):
+        if any(b.limit_type == "uncached" for b in applicable):
             uncached = self.uncached_estimate(job, length, blocks)
         estimates: dict[str, int] = {}
-        for b in self.budgets.values():
-            if not b.applies(model):
-                continue
+        for b in applicable:
             if b.charge_basis == PROMPT_PLUS_MAX:
-                estimates[b.name] = reserved_for(b.name, prompt, requested, uncached)
+                estimates[b.name] = reserved_for(b.limit_type, prompt, requested, uncached)
             else:
-                estimates[b.name] = estimate_for(b.name, prompt, output, uncached)
+                estimates[b.name] = estimate_for(b.limit_type, prompt, output, uncached)
         return Ticket(
             job=job,
             lane=lane,
@@ -972,7 +989,7 @@ class Governor:
             real = {"total": prompt + output, "output": output, "uncached": prompt - cached}
         for budget, entry in ticket.holds:
             if budget.charge_basis == BILLED:
-                entry.amount = real.get(budget.name, entry.amount)
+                entry.amount = real.get(budget.limit_type, entry.amount)
             entry.done = True
             entry.at = now
         ticket.holds = []
@@ -1032,26 +1049,32 @@ class Governor:
             entry.at = now
         ticket.holds = []
 
-    def learn_from_429(self, ticket: Ticket, body_text: str) -> None:
-        """Adopt a stated limit when the body names one; cut the target of the budget it names.
+    def budgets_for_limit(self, limit_type: str, model: str) -> list[Budget]:
+        """The budgets that track a stated limit type and apply to the model that was refused."""
+        return [b for b in self.budgets.values() if b.limit_type == limit_type and b.applies(model)]
 
-        A body that names no limit cuts every budget the request touched. service_overloaded
-        is a platform-wide signal, so it cuts the total budget only. A budget is cut at most once
-        per fast_interval_s: a burst of 429s is one cut, and each 429 still counts and refreshes
-        last_429.
+    def learn_from_429(self, ticket: Ticket, body_text: str) -> None:
+        """Adopt a stated limit when the body names one; cut the target of the budgets it names.
+
+        A stated limit goes only to budgets with its limit type that apply to the ticket's model,
+        so one model's 429 never rewrites another model's limit. A body that names no usable limit
+        cuts every budget the request touched. service_overloaded is a platform-wide signal, so it
+        cuts the total budget only. A budget is cut at most once per fast_interval_s: a burst of 429s
+        is one cut, and each 429 still counts and refreshes last_429.
         """
         now = self.clock()
         self.row(ticket.model)["r429"] += 1
         self.job_counters(ticket)["r429"] += 1
-        self.note_calib_429(body_text)
         stated = parse_stated_limit(body_text)
-        if stated is not None:
-            name, limit = stated
-            targets = [self.budgets[name]] if name in self.budgets else []
-            for budget in targets:
+        named = self.budgets_for_limit(stated[0], ticket.model) if stated is not None else []
+        self.note_calib_429(body_text, [b.name for b in named])
+        if named:
+            limit = stated[1]
+            for budget in named:
                 if budget.limit != limit:
                     self.log("limit_adopted", budget=budget.name, old=budget.limit, new=limit)
                     budget.limit = limit
+            targets = named
         elif "service_overloaded" in body_text:
             targets = [self.budgets["total"]] if "total" in self.budgets else []
         else:
@@ -1272,9 +1295,9 @@ class Governor:
         overall["billed"] += billed
         family["billed"] += billed
 
-    def note_calib_429(self, body_text: str) -> None:
-        """Log one upstream 429 with the current minute so far: where in the minute it fell, which budget
-        the body names, and the admitted and billed totals for this minute."""
+    def note_calib_429(self, body_text: str, budget_names: list[str]) -> None:
+        """Log one upstream 429 with the current minute so far: where in the minute it fell, the budgets
+        the body's stated limit was applied to, and the admitted and billed totals for this minute."""
         now = self.wall()
         minute = minute_stamp(now)
         record = self.calib_record(minute)
@@ -1287,7 +1310,8 @@ class Governor:
         self.log(
             "calib",
             minute=minute,
-            budget=stated[0] if stated else None,
+            limit_type=stated[0] if stated else None,
+            budget=",".join(budget_names) or None,
             sec=second,
             first_429_s=record["first_429_s"],
             r429=record["r429"],
@@ -1360,6 +1384,7 @@ class Governor:
                 "used_60s": self._used(budget),
                 "queued": per_lane,
                 "saturated": budget.saturated,
+                "limit_type": budget.limit_type,
                 "window_mode": budget.window_mode,
                 "charge_basis": budget.charge_basis,
             }
