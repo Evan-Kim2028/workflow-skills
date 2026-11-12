@@ -279,7 +279,7 @@ class ServerTest(unittest.TestCase):
         self.assertTrue(ctype.startswith("text/html"))
         self.assertIn("<!DOCTYPE html>", html)
         for title in (
-            "Total pool and DeepSeek output, % of limit",
+            "Share of each Morph-enforced limit, % of limit",
             "Active runs over time, with caps",
             "Tokens per minute, millions",
             "Runs",
@@ -907,3 +907,23 @@ class UpstreamLatencyDashTest(unittest.TestCase):
             "function compact(",
         ):
             self.assertIn(marker, dash.PAGE_HTML)
+
+
+class EnforcedLimitsChartTest(unittest.TestCase):
+    def test_main_billed_chart_plots_only_enforced_limits(self) -> None:
+        html = dash.PAGE_HTML
+        start = html.index('registerChart("c-billed"')
+        block = html[start:html.index('registerChart("c-workers"')]
+        self.assertIn("pct_total", block)
+        self.assertIn("pct_ds_uncached", block)
+        self.assertNotIn("pct_ds_output", block)
+        self.assertNotIn("70k", block)
+
+    def test_ds_uncached_share_is_of_the_400k_limit(self) -> None:
+        point = dash.minute_point(0, {"ds_uncached": 200_000})
+        self.assertEqual(point["pct_ds_uncached"], 0.5)
+
+    def test_page_has_at_most_twelve_kpi_tiles(self) -> None:
+        import re
+        tiles = re.findall(r'class="kpi(?: head)?"', dash.PAGE_HTML)
+        self.assertLessEqual(len(tiles), 12)

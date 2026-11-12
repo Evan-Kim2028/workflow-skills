@@ -40,11 +40,16 @@ LIVE_TIMEOUT_S = 2.0
 DB_TIMEOUT_S = 2.0
 PS_TIMEOUT_S = 10.0
 ERROR_CHARS = 200
-LIMITS = {"total": 10_000_000, "output": 70_000, "uncached": 24_290}
-LIMIT_KEYS = {"total": "total", "output": "ds_output", "uncached": "kimi_uncached"}
+LIMITS = {"total": 10_000_000, "output": 70_000, "uncached": 24_290, "uncached_ds": 400_000}
+LIMIT_KEYS = {"total": "total", "output": "ds_output", "uncached": "kimi_uncached", "uncached_ds": "ds_uncached"}
 DEFAULT_CAPS = {"deepseek": 64, "kimi": 2}
 TIER_CAP_KEYS = {"pi-deepseek-flash": "deepseek", "pi-kimi": "kimi"}
-LIMIT_LABELS = {"total": "Total pool", "output": "DeepSeek output", "uncached": "Kimi uncached"}
+LIMIT_LABELS = {
+    "total": "Total pool",
+    "output": "DeepSeek output",
+    "uncached": "Kimi uncached",
+    "uncached_ds": "DeepSeek uncached input",
+}
 UNTAGGED_JOBS = frozenset({"", "none"})
 UNTAGGED_LABEL = "untagged (pre-tagging workers)"
 ACTIVE_WINDOW_S = 120
@@ -54,8 +59,8 @@ RUN_ROWS = 200
 TOP_CONSUMERS = 10
 VERDICTS = ("PASS", "PARTIAL", "FAIL")
 FAR_FUTURE = 4102444800.0
-BUCKET_SUM_KEYS = ("total", "ds_output", "kimi_uncached", "ok", "r429", "req", "input", "cache_read", "output", "wait_p50_weighted")
-PCT_KEYS = ("pct_total", "pct_ds_output", "pct_kimi_uncached")
+BUCKET_SUM_KEYS = ("total", "ds_output", "kimi_uncached", "ds_uncached", "ok", "r429", "req", "input", "cache_read", "output", "wait_p50_weighted")
+PCT_KEYS = ("pct_total", "pct_ds_output", "pct_kimi_uncached", "pct_ds_uncached")
 WORKER_KEYS = ("ds_workers", "kimi_workers", "queue_workers", "direct_workers", "queued_jobs")
 LOG_SOURCES = {"proxy": "proxy.err.log", "broker": "broker.log"}
 LOG_PAGE = 100
@@ -83,6 +88,7 @@ SELECT minute,
        SUM(COALESCE(input, 0) + COALESCE(cache_read, 0) + COALESCE(output, 0)) AS total,
        SUM(CASE WHEN model LIKE 'morph-dsv%' THEN COALESCE(output, 0) ELSE 0 END) AS ds_output,
        SUM(CASE WHEN model LIKE 'morph-kimi%' THEN COALESCE(input, 0) ELSE 0 END) AS kimi_uncached,
+       SUM(CASE WHEN model LIKE 'morph-dsv%' THEN COALESCE(input, 0) ELSE 0 END) AS ds_uncached,
        SUM(COALESCE(ok, 0)) AS ok,
        SUM(COALESCE(r429, 0)) AS r429,
        SUM(COALESCE(req, 0)) AS req,
@@ -298,60 +304,35 @@ td.wrap .cont { color: var(--ink-3); display: block; }
     <section class="panel" aria-labelledby="g-cap">
       <h3 class="group" id="g-cap">Capacity</h3>
       <div class="kpis">
-        <div class="kpi head"><div class="label">Capacity used, 5 min</div><div class="value" id="cap-used">—</div><div class="note" id="cap-binding">—</div></div>
-        <div class="kpi"><div class="label">DeepSeek output, 5 min avg</div><div class="value sm" id="cap-dso">—</div><div class="note" id="cap-dso-note">—</div></div>
-        <div class="kpi"><div class="label">Total pool, last minute</div><div class="value sm" id="lim-total-now">—</div><div class="note" id="lim-total-note">—</div></div>
-        <div class="kpi"><div class="label">DeepSeek output, last minute</div><div class="value sm" id="lim-output-now">—</div><div class="note" id="lim-output-note">—</div></div>
-        <div class="kpi"><div class="label">Kimi uncached, last minute</div><div class="value sm" id="lim-uncached-now">—</div><div class="note" id="lim-uncached-note">—</div></div>
+        <div class="kpi head"><div class="label">Total pool, 5 min avg</div><div class="value sm" id="cap-used">—</div><div class="note" id="cap-binding">—</div></div>
+        <div class="kpi"><div class="label">DeepSeek uncached input, 5 min avg</div><div class="value sm" id="cap-ds-unc">—</div><div class="note" id="cap-ds-unc-note">—</div></div>
         <div class="kpi"><div class="label">Waiting at the proxy</div><div class="value" id="k-waiting">—</div><div class="note" id="k-waiting-note">—</div></div>
+        <div class="kpi"><div class="label">Requests in flight now</div><div class="value sm" id="p-inflight">—</div><div class="note">sent upstream, not yet answered</div></div>
+        <div class="kpi"><div class="label">Morph response p50 / p95</div><div class="value sm" id="p-morph">—</div><div class="note">per request, last 15 min; p95 is the worst minute</div></div>
       </div>
     </section>
     <section class="panel" aria-labelledby="g-runs">
-      <h3 class="group" id="g-runs">Runs</h3>
+      <h3 class="group" id="g-runs">Work</h3>
       <div class="kpis">
         <div class="kpi"><div class="label">DeepSeek runs active</div><div class="value" id="r-ds">—</div><div class="note" id="r-ds-note">—</div></div>
-        <div class="kpi"><div class="label">Kimi runs active</div><div class="value" id="r-kimi">—</div><div class="note" id="r-kimi-note">—</div></div>
-        <div class="kpi"><div class="label">Runs seen today</div><div class="value" id="r-seen">—</div><div class="note">distinct jobs, local day</div></div>
+        <div class="kpi"><div class="label">Jobs queued</div><div class="value" id="r-queued">—</div><div class="note">waiting for a worker</div></div>
         <div class="kpi"><div class="label">Finished today</div><div class="value sm" id="r-finished">—</div><div class="note">PASS / PARTIAL / FAIL</div></div>
         <div class="kpi"><div class="label">Tokens today</div><div class="value" id="r-tokens">—</div><div class="note">all runs, local day</div></div>
-        <div class="kpi"><div class="label">Median tokens per run</div><div class="value" id="r-median-tok">—</div><div class="note" id="r-median-req">—</div></div>
-      </div>
-    </section>
-    <section class="panel" aria-labelledby="g-perf">
-      <h3 class="group" id="g-perf">Performance</h3>
-      <div class="kpis">
-        <div class="kpi"><div class="label">Proxy wait, p50 / p95</div><div class="value sm" id="p-wait">—</div><div class="note">last 15 min; p95 is the worst minute</div></div>
-        <div class="kpi"><div class="label">Upstream per request</div><div class="value sm" id="p-upstream">—</div><div class="note">median, runs active in 15 min</div></div>
-        <div class="kpi"><div class="label">429 rate</div><div class="value sm" id="p-429rate">—</div><div class="note" id="p-429-note">—</div></div>
-        <div class="kpi"><div class="label">Morph response p50 / p95</div><div class="value sm" id="p-morph">—</div><div class="note">per request, last 15 min; p95 is the worst minute</div></div>
-        <div class="kpi"><div class="label">Requests in flight now</div><div class="value sm" id="p-inflight">—</div><div class="note">sent upstream, not yet answered</div></div>
-        <div class="kpi"><div class="label">Requests per minute</div><div class="value sm" id="p-rpm">—</div><div class="note">average, last 5 min</div></div>
+        <div class="kpi"><div class="label">429s absorbed</div><div class="value" id="r-429">—</div><div class="note" id="r-429-note">retried by the proxy</div></div>
       </div>
     </section>
   </div>
-
-  <section class="panel range-panel" aria-labelledby="g-range">
-    <h3 class="group" id="g-range">Selected range</h3>
-    <div class="kpis">
-      <div class="kpi"><div class="label">Total tokens</div><div class="value" id="rg-tokens">—</div><div class="note" id="rg-tokens-note">—</div></div>
-      <div class="kpi"><div class="label">Requests</div><div class="value" id="rg-req">—</div><div class="note">proxy requests in range</div></div>
-      <div class="kpi"><div class="label">429s absorbed</div><div class="value" id="rg-r429">—</div><div class="note">retried by the proxy</div></div>
-      <div class="kpi"><div class="label">Runs started</div><div class="value" id="rg-started">—</div><div class="note">queue and direct</div></div>
-      <div class="kpi"><div class="label">Finished, PASS / PARTIAL / FAIL</div><div class="value sm" id="rg-finished">—</div><div class="note">queue jobs with a verdict</div></div>
-      <div class="kpi"><div class="label">DeepSeek output tokens</div><div class="value" id="rg-ds">—</div><div class="note">counted per finished request</div></div>
-    </div>
-  </section>
 
   <section class="group-block" aria-labelledby="g-capacity">
     <h3 class="group" id="g-capacity">Capacity vs workers</h3>
     <div class="pair">
   <section class="card" aria-labelledby="h-billed">
     <div class="card-head">
-      <h2 id="h-billed">Total pool and DeepSeek output, % of limit</h2>
+      <h2 id="h-billed">Share of each Morph-enforced limit, % of limit</h2>
       <div class="legend" id="lg-billed"></div>
     </div>
     <div class="chart" id="c-billed"></div>
-    <div class="note-line">Tokens are counted in the minute each request finishes; Morph enforces only the 10M total per UTC minute. Output above 100% has never been rejected.</div>
+    <div class="note-line">Each line is the share of a limit Morph enforces; lines are comparable. Only limits Morph enforces are shown as %.</div>
     <div class="note-line">Total pool uses tokens admitted in each minute where the proxy recorded them, and falls back to completion minutes elsewhere.</div>
   </section>
 
@@ -1017,17 +998,12 @@ td.wrap .cont { color: var(--ink-3); display: block; }
   function renderCapacity(d) {
     var cap = d.capacity || {};
     var limits = d.limits || {};
-    setText("cap-used", pct(cap.used_frac));
-    setText("cap-binding", cap.binding_label ? "binding: " + cap.binding_label : "no traffic in 5 min");
-    var dso = d.ds_output_5m_per_min;
-    setText("cap-dso", dso === null || dso === undefined ? "—" : tokens(dso) + "/min");
-    setText("cap-dso-note", "stated limit " + tokens((limits.output || {}).limit) + "/min");
-    [["total", "lim-total"], ["output", "lim-output"], ["uncached", "lim-uncached"]].forEach(function (row) {
-      var lim = limits[row[0]] || {};
-      setText(row[1] + "-now", pct(lim.last_min_frac));
-      var target = lim.target_frac === null || lim.target_frac === undefined ? "target n/a" : "target " + pct(lim.target_frac, 0);
-      setText(row[1] + "-note", "5 min avg " + pct(lim.avg_5m_frac) + " · " + target);
-    });
+    var total = limits.total || {};
+    var dsu = limits.uncached_ds || {};
+    setText("cap-used", pct(total.avg_5m_frac));
+    setText("cap-binding", "of the " + compact(total.limit) + " per minute limit");
+    setText("cap-ds-unc", pct(dsu.avg_5m_frac));
+    setText("cap-ds-unc-note", "of " + compact(dsu.limit) + " per minute");
     setTile("k-waiting", cap.waiting_now);
     var lanes = cap.waiting_by_lane || {};
     setText("k-waiting-note", Object.keys(lanes).length
@@ -1039,41 +1015,23 @@ td.wrap .cont { color: var(--ink-3); display: block; }
     var rk = d.run_kpis || {};
     setTile("r-ds", rk.active_deepseek);
     setText("r-ds-note", "of cap " + count(rk.cap_deepseek));
-    setTile("r-kimi", rk.active_kimi);
-    setText("r-kimi-note", "of cap " + count(rk.cap_kimi));
-    setTile("r-seen", rk.seen_today);
+    var queued = ((d.jobs || {}).by_state || {}).queued;
+    setTile("r-queued", queued === undefined ? null : queued);
     var fin = rk.finished_today || {};
     setTileList("r-finished", ["PASS", "PARTIAL", "FAIL"].map(function (v) { return fin[v] || 0; }));
     setTile("r-tokens", rk.tokens_today);
-    setTile("r-median-tok", rk.median_tokens_per_run);
-    setText("r-median-req", "median " + num1(rk.median_requests_per_run) + " requests");
   }
 
   function renderPerf(d) {
     var pk = d.perf_kpis || {};
-    var p50 = pk.wait_p50_ms === null || pk.wait_p50_ms === undefined ? "—" : seconds(pk.wait_p50_ms);
-    setText("p-wait", p50 + " / " + seconds(pk.wait_p95_ms));
-    setText("p-upstream", seconds(pk.upstream_median_ms));
     setText("p-morph", seconds(pk.upstream_response_p50_ms) + " / " + seconds(pk.upstream_response_p95_ms));
     setTile("p-inflight", pk.in_flight_now);
-    setText("p-429rate", pct(pk.r429_rate_60m, 2));
-    var r429 = d.r429_60m;
-    setText("p-429-note", (r429 === undefined ? "—" : count(r429)) + " 429s in the last 60 min");
-    setText("p-rpm", num1(pk.requests_per_min_5m));
   }
 
   function renderRange(d) {
     var rt = d.range_totals || {};
-    var tok = rt.tokens || {};
-    setText("g-range", "Selected range, " + (RANGE_NAME[d.hours] || ""));
-    setTile("rg-tokens", tok.total);
-    setText("rg-tokens-note", "cache " + tokens(tok.cache_read) + " · uncached " + tokens(tok.uncached) + " · output " + tokens(tok.output));
-    setTile("rg-req", rt.requests);
-    setTile("rg-r429", rt.r429);
-    setTile("rg-started", rt.runs_started);
-    var fin = rt.finished || {};
-    setTileList("rg-finished", ["PASS", "PARTIAL", "FAIL"].map(function (v) { return fin[v] || 0; }));
-    setText("rg-ds", tokens(rt.ds_output));
+    setTile("r-429", rt.r429);
+    setText("r-429-note", "retried by the proxy, " + (RANGE_NAME[d.hours] || "") + " range");
   }
 
   function renderCharts(d) {
@@ -1095,20 +1053,19 @@ td.wrap .cont { color: var(--ink-3); display: block; }
 
     var PAIR_MARGIN = { l: 64, r: 16 };
     registerChart("c-billed", {
-      title: "Total pool and DeepSeek output, percent of limit per interval",
+      title: "Share of each Morph-enforced limit, percent per interval",
       kind: "line", bucket_s: bucket, tickFmt: fmtX, margin: PAIR_MARGIN, group: "capacity",
       x0: win.start, x1: win.end, height: 260,
       points: minutes,
       series: [
-        { key: "pct_total", name: "Total pool", color: COLORS.s1 },
-        { key: "pct_ds_output", name: "DeepSeek output vs stated 70k/min (not enforced per minute)", color: COLORS.s2,
-          overNote: "above stated limit, not rejected by Morph (0 output-limit 429s)" }
+        { key: "pct_total", name: "Total pool (of 10M/min)", color: COLORS.s1 },
+        { key: "pct_ds_uncached", name: "DeepSeek uncached input (of 400k/min)", color: COLORS.s2 }
       ],
-      y: clippedAxis(valuesOf(minutes, ["pct_total", "pct_ds_output"]), pctFmt),
+      y: clippedAxis(valuesOf(minutes, ["pct_total", "pct_ds_uncached"]), pctFmt),
       refs: [{ v: 1, label: "100% of limit" }],
       fmt: pctFmt
     });
-    setText("h-billed", "Total pool and DeepSeek output, % of limit");
+    setText("h-billed", "Share of each Morph-enforced limit, % of limit");
     registerChart("c-workers", {
       title: "Active runs over time",
       kind: "line", bucket_s: bucket, tickFmt: fmtX, margin: PAIR_MARGIN, group: "capacity",
@@ -1136,8 +1093,8 @@ td.wrap .cont { color: var(--ink-3); display: block; }
     }, drawTokenCombo);
     setText("h-tokens", "Tokens per " + unit + ", millions");
     legendFor($("lg-billed"), [
-      { name: "Total pool", color: COLORS.s1 },
-      { name: "DeepSeek output vs stated 70k/min (not enforced per minute)", color: COLORS.s2 }
+      { name: "Total pool (of 10M/min)", color: COLORS.s1 },
+      { name: "DeepSeek uncached input (of 400k/min)", color: COLORS.s2 }
     ]);
     legendFor($("lg-workers"), [
       { name: "DeepSeek runs", color: COLORS.s1 },
@@ -1735,6 +1692,7 @@ def minute_point(t: int, row: dict | None) -> dict:
         "total": total,
         "ds_output": ds_output,
         "kimi_uncached": kimi_uncached,
+        "ds_uncached": int(row.get("ds_uncached") or 0),
         "input": int(row.get("input") or 0),
         "cache_read": int(row.get("cache_read") or 0),
         "output": int(row.get("output") or 0),
@@ -1749,6 +1707,7 @@ def minute_point(t: int, row: dict | None) -> dict:
         "pct_total": fraction(total, LIMITS["total"]),
         "pct_ds_output": fraction(ds_output, LIMITS["output"]),
         "pct_kimi_uncached": fraction(kimi_uncached, LIMITS["uncached"]),
+        "pct_ds_uncached": fraction(int(row.get("ds_uncached") or 0), LIMITS["uncached_ds"]),
     }
 
 
@@ -1886,7 +1845,8 @@ def median_or_none(values: list[float]) -> float | None:
 
 def capacity_headline(limits: dict, live: dict | None) -> dict:
     """The limit with the highest 5-minute billed fraction (the binding one), and requests waiting at the proxy."""
-    binding = max(LIMIT_KEYS, key=lambda name: limits[name]["avg_5m_frac"]) if limits else None
+    present = [name for name in LIMIT_KEYS if name in limits]
+    binding = max(present, key=lambda name: limits[name]["avg_5m_frac"]) if present else None
     queued = (live or {}).get("queued") if isinstance(live, dict) else None
     by_lane = None
     waiting = None
