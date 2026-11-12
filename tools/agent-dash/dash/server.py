@@ -335,7 +335,26 @@ class DashServer(ThreadingHTTPServer):
             pass
         self._disconnects: deque = deque()
         self._disconnects_lock = threading.Lock()
+        # The SSE tick's running list, refreshed at most every
+        # TICK_RUNNING_TTL_S and shared by every open stream.
+        self._tick_running_lock = threading.Lock()
+        self._tick_running: tuple[float, list] | None = None
         super().__init__((host, port), Handler)
+
+    def tick_running(self, now: float) -> list:
+        """Running runs for the SSE tick, recomputed at most every TICK_RUNNING_TTL_S.
+
+        Built from an uncached snapshot of the ``all`` scope, so the tick
+        never pays for a full snapshot per data write. A view change
+        reaches the page on the next tick through ``view_seq``, and the
+        page refetches its full data then.
+        """
+        with self._tick_running_lock:
+            if self._tick_running is not None and now - self._tick_running[0] < TICK_RUNNING_TTL_S:
+                return self._tick_running[1]
+            running = self.store.snapshot(now, "all", recent_limit=1)["running"]
+            self._tick_running = (now, running)
+            return running
 
     def process_request(self, request, client_address):
         """Every accepted connection is served activity for the source runner's idle mode."""
@@ -1592,21 +1611,7 @@ class Handler(BaseHTTPRequestHandler):
         interval = self.server.stream_interval
         while not self.server.stop.is_set():
             now = time.time()
-            payload = self.server.store.snapshot_cached(now, "all")
-            try:
-                sources = self.server.registry.source_states(now)
-            except Exception:
-                sources = []
-            data = {
-                "seq": payload["seq"],
-                "view_seq": payload.get("view_seq"),
-                "running": payload["running"],
-                "now": now,
-                "data_seq": payload.get("data_seq"),
-                "last_data_ts": payload.get("last_data_ts"),
-                "last_poll": _last_poll(self.server.registry),
-                "sources": sources,
-            }
+            data = _tick_payload(self.server, now)
             blob = ("event: tick\ndata: " + json.dumps(data, separators=(",", ":"), allow_nan=False) + "\n\n").encode()
             try:
                 self.wfile.write(blob)
@@ -1955,6 +1960,33 @@ def _accepts_gzip(header_value) -> bool:
         part.strip().split(";")[0].strip().lower() == "gzip"
         for part in str(header_value).split(",")
     )
+
+
+TICK_RUNNING_TTL_S = 10.0
+
+
+def _tick_payload(server, now: float) -> dict:
+    """One SSE tick body: the sequence counters, running runs, and source states.
+
+    Counters are read directly from the store and running comes from
+    :meth:`DashServer.tick_running`, so a tick never builds a full
+    snapshot. Key order and value meanings match the historic tick.
+    """
+    counters = server.store.tick_counters()
+    try:
+        sources = server.registry.source_states(now)
+    except Exception:
+        sources = []
+    return {
+        "seq": counters["seq"],
+        "view_seq": counters["view_seq"],
+        "running": server.tick_running(now),
+        "now": now,
+        "data_seq": counters["data_seq"],
+        "last_data_ts": counters["last_data_ts"],
+        "last_poll": _last_poll(server.registry),
+        "sources": sources,
+    }
 
 
 def _last_poll(registry) -> float | None:

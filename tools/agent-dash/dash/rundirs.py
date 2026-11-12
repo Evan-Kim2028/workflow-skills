@@ -268,8 +268,9 @@ def describe_roots(cfg, now=None, processes="auto") -> dict:
         covered = roots
     live = _live_labels(processes)
     warnings = []
+    resolve = _memoized_realpath()
     for rundir in reg:
-        if _covered(rundir, covered):
+        if _covered(rundir, covered, resolve):
             continue
         labels = _manifest_labels(rundir)
         if not labels:
@@ -310,19 +311,31 @@ def _live_labels(processes) -> set | None:
     return found
 
 
-def _covered(path: str, roots: list) -> bool:
-    try:
-        real = os.path.realpath(path)
-    except OSError:
-        real = path
+def _covered(path: str, roots: list, resolve=None) -> bool:
+    """True when ``path`` resolves under one of ``roots``.
+
+    ``resolve`` maps a path to its real path; a caller checking many
+    paths against the same roots passes a memoized one.
+    """
+    real_of = resolve or _real
+    real = real_of(path)
     for root in roots:
-        try:
-            want = os.path.realpath(root)
-        except OSError:
-            want = root
+        want = real_of(root)
         if real == want or real.startswith(want + os.sep):
             return True
     return False
+
+
+def _memoized_realpath():
+    """A realpath resolver that caches each path for one report."""
+    seen: dict = {}
+
+    def resolve(path: str) -> str:
+        if path not in seen:
+            seen[path] = _real(path)
+        return seen[path]
+
+    return resolve
 
 
 def _manifest_labels(rundir: str) -> list:

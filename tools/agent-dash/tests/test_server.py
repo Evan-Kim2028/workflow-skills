@@ -474,6 +474,102 @@ class ServerTest(unittest.TestCase):
         conn.close()
 
 
+class StreamTickPayloadTest(unittest.TestCase):
+    """The SSE tick carries the historic fields and values without a full snapshot."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.store = Store(Path(self.tmp.name) / "dash.sqlite")
+        self.now = time.time()
+        self.store.upsert_run(
+            {
+                "run_id": "muse:a:ws1-a",
+                "source": "muse",
+                "tier": "muse",
+                "model": "claude-sonnet-4-5",
+                "label": "ws1-a",
+                "session_id": "sess-a",
+                "status": "running",
+                "started_at": self.now - 300,
+            }
+        )
+        self.store.add_usage(
+            {
+                "ts": self.now - 60,
+                "session_id": "sess-a",
+                "run_id": "muse:a:ws1-a",
+                "model": "claude-sonnet-4-5",
+                "tool": "muse",
+                "message_id": "m1",
+                "input": 100,
+                "output": 50,
+                "cache_read": 10,
+                "cache_write": 5,
+            }
+        )
+        self.server = DashServer(self.store, Registry([]), "127.0.0.1", 0, cfg=default_cfg())
+
+    def tearDown(self):
+        self.server.server_close()
+        self.store.close()
+        self.tmp.cleanup()
+
+    def historic_tick(self, now):
+        """The tick body the server built before the cheap-field path existed."""
+        payload = self.store.snapshot_cached(now, "all")
+        return {
+            "seq": payload["seq"],
+            "view_seq": payload.get("view_seq"),
+            "running": payload["running"],
+            "now": now,
+            "data_seq": payload.get("data_seq"),
+            "last_data_ts": payload.get("last_data_ts"),
+            "last_poll": server_mod._last_poll(self.server.registry),
+            "sources": self.server.registry.source_states(now),
+        }
+
+    def test_tick_matches_historic_payload_and_key_order(self):
+        expected = self.historic_tick(self.now)
+        with mock.patch.object(self.store, "snapshot_cached", side_effect=AssertionError("tick built a cached snapshot")):
+            actual = server_mod._tick_payload(self.server, self.now)
+        self.assertEqual(list(actual), list(expected))
+        self.assertEqual(actual["seq"], expected["seq"])
+        self.assertEqual(actual["view_seq"], expected["view_seq"])
+        self.assertEqual(actual["data_seq"], expected["data_seq"])
+        self.assertEqual(actual["last_data_ts"], expected["last_data_ts"])
+        self.assertEqual(actual["running"], expected["running"])
+        self.assertTrue(actual["running"], "fixture should have a running run")
+        encode = lambda body: json.dumps(body, separators=(",", ":"), allow_nan=False)
+        self.assertEqual(encode(actual), encode(expected))
+
+    def test_running_list_refreshes_at_most_every_ttl(self):
+        with mock.patch.object(self.store, "snapshot", wraps=self.store.snapshot) as snap:
+            server_mod._tick_payload(self.server, self.now)
+            server_mod._tick_payload(self.server, self.now + 2)
+            self.assertEqual(snap.call_count, 1)
+            server_mod._tick_payload(self.server, self.now + server_mod.TICK_RUNNING_TTL_S + 0.5)
+            self.assertEqual(snap.call_count, 2)
+
+    def test_counters_follow_store_writes_without_snapshot(self):
+        before = server_mod._tick_payload(self.server, self.now)
+        self.store.add_usage(
+            {
+                "ts": self.now - 30,
+                "session_id": "sess-a",
+                "run_id": "muse:a:ws1-a",
+                "model": "claude-sonnet-4-5",
+                "tool": "muse",
+                "message_id": "m2",
+                "input": 1,
+                "output": 1,
+            }
+        )
+        after = server_mod._tick_payload(self.server, self.now)
+        self.assertGreater(after["data_seq"], before["data_seq"])
+        self.assertEqual(after["data_seq"], self.store.data_seq)
+        self.assertEqual(after["seq"], self.store.seq)
+
+
 class _InlineThread:
     """Run a warm thread's target on the calling thread, so a test can assert
     on the whole path without racing a daemon."""

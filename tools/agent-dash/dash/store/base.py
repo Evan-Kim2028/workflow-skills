@@ -81,6 +81,7 @@ class BaseMixin:
             self._usage_fold_versions: dict = {}
             self._usage_run_versions: dict = {}
             self._usage_fold_epoch = 0
+            self._usage_unattributed_version = 0
             self._usage_fold_built_epoch = -1
             # Per-run event folds survive restarts: the JSON beside the
             # database keys each fold on the run's max usage rowid, so a
@@ -152,6 +153,18 @@ class BaseMixin:
         @property
         def last_data_ts(self) -> float | None:
             return self._last_data_ts
+        def tick_counters(self) -> dict:
+            """The sequence fields an SSE tick carries, without a snapshot.
+
+            Plain attribute reads, so no lock: each value is the counter
+            as of the read, the same numbers a snapshot would stamp.
+            """
+            return {
+                "seq": self._seq,
+                "view_seq": self._view_seq,
+                "data_seq": self._data_seq,
+                "last_data_ts": self._last_data_ts,
+            }
         def _note_data_write(self, counted: bool = True) -> None:
             """Stamp the last data-changing write. Caller holds the lock.
 
@@ -179,6 +192,7 @@ class BaseMixin:
             the cache and made the next full build rescan every run.
             """
             if run_id is None:
+                self._usage_unattributed_version += 1
                 return
             if not isinstance(run_id, str):
                 run_id = str(run_id)

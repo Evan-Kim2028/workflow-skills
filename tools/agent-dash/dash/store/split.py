@@ -137,6 +137,7 @@ class SplitMixin:
                     " WHERE session_id=?",
                     (primary_id, sid),
                 )
+                self._usage_fold_epoch += 1
                 self._conn.execute(
                     "DELETE FROM runs WHERE slice_of=?", (primary_id,)
                 )
@@ -326,6 +327,7 @@ class SplitMixin:
                            WHERE session_id=? AND ws_split=? AND run_id=?""",
                         (slice_id, sid, ws, primary_id),
                     )
+                    self._usage_fold_epoch += 1
                     for hour in hours:
                         self._rebuild_hour(int(hour))
                 except Exception:
