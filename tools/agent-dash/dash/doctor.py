@@ -34,6 +34,8 @@ import urllib.request
 from pathlib import Path
 from types import SimpleNamespace
 
+from dash.caps import over_caps
+
 TOOL_ROOT = Path(__file__).resolve().parents[1]
 log = logging.getLogger("agent_dash.doctor")
 
@@ -3544,27 +3546,31 @@ def _collect_fleet(ctx) -> None:
         registry, reg_path = _workers_registry()
     counts = ctx.pgrep_counts if ctx.pgrep_counts is not None else {}
     if isinstance(registry, dict):
-        for name, worker in (registry.get("workers") or {}).items():
-            if not isinstance(worker, dict):
-                continue
-            try:
-                cap = int(worker.get("cap"))
-            except (TypeError, ValueError):
-                continue
-            pattern = worker.get("pgrep") or ""
-            if pattern in counts:
-                live = counts[pattern]
-            else:
-                live = _pgrep_count(pattern)
-                counts[pattern] = live
-            if live > cap:
-                where = f" in {reg_path}" if reg_path is not None else ""
-                _group_add(
-                    ctx, "over-cap", "warn", "global", None,
-                    f"tier {name}", str(name), ctx.now,
-                    f"tier {name}{where} has {live} live workers above cap {cap}",
+
+        def live_count(pattern):
+            if pattern not in counts:
+                counts[pattern] = _pgrep_count(pattern)
+            return counts[pattern]
+
+        where = f" in {reg_path}" if reg_path is not None else ""
+        for finding in over_caps(registry, live_count):
+            if finding["which"] == "pool":
+                title = f"model {finding['name']}"
+                detail = (
+                    f"model {finding['name']}{where} has {finding['live']} live workers "
+                    f"across {', '.join(finding['tiers'])}, above pool cap {finding['limit']}"
                 )
-                count += 1
+            else:
+                title = f"tier {finding['name']}"
+                detail = (
+                    f"tier {finding['name']}{where} has {finding['live']} live workers "
+                    f"above cap {finding['limit']}"
+                )
+            _group_add(
+                ctx, "over-cap", "warn", "global", None,
+                title, str(finding["name"]), ctx.now, detail,
+            )
+            count += 1
     _check(
         ctx, "fleet", count == 0,
         f"{len(ctx.processes)} live workers checked, {count} fleet problems" if count

@@ -4,6 +4,7 @@ import importlib.util
 import io
 import json
 import os
+import re
 import tempfile
 import time
 import unittest
@@ -88,6 +89,7 @@ class RunWorkerTests(unittest.TestCase):
         self.run_dir = self.root / "runs"
         self.reg = self.root / "workers.json"
         self.reg.write_text(json.dumps(registry()), encoding="utf-8")
+        self.counts = {}
         self.env = {
             "AGENT_DASH_WORKERS": os.environ.get("AGENT_DASH_WORKERS"),
             "AGENT_DASH_STATE_DIR": os.environ.get("AGENT_DASH_STATE_DIR"),
@@ -126,6 +128,9 @@ class RunWorkerTests(unittest.TestCase):
         return code, buf.getvalue().strip()
 
     def pgrep(self, pattern):
+        # A union of several tiers' patterns (one shared model) counts each part.
+        if pattern.startswith("(") and ")|(" in pattern:
+            return sum(self.counts.get(part, 0) for part in pattern[1:-1].split(")|("))
         return self.counts.get(pattern, 0)
 
     def test_example_lists_the_launch_tiers(self):
@@ -258,6 +263,100 @@ class RunWorkerTests(unittest.TestCase):
         self.assertEqual(
             row, ["ws1-plan-lane-1", SID, "1700000000", "glm-5.3-flash", "glm-flash", "grok-cli"]
         )
+
+    def test_named_tier_at_its_cap_refuses_without_waiting(self):
+        self.counts = {"[l]aunch_pi.py.*--tier pi-deepseek-flash": 5}
+        launch = Launch()
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            code, line = self.go("pi-deepseek-flash", launch, max_wait="540")
+        self.assertEqual(code, 0)
+        self.assertIn("STATUS: failed", line)
+        self.assertIn("reason=none-available", line)
+        self.assertEqual(launch.cmds, [])
+        self.assertIn("pi-deepseek-flash is full", err.getvalue())
+
+    def test_named_tier_below_its_cap_launches(self):
+        self.counts = {"[l]aunch_pi.py.*--tier pi-deepseek-flash": 4}
+        launch = Launch()
+        code, line = self.go("pi-deepseek-flash", launch)
+        self.assertIn("STATUS: done", line)
+        self.assertEqual(len(launch.cmds), 1)
+
+    def _process_table(self, lines):
+        """A pgrep stand-in matching each pattern against fake command lines, as pgrep -f does."""
+        return lambda pattern: sum(1 for line in lines if re.search(pattern, line))
+
+    def _shared_model_lines(self, flash, low):
+        base = "launch_pi.py ws1 /ws/prompt /out --model river/deepseek-ai/DeepSeek-V4.1-Flash-1017"
+        return [base + " --tier pi-deepseek-flash"] * flash + [base + " --tier pi-deepseek-flash-low"] * low
+
+    def _flash_and_low(self, flash_cap=26, low_cap=20, model_caps=None):
+        """Flash and low tiers on one model. Their patterns end on a word boundary, so a
+        flash count does not also take the low runs."""
+        workers = registry()["workers"]
+        workers["pi-deepseek-flash"] = dict(
+            workers["pi-deepseek-flash"], cap=flash_cap,
+            pgrep="[l]aunch_pi.py.*--tier pi-deepseek-flash( |$)",
+        )
+        workers["pi-deepseek-flash-low"] = dict(
+            workers["pi-deepseek-flash"],
+            model="river/deepseek-ai/DeepSeek-V4.1-Flash-1017:low",
+            cap=low_cap,
+            pgrep="[l]aunch_pi.py.*--tier pi-deepseek-flash-low( |$)",
+        )
+        data = registry()
+        data["workers"] = workers
+        if model_caps is not None:
+            data["model_caps"] = model_caps
+        self.reg.write_text(json.dumps(data), encoding="utf-8")
+
+    def test_pool_is_the_bigger_cap_without_model_caps(self):
+        # Flash 26 and low 20, no model_caps: the pool is 26, not 20. Twenty low
+        # and five flash is 25 live (deduplicated), so flash still launches.
+        self._flash_and_low()
+        self.pgrep = self._process_table(self._shared_model_lines(flash=5, low=20))
+        launch = Launch()
+        code, line = self.go("pi-deepseek-flash", launch)
+        self.assertIn("STATUS: done", line)
+        self.assertEqual(len(launch.cmds), 1)
+
+    def test_a_full_low_tier_does_not_block_flash(self):
+        self._flash_and_low()
+        self.pgrep = self._process_table(self._shared_model_lines(flash=0, low=20))
+        launch = Launch()
+        code, line = self.go("pi-deepseek-flash", launch)
+        self.assertIn("STATUS: done", line)
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            code, line = self.go("pi-deepseek-flash-low", Launch(), label="ws1-plan-lane-2")
+        self.assertIn("reason=none-available", line)
+        self.assertIn("its tier is at 20 of 20", err.getvalue())
+
+    def test_a_full_pool_blocks_both_tiers(self):
+        self._flash_and_low()
+        self.pgrep = self._process_table(self._shared_model_lines(flash=6, low=20))
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            code, line = self.go("pi-deepseek-flash", Launch())
+            code2, line2 = self.go("pi-deepseek-flash-low", Launch(), label="ws1-plan-lane-2")
+        self.assertIn("reason=none-available", line)
+        self.assertIn("reason=none-available", line2)
+        self.assertIn("its pool is at 26 of 26", err.getvalue())
+
+    def test_model_caps_raises_the_pool(self):
+        # Without model_caps the 26 live runs fill the pool; a model_caps of 40 lets flash launch.
+        self._flash_and_low(model_caps={"river/deepseek-ai/DeepSeek-V4.1-Flash-1017": 40})
+        self.pgrep = self._process_table(self._shared_model_lines(flash=6, low=20))
+        launch = Launch()
+        code, line = self.go("pi-deepseek-flash", launch)
+        self.assertIn("STATUS: done", line)
+        self.assertEqual(len(launch.cmds), 1)
+
+    def test_model_caps_bounds_the_pool_below_the_tier_caps(self):
+        self._flash_and_low(model_caps={"river/deepseek-ai/DeepSeek-V4.1-Flash-1017:low": 3})
+        self.pgrep = self._process_table(self._shared_model_lines(flash=2, low=1))
+        with contextlib.redirect_stderr(io.StringIO()):
+            code, line = self.go("pi-deepseek-flash", Launch())
+        self.assertIn("reason=none-available", line)
 
     def test_weak_label_refuses_before_launch(self):
         # No mark, no task match: exit 2 with the fix, nothing spawned,
@@ -554,7 +653,7 @@ class RunWorkerTests(unittest.TestCase):
         # A QUOTA marker older than this attempt's tier file belongs to a
         # previous attempt and never cools the relaunch.
         self.counts = {}
-        stale = self.run_dir / "pi" / "QUOTA"
+        stale = self.run_dir / "pi" / "QUOTA-ws1-plan-lane-1"
         stale.parent.mkdir(parents=True, exist_ok=True)
         stale.write_text("model\triver/deepseek-ai/DeepSeek-V4.1-Flash-1017\nlabel\tws1-plan-lane-1\n", encoding="utf-8")
         old = time.time() - 3600
@@ -565,6 +664,68 @@ class RunWorkerTests(unittest.TestCase):
         self.assertIn("STATUS: done", line)
         self.assertIn("tier=pi-deepseek-flash", line)
         self.assertFalse((self.state / "worker-cooldowns.json").exists())
+
+    def test_pi_quota_marker_naming_this_label_cools_the_tier(self):
+        self.counts = {}
+
+        class PiMarked(Launch):
+            def spawn(self, cmd, out_path, err_path, env=None):
+                pid = super().spawn(cmd, out_path, err_path, env)
+                Path(out_path).write_text("", encoding="utf-8")
+                (self_run_dir / "pi").mkdir(parents=True, exist_ok=True)
+                (self_run_dir / "pi" / "QUOTA-ws1-plan-lane-1").write_text(
+                    "model\triver/deepseek-ai/DeepSeek-V4.1-Flash-1017\nlabel\tws1-plan-lane-1\n",
+                    encoding="utf-8",
+                )
+                return pid
+
+        self_run_dir = self.run_dir
+        code, line = self.go("pi-deepseek-flash", PiMarked())
+        self.assertIn("reason=quota", line)
+        cooled = json.loads((self.state / "worker-cooldowns.json").read_text(encoding="utf-8"))
+        self.assertIn("pi-deepseek-flash", cooled)
+
+    def test_pi_quota_marker_for_another_label_does_not_cool_the_tier(self):
+        # Runs sharing a pi/ outdir each have their own marker; a sibling's
+        # marker never cools this launch.
+        self.counts = {}
+
+        class SiblingMarked(Launch):
+            def spawn(self, cmd, out_path, err_path, env=None):
+                pid = super().spawn(cmd, out_path, err_path, env)
+                (self_run_dir / "pi").mkdir(parents=True, exist_ok=True)
+                (self_run_dir / "pi" / "QUOTA-ws1-plan-lane-9").write_text(
+                    "model\triver/deepseek-ai/DeepSeek-V4.1-Flash-1017\nlabel\tws1-plan-lane-9\n",
+                    encoding="utf-8",
+                )
+                return pid
+
+        self_run_dir = self.run_dir
+        code, line = self.go("pi-deepseek-flash", SiblingMarked())
+        self.assertIn("STATUS: done", line)
+        self.assertFalse((self.state / "worker-cooldowns.json").exists())
+
+    def test_legacy_bare_quota_file_naming_this_label_still_cools_the_tier(self):
+        # A pi run started before the per-label name leaves a bare pi/QUOTA
+        # naming its label; it still counts, matched on the label line.
+        self.counts = {}
+
+        class LegacyMarked(Launch):
+            def spawn(self, cmd, out_path, err_path, env=None):
+                pid = super().spawn(cmd, out_path, err_path, env)
+                Path(out_path).write_text("", encoding="utf-8")
+                (self_run_dir / "pi").mkdir(parents=True, exist_ok=True)
+                (self_run_dir / "pi" / "QUOTA").write_text(
+                    "model\triver/deepseek-ai/DeepSeek-V4.1-Flash-1017\nlabel\tws1-plan-lane-1\n",
+                    encoding="utf-8",
+                )
+                return pid
+
+        self_run_dir = self.run_dir
+        code, line = self.go("pi-deepseek-flash", LegacyMarked())
+        self.assertIn("reason=quota", line)
+        cooled = json.loads((self.state / "worker-cooldowns.json").read_text(encoding="utf-8"))
+        self.assertIn("pi-deepseek-flash", cooled)
 
     def test_pi_summary_retry_line_never_reads_quota(self):
         # For a pi tier the outer out file is launch_pi.py's summary line
