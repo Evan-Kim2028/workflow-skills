@@ -81,6 +81,7 @@ DEFAULT_ADAPTIVE = {
     "gauge_ttl_s": 15.0,
 }
 TIER_BUDGETS = {"pi-deepseek-flash": ("total", "output"), "pi-kimi": ("total", "uncached")}
+TIER_FAMILY = {"pi-deepseek-flash": "morph-dsv41flash", "pi-kimi": "morph-kimik31"}
 DEFAULT_AUTO_WORKTREE = {"enabled": True, "root": "~/Documents/worktrees"}
 AUTO_WORKTREE_RETRY_S = 60.0
 AUTO_WORKTREE_MAX_TRIES = 3
@@ -184,6 +185,19 @@ def queued_total(budget: dict) -> int:
     return sum(int(count) for count in queued.values() if isinstance(count, int))
 
 
+def blocked_for_family(budget: dict, family: str | None) -> int:
+    """Requests of one model family that a proxy budget is holding right now.
+
+    A proxy older than the per-family fields reports no ``blocked_by_family``; its whole queue
+    stands in, which is the old gate's count.
+    """
+    by_family = budget.get("blocked_by_family")
+    if isinstance(by_family, dict) and family is not None:
+        count = by_family.get(family, 0)
+        return count if isinstance(count, int) else 0
+    return queued_total(budget)
+
+
 def plain_hold(text: str) -> tuple[str, str]:
     """A hold reason with no live number: its key is its text."""
     return text, text
@@ -194,18 +208,20 @@ def morph_hold(tier: str, lane: str, status: dict | None, max_waiting: float) ->
 
     Returns (key, text). The key names the budget and threshold but not the live queue depth,
     so a job held by a changing queue keeps one key. Urgent jobs never wait here. A normal job
-    waits while a budget its model uses has more than ``max_waiting`` requests queued. A backlog
-    job also waits for every such budget to queue nothing. With no status (proxy down) there is
-    no Morph gate.
+    waits while a budget its tier uses is holding more than ``max_waiting`` requests of the
+    tier's own model family. A backlog job also waits while any such budget holds one of them.
+    Requests from another family, such as Kimi's own uncached limit, never hold a DeepSeek job.
+    With no status (proxy down) there is no Morph gate.
     """
     if status is None or lane == "urgent":
         return None
     budgets = status.get("budgets") if isinstance(status.get("budgets"), dict) else {}
+    family = TIER_FAMILY.get(tier)
     for name in TIER_BUDGETS.get(tier, ()):
         budget = budgets.get(name)
         if not isinstance(budget, dict):
             continue
-        waiting = queued_total(budget)
+        waiting = blocked_for_family(budget, family)
         if waiting > max_waiting:
             return f"proxy {name} waiting > {max_waiting:g}", f"proxy {name} waiting {waiting} > {max_waiting:g}"
         if lane == "backlog" and waiting > 0:

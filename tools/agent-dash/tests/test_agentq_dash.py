@@ -1165,6 +1165,21 @@ class LimitedByTest(unittest.TestCase):
         self.assertEqual(dash.proxy_waiting_by_budget(live), {"total": 0, "output": 1, "uncached_ds": 4})
         self.assertIsNone(dash.proxy_waiting_by_budget(None))
 
+    def test_proxy_waiting_by_budget_reads_deepseek_family_counts_when_the_proxy_reports_them(self) -> None:
+        def budget(ds, kimi):
+            return {
+                "queued": {"urgent": 0, "normal": ds + kimi, "backlog": 0},
+                "queued_by_family": {"morph-dsv41flash": ds, "morph-kimik31": kimi, "other": 0},
+            }
+
+        live = {"budgets": {
+            "total": budget(ds=3, kimi=19),
+            "output": budget(ds=1, kimi=0),
+            "uncached": budget(ds=0, kimi=19),
+            "uncached_ds": budget(ds=4, kimi=0),
+        }}
+        self.assertEqual(dash.proxy_waiting_by_budget(live), {"total": 3, "output": 1, "uncached_ds": 4})
+
 
 class RoomForWorkersTest(unittest.TestCase):
     def room_for(self, raw, *, workers, laptop=CALM):

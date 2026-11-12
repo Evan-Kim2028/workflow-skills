@@ -35,6 +35,9 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 LANES = ("urgent", "normal", "backlog")
+MORPH_FAMILIES = ("morph-dsv41flash", "morph-kimik31")
+OTHER_FAMILY = "other"
+FAMILY_KEYS = (*MORPH_FAMILIES, OTHER_FAMILY)
 RESTORED_LANE = "restored"
 FAST_LIMIT_QUIET_S = 30 * 60.0
 DEFAULT_HOME = "~/.local/state/agentq"
@@ -385,6 +388,14 @@ def model_family(model: str) -> str:
     return re.sub(r"-\d+$", "", model)
 
 
+def family_of(model: str) -> str:
+    """The Morph family a request belongs to: one of MORPH_FAMILIES, or OTHER_FAMILY for any other model."""
+    for family in MORPH_FAMILIES:
+        if model.startswith(family):
+            return family
+    return OTHER_FAMILY
+
+
 def seconds_into_minute(wall: float) -> float:
     return wall % MINUTE_S
 
@@ -631,6 +642,13 @@ class Ticket:
     requested: int = 0
     admitted_minute: str = ""
     holds: list[tuple[Budget, Entry]] = field(default_factory=list)
+    blocked_by: str | None = None
+    backoff_by: str | None = None
+
+    def blocking_budget(self, now: float) -> str | None:
+        """The budget holding this waiting ticket now: the budget its 429 named while it backs off,
+        else the budget that refused it in the last pump. None when no budget is known to hold it."""
+        return self.backoff_by if self.not_before > now else self.blocked_by
 
 
 class Governor:
@@ -913,7 +931,12 @@ class Governor:
             while index < len(queue):
                 head = queue[index]
                 closed = blocked | urgent_guarded if lane == "urgent" else blocked
-                if head.not_before > now or not closed.isdisjoint(head.estimates):
+                if head.not_before > now:
+                    head.blocked_by = None
+                    index += 1
+                    continue
+                if not closed.isdisjoint(head.estimates):
+                    head.blocked_by = next(name for name in head.estimates if name in closed)
                     index += 1
                     continue
                 found = self._blocker(head, now, lower_waiting)
@@ -922,6 +945,7 @@ class Governor:
                     self._admit(head, now)
                     continue
                 blocker, guard_only = found
+                head.blocked_by = blocker.name
                 if not guard_only:
                     blocker.saturated = True
                     blocker.saturated_since_tick = True
@@ -950,6 +974,7 @@ class Governor:
 
     def _admit(self, ticket: Ticket, now: float) -> None:
         ticket.holds = []
+        ticket.blocked_by = None
         wall = self.wall()
         ticket.admitted_minute = minute_stamp(wall)
         for name, estimate in ticket.estimates.items():
@@ -1079,6 +1104,12 @@ class Governor:
             targets = [self.budgets["total"]] if "total" in self.budgets else []
         else:
             targets = [self.budgets[name] for name in ticket.estimates]
+        if named:
+            ticket.backoff_by = named[0].name
+        elif "service_overloaded" in body_text and "total" in self.budgets:
+            ticket.backoff_by = "total"
+        else:
+            ticket.backoff_by = None
         floor = float(self.config["target_floor"])
         cut = float(self.config["target_cut"])
         pace = float(self.config.get("fast_interval_s", 10.0))
@@ -1378,11 +1409,23 @@ class Governor:
         budgets = {}
         for name, budget in self.budgets.items():
             per_lane = {lane: sum(1 for t in self.queues[lane] if name in t.estimates) for lane in LANES}
+            queued_by_family = dict.fromkeys(FAMILY_KEYS, 0)
+            blocked_by_family = dict.fromkeys(FAMILY_KEYS, 0)
+            for lane in LANES:
+                for ticket in self.queues[lane]:
+                    if name not in ticket.estimates:
+                        continue
+                    family = family_of(ticket.model)
+                    queued_by_family[family] += 1
+                    if ticket.blocking_budget(now) == name:
+                        blocked_by_family[family] += 1
             budgets[name] = {
                 "limit": budget.limit,
                 "target_frac": round(budget.target, 4),
                 "used_60s": self._used(budget),
                 "queued": per_lane,
+                "queued_by_family": queued_by_family,
+                "blocked_by_family": blocked_by_family,
                 "saturated": budget.saturated,
                 "limit_type": budget.limit_type,
                 "window_mode": budget.window_mode,
