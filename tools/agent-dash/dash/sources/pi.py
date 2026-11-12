@@ -664,6 +664,20 @@ def _process_apply(store, run, processes):
         _fail("liveness")
 
 
+def _names_label(text, label) -> bool:
+    """True when a ``label<TAB><label>`` line of a QUOTA marker names exactly ``label``.
+
+    Exact on the whole label, so ``x`` never matches a marker for ``x2``.
+    """
+    if not isinstance(label, str):
+        return False
+    for raw in text.splitlines():
+        parts = raw.strip().split("\t")
+        if len(parts) == 2 and parts[0].strip() == "label" and parts[1].strip() == label:
+            return True
+    return False
+
+
 def _quota(pad, label, out_path, err_path, sid) -> bool:
     """True when this run's quota marker or a quota log names its failure.
 
@@ -687,7 +701,7 @@ def _quota(pad, label, out_path, err_path, sid) -> bool:
                 except OSError:
                     cached_text = ""
                 _quota_cache[quota_path] = (sig, cached_text)
-            if not cached_text.strip() or (isinstance(label, str) and label in cached_text) or (isinstance(sid, str) and sid in cached_text):
+            if not cached_text.strip() or _names_label(cached_text, label) or (isinstance(sid, str) and sid in cached_text):
                 return True
         except OSError:
             pass

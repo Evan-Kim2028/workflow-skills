@@ -140,9 +140,14 @@ class LauncherHelperTest(unittest.TestCase):
         self.assertIsNone(launch.validate_label("ws1-plan-visuals"))
 
     def test_quota_marks(self):
-        self.assertTrue(launch.quota_hit([{"error": "insufficient credits", "stop": "error"}]))
-        self.assertTrue(launch.quota_hit([{"error": "HTTP 402 payment required", "stop": "error"}]))
-        self.assertTrue(launch.quota_hit([{"error": "429 rate limit", "stop": "error"}]))
+        # Structured provider errors: a 402/429 status with a JSON error body, or Morph's text.
+        self.assertTrue(launch.quota_hit([{"error": '402: {"error":{"message":"insufficient credits"}}', "stop": "error"}]))
+        self.assertTrue(launch.quota_hit([{"error": "Rate limit exceeded", "stop": "error"}]))
+        # Bare substrings in an error line are not quota.
+        self.assertFalse(launch.quota_hit([{"error": "insufficient credits", "stop": "error"}]))
+        self.assertFalse(launch.quota_hit([{"error": "HTTP 402 payment required", "stop": "error"}]))
+        self.assertFalse(launch.quota_hit([{"error": "429 rate limit", "stop": "error"}]))
+        self.assertFalse(launch.quota_hit([{"error": "the balance is 4029 credits", "stop": "error"}]))
         self.assertFalse(launch.quota_hit([{"error": "connection reset", "stop": "error"}]))
 
     def test_recovered_429_is_not_quota_and_counts_as_a_retry(self):
@@ -164,7 +169,7 @@ class LauncherHelperTest(unittest.TestCase):
     def test_unrecovered_429_is_quota(self):
         # Last assistant message_end: nothing follows, so quota.
         self.assertTrue(
-            launch.quota_hit([{"error": "429: Account request rate limit exceeded for this model", "stop": "error"}])
+            launch.quota_hit([{"error": '429: {"message":"Account request rate limit exceeded","type":"rate_limit_error"}', "stop": "error"}])
         )
         # A 429 with no successful assistant message after it is unrecovered.
         tail = [
@@ -176,12 +181,12 @@ class LauncherHelperTest(unittest.TestCase):
 
     def test_credit_exhaustion_is_quota_even_when_recovered(self):
         recovered = [
-            {"error": "HTTP 402 payment required", "stop": "error"},
+            {"error": '402: {"error":{"message":"payment required"}}', "stop": "error"},
             {"error": None, "stop": "stop"},
         ]
         self.assertTrue(launch.quota_hit(recovered))
         self.assertTrue(
-            launch.quota_hit([{"error": None, "stop": "toolUse"}, {"error": "insufficient credits", "stop": "error"}])
+            launch.quota_hit([{"error": None, "stop": "toolUse"}, {"error": '402: {"error":{"message":"insufficient credits"}}', "stop": "error"}])
         )
 
     def test_clean_run_has_no_quota_and_no_retries(self):
@@ -520,6 +525,14 @@ class SourceTest(unittest.TestCase):
         run = self.store.runs[self.run_id("ws15-exec-legacy")]
         self.assertEqual(run["status"], "died_early")
         self.assertEqual(run["verdict"], "BLOCKED")
+
+    def test_legacy_quota_label_match_is_exact_not_substring(self):
+        # A legacy bare QUOTA naming "ws15-exec-quota2" must not block "ws15-exec-quota".
+        self.write_tsv([["ws15-exec-quota", SID, 1792000000, DEEPSEEK]])
+        (self.pad / "QUOTA").write_text("model\t%s\nlabel\tws15-exec-quota2\n" % DEEPSEEK, encoding="utf-8")
+        self.poll()
+        run = self.store.runs[self.run_id("ws15-exec-quota")]
+        self.assertNotEqual(run.get("verdict"), "BLOCKED")
 
     def test_quota_marker_for_a_sibling_label_does_not_block_this_run(self):
         self.write_tsv([["ws15-exec-quota3", SID, 1792000000, DEEPSEEK]])
