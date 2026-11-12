@@ -60,7 +60,17 @@ VERDICT_CHIPS = {
     "proxy_pacing": "Proxy pacing",
     "launching": "Launching",
     "headroom": "Headroom",
+    "held_laptop": "Laptop",
+    "held_ssh": "SSH slots",
+    "held_proxy": "Proxy pacing",
+    "held_workspace": "Workspace",
+    "held_other": "Held",
 }
+HOLD_DETAIL = re.compile(r"^hold ([^:]+): (.*)$", re.DOTALL)
+LOAD_HOLD = re.compile(r"load ([\d.]+) per cpu >= ([\d.]+)")
+MEMORY_HOLD = re.compile(r"memory free (\d+)% < (\d+)%")
+HOLD_GROUP_ORDER = ("laptop", "ssh", "proxy", "workspace", "other")
+HOLD_GROUP_KEYS = {group: f"held_{group}" for group in HOLD_GROUP_ORDER}
 RATE_WINDOW_MINUTES = 60
 SAMPLE_INTERVAL_S = 60.0
 SAMPLE_KEEP_S = 7 * 24 * 3600
@@ -137,6 +147,11 @@ WHERE minute >= ? AND minute < ?
 GROUP BY minute
 """
 JOBS_COUNT_SQL = "SELECT state, tier, COUNT(*) AS n FROM jobs GROUP BY state, tier"
+QUEUED_DS_DETAIL_SQL = """
+SELECT detail FROM jobs
+WHERE state = 'queued' AND tier = 'pi-deepseek-flash' AND detail IS NOT NULL AND detail != ''
+"""
+RUNNING_BY_RES_SQL = "SELECT res, COUNT(*) AS n FROM jobs WHERE state = 'running' GROUP BY res"
 JOBS_RECENT_SQL = """
 SELECT id, state, lane, tier, kind, verdict, label, submitted_at, started_at, finished_at
 FROM jobs ORDER BY submitted_at DESC LIMIT ?
@@ -1871,6 +1886,8 @@ def read_jobs(agentq_db: Path) -> dict:
     try:
         counts = connection.execute(JOBS_COUNT_SQL).fetchall()
         recent = connection.execute(JOBS_RECENT_SQL, (RECENT_JOBS,)).fetchall()
+        ds_holds = [row["detail"] for row in connection.execute(QUEUED_DS_DETAIL_SQL).fetchall()]
+        running = {row["res"]: row["n"] for row in connection.execute(RUNNING_BY_RES_SQL).fetchall()}
     finally:
         connection.close()
     by_state: dict[str, int] = {}
@@ -1878,7 +1895,10 @@ def read_jobs(agentq_db: Path) -> dict:
     for row in counts:
         by_state[row["state"]] = by_state.get(row["state"], 0) + row["n"]
         by_tier.setdefault(row["tier"], {})[row["state"]] = row["n"]
-    return {"by_state": by_state, "by_tier": by_tier, "recent": [dict(row) for row in recent]}
+    return {
+        "by_state": by_state, "by_tier": by_tier, "recent": [dict(row) for row in recent],
+        "ds_holds": ds_holds, "running_by_res": running,
+    }
 
 
 def read_queued(agentq_db: Path) -> int:
@@ -2541,6 +2561,95 @@ def proxy_waiting_by_budget(live: dict | None) -> dict[str, int] | None:
     }
 
 
+def split_hold(detail: str) -> tuple[str, str]:
+    """(gate, reason) from a queued job's detail, ``hold <gate>: <reason>``. A detail without that prefix has no gate."""
+    match = HOLD_DETAIL.match(detail)
+    return (match.group(1), match.group(2)) if match else ("", detail)
+
+
+def hold_group(gate: str, reason: str) -> str:
+    """The limit a held DeepSeek job waits on: a proxy budget, a workspace, an ssh slot, laptop load or memory, or other."""
+    if reason.startswith("proxy "):
+        return "proxy"
+    if reason == "workspace busy":
+        return "workspace"
+    if gate == "ssh":
+        return "ssh"
+    if gate in ("tests", "light") and (LOAD_HOLD.search(reason) or MEMORY_HOLD.search(reason)):
+        return "laptop"
+    return "other"
+
+
+def laptop_phrases(rows: list[tuple[str, str]]) -> list[str]:
+    """One phrase per gate and limit kind, quoting the worst reading: the highest load or the lowest free memory.
+
+    The broker refreshes each held job's reason on its own tick, so the numbers differ a little across jobs.
+    """
+    buckets: dict[tuple[str, str], list] = {}
+    for gate, reason in rows:
+        load, memory = LOAD_HOLD.search(reason), MEMORY_HOLD.search(reason)
+        if load:
+            kind, rank = "load", float(load.group(1))
+            text = f"load {rank:.2f} per CPU, limit {float(load.group(2)):.1f}"
+        else:
+            kind, rank = "memory", -float(memory.group(1))
+            text = f"memory {-rank:.0f}% free, floor {memory.group(2)}%"
+        bucket = buckets.setdefault((gate, kind), [0, rank, text])
+        bucket[0] += 1
+        if rank > bucket[1]:
+            bucket[1], bucket[2] = rank, text
+    return [
+        f"{count} {'test job' if gate == 'tests' else 'light job'}{'' if count == 1 else 's'} ({text})"
+        for (gate, _), (count, _, text) in buckets.items()
+    ]
+
+
+def hold_body(group: str, gate: str, reason: str, ssh_in_use: int | None) -> tuple[str, str]:
+    """(singular, plural) noun phrase for one held reason of a non-laptop group, without its count."""
+    if group == "ssh":
+        in_use = f" ({ssh_in_use} in use)" if ssh_in_use is not None else ""
+        return f"job waiting for a production ssh slot{in_use}", f"jobs waiting for a production ssh slot{in_use}"
+    if group == "proxy":
+        return (
+            f"DeepSeek job waiting at the Morph proxy ({reason})",
+            f"DeepSeek jobs waiting at the Morph proxy ({reason})",
+        )
+    if group == "workspace":
+        return "write job waiting for its workspace", "write jobs waiting for their workspace"
+    detail = f"{gate}: {reason}" if gate else reason
+    return f"job held ({detail})", f"jobs held ({detail})"
+
+
+def held_verdict(details: list[str], ssh_in_use: int | None) -> tuple[str, str] | None:
+    """(key, text) when ready DeepSeek jobs carry a broker hold, else None.
+
+    The chip follows the largest group of held jobs (ties keep HOLD_GROUP_ORDER). Each group names its
+    reasons with counts; the other groups follow after a semicolon.
+    """
+    groups: dict[str, list[tuple[str, str]]] = {}
+    for detail in details:
+        if detail:
+            gate, reason = split_hold(detail)
+            groups.setdefault(hold_group(gate, reason), []).append((gate, reason))
+    if not groups:
+        return None
+    primary = max(HOLD_GROUP_ORDER, key=lambda group: len(groups.get(group, ())))
+    phrases = []
+    for group in (primary, *(g for g in HOLD_GROUP_ORDER if g in groups and g != primary)):
+        if group == "laptop":
+            phrases.append("; ".join(laptop_phrases(groups[group])))
+            continue
+        counts: dict[tuple[str, str], int] = {}
+        for gate, reason in groups[group]:
+            body = hold_body(group, gate, reason, ssh_in_use)
+            counts[body] = counts.get(body, 0) + 1
+        phrases.append("; ".join(f"{n} {singular if n == 1 else plural}" for (singular, plural), n in counts.items()))
+    if primary == "laptop":
+        total = sum(len(rows) for rows in groups.values())
+        return HOLD_GROUP_KEYS[primary], f"{total} DeepSeek jobs held for laptop headroom: {'; '.join(phrases)}."
+    return HOLD_GROUP_KEYS[primary], f"{'; '.join(phrases)}."
+
+
 def verdict(
     raw: dict[int, dict],
     until: int,
@@ -2553,9 +2662,14 @@ def verdict(
     ds_jobs_ready: int | None,
     ds_p50_5m_ms: int | None,
     ds_p50_base_ms: int | None,
+    ds_holds: list[str] | None = None,
+    ssh_in_use: int | None = None,
 ) -> dict:
     """What limits the pool, from the last 5 complete minutes. The first matching rule wins:
     Morph limit, Morph slow, Laptop, Near capacity, Proxy pacing, Launching, Headroom.
+
+    Launching names the broker's hold reason when ready DeepSeek jobs carry one (``ds_holds``, the queued
+    jobs' detail strings), and says the broker is starting them otherwise.
 
     An enforced budget counts as hit when its 5-minute average reached AVERAGE_SATURATION_FRAC of its limit,
     or when upstream 429s named it in MORPH_429_MINUTES of the 5 minutes. The peak minute is context only: it
@@ -2621,8 +2735,10 @@ def verdict(
             f"while the pool is at {pool * 100:.0f}%."
         )
     elif ds_jobs_ready:
-        key = "launching"
-        text = f"Launching: {ds_jobs_ready} DeepSeek jobs are ready; the broker is starting them."
+        held = held_verdict(ds_holds or [], ssh_in_use)
+        key, text = held or (
+            "launching", f"Launching: {ds_jobs_ready} DeepSeek jobs are ready; the broker is starting them.",
+        )
     else:
         key = "headroom"
         text = f"Headroom: pool at {pool * 100:.0f}% of Morph's limit; room for more work."
@@ -2731,6 +2847,8 @@ def build_summary(
         ds_jobs_ready=int((jobs_by_tier.get("pi-deepseek-flash") or {}).get("queued") or 0),
         ds_p50_5m_ms=ds_p50_5m,
         ds_p50_base_ms=median_or_none(base_p50s),
+        ds_holds=(jobs or {}).get("ds_holds"),
+        ssh_in_use=int((jobs or {}).get("running_by_res", {}).get("ssh", 0)) if jobs else None,
     )
     room_now = room(
         raw, until, resolved,
