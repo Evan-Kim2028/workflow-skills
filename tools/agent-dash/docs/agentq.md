@@ -143,7 +143,7 @@ The queue limits whole jobs by their `--res` label. What a worker runs inside a 
 was unguarded, so `launch_pi.py` puts `agentq/shims/` first on PATH for the pi child.
 Five shell wrappers (`ssh`, `pytest`, `python`, `python3`, `uv`) in `agentq/shims/`
 decide in sh, with no Python start-up on the common path (`python3 -c pass` through the
-shim is about 35 ms, against 28 ms bare). Only a pytest argv, or an ssh argv naming a gated
+shim is about 31 ms, against 25 ms bare, measured interleaved). Only a pytest argv, or an ssh argv naming a gated
 host, reaches `agentq/shims/dispatch.py`. Everything else is exec'd with the same argv.
 Stdlib only; slots live in `agentq/slots.py`.
 
