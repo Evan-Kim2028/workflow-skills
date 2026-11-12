@@ -140,9 +140,14 @@ class LauncherHelperTest(unittest.TestCase):
         self.assertIsNone(launch.validate_label("ws1-plan-visuals"))
 
     def test_quota_marks(self):
-        self.assertTrue(launch.quota_hit([{"error": "insufficient credits", "stop": "error"}]))
-        self.assertTrue(launch.quota_hit([{"error": "HTTP 402 payment required", "stop": "error"}]))
-        self.assertTrue(launch.quota_hit([{"error": "429 rate limit", "stop": "error"}]))
+        # Structured provider errors: a 402/429 status with a JSON error body, or Morph's text.
+        self.assertTrue(launch.quota_hit([{"error": '402: {"error":{"message":"insufficient credits"}}', "stop": "error"}]))
+        self.assertTrue(launch.quota_hit([{"error": "Rate limit exceeded", "stop": "error"}]))
+        # Bare substrings in an error line are not quota.
+        self.assertFalse(launch.quota_hit([{"error": "insufficient credits", "stop": "error"}]))
+        self.assertFalse(launch.quota_hit([{"error": "HTTP 402 payment required", "stop": "error"}]))
+        self.assertFalse(launch.quota_hit([{"error": "429 rate limit", "stop": "error"}]))
+        self.assertFalse(launch.quota_hit([{"error": "the balance is 4029 credits", "stop": "error"}]))
         self.assertFalse(launch.quota_hit([{"error": "connection reset", "stop": "error"}]))
 
     def test_recovered_429_is_not_quota_and_counts_as_a_retry(self):
@@ -164,7 +169,7 @@ class LauncherHelperTest(unittest.TestCase):
     def test_unrecovered_429_is_quota(self):
         # Last assistant message_end: nothing follows, so quota.
         self.assertTrue(
-            launch.quota_hit([{"error": "429: Account request rate limit exceeded for this model", "stop": "error"}])
+            launch.quota_hit([{"error": '429: {"message":"Account request rate limit exceeded","type":"rate_limit_error"}', "stop": "error"}])
         )
         # A 429 with no successful assistant message after it is unrecovered.
         tail = [
@@ -176,12 +181,12 @@ class LauncherHelperTest(unittest.TestCase):
 
     def test_credit_exhaustion_is_quota_even_when_recovered(self):
         recovered = [
-            {"error": "HTTP 402 payment required", "stop": "error"},
+            {"error": '402: {"error":{"message":"payment required"}}', "stop": "error"},
             {"error": None, "stop": "stop"},
         ]
         self.assertTrue(launch.quota_hit(recovered))
         self.assertTrue(
-            launch.quota_hit([{"error": None, "stop": "toolUse"}, {"error": "insufficient credits", "stop": "error"}])
+            launch.quota_hit([{"error": None, "stop": "toolUse"}, {"error": '402: {"error":{"message":"insufficient credits"}}', "stop": "error"}])
         )
 
     def test_clean_run_has_no_quota_and_no_retries(self):
@@ -259,6 +264,145 @@ class LauncherHelperTest(unittest.TestCase):
         self.assertFalse(launch.quota_hit(events))
         self.assertEqual(launch.rate_limit_retries(events), 1)
         self.assertEqual(pi.final_text(raw), "PASS\nreport body")
+
+
+class LauncherQuotaMarkerTest(unittest.TestCase):
+    """launch_pi writes its quota marker per label, so runs sharing an outdir keep their own."""
+
+    def setUp(self):
+        from unittest import mock
+
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        self.state = root / "state"
+        self.ws = root / "ws"
+        self.ws.mkdir()
+        self.prompt = root / "prompt.md"
+        self.prompt.write_text("do the task\n", encoding="utf-8")
+        self.outdir = root / "pi"
+        patches = [
+            mock.patch.object(launch, "state_dir", return_value=self.state),
+            mock.patch.object(launch, "register_run_dir", return_value=None),
+            mock.patch.object(launch.logfilter, "run_filtered", return_value=0),
+        ]
+        for patch in patches:
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def run_pi(self, label, quota):
+        from unittest import mock
+
+        with mock.patch.object(launch, "quota_hit", return_value=quota):
+            return launch.main([label, str(self.ws), str(self.prompt), str(self.outdir), "--model", DEEPSEEK])
+
+    def test_quota_marker_names_its_label(self):
+        self.assertEqual(self.run_pi("ws1-exec-lane-1", True), 1)
+        marker = self.outdir / "QUOTA-ws1-exec-lane-1"
+        self.assertEqual(
+            marker.read_text(encoding="utf-8"),
+            "model\t%s\nlabel\tws1-exec-lane-1\n" % DEEPSEEK,
+        )
+        self.assertFalse((self.outdir / "QUOTA").exists())
+
+    def test_two_quota_runs_in_one_outdir_keep_two_markers(self):
+        self.run_pi("ws1-exec-lane-1", True)
+        self.run_pi("ws1-exec-lane-2", True)
+        self.assertTrue((self.outdir / "QUOTA-ws1-exec-lane-1").is_file())
+        self.assertTrue((self.outdir / "QUOTA-ws1-exec-lane-2").is_file())
+
+    def test_clean_run_writes_no_marker(self):
+        self.run_pi("ws1-exec-lane-3", False)
+        self.assertEqual([p.name for p in self.outdir.glob("QUOTA*")], [])
+
+
+class LauncherResumeTest(unittest.TestCase):
+    """AGENTQ_RESUME_SESSION forks the dead run's session into the new pi dir, or starts fresh."""
+
+    def setUp(self):
+        from unittest import mock
+
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        self.state = root / "state"
+        self.ws = root / "ws"
+        self.ws.mkdir()
+        self.prompt = root / "prompt.md"
+        self.prompt.write_text("do the task\n", encoding="utf-8")
+        self.outdir = root / "pi"
+        self.old_session = root / "old-pi" / "sessions" / "old.jsonl"
+        self.old_session.parent.mkdir(parents=True)
+        self.old_session.write_text('{"type":"session"}\n', encoding="utf-8")
+        self.calls = []
+        self.results = [0]
+        self.captured = []
+        patches = [
+            mock.patch.object(launch, "state_dir", return_value=self.state),
+            mock.patch.object(launch, "register_run_dir", return_value=None),
+            mock.patch.object(launch, "report_lines", side_effect=lambda state, lines: self.captured.extend(lines)),
+            mock.patch.object(launch, "quota_hit", return_value=False),
+            mock.patch.object(launch.logfilter, "run_filtered", side_effect=self.fake_pi),
+        ]
+        for patch in patches:
+            patch.start()
+            self.addCleanup(patch.stop)
+        env = mock.patch.dict(os.environ, {}, clear=False)
+        env.start()
+        self.addCleanup(env.stop)
+        os.environ.pop(launch.RESUME_ENV, None)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def fake_pi(self, argv, stream_path, **kwargs):
+        self.calls.append(list(argv))
+        rc = self.results[min(len(self.calls), len(self.results)) - 1]
+        Path(stream_path).write_bytes(b"")
+        return rc
+
+    def run_launcher(self, label="ws1-exec-lane-7"):
+        return launch.main([label, str(self.ws), str(self.prompt), str(self.outdir), "--model", DEEPSEEK])
+
+    def err_text(self, label="ws1-exec-lane-7"):
+        return (self.outdir / f"err-{label}.log").read_text(encoding="utf-8")
+
+    def test_resume_forks_the_old_session_into_the_new_pi_dir(self):
+        os.environ[launch.RESUME_ENV] = str(self.old_session)
+        self.results = [0]
+        self.run_launcher()
+        argv = self.calls[0]
+        self.assertEqual(argv[argv.index("--fork") + 1], str(self.old_session))
+        self.assertEqual(argv[argv.index("--session-dir") + 1], str(self.outdir / "sessions"))
+        self.assertIn(launch.RESUME_PROMPT, argv)
+        self.assertFalse(any(arg.startswith("@") for arg in argv))
+        self.assertEqual(len(self.calls), 1)
+        run = [line for line in self.captured if line.get("type") == "run"][-1]
+        self.assertEqual(run["resumed_from"], str(self.old_session))
+        self.assertNotIn(str(self.old_session.parent), " ".join(argv[argv.index("--session-dir") + 1:]))
+
+    def test_missing_session_file_starts_fresh_with_a_note(self):
+        os.environ[launch.RESUME_ENV] = str(self.old_session.parent / "gone.jsonl")
+        self.results = [0]
+        self.run_launcher()
+        self.assertEqual(len(self.calls), 1)
+        self.assertTrue(any(arg.startswith("@") for arg in self.calls[0]))
+        self.assertNotIn("--fork", self.calls[0])
+        self.assertIn("missing or empty; starting fresh", self.err_text())
+        run = [line for line in self.captured if line.get("type") == "run"][-1]
+        self.assertIsNone(run["resumed_from"])
+
+    def test_refused_resume_falls_back_to_a_fresh_launch(self):
+        os.environ[launch.RESUME_ENV] = str(self.old_session)
+        self.results = [1, 0]
+        self.run_launcher()
+        self.assertEqual(len(self.calls), 2)
+        self.assertIn("--fork", self.calls[0])
+        self.assertTrue(any(arg.startswith("@") for arg in self.calls[1]))
+        self.assertIn("pi refused", self.err_text())
+        run = [line for line in self.captured if line.get("type") == "run"][-1]
+        self.assertIsNone(run["resumed_from"])
 
 
 class SourceTest(unittest.TestCase):
@@ -368,11 +512,36 @@ class SourceTest(unittest.TestCase):
 
     def test_quota_file_finishes_died_early_blocked(self):
         self.write_tsv([["ws15-exec-quota", SID, 1792000000, DEEPSEEK]])
-        (self.pad / "QUOTA").write_text("model\t%s\nlabel\tws15-exec-quota\n" % DEEPSEEK, encoding="utf-8")
+        (self.pad / "QUOTA-ws15-exec-quota").write_text("model\t%s\nlabel\tws15-exec-quota\n" % DEEPSEEK, encoding="utf-8")
         self.poll()
         run = self.store.runs[self.run_id("ws15-exec-quota")]
         self.assertEqual(run["status"], "died_early")
         self.assertEqual(run["verdict"], "BLOCKED")
+
+    def test_legacy_bare_quota_file_naming_this_label_still_blocks_it(self):
+        self.write_tsv([["ws15-exec-legacy", SID, 1792000000, DEEPSEEK]])
+        (self.pad / "QUOTA").write_text("model\t%s\nlabel\tws15-exec-legacy\n" % DEEPSEEK, encoding="utf-8")
+        self.poll()
+        run = self.store.runs[self.run_id("ws15-exec-legacy")]
+        self.assertEqual(run["status"], "died_early")
+        self.assertEqual(run["verdict"], "BLOCKED")
+
+    def test_legacy_quota_label_match_is_exact_not_substring(self):
+        # A legacy bare QUOTA naming "ws15-exec-quota2" must not block "ws15-exec-quota".
+        self.write_tsv([["ws15-exec-quota", SID, 1792000000, DEEPSEEK]])
+        (self.pad / "QUOTA").write_text("model\t%s\nlabel\tws15-exec-quota2\n" % DEEPSEEK, encoding="utf-8")
+        self.poll()
+        run = self.store.runs[self.run_id("ws15-exec-quota")]
+        self.assertNotEqual(run.get("verdict"), "BLOCKED")
+
+    def test_quota_marker_for_a_sibling_label_does_not_block_this_run(self):
+        self.write_tsv([["ws15-exec-quota3", SID, 1792000000, DEEPSEEK]])
+        (self.pad / "QUOTA-ws15-exec-sibling").write_text(
+            "model\t%s\nlabel\tws15-exec-sibling\n" % DEEPSEEK, encoding="utf-8"
+        )
+        self.poll()
+        run = self.store.runs[self.run_id("ws15-exec-quota3")]
+        self.assertNotEqual(run.get("verdict"), "BLOCKED")
 
     def test_quota_error_log_finishes_died_early_blocked(self):
         self.write_tsv([["ws15-exec-quota2", SID, 1792000000, DEEPSEEK]])

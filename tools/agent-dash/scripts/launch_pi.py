@@ -17,7 +17,7 @@ Writes, in ``outdir``:
   <outdir>/out-<label>.md           final assistant text
   <outdir>/err-<label>.log          stderr
   <outdir>/running/<label>          "<pid>\\t<model>" while the run is live
-  <outdir>/QUOTA                    only on quota/credit exhaustion
+  <outdir>/QUOTA-<label>            only on quota/credit exhaustion
   <state-dir>/generic.jsonl         one start, one usage per assistant
                                     message, one finish line (run id
                                     ``pi:<session>:<label>``)
@@ -25,10 +25,19 @@ Writes, in ``outdir``:
 Quota/credit exhaustion (an ``errorMessage`` naming insufficient
 credit/quota/balance, HTTP 402, or a rate-limit 429 the run never
 recovered from) finishes ``died_early`` with verdict ``BLOCKED`` and
-writes ``QUOTA`` naming the model and label, so the lead knows to swap
+writes ``QUOTA-<label>`` naming the model and label, so the lead knows to swap
 the API key. A transient 429 pi auto-retried past is not quota: the
 summary line records it as ``rate_limit_retries=<n>``. ``outdir`` is
 registered in ``run-dirs.txt`` like ``run_worker.py`` does.
+
+``AGENTQ_RESUME_SESSION`` (set by the agentq broker on a relaunch after a run
+died without a report) names the dead run's pi session file. When it names a
+non-empty file, the launcher runs ``pi --fork <file> --session-dir <outdir>/sessions``
+with a continuation prompt instead of the task, so pi writes a new session
+into this run's folder and the old folder is only read. A missing file, or a
+resume pi exits on without output, falls back to the fresh launch with a note
+on stderr. The resumed-from path is recorded on the run's ``generic.jsonl``
+line (``resumed_from``) and in the summary line.
 
 The manifest's fifth cell is the tier: ``run_worker.py`` (``kind: pi``)
 passes the registry tier name with ``--tier``, so a DeepSeek run reads
@@ -69,13 +78,21 @@ _UUID = re.compile(
     r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
 )
 
-#: Quota/credit exhaustion markers in an assistant ``errorMessage``.
-_QUOTA_WORDS = ("insufficient", "credit", "quota", "balance", "payment required")
+#: A provider status code of 402 or 429 in an assistant ``errorMessage``:
+#: ``HTTP 429``, ``status 402``, ``"status": 429``, ``code 429``, or a leading
+#: ``429:`` (River's form). Lowercased text; a bare number elsewhere is not a status.
+_STATUS_CODE = re.compile(r'(?:^|\bhttp[ /]?|\bstatus"?\s*[:=]?\s*|\bcode"?\s*[:=]?\s*)(402|429)\b')
 
-#: Rate-limit markers: River's transient per-account 429 lands as
-#: ``errorMessage`` "429: ... rate_limit_error ... account_rate". pi
-#: auto-retries these, so they are quota only when nothing recovers.
-_RATE_LIMIT_MARKERS = ("429", "rate limit", "rate_limit_error", "account_rate")
+#: A JSON object body (``{"message": ...``), the structured half of a provider error.
+_JSON_BODY = re.compile(r'\{\s*"[^"]+"\s*:')
+
+#: Morph's rate-limit text, returned as a plain error line with no JSON body.
+_MORPH_RATE_LIMIT = "rate limit exceeded"
+
+
+def _status_with_body(text: str, code: str) -> bool:
+    """True when the text names HTTP ``code`` and carries a JSON error body."""
+    return any(m.group(1) == code for m in _STATUS_CODE.finditer(text)) and bool(_JSON_BODY.search(text))
 
 
 def tier_of(model: str | None) -> str:
@@ -117,12 +134,13 @@ def _event_text(ev) -> str:
 
 
 def _credit_hit(text: str) -> bool:
-    """Insufficient credit/quota/balance or HTTP 402: never transient."""
-    return "402" in text or any(word in text for word in _QUOTA_WORDS)
+    """HTTP 402 with a JSON error body: credit or quota exhausted, never transient."""
+    return _status_with_body(text, "402")
 
 
 def _rate_limit_hit(text: str) -> bool:
-    return any(marker in text for marker in _RATE_LIMIT_MARKERS)
+    """HTTP 429 with a JSON error body, or Morph's ``Rate limit exceeded`` text."""
+    return _status_with_body(text, "429") or _MORPH_RATE_LIMIT in text
 
 
 def _recovered(events: list[dict], index: int) -> bool:
@@ -304,6 +322,65 @@ def build_argv(label, workspace, prompt_file, outdir, model):
     ]
 
 
+RESUME_ENV = "AGENTQ_RESUME_SESSION"
+RESUME_PROMPT = (
+    "Your previous run was interrupted. Continue the task from where the session "
+    "left off; finish with the usual report and verdict line."
+)
+
+
+def resume_source(requested):
+    """The resume session file when ``requested`` names a non-empty file, else None."""
+    if not requested:
+        return None
+    path = Path(requested).expanduser()
+    try:
+        return path if path.is_file() and path.stat().st_size > 0 else None
+    except OSError:
+        return None
+
+
+def build_resume_argv(session_file, outdir, model):
+    """Fork the dead run's session into the new pi dir and send the continuation prompt.
+
+    ``--fork`` makes a new session from the old one, and ``--session-dir``
+    stores that new session under this run's ``sessions/``, so the old run's
+    folder is only read, never appended to.
+    """
+    return [
+        "pi",
+        "-p",
+        "--mode",
+        "json",
+        "--fork",
+        str(session_file),
+        "--session-dir",
+        str(Path(outdir) / "sessions"),
+        "--model",
+        model,
+        RESUME_PROMPT,
+    ]
+
+
+def run_pi(argv, stream, workspace, se):
+    """Run one pi command through the base64 filter into ``stream``; return its exit code."""
+    return logfilter.run_filtered(
+        argv,
+        stream,
+        cwd=str(Path(workspace).expanduser()),
+        stderr=se,
+        stdin=subprocess.DEVNULL,
+        warn=logfilter.warn_to(se),
+        detached=True,
+    )
+
+
+def pi_refused_resume(rc, stream) -> bool:
+    """True when a resume attempt exited non-zero and produced no assistant output."""
+    raw = stream.read_bytes() if stream.exists() else b""
+    return rc != 0 and not assistant_events(raw)
+
+
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     model = DEFAULT_MODEL
@@ -344,19 +421,25 @@ def main(argv=None):
     started = int(time.time())
     run_id = f"running/{label}"
     (out / run_id).write_text(f"{os.getpid()}\t{model}", encoding="utf-8")
+    requested = (os.environ.get(RESUME_ENV) or "").strip()
+    resume = resume_source(requested)
+    resumed_from = None
     with open(err, "a") as se:
         se.write(f"--- pi launch label {label} model {model} at {started}\n")
         se.flush()
-        # The event stream goes through the base64 filter; the child's exit code is kept.
-        rc = logfilter.run_filtered(
-            build_argv(label, workspace, local_prompt, out, model),
-            stream,
-            cwd=str(Path(workspace).expanduser()),
-            stderr=se,
-            stdin=subprocess.DEVNULL,
-            warn=logfilter.warn_to(se),
-            detached=True,
-        )
+        if requested and resume is None:
+            se.write(f"resume: {requested} is missing or empty; starting fresh\n")
+            se.flush()
+        if resume is not None:
+            rc = run_pi(build_resume_argv(resume, out, model), stream, workspace, se)
+            if pi_refused_resume(rc, stream):
+                se.write(f"resume: pi refused {resume} (exit {rc}, no output); starting fresh\n")
+                se.flush()
+                resume = None
+            else:
+                resumed_from = str(resume)
+        if resume is None:
+            rc = run_pi(build_argv(label, workspace, local_prompt, out, model), stream, workspace, se)
     try:
         os.unlink(out / run_id)
     except FileNotFoundError:
@@ -379,7 +462,7 @@ def main(argv=None):
         fh.write(f"{label}\t{sid}\t{started}\t{model}\t{tier}\n")
 
     if quota:
-        (out / "QUOTA").write_text(f"model\t{model}\nlabel\t{label}\n", encoding="utf-8")
+        (out / f"QUOTA-{label}").write_text(f"model\t{model}\nlabel\t{label}\n", encoding="utf-8")
         verdict, status = "BLOCKED", "died_early"
     else:
         verdict = verdict_of(text)
@@ -415,12 +498,14 @@ def main(argv=None):
             "status": status,
             "verdict": verdict,
             "ended_at": float(ended),
+            "resumed_from": resumed_from,
         }
     )
     report_lines(state_dir(), lines)
     print(
         f"launched pi {label} model {model} status {status} verdict {verdict}"
         f" rate_limit_retries={retries}"
+        + (f" resumed_from={resumed_from}" if resumed_from else "")
     )
     return 0 if status == "done" and rc == 0 else 1
 

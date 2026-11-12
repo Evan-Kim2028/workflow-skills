@@ -53,6 +53,17 @@ launcher with ``AGENT_DASH_PI_ENV_FILE`` set to that path, so the launcher
 sources the standby credential instead of the primary one. The path is
 only passed through; no key is ever read or printed here.
 
+Two caps gate a launch. The pool is the live workers of one base model across
+every tier that runs it (``pi-deepseek-flash`` and ``pi-deepseek-flash-low``
+both run ``morph/morph-dsv41flash-1017``; a ``:<level>`` suffix is a thinking
+level and is stripped). Its limit is the registry's ``model_caps`` entry for
+the model when it has one, else the largest enabled tier ``cap`` among those
+tiers, so a smaller tier's cap never throttles a bigger one. The tier is its
+own pattern's live count against its own ``cap``. A launch is refused when
+either is full. A named tier at its limit gets
+``STATUS: failed reason=none-available`` at once, the same answer ``auto``
+gives when nothing is eligible; nothing waits.
+
 Prints one line:
 STATUS: running|done|failed out=<report> err=<stderr> tier=<name> [reason=...]
 """
@@ -73,6 +84,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+
+from dash.caps import PgrepFailed, as_int, base_model, cap_block  # noqa: E402
 
 RUN_RULE = (
     "RUN RULE: this is one non-interactive turn. Keep calling tools until the task is complete, "
@@ -546,6 +559,19 @@ def pick_initial(ctx):
         return None, "unknown-tier"
     if not worker.get("enabled", True):
         return None, "disabled"
+    try:
+        block = cap_block(ctx["registry"], worker, ctx["hooks"]["pgrep"])
+    except PgrepFailed as exc:
+        print(f"cap: {name} refused, cannot count live workers: {exc}; not launching", file=sys.stderr)
+        return None, "none-available"
+    if block is not None:
+        which, live, limit = block
+        print(
+            f"cap: {name} is full: its {which} is at {live} of {limit} "
+            f"for {base_model(worker.get('model'))}; not launching",
+            file=sys.stderr,
+        )
+        return None, "none-available"
     return name, None
 
 
@@ -737,13 +763,14 @@ def eligible(ctx, skip):
                 file=sys.stderr,
             )
             continue
-        try:
-            cap = int(worker.get("cap"))
-        except (TypeError, ValueError):
+        if as_int(worker.get("cap")) is None:
             continue
-        pattern = worker.get("pgrep") or ""
-        count = ctx["hooks"]["pgrep"](pattern) if pattern else 0
-        if count >= cap:
+        try:
+            blocked = cap_block(ctx["registry"], worker, ctx["hooks"]["pgrep"])
+        except PgrepFailed as exc:
+            print(f"auto: skipping {launch_name}: cannot count live workers: {exc}", file=sys.stderr)
+            continue
+        if blocked is not None:
             continue
         return launch_name
     return None
@@ -847,14 +874,16 @@ def outcome(worker, out_path, err_path):
 def quota_file_hit(ctx) -> bool:
     """True when a launcher QUOTA marker names this label from this attempt.
 
-    ``launch_pi.py`` writes a shared ``QUOTA`` file (``model`` and
-    ``label`` lines) and ``launch_codex.py`` writes ``QUOTA-<label>``:
-    both land beside the launcher's outdir, which the log-pattern scan
-    cannot see when the worker's quota error never reaches the report
-    tails (an empty report with a quota marker is a quota hit, not an
-    empty report). Only a marker naming this label and written after
-    this attempt's tier file counts, so a previous attempt's marker (or
-    another label sharing the outdir) never cools this launch.
+    ``launch_pi.py`` and ``launch_codex.py`` both write ``QUOTA-<label>``
+    (``model`` and ``label`` lines) beside the launcher's outdir, which the
+    log-pattern scan cannot see when the worker's quota error never reaches
+    the report tails (an empty report with a quota marker is a quota hit,
+    not an empty report). The name is per run, so runs sharing an outdir
+    each keep their own marker. Only a marker naming this label and written
+    after this attempt's tier file counts, so a previous attempt's marker
+    never cools this launch. The bare ``pi/QUOTA`` file that launchers
+    wrote before the per-label name is still read, matched on its label
+    line the same way, so a pi run started before the change is seen.
     """
     label = ctx.get("label") or ""
     try:
@@ -863,10 +892,9 @@ def quota_file_hit(ctx) -> bool:
         return False
     base = Path(ctx["run_dir"])
     candidates = [
-        base / "QUOTA",
-        base / "pi" / "QUOTA",
         base / f"QUOTA-{label}",
         base / "pi" / f"QUOTA-{label}",
+        base / "pi" / "QUOTA",
         base / "codex" / f"QUOTA-{label}",
     ]
     for path in candidates:
@@ -1198,6 +1226,7 @@ def pid_alive(pid) -> bool:
 
 
 def pgrep_count(pattern: str) -> int:
+    """Live processes matching ``pattern``. Raises ``PgrepFailed`` when the count cannot be read."""
     if not pattern:
         return 0
     cmd = ["pgrep", "-f"]
@@ -1206,10 +1235,13 @@ def pgrep_count(pattern: str) -> int:
     cmd.append(pattern)
     try:
         proc = subprocess.run(cmd, check=False, capture_output=True, text=True, timeout=2)
-    except (OSError, subprocess.TimeoutExpired):
-        return 0
+    except subprocess.TimeoutExpired as exc:
+        raise PgrepFailed(f"pgrep timed out for {pattern!r}") from exc
+    except OSError as exc:
+        raise PgrepFailed(f"pgrep could not run: {exc}") from exc
     if proc.returncode not in (0, 1):
-        return 0
+        detail = (proc.stderr or "").strip() or "no stderr"
+        raise PgrepFailed(f"pgrep exited {proc.returncode} for {pattern!r}: {detail}")
     return len([line for line in proc.stdout.splitlines() if line.strip()])
 
 
