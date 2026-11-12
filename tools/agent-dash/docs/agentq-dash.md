@@ -6,7 +6,9 @@ each limit, worker counts, 429s, queue wait and recent jobs.
 ## URL and process
 
 - Page: `http://127.0.0.1:18791/` (bound to loopback only; `--port` overrides).
-- JSON: `http://127.0.0.1:18791/api/summary?hours=1|6|24` (default 6).
+- JSON: `http://127.0.0.1:18791/api/summary?hours=1|6|24|168` (default 6; 168 is the 7 d range, other values return 400).
+- Log: `http://127.0.0.1:18791/api/log?source=proxy|broker&page=N&q=text` returns 100 lines a page, newest first, read from the last 5 MB of `$AGENTQ_HOME/logs/proxy.err.log` or `logs/broker.log`. Lines naming an Authorization header or an api key are dropped with their continuation lines. Only those two fixed files are readable.
+- Page: `/?range=1h|6h|24h|7d` selects the range on load.
 - Run: `python3 tools/agent-dash/agentq/dash.py`. Launchd unit template:
   `tools/agent-dash/agentq/launchd/com.agentq.dash.plist` (placeholders
   `__HOME__` and `__PYTHON__`; logs go to `$AGENTQ_HOME/logs/dash.log`).
@@ -30,7 +32,7 @@ A source that fails shows as null or empty in the JSON and is named under
 
 ## Cadence and cost
 
-- The page polls `/api/summary` every 30 s, and only while the tab is visible.
+- The page polls `/api/summary` every 30 s (every 120 s on the 7 d range), and only while the tab is visible.
   Hiding the tab stops polling; showing it again refreshes at once.
 - The sampler runs one `ps -E -axo pid=,command=` call and one count query on
   `agentq.db` each minute, whether or not anyone has the page open. That is the
@@ -51,3 +53,10 @@ A source that fails shows as null or empty in the JSON and is named under
   proxy overshooting a limit within a minute; the y-axis grows to fit them.
 - A queue worker is a launch_pi process whose environment has
   `AGENTQ_JOB=<12 hex>`. Every other launch_pi process counts as direct.
+
+## Ranges and buckets
+
+- 24 h aggregates to 5-minute buckets and 7 d to 30-minute buckets: counts are summed, the p95 wait is the worst minute, the % of limit is the mean over the bucket's minutes, and worker samples are averaged.
+- The token chart stacks cache read, uncached input and output per interval, with the running total as a line on the right axis.
+- The total pool % uses tokens admitted in each UTC minute (`proxy_calib.billed`) where that row exists, and falls back to completion-minute totals from `proxy_minutes` otherwise.
+- DeepSeek output is measured against the stated 70k per minute. Morph has not enforced that per-minute output limit, so values above 100% are marked as such rather than as rejections. Kimi uncached is an estimate computed by the proxy, not Morph's own tally.
