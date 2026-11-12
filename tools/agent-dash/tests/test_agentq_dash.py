@@ -1202,6 +1202,65 @@ class BudgetRateLimitLogTest(unittest.TestCase):
         self.assertEqual(found, {"total": {UNTIL - 60}})
 
 
+class RunsAxisTest(unittest.TestCase):
+    CAPS = {"deepseek": 96, "kimi": 2}
+
+    def workers(self, ds: int, kimi: int = 0, queued: int = 0) -> list[dict]:
+        return [{"ts": 0.0, "ds_workers": ds, "kimi_workers": kimi, "queued_jobs": queued}]
+
+    def test_axis_top_follows_the_data_not_the_96_cap(self) -> None:
+        axis = dash.runs_axis(self.workers(ds=55, kimi=15, queued=3), self.CAPS)
+        self.assertEqual(axis["max"], 75)
+        self.assertEqual(axis["ticks"], [0, 25, 50, 75])
+
+    def test_axis_has_a_floor_of_ten_and_integer_ticks(self) -> None:
+        empty = dash.runs_axis([], self.CAPS)
+        self.assertEqual(empty["max"], 10)
+        self.assertEqual(empty["ticks"], [0, 5, 10])
+        for peak in (1, 7, 13, 40, 97, 310):
+            axis = dash.runs_axis(self.workers(ds=peak), self.CAPS)
+            self.assertGreaterEqual(axis["max"], peak * 1.15)
+            self.assertEqual(axis["ticks"][0], 0)
+            self.assertEqual(axis["ticks"][-1], axis["max"])
+            self.assertTrue(all(isinstance(t, int) for t in axis["ticks"]), peak)
+            self.assertTrue(2 <= len(axis["ticks"]) - 1 <= 5, peak)
+
+    def test_cap_above_the_axis_is_off_scale_and_cap_inside_is_on_scale(self) -> None:
+        axis = dash.runs_axis(self.workers(ds=55, kimi=15), self.CAPS)
+        by_label = {cap["label"]: cap for cap in axis["caps"]}
+        self.assertEqual(by_label["DeepSeek cap 96"]["on_scale"], False)
+        self.assertEqual(by_label["Kimi cap 2"]["on_scale"], True)
+        inside = dash.runs_axis(self.workers(ds=55), {"deepseek": 64, "kimi": 2})
+        self.assertTrue(all(cap["on_scale"] for cap in inside["caps"]))
+        self.assertEqual(inside["max"], 75)
+
+    def test_summary_carries_the_runs_axis_for_the_page(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = make_home(Path(tmp))
+            summary = dash.build_summary(home, 1, now=NOW, fetch_live=lambda: None)
+        self.assertEqual(set(summary["runs_axis"]), {"max", "ticks", "caps"})
+        self.assertEqual(summary["runs_axis"]["max"], dash.runs_axis(summary["workers"], summary["caps"])["max"])
+
+    def test_workers_chart_reads_the_axis_and_labels_off_scale_caps(self) -> None:
+        html = dash.PAGE_HTML
+        start = html.index('registerChart("c-workers"')
+        block = html[start:html.index("var mix =", start)]
+        self.assertIn("y: { min: 0, max: axis.max, ticks: axis.ticks, fmt: intFmt }", block)
+        self.assertNotIn("niceTicks(Math.max(caps.deepseek", block)
+        self.assertIn("c.on_scale", block)
+        self.assertIn("(off scale)", block)
+        self.assertIn("height: PAIR_LAYOUT.height", block)
+        self.assertIn("margin: PAIR_LAYOUT.margin", block)
+
+    def test_draw_chart_places_off_scale_labels_top_right_without_a_line(self) -> None:
+        html = dash.PAGE_HTML
+        start = html.index("(cfg.offScale || []).forEach")
+        block = html[start:html.index("var refPlaced", start)]
+        self.assertIn('"text-anchor": "end"', block)
+        self.assertIn("y: m.t + 13", block)
+        self.assertNotIn('"stroke-dasharray"', block)
+
+
 class CapacityPairTest(unittest.TestCase):
     def test_paired_charts_share_one_layout_object_for_height_and_margins(self) -> None:
         html = dash.PAGE_HTML

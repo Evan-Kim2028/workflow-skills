@@ -819,6 +819,12 @@ td.wrap .cont { color: var(--ink-3); display: block; }
     refs.forEach(function (r) {
       svgEl("line", { x1: m.l, x2: W - m.r, y1: Y(r.v), y2: Y(r.v), stroke: "var(--ink-3)", "stroke-width": 1, "stroke-dasharray": "5 4" }, svg);
     });
+    (cfg.offScale || []).forEach(function (text, i) {
+      svgEl("text", {
+        x: W - m.r - 6, y: m.t + 13 + i * 15, "text-anchor": "end", class: "direct",
+        style: "fill: var(--ink-3); stroke: var(--surface); stroke-width: 3px; paint-order: stroke"
+      }, svg).textContent = text;
+    });
     var refPlaced = refs.map(function (r) { return { text: r.label, y: Y(r.v) - 5 }; })
       .sort(function (a, b) { return a.y - b.y; });
     refPlaced.forEach(function (r, i) {
@@ -1146,15 +1152,12 @@ td.wrap .cont { color: var(--ink-3); display: block; }
     var unit = unitLabel(bucket);
     var fmtX = d.hours >= 168 ? dateHM : hm;
     var minutes = d.minutes || [];
-    var caps = d.caps || { deepseek: 64, kimi: 2 };
+    var axis = d.runs_axis;
     var tb = d.token_bucket_s || bucket;
     var tunit = unitLabel(tb);
     var workers = (d.workers || []).map(function (w) {
       return { t: w.ts, ds: w.ds_workers, kimi: w.kimi_workers, queued: w.queued_jobs };
     });
-    var maxWorkers = workers.reduce(function (a, w) {
-      return Math.max(a, w.ds || 0, w.kimi || 0, w.queued || 0);
-    }, 0);
     var PAIR_LAYOUT = { height: 260, margin: { l: 64, r: 16, t: 14, b: 24 } };
     var pctFmt = function (v, inline) { return inline ? (v * 100).toFixed(1) + "%" : Math.round(v * 100) + "%"; };
     var intFmt = function (v) { return Math.round(v).toLocaleString("en-US"); };
@@ -1181,8 +1184,9 @@ td.wrap .cont { color: var(--ink-3); display: block; }
         { key: "kimi", name: "Kimi runs", color: COLORS.s2 },
         { key: "queued", name: "Queued jobs", color: COLORS.s3 }
       ],
-      y: niceTicks(Math.max(caps.deepseek, maxWorkers), 4),
-      refs: [{ v: caps.deepseek, label: "DeepSeek cap " + caps.deepseek }, { v: caps.kimi, label: "Kimi cap " + caps.kimi }],
+      y: { min: 0, max: axis.max, ticks: axis.ticks, fmt: intFmt },
+      refs: axis.caps.filter(function (c) { return c.on_scale; }).map(function (c) { return { v: c.value, label: c.label }; }),
+      offScale: axis.caps.filter(function (c) { return !c.on_scale; }).map(function (c) { return c.label + " \u2191 (off scale)"; }),
       fmt: intFmt
     });
     var mix = (d.token_mix || []).map(function (p) {
@@ -2066,6 +2070,32 @@ def bucket_minutes(points: list[dict], size: int) -> list[dict]:
     return buckets
 
 
+RUNS_AXIS_KEYS = ("ds_workers", "kimi_workers", "queued_jobs")
+RUNS_AXIS_HEADROOM = 1.15
+RUNS_AXIS_MIN = 10
+RUNS_AXIS_STEPS = tuple(sorted({m * 10**k for k in range(7) for m in (1, 2, 5, 10, 20, 25, 50)}))
+CAP_LABELS = {"deepseek": "DeepSeek cap", "kimi": "Kimi cap"}
+
+
+def runs_axis(workers: list[dict], caps: dict[str, int]) -> dict:
+    """Integer y axis for the active-runs chart, fitted to the plotted series.
+
+    The top is the smallest whole-number ceiling of 1.15 x the largest plotted value (at least 10) that a
+    whole-number step divides into 3 or 4 intervals (2 to 5 when no step fits). Each cap says whether it
+    falls inside that axis; a cap above the top is flagged off scale instead of stretching the axis.
+    """
+    peak = max((w[key] for w in workers for key in RUNS_AXIS_KEYS if w.get(key)), default=0)
+    want = max(RUNS_AXIS_MIN, math.ceil(peak * RUNS_AXIS_HEADROOM))
+    options = [(step * math.ceil(want / step), -step, step, math.ceil(want / step)) for step in RUNS_AXIS_STEPS]
+    preferred = [option for option in options if 3 <= option[3] <= 4] or [option for option in options if 2 <= option[3] <= 5]
+    top, _, step, intervals = min(preferred)
+    cap_rows = [
+        {"value": caps[key], "label": f"{CAP_LABELS[key]} {caps[key]}", "on_scale": caps[key] <= top}
+        for key in ("deepseek", "kimi") if key in caps
+    ]
+    return {"max": top, "ticks": [step * i for i in range(intervals + 1)], "caps": cap_rows}
+
+
 def bucket_workers(samples: list[dict], size: int) -> list[dict]:
     """Worker samples averaged per bucket of ``size`` seconds; ``None`` values are left out of the mean."""
     if size <= 60:
@@ -2829,6 +2859,7 @@ def build_summary(
     token_bucket = TOKEN_BUCKET_S[hours]
     token_minutes = bucket_minutes(minute_points, token_bucket)
     range_verdicts = _guard("range_verdicts", errors, read_verdicts, {}, agentq_db, float(since), float(until))
+    workers_bucketed = bucket_workers(samples, bucket)
     kpis = run_kpis(runs, day, caps, verdicts)
     laptop_now = laptop if laptop is not None else laptop_reading(home, now)
     baseline_raw = raw if hours >= 6 else _guard("minutes_6h", errors, read_minute_rows, {}, agentq_db, until - 6 * 3600, until)
@@ -2877,7 +2908,8 @@ def build_summary(
         "token_bucket_s": token_bucket,
         "range_totals": range_totals(raw, since, until, runs, range_verdicts),
         "jobs": jobs,
-        "workers": bucket_workers(samples, bucket),
+        "workers": workers_bucketed,
+        "runs_axis": runs_axis(workers_bucketed, caps),
         "caps": caps,
         "runs": table_runs(runs),
         "run_kpis": kpis,
