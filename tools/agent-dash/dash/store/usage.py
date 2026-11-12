@@ -1056,6 +1056,17 @@ class UsageMixin:
                 _perf.record_cache("usage_fold", "full")
             self._usage_cache = (self._data_seq, self._usage_folds)
             return dict(self._usage_folds)
+        def usage_marks(self) -> tuple[int, dict, int]:
+            """Usage write marks for incremental readers, read under the lock.
+
+            Returns ``(epoch, per_run_versions, unattributed_version)``.
+            ``epoch`` moves on bulk rewrites, ``per_run_versions`` on every
+            write that names a run, and ``unattributed_version`` on writes
+            with no run. A reader that keeps the marks it last saw knows
+            exactly which runs changed since.
+            """
+            with self._lock:
+                return self._usage_fold_epoch, dict(self._usage_run_versions), self._usage_unattributed_version
         def _refold_runs_locked(self, run_ids: list) -> None:
             """Refold exactly ``run_ids`` in place. Caller holds the lock.
 

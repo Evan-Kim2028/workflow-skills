@@ -3596,40 +3596,190 @@ def _labels_plan_tasks(ctx, workstreams: list) -> dict:
         return {ws: [] for ws in workstreams}
 
 
+#: Billed tokens of one usage row, summed per run in SQL.
+_TOKEN_SUM = (
+    "SUM(COALESCE(input_tokens,0) + COALESCE(output_tokens,0)"
+    " + COALESCE(cache_read,0) + COALESCE(cache_write,0))"
+)
+
+#: Full rescan interval: bounds any usage change the store's write marks missed.
+_TOKEN_SUMS_FULL_EVERY_S = 6 * 3600.0
+
+#: Run ids per ``IN (...)`` lookup in an incremental refresh.
+_TOKEN_SUMS_CHUNK = 500
+
+
+class _TokenSumState:
+    """Per-run billed-token sums for one database, kept current from the store's write marks.
+
+    ``seen`` holds the per-run write versions the sums were computed at;
+    ``unattributed`` the version of the no-run group. A refresh recomputes
+    only runs whose version moved.
+    """
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.epoch: int | None = None
+        self.seen: dict = {}
+        self.unattributed: int | None = None
+        self.built_at: float | None = None
+        self.events: dict = {}
+        self.rollup: dict = {}
+
+
+_TOKEN_STATES: dict[str, _TokenSumState] = {}
+_TOKEN_STATES_LOCK = threading.Lock()
+
+
 def _labels_usage_tokens(ctx) -> dict:
     """Billed tokens per run id, read-only. Never raises.
 
-    Rolled bundles rejoin with exact token sums per run.
+    Rolled bundles rejoin with exact token sums per run. A live store
+    keeps the sums current from its usage write marks, so a run pays
+    for a rescan only when its usage changed; without a live store the
+    sums come from a fresh scan of both tables.
     """
     db = _db_file(ctx)
     if db is None or not db.is_file():
         return {}
+    if callable(getattr(ctx.store, "usage_marks", None)):
+        try:
+            return _incremental_token_sums(ctx.store, db)
+        except sqlite3.Error:
+            pass
+    return _scan_token_sums(db)
+
+
+def _full_token_sums(conn) -> tuple[dict, dict]:
+    """Per-run billed tokens from ``usage_events`` and ``usage_rollup_1h``: one full scan of each."""
+    events = {
+        row["run_id"]: int(row["tokens"] or 0)
+        for row in conn.execute(
+            f"SELECT run_id AS run_id, {_TOKEN_SUM} AS tokens FROM usage_events GROUP BY run_id"
+        ).fetchall()
+    }
+    rollup = {
+        row["run_id"]: int(row["tokens"] or 0)
+        for row in conn.execute(
+            f"SELECT run_id AS run_id, {_TOKEN_SUM} AS tokens FROM usage_rollup_1h GROUP BY run_id"
+        ).fetchall()
+    }
+    return events, rollup
+
+
+def _run_token_sums(conn, run_ids: list) -> tuple[dict, dict]:
+    """Per-run billed tokens for the named runs; ``None`` names the no-run group.
+
+    Each lookup uses the run_id index, so the cost follows the runs named,
+    not the table size.
+    """
+    events: dict = {}
+    rollup: dict = {}
+    named = [run for run in run_ids if run is not None]
+    for table, out in (("usage_events", events), ("usage_rollup_1h", rollup)):
+        for pos in range(0, len(named), _TOKEN_SUMS_CHUNK):
+            chunk = named[pos:pos + _TOKEN_SUMS_CHUNK]
+            placeholders = ",".join("?" for _ in chunk)
+            for row in conn.execute(
+                f"SELECT run_id AS run_id, {_TOKEN_SUM} AS tokens FROM {table}"
+                f" WHERE run_id IN ({placeholders}) GROUP BY run_id",
+                chunk,
+            ).fetchall():
+                out[row["run_id"]] = int(row["tokens"] or 0)
+        if None in run_ids:
+            for row in conn.execute(
+                f"SELECT run_id AS run_id, {_TOKEN_SUM} AS tokens FROM {table}"
+                " WHERE run_id IS NULL GROUP BY run_id"
+            ).fetchall():
+                out[row["run_id"]] = int(row["tokens"] or 0)
+    return events, rollup
+
+
+def _merged_token_sums(events: dict, rollup: dict) -> dict:
+    """Key the per-run sums by run id text, adding each run's rolled-up tokens."""
+    out = {str(run): tokens for run, tokens in events.items()}
+    for run, tokens in rollup.items():
+        key = str(run)
+        out[key] = out.get(key, 0) + tokens
+    return out
+
+
+def _scan_token_sums(db) -> dict:
+    """Billed tokens per run from a fresh read-only scan. Never raises."""
     try:
         conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
     except sqlite3.Error:
         return {}
     try:
         conn.row_factory = sqlite3.Row
-        rows = conn.execute(
-            """SELECT run_id AS run_id,
-                      SUM(COALESCE(input_tokens,0) + COALESCE(output_tokens,0)
-                          + COALESCE(cache_read,0) + COALESCE(cache_write,0)) AS tokens
-               FROM usage_events GROUP BY run_id"""
-        ).fetchall()
-        out = {str(row["run_id"]): int(row["tokens"] or 0) for row in rows}
-        for row in conn.execute(
-            """SELECT run_id AS run_id,
-                      SUM(COALESCE(input_tokens,0) + COALESCE(output_tokens,0)
-                          + COALESCE(cache_read,0) + COALESCE(cache_write,0)) AS tokens
-               FROM usage_rollup_1h GROUP BY run_id"""
-        ).fetchall():
-            key = str(row["run_id"])
-            out[key] = out.get(key, 0) + int(row["tokens"] or 0)
-        return out
+        events, rollup = _full_token_sums(conn)
     except sqlite3.Error:
         return {}
     finally:
         conn.close()
+    return _merged_token_sums(events, rollup)
+
+
+def _token_state(db) -> _TokenSumState:
+    key = str(db)
+    with _TOKEN_STATES_LOCK:
+        state = _TOKEN_STATES.get(key)
+        if state is None:
+            state = _TOKEN_STATES[key] = _TokenSumState()
+        return state
+
+
+def _incremental_token_sums(store, db) -> dict:
+    """Current per-run billed tokens, recomputing only runs the store marked written.
+
+    The write marks are read before any query, so a write that lands
+    during a refresh is marked again and picked up by the next one. A
+    full rescan runs on first use, after a bulk rewrite (the epoch
+    moved), and at least every ``_TOKEN_SUMS_FULL_EVERY_S``.
+    """
+    epoch, versions, unattributed = store.usage_marks()
+    state = _token_state(db)
+    with state.lock:
+        now = time.monotonic()
+        full = (
+            state.built_at is None
+            or state.epoch != epoch
+            or now - state.built_at >= _TOKEN_SUMS_FULL_EVERY_S
+        )
+        conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        try:
+            conn.row_factory = sqlite3.Row
+            if full:
+                events, rollup = _full_token_sums(conn)
+                state.events, state.rollup = events, rollup
+                state.seen = dict(versions)
+                state.epoch = epoch
+                state.unattributed = unattributed
+                state.built_at = now
+            else:
+                dirty = [run for run, version in versions.items() if state.seen.get(run) != version]
+                targets = dirty + ([None] if unattributed != state.unattributed else [])
+                if targets:
+                    events, rollup = _run_token_sums(conn, targets)
+                    for run in targets:
+                        _set_or_drop(state.events, run, events)
+                        _set_or_drop(state.rollup, run, rollup)
+                state.seen.update({run: versions[run] for run in dirty})
+                state.unattributed = unattributed
+        except sqlite3.Error:
+            state.built_at = None
+            raise
+        finally:
+            conn.close()
+        return _merged_token_sums(state.events, state.rollup)
+
+
+def _set_or_drop(target: dict, run, fresh: dict) -> None:
+    """Take ``run``'s recomputed sum; a run with no rows leaves the map."""
+    if run in fresh:
+        target[run] = fresh[run]
+    else:
+        target.pop(run, None)
 
 
 #: Sources that a guarded launch path creates: ``muse`` and ``glm``

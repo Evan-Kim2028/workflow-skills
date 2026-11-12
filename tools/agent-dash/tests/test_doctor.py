@@ -3,6 +3,7 @@ import os
 os.environ["AGENT_DASH_IGNORE_LOCAL"] = "1"
 import io
 import json
+import sqlite3
 import sys
 import tempfile
 import threading
@@ -10,12 +11,14 @@ import time
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import agent_dash
 from agent_dash import default_cfg, main
+from dash import doctor as doctor_mod
 from dash.doctor import format_human, run_doctor
 from dash.server import DashServer
 from dash.sources import Registry
@@ -2929,6 +2932,117 @@ class LinearDoctorTest(unittest.TestCase):
         env = dict(self.env_clean, LINEAR_API_KEY="lin_test_key")
         self.assertEqual(self._linear_items(self._collect(env)), [])
 
+
+class LabelTokenSumsTest(unittest.TestCase):
+    """Per-run billed tokens for the labels check match the historic full scan,
+    and a refresh with no new usage does not rescan the usage table."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db = Path(self.tmp.name) / "dash.sqlite"
+        self.store = Store(self.db)
+        self.ctx = SimpleNamespace(store=self.store, cfg={})
+        self.ts = time.time() - 600
+        for index, run in enumerate(["ws1-a", "ws1-a", "ws2-b", None]):
+            self.add(run, index, tool="muse", input_tokens=100 + index, output=20)
+        self.add("ws2-b", 9, tool="grok-context", input_tokens=7, output=0)
+
+    def tearDown(self):
+        self.store.close()
+        self.tmp.cleanup()
+
+    def add(self, run, index, tool="muse", input_tokens=0, output=0):
+        row = {
+            "ts": self.ts + index,
+            "session_id": f"sess-{index}",
+            "run_id": run,
+            "model": "claude-sonnet-4-5",
+            "tool": tool,
+            "message_id": f"m-{index}-{tool}",
+            "input": input_tokens,
+            "output": output,
+            "cache_read": 3,
+            "cache_write": 2,
+        }
+        self.store.add_usage(row)
+
+    def historic_sums(self):
+        """The GROUP BY scan ``_labels_usage_tokens`` ran before the cache."""
+        conn = sqlite3.connect(f"file:{self.db}?mode=ro", uri=True)
+        conn.row_factory = sqlite3.Row
+        try:
+            rows = conn.execute(
+                """SELECT run_id AS run_id,
+                          SUM(COALESCE(input_tokens,0) + COALESCE(output_tokens,0)
+                              + COALESCE(cache_read,0) + COALESCE(cache_write,0)) AS tokens
+                   FROM usage_events GROUP BY run_id"""
+            ).fetchall()
+            out = {str(row["run_id"]): int(row["tokens"] or 0) for row in rows}
+            for row in conn.execute(
+                """SELECT run_id AS run_id,
+                          SUM(COALESCE(input_tokens,0) + COALESCE(output_tokens,0)
+                              + COALESCE(cache_read,0) + COALESCE(cache_write,0)) AS tokens
+                   FROM usage_rollup_1h GROUP BY run_id"""
+            ).fetchall():
+                key = str(row["run_id"])
+                out[key] = out.get(key, 0) + int(row["tokens"] or 0)
+            return out
+        finally:
+            conn.close()
+
+    def move_run_to_rollup(self, run):
+        """Fold one run's live usage into hourly bundles, as the nightly rollup does, keeping grok-context rows live."""
+        conn = self.store._conn
+        conn.execute(
+            """INSERT INTO usage_rollup_1h(
+                   run_id, hour_ts, model, tool, ws_split, n_events,
+                   input_tokens, output_tokens, cache_read, cache_write,
+                   reasoning, missing, unpriced, cost_usd)
+               SELECT run_id, 0, model, tool, '', COUNT(*),
+                      SUM(input_tokens), SUM(output_tokens), SUM(cache_read), SUM(cache_write),
+                      NULL, 0, 0, 0
+               FROM usage_events WHERE run_id=? AND tool != 'grok-context' GROUP BY run_id, model, tool""",
+            (run,),
+        )
+        conn.execute("DELETE FROM usage_events WHERE run_id=? AND tool != 'grok-context'", (run,))
+        rolled = conn.execute("SELECT COUNT(*) FROM usage_rollup_1h WHERE run_id=?", (run,)).fetchone()[0]
+        self.assertGreater(rolled, 0)
+
+    def test_sums_match_historic_scan_including_rollups_and_null_runs(self):
+        self.move_run_to_rollup("ws2-b")
+        self.assertEqual(doctor_mod._labels_usage_tokens(self.ctx), self.historic_sums())
+        self.add("ws1-a", 20, input_tokens=500)
+        self.assertEqual(doctor_mod._labels_usage_tokens(self.ctx), self.historic_sums())
+        self.assertIn("None", doctor_mod._labels_usage_tokens(self.ctx))
+
+    def test_repeat_refresh_without_new_usage_does_no_full_scan(self):
+        with mock.patch.object(doctor_mod, "_full_token_sums", wraps=doctor_mod._full_token_sums) as full, \
+                mock.patch.object(doctor_mod, "_run_token_sums", wraps=doctor_mod._run_token_sums) as partial:
+            first = doctor_mod._labels_usage_tokens(self.ctx)
+            self.assertEqual(full.call_count, 1)
+            second = doctor_mod._labels_usage_tokens(self.ctx)
+            self.assertEqual(full.call_count, 1)
+            self.assertEqual(partial.call_count, 0)
+            self.assertEqual(first, second)
+            self.assertEqual(second, self.historic_sums())
+
+            self.add("ws2-b", 30, input_tokens=40)
+            third = doctor_mod._labels_usage_tokens(self.ctx)
+            self.assertEqual(full.call_count, 1)
+            self.assertEqual(partial.call_count, 1)
+            self.assertEqual(third, self.historic_sums())
+
+    def test_bulk_rewrite_epoch_forces_one_full_rebuild(self):
+        with mock.patch.object(doctor_mod, "_full_token_sums", wraps=doctor_mod._full_token_sums) as full:
+            doctor_mod._labels_usage_tokens(self.ctx)
+            self.store._usage_fold_epoch += 1
+            self.assertEqual(doctor_mod._labels_usage_tokens(self.ctx), self.historic_sums())
+            self.assertEqual(full.call_count, 2)
+
+    def test_without_live_store_falls_back_to_scan(self):
+        ctx = SimpleNamespace(store=None, cfg={})
+        with mock.patch.object(doctor_mod, "_db_file", return_value=self.db):
+            self.assertEqual(doctor_mod._labels_usage_tokens(ctx), self.historic_sums())
 
 if __name__ == "__main__":
     unittest.main()
