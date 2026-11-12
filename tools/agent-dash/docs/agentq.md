@@ -52,13 +52,30 @@ Typical use from a harness: `agentq submit prompt.md --kind review`, then
 - A normal job queued for more than 15 minutes sorts with urgent jobs.
 - Urgent jobs hold at most half of the total slots while another job waits
   (never less than one slot).
-- Slots: `broker.json` `slots` gives caps per resource (defaults `light` 40,
-  `tests` 6, `ssh` 8). `tiers` gives caps per tier (defaults `pi-kimi` 2,
-  `pi-deepseek-flash` 48). Both are read on every tick.
+- Slots and tiers: `broker.json` `slots` gives caps per resource (defaults `light`
+  40, `tests` 6, `ssh` 8). `tiers` gives caps per tier (defaults `pi-kimi` 2,
+  `pi-deepseek-flash` 48). Both are ceilings, read on every tick.
+- Adaptive admission: `broker.json` `adaptive` (on by default; an absent key means
+  on with the defaults below). Above the ceilings, a job waits only for real headroom.
+  - Morph (`pi-deepseek-flash`, `pi-kimi`): a normal job waits while a budget its
+    model uses has more than `max_waiting_requests` (default 8) requests queued in
+    `/agentq/status`. DeepSeek uses `total` and `output`; Kimi uses `total` and
+    `uncached`. A backlog job also waits until those budgets queue nothing. Urgent
+    jobs ignore this gate. If the proxy is down, no Morph gate applies.
+  - Laptop: a `tests` job always launches while fewer than `tests_floor` (default 4)
+    tests jobs run. Above the floor it waits while memory free is under
+    `tests_min_free_pct` (default 35), or while 1-minute load per CPU is at or above
+    `tests_max_load_per_cpu` (default 1.0). A `light` job waits only while memory free
+    is under `light_min_free_pct` (default 20). Memory comes from `memory_pressure`
+    and is read at most every `gauge_ttl_s` (default 15) seconds. An unreadable gauge
+    means no extra gate. `ssh` keeps its fixed cap, since it protects prod hosts.
+  - The `tests` ceiling is `slots.tests`. Recommended: 16 (the owner's setting is 10).
+  - `"adaptive": {"enabled": false}` restores the fixed caps exactly, including the
+    old rule that a `saturated` proxy holds backlog jobs.
+- A held job records why it waits in `jobs.detail` (for example
+  `hold tests: memory free 31% < 35%`). `logs/broker.log` gets one line each time
+  that reason changes.
 - One write job per workspace at a time; a second waits.
-- When the proxy reports `saturated`, the broker starts no normal or backlog job
-  for that tick. Urgent jobs still launch, and running jobs continue. If the proxy
-  is down, static slots apply.
 - A pool or tier cap that is full (run_worker reports `reason=none-available`) is
   a wait, not a failure: the job stays queued, no attempt is counted, and it
   retries 20 s later. One `capacity-wait` event is logged per refusal streak.
@@ -109,7 +126,7 @@ Under `$AGENTQ_HOME` (default `~/.local/state/agentq`):
 | Path | What it is |
 |---|---|
 | `agentq.db` | SQLite store: `jobs`, `events`. `proxy_minutes` belongs to the proxy |
-| `broker.json` | optional slot and tier caps (see above) |
+| `broker.json` | optional slot and tier ceilings, and the `adaptive` admission settings (see above) |
 | `broker.pid` | the daemon's flock'd pidfile |
 | `jobs/<id>/prompt.md` | the submitted prompt |
 | `jobs/<id>/runs/<n>/` | the run folder of each launch (run_worker's files live here) |

@@ -102,9 +102,38 @@ def run_cli(env, argv, now=None):
     return code, out.getvalue()
 
 
-def make_broker(home, launcher=None, clock=None, proxy=None):
+class FakeGauges:
+    """Laptop gauges with fixed readings; counts reads so tests can see caching."""
+
+    def __init__(self, free=90.0, load=0.2):
+        self.free = free
+        self.load = load
+        self.reads = 0
+
+    def read(self, ttl_s):
+        self.reads += 1
+        return self.free, self.load
+
+
+def proxy_doc(total=0, output=0, uncached=0, saturated=False):
+    """A proxy status document whose budgets hold ``n`` normal-lane requests each."""
+    def lanes(n):
+        return {"urgent": 0, "normal": n, "backlog": 0}
+
+    return {
+        "ok": True,
+        "saturated": saturated,
+        "budgets": {
+            "total": {"queued": lanes(total)},
+            "output": {"queued": lanes(output)},
+            "uncached": {"queued": lanes(uncached)},
+        },
+    }
+
+
+def make_broker(home, launcher=None, clock=None, proxy=None, gauges=None):
     return B.Broker(home, launcher=launcher or FakeLauncher(), now=clock or time.time,
-                    proxy=proxy or (lambda: None))
+                    proxy=proxy or (lambda: None), gauges=gauges or FakeGauges())
 
 
 def write_config(home, slots=None, tiers=None):
@@ -315,18 +344,18 @@ class LaneAndSlotTests(ProcessCleanup):
         self.assertEqual(launched, [w1, r1])
         self.assertEqual(row(self.home, w2)["state"], "queued")
 
-    def test_saturated_proxy_stops_new_launches_but_not_running_jobs(self):
+    def test_busy_proxy_stops_new_launches_but_not_running_jobs(self):
         first = submit(self.env, self.prompt, label="first")
-        status = {"saturated": False}
+        status = {"doc": proxy_doc(total=0)}
         launcher = self.fake(live_s=30)
-        broker = make_broker(self.home, launcher, proxy=lambda: dict(status))
+        broker = make_broker(self.home, launcher, proxy=lambda: status["doc"])
         self.assertEqual(broker.tick(), [first])
-        status["saturated"] = True
-        second = submit(self.env, self.prompt, "--backlog", label="second")
+        status["doc"] = proxy_doc(total=9)
+        second = submit(self.env, self.prompt, label="second")
         self.assertEqual(broker.tick(), [])
         self.assertEqual(row(self.home, first)["state"], "running")
         self.assertEqual(row(self.home, second)["state"], "queued")
-        status["saturated"] = False
+        status["doc"] = proxy_doc(total=0)
         self.assertEqual(broker.tick(), [second])
 
     def test_proxy_down_falls_back_to_static_slots(self):
@@ -667,11 +696,11 @@ class ReviewFixTests(ProcessCleanup):
         job = row(self.home, job_id)
         self.assertEqual((job["state"], job["rate_attempts"], job["attempt"]), ("queued", 1, 1))
 
-    def test_10_saturated_proxy_holds_only_backlog_jobs(self):
+    def test_10_proxy_queue_holds_only_backlog_jobs_when_not_empty(self):
         backlog = submit(self.env, self.prompt, "--backlog", label="b")
         normal = submit(self.env, self.prompt, label="n")
         urgent = submit(self.env, self.prompt, "--urgent", label="u")
-        broker = make_broker(self.home, self.fake(live_s=30), proxy=lambda: {"saturated": True})
+        broker = make_broker(self.home, self.fake(live_s=30), proxy=lambda: proxy_doc(total=1))
         self.assertEqual(sorted(broker.tick()), sorted([normal, urgent]))
         self.assertEqual(row(self.home, normal)["state"], "running")
         self.assertEqual(row(self.home, urgent)["state"], "running")
@@ -743,6 +772,161 @@ class ReviewFixTests(ProcessCleanup):
     def test_16_submit_takes_max_runtime(self):
         job_id = submit(self.env, self.prompt, "--max-runtime", "120", label="mr")
         self.assertEqual(row(self.home, job_id)["max_runtime_s"], 120.0)
+
+
+class AdaptiveAdmissionTests(ProcessCleanup):
+    def broker(self, proxy=lambda: None, gauges=None):
+        return make_broker(self.home, self.fake(live_s=30), proxy=proxy, gauges=gauges)
+
+    def write_broker_json(self, data):
+        import json
+
+        self.home.mkdir(parents=True, exist_ok=True)
+        (self.home / "broker.json").write_text(json.dumps(data), encoding="utf-8")
+
+    def test_morph_gate_holds_deepseek_above_the_waiting_limit(self):
+        job = submit(self.env, self.prompt, label="over")
+        self.assertEqual(self.broker(proxy=lambda: proxy_doc(total=9)).tick(), [])
+        self.assertEqual(row(self.home, job)["state"], "queued")
+        self.assertEqual(row(self.home, job)["detail"], "hold pi-deepseek-flash: proxy total waiting 9 > 8")
+
+    def test_morph_gate_allows_exactly_the_waiting_limit(self):
+        job = submit(self.env, self.prompt, label="at-limit")
+        self.assertEqual(self.broker(proxy=lambda: proxy_doc(total=8)).tick(), [job])
+
+    def test_urgent_jobs_ignore_the_morph_gate(self):
+        urgent = submit(self.env, self.prompt, "--urgent", label="urgent")
+        self.assertEqual(self.broker(proxy=lambda: proxy_doc(total=50)).tick(), [urgent])
+
+    def test_backlog_also_needs_its_budgets_queue_empty(self):
+        backlog = submit(self.env, self.prompt, "--backlog", label="backlog")
+        status = {"doc": proxy_doc(total=1)}
+        broker = self.broker(proxy=lambda: status["doc"])
+        self.assertEqual(broker.tick(), [])
+        self.assertEqual(row(self.home, backlog)["detail"],
+                         "hold pi-deepseek-flash: proxy total waiting 1; backlog waits for 0")
+        status["doc"] = proxy_doc(total=0)
+        self.assertEqual(broker.tick(), [backlog])
+
+    def test_deepseek_ignores_the_uncached_budget_and_kimi_ignores_output(self):
+        deepseek = submit(self.env, self.prompt, label="deepseek")
+        kimi = submit(self.env, self.prompt, "--kind", "review", label="kimi")
+        self.assertEqual(self.broker(proxy=lambda: proxy_doc(output=20)).tick(), [kimi])
+        self.assertEqual(row(self.home, deepseek)["state"], "queued")
+
+    def test_kimi_waits_on_the_uncached_budget(self):
+        kimi = submit(self.env, self.prompt, "--kind", "review", label="kimi")
+        deepseek = submit(self.env, self.prompt, label="deepseek")
+        self.assertEqual(self.broker(proxy=lambda: proxy_doc(uncached=20)).tick(), [deepseek])
+        self.assertEqual(row(self.home, kimi)["detail"], "hold pi-kimi: proxy uncached waiting 20 > 8")
+
+    def test_unreachable_proxy_keeps_only_the_fixed_caps(self):
+        jobs = [submit(self.env, self.prompt, label=f"p{i}") for i in range(3)]
+        self.assertEqual(self.broker(proxy=lambda: None).tick(), jobs)
+
+    def test_tests_jobs_launch_to_the_floor_then_wait_for_memory(self):
+        write_config(self.home, slots={"light": 40, "tests": 10, "ssh": 8})
+        jobs = [submit(self.env, self.prompt, "--res", "tests", label=f"t{i}") for i in range(6)]
+        gauges = FakeGauges(free=31.0, load=0.2)
+        self.assertEqual(self.broker(gauges=gauges).tick(), jobs[:4])
+        self.assertEqual(gauges.reads, 1)
+        self.assertEqual(row(self.home, jobs[4])["detail"], "hold tests: memory free 31% < 35%")
+
+    def test_tests_jobs_wait_on_load_per_cpu_above_the_floor(self):
+        write_config(self.home, slots={"light": 40, "tests": 10, "ssh": 8})
+        jobs = [submit(self.env, self.prompt, "--res", "tests", label=f"t{i}") for i in range(5)]
+        launched = self.broker(gauges=FakeGauges(free=90.0, load=1.2)).tick()
+        self.assertEqual(launched, jobs[:4])
+        self.assertEqual(row(self.home, jobs[4])["detail"], "hold tests: load 1.20 per cpu >= 1")
+
+    def test_tests_ceiling_is_the_fixed_slot_count(self):
+        write_config(self.home, slots={"light": 40, "tests": 2, "ssh": 8})
+        jobs = [submit(self.env, self.prompt, "--res", "tests", label=f"t{i}") for i in range(3)]
+        self.assertEqual(self.broker(gauges=FakeGauges(free=90.0, load=0.2)).tick(), jobs[:2])
+
+    def test_light_jobs_wait_only_below_twenty_percent_memory(self):
+        light = submit(self.env, self.prompt, label="light")
+        ssh = submit(self.env, self.prompt, "--res", "ssh", label="ssh")
+        self.assertEqual(self.broker(gauges=FakeGauges(free=15.0, load=9.0)).tick(), [ssh])
+        self.assertEqual(row(self.home, light)["detail"], "hold light: memory free 15% < 20%")
+        self.assertEqual(self.broker(gauges=FakeGauges(free=25.0, load=9.0)).tick(), [light])
+
+    def test_unreadable_gauges_fall_back_to_the_fixed_caps(self):
+        write_config(self.home, slots={"light": 40, "tests": 3, "ssh": 8})
+        jobs = [submit(self.env, self.prompt, "--res", "tests", label=f"t{i}") for i in range(4)]
+        self.assertEqual(self.broker(gauges=FakeGauges(free=None, load=None)).tick(), jobs[:3])
+
+    def test_disabled_adaptive_restores_fixed_caps(self):
+        self.write_broker_json({"slots": {"light": 40, "tests": 2, "ssh": 8},
+                                "adaptive": {"enabled": False}})
+        normal = submit(self.env, self.prompt, label="normal")
+        t1 = submit(self.env, self.prompt, "--res", "tests", label="t1")
+        t2 = submit(self.env, self.prompt, "--res", "tests", label="t2")
+        t3 = submit(self.env, self.prompt, "--res", "tests", label="t3")
+        backlog = submit(self.env, self.prompt, "--backlog", label="backlog")
+        broker = self.broker(proxy=lambda: proxy_doc(total=50, saturated=True),
+                             gauges=FakeGauges(free=5.0, load=9.0))
+        self.assertEqual(sorted(broker.tick()), sorted([normal, t1, t2]))
+        self.assertEqual(row(self.home, t3)["detail"], "hold tests: slots full")
+        self.assertEqual(row(self.home, backlog)["detail"], "hold pi-deepseek-flash: proxy saturated")
+
+    def test_absent_adaptive_key_means_on_with_defaults(self):
+        cfg = B.load_config(self.home)
+        self.assertIs(cfg["adaptive"]["enabled"], True)
+        self.assertEqual(cfg["adaptive"]["max_waiting_requests"], 8)
+        self.assertEqual(cfg["adaptive"]["tests_floor"], 4)
+
+    def test_adaptive_overrides_merge_over_defaults(self):
+        self.write_broker_json({"adaptive": {"tests_floor": 2, "enabled": False, "bogus": 1}})
+        adaptive = B.load_config(self.home)["adaptive"]
+        self.assertIs(adaptive["enabled"], False)
+        self.assertEqual(adaptive["tests_floor"], 2.0)
+        self.assertEqual(adaptive["light_min_free_pct"], 20)
+        self.assertNotIn("bogus", adaptive)
+
+    def test_memory_is_read_at_most_once_per_ttl(self):
+        clock = Clock(0.0)
+        calls = []
+
+        def memory():
+            calls.append(1)
+            return 42.0
+
+        gauges = B.Gauges(memory=memory, loadavg=lambda: (1.5, 0.0, 0.0), cpus=lambda: 15, clock=clock)
+        self.assertEqual(gauges.read(15.0), (42.0, 0.1))
+        clock.t = 5.0
+        gauges.read(15.0)
+        self.assertEqual(len(calls), 1)
+        clock.t = 15.0
+        gauges.read(15.0)
+        self.assertEqual(len(calls), 2)
+
+    def test_memory_free_percent_is_parsed_from_memory_pressure(self):
+        from types import SimpleNamespace
+
+        out = "The system has...\nSystem-wide memory free percentage: 31%\n"
+        self.assertEqual(B.memory_free_pct(run=lambda *a, **k: SimpleNamespace(stdout=out)), 31.0)
+
+        def missing(*args, **kwargs):
+            raise OSError("no memory_pressure")
+
+        self.assertIsNone(B.memory_free_pct(run=missing))
+
+    def test_hold_reason_is_logged_and_written_only_when_it_changes(self):
+        job = submit(self.env, self.prompt, label="held")
+        status = {"doc": proxy_doc(total=9)}
+        broker = self.broker(proxy=lambda: status["doc"])
+        broker.tick()
+        broker.tick()
+        log_path = self.home / "logs" / "broker.log"
+        self.assertEqual(log_path.read_text().count("hold pi-deepseek-flash"), 1)
+        status["doc"] = proxy_doc(total=12)
+        broker.tick()
+        self.assertEqual(log_path.read_text().count("hold pi-deepseek-flash"), 2)
+        self.assertEqual(row(self.home, job)["detail"], "hold pi-deepseek-flash: proxy total waiting 12 > 8")
+        status["doc"] = proxy_doc(total=0)
+        self.assertEqual(broker.tick(), [job])
+        self.assertIsNone(row(self.home, job)["detail"])
 
 
 if __name__ == "__main__":
