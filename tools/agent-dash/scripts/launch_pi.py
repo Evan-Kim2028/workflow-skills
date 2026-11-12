@@ -362,6 +362,18 @@ def build_resume_argv(session_file, outdir, model):
     ]
 
 
+RUN_ENV = "AGENTQ_RUN"
+
+
+def set_run_label(label, environ=os.environ):
+    """Name the run for the agentq proxy's per-run accounting. The pi process reads it through
+    AGENTQ_RUN, and the models.json header uses it when no broker job id is set. An existing value
+    stays; AGENTQ_JOB is never touched, since run_worker.py reads it to detect broker launches."""
+    if not (environ.get(RUN_ENV) or "").strip():
+        environ[RUN_ENV] = label
+    return environ
+
+
 def run_pi(argv, stream, workspace, se):
     """Run one pi command through the base64 filter into ``stream``; return its exit code."""
     return logfilter.run_filtered(
@@ -407,6 +419,7 @@ def main(argv=None):
         print(f"label refused: {fix}", file=sys.stderr)
         return 2
 
+    set_run_label(label)
     out = Path(outdir)
     out.mkdir(parents=True, exist_ok=True)
     (out / "running").mkdir(parents=True, exist_ok=True)
