@@ -22,7 +22,7 @@ JOB_DDL = """
 CREATE TABLE jobs (
     id TEXT PRIMARY KEY, state TEXT NOT NULL, lane TEXT NOT NULL, tier TEXT NOT NULL,
     kind TEXT NOT NULL, verdict TEXT, submitted_at REAL NOT NULL, started_at REAL, finished_at REAL,
-    label TEXT NOT NULL DEFAULT ''
+    label TEXT NOT NULL DEFAULT '', detail TEXT, res TEXT NOT NULL DEFAULT ''
 )
 """
 PROXY_JOBS_DDL = """
@@ -1049,6 +1049,56 @@ class LimitedByTest(unittest.TestCase):
         self.assertEqual(result["chip"], "Launching")
         self.assertEqual(result["text"], "Launching: 3 DeepSeek jobs are ready; the broker is starting them.")
 
+    def test_launching_when_the_queued_details_are_empty(self) -> None:
+        result = dash.verdict(
+            five_minutes(total=4_100_000), UNTIL, LIMITS_NOW, IDLE_LIVE, kimi_jobs_waiting=0, budget_429s={},
+            laptop=CALM, ds_jobs_ready=2, ds_p50_5m_ms=None, ds_p50_base_ms=None, ds_holds=["", None],
+        )
+        self.assertEqual(result["key"], "launching")
+        self.assertEqual(result["chip"], "Launching")
+        self.assertEqual(result["text"], "Launching: 2 DeepSeek jobs are ready; the broker is starting them.")
+
+    def test_held_jobs_on_the_laptop_gate_and_ssh_slots_name_the_laptop_chip(self) -> None:
+        details = ["hold tests: load 1.40 per cpu >= 1"] * 4 + ["hold ssh: slots full"] * 2
+        result = dash.verdict(
+            five_minutes(total=4_100_000), UNTIL, LIMITS_NOW, IDLE_LIVE, kimi_jobs_waiting=0, budget_429s={},
+            laptop=CALM, ds_jobs_ready=6, ds_p50_5m_ms=None, ds_p50_base_ms=None,
+            ds_holds=details, ssh_in_use=8,
+        )
+        self.assertEqual(result["key"], "held_laptop")
+        self.assertEqual(result["chip"], "Laptop")
+        self.assertEqual(
+            result["text"],
+            "6 DeepSeek jobs held for laptop headroom: 4 test jobs (load 1.40 per CPU, limit 1.0); "
+            "2 jobs waiting for a production ssh slot (8 in use).",
+        )
+
+    def test_all_jobs_held_on_ssh_slots_name_the_ssh_chip(self) -> None:
+        result = dash.verdict(
+            five_minutes(total=4_100_000), UNTIL, LIMITS_NOW, IDLE_LIVE, kimi_jobs_waiting=0, budget_429s={},
+            laptop=CALM, ds_jobs_ready=2, ds_p50_5m_ms=None, ds_p50_base_ms=None,
+            ds_holds=["hold ssh: slots full", "hold ssh: slots full"], ssh_in_use=8,
+        )
+        self.assertEqual(result["key"], "held_ssh")
+        self.assertEqual(result["chip"], "SSH slots")
+        self.assertEqual(result["text"], "2 jobs waiting for a production ssh slot (8 in use).")
+
+    def test_held_jobs_waiting_on_a_workspace_or_the_proxy_name_their_chip(self) -> None:
+        workspace = dash.verdict(
+            five_minutes(total=4_100_000), UNTIL, LIMITS_NOW, IDLE_LIVE, kimi_jobs_waiting=0, budget_429s={},
+            laptop=CALM, ds_jobs_ready=1, ds_p50_5m_ms=None, ds_p50_base_ms=None,
+            ds_holds=["hold pi-deepseek-flash: workspace busy"],
+        )
+        self.assertEqual(workspace["chip"], "Workspace")
+        self.assertEqual(workspace["text"], "1 write job waiting for its workspace.")
+        held_proxy = dash.verdict(
+            five_minutes(total=4_100_000), UNTIL, LIMITS_NOW, IDLE_LIVE, kimi_jobs_waiting=0, budget_429s={},
+            laptop=CALM, ds_jobs_ready=1, ds_p50_5m_ms=None, ds_p50_base_ms=None,
+            ds_holds=["hold pi-deepseek-flash: proxy total waiting 3 > 0"],
+        )
+        self.assertEqual(held_proxy["key"], "held_proxy")
+        self.assertEqual(held_proxy["chip"], "Proxy pacing")
+
     def test_headroom_when_the_pool_is_below_85_and_nothing_waits(self) -> None:
         result = verdict_for(five_minutes(total=4_100_000))
         self.assertEqual(result["key"], "headroom")
@@ -1128,7 +1178,7 @@ class SummaryVerdictTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             home = make_home(Path(tmp))
             summary = dash.build_summary(home, 6, now=NOW, fetch_live=proxy_status, laptop=CALM)
-        self.assertIn(summary["verdict"]["key"], {"morph_limit", "morph_slow", "laptop", "near_capacity", "proxy_pacing", "launching", "headroom"})
+        self.assertIn(summary["verdict"]["key"], {"morph_limit", "morph_slow", "laptop", "near_capacity", "proxy_pacing", "launching", "headroom", "held_laptop", "held_ssh", "held_proxy", "held_workspace", "held_other"})
         self.assertIn("text", summary["room"])
         self.assertIn("tokens_5m", summary["activity"])
         self.assertEqual(summary["token_bucket_s"], 300)
