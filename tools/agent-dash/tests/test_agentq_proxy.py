@@ -28,6 +28,7 @@ from agentq.proxy import (
     Governor,
     Proxy,
     body_snippet,
+    family_of,
     load_key,
     main,
     merge_config,
@@ -628,6 +629,93 @@ class PerBudgetQueueTest(unittest.TestCase):
     def test_body_snippet_is_one_line_and_capped(self) -> None:
         self.assertEqual(body_snippet(b'ab\n"cd\'', limit=300), "ab  cd ")
         self.assertEqual(len(body_snippet(b"x" * 500)), 300)
+
+
+class PerFamilyBlockTest(unittest.TestCase):
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.gov = Governor(Path(tmp.name), config_with(start_target=0.95), log=quiet)
+
+    def occupy(self, budget: str, amount: int) -> None:
+        self.gov.budgets[budget].entries.append(Entry(at=self.gov.clock(), amount=amount, lane="normal"))
+
+    def queue(self, *tickets) -> None:
+        for ticket in tickets:
+            self.gov.enqueue(ticket)
+
+    def budget_status(self, name: str) -> dict:
+        return self.gov.status()["budgets"][name]
+
+    def test_family_of_maps_the_two_gated_families_and_leaves_the_rest_as_other(self) -> None:
+        self.assertEqual(family_of(MODEL_OUT), "morph-dsv41flash")
+        self.assertEqual(family_of(MODEL_KIMI), "morph-kimik31")
+        self.assertEqual(family_of("morph-other-model"), "other")
+
+    def test_kimi_blocked_on_its_own_uncached_limit_counts_under_uncached_not_total(self) -> None:
+        self.occupy("uncached", 23_000)
+        self.queue(*(make_ticket(self.gov, job=f"kimi-{i}", model=MODEL_KIMI, text="A" * 4096) for i in range(20)))
+        self.gov.pump()
+        total = self.budget_status("total")
+        self.assertEqual(total["queued_by_family"]["morph-kimik31"], 20)
+        self.assertEqual(total["blocked_by_family"]["morph-kimik31"], 0)
+        self.assertEqual(self.budget_status("uncached")["blocked_by_family"]["morph-kimik31"], 20)
+
+    def test_deepseek_blocked_by_total_counts_under_total_and_nothing_else(self) -> None:
+        self.occupy("total", int(self.gov.budgets["total"].cap()) - 1)
+        self.queue(*(make_ticket(self.gov, job=f"ds-{i}", model=MODEL_OUT, text="x", max_tokens=8) for i in range(10)))
+        self.gov.pump()
+        self.assertEqual(self.budget_status("total")["blocked_by_family"]["morph-dsv41flash"], 10)
+        self.assertEqual(self.budget_status("output")["blocked_by_family"]["morph-dsv41flash"], 0)
+        self.assertEqual(self.budget_status("uncached_ds")["blocked_by_family"]["morph-dsv41flash"], 0)
+
+    def test_deepseek_blocked_by_uncached_ds_counts_under_uncached_ds_not_total(self) -> None:
+        self.occupy("uncached_ds", int(self.gov.budgets["uncached_ds"].cap()))
+        self.queue(*(make_ticket(self.gov, job=f"ds-{i}", model=MODEL_OUT, text="x" * 400, max_tokens=8) for i in range(4)))
+        self.gov.pump()
+        self.assertEqual(self.budget_status("uncached_ds")["blocked_by_family"]["morph-dsv41flash"], 4)
+        self.assertEqual(self.budget_status("total")["blocked_by_family"]["morph-dsv41flash"], 0)
+        self.assertEqual(self.budget_status("total")["queued_by_family"]["morph-dsv41flash"], 4)
+
+    def test_queued_counts_a_kimi_ticket_on_total_but_blocked_counts_it_under_uncached(self) -> None:
+        self.occupy("uncached", 23_000)
+        kimi = make_ticket(self.gov, job="kimi-a", model=MODEL_KIMI, text="A" * 4096)
+        deepseek = make_ticket(self.gov, job="ds-a", model=MODEL_OUT, text="x", max_tokens=8)
+        self.queue(kimi, deepseek)
+        self.gov.pump()
+        self.assertTrue(deepseek.holds)
+        total = self.budget_status("total")
+        self.assertEqual(total["queued_by_family"], {"morph-dsv41flash": 0, "morph-kimik31": 1, "other": 0})
+        self.assertEqual(total["blocked_by_family"], {"morph-dsv41flash": 0, "morph-kimik31": 0, "other": 0})
+        self.assertEqual(self.budget_status("uncached")["blocked_by_family"]["morph-kimik31"], 1)
+
+    def test_admitted_ticket_leaves_both_counts(self) -> None:
+        ticket = make_ticket(self.gov, job="ds-ok", model=MODEL_OUT, text="x", max_tokens=8)
+        self.queue(ticket)
+        self.gov.pump()
+        self.assertTrue(ticket.holds)
+        self.assertEqual(self.budget_status("total")["queued_by_family"]["morph-dsv41flash"], 0)
+        self.assertEqual(self.budget_status("total")["blocked_by_family"]["morph-dsv41flash"], 0)
+
+    def test_backing_off_ticket_counts_under_the_budget_its_429_named(self) -> None:
+        ticket = make_ticket(self.gov, job="ds-429", model=MODEL_OUT, text="x", max_tokens=8)
+        self.queue(ticket)
+        self.gov.learn_from_429(ticket, "Limit: 70000 output tokens/minute.")
+        ticket.not_before = self.gov.clock() + 100.0
+        self.gov.pump()
+        self.assertEqual(ticket.backoff_by, "output")
+        self.assertEqual(self.budget_status("output")["blocked_by_family"]["morph-dsv41flash"], 1)
+        self.assertEqual(self.budget_status("total")["blocked_by_family"]["morph-dsv41flash"], 0)
+
+    def test_backing_off_ticket_whose_429_names_no_budget_is_not_counted_as_blocked(self) -> None:
+        ticket = make_ticket(self.gov, job="ds-429", model=MODEL_OUT, text="x", max_tokens=8)
+        self.queue(ticket)
+        self.gov.learn_from_429(ticket, "upstream hiccup")
+        ticket.not_before = self.gov.clock() + 100.0
+        self.gov.pump()
+        self.assertIsNone(ticket.backoff_by)
+        self.assertEqual(self.budget_status("total")["queued_by_family"]["morph-dsv41flash"], 1)
+        self.assertEqual(self.budget_status("total")["blocked_by_family"]["morph-dsv41flash"], 0)
 
 
 class HygieneTest(unittest.IsolatedAsyncioTestCase):

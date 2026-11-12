@@ -132,6 +132,24 @@ def proxy_doc(total=0, output=0, uncached=0, saturated=False):
     }
 
 
+def family_proxy_doc(held=None, queued=None):
+    """A proxy status with per-family fields. ``held`` and ``queued`` map (budget, family) to a count:
+    held is what the budget is blocking, queued is everything waiting on it."""
+    held = held or {}
+    queued = queued or {}
+    families = ("morph-dsv41flash", "morph-kimik31", "other")
+    budgets = {}
+    for name in ("total", "output", "uncached", "uncached_ds"):
+        blocked = {family: held.get((name, family), 0) for family in families}
+        waiting = {family: queued.get((name, family), blocked[family]) for family in families}
+        budgets[name] = {
+            "queued": {"urgent": 0, "normal": sum(waiting.values()), "backlog": 0},
+            "queued_by_family": waiting,
+            "blocked_by_family": blocked,
+        }
+    return {"ok": True, "saturated": False, "budgets": budgets}
+
+
 class InlinePool:
     """Runs each launch on the calling thread, so a tick's launches have landed when it returns."""
 
@@ -827,6 +845,44 @@ class AdaptiveAdmissionTests(ProcessCleanup):
         kimi = submit(self.env, self.prompt, "--kind", "review", label="kimi")
         self.assertEqual(self.broker(proxy=lambda: proxy_doc(output=20)).tick(), [kimi])
         self.assertEqual(row(self.home, deepseek)["state"], "queued")
+
+    def test_kimi_requests_held_on_kimi_limits_do_not_hold_a_deepseek_job(self):
+        deepseek = submit(self.env, self.prompt, label="ds-behind-kimi")
+        doc = family_proxy_doc(held={("total", "morph-kimik31"): 20, ("uncached", "morph-kimik31"): 20})
+        self.assertEqual(self.broker(proxy=lambda: doc).tick(), [deepseek])
+
+    def test_deepseek_held_on_total_past_the_limit_holds_the_job(self):
+        job = submit(self.env, self.prompt, label="ds-held-total")
+        doc = family_proxy_doc(held={("total", "morph-dsv41flash"): 10})
+        self.assertEqual(self.broker(proxy=lambda: doc).tick(), [])
+        self.assertEqual(row(self.home, job)["detail"], "hold pi-deepseek-flash: proxy total waiting 10 > 8")
+
+    def test_deepseek_queued_but_not_held_launches_even_with_a_long_queue(self):
+        job = submit(self.env, self.prompt, label="ds-queued-only")
+        doc = family_proxy_doc(queued={("total", "morph-dsv41flash"): 30, ("output", "morph-dsv41flash"): 30})
+        self.assertEqual(self.broker(proxy=lambda: doc).tick(), [job])
+
+    def test_backlog_deepseek_waits_only_while_its_own_family_is_held(self):
+        backlog = submit(self.env, self.prompt, "--backlog", label="ds-backlog")
+        status = {"doc": family_proxy_doc(held={("output", "morph-kimik31"): 3})}
+        broker = self.broker(proxy=lambda: status["doc"])
+        self.assertEqual(broker.tick(), [backlog])
+
+    def test_backlog_deepseek_waits_while_a_deepseek_request_is_held(self):
+        backlog = submit(self.env, self.prompt, "--backlog", label="ds-backlog-held")
+        doc = family_proxy_doc(held={("total", "morph-dsv41flash"): 1})
+        self.assertEqual(self.broker(proxy=lambda: doc).tick(), [])
+        self.assertEqual(row(self.home, backlog)["detail"],
+                         "hold pi-deepseek-flash: proxy total waiting 1; backlog waits for 0")
+
+    def test_kimi_job_waits_on_its_own_held_requests_and_ignores_deepseek_ones(self):
+        kimi = submit(self.env, self.prompt, "--kind", "review", label="kimi-held")
+        held_ds = family_proxy_doc(held={("total", "morph-dsv41flash"): 20})
+        self.assertEqual(self.broker(proxy=lambda: held_ds).tick(), [kimi])
+        held_kimi = family_proxy_doc(held={("uncached", "morph-kimik31"): 9})
+        kimi_two = submit(self.env, self.prompt, "--kind", "review", label="kimi-held-two")
+        self.assertEqual(self.broker(proxy=lambda: held_kimi).tick(), [])
+        self.assertEqual(row(self.home, kimi_two)["state"], "queued")
 
     def test_kimi_waits_on_the_uncached_budget(self):
         kimi = submit(self.env, self.prompt, "--kind", "review", label="kimi")

@@ -48,6 +48,7 @@ GAUGE_MAX_AGE_S = 60.0
 MEMORY_CACHE_S = 15.0
 MEMORY_LINE = re.compile(r"System-wide memory free percentage:\s*(\d+(?:\.\d+)?)%")
 BUDGET_FIELDS = {"total": "total", "output": "ds_output", "uncached": "kimi_uncached", "uncached_ds": "ds_uncached"}
+DEEPSEEK_FAMILY = "morph-dsv41flash"
 ROOM_BOUND_LABELS = {
     "laptop": "bounded by laptop CPU",
     "total": "bounded by Morph total",
@@ -2574,9 +2575,10 @@ def window_tokens(raw: dict[int, dict], until: int, minutes: int) -> dict:
 def proxy_waiting_by_budget(live: dict | None) -> dict[str, int] | None:
     """DeepSeek requests waiting at the proxy, per DeepSeek budget, or None when the proxy is unreachable.
 
-    The proxy queues a request on every budget it charges, so a waiting Kimi request also shows in the total
-    budget's queue (Kimi charges total and its own uncached budget). Kimi's share of total is therefore
-    subtracted using the uncached queue. The output and uncached_ds budgets are DeepSeek-only.
+    A proxy that reports ``queued_by_family`` counts DeepSeek's own requests on each budget directly.
+    An older proxy queues a request on every budget it charges, so a waiting Kimi request also shows in
+    the total queue; that case subtracts Kimi's share, taken from the uncached queue. The output and
+    uncached_ds budgets are DeepSeek-only.
     """
     budgets = live.get("budgets") if isinstance(live, dict) else None
     if not isinstance(budgets, dict):
@@ -2586,12 +2588,15 @@ def proxy_waiting_by_budget(live: dict | None) -> dict[str, int] | None:
         lanes = (budgets.get(name) or {}).get("queued")
         return sum(int(n) for n in lanes.values()) if isinstance(lanes, dict) else 0
 
-    kimi = queued("uncached")
-    return {
-        "total": max(0, queued("total") - kimi),
-        "output": queued("output"),
-        "uncached_ds": queued("uncached_ds"),
-    }
+    def deepseek_queued(name: str) -> int:
+        by_family = (budgets.get(name) or {}).get("queued_by_family")
+        if isinstance(by_family, dict):
+            return int(by_family.get(DEEPSEEK_FAMILY) or 0)
+        if name == "total":
+            return max(0, queued("total") - queued("uncached"))
+        return queued(name)
+
+    return {name: deepseek_queued(name) for name in ("total", "output", "uncached_ds")}
 
 
 def split_hold(detail: str) -> tuple[str, str]:
