@@ -215,12 +215,63 @@ class PassthroughTest(ProxyCase):
         self.assertEqual(len(self.fake.requests), 2)
         self.assertIn("retry", [event for event, _ in self.logs])
 
-    async def test_give_up_returns_last_429(self) -> None:
-        self.gov.config["give_up_s"] = 0.0
-        self.fake.script = [{"status": 429, "body": "Limit: 70000 output tokens/minute."}]
-        status, text = await self.post(self.chat(MODEL_OUT), job="job-g")
+
+
+class GiveUpTest(ProxyCase):
+    overrides = {"window_s": 2.0, "give_up_s": 0.5}
+
+    async def test_queued_request_gives_up_with_held_body(self) -> None:
+        self.gov.budgets["output"].limit = 1000
+        hold = asyncio.Event()
+        self.fake.script = [{"usage": (100, 800), "hold": hold}]
+        blocker = asyncio.create_task(self.post(self.chat(MODEL_OUT, 800), job="blocker"))
+        await wait_for(lambda: len(self.fake.requests) == 1)
+        status, text = await self.post(self.chat(MODEL_OUT, 800), job="waiter")
+        hold.set()
+        await blocker
         self.assertEqual(status, 429)
-        self.assertEqual(len(self.fake.requests), 1)
+        self.assertEqual(text, "agentq: held 0.5 s, budget full")
+        self.assertEqual([r["job"] for r in self.fake.requests], ["blocker"])
+
+    async def test_retry_loop_gives_up_with_held_body(self) -> None:
+        self.fake.script = [{"status": 429, "body": "Limit: 70000 output tokens/minute."}] * 200
+        status, text = await self.post(self.chat(MODEL_OUT), job="looping")
+        self.assertEqual(status, 429)
+        self.assertEqual(text, "agentq: held 0.5 s, budget full")
+        self.assertGreater(len(self.fake.requests), 1)
+
+
+class ClientGoneTest(ProxyCase):
+    overrides = {"window_s": 1.0}
+
+    async def test_client_disconnect_while_queued_is_never_sent(self) -> None:
+        self.gov.budgets["output"].limit = 1000
+        hold = asyncio.Event()
+        self.fake.script = [{"usage": (100, 800), "hold": hold}]
+        blocker = asyncio.create_task(self.post(self.chat(MODEL_OUT, 800), job="blocker"))
+        await wait_for(lambda: len(self.fake.requests) == 1)
+
+        payload = json.dumps(
+            {"model": MODEL_OUT, "max_tokens": 800, "stream": True, "messages": [{"role": "user", "content": "ghost"}]}
+        ).encode()
+        head = (
+            "POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n"
+            f"X-Agentq-Job: ghost\r\nContent-Length: {len(payload)}\r\n\r\n"
+        ).encode()
+        reader, writer = await asyncio.open_connection("127.0.0.1", self.port)
+        writer.write(head + payload)
+        await writer.drain()
+        await asyncio.sleep(0.2)
+        writer.close()
+        await asyncio.sleep(0.3)
+        self.assertIn("client_gone", [event for event, _ in self.logs])
+
+        after = asyncio.create_task(self.post(self.chat(MODEL_OUT, 800), job="after"))
+        await asyncio.sleep(0.1)
+        hold.set()
+        results = await asyncio.gather(blocker, after)
+        self.assertEqual([status for status, _ in results], [200, 200])
+        self.assertEqual([r["job"] for r in self.fake.requests], ["blocker", "after"])
 
 
 class LearningTest(ProxyCase):

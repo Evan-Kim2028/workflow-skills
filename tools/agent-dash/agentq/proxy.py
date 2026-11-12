@@ -49,7 +49,7 @@ DEFAULT_CONFIG = {
     "target_cut": 0.97,
     "target_step_up": 0.005,
     "default_output_tokens": 800,
-    "give_up_s": 900.0,
+    "give_up_s": 240.0,
     "retry_floor_s": 1.0,
     "retry_jitter_s": 2.0,
     "aging_s": 900.0,
@@ -467,6 +467,11 @@ class Governor:
     def requeue_head(self, ticket: Ticket) -> None:
         self.queues[ticket.lane].appendleft(ticket)
 
+    def drop(self, ticket: Ticket) -> None:
+        """Remove a ticket that will never be sent: its client left or it gave up."""
+        with contextlib.suppress(ValueError):
+            self.queues[ticket.lane].remove(ticket)
+
     def promote_aged(self, now: float) -> None:
         """Normal tickets queued past aging_s join the urgent lane, kept in arrival order."""
         aging = float(self.config["aging_s"])
@@ -762,6 +767,12 @@ class UsageScanner:
             self.usage = payload["usage"]
 
 
+def held_body(governor: "Governor") -> bytes:
+    """The 429 body a client sees when its request was held past give_up_s."""
+    seconds = float(governor.config["give_up_s"])
+    return f"agentq: held {seconds:g} s, budget full".encode()
+
+
 def parse_payload(body: bytes) -> dict | None:
     if not body:
         return None
@@ -956,7 +967,7 @@ class Proxy:
             if path == STATUS_PATH and method == "GET":
                 await send_simple(client, 200, json.dumps(self.gov.status()).encode())
             elif path.startswith(UPSTREAM_PREFIX + "/"):
-                await self.forward(method, path, headers, body, client)
+                await self.forward(method, path, headers, body, client, reader)
             else:
                 await send_simple(client, 404, b'{"error":"not found"}')
         except (ConnectionError, OSError, EOFError):
@@ -1009,6 +1020,36 @@ class Proxy:
             raise
         return Upstream(reader, writer, status, response_headers)
 
+    async def wait_turn(self, ticket: Ticket, reader: asyncio.StreamReader) -> str:
+        """Block until the ticket is admitted. Returns admitted, gone (client closed) or expired (held too long).
+
+        The deadline runs from the first enqueue, so queue wait and 429 retries share one give-up bound.
+        """
+        deadline = ticket.first_seen + float(self.gov.config["give_up_s"])
+        watch = asyncio.ensure_future(reader.read(1))
+        try:
+            while True:
+                if ticket.future.done():
+                    return "admitted"
+                remaining = deadline - self.gov.clock()
+                if remaining <= 0:
+                    return "expired"
+                done, _ = await asyncio.wait(
+                    {ticket.future, watch},
+                    timeout=remaining,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if watch in done:
+                    try:
+                        data = watch.result()
+                    except (OSError, EOFError):
+                        return "gone"
+                    if not data:
+                        return "gone"
+                    watch = asyncio.ensure_future(reader.read(1))
+        finally:
+            watch.cancel()
+
     async def forward(
         self,
         method: str,
@@ -1016,6 +1057,7 @@ class Proxy:
         headers: dict[str, str],
         body: bytes,
         client: Client,
+        reader: asyncio.StreamReader,
     ) -> None:
         gov = self.gov
         loop = asyncio.get_running_loop()
@@ -1045,7 +1087,16 @@ class Proxy:
         gov.enqueue(ticket)
         gov.pump()
         while True:
-            await ticket.future
+            outcome = await self.wait_turn(ticket, reader)
+            if outcome == "gone":
+                gov.drop(ticket)
+                gov.log("client_gone", job=job, model=model)
+                return
+            if outcome == "expired":
+                gov.drop(ticket)
+                gov.log("gave_up", job=job, model=model, attempts=ticket.attempts + 1)
+                await send_simple(client, 429, held_body(gov), "text/plain")
+                return
             try:
                 upstream = await self.open_upstream(method, path, headers, out_body)
             except (OSError, ssl.SSLError) as exc:
@@ -1061,8 +1112,7 @@ class Proxy:
                 now = gov.clock()
                 if now - ticket.first_seen >= float(gov.config["give_up_s"]):
                     gov.log("gave_up", job=job, model=model, attempts=ticket.attempts + 1)
-                    content_type = upstream.headers.get("content-type", "application/json")
-                    await send_simple(client, 429, raw, content_type)
+                    await send_simple(client, 429, held_body(gov), "text/plain")
                     return
                 delay = gov.retry_delay(ticket, now)
                 ticket.attempts += 1

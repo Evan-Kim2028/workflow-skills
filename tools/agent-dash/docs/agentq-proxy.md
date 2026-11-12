@@ -10,7 +10,7 @@ the proxy and never reach the client.
 
 | Budget | Scope | Default limit | Metric |
 |---|---|---|---|
-| `total` | all models | 10,000,000 / min | prompt + completion tokens |
+| `total` | all models | 10,000,000 / min | prompt_tokens (includes cached tokens) + completion_tokens |
 | `output` | models starting `morph-dsv41flash` | 70,000 / min | completion tokens |
 | `uncached` | model `morph-kimik31` | 24,290 / min | prompt tokens minus cached prompt tokens |
 
@@ -46,8 +46,17 @@ the response replaces the estimate.
 ## Retries
 
 A 429 is retried after `max(time the budget needs to free, 1 s) + 0-2 s` of
-jitter, at the head of its lane. After 15 minutes the last 429 goes back to the
-client. Other upstream errors pass through unchanged.
+jitter, at the head of its lane. Other upstream errors pass through unchanged.
+
+Give-up is one bound, `give_up_s` (default 240 s), counted from the first enqueue
+and covering queue wait plus 429 retries. pi gives up on a request near 300 s and
+retries it, so a longer hold would send a duplicate. When the bound passes, the
+client gets `429` with the body `agentq: held 240 s, budget full`, and pi's own
+backoff takes over. The ticket is dropped and never sent.
+
+If the client disconnects while its request is queued or waiting to retry, the
+proxy sees EOF on the client socket, drops the ticket and logs `client_gone`.
+A request that is already streaming upstream is not cancelled.
 
 ## Status and minute table
 
@@ -81,6 +90,10 @@ cd tools/agent-dash
 python3 -u agentq/proxy.py --home ~/.local/state/agentq
 python3 -m pytest tests/test_agentq_proxy.py -q
 ```
+
+Upstream connections: each upstream request opens a new TLS connection with
+`Connection: close`. Connection reuse is not implemented. At about 110 requests
+per minute the handshake cost is acceptable.
 
 The proxy uses only the standard library (asyncio streams and ssl), so the
 launchd agent runs the system `python3` with no virtualenv. `httpx` is not used.
