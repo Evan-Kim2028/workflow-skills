@@ -43,18 +43,26 @@ the response replaces the estimate.
 
 ## Learning the edge
 
-- Target starts at 0.95. A 429 multiplies the named budget's target by 0.97,
-  floor 0.6. A body that states a limit (`Limit: N output tokens/minute.`) also
-  sets that budget's limit to N. `service_overloaded` cuts `total`. A 429 with
-  no recognisable limit cuts every budget the request touched.
-- Below `fast_until` (0.9) a saturated budget with no 429 in the last
-  `fast_interval_s` (10 s) raises its target by `fast_step_up` (0.05) every
-  `fast_interval_s`, so a 0.6 floor recovers to 0.9 in about 60 s of demand.
-  A 429 also sets the budget's `fast_limit` to the target it cut to, and the fast
-  ramp stops there: above it the slow rule applies. `fast_limit` clears after 30
-  minutes with no 429 on that budget, and it is kept in `proxy_state.json`.
-  Above `fast_until` each full minute with no 429 and blocked demand raises the
-  target by `target_step_up` (0.02), up to `target_ceiling` (1.5).
+- Target starts at 0.98 (`start_target`). A 429 multiplies the named budget's
+  target by 0.97 (`target_cut`), floor 0.6. A cut is paced: a budget is cut at most
+  once per `fast_interval_s` (10 s), so a burst of 429s is one cut. Every 429
+  still counts in the minute row and refreshes the quiet clock. A body that states
+  a limit (`Limit: N output tokens/minute.`) also sets that budget's limit to N.
+  `service_overloaded` cuts `total`. A 429 with no recognisable limit cuts every
+  budget the request touched.
+- With no 429 history a saturated budget climbs the fast ramp: its target rises
+  by `fast_step_up` (0.05) every `fast_interval_s` (10 s) up to `fast_until`
+  (1.5), so from 0.98 it reaches 1.0 in about 10 s and keeps climbing until Morph's
+  first 429. The 429 cut sets the budget's `fast_limit` to the cut target, and the
+  fast ramp stops there: above it the slow rule applies, one `target_step_up`
+  (0.02) per full minute with no 429 and blocked demand, up to `target_ceiling`
+  (1.5). `fast_limit` clears after 30 minutes with no 429 on that budget, so the
+  ramp can try the edge again. It is kept in `proxy_state.json`.
+- Steady state: the proxy sits at the edge it learned. The first 429 sets
+  `fast_limit` near Morph's real edge E. The target then probes up by 0.02 a
+  minute and is cut by 0.97 on the next 429, so it oscillates between about
+  0.97 E and E (plus at most one probe step). Between 429s it is at 1.0 of the
+  learned edge; right after a cut it is at about 0.97 of it.
 
 Targets may exceed 1.0. The window counts each in-flight request at its full
 estimate from admission and again at its real usage for 60 s after completion,

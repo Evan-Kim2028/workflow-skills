@@ -295,6 +295,8 @@ class PassthroughTest(ProxyCase):
 
 
 class LearningTest(ProxyCase):
+    overrides = {"start_target": 0.95}
+
     async def test_target_shrinks_and_stated_limit_is_adopted(self) -> None:
         self.fake.script = [{"status": 429, "body": "Limit: 60000 output tokens/minute."}]
         status, _ = await self.post(self.chat(MODEL_OUT), job="job-t")
@@ -526,7 +528,7 @@ class PerBudgetQueueTest(unittest.TestCase):
     def setUp(self) -> None:
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
-        self.gov = Governor(Path(tmp.name), config_with(), log=quiet)
+        self.gov = Governor(Path(tmp.name), config_with(start_target=0.95), log=quiet)
 
     def occupy(self, budget: str, amount: int, lane: str = "normal") -> None:
         self.gov.budgets[budget].entries.append(Entry(at=self.gov.clock(), amount=amount, lane=lane))
@@ -773,7 +775,7 @@ class TargetCeilingTest(unittest.TestCase):
         return Governor(self.home, config, clock=lambda: self.now[0], log=quiet)
 
     def test_tick_raises_past_one_and_stops_at_the_ceiling(self) -> None:
-        gov = self.governor(config_with())
+        gov = self.governor(config_with(fast_until=0.9))
         output = gov.budgets["output"]
         output.target = 1.4
         output.saturated = True
@@ -786,7 +788,7 @@ class TargetCeilingTest(unittest.TestCase):
         self.assertEqual(output.target, 1.5)
 
     def test_tick_stops_at_one_when_an_older_config_has_no_ceiling(self) -> None:
-        config = config_with()
+        config = config_with(fast_until=0.9)
         del config["target_ceiling"]
         gov = self.governor(config)
         output = gov.budgets["output"]
@@ -819,7 +821,7 @@ class StateTest(unittest.TestCase):
         self.tmp.cleanup()
 
     def test_state_persists_across_restart(self) -> None:
-        config = config_with()
+        config = config_with(start_target=0.95)
         first = Governor(self.home, config, log=quiet)
         first.learn_from_429(make_ticket(first, max_tokens=800), "Limit: 60000 output tokens/minute.")
         first.save_state()
@@ -928,7 +930,7 @@ class FastRampTest(unittest.TestCase):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.now = [1000.0]
-        self.gov = Governor(Path(tmp.name), config_with(), clock=lambda: self.now[0], log=quiet)
+        self.gov = Governor(Path(tmp.name), config_with(fast_until=0.9), clock=lambda: self.now[0], log=quiet)
         self.total = self.gov.budgets["total"]
         self.total.target = 0.6
 
@@ -987,6 +989,38 @@ class FastRampTest(unittest.TestCase):
         self.assertFalse(self.total.saturated_since_tick)
 
 
+class CutPacingTest(unittest.TestCase):
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.now = [1000.0]
+        self.gov = Governor(Path(tmp.name), config_with(), clock=lambda: self.now[0], log=quiet)
+        self.total = self.gov.budgets["total"]
+        self.total.target = 0.9
+
+    def burst(self, count: int, spacing_s: float) -> None:
+        for _ in range(count):
+            self.now[0] += spacing_s
+            self.gov.learn_from_429(make_ticket(self.gov, max_tokens=8), "service_overloaded")
+
+    def test_a_burst_of_429s_within_a_few_seconds_is_one_cut(self) -> None:
+        self.burst(8, 0.4)
+        self.assertAlmostEqual(self.total.target, 0.9 * 0.97, places=9)
+        self.assertAlmostEqual(self.total.fast_limit, 0.9 * 0.97, places=9)
+        self.assertEqual(sum(row["r429"] for row in self.gov.minute_rows.values()), 8)
+
+    def test_a_429_fifteen_seconds_after_the_cut_is_a_second_cut(self) -> None:
+        self.burst(8, 0.4)
+        self.now[0] += 15.0
+        self.gov.learn_from_429(make_ticket(self.gov, max_tokens=8), "service_overloaded")
+        self.assertAlmostEqual(self.total.target, 0.9 * 0.97 * 0.97, places=9)
+        self.assertAlmostEqual(self.total.fast_limit, 0.9 * 0.97 * 0.97, places=9)
+
+    def test_a_steady_stream_of_429s_still_cuts_once_per_interval(self) -> None:
+        self.burst(4, 5.0)
+        self.assertAlmostEqual(self.total.target, 0.9 * 0.97 * 0.97, places=9)
+
+
 class FastLimitTest(unittest.TestCase):
     STEP_S = 0.25
 
@@ -995,7 +1029,7 @@ class FastLimitTest(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         self.home = Path(tmp.name)
         self.now = [1000.0]
-        self.gov = Governor(self.home, config_with(), clock=lambda: self.now[0], log=quiet)
+        self.gov = Governor(self.home, config_with(fast_until=0.9), clock=lambda: self.now[0], log=quiet)
         self.total = self.gov.budgets["total"]
         self.total.target = 0.6
 

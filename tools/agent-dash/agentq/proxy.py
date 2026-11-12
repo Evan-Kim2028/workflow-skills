@@ -48,12 +48,12 @@ DEFAULT_CONFIG = {
     "port": 18790,
     "upstream": DEFAULT_UPSTREAM,
     "window_s": 60.0,
-    "start_target": 0.95,
+    "start_target": 0.98,
     "target_floor": 0.6,
     "target_ceiling": 1.5,
     "target_cut": 0.97,
     "target_step_up": 0.02,
-    "fast_until": 0.9,
+    "fast_until": 1.5,
     "fast_step_up": 0.05,
     "fast_interval_s": 10.0,
     "default_output_tokens": 800,
@@ -380,6 +380,7 @@ class Budget:
     hold_s: float = 600.0
     entries: list[Entry] = field(default_factory=list)
     last_429: float = float("-inf")
+    last_cut: float = float("-inf")
     last_grow: float = 0.0
     fast_limit: float | None = None
     saturated: bool = False
@@ -765,7 +766,9 @@ class Governor:
         """Adopt a stated limit when the body names one; cut the target of the budget it names.
 
         A body that names no limit cuts every budget the request touched. service_overloaded
-        is a platform-wide signal, so it cuts the total budget only.
+        is a platform-wide signal, so it cuts the total budget only. A budget is cut at most once
+        per fast_interval_s: a burst of 429s is one cut, and each 429 still counts and refreshes
+        last_429.
         """
         now = self.clock()
         self.row(ticket.model)["r429"] += 1
@@ -783,9 +786,13 @@ class Governor:
             targets = [self.budgets[name] for name in ticket.estimates]
         floor = float(self.config["target_floor"])
         cut = float(self.config["target_cut"])
+        pace = float(self.config.get("fast_interval_s", 10.0))
         for budget in targets:
-            budget.target = max(floor, budget.target * cut)
             budget.last_429 = now
+            if now - budget.last_cut < pace:
+                continue
+            budget.last_cut = now
+            budget.target = max(floor, budget.target * cut)
             budget.fast_limit = budget.target
             self.log("target_cut", budget=budget.name, target=round(budget.target, 4), limit=budget.limit)
         self.state_dirty = True
@@ -813,7 +820,7 @@ class Governor:
         window = self.window
         step = float(self.config["target_step_up"])
         ceiling = float(self.config.get("target_ceiling", 1.0))
-        fast_until = float(self.config.get("fast_until", 0.9))
+        fast_until = float(self.config.get("fast_until", 1.5))
         fast_step = float(self.config.get("fast_step_up", 0.05))
         fast_interval = float(self.config.get("fast_interval_s", 10.0))
         for budget in self.budgets.values():
