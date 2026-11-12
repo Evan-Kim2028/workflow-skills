@@ -58,7 +58,17 @@ from pathlib import Path
 from dash import logarchive, vlogs
 from dash.dataroot import state_dir as _state_dir
 
-DEFAULT_DEST = "~/Documents/data/agent-sessions"
+#: The archive dest. It must stay outside the macOS privacy (TCC) folders
+#: (``~/Documents``, ``~/Desktop``, ``~/Downloads``, iCloud Drive): a launchd
+#: job has no TCC grant for them, so a scheduled run there fails with EPERM
+#: and used to hang. ``~/Documents/data/agent-sessions`` is a browsing
+#: symlink to this folder, never the real dest.
+DEFAULT_DEST = "~/.local/share/agent-sessions"
+#: Path markers that anchor a legacy absolute record to the current dest.
+#: A record written before the dest moved carries only an absolute path;
+#: when that path is gone, the tail from one of these markers is resolved
+#: against the current dest. Nothing else is guessed.
+LEGACY_PATH_MARKERS = ("/archive/", "/state/trash/")
 DEFAULT_MIN_IDLE_HOURS = 6.0
 DEFAULT_RECLAIM_DAYS = 14.0
 DEFAULT_MAX_MINUTES = 90.0
@@ -130,6 +140,50 @@ def load_config(state: Path | None = None) -> dict:
     if not isinstance(cfg["reclaim_days_by_tool"], dict):
         cfg["reclaim_days_by_tool"] = {}
     return cfg
+
+
+# --------------------------------------------------------------- paths
+
+def _abs_path(path) -> str:
+    return os.path.abspath(os.path.expanduser(str(path)))
+
+
+def dest_rel(path, dest) -> str | None:
+    """``path`` relative to ``dest`` (``/``-separated), or None when outside."""
+    p, d = _abs_path(path), _abs_path(dest)
+    if p == d or not p.startswith(d + os.sep):
+        return None
+    return os.path.relpath(p, d).replace(os.sep, "/")
+
+
+def resolve_stored_path(dest, rel=None, absolute=None) -> str:
+    """Absolute location of a stored archive/trash path, resolved at read time.
+
+    A relative path (``archive_rel``, per-sequence ``rel``) resolves against
+    the *current* dest, so moving the data and changing the config keeps
+    every record working without rewriting the manifest. An older record
+    carries only an absolute path: it is used while it exists; once it is
+    gone and it sits under an ``archive/`` or ``state/trash/`` marker, the
+    tail from that marker is resolved against the current dest. Nothing
+    else is guessed.
+    """
+    dest = _abs_path(dest)
+    if rel:
+        return os.path.join(dest, *str(rel).split("/"))
+    absolute = str(absolute or "")
+    if not absolute:
+        return ""
+    if os.path.exists(absolute):
+        return absolute
+    real = _abs_path(absolute).replace(os.sep, "/")
+    for marker in LEGACY_PATH_MARKERS:
+        at = real.find(marker)
+        if at < 0:
+            continue
+        tail = real[at + 1:]
+        if tail:
+            return os.path.join(dest, *tail.split("/"))
+    return absolute
 
 
 # --------------------------------------------------------------- time
@@ -1413,8 +1467,10 @@ def _rollback(trash: Path, members) -> str:
     return "; ".join(problems)
 
 
-def _archive_ok(rec: dict) -> bool:
+def _archive_ok(rec: dict, dest=None) -> bool:
     archive = rec.get("archive")
+    if dest is not None:
+        archive = resolve_stored_path(dest, rec.get("archive_rel"), archive)
     if not archive or not os.path.exists(archive):
         return False
     if os.path.getsize(archive) != int(rec.get("archive_bytes") or -1):
@@ -1514,7 +1570,7 @@ def reclaim_unit(
             return "content changed since archive: %s" % member.rel
 
     # The archive must exist, be the recorded size, and verify.
-    archive = rec.get("archive")
+    archive = resolve_stored_path(dest, rec.get("archive_rel"), rec.get("archive"))
     if not archive or not os.path.exists(archive):
         return "archive missing: %s" % archive
     if os.path.getsize(archive) != int(rec.get("archive_bytes") or -1):
@@ -1561,6 +1617,7 @@ def reclaim_unit(
         rec,
         status="reclaiming",
         trash=str(trash),
+        trash_rel=dest_rel(trash, dest),
         trash_members=trash_members,
         reclaim_started_ts=round(time.time(), 3),
     )
@@ -1624,6 +1681,8 @@ def _trash_plan(manifest: Manifest, entry: Path) -> tuple[str, str]:
         return "leave", "manifest record for %s is not a reclaim journal" % uid
     members = rec["trash_members"]
     named = rec.get("trash")
+    if named:
+        named = resolve_stored_path(manifest.dest, rec.get("trash_rel"), named)
     if named and os.path.abspath(str(named)) != os.path.abspath(str(entry)):
         return "leave", "record names a non-canonical trash dir %s" % named
     files = _trash_files(entry) if entry.is_dir() else []
@@ -1631,7 +1690,7 @@ def _trash_plan(manifest: Manifest, entry: Path) -> tuple[str, str]:
         return "leave", "holds a symlink or non-regular entry"
     if not files:
         # Crash after the trash delete (or before any rename).
-        if _archive_ok(rec) and all(not os.path.exists(m["path"]) for m in members):
+        if _archive_ok(rec, manifest.dest) and all(not os.path.exists(m["path"]) for m in members):
             return "finish", "trash already deleted"
         return "archive", "nothing in trash"
     rels = {str(p.relative_to(entry)) for p in files}
@@ -1640,7 +1699,7 @@ def _trash_plan(manifest: Manifest, entry: Path) -> tuple[str, str]:
     if unlisted:
         return "leave", "holds file(s) not in the manifest record: %s" % ", ".join(unlisted[:5])
     bad = _trash_mismatch(entry, members)
-    if rels == listed and not bad and _archive_ok(rec):
+    if rels == listed and not bad and _archive_ok(rec, manifest.dest):
         return "finish", "trash matches the verified archive"
     # Roll back only when every file in the dir is a listed member whose
     # original path is free; a member still at its original path is fine.
@@ -1719,10 +1778,17 @@ def recover_trash(dest, manifest: Manifest, out) -> int:
 # --------------------------------------------------------------- manifest
 
 class Manifest:
-    """Append-only JSON lines; the last record for a unit wins."""
+    """Append-only JSON lines; the last record for a unit wins.
+
+    ``dest`` is the archive dest this manifest belongs to (``state_dir``'s
+    parent). Stored paths are resolved against it at read time, so a record
+    written under an older dest still resolves after the data moves.
+    """
 
     def __init__(self, state_dir: Path) -> None:
-        self.path = Path(state_dir) / "manifest.jsonl"
+        self.state_dir = Path(_abs_path(state_dir))
+        self.dest = self.state_dir.parent
+        self.path = self.state_dir / "manifest.jsonl"
         self.latest: dict[str, dict] = {}
         if self.path.exists():
             with open(self.path, "r", encoding="utf-8") as fh:
@@ -1833,17 +1899,25 @@ def process_unit(
     # (an ingest retry after an error record must not pack a new version).
     reuse = None
     if prior and prior.get("archive") and _fp_equal(prior.get("members"), fp):
-        path = prior["archive"]
+        path = resolve_stored_path(state_dir, prior.get("archive_rel"), prior["archive"])
         if os.path.exists(path) and os.path.getsize(path) == int(prior.get("archive_bytes") or -1):
             reuse = prior
 
     if reuse is not None:
         records = reuse["members"]
-        archive = Path(reuse["archive"])
+        archive = Path(resolve_stored_path(state_dir, reuse.get("archive_rel"), reuse["archive"]))
         seq = int(reuse.get("seq", 0))
         archives = list(reuse.get("archives") or [])
         if not archives:
-            archives = [{"seq": seq, "path": str(archive), "bytes": int(reuse.get("archive_bytes") or 0), "members": records}]
+            archives = [
+                {
+                    "seq": seq,
+                    "path": str(archive),
+                    "rel": dest_rel(archive, state_dir),
+                    "bytes": int(reuse.get("archive_bytes") or 0),
+                    "members": records,
+                }
+            ]
     else:
         seq = next_archive_seq(state_dir, unit)
         archive = archive_path(state_dir, unit, seq)
@@ -1866,7 +1940,13 @@ def process_unit(
                     pass
         archives = list((prior or {}).get("archives") or [])
         archives.append(
-            {"seq": seq, "path": str(archive), "bytes": os.path.getsize(archive), "members": records}
+            {
+                "seq": seq,
+                "path": str(archive),
+                "rel": dest_rel(archive, state_dir),
+                "bytes": os.path.getsize(archive),
+                "members": records,
+            }
         )
 
     rev, total, sent = ingest_unit(unit, records, prior, client)
@@ -1878,6 +1958,7 @@ def process_unit(
         "root": unit.root,
         "parent": unit.parent,
         "archive": str(archive),
+        "archive_rel": dest_rel(archive, state_dir),
         "archive_bytes": os.path.getsize(archive),
         "seq": seq,
         "archives": archives,
@@ -2115,11 +2196,12 @@ def _projected(units, cfg, manifest, open_set, now, sample) -> int:
 def _find_record(manifest: Manifest, arg: str) -> dict | None:
     if arg in manifest.latest:
         return manifest.latest[arg]
+    dest = manifest.dest
     for rec in manifest.latest.values():
-        if rec.get("archive") == arg:
+        if resolve_stored_path(dest, rec.get("archive_rel"), rec.get("archive")) == arg:
             return rec
         for entry in rec.get("archives") or []:
-            if entry.get("path") == arg:
+            if resolve_stored_path(dest, entry.get("rel"), entry.get("path")) == arg:
                 return rec
     matches = [
         rec
@@ -2132,25 +2214,35 @@ def _find_record(manifest: Manifest, arg: str) -> dict | None:
     return matches[0]
 
 
-def _seq_entries(rec: dict) -> list[dict]:
-    """Every archive version recorded for a unit, newest sequence first."""
+def _seq_entries(rec: dict, dest) -> list[dict]:
+    """Every archive version recorded for a unit, newest sequence first.
+
+    ``path`` is resolved against the current ``dest``: a record with a
+    ``rel`` follows the data, and a legacy absolute path is re-anchored when
+    its file is gone.
+    """
     entries = []
     seen = set()
     for entry in rec.get("archives") or []:
-        if not isinstance(entry, dict) or not entry.get("path") or entry["path"] in seen:
+        if not isinstance(entry, dict) or not (entry.get("path") or entry.get("rel")):
             continue
-        seen.add(entry["path"])
-        entries.append(entry)
+        path = resolve_stored_path(dest, entry.get("rel"), entry.get("path"))
+        if not path or path in seen:
+            continue
+        seen.add(path)
+        entries.append(dict(entry, path=path))
     current = rec.get("archive")
-    if current and current not in seen:
-        entry = {
-            "seq": int(rec.get("seq") or 0),
-            "path": current,
-            "members": rec.get("members") or [],
-        }
-        if rec.get("archive_bytes") is not None:
-            entry["bytes"] = int(rec["archive_bytes"])
-        entries.append(entry)
+    if current or rec.get("archive_rel"):
+        path = resolve_stored_path(dest, rec.get("archive_rel"), current)
+        if path and path not in seen:
+            entry = {
+                "seq": int(rec.get("seq") or 0),
+                "path": path,
+                "members": rec.get("members") or [],
+            }
+            if rec.get("archive_bytes") is not None:
+                entry["bytes"] = int(rec["archive_bytes"])
+            entries.append(entry)
     entries.sort(key=lambda e: int(e.get("seq") or 0), reverse=True)
     return entries
 
@@ -2185,7 +2277,7 @@ def _select_archive(manifest: Manifest, arg: str, out):
     """
     wanted = os.path.abspath(os.path.expanduser(arg))
     for rec in manifest.latest.values():
-        for entry in _seq_entries(rec):
+        for entry in _seq_entries(rec, manifest.dest):
             if os.path.abspath(entry["path"]) == wanted:
                 why = _entry_error(entry)
                 if why:
@@ -2200,7 +2292,7 @@ def _select_archive(manifest: Manifest, arg: str, out):
         return "no archived session matches %r" % arg
     skipped = []
     chosen = None
-    for entry in _seq_entries(rec):
+    for entry in _seq_entries(rec, manifest.dest):
         why = _entry_error(entry)
         if why is None:
             chosen = entry
@@ -2641,6 +2733,56 @@ def scheduled_skip(state_dir: Path, now: float) -> str | None:
     return None
 
 
+# --------------------------------------------------------------- access
+
+def _probe_write(state_dir: Path) -> None:
+    """Create and remove a probe file in ``state_dir`` (made if missing)."""
+    state_dir.mkdir(parents=True, exist_ok=True)
+    probe = state_dir / (".access-probe-%d" % os.getpid())
+    with open(probe, "w", encoding="utf-8") as fh:
+        fh.write("ok")
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.remove(probe)
+
+
+def _probe_read(path: str) -> None:
+    """Read one entry of ``path``; raises OSError (EPERM under TCC)."""
+    with os.scandir(path) as it:
+        for _entry in it:
+            break
+
+
+def preflight_access(dest, tools) -> tuple[str, OSError] | None:
+    """``(path, error)`` for the first path a scheduled run cannot use.
+
+    A launchd job runs outside the user's TCC grants: reading anything under
+    ``~/Documents``, ``~/Desktop``, ``~/Downloads`` or iCloud Drive fails
+    with EPERM, and a job that then waits on a prompt hangs until the next
+    tick. So a scheduled run proves both halves of its access first - a
+    write probe in ``<dest>/state`` and one read of a tool root - and gives
+    up on the first failure instead of starting work it cannot finish.
+    """
+    state_dir = Path(dest) / "state"
+    try:
+        _probe_write(state_dir)
+    except OSError as exc:
+        return str(state_dir), exc
+    for tool in tools:
+        root = os.path.expanduser(TOOLS[tool][0])
+        try:
+            os.stat(root)
+        except FileNotFoundError:
+            continue  # an absent tool root is normal, not a permission failure
+        except OSError as exc:
+            return root, exc
+        try:
+            _probe_read(root)
+        except OSError as exc:
+            return root, exc
+    return None
+
+
 # --------------------------------------------------------------- driver
 
 def _write_last_success(state_dir: Path, now: float) -> None:
@@ -2655,7 +2797,7 @@ def _write_last_success(state_dir: Path, now: float) -> None:
 
 def run(opts: dict, out=None, *, state: Path | None = None, now: float | None = None) -> int:
     """One pass. Returns 0 ok, 1 failures or empty dry run, 2 bad options,
-    3 lock held, 5 store unreachable."""
+    3 lock held, 5 store unreachable, 6 no access for a scheduled run."""
     out = out or sys.stdout
     state_dir = Path(state) if state is not None else Path(_state_dir())
     cfg = load_config(state_dir)
@@ -2664,7 +2806,25 @@ def run(opts: dict, out=None, *, state: Path | None = None, now: float | None = 
     now = time.time() if now is None else now
     dest = Path(cfg["dest"])
 
+    tools = opts.get("tools") or cfg.get("tools") or list(TOOLS)
+    bad = [t for t in tools if t not in TOOLS]
+    if bad:
+        print("unknown tool(s): %s" % ", ".join(bad), file=sys.stderr)
+        return 2
+
     if opts.get("scheduled"):
+        # First thing: prove this job can read its code roots and write its
+        # dest. Under launchd, TCC answers EPERM instead of prompting, and
+        # an unhandled EPERM used to leave the job waiting forever.
+        blocked = preflight_access(dest, tools)
+        if blocked is not None:
+            path = blocked[0]
+            print(
+                "ERROR: no access to %s (macOS privacy: launchd jobs cannot read "
+                "~/Documents; move the dest/code, see docs)" % path,
+                file=out,
+            )
+            return 6
         state_dest = dest / "state"
         why = scheduled_skip(state_dest, now)
         if why:
@@ -2680,12 +2840,6 @@ def run(opts: dict, out=None, *, state: Path | None = None, now: float | None = 
             _write_disk_warning(state_dest, now, free_gb)
         else:
             _clear_disk_warning(state_dest)
-
-    tools = opts.get("tools") or cfg.get("tools") or list(TOOLS)
-    bad = [t for t in tools if t not in TOOLS]
-    if bad:
-        print("unknown tool(s): %s" % ", ".join(bad), file=sys.stderr)
-        return 2
 
     units, meta = discover(tools)
     manifest = Manifest(dest / "state")
