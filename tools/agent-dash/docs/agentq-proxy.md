@@ -71,7 +71,8 @@ A request that is already streaming upstream is not cancelled.
 `$AGENTQ_HOME/proxy.json` overrides the defaults above. It may set `port`,
 `upstream`, `window_s`, `start_target`, `target_floor`, `target_cut`,
 `target_step_up`, `default_output_tokens`, `give_up_s`, `retry_floor_s`,
-`retry_jitter_s`, `aging_s` and `budgets`. Environment variables:
+`retry_jitter_s`, `aging_s`, `connect_timeout_s` (10), `upstream_idle_s` (120),
+`drain_s` (20) and `budgets`. Environment variables:
 
 - `AGENTQ_HOME` (default `~/.local/state/agentq`)
 - `AGENTQ_PROXY_PORT` (default 8790)
@@ -100,6 +101,44 @@ launchd agent runs the system `python3` with no virtualenv. `httpx` is not used.
 The template `agentq/launchd/com.agentq.proxy.plist` has `__PYTHON__` and
 `__HOME__` placeholders. Install it by substituting them and copying it to
 `~/Library/LaunchAgents/`. Nothing is installed by this change.
+
+## Failure handling
+
+Every path after admission settles or releases the ticket's charge: a 200 that
+ends cleanly settles to real usage, and anything else releases it (a 429, an
+error, a client that left, a timeout, a truncated stream).
+
+- A client that closes while its request is queued, waiting to retry, or already
+  admitted but not yet sent is dropped and its charge released. Nothing is sent.
+- Upstream timeouts: connect after `connect_timeout_s`; each read after
+  `upstream_idle_s` without bytes. A timeout before any response byte returns 504
+  to the client. After that, the client connection is aborted.
+- Upstream closes before a status line: `502` with `{"error": "bad_status_line"}`.
+- A chunked or length-delimited body that ends early is a truncation. The client
+  connection is aborted with no terminating chunk, so the client sees the cut.
+  The proxy never reports a truncated body as complete.
+- Errors are counted by kind in the `errors` object of the status endpoint:
+  `timeout`, `truncated`, `bad_status_line`, `connection`.
+- Backstop: an unfinished charge older than `give_up_s + upstream_idle_s` is
+  expired from the budget, so a lost request cannot hold budget forever. A
+  stream still legitimately running past that age stops counting. This is rare
+  and the error is in the safe direction.
+
+## Shutdown and state
+
+- On SIGTERM or SIGINT the proxy stops accepting connections, lets in-flight
+  requests finish for up to `drain_s` (20 s), cancels what remains, and exits.
+- The learned state is written by the maintenance loop (about every 0.2 s when
+  it changed), off the request path, not on every 429.
+- Prefix memory: each job keeps 8-byte digests of 1024-character blocks, not its
+  prompt. The uncached estimate is accurate to one block (about 256 tokens).
+- Large request bodies (over 256 KiB) are parsed in a worker thread.
+
+## Missing key
+
+If the Keychain has no Morph key, the proxy writes one line to stderr and exits
+with status 78 (EX_CONFIG). The plist sets `ThrottleInterval` to 30 s, so a
+missing key shows as a slow restart loop with one clear line in the log.
 
 ## Requests
 
