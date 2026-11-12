@@ -11,7 +11,9 @@ from __future__ import annotations
 
 import contextlib
 import os
+import random
 import sqlite3
+import time
 import uuid
 from pathlib import Path
 
@@ -24,6 +26,11 @@ TERMINAL_STATES = ("done", "failed", "cancelled")
 AGING_S = 15 * 60
 MAX_RUNTIME_S = 6 * 3600
 DEFAULT_HOME = "~/.local/state/agentq"
+BUSY_TIMEOUT_MS = 30000
+CONNECT_TIMEOUT_S = 30
+RETRY_BUDGET_S = 60.0
+BACKOFF_MIN_S = 0.05
+BACKOFF_MAX_S = 1.0
 
 _STATEMENTS = (
     """CREATE TABLE jobs (
@@ -100,19 +107,65 @@ def new_job_id() -> str:
     return uuid.uuid4().hex[:12]
 
 
+def _is_busy(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    return isinstance(exc, sqlite3.OperationalError) and ("locked" in text or "busy" in text)
+
+
+def retrying(action, *, sleep=time.sleep, clock=time.monotonic, jitter=random.random):
+    """Run ``action`` and retry on lock contention until ``RETRY_BUDGET_S`` is spent.
+
+    Backoff starts at ``BACKOFF_MIN_S`` and doubles to ``BACKOFF_MAX_S``, with
+    jitter so concurrent processes do not retry in step. Any other error, and a
+    busy error after the budget, is raised. Only use it around work that has no
+    effect when it fails (opening, a pragma, ``BEGIN``).
+    """
+    deadline = clock() + RETRY_BUDGET_S
+    delay = BACKOFF_MIN_S
+    while True:
+        try:
+            return action()
+        except sqlite3.OperationalError as exc:
+            if not _is_busy(exc) or clock() >= deadline:
+                raise
+        sleep(min(BACKOFF_MAX_S, delay * (0.5 + jitter())))
+        delay = min(BACKOFF_MAX_S, delay * 2)
+
+
 def connect(home) -> sqlite3.Connection:
-    """Open (and create or migrate) the store. Autocommit; writes go through ``tx``."""
+    """Open (and create or migrate) the store. Autocommit; writes go through ``tx``.
+
+    A connection that finds the schema and WAL already in place takes no write lock.
+    """
     Path(home).mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(db_path(home), timeout=5.0, isolation_level=None)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA busy_timeout = 5000")
-    conn.execute("PRAGMA journal_mode = WAL")
-    migrate(conn)
-    return conn
+
+    def open_ready():
+        conn = sqlite3.connect(db_path(home), timeout=CONNECT_TIMEOUT_S, isolation_level=None)
+        try:
+            conn.row_factory = sqlite3.Row
+            conn.execute(f"PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}")
+            ensure_wal(conn)
+            migrate(conn)
+        except BaseException:
+            conn.close()
+            raise
+        return conn
+
+    return retrying(open_ready)
+
+
+def ensure_wal(conn: sqlite3.Connection) -> None:
+    """Switch to WAL only when it is not already set. The switch needs an exclusive
+    lock and returns busy without waiting, so it runs under the retry."""
+    if conn.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal":
+        return
+    retrying(lambda: conn.execute("PRAGMA journal_mode = WAL").fetchone())
 
 
 def migrate(conn: sqlite3.Connection) -> None:
-    """Create the schema once. ``user_version`` is checked under the write lock."""
+    """Create the schema once. A current schema is read without a write lock."""
+    if conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION:
+        return
     with tx(conn):
         if conn.execute("PRAGMA user_version").fetchone()[0] == 0:
             for statement in _STATEMENTS:
@@ -122,8 +175,12 @@ def migrate(conn: sqlite3.Connection) -> None:
 
 @contextlib.contextmanager
 def tx(conn: sqlite3.Connection):
-    """One write transaction; rolls back on any exception. Do not nest."""
-    conn.execute("BEGIN IMMEDIATE")
+    """One write transaction; rolls back on any exception. Do not nest.
+
+    Only ``BEGIN IMMEDIATE`` is retried on contention: it has not started anything
+    when it fails. Callers must not hold a transaction across a subprocess or slow I/O.
+    """
+    retrying(lambda: conn.execute("BEGIN IMMEDIATE"))
     try:
         yield conn
     except BaseException:

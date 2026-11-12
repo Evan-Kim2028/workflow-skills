@@ -73,7 +73,9 @@ with each job.
 ## Durability
 
 - Every job state change is one SQLite transaction (`BEGIN IMMEDIATE`, WAL,
-  busy timeout 5 s). Concurrent submits from many processes do not lose jobs.
+  busy timeout 30 s). Opening the store, switching to WAL and `BEGIN` retry lock
+  contention for up to 60 s with jittered backoff (50 ms to 1 s). No transaction is
+  held across a subprocess call or other slow I/O. Concurrent submits from many processes do not lose jobs.
 - Workers run in their own session, so they outlive the broker.
 - Each tick reconciles running jobs first:
   - process alive with a matching start time: adopted, nothing changes;
