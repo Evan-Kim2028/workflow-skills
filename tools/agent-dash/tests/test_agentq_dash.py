@@ -784,3 +784,126 @@ class LogTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+OLD_MINUTES_DDL = """
+CREATE TABLE proxy_minutes (
+    minute TEXT NOT NULL, model TEXT NOT NULL,
+    req INT, ok INT, r429 INT,
+    input INT, cache_read INT, output INT, uncached_est INT,
+    wait_p50_ms INT, wait_p95_ms INT, target REAL,
+    PRIMARY KEY (minute, model)
+)
+"""
+LATENCY_ROW_COLUMNS = (
+    "minute, model, req, ok, r429, input, cache_read, output, uncached_est, wait_p50_ms, wait_p95_ms, target, "
+    "upstream_ms_sum, upstream_n, upstream_p50_ms, upstream_p95_ms, ttfb_p50_ms, in_flight_max"
+)
+
+
+def write_latency_home(tmp: Path, rows: list[tuple]) -> Path:
+    home = make_home(tmp, minutes=False, jobs=False)
+    connection = sqlite3.connect(home / "agentq.db")
+    connection.execute(PROXY_MINUTES_DDL)
+    connection.executemany(f"INSERT INTO proxy_minutes ({LATENCY_ROW_COLUMNS}) VALUES ({','.join('?' * 18)})", rows)
+    connection.commit()
+    connection.close()
+    return home
+
+
+def latency_row(minute: str, model: str, n: int, p50: int | None, p95: int | None) -> tuple:
+    total_ms = None if p50 is None else p50 * n
+    return (minute, model, n, n, 0, 0, 0, 0, 0, 0, 0, 0.9, total_ms, n if p50 is not None else None, p50, p95, None, 1)
+
+
+class UpstreamLatencyDashTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.rows = [
+            latency_row(minute_at(60), "morph-dsv41flash-1017", 2, 1000, 2000),
+            latency_row(minute_at(60), "morph-kimik31", 4, 500, 900),
+            latency_row(minute_at(120), "morph-dsv41flash-1017", 3, None, None),
+            latency_row(minute_at(180), "morph-dsv41flash-1017", 2, 300, 700),
+        ]
+        self.home = write_latency_home(Path(self.tmp.name), self.rows)
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def summary(self, live=None, hours: int = 24) -> dict:
+        return dash.build_summary(self.home, hours, now=NOW, fetch_live=lambda: live)
+
+    def point(self, minutes_ago: int, home: Path | None = None) -> dict:
+        since = UNTIL - 24 * 3600
+        points = dash.minute_series(dash.read_minute_rows((home or self.home) / "agentq.db", since, UNTIL), since, UNTIL)
+        return next(p for p in points if p["t"] == UNTIL - minutes_ago * 60)
+
+    def test_minute_point_combines_models_by_request_weighted_p50_and_worst_p95(self) -> None:
+        point = self.point(1)
+        self.assertEqual(point["upstream_p50_ms"], round((1000 * 2 + 500 * 4) / 6))
+        self.assertEqual(point["upstream_p95_ms"], 2000)
+        self.assertEqual(point["upstream_n"], 6)
+
+    def test_rows_without_latency_give_null_points_not_zeros(self) -> None:
+        point = self.point(2)
+        self.assertIsNone(point["upstream_p50_ms"])
+        self.assertIsNone(point["upstream_p95_ms"])
+
+    def test_bucket_averages_p50_and_takes_the_worst_p95(self) -> None:
+        points = [
+            {"t": 600, "wait_p95_ms": None, "upstream_p50_ms": 1000, "upstream_p95_ms": 2000,
+             **{k: 0 for k in dash.BUCKET_SUM_KEYS}, **{k: 0.0 for k in dash.PCT_KEYS}, "minute": "x"},
+            {"t": 660, "wait_p95_ms": None, "upstream_p50_ms": 500, "upstream_p95_ms": 900,
+             **{k: 0 for k in dash.BUCKET_SUM_KEYS}, **{k: 0.0 for k in dash.PCT_KEYS}, "minute": "x"},
+            {"t": 720, "wait_p95_ms": None, "upstream_p50_ms": None, "upstream_p95_ms": None,
+             **{k: 0 for k in dash.BUCKET_SUM_KEYS}, **{k: 0.0 for k in dash.PCT_KEYS}, "minute": "x"},
+        ]
+        bucket = dash.bucket_minutes(points, 300)[0]
+        self.assertEqual(bucket["upstream_p50_ms"], 750)
+        self.assertEqual(bucket["upstream_p95_ms"], 2000)
+
+    def test_perf_kpi_is_request_weighted_over_minutes_that_have_latency(self) -> None:
+        perf = self.summary()["perf_kpis"]
+        self.assertEqual(perf["upstream_response_p50_ms"], round((4000 + 600) / 8))
+        self.assertEqual(perf["upstream_response_p95_ms"], 2000)
+
+    def test_in_flight_now_sums_the_live_status_across_models(self) -> None:
+        live = {"ok": True, "budgets": {}, "upstream": {"in_flight": {"morph-dsv41flash-1017": 3, "morph-kimik31": 1}}}
+        self.assertEqual(self.summary(live)["perf_kpis"]["in_flight_now"], 4)
+
+    def test_in_flight_now_is_null_without_a_live_status(self) -> None:
+        self.assertIsNone(self.summary(None)["perf_kpis"]["in_flight_now"])
+
+    def test_old_schema_without_latency_columns_still_charts_the_counts(self) -> None:
+        tmp = Path(tempfile.mkdtemp())
+        home = make_home(tmp, minutes=False, jobs=False)
+        connection = sqlite3.connect(home / "agentq.db")
+        connection.execute(OLD_MINUTES_DDL)
+        connection.execute(
+            "INSERT INTO proxy_minutes (minute, model, req, ok, r429, input, cache_read, output, uncached_est, "
+            "wait_p50_ms, wait_p95_ms, target) VALUES (?,?,5,5,1,100,0,50,0,200,800,0.9)",
+            (minute_at(60), "morph-dsv41flash-1017"),
+        )
+        connection.commit()
+        connection.close()
+        summary = dash.build_summary(home, 24, now=NOW, fetch_live=no_proxy)
+        self.assertNotIn("minutes", summary["errors"])
+        point = self.point(1, home)
+        self.assertEqual(point["req"], 5)
+        self.assertEqual(point["wait_p95_ms"], 800)
+        self.assertIsNone(point["upstream_p50_ms"])
+        self.assertIsNone(summary["perf_kpis"]["upstream_response_p50_ms"])
+        self.assertIsNone(summary["perf_kpis"]["upstream_response_p95_ms"])
+
+    def test_page_has_the_paired_capacity_charts_the_response_chart_and_the_tiles(self) -> None:
+        for marker in (
+            "Capacity vs workers",
+            'id="c-billed"',
+            'id="c-workers"',
+            'id="c-upstream"',
+            'id="p-morph"',
+            'id="p-inflight"',
+            "Morph response time per request (s), p50 and p95",
+            "function compact(",
+        ):
+            self.assertIn(marker, dash.PAGE_HTML)
