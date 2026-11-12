@@ -6,6 +6,7 @@ launchctl is touched. Real-data runs are dry runs only.
 """
 
 import fcntl
+import io
 import json
 import os
 import re
@@ -101,6 +102,16 @@ class Base(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.home = Path(self.tmp.name)
         self.addCleanup(self.tmp.cleanup)
+        # lsof lives in /usr/sbin on macOS. The tests need it for the
+        # open-handle probe, so they add it themselves rather than relying
+        # on the caller's PATH.
+        old_path = os.environ.get("PATH", "")
+        parts = old_path.split(os.pathsep) if old_path else []
+        for extra in ("/usr/sbin", "/sbin"):
+            if extra not in parts:
+                parts.append(extra)
+        os.environ["PATH"] = os.pathsep.join(parts)
+        self.addCleanup(lambda: os.environ.__setitem__("PATH", old_path))
 
     def unit(self, tool, root):
         units = sa.TOOLS[tool][1](str(root))
@@ -1292,10 +1303,274 @@ class ReclaimCrashTest(Base):
         self._crash("trashdelete")
 
 
+# --------------------------------------------------------------- round 4
+
+class ApplyPassRecoveryTest(Base):
+    """Round 4 finding 1: a reclaim crash through apply_pass keeps its journal.
+
+    The review of e6e145d showed that an exception raised after the
+    ``reclaiming`` journal is written made ``apply_pass`` record an error
+    from the stale prior record, dropping ``trash_members`` and stranding
+    the originals in trash forever.
+    """
+
+    def _setup(self):
+        root = self.home / "grok"
+        sdir = root / "enc" / "sid"
+        write(sdir / "chat_history.jsonl", '{"type":"system"}\n')
+        write(sdir / "blob.bin", bytes(range(256)) * 32)
+        for path in sdir.rglob("*"):
+            if path.is_file():
+                age(path, 20)
+        unit = self.unit("grok", root)
+        dest = self.home / "dest"
+        client = FakeClient()
+        rec, manifest = self.archive_unit(unit, dest, client)
+        cfg = {
+            "reclaim_days": 14.0,
+            "reclaim_days_by_tool": {},
+            "min_idle_hours": 6.0,
+            "max_minutes": 90.0,
+            "dest": str(dest),
+        }
+        return unit, dest, client, manifest, cfg
+
+    def _apply_crash(self, point):
+        """Run apply_pass and crash at one reclaim step (journal/rename/...)."""
+        unit, dest, client, manifest, cfg = self._setup()
+        real_rename = os.rename
+        real_write = sa.Manifest.write
+        real_mismatch = sa._trash_mismatch
+        real_rmtree = shutil.rmtree
+        state = {"renames": 0}
+
+        def flaky_rename(src, dst):
+            state["renames"] += 1
+            if point == "rename1" and state["renames"] == 1:
+                raise RuntimeError("simulated crash")
+            if point == "rename2" and state["renames"] == 2:
+                raise RuntimeError("simulated crash")
+            return real_rename(src, dst)
+
+        def flaky_write(self_, r):
+            real_write(self_, r)
+            if point == "journal" and r.get("status") == "reclaiming":
+                raise OSError("simulated crash")
+
+        def flaky_mismatch(trash, members):
+            result = real_mismatch(trash, members)
+            if point == "rehash":
+                raise OSError("simulated crash")
+            return result
+
+        def flaky_rmtree(path, *args, **kwargs):
+            real_rmtree(path, *args, **kwargs)
+            if point == "trashdelete" and str(path).startswith(str(dest / "state" / "trash")):
+                raise OSError("simulated crash")
+
+        with mock.patch.object(sa.os, "rename", flaky_rename), mock.patch.object(
+            sa.Manifest, "write", flaky_write
+        ), mock.patch.object(sa, "_trash_mismatch", flaky_mismatch), mock.patch.object(
+            sa.shutil, "rmtree", flaky_rmtree
+        ):
+            results = sa.apply_pass(
+                [unit],
+                cfg,
+                client,
+                manifest,
+                dest,
+                set(),
+                open(os.devnull, "w"),
+                no_reclaim=False,
+                limit=None,
+                max_minutes=90.0,
+                now=time.time(),
+            )
+        self.assertEqual(results["errors"], 1, point)
+        return unit, dest
+
+    def _recover(self, unit, dest):
+        sa.recover_trash(dest, sa.Manifest(dest / "state"), open(os.devnull, "w"))
+        return sa.Manifest(dest / "state").latest[unit.uid]
+
+    def test_crash_after_journal_write_keeps_trash_members(self):
+        unit, dest = self._apply_crash("journal")
+        crashed = sa.Manifest(dest / "state").latest[unit.uid]
+        self.assertEqual(crashed["status"], "error")
+        self.assertTrue(crashed.get("trash_members"), "error record dropped the reclaim journal")
+        self.assertTrue(crashed.get("trash"))
+        final = self._recover(unit, dest)
+        self.assertEqual(final["status"], "archived")
+        for member in unit.members:
+            self.assertTrue(Path(member.path).exists(), member.rel)
+        self.assertTrue(sa._archive_ok(final))
+
+    def test_crash_before_first_rename_recovers_through_apply_pass(self):
+        unit, dest = self._apply_crash("rename1")
+        final = self._recover(unit, dest)
+        self.assertEqual(final["status"], "archived")
+        for member in unit.members:
+            self.assertTrue(Path(member.path).exists(), member.rel)
+        self.assertTrue(sa._archive_ok(final))
+
+    def test_crash_mid_rename_recovers_through_apply_pass(self):
+        unit, dest = self._apply_crash("rename2")
+        final = self._recover(unit, dest)
+        self.assertEqual(final["status"], "archived")
+        for member in unit.members:
+            self.assertTrue(Path(member.path).exists(), member.rel)
+        self.assertTrue(sa._archive_ok(final))
+
+    def test_crash_after_rehash_recovers_through_apply_pass(self):
+        unit, dest = self._apply_crash("rehash")
+        final = self._recover(unit, dest)
+        self.assertEqual(final["status"], "reclaimed")
+        for member in unit.members:
+            self.assertFalse(Path(member.path).exists(), member.rel)
+        self.assertTrue(sa._archive_ok(final))
+
+    def test_crash_after_trash_delete_recovers_through_apply_pass(self):
+        unit, dest = self._apply_crash("trashdelete")
+        final = self._recover(unit, dest)
+        self.assertEqual(final["status"], "reclaimed")
+        self.assertFalse(any(Path(m.path).exists() for m in unit.members))
+        self.assertTrue(sa._archive_ok(final))
+
+    def test_error_record_without_trash_members_still_recovers(self):
+        """An e6e145d-style clobbered record is matched and rolled back."""
+        unit, dest, _client, manifest, _cfg = self._setup()
+        rec = manifest.latest[unit.uid]
+        trash = sa._trash_dir(dest, unit.uid)
+        for member in unit.members:
+            dst = trash / member.rel
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            os.rename(member.path, dst)
+        # The pre-fix apply_pass wrote the error record from the stale prior,
+        # so it carries neither trash nor trash_members.
+        manifest.write(dict(rec, status="error", error="simulated stale record"))
+        crashed = sa.Manifest(dest / "state").latest[unit.uid]
+        self.assertFalse(crashed.get("trash_members"))
+        final = self._recover(unit, dest)
+        # The archive verifies and the trash hashes match its members, so
+        # recovery finishes the reclaim instead of leaving the files stranded.
+        self.assertEqual(final["status"], "reclaimed")
+        for member in unit.members:
+            self.assertFalse(Path(member.path).exists(), member.rel)
+        self.assertTrue(sa._archive_ok(final))
+
+    def test_unmatched_trash_dir_is_left_and_reported(self):
+        unit, dest, _client, _manifest, _cfg = self._setup()
+        orphan = sa._trash_root(dest) / "unknown%2Funit"
+        write(orphan / "keep.txt", "not ours\n")
+        sa.recover_trash(dest, sa.Manifest(dest / "state"), open(os.devnull, "w"))
+        self.assertEqual((orphan / "keep.txt").read_text(encoding="utf-8"), "not ours\n")
+        out = io.StringIO()
+        self.assertEqual(sa.status(dest / "state", out), 0)
+        self.assertIn("trash without a manifest record", out.getvalue())
+        self.assertIn(str(orphan), out.getvalue())
+        sa.recover_trash(dest, sa.Manifest(dest / "state"), open(os.devnull, "w"))
+        self.assertTrue((orphan / "keep.txt").exists())
+
+
+class RestoreRound4Test(Base):
+    """Round 4 findings 2 and 3: symlinked ancestors and archive selection."""
+
+    def test_restore_refuses_symlinked_ancestor(self):
+        root = self.home / "grok"
+        sdir = root / "enc" / "sid"
+        write(sdir / "sub" / "a.jsonl", '{"type":"system"}\n')
+        for path in sdir.rglob("*"):
+            if path.is_file():
+                age(path, 20)
+        unit = self.unit("grok", root)
+        dest = self.home / "dest"
+        _rec, _manifest = self.archive_unit(unit, dest, FakeClient())
+        outside = self.home / "outside"
+        outside.mkdir()
+        target = self.home / "restored"
+        target.mkdir()
+        os.symlink(outside, target / "sid")
+        self.assertEqual(sa.restore(unit.session, str(target), dest / "state", sys.stdout), 2)
+        self.assertEqual(list(outside.rglob("*")), [], "restore wrote outside the target")
+        self.assertTrue((target / "sid").is_symlink())
+
+    def _pack(self, unit, dest, client, prior=None):
+        seq = sa.next_archive_seq(dest, unit)
+        archive = sa.archive_path(dest, unit, seq)
+        archive.parent.mkdir(parents=True, exist_ok=True)
+        records = sa.pack(unit, str(archive))
+        for rec, member in zip(records, unit.members):
+            if rec["lines"] is None:
+                rec["lines"] = sa.count_member_rows(member, unit)
+        sa.verify_archive(str(archive), records)
+        rev, total, _sent = sa.ingest_unit(unit, records, prior, client)
+        rec = {
+            "unit": unit.uid,
+            "tool": unit.tool,
+            "key": unit.key,
+            "session": unit.session,
+            "root": unit.root,
+            "parent": unit.parent,
+            "archive": str(archive),
+            "archive_bytes": os.path.getsize(archive),
+            "seq": seq,
+            "raw_bytes": unit.raw_bytes,
+            "rev": rev,
+            "lines": total,
+            "members": records,
+            "status": "archived",
+            "archives": list((prior or {}).get("archives") or [])
+            + [{"seq": seq, "path": str(archive), "bytes": os.path.getsize(archive), "members": records}],
+        }
+        sa.Manifest(dest / "state").write(rec)
+        return rec, archive
+
+    def _versions(self):
+        """Two archive sequences for one unit: seq 0 ``old``, seq 1 ``new``."""
+        root = self.home / "pi"
+        path = write(root / "proj" / "a.jsonl", "old\n")
+        age(path, 20)
+        unit = self.unit("pi", root)
+        dest = self.home / "dest"
+        client = FakeClient()
+        rec0, archive0 = self._pack(unit, dest, client)
+        path.write_text("new\n", encoding="utf-8")
+        age(path, 20)
+        unit2 = self.unit("pi", root)
+        rec1, archive1 = self._pack(unit2, dest, client, prior=rec0)
+        return unit2, dest, rec0, archive0, rec1, archive1
+
+    def test_explicit_older_archive_restores_that_seq(self):
+        _unit, dest, _rec0, archive0, _rec1, _archive1 = self._versions()
+        target = self.home / "r0"
+        self.assertEqual(sa.restore(str(archive0), str(target), dest / "state", sys.stdout), 0)
+        self.assertEqual((target / "a.jsonl").read_bytes(), b"old\n")
+
+    def test_restore_by_session_uses_newest_verifying_seq(self):
+        unit, dest, _rec0, _archive0, _rec1, _archive1 = self._versions()
+        target = self.home / "new"
+        self.assertEqual(sa.restore(unit.session, str(target), dest / "state", sys.stdout), 0)
+        self.assertEqual((target / "a.jsonl").read_bytes(), b"new\n")
+
+    def test_restore_by_session_falls_back_to_older_intact_seq(self):
+        unit, dest, _rec0, _archive0, _rec1, archive1 = self._versions()
+        Path(archive1).write_bytes(b"corrupt")
+        out = io.StringIO()
+        target = self.home / "fallback"
+        self.assertEqual(sa.restore(unit.session, str(target), dest / "state", out), 0)
+        self.assertEqual((target / "a.jsonl").read_bytes(), b"old\n")
+        self.assertIn("restoring seq 0", out.getvalue())
+        # An explicit corrupt path never silently substitutes another seq.
+        self.assertEqual(
+            sa.restore(str(archive1), str(self.home / "bad"), dest / "state", sys.stdout), 2
+        )
+        self.assertFalse((self.home / "bad").exists())
+
+
 # --------------------------------------------------------------- real store e2e
 
 VLOGS_BIN = Path.home() / ".local/share/agent-dash/vlogs/bin/victoria-logs-prod"
-VLOGS_E2E_PORT = 19530
+VLOGS_E2E_PORT = 19537
 
 
 @unittest.skipUnless(os.environ.get("VLOGS_E2E") == "1", "set VLOGS_E2E=1 for the real-binary run")

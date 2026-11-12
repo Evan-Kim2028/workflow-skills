@@ -1514,10 +1514,53 @@ def reclaim_unit(
     return None
 
 
-def _recover_one(uid: str, rec: dict, dest, manifest: Manifest, out) -> None:
+def _recover_members(rec: dict) -> list[dict] | None:
+    """Members a recovery can verify, or None when the record cannot.
+
+    The reclaiming journal carries ``trash_members`` with each original
+    path. A record that lost them (an ``error`` record built before the
+    journal was preserved) still names its packed members and its parent,
+    so the original path is ``parent/rel``; such a member is only usable
+    when its sha256 is recorded, otherwise the trash contents cannot be
+    proven and must be left alone.
+    """
+    members = rec.get("trash_members")
+    if members:
+        return members
+    parent = rec.get("parent") or ""
+    out = []
+    for m in rec.get("members") or []:
+        if not m.get("sha256") or m.get("size") is None or not m.get("rel"):
+            return None
+        path = m.get("path") or (os.path.join(parent, m["rel"]) if parent else "")
+        if not path:
+            return None
+        out.append({"rel": m["rel"], "path": path, "sha256": m["sha256"], "size": m["size"]})
+    return out or None
+
+
+def _trash_uid(manifest: Manifest, entry: Path) -> str | None:
+    """The unit whose manifest record names ``entry`` as its trash dir."""
+    name = entry.name
+    for uid in manifest.latest:
+        if _uid_safe(uid) == name:
+            return uid
+    target = os.path.abspath(str(entry))
+    for uid, rec in manifest.latest.items():
+        try:
+            named = os.path.abspath(str(rec.get("trash") or ""))
+        except (TypeError, ValueError):
+            continue
+        if rec.get("trash") and named == target:
+            return uid
+    return None
+
+
+def _recover_one(uid: str, rec: dict, dest, manifest: Manifest, out, members=None) -> None:
     """Resolve one ``reclaiming`` record from whatever the trash holds."""
     entry = _trash_dir(dest, uid)
-    members = rec.get("trash_members") or []
+    if members is None:
+        members = _recover_members(rec) or []
     files = [p for p in entry.rglob("*") if p.is_file()] if entry.is_dir() else []
     if not files:
         # Crash after the trash delete (or before any rename).
@@ -1552,11 +1595,15 @@ def recover_trash(dest, manifest: Manifest, out) -> int:
     manifest and the archive verifies, step 5 is finished (``reclaimed``);
     otherwise the files are moved back and the unit returns to ``archived``.
     A ``reclaiming`` record is resolved even when its trash dir is already
-    gone (a crash after the trash delete). Returns the number resolved.
+    gone (a crash after the trash delete). An ``error`` record that carries
+    ``trash_members`` is resolved too, and a leftover trash dir is matched
+    to its unit through the manifest (by the recorded ``trash`` path when
+    the dir name alone does not match). A dir no record names is never
+    deleted: it is left in place and reported. Returns the number resolved.
     """
     root = _trash_root(dest)
     resolved = 0
-    seen = set()
+    resolved_uids: set[str] = set()
 
     def needs_recovery(rec) -> bool:
         return rec.get("status") == "reclaiming" or (
@@ -1566,23 +1613,34 @@ def recover_trash(dest, manifest: Manifest, out) -> int:
     for uid, rec in list(manifest.latest.items()):
         if not needs_recovery(rec):
             continue
-        seen.add(_uid_safe(uid))
         _recover_one(uid, rec, dest, manifest, out)
+        resolved_uids.add(uid)
         resolved += 1
     if root.is_dir():
         for entry in sorted(root.iterdir()):
-            if not entry.is_dir() or entry.name in seen:
+            if not entry.is_dir():
                 continue
-            uid = entry.name.replace("%2F", "/").replace("%25", "%")
-            rec = manifest.latest.get(uid)
-            if rec is None or not needs_recovery(rec):
-                # No journal: never delete unknown data. Leave it and say so.
+            uid = _trash_uid(manifest, entry)
+            if uid is None:
+                # No manifest record names this dir: never delete unknown
+                # data. Leave it in place; `status` reports it.
                 if any(entry.iterdir()):
-                    print("  trash without a reclaiming record: %s" % entry, file=out)
+                    print("  trash without a manifest record, left in place: %s" % entry, file=out)
                 else:
                     shutil.rmtree(entry, ignore_errors=True)
                 continue
-            _recover_one(uid, rec, dest, manifest, out)
+            if uid in resolved_uids:
+                continue
+            rec = manifest.latest.get(uid) or {}
+            members = _recover_members(rec)
+            if members is None:
+                print(
+                    "  trash dir %s has no verifiable manifest record, left in place" % entry,
+                    file=out,
+                )
+                continue
+            _recover_one(uid, rec, dest, manifest, out, members=members)
+            resolved_uids.add(uid)
             resolved += 1
     return resolved
 
@@ -1820,9 +1878,17 @@ def apply_pass(
         except Exception as exc:  # one unit never stops the run
             results["errors"] += 1
             reason = "%s: %s" % (exc.__class__.__name__, exc)
-            # Keep the previous confirmed members, rev and totals so the
-            # next run resumes instead of rejecting already-posted rows.
+            # Start from the *latest* record, never the stale `prior`
+            # argument: reclaim writes a `reclaiming` journal with
+            # `trash`/`trash_members` before it moves anything, and dropping
+            # those here would strand the originals in trash with no way to
+            # recover them on the next pass.
+            latest = manifest.latest.get(unit.uid)
             base = dict(prior) if prior else {}
+            if latest:
+                base.update(latest)
+            # Keep the confirmed members, rev and totals so the next run
+            # resumes instead of rejecting already-posted rows.
             base.update(
                 {
                     "unit": unit.uid,
@@ -1995,6 +2061,152 @@ def _find_record(manifest: Manifest, arg: str) -> dict | None:
     return matches[0]
 
 
+def _seq_entries(rec: dict) -> list[dict]:
+    """Every archive version recorded for a unit, newest sequence first."""
+    entries = []
+    seen = set()
+    for entry in rec.get("archives") or []:
+        if not isinstance(entry, dict) or not entry.get("path") or entry["path"] in seen:
+            continue
+        seen.add(entry["path"])
+        entries.append(entry)
+    current = rec.get("archive")
+    if current and current not in seen:
+        entry = {
+            "seq": int(rec.get("seq") or 0),
+            "path": current,
+            "members": rec.get("members") or [],
+        }
+        if rec.get("archive_bytes") is not None:
+            entry["bytes"] = int(rec["archive_bytes"])
+        entries.append(entry)
+    entries.sort(key=lambda e: int(e.get("seq") or 0), reverse=True)
+    return entries
+
+
+def _entry_error(entry: dict) -> str | None:
+    """Why this archive version cannot be restored, or None when it can."""
+    path = entry.get("path")
+    members = entry.get("members") or []
+    if not path:
+        return "no path recorded"
+    if not os.path.exists(path):
+        return "missing"
+    if not members:
+        return "no member list recorded for this sequence"
+    size = entry.get("bytes")
+    if size is not None and os.path.getsize(path) != int(size):
+        return "size changed"
+    try:
+        verify_archive(path, members)
+    except ArchiveError as exc:
+        return str(exc)
+    return None
+
+
+def _select_archive(manifest: Manifest, arg: str, out):
+    """``(record, archive entry)`` for ``arg``, or an error string.
+
+    An explicit archive path selects exactly that sequence and never a
+    substitute, so a caller can restore an older version on purpose. A
+    session id or unit id selects the newest sequence whose bytes still
+    verify, falling back to older ones with a printed note.
+    """
+    wanted = os.path.abspath(os.path.expanduser(arg))
+    for rec in manifest.latest.values():
+        for entry in _seq_entries(rec):
+            if os.path.abspath(entry["path"]) == wanted:
+                why = _entry_error(entry)
+                if why:
+                    return "archive %s (seq %s) cannot be restored: %s" % (
+                        entry["path"],
+                        entry.get("seq"),
+                        why,
+                    )
+                return rec, entry
+    rec = _find_record(manifest, arg)
+    if rec is None:
+        return "no archived session matches %r" % arg
+    skipped = []
+    chosen = None
+    for entry in _seq_entries(rec):
+        why = _entry_error(entry)
+        if why is None:
+            chosen = entry
+            break
+        skipped.append("seq %s: %s" % (entry.get("seq"), why))
+    if chosen is None:
+        return "no archive version for %s can be restored (%s)" % (
+            rec.get("unit"),
+            "; ".join(skipped) or "none recorded",
+        )
+    if skipped:
+        print(
+            "note: newest archive for %s is unusable (%s); restoring seq %s"
+            % (rec.get("unit"), "; ".join(skipped), chosen.get("seq")),
+            file=out,
+        )
+    return rec, chosen
+
+
+def _ensure_dir(path: str) -> None:
+    """Create ``path``; every component made is verified as a real dir."""
+    path = os.path.abspath(path)
+    missing = []
+    cur = path
+    while not os.path.isdir(cur):
+        if os.path.lexists(cur):
+            raise ArchiveError("refusing to create %s: %s exists and is not a directory" % (path, cur))
+        missing.append(cur)
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            break
+        cur = parent
+    for piece in reversed(missing):
+        try:
+            os.mkdir(piece)
+        except FileExistsError:
+            pass
+        if os.path.islink(piece) or not os.path.isdir(piece):
+            raise ArchiveError("refusing to create %s: %s is not a real directory" % (path, piece))
+
+
+def _ancestor_problems(target: str, members) -> list[str]:
+    """Symlinked or escaping ancestors of every final path under ``target``.
+
+    Walks every existing component between the restore target and each
+    member's file. A symlink there (or a component that resolves somewhere
+    else) could take restored bytes outside ``target``, so it is refused
+    before anything is created.
+    """
+    target = os.path.abspath(target)
+    if os.path.islink(target):
+        return ["%s is a symlink" % target]
+    bad: list[str] = []
+    seen: set[str] = set()
+    for m in members:
+        parts = (m.get("rel") or "").replace("\\", "/").split("/")[:-1]
+        cur = target
+        for part in parts:
+            cur = os.path.join(cur, part)
+            if cur in seen:
+                continue
+            seen.add(cur)
+            if os.path.islink(cur):
+                bad.append("%s is a symlink" % cur)
+                break
+            if not os.path.lexists(cur):
+                break
+            if not os.path.isdir(cur):
+                bad.append("%s is not a directory" % cur)
+                break
+            real = os.path.realpath(cur)
+            if real != cur:
+                bad.append("%s resolves to %s" % (cur, real))
+                break
+    return bad
+
+
 def _safe_rel(name: str) -> bool:
     """A relative member name with no ``..`` and no absolute prefix."""
     if not name or name.startswith("/") or os.path.isabs(name):
@@ -2059,43 +2271,71 @@ def _extract(archive: str, target: str, members: list[dict]) -> None:
 
 def restore(arg: str, to: str | None, state_dir: Path, out) -> int:
     manifest = Manifest(state_dir)
-    rec = _find_record(manifest, arg)
-    if rec is None:
-        print("no archived session matches %r" % arg, file=sys.stderr)
+    picked = _select_archive(manifest, arg, out)
+    if isinstance(picked, str):
+        print(picked, file=sys.stderr)
         return 2
-    archive = rec.get("archive")
-    if not archive or not os.path.exists(archive):
-        print("archive missing: %s" % archive, file=sys.stderr)
-        return 2
+    rec, entry = picked
+    archive = entry["path"]
+    members = entry.get("members") or []
     target = os.path.expanduser(to) if to else rec.get("parent")
     if not target:
         print("no target dir; pass --to DIR", file=sys.stderr)
         return 2
-    members = rec.get("members") or []
-    existing = [os.path.join(target, m["rel"]) for m in members if os.path.exists(os.path.join(target, m["rel"]))]
+    target_abs = os.path.abspath(target)
+    existing = [
+        os.path.join(target_abs, m["rel"])
+        for m in members
+        if os.path.lexists(os.path.join(target_abs, m["rel"]))
+    ]
     if existing:
         print("refusing to overwrite %d existing path(s):" % len(existing), file=sys.stderr)
         for path in existing[:20]:
             print("  %s" % path, file=sys.stderr)
         return 2
-    target_abs = os.path.abspath(target)
+    # Refuse a symlinked or escaping ancestor of any final path before
+    # creating or renaming anything: extraction into a temp dir is safe,
+    # but a rename would otherwise follow an existing ``target/sid -> /x``.
+    bad = _ancestor_problems(target_abs, members)
+    if bad:
+        print("refusing to restore through %d unexpected ancestor(s):" % len(bad), file=sys.stderr)
+        for line in bad[:20]:
+            print("  %s" % line, file=sys.stderr)
+        return 2
     parent = os.path.dirname(target_abs) or "."
-    os.makedirs(parent, exist_ok=True)
+    try:
+        _ensure_dir(parent)
+    except ArchiveError as exc:
+        print("restore failed, target untouched: %s" % exc, file=sys.stderr)
+        return 2
     tmp = tempfile.mkdtemp(prefix=".restore-", dir=parent)
     moved: list[tuple[str, str]] = []
     try:
         _extract(archive, tmp, members)
-        # Re-check after extraction: a concurrent writer must not be clobbered.
-        existing = [os.path.join(target_abs, m["rel"]) for m in members if os.path.exists(os.path.join(target_abs, m["rel"]))]
+        # Re-check after extraction: a concurrent writer (or a symlink made
+        # while we extracted) must not be clobbered or followed.
+        existing = [
+            os.path.join(target_abs, m["rel"])
+            for m in members
+            if os.path.lexists(os.path.join(target_abs, m["rel"]))
+        ]
         if existing:
             print("refusing to overwrite %d existing path(s):" % len(existing), file=sys.stderr)
             for path in existing[:20]:
                 print("  %s" % path, file=sys.stderr)
             return 2
+        bad = _ancestor_problems(target_abs, members)
+        if bad:
+            print("refusing to restore through %d unexpected ancestor(s):" % len(bad), file=sys.stderr)
+            for line in bad[:20]:
+                print("  %s" % line, file=sys.stderr)
+            return 2
         for m in members:
             src = os.path.join(tmp, m["rel"])
             dst = os.path.join(target_abs, m["rel"])
-            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            _ensure_dir(os.path.dirname(dst))
+            if os.path.islink(dst) or os.path.lexists(dst):
+                raise ArchiveError("refusing to overwrite %s" % dst)
             os.rename(src, dst)
             moved.append((src, dst))
     except (ArchiveError, OSError) as exc:
@@ -2174,6 +2414,11 @@ def status(state_dir: Path, out) -> int:
                 except OSError:
                     pass
         print("trash: %d file(s), %s (resolved by the next --apply)" % (count, _fmt(size)), file=out)
+        # A trash dir no manifest record names is never deleted by recovery;
+        # report it here so a person can look at it.
+        for entry in sorted(trash.iterdir()):
+            if entry.is_dir() and _trash_uid(manifest, entry) is None and any(entry.iterdir()):
+                print("trash without a manifest record (left in place): %s" % entry, file=out)
     last = state_dir / "last_success.json"
     if last.exists():
         try:

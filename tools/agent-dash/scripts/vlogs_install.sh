@@ -12,10 +12,10 @@
 #
 # Test overrides (never needed in normal use):
 #   VLOGS_HOME       install dir            (default ~/.local/share/agent-dash/vlogs)
-#   VLOGS_DATA       store data dir         (default $VLOGS_HOME/data)
-#   VLOGS_MAX_DISK   retention disk cap     (default 20GiB; `none` or an
-#                    empty value omits the cap entirely, so the store never
-#                    evicts rows for space)
+#   VLOGS_DATA       store data dir         (default: kept from the plist)
+#   VLOGS_MAX_DISK   retention disk cap     (default: kept from the plist;
+#                    a fresh install uses 20GiB; `none` or an empty value
+#                    omits the cap entirely, so the store never evicts)
 #   VLOGS_PLIST_DIR  launch agents dir      (default ~/Library/LaunchAgents)
 #   VLOGS_NO_LOAD=1  write the plist but do not bootstrap it with launchctl
 
@@ -30,9 +30,29 @@ HOME_DIR="${VLOGS_HOME:-$HOME/.local/share/agent-dash/vlogs}"
 PLIST_DIR="${VLOGS_PLIST_DIR:-$HOME/Library/LaunchAgents}"
 PLIST="$PLIST_DIR/$LABEL.plist"
 BIN="$HOME_DIR/bin/victoria-logs-prod"
-DATA="${VLOGS_DATA:-$HOME_DIR/data}"
+DATA="${VLOGS_DATA-$HOME_DIR/data}"
 # Unset keeps the 20GiB default; an explicitly empty value means no cap.
 MAX_DISK="${VLOGS_MAX_DISK-20GiB}"
+
+# An update must not silently move the store or change its retention cap:
+# when VLOGS_DATA / VLOGS_MAX_DISK are unset, keep the values the currently
+# installed plist already runs with. A fresh install (no plist yet) keeps
+# today's defaults.
+if [ -f "$PLIST" ]; then
+    if [ -z "${VLOGS_DATA+set}" ]; then
+        old_data=$(sed -n 's|.*<string>-storageDataPath=\(.*\)</string>.*|\1|p' "$PLIST" | head -n 1)
+        if [ -n "$old_data" ]; then DATA="$old_data"; fi
+    fi
+    if [ -z "${VLOGS_MAX_DISK+set}" ]; then
+        if grep -q -- '-retention\.maxDiskSpaceUsageBytes=' "$PLIST"; then
+            # Keep whatever cap the plist carries, including an empty one.
+            MAX_DISK=$(sed -n 's|.*<string>-retention\.maxDiskSpaceUsageBytes=\(.*\)</string>.*|\1|p' "$PLIST" | head -n 1)
+        else
+            # An installed plist with no cap line runs uncapped; keep it so.
+            MAX_DISK=""
+        fi
+    fi
+fi
 case "$MAX_DISK" in
     ""|none|NONE|None) MAX_DISK_LINE="" ;;
     *) MAX_DISK_LINE="        <string>-retention.maxDiskSpaceUsageBytes=$MAX_DISK</string>" ;;
