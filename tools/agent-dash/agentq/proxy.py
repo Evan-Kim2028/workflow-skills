@@ -43,6 +43,14 @@ KEYCHAIN_SERVICE = "morph-api-key"
 STATUS_PATH = "/agentq/status"
 UPSTREAM_PREFIX = "/v1"
 EX_CONFIG = 78
+ROLLING = "rolling"
+CALENDAR = "calendar"
+WINDOW_MODES = (ROLLING, CALENDAR)
+BILLED = "billed"
+PROMPT_PLUS_MAX = "prompt_plus_max"
+CHARGE_BASES = (BILLED, PROMPT_PLUS_MAX)
+MINUTE_S = 60.0
+CALIB_KEEP_S = 180.0
 
 DEFAULT_CONFIG = {
     "port": 18790,
@@ -65,6 +73,9 @@ DEFAULT_CONFIG = {
     "upstream_idle_s": 120.0,
     "drain_s": 20.0,
     "max_tokens_cap": {},
+    "window_mode": "rolling",
+    "charge_basis": "billed",
+    "calendar_jitter_s": 1.5,
     "budgets": {
         "total": {"limit": 10_000_000},
         "output": {"limit": 70_000, "model_prefix": "morph-dsv41flash"},
@@ -155,6 +166,17 @@ CREATE TABLE IF NOT EXISTS proxy_minutes (
     PRIMARY KEY (minute, model)
 )
 """
+
+
+PROXY_CALIB_DDL = """
+CREATE TABLE IF NOT EXISTS proxy_calib (
+    minute TEXT PRIMARY KEY,
+    req INT, prompt_est INT, max_tokens INT, billed INT,
+    first_429_s REAL, r429 INT
+)
+"""
+
+CALIB_FIELDS = ("req", "prompt_est", "max_tokens", "billed")
 
 
 class TruncatedBody(ValueError):
@@ -324,6 +346,69 @@ def estimate_for(budget_name: str, prompt: int, output: int, uncached: int) -> i
     return prompt + output
 
 
+def reserved_for(budget_name: str, prompt: int, requested: int, uncached: int) -> int:
+    """Charge for a reservation: the requested max_tokens counts in full, as if Morph held it for the minute."""
+    if budget_name == "output":
+        return requested
+    if budget_name == "uncached":
+        return uncached
+    return prompt + requested
+
+
+def model_family(model: str) -> str:
+    """The model name without its trailing version digits: morph-dsv41flash-1017 is morph-dsv41flash."""
+    return re.sub(r"-\d+$", "", model)
+
+
+def seconds_into_minute(wall: float) -> float:
+    return wall % MINUTE_S
+
+
+def seconds_to_next_minute(wall: float) -> float:
+    """Seconds until the next UTC :00. Exactly on :00 this is zero."""
+    return (-wall) % MINUTE_S
+
+
+def read_calib_counts(db_path: Path, minute: str) -> dict | None:
+    """The stored proxy_calib row for one UTC minute as a seed, or None. Read-only."""
+    try:
+        connection = sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=ro", uri=True, timeout=1.0)
+        try:
+            found = connection.execute(
+                "SELECT req, prompt_est, max_tokens, billed, first_429_s, r429 FROM proxy_calib WHERE minute = ?",
+                (minute,),
+            ).fetchone()
+        finally:
+            connection.close()
+    except sqlite3.Error:
+        return None
+    if found is None:
+        return None
+    req, prompt_est, max_tokens, billed, first_429_s, r429 = found
+    overall = {
+        "req": int(req or 0),
+        "prompt_est": int(prompt_est or 0),
+        "max_tokens": int(max_tokens or 0),
+        "billed": int(billed or 0),
+    }
+    return {"overall": overall, "families": {}, "first_429_s": first_429_s, "r429": int(r429 or 0)}
+
+
+def write_calib_rows(db_path: Path, rows: list[tuple]) -> None:
+    """Upsert one proxy_calib row per UTC minute. The minute is owned by this process, so each write
+    carries the whole minute. Runs in a worker thread."""
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(db_path, timeout=5.0)
+    try:
+        connection.execute("PRAGMA busy_timeout = 5000")
+        connection.execute("PRAGMA journal_mode = WAL")
+        connection.execute(PROXY_CALIB_DDL)
+        connection.executemany("INSERT OR REPLACE INTO proxy_calib VALUES (?,?,?,?,?,?,?)", rows)
+        connection.commit()
+    finally:
+        connection.close()
+
+
 def read_lane(db_path: Path, job: str) -> str:
     """Read a job's lane from agentq.db without writing. Anything missing means normal."""
     if not db_path.exists():
@@ -411,6 +496,7 @@ class Entry:
     amount: int
     lane: str
     done: bool = False
+    wall_at: float = 0.0
 
 
 @dataclass(eq=False)
@@ -423,6 +509,8 @@ class Budget:
     model_prefix: str | None = None
     model: str | None = None
     hold_s: float = 600.0
+    window_mode: str = ROLLING
+    charge_basis: str = BILLED
     entries: list[Entry] = field(default_factory=list)
     last_429: float = float("-inf")
     last_cut: float = float("-inf")
@@ -450,8 +538,13 @@ class Budget:
             e for e in self.entries if (e.done and e.at > cutoff) or (not e.done and e.at > hold_cutoff)
         ]
 
-    def used(self, now: float, window: float, lane: str | None = None) -> int:
-        self.prune(now, window)
+    def used(self, now: float, window: float, lane: str | None = None, wall_start: float | None = None) -> int:
+        """Tokens charged in the current window. Rolling: completed charges newer than the window, plus
+        every charge in flight. Calendar (wall_start given): charges admitted at or after wall_start."""
+        if wall_start is None:
+            self.prune(now, window)
+        else:
+            self.entries = [e for e in self.entries if e.wall_at >= wall_start]
         return sum(e.amount for e in self.entries if lane is None or e.lane == lane)
 
     def seconds_until_free(self, needed: float, now: float, window: float) -> float:
@@ -482,6 +575,9 @@ class Ticket:
     future: asyncio.Future | None = None
     not_before: float = 0.0
     attempts: int = 0
+    prompt_est: int = 0
+    requested: int = 0
+    admitted_minute: str = ""
     holds: list[tuple[Budget, Entry]] = field(default_factory=list)
 
 
@@ -509,6 +605,12 @@ class Governor:
         hold_s = float(config["give_up_s"]) + float(config["upstream_idle_s"])
         self.budgets: dict[str, Budget] = {}
         for name, spec in config["budgets"].items():
+            window_mode = spec.get("window_mode", config["window_mode"])
+            charge_basis = spec.get("charge_basis", config["charge_basis"])
+            if window_mode not in WINDOW_MODES:
+                raise ValueError(f"budget {name}: window_mode must be one of {WINDOW_MODES}, not {window_mode!r}")
+            if charge_basis not in CHARGE_BASES:
+                raise ValueError(f"budget {name}: charge_basis must be one of {CHARGE_BASES}, not {charge_basis!r}")
             self.budgets[name] = Budget(
                 name=name,
                 limit=int(spec["limit"]),
@@ -516,8 +618,12 @@ class Governor:
                 model_prefix=spec.get("model_prefix"),
                 model=spec.get("model"),
                 hold_s=hold_s,
+                window_mode=window_mode,
+                charge_basis=charge_basis,
                 last_grow=start,
             )
+        self.calib: dict[str, dict] = {}
+        self.calib_dirty: set[str] = set()
         self.queues: dict[str, deque[Ticket]] = {lane: deque() for lane in LANES}
         self.output_history: dict[str, deque[int]] = {}
         self.prefixes: OrderedDict[str, tuple[int, tuple[bytes, ...]]] = OrderedDict()
@@ -533,6 +639,17 @@ class Governor:
     @property
     def db_path(self) -> Path:
         return self.home / "agentq.db"
+
+    def minute_start(self) -> float:
+        """Wall-clock time of the current UTC minute's :00."""
+        wall = self.wall()
+        return wall - seconds_into_minute(wall)
+
+    def _used(self, budget: Budget, lane: str | None = None) -> int:
+        """The budget's usage in its current window, in whichever window mode the budget uses."""
+        if budget.window_mode == CALENDAR:
+            return budget.used(self.clock(), self.window, lane, wall_start=self.minute_start())
+        return budget.used(self.clock(), self.window, lane)
 
     @property
     def state_path(self) -> Path:
@@ -562,7 +679,13 @@ class Governor:
             window_used = int(spec.get("window_used", 0))
             if age is not None and 0 <= age < self.window and window_used > 0:
                 budget.entries.append(
-                    Entry(at=self.clock() - age, amount=window_used, lane=RESTORED_LANE, done=True)
+                    Entry(
+                        at=self.clock() - age,
+                        amount=window_used,
+                        lane=RESTORED_LANE,
+                        done=True,
+                        wall_at=self.wall() - age,
+                    )
                 )
 
     def snapshot_state(self) -> dict:
@@ -574,7 +697,7 @@ class Governor:
                     "limit": b.limit,
                     "target_frac": round(b.target, 6),
                     "fast_limit": None if b.fast_limit is None else round(b.fast_limit, 6),
-                    "window_used": b.used(now, self.window),
+                    "window_used": self._used(b),
                 }
                 for name, b in self.budgets.items()
             },
@@ -653,16 +776,20 @@ class Governor:
         now: float,
     ) -> Ticket:
         prompt = tokens_for_chars(length)
+        requested = _as_int(max_tokens)
         output = self.output_estimate(model, max_tokens)
         uncached_budget = self.budgets.get("uncached")
         uncached = 0
         if uncached_budget is not None and uncached_budget.applies(model):
             uncached = self.uncached_estimate(job, length, blocks)
-        estimates = {
-            b.name: estimate_for(b.name, prompt, output, uncached)
-            for b in self.budgets.values()
-            if b.applies(model)
-        }
+        estimates: dict[str, int] = {}
+        for b in self.budgets.values():
+            if not b.applies(model):
+                continue
+            if b.charge_basis == PROMPT_PLUS_MAX:
+                estimates[b.name] = reserved_for(b.name, prompt, requested, uncached)
+            else:
+                estimates[b.name] = estimate_for(b.name, prompt, output, uncached)
         return Ticket(
             job=job,
             lane=lane,
@@ -672,6 +799,8 @@ class Governor:
             queued_at=now,
             first_seen=now,
             waiting_since=now,
+            prompt_est=prompt,
+            requested=requested,
         )
 
     def enqueue(self, ticket: Ticket) -> None:
@@ -754,22 +883,25 @@ class Governor:
         for name, estimate in ticket.estimates.items():
             budget = self.budgets[name]
             cap = budget.cap()
-            used = budget.used(now, self.window)
+            used = self._used(budget)
             if used > 0 and used + estimate > cap:
                 return budget, False
             if ticket.lane == "urgent" and lower_waiting:
-                urgent_used = budget.used(now, self.window, lane="urgent")
+                urgent_used = self._used(budget, lane="urgent")
                 if urgent_used > 0 and urgent_used + estimate > 0.5 * cap:
                     return budget, True
         return None
 
     def _admit(self, ticket: Ticket, now: float) -> None:
         ticket.holds = []
+        wall = self.wall()
+        ticket.admitted_minute = minute_stamp(wall)
         for name, estimate in ticket.estimates.items():
             budget = self.budgets[name]
-            entry = Entry(at=now, amount=estimate, lane=ticket.lane)
+            entry = Entry(at=now, amount=estimate, lane=ticket.lane, wall_at=wall)
             budget.entries.append(entry)
             ticket.holds.append((budget, entry))
+        self.note_calib_admitted(ticket)
         wait = now - ticket.queued_at
         self.waits.append((now, wait))
         row = self.row(ticket.model)
@@ -791,10 +923,12 @@ class Governor:
             prompt, output, cached = usage_fields(usage)
             real = {"total": prompt + output, "output": output, "uncached": prompt - cached}
         for budget, entry in ticket.holds:
-            entry.amount = real.get(budget.name, entry.amount)
+            if budget.charge_basis == BILLED:
+                entry.amount = real.get(budget.name, entry.amount)
             entry.done = True
             entry.at = now
         ticket.holds = []
+        self.note_calib_billed(ticket, prompt + output)
         if output > 0:
             self.output_history.setdefault(ticket.model, deque(maxlen=20)).append(output)
         row = self.row(ticket.model)
@@ -829,6 +963,7 @@ class Governor:
         now = self.clock()
         self.row(ticket.model)["r429"] += 1
         self.job_counters(ticket)["r429"] += 1
+        self.note_calib_429(body_text)
         stated = parse_stated_limit(body_text)
         if stated is not None:
             name, limit = stated
@@ -855,13 +990,22 @@ class Governor:
         self.state_dirty = True
 
     def retry_delay(self, ticket: Ticket, now: float) -> float:
+        """Seconds to wait before retrying a refused ticket. A rolling budget waits until enough
+        completed charges age out. A calendar budget that is full waits for the next UTC :00, and the
+        jitter is the calendar one."""
         wait = 0.0
+        jitter = float(self.config["retry_jitter_s"])
         for name, estimate in ticket.estimates.items():
             budget = self.budgets[name]
-            needed = budget.used(now, self.window) + estimate - budget.cap()
+            used = self._used(budget)
+            if budget.window_mode == CALENDAR:
+                if used + estimate > budget.cap():
+                    wait = max(wait, seconds_to_next_minute(self.wall()))
+                    jitter = float(self.config["calendar_jitter_s"])
+                continue
+            needed = used + estimate - budget.cap()
             wait = max(wait, budget.seconds_until_free(needed, now, self.window))
         floor = float(self.config["retry_floor_s"])
-        jitter = float(self.config["retry_jitter_s"])
         return max(wait, floor) + random.uniform(0.0, jitter)
 
     def tick(self) -> None:
@@ -1003,6 +1147,95 @@ class Governor:
             del self.minute_rows[key]
         return rows
 
+    def calib_record(self, minute: str) -> dict:
+        """The calibration counters for one UTC minute, seeded from proxy_calib on first use in this process."""
+        record = self.calib.get(minute)
+        if record is None:
+            record = read_calib_counts(self.db_path, minute) or {
+                "overall": {name: 0 for name in CALIB_FIELDS},
+                "families": {},
+                "first_429_s": None,
+                "r429": 0,
+            }
+            self.calib[minute] = record
+        self.calib_dirty.add(minute)
+        return record
+
+    def _calib_buckets(self, minute: str, model: str) -> tuple[dict, dict]:
+        """The overall and per-family counters for a minute and model."""
+        record = self.calib_record(minute)
+        family = record["families"].setdefault(model_family(model), {name: 0 for name in CALIB_FIELDS})
+        return record["overall"], family
+
+    def note_calib_admitted(self, ticket: Ticket) -> None:
+        """Count one admitted request: its prompt estimate and its capped requested max_tokens."""
+        overall, family = self._calib_buckets(ticket.admitted_minute, ticket.model)
+        for bucket in (overall, family):
+            bucket["req"] += 1
+            bucket["prompt_est"] += ticket.prompt_est
+            bucket["max_tokens"] += ticket.requested
+
+    def note_calib_billed(self, ticket: Ticket, billed: int) -> None:
+        """Add a completed request's real prompt plus completion tokens to the minute it was admitted in."""
+        if not ticket.admitted_minute:
+            return
+        overall, family = self._calib_buckets(ticket.admitted_minute, ticket.model)
+        overall["billed"] += billed
+        family["billed"] += billed
+
+    def note_calib_429(self, body_text: str) -> None:
+        """Log one upstream 429 with the current minute so far: where in the minute it fell, which budget
+        the body names, and the admitted and billed totals for this minute."""
+        now = self.wall()
+        minute = minute_stamp(now)
+        record = self.calib_record(minute)
+        second = round(seconds_into_minute(now), 2)
+        record["r429"] += 1
+        if record["first_429_s"] is None:
+            record["first_429_s"] = second
+        stated = parse_stated_limit(body_text)
+        overall = record["overall"]
+        self.log(
+            "calib",
+            minute=minute,
+            budget=stated[0] if stated else None,
+            sec=second,
+            first_429_s=record["first_429_s"],
+            r429=record["r429"],
+            req=overall["req"],
+            prompt_est=overall["prompt_est"],
+            max_tokens=overall["max_tokens"],
+            prompt_max=overall["prompt_est"] + overall["max_tokens"],
+            billed=overall["billed"],
+            families=json.dumps(record["families"], separators=(",", ":"), sort_keys=True),
+        )
+
+    def take_calib_rows(self) -> list[tuple]:
+        """Rows of the minutes changed since the last call, ready for write_calib_rows. Minutes older than
+        CALIB_KEEP_S are forgotten; a late charge for one reseeds it from proxy_calib."""
+        rows = []
+        for minute in self.calib_dirty:
+            record = self.calib.get(minute)
+            if record is None:
+                continue
+            overall = record["overall"]
+            rows.append(
+                (
+                    minute,
+                    overall["req"],
+                    overall["prompt_est"],
+                    overall["max_tokens"],
+                    overall["billed"],
+                    record["first_429_s"],
+                    record["r429"],
+                )
+            )
+        self.calib_dirty.clear()
+        cutoff = minute_stamp(self.wall() - CALIB_KEEP_S)
+        for minute in [m for m in self.calib if m < cutoff]:
+            del self.calib[minute]
+        return rows
+
     def status(self) -> dict:
         now = self.clock()
         window = self.window
@@ -1018,10 +1251,14 @@ class Governor:
             budgets[name] = {
                 "limit": budget.limit,
                 "target_frac": round(budget.target, 4),
-                "used_60s": budget.used(now, window),
+                "used_60s": self._used(budget),
                 "queued": per_lane,
                 "saturated": budget.saturated,
+                "window_mode": budget.window_mode,
+                "charge_basis": budget.charge_basis,
             }
+            if budget.window_mode == CALENDAR:
+                budgets[name]["seconds_to_reset"] = round(seconds_to_next_minute(self.wall()), 2)
         return {
             "ok": True,
             "window_s": window,
@@ -1376,6 +1613,12 @@ class Proxy:
         if rows:
             try:
                 await asyncio.to_thread(write_minute_rows, self.gov.db_path, rows)
+            except sqlite3.Error as exc:
+                self.gov.log("flush_error", kind=type(exc).__name__)
+        calib_rows = self.gov.take_calib_rows()
+        if calib_rows:
+            try:
+                await asyncio.to_thread(write_calib_rows, self.gov.db_path, calib_rows)
             except sqlite3.Error as exc:
                 self.gov.log("flush_error", kind=type(exc).__name__)
         job_rows, snapshot = self.gov.take_job_rows()

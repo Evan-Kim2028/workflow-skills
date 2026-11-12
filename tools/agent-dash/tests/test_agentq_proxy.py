@@ -35,8 +35,11 @@ from agentq.proxy import (
     LARGE_BODY,
     prepare_body,
     prepare_body_async,
+    read_calib_counts,
     read_request,
+    seconds_to_next_minute,
     tokens_for_chars,
+    write_calib_rows,
     write_minute_rows,
 )
 
@@ -1284,6 +1287,242 @@ class MaxTokensCapEndToEndTest(ProxyCase):
     async def test_the_forwarded_request_carries_the_capped_value(self) -> None:
         await self.post(self.chat(MODEL_OUT, max_tokens=74000), job="cap-job")
         self.assertEqual(self.fake.requests[0]["payload"]["max_tokens"], 100)
+
+
+WALL_MINUTE_START = 1_700_000_040.0
+
+
+class Clocks:
+    """A monotonic clock and a wall clock that move together, so a test can cross a UTC :00."""
+
+    def __init__(self, wall: float) -> None:
+        self.mono = 0.0
+        self.now_wall = wall
+
+    def clock(self) -> float:
+        return self.mono
+
+    def wall(self) -> float:
+        return self.now_wall
+
+    def advance(self, seconds: float) -> None:
+        self.mono += seconds
+        self.now_wall += seconds
+
+
+def timed_governor(home: Path, wall: float, log=quiet, **settings) -> tuple[Governor, Clocks]:
+    clocks = Clocks(wall)
+    gov = Governor(home, config_with(**settings), clock=clocks.clock, wall=clocks.wall, log=log)
+    return gov, clocks
+
+
+def admit(gov: Governor, ticket) -> None:
+    gov.enqueue(ticket)
+    gov.pump()
+    assert ticket.holds, "ticket was not admitted"
+
+
+class CalendarWindowTest(unittest.TestCase):
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.home = Path(tmp.name)
+
+    def test_calendar_used_resets_at_the_next_utc_minute(self) -> None:
+        gov, clocks = timed_governor(self.home, WALL_MINUTE_START + 50, window_mode="calendar")
+        ticket = make_ticket(gov, text="x" * 400)
+        admit(gov, ticket)
+        gov.finish_ok(ticket, {"prompt_tokens": 100, "completion_tokens": 50})
+        self.assertEqual(gov.budgets["total"].window_mode, "calendar")
+        self.assertEqual(gov._used(gov.budgets["total"]), 150)
+        clocks.advance(9.5)
+        self.assertEqual(gov._used(gov.budgets["total"]), 150)
+        clocks.advance(0.5)
+        self.assertEqual(gov._used(gov.budgets["total"]), 0)
+
+    def test_rolling_default_keeps_the_charge_for_a_full_window(self) -> None:
+        gov, clocks = timed_governor(self.home, WALL_MINUTE_START + 50)
+        ticket = make_ticket(gov, text="x" * 400)
+        admit(gov, ticket)
+        gov.finish_ok(ticket, {"prompt_tokens": 100, "completion_tokens": 50})
+        clocks.advance(20)
+        self.assertEqual(gov._used(gov.budgets["total"]), 150)
+        self.assertEqual(gov.budgets["total"].window_mode, "rolling")
+
+    def test_a_full_calendar_budget_retries_at_the_next_minute(self) -> None:
+        gov, clocks = timed_governor(self.home, WALL_MINUTE_START + 50, window_mode="calendar", budgets={"total": {"limit": 1000}})
+        first = make_ticket(gov, text="x" * 400)
+        admit(gov, first)
+        refused = make_ticket(gov, text="x" * 400)
+        gov.enqueue(refused)
+        gov.pump()
+        self.assertEqual(refused.holds, [])
+        delay = gov.retry_delay(refused, gov.clock())
+        self.assertGreaterEqual(delay, 10.0)
+        self.assertLessEqual(delay, 10.0 + 1.5)
+        clocks.advance(10)
+        gov.pump()
+        self.assertTrue(refused.holds, "the refused ticket is admitted once the minute turns over")
+
+    def test_a_rolling_budget_still_waits_for_completed_charges_to_age_out(self) -> None:
+        gov, clocks = timed_governor(self.home, WALL_MINUTE_START + 50, budgets={"total": {"limit": 200}})
+        first = make_ticket(gov, text="x" * 400)
+        admit(gov, first)
+        gov.finish_ok(first, {"prompt_tokens": 100, "completion_tokens": 50})
+        refused = make_ticket(gov, text="x" * 400)
+        self.assertEqual(refused.estimates["total"], 150)
+        clocks.advance(10)
+        delay = gov.retry_delay(refused, gov.clock())
+        self.assertGreaterEqual(delay, 50.0)
+        self.assertLessEqual(delay, 50.0 + 2.0)
+
+    def test_seconds_to_next_minute_is_zero_exactly_on_the_minute(self) -> None:
+        self.assertEqual(seconds_to_next_minute(WALL_MINUTE_START), 0.0)
+        self.assertEqual(seconds_to_next_minute(WALL_MINUTE_START + 50), 10.0)
+
+    def test_budget_overrides_set_window_mode_and_basis_per_budget(self) -> None:
+        gov, _ = timed_governor(self.home, WALL_MINUTE_START, budgets={"total": {"window_mode": "calendar"}})
+        self.assertEqual(gov.budgets["total"].window_mode, "calendar")
+        self.assertEqual(gov.budgets["total"].limit, 10_000_000)
+        self.assertEqual(gov.budgets["output"].window_mode, "rolling")
+        self.assertEqual(gov.budgets["output"].charge_basis, "billed")
+
+    def test_unknown_modes_are_refused_at_start(self) -> None:
+        with self.assertRaises(ValueError):
+            timed_governor(self.home, WALL_MINUTE_START, window_mode="hourly")
+        with self.assertRaises(ValueError):
+            timed_governor(self.home, WALL_MINUTE_START, budgets={"total": {"charge_basis": "guess"}})
+
+    def test_status_reports_window_mode_basis_and_seconds_to_reset(self) -> None:
+        gov, _ = timed_governor(self.home, WALL_MINUTE_START + 45, window_mode="calendar")
+        budgets = gov.status()["budgets"]
+        self.assertEqual(budgets["total"]["window_mode"], "calendar")
+        self.assertEqual(budgets["total"]["charge_basis"], "billed")
+        self.assertEqual(budgets["total"]["seconds_to_reset"], 15.0)
+        self.assertEqual(budgets["output"]["window_mode"], "calendar")
+        rolling, _ = timed_governor(self.home, WALL_MINUTE_START + 45)
+        self.assertNotIn("seconds_to_reset", rolling.status()["budgets"]["total"])
+
+
+class ChargeBasisTest(unittest.TestCase):
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.home = Path(tmp.name)
+
+    def test_prompt_plus_max_keeps_the_reservation_after_completion(self) -> None:
+        gov, _ = timed_governor(self.home, WALL_MINUTE_START + 5, budgets={"total": {"charge_basis": "prompt_plus_max"}})
+        ticket = make_ticket(gov, text="x" * 400, max_tokens=800)
+        self.assertEqual(ticket.estimates["total"], 100 + 800)
+        admit(gov, ticket)
+        gov.finish_ok(ticket, {"prompt_tokens": 100, "completion_tokens": 50})
+        self.assertEqual(gov._used(gov.budgets["total"]), 900)
+        self.assertEqual(gov._used(gov.budgets["output"]), 50)
+
+    def test_prompt_plus_max_without_a_requested_max_charges_the_prompt_only(self) -> None:
+        gov, _ = timed_governor(self.home, WALL_MINUTE_START + 5, budgets={"total": {"charge_basis": "prompt_plus_max"}})
+        ticket = make_ticket(gov, text="x" * 400)
+        self.assertEqual(ticket.estimates["total"], 100)
+
+    def test_billed_default_is_replaced_by_real_usage(self) -> None:
+        gov, _ = timed_governor(self.home, WALL_MINUTE_START + 5)
+        ticket = make_ticket(gov, text="x" * 400, max_tokens=800)
+        admit(gov, ticket)
+        gov.finish_ok(ticket, {"prompt_tokens": 100, "completion_tokens": 50})
+        self.assertEqual(gov._used(gov.budgets["total"]), 150)
+
+    def test_a_released_reservation_is_not_charged(self) -> None:
+        gov, _ = timed_governor(self.home, WALL_MINUTE_START + 5, budgets={"total": {"charge_basis": "prompt_plus_max"}})
+        ticket = make_ticket(gov, text="x" * 400, max_tokens=800)
+        admit(gov, ticket)
+        gov.release(ticket)
+        self.assertEqual(gov._used(gov.budgets["total"]), 0)
+
+
+class CalibrationTest(unittest.TestCase):
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.home = Path(tmp.name)
+        self.logged: list[tuple[str, dict]] = []
+
+    def capture(self, event: str, **fields) -> None:
+        self.logged.append((event, fields))
+
+    def test_admitted_and_billed_counts_accumulate_per_minute_and_family(self) -> None:
+        gov, _ = timed_governor(self.home, WALL_MINUTE_START + 17.5, log=self.capture)
+        ticket = make_ticket(gov, text="x" * 400, max_tokens=800)
+        admit(gov, ticket)
+        gov.finish_ok(ticket, {"prompt_tokens": 100, "completion_tokens": 50})
+        record = gov.calib[minute_stamp(WALL_MINUTE_START)]
+        self.assertEqual(record["overall"], {"req": 1, "prompt_est": 100, "max_tokens": 800, "billed": 150})
+        self.assertEqual(record["families"]["morph-dsv41flash"]["billed"], 150)
+
+    def test_a_429_records_the_first_second_in_the_minute_and_logs_calib(self) -> None:
+        gov, clocks = timed_governor(self.home, WALL_MINUTE_START + 17.5, log=self.capture)
+        ticket = make_ticket(gov, text="x" * 400, max_tokens=800)
+        gov.learn_from_429(ticket, "Limit: 10000000 tokens/minute. Please retry.")
+        clocks.advance(12)
+        gov.learn_from_429(ticket, "Limit: 10000000 tokens/minute.")
+        record = gov.calib[minute_stamp(WALL_MINUTE_START)]
+        self.assertEqual(record["first_429_s"], 17.5)
+        self.assertEqual(record["r429"], 2)
+        calls = [fields for event, fields in self.logged if event == "calib"]
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0]["budget"], "total")
+        self.assertEqual(calls[0]["sec"], 17.5)
+        self.assertEqual(calls[1]["first_429_s"], 17.5)
+
+    def test_a_body_naming_no_budget_logs_none(self) -> None:
+        gov, _ = timed_governor(self.home, WALL_MINUTE_START + 3, log=self.capture)
+        gov.learn_from_429(make_ticket(gov, text="x"), "service_overloaded")
+        calls = [fields for event, fields in self.logged if event == "calib"]
+        self.assertIsNone(calls[0]["budget"])
+
+    def test_the_minute_row_is_written_and_a_restart_reseeds_it(self) -> None:
+        gov, clocks = timed_governor(self.home, WALL_MINUTE_START + 17.5)
+        ticket = make_ticket(gov, text="x" * 400, max_tokens=800)
+        admit(gov, ticket)
+        gov.finish_ok(ticket, {"prompt_tokens": 100, "completion_tokens": 50})
+        gov.learn_from_429(ticket, "Limit: 10000000 tokens/minute.")
+        write_calib_rows(self.home / "agentq.db", gov.take_calib_rows())
+        connection = sqlite3.connect(self.home / "agentq.db")
+        stored = connection.execute(
+            "SELECT minute, req, prompt_est, max_tokens, billed, first_429_s, r429 FROM proxy_calib"
+        ).fetchall()
+        connection.close()
+        self.assertEqual(stored, [(minute_stamp(WALL_MINUTE_START), 1, 100, 800, 150, 17.5, 1)])
+
+        restarted, _ = timed_governor(self.home, WALL_MINUTE_START + 25)
+        seeded = restarted.calib_record(minute_stamp(WALL_MINUTE_START))
+        self.assertEqual(seeded["overall"], {"req": 1, "prompt_est": 100, "max_tokens": 800, "billed": 150})
+        self.assertEqual(seeded["first_429_s"], 17.5)
+        self.assertEqual(seeded["r429"], 1)
+
+    def test_minutes_older_than_three_minutes_are_forgotten(self) -> None:
+        gov, clocks = timed_governor(self.home, WALL_MINUTE_START + 1)
+        gov.calib_record(minute_stamp(WALL_MINUTE_START))
+        clocks.advance(240)
+        gov.take_calib_rows()
+        self.assertNotIn(minute_stamp(WALL_MINUTE_START), gov.calib)
+
+    def test_read_calib_counts_is_none_without_a_row(self) -> None:
+        self.assertIsNone(read_calib_counts(self.home / "missing.db", "2023-11-14T22:14"))
+
+
+class Calib429EndToEndTest(ProxyCase):
+    async def test_a_429_is_logged_as_calib_and_the_minute_row_is_flushed(self) -> None:
+        self.fake.script = [{"status": 429, "body": "Limit: 10000000 tokens/minute."}]
+        status, _ = await self.post(self.chat(MODEL_OUT), job="calib-job")
+        self.assertEqual(status, 200)
+        self.assertIn("calib", self.events())
+        await self.proxy.flush()
+        connection = sqlite3.connect(self.home / "agentq.db")
+        rows = connection.execute("SELECT r429, first_429_s FROM proxy_calib").fetchall()
+        connection.close()
+        self.assertEqual(rows[0][0], 1)
+        self.assertGreaterEqual(rows[0][1], 0.0)
+        self.assertLess(rows[0][1], 60.0)
 
 
 if __name__ == "__main__":
