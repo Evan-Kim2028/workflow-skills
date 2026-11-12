@@ -36,6 +36,7 @@ from urllib.parse import urlsplit
 
 LANES = ("urgent", "normal", "backlog")
 RESTORED_LANE = "restored"
+FAST_LIMIT_QUIET_S = 30 * 60.0
 DEFAULT_HOME = "~/.local/state/agentq"
 DEFAULT_UPSTREAM = "https://api.morphllm.com/v1"
 KEYCHAIN_SERVICE = "morph-api-key"
@@ -47,12 +48,12 @@ DEFAULT_CONFIG = {
     "port": 18790,
     "upstream": DEFAULT_UPSTREAM,
     "window_s": 60.0,
-    "start_target": 0.95,
+    "start_target": 0.98,
     "target_floor": 0.6,
     "target_ceiling": 1.5,
     "target_cut": 0.97,
     "target_step_up": 0.02,
-    "fast_until": 0.9,
+    "fast_until": 1.5,
     "fast_step_up": 0.05,
     "fast_interval_s": 10.0,
     "default_output_tokens": 800,
@@ -309,6 +310,32 @@ def read_lane(db_path: Path, job: str) -> str:
     return lane if lane in LANES else "normal"
 
 
+def empty_minute_row() -> dict:
+    return {"req": 0, "ok": 0, "r429": 0, "input": 0, "cache_read": 0, "output": 0, "uncached_est": 0, "waits": []}
+
+
+def read_minute_counts(db_path: Path, minute: str, model: str) -> dict | None:
+    """The counters already stored for one model and minute, or None. Waits start empty. Read-only."""
+    try:
+        connection = sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=ro", uri=True, timeout=1.0)
+        try:
+            found = connection.execute(
+                "SELECT req, ok, r429, input, cache_read, output, uncached_est FROM proxy_minutes "
+                "WHERE minute = ? AND model = ?",
+                (minute, model),
+            ).fetchone()
+        finally:
+            connection.close()
+    except sqlite3.Error:
+        return None
+    if found is None:
+        return None
+    row = empty_minute_row()
+    for name, value in zip(("req", "ok", "r429", "input", "cache_read", "output", "uncached_est"), found):
+        row[name] = int(value or 0)
+    return row
+
+
 def write_minute_rows(db_path: Path, rows: list[tuple]) -> None:
     """Upsert one proxy_minutes row per model per minute. Runs in a worker thread."""
     db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -353,7 +380,9 @@ class Budget:
     hold_s: float = 600.0
     entries: list[Entry] = field(default_factory=list)
     last_429: float = float("-inf")
+    last_cut: float = float("-inf")
     last_grow: float = 0.0
+    fast_limit: float | None = None
     saturated: bool = False
     saturated_since_tick: bool = False
 
@@ -480,6 +509,9 @@ class Governor:
             floor = float(self.config["target_floor"])
             ceiling = float(self.config.get("target_ceiling", 1.0))
             budget.target = min(ceiling, max(floor, float(spec.get("target_frac", budget.target))))
+            if spec.get("fast_limit") is not None:
+                budget.fast_limit = float(spec["fast_limit"])
+                budget.last_429 = self.clock()
             window_used = int(spec.get("window_used", 0))
             if age is not None and 0 <= age < self.window and window_used > 0:
                 budget.entries.append(
@@ -494,6 +526,7 @@ class Governor:
                 name: {
                     "limit": b.limit,
                     "target_frac": round(b.target, 6),
+                    "fast_limit": None if b.fast_limit is None else round(b.fast_limit, 6),
                     "window_used": b.used(now, self.window),
                 }
                 for name, b in self.budgets.items()
@@ -733,7 +766,9 @@ class Governor:
         """Adopt a stated limit when the body names one; cut the target of the budget it names.
 
         A body that names no limit cuts every budget the request touched. service_overloaded
-        is a platform-wide signal, so it cuts the total budget only.
+        is a platform-wide signal, so it cuts the total budget only. A budget is cut at most once
+        per fast_interval_s: a burst of 429s is one cut, and each 429 still counts and refreshes
+        last_429.
         """
         now = self.clock()
         self.row(ticket.model)["r429"] += 1
@@ -751,9 +786,14 @@ class Governor:
             targets = [self.budgets[name] for name in ticket.estimates]
         floor = float(self.config["target_floor"])
         cut = float(self.config["target_cut"])
+        pace = float(self.config.get("fast_interval_s", 10.0))
         for budget in targets:
-            budget.target = max(floor, budget.target * cut)
             budget.last_429 = now
+            if now - budget.last_cut < pace:
+                continue
+            budget.last_cut = now
+            budget.target = max(floor, budget.target * cut)
+            budget.fast_limit = budget.target
             self.log("target_cut", budget=budget.name, target=round(budget.target, 4), limit=budget.limit)
         self.state_dirty = True
 
@@ -770,25 +810,32 @@ class Governor:
     def tick(self) -> None:
         """Raise a target while its budget is saturated and no 429 has come recently.
 
-        Below fast_until the target climbs by fast_step_up every fast_interval_s. Above it the target
-        climbs by target_step_up once per full window, up to target_ceiling. Saturation counts if the
+        Below the fast cap the target climbs by fast_step_up every fast_interval_s. The fast cap is
+        fast_until, or the budget's fast_limit (the target a 429 cut left) when that is lower. Above
+        the fast cap the target climbs by target_step_up once per full window, up to target_ceiling.
+        A budget with no 429 for FAST_LIMIT_QUIET_S loses its fast_limit. Saturation counts if the
         current pump or any pump since the last tick marked the budget.
         """
         now = self.clock()
         window = self.window
         step = float(self.config["target_step_up"])
         ceiling = float(self.config.get("target_ceiling", 1.0))
-        fast_until = float(self.config.get("fast_until", 0.9))
+        fast_until = float(self.config.get("fast_until", 1.5))
         fast_step = float(self.config.get("fast_step_up", 0.05))
         fast_interval = float(self.config.get("fast_interval_s", 10.0))
         for budget in self.budgets.values():
             demanded = budget.saturated or budget.saturated_since_tick
             budget.saturated_since_tick = False
+            if budget.fast_limit is not None and now - budget.last_429 >= FAST_LIMIT_QUIET_S:
+                self.log("fast_limit_cleared", budget=budget.name, fast_limit=round(budget.fast_limit, 4))
+                budget.fast_limit = None
+                self.state_dirty = True
             if not demanded:
                 continue
-            if budget.target < fast_until:
+            fast_cap = fast_until if budget.fast_limit is None else min(fast_until, budget.fast_limit)
+            if budget.target < fast_cap:
                 if now - budget.last_429 >= fast_interval and now - budget.last_grow >= fast_interval:
-                    budget.target = min(fast_until, budget.target + fast_step)
+                    budget.target = min(fast_cap, budget.target + fast_step)
                     budget.last_grow = now
                     self.state_dirty = True
                     self.log("target_raised", budget=budget.name, target=round(budget.target, 4))
@@ -801,10 +848,12 @@ class Governor:
                 self.log("target_raised", budget=budget.name, target=round(budget.target, 4))
 
     def row(self, model: str) -> dict:
+        """The in-memory counters for this model's current minute. The first use of a minute in this
+        process seeds them from the stored row, because the flush REPLACEs that row."""
         key = (minute_stamp(self.wall()), model)
         row = self.minute_rows.get(key)
         if row is None:
-            row = {"req": 0, "ok": 0, "r429": 0, "input": 0, "cache_read": 0, "output": 0, "uncached_est": 0, "waits": []}
+            row = read_minute_counts(self.db_path, key[0], model) or empty_minute_row()
             self.minute_rows[key] = row
         self.dirty.add(key)
         return row

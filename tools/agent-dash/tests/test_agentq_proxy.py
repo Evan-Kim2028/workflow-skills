@@ -20,6 +20,7 @@ from agentq.proxy import (
     BLOCK_CHARS,
     DEFAULT_CONFIG,
     EX_CONFIG,
+    PROXY_MINUTES_DDL,
     Client,
     Entry,
     Governor,
@@ -28,12 +29,14 @@ from agentq.proxy import (
     load_key,
     main,
     merge_config,
+    minute_stamp,
     parse_stated_limit,
     prefix_blocks,
     prepare_body,
     prepare_body_async,
     read_request,
     tokens_for_chars,
+    write_minute_rows,
 )
 
 KEY = "SECRET-KEY-123"
@@ -292,6 +295,8 @@ class PassthroughTest(ProxyCase):
 
 
 class LearningTest(ProxyCase):
+    overrides = {"start_target": 0.95}
+
     async def test_target_shrinks_and_stated_limit_is_adopted(self) -> None:
         self.fake.script = [{"status": 429, "body": "Limit: 60000 output tokens/minute."}]
         status, _ = await self.post(self.chat(MODEL_OUT), job="job-t")
@@ -523,7 +528,7 @@ class PerBudgetQueueTest(unittest.TestCase):
     def setUp(self) -> None:
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
-        self.gov = Governor(Path(tmp.name), config_with(), log=quiet)
+        self.gov = Governor(Path(tmp.name), config_with(start_target=0.95), log=quiet)
 
     def occupy(self, budget: str, amount: int, lane: str = "normal") -> None:
         self.gov.budgets[budget].entries.append(Entry(at=self.gov.clock(), amount=amount, lane=lane))
@@ -770,7 +775,7 @@ class TargetCeilingTest(unittest.TestCase):
         return Governor(self.home, config, clock=lambda: self.now[0], log=quiet)
 
     def test_tick_raises_past_one_and_stops_at_the_ceiling(self) -> None:
-        gov = self.governor(config_with())
+        gov = self.governor(config_with(fast_until=0.9))
         output = gov.budgets["output"]
         output.target = 1.4
         output.saturated = True
@@ -783,7 +788,7 @@ class TargetCeilingTest(unittest.TestCase):
         self.assertEqual(output.target, 1.5)
 
     def test_tick_stops_at_one_when_an_older_config_has_no_ceiling(self) -> None:
-        config = config_with()
+        config = config_with(fast_until=0.9)
         del config["target_ceiling"]
         gov = self.governor(config)
         output = gov.budgets["output"]
@@ -816,7 +821,7 @@ class StateTest(unittest.TestCase):
         self.tmp.cleanup()
 
     def test_state_persists_across_restart(self) -> None:
-        config = config_with()
+        config = config_with(start_target=0.95)
         first = Governor(self.home, config, log=quiet)
         first.learn_from_429(make_ticket(first, max_tokens=800), "Limit: 60000 output tokens/minute.")
         first.save_state()
@@ -925,7 +930,7 @@ class FastRampTest(unittest.TestCase):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.now = [1000.0]
-        self.gov = Governor(Path(tmp.name), config_with(), clock=lambda: self.now[0], log=quiet)
+        self.gov = Governor(Path(tmp.name), config_with(fast_until=0.9), clock=lambda: self.now[0], log=quiet)
         self.total = self.gov.budgets["total"]
         self.total.target = 0.6
 
@@ -962,8 +967,8 @@ class FastRampTest(unittest.TestCase):
         cut = self.total.target
         self.run_for(9.75)
         self.assertAlmostEqual(self.total.target, cut, places=6)
-        self.run_for(0.25)
-        self.assertAlmostEqual(self.total.target, cut + 0.05, places=6)
+        self.run_for(30.0)
+        self.assertAlmostEqual(self.total.target, cut, places=6)
 
     def test_unsaturated_budget_does_not_grow(self) -> None:
         seen = self.run_for(60.0, saturated=False)
@@ -982,6 +987,144 @@ class FastRampTest(unittest.TestCase):
         self.gov.tick()
         self.assertAlmostEqual(self.total.target, 0.65, places=6)
         self.assertFalse(self.total.saturated_since_tick)
+
+
+class CutPacingTest(unittest.TestCase):
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.now = [1000.0]
+        self.gov = Governor(Path(tmp.name), config_with(), clock=lambda: self.now[0], log=quiet)
+        self.total = self.gov.budgets["total"]
+        self.total.target = 0.9
+
+    def burst(self, count: int, spacing_s: float) -> None:
+        for _ in range(count):
+            self.now[0] += spacing_s
+            self.gov.learn_from_429(make_ticket(self.gov, max_tokens=8), "service_overloaded")
+
+    def test_a_burst_of_429s_within_a_few_seconds_is_one_cut(self) -> None:
+        self.burst(8, 0.4)
+        self.assertAlmostEqual(self.total.target, 0.9 * 0.97, places=9)
+        self.assertAlmostEqual(self.total.fast_limit, 0.9 * 0.97, places=9)
+        self.assertEqual(sum(row["r429"] for row in self.gov.minute_rows.values()), 8)
+
+    def test_a_429_fifteen_seconds_after_the_cut_is_a_second_cut(self) -> None:
+        self.burst(8, 0.4)
+        self.now[0] += 15.0
+        self.gov.learn_from_429(make_ticket(self.gov, max_tokens=8), "service_overloaded")
+        self.assertAlmostEqual(self.total.target, 0.9 * 0.97 * 0.97, places=9)
+        self.assertAlmostEqual(self.total.fast_limit, 0.9 * 0.97 * 0.97, places=9)
+
+    def test_a_steady_stream_of_429s_still_cuts_once_per_interval(self) -> None:
+        self.burst(4, 5.0)
+        self.assertAlmostEqual(self.total.target, 0.9 * 0.97 * 0.97, places=9)
+
+
+class FastLimitTest(unittest.TestCase):
+    STEP_S = 0.25
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.home = Path(tmp.name)
+        self.now = [1000.0]
+        self.gov = Governor(self.home, config_with(fast_until=0.9), clock=lambda: self.now[0], log=quiet)
+        self.total = self.gov.budgets["total"]
+        self.total.target = 0.6
+
+    def run_for(self, seconds: float) -> list[float]:
+        seen = []
+        for _ in range(round(seconds / self.STEP_S)):
+            self.now[0] += self.STEP_S
+            self.total.saturated = True
+            self.gov.tick()
+            seen.append(self.total.target)
+        return seen
+
+    def cut_at_fast_top(self) -> float:
+        self.run_for(50.0)
+        self.assertAlmostEqual(self.total.target, 0.85, places=6)
+        self.gov.learn_from_429(make_ticket(self.gov, max_tokens=8), "service_overloaded")
+        self.assertAlmostEqual(self.total.fast_limit, 0.85 * 0.97, places=9)
+        return self.total.target
+
+    def test_after_a_cut_fast_steps_stop_at_the_cut_and_slow_steps_continue(self) -> None:
+        cut = self.cut_at_fast_top()
+        seen = self.run_for(120.0)
+        self.assertLessEqual(max(seen), cut + 0.04 + 1e-9)
+        self.assertAlmostEqual(self.total.target, cut + 0.04, places=6)
+
+    def test_a_fast_step_never_overshoots_the_cut(self) -> None:
+        cut = self.cut_at_fast_top()
+        seen = self.run_for(59.75)
+        self.assertTrue(all(value <= cut + 1e-9 for value in seen))
+
+    def test_fast_limit_clears_after_thirty_quiet_minutes(self) -> None:
+        self.cut_at_fast_top()
+        self.run_for(30 * 60 - 0.25)
+        self.assertIsNotNone(self.total.fast_limit)
+        self.run_for(0.25)
+        self.assertIsNone(self.total.fast_limit)
+
+    def test_a_new_429_resets_the_quiet_clock(self) -> None:
+        self.cut_at_fast_top()
+        self.run_for(29 * 60)
+        self.gov.learn_from_429(make_ticket(self.gov, max_tokens=8), "service_overloaded")
+        self.run_for(30 * 60 - 0.25)
+        self.assertIsNotNone(self.total.fast_limit)
+
+    def test_fast_limit_round_trips_through_the_state_file(self) -> None:
+        cut = self.cut_at_fast_top()
+        self.gov.save_state()
+        restarted = Governor(self.home, config_with(), log=quiet)
+        self.assertAlmostEqual(restarted.budgets["total"].fast_limit, cut, places=6)
+        self.assertIsNone(restarted.budgets["output"].fast_limit)
+
+    def test_state_without_the_key_loads_as_no_fast_limit(self) -> None:
+        self.gov.save_state()
+        restarted = Governor(self.home, config_with(), log=quiet)
+        self.assertIsNone(restarted.budgets["total"].fast_limit)
+
+
+class MinuteSeedTest(unittest.TestCase):
+    def test_restart_adds_new_requests_to_the_stored_minute_row(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        home = Path(tmp.name)
+        wall = 1_700_000_030.0
+        minute = minute_stamp(wall)
+        connection = sqlite3.connect(home / "agentq.db")
+        connection.execute(PROXY_MINUTES_DDL)
+        connection.execute(
+            "INSERT INTO proxy_minutes VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            (minute, MODEL_OUT, 60, 58, 2, 1000, 0, 500, 900, 0, 0, 0.9),
+        )
+        connection.commit()
+        connection.close()
+
+        gov = Governor(home, config_with(), wall=lambda: wall, log=quiet)
+        row = gov.row(MODEL_OUT)
+        row["req"] += 5
+        row["output"] += 100
+        row["ok"] += 5
+        write_minute_rows(home / "agentq.db", gov.take_minute_rows())
+
+        connection = sqlite3.connect(home / "agentq.db")
+        stored = connection.execute(
+            "SELECT req, ok, r429, input, output FROM proxy_minutes WHERE minute = ? AND model = ?",
+            (minute, MODEL_OUT),
+        ).fetchone()
+        connection.close()
+        self.assertEqual(stored, (65, 63, 2, 1000, 600))
+
+    def test_a_minute_with_no_stored_row_starts_from_zero(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        gov = Governor(Path(tmp.name), config_with(), log=quiet)
+        row = gov.row(MODEL_OUT)
+        self.assertEqual(row["req"], 0)
+        self.assertEqual(row["waits"], [])
 
 
 if __name__ == "__main__":
