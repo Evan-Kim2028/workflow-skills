@@ -874,6 +874,13 @@ class InstallerTest(unittest.TestCase):
             self.assertIn("<integer>3600</integer>", text)
             self.assertIn("<key>LowPriorityIO</key>", text)
             self.assertIn("/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin", text)
+            # The job runs the deployed release, never a symlink into
+            # ~/Documents (a launchd job cannot read that under TCC).
+            code = home / ".local" / "share" / "agent-dash" / "releases" / "CURRENT" / "tools" / "agent-dash"
+            self.assertIn("<string>%s/scripts/memcap.sh</string>" % code, text)
+            self.assertIn("<string>%s/agent_dash.py</string>" % code, text)
+            self.assertNotIn(".claude/tools", text)
+            self.assertNotIn(".claude/scripts", text)
             # Uninstall removes the plist.
             res = subprocess.run(
                 ["sh", str(SCRIPTS / "session_archive_install.sh"), "--uninstall"],
@@ -883,6 +890,100 @@ class InstallerTest(unittest.TestCase):
             )
             self.assertEqual(res.returncode, 0, res.stderr)
             self.assertFalse(plist.exists())
+
+    def test_session_archive_code_dir_override(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            code = home / "release" / "tools" / "agent-dash"
+            env = dict(os.environ)
+            env.update(
+                {
+                    "HOME": str(home),
+                    "SESSION_ARCHIVE_PLIST_DIR": str(home / "LaunchAgents"),
+                    "SESSION_ARCHIVE_LOG_DIR": str(home / "Logs"),
+                    "SESSION_ARCHIVE_NO_LOAD": "1",
+                    "SESSION_ARCHIVE_CODE_DIR": str(code),
+                }
+            )
+            res = subprocess.run(
+                ["sh", str(SCRIPTS / "session_archive_install.sh")],
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(res.returncode, 0, res.stderr)
+            text = (home / "LaunchAgents" / "com.agent-dash.session-archive.plist").read_text(
+                encoding="utf-8"
+            )
+            self.assertIn("<string>%s/scripts/memcap.sh</string>" % code, text)
+            self.assertIn("<string>%s/agent_dash.py</string>" % code, text)
+
+    def _install(self, home, **env_extra):
+        env = dict(os.environ)
+        env.update(
+            {
+                "HOME": str(home),
+                "SESSION_ARCHIVE_PLIST_DIR": str(home / "LaunchAgents"),
+                "SESSION_ARCHIVE_LOG_DIR": str(home / "Logs"),
+                "SESSION_ARCHIVE_NO_LOAD": "1",
+            }
+        )
+        env.update(env_extra)
+        return subprocess.run(
+            ["sh", str(SCRIPTS / "session_archive_install.sh")],
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+
+    def test_refuses_code_dir_under_documents(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            res = self._install(home, SESSION_ARCHIVE_CODE_DIR=str(home / "Documents" / "code"))
+            self.assertEqual(res.returncode, 2, res.stdout)
+            self.assertIn("refusing", res.stderr)
+            self.assertIn("Documents", res.stderr)
+            self.assertFalse((home / "LaunchAgents" / "com.agent-dash.session-archive.plist").exists())
+
+    def test_refuses_dest_in_every_tcc_folder(self):
+        for folder in ("Documents", "Desktop", "Downloads", "Library/Mobile Documents"):
+            with self.subTest(folder=folder), tempfile.TemporaryDirectory() as tmp:
+                home = Path(tmp)
+                res = self._install(
+                    home,
+                    SESSION_ARCHIVE_CODE_DIR=str(home / "release"),
+                    SESSION_ARCHIVE_DEST=str(home / folder / "agent-sessions"),
+                )
+                self.assertEqual(res.returncode, 2, res.stdout)
+                self.assertIn("refusing", res.stderr)
+                self.assertIn("archive dest", res.stderr)
+
+    def test_refuses_code_dir_that_symlinks_into_documents(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            real = home / "Documents" / "projects" / "workflow-skills" / "tools" / "agent-dash"
+            real.mkdir(parents=True)
+            link = home / ".claude" / "tools" / "agent-dash"
+            link.parent.mkdir(parents=True)
+            os.symlink(real, link)
+            res = self._install(home, SESSION_ARCHIVE_CODE_DIR=str(link))
+            self.assertEqual(res.returncode, 2, res.stdout)
+            self.assertIn("refusing", res.stderr)
+
+    def test_symlinked_dest_out_of_documents_is_allowed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            real = home / ".local" / "share" / "agent-sessions"
+            real.mkdir(parents=True)
+            link = home / "Documents" / "data" / "agent-sessions"
+            link.parent.mkdir(parents=True)
+            os.symlink(real, link)
+            res = self._install(
+                home,
+                SESSION_ARCHIVE_CODE_DIR=str(home / "release"),
+                SESSION_ARCHIVE_DEST=str(link),
+            )
+            self.assertEqual(res.returncode, 0, res.stderr)
 
 
 # --------------------------------------------------------------- review regressions
@@ -2052,6 +2153,181 @@ class VLogsEndToEndTest(Base):
         self.assertFalse(path.exists())
         self.assertTrue(sa._archive_ok(final))
         self.assertEqual(sa.count_uniq_rows(client, uid, final["rev"]), 2)
+
+
+# --------------------------------------------------------------- dest move
+
+class DestMoveTest(Base):
+    """Records keep working when the archive dest moves.
+
+    New records carry ``archive_rel``/``rel``; older ones carry only an
+    absolute path, which is re-anchored at read time when it is gone.
+    """
+
+    def _unit(self):
+        root = self.home / "pi"
+        path = write(root / "proj" / "a.jsonl", '{"type":"session"}\n{"type":"message"}\n')
+        age(path, 30)
+        return root, path, self.unit("pi", root)
+
+    def test_legacy_absolute_record_follows_the_move(self):
+        root, _path, unit = self._unit()
+        old = self.home / "old"
+        rec, _manifest = self.archive_unit(unit, old, FakeClient())
+        # Exactly the old shape: no relative fields at all.
+        self.assertNotIn("archive_rel", rec)
+        self.assertNotIn("rel", rec["archives"][0])
+        self.assertTrue(rec["archive"].startswith(str(old) + os.sep))
+
+        new = self.home / "new"
+        os.rename(old, new)
+        moved = sa.Manifest(new / "state")
+        rec = moved.latest[unit.uid]
+
+        entries = sa._seq_entries(rec, new)
+        self.assertEqual(len(entries), 1)
+        archive = entries[0]["path"]
+        self.assertTrue(archive.startswith(str(new) + os.sep), archive)
+        self.assertIn("/archive/", archive)
+        self.assertTrue(os.path.exists(archive))
+        self.assertIsNone(sa._entry_error(entries[0]))
+        # The manifest was not rewritten: the absolute path is still the old one.
+        self.assertTrue(rec["archive"].startswith(str(old) + os.sep))
+        self.assertTrue(sa._archive_ok(rec, new))
+
+        target = self.home / "restored"
+        buf = io.StringIO()
+        self.assertEqual(sa.restore(unit.uid, str(target), new / "state", buf), 0)
+        self.assertEqual((target / "a.jsonl").read_bytes(), Path(unit.members[0].path).read_bytes())
+        self.assertEqual(sa.Manifest(new / "state").latest[unit.uid]["status"], "restored")
+
+    def test_legacy_trash_path_follows_the_move(self):
+        root, _path, unit = self._unit()
+        dest = self.home / "old"
+        rec, manifest = self.archive_unit(unit, dest, FakeClient())
+        trash = sa._trash_dir(dest, unit.uid)
+        trash.mkdir(parents=True, exist_ok=True)
+        journal = dict(
+            rec,
+            status="reclaiming",
+            trash=str(trash),
+            trash_members=[
+                {"rel": m["rel"], "path": member.path, "sha256": m["sha256"], "size": m["size"]}
+                for m, member in zip(rec["members"], unit.members)
+            ],
+        )
+        manifest.write(journal)
+        new = self.home / "new"
+        os.rename(dest, new)
+        moved = sa.Manifest(new / "state")
+        rec = moved.latest[unit.uid]
+        self.assertNotIn("trash_rel", rec)
+        named = sa.resolve_stored_path(moved.dest, rec.get("trash_rel"), rec["trash"])
+        self.assertEqual(os.path.abspath(named), os.path.abspath(str(sa._trash_dir(new, unit.uid))))
+        # Recovery therefore sees a canonical trash dir, not a stale path.
+        action, why = sa._trash_plan(moved, sa._trash_dir(new, unit.uid))
+        self.assertNotIn("non-canonical", why)
+        self.assertIn(action, ("archive", "finish"), why)
+
+    def test_new_records_store_relative_paths(self):
+        root, _path, unit = self._unit()
+        dest = self.home / "dest"
+        client = FakeClient()
+        code = process_one(unit, dest, client)
+        self.assertEqual(code, 0)
+        rec = sa.Manifest(dest / "state").latest[unit.uid]
+        self.assertEqual(rec["archive_rel"], "archive/pi/proj/a.jsonl.0.tar.zst")
+        self.assertEqual(rec["archives"][0]["rel"], rec["archive_rel"])
+        os.rename(dest, self.home / "moved")
+        entries = sa._seq_entries(rec, self.home / "moved")
+        self.assertTrue(entries[0]["path"].startswith(str(self.home / "moved") + os.sep))
+        self.assertIsNone(sa._entry_error(entries[0]))
+
+
+def process_one(unit, dest, client):
+    """Run one ``--apply --no-reclaim`` pass for a single patched tool."""
+    out = io.StringIO()
+    opts = {
+        "apply": True,
+        "no_reclaim": True,
+        "scheduled": False,
+        "tools": [unit.tool],
+        "limit": None,
+        "max_minutes": None,
+        "url": None,
+        "dest": str(dest),
+    }
+    with mock.patch.dict(sa.TOOLS, {unit.tool: (unit.root, sa.TOOLS[unit.tool][1])}), mock.patch.object(
+        sa.vlogs, "VLogsClient", lambda url=None: client
+    ), mock.patch.object(sa, "live_files", lambda names: []):
+        return sa.run(opts, out=out, state=Path(dest).parent / "config-state")
+
+
+# --------------------------------------------------------------- access preflight
+
+class PreflightTest(Base):
+    def _run_scheduled(self, root, dest, buf):
+        opts = {
+            "apply": True,
+            "no_reclaim": False,
+            "scheduled": True,
+            "tools": ["pi"],
+            "limit": None,
+            "max_minutes": None,
+            "url": None,
+            "dest": str(dest),
+        }
+        with mock.patch.dict(sa.TOOLS, {"pi": (str(root), sa.discover_pi)}), mock.patch.object(
+            sa.vlogs, "VLogsClient", lambda url=None: FakeClient()
+        ), mock.patch.object(sa, "live_files", lambda names: []):
+            started = time.monotonic()
+            code = sa.run(opts, out=buf, state=self.home / "state")
+            elapsed = time.monotonic() - started
+        return code, elapsed
+
+    def test_unwritable_dest_exits_6_with_one_line(self):
+        root = self.home / "pi"
+        path = write(root / "proj" / "a.jsonl", '{"type":"session"}\n')
+        age(path, 30)
+        dest = self.home / "locked"
+        dest.mkdir()
+        os.chmod(dest, 0o500)
+        self.addCleanup(os.chmod, str(dest), 0o700)
+        buf = io.StringIO()
+        code, elapsed = self._run_scheduled(root, dest, buf)
+        self.assertEqual(code, 6)
+        self.assertLess(elapsed, 30, "preflight must not wait")
+        text = buf.getvalue().strip()
+        self.assertEqual(len(text.splitlines()), 1, text)
+        self.assertIn("ERROR: no access to", text)
+        self.assertIn("macOS privacy", text)
+        self.assertTrue(path.exists())
+
+    def test_unreadable_tool_root_exits_6(self):
+        root = self.home / "pi"
+        _path = write(root / "proj" / "a.jsonl", '{"type":"session"}\n')
+        buf = io.StringIO()
+        real_scandir = os.scandir
+
+        def denied(path):
+            if os.path.abspath(str(path)) == os.path.abspath(str(root)):
+                raise PermissionError(1, "Operation not permitted", str(path))
+            return real_scandir(path)
+
+        with mock.patch.object(sa.os, "scandir", denied):
+            code, _elapsed = self._run_scheduled(root, self.home / "dest", buf)
+        self.assertEqual(code, 6)
+        self.assertIn("ERROR: no access to %s" % root, buf.getvalue())
+
+    def test_writable_dest_passes_preflight(self):
+        root = self.home / "pi"
+        path = write(root / "proj" / "a.jsonl", '{"type":"session"}\n')
+        age(path, 30)
+        buf = io.StringIO()
+        with mock.patch.object(sa, "scheduled_skip", lambda _state, _now: None):
+            code, _elapsed = self._run_scheduled(root, self.home / "dest", buf)
+        self.assertEqual(code, 0, buf.getvalue())
+        self.assertFalse(path.exists())
 
 
 if __name__ == "__main__":

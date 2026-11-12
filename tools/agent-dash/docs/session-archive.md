@@ -21,7 +21,7 @@ from `dash/logarchive.py`, but not the base64 filter.
 | CLI | `agent_dash.py logs sessions` | `--apply`, `--no-reclaim`, `--scheduled`, `--tool`, `--limit`, `--max-minutes`, `--url`, `--dest`; plus `restore` and `status`. |
 | Store client | `dash/vlogs.py` | `make_row(..., extra=...)` adds the native fields; redaction and truncation apply as before. |
 | Store service | `scripts/vlogs_install.sh` | `VLOGS_DATA` and `VLOGS_MAX_DISK` feed `-storageDataPath` and `-retention.maxDiskSpaceUsageBytes`; `VLOGS_MAX_DISK=none` (or empty) omits the cap. |
-| Schedule | `scripts/session_archive_install.sh` | launchd agent `com.agent-dash.session-archive`, hourly, `ProcessType=Background`, `Nice=10`, under `taskpolicy -b` and `memcap.sh 4096`. |
+| Schedule | `scripts/session_archive_install.sh` | launchd agent `com.agent-dash.session-archive`, hourly, `ProcessType=Background`, `Nice=10`, under `taskpolicy -b` and `memcap.sh 4096`, running the deployed release (`~/.local/share/agent-dash/releases/CURRENT/tools/agent-dash`). |
 
 ## Config
 
@@ -30,7 +30,7 @@ git-ignored), the same file `logarchive` reads `log_archive.roots` from:
 
 ```json
 {"log_archive": {"sessions": {
-  "dest": "~/Documents/data/agent-sessions",
+  "dest": "~/.local/share/agent-sessions",
   "min_idle_hours": 6,
   "reclaim_days": 14,
   "reclaim_days_by_tool": {},
@@ -43,6 +43,44 @@ All keys are optional; the values above are the defaults. `tools: null`
 means every registered tool; a list narrows it (`["pi", "claude"]`).
 `SESSION_ARCHIVE_DEST` overrides `dest`, and `--dest` overrides both (used
 by tests and by a read-only census that must not create the real folder).
+
+### macOS privacy (TCC): keep the dest and the code out of ~/Documents
+
+A process started by launchd inherits no TCC ("privacy") grant. Reading
+anything under `~/Documents`, `~/Desktop`, `~/Downloads` or
+`~/Library/Mobile Documents` answers `EPERM` instead of prompting the user,
+so a job pointed there hangs on its first read. That is exactly what broke
+the first install: the plist ran `~/.claude/tools/agent-dash/agent_dash.py`
+and `~/.claude/scripts/memcap.sh`, both symlinks into a checkout under
+`~/Documents`, and its dest was `~/Documents/data/agent-sessions`.
+
+So the real dest is `~/.local/share/agent-sessions` (a real directory, not
+a symlink), the job runs the deployed release under
+`~/.local/share/agent-dash/releases/CURRENT`, and
+`~/Documents/data/agent-sessions` is only a browsing symlink to the real
+dest. The installer resolves every path and refuses (exit 2) a code dir,
+`memcap.sh` or dest whose realpath is inside a TCC-protected folder; a
+symlink that points out of `~/Documents` is fine, because the realpath is
+what launchd will read.
+
+A `--scheduled` run also proves its access before doing any work: it
+creates and removes a probe file in `<dest>/state/` and reads one tool
+root. On `EPERM`/`EACCES` it prints one line and exits `6` instead of
+waiting:
+
+```
+ERROR: no access to <path> (macOS privacy: launchd jobs cannot read ~/Documents; move the dest/code, see docs)
+```
+
+### Manifest paths are relative to the dest
+
+Each record stores `archive_rel` (and a per-sequence `rel` in `archives`),
+resolved against the *current* dest at read time, so moving the data and
+changing `dest` keeps every record working without rewriting the manifest.
+An older record that only carries an absolute `archive` path is used while
+that path exists; once it is gone, the tail from its `archive/` (or
+`state/trash/`) marker is resolved against the current dest. Nothing else
+is guessed.
 
 ## Retention policy
 
@@ -70,6 +108,10 @@ Nothing this job writes is ever deleted for age or space:
   state/last_success.json
   state/disk_warning.json        only while a scheduled run saw < 30 GB free
 ```
+
+`<dest>` defaults to `~/.local/share/agent-sessions`;
+`~/Documents/data/agent-sessions` is a symlink to it for browsing, never a
+dest the job writes through (see *macOS privacy* above).
 
 The unit path is the unit's path relative to the tool root, so a Claude
 Code session archives to
@@ -219,7 +261,8 @@ Streams are keyed by `ws,label`, so each session is its own stream.
 
 Exit codes: `0` ok, `1` failures or an empty dry run on real input, `2` bad
 options, `3` another run holds the lock, `5` store unreachable (only for
-`--apply`; the dry run works without the store).
+`--apply`; the dry run works without the store), `6` a `--scheduled` run
+cannot read its code roots or write its dest (macOS privacy, see above).
 
 ## Modes
 
@@ -230,7 +273,9 @@ grok worktrees). It measures a projected archive size by compressing the
 first 3 eligible units per tool into a temp dir, then deletes it. A dry run
 that plans zero actions on real, non-archived input exits 1.
 
-`--scheduled` exits `0` immediately with a reason when any of these hold:
+`--scheduled` first proves its access (see *macOS privacy* above) and exits
+`6` when it cannot. It then exits `0` immediately with a reason when any of
+these hold:
 `last_success.json` is under 20 h old, `memory_pressure` reports under 30 %
 free, or `pmset -g batt` says `Battery Power`. When the dest volume has
 less than 30 GB free it prints a `WARNING` line and records
@@ -270,7 +315,7 @@ python3 ~/.claude/tools/agent-dash/agent_dash.py logs sessions restore <session-
 python3 ~/.claude/tools/agent-dash/agent_dash.py logs sessions restore \
   pi/--Users-me-proj--/2026-11-03T18-25-46-002Z_01a1a2a8.jsonl
 python3 ~/.claude/tools/agent-dash/agent_dash.py logs sessions restore \
-  ~/Documents/data/agent-sessions/archive/pi/....tar.zst --to /tmp/restore
+  ~/.local/share/agent-sessions/archive/pi/....tar.zst --to /tmp/restore
 ```
 
 It extracts to a temporary dir under the target's parent, accepts only
