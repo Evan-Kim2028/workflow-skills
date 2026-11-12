@@ -2,6 +2,7 @@
   "default": "pi-anthropic-haiku",
   "auto_order": ["pi-anthropic-haiku", "pi-deepseek-flash"],
   "cooldown_minutes": 30,
+  "model_caps": {"river/deepseek-ai/DeepSeek-V4.1-Flash-1017": 5},
   "workers": {
     "pi-anthropic-haiku": {
       "enabled": true,

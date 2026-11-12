@@ -38,7 +38,7 @@ listing is unavailable.
 
 Verdict comes from the first line of ``out-<label>.md``. A run whose err
 or out log shows quota/credit exhaustion finishes ``died_early`` with
-verdict ``BLOCKED``; ``QUOTA`` beside the manifest names the model to
+verdict ``BLOCKED``; ``QUOTA-<label>`` beside the manifest names the model to
 swap. An empty out file with a real error and no live process reads
 ``died_early``.
 
@@ -132,7 +132,7 @@ def _outdirs_walk(root):
     folder is not enough: another harness's outdir (Command Code keeps its
     own ``running/``) would read as a second ``pi:`` run for the same
     label, so a manifest-less outdir must also carry pi evidence (a
-    ``prompt-`` file, the ``QUOTA`` marker, a ``sessions/`` dir, or a
+    ``prompt-`` file, a ``QUOTA-<label>`` marker, a ``sessions/`` dir, or a
     pi-shaped ``stream-<label>.ndjson``, never the ``-<n>`` Command Code
     shape).
     """
@@ -248,15 +248,15 @@ def _looks_like_pi_dir(path):
     """True when a manifest-less folder carries pi-only evidence.
 
     ``out-``/``err-`` files and ``running/`` are shared with the Command
-    Code launcher, so they do not count: only a ``prompt-`` file, the
-    ``QUOTA`` marker, the pi ``sessions/`` dir, or a pi-shaped stream
+    Code launcher, so they do not count: only a ``prompt-`` file, a
+    ``QUOTA-<label>`` marker, the pi ``sessions/`` dir, or a pi-shaped stream
     (``stream-<label>.ndjson``, never the ``-<n>`` Command Code shape).
     """
     try:
         names = os.listdir(path)
     except OSError:
         return False
-    if "QUOTA" in names:
+    if any(name.startswith("QUOTA-") for name in names):
         return True
     if "sessions" in names and os.path.isdir(os.path.join(path, "sessions")):
         return True
@@ -665,12 +665,13 @@ def _process_apply(store, run, processes):
 
 
 def _quota(pad, label, out_path, err_path, sid) -> bool:
-    """True when the QUOTA marker or a quota log names this run's failure.
+    """True when this run's ``QUOTA-<label>`` marker or a quota log names its failure.
 
-    Cached on (path, size, mtime_ns) so a quiet run does not re-open and
+    The marker is per label, so runs sharing a ``pi/`` outdir each keep their
+    own. Cached on (path, size, mtime_ns) so a quiet run does not re-open and
     regex-scan its logs every 2 s across 140+ live runs.
     """
-    quota_path = os.path.join(pad, "QUOTA")
+    quota_path = os.path.join(pad, f"QUOTA-{label}")
     try:
         st = os.stat(quota_path)
         sig = (st.st_size, st.st_mtime_ns)

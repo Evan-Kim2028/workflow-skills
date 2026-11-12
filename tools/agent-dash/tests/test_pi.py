@@ -261,6 +261,58 @@ class LauncherHelperTest(unittest.TestCase):
         self.assertEqual(pi.final_text(raw), "PASS\nreport body")
 
 
+class LauncherQuotaMarkerTest(unittest.TestCase):
+    """launch_pi writes its quota marker per label, so runs sharing an outdir keep their own."""
+
+    def setUp(self):
+        from unittest import mock
+
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        self.state = root / "state"
+        self.ws = root / "ws"
+        self.ws.mkdir()
+        self.prompt = root / "prompt.md"
+        self.prompt.write_text("do the task\n", encoding="utf-8")
+        self.outdir = root / "pi"
+        patches = [
+            mock.patch.object(launch, "state_dir", return_value=self.state),
+            mock.patch.object(launch, "register_run_dir", return_value=None),
+            mock.patch.object(launch.logfilter, "run_filtered", return_value=0),
+        ]
+        for patch in patches:
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def run_pi(self, label, quota):
+        from unittest import mock
+
+        with mock.patch.object(launch, "quota_hit", return_value=quota):
+            return launch.main([label, str(self.ws), str(self.prompt), str(self.outdir), "--model", DEEPSEEK])
+
+    def test_quota_marker_names_its_label(self):
+        self.assertEqual(self.run_pi("ws1-exec-lane-1", True), 1)
+        marker = self.outdir / "QUOTA-ws1-exec-lane-1"
+        self.assertEqual(
+            marker.read_text(encoding="utf-8"),
+            "model\t%s\nlabel\tws1-exec-lane-1\n" % DEEPSEEK,
+        )
+        self.assertFalse((self.outdir / "QUOTA").exists())
+
+    def test_two_quota_runs_in_one_outdir_keep_two_markers(self):
+        self.run_pi("ws1-exec-lane-1", True)
+        self.run_pi("ws1-exec-lane-2", True)
+        self.assertTrue((self.outdir / "QUOTA-ws1-exec-lane-1").is_file())
+        self.assertTrue((self.outdir / "QUOTA-ws1-exec-lane-2").is_file())
+
+    def test_clean_run_writes_no_marker(self):
+        self.run_pi("ws1-exec-lane-3", False)
+        self.assertEqual([p.name for p in self.outdir.glob("QUOTA*")], [])
+
+
 class SourceTest(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -368,11 +420,20 @@ class SourceTest(unittest.TestCase):
 
     def test_quota_file_finishes_died_early_blocked(self):
         self.write_tsv([["ws15-exec-quota", SID, 1792000000, DEEPSEEK]])
-        (self.pad / "QUOTA").write_text("model\t%s\nlabel\tws15-exec-quota\n" % DEEPSEEK, encoding="utf-8")
+        (self.pad / "QUOTA-ws15-exec-quota").write_text("model\t%s\nlabel\tws15-exec-quota\n" % DEEPSEEK, encoding="utf-8")
         self.poll()
         run = self.store.runs[self.run_id("ws15-exec-quota")]
         self.assertEqual(run["status"], "died_early")
         self.assertEqual(run["verdict"], "BLOCKED")
+
+    def test_quota_marker_for_a_sibling_label_does_not_block_this_run(self):
+        self.write_tsv([["ws15-exec-quota3", SID, 1792000000, DEEPSEEK]])
+        (self.pad / "QUOTA-ws15-exec-sibling").write_text(
+            "model\t%s\nlabel\tws15-exec-sibling\n" % DEEPSEEK, encoding="utf-8"
+        )
+        self.poll()
+        run = self.store.runs[self.run_id("ws15-exec-quota3")]
+        self.assertNotEqual(run.get("verdict"), "BLOCKED")
 
     def test_quota_error_log_finishes_died_early_blocked(self):
         self.write_tsv([["ws15-exec-quota2", SID, 1792000000, DEEPSEEK]])

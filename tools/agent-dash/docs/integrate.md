@@ -321,7 +321,7 @@ GLM by their model ids.
 Quota or credit exhaustion (an `errorMessage` naming
 insufficient/credit/quota/balance, HTTP 402, or a rate-limit 429 the run
 never recovered from) finishes `died_early` with verdict `BLOCKED` and
-writes `<outdir>/QUOTA` naming the model and label, so the lead knows to
+writes `<outdir>/QUOTA-<label>` naming the model and label, so the lead knows to
 swap the API key. A transient 429 pi auto-retried past is not quota: the
 launcher's summary line records it as `rate_limit_retries=<n>`. Run the worker with a
 `ws<N>-plan-<slug>` or `ws<N>-exec-<slug>` label so the Project home

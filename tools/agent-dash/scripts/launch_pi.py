@@ -17,7 +17,7 @@ Writes, in ``outdir``:
   <outdir>/out-<label>.md           final assistant text
   <outdir>/err-<label>.log          stderr
   <outdir>/running/<label>          "<pid>\\t<model>" while the run is live
-  <outdir>/QUOTA                    only on quota/credit exhaustion
+  <outdir>/QUOTA-<label>            only on quota/credit exhaustion
   <state-dir>/generic.jsonl         one start, one usage per assistant
                                     message, one finish line (run id
                                     ``pi:<session>:<label>``)
@@ -25,7 +25,7 @@ Writes, in ``outdir``:
 Quota/credit exhaustion (an ``errorMessage`` naming insufficient
 credit/quota/balance, HTTP 402, or a rate-limit 429 the run never
 recovered from) finishes ``died_early`` with verdict ``BLOCKED`` and
-writes ``QUOTA`` naming the model and label, so the lead knows to swap
+writes ``QUOTA-<label>`` naming the model and label, so the lead knows to swap
 the API key. A transient 429 pi auto-retried past is not quota: the
 summary line records it as ``rate_limit_retries=<n>``. ``outdir`` is
 registered in ``run-dirs.txt`` like ``run_worker.py`` does.
@@ -379,7 +379,7 @@ def main(argv=None):
         fh.write(f"{label}\t{sid}\t{started}\t{model}\t{tier}\n")
 
     if quota:
-        (out / "QUOTA").write_text(f"model\t{model}\nlabel\t{label}\n", encoding="utf-8")
+        (out / f"QUOTA-{label}").write_text(f"model\t{model}\nlabel\t{label}\n", encoding="utf-8")
         verdict, status = "BLOCKED", "died_early"
     else:
         verdict = verdict_of(text)

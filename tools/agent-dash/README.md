@@ -74,7 +74,7 @@ reads the manifest and a `pi/` folder beside it, takes status and verdict
 from the files, and reads liveness from the live `node .../pi-coding-agent`
 process. Quota/credit exhaustion (or a rate-limit 429 the run never
 recovered from) finishes `died_early` with verdict `BLOCKED` and writes
-`QUOTA` naming the model and label; a transient 429 pi auto-retried past
+`QUOTA-<label>` naming the model and label; a transient 429 pi auto-retried past
 is recorded as `rate_limit_retries=<n>` on the launcher's summary line.
 See [docs/integrate.md](docs/integrate.md).
 

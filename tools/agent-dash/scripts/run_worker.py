@@ -53,6 +53,14 @@ launcher with ``AGENT_DASH_PI_ENV_FILE`` set to that path, so the launcher
 sources the standby credential instead of the primary one. The path is
 only passed through; no key is ever read or printed here.
 
+Caps count live workers per base model, not per tier name: tiers that run
+one model (``pi-deepseek-flash`` and ``pi-deepseek-flash-low`` both run
+``morph/morph-dsv41flash-1017``; a ``:<level>`` suffix is a thinking level and
+is stripped) share one pool. The limit is the strictest of the enabled tiers'
+``cap`` values and the registry's optional ``model_caps`` entry for the model.
+A named tier at its limit gets ``STATUS: failed reason=none-available`` at
+once, the same answer ``auto`` gives when nothing is eligible; nothing waits.
+
 Prints one line:
 STATUS: running|done|failed out=<report> err=<stderr> tier=<name> [reason=...]
 """
@@ -546,6 +554,13 @@ def pick_initial(ctx):
         return None, "unknown-tier"
     if not worker.get("enabled", True):
         return None, "disabled"
+    live, limit = model_capacity(ctx, base_model(worker.get("model")))
+    if limit is not None and live >= limit:
+        print(
+            f"cap: {name} is full ({live} live of {limit} for {base_model(worker.get('model'))}); not launching",
+            file=sys.stderr,
+        )
+        return None, "none-available"
     return name, None
 
 
@@ -737,16 +752,76 @@ def eligible(ctx, skip):
                 file=sys.stderr,
             )
             continue
-        try:
-            cap = int(worker.get("cap"))
-        except (TypeError, ValueError):
+        if _int_or_none(worker.get("cap")) is None:
             continue
-        pattern = worker.get("pgrep") or ""
-        count = ctx["hooks"]["pgrep"](pattern) if pattern else 0
-        if count >= cap:
+        live, limit = model_capacity(ctx, base_model(worker.get("model")))
+        if live >= limit:
             continue
         return launch_name
     return None
+
+
+THINKING_SUFFIX = re.compile(r":[A-Za-z]+$")
+
+
+def base_model(model) -> str:
+    """A model id without a trailing ``:<level>`` thinking suffix.
+
+    ``morph/morph-dsv41flash-1017:low`` runs the same model as
+    ``morph/morph-dsv41flash-1017``; the level only sets its thinking budget.
+    """
+    return THINKING_SUFFIX.sub("", str(model or ""))
+
+
+def _int_or_none(value):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def model_caps(registry) -> dict:
+    """``registry["model_caps"]`` keyed by base model id; malformed entries are dropped."""
+    caps = registry.get("model_caps")
+    if not isinstance(caps, dict):
+        return {}
+    found = {}
+    for key, value in caps.items():
+        cap = _int_or_none(value)
+        if cap is not None:
+            found[base_model(key)] = cap
+    return found
+
+
+def model_capacity(ctx, model):
+    """``(live, limit)`` for one base model shared by one or more tiers.
+
+    ``live`` counts every live worker of the model across all tiers that run
+    it, through one pgrep over the union of their patterns, so a process two
+    patterns both match counts once. ``limit`` is the strictest cap that
+    applies: the lowest ``cap`` of the enabled tiers for this model and the
+    model's ``model_caps`` entry, or None when nothing caps it.
+    """
+    registry = ctx["registry"]
+    patterns = []
+    caps = []
+    for worker in (registry.get("workers") or {}).values():
+        if not isinstance(worker, dict) or base_model(worker.get("model")) != model:
+            continue
+        pattern = worker.get("pgrep") or ""
+        if pattern and pattern not in patterns:
+            patterns.append(pattern)
+        cap = _int_or_none(worker.get("cap"))
+        if worker.get("enabled", True) and cap is not None:
+            caps.append(cap)
+    model_cap = model_caps(registry).get(model)
+    if model_cap is not None:
+        caps.append(model_cap)
+    if not patterns:
+        return 0, (min(caps) if caps else None)
+    union = patterns[0] if len(patterns) == 1 else "|".join(f"({p})" for p in patterns)
+    live = ctx["hooks"]["pgrep"](union)
+    return live, (min(caps) if caps else None)
 
 
 def model_priced(worker) -> bool:
@@ -847,14 +922,14 @@ def outcome(worker, out_path, err_path):
 def quota_file_hit(ctx) -> bool:
     """True when a launcher QUOTA marker names this label from this attempt.
 
-    ``launch_pi.py`` writes a shared ``QUOTA`` file (``model`` and
-    ``label`` lines) and ``launch_codex.py`` writes ``QUOTA-<label>``:
-    both land beside the launcher's outdir, which the log-pattern scan
-    cannot see when the worker's quota error never reaches the report
-    tails (an empty report with a quota marker is a quota hit, not an
-    empty report). Only a marker naming this label and written after
-    this attempt's tier file counts, so a previous attempt's marker (or
-    another label sharing the outdir) never cools this launch.
+    ``launch_pi.py`` and ``launch_codex.py`` both write ``QUOTA-<label>``
+    (``model`` and ``label`` lines) beside the launcher's outdir, which the
+    log-pattern scan cannot see when the worker's quota error never reaches
+    the report tails (an empty report with a quota marker is a quota hit,
+    not an empty report). The name is per run, so runs sharing an outdir
+    each keep their own marker. Only a marker naming this label and written
+    after this attempt's tier file counts, so a previous attempt's marker
+    never cools this launch.
     """
     label = ctx.get("label") or ""
     try:
@@ -863,8 +938,6 @@ def quota_file_hit(ctx) -> bool:
         return False
     base = Path(ctx["run_dir"])
     candidates = [
-        base / "QUOTA",
-        base / "pi" / "QUOTA",
         base / f"QUOTA-{label}",
         base / "pi" / f"QUOTA-{label}",
         base / "codex" / f"QUOTA-{label}",
