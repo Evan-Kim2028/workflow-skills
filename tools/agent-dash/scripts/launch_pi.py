@@ -10,6 +10,18 @@ library and refused with the exact fix on a bad one, and the prompt gets a
 ``<outdir>/prompt-<label>.md`` with the prefix, so the original is never
 modified). ``stdin`` is closed: pi hangs otherwise.
 
+The brief goes in the system prompt: the launcher passes the local prompt
+file with ``--append-system-prompt``, and pi reads that file's contents. Pi
+rebuilds the system prompt every turn and compaction never summarises it,
+so a long run keeps its scope rules and verdict format. The only user message
+points at the brief.
+
+A compaction pilot is off unless ``$AGENTQ_HOME/pilot.json`` names a valid
+extension file. Each label then lands in the ``ext`` arm (the extension is
+loaded with ``-e``) or the ``control`` arm, decided by a hash of the label, so
+a resumed run keeps its arm. The arm is written to ``<outdir>/pilot-arm`` and
+appended to ``$AGENTQ_HOME/pilot_runs.tsv``.
+
 Writes, in ``outdir``:
 
   <outdir>/pi-sessions.tsv          label, session_id, start epoch, model, tier
@@ -51,6 +63,7 @@ path travels through this script; no key is read, logged, or printed.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -71,6 +84,11 @@ from dash.sources import pi as pi_source  # noqa: E402
 from dash.sources.manifests import parent_session_from_pad  # noqa: E402
 
 DEFAULT_MODEL = "river/deepseek-ai/DeepSeek-V4.1-Flash-1017"
+BRIEF_MESSAGE = (
+    "Do the task described in the Task brief in your system prompt. Your final message is the report."
+)
+PILOT_CONFIG = "pilot.json"
+PILOT_RUNS = "pilot_runs.tsv"
 USAGE = "usage: launch_pi.py <label> <workspace> <prompt_file> <outdir> [--model M] [--tier T]"
 
 _UUID = re.compile(
@@ -306,7 +324,17 @@ def report_lines(state: Path, lines) -> None:
         pass
 
 
-def build_argv(label, workspace, prompt_file, outdir, model):
+def brief_args(prompt_file):
+    """Carry the brief in the system prompt. ``prompt_file`` must be an absolute path."""
+    return ["--append-system-prompt", str(prompt_file)]
+
+
+def extension_args(extension):
+    """``-e <path>`` for the pilot's ext arm, nothing for control or no pilot."""
+    return ["-e", str(extension)] if extension else []
+
+
+def build_argv(label, workspace, prompt_file, outdir, model, extension=None):
     """The exact pi command line. ``stdin`` is closed by the caller."""
     return [
         "pi",
@@ -317,8 +345,9 @@ def build_argv(label, workspace, prompt_file, outdir, model):
         str(Path(outdir) / "sessions"),
         "--model",
         model,
-        f"@{prompt_file}",
-        "Do the task in the attached prompt file. Your final message is the report.",
+        *extension_args(extension),
+        *brief_args(prompt_file),
+        BRIEF_MESSAGE,
     ]
 
 
@@ -340,12 +369,13 @@ def resume_source(requested):
         return None
 
 
-def build_resume_argv(session_file, outdir, model):
+def build_resume_argv(session_file, outdir, model, prompt_file, extension=None):
     """Fork the dead run's session into the new pi dir and send the continuation prompt.
 
     ``--fork`` makes a new session from the old one, and ``--session-dir``
     stores that new session under this run's ``sessions/``, so the old run's
-    folder is only read, never appended to.
+    folder is only read, never appended to. The brief rides the system prompt
+    again, so the forked session keeps it.
     """
     return [
         "pi",
@@ -358,8 +388,68 @@ def build_resume_argv(session_file, outdir, model):
         str(Path(outdir) / "sessions"),
         "--model",
         model,
+        *extension_args(extension),
+        *brief_args(prompt_file),
         RESUME_PROMPT,
     ]
+
+
+def agentq_home():
+    """``$AGENTQ_HOME``, else the broker's default state folder."""
+    env = (os.environ.get("AGENTQ_HOME") or "").strip()
+    if env:
+        return Path(env).expanduser()
+    return Path.home() / ".local" / "state" / "agentq"
+
+
+def pilot_config(home):
+    """``(extension path, fraction)`` from ``<home>/pilot.json``, or None when absent or invalid."""
+    try:
+        config = json.loads((Path(home) / PILOT_CONFIG).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(config, dict):
+        return None
+    extension = config.get("compaction_extension")
+    fraction = config.get("fraction")
+    if not isinstance(extension, str) or not os.path.isabs(extension):
+        return None
+    if isinstance(fraction, bool) or not isinstance(fraction, (int, float)) or not 0 <= fraction <= 1:
+        return None
+    path = Path(extension)
+    if not path.is_file():
+        return None
+    return path, float(fraction)
+
+
+def pilot_arm(label, fraction):
+    """``"ext"`` or ``"control"``: a fixed hash bucket of the label, so one label always gets one arm."""
+    bucket = int(hashlib.sha1(label.encode("utf-8")).hexdigest(), 16) % 1000
+    return "ext" if bucket < fraction * 1000 else "control"
+
+
+def pilot_for(label, home):
+    """``(arm, extension path or None)`` for this label, or ``(None, None)`` when no pilot runs."""
+    config = pilot_config(home)
+    if config is None:
+        return None, None
+    extension, fraction = config
+    arm = pilot_arm(label, fraction)
+    return arm, (extension if arm == "ext" else None)
+
+
+def record_pilot(label, arm, outdir, home, started):
+    """Write the arm into the run folder and append one row to pilot_runs.tsv. Best effort."""
+    try:
+        (Path(outdir) / "pilot-arm").write_text(arm + "\n", encoding="utf-8")
+    except OSError:
+        pass
+    try:
+        Path(home).mkdir(parents=True, exist_ok=True)
+        with open(Path(home) / PILOT_RUNS, "a", encoding="utf-8") as fh:
+            fh.write(f"{label}\t{arm}\t{started}\n")
+    except OSError:
+        pass
 
 
 RUN_ENV = "AGENTQ_RUN"
@@ -426,12 +516,15 @@ def main(argv=None):
     register_run_dir(out)
 
     prompt_text = Path(prompt_file).read_text(encoding="utf-8")
-    local_prompt = out / f"prompt-{label}.md"
+    local_prompt = (out / f"prompt-{label}.md").resolve()
     local_prompt.write_text(ensure_label_prefix(prompt_text, label), encoding="utf-8")
 
     stream = out / f"stream-{label}.ndjson"
     err = out / f"err-{label}.log"
     started = int(time.time())
+    arm, extension = pilot_for(label, agentq_home())
+    if arm is not None:
+        record_pilot(label, arm, out, agentq_home(), started)
     run_id = f"running/{label}"
     (out / run_id).write_text(f"{os.getpid()}\t{model}", encoding="utf-8")
     requested = (os.environ.get(RESUME_ENV) or "").strip()
@@ -444,7 +537,7 @@ def main(argv=None):
             se.write(f"resume: {requested} is missing or empty; starting fresh\n")
             se.flush()
         if resume is not None:
-            rc = run_pi(build_resume_argv(resume, out, model), stream, workspace, se)
+            rc = run_pi(build_resume_argv(resume, out, model, local_prompt, extension), stream, workspace, se)
             if pi_refused_resume(rc, stream):
                 se.write(f"resume: pi refused {resume} (exit {rc}, no output); starting fresh\n")
                 se.flush()
@@ -452,7 +545,7 @@ def main(argv=None):
             else:
                 resumed_from = str(resume)
         if resume is None:
-            rc = run_pi(build_argv(label, workspace, local_prompt, out, model), stream, workspace, se)
+            rc = run_pi(build_argv(label, workspace, local_prompt, out, model, extension), stream, workspace, se)
     try:
         os.unlink(out / run_id)
     except FileNotFoundError:
