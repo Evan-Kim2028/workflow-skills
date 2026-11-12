@@ -770,6 +770,44 @@ class OpenRouterFreeAndGrokBuildTest(unittest.TestCase):
         self.assertIsNone(cost("grok-9.9-build", 1, 1, 0, 0))
         self.assertIsNone(cost("muse-wonder-full-1.0", 1, 1, 0, 0))
 
+    def test_provider_prefix_matches_the_catalog_provider_spelling(self):
+        """pi writes ``zai/glm-5.3-flash``; the catalog row is ``glm-5.3-flash``
+        under provider ``z.ai``. The prefix names the provider, so it prices at
+        that row's rate, and the health check, reprice and ingest all agree."""
+        table = catalog()
+        rate = cost("glm-5.3-flash", 1_000_000, 1_000_000, 0, 0, table)
+        self.assertAlmostEqual(rate, 0.65)
+        self.assertTrue(status("zai/glm-5.3-flash")["priced"])
+        self.assertAlmostEqual(cost("zai/glm-5.3-flash", 1_000_000, 1_000_000, 0, 0, table), rate)
+        self.assertAlmostEqual(cost("zai/glm-5.3-flash:high", 1_000_000, 1_000_000, 0, 0, table), rate)
+        # A prefix that names another provider never borrows the z.ai rate.
+        self.assertFalse(status("openai/glm-5.3-flash")["priced"])
+        self.assertIsNone(cost("openai/glm-5.3-flash", 1, 1, 0, 0, table))
+        self.assertFalse(status("zai/glm-9.9-flash")["priced"])
+
+    def test_zai_prefixed_pi_rows_are_not_unpriced_in_the_window(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "dash.sqlite")
+            try:
+                store.add_usage(
+                    {
+                        "ts": 1_700_000_000.0,
+                        "session_id": "s",
+                        "run_id": "generic:s:m1",
+                        "model": "zai/glm-5.3-flash",
+                        "tool": "pi",
+                        "message_id": "m1",
+                        "input": 14_473,
+                        "output": 377,
+                        "cache_read": 0,
+                        "cache_write": 0,
+                        "reasoning": 0,
+                    }
+                )
+                self.assertEqual(store.unpriced_models(1_700_001_000.0, 1_699_913_000.0, 1_700_001_000.0), [])
+            finally:
+                store.close()
+
 
 if __name__ == "__main__":
     unittest.main()

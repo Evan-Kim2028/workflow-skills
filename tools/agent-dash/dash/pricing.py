@@ -550,36 +550,59 @@ def _bare_id(model) -> str | None:
     return bare if bare != model else None
 
 
+def _provider_key(name) -> str:
+    """Provider spelling without punctuation: ``z.ai`` and ``zai`` are one provider."""
+    return re.sub(r"[^a-z0-9]", "", str(name or "").lower())
+
+
+def _provider_row(model: str, get):
+    """The bare row for ``<provider>/<id>`` when the prefix names that row's provider.
+
+    pi writes ``zai/glm-5.3-flash``; the catalog row is ``glm-5.3-flash``
+    under provider ``z.ai``. A prefix that names another provider finds nothing.
+    """
+    if not isinstance(model, str):
+        return None
+    provider, sep, bare = model.partition("/")
+    if not sep or not bare:
+        return None
+    hit = get(bare)
+    if hit is None or _provider_key(hit.get("provider")) != _provider_key(provider):
+        return None
+    return hit
+
+
 def _lookup(model, table):
     if not model:
         return None
     if isinstance(table, dict):
-        hit = table.get(model)
-        if hit is None:
-            bare = _bare_id(model)
-            hit = table.get(bare) if bare is not None else None
-        return hit
-    memo = _index_memo.get(id(table))
-    if memo is None or memo[0] is not table:
-        index: dict = {}
-        for row in table:
-            index.setdefault(row.get("model"), row)
-        with _lock:
-            if len(_index_memo) >= _INDEX_LIMIT:
-                _index_memo.clear()
-            _index_memo[id(table)] = (table, index)
-        memo = (table, index)
-    try:
-        hit = memo[1].get(model)
-    except TypeError:
-        return None
+        get = table.get
+    else:
+        memo = _index_memo.get(id(table))
+        if memo is None or memo[0] is not table:
+            index: dict = {}
+            for row in table:
+                index.setdefault(row.get("model"), row)
+            with _lock:
+                if len(_index_memo) >= _INDEX_LIMIT:
+                    _index_memo.clear()
+                _index_memo[id(table)] = (table, index)
+            memo = (table, index)
+        get = memo[1].get
+
+    def fetch(key):
+        try:
+            return get(key)
+        except TypeError:
+            return None
+
+    hit = fetch(model)
     if hit is None:
         bare = _bare_id(model)
         if bare is not None:
-            try:
-                hit = memo[1].get(bare)
-            except TypeError:
-                hit = None
+            hit = fetch(bare)
+    if hit is None:
+        hit = _provider_row(_bare_id(model) or model, fetch)
     return hit
 
 
