@@ -217,32 +217,57 @@ class SubmitWaitTests(ProcessCleanup):
     def test_store_is_wal_with_schema(self):
         conn = db.connect(self.home)
         self.assertEqual(conn.execute("PRAGMA journal_mode").fetchone()[0], "wal")
-        self.assertEqual(conn.execute("PRAGMA busy_timeout").fetchone()[0], 5000)
+        self.assertEqual(conn.execute("PRAGMA busy_timeout").fetchone()[0], db.BUSY_TIMEOUT_MS)
         self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], db.SCHEMA_VERSION)
 
     def test_concurrent_submits_from_several_processes_lose_nothing(self):
+        """8 submitting processes x 25 submits, while a broker ticks in a thread."""
+        processes, per_process = 8, 25
         script = (
-            "import sys; sys.path.insert(0, sys.argv[1]); from agentq import cli; import io\n"
-            "tag = sys.argv[2]; prompt = sys.argv[3]; home = sys.argv[4]\n"
+            "import sys, io; sys.path.insert(0, sys.argv[1]); from agentq import cli\n"
+            "tag, prompt, home = sys.argv[2], sys.argv[3], sys.argv[4]\n"
             "env = {'AGENTQ_HOME': home, 'AGENTQ_SESSION': tag, 'PATH': '/usr/bin:/bin'}\n"
-            "for j in range(10):\n"
+            f"for j in range({per_process}):\n"
             "    out = io.StringIO()\n"
             "    code = cli.main(['submit', prompt, '--label', f'{tag}-{j}'], env=env, out=out)\n"
-            "    assert code == 0, out.getvalue()\n"
+            "    if code != 0:\n"
+            "        sys.exit(f'exit {code}: ' + out.getvalue())\n"
         )
+        broker = make_broker(self.home, self.fake(live_s=0))
+        stop = threading.Event()
+        tick_errors = []
+
+        def ticker():
+            while not stop.is_set():
+                try:
+                    broker.tick()
+                except Exception as exc:  # recorded and asserted empty below
+                    tick_errors.append(repr(exc))
+                time.sleep(0.01)
+
+        thread = threading.Thread(target=ticker, daemon=True)
+        thread.start()
         procs = [
             subprocess.Popen(
                 [sys.executable, "-c", script, str(ROOT), f"w{i}", str(self.prompt), str(self.home)],
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-            )
-            for i in range(4)
+            )  # fmt: skip
+            for i in range(processes)
         ]
-        for proc in procs:
-            _, err = proc.communicate(timeout=60)
+        try:
+            results = [proc.communicate(timeout=240) for proc in procs]
+        finally:
+            stop.set()
+            thread.join(30)
+        for proc, (_, err) in zip(procs, results):
             self.assertEqual(proc.returncode, 0, err)
-        jobs = db.select_jobs(db.connect(self.home))
-        self.assertEqual(len(jobs), 40)
-        self.assertEqual(len({job["id"] for job in jobs}), 40)
+        self.assertEqual(tick_errors, [])
+        conn = db.connect(self.home)
+        jobs = db.select_jobs(conn)
+        self.assertEqual(len(jobs), processes * per_process)
+        self.assertEqual(len({job["id"] for job in jobs}), processes * per_process)
+        submits = conn.execute("SELECT COUNT(*) FROM events WHERE kind = 'submit'").fetchone()[0]
+        self.assertEqual(submits, processes * per_process)
 
 
 class LaneAndSlotTests(ProcessCleanup):
