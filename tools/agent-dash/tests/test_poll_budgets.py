@@ -161,8 +161,8 @@ class WatchdogTests(unittest.TestCase):
         entry = body["sources"][0]
         self.assertEqual(
             set(entry),
-            {"name", "last_poll", "last_error", "lag_s", "last_duration_s", "interval_s", "stalled",
-             "state", "started_at"},
+            {"name", "last_poll", "last_error", "lag_s", "last_duration_s", "interval_s",
+             "effective_interval_s", "idle", "stalled", "state", "started_at"},
         )
         self.assertTrue(entry["stalled"])
         self.assertIsNotNone(entry["last_duration_s"])

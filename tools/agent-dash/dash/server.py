@@ -337,6 +337,20 @@ class DashServer(ThreadingHTTPServer):
         self._disconnects_lock = threading.Lock()
         super().__init__((host, port), Handler)
 
+    def process_request(self, request, client_address):
+        """Every accepted connection is served activity for the source runner's idle mode."""
+        self._registry_call("note_activity")
+        super().process_request(request, client_address)
+
+    def _registry_call(self, name: str, *args) -> None:
+        """Call an optional registry hook (test doubles may lack it). Never raises."""
+        hook = getattr(self.registry, name, None)
+        if callable(hook):
+            try:
+                hook(*args)
+            except Exception:
+                pass
+
     def warm(self) -> None:
         """Fill the hot caches off the request path, in a daemon thread.
 
@@ -1567,6 +1581,14 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.send_header("Connection", "close")
         self.end_headers()
+        # An open stream keeps the source runner out of idle mode until it closes.
+        self.server._registry_call("stream_opened")
+        try:
+            self._stream_ticks()
+        finally:
+            self.server._registry_call("stream_closed")
+
+    def _stream_ticks(self):
         interval = self.server.stream_interval
         while not self.server.stop.is_set():
             now = time.time()
