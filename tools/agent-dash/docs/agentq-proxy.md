@@ -1,6 +1,6 @@
 # agentq proxy: Morph rate governor
 
-`agentq/proxy.py` is a local HTTP proxy on `127.0.0.1:8790` between pi and
+`agentq/proxy.py` is a local HTTP proxy on `127.0.0.1:18790` between pi and
 `api.morphllm.com`. It admits each request only when every Morph budget the
 request touches has room under its learned target. Requests that do not fit
 wait in lane queues (urgent, normal, backlog). Upstream 429s are retried inside
@@ -60,7 +60,7 @@ A request that is already streaming upstream is not cancelled.
 
 ## Status and minute table
 
-- `GET http://127.0.0.1:8790/agentq/status` returns JSON: per budget `limit`,
+- `GET http://127.0.0.1:18790/agentq/status` returns JSON: per budget `limit`,
   `target_frac`, `used_60s` and `queued` per lane, plus `saturated` (a request
   waited more than 2 s in the last minute or is waiting now).
 - Each model and minute has one `proxy_minutes` row (created if missing, WAL,
@@ -75,7 +75,7 @@ A request that is already streaming upstream is not cancelled.
 `drain_s` (20) and `budgets`. Environment variables:
 
 - `AGENTQ_HOME` (default `~/.local/state/agentq`)
-- `AGENTQ_PROXY_PORT` (default 8790)
+- `AGENTQ_PROXY_PORT` (default 18790)
 - `AGENTQ_UPSTREAM` (default `https://api.morphllm.com/v1`)
 - `AGENTQ_UPSTREAM_KEY` replaces the Keychain lookup. Use it for tests only.
 
