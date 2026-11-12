@@ -426,6 +426,14 @@ class SourceTest(unittest.TestCase):
         self.assertEqual(run["status"], "died_early")
         self.assertEqual(run["verdict"], "BLOCKED")
 
+    def test_legacy_bare_quota_file_naming_this_label_still_blocks_it(self):
+        self.write_tsv([["ws15-exec-legacy", SID, 1792000000, DEEPSEEK]])
+        (self.pad / "QUOTA").write_text("model\t%s\nlabel\tws15-exec-legacy\n" % DEEPSEEK, encoding="utf-8")
+        self.poll()
+        run = self.store.runs[self.run_id("ws15-exec-legacy")]
+        self.assertEqual(run["status"], "died_early")
+        self.assertEqual(run["verdict"], "BLOCKED")
+
     def test_quota_marker_for_a_sibling_label_does_not_block_this_run(self):
         self.write_tsv([["ws15-exec-quota3", SID, 1792000000, DEEPSEEK]])
         (self.pad / "QUOTA-ws15-exec-sibling").write_text(

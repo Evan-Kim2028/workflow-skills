@@ -53,13 +53,16 @@ launcher with ``AGENT_DASH_PI_ENV_FILE`` set to that path, so the launcher
 sources the standby credential instead of the primary one. The path is
 only passed through; no key is ever read or printed here.
 
-Caps count live workers per base model, not per tier name: tiers that run
-one model (``pi-deepseek-flash`` and ``pi-deepseek-flash-low`` both run
-``morph/morph-dsv41flash-1017``; a ``:<level>`` suffix is a thinking level and
-is stripped) share one pool. The limit is the strictest of the enabled tiers'
-``cap`` values and the registry's optional ``model_caps`` entry for the model.
-A named tier at its limit gets ``STATUS: failed reason=none-available`` at
-once, the same answer ``auto`` gives when nothing is eligible; nothing waits.
+Two caps gate a launch. The pool is the live workers of one base model across
+every tier that runs it (``pi-deepseek-flash`` and ``pi-deepseek-flash-low``
+both run ``morph/morph-dsv41flash-1017``; a ``:<level>`` suffix is a thinking
+level and is stripped). Its limit is the registry's ``model_caps`` entry for
+the model when it has one, else the largest enabled tier ``cap`` among those
+tiers, so a smaller tier's cap never throttles a bigger one. The tier is its
+own pattern's live count against its own ``cap``. A launch is refused when
+either is full. A named tier at its limit gets
+``STATUS: failed reason=none-available`` at once, the same answer ``auto``
+gives when nothing is eligible; nothing waits.
 
 Prints one line:
 STATUS: running|done|failed out=<report> err=<stderr> tier=<name> [reason=...]
@@ -554,10 +557,12 @@ def pick_initial(ctx):
         return None, "unknown-tier"
     if not worker.get("enabled", True):
         return None, "disabled"
-    live, limit = model_capacity(ctx, base_model(worker.get("model")))
-    if limit is not None and live >= limit:
+    block = cap_block(ctx, worker)
+    if block is not None:
+        which, live, limit = block
         print(
-            f"cap: {name} is full ({live} live of {limit} for {base_model(worker.get('model'))}); not launching",
+            f"cap: {name} is full: its {which} is at {live} of {limit} "
+            f"for {base_model(worker.get('model'))}; not launching",
             file=sys.stderr,
         )
         return None, "none-available"
@@ -754,8 +759,7 @@ def eligible(ctx, skip):
             continue
         if _int_or_none(worker.get("cap")) is None:
             continue
-        live, limit = model_capacity(ctx, base_model(worker.get("model")))
-        if live >= limit:
+        if cap_block(ctx, worker) is not None:
             continue
         return launch_name
     return None
@@ -793,14 +797,16 @@ def model_caps(registry) -> dict:
     return found
 
 
-def model_capacity(ctx, model):
-    """``(live, limit)`` for one base model shared by one or more tiers.
+def pool_capacity(ctx, model):
+    """``(live, limit)`` for the pool of one base model shared by one or more tiers.
 
     ``live`` counts every live worker of the model across all tiers that run
     it, through one pgrep over the union of their patterns, so a process two
-    patterns both match counts once. ``limit`` is the strictest cap that
-    applies: the lowest ``cap`` of the enabled tiers for this model and the
-    model's ``model_caps`` entry, or None when nothing caps it.
+    patterns both match counts once. ``limit`` is the model's ``model_caps``
+    entry when it has one. Without an entry it is the largest ``cap`` among
+    the enabled tiers for the model, so the tiers cannot sum past the bigger
+    cap and a smaller tier's cap never throttles the bigger one. None when
+    nothing caps the pool.
     """
     registry = ctx["registry"]
     patterns = []
@@ -814,14 +820,33 @@ def model_capacity(ctx, model):
         cap = _int_or_none(worker.get("cap"))
         if worker.get("enabled", True) and cap is not None:
             caps.append(cap)
-    model_cap = model_caps(registry).get(model)
-    if model_cap is not None:
-        caps.append(model_cap)
+    pinned = model_caps(registry)
+    limit = pinned[model] if model in pinned else (max(caps) if caps else None)
     if not patterns:
-        return 0, (min(caps) if caps else None)
+        return 0, limit
     union = patterns[0] if len(patterns) == 1 else "|".join(f"({p})" for p in patterns)
-    live = ctx["hooks"]["pgrep"](union)
-    return live, (min(caps) if caps else None)
+    return ctx["hooks"]["pgrep"](union), limit
+
+
+def cap_block(ctx, worker):
+    """Why a launch of ``worker`` is refused by a cap, or None when it may launch.
+
+    The pool check comes first: the model's live workers across every sharing
+    tier must stay below ``pool_capacity``'s limit. Then the tier check: this
+    tier's own pattern count must stay below its own ``cap``. Returns
+    ``(which, live, limit)`` with ``which`` of ``"pool"`` or ``"tier"``.
+    """
+    live, limit = pool_capacity(ctx, base_model(worker.get("model")))
+    if limit is not None and live >= limit:
+        return "pool", live, limit
+    cap = _int_or_none(worker.get("cap"))
+    if cap is None:
+        return None
+    pattern = worker.get("pgrep") or ""
+    own = ctx["hooks"]["pgrep"](pattern) if pattern else 0
+    if own >= cap:
+        return "tier", own, cap
+    return None
 
 
 def model_priced(worker) -> bool:
@@ -929,7 +954,9 @@ def quota_file_hit(ctx) -> bool:
     not an empty report). The name is per run, so runs sharing an outdir
     each keep their own marker. Only a marker naming this label and written
     after this attempt's tier file counts, so a previous attempt's marker
-    never cools this launch.
+    never cools this launch. The bare ``pi/QUOTA`` file that launchers
+    wrote before the per-label name is still read, matched on its label
+    line the same way, so a pi run started before the change is seen.
     """
     label = ctx.get("label") or ""
     try:
@@ -940,6 +967,7 @@ def quota_file_hit(ctx) -> bool:
     candidates = [
         base / f"QUOTA-{label}",
         base / "pi" / f"QUOTA-{label}",
+        base / "pi" / "QUOTA",
         base / "codex" / f"QUOTA-{label}",
     ]
     for path in candidates:

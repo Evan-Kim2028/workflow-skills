@@ -256,7 +256,7 @@ def _looks_like_pi_dir(path):
         names = os.listdir(path)
     except OSError:
         return False
-    if any(name.startswith("QUOTA-") for name in names):
+    if "QUOTA" in names or any(name.startswith("QUOTA-") for name in names):
         return True
     if "sessions" in names and os.path.isdir(os.path.join(path, "sessions")):
         return True
@@ -665,30 +665,32 @@ def _process_apply(store, run, processes):
 
 
 def _quota(pad, label, out_path, err_path, sid) -> bool:
-    """True when this run's ``QUOTA-<label>`` marker or a quota log names its failure.
+    """True when this run's quota marker or a quota log names its failure.
 
-    The marker is per label, so runs sharing a ``pi/`` outdir each keep their
-    own. Cached on (path, size, mtime_ns) so a quiet run does not re-open and
-    regex-scan its logs every 2 s across 140+ live runs.
+    The marker is ``QUOTA-<label>``, per label, so runs sharing a ``pi/``
+    outdir each keep their own. The bare ``QUOTA`` file that launchers wrote
+    before that name is still read, with the same text test, so a run started
+    before the change is seen. Cached on (path, size, mtime_ns) so a quiet
+    run does not re-open and regex-scan its logs every 2 s across 140+ live runs.
     """
-    quota_path = os.path.join(pad, f"QUOTA-{label}")
-    try:
-        st = os.stat(quota_path)
-        sig = (st.st_size, st.st_mtime_ns)
-        hit = _quota_cache.get(quota_path)
-        if hit is not None and hit[0] == sig:
-            cached_text = hit[1]
-        else:
-            try:
-                with open(quota_path, "r", encoding="utf-8") as fh:
-                    cached_text = fh.read(4096)
-            except OSError:
-                cached_text = ""
-            _quota_cache[quota_path] = (sig, cached_text)
-        if not cached_text.strip() or (isinstance(label, str) and label in cached_text) or (isinstance(sid, str) and sid in cached_text):
-            return True
-    except OSError:
-        pass
+    for quota_path in (os.path.join(pad, f"QUOTA-{label}"), os.path.join(pad, "QUOTA")):
+        try:
+            st = os.stat(quota_path)
+            sig = (st.st_size, st.st_mtime_ns)
+            hit = _quota_cache.get(quota_path)
+            if hit is not None and hit[0] == sig:
+                cached_text = hit[1]
+            else:
+                try:
+                    with open(quota_path, "r", encoding="utf-8") as fh:
+                        cached_text = fh.read(4096)
+                except OSError:
+                    cached_text = ""
+                _quota_cache[quota_path] = (sig, cached_text)
+            if not cached_text.strip() or (isinstance(label, str) and label in cached_text) or (isinstance(sid, str) and sid in cached_text):
+                return True
+        except OSError:
+            pass
     for path in (err_path, out_path):
         if not path:
             continue
