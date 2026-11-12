@@ -16,6 +16,7 @@ ROOT = HERE.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 from dash.caps import PgrepFailed, anchored  # noqa: E402
+from agentq import cli, db  # noqa: E402
 SID = "11111111-1111-4111-8111-111111111111"
 NOW = 1_700_000_000.0
 
@@ -1071,6 +1072,134 @@ class RunWorkerTests(unittest.TestCase):
         code, line = self.go("muse", launch, label="ws1-exec-lane-1")
         self.assertEqual(len(launch.cmds), 1, "second call must observe, not relaunch")
         self.assertTrue(line.startswith("STATUS: done"), line)
+
+
+class DirectQueueTests(unittest.TestCase):
+    """A direct launch yields to ready queued jobs for the same model while the broker is alive."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.ws = self.root / "ws"
+        self.ws.mkdir()
+        self.prompt = self.root / "prompt.md"
+        self.prompt.write_text("do the task\n", encoding="utf-8")
+        self.run_dir = self.root / "runs"
+        self.home = self.root / "agentq"
+        self.home.mkdir()
+        self.reg = self.root / "workers.json"
+        self.reg.write_text(json.dumps(registry()), encoding="utf-8")
+        self.saved = {
+            key: os.environ.get(key)
+            for key in ("AGENT_DASH_WORKERS", "AGENT_DASH_STATE_DIR", "AGENT_DASH_SCRATCH_ROOT", "AGENTQ_HOME", "AGENTQ_JOB")
+        }
+        os.environ["AGENT_DASH_WORKERS"] = str(self.reg)
+        os.environ["AGENT_DASH_STATE_DIR"] = str(self.root / "state")
+        os.environ["AGENT_DASH_SCRATCH_ROOT"] = str(self.root / "scratch")
+        os.environ["AGENTQ_HOME"] = str(self.home)
+        os.environ.pop("AGENTQ_JOB", None)
+
+    def tearDown(self):
+        for key, value in self.saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        self.tmp.cleanup()
+
+    def heartbeat(self, at=NOW):
+        (self.home / "broker.heartbeat").write_text(f"{at}\n", encoding="utf-8")
+
+    def queue(self, tier, label, not_before=0.0):
+        out = io.StringIO()
+        env = {"AGENTQ_HOME": str(self.home), "AGENTQ_SESSION": "sess-q", "PATH": os.environ["PATH"]}
+        code = cli.main(["submit", str(self.prompt), "--label", label, "--tier", tier], env=env, out=out, now=lambda: NOW)
+        self.assertEqual(code, 0, out.getvalue())
+        conn = db.connect(self.home)
+        conn.execute("UPDATE jobs SET not_before = ? WHERE label = ?", (not_before, label))
+        conn.close()
+
+    def launch(self, tier, launch=None, label="ws1-plan-lane-1"):
+        launch = launch or Launch()
+        argv = [tier, label, str(self.ws), str(self.prompt), str(self.run_dir), "0", "--no-preflight"]
+        out = io.StringIO()
+        err = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = runner.run(
+                argv,
+                spawn=launch.spawn,
+                pgrep=lambda _pattern: 0,
+                sleep=lambda _s: None,
+                now=lambda: NOW,
+                alive=launch.is_alive,
+                new_uuid=lambda: SID,
+            )
+        return code, out.getvalue().strip(), err.getvalue(), launch
+
+    def test_fresh_heartbeat_and_ready_job_for_the_same_model_refuse_a_direct_launch(self):
+        self.heartbeat()
+        self.queue("muse", "queued-muse")
+        code, line, err, launch = self.launch("muse")
+        self.assertEqual(code, 0)
+        self.assertIn("reason=none-available", line)
+        self.assertEqual(launch.cmds, [])
+        self.assertIn("agentq queue has 1 waiting job(s) for this model; queue first", err)
+
+    def test_a_job_on_another_tier_of_the_same_model_also_refuses(self):
+        self.heartbeat()
+        self.queue("pi-deepseek", "queued-sibling")
+        code, line, _err, launch = self.launch("pi-deepseek-flash")
+        self.assertIn("reason=none-available", line)
+        self.assertEqual(launch.cmds, [])
+
+    def test_auto_skips_a_tier_whose_model_has_a_ready_queued_job(self):
+        self.heartbeat()
+        self.queue("muse", "queued-muse")
+        code, line, _err, launch = self.launch("auto")
+        self.assertEqual(code, 0)
+        self.assertIn("tier=glm-flash", line)
+        self.assertEqual(len(launch.cmds), 1)
+
+    def test_stale_heartbeat_allows_the_direct_launch(self):
+        self.heartbeat(at=NOW - 121)
+        self.queue("muse", "queued-muse")
+        code, line, _err, launch = self.launch("muse")
+        self.assertIn("STATUS: done", line)
+        self.assertEqual(len(launch.cmds), 1)
+
+    def test_missing_database_allows_the_direct_launch(self):
+        self.heartbeat()
+        code, line, _err, launch = self.launch("muse")
+        self.assertIn("STATUS: done", line)
+        self.assertEqual(len(launch.cmds), 1)
+
+    def test_job_not_yet_ready_allows_the_direct_launch(self):
+        self.heartbeat()
+        self.queue("muse", "queued-later", not_before=NOW + 60)
+        code, line, _err, launch = self.launch("muse")
+        self.assertIn("STATUS: done", line)
+        self.assertEqual(len(launch.cmds), 1)
+
+    def test_job_for_a_different_model_allows_the_direct_launch(self):
+        self.heartbeat()
+        self.queue("deepseek-flash", "queued-other")
+        code, line, _err, launch = self.launch("muse")
+        self.assertIn("STATUS: done", line)
+        self.assertEqual(len(launch.cmds), 1)
+
+    def test_broker_launched_run_is_never_held_by_the_queue(self):
+        self.heartbeat()
+        self.queue("muse", "queued-muse")
+        os.environ["AGENTQ_JOB"] = "job-from-broker"
+        code, line, _err, launch = self.launch("muse")
+        self.assertIn("STATUS: done", line)
+        self.assertEqual(len(launch.cmds), 1)
+
+    def test_empty_queue_leaves_a_direct_launch_unchanged(self):
+        self.heartbeat()
+        code, line, _err, launch = self.launch("muse")
+        self.assertIn("STATUS: done", line)
+        self.assertEqual(len(launch.cmds), 1)
 
 
 class PreflightTests(unittest.TestCase):

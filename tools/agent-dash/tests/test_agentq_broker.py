@@ -322,7 +322,7 @@ class LaneAndSlotTests(ProcessCleanup):
         broker = make_broker(self.home, launcher, proxy=lambda: dict(status))
         self.assertEqual(broker.tick(), [first])
         status["saturated"] = True
-        second = submit(self.env, self.prompt, label="second")
+        second = submit(self.env, self.prompt, "--backlog", label="second")
         self.assertEqual(broker.tick(), [])
         self.assertEqual(row(self.home, first)["state"], "running")
         self.assertEqual(row(self.home, second)["state"], "queued")
@@ -667,12 +667,23 @@ class ReviewFixTests(ProcessCleanup):
         job = row(self.home, job_id)
         self.assertEqual((job["state"], job["rate_attempts"], job["attempt"]), ("queued", 1, 1))
 
-    def test_10_saturated_proxy_still_launches_urgent_jobs(self):
+    def test_10_saturated_proxy_holds_only_backlog_jobs(self):
+        backlog = submit(self.env, self.prompt, "--backlog", label="b")
         normal = submit(self.env, self.prompt, label="n")
         urgent = submit(self.env, self.prompt, "--urgent", label="u")
         broker = make_broker(self.home, self.fake(live_s=30), proxy=lambda: {"saturated": True})
-        self.assertEqual(broker.tick(), [urgent])
-        self.assertEqual(row(self.home, normal)["state"], "queued")
+        self.assertEqual(sorted(broker.tick()), sorted([normal, urgent]))
+        self.assertEqual(row(self.home, normal)["state"], "running")
+        self.assertEqual(row(self.home, urgent)["state"], "running")
+        self.assertEqual(row(self.home, backlog)["state"], "queued")
+
+    def test_tick_writes_the_broker_heartbeat_atomically(self):
+        before = time.time()
+        make_broker(self.home, self.fake()).tick()
+        beat = float((self.home / "broker.heartbeat").read_text(encoding="utf-8"))
+        self.assertGreaterEqual(beat, before - 1)
+        self.assertLessEqual(beat, time.time() + 1)
+        self.assertFalse((self.home / "broker.heartbeat.tmp").exists())
 
     def test_11_max_runtime_kills_the_worker_and_fails_the_job(self):
         job_id = submit(self.env, self.prompt, "--max-runtime", "5", label="slow")
