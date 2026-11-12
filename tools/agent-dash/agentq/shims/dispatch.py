@@ -9,7 +9,7 @@ Gated runs:
 
 - ``ssh``: only when the target host is in ``shims.ssh_gated_hosts`` of
   ``broker.json`` (no default: the production host aliases are set locally, so
-  they stay out of the repo). Others, such as git over ssh to github.com, exec
+  they stay out of the repo). Every run rewrites ``slots/ssh_hosts`` for the sh fast path. Others, such as git over ssh to github.com, exec
   the real ssh untouched. Takes an ``ssh`` slot.
 - ``pytest``: ``pytest``, ``python[3] -m pytest``, ``uv run pytest`` and
   ``uv run python[3] -m pytest``. Takes a ``pytest`` slot, then runs the real
@@ -38,7 +38,6 @@ if str(ROOT) not in sys.path:
 
 from agentq import db, slots  # noqa: E402
 
-DEFAULT_GATED_HOSTS: tuple[str, ...] = ()
 PYTEST_MEMCAP_MB = 8192
 PYTHON_NAMES = ("python", "python3")
 SSH_VALUE_FLAGS = frozenset("BbcDEeFIiJLlmOoPpQRSWw")
@@ -112,15 +111,6 @@ def ssh_gated(args, patterns) -> bool:
     """True when the ssh argv targets a host matching one of ``patterns`` (shell-style globs)."""
     host = ssh_host(args)
     return host is not None and any(fnmatch.fnmatchcase(host, pattern.lower()) for pattern in patterns)
-
-
-def gated_hosts(home) -> tuple[str, ...]:
-    """``shims.ssh_gated_hosts`` from ``broker.json``, or the default production aliases."""
-    shims = slots.read_broker_json(home).get("shims")
-    hosts = shims.get("ssh_gated_hosts") if isinstance(shims, dict) else None
-    if isinstance(hosts, list) and all(isinstance(host, str) for host in hosts):
-        return tuple(hosts)
-    return DEFAULT_GATED_HOSTS
 
 
 def is_pytest(name: str, args) -> bool:
@@ -221,7 +211,8 @@ def main(argv, environ=None) -> int:
         return 127
     home = db.home_dir(environ)
     command = [real, *args]
-    if name == "ssh" and ssh_gated(args, gated_hosts(home)):
+    slots.write_ssh_hosts(home)
+    if name == "ssh" and ssh_gated(args, slots.gated_hosts(home)):
         return run_gated("ssh", command, environ, home)
     if is_pytest(name, args):
         return run_gated("pytest", command, environ, home)

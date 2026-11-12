@@ -30,6 +30,8 @@ from typing import Callable, Optional, Protocol
 from agentq import broker
 
 KINDS = ("ssh", "pytest")
+DEFAULT_GATED_HOSTS: tuple[str, ...] = ()
+SSH_HOSTS_FILE = "ssh_hosts"
 PYTEST_CEILING = 16
 MAX_WAIT_S = 1800.0
 BACKOFF_MIN_S = 0.5
@@ -115,6 +117,34 @@ def load_limits(home) -> Limits:
         max_load_per_cpu=float(adaptive["tests_max_load_per_cpu"]),
         gauge_ttl_s=float(adaptive["gauge_ttl_s"]),
     )
+
+
+def gated_hosts(home) -> tuple[str, ...]:
+    """``shims.ssh_gated_hosts`` from ``broker.json``, or ``DEFAULT_GATED_HOSTS`` (empty) when unset."""
+    shims = read_broker_json(home).get("shims")
+    hosts = shims.get("ssh_gated_hosts") if isinstance(shims, dict) else None
+    if isinstance(hosts, list) and all(isinstance(host, str) for host in hosts):
+        return tuple(hosts)
+    return DEFAULT_GATED_HOSTS
+
+
+def ssh_hosts_path(home) -> Path:
+    """The file the sh ssh shim greps: one gated host pattern per line."""
+    return Path(home) / "slots" / SSH_HOSTS_FILE
+
+
+def write_ssh_hosts(home) -> Path:
+    """Write the gated host patterns to ``ssh_hosts_path`` (empty file when none). Atomic; best effort."""
+    path = ssh_hosts_path(home)
+    text = "".join(f"{host.lower()}\n" for host in gated_hosts(home))
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+        tmp.write_text(text, encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError:
+        pass
+    return path
 
 
 def kind_limit(limits: Limits, kind: str) -> int:

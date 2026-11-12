@@ -78,6 +78,7 @@ ROOT = HERE.parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from agentq import slots as agentq_slots  # noqa: E402
 from dash import labels as label_lib  # noqa: E402
 from dash import logfilter  # noqa: E402
 from dash.sources import pi as pi_source  # noqa: E402
@@ -529,6 +530,7 @@ def main(argv=None):
 
     set_run_label(label)
     shim_environ(os.environ)
+    agentq_slots.write_ssh_hosts(agentq_home())
     out = Path(outdir)
     out.mkdir(parents=True, exist_ok=True)
     (out / "running").mkdir(parents=True, exist_ok=True)

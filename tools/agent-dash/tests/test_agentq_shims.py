@@ -262,9 +262,9 @@ class HostParsingTests(unittest.TestCase):
     def test_no_host_is_gated_until_the_local_config_lists_one(self):
         home = Path(tempfile.mkdtemp())
         try:
-            self.assertEqual(dispatch.DEFAULT_GATED_HOSTS, ())
-            self.assertEqual(dispatch.gated_hosts(home), ())
-            self.assertFalse(dispatch.ssh_gated(["prod-box"], dispatch.gated_hosts(home)))
+            self.assertEqual(slots.DEFAULT_GATED_HOSTS, ())
+            self.assertEqual(slots.gated_hosts(home), ())
+            self.assertFalse(dispatch.ssh_gated(["prod-box"], slots.gated_hosts(home)))
         finally:
             shutil.rmtree(home)
 
@@ -273,9 +273,9 @@ class HostParsingTests(unittest.TestCase):
         try:
             (home / "broker.json").write_text(json.dumps({"shims": {"ssh_gated_hosts": ["box-*"]}}),
                                               encoding="utf-8")
-            self.assertEqual(dispatch.gated_hosts(home), ("box-*",))
-            self.assertTrue(dispatch.ssh_gated(["box-7"], dispatch.gated_hosts(home)))
-            self.assertFalse(dispatch.ssh_gated(["prod-box"], dispatch.gated_hosts(home)))
+            self.assertEqual(slots.gated_hosts(home), ("box-*",))
+            self.assertTrue(dispatch.ssh_gated(["box-7"], slots.gated_hosts(home)))
+            self.assertFalse(dispatch.ssh_gated(["prod-box"], slots.gated_hosts(home)))
         finally:
             shutil.rmtree(home)
 
@@ -305,7 +305,8 @@ class RealBinaryTests(Base):
 
     def test_missing_real_binary_exits_127_from_the_shell_shim(self):
         result = subprocess.run([str(SHIMS / "ssh"), "-V"], env={"PATH": str(SHIMS),
-                                                                 "AGENTQ_SHIM_PYTHON": sys.executable},
+                                                                 "AGENTQ_SHIM_PYTHON": sys.executable,
+                                                                 "AGENTQ_HOME": str(self.home)},
                                 capture_output=True, text=True, timeout=30)
         self.assertEqual(result.returncode, 127)
         self.assertIn("no real `ssh`", result.stderr)
@@ -353,13 +354,17 @@ class ShimEndToEndTests(Base):
         self.assertFalse((self.home / "slots" / "pytest").exists())
 
     def test_gated_ssh_holds_an_ssh_slot_and_returns_the_exit_code(self):
+        env = self.shim_env()
+        slots.write_ssh_hosts(self.home)
         record = self.bin / "ssh-argv"
         self.fake_binary("ssh", f'printf "%s\\n" "$@" > "{record}"\nexit 5\n')
         result = subprocess.run([str(SHIMS / "ssh"), "-o", "BatchMode=yes", "prod-box", "uptime"],
-                                env=self.shim_env(), capture_output=True, text=True, timeout=60)
+                                env=env, capture_output=True, text=True, timeout=60)
         self.assertEqual(result.returncode, 5)
         self.assertEqual(record.read_text().split(), ["-o", "BatchMode=yes", "prod-box", "uptime"])
+        self.assertTrue((self.home / "slots" / "ssh").is_dir())
         self.assertEqual(slots.holders(self.home, "ssh", 8), [])
+        self.assertEqual((self.home / "slots" / "ssh_hosts").read_text(), "prod-box\n")
         self.assertTrue((self.home / "slots" / "ssh").is_dir())
 
     def test_ungated_ssh_is_exec_d_without_a_slot(self):
@@ -411,6 +416,103 @@ class SlotsCommandTests(Base):
         self.assertIn("ws2-exec-z", "\n".join(text))
         self.assertTrue(text[-1].startswith("ANSWER: "))
         self.assertIn("pytest 1/16", text[-1])
+
+
+class ShellFastPathTests(Base):
+    """The sh fast path: only pytest argv reaches dispatch.py, and ssh reaches it only for listed hosts."""
+
+    def copied_shims(self):
+        folder = self.bin / "shims-copy"
+        folder.mkdir()
+        for name in ("python", "python3", "uv", "ssh", "pytest", "shim-lib.sh"):
+            shutil.copy(SHIMS / name, folder / name)
+        marker = self.home / "dispatch-ran"
+        (folder / "dispatch.py").write_text(
+            "import sys\nopen(%r, 'a').write(repr(sys.argv[1:]) + chr(10))\n" % str(marker), encoding="utf-8")
+        return folder, marker
+
+    def run_shim(self, folder, name, args, extra=None):
+        env = self.shim_env(extra)
+        env["PATH"] = os.pathsep.join([str(folder), str(self.bin), "/usr/bin", "/bin"])
+        return subprocess.run([str(folder / name), *args], env=env, capture_output=True, text=True, timeout=60)
+
+    def test_non_pytest_python_never_runs_dispatch(self):
+        folder, marker = self.copied_shims()
+        record = self.bin / "argv"
+        self.fake_binary("python3", f'printf "%s\\n" "$@" > "{record}"\nexit 4\n')
+        result = self.run_shim(folder, "python3", ["-c", "pass"])
+        self.assertEqual(result.returncode, 4)
+        self.assertEqual(record.read_text().split(), ["-c", "pass"])
+        self.assertFalse(marker.exists())
+
+    def test_pytest_words_anywhere_in_argv_reach_dispatch(self):
+        folder, marker = self.copied_shims()
+        for name, args in (("python3", ["-m", "pytest", "x.py"]), ("python", ["-m", "pytest"]),
+                           ("uv", ["run", "pytest", "-q"]), ("pytest", ["-q"])):
+            with self.subTest(name=name, args=args):
+                marker.unlink(missing_ok=True)
+                self.run_shim(folder, name, args)
+                self.assertTrue(marker.exists())
+        marker.unlink(missing_ok=True)
+        self.run_shim(folder, "uv", ["sync"])
+        self.assertFalse(marker.exists())
+
+    def test_shell_shim_refuses_to_recurse_into_itself(self):
+        folder, _ = self.copied_shims()
+        os.symlink(folder / "python3", self.bin / "python3")
+        result = subprocess.run([str(folder / "python3"), "-c", "pass"],
+                                env=self.shim_env({"PATH": os.pathsep.join([str(folder), str(self.bin)])}),
+                                capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 127)
+        self.assertIn("refusing to recurse", result.stderr)
+
+    def test_shell_shim_without_a_real_binary_fails_cleanly(self):
+        folder, _ = self.copied_shims()
+        result = subprocess.run([str(folder / "python3"), "-c", "pass"],
+                                env={"PATH": str(folder), "AGENTQ_HOME": str(self.home)},
+                                capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 127)
+        self.assertIn("no real `python3`", result.stderr)
+
+    def test_ssh_fast_path_sends_only_listed_hosts_to_dispatch(self):
+        folder, marker = self.copied_shims()
+        hosts = self.home / "slots" / "ssh_hosts"
+        hosts.parent.mkdir(parents=True, exist_ok=True)
+        hosts.write_text("prod-box\nbox-*\n", encoding="utf-8")
+        record = self.bin / "ssh-argv"
+        self.fake_binary("ssh", f'printf "%s\\n" "$@" > "{record}"\n')
+        for args in (["github.com"], ["-T", "git@github.com", "git-upload-pack"]):
+            with self.subTest(args=args):
+                marker.unlink(missing_ok=True)
+                self.assertEqual(self.run_shim(folder, "ssh", args).returncode, 0)
+                self.assertFalse(marker.exists())
+                self.assertEqual(record.read_text().split(), args)
+        marker.unlink(missing_ok=True)
+        self.run_shim(folder, "ssh", ["-p", "22", "evan@prod-box", "uptime"])
+        self.assertTrue(marker.exists())
+        marker.unlink(missing_ok=True)
+        self.run_shim(folder, "ssh", ["Box-7"])
+        self.assertTrue(marker.exists())
+
+    def test_empty_ssh_hosts_file_execs_real_ssh_for_everything(self):
+        folder, marker = self.copied_shims()
+        hosts = self.home / "slots" / "ssh_hosts"
+        hosts.parent.mkdir(parents=True, exist_ok=True)
+        hosts.write_text("", encoding="utf-8")
+        self.fake_binary("ssh", "exit 0\n")
+        self.assertEqual(self.run_shim(folder, "ssh", ["prod-box"]).returncode, 0)
+        self.assertFalse(marker.exists())
+
+
+class SshHostsFileTests(Base):
+    def test_file_lists_configured_patterns_lowercased(self):
+        (self.home / "broker.json").write_text(json.dumps({"shims": {"ssh_gated_hosts": ["Prod-Box", "box-*"]}}),
+                                               encoding="utf-8")
+        path = slots.write_ssh_hosts(self.home)
+        self.assertEqual(path.read_text(), "prod-box\nbox-*\n")
+
+    def test_file_is_empty_without_configuration(self):
+        self.assertEqual(slots.write_ssh_hosts(self.home).read_text(), "")
 
 
 if __name__ == "__main__":

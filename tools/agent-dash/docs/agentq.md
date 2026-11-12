@@ -141,9 +141,15 @@ Install the LaunchAgent (not done by the repo): fill `__PYTHON__` and `__HOME__`
 
 The queue limits whole jobs by their `--res` label. What a worker runs inside a job
 was unguarded, so `launch_pi.py` puts `agentq/shims/` first on PATH for the pi child.
-Five shell wrappers (`ssh`, `pytest`, `python`, `python3`, `uv`) call
-`agentq/shims/dispatch.py`, which gates only the commands below. Everything else is
-exec'd unchanged with the same argv. Stdlib only; slots live in `agentq/slots.py`.
+Five shell wrappers (`ssh`, `pytest`, `python`, `python3`, `uv`) in `agentq/shims/`
+decide in sh, with no Python start-up on the common path (`python3 -c pass` through the
+shim is about 35 ms, against 28 ms bare). Only a pytest argv, or an ssh argv naming a gated
+host, reaches `agentq/shims/dispatch.py`. Everything else is exec'd with the same argv.
+Stdlib only; slots live in `agentq/slots.py`.
+
+The ssh fast path reads `$AGENTQ_HOME/slots/ssh_hosts`, one host pattern per line.
+`launch_pi.py` writes it at launch from `broker.json`, and every dispatch run rewrites it.
+Without that file, ssh is not gated, so the launch step matters.
 
 - **ssh** to a host in `shims.ssh_gated_hosts` holds one of `slots.ssh` (8) slots for the
   life of the command. The list has no default in the repo, so production aliases are set
