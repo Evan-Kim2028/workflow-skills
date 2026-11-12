@@ -949,13 +949,25 @@ def verdict_for(raw, *, live=IDLE_LIVE, laptop=CALM, kimi_waiting=False, budget_
 
 
 class LimitedByTest(unittest.TestCase):
-    def test_morph_limit_when_an_enforced_budget_peaks_at_95_percent(self) -> None:
-        raw = five_minutes(total=1_000_000, ds_uncached=0)
-        raw[UNTIL - 120] = {"total": 1_000_000, "ds_uncached": 390_000}
-        result = verdict_for(raw)
+    def test_morph_limit_when_an_enforced_budget_averages_90_percent(self) -> None:
+        result = verdict_for(five_minutes(total=1_000_000, ds_uncached=380_000))
         self.assertEqual(result["key"], "morph_limit")
         self.assertEqual(result["chip"], "Morph limit")
-        self.assertIn("DeepSeek uncached input reached 98%", result["text"])
+        self.assertIn("DeepSeek uncached input averaged 95% of its limit over the last 5 minutes", result["text"])
+
+    def test_a_single_peak_minute_with_a_low_average_is_not_morph_limit(self) -> None:
+        raw = five_minutes(total=1_000_000, ds_uncached=40_000)
+        raw[UNTIL - 120] = {"total": 1_000_000, "ds_uncached": 507_000}
+        result = verdict_for(raw)
+        self.assertNotEqual(result["key"], "morph_limit")
+        self.assertNotIn("peak minute 127%", result["text"])
+
+    def test_peak_minute_is_context_in_the_sentence_when_morph_limit_holds_on_average(self) -> None:
+        raw = five_minutes(total=1_000_000, ds_uncached=370_000)
+        raw[UNTIL - 120] = {"total": 1_000_000, "ds_uncached": 507_000}
+        result = verdict_for(raw)
+        self.assertEqual(result["key"], "morph_limit")
+        self.assertIn("peak minute 127%", result["text"])
 
     def test_morph_limit_when_an_enforced_budget_had_429s_in_two_minutes(self) -> None:
         raw = five_minutes(total=1_000_000)
@@ -972,7 +984,7 @@ class LimitedByTest(unittest.TestCase):
         self.assertNotEqual(verdict_for(raw, kimi_waiting=False)["key"], "morph_limit")
         waiting = verdict_for(raw, kimi_waiting=True)
         self.assertEqual(waiting["key"], "morph_limit")
-        self.assertIn("Kimi uncached reached", waiting["text"])
+        self.assertIn("Kimi uncached averaged 100%", waiting["text"])
 
     def test_morph_slow_when_deepseek_p50_doubles_and_proxy_queue_is_empty(self) -> None:
         result = verdict_for(five_minutes(total=1_000_000), ds_p50_5m_ms=12_000, ds_p50_base_ms=5_000)
@@ -1002,7 +1014,7 @@ class LimitedByTest(unittest.TestCase):
         self.assertEqual(verdict_for(five_minutes(total=1_000_000), jobs_queued=2)["key"], "near_capacity")
 
     def test_near_capacity_otherwise(self) -> None:
-        result = verdict_for(five_minutes(total=9_000_000))
+        result = verdict_for(five_minutes(total=8_800_000))
         self.assertEqual(result["key"], "near_capacity")
         self.assertEqual(result["chip"], "Near capacity")
 

@@ -35,7 +35,7 @@ DEFAULT_HOURS = 6
 RECENT_JOBS = 200
 LIMIT_WINDOW_MINUTES = 5
 TOKEN_BUCKET_S = {1: 300, 6: 300, 24: 300, 168: 1800}
-SATURATION_FRAC = 0.95
+AVERAGE_SATURATION_FRAC = 0.90
 ROOM_FRAC = 0.95
 POOL_IDLE_FRAC = 0.85
 MORPH_429_MINUTES = 2
@@ -2461,8 +2461,9 @@ def verdict(
     """What limits the pool, from the last 5 complete minutes. The first matching rule wins:
     Morph limit, Morph slow, Laptop, Demand, Near capacity.
 
-    An enforced budget counts as hit when any minute reached SATURATION_FRAC of its limit, or when it had
-    429s in MORPH_429_MINUTES of the 5 minutes. Kimi uncached counts only while Kimi jobs wait.
+    An enforced budget counts as hit when its 5-minute average reached AVERAGE_SATURATION_FRAC of its limit,
+    or when upstream 429s named it in MORPH_429_MINUTES of the 5 minutes. The peak minute is context only: it
+    never decides the verdict. Kimi uncached counts only while Kimi jobs wait.
     """
     five = list(range(until - LIMIT_WINDOW_MINUTES * 60, until, 60))
     queued_values = (live or {}).get("queued") if isinstance(live, dict) else None
@@ -2472,21 +2473,23 @@ def verdict(
         if name == "uncached" and not kimi_waiting:
             continue
         field = BUDGET_FIELDS[name]
+        average = sum(int((raw.get(t) or {}).get(field) or 0) for t in five) / LIMIT_WINDOW_MINUTES / limits[name]
         peak = max(int((raw.get(t) or {}).get(field) or 0) for t in five) / limits[name]
         minutes_429 = sum(1 for t in five if t in budget_429s.get(name, set()))
-        if peak >= SATURATION_FRAC or minutes_429 >= MORPH_429_MINUTES:
-            hits.append((name, peak, minutes_429))
+        if average >= AVERAGE_SATURATION_FRAC or minutes_429 >= MORPH_429_MINUTES:
+            hits.append((name, average, peak, minutes_429))
     pool = window_sum(raw, until, LIMIT_WINDOW_MINUTES, "total") / LIMIT_WINDOW_MINUTES / limits["total"]
     load = laptop.get("load_per_cpu")
     free = laptop.get("memory_free_pct")
     laptop_hot = (load is not None and load > LOAD_PER_CPU_MAX) or (free is not None and free < MEMORY_FREE_MIN)
     if hits:
-        name, peak, minutes_429 = hits[0]
+        name, average, peak, minutes_429 = hits[0]
         label = LIMIT_LABELS[name]
-        if peak >= SATURATION_FRAC:
-            detail = f"{label} reached {peak * 100:.0f}% of its limit in the last 5 minutes"
+        context = f"peak minute {peak * 100:.0f}%"
+        if average >= AVERAGE_SATURATION_FRAC:
+            detail = f"{label} averaged {average * 100:.0f}% of its limit over the last 5 minutes ({context})"
         else:
-            detail = f"{label} returned 429s in {minutes_429} of the last 5 minutes"
+            detail = f"{label} returned 429s in {minutes_429} of the last 5 minutes ({context})"
         key, text = "morph_limit", f"Morph is limiting us: {detail}."
     elif ds_p50_5m_ms and ds_p50_base_ms and ds_p50_5m_ms > SLOW_FACTOR * ds_p50_base_ms and proxy_queued == 0:
         key = "morph_slow"
