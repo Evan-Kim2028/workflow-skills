@@ -365,6 +365,9 @@ class LauncherResumeTest(unittest.TestCase):
     def run_launcher(self, label="ws1-exec-lane-7"):
         return launch.main([label, str(self.ws), str(self.prompt), str(self.outdir), "--model", DEEPSEEK])
 
+    def local_prompt(self, label="ws1-exec-lane-7"):
+        return (self.outdir / f"prompt-{label}.md").resolve()
+
     def err_text(self, label="ws1-exec-lane-7"):
         return (self.outdir / f"err-{label}.log").read_text(encoding="utf-8")
 
@@ -377,6 +380,7 @@ class LauncherResumeTest(unittest.TestCase):
         self.assertEqual(argv[argv.index("--session-dir") + 1], str(self.outdir / "sessions"))
         self.assertIn(launch.RESUME_PROMPT, argv)
         self.assertFalse(any(arg.startswith("@") for arg in argv))
+        self.assertEqual(argv[argv.index("--append-system-prompt") + 1], str(self.local_prompt()))
         self.assertEqual(len(self.calls), 1)
         run = [line for line in self.captured if line.get("type") == "run"][-1]
         self.assertEqual(run["resumed_from"], str(self.old_session))
@@ -387,7 +391,7 @@ class LauncherResumeTest(unittest.TestCase):
         self.results = [0]
         self.run_launcher()
         self.assertEqual(len(self.calls), 1)
-        self.assertTrue(any(arg.startswith("@") for arg in self.calls[0]))
+        self.assertEqual(self.calls[0][self.calls[0].index("--append-system-prompt") + 1], str(self.local_prompt()))
         self.assertNotIn("--fork", self.calls[0])
         self.assertIn("missing or empty; starting fresh", self.err_text())
         run = [line for line in self.captured if line.get("type") == "run"][-1]
@@ -399,7 +403,7 @@ class LauncherResumeTest(unittest.TestCase):
         self.run_launcher()
         self.assertEqual(len(self.calls), 2)
         self.assertIn("--fork", self.calls[0])
-        self.assertTrue(any(arg.startswith("@") for arg in self.calls[1]))
+        self.assertEqual(self.calls[1][self.calls[1].index("--append-system-prompt") + 1], str(self.local_prompt()))
         self.assertIn("pi refused", self.err_text())
         run = [line for line in self.captured if line.get("type") == "run"][-1]
         self.assertIsNone(run["resumed_from"])
@@ -1231,6 +1235,152 @@ class RunLabelEnvTest(unittest.TestCase):
     def test_never_touches_the_broker_job_id(self):
         env = launch.set_run_label("ws5-exec-slug", {})
         self.assertNotIn("AGENTQ_JOB", env)
+
+
+class BriefAndPilotTest(unittest.TestCase):
+    """The brief rides --append-system-prompt; the compaction pilot is off unless configured."""
+
+    def setUp(self):
+        from unittest import mock
+
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        self.state = root / "state"
+        self.home = root / "agentq-home"
+        self.home.mkdir()
+        self.ws = root / "ws"
+        self.ws.mkdir()
+        self.prompt = root / "prompt.md"
+        self.prompt.write_text("scope rules\n", encoding="utf-8")
+        self.outdir = root / "pi"
+        self.extension = root / "compact.ts"
+        self.extension.write_text("export default {};\n", encoding="utf-8")
+        self.old_session = root / "old-pi" / "sessions" / "old.jsonl"
+        self.old_session.parent.mkdir(parents=True)
+        self.old_session.write_text('{"type":"session"}\n', encoding="utf-8")
+        self.calls = []
+        patches = [
+            mock.patch.object(launch, "state_dir", return_value=self.state),
+            mock.patch.object(launch, "register_run_dir", return_value=None),
+            mock.patch.object(launch, "report_lines", return_value=None),
+            mock.patch.object(launch, "quota_hit", return_value=False),
+            mock.patch.object(launch.logfilter, "run_filtered", side_effect=self.fake_pi),
+        ]
+        for patch in patches:
+            patch.start()
+            self.addCleanup(patch.stop)
+        env = mock.patch.dict(os.environ, {"AGENTQ_HOME": str(self.home)}, clear=False)
+        env.start()
+        self.addCleanup(env.stop)
+        os.environ.pop(launch.RESUME_ENV, None)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def fake_pi(self, argv, stream_path, **kwargs):
+        self.calls.append(list(argv))
+        Path(stream_path).write_bytes(b"")
+        return 0
+
+    def write_config(self, fraction=0.5, extension=None):
+        config = {"compaction_extension": str(extension or self.extension), "fraction": fraction}
+        (self.home / "pilot.json").write_text(json.dumps(config), encoding="utf-8")
+
+    def run_launcher(self, label="ws1-exec-lane-9"):
+        return launch.main([label, str(self.ws), str(self.prompt), str(self.outdir), "--model", DEEPSEEK])
+
+    def local_prompt(self, label="ws1-exec-lane-9"):
+        return (self.outdir / f"prompt-{label}.md").resolve()
+
+    def test_brief_is_in_the_system_prompt_not_an_attachment(self):
+        self.run_launcher()
+        argv = self.calls[0]
+        self.assertEqual(argv[argv.index("--append-system-prompt") + 1], str(self.local_prompt()))
+        self.assertTrue(Path(argv[argv.index("--append-system-prompt") + 1]).is_file())
+        self.assertFalse(any(arg.startswith("@") for arg in argv))
+        self.assertEqual(argv[-1], launch.BRIEF_MESSAGE)
+        self.assertNotIn("-e", argv)
+
+    def test_resume_keeps_the_brief_in_the_system_prompt(self):
+        os.environ[launch.RESUME_ENV] = str(self.old_session)
+        self.run_launcher()
+        argv = self.calls[0]
+        self.assertIn("--fork", argv)
+        self.assertEqual(argv[argv.index("--append-system-prompt") + 1], str(self.local_prompt()))
+
+    def test_pilot_is_off_without_config(self):
+        self.run_launcher()
+        self.assertFalse((self.outdir / "pilot-arm").exists())
+        self.assertFalse((self.home / launch.PILOT_RUNS).exists())
+
+    def test_arm_is_a_fixed_hash_bucket_of_the_label(self):
+        import hashlib
+
+        label = "ws1-exec-lane-9"
+        bucket = int(hashlib.sha1(label.encode("utf-8")).hexdigest(), 16) % 1000
+        expected = "ext" if bucket < 500 else "control"
+        self.assertEqual(launch.pilot_arm(label, 0.5), expected)
+        self.assertEqual(launch.pilot_arm(label, 0.5), launch.pilot_arm(label, 0.5))
+        self.assertEqual(launch.pilot_arm(label, 0.0), "control")
+        self.assertEqual(launch.pilot_arm(label, 1.0), "ext")
+
+    def test_ext_arm_adds_the_extension_to_the_launch(self):
+        self.write_config(fraction=1.0)
+        self.run_launcher()
+        argv = self.calls[0]
+        self.assertEqual(argv[argv.index("-e") + 1], str(self.extension))
+        self.assertEqual(argv[argv.index("--append-system-prompt") + 1], str(self.local_prompt()))
+        self.assertEqual((self.outdir / "pilot-arm").read_text(encoding="utf-8").strip(), "ext")
+
+    def test_control_arm_does_not_add_the_extension(self):
+        self.write_config(fraction=0.0)
+        self.run_launcher()
+        argv = self.calls[0]
+        self.assertNotIn("-e", argv)
+        self.assertNotIn(str(self.extension), argv)
+        self.assertEqual((self.outdir / "pilot-arm").read_text(encoding="utf-8").strip(), "control")
+
+    def test_resumed_ext_run_keeps_the_extension(self):
+        self.write_config(fraction=1.0)
+        os.environ[launch.RESUME_ENV] = str(self.old_session)
+        self.run_launcher()
+        argv = self.calls[0]
+        self.assertIn("--fork", argv)
+        self.assertEqual(argv[argv.index("-e") + 1], str(self.extension))
+
+    def test_missing_extension_file_means_no_pilot(self):
+        self.write_config(fraction=1.0, extension=self.extension.parent / "gone.ts")
+        self.run_launcher()
+        self.assertNotIn("-e", self.calls[0])
+        self.assertFalse((self.outdir / "pilot-arm").exists())
+        self.assertFalse((self.home / launch.PILOT_RUNS).exists())
+
+    def test_invalid_config_means_no_pilot(self):
+        bad = [
+            "{not json",
+            json.dumps(["list"]),
+            json.dumps({"compaction_extension": "relative/compact.ts", "fraction": 0.5}),
+            json.dumps({"compaction_extension": str(self.extension), "fraction": "0.5"}),
+            json.dumps({"compaction_extension": str(self.extension), "fraction": 1.5}),
+            json.dumps({"compaction_extension": str(self.extension), "fraction": True}),
+        ]
+        for text in bad:
+            (self.home / "pilot.json").write_text(text, encoding="utf-8")
+            self.calls.clear()
+            self.run_launcher()
+            self.assertNotIn("-e", self.calls[0], text)
+            self.assertFalse((self.outdir / "pilot-arm").exists(), text)
+
+    def test_pilot_runs_row_is_appended_per_launch(self):
+        self.write_config(fraction=1.0)
+        label = "ws1-exec-lane-9"
+        self.run_launcher(label)
+        self.run_launcher("ws1-exec-lane-10")
+        rows = (self.home / launch.PILOT_RUNS).read_text(encoding="utf-8").splitlines()
+        self.assertEqual(len(rows), 2)
+        name, arm, started = rows[0].split("\t")
+        self.assertEqual((name, arm), (label, "ext"))
+        self.assertTrue(started.isdigit())
 
 
 if __name__ == "__main__":
