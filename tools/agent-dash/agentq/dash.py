@@ -614,6 +614,7 @@ td.wrap { white-space: normal; max-width: 260px; overflow-wrap: anywhere; }
 
   function registerChart(hostId, cfg) {
     var host = $(hostId);
+    if (cfg.fmt && cfg.y && !cfg.y.fmt) cfg.y.fmt = cfg.fmt;
     var entry = { host: host, cfg: cfg };
     charts.push(entry);
     drawChart(host, cfg);
