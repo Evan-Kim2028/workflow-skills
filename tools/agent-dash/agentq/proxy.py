@@ -2,13 +2,13 @@
 
 A local HTTP proxy between pi and api.morphllm.com. Each request is admitted
 only when every Morph budget it touches has room under the learned target,
-otherwise it waits in a lane queue (urgent, normal, backlog). Upstream 429s
-are retried inside the proxy and never reach the client. The limits are
-learned from the 429 bodies and persisted in proxy_state.json.
+otherwise it waits in a lane queue (urgent, normal, backlog). Upstream 429s are
+retried inside the proxy and never reach the client. The limits are learned from
+the 429 bodies and persisted in proxy_state.json.
 
-Stdlib only (asyncio streams and ssl), so launchd runs the file with the
-system python3 and needs no virtualenv. Streaming responses pass through
-chunk by chunk; the usage object in the last SSE event is read on the way.
+Stdlib only (asyncio streams and ssl), so launchd runs the file with the system
+python3 and needs no virtualenv. Streaming responses pass through chunk by chunk;
+the usage object in the last SSE event is read on the way.
 """
 
 from __future__ import annotations
@@ -17,6 +17,7 @@ import argparse
 import asyncio
 import contextlib
 import getpass
+import hashlib
 import json
 import os
 import random
@@ -39,6 +40,7 @@ DEFAULT_UPSTREAM = "https://api.morphllm.com/v1"
 KEYCHAIN_SERVICE = "morph-api-key"
 STATUS_PATH = "/agentq/status"
 UPSTREAM_PREFIX = "/v1"
+EX_CONFIG = 78
 
 DEFAULT_CONFIG = {
     "port": 8790,
@@ -53,6 +55,9 @@ DEFAULT_CONFIG = {
     "retry_floor_s": 1.0,
     "retry_jitter_s": 2.0,
     "aging_s": 900.0,
+    "connect_timeout_s": 10.0,
+    "upstream_idle_s": 120.0,
+    "drain_s": 20.0,
     "budgets": {
         "total": {"limit": 10_000_000},
         "output": {"limit": 70_000, "model_prefix": "morph-dsv41flash"},
@@ -64,6 +69,8 @@ SATURATION_WAIT_S = 2.0
 LANE_CACHE_S = 2.0
 LANE_CACHE_MAX = 10_000
 PREFIX_STORE_JOBS = 64
+BLOCK_CHARS = 1024
+LARGE_BODY = 256 * 1024
 MAINTAIN_S = 0.2
 FLUSH_S = 5.0
 MAX_REQUEST_BODY = 32 * 1024 * 1024
@@ -113,6 +120,35 @@ CREATE TABLE IF NOT EXISTS proxy_minutes (
 """
 
 
+class TruncatedBody(ValueError):
+    """A body ended before its declared length or its terminating chunk."""
+
+
+class UpstreamError(Exception):
+    """Upstream sent something the proxy cannot frame (for example a missing status line)."""
+
+    def __init__(self, kind: str) -> None:
+        super().__init__(kind)
+        self.kind = kind
+
+
+class KeyMissingError(RuntimeError):
+    """The Morph key is not in the Keychain and no override is set."""
+
+
+UPSTREAM_FAILURES = (OSError, ssl.SSLError, asyncio.TimeoutError, UpstreamError, TruncatedBody, EOFError)
+
+
+def failure_kind(exc: BaseException) -> str:
+    if isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
+        return "timeout"
+    if isinstance(exc, TruncatedBody):
+        return "truncated"
+    if isinstance(exc, UpstreamError):
+        return exc.kind
+    return "connection"
+
+
 def default_log(event: str, **fields: object) -> None:
     """Write one structured line to stderr. Callers pass only ids and counts."""
     stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
@@ -144,7 +180,7 @@ def load_config(home: Path) -> dict:
 def load_key(environ: dict | None = None) -> str:
     """Return the Morph key from the override env var or the macOS Keychain.
 
-    The key is returned to the caller only. Errors name the source, never the value.
+    Errors name the source, never the value.
     """
     env = os.environ if environ is None else environ
     override = env.get("AGENTQ_UPSTREAM_KEY")
@@ -160,10 +196,10 @@ def load_key(environ: dict | None = None) -> str:
             check=False,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
-        raise SystemExit(f"agentq proxy: cannot read the Morph key from the Keychain ({type(exc).__name__})")
+        raise KeyMissingError(type(exc).__name__) from exc
     key = result.stdout.strip()
     if result.returncode != 0 or not key:
-        raise SystemExit(f"agentq proxy: no Morph key in the Keychain (service {KEYCHAIN_SERVICE})")
+        raise KeyMissingError(f"no entry for service {KEYCHAIN_SERVICE}")
     return key
 
 
@@ -172,16 +208,12 @@ def tokens_for_chars(chars: int) -> int:
     return (max(chars, 0) + 3) // 4
 
 
-def common_prefix_len(first: str, second: str) -> int:
-    """Length of the shared leading run, found by bisection over slice comparisons."""
-    low, high = 0, min(len(first), len(second))
-    while low < high:
-        mid = (low + high + 1) // 2
-        if first[:mid] == second[:mid]:
-            low = mid
-        else:
-            high = mid - 1
-    return low
+def prefix_blocks(text: str) -> tuple[bytes, ...]:
+    """Fixed-size block digests of a prompt. A job keeps these instead of the prompt text."""
+    return tuple(
+        hashlib.blake2b(text[start : start + BLOCK_CHARS].encode("utf-8", "replace"), digest_size=8).digest()
+        for start in range(0, len(text), BLOCK_CHARS)
+    )
 
 
 def percentile(sorted_values: list[float], fraction: float) -> float:
@@ -259,6 +291,14 @@ def write_minute_rows(db_path: Path, rows: list[tuple]) -> None:
         connection.close()
 
 
+def write_state_file(path: Path, data: dict) -> None:
+    """Replace the state file atomically. Runs in a worker thread."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(json.dumps(data, indent=2) + "\n")
+    os.replace(temporary, path)
+
+
 @dataclass(eq=False)
 class Entry:
     """One budget charge. In-flight charges hold the estimate; done ones hold real usage."""
@@ -278,6 +318,7 @@ class Budget:
     target: float
     model_prefix: str | None = None
     model: str | None = None
+    hold_s: float = 600.0
     entries: list[Entry] = field(default_factory=list)
     last_429: float = float("-inf")
     last_grow: float = 0.0
@@ -293,9 +334,17 @@ class Budget:
     def cap(self) -> float:
         return self.limit * self.target
 
-    def used(self, now: float, window: float, lane: str | None = None) -> int:
+    def prune(self, now: float, window: float) -> None:
+        """Forget completed charges older than the window. Unfinished charges older than hold_s are
+        expired too, so a lost request cannot hold budget forever."""
         cutoff = now - window
-        self.entries = [e for e in self.entries if not e.done or e.at > cutoff]
+        hold_cutoff = now - self.hold_s
+        self.entries = [
+            e for e in self.entries if (e.done and e.at > cutoff) or (not e.done and e.at > hold_cutoff)
+        ]
+
+    def used(self, now: float, window: float, lane: str | None = None) -> int:
+        self.prune(now, window)
         return sum(e.amount for e in self.entries if lane is None or e.lane == lane)
 
     def seconds_until_free(self, needed: float, now: float, window: float) -> float:
@@ -329,8 +378,9 @@ class Ticket:
 
 
 class Governor:
-    """Admission, lane queues, learned limits and minute counters. All calls run on the event loop thread,
-    except lane_for, which the proxy calls in a worker thread and which touches only its own cache."""
+    """Admission, lane queues, learned limits and minute counters. All calls run on the event loop
+    thread, except lane_for, which the proxy calls in a worker thread and which touches only its own
+    cache."""
 
     def __init__(
         self,
@@ -348,6 +398,7 @@ class Governor:
         self.log = log
         self.window = float(config["window_s"])
         start = clock()
+        hold_s = float(config["give_up_s"]) + float(config["upstream_idle_s"])
         self.budgets: dict[str, Budget] = {}
         for name, spec in config["budgets"].items():
             self.budgets[name] = Budget(
@@ -356,15 +407,18 @@ class Governor:
                 target=float(config["start_target"]),
                 model_prefix=spec.get("model_prefix"),
                 model=spec.get("model"),
+                hold_s=hold_s,
                 last_grow=start,
             )
         self.queues: dict[str, deque[Ticket]] = {lane: deque() for lane in LANES}
         self.output_history: dict[str, deque[int]] = {}
-        self.prefixes: OrderedDict[str, str] = OrderedDict()
+        self.prefixes: OrderedDict[str, tuple[int, tuple[bytes, ...]]] = OrderedDict()
         self.lane_cache: dict[str, tuple[str, float]] = {}
         self.minute_rows: dict[tuple[str, str], dict] = {}
         self.dirty: set[tuple[str, str]] = set()
         self.waits: deque[tuple[float, float]] = deque()
+        self.errors: dict[str, int] = {}
+        self.state_dirty = False
         self.load_state()
 
     @property
@@ -388,17 +442,21 @@ class Governor:
             floor = float(self.config["target_floor"])
             budget.target = min(1.0, max(floor, float(spec.get("target_frac", budget.target))))
 
-    def save_state(self) -> None:
-        self.home.mkdir(parents=True, exist_ok=True)
-        data = {
+    def snapshot_state(self) -> dict:
+        return {
             "saved_at": self.wall(),
             "budgets": {
                 name: {"limit": b.limit, "target_frac": round(b.target, 6)} for name, b in self.budgets.items()
             },
         }
-        temporary = self.state_path.with_name(self.state_path.name + ".tmp")
-        temporary.write_text(json.dumps(data, indent=2) + "\n")
-        os.replace(temporary, self.state_path)
+
+    def save_state(self) -> None:
+        """Write the state now, on the calling thread. The proxy uses the dirty flag instead."""
+        write_state_file(self.state_path, self.snapshot_state())
+        self.state_dirty = False
+
+    def count_error(self, kind: str) -> None:
+        self.errors[kind] = self.errors.get(kind, 0) + 1
 
     def lane_for(self, job: str) -> str:
         if not job:
@@ -421,17 +479,29 @@ class Governor:
             estimate = min(estimate, int(max_tokens))
         return max(estimate, 1)
 
-    def uncached_estimate(self, job: str, text: str) -> int:
-        """Tokens beyond the longest prefix this job sent last time. An unknown job counts the whole prompt."""
+    def uncached_estimate(self, job: str, length: int, blocks: tuple[bytes, ...]) -> int:
+        """Tokens beyond the longest prefix this job sent last time, at block granularity.
+
+        Blocks are compared whole, so the shared prefix can be short by up to one block
+        (BLOCK_CHARS, about 256 tokens). An unknown job counts the whole prompt.
+        """
         if not job:
-            return tokens_for_chars(len(text))
+            return tokens_for_chars(length)
         previous = self.prefixes.get(job)
-        shared = common_prefix_len(previous, text) if previous is not None else 0
-        self.prefixes[job] = text
+        shared = 0
+        if previous is not None:
+            previous_length, previous_blocks = previous
+            common = 0
+            for old, new in zip(previous_blocks, blocks):
+                if old != new:
+                    break
+                common += 1
+            shared = min(common * BLOCK_CHARS, previous_length, length)
+        self.prefixes[job] = (length, blocks)
         self.prefixes.move_to_end(job)
         while len(self.prefixes) > PREFIX_STORE_JOBS:
             self.prefixes.popitem(last=False)
-        return tokens_for_chars(len(text) - shared)
+        return tokens_for_chars(length - shared)
 
     def make_ticket(
         self,
@@ -439,13 +509,14 @@ class Governor:
         job: str,
         lane: str,
         model: str,
-        text: str,
+        length: int,
+        blocks: tuple[bytes, ...],
         max_tokens: int | None,
         now: float,
     ) -> Ticket:
-        prompt = tokens_for_chars(len(text))
+        prompt = tokens_for_chars(length)
         output = self.output_estimate(model, max_tokens)
-        uncached = self.uncached_estimate(job, text)
+        uncached = self.uncached_estimate(job, length, blocks)
         estimates = {
             b.name: estimate_for(b.name, prompt, output, uncached)
             for b in self.budgets.values()
@@ -487,7 +558,11 @@ class Governor:
         self.queues["urgent"] = deque(sorted(urgent, key=lambda t: t.queued_at))
 
     def pump(self) -> None:
-        """Admit every queued ticket that fits, urgent first, FIFO within a lane."""
+        """Admit every queued ticket that fits, urgent first, FIFO within a lane.
+
+        A ticket backing off after a 429 is skipped, so it does not hold up the tickets behind it.
+        A ticket that does not fit stops its lane, which keeps the order.
+        """
         now = self.clock()
         self.promote_aged(now)
         for budget in self.budgets.values():
@@ -498,15 +573,17 @@ class Governor:
             if lane == "backlog" and urgent_or_normal:
                 break
             queue = self.queues[lane]
-            while queue:
-                head = queue[0]
+            index = 0
+            while index < len(queue):
+                head = queue[index]
                 if head.not_before > now:
-                    break
+                    index += 1
+                    continue
                 blocker = self._blocker(head, now, lower_waiting)
                 if blocker is not None:
                     blocker.saturated = True
                     break
-                queue.popleft()
+                del queue[index]
                 self._admit(head, now)
 
     def _blocker(self, ticket: Ticket, now: float, lower_waiting: bool) -> Budget | None:
@@ -566,7 +643,7 @@ class Governor:
         row["uncached_est"] += ticket.uncached_est
 
     def release(self, ticket: Ticket) -> None:
-        """Drop a charge that upstream did not bill: a 429, an error, or an unreachable upstream."""
+        """Drop a charge that upstream did not bill: a 429, an error, a truncated stream, or a client that left."""
         now = self.clock()
         for _, entry in ticket.holds:
             entry.amount = 0
@@ -600,7 +677,7 @@ class Governor:
             budget.target = max(floor, budget.target * cut)
             budget.last_429 = now
             self.log("target_cut", budget=budget.name, target=round(budget.target, 4), limit=budget.limit)
-        self.save_state()
+        self.state_dirty = True
 
     def retry_delay(self, ticket: Ticket, now: float) -> float:
         wait = 0.0
@@ -617,16 +694,13 @@ class Governor:
         now = self.clock()
         window = self.window
         step = float(self.config["target_step_up"])
-        changed = False
         for budget in self.budgets.values():
             quiet = now - budget.last_429 >= window and now - budget.last_grow >= window
             if budget.saturated and budget.target < 1.0 and quiet:
                 budget.target = min(1.0, budget.target + step)
                 budget.last_grow = now
-                changed = True
+                self.state_dirty = True
                 self.log("target_raised", budget=budget.name, target=round(budget.target, 4))
-        if changed:
-            self.save_state()
 
     def row(self, model: str) -> dict:
         key = (minute_stamp(self.wall()), model)
@@ -693,14 +767,16 @@ class Governor:
             "window_s": window,
             "saturated": saturated,
             "queued": {lane: len(self.queues[lane]) for lane in LANES},
+            "errors": dict(self.errors),
             "budgets": budgets,
         }
 
 
 @dataclass(eq=False)
 class Client:
-    writer: asyncio.StreamWriter
+    writer: asyncio.StreamWriter | None
     started: bool = False
+    aborted: bool = False
 
 
 @dataclass(eq=False)
@@ -767,12 +843,6 @@ class UsageScanner:
             self.usage = payload["usage"]
 
 
-def held_body(governor: "Governor") -> bytes:
-    """The 429 body a client sees when its request was held past give_up_s."""
-    seconds = float(governor.config["give_up_s"])
-    return f"agentq: held {seconds:g} s, budget full".encode()
-
-
 def parse_payload(body: bytes) -> dict | None:
     if not body:
         return None
@@ -794,14 +864,37 @@ def with_usage_option(payload: dict) -> bytes | None:
     return json.dumps(payload, separators=(",", ":")).encode()
 
 
+def prepare_body(body: bytes) -> tuple[dict | None, bytes, int, tuple[bytes, ...]]:
+    """Parse the request, set include_usage on streams, and describe the prompt. Pure, so it can run in a thread."""
+    payload = parse_payload(body)
+    out_body = body
+    if payload is not None and payload.get("stream") is True:
+        out_body = with_usage_option(payload) or body
+    text = out_body.decode("utf-8", "replace")
+    return payload, out_body, len(text), prefix_blocks(text)
+
+
+async def prepare_body_async(body: bytes) -> tuple[dict | None, bytes, int, tuple[bytes, ...]]:
+    if len(body) < LARGE_BODY:
+        return prepare_body(body)
+    return await asyncio.to_thread(prepare_body, body)
+
+
 def is_event_stream(headers: dict[str, str]) -> bool:
     return "text/event-stream" in headers.get("content-type", "")
 
 
-async def read_headers(reader: asyncio.StreamReader) -> dict[str, str]:
+async def bounded(awaitable, idle_s: float | None):
+    """Wait for one read, at most idle_s seconds. None means no bound."""
+    if idle_s is None:
+        return await awaitable
+    return await asyncio.wait_for(awaitable, idle_s)
+
+
+async def read_headers(reader: asyncio.StreamReader, idle_s: float | None = None) -> dict[str, str]:
     headers: dict[str, str] = {}
     while True:
-        line = await reader.readline()
+        line = await bounded(reader.readline(), idle_s)
         if line in (b"\r\n", b"\n", b""):
             return headers
         name, separator, value = line.decode("latin-1").partition(":")
@@ -809,39 +902,49 @@ async def read_headers(reader: asyncio.StreamReader) -> dict[str, str]:
             headers[name.strip().lower()] = value.strip()
 
 
-async def iter_body(reader: asyncio.StreamReader, headers: dict[str, str]):
-    """Yield body bytes as they arrive: chunked, length-delimited, or read-to-close."""
+async def iter_body(reader: asyncio.StreamReader, headers: dict[str, str], idle_s: float | None = None):
+    """Yield body bytes as they arrive: chunked, length-delimited, or read-to-close.
+
+    A chunked or length-delimited body that ends early raises TruncatedBody. Read-to-close
+    ends at EOF by definition.
+    """
     if "chunked" in headers.get("transfer-encoding", "").lower():
         while True:
-            size_line = await reader.readline()
+            size_line = await bounded(reader.readline(), idle_s)
             if not size_line:
-                return
-            size = int(size_line.split(b";")[0].strip() or b"0", 16)
+                raise TruncatedBody("chunk size missing")
+            try:
+                size = int(size_line.split(b";")[0].strip() or b"0", 16)
+            except ValueError as exc:
+                raise UpstreamError("bad_chunk") from exc
             if size == 0:
-                await read_headers(reader)
+                await read_headers(reader, idle_s)
                 return
-            data = await reader.readexactly(size)
-            await reader.readexactly(2)
+            try:
+                data = await bounded(reader.readexactly(size), idle_s)
+                await bounded(reader.readexactly(2), idle_s)
+            except asyncio.IncompleteReadError as exc:
+                raise TruncatedBody("chunk cut short") from exc
             yield data
     elif "content-length" in headers:
         remaining = int(headers["content-length"])
         while remaining > 0:
-            data = await reader.read(min(READ_CHUNK, remaining))
+            data = await bounded(reader.read(min(READ_CHUNK, remaining)), idle_s)
             if not data:
-                return
+                raise TruncatedBody("body ended before content-length")
             remaining -= len(data)
             yield data
     else:
         while True:
-            data = await reader.read(READ_CHUNK)
+            data = await bounded(reader.read(READ_CHUNK), idle_s)
             if not data:
                 return
             yield data
 
 
-async def read_all(reader: asyncio.StreamReader, headers: dict[str, str], cap: int) -> bytes:
+async def read_all(reader: asyncio.StreamReader, headers: dict[str, str], cap: int, idle_s: float | None = None) -> bytes:
     data = bytearray()
-    async for chunk in iter_body(reader, headers):
+    async for chunk in iter_body(reader, headers, idle_s):
         if len(data) + len(chunk) > cap:
             data += chunk[: max(cap - len(data), 0)]
             break
@@ -870,6 +973,13 @@ async def read_request(reader: asyncio.StreamReader) -> tuple[str, str, dict[str
             raise ValueError("request body too large")
         body_bytes = await reader.readexactly(length) if length else b""
     return parts[0], parts[1].split("?", 1)[0], headers, body_bytes
+
+
+def parse_status_line(line: bytes) -> int:
+    parts = line.decode("latin-1").split(" ", 2)
+    if len(parts) < 2 or not parts[1].isdigit():
+        raise UpstreamError("bad_status_line")
+    return int(parts[1])
 
 
 def _reason(status: int) -> str:
@@ -912,6 +1022,12 @@ async def send_simple(client: Client, status: int, body: bytes, content_type: st
     await client.writer.drain()
 
 
+def held_body(governor: Governor) -> bytes:
+    """The 429 body a client sees when its request was held past give_up_s."""
+    seconds = float(governor.config["give_up_s"])
+    return f"agentq: held {seconds:g} s, budget full".encode()
+
+
 class Proxy:
     """HTTP front end: admits requests through the Governor, forwards them, and retries 429s."""
 
@@ -922,10 +1038,22 @@ class Proxy:
         scheme = urlsplit(upstream_url).scheme
         self.ssl_context = ssl.create_default_context() if scheme == "https" else None
         self.maintenance: asyncio.Task | None = None
+        self.active: set[asyncio.Task] = set()
 
     async def start(self, host: str = "127.0.0.1", port: int = 0) -> asyncio.Server:
         self.maintenance = asyncio.create_task(self.maintain())
         return await asyncio.start_server(self.handle, host, port)
+
+    async def drain(self, timeout: float) -> None:
+        """Let in-flight connections finish for up to timeout seconds, then cancel what remains."""
+        pending = set(self.active)
+        if pending:
+            await asyncio.wait(pending, timeout=timeout)
+        remaining = list(self.active)
+        for task in remaining:
+            task.cancel()
+        if remaining:
+            await asyncio.gather(*remaining, return_exceptions=True)
 
     async def close(self) -> None:
         if self.maintenance is not None:
@@ -933,7 +1061,7 @@ class Proxy:
             with contextlib.suppress(asyncio.CancelledError):
                 await self.maintenance
         await self.flush()
-        self.gov.save_state()
+        await self.flush_state()
 
     async def maintain(self) -> None:
         last_flush = self.gov.clock()
@@ -942,6 +1070,7 @@ class Proxy:
             try:
                 self.gov.pump()
                 self.gov.tick()
+                await self.flush_state()
                 if self.gov.clock() - last_flush >= FLUSH_S:
                     last_flush = self.gov.clock()
                     await self.flush()
@@ -957,8 +1086,21 @@ class Proxy:
         except sqlite3.Error as exc:
             self.gov.log("flush_error", kind=type(exc).__name__)
 
+    async def flush_state(self) -> None:
+        if not self.gov.state_dirty:
+            return
+        snapshot = self.gov.snapshot_state()
+        self.gov.state_dirty = False
+        try:
+            await asyncio.to_thread(write_state_file, self.gov.state_path, snapshot)
+        except OSError as exc:
+            self.gov.state_dirty = True
+            self.gov.log("state_error", kind=type(exc).__name__)
+
     async def handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         client = Client(writer)
+        task = asyncio.current_task()
+        self.active.add(task)
         try:
             request = await read_request(reader)
             if request is None:
@@ -979,7 +1121,11 @@ class Proxy:
             self.gov.log("proxy_error", kind=type(exc).__name__)
             await self._fail(client, 502, b'{"error":"proxy error"}')
         finally:
-            writer.close()
+            self.active.discard(task)
+            if client.aborted:
+                writer.transport.abort()
+            else:
+                writer.close()
 
     async def _fail(self, client: Client, status: int, body: bytes) -> None:
         if client.started:
@@ -991,11 +1137,16 @@ class Proxy:
         url = urlsplit(self.upstream_url)
         secure = url.scheme == "https"
         port = url.port or (443 if secure else 80)
-        reader, writer = await asyncio.open_connection(
-            url.hostname,
-            port,
-            ssl=self.ssl_context,
-            server_hostname=url.hostname if secure else None,
+        connect_s = float(self.gov.config["connect_timeout_s"])
+        idle_s = float(self.gov.config["upstream_idle_s"])
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(
+                url.hostname,
+                port,
+                ssl=self.ssl_context,
+                server_hostname=url.hostname if secure else None,
+            ),
+            connect_s,
         )
         try:
             target = url.path.rstrip("/") + path[len(UPSTREAM_PREFIX) :]
@@ -1011,10 +1162,9 @@ class Proxy:
                 if name not in REQUEST_DROP:
                     lines.append(f"{name.title()}: {value}")
             writer.write(("\r\n".join(lines) + "\r\n\r\n").encode("latin-1") + body)
-            await writer.drain()
-            status_line = await reader.readline()
-            status = int(status_line.decode("latin-1").split(" ", 2)[1])
-            response_headers = await read_headers(reader)
+            await bounded(writer.drain(), idle_s)
+            status = parse_status_line(await bounded(reader.readline(), idle_s))
+            response_headers = await read_headers(reader, idle_s)
         except BaseException:
             writer.close()
             raise
@@ -1024,13 +1174,14 @@ class Proxy:
         """Block until the ticket is admitted. Returns admitted, gone (client closed) or expired (held too long).
 
         The deadline runs from the first enqueue, so queue wait and 429 retries share one give-up bound.
+        A client that closed by the time it was admitted counts as gone, so nothing is sent for it.
         """
         deadline = ticket.first_seen + float(self.gov.config["give_up_s"])
         watch = asyncio.ensure_future(reader.read(1))
         try:
             while True:
                 if ticket.future.done():
-                    return "admitted"
+                    return "gone" if reader.at_eof() else "admitted"
                 remaining = deadline - self.gov.clock()
                 if remaining <= 0:
                     return "expired"
@@ -1060,90 +1211,126 @@ class Proxy:
         reader: asyncio.StreamReader,
     ) -> None:
         gov = self.gov
-        loop = asyncio.get_running_loop()
         job = headers.get("x-agentq-job", "")
-        payload = parse_payload(body)
+        payload, out_body, length, blocks = await prepare_body_async(body)
         model = ""
         max_tokens = None
         streaming = False
-        out_body = body
         if payload is not None:
             model = str(payload.get("model") or "")
             max_tokens = payload.get("max_tokens") or payload.get("max_completion_tokens")
             streaming = payload.get("stream") is True
-            if streaming:
-                out_body = with_usage_option(payload) or body
-        text = out_body.decode("utf-8", "replace")
         lane = await asyncio.to_thread(gov.lane_for, job)
         ticket = gov.make_ticket(
             job=job,
             lane=lane,
             model=model,
-            text=text,
+            length=length,
+            blocks=blocks,
             max_tokens=max_tokens,
             now=gov.clock(),
         )
-        ticket.future = loop.create_future()
+        ticket.future = asyncio.get_running_loop().create_future()
         gov.enqueue(ticket)
         gov.pump()
+        try:
+            await self._serve(ticket, reader, client, method, path, headers, out_body, streaming)
+        finally:
+            if ticket.holds:
+                gov.release(ticket)
+
+    async def _serve(
+        self,
+        ticket: Ticket,
+        reader: asyncio.StreamReader,
+        client: Client,
+        method: str,
+        path: str,
+        headers: dict[str, str],
+        body: bytes,
+        streaming: bool,
+    ) -> None:
+        """Send the ticket upstream, retrying 429s, and settle its charge on every exit path.
+
+        Every path either settles the charge (finish_ok on a 200 that ends cleanly) or releases it,
+        and forward's finally releases whatever is left.
+        """
+        gov = self.gov
+        idle_s = float(gov.config["upstream_idle_s"])
         while True:
             outcome = await self.wait_turn(ticket, reader)
             if outcome == "gone":
                 gov.drop(ticket)
-                gov.log("client_gone", job=job, model=model)
+                gov.release(ticket)
+                gov.log("client_gone", job=ticket.job, model=ticket.model)
                 return
             if outcome == "expired":
                 gov.drop(ticket)
-                gov.log("gave_up", job=job, model=model, attempts=ticket.attempts + 1)
+                gov.release(ticket)
+                gov.log("gave_up", job=ticket.job, model=ticket.model, attempts=ticket.attempts + 1)
                 await send_simple(client, 429, held_body(gov), "text/plain")
                 return
+            upstream = None
             try:
-                upstream = await self.open_upstream(method, path, headers, out_body)
-            except (OSError, ssl.SSLError) as exc:
-                gov.release(ticket)
-                gov.log("upstream_unreachable", kind=type(exc).__name__)
-                await send_simple(client, 502, b'{"error":"upstream unreachable"}')
-                return
-            if upstream.status == 429:
-                raw = await read_all(upstream.reader, upstream.headers, MAX_429_BODY)
-                upstream.close()
-                gov.release(ticket)
-                gov.learn_from_429(ticket, raw.decode("utf-8", "replace"))
-                now = gov.clock()
-                if now - ticket.first_seen >= float(gov.config["give_up_s"]):
-                    gov.log("gave_up", job=job, model=model, attempts=ticket.attempts + 1)
-                    await send_simple(client, 429, held_body(gov), "text/plain")
-                    return
-                delay = gov.retry_delay(ticket, now)
-                ticket.attempts += 1
-                ticket.not_before = now + delay
-                ticket.future = loop.create_future()
-                gov.requeue_head(ticket)
-                gov.log("retry", job=job, model=model, attempt=ticket.attempts + 1, delay_s=round(delay, 2))
-                continue
-            scanner = UsageScanner(is_event_stream(upstream.headers) or streaming)
-            try:
+                upstream = await self.open_upstream(method, path, headers, body)
+                if upstream.status == 429:
+                    raw = await read_all(upstream.reader, upstream.headers, MAX_429_BODY, idle_s)
+                    upstream.close()
+                    upstream = None
+                    gov.release(ticket)
+                    gov.learn_from_429(ticket, raw.decode("utf-8", "replace"))
+                    now = gov.clock()
+                    if now - ticket.first_seen >= float(gov.config["give_up_s"]):
+                        gov.log("gave_up", job=ticket.job, model=ticket.model, attempts=ticket.attempts + 1)
+                        await send_simple(client, 429, held_body(gov), "text/plain")
+                        return
+                    delay = gov.retry_delay(ticket, now)
+                    ticket.attempts += 1
+                    ticket.not_before = now + delay
+                    ticket.future = asyncio.get_running_loop().create_future()
+                    gov.requeue_head(ticket)
+                    gov.log("retry", job=ticket.job, model=ticket.model, attempt=ticket.attempts + 1, delay_s=round(delay, 2))
+                    continue
+                scanner = UsageScanner(is_event_stream(upstream.headers) or streaming)
                 await send_head(client, upstream.status, upstream.headers)
-                async for chunk in iter_body(upstream.reader, upstream.headers):
+                async for chunk in iter_body(upstream.reader, upstream.headers, idle_s):
                     scanner.feed(chunk)
                     await send_chunk(client, chunk)
                 await end_chunks(client)
-            finally:
-                upstream.close()
                 scanner.finish()
                 if upstream.status == 200:
                     gov.finish_ok(ticket, scanner.usage)
                 else:
                     gov.release(ticket)
-            gov.log(
-                "request",
-                job=job,
-                model=model,
-                lane=lane,
-                status=upstream.status,
-                attempts=ticket.attempts + 1,
-            )
-            return
+                gov.log(
+                    "request",
+                    job=ticket.job,
+                    model=ticket.model,
+                    lane=ticket.lane,
+                    status=upstream.status,
+                    attempts=ticket.attempts + 1,
+                )
+                return
+            except UPSTREAM_FAILURES as exc:
+                kind = failure_kind(exc)
+                gov.count_error(kind)
+                gov.release(ticket)
+                gov.log(
+                    "upstream_failed",
+                    job=ticket.job,
+                    model=ticket.model,
+                    kind=kind,
+                    client_started=client.started,
+                )
+                if client.started:
+                    client.aborted = True
+                else:
+                    status = 504 if kind == "timeout" else 502
+                    await self._fail(client, status, json.dumps({"error": kind}).encode())
+                return
+            finally:
+                if upstream is not None:
+                    upstream.close()
 
 
 async def run(governor: Governor, upstream_url: str, key: str, port: int) -> None:
@@ -1156,6 +1343,8 @@ async def run(governor: Governor, upstream_url: str, key: str, port: int) -> Non
     governor.log("started", port=port, upstream=urlsplit(upstream_url).netloc)
     await stop.wait()
     server.close()
+    governor.log("draining", in_flight=len(proxy.active))
+    await proxy.drain(float(governor.config["drain_s"]))
     await proxy.close()
     governor.log("stopped")
 
@@ -1169,7 +1358,14 @@ def main(argv: list[str] | None = None) -> int:
     config = load_config(home)
     port = args.port or int(os.environ.get("AGENTQ_PROXY_PORT", config["port"]))
     upstream = os.environ.get("AGENTQ_UPSTREAM", config["upstream"])
-    key = load_key()
+    try:
+        key = load_key()
+    except KeyMissingError:
+        sys.stderr.write(
+            f"agentq proxy: no Morph key in the Keychain (service {KEYCHAIN_SERVICE}); "
+            f"exit {EX_CONFIG}, launchd throttles the restart\n"
+        )
+        return EX_CONFIG
     asyncio.run(run(Governor(home, config), upstream, key, port))
     return 0
 
