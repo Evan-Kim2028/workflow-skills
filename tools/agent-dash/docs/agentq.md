@@ -239,8 +239,9 @@ Without that file, ssh is not gated, so the launch step matters.
 
 Not enforced:
 
-- Absolute paths bypass the shims: `/usr/bin/ssh`, `/usr/bin/python3 -m pytest`, or a
-  venv's `.venv/bin/pytest` run the real binary directly.
+- Absolute paths bypass the shims: `/usr/bin/ssh` or `/usr/bin/python3 -m pytest` run the
+  real binary directly. A venv's `.venv/bin/python -m pytest` is covered by the pytest
+  plugin below, not by the shims.
 - Other `uv` forms (for example `uv run --project DIR pytest`) pass through ungated.
 - A shell that sources a login profile reorders PATH and puts `/usr/bin` first. Pi's bash
   tool runs `bash -c` (no login profile), so the shims hold there. A custom
@@ -250,6 +251,37 @@ Not enforced:
 
 Disable: launch with `AGENTQ_SHIMS=0` (launch_pi then leaves PATH alone), or drop the
 shims folder from PATH. Tests: `tests/test_agentq_shims.py`.
+
+## Pytest slot plugin (absolute-path interpreters)
+
+The shims only see `pytest` typed by name. A pi worker that runs a venv interpreter by
+absolute path (`~/Documents/projects/<repo>/.venv/bin/python -m pytest`) bypasses them,
+and several such runs at 44-71% CPU each were seen on a laptop at load 38-44 on 15 cores.
+`agentq/pyplugin/agentq_pytest_slot.py` closes that gap from inside pytest.
+
+- **What it does.** A pytest plugin, stdlib only, Python 3.9+. Its `pytest_configure` takes a
+  `pytest` slot in the main process with the same admission rule and 30-minute max wait as
+  the shims (`slots.pytest_admission`, `slots.acquire`). The record names `AGENTQ_RUN`
+  (else `AGENTQ_JOB`, else `-`) and the pytest arguments. `pytest_unconfigure` releases it.
+- **Where it is loaded.** `launch_pi.py` sets, on the pi child unless `AGENTQ_SHIMS=0`:
+  `PYTHONPATH` (plugin folder prepended), `PYTEST_ADDOPTS` (`-p agentq_pytest_slot` appended),
+  and `PYTEST_XDIST_AUTO_NUM_WORKERS=2` and `LOR_CI_XDIST=2` when unset. Any project venv
+  then loads the plugin with no change to the project.
+- **Skips.** xdist workers (`workerinput` or `PYTEST_XDIST_WORKER`), so the main process
+  holds the one slot for the whole run; a run with `AGENTQ_PYTEST_SLOT_HELD` set. The shim
+  sets that variable for its child, so a shim-gated pytest takes no second slot. The plugin
+  sets it too on acquire, so a pytest started inside the run does not wait.
+- **Never fails a run.** Each error (missing or broken `slots.py`, an unwritable home, any
+  exception) prints one `agentq pytest slot:` line to stderr and the run continues unslotted.
+  `slots.py` is loaded by file path (`AGENTQ_SLOTS_PY` overrides it), and its package root
+  is on `sys.path` only while it imports.
+- **Not covered.** A pytest run with `PYTEST_ADDOPTS` set but outside a pi launch, where
+  `PYTHONPATH` may not name the plugin folder, fails at `-p` load time; that is pytest's
+  error and is why the launcher sets both variables together. Runs outside pi are not gated.
+
+Tests: `tests/test_agentq_pytest_plugin.py` (slot acquire and release, skips, error paths,
+a live `sys.executable -m pytest` run that checks the slot is held during the run, shim
+handoff, launcher env composition).
 
 ## Known limits
 

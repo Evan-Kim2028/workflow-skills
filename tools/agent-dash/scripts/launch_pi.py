@@ -56,6 +56,16 @@ passes the registry tier name with ``--tier``, so a DeepSeek run reads
 ``pi-deepseek`` and a Beam run ``pi-beam`` instead of the bare harness
 name. Without ``--tier`` the tier comes from the model family.
 
+Pytest slots (``agentq/pyplugin/agentq_pytest_slot.py``), unless ``AGENTQ_SHIMS=0``.
+The PATH shims only see ``pytest`` typed by name, so a worker that runs a venv
+interpreter by absolute path (``<venv>/bin/python -m pytest``) gets the slot from
+the plugin instead. ``shim_environ`` sets, on the pi child:
+
+- ``PYTHONPATH``: the plugin folder prepended to any existing value.
+- ``PYTEST_ADDOPTS``: ``-p agentq_pytest_slot`` appended to any existing value.
+- ``PYTEST_XDIST_AUTO_NUM_WORKERS=2`` and ``LOR_CI_XDIST=2``, each only when unset,
+  so xdist runs cap at two workers and a shared laptop is not oversubscribed.
+
 ``AGENT_DASH_PI_ENV_FILE`` names an env file to source before the run:
 ``run_worker.py`` sets it for a tier that declares ``standby_env_file``, so
 a rate-limited primary credential switches to the standby one. Only the
@@ -457,6 +467,9 @@ RUN_ENV = "AGENTQ_RUN"
 SHIMS_ENV = "AGENTQ_SHIMS"
 SHIM_PYTHON_ENV = "AGENTQ_SHIM_PYTHON"
 SHIMS_DIR = ROOT / "agentq" / "shims"
+PYTEST_PLUGIN_DIR = ROOT / "agentq" / "pyplugin"
+PYTEST_PLUGIN = "agentq_pytest_slot"
+XDIST_DEFAULTS = (("PYTEST_XDIST_AUTO_NUM_WORKERS", "2"), ("LOR_CI_XDIST", "2"))
 
 
 def set_run_label(label, environ=os.environ):
@@ -468,11 +481,13 @@ def set_run_label(label, environ=os.environ):
     return environ
 
 
-def shim_environ(environ, shims_dir=SHIMS_DIR, python=sys.executable):
+def shim_environ(environ, shims_dir=SHIMS_DIR, python=sys.executable, plugin_dir=PYTEST_PLUGIN_DIR):
     """Put the agentq command shims first on PATH for the pi child; ``AGENTQ_SHIMS=0`` skips it.
 
     The shims gate ssh to production hosts and pytest runs (see agentq/shims/dispatch.py).
     ``AGENTQ_SHIM_PYTHON`` names the interpreter the shims run their dispatcher with.
+    The pytest slot plugin and its xdist caps are set in the same place (see the module
+    docstring), under the same ``AGENTQ_SHIMS=0`` switch.
     """
     if (environ.get(SHIMS_ENV) or "").strip() == "0":
         return environ
@@ -480,6 +495,15 @@ def shim_environ(environ, shims_dir=SHIMS_DIR, python=sys.executable):
     rest = [part for part in (environ.get("PATH") or "").split(os.pathsep) if part and part != shims]
     environ["PATH"] = os.pathsep.join([shims, *rest])
     environ.setdefault(SHIM_PYTHON_ENV, python)
+    plugin = str(plugin_dir)
+    pythonpath = [part for part in (environ.get("PYTHONPATH") or "").split(os.pathsep) if part and part != plugin]
+    environ["PYTHONPATH"] = os.pathsep.join([plugin, *pythonpath])
+    addopts = (environ.get("PYTEST_ADDOPTS") or "").strip()
+    if f"-p {PYTEST_PLUGIN}" not in addopts:
+        environ["PYTEST_ADDOPTS"] = " ".join(part for part in (addopts, f"-p {PYTEST_PLUGIN}") if part)
+    for key, value in XDIST_DEFAULTS:
+        if not (environ.get(key) or "").strip():
+            environ[key] = value
     return environ
 
 
