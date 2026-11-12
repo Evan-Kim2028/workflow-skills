@@ -46,6 +46,7 @@ import os
 import re
 import shutil
 import sqlite3
+import stat
 import subprocess
 import sys
 import tarfile
@@ -946,7 +947,7 @@ def _cursor_rows(member: Member, fallback_ms: int):
         finally:
             con.close()
     finally:
-        shutil.rmtree(tmp, ignore_errors=True)
+        _discard_tree(tmp)
 
 
 def iter_member_rows(member: Member, unit: Unit, skip: int = 0):
@@ -1309,6 +1310,55 @@ def _trash_mismatch(trash: Path, members) -> list[str]:
     return bad
 
 
+def _rmdir_empty(root) -> None:
+    """Remove ``root`` and its now-empty subdirs bottom-up; never a file."""
+    for dirpath, _dirnames, _filenames in os.walk(str(root), topdown=False):
+        try:
+            os.rmdir(dirpath)
+        except OSError:
+            pass
+
+
+def _discard_tree(root) -> None:
+    """Remove a private temp tree: unlink its files, then rmdir bottom-up."""
+    root = str(root)
+    for dirpath, dirnames, filenames in os.walk(root, topdown=False):
+        for name in filenames:
+            try:
+                os.unlink(os.path.join(dirpath, name))
+            except OSError:
+                pass
+        for name in dirnames:
+            path = os.path.join(dirpath, name)
+            if os.path.islink(path):
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+        try:
+            os.rmdir(dirpath)
+        except OSError:
+            pass
+
+
+def _trash_files(entry: Path) -> list[Path] | None:
+    """Regular files under ``entry``; None if it holds a symlink or other type."""
+    files: list[Path] = []
+    for dirpath, dirnames, filenames in os.walk(str(entry), followlinks=False):
+        for name in dirnames + filenames:
+            path = Path(dirpath) / name
+            try:
+                st = os.lstat(path)
+            except OSError:
+                return None
+            if stat.S_ISDIR(st.st_mode):
+                continue
+            if not stat.S_ISREG(st.st_mode):
+                return None
+            files.append(path)
+    return files
+
+
 def _rollback(trash: Path, members) -> str:
     """Move trashed files back to their original paths. Returns leftovers.
 
@@ -1334,7 +1384,7 @@ def _rollback(trash: Path, members) -> str:
             problems.append("%s: %s" % (dst, exc))
             left = True
     if not left:
-        shutil.rmtree(trash, ignore_errors=True)
+        _rmdir_empty(trash)
     return "; ".join(problems)
 
 
@@ -1352,12 +1402,21 @@ def _archive_ok(rec: dict) -> bool:
 
 
 def _finish_reclaim(rec: dict, dest, manifest: Manifest) -> None:
-    """Step 5: delete the unit's trash dir, prune empty parents, record it."""
+    """Step 5: delete exactly the recorded trash members, prune, record it.
+
+    Only the files named in ``trash_members`` are unlinked, and the now-empty
+    dirs are removed bottom-up with ``os.rmdir``. An unlisted file (or any
+    non-empty dir) is therefore never deleted: the trash dir is left in place
+    for a person to look at.
+    """
     trash = _trash_dir(dest, rec["unit"])
-    root = _trash_root(dest)
-    if str(trash).startswith(str(root) + os.sep):
-        shutil.rmtree(trash, ignore_errors=True)
-    members = rec.get("trash_members") or rec.get("members") or []
+    members = rec.get("trash_members") or []
+    for m in members:
+        try:
+            os.unlink(trash / m["rel"])
+        except OSError:
+            pass
+    _rmdir_empty(trash)
     _prune_dirs(rec.get("parent") or "", [m["rel"] for m in members])
     manifest.write(dict(rec, status="reclaimed", reclaimed_ts=round(time.time(), 3)))
 
@@ -1514,92 +1573,94 @@ def reclaim_unit(
     return None
 
 
-def _recover_members(rec: dict) -> list[dict] | None:
-    """Members a recovery can verify, or None when the record cannot.
-
-    The reclaiming journal carries ``trash_members`` with each original
-    path. A record that lost them (an ``error`` record built before the
-    journal was preserved) still names its packed members and its parent,
-    so the original path is ``parent/rel``; such a member is only usable
-    when its sha256 is recorded, otherwise the trash contents cannot be
-    proven and must be left alone.
-    """
-    members = rec.get("trash_members")
-    if members:
-        return members
-    parent = rec.get("parent") or ""
-    out = []
-    for m in rec.get("members") or []:
-        if not m.get("sha256") or m.get("size") is None or not m.get("rel"):
-            return None
-        path = m.get("path") or (os.path.join(parent, m["rel"]) if parent else "")
-        if not path:
-            return None
-        out.append({"rel": m["rel"], "path": path, "sha256": m["sha256"], "size": m["size"]})
-    return out or None
-
-
 def _trash_uid(manifest: Manifest, entry: Path) -> str | None:
-    """The unit whose manifest record names ``entry`` as its trash dir."""
+    """The unit whose canonical trash dir name is ``entry``'s name."""
     name = entry.name
     for uid in manifest.latest:
         if _uid_safe(uid) == name:
             return uid
-    target = os.path.abspath(str(entry))
-    for uid, rec in manifest.latest.items():
-        try:
-            named = os.path.abspath(str(rec.get("trash") or ""))
-        except (TypeError, ValueError):
-            continue
-        if rec.get("trash") and named == target:
-            return uid
     return None
 
 
-def _recover_one(uid: str, rec: dict, dest, manifest: Manifest, out, members=None) -> None:
-    """Resolve one ``reclaiming`` record from whatever the trash holds."""
-    entry = _trash_dir(dest, uid)
-    if members is None:
-        members = _recover_members(rec) or []
-    files = [p for p in entry.rglob("*") if p.is_file()] if entry.is_dir() else []
+def _trash_plan(manifest: Manifest, entry: Path) -> tuple[str, str]:
+    """What recovery does with ``entry``, and why.
+
+    ``finish`` deletes exactly the recorded members, ``rollback`` moves them
+    back to their original paths, ``archive`` records that nothing is left in
+    trash, and ``leave`` touches nothing. Recovery acts only on a canonical
+    trash dir named by a ``reclaiming``/``error`` record that carries
+    ``trash_members``; every other dir is left exactly as it is.
+    """
+    uid = _trash_uid(manifest, entry)
+    if uid is None:
+        return "leave", "no manifest record names this trash dir"
+    rec = manifest.latest.get(uid) or {}
+    if rec.get("status") not in ("reclaiming", "error") or not rec.get("trash_members"):
+        return "leave", "manifest record for %s is not a reclaim journal" % uid
+    members = rec["trash_members"]
+    named = rec.get("trash")
+    if named and os.path.abspath(str(named)) != os.path.abspath(str(entry)):
+        return "leave", "record names a non-canonical trash dir %s" % named
+    files = _trash_files(entry) if entry.is_dir() else []
+    if files is None:
+        return "leave", "holds a symlink or non-regular entry"
     if not files:
         # Crash after the trash delete (or before any rename).
         if _archive_ok(rec) and all(not os.path.exists(m["path"]) for m in members):
-            _finish_reclaim(rec, dest, manifest)
-            print("  recovered reclaim %s: reclaimed" % uid, file=out)
-        else:
-            manifest.write(dict(rec, status="archived", reclaim_reason="recovered: nothing in trash"))
-            print("  recovered reclaim %s: archived" % uid, file=out)
-        return
+            return "finish", "trash already deleted"
+        return "archive", "nothing in trash"
+    rels = {str(p.relative_to(entry)) for p in files}
+    listed = {m["rel"] for m in members}
+    unlisted = sorted(rels - listed)
+    if unlisted:
+        return "leave", "holds file(s) not in the manifest record: %s" % ", ".join(unlisted[:5])
     bad = _trash_mismatch(entry, members)
-    if bad or not _archive_ok(rec):
-        leftover = _rollback(entry, members)
+    if rels == listed and not bad and _archive_ok(rec):
+        return "finish", "trash matches the verified archive"
+    # Roll back only when every file in the dir is a listed member whose
+    # original path is free; a member still at its original path is fine.
+    taken = [m["path"] for m in members if m["rel"] in rels and os.path.lexists(m["path"])]
+    if taken:
+        return "leave", "original path(s) already present: %s" % ", ".join(taken[:5])
+    return "rollback", "trash does not match the archive: %s" % (", ".join(bad[:5]) or "incomplete")
+
+
+def _recover_one(uid: str, rec: dict, dest, manifest: Manifest, out) -> None:
+    """Resolve one reclaim journal from its canonical trash dir, or leave it."""
+    entry = _trash_dir(dest, uid)
+    action, why = _trash_plan(manifest, entry)
+    if action == "finish":
+        _finish_reclaim(rec, dest, manifest)
+        print("  recovered reclaim %s: reclaimed" % uid, file=out)
+    elif action == "archive":
+        manifest.write(dict(rec, status="archived", reclaim_reason="recovered: nothing in trash"))
+        print("  recovered reclaim %s: archived" % uid, file=out)
+    elif action == "rollback":
+        leftover = _rollback(entry, rec["trash_members"])
         manifest.write(
             dict(
                 rec,
                 status="error" if leftover else "archived",
-                error="recovered: trash mismatch %s%s"
-                % (", ".join(bad[:5]), "; " + leftover if leftover else ""),
+                error="recovered: %s%s" % (why, "; " + leftover if leftover else ""),
             )
         )
         print("  recovered reclaim %s: rolled back" % uid, file=out)
     else:
-        _finish_reclaim(rec, dest, manifest)
-        print("  recovered reclaim %s: reclaimed" % uid, file=out)
+        print("  trash dir %s left in place (%s)" % (entry, why), file=out)
 
 
 def recover_trash(dest, manifest: Manifest, out) -> int:
-    """Resolve every ``reclaiming`` record and leftover trash dir.
+    """Resolve every reclaim journal and report every other trash dir.
 
-    Runs at the start of every ``--apply``. If the trash hashes match the
-    manifest and the archive verifies, step 5 is finished (``reclaimed``);
-    otherwise the files are moved back and the unit returns to ``archived``.
-    A ``reclaiming`` record is resolved even when its trash dir is already
-    gone (a crash after the trash delete). An ``error`` record that carries
-    ``trash_members`` is resolved too, and a leftover trash dir is matched
-    to its unit through the manifest (by the recorded ``trash`` path when
-    the dir name alone does not match). A dir no record names is never
-    deleted: it is left in place and reported. Returns the number resolved.
+    Runs at the start of every ``--apply``. A record whose latest status is
+    ``reclaiming`` or ``error`` and that carries ``trash_members`` is
+    resolved from its canonical trash dir: when the dir holds exactly the
+    recorded members, each hashing to its recorded sha256, and the archive
+    verifies, the reclaim is finished; when every file is a listed member
+    whose original path is free, the files are moved back. Anything else is
+    left exactly as it is and reported. A trash dir no record names, or one
+    whose record is not a reclaim journal, is never touched. Returns the
+    number of records resolved.
     """
     root = _trash_root(dest)
     resolved = 0
@@ -1622,26 +1683,11 @@ def recover_trash(dest, manifest: Manifest, out) -> int:
                 continue
             uid = _trash_uid(manifest, entry)
             if uid is None:
-                # No manifest record names this dir: never delete unknown
-                # data. Leave it in place; `status` reports it.
-                if any(entry.iterdir()):
-                    print("  trash without a manifest record, left in place: %s" % entry, file=out)
-                else:
-                    shutil.rmtree(entry, ignore_errors=True)
+                print("  trash without a manifest record, left in place: %s" % entry, file=out)
                 continue
             if uid in resolved_uids:
                 continue
-            rec = manifest.latest.get(uid) or {}
-            members = _recover_members(rec)
-            if members is None:
-                print(
-                    "  trash dir %s has no verifiable manifest record, left in place" % entry,
-                    file=out,
-                )
-                continue
-            _recover_one(uid, rec, dest, manifest, out, members=members)
-            resolved_uids.add(uid)
-            resolved += 1
+            print("  trash dir %s has no reclaim journal, left in place" % entry, file=out)
     return resolved
 
 
@@ -2035,7 +2081,7 @@ def _projected(units, cfg, manifest, open_set, now, sample) -> int:
                 continue
             picked[unit.tool] = picked.get(unit.tool, 0) + 1
     finally:
-        shutil.rmtree(tmpdir, ignore_errors=True)
+        _discard_tree(tmpdir)
     return total
 
 
@@ -2149,62 +2195,37 @@ def _select_archive(manifest: Manifest, arg: str, out):
     return rec, chosen
 
 
-def _ensure_dir(path: str) -> None:
-    """Create ``path``; every component made is verified as a real dir."""
-    path = os.path.abspath(path)
-    missing = []
-    cur = path
-    while not os.path.isdir(cur):
-        if os.path.lexists(cur):
-            raise ArchiveError("refusing to create %s: %s exists and is not a directory" % (path, cur))
-        missing.append(cur)
-        parent = os.path.dirname(cur)
-        if parent == cur:
-            break
-        cur = parent
-    for piece in reversed(missing):
-        try:
-            os.mkdir(piece)
-        except FileExistsError:
-            pass
-        if os.path.islink(piece) or not os.path.isdir(piece):
-            raise ArchiveError("refusing to create %s: %s is not a real directory" % (path, piece))
+def _open_dir_at(name: str, parent_fd: int) -> int:
+    """Open ``name`` under ``parent_fd`` as a real directory, never a symlink."""
+    return os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd)
 
 
-def _ancestor_problems(target: str, members) -> list[str]:
-    """Symlinked or escaping ancestors of every final path under ``target``.
+def _open_dirs_at(root_fd: int, parts, create: bool) -> tuple[int, list[int]]:
+    """Open the dir for ``parts`` under ``root_fd``; returns (fd, opened fds).
 
-    Walks every existing component between the restore target and each
-    member's file. A symlink there (or a component that resolves somewhere
-    else) could take restored bytes outside ``target``, so it is refused
-    before anything is created.
+    Every component is opened with ``O_NOFOLLOW``, so a symlink swapped in
+    after validation is refused rather than followed. With ``create`` a
+    missing component is made with ``mkdir(..., dir_fd=...)`` and then opened
+    the same way. The caller closes every fd in the returned list.
     """
-    target = os.path.abspath(target)
-    if os.path.islink(target):
-        return ["%s is a symlink" % target]
-    bad: list[str] = []
-    seen: set[str] = set()
-    for m in members:
-        parts = (m.get("rel") or "").replace("\\", "/").split("/")[:-1]
-        cur = target
+    opened: list[int] = []
+    fd = root_fd
+    try:
         for part in parts:
-            cur = os.path.join(cur, part)
-            if cur in seen:
-                continue
-            seen.add(cur)
-            if os.path.islink(cur):
-                bad.append("%s is a symlink" % cur)
-                break
-            if not os.path.lexists(cur):
-                break
-            if not os.path.isdir(cur):
-                bad.append("%s is not a directory" % cur)
-                break
-            real = os.path.realpath(cur)
-            if real != cur:
-                bad.append("%s resolves to %s" % (cur, real))
-                break
-    return bad
+            try:
+                nfd = _open_dir_at(part, fd)
+            except FileNotFoundError:
+                if not create:
+                    raise
+                os.mkdir(part, 0o700, dir_fd=fd)
+                nfd = _open_dir_at(part, fd)
+            opened.append(nfd)
+            fd = nfd
+    except BaseException:
+        for other in opened:
+            os.close(other)
+        raise
+    return fd, opened
 
 
 def _safe_rel(name: str) -> bool:
@@ -2293,63 +2314,61 @@ def restore(arg: str, to: str | None, state_dir: Path, out) -> int:
         for path in existing[:20]:
             print("  %s" % path, file=sys.stderr)
         return 2
-    # Refuse a symlinked or escaping ancestor of any final path before
-    # creating or renaming anything: extraction into a temp dir is safe,
-    # but a rename would otherwise follow an existing ``target/sid -> /x``.
-    bad = _ancestor_problems(target_abs, members)
-    if bad:
-        print("refusing to restore through %d unexpected ancestor(s):" % len(bad), file=sys.stderr)
-        for line in bad[:20]:
-            print("  %s" % line, file=sys.stderr)
-        return 2
-    parent = os.path.dirname(target_abs) or "."
+    # Every step below is fd-relative: the target is opened once with
+    # O_NOFOLLOW, each component is opened with O_NOFOLLOW, and the final
+    # rename uses the already-open dir fd. A symlink swapped in after the
+    # target was opened is therefore never followed.
     try:
-        _ensure_dir(parent)
-    except ArchiveError as exc:
+        os.makedirs(target_abs, exist_ok=True)
+        target_fd = os.open(target_abs, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError as exc:
         print("restore failed, target untouched: %s" % exc, file=sys.stderr)
         return 2
-    tmp = tempfile.mkdtemp(prefix=".restore-", dir=parent)
-    moved: list[tuple[str, str]] = []
+    tmp_name = ".restore-%s" % os.urandom(6).hex()
+    tmp_fd = -1
+    moved: list[str] = []
     try:
-        _extract(archive, tmp, members)
-        # Re-check after extraction: a concurrent writer (or a symlink made
-        # while we extracted) must not be clobbered or followed.
-        existing = [
-            os.path.join(target_abs, m["rel"])
-            for m in members
-            if os.path.lexists(os.path.join(target_abs, m["rel"]))
-        ]
-        if existing:
-            print("refusing to overwrite %d existing path(s):" % len(existing), file=sys.stderr)
-            for path in existing[:20]:
-                print("  %s" % path, file=sys.stderr)
-            return 2
-        bad = _ancestor_problems(target_abs, members)
-        if bad:
-            print("refusing to restore through %d unexpected ancestor(s):" % len(bad), file=sys.stderr)
-            for line in bad[:20]:
-                print("  %s" % line, file=sys.stderr)
-            return 2
+        os.mkdir(tmp_name, 0o700, dir_fd=target_fd)
+        tmp_fd = _open_dir_at(tmp_name, target_fd)
+        _extract(archive, os.path.join(target_abs, tmp_name), members)
         for m in members:
-            src = os.path.join(tmp, m["rel"])
-            dst = os.path.join(target_abs, m["rel"])
-            _ensure_dir(os.path.dirname(dst))
-            if os.path.islink(dst) or os.path.lexists(dst):
-                raise ArchiveError("refusing to overwrite %s" % dst)
-            os.rename(src, dst)
-            moved.append((src, dst))
+            parts = m["rel"].split("/")
+            leaf = parts[-1]
+            pfd, opened = _open_dirs_at(target_fd, parts[:-1], create=True)
+            try:
+                try:
+                    os.stat(leaf, dir_fd=pfd, follow_symlinks=False)
+                except FileNotFoundError:
+                    pass
+                else:
+                    raise ArchiveError("refusing to overwrite %s" % m["rel"])
+                os.rename(m["rel"], leaf, src_dir_fd=tmp_fd, dst_dir_fd=pfd)
+                moved.append(m["rel"])
+            finally:
+                for fd in opened:
+                    os.close(fd)
     except (ArchiveError, OSError) as exc:
         # Put back anything already renamed so the target is untouched.
-        for src, dst in reversed(moved):
+        for rel in reversed(moved):
+            parts = rel.split("/")
             try:
-                os.makedirs(os.path.dirname(src), exist_ok=True)
-                os.rename(dst, src)
+                pfd, opened = _open_dirs_at(target_fd, parts[:-1], create=False)
+            except OSError:
+                continue
+            try:
+                os.rename(parts[-1], rel, src_dir_fd=pfd, dst_dir_fd=tmp_fd)
             except OSError:
                 pass
+            finally:
+                for fd in opened:
+                    os.close(fd)
         print("restore failed, target untouched: %s" % exc, file=sys.stderr)
         return 2
     finally:
-        shutil.rmtree(tmp, ignore_errors=True)
+        if tmp_fd >= 0:
+            os.close(tmp_fd)
+        os.close(target_fd)
+        _discard_tree(os.path.join(target_abs, tmp_name))
     manifest.write(dict(rec, status="restored"))
     print("restored %s to %s" % (rec["unit"], target), file=out)
     return 0
@@ -2414,11 +2433,17 @@ def status(state_dir: Path, out) -> int:
                 except OSError:
                     pass
         print("trash: %d file(s), %s (resolved by the next --apply)" % (count, _fmt(size)), file=out)
-        # A trash dir no manifest record names is never deleted by recovery;
-        # report it here so a person can look at it.
+        # Recovery never deletes a trash dir it cannot prove; report every
+        # dir it will leave in place so a person can look at it.
         for entry in sorted(trash.iterdir()):
-            if entry.is_dir() and _trash_uid(manifest, entry) is None and any(entry.iterdir()):
+            if not entry.is_dir():
+                continue
+            if _trash_uid(manifest, entry) is None:
                 print("trash without a manifest record (left in place): %s" % entry, file=out)
+                continue
+            action, why = _trash_plan(manifest, entry)
+            if action == "leave":
+                print("trash left in place: %s (%s)" % (entry, why), file=out)
     last = state_dir / "last_success.json"
     if last.exists():
         try:

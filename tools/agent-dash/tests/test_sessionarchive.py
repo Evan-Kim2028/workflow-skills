@@ -92,6 +92,26 @@ def age(path, days):
     os.utime(path, (ts, ts))
 
 
+def _archive_diag(rec):
+    """Why ``_archive_ok`` would say no: path, size vs recorded, verify error."""
+    archive = rec.get("archive")
+    try:
+        size = os.path.getsize(archive) if archive else None
+    except OSError as exc:
+        size = "stat failed: %s" % exc
+    try:
+        sa.verify_archive(archive, rec.get("members") or [])
+        why = "verifies"
+    except Exception as exc:  # noqa: BLE001 - diagnostic only
+        why = "%s: %s" % (type(exc).__name__, exc)
+    return "archive=%r size=%r archive_bytes=%r verify=%s" % (
+        archive,
+        size,
+        rec.get("archive_bytes"),
+        why,
+    )
+
+
 def zstd_compress(src, dst):
     Path(dst).parent.mkdir(parents=True, exist_ok=True)
     subprocess.run(["zstd", "-q", "-f", "-o", str(dst), str(src)], check=True)
@@ -1239,7 +1259,7 @@ class ReclaimCrashTest(Base):
         real_rename = os.rename
         real_write = sa.Manifest.write
         real_mismatch = sa._trash_mismatch
-        real_rmtree = shutil.rmtree
+        real_rmdir_empty = sa._rmdir_empty
         state = {"renames": 0}
 
         def flaky_rename(src, dst):
@@ -1261,15 +1281,15 @@ class ReclaimCrashTest(Base):
                 raise OSError("crash")
             return result
 
-        def flaky_rmtree(path, *args, **kwargs):
-            real_rmtree(path, *args, **kwargs)
+        def flaky_rmdir_empty(path):
+            real_rmdir_empty(path)
             if point == "trashdelete" and str(path).startswith(str(dest / "state" / "trash")):
                 raise OSError("crash")
 
         with mock.patch.object(sa.os, "rename", flaky_rename), mock.patch.object(
             sa.Manifest, "write", flaky_write
         ), mock.patch.object(sa, "_trash_mismatch", flaky_mismatch), mock.patch.object(
-            sa.shutil, "rmtree", flaky_rmtree
+            sa, "_rmdir_empty", flaky_rmdir_empty
         ):
             try:
                 sa.reclaim_unit(unit, rec, cfg, time.time(), manifest, dest, client)
@@ -1279,7 +1299,10 @@ class ReclaimCrashTest(Base):
         sa.recover_trash(dest, sa.Manifest(dest / "state"), open(os.devnull, "w"))
         final = sa.Manifest(dest / "state").latest[unit.uid]
         originals = [Path(m.path).exists() for m in unit.members]
-        self.assertTrue(sa._archive_ok(final), "archive must verify after %s" % point)
+        self.assertTrue(
+            sa._archive_ok(final),
+            "archive must verify after %s: %s" % (point, _archive_diag(final)),
+        )
         if final["status"] == "reclaimed":
             self.assertFalse(any(originals), "reclaimed but originals remain after %s" % point)
         else:
@@ -1341,7 +1364,7 @@ class ApplyPassRecoveryTest(Base):
         real_rename = os.rename
         real_write = sa.Manifest.write
         real_mismatch = sa._trash_mismatch
-        real_rmtree = shutil.rmtree
+        real_rmdir_empty = sa._rmdir_empty
         state = {"renames": 0}
 
         def flaky_rename(src, dst):
@@ -1363,15 +1386,15 @@ class ApplyPassRecoveryTest(Base):
                 raise OSError("simulated crash")
             return result
 
-        def flaky_rmtree(path, *args, **kwargs):
-            real_rmtree(path, *args, **kwargs)
+        def flaky_rmdir_empty(path):
+            real_rmdir_empty(path)
             if point == "trashdelete" and str(path).startswith(str(dest / "state" / "trash")):
                 raise OSError("simulated crash")
 
         with mock.patch.object(sa.os, "rename", flaky_rename), mock.patch.object(
             sa.Manifest, "write", flaky_write
         ), mock.patch.object(sa, "_trash_mismatch", flaky_mismatch), mock.patch.object(
-            sa.shutil, "rmtree", flaky_rmtree
+            sa, "_rmdir_empty", flaky_rmdir_empty
         ):
             results = sa.apply_pass(
                 [unit],
@@ -1436,8 +1459,8 @@ class ApplyPassRecoveryTest(Base):
         self.assertFalse(any(Path(m.path).exists() for m in unit.members))
         self.assertTrue(sa._archive_ok(final))
 
-    def test_error_record_without_trash_members_still_recovers(self):
-        """An e6e145d-style clobbered record is matched and rolled back."""
+    def test_error_record_without_trash_members_is_left_and_reported(self):
+        """An e6e145d-style record without trash_members is never guessed at."""
         unit, dest, _client, manifest, _cfg = self._setup()
         rec = manifest.latest[unit.uid]
         trash = sa._trash_dir(dest, unit.uid)
@@ -1450,13 +1473,15 @@ class ApplyPassRecoveryTest(Base):
         manifest.write(dict(rec, status="error", error="simulated stale record"))
         crashed = sa.Manifest(dest / "state").latest[unit.uid]
         self.assertFalse(crashed.get("trash_members"))
-        final = self._recover(unit, dest)
-        # The archive verifies and the trash hashes match its members, so
-        # recovery finishes the reclaim instead of leaving the files stranded.
-        self.assertEqual(final["status"], "reclaimed")
+        out = io.StringIO()
+        sa.recover_trash(dest, sa.Manifest(dest / "state"), out)
+        final = sa.Manifest(dest / "state").latest[unit.uid]
+        # Without trash_members the trash contents cannot be proven, so
+        # nothing is deleted and the unit is not marked reclaimed.
+        self.assertEqual(final["status"], "error")
         for member in unit.members:
-            self.assertFalse(Path(member.path).exists(), member.rel)
-        self.assertTrue(sa._archive_ok(final))
+            self.assertTrue((trash / member.rel).exists(), member.rel)
+        self.assertIn("no reclaim journal", out.getvalue())
 
     def test_unmatched_trash_dir_is_left_and_reported(self):
         unit, dest, _client, _manifest, _cfg = self._setup()
@@ -1565,6 +1590,131 @@ class RestoreRound4Test(Base):
             sa.restore(str(archive1), str(self.home / "bad"), dest / "state", sys.stdout), 2
         )
         self.assertFalse((self.home / "bad").exists())
+
+
+# --------------------------------------------------------------- round 5
+
+class Round5RecoveryTest(Base):
+    """Round 5: recovery acts only on a provable, canonical trash dir."""
+
+    def _setup(self):
+        root = self.home / "grok"
+        sdir = root / "enc" / "sid"
+        write(sdir / "chat_history.jsonl", '{"type":"system"}\n')
+        write(sdir / "blob.bin", bytes(range(256)) * 32)
+        for path in sdir.rglob("*"):
+            if path.is_file():
+                age(path, 20)
+        unit = self.unit("grok", root)
+        dest = self.home / "dest"
+        rec, manifest = self.archive_unit(unit, dest, FakeClient())
+        return unit, dest, rec, manifest
+
+    def _journal(self, unit, dest, manifest, rec, trash, status="reclaiming"):
+        """Move the originals into ``trash`` and write a reclaim journal."""
+        by_rel = {m["rel"]: m for m in rec["members"]}
+        members = []
+        for member in unit.members:
+            dst = trash / member.rel
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            os.rename(member.path, dst)
+            members.append(
+                {
+                    "rel": member.rel,
+                    "path": member.path,
+                    "sha256": by_rel[member.rel]["sha256"],
+                    "size": by_rel[member.rel]["size"],
+                }
+            )
+        manifest.write(dict(rec, status=status, trash=str(trash), trash_members=members))
+        return members
+
+    def test_unlisted_file_in_a_matched_trash_dir_survives(self):
+        unit, dest, rec, manifest = self._setup()
+        trash = sa._trash_dir(dest, unit.uid)
+        self._journal(unit, dest, manifest, rec, trash)
+        unlisted = trash / "sid" / "unlisted-only-copy.txt"
+        write(unlisted, "only here\n")
+        out = io.StringIO()
+        sa.recover_trash(dest, sa.Manifest(dest / "state"), out)
+        final = sa.Manifest(dest / "state").latest[unit.uid]
+        self.assertNotEqual(final["status"], "reclaimed")
+        self.assertEqual(unlisted.read_text(encoding="utf-8"), "only here\n")
+        for member in unit.members:
+            self.assertTrue((trash / member.rel).exists(), member.rel)
+        self.assertIn("not in the manifest record", out.getvalue())
+        status_out = io.StringIO()
+        sa.status(dest / "state", status_out)
+        self.assertIn("trash left in place", status_out.getvalue())
+        self.assertIn(str(trash), status_out.getvalue())
+        self.assertIn("unlisted-only-copy.txt", status_out.getvalue())
+
+    def test_unmatched_empty_trash_dir_survives(self):
+        _unit, dest, _rec, _manifest = self._setup()
+        orphan = sa._trash_root(dest) / "unknown%2Funit"
+        orphan.mkdir(parents=True)
+        out = io.StringIO()
+        sa.recover_trash(dest, sa.Manifest(dest / "state"), out)
+        self.assertTrue(orphan.is_dir(), "an unmatched empty trash dir was deleted")
+        self.assertIn("trash without a manifest record", out.getvalue())
+        status_out = io.StringIO()
+        sa.status(dest / "state", status_out)
+        self.assertIn("trash without a manifest record", status_out.getvalue())
+        self.assertIn(str(orphan), status_out.getvalue())
+
+    def test_non_canonical_trash_dir_is_left_and_not_reclaimed(self):
+        unit, dest, rec, manifest = self._setup()
+        custom = sa._trash_root(dest) / "legacy-custom-name"
+        self._journal(unit, dest, manifest, rec, custom, status="error")
+        out = io.StringIO()
+        sa.recover_trash(dest, sa.Manifest(dest / "state"), out)
+        final = sa.Manifest(dest / "state").latest[unit.uid]
+        self.assertNotEqual(final["status"], "reclaimed")
+        for member in unit.members:
+            self.assertTrue((custom / member.rel).exists(), member.rel)
+        self.assertIn("non-canonical", out.getvalue())
+        status_out = io.StringIO()
+        sa.status(dest / "state", status_out)
+        self.assertIn(str(custom), status_out.getvalue())
+
+
+class Round5RestoreTest(Base):
+    """Round 5: restore is fd-relative, so a late symlink is never followed."""
+
+    def test_restore_does_not_follow_a_symlink_swapped_in_after_open(self):
+        root = self.home / "grok"
+        sdir = root / "enc" / "sid"
+        write(sdir / "sub" / "a.jsonl", '{"type":"system"}\n')
+        for path in sdir.rglob("*"):
+            if path.is_file():
+                age(path, 20)
+        unit = self.unit("grok", root)
+        dest = self.home / "dest"
+        self.archive_unit(unit, dest, FakeClient())
+        outside = self.home / "outside"
+        outside.mkdir()
+        target = self.home / "restored"
+        target.mkdir()
+        real_rename = os.rename
+        state = {"swapped": False}
+
+        def swapping_rename(src, dst, *args, **kwargs):
+            if not state["swapped"]:
+                state["swapped"] = True
+                # Swap the already-opened component for a symlink to outside
+                # between the dir open and the rename.
+                (outside / "sub").mkdir(parents=True, exist_ok=True)
+                real_rename(str(target / "sid"), str(target / "sid-real"))
+                os.symlink(outside, target / "sid")
+            return real_rename(src, dst, *args, **kwargs)
+
+        with mock.patch.object(sa.os, "rename", swapping_rename):
+            rc = sa.restore(unit.session, str(target), dest / "state", sys.stdout)
+        self.assertEqual(rc, 0)
+        self.assertEqual([p for p in outside.rglob("*") if p.is_file()], [])
+        self.assertEqual(
+            (target / "sid-real" / "sub" / "a.jsonl").read_bytes(), b'{"type":"system"}\n'
+        )
 
 
 # --------------------------------------------------------------- real store e2e
