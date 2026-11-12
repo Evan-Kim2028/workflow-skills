@@ -17,10 +17,12 @@ import time
 import uuid
 from pathlib import Path
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 LANES = ("urgent", "normal", "backlog")
 KINDS = ("read", "write", "review")
 RESOURCES = ("light", "tests", "ssh")
+REVIEW_TIER = "pi-kimi"
+DEFAULT_TIER = "pi-deepseek-flash"
 OPEN_STATES = ("queued", "running")
 TERMINAL_STATES = ("done", "failed", "cancelled")
 AGING_S = 15 * 60
@@ -31,6 +33,20 @@ CONNECT_TIMEOUT_S = 30
 RETRY_BUDGET_S = 60.0
 BACKOFF_MIN_S = 0.05
 BACKOFF_MAX_S = 1.0
+
+BACKLOG_TABLE = """CREATE TABLE backlog_templates (
+    name TEXT PRIMARY KEY,
+    prompt_path TEXT NOT NULL,
+    kind TEXT NOT NULL DEFAULT 'read',
+    res TEXT NOT NULL DEFAULT 'light',
+    tier TEXT,
+    workspace TEXT NOT NULL,
+    every_s REAL NOT NULL,
+    max_runtime_s REAL,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    last_submitted REAL,
+    created_at REAL NOT NULL
+)"""
 
 _STATEMENTS = (
     """CREATE TABLE jobs (
@@ -76,6 +92,7 @@ _STATEMENTS = (
         kind TEXT NOT NULL,
         detail TEXT
     )""",
+    BACKLOG_TABLE,
 )
 
 # Each step upgrades a store from the version it names to the next one.
@@ -84,6 +101,7 @@ _UPGRADES = {
         "ALTER TABLE jobs ADD COLUMN orig_workspace TEXT",
         "ALTER TABLE jobs ADD COLUMN in_place INTEGER NOT NULL DEFAULT 0",
     ),
+    2: (BACKLOG_TABLE.replace("CREATE TABLE ", "CREATE TABLE IF NOT EXISTS ", 1),),
 }
 
 JOB_COLUMNS = frozenset(
@@ -96,6 +114,11 @@ JOB_COLUMNS = frozenset(
         "finished_at", "priority_age_at",
     }
 )  # fmt: skip
+
+
+def default_tier(kind: str) -> str:
+    """The tier a job of ``kind`` runs on when no tier is given: review goes to pi-kimi."""
+    return REVIEW_TIER if kind == "review" else DEFAULT_TIER
 
 
 def home_dir(env=None) -> Path:

@@ -1,6 +1,7 @@
 """agentq command line.
 
-Commands: submit, wait, escalate, ls, result, cancel, daemon, status. Every
+Commands: submit, wait, escalate, ls, result, cancel, daemon, status, slots and
+backlog (add, ls, rm, pause, resume). Every
 command prints its output and ends with one ``ANSWER:`` line. Exit codes:
 0 ok, 1 negative fact (unknown job, nothing to escalate, a failed job), 3
 timeout or the store unreachable.
@@ -18,20 +19,17 @@ import sys
 import time
 from pathlib import Path
 
+from agentq import backlog as backlog_lib
 from agentq import broker as broker_lib
 from agentq import db
 from agentq import slots as slots_lib
 
-AGENT_DASH = Path(__file__).resolve().parents[1]
-AGENT_DASH_LABEL = AGENT_DASH / "agent_dash.py"
 HARNESS_VARS = (
     ("CLAUDE_CODE_SESSION_ID", "claude"),
     ("CODEX_SESSION_ID", "codex"),
     ("MUSE_SESSION_ID", "muse"),
 )
 HARNESS_BINARIES = ("claude", "codex", "muse", "pi")
-REVIEW_TIER = "pi-kimi"
-DEFAULT_TIER = "pi-deepseek-flash"
 
 
 def _ps_parent_and_args(pid: int):
@@ -87,21 +85,6 @@ def identity(env, cwd: str, ancestor=harness_ancestor) -> tuple[str, str]:
     return f"shell:{os.getppid()}:{cwd}", "shell"
 
 
-def make_label(kind: str, job_id: str) -> str | None:
-    """A hub label from ``agent_dash.py label make``, or None when it refuses."""
-    mark = "review" if kind == "review" else "exec"
-    cmd = [
-        sys.executable, str(AGENT_DASH_LABEL), "label", "make",
-        "--scope", "hub", "--mark", mark, "--slug", f"agentq-{job_id[:8]}",
-    ]
-    try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30, check=False)
-    except (OSError, subprocess.SubprocessError):
-        return None
-    lines = proc.stdout.strip().splitlines()
-    return lines[-1] if proc.returncode == 0 and lines else None
-
-
 class Context:
     """Per-invocation state: home, output stream, clock and the caller's identity."""
 
@@ -141,10 +124,10 @@ def cmd_submit(args, ctx: Context) -> int:
         return answer(ctx, f"no prompt file at {prompt}", 1)
     lane = "urgent" if args.urgent else "backlog" if args.backlog else "normal"
     job_id = db.new_job_id()
-    label = args.label or make_label(args.kind, job_id)
+    label = args.label or broker_lib.label_for(args.kind, f"agentq-{job_id[:8]}")
     if not label:
         return answer(ctx, "label make refused; pass --label", 1)
-    tier = args.tier or (REVIEW_TIER if args.kind == "review" else DEFAULT_TIER)
+    tier = args.tier or db.default_tier(args.kind)
     workspace = os.path.abspath(os.path.expanduser(args.workspace or os.getcwd()))
     conn = db.connect(ctx.home)
     dest = db.job_dir(ctx.home, job_id) / "prompt.md"
@@ -281,6 +264,10 @@ def cmd_status(args, ctx: Context) -> int:
         ctx.print(f"queued {lane}: {depth.get(lane, 0)}")
     for tier, res, count in running:
         ctx.print(f"running {tier} {res}: {count}")
+    templates = backlog_lib.select_all(conn)
+    enabled = sum(1 for template in templates if template["enabled"])
+    ctx.print(f"backlog templates: {enabled} enabled of {len(templates)}; "
+              f"template jobs open: {backlog_lib.open_backlog_jobs(conn)}")
     proxy = broker_lib.proxy_status()
     ctx.print(f"proxy: {'reachable' if proxy is not None else 'unreachable (static slots)'}")
     daemon = "not running" if pid is None else f"running (pid {pid or '?'})"
@@ -301,6 +288,81 @@ def cmd_slots(args, ctx: Context) -> int:
                       f"label {item['label'] or '-'}  {item['command']}")
         parts.append(f"{kind} {len(held)}/{limit}")
     return answer(ctx, "slots held: " + "; ".join(parts), 0)
+
+
+def _when(ts) -> str:
+    return "never" if ts is None else time.strftime("%Y-%m-%d %H:%M", time.localtime(ts))
+
+
+def _next_due(conn, template: dict, now: float) -> str:
+    if not template["enabled"]:
+        return "paused"
+    if backlog_lib.open_job(conn, template["name"]) is not None:
+        return "job open"
+    if backlog_lib.is_due(template, now):
+        return "now (waits for idle Morph)"
+    return _when(template["last_submitted"] + template["every_s"])
+
+
+def cmd_backlog_add(args, ctx: Context) -> int:
+    conn = db.connect(ctx.home)
+    try:
+        every_s = backlog_lib.parse_duration(args.every)
+        max_runtime = backlog_lib.parse_duration(args.max_runtime) if args.max_runtime else None
+        workspace = os.path.abspath(os.path.expanduser(args.workspace or os.getcwd()))
+        with db.tx(conn):
+            row = backlog_lib.add(
+                conn, ctx.home, name=args.name, prompt_file=args.prompt_file, every_s=every_s,
+                kind=args.kind, res=args.res, workspace=workspace, tier=args.tier,
+                max_runtime_s=max_runtime, now=ctx.now(),
+            )
+    except ValueError as exc:
+        return answer(ctx, str(exc), 1)
+    every = backlog_lib.format_duration(row["every_s"])
+    return answer(ctx, f"added backlog {row['name']}: every {every}, {row['kind']} {row['res']}, "
+                       f"prompt copied to {row['prompt_path']}", 0)
+
+
+def cmd_backlog_ls(args, ctx: Context) -> int:
+    conn = db.connect(ctx.home)
+    templates = backlog_lib.select_all(conn)
+    now = ctx.now()
+    for template in templates:
+        last = backlog_lib.last_job(conn, template["name"])
+        last_text = f"{last['id']} {last['state']} {last['verdict'] or '-'}" if last else "-"
+        ctx.print(f"{template['name']:<24} every {backlog_lib.format_duration(template['every_s']):<4} "
+                  f"{'enabled' if template['enabled'] else 'paused':<8} "
+                  f"last {_when(template['last_submitted']):<17} "
+                  f"next {_next_due(conn, template, now)}  job {last_text}")
+    enabled = sum(1 for template in templates if template["enabled"])
+    return answer(ctx, f"{len(templates)} backlog template(s), {enabled} enabled", 0)
+
+
+def _set_paused(args, ctx: Context, enabled: bool) -> int:
+    conn = db.connect(ctx.home)
+    with db.tx(conn):
+        found = backlog_lib.set_enabled(conn, args.name, enabled)
+    if not found:
+        return answer(ctx, f"no backlog template {args.name}", 1)
+    state = "resumed" if enabled else "paused"
+    return answer(ctx, f"{state} backlog {args.name}", 0)
+
+
+def cmd_backlog_pause(args, ctx: Context) -> int:
+    return _set_paused(args, ctx, False)
+
+
+def cmd_backlog_resume(args, ctx: Context) -> int:
+    return _set_paused(args, ctx, True)
+
+
+def cmd_backlog_rm(args, ctx: Context) -> int:
+    conn = db.connect(ctx.home)
+    with db.tx(conn):
+        removed = backlog_lib.remove(conn, ctx.home, args.name)
+    if not removed:
+        return answer(ctx, f"no backlog template {args.name}", 1)
+    return answer(ctx, f"removed backlog {args.name}; its past jobs stay in the history", 0)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -352,6 +414,30 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("daemon", help="run the broker loop (launchd runs this)").set_defaults(func=cmd_daemon)
     sub.add_parser("status", help="daemon, queue depth, running slots, proxy").set_defaults(func=cmd_status)
     sub.add_parser("slots", help="ssh and pytest slots held by pi workers, with holder pid and label").set_defaults(func=cmd_slots)
+
+    p = sub.add_parser("backlog", help="recurring low-priority jobs that fill idle Morph capacity")
+    bsub = p.add_subparsers(dest="backlog_cmd", required=True)
+    b = bsub.add_parser("add", help="add a template: its prompt is resubmitted every interval")
+    b.add_argument("name", help="lowercase letters, digits and dashes")
+    b.add_argument("prompt_file")
+    b.add_argument("--every", required=True, metavar="DURATION", help="interval: 30m, 6h or 1d")
+    b.add_argument("--kind", choices=db.KINDS, default="read")
+    b.add_argument("--res", choices=db.RESOURCES, default="light")
+    b.add_argument("--workspace", help="folder the jobs run in (default the current directory)")
+    b.add_argument("--tier", help="tier for every job (default by kind)")
+    b.add_argument("--max-runtime", metavar="DURATION", help="wall-clock cap per job, e.g. 2h (default six hours)")
+    b.set_defaults(func=cmd_backlog_add)
+    b = bsub.add_parser("ls", help="templates with interval, state, last and next submission, last job")
+    b.set_defaults(func=cmd_backlog_ls)
+    b = bsub.add_parser("rm", help="delete a template (its past jobs stay)")
+    b.add_argument("name")
+    b.set_defaults(func=cmd_backlog_rm)
+    b = bsub.add_parser("pause", help="stop submitting a template; a running job finishes")
+    b.add_argument("name")
+    b.set_defaults(func=cmd_backlog_pause)
+    b = bsub.add_parser("resume", help="submit a paused template again")
+    b.add_argument("name")
+    b.set_defaults(func=cmd_backlog_resume)
     return parser
 
 
