@@ -3,7 +3,10 @@
 Each tick (``TICK_S`` seconds) first reconciles every running job against its
 process and its run folder, then launches queued jobs that fit the slot, tier
 and workspace limits. The proxy status is read once per tick: a ``saturated``
-proxy holds back normal and backlog jobs, while urgent jobs still launch.
+proxy holds back backlog jobs only; normal and urgent jobs launch whenever the
+slot and tier caps allow, since the proxy queues their requests fairly. Each
+tick ends by writing ``broker.heartbeat`` so direct launches can tell the
+broker is alive.
 
 Workers start through ``scripts/run_worker.py`` with max-wait ``0``, which
 returns at once. The worker runs in its own session, so a broker restart does
@@ -332,6 +335,14 @@ def run_worker_launcher(job: dict, run_dir, env: dict) -> int:
     return pid
 
 
+def write_heartbeat(home) -> None:
+    """Write the current epoch to ``broker.heartbeat`` atomically (temp file, then rename)."""
+    path = Path(home) / "broker.heartbeat"
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(f"{time.time():.3f}\n", encoding="utf-8")
+    os.replace(tmp, path)
+
+
 def log_line(home, message: str) -> None:
     """Append one timestamped line to ``logs/broker.log``. Best effort."""
     try:
@@ -417,9 +428,11 @@ class Broker:
         try:
             now = self.now()
             self.reconcile(conn, now)
-            return self.launch_ready(conn, now, saturated=self._is_saturated())
+            launched = self.launch_ready(conn, now, saturated=self._is_saturated())
         finally:
             conn.close()
+        write_heartbeat(self.home)
+        return launched
 
     def run_forever(self, tick_s: float = TICK_S) -> None:
         handle = acquire_lock(self.home)
@@ -456,7 +469,7 @@ class Broker:
         others_waiting = any(job["lane"] != "urgent" for job in ready)
         launched: list[str] = []
         for job in order_queue(ready, now):
-            if saturated and job["lane"] != "urgent":
+            if saturated and job["lane"] == "backlog":
                 continue
             if job["lane"] == "urgent" and others_waiting and urgent_running >= urgent_cap:
                 continue

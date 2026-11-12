@@ -64,6 +64,11 @@ either is full. A named tier at its limit gets
 ``STATUS: failed reason=none-available`` at once, the same answer ``auto``
 gives when nothing is eligible; nothing waits.
 
+A direct launch (``AGENTQ_JOB`` unset) also yields a pool to the agentq queue:
+while the broker heartbeat is fresh and agentq.db holds a ready queued job for
+the same base model, the launch gets ``none-available`` as a full pool does.
+Any failure reading the heartbeat or the database allows the launch.
+
 Prints one line:
 STATUS: running|done|failed out=<report> err=<stderr> tier=<name> [reason=...]
 """
@@ -74,6 +79,7 @@ import fcntl
 import json
 import os
 import re
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -95,6 +101,8 @@ RUN_RULE = (
 LABEL_OK = re.compile(r"^[\w.+-]{1,80}$")
 KINDS = ("muse", "cursor", "grok-build", "pi", "codex")
 READ_LIMIT = 262144
+AGENTQ_HOME_DEFAULT = "~/.local/state/agentq"
+HEARTBEAT_FRESH_S = 120
 #: A finished report is at least this many bytes after stripping; below it
 #: the out file counts toward a quota hit in full. In a report at or above
 #: the threshold, only quota wording in the last REPORT_TAIL_BYTES counts,
@@ -319,6 +327,7 @@ def run(argv, spawn=None, pgrep=None, sleep=None, now=None, alive=None, new_uuid
     if prompt_over_budget(ctx) is not None:
         emit("failed", out, err, requested, "prompt-budget")
         return 2
+    ctx["queued"] = direct_queue(registry, ctx["hooks"]["now"]())
     name, reason = pick_initial(ctx)
     if not name:
         code = 0 if reason == "none-available" else 2
@@ -546,6 +555,41 @@ def prompt_over_budget(ctx):
     return size
 
 
+def direct_queue(registry, now) -> dict:
+    """Ready queued jobs per base model, for a direct launch to yield to.
+
+    Empty when the launch came from the broker (``AGENTQ_JOB`` set), when the
+    broker heartbeat is not fresh, or when agentq.db cannot be read: then the
+    launch proceeds as it did before the queue existed. A job whose tier is not
+    a registry worker (``auto``, for one) counts toward no pool.
+    """
+    if os.environ.get("AGENTQ_JOB"):
+        return {}
+    home = Path(os.path.expanduser(os.environ.get("AGENTQ_HOME") or AGENTQ_HOME_DEFAULT))
+    try:
+        age = now - float((home / "broker.heartbeat").read_text(encoding="utf-8").strip())
+        if not 0 <= age <= HEARTBEAT_FRESH_S:
+            return {}
+        conn = sqlite3.connect(f"{(home / 'agentq.db').resolve().as_uri()}?mode=ro", uri=True, timeout=2)
+        try:
+            rows = conn.execute(
+                "SELECT tier, COUNT(*) FROM jobs WHERE state = 'queued' AND not_before <= ? GROUP BY tier",
+                (now,),
+            ).fetchall()
+        finally:
+            conn.close()
+    except (OSError, ValueError, sqlite3.Error):
+        return {}
+    workers = registry.get("workers") or {}
+    pools: dict[str, int] = {}
+    for tier, count in rows:
+        worker = workers.get(tier)
+        if isinstance(worker, dict) and worker.get("model"):
+            model = base_model(worker["model"])
+            pools[model] = pools.get(model, 0) + count
+    return pools
+
+
 def pick_initial(ctx):
     requested = ctx["requested"]
     registry = ctx["registry"]
@@ -571,6 +615,10 @@ def pick_initial(ctx):
             f"for {base_model(worker.get('model'))}; not launching",
             file=sys.stderr,
         )
+        return None, "none-available"
+    waiting = ctx.get("queued", {}).get(base_model(worker.get("model")), 0)
+    if waiting:
+        print(f"agentq queue has {waiting} waiting job(s) for this model; queue first", file=sys.stderr)
         return None, "none-available"
     return name, None
 
@@ -771,6 +819,8 @@ def eligible(ctx, skip):
             print(f"auto: skipping {launch_name}: cannot count live workers: {exc}", file=sys.stderr)
             continue
         if blocked is not None:
+            continue
+        if ctx.get("queued", {}).get(base_model(worker.get("model")), 0):
             continue
         return launch_name
     return None
