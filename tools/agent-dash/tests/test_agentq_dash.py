@@ -281,7 +281,7 @@ class ServerTest(unittest.TestCase):
         for title in (
             "Share of each Morph-enforced limit, % of limit",
             "Active runs over time, with caps",
-            "Tokens per minute, millions",
+            "Tokens per 5 minutes, millions",
             "Runs",
             "Top consumers today",
             "Upstream 429s per minute",
@@ -459,12 +459,12 @@ class RunsTest(unittest.TestCase):
         self.assertEqual(capacity["waiting_now"], 3)
         self.assertEqual(capacity["waiting_by_lane"], {"urgent": 0, "normal": 2, "backlog": 1})
 
-    def test_token_mix_splits_each_minute_into_three_series(self) -> None:
-        by_minute = {row["minute"]: row for row in self.summary["token_mix"]}
-        row = by_minute[minute_at(60)]
-        self.assertEqual(row["cache_read"], 1000)
-        self.assertEqual(row["uncached"], 100 + 2429)
-        self.assertEqual(row["output"], 7000 + 100)
+    def test_token_mix_uses_five_minute_buckets_and_keeps_every_token(self) -> None:
+        mix = self.summary["token_mix"]
+        self.assertEqual(self.summary["token_bucket_s"], 300)
+        self.assertTrue(all(row["t"] % 300 == 0 for row in mix))
+        for key, source in (("cache_read", "cache_read"), ("uncached", "input"), ("output", "output")):
+            self.assertEqual(sum(row[key] for row in mix), sum(p[source] for p in self.summary["minutes"]))
 
     def test_direct_run_past_the_seven_day_lookback_is_absent(self) -> None:
         self.assertNotIn("hub-direct-launch-x", self.runs)
@@ -927,3 +927,160 @@ class EnforcedLimitsChartTest(unittest.TestCase):
         import re
         tiles = re.findall(r'class="kpi(?: head)?"', dash.PAGE_HTML)
         self.assertLessEqual(len(tiles), 12)
+
+
+LIMITS_NOW = {"total": 10_000_000, "output": 70_000, "uncached": 24_290, "uncached_ds": 400_000}
+CALM = {"load1": 2.0, "cpus": 15, "load_per_cpu": 2.0 / 15, "memory_free_pct": 60.0}
+HOT = {"load1": 44.0, "cpus": 15, "load_per_cpu": 44.0 / 15, "memory_free_pct": 40.0}
+IDLE_LIVE = {"queued": {"urgent": 0, "normal": 0, "backlog": 0}}
+
+
+def five_minutes(**fields) -> dict:
+    """Minute rows for the five complete minutes before UNTIL, each with the same fields."""
+    return {UNTIL - 60 * k: fields for k in range(1, 6)}
+
+
+def verdict_for(raw, *, live=IDLE_LIVE, laptop=CALM, kimi_waiting=False, budget_429s=None,
+                jobs_queued=0, ds_p50_5m_ms=None, ds_p50_base_ms=None):
+    return dash.verdict(
+        raw, UNTIL, LIMITS_NOW, live, kimi_waiting=kimi_waiting, budget_429s=budget_429s or {},
+        laptop=laptop, jobs_queued=jobs_queued, ds_p50_5m_ms=ds_p50_5m_ms, ds_p50_base_ms=ds_p50_base_ms,
+    )
+
+
+class LimitedByTest(unittest.TestCase):
+    def test_morph_limit_when_an_enforced_budget_peaks_at_95_percent(self) -> None:
+        raw = five_minutes(total=1_000_000, ds_uncached=0)
+        raw[UNTIL - 120] = {"total": 1_000_000, "ds_uncached": 390_000}
+        result = verdict_for(raw)
+        self.assertEqual(result["key"], "morph_limit")
+        self.assertEqual(result["chip"], "Morph limit")
+        self.assertIn("DeepSeek uncached input reached 98%", result["text"])
+
+    def test_morph_limit_when_an_enforced_budget_had_429s_in_two_minutes(self) -> None:
+        raw = five_minutes(total=1_000_000)
+        result = verdict_for(raw, budget_429s={"total": {UNTIL - 60, UNTIL - 180}})
+        self.assertEqual(result["key"], "morph_limit")
+        self.assertIn("Total pool returned 429s in 2 of the last 5 minutes", result["text"])
+
+    def test_one_429_minute_is_not_enough(self) -> None:
+        result = verdict_for(five_minutes(total=1_000_000), budget_429s={"total": {UNTIL - 60}})
+        self.assertNotEqual(result["key"], "morph_limit")
+
+    def test_kimi_uncached_counts_only_while_kimi_jobs_wait(self) -> None:
+        raw = five_minutes(total=0, kimi_uncached=24_290)
+        self.assertNotEqual(verdict_for(raw, kimi_waiting=False)["key"], "morph_limit")
+        waiting = verdict_for(raw, kimi_waiting=True)
+        self.assertEqual(waiting["key"], "morph_limit")
+        self.assertIn("Kimi uncached reached", waiting["text"])
+
+    def test_morph_slow_when_deepseek_p50_doubles_and_proxy_queue_is_empty(self) -> None:
+        result = verdict_for(five_minutes(total=1_000_000), ds_p50_5m_ms=12_000, ds_p50_base_ms=5_000)
+        self.assertEqual(result["key"], "morph_slow")
+        self.assertEqual(result["chip"], "Morph slow")
+
+    def test_morph_slow_needs_an_empty_proxy_queue(self) -> None:
+        queued = {"queued": {"urgent": 0, "normal": 3, "backlog": 0}}
+        result = verdict_for(five_minutes(total=1_000_000), live=queued, ds_p50_5m_ms=12_000, ds_p50_base_ms=5_000)
+        self.assertNotEqual(result["key"], "morph_slow")
+
+    def test_laptop_when_load_per_cpu_is_over_1_5(self) -> None:
+        result = verdict_for(five_minutes(total=1_000_000), laptop=HOT)
+        self.assertEqual(result["key"], "laptop")
+        self.assertIn("load 44.0 on 15 CPUs", result["text"])
+
+    def test_laptop_when_memory_free_is_under_25_percent(self) -> None:
+        low_memory = dict(CALM, memory_free_pct=20.0)
+        self.assertEqual(verdict_for(five_minutes(total=1_000_000), laptop=low_memory)["key"], "laptop")
+
+    def test_demand_when_pool_is_idle_and_nothing_waits(self) -> None:
+        result = verdict_for(five_minutes(total=1_000_000))
+        self.assertEqual(result["key"], "demand")
+        self.assertEqual(result["chip"], "Demand")
+
+    def test_demand_needs_no_ready_job(self) -> None:
+        self.assertEqual(verdict_for(five_minutes(total=1_000_000), jobs_queued=2)["key"], "near_capacity")
+
+    def test_near_capacity_otherwise(self) -> None:
+        result = verdict_for(five_minutes(total=9_000_000))
+        self.assertEqual(result["key"], "near_capacity")
+        self.assertEqual(result["chip"], "Near capacity")
+
+
+class RoomForWorkersTest(unittest.TestCase):
+    def room_for(self, raw, *, workers, laptop=CALM):
+        return dash.room(raw, UNTIL, LIMITS_NOW, active_ds_workers=workers, laptop=laptop)
+
+    def test_bounded_by_morph_uncached_input(self) -> None:
+        raw = five_minutes(total=1_000_000, ds_uncached=300_000)
+        result = self.room_for(raw, workers=50)
+        self.assertEqual(result["bound"], "uncached_ds")
+        self.assertEqual(result["workers"], 13)
+        self.assertEqual(result["text"], "Room for about 13 more busy DeepSeek workers (bounded by Morph uncached input).")
+
+    def test_bounded_by_morph_total(self) -> None:
+        raw = five_minutes(total=9_000_000, ds_uncached=0)
+        result = self.room_for(raw, workers=50)
+        self.assertEqual(result["bound"], "total")
+        self.assertEqual(result["workers"], 2)
+        self.assertIn("bounded by Morph total", result["text"])
+
+    def test_bounded_by_laptop_cpu_leaves_no_room(self) -> None:
+        raw = five_minutes(total=1_000_000, ds_uncached=100_000)
+        result = self.room_for(raw, workers=50, laptop=HOT)
+        self.assertEqual(result["bound"], "laptop")
+        self.assertEqual(result["workers"], 0)
+        self.assertEqual(result["text"], "No room; adding workers will only queue (bounded by laptop CPU).")
+
+    def test_no_active_workers_means_room_is_unknown(self) -> None:
+        result = self.room_for(five_minutes(total=1_000_000), workers=None)
+        self.assertIsNone(result["workers"])
+        self.assertIn("Room unknown", result["text"])
+
+
+class ActivityWindowTest(unittest.TestCase):
+    def test_five_and_fifteen_minute_totals_with_deltas(self) -> None:
+        raw = {UNTIL - 60 * k: {"total": 100, "req": 2} for k in range(1, 6)}
+        raw.update({UNTIL - 60 * k: {"total": 50, "req": 1} for k in range(6, 11)})
+        five = dash.window_tokens(raw, UNTIL, 5)
+        self.assertEqual((five["tokens"], five["requests"], five["previous_tokens"]), (500, 10, 250))
+        self.assertEqual(five["delta"], 1.0)
+        fifteen = dash.window_tokens(raw, UNTIL, 15)
+        self.assertEqual(fifteen["tokens"], 750)
+        self.assertIsNone(fifteen["delta"])
+
+    def test_live_limits_override_the_constants(self) -> None:
+        live = {"budgets": {"uncached_ds": {"limit": 400_000}, "total": {"limit": 9_000_000}}}
+        resolved = dash.resolve_limits(live)
+        self.assertEqual(resolved["uncached_ds"], 400_000)
+        self.assertEqual(resolved["total"], 9_000_000)
+        self.assertEqual(dash.resolve_limits(None)["uncached"], 24_290)
+
+
+class SummaryVerdictTest(unittest.TestCase):
+    def test_summary_carries_verdict_room_activity_and_five_minute_token_buckets(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = make_home(Path(tmp))
+            summary = dash.build_summary(home, 6, now=NOW, fetch_live=proxy_status, laptop=CALM)
+        self.assertIn(summary["verdict"]["key"], {"morph_limit", "morph_slow", "laptop", "demand", "near_capacity"})
+        self.assertIn("text", summary["room"])
+        self.assertIn("tokens_5m", summary["activity"])
+        self.assertEqual(summary["token_bucket_s"], 300)
+        self.assertEqual({p["t"] % 300 for p in summary["token_mix"]}, {0})
+
+
+class BudgetRateLimitLogTest(unittest.TestCase):
+    def test_calib_lines_give_the_minutes_each_budget_was_429d(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            (home / "logs").mkdir()
+            this = dash.minute_stamp(UNTIL - 60)
+            old = dash.minute_stamp(UNTIL - 3600)
+            (home / "logs" / "proxy.err.log").write_text(
+                f"{this}:30Z agentq-proxy calib minute={this} budget=total sec=30.0\n"
+                f"{old}:30Z agentq-proxy calib minute={old} budget=total sec=30.0\n"
+                f"{this}:31Z agentq-proxy calib minute={this} budget=None sec=31.0\n",
+                encoding="utf-8",
+            )
+            found = dash.budget_429_minutes(home, UNTIL)
+        self.assertEqual(found, {"total": {UNTIL - 60}})
