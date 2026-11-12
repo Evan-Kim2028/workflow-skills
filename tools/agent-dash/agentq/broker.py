@@ -55,9 +55,11 @@ import uuid
 from pathlib import Path
 from typing import NamedTuple
 
+from agentq import backlog as backlog_lib
 from agentq import db
 
 TICK_S = 2.0
+BACKLOG_RETRY_S = 300.0
 MAX_ATTEMPTS = 3
 MAX_RATE_ATTEMPTS = 20
 RATE_BACKOFF_S = 60.0
@@ -90,6 +92,7 @@ MEMORY_FREE_LINE = re.compile(r"System-wide memory free percentage:\s*(\d+(?:\.\
 VERDICT_LINE = re.compile(r"^\W*(?:verdict\W*)?(PASS|PARTIAL|BLOCKED)\b", re.IGNORECASE)
 RATE_LIMIT_BODY = re.compile(r"\b429\b\s*[:\-]?\s*\{|Rate limit exceeded", re.IGNORECASE)
 LAUNCH_LINE_PREFIX = "launched "
+AGENT_DASH_LABEL = Path(__file__).resolve().parents[1] / "agent_dash.py"
 OPEN = db.OPEN_STATES
 ALL_STATES = db.OPEN_STATES + db.TERMINAL_STATES
 
@@ -576,6 +579,24 @@ def cancel(conn, job: dict, now: float) -> str | None:
     return action if moved else None
 
 
+def label_for(kind: str, slug: str) -> str | None:
+    """A hub label from ``agent_dash.py label make``, or None when it refuses.
+
+    The mark is ``review`` for a review job and ``exec`` otherwise.
+    """
+    mark = "review" if kind == "review" else "exec"
+    cmd = [
+        sys.executable, str(AGENT_DASH_LABEL), "label", "make",
+        "--scope", "hub", "--mark", mark, "--slug", slug,
+    ]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    lines = proc.stdout.strip().splitlines()
+    return lines[-1] if proc.returncode == 0 and lines else None
+
+
 def branch_for(job_id: str) -> str:
     """The branch a job's auto worktree is created on."""
     return f"agentq/{job_id}"
@@ -697,9 +718,11 @@ def worktree_prompt(run_dir, job: dict) -> Path:
 class Broker:
     """One broker over one agentq home. ``launcher``, ``now`` and ``proxy`` are injectable."""
 
-    def __init__(self, home, *, launcher=None, now=time.time, proxy=None, gauges=None, launch_pool=None):
+    def __init__(self, home, *, launcher=None, now=time.time, proxy=None, gauges=None, launch_pool=None,
+                 labeler=None):
         self.home = Path(home)
         self.launcher = launcher or run_worker_launcher
+        self.labeler = labeler or label_for
         self.now = now
         self.proxy = proxy or proxy_status
         self.gauges = gauges or Gauges(clock=now)
@@ -709,18 +732,21 @@ class Broker:
         self._saturated_last = False
         self._holds: dict[str, tuple[tuple[str, str], float]] = {}
         self._plans: dict[str, tuple[Path, Path] | None] = {}
+        self._backlog_retry: dict[str, float] = {}
 
     def log(self, message: str) -> None:
         log_line(self.home, message)
 
     def tick(self) -> list[str]:
-        """One pass: reconcile, then launch. Returns the ids launched this tick."""
+        """One pass: reconcile, launch, then submit due backlog jobs. Returns the ids launched this tick."""
         conn = db.connect(self.home)
         try:
             now = self.now()
             self._collect_launches(conn, now)
             self.reconcile(conn, now)
-            launched = self.launch_ready(conn, now, status=self._proxy_status())
+            status = self._proxy_status()
+            launched = self.launch_ready(conn, now, status=status)
+            self.submit_backlog(conn, now, status)
         finally:
             conn.close()
         write_heartbeat(self.home)
@@ -860,6 +886,63 @@ class Broker:
             message = f"hold {name}: {text}"
             db.transition(conn, job_id, ("queued",), now, None, "", detail=message)
             self.log(f"{message} (job {job_id})")
+
+    def submit_backlog(self, conn, now: float, status: dict | None) -> list[str]:
+        """Queue one job per due backlog template whose Morph budgets are idle. Returns the new job ids.
+
+        A template with a queued or running job waits. The Morph gate is the same one a
+        backlog job meets at launch (``morph_hold``), so no request queues behind a template. With no
+        proxy status there is no headroom to read, so nothing is submitted. A refused label
+        is retried after ``BACKLOG_RETRY_S``.
+        """
+        if status is None:
+            return []
+        max_waiting = load_config(self.home)["adaptive"]["max_waiting_requests"]
+        submitted = []
+        for template in backlog_lib.select_all(conn):
+            name = template["name"]
+            if not backlog_lib.is_due(template, now) or self._backlog_retry.get(name, 0.0) > now:
+                continue
+            if backlog_lib.open_job(conn, name) is not None:
+                continue
+            if morph_hold(backlog_lib.tier_for(template), "backlog", status, max_waiting) is not None:
+                continue
+            job_id = self._backlog_job(conn, template, now)
+            if job_id is not None:
+                submitted.append(job_id)
+        return submitted
+
+    def _backlog_job(self, conn, template: dict, now: float) -> str | None:
+        """Write one template's prompt into a new job folder and queue the job. Returns the job id, or None."""
+        name = template["name"]
+        retry_at = now + BACKLOG_RETRY_S
+        try:
+            body = Path(template["prompt_path"]).read_text(encoding="utf-8")
+        except OSError as exc:
+            self._backlog_retry[name] = retry_at
+            self.log(f"backlog {name}: prompt unreadable ({exc}); retry in {int(BACKLOG_RETRY_S)}s")
+            return None
+        label = self.labeler(template["kind"], backlog_lib.label_slug(name))
+        if label is None:
+            self._backlog_retry[name] = retry_at
+            self.log(f"backlog {name}: label make refused; retry in {int(BACKLOG_RETRY_S)}s")
+            return None
+        job_id = db.new_job_id()
+        prompt = db.job_dir(self.home, job_id) / "prompt.md"
+        prompt.parent.mkdir(parents=True, exist_ok=True)
+        prompt.write_text(backlog_lib.preamble_for(template["kind"], body), encoding="utf-8")
+        job = {
+            "id": job_id, "lane": "backlog", "kind": template["kind"], "res": template["res"],
+            "tier": backlog_lib.tier_for(template), "label": label, "workspace": template["workspace"],
+            "session": backlog_lib.SESSION, "harness": backlog_lib.SESSION, "prompt_path": str(prompt),
+        }  # fmt: skip
+        if template["max_runtime_s"]:
+            job["max_runtime_s"] = template["max_runtime_s"]
+        with db.tx(conn):
+            db.insert_job(conn, job, now)
+            backlog_lib.mark_submitted(conn, name, now)
+        self.log(f"backlog {name} submitted {job_id} ({label})")
+        return job_id
 
     def _proxy_status(self) -> dict | None:
         """The proxy status for this tick (None when down). Logs each change of its saturated flag."""

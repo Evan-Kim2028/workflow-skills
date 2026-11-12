@@ -7,8 +7,10 @@ back as a file. The queue survives broker, harness and laptop restarts.
 
 Code: `agentq/db.py` (schema, the only writer of `jobs` and `events`),
 `agentq/broker.py` (the daemon loop), `agentq/cli.py` (the commands),
-`scripts/agentq` (wrapper), `agentq/launchd/com.agentq.broker.plist` (template,
-not installed). Tests: `tests/test_agentq_broker.py`.
+`agentq/backlog.py` (backlog templates) and `agentq/backlog_seed.py` (the standing
+templates), `scripts/agentq` (wrapper), `agentq/launchd/com.agentq.broker.plist`
+(template, not installed). Tests: `tests/test_agentq_broker.py`,
+`tests/test_agentq_backlog.py`.
 
 ## The five commands
 
@@ -25,6 +27,9 @@ agentq ls [--mine|--all] [--json]
 agentq result ID [--print]
 agentq cancel ID
 agentq status
+agentq backlog add NAME PROMPT_FILE --every 6h [--kind read|write|review]
+              [--res light|tests|ssh] [--workspace PATH] [--tier T] [--max-runtime 2h]
+agentq backlog ls | rm NAME | pause NAME | resume NAME
 agentq daemon                                    # the broker loop; launchd runs this
 ```
 
@@ -45,6 +50,40 @@ agentq daemon                                    # the broker loop; launchd runs
 
 Typical use from a harness: `agentq submit prompt.md --kind review`, then
 `agentq wait <id>`. For "escalate this subagent work", run `agentq escalate`.
+
+## Backlog templates
+
+A backlog template is a prompt the broker resubmits on a timer, so Morph capacity
+stays busy when real work runs short. `agentq backlog add` copies the prompt to
+`$AGENTQ_HOME/backlog/<name>.md`, so later edits to the source file do not change
+the template. `--every` takes `30m`, `6h`, `1d` (or `90s`); `--max-runtime` takes
+the same units.
+
+- Each tick, after the launches, the broker submits one job for every enabled
+  template that is due (never run, or its interval has passed). The job goes in
+  the `backlog` lane, so every normal and urgent job launches first.
+- One job per template at a time: a template with a queued or running job waits.
+  The job's label is `hub-<mark>-backlog-<name>` (mark `review` for a review
+  template, `exec` otherwise), which is how the template finds its open and last
+  job after a restart.
+- The Morph gate is the launch gate for a backlog job (`morph_hold`): a template
+  is submitted only while its tier's proxy budgets queue nothing. With the proxy
+  down there is no headroom to read, so nothing is submitted.
+- A read or review job gets the preamble "This is a recurring low-priority backlog
+  job. Read-only unless the brief says otherwise..." above the template text. A
+  write template gets no preamble.
+- `agentq backlog ls` shows each template's interval, state, last submission, next
+  due time and last job with its verdict. `agentq status` counts the enabled
+  templates and the open template jobs.
+- `pause` stops new submissions; a running job finishes. `rm` deletes the template
+  and its prompt copy; its past jobs stay in the history.
+- The standing templates are `merged-review-lor` and `merged-review-ws` (every 6h,
+  read-only reviews of the commits merged to origin/main in the last six hours).
+  `python3 -m agentq.backlog_seed` creates them once; a second run changes nothing.
+  The broker never runs the seed. Their folders are not in the repo: the seed reads
+  `$AGENTQ_HOME/backlog-seed.json` (or `--config PATH`), a JSON object keyed by
+  template name with `workspace` and `report_dir` for each. The prompts in
+  `agentq/backlog_prompts/` take those two values as `{workspace}` and `{report_dir}`.
 
 ## Lanes and ordering
 
@@ -147,7 +186,8 @@ Under `$AGENTQ_HOME` (default `~/.local/state/agentq`):
 
 | Path | What it is |
 |---|---|
-| `agentq.db` | SQLite store: `jobs`, `events`. `proxy_minutes` belongs to the proxy |
+| `agentq.db` | SQLite store: `jobs`, `events`, `backlog_templates`. `proxy_minutes` belongs to the proxy |
+| `backlog/<name>.md` | a backlog template's prompt copy |
 | `broker.json` | optional slot and tier ceilings, the `adaptive` admission settings and the `auto_worktree` settings (see above) |
 | `broker.pid` | the daemon's flock'd pidfile |
 | `jobs/<id>/prompt.md` | the submitted prompt |
