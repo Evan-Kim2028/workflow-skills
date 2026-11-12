@@ -279,7 +279,7 @@ class ServerTest(unittest.TestCase):
         self.assertTrue(ctype.startswith("text/html"))
         self.assertIn("<!DOCTYPE html>", html)
         for title in (
-            "Billed use, % of each Morph limit, per minute",
+            "Total pool and DeepSeek output, % of limit",
             "Active runs over time, with caps",
             "Tokens per minute, millions",
             "Runs",
@@ -401,10 +401,18 @@ class RunsTest(unittest.TestCase):
 
     def test_direct_launch_keeps_its_job_string_and_active_state(self) -> None:
         run = self.runs["none"]
-        self.assertEqual(run["run"], "none")
+        self.assertEqual(run["run"], dash.UNTAGGED_LABEL)
+        self.assertEqual(run["job"], "none")
         self.assertFalse(run["queue"])
         self.assertEqual(run["status"], "active")
         self.assertIsNone(run["verdict"])
+
+    def test_untagged_row_is_flagged_and_listed_last(self) -> None:
+        self.assertEqual(self.runs["none"]["run"], "untagged (pre-tagging workers)")
+        self.assertTrue(self.runs["none"]["untagged"])
+        self.assertFalse(self.runs["a" * 12]["untagged"])
+        self.assertEqual([run["untagged"] for run in self.summary["runs"]].count(True), 1)
+        self.assertEqual(self.summary["runs"][-1]["job"], "none")
 
     def test_queue_status_comes_from_jobs_not_from_proxy_recency(self) -> None:
         self.assertEqual(self.runs["b" * 12]["status"], "running")
@@ -516,3 +524,53 @@ class MissingRunsTableTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class IncompleteMinuteTest(unittest.TestCase):
+    """Only complete minutes feed the tiles and series; the current minute and unflushed minutes never read as zero."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.home = make_home(Path(self.tmp.name))
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def delete_minute(self, seconds_before_until: int) -> None:
+        conn = sqlite3.connect(self.home / "agentq.db")
+        conn.execute("DELETE FROM proxy_minutes WHERE minute = ?", (minute_at(seconds_before_until),))
+        conn.commit()
+        conn.close()
+
+    def summary(self) -> dict:
+        return dash.build_summary(self.home, 1, now=NOW, fetch_live=proxy_status)
+
+    def test_last_minute_tiles_read_the_latest_complete_minute_not_the_current_one(self) -> None:
+        limits = self.summary()["limits"]
+        self.assertEqual(limits["total"]["last_min_frac"], dash.fraction(100 + 7000 + 2429 + 1000 + 100, 10_000_000))
+        self.assertEqual(limits["output"]["last_min_frac"], dash.fraction(7000, 70_000))
+
+    def test_last_minute_falls_back_one_minute_when_the_latest_complete_minute_has_no_row(self) -> None:
+        self.delete_minute(60)
+        limits = self.summary()["limits"]
+        self.assertEqual(limits["output"]["last_min_frac"], dash.fraction(500_000, 70_000))
+        self.assertEqual(limits["total"]["last_min_frac"], dash.fraction(500_000, 10_000_000))
+
+    def test_last_minute_tiles_are_none_when_neither_recent_minute_has_a_row(self) -> None:
+        self.delete_minute(60)
+        self.delete_minute(120)
+        limits = self.summary()["limits"]
+        self.assertIsNone(limits["output"]["last_min_frac"])
+        self.assertIsNone(limits["total"]["last_min_frac"])
+
+    def test_series_ends_at_the_last_minute_with_a_row_and_keeps_idle_gaps_as_zero(self) -> None:
+        self.delete_minute(60)
+        minutes = self.summary()["minutes"]
+        self.assertEqual(minutes[-1]["minute"], minute_at(120))
+        by_minute = {p["minute"]: p for p in minutes}
+        self.assertNotIn(minute_at(60), by_minute)
+        self.assertEqual(by_minute[minute_at(4 * 60)]["total"], 0)
+
+    def test_deepseek_output_rate_averages_five_complete_minutes(self) -> None:
+        # 11:59 = 7000, 11:58 = 500000, 11:57 = 5, 11:56 and 11:55 have no rows; the current minute is excluded.
+        self.assertEqual(self.summary()["ds_output_5m_per_min"], (7000 + 500_000 + 5) / 5)
