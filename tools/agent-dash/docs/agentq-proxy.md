@@ -144,7 +144,14 @@ error, a client that left, a timeout, a truncated stream).
 - On SIGTERM or SIGINT the proxy stops accepting connections, lets in-flight
   requests finish for up to `drain_s` (20 s), cancels what remains, and exits.
 - The learned state is written by the maintenance loop (about every 0.2 s when
-  it changed), off the request path, not on every 429.
+  it changed, and at least every 5 s), off the request path, not on every 429.
+  Shutdown always writes it once more, after in-flight requests settle.
+- Warm restarts: each budget's state records `window_used`, the tokens charged
+  in the current window (completed and in-flight). If the state is less than one
+  window old at startup, that usage is restored as one completed charge that
+  expires when the old window would have, so a restart does not reopen an empty
+  budget while Morph still counts the previous minute. Older state seeds nothing,
+  and state without `window_used` loads as before.
 - Prefix memory: each job (or anonymous session) keeps 8-byte digests of
   1024-character blocks, not its prompt. The uncached estimate is accurate to one block (about 256 tokens).
 - Large request bodies (over 256 KiB) are parsed in a worker thread.

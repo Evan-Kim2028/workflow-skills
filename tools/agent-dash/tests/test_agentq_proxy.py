@@ -852,5 +852,71 @@ class StateTest(unittest.TestCase):
         self.assertEqual(list(gov.queues["urgent"]), [old])
 
 
+class WarmRestartTest(unittest.IsolatedAsyncioTestCase):
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.home = Path(tmp.name) / "agentq"
+        self.clock = [1000.0]
+        self.wall = [1_700_000_000.0]
+
+    def governor(self) -> Governor:
+        return Governor(
+            self.home, config_with(), clock=lambda: self.clock[0], wall=lambda: self.wall[0], log=quiet
+        )
+
+    def save_state(self, budgets: dict, age: float) -> None:
+        self.home.mkdir(parents=True, exist_ok=True)
+        state = {"saved_at": self.wall[0] - age, "budgets": budgets}
+        (self.home / "proxy_state.json").write_text(json.dumps(state))
+
+    def test_restart_within_window_blocks_until_the_old_window_ages_out(self) -> None:
+        self.save_state({"total": {"limit": 10_000_000, "target_frac": 0.95, "window_used": 7_000_000}}, age=10)
+        gov = self.governor()
+        ticket = make_ticket(gov, model=MODEL_OUT, text="x", max_tokens=8)
+        ticket.estimates = {"total": 3_000_000}
+        gov.enqueue(ticket)
+        gov.pump()
+        self.assertFalse(ticket.holds)
+        self.clock[0] += 49.0
+        self.wall[0] += 49.0
+        gov.pump()
+        self.assertFalse(ticket.holds)
+        self.clock[0] += 1.0
+        self.wall[0] += 1.0
+        gov.pump()
+        self.assertTrue(ticket.holds)
+
+    def test_restart_after_a_full_window_seeds_nothing(self) -> None:
+        self.save_state({"total": {"limit": 10_000_000, "target_frac": 0.95, "window_used": 7_000_000}}, age=90)
+        gov = self.governor()
+        self.assertEqual(gov.budgets["total"].entries, [])
+        self.assertEqual(gov.budgets["total"].used(gov.clock(), gov.window), 0)
+
+    def test_old_state_file_without_window_used_loads(self) -> None:
+        self.save_state({"total": {"limit": 10_000_000, "target_frac": 0.8}}, age=5)
+        gov = self.governor()
+        self.assertEqual(gov.budgets["total"].target, 0.8)
+        self.assertEqual(gov.budgets["total"].used(gov.clock(), gov.window), 0)
+
+    def test_snapshot_includes_window_used_for_completed_and_in_flight_charges(self) -> None:
+        gov = self.governor()
+        gov.budgets["total"].entries.append(Entry(at=self.clock[0], amount=1_200, lane="normal", done=True))
+        gov.budgets["total"].entries.append(Entry(at=self.clock[0], amount=300, lane="normal"))
+        snapshot = gov.snapshot_state()
+        self.assertEqual(snapshot["saved_at"], self.wall[0])
+        self.assertEqual(snapshot["budgets"]["total"]["window_used"], 1_500)
+        self.assertEqual(snapshot["budgets"]["output"]["window_used"], 0)
+
+    async def test_shutdown_writes_state_even_when_nothing_is_dirty(self) -> None:
+        gov = self.governor()
+        gov.budgets["total"].entries.append(Entry(at=self.clock[0], amount=4_000, lane="normal", done=True))
+        gov.state_dirty = False
+        proxy = Proxy(gov, "http://127.0.0.1:9/v1", KEY)
+        await proxy.close()
+        saved = json.loads((self.home / "proxy_state.json").read_text())
+        self.assertEqual(saved["budgets"]["total"]["window_used"], 4_000)
+
+
 if __name__ == "__main__":
     unittest.main()
