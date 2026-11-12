@@ -19,13 +19,18 @@ Pieces:
   discovery function. A root that does not exist is reported ``absent``.
 * ``pack`` streams a PAX tar of the unit's members into ``zstd -12
   --long=27 -T2`` and hashes every member while reading, so a 500 MB
-  member costs bounded memory.
+  member costs bounded memory. Archives are versioned
+  (``<key>.<seq>.tar.zst``) and a pack never replaces an existing file.
 * ``verify_archive`` streams the copy back through ``tarfile`` and compares
   every member's sha256 and size before the atomic rename.
-* ``ingest_unit`` sends only new lines on append growth, bumps ``rev`` on a
-  rewrite, and verifies the stored row count for ``(unit, rev)``.
-* ``reclaim_unit`` re-stats and re-hashes the members, refuses on any
-  doubt, and deletes exactly the unit.
+* ``ingest_unit`` is at-least-once: every row carries ``line``, verification
+  is ``count_uniq(member, line)``, and a retry resends from the last
+  confirmed line. A rewrite bumps ``rev``.
+* ``reclaim_unit`` is a journaled two-phase move: preconditions, a
+  ``reclaiming`` manifest record, rename into ``state/trash``, re-hash, then
+  delete the trash. ``recover_trash`` resolves a crash at any step.
+* ``restore`` extracts to a temp dir, accepts only manifest members as
+  regular files, verifies every hash, and refuses to overwrite.
 
 Entry points: ``main(argv)`` (the CLI, ``agent_dash.py logs sessions``) and
 ``run(opts)`` (for tests and a later hook).
@@ -62,6 +67,9 @@ ZSTD_LEVEL = "-12"
 ZSTD_LONG = "--long=27"
 ZSTD_THREADS = "-T2"
 READ_CHUNK = 1 << 20
+#: A line longer than this is truncated to ``vlogs.MAX_MSG_BYTES`` and the
+#: rest is discarded while streaming, so RSS stays bounded.
+MAX_LINE_BYTES = 64 << 20
 CONFIG_KEYS = ("dest", "min_idle_hours", "reclaim_days", "reclaim_days_by_tool", "max_minutes", "tools")
 #: Directories that are never part of a unit, per tool.
 CLAUDE_SKIP_DIRS = ("memory",)
@@ -294,26 +302,38 @@ _CODEX_RE = re.compile(
 
 
 def discover_codex(root: str) -> list[Unit]:
+    """Exactly the specified layout, no recursion under ``archived_sessions``.
+
+    ``sessions/YYYY/MM/DD/rollout-*.jsonl``, the same with ``.zst``, and
+    ``archived_sessions/rollout-*.jsonl.zst``. Anything else under the root
+    (nested or uncompressed archived files, sqlite stores) is not a unit.
+    """
+    import glob
+
     units = []
     if not _isdir(root):
         return units
-    for sub in ("sessions", "archived_sessions"):
-        base = os.path.join(root, sub)
-        if not _isdir(base):
-            continue
-        for path, rel in _walk_files(base):
+    patterns = []
+    sessions = os.path.join(root, "sessions")
+    if _isdir(sessions):
+        day = os.path.join(sessions, "[0-9][0-9][0-9][0-9]", "[0-9][0-9]", "[0-9][0-9]")
+        patterns.append(("sessions", os.path.join(day, "rollout-*.jsonl")))
+        patterns.append(("sessions", os.path.join(day, "rollout-*.jsonl.zst")))
+    archived = os.path.join(root, "archived_sessions")
+    if _isdir(archived):
+        patterns.append(("archived_sessions", os.path.join(archived, "rollout-*.jsonl.zst")))
+    for sub, pattern in patterns:
+        for path in sorted(glob.glob(pattern)):
+            if os.path.islink(path) or not os.path.isfile(path):
+                continue
             name = os.path.basename(path)
-            if not name.startswith("rollout-"):
-                continue
-            if not (name.endswith(".jsonl") or name.endswith(".jsonl.zst")):
-                continue
             match = _CODEX_RE.match(name)
             session = match.group(1) if match else name
             units.append(
                 _finish(
                     Unit(
                         "codex",
-                        _rel(sub, rel),
+                        _rel(os.path.relpath(path, root)),
                         root,
                         os.path.dirname(path),
                         session,
@@ -650,7 +670,12 @@ def pack(unit: Unit, out_path: str) -> list[dict]:
                     reader = _HashReader(fh)
                     tar.addfile(info, reader)
                 if member.rows in ("jsonl", "log"):
-                    lines = reader.nl + (1 if reader.n and reader.last != b"\n" else 0)
+                    if member.path.endswith(".zst"):
+                        # The tar holds compressed bytes; ingest reads the
+                        # decompressed stream, so count that same stream.
+                        lines = _count_lines(member.path)
+                    else:
+                        lines = reader.nl + (1 if reader.n and reader.last != b"\n" else 0)
                 elif member.rows == "none":
                     lines = 0
                 else:
@@ -738,23 +763,64 @@ def _iter_lines(path: str):
             yield from _split_lines(fh)
 
 
-def _split_lines(fh):
-    buf = b""
+def _iter_lines_offsets(fh):
+    """Yield ``(line, end_offset, complete)`` with a bounded buffer.
+
+    A line longer than ``MAX_LINE_BYTES`` without a newline is emitted once
+    as ``MAX_MSG_BYTES + 1`` bytes (so ``make_row`` truncates it and sets
+    ``truncated=1``); the rest of that line is discarded while streaming.
+    ``end_offset`` is the byte position just past the line's newline (or
+    past the last byte at EOF), so a live-history offset never lands in the
+    middle of a discarded line. ``complete`` is False only for a trailing
+    partial line at EOF, which a live history leaves for the next run.
+    """
+    buf = bytearray()
+    pos = 0
+    long_head = None
     while True:
         chunk = fh.read(READ_CHUNK)
         if not chunk:
             break
+        if long_head is not None:
+            nl = chunk.find(b"\n")
+            if nl < 0:
+                pos += len(chunk)
+                continue
+            pos += nl + 1
+            yield long_head, pos, True
+            long_head = None
+            chunk = chunk[nl + 1:]
+            if not chunk:
+                continue
         buf += chunk
         start = 0
         while True:
             nl = buf.find(b"\n", start)
             if nl < 0:
                 break
-            yield buf[start:nl]
+            yield bytes(buf[start:nl]), pos + (nl + 1 - start), True
+            pos += nl + 1 - start
             start = nl + 1
-        buf = buf[start:]
-    if buf:
-        yield buf
+        del buf[:start]
+        if len(buf) > MAX_LINE_BYTES:
+            long_head = bytes(buf[: vlogs.MAX_MSG_BYTES + 1])
+            pos += len(buf)
+            buf.clear()
+    if long_head is not None:
+        yield long_head, pos, False
+    elif buf:
+        pos += len(buf)
+        yield bytes(buf), pos, False
+
+
+def _split_lines(fh):
+    for line, _end, _complete in _iter_lines_offsets(fh):
+        yield line
+
+
+def _count_lines(path: str) -> int:
+    """Line count of the stream ingest reads (decompressed for ``.zst``)."""
+    return sum(1 for _ in _iter_lines(path))
 
 
 def _json(line: bytes):
@@ -884,22 +950,34 @@ def _cursor_rows(member: Member, fallback_ms: int):
 
 
 def iter_member_rows(member: Member, unit: Unit, skip: int = 0):
-    """Yield ``(text, type, ms, project, model, subtype)`` for one member."""
+    """Yield ``(text, type, ms, project, model, subtype, line)`` per row.
+
+    ``line`` is the 1-based line number within the member (for a cursor
+    store, the 1-based row index). It is the dedupe key for at-least-once
+    ingest: ``count_uniq(member, line)`` is the verification count.
+    """
     fallback = int(unit.newest_mtime * 1000)
     if member.rows == "cursor-store":
-        for text, type_, ms in _cursor_rows(member, fallback):
-            yield text, type_, ms, "", "", ""
+        for line_no, (text, type_, ms) in enumerate(_cursor_rows(member, fallback), 1):
+            if line_no <= skip:
+                continue
+            yield text, type_, ms, "", "", "", line_no
         return
     if member.rows not in ("jsonl", "log"):
         return
-    seen = 0
-    for line in _iter_lines(member.path):
-        if seen < skip:
-            seen += 1
+    for line_no, line in enumerate(_iter_lines(member.path), 1):
+        if line_no <= skip:
             continue
-        seen += 1
         info = extract(unit.tool, line, member, fallback)
-        yield line.decode("utf-8", "replace"), info["type"], info["ms"], info["project"], info["model"], info["subtype"]
+        yield (
+            line.decode("utf-8", "replace"),
+            info["type"],
+            info["ms"],
+            info["project"],
+            info["model"],
+            info["subtype"],
+            line_no,
+        )
 
 
 def count_member_rows(member: Member, unit: Unit) -> int:
@@ -937,7 +1015,7 @@ def _prefix_sha(path: str, n: int) -> str:
     return digest.hexdigest()
 
 
-def _live_row(tool: str, uid: str, rel: str, line: bytes, rev: str) -> bytes:
+def _live_row(tool: str, uid: str, rel: str, line: bytes, rev: str, line_no: int) -> bytes:
     obj = _json(line)
     type_ = "raw"
     session = ""
@@ -948,7 +1026,14 @@ def _live_row(tool: str, uid: str, rel: str, line: bytes, rev: str) -> bytes:
             obj.get("sessionId") or obj.get("session_id") or obj.get("session") or ""
         )
         ms = _line_ms(obj, ms)
-    extra = {"tool": tool, "session": session, "unit": uid, "member": rel, "rev": rev}
+    extra = {
+        "tool": tool,
+        "session": session,
+        "unit": uid,
+        "member": rel,
+        "rev": rev,
+        "line": str(line_no),
+    }
     row, _truncated, _redactions = vlogs.make_row(
         time_iso=iso_from_ms(ms),
         msg=line.decode("utf-8", "replace"),
@@ -967,7 +1052,9 @@ def ingest_live(tool: str, path: str, manifest: Manifest, client) -> int:
 
     A shrink or a change in the sha256 of the first ``min(size, 4096)``
     bytes restarts from offset 0 with ``rev+1``. A trailing partial line is
-    left for the next run. Returns the number of rows sent.
+    left for the next run. Every row carries its 1-based ``line`` number in
+    the file for that rev, so a resend after a crash is a harmless duplicate
+    and verification uses ``count_uniq(member, line)``.
     """
     home = os.path.expanduser("~")
     try:
@@ -983,39 +1070,37 @@ def ingest_live(tool: str, path: str, manifest: Manifest, client) -> int:
     prefix = _prefix_sha(path, min(prefix_len, size))
     offset = int(prior.get("offset", 0)) if prior else 0
     rev = str(prior.get("rev", "0")) if prior else "0"
+    line_no = int(prior.get("line", 0)) if prior else 0
     if prior and (size < offset or prefix != prior.get("prefix_sha256")):
         offset = 0
         rev = str(int(rev) + 1)
+        line_no = 0
     if offset > size:
         offset = 0
+        line_no = 0
     new_offset = offset
     sent = 0
     if size > offset:
         def gen():
-            nonlocal new_offset
-            pos = offset
+            nonlocal new_offset, line_no
             with open(path, "rb") as fh:
                 fh.seek(offset)
-                buf = b""
-                while True:
-                    chunk = fh.read(READ_CHUNK)
-                    if not chunk:
+                for line, end, complete in _iter_lines_offsets(fh):
+                    if not complete:
+                        # A trailing partial line is left for the next run.
                         break
-                    buf += chunk
-                    start = 0
-                    while True:
-                        nl = buf.find(b"\n", start)
-                        if nl < 0:
-                            break
-                        line = buf[start:nl]
-                        start = nl + 1
-                        pos += len(line) + 1
-                        new_offset = pos
-                        yield _live_row(tool, uid, rel, line, rev)
-                    buf = buf[start:]
+                    new_offset = offset + end
+                    line_no += 1
+                    yield _live_row(tool, uid, rel, line, rev, line_no)
 
         sent = client.insert(gen())
         client.flush()
+    got = count_uniq_rows(client, uid, rev)
+    if got != line_no:
+        raise ArchiveError(
+            "store has %d distinct (member,line) rows for %s rev %s, expected %d"
+            % (got, uid, rev, line_no)
+        )
     manifest.write(
         {
             "unit": uid,
@@ -1027,7 +1112,8 @@ def ingest_live(tool: str, path: str, manifest: Manifest, client) -> int:
             "prefix_len": prefix_len,
             "size": size,
             "rev": rev,
-            "lines": int((prior or {}).get("lines", 0)) + sent,
+            "line": line_no,
+            "lines": line_no,
         }
     )
     return sent
@@ -1046,6 +1132,21 @@ def count_rows(client, unit_uid: str, rev: str | None = None) -> int:
     if rev is not None:
         query += ' rev:="%s"' % _quote(rev)
     query += " | stats count() n"
+    rows = client.query(query)
+    return int(rows[0]["n"]) if rows else 0
+
+
+def count_uniq_rows(client, unit_uid: str, rev: str) -> int:
+    """Distinct ``(member, line)`` pairs stored for ``(unit, rev)``.
+
+    This is the ingest verification count. A resend after a crash stores
+    duplicate rows, which are harmless and invisible here; the docs give
+    the analytics dedupe pattern ``| uniq by (unit, member, rev, line)``.
+    """
+    query = 'unit:="%s" rev:="%s" | stats count_uniq(member, line) n' % (
+        _quote(unit_uid),
+        _quote(rev),
+    )
     rows = client.query(query)
     return int(rows[0]["n"]) if rows else 0
 
@@ -1070,60 +1171,56 @@ def _prefix_matches(path: str, old: dict) -> bool:
 def ingest_unit(unit: Unit, records: list[dict], prior: dict | None, client) -> tuple[str, int, int]:
     """Send the unit's rows, verify the store, and return ``(rev, total, sent)``.
 
-    A rerun that finds the store holding exactly the manifest's row count
-    sends only the lines after the recorded count (append growth). A member
-    whose old bytes are not a prefix of the new file is a rewrite: the unit
-    ``rev`` is bumped and every member is resent at the new rev.
+    At-least-once: a rerun resends from the last line the manifest confirmed
+    (or from line 1 of the current rev) and verifies with
+    ``count_uniq(member, line)``, so a crash after a POST but before the
+    manifest write is harmless. A member whose old bytes are not a prefix of
+    the new file is a rewrite: the unit ``rev`` is bumped and every member is
+    resent at the new rev. Verification and append planning use only the
+    current rev, so rows kept from an older rev never block growth.
     """
     prior_members = {m["rel"]: m for m in (prior or {}).get("members", [])}
     prior_rev = str((prior or {}).get("rev", "0"))
-    prior_total = sum(int(m.get("lines") or 0) for m in prior_members.values())
-    stored = count_rows(client, unit.uid)
-    total_all = sum(int(r.get("lines") or 0) for r in records)
-    if prior is None:
-        if stored not in (0, total_all):
-            raise ArchiveError("store has %d rows for %s with no manifest record" % (stored, unit.uid))
-        if stored and stored == total_all:
-            # A previous run posted every row and died before the manifest write.
-            got = count_rows(client, unit.uid, prior_rev)
-            if got != total_all:
-                raise ArchiveError(
-                    "store has %d rows for %s rev %s, expected %d" % (got, unit.uid, prior_rev, total_all)
-                )
-            return prior_rev, total_all, 0
-    if prior is not None and stored != prior_total:
-        raise ArchiveError(
-            "store has %d rows for %s, manifest records %d" % (stored, unit.uid, prior_total)
-        )
-
-    rev = prior_rev
-    plan: list[tuple[Member, dict, int]] = []
-    rewrite = False
+    total = sum(int(r.get("lines") or 0) for r in records)
     by_rel = {r["rel"]: r for r in records}
+
+    rewrite = False
+    for member in unit.members:
+        rec = by_rel.get(member.rel)
+        old = prior_members.get(member.rel)
+        if rec is None or old is None:
+            continue
+        if old.get("sha256") == rec["sha256"] and old.get("size") == rec["size"]:
+            continue
+        if not _prefix_matches(member.path, old):
+            rewrite = True
+            break
+    rev = str(int(prior_rev) + 1) if rewrite else prior_rev
+
+    if not rewrite and count_uniq_rows(client, unit.uid, rev) == total:
+        # A previous run posted every row and died before the manifest write.
+        return rev, total, 0
+
+    plan: list[tuple[Member, int]] = []
     for member in unit.members:
         rec = by_rel.get(member.rel)
         if rec is None:
             continue
         old = prior_members.get(member.rel)
-        if old is None:
-            plan.append((member, rec, 0))
+        if rewrite or old is None:
+            plan.append((member, 0))
+        elif old.get("sha256") == rec["sha256"] and old.get("size") == rec["size"]:
             continue
-        if old.get("sha256") == rec["sha256"] and old.get("size") == rec["size"]:
-            continue
-        if _prefix_matches(member.path, old):
-            plan.append((member, rec, int(old.get("lines") or 0)))
+        elif _prefix_matches(member.path, old):
+            plan.append((member, int(old.get("lines") or 0)))
         else:
-            rewrite = True
-            break
-    if rewrite:
-        rev = str(int(prior_rev) + 1)
-        plan = [(m, by_rel[m.rel], 0) for m in unit.members if m.rel in by_rel]
+            plan.append((member, 0))
 
     sent = 0
     if plan:
         def gen():
-            for member, _rec, skip in plan:
-                for text, type_, ms, project, model, subtype in iter_member_rows(member, unit, skip):
+            for member, skip in plan:
+                for text, type_, ms, project, model, subtype, line_no in iter_member_rows(member, unit, skip):
                     extra = {
                         "tool": unit.tool,
                         "session": unit.session,
@@ -1133,6 +1230,7 @@ def ingest_unit(unit: Unit, records: list[dict], prior: dict | None, client) -> 
                         "unit": unit.uid,
                         "member": member.rel,
                         "rev": rev,
+                        "line": str(line_no),
                     }
                     line, _truncated, _redactions = vlogs.make_row(
                         time_iso=iso_from_ms(ms),
@@ -1149,27 +1247,119 @@ def ingest_unit(unit: Unit, records: list[dict], prior: dict | None, client) -> 
         sent = client.insert(gen())
         client.flush()
 
-    total = sum(int(r.get("lines") or 0) for r in records)
-    got = count_rows(client, unit.uid, rev)
+    got = count_uniq_rows(client, unit.uid, rev)
     if got != total:
-        raise ArchiveError("store has %d rows for %s rev %s, expected %d" % (got, unit.uid, rev, total))
+        raise ArchiveError(
+            "store has %d distinct (member,line) rows for %s rev %s, expected %d"
+            % (got, unit.uid, rev, total)
+        )
     return rev, total, sent
 
 
 # --------------------------------------------------------------- reclaim
 
-def _remove_unit(unit: Unit) -> None:
-    for member in unit.members:
+def _uid_safe(uid: str) -> str:
+    """Reversible directory name for a unit id (``/`` -> ``%2F``)."""
+    return uid.replace("%", "%25").replace("/", "%2F")
+
+
+def _trash_root(dest) -> Path:
+    return Path(dest) / "state" / "trash"
+
+
+def _trash_dir(dest, uid: str) -> Path:
+    return _trash_root(dest) / _uid_safe(uid)
+
+
+def _prune_dirs(parent: str, rels) -> None:
+    """Remove now-empty ancestor dirs of ``rels``, bottom-up, never siblings.
+
+    Stops at ``parent`` (the unit's parent dir), so a Claude ``memory/``
+    subtree or any other excluded tree is never walked or removed.
+    """
+    base = os.path.abspath(parent)
+    dirs = set()
+    for rel in rels:
+        d = os.path.dirname(os.path.abspath(os.path.join(base, rel)))
+        while d and d != base and d.startswith(base + os.sep):
+            dirs.add(d)
+            d = os.path.dirname(d)
+    for d in sorted(dirs, key=len, reverse=True):
         try:
-            os.remove(member.path)
-        except FileNotFoundError:
+            os.rmdir(d)
+        except OSError:
             pass
-    if unit.is_dir and unit.unit_dir:
-        for dirpath, _dirnames, _filenames in os.walk(unit.unit_dir, topdown=False):
-            try:
-                os.rmdir(dirpath)
-            except OSError:
-                pass
+
+
+def _trash_mismatch(trash: Path, members) -> list[str]:
+    """Rels whose file in trash is missing or does not match the manifest."""
+    bad = []
+    for m in members:
+        path = trash / m["rel"]
+        try:
+            st = os.stat(path)
+        except OSError:
+            bad.append(m["rel"])
+            continue
+        if st.st_size != int(m["size"]):
+            bad.append(m["rel"])
+            continue
+        if _sha256_file(str(path)) != m["sha256"]:
+            bad.append(m["rel"])
+    return bad
+
+
+def _rollback(trash: Path, members) -> str:
+    """Move trashed files back to their original paths. Returns leftovers.
+
+    A file whose original path now exists is left in trash (never
+    overwritten) and named in the returned string; the trash dir is kept so
+    the next recovery can retry it.
+    """
+    problems = []
+    left = False
+    for m in members:
+        src = trash / m["rel"]
+        if not src.exists():
+            continue
+        dst = Path(m["path"])
+        if dst.exists():
+            problems.append("%s (left in trash: %s)" % (dst, src))
+            left = True
+            continue
+        try:
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            os.rename(src, dst)
+        except OSError as exc:
+            problems.append("%s: %s" % (dst, exc))
+            left = True
+    if not left:
+        shutil.rmtree(trash, ignore_errors=True)
+    return "; ".join(problems)
+
+
+def _archive_ok(rec: dict) -> bool:
+    archive = rec.get("archive")
+    if not archive or not os.path.exists(archive):
+        return False
+    if os.path.getsize(archive) != int(rec.get("archive_bytes") or -1):
+        return False
+    try:
+        verify_archive(archive, rec.get("members") or [])
+    except ArchiveError:
+        return False
+    return True
+
+
+def _finish_reclaim(rec: dict, dest, manifest: Manifest) -> None:
+    """Step 5: delete the unit's trash dir, prune empty parents, record it."""
+    trash = _trash_dir(dest, rec["unit"])
+    root = _trash_root(dest)
+    if str(trash).startswith(str(root) + os.sep):
+        shutil.rmtree(trash, ignore_errors=True)
+    members = rec.get("trash_members") or rec.get("members") or []
+    _prune_dirs(rec.get("parent") or "", [m["rel"] for m in members])
+    manifest.write(dict(rec, status="reclaimed", reclaimed_ts=round(time.time(), 3)))
 
 
 def _delete_guard(unit: Unit, cfg: dict) -> None:
@@ -1193,8 +1383,26 @@ def _delete_guard(unit: Unit, cfg: dict) -> None:
             raise ArchiveError("refusing to delete %s: not under the tool root %s" % (path, root))
 
 
-def reclaim_unit(unit: Unit, rec: dict, cfg: dict, now: float) -> str | None:
-    """Delete the unit's members when every check passes. Returns a reason to keep."""
+def reclaim_unit(
+    unit: Unit,
+    rec: dict,
+    cfg: dict,
+    now: float,
+    manifest: Manifest,
+    dest,
+    client,
+) -> str | None:
+    """Journaled two-phase reclaim. Returns a reason to keep, or None.
+
+    Preconditions (all, else keep and record why): status ``archived``,
+    fingerprint unchanged, idle >= ``reclaim_days``, no open handle, store
+    reachable and the unit's ingest verified, the current archive exists at
+    the recorded size and verifies against the recorded members, and the
+    delete guard passes. Then the manifest records ``reclaiming`` before any
+    file moves, each member is renamed into ``state/trash/<uid>/``, every
+    trashed file is re-hashed, and only then is the trash deleted. A crash
+    at any point is resolved by ``recover_trash`` on the next ``--apply``.
+    """
     _delete_guard(unit, cfg)
     days = float(cfg["reclaim_days_by_tool"].get(unit.tool, cfg["reclaim_days"]))
     idle_hours = (now - unit.newest_mtime) / 3600.0
@@ -1220,8 +1428,163 @@ def reclaim_unit(unit: Unit, rec: dict, cfg: dict, now: float) -> str | None:
             return "changed since archive: %s" % member.rel
         if _sha256_file(member.path) != old["sha256"]:
             return "content changed since archive: %s" % member.rel
-    _remove_unit(unit)
+
+    # The archive must exist, be the recorded size, and verify.
+    archive = rec.get("archive")
+    if not archive or not os.path.exists(archive):
+        return "archive missing: %s" % archive
+    if os.path.getsize(archive) != int(rec.get("archive_bytes") or -1):
+        return "archive size changed: %s" % archive
+    try:
+        verify_archive(archive, rec.get("members") or [])
+    except ArchiveError as exc:
+        return "archive does not verify: %s" % exc
+
+    # The store must be reachable and this unit's ingest verified.
+    if client is None:
+        return "store not checked"
+    try:
+        got = count_uniq_rows(client, unit.uid, str(rec.get("rev", "0")))
+    except Exception as exc:  # store down or query failed
+        return "store unreachable: %s" % exc
+    if got != int(rec.get("lines") or 0):
+        return "ingest not verified (%d/%d rows)" % (got, int(rec.get("lines") or 0))
+
+    # Same volume: rename must not cross a device boundary.
+    trash = _trash_dir(dest, unit.uid)
+    try:
+        trash.parent.mkdir(parents=True, exist_ok=True)
+        trash_dev = os.stat(trash.parent).st_dev
+    except OSError as exc:
+        return "trash dir unavailable: %s" % exc
+    for member in unit.members:
+        try:
+            if os.stat(member.path).st_dev != trash_dev:
+                return "different device for %s" % member.rel
+        except OSError as exc:
+            return "stat failed: %s" % exc
+
+    trash_members = [
+        {
+            "rel": m.rel,
+            "path": m.path,
+            "sha256": recorded[m.rel]["sha256"],
+            "size": recorded[m.rel]["size"],
+        }
+        for m in unit.members
+    ]
+    journal = dict(
+        rec,
+        status="reclaiming",
+        trash=str(trash),
+        trash_members=trash_members,
+        reclaim_started_ts=round(time.time(), 3),
+    )
+    manifest.write(journal)
+
+    try:
+        for m in unit.members:
+            dst = trash / m.rel
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            os.rename(m.path, dst)
+    except OSError as exc:
+        leftover = _rollback(trash, trash_members)
+        manifest.write(
+            dict(
+                journal,
+                status="error" if leftover else "archived",
+                reclaim_reason="rename failed: %s%s" % (exc, "; " + leftover if leftover else ""),
+            )
+        )
+        return "rename failed: %s" % exc
+
+    bad = _trash_mismatch(trash, trash_members)
+    if bad:
+        leftover = _rollback(trash, trash_members)
+        manifest.write(
+            dict(
+                journal,
+                status="error" if leftover else "archived",
+                error="trash hash mismatch: %s%s" % (", ".join(bad[:5]), "; " + leftover if leftover else ""),
+            )
+        )
+        return "trash hash mismatch: %s" % ", ".join(bad[:5])
+
+    _finish_reclaim(journal, dest, manifest)
     return None
+
+
+def _recover_one(uid: str, rec: dict, dest, manifest: Manifest, out) -> None:
+    """Resolve one ``reclaiming`` record from whatever the trash holds."""
+    entry = _trash_dir(dest, uid)
+    members = rec.get("trash_members") or []
+    files = [p for p in entry.rglob("*") if p.is_file()] if entry.is_dir() else []
+    if not files:
+        # Crash after the trash delete (or before any rename).
+        if _archive_ok(rec) and all(not os.path.exists(m["path"]) for m in members):
+            _finish_reclaim(rec, dest, manifest)
+            print("  recovered reclaim %s: reclaimed" % uid, file=out)
+        else:
+            manifest.write(dict(rec, status="archived", reclaim_reason="recovered: nothing in trash"))
+            print("  recovered reclaim %s: archived" % uid, file=out)
+        return
+    bad = _trash_mismatch(entry, members)
+    if bad or not _archive_ok(rec):
+        leftover = _rollback(entry, members)
+        manifest.write(
+            dict(
+                rec,
+                status="error" if leftover else "archived",
+                error="recovered: trash mismatch %s%s"
+                % (", ".join(bad[:5]), "; " + leftover if leftover else ""),
+            )
+        )
+        print("  recovered reclaim %s: rolled back" % uid, file=out)
+    else:
+        _finish_reclaim(rec, dest, manifest)
+        print("  recovered reclaim %s: reclaimed" % uid, file=out)
+
+
+def recover_trash(dest, manifest: Manifest, out) -> int:
+    """Resolve every ``reclaiming`` record and leftover trash dir.
+
+    Runs at the start of every ``--apply``. If the trash hashes match the
+    manifest and the archive verifies, step 5 is finished (``reclaimed``);
+    otherwise the files are moved back and the unit returns to ``archived``.
+    A ``reclaiming`` record is resolved even when its trash dir is already
+    gone (a crash after the trash delete). Returns the number resolved.
+    """
+    root = _trash_root(dest)
+    resolved = 0
+    seen = set()
+
+    def needs_recovery(rec) -> bool:
+        return rec.get("status") == "reclaiming" or (
+            rec.get("status") == "error" and bool(rec.get("trash_members"))
+        )
+
+    for uid, rec in list(manifest.latest.items()):
+        if not needs_recovery(rec):
+            continue
+        seen.add(_uid_safe(uid))
+        _recover_one(uid, rec, dest, manifest, out)
+        resolved += 1
+    if root.is_dir():
+        for entry in sorted(root.iterdir()):
+            if not entry.is_dir() or entry.name in seen:
+                continue
+            uid = entry.name.replace("%2F", "/").replace("%25", "%")
+            rec = manifest.latest.get(uid)
+            if rec is None or not needs_recovery(rec):
+                # No journal: never delete unknown data. Leave it and say so.
+                if any(entry.iterdir()):
+                    print("  trash without a reclaiming record: %s" % entry, file=out)
+                else:
+                    shutil.rmtree(entry, ignore_errors=True)
+                continue
+            _recover_one(uid, rec, dest, manifest, out)
+            resolved += 1
+    return resolved
 
 
 # --------------------------------------------------------------- manifest
@@ -1252,8 +1615,24 @@ class Manifest:
         self.latest[rec["unit"]] = rec
 
 
-def archive_path(state_dir: Path, unit: Unit) -> Path:
-    return Path(state_dir) / "archive" / unit.tool / (unit.key + ".tar.zst")
+def archive_path(state_dir: Path, unit: Unit, seq: int = 0) -> Path:
+    """``<dest>/archive/<tool>/<key>.<seq>.tar.zst``. A pack never replaces."""
+    return Path(state_dir) / "archive" / unit.tool / ("%s.%d.tar.zst" % (unit.key, seq))
+
+
+def next_archive_seq(state_dir: Path, unit: Unit) -> int:
+    """The next free archive sequence for a unit (0 when none exist)."""
+    base = archive_path(state_dir, unit, 0).parent
+    prefix = os.path.basename(unit.key) + "."
+    seq = 0
+    if base.is_dir():
+        for name in os.listdir(base):
+            if not (name.startswith(prefix) and name.endswith(".tar.zst")):
+                continue
+            mid = name[len(prefix): -len(".tar.zst")]
+            if mid.isdigit():
+                seq = max(seq, int(mid) + 1)
+    return seq
 
 
 # --------------------------------------------------------------- eligibility
@@ -1273,15 +1652,19 @@ def _reclaim_ready(unit: Unit, cfg: dict, now: float) -> bool:
 
 def _done(unit: Unit, manifest: Manifest) -> bool:
     prior = manifest.latest.get(unit.uid)
-    return bool(prior) and prior.get("status") == "reclaimed" and _fp_equal(prior.get("members"), fingerprint(unit))
+    return (
+        bool(prior)
+        and prior.get("status") in ("reclaimed", "restored")
+        and _fp_equal(prior.get("members"), fingerprint(unit))
+    )
 
 
 def _settled(unit: Unit, manifest: Manifest) -> bool:
-    """Archived or reclaimed with a matching fingerprint: nothing to plan."""
+    """Archived, reclaimed or restored with a matching fingerprint."""
     prior = manifest.latest.get(unit.uid)
     return (
         bool(prior)
-        and prior.get("status") in ("archived", "reclaimed")
+        and prior.get("status") in ("archived", "reclaimed", "restored")
         and _fp_equal(prior.get("members"), fingerprint(unit))
     )
 
@@ -1302,35 +1685,60 @@ def process_unit(
 ) -> str:
     """Archive, ingest and maybe reclaim one unit. Returns the outcome name."""
     fp = fingerprint(unit)
-    if prior and prior.get("status") == "reclaimed" and _fp_equal(prior.get("members"), fp):
+    if prior and prior.get("status") in ("reclaimed", "restored") and _fp_equal(prior.get("members"), fp):
         return "done"
+    if prior and prior.get("status") == "reclaiming":
+        # recover_trash runs first; an unresolved journal is never re-packed.
+        return "skipped"
     if prior and prior.get("status") == "archived" and _fp_equal(prior.get("members"), fp):
         if no_reclaim:
             return "archived"
-        reason = reclaim_unit(unit, prior, cfg, now)
+        reason = reclaim_unit(unit, prior, cfg, now, manifest, state_dir, client)
         if reason:
             print("  keep %s: %s" % (unit.uid, reason), file=out)
             return "archived"
-        manifest.write(dict(prior, status="reclaimed"))
         print("  reclaimed %s" % unit.uid, file=out)
         return "reclaimed"
 
-    archive = archive_path(state_dir, unit)
-    archive.parent.mkdir(parents=True, exist_ok=True)
-    tmp = str(archive) + ".tmp"
-    try:
-        records = pack(unit, tmp)
-        for rec, member in zip(records, unit.members):
-            if rec["lines"] is None:
-                rec["lines"] = count_member_rows(member, unit)
-        verify_archive(tmp, records)
-        os.replace(tmp, archive)
-    finally:
-        if os.path.exists(tmp):
-            try:
-                os.remove(tmp)
-            except OSError:
-                pass
+    # Reuse the current archive when it already matches this fingerprint
+    # (an ingest retry after an error record must not pack a new version).
+    reuse = None
+    if prior and prior.get("archive") and _fp_equal(prior.get("members"), fp):
+        path = prior["archive"]
+        if os.path.exists(path) and os.path.getsize(path) == int(prior.get("archive_bytes") or -1):
+            reuse = prior
+
+    if reuse is not None:
+        records = reuse["members"]
+        archive = Path(reuse["archive"])
+        seq = int(reuse.get("seq", 0))
+        archives = list(reuse.get("archives") or [])
+        if not archives:
+            archives = [{"seq": seq, "path": str(archive), "bytes": int(reuse.get("archive_bytes") or 0), "members": records}]
+    else:
+        seq = next_archive_seq(state_dir, unit)
+        archive = archive_path(state_dir, unit, seq)
+        archive.parent.mkdir(parents=True, exist_ok=True)
+        tmp = str(archive) + ".tmp"
+        try:
+            records = pack(unit, tmp)
+            for rec, member in zip(records, unit.members):
+                if rec["lines"] is None:
+                    rec["lines"] = count_member_rows(member, unit)
+            verify_archive(tmp, records)
+            if os.path.exists(archive):
+                raise ArchiveError("refusing to replace existing archive %s" % archive)
+            os.rename(tmp, archive)
+        finally:
+            if os.path.exists(tmp):
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+        archives = list((prior or {}).get("archives") or [])
+        archives.append(
+            {"seq": seq, "path": str(archive), "bytes": os.path.getsize(archive), "members": records}
+        )
 
     rev, total, sent = ingest_unit(unit, records, prior, client)
     rec = {
@@ -1342,6 +1750,8 @@ def process_unit(
         "parent": unit.parent,
         "archive": str(archive),
         "archive_bytes": os.path.getsize(archive),
+        "seq": seq,
+        "archives": archives,
         "raw_bytes": unit.raw_bytes,
         "rev": rev,
         "lines": total,
@@ -1350,17 +1760,16 @@ def process_unit(
     }
     manifest.write(rec)
     print(
-        "  archived %s  raw %d -> zst %d  rows %d (sent %d, rev %s)"
-        % (unit.uid, unit.raw_bytes, rec["archive_bytes"], total, sent, rev),
+        "  archived %s  raw %d -> zst %d  rows %d (sent %d, rev %s, seq %d)"
+        % (unit.uid, unit.raw_bytes, rec["archive_bytes"], total, sent, rev, seq),
         file=out,
     )
     if no_reclaim:
         return "archived"
-    reason = reclaim_unit(unit, rec, cfg, now)
+    reason = reclaim_unit(unit, rec, cfg, now, manifest, state_dir, client)
     if reason:
         print("  keep %s: %s" % (unit.uid, reason), file=out)
         return "archived"
-    manifest.write(dict(rec, status="reclaimed"))
     print("  reclaimed %s" % unit.uid, file=out)
     return "reclaimed"
 
@@ -1383,6 +1792,8 @@ def apply_pass(
     started = time.monotonic()
     budget = max_minutes * 60.0
     picked = 0
+    # Resolve any journal left by a crash before planning new work.
+    recover_trash(state_dir, manifest, out)
     for unit in units:
         if limit is not None and picked >= limit:
             break
@@ -1409,16 +1820,21 @@ def apply_pass(
         except Exception as exc:  # one unit never stops the run
             results["errors"] += 1
             reason = "%s: %s" % (exc.__class__.__name__, exc)
-            manifest.write(
+            # Keep the previous confirmed members, rev and totals so the
+            # next run resumes instead of rejecting already-posted rows.
+            base = dict(prior) if prior else {}
+            base.update(
                 {
                     "unit": unit.uid,
                     "tool": unit.tool,
                     "key": unit.key,
                     "status": "error",
                     "error": reason[:500],
-                    "members": _fp_members(fingerprint(unit)),
                 }
             )
+            if "members" not in base:
+                base["members"] = _fp_members(fingerprint(unit))
+            manifest.write(base)
             print("  ERROR %s: %s" % (unit.uid, reason), file=out)
     return results
 
@@ -1565,6 +1981,9 @@ def _find_record(manifest: Manifest, arg: str) -> dict | None:
     for rec in manifest.latest.values():
         if rec.get("archive") == arg:
             return rec
+        for entry in rec.get("archives") or []:
+            if entry.get("path") == arg:
+                return rec
     matches = [
         rec
         for rec in manifest.latest.values()
@@ -1576,18 +1995,45 @@ def _find_record(manifest: Manifest, arg: str) -> dict | None:
     return matches[0]
 
 
+def _safe_rel(name: str) -> bool:
+    """A relative member name with no ``..`` and no absolute prefix."""
+    if not name or name.startswith("/") or os.path.isabs(name):
+        return False
+    parts = name.replace("\\", "/").split("/")
+    return all(part not in ("", ".", "..") for part in parts)
+
+
 def _extract(archive: str, target: str, members: list[dict]) -> None:
+    """Extract only manifest members, as regular files, beneath ``target``.
+
+    Rejects absolute names, ``..`` components, names not in the manifest,
+    and any non-regular entry (symlink, hardlink, device, fifo). Verifies
+    every member's size and sha256 and that every manifest member is
+    present. Raises ``ArchiveError`` on any doubt.
+    """
     expected = {m["rel"]: m for m in members}
+    target_abs = os.path.abspath(target)
+    os.makedirs(target_abs, exist_ok=True)
+    seen: set[str] = set()
     proc = subprocess.Popen([_zstd_bin(), "-dc", ZSTD_LONG, archive], stdout=subprocess.PIPE)
     try:
         with tarfile.open(fileobj=proc.stdout, mode="r|") as tar:
             for info in tar:
                 if info.isdir():
-                    os.makedirs(os.path.join(target, info.name), exist_ok=True)
+                    if not _safe_rel(info.name):
+                        raise ArchiveError("refusing unsafe archive entry %r" % info.name)
                     continue
                 if not info.isfile():
-                    continue
-                dest = os.path.join(target, info.name)
+                    raise ArchiveError("refusing non-regular archive entry %r" % info.name)
+                name = info.name
+                if not _safe_rel(name):
+                    raise ArchiveError("refusing unsafe archive entry %r" % name)
+                exp = expected.get(name)
+                if exp is None:
+                    raise ArchiveError("archive entry %r is not in the manifest" % name)
+                dest = os.path.abspath(os.path.join(target_abs, name))
+                if not dest.startswith(target_abs + os.sep):
+                    raise ArchiveError("archive entry %r escapes the target" % name)
                 os.makedirs(os.path.dirname(dest), exist_ok=True)
                 digest = hashlib.sha256()
                 size = 0
@@ -1600,12 +2046,15 @@ def _extract(archive: str, target: str, members: list[dict]) -> None:
                         digest.update(chunk)
                         size += len(chunk)
                         fh.write(chunk)
-                exp = expected.get(info.name)
-                if exp and (size != exp["size"] or digest.hexdigest() != exp["sha256"]):
-                    raise ArchiveError("restored %s does not match the manifest" % info.name)
+                if size != exp["size"] or digest.hexdigest() != exp["sha256"]:
+                    raise ArchiveError("restored %s does not match the manifest" % name)
+                seen.add(name)
     finally:
         proc.stdout.close()
         proc.wait()
+    missing = sorted(set(expected) - seen)
+    if missing:
+        raise ArchiveError("archive is missing manifest member(s): %s" % ", ".join(missing[:5]))
 
 
 def restore(arg: str, to: str | None, state_dir: Path, out) -> int:
@@ -1629,8 +2078,38 @@ def restore(arg: str, to: str | None, state_dir: Path, out) -> int:
         for path in existing[:20]:
             print("  %s" % path, file=sys.stderr)
         return 2
-    os.makedirs(target, exist_ok=True)
-    _extract(archive, target, members)
+    target_abs = os.path.abspath(target)
+    parent = os.path.dirname(target_abs) or "."
+    os.makedirs(parent, exist_ok=True)
+    tmp = tempfile.mkdtemp(prefix=".restore-", dir=parent)
+    moved: list[tuple[str, str]] = []
+    try:
+        _extract(archive, tmp, members)
+        # Re-check after extraction: a concurrent writer must not be clobbered.
+        existing = [os.path.join(target_abs, m["rel"]) for m in members if os.path.exists(os.path.join(target_abs, m["rel"]))]
+        if existing:
+            print("refusing to overwrite %d existing path(s):" % len(existing), file=sys.stderr)
+            for path in existing[:20]:
+                print("  %s" % path, file=sys.stderr)
+            return 2
+        for m in members:
+            src = os.path.join(tmp, m["rel"])
+            dst = os.path.join(target_abs, m["rel"])
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            os.rename(src, dst)
+            moved.append((src, dst))
+    except (ArchiveError, OSError) as exc:
+        # Put back anything already renamed so the target is untouched.
+        for src, dst in reversed(moved):
+            try:
+                os.makedirs(os.path.dirname(src), exist_ok=True)
+                os.rename(dst, src)
+            except OSError:
+                pass
+        print("restore failed, target untouched: %s" % exc, file=sys.stderr)
+        return 2
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
     manifest.write(dict(rec, status="restored"))
     print("restored %s to %s" % (rec["unit"], target), file=out)
     return 0
@@ -1645,7 +2124,15 @@ def status(state_dir: Path, out) -> int:
         tool = rec.get("tool") or str(rec.get("unit", "")).split("/")[0]
         row = per.setdefault(
             tool,
-            {"archived": 0, "reclaimed": 0, "restored": 0, "error": 0, "archive_bytes": 0, "reclaimed_bytes": 0},
+            {
+                "archived": 0,
+                "reclaimed": 0,
+                "restored": 0,
+                "reclaiming": 0,
+                "error": 0,
+                "archive_bytes": 0,
+                "reclaimed_bytes": 0,
+            },
         )
         st = rec.get("status")
         if st in row:
@@ -1654,22 +2141,39 @@ def status(state_dir: Path, out) -> int:
             row["archive_bytes"] += int(rec.get("archive_bytes") or 0)
         if st == "reclaimed":
             row["reclaimed_bytes"] += int(rec.get("raw_bytes") or 0)
-    print("%-12s %9s %10s %9s %7s %12s %14s" % ("tool", "archived", "reclaimed", "restored", "error", "archive", "reclaimed bytes"), file=out)
+    print(
+        "%-12s %9s %10s %9s %10s %7s %12s %14s"
+        % ("tool", "archived", "reclaimed", "restored", "reclaiming", "error", "archive", "reclaimed bytes"),
+        file=out,
+    )
     for tool in sorted(per):
         row = per[tool]
         print(
-            "%-12s %9d %10d %9d %7d %12s %14s"
+            "%-12s %9d %10d %9d %10d %7d %12s %14s"
             % (
                 tool,
                 row["archived"],
                 row["reclaimed"],
                 row["restored"],
+                row["reclaiming"],
                 row["error"],
                 _fmt(row["archive_bytes"]),
                 _fmt(row["reclaimed_bytes"]),
             ),
             file=out,
         )
+    trash = state_dir / "trash"
+    if trash.is_dir():
+        size = 0
+        count = 0
+        for dirpath, _dirnames, filenames in os.walk(trash):
+            for name in filenames:
+                try:
+                    size += os.path.getsize(os.path.join(dirpath, name))
+                    count += 1
+                except OSError:
+                    pass
+        print("trash: %d file(s), %s (resolved by the next --apply)" % (count, _fmt(size)), file=out)
     last = state_dir / "last_success.json"
     if last.exists():
         try:

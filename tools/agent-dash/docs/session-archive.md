@@ -63,19 +63,29 @@ Nothing this job writes is ever deleted for age or space:
 
 ```
 <dest>/                          mode 0700, holds .metadata_never_index
-  archive/<tool>/<unit>.tar.zst
+  archive/<tool>/<unit>.<seq>.tar.zst
   state/manifest.jsonl           append-only; last record per unit wins
   state/archive.lock
+  state/trash/<uid-safe>/<rel>   only during a reclaim (see the journal)
   state/last_success.json
   state/disk_warning.json        only while a scheduled run saw < 30 GB free
 ```
 
 The unit path is the unit's path relative to the tool root, so a Claude
 Code session archives to
-`archive/claude/<proj>/<uuid>.tar.zst` and a Codex rollout to
-`archive/codex/sessions/2026/11/03/rollout-....jsonl.tar.zst`. The tar
+`archive/claude/<proj>/<uuid>.0.tar.zst` and a Codex rollout to
+`archive/codex/sessions/2026/11/03/rollout-....jsonl.0.tar.zst`. The tar
 holds members relative to the unit's **parent** dir, so extract restores the
 same names.
+
+### Archive versioning
+
+A pack **never replaces** an existing archive file. The sequence starts at
+`0` and the next free number is used, so a later partial or changed pack
+can never destroy an earlier complete archive. The manifest record lists
+every archive for the unit under `archives` (`seq`, `path`, `bytes`,
+`members`); the newest verified one is current (`archive`, `archive_bytes`,
+`members`). Old versions are kept forever, like every other archive.
 
 `.metadata_never_index` stops Spotlight from indexing the archive.
 
@@ -84,7 +94,7 @@ same names.
 | tool | root | unit | rows from |
 |---|---|---|---|
 | claude | `~/.claude/projects` | `<proj>/<uuid>.jsonl` plus sibling dir `<proj>/<uuid>/` (`subagents/`, `tool-results/`) | the `.jsonl` and `<uuid>/subagents/*.jsonl` |
-| codex | `~/.codex` | each `sessions/**/rollout-*.jsonl`, `sessions/**/rollout-*.jsonl.zst`, `archived_sessions/*.jsonl.zst` | that file (`.zst` decompressed while reading) |
+| codex | `~/.codex` | exactly `sessions/YYYY/MM/DD/rollout-*.jsonl`, the same with `.zst`, and `archived_sessions/rollout-*.jsonl.zst` (no recursion under `archived_sessions`) | that file (`.zst` decompressed while reading; line counts come from the decompressed stream) |
 | grok | `~/.grok/sessions` | each dir `<enc-cwd>/<id>/` | `*.jsonl` lines; `*.log` lines as text rows `type=log` |
 | cursor | `~/.cursor` | each dir `chats/<ws>/<id>/` and each dir `projects/<proj>/` | chats: `store.db` via `sqlite3` read-only after copying db+wal+shm to a temp dir; projects: `*.jsonl` and `*.log` lines |
 | commandcode | `~/.commandcode/projects` | files grouped by session stem `<proj>/<uuid>.*` | `*.jsonl` |
@@ -128,6 +138,31 @@ the 1.8 MiB text cap apply. Per row:
 | `unit` | `<tool>/<unit path>` (relative to the tool root) |
 | `member` | the file inside the unit |
 | `rev` | starts `"0"`, bumped when a member is rewritten |
+| `line` | 1-based line number within the member (for live histories, the line number in the file for that rev) |
+| `truncated` | `"1"` only when a line exceeded the text cap (see below) |
+
+### Ingest is at-least-once
+
+Every row carries `unit`, `member`, `rev` and `line`. Verification is
+`count_uniq(member, line)` over `unit:=<uid> rev:=<rev>` equals the expected
+line count, so a resend after a crash stores duplicate rows that are
+harmless and invisible to verification. On restart after a crash, a
+transient mismatch or an `error` record, the pass does not compare raw
+counts to the manifest: it resends from the last line the manifest
+confirmed (or from line 1 of that rev) and verifies with `count_uniq`.
+Error records keep the previous confirmed members and totals, so the next
+run resumes. A rewrite bumps `rev`; verification and append planning use
+only the current rev, so rows kept from an older rev never block growth.
+
+Dedupe for analytics:
+
+```logsql
+unit:="<uid>" | uniq by (unit, member, rev, line)
+```
+
+A line longer than 64 MiB without a newline is emitted once with the first
+`MAX_MSG_BYTES` bytes and `truncated=1`; the rest is discarded while
+streaming, so RSS stays bounded.
 
 Streams are keyed by `ws,label`, so each session is its own stream.
 
@@ -144,22 +179,43 @@ Streams are keyed by `ws,label`, so each session is its own stream.
    included).
 4. **verify**: stream the copy back through `tarfile` and compare every
    member's sha256 and size; then atomic rename to the final path.
-5. **ingest**: query the stored row count for the unit. If it equals the
-   manifest's count, send only the lines after the recorded line count when
-   a member's old bytes are a prefix of the new file (append growth). If the
-   old bytes are not a prefix (rewrite), bump `rev` and resend every member.
-   Then `flush()` and verify the stored count for `(unit, rev)`. Any
-   mismatch is `status: error` naming the unit; the pass continues.
+5. **ingest**: if `count_uniq(member, line)` for the current rev already
+   equals the expected count, send nothing. Otherwise send from the last
+   confirmed line when a member's old bytes are a prefix of the new file
+   (append growth); if the old bytes are not a prefix (rewrite), bump `rev`
+   and resend every member. Then `flush()` and verify with `count_uniq`.
+   Any mismatch is `status: error` naming the unit, keeping the previous
+   confirmed members; the pass continues.
 6. **record** `archived` with each member's `rel`, `size`, `mtime_ns`,
-   `sha256`, `lines`, `rev`, plus the archive path and byte counts.
-7. **reclaim** (unless `--no-reclaim`), only when: the unit is idle at
-   least `reclaim_days` (per-tool override applies), status is `archived`,
-   the fingerprint is unchanged, no member is open, every path resolves
-   inside the tool root and none resolves under the archive dest, and
-   re-stat + re-hash matches the manifest. It deletes exactly the unit's
-   members and any directory that becomes empty. Any doubt records why and
-   keeps the files; a path that fails the dest/root guard is recorded as
-   the unit's `error` and the pass continues.
+   `sha256`, `lines`, `rev`, the archive path and byte counts, and the
+   `archives` list.
+7. **reclaim** (unless `--no-reclaim`) is a journaled two-phase move, never
+   a straight unlink. Preconditions, all of them, else keep and record why:
+   status `archived`; fingerprint unchanged; idle at least `reclaim_days`
+   (per-tool override applies); no open handle; the store is reachable and
+   the unit's ingest verified; the current archive exists, its size equals
+   the recorded `archive_bytes`, and `verify_archive` passes against the
+   recorded members; the delete guard passes (every path inside the tool
+   root, none under the archive dest); and the member and trash dir are on
+   the same device. Then:
+   1. write manifest status `reclaiming` (with the archive seq and member
+      list) **before** touching files;
+   2. `os.rename` each member into `state/trash/<uid-safe>/<rel>`;
+   3. re-hash every file now in trash against the manifest sha256 — any
+      mismatch moves every trashed file back (refusing to overwrite a path
+      that now exists, leaving it in trash and recording `error` with both
+      paths) and records `archived`;
+   4. all match: delete that unit's trash dir, then remove now-empty parent
+      dirs of the members only (bottom-up, stopping at the unit dir / tool
+      root, never walking siblings, never touching excluded subtrees such
+      as Claude `memory/`), and record `reclaimed`.
+
+   Recovery runs at the start of every `--apply`: for any unit whose latest
+   status is `reclaiming`, or any leftover `state/trash/*`, if the trash
+   hashes match the manifest and the archive verifies, step 4 is finished;
+   otherwise the files are moved back. A unit in `reclaiming` is never
+   re-packed. The trash dir is the only place under dest the code deletes
+   from; the dest/root guard still covers every other path.
 
 Exit codes: `0` ok, `1` failures or an empty dry run on real input, `2` bad
 options, `3` another run holds the lock, `5` store unreachable (only for
@@ -217,9 +273,14 @@ python3 ~/.claude/tools/agent-dash/agent_dash.py logs sessions restore \
   ~/Documents/data/agent-sessions/archive/pi/....tar.zst --to /tmp/restore
 ```
 
-It extracts to the original parent dir (or `--to DIR`) and refuses, exit 2,
-if any target path already exists. The record becomes `restored`; the next
-pass sees a matching fingerprint and does nothing.
+It extracts to a temporary dir under the target's parent, accepts only
+regular-file entries whose names are relative, contain no `..`, and are
+listed in the manifest (symlinks, hardlinks and devices are rejected),
+verifies every manifest member is present with matching sha256 and size,
+then refuses (exit 2) if any final path already exists, and only then
+renames into place. Any failure leaves the target untouched. The record
+becomes `restored`; the next pass sees a matching fingerprint and does
+nothing.
 
 Read an archive by hand:
 
@@ -243,7 +304,8 @@ python3 ~/.claude/tools/agent-dash/agent_dash.py logs sessions --apply \
 # archive without deleting originals
 python3 ~/.claude/tools/agent-dash/agent_dash.py logs sessions --apply --no-reclaim
 
-# status and last errors
+# status: per-tool counts (archived, reclaimed, restored, reclaiming, error),
+# archive bytes, reclaimed bytes, trash size, last success and last errors
 python3 ~/.claude/tools/agent-dash/agent_dash.py logs sessions status
 
 # uninstall the schedule (keeps archives and state)

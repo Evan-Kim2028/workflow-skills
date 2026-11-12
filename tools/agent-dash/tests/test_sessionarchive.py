@@ -62,6 +62,9 @@ class FakeClient:
         rev = _REV_RE.search(query)
         if rev:
             rows = [r for r in rows if r.get("rev") == rev.group(1)]
+        if "count_uniq" in query:
+            pairs = {(r.get("member"), r.get("line")) for r in rows}
+            return [{"n": str(len(pairs))}]
         return [{"n": str(len(rows))}]
 
 
@@ -103,6 +106,40 @@ class Base(unittest.TestCase):
         units = sa.TOOLS[tool][1](str(root))
         self.assertTrue(units, "no units discovered for %s" % tool)
         return units[0]
+
+    def archive_unit(self, unit, dest, client, status="archived"):
+        """Pack a unit into ``dest``, ingest it, and write an archived record."""
+        seq = sa.next_archive_seq(dest, unit)
+        archive = sa.archive_path(dest, unit, seq)
+        archive.parent.mkdir(parents=True, exist_ok=True)
+        records = sa.pack(unit, str(archive))
+        for rec, member in zip(records, unit.members):
+            if rec["lines"] is None:
+                rec["lines"] = sa.count_member_rows(member, unit)
+        sa.verify_archive(str(archive), records)
+        rev, total, _sent = sa.ingest_unit(unit, records, None, client)
+        manifest = sa.Manifest(dest / "state")
+        rec = {
+            "unit": unit.uid,
+            "tool": unit.tool,
+            "key": unit.key,
+            "session": unit.session,
+            "root": unit.root,
+            "parent": unit.parent,
+            "archive": str(archive),
+            "archive_bytes": os.path.getsize(archive),
+            "seq": seq,
+            "archives": [
+                {"seq": seq, "path": str(archive), "bytes": os.path.getsize(archive), "members": records}
+            ],
+            "raw_bytes": unit.raw_bytes,
+            "rev": rev,
+            "lines": total,
+            "members": records,
+            "status": status,
+        }
+        manifest.write(rec)
+        return rec, manifest
 
 
 # --------------------------------------------------------------- discovery
@@ -453,91 +490,89 @@ class LiveTest(Base):
 # --------------------------------------------------------------- reclaim
 
 class ReclaimTest(Base):
-    def _archived(self, root, days=20):
+    def _archived(self, root, days=20, client=None):
         path = write(root / "proj" / "a.jsonl", '{"type":"session"}\n')
         age(path, days)
         unit = self.unit("pi", root)
-        records = sa.pack(unit, str(self.home / "a.tar.zst"))
-        for rec, member in zip(records, unit.members):
-            if rec["lines"] is None:
-                rec["lines"] = sa.count_member_rows(member, unit)
-        rec = {"unit": unit.uid, "members": records, "status": "archived"}
-        return unit, rec, path
+        dest = self.home / "dest"
+        client = client or FakeClient()
+        rec, manifest = self.archive_unit(unit, dest, client)
+        return unit, rec, path, dest, manifest, client
+
+    def _cfg(self, dest, **extra):
+        cfg = {"reclaim_days": 14.0, "reclaim_days_by_tool": {}, "dest": str(dest)}
+        cfg.update(extra)
+        return cfg
 
     def test_reclaim_deletes_exactly_the_unit(self):
         root = self.home / "pi"
-        unit, rec, path = self._archived(root)
+        unit, rec, path, dest, manifest, client = self._archived(root)
         other = write(root / "proj" / "b.jsonl", '{"type":"session"}\n')
         age(other, 20)
-        cfg = {"reclaim_days": 14.0, "reclaim_days_by_tool": {}}
-        reason = sa.reclaim_unit(unit, rec, cfg, time.time())
+        reason = sa.reclaim_unit(unit, rec, self._cfg(dest), time.time(), manifest, dest, client)
         self.assertIsNone(reason)
         self.assertFalse(path.exists())
         self.assertTrue(other.exists())
+        self.assertEqual(sa.Manifest(dest / "state").latest[unit.uid]["status"], "reclaimed")
 
     def test_refused_when_too_young(self):
         root = self.home / "pi"
-        unit, rec, path = self._archived(root, days=1)
-        cfg = {"reclaim_days": 14.0, "reclaim_days_by_tool": {}}
-        reason = sa.reclaim_unit(unit, rec, cfg, time.time())
+        unit, rec, path, dest, manifest, client = self._archived(root, days=1)
+        reason = sa.reclaim_unit(unit, rec, self._cfg(dest), time.time(), manifest, dest, client)
         self.assertIn("too young", reason)
         self.assertTrue(path.exists())
 
     def test_refused_when_changed_since_archive(self):
         root = self.home / "pi"
-        unit, rec, path = self._archived(root)
+        unit, rec, path, dest, manifest, client = self._archived(root)
         path.write_text('{"type":"session","x":1}\n', encoding="utf-8")
-        cfg = {"reclaim_days": 14.0, "reclaim_days_by_tool": {}}
-        reason = sa.reclaim_unit(unit, rec, cfg, time.time())
+        reason = sa.reclaim_unit(unit, rec, self._cfg(dest), time.time(), manifest, dest, client)
         self.assertIn("changed since archive", reason)
         self.assertTrue(path.exists())
 
     def test_refused_when_path_escapes_root(self):
         root = self.home / "pi"
-        unit, rec, _path = self._archived(root)
+        unit, rec, _path, dest, manifest, client = self._archived(root)
         outside = write(self.home / "outside.jsonl", '{"type":"session"}\n')
         age(outside, 20)
         unit.members[0].path = str(outside)
-        cfg = {"reclaim_days": 14.0, "reclaim_days_by_tool": {}}
         with self.assertRaises(sa.ArchiveError) as ctx:
-            sa.reclaim_unit(unit, rec, cfg, time.time())
+            sa.reclaim_unit(unit, rec, self._cfg(dest), time.time(), manifest, dest, client)
         self.assertIn("not under the tool root", str(ctx.exception))
         self.assertTrue(outside.exists())
 
     def test_refused_when_path_under_dest_nested_in_root(self):
         root = self.home / "pi"
-        unit, rec, _path = self._archived(root)
+        unit, rec, _path, _dest, manifest, client = self._archived(root)
         dest = root / "archive-dest"
         nested = write(dest / "proj" / "a.jsonl", '{"type":"session"}\n')
         age(nested, 20)
         unit.members[0].path = str(nested)
-        cfg = {"reclaim_days": 14.0, "reclaim_days_by_tool": {}, "dest": str(dest)}
         with self.assertRaises(sa.ArchiveError) as ctx:
-            sa.reclaim_unit(unit, rec, cfg, time.time())
+            sa.reclaim_unit(unit, rec, self._cfg(dest), time.time(), manifest, dest, client)
         self.assertIn("under the archive dest", str(ctx.exception))
         self.assertTrue(nested.exists())
 
     def test_refused_when_unit_is_a_symlink_into_dest(self):
         root = self.home / "pi"
-        unit, rec, path = self._archived(root)
+        unit, rec, path, _dest, manifest, client = self._archived(root)
         dest = root / "store"
         real = write(dest / "sessions" / "a.jsonl", '{"type":"session"}\n')
         age(real, 20)
         os.remove(path)
         os.symlink(real, path)
         unit.members[0].path = str(path)
-        cfg = {"reclaim_days": 14.0, "reclaim_days_by_tool": {}, "dest": str(dest)}
         with self.assertRaises(sa.ArchiveError) as ctx:
-            sa.reclaim_unit(unit, rec, cfg, time.time())
+            sa.reclaim_unit(unit, rec, self._cfg(dest), time.time(), manifest, dest, client)
         self.assertIn("under the archive dest", str(ctx.exception))
         self.assertTrue(real.exists())
         self.assertTrue(path.is_symlink())
 
     def test_per_tool_override(self):
         root = self.home / "pi"
-        unit, rec, path = self._archived(root, days=3)
-        cfg = {"reclaim_days": 14.0, "reclaim_days_by_tool": {"pi": 1.0}}
-        self.assertIsNone(sa.reclaim_unit(unit, rec, cfg, time.time()))
+        unit, rec, path, dest, manifest, client = self._archived(root, days=3)
+        cfg = self._cfg(dest, reclaim_days_by_tool={"pi": 1.0})
+        self.assertIsNone(sa.reclaim_unit(unit, rec, cfg, time.time(), manifest, dest, client))
         self.assertFalse(path.exists())
 
 
@@ -807,6 +842,604 @@ class InstallerTest(unittest.TestCase):
             )
             self.assertEqual(res.returncode, 0, res.stderr)
             self.assertFalse(plist.exists())
+
+
+# --------------------------------------------------------------- review regressions
+
+def make_tar_zst(path, entries):
+    """Build a ``tar.zst`` from ``(name, data, kind)`` entries for restore tests."""
+    import io
+    import tarfile
+
+    tar_path = str(path) + ".tar"
+    with tarfile.open(tar_path, "w") as tar:
+        for name, data, kind in entries:
+            info = tarfile.TarInfo(name)
+            if kind == "file":
+                info.size = len(data)
+                tar.addfile(info, io.BytesIO(data))
+            elif kind == "symlink":
+                info.type = tarfile.SYMTYPE
+                info.linkname = data.decode()
+                tar.addfile(info)
+            elif kind == "dir":
+                info.type = tarfile.DIRTYPE
+                tar.addfile(info)
+    zstd_compress(tar_path, path)
+    os.remove(tar_path)
+
+
+class ReviewRegressionTest(Base):
+    """One test per finding in the independent review of d045281."""
+
+    def _cfg(self, dest, **extra):
+        cfg = {
+            "reclaim_days": 14.0,
+            "reclaim_days_by_tool": {},
+            "min_idle_hours": 6.0,
+            "max_minutes": 90.0,
+            "dest": str(dest),
+        }
+        cfg.update(extra)
+        return cfg
+
+    def _grok_unit(self, days=20):
+        root = self.home / "grok"
+        sdir = root / "enc" / "sid"
+        write(sdir / "chat_history.jsonl", '{"type":"system"}\n')
+        write(sdir / "blob.bin", bytes(range(256)) * 32)
+        for path in sdir.rglob("*"):
+            if path.is_file():
+                age(path, days)
+        return root, self.unit("grok", root)
+
+    # -- finding 1: a crash mid-reclaim must never destroy the only archive
+    def test_review_f1_crash_mid_reclaim_keeps_complete_archive(self):
+        root, unit = self._grok_unit()
+        dest = self.home / "dest"
+        client = FakeClient()
+        rec, manifest = self.archive_unit(unit, dest, client)
+        archive0 = Path(rec["archive"])
+        real_rename = os.rename
+        calls = {"n": 0}
+
+        def flaky(src, dst):
+            calls["n"] += 1
+            if calls["n"] == 2:
+                raise OSError("simulated crash after the first rename")
+            return real_rename(src, dst)
+
+        with mock.patch.object(sa.os, "rename", flaky):
+            reason = sa.reclaim_unit(unit, rec, self._cfg(dest), time.time(), manifest, dest, client)
+        self.assertIn("rename failed", reason)
+        for member in unit.members:
+            self.assertTrue(Path(member.path).exists(), member.rel)
+        # The complete archive is still there and still verifies.
+        sa.verify_archive(str(archive0), rec["members"])
+        self.assertEqual(len(rec["members"]), 2)
+        # A later pack gets a new sequence and never replaces archive 0.
+        self.assertEqual(sa.next_archive_seq(dest, unit), 1)
+        self.assertTrue(archive0.exists())
+
+    # -- finding 2: reclaim must check the archive exists and verifies
+    def test_review_f2_reclaim_refuses_missing_or_truncated_archive(self):
+        root, unit = self._grok_unit()
+        dest = self.home / "dest"
+        client = FakeClient()
+        rec, manifest = self.archive_unit(unit, dest, client)
+        archive = Path(rec["archive"])
+        archive.write_bytes(b"truncated")
+        reason = sa.reclaim_unit(unit, rec, self._cfg(dest), time.time(), manifest, dest, client)
+        self.assertIn("archive size changed", reason)
+        for member in unit.members:
+            self.assertTrue(Path(member.path).exists(), member.rel)
+        archive.unlink()
+        reason = sa.reclaim_unit(unit, rec, self._cfg(dest), time.time(), manifest, dest, client)
+        self.assertIn("archive missing", reason)
+        for member in unit.members:
+            self.assertTrue(Path(member.path).exists(), member.rel)
+
+    # -- finding 3: a mutation between hashing and the move is not deleted
+    def test_review_f3_mutation_after_hash_is_rolled_back(self):
+        root, unit = self._grok_unit()
+        dest = self.home / "dest"
+        client = FakeClient()
+        rec, manifest = self.archive_unit(unit, dest, client)
+        real_rename = os.rename
+        calls = {"n": 0}
+        changed = b"changed after the hash\n"
+
+        def flaky(src, dst):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                Path(src).write_bytes(changed)
+            return real_rename(src, dst)
+
+        with mock.patch.object(sa.os, "rename", flaky):
+            reason = sa.reclaim_unit(unit, rec, self._cfg(dest), time.time(), manifest, dest, client)
+        self.assertIn("trash hash mismatch", reason)
+        # The changed bytes are back at the original path, not silently gone.
+        self.assertEqual(Path(unit.members[0].path).read_bytes(), changed)
+        self.assertEqual(sa.Manifest(dest / "state").latest[unit.uid]["status"], "archived")
+
+    # -- finding 4: codex .jsonl.zst line counts come from the decompressed stream
+    def test_review_f4_codex_zst_line_count_is_decompressed(self):
+        root = self.home / "codex"
+        src = write(self.home / "src.jsonl", '{"type":"a"}\n{"type":"b"}\n')
+        zname = "rollout-2026-11-03T11-27-46-01a1a23c-f580-7c42-a723-1b4f18c257f2.jsonl.zst"
+        zstd_compress(src, root / "sessions" / "2026" / "11" / "03" / zname)
+        unit = self.unit("codex", root)
+        records = sa.pack(unit, str(self.home / "a.tar.zst"))
+        self.assertEqual(records[0]["lines"], 2)
+        client = FakeClient()
+        rev, total, sent = sa.ingest_unit(unit, records, None, client)
+        self.assertEqual((rev, total, sent), ("0", 2, 2))
+        self.assertEqual(len(client.rows), 2)
+
+    # -- finding 5: an error record keeps the confirmed members so retry resumes
+    def test_review_f5_error_record_keeps_confirmed_members(self):
+        root = self.home / "pi"
+        path = write(root / "proj" / "a.jsonl", '{"type":"session"}\n{"type":"message"}\n')
+        age(path, 20)
+        unit = self.unit("pi", root)
+        dest = self.home / "dest"
+        client = FakeClient()
+        rec, manifest = self.archive_unit(unit, dest, client)
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write('{"type":"message"}\n')
+        age(path, 20)
+        unit2 = self.unit("pi", root)
+
+        class Flaky(FakeClient):
+            def __init__(self, rows):
+                super().__init__()
+                self.rows = rows
+                self.fail = 1
+                self.inserted = False
+
+            def insert(self, lines):
+                sent = super().insert(lines)
+                self.inserted = True
+                return sent
+
+            def query(self, query):
+                # Fail the verification query after the POST, not the pre-check.
+                if "count_uniq" in query and self.inserted and self.fail:
+                    self.fail -= 1
+                    return [{"n": "0"}]
+                return super().query(query)
+
+        flaky = Flaky(client.rows)
+        out = open(os.devnull, "w")
+        results = sa.apply_pass(
+            [unit2], self._cfg(dest), flaky, manifest, dest, set(), out,
+            no_reclaim=True, limit=None, max_minutes=90.0, now=time.time(),
+        )
+        self.assertEqual(results["errors"], 1)
+        err = sa.Manifest(dest / "state").latest[unit2.uid]
+        self.assertEqual(err["status"], "error")
+        self.assertEqual(err["lines"], 2)
+        self.assertTrue(err["members"][0]["sha256"])
+        # Retry with a healthy store: at-least-once resend verifies.
+        results2 = sa.apply_pass(
+            [unit2], self._cfg(dest), client, sa.Manifest(dest / "state"), dest, set(), out,
+            no_reclaim=True, limit=None, max_minutes=90.0, now=time.time(),
+        )
+        self.assertEqual(results2["errors"], 0)
+        rec2 = sa.Manifest(dest / "state").latest[unit2.uid]
+        self.assertEqual(rec2["status"], "archived")
+        self.assertEqual(rec2["lines"], 3)
+        self.assertEqual(sa.count_uniq_rows(client, unit2.uid, rec2["rev"]), 3)
+
+    # -- finding 6: append growth works after a rewrite (old rev rows ignored)
+    def test_review_f6_append_growth_after_rewrite(self):
+        root = self.home / "pi"
+        path = write(root / "proj" / "a.jsonl", '{"type":"session"}\n{"type":"message"}\n')
+        unit = self.unit("pi", root)
+        client = FakeClient()
+        records = sa.pack(unit, str(self.home / "a.tar.zst"))
+        rev, total, _sent = sa.ingest_unit(unit, records, None, client)
+        self.assertEqual((rev, total), ("0", 2))
+        path.write_text('{"type":"other"}\n{"type":"message"}\n', encoding="utf-8")
+        unit2 = self.unit("pi", root)
+        records2 = sa.pack(unit2, str(self.home / "b.tar.zst"))
+        prior = {"unit": unit.uid, "rev": rev, "members": records}
+        rev2, total2, _sent2 = sa.ingest_unit(unit2, records2, prior, client)
+        self.assertEqual((rev2, total2), ("1", 2))
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write('{"type":"message"}\n')
+        unit3 = self.unit("pi", root)
+        records3 = sa.pack(unit3, str(self.home / "c.tar.zst"))
+        prior2 = {"unit": unit.uid, "rev": rev2, "members": records2}
+        rev3, total3, sent3 = sa.ingest_unit(unit3, records3, prior2, client)
+        self.assertEqual((rev3, total3, sent3), ("1", 3, 1))
+        self.assertEqual(sa.count_uniq_rows(client, unit.uid, "1"), 3)
+
+    # -- finding 7: restore rejects traversal, symlinks and unlisted entries
+    def test_review_f7_restore_rejects_traversal_and_symlinks(self):
+        root = self.home / "pi"
+        path = write(root / "proj" / "a.jsonl", '{"type":"session"}\n')
+        unit = self.unit("pi", root)
+        dest = self.home / "dest"
+        client = FakeClient()
+        rec, manifest = self.archive_unit(unit, dest, client)
+        archive = Path(rec["archive"])
+        victim = write(self.home / "victim.txt", "original\n")
+        make_tar_zst(
+            archive,
+            [
+                ("a.jsonl", path.read_bytes(), "file"),
+                ("../victim.txt", b"pwned\n", "file"),
+            ],
+        )
+        target = self.home / "restored"
+        self.assertEqual(sa.restore(unit.session, str(target), dest / "state", sys.stdout), 2)
+        self.assertEqual(victim.read_text(encoding="utf-8"), "original\n")
+        self.assertFalse((target / "a.jsonl").exists())
+        # A symlink entry is refused too.
+        make_tar_zst(archive, [("a.jsonl", b"x", "symlink")])
+        self.assertEqual(sa.restore(unit.session, str(target), dest / "state", sys.stdout), 2)
+        self.assertFalse((target / "a.jsonl").exists())
+
+    # -- finding 8: a live-history resend after a crash is a harmless duplicate
+    def test_review_f8_live_retry_duplicates_are_harmless(self):
+        path = write(
+            self.home / ".claude" / "history.jsonl",
+            '{"sessionId":"s1","display":"a"}\n{"sessionId":"s1","display":"b"}\n',
+        )
+        manifest = sa.Manifest(self.home / "state")
+        client = FakeClient()
+        real_write = sa.Manifest.write
+        calls = {"n": 0}
+
+        def flaky(self_, rec):
+            if rec.get("status") == "live" and calls["n"] == 0:
+                calls["n"] += 1
+                raise OSError("crash after the POST, before the manifest write")
+            return real_write(self_, rec)
+
+        with mock.patch.object(sa.Manifest, "write", flaky), mock.patch.object(
+            sa.os.path, "expanduser", lambda p: str(self.home) if p == "~" else p
+        ):
+            with self.assertRaises(OSError):
+                sa.ingest_live("claude", str(path), manifest, client)
+        with mock.patch.object(
+            sa.os.path, "expanduser", lambda p: str(self.home) if p == "~" else p
+        ):
+            sa.ingest_live("claude", str(path), manifest, client)
+        uid = "live/claude/.claude/history.jsonl"
+        self.assertEqual(sa.count_uniq_rows(client, uid, "0"), 2)
+        self.assertGreaterEqual(len(client.rows), 2)
+        self.assertEqual(manifest.latest[uid]["line"], 2)
+
+    # -- finding 9: a long line is truncated and the buffer stays bounded
+    def test_review_f9_long_line_is_bounded(self):
+        root = self.home / "pi"
+        path = write(root / "proj" / "a.jsonl", b"x" * (4 << 20) + b"\n" + b'{"type":"a"}\n')
+        unit = self.unit("pi", root)
+        with mock.patch.object(sa, "MAX_LINE_BYTES", 1 << 20):
+            lines = list(sa._iter_lines(str(path)))
+            self.assertEqual(len(lines), 2)
+            self.assertEqual(len(lines[0]), sa.vlogs.MAX_MSG_BYTES + 1)
+            records = sa.pack(unit, str(self.home / "a.tar.zst"))
+            client = FakeClient()
+            sa.ingest_unit(unit, records, None, client)
+        self.assertEqual(len(client.rows), 2)
+        self.assertEqual(client.rows[0]["truncated"], "1")
+        self.assertLessEqual(len(client.rows[0]["_msg"].encode("utf-8")), sa.vlogs.MAX_MSG_BYTES)
+        self.assertNotIn("truncated", client.rows[1])
+
+    @unittest.skipUnless(
+        os.environ.get("SESSION_ARCHIVE_BIG") == "1",
+        "set SESSION_ARCHIVE_BIG=1 for the 200 MiB single-line RSS run",
+    )
+    def test_review_f9_200mib_line_bounded(self):
+        script = r"""
+import os, resource, sys, tempfile
+sys.path.insert(0, %r)
+from dash import sessionarchive as sa
+with tempfile.TemporaryDirectory() as tmp:
+    path = os.path.join(tmp, "long.jsonl")
+    with open(path, "wb") as fh:
+        chunk = b"x" * (1 << 20)
+        for _ in range(200):
+            fh.write(chunk)
+        fh.write(b"\n")
+    n = 0
+    for line in sa._iter_lines(path):
+        n += 1
+        assert len(line) <= sa.vlogs.MAX_MSG_BYTES + 1, len(line)
+    assert n == 1, n
+print(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+""" % str(ROOT)
+        res = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=900)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        maxrss = int(res.stdout.strip().splitlines()[-1])
+        # macOS reports ru_maxrss in bytes, Linux in KiB.
+        maxrss_kb = maxrss // 1024 if sys.platform == "darwin" else maxrss
+        self.assertLess(maxrss_kb, 500 * 1024, "peak RSS %d KB" % maxrss_kb)
+
+    # -- finding 10: reclaim never touches an excluded claude memory/ tree
+    def test_review_f10_reclaim_keeps_claude_memory_tree(self):
+        root = self.home / "claude"
+        proj = root / "-Users-me-proj"
+        write(proj / "abc.jsonl", '{"type":"user"}\n')
+        write(proj / "abc" / "subagents" / "a.jsonl", '{"type":"assistant"}\n')
+        (proj / "abc" / "memory" / "empty" / "nested").mkdir(parents=True)
+        for path in proj.rglob("*"):
+            if path.is_file():
+                age(path, 20)
+        unit = self.unit("claude", root)
+        dest = self.home / "dest"
+        client = FakeClient()
+        rec, manifest = self.archive_unit(unit, dest, client)
+        reason = sa.reclaim_unit(unit, rec, self._cfg(dest), time.time(), manifest, dest, client)
+        self.assertIsNone(reason)
+        self.assertFalse((proj / "abc.jsonl").exists())
+        self.assertFalse((proj / "abc" / "subagents").exists())
+        self.assertTrue((proj / "abc" / "memory" / "empty" / "nested").is_dir())
+        self.assertTrue((proj / "abc").is_dir())
+
+    # -- finding 11: codex discovery is exactly the specified layout
+    def test_review_f11_codex_discovery_is_exact(self):
+        root = self.home / "codex"
+        day = root / "sessions" / "2026" / "11" / "03"
+        write(day / "rollout-2026-11-03T00-00-00-01a1a2d8-ef9e-7771-a442-27b79500e9aa.jsonl", "{}\n")
+        src = write(self.home / "src.jsonl", "{}\n")
+        zstd_compress(src, day / "rollout-2026-11-03T00-00-01-01a1a23c-f580-7c42-a723-1b4f18c257f2.jsonl.zst")
+        zstd_compress(src, root / "archived_sessions" / "rollout-2026-10-23T00-00-00-01a168da-daeb-7113-a1ac-5f5a8c2e3e3a.jsonl.zst")
+        # Not units: nested, uncompressed archived, and a non-rollout name.
+        write(root / "archived_sessions" / "nested" / "rollout-2026-10-24T00-00-00-01a168da-daeb-7113-a1ac-5f5a8c2e3e3b.jsonl", "{}\n")
+        write(root / "archived_sessions" / "rollout-2026-10-25T00-00-00-01a168da-daeb-7113-a1ac-5f5a8c2e3e3c.jsonl", "{}\n")
+        write(day / "notes.jsonl", "{}\n")
+        units = sa.TOOLS["codex"][1](str(root))
+        self.assertEqual(len(units), 3)
+        keys = sorted(u.key for u in units)
+        self.assertEqual(
+            keys,
+            [
+                "archived_sessions/rollout-2026-10-23T00-00-00-01a168da-daeb-7113-a1ac-5f5a8c2e3e3a.jsonl.zst",
+                "sessions/2026/11/03/rollout-2026-11-03T00-00-00-01a1a2d8-ef9e-7771-a442-27b79500e9aa.jsonl",
+                "sessions/2026/11/03/rollout-2026-11-03T00-00-01-01a1a23c-f580-7c42-a723-1b4f18c257f2.jsonl.zst",
+            ],
+        )
+
+
+class ReclaimCrashTest(Base):
+    """Crash injection at every reclaim step: never neither."""
+
+    def _setup(self):
+        root = self.home / "grok"
+        sdir = root / "enc" / "sid"
+        write(sdir / "chat_history.jsonl", '{"type":"system"}\n')
+        write(sdir / "blob.bin", bytes(range(256)) * 32)
+        for path in sdir.rglob("*"):
+            if path.is_file():
+                age(path, 20)
+        unit = self.unit("grok", root)
+        dest = self.home / "dest"
+        client = FakeClient()
+        rec, manifest = self.archive_unit(unit, dest, client)
+        cfg = {"reclaim_days": 14.0, "reclaim_days_by_tool": {}, "dest": str(dest)}
+        return unit, dest, client, rec, manifest, cfg
+
+    def _crash(self, point):
+        unit, dest, client, rec, manifest, cfg = self._setup()
+        real_rename = os.rename
+        real_write = sa.Manifest.write
+        real_mismatch = sa._trash_mismatch
+        real_rmtree = shutil.rmtree
+        state = {"renames": 0}
+
+        def flaky_rename(src, dst):
+            state["renames"] += 1
+            if point == "rename1" and state["renames"] == 1:
+                raise OSError("crash")
+            if point == "rename2" and state["renames"] == 2:
+                raise OSError("crash")
+            return real_rename(src, dst)
+
+        def flaky_write(self_, r):
+            real_write(self_, r)
+            if point == "journal" and r.get("status") == "reclaiming":
+                raise OSError("crash")
+
+        def flaky_mismatch(trash, members):
+            result = real_mismatch(trash, members)
+            if point == "rehash":
+                raise OSError("crash")
+            return result
+
+        def flaky_rmtree(path, *args, **kwargs):
+            real_rmtree(path, *args, **kwargs)
+            if point == "trashdelete" and str(path).startswith(str(dest / "state" / "trash")):
+                raise OSError("crash")
+
+        with mock.patch.object(sa.os, "rename", flaky_rename), mock.patch.object(
+            sa.Manifest, "write", flaky_write
+        ), mock.patch.object(sa, "_trash_mismatch", flaky_mismatch), mock.patch.object(
+            sa.shutil, "rmtree", flaky_rmtree
+        ):
+            try:
+                sa.reclaim_unit(unit, rec, cfg, time.time(), manifest, dest, client)
+            except OSError:
+                pass
+
+        sa.recover_trash(dest, sa.Manifest(dest / "state"), open(os.devnull, "w"))
+        final = sa.Manifest(dest / "state").latest[unit.uid]
+        originals = [Path(m.path).exists() for m in unit.members]
+        self.assertTrue(sa._archive_ok(final), "archive must verify after %s" % point)
+        if final["status"] == "reclaimed":
+            self.assertFalse(any(originals), "reclaimed but originals remain after %s" % point)
+        else:
+            self.assertTrue(all(originals), "not reclaimed but originals missing after %s" % point)
+        # Never neither: either the originals are in place or the archive is.
+        self.assertTrue(any(originals) or final["status"] == "reclaimed")
+
+    def test_crash_after_reclaiming_write(self):
+        self._crash("journal")
+
+    def test_crash_after_first_rename(self):
+        self._crash("rename1")
+
+    def test_crash_after_second_rename(self):
+        self._crash("rename2")
+
+    def test_crash_after_rehash(self):
+        self._crash("rehash")
+
+    def test_crash_after_trash_delete(self):
+        self._crash("trashdelete")
+
+
+# --------------------------------------------------------------- real store e2e
+
+VLOGS_BIN = Path.home() / ".local/share/agent-dash/vlogs/bin/victoria-logs-prod"
+VLOGS_E2E_PORT = 19530
+
+
+@unittest.skipUnless(os.environ.get("VLOGS_E2E") == "1", "set VLOGS_E2E=1 for the real-binary run")
+class VLogsEndToEndTest(Base):
+    """Archive -> ingest -> crash -> rerun -> verify -> reclaim -> restore."""
+
+    def setUp(self):
+        super().setUp()
+        if not VLOGS_BIN.exists():
+            self.skipTest("victoria-logs binary not installed")
+        import urllib.request
+
+        url = "http://127.0.0.1:%d" % VLOGS_E2E_PORT
+        try:
+            urllib.request.urlopen(url + "/health", timeout=1).read()
+            self.skipTest("port %d already in use" % VLOGS_E2E_PORT)
+        except Exception:
+            pass
+        data = self.home / "vlogs-data"
+        data.mkdir()
+        self.proc = subprocess.Popen(
+            [
+                str(VLOGS_BIN),
+                "-storageDataPath=%s" % data,
+                "-httpListenAddr=127.0.0.1:%d" % VLOGS_E2E_PORT,
+                "-retentionPeriod=100y",
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        self.addCleanup(self._stop)
+        deadline = time.time() + 60
+        while time.time() < deadline:
+            try:
+                urllib.request.urlopen(url + "/health", timeout=1).read()
+                return
+            except Exception:
+                time.sleep(0.3)
+        self.fail("throwaway VictoriaLogs did not become healthy")
+
+    def _stop(self):
+        self.proc.terminate()
+        try:
+            self.proc.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            self.proc.kill()
+            self.proc.wait(timeout=10)
+
+    def _run(self, root, dest, **opts):
+        base = {
+            "apply": True,
+            "no_reclaim": False,
+            "scheduled": False,
+            "tools": ["pi"],
+            "limit": None,
+            "max_minutes": None,
+            "url": "http://127.0.0.1:%d" % VLOGS_E2E_PORT,
+            "dest": str(dest),
+        }
+        base.update(opts)
+        with mock.patch.dict(sa.TOOLS, {"pi": (str(root), sa.discover_pi)}), mock.patch.object(
+            sa, "live_files", lambda names: []
+        ):
+            return sa.run(base, out=open(os.devnull, "w"), state=self.home / "state")
+
+    def test_archive_ingest_crash_rerun_verify_reclaim_restore(self):
+        from dash import vlogs
+
+        root = self.home / "pi"
+        path = write(
+            root / "proj" / "a.jsonl",
+            '{"type":"session","timestamp":"2026-11-01T00:00:00.000Z"}\n'
+            '{"type":"message","timestamp":"2026-11-01T00:00:01.000Z"}\n'
+            '{"type":"message","timestamp":"2026-11-01T00:00:02.000Z"}\n',
+        )
+        original = path.read_bytes()
+        age(path, 20)
+        dest = self.home / "dest"
+        client = vlogs.VLogsClient("http://127.0.0.1:%d" % VLOGS_E2E_PORT)
+        uid = "pi/proj/a.jsonl"
+
+        # Crash after the POST but before the archived record is written.
+        real_write = sa.Manifest.write
+        crashed = {"done": False}
+
+        def flaky(self_, rec):
+            if rec.get("status") == "archived" and not crashed["done"]:
+                crashed["done"] = True
+                raise OSError("simulated crash after ingest")
+            return real_write(self_, rec)
+
+        with mock.patch.object(sa.Manifest, "write", flaky):
+            self.assertEqual(self._run(root, dest), 1)
+        self.assertTrue(path.exists())
+        self.assertEqual(sa.count_uniq_rows(client, uid, "0"), 3)
+
+        # Rerun: at-least-once resend verifies, then reclaim.
+        self.assertEqual(self._run(root, dest), 0)
+        self.assertFalse(path.exists())
+        rec = sa.Manifest(dest / "state").latest[uid]
+        self.assertEqual(rec["status"], "reclaimed")
+        self.assertEqual(sa.count_uniq_rows(client, uid, rec["rev"]), 3)
+        self.assertTrue(sa._archive_ok(rec))
+
+        # Restore is byte-identical.
+        target = self.home / "restored"
+        self.assertEqual(sa.restore(uid, str(target), dest / "state", sys.stdout), 0)
+        self.assertEqual((target / "a.jsonl").read_bytes(), original)
+
+    def test_crash_mid_reclaim_recovers_with_the_real_store(self):
+        from dash import vlogs
+
+        root = self.home / "pi"
+        path = write(root / "proj" / "a.jsonl", '{"type":"session"}\n{"type":"message"}\n')
+        age(path, 20)
+        dest = self.home / "dest"
+        client = vlogs.VLogsClient("http://127.0.0.1:%d" % VLOGS_E2E_PORT)
+        uid = "pi/proj/a.jsonl"
+        self.assertEqual(self._run(root, dest, no_reclaim=True), 0)
+        self.assertTrue(path.exists())
+        rec = sa.Manifest(dest / "state").latest[uid]
+        self.assertEqual(rec["status"], "archived")
+
+        real_rename = os.rename
+        calls = {"n": 0}
+
+        def flaky(src, dst):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise OSError("simulated crash during reclaim")
+            return real_rename(src, dst)
+
+        with mock.patch.object(sa.os, "rename", flaky):
+            self.assertEqual(self._run(root, dest), 0)
+        # The failed move rolled back: the original is still in place.
+        self.assertTrue(path.exists())
+        self.assertEqual(sa.Manifest(dest / "state").latest[uid]["status"], "archived")
+        # The next pass reclaims it.
+        self.assertEqual(self._run(root, dest), 0)
+        final = sa.Manifest(dest / "state").latest[uid]
+        self.assertEqual(final["status"], "reclaimed")
+        self.assertFalse(path.exists())
+        self.assertTrue(sa._archive_ok(final))
+        self.assertEqual(sa.count_uniq_rows(client, uid, final["rev"]), 2)
 
 
 if __name__ == "__main__":

@@ -104,6 +104,8 @@ def make_row(
         "kind": kind,
         "path": path,
     }
+    if truncated:
+        row["truncated"] = "1"
     if extra:
         for key, value in extra.items():
             if value is None or value == "":

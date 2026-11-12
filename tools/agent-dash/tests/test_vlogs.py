@@ -117,6 +117,7 @@ class MakeRowTest(unittest.TestCase):
         row = json.loads(line)
         self.assertLessEqual(len(row["_msg"].encode("utf-8")), vlogs.MAX_MSG_BYTES)
         self.assertTrue(row["_msg"].startswith("é"))
+        self.assertEqual(row["truncated"], "1")
 
 
 class _Fake(http.server.BaseHTTPRequestHandler):
