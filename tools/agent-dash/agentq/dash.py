@@ -34,6 +34,7 @@ BUCKET_S = {1: 60, 6: 60, 24: 300, 168: 1800}
 DEFAULT_HOURS = 6
 RECENT_JOBS = 200
 LIMIT_WINDOW_MINUTES = 5
+RECENT_WINDOW_MINUTES = 60
 TOKEN_BUCKET_S = {1: 300, 6: 300, 24: 300, 168: 1800}
 AVERAGE_SATURATION_FRAC = 0.90
 ROOM_FRAC = 0.95
@@ -313,6 +314,7 @@ h3.group { font-size: 12px; font-weight: 600; color: var(--ink-2); text-transfor
 .tip .warn { color: var(--ink-3); white-space: normal; max-width: 260px; }
 .grid3 { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 14px; }
 .grid3 .card { margin-bottom: 0; }
+.grid3 .note-line { min-height: 35px; margin-top: 0; }
 .pair { display: grid; grid-template-columns: 1fr; gap: 14px; }
 .pair .card { margin-bottom: 0; }
 .pair .card-head { min-height: 58px; align-items: flex-start; }
@@ -426,32 +428,23 @@ td.wrap .cont { color: var(--ink-3); display: block; }
 
   <section class="grid3">
     <div class="card" aria-labelledby="h-kimi">
-      <div class="card-head">
-        <h2 id="h-kimi">Kimi uncached input, estimated % of 24,290/min</h2>
-      </div>
-      <div class="legend" style="margin-bottom: 4px"><span class="key"><span class="swatch" style="border-color: var(--s3)"></span>Kimi uncached (estimate)</span></div>
+      <div class="card-head"><h2 id="h-kimi">Kimi uncached (est.)</h2></div>
+      <div class="note-line">last 60 min</div>
       <div class="chart" id="c-kimi"></div>
     </div>
     <div class="card" aria-labelledby="h-dsu">
-      <div class="card-head">
-        <h2 id="h-dsu">DeepSeek uncached input — our estimate vs 400k/min</h2>
-      </div>
-      <div class="legend" style="margin-bottom: 4px"><span class="key"><span class="swatch" style="border-color: var(--s2)"></span>DeepSeek uncached (estimate)</span></div>
-      <div class="chart" id="c-dsu"></div>
+      <div class="card-head"><h2 id="h-dsu">DeepSeek uncached (est.)</h2></div>
       <div class="note-line" id="dsu-sub">—</div>
+      <div class="chart" id="c-dsu"></div>
     </div>
     <div class="card" aria-labelledby="h-429">
-      <div class="card-head">
-        <h2 id="h-429">Upstream 429s per minute</h2>
-      </div>
-      <div class="legend" style="margin-bottom: 4px"><span class="key"><span class="block" style="background: var(--crit)"></span>429s</span></div>
+      <div class="card-head"><h2 id="h-429">Morph 429s</h2></div>
+      <div class="note-line">last 60 min</div>
       <div class="chart" id="c-429"></div>
     </div>
     <div class="card" aria-labelledby="h-wait">
-      <div class="card-head">
-        <h2 id="h-wait">Wait p95 per minute</h2>
-      </div>
-      <div class="legend" style="margin-bottom: 4px"><span class="key"><span class="swatch" style="border-color: var(--s1)"></span>p95 wait, seconds</span></div>
+      <div class="card-head"><h2 id="h-wait">Proxy wait p95</h2></div>
+      <div class="note-line">last 60 min</div>
       <div class="chart" id="c-wait"></div>
     </div>
   </section>
@@ -687,6 +680,7 @@ td.wrap .cont { color: var(--ink-3); display: block; }
     var ticks = niceTicks(top, 3).ticks.filter(function (v) { return v <= top; });
     return { min: 0, max: top, clip: top, ticks: ticks, fmt: fmt };
   }
+  function labelled(axis, label) { return Object.assign({}, axis, { label: label }); }
   function legendFor(el, series) {
     el.innerHTML = "";
     series.forEach(function (s) {
@@ -717,7 +711,7 @@ td.wrap .cont { color: var(--ink-3); display: block; }
   }
   function xTicks(svg, cfg, iw, H, m, X, fmtX) {
     var sample = Math.max(measure(svg, fmtX(cfg.x0), "tick"), measure(svg, fmtX(cfg.x1), "tick"));
-    var steps = Math.max(1, Math.min(6, Math.floor(iw / (sample * 1.5 + 8))));
+    var steps = cfg.xSteps || Math.max(1, Math.min(6, Math.floor(iw / (sample * 1.5 + 8))));
     for (var i = 0; i <= steps; i++) {
       var t = cfg.x0 + ((cfg.x1 - cfg.x0) * i) / steps;
       var anchor = i === 0 ? "start" : i === steps ? "end" : "middle";
@@ -798,7 +792,7 @@ td.wrap .cont { color: var(--ink-3); display: block; }
     var m = cfg.margin ? { l: cfg.margin.l, r: cfg.margin.r, t: cfg.margin.t, b: cfg.margin.b } : {
       l: Math.max(44, Math.ceil(tickW) + 12),
       r: ends.length ? Math.min(Math.ceil(endW) + 24, Math.floor(W * 0.42)) : 12,
-      t: 14,
+      t: 26,
       b: 24
     };
     var iw = W - m.l - m.r;
@@ -814,6 +808,7 @@ td.wrap .cont { color: var(--ink-3); display: block; }
       svgEl("text", { x: m.l - 8, y: Y(v) + 4, "text-anchor": "end", class: "tick" }, svg).textContent = fmtY(v);
     });
     xTicks(svg, cfg, iw, H, m, X, fmtX);
+    if (cfg.y.label) svgEl("text", { x: m.l, y: 12, class: "tick" }, svg).textContent = cfg.y.label;
 
     var refs = (cfg.refs || []).slice();
     refs.forEach(function (r) {
@@ -1158,7 +1153,7 @@ td.wrap .cont { color: var(--ink-3); display: block; }
     var workers = (d.workers || []).map(function (w) {
       return { t: w.ts, ds: w.ds_workers, kimi: w.kimi_workers, queued: w.queued_jobs };
     });
-    var PAIR_LAYOUT = { height: 260, margin: { l: 64, r: 16, t: 14, b: 24 } };
+    var PAIR_LAYOUT = { height: 260, margin: { l: 64, r: 16, t: 26, b: 24 } };
     var pctFmt = function (v, inline) { return inline ? (v * 100).toFixed(1) + "%" : Math.round(v * 100) + "%"; };
     var intFmt = function (v) { return Math.round(v).toLocaleString("en-US"); };
     charts.length = 0;
@@ -1170,7 +1165,7 @@ td.wrap .cont { color: var(--ink-3); display: block; }
       x0: win.start, x1: win.end, height: PAIR_LAYOUT.height,
       points: minutes,
       series: [{ key: "pct_total", name: "Total pool, % of 10M/min", color: COLORS.s1 }],
-      y: pctAxis,
+      y: labelled(pctAxis, "% of 10M tokens/min"),
       refs: [{ v: 1, label: "Morph limit (10M/min)" }],
       fmt: pctFmt
     });
@@ -1184,7 +1179,7 @@ td.wrap .cont { color: var(--ink-3); display: block; }
         { key: "kimi", name: "Kimi runs", color: COLORS.s2 },
         { key: "queued", name: "Queued jobs", color: COLORS.s3 }
       ],
-      y: { min: 0, max: axis.max, ticks: axis.ticks, fmt: intFmt },
+      y: labelled({ min: 0, max: axis.max, ticks: axis.ticks, fmt: intFmt }, "runs / jobs"),
       refs: axis.caps.filter(function (c) { return c.on_scale; }).map(function (c) { return { v: c.value, label: c.label }; }),
       offScale: axis.caps.filter(function (c) { return !c.on_scale; }).map(function (c) { return c.label + " \u2191 (off scale)"; }),
       fmt: intFmt
@@ -1215,52 +1210,60 @@ td.wrap .cont { color: var(--ink-3); display: block; }
       { name: "Output", color: COLORS.s2, block: true },
       { name: "Cumulative (right axis)", color: COLORS.ink }
     ]);
-    registerChart("c-kimi", {
-      title: "Kimi uncached input, estimated percent of limit per minute",
-      kind: "line", bucket_s: bucket, tickFmt: fmtX, x0: win.start, x1: win.end, height: 200,
-      points: minutes,
-      series: [{ key: "pct_kimi_uncached", name: "Kimi uncached (estimate)", color: COLORS.s3 }],
-      y: clippedAxis(valuesOf(minutes, ["pct_kimi_uncached"]), pctFmt),
-      refs: [{ v: 1, label: "100% of limit" }],
-      fmt: pctFmt
-    });
-    setText("h-kimi", "Kimi uncached input, estimated % of 24,290/min");
-    registerChart("c-dsu", {
-      title: "DeepSeek uncached input, estimated percent of 400k per minute",
-      kind: "line", bucket_s: bucket, tickFmt: fmtX, x0: win.start, x1: win.end, height: 200,
-      points: minutes,
-      series: [{ key: "pct_ds_uncached", name: "DeepSeek uncached (estimate)", color: COLORS.s2 }],
-      y: pctAxis,
-      refs: [{ v: 1, label: "400k/min" }],
-      fmt: pctFmt
-    });
-    var rej = d.ds_uncached_rejections || {};
-    setText("dsu-sub", rej.count === null || rej.count === undefined
-      ? "rejections not recorded"
-      : "Morph rejected " + count(rej.count) + " requests on this limit in the selected range" + (rej.partial ? " (proxy log tail only)" : ""));
-    var maxR = minutes.reduce(function (a, p) { return Math.max(a, p.r429); }, 0);
-    registerChart("c-429", {
-      title: "Upstream 429s per " + unit,
-      kind: "bar", bucket_s: bucket, tickFmt: fmtX, x0: win.start, x1: win.end, height: 200,
-      points: minutes,
-      series: [{ key: "r429", name: "429s", color: "var(--crit)" }],
-      y: niceTicks(Math.max(maxR, 1), 3),
-      fmt: intFmt
-    });
-    setText("h-429", "Upstream 429s per " + unit);
-    var maxW = minutes.reduce(function (a, p) { return p.wait_p95_ms === null ? a : Math.max(a, p.wait_p95_ms / 1000); }, 0);
-    var waitPoints = minutes.map(function (p) {
+    var recent = d.recent || { window: { start: 0, end: 0 }, minutes: [] };
+    var recentMinutes = recent.minutes || [];
+    var recentWin = recent.window || { start: 0, end: 0 };
+    var smallLayout = { height: 200, margin: { l: 48, r: 12, t: 26, b: 24 } };
+    var smallPctAxis = { min: 0, max: 2, clip: 2, ticks: [0, 1, 2], fmt: pctFmt };
+    var smallChart = function (id, cfg) {
+      return Object.assign({
+        kind: "line", bucket_s: 60, tickFmt: hm, xSteps: 2, margin: smallLayout.margin,
+        x0: recentWin.start, x1: recentWin.end, height: smallLayout.height, points: recentMinutes
+      }, cfg);
+    };
+    var maxR = recentMinutes.reduce(function (a, p) { return Math.max(a, p.r429); }, 0);
+    var waitPoints = recentMinutes.map(function (p) {
       return { t: p.t, wait: p.wait_p95_ms === null || p.wait_p95_ms === undefined ? null : p.wait_p95_ms / 1000 };
     });
-    registerChart("c-wait", {
-      title: "Wait p95 seconds per " + unit,
-      kind: "line", bucket_s: bucket, tickFmt: fmtX, x0: win.start, x1: win.end, height: 200,
+    var maxW = waitPoints.reduce(function (a, p) { return p.wait === null ? a : Math.max(a, p.wait); }, 0);
+    var waitTop = maxW > 120 ? 120 * Math.ceil(maxW / 120) : niceTicks(Math.max(maxW, 1), 2).max;
+    var waitFmt = function (v, inline) {
+      if (v >= 60) return (inline ? (v / 60).toFixed(1) : Math.round(v / 60)) + " m";
+      return (inline ? v.toFixed(1) : Math.round(v)) + " s";
+    };
+
+    registerChart("c-kimi", smallChart("c-kimi", {
+      title: "Kimi uncached, estimated percent of 24,290 per minute",
+      series: [{ key: "pct_kimi_uncached", name: "Kimi uncached (estimate)", color: COLORS.s3 }],
+      y: labelled(smallPctAxis, "% of 24,290 tokens/min"),
+      refs: [{ v: 1, label: "limit" }],
+      fmt: pctFmt
+    }));
+    var rej = d.recent && d.recent.ds_uncached_rejections ? d.recent.ds_uncached_rejections : {};
+    setText("dsu-sub", rej.count === null || rej.count === undefined
+      ? "rejections not recorded"
+      : "Morph rejections on this limit, last 60 min: " + count(rej.count) + (rej.partial ? " (proxy log tail only)" : ""));
+    registerChart("c-dsu", smallChart("c-dsu", {
+      title: "DeepSeek uncached input, estimated percent of 400k per minute",
+      series: [{ key: "pct_ds_uncached", name: "DeepSeek uncached (estimate)", color: COLORS.s2 }],
+      y: labelled(smallPctAxis, "% of 400k tokens/min"),
+      refs: [{ v: 1, label: "limit" }],
+      fmt: pctFmt
+    }));
+    registerChart("c-429", smallChart("c-429", {
+      title: "Upstream 429s per minute",
+      kind: "bar",
+      series: [{ key: "r429", name: "429s", color: "var(--crit)" }],
+      y: labelled(niceTicks(Math.max(maxR, 1), 2), "429s per minute"),
+      fmt: intFmt
+    }));
+    registerChart("c-wait", smallChart("c-wait", {
+      title: "Wait p95 seconds per minute",
       points: waitPoints,
       series: [{ key: "wait", name: "p95 wait", color: COLORS.s1 }],
-      y: niceTicks(Math.max(maxW, 1), 3),
-      fmt: function (v, inline) { return v.toFixed(inline ? 1 : 0) + " s"; }
-    });
-    setText("h-wait", "Wait p95 per " + unit);
+      y: labelled({ min: 0, max: waitTop, ticks: [0, waitTop / 2, waitTop], fmt: waitFmt }, "seconds"),
+      fmt: waitFmt
+    }));
     var upPoints = minutes.map(function (p) {
       var sec = function (v) { return v === null || v === undefined ? null : v / 1000; };
       return { t: p.t, p50: sec(p.upstream_p50_ms), p95: sec(p.upstream_p95_ms) };
@@ -1275,7 +1278,7 @@ td.wrap .cont { color: var(--ink-3); display: block; }
         { key: "p50", name: "p50", color: COLORS.s1 },
         { key: "p95", name: "p95", color: COLORS.s2 }
       ],
-      y: niceTicks(Math.max(maxU, 1), 3),
+      y: labelled(niceTicks(Math.max(maxU, 1), 3), "seconds per request"),
       fmt: function (v) { return (Math.abs(v) < 10 ? v.toFixed(1) : v.toFixed(0)) + " s"; }
     });
     var hasUpstream = upPoints.some(function (p) { return p.p50 !== null; });
@@ -2892,9 +2895,16 @@ def build_summary(
         "tokens_15m": window_tokens(raw, until, 15),
         "pool_per_minute": pool_per_minute(raw, admitted, until),
     }
+    recent_since = until - RECENT_WINDOW_MINUTES * 60
+    recent = {
+        "window": {"start": recent_since, "end": until},
+        "minutes": minute_series(raw, recent_since, until),
+        "ds_uncached_rejections": budget_rejections(calib_429s, "uncached_ds", recent_since, until),
+    }
     return {
         "generated_at": now,
         "hours": hours,
+        "recent": recent,
         "window": {"start": since, "end": until},
         "live": live,
         "limits": limits,

@@ -1,4 +1,5 @@
 import calendar
+import re
 import hashlib
 import http.client
 import json
@@ -284,8 +285,8 @@ class ServerTest(unittest.TestCase):
             "Tokens per 5 minutes, millions",
             "Runs",
             "Top consumers today",
-            "Upstream 429s per minute",
-            "Wait p95 per minute",
+            "Morph 429s",
+            "Proxy wait p95",
             "Recent jobs",
             "Minute data (table view)",
         ):
@@ -298,6 +299,8 @@ class ServerTest(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(ctype, "application/json")
         data = json.loads(body)
+        self.assertEqual(sorted(data["recent"]), ["ds_uncached_rejections", "minutes", "window"])
+        self.assertEqual(data["recent"]["window"]["end"] - data["recent"]["window"]["start"], 3600)
         for key in (
             "live", "limits", "capacity", "minutes", "token_mix", "jobs", "workers", "caps", "runs",
             "run_kpis", "perf_kpis", "top_consumers", "errors", "r429_60m", "window",
@@ -909,6 +912,46 @@ class UpstreamLatencyDashTest(unittest.TestCase):
             self.assertIn(marker, dash.PAGE_HTML)
 
 
+class YAxisLabelTest(unittest.TestCase):
+    LABELS = {
+        "c-billed": 'labelled(pctAxis, "% of 10M tokens/min")',
+        "c-workers": 'labelled({ min: 0, max: axis.max, ticks: axis.ticks, fmt: intFmt }, "runs / jobs")',
+        "c-kimi": 'labelled(smallPctAxis, "% of 24,290 tokens/min")',
+        "c-dsu": 'labelled(smallPctAxis, "% of 400k tokens/min")',
+        "c-429": 'labelled(niceTicks(Math.max(maxR, 1), 2), "429s per minute")',
+        "c-wait": 'labelled({ min: 0, max: waitTop, ticks: [0, waitTop / 2, waitTop], fmt: waitFmt }, "seconds")',
+        "c-upstream": 'labelled(niceTicks(Math.max(maxU, 1), 3), "seconds per request")',
+    }
+
+    def config_block(self, chart_id: str) -> str:
+        html = dash.PAGE_HTML
+        start = html.index(f'registerChart("{chart_id}"')
+        end = html.find("registerChart(", start + 1)
+        return html[start:end if end != -1 else len(html)]
+
+    def test_every_registered_line_and_bar_chart_has_a_y_label(self) -> None:
+        html = dash.PAGE_HTML
+        registered = set(re.findall(r'registerChart\("(c-[a-z0-9-]+)"', html))
+        self.assertEqual(registered, set(self.LABELS) | {"c-tokens"})
+        for chart_id, label in self.LABELS.items():
+            with self.subTest(chart=chart_id):
+                self.assertIn(label, self.config_block(chart_id))
+
+    def test_the_label_is_drawn_above_the_plot_in_the_muted_tick_class(self) -> None:
+        html = dash.PAGE_HTML
+        self.assertIn('if (cfg.y.label) svgEl("text", { x: m.l, y: 12, class: "tick" }', html)
+        self.assertIn('"tokens per " + cfg.unit + " (M)"', html)
+        self.assertIn('"cumulative tokens"', html)
+
+    def test_pair_layout_is_shared_by_both_capacity_charts_and_reserves_the_label_row(self) -> None:
+        html = dash.PAGE_HTML
+        self.assertIn("var PAIR_LAYOUT = { height: 260, margin: { l: 64, r: 16, t: 26, b: 24 } };", html)
+        for chart_id in ("c-billed", "c-workers", "c-upstream"):
+            with self.subTest(chart=chart_id):
+                self.assertIn('margin: PAIR_LAYOUT.margin, group: "capacity"', self.config_block(chart_id))
+        self.assertEqual(html.count("margin: PAIR_LAYOUT.margin"), 3)
+
+
 class EnforcedLimitsChartTest(unittest.TestCase):
     def test_main_billed_chart_has_exactly_one_series_the_total_pool(self) -> None:
         html = dash.PAGE_HTML
@@ -1245,7 +1288,7 @@ class RunsAxisTest(unittest.TestCase):
         html = dash.PAGE_HTML
         start = html.index('registerChart("c-workers"')
         block = html[start:html.index("var mix =", start)]
-        self.assertIn("y: { min: 0, max: axis.max, ticks: axis.ticks, fmt: intFmt }", block)
+        self.assertIn('labelled({ min: 0, max: axis.max, ticks: axis.ticks, fmt: intFmt }, "runs / jobs")', block)
         self.assertNotIn("niceTicks(Math.max(caps.deepseek", block)
         self.assertIn("c.on_scale", block)
         self.assertIn("(off scale)", block)
@@ -1261,10 +1304,39 @@ class RunsAxisTest(unittest.TestCase):
         self.assertNotIn('"stroke-dasharray"', block)
 
 
+class SmallChartRowTest(unittest.TestCase):
+    SMALL = ("c-kimi", "c-dsu", "c-429", "c-wait")
+
+    def test_small_charts_read_the_last_hour_not_the_selected_range(self) -> None:
+        html = dash.PAGE_HTML
+        self.assertIn("var recent = d.recent", html)
+        self.assertIn("recentMinutes", html)
+        for chart_id in self.SMALL:
+            with self.subTest(chart=chart_id):
+                start = html.index(f'registerChart("{chart_id}"')
+                end = html.index("var upPoints", start) if chart_id == "c-wait" else html.index("registerChart(", start + 1)
+                block = html[start:end]
+                self.assertIn("smallChart(", block)
+                self.assertNotIn("minutes", block.replace("recentMinutes", ""))
+
+    def test_small_charts_share_one_plot_layout_and_three_ticks(self) -> None:
+        html = dash.PAGE_HTML
+        self.assertIn("var smallLayout = { height: 200, margin: { l: 48, r: 12, t: 26, b: 24 } };", html)
+        self.assertIn("xSteps: 2", html)
+        self.assertIn('{ v: 1, label: "limit" }', html)
+        self.assertIn("var smallPctAxis = { min: 0, max: 2, clip: 2, ticks: [0, 1, 2], fmt: pctFmt };", html)
+
+    def test_small_cards_have_no_legend_and_the_rejection_subtitle_is_short(self) -> None:
+        html = dash.PAGE_HTML
+        grid = html[html.index('<section class="grid3">'):html.index('aria-labelledby="h-upstream"')]
+        self.assertNotIn('class="legend"', grid)
+        self.assertIn("Morph rejections on this limit, last 60 min: ", html)
+
+
 class CapacityPairTest(unittest.TestCase):
     def test_paired_charts_share_one_layout_object_for_height_and_margins(self) -> None:
         html = dash.PAGE_HTML
-        self.assertIn("var PAIR_LAYOUT = { height: 260, margin: { l: 64, r: 16, t: 14, b: 24 } };", html)
+        self.assertIn("var PAIR_LAYOUT = { height: 260, margin: { l: 64, r: 16, t: 26, b: 24 } };", html)
         for name, end in (("c-billed", "c-workers"), ("c-workers", "var mix =")):
             start = html.index(f'registerChart("{name}"')
             block = html[start:html.index(end, start)]
@@ -1284,11 +1356,11 @@ class CapacityPairTest(unittest.TestCase):
 
     def test_deepseek_uncached_chart_sits_next_to_kimi_with_a_rejection_subtitle(self) -> None:
         html = dash.PAGE_HTML
-        self.assertIn("DeepSeek uncached input — our estimate vs 400k/min", html)
+        self.assertIn("DeepSeek uncached (est.)", html)
         self.assertLess(html.index('id="c-kimi"'), html.index('id="c-dsu"'))
         self.assertIn('id="dsu-sub"', html)
         self.assertIn("rejections not recorded", html)
-        self.assertIn("Morph rejected ", html)
+        self.assertIn("Morph rejections on this limit, last 60 min: ", html)
 
     def test_response_time_chart_sits_below_the_small_charts_and_above_runs(self) -> None:
         html = dash.PAGE_HTML
