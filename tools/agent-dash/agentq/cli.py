@@ -153,6 +153,7 @@ def cmd_submit(args, ctx: Context) -> int:
         "id": job_id, "lane": lane, "kind": args.kind, "res": args.res, "tier": tier,
         "label": label, "workspace": workspace, "session": ctx.session,
         "harness": ctx.harness, "prompt_path": str(dest),
+        "max_runtime_s": args.max_runtime,
     }
     with db.tx(conn):
         db.insert_job(conn, job, ctx.now())
@@ -201,12 +202,11 @@ def cmd_escalate(args, ctx: Context) -> int:
         candidates = [job]
     else:
         candidates = db.select_jobs(conn, "session = ? AND state IN ('queued', 'running')", (ctx.session,))
-    moved = [job for job in candidates if job["state"] not in db.TERMINAL_STATES and job["lane"] != "urgent"]
+    moved = [job for job in candidates if job["state"] in db.OPEN_STATES and job["lane"] != "urgent"]
     for job in moved:
         detail = json.dumps({"session": ctx.session, "harness": ctx.harness, "from": job["lane"]})
-        with db.tx(conn):
-            db.update_job(conn, job["id"], lane="urgent")
-            db.add_event(conn, job["id"], "escalate", detail, ctx.now())
+        if not db.transition(conn, job["id"], db.OPEN_STATES, ctx.now(), "escalate", detail, lane="urgent"):
+            continue
         ctx.print(f"{job['id']} {job['lane']} -> urgent ({job['state']})")
     if not moved:
         return answer(ctx, "nothing to escalate: no open job below urgent for this target", 1)
@@ -248,6 +248,9 @@ def cmd_cancel(args, ctx: Context) -> int:
     if job["state"] in db.TERMINAL_STATES:
         return answer(ctx, f"{args.id} is already {job['state']}", 1)
     action = broker_lib.cancel(conn, job, ctx.now())
+    if action is None:
+        now_state = db.get_job(conn, args.id)["state"]
+        return answer(ctx, f"{args.id} is already {now_state}; not changed", 1)
     return answer(ctx, f"cancelled {args.id}: {action}", 0)
 
 
@@ -255,7 +258,8 @@ def cmd_daemon(args, ctx: Context) -> int:
     try:
         broker_lib.Broker(ctx.home).run_forever()
     except broker_lib.DaemonRunning as exc:
-        return answer(ctx, str(exc), 1)
+        broker_lib.log_line(ctx.home, f"second daemon exits: {exc}")
+        return answer(ctx, f"{exc}; this instance exits", 0)
     except KeyboardInterrupt:
         return 0
     return 0
@@ -295,6 +299,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--tier")
     p.add_argument("--label")
     p.add_argument("--res", choices=db.RESOURCES, default="light")
+    p.add_argument("--max-runtime", type=float, default=db.MAX_RUNTIME_S, metavar="SECONDS",
+                   help="kill the worker after this long (default 21600)")
     p.set_defaults(func=cmd_submit)
 
     p = sub.add_parser("wait", help="block until the named jobs are terminal")
