@@ -47,6 +47,7 @@ MAX_ATTEMPTS = 3
 MAX_RATE_ATTEMPTS = 20
 RATE_BACKOFF_S = 60.0
 CAPACITY_RETRY_S = 20.0
+HOLD_REFRESH_S = 300.0
 STALL_S = 45 * 60
 PROBE_RETRIES = 3
 PROXY_STATUS_URL = "http://127.0.0.1:18790/agentq/status"
@@ -143,12 +144,19 @@ def queued_total(budget: dict) -> int:
     return sum(int(count) for count in queued.values() if isinstance(count, int))
 
 
-def morph_hold(tier: str, lane: str, status: dict | None, max_waiting: float) -> str | None:
+def plain_hold(text: str) -> tuple[str, str]:
+    """A hold reason with no live number: its key is its text."""
+    return text, text
+
+
+def morph_hold(tier: str, lane: str, status: dict | None, max_waiting: float) -> tuple[str, str] | None:
     """Why a job for ``tier`` must wait on the Morph proxy, or None when it may launch.
 
-    Urgent jobs never wait here. A normal job waits while a budget its model uses has more
-    than ``max_waiting`` requests queued. A backlog job also waits for every such budget to
-    queue nothing. With no status (proxy down) there is no Morph gate.
+    Returns (key, text). The key names the budget and threshold but not the live queue depth,
+    so a job held by a changing queue keeps one key. Urgent jobs never wait here. A normal job
+    waits while a budget its model uses has more than ``max_waiting`` requests queued. A backlog
+    job also waits for every such budget to queue nothing. With no status (proxy down) there is
+    no Morph gate.
     """
     if status is None or lane == "urgent":
         return None
@@ -159,30 +167,33 @@ def morph_hold(tier: str, lane: str, status: dict | None, max_waiting: float) ->
             continue
         waiting = queued_total(budget)
         if waiting > max_waiting:
-            return f"proxy {name} waiting {waiting} > {max_waiting:g}"
+            return f"proxy {name} waiting > {max_waiting:g}", f"proxy {name} waiting {waiting} > {max_waiting:g}"
         if lane == "backlog" and waiting > 0:
-            return f"proxy {name} waiting {waiting}; backlog waits for 0"
+            return f"proxy {name} backlog waits for 0", f"proxy {name} waiting {waiting}; backlog waits for 0"
     return None
 
 
-def laptop_hold(res: str, gauges: tuple, running_tests: int, adaptive: dict) -> str | None:
+def laptop_hold(res: str, gauges: tuple, running_tests: int, adaptive: dict) -> tuple[str, str] | None:
     """Why a ``tests`` or ``light`` job must wait for laptop headroom, or None.
 
-    ``gauges`` is (memory free percent, load per CPU), either may be None when unreadable.
-    An unreadable gauge means no extra gate: the fixed slot caps apply, as with the proxy.
-    ``tests`` jobs below ``tests_floor`` always launch. ``light`` waits only on memory.
+    Returns (key, text). ``gauges`` is (memory free percent, load per CPU), either may be None
+    when unreadable. An unreadable gauge means no extra gate: the fixed slot caps apply, as with
+    the proxy. ``tests`` jobs below ``tests_floor`` always launch. ``light`` waits only on memory.
     """
     free, load = gauges
     if res == "tests":
         if running_tests < adaptive["tests_floor"] or free is None or load is None:
             return None
-        if free < adaptive["tests_min_free_pct"]:
-            return f"memory free {free:.0f}% < {adaptive['tests_min_free_pct']:.0f}%"
-        if load >= adaptive["tests_max_load_per_cpu"]:
-            return f"load {load:.2f} per cpu >= {adaptive['tests_max_load_per_cpu']:g}"
+        min_free = adaptive["tests_min_free_pct"]
+        if free < min_free:
+            return f"memory free < {min_free:.0f}%", f"memory free {free:.0f}% < {min_free:.0f}%"
+        max_load = adaptive["tests_max_load_per_cpu"]
+        if load >= max_load:
+            return f"load per cpu >= {max_load:g}", f"load {load:.2f} per cpu >= {max_load:g}"
         return None
     if res == "light" and free is not None and free < adaptive["light_min_free_pct"]:
-        return f"memory free {free:.0f}% < {adaptive['light_min_free_pct']:.0f}%"
+        floor = adaptive["light_min_free_pct"]
+        return f"memory free < {floor:.0f}%", f"memory free {free:.0f}% < {floor:.0f}%"
     return None
 
 
@@ -537,7 +548,7 @@ class Broker:
         self.proxy = proxy or proxy_status
         self.gauges = gauges or Gauges(clock=now)
         self._saturated_last = False
-        self._holds: dict[str, tuple[str, str]] = {}
+        self._holds: dict[str, tuple[tuple[str, str], float]] = {}
 
     def log(self, message: str) -> None:
         log_line(self.home, message)
@@ -600,7 +611,7 @@ class Broker:
                 gauge_reading.append(self.gauges.read(adaptive["gauge_ttl_s"]))
             return gauge_reading[0]
 
-        holds: dict[str, tuple[str, str]] = {}
+        holds: dict[str, tuple[str, tuple[str, str]]] = {}
         launched: list[str] = []
         for job in order_queue(ready, now):
             name, reason = job["res"], None
@@ -609,16 +620,16 @@ class Broker:
                 if reason:
                     name = job["tier"]
             elif saturated and job["lane"] == "backlog":
-                name, reason = job["tier"], "proxy saturated"
+                name, reason = job["tier"], plain_hold("proxy saturated")
             if reason is None and job["lane"] == "urgent" and others_waiting and urgent_running >= urgent_cap:
-                reason = "urgent share full"
+                reason = plain_hold("urgent share full")
             if reason is None and job["kind"] == "write" and job["workspace"] in busy_workspaces:
-                reason = "workspace busy"
+                reason = plain_hold("workspace busy")
             if reason is None and slots_free.get(job["res"], 0) <= 0:
-                reason = "slots full"
+                reason = plain_hold("slots full")
             tier_cap = cfg["tiers"].get(job["tier"])
             if reason is None and tier_cap is not None and tier_used.get(job["tier"], 0) >= tier_cap:
-                name, reason = job["tier"], "tier cap full"
+                name, reason = job["tier"], plain_hold("tier cap full")
             if reason is None and on and job["res"] in LAPTOP_GATED:
                 reason = laptop_hold(job["res"], laptop(), res_used.get("tests", 0), adaptive)
             if reason:
@@ -638,7 +649,12 @@ class Broker:
         return launched
 
     def _record_holds(self, conn, now: float, ready: list[dict], holds: dict) -> None:
-        """Write each queued job's hold reason to ``jobs.detail`` and log it, only when it changes."""
+        """Write each queued job's hold to ``jobs.detail`` and the log.
+
+        A hold is identified by (gate, reason key), not by its text, because the text carries
+        live numbers. A job writes and logs when its key changes, and otherwise at most once
+        per ``HOLD_REFRESH_S`` so its detail shows a current number.
+        """
         ready_ids = {job["id"] for job in ready}
         for job_id in [job_id for job_id in self._holds if job_id not in ready_ids]:
             del self._holds[job_id]
@@ -646,16 +662,19 @@ class Broker:
         for job in ready:
             job_id = job["id"]
             hold = holds.get(job_id)
-            if hold == self._holds.get(job_id):
-                continue
             if hold is None:
-                self._holds.pop(job_id, None)
-                db.transition(conn, job_id, ("queued",), now, None, "", detail=None)
+                if self._holds.pop(job_id, None) is not None:
+                    db.transition(conn, job_id, ("queued",), now, None, "", detail=None)
                 continue
-            self._holds[job_id] = hold
-            text = f"hold {hold[0]}: {hold[1]}"
-            db.transition(conn, job_id, ("queued",), now, None, "", detail=text)
-            self.log(f"{text} (job {job_id})")
+            name, (key, text) = hold
+            identity = (name, key)
+            written = self._holds.get(job_id)
+            if written is not None and written[0] == identity and now - written[1] < HOLD_REFRESH_S:
+                continue
+            self._holds[job_id] = (identity, now)
+            message = f"hold {name}: {text}"
+            db.transition(conn, job_id, ("queued",), now, None, "", detail=message)
+            self.log(f"{message} (job {job_id})")
 
     def _proxy_status(self) -> dict | None:
         """The proxy status for this tick (None when down). Logs each change of its saturated flag."""
