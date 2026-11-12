@@ -20,6 +20,7 @@ from pathlib import Path
 
 from agentq import broker as broker_lib
 from agentq import db
+from agentq import slots as slots_lib
 
 AGENT_DASH = Path(__file__).resolve().parents[1]
 AGENT_DASH_LABEL = AGENT_DASH / "agent_dash.py"
@@ -285,6 +286,20 @@ def cmd_status(args, ctx: Context) -> int:
     return answer(ctx, summary, 0 if pid is not None else 1)
 
 
+def cmd_slots(args, ctx: Context) -> int:
+    limits = slots_lib.load_limits(ctx.home)
+    parts = []
+    for kind in slots_lib.KINDS:
+        limit = slots_lib.kind_limit(limits, kind)
+        held = slots_lib.holders(ctx.home, kind, limit, clock=ctx.now)
+        ctx.print(f"{kind}: {len(held)} of {limit} held")
+        for item in held:
+            ctx.print(f"  slot {item['slot']}  pid {item['pid']}  held {item['held_s']}s  "
+                      f"label {item['label'] or '-'}  {item['command']}")
+        parts.append(f"{kind} {len(held)}/{limit}")
+    return answer(ctx, "slots held: " + "; ".join(parts), 0)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="agentq", description=__doc__.split("\n")[0])
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -331,6 +346,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("daemon", help="run the broker loop (launchd runs this)").set_defaults(func=cmd_daemon)
     sub.add_parser("status", help="daemon, queue depth, running slots, proxy").set_defaults(func=cmd_status)
+    sub.add_parser("slots", help="ssh and pytest slots held by pi workers, with holder pid and label").set_defaults(func=cmd_slots)
     return parser
 
 

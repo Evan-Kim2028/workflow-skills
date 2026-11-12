@@ -1,0 +1,4 @@
+#!/bin/sh
+# agentq PATH shim: slot and memory-cap gate for this command. Logic: dispatch.py.
+case $0 in */*) here=${0%/*} ;; *) here=. ;; esac
+exec "${AGENTQ_SHIM_PYTHON:-/usr/bin/python3}" -I "$here/dispatch.py" "${0##*/}" "$@"
