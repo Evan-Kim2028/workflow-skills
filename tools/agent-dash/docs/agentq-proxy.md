@@ -13,17 +13,23 @@ the proxy and never reach the client.
 | `total` | all models | 10,000,000 / min | prompt_tokens (includes cached tokens) + completion_tokens |
 | `output` | models starting `morph-dsv41flash` | 70,000 / min | completion tokens |
 | `uncached` | model `morph-kimik31` | 24,290 / min | prompt tokens minus cached prompt tokens |
+| `uncached_ds` | models starting `morph-dsv41flash` | 400,000 / min | prompt tokens minus cached prompt tokens |
+
+Each budget has a `limit_type` (`total`, `output` or `uncached`) that says which
+Morph limit it tracks. Uncached is split per model because Morph states one
+uncached limit per model: DeepSeek's and Kimi's limits are different numbers.
 
 Windows are rolling 60 s by default; `window_mode` can make a budget a UTC
 calendar minute instead (see "Calendar window and charge basis"). A request's cost is estimated before it is sent:
 prompt tokens are body characters / 4, output is the mean of the model's recent
-completions capped at `max_tokens`, and the Kimi uncached estimate counts only
-the text beyond the longest prefix any recent request shared with it (Morph's
-prompt cache is shared, so the match is across jobs). Requests with no job id or
-the literal `none` are anonymous: a request that extends a stored conversation
-replaces that entry, and any other request adds one, so each session keeps one
-entry. Only Kimi requests touch the store. Real usage from
-the response replaces the estimate.
+completions capped at `max_tokens`, and the uncached estimate (for Kimi and
+DeepSeek alike) counts only the text beyond the longest prefix any recent request
+shared with it (Morph's prompt cache is shared, so the match is across jobs).
+Requests with no job id or the literal `none` are anonymous: a request that
+extends a stored conversation replaces that entry, and any other request adds
+one, so each session keeps one entry. The store holds the 256 most recent jobs,
+and requests from both models share it. Real usage from the response replaces the
+estimate.
 
 ## Admission and lanes
 
@@ -48,9 +54,12 @@ the response replaces the estimate.
   target by 0.97 (`target_cut`), floor 0.6. A cut is paced: a budget is cut at most
   once per `fast_interval_s` (10 s), so a burst of 429s is one cut. Every 429
   still counts in the minute row and refreshes the quiet clock. A body that states
-  a limit (`Limit: N output tokens/minute.`) also sets that budget's limit to N.
-  `service_overloaded` cuts `total`. A 429 with no recognisable limit cuts every
-  budget the request touched.
+  a limit (`Limit: N output tokens/minute.`) also sets the limit to N on every
+  budget that has that `limit_type` and applies to the refused model. A stated
+  limit never reaches a budget for another model, so a DeepSeek body cannot
+  overwrite Kimi's uncached limit or the reverse. `service_overloaded` cuts
+  `total`. A 429 with no recognisable limit, or with a stated limit that no
+  budget for the model tracks, cuts every budget the request touched.
 - With no 429 history a saturated budget climbs the fast ramp: its target rises
   by `fast_step_up` (0.05) every `fast_interval_s` (10 s) up to `fast_until`
   (1.5), so from 0.98 it reaches 1.0 in about 10 s and keeps climbing until Morph's
@@ -99,7 +108,7 @@ Two settings test this. Both default to the current behaviour.
   charge after completion, which models a reservation Morph holds for the minute.
   A reservation is released only when the request is refused (429), fails or is
   abandoned, because upstream did not bill it. The output budget reserves its
-  requested `max_tokens`, and the uncached budget keeps its estimate.
+  requested `max_tokens`, and each uncached budget keeps its estimate.
 
 Set either in `$AGENTQ_HOME/proxy.json`, globally or per budget:
 
@@ -112,7 +121,7 @@ Restart the proxy after an edit. Config is read at start, and an unknown mode
 or basis stops the proxy at start.
 
 Calibration runs in every mode. Each upstream 429 logs a `calib` line with the
-budget its body names, the second of the UTC minute it fell in, and the minute's
+budget its stated limit applied to, the second of the UTC minute it fell in, and the minute's
 totals so far: admitted requests, admitted prompt estimate, admitted capped
 `max_tokens`, and billed prompt plus completion of requests admitted in that
 minute. Each UTC minute also has one `proxy_calib` row (`minute`, `req`,
@@ -242,8 +251,8 @@ error, a client that left, a timeout, a truncated stream).
 - Minute rows: the first flush of a model's minute in a process seeds its counters
   from the stored `proxy_minutes` row, so a restart adds to the minute instead of
   replacing it.
-- Prefix memory: each job (or anonymous session) keeps 8-byte digests of
-  1024-character blocks, not its prompt. The uncached estimate is accurate to one block (about 256 tokens).
+- Prefix memory: each job (or anonymous session) keeps cumulative 8-byte digests
+  of 1024-character blocks, not its prompt. The uncached estimate is accurate to one block (about 256 tokens).
 - Large request bodies (over 256 KiB) are parsed in a worker thread.
 
 ## Missing key
