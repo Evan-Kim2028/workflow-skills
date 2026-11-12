@@ -834,6 +834,12 @@ td.wrap .cont { color: var(--ink-3); display: block; }
     var H = cfg.height || 280;
     var svg = svgEl("svg", { width: W, height: H, viewBox: "0 0 " + W + " " + H, role: "img", "aria-label": cfg.title }, host);
     var fmtM = function (v) { return (v >= 10 ? v.toFixed(0) : v.toFixed(1)) + "M"; };
+    var fmtCompact = function (v) {
+      if (v >= 1000) { var b = v / 1000; return (b >= 10 ? b.toFixed(0) : b.toFixed(1)).replace(/\.0$/, "") + "B"; }
+      if (v >= 1) return (v >= 10 ? v.toFixed(0) : v.toFixed(1)).replace(/\.0$/, "") + "M";
+      if (v > 0) return Math.round(v * 1000) + "K";
+      return "0";
+    };
     var stackMax = points.reduce(function (a, p) { return Math.max(a, p.cache + p.uncached + p.output); }, 0);
     var cumMax = points.reduce(function (a, p) { return Math.max(a, p.cumulative); }, 0);
     var left = niceTicks(Math.max(stackMax, 0.1), 4);
@@ -855,10 +861,10 @@ td.wrap .cont { color: var(--ink-3); display: block; }
       svgEl("text", { x: m.l - 8, y: YL(v) + 4, "text-anchor": "end", class: "tick" }, svg).textContent = fmtM(v);
     });
     right.ticks.forEach(function (v) {
-      svgEl("text", { x: W - m.r + 8, y: YR(v) + 4, "text-anchor": "start", class: "tick" }, svg).textContent = fmtM(v);
+      svgEl("text", { x: W - m.r + 8, y: YR(v) + 4, "text-anchor": "start", class: "tick" }, svg).textContent = fmtCompact(v);
     });
     svgEl("text", { x: m.l, y: 12, class: "tick" }, svg).textContent = "tokens per " + cfg.unit + " (M)";
-    svgEl("text", { x: W - m.r, y: 12, "text-anchor": "end", class: "tick" }, svg).textContent = "cumulative tokens (M)";
+    svgEl("text", { x: W - m.r, y: 12, "text-anchor": "end", class: "tick" }, svg).textContent = "cumulative tokens";
     xTicks(svg, cfg, iw, H, m, X, cfg.tickFmt || hm);
 
     var band = iw / Math.max(1, points.length);
@@ -919,7 +925,7 @@ td.wrap .cont { color: var(--ink-3); display: block; }
         { color: COLORS.s3, text: "Cache read: " + fmtM(p.cache) },
         { color: COLORS.s1, text: "Uncached input: " + fmtM(p.uncached) },
         { color: COLORS.s2, text: "Output: " + fmtM(p.output) },
-        { color: COLORS.ink, text: "Cumulative (right axis): " + fmtM(p.cumulative) }
+        { color: COLORS.ink, text: "Cumulative (right axis): " + fmtCompact(p.cumulative) }
       ]);
       place(X(p.t), 8);
     });
