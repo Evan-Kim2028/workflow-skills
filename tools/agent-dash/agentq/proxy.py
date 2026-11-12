@@ -35,6 +35,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 LANES = ("urgent", "normal", "backlog")
+RESTORED_LANE = "restored"
 DEFAULT_HOME = "~/.local/state/agentq"
 DEFAULT_UPSTREAM = "https://api.morphllm.com/v1"
 KEYCHAIN_SERVICE = "morph-api-key"
@@ -51,6 +52,9 @@ DEFAULT_CONFIG = {
     "target_ceiling": 1.5,
     "target_cut": 0.97,
     "target_step_up": 0.02,
+    "fast_until": 0.9,
+    "fast_step_up": 0.05,
+    "fast_interval_s": 10.0,
     "default_output_tokens": 800,
     "give_up_s": 240.0,
     "retry_floor_s": 1.0,
@@ -351,6 +355,7 @@ class Budget:
     last_429: float = float("-inf")
     last_grow: float = 0.0
     saturated: bool = False
+    saturated_since_tick: bool = False
 
     def applies(self, model: str) -> bool:
         if self.model_prefix is not None:
@@ -458,10 +463,15 @@ class Governor:
         return self.home / "proxy_state.json"
 
     def load_state(self) -> None:
+        """Restore limits, targets and the rolling window. A window is carried over only when the
+        state was saved less than one window ago; its usage is re-entered as one completed charge that
+        expires when the old window would have, so a restart does not reopen an empty budget."""
         try:
             data = json.loads(self.state_path.read_text())
         except (OSError, ValueError):
             return
+        saved_at = data.get("saved_at")
+        age = self.wall() - float(saved_at) if isinstance(saved_at, (int, float)) else None
         for name, spec in (data.get("budgets") or {}).items():
             budget = self.budgets.get(name)
             if budget is None or not isinstance(spec, dict):
@@ -470,12 +480,23 @@ class Governor:
             floor = float(self.config["target_floor"])
             ceiling = float(self.config.get("target_ceiling", 1.0))
             budget.target = min(ceiling, max(floor, float(spec.get("target_frac", budget.target))))
+            window_used = int(spec.get("window_used", 0))
+            if age is not None and 0 <= age < self.window and window_used > 0:
+                budget.entries.append(
+                    Entry(at=self.clock() - age, amount=window_used, lane=RESTORED_LANE, done=True)
+                )
 
     def snapshot_state(self) -> dict:
+        now = self.clock()
         return {
             "saved_at": self.wall(),
             "budgets": {
-                name: {"limit": b.limit, "target_frac": round(b.target, 6)} for name, b in self.budgets.items()
+                name: {
+                    "limit": b.limit,
+                    "target_frac": round(b.target, 6),
+                    "window_used": b.used(now, self.window),
+                }
+                for name, b in self.budgets.items()
             },
         }
 
@@ -635,7 +656,9 @@ class Governor:
                     self._admit(head, now)
                     continue
                 blocker, guard_only = found
-                blocker.saturated = blocker.saturated or not guard_only
+                if not guard_only:
+                    blocker.saturated = True
+                    blocker.saturated_since_tick = True
                 (urgent_guarded if guard_only else blocked).add(blocker.name)
                 index += 1
 
@@ -745,14 +768,33 @@ class Governor:
         return max(wait, floor) + random.uniform(0.0, jitter)
 
     def tick(self) -> None:
-        """Raise a target by one step after a full window with no 429 and with demand still blocked."""
+        """Raise a target while its budget is saturated and no 429 has come recently.
+
+        Below fast_until the target climbs by fast_step_up every fast_interval_s. Above it the target
+        climbs by target_step_up once per full window, up to target_ceiling. Saturation counts if the
+        current pump or any pump since the last tick marked the budget.
+        """
         now = self.clock()
         window = self.window
         step = float(self.config["target_step_up"])
         ceiling = float(self.config.get("target_ceiling", 1.0))
+        fast_until = float(self.config.get("fast_until", 0.9))
+        fast_step = float(self.config.get("fast_step_up", 0.05))
+        fast_interval = float(self.config.get("fast_interval_s", 10.0))
         for budget in self.budgets.values():
+            demanded = budget.saturated or budget.saturated_since_tick
+            budget.saturated_since_tick = False
+            if not demanded:
+                continue
+            if budget.target < fast_until:
+                if now - budget.last_429 >= fast_interval and now - budget.last_grow >= fast_interval:
+                    budget.target = min(fast_until, budget.target + fast_step)
+                    budget.last_grow = now
+                    self.state_dirty = True
+                    self.log("target_raised", budget=budget.name, target=round(budget.target, 4))
+                continue
             quiet = now - budget.last_429 >= window and now - budget.last_grow >= window
-            if budget.saturated and budget.target < ceiling and quiet:
+            if budget.target < ceiling and quiet:
                 budget.target = min(ceiling, budget.target + step)
                 budget.last_grow = now
                 self.state_dirty = True
@@ -1117,7 +1159,7 @@ class Proxy:
             with contextlib.suppress(asyncio.CancelledError):
                 await self.maintenance
         await self.flush()
-        await self.flush_state()
+        await self.flush_state(force=True)
 
     async def maintain(self) -> None:
         last_flush = self.gov.clock()
@@ -1126,10 +1168,11 @@ class Proxy:
             try:
                 self.gov.pump()
                 self.gov.tick()
-                await self.flush_state()
                 if self.gov.clock() - last_flush >= FLUSH_S:
                     last_flush = self.gov.clock()
+                    self.gov.state_dirty = True
                     await self.flush()
+                await self.flush_state()
             except Exception as exc:
                 self.gov.log("maintain_error", kind=type(exc).__name__)
 
@@ -1142,8 +1185,8 @@ class Proxy:
         except sqlite3.Error as exc:
             self.gov.log("flush_error", kind=type(exc).__name__)
 
-    async def flush_state(self) -> None:
-        if not self.gov.state_dirty:
+    async def flush_state(self, force: bool = False) -> None:
+        if not (self.gov.state_dirty or force):
             return
         snapshot = self.gov.snapshot_state()
         self.gov.state_dirty = False

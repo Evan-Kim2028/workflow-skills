@@ -47,8 +47,11 @@ the response replaces the estimate.
   floor 0.6. A body that states a limit (`Limit: N output tokens/minute.`) also
   sets that budget's limit to N. `service_overloaded` cuts `total`. A 429 with
   no recognisable limit cuts every budget the request touched.
-- Each full minute with no 429 and blocked demand raises the target by
-  `target_step_up` (0.02), up to `target_ceiling` (1.5).
+- Below `fast_until` (0.9) a saturated budget with no 429 in the last
+  `fast_interval_s` (10 s) raises its target by `fast_step_up` (0.05) every
+  `fast_interval_s`, so a 0.6 floor recovers to 0.9 in about 60 s of demand.
+  Above `fast_until` each full minute with no 429 and blocked demand raises the
+  target by `target_step_up` (0.02), up to `target_ceiling` (1.5).
 
 Targets may exceed 1.0. The window counts each in-flight request at its full
 estimate from admission and again at its real usage for 60 s after completion,
@@ -85,7 +88,7 @@ A request that is already streaming upstream is not cancelled.
 
 `$AGENTQ_HOME/proxy.json` overrides the defaults above. It may set `port`,
 `upstream`, `window_s`, `start_target`, `target_floor`, `target_cut`,
-`target_step_up`, `target_ceiling`, `default_output_tokens`, `give_up_s`, `retry_floor_s`,
+`target_step_up`, `target_ceiling`, `fast_until`, `fast_step_up`, `fast_interval_s`, `default_output_tokens`, `give_up_s`, `retry_floor_s`,
 `retry_jitter_s`, `aging_s`, `connect_timeout_s` (10), `upstream_idle_s` (120),
 `drain_s` (20) and `budgets`. Environment variables:
 
@@ -144,7 +147,14 @@ error, a client that left, a timeout, a truncated stream).
 - On SIGTERM or SIGINT the proxy stops accepting connections, lets in-flight
   requests finish for up to `drain_s` (20 s), cancels what remains, and exits.
 - The learned state is written by the maintenance loop (about every 0.2 s when
-  it changed), off the request path, not on every 429.
+  it changed, and at least every 5 s), off the request path, not on every 429.
+  Shutdown always writes it once more, after in-flight requests settle.
+- Warm restarts: each budget's state records `window_used`, the tokens charged
+  in the current window (completed and in-flight). If the state is less than one
+  window old at startup, that usage is restored as one completed charge that
+  expires when the old window would have, so a restart does not reopen an empty
+  budget while Morph still counts the previous minute. Older state seeds nothing,
+  and state without `window_used` loads as before.
 - Prefix memory: each job (or anonymous session) keeps 8-byte digests of
   1024-character blocks, not its prompt. The uncached estimate is accurate to one block (about 256 tokens).
 - Large request bodies (over 256 KiB) are parsed in a worker thread.
