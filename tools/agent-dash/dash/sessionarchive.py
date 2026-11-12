@@ -924,7 +924,7 @@ def _cursor_rows(member: Member, fallback_ms: int):
     ``-shm`` and replay a copied ``-wal`` into the copy. ``immutable=1`` is
     not an option: it ignores the WAL and would drop recent pages.
     """
-    tmp = tempfile.mkdtemp(prefix="cursor-store-")
+    tmp = _private_mkdtemp("cursor-store-")
     try:
         for suffix in ("", "-wal", "-shm"):
             src = member.path + suffix
@@ -1324,9 +1324,29 @@ def _rmdir_empty(root) -> None:
             pass
 
 
+#: Roots ``_discard_tree`` may delete: private temp trees this process made.
+_DISCARD_ROOTS: set[str] = set()
+
+
+def _private_mkdtemp(prefix: str) -> str:
+    """``tempfile.mkdtemp`` that records the tree for ``_discard_tree``."""
+    path = os.path.realpath(tempfile.mkdtemp(prefix=prefix))
+    _DISCARD_ROOTS.add(path)
+    return path
+
+
 def _discard_tree(root) -> None:
-    """Remove a private temp tree: unlink its files, then rmdir bottom-up."""
-    root = str(root)
+    """Remove a private temp tree: unlink its files, then rmdir bottom-up.
+
+    Refuses any root that is not a private tree this process created (a
+    ``tempfile.mkdtemp`` dir, the census sample dir, or a restore staging
+    dir under ``<dest>/state/restore-tmp``). A pathname swapped for a
+    symlink therefore resolves outside the allowed roots and is refused
+    instead of being walked and deleted.
+    """
+    root = os.path.realpath(str(root))
+    if not any(root == base or root.startswith(base + os.sep) for base in _DISCARD_ROOTS):
+        raise ArchiveError("refusing to discard %s: not a private temp tree" % root)
     for dirpath, dirnames, filenames in os.walk(root, topdown=False):
         for name in filenames:
             try:
@@ -2068,7 +2088,7 @@ def _projected(units, cfg, manifest, open_set, now, sample) -> int:
     """Compress a sample of eligible units into a temp dir and sum the copies."""
     picked: dict[str, int] = {}
     total = 0
-    tmpdir = tempfile.mkdtemp(prefix="session-archive-sample-")
+    tmpdir = _private_mkdtemp("session-archive-sample-")
     try:
         for unit in units:
             if picked.get(unit.tool, 0) >= sample:
@@ -2241,17 +2261,19 @@ def _safe_rel(name: str) -> bool:
     return all(part not in ("", ".", "..") for part in parts)
 
 
-def _extract(archive: str, target: str, members: list[dict]) -> None:
-    """Extract only manifest members, as regular files, beneath ``target``.
+def _extract(archive: str, dir_fd: int, members: list[dict]) -> None:
+    """Extract only manifest members, as regular files, beneath ``dir_fd``.
 
-    Rejects absolute names, ``..`` components, names not in the manifest,
-    and any non-regular entry (symlink, hardlink, device, fifo). Verifies
-    every member's size and sha256 and that every manifest member is
-    present. Raises ``ArchiveError`` on any doubt.
+    Every write is fd-relative: subdirectories are opened with ``O_NOFOLLOW``
+    from the already-open staging dir and each file is created with
+    ``O_CREAT | O_EXCL | O_NOFOLLOW``, so a pathname swapped for a symlink
+    after the staging dir was opened is never followed. Rejects absolute
+    names, ``..`` components, names not in the manifest, and any non-regular
+    entry (symlink, hardlink, device, fifo). Verifies every member's size and
+    sha256 and that every manifest member is present. Raises ``ArchiveError``
+    on any doubt.
     """
     expected = {m["rel"]: m for m in members}
-    target_abs = os.path.abspath(target)
-    os.makedirs(target_abs, exist_ok=True)
     seen: set[str] = set()
     proc = subprocess.Popen([_zstd_bin(), "-dc", ZSTD_LONG, archive], stdout=subprocess.PIPE)
     try:
@@ -2269,21 +2291,29 @@ def _extract(archive: str, target: str, members: list[dict]) -> None:
                 exp = expected.get(name)
                 if exp is None:
                     raise ArchiveError("archive entry %r is not in the manifest" % name)
-                dest = os.path.abspath(os.path.join(target_abs, name))
-                if not dest.startswith(target_abs + os.sep):
-                    raise ArchiveError("archive entry %r escapes the target" % name)
-                os.makedirs(os.path.dirname(dest), exist_ok=True)
-                digest = hashlib.sha256()
-                size = 0
-                src = tar.extractfile(info)
-                with open(dest, "wb") as fh:
-                    while True:
-                        chunk = src.read(READ_CHUNK)
-                        if not chunk:
-                            break
-                        digest.update(chunk)
-                        size += len(chunk)
-                        fh.write(chunk)
+                parts = name.split("/")
+                pfd, opened = _open_dirs_at(dir_fd, parts[:-1], create=True)
+                try:
+                    digest = hashlib.sha256()
+                    size = 0
+                    src = tar.extractfile(info)
+                    fd = os.open(
+                        parts[-1],
+                        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                        0o600,
+                        dir_fd=pfd,
+                    )
+                    with os.fdopen(fd, "wb") as fh:
+                        while True:
+                            chunk = src.read(READ_CHUNK)
+                            if not chunk:
+                                break
+                            digest.update(chunk)
+                            size += len(chunk)
+                            fh.write(chunk)
+                finally:
+                    for other in opened:
+                        os.close(other)
                 if size != exp["size"] or digest.hexdigest() != exp["sha256"]:
                     raise ArchiveError("restored %s does not match the manifest" % name)
                 seen.add(name)
@@ -2293,6 +2323,54 @@ def _extract(archive: str, target: str, members: list[dict]) -> None:
     missing = sorted(set(expected) - seen)
     if missing:
         raise ArchiveError("archive is missing manifest member(s): %s" % ", ".join(missing[:5]))
+
+
+def _stage_device(path) -> int:
+    """``st_dev`` of the staging dir; a seam for the cross-device check."""
+    return os.stat(str(path), follow_symlinks=False).st_dev
+
+
+def _fd_device(fd: int) -> int:
+    """``st_dev`` of an open directory fd; a seam for the cross-device check."""
+    return os.fstat(fd).st_dev
+
+
+def _restore_staging_base(state_dir: Path) -> str:
+    """Create ``<dest>/state/restore-tmp`` (mode 0700) and return its path.
+
+    Restore stages here, never inside the replaceable target, so nothing but
+    this process writes to the staging tree.
+    """
+    base = os.path.join(str(state_dir), "restore-tmp")
+    os.makedirs(base, mode=0o700, exist_ok=True)
+    st = os.lstat(base)
+    if not stat.S_ISDIR(st.st_mode):
+        raise OSError("staging path %s is not a directory" % base)
+    os.chmod(base, 0o700)
+    _DISCARD_ROOTS.add(os.path.realpath(base))
+    return base
+
+
+def _discard_staging(staging: str, created) -> None:
+    """Discard the staging tree only while the pathname still names it.
+
+    A pathname renamed and replaced by a symlink is left alone: the real
+    tree stays under the private restore-tmp dir and nothing outside it is
+    touched.
+    """
+    try:
+        st = os.lstat(staging)
+    except OSError:
+        return
+    if not stat.S_ISDIR(st.st_mode) or (st.st_dev, st.st_ino) != (created.st_dev, created.st_ino):
+        print("warning: staging %s was replaced; leaving it in place" % staging, file=sys.stderr)
+        return
+    try:
+        _discard_tree(staging)
+    except ArchiveError as exc:
+        print("warning: %s" % exc, file=sys.stderr)
+        return
+    _DISCARD_ROOTS.discard(staging)
 
 
 def restore(arg: str, to: str | None, state_dir: Path, out) -> int:
@@ -2322,20 +2400,41 @@ def restore(arg: str, to: str | None, state_dir: Path, out) -> int:
     # Every step below is fd-relative: the target is opened once with
     # O_NOFOLLOW, each component is opened with O_NOFOLLOW, and the final
     # rename uses the already-open dir fd. A symlink swapped in after the
-    # target was opened is therefore never followed.
+    # target was opened is therefore never followed. Staging lives outside
+    # the target, in a private dir under <dest>/state/restore-tmp, so a
+    # pathname swapped inside the target cannot redirect extraction either.
     try:
         os.makedirs(target_abs, exist_ok=True)
         target_fd = os.open(target_abs, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     except OSError as exc:
         print("restore failed, target untouched: %s" % exc, file=sys.stderr)
         return 2
-    tmp_name = ".restore-%s" % os.urandom(6).hex()
+    try:
+        staging_base = _restore_staging_base(state_dir)
+        staging = os.path.realpath(tempfile.mkdtemp(prefix="restore-", dir=staging_base))
+    except OSError as exc:
+        os.close(target_fd)
+        print("restore failed, target untouched: %s" % exc, file=sys.stderr)
+        return 2
+    _DISCARD_ROOTS.add(staging)
+    try:
+        staging_id = os.lstat(staging)
+    except OSError as exc:
+        os.close(target_fd)
+        print("restore failed, target untouched: %s" % exc, file=sys.stderr)
+        return 2
     tmp_fd = -1
     moved: list[str] = []
     try:
-        os.mkdir(tmp_name, 0o700, dir_fd=target_fd)
-        tmp_fd = _open_dir_at(tmp_name, target_fd)
-        _extract(archive, os.path.join(target_abs, tmp_name), members)
+        if _stage_device(staging) != _fd_device(target_fd):
+            print(
+                "restore failed, target untouched: staging %s and target %s are on "
+                "different devices; pass --to DIR on the same volume" % (staging, target_abs),
+                file=sys.stderr,
+            )
+            return 2
+        tmp_fd = os.open(staging, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        _extract(archive, tmp_fd, members)
         for m in members:
             parts = m["rel"].split("/")
             leaf = parts[-1]
@@ -2373,7 +2472,7 @@ def restore(arg: str, to: str | None, state_dir: Path, out) -> int:
         if tmp_fd >= 0:
             os.close(tmp_fd)
         os.close(target_fd)
-        _discard_tree(os.path.join(target_abs, tmp_name))
+        _discard_staging(staging, staging_id)
     manifest.write(dict(rec, status="restored"))
     print("restored %s to %s" % (rec["unit"], target), file=out)
     return 0

@@ -336,7 +336,12 @@ class PackTest(Base):
         records = sa.pack(unit, str(archive))
         sa.verify_archive(str(archive), records)
         target = self.home / "restore"
-        sa._extract(str(archive), str(target), records)
+        target.mkdir()
+        fd = os.open(str(target), os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            sa._extract(str(archive), fd, records)
+        finally:
+            os.close(fd)
         for member in unit.members:
             original = Path(member.path).read_bytes()
             restored = (target / member.rel).read_bytes()
@@ -352,7 +357,12 @@ class PackTest(Base):
         records = sa.pack(unit, str(archive))
         sa.verify_archive(str(archive), records)
         target = self.home / "restore"
-        sa._extract(str(archive), str(target), records)
+        target.mkdir()
+        fd = os.open(str(target), os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            sa._extract(str(archive), fd, records)
+        finally:
+            os.close(fd)
         self.assertEqual(
             (target / unit.members[0].rel).read_bytes(),
             (root / "sessions" / "2026" / "11" / "03" / zname).read_bytes(),
@@ -1796,6 +1806,102 @@ class Round6CursorStoreTest(Base):
         _unit, _member, rows = self._rows(root)
         self.assertEqual(len(rows), 6, rows)
         self.assertEqual(sum(1 for r in rows if r[1] == "user"), 3)
+
+
+# --------------------------------------------------------------- round 7
+
+class Round7RestoreStagingTest(Base):
+    """Round 7: restore stages outside the target, in a private tree."""
+
+    def _archived(self):
+        root = self.home / "grok"
+        sdir = root / "enc" / "sid"
+        write(sdir / "sub" / "a.jsonl", '{"type":"system"}\n')
+        for path in sdir.rglob("*"):
+            if path.is_file():
+                age(path, 20)
+        unit = self.unit("grok", root)
+        dest = self.home / "dest"
+        self.archive_unit(unit, dest, FakeClient())
+        return unit, dest
+
+    def test_staging_symlink_swap_writes_and_deletes_nothing_outside(self):
+        """The reviewer's repro: swap the staging pathname at tarfile.open."""
+        unit, dest = self._archived()
+        outside = self.home / "outside"
+        outside.mkdir()
+        sentinel = outside / "unarchived-only-copy.txt"
+        sentinel.write_text("keep me\n", encoding="utf-8")
+        target = self.home / "restored"
+        target.mkdir()
+        base = dest / "state" / "restore-tmp"
+        real_open = sa.tarfile.open
+        state = {"swapped": False}
+
+        def staging_dirs():
+            """The staging dir, wherever this build puts it."""
+            for parent in (base, target):
+                if not parent.is_dir():
+                    continue
+                found = [
+                    parent / n
+                    for n in os.listdir(str(parent))
+                    if n.startswith("restore-") or n.startswith(".restore-")
+                ]
+                if found:
+                    return found
+            return []
+
+        def swapping_open(*args, **kwargs):
+            if not state["swapped"]:
+                found = staging_dirs()
+                if found:
+                    state["swapped"] = True
+                    self.assertEqual(len(found), 1, found)
+                    staging = found[0]
+                    os.rename(str(staging), str(staging) + "-real")
+                    os.symlink(str(outside), str(staging))
+            return real_open(*args, **kwargs)
+
+        err = io.StringIO()
+        with mock.patch.object(sa.tarfile, "open", swapping_open):
+            with mock.patch.object(sys, "stderr", err):
+                rc = sa.restore(unit.session, str(target), dest / "state", sys.stdout)
+        self.assertTrue(state["swapped"], "the repro never reached tarfile.open")
+        self.assertEqual(rc, 0, err.getvalue())
+        self.assertEqual(sentinel.read_text(encoding="utf-8"), "keep me\n")
+        self.assertEqual(
+            sorted(p.name for p in outside.iterdir()), ["unarchived-only-copy.txt"]
+        )
+        self.assertEqual(
+            (target / "sid" / "sub" / "a.jsonl").read_bytes(), b'{"type":"system"}\n'
+        )
+        self.assertIn("was replaced; leaving it in place", err.getvalue())
+
+    def test_cross_device_staging_is_refused(self):
+        unit, dest = self._archived()
+        target = self.home / "restored"
+        err = io.StringIO()
+        with mock.patch.object(sa, "_stage_device", lambda path: -1):
+            with mock.patch.object(sys, "stderr", err):
+                rc = sa.restore(unit.session, str(target), dest / "state", sys.stdout)
+        self.assertEqual(rc, 2)
+        self.assertIn("same volume", err.getvalue())
+        self.assertEqual(list(target.rglob("*")), [], "target was written on refusal")
+        # The private staging dir is discarded on refusal.
+        self.assertEqual(list((dest / "state" / "restore-tmp").iterdir()), [])
+
+    def test_discard_tree_refuses_an_arbitrary_path(self):
+        victim = self.home / "victim"
+        write(victim / "keep.txt", "not ours\n")
+        with self.assertRaises(sa.ArchiveError):
+            sa._discard_tree(str(victim))
+        self.assertEqual((victim / "keep.txt").read_text(encoding="utf-8"), "not ours\n")
+        # A private tree this process made is still discarded.
+        private = sa._private_mkdtemp("round7-")
+        write(Path(private) / "junk.txt", "x\n")
+        sa._discard_tree(private)
+        self.assertFalse(os.path.exists(private))
 
 
 # --------------------------------------------------------------- real store e2e
