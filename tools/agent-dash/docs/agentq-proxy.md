@@ -14,7 +14,8 @@ the proxy and never reach the client.
 | `output` | models starting `morph-dsv41flash` | 70,000 / min | completion tokens |
 | `uncached` | model `morph-kimik31` | 24,290 / min | prompt tokens minus cached prompt tokens |
 
-Windows are rolling 60 s. A request's cost is estimated before it is sent:
+Windows are rolling 60 s by default; `window_mode` can make a budget a UTC
+calendar minute instead (see "Calendar window and charge basis"). A request's cost is estimated before it is sent:
 prompt tokens are body characters / 4, output is the mean of the model's recent
 completions capped at `max_tokens`, and the Kimi uncached estimate counts only
 the text beyond the longest prefix any recent request shared with it (Morph's
@@ -72,6 +73,54 @@ edge from 429 feedback instead of stopping at that projection.
 - `$AGENTQ_HOME/proxy_state.json` holds the learned limits and targets. It is
   written atomically and read at start.
 
+## Calendar window and charge basis
+
+Evidence for the experiment. Of 626 upstream 429s whose body states
+`Limit: 10000000 tokens/minute`, 1 % fell in seconds :00 to :29 of the UTC
+minute, 7 % in :30 to :39, 31 % in :40 to :49 and 62 % in :50 to :59, and the
+bursts stop at :00. Morph therefore appears to enforce the total limit on a fixed
+UTC minute that resets at :00, not on a rolling 60 s window. Morph also seems to
+count more than the billed usage: it reaches 10 M by about :45, while the billed
+prompt plus completion for the whole minute is 5 to 8 M. One explanation is that
+Morph charges the prompt plus the requested `max_tokens` when a request starts,
+so requests that ask for a large `max_tokens` (pi sends about 74,000, which the
+proxy caps at 32,768 for DeepSeek) hold more than they bill.
+
+Two settings test this. Both default to the current behaviour.
+
+- `window_mode`: `rolling` (default) or `calendar`. In `calendar` mode a budget's
+  usage is the charges admitted in the current UTC minute, and the window resets
+  at :00. A request refused by a full calendar budget waits for the next :00 plus
+  up to `calendar_jitter_s` (1.5 s) of jitter, instead of the time until
+  completed charges age out.
+- `charge_basis`: `billed` (default) estimates at admission and replaces the
+  estimate with real usage at completion. `prompt_plus_max` charges the prompt
+  estimate plus the capped requested `max_tokens` at admission and keeps that
+  charge after completion, which models a reservation Morph holds for the minute.
+  A reservation is released only when the request is refused (429), fails or is
+  abandoned, because upstream did not bill it. The output budget reserves its
+  requested `max_tokens`, and the uncached budget keeps its estimate.
+
+Set either in `$AGENTQ_HOME/proxy.json`, globally or per budget:
+
+```json
+{"window_mode": "calendar", "charge_basis": "prompt_plus_max",
+ "budgets": {"total": {"window_mode": "calendar"}}}
+```
+
+Restart the proxy after an edit. Config is read at start, and an unknown mode
+or basis stops the proxy at start.
+
+Calibration runs in every mode. Each upstream 429 logs a `calib` line with the
+budget its body names, the second of the UTC minute it fell in, and the minute's
+totals so far: admitted requests, admitted prompt estimate, admitted capped
+`max_tokens`, and billed prompt plus completion of requests admitted in that
+minute. Each UTC minute also has one `proxy_calib` row (`minute`, `req`,
+`prompt_est`, `max_tokens`, `billed`, `first_429_s`, `r429`), flushed with the
+minute rows. Minutes are held in memory for three minutes and seeded from the row
+after a restart, so counts survive a restart. The per-family split is in the log
+line only, and it restarts from zero after a restart.
+
 ## Retries
 
 A 429 is retried after `max(time the budget needs to free, 1 s) + 0-2 s` of
@@ -92,6 +141,9 @@ A request that is already streaming upstream is not cancelled.
 - `GET http://127.0.0.1:18790/agentq/status` returns JSON: per budget `limit`,
   `target_frac`, `used_60s` and `queued` per lane, plus `saturated` (a request
   waited more than 2 s in the last minute or is waiting now).
+- Each budget reports `window_mode` and `charge_basis`. A calendar budget also
+  reports `seconds_to_reset`, the seconds until its next UTC :00.
+- Each UTC minute has one `proxy_calib` row (see "Calendar window and charge basis").
 - Each model and minute has one `proxy_minutes` row (created if missing, WAL,
   busy timeout 5000 ms), flushed every 5 s.
 - Each (job, model) pair has one `proxy_jobs` row for per-run accounting. The job
@@ -114,7 +166,8 @@ A request that is already streaming upstream is not cancelled.
 `upstream`, `window_s`, `start_target`, `target_floor`, `target_cut`,
 `target_step_up`, `target_ceiling`, `fast_until`, `fast_step_up`, `fast_interval_s`, `default_output_tokens`, `give_up_s`, `retry_floor_s`,
 `retry_jitter_s`, `aging_s`, `connect_timeout_s` (10), `upstream_idle_s` (120),
-`drain_s` (20), `budgets` and `max_tokens_cap`. Environment variables:
+`drain_s` (20), `budgets`, `max_tokens_cap`, `window_mode` (`rolling`),
+`charge_basis` (`billed`) and `calendar_jitter_s` (1.5). Environment variables:
 
 - `AGENTQ_HOME` (default `~/.local/state/agentq`)
 - `AGENTQ_PROXY_PORT` (default 18790)
