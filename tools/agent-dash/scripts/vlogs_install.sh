@@ -13,7 +13,9 @@
 # Test overrides (never needed in normal use):
 #   VLOGS_HOME       install dir            (default ~/.local/share/agent-dash/vlogs)
 #   VLOGS_DATA       store data dir         (default $VLOGS_HOME/data)
-#   VLOGS_MAX_DISK   retention disk cap     (default 20GiB)
+#   VLOGS_MAX_DISK   retention disk cap     (default 20GiB; `none` or an
+#                    empty value omits the cap entirely, so the store never
+#                    evicts rows for space)
 #   VLOGS_PLIST_DIR  launch agents dir      (default ~/Library/LaunchAgents)
 #   VLOGS_NO_LOAD=1  write the plist but do not bootstrap it with launchctl
 
@@ -29,7 +31,12 @@ PLIST_DIR="${VLOGS_PLIST_DIR:-$HOME/Library/LaunchAgents}"
 PLIST="$PLIST_DIR/$LABEL.plist"
 BIN="$HOME_DIR/bin/victoria-logs-prod"
 DATA="${VLOGS_DATA:-$HOME_DIR/data}"
-MAX_DISK="${VLOGS_MAX_DISK:-20GiB}"
+# Unset keeps the 20GiB default; an explicitly empty value means no cap.
+MAX_DISK="${VLOGS_MAX_DISK-20GiB}"
+case "$MAX_DISK" in
+    ""|none|NONE|None) MAX_DISK_LINE="" ;;
+    *) MAX_DISK_LINE="        <string>-retention.maxDiskSpaceUsageBytes=$MAX_DISK</string>" ;;
+esac
 LOG="$HOME_DIR/server.log"
 VERSION_FILE="$HOME_DIR/VERSION"
 
@@ -123,7 +130,7 @@ cat > "$PLIST.tmp" <<EOF
         <string>-httpListenAddr=127.0.0.1:$PORT</string>
         <string>-storageDataPath=$DATA</string>
         <string>-retentionPeriod=100y</string>
-        <string>-retention.maxDiskSpaceUsageBytes=$MAX_DISK</string>
+$MAX_DISK_LINE
         <string>-memory.allowedBytes=1GiB</string>
         <string>-insert.maxLineSizeBytes=8MiB</string>
     </array>

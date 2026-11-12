@@ -56,6 +56,8 @@ DEFAULT_DEST = "~/Documents/data/agent-sessions"
 DEFAULT_MIN_IDLE_HOURS = 6.0
 DEFAULT_RECLAIM_DAYS = 14.0
 DEFAULT_MAX_MINUTES = 90.0
+#: Warn (but still run) when the dest volume has less free space than this.
+DISK_WARN_GB = 30.0
 ZSTD_LEVEL = "-12"
 ZSTD_LONG = "--long=27"
 ZSTD_THREADS = "-T2"
@@ -1170,8 +1172,30 @@ def _remove_unit(unit: Unit) -> None:
                 pass
 
 
+def _delete_guard(unit: Unit, cfg: dict) -> None:
+    """Refuse any delete under the archive dest or outside the tool root.
+
+    The guard resolves symlinks, so a unit that points into the archive
+    folder (or anywhere outside its tool root) can never be deleted. It
+    raises ``ArchiveError``; ``apply_pass`` records that as the unit's
+    error and keeps going, so one bad unit never stops the pass.
+    """
+    dest = os.path.realpath(os.path.expanduser(str(cfg.get("dest") or DEFAULT_DEST)))
+    root = os.path.realpath(unit.root)
+    targets = [m.path for m in unit.members]
+    if unit.is_dir and unit.unit_dir:
+        targets.append(unit.unit_dir)
+    for path in targets:
+        real = os.path.realpath(path)
+        if real == dest or real.startswith(dest + os.sep):
+            raise ArchiveError("refusing to delete %s: under the archive dest %s" % (path, dest))
+        if not (real == root or real.startswith(root + os.sep)):
+            raise ArchiveError("refusing to delete %s: not under the tool root %s" % (path, root))
+
+
 def reclaim_unit(unit: Unit, rec: dict, cfg: dict, now: float) -> str | None:
     """Delete the unit's members when every check passes. Returns a reason to keep."""
+    _delete_guard(unit, cfg)
     days = float(cfg["reclaim_days_by_tool"].get(unit.tool, cfg["reclaim_days"]))
     idle_hours = (now - unit.newest_mtime) / 3600.0
     if idle_hours < days * 24.0:
@@ -1653,6 +1677,17 @@ def status(state_dir: Path, out) -> int:
             print("last success: %s" % rec.get("iso", rec.get("ts")), file=out)
         except (OSError, ValueError):
             pass
+    warn = state_dir / "disk_warning.json"
+    if warn.exists():
+        try:
+            rec = json.loads(warn.read_text(encoding="utf-8"))
+            print(
+                "warning: dest free disk %.1f GB (< %g GB) at %s"
+                % (float(rec.get("free_gb", 0)), DISK_WARN_GB, rec.get("iso", rec.get("ts"))),
+                file=out,
+            )
+        except (OSError, ValueError, TypeError):
+            pass
     errors = [r for r in manifest.latest.values() if r.get("status") == "error"]
     for rec in errors[-5:]:
         print("error %s: %s" % (rec.get("unit"), rec.get("error")), file=out)
@@ -1660,6 +1695,38 @@ def status(state_dir: Path, out) -> int:
 
 
 # --------------------------------------------------------------- scheduled
+
+def _free_disk_gb(path) -> float | None:
+    """Free space in GB on the volume holding ``path`` (nearest existing parent)."""
+    probe = Path(path)
+    while True:
+        try:
+            return shutil.disk_usage(str(probe)).free / 1e9
+        except OSError:
+            if probe.parent == probe:
+                return None
+            probe = probe.parent
+
+
+def _write_disk_warning(state_dir: Path, now: float, free_gb: float) -> None:
+    state_dir.mkdir(parents=True, exist_ok=True)
+    path = state_dir / "disk_warning.json"
+    tmp = str(path) + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(
+            {"ts": round(now, 3), "iso": iso_from_ms(int(now * 1000)), "free_gb": round(free_gb, 2)},
+            fh,
+        )
+        fh.write("\n")
+    os.replace(tmp, path)
+
+
+def _clear_disk_warning(state_dir: Path) -> None:
+    try:
+        (state_dir / "disk_warning.json").unlink()
+    except FileNotFoundError:
+        pass
+
 
 def _memory_free_pct() -> int | None:
     try:
@@ -1720,10 +1787,21 @@ def run(opts: dict, out=None, *, state: Path | None = None, now: float | None = 
     dest = Path(cfg["dest"])
 
     if opts.get("scheduled"):
-        why = scheduled_skip(dest / "state", now)
+        state_dest = dest / "state"
+        why = scheduled_skip(state_dest, now)
         if why:
             print("scheduled: skip (%s)" % why, file=out)
             return 0
+        free_gb = _free_disk_gb(dest)
+        if free_gb is not None and free_gb < DISK_WARN_GB:
+            print(
+                "WARNING: dest volume has %.1f GB free (< %g GB); running anyway, archiving frees space"
+                % (free_gb, DISK_WARN_GB),
+                file=out,
+            )
+            _write_disk_warning(state_dest, now, free_gb)
+        else:
+            _clear_disk_warning(state_dest)
 
     tools = opts.get("tools") or cfg.get("tools") or list(TOOLS)
     bad = [t for t in tools if t not in TOOLS]

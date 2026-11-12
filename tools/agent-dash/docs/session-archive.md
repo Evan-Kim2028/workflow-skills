@@ -20,7 +20,7 @@ from `dash/logarchive.py`, but not the base64 filter.
 | Archive pass | `dash/sessionarchive.py` | Unit discovery, `tar.zst` packing, ingestion, reclaim, restore, census. |
 | CLI | `agent_dash.py logs sessions` | `--apply`, `--no-reclaim`, `--scheduled`, `--tool`, `--limit`, `--max-minutes`, `--url`, `--dest`; plus `restore` and `status`. |
 | Store client | `dash/vlogs.py` | `make_row(..., extra=...)` adds the native fields; redaction and truncation apply as before. |
-| Store service | `scripts/vlogs_install.sh` | `VLOGS_DATA` and `VLOGS_MAX_DISK` feed `-storageDataPath` and `-retention.maxDiskSpaceUsageBytes`. |
+| Store service | `scripts/vlogs_install.sh` | `VLOGS_DATA` and `VLOGS_MAX_DISK` feed `-storageDataPath` and `-retention.maxDiskSpaceUsageBytes`; `VLOGS_MAX_DISK=none` (or empty) omits the cap. |
 | Schedule | `scripts/session_archive_install.sh` | launchd agent `com.agent-dash.session-archive`, hourly, `ProcessType=Background`, `Nice=10`, under `taskpolicy -b` and `memcap.sh 4096`. |
 
 ## Config
@@ -44,6 +44,21 @@ means every registered tool; a list narrows it (`["pi", "claude"]`).
 `SESSION_ARCHIVE_DEST` overrides `dest`, and `--dest` overrides both (used
 by tests and by a read-only census that must not create the real folder).
 
+## Retention policy
+
+Nothing this job writes is ever deleted for age or space:
+
+- **Archives are kept forever.** `<dest>/archive/**/*.tar.zst` is never
+  pruned by the pass, by `--scheduled`, or by the installer.
+- **Store rows are kept forever.** The VictoriaLogs store runs with
+  `-retentionPeriod=100y`. On this laptop it is installed with
+  `VLOGS_MAX_DISK=none`, which omits
+  `-retention.maxDiskSpaceUsageBytes` entirely, so the store never evicts
+  rows to stay under a disk cap. Other installs keep the 20GiB default.
+- **Only original session files are reclaimed**, and only after
+  `reclaim_days` of idleness and a full re-verify (see step 7 below).
+  `--no-reclaim` disables even that.
+
 ## Layout
 
 ```
@@ -52,6 +67,7 @@ by tests and by a read-only census that must not create the real folder).
   state/manifest.jsonl           append-only; last record per unit wins
   state/archive.lock
   state/last_success.json
+  state/disk_warning.json        only while a scheduled run saw < 30 GB free
 ```
 
 The unit path is the unit's path relative to the tool root, so a Claude
@@ -139,9 +155,11 @@ Streams are keyed by `ws,label`, so each session is its own stream.
 7. **reclaim** (unless `--no-reclaim`), only when: the unit is idle at
    least `reclaim_days` (per-tool override applies), status is `archived`,
    the fingerprint is unchanged, no member is open, every path resolves
-   inside the tool root, and re-stat + re-hash matches the manifest. It
-   deletes exactly the unit's members and any directory that becomes empty.
-   Any doubt records why and keeps the files.
+   inside the tool root and none resolves under the archive dest, and
+   re-stat + re-hash matches the manifest. It deletes exactly the unit's
+   members and any directory that becomes empty. Any doubt records why and
+   keeps the files; a path that fails the dest/root guard is recorded as
+   the unit's `error` and the pass continues.
 
 Exit codes: `0` ok, `1` failures or an empty dry run on real input, `2` bad
 options, `3` another run holds the lock, `5` store unreachable (only for
@@ -158,7 +176,10 @@ that plans zero actions on real, non-archived input exits 1.
 
 `--scheduled` exits `0` immediately with a reason when any of these hold:
 `last_success.json` is under 20 h old, `memory_pressure` reports under 30 %
-free, or `pmset -g batt` says `Battery Power`. `last_success.json` is
+free, or `pmset -g batt` says `Battery Power`. When the dest volume has
+less than 30 GB free it prints a `WARNING` line and records
+`state/disk_warning.json` (shown by `status`), but still runs: archiving
+frees space. `last_success.json` is
 written only when a run finished with no error and did not stop on the time
 budget (a budget stop leaves it unset so the next hourly tick continues the
 backlog).

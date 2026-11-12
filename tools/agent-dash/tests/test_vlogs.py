@@ -14,7 +14,9 @@ when ``VLOGS_LIVE_TEST=1`` is set (read-only check against 127.0.0.1:19428).
 import http.server
 import json
 import os
+import subprocess
 import sys
+import tempfile
 import threading
 import unittest
 from pathlib import Path
@@ -24,6 +26,8 @@ from urllib.parse import parse_qs, urlsplit
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+
+SCRIPTS = ROOT / "scripts"
 
 from dash import vlogs  # noqa: E402
 
@@ -206,6 +210,66 @@ class ClientTest(unittest.TestCase):
         self.assertEqual(client.count("nope"), 0)
         with self.assertRaises(vlogs.VLogsError):
             client.count('bad"path')
+
+
+class VlogsInstallerTest(unittest.TestCase):
+    """The plist's retention cap: default 20GiB, `none`/empty omits the flag."""
+
+    def _install(self, tmp, max_disk):
+        home = Path(tmp) / "vlogs"
+        plist_dir = Path(tmp) / "LaunchAgents"
+        (home / "bin").mkdir(parents=True, exist_ok=True)
+        binary = home / "bin" / "victoria-logs-prod"
+        binary.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        binary.chmod(0o755)
+        (home / "VERSION").write_text("v1.53.0\n", encoding="utf-8")
+        env = dict(
+            os.environ,
+            VLOGS_HOME=str(home),
+            VLOGS_DATA=str(home / "data"),
+            VLOGS_PLIST_DIR=str(plist_dir),
+            VLOGS_NO_LOAD="1",
+            VLOGS_MAX_DISK=max_disk,
+        )
+        res = subprocess.run(
+            ["sh", str(SCRIPTS / "vlogs_install.sh")], env=env, capture_output=True, text=True
+        )
+        self.assertEqual(res.returncode, 0, res.stderr)
+        plist = plist_dir / "com.agent-dash.vlogs.plist"
+        lint = subprocess.run(["plutil", "-lint", str(plist)], capture_output=True, text=True)
+        self.assertEqual(lint.returncode, 0, lint.stdout + lint.stderr)
+        return plist.read_text(encoding="utf-8")
+
+    def test_max_disk_none_and_empty_omit_the_flag(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for value in ("none", ""):
+                text = self._install(tmp, value)
+                self.assertNotIn("maxDiskSpaceUsageBytes", text)
+                self.assertIn("-retentionPeriod=100y", text)
+
+    def test_max_disk_value_keeps_the_flag(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            text = self._install(tmp, "30GiB")
+            self.assertIn("<string>-retention.maxDiskSpaceUsageBytes=30GiB</string>", text)
+
+    def test_default_is_20gib(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "vlogs"
+            plist_dir = Path(tmp) / "LaunchAgents"
+            (home / "bin").mkdir(parents=True, exist_ok=True)
+            binary = home / "bin" / "victoria-logs-prod"
+            binary.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            binary.chmod(0o755)
+            (home / "VERSION").write_text("v1.53.0\n", encoding="utf-8")
+            env = dict(os.environ, VLOGS_HOME=str(home), VLOGS_DATA=str(home / "data"),
+                       VLOGS_PLIST_DIR=str(plist_dir), VLOGS_NO_LOAD="1")
+            env.pop("VLOGS_MAX_DISK", None)
+            res = subprocess.run(
+                ["sh", str(SCRIPTS / "vlogs_install.sh")], env=env, capture_output=True, text=True
+            )
+            self.assertEqual(res.returncode, 0, res.stderr)
+            text = (plist_dir / "com.agent-dash.vlogs.plist").read_text(encoding="utf-8")
+            self.assertIn("<string>-retention.maxDiskSpaceUsageBytes=20GiB</string>", text)
 
 
 @unittest.skipUnless(os.environ.get("VLOGS_LIVE_TEST") == "1", "set VLOGS_LIVE_TEST=1 to query a running store")

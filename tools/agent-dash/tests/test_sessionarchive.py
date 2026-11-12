@@ -499,9 +499,39 @@ class ReclaimTest(Base):
         age(outside, 20)
         unit.members[0].path = str(outside)
         cfg = {"reclaim_days": 14.0, "reclaim_days_by_tool": {}}
-        reason = sa.reclaim_unit(unit, rec, cfg, time.time())
-        self.assertIn("escapes root", reason)
+        with self.assertRaises(sa.ArchiveError) as ctx:
+            sa.reclaim_unit(unit, rec, cfg, time.time())
+        self.assertIn("not under the tool root", str(ctx.exception))
         self.assertTrue(outside.exists())
+
+    def test_refused_when_path_under_dest_nested_in_root(self):
+        root = self.home / "pi"
+        unit, rec, _path = self._archived(root)
+        dest = root / "archive-dest"
+        nested = write(dest / "proj" / "a.jsonl", '{"type":"session"}\n')
+        age(nested, 20)
+        unit.members[0].path = str(nested)
+        cfg = {"reclaim_days": 14.0, "reclaim_days_by_tool": {}, "dest": str(dest)}
+        with self.assertRaises(sa.ArchiveError) as ctx:
+            sa.reclaim_unit(unit, rec, cfg, time.time())
+        self.assertIn("under the archive dest", str(ctx.exception))
+        self.assertTrue(nested.exists())
+
+    def test_refused_when_unit_is_a_symlink_into_dest(self):
+        root = self.home / "pi"
+        unit, rec, path = self._archived(root)
+        dest = root / "store"
+        real = write(dest / "sessions" / "a.jsonl", '{"type":"session"}\n')
+        age(real, 20)
+        os.remove(path)
+        os.symlink(real, path)
+        unit.members[0].path = str(path)
+        cfg = {"reclaim_days": 14.0, "reclaim_days_by_tool": {}, "dest": str(dest)}
+        with self.assertRaises(sa.ArchiveError) as ctx:
+            sa.reclaim_unit(unit, rec, cfg, time.time())
+        self.assertIn("under the archive dest", str(ctx.exception))
+        self.assertTrue(real.exists())
+        self.assertTrue(path.is_symlink())
 
     def test_per_tool_override(self):
         root = self.home / "pi"
@@ -561,6 +591,10 @@ class ScheduledTest(Base):
             self.assertIn("battery", sa.scheduled_skip(state, now))
         with mock.patch.object(sa, "_memory_free_pct", lambda: 80), mock.patch.object(sa, "_on_battery", lambda: False):
             self.assertIsNone(sa.scheduled_skip(state, now))
+
+    def test_free_disk_probe_finds_the_volume(self):
+        self.assertGreater(sa._free_disk_gb(self.home), 0)
+        self.assertGreater(sa._free_disk_gb(self.home / "does-not-exist" / "yet"), 0)
 
 
 # --------------------------------------------------------------- driver
@@ -648,6 +682,66 @@ class DriverTest(Base):
         code = self._run(root, FakeClient(), apply=True, scheduled=True)
         self.assertEqual(code, 0)
         self.assertTrue(path.exists())
+
+    def test_scheduled_low_disk_warns_but_still_archives(self):
+        root, path = self._fixture()
+        with mock.patch.object(sa, "_free_disk_gb", lambda _path: 5.0):
+            code = self._run(root, FakeClient(), apply=True, scheduled=True)
+        self.assertEqual(code, 0)
+        self.assertFalse(path.exists())
+        warn = self.home / "dest" / "state" / "disk_warning.json"
+        self.assertTrue(warn.exists())
+        self.assertIn("free_gb", json.loads(warn.read_text(encoding="utf-8")))
+        import io
+
+        buf = io.StringIO()
+        self.assertEqual(sa.status(self.home / "dest" / "state", buf), 0)
+        self.assertIn("dest free disk", buf.getvalue())
+
+    def test_scheduled_plenty_of_disk_clears_warning(self):
+        root, _path = self._fixture()
+        state = self.home / "dest" / "state"
+        state.mkdir(parents=True)
+        (state / "disk_warning.json").write_text(json.dumps({"free_gb": 5.0}), encoding="utf-8")
+        with mock.patch.object(sa, "_free_disk_gb", lambda _path: 500.0):
+            code = self._run(root, FakeClient(), apply=True, scheduled=True)
+        self.assertEqual(code, 0)
+        self.assertFalse((state / "disk_warning.json").exists())
+
+    def test_delete_guard_error_is_recorded_and_pass_continues(self):
+        root = self.home / "pi"
+        dest = root / "store"
+        path = write(dest / "a.jsonl", '{"type":"session"}\n')
+        age(path, 30)
+        unit = self.unit("pi", root)
+        records = sa.pack(unit, str(self.home / "a.tar.zst"))
+        manifest = sa.Manifest(dest / "state")
+        manifest.write({"unit": unit.uid, "tool": "pi", "key": unit.key, "status": "archived", "members": records})
+        cfg = {
+            "dest": str(dest),
+            "reclaim_days": 1.0,
+            "reclaim_days_by_tool": {},
+            "min_idle_hours": 6.0,
+            "max_minutes": 90.0,
+        }
+        results = sa.apply_pass(
+            [unit],
+            cfg,
+            FakeClient(),
+            manifest,
+            dest,
+            set(),
+            open(os.devnull, "w"),
+            no_reclaim=False,
+            limit=None,
+            max_minutes=90.0,
+            now=time.time(),
+        )
+        self.assertEqual(results["errors"], 1)
+        self.assertTrue(path.exists())
+        rec = sa.Manifest(dest / "state").latest[unit.uid]
+        self.assertEqual(rec["status"], "error")
+        self.assertIn("under the archive dest", rec["error"])
 
 
 class StatusTest(Base):
