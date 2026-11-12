@@ -918,5 +918,71 @@ class WarmRestartTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(saved["budgets"]["total"]["window_used"], 4_000)
 
 
+class FastRampTest(unittest.TestCase):
+    STEP_S = 0.25
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.now = [1000.0]
+        self.gov = Governor(Path(tmp.name), config_with(), clock=lambda: self.now[0], log=quiet)
+        self.total = self.gov.budgets["total"]
+        self.total.target = 0.6
+
+    def run_for(self, seconds: float, saturated: bool = True) -> list[float]:
+        """Tick the governor every STEP_S, as the maintenance loop does, and return the target seen each tick."""
+        seen = []
+        for _ in range(round(seconds / self.STEP_S)):
+            self.now[0] += self.STEP_S
+            self.total.saturated = saturated
+            self.gov.tick()
+            seen.append(self.total.target)
+        return seen
+
+    def test_saturated_budget_reaches_fast_until_in_six_intervals_and_stops_there(self) -> None:
+        seen = self.run_for(59.75)
+        self.assertAlmostEqual(seen[-1], 0.85, places=6)
+        self.run_for(0.25)
+        self.assertAlmostEqual(self.total.target, 0.9, places=6)
+        self.assertLessEqual(max(seen), 0.9 + 1e-9)
+
+    def test_above_fast_until_the_target_grows_one_step_per_window(self) -> None:
+        self.run_for(60.0)
+        self.assertAlmostEqual(self.total.target, 0.9, places=6)
+        self.run_for(59.75)
+        self.assertAlmostEqual(self.total.target, 0.9, places=6)
+        self.run_for(0.25)
+        self.assertAlmostEqual(self.total.target, 0.92, places=6)
+
+    def test_429_blocks_the_next_fast_step_and_cuts_by_target_cut(self) -> None:
+        self.run_for(20.0)
+        self.assertAlmostEqual(self.total.target, 0.7, places=6)
+        self.gov.learn_from_429(make_ticket(self.gov, max_tokens=8), "")
+        self.assertAlmostEqual(self.total.target, 0.7 * 0.97, places=6)
+        cut = self.total.target
+        self.run_for(9.75)
+        self.assertAlmostEqual(self.total.target, cut, places=6)
+        self.run_for(0.25)
+        self.assertAlmostEqual(self.total.target, cut + 0.05, places=6)
+
+    def test_unsaturated_budget_does_not_grow(self) -> None:
+        seen = self.run_for(60.0, saturated=False)
+        self.assertEqual(set(seen), {0.6})
+
+    def test_demand_seen_by_a_pump_between_ticks_counts(self) -> None:
+        self.total.entries.append(Entry(at=self.now[0], amount=10_000_000, lane="normal"))
+        ticket = make_ticket(self.gov, max_tokens=8)
+        self.gov.enqueue(ticket)
+        self.gov.pump()
+        self.assertTrue(self.total.saturated_since_tick)
+        self.total.entries.clear()
+        self.gov.pump()
+        self.assertFalse(self.total.saturated)
+        self.now[0] += 10.0
+        self.gov.tick()
+        self.assertAlmostEqual(self.total.target, 0.65, places=6)
+        self.assertFalse(self.total.saturated_since_tick)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -52,6 +52,9 @@ DEFAULT_CONFIG = {
     "target_ceiling": 1.5,
     "target_cut": 0.97,
     "target_step_up": 0.02,
+    "fast_until": 0.9,
+    "fast_step_up": 0.05,
+    "fast_interval_s": 10.0,
     "default_output_tokens": 800,
     "give_up_s": 240.0,
     "retry_floor_s": 1.0,
@@ -352,6 +355,7 @@ class Budget:
     last_429: float = float("-inf")
     last_grow: float = 0.0
     saturated: bool = False
+    saturated_since_tick: bool = False
 
     def applies(self, model: str) -> bool:
         if self.model_prefix is not None:
@@ -652,7 +656,9 @@ class Governor:
                     self._admit(head, now)
                     continue
                 blocker, guard_only = found
-                blocker.saturated = blocker.saturated or not guard_only
+                if not guard_only:
+                    blocker.saturated = True
+                    blocker.saturated_since_tick = True
                 (urgent_guarded if guard_only else blocked).add(blocker.name)
                 index += 1
 
@@ -762,14 +768,33 @@ class Governor:
         return max(wait, floor) + random.uniform(0.0, jitter)
 
     def tick(self) -> None:
-        """Raise a target by one step after a full window with no 429 and with demand still blocked."""
+        """Raise a target while its budget is saturated and no 429 has come recently.
+
+        Below fast_until the target climbs by fast_step_up every fast_interval_s. Above it the target
+        climbs by target_step_up once per full window, up to target_ceiling. Saturation counts if the
+        current pump or any pump since the last tick marked the budget.
+        """
         now = self.clock()
         window = self.window
         step = float(self.config["target_step_up"])
         ceiling = float(self.config.get("target_ceiling", 1.0))
+        fast_until = float(self.config.get("fast_until", 0.9))
+        fast_step = float(self.config.get("fast_step_up", 0.05))
+        fast_interval = float(self.config.get("fast_interval_s", 10.0))
         for budget in self.budgets.values():
+            demanded = budget.saturated or budget.saturated_since_tick
+            budget.saturated_since_tick = False
+            if not demanded:
+                continue
+            if budget.target < fast_until:
+                if now - budget.last_429 >= fast_interval and now - budget.last_grow >= fast_interval:
+                    budget.target = min(fast_until, budget.target + fast_step)
+                    budget.last_grow = now
+                    self.state_dirty = True
+                    self.log("target_raised", budget=budget.name, target=round(budget.target, 4))
+                continue
             quiet = now - budget.last_429 >= window and now - budget.last_grow >= window
-            if budget.saturated and budget.target < ceiling and quiet:
+            if budget.target < ceiling and quiet:
                 budget.target = min(ceiling, budget.target + step)
                 budget.last_grow = now
                 self.state_dirty = True
