@@ -12,6 +12,8 @@
 #
 # Test overrides (never needed in normal use):
 #   VLOGS_HOME       install dir            (default ~/.local/share/agent-dash/vlogs)
+#   VLOGS_DATA       store data dir         (default $VLOGS_HOME/data)
+#   VLOGS_MAX_DISK   retention disk cap     (default 20GiB)
 #   VLOGS_PLIST_DIR  launch agents dir      (default ~/Library/LaunchAgents)
 #   VLOGS_NO_LOAD=1  write the plist but do not bootstrap it with launchctl
 
@@ -26,7 +28,8 @@ HOME_DIR="${VLOGS_HOME:-$HOME/.local/share/agent-dash/vlogs}"
 PLIST_DIR="${VLOGS_PLIST_DIR:-$HOME/Library/LaunchAgents}"
 PLIST="$PLIST_DIR/$LABEL.plist"
 BIN="$HOME_DIR/bin/victoria-logs-prod"
-DATA="$HOME_DIR/data"
+DATA="${VLOGS_DATA:-$HOME_DIR/data}"
+MAX_DISK="${VLOGS_MAX_DISK:-20GiB}"
 LOG="$HOME_DIR/server.log"
 VERSION_FILE="$HOME_DIR/VERSION"
 
@@ -36,7 +39,7 @@ for arg in "$@"; do
     case "$arg" in
         --uninstall) uninstall=1 ;;
         --purge) purge=1 ;;
-        -h|--help) sed -n '2,16p' "$0"; exit 0 ;;
+        -h|--help) sed -n '2,19p' "$0"; exit 0 ;;
         *) echo "vlogs_install: unknown argument '$arg'" >&2; exit 2 ;;
     esac
 done
@@ -120,7 +123,7 @@ cat > "$PLIST.tmp" <<EOF
         <string>-httpListenAddr=127.0.0.1:$PORT</string>
         <string>-storageDataPath=$DATA</string>
         <string>-retentionPeriod=100y</string>
-        <string>-retention.maxDiskSpaceUsageBytes=20GiB</string>
+        <string>-retention.maxDiskSpaceUsageBytes=$MAX_DISK</string>
         <string>-memory.allowedBytes=1GiB</string>
         <string>-insert.maxLineSizeBytes=8MiB</string>
     </array>

@@ -18,6 +18,10 @@ exception is in `CONTRACT.md` ("Log archive exception").
 | Service | `scripts/vlogs_install.sh` | VictoriaLogs v1.53.0, checksum-verified, launchd agent `com.agent-dash.vlogs`, 127.0.0.1:19428, flags as specified. `--uninstall`, `--purge`. |
 | Option test | `scripts/log_keep_eval.py` | Evidence for what stays at the original path (below and "Per-kind decision"). |
 
+Native agent session history (Claude Code, Codex, Grok build, Cursor, Command
+Code, pi, muse) is handled by a separate, lossless job: see
+[session archive](session-archive.md).
+
 ## The archive pass, per file
 
 1. **measure** (one streaming pass): filter, count lines and assistant tokens on the raw and stripped bytes, write zstd -9 to a temp file, keep the stripped sha256.

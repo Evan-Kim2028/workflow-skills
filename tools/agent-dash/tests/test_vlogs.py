@@ -87,6 +87,23 @@ class MakeRowTest(unittest.TestCase):
         self.assertFalse(truncated)
         self.assertEqual(red, 1)
 
+    def test_extra_fields_are_added_and_empty_ones_omitted(self):
+        line, _truncated, _red = vlogs.make_row(
+            time_iso="2026-11-01T00:00:00.000Z",
+            msg="x",
+            ws="native/pi",
+            label="s1",
+            type_="message",
+            kind="native",
+            path="pi/proj/a.jsonl",
+            extra={"tool": "pi", "session": "s1", "project": "", "model": None, "rev": "0"},
+        )
+        row = json.loads(line)
+        self.assertEqual(row["tool"], "pi")
+        self.assertEqual(row["rev"], "0")
+        self.assertNotIn("project", row)
+        self.assertNotIn("model", row)
+
     def test_oversize_row_is_truncated_counted_and_still_valid(self):
         big = "é" * (vlogs.MAX_MSG_BYTES // 2 + 1000)  # multi-byte, so the cut must land on a character
         line, truncated, _ = vlogs.make_row(
