@@ -78,13 +78,21 @@ _UUID = re.compile(
     r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
 )
 
-#: Quota/credit exhaustion markers in an assistant ``errorMessage``.
-_QUOTA_WORDS = ("insufficient", "credit", "quota", "balance", "payment required")
+#: A provider status code of 402 or 429 in an assistant ``errorMessage``:
+#: ``HTTP 429``, ``status 402``, ``"status": 429``, ``code 429``, or a leading
+#: ``429:`` (River's form). Lowercased text; a bare number elsewhere is not a status.
+_STATUS_CODE = re.compile(r'(?:^|\bhttp[ /]?|\bstatus"?\s*[:=]?\s*|\bcode"?\s*[:=]?\s*)(402|429)\b')
 
-#: Rate-limit markers: River's transient per-account 429 lands as
-#: ``errorMessage`` "429: ... rate_limit_error ... account_rate". pi
-#: auto-retries these, so they are quota only when nothing recovers.
-_RATE_LIMIT_MARKERS = ("429", "rate limit", "rate_limit_error", "account_rate")
+#: A JSON object body (``{"message": ...``), the structured half of a provider error.
+_JSON_BODY = re.compile(r'\{\s*"[^"]+"\s*:')
+
+#: Morph's rate-limit text, returned as a plain error line with no JSON body.
+_MORPH_RATE_LIMIT = "rate limit exceeded"
+
+
+def _status_with_body(text: str, code: str) -> bool:
+    """True when the text names HTTP ``code`` and carries a JSON error body."""
+    return any(m.group(1) == code for m in _STATUS_CODE.finditer(text)) and bool(_JSON_BODY.search(text))
 
 
 def tier_of(model: str | None) -> str:
@@ -126,12 +134,13 @@ def _event_text(ev) -> str:
 
 
 def _credit_hit(text: str) -> bool:
-    """Insufficient credit/quota/balance or HTTP 402: never transient."""
-    return "402" in text or any(word in text for word in _QUOTA_WORDS)
+    """HTTP 402 with a JSON error body: credit or quota exhausted, never transient."""
+    return _status_with_body(text, "402")
 
 
 def _rate_limit_hit(text: str) -> bool:
-    return any(marker in text for marker in _RATE_LIMIT_MARKERS)
+    """HTTP 429 with a JSON error body, or Morph's ``Rate limit exceeded`` text."""
+    return _status_with_body(text, "429") or _MORPH_RATE_LIMIT in text
 
 
 def _recovered(events: list[dict], index: int) -> bool:

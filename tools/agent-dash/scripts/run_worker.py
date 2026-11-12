@@ -85,7 +85,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from dash.caps import as_int, base_model, cap_block  # noqa: E402
+from dash.caps import PgrepFailed, as_int, base_model, cap_block  # noqa: E402
 
 RUN_RULE = (
     "RUN RULE: this is one non-interactive turn. Keep calling tools until the task is complete, "
@@ -559,7 +559,11 @@ def pick_initial(ctx):
         return None, "unknown-tier"
     if not worker.get("enabled", True):
         return None, "disabled"
-    block = cap_block(ctx["registry"], worker, ctx["hooks"]["pgrep"])
+    try:
+        block = cap_block(ctx["registry"], worker, ctx["hooks"]["pgrep"])
+    except PgrepFailed as exc:
+        print(f"cap: {name} refused, cannot count live workers: {exc}; not launching", file=sys.stderr)
+        return None, "none-available"
     if block is not None:
         which, live, limit = block
         print(
@@ -761,7 +765,12 @@ def eligible(ctx, skip):
             continue
         if as_int(worker.get("cap")) is None:
             continue
-        if cap_block(ctx["registry"], worker, ctx["hooks"]["pgrep"]) is not None:
+        try:
+            blocked = cap_block(ctx["registry"], worker, ctx["hooks"]["pgrep"])
+        except PgrepFailed as exc:
+            print(f"auto: skipping {launch_name}: cannot count live workers: {exc}", file=sys.stderr)
+            continue
+        if blocked is not None:
             continue
         return launch_name
     return None
@@ -1217,6 +1226,7 @@ def pid_alive(pid) -> bool:
 
 
 def pgrep_count(pattern: str) -> int:
+    """Live processes matching ``pattern``. Raises ``PgrepFailed`` when the count cannot be read."""
     if not pattern:
         return 0
     cmd = ["pgrep", "-f"]
@@ -1225,10 +1235,13 @@ def pgrep_count(pattern: str) -> int:
     cmd.append(pattern)
     try:
         proc = subprocess.run(cmd, check=False, capture_output=True, text=True, timeout=2)
-    except (OSError, subprocess.TimeoutExpired):
-        return 0
+    except subprocess.TimeoutExpired as exc:
+        raise PgrepFailed(f"pgrep timed out for {pattern!r}") from exc
+    except OSError as exc:
+        raise PgrepFailed(f"pgrep could not run: {exc}") from exc
     if proc.returncode not in (0, 1):
-        return 0
+        detail = (proc.stderr or "").strip() or "no stderr"
+        raise PgrepFailed(f"pgrep exited {proc.returncode} for {pattern!r}: {detail}")
     return len([line for line in proc.stdout.splitlines() if line.strip()])
 
 

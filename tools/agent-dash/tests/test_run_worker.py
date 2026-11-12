@@ -5,6 +5,7 @@ import io
 import json
 import os
 import re
+import sys
 import tempfile
 import time
 import unittest
@@ -12,6 +13,9 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+from dash.caps import PgrepFailed, anchored  # noqa: E402
 SID = "11111111-1111-4111-8111-111111111111"
 NOW = 1_700_000_000.0
 
@@ -128,10 +132,10 @@ class RunWorkerTests(unittest.TestCase):
         return code, buf.getvalue().strip()
 
     def pgrep(self, pattern):
-        # A union of several tiers' patterns (one shared model) counts each part.
-        if pattern.startswith("(") and ")|(" in pattern:
-            return sum(self.counts.get(part, 0) for part in pattern[1:-1].split(")|("))
-        return self.counts.get(pattern, 0)
+        # Counts are keyed by a tier's registry pattern. The caps module asks
+        # with that pattern anchored, or with a union of anchored patterns, so
+        # a key counts when its anchored form appears in the asked pattern.
+        return sum(value for key, value in self.counts.items() if anchored(key) in pattern)
 
     def test_example_lists_the_launch_tiers(self):
         data = shipped_registry()
@@ -357,6 +361,77 @@ class RunWorkerTests(unittest.TestCase):
         with contextlib.redirect_stderr(io.StringIO()):
             code, line = self.go("pi-deepseek-flash", Launch())
         self.assertIn("reason=none-available", line)
+
+    def test_unreadable_pgrep_refuses_the_named_tier_fail_closed(self):
+        def broken(pattern):
+            raise PgrepFailed("pgrep exited 2 for %r: bad regex" % pattern)
+
+        self.pgrep = broken
+        launch = Launch()
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            code, line = self.go("pi-deepseek-flash", launch)
+        self.assertEqual(code, 0)
+        self.assertIn("reason=none-available", line)
+        self.assertEqual(launch.cmds, [])
+        self.assertIn("cannot count live workers", err.getvalue())
+        self.assertIn("bad regex", err.getvalue())
+
+    def test_unreadable_pgrep_skips_every_auto_tier(self):
+        def broken(pattern):
+            raise PgrepFailed("pgrep timed out")
+
+        self.pgrep = broken
+        launch = Launch()
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            code, line = self.go("auto", launch)
+        self.assertIn("reason=none-available", line)
+        self.assertEqual(launch.cmds, [])
+        self.assertIn("cannot count live workers", err.getvalue())
+
+    def test_pgrep_exit_two_raises_instead_of_counting_zero(self):
+        import subprocess as sp
+        from unittest import mock
+
+        bad = sp.CompletedProcess(args=["pgrep"], returncode=2, stdout="", stderr="regex error")
+        with mock.patch.object(runner.subprocess, "run", return_value=bad):
+            with self.assertRaises(PgrepFailed) as caught:
+                runner.pgrep_count("[l]aunch_pi.py.*--tier pi-deepseek-flash(")
+        self.assertIn("regex error", str(caught.exception))
+
+    def test_pgrep_timeout_raises_instead_of_counting_zero(self):
+        import subprocess as sp
+        from unittest import mock
+
+        with mock.patch.object(runner.subprocess, "run", side_effect=sp.TimeoutExpired(cmd="pgrep", timeout=2)):
+            with self.assertRaises(PgrepFailed):
+                runner.pgrep_count("[m]use")
+
+    def test_pgrep_no_match_is_zero_not_an_error(self):
+        import subprocess as sp
+        from unittest import mock
+
+        none = sp.CompletedProcess(args=["pgrep"], returncode=1, stdout="", stderr="")
+        with mock.patch.object(runner.subprocess, "run", return_value=none):
+            self.assertEqual(runner.pgrep_count("[m]use"), 0)
+
+    def test_unanchored_tier_pattern_does_not_count_its_longer_sibling(self):
+        # The fixture's flash pattern has no boundary. Five low runs must not
+        # fill flash's own cap of 5: the count anchors the tier name itself.
+        base = "launch_pi.py ws1 /ws/prompt /out --model river/deepseek-ai/DeepSeek-V4.1-Flash-1017"
+        lines = [base + " --tier pi-deepseek-flash-low"] * 5
+        self.pgrep = self._process_table(lines)
+        launch = Launch()
+        code, line = self.go("pi-deepseek-flash", launch)
+        self.assertIn("STATUS: done", line)
+        self.assertEqual(len(launch.cmds), 1)
+
+    def test_shipped_tier_patterns_are_already_anchored(self):
+        # Every tier pattern in the shipped registry ends in a boundary, so
+        # anchoring it again changes nothing.
+        for name, worker in shipped_registry()["workers"].items():
+            self.assertEqual(anchored(worker["pgrep"]), worker["pgrep"], name)
 
     def test_weak_label_refuses_before_launch(self):
         # No mark, no task match: exit 2 with the fix, nothing spawned,

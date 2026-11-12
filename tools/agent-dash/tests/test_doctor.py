@@ -1270,13 +1270,13 @@ class FleetTest(unittest.TestCase):
 
     def test_over_cap(self):
         registry = {"workers": {"muse": {"cap": 1, "pgrep": "[m]use", "kind": "muse"}}}
-        result = self._collect(workers_registry=registry, pgrep_counts={"[m]use": 3})
+        result = self._collect(workers_registry=registry, pgrep_counts={"([m]use)( |$)": 3})
         found = [item for item in result["problems"] if item["code"] == "over-cap"]
         self.assertEqual(len(found), 1)
         self.assertEqual(found[0]["id"], "over-cap:global")
         self.assertIn("3", found[0]["detail"])
         self.assertEqual(found[0]["fix_command"], "python3 agent_dash.py doctor --all")
-        calm = self._collect(workers_registry=registry, pgrep_counts={"[m]use": 1})
+        calm = self._collect(workers_registry=registry, pgrep_counts={"([m]use)( |$)": 1})
         self.assertFalse([item for item in calm["problems"] if item["code"] == "over-cap"])
 
     def test_over_cap_counts_a_shared_model_pool(self):

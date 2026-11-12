@@ -9,6 +9,8 @@ tiers, so a smaller tier's cap never throttles a bigger one. The tier is its
 own pattern's live count against its own ``cap``.
 
 ``pgrep`` is a callable taking one pattern string and returning a live count.
+It raises ``PgrepFailed`` when the count cannot be read; a cap check then
+refuses the launch rather than counting zero.
 The pool count passes one union pattern over the sharing tiers' patterns, so a
 process that two patterns both match is counted once.
 """
@@ -18,6 +20,25 @@ from __future__ import annotations
 import re
 
 THINKING_SUFFIX = re.compile(r":[A-Za-z]+$")
+#: The word boundary that closes a tier or model name in a pgrep pattern.
+TIER_END = "( |$)"
+
+
+class PgrepFailed(RuntimeError):
+    """A live-process count could not be read. A cap check must refuse, never read it as zero."""
+
+
+def anchored(pattern) -> str:
+    """The pattern with its trailing name closed by a word boundary.
+
+    A tier pattern ends in its tier or model name (``--tier pi-deepseek-flash``),
+    and unanchored it also matches the longer sibling (``--tier pi-deepseek-flash-low``).
+    A pattern already closed by ``( |$)``, or ending in a group, is returned as is.
+    """
+    text = str(pattern or "")
+    if not text or text.endswith(TIER_END) or not re.search(r"[\w.-]$", text):
+        return text
+    return f"({text}){TIER_END}"
 
 
 def as_int(value):
@@ -78,7 +99,8 @@ def pool_capacity(registry, model, pgrep):
     limit = pinned[model] if model in pinned else (max(caps) if caps else None)
     if not patterns:
         return 0, limit
-    union = patterns[0] if len(patterns) == 1 else "|".join(f"({p})" for p in patterns)
+    closed = [anchored(p) for p in patterns]
+    union = closed[0] if len(closed) == 1 else "|".join(f"({p})" for p in closed)
     return pgrep(union), limit
 
 
@@ -97,7 +119,7 @@ def cap_block(registry, worker, pgrep):
     if cap is None:
         return None
     pattern = worker.get("pgrep") or ""
-    own = pgrep(pattern) if pattern else 0
+    own = pgrep(anchored(pattern)) if pattern else 0
     if own >= cap:
         return "tier", own, cap
     return None
@@ -131,7 +153,7 @@ def over_caps(registry, pgrep):
         pattern = worker.get("pgrep") or ""
         if cap is None or not pattern:
             continue
-        live = pgrep(pattern)
+        live = pgrep(anchored(pattern))
         if live > cap:
             findings.append({"which": "tier", "name": name, "tiers": [name], "live": live, "limit": cap})
     return findings
