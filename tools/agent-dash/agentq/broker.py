@@ -80,7 +80,7 @@ DEFAULT_ADAPTIVE = {
     "light_min_free_pct": 20,
     "gauge_ttl_s": 15.0,
 }
-TIER_BUDGETS = {"pi-deepseek-flash": ("total", "output"), "pi-kimi": ("total", "uncached")}
+TIER_BUDGETS = {"pi-deepseek-flash": ("total", "output", "uncached_ds"), "pi-kimi": ("total", "uncached")}
 TIER_FAMILY = {"pi-deepseek-flash": "morph-dsv41flash", "pi-kimi": "morph-kimik31"}
 DEFAULT_AUTO_WORKTREE = {"enabled": True, "root": "~/Documents/worktrees"}
 AUTO_WORKTREE_RETRY_S = 60.0
