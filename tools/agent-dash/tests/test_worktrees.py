@@ -229,6 +229,64 @@ class ReapDecisionsTest(unittest.TestCase):
         row = rows_by_path(rows)[os.path.realpath(path)]
         self.assertEqual(row["decision"], "reap")
 
+    def _detached(self, repo, name):
+        """Detached worktree at the current main tip. Returns its path."""
+        path = repo.parent / (repo.name + "-" + name)
+        git(repo, "worktree", "add", "--detach", str(path), "HEAD")
+        return path
+
+    def test_detached_on_main_is_removed(self):
+        """A detached HEAD whose commit is on origin/main is reaped, and no branch is deleted."""
+        repo = self._repo()
+        path = self._detached(repo, "det-main")
+        make_old(path)
+        top, rows = worktrees.collect(str(repo), worktrees.DEFAULT_MIN_AGE_S, set(), time.time())
+        row = rows_by_path(rows)[os.path.realpath(path)]
+        self.assertEqual(row["decision"], "reap")
+        self.assertIn("ancestor of origin/main", row["reason"])
+        self.assertEqual(
+            cmd_worktrees(["reap", "--repo", str(repo), "--min-age", "0s", "--apply"]),
+            0,
+        )
+        self.assertFalse(Path(path).exists())
+        self.assertEqual(git(repo, "branch", "--list").count("\n"), 0)
+
+    def test_detached_with_own_commit_is_kept(self):
+        """A detached HEAD carrying a commit main lacks is kept."""
+        repo = self._repo()
+        path = self._detached(repo, "det-work")
+        commit_in(path, "lane.txt")
+        make_old(path)
+        top, rows = worktrees.collect(str(repo), worktrees.DEFAULT_MIN_AGE_S, set(), time.time())
+        row = rows_by_path(rows)[os.path.realpath(path)]
+        self.assertEqual(row["decision"], "keep")
+        self.assertIn("not on origin/main", row["reason"])
+        self.assertEqual(
+            cmd_worktrees(["reap", "--repo", str(repo), "--min-age", "0s", "--apply"]),
+            0,
+        )
+        self.assertTrue(Path(path).exists())
+
+    def test_dirty_detached_is_kept(self):
+        """Uncommitted changes keep a detached worktree on main."""
+        repo = self._repo()
+        path = self._detached(repo, "det-dirty")
+        make_old(path)
+        (Path(path) / "scratch.txt").write_text("uncommitted\n", encoding="utf-8")
+        top, rows = worktrees.collect(str(repo), worktrees.DEFAULT_MIN_AGE_S, set(), time.time())
+        row = rows_by_path(rows)[os.path.realpath(path)]
+        self.assertEqual(row["decision"], "keep")
+        self.assertIn("dirty", row["reason"])
+
+    def test_young_detached_is_kept(self):
+        """A detached worktree on main younger than the minimum age waits."""
+        repo = self._repo()
+        path = self._detached(repo, "det-young")
+        top, rows = worktrees.collect(str(repo), worktrees.DEFAULT_MIN_AGE_S, set(), time.time())
+        row = rows_by_path(rows)[os.path.realpath(path)]
+        self.assertEqual(row["decision"], "keep")
+        self.assertIn("younger", row["reason"])
+
     def test_durations_and_main_wiring(self):
         """Duration parsing, table shape, and the agent_dash entry point."""
         self.assertEqual(worktrees.parse_duration("3h"), 10800.0)
@@ -246,6 +304,37 @@ class ReapDecisionsTest(unittest.TestCase):
         self.assertEqual(agent_dash.main(["worktrees", "reap", "--repo", str(repo)]), 0)
         self.assertEqual(agent_dash.main(["worktrees"]), 2)
         self.assertEqual(cmd_worktrees(["reap"]), 2)
+
+
+class MergedPrLookupTest(unittest.TestCase):
+    def setUp(self):
+        worktrees._MERGED_HEADS.clear()
+        self.addCleanup(worktrees._MERGED_HEADS.clear)
+
+    def _fake_gh(self, stdout="", returncode=0):
+        return mock.patch.object(
+            worktrees.subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess(args=["gh"], returncode=returncode, stdout=stdout, stderr=""),
+        )
+
+    def test_one_bulk_call_per_repo_answers_every_branch(self):
+        """Many branch checks cost one gh call, and a branch matches by its head name."""
+        payload = '[{"headRefName": "lane-a"}, {"headRefName": "lane-b"}]'
+        with self._fake_gh(payload) as run:
+            self.assertTrue(worktrees.gh_pr_merged("/repo/x", "lane-a"))
+            self.assertFalse(worktrees.gh_pr_merged("/repo/x", "lane-c"))
+            self.assertTrue(worktrees.gh_pr_merged("/repo/x", "lane-b"))
+        self.assertEqual(run.call_count, 1)
+        self.assertIn("1000", run.call_args.args[0])
+
+    def test_failed_lookup_reads_as_no_merged_pull_requests(self):
+        """A failed gh call keeps the worktree; it is not read as merged."""
+        with self._fake_gh("", returncode=1):
+            self.assertFalse(worktrees.gh_pr_merged("/repo/y", "lane-a"))
+        with mock.patch.object(worktrees.subprocess, "run", side_effect=subprocess.TimeoutExpired("gh", 60)):
+            worktrees._MERGED_HEADS.clear()
+            self.assertFalse(worktrees.gh_pr_merged("/repo/y", "lane-a"))
 
 
 if __name__ == "__main__":

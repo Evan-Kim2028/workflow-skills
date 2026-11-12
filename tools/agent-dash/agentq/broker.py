@@ -11,9 +11,14 @@ why it waits in ``jobs.detail``. Each tick ends by writing ``broker.heartbeat``
 so direct launches can tell the broker is alive.
 
 Workers start through ``scripts/run_worker.py`` with max-wait ``0``, which
-returns at once. The worker runs in its own session, so a broker restart does
-not stop it, and the broker finds it again by pid and identity (start time, or
-the label or run folder in its command line).
+returns at once. The broker runs those launches on a small pool (at most
+``MAX_CONCURRENT_LAUNCHES``), so one slow start never holds up a tick, a
+heartbeat or another job's launch; the pool thread only starts the worker,
+and every database write happens on the broker thread.
+
+The worker runs in its own session, so a broker restart does not stop it, and
+the broker finds it again by pid and identity (start time, or the label or run
+folder in its command line).
 
 A pi run writes its report, QUOTA marker, pi session file and err log under
 ``<run_dir>/pi/`` (``launch_pi.py`` gets that outdir from ``run_worker.py``).
@@ -23,10 +28,20 @@ The run folder itself keeps only the launcher's one summary line in
 Every state change is a conditional update (``db.transition``) from the state
 the decision was made in. A cancel or a finish that lands first wins, and the
 broker's late write matches no row.
+
+A write job whose workspace is the main checkout of a git repo (with an
+``origin`` remote) gets its own worktree at launch, unless it was submitted
+with ``--in-place`` or ``broker.json`` turns ``auto_worktree`` off. The worktree
+is ``<root>/<repo>/agentq-<job id>`` on a new branch ``agentq/<job id>`` from
+``origin/main``. The job's ``workspace`` moves to it and ``orig_workspace``
+keeps the checkout, so the one-writer rule applies per worktree and such jobs
+run in parallel. A failed creation retries after 60 s and fails the job on the
+third try; it never falls back to writing in place.
 """
 
 from __future__ import annotations
 
+import concurrent.futures
 import fcntl
 import json
 import os
@@ -40,9 +55,11 @@ import uuid
 from pathlib import Path
 from typing import NamedTuple
 
+from agentq import backlog as backlog_lib
 from agentq import db
 
 TICK_S = 2.0
+BACKLOG_RETRY_S = 300.0
 MAX_ATTEMPTS = 3
 MAX_RATE_ATTEMPTS = 20
 RATE_BACKOFF_S = 60.0
@@ -64,11 +81,18 @@ DEFAULT_ADAPTIVE = {
     "gauge_ttl_s": 15.0,
 }
 TIER_BUDGETS = {"pi-deepseek-flash": ("total", "output"), "pi-kimi": ("total", "uncached")}
+DEFAULT_AUTO_WORKTREE = {"enabled": True, "root": "~/Documents/worktrees"}
+AUTO_WORKTREE_RETRY_S = 60.0
+AUTO_WORKTREE_MAX_TRIES = 3
+GIT_TIMEOUT_S = 60.0
+LAUNCH_TIMEOUT_S = 120.0
+MAX_CONCURRENT_LAUNCHES = 8
 LAPTOP_GATED = ("tests", "light")
 MEMORY_FREE_LINE = re.compile(r"System-wide memory free percentage:\s*(\d+(?:\.\d+)?)%")
 VERDICT_LINE = re.compile(r"^\W*(?:verdict\W*)?(PASS|PARTIAL|BLOCKED)\b", re.IGNORECASE)
 RATE_LIMIT_BODY = re.compile(r"\b429\b\s*[:\-]?\s*\{|Rate limit exceeded", re.IGNORECASE)
 LAUNCH_LINE_PREFIX = "launched "
+AGENT_DASH_LABEL = Path(__file__).resolve().parents[1] / "agent_dash.py"
 OPEN = db.OPEN_STATES
 ALL_STATES = db.OPEN_STATES + db.TERMINAL_STATES
 
@@ -83,6 +107,10 @@ class CapacityRefused(LaunchError):
 
 class DaemonRunning(RuntimeError):
     """Another broker already holds the daemon lock."""
+
+
+class WorktreeError(RuntimeError):
+    """git could not inspect a workspace or create a job's worktree. The job waits and retries."""
 
 
 class Probe(NamedTuple):
@@ -105,6 +133,7 @@ def load_config(home) -> dict:
         "slots": _caps(DEFAULT_SLOTS, data.get("slots")),
         "tiers": _caps(DEFAULT_TIERS, data.get("tiers")),
         "adaptive": _adaptive(data.get("adaptive")),
+        "auto_worktree": _auto_worktree(data.get("auto_worktree")),
     }
 
 
@@ -133,6 +162,17 @@ def _adaptive(override) -> dict:
                 settings[name] = float(value)
             except (TypeError, ValueError):
                 continue
+    return settings
+
+
+def _auto_worktree(override) -> dict:
+    """Write-job worktree settings. ``enabled: false`` or a root folder override the defaults."""
+    settings = dict(DEFAULT_AUTO_WORKTREE)
+    if isinstance(override, dict):
+        if "enabled" in override:
+            settings["enabled"] = bool(override["enabled"])
+        if isinstance(override.get("root"), str) and override["root"].strip():
+            settings["root"] = override["root"].strip()
     return settings
 
 
@@ -431,18 +471,19 @@ def _read_pid(path) -> int | None:
 def run_worker_launcher(job: dict, run_dir, env: dict) -> int:
     """Start one worker through ``run_worker.py`` (max-wait 0) and return its pid.
 
-    A launcher that times out still counts if it left a pid file: the worker
-    is adopted rather than launched again.
+    The broker has already checked tier and caps, so the launcher skips the
+    dashboard preflight (``--no-preflight``). A launcher that times out still
+    counts if it left a pid file: the worker is adopted rather than launched again.
     """
     run_dir = Path(run_dir)
     run_dir.mkdir(parents=True, exist_ok=True)
     cmd = [
         sys.executable, str(RUN_WORKER), job["tier"], job["label"],
-        job["workspace"], job["prompt_path"], str(run_dir), "0",
+        job["workspace"], job["prompt_path"], str(run_dir), "0", "--no-preflight",
     ]  # fmt: skip
     try:
         proc = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=300, env=env,
+            cmd, capture_output=True, text=True, timeout=LAUNCH_TIMEOUT_S, env=env,
             stdin=subprocess.DEVNULL, start_new_session=True, check=False,
         )  # fmt: skip
     except subprocess.TimeoutExpired:
@@ -538,28 +579,174 @@ def cancel(conn, job: dict, now: float) -> str | None:
     return action if moved else None
 
 
+def label_for(kind: str, slug: str) -> str | None:
+    """A hub label from ``agent_dash.py label make``, or None when it refuses.
+
+    The mark is ``review`` for a review job and ``exec`` otherwise.
+    """
+    mark = "review" if kind == "review" else "exec"
+    cmd = [
+        sys.executable, str(AGENT_DASH_LABEL), "label", "make",
+        "--scope", "hub", "--mark", mark, "--slug", slug,
+    ]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    lines = proc.stdout.strip().splitlines()
+    return lines[-1] if proc.returncode == 0 and lines else None
+
+
+def branch_for(job_id: str) -> str:
+    """The branch a job's auto worktree is created on."""
+    return f"agentq/{job_id}"
+
+
+def worktree_path(root: str, repo: Path, job_id: str) -> Path:
+    """``<root>/<repo name>/agentq-<job id>``, with ``~`` expanded."""
+    return Path(os.path.expanduser(root)) / repo.name / f"agentq-{job_id}"
+
+
+def worktree_note(job: dict) -> str:
+    """``worktree <path> branch <branch>`` for a job that runs in its own worktree, else empty."""
+    if not job.get("orig_workspace"):
+        return ""
+    return f"worktree {job['workspace']} branch {branch_for(job['id'])}"
+
+
+def _short(text: str) -> str:
+    lines = [line.strip() for line in (text or "").splitlines() if line.strip()]
+    return (lines[-1] if lines else "no output")[:200]
+
+
+def _git(cwd, *args, timeout: float = GIT_TIMEOUT_S):
+    """Run ``git -C cwd args``. A missing git or a timeout raises WorktreeError."""
+    try:
+        return subprocess.run(
+            ["git", "-C", str(cwd), *args], capture_output=True, text=True,
+            timeout=timeout, check=False, stdin=subprocess.DEVNULL,
+        )  # fmt: skip
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise WorktreeError(f"git {args[0]} did not run: {_short(str(exc))}") from exc
+
+
+def main_checkout_of(workspace) -> Path | None:
+    """The workspace when it is the main working tree of a git repo with an ``origin`` remote.
+
+    The main working tree is the one whose git common dir is its own ``.git``. A linked
+    worktree points elsewhere, and a subfolder of a checkout resolves to the parent's
+    ``.git``, so both return None, as does a folder that is not a repo or has no origin.
+    A git failure other than "not a git repository" raises WorktreeError.
+    """
+    ws = Path(workspace)
+    if not ws.is_dir():
+        return None
+    probe = _git(ws, "rev-parse", "--git-common-dir")
+    if probe.returncode != 0:
+        if "not a git repository" in probe.stderr.lower():
+            return None
+        raise WorktreeError(f"rev-parse failed: {_short(probe.stderr)}")
+    common = Path(probe.stdout.strip())
+    if not common.is_absolute():
+        common = ws / common
+    if os.path.realpath(common) != os.path.realpath(ws / ".git"):
+        return None
+    if _git(ws, "remote", "get-url", "origin").returncode != 0:
+        return None
+    return ws
+
+
+def plan_worktree(job: dict, settings: dict):
+    """``(repo, worktree path)`` for a queued write job that gets its own worktree, else None.
+
+    Off when auto worktrees are disabled, when the submitter passed ``--in-place``, or when the
+    job already runs in a worktree it was given (a requeued job keeps it).
+    """
+    if not settings["enabled"] or job["in_place"] or job["orig_workspace"]:
+        return None
+    repo = main_checkout_of(job["workspace"])
+    if repo is None:
+        return None
+    return repo, worktree_path(settings["root"], repo, job["id"])
+
+
+def create_worktree(repo: Path, path: Path, branch: str, *, fetch: bool) -> str:
+    """Create ``path`` on a new ``branch`` from ``origin/main``. Returns a note for the log.
+
+    The fetch runs first unless ``fetch`` is False; a failed fetch falls back to the local
+    ``origin/main`` ref and says so in the note. A path or branch left by an earlier attempt
+    is reused when it already holds that branch, so a retry converges.
+    """
+    note = ""
+    if fetch:
+        got = _git(repo, "fetch", "-q", "origin", "main")
+        if got.returncode != 0:
+            note = f"fetch origin main failed, using local origin/main: {_short(got.stderr)}"
+    if _git(repo, "rev-parse", "--verify", "-q", "origin/main^{commit}").returncode != 0:
+        raise WorktreeError("no origin/main ref to branch from")
+    if path.exists():
+        head = _git(path, "rev-parse", "--abbrev-ref", "HEAD")
+        if head.returncode == 0 and head.stdout.strip() == branch:
+            return note
+        raise WorktreeError(f"{path} exists and is not a worktree on {branch}")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise WorktreeError(f"cannot create {path.parent}: {_short(str(exc))}") from exc
+    if _git(repo, "rev-parse", "--verify", "-q", f"refs/heads/{branch}").returncode == 0:
+        added = _git(repo, "worktree", "add", str(path), branch)
+    else:
+        added = _git(repo, "worktree", "add", "-b", branch, str(path), "origin/main")
+    if added.returncode != 0:
+        raise WorktreeError(f"worktree add failed: {_short(added.stderr)}")
+    return note
+
+
+def worktree_prompt(run_dir, job: dict) -> Path:
+    """Copy the job's prompt into its run folder with the worktree instruction as the first line."""
+    line = (
+        f"You are working in a fresh worktree {job['workspace']} on branch {branch_for(job['id'])}, "
+        f"created from origin/main for this job. Commit your work on this branch; "
+        f"do not edit {job['orig_workspace']}."
+    )
+    dest = Path(run_dir) / "prompt-worktree.md"
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_text(line + "\n\n" + _read(job["prompt_path"]), encoding="utf-8")
+    return dest
+
+
 class Broker:
     """One broker over one agentq home. ``launcher``, ``now`` and ``proxy`` are injectable."""
 
-    def __init__(self, home, *, launcher=None, now=time.time, proxy=None, gauges=None):
+    def __init__(self, home, *, launcher=None, now=time.time, proxy=None, gauges=None, launch_pool=None,
+                 labeler=None):
         self.home = Path(home)
         self.launcher = launcher or run_worker_launcher
+        self.labeler = labeler or label_for
         self.now = now
         self.proxy = proxy or proxy_status
         self.gauges = gauges or Gauges(clock=now)
+        self.launch_pool = launch_pool or concurrent.futures.ThreadPoolExecutor(
+            max_workers=MAX_CONCURRENT_LAUNCHES, thread_name_prefix="agentq-launch")
+        self._inflight: dict[str, concurrent.futures.Future] = {}
         self._saturated_last = False
         self._holds: dict[str, tuple[tuple[str, str], float]] = {}
+        self._plans: dict[str, tuple[Path, Path] | None] = {}
+        self._backlog_retry: dict[str, float] = {}
 
     def log(self, message: str) -> None:
         log_line(self.home, message)
 
     def tick(self) -> list[str]:
-        """One pass: reconcile, then launch. Returns the ids launched this tick."""
+        """One pass: reconcile, launch, then submit due backlog jobs. Returns the ids launched this tick."""
         conn = db.connect(self.home)
         try:
             now = self.now()
+            self._collect_launches(conn, now)
             self.reconcile(conn, now)
-            launched = self.launch_ready(conn, now, status=self._proxy_status())
+            status = self._proxy_status()
+            launched = self.launch_ready(conn, now, status=status)
+            self.submit_backlog(conn, now, status)
         finally:
             conn.close()
         write_heartbeat(self.home)
@@ -579,8 +766,14 @@ class Broker:
             handle.close()
 
     def reconcile(self, conn, now: float) -> None:
-        """Adopt, finish, requeue or watch every running job. Runs first each tick."""
+        """Adopt, finish, requeue or watch every running job. Runs first each tick.
+
+        A job whose launch is still in the pool is running with no pid yet; it is
+        skipped here, so its worker is not mistaken for a dead one.
+        """
         for job in db.select_jobs(conn, "state = 'running'"):
+            if job["id"] in self._inflight:
+                continue
             self._reconcile_one(conn, job, now)
 
     def launch_ready(self, conn, now: float, status: dict | None = None) -> list[str]:
@@ -611,9 +804,15 @@ class Broker:
                 gauge_reading.append(self.gauges.read(adaptive["gauge_ttl_s"]))
             return gauge_reading[0]
 
+        worktree_settings = cfg["auto_worktree"]
+        ready_ids = {job["id"] for job in ready}
+        self._plans = {job_id: plan for job_id, plan in self._plans.items() if job_id in ready_ids}
+        fetched: set[Path] = set()
         holds: dict[str, tuple[str, tuple[str, str]]] = {}
         launched: list[str] = []
         for job in order_queue(ready, now):
+            if len(self._inflight) >= MAX_CONCURRENT_LAUNCHES:
+                break
             name, reason = job["res"], None
             if on:
                 reason = morph_hold(job["tier"], job["lane"], status, adaptive["max_waiting_requests"])
@@ -623,7 +822,14 @@ class Broker:
                 name, reason = job["tier"], plain_hold("proxy saturated")
             if reason is None and job["lane"] == "urgent" and others_waiting and urgent_running >= urgent_cap:
                 reason = plain_hold("urgent share full")
-            if reason is None and job["kind"] == "write" and job["workspace"] in busy_workspaces:
+            plan = None
+            if reason is None and job["kind"] == "write":
+                try:
+                    plan = self._worktree_plan(job, worktree_settings)
+                except WorktreeError as exc:
+                    self._worktree_failed(conn, job, now, exc)
+                    continue
+            if reason is None and plan is None and job["kind"] == "write" and job["workspace"] in busy_workspaces:
                 reason = plain_hold("workspace busy")
             if reason is None and slots_free.get(job["res"], 0) <= 0:
                 reason = plain_hold("slots full")
@@ -635,6 +841,10 @@ class Broker:
             if reason:
                 holds[job["id"]] = (name, reason)
                 continue
+            if plan is not None:
+                job = self._prepare_worktree(conn, job, plan, now, fetched)
+                if job is None:
+                    continue
             slots_free[job["res"]] -= 1
             tier_used[job["tier"]] = tier_used.get(job["tier"], 0) + 1
             res_used[job["res"]] = res_used.get(job["res"], 0) + 1
@@ -645,6 +855,7 @@ class Broker:
             if self._launch(conn, job, now):
                 launched.append(job["id"])
             self._holds.pop(job["id"], None)
+        self._collect_launches(conn, now)
         self._record_holds(conn, now, ready, holds)
         return launched
 
@@ -676,6 +887,63 @@ class Broker:
             db.transition(conn, job_id, ("queued",), now, None, "", detail=message)
             self.log(f"{message} (job {job_id})")
 
+    def submit_backlog(self, conn, now: float, status: dict | None) -> list[str]:
+        """Queue one job per due backlog template whose Morph budgets are idle. Returns the new job ids.
+
+        A template with a queued or running job waits. The Morph gate is the same one a
+        backlog job meets at launch (``morph_hold``), so no request queues behind a template. With no
+        proxy status there is no headroom to read, so nothing is submitted. A refused label
+        is retried after ``BACKLOG_RETRY_S``.
+        """
+        if status is None:
+            return []
+        max_waiting = load_config(self.home)["adaptive"]["max_waiting_requests"]
+        submitted = []
+        for template in backlog_lib.select_all(conn):
+            name = template["name"]
+            if not backlog_lib.is_due(template, now) or self._backlog_retry.get(name, 0.0) > now:
+                continue
+            if backlog_lib.open_job(conn, name) is not None:
+                continue
+            if morph_hold(backlog_lib.tier_for(template), "backlog", status, max_waiting) is not None:
+                continue
+            job_id = self._backlog_job(conn, template, now)
+            if job_id is not None:
+                submitted.append(job_id)
+        return submitted
+
+    def _backlog_job(self, conn, template: dict, now: float) -> str | None:
+        """Write one template's prompt into a new job folder and queue the job. Returns the job id, or None."""
+        name = template["name"]
+        retry_at = now + BACKLOG_RETRY_S
+        try:
+            body = Path(template["prompt_path"]).read_text(encoding="utf-8")
+        except OSError as exc:
+            self._backlog_retry[name] = retry_at
+            self.log(f"backlog {name}: prompt unreadable ({exc}); retry in {int(BACKLOG_RETRY_S)}s")
+            return None
+        label = self.labeler(template["kind"], backlog_lib.label_slug(name))
+        if label is None:
+            self._backlog_retry[name] = retry_at
+            self.log(f"backlog {name}: label make refused; retry in {int(BACKLOG_RETRY_S)}s")
+            return None
+        job_id = db.new_job_id()
+        prompt = db.job_dir(self.home, job_id) / "prompt.md"
+        prompt.parent.mkdir(parents=True, exist_ok=True)
+        prompt.write_text(backlog_lib.preamble_for(template["kind"], body), encoding="utf-8")
+        job = {
+            "id": job_id, "lane": "backlog", "kind": template["kind"], "res": template["res"],
+            "tier": backlog_lib.tier_for(template), "label": label, "workspace": template["workspace"],
+            "session": backlog_lib.SESSION, "harness": backlog_lib.SESSION, "prompt_path": str(prompt),
+        }  # fmt: skip
+        if template["max_runtime_s"]:
+            job["max_runtime_s"] = template["max_runtime_s"]
+        with db.tx(conn):
+            db.insert_job(conn, job, now)
+            backlog_lib.mark_submitted(conn, name, now)
+        self.log(f"backlog {name} submitted {job_id} ({label})")
+        return job_id
+
     def _proxy_status(self) -> dict | None:
         """The proxy status for this tick (None when down). Logs each change of its saturated flag."""
         status = self.proxy()
@@ -684,6 +952,54 @@ class Broker:
             self.log(f"proxy saturated={saturated}")
         self._saturated_last = saturated
         return status
+
+    def _worktree_plan(self, job: dict, settings: dict):
+        """The job's worktree plan, cached until it launches or leaves the queue."""
+        if job["id"] not in self._plans:
+            self._plans[job["id"]] = plan_worktree(job, settings)
+        return self._plans[job["id"]]
+
+    def _prepare_worktree(self, conn, job: dict, plan, now: float, fetched: set) -> dict | None:
+        """Create the job's worktree and point the job at it. Returns the updated job, or None.
+
+        None means the job stays queued: the creation failed (retry scheduled) or the job
+        moved on (cancelled) before the change was recorded.
+        """
+        repo, path = plan
+        try:
+            note = create_worktree(repo, path, branch_for(job["id"]), fetch=repo not in fetched)
+        except WorktreeError as exc:
+            self._worktree_failed(conn, job, now, exc)
+            return None
+        fetched.add(repo)
+        if not db.transition(conn, job["id"], ("queued",), now, "auto-worktree", str(path),
+                             workspace=str(path), orig_workspace=job["workspace"], detail=None):  # fmt: skip
+            return None
+        self._plans.pop(job["id"], None)
+        if note:
+            self.log(f"{job['id']} {note}")
+        self.log(f"auto-worktree {job['id']} {path}")
+        return {**job, "workspace": str(path), "orig_workspace": job["workspace"]}
+
+    def _worktree_failed(self, conn, job: dict, now: float, exc: Exception) -> None:
+        """Count one failed worktree attempt. The job retries after a minute; the third failure fails it.
+
+        The job never falls back to writing in place: that is the hazard this step removes.
+        The attempt count lives in the events table, so it survives a broker restart.
+        """
+        self._holds.pop(job["id"], None)
+        self._plans.pop(job["id"], None)
+        tries = db.count_events(conn, job["id"], "auto-worktree-failed") + 1
+        if tries >= AUTO_WORKTREE_MAX_TRIES:
+            reason = f"auto-worktree failed after {tries} tries: {exc}"
+            db.transition(conn, job["id"], ("queued",), now, "failed", reason,
+                          state="failed", finished_at=now, detail=reason)  # fmt: skip
+            self.log(f"{job['id']} failed: {reason}")
+            return
+        message = f"auto-worktree failed: {exc}"
+        db.transition(conn, job["id"], ("queued",), now, "auto-worktree-failed", str(exc),
+                      detail=message, not_before=now + AUTO_WORKTREE_RETRY_S)  # fmt: skip
+        self.log(f"{job['id']} {message}; retry in {int(AUTO_WORKTREE_RETRY_S)}s")
 
     def _move(self, conn, job_id: str, from_states, now: float, kind: str | None, note: str, **fields) -> bool:
         moved = db.transition(conn, job_id, from_states, now, kind, note, **fields)
@@ -758,6 +1074,7 @@ class Broker:
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_text(text, encoding="utf-8")
         verdict = verdict_of(text)
+        note = "; ".join(part for part in (note, worktree_note(job)) if part)
         self._move(
             conn, job["id"], ("running",), now, "finish", f"verdict {verdict}" + (f"; {note}" if note else ""),
             state="done", verdict=verdict, report_path=str(dest), finished_at=now,
@@ -811,8 +1128,49 @@ class Broker:
             capacity_refusals=streak, not_before=now + CAPACITY_RETRY_S,
         )  # fmt: skip
 
+    def _collect_launches(self, conn, now: float) -> None:
+        """Record the outcome of every finished launch. Runs on the broker thread only.
+
+        A launch that was cancelled while in the pool still ends here: its worker is
+        stopped, because the ``started`` write no longer matches a running job.
+        """
+        for job_id, future in list(self._inflight.items()):
+            if not future.done():
+                continue
+            del self._inflight[job_id]
+            job = db.get_job(conn, job_id)
+            try:
+                pid, found, pgid = future.result()
+            except CapacityRefused as exc:
+                self._capacity_refused(conn, job, now, str(exc))
+                continue
+            except Exception as exc:  # a LaunchError, or a launcher bug: the job's attempt logic decides
+                self._death(conn, job, now, f"launch failed: {exc}")
+                continue
+            if not self._move(
+                conn, job_id, ("running",), now, "started", f"pid {pid}",
+                pid=pid, pgid=pgid, pid_start=found.start, capacity_refusals=0,
+            ):  # fmt: skip
+                kill_group(pgid)
+                self.log(f"{job_id} cancelled during launch; stopped pid {pid}")
+
+    def _start_worker(self, job: dict, run_dir, env: dict):
+        """Pool thread: run the launcher and identify the pid it returns. No database access."""
+        pid = self.launcher(job, run_dir, env)
+        found = probe(pid)
+        for _ in range(PROBE_RETRIES - 1):
+            if found.state != "unknown":
+                break
+            found = probe(pid)
+        return pid, found, process_group(pid)
+
     def _launch(self, conn, job: dict, now: float) -> bool:
-        """Start one queued job. Returns False when it was cancelled before the launch."""
+        """Mark one queued job running and hand its worker start to the launch pool.
+
+        The job stays ``running`` with no pid until ``_collect_launches`` records the
+        result, which is how a cancel during the launch is recognised.
+        Returns False when the job was cancelled before the launch began.
+        """
         previous = job["run_dir"]
         run_dir = db.job_dir(self.home, job["id"]) / "runs" / uuid.uuid4().hex[:8]
         if not self._move(
@@ -827,24 +1185,8 @@ class Broker:
         resume = resume_file(previous, job["pi_session"])
         if resume:
             env["AGENTQ_RESUME_SESSION"] = resume
-        try:
-            pid = self.launcher(job, run_dir, env)
-        except CapacityRefused as exc:
-            self._capacity_refused(conn, job, now, str(exc))
-            return False
-        except LaunchError as exc:
-            self._death(conn, job, now, f"launch failed: {exc}")
-            return False
-        found = probe(pid)
-        for _ in range(PROBE_RETRIES - 1):
-            if found.state != "unknown":
-                break
-            found = probe(pid)
-        if not self._move(
-            conn, job["id"], ("running",), now, "started", f"pid {pid}",
-            pid=pid, pgid=process_group(pid), pid_start=found.start, capacity_refusals=0,
-        ):  # fmt: skip
-            kill_group(process_group(pid))
-            self.log(f"{job['id']} cancelled during launch; stopped pid {pid}")
-            return False
+        launch_job = job
+        if job["orig_workspace"]:
+            launch_job = {**job, "prompt_path": str(worktree_prompt(run_dir, job))}
+        self._inflight[job["id"]] = self.launch_pool.submit(self._start_worker, launch_job, run_dir, env)
         return True

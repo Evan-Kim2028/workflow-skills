@@ -77,16 +77,17 @@ DEFAULT_CONFIG = {
     "charge_basis": "billed",
     "calendar_jitter_s": 1.5,
     "budgets": {
-        "total": {"limit": 10_000_000},
-        "output": {"limit": 70_000, "model_prefix": "morph-dsv41flash"},
-        "uncached": {"limit": 24_290, "model": "morph-kimik31"},
+        "total": {"limit_type": "total", "limit": 10_000_000},
+        "output": {"limit_type": "output", "limit": 70_000, "model_prefix": "morph-dsv41flash"},
+        "uncached": {"limit_type": "uncached", "limit": 24_290, "model": "morph-kimik31"},
+        "uncached_ds": {"limit_type": "uncached", "limit": 400_000, "model_prefix": "morph-dsv41flash"},
     },
 }
 
 SATURATION_WAIT_S = 2.0
 LANE_CACHE_S = 2.0
 LANE_CACHE_MAX = 10_000
-PREFIX_STORE_JOBS = 64
+PREFIX_STORE_JOBS = 256
 ANONYMOUS_JOBS = frozenset({"", "none"})
 BLOCK_CHARS = 1024
 LARGE_BODY = 256 * 1024
@@ -97,6 +98,7 @@ MAX_429_BODY = 1024 * 1024
 MAX_WHOLE_BODY = 8 * 1024 * 1024
 READ_CHUNK = 64 * 1024
 ROW_WAIT_SAMPLES = 500
+UPSTREAM_RECENT_S = 60.0
 
 HOP_BY_HOP = frozenset(
     {
@@ -125,6 +127,7 @@ LIMIT_PATTERNS = (
     ("uncached", re.compile(r"Limit:\s*(\d+)\s+uncached input tokens/minute")),
     ("total", re.compile(r"Limit:\s*(\d+)\s+tokens/minute")),
 )
+LIMIT_TYPES = tuple(name for name, _ in LIMIT_PATTERNS)
 
 PROXY_JOBS_DDL = """
 CREATE TABLE IF NOT EXISTS proxy_jobs (
@@ -163,9 +166,23 @@ CREATE TABLE IF NOT EXISTS proxy_minutes (
     input INT, cache_read INT, output INT, uncached_est INT,
     wait_p50_ms INT, wait_p95_ms INT,
     target REAL,
+    upstream_ms_sum INT, upstream_n INT, upstream_p50_ms INT, upstream_p95_ms INT,
+    ttfb_p50_ms INT, in_flight_max INT,
     PRIMARY KEY (minute, model)
 )
 """
+PROXY_MINUTES_ADDED_COLUMNS = (
+    ("upstream_ms_sum", "INT"),
+    ("upstream_n", "INT"),
+    ("upstream_p50_ms", "INT"),
+    ("upstream_p95_ms", "INT"),
+    ("ttfb_p50_ms", "INT"),
+    ("in_flight_max", "INT"),
+)
+MINUTE_SEED_COLUMNS = (
+    "req", "ok", "r429", "input", "cache_read", "output", "uncached_est",
+    "upstream_ms_sum", "upstream_n", "in_flight_max",
+)
 
 
 PROXY_CALIB_DDL = """
@@ -268,11 +285,16 @@ def tokens_for_chars(chars: int) -> int:
 
 
 def prefix_blocks(text: str) -> tuple[bytes, ...]:
-    """Fixed-size block digests of a prompt. A job keeps these instead of the prompt text."""
-    return tuple(
-        hashlib.blake2b(text[start : start + BLOCK_CHARS].encode("utf-8", "replace"), digest_size=8).digest()
-        for start in range(0, len(text), BLOCK_CHARS)
-    )
+    """Cumulative digests of a prompt's fixed-size blocks: entry k digests the first k+1 blocks. A job keeps
+    these instead of the prompt text, and two prompts share their first k+1 blocks exactly when entry k
+    matches, so a shared prefix is found with one comparison per probe."""
+    chain = b""
+    digests = []
+    for start in range(0, len(text), BLOCK_CHARS):
+        piece = text[start : start + BLOCK_CHARS].encode("utf-8", "replace")
+        chain = hashlib.blake2b(chain + piece, digest_size=8).digest()
+        digests.append(chain)
+    return tuple(digests)
 
 
 def is_anonymous(job: str) -> bool:
@@ -292,13 +314,16 @@ def anonymous_key(blocks: tuple[bytes, ...]) -> str:
 
 
 def _common_blocks(previous: tuple[bytes, ...], blocks: tuple[bytes, ...]) -> int:
-    """How many leading whole blocks two prompts share."""
-    common = 0
-    for old, new in zip(previous, blocks):
-        if old != new:
-            break
-        common += 1
-    return common
+    """How many leading whole blocks two prompts share. Entries are cumulative, so entry k matches exactly
+    when the first k+1 blocks match. That is monotone, and a binary search finds the boundary in log steps."""
+    low, high = 0, min(len(previous), len(blocks))
+    while low < high:
+        middle = (low + high + 1) // 2
+        if previous[middle - 1] == blocks[middle - 1]:
+            low = middle
+        else:
+            high = middle - 1
+    return low
 
 
 def percentile(sorted_values: list[float], fraction: float) -> float:
@@ -337,20 +362,20 @@ def _as_int(value: object) -> int:
         return 0
 
 
-def estimate_for(budget_name: str, prompt: int, output: int, uncached: int) -> int:
+def estimate_for(limit_type: str, prompt: int, output: int, uncached: int) -> int:
     """Token cost a request is expected to add to one budget before its real usage arrives."""
-    if budget_name == "output":
+    if limit_type == "output":
         return output
-    if budget_name == "uncached":
+    if limit_type == "uncached":
         return uncached
     return prompt + output
 
 
-def reserved_for(budget_name: str, prompt: int, requested: int, uncached: int) -> int:
+def reserved_for(limit_type: str, prompt: int, requested: int, uncached: int) -> int:
     """Charge for a reservation: the requested max_tokens counts in full, as if Morph held it for the minute."""
-    if budget_name == "output":
+    if limit_type == "output":
         return requested
-    if budget_name == "uncached":
+    if limit_type == "uncached":
         return uncached
     return prompt + requested
 
@@ -426,19 +451,34 @@ def read_lane(db_path: Path, job: str) -> str:
 
 
 def empty_minute_row() -> dict:
-    return {"req": 0, "ok": 0, "r429": 0, "input": 0, "cache_read": 0, "output": 0, "uncached_est": 0, "waits": []}
+    return {
+        "req": 0, "ok": 0, "r429": 0, "input": 0, "cache_read": 0, "output": 0, "uncached_est": 0,
+        "upstream_ms_sum": 0, "upstream_n": 0, "in_flight_max": 0,
+        "waits": [], "upstream_samples": [], "ttfb_samples": [],
+    }
+
+
+def ensure_minutes_schema(connection: sqlite3.Connection) -> None:
+    """Create proxy_minutes, then add each latency column an older table lacks. Safe to run every time."""
+    connection.execute(PROXY_MINUTES_DDL)
+    present = {row[1] for row in connection.execute("PRAGMA table_info(proxy_minutes)")}
+    for name, kind in PROXY_MINUTES_ADDED_COLUMNS:
+        if name not in present:
+            connection.execute(f"ALTER TABLE proxy_minutes ADD COLUMN {name} {kind}")
 
 
 def read_minute_counts(db_path: Path, minute: str, model: str) -> dict | None:
-    """The counters already stored for one model and minute, or None. Waits start empty. Read-only."""
+    """The counters already stored for one model and minute, or None. Waits and latency samples start
+    empty; the latency sums and counts carry over. Columns an older table lacks read as zero. Read-only."""
     try:
         connection = sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=ro", uri=True, timeout=1.0)
         try:
+            present = {row[1] for row in connection.execute("PRAGMA table_info(proxy_minutes)")}
+            selected = [name for name in MINUTE_SEED_COLUMNS if name in present]
             found = connection.execute(
-                "SELECT req, ok, r429, input, cache_read, output, uncached_est FROM proxy_minutes "
-                "WHERE minute = ? AND model = ?",
+                f"SELECT {', '.join(selected)} FROM proxy_minutes WHERE minute = ? AND model = ?",
                 (minute, model),
-            ).fetchone()
+            ).fetchone() if selected else None
         finally:
             connection.close()
     except sqlite3.Error:
@@ -446,9 +486,16 @@ def read_minute_counts(db_path: Path, minute: str, model: str) -> dict | None:
     if found is None:
         return None
     row = empty_minute_row()
-    for name, value in zip(("req", "ok", "r429", "input", "cache_read", "output", "uncached_est"), found):
+    for name, value in zip(selected, found):
         row[name] = int(value or 0)
     return row
+
+
+def sample_percentile_ms(samples: list[int], fraction: float) -> int | None:
+    """The fraction-th percentile of recorded millisecond samples, or None when there are none."""
+    if not samples:
+        return None
+    return round(percentile(sorted(samples), fraction))
 
 
 def write_minute_rows(db_path: Path, rows: list[tuple]) -> None:
@@ -458,8 +505,8 @@ def write_minute_rows(db_path: Path, rows: list[tuple]) -> None:
     try:
         connection.execute("PRAGMA busy_timeout = 5000")
         connection.execute("PRAGMA journal_mode = WAL")
-        connection.execute(PROXY_MINUTES_DDL)
-        connection.executemany("INSERT OR REPLACE INTO proxy_minutes VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", rows)
+        ensure_minutes_schema(connection)
+        connection.executemany("INSERT OR REPLACE INTO proxy_minutes VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
         connection.commit()
     finally:
         connection.close()
@@ -501,11 +548,16 @@ class Entry:
 
 @dataclass(eq=False)
 class Budget:
-    """A rolling-window token budget with a learned limit and a target fraction of it."""
+    """A rolling-window token budget with a learned limit and a target fraction of it.
+
+    limit_type says which Morph limit this budget tracks (total, output or uncached). A stated limit
+    is only ever adopted by a budget with the same limit_type that applies to the refused model.
+    """
 
     name: str
     limit: int
     target: float
+    limit_type: str = "total"
     model_prefix: str | None = None
     model: str | None = None
     hold_s: float = 600.0
@@ -611,10 +663,14 @@ class Governor:
                 raise ValueError(f"budget {name}: window_mode must be one of {WINDOW_MODES}, not {window_mode!r}")
             if charge_basis not in CHARGE_BASES:
                 raise ValueError(f"budget {name}: charge_basis must be one of {CHARGE_BASES}, not {charge_basis!r}")
+            limit_type = spec.get("limit_type", name)
+            if limit_type not in LIMIT_TYPES:
+                raise ValueError(f"budget {name}: limit_type must be one of {LIMIT_TYPES}, not {limit_type!r}")
             self.budgets[name] = Budget(
                 name=name,
                 limit=int(spec["limit"]),
                 target=float(config["start_target"]),
+                limit_type=limit_type,
                 model_prefix=spec.get("model_prefix"),
                 model=spec.get("model"),
                 hold_s=hold_s,
@@ -629,6 +685,8 @@ class Governor:
         self.prefixes: OrderedDict[str, tuple[int, tuple[bytes, ...]]] = OrderedDict()
         self.lane_cache: dict[str, tuple[str, float]] = {}
         self.minute_rows: dict[tuple[str, str], dict] = {}
+        self.in_flight: dict[str, int] = {}
+        self.upstream_recent: deque[tuple[float, str, float]] = deque()
         self.dirty: set[tuple[str, str]] = set()
         self.job_rows: dict[tuple[str, str], dict] = {}
         self.waits: deque[tuple[float, float]] = deque()
@@ -778,18 +836,16 @@ class Governor:
         prompt = tokens_for_chars(length)
         requested = _as_int(max_tokens)
         output = self.output_estimate(model, max_tokens)
-        uncached_budget = self.budgets.get("uncached")
+        applicable = [b for b in self.budgets.values() if b.applies(model)]
         uncached = 0
-        if uncached_budget is not None and uncached_budget.applies(model):
+        if any(b.limit_type == "uncached" for b in applicable):
             uncached = self.uncached_estimate(job, length, blocks)
         estimates: dict[str, int] = {}
-        for b in self.budgets.values():
-            if not b.applies(model):
-                continue
+        for b in applicable:
             if b.charge_basis == PROMPT_PLUS_MAX:
-                estimates[b.name] = reserved_for(b.name, prompt, requested, uncached)
+                estimates[b.name] = reserved_for(b.limit_type, prompt, requested, uncached)
             else:
-                estimates[b.name] = estimate_for(b.name, prompt, output, uncached)
+                estimates[b.name] = estimate_for(b.limit_type, prompt, output, uncached)
         return Ticket(
             job=job,
             lane=lane,
@@ -914,8 +970,17 @@ class Governor:
         if ticket.future is not None and not ticket.future.done():
             ticket.future.set_result(None)
 
-    def finish_ok(self, ticket: Ticket, usage: dict | None) -> None:
-        """Replace the estimates with real usage. Without usage the estimate stays, which errs on the safe side."""
+    def finish_ok(
+        self,
+        ticket: Ticket,
+        usage: dict | None,
+        upstream_s: float | None = None,
+        ttfb_s: float | None = None,
+    ) -> None:
+        """Replace the estimates with real usage. Without usage the estimate stays, which errs on the safe side.
+
+        upstream_s and ttfb_s, when given, are this request's latency; they are recorded in the minute it completes.
+        """
         now = self.clock()
         prompt = cached = output = 0
         real: dict[str, int] = {}
@@ -924,7 +989,7 @@ class Governor:
             real = {"total": prompt + output, "output": output, "uncached": prompt - cached}
         for budget, entry in ticket.holds:
             if budget.charge_basis == BILLED:
-                entry.amount = real.get(budget.name, entry.amount)
+                entry.amount = real.get(budget.limit_type, entry.amount)
             entry.done = True
             entry.at = now
         ticket.holds = []
@@ -942,6 +1007,38 @@ class Governor:
         counters["input"] += prompt - cached
         counters["cache_read"] += cached
         counters["output"] += output
+        if upstream_s is not None and ttfb_s is not None:
+            self.note_latency(ticket, upstream_s, ttfb_s)
+
+    def note_latency(self, ticket: Ticket, upstream_s: float, ttfb_s: float) -> None:
+        """Record one successful request's upstream time and time to first byte in the minute it completes."""
+        row = self.row(ticket.model)
+        upstream_ms = round(upstream_s * 1000)
+        row["upstream_ms_sum"] += upstream_ms
+        row["upstream_n"] += 1
+        if len(row["upstream_samples"]) < ROW_WAIT_SAMPLES:
+            row["upstream_samples"].append(upstream_ms)
+        if len(row["ttfb_samples"]) < ROW_WAIT_SAMPLES:
+            row["ttfb_samples"].append(round(ttfb_s * 1000))
+        now = self.clock()
+        self.upstream_recent.append((now, ticket.model, upstream_s))
+        while self.upstream_recent and self.upstream_recent[0][0] < now - UPSTREAM_RECENT_S:
+            self.upstream_recent.popleft()
+
+    def upstream_started(self, ticket: Ticket) -> None:
+        """Count one upstream request now in flight for its model. The minute's peak is the most seen at any start."""
+        model = ticket.model
+        self.in_flight[model] = self.in_flight.get(model, 0) + 1
+        row = self.row(model)
+        row["in_flight_max"] = max(row["in_flight_max"], self.in_flight[model])
+
+    def upstream_finished(self, ticket: Ticket) -> None:
+        """Count one upstream request that has ended, whatever its outcome."""
+        remaining = self.in_flight.get(ticket.model, 0) - 1
+        if remaining > 0:
+            self.in_flight[ticket.model] = remaining
+        else:
+            self.in_flight.pop(ticket.model, None)
 
     def release(self, ticket: Ticket) -> None:
         """Drop a charge that upstream did not bill: a 429, an error, a truncated stream, or a client that left."""
@@ -952,26 +1049,32 @@ class Governor:
             entry.at = now
         ticket.holds = []
 
-    def learn_from_429(self, ticket: Ticket, body_text: str) -> None:
-        """Adopt a stated limit when the body names one; cut the target of the budget it names.
+    def budgets_for_limit(self, limit_type: str, model: str) -> list[Budget]:
+        """The budgets that track a stated limit type and apply to the model that was refused."""
+        return [b for b in self.budgets.values() if b.limit_type == limit_type and b.applies(model)]
 
-        A body that names no limit cuts every budget the request touched. service_overloaded
-        is a platform-wide signal, so it cuts the total budget only. A budget is cut at most once
-        per fast_interval_s: a burst of 429s is one cut, and each 429 still counts and refreshes
-        last_429.
+    def learn_from_429(self, ticket: Ticket, body_text: str) -> None:
+        """Adopt a stated limit when the body names one; cut the target of the budgets it names.
+
+        A stated limit goes only to budgets with its limit type that apply to the ticket's model,
+        so one model's 429 never rewrites another model's limit. A body that names no usable limit
+        cuts every budget the request touched. service_overloaded is a platform-wide signal, so it
+        cuts the total budget only. A budget is cut at most once per fast_interval_s: a burst of 429s
+        is one cut, and each 429 still counts and refreshes last_429.
         """
         now = self.clock()
         self.row(ticket.model)["r429"] += 1
         self.job_counters(ticket)["r429"] += 1
-        self.note_calib_429(body_text)
         stated = parse_stated_limit(body_text)
-        if stated is not None:
-            name, limit = stated
-            targets = [self.budgets[name]] if name in self.budgets else []
-            for budget in targets:
+        named = self.budgets_for_limit(stated[0], ticket.model) if stated is not None else []
+        self.note_calib_429(body_text, [b.name for b in named])
+        if named:
+            limit = stated[1]
+            for budget in named:
                 if budget.limit != limit:
                     self.log("limit_adopted", budget=budget.name, old=budget.limit, new=limit)
                     budget.limit = limit
+            targets = named
         elif "service_overloaded" in body_text:
             targets = [self.budgets["total"]] if "total" in self.budgets else []
         else:
@@ -1055,6 +1158,7 @@ class Governor:
         row = self.minute_rows.get(key)
         if row is None:
             row = read_minute_counts(self.db_path, key[0], model) or empty_minute_row()
+            row["in_flight_max"] = max(row["in_flight_max"], self.in_flight.get(model, 0))
             self.minute_rows[key] = row
         self.dirty.add(key)
         return row
@@ -1124,6 +1228,8 @@ class Governor:
                 continue
             minute, model = key
             waits = sorted(row["waits"])
+            upstream = row["upstream_samples"]
+            ttfb = row["ttfb_samples"]
             target = min((b.target for b in self.budgets.values() if b.applies(model)), default=0.0)
             rows.append(
                 (
@@ -1139,6 +1245,12 @@ class Governor:
                     round(percentile(waits, 0.5) * 1000),
                     round(percentile(waits, 0.95) * 1000),
                     target,
+                    row["upstream_ms_sum"],
+                    row["upstream_n"],
+                    sample_percentile_ms(upstream, 0.5),
+                    sample_percentile_ms(upstream, 0.95),
+                    sample_percentile_ms(ttfb, 0.5),
+                    row["in_flight_max"],
                 )
             )
         self.dirty.clear()
@@ -1183,9 +1295,9 @@ class Governor:
         overall["billed"] += billed
         family["billed"] += billed
 
-    def note_calib_429(self, body_text: str) -> None:
-        """Log one upstream 429 with the current minute so far: where in the minute it fell, which budget
-        the body names, and the admitted and billed totals for this minute."""
+    def note_calib_429(self, body_text: str, budget_names: list[str]) -> None:
+        """Log one upstream 429 with the current minute so far: where in the minute it fell, the budgets
+        the body's stated limit was applied to, and the admitted and billed totals for this minute."""
         now = self.wall()
         minute = minute_stamp(now)
         record = self.calib_record(minute)
@@ -1198,7 +1310,8 @@ class Governor:
         self.log(
             "calib",
             minute=minute,
-            budget=stated[0] if stated else None,
+            limit_type=stated[0] if stated else None,
+            budget=",".join(budget_names) or None,
             sec=second,
             first_429_s=record["first_429_s"],
             r429=record["r429"],
@@ -1236,6 +1349,23 @@ class Governor:
             del self.calib[minute]
         return rows
 
+    def upstream_status(self, now: float) -> dict:
+        """Upstream requests in flight now per model, and the last minute's p50 and p95 upstream time per model."""
+        while self.upstream_recent and self.upstream_recent[0][0] < now - UPSTREAM_RECENT_S:
+            self.upstream_recent.popleft()
+        by_model: dict[str, list[int]] = {}
+        for _, model, upstream_s in self.upstream_recent:
+            by_model.setdefault(model, []).append(round(upstream_s * 1000))
+        last = {
+            model: {
+                "n": len(values),
+                "p50_ms": sample_percentile_ms(values, 0.5),
+                "p95_ms": sample_percentile_ms(values, 0.95),
+            }
+            for model, values in by_model.items()
+        }
+        return {"in_flight": dict(self.in_flight), "last_60s": last}
+
     def status(self) -> dict:
         now = self.clock()
         window = self.window
@@ -1254,6 +1384,7 @@ class Governor:
                 "used_60s": self._used(budget),
                 "queued": per_lane,
                 "saturated": budget.saturated,
+                "limit_type": budget.limit_type,
                 "window_mode": budget.window_mode,
                 "charge_basis": budget.charge_basis,
             }
@@ -1266,6 +1397,7 @@ class Governor:
             "queued": {lane: len(self.queues[lane]) for lane in LANES},
             "errors": dict(self.errors),
             "budgets": budgets,
+            "upstream": self.upstream_status(now),
         }
 
 
@@ -1817,8 +1949,10 @@ class Proxy:
                 return
             upstream = None
             sent_at = gov.clock()
+            gov.upstream_started(ticket)
             try:
                 upstream = await self.open_upstream(method, path, headers, body)
+                ttfb_s = gov.clock() - sent_at
                 if upstream.status == 429:
                     raw = await read_all(upstream.reader, upstream.headers, MAX_429_BODY, idle_s)
                     gov.note_upstream(ticket, gov.clock() - sent_at)
@@ -1853,9 +1987,10 @@ class Proxy:
                     await send_chunk(client, chunk)
                 await end_chunks(client)
                 scanner.finish()
-                gov.note_upstream(ticket, gov.clock() - sent_at)
+                upstream_s = gov.clock() - sent_at
+                gov.note_upstream(ticket, upstream_s)
                 if upstream.status == 200:
-                    gov.finish_ok(ticket, scanner.usage)
+                    gov.finish_ok(ticket, scanner.usage, upstream_s=upstream_s, ttfb_s=ttfb_s)
                 else:
                     gov.release(ticket)
                 gov.log(
@@ -1885,6 +2020,7 @@ class Proxy:
                     await self._fail(client, status, json.dumps({"error": kind}).encode())
                 return
             finally:
+                gov.upstream_finished(ticket)
                 if upstream is not None:
                     upstream.close()
 

@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import calendar
 import json
+import math
 import os
 import re
 import sqlite3
@@ -33,6 +34,31 @@ BUCKET_S = {1: 60, 6: 60, 24: 300, 168: 1800}
 DEFAULT_HOURS = 6
 RECENT_JOBS = 200
 LIMIT_WINDOW_MINUTES = 5
+TOKEN_BUCKET_S = {1: 300, 6: 300, 24: 300, 168: 1800}
+AVERAGE_SATURATION_FRAC = 0.90
+ROOM_FRAC = 0.95
+POOL_IDLE_FRAC = 0.85
+MORPH_429_MINUTES = 2
+SLOW_FACTOR = 2.0
+LOAD_PER_CPU_MAX = 1.5
+MEMORY_FREE_MIN = 25.0
+ROOM_CPU_FRAC = 1.2
+GAUGE_MAX_AGE_S = 60.0
+MEMORY_CACHE_S = 15.0
+MEMORY_LINE = re.compile(r"System-wide memory free percentage:\s*(\d+(?:\.\d+)?)%")
+BUDGET_FIELDS = {"total": "total", "output": "ds_output", "uncached": "kimi_uncached", "uncached_ds": "ds_uncached"}
+ROOM_BOUND_LABELS = {
+    "laptop": "bounded by laptop CPU",
+    "total": "bounded by Morph total",
+    "uncached_ds": "bounded by Morph uncached input",
+}
+VERDICT_CHIPS = {
+    "morph_limit": "Morph limit",
+    "morph_slow": "Morph slow",
+    "laptop": "Laptop",
+    "demand": "Demand",
+    "near_capacity": "Near capacity",
+}
 RATE_WINDOW_MINUTES = 60
 SAMPLE_INTERVAL_S = 60.0
 SAMPLE_KEEP_S = 7 * 24 * 3600
@@ -40,11 +66,16 @@ LIVE_TIMEOUT_S = 2.0
 DB_TIMEOUT_S = 2.0
 PS_TIMEOUT_S = 10.0
 ERROR_CHARS = 200
-LIMITS = {"total": 10_000_000, "output": 70_000, "uncached": 24_290}
-LIMIT_KEYS = {"total": "total", "output": "ds_output", "uncached": "kimi_uncached"}
+LIMITS = {"total": 10_000_000, "output": 70_000, "uncached": 24_290, "uncached_ds": 400_000}
+LIMIT_KEYS = {"total": "total", "output": "ds_output", "uncached": "kimi_uncached", "uncached_ds": "ds_uncached"}
 DEFAULT_CAPS = {"deepseek": 64, "kimi": 2}
 TIER_CAP_KEYS = {"pi-deepseek-flash": "deepseek", "pi-kimi": "kimi"}
-LIMIT_LABELS = {"total": "Total pool", "output": "DeepSeek output", "uncached": "Kimi uncached"}
+LIMIT_LABELS = {
+    "total": "Total pool",
+    "output": "DeepSeek output",
+    "uncached": "Kimi uncached",
+    "uncached_ds": "DeepSeek uncached input",
+}
 UNTAGGED_JOBS = frozenset({"", "none"})
 UNTAGGED_LABEL = "untagged (pre-tagging workers)"
 ACTIVE_WINDOW_S = 120
@@ -54,8 +85,8 @@ RUN_ROWS = 200
 TOP_CONSUMERS = 10
 VERDICTS = ("PASS", "PARTIAL", "FAIL")
 FAR_FUTURE = 4102444800.0
-BUCKET_SUM_KEYS = ("total", "ds_output", "kimi_uncached", "ok", "r429", "req", "input", "cache_read", "output", "wait_p50_weighted")
-PCT_KEYS = ("pct_total", "pct_ds_output", "pct_kimi_uncached")
+BUCKET_SUM_KEYS = ("total", "ds_output", "kimi_uncached", "ds_uncached", "ok", "r429", "req", "input", "cache_read", "output", "wait_p50_weighted")
+PCT_KEYS = ("pct_total", "pct_ds_output", "pct_kimi_uncached", "pct_ds_uncached")
 WORKER_KEYS = ("ds_workers", "kimi_workers", "queue_workers", "direct_workers", "queued_jobs")
 LOG_SOURCES = {"proxy": "proxy.err.log", "broker": "broker.log"}
 LOG_PAGE = 100
@@ -83,6 +114,7 @@ SELECT minute,
        SUM(COALESCE(input, 0) + COALESCE(cache_read, 0) + COALESCE(output, 0)) AS total,
        SUM(CASE WHEN model LIKE 'morph-dsv%' THEN COALESCE(output, 0) ELSE 0 END) AS ds_output,
        SUM(CASE WHEN model LIKE 'morph-kimi%' THEN COALESCE(input, 0) ELSE 0 END) AS kimi_uncached,
+       SUM(CASE WHEN model LIKE 'morph-dsv%' THEN COALESCE(input, 0) ELSE 0 END) AS ds_uncached,
        SUM(COALESCE(ok, 0)) AS ok,
        SUM(COALESCE(r429, 0)) AS r429,
        SUM(COALESCE(req, 0)) AS req,
@@ -90,7 +122,14 @@ SELECT minute,
        SUM(COALESCE(cache_read, 0)) AS cache_read,
        SUM(COALESCE(output, 0)) AS output,
        SUM(COALESCE(wait_p50_ms, 0) * COALESCE(req, 0)) AS wait_p50_weighted,
-       MAX(wait_p95_ms) AS wait_p95_ms
+       MAX(wait_p95_ms) AS wait_p95_ms,
+       {upstream_ms_sum} AS upstream_ms_sum,
+       {upstream_n} AS upstream_n,
+       {upstream_p50_weighted} AS upstream_p50_weighted,
+       {upstream_p50_weight} AS upstream_p50_weight,
+       {upstream_p95_ms} AS upstream_p95_ms,
+       {ds_p50_weighted} AS ds_p50_weighted,
+       {ds_p50_weight} AS ds_p50_weight
 FROM proxy_minutes
 WHERE minute >= ? AND minute < ?
 GROUP BY minute
@@ -220,6 +259,17 @@ h3.group { font-size: 12px; font-weight: 600; color: var(--ink-2); text-transfor
 .kpi .value { font-size: 20px; font-weight: 600; line-height: 1.25; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .kpi .value.sm { font-size: 16px; }
 .kpi .note { color: var(--ink-3); font-size: 11px; line-height: 1.3; }
+.verdict { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 12px; font-size: 16px; font-weight: 600; }
+.verdict .text { font-weight: 400; color: var(--ink); }
+.chip { display: inline-block; border: 1px solid var(--ring); border-radius: 999px; padding: 2px 10px; font-size: 12px; font-weight: 600; color: var(--ink-2); }
+.chip.crit { color: var(--crit); border-color: var(--crit); }
+.chip.ok { color: var(--s3); border-color: var(--s3); }
+.room { margin-top: 6px; font-size: 14px; color: var(--ink-2); }
+.activity { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; margin-bottom: 12px; }
+.stat { background: var(--surface); border: 1px solid var(--ring); border-radius: 8px; padding: 10px 12px; min-width: 0; }
+.stat .label { color: var(--ink-2); font-size: 11px; }
+.stat .value { font-size: 22px; font-weight: 600; line-height: 1.25; white-space: nowrap; }
+.stat .note { color: var(--ink-3); font-size: 11px; }
 .range-panel { margin-bottom: 14px; }
 .range-panel .kpis { grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); }
 
@@ -246,6 +296,9 @@ h3.group { font-size: 12px; font-weight: 600; color: var(--ink-2); text-transfor
 .tip .warn { color: var(--ink-3); white-space: normal; max-width: 260px; }
 .grid3 { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 14px; }
 .grid3 .card { margin-bottom: 0; }
+.pair { display: grid; grid-template-columns: 1fr; gap: 14px; }
+.pair .card { margin-bottom: 14px; }
+@media (min-width: 1100px) { .pair { grid-template-columns: 1fr 1fr; } }
 
 .tbl-tools { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 8px; margin: 2px 0 8px; }
 .filter input {
@@ -286,59 +339,51 @@ td.wrap .cont { color: var(--ink-3); display: block; }
     </div>
   </header>
 
+  <section class="panel verdict-panel" aria-labelledby="g-verdict">
+    <h3 class="group" id="g-verdict">Limited by</h3>
+    <div class="verdict"><span class="chip" id="v-chip">—</span><span class="text" id="v-text">Loading</span></div>
+    <div class="room" id="v-room">—</div>
+  </section>
+
+  <div class="activity" aria-label="Activity">
+    <div class="stat"><div class="label">Tokens, last 5 min</div><div class="value" id="a5-tokens">—</div><div class="note" id="a5-note">—</div></div>
+    <div class="stat"><div class="label">Tokens, last 15 min</div><div class="value" id="a15-tokens">—</div><div class="note" id="a15-note">—</div></div>
+    <div class="stat"><div class="label">DeepSeek output, 5 min avg per min</div><div class="value" id="a-ds">—</div><div class="note">tokens per minute, plain count</div></div>
+  </div>
+
   <div class="panels">
     <section class="panel" aria-labelledby="g-cap">
       <h3 class="group" id="g-cap">Capacity</h3>
       <div class="kpis">
-        <div class="kpi head"><div class="label">Capacity used, 5 min</div><div class="value" id="cap-used">—</div><div class="note" id="cap-binding">—</div></div>
-        <div class="kpi"><div class="label">DeepSeek output, 5 min avg</div><div class="value sm" id="cap-dso">—</div><div class="note" id="cap-dso-note">—</div></div>
-        <div class="kpi"><div class="label">Total pool, last minute</div><div class="value sm" id="lim-total-now">—</div><div class="note" id="lim-total-note">—</div></div>
-        <div class="kpi"><div class="label">DeepSeek output, last minute</div><div class="value sm" id="lim-output-now">—</div><div class="note" id="lim-output-note">—</div></div>
-        <div class="kpi"><div class="label">Kimi uncached, last minute</div><div class="value sm" id="lim-uncached-now">—</div><div class="note" id="lim-uncached-note">—</div></div>
+        <div class="kpi head"><div class="label">Total pool, 5 min avg</div><div class="value sm" id="cap-used">—</div><div class="note" id="cap-binding">—</div></div>
+        <div class="kpi"><div class="label">DeepSeek uncached, 5 min avg</div><div class="value sm" id="cap-ds-unc">—</div><div class="note" id="cap-ds-unc-note">—</div></div>
         <div class="kpi"><div class="label">Waiting at the proxy</div><div class="value" id="k-waiting">—</div><div class="note" id="k-waiting-note">—</div></div>
+        <div class="kpi"><div class="label">Requests in flight now</div><div class="value sm" id="p-inflight">—</div><div class="note">sent upstream, not yet answered</div></div>
+        <div class="kpi"><div class="label">Morph response p50 / p95</div><div class="value sm" id="p-morph">—</div><div class="note">per request, last 15 min; p95 is the worst minute</div></div>
       </div>
     </section>
     <section class="panel" aria-labelledby="g-runs">
-      <h3 class="group" id="g-runs">Runs</h3>
+      <h3 class="group" id="g-runs">Work</h3>
       <div class="kpis">
         <div class="kpi"><div class="label">DeepSeek runs active</div><div class="value" id="r-ds">—</div><div class="note" id="r-ds-note">—</div></div>
-        <div class="kpi"><div class="label">Kimi runs active</div><div class="value" id="r-kimi">—</div><div class="note" id="r-kimi-note">—</div></div>
-        <div class="kpi"><div class="label">Runs seen today</div><div class="value" id="r-seen">—</div><div class="note">distinct jobs, local day</div></div>
+        <div class="kpi"><div class="label">Jobs queued</div><div class="value" id="r-queued">—</div><div class="note">waiting for a worker</div></div>
         <div class="kpi"><div class="label">Finished today</div><div class="value sm" id="r-finished">—</div><div class="note">PASS / PARTIAL / FAIL</div></div>
         <div class="kpi"><div class="label">Tokens today</div><div class="value" id="r-tokens">—</div><div class="note">all runs, local day</div></div>
-        <div class="kpi"><div class="label">Median tokens per run</div><div class="value" id="r-median-tok">—</div><div class="note" id="r-median-req">—</div></div>
-      </div>
-    </section>
-    <section class="panel" aria-labelledby="g-perf">
-      <h3 class="group" id="g-perf">Performance</h3>
-      <div class="kpis">
-        <div class="kpi"><div class="label">Proxy wait, p50 / p95</div><div class="value sm" id="p-wait">—</div><div class="note">last 15 min; p95 is the worst minute</div></div>
-        <div class="kpi"><div class="label">Upstream per request</div><div class="value sm" id="p-upstream">—</div><div class="note">median, runs active in 15 min</div></div>
-        <div class="kpi"><div class="label">429 rate</div><div class="value sm" id="p-429rate">—</div><div class="note" id="p-429-note">—</div></div>
-        <div class="kpi"><div class="label">Requests per minute</div><div class="value sm" id="p-rpm">—</div><div class="note">average, last 5 min</div></div>
+        <div class="kpi"><div class="label">429s absorbed</div><div class="value" id="r-429">—</div><div class="note" id="r-429-note">retried by the proxy</div></div>
       </div>
     </section>
   </div>
 
-  <section class="panel range-panel" aria-labelledby="g-range">
-    <h3 class="group" id="g-range">Selected range</h3>
-    <div class="kpis">
-      <div class="kpi"><div class="label">Total tokens</div><div class="value" id="rg-tokens">—</div><div class="note" id="rg-tokens-note">—</div></div>
-      <div class="kpi"><div class="label">Requests</div><div class="value" id="rg-req">—</div><div class="note">proxy requests in range</div></div>
-      <div class="kpi"><div class="label">429s absorbed</div><div class="value" id="rg-r429">—</div><div class="note">retried by the proxy</div></div>
-      <div class="kpi"><div class="label">Runs started</div><div class="value" id="rg-started">—</div><div class="note">queue and direct</div></div>
-      <div class="kpi"><div class="label">Finished, PASS / PARTIAL / FAIL</div><div class="value sm" id="rg-finished">—</div><div class="note">queue jobs with a verdict</div></div>
-      <div class="kpi"><div class="label">DeepSeek output tokens</div><div class="value" id="rg-ds">—</div><div class="note">counted per finished request</div></div>
-    </div>
-  </section>
-
+  <section class="group-block" aria-labelledby="g-capacity">
+    <h3 class="group" id="g-capacity">Capacity vs workers</h3>
+    <div class="pair">
   <section class="card" aria-labelledby="h-billed">
     <div class="card-head">
-      <h2 id="h-billed">Total pool and DeepSeek output, % of limit</h2>
+      <h2 id="h-billed">Share of each Morph-enforced limit, % of limit</h2>
       <div class="legend" id="lg-billed"></div>
     </div>
     <div class="chart" id="c-billed"></div>
-    <div class="note-line">Tokens are counted in the minute each request finishes; Morph enforces only the 10M total per UTC minute. Output above 100% has never been rejected.</div>
+    <div class="note-line">Each line is the share of a limit Morph enforces; lines are comparable. Only limits Morph enforces are shown as %.</div>
     <div class="note-line">Total pool uses tokens admitted in each minute where the proxy recorded them, and falls back to completion minutes elsewhere.</div>
   </section>
 
@@ -349,10 +394,20 @@ td.wrap .cont { color: var(--ink-3); display: block; }
     </div>
     <div class="chart" id="c-workers"></div>
   </section>
+    </div>
+    <section class="card" aria-labelledby="h-upstream">
+      <div class="card-head">
+        <h2 id="h-upstream">Morph response time per request (s), p50 and p95</h2>
+        <div class="legend"><span class="key"><span class="swatch" style="border-color: var(--s1)"></span>p50</span><span class="key"><span class="swatch" style="border-color: var(--s2)"></span>p95</span></div>
+      </div>
+      <div class="chart" id="c-upstream"></div>
+      <div class="note-line" id="up-note"></div>
+    </section>
+  </section>
 
   <section class="card" aria-labelledby="h-tokens">
     <div class="card-head">
-      <h2 id="h-tokens">Tokens per minute, millions</h2>
+      <h2 id="h-tokens">Tokens per 5 minutes, millions</h2>
       <div class="legend" id="lg-tokens"></div>
     </div>
     <div class="chart" id="c-tokens"></div>
@@ -527,11 +582,37 @@ td.wrap .cont { color: var(--ink-3); display: block; }
     if (n === null || n === undefined) return "—";
     return Number(n).toLocaleString("en-US", { maximumFractionDigits: 1 });
   }
-  function tokens(n) {
+  function truncateTo(v, digits) {
+    var f = Math.pow(10, digits);
+    return (Math.floor(v * f + 1e-9) / f).toFixed(digits);
+  }
+  function compact(n) {
     if (n === null || n === undefined) return "—";
-    if (n >= 1e6) return (n / 1e6).toFixed(n >= 1e7 ? 1 : 2) + "M";
-    if (n >= 1e3) return (n / 1e3).toFixed(0) + "k";
-    return String(Math.round(n));
+    var a = Math.abs(n), sign = n < 0 ? "-" : "";
+    var units = [[1e9, "B"], [1e6, "M"], [1e3, "K"]];
+    for (var i = 0; i < units.length; i++) {
+      if (a >= units[i][0]) {
+        var v = a / units[i][0];
+        return sign + truncateTo(v, v >= 100 ? 0 : 1) + units[i][1];
+      }
+    }
+    return sign + String(Math.floor(a));
+  }
+  function exactCount(n) {
+    return n === null || n === undefined ? "—" : Number(n).toLocaleString("en-US");
+  }
+  function setTile(id, n) {
+    var el = $(id);
+    el.textContent = compact(n);
+    el.title = exactCount(n);
+  }
+  function setTileList(id, values) {
+    var el = $(id);
+    el.textContent = values.map(function (v) { return compact(v); }).join(" / ");
+    el.title = values.map(function (v) { return exactCount(v); }).join(" / ");
+  }
+  function tokens(n) {
+    return compact(n);
   }
   function duration(sec) {
     if (sec === null || sec === undefined) return "—";
@@ -686,7 +767,7 @@ td.wrap .cont { color: var(--ink-3); display: block; }
     var endText = function (e) { return e.s.name + " " + fmtY(e.v, true); };
     var endW = 0;
     ends.forEach(function (e) { endW = Math.max(endW, measure(svg, endText(e), "direct")); });
-    var m = {
+    var m = cfg.margin ? { l: cfg.margin.l, r: cfg.margin.r, t: 14, b: 24 } : {
       l: Math.max(44, Math.ceil(tickW) + 12),
       r: ends.length ? Math.min(Math.ceil(endW) + 24, Math.floor(W * 0.42)) : 12,
       t: 14,
@@ -800,6 +881,10 @@ td.wrap .cont { color: var(--ink-3); display: block; }
     host.appendChild(tip);
     var place = tooltipFor(host, svg, W, X, hit, cross, tip, function (px) {
       var sec = x0 + ((px - m.l) / Math.max(1, iw)) * (x1 - x0);
+      showAt(sec);
+      peersOf(host).forEach(function (peer) { peer.showAt(sec); });
+    });
+    function showAt(sec) {
       var p = nearest(points, sec);
       if (!p) return;
       cross.setAttribute("x1", X(p.t)); cross.setAttribute("x2", X(p.t));
@@ -812,9 +897,23 @@ td.wrap .cont { color: var(--ink-3); display: block; }
       });
       fillTip(tip, fmtX(p.t) + span, rows);
       place(X(p.t), 8);
-    });
+    }
     hit.addEventListener("mouseenter", function () { cross.setAttribute("visibility", "visible"); });
+    hit.addEventListener("mouseleave", function () { peersOf(host).forEach(function (peer) { peer.hide(); }); });
+    host._hover = {
+      showAt: showAt,
+      hide: function () { cross.setAttribute("visibility", "hidden"); tip.style.display = "none"; }
+    };
+    if (cfg.group) host.setAttribute("data-hover-group", cfg.group);
     return svg;
+  }
+
+  function peersOf(host) {
+    var group = host.getAttribute("data-hover-group");
+    if (!group) return [];
+    return Array.prototype.slice.call(document.querySelectorAll('[data-hover-group="' + group + '"]'))
+      .filter(function (el) { return el !== host && el._hover; })
+      .map(function (el) { return el._hover; });
   }
 
   function nearest(points, sec) {
@@ -947,21 +1046,38 @@ td.wrap .cont { color: var(--ink-3); display: block; }
     return bucket === 60 ? "minute" : bucket / 60 + " min";
   }
 
+  function renderVerdict(d) {
+    var v = d.verdict || {};
+    var chip = $("v-chip");
+    chip.textContent = v.chip || "—";
+    chip.className = "chip " + (v.key === "morph_limit" || v.key === "morph_slow" || v.key === "laptop" ? "crit" : "ok");
+    setText("v-text", v.text || "No data yet");
+    setText("v-room", (d.room || {}).text || "—");
+  }
+
+  function renderActivity(d) {
+    var a = d.activity || {};
+    [["5", a.tokens_5m], ["15", a.tokens_15m]].forEach(function (row) {
+      var w = row[1] || {};
+      setTile("a" + row[0] + "-tokens", w.tokens);
+      var delta = w.delta === null || w.delta === undefined ? "no previous window" :
+        (w.delta >= 0 ? "+" : "") + Math.round(w.delta * 100) + "% vs previous " + row[0] + " min";
+      setText("a" + row[0] + "-note", count(w.requests) + " requests · " + delta);
+    });
+    var dso = d.ds_output_5m_per_min;
+    setTile("a-ds", dso === null || dso === undefined ? null : Math.round(dso));
+  }
+
   function renderCapacity(d) {
     var cap = d.capacity || {};
     var limits = d.limits || {};
-    setText("cap-used", pct(cap.used_frac));
-    setText("cap-binding", cap.binding_label ? "binding: " + cap.binding_label : "no traffic in 5 min");
-    var dso = d.ds_output_5m_per_min;
-    setText("cap-dso", dso === null || dso === undefined ? "—" : tokens(dso) + "/min");
-    setText("cap-dso-note", "stated limit " + tokens((limits.output || {}).limit) + "/min");
-    [["total", "lim-total"], ["output", "lim-output"], ["uncached", "lim-uncached"]].forEach(function (row) {
-      var lim = limits[row[0]] || {};
-      setText(row[1] + "-now", pct(lim.last_min_frac));
-      var target = lim.target_frac === null || lim.target_frac === undefined ? "target n/a" : "target " + pct(lim.target_frac, 0);
-      setText(row[1] + "-note", "5 min avg " + pct(lim.avg_5m_frac) + " · " + target);
-    });
-    setText("k-waiting", count(cap.waiting_now));
+    var total = limits.total || {};
+    var dsu = limits.uncached_ds || {};
+    setText("cap-used", pct(total.avg_5m_frac));
+    setText("cap-binding", "of the " + compact(total.limit) + " per minute limit");
+    setText("cap-ds-unc", pct(dsu.avg_5m_frac));
+    setText("cap-ds-unc-note", "of " + compact(dsu.limit) + " per minute");
+    setTile("k-waiting", cap.waiting_now);
     var lanes = cap.waiting_by_lane || {};
     setText("k-waiting-note", Object.keys(lanes).length
       ? Object.keys(lanes).map(function (k) { return k + " " + lanes[k]; }).join(" · ")
@@ -970,41 +1086,25 @@ td.wrap .cont { color: var(--ink-3); display: block; }
 
   function renderRunKpis(d) {
     var rk = d.run_kpis || {};
-    setText("r-ds", count(rk.active_deepseek));
+    setTile("r-ds", rk.active_deepseek);
     setText("r-ds-note", "of cap " + count(rk.cap_deepseek));
-    setText("r-kimi", count(rk.active_kimi));
-    setText("r-kimi-note", "of cap " + count(rk.cap_kimi));
-    setText("r-seen", count(rk.seen_today));
+    var queued = ((d.jobs || {}).by_state || {}).queued;
+    setTile("r-queued", queued === undefined ? null : queued);
     var fin = rk.finished_today || {};
-    setText("r-finished", ["PASS", "PARTIAL", "FAIL"].map(function (v) { return count(fin[v] || 0); }).join(" / "));
-    setText("r-tokens", tokens(rk.tokens_today));
-    setText("r-median-tok", tokens(rk.median_tokens_per_run));
-    setText("r-median-req", "median " + num1(rk.median_requests_per_run) + " requests");
+    setTileList("r-finished", ["PASS", "PARTIAL", "FAIL"].map(function (v) { return fin[v] || 0; }));
+    setTile("r-tokens", rk.tokens_today);
   }
 
   function renderPerf(d) {
     var pk = d.perf_kpis || {};
-    var p50 = pk.wait_p50_ms === null || pk.wait_p50_ms === undefined ? "—" : seconds(pk.wait_p50_ms);
-    setText("p-wait", p50 + " / " + seconds(pk.wait_p95_ms));
-    setText("p-upstream", seconds(pk.upstream_median_ms));
-    setText("p-429rate", pct(pk.r429_rate_60m, 2));
-    var r429 = d.r429_60m;
-    setText("p-429-note", (r429 === undefined ? "—" : count(r429)) + " 429s in the last 60 min");
-    setText("p-rpm", num1(pk.requests_per_min_5m));
+    setText("p-morph", seconds(pk.upstream_response_p50_ms) + " / " + seconds(pk.upstream_response_p95_ms));
+    setTile("p-inflight", pk.in_flight_now);
   }
 
   function renderRange(d) {
     var rt = d.range_totals || {};
-    var tok = rt.tokens || {};
-    setText("g-range", "Selected range, " + (RANGE_NAME[d.hours] || ""));
-    setText("rg-tokens", tokens(tok.total));
-    setText("rg-tokens-note", "cache " + tokens(tok.cache_read) + " · uncached " + tokens(tok.uncached) + " · output " + tokens(tok.output));
-    setText("rg-req", count(rt.requests));
-    setText("rg-r429", count(rt.r429));
-    setText("rg-started", count(rt.runs_started));
-    var fin = rt.finished || {};
-    setText("rg-finished", ["PASS", "PARTIAL", "FAIL"].map(function (v) { return count(fin[v] || 0); }).join(" / "));
-    setText("rg-ds", tokens(rt.ds_output));
+    setTile("r-429", rt.r429);
+    setText("r-429-note", "retried by the proxy, " + (RANGE_NAME[d.hours] || "") + " range");
   }
 
   function renderCharts(d) {
@@ -1014,6 +1114,8 @@ td.wrap .cont { color: var(--ink-3); display: block; }
     var fmtX = d.hours >= 168 ? dateHM : hm;
     var minutes = d.minutes || [];
     var caps = d.caps || { deepseek: 64, kimi: 2 };
+    var tb = d.token_bucket_s || bucket;
+    var tunit = unitLabel(tb);
     var workers = (d.workers || []).map(function (w) {
       return { t: w.ts, ds: w.ds_workers, kimi: w.kimi_workers, queued: w.queued_jobs };
     });
@@ -1024,24 +1126,24 @@ td.wrap .cont { color: var(--ink-3); display: block; }
     var intFmt = function (v) { return Math.round(v).toLocaleString("en-US"); };
     charts.length = 0;
 
+    var PAIR_MARGIN = { l: 64, r: 16 };
     registerChart("c-billed", {
-      title: "Total pool and DeepSeek output, percent of limit per interval",
-      kind: "line", endLabels: true, bucket_s: bucket, tickFmt: fmtX,
+      title: "Share of each Morph-enforced limit, percent per interval",
+      kind: "line", bucket_s: bucket, tickFmt: fmtX, margin: PAIR_MARGIN, group: "capacity",
       x0: win.start, x1: win.end, height: 260,
       points: minutes,
       series: [
-        { key: "pct_total", name: "Total pool", color: COLORS.s1 },
-        { key: "pct_ds_output", name: "DeepSeek output vs stated 70k/min (not enforced per minute)", color: COLORS.s2,
-          overNote: "above stated limit, not rejected by Morph (0 output-limit 429s)" }
+        { key: "pct_total", name: "Total pool (of 10M/min)", color: COLORS.s1 },
+        { key: "pct_ds_uncached", name: "DeepSeek uncached input (of 400k/min)", color: COLORS.s2 }
       ],
-      y: clippedAxis(valuesOf(minutes, ["pct_total", "pct_ds_output"]), pctFmt),
+      y: clippedAxis(valuesOf(minutes, ["pct_total", "pct_ds_uncached"]), pctFmt),
       refs: [{ v: 1, label: "100% of limit" }],
       fmt: pctFmt
     });
-    setText("h-billed", "Total pool and DeepSeek output, % of limit");
+    setText("h-billed", "Share of each Morph-enforced limit, % of limit");
     registerChart("c-workers", {
       title: "Active runs over time",
-      kind: "line", endLabels: true, bucket_s: bucket, tickFmt: fmtX,
+      kind: "line", bucket_s: bucket, tickFmt: fmtX, margin: PAIR_MARGIN, group: "capacity",
       x0: win.start, x1: win.end, height: 260,
       points: workers,
       series: [
@@ -1061,13 +1163,13 @@ td.wrap .cont { color: var(--ink-3); display: block; }
     });
     registerChart("c-tokens", {
       title: "Tokens per interval, millions, with cumulative total",
-      unit: unit, bucket_s: bucket, tickFmt: fmtX, x0: win.start, x1: win.end, height: 280,
+      unit: tunit, bucket_s: tb, tickFmt: fmtX, x0: win.start, x1: win.end, height: 280,
       points: mix
     }, drawTokenCombo);
-    setText("h-tokens", "Tokens per " + unit + ", millions");
+    setText("h-tokens", "Tokens per " + tunit + ", millions");
     legendFor($("lg-billed"), [
-      { name: "Total pool", color: COLORS.s1 },
-      { name: "DeepSeek output vs stated 70k/min (not enforced per minute)", color: COLORS.s2 }
+      { name: "Total pool (of 10M/min)", color: COLORS.s1 },
+      { name: "DeepSeek uncached input (of 400k/min)", color: COLORS.s2 }
     ]);
     legendFor($("lg-workers"), [
       { name: "DeepSeek runs", color: COLORS.s1 },
@@ -1113,6 +1215,25 @@ td.wrap .cont { color: var(--ink-3); display: block; }
       fmt: function (v, inline) { return v.toFixed(inline ? 1 : 0) + " s"; }
     });
     setText("h-wait", "Wait p95 per " + unit);
+    var upPoints = minutes.map(function (p) {
+      var sec = function (v) { return v === null || v === undefined ? null : v / 1000; };
+      return { t: p.t, p50: sec(p.upstream_p50_ms), p95: sec(p.upstream_p95_ms) };
+    });
+    var maxU = upPoints.reduce(function (a, p) { return p.p95 === null ? a : Math.max(a, p.p95); }, 0);
+    registerChart("c-upstream", {
+      title: "Morph response time per request, seconds per " + unit,
+      kind: "line", bucket_s: bucket, tickFmt: fmtX, margin: PAIR_MARGIN, group: "capacity",
+      x0: win.start, x1: win.end, height: 200,
+      points: upPoints,
+      series: [
+        { key: "p50", name: "p50", color: COLORS.s1 },
+        { key: "p95", name: "p95", color: COLORS.s2 }
+      ],
+      y: niceTicks(Math.max(maxU, 1), 3),
+      fmt: function (v) { return (Math.abs(v) < 10 ? v.toFixed(1) : v.toFixed(0)) + " s"; }
+    });
+    var hasUpstream = upPoints.some(function (p) { return p.p50 !== null; });
+    setText("up-note", hasUpstream ? "" : "No response times recorded in this range: the proxy started recording them later.");
     setText("minute-sub", bucket === 60 ? "Newest first; one row per minute" : "Newest first; one row per " + unit + " bucket");
   }
 
@@ -1371,6 +1492,8 @@ td.wrap .cont { color: var(--ink-3); display: block; }
   }
 
   function render(d) {
+    renderVerdict(d);
+    renderActivity(d);
     renderCapacityAndRest(d);
     renderCharts(d);
     renderRuns(d);
@@ -1593,14 +1716,53 @@ def readonly_connection(path: Path) -> sqlite3.Connection:
     return connection
 
 
+def minutes_sql(columns: set[str]) -> str:
+    """MINUTES_SQL with the upstream latency aggregates for the columns this database has. Older
+    databases lack them, so those read as NULL and the chart shows a gap instead of failing."""
+
+    def has(*names: str) -> bool:
+        return all(name in columns for name in names)
+
+    return MINUTES_SQL.format(
+        upstream_ms_sum="SUM(COALESCE(upstream_ms_sum, 0))" if has("upstream_ms_sum") else "NULL",
+        upstream_n="SUM(COALESCE(upstream_n, 0))" if has("upstream_n") else "NULL",
+        upstream_p50_weighted=(
+            "SUM(CASE WHEN upstream_p50_ms IS NOT NULL THEN upstream_p50_ms * COALESCE(upstream_n, 0) ELSE 0 END)"
+            if has("upstream_p50_ms", "upstream_n") else "NULL"
+        ),
+        upstream_p50_weight=(
+            "SUM(CASE WHEN upstream_p50_ms IS NOT NULL THEN COALESCE(upstream_n, 0) ELSE 0 END)"
+            if has("upstream_p50_ms", "upstream_n") else "NULL"
+        ),
+        upstream_p95_ms="MAX(upstream_p95_ms)" if has("upstream_p95_ms") else "NULL",
+        ds_p50_weighted=(
+            "SUM(CASE WHEN model LIKE 'morph-dsv%' AND upstream_p50_ms IS NOT NULL THEN upstream_p50_ms * COALESCE(upstream_n, 0) ELSE 0 END)"
+            if has("upstream_p50_ms", "upstream_n") else "NULL"
+        ),
+        ds_p50_weight=(
+            "SUM(CASE WHEN model LIKE 'morph-dsv%' AND upstream_p50_ms IS NOT NULL THEN COALESCE(upstream_n, 0) ELSE 0 END)"
+            if has("upstream_p50_ms", "upstream_n") else "NULL"
+        ),
+    )
+
+
 def read_minute_rows(agentq_db: Path, since: int, until: int) -> dict[int, dict]:
     """Summed proxy_minutes rows keyed by the epoch second of each complete minute in [since, until)."""
     connection = readonly_connection(agentq_db)
     try:
-        rows = connection.execute(MINUTES_SQL, (minute_stamp(since), minute_stamp(until))).fetchall()
+        columns = {row["name"] for row in connection.execute("PRAGMA table_info(proxy_minutes)")}
+        rows = connection.execute(minutes_sql(columns), (minute_stamp(since), minute_stamp(until))).fetchall()
     finally:
         connection.close()
     return {minute_epoch(row["minute"]): dict(row) for row in rows}
+
+
+def weighted_upstream_p50(row: dict) -> int | None:
+    """Request-weighted p50 of the proxy's upstream response time over the rows summed into ``row``; None when none recorded one."""
+    weight = int(row.get("upstream_p50_weight") or 0)
+    if not weight:
+        return None
+    return round(int(row.get("upstream_p50_weighted") or 0) / weight)
 
 
 def minute_point(t: int, row: dict | None) -> dict:
@@ -1615,6 +1777,7 @@ def minute_point(t: int, row: dict | None) -> dict:
         "total": total,
         "ds_output": ds_output,
         "kimi_uncached": kimi_uncached,
+        "ds_uncached": int(row.get("ds_uncached") or 0),
         "input": int(row.get("input") or 0),
         "cache_read": int(row.get("cache_read") or 0),
         "output": int(row.get("output") or 0),
@@ -1623,9 +1786,13 @@ def minute_point(t: int, row: dict | None) -> dict:
         "req": int(row.get("req") or 0),
         "wait_p50_weighted": int(row.get("wait_p50_weighted") or 0),
         "wait_p95_ms": row.get("wait_p95_ms"),
+        "upstream_p50_ms": weighted_upstream_p50(row),
+        "upstream_p95_ms": row.get("upstream_p95_ms"),
+        "upstream_n": int(row.get("upstream_n") or 0),
         "pct_total": fraction(total, LIMITS["total"]),
         "pct_ds_output": fraction(ds_output, LIMITS["output"]),
         "pct_kimi_uncached": fraction(kimi_uncached, LIMITS["uncached"]),
+        "pct_ds_uncached": fraction(int(row.get("ds_uncached") or 0), LIMITS["uncached_ds"]),
     }
 
 
@@ -1763,7 +1930,8 @@ def median_or_none(values: list[float]) -> float | None:
 
 def capacity_headline(limits: dict, live: dict | None) -> dict:
     """The limit with the highest 5-minute billed fraction (the binding one), and requests waiting at the proxy."""
-    binding = max(LIMIT_KEYS, key=lambda name: limits[name]["avg_5m_frac"]) if limits else None
+    present = [name for name in LIMIT_KEYS if name in limits]
+    binding = max(present, key=lambda name: limits[name]["avg_5m_frac"]) if present else None
     queued = (live or {}).get("queued") if isinstance(live, dict) else None
     by_lane = None
     waiting = None
@@ -1841,6 +2009,10 @@ def bucket_minutes(points: list[dict], size: int) -> list[dict]:
         for key in BUCKET_SUM_KEYS:
             bucket[key] = sum(m[key] for m in members)
         bucket["wait_p95_ms"] = max(p95s) if p95s else None
+        p50s = [m["upstream_p50_ms"] for m in members if m.get("upstream_p50_ms") is not None]
+        upstream_p95s = [m["upstream_p95_ms"] for m in members if m.get("upstream_p95_ms") is not None]
+        bucket["upstream_p50_ms"] = round(sum(p50s) / len(p50s)) if p50s else None
+        bucket["upstream_p95_ms"] = max(upstream_p95s) if upstream_p95s else None
         for key in PCT_KEYS:
             bucket[key] = round(sum(m[key] for m in members) / len(members), 4)
         buckets.append(bucket)
@@ -2089,9 +2261,21 @@ def run_kpis(runs: list[dict], day: float, caps: dict[str, int], verdicts: dict[
     }
 
 
-def perf_kpis(raw: dict[int, dict], until: int, runs: list[dict], now: float) -> dict:
-    """Proxy wait, upstream time, 429 rate and request rate. Wait p50 is request-weighted; p95 is the worst minute."""
+def in_flight_total(live: dict | None) -> int | None:
+    """Upstream requests in flight right now across models, from the proxy's status; None when the proxy did not answer."""
+    upstream = (live or {}).get("upstream")
+    in_flight = upstream.get("in_flight") if isinstance(upstream, dict) else None
+    if not isinstance(in_flight, dict):
+        return None
+    return sum(int(value) for value in in_flight.values())
+
+
+def perf_kpis(raw: dict[int, dict], until: int, runs: list[dict], now: float, live: dict | None = None) -> dict:
+    """Proxy wait, upstream time, 429 rate and request rate. Wait p50 is request-weighted; p95 is the worst minute.
+    The Morph response time uses the same weighting: p50 is request-weighted over the minutes, p95 the worst minute."""
     window = [raw[t] for t in range(until - PERF_WINDOW_MINUTES * 60, until, 60) if t in raw]
+    upstream_weight = sum(int(row.get("upstream_p50_weight") or 0) for row in window)
+    upstream_p95s = [row["upstream_p95_ms"] for row in window if row.get("upstream_p95_ms") is not None]
     req_15m = sum(row["req"] for row in window)
     p95s = [row["wait_p95_ms"] for row in window if row["wait_p95_ms"] is not None]
     upstream = [
@@ -2103,6 +2287,12 @@ def perf_kpis(raw: dict[int, dict], until: int, runs: list[dict], now: float) ->
     return {
         "wait_p50_ms": sum(row["wait_p50_weighted"] for row in window) / req_15m if req_15m else None,
         "wait_p95_ms": max(p95s) if p95s else None,
+        "upstream_response_p50_ms": (
+            round(sum(int(row.get("upstream_p50_weighted") or 0) for row in window) / upstream_weight)
+            if upstream_weight else None
+        ),
+        "upstream_response_p95_ms": max(upstream_p95s) if upstream_p95s else None,
+        "in_flight_now": in_flight_total(live),
         "upstream_median_ms": median_or_none(upstream),
         "r429_rate_60m": window_sum(raw, until, RATE_WINDOW_MINUTES, "r429") / req_60m if req_60m else None,
         "requests_per_min_5m": window_sum(raw, until, LIMIT_WINDOW_MINUTES, "req") / LIMIT_WINDOW_MINUTES,
@@ -2151,7 +2341,231 @@ def _guard(name: str, errors: dict, fn, default, *args):
         return default
 
 
-def build_summary(home: Path, hours: int = DEFAULT_HOURS, *, now: float | None = None, fetch_live=fetch_live_status) -> dict:
+def resolve_limits(live: dict | None) -> dict[str, int]:
+    """The limit per budget: the proxy's live figure where it gives one, else the documented constant."""
+    limits = {name: LIMITS[name] for name in LIMIT_KEYS}
+    budgets = (live or {}).get("budgets") if isinstance(live, dict) else None
+    if isinstance(budgets, dict):
+        for name in LIMIT_KEYS:
+            budget = budgets.get(name)
+            value = budget.get("limit") if isinstance(budget, dict) else None
+            if isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0:
+                limits[name] = int(value)
+    return limits
+
+
+def ds_upstream_p50(rows: list[dict]) -> int | None:
+    """Request-weighted DeepSeek upstream p50 over minute rows; None when no DeepSeek minute recorded one."""
+    weight = sum(int(row.get("ds_p50_weight") or 0) for row in rows)
+    if not weight:
+        return None
+    return round(sum(int(row.get("ds_p50_weighted") or 0) for row in rows) / weight)
+
+
+def budget_429_minutes(home: Path, until: int) -> dict[str, set[int]]:
+    """Minutes with an upstream 429 per budget name, from the proxy's calib log lines in the last 5 minutes.
+
+    The proxy names the budget a 429 body states. A 429 with no stated budget is not counted.
+    """
+    try:
+        data, _ = read_log_tail(Path(home) / "logs" / LOG_SOURCES["proxy"])
+    except OSError:
+        return {}
+    start = until - LIMIT_WINDOW_MINUTES * 60
+    found: dict[str, set[int]] = {}
+    for line in data.decode("utf-8", "replace").splitlines():
+        entry = parse_log_line(line)
+        if entry is None or entry["event"] != "calib":
+            continue
+        fields = {f["k"]: f["v"] for f in entry["fields"]}
+        budget, stamp = fields.get("budget"), fields.get("minute")
+        if not budget or budget == "None" or not stamp:
+            continue
+        try:
+            minute = minute_epoch(stamp)
+        except ValueError:
+            continue
+        if start <= minute < until:
+            found.setdefault(budget, set()).add(minute)
+    return found
+
+
+def memory_free_pressure(now: float, run=subprocess.run) -> float | None:
+    """Free system memory percent from macOS memory_pressure, or None; cached for MEMORY_CACHE_S."""
+    cached = _MEMORY_CACHE
+    if cached.get("at") is not None and 0 <= now - cached["at"] < MEMORY_CACHE_S:
+        return cached["free"]
+    try:
+        out = run(["memory_pressure"], capture_output=True, text=True, timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        out = ""
+    match = MEMORY_LINE.search(out or "")
+    cached["at"], cached["free"] = now, (float(match.group(1)) if match else None)
+    return cached["free"]
+
+
+_MEMORY_CACHE: dict = {}
+
+
+def laptop_reading(home: Path, now: float, memory=memory_free_pressure) -> dict:
+    """Laptop load and free memory. Memory comes from the broker's gauge file when it is fresh, else from memory_pressure."""
+    try:
+        load1 = os.getloadavg()[0]
+    except OSError:
+        load1 = None
+    cpus = os.cpu_count() or 1
+    free = None
+    try:
+        gauge = json.loads((Path(home) / "slots" / "gauge.json").read_text(encoding="utf-8"))
+        at, value = gauge.get("at"), gauge.get("free")
+        if isinstance(at, (int, float)) and isinstance(value, (int, float)) and 0 <= now - at <= GAUGE_MAX_AGE_S:
+            free = float(value)
+    except (OSError, ValueError, AttributeError):
+        pass
+    if free is None:
+        free = memory(now)
+    return {
+        "load1": load1,
+        "cpus": cpus,
+        "load_per_cpu": load1 / cpus if load1 is not None else None,
+        "memory_free_pct": free,
+    }
+
+
+def window_tokens(raw: dict[int, dict], until: int, minutes: int) -> dict:
+    """Billed tokens and requests over the last ``minutes`` complete minutes, against the window before them."""
+    current = window_sum(raw, until, minutes, "total")
+    previous = sum(int((raw.get(t) or {}).get("total") or 0) for t in range(until - 2 * minutes * 60, until - minutes * 60, 60))
+    return {
+        "minutes": minutes,
+        "tokens": current,
+        "requests": window_sum(raw, until, minutes, "req"),
+        "previous_tokens": previous,
+        "delta": (current - previous) / previous if previous else None,
+    }
+
+
+def verdict(
+    raw: dict[int, dict],
+    until: int,
+    limits: dict[str, int],
+    live: dict | None,
+    *,
+    kimi_waiting: bool,
+    budget_429s: dict[str, set[int]],
+    laptop: dict,
+    jobs_queued: int | None,
+    ds_p50_5m_ms: int | None,
+    ds_p50_base_ms: int | None,
+) -> dict:
+    """What limits the pool, from the last 5 complete minutes. The first matching rule wins:
+    Morph limit, Morph slow, Laptop, Demand, Near capacity.
+
+    An enforced budget counts as hit when its 5-minute average reached AVERAGE_SATURATION_FRAC of its limit,
+    or when upstream 429s named it in MORPH_429_MINUTES of the 5 minutes. The peak minute is context only: it
+    never decides the verdict. Kimi uncached counts only while Kimi jobs wait.
+    """
+    five = list(range(until - LIMIT_WINDOW_MINUTES * 60, until, 60))
+    queued_values = (live or {}).get("queued") if isinstance(live, dict) else None
+    proxy_queued = sum(int(n) for n in queued_values.values()) if isinstance(queued_values, dict) else None
+    hits = []
+    for name in ("total", "uncached_ds", "uncached"):
+        if name == "uncached" and not kimi_waiting:
+            continue
+        field = BUDGET_FIELDS[name]
+        average = sum(int((raw.get(t) or {}).get(field) or 0) for t in five) / LIMIT_WINDOW_MINUTES / limits[name]
+        peak = max(int((raw.get(t) or {}).get(field) or 0) for t in five) / limits[name]
+        minutes_429 = sum(1 for t in five if t in budget_429s.get(name, set()))
+        if average >= AVERAGE_SATURATION_FRAC or minutes_429 >= MORPH_429_MINUTES:
+            hits.append((name, average, peak, minutes_429))
+    pool = window_sum(raw, until, LIMIT_WINDOW_MINUTES, "total") / LIMIT_WINDOW_MINUTES / limits["total"]
+    load = laptop.get("load_per_cpu")
+    free = laptop.get("memory_free_pct")
+    laptop_hot = (load is not None and load > LOAD_PER_CPU_MAX) or (free is not None and free < MEMORY_FREE_MIN)
+    if hits:
+        name, average, peak, minutes_429 = hits[0]
+        label = LIMIT_LABELS[name]
+        context = f"peak minute {peak * 100:.0f}%"
+        if average >= AVERAGE_SATURATION_FRAC:
+            detail = f"{label} averaged {average * 100:.0f}% of its limit over the last 5 minutes ({context})"
+        else:
+            detail = f"{label} returned 429s in {minutes_429} of the last 5 minutes ({context})"
+        key, text = "morph_limit", f"Morph is limiting us: {detail}."
+    elif ds_p50_5m_ms and ds_p50_base_ms and ds_p50_5m_ms > SLOW_FACTOR * ds_p50_base_ms and proxy_queued == 0:
+        key = "morph_slow"
+        text = (
+            f"Morph is slow: DeepSeek response p50 is {ds_p50_5m_ms / 1000:.1f} s, "
+            f"{ds_p50_5m_ms / ds_p50_base_ms:.1f}x its 6-hour median of {ds_p50_base_ms / 1000:.1f} s, "
+            "with nothing queued at the proxy."
+        )
+    elif laptop_hot:
+        key = "laptop"
+        cpus = laptop.get("cpus")
+        load_text = f"load {laptop['load1']:.1f} on {cpus} CPUs ({load:.2f} per CPU)" if load is not None else "load unknown"
+        mem_text = f"{free:.0f}% memory free" if free is not None else "memory unknown"
+        text = f"The laptop is the bottleneck: {load_text}, {mem_text}."
+    elif pool < POOL_IDLE_FRAC and proxy_queued == 0 and jobs_queued == 0:
+        key = "demand"
+        text = (
+            f"Demand is the limit: the pool is at {pool * 100:.0f}% of its limit, "
+            "nothing waits at the proxy, and no job is ready."
+        )
+    else:
+        key = "near_capacity"
+        text = (
+            f"Near capacity: no single limit is saturated, but the pool is at {pool * 100:.0f}% "
+            "of its limit or work is waiting."
+        )
+    return {"key": key, "chip": VERDICT_CHIPS[key], "text": text}
+
+
+def room(
+    raw: dict[int, dict],
+    until: int,
+    limits: dict[str, int],
+    *,
+    active_ds_workers: float | None,
+    laptop: dict,
+) -> dict:
+    """How many more busy DeepSeek workers fit: the smallest of three candidates, each in workers.
+
+    Morph total and Morph uncached input (ds_uncached) use ROOM_FRAC of their limit less the 5-minute average
+    per minute, divided by the per-worker rate. The laptop uses ROOM_CPU_FRAC times the CPU count less the
+    1-minute load, divided by the load per worker. A candidate with no per-worker rate is left out.
+    """
+    workers = active_ds_workers
+    total5 = window_sum(raw, until, LIMIT_WINDOW_MINUTES, "total") / LIMIT_WINDOW_MINUTES
+    uncached5 = window_sum(raw, until, LIMIT_WINDOW_MINUTES, "ds_uncached") / LIMIT_WINDOW_MINUTES
+    candidates: dict[str, float] = {}
+    if workers and workers > 0:
+        if total5 > 0:
+            candidates["total"] = (ROOM_FRAC * limits["total"] - total5) / (total5 / workers)
+        if uncached5 > 0:
+            candidates["uncached_ds"] = (ROOM_FRAC * limits["uncached_ds"] - uncached5) / (uncached5 / workers)
+        load1, cpus = laptop.get("load1"), laptop.get("cpus")
+        if load1 is not None and cpus and load1 > 0:
+            candidates["laptop"] = max(0.0, ROOM_CPU_FRAC * cpus - load1) / (load1 / workers)
+    if not candidates:
+        return {
+            "workers": None, "bound": None, "active_ds_workers": workers,
+            "text": "Room unknown: no DeepSeek workers active in the last 5 minutes.",
+        }
+    bound = min(candidates, key=candidates.get)
+    count = math.floor(candidates[bound])
+    label = ROOM_BOUND_LABELS[bound]
+    if count <= 0:
+        text = f"No room; adding workers will only queue ({label})."
+    else:
+        text = f"Room for about {count} more busy DeepSeek workers ({label})."
+    return {
+        "workers": count, "bound": bound, "active_ds_workers": workers,
+        "text": text, "candidates": {k: round(v, 2) for k, v in candidates.items()},
+    }
+
+
+def build_summary(
+    home: Path, hours: int = DEFAULT_HOURS, *, now: float | None = None, fetch_live=fetch_live_status, laptop: dict | None = None
+) -> dict:
     """The JSON the page renders. Each source degrades to null or empty and is named in ``errors``."""
     home = Path(home)
     now = time.time() if now is None else float(now)
@@ -2171,10 +2585,11 @@ def build_summary(home: Path, hours: int = DEFAULT_HOURS, *, now: float | None =
     verdicts = _guard("verdicts", errors, read_verdicts, {}, agentq_db, day)
     caps = read_caps(home)
     targets = live_targets(live)
+    resolved = resolve_limits(live)
     limits = {
         name: {
             "label": LIMIT_LABELS[name],
-            "limit": LIMITS[name],
+            "limit": resolved[name],
             "last_min_frac": last_minute_fraction(raw, until, LIMIT_KEYS[name], LIMITS[name]),
             "avg_5m_frac": average_fraction(raw, until, LIMIT_KEYS[name], LIMITS[name]),
             "target_frac": targets[name],
@@ -2185,8 +2600,34 @@ def build_summary(home: Path, hours: int = DEFAULT_HOURS, *, now: float | None =
     minute_points = minute_series(raw, since, until)
     apply_admitted_totals(minute_points, admitted)
     minutes = bucket_minutes(minute_points, bucket)
+    token_bucket = TOKEN_BUCKET_S[hours]
+    token_minutes = bucket_minutes(minute_points, token_bucket)
     range_verdicts = _guard("range_verdicts", errors, read_verdicts, {}, agentq_db, float(since), float(until))
     kpis = run_kpis(runs, day, caps, verdicts)
+    laptop_now = laptop if laptop is not None else laptop_reading(home, now)
+    baseline_raw = raw if hours >= 6 else _guard("minutes_6h", errors, read_minute_rows, {}, agentq_db, until - 6 * 3600, until)
+    five = range(until - LIMIT_WINDOW_MINUTES * 60, until, 60)
+    ds_p50_5m = ds_upstream_p50([raw[t] for t in five if t in raw])
+    base_p50s = [
+        p for p in (ds_upstream_p50([row]) for stamp, row in sorted(baseline_raw.items()) if stamp >= until - 6 * 3600) if p is not None
+    ]
+    worker_vals = [s["ds_workers"] for s in samples if until - LIMIT_WINDOW_MINUTES * 60 <= s["ts"] < until and s["ds_workers"] is not None]
+    jobs_by_tier = (jobs or {}).get("by_tier") or {}
+    verdict_now = verdict(
+        raw, until, resolved, live,
+        kimi_waiting=int((jobs_by_tier.get("pi-kimi") or {}).get("queued") or 0) > 0,
+        budget_429s=budget_429_minutes(home, until),
+        laptop=laptop_now,
+        jobs_queued=((jobs or {}).get("by_state") or {}).get("queued"),
+        ds_p50_5m_ms=ds_p50_5m,
+        ds_p50_base_ms=median_or_none(base_p50s),
+    )
+    room_now = room(
+        raw, until, resolved,
+        active_ds_workers=(sum(worker_vals) / len(worker_vals)) if worker_vals else None,
+        laptop=laptop_now,
+    )
+    activity = {"tokens_5m": window_tokens(raw, until, 5), "tokens_15m": window_tokens(raw, until, 15)}
     return {
         "generated_at": now,
         "hours": hours,
@@ -2198,14 +2639,19 @@ def build_summary(home: Path, hours: int = DEFAULT_HOURS, *, now: float | None =
         "ds_output_5m_per_min": deepseek_output_rate(raw, until),
         "bucket_s": bucket,
         "minutes": minutes,
-        "token_mix": token_mix(minutes),
+        "token_mix": token_mix(token_minutes),
+        "token_bucket_s": token_bucket,
         "range_totals": range_totals(raw, since, until, runs, range_verdicts),
         "jobs": jobs,
         "workers": bucket_workers(samples, bucket),
         "caps": caps,
         "runs": table_runs(runs),
         "run_kpis": kpis,
-        "perf_kpis": perf_kpis(raw, until, runs, now),
+        "verdict": verdict_now,
+        "room": room_now,
+        "activity": activity,
+        "laptop": laptop_now,
+        "perf_kpis": perf_kpis(raw, until, runs, now, live),
         "top_consumers": top_consumers(runs, day, kpis["tokens_today"]),
         "errors": errors,
     }

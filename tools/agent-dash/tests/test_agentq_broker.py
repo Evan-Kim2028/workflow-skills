@@ -5,6 +5,7 @@ run_worker.py: it writes a pi-shaped report and starts a real short-lived proces
 (``sleep``) so pid and start-time checks run for real. The proxy is always stubbed.
 """
 
+import concurrent.futures
 import io
 import os
 import plistlib
@@ -131,9 +132,22 @@ def proxy_doc(total=0, output=0, uncached=0, saturated=False):
     }
 
 
-def make_broker(home, launcher=None, clock=None, proxy=None, gauges=None):
+class InlinePool:
+    """Runs each launch on the calling thread, so a tick's launches have landed when it returns."""
+
+    def submit(self, fn, *args):
+        future = concurrent.futures.Future()
+        try:
+            future.set_result(fn(*args))
+        except BaseException as exc:
+            future.set_exception(exc)
+        return future
+
+
+def make_broker(home, launcher=None, clock=None, proxy=None, gauges=None, launch_pool=None):
     return B.Broker(home, launcher=launcher or FakeLauncher(), now=clock or time.time,
-                    proxy=proxy or (lambda: None), gauges=gauges or FakeGauges())
+                    proxy=proxy or (lambda: None), gauges=gauges or FakeGauges(),
+                    launch_pool=launch_pool or InlinePool())
 
 
 def write_config(home, slots=None, tiers=None):
@@ -562,7 +576,7 @@ class ReviewFixTests(ProcessCleanup):
             (Path(run_dir) / f"{job['label']}.pid").write_text(str(proc.pid))
             return proc.pid
 
-        self.assertEqual(make_broker(self.home, racing_launcher).tick(), [])
+        make_broker(self.home, racing_launcher).tick()
         self.assertEqual(row(self.home, job_id)["state"], "cancelled")
         self.assertEqual(spawned[0].wait(timeout=10), -signal.SIGTERM)
 
@@ -609,7 +623,7 @@ class ReviewFixTests(ProcessCleanup):
 
         def run_worker_hangs(cmd, **kw):
             if len(cmd) > 1 and str(cmd[1]).endswith("run_worker.py"):
-                raise subprocess.TimeoutExpired(cmd, 300)
+                raise subprocess.TimeoutExpired(cmd, B.LAUNCH_TIMEOUT_S)
             return real_run(cmd, **kw)
 
         with mock.patch.object(B.subprocess, "run", run_worker_hangs):
@@ -970,6 +984,369 @@ class AdaptiveAdmissionTests(ProcessCleanup):
         self.assertEqual(row(self.home, job)["detail"], "hold pi-deepseek-flash: proxy total waiting 12 > 8")
         log_path = self.home / "logs" / "broker.log"
         self.assertEqual(log_path.read_text().count("hold pi-deepseek-flash"), 2)
+
+
+
+def git(cwd, *args):
+    """Run git in ``cwd`` with a throwaway identity; fail the test on a non-zero exit."""
+    return subprocess.run(
+        ["git", "-c", "user.name=agentq-test", "-c", "user.email=agentq-test@example.invalid", *args],
+        cwd=str(cwd), capture_output=True, text=True, check=True,
+    ).stdout.strip()
+
+
+def write_auto_config(home, **auto):
+    import json
+
+    home = Path(home)
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "broker.json").write_text(json.dumps({"auto_worktree": auto}), encoding="utf-8")
+
+
+class AutoWorktreeTests(ProcessCleanup):
+    """Write jobs on a main checkout get their own worktree at launch (a real temp git repo)."""
+
+    def setUp(self):
+        super().setUp()
+        self.root = self.tmp / "worktrees"
+        self.main = self.make_repo()
+        write_auto_config(self.home, root=str(self.root))
+
+    def make_repo(self):
+        origin = self.tmp / "origin.git"
+        seed = self.tmp / "seed"
+        main = self.tmp / "workflow-skills"
+        git(self.tmp, "init", "-q", "--bare", "-b", "main", str(origin))
+        git(self.tmp, "init", "-q", "-b", "main", str(seed))
+        (seed / "README.md").write_text("seed\n", encoding="utf-8")
+        git(seed, "add", "README.md")
+        git(seed, "commit", "-q", "-m", "seed")
+        git(seed, "remote", "add", "origin", str(origin))
+        git(seed, "push", "-q", "origin", "main")
+        git(self.tmp, "clone", "-q", str(origin), str(main))
+        return main
+
+    def submit_write(self, workspace=None, *extra, label=None):
+        args = ["--kind", "write", *extra]
+        if workspace is not None:
+            args += ["--workspace", str(workspace)]
+        return submit(self.env, self.prompt, *args, label=label)
+
+    def expected_path(self, job_id):
+        return self.root / "workflow-skills" / f"agentq-{job_id}"
+
+    def test_write_on_main_checkout_gets_a_worktree_and_launches(self):
+        job_id = self.submit_write(self.main, label="w-main")
+        launcher = self.fake(live_s=30)
+        launched = make_broker(self.home, launcher).tick()
+        self.assertEqual(launched, [job_id])
+        job = row(self.home, job_id)
+        path = self.expected_path(job_id)
+        self.assertEqual(job["workspace"], str(path))
+        self.assertEqual(job["orig_workspace"], str(self.main))
+        self.assertEqual(git(path, "rev-parse", "--abbrev-ref", "HEAD"), f"agentq/{job_id}")
+        self.assertEqual(git(self.main, "status", "--porcelain"), "")
+        self.assertIn(f"auto-worktree {job_id} {path}", (self.home / "logs" / "broker.log").read_text())
+        self.assertEqual(launcher.calls[0]["id"], job_id)
+
+    def test_two_write_jobs_on_the_main_checkout_launch_in_parallel(self):
+        first = self.submit_write(self.main, label="w1")
+        second = self.submit_write(self.main, label="w2")
+        launched = make_broker(self.home, self.fake(live_s=30)).tick()
+        self.assertEqual(launched, [first, second])
+        self.assertNotEqual(row(self.home, first)["workspace"], row(self.home, second)["workspace"])
+
+    def test_auto_worktree_is_not_blocked_by_an_in_place_write_on_the_checkout(self):
+        in_place = self.submit_write(self.main, "--in-place", label="ip")
+        auto = self.submit_write(self.main, label="auto")
+        second_in_place = self.submit_write(self.main, "--in-place", label="ip2")
+        launched = make_broker(self.home, self.fake(live_s=30)).tick()
+        self.assertEqual(launched, [in_place, auto])
+        self.assertEqual(row(self.home, second_in_place)["state"], "queued")
+        self.assertEqual(row(self.home, second_in_place)["detail"], "hold light: workspace busy")
+
+    def test_linked_worktree_workspace_is_untouched(self):
+        linked = self.tmp / "linked"
+        git(self.main, "worktree", "add", "-q", "-b", "feat-linked", str(linked), "origin/main")
+        job_id = self.submit_write(linked, label="linked")
+        self.assertEqual(make_broker(self.home, self.fake(live_s=30)).tick(), [job_id])
+        job = row(self.home, job_id)
+        self.assertEqual(job["workspace"], str(linked))
+        self.assertIsNone(job["orig_workspace"])
+
+    def test_non_git_workspace_is_untouched(self):
+        folder = self.tmp / "hub-state"
+        folder.mkdir()
+        job_id = self.submit_write(folder, label="plain")
+        self.assertEqual(make_broker(self.home, self.fake(live_s=30)).tick(), [job_id])
+        job = row(self.home, job_id)
+        self.assertEqual(job["workspace"], str(folder))
+        self.assertIsNone(job["orig_workspace"])
+
+    def test_in_place_flag_keeps_the_checkout(self):
+        job_id = self.submit_write(self.main, "--in-place", label="ip")
+        self.assertEqual(make_broker(self.home, self.fake(live_s=30)).tick(), [job_id])
+        job = row(self.home, job_id)
+        self.assertEqual(job["workspace"], str(self.main))
+        self.assertIsNone(job["orig_workspace"])
+        self.assertEqual(job["in_place"], 1)
+
+    def test_read_jobs_on_the_checkout_are_untouched(self):
+        job_id = submit(self.env, self.prompt, "--workspace", str(self.main), label="read")
+        self.assertEqual(make_broker(self.home, self.fake(live_s=30)).tick(), [job_id])
+        self.assertIsNone(row(self.home, job_id)["orig_workspace"])
+
+    def test_disabled_config_keeps_the_checkout(self):
+        write_auto_config(self.home, enabled=False, root=str(self.root))
+        job_id = self.submit_write(self.main, label="off")
+        self.assertEqual(make_broker(self.home, self.fake(live_s=30)).tick(), [job_id])
+        job = row(self.home, job_id)
+        self.assertEqual(job["workspace"], str(self.main))
+        self.assertIsNone(job["orig_workspace"])
+
+    def test_worktree_creation_failure_retries_then_fails_without_writing_in_place(self):
+        blocker = self.tmp / "blocker"
+        blocker.write_text("a file, not a folder\n", encoding="utf-8")
+        write_auto_config(self.home, root=str(blocker))
+        job_id = self.submit_write(self.main, label="fails")
+        launcher = self.fake(live_s=30)
+        clock = Clock(1000.0)
+        broker = make_broker(self.home, launcher, clock=clock)
+
+        self.assertEqual(broker.tick(), [])
+        job = row(self.home, job_id)
+        self.assertEqual(job["state"], "queued")
+        self.assertTrue(job["detail"].startswith("auto-worktree failed: "), job["detail"])
+        self.assertEqual(job["not_before"], 1060.0)
+        self.assertEqual(job["workspace"], str(self.main))
+
+        clock.t = 1061.0
+        self.assertEqual(broker.tick(), [])
+        self.assertEqual(row(self.home, job_id)["state"], "queued")
+
+        clock.t = 1122.0
+        self.assertEqual(broker.tick(), [])
+        job = row(self.home, job_id)
+        self.assertEqual(job["state"], "failed")
+        self.assertTrue(job["detail"].startswith("auto-worktree failed after 3 tries: "), job["detail"])
+        self.assertEqual(launcher.calls, [])
+
+    def test_a_retry_after_the_fault_clears_launches_in_a_worktree(self):
+        blocker = self.tmp / "blocker"
+        blocker.write_text("x\n", encoding="utf-8")
+        write_auto_config(self.home, root=str(blocker))
+        job_id = self.submit_write(self.main, label="later")
+        clock = Clock(1000.0)
+        broker = make_broker(self.home, self.fake(live_s=30), clock=clock)
+        self.assertEqual(broker.tick(), [])
+        write_auto_config(self.home, root=str(self.root))
+        clock.t = 1061.0
+        self.assertEqual(broker.tick(), [job_id])
+        job = row(self.home, job_id)
+        self.assertEqual(job["workspace"], str(self.expected_path(job_id)))
+        self.assertIsNone(job["detail"])
+
+    def test_worker_prompt_copy_starts_with_the_worktree_line(self):
+        job_id = self.submit_write(self.main, label="prompted")
+        seen = {}
+        worker = self.fake(live_s=30)
+
+        def recording(job, run_dir, env):
+            seen["prompt"] = Path(job["prompt_path"]).read_text(encoding="utf-8")
+            seen["path"] = job["prompt_path"]
+            return worker(job, run_dir, env)
+
+        make_broker(self.home, recording).tick()
+        path = self.expected_path(job_id)
+        expected_line = (
+            f"You are working in a fresh worktree {path} on branch agentq/{job_id}, created from "
+            f"origin/main for this job. Commit your work on this branch; do not edit {self.main}."
+        )
+        self.assertEqual(seen["prompt"], expected_line + "\n\nDo the thing.\n")
+        self.assertNotEqual(seen["path"], row(self.home, job_id)["prompt_path"])
+        self.assertEqual(Path(row(self.home, job_id)["prompt_path"]).read_text(encoding="utf-8"), "Do the thing.\n")
+
+    def test_finish_log_and_result_show_the_worktree_and_branch(self):
+        job_id = self.submit_write(self.main, label="done")
+        broker = make_broker(self.home, self.fake(live_s=0))
+        broker.tick()
+        broker.tick()
+        job = row(self.home, job_id)
+        self.assertEqual(job["state"], "done")
+        note = f"worktree {job['workspace']} branch agentq/{job_id}"
+        self.assertIn(f"{job_id} finish verdict PASS; {note}", (self.home / "logs" / "broker.log").read_text())
+        code, out = run_cli(self.env, ["result", job_id])
+        self.assertEqual(code, 0)
+        self.assertIn(f"{note} (from {self.main})", out)
+        code, out = run_cli(self.env, ["ls", "--mine"])
+        self.assertIn(f"worktree {job['workspace']}", out)
+
+    def test_submit_records_in_place_as_zero_by_default(self):
+        job_id = self.submit_write(self.main, label="default")
+        self.assertEqual(row(self.home, job_id)["in_place"], 0)
+
+
+class SchemaUpgradeTests(ProcessCleanup):
+    def test_a_version_one_store_gains_the_worktree_columns(self):
+        conn = db.connect(self.home)
+        conn.execute("ALTER TABLE jobs DROP COLUMN orig_workspace")
+        conn.execute("ALTER TABLE jobs DROP COLUMN in_place")
+        conn.execute("PRAGMA user_version = 1")
+        conn.close()
+        conn = db.connect(self.home)
+        columns = {r[1] for r in conn.execute("PRAGMA table_info(jobs)")}
+        self.assertIn("orig_workspace", columns)
+        self.assertIn("in_place", columns)
+        self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], db.SCHEMA_VERSION)
+        conn.close()
+
+
+class BlockingLauncher(FakeLauncher):
+    """Holds every launch whose label is in ``slow`` until ``release`` is set. Real sleeping workers."""
+
+    def __init__(self, slow, release, owner):
+        super().__init__(live_s=30)
+        self.slow = set(slow)
+        self.release = release
+        self.lock = threading.Lock()
+        owner.launchers.append(self)
+
+    def __call__(self, job, run_dir, env):
+        if job["label"] in self.slow:
+            self.release.wait(10)
+        with self.lock:
+            return super().__call__(job, run_dir, env)
+
+    def calls_for(self, job_id):
+        return [call for call in self.calls if call["id"] == job_id]
+
+
+class NonBlockingLaunchTests(ProcessCleanup):
+    def setUp(self):
+        super().setUp()
+        self.pool = concurrent.futures.ThreadPoolExecutor(max_workers=B.MAX_CONCURRENT_LAUNCHES)
+        self.addCleanup(self.pool.shutdown, wait=False)
+        self.release = threading.Event()
+        self.addCleanup(self.release.set)
+
+    def blocking_broker(self, slow, clock=None):
+        launcher = BlockingLauncher(slow, self.release, self)
+        return make_broker(self.home, launcher, clock=clock, launch_pool=self.pool), launcher
+
+    def wait_for(self, broker, predicate, timeout=10.0):
+        deadline = time.monotonic() + timeout
+        while not predicate():
+            if time.monotonic() > deadline:
+                raise AssertionError("condition not reached")
+            broker.tick()
+            time.sleep(0.02)
+
+    def settle(self, broker, timeout=10.0):
+        deadline = time.monotonic() + timeout
+        while broker._inflight:
+            if time.monotonic() > deadline:
+                raise AssertionError("launches still in flight")
+            concurrent.futures.wait(list(broker._inflight.values()), timeout=0.05)
+            conn = db.connect(self.home)
+            try:
+                broker._collect_launches(conn, broker.now())
+            finally:
+                conn.close()
+
+    def test_a_slow_launch_does_not_block_the_next_job(self):
+        write_config(self.home, slots={"light": 4, "tests": 0, "ssh": 0})
+        slow = submit(self.env, self.prompt, label="slow-one")
+        fast = submit(self.env, self.prompt, label="fast-one")
+        broker, launcher = self.blocking_broker({"slow-one"})
+        self.assertEqual(broker.tick(), [slow, fast])
+        self.wait_for(broker, lambda: row(self.home, fast)["pid"] is not None)
+        self.assertIsNone(row(self.home, slow)["pid"])
+        self.assertFalse(self.release.is_set())
+        self.release.set()
+        self.settle(broker)
+        self.assertIsNotNone(row(self.home, slow)["pid"])
+        self.assertEqual(row(self.home, slow)["state"], "running")
+
+    def test_heartbeat_is_written_while_a_launch_is_slow(self):
+        job_id = submit(self.env, self.prompt, label="hb-slow")
+        broker, _ = self.blocking_broker({"hb-slow"})
+        broker.tick()
+        self.assertIn(job_id, broker._inflight)
+        beat = float((self.home / "broker.heartbeat").read_text(encoding="utf-8"))
+        self.assertLess(abs(time.time() - beat), 60)
+        self.release.set()
+        self.settle(broker)
+
+    def test_an_in_flight_launch_holds_its_slot(self):
+        write_config(self.home, slots={"light": 1, "tests": 0, "ssh": 0})
+        first = submit(self.env, self.prompt, label="hold-a")
+        second = submit(self.env, self.prompt, label="hold-b")
+        broker, launcher = self.blocking_broker({"hold-a"})
+        self.assertEqual(broker.tick(), [first])
+        self.assertEqual(broker.tick(), [])
+        self.assertEqual(row(self.home, second)["state"], "queued")
+        self.assertEqual(launcher.calls_for(second), [])
+        self.release.set()
+        self.settle(broker)
+        self.assertEqual(row(self.home, first)["state"], "running")
+
+    def test_an_in_flight_launch_is_not_launched_twice(self):
+        job_id = submit(self.env, self.prompt, label="once-slow")
+        broker, launcher = self.blocking_broker({"once-slow"})
+        self.assertEqual(broker.tick(), [job_id])
+        for _ in range(3):
+            self.assertEqual(broker.tick(), [])
+        self.release.set()
+        self.settle(broker)
+        self.assertEqual(len(launcher.calls_for(job_id)), 1)
+        self.assertEqual(row(self.home, job_id)["state"], "running")
+
+    def test_in_flight_launches_are_capped(self):
+        ids = [submit(self.env, self.prompt, label=f"cap-{i}") for i in range(B.MAX_CONCURRENT_LAUNCHES + 1)]
+        broker, _ = self.blocking_broker({f"cap-{i}" for i in range(len(ids))})
+        self.assertEqual(broker.tick(), ids[: B.MAX_CONCURRENT_LAUNCHES])
+        self.assertEqual(row(self.home, ids[-1])["state"], "queued")
+        self.release.set()
+        self.settle(broker)
+        self.assertEqual(broker.tick(), [ids[-1]])
+        self.settle(broker)
+        self.assertEqual(row(self.home, ids[-1])["state"], "running")
+
+    def test_a_timed_out_launch_requeues_then_fails_after_the_attempt_limit(self):
+        job_id = submit(self.env, self.prompt, label="timeout-job")
+
+        def timing_out(job, run_dir, env):
+            raise B.LaunchError("run_worker timed out with no pid file")
+
+        broker = make_broker(self.home, timing_out, launch_pool=self.pool)
+        for attempt in range(1, B.MAX_ATTEMPTS):
+            broker.tick()
+            self.settle(broker)
+            job = row(self.home, job_id)
+            self.assertEqual((job["state"], job["attempt"]), ("queued", attempt))
+        broker.tick()
+        self.settle(broker)
+        job = row(self.home, job_id)
+        self.assertEqual(job["state"], "failed")
+        self.assertIn("timed out with no pid file", job["detail"])
+
+    def test_launcher_runs_with_no_preflight_and_a_bounded_wait(self):
+        run_dir = self.tmp / "bounded-run"
+        job = {"tier": "pi-kimi", "label": "bounded", "workspace": str(self.tmp),
+               "prompt_path": str(self.prompt)}  # fmt: skip
+        seen = {}
+
+        def fake_run(cmd, **kw):
+            seen["cmd"] = list(cmd)
+            seen["timeout"] = kw["timeout"]
+            (run_dir / "bounded.pid").write_text("4242", encoding="utf-8")
+            return subprocess.CompletedProcess(cmd, 0, stdout="STATUS: running tier=pi-kimi\n", stderr="")
+
+        with mock.patch.object(B.subprocess, "run", fake_run):
+            self.assertEqual(B.run_worker_launcher(job, run_dir, dict(os.environ)), 4242)
+        self.assertIn("--no-preflight", seen["cmd"])
+        self.assertEqual(seen["timeout"], 120)
+        self.assertEqual(B.LAUNCH_TIMEOUT_S, 120)
 
 
 if __name__ == "__main__":

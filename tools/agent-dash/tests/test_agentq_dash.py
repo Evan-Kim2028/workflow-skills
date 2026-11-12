@@ -279,9 +279,9 @@ class ServerTest(unittest.TestCase):
         self.assertTrue(ctype.startswith("text/html"))
         self.assertIn("<!DOCTYPE html>", html)
         for title in (
-            "Total pool and DeepSeek output, % of limit",
+            "Share of each Morph-enforced limit, % of limit",
             "Active runs over time, with caps",
-            "Tokens per minute, millions",
+            "Tokens per 5 minutes, millions",
             "Runs",
             "Top consumers today",
             "Upstream 429s per minute",
@@ -459,12 +459,12 @@ class RunsTest(unittest.TestCase):
         self.assertEqual(capacity["waiting_now"], 3)
         self.assertEqual(capacity["waiting_by_lane"], {"urgent": 0, "normal": 2, "backlog": 1})
 
-    def test_token_mix_splits_each_minute_into_three_series(self) -> None:
-        by_minute = {row["minute"]: row for row in self.summary["token_mix"]}
-        row = by_minute[minute_at(60)]
-        self.assertEqual(row["cache_read"], 1000)
-        self.assertEqual(row["uncached"], 100 + 2429)
-        self.assertEqual(row["output"], 7000 + 100)
+    def test_token_mix_uses_five_minute_buckets_and_keeps_every_token(self) -> None:
+        mix = self.summary["token_mix"]
+        self.assertEqual(self.summary["token_bucket_s"], 300)
+        self.assertTrue(all(row["t"] % 300 == 0 for row in mix))
+        for key, source in (("cache_read", "cache_read"), ("uncached", "input"), ("output", "output")):
+            self.assertEqual(sum(row[key] for row in mix), sum(p[source] for p in self.summary["minutes"]))
 
     def test_direct_run_past_the_seven_day_lookback_is_absent(self) -> None:
         self.assertNotIn("hub-direct-launch-x", self.runs)
@@ -784,3 +784,315 @@ class LogTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+OLD_MINUTES_DDL = """
+CREATE TABLE proxy_minutes (
+    minute TEXT NOT NULL, model TEXT NOT NULL,
+    req INT, ok INT, r429 INT,
+    input INT, cache_read INT, output INT, uncached_est INT,
+    wait_p50_ms INT, wait_p95_ms INT, target REAL,
+    PRIMARY KEY (minute, model)
+)
+"""
+LATENCY_ROW_COLUMNS = (
+    "minute, model, req, ok, r429, input, cache_read, output, uncached_est, wait_p50_ms, wait_p95_ms, target, "
+    "upstream_ms_sum, upstream_n, upstream_p50_ms, upstream_p95_ms, ttfb_p50_ms, in_flight_max"
+)
+
+
+def write_latency_home(tmp: Path, rows: list[tuple]) -> Path:
+    home = make_home(tmp, minutes=False, jobs=False)
+    connection = sqlite3.connect(home / "agentq.db")
+    connection.execute(PROXY_MINUTES_DDL)
+    connection.executemany(f"INSERT INTO proxy_minutes ({LATENCY_ROW_COLUMNS}) VALUES ({','.join('?' * 18)})", rows)
+    connection.commit()
+    connection.close()
+    return home
+
+
+def latency_row(minute: str, model: str, n: int, p50: int | None, p95: int | None) -> tuple:
+    total_ms = None if p50 is None else p50 * n
+    return (minute, model, n, n, 0, 0, 0, 0, 0, 0, 0, 0.9, total_ms, n if p50 is not None else None, p50, p95, None, 1)
+
+
+class UpstreamLatencyDashTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.rows = [
+            latency_row(minute_at(60), "morph-dsv41flash-1017", 2, 1000, 2000),
+            latency_row(minute_at(60), "morph-kimik31", 4, 500, 900),
+            latency_row(minute_at(120), "morph-dsv41flash-1017", 3, None, None),
+            latency_row(minute_at(180), "morph-dsv41flash-1017", 2, 300, 700),
+        ]
+        self.home = write_latency_home(Path(self.tmp.name), self.rows)
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def summary(self, live=None, hours: int = 24) -> dict:
+        return dash.build_summary(self.home, hours, now=NOW, fetch_live=lambda: live)
+
+    def point(self, minutes_ago: int, home: Path | None = None) -> dict:
+        since = UNTIL - 24 * 3600
+        points = dash.minute_series(dash.read_minute_rows((home or self.home) / "agentq.db", since, UNTIL), since, UNTIL)
+        return next(p for p in points if p["t"] == UNTIL - minutes_ago * 60)
+
+    def test_minute_point_combines_models_by_request_weighted_p50_and_worst_p95(self) -> None:
+        point = self.point(1)
+        self.assertEqual(point["upstream_p50_ms"], round((1000 * 2 + 500 * 4) / 6))
+        self.assertEqual(point["upstream_p95_ms"], 2000)
+        self.assertEqual(point["upstream_n"], 6)
+
+    def test_rows_without_latency_give_null_points_not_zeros(self) -> None:
+        point = self.point(2)
+        self.assertIsNone(point["upstream_p50_ms"])
+        self.assertIsNone(point["upstream_p95_ms"])
+
+    def test_bucket_averages_p50_and_takes_the_worst_p95(self) -> None:
+        points = [
+            {"t": 600, "wait_p95_ms": None, "upstream_p50_ms": 1000, "upstream_p95_ms": 2000,
+             **{k: 0 for k in dash.BUCKET_SUM_KEYS}, **{k: 0.0 for k in dash.PCT_KEYS}, "minute": "x"},
+            {"t": 660, "wait_p95_ms": None, "upstream_p50_ms": 500, "upstream_p95_ms": 900,
+             **{k: 0 for k in dash.BUCKET_SUM_KEYS}, **{k: 0.0 for k in dash.PCT_KEYS}, "minute": "x"},
+            {"t": 720, "wait_p95_ms": None, "upstream_p50_ms": None, "upstream_p95_ms": None,
+             **{k: 0 for k in dash.BUCKET_SUM_KEYS}, **{k: 0.0 for k in dash.PCT_KEYS}, "minute": "x"},
+        ]
+        bucket = dash.bucket_minutes(points, 300)[0]
+        self.assertEqual(bucket["upstream_p50_ms"], 750)
+        self.assertEqual(bucket["upstream_p95_ms"], 2000)
+
+    def test_perf_kpi_is_request_weighted_over_minutes_that_have_latency(self) -> None:
+        perf = self.summary()["perf_kpis"]
+        self.assertEqual(perf["upstream_response_p50_ms"], round((4000 + 600) / 8))
+        self.assertEqual(perf["upstream_response_p95_ms"], 2000)
+
+    def test_in_flight_now_sums_the_live_status_across_models(self) -> None:
+        live = {"ok": True, "budgets": {}, "upstream": {"in_flight": {"morph-dsv41flash-1017": 3, "morph-kimik31": 1}}}
+        self.assertEqual(self.summary(live)["perf_kpis"]["in_flight_now"], 4)
+
+    def test_in_flight_now_is_null_without_a_live_status(self) -> None:
+        self.assertIsNone(self.summary(None)["perf_kpis"]["in_flight_now"])
+
+    def test_old_schema_without_latency_columns_still_charts_the_counts(self) -> None:
+        tmp = Path(tempfile.mkdtemp())
+        home = make_home(tmp, minutes=False, jobs=False)
+        connection = sqlite3.connect(home / "agentq.db")
+        connection.execute(OLD_MINUTES_DDL)
+        connection.execute(
+            "INSERT INTO proxy_minutes (minute, model, req, ok, r429, input, cache_read, output, uncached_est, "
+            "wait_p50_ms, wait_p95_ms, target) VALUES (?,?,5,5,1,100,0,50,0,200,800,0.9)",
+            (minute_at(60), "morph-dsv41flash-1017"),
+        )
+        connection.commit()
+        connection.close()
+        summary = dash.build_summary(home, 24, now=NOW, fetch_live=no_proxy)
+        self.assertNotIn("minutes", summary["errors"])
+        point = self.point(1, home)
+        self.assertEqual(point["req"], 5)
+        self.assertEqual(point["wait_p95_ms"], 800)
+        self.assertIsNone(point["upstream_p50_ms"])
+        self.assertIsNone(summary["perf_kpis"]["upstream_response_p50_ms"])
+        self.assertIsNone(summary["perf_kpis"]["upstream_response_p95_ms"])
+
+    def test_page_has_the_paired_capacity_charts_the_response_chart_and_the_tiles(self) -> None:
+        for marker in (
+            "Capacity vs workers",
+            'id="c-billed"',
+            'id="c-workers"',
+            'id="c-upstream"',
+            'id="p-morph"',
+            'id="p-inflight"',
+            "Morph response time per request (s), p50 and p95",
+            "function compact(",
+        ):
+            self.assertIn(marker, dash.PAGE_HTML)
+
+
+class EnforcedLimitsChartTest(unittest.TestCase):
+    def test_main_billed_chart_plots_only_enforced_limits(self) -> None:
+        html = dash.PAGE_HTML
+        start = html.index('registerChart("c-billed"')
+        block = html[start:html.index('registerChart("c-workers"')]
+        self.assertIn("pct_total", block)
+        self.assertIn("pct_ds_uncached", block)
+        self.assertNotIn("pct_ds_output", block)
+        self.assertNotIn("70k", block)
+
+    def test_ds_uncached_share_is_of_the_400k_limit(self) -> None:
+        point = dash.minute_point(0, {"ds_uncached": 200_000})
+        self.assertEqual(point["pct_ds_uncached"], 0.5)
+
+    def test_page_has_at_most_twelve_kpi_tiles(self) -> None:
+        import re
+        tiles = re.findall(r'class="kpi(?: head)?"', dash.PAGE_HTML)
+        self.assertLessEqual(len(tiles), 12)
+
+
+LIMITS_NOW = {"total": 10_000_000, "output": 70_000, "uncached": 24_290, "uncached_ds": 400_000}
+CALM = {"load1": 2.0, "cpus": 15, "load_per_cpu": 2.0 / 15, "memory_free_pct": 60.0}
+HOT = {"load1": 44.0, "cpus": 15, "load_per_cpu": 44.0 / 15, "memory_free_pct": 40.0}
+IDLE_LIVE = {"queued": {"urgent": 0, "normal": 0, "backlog": 0}}
+
+
+def five_minutes(**fields) -> dict:
+    """Minute rows for the five complete minutes before UNTIL, each with the same fields."""
+    return {UNTIL - 60 * k: fields for k in range(1, 6)}
+
+
+def verdict_for(raw, *, live=IDLE_LIVE, laptop=CALM, kimi_waiting=False, budget_429s=None,
+                jobs_queued=0, ds_p50_5m_ms=None, ds_p50_base_ms=None):
+    return dash.verdict(
+        raw, UNTIL, LIMITS_NOW, live, kimi_waiting=kimi_waiting, budget_429s=budget_429s or {},
+        laptop=laptop, jobs_queued=jobs_queued, ds_p50_5m_ms=ds_p50_5m_ms, ds_p50_base_ms=ds_p50_base_ms,
+    )
+
+
+class LimitedByTest(unittest.TestCase):
+    def test_morph_limit_when_an_enforced_budget_averages_90_percent(self) -> None:
+        result = verdict_for(five_minutes(total=1_000_000, ds_uncached=380_000))
+        self.assertEqual(result["key"], "morph_limit")
+        self.assertEqual(result["chip"], "Morph limit")
+        self.assertIn("DeepSeek uncached input averaged 95% of its limit over the last 5 minutes", result["text"])
+
+    def test_a_single_peak_minute_with_a_low_average_is_not_morph_limit(self) -> None:
+        raw = five_minutes(total=1_000_000, ds_uncached=40_000)
+        raw[UNTIL - 120] = {"total": 1_000_000, "ds_uncached": 507_000}
+        result = verdict_for(raw)
+        self.assertNotEqual(result["key"], "morph_limit")
+        self.assertNotIn("peak minute 127%", result["text"])
+
+    def test_peak_minute_is_context_in_the_sentence_when_morph_limit_holds_on_average(self) -> None:
+        raw = five_minutes(total=1_000_000, ds_uncached=370_000)
+        raw[UNTIL - 120] = {"total": 1_000_000, "ds_uncached": 507_000}
+        result = verdict_for(raw)
+        self.assertEqual(result["key"], "morph_limit")
+        self.assertIn("peak minute 127%", result["text"])
+
+    def test_morph_limit_when_an_enforced_budget_had_429s_in_two_minutes(self) -> None:
+        raw = five_minutes(total=1_000_000)
+        result = verdict_for(raw, budget_429s={"total": {UNTIL - 60, UNTIL - 180}})
+        self.assertEqual(result["key"], "morph_limit")
+        self.assertIn("Total pool returned 429s in 2 of the last 5 minutes", result["text"])
+
+    def test_one_429_minute_is_not_enough(self) -> None:
+        result = verdict_for(five_minutes(total=1_000_000), budget_429s={"total": {UNTIL - 60}})
+        self.assertNotEqual(result["key"], "morph_limit")
+
+    def test_kimi_uncached_counts_only_while_kimi_jobs_wait(self) -> None:
+        raw = five_minutes(total=0, kimi_uncached=24_290)
+        self.assertNotEqual(verdict_for(raw, kimi_waiting=False)["key"], "morph_limit")
+        waiting = verdict_for(raw, kimi_waiting=True)
+        self.assertEqual(waiting["key"], "morph_limit")
+        self.assertIn("Kimi uncached averaged 100%", waiting["text"])
+
+    def test_morph_slow_when_deepseek_p50_doubles_and_proxy_queue_is_empty(self) -> None:
+        result = verdict_for(five_minutes(total=1_000_000), ds_p50_5m_ms=12_000, ds_p50_base_ms=5_000)
+        self.assertEqual(result["key"], "morph_slow")
+        self.assertEqual(result["chip"], "Morph slow")
+
+    def test_morph_slow_needs_an_empty_proxy_queue(self) -> None:
+        queued = {"queued": {"urgent": 0, "normal": 3, "backlog": 0}}
+        result = verdict_for(five_minutes(total=1_000_000), live=queued, ds_p50_5m_ms=12_000, ds_p50_base_ms=5_000)
+        self.assertNotEqual(result["key"], "morph_slow")
+
+    def test_laptop_when_load_per_cpu_is_over_1_5(self) -> None:
+        result = verdict_for(five_minutes(total=1_000_000), laptop=HOT)
+        self.assertEqual(result["key"], "laptop")
+        self.assertIn("load 44.0 on 15 CPUs", result["text"])
+
+    def test_laptop_when_memory_free_is_under_25_percent(self) -> None:
+        low_memory = dict(CALM, memory_free_pct=20.0)
+        self.assertEqual(verdict_for(five_minutes(total=1_000_000), laptop=low_memory)["key"], "laptop")
+
+    def test_demand_when_pool_is_idle_and_nothing_waits(self) -> None:
+        result = verdict_for(five_minutes(total=1_000_000))
+        self.assertEqual(result["key"], "demand")
+        self.assertEqual(result["chip"], "Demand")
+
+    def test_demand_needs_no_ready_job(self) -> None:
+        self.assertEqual(verdict_for(five_minutes(total=1_000_000), jobs_queued=2)["key"], "near_capacity")
+
+    def test_near_capacity_otherwise(self) -> None:
+        result = verdict_for(five_minutes(total=8_800_000))
+        self.assertEqual(result["key"], "near_capacity")
+        self.assertEqual(result["chip"], "Near capacity")
+
+
+class RoomForWorkersTest(unittest.TestCase):
+    def room_for(self, raw, *, workers, laptop=CALM):
+        return dash.room(raw, UNTIL, LIMITS_NOW, active_ds_workers=workers, laptop=laptop)
+
+    def test_bounded_by_morph_uncached_input(self) -> None:
+        raw = five_minutes(total=1_000_000, ds_uncached=300_000)
+        result = self.room_for(raw, workers=50)
+        self.assertEqual(result["bound"], "uncached_ds")
+        self.assertEqual(result["workers"], 13)
+        self.assertEqual(result["text"], "Room for about 13 more busy DeepSeek workers (bounded by Morph uncached input).")
+
+    def test_bounded_by_morph_total(self) -> None:
+        raw = five_minutes(total=9_000_000, ds_uncached=0)
+        result = self.room_for(raw, workers=50)
+        self.assertEqual(result["bound"], "total")
+        self.assertEqual(result["workers"], 2)
+        self.assertIn("bounded by Morph total", result["text"])
+
+    def test_bounded_by_laptop_cpu_leaves_no_room(self) -> None:
+        raw = five_minutes(total=1_000_000, ds_uncached=100_000)
+        result = self.room_for(raw, workers=50, laptop=HOT)
+        self.assertEqual(result["bound"], "laptop")
+        self.assertEqual(result["workers"], 0)
+        self.assertEqual(result["text"], "No room; adding workers will only queue (bounded by laptop CPU).")
+
+    def test_no_active_workers_means_room_is_unknown(self) -> None:
+        result = self.room_for(five_minutes(total=1_000_000), workers=None)
+        self.assertIsNone(result["workers"])
+        self.assertIn("Room unknown", result["text"])
+
+
+class ActivityWindowTest(unittest.TestCase):
+    def test_five_and_fifteen_minute_totals_with_deltas(self) -> None:
+        raw = {UNTIL - 60 * k: {"total": 100, "req": 2} for k in range(1, 6)}
+        raw.update({UNTIL - 60 * k: {"total": 50, "req": 1} for k in range(6, 11)})
+        five = dash.window_tokens(raw, UNTIL, 5)
+        self.assertEqual((five["tokens"], five["requests"], five["previous_tokens"]), (500, 10, 250))
+        self.assertEqual(five["delta"], 1.0)
+        fifteen = dash.window_tokens(raw, UNTIL, 15)
+        self.assertEqual(fifteen["tokens"], 750)
+        self.assertIsNone(fifteen["delta"])
+
+    def test_live_limits_override_the_constants(self) -> None:
+        live = {"budgets": {"uncached_ds": {"limit": 400_000}, "total": {"limit": 9_000_000}}}
+        resolved = dash.resolve_limits(live)
+        self.assertEqual(resolved["uncached_ds"], 400_000)
+        self.assertEqual(resolved["total"], 9_000_000)
+        self.assertEqual(dash.resolve_limits(None)["uncached"], 24_290)
+
+
+class SummaryVerdictTest(unittest.TestCase):
+    def test_summary_carries_verdict_room_activity_and_five_minute_token_buckets(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = make_home(Path(tmp))
+            summary = dash.build_summary(home, 6, now=NOW, fetch_live=proxy_status, laptop=CALM)
+        self.assertIn(summary["verdict"]["key"], {"morph_limit", "morph_slow", "laptop", "demand", "near_capacity"})
+        self.assertIn("text", summary["room"])
+        self.assertIn("tokens_5m", summary["activity"])
+        self.assertEqual(summary["token_bucket_s"], 300)
+        self.assertEqual({p["t"] % 300 for p in summary["token_mix"]}, {0})
+
+
+class BudgetRateLimitLogTest(unittest.TestCase):
+    def test_calib_lines_give_the_minutes_each_budget_was_429d(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            (home / "logs").mkdir()
+            this = dash.minute_stamp(UNTIL - 60)
+            old = dash.minute_stamp(UNTIL - 3600)
+            (home / "logs" / "proxy.err.log").write_text(
+                f"{this}:30Z agentq-proxy calib minute={this} budget=total sec=30.0\n"
+                f"{old}:30Z agentq-proxy calib minute={old} budget=total sec=30.0\n"
+                f"{this}:31Z agentq-proxy calib minute={this} budget=None sec=31.0\n",
+                encoding="utf-8",
+            )
+            found = dash.budget_429_minutes(home, UNTIL)
+        self.assertEqual(found, {"total": {UNTIL - 60}})

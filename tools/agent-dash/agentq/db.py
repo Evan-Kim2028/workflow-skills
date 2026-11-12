@@ -17,10 +17,12 @@ import time
 import uuid
 from pathlib import Path
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 3
 LANES = ("urgent", "normal", "backlog")
 KINDS = ("read", "write", "review")
 RESOURCES = ("light", "tests", "ssh")
+REVIEW_TIER = "pi-kimi"
+DEFAULT_TIER = "pi-deepseek-flash"
 OPEN_STATES = ("queued", "running")
 TERMINAL_STATES = ("done", "failed", "cancelled")
 AGING_S = 15 * 60
@@ -31,6 +33,20 @@ CONNECT_TIMEOUT_S = 30
 RETRY_BUDGET_S = 60.0
 BACKOFF_MIN_S = 0.05
 BACKOFF_MAX_S = 1.0
+
+BACKLOG_TABLE = """CREATE TABLE backlog_templates (
+    name TEXT PRIMARY KEY,
+    prompt_path TEXT NOT NULL,
+    kind TEXT NOT NULL DEFAULT 'read',
+    res TEXT NOT NULL DEFAULT 'light',
+    tier TEXT,
+    workspace TEXT NOT NULL,
+    every_s REAL NOT NULL,
+    max_runtime_s REAL,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    last_submitted REAL,
+    created_at REAL NOT NULL
+)"""
 
 _STATEMENTS = (
     """CREATE TABLE jobs (
@@ -43,6 +59,8 @@ _STATEMENTS = (
         tier TEXT NOT NULL,
         label TEXT NOT NULL,
         workspace TEXT NOT NULL,
+        orig_workspace TEXT,
+        in_place INTEGER NOT NULL DEFAULT 0,
         session TEXT NOT NULL,
         harness TEXT NOT NULL,
         prompt_path TEXT NOT NULL,
@@ -74,18 +92,33 @@ _STATEMENTS = (
         kind TEXT NOT NULL,
         detail TEXT
     )""",
+    BACKLOG_TABLE,
 )
+
+# Each step upgrades a store from the version it names to the next one.
+_UPGRADES = {
+    1: (
+        "ALTER TABLE jobs ADD COLUMN orig_workspace TEXT",
+        "ALTER TABLE jobs ADD COLUMN in_place INTEGER NOT NULL DEFAULT 0",
+    ),
+    2: (BACKLOG_TABLE.replace("CREATE TABLE ", "CREATE TABLE IF NOT EXISTS ", 1),),
+}
 
 JOB_COLUMNS = frozenset(
     {
         "id", "queue_seq", "lane", "state", "kind", "res", "tier", "label",
-        "workspace", "session", "harness", "prompt_path", "run_dir", "pid",
+        "workspace", "orig_workspace", "in_place", "session", "harness", "prompt_path", "run_dir", "pid",
         "pgid", "pid_start", "pi_session", "attempt", "rate_attempts",
         "watchdog_trips", "capacity_refusals", "max_runtime_s", "not_before",
         "verdict", "report_path", "detail", "submitted_at", "started_at",
         "finished_at", "priority_age_at",
     }
 )  # fmt: skip
+
+
+def default_tier(kind: str) -> str:
+    """The tier a job of ``kind`` runs on when no tier is given: review goes to pi-kimi."""
+    return REVIEW_TIER if kind == "review" else DEFAULT_TIER
 
 
 def home_dir(env=None) -> Path:
@@ -163,14 +196,24 @@ def ensure_wal(conn: sqlite3.Connection) -> None:
 
 
 def migrate(conn: sqlite3.Connection) -> None:
-    """Create the schema once. A current schema is read without a write lock."""
+    """Create the schema once, or upgrade an older store step by step.
+
+    A current schema is read without a write lock.
+    """
     if conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION:
         return
     with tx(conn):
-        if conn.execute("PRAGMA user_version").fetchone()[0] == 0:
+        version = conn.execute("PRAGMA user_version").fetchone()[0]
+        if version == SCHEMA_VERSION:
+            return
+        if version == 0:
             for statement in _STATEMENTS:
                 conn.execute(statement)
-            conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+        else:
+            for step in range(version, SCHEMA_VERSION):
+                for statement in _UPGRADES[step]:
+                    conn.execute(statement)
+        conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
 
 @contextlib.contextmanager
@@ -235,6 +278,11 @@ def transition(conn, job_id: str, from_states, now: float, kind: str | None, not
         if kind is not None:
             add_event(conn, job_id, kind, note, now)
     return True
+
+
+def count_events(conn, job_id: str, kind: str) -> int:
+    row = conn.execute("SELECT COUNT(*) FROM events WHERE job_id = ? AND kind = ?", (job_id, kind)).fetchone()
+    return row[0]
 
 
 def front_queue_seq(conn, lane: str) -> int:
