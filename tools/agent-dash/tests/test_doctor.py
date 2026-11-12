@@ -1270,13 +1270,32 @@ class FleetTest(unittest.TestCase):
 
     def test_over_cap(self):
         registry = {"workers": {"muse": {"cap": 1, "pgrep": "[m]use", "kind": "muse"}}}
-        result = self._collect(workers_registry=registry, pgrep_counts={"[m]use": 3})
+        result = self._collect(workers_registry=registry, pgrep_counts={"([m]use)( |$)": 3})
         found = [item for item in result["problems"] if item["code"] == "over-cap"]
         self.assertEqual(len(found), 1)
         self.assertEqual(found[0]["id"], "over-cap:global")
         self.assertIn("3", found[0]["detail"])
         self.assertEqual(found[0]["fix_command"], "python3 agent_dash.py doctor --all")
-        calm = self._collect(workers_registry=registry, pgrep_counts={"[m]use": 1})
+        calm = self._collect(workers_registry=registry, pgrep_counts={"([m]use)( |$)": 1})
+        self.assertFalse([item for item in calm["problems"] if item["code"] == "over-cap"])
+
+    def test_over_cap_counts_a_shared_model_pool(self):
+        # Flash (26) and low (20) run one model: the pool is the largest cap, 26.
+        # A pool of 27 is over; each tier's own count is under its own cap.
+        registry = {"workers": {
+            "flash": {"cap": 26, "pgrep": "[l]aunch_pi.py.*--tier flash( |$)", "model": "river/m"},
+            "low": {"cap": 20, "pgrep": "[l]aunch_pi.py.*--tier low( |$)", "model": "river/m:low"},
+        }}
+        union = "([l]aunch_pi.py.*--tier flash( |$))|([l]aunch_pi.py.*--tier low( |$))"
+        counts = {union: 27, "[l]aunch_pi.py.*--tier flash( |$)": 15, "[l]aunch_pi.py.*--tier low( |$)": 12}
+        result = self._collect(workers_registry=registry, pgrep_counts=dict(counts))
+        found = [item for item in result["problems"] if item["code"] == "over-cap"]
+        self.assertEqual(len(found), 1)
+        self.assertIn("river/m", found[0]["detail"])
+        self.assertIn("27", found[0]["detail"])
+        self.assertIn("26", found[0]["detail"])
+        counts[union] = 26
+        calm = self._collect(workers_registry=registry, pgrep_counts=dict(counts))
         self.assertFalse([item for item in calm["problems"] if item["code"] == "over-cap"])
 
 

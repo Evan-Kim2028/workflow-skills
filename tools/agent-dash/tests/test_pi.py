@@ -140,9 +140,14 @@ class LauncherHelperTest(unittest.TestCase):
         self.assertIsNone(launch.validate_label("ws1-plan-visuals"))
 
     def test_quota_marks(self):
-        self.assertTrue(launch.quota_hit([{"error": "insufficient credits", "stop": "error"}]))
-        self.assertTrue(launch.quota_hit([{"error": "HTTP 402 payment required", "stop": "error"}]))
-        self.assertTrue(launch.quota_hit([{"error": "429 rate limit", "stop": "error"}]))
+        # Structured provider errors: a 402/429 status with a JSON error body, or Morph's text.
+        self.assertTrue(launch.quota_hit([{"error": '402: {"error":{"message":"insufficient credits"}}', "stop": "error"}]))
+        self.assertTrue(launch.quota_hit([{"error": "Rate limit exceeded", "stop": "error"}]))
+        # Bare substrings in an error line are not quota.
+        self.assertFalse(launch.quota_hit([{"error": "insufficient credits", "stop": "error"}]))
+        self.assertFalse(launch.quota_hit([{"error": "HTTP 402 payment required", "stop": "error"}]))
+        self.assertFalse(launch.quota_hit([{"error": "429 rate limit", "stop": "error"}]))
+        self.assertFalse(launch.quota_hit([{"error": "the balance is 4029 credits", "stop": "error"}]))
         self.assertFalse(launch.quota_hit([{"error": "connection reset", "stop": "error"}]))
 
     def test_recovered_429_is_not_quota_and_counts_as_a_retry(self):
@@ -164,7 +169,7 @@ class LauncherHelperTest(unittest.TestCase):
     def test_unrecovered_429_is_quota(self):
         # Last assistant message_end: nothing follows, so quota.
         self.assertTrue(
-            launch.quota_hit([{"error": "429: Account request rate limit exceeded for this model", "stop": "error"}])
+            launch.quota_hit([{"error": '429: {"message":"Account request rate limit exceeded","type":"rate_limit_error"}', "stop": "error"}])
         )
         # A 429 with no successful assistant message after it is unrecovered.
         tail = [
@@ -176,12 +181,12 @@ class LauncherHelperTest(unittest.TestCase):
 
     def test_credit_exhaustion_is_quota_even_when_recovered(self):
         recovered = [
-            {"error": "HTTP 402 payment required", "stop": "error"},
+            {"error": '402: {"error":{"message":"payment required"}}', "stop": "error"},
             {"error": None, "stop": "stop"},
         ]
         self.assertTrue(launch.quota_hit(recovered))
         self.assertTrue(
-            launch.quota_hit([{"error": None, "stop": "toolUse"}, {"error": "insufficient credits", "stop": "error"}])
+            launch.quota_hit([{"error": None, "stop": "toolUse"}, {"error": '402: {"error":{"message":"insufficient credits"}}', "stop": "error"}])
         )
 
     def test_clean_run_has_no_quota_and_no_retries(self):
@@ -259,6 +264,149 @@ class LauncherHelperTest(unittest.TestCase):
         self.assertFalse(launch.quota_hit(events))
         self.assertEqual(launch.rate_limit_retries(events), 1)
         self.assertEqual(pi.final_text(raw), "PASS\nreport body")
+
+
+class LauncherQuotaMarkerTest(unittest.TestCase):
+    """launch_pi writes its quota marker per label, so runs sharing an outdir keep their own."""
+
+    def setUp(self):
+        from unittest import mock
+
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        self.state = root / "state"
+        self.ws = root / "ws"
+        self.ws.mkdir()
+        self.prompt = root / "prompt.md"
+        self.prompt.write_text("do the task\n", encoding="utf-8")
+        self.outdir = root / "pi"
+        patches = [
+            mock.patch.object(launch, "state_dir", return_value=self.state),
+            mock.patch.object(launch, "register_run_dir", return_value=None),
+            mock.patch.object(launch.logfilter, "run_filtered", return_value=0),
+        ]
+        for patch in patches:
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def run_pi(self, label, quota):
+        from unittest import mock
+
+        with mock.patch.object(launch, "quota_hit", return_value=quota):
+            return launch.main([label, str(self.ws), str(self.prompt), str(self.outdir), "--model", DEEPSEEK])
+
+    def test_quota_marker_names_its_label(self):
+        self.assertEqual(self.run_pi("ws1-exec-lane-1", True), 1)
+        marker = self.outdir / "QUOTA-ws1-exec-lane-1"
+        self.assertEqual(
+            marker.read_text(encoding="utf-8"),
+            "model\t%s\nlabel\tws1-exec-lane-1\n" % DEEPSEEK,
+        )
+        self.assertFalse((self.outdir / "QUOTA").exists())
+
+    def test_two_quota_runs_in_one_outdir_keep_two_markers(self):
+        self.run_pi("ws1-exec-lane-1", True)
+        self.run_pi("ws1-exec-lane-2", True)
+        self.assertTrue((self.outdir / "QUOTA-ws1-exec-lane-1").is_file())
+        self.assertTrue((self.outdir / "QUOTA-ws1-exec-lane-2").is_file())
+
+    def test_clean_run_writes_no_marker(self):
+        self.run_pi("ws1-exec-lane-3", False)
+        self.assertEqual([p.name for p in self.outdir.glob("QUOTA*")], [])
+
+
+class LauncherResumeTest(unittest.TestCase):
+    """AGENTQ_RESUME_SESSION forks the dead run's session into the new pi dir, or starts fresh."""
+
+    def setUp(self):
+        from unittest import mock
+
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        self.state = root / "state"
+        self.ws = root / "ws"
+        self.ws.mkdir()
+        self.prompt = root / "prompt.md"
+        self.prompt.write_text("do the task\n", encoding="utf-8")
+        self.outdir = root / "pi"
+        self.old_session = root / "old-pi" / "sessions" / "old.jsonl"
+        self.old_session.parent.mkdir(parents=True)
+        self.old_session.write_text('{"type":"session"}\n', encoding="utf-8")
+        self.calls = []
+        self.results = [0]
+        self.captured = []
+        patches = [
+            mock.patch.object(launch, "state_dir", return_value=self.state),
+            mock.patch.object(launch, "register_run_dir", return_value=None),
+            mock.patch.object(launch, "report_lines", side_effect=lambda state, lines: self.captured.extend(lines)),
+            mock.patch.object(launch, "quota_hit", return_value=False),
+            mock.patch.object(launch.logfilter, "run_filtered", side_effect=self.fake_pi),
+        ]
+        for patch in patches:
+            patch.start()
+            self.addCleanup(patch.stop)
+        env = mock.patch.dict(os.environ, {}, clear=False)
+        env.start()
+        self.addCleanup(env.stop)
+        os.environ.pop(launch.RESUME_ENV, None)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def fake_pi(self, argv, stream_path, **kwargs):
+        self.calls.append(list(argv))
+        rc = self.results[min(len(self.calls), len(self.results)) - 1]
+        Path(stream_path).write_bytes(b"")
+        return rc
+
+    def run_launcher(self, label="ws1-exec-lane-7"):
+        return launch.main([label, str(self.ws), str(self.prompt), str(self.outdir), "--model", DEEPSEEK])
+
+    def local_prompt(self, label="ws1-exec-lane-7"):
+        return (self.outdir / f"prompt-{label}.md").resolve()
+
+    def err_text(self, label="ws1-exec-lane-7"):
+        return (self.outdir / f"err-{label}.log").read_text(encoding="utf-8")
+
+    def test_resume_forks_the_old_session_into_the_new_pi_dir(self):
+        os.environ[launch.RESUME_ENV] = str(self.old_session)
+        self.results = [0]
+        self.run_launcher()
+        argv = self.calls[0]
+        self.assertEqual(argv[argv.index("--fork") + 1], str(self.old_session))
+        self.assertEqual(argv[argv.index("--session-dir") + 1], str(self.outdir / "sessions"))
+        self.assertIn(launch.RESUME_PROMPT, argv)
+        self.assertFalse(any(arg.startswith("@") for arg in argv))
+        self.assertEqual(argv[argv.index("--append-system-prompt") + 1], str(self.local_prompt()))
+        self.assertEqual(len(self.calls), 1)
+        run = [line for line in self.captured if line.get("type") == "run"][-1]
+        self.assertEqual(run["resumed_from"], str(self.old_session))
+        self.assertNotIn(str(self.old_session.parent), " ".join(argv[argv.index("--session-dir") + 1:]))
+
+    def test_missing_session_file_starts_fresh_with_a_note(self):
+        os.environ[launch.RESUME_ENV] = str(self.old_session.parent / "gone.jsonl")
+        self.results = [0]
+        self.run_launcher()
+        self.assertEqual(len(self.calls), 1)
+        self.assertEqual(self.calls[0][self.calls[0].index("--append-system-prompt") + 1], str(self.local_prompt()))
+        self.assertNotIn("--fork", self.calls[0])
+        self.assertIn("missing or empty; starting fresh", self.err_text())
+        run = [line for line in self.captured if line.get("type") == "run"][-1]
+        self.assertIsNone(run["resumed_from"])
+
+    def test_refused_resume_falls_back_to_a_fresh_launch(self):
+        os.environ[launch.RESUME_ENV] = str(self.old_session)
+        self.results = [1, 0]
+        self.run_launcher()
+        self.assertEqual(len(self.calls), 2)
+        self.assertIn("--fork", self.calls[0])
+        self.assertEqual(self.calls[1][self.calls[1].index("--append-system-prompt") + 1], str(self.local_prompt()))
+        self.assertIn("pi refused", self.err_text())
+        run = [line for line in self.captured if line.get("type") == "run"][-1]
+        self.assertIsNone(run["resumed_from"])
 
 
 class SourceTest(unittest.TestCase):
@@ -368,11 +516,36 @@ class SourceTest(unittest.TestCase):
 
     def test_quota_file_finishes_died_early_blocked(self):
         self.write_tsv([["ws15-exec-quota", SID, 1792000000, DEEPSEEK]])
-        (self.pad / "QUOTA").write_text("model\t%s\nlabel\tws15-exec-quota\n" % DEEPSEEK, encoding="utf-8")
+        (self.pad / "QUOTA-ws15-exec-quota").write_text("model\t%s\nlabel\tws15-exec-quota\n" % DEEPSEEK, encoding="utf-8")
         self.poll()
         run = self.store.runs[self.run_id("ws15-exec-quota")]
         self.assertEqual(run["status"], "died_early")
         self.assertEqual(run["verdict"], "BLOCKED")
+
+    def test_legacy_bare_quota_file_naming_this_label_still_blocks_it(self):
+        self.write_tsv([["ws15-exec-legacy", SID, 1792000000, DEEPSEEK]])
+        (self.pad / "QUOTA").write_text("model\t%s\nlabel\tws15-exec-legacy\n" % DEEPSEEK, encoding="utf-8")
+        self.poll()
+        run = self.store.runs[self.run_id("ws15-exec-legacy")]
+        self.assertEqual(run["status"], "died_early")
+        self.assertEqual(run["verdict"], "BLOCKED")
+
+    def test_legacy_quota_label_match_is_exact_not_substring(self):
+        # A legacy bare QUOTA naming "ws15-exec-quota2" must not block "ws15-exec-quota".
+        self.write_tsv([["ws15-exec-quota", SID, 1792000000, DEEPSEEK]])
+        (self.pad / "QUOTA").write_text("model\t%s\nlabel\tws15-exec-quota2\n" % DEEPSEEK, encoding="utf-8")
+        self.poll()
+        run = self.store.runs[self.run_id("ws15-exec-quota")]
+        self.assertNotEqual(run.get("verdict"), "BLOCKED")
+
+    def test_quota_marker_for_a_sibling_label_does_not_block_this_run(self):
+        self.write_tsv([["ws15-exec-quota3", SID, 1792000000, DEEPSEEK]])
+        (self.pad / "QUOTA-ws15-exec-sibling").write_text(
+            "model\t%s\nlabel\tws15-exec-sibling\n" % DEEPSEEK, encoding="utf-8"
+        )
+        self.poll()
+        run = self.store.runs[self.run_id("ws15-exec-quota3")]
+        self.assertNotEqual(run.get("verdict"), "BLOCKED")
 
     def test_quota_error_log_finishes_died_early_blocked(self):
         self.write_tsv([["ws15-exec-quota2", SID, 1792000000, DEEPSEEK]])
@@ -1041,6 +1214,173 @@ class NonAnthropicPricingUnchangedTest(unittest.TestCase):
         self.assertIsNone(pricing.cost(DEEPSEEK_ID, 10, 10, 0, 5000))
         self.assertIsNone(pricing.cost(DEEPSEEK_ID, 10, 10, 0, 5000, cache_write_5m=5000, cache_write_1h=0))
         self.assertEqual(pricing.cost("reflection/Beam-1.0-501B-A23B", 10, 10, 0, 0), 0.0)
+
+
+class RunLabelEnvTest(unittest.TestCase):
+    """launch_pi names the run for the proxy's per-run accounting through AGENTQ_RUN."""
+
+    def test_sets_agentq_run_to_the_label(self):
+        env = launch.set_run_label("ws5-exec-slug", {"PATH": "/bin"})
+        self.assertEqual(env["AGENTQ_RUN"], "ws5-exec-slug")
+        self.assertEqual(env["PATH"], "/bin")
+
+    def test_does_not_override_an_existing_run_label(self):
+        env = launch.set_run_label("ws5-exec-slug", {"AGENTQ_RUN": "ws5-plan-other"})
+        self.assertEqual(env["AGENTQ_RUN"], "ws5-plan-other")
+
+    def test_empty_run_label_counts_as_unset(self):
+        env = launch.set_run_label("ws5-exec-slug", {"AGENTQ_RUN": "  "})
+        self.assertEqual(env["AGENTQ_RUN"], "ws5-exec-slug")
+
+    def test_never_touches_the_broker_job_id(self):
+        env = launch.set_run_label("ws5-exec-slug", {})
+        self.assertNotIn("AGENTQ_JOB", env)
+
+
+class BriefAndPilotTest(unittest.TestCase):
+    """The brief rides --append-system-prompt; the compaction pilot is off unless configured."""
+
+    def setUp(self):
+        from unittest import mock
+
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        self.state = root / "state"
+        self.home = root / "agentq-home"
+        self.home.mkdir()
+        self.ws = root / "ws"
+        self.ws.mkdir()
+        self.prompt = root / "prompt.md"
+        self.prompt.write_text("scope rules\n", encoding="utf-8")
+        self.outdir = root / "pi"
+        self.extension = root / "compact.ts"
+        self.extension.write_text("export default {};\n", encoding="utf-8")
+        self.old_session = root / "old-pi" / "sessions" / "old.jsonl"
+        self.old_session.parent.mkdir(parents=True)
+        self.old_session.write_text('{"type":"session"}\n', encoding="utf-8")
+        self.calls = []
+        patches = [
+            mock.patch.object(launch, "state_dir", return_value=self.state),
+            mock.patch.object(launch, "register_run_dir", return_value=None),
+            mock.patch.object(launch, "report_lines", return_value=None),
+            mock.patch.object(launch, "quota_hit", return_value=False),
+            mock.patch.object(launch.logfilter, "run_filtered", side_effect=self.fake_pi),
+        ]
+        for patch in patches:
+            patch.start()
+            self.addCleanup(patch.stop)
+        env = mock.patch.dict(os.environ, {"AGENTQ_HOME": str(self.home)}, clear=False)
+        env.start()
+        self.addCleanup(env.stop)
+        os.environ.pop(launch.RESUME_ENV, None)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def fake_pi(self, argv, stream_path, **kwargs):
+        self.calls.append(list(argv))
+        Path(stream_path).write_bytes(b"")
+        return 0
+
+    def write_config(self, fraction=0.5, extension=None):
+        config = {"compaction_extension": str(extension or self.extension), "fraction": fraction}
+        (self.home / "pilot.json").write_text(json.dumps(config), encoding="utf-8")
+
+    def run_launcher(self, label="ws1-exec-lane-9"):
+        return launch.main([label, str(self.ws), str(self.prompt), str(self.outdir), "--model", DEEPSEEK])
+
+    def local_prompt(self, label="ws1-exec-lane-9"):
+        return (self.outdir / f"prompt-{label}.md").resolve()
+
+    def test_brief_is_in_the_system_prompt_not_an_attachment(self):
+        self.run_launcher()
+        argv = self.calls[0]
+        self.assertEqual(argv[argv.index("--append-system-prompt") + 1], str(self.local_prompt()))
+        self.assertTrue(Path(argv[argv.index("--append-system-prompt") + 1]).is_file())
+        self.assertFalse(any(arg.startswith("@") for arg in argv))
+        self.assertEqual(argv[-1], launch.BRIEF_MESSAGE)
+        self.assertNotIn("-e", argv)
+
+    def test_resume_keeps_the_brief_in_the_system_prompt(self):
+        os.environ[launch.RESUME_ENV] = str(self.old_session)
+        self.run_launcher()
+        argv = self.calls[0]
+        self.assertIn("--fork", argv)
+        self.assertEqual(argv[argv.index("--append-system-prompt") + 1], str(self.local_prompt()))
+
+    def test_pilot_is_off_without_config(self):
+        self.run_launcher()
+        self.assertFalse((self.outdir / "pilot-arm").exists())
+        self.assertFalse((self.home / launch.PILOT_RUNS).exists())
+
+    def test_arm_is_a_fixed_hash_bucket_of_the_label(self):
+        import hashlib
+
+        label = "ws1-exec-lane-9"
+        bucket = int(hashlib.sha1(label.encode("utf-8")).hexdigest(), 16) % 1000
+        expected = "ext" if bucket < 500 else "control"
+        self.assertEqual(launch.pilot_arm(label, 0.5), expected)
+        self.assertEqual(launch.pilot_arm(label, 0.5), launch.pilot_arm(label, 0.5))
+        self.assertEqual(launch.pilot_arm(label, 0.0), "control")
+        self.assertEqual(launch.pilot_arm(label, 1.0), "ext")
+
+    def test_ext_arm_adds_the_extension_to_the_launch(self):
+        self.write_config(fraction=1.0)
+        self.run_launcher()
+        argv = self.calls[0]
+        self.assertEqual(argv[argv.index("-e") + 1], str(self.extension))
+        self.assertEqual(argv[argv.index("--append-system-prompt") + 1], str(self.local_prompt()))
+        self.assertEqual((self.outdir / "pilot-arm").read_text(encoding="utf-8").strip(), "ext")
+
+    def test_control_arm_does_not_add_the_extension(self):
+        self.write_config(fraction=0.0)
+        self.run_launcher()
+        argv = self.calls[0]
+        self.assertNotIn("-e", argv)
+        self.assertNotIn(str(self.extension), argv)
+        self.assertEqual((self.outdir / "pilot-arm").read_text(encoding="utf-8").strip(), "control")
+
+    def test_resumed_ext_run_keeps_the_extension(self):
+        self.write_config(fraction=1.0)
+        os.environ[launch.RESUME_ENV] = str(self.old_session)
+        self.run_launcher()
+        argv = self.calls[0]
+        self.assertIn("--fork", argv)
+        self.assertEqual(argv[argv.index("-e") + 1], str(self.extension))
+
+    def test_missing_extension_file_means_no_pilot(self):
+        self.write_config(fraction=1.0, extension=self.extension.parent / "gone.ts")
+        self.run_launcher()
+        self.assertNotIn("-e", self.calls[0])
+        self.assertFalse((self.outdir / "pilot-arm").exists())
+        self.assertFalse((self.home / launch.PILOT_RUNS).exists())
+
+    def test_invalid_config_means_no_pilot(self):
+        bad = [
+            "{not json",
+            json.dumps(["list"]),
+            json.dumps({"compaction_extension": "relative/compact.ts", "fraction": 0.5}),
+            json.dumps({"compaction_extension": str(self.extension), "fraction": "0.5"}),
+            json.dumps({"compaction_extension": str(self.extension), "fraction": 1.5}),
+            json.dumps({"compaction_extension": str(self.extension), "fraction": True}),
+        ]
+        for text in bad:
+            (self.home / "pilot.json").write_text(text, encoding="utf-8")
+            self.calls.clear()
+            self.run_launcher()
+            self.assertNotIn("-e", self.calls[0], text)
+            self.assertFalse((self.outdir / "pilot-arm").exists(), text)
+
+    def test_pilot_runs_row_is_appended_per_launch(self):
+        self.write_config(fraction=1.0)
+        label = "ws1-exec-lane-9"
+        self.run_launcher(label)
+        self.run_launcher("ws1-exec-lane-10")
+        rows = (self.home / launch.PILOT_RUNS).read_text(encoding="utf-8").splitlines()
+        self.assertEqual(len(rows), 2)
+        name, arm, started = rows[0].split("\t")
+        self.assertEqual((name, arm), (label, "ext"))
+        self.assertTrue(started.isdigit())
 
 
 if __name__ == "__main__":

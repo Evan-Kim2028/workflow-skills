@@ -1,0 +1,5 @@
+#!/bin/sh
+# agentq PATH shim for pytest: always gated. Logic: dispatch.py.
+case $0 in */*) SHIM_HERE=${0%/*} ;; *) SHIM_HERE=. ;; esac
+. "$SHIM_HERE/shim-lib.sh"
+shim_dispatch pytest "$@"

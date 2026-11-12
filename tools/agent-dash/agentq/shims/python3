@@ -1,0 +1,11 @@
+#!/bin/sh
+# agentq PATH shim. Fast path in sh; pytest argv goes to dispatch.py (agentq/shims/dispatch.py).
+case $0 in */*) SHIM_HERE=${0%/*} ;; *) SHIM_HERE=. ;; esac
+. "$SHIM_HERE/shim-lib.sh"
+for _arg in "$@"; do
+    if [ "$_arg" = pytest ]; then
+        shim_dispatch "${0##*/}" "$@"
+    fi
+done
+shim_real "${0##*/}" || exit 127
+exec "$REAL" "$@"

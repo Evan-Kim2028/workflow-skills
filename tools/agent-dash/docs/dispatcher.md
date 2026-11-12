@@ -6,6 +6,12 @@ launches each ready task that has a prompt through `scripts/run_worker.py`, reco
 each outcome, and writes one event stream. The lead writes prompts, reads reports,
 decides and merges. It no longer launches, polls or tracks run status by hand.
 
+For new pi work, workstream leads should prefer `agentq submit` (see `agentq.md`
+in this folder). The queue owns pi concurrency and the Morph rate limits, and
+"escalate this subagent work" reaches its jobs. This dispatcher stays for existing
+bundles. Note: it still launches tiers through `scripts/run_worker.py` directly, so
+pi work routed through it bypasses the queue until it submits through agentq.
+
 ## Files
 
 Code:

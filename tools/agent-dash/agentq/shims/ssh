@@ -1,0 +1,27 @@
+#!/bin/sh
+# agentq PATH shim for ssh. Fast path in sh: only argv words matching slots/ssh_hosts go to dispatch.py.
+case $0 in */*) SHIM_HERE=${0%/*} ;; *) SHIM_HERE=. ;; esac
+. "$SHIM_HERE/shim-lib.sh"
+_hosts=${AGENTQ_HOME:-$HOME/.local/state/agentq}/slots/ssh_hosts
+_gated=
+if [ -s "$_hosts" ]; then
+    for _arg in "$@"; do
+        case $_arg in -*) continue ;; esac
+        _host=${_arg#ssh://}
+        _host=${_host##*@}
+        _host=${_host%%/*}
+        case $_host in *[A-Z]*) _host=$(printf '%s' "$_host" | tr '[:upper:]' '[:lower:]') ;; esac
+        _bare=${_host%:*}
+        while IFS= read -r _pat || [ -n "$_pat" ]; do
+            case $_host in $_pat) _gated=1 ;; esac
+            case $_bare in $_pat) _gated=1 ;; esac
+            [ -n "$_gated" ] && break
+        done < "$_hosts"
+        [ -n "$_gated" ] && break
+    done
+fi
+if [ -n "$_gated" ]; then
+    shim_dispatch ssh "$@"
+fi
+shim_real ssh || exit 127
+exec "$REAL" "$@"

@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.agentq.dash</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>__PYTHON__</string>
+        <string>-u</string>
+        <string>__HOME__/.claude/tools/agent-dash/agentq/dash.py</string>
+        <string>--port</string>
+        <string>18791</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>AGENTQ_HOME</key>
+        <string>__HOME__/.local/state/agentq</string>
+        <key>PYTHONUNBUFFERED</key>
+        <string>1</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>Nice</key>
+    <integer>10</integer>
+    <key>StandardOutPath</key>
+    <string>__HOME__/.local/state/agentq/logs/dash.log</string>
+    <key>StandardErrorPath</key>
+    <string>__HOME__/.local/state/agentq/logs/dash.log</string>
+</dict>
+</plist>

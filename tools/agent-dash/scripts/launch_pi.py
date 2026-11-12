@@ -10,6 +10,18 @@ library and refused with the exact fix on a bad one, and the prompt gets a
 ``<outdir>/prompt-<label>.md`` with the prefix, so the original is never
 modified). ``stdin`` is closed: pi hangs otherwise.
 
+The brief goes in the system prompt: the launcher passes the local prompt
+file with ``--append-system-prompt``, and pi reads that file's contents. Pi
+rebuilds the system prompt every turn and compaction never summarises it,
+so a long run keeps its scope rules and verdict format. The only user message
+points at the brief.
+
+A compaction pilot is off unless ``$AGENTQ_HOME/pilot.json`` names a valid
+extension file. Each label then lands in the ``ext`` arm (the extension is
+loaded with ``-e``) or the ``control`` arm, decided by a hash of the label, so
+a resumed run keeps its arm. The arm is written to ``<outdir>/pilot-arm`` and
+appended to ``$AGENTQ_HOME/pilot_runs.tsv``.
+
 Writes, in ``outdir``:
 
   <outdir>/pi-sessions.tsv          label, session_id, start epoch, model, tier
@@ -17,7 +29,7 @@ Writes, in ``outdir``:
   <outdir>/out-<label>.md           final assistant text
   <outdir>/err-<label>.log          stderr
   <outdir>/running/<label>          "<pid>\\t<model>" while the run is live
-  <outdir>/QUOTA                    only on quota/credit exhaustion
+  <outdir>/QUOTA-<label>            only on quota/credit exhaustion
   <state-dir>/generic.jsonl         one start, one usage per assistant
                                     message, one finish line (run id
                                     ``pi:<session>:<label>``)
@@ -25,10 +37,19 @@ Writes, in ``outdir``:
 Quota/credit exhaustion (an ``errorMessage`` naming insufficient
 credit/quota/balance, HTTP 402, or a rate-limit 429 the run never
 recovered from) finishes ``died_early`` with verdict ``BLOCKED`` and
-writes ``QUOTA`` naming the model and label, so the lead knows to swap
+writes ``QUOTA-<label>`` naming the model and label, so the lead knows to swap
 the API key. A transient 429 pi auto-retried past is not quota: the
 summary line records it as ``rate_limit_retries=<n>``. ``outdir`` is
 registered in ``run-dirs.txt`` like ``run_worker.py`` does.
+
+``AGENTQ_RESUME_SESSION`` (set by the agentq broker on a relaunch after a run
+died without a report) names the dead run's pi session file. When it names a
+non-empty file, the launcher runs ``pi --fork <file> --session-dir <outdir>/sessions``
+with a continuation prompt instead of the task, so pi writes a new session
+into this run's folder and the old folder is only read. A missing file, or a
+resume pi exits on without output, falls back to the fresh launch with a note
+on stderr. The resumed-from path is recorded on the run's ``generic.jsonl``
+line (``resumed_from``) and in the summary line.
 
 The manifest's fifth cell is the tier: ``run_worker.py`` (``kind: pi``)
 passes the registry tier name with ``--tier``, so a DeepSeek run reads
@@ -42,6 +63,7 @@ path travels through this script; no key is read, logged, or printed.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -56,12 +78,18 @@ ROOT = HERE.parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from agentq import slots as agentq_slots  # noqa: E402
 from dash import labels as label_lib  # noqa: E402
 from dash import logfilter  # noqa: E402
 from dash.sources import pi as pi_source  # noqa: E402
 from dash.sources.manifests import parent_session_from_pad  # noqa: E402
 
 DEFAULT_MODEL = "river/deepseek-ai/DeepSeek-V4.1-Flash-1017"
+BRIEF_MESSAGE = (
+    "Do the task described in the Task brief in your system prompt. Your final message is the report."
+)
+PILOT_CONFIG = "pilot.json"
+PILOT_RUNS = "pilot_runs.tsv"
 USAGE = "usage: launch_pi.py <label> <workspace> <prompt_file> <outdir> [--model M] [--tier T]"
 
 _UUID = re.compile(
@@ -69,13 +97,21 @@ _UUID = re.compile(
     r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
 )
 
-#: Quota/credit exhaustion markers in an assistant ``errorMessage``.
-_QUOTA_WORDS = ("insufficient", "credit", "quota", "balance", "payment required")
+#: A provider status code of 402 or 429 in an assistant ``errorMessage``:
+#: ``HTTP 429``, ``status 402``, ``"status": 429``, ``code 429``, or a leading
+#: ``429:`` (River's form). Lowercased text; a bare number elsewhere is not a status.
+_STATUS_CODE = re.compile(r'(?:^|\bhttp[ /]?|\bstatus"?\s*[:=]?\s*|\bcode"?\s*[:=]?\s*)(402|429)\b')
 
-#: Rate-limit markers: River's transient per-account 429 lands as
-#: ``errorMessage`` "429: ... rate_limit_error ... account_rate". pi
-#: auto-retries these, so they are quota only when nothing recovers.
-_RATE_LIMIT_MARKERS = ("429", "rate limit", "rate_limit_error", "account_rate")
+#: A JSON object body (``{"message": ...``), the structured half of a provider error.
+_JSON_BODY = re.compile(r'\{\s*"[^"]+"\s*:')
+
+#: Morph's rate-limit text, returned as a plain error line with no JSON body.
+_MORPH_RATE_LIMIT = "rate limit exceeded"
+
+
+def _status_with_body(text: str, code: str) -> bool:
+    """True when the text names HTTP ``code`` and carries a JSON error body."""
+    return any(m.group(1) == code for m in _STATUS_CODE.finditer(text)) and bool(_JSON_BODY.search(text))
 
 
 def tier_of(model: str | None) -> str:
@@ -117,12 +153,13 @@ def _event_text(ev) -> str:
 
 
 def _credit_hit(text: str) -> bool:
-    """Insufficient credit/quota/balance or HTTP 402: never transient."""
-    return "402" in text or any(word in text for word in _QUOTA_WORDS)
+    """HTTP 402 with a JSON error body: credit or quota exhausted, never transient."""
+    return _status_with_body(text, "402")
 
 
 def _rate_limit_hit(text: str) -> bool:
-    return any(marker in text for marker in _RATE_LIMIT_MARKERS)
+    """HTTP 429 with a JSON error body, or Morph's ``Rate limit exceeded`` text."""
+    return _status_with_body(text, "429") or _MORPH_RATE_LIMIT in text
 
 
 def _recovered(events: list[dict], index: int) -> bool:
@@ -288,7 +325,17 @@ def report_lines(state: Path, lines) -> None:
         pass
 
 
-def build_argv(label, workspace, prompt_file, outdir, model):
+def brief_args(prompt_file):
+    """Carry the brief in the system prompt. ``prompt_file`` must be an absolute path."""
+    return ["--append-system-prompt", str(prompt_file)]
+
+
+def extension_args(extension):
+    """``-e <path>`` for the pilot's ext arm, nothing for control or no pilot."""
+    return ["-e", str(extension)] if extension else []
+
+
+def build_argv(label, workspace, prompt_file, outdir, model, extension=None):
     """The exact pi command line. ``stdin`` is closed by the caller."""
     return [
         "pi",
@@ -299,9 +346,160 @@ def build_argv(label, workspace, prompt_file, outdir, model):
         str(Path(outdir) / "sessions"),
         "--model",
         model,
-        f"@{prompt_file}",
-        "Do the task in the attached prompt file. Your final message is the report.",
+        *extension_args(extension),
+        *brief_args(prompt_file),
+        BRIEF_MESSAGE,
     ]
+
+
+RESUME_ENV = "AGENTQ_RESUME_SESSION"
+RESUME_PROMPT = (
+    "Your previous run was interrupted. Continue the task from where the session "
+    "left off; finish with the usual report and verdict line."
+)
+
+
+def resume_source(requested):
+    """The resume session file when ``requested`` names a non-empty file, else None."""
+    if not requested:
+        return None
+    path = Path(requested).expanduser()
+    try:
+        return path if path.is_file() and path.stat().st_size > 0 else None
+    except OSError:
+        return None
+
+
+def build_resume_argv(session_file, outdir, model, prompt_file, extension=None):
+    """Fork the dead run's session into the new pi dir and send the continuation prompt.
+
+    ``--fork`` makes a new session from the old one, and ``--session-dir``
+    stores that new session under this run's ``sessions/``, so the old run's
+    folder is only read, never appended to. The brief rides the system prompt
+    again, so the forked session keeps it.
+    """
+    return [
+        "pi",
+        "-p",
+        "--mode",
+        "json",
+        "--fork",
+        str(session_file),
+        "--session-dir",
+        str(Path(outdir) / "sessions"),
+        "--model",
+        model,
+        *extension_args(extension),
+        *brief_args(prompt_file),
+        RESUME_PROMPT,
+    ]
+
+
+def agentq_home():
+    """``$AGENTQ_HOME``, else the broker's default state folder."""
+    env = (os.environ.get("AGENTQ_HOME") or "").strip()
+    if env:
+        return Path(env).expanduser()
+    return Path.home() / ".local" / "state" / "agentq"
+
+
+def pilot_config(home):
+    """``(extension path, fraction)`` from ``<home>/pilot.json``, or None when absent or invalid."""
+    try:
+        config = json.loads((Path(home) / PILOT_CONFIG).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(config, dict):
+        return None
+    extension = config.get("compaction_extension")
+    fraction = config.get("fraction")
+    if not isinstance(extension, str) or not os.path.isabs(extension):
+        return None
+    if isinstance(fraction, bool) or not isinstance(fraction, (int, float)) or not 0 <= fraction <= 1:
+        return None
+    path = Path(extension)
+    if not path.is_file():
+        return None
+    return path, float(fraction)
+
+
+def pilot_arm(label, fraction):
+    """``"ext"`` or ``"control"``: a fixed hash bucket of the label, so one label always gets one arm."""
+    bucket = int(hashlib.sha1(label.encode("utf-8")).hexdigest(), 16) % 1000
+    return "ext" if bucket < fraction * 1000 else "control"
+
+
+def pilot_for(label, home):
+    """``(arm, extension path or None)`` for this label, or ``(None, None)`` when no pilot runs."""
+    config = pilot_config(home)
+    if config is None:
+        return None, None
+    extension, fraction = config
+    arm = pilot_arm(label, fraction)
+    return arm, (extension if arm == "ext" else None)
+
+
+def record_pilot(label, arm, outdir, home, started):
+    """Write the arm into the run folder and append one row to pilot_runs.tsv. Best effort."""
+    try:
+        (Path(outdir) / "pilot-arm").write_text(arm + "\n", encoding="utf-8")
+    except OSError:
+        pass
+    try:
+        Path(home).mkdir(parents=True, exist_ok=True)
+        with open(Path(home) / PILOT_RUNS, "a", encoding="utf-8") as fh:
+            fh.write(f"{label}\t{arm}\t{started}\n")
+    except OSError:
+        pass
+
+
+RUN_ENV = "AGENTQ_RUN"
+SHIMS_ENV = "AGENTQ_SHIMS"
+SHIM_PYTHON_ENV = "AGENTQ_SHIM_PYTHON"
+SHIMS_DIR = ROOT / "agentq" / "shims"
+
+
+def set_run_label(label, environ=os.environ):
+    """Name the run for the agentq proxy's per-run accounting. The pi process reads it through
+    AGENTQ_RUN, and the models.json header uses it when no broker job id is set. An existing value
+    stays; AGENTQ_JOB is never touched, since run_worker.py reads it to detect broker launches."""
+    if not (environ.get(RUN_ENV) or "").strip():
+        environ[RUN_ENV] = label
+    return environ
+
+
+def shim_environ(environ, shims_dir=SHIMS_DIR, python=sys.executable):
+    """Put the agentq command shims first on PATH for the pi child; ``AGENTQ_SHIMS=0`` skips it.
+
+    The shims gate ssh to production hosts and pytest runs (see agentq/shims/dispatch.py).
+    ``AGENTQ_SHIM_PYTHON`` names the interpreter the shims run their dispatcher with.
+    """
+    if (environ.get(SHIMS_ENV) or "").strip() == "0":
+        return environ
+    shims = str(shims_dir)
+    rest = [part for part in (environ.get("PATH") or "").split(os.pathsep) if part and part != shims]
+    environ["PATH"] = os.pathsep.join([shims, *rest])
+    environ.setdefault(SHIM_PYTHON_ENV, python)
+    return environ
+
+
+def run_pi(argv, stream, workspace, se):
+    """Run one pi command through the base64 filter into ``stream``; return its exit code."""
+    return logfilter.run_filtered(
+        argv,
+        stream,
+        cwd=str(Path(workspace).expanduser()),
+        stderr=se,
+        stdin=subprocess.DEVNULL,
+        warn=logfilter.warn_to(se),
+        detached=True,
+    )
+
+
+def pi_refused_resume(rc, stream) -> bool:
+    """True when a resume attempt exited non-zero and produced no assistant output."""
+    raw = stream.read_bytes() if stream.exists() else b""
+    return rc != 0 and not assistant_events(raw)
 
 
 def main(argv=None):
@@ -330,33 +528,45 @@ def main(argv=None):
         print(f"label refused: {fix}", file=sys.stderr)
         return 2
 
+    set_run_label(label)
+    shim_environ(os.environ)
+    agentq_slots.write_ssh_hosts(agentq_home())
     out = Path(outdir)
     out.mkdir(parents=True, exist_ok=True)
     (out / "running").mkdir(parents=True, exist_ok=True)
     register_run_dir(out)
 
     prompt_text = Path(prompt_file).read_text(encoding="utf-8")
-    local_prompt = out / f"prompt-{label}.md"
+    local_prompt = (out / f"prompt-{label}.md").resolve()
     local_prompt.write_text(ensure_label_prefix(prompt_text, label), encoding="utf-8")
 
     stream = out / f"stream-{label}.ndjson"
     err = out / f"err-{label}.log"
     started = int(time.time())
+    arm, extension = pilot_for(label, agentq_home())
+    if arm is not None:
+        record_pilot(label, arm, out, agentq_home(), started)
     run_id = f"running/{label}"
     (out / run_id).write_text(f"{os.getpid()}\t{model}", encoding="utf-8")
+    requested = (os.environ.get(RESUME_ENV) or "").strip()
+    resume = resume_source(requested)
+    resumed_from = None
     with open(err, "a") as se:
         se.write(f"--- pi launch label {label} model {model} at {started}\n")
         se.flush()
-        # The event stream goes through the base64 filter; the child's exit code is kept.
-        rc = logfilter.run_filtered(
-            build_argv(label, workspace, local_prompt, out, model),
-            stream,
-            cwd=str(Path(workspace).expanduser()),
-            stderr=se,
-            stdin=subprocess.DEVNULL,
-            warn=logfilter.warn_to(se),
-            detached=True,
-        )
+        if requested and resume is None:
+            se.write(f"resume: {requested} is missing or empty; starting fresh\n")
+            se.flush()
+        if resume is not None:
+            rc = run_pi(build_resume_argv(resume, out, model, local_prompt, extension), stream, workspace, se)
+            if pi_refused_resume(rc, stream):
+                se.write(f"resume: pi refused {resume} (exit {rc}, no output); starting fresh\n")
+                se.flush()
+                resume = None
+            else:
+                resumed_from = str(resume)
+        if resume is None:
+            rc = run_pi(build_argv(label, workspace, local_prompt, out, model, extension), stream, workspace, se)
     try:
         os.unlink(out / run_id)
     except FileNotFoundError:
@@ -379,7 +589,7 @@ def main(argv=None):
         fh.write(f"{label}\t{sid}\t{started}\t{model}\t{tier}\n")
 
     if quota:
-        (out / "QUOTA").write_text(f"model\t{model}\nlabel\t{label}\n", encoding="utf-8")
+        (out / f"QUOTA-{label}").write_text(f"model\t{model}\nlabel\t{label}\n", encoding="utf-8")
         verdict, status = "BLOCKED", "died_early"
     else:
         verdict = verdict_of(text)
@@ -415,12 +625,14 @@ def main(argv=None):
             "status": status,
             "verdict": verdict,
             "ended_at": float(ended),
+            "resumed_from": resumed_from,
         }
     )
     report_lines(state_dir(), lines)
     print(
         f"launched pi {label} model {model} status {status} verdict {verdict}"
         f" rate_limit_retries={retries}"
+        + (f" resumed_from={resumed_from}" if resumed_from else "")
     )
     return 0 if status == "done" and rc == 0 else 1
 

@@ -38,7 +38,7 @@ listing is unavailable.
 
 Verdict comes from the first line of ``out-<label>.md``. A run whose err
 or out log shows quota/credit exhaustion finishes ``died_early`` with
-verdict ``BLOCKED``; ``QUOTA`` beside the manifest names the model to
+verdict ``BLOCKED``; ``QUOTA-<label>`` beside the manifest names the model to
 swap. An empty out file with a real error and no live process reads
 ``died_early``.
 
@@ -132,7 +132,7 @@ def _outdirs_walk(root):
     folder is not enough: another harness's outdir (Command Code keeps its
     own ``running/``) would read as a second ``pi:`` run for the same
     label, so a manifest-less outdir must also carry pi evidence (a
-    ``prompt-`` file, the ``QUOTA`` marker, a ``sessions/`` dir, or a
+    ``prompt-`` file, a ``QUOTA-<label>`` marker, a ``sessions/`` dir, or a
     pi-shaped ``stream-<label>.ndjson``, never the ``-<n>`` Command Code
     shape).
     """
@@ -248,15 +248,15 @@ def _looks_like_pi_dir(path):
     """True when a manifest-less folder carries pi-only evidence.
 
     ``out-``/``err-`` files and ``running/`` are shared with the Command
-    Code launcher, so they do not count: only a ``prompt-`` file, the
-    ``QUOTA`` marker, the pi ``sessions/`` dir, or a pi-shaped stream
+    Code launcher, so they do not count: only a ``prompt-`` file, a
+    ``QUOTA-<label>`` marker, the pi ``sessions/`` dir, or a pi-shaped stream
     (``stream-<label>.ndjson``, never the ``-<n>`` Command Code shape).
     """
     try:
         names = os.listdir(path)
     except OSError:
         return False
-    if "QUOTA" in names:
+    if "QUOTA" in names or any(name.startswith("QUOTA-") for name in names):
         return True
     if "sessions" in names and os.path.isdir(os.path.join(path, "sessions")):
         return True
@@ -664,30 +664,47 @@ def _process_apply(store, run, processes):
         _fail("liveness")
 
 
-def _quota(pad, label, out_path, err_path, sid) -> bool:
-    """True when the QUOTA marker or a quota log names this run's failure.
+def _names_label(text, label) -> bool:
+    """True when a ``label<TAB><label>`` line of a QUOTA marker names exactly ``label``.
 
-    Cached on (path, size, mtime_ns) so a quiet run does not re-open and
-    regex-scan its logs every 2 s across 140+ live runs.
+    Exact on the whole label, so ``x`` never matches a marker for ``x2``.
     """
-    quota_path = os.path.join(pad, "QUOTA")
-    try:
-        st = os.stat(quota_path)
-        sig = (st.st_size, st.st_mtime_ns)
-        hit = _quota_cache.get(quota_path)
-        if hit is not None and hit[0] == sig:
-            cached_text = hit[1]
-        else:
-            try:
-                with open(quota_path, "r", encoding="utf-8") as fh:
-                    cached_text = fh.read(4096)
-            except OSError:
-                cached_text = ""
-            _quota_cache[quota_path] = (sig, cached_text)
-        if not cached_text.strip() or (isinstance(label, str) and label in cached_text) or (isinstance(sid, str) and sid in cached_text):
+    if not isinstance(label, str):
+        return False
+    for raw in text.splitlines():
+        parts = raw.strip().split("\t")
+        if len(parts) == 2 and parts[0].strip() == "label" and parts[1].strip() == label:
             return True
-    except OSError:
-        pass
+    return False
+
+
+def _quota(pad, label, out_path, err_path, sid) -> bool:
+    """True when this run's quota marker or a quota log names its failure.
+
+    The marker is ``QUOTA-<label>``, per label, so runs sharing a ``pi/``
+    outdir each keep their own. The bare ``QUOTA`` file that launchers wrote
+    before that name is still read, with the same text test, so a run started
+    before the change is seen. Cached on (path, size, mtime_ns) so a quiet
+    run does not re-open and regex-scan its logs every 2 s across 140+ live runs.
+    """
+    for quota_path in (os.path.join(pad, f"QUOTA-{label}"), os.path.join(pad, "QUOTA")):
+        try:
+            st = os.stat(quota_path)
+            sig = (st.st_size, st.st_mtime_ns)
+            hit = _quota_cache.get(quota_path)
+            if hit is not None and hit[0] == sig:
+                cached_text = hit[1]
+            else:
+                try:
+                    with open(quota_path, "r", encoding="utf-8") as fh:
+                        cached_text = fh.read(4096)
+                except OSError:
+                    cached_text = ""
+                _quota_cache[quota_path] = (sig, cached_text)
+            if not cached_text.strip() or _names_label(cached_text, label) or (isinstance(sid, str) and sid in cached_text):
+                return True
+        except OSError:
+            pass
     for path in (err_path, out_path):
         if not path:
             continue
