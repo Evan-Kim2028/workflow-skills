@@ -37,7 +37,7 @@ LIMIT_WINDOW_MINUTES = 5
 TOKEN_BUCKET_S = {1: 300, 6: 300, 24: 300, 168: 1800}
 AVERAGE_SATURATION_FRAC = 0.90
 ROOM_FRAC = 0.95
-POOL_IDLE_FRAC = 0.85
+POOL_NEAR_CAPACITY_FRAC = 0.85
 MORPH_429_MINUTES = 2
 SLOW_FACTOR = 2.0
 LOAD_PER_CPU_MAX = 1.5
@@ -56,8 +56,10 @@ VERDICT_CHIPS = {
     "morph_limit": "Morph limit",
     "morph_slow": "Morph slow",
     "laptop": "Laptop",
-    "demand": "Demand",
     "near_capacity": "Near capacity",
+    "proxy_pacing": "Proxy pacing",
+    "launching": "Launching",
+    "headroom": "Headroom",
 }
 RATE_WINDOW_MINUTES = 60
 SAMPLE_INTERVAL_S = 60.0
@@ -345,6 +347,7 @@ td.wrap .cont { color: var(--ink-3); display: block; }
   <section class="panel verdict-panel" aria-labelledby="g-verdict">
     <h3 class="group" id="g-verdict">Limited by</h3>
     <div class="verdict"><span class="chip" id="v-chip">—</span><span class="text" id="v-text">Loading</span></div>
+    <div class="room" id="v-secondary"></div>
     <div class="room" id="v-room">—</div>
   </section>
 
@@ -1062,6 +1065,7 @@ td.wrap .cont { color: var(--ink-3); display: block; }
     chip.textContent = v.chip || "—";
     chip.className = "chip " + (v.key === "morph_limit" || v.key === "morph_slow" || v.key === "laptop" ? "crit" : "ok");
     setText("v-text", v.text || "No data yet");
+    setText("v-secondary", v.secondary || "");
     setText("v-room", (d.room || {}).text || "—");
   }
 
@@ -2514,29 +2518,56 @@ def window_tokens(raw: dict[int, dict], until: int, minutes: int) -> dict:
     }
 
 
+def proxy_waiting_by_budget(live: dict | None) -> dict[str, int] | None:
+    """DeepSeek requests waiting at the proxy, per DeepSeek budget, or None when the proxy is unreachable.
+
+    The proxy queues a request on every budget it charges, so a waiting Kimi request also shows in the total
+    budget's queue (Kimi charges total and its own uncached budget). Kimi's share of total is therefore
+    subtracted using the uncached queue. The output and uncached_ds budgets are DeepSeek-only.
+    """
+    budgets = live.get("budgets") if isinstance(live, dict) else None
+    if not isinstance(budgets, dict):
+        return None
+
+    def queued(name: str) -> int:
+        lanes = (budgets.get(name) or {}).get("queued")
+        return sum(int(n) for n in lanes.values()) if isinstance(lanes, dict) else 0
+
+    kimi = queued("uncached")
+    return {
+        "total": max(0, queued("total") - kimi),
+        "output": queued("output"),
+        "uncached_ds": queued("uncached_ds"),
+    }
+
+
 def verdict(
     raw: dict[int, dict],
     until: int,
     limits: dict[str, int],
     live: dict | None,
     *,
-    kimi_waiting: bool,
+    kimi_jobs_waiting: int,
     budget_429s: dict[str, set[int]],
     laptop: dict,
-    jobs_queued: int | None,
+    ds_jobs_ready: int | None,
     ds_p50_5m_ms: int | None,
     ds_p50_base_ms: int | None,
 ) -> dict:
     """What limits the pool, from the last 5 complete minutes. The first matching rule wins:
-    Morph limit, Morph slow, Laptop, Demand, Near capacity.
+    Morph limit, Morph slow, Laptop, Near capacity, Proxy pacing, Launching, Headroom.
 
     An enforced budget counts as hit when its 5-minute average reached AVERAGE_SATURATION_FRAC of its limit,
     or when upstream 429s named it in MORPH_429_MINUTES of the 5 minutes. The peak minute is context only: it
     never decides the verdict. Kimi uncached counts only while Kimi jobs wait.
+
+    Waiting work in the headline is DeepSeek only: requests queued at the proxy and DeepSeek jobs ready in
+    agentq. Kimi waits never change the headline; they add a secondary line instead.
     """
     five = list(range(until - LIMIT_WINDOW_MINUTES * 60, until, 60))
-    queued_values = (live or {}).get("queued") if isinstance(live, dict) else None
-    proxy_queued = sum(int(n) for n in queued_values.values()) if isinstance(queued_values, dict) else None
+    waiting = proxy_waiting_by_budget(live)
+    ds_waiting = sum(waiting.values()) if waiting is not None else None
+    kimi_waiting = kimi_jobs_waiting > 0
     hits = []
     for name in ("total", "uncached_ds", "uncached"):
         if name == "uncached" and not kimi_waiting:
@@ -2551,6 +2582,12 @@ def verdict(
     load = laptop.get("load_per_cpu")
     free = laptop.get("memory_free_pct")
     laptop_hot = (load is not None and load > LOAD_PER_CPU_MAX) or (free is not None and free < MEMORY_FREE_MIN)
+    secondary = None
+    if kimi_waiting:
+        secondary = (
+            f"Kimi reviews waiting: {kimi_jobs_waiting} "
+            f"(Kimi's own {limits['uncached']:,}/min uncached limit)."
+        )
     if hits:
         name, average, peak, minutes_429 = hits[0]
         label = LIMIT_LABELS[name]
@@ -2560,7 +2597,7 @@ def verdict(
         else:
             detail = f"{label} returned 429s in {minutes_429} of the last 5 minutes ({context})"
         key, text = "morph_limit", f"Morph is limiting us: {detail}."
-    elif ds_p50_5m_ms and ds_p50_base_ms and ds_p50_5m_ms > SLOW_FACTOR * ds_p50_base_ms and proxy_queued == 0:
+    elif ds_p50_5m_ms and ds_p50_base_ms and ds_p50_5m_ms > SLOW_FACTOR * ds_p50_base_ms and ds_waiting == 0:
         key = "morph_slow"
         text = (
             f"Morph is slow: DeepSeek response p50 is {ds_p50_5m_ms / 1000:.1f} s, "
@@ -2573,19 +2610,23 @@ def verdict(
         load_text = f"load {laptop['load1']:.1f} on {cpus} CPUs ({load:.2f} per CPU)" if load is not None else "load unknown"
         mem_text = f"{free:.0f}% memory free" if free is not None else "memory unknown"
         text = f"The laptop is the bottleneck: {load_text}, {mem_text}."
-    elif pool < POOL_IDLE_FRAC and proxy_queued == 0 and jobs_queued == 0:
-        key = "demand"
-        text = (
-            f"Demand is the limit: the pool is at {pool * 100:.0f}% of its limit, "
-            "nothing waits at the proxy, and no job is ready."
-        )
-    else:
+    elif pool >= POOL_NEAR_CAPACITY_FRAC:
         key = "near_capacity"
+        text = f"Near capacity: pool at {pool * 100:.0f}% of Morph's {limits['total'] // 1_000_000}M/min limit."
+    elif ds_waiting:
+        key = "proxy_pacing"
+        budget = max((name for name in waiting if waiting[name] > 0), key=lambda name: waiting[name])
         text = (
-            f"Near capacity: no single limit is saturated, but the pool is at {pool * 100:.0f}% "
-            "of its limit or work is waiting."
+            f"Proxy pacing: DeepSeek requests are waiting on {LIMIT_LABELS[budget]} "
+            f"while the pool is at {pool * 100:.0f}%."
         )
-    return {"key": key, "chip": VERDICT_CHIPS[key], "text": text}
+    elif ds_jobs_ready:
+        key = "launching"
+        text = f"Launching: {ds_jobs_ready} DeepSeek jobs are ready; the broker is starting them."
+    else:
+        key = "headroom"
+        text = f"Headroom: pool at {pool * 100:.0f}% of Morph's limit; room for more work."
+    return {"key": key, "chip": VERDICT_CHIPS[key], "text": text, "secondary": secondary}
 
 
 def room(
@@ -2684,10 +2725,10 @@ def build_summary(
     jobs_by_tier = (jobs or {}).get("by_tier") or {}
     verdict_now = verdict(
         raw, until, resolved, live,
-        kimi_waiting=int((jobs_by_tier.get("pi-kimi") or {}).get("queued") or 0) > 0,
+        kimi_jobs_waiting=int((jobs_by_tier.get("pi-kimi") or {}).get("queued") or 0),
         budget_429s=budget_429_minutes(home, until),
         laptop=laptop_now,
-        jobs_queued=((jobs or {}).get("by_state") or {}).get("queued"),
+        ds_jobs_ready=int((jobs_by_tier.get("pi-deepseek-flash") or {}).get("queued") or 0),
         ds_p50_5m_ms=ds_p50_5m,
         ds_p50_base_ms=median_or_none(base_p50s),
     )

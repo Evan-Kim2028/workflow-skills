@@ -933,7 +933,13 @@ class EnforcedLimitsChartTest(unittest.TestCase):
 LIMITS_NOW = {"total": 10_000_000, "output": 70_000, "uncached": 24_290, "uncached_ds": 400_000}
 CALM = {"load1": 2.0, "cpus": 15, "load_per_cpu": 2.0 / 15, "memory_free_pct": 60.0}
 HOT = {"load1": 44.0, "cpus": 15, "load_per_cpu": 44.0 / 15, "memory_free_pct": 40.0}
-IDLE_LIVE = {"queued": {"urgent": 0, "normal": 0, "backlog": 0}}
+def live_queued(total=0, output=0, uncached=0, uncached_ds=0) -> dict:
+    """A proxy status whose budgets hold the given number of waiting requests each, all in the normal lane."""
+    waits = {"total": total, "output": output, "uncached": uncached, "uncached_ds": uncached_ds}
+    return {"budgets": {name: {"queued": {"urgent": 0, "normal": n, "backlog": 0}} for name, n in waits.items()}}
+
+
+IDLE_LIVE = live_queued()
 
 
 def five_minutes(**fields) -> dict:
@@ -941,11 +947,11 @@ def five_minutes(**fields) -> dict:
     return {UNTIL - 60 * k: fields for k in range(1, 6)}
 
 
-def verdict_for(raw, *, live=IDLE_LIVE, laptop=CALM, kimi_waiting=False, budget_429s=None,
-                jobs_queued=0, ds_p50_5m_ms=None, ds_p50_base_ms=None):
+def verdict_for(raw, *, live=IDLE_LIVE, laptop=CALM, kimi_jobs_waiting=0, budget_429s=None,
+                ds_jobs_ready=0, ds_p50_5m_ms=None, ds_p50_base_ms=None):
     return dash.verdict(
-        raw, UNTIL, LIMITS_NOW, live, kimi_waiting=kimi_waiting, budget_429s=budget_429s or {},
-        laptop=laptop, jobs_queued=jobs_queued, ds_p50_5m_ms=ds_p50_5m_ms, ds_p50_base_ms=ds_p50_base_ms,
+        raw, UNTIL, LIMITS_NOW, live, kimi_jobs_waiting=kimi_jobs_waiting, budget_429s=budget_429s or {},
+        laptop=laptop, ds_jobs_ready=ds_jobs_ready, ds_p50_5m_ms=ds_p50_5m_ms, ds_p50_base_ms=ds_p50_base_ms,
     )
 
 
@@ -982,8 +988,8 @@ class LimitedByTest(unittest.TestCase):
 
     def test_kimi_uncached_counts_only_while_kimi_jobs_wait(self) -> None:
         raw = five_minutes(total=0, kimi_uncached=24_290)
-        self.assertNotEqual(verdict_for(raw, kimi_waiting=False)["key"], "morph_limit")
-        waiting = verdict_for(raw, kimi_waiting=True)
+        self.assertNotEqual(verdict_for(raw, kimi_jobs_waiting=0)["key"], "morph_limit")
+        waiting = verdict_for(raw, kimi_jobs_waiting=1)
         self.assertEqual(waiting["key"], "morph_limit")
         self.assertIn("Kimi uncached averaged 100%", waiting["text"])
 
@@ -993,9 +999,14 @@ class LimitedByTest(unittest.TestCase):
         self.assertEqual(result["chip"], "Morph slow")
 
     def test_morph_slow_needs_an_empty_proxy_queue(self) -> None:
-        queued = {"queued": {"urgent": 0, "normal": 3, "backlog": 0}}
-        result = verdict_for(five_minutes(total=1_000_000), live=queued, ds_p50_5m_ms=12_000, ds_p50_base_ms=5_000)
+        result = verdict_for(five_minutes(total=1_000_000), live=live_queued(output=3), ds_p50_5m_ms=12_000, ds_p50_base_ms=5_000)
         self.assertNotEqual(result["key"], "morph_slow")
+
+    def test_a_waiting_kimi_request_does_not_block_morph_slow(self) -> None:
+        live = live_queued(uncached=1)
+        result = verdict_for(five_minutes(total=1_000_000), live=live, kimi_jobs_waiting=1,
+                             ds_p50_5m_ms=12_000, ds_p50_base_ms=5_000)
+        self.assertEqual(result["key"], "morph_slow")
 
     def test_laptop_when_load_per_cpu_is_over_1_5(self) -> None:
         result = verdict_for(five_minutes(total=1_000_000), laptop=HOT)
@@ -1006,18 +1017,60 @@ class LimitedByTest(unittest.TestCase):
         low_memory = dict(CALM, memory_free_pct=20.0)
         self.assertEqual(verdict_for(five_minutes(total=1_000_000), laptop=low_memory)["key"], "laptop")
 
-    def test_demand_when_pool_is_idle_and_nothing_waits(self) -> None:
-        result = verdict_for(five_minutes(total=1_000_000))
-        self.assertEqual(result["key"], "demand")
-        self.assertEqual(result["chip"], "Demand")
-
-    def test_demand_needs_no_ready_job(self) -> None:
-        self.assertEqual(verdict_for(five_minutes(total=1_000_000), jobs_queued=2)["key"], "near_capacity")
-
-    def test_near_capacity_otherwise(self) -> None:
-        result = verdict_for(five_minutes(total=8_800_000))
+    def test_near_capacity_when_the_pool_averages_85_percent(self) -> None:
+        result = verdict_for(five_minutes(total=8_500_000))
         self.assertEqual(result["key"], "near_capacity")
         self.assertEqual(result["chip"], "Near capacity")
+        self.assertEqual(result["text"], "Near capacity: pool at 85% of Morph's 10M/min limit.")
+
+    def test_near_capacity_wins_over_proxy_pacing(self) -> None:
+        result = verdict_for(five_minutes(total=8_800_000), live=live_queued(total=2))
+        self.assertEqual(result["key"], "near_capacity")
+
+    def test_proxy_pacing_names_the_deepseek_budget_with_waiting_requests(self) -> None:
+        result = verdict_for(five_minutes(total=4_100_000), live=live_queued(total=2))
+        self.assertEqual(result["key"], "proxy_pacing")
+        self.assertEqual(result["chip"], "Proxy pacing")
+        self.assertEqual(result["text"], "Proxy pacing: DeepSeek requests are waiting on Total pool while the pool is at 41%.")
+
+    def test_proxy_pacing_names_deepseek_uncached_input_when_that_budget_waits(self) -> None:
+        result = verdict_for(five_minutes(total=4_100_000), live=live_queued(uncached_ds=3))
+        self.assertEqual(result["key"], "proxy_pacing")
+        self.assertIn("waiting on DeepSeek uncached input", result["text"])
+
+    def test_a_waiting_kimi_request_is_not_deepseek_pacing(self) -> None:
+        live = live_queued(total=1, uncached=1)
+        result = verdict_for(five_minutes(total=4_100_000), live=live, kimi_jobs_waiting=1)
+        self.assertNotEqual(result["key"], "proxy_pacing")
+
+    def test_launching_when_deepseek_jobs_are_ready_and_nothing_waits_at_the_proxy(self) -> None:
+        result = verdict_for(five_minutes(total=4_100_000), ds_jobs_ready=3)
+        self.assertEqual(result["key"], "launching")
+        self.assertEqual(result["chip"], "Launching")
+        self.assertEqual(result["text"], "Launching: 3 DeepSeek jobs are ready; the broker is starting them.")
+
+    def test_headroom_when_the_pool_is_below_85_and_nothing_waits(self) -> None:
+        result = verdict_for(five_minutes(total=4_100_000))
+        self.assertEqual(result["key"], "headroom")
+        self.assertEqual(result["chip"], "Headroom")
+        self.assertEqual(result["text"], "Headroom: pool at 41% of Morph's limit; room for more work.")
+        self.assertIsNone(result["secondary"])
+
+    def test_live_case_kimi_review_held_by_its_own_budget_is_headroom_with_a_kimi_line(self) -> None:
+        live = live_queued(total=1, uncached=1)
+        result = verdict_for(five_minutes(total=4_100_000), live=live, kimi_jobs_waiting=1, ds_jobs_ready=0)
+        self.assertEqual(result["key"], "headroom")
+        self.assertEqual(result["text"], "Headroom: pool at 41% of Morph's limit; room for more work.")
+        self.assertEqual(result["secondary"], "Kimi reviews waiting: 1 (Kimi's own 24,290/min uncached limit).")
+
+    def test_headroom_when_the_proxy_is_unreachable_and_no_deepseek_job_is_ready(self) -> None:
+        result = verdict_for(five_minutes(total=4_100_000), live=None)
+        self.assertEqual(result["key"], "headroom")
+
+    def test_proxy_waiting_by_budget_takes_kimi_out_of_the_total_queue(self) -> None:
+        live = live_queued(total=2, output=1, uncached=2, uncached_ds=4)
+        self.assertEqual(dash.proxy_waiting_by_budget(live), {"total": 0, "output": 1, "uncached_ds": 4})
+        self.assertIsNone(dash.proxy_waiting_by_budget(None))
 
 
 class RoomForWorkersTest(unittest.TestCase):
@@ -1075,7 +1128,7 @@ class SummaryVerdictTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             home = make_home(Path(tmp))
             summary = dash.build_summary(home, 6, now=NOW, fetch_live=proxy_status, laptop=CALM)
-        self.assertIn(summary["verdict"]["key"], {"morph_limit", "morph_slow", "laptop", "demand", "near_capacity"})
+        self.assertIn(summary["verdict"]["key"], {"morph_limit", "morph_slow", "laptop", "near_capacity", "proxy_pacing", "launching", "headroom"})
         self.assertIn("text", summary["room"])
         self.assertIn("tokens_5m", summary["activity"])
         self.assertEqual(summary["token_bucket_s"], 300)
