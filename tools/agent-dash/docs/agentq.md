@@ -137,6 +137,58 @@ Install the LaunchAgent (not done by the repo): fill `__PYTHON__` and `__HOME__`
 `agentq/launchd/com.agentq.broker.plist`, copy it to
 `~/Library/LaunchAgents/`, then `launchctl bootstrap gui/$(id -u) <plist>`.
 
+## Runtime ssh and pytest slots (PATH shims)
+
+The queue limits whole jobs by their `--res` label. What a worker runs inside a job
+was unguarded, so `launch_pi.py` puts `agentq/shims/` first on PATH for the pi child.
+Five shell wrappers (`ssh`, `pytest`, `python`, `python3`, `uv`) in `agentq/shims/`
+decide in sh, with no Python start-up on the common path (`python3 -c pass` through the
+shim is about 31 ms, against 25 ms bare, measured interleaved). Only a pytest argv, or an ssh argv naming a gated
+host, reaches `agentq/shims/dispatch.py`. Everything else is exec'd with the same argv.
+Stdlib only; slots live in `agentq/slots.py`.
+
+The ssh fast path reads `$AGENTQ_HOME/slots/ssh_hosts`, one host pattern per line.
+`launch_pi.py` writes it at launch from `broker.json`, and every dispatch run rewrites it.
+Without that file, ssh is not gated, so the launch step matters.
+
+- **ssh** to a host in `shims.ssh_gated_hosts` holds one of `slots.ssh` (8) slots for the
+  life of the command. The list has no default in the repo, so production aliases are set
+  in the local `$AGENTQ_HOME/broker.json`, for example
+  `"shims": {"ssh_gated_hosts": ["<prod-alias>", "<prod-alias-2>"]}` (glob patterns allowed).
+  Until that list is set, no ssh is gated. ssh to any other host, such as git over ssh to
+  github.com, passes through.
+- **pytest**: `pytest`, `python[3] -m pytest`, `uv run pytest` and `uv run python -m pytest`
+  hold one of the pytest slots, then run the real command under `memcap.sh 8192`.
+  The ceiling is `slots.tests` when `broker.json` sets it, else 16. The broker's own
+  `tests` cap of 6 governs broker jobs and is not reused. A new run starts at once
+  while fewer than `adaptive.tests_floor` (4) are busy. Above that it also needs memory
+  free of at least `tests_min_free_pct` (35) and load per CPU under `tests_max_load_per_cpu`
+  (1.0), read through `memory_pressure` at most every `gauge_ttl_s` (15) seconds and cached
+  in `slots/gauge.json`. An unreadable gauge adds no gate, as in the broker.
+- **Slots** are `$AGENTQ_HOME/slots/<kind>/slot-N` files. A holder takes
+  `flock(LOCK_EX | LOCK_NB)` and keeps it while its child runs, so a crashed holder frees
+  its slot. The holder's pid, label and command are written into the slot. Waiters back
+  off from 0.5 s to 5 s with jitter. After 30 minutes a waiter runs anyway, unslotted,
+  and appends a line to `slots/overruns.log`: a stuck slot slows a worker but never
+  deadlocks it.
+- A pytest started inside a held slot (a test that runs pytest) skips the gate, through
+  `AGENTQ_SLOT_HELD`, so it cannot wait on its parent's slot.
+- `agentq slots` lists the holders per kind and ends with an `ANSWER:` line.
+
+Not enforced:
+
+- Absolute paths bypass the shims: `/usr/bin/ssh`, `/usr/bin/python3 -m pytest`, or a
+  venv's `.venv/bin/pytest` run the real binary directly.
+- Other `uv` forms (for example `uv run --project DIR pytest`) pass through ungated.
+- A shell that sources a login profile reorders PATH and puts `/usr/bin` first. Pi's bash
+  tool runs `bash -c` (no login profile), so the shims hold there. A custom
+  `shellCommandPrefix` that sources a profile would undo that.
+- Commands started outside a pi worker, and the broker's own launches.
+- A run that overruns the 30-minute wait goes ahead unslotted by design.
+
+Disable: launch with `AGENTQ_SHIMS=0` (launch_pi then leaves PATH alone), or drop the
+shims folder from PATH. Tests: `tests/test_agentq_shims.py`.
+
 ## Known limits
 
 - Resume: on a requeue the broker resolves the previous attempt's session file

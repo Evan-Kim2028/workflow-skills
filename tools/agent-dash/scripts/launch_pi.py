@@ -78,6 +78,7 @@ ROOT = HERE.parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from agentq import slots as agentq_slots  # noqa: E402
 from dash import labels as label_lib  # noqa: E402
 from dash import logfilter  # noqa: E402
 from dash.sources import pi as pi_source  # noqa: E402
@@ -453,6 +454,9 @@ def record_pilot(label, arm, outdir, home, started):
 
 
 RUN_ENV = "AGENTQ_RUN"
+SHIMS_ENV = "AGENTQ_SHIMS"
+SHIM_PYTHON_ENV = "AGENTQ_SHIM_PYTHON"
+SHIMS_DIR = ROOT / "agentq" / "shims"
 
 
 def set_run_label(label, environ=os.environ):
@@ -461,6 +465,21 @@ def set_run_label(label, environ=os.environ):
     stays; AGENTQ_JOB is never touched, since run_worker.py reads it to detect broker launches."""
     if not (environ.get(RUN_ENV) or "").strip():
         environ[RUN_ENV] = label
+    return environ
+
+
+def shim_environ(environ, shims_dir=SHIMS_DIR, python=sys.executable):
+    """Put the agentq command shims first on PATH for the pi child; ``AGENTQ_SHIMS=0`` skips it.
+
+    The shims gate ssh to production hosts and pytest runs (see agentq/shims/dispatch.py).
+    ``AGENTQ_SHIM_PYTHON`` names the interpreter the shims run their dispatcher with.
+    """
+    if (environ.get(SHIMS_ENV) or "").strip() == "0":
+        return environ
+    shims = str(shims_dir)
+    rest = [part for part in (environ.get("PATH") or "").split(os.pathsep) if part and part != shims]
+    environ["PATH"] = os.pathsep.join([shims, *rest])
+    environ.setdefault(SHIM_PYTHON_ENV, python)
     return environ
 
 
@@ -510,6 +529,8 @@ def main(argv=None):
         return 2
 
     set_run_label(label)
+    shim_environ(os.environ)
+    agentq_slots.write_ssh_hosts(agentq_home())
     out = Path(outdir)
     out.mkdir(parents=True, exist_ok=True)
     (out / "running").mkdir(parents=True, exist_ok=True)
