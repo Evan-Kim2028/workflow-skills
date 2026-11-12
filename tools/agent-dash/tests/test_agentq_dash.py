@@ -279,7 +279,7 @@ class ServerTest(unittest.TestCase):
         self.assertTrue(ctype.startswith("text/html"))
         self.assertIn("<!DOCTYPE html>", html)
         for title in (
-            "Share of each Morph-enforced limit, % of limit",
+            "Morph total-token limit used per minute",
             "Active runs over time, with caps",
             "Tokens per 5 minutes, millions",
             "Runs",
@@ -910,13 +910,14 @@ class UpstreamLatencyDashTest(unittest.TestCase):
 
 
 class EnforcedLimitsChartTest(unittest.TestCase):
-    def test_main_billed_chart_plots_only_enforced_limits(self) -> None:
+    def test_main_billed_chart_has_exactly_one_series_the_total_pool(self) -> None:
         html = dash.PAGE_HTML
         start = html.index('registerChart("c-billed"')
         block = html[start:html.index('registerChart("c-workers"')]
-        self.assertIn("pct_total", block)
-        self.assertIn("pct_ds_uncached", block)
-        self.assertNotIn("pct_ds_output", block)
+        self.assertEqual(block.count('key: "pct_'), 1)
+        self.assertIn('key: "pct_total"', block)
+        self.assertIn("Morph limit (10M/min)", block)
+        self.assertNotIn("pct_ds_uncached", block)
         self.assertNotIn("70k", block)
 
     def test_ds_uncached_share_is_of_the_400k_limit(self) -> None:
@@ -1096,3 +1097,83 @@ class BudgetRateLimitLogTest(unittest.TestCase):
             )
             found = dash.budget_429_minutes(home, UNTIL)
         self.assertEqual(found, {"total": {UNTIL - 60}})
+
+
+class CapacityPairTest(unittest.TestCase):
+    def test_paired_charts_share_one_layout_object_for_height_and_margins(self) -> None:
+        html = dash.PAGE_HTML
+        self.assertIn("var PAIR_LAYOUT = { height: 260, margin: { l: 64, r: 16, t: 14, b: 24 } };", html)
+        for name, end in (("c-billed", "c-workers"), ("c-workers", "var mix =")):
+            start = html.index(f'registerChart("{name}"')
+            block = html[start:html.index(end, start)]
+            self.assertIn("height: PAIR_LAYOUT.height", block, name)
+            self.assertIn("margin: PAIR_LAYOUT.margin", block, name)
+
+    def test_response_time_chart_uses_the_pair_gutters_so_its_x_scale_matches(self) -> None:
+        html = dash.PAGE_HTML
+        start = html.index('registerChart("c-upstream"')
+        self.assertIn("margin: PAIR_LAYOUT.margin", html[start:html.index("setText(\"up-note\"", start)])
+
+    def test_shared_note_sits_under_both_columns_and_the_old_claim_is_gone(self) -> None:
+        html = dash.PAGE_HTML
+        self.assertIn('class="note-line pair-note"', html)
+        self.assertNotIn("lines are comparable", html)
+        self.assertLess(html.index('id="c-workers"'), html.index('class="note-line pair-note"'))
+
+    def test_deepseek_uncached_chart_sits_next_to_kimi_with_a_rejection_subtitle(self) -> None:
+        html = dash.PAGE_HTML
+        self.assertIn("DeepSeek uncached input — our estimate vs 400k/min", html)
+        self.assertLess(html.index('id="c-kimi"'), html.index('id="c-dsu"'))
+        self.assertIn('id="dsu-sub"', html)
+        self.assertIn("rejections not recorded", html)
+        self.assertIn("Morph rejected ", html)
+
+    def test_response_time_chart_sits_below_the_small_charts_and_above_runs(self) -> None:
+        html = dash.PAGE_HTML
+        self.assertLess(html.index('id="c-wait"'), html.index('id="c-upstream"'))
+        self.assertLess(html.index('id="c-upstream"'), html.index('aria-labelledby="h-runs"'))
+
+    def test_activity_tiles_carry_per_minute_subtext(self) -> None:
+        html = dash.PAGE_HTML
+        self.assertIn('id="a5-min"', html)
+        self.assertIn('id="a15-min"', html)
+        self.assertIn("last full minute: ", html)
+        self.assertIn('"avg/min: "', html)
+
+
+class RejectionAndPerMinuteValuesTest(unittest.TestCase):
+    def test_rejections_count_uncached_ds_calib_lines_inside_the_range(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            (home / "logs").mkdir()
+            this = dash.minute_stamp(UNTIL - 60)
+            old = dash.minute_stamp(UNTIL - 3600)
+            (home / "logs" / "proxy.err.log").write_text(
+                f"{this}:30Z agentq-proxy calib minute={this} budget=uncached_ds sec=30.0\n"
+                f"{this}:40Z agentq-proxy calib minute={this} budget=uncached_ds sec=40.0\n"
+                f"{old}:30Z agentq-proxy calib minute={old} budget=uncached_ds sec=30.0\n"
+                f"{this}:31Z agentq-proxy calib minute={this} budget=total sec=31.0\n",
+                encoding="utf-8",
+            )
+            read = dash.read_calib_429s(home)
+        rejected = dash.budget_rejections(read, "uncached_ds", UNTIL - 1800, UNTIL)
+        self.assertEqual(rejected, {"count": 2, "partial": False})
+
+    def test_no_stated_budget_lines_means_rejections_are_not_recorded(self) -> None:
+        self.assertEqual(dash.budget_rejections({"events": [], "truncated": False}, "uncached_ds", 0, UNTIL),
+                         {"count": None, "partial": False})
+        self.assertEqual(dash.budget_rejections(None, "uncached_ds", 0, UNTIL), {"count": None, "partial": False})
+
+    def test_truncated_log_tail_marks_the_count_partial(self) -> None:
+        read = {"events": [("uncached_ds", UNTIL - 60)], "truncated": True}
+        self.assertEqual(dash.budget_rejections(read, "uncached_ds", UNTIL - 3600, UNTIL),
+                         {"count": 1, "partial": True})
+
+    def test_pool_per_minute_prefers_admitted_minutes_and_averages_over_the_window(self) -> None:
+        raw = five_minutes(total=1_000_000)
+        admitted = {UNTIL - 60: 4_000_000}
+        per_minute = dash.pool_per_minute(raw, admitted, UNTIL)
+        self.assertEqual(per_minute["last_full_minute"], 4_000_000)
+        self.assertEqual(per_minute["last_full_minute_frac"], 0.4)
+        self.assertEqual(per_minute["avg_5m"], 1_600_000)
+        self.assertEqual(per_minute["avg_15m"], round((4_000_000 + 4 * 1_000_000) / 15))

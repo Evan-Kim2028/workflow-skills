@@ -294,10 +294,13 @@ h3.group { font-size: 12px; font-weight: 600; color: var(--ink-2); text-transfor
 .tip .row { display: flex; align-items: center; gap: 6px; }
 .tip .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
 .tip .warn { color: var(--ink-3); white-space: normal; max-width: 260px; }
-.grid3 { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 14px; }
+.grid3 { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 14px; }
 .grid3 .card { margin-bottom: 0; }
 .pair { display: grid; grid-template-columns: 1fr; gap: 14px; }
-.pair .card { margin-bottom: 14px; }
+.pair .card { margin-bottom: 0; }
+.pair .card-head { min-height: 58px; align-items: flex-start; }
+.pair .legend { min-height: 18px; }
+.pair .pair-note { grid-column: 1 / -1; margin-top: 0; }
 @media (min-width: 1100px) { .pair { grid-template-columns: 1fr 1fr; } }
 
 .tbl-tools { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 8px; margin: 2px 0 8px; }
@@ -346,8 +349,8 @@ td.wrap .cont { color: var(--ink-3); display: block; }
   </section>
 
   <div class="activity" aria-label="Activity">
-    <div class="stat"><div class="label">Tokens, last 5 min</div><div class="value" id="a5-tokens">—</div><div class="note" id="a5-note">—</div></div>
-    <div class="stat"><div class="label">Tokens, last 15 min</div><div class="value" id="a15-tokens">—</div><div class="note" id="a15-note">—</div></div>
+    <div class="stat"><div class="label">Tokens, last 5 min</div><div class="value" id="a5-tokens">—</div><div class="note" id="a5-note">—</div><div class="note" id="a5-min">—</div></div>
+    <div class="stat"><div class="label">Tokens, last 15 min</div><div class="value" id="a15-tokens">—</div><div class="note" id="a15-note">—</div><div class="note" id="a15-min">—</div></div>
     <div class="stat"><div class="label">DeepSeek output, 5 min avg per min</div><div class="value" id="a-ds">—</div><div class="note">tokens per minute, plain count</div></div>
   </div>
 
@@ -377,32 +380,22 @@ td.wrap .cont { color: var(--ink-3); display: block; }
   <section class="group-block" aria-labelledby="g-capacity">
     <h3 class="group" id="g-capacity">Capacity vs workers</h3>
     <div class="pair">
-  <section class="card" aria-labelledby="h-billed">
-    <div class="card-head">
-      <h2 id="h-billed">Share of each Morph-enforced limit, % of limit</h2>
-      <div class="legend" id="lg-billed"></div>
+      <section class="card" aria-labelledby="h-billed">
+        <div class="card-head">
+          <h2 id="h-billed">Morph total-token limit used per minute</h2>
+          <div class="legend" id="lg-billed"></div>
+        </div>
+        <div class="chart" id="c-billed"></div>
+      </section>
+      <section class="card" aria-labelledby="h-workers">
+        <div class="card-head">
+          <h2 id="h-workers">Active runs over time, with caps</h2>
+          <div class="legend" id="lg-workers"></div>
+        </div>
+        <div class="chart" id="c-workers"></div>
+      </section>
+      <div class="note-line pair-note">The left chart is total pool tokens per minute as a share of Morph's 10M limit: admitted tokens where the proxy recorded them, completion minutes elsewhere. The dashed line is that limit; carets mark values above the 120% axis top, and the tooltip shows the true value.</div>
     </div>
-    <div class="chart" id="c-billed"></div>
-    <div class="note-line">Each line is the share of a limit Morph enforces; lines are comparable. Only limits Morph enforces are shown as %.</div>
-    <div class="note-line">Total pool uses tokens admitted in each minute where the proxy recorded them, and falls back to completion minutes elsewhere.</div>
-  </section>
-
-  <section class="card" aria-labelledby="h-workers">
-    <div class="card-head">
-      <h2 id="h-workers">Active runs over time, with caps</h2>
-      <div class="legend" id="lg-workers"></div>
-    </div>
-    <div class="chart" id="c-workers"></div>
-  </section>
-    </div>
-    <section class="card" aria-labelledby="h-upstream">
-      <div class="card-head">
-        <h2 id="h-upstream">Morph response time per request (s), p50 and p95</h2>
-        <div class="legend"><span class="key"><span class="swatch" style="border-color: var(--s1)"></span>p50</span><span class="key"><span class="swatch" style="border-color: var(--s2)"></span>p95</span></div>
-      </div>
-      <div class="chart" id="c-upstream"></div>
-      <div class="note-line" id="up-note"></div>
-    </section>
   </section>
 
   <section class="card" aria-labelledby="h-tokens">
@@ -421,6 +414,14 @@ td.wrap .cont { color: var(--ink-3); display: block; }
       <div class="legend" style="margin-bottom: 4px"><span class="key"><span class="swatch" style="border-color: var(--s3)"></span>Kimi uncached (estimate)</span></div>
       <div class="chart" id="c-kimi"></div>
     </div>
+    <div class="card" aria-labelledby="h-dsu">
+      <div class="card-head">
+        <h2 id="h-dsu">DeepSeek uncached input — our estimate vs 400k/min</h2>
+      </div>
+      <div class="legend" style="margin-bottom: 4px"><span class="key"><span class="swatch" style="border-color: var(--s2)"></span>DeepSeek uncached (estimate)</span></div>
+      <div class="chart" id="c-dsu"></div>
+      <div class="note-line" id="dsu-sub">—</div>
+    </div>
     <div class="card" aria-labelledby="h-429">
       <div class="card-head">
         <h2 id="h-429">Upstream 429s per minute</h2>
@@ -435,6 +436,15 @@ td.wrap .cont { color: var(--ink-3); display: block; }
       <div class="legend" style="margin-bottom: 4px"><span class="key"><span class="swatch" style="border-color: var(--s1)"></span>p95 wait, seconds</span></div>
       <div class="chart" id="c-wait"></div>
     </div>
+  </section>
+
+  <section class="card" aria-labelledby="h-upstream">
+    <div class="card-head">
+      <h2 id="h-upstream">Morph response time per request (s), p50 and p95</h2>
+      <div class="legend"><span class="key"><span class="swatch" style="border-color: var(--s1)"></span>p50</span><span class="key"><span class="swatch" style="border-color: var(--s2)"></span>p95</span></div>
+    </div>
+    <div class="chart" id="c-upstream"></div>
+    <div class="note-line" id="up-note"></div>
   </section>
 
   <section class="card" aria-labelledby="h-runs">
@@ -767,7 +777,7 @@ td.wrap .cont { color: var(--ink-3); display: block; }
     var endText = function (e) { return e.s.name + " " + fmtY(e.v, true); };
     var endW = 0;
     ends.forEach(function (e) { endW = Math.max(endW, measure(svg, endText(e), "direct")); });
-    var m = cfg.margin ? { l: cfg.margin.l, r: cfg.margin.r, t: 14, b: 24 } : {
+    var m = cfg.margin ? { l: cfg.margin.l, r: cfg.margin.r, t: cfg.margin.t, b: cfg.margin.b } : {
       l: Math.max(44, Math.ceil(tickW) + 12),
       r: ends.length ? Math.min(Math.ceil(endW) + 24, Math.floor(W * 0.42)) : 12,
       t: 14,
@@ -1064,6 +1074,10 @@ td.wrap .cont { color: var(--ink-3); display: block; }
         (w.delta >= 0 ? "+" : "") + Math.round(w.delta * 100) + "% vs previous " + row[0] + " min";
       setText("a" + row[0] + "-note", count(w.requests) + " requests · " + delta);
     });
+    var pm = a.pool_per_minute || {};
+    setText("a5-min", pm.last_full_minute === undefined ? "—" :
+      "last full minute: " + compact(pm.last_full_minute) + " (" + pct(pm.last_full_minute_frac, 0) + " of 10M) · avg/min: " + compact(pm.avg_5m));
+    setText("a15-min", pm.avg_15m === undefined ? "—" : "avg/min: " + compact(pm.avg_15m));
     var dso = d.ds_output_5m_per_min;
     setTile("a-ds", dso === null || dso === undefined ? null : Math.round(dso));
   }
@@ -1122,29 +1136,26 @@ td.wrap .cont { color: var(--ink-3); display: block; }
     var maxWorkers = workers.reduce(function (a, w) {
       return Math.max(a, w.ds || 0, w.kimi || 0, w.queued || 0);
     }, 0);
+    var PAIR_LAYOUT = { height: 260, margin: { l: 64, r: 16, t: 14, b: 24 } };
     var pctFmt = function (v, inline) { return inline ? (v * 100).toFixed(1) + "%" : Math.round(v * 100) + "%"; };
     var intFmt = function (v) { return Math.round(v).toLocaleString("en-US"); };
     charts.length = 0;
 
-    var PAIR_MARGIN = { l: 64, r: 16 };
+    var pctAxis = { min: 0, max: 1.2, clip: 1.2, ticks: [0, 0.2, 0.4, 0.6, 0.8, 1, 1.2], fmt: pctFmt };
     registerChart("c-billed", {
-      title: "Share of each Morph-enforced limit, percent per interval",
-      kind: "line", bucket_s: bucket, tickFmt: fmtX, margin: PAIR_MARGIN, group: "capacity",
-      x0: win.start, x1: win.end, height: 260,
+      title: "Morph total-token limit used per minute",
+      kind: "line", bucket_s: bucket, tickFmt: fmtX, margin: PAIR_LAYOUT.margin, group: "capacity",
+      x0: win.start, x1: win.end, height: PAIR_LAYOUT.height,
       points: minutes,
-      series: [
-        { key: "pct_total", name: "Total pool (of 10M/min)", color: COLORS.s1 },
-        { key: "pct_ds_uncached", name: "DeepSeek uncached input (of 400k/min)", color: COLORS.s2 }
-      ],
-      y: clippedAxis(valuesOf(minutes, ["pct_total", "pct_ds_uncached"]), pctFmt),
-      refs: [{ v: 1, label: "100% of limit" }],
+      series: [{ key: "pct_total", name: "Total pool, % of 10M/min", color: COLORS.s1 }],
+      y: pctAxis,
+      refs: [{ v: 1, label: "Morph limit (10M/min)" }],
       fmt: pctFmt
     });
-    setText("h-billed", "Share of each Morph-enforced limit, % of limit");
     registerChart("c-workers", {
       title: "Active runs over time",
-      kind: "line", bucket_s: bucket, tickFmt: fmtX, margin: PAIR_MARGIN, group: "capacity",
-      x0: win.start, x1: win.end, height: 260,
+      kind: "line", bucket_s: bucket, tickFmt: fmtX, margin: PAIR_LAYOUT.margin, group: "capacity",
+      x0: win.start, x1: win.end, height: PAIR_LAYOUT.height,
       points: workers,
       series: [
         { key: "ds", name: "DeepSeek runs", color: COLORS.s1 },
@@ -1168,8 +1179,7 @@ td.wrap .cont { color: var(--ink-3); display: block; }
     }, drawTokenCombo);
     setText("h-tokens", "Tokens per " + tunit + ", millions");
     legendFor($("lg-billed"), [
-      { name: "Total pool (of 10M/min)", color: COLORS.s1 },
-      { name: "DeepSeek uncached input (of 400k/min)", color: COLORS.s2 }
+      { name: "Total pool, % of 10M/min", color: COLORS.s1 }
     ]);
     legendFor($("lg-workers"), [
       { name: "DeepSeek runs", color: COLORS.s1 },
@@ -1192,6 +1202,19 @@ td.wrap .cont { color: var(--ink-3); display: block; }
       fmt: pctFmt
     });
     setText("h-kimi", "Kimi uncached input, estimated % of 24,290/min");
+    registerChart("c-dsu", {
+      title: "DeepSeek uncached input, estimated percent of 400k per minute",
+      kind: "line", bucket_s: bucket, tickFmt: fmtX, x0: win.start, x1: win.end, height: 200,
+      points: minutes,
+      series: [{ key: "pct_ds_uncached", name: "DeepSeek uncached (estimate)", color: COLORS.s2 }],
+      y: pctAxis,
+      refs: [{ v: 1, label: "400k/min" }],
+      fmt: pctFmt
+    });
+    var rej = d.ds_uncached_rejections || {};
+    setText("dsu-sub", rej.count === null || rej.count === undefined
+      ? "rejections not recorded"
+      : "Morph rejected " + count(rej.count) + " requests on this limit in the selected range" + (rej.partial ? " (proxy log tail only)" : ""));
     var maxR = minutes.reduce(function (a, p) { return Math.max(a, p.r429); }, 0);
     registerChart("c-429", {
       title: "Upstream 429s per " + unit,
@@ -1222,7 +1245,7 @@ td.wrap .cont { color: var(--ink-3); display: block; }
     var maxU = upPoints.reduce(function (a, p) { return p.p95 === null ? a : Math.max(a, p.p95); }, 0);
     registerChart("c-upstream", {
       title: "Morph response time per request, seconds per " + unit,
-      kind: "line", bucket_s: bucket, tickFmt: fmtX, margin: PAIR_MARGIN, group: "capacity",
+      kind: "line", bucket_s: bucket, tickFmt: fmtX, margin: PAIR_LAYOUT.margin, group: "capacity",
       x0: win.start, x1: win.end, height: 200,
       points: upPoints,
       series: [
@@ -2362,17 +2385,17 @@ def ds_upstream_p50(rows: list[dict]) -> int | None:
     return round(sum(int(row.get("ds_p50_weighted") or 0) for row in rows) / weight)
 
 
-def budget_429_minutes(home: Path, until: int) -> dict[str, set[int]]:
-    """Minutes with an upstream 429 per budget name, from the proxy's calib log lines in the last 5 minutes.
+def read_calib_429s(home: Path) -> dict | None:
+    """Calib log lines that name a 429 budget, from the proxy log tail: ``events`` as (budget, minute epoch) pairs.
 
-    The proxy names the budget a 429 body states. A 429 with no stated budget is not counted.
+    ``events`` is empty when the log holds no such line, which means the proxy did not record rejections.
+    ``truncated`` says the tail does not reach back to the start of the log. None when the log is unreadable.
     """
     try:
-        data, _ = read_log_tail(Path(home) / "logs" / LOG_SOURCES["proxy"])
+        data, truncated = read_log_tail(Path(home) / "logs" / LOG_SOURCES["proxy"])
     except OSError:
-        return {}
-    start = until - LIMIT_WINDOW_MINUTES * 60
-    found: dict[str, set[int]] = {}
+        return None
+    events: list[tuple[str, int]] = []
     for line in data.decode("utf-8", "replace").splitlines():
         entry = parse_log_line(line)
         if entry is None or entry["event"] != "calib":
@@ -2382,12 +2405,58 @@ def budget_429_minutes(home: Path, until: int) -> dict[str, set[int]]:
         if not budget or budget == "None" or not stamp:
             continue
         try:
-            minute = minute_epoch(stamp)
+            events.append((budget, minute_epoch(stamp)))
         except ValueError:
             continue
+    return {"events": events, "truncated": truncated}
+
+
+def budget_429_minutes(home: Path, until: int) -> dict[str, set[int]]:
+    """Minutes with an upstream 429 per budget name, from the proxy's calib log lines in the last 5 minutes.
+
+    The proxy names the budget a 429 body states. A 429 with no stated budget is not counted.
+    """
+    read = read_calib_429s(home)
+    if read is None:
+        return {}
+    start = until - LIMIT_WINDOW_MINUTES * 60
+    found: dict[str, set[int]] = {}
+    for budget, minute in read["events"]:
         if start <= minute < until:
             found.setdefault(budget, set()).add(minute)
     return found
+
+
+def budget_rejections(read: dict | None, budget: str, since: int, until: int) -> dict:
+    """Upstream 429s that named ``budget`` in [since, until), from ``read_calib_429s``.
+
+    ``count`` is None when the log records no stated-budget 429 at all, so the page can say rejections are not recorded.
+    ``partial`` says the log tail may not cover the whole range.
+    """
+    if read is None or not read["events"]:
+        return {"count": None, "partial": False}
+    count = sum(1 for name, minute in read["events"] if name == budget and since <= minute < until)
+    return {"count": count, "partial": bool(read["truncated"])}
+
+
+def minute_pool_tokens(raw: dict[int, dict], admitted: dict[int, int], minute: int) -> int:
+    """Total-pool tokens for one minute: admitted tokens where proxy_calib has the minute, else completion tokens."""
+    if minute in admitted:
+        return int(admitted[minute])
+    return int((raw.get(minute) or {}).get("total") or 0)
+
+
+def pool_per_minute(raw: dict[int, dict], admitted: dict[int, int], until: int) -> dict:
+    """Total-pool tokens per minute on the same basis as the main capacity line: the last full minute and 5 and 15 minute averages."""
+    last = minute_pool_tokens(raw, admitted, until - 60)
+    avg5 = sum(minute_pool_tokens(raw, admitted, t) for t in range(until - 300, until, 60)) / 5
+    avg15 = sum(minute_pool_tokens(raw, admitted, t) for t in range(until - 900, until, 60)) / 15
+    return {
+        "last_full_minute": last,
+        "last_full_minute_frac": fraction(last, LIMITS["total"]),
+        "avg_5m": round(avg5),
+        "avg_15m": round(avg15),
+    }
 
 
 def memory_free_pressure(now: float, run=subprocess.run) -> float | None:
@@ -2627,7 +2696,12 @@ def build_summary(
         active_ds_workers=(sum(worker_vals) / len(worker_vals)) if worker_vals else None,
         laptop=laptop_now,
     )
-    activity = {"tokens_5m": window_tokens(raw, until, 5), "tokens_15m": window_tokens(raw, until, 15)}
+    calib_429s = _guard("calib_429s", errors, read_calib_429s, None, home)
+    activity = {
+        "tokens_5m": window_tokens(raw, until, 5),
+        "tokens_15m": window_tokens(raw, until, 15),
+        "pool_per_minute": pool_per_minute(raw, admitted, until),
+    }
     return {
         "generated_at": now,
         "hours": hours,
@@ -2636,6 +2710,7 @@ def build_summary(
         "limits": limits,
         "capacity": capacity_headline(limits, live),
         "r429_60m": recent_429s(raw, until),
+        "ds_uncached_rejections": budget_rejections(calib_429s, "uncached_ds", since, until),
         "ds_output_5m_per_min": deepseek_output_rate(raw, until),
         "bucket_s": bucket,
         "minutes": minutes,
