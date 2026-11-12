@@ -90,7 +90,12 @@ SELECT minute,
        SUM(COALESCE(cache_read, 0)) AS cache_read,
        SUM(COALESCE(output, 0)) AS output,
        SUM(COALESCE(wait_p50_ms, 0) * COALESCE(req, 0)) AS wait_p50_weighted,
-       MAX(wait_p95_ms) AS wait_p95_ms
+       MAX(wait_p95_ms) AS wait_p95_ms,
+       {upstream_ms_sum} AS upstream_ms_sum,
+       {upstream_n} AS upstream_n,
+       {upstream_p50_weighted} AS upstream_p50_weighted,
+       {upstream_p50_weight} AS upstream_p50_weight,
+       {upstream_p95_ms} AS upstream_p95_ms
 FROM proxy_minutes
 WHERE minute >= ? AND minute < ?
 GROUP BY minute
@@ -246,6 +251,9 @@ h3.group { font-size: 12px; font-weight: 600; color: var(--ink-2); text-transfor
 .tip .warn { color: var(--ink-3); white-space: normal; max-width: 260px; }
 .grid3 { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 14px; }
 .grid3 .card { margin-bottom: 0; }
+.pair { display: grid; grid-template-columns: 1fr; gap: 14px; }
+.pair .card { margin-bottom: 14px; }
+@media (min-width: 1100px) { .pair { grid-template-columns: 1fr 1fr; } }
 
 .tbl-tools { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 8px; margin: 2px 0 8px; }
 .filter input {
@@ -315,6 +323,8 @@ td.wrap .cont { color: var(--ink-3); display: block; }
         <div class="kpi"><div class="label">Proxy wait, p50 / p95</div><div class="value sm" id="p-wait">—</div><div class="note">last 15 min; p95 is the worst minute</div></div>
         <div class="kpi"><div class="label">Upstream per request</div><div class="value sm" id="p-upstream">—</div><div class="note">median, runs active in 15 min</div></div>
         <div class="kpi"><div class="label">429 rate</div><div class="value sm" id="p-429rate">—</div><div class="note" id="p-429-note">—</div></div>
+        <div class="kpi"><div class="label">Morph response p50 / p95</div><div class="value sm" id="p-morph">—</div><div class="note">per request, last 15 min; p95 is the worst minute</div></div>
+        <div class="kpi"><div class="label">Requests in flight now</div><div class="value sm" id="p-inflight">—</div><div class="note">sent upstream, not yet answered</div></div>
         <div class="kpi"><div class="label">Requests per minute</div><div class="value sm" id="p-rpm">—</div><div class="note">average, last 5 min</div></div>
       </div>
     </section>
@@ -332,6 +342,9 @@ td.wrap .cont { color: var(--ink-3); display: block; }
     </div>
   </section>
 
+  <section class="group-block" aria-labelledby="g-capacity">
+    <h3 class="group" id="g-capacity">Capacity vs workers</h3>
+    <div class="pair">
   <section class="card" aria-labelledby="h-billed">
     <div class="card-head">
       <h2 id="h-billed">Total pool and DeepSeek output, % of limit</h2>
@@ -348,6 +361,16 @@ td.wrap .cont { color: var(--ink-3); display: block; }
       <div class="legend" id="lg-workers"></div>
     </div>
     <div class="chart" id="c-workers"></div>
+  </section>
+    </div>
+    <section class="card" aria-labelledby="h-upstream">
+      <div class="card-head">
+        <h2 id="h-upstream">Morph response time per request (s), p50 and p95</h2>
+        <div class="legend"><span class="key"><span class="swatch" style="border-color: var(--s1)"></span>p50</span><span class="key"><span class="swatch" style="border-color: var(--s2)"></span>p95</span></div>
+      </div>
+      <div class="chart" id="c-upstream"></div>
+      <div class="note-line" id="up-note"></div>
+    </section>
   </section>
 
   <section class="card" aria-labelledby="h-tokens">
@@ -527,11 +550,37 @@ td.wrap .cont { color: var(--ink-3); display: block; }
     if (n === null || n === undefined) return "—";
     return Number(n).toLocaleString("en-US", { maximumFractionDigits: 1 });
   }
-  function tokens(n) {
+  function truncateTo(v, digits) {
+    var f = Math.pow(10, digits);
+    return (Math.floor(v * f + 1e-9) / f).toFixed(digits);
+  }
+  function compact(n) {
     if (n === null || n === undefined) return "—";
-    if (n >= 1e6) return (n / 1e6).toFixed(n >= 1e7 ? 1 : 2) + "M";
-    if (n >= 1e3) return (n / 1e3).toFixed(0) + "k";
-    return String(Math.round(n));
+    var a = Math.abs(n), sign = n < 0 ? "-" : "";
+    var units = [[1e9, "B"], [1e6, "M"], [1e3, "K"]];
+    for (var i = 0; i < units.length; i++) {
+      if (a >= units[i][0]) {
+        var v = a / units[i][0];
+        return sign + truncateTo(v, v >= 100 ? 0 : 1) + units[i][1];
+      }
+    }
+    return sign + String(Math.floor(a));
+  }
+  function exactCount(n) {
+    return n === null || n === undefined ? "—" : Number(n).toLocaleString("en-US");
+  }
+  function setTile(id, n) {
+    var el = $(id);
+    el.textContent = compact(n);
+    el.title = exactCount(n);
+  }
+  function setTileList(id, values) {
+    var el = $(id);
+    el.textContent = values.map(function (v) { return compact(v); }).join(" / ");
+    el.title = values.map(function (v) { return exactCount(v); }).join(" / ");
+  }
+  function tokens(n) {
+    return compact(n);
   }
   function duration(sec) {
     if (sec === null || sec === undefined) return "—";
@@ -686,7 +735,7 @@ td.wrap .cont { color: var(--ink-3); display: block; }
     var endText = function (e) { return e.s.name + " " + fmtY(e.v, true); };
     var endW = 0;
     ends.forEach(function (e) { endW = Math.max(endW, measure(svg, endText(e), "direct")); });
-    var m = {
+    var m = cfg.margin ? { l: cfg.margin.l, r: cfg.margin.r, t: 14, b: 24 } : {
       l: Math.max(44, Math.ceil(tickW) + 12),
       r: ends.length ? Math.min(Math.ceil(endW) + 24, Math.floor(W * 0.42)) : 12,
       t: 14,
@@ -800,6 +849,10 @@ td.wrap .cont { color: var(--ink-3); display: block; }
     host.appendChild(tip);
     var place = tooltipFor(host, svg, W, X, hit, cross, tip, function (px) {
       var sec = x0 + ((px - m.l) / Math.max(1, iw)) * (x1 - x0);
+      showAt(sec);
+      peersOf(host).forEach(function (peer) { peer.showAt(sec); });
+    });
+    function showAt(sec) {
       var p = nearest(points, sec);
       if (!p) return;
       cross.setAttribute("x1", X(p.t)); cross.setAttribute("x2", X(p.t));
@@ -812,9 +865,23 @@ td.wrap .cont { color: var(--ink-3); display: block; }
       });
       fillTip(tip, fmtX(p.t) + span, rows);
       place(X(p.t), 8);
-    });
+    }
     hit.addEventListener("mouseenter", function () { cross.setAttribute("visibility", "visible"); });
+    hit.addEventListener("mouseleave", function () { peersOf(host).forEach(function (peer) { peer.hide(); }); });
+    host._hover = {
+      showAt: showAt,
+      hide: function () { cross.setAttribute("visibility", "hidden"); tip.style.display = "none"; }
+    };
+    if (cfg.group) host.setAttribute("data-hover-group", cfg.group);
     return svg;
+  }
+
+  function peersOf(host) {
+    var group = host.getAttribute("data-hover-group");
+    if (!group) return [];
+    return Array.prototype.slice.call(document.querySelectorAll('[data-hover-group="' + group + '"]'))
+      .filter(function (el) { return el !== host && el._hover; })
+      .map(function (el) { return el._hover; });
   }
 
   function nearest(points, sec) {
@@ -961,7 +1028,7 @@ td.wrap .cont { color: var(--ink-3); display: block; }
       var target = lim.target_frac === null || lim.target_frac === undefined ? "target n/a" : "target " + pct(lim.target_frac, 0);
       setText(row[1] + "-note", "5 min avg " + pct(lim.avg_5m_frac) + " · " + target);
     });
-    setText("k-waiting", count(cap.waiting_now));
+    setTile("k-waiting", cap.waiting_now);
     var lanes = cap.waiting_by_lane || {};
     setText("k-waiting-note", Object.keys(lanes).length
       ? Object.keys(lanes).map(function (k) { return k + " " + lanes[k]; }).join(" · ")
@@ -970,15 +1037,15 @@ td.wrap .cont { color: var(--ink-3); display: block; }
 
   function renderRunKpis(d) {
     var rk = d.run_kpis || {};
-    setText("r-ds", count(rk.active_deepseek));
+    setTile("r-ds", rk.active_deepseek);
     setText("r-ds-note", "of cap " + count(rk.cap_deepseek));
-    setText("r-kimi", count(rk.active_kimi));
+    setTile("r-kimi", rk.active_kimi);
     setText("r-kimi-note", "of cap " + count(rk.cap_kimi));
-    setText("r-seen", count(rk.seen_today));
+    setTile("r-seen", rk.seen_today);
     var fin = rk.finished_today || {};
-    setText("r-finished", ["PASS", "PARTIAL", "FAIL"].map(function (v) { return count(fin[v] || 0); }).join(" / "));
-    setText("r-tokens", tokens(rk.tokens_today));
-    setText("r-median-tok", tokens(rk.median_tokens_per_run));
+    setTileList("r-finished", ["PASS", "PARTIAL", "FAIL"].map(function (v) { return fin[v] || 0; }));
+    setTile("r-tokens", rk.tokens_today);
+    setTile("r-median-tok", rk.median_tokens_per_run);
     setText("r-median-req", "median " + num1(rk.median_requests_per_run) + " requests");
   }
 
@@ -987,6 +1054,8 @@ td.wrap .cont { color: var(--ink-3); display: block; }
     var p50 = pk.wait_p50_ms === null || pk.wait_p50_ms === undefined ? "—" : seconds(pk.wait_p50_ms);
     setText("p-wait", p50 + " / " + seconds(pk.wait_p95_ms));
     setText("p-upstream", seconds(pk.upstream_median_ms));
+    setText("p-morph", seconds(pk.upstream_response_p50_ms) + " / " + seconds(pk.upstream_response_p95_ms));
+    setTile("p-inflight", pk.in_flight_now);
     setText("p-429rate", pct(pk.r429_rate_60m, 2));
     var r429 = d.r429_60m;
     setText("p-429-note", (r429 === undefined ? "—" : count(r429)) + " 429s in the last 60 min");
@@ -997,13 +1066,13 @@ td.wrap .cont { color: var(--ink-3); display: block; }
     var rt = d.range_totals || {};
     var tok = rt.tokens || {};
     setText("g-range", "Selected range, " + (RANGE_NAME[d.hours] || ""));
-    setText("rg-tokens", tokens(tok.total));
+    setTile("rg-tokens", tok.total);
     setText("rg-tokens-note", "cache " + tokens(tok.cache_read) + " · uncached " + tokens(tok.uncached) + " · output " + tokens(tok.output));
-    setText("rg-req", count(rt.requests));
-    setText("rg-r429", count(rt.r429));
-    setText("rg-started", count(rt.runs_started));
+    setTile("rg-req", rt.requests);
+    setTile("rg-r429", rt.r429);
+    setTile("rg-started", rt.runs_started);
     var fin = rt.finished || {};
-    setText("rg-finished", ["PASS", "PARTIAL", "FAIL"].map(function (v) { return count(fin[v] || 0); }).join(" / "));
+    setTileList("rg-finished", ["PASS", "PARTIAL", "FAIL"].map(function (v) { return fin[v] || 0; }));
     setText("rg-ds", tokens(rt.ds_output));
   }
 
@@ -1024,9 +1093,10 @@ td.wrap .cont { color: var(--ink-3); display: block; }
     var intFmt = function (v) { return Math.round(v).toLocaleString("en-US"); };
     charts.length = 0;
 
+    var PAIR_MARGIN = { l: 64, r: 16 };
     registerChart("c-billed", {
       title: "Total pool and DeepSeek output, percent of limit per interval",
-      kind: "line", endLabels: true, bucket_s: bucket, tickFmt: fmtX,
+      kind: "line", bucket_s: bucket, tickFmt: fmtX, margin: PAIR_MARGIN, group: "capacity",
       x0: win.start, x1: win.end, height: 260,
       points: minutes,
       series: [
@@ -1041,7 +1111,7 @@ td.wrap .cont { color: var(--ink-3); display: block; }
     setText("h-billed", "Total pool and DeepSeek output, % of limit");
     registerChart("c-workers", {
       title: "Active runs over time",
-      kind: "line", endLabels: true, bucket_s: bucket, tickFmt: fmtX,
+      kind: "line", bucket_s: bucket, tickFmt: fmtX, margin: PAIR_MARGIN, group: "capacity",
       x0: win.start, x1: win.end, height: 260,
       points: workers,
       series: [
@@ -1113,6 +1183,25 @@ td.wrap .cont { color: var(--ink-3); display: block; }
       fmt: function (v, inline) { return v.toFixed(inline ? 1 : 0) + " s"; }
     });
     setText("h-wait", "Wait p95 per " + unit);
+    var upPoints = minutes.map(function (p) {
+      var sec = function (v) { return v === null || v === undefined ? null : v / 1000; };
+      return { t: p.t, p50: sec(p.upstream_p50_ms), p95: sec(p.upstream_p95_ms) };
+    });
+    var maxU = upPoints.reduce(function (a, p) { return p.p95 === null ? a : Math.max(a, p.p95); }, 0);
+    registerChart("c-upstream", {
+      title: "Morph response time per request, seconds per " + unit,
+      kind: "line", bucket_s: bucket, tickFmt: fmtX, margin: PAIR_MARGIN, group: "capacity",
+      x0: win.start, x1: win.end, height: 200,
+      points: upPoints,
+      series: [
+        { key: "p50", name: "p50", color: COLORS.s1 },
+        { key: "p95", name: "p95", color: COLORS.s2 }
+      ],
+      y: niceTicks(Math.max(maxU, 1), 3),
+      fmt: function (v) { return (Math.abs(v) < 10 ? v.toFixed(1) : v.toFixed(0)) + " s"; }
+    });
+    var hasUpstream = upPoints.some(function (p) { return p.p50 !== null; });
+    setText("up-note", hasUpstream ? "" : "No response times recorded in this range: the proxy started recording them later.");
     setText("minute-sub", bucket === 60 ? "Newest first; one row per minute" : "Newest first; one row per " + unit + " bucket");
   }
 
@@ -1593,14 +1682,45 @@ def readonly_connection(path: Path) -> sqlite3.Connection:
     return connection
 
 
+def minutes_sql(columns: set[str]) -> str:
+    """MINUTES_SQL with the upstream latency aggregates for the columns this database has. Older
+    databases lack them, so those read as NULL and the chart shows a gap instead of failing."""
+
+    def has(*names: str) -> bool:
+        return all(name in columns for name in names)
+
+    return MINUTES_SQL.format(
+        upstream_ms_sum="SUM(COALESCE(upstream_ms_sum, 0))" if has("upstream_ms_sum") else "NULL",
+        upstream_n="SUM(COALESCE(upstream_n, 0))" if has("upstream_n") else "NULL",
+        upstream_p50_weighted=(
+            "SUM(CASE WHEN upstream_p50_ms IS NOT NULL THEN upstream_p50_ms * COALESCE(upstream_n, 0) ELSE 0 END)"
+            if has("upstream_p50_ms", "upstream_n") else "NULL"
+        ),
+        upstream_p50_weight=(
+            "SUM(CASE WHEN upstream_p50_ms IS NOT NULL THEN COALESCE(upstream_n, 0) ELSE 0 END)"
+            if has("upstream_p50_ms", "upstream_n") else "NULL"
+        ),
+        upstream_p95_ms="MAX(upstream_p95_ms)" if has("upstream_p95_ms") else "NULL",
+    )
+
+
 def read_minute_rows(agentq_db: Path, since: int, until: int) -> dict[int, dict]:
     """Summed proxy_minutes rows keyed by the epoch second of each complete minute in [since, until)."""
     connection = readonly_connection(agentq_db)
     try:
-        rows = connection.execute(MINUTES_SQL, (minute_stamp(since), minute_stamp(until))).fetchall()
+        columns = {row["name"] for row in connection.execute("PRAGMA table_info(proxy_minutes)")}
+        rows = connection.execute(minutes_sql(columns), (minute_stamp(since), minute_stamp(until))).fetchall()
     finally:
         connection.close()
     return {minute_epoch(row["minute"]): dict(row) for row in rows}
+
+
+def weighted_upstream_p50(row: dict) -> int | None:
+    """Request-weighted p50 of the proxy's upstream response time over the rows summed into ``row``; None when none recorded one."""
+    weight = int(row.get("upstream_p50_weight") or 0)
+    if not weight:
+        return None
+    return round(int(row.get("upstream_p50_weighted") or 0) / weight)
 
 
 def minute_point(t: int, row: dict | None) -> dict:
@@ -1623,6 +1743,9 @@ def minute_point(t: int, row: dict | None) -> dict:
         "req": int(row.get("req") or 0),
         "wait_p50_weighted": int(row.get("wait_p50_weighted") or 0),
         "wait_p95_ms": row.get("wait_p95_ms"),
+        "upstream_p50_ms": weighted_upstream_p50(row),
+        "upstream_p95_ms": row.get("upstream_p95_ms"),
+        "upstream_n": int(row.get("upstream_n") or 0),
         "pct_total": fraction(total, LIMITS["total"]),
         "pct_ds_output": fraction(ds_output, LIMITS["output"]),
         "pct_kimi_uncached": fraction(kimi_uncached, LIMITS["uncached"]),
@@ -1841,6 +1964,10 @@ def bucket_minutes(points: list[dict], size: int) -> list[dict]:
         for key in BUCKET_SUM_KEYS:
             bucket[key] = sum(m[key] for m in members)
         bucket["wait_p95_ms"] = max(p95s) if p95s else None
+        p50s = [m["upstream_p50_ms"] for m in members if m.get("upstream_p50_ms") is not None]
+        upstream_p95s = [m["upstream_p95_ms"] for m in members if m.get("upstream_p95_ms") is not None]
+        bucket["upstream_p50_ms"] = round(sum(p50s) / len(p50s)) if p50s else None
+        bucket["upstream_p95_ms"] = max(upstream_p95s) if upstream_p95s else None
         for key in PCT_KEYS:
             bucket[key] = round(sum(m[key] for m in members) / len(members), 4)
         buckets.append(bucket)
@@ -2089,9 +2216,21 @@ def run_kpis(runs: list[dict], day: float, caps: dict[str, int], verdicts: dict[
     }
 
 
-def perf_kpis(raw: dict[int, dict], until: int, runs: list[dict], now: float) -> dict:
-    """Proxy wait, upstream time, 429 rate and request rate. Wait p50 is request-weighted; p95 is the worst minute."""
+def in_flight_total(live: dict | None) -> int | None:
+    """Upstream requests in flight right now across models, from the proxy's status; None when the proxy did not answer."""
+    upstream = (live or {}).get("upstream")
+    in_flight = upstream.get("in_flight") if isinstance(upstream, dict) else None
+    if not isinstance(in_flight, dict):
+        return None
+    return sum(int(value) for value in in_flight.values())
+
+
+def perf_kpis(raw: dict[int, dict], until: int, runs: list[dict], now: float, live: dict | None = None) -> dict:
+    """Proxy wait, upstream time, 429 rate and request rate. Wait p50 is request-weighted; p95 is the worst minute.
+    The Morph response time uses the same weighting: p50 is request-weighted over the minutes, p95 the worst minute."""
     window = [raw[t] for t in range(until - PERF_WINDOW_MINUTES * 60, until, 60) if t in raw]
+    upstream_weight = sum(int(row.get("upstream_p50_weight") or 0) for row in window)
+    upstream_p95s = [row["upstream_p95_ms"] for row in window if row.get("upstream_p95_ms") is not None]
     req_15m = sum(row["req"] for row in window)
     p95s = [row["wait_p95_ms"] for row in window if row["wait_p95_ms"] is not None]
     upstream = [
@@ -2103,6 +2242,12 @@ def perf_kpis(raw: dict[int, dict], until: int, runs: list[dict], now: float) ->
     return {
         "wait_p50_ms": sum(row["wait_p50_weighted"] for row in window) / req_15m if req_15m else None,
         "wait_p95_ms": max(p95s) if p95s else None,
+        "upstream_response_p50_ms": (
+            round(sum(int(row.get("upstream_p50_weighted") or 0) for row in window) / upstream_weight)
+            if upstream_weight else None
+        ),
+        "upstream_response_p95_ms": max(upstream_p95s) if upstream_p95s else None,
+        "in_flight_now": in_flight_total(live),
         "upstream_median_ms": median_or_none(upstream),
         "r429_rate_60m": window_sum(raw, until, RATE_WINDOW_MINUTES, "r429") / req_60m if req_60m else None,
         "requests_per_min_5m": window_sum(raw, until, LIMIT_WINDOW_MINUTES, "req") / LIMIT_WINDOW_MINUTES,
@@ -2205,7 +2350,7 @@ def build_summary(home: Path, hours: int = DEFAULT_HOURS, *, now: float | None =
         "caps": caps,
         "runs": table_runs(runs),
         "run_kpis": kpis,
-        "perf_kpis": perf_kpis(raw, until, runs, now),
+        "perf_kpis": perf_kpis(raw, until, runs, now, live),
         "top_consumers": top_consumers(runs, day, kpis["tokens_today"]),
         "errors": errors,
     }

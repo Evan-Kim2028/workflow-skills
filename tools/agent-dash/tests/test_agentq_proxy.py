@@ -21,6 +21,7 @@ from agentq.proxy import (
     DEFAULT_CONFIG,
     EX_CONFIG,
     PROXY_MINUTES_DDL,
+    ROW_WAIT_SAMPLES,
     Client,
     Entry,
     Governor,
@@ -36,6 +37,7 @@ from agentq.proxy import (
     prepare_body,
     prepare_body_async,
     read_calib_counts,
+    read_minute_counts,
     read_request,
     seconds_to_next_minute,
     tokens_for_chars,
@@ -1101,7 +1103,8 @@ class MinuteSeedTest(unittest.TestCase):
         connection = sqlite3.connect(home / "agentq.db")
         connection.execute(PROXY_MINUTES_DDL)
         connection.execute(
-            "INSERT INTO proxy_minutes VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO proxy_minutes (minute, model, req, ok, r429, input, cache_read, output, uncached_est, "
+            "wait_p50_ms, wait_p95_ms, target) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
             (minute, MODEL_OUT, 60, 58, 2, 1000, 0, 500, 900, 0, 0, 0.9),
         )
         connection.commit()
@@ -1527,3 +1530,185 @@ class Calib429EndToEndTest(ProxyCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+OLD_MINUTES_DDL = """
+CREATE TABLE proxy_minutes (
+    minute TEXT NOT NULL, model TEXT NOT NULL,
+    req INT, ok INT, r429 INT,
+    input INT, cache_read INT, output INT, uncached_est INT,
+    wait_p50_ms INT, wait_p95_ms INT,
+    target REAL,
+    PRIMARY KEY (minute, model)
+)
+"""
+LATENCY_COLUMNS = ("upstream_ms_sum", "upstream_n", "upstream_p50_ms", "upstream_p95_ms", "ttfb_p50_ms", "in_flight_max")
+WALL_MINUTE = 1_700_000_040.0
+
+
+class UpstreamLatencyTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.home = Path(self.tmp.name) / "agentq"
+        self.home.mkdir(parents=True)
+        self.now = [1000.0]
+        self.wall = [WALL_MINUTE]
+        self.gov = self.governor()
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def governor(self) -> Governor:
+        return Governor(
+            self.home,
+            config_with(),
+            clock=lambda: self.now[0],
+            wall=lambda: self.wall[0],
+            log=quiet,
+        )
+
+    def request(self, gov: Governor, upstream_s: float, ttfb_s: float, model: str = MODEL_OUT) -> None:
+        ticket = make_ticket(gov, model=model)
+        gov.upstream_started(ticket)
+        self.now[0] += upstream_s
+        gov.finish_ok(ticket, None, upstream_s=upstream_s, ttfb_s=ttfb_s)
+        gov.upstream_finished(ticket)
+
+    def minute_tuple(self, gov: Governor, model: str = MODEL_OUT) -> tuple:
+        stamp = minute_stamp(self.wall[0])
+        rows = [row for row in gov.take_minute_rows() if row[0] == stamp and row[1] == model]
+        self.assertEqual(len(rows), 1)
+        return rows[0]
+
+    def test_latency_sums_and_percentiles_are_kept_per_minute(self) -> None:
+        for step in range(1, 11):
+            self.request(self.gov, step / 10, step / 100)
+        row = self.minute_tuple(self.gov)
+        self.assertEqual(len(row), 18)
+        upstream_sum, upstream_n, p50, p95, ttfb50, in_flight = row[12:18]
+        self.assertEqual(upstream_sum, 5500)
+        self.assertEqual(upstream_n, 10)
+        self.assertEqual(p50, 600)
+        self.assertEqual(p95, 1000)
+        self.assertEqual(ttfb50, 60)
+        self.assertEqual(in_flight, 1)
+
+    def test_a_request_that_is_not_successful_adds_no_latency(self) -> None:
+        ticket = make_ticket(self.gov)
+        self.gov.upstream_started(ticket)
+        self.now[0] += 0.5
+        self.gov.upstream_finished(ticket)
+        self.gov.release(ticket)
+        row = self.minute_tuple(self.gov)
+        self.assertEqual(row[12:14], (0, 0))
+        self.assertIsNone(row[14])
+        self.assertIsNone(row[15])
+
+    def test_samples_stop_at_the_row_cap_but_sums_keep_counting(self) -> None:
+        for _ in range(ROW_WAIT_SAMPLES + 5):
+            self.request(self.gov, 0.2, 0.1)
+        row = self.minute_tuple(self.gov)
+        self.assertEqual(row[13], ROW_WAIT_SAMPLES + 5)
+        self.assertEqual(row[12], (ROW_WAIT_SAMPLES + 5) * 200)
+        self.assertEqual(row[14], 200)
+
+    def test_in_flight_max_is_the_peak_seen_in_the_minute(self) -> None:
+        first = make_ticket(self.gov, job="a")
+        second = make_ticket(self.gov, job="b")
+        third = make_ticket(self.gov, job="c")
+        for ticket in (first, second, third):
+            self.gov.upstream_started(ticket)
+        self.gov.upstream_finished(first)
+        self.gov.upstream_started(make_ticket(self.gov, job="d"))
+        self.assertEqual(self.gov.in_flight, {MODEL_OUT: 3})
+        for ticket in (second, third):
+            self.gov.upstream_finished(ticket)
+        self.assertEqual(self.minute_tuple(self.gov)[17], 3)
+
+    def test_a_new_minute_starts_its_peak_from_the_requests_still_in_flight(self) -> None:
+        held = make_ticket(self.gov, job="held")
+        self.gov.upstream_started(held)
+        self.wall[0] += 60
+        self.request(self.gov, 0.1, 0.05)
+        self.assertEqual(self.minute_tuple(self.gov)[17], 2)
+
+    def test_seed_carries_the_sums_and_restarts_the_percentiles_empty(self) -> None:
+        self.request(self.gov, 1.0, 0.2)
+        self.request(self.gov, 2.0, 0.4)
+        rows = self.gov.take_minute_rows()
+        write_minute_rows(self.gov.db_path, rows)
+        restarted = self.governor()
+        seeded = restarted.row(MODEL_OUT)
+        self.assertEqual(seeded["upstream_ms_sum"], 3000)
+        self.assertEqual(seeded["upstream_n"], 2)
+        self.assertEqual(seeded["upstream_samples"], [])
+        self.request(restarted, 0.5, 0.1)
+        row = self.minute_tuple(restarted)
+        self.assertEqual(row[12:14], (3500, 3))
+        self.assertEqual(row[14], 500)
+
+    def test_old_schema_gains_the_latency_columns_and_keeps_its_rows(self) -> None:
+        db = self.gov.db_path
+        connection = sqlite3.connect(db)
+        connection.execute(OLD_MINUTES_DDL)
+        connection.execute(
+            "INSERT INTO proxy_minutes (minute, model, req, ok, r429, input, cache_read, output, uncached_est, "
+            "wait_p50_ms, wait_p95_ms, target) VALUES ('2026-11-01T10:00', ?, 4, 4, 0, 10, 0, 20, 0, 1, 2, 0.9)",
+            (MODEL_OUT,),
+        )
+        connection.commit()
+        connection.close()
+        self.request(self.gov, 0.3, 0.1)
+        write_minute_rows(db, self.gov.take_minute_rows())
+        write_minute_rows(db, [])
+        connection = sqlite3.connect(db)
+        present = {row[1] for row in connection.execute("PRAGMA table_info(proxy_minutes)")}
+        old = connection.execute(
+            "SELECT req, output, upstream_n FROM proxy_minutes WHERE minute = '2026-11-01T10:00'"
+        ).fetchone()
+        connection.close()
+        self.assertTrue(set(LATENCY_COLUMNS) <= present)
+        self.assertEqual(old, (4, 20, None))
+
+    def test_old_schema_seed_reads_zero_latency(self) -> None:
+        db = self.gov.db_path
+        connection = sqlite3.connect(db)
+        connection.execute(OLD_MINUTES_DDL)
+        connection.execute(
+            "INSERT INTO proxy_minutes (minute, model, req, ok, r429, input, cache_read, output, uncached_est, "
+            "wait_p50_ms, wait_p95_ms, target) VALUES (?, ?, 7, 7, 0, 0, 0, 0, 0, 0, 0, 0.9)",
+            (minute_stamp(WALL_MINUTE), MODEL_OUT),
+        )
+        connection.commit()
+        connection.close()
+        seeded = read_minute_counts(db, minute_stamp(WALL_MINUTE), MODEL_OUT)
+        self.assertEqual(seeded["req"], 7)
+        self.assertEqual(seeded["upstream_n"], 0)
+        self.assertEqual(seeded["upstream_ms_sum"], 0)
+
+    def test_status_reports_in_flight_per_model_and_the_last_minute_percentiles(self) -> None:
+        for _ in range(2):
+            self.gov.upstream_started(make_ticket(self.gov, model=MODEL_OUT))
+        self.gov.upstream_started(make_ticket(self.gov, model=MODEL_KIMI))
+        self.assertEqual(self.gov.status()["upstream"]["in_flight"], {MODEL_OUT: 2, MODEL_KIMI: 1})
+        self.gov.upstream_finished(make_ticket(self.gov, model=MODEL_KIMI))
+        self.request(self.gov, 1.0, 0.1)
+        self.request(self.gov, 3.0, 0.1)
+        upstream = self.gov.status()["upstream"]
+        self.assertEqual(upstream["in_flight"], {MODEL_OUT: 2})
+        self.assertEqual(upstream["last_60s"][MODEL_OUT], {"n": 2, "p50_ms": 3000, "p95_ms": 3000})
+        self.now[0] += 61
+        self.assertEqual(self.gov.status()["upstream"]["last_60s"], {})
+
+
+class ProxyLatencyTest(ProxyCase):
+    async def test_a_successful_request_is_timed_and_reported_in_status(self) -> None:
+        status, _ = await self.post({"model": MODEL_OUT, "messages": []}, job="job1")
+        self.assertEqual(status, 200)
+        status, text = await asyncio.to_thread(get_json, self.port, "/agentq/status")
+        upstream = json.loads(text)["upstream"]
+        self.assertEqual(upstream["in_flight"], {})
+        self.assertEqual(upstream["last_60s"][MODEL_OUT]["n"], 1)
+        row = self.gov.row(MODEL_OUT)
+        self.assertEqual(row["upstream_n"], 1)
+        self.assertGreaterEqual(row["in_flight_max"], 1)
