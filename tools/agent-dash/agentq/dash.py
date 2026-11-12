@@ -44,6 +44,8 @@ LIMIT_KEYS = {"total": "total", "output": "ds_output", "uncached": "kimi_uncache
 DEFAULT_CAPS = {"deepseek": 64, "kimi": 2}
 TIER_CAP_KEYS = {"pi-deepseek-flash": "deepseek", "pi-kimi": "kimi"}
 LIMIT_LABELS = {"total": "Total pool", "output": "DeepSeek output", "uncached": "Kimi uncached"}
+UNTAGGED_JOBS = frozenset({"", "none"})
+UNTAGGED_LABEL = "untagged (pre-tagging workers)"
 ACTIVE_WINDOW_S = 120
 PERF_WINDOW_MINUTES = 15
 RUN_LOOKBACK_S = 7 * 24 * 3600
@@ -222,15 +224,16 @@ h3.group { font-size: 12px; font-weight: 600; color: var(--ink-2); text-transfor
 .tip .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
 .grid2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 14px; }
 .grid2 .card { margin-bottom: 0; }
-table { width: 100%; border-collapse: collapse; font-size: 12px; font-variant-numeric: tabular-nums; }
+table { width: 100%; table-layout: auto; border-collapse: collapse; font-size: 12px; font-variant-numeric: tabular-nums; }
 th, td { text-align: left; padding: 5px 8px; border-bottom: 1px solid var(--grid); white-space: nowrap; }
 th { color: var(--ink-2); font-weight: 600; }
 th.sortable { cursor: pointer; user-select: none; }
 th.sortable:hover { color: var(--ink); }
 th.sorted::after { content: attr(data-dir); margin-left: 4px; color: var(--ink-3); }
 td { color: var(--ink); }
-td.num, th.num { text-align: right; }
-td.wrap { white-space: normal; max-width: 260px; overflow-wrap: anywhere; }
+td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+td.ellipsis { white-space: nowrap; max-width: 28ch; overflow: hidden; text-overflow: ellipsis; }
+.ellipsis-inner { display: block; max-width: 28ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .table-wrap { overflow-x: auto; }
 .note-line { color: var(--ink-3); font-size: 12px; margin-top: 4px; }
 </style>
@@ -252,6 +255,7 @@ td.wrap { white-space: normal; max-width: 260px; overflow-wrap: anywhere; }
   <h3 class="group">Capacity</h3>
   <section class="tiles" aria-label="Capacity">
     <div class="tile headline"><div class="label">Capacity used, 5 min</div><div class="value" id="k-used">—</div><div class="note" id="k-binding">—</div></div>
+    <div class="tile"><div class="label">DeepSeek output, 5 min avg</div><div class="value sm" id="k-dso">—</div><div class="note" id="k-dso-note">—</div></div>
     <div class="tile"><div class="label">Total pool, last minute</div><div class="value sm" id="lim-total-now">—</div><div class="note" id="lim-total-note">—</div></div>
     <div class="tile"><div class="label">DeepSeek output, last minute</div><div class="value sm" id="lim-output-now">—</div><div class="note" id="lim-output-note">—</div></div>
     <div class="tile"><div class="label">Kimi uncached, last minute</div><div class="value sm" id="lim-uncached-now">—</div><div class="note" id="lim-uncached-note">—</div></div>
@@ -280,10 +284,11 @@ td.wrap { white-space: normal; max-width: 260px; overflow-wrap: anywhere; }
 
   <section class="card" aria-labelledby="h-billed">
     <div class="card-head">
-      <h2 id="h-billed">Billed use, % of each Morph limit, per minute</h2>
+      <h2 id="h-billed">Total pool and DeepSeek output, % of limit</h2>
       <div class="legend" id="lg-billed"></div>
     </div>
     <div class="chart" id="c-billed"></div>
+    <div class="note-line">Above the top edge a caret marks a clipped minute; hover shows the true value. Kimi uncached is charted beside the 429s.</div>
   </section>
 
   <section class="card" aria-labelledby="h-workers">
@@ -303,6 +308,13 @@ td.wrap { white-space: normal; max-width: 260px; overflow-wrap: anywhere; }
   </section>
 
   <section class="grid2">
+    <div class="card" aria-labelledby="h-kimi">
+      <div class="card-head">
+        <h2 id="h-kimi">Kimi uncached, % of limit</h2>
+        <div class="legend"><span class="key"><span class="swatch" style="border-color: var(--s3)"></span>Kimi uncached</span></div>
+      </div>
+      <div class="chart" id="c-kimi"></div>
+    </div>
     <div class="card" aria-labelledby="h-429">
       <div class="card-head">
         <h2 id="h-429">Upstream 429s per minute</h2>
@@ -445,6 +457,25 @@ td.wrap { white-space: normal; max-width: 260px; overflow-wrap: anywhere; }
     for (var i = 0; i <= steps; i++) ticks.push(+(unit * i).toFixed(6));
     return { min: 0, max: max, ticks: ticks };
   }
+  function percentile(values, q) {
+    if (!values.length) return 0;
+    var sorted = values.slice().sort(function (a, b) { return a - b; });
+    return sorted[Math.floor(q * (sorted.length - 1))];
+  }
+  function valuesOf(points, keys) {
+    var out = [];
+    points.forEach(function (p) {
+      keys.forEach(function (k) {
+        if (typeof p[k] === "number") out.push(p[k]);
+      });
+    });
+    return out;
+  }
+  function clippedAxis(values, fmt) {
+    var top = Math.max(1.5, 1.1 * percentile(values, 0.95));
+    var ticks = niceTicks(top, 3).ticks.filter(function (v) { return v <= top; });
+    return { min: 0, max: top, clip: top, ticks: ticks, fmt: fmt };
+  }
   function legendFor(el, series) {
     el.innerHTML = "";
     series.forEach(function (s) {
@@ -477,6 +508,7 @@ td.wrap { white-space: normal; max-width: 260px; overflow-wrap: anywhere; }
     var x0 = cfg.x0, x1 = cfg.x1;
     function X(t) { return m.l + ((t - x0) / Math.max(1, x1 - x0)) * iw; }
     function Y(v) { return m.t + ih - ((v - cfg.y.min) / (cfg.y.max - cfg.y.min || 1)) * ih; }
+    function Yc(v) { return Y(cfg.y.clip !== undefined && v > cfg.y.clip ? cfg.y.clip : v); }
     var svg = svgEl("svg", { width: W, height: H, viewBox: "0 0 " + W + " " + H, role: "img", "aria-label": cfg.title }, host);
 
     cfg.y.ticks.forEach(function (v) {
@@ -485,9 +517,10 @@ td.wrap { white-space: normal; max-width: 260px; overflow-wrap: anywhere; }
       var label = svgEl("text", { x: m.l - 8, y: Y(v) + 4, "text-anchor": "end", class: "tick" }, svg);
       label.textContent = cfg.y.fmt(v);
     });
-    for (var i = 0; i <= 4; i++) {
-      var t = x0 + ((x1 - x0) * i) / 4;
-      var anchor = i === 0 ? "start" : i === 4 ? "end" : "middle";
+    var xSteps = W < 480 ? 1 : 4;
+    for (var i = 0; i <= xSteps; i++) {
+      var t = x0 + ((x1 - x0) * i) / xSteps;
+      var anchor = i === 0 ? "start" : i === xSteps ? "end" : "middle";
       var xl = svgEl("text", { x: X(t), y: H - 6, "text-anchor": anchor, class: "tick" }, svg);
       xl.textContent = hm(t);
     }
@@ -535,17 +568,25 @@ td.wrap { white-space: normal; max-width: 260px; overflow-wrap: anywhere; }
         points.forEach(function (p) {
           var v = p[s.key];
           if (v === null || v === undefined) { lastPoint = null; return; }
-          d += (lastPoint ? " L" : " M") + X(p.t).toFixed(1) + "," + Y(v).toFixed(1);
+          d += (lastPoint ? " L" : " M") + X(p.t).toFixed(1) + "," + Yc(v).toFixed(1);
           lastPoint = p;
         });
         if (d) svgEl("path", { d: d.trim(), fill: "none", stroke: s.color, "stroke-width": 2, "stroke-linejoin": "round", "stroke-linecap": "round" }, svg);
+        if (cfg.y.clip !== undefined) {
+          points.forEach(function (p) {
+            if (p[s.key] > cfg.y.clip) {
+              var cx = X(p.t);
+              svgEl("path", { d: "M" + (cx - 4) + "," + (m.t + 6) + " L" + cx + "," + m.t + " L" + (cx + 4) + "," + (m.t + 6) + " Z", fill: s.color }, svg);
+            }
+          });
+        }
       });
       var ends = [];
       cfg.series.forEach(function (s) {
         for (var j = points.length - 1; j >= 0; j--) {
           var v = points[j][s.key];
           if (v !== null && v !== undefined) {
-            ends.push({ s: s, y: Y(v), x: X(points[j].t), v: v });
+            ends.push({ s: s, y: Yc(v), x: X(points[j].t), v: v });
             return;
           }
         }
@@ -631,6 +672,9 @@ td.wrap { white-space: normal; max-width: 260px; overflow-wrap: anywhere; }
     var limits = d.limits || {};
     setText("k-used", pct(cap.used_frac));
     setText("k-binding", cap.binding_label ? "binding limit: " + cap.binding_label : "no traffic in 5 min");
+    var dso = d.ds_output_5m_per_min;
+    setText("k-dso", dso === null || dso === undefined ? "—" : tokens(dso) + "/min");
+    setText("k-dso-note", "tokens per minute · limit " + tokens((limits.output || {}).limit) + "/min");
     [["total", "lim-total"], ["output", "lim-output"], ["uncached", "lim-uncached"]].forEach(function (row) {
       var lim = limits[row[0]] || {};
       setText(row[1] + "-now", pct(lim.last_min_frac));
@@ -673,24 +717,20 @@ td.wrap { white-space: normal; max-width: 260px; overflow-wrap: anywhere; }
     var minutes = d.minutes || [];
     var runsOverTime = (d.workers || []).map(function (w) { return { t: w.ts, ds: w.ds_workers, kimi: w.kimi_workers, queued: w.queued_jobs }; });
     var caps = d.caps || { deepseek: 64, kimi: 2 };
-    var maxPct = minutes.reduce(function (a, p) {
-      return Math.max(a, p.pct_total, p.pct_ds_output, p.pct_kimi_uncached);
-    }, 0);
     var maxWorkers = runsOverTime.reduce(function (a, w) {
       return Math.max(a, w.ds || 0, w.kimi || 0);
     }, 0);
     var pctFmt = function (v, inline) { return inline ? (v * 100).toFixed(1) + "%" : Math.round(v * 100) + "%"; };
     charts.length = 0;
     registerChart("c-billed", {
-      title: "Billed use, percent of each Morph limit per minute",
+      title: "Total pool and DeepSeek output, percent of limit per minute",
       kind: "line", x0: win.start, x1: win.end, height: 260,
       points: minutes,
       series: [
         { key: "pct_total", name: "Total pool", color: COLORS.s1 },
-        { key: "pct_ds_output", name: "DeepSeek output", color: COLORS.s2 },
-        { key: "pct_kimi_uncached", name: "Kimi uncached", color: COLORS.s3 }
+        { key: "pct_ds_output", name: "DeepSeek output", color: COLORS.s2 }
       ],
-      y: niceTicks(Math.max(1.5, maxPct), 3),
+      y: clippedAxis(valuesOf(minutes, ["pct_total", "pct_ds_output"]), pctFmt),
       refs: [{ v: 1, label: "100% of limit" }],
       fmt: pctFmt
     });
@@ -726,8 +766,7 @@ td.wrap { white-space: normal; max-width: 260px; overflow-wrap: anywhere; }
     });
     legendFor($("lg-billed"), [
       { name: "Total pool", color: COLORS.s1 },
-      { name: "DeepSeek output", color: COLORS.s2 },
-      { name: "Kimi uncached", color: COLORS.s3 }
+      { name: "DeepSeek output", color: COLORS.s2 }
     ]);
     legendFor($("lg-workers"), [
       { name: "DeepSeek runs", color: COLORS.s1 },
@@ -739,6 +778,15 @@ td.wrap { white-space: normal; max-width: 260px; overflow-wrap: anywhere; }
       { name: "Uncached input", color: COLORS.s1 },
       { name: "Output", color: COLORS.s2 }
     ]);
+    registerChart("c-kimi", {
+      title: "Kimi uncached, percent of limit per minute",
+      kind: "line", x0: win.start, x1: win.end, height: 200,
+      points: minutes,
+      series: [{ key: "pct_kimi_uncached", name: "Kimi uncached", color: COLORS.s3 }],
+      y: clippedAxis(valuesOf(minutes, ["pct_kimi_uncached"]), pctFmt),
+      refs: [{ v: 1, label: "100% of limit" }],
+      fmt: pctFmt
+    });
     var maxR = minutes.reduce(function (a, p) { return Math.max(a, p.r429); }, 0);
     registerChart("c-429", {
       title: "Upstream 429s per minute",
@@ -763,7 +811,7 @@ td.wrap { white-space: normal; max-width: 260px; overflow-wrap: anywhere; }
   }
 
   var RUN_COLUMNS = [
-    { key: "run", label: "Run", text: true, value: function (r) { return r.run; }, cell: function (r) { return r.run; }, wrap: true },
+    { key: "run", label: "Run", text: true, value: function (r) { return r.run; }, cell: function (r) { return r.run; }, ellipsis: true },
     { key: "tier", label: "Tier / model", text: true, value: function (r) { return (r.tier || "") + " " + r.models; }, cell: function (r) { return (r.tier ? r.tier + " · " : "") + r.models; } },
     { key: "status", label: "Status", text: true, value: function (r) { return r.status; }, cell: function (r) { return r.status; } },
     { key: "started", label: "Started", value: function (r) { return r.started; }, cell: function (r) { return fullTime(r.started); } },
@@ -780,18 +828,19 @@ td.wrap { white-space: normal; max-width: 260px; overflow-wrap: anywhere; }
 
   function sortedRuns(runs) {
     var list = runs.slice();
-    if (!state.sort) return list;
-    var col = RUN_COLUMNS.find(function (c) { return c.key === state.sort.key; });
-    if (!col) return list;
-    var dir = state.sort.dir;
-    list.sort(function (a, b) {
-      var va = col.value(a), vb = col.value(b);
-      var na = va === null || va === undefined, nb = vb === null || vb === undefined;
-      if (na || nb) return na === nb ? 0 : na ? 1 : -1;
-      if (typeof va === "string" || typeof vb === "string") return String(va).localeCompare(String(vb)) * dir;
-      return (va - vb) * dir;
-    });
-    return list;
+    var col = state.sort ? RUN_COLUMNS.find(function (c) { return c.key === state.sort.key; }) : null;
+    if (col) {
+      var dir = state.sort.dir;
+      list.sort(function (a, b) {
+        var va = col.value(a), vb = col.value(b);
+        var na = va === null || va === undefined, nb = vb === null || vb === undefined;
+        if (na || nb) return na === nb ? 0 : na ? 1 : -1;
+        if (typeof va === "string" || typeof vb === "string") return String(va).localeCompare(String(vb)) * dir;
+        return (va - vb) * dir;
+      });
+    }
+    return list.filter(function (r) { return !r.untagged; })
+      .concat(list.filter(function (r) { return r.untagged; }));
   }
 
   function renderRunsTable(d) {
@@ -829,9 +878,16 @@ td.wrap { white-space: normal; max-width: 260px; overflow-wrap: anywhere; }
       var tr = document.createElement("tr");
       RUN_COLUMNS.forEach(function (col) {
         var td = document.createElement("td");
-        if (col.num) td.className = "num";
-        if (col.wrap) td.className += " wrap";
-        td.textContent = col.cell(r);
+        td.className = [col.num ? "num" : "", col.ellipsis ? "ellipsis" : ""].join(" ").trim();
+        if (col.ellipsis) {
+          td.title = r.run;
+          var inner = document.createElement("span");
+          inner.className = "ellipsis-inner";
+          inner.textContent = col.cell(r);
+          td.appendChild(inner);
+        } else {
+          td.textContent = col.cell(r);
+        }
         tr.appendChild(td);
       });
       body.appendChild(tr);
@@ -1125,16 +1181,21 @@ def minute_point(t: int, row: dict | None) -> dict:
 
 
 def minute_series(raw: dict[int, dict], since: int, until: int) -> list[dict]:
-    """Complete minutes from the first recorded one to the last complete one.
+    """Complete minutes from the first recorded one through the last complete minute that has a row.
 
-    The proxy writes a row only for minutes with traffic, so a minute with no
-    row is a minute with zero billed use. The first recorded minute bounds the
-    series so the window before the proxy started stays empty.
+    The proxy writes a row only for minutes with traffic, so a minute between
+    rows with no row is a minute with zero billed use. Trailing minutes with no
+    row are left out: they may simply not be flushed yet, so they are not zero.
+    The first recorded minute bounds the series so the window before the proxy
+    started stays empty.
     """
     if not raw:
         return []
     first = max(min(raw), since)
-    return [minute_point(t, raw.get(t)) for t in range(first, until, 60)]
+    stamped = [t for t in range(first, until, 60) if t in raw]
+    if not stamped:
+        return []
+    return [minute_point(t, raw.get(t)) for t in range(first, stamped[-1] + 60, 60)]
 
 
 def average_fraction(raw: dict[int, dict], until: int, key: str, limit: int) -> float:
@@ -1211,14 +1272,33 @@ def read_samples(dash_db: Path, since: float) -> list[dict]:
         connection.close()
 
 
-def last_minute_fraction(raw: dict[int, dict], until: int, key: str, limit: int) -> float:
-    """Billed fraction of a limit in the last complete minute."""
-    return fraction(int((raw.get(until - 60) or {}).get(key) or 0), limit)
+def last_complete_minute(raw: dict[int, dict], until: int) -> int | None:
+    """The minute the "last minute" tiles read: the minute before ``until`` when it has a row, else the one before that.
+
+    The proxy flushes a minute's row shortly after the minute ends, so the newest complete minute may not have one yet.
+    """
+    for stamp in (until - 60, until - 120):
+        if stamp in raw:
+            return stamp
+    return None
+
+
+def last_minute_fraction(raw: dict[int, dict], until: int, key: str, limit: int) -> float | None:
+    """Billed fraction of a limit in the last complete minute that has a row; None when neither recent minute has one."""
+    stamp = last_complete_minute(raw, until)
+    if stamp is None:
+        return None
+    return fraction(int(raw[stamp].get(key) or 0), limit)
 
 
 def window_sum(raw: dict[int, dict], until: int, minutes: int, key: str) -> int:
     """Sum of one minute-row field over the last ``minutes`` complete minutes."""
     return sum(int((raw.get(t) or {}).get(key) or 0) for t in range(until - minutes * 60, until, 60))
+
+
+def deepseek_output_rate(raw: dict[int, dict], until: int) -> float:
+    """Average DeepSeek output tokens per minute over the last LIMIT_WINDOW_MINUTES complete minutes."""
+    return window_sum(raw, until, LIMIT_WINDOW_MINUTES, "ds_output") / LIMIT_WINDOW_MINUTES
 
 
 def day_start(now: float) -> float:
@@ -1287,9 +1367,11 @@ def shape_run(row: dict, now: float) -> dict:
     requests, ok = row["req"], row["ok"]
     input_tokens, cache_read, output = row["input"], row["cache_read"], row["output"]
     fresh = input_tokens + cache_read
+    untagged = row["job"] in UNTAGGED_JOBS
     return {
         "job": row["job"],
-        "run": row["label"] or row["job"],
+        "run": UNTAGGED_LABEL if untagged else (row["label"] or row["job"]),
+        "untagged": untagged,
         "tier": row["tier"],
         "models": row["models"] or "",
         "queue": queue,
@@ -1435,12 +1517,13 @@ def build_summary(home: Path, hours: int = DEFAULT_HOURS, *, now: float | None =
         "limits": limits,
         "capacity": capacity_headline(limits, live),
         "r429_60m": recent_429s(raw, until),
+        "ds_output_5m_per_min": deepseek_output_rate(raw, until),
         "minutes": minutes,
         "token_mix": token_mix(minutes),
         "jobs": jobs,
         "workers": samples,
         "caps": caps,
-        "runs": runs[:RUN_ROWS],
+        "runs": table_runs(runs),
         "run_kpis": kpis,
         "perf_kpis": perf_kpis(raw, until, runs, now),
         "top_consumers": top_consumers(runs, day, kpis["tokens_today"]),
@@ -1449,8 +1532,14 @@ def build_summary(home: Path, hours: int = DEFAULT_HOURS, *, now: float | None =
 
 
 def shape_runs(rows: list[dict], now: float) -> list[dict]:
-    """Every run in the lookback, most recent activity first."""
-    return [shape_run(row, now) for row in rows]
+    """Every run in the lookback, most recent activity first, with the untagged aggregate last."""
+    return sorted((shape_run(row, now) for row in rows), key=lambda run: run["untagged"])
+
+
+def table_runs(runs: list[dict]) -> list[dict]:
+    """The rows the runs table shows: the newest RUN_ROWS tagged runs, then the untagged row, which is never cut."""
+    tagged = [run for run in runs if not run["untagged"]]
+    return tagged[:RUN_ROWS] + [run for run in runs if run["untagged"]]
 
 
 def write_sample(dash_db: Path, row: dict) -> None:
