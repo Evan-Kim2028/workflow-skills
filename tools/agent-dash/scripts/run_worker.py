@@ -85,6 +85,8 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from dash.caps import as_int, base_model, cap_block  # noqa: E402
+
 RUN_RULE = (
     "RUN RULE: this is one non-interactive turn. Keep calling tools until the task is complete, "
     "then end with the full final report as your last message (it is captured from stdout). "
@@ -557,7 +559,7 @@ def pick_initial(ctx):
         return None, "unknown-tier"
     if not worker.get("enabled", True):
         return None, "disabled"
-    block = cap_block(ctx, worker)
+    block = cap_block(ctx["registry"], worker, ctx["hooks"]["pgrep"])
     if block is not None:
         which, live, limit = block
         print(
@@ -757,95 +759,11 @@ def eligible(ctx, skip):
                 file=sys.stderr,
             )
             continue
-        if _int_or_none(worker.get("cap")) is None:
+        if as_int(worker.get("cap")) is None:
             continue
-        if cap_block(ctx, worker) is not None:
+        if cap_block(ctx["registry"], worker, ctx["hooks"]["pgrep"]) is not None:
             continue
         return launch_name
-    return None
-
-
-THINKING_SUFFIX = re.compile(r":[A-Za-z]+$")
-
-
-def base_model(model) -> str:
-    """A model id without a trailing ``:<level>`` thinking suffix.
-
-    ``morph/morph-dsv41flash-1017:low`` runs the same model as
-    ``morph/morph-dsv41flash-1017``; the level only sets its thinking budget.
-    """
-    return THINKING_SUFFIX.sub("", str(model or ""))
-
-
-def _int_or_none(value):
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return None
-
-
-def model_caps(registry) -> dict:
-    """``registry["model_caps"]`` keyed by base model id; malformed entries are dropped."""
-    caps = registry.get("model_caps")
-    if not isinstance(caps, dict):
-        return {}
-    found = {}
-    for key, value in caps.items():
-        cap = _int_or_none(value)
-        if cap is not None:
-            found[base_model(key)] = cap
-    return found
-
-
-def pool_capacity(ctx, model):
-    """``(live, limit)`` for the pool of one base model shared by one or more tiers.
-
-    ``live`` counts every live worker of the model across all tiers that run
-    it, through one pgrep over the union of their patterns, so a process two
-    patterns both match counts once. ``limit`` is the model's ``model_caps``
-    entry when it has one. Without an entry it is the largest ``cap`` among
-    the enabled tiers for the model, so the tiers cannot sum past the bigger
-    cap and a smaller tier's cap never throttles the bigger one. None when
-    nothing caps the pool.
-    """
-    registry = ctx["registry"]
-    patterns = []
-    caps = []
-    for worker in (registry.get("workers") or {}).values():
-        if not isinstance(worker, dict) or base_model(worker.get("model")) != model:
-            continue
-        pattern = worker.get("pgrep") or ""
-        if pattern and pattern not in patterns:
-            patterns.append(pattern)
-        cap = _int_or_none(worker.get("cap"))
-        if worker.get("enabled", True) and cap is not None:
-            caps.append(cap)
-    pinned = model_caps(registry)
-    limit = pinned[model] if model in pinned else (max(caps) if caps else None)
-    if not patterns:
-        return 0, limit
-    union = patterns[0] if len(patterns) == 1 else "|".join(f"({p})" for p in patterns)
-    return ctx["hooks"]["pgrep"](union), limit
-
-
-def cap_block(ctx, worker):
-    """Why a launch of ``worker`` is refused by a cap, or None when it may launch.
-
-    The pool check comes first: the model's live workers across every sharing
-    tier must stay below ``pool_capacity``'s limit. Then the tier check: this
-    tier's own pattern count must stay below its own ``cap``. Returns
-    ``(which, live, limit)`` with ``which`` of ``"pool"`` or ``"tier"``.
-    """
-    live, limit = pool_capacity(ctx, base_model(worker.get("model")))
-    if limit is not None and live >= limit:
-        return "pool", live, limit
-    cap = _int_or_none(worker.get("cap"))
-    if cap is None:
-        return None
-    pattern = worker.get("pgrep") or ""
-    own = ctx["hooks"]["pgrep"](pattern) if pattern else 0
-    if own >= cap:
-        return "tier", own, cap
     return None
 
 
