@@ -19,8 +19,9 @@ prompt tokens are body characters / 4, output is the mean of the model's recent
 completions capped at `max_tokens`, and the Kimi uncached estimate counts only
 the text beyond the longest prefix any recent request shared with it (Morph's
 prompt cache is shared, so the match is across jobs). Requests with no job id or
-the literal `none` are anonymous: they share the store under a digest of their
-first blocks, and only Kimi requests touch it. Real usage from
+the literal `none` are anonymous: a request that extends a stored conversation
+replaces that entry, and any other request adds one, so each session keeps one
+entry. Only Kimi requests touch the store. Real usage from
 the response replaces the estimate.
 
 ## Admission and lanes
@@ -35,8 +36,10 @@ the response replaces the estimate.
   Blocking is per budget: a ticket that does not fit closes its budget for the
   rest of the pass, and later tickets on that budget wait in order, while tickets
   on other budgets still run. Backlog runs only on budgets that no waiting urgent
-  or normal ticket is blocked on. A normal ticket
-  queued longer than `aging_s` (15 min) moves to urgent.
+  or normal ticket is blocked on. A block caused only by the urgent 50 % guard
+  closes that budget for the rest of the urgent lane; normal and backlog work
+  still use it. A normal ticket queued longer than `aging_s` (15 min) moves to
+  urgent.
 
 ## Learning the edge
 

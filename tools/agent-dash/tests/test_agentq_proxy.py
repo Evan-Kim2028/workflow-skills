@@ -525,8 +525,8 @@ class PerBudgetQueueTest(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         self.gov = Governor(Path(tmp.name), config_with(), log=quiet)
 
-    def occupy(self, budget: str, amount: int) -> None:
-        self.gov.budgets[budget].entries.append(Entry(at=self.gov.clock(), amount=amount, lane="normal"))
+    def occupy(self, budget: str, amount: int, lane: str = "normal") -> None:
+        self.gov.budgets[budget].entries.append(Entry(at=self.gov.clock(), amount=amount, lane=lane))
 
     def queue(self, *tickets) -> None:
         for ticket in tickets:
@@ -542,6 +542,18 @@ class PerBudgetQueueTest(unittest.TestCase):
         self.assertFalse(kimi.holds)
         self.assertEqual(list(self.gov.queues["normal"]), [kimi])
         self.assertTrue(self.gov.budgets["uncached"].saturated)
+
+    def test_urgent_guard_block_does_not_hold_normal_on_the_same_budget(self) -> None:
+        self.gov.budgets["output"].limit = 1000
+        self.gov.budgets["output"].target = 1.0
+        self.occupy("output", 500, lane="urgent")
+        urgent = make_ticket(self.gov, job="urgent-next", model=MODEL_OUT, text="x", max_tokens=100, lane="urgent")
+        normal = make_ticket(self.gov, job="normal-x", model=MODEL_OUT, text="x", max_tokens=100)
+        self.queue(urgent, normal)
+        self.gov.pump()
+        self.assertFalse(urgent.holds)
+        self.assertTrue(normal.holds)
+        self.assertEqual(list(self.gov.queues["urgent"]), [urgent])
 
     def test_second_kimi_waits_behind_blocked_kimi_even_if_it_fits(self) -> None:
         self.occupy("uncached", 23_000)
@@ -709,15 +721,18 @@ class EstimateTest(unittest.TestCase):
         identical = make_ticket(self.gov, job="job-other", model=MODEL_KIMI, text="A" * 4096 + "B" * 400)
         self.assertEqual(identical.estimates["uncached"], 0)
 
-    def test_anonymous_session_shares_prefix_and_keeps_one_entry(self) -> None:
-        shared = "S" * (BLOCK_CHARS * 10)
-        first = make_ticket(self.gov, job="none", model=MODEL_KIMI, text=shared + "one" * 100)
-        self.assertEqual(first.estimates["uncached"], tokens_for_chars(len(shared) + 300))
-        second = make_ticket(self.gov, job="none", model=MODEL_KIMI, text=shared + "two" * 100)
-        self.assertEqual(second.estimates["uncached"], tokens_for_chars(300))
-        self.assertEqual(sum(key.startswith("anon:") for key in self.gov.prefixes), 1)
-        unrelated = make_ticket(self.gov, job="none", model=MODEL_KIMI, text="Z" * 2000)
-        self.assertEqual(unrelated.estimates["uncached"], tokens_for_chars(2000))
+    def test_interleaved_anonymous_sessions_extend_their_own_entries(self) -> None:
+        system = "S" * (BLOCK_CHARS * 20)
+        estimates = []
+        for turn in (1, 2, 3):
+            for session in ("A", "B"):
+                text = system + session * (1000 * turn)
+                ticket = make_ticket(self.gov, job="none", model=MODEL_KIMI, text=text)
+                estimates.append((session, turn, ticket.estimates["uncached"]))
+        suffix = tokens_for_chars(1000)
+        self.assertEqual(estimates[0], ("A", 1, tokens_for_chars(len(system) + 1000)))
+        for session, turn, estimate in estimates[1:]:
+            self.assertEqual(estimate, suffix, (session, turn))
         self.assertEqual(sum(key.startswith("anon:") for key in self.gov.prefixes), 2)
 
     def test_deepseek_traffic_leaves_prefix_store_empty(self) -> None:

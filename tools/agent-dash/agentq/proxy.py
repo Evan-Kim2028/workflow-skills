@@ -228,11 +228,19 @@ def body_snippet(raw: bytes, limit: int = 300) -> str:
     return text.translate(str.maketrans({"\n": " ", "\r": " ", '"': " ", "'": " "}))
 
 
-def _prefix_key(job: str, blocks: tuple[bytes, ...]) -> str:
-    """The prefix store key: the job id, or a digest of the first blocks for anonymous requests."""
-    if not is_anonymous(job):
-        return job
-    return "anon:" + hashlib.sha1(b"".join(blocks[:8])).hexdigest()
+def anonymous_key(blocks: tuple[bytes, ...]) -> str:
+    """The prefix store key for an anonymous request: a digest of all its blocks."""
+    return "anon:" + hashlib.sha1(b"".join(blocks)).hexdigest()
+
+
+def _common_blocks(previous: tuple[bytes, ...], blocks: tuple[bytes, ...]) -> int:
+    """How many leading whole blocks two prompts share."""
+    common = 0
+    for old, new in zip(previous, blocks):
+        if old != new:
+            break
+        common += 1
+    return common
 
 
 def percentile(sorted_values: list[float], fraction: float) -> float:
@@ -499,27 +507,36 @@ class Governor:
         return max(estimate, 1)
 
     def uncached_estimate(self, job: str, length: int, blocks: tuple[bytes, ...]) -> int:
-        """Tokens beyond the longest prefix any recent request shared with this one.
+        """Tokens beyond the longest prefix any stored entry shares with this request.
 
-        Morph's prompt cache is shared across requests, so the shared prefix is taken against every
-        stored entry, not only this job's. Blocks are compared whole, so the shared prefix can be
-        short by up to one block (BLOCK_CHARS, about 256 tokens). Anonymous requests are keyed by
-        their first blocks, so one session keeps one entry. An empty store counts the whole prompt.
+        Morph's prompt cache is shared across requests, so every stored entry is a candidate, not
+        only this job's. Blocks are compared whole, so a partial most-recent block is not matched
+        and the shared prefix can be short by up to one block (BLOCK_CHARS, about 256 tokens).
+
+        An entry that this request extends (the same full blocks, and a longer prompt) is the same
+        conversation grown, so it is replaced when the request is anonymous and its shared length is
+        taken as the whole stored length, which can overcount by one block. Among candidates, an
+        extension beats a plain shared prefix, and ties go to the least recently stored entry.
+        Named jobs are keyed by job id. Anonymous requests are keyed by a digest of all their blocks
+        and so do not collide across sessions. An empty store counts the whole prompt.
         """
-        shared = 0
-        for previous_length, previous_blocks in self.prefixes.values():
-            common = 0
-            for old, new in zip(previous_blocks, blocks):
-                if old != new:
-                    break
-                common += 1
-            shared = max(shared, min(common * BLOCK_CHARS, previous_length, length))
-        key = _prefix_key(job, blocks)
+        best_key: str | None = None
+        best = (False, 0)
+        for key, (previous_length, previous_blocks) in self.prefixes.items():
+            common = _common_blocks(previous_blocks, blocks)
+            extends = length > previous_length and common >= previous_length // BLOCK_CHARS
+            shared = previous_length if extends else min(common * BLOCK_CHARS, previous_length, length)
+            if (extends, shared) > best:
+                best_key, best = key, (extends, shared)
+        anonymous = is_anonymous(job)
+        if anonymous and best[0] and best_key is not None:
+            del self.prefixes[best_key]
+        key = anonymous_key(blocks) if anonymous else job
         self.prefixes[key] = (length, blocks)
         self.prefixes.move_to_end(key)
         while len(self.prefixes) > PREFIX_STORE_JOBS:
             self.prefixes.popitem(last=False)
-        return tokens_for_chars(length - shared)
+        return tokens_for_chars(length - best[1])
 
     def make_ticket(
         self,
@@ -586,6 +603,9 @@ class Governor:
         holds on each budget without stalling tickets that use other budgets. A ticket backing off
         after a 429 blocks nothing, and while it waits its budgets stay closed to backlog.
         Backlog runs only on budgets that no waiting urgent or normal ticket is blocked on.
+
+        A block caused only by the urgent share guard closes its budget for the rest of the urgent
+        lane. Normal and backlog tickets still use that budget, which is what the guard intends.
         """
         now = self.clock()
         self.promote_aged(now)
@@ -593,6 +613,7 @@ class Governor:
             budget.saturated = False
         lower_waiting = bool(self.queues["normal"] or self.queues["backlog"])
         blocked: set[str] = set()
+        urgent_guarded: set[str] = set()
         for lane in LANES:
             if lane == "backlog":
                 for waiting in (*self.queues["urgent"], *self.queues["normal"]):
@@ -602,34 +623,38 @@ class Governor:
             index = 0
             while index < len(queue):
                 head = queue[index]
-                if head.not_before > now or not blocked.isdisjoint(head.estimates):
+                closed = blocked | urgent_guarded if lane == "urgent" else blocked
+                if head.not_before > now or not closed.isdisjoint(head.estimates):
                     index += 1
                     continue
-                blocker = self._blocker(head, now, lower_waiting)
-                if blocker is None:
+                found = self._blocker(head, now, lower_waiting)
+                if found is None:
                     del queue[index]
                     self._admit(head, now)
                     continue
+                blocker, guard_only = found
                 blocker.saturated = True
-                blocked.add(blocker.name)
+                (urgent_guarded if guard_only else blocked).add(blocker.name)
                 index += 1
 
-    def _blocker(self, ticket: Ticket, now: float, lower_waiting: bool) -> Budget | None:
-        """Return the first budget that cannot take this ticket now, or None when it fits everywhere.
+    def _blocker(self, ticket: Ticket, now: float, lower_waiting: bool) -> tuple[Budget, bool] | None:
+        """Return (budget, guard_only) for the first budget that refuses this ticket now, or None.
 
-        A budget with no charges in the window always admits one request, even an oversized one,
-        so a large request cannot wait forever.
+        guard_only is True when the budget has room and only the urgent share guard refuses: urgent
+        tickets may hold at most half of a budget while lower lanes wait. A budget with no charges
+        in the window always admits one request, even an oversized one, so a large request cannot
+        wait forever.
         """
         for name, estimate in ticket.estimates.items():
             budget = self.budgets[name]
             cap = budget.cap()
             used = budget.used(now, self.window)
             if used > 0 and used + estimate > cap:
-                return budget
+                return budget, False
             if ticket.lane == "urgent" and lower_waiting:
                 urgent_used = budget.used(now, self.window, lane="urgent")
                 if urgent_used > 0 and urgent_used + estimate > 0.5 * cap:
-                    return budget
+                    return budget, True
         return None
 
     def _admit(self, ticket: Ticket, now: float) -> None:
