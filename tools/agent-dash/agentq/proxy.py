@@ -64,6 +64,7 @@ DEFAULT_CONFIG = {
     "connect_timeout_s": 10.0,
     "upstream_idle_s": 120.0,
     "drain_s": 20.0,
+    "max_tokens_cap": {},
     "budgets": {
         "total": {"limit": 10_000_000},
         "output": {"limit": 70_000, "model_prefix": "morph-dsv41flash"},
@@ -113,6 +114,35 @@ LIMIT_PATTERNS = (
     ("uncached", re.compile(r"Limit:\s*(\d+)\s+uncached input tokens/minute")),
     ("total", re.compile(r"Limit:\s*(\d+)\s+tokens/minute")),
 )
+
+PROXY_JOBS_DDL = """
+CREATE TABLE IF NOT EXISTS proxy_jobs (
+    job TEXT NOT NULL, model TEXT NOT NULL,
+    first_ts REAL NOT NULL, last_ts REAL NOT NULL,
+    req INT, ok INT, r429 INT,
+    input INT, cache_read INT, output INT,
+    wait_ms_total INT, upstream_ms_total INT,
+    PRIMARY KEY (job, model))
+"""
+
+JOB_UPSERT_SQL = """
+INSERT INTO proxy_jobs (job, model, first_ts, last_ts, req, ok, r429, input, cache_read, output,
+    wait_ms_total, upstream_ms_total)
+VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+ON CONFLICT(job, model) DO UPDATE SET
+    req = req + excluded.req,
+    ok = ok + excluded.ok,
+    r429 = r429 + excluded.r429,
+    input = input + excluded.input,
+    cache_read = cache_read + excluded.cache_read,
+    output = output + excluded.output,
+    wait_ms_total = wait_ms_total + excluded.wait_ms_total,
+    upstream_ms_total = upstream_ms_total + excluded.upstream_ms_total,
+    first_ts = min(first_ts, excluded.first_ts),
+    last_ts = max(last_ts, excluded.last_ts)
+"""
+
+JOB_COUNTERS = ("req", "ok", "r429", "input", "cache_read", "output", "wait_ms", "upstream_ms")
 
 PROXY_MINUTES_DDL = """
 CREATE TABLE IF NOT EXISTS proxy_minutes (
@@ -350,6 +380,21 @@ def write_minute_rows(db_path: Path, rows: list[tuple]) -> None:
         connection.close()
 
 
+def write_job_rows(db_path: Path, rows: list[tuple]) -> None:
+    """Add per-run deltas to proxy_jobs. Additive upserts, so two processes or restarts never overwrite.
+    Runs in a worker thread."""
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(db_path, timeout=5.0)
+    try:
+        connection.execute("PRAGMA busy_timeout = 5000")
+        connection.execute("PRAGMA journal_mode = WAL")
+        connection.execute(PROXY_JOBS_DDL)
+        connection.executemany(JOB_UPSERT_SQL, rows)
+        connection.commit()
+    finally:
+        connection.close()
+
+
 def write_state_file(path: Path, data: dict) -> None:
     """Replace the state file atomically. Runs in a worker thread."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -433,6 +478,7 @@ class Ticket:
     uncached_est: int
     queued_at: float
     first_seen: float
+    waiting_since: float = 0.0
     future: asyncio.Future | None = None
     not_before: float = 0.0
     attempts: int = 0
@@ -478,6 +524,7 @@ class Governor:
         self.lane_cache: dict[str, tuple[str, float]] = {}
         self.minute_rows: dict[tuple[str, str], dict] = {}
         self.dirty: set[tuple[str, str]] = set()
+        self.job_rows: dict[tuple[str, str], dict] = {}
         self.waits: deque[tuple[float, float]] = deque()
         self.errors: dict[str, int] = {}
         self.state_dirty = False
@@ -624,6 +671,7 @@ class Governor:
             uncached_est=uncached,
             queued_at=now,
             first_seen=now,
+            waiting_since=now,
         )
 
     def enqueue(self, ticket: Ticket) -> None:
@@ -728,6 +776,9 @@ class Governor:
         row["req"] += 1
         if len(row["waits"]) < ROW_WAIT_SAMPLES:
             row["waits"].append(wait)
+        counters = self.job_counters(ticket)
+        counters["req"] += 1
+        counters["wait_ms"] += round((now - ticket.waiting_since) * 1000)
         if ticket.future is not None and not ticket.future.done():
             ticket.future.set_result(None)
 
@@ -752,6 +803,11 @@ class Governor:
         row["cache_read"] += cached
         row["output"] += output
         row["uncached_est"] += ticket.uncached_est
+        counters = self.job_counters(ticket)
+        counters["ok"] += 1
+        counters["input"] += prompt - cached
+        counters["cache_read"] += cached
+        counters["output"] += output
 
     def release(self, ticket: Ticket) -> None:
         """Drop a charge that upstream did not bill: a 429, an error, a truncated stream, or a client that left."""
@@ -772,6 +828,7 @@ class Governor:
         """
         now = self.clock()
         self.row(ticket.model)["r429"] += 1
+        self.job_counters(ticket)["r429"] += 1
         stated = parse_stated_limit(body_text)
         if stated is not None:
             name, limit = stated
@@ -857,6 +914,62 @@ class Governor:
             self.minute_rows[key] = row
         self.dirty.add(key)
         return row
+
+    def job_counters(self, ticket: Ticket) -> dict:
+        """The per-run counters for one (job, model), created on first use. Anonymous requests count
+        under job "none". The first and last times only ever widen, so re-sending them is harmless."""
+        key = (ticket.job or "none", ticket.model)
+        row = self.job_rows.get(key)
+        if row is None:
+            row = {name: 0 for name in JOB_COUNTERS} | {"first": None, "last": None}
+            self.job_rows[key] = row
+        now = self.wall()
+        row["first"] = now if row["first"] is None else min(row["first"], now)
+        row["last"] = now if row["last"] is None else max(row["last"], now)
+        return row
+
+    def take_job_rows(self) -> tuple[list[tuple], dict]:
+        """Rows of per-run deltas to add to proxy_jobs, plus the counts they carry. Nothing is cleared
+        here: settle_job_rows subtracts the counts once the write has succeeded."""
+        rows = []
+        snapshot = {}
+        for key, row in self.job_rows.items():
+            counts = {name: row[name] for name in JOB_COUNTERS}
+            if not any(counts.values()):
+                continue
+            snapshot[key] = counts
+            job, model = key
+            rows.append(
+                (
+                    job,
+                    model,
+                    row["first"],
+                    row["last"],
+                    counts["req"],
+                    counts["ok"],
+                    counts["r429"],
+                    counts["input"],
+                    counts["cache_read"],
+                    counts["output"],
+                    counts["wait_ms"],
+                    counts["upstream_ms"],
+                )
+            )
+        return rows, snapshot
+
+    def settle_job_rows(self, snapshot: dict) -> None:
+        """Remove the counts a successful write carried. Events that arrived during the write stay."""
+        for key, counts in snapshot.items():
+            row = self.job_rows.get(key)
+            if row is None:
+                continue
+            for name, value in counts.items():
+                row[name] -= value
+            if not any(row[name] for name in JOB_COUNTERS):
+                del self.job_rows[key]
+
+    def note_upstream(self, ticket: Ticket, seconds: float) -> None:
+        self.job_counters(ticket)["upstream_ms"] += round(seconds * 1000)
 
     def take_minute_rows(self) -> list[tuple]:
         """Return the rows changed since the last call, ready for write_minute_rows."""
@@ -1000,6 +1113,10 @@ def parse_payload(body: bytes) -> dict | None:
     return payload if isinstance(payload, dict) else None
 
 
+def dump_payload(payload: dict) -> bytes:
+    return json.dumps(payload, separators=(",", ":")).encode()
+
+
 def with_usage_option(payload: dict) -> bytes | None:
     """Return the body with stream_options.include_usage set, or None when the client already set it."""
     options = payload.get("stream_options")
@@ -1008,23 +1125,52 @@ def with_usage_option(payload: dict) -> bytes | None:
         return None
     options["include_usage"] = True
     payload["stream_options"] = options
-    return json.dumps(payload, separators=(",", ":")).encode()
+    return dump_payload(payload)
 
 
-def prepare_body(body: bytes) -> tuple[dict | None, bytes, int, tuple[bytes, ...]]:
-    """Parse the request, set include_usage on streams, and describe the prompt. Pure, so it can run in a thread."""
+def max_tokens_cap_for(model: str, caps: dict) -> int | None:
+    """The cap of the longest configured prefix that the model name starts with, or None."""
+    matches = [prefix for prefix in caps if model.startswith(prefix)]
+    if not matches:
+        return None
+    return int(caps[max(matches, key=len)])
+
+
+def cap_max_tokens(payload: dict, caps: dict) -> bool:
+    """Lower max_tokens and max_completion_tokens to the model's cap when they are above it.
+    Returns whether the payload changed."""
+    cap = max_tokens_cap_for(str(payload.get("model") or ""), caps)
+    if cap is None:
+        return False
+    changed = False
+    for name in ("max_tokens", "max_completion_tokens"):
+        value = payload.get(name)
+        if isinstance(value, int) and not isinstance(value, bool) and value > cap:
+            payload[name] = cap
+            changed = True
+    return changed
+
+
+def prepare_body(body: bytes, caps: dict | None = None) -> tuple[dict | None, bytes, int, tuple[bytes, ...]]:
+    """Parse the request, apply the max_tokens cap, set include_usage on streams, and describe the prompt.
+    Pure, so it can run in a thread."""
     payload = parse_payload(body)
     out_body = body
-    if payload is not None and payload.get("stream") is True:
-        out_body = with_usage_option(payload) or body
+    if payload is not None:
+        capped = cap_max_tokens(payload, caps or {})
+        with_usage = with_usage_option(payload) if payload.get("stream") is True else None
+        if with_usage is not None:
+            out_body = with_usage
+        elif capped:
+            out_body = dump_payload(payload)
     text = out_body.decode("utf-8", "replace")
     return payload, out_body, len(text), prefix_blocks(text)
 
 
-async def prepare_body_async(body: bytes) -> tuple[dict | None, bytes, int, tuple[bytes, ...]]:
+async def prepare_body_async(body: bytes, caps: dict | None = None) -> tuple[dict | None, bytes, int, tuple[bytes, ...]]:
     if len(body) < LARGE_BODY:
-        return prepare_body(body)
-    return await asyncio.to_thread(prepare_body, body)
+        return prepare_body(body, caps)
+    return await asyncio.to_thread(prepare_body, body, caps)
 
 
 def is_event_stream(headers: dict[str, str]) -> bool:
@@ -1227,12 +1373,20 @@ class Proxy:
 
     async def flush(self) -> None:
         rows = self.gov.take_minute_rows()
-        if not rows:
+        if rows:
+            try:
+                await asyncio.to_thread(write_minute_rows, self.gov.db_path, rows)
+            except sqlite3.Error as exc:
+                self.gov.log("flush_error", kind=type(exc).__name__)
+        job_rows, snapshot = self.gov.take_job_rows()
+        if not job_rows:
             return
         try:
-            await asyncio.to_thread(write_minute_rows, self.gov.db_path, rows)
+            await asyncio.to_thread(write_job_rows, self.gov.db_path, job_rows)
         except sqlite3.Error as exc:
             self.gov.log("flush_error", kind=type(exc).__name__)
+            return
+        self.gov.settle_job_rows(snapshot)
 
     async def flush_state(self, force: bool = False) -> None:
         if not (self.gov.state_dirty or force):
@@ -1360,7 +1514,7 @@ class Proxy:
     ) -> None:
         gov = self.gov
         job = headers.get("x-agentq-job", "")
-        payload, out_body, length, blocks = await prepare_body_async(body)
+        payload, out_body, length, blocks = await prepare_body_async(body, gov.config.get("max_tokens_cap"))
         model = ""
         max_tokens = None
         streaming = False
@@ -1419,10 +1573,12 @@ class Proxy:
                 await send_simple(client, 429, held_body(gov), "text/plain")
                 return
             upstream = None
+            sent_at = gov.clock()
             try:
                 upstream = await self.open_upstream(method, path, headers, body)
                 if upstream.status == 429:
                     raw = await read_all(upstream.reader, upstream.headers, MAX_429_BODY, idle_s)
+                    gov.note_upstream(ticket, gov.clock() - sent_at)
                     upstream.close()
                     upstream = None
                     gov.log(
@@ -1442,6 +1598,7 @@ class Proxy:
                     delay = gov.retry_delay(ticket, now)
                     ticket.attempts += 1
                     ticket.not_before = now + delay
+                    ticket.waiting_since = now
                     ticket.future = asyncio.get_running_loop().create_future()
                     gov.requeue_head(ticket)
                     gov.log("retry", job=ticket.job, model=ticket.model, attempt=ticket.attempts + 1, delay_s=round(delay, 2))
@@ -1453,6 +1610,7 @@ class Proxy:
                     await send_chunk(client, chunk)
                 await end_chunks(client)
                 scanner.finish()
+                gov.note_upstream(ticket, gov.clock() - sent_at)
                 if upstream.status == 200:
                     gov.finish_ok(ticket, scanner.usage)
                 else:

@@ -32,6 +32,7 @@ from agentq.proxy import (
     minute_stamp,
     parse_stated_limit,
     prefix_blocks,
+    LARGE_BODY,
     prepare_body,
     prepare_body_async,
     read_request,
@@ -1125,6 +1126,164 @@ class MinuteSeedTest(unittest.TestCase):
         row = gov.row(MODEL_OUT)
         self.assertEqual(row["req"], 0)
         self.assertEqual(row["waits"], [])
+
+
+def job_table(home: Path) -> dict:
+    connection = sqlite3.connect(home / "agentq.db")
+    try:
+        found = connection.execute(
+            "SELECT job, model, first_ts, last_ts, req, ok, r429, input, cache_read, output, "
+            "wait_ms_total, upstream_ms_total FROM proxy_jobs"
+        ).fetchall()
+    except sqlite3.OperationalError:
+        found = []
+    finally:
+        connection.close()
+    names = ("job", "model", "first_ts", "last_ts", "req", "ok", "r429", "input", "cache_read", "output",
+             "wait_ms_total", "upstream_ms_total")
+    return {(row[0], row[1]): dict(zip(names, row)) for row in found}
+
+
+class PerRunAccountingTest(ProxyCase):
+    async def test_admitted_ok_and_429_are_counted_per_run(self) -> None:
+        self.fake.script = [{"status": 429, "body": '{"message":"Limit: 70000 output tokens/minute."}'}]
+        status, _ = await self.post(self.chat(MODEL_OUT), job="run-a")
+        self.assertEqual(status, 200)
+        await self.proxy.flush()
+        row = job_table(self.home)[("run-a", MODEL_OUT)]
+        self.assertEqual(row["req"], 2)
+        self.assertEqual(row["ok"], 1)
+        self.assertEqual(row["r429"], 1)
+        self.assertEqual((row["input"], row["cache_read"], row["output"]), (100, 0, 50))
+        self.assertGreaterEqual(row["wait_ms_total"], 0)
+        self.assertGreaterEqual(row["upstream_ms_total"], 0)
+        self.assertLessEqual(row["first_ts"], row["last_ts"])
+
+    async def test_anonymous_requests_are_keyed_none(self) -> None:
+        await self.post(self.chat(MODEL_OUT), job="")
+        await self.proxy.flush()
+        self.assertIn(("none", MODEL_OUT), job_table(self.home))
+
+    async def test_repeated_flushes_add_and_a_second_process_adds(self) -> None:
+        await self.post(self.chat(MODEL_OUT), job="run-b")
+        await self.proxy.flush()
+        await self.post(self.chat(MODEL_OUT), job="run-b")
+        await self.proxy.flush()
+        await self.proxy.flush()
+        self.assertEqual(job_table(self.home)[("run-b", MODEL_OUT)]["req"], 2)
+
+        second = Governor(self.home, self.config, log=self.capture)
+        ticket = make_ticket(second, job="run-b", model=MODEL_OUT)
+        second._admit(ticket, second.clock())
+        second.finish_ok(ticket, {"prompt_tokens": 10, "completion_tokens": 30, "prompt_tokens_details": {"cached_tokens": 4}})
+        await Proxy(second, self.proxy.upstream_url, KEY).flush()
+        row = job_table(self.home)[("run-b", MODEL_OUT)]
+        self.assertEqual((row["req"], row["ok"], row["output"], row["cache_read"]), (3, 3, 130, 4))
+
+    async def test_a_failed_write_keeps_the_deltas_for_the_next_flush(self) -> None:
+        await self.post(self.chat(MODEL_OUT), job="run-c")
+        with mock.patch("agentq.proxy.write_job_rows", side_effect=sqlite3.OperationalError("locked")):
+            await self.proxy.flush()
+        self.assertIn("flush_error", self.events())
+        self.assertNotIn(("run-c", MODEL_OUT), job_table(self.home))
+        await self.proxy.flush()
+        self.assertEqual(job_table(self.home)[("run-c", MODEL_OUT)]["req"], 1)
+
+    async def test_restart_does_not_replay_flushed_counts(self) -> None:
+        await self.post(self.chat(MODEL_OUT), job="run-d")
+        await self.proxy.flush()
+        restarted = Governor(self.home, self.config, log=self.capture)
+        await Proxy(restarted, self.proxy.upstream_url, KEY).flush()
+        self.assertEqual(job_table(self.home)[("run-d", MODEL_OUT)]["req"], 1)
+
+
+class JobTimingTest(unittest.TestCase):
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.home = Path(tmp.name)
+        self.clock = [0.0]
+        self.gov = Governor(self.home, config_with(), clock=lambda: self.clock[0], wall=lambda: 1_700_000_000.0, log=quiet)
+
+    def test_wait_is_measured_from_the_last_enqueue_to_admission(self) -> None:
+        ticket = make_ticket(self.gov, job="timed", now=0.0)
+        self.clock[0] = 2.5
+        self.gov._admit(ticket, 2.5)
+        counters = self.gov.job_rows[("timed", MODEL_OUT)]
+        self.assertEqual(counters["req"], 1)
+        self.assertEqual(counters["wait_ms"], 2500)
+
+    def test_upstream_time_is_summed_per_attempt(self) -> None:
+        ticket = make_ticket(self.gov, job="timed", now=0.0)
+        self.gov.note_upstream(ticket, 1.25)
+        self.gov.note_upstream(ticket, 0.75)
+        self.assertEqual(self.gov.job_rows[("timed", MODEL_OUT)]["upstream_ms"], 2000)
+
+    def test_flush_rows_carry_the_counts_and_settle_clears_them(self) -> None:
+        ticket = make_ticket(self.gov, job="job-s", now=0.0)
+        self.gov._admit(ticket, 0.0)
+        rows, snapshot = self.gov.take_job_rows()
+        self.assertEqual(rows[0][:2], ("job-s", MODEL_OUT))
+        self.gov.settle_job_rows(snapshot)
+        self.assertEqual(self.gov.job_rows, {})
+
+    def test_rows_recorded_during_a_write_survive_the_settle(self) -> None:
+        ticket = make_ticket(self.gov, job="job-w", now=0.0)
+        self.gov._admit(ticket, 0.0)
+        _, snapshot = self.gov.take_job_rows()
+        self.gov._admit(ticket, 1.0)
+        self.gov.settle_job_rows(snapshot)
+        self.assertEqual(self.gov.job_rows[("job-w", MODEL_OUT)]["req"], 1)
+
+
+class MaxTokensCapTest(unittest.TestCase):
+    CAPS = {"morph-dsv41flash": 8000}
+
+    def body(self, model: str, **fields) -> bytes:
+        payload = {"model": model, "messages": [{"role": "user", "content": "hi"}]}
+        payload.update(fields)
+        return json.dumps(payload).encode()
+
+    def test_max_tokens_above_the_cap_is_lowered_for_a_matching_prefix(self) -> None:
+        payload, out, _, _ = prepare_body(self.body("morph-dsv41flash-1017", max_tokens=74000), self.CAPS)
+        self.assertEqual(json.loads(out)["max_tokens"], 8000)
+        self.assertEqual(payload["max_tokens"], 8000)
+
+    def test_max_completion_tokens_is_capped_too(self) -> None:
+        _, out, _, _ = prepare_body(self.body("morph-dsv41flash-1017", max_completion_tokens=9000), self.CAPS)
+        self.assertEqual(json.loads(out)["max_completion_tokens"], 8000)
+
+    def test_a_value_at_or_below_the_cap_and_other_models_pass_through_unchanged(self) -> None:
+        below = self.body("morph-dsv41flash-1017", max_tokens=8000)
+        self.assertIs(prepare_body(below, self.CAPS)[1], below)
+        other = self.body("morph-kimik31", max_tokens=74000)
+        self.assertIs(prepare_body(other, self.CAPS)[1], other)
+        self.assertIs(prepare_body(other)[1], other)
+
+    def test_cap_keeps_include_usage_on_streams(self) -> None:
+        raw = self.body("morph-dsv41flash-1017", max_tokens=74000, stream=True)
+        _, out, _, _ = prepare_body(raw, self.CAPS)
+        decoded = json.loads(out)
+        self.assertEqual(decoded["max_tokens"], 8000)
+        self.assertTrue(decoded["stream_options"]["include_usage"])
+
+    def test_large_bodies_take_the_threaded_path_with_the_cap(self) -> None:
+        filler = "x" * (LARGE_BODY + 10)
+        raw = self.body("morph-dsv41flash-1017", max_tokens=74000, filler=filler)
+        payload, out, _, _ = asyncio.run(prepare_body_async(raw, self.CAPS))
+        self.assertEqual(json.loads(out)["max_tokens"], 8000)
+        self.assertEqual(payload["max_tokens"], 8000)
+
+    def test_default_config_caps_nothing(self) -> None:
+        self.assertEqual(DEFAULT_CONFIG["max_tokens_cap"], {})
+
+
+class MaxTokensCapEndToEndTest(ProxyCase):
+    overrides = {"max_tokens_cap": {MODEL_OUT: 100}}
+
+    async def test_the_forwarded_request_carries_the_capped_value(self) -> None:
+        await self.post(self.chat(MODEL_OUT, max_tokens=74000), job="cap-job")
+        self.assertEqual(self.fake.requests[0]["payload"]["max_tokens"], 100)
 
 
 if __name__ == "__main__":

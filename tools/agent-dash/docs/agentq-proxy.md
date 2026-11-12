@@ -94,6 +94,19 @@ A request that is already streaming upstream is not cancelled.
   waited more than 2 s in the last minute or is waiting now).
 - Each model and minute has one `proxy_minutes` row (created if missing, WAL,
   busy timeout 5000 ms), flushed every 5 s.
+- Each (job, model) pair has one `proxy_jobs` row for per-run accounting. The job
+  is the `X-Agentq-Job` header, which the broker sets to the 12-hex job id; a
+  request without one counts under job `none`. Direct pi launches send their run
+  label (`AGENTQ_RUN`, set by `launch_pi.py`) once the models.json header reads it.
+  Columns: `first_ts` and `last_ts` (wall-clock epochs), `req` (admitted
+  requests, a retry is admitted again), `ok` (200 responses), `r429` (upstream
+  429s), `input` (uncached prompt tokens), `cache_read`, `output`,
+  `wait_ms_total` (queue wait before each admission, summed) and
+  `upstream_ms_total` (send to end of response, summed over upstream attempts).
+  The counters live in memory per key and are flushed with the minute rows. Each
+  flush adds its deltas with an upsert and subtracts them only after the write
+  succeeds, so a failed write is retried, a restart does not replay counts, and
+  several processes can share the table.
 
 ## Configuration
 
@@ -101,12 +114,19 @@ A request that is already streaming upstream is not cancelled.
 `upstream`, `window_s`, `start_target`, `target_floor`, `target_cut`,
 `target_step_up`, `target_ceiling`, `fast_until`, `fast_step_up`, `fast_interval_s`, `default_output_tokens`, `give_up_s`, `retry_floor_s`,
 `retry_jitter_s`, `aging_s`, `connect_timeout_s` (10), `upstream_idle_s` (120),
-`drain_s` (20) and `budgets`. Environment variables:
+`drain_s` (20), `budgets` and `max_tokens_cap`. Environment variables:
 
 - `AGENTQ_HOME` (default `~/.local/state/agentq`)
 - `AGENTQ_PROXY_PORT` (default 18790)
 - `AGENTQ_UPSTREAM` (default `https://api.morphllm.com/v1`)
 - `AGENTQ_UPSTREAM_KEY` replaces the Keychain lookup. Use it for tests only.
+
+`max_tokens_cap` maps a model-name prefix to an integer. When a request's model
+starts with a prefix (the longest match wins) and its `max_tokens` or
+`max_completion_tokens` is above the cap, the proxy lowers that field to the cap
+before forwarding and estimates output from the capped value. Requests at or below
+the cap pass through byte for byte. The default is empty, so nothing is capped.
+Example, for an experiment: `{"max_tokens_cap": {"morph-dsv41flash": 8000}}`.
 
 The key is read once at start from
 `security find-generic-password -a "$USER" -s morph-api-key -w`. The proxy strips

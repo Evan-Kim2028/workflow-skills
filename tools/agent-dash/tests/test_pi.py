@@ -1212,6 +1212,27 @@ class NonAnthropicPricingUnchangedTest(unittest.TestCase):
         self.assertEqual(pricing.cost("reflection/Beam-1.0-501B-A23B", 10, 10, 0, 0), 0.0)
 
 
+class RunLabelEnvTest(unittest.TestCase):
+    """launch_pi names the run for the proxy's per-run accounting through AGENTQ_RUN."""
+
+    def test_sets_agentq_run_to_the_label(self):
+        env = launch.set_run_label("ws5-exec-slug", {"PATH": "/bin"})
+        self.assertEqual(env["AGENTQ_RUN"], "ws5-exec-slug")
+        self.assertEqual(env["PATH"], "/bin")
+
+    def test_does_not_override_an_existing_run_label(self):
+        env = launch.set_run_label("ws5-exec-slug", {"AGENTQ_RUN": "ws5-plan-other"})
+        self.assertEqual(env["AGENTQ_RUN"], "ws5-plan-other")
+
+    def test_empty_run_label_counts_as_unset(self):
+        env = launch.set_run_label("ws5-exec-slug", {"AGENTQ_RUN": "  "})
+        self.assertEqual(env["AGENTQ_RUN"], "ws5-exec-slug")
+
+    def test_never_touches_the_broker_job_id(self):
+        env = launch.set_run_label("ws5-exec-slug", {})
+        self.assertNotIn("AGENTQ_JOB", env)
+
+
 if __name__ == "__main__":
     unittest.main()
 
