@@ -775,8 +775,8 @@ class ReviewFixTests(ProcessCleanup):
 
 
 class AdaptiveAdmissionTests(ProcessCleanup):
-    def broker(self, proxy=lambda: None, gauges=None):
-        return make_broker(self.home, self.fake(live_s=30), proxy=proxy, gauges=gauges)
+    def broker(self, proxy=lambda: None, gauges=None, clock=None):
+        return make_broker(self.home, self.fake(live_s=30), proxy=proxy, gauges=gauges, clock=clock)
 
     def write_broker_json(self, data):
         import json
@@ -922,11 +922,54 @@ class AdaptiveAdmissionTests(ProcessCleanup):
         self.assertEqual(log_path.read_text().count("hold pi-deepseek-flash"), 1)
         status["doc"] = proxy_doc(total=12)
         broker.tick()
-        self.assertEqual(log_path.read_text().count("hold pi-deepseek-flash"), 2)
-        self.assertEqual(row(self.home, job)["detail"], "hold pi-deepseek-flash: proxy total waiting 12 > 8")
+        self.assertEqual(log_path.read_text().count("hold pi-deepseek-flash"), 1)
+        self.assertEqual(row(self.home, job)["detail"], "hold pi-deepseek-flash: proxy total waiting 9 > 8")
         status["doc"] = proxy_doc(total=0)
         self.assertEqual(broker.tick(), [job])
         self.assertIsNone(row(self.home, job)["detail"])
+
+    def test_hold_logs_once_while_the_load_reading_moves(self):
+        write_config(self.home, slots={"light": 40, "tests": 10, "ssh": 8})
+        jobs = [submit(self.env, self.prompt, "--res", "tests", label=f"t{i}") for i in range(5)]
+        gauges = FakeGauges(free=90.0, load=1.05)
+        broker = self.broker(gauges=gauges, clock=Clock(1000.0))
+        self.assertEqual(broker.tick(), jobs[:4])
+        for load in (1.04, 1.02, 1.01):
+            gauges.load = load
+            self.assertEqual(broker.tick(), [])
+        log_path = self.home / "logs" / "broker.log"
+        self.assertEqual(log_path.read_text().count("hold tests"), 1)
+        self.assertEqual(row(self.home, jobs[4])["state"], "queued")
+        self.assertEqual(row(self.home, jobs[4])["detail"], "hold tests: load 1.05 per cpu >= 1")
+
+    def test_hold_logs_again_when_the_gate_changes_from_load_to_memory(self):
+        write_config(self.home, slots={"light": 40, "tests": 10, "ssh": 8})
+        jobs = [submit(self.env, self.prompt, "--res", "tests", label=f"t{i}") for i in range(5)]
+        gauges = FakeGauges(free=90.0, load=1.2)
+        broker = self.broker(gauges=gauges, clock=Clock(1000.0))
+        broker.tick()
+        gauges.free = 31.0
+        gauges.load = 0.2
+        broker.tick()
+        log_path = self.home / "logs" / "broker.log"
+        self.assertEqual(log_path.read_text().count("hold tests"), 2)
+        self.assertEqual(row(self.home, jobs[4])["detail"], "hold tests: memory free 31% < 35%")
+
+    def test_held_job_refreshes_its_detail_five_minutes_after_the_last_write(self):
+        job = submit(self.env, self.prompt, label="held", now=Clock(1000.0))
+        status = {"doc": proxy_doc(total=9)}
+        clock = Clock(1000.0)
+        broker = self.broker(proxy=lambda: status["doc"], clock=clock)
+        broker.tick()
+        status["doc"] = proxy_doc(total=12)
+        clock.t = 1299.0
+        broker.tick()
+        self.assertEqual(row(self.home, job)["detail"], "hold pi-deepseek-flash: proxy total waiting 9 > 8")
+        clock.t = 1300.0
+        broker.tick()
+        self.assertEqual(row(self.home, job)["detail"], "hold pi-deepseek-flash: proxy total waiting 12 > 8")
+        log_path = self.home / "logs" / "broker.log"
+        self.assertEqual(log_path.read_text().count("hold pi-deepseek-flash"), 2)
 
 
 if __name__ == "__main__":
