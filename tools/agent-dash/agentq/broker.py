@@ -23,6 +23,15 @@ The run folder itself keeps only the launcher's one summary line in
 Every state change is a conditional update (``db.transition``) from the state
 the decision was made in. A cancel or a finish that lands first wins, and the
 broker's late write matches no row.
+
+A write job whose workspace is the main checkout of a git repo (with an
+``origin`` remote) gets its own worktree at launch, unless it was submitted
+with ``--in-place`` or ``broker.json`` turns ``auto_worktree`` off. The worktree
+is ``<root>/<repo>/agentq-<job id>`` on a new branch ``agentq/<job id>`` from
+``origin/main``. The job's ``workspace`` moves to it and ``orig_workspace``
+keeps the checkout, so the one-writer rule applies per worktree and such jobs
+run in parallel. A failed creation retries after 60 s and fails the job on the
+third try; it never falls back to writing in place.
 """
 
 from __future__ import annotations
@@ -64,6 +73,10 @@ DEFAULT_ADAPTIVE = {
     "gauge_ttl_s": 15.0,
 }
 TIER_BUDGETS = {"pi-deepseek-flash": ("total", "output"), "pi-kimi": ("total", "uncached")}
+DEFAULT_AUTO_WORKTREE = {"enabled": True, "root": "~/Documents/worktrees"}
+AUTO_WORKTREE_RETRY_S = 60.0
+AUTO_WORKTREE_MAX_TRIES = 3
+GIT_TIMEOUT_S = 60.0
 LAPTOP_GATED = ("tests", "light")
 MEMORY_FREE_LINE = re.compile(r"System-wide memory free percentage:\s*(\d+(?:\.\d+)?)%")
 VERDICT_LINE = re.compile(r"^\W*(?:verdict\W*)?(PASS|PARTIAL|BLOCKED)\b", re.IGNORECASE)
@@ -83,6 +96,10 @@ class CapacityRefused(LaunchError):
 
 class DaemonRunning(RuntimeError):
     """Another broker already holds the daemon lock."""
+
+
+class WorktreeError(RuntimeError):
+    """git could not inspect a workspace or create a job's worktree. The job waits and retries."""
 
 
 class Probe(NamedTuple):
@@ -105,6 +122,7 @@ def load_config(home) -> dict:
         "slots": _caps(DEFAULT_SLOTS, data.get("slots")),
         "tiers": _caps(DEFAULT_TIERS, data.get("tiers")),
         "adaptive": _adaptive(data.get("adaptive")),
+        "auto_worktree": _auto_worktree(data.get("auto_worktree")),
     }
 
 
@@ -133,6 +151,17 @@ def _adaptive(override) -> dict:
                 settings[name] = float(value)
             except (TypeError, ValueError):
                 continue
+    return settings
+
+
+def _auto_worktree(override) -> dict:
+    """Write-job worktree settings. ``enabled: false`` or a root folder override the defaults."""
+    settings = dict(DEFAULT_AUTO_WORKTREE)
+    if isinstance(override, dict):
+        if "enabled" in override:
+            settings["enabled"] = bool(override["enabled"])
+        if isinstance(override.get("root"), str) and override["root"].strip():
+            settings["root"] = override["root"].strip()
     return settings
 
 
@@ -538,6 +567,124 @@ def cancel(conn, job: dict, now: float) -> str | None:
     return action if moved else None
 
 
+def branch_for(job_id: str) -> str:
+    """The branch a job's auto worktree is created on."""
+    return f"agentq/{job_id}"
+
+
+def worktree_path(root: str, repo: Path, job_id: str) -> Path:
+    """``<root>/<repo name>/agentq-<job id>``, with ``~`` expanded."""
+    return Path(os.path.expanduser(root)) / repo.name / f"agentq-{job_id}"
+
+
+def worktree_note(job: dict) -> str:
+    """``worktree <path> branch <branch>`` for a job that runs in its own worktree, else empty."""
+    if not job.get("orig_workspace"):
+        return ""
+    return f"worktree {job['workspace']} branch {branch_for(job['id'])}"
+
+
+def _short(text: str) -> str:
+    lines = [line.strip() for line in (text or "").splitlines() if line.strip()]
+    return (lines[-1] if lines else "no output")[:200]
+
+
+def _git(cwd, *args, timeout: float = GIT_TIMEOUT_S):
+    """Run ``git -C cwd args``. A missing git or a timeout raises WorktreeError."""
+    try:
+        return subprocess.run(
+            ["git", "-C", str(cwd), *args], capture_output=True, text=True,
+            timeout=timeout, check=False, stdin=subprocess.DEVNULL,
+        )  # fmt: skip
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise WorktreeError(f"git {args[0]} did not run: {_short(str(exc))}") from exc
+
+
+def main_checkout_of(workspace) -> Path | None:
+    """The workspace when it is the main working tree of a git repo with an ``origin`` remote.
+
+    The main working tree is the one whose git common dir is its own ``.git``. A linked
+    worktree points elsewhere, and a subfolder of a checkout resolves to the parent's
+    ``.git``, so both return None, as does a folder that is not a repo or has no origin.
+    A git failure other than "not a git repository" raises WorktreeError.
+    """
+    ws = Path(workspace)
+    if not ws.is_dir():
+        return None
+    probe = _git(ws, "rev-parse", "--git-common-dir")
+    if probe.returncode != 0:
+        if "not a git repository" in probe.stderr.lower():
+            return None
+        raise WorktreeError(f"rev-parse failed: {_short(probe.stderr)}")
+    common = Path(probe.stdout.strip())
+    if not common.is_absolute():
+        common = ws / common
+    if os.path.realpath(common) != os.path.realpath(ws / ".git"):
+        return None
+    if _git(ws, "remote", "get-url", "origin").returncode != 0:
+        return None
+    return ws
+
+
+def plan_worktree(job: dict, settings: dict):
+    """``(repo, worktree path)`` for a queued write job that gets its own worktree, else None.
+
+    Off when auto worktrees are disabled, when the submitter passed ``--in-place``, or when the
+    job already runs in a worktree it was given (a requeued job keeps it).
+    """
+    if not settings["enabled"] or job["in_place"] or job["orig_workspace"]:
+        return None
+    repo = main_checkout_of(job["workspace"])
+    if repo is None:
+        return None
+    return repo, worktree_path(settings["root"], repo, job["id"])
+
+
+def create_worktree(repo: Path, path: Path, branch: str, *, fetch: bool) -> str:
+    """Create ``path`` on a new ``branch`` from ``origin/main``. Returns a note for the log.
+
+    The fetch runs first unless ``fetch`` is False; a failed fetch falls back to the local
+    ``origin/main`` ref and says so in the note. A path or branch left by an earlier attempt
+    is reused when it already holds that branch, so a retry converges.
+    """
+    note = ""
+    if fetch:
+        got = _git(repo, "fetch", "-q", "origin", "main")
+        if got.returncode != 0:
+            note = f"fetch origin main failed, using local origin/main: {_short(got.stderr)}"
+    if _git(repo, "rev-parse", "--verify", "-q", "origin/main^{commit}").returncode != 0:
+        raise WorktreeError("no origin/main ref to branch from")
+    if path.exists():
+        head = _git(path, "rev-parse", "--abbrev-ref", "HEAD")
+        if head.returncode == 0 and head.stdout.strip() == branch:
+            return note
+        raise WorktreeError(f"{path} exists and is not a worktree on {branch}")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise WorktreeError(f"cannot create {path.parent}: {_short(str(exc))}") from exc
+    if _git(repo, "rev-parse", "--verify", "-q", f"refs/heads/{branch}").returncode == 0:
+        added = _git(repo, "worktree", "add", str(path), branch)
+    else:
+        added = _git(repo, "worktree", "add", "-b", branch, str(path), "origin/main")
+    if added.returncode != 0:
+        raise WorktreeError(f"worktree add failed: {_short(added.stderr)}")
+    return note
+
+
+def worktree_prompt(run_dir, job: dict) -> Path:
+    """Copy the job's prompt into its run folder with the worktree instruction as the first line."""
+    line = (
+        f"You are working in a fresh worktree {job['workspace']} on branch {branch_for(job['id'])}, "
+        f"created from origin/main for this job. Commit your work on this branch; "
+        f"do not edit {job['orig_workspace']}."
+    )
+    dest = Path(run_dir) / "prompt-worktree.md"
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_text(line + "\n\n" + _read(job["prompt_path"]), encoding="utf-8")
+    return dest
+
+
 class Broker:
     """One broker over one agentq home. ``launcher``, ``now`` and ``proxy`` are injectable."""
 
@@ -549,6 +696,7 @@ class Broker:
         self.gauges = gauges or Gauges(clock=now)
         self._saturated_last = False
         self._holds: dict[str, tuple[tuple[str, str], float]] = {}
+        self._plans: dict[str, tuple[Path, Path] | None] = {}
 
     def log(self, message: str) -> None:
         log_line(self.home, message)
@@ -611,6 +759,10 @@ class Broker:
                 gauge_reading.append(self.gauges.read(adaptive["gauge_ttl_s"]))
             return gauge_reading[0]
 
+        worktree_settings = cfg["auto_worktree"]
+        ready_ids = {job["id"] for job in ready}
+        self._plans = {job_id: plan for job_id, plan in self._plans.items() if job_id in ready_ids}
+        fetched: set[Path] = set()
         holds: dict[str, tuple[str, tuple[str, str]]] = {}
         launched: list[str] = []
         for job in order_queue(ready, now):
@@ -623,7 +775,14 @@ class Broker:
                 name, reason = job["tier"], plain_hold("proxy saturated")
             if reason is None and job["lane"] == "urgent" and others_waiting and urgent_running >= urgent_cap:
                 reason = plain_hold("urgent share full")
-            if reason is None and job["kind"] == "write" and job["workspace"] in busy_workspaces:
+            plan = None
+            if reason is None and job["kind"] == "write":
+                try:
+                    plan = self._worktree_plan(job, worktree_settings)
+                except WorktreeError as exc:
+                    self._worktree_failed(conn, job, now, exc)
+                    continue
+            if reason is None and plan is None and job["kind"] == "write" and job["workspace"] in busy_workspaces:
                 reason = plain_hold("workspace busy")
             if reason is None and slots_free.get(job["res"], 0) <= 0:
                 reason = plain_hold("slots full")
@@ -635,6 +794,10 @@ class Broker:
             if reason:
                 holds[job["id"]] = (name, reason)
                 continue
+            if plan is not None:
+                job = self._prepare_worktree(conn, job, plan, now, fetched)
+                if job is None:
+                    continue
             slots_free[job["res"]] -= 1
             tier_used[job["tier"]] = tier_used.get(job["tier"], 0) + 1
             res_used[job["res"]] = res_used.get(job["res"], 0) + 1
@@ -684,6 +847,54 @@ class Broker:
             self.log(f"proxy saturated={saturated}")
         self._saturated_last = saturated
         return status
+
+    def _worktree_plan(self, job: dict, settings: dict):
+        """The job's worktree plan, cached until it launches or leaves the queue."""
+        if job["id"] not in self._plans:
+            self._plans[job["id"]] = plan_worktree(job, settings)
+        return self._plans[job["id"]]
+
+    def _prepare_worktree(self, conn, job: dict, plan, now: float, fetched: set) -> dict | None:
+        """Create the job's worktree and point the job at it. Returns the updated job, or None.
+
+        None means the job stays queued: the creation failed (retry scheduled) or the job
+        moved on (cancelled) before the change was recorded.
+        """
+        repo, path = plan
+        try:
+            note = create_worktree(repo, path, branch_for(job["id"]), fetch=repo not in fetched)
+        except WorktreeError as exc:
+            self._worktree_failed(conn, job, now, exc)
+            return None
+        fetched.add(repo)
+        if not db.transition(conn, job["id"], ("queued",), now, "auto-worktree", str(path),
+                             workspace=str(path), orig_workspace=job["workspace"], detail=None):  # fmt: skip
+            return None
+        self._plans.pop(job["id"], None)
+        if note:
+            self.log(f"{job['id']} {note}")
+        self.log(f"auto-worktree {job['id']} {path}")
+        return {**job, "workspace": str(path), "orig_workspace": job["workspace"]}
+
+    def _worktree_failed(self, conn, job: dict, now: float, exc: Exception) -> None:
+        """Count one failed worktree attempt. The job retries after a minute; the third failure fails it.
+
+        The job never falls back to writing in place: that is the hazard this step removes.
+        The attempt count lives in the events table, so it survives a broker restart.
+        """
+        self._holds.pop(job["id"], None)
+        self._plans.pop(job["id"], None)
+        tries = db.count_events(conn, job["id"], "auto-worktree-failed") + 1
+        if tries >= AUTO_WORKTREE_MAX_TRIES:
+            reason = f"auto-worktree failed after {tries} tries: {exc}"
+            db.transition(conn, job["id"], ("queued",), now, "failed", reason,
+                          state="failed", finished_at=now, detail=reason)  # fmt: skip
+            self.log(f"{job['id']} failed: {reason}")
+            return
+        message = f"auto-worktree failed: {exc}"
+        db.transition(conn, job["id"], ("queued",), now, "auto-worktree-failed", str(exc),
+                      detail=message, not_before=now + AUTO_WORKTREE_RETRY_S)  # fmt: skip
+        self.log(f"{job['id']} {message}; retry in {int(AUTO_WORKTREE_RETRY_S)}s")
 
     def _move(self, conn, job_id: str, from_states, now: float, kind: str | None, note: str, **fields) -> bool:
         moved = db.transition(conn, job_id, from_states, now, kind, note, **fields)
@@ -758,6 +969,7 @@ class Broker:
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_text(text, encoding="utf-8")
         verdict = verdict_of(text)
+        note = "; ".join(part for part in (note, worktree_note(job)) if part)
         self._move(
             conn, job["id"], ("running",), now, "finish", f"verdict {verdict}" + (f"; {note}" if note else ""),
             state="done", verdict=verdict, report_path=str(dest), finished_at=now,
@@ -827,8 +1039,11 @@ class Broker:
         resume = resume_file(previous, job["pi_session"])
         if resume:
             env["AGENTQ_RESUME_SESSION"] = resume
+        launch_job = job
+        if job["orig_workspace"]:
+            launch_job = {**job, "prompt_path": str(worktree_prompt(run_dir, job))}
         try:
-            pid = self.launcher(job, run_dir, env)
+            pid = self.launcher(launch_job, run_dir, env)
         except CapacityRefused as exc:
             self._capacity_refused(conn, job, now, str(exc))
             return False

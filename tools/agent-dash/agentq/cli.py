@@ -154,7 +154,7 @@ def cmd_submit(args, ctx: Context) -> int:
         "id": job_id, "lane": lane, "kind": args.kind, "res": args.res, "tier": tier,
         "label": label, "workspace": workspace, "session": ctx.session,
         "harness": ctx.harness, "prompt_path": str(dest),
-        "max_runtime_s": args.max_runtime,
+        "max_runtime_s": args.max_runtime, "in_place": int(args.in_place),
     }
     with db.tx(conn):
         db.insert_job(conn, job, ctx.now())
@@ -224,7 +224,8 @@ def cmd_ls(args, ctx: Context) -> int:
         ctx.print(json.dumps(jobs, indent=2))
     else:
         for job in jobs:
-            ctx.print(f"{job['id']} {job['state']:<9} {job['lane']:<7} {job['tier']:<20} {job['label']} {job['verdict'] or '-'}")
+            worktree = f" {broker_lib.worktree_note(job)}" if job["orig_workspace"] else ""
+            ctx.print(f"{job['id']} {job['state']:<9} {job['lane']:<7} {job['tier']:<20} {job['label']} {job['verdict'] or '-'}{worktree}")
     return answer(ctx, f"{len(jobs)} job(s)", 0)
 
 
@@ -235,6 +236,8 @@ def cmd_result(args, ctx: Context) -> int:
     if job["state"] not in db.TERMINAL_STATES:
         return answer(ctx, f"{args.id} is {job['state']}; no result yet", 1)
     ctx.print(f"{job['id']} {job['verdict'] or 'none'} {job['report_path'] or '-'}")
+    if job["orig_workspace"]:
+        ctx.print(f"{broker_lib.worktree_note(job)} (from {job['orig_workspace']})")
     if args.print and job["report_path"]:
         ctx.print(Path(job["report_path"]).read_text(encoding="utf-8"))
     ok = job["state"] == "done"
@@ -311,6 +314,8 @@ def build_parser() -> argparse.ArgumentParser:
     lane.add_argument("--urgent", action="store_true")
     lane.add_argument("--backlog", action="store_true")
     p.add_argument("--workspace")
+    p.add_argument("--in-place", action="store_true",
+                   help="a write job runs in the workspace itself, not in its own worktree")
     p.add_argument("--tier")
     p.add_argument("--label")
     p.add_argument("--res", choices=db.RESOURCES, default="light")
