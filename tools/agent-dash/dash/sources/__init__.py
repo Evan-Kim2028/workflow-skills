@@ -57,6 +57,94 @@ SLOW_AFTER_S = 15.0
 BACKOFF_AFTER = 3
 BACKOFF_MAX_S = 300.0
 
+# Cadence policy, read from cfg. ``load_cfg`` supplies the production defaults
+# (floor 15 s, duty factor 8, idle after 300 s, idle factor 8, 2 concurrent
+# polls). A cfg without these keys keeps each source's declared interval, the
+# old duty gap of 2 x its last duration, no idle mode and no cap.
+IDLE_FACTOR_DEFAULT = 8.0
+DUTY_FACTOR_DEFAULT = 2.0
+
+
+def _cfg_number(cfg, key: str):
+    try:
+        return float((cfg or {})[key])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def poll_floor_s(cfg) -> float:
+    """``poll_interval_floor_s``: no source polls more often than this."""
+    value = _cfg_number(cfg, "poll_interval_floor_s")
+    return max(0.0, value) if value is not None else 0.0
+
+
+def poll_duty_factor(cfg) -> float:
+    """``poll_duty_factor``: the gap is at least this many times the last poll's duration.
+
+    A source that is polled again only after ``factor x duration`` scans for
+    about ``1 / factor`` of the wall time (start-to-start gap). 0 leaves only
+    the interval.
+    """
+    value = _cfg_number(cfg, "poll_duty_factor")
+    return max(0.0, value) if value is not None else DUTY_FACTOR_DEFAULT
+
+
+def idle_after_s(cfg):
+    """``idle_after_s`` seconds without a request or open stream, or None (idle mode off)."""
+    value = _cfg_number(cfg, "idle_after_s")
+    return value if value is not None and value > 0 else None
+
+
+def idle_factor(cfg) -> float:
+    """``idle_factor``: the multiplier on every gap while idle (at least 1)."""
+    value = _cfg_number(cfg, "idle_factor")
+    return max(1.0, value) if value is not None else IDLE_FACTOR_DEFAULT
+
+
+def max_concurrent_polls(cfg):
+    """``max_concurrent_polls``: most poll threads running at once, or None (no cap)."""
+    value = _cfg_number(cfg, "max_concurrent_polls")
+    return max(1, int(value)) if value is not None and value >= 1 else None
+
+
+def effective_interval_s(source, cfg=None, multiplier: float = 1.0) -> float:
+    """A source's poll interval after the per-source override, the floor and the idle multiplier.
+
+    ``poll_intervals`` in cfg overrides ``INTERVAL_S`` by source name. The
+    floor applies to whichever value wins, so an override below the floor
+    is raised to it.
+    """
+    base = _interval_s(source)
+    overrides = cfg.get("poll_intervals") if isinstance(cfg, dict) else None
+    name = getattr(source, "NAME", None)
+    if isinstance(overrides, dict) and overrides.get(name) is not None:
+        try:
+            base = float(overrides[name])
+        except (TypeError, ValueError):
+            pass
+    return max(base, poll_floor_s(cfg)) * multiplier
+
+
+def _stall_base(source, state: dict) -> float:
+    """The gap a silent source is judged against: its declared interval or its last scheduled gap."""
+    try:
+        gap = float(state.get("gap_s") or 0.0)
+    except (TypeError, ValueError):
+        gap = 0.0
+    return max(_interval_s(source), gap)
+
+
+def _next_due_in(state: dict, now: float):
+    """Seconds until a non-signal source's next scheduled start, or None (signal-driven or not yet scheduled)."""
+    next_due = state.get("next_due")
+    if next_due is None:
+        return None
+    return max(0.0, float(next_due) - now)
+
+
+def _alive(thread) -> bool:
+    return thread is not None and thread.is_alive()
+
 
 def _budget(cfg) -> float:
     try:
@@ -80,6 +168,8 @@ def _new_state() -> dict:
         "idle": 0,
         "sig": None,
         "sig_at": None,
+        "gap_s": None,
+        "wake": False,
     }
 
 
@@ -88,12 +178,59 @@ class Registry:
         self.state = {}
         self._born = time.time()
         self._lock = threading.Lock()
+        # Idle mode: the last served request or stream, the open SSE streams,
+        # a wake armed by the first request after idle, and the cfg the last
+        # tick saw (health and the idle check read it between ticks).
+        self._activity_at = self._born
+        self._streams = 0
+        self._wake = False
+        self._cfg: dict = {}
         if sources is None:
             sources = discover(self.state)
         else:
             for source in sources:
                 self.state[source.NAME] = _new_state()
         self.sources = sources
+
+    def note_activity(self, now: float | None = None) -> None:
+        """Record one served request. The first one after an idle spell arms a wake."""
+        now = time.time() if now is None else now
+        with self._lock:
+            if self._idle_locked(now):
+                self._wake = True
+            self._activity_at = now
+
+    def stream_opened(self, now: float | None = None) -> None:
+        """An SSE stream opened: counts as activity and blocks idle mode while open."""
+        now = time.time() if now is None else now
+        with self._lock:
+            if self._idle_locked(now):
+                self._wake = True
+            self._activity_at = now
+            self._streams += 1
+
+    def stream_closed(self, now: float | None = None) -> None:
+        now = time.time() if now is None else now
+        with self._lock:
+            self._streams = max(0, self._streams - 1)
+            self._activity_at = now
+
+    def idle(self, now: float) -> bool:
+        """True when idle mode is on: no open stream and nothing served for ``idle_after_s``."""
+        with self._lock:
+            return self._idle_locked(now)
+
+    def _idle_locked(self, now: float) -> bool:
+        after = idle_after_s(self._cfg)
+        if after is None or self._streams > 0:
+            return False
+        return now - self._activity_at >= after
+
+    def _multiplier_locked(self, now: float) -> float:
+        return idle_factor(self._cfg) if self._idle_locked(now) else 1.0
+
+    def _running_locked(self) -> int:
+        return sum(1 for state in self.state.values() if _alive(state.get("thread")))
 
     def tick(self, store, cfg, now: float, force: bool = False, stop=None) -> None:
         budget = _budget(cfg)
@@ -105,31 +242,54 @@ class Registry:
         # inside the tick, and an overrun is flagged without blocking the
         # rest. Completion (and its timeout flag) is recorded by
         # ``_run_poll`` itself, so nothing is lost by moving on.
-        started: list = []
-        for source in self.sources:
-            if stop is not None and stop.is_set():
-                return
-            with self._lock:
+        #
+        # Due sources start oldest-poll first and never more than
+        # ``max_concurrent_polls`` threads at once (not for ``force``). A
+        # source still running is skipped, and one that finds no free slot
+        # stays due for the next tick.
+        with self._lock:
+            self._cfg = cfg or {}
+            if self._wake:
+                # Each source keeps its wake until it starts, so one that
+                # loses its slot to the cap is not left on its idle gap.
+                self._wake = False
+                for source in self.sources:
+                    self.state.setdefault(source.NAME, _new_state())["wake"] = True
+            mult = self._multiplier_locked(now)
+            candidates = []
+            for source in self.sources:
                 state = self.state.setdefault(source.NAME, _new_state())
-                thread = state.get("thread")
-                if thread is not None and thread.is_alive():
+                if _alive(state.get("thread")):
                     continue
                 state["thread"] = None
                 if state.get("skip"):
                     continue
-                if not force and not _due(source, state, now, cfg):
+                if not force and not state.get("wake") and not _due(source, state, now, cfg, mult):
                     continue
+                candidates.append(source)
+            candidates.sort(key=lambda source: self.state[source.NAME].get("last_poll") or 0.0)
+        cap = None if force else max_concurrent_polls(cfg)
+        started: list = []
+        for source in candidates:
+            if stop is not None and stop.is_set():
+                return
+            with self._lock:
+                if cap is not None and self._running_locked() >= cap:
+                    break
+                state = self.state.setdefault(source.NAME, _new_state())
                 if declares_signals(source):
                     state["sig"] = signal_token(source, cfg)
                     state["sig_at"] = now
                 worker = threading.Thread(
                     target=_run_poll,
-                    args=(self, source, store, cfg, now, budget),
+                    args=(self, source, store, cfg, now, budget, mult),
                     name=f"poll-{source.NAME}",
                     daemon=True,
                 )
                 state["thread"] = worker
                 state["poll_start"] = now
+                state["gap_s"] = effective_interval_s(source, cfg, mult)
+                state["wake"] = False
             worker.start()
             started.append((source, worker))
         if force:
@@ -217,6 +377,15 @@ class Registry:
             born,
             now,
         )
+        with self._lock:
+            cfg_seen = self._cfg
+            mult = self._multiplier_locked(now)
+            idle_now = self._idle_locked(now)
+            wake_pending = self._wake or any(
+                state.get("wake") for state in self.state.values()
+            )
+            running = self._running_locked()
+        cap = max_concurrent_polls(cfg_seen)
         for source, state in items:
             error = state.get("last_error")
             last = state.get("last_poll")
@@ -234,6 +403,9 @@ class Registry:
                     "lag_s": None if last is None else max(0.0, now - last),
                     "last_duration_s": state.get("last_duration_s"),
                     "interval_s": source.INTERVAL_S,
+                    "effective_interval_s": effective_interval_s(source, cfg_seen, mult),
+                    "next_due_in_s": _next_due_in(state, now),
+                    "idle": idle_now,
                     "stalled": stalled,
                     "state": name,
                     "started_at": born,
@@ -247,7 +419,16 @@ class Registry:
                     info = None
                 if isinstance(info, dict) and info:
                     extra_body.setdefault(source.NAME, {}).update(info)
-        body: dict = {"ok": ok, "sources": sources, "slow_sources": slow}
+        body: dict = {
+            "ok": ok,
+            "sources": sources,
+            "slow_sources": slow,
+            "idle_mode": idle_now,
+            "duty_factor": poll_duty_factor(cfg_seen),
+            "wake_pending": wake_pending,
+            "polls_running": running,
+            "max_concurrent_polls": cap,
+        }
         body.update(extra_body)
         if cfg is not None:
             try:
@@ -298,7 +479,7 @@ def _perf_poll(source, duration: float) -> None:
         pass
 
 
-def _run_poll(registry: Registry, source, store, cfg, now: float, budget: float) -> None:
+def _run_poll(registry: Registry, source, store, cfg, now: float, budget: float, mult: float = 1.0) -> None:
     """Poll one source and record the outcome. Always runs in a worker thread."""
     start = time.monotonic()
     counter = getattr(store, "write_count", None)
@@ -314,7 +495,7 @@ def _run_poll(registry: Registry, source, store, cfg, now: float, budget: float)
             state["last_poll"] = now
             state["last_error"] = _short(exc)
             state["last_duration_s"] = duration
-            _set_next_due(source, state, now, duration)
+            _set_next_due(source, state, now, duration, cfg, mult)
             if duration <= budget:
                 state["timed_out"] = False
         log.warning("source %s: %s", source.NAME, state["last_error"])
@@ -328,7 +509,7 @@ def _run_poll(registry: Registry, source, store, cfg, now: float, budget: float)
             state["last_ok"] = now
             state["last_error"] = _surfaced(source)
             state["last_duration_s"] = duration
-            _set_next_due(source, state, now, duration)
+            _set_next_due(source, state, now, duration, cfg, mult)
             state["timed_out"] = duration > budget
             if state["timed_out"]:
                 state["last_error"] = (
@@ -352,13 +533,15 @@ def declares_signals(source) -> bool:
     return getattr(source, "signal_paths", None) is not None
 
 
-def backoff_gap(source, idle: int) -> float:
+def backoff_gap(source, idle: int, interval=None) -> float:
     """Seconds between polls of a dormant source after ``idle`` empty polls.
 
     Starts at ``BACKOFF_AFTER`` polls: the gap is the interval, doubled per
-    further empty poll, capped at ``BACKOFF_MAX_S``.
+    further empty poll, capped at ``BACKOFF_MAX_S``. ``interval`` overrides
+    the source's own (the floored, idle-scaled value the runner passes in).
     """
-    interval = max(_interval_s(source), 1.0)
+    base = _interval_s(source) if interval is None else float(interval)
+    interval = max(base, 1.0)
     steps = max(0, int(idle) - BACKOFF_AFTER + 1)
     return min(BACKOFF_MAX_S, interval * (2 ** min(steps, 16)))
 
@@ -403,36 +586,42 @@ def signal_token(source, cfg):
     return tuple(token)
 
 
-def _set_next_due(source, state: dict, now: float, duration: float) -> None:
-    """Earliest next start for a source without signals: twice its own duration.
+def _set_next_due(source, state: dict, now: float, duration: float, cfg=None, mult: float = 1.0) -> None:
+    """Earliest next start for a source without signals: ``poll_duty_factor`` x its duration.
 
     A poll that outlasts its interval is due again the moment it returns, so
     a heavy source ran back to back and contended on the store lock. The
-    delay is measured from the poll start (``now``), so a source gets at
-    least its own duration of quiet between starts. Signal-backed sources
-    keep their signal and dormant-backoff cadence.
+    delay is measured from the poll start (``now``): the gap is at least
+    ``poll_duty_factor`` times the last duration, so the source scans for
+    about ``1 / factor`` of the wall time. The floor and the idle multiplier
+    scale the whole gap. Signal-backed sources keep their signal and
+    dormant-backoff cadence; they never read the duration.
     """
     if declares_signals(source):
         return
-    state["next_due"] = now + max(_interval_s(source), duration * 2.0)
+    factor = poll_duty_factor(cfg)
+    gap = max(effective_interval_s(source, cfg), duration * factor) * mult
+    state["next_due"] = now + gap
+    state["gap_s"] = gap
 
 
-def _due(source, state: dict, now: float, cfg) -> bool:
+def _due(source, state: dict, now: float, cfg, mult: float = 1.0) -> bool:
     """Whether a source's next poll is due (interval, or dormant backoff)."""
     last = state.get("last_poll")
     if last is None:
         return True
+    interval = effective_interval_s(source, cfg, mult)
     if not declares_signals(source):
         next_due = state.get("next_due")
         if next_due is not None:
             return now >= next_due
-        return now - last >= source.INTERVAL_S
+        return now - last >= interval
     if int(state.get("idle") or 0) < BACKOFF_AFTER:
-        return now - last >= source.INTERVAL_S
-    if fallback_enabled(source) and now - last >= backoff_gap(source, state["idle"]):
+        return now - last >= interval
+    if fallback_enabled(source) and now - last >= backoff_gap(source, state["idle"], interval):
         return True
     sig_at = state.get("sig_at")
-    if sig_at is not None and now - sig_at < source.INTERVAL_S:
+    if sig_at is not None and now - sig_at < interval:
         return False
     state["sig_at"] = now
     return signal_token(source, cfg) != state.get("sig")
@@ -544,10 +733,7 @@ def _poll_in_flight(state: dict, now: float, source) -> bool:
         return False
     if not alive:
         return False
-    try:
-        limit = STALL_FACTOR * float(getattr(source, "INTERVAL_S", 0) or 0)
-    except (TypeError, ValueError):
-        return True
+    limit = STALL_FACTOR * _stall_base(source, state)
     start = state.get("poll_start")
     if start is None:
         return True
@@ -594,7 +780,7 @@ def source_state(source, state: dict, now: float, born: float, *, startup: bool 
 
 
 def _is_stalled(source, state: dict, now: float, born: float) -> bool:
-    limit = STALL_FACTOR * float(getattr(source, "INTERVAL_S", 0) or 0)
+    limit = STALL_FACTOR * _stall_base(source, state)
     if declares_signals(source) and int(state.get("idle") or 0) >= BACKOFF_AFTER:
         if not fallback_enabled(source):
             # Silent by design until a signal moves: never a stall.
