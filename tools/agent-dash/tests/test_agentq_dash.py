@@ -522,10 +522,6 @@ class MissingRunsTableTest(unittest.TestCase):
                 thread.join(timeout=5)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class IncompleteMinuteTest(unittest.TestCase):
     """Only complete minutes feed the tiles and series; the current minute and unflushed minutes never read as zero."""
 
@@ -574,3 +570,217 @@ class IncompleteMinuteTest(unittest.TestCase):
     def test_deepseek_output_rate_averages_five_complete_minutes(self) -> None:
         # 11:59 = 7000, 11:58 = 500000, 11:57 = 5, 11:56 and 11:55 have no rows; the current minute is excluded.
         self.assertEqual(self.summary()["ds_output_5m_per_min"], (7000 + 500_000 + 5) / 5)
+
+
+CALIB_DDL = """
+CREATE TABLE proxy_calib (
+    minute TEXT PRIMARY KEY, req INT, prompt_est INT, max_tokens INT, billed INT,
+    first_429_s REAL, r429 INT
+)
+"""
+
+
+class BucketAndTotalsTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.home = make_home(Path(self.tmp.name))
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def raw_minutes(self, hours: int) -> list[dict]:
+        since = UNTIL - hours * 3600
+        return dash.minute_series(dash.read_minute_rows(self.home / "agentq.db", since, UNTIL), since, UNTIL)
+
+    def test_24h_uses_five_minute_buckets_that_keep_every_token(self) -> None:
+        summary = dash.build_summary(self.home, 24, now=NOW, fetch_live=proxy_status)
+        self.assertEqual(summary["bucket_s"], 300)
+        self.assertTrue(all(p["t"] % 300 == 0 for p in summary["minutes"]))
+        self.assertEqual(sum(p["total"] for p in summary["minutes"]), sum(p["total"] for p in self.raw_minutes(24)))
+        self.assertEqual(sum(p["r429"] for p in summary["minutes"]), sum(p["r429"] for p in self.raw_minutes(24)))
+
+    def test_7d_uses_thirty_minute_buckets_and_averages_percent_over_members(self) -> None:
+        summary = dash.build_summary(self.home, 168, now=NOW, fetch_live=proxy_status)
+        self.assertEqual(summary["bucket_s"], 1800)
+        self.assertTrue(all(p["t"] % 1800 == 0 for p in summary["minutes"]))
+        members = [p for p in self.raw_minutes(168) if p["t"] // 1800 * 1800 == UNTIL // 1800 * 1800 - 1800 * 2]
+        bucket = next(p for p in summary["minutes"] if p["t"] == UNTIL // 1800 * 1800 - 1800 * 2)
+        self.assertEqual(bucket["minutes"], len(members))
+        self.assertAlmostEqual(bucket["pct_ds_output"], sum(m["pct_ds_output"] for m in members) / len(members), places=3)
+        self.assertEqual(bucket["total"], sum(m["total"] for m in members))
+
+    def test_wait_p95_bucket_is_the_worst_minute(self) -> None:
+        points = [
+            {"t": 600, "wait_p95_ms": 900, **{k: 0 for k in dash.BUCKET_SUM_KEYS}, **{k: 0.0 for k in dash.PCT_KEYS}, "minute": "x"},
+            {"t": 660, "wait_p95_ms": 2500, **{k: 0 for k in dash.BUCKET_SUM_KEYS}, **{k: 0.0 for k in dash.PCT_KEYS}, "minute": "x"},
+            {"t": 720, "wait_p95_ms": None, **{k: 0 for k in dash.BUCKET_SUM_KEYS}, **{k: 0.0 for k in dash.PCT_KEYS}, "minute": "x"},
+        ]
+        bucket = dash.bucket_minutes(points, 300)
+        self.assertEqual(len(bucket), 1)
+        self.assertEqual(bucket[0]["wait_p95_ms"], 2500)
+
+    def test_worker_samples_average_per_bucket_and_skip_missing_queue_counts(self) -> None:
+        samples = [
+            {"ts": 600.0, "ds_workers": 2, "kimi_workers": 0, "queue_workers": 1, "direct_workers": 1, "queued_jobs": None},
+            {"ts": 660.0, "ds_workers": 4, "kimi_workers": 1, "queue_workers": 1, "direct_workers": 3, "queued_jobs": 6},
+        ]
+        rows = dash.bucket_workers(samples, 1800)
+        self.assertEqual(rows, [{"ts": 0.0, "ds_workers": 3.0, "kimi_workers": 0.5, "queue_workers": 1.0,
+                                 "direct_workers": 2.0, "queued_jobs": 6.0}])
+
+    def test_cumulative_token_mix_is_a_running_sum_over_the_range(self) -> None:
+        summary = dash.build_summary(self.home, 6, now=NOW, fetch_live=proxy_status)
+        mix = summary["token_mix"]
+        running = 0
+        for row in mix:
+            running += row["cache_read"] + row["uncached"] + row["output"]
+            self.assertEqual(row["cumulative"], running)
+        self.assertEqual(mix[-1]["cumulative"], sum(p["total"] for p in summary["minutes"]))
+
+    def test_range_totals_sum_the_range_and_count_runs_and_verdicts(self) -> None:
+        totals = dash.build_summary(self.home, 1, now=NOW, fetch_live=proxy_status)["range_totals"]
+        # Inside the last hour (current minute excluded): requests 1+1+1+1+1 and 429s 0+1+0+3+0.
+        self.assertEqual(totals["requests"], 5)
+        self.assertEqual(totals["r429"], 4)
+        self.assertEqual(totals["ds_output"], 7000 + 500000 + 5)
+        self.assertEqual(totals["finished"], {"PASS": 1, "PARTIAL": 0, "FAIL": 0})
+        self.assertEqual(totals["tokens"]["output"], 7000 + 100 + 500000 + 5)
+
+    def test_runs_started_counts_runs_whose_start_is_inside_the_range(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = make_runs_home(Path(tmp))
+            totals = dash.build_summary(home, 1, now=NOW, fetch_live=live_with_queue)["range_totals"]
+            self.assertEqual(totals["runs_started"], 4)
+
+    def test_admitted_total_is_used_where_calib_has_the_minute(self) -> None:
+        conn = sqlite3.connect(self.home / "agentq.db")
+        conn.execute(CALIB_DDL)
+        conn.execute("INSERT INTO proxy_calib (minute, billed) VALUES (?, ?)", (minute_at(60), 4_000_000))
+        conn.commit()
+        conn.close()
+        minutes = {p["minute"]: p for p in dash.build_summary(self.home, 1, now=NOW, fetch_live=proxy_status)["minutes"]}
+        admitted = minutes[minute_at(60)]
+        self.assertEqual(admitted["total_source"], "admitted")
+        self.assertEqual(admitted["pct_total"], dash.fraction(4_000_000, 10_000_000))
+        completed = minutes[minute_at(120)]
+        self.assertEqual(completed["total_source"], "completed")
+        self.assertEqual(completed["pct_total"], dash.fraction(500_000, 10_000_000))
+
+    def test_missing_calib_table_falls_back_to_completion_totals(self) -> None:
+        summary = dash.build_summary(self.home, 1, now=NOW, fetch_live=proxy_status)
+        self.assertIn("admitted", summary["errors"])
+        minute = next(p for p in summary["minutes"] if p["minute"] == minute_at(60))
+        self.assertEqual(minute["total_source"], "completed")
+        self.assertEqual(minute["pct_total"], dash.fraction(minute["total"], 10_000_000))
+
+
+LOG_LINES = """\
+2026-11-12T10:00:00Z agentq-proxy request job=aaaaaaaaaaaa model=m lane=urgent status=200
+continuation for the first row
+2026-11-12T10:00:01Z agentq-proxy request job=bbbbbbbbbbbb Authorization: Bearer sk-secret
+  Authorization header continuation that must go
+2026-11-12T10:00:02Z agentq-proxy retry job=cccccccccccc api-key=sk-hidden attempt=2
+2026-11-12T10:00:03Z agentq-proxy done ok=1 status=200
+"""
+
+
+class LogTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.home = Path(self.tmp.name) / "agentq"
+        (self.home / "logs").mkdir(parents=True)
+        (self.home / "logs" / "proxy.err.log").write_text(LOG_LINES, encoding="utf-8")
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def test_rows_are_newest_first_with_fields_and_continuations(self) -> None:
+        body = dash.read_log(self.home, "proxy")
+        self.assertEqual([r["event"] for r in body["rows"]], ["done", "request"])
+        newest, first = body["rows"]
+        self.assertEqual(newest["time"], "2026-11-12T10:00:03Z")
+        self.assertEqual(newest["fields"], [{"k": "ok", "v": "1"}, {"k": "status", "v": "200"}])
+        self.assertEqual(first["fields"][0], {"k": "job", "v": "aaaaaaaaaaaa"})
+        self.assertEqual(first["continuation"], ["continuation for the first row"])
+
+    def test_secret_lines_and_their_continuations_are_dropped(self) -> None:
+        body = dash.read_log(self.home, "proxy")
+        dumped = json.dumps(body)
+        self.assertNotIn("Authorization", dumped)
+        self.assertNotIn("api-key", dumped)
+        self.assertNotIn("sk-secret", dumped)
+        self.assertNotIn("must go", dumped)
+        self.assertEqual(body["redacted_lines"], 3)
+        self.assertEqual(body["total"], 2)
+
+    def test_pages_hold_one_hundred_lines_newest_first(self) -> None:
+        lines = "".join(f"2026-11-12T10:{i // 60:02d}:{i % 60:02d}Z agentq-proxy tick n={i}\n" for i in range(250))
+        (self.home / "logs" / "proxy.err.log").write_text(lines, encoding="utf-8")
+        first = dash.read_log(self.home, "proxy", 1)
+        self.assertEqual((first["pages"], first["total"], len(first["rows"])), (3, 250, 100))
+        self.assertEqual(first["rows"][0]["fields"][0]["v"], "249")
+        last = dash.read_log(self.home, "proxy", 3)
+        self.assertEqual(len(last["rows"]), 50)
+        self.assertEqual(last["rows"][-1]["fields"][0]["v"], "0")
+        clamped = dash.read_log(self.home, "proxy", 99)
+        self.assertEqual(clamped["page"], 3)
+
+    def test_filter_text_applies_before_paging(self) -> None:
+        body = dash.read_log(self.home, "proxy", 1, "AAAAAAAAAAAA")
+        self.assertEqual(body["total"], 1)
+        self.assertEqual(body["rows"][0]["event"], "request")
+        self.assertEqual(dash.read_log(self.home, "proxy", 1, "cccccccccccc")["total"], 0)
+        self.assertEqual(dash.read_log(self.home, "proxy", 1, "zzz-no-match")["rows"], [])
+
+    def test_only_fixed_source_names_are_accepted(self) -> None:
+        with self.assertRaises(ValueError):
+            dash.read_log(self.home, "../../etc/passwd")
+        server = dash.make_server(self.home, 0, fetch_live=no_proxy)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            port = server.server_address[1]
+            for path in ("/api/log?source=../x", "/api/log?source=proxy&page=abc", "/api/summary?hours=3"):
+                conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+                conn.request("GET", path)
+                self.assertEqual(conn.getresponse().status, 400, path)
+                conn.close()
+            conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+            conn.request("GET", "/api/summary?hours=168")
+            response = conn.getresponse()
+            self.assertEqual(response.status, 200)
+            self.assertEqual(json.loads(response.read())["bucket_s"], 1800)
+            conn.close()
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+    def test_a_log_that_links_outside_the_logs_folder_is_refused(self) -> None:
+        outside = Path(self.tmp.name) / "outside.log"
+        outside.write_text("2026-11-12T10:00:00Z leak x=1\n", encoding="utf-8")
+        link = self.home / "logs" / "broker.log"
+        link.symlink_to(outside)
+        body = dash.read_log(self.home, "broker")
+        self.assertEqual(body["rows"], [])
+        self.assertIn("outside", body["error"])
+
+    def test_missing_file_is_an_empty_page_with_an_error(self) -> None:
+        body = dash.read_log(self.home, "broker")
+        self.assertEqual(body["rows"], [])
+        self.assertEqual(body["error"], "log file not found")
+
+    def test_tail_read_is_capped_and_drops_the_partial_first_line(self) -> None:
+        path = self.home / "logs" / "proxy.err.log"
+        path.write_text("".join(f"2026-11-12T10:00:{i:02d}Z agentq-proxy tick n={i}\n" for i in range(60)), encoding="utf-8")
+        data, truncated = dash.read_log_tail(path, max_bytes=200)
+        self.assertTrue(truncated)
+        self.assertLessEqual(len(data), 200)
+        self.assertTrue(data.startswith(b"2026-11-12T10:00:"))
+        full, truncated_full = dash.read_log_tail(path)
+        self.assertFalse(truncated_full)
+        self.assertEqual(full.count(b"\n"), 60)
+
+
+if __name__ == "__main__":
+    unittest.main()
