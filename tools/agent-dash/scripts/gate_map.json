@@ -310,10 +310,18 @@
     ],
     "dash/vlogs.py": [
       "test_vlogs",
-      "test_logarchive"
+      "test_logarchive",
+      "test_sessionarchive"
+    ],
+    "dash/sessionarchive.py": [
+      "test_sessionarchive"
+    ],
+    "scripts/session_archive_install.sh": [
+      "test_sessionarchive"
     ],
     "scripts/vlogs_install.sh": [
-      "test_vlogs"
+      "test_vlogs",
+      "test_sessionarchive"
     ],
     "scripts/log_keep_eval.py": [
       "test_logarchive"

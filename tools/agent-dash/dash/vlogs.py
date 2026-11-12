@@ -70,12 +70,23 @@ def redact(text: str) -> tuple[str, int]:
     return text, count
 
 
-def make_row(*, time_iso: str, msg: str, ws: str, label: str, type_: str, kind: str, path: str) -> tuple[bytes, bool, int]:
+def make_row(
+    *,
+    time_iso: str,
+    msg: str,
+    ws: str,
+    label: str,
+    type_: str,
+    kind: str,
+    path: str,
+    extra: dict | None = None,
+) -> tuple[bytes, bool, int]:
     """One JSON-line row. Returns ``(line, truncated, redactions)``.
 
     ``msg`` is redacted, then truncated to ``MAX_MSG_BYTES`` (UTF-8). A
     truncated row is still valid JSON because truncation happens on a
-    character boundary.
+    character boundary. ``extra`` adds string fields to the row object;
+    empty values are omitted so a row never carries a blank field.
     """
     clean, redactions = redact(msg)
     truncated = False
@@ -93,6 +104,13 @@ def make_row(*, time_iso: str, msg: str, ws: str, label: str, type_: str, kind: 
         "kind": kind,
         "path": path,
     }
+    if truncated:
+        row["truncated"] = "1"
+    if extra:
+        for key, value in extra.items():
+            if value is None or value == "":
+                continue
+            row[key] = value
     return json.dumps(row, ensure_ascii=True, separators=(",", ":")).encode("ascii") + b"\n", truncated, redactions
 
 

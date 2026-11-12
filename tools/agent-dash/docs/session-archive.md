@@ -1,0 +1,325 @@
+# Native agent-session archive
+
+`agent_dash.py logs sessions` keeps the native session history of every
+coding agent on the laptop in two places: a **lossless** `tar.zst` copy
+under a destination folder, and searchable transcript rows in the loopback
+VictoriaLogs store. After a longer idle window it deletes the original once
+the archive has been re-verified, and any unit can be restored
+byte-for-byte.
+
+This is the companion to [log archive](log-archive.md). That one handles
+agent-dash's own run streams and strips base64 images; this one handles the
+agents' private session stores and strips nothing. The two share the
+manifest/lock conventions, the `lsof` liveness probe and the zstd helpers
+from `dash/logarchive.py`, but not the base64 filter.
+
+## Pieces
+
+| Piece | Where | What |
+|---|---|---|
+| Archive pass | `dash/sessionarchive.py` | Unit discovery, `tar.zst` packing, ingestion, reclaim, restore, census. |
+| CLI | `agent_dash.py logs sessions` | `--apply`, `--no-reclaim`, `--scheduled`, `--tool`, `--limit`, `--max-minutes`, `--url`, `--dest`; plus `restore` and `status`. |
+| Store client | `dash/vlogs.py` | `make_row(..., extra=...)` adds the native fields; redaction and truncation apply as before. |
+| Store service | `scripts/vlogs_install.sh` | `VLOGS_DATA` and `VLOGS_MAX_DISK` feed `-storageDataPath` and `-retention.maxDiskSpaceUsageBytes`; `VLOGS_MAX_DISK=none` (or empty) omits the cap. |
+| Schedule | `scripts/session_archive_install.sh` | launchd agent `com.agent-dash.session-archive`, hourly, `ProcessType=Background`, `Nice=10`, under `taskpolicy -b` and `memcap.sh 4096`. |
+
+## Config
+
+`log_archive.sessions` in the agent-dash local config (`<state>/config.local.json`,
+git-ignored), the same file `logarchive` reads `log_archive.roots` from:
+
+```json
+{"log_archive": {"sessions": {
+  "dest": "~/Documents/data/agent-sessions",
+  "min_idle_hours": 6,
+  "reclaim_days": 14,
+  "reclaim_days_by_tool": {},
+  "max_minutes": 90,
+  "tools": null
+}}}
+```
+
+All keys are optional; the values above are the defaults. `tools: null`
+means every registered tool; a list narrows it (`["pi", "claude"]`).
+`SESSION_ARCHIVE_DEST` overrides `dest`, and `--dest` overrides both (used
+by tests and by a read-only census that must not create the real folder).
+
+## Retention policy
+
+Nothing this job writes is ever deleted for age or space:
+
+- **Archives are kept forever.** `<dest>/archive/**/*.tar.zst` is never
+  pruned by the pass, by `--scheduled`, or by the installer.
+- **Store rows are kept forever.** The VictoriaLogs store runs with
+  `-retentionPeriod=100y`. On this laptop it is installed with
+  `VLOGS_MAX_DISK=none`, which omits
+  `-retention.maxDiskSpaceUsageBytes` entirely, so the store never evicts
+  rows to stay under a disk cap. Other installs keep the 20GiB default.
+- **Only original session files are reclaimed**, and only after
+  `reclaim_days` of idleness and a full re-verify (see step 7 below).
+  `--no-reclaim` disables even that.
+
+## Layout
+
+```
+<dest>/                          mode 0700, holds .metadata_never_index
+  archive/<tool>/<unit>.<seq>.tar.zst
+  state/manifest.jsonl           append-only; last record per unit wins
+  state/archive.lock
+  state/trash/<uid-safe>/<rel>   only during a reclaim (see the journal)
+  state/last_success.json
+  state/disk_warning.json        only while a scheduled run saw < 30 GB free
+```
+
+The unit path is the unit's path relative to the tool root, so a Claude
+Code session archives to
+`archive/claude/<proj>/<uuid>.0.tar.zst` and a Codex rollout to
+`archive/codex/sessions/2026/11/03/rollout-....jsonl.0.tar.zst`. The tar
+holds members relative to the unit's **parent** dir, so extract restores the
+same names.
+
+### Archive versioning
+
+A pack **never replaces** an existing archive file. The sequence starts at
+`0` and the next free number is used, so a later partial or changed pack
+can never destroy an earlier complete archive. The manifest record lists
+every archive for the unit under `archives` (`seq`, `path`, `bytes`,
+`members`); the newest verified one is current (`archive`, `archive_bytes`,
+`members`). Old versions are kept forever, like every other archive.
+
+`.metadata_never_index` stops Spotlight from indexing the archive.
+
+## Units per tool
+
+| tool | root | unit | rows from |
+|---|---|---|---|
+| claude | `~/.claude/projects` | `<proj>/<uuid>.jsonl` plus sibling dir `<proj>/<uuid>/` (`subagents/`, `tool-results/`) | the `.jsonl` and `<uuid>/subagents/*.jsonl` |
+| codex | `~/.codex` | exactly `sessions/YYYY/MM/DD/rollout-*.jsonl`, the same with `.zst`, and `archived_sessions/rollout-*.jsonl.zst` (no recursion under `archived_sessions`) | that file (`.zst` decompressed while reading; line counts come from the decompressed stream) |
+| grok | `~/.grok/sessions` | each dir `<enc-cwd>/<id>/` | `*.jsonl` lines; `*.log` lines as text rows `type=log` |
+| cursor | `~/.cursor` | each dir `chats/<ws>/<id>/` and each dir `projects/<proj>/` | chats: `store.db` via `sqlite3` read-only after copying db+wal+shm to a temp dir; projects: `*.jsonl` and `*.log` lines |
+| commandcode | `~/.commandcode/projects` | files grouped by session stem `<proj>/<uuid>.*` | `*.jsonl` |
+| pi | `~/.pi/agent/sessions` | each `<proj>/<file>.jsonl` | that file |
+| muse | `~/.local/share/muse/sessions` | each dir `YYYY/MM/DD/<id>/` | `session.jsonl` only |
+
+A root that does not exist is reported `absent` and skipped.
+
+### Never touched
+
+- muse `.msp-view-*`, `session-index.db`, `local-tracing`
+- `~/.grok/worktrees`, `~/.grok/sessions/session_search.sqlite`
+- `~/.codex/*.sqlite`
+- `~/.claude/projects/*/<uuid>/memory/`
+- any file in a tool root that is not part of a unit above
+- symlinks (never followed, never packed)
+
+### Live append-only histories (ingest only)
+
+These are ingested but never packed or reclaimed:
+`~/.claude/history.jsonl`, `~/.codex/history.jsonl`,
+`~/.commandcode/history.jsonl`, `~/.grok/sessions/*/prompt_history.jsonl`.
+Each keeps a stored byte offset and the sha256 of its first `min(size,
+4096)` bytes; a shrink or a prefix-hash change restarts from offset 0 with
+`rev+1`.
+
+## Row shape
+
+Each row is built with `vlogs.make_row(..., extra=...)`, so redaction and
+the 1.8 MiB text cap apply. Per row:
+
+| field | value |
+|---|---|
+| `_time` | the line's own time field, else the file mtime |
+| `_msg` | the original line, lossless (text; for cursor, the decoded JSON) |
+| `ws` | `native/<tool>` |
+| `label` | the session id |
+| `kind` | `native` |
+| `type` | the line's type (`role`/`type`/`method`/`record_type`); `raw` if unparseable |
+| `tool`, `session`, `project`, `model`, `subtype` | extracted per tool; empty fields omitted |
+| `unit` | `<tool>/<unit path>` (relative to the tool root) |
+| `member` | the file inside the unit |
+| `rev` | starts `"0"`, bumped when a member is rewritten |
+| `line` | 1-based line number within the member (for live histories, the line number in the file for that rev) |
+| `truncated` | `"1"` only when a line exceeded the text cap (see below) |
+
+### Ingest is at-least-once
+
+Every row carries `unit`, `member`, `rev` and `line`. Verification is
+`count_uniq(member, line)` over `unit:=<uid> rev:=<rev>` equals the expected
+line count, so a resend after a crash stores duplicate rows that are
+harmless and invisible to verification. On restart after a crash, a
+transient mismatch or an `error` record, the pass does not compare raw
+counts to the manifest: it resends from the last line the manifest
+confirmed (or from line 1 of that rev) and verifies with `count_uniq`.
+Error records keep the previous confirmed members and totals, so the next
+run resumes. A rewrite bumps `rev`; verification and append planning use
+only the current rev, so rows kept from an older rev never block growth.
+
+Dedupe for analytics:
+
+```logsql
+unit:="<uid>" | uniq by (unit, member, rev, line)
+```
+
+A line longer than 64 MiB without a newline is emitted once with the first
+`MAX_MSG_BYTES` bytes and `truncated=1`; the rest is discarded while
+streaming, so RSS stays bounded.
+
+Streams are keyed by `ws,label`, so each session is its own stream.
+
+## The pass, per unit (`--apply`)
+
+1. **eligible** when the newest member mtime is at least `min_idle_hours`
+   old and no member has an open handle (`logarchive.open_paths`). A unit
+   never becomes eligible while open.
+2. **skip** when the manifest already has a `reclaimed` record whose
+   fingerprint (sorted `(rel, size, mtime_ns)` per member) matches, or an
+   `archived` record with a matching fingerprint and reclaim is not due.
+3. **pack**: stream a PAX tar of the members into `zstd -12 --long=27 -T2`,
+   hashing each member while reading (bounded RSS, 500 MB members
+   included).
+4. **verify**: stream the copy back through `tarfile` and compare every
+   member's sha256 and size; then atomic rename to the final path.
+5. **ingest**: if `count_uniq(member, line)` for the current rev already
+   equals the expected count, send nothing. Otherwise send from the last
+   confirmed line when a member's old bytes are a prefix of the new file
+   (append growth); if the old bytes are not a prefix (rewrite), bump `rev`
+   and resend every member. Then `flush()` and verify with `count_uniq`.
+   Any mismatch is `status: error` naming the unit, keeping the previous
+   confirmed members; the pass continues.
+6. **record** `archived` with each member's `rel`, `size`, `mtime_ns`,
+   `sha256`, `lines`, `rev`, the archive path and byte counts, and the
+   `archives` list.
+7. **reclaim** (unless `--no-reclaim`) is a journaled two-phase move, never
+   a straight unlink. Preconditions, all of them, else keep and record why:
+   status `archived`; fingerprint unchanged; idle at least `reclaim_days`
+   (per-tool override applies); no open handle; the store is reachable and
+   the unit's ingest verified; the current archive exists, its size equals
+   the recorded `archive_bytes`, and `verify_archive` passes against the
+   recorded members; the delete guard passes (every path inside the tool
+   root, none under the archive dest); and the member and trash dir are on
+   the same device. Then:
+   1. write manifest status `reclaiming` (with the archive seq and member
+      list) **before** touching files;
+   2. `os.rename` each member into `state/trash/<uid-safe>/<rel>`;
+   3. re-hash every file now in trash against the manifest sha256 — any
+      mismatch moves every trashed file back (refusing to overwrite a path
+      that now exists, leaving it in trash and recording `error` with both
+      paths) and records `archived`;
+   4. all match: delete that unit's trash dir, then remove now-empty parent
+      dirs of the members only (bottom-up, stopping at the unit dir / tool
+      root, never walking siblings, never touching excluded subtrees such
+      as Claude `memory/`), and record `reclaimed`.
+
+   Recovery runs at the start of every `--apply`: for any unit whose latest
+   status is `reclaiming`, or any leftover `state/trash/*`, if the trash
+   hashes match the manifest and the archive verifies, step 4 is finished;
+   otherwise the files are moved back. A unit in `reclaiming` is never
+   re-packed. The trash dir is the only place under dest the code deletes
+   from; the dest/root guard still covers every other path.
+
+Exit codes: `0` ok, `1` failures or an empty dry run on real input, `2` bad
+options, `3` another run holds the lock, `5` store unreachable (only for
+`--apply`; the dry run works without the store).
+
+## Modes
+
+`logs sessions` (default) is a **read-only census**: per tool it prints
+units, raw bytes, eligible to archive, already archived, eligible to
+reclaim (and bytes), absent roots, and the out-of-scope sizes (muse views,
+grok worktrees). It measures a projected archive size by compressing the
+first 3 eligible units per tool into a temp dir, then deletes it. A dry run
+that plans zero actions on real, non-archived input exits 1.
+
+`--scheduled` exits `0` immediately with a reason when any of these hold:
+`last_success.json` is under 20 h old, `memory_pressure` reports under 30 %
+free, or `pmset -g batt` says `Battery Power`. When the dest volume has
+less than 30 GB free it prints a `WARNING` line and records
+`state/disk_warning.json` (shown by `status`), but still runs: archiving
+frees space. `last_success.json` is
+written only when a run finished with no error and did not stop on the time
+budget (a budget stop leaves it unset so the next hourly tick continues the
+backlog).
+
+## LogsQL examples
+
+```logsql
+# every row of one session
+label:="<session-id>"
+
+# pi tool errors in the last day
+ws:="native/pi" type:="error" _time:1d
+
+# rows per tool and type over a week
+_time:7d | stats by (tool, type) count() rows
+
+# one unit's rows
+unit:="claude/-Users-me-projects/1234-uuid" | stats count() n
+
+# model usage by tool
+model:* | stats by (tool, model) count() rows
+
+# raw lines that did not parse
+type:="raw" | stats by (tool) count() rows
+```
+
+## Restore
+
+```sh
+# by session id, unit path, or archive path
+python3 ~/.claude/tools/agent-dash/agent_dash.py logs sessions restore <session-id>
+python3 ~/.claude/tools/agent-dash/agent_dash.py logs sessions restore \
+  pi/--Users-me-proj--/2026-11-03T18-25-46-002Z_01a1a2a8.jsonl
+python3 ~/.claude/tools/agent-dash/agent_dash.py logs sessions restore \
+  ~/Documents/data/agent-sessions/archive/pi/....tar.zst --to /tmp/restore
+```
+
+It extracts to a temporary dir under the target's parent, accepts only
+regular-file entries whose names are relative, contain no `..`, and are
+listed in the manifest (symlinks, hardlinks and devices are rejected),
+verifies every manifest member is present with matching sha256 and size,
+then refuses (exit 2) if any final path already exists, and only then
+renames into place. Any failure leaves the target untouched. The record
+becomes `restored`; the next pass sees a matching fingerprint and does
+nothing.
+
+Read an archive by hand:
+
+```sh
+zstd -dc <dest>/archive/<tool>/<unit>.tar.zst | tar -tvf -
+```
+
+## Operate
+
+```sh
+# install / update the hourly agent (idempotent)
+sh tools/agent-dash/scripts/session_archive_install.sh
+
+# census only (reads, writes nothing)
+python3 ~/.claude/tools/agent-dash/agent_dash.py logs sessions
+
+# one tool, 20 units, a 10-minute budget
+python3 ~/.claude/tools/agent-dash/agent_dash.py logs sessions --apply \
+  --tool pi --limit 20 --max-minutes 10
+
+# archive without deleting originals
+python3 ~/.claude/tools/agent-dash/agent_dash.py logs sessions --apply --no-reclaim
+
+# status: per-tool counts (archived, reclaimed, restored, reclaiming, error),
+# archive bytes, reclaimed bytes, trash size, last success and last errors
+python3 ~/.claude/tools/agent-dash/agent_dash.py logs sessions status
+
+# uninstall the schedule (keeps archives and state)
+sh tools/agent-dash/scripts/session_archive_install.sh --uninstall
+```
+
+## Out of scope
+
+- No network: the store is loopback only; the archive folder is local.
+- No encryption, no compression of the store's row text beyond redaction
+  and truncation.
+- Not touched by this job: muse `.msp-view-*`/`session-index.db`/
+  `local-tracing`, grok `worktrees` and `session_search.sqlite`, codex
+  `*.sqlite`, Claude Code `memory/` dirs, symlinks, and any file in a tool
+  root that is not part of a unit.
+- No dashboard page. The rows are searchable with LogsQL; the archive is a
+  directory tree.

@@ -14,7 +14,9 @@ when ``VLOGS_LIVE_TEST=1`` is set (read-only check against 127.0.0.1:19428).
 import http.server
 import json
 import os
+import subprocess
 import sys
+import tempfile
 import threading
 import unittest
 from pathlib import Path
@@ -24,6 +26,8 @@ from urllib.parse import parse_qs, urlsplit
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+
+SCRIPTS = ROOT / "scripts"
 
 from dash import vlogs  # noqa: E402
 
@@ -87,6 +91,23 @@ class MakeRowTest(unittest.TestCase):
         self.assertFalse(truncated)
         self.assertEqual(red, 1)
 
+    def test_extra_fields_are_added_and_empty_ones_omitted(self):
+        line, _truncated, _red = vlogs.make_row(
+            time_iso="2026-11-01T00:00:00.000Z",
+            msg="x",
+            ws="native/pi",
+            label="s1",
+            type_="message",
+            kind="native",
+            path="pi/proj/a.jsonl",
+            extra={"tool": "pi", "session": "s1", "project": "", "model": None, "rev": "0"},
+        )
+        row = json.loads(line)
+        self.assertEqual(row["tool"], "pi")
+        self.assertEqual(row["rev"], "0")
+        self.assertNotIn("project", row)
+        self.assertNotIn("model", row)
+
     def test_oversize_row_is_truncated_counted_and_still_valid(self):
         big = "é" * (vlogs.MAX_MSG_BYTES // 2 + 1000)  # multi-byte, so the cut must land on a character
         line, truncated, _ = vlogs.make_row(
@@ -96,6 +117,7 @@ class MakeRowTest(unittest.TestCase):
         row = json.loads(line)
         self.assertLessEqual(len(row["_msg"].encode("utf-8")), vlogs.MAX_MSG_BYTES)
         self.assertTrue(row["_msg"].startswith("é"))
+        self.assertEqual(row["truncated"], "1")
 
 
 class _Fake(http.server.BaseHTTPRequestHandler):
@@ -189,6 +211,77 @@ class ClientTest(unittest.TestCase):
         self.assertEqual(client.count("nope"), 0)
         with self.assertRaises(vlogs.VLogsError):
             client.count('bad"path')
+
+
+class VlogsInstallerTest(unittest.TestCase):
+    """The plist's retention cap and data path across installs."""
+
+    def _install(self, tmp, max_disk=None, data=None, unset=()):
+        home = Path(tmp) / "vlogs"
+        plist_dir = Path(tmp) / "LaunchAgents"
+        (home / "bin").mkdir(parents=True, exist_ok=True)
+        binary = home / "bin" / "victoria-logs-prod"
+        binary.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        binary.chmod(0o755)
+        (home / "VERSION").write_text("v1.53.0\n", encoding="utf-8")
+        env = dict(
+            os.environ,
+            VLOGS_HOME=str(home),
+            VLOGS_DATA=str(home / "data") if data is None else data,
+            VLOGS_PLIST_DIR=str(plist_dir),
+            VLOGS_NO_LOAD="1",
+        )
+        if max_disk is not None:
+            env["VLOGS_MAX_DISK"] = max_disk
+        for key in unset:
+            env.pop(key, None)
+        res = subprocess.run(
+            ["sh", str(SCRIPTS / "vlogs_install.sh")], env=env, capture_output=True, text=True
+        )
+        self.assertEqual(res.returncode, 0, res.stderr)
+        plist = plist_dir / "com.agent-dash.vlogs.plist"
+        lint = subprocess.run(["plutil", "-lint", str(plist)], capture_output=True, text=True)
+        self.assertEqual(lint.returncode, 0, lint.stdout + lint.stderr)
+        return plist.read_text(encoding="utf-8")
+
+    def test_max_disk_none_and_empty_omit_the_flag(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for value in ("none", ""):
+                text = self._install(tmp, value)
+                self.assertNotIn("maxDiskSpaceUsageBytes", text)
+                self.assertIn("-retentionPeriod=100y", text)
+
+    def test_max_disk_value_keeps_the_flag(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            text = self._install(tmp, "30GiB")
+            self.assertIn("<string>-retention.maxDiskSpaceUsageBytes=30GiB</string>", text)
+
+    def test_default_is_20gib(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            text = self._install(tmp, unset=("VLOGS_MAX_DISK",))
+            self.assertIn("<string>-retention.maxDiskSpaceUsageBytes=20GiB</string>", text)
+
+    def test_update_keeps_installed_data_path_and_cap(self):
+        """An update with both vars unset must not move or uncap the store."""
+        with tempfile.TemporaryDirectory() as tmp:
+            custom = str(Path(tmp) / "elsewhere" / "data")
+            self._install(tmp, max_disk="30GiB", data=custom)
+            text = self._install(tmp, unset=("VLOGS_DATA", "VLOGS_MAX_DISK"))
+            self.assertIn("<string>-storageDataPath=%s</string>" % custom, text)
+            self.assertIn("<string>-retention.maxDiskSpaceUsageBytes=30GiB</string>", text)
+            self.assertTrue(Path(custom).is_dir(), "the preserved data dir must still be used")
+
+    def test_update_keeps_an_omitted_cap_omitted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._install(tmp, max_disk="")
+            text = self._install(tmp, unset=("VLOGS_DATA", "VLOGS_MAX_DISK"))
+            self.assertNotIn("maxDiskSpaceUsageBytes", text)
+
+    def test_fresh_install_with_no_plist_uses_defaults(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            text = self._install(tmp, unset=("VLOGS_DATA", "VLOGS_MAX_DISK"))
+            self.assertIn("<string>-storageDataPath=%s/data</string>" % (Path(tmp) / "vlogs"), text)
+            self.assertIn("<string>-retention.maxDiskSpaceUsageBytes=20GiB</string>", text)
 
 
 @unittest.skipUnless(os.environ.get("VLOGS_LIVE_TEST") == "1", "set VLOGS_LIVE_TEST=1 to query a running store")
