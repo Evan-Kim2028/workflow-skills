@@ -11,9 +11,14 @@ why it waits in ``jobs.detail``. Each tick ends by writing ``broker.heartbeat``
 so direct launches can tell the broker is alive.
 
 Workers start through ``scripts/run_worker.py`` with max-wait ``0``, which
-returns at once. The worker runs in its own session, so a broker restart does
-not stop it, and the broker finds it again by pid and identity (start time, or
-the label or run folder in its command line).
+returns at once. The broker runs those launches on a small pool (at most
+``MAX_CONCURRENT_LAUNCHES``), so one slow start never holds up a tick, a
+heartbeat or another job's launch; the pool thread only starts the worker,
+and every database write happens on the broker thread.
+
+The worker runs in its own session, so a broker restart does not stop it, and
+the broker finds it again by pid and identity (start time, or the label or run
+folder in its command line).
 
 A pi run writes its report, QUOTA marker, pi session file and err log under
 ``<run_dir>/pi/`` (``launch_pi.py`` gets that outdir from ``run_worker.py``).
@@ -36,6 +41,7 @@ third try; it never falls back to writing in place.
 
 from __future__ import annotations
 
+import concurrent.futures
 import fcntl
 import json
 import os
@@ -77,6 +83,8 @@ DEFAULT_AUTO_WORKTREE = {"enabled": True, "root": "~/Documents/worktrees"}
 AUTO_WORKTREE_RETRY_S = 60.0
 AUTO_WORKTREE_MAX_TRIES = 3
 GIT_TIMEOUT_S = 60.0
+LAUNCH_TIMEOUT_S = 120.0
+MAX_CONCURRENT_LAUNCHES = 8
 LAPTOP_GATED = ("tests", "light")
 MEMORY_FREE_LINE = re.compile(r"System-wide memory free percentage:\s*(\d+(?:\.\d+)?)%")
 VERDICT_LINE = re.compile(r"^\W*(?:verdict\W*)?(PASS|PARTIAL|BLOCKED)\b", re.IGNORECASE)
@@ -460,18 +468,19 @@ def _read_pid(path) -> int | None:
 def run_worker_launcher(job: dict, run_dir, env: dict) -> int:
     """Start one worker through ``run_worker.py`` (max-wait 0) and return its pid.
 
-    A launcher that times out still counts if it left a pid file: the worker
-    is adopted rather than launched again.
+    The broker has already checked tier and caps, so the launcher skips the
+    dashboard preflight (``--no-preflight``). A launcher that times out still
+    counts if it left a pid file: the worker is adopted rather than launched again.
     """
     run_dir = Path(run_dir)
     run_dir.mkdir(parents=True, exist_ok=True)
     cmd = [
         sys.executable, str(RUN_WORKER), job["tier"], job["label"],
-        job["workspace"], job["prompt_path"], str(run_dir), "0",
+        job["workspace"], job["prompt_path"], str(run_dir), "0", "--no-preflight",
     ]  # fmt: skip
     try:
         proc = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=300, env=env,
+            cmd, capture_output=True, text=True, timeout=LAUNCH_TIMEOUT_S, env=env,
             stdin=subprocess.DEVNULL, start_new_session=True, check=False,
         )  # fmt: skip
     except subprocess.TimeoutExpired:
@@ -688,12 +697,15 @@ def worktree_prompt(run_dir, job: dict) -> Path:
 class Broker:
     """One broker over one agentq home. ``launcher``, ``now`` and ``proxy`` are injectable."""
 
-    def __init__(self, home, *, launcher=None, now=time.time, proxy=None, gauges=None):
+    def __init__(self, home, *, launcher=None, now=time.time, proxy=None, gauges=None, launch_pool=None):
         self.home = Path(home)
         self.launcher = launcher or run_worker_launcher
         self.now = now
         self.proxy = proxy or proxy_status
         self.gauges = gauges or Gauges(clock=now)
+        self.launch_pool = launch_pool or concurrent.futures.ThreadPoolExecutor(
+            max_workers=MAX_CONCURRENT_LAUNCHES, thread_name_prefix="agentq-launch")
+        self._inflight: dict[str, concurrent.futures.Future] = {}
         self._saturated_last = False
         self._holds: dict[str, tuple[tuple[str, str], float]] = {}
         self._plans: dict[str, tuple[Path, Path] | None] = {}
@@ -706,6 +718,7 @@ class Broker:
         conn = db.connect(self.home)
         try:
             now = self.now()
+            self._collect_launches(conn, now)
             self.reconcile(conn, now)
             launched = self.launch_ready(conn, now, status=self._proxy_status())
         finally:
@@ -727,8 +740,14 @@ class Broker:
             handle.close()
 
     def reconcile(self, conn, now: float) -> None:
-        """Adopt, finish, requeue or watch every running job. Runs first each tick."""
+        """Adopt, finish, requeue or watch every running job. Runs first each tick.
+
+        A job whose launch is still in the pool is running with no pid yet; it is
+        skipped here, so its worker is not mistaken for a dead one.
+        """
         for job in db.select_jobs(conn, "state = 'running'"):
+            if job["id"] in self._inflight:
+                continue
             self._reconcile_one(conn, job, now)
 
     def launch_ready(self, conn, now: float, status: dict | None = None) -> list[str]:
@@ -766,6 +785,8 @@ class Broker:
         holds: dict[str, tuple[str, tuple[str, str]]] = {}
         launched: list[str] = []
         for job in order_queue(ready, now):
+            if len(self._inflight) >= MAX_CONCURRENT_LAUNCHES:
+                break
             name, reason = job["res"], None
             if on:
                 reason = morph_hold(job["tier"], job["lane"], status, adaptive["max_waiting_requests"])
@@ -808,6 +829,7 @@ class Broker:
             if self._launch(conn, job, now):
                 launched.append(job["id"])
             self._holds.pop(job["id"], None)
+        self._collect_launches(conn, now)
         self._record_holds(conn, now, ready, holds)
         return launched
 
@@ -1023,8 +1045,49 @@ class Broker:
             capacity_refusals=streak, not_before=now + CAPACITY_RETRY_S,
         )  # fmt: skip
 
+    def _collect_launches(self, conn, now: float) -> None:
+        """Record the outcome of every finished launch. Runs on the broker thread only.
+
+        A launch that was cancelled while in the pool still ends here: its worker is
+        stopped, because the ``started`` write no longer matches a running job.
+        """
+        for job_id, future in list(self._inflight.items()):
+            if not future.done():
+                continue
+            del self._inflight[job_id]
+            job = db.get_job(conn, job_id)
+            try:
+                pid, found, pgid = future.result()
+            except CapacityRefused as exc:
+                self._capacity_refused(conn, job, now, str(exc))
+                continue
+            except Exception as exc:  # a LaunchError, or a launcher bug: the job's attempt logic decides
+                self._death(conn, job, now, f"launch failed: {exc}")
+                continue
+            if not self._move(
+                conn, job_id, ("running",), now, "started", f"pid {pid}",
+                pid=pid, pgid=pgid, pid_start=found.start, capacity_refusals=0,
+            ):  # fmt: skip
+                kill_group(pgid)
+                self.log(f"{job_id} cancelled during launch; stopped pid {pid}")
+
+    def _start_worker(self, job: dict, run_dir, env: dict):
+        """Pool thread: run the launcher and identify the pid it returns. No database access."""
+        pid = self.launcher(job, run_dir, env)
+        found = probe(pid)
+        for _ in range(PROBE_RETRIES - 1):
+            if found.state != "unknown":
+                break
+            found = probe(pid)
+        return pid, found, process_group(pid)
+
     def _launch(self, conn, job: dict, now: float) -> bool:
-        """Start one queued job. Returns False when it was cancelled before the launch."""
+        """Mark one queued job running and hand its worker start to the launch pool.
+
+        The job stays ``running`` with no pid until ``_collect_launches`` records the
+        result, which is how a cancel during the launch is recognised.
+        Returns False when the job was cancelled before the launch began.
+        """
         previous = job["run_dir"]
         run_dir = db.job_dir(self.home, job["id"]) / "runs" / uuid.uuid4().hex[:8]
         if not self._move(
@@ -1042,24 +1105,5 @@ class Broker:
         launch_job = job
         if job["orig_workspace"]:
             launch_job = {**job, "prompt_path": str(worktree_prompt(run_dir, job))}
-        try:
-            pid = self.launcher(launch_job, run_dir, env)
-        except CapacityRefused as exc:
-            self._capacity_refused(conn, job, now, str(exc))
-            return False
-        except LaunchError as exc:
-            self._death(conn, job, now, f"launch failed: {exc}")
-            return False
-        found = probe(pid)
-        for _ in range(PROBE_RETRIES - 1):
-            if found.state != "unknown":
-                break
-            found = probe(pid)
-        if not self._move(
-            conn, job["id"], ("running",), now, "started", f"pid {pid}",
-            pid=pid, pgid=process_group(pid), pid_start=found.start, capacity_refusals=0,
-        ):  # fmt: skip
-            kill_group(process_group(pid))
-            self.log(f"{job['id']} cancelled during launch; stopped pid {pid}")
-            return False
+        self._inflight[job["id"]] = self.launch_pool.submit(self._start_worker, launch_job, run_dir, env)
         return True

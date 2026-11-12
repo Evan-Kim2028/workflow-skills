@@ -5,6 +5,7 @@ run_worker.py: it writes a pi-shaped report and starts a real short-lived proces
 (``sleep``) so pid and start-time checks run for real. The proxy is always stubbed.
 """
 
+import concurrent.futures
 import io
 import os
 import plistlib
@@ -131,9 +132,22 @@ def proxy_doc(total=0, output=0, uncached=0, saturated=False):
     }
 
 
-def make_broker(home, launcher=None, clock=None, proxy=None, gauges=None):
+class InlinePool:
+    """Runs each launch on the calling thread, so a tick's launches have landed when it returns."""
+
+    def submit(self, fn, *args):
+        future = concurrent.futures.Future()
+        try:
+            future.set_result(fn(*args))
+        except BaseException as exc:
+            future.set_exception(exc)
+        return future
+
+
+def make_broker(home, launcher=None, clock=None, proxy=None, gauges=None, launch_pool=None):
     return B.Broker(home, launcher=launcher or FakeLauncher(), now=clock or time.time,
-                    proxy=proxy or (lambda: None), gauges=gauges or FakeGauges())
+                    proxy=proxy or (lambda: None), gauges=gauges or FakeGauges(),
+                    launch_pool=launch_pool or InlinePool())
 
 
 def write_config(home, slots=None, tiers=None):
@@ -562,7 +576,7 @@ class ReviewFixTests(ProcessCleanup):
             (Path(run_dir) / f"{job['label']}.pid").write_text(str(proc.pid))
             return proc.pid
 
-        self.assertEqual(make_broker(self.home, racing_launcher).tick(), [])
+        make_broker(self.home, racing_launcher).tick()
         self.assertEqual(row(self.home, job_id)["state"], "cancelled")
         self.assertEqual(spawned[0].wait(timeout=10), -signal.SIGTERM)
 
@@ -609,7 +623,7 @@ class ReviewFixTests(ProcessCleanup):
 
         def run_worker_hangs(cmd, **kw):
             if len(cmd) > 1 and str(cmd[1]).endswith("run_worker.py"):
-                raise subprocess.TimeoutExpired(cmd, 300)
+                raise subprocess.TimeoutExpired(cmd, B.LAUNCH_TIMEOUT_S)
             return real_run(cmd, **kw)
 
         with mock.patch.object(B.subprocess, "run", run_worker_hangs):
@@ -1185,6 +1199,154 @@ class SchemaUpgradeTests(ProcessCleanup):
         self.assertIn("in_place", columns)
         self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], db.SCHEMA_VERSION)
         conn.close()
+
+
+class BlockingLauncher(FakeLauncher):
+    """Holds every launch whose label is in ``slow`` until ``release`` is set. Real sleeping workers."""
+
+    def __init__(self, slow, release, owner):
+        super().__init__(live_s=30)
+        self.slow = set(slow)
+        self.release = release
+        self.lock = threading.Lock()
+        owner.launchers.append(self)
+
+    def __call__(self, job, run_dir, env):
+        if job["label"] in self.slow:
+            self.release.wait(10)
+        with self.lock:
+            return super().__call__(job, run_dir, env)
+
+    def calls_for(self, job_id):
+        return [call for call in self.calls if call["id"] == job_id]
+
+
+class NonBlockingLaunchTests(ProcessCleanup):
+    def setUp(self):
+        super().setUp()
+        self.pool = concurrent.futures.ThreadPoolExecutor(max_workers=B.MAX_CONCURRENT_LAUNCHES)
+        self.addCleanup(self.pool.shutdown, wait=False)
+        self.release = threading.Event()
+        self.addCleanup(self.release.set)
+
+    def blocking_broker(self, slow, clock=None):
+        launcher = BlockingLauncher(slow, self.release, self)
+        return make_broker(self.home, launcher, clock=clock, launch_pool=self.pool), launcher
+
+    def wait_for(self, broker, predicate, timeout=10.0):
+        deadline = time.monotonic() + timeout
+        while not predicate():
+            if time.monotonic() > deadline:
+                raise AssertionError("condition not reached")
+            broker.tick()
+            time.sleep(0.02)
+
+    def settle(self, broker, timeout=10.0):
+        deadline = time.monotonic() + timeout
+        while broker._inflight:
+            if time.monotonic() > deadline:
+                raise AssertionError("launches still in flight")
+            concurrent.futures.wait(list(broker._inflight.values()), timeout=0.05)
+            conn = db.connect(self.home)
+            try:
+                broker._collect_launches(conn, broker.now())
+            finally:
+                conn.close()
+
+    def test_a_slow_launch_does_not_block_the_next_job(self):
+        write_config(self.home, slots={"light": 4, "tests": 0, "ssh": 0})
+        slow = submit(self.env, self.prompt, label="slow-one")
+        fast = submit(self.env, self.prompt, label="fast-one")
+        broker, launcher = self.blocking_broker({"slow-one"})
+        self.assertEqual(broker.tick(), [slow, fast])
+        self.wait_for(broker, lambda: row(self.home, fast)["pid"] is not None)
+        self.assertIsNone(row(self.home, slow)["pid"])
+        self.assertFalse(self.release.is_set())
+        self.release.set()
+        self.settle(broker)
+        self.assertIsNotNone(row(self.home, slow)["pid"])
+        self.assertEqual(row(self.home, slow)["state"], "running")
+
+    def test_heartbeat_is_written_while_a_launch_is_slow(self):
+        job_id = submit(self.env, self.prompt, label="hb-slow")
+        broker, _ = self.blocking_broker({"hb-slow"})
+        broker.tick()
+        self.assertIn(job_id, broker._inflight)
+        beat = float((self.home / "broker.heartbeat").read_text(encoding="utf-8"))
+        self.assertLess(abs(time.time() - beat), 60)
+        self.release.set()
+        self.settle(broker)
+
+    def test_an_in_flight_launch_holds_its_slot(self):
+        write_config(self.home, slots={"light": 1, "tests": 0, "ssh": 0})
+        first = submit(self.env, self.prompt, label="hold-a")
+        second = submit(self.env, self.prompt, label="hold-b")
+        broker, launcher = self.blocking_broker({"hold-a"})
+        self.assertEqual(broker.tick(), [first])
+        self.assertEqual(broker.tick(), [])
+        self.assertEqual(row(self.home, second)["state"], "queued")
+        self.assertEqual(launcher.calls_for(second), [])
+        self.release.set()
+        self.settle(broker)
+        self.assertEqual(row(self.home, first)["state"], "running")
+
+    def test_an_in_flight_launch_is_not_launched_twice(self):
+        job_id = submit(self.env, self.prompt, label="once-slow")
+        broker, launcher = self.blocking_broker({"once-slow"})
+        self.assertEqual(broker.tick(), [job_id])
+        for _ in range(3):
+            self.assertEqual(broker.tick(), [])
+        self.release.set()
+        self.settle(broker)
+        self.assertEqual(len(launcher.calls_for(job_id)), 1)
+        self.assertEqual(row(self.home, job_id)["state"], "running")
+
+    def test_in_flight_launches_are_capped(self):
+        ids = [submit(self.env, self.prompt, label=f"cap-{i}") for i in range(B.MAX_CONCURRENT_LAUNCHES + 1)]
+        broker, _ = self.blocking_broker({f"cap-{i}" for i in range(len(ids))})
+        self.assertEqual(broker.tick(), ids[: B.MAX_CONCURRENT_LAUNCHES])
+        self.assertEqual(row(self.home, ids[-1])["state"], "queued")
+        self.release.set()
+        self.settle(broker)
+        self.assertEqual(broker.tick(), [ids[-1]])
+        self.settle(broker)
+        self.assertEqual(row(self.home, ids[-1])["state"], "running")
+
+    def test_a_timed_out_launch_requeues_then_fails_after_the_attempt_limit(self):
+        job_id = submit(self.env, self.prompt, label="timeout-job")
+
+        def timing_out(job, run_dir, env):
+            raise B.LaunchError("run_worker timed out with no pid file")
+
+        broker = make_broker(self.home, timing_out, launch_pool=self.pool)
+        for attempt in range(1, B.MAX_ATTEMPTS):
+            broker.tick()
+            self.settle(broker)
+            job = row(self.home, job_id)
+            self.assertEqual((job["state"], job["attempt"]), ("queued", attempt))
+        broker.tick()
+        self.settle(broker)
+        job = row(self.home, job_id)
+        self.assertEqual(job["state"], "failed")
+        self.assertIn("timed out with no pid file", job["detail"])
+
+    def test_launcher_runs_with_no_preflight_and_a_bounded_wait(self):
+        run_dir = self.tmp / "bounded-run"
+        job = {"tier": "pi-kimi", "label": "bounded", "workspace": str(self.tmp),
+               "prompt_path": str(self.prompt)}  # fmt: skip
+        seen = {}
+
+        def fake_run(cmd, **kw):
+            seen["cmd"] = list(cmd)
+            seen["timeout"] = kw["timeout"]
+            (run_dir / "bounded.pid").write_text("4242", encoding="utf-8")
+            return subprocess.CompletedProcess(cmd, 0, stdout="STATUS: running tier=pi-kimi\n", stderr="")
+
+        with mock.patch.object(B.subprocess, "run", fake_run):
+            self.assertEqual(B.run_worker_launcher(job, run_dir, dict(os.environ)), 4242)
+        self.assertIn("--no-preflight", seen["cmd"])
+        self.assertEqual(seen["timeout"], 120)
+        self.assertEqual(B.LAUNCH_TIMEOUT_S, 120)
 
 
 if __name__ == "__main__":

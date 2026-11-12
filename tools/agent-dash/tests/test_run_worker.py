@@ -10,6 +10,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
@@ -255,6 +256,34 @@ class RunWorkerTests(unittest.TestCase):
         row = (self.run_dir / "muse-sessions.tsv").read_text(encoding="utf-8").strip()
         self.assertEqual(row, "ws1-plan-lane-1\t%s\t1700000000\tmuse-spark-1.3-contributor\tmuse\tmuse" % SID)
         self.assertEqual((self.run_dir / "ws1-plan-lane-1.tier").read_text(encoding="utf-8").strip(), "muse")
+
+    def test_no_preflight_still_writes_the_pid_file(self):
+        self.counts = {}
+        launch = Launch()
+        code, _ = self.go("muse", launch)
+        self.assertEqual(code, 0)
+        self.assertEqual((self.run_dir / "ws1-plan-lane-1.pid").read_text(encoding="utf-8").strip(), "4001")
+
+    def test_broker_launch_writes_phase_timings(self):
+        self.counts = {}
+        with mock.patch.dict(os.environ, {"AGENTQ_JOB": "job-timing"}):
+            code, _ = self.go("muse", Launch())
+        self.assertEqual(code, 0)
+        doc = json.loads((self.run_dir / "launch-timing.json").read_text(encoding="utf-8"))
+        self.assertEqual(doc["job"], "job-timing")
+        self.assertEqual(
+            set(doc["phases_s"]), {"label", "registry", "preflight", "prompt", "caps", "spawn", "pid-file"}
+        )
+        self.assertTrue(all(value >= 0 for value in doc["phases_s"].values()))
+        self.assertAlmostEqual(doc["total_s"], sum(doc["phases_s"].values()), places=2)
+
+    def test_direct_launch_writes_no_timing_file(self):
+        self.counts = {}
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("AGENTQ_JOB", None)
+            code, _ = self.go("muse", Launch())
+        self.assertEqual(code, 0)
+        self.assertFalse((self.run_dir / "launch-timing.json").exists())
 
     def test_auto_skips_a_worker_at_its_cap(self):
         self.counts = {"[m]use-bin|[m]use exec": 25}
