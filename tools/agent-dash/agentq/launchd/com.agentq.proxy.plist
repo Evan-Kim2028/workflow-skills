@@ -8,7 +8,7 @@
     <array>
         <string>__PYTHON__</string>
         <string>-u</string>
-        <string>__HOME__/Documents/projects/wt-agentq-proxy/tools/agent-dash/agentq/proxy.py</string>
+        <string>__HOME__/.claude/tools/agent-dash/agentq/proxy.py</string>
     </array>
     <key>EnvironmentVariables</key>
     <dict>
