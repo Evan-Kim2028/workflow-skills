@@ -916,8 +916,13 @@ def _cursor_type(obj) -> str:
 def _cursor_rows(member: Member, fallback_ms: int):
     """Rows from a Cursor ``store.db``: hex-JSON meta values and JSON blobs.
 
-    The db (plus ``-wal``/``-shm``) is copied to a temp dir first, then
-    opened read-only, so a live Cursor process is never touched.
+    The db (plus ``-wal``/``-shm``) is copied to a temp dir first, so a live
+    Cursor process is never touched. The copy is opened read-write: every
+    Cursor store is WAL mode, and SQLite 3.54 (the system python the launchd
+    job runs) refuses a read-only open of a WAL db that has no ``-shm``
+    (``unable to open database file``). Read-write lets SQLite create the
+    ``-shm`` and replay a copied ``-wal`` into the copy. ``immutable=1`` is
+    not an option: it ignores the WAL and would drop recent pages.
     """
     tmp = tempfile.mkdtemp(prefix="cursor-store-")
     try:
@@ -925,7 +930,7 @@ def _cursor_rows(member: Member, fallback_ms: int):
             src = member.path + suffix
             if os.path.exists(src):
                 shutil.copy2(src, os.path.join(tmp, "store.db" + suffix))
-        con = sqlite3.connect("file:%s?mode=ro" % os.path.join(tmp, "store.db"), uri=True)
+        con = sqlite3.connect(os.path.join(tmp, "store.db"))
         try:
             for (value,) in con.execute("select value from meta"):
                 text = _hex_text(value)

@@ -1717,6 +1717,87 @@ class Round5RestoreTest(Base):
         )
 
 
+class Round6CursorStoreTest(Base):
+    """Round 6: a WAL-mode Cursor store opens from the private temp copy.
+
+    Every Cursor ``store.db`` is WAL mode. SQLite 3.54 (the system python the
+    launchd job runs) refuses a read-only open of a WAL db with no ``-shm``
+    (``unable to open database file``); 3.53.1 allowed it. The copy is opened
+    read-write so SQLite can create the ``-shm`` and replay a copied ``-wal``.
+    """
+
+    def _wal_store(self, cdir, rows=2, checkpoint=True):
+        """A WAL-mode store.db in ``cdir``; returns the writer connection."""
+        cdir.mkdir(parents=True, exist_ok=True)
+        con = sqlite3.connect(str(cdir / "store.db"))
+        con.execute("pragma journal_mode=wal")
+        con.execute("pragma wal_autocheckpoint=0")
+        con.execute("create table meta (key text primary key, value text)")
+        con.execute("create table blobs (id text primary key, data blob)")
+        for i in range(rows):
+            con.execute(
+                "insert into meta values (?, ?)",
+                (str(i), json.dumps({"agentId": "chat1", "n": i}).encode().hex()),
+            )
+            con.execute("insert into blobs values (?, ?)", ("b%d" % i, b'{"role":"user"}'))
+        con.commit()
+        if checkpoint:
+            con.execute("pragma wal_checkpoint(truncate)")
+        return con
+
+    def _rows(self, root):
+        unit = self.unit("cursor", root)
+        member = [m for m in unit.members if m.rows == "cursor-store"][0]
+        return unit, member, list(sa.iter_member_rows(member, unit))
+
+    def test_wal_store_copied_without_wal_or_shm(self):
+        root = self.home / "cursor"
+        cdir = root / "chats" / "ws1" / "chat1"
+        con = self._wal_store(cdir)
+        con.close()
+        # Copy the db alone: no -wal, no -shm.
+        for suffix in ("-wal", "-shm"):
+            if (cdir / ("store.db" + suffix)).exists():
+                (cdir / ("store.db" + suffix)).unlink()
+        self.assertEqual((cdir / "store.db").read_bytes()[18:20], b"\x02\x02", "not WAL mode")
+        self.assertFalse((cdir / "store.db-wal").exists())
+        self.assertFalse((cdir / "store.db-shm").exists())
+        _unit, _member, rows = self._rows(root)
+        self.assertEqual(len(rows), 4, rows)
+        self.assertEqual([r[1] for r in rows], ["raw", "raw", "user", "user"])
+        # The original is never opened: no shm appears beside it.
+        self.assertFalse((cdir / "store.db-shm").exists())
+
+    def test_wal_store_rows_still_only_in_wal(self):
+        root = self.home / "cursor"
+        cdir = root / "chats" / "ws1" / "chat1"
+        staging = self.home / "staging"
+        con = self._wal_store(staging, rows=3, checkpoint=False)
+        # Copy db + wal + shm while the writer is still open, as a live Cursor
+        # process would leave them.
+        cdir.mkdir(parents=True, exist_ok=True)
+        for suffix in ("", "-wal", "-shm"):
+            shutil.copy2(str(staging / ("store.db" + suffix)), str(cdir / ("store.db" + suffix)))
+        con.close()
+        self.assertGreater((cdir / "store.db-wal").stat().st_size, 0)
+        # The rows really are only in the WAL: the db alone has none.
+        alone = self.home / "alone"
+        alone.mkdir()
+        shutil.copy2(str(cdir / "store.db"), str(alone / "store.db"))
+        bare = sqlite3.connect(str(alone / "store.db"))
+        try:
+            try:
+                n = bare.execute("select count(*) from meta").fetchone()[0]
+            except sqlite3.OperationalError:
+                n = 0  # the schema itself is still only in the WAL
+            self.assertEqual(n, 0)
+        finally:
+            bare.close()
+        _unit, _member, rows = self._rows(root)
+        self.assertEqual(len(rows), 6, rows)
+        self.assertEqual(sum(1 for r in rows if r[1] == "user"), 3)
+
+
 # --------------------------------------------------------------- real store e2e
 
 VLOGS_BIN = Path.home() / ".local/share/agent-dash/vlogs/bin/victoria-logs-prod"
