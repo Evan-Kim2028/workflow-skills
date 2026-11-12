@@ -14,6 +14,7 @@ import json
 import os
 import re
 import sqlite3
+import statistics
 import subprocess
 import sys
 import threading
@@ -42,6 +43,13 @@ LIMITS = {"total": 10_000_000, "output": 70_000, "uncached": 24_290}
 LIMIT_KEYS = {"total": "total", "output": "ds_output", "uncached": "kimi_uncached"}
 DEFAULT_CAPS = {"deepseek": 64, "kimi": 2}
 TIER_CAP_KEYS = {"pi-deepseek-flash": "deepseek", "pi-kimi": "kimi"}
+LIMIT_LABELS = {"total": "Total pool", "output": "DeepSeek output", "uncached": "Kimi uncached"}
+ACTIVE_WINDOW_S = 120
+PERF_WINDOW_MINUTES = 15
+RUN_LOOKBACK_S = 7 * 24 * 3600
+RUN_ROWS = 50
+TOP_CONSUMERS = 10
+VERDICTS = ("PASS", "PARTIAL", "FAIL")
 QUEUE_JOB_ENV = re.compile(r"AGENTQ_JOB=[0-9a-f]{12}\b")
 SAMPLES_DDL = """
 CREATE TABLE IF NOT EXISTS samples (
@@ -60,6 +68,11 @@ SELECT minute,
        SUM(CASE WHEN model LIKE 'morph-kimi%' THEN COALESCE(input, 0) ELSE 0 END) AS kimi_uncached,
        SUM(COALESCE(ok, 0)) AS ok,
        SUM(COALESCE(r429, 0)) AS r429,
+       SUM(COALESCE(req, 0)) AS req,
+       SUM(COALESCE(input, 0)) AS input,
+       SUM(COALESCE(cache_read, 0)) AS cache_read,
+       SUM(COALESCE(output, 0)) AS output,
+       SUM(COALESCE(wait_p50_ms, 0) * COALESCE(req, 0)) AS wait_p50_weighted,
        MAX(wait_p95_ms) AS wait_p95_ms
 FROM proxy_minutes
 WHERE minute >= ? AND minute < ?
@@ -75,6 +88,36 @@ SELECT ts, ds_workers, kimi_workers, queue_workers, direct_workers, queued_jobs
 FROM samples WHERE ts >= ? ORDER BY ts
 """
 SAMPLE_INSERT_SQL = "INSERT OR REPLACE INTO samples VALUES (?, ?, ?, ?, ?, ?)"
+RUNS_SQL = """
+SELECT p.job AS job,
+       MIN(p.first_ts) AS first_ts,
+       MAX(p.last_ts) AS last_ts,
+       COALESCE(SUM(p.req), 0) AS req,
+       COALESCE(SUM(p.ok), 0) AS ok,
+       COALESCE(SUM(p.r429), 0) AS r429,
+       COALESCE(SUM(p.input), 0) AS input,
+       COALESCE(SUM(p.cache_read), 0) AS cache_read,
+       COALESCE(SUM(p.output), 0) AS output,
+       COALESCE(SUM(p.wait_ms_total), 0) AS wait_ms_total,
+       COALESCE(SUM(p.upstream_ms_total), 0) AS upstream_ms_total,
+       GROUP_CONCAT(DISTINCT p.model) AS models,
+       j.label AS label,
+       j.tier AS tier,
+       j.state AS state,
+       j.verdict AS verdict,
+       j.started_at AS started_at,
+       j.finished_at AS finished_at
+FROM proxy_jobs AS p
+LEFT JOIN jobs AS j ON j.id = p.job
+WHERE p.last_ts >= ?
+GROUP BY p.job
+ORDER BY MAX(p.last_ts) DESC
+"""
+VERDICTS_TODAY_SQL = """
+SELECT verdict, COUNT(*) AS n FROM jobs
+WHERE finished_at >= ? AND verdict IS NOT NULL
+GROUP BY verdict
+"""
 PAGE_HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -140,6 +183,7 @@ main { max-width: 1120px; margin: 0 auto; padding: 20px 20px 40px; }
 header { display: flex; flex-wrap: wrap; align-items: center; gap: 12px 20px; justify-content: space-between; margin-bottom: 16px; }
 h1 { font-size: 18px; font-weight: 600; margin: 0; }
 h2 { font-size: 14px; font-weight: 600; margin: 0 0 2px; }
+h3.group { font-size: 12px; font-weight: 600; color: var(--ink-2); text-transform: uppercase; letter-spacing: 0.04em; margin: 18px 0 8px; }
 .sub { color: var(--ink-2); font-size: 12px; }
 .range { display: inline-flex; border: 1px solid var(--ring); border-radius: 6px; overflow: hidden; }
 .range button {
@@ -149,16 +193,19 @@ h2 { font-size: 14px; font-weight: 600; margin: 0 0 2px; }
 .range button[aria-pressed="true"] { color: var(--ink); font-weight: 600; background: var(--page); }
 .status { font-size: 12px; color: var(--ink-2); }
 .status .stale { color: var(--crit); font-weight: 600; }
-.tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin-bottom: 14px; }
+.tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin-bottom: 8px; }
 .tile { background: var(--surface); border: 1px solid var(--ring); border-radius: 8px; padding: 12px 14px; }
+.tile.headline { border-color: var(--s1); }
 .tile .label { color: var(--ink-2); font-size: 12px; }
-.tile .value { font-size: 26px; font-weight: 600; margin-top: 2px; }
+.tile .value { font-size: 26px; font-weight: 600; margin-top: 2px; font-variant-numeric: tabular-nums; }
+.tile .value.sm { font-size: 20px; }
 .tile .note { color: var(--ink-3); font-size: 12px; margin-top: 2px; }
 .card { background: var(--surface); border: 1px solid var(--ring); border-radius: 8px; padding: 14px 16px; margin-bottom: 14px; position: relative; }
 .card-head { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 6px 16px; align-items: baseline; margin-bottom: 6px; }
 .legend { display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: 12px; color: var(--ink-2); }
 .legend .key { display: inline-flex; align-items: center; gap: 6px; }
 .legend .swatch { width: 14px; height: 0; border-top: 2px solid; display: inline-block; }
+.legend .block { width: 10px; height: 10px; border-radius: 2px; display: inline-block; }
 .chart { position: relative; width: 100%; min-height: 240px; }
 .chart svg { display: block; width: 100%; overflow: visible; }
 .chart text { fill: var(--ink-2); font-size: 11px; font-variant-numeric: tabular-nums; }
@@ -178,11 +225,13 @@ h2 { font-size: 14px; font-weight: 600; margin: 0 0 2px; }
 table { width: 100%; border-collapse: collapse; font-size: 12px; font-variant-numeric: tabular-nums; }
 th, td { text-align: left; padding: 5px 8px; border-bottom: 1px solid var(--grid); white-space: nowrap; }
 th { color: var(--ink-2); font-weight: 600; }
+th.sortable { cursor: pointer; user-select: none; }
+th.sortable:hover { color: var(--ink); }
+th.sorted::after { content: attr(data-dir); margin-left: 4px; color: var(--ink-3); }
 td { color: var(--ink); }
 td.num, th.num { text-align: right; }
+td.wrap { white-space: normal; max-width: 260px; overflow-wrap: anywhere; }
 .table-wrap { overflow-x: auto; }
-details { margin-top: 10px; }
-summary { cursor: pointer; color: var(--ink-2); font-size: 12px; }
 .note-line { color: var(--ink-3); font-size: 12px; margin-top: 4px; }
 </style>
 </head>
@@ -200,14 +249,33 @@ summary { cursor: pointer; color: var(--ink-2); font-size: 12px; }
     </div>
   </header>
 
-  <section class="tiles" aria-label="Current state">
-    <div class="tile"><div class="label">DeepSeek workers running</div><div class="value" id="t-ds">—</div><div class="note" id="n-ds">—</div></div>
-    <div class="tile"><div class="label">Kimi workers running</div><div class="value" id="t-kimi">—</div><div class="note" id="n-kimi">—</div></div>
-    <div class="tile"><div class="label">Jobs queued</div><div class="value" id="t-queued">—</div><div class="note" id="n-queued">—</div></div>
-    <div class="tile"><div class="label">Upstream 429s, last 60 min</div><div class="value" id="t-429">—</div><div class="note" id="n-429">—</div></div>
-    <div class="tile"><div class="label">Total pool, billed avg (5 min)</div><div class="value" id="t-total">—</div><div class="note" id="n-total">—</div></div>
-    <div class="tile"><div class="label">DeepSeek output, billed avg (5 min)</div><div class="value" id="t-output">—</div><div class="note" id="n-output">—</div></div>
-    <div class="tile"><div class="label">Kimi uncached, billed avg (5 min)</div><div class="value" id="t-uncached">—</div><div class="note" id="n-uncached">—</div></div>
+  <h3 class="group">Capacity</h3>
+  <section class="tiles" aria-label="Capacity">
+    <div class="tile headline"><div class="label">Capacity used, 5 min</div><div class="value" id="k-used">—</div><div class="note" id="k-binding">—</div></div>
+    <div class="tile"><div class="label">Total pool, last minute</div><div class="value sm" id="lim-total-now">—</div><div class="note" id="lim-total-note">—</div></div>
+    <div class="tile"><div class="label">DeepSeek output, last minute</div><div class="value sm" id="lim-output-now">—</div><div class="note" id="lim-output-note">—</div></div>
+    <div class="tile"><div class="label">Kimi uncached, last minute</div><div class="value sm" id="lim-uncached-now">—</div><div class="note" id="lim-uncached-note">—</div></div>
+    <div class="tile"><div class="label">Waiting at the proxy now</div><div class="value" id="k-waiting">—</div><div class="note" id="k-waiting-note">—</div></div>
+    <div class="tile"><div class="label">Upstream 429s, last 60 min</div><div class="value" id="k-429">—</div><div class="note">absorbed by retries</div></div>
+  </section>
+
+  <h3 class="group">Runs</h3>
+  <section class="tiles" aria-label="Runs">
+    <div class="tile"><div class="label">DeepSeek runs active now</div><div class="value" id="r-ds">—</div><div class="note" id="r-ds-note">—</div></div>
+    <div class="tile"><div class="label">Kimi runs active now</div><div class="value" id="r-kimi">—</div><div class="note" id="r-kimi-note">—</div></div>
+    <div class="tile"><div class="label">Runs seen today</div><div class="value" id="r-seen">—</div><div class="note">distinct jobs, local day</div></div>
+    <div class="tile"><div class="label">Finished today, PASS / PARTIAL / FAIL</div><div class="value sm" id="r-finished">—</div><div class="note">queue jobs with a verdict</div></div>
+    <div class="tile"><div class="label">Tokens today</div><div class="value" id="r-tokens">—</div><div class="note">all runs, local day</div></div>
+    <div class="tile"><div class="label">Median tokens per run</div><div class="value" id="r-median-tok">—</div><div class="note">runs seen today</div></div>
+    <div class="tile"><div class="label">Median requests per run</div><div class="value" id="r-median-req">—</div><div class="note">runs seen today</div></div>
+  </section>
+
+  <h3 class="group">Performance</h3>
+  <section class="tiles" aria-label="Performance">
+    <div class="tile"><div class="label">Proxy wait, p50 / p95</div><div class="value sm" id="p-wait">—</div><div class="note">last 15 min; p95 is the worst minute</div></div>
+    <div class="tile"><div class="label">Upstream time per request</div><div class="value sm" id="p-upstream">—</div><div class="note">median, runs active in 15 min</div></div>
+    <div class="tile"><div class="label">429 rate</div><div class="value sm" id="p-429rate">—</div><div class="note">429s over requests, last 60 min</div></div>
+    <div class="tile"><div class="label">Requests per minute</div><div class="value sm" id="p-rpm">—</div><div class="note">average, last 5 min</div></div>
   </section>
 
   <section class="card" aria-labelledby="h-billed">
@@ -220,10 +288,18 @@ summary { cursor: pointer; color: var(--ink-2); font-size: 12px; }
 
   <section class="card" aria-labelledby="h-workers">
     <div class="card-head">
-      <h2 id="h-workers">Workers</h2>
+      <h2 id="h-workers">Active runs over time, with caps</h2>
       <div class="legend" id="lg-workers"></div>
     </div>
     <div class="chart" id="c-workers"></div>
+  </section>
+
+  <section class="card" aria-labelledby="h-tokens">
+    <div class="card-head">
+      <h2 id="h-tokens">Tokens per minute, millions</h2>
+      <div class="legend" id="lg-tokens"></div>
+    </div>
+    <div class="chart" id="c-tokens"></div>
   </section>
 
   <section class="grid2">
@@ -243,16 +319,44 @@ summary { cursor: pointer; color: var(--ink-2); font-size: 12px; }
     </div>
   </section>
 
-  <section class="card" aria-labelledby="h-jobs">
+  <section class="card" aria-labelledby="h-runs">
     <div class="card-head">
-      <h2 id="h-jobs">Recent jobs</h2>
-      <div class="sub" id="jobs-counts"></div>
+      <h2 id="h-runs">Runs</h2>
+      <div class="sub" id="runs-count">Top 50 by last activity; click a header to sort</div>
     </div>
     <div class="table-wrap">
       <table>
-        <thead><tr><th>Id</th><th>State</th><th>Lane</th><th>Tier</th><th>Kind</th><th>Verdict</th><th>Submitted</th><th>Started</th><th>Finished</th></tr></thead>
-        <tbody id="jobs-body"></tbody>
+        <thead><tr id="runs-head"></tr></thead>
+        <tbody id="runs-body"></tbody>
       </table>
+    </div>
+    <div class="note-line">Cache-read % is cache reads over all input tokens. Avg wait is per request; avg upstream is per successful request. Queue runs show their jobs-table state.</div>
+  </section>
+
+  <section class="grid2">
+    <div class="card" aria-labelledby="h-top">
+      <div class="card-head">
+        <h2 id="h-top">Top consumers today</h2>
+        <div class="sub" id="top-total"></div>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Run</th><th class="num">Tokens</th><th class="num">Share</th></tr></thead>
+          <tbody id="top-body"></tbody>
+        </table>
+      </div>
+    </div>
+    <div class="card" aria-labelledby="h-jobs">
+      <div class="card-head">
+        <h2 id="h-jobs">Recent jobs</h2>
+        <div class="sub" id="jobs-counts"></div>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Id</th><th>State</th><th>Lane</th><th>Tier</th><th>Kind</th><th>Verdict</th><th>Submitted</th><th>Started</th><th>Finished</th></tr></thead>
+          <tbody id="jobs-body"></tbody>
+        </table>
+      </div>
     </div>
   </section>
 
@@ -263,7 +367,7 @@ summary { cursor: pointer; color: var(--ink-2); font-size: 12px; }
     </div>
     <div class="table-wrap">
       <table>
-        <thead><tr><th>Minute (UTC)</th><th class="num">Total pool %</th><th class="num">DeepSeek output %</th><th class="num">Kimi uncached %</th><th class="num">OK</th><th class="num">429s</th><th class="num">Wait p95 s</th></tr></thead>
+        <thead><tr><th>Minute (UTC)</th><th class="num">Total pool %</th><th class="num">DeepSeek output %</th><th class="num">Kimi uncached %</th><th class="num">Tokens (M)</th><th class="num">OK</th><th class="num">429s</th><th class="num">Wait p95 s</th></tr></thead>
         <tbody id="minute-body"></tbody>
       </table>
     </div>
@@ -275,8 +379,8 @@ summary { cursor: pointer; color: var(--ink-2); font-size: 12px; }
 (function () {
   "use strict";
   var NS = "http://www.w3.org/2000/svg";
-  var POLL_MS = 15000;
-  var state = { hours: 6, data: null, timer: null, inFlight: false, lastGood: null };
+  var POLL_MS = 30000;
+  var state = { hours: 6, data: null, timer: null, inFlight: false, lastGood: null, stale: null, sort: null };
   var COLORS = { s1: "var(--s1)", s2: "var(--s2)", s3: "var(--s3)" };
   var charts = [];
 
@@ -301,6 +405,25 @@ summary { cursor: pointer; color: var(--ink-2); font-size: 12px; }
   }
   function count(n) {
     return n === null || n === undefined ? "—" : Number(n).toLocaleString("en-US");
+  }
+  function num1(n) {
+    if (n === null || n === undefined) return "—";
+    return Number(n).toLocaleString("en-US", { maximumFractionDigits: 1 });
+  }
+  function tokens(n) {
+    if (n === null || n === undefined) return "—";
+    if (n >= 1e6) return (n / 1e6).toFixed(n >= 1e7 ? 1 : 2) + "M";
+    if (n >= 1e3) return (n / 1e3).toFixed(0) + "k";
+    return String(Math.round(n));
+  }
+  function duration(sec) {
+    if (sec === null || sec === undefined) return "—";
+    if (sec < 90) return Math.round(sec) + " s";
+    if (sec < 5400) return Math.round(sec / 60) + " min";
+    return (sec / 3600).toFixed(1) + " h";
+  }
+  function seconds(ms) {
+    return ms === null || ms === undefined ? "—" : (ms / 1000).toFixed(2) + " s";
   }
   function svgEl(tag, attrs, parent) {
     var node = document.createElementNS(NS, tag);
@@ -390,6 +513,20 @@ summary { cursor: pointer; color: var(--ink-2); font-size: 12px; }
           " L" + (right - r) + "," + top + " Q" + right + "," + top + " " + right + "," + (top + r) +
           " L" + right + "," + base + " Z";
         svgEl("path", { d: d, fill: cfg.series[0].color }, svg);
+      });
+    } else if (cfg.kind === "stack") {
+      var below = points.map(function () { return 0; });
+      cfg.series.forEach(function (s) {
+        var above = points.map(function (p, idx) { return below[idx] + (p[s.key] || 0); });
+        var d = "";
+        points.forEach(function (p, idx) {
+          d += (idx ? " L" : "M") + X(p.t).toFixed(1) + "," + Y(above[idx]).toFixed(1);
+        });
+        for (var j = points.length - 1; j >= 0; j--) {
+          d += " L" + X(points[j].t).toFixed(1) + "," + Y(below[j]).toFixed(1);
+        }
+        svgEl("path", { d: d + " Z", fill: s.color, "fill-opacity": 0.5, stroke: s.color, "stroke-width": 1 }, svg);
+        below = above;
       });
     } else {
       cfg.series.forEach(function (s) {
@@ -488,40 +625,58 @@ summary { cursor: pointer; color: var(--ink-2); font-size: 12px; }
 
   function setText(id, value) { $(id).textContent = value; }
 
-  function renderTiles(d) {
-    var workers = d.workers || [];
-    var last = workers.length ? workers[workers.length - 1] : null;
-    var caps = d.caps || { deepseek: 64, kimi: 2 };
-    setText("t-ds", last && last.ds_workers !== null ? count(last.ds_workers) : "—");
-    setText("n-ds", "of cap " + caps.deepseek + (last ? " · sampled " + clock(last.ts * 1000) : " · no samples yet"));
-    setText("t-kimi", last && last.kimi_workers !== null ? count(last.kimi_workers) : "—");
-    setText("n-kimi", "of cap " + caps.kimi + (last ? " · sampled " + clock(last.ts * 1000) : " · no samples yet"));
-    var queued = d.jobs && d.jobs.by_state ? d.jobs.by_state.queued || 0 : null;
-    setText("t-queued", count(queued));
-    setText("n-queued", "jobs in state queued now");
-    setText("t-429", count(d.r429_60m));
-    setText("n-429", "upstream responses (complete minutes)");
+  function renderCapacity(d) {
+    var cap = d.capacity || {};
     var limits = d.limits || {};
-    [["total", "t-total", "n-total"], ["output", "t-output", "n-output"], ["uncached", "t-uncached", "n-uncached"]].forEach(function (row) {
-      var lim = limits[row[0]];
-      setText(row[1], lim ? pct(lim.avg_5m_frac) : "—");
-      var target = lim && lim.target_frac !== null && lim.target_frac !== undefined
-        ? "proxy target " + pct(lim.target_frac, 0)
-        : "proxy target unavailable";
-      setText(row[2], target);
+    setText("k-used", pct(cap.used_frac));
+    setText("k-binding", cap.binding_label ? "binding limit: " + cap.binding_label : "no traffic in 5 min");
+    [["total", "lim-total"], ["output", "lim-output"], ["uncached", "lim-uncached"]].forEach(function (row) {
+      var lim = limits[row[0]] || {};
+      setText(row[1] + "-now", pct(lim.last_min_frac));
+      var target = lim.target_frac === null || lim.target_frac === undefined ? "target n/a" : "target " + pct(lim.target_frac, 0);
+      setText(row[1] + "-note", "5 min avg " + pct(lim.avg_5m_frac) + " · " + target);
     });
+    setText("k-waiting", count(cap.waiting_now));
+    var lanes = cap.waiting_by_lane || {};
+    setText("k-waiting-note", Object.keys(lanes).length
+      ? Object.keys(lanes).map(function (k) { return k + " " + lanes[k]; }).join(" · ")
+      : "proxy status unavailable");
+    setText("k-429", count(d.r429_60m));
+  }
+
+  function renderRunKpis(d) {
+    var rk = d.run_kpis || {};
+    setText("r-ds", count(rk.active_deepseek));
+    setText("r-ds-note", "of cap " + count(rk.cap_deepseek));
+    setText("r-kimi", count(rk.active_kimi));
+    setText("r-kimi-note", "of cap " + count(rk.cap_kimi));
+    setText("r-seen", count(rk.seen_today));
+    var fin = rk.finished_today || {};
+    setText("r-finished", ["PASS", "PARTIAL", "FAIL"].map(function (v) { return count(fin[v] || 0); }).join(" / "));
+    setText("r-tokens", tokens(rk.tokens_today));
+    setText("r-median-tok", tokens(rk.median_tokens_per_run));
+    setText("r-median-req", num1(rk.median_requests_per_run));
+  }
+
+  function renderPerf(d) {
+    var pk = d.perf_kpis || {};
+    var p50 = pk.wait_p50_ms === null || pk.wait_p50_ms === undefined ? "—" : seconds(pk.wait_p50_ms);
+    setText("p-wait", p50 + " / " + seconds(pk.wait_p95_ms));
+    setText("p-upstream", seconds(pk.upstream_median_ms));
+    setText("p-429rate", pct(pk.r429_rate_60m, 2));
+    setText("p-rpm", num1(pk.requests_per_min_5m));
   }
 
   function renderCharts(d) {
     var win = d.window || { start: 0, end: 0 };
     var minutes = d.minutes || [];
-    var workers = (d.workers || []).map(function (w) { return { t: w.ts, ds: w.ds_workers, kimi: w.kimi_workers, queued: w.queued_jobs }; });
+    var runsOverTime = (d.workers || []).map(function (w) { return { t: w.ts, ds: w.ds_workers, kimi: w.kimi_workers, queued: w.queued_jobs }; });
     var caps = d.caps || { deepseek: 64, kimi: 2 };
     var maxPct = minutes.reduce(function (a, p) {
       return Math.max(a, p.pct_total, p.pct_ds_output, p.pct_kimi_uncached);
     }, 0);
-    var maxWorkers = workers.reduce(function (a, w) {
-      return Math.max(a, w.ds || 0, w.kimi || 0, w.queued || 0);
+    var maxWorkers = runsOverTime.reduce(function (a, w) {
+      return Math.max(a, w.ds || 0, w.kimi || 0);
     }, 0);
     var pctFmt = function (v, inline) { return inline ? (v * 100).toFixed(1) + "%" : Math.round(v * 100) + "%"; };
     charts.length = 0;
@@ -539,17 +694,34 @@ summary { cursor: pointer; color: var(--ink-2); font-size: 12px; }
       fmt: pctFmt
     });
     registerChart("c-workers", {
-      title: "Workers and queued jobs",
+      title: "Active runs over time",
       kind: "line", x0: win.start, x1: win.end, height: 260,
-      points: workers.map(function (w) { return { t: w.t, ds: w.ds, kimi: w.kimi, queued: w.queued }; }),
+      points: runsOverTime,
       series: [
-        { key: "ds", name: "DeepSeek workers", color: COLORS.s1 },
-        { key: "kimi", name: "Kimi workers", color: COLORS.s2 },
+        { key: "ds", name: "DeepSeek runs", color: COLORS.s1 },
+        { key: "kimi", name: "Kimi runs", color: COLORS.s2 },
         { key: "queued", name: "Queued jobs", color: COLORS.s3 }
       ],
       y: niceTicks(Math.max(caps.deepseek, maxWorkers), 4),
-      refs: [{ v: caps.deepseek, label: "DeepSeek cap " + caps.deepseek }],
+      refs: [{ v: caps.deepseek, label: "DeepSeek cap " + caps.deepseek }, { v: caps.kimi, label: "Kimi cap " + caps.kimi }],
       fmt: function (v) { return Math.round(v).toLocaleString("en-US"); }
+    });
+    var mix = (d.token_mix || []).map(function (p) {
+      return { t: p.t, cache: p.cache_read / 1e6, uncached: p.uncached / 1e6, output: p.output / 1e6 };
+    });
+    var maxMix = mix.reduce(function (a, p) { return Math.max(a, p.cache + p.uncached + p.output); }, 0);
+    var millions = function (v) { return (v >= 10 ? v.toFixed(0) : v.toFixed(1)) + "M"; };
+    registerChart("c-tokens", {
+      title: "Tokens per minute, millions",
+      kind: "stack", x0: win.start, x1: win.end, height: 260,
+      points: mix,
+      series: [
+        { key: "cache", name: "Cache read", color: COLORS.s3 },
+        { key: "uncached", name: "Uncached input", color: COLORS.s1 },
+        { key: "output", name: "Output", color: COLORS.s2 }
+      ],
+      y: niceTicks(Math.max(maxMix, 0.1), 4),
+      fmt: millions
     });
     legendFor($("lg-billed"), [
       { name: "Total pool", color: COLORS.s1 },
@@ -557,9 +729,14 @@ summary { cursor: pointer; color: var(--ink-2); font-size: 12px; }
       { name: "Kimi uncached", color: COLORS.s3 }
     ]);
     legendFor($("lg-workers"), [
-      { name: "DeepSeek workers", color: COLORS.s1 },
-      { name: "Kimi workers", color: COLORS.s2 },
+      { name: "DeepSeek runs", color: COLORS.s1 },
+      { name: "Kimi runs", color: COLORS.s2 },
       { name: "Queued jobs", color: COLORS.s3 }
+    ]);
+    legendFor($("lg-tokens"), [
+      { name: "Cache read", color: COLORS.s3 },
+      { name: "Uncached input", color: COLORS.s1 },
+      { name: "Output", color: COLORS.s2 }
     ]);
     var maxR = minutes.reduce(function (a, p) { return Math.max(a, p.r429); }, 0);
     registerChart("c-429", {
@@ -582,6 +759,109 @@ summary { cursor: pointer; color: var(--ink-2); font-size: 12px; }
       y: niceTicks(Math.max(maxW, 1), 3),
       fmt: function (v, inline) { return v.toFixed(inline ? 1 : 0) + " s"; }
     });
+  }
+
+  var RUN_COLUMNS = [
+    { key: "run", label: "Run", text: true, value: function (r) { return r.run; }, cell: function (r) { return r.run; }, wrap: true },
+    { key: "tier", label: "Tier / model", text: true, value: function (r) { return (r.tier || "") + " " + r.models; }, cell: function (r) { return (r.tier ? r.tier + " · " : "") + r.models; } },
+    { key: "status", label: "Status", text: true, value: function (r) { return r.status; }, cell: function (r) { return r.status; } },
+    { key: "started", label: "Started", value: function (r) { return r.started; }, cell: function (r) { return fullTime(r.started); } },
+    { key: "duration", label: "Duration", num: true, value: function (r) { return r.duration_s; }, cell: function (r) { return duration(r.duration_s); } },
+    { key: "requests", label: "Requests", num: true, value: function (r) { return r.requests; }, cell: function (r) { return count(r.requests); } },
+    { key: "total", label: "Total tokens", num: true, value: function (r) { return r.total_tokens; }, cell: function (r) { return tokens(r.total_tokens); } },
+    { key: "output", label: "Output tokens", num: true, value: function (r) { return r.output; }, cell: function (r) { return tokens(r.output); } },
+    { key: "cache", label: "Cache-read %", num: true, value: function (r) { return r.cache_read_pct; }, cell: function (r) { return pct(r.cache_read_pct, 0); } },
+    { key: "r429", label: "429s", num: true, value: function (r) { return r.r429; }, cell: function (r) { return count(r.r429); } },
+    { key: "wait", label: "Avg wait s", num: true, value: function (r) { return r.avg_wait_s; }, cell: function (r) { return r.avg_wait_s === null ? "—" : r.avg_wait_s.toFixed(2); } },
+    { key: "upstream", label: "Avg upstream s", num: true, value: function (r) { return r.avg_upstream_s; }, cell: function (r) { return r.avg_upstream_s === null ? "—" : r.avg_upstream_s.toFixed(1); } },
+    { key: "verdict", label: "Verdict", text: true, value: function (r) { return r.verdict; }, cell: function (r) { return r.verdict || "—"; } }
+  ];
+
+  function sortedRuns(runs) {
+    var list = runs.slice();
+    if (!state.sort) return list;
+    var col = RUN_COLUMNS.find(function (c) { return c.key === state.sort.key; });
+    if (!col) return list;
+    var dir = state.sort.dir;
+    list.sort(function (a, b) {
+      var va = col.value(a), vb = col.value(b);
+      var na = va === null || va === undefined, nb = vb === null || vb === undefined;
+      if (na || nb) return na === nb ? 0 : na ? 1 : -1;
+      if (typeof va === "string" || typeof vb === "string") return String(va).localeCompare(String(vb)) * dir;
+      return (va - vb) * dir;
+    });
+    return list;
+  }
+
+  function renderRunsTable(d) {
+    var head = $("runs-head");
+    head.innerHTML = "";
+    RUN_COLUMNS.forEach(function (col) {
+      var th = document.createElement("th");
+      th.className = "sortable" + (col.num ? " num" : "");
+      th.setAttribute("data-key", col.key);
+      th.textContent = col.label;
+      if (state.sort && state.sort.key === col.key) {
+        th.className += " sorted";
+        th.setAttribute("data-dir", state.sort.dir > 0 ? "▲" : "▼");
+      }
+      th.setAttribute("aria-sort", state.sort && state.sort.key === col.key ? (state.sort.dir > 0 ? "ascending" : "descending") : "none");
+      th.addEventListener("click", function () {
+        if (state.sort && state.sort.key === col.key) state.sort = { key: col.key, dir: -state.sort.dir };
+        else state.sort = { key: col.key, dir: col.text ? 1 : -1 };
+        renderRunsTable(state.data || d);
+      });
+      head.appendChild(th);
+    });
+    var body = $("runs-body");
+    body.innerHTML = "";
+    var runs = d.runs || [];
+    if (!runs.length) {
+      var none = document.createElement("tr");
+      var cell = document.createElement("td");
+      cell.colSpan = RUN_COLUMNS.length;
+      cell.textContent = d.errors && d.errors.runs ? "Runs unavailable: " + d.errors.runs : "No runs in the last 7 days";
+      none.appendChild(cell);
+      body.appendChild(none);
+    }
+    sortedRuns(runs).forEach(function (r) {
+      var tr = document.createElement("tr");
+      RUN_COLUMNS.forEach(function (col) {
+        var td = document.createElement("td");
+        if (col.num) td.className = "num";
+        if (col.wrap) td.className += " wrap";
+        td.textContent = col.cell(r);
+        tr.appendChild(td);
+      });
+      body.appendChild(tr);
+    });
+    $("runs-count").textContent = "Top " + runs.length + " by last activity; click a header to sort";
+  }
+
+  function renderTop(d) {
+    var body = $("top-body");
+    body.innerHTML = "";
+    var top = d.top_consumers || [];
+    if (!top.length) {
+      var none = document.createElement("tr");
+      var cell = document.createElement("td");
+      cell.colSpan = 3;
+      cell.textContent = "No runs today";
+      none.appendChild(cell);
+      body.appendChild(none);
+    }
+    top.forEach(function (r) {
+      var tr = document.createElement("tr");
+      [r.run, tokens(r.total_tokens), pct(r.share, 1)].forEach(function (v, i) {
+        var td = document.createElement("td");
+        if (i > 0) td.className = "num";
+        td.textContent = String(v);
+        tr.appendChild(td);
+      });
+      body.appendChild(tr);
+    });
+    var today = (d.run_kpis || {}).tokens_today;
+    $("top-total").textContent = today === undefined ? "" : "Today: " + tokens(today) + " tokens";
   }
 
   function renderJobs(d) {
@@ -618,7 +898,7 @@ summary { cursor: pointer; color: var(--ink-2); font-size: 12px; }
     var rows = (d.minutes || []).slice(-60).reverse();
     rows.forEach(function (p) {
       var tr = document.createElement("tr");
-      [p.minute, pct(p.pct_total), pct(p.pct_ds_output), pct(p.pct_kimi_uncached), count(p.ok), count(p.r429),
+      [p.minute, pct(p.pct_total), pct(p.pct_ds_output), pct(p.pct_kimi_uncached), tokens(p.total), count(p.ok), count(p.r429),
         p.wait_p95_ms === null ? "—" : (p.wait_p95_ms / 1000).toFixed(1)].forEach(function (v, i) {
         var td = document.createElement("td");
         if (i > 0) td.className = "num";
@@ -629,29 +909,34 @@ summary { cursor: pointer; color: var(--ink-2); font-size: 12px; }
     });
   }
 
-  function render(d) {
-    renderTiles(d);
-    renderCharts(d);
-    renderJobs(d);
-    renderMinuteTable(d);
-    var errs = Object.keys(d.errors || {});
+  function renderStatus() {
     var status = $("status");
     status.innerHTML = "";
-    var up = document.createElement("span");
-    up.textContent = "Last updated " + clock(d.generated_at * 1000) + (errs.length ? " · partial: " + errs.join(", ") : "");
-    status.appendChild(up);
+    if (state.stale) {
+      var warn = document.createElement("span");
+      warn.className = "stale";
+      warn.textContent = "Stale: fetch failed";
+      status.appendChild(warn);
+      status.appendChild(document.createTextNode(" · " + state.stale + " · "));
+    }
+    var text = state.lastGood
+      ? "updated " + Math.max(0, Math.floor((Date.now() - state.lastGood) / 1000)) + "s ago"
+      : "loading";
+    var errs = state.data && state.data.errors ? Object.keys(state.data.errors) : [];
+    if (errs.length) text += " · partial: " + errs.join(", ");
+    status.appendChild(document.createTextNode(text));
   }
 
-  function setStale(message) {
-    var status = $("status");
-    if (!message) return;
-    var last = state.lastGood ? clock(state.lastGood) : "never";
-    status.innerHTML = "";
-    var warn = document.createElement("span");
-    warn.className = "stale";
-    warn.textContent = "Stale: fetch failed";
-    status.appendChild(warn);
-    status.appendChild(document.createTextNode(" · last good refresh " + last + " · " + message));
+  function render(d) {
+    renderCapacity(d);
+    renderRunKpis(d);
+    renderPerf(d);
+    renderCharts(d);
+    renderRunsTable(d);
+    renderTop(d);
+    renderJobs(d);
+    renderMinuteTable(d);
+    renderStatus();
   }
 
   function refresh() {
@@ -665,10 +950,12 @@ summary { cursor: pointer; color: var(--ink-2); font-size: 12px; }
       .then(function (data) {
         state.data = data;
         state.lastGood = Date.now();
+        state.stale = null;
         render(data);
       })
       .catch(function (err) {
-        setStale(err && err.message ? err.message : "network error");
+        state.stale = err && err.message ? err.message : "network error";
+        renderStatus();
       })
       .then(function () { state.inFlight = false; });
   }
@@ -710,6 +997,8 @@ summary { cursor: pointer; color: var(--ink-2); font-size: 12px; }
       if (w !== lastWidth) { lastWidth = w; redrawAll(); }
     }).observe(document.querySelector("main"));
   }
+
+  setInterval(renderStatus, 1000);
 
   if (document.visibilityState === "visible") {
     refresh();
@@ -820,8 +1109,13 @@ def minute_point(t: int, row: dict | None) -> dict:
         "total": total,
         "ds_output": ds_output,
         "kimi_uncached": kimi_uncached,
+        "input": int(row.get("input") or 0),
+        "cache_read": int(row.get("cache_read") or 0),
+        "output": int(row.get("output") or 0),
         "ok": int(row.get("ok") or 0),
         "r429": int(row.get("r429") or 0),
+        "req": int(row.get("req") or 0),
+        "wait_p50_weighted": int(row.get("wait_p50_weighted") or 0),
         "wait_p95_ms": row.get("wait_p95_ms"),
         "pct_total": fraction(total, LIMITS["total"]),
         "pct_ds_output": fraction(ds_output, LIMITS["output"]),
@@ -916,6 +1210,182 @@ def read_samples(dash_db: Path, since: float) -> list[dict]:
         connection.close()
 
 
+def last_minute_fraction(raw: dict[int, dict], until: int, key: str, limit: int) -> float:
+    """Billed fraction of a limit in the last complete minute."""
+    return fraction(int((raw.get(until - 60) or {}).get(key) or 0), limit)
+
+
+def window_sum(raw: dict[int, dict], until: int, minutes: int, key: str) -> int:
+    """Sum of one minute-row field over the last ``minutes`` complete minutes."""
+    return sum(int((raw.get(t) or {}).get(key) or 0) for t in range(until - minutes * 60, until, 60))
+
+
+def day_start(now: float) -> float:
+    """Epoch second of local midnight on the day ``now`` falls in."""
+    local = time.localtime(now)
+    return time.mktime((local.tm_year, local.tm_mon, local.tm_mday, 0, 0, 0, 0, 0, -1))
+
+
+def median_or_none(values: list[float]) -> float | None:
+    """The median of ``values``, or None when there are none."""
+    return statistics.median(values) if values else None
+
+
+def capacity_headline(limits: dict, live: dict | None) -> dict:
+    """The limit with the highest 5-minute billed fraction (the binding one), and requests waiting at the proxy."""
+    binding = max(LIMIT_KEYS, key=lambda name: limits[name]["avg_5m_frac"]) if limits else None
+    queued = (live or {}).get("queued") if isinstance(live, dict) else None
+    by_lane = None
+    waiting = None
+    if isinstance(queued, dict):
+        by_lane = {str(lane): int(n) for lane, n in queued.items() if isinstance(n, int)}
+        waiting = sum(by_lane.values())
+    return {
+        "used_frac": limits[binding]["avg_5m_frac"] if binding else None,
+        "binding": binding,
+        "binding_label": LIMIT_LABELS[binding] if binding else None,
+        "waiting_now": waiting,
+        "waiting_by_lane": by_lane,
+    }
+
+
+def read_run_rows(agentq_db: Path, since: int) -> list[dict]:
+    """Per-job proxy totals joined to the queue job row, for jobs with proxy activity since ``since``. Read-only."""
+    connection = readonly_connection(agentq_db)
+    try:
+        return [dict(row) for row in connection.execute(RUNS_SQL, (since,)).fetchall()]
+    finally:
+        connection.close()
+
+
+def read_verdicts_today(agentq_db: Path, day: float) -> dict[str, int]:
+    """Queue jobs finished since ``day`` by verdict. Read-only."""
+    connection = readonly_connection(agentq_db)
+    try:
+        rows = connection.execute(VERDICTS_TODAY_SQL, (day,)).fetchall()
+    finally:
+        connection.close()
+    return {row["verdict"]: row["n"] for row in rows}
+
+
+def shape_run(row: dict, now: float) -> dict:
+    """One run: a queue job when the jobs table has its id (status from jobs.state), else a direct launch."""
+    queue = row["state"] is not None
+    if queue:
+        active = row["state"] == "running"
+        status = row["state"]
+    else:
+        active = now - row["last_ts"] <= ACTIVE_WINDOW_S
+        status = "active" if active else "idle"
+    if queue and row["started_at"] is not None:
+        started = row["started_at"]
+        end = row["finished_at"] if row["finished_at"] is not None else row["last_ts"]
+    else:
+        started = row["first_ts"]
+        end = row["last_ts"]
+    requests, ok = row["req"], row["ok"]
+    input_tokens, cache_read, output = row["input"], row["cache_read"], row["output"]
+    fresh = input_tokens + cache_read
+    return {
+        "job": row["job"],
+        "run": row["label"] or row["job"],
+        "tier": row["tier"],
+        "models": row["models"] or "",
+        "queue": queue,
+        "status": status,
+        "active": active,
+        "started": started,
+        "last_ts": row["last_ts"],
+        "duration_s": end - started,
+        "requests": requests,
+        "r429": row["r429"],
+        "input": input_tokens,
+        "cache_read": cache_read,
+        "output": output,
+        "total_tokens": fresh + output,
+        "cache_read_pct": cache_read / fresh if fresh else None,
+        "avg_wait_s": row["wait_ms_total"] / requests / 1000 if requests else None,
+        "avg_upstream_s": row["upstream_ms_total"] / ok / 1000 if ok else None,
+        "upstream_ms_per_req": row["upstream_ms_total"] / ok if ok else None,
+        "verdict": row["verdict"],
+    }
+
+
+def run_tier(run: dict) -> str | None:
+    """'deepseek' or 'kimi' for a run: its queue tier, else its models (a run on both counts as DeepSeek)."""
+    if run["queue"] and run["tier"]:
+        return tier_of(run["tier"])
+    tiers = {tier_of(model) for model in run["models"].split(",") if model}
+    if "deepseek" in tiers:
+        return "deepseek"
+    return "kimi" if "kimi" in tiers else None
+
+
+def run_kpis(runs: list[dict], day: float, caps: dict[str, int], verdicts: dict[str, int]) -> dict:
+    """Active runs against their caps, runs and tokens seen today, and today's finished queue verdicts."""
+    active_tiers = [run_tier(run) for run in runs if run["active"]]
+    today = [run for run in runs if run["last_ts"] >= day]
+    return {
+        "active_deepseek": active_tiers.count("deepseek"),
+        "active_kimi": active_tiers.count("kimi"),
+        "cap_deepseek": caps["deepseek"],
+        "cap_kimi": caps["kimi"],
+        "seen_today": len(today),
+        "finished_today": {verdict: int(verdicts.get(verdict, 0)) for verdict in VERDICTS},
+        "tokens_today": sum(run["total_tokens"] for run in today),
+        "median_tokens_per_run": median_or_none([run["total_tokens"] for run in today]),
+        "median_requests_per_run": median_or_none([run["requests"] for run in today]),
+    }
+
+
+def perf_kpis(raw: dict[int, dict], until: int, runs: list[dict], now: float) -> dict:
+    """Proxy wait, upstream time, 429 rate and request rate. Wait p50 is request-weighted; p95 is the worst minute."""
+    window = [raw[t] for t in range(until - PERF_WINDOW_MINUTES * 60, until, 60) if t in raw]
+    req_15m = sum(row["req"] for row in window)
+    p95s = [row["wait_p95_ms"] for row in window if row["wait_p95_ms"] is not None]
+    upstream = [
+        run["upstream_ms_per_req"]
+        for run in runs
+        if run["upstream_ms_per_req"] is not None and now - run["last_ts"] <= PERF_WINDOW_MINUTES * 60
+    ]
+    req_60m = window_sum(raw, until, RATE_WINDOW_MINUTES, "req")
+    return {
+        "wait_p50_ms": sum(row["wait_p50_weighted"] for row in window) / req_15m if req_15m else None,
+        "wait_p95_ms": max(p95s) if p95s else None,
+        "upstream_median_ms": median_or_none(upstream),
+        "r429_rate_60m": window_sum(raw, until, RATE_WINDOW_MINUTES, "r429") / req_60m if req_60m else None,
+        "requests_per_min_5m": window_sum(raw, until, LIMIT_WINDOW_MINUTES, "req") / LIMIT_WINDOW_MINUTES,
+    }
+
+
+def token_mix(minutes: list[dict]) -> list[dict]:
+    """Per-minute tokens split into cache read, uncached input and output."""
+    return [
+        {
+            "t": point["t"],
+            "minute": point["minute"],
+            "cache_read": point["cache_read"],
+            "uncached": point["input"],
+            "output": point["output"],
+        }
+        for point in minutes
+    ]
+
+
+def top_consumers(runs: list[dict], day: float, tokens_today: int) -> list[dict]:
+    """The runs with the most tokens today, each with its share of today's total."""
+    today = sorted((run for run in runs if run["last_ts"] >= day), key=lambda run: run["total_tokens"], reverse=True)
+    return [
+        {
+            "run": run["run"],
+            "job": run["job"],
+            "total_tokens": run["total_tokens"],
+            "share": run["total_tokens"] / tokens_today if tokens_today else None,
+        }
+        for run in today[:TOP_CONSUMERS]
+    ]
+
+
 def _guard(name: str, errors: dict, fn, default, *args):
     """Run one data source; on failure record its error and return the default."""
     try:
@@ -938,28 +1408,48 @@ def build_summary(home: Path, hours: int = DEFAULT_HOURS, *, now: float | None =
     live = _guard("live", errors, fetch_live, None)
     jobs = _guard("jobs", errors, read_jobs, None, agentq_db)
     samples = _guard("workers", errors, read_samples, [], home / DASH_DB_NAME, float(since))
+    day = day_start(now)
+    run_rows = _guard("runs", errors, read_run_rows, [], agentq_db, int(now - RUN_LOOKBACK_S))
+    verdicts = _guard("verdicts", errors, read_verdicts_today, {}, agentq_db, day)
+    caps = read_caps(home)
     targets = live_targets(live)
     limits = {
         name: {
+            "label": LIMIT_LABELS[name],
             "limit": LIMITS[name],
+            "last_min_frac": last_minute_fraction(raw, until, LIMIT_KEYS[name], LIMITS[name]),
             "avg_5m_frac": average_fraction(raw, until, LIMIT_KEYS[name], LIMITS[name]),
             "target_frac": targets[name],
         }
         for name in LIMIT_KEYS
     }
+    runs = shape_runs(run_rows, now)
+    minutes = minute_series(raw, since, until)
+    kpis = run_kpis(runs, day, caps, verdicts)
     return {
         "generated_at": now,
         "hours": hours,
         "window": {"start": since, "end": until},
         "live": live,
         "limits": limits,
+        "capacity": capacity_headline(limits, live),
         "r429_60m": recent_429s(raw, until),
-        "minutes": minute_series(raw, since, until),
+        "minutes": minutes,
+        "token_mix": token_mix(minutes),
         "jobs": jobs,
         "workers": samples,
-        "caps": read_caps(home),
+        "caps": caps,
+        "runs": runs[:RUN_ROWS],
+        "run_kpis": kpis,
+        "perf_kpis": perf_kpis(raw, until, runs, now),
+        "top_consumers": top_consumers(runs, day, kpis["tokens_today"]),
         "errors": errors,
     }
+
+
+def shape_runs(rows: list[dict], now: float) -> list[dict]:
+    """Every run in the lookback, most recent activity first."""
+    return [shape_run(row, now) for row in rows]
 
 
 def write_sample(dash_db: Path, row: dict) -> None:
