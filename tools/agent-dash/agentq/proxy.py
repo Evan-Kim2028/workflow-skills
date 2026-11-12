@@ -43,7 +43,7 @@ UPSTREAM_PREFIX = "/v1"
 EX_CONFIG = 78
 
 DEFAULT_CONFIG = {
-    "port": 8790,
+    "port": 18790,
     "upstream": DEFAULT_UPSTREAM,
     "window_s": 60.0,
     "start_target": 0.95,

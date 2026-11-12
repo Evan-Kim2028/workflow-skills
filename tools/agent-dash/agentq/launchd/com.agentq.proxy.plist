@@ -15,7 +15,7 @@
         <key>AGENTQ_HOME</key>
         <string>__HOME__/.local/state/agentq</string>
         <key>AGENTQ_PROXY_PORT</key>
-        <string>8790</string>
+        <string>18790</string>
         <key>PYTHONUNBUFFERED</key>
         <string>1</string>
     </dict>
