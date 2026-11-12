@@ -50,6 +50,9 @@ the response replaces the estimate.
 - Below `fast_until` (0.9) a saturated budget with no 429 in the last
   `fast_interval_s` (10 s) raises its target by `fast_step_up` (0.05) every
   `fast_interval_s`, so a 0.6 floor recovers to 0.9 in about 60 s of demand.
+  A 429 also sets the budget's `fast_limit` to the target it cut to, and the fast
+  ramp stops there: above it the slow rule applies. `fast_limit` clears after 30
+  minutes with no 429 on that budget, and it is kept in `proxy_state.json`.
   Above `fast_until` each full minute with no 429 and blocked demand raises the
   target by `target_step_up` (0.02), up to `target_ceiling` (1.5).
 
@@ -155,6 +158,9 @@ error, a client that left, a timeout, a truncated stream).
   expires when the old window would have, so a restart does not reopen an empty
   budget while Morph still counts the previous minute. Older state seeds nothing,
   and state without `window_used` loads as before.
+- Minute rows: the first flush of a model's minute in a process seeds its counters
+  from the stored `proxy_minutes` row, so a restart adds to the minute instead of
+  replacing it.
 - Prefix memory: each job (or anonymous session) keeps 8-byte digests of
   1024-character blocks, not its prompt. The uncached estimate is accurate to one block (about 256 tokens).
 - Large request bodies (over 256 KiB) are parsed in a worker thread.
