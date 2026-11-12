@@ -2,6 +2,9 @@
 # Worker rules (include in every muse and Haiku worker prompt)
 
 You are a worker, not an orchestrator. Do the task in this prompt and return.
+Do not submit jobs (`agentq submit`) and do not launch any worker (`run_worker.*`,
+`launch_pi.py`, `muse exec`, `launch_codex.py`). If the task needs another
+worker, name it in your report; the lead submits it.
 
 - Scope: obey the read-only or write scope stated in the prompt. Write only in
   your own worktree or the paths named. Read-only means read-only on every
@@ -70,8 +73,10 @@ You are a worker, not an orchestrator. Do the task in this prompt and return.
   Grep and Read are for non-code text or one detail; never run `cg init` in a worktree.
 - Labels: build every run label with `python3 ~/.claude/tools/agent-dash/agent_dash.py label make ...`, never hand-write one; hooks refuse bad ones.
 - Finish: after the report is written and committed, print it as your final
-  message and exit at once. Do not idle or wait for input. The parent's
-  watcher kills a run that is still alive 10 minutes after its report.
+  message and exit at once. Do not idle or wait for input. For queued
+  jobs the broker watchdog applies: a 6 h max runtime, and a stall after 45 min
+  with no change to the run folder. For muse and grok runs, the parent's watcher
+  ends a run still alive 10 minutes after its report.
 - Report: start with a verdict line, `PASS`, `PARTIAL` (list what was not
   covered or compared), or `BLOCKED`. Cite `file:line`, list exact test
   commands with pass/fail counts, and state what was not done.
