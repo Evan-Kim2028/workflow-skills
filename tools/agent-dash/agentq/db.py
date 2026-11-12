@@ -1,9 +1,10 @@
 """agentq schema, migrations and the job and event write helpers.
 
 This module is the only code that writes the ``jobs`` and ``events`` tables.
-The broker daemon and the CLI both call it. Every state change runs inside one
-``BEGIN IMMEDIATE`` transaction (``tx``), so processes sharing the WAL file
-serialize on the write lock and no reader sees half a change.
+The broker daemon and the CLI both call it. A state change is one conditional
+``UPDATE ... WHERE state IN (...)`` inside one ``BEGIN IMMEDIATE`` transaction
+(``transition``), so a change that lost a race (a cancel, a finish) matches no
+row, writes no event, and the caller sees ``False``.
 """
 
 from __future__ import annotations
@@ -21,6 +22,7 @@ RESOURCES = ("light", "tests", "ssh")
 OPEN_STATES = ("queued", "running")
 TERMINAL_STATES = ("done", "failed", "cancelled")
 AGING_S = 15 * 60
+MAX_RUNTIME_S = 6 * 3600
 DEFAULT_HOME = "~/.local/state/agentq"
 
 _STATEMENTS = (
@@ -43,6 +45,10 @@ _STATEMENTS = (
         pid_start TEXT,
         pi_session TEXT,
         attempt INTEGER NOT NULL DEFAULT 0,
+        rate_attempts INTEGER NOT NULL DEFAULT 0,
+        watchdog_trips INTEGER NOT NULL DEFAULT 0,
+        capacity_refusals INTEGER NOT NULL DEFAULT 0,
+        max_runtime_s REAL NOT NULL DEFAULT 21600,
         not_before REAL NOT NULL DEFAULT 0,
         verdict TEXT,
         report_path TEXT,
@@ -67,11 +73,12 @@ JOB_COLUMNS = frozenset(
     {
         "id", "queue_seq", "lane", "state", "kind", "res", "tier", "label",
         "workspace", "session", "harness", "prompt_path", "run_dir", "pid",
-        "pgid", "pid_start", "pi_session", "attempt", "not_before", "verdict",
-        "report_path", "detail", "submitted_at", "started_at", "finished_at",
-        "priority_age_at",
+        "pgid", "pid_start", "pi_session", "attempt", "rate_attempts",
+        "watchdog_trips", "capacity_refusals", "max_runtime_s", "not_before",
+        "verdict", "report_path", "detail", "submitted_at", "started_at",
+        "finished_at", "priority_age_at",
     }
-)
+)  # fmt: skip
 
 
 def home_dir(env=None) -> Path:
@@ -94,7 +101,7 @@ def new_job_id() -> str:
 
 
 def connect(home) -> sqlite3.Connection:
-    """Open (and create or migrate) the store. Autocommit; use ``tx`` to write."""
+    """Open (and create or migrate) the store. Autocommit; writes go through ``tx``."""
     Path(home).mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(db_path(home), timeout=5.0, isolation_level=None)
     conn.row_factory = sqlite3.Row
@@ -115,7 +122,7 @@ def migrate(conn: sqlite3.Connection) -> None:
 
 @contextlib.contextmanager
 def tx(conn: sqlite3.Connection):
-    """One write transaction; rolls back on any exception."""
+    """One write transaction; rolls back on any exception. Do not nest."""
     conn.execute("BEGIN IMMEDIATE")
     try:
         yield conn
@@ -136,6 +143,7 @@ def insert_job(conn, job: dict, now: float) -> None:
     """Queue a new job at the back of the queue. Call inside ``tx``."""
     seq = conn.execute("SELECT COALESCE(MAX(queue_seq), 0) + 1 FROM jobs").fetchone()[0]
     row = {
+        "max_runtime_s": MAX_RUNTIME_S,
         **job,
         "queue_seq": seq,
         "state": "queued",
@@ -150,6 +158,28 @@ def insert_job(conn, job: dict, now: float) -> None:
     add_event(conn, job["id"], "submit", f"{job['kind']} {job['tier']} {job['lane']}", now)
 
 
+def transition(conn, job_id: str, from_states, now: float, kind: str | None, note: str, **fields) -> bool:
+    """Set ``fields`` only if the job is still in one of ``from_states``.
+
+    Returns False and writes nothing when the job has moved on (a cancel or a
+    finish won the race). ``kind=None`` updates without an event row. One
+    transaction; the caller must not hold ``tx``.
+    """
+    unknown = set(fields) - JOB_COLUMNS
+    if unknown:
+        raise ValueError(f"not a jobs column: {sorted(unknown)}")
+    assignments = ", ".join(f"{name} = ?" for name in fields)
+    marks = ", ".join("?" for _ in from_states)
+    sql = f"UPDATE jobs SET {assignments} WHERE id = ? AND state IN ({marks})"
+    with tx(conn):
+        cur = conn.execute(sql, (*fields.values(), job_id, *from_states))
+        if cur.rowcount != 1:
+            return False
+        if kind is not None:
+            add_event(conn, job_id, kind, note, now)
+    return True
+
+
 def front_queue_seq(conn, lane: str) -> int:
     """A queue position ahead of every queued job in ``lane``."""
     row = conn.execute(
@@ -157,15 +187,6 @@ def front_queue_seq(conn, lane: str) -> int:
         (lane,),
     ).fetchone()
     return row[0]
-
-
-def update_job(conn, job_id: str, **fields) -> None:
-    """Set columns on one job. Call inside ``tx``."""
-    unknown = set(fields) - JOB_COLUMNS
-    if unknown:
-        raise ValueError(f"not a jobs column: {sorted(unknown)}")
-    assignments = ", ".join(f"{name} = ?" for name in fields)
-    conn.execute(f"UPDATE jobs SET {assignments} WHERE id = ?", (*fields.values(), job_id))
 
 
 def get_job(conn, job_id: str) -> dict | None:

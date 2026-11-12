@@ -30,7 +30,7 @@
     <key>KeepAlive</key>
     <true/>
     <key>ThrottleInterval</key>
-    <integer>10</integer>
+    <integer>30</integer>
     <key>StandardOutPath</key>
     <string>__HOME__/.local/state/agentq/logs/broker.launchd.log</string>
     <key>StandardErrorPath</key>

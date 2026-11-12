@@ -7,6 +7,8 @@ run_worker.py: it writes a pi-shaped report and starts a real short-lived proces
 
 import io
 import os
+import plistlib
+import signal
 import subprocess
 import sys
 import tempfile
@@ -14,6 +16,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -28,6 +31,15 @@ class Clock:
 
     def __call__(self):
         return self.t
+
+
+def write_session(run_dir, sid):
+    """A session file named the way pi names them: timestamp, underscore, uuid."""
+    sessions = Path(run_dir) / "pi" / "sessions"
+    sessions.mkdir(parents=True, exist_ok=True)
+    path = sessions / f"2026-11-12T14-38-41-598Z_{sid}.jsonl"
+    path.write_text('{"type":"session"}\n', encoding="utf-8")
+    return path
 
 
 class FakeLauncher:
@@ -108,17 +120,17 @@ def write_config(home, slots=None, tiers=None):
     (home / "broker.json").write_text(json.dumps(data), encoding="utf-8")
 
 
-def set_running(home, job_id, *, pid=None, run_dir=None, attempt=0, pi_session=None):
+def set_running(home, job_id, *, pid=None, run_dir=None, attempt=0, pi_session=None, rate_attempts=0):
     conn = db.connect(home)
-    info = B.process_info(pid) if pid else None
-    with db.tx(conn):
-        db.update_job(
-            conn, job_id, state="running", pid=pid,
-            pgid=B.process_group(pid) if pid else None,
-            pid_start=info[0] if info else None,
-            run_dir=str(run_dir) if run_dir else None, attempt=attempt,
-            pi_session=pi_session, started_at=0.0,
-        )
+    found = B.probe(pid) if pid else None
+    db.transition(
+        conn, job_id, B.ALL_STATES, time.time(), None, "",
+        state="running", pid=pid,
+        pgid=B.process_group(pid) if pid else None,
+        pid_start=found.start if found else None,
+        run_dir=str(run_dir) if run_dir else None, attempt=attempt,
+        pi_session=pi_session, started_at=time.time(), rate_attempts=rate_attempts,
+    )
 
 
 def row(home, job_id):
@@ -323,9 +335,10 @@ class RecoveryTests(ProcessCleanup):
         other = submit(self.env, self.prompt, label="other")
         job_id = submit(self.env, self.prompt, label="requeue")
         run_dir = self.tmp / "run"
-        (run_dir / "pi").mkdir(parents=True)
+        sid = "b7f1c2d4-1111-4222-8333-444455556666"
+        session_file = write_session(run_dir, sid)
         (run_dir / "pi" / "pi-sessions.tsv").write_text(
-            "label\tsession_id\tstarted_epoch\tmodel\ttier\nrequeue\tsid-123\t1\tm\tpi-kimi\n",
+            f"label\tsession_id\tstarted_epoch\tmodel\ttier\nrequeue\t{sid}\t1\tm\tpi-kimi\n",
             encoding="utf-8",
         )
         set_running(self.home, job_id, pid=dead_pid(), run_dir=run_dir)
@@ -334,9 +347,10 @@ class RecoveryTests(ProcessCleanup):
         make_broker(self.home, launcher).tick()
         self.assertEqual(launcher.calls[0]["id"], job_id)
         self.assertEqual(launcher.calls[0]["attempt"], 1)
-        self.assertEqual(launcher.calls[0]["env"]["AGENTQ_RESUME_SESSION"], "sid-123")
+        self.assertEqual(launcher.calls[0]["env"]["AGENTQ_RESUME_SESSION"], str(session_file))
+        self.assertNotIn("AGENTQ_RESUME_DIR", launcher.calls[0]["env"])
         self.assertEqual(row(self.home, other)["state"], "queued")
-        self.assertEqual(row(self.home, job_id)["pi_session"], "sid-123")
+        self.assertEqual(row(self.home, job_id)["pi_session"], sid)
 
     def test_third_death_without_report_fails(self):
         job_id = submit(self.env, self.prompt, label="doomed")
@@ -358,14 +372,14 @@ class RecoveryTests(ProcessCleanup):
         job = row(self.home, job_id)
         self.assertEqual((job["state"], job["attempt"]), ("queued", 1))
         self.assertGreater(job["not_before"], clock.t)
-        clock.t += B.RATE_LIMIT_BACKOFF_S + 1
+        clock.t += B.RATE_BACKOFF_S + 1
         self.assertEqual(broker.tick(), [job_id])
 
     def test_rate_limit_in_err_log_requeues_without_attempt(self):
         job_id = submit(self.env, self.prompt, label="ratelimit")
         run_dir = self.tmp / "run"
         (run_dir / "pi").mkdir(parents=True)
-        (run_dir / "pi" / "err-ratelimit.log").write_text("HTTP 429 rate_limit_error\n", encoding="utf-8")
+        (run_dir / "pi" / "err-ratelimit.log").write_text('429: {"error": {"type": "rate_limit_error"}}\n', encoding="utf-8")
         set_running(self.home, job_id, pid=dead_pid(), run_dir=run_dir)
         make_broker(self.home, self.fake(report=False), clock=Clock(0.0)).tick()
         job = row(self.home, job_id)
@@ -392,7 +406,7 @@ class CancelAndEscalateTests(ProcessCleanup):
         code, out = run_cli(self.env, ["cancel", job_id])
         self.assertEqual(code, 0, out)
         self.assertEqual(row(self.home, job_id)["state"], "cancelled")
-        self.assertEqual(group.wait(timeout=10), -signal_term())
+        self.assertEqual(group.wait(timeout=10), -signal.SIGTERM)
 
     def test_cancel_queued_drops_it(self):
         job_id = submit(self.env, self.prompt, label="drop")
@@ -406,8 +420,7 @@ class CancelAndEscalateTests(ProcessCleanup):
     def test_escalate_without_argument_moves_only_this_sessions_open_jobs(self):
         mine = submit(self.env, self.prompt, label="mine")
         done = submit(self.env, self.prompt, label="done")
-        with db.tx(db.connect(self.home)) as conn:
-            db.update_job(conn, done, state="done")
+        db.transition(db.connect(self.home), done, B.ALL_STATES, 0.0, None, "", state="done")
         theirs = submit(env_for(self.home, "sess-b"), self.prompt, label="theirs")
         code, out = run_cli(self.env, ["escalate"])
         self.assertEqual(code, 0, out)
@@ -439,10 +452,261 @@ class DaemonLockTests(ProcessCleanup):
         self.assertIn("daemon running", out)
 
 
-def signal_term():
-    import signal
+class ReviewFixTests(ProcessCleanup):
+    def fake_run_worker(self, stdout):
+        """Patch run_worker.py calls to return a canned STATUS line; ps and others run for real."""
+        real_run = subprocess.run
 
-    return signal.SIGTERM
+        def fake(cmd, **kw):
+            if len(cmd) > 1 and str(cmd[1]).endswith("run_worker.py"):
+                return subprocess.CompletedProcess(cmd, 0, stdout=stdout, stderr="")
+            return real_run(cmd, **kw)
+
+        return mock.patch.object(B.subprocess, "run", fake)
+
+    def test_01_capacity_refusal_waits_without_attempt_and_logs_one_event(self):
+        job_id = submit(self.env, self.prompt, label="cap")
+        clock = Clock(1000.0)
+        broker = make_broker(self.home, B.run_worker_launcher, clock=clock)
+        line = "STATUS: failed out=x err=y tier=pi-deepseek-flash reason=none-available\n"
+        with self.fake_run_worker(line):
+            for _ in range(4):
+                broker.tick()
+                clock.t += 25
+        job = row(self.home, job_id)
+        self.assertEqual((job["state"], job["attempt"], job["capacity_refusals"]), ("queued", 0, 4))
+        self.assertGreater(job["not_before"], 1000.0)
+        kinds = [e["kind"] for e in db.connect(self.home).execute(
+            "SELECT kind FROM events WHERE job_id = ?", (job_id,)).fetchall()]  # fmt: skip
+        self.assertEqual(kinds.count("capacity-wait"), 1)
+        self.assertNotIn("failed", kinds)
+
+    def test_02_resume_passes_the_session_file_path(self):
+        job_id = submit(self.env, self.prompt, label="resume")
+        run_dir = self.tmp / "run-old"
+        sid = "b7f1c2d4-1111-4222-8333-444455556666"
+        session_file = write_session(run_dir, sid)
+        (run_dir / "pi" / "pi-sessions.tsv").write_text(
+            f"label\tsession_id\tstarted_epoch\tmodel\ttier\nresume\t{sid}\t1\tm\tpi-kimi\n", encoding="utf-8")
+        set_running(self.home, job_id, pid=dead_pid(), run_dir=run_dir)
+        launcher = self.fake()
+        make_broker(self.home, launcher).tick()
+        env = launcher.calls[0]["env"]
+        self.assertEqual(env["AGENTQ_RESUME_SESSION"], str(session_file))
+        self.assertTrue(env["AGENTQ_RESUME_SESSION"].endswith(f"_{sid}.jsonl"))
+        self.assertNotIn("AGENTQ_RESUME_DIR", env)
+
+    def test_03_cancel_during_launch_stops_the_new_worker(self):
+        job_id = submit(self.env, self.prompt, label="race")
+        spawned = []
+
+        def racing_launcher(job, run_dir, env):
+            cli.main(["cancel", job["id"]], env=self.env, out=io.StringIO())
+            proc = subprocess.Popen(["sleep", "30"], start_new_session=True)
+            spawned.append(proc)
+            Path(run_dir).mkdir(parents=True, exist_ok=True)
+            (Path(run_dir) / f"{job['label']}.pid").write_text(str(proc.pid))
+            return proc.pid
+
+        self.assertEqual(make_broker(self.home, racing_launcher).tick(), [])
+        self.assertEqual(row(self.home, job_id)["state"], "cancelled")
+        self.assertEqual(spawned[0].wait(timeout=10), -signal.SIGTERM)
+
+    def test_04_terminal_state_is_never_overwritten(self):
+        job_id = submit(self.env, self.prompt, label="term")
+        conn = db.connect(self.home)
+        db.transition(conn, job_id, db.OPEN_STATES, 1.0, None, "", state="done", verdict="PASS")
+        code, out = run_cli(self.env, ["cancel", job_id])
+        self.assertEqual(code, 1)
+        self.assertIn("is already done", out)
+        code, _ = run_cli(self.env, ["escalate", job_id])
+        self.assertEqual(code, 1)
+        self.assertFalse(db.transition(conn, job_id, ("running",), 2.0, "finish", "x", state="failed"))
+        self.assertEqual(row(self.home, job_id)["state"], "done")
+
+    def test_05_unknown_probe_skips_the_job_and_never_requeues(self):
+        job_id = submit(self.env, self.prompt, label="unknown")
+        live = subprocess.Popen(["sleep", "30"], start_new_session=True)
+        self.addCleanup(lambda: (live.kill(), live.wait()))
+        set_running(self.home, job_id, pid=live.pid, run_dir=self.tmp / "run")
+        real_run = subprocess.run
+
+        def ps_times_out(cmd, **kw):
+            if cmd and cmd[0] == "ps":
+                raise subprocess.TimeoutExpired(cmd, 5)
+            return real_run(cmd, **kw)
+
+        launcher = self.fake()
+        with mock.patch.object(B.subprocess, "run", ps_times_out):
+            make_broker(self.home, launcher).tick()
+        job = row(self.home, job_id)
+        self.assertEqual((job["state"], job["attempt"], job["pid"]), ("running", 0, live.pid))
+        self.assertEqual(launcher.calls, [])
+
+    def test_05b_launcher_timeout_adopts_the_pid_file(self):
+        run_dir = self.tmp / "timeout-run"
+        run_dir.mkdir()
+        live = subprocess.Popen(["sleep", "30"], start_new_session=True)
+        self.addCleanup(lambda: (live.kill(), live.wait()))
+        (run_dir / "tmo.pid").write_text(str(live.pid))
+        job = {"tier": "pi-kimi", "label": "tmo", "workspace": str(self.tmp),
+               "prompt_path": str(self.prompt)}  # fmt: skip
+        real_run = subprocess.run
+
+        def run_worker_hangs(cmd, **kw):
+            if len(cmd) > 1 and str(cmd[1]).endswith("run_worker.py"):
+                raise subprocess.TimeoutExpired(cmd, 300)
+            return real_run(cmd, **kw)
+
+        with mock.patch.object(B.subprocess, "run", run_worker_hangs):
+            self.assertEqual(B.run_worker_launcher(job, run_dir, dict(os.environ)), live.pid)
+            (run_dir / "tmo.pid").unlink()
+            with self.assertRaises(B.LaunchError):
+                B.run_worker_launcher(job, run_dir, dict(os.environ))
+
+    def test_06_pid_file_adoption_requires_identity(self):
+        run_dir = self.tmp / "run"
+        run_dir.mkdir()
+        other = subprocess.Popen(["sleep", "30"], start_new_session=True)
+        self.addCleanup(lambda: (other.kill(), other.wait()))
+        (run_dir / "ident-job.pid").write_text(str(other.pid))
+        job_id = submit(self.env, self.prompt, label="ident-job")
+        set_running(self.home, job_id, run_dir=run_dir)
+        launcher = self.fake(report=False)
+        make_broker(self.home, launcher).tick()
+        job = row(self.home, job_id)
+        self.assertNotEqual(job["pid"], other.pid)
+        self.assertEqual(job["attempt"], 1)
+        self.assertEqual(len(launcher.calls), 1)
+
+    def test_06b_pid_file_with_a_named_process_is_adopted(self):
+        run_dir = self.tmp / "run"
+        run_dir.mkdir()
+        named = subprocess.Popen(["sh", "-c", "sleep 30; true", "named-job"], start_new_session=True)
+        self.addCleanup(lambda: (named.kill(), named.wait()))
+        (run_dir / "named-job.pid").write_text(str(named.pid))
+        job_id = submit(self.env, self.prompt, label="named-job")
+        set_running(self.home, job_id, run_dir=run_dir)
+        launcher = self.fake()
+        make_broker(self.home, launcher).tick()
+        job = row(self.home, job_id)
+        self.assertEqual((job["state"], job["pid"]), ("running", named.pid))
+        self.assertEqual(launcher.calls, [])
+
+    def test_07_quota_marker_matches_only_this_label(self):
+        run = self.tmp / "run"
+        (run / "pi").mkdir(parents=True)
+        (run / "pi" / "QUOTA-other").write_text("")
+        (run / "pi" / "QUOTA").write_text("model\tm\nlabel\tother-job\n")
+        self.assertFalse(B.quota_marked(run, "mine"))
+        (run / "pi" / "QUOTA").write_text("model\tm\nlabel\tmine-two\n")
+        self.assertFalse(B.quota_marked(run, "mine"))
+        (run / "pi" / "QUOTA").write_text("model\tm\nlabel\tmine\n")
+        self.assertTrue(B.quota_marked(run, "mine"))
+        (run / "pi" / "QUOTA").unlink()
+        (run / "pi" / "QUOTA-mine").write_text("")
+        self.assertTrue(B.quota_marked(run, "mine"))
+
+    def test_08_429_matches_only_structured_pi_error_text(self):
+        run = self.tmp / "run"
+        (run / "pi").mkdir(parents=True)
+        err = run / "pi" / "err-l.log"
+        cases = {
+            "HTTP 429 rate_limit_error\n": False,
+            "request 4290 accepted\n": False,
+            '429: {"error": {"type": "rate_limit_error"}}\n': True,
+            "Rate limit exceeded for account\n": True,
+        }
+        for text, expected in cases.items():
+            err.write_text(text, encoding="utf-8")
+            self.assertEqual(B.rate_limited(run, "l"), expected, text)
+
+    def test_09_rate_requeues_are_capped_at_twenty(self):
+        job_id = submit(self.env, self.prompt, label="capped")
+        run_dir = self.tmp / "run"
+        (run_dir / "pi").mkdir(parents=True)
+        (run_dir / "pi" / "QUOTA-capped").write_text("")
+        set_running(self.home, job_id, pid=dead_pid(), run_dir=run_dir, rate_attempts=20)
+        make_broker(self.home, self.fake()).tick()
+        job = row(self.home, job_id)
+        self.assertEqual(job["state"], "failed")
+        self.assertIn("rate-limited", job["detail"])
+
+    def test_09b_rate_requeue_increments_the_separate_counter(self):
+        job_id = submit(self.env, self.prompt, label="counted")
+        run_dir = self.tmp / "run"
+        (run_dir / "pi").mkdir(parents=True)
+        (run_dir / "pi" / "QUOTA-counted").write_text("")
+        set_running(self.home, job_id, pid=dead_pid(), run_dir=run_dir, attempt=1)
+        make_broker(self.home, self.fake(), clock=Clock(0.0)).tick()
+        job = row(self.home, job_id)
+        self.assertEqual((job["state"], job["rate_attempts"], job["attempt"]), ("queued", 1, 1))
+
+    def test_10_saturated_proxy_still_launches_urgent_jobs(self):
+        normal = submit(self.env, self.prompt, label="n")
+        urgent = submit(self.env, self.prompt, "--urgent", label="u")
+        broker = make_broker(self.home, self.fake(live_s=30), proxy=lambda: {"saturated": True})
+        self.assertEqual(broker.tick(), [urgent])
+        self.assertEqual(row(self.home, normal)["state"], "queued")
+
+    def test_11_max_runtime_kills_the_worker_and_fails_the_job(self):
+        job_id = submit(self.env, self.prompt, "--max-runtime", "5", label="slow")
+        launcher = self.fake(live_s=30, report=False)
+        clock = Clock(1000.0)
+        broker = make_broker(self.home, launcher, clock=clock)
+        broker.tick()
+        clock.t = 1010.0
+        broker.tick()
+        job = row(self.home, job_id)
+        self.assertEqual(job["state"], "failed")
+        self.assertIn("max runtime 5s exceeded", job["detail"])
+        self.assertEqual(launcher.procs[0].wait(timeout=10), -signal.SIGTERM)
+
+    def test_12_stalled_worker_is_requeued_once_then_failed(self):
+        job_id = submit(self.env, self.prompt, label="stall")
+        launcher = self.fake(live_s=30, report=False)
+        real = time.time()
+        clock = Clock(real)
+        broker = make_broker(self.home, launcher, clock=clock)
+        broker.tick()
+        clock.t = real + B.STALL_S + 60
+        broker.tick()
+        job = row(self.home, job_id)
+        self.assertEqual((job["state"], job["watchdog_trips"], job["attempt"]), ("running", 1, 1))
+        self.assertEqual(launcher.procs[0].wait(timeout=10), -signal.SIGTERM)
+        clock.t = real + 2 * (B.STALL_S + 60)
+        broker.tick()
+        job = row(self.home, job_id)
+        self.assertEqual(job["state"], "failed")
+        self.assertIn("stalled", job["detail"])
+
+    def test_13_verdict_is_the_last_verdict_line(self):
+        cases = {
+            "PASS (no BLOCKED items)": "PASS",
+            "Summary\nPARTIAL\n\nverdict: BLOCKED": "BLOCKED",
+            "verdict - pass\nall fine": "PASS",
+            "no verdict here PASS": "none",
+            "BLOCKED by upstream\n\nPASS": "PASS",
+        }
+        for text, expected in cases.items():
+            self.assertEqual(B.verdict_of(text), expected, text)
+
+    def test_14_second_daemon_exits_zero_and_logs(self):
+        handle = B.acquire_lock(self.home)
+        self.addCleanup(handle.close)
+        out = io.StringIO()
+        code = cli.main(["daemon"], env=self.env, out=out)
+        self.assertEqual(code, 0)
+        self.assertIn("ANSWER:", out.getvalue())
+        self.assertIn("second daemon exits", (self.home / "logs" / "broker.log").read_text(encoding="utf-8"))
+
+    def test_15_plist_throttles_restarts_to_30_seconds(self):
+        data = plistlib.loads((ROOT / "agentq" / "launchd" / "com.agentq.broker.plist").read_bytes())
+        self.assertEqual(data["ThrottleInterval"], 30)
+
+    def test_16_submit_takes_max_runtime(self):
+        job_id = submit(self.env, self.prompt, "--max-runtime", "120", label="mr")
+        self.assertEqual(row(self.home, job_id)["max_runtime_s"], 120.0)
 
 
 if __name__ == "__main__":
