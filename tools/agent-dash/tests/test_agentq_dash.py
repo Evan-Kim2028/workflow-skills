@@ -21,7 +21,16 @@ UNTIL = int(NOW // 60) * 60
 JOB_DDL = """
 CREATE TABLE jobs (
     id TEXT PRIMARY KEY, state TEXT NOT NULL, lane TEXT NOT NULL, tier TEXT NOT NULL,
-    kind TEXT NOT NULL, verdict TEXT, submitted_at REAL NOT NULL, started_at REAL, finished_at REAL
+    kind TEXT NOT NULL, verdict TEXT, submitted_at REAL NOT NULL, started_at REAL, finished_at REAL,
+    label TEXT NOT NULL DEFAULT ''
+)
+"""
+PROXY_JOBS_DDL = """
+CREATE TABLE proxy_jobs (
+    job TEXT NOT NULL, model TEXT NOT NULL, first_ts REAL, last_ts REAL,
+    req INT, ok INT, r429 INT, input INT, cache_read INT, output INT,
+    wait_ms_total INT, upstream_ms_total INT,
+    PRIMARY KEY (job, model)
 )
 """
 MINUTE_COLUMNS = "minute, model, req, ok, r429, input, cache_read, output, uncached_est, wait_p50_ms, wait_p95_ms, target"
@@ -57,11 +66,12 @@ def make_home(tmp: Path, *, minutes=True, jobs=True) -> Path:
         if jobs:
             conn.execute(JOB_DDL)
             conn.executemany(
-                "INSERT INTO jobs VALUES (?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO jobs (id, state, lane, tier, kind, verdict, submitted_at, started_at, finished_at, label) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?)",
                 [
-                    ("a" * 12, "queued", "normal", "pi-deepseek-flash", "read", None, NOW - 30, None, None),
-                    ("b" * 12, "running", "urgent", "pi-kimi", "review", None, NOW - 90, NOW - 80, None),
-                    ("c" * 12, "done", "normal", "pi-deepseek-flash", "write", "PASS", NOW - 600, NOW - 580, NOW - 500),
+                    ("a" * 12, "queued", "normal", "pi-deepseek-flash", "read", None, NOW - 30, None, None, "queued-read"),
+                    ("b" * 12, "running", "urgent", "pi-kimi", "review", None, NOW - 90, NOW - 80, None, "review-kimi"),
+                    ("c" * 12, "done", "normal", "pi-deepseek-flash", "write", "PASS", NOW - 600, NOW - 580, NOW - 500, "write-ds"),
                 ],
             )
         conn.commit()
@@ -270,7 +280,10 @@ class ServerTest(unittest.TestCase):
         self.assertIn("<!DOCTYPE html>", html)
         for title in (
             "Billed use, % of each Morph limit, per minute",
-            "Workers",
+            "Active runs over time, with caps",
+            "Tokens per minute, millions",
+            "Runs",
+            "Top consumers today",
             "Upstream 429s per minute",
             "Wait p95 per minute",
             "Recent jobs",
@@ -285,7 +298,10 @@ class ServerTest(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(ctype, "application/json")
         data = json.loads(body)
-        for key in ("live", "limits", "minutes", "jobs", "workers", "caps", "errors", "r429_60m", "window"):
+        for key in (
+            "live", "limits", "capacity", "minutes", "token_mix", "jobs", "workers", "caps", "runs",
+            "run_kpis", "perf_kpis", "top_consumers", "errors", "r429_60m", "window",
+        ):
             self.assertIn(key, data)
         self.assertEqual(data["hours"], 1)
         self.assertIsNone(data["live"])
@@ -313,7 +329,189 @@ class PlistAndPageTest(unittest.TestCase):
     def test_page_script_has_no_obvious_syntax_break(self) -> None:
         self.assertIn("visibilitychange", dash.PAGE_HTML)
         self.assertIn("api/summary", dash.PAGE_HTML)
-        self.assertIn("15000", dash.PAGE_HTML)
+
+    def test_poll_interval_is_thirty_seconds_in_the_served_html(self) -> None:
+        self.assertIn("var POLL_MS = 30000;", dash.PAGE_HTML)
+        self.assertNotIn("POLL_MS = 15000", dash.PAGE_HTML)
+
+
+DAY_START = dash.day_start(NOW)
+RUN_TODAY = max(NOW - 30, DAY_START)
+
+
+def make_runs_home(tmp: Path, *, proxy_jobs=True) -> Path:
+    home = make_home(tmp)
+    conn = sqlite3.connect(home / "agentq.db")
+    conn.execute("DROP TABLE jobs")
+    conn.execute(JOB_DDL)
+    conn.executemany(
+        "INSERT INTO jobs (id, state, lane, tier, kind, verdict, submitted_at, started_at, finished_at, label) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?)",
+        [
+            ("a" * 12, "queued", "normal", "pi-deepseek-flash", "read", None, NOW - 900, None, None, "hub-exec-agentq-18f40a1d"),
+            ("b" * 12, "running", "urgent", "pi-kimi", "review", None, NOW - 900, NOW - 880, None, "hub-review-agentq-460a92e5"),
+            ("c" * 12, "done", "normal", "pi-deepseek-flash", "write", "PASS", NOW - 900, NOW - 880, NOW - 200, "write-ds"),
+            ("d" * 12, "done", "normal", "pi-deepseek-flash", "write", "FAIL", NOW - 900, NOW - 880, NOW - 300, "write-fail"),
+            ("e" * 12, "done", "normal", "pi-kimi", "review", "PARTIAL", NOW - 3 * 86400, NOW - 3 * 86400, NOW - 2 * 86400, "old-partial"),
+        ],
+    )
+    if proxy_jobs:
+        conn.execute(PROXY_JOBS_DDL)
+        conn.executemany(
+            "INSERT INTO proxy_jobs VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            [
+                ("a" * 12, "morph-dsv41flash-1017", NOW - 600, RUN_TODAY, 4, 4, 1, 1000, 3000, 500, 800, 4000),
+                ("b" * 12, "morph-kimik31", NOW - 900, NOW - 100, 10, 10, 2, 5000, 0, 200, 2000, 20000),
+                ("c" * 12, "morph-dsv41flash-1017", NOW - 300, NOW - 200, 1, 1, 0, 100, 0, 50, 10, 200),
+                ("none", "morph-dsv41flash-1017", NOW - 60, NOW - 50, 2, 2, 0, 300, 0, 100, 40, 1000),
+                ("hub-direct-launch-x", "morph-kimik31", NOW - 9 * 86400, NOW - 8 * 86400, 1, 1, 0, 50, 0, 5, 5, 100),
+            ],
+        )
+    conn.commit()
+    conn.close()
+    return home
+
+
+def live_with_queue():
+    status = proxy_status()
+    status["queued"] = {"urgent": 0, "normal": 2, "backlog": 1}
+    return status
+
+
+class RunsTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.home = make_runs_home(Path(self.tmp.name))
+        self.summary = dash.build_summary(self.home, 1, now=NOW, fetch_live=live_with_queue)
+        self.runs = {run["job"]: run for run in self.summary["runs"]}
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def test_queue_run_takes_its_label_from_the_jobs_table(self) -> None:
+        run = self.runs["a" * 12]
+        self.assertEqual(run["run"], "hub-exec-agentq-18f40a1d")
+        self.assertEqual(run["status"], "queued")
+        self.assertEqual(run["tier"], "pi-deepseek-flash")
+        self.assertEqual(run["total_tokens"], 1000 + 3000 + 500)
+        self.assertEqual(run["cache_read_pct"], 0.75)
+        self.assertEqual(run["avg_wait_s"], 0.2)
+        self.assertEqual(run["avg_upstream_s"], 1.0)
+        self.assertEqual(run["duration_s"], RUN_TODAY - (NOW - 600))
+
+    def test_direct_launch_keeps_its_job_string_and_active_state(self) -> None:
+        run = self.runs["none"]
+        self.assertEqual(run["run"], "none")
+        self.assertFalse(run["queue"])
+        self.assertEqual(run["status"], "active")
+        self.assertIsNone(run["verdict"])
+
+    def test_queue_status_comes_from_jobs_not_from_proxy_recency(self) -> None:
+        self.assertEqual(self.runs["b" * 12]["status"], "running")
+        self.assertEqual(self.runs["b" * 12]["verdict"], None)
+        self.assertEqual(self.runs["c" * 12]["verdict"], "PASS")
+
+    def test_run_kpis_count_active_runs_against_caps(self) -> None:
+        kpis = self.summary["run_kpis"]
+        self.assertEqual(kpis["active_deepseek"], 1)
+        self.assertEqual(kpis["active_kimi"], 1)
+        self.assertEqual(kpis["cap_deepseek"], 64)
+        self.assertEqual(kpis["cap_kimi"], 2)
+
+    def test_runs_seen_today_are_distinct_jobs_with_activity_today(self) -> None:
+        kpis = self.summary["run_kpis"]
+        self.assertEqual(kpis["seen_today"], 4)
+        self.assertEqual(kpis["tokens_today"], 4500 + 5200 + 150 + 400)
+        self.assertEqual(kpis["median_tokens_per_run"], (400 + 4500) / 2)
+        self.assertEqual(kpis["median_requests_per_run"], 3.0)
+
+    def test_finished_today_counts_queue_verdicts_on_the_local_day(self) -> None:
+        self.assertEqual(self.summary["run_kpis"]["finished_today"], {"PASS": 1, "PARTIAL": 0, "FAIL": 1})
+
+    def test_top_consumers_rank_today_runs_with_share_of_today(self) -> None:
+        top = self.summary["top_consumers"]
+        self.assertEqual([row["job"] for row in top], ["b" * 12, "a" * 12, "none", "c" * 12])
+        self.assertAlmostEqual(top[0]["share"], 5200 / (4500 + 5200 + 150 + 400))
+        self.assertEqual(sum(row["share"] for row in top), 1.0)
+
+    def test_perf_kpis_from_minutes_and_active_runs(self) -> None:
+        perf = self.summary["perf_kpis"]
+        self.assertAlmostEqual(perf["wait_p50_ms"], (300 + 1500 + 100 + 10 + 0) / 5)
+        self.assertEqual(perf["wait_p95_ms"], 2000)
+        self.assertEqual(perf["upstream_median_ms"], 750.0)
+        self.assertEqual(perf["r429_rate_60m"], 0.8)
+        self.assertEqual(perf["requests_per_min_5m"], 0.8)
+
+    def test_capacity_headline_names_the_binding_limit(self) -> None:
+        capacity = self.summary["capacity"]
+        self.assertEqual(capacity["binding"], "output")
+        self.assertEqual(capacity["binding_label"], "DeepSeek output")
+        self.assertEqual(capacity["used_frac"], self.summary["limits"]["output"]["avg_5m_frac"])
+        self.assertEqual(self.summary["limits"]["output"]["last_min_frac"], 0.1)
+        self.assertEqual(capacity["waiting_now"], 3)
+        self.assertEqual(capacity["waiting_by_lane"], {"urgent": 0, "normal": 2, "backlog": 1})
+
+    def test_token_mix_splits_each_minute_into_three_series(self) -> None:
+        by_minute = {row["minute"]: row for row in self.summary["token_mix"]}
+        row = by_minute[minute_at(60)]
+        self.assertEqual(row["cache_read"], 1000)
+        self.assertEqual(row["uncached"], 100 + 2429)
+        self.assertEqual(row["output"], 7000 + 100)
+
+    def test_direct_run_past_the_seven_day_lookback_is_absent(self) -> None:
+        self.assertNotIn("hub-direct-launch-x", self.runs)
+
+
+class CapacityHeadlineTest(unittest.TestCase):
+    def test_binding_limit_is_the_maximum_five_minute_fraction(self) -> None:
+        limits = {
+            "total": {"avg_5m_frac": 0.95},
+            "output": {"avg_5m_frac": 0.9},
+            "uncached": {"avg_5m_frac": 0.2},
+        }
+        headline = dash.capacity_headline(limits, None)
+        self.assertEqual(headline["binding"], "total")
+        self.assertEqual(headline["used_frac"], 0.95)
+        self.assertIsNone(headline["waiting_now"])
+
+    def test_tie_goes_to_the_first_limit_in_order(self) -> None:
+        limits = {"total": {"avg_5m_frac": 0.5}, "output": {"avg_5m_frac": 0.5}, "uncached": {"avg_5m_frac": 0.1}}
+        self.assertEqual(dash.capacity_headline(limits, None)["binding"], "total")
+
+
+class MissingRunsTableTest(unittest.TestCase):
+    def test_missing_proxy_jobs_degrades_only_the_runs_sources(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = make_runs_home(Path(tmp), proxy_jobs=False)
+            summary = dash.build_summary(home, 1, now=NOW, fetch_live=no_proxy)
+            self.assertIn("runs", summary["errors"])
+            self.assertNotIn("minutes", summary["errors"])
+            self.assertNotIn("jobs", summary["errors"])
+            self.assertEqual(summary["runs"], [])
+            self.assertEqual(summary["top_consumers"], [])
+            self.assertEqual(summary["run_kpis"]["seen_today"], 0)
+            self.assertEqual(summary["run_kpis"]["finished_today"], {"PASS": 1, "PARTIAL": 0, "FAIL": 1})
+            self.assertIsNone(summary["perf_kpis"]["upstream_median_ms"])
+            self.assertEqual(summary["jobs"]["by_state"], {"queued": 1, "running": 1, "done": 3})
+            self.assertTrue(summary["minutes"])
+
+    def test_page_and_summary_still_serve_when_proxy_jobs_is_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = make_runs_home(Path(tmp), proxy_jobs=False)
+            server = dash.make_server(home, 0, fetch_live=no_proxy)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                conn = http.client.HTTPConnection("127.0.0.1", server.server_address[1], timeout=10)
+                conn.request("GET", "/api/summary?hours=1")
+                response = conn.getresponse()
+                self.assertEqual(response.status, 200)
+                self.assertIn("runs", json.loads(response.read())["errors"])
+                conn.close()
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=5)
 
 
 if __name__ == "__main__":
