@@ -1,12 +1,14 @@
 """agentq broker: the daemon that reconciles running jobs and launches queued ones.
 
 Each tick (``TICK_S`` seconds) first reconciles every running job against its
-process and its run folder, then launches queued jobs that fit the slot, tier
-and workspace limits. The proxy status is read once per tick: a ``saturated``
-proxy holds back backlog jobs only; normal and urgent jobs launch whenever the
-slot and tier caps allow, since the proxy queues their requests fairly. Each
-tick ends by writing ``broker.heartbeat`` so direct launches can tell the
-broker is alive.
+process and its run folder, then launches queued jobs. The fixed slot and tier
+caps in ``broker.json`` are ceilings. Above them, admission follows real
+headroom (the "adaptive" section of ``broker.json``): a job that calls Morph
+waits only while the proxy queue for its budgets is long, and a ``tests`` or
+``light`` job waits only while the laptop is short of memory or CPU. The proxy
+status and the laptop gauges are read at most once per tick. A held job records
+why it waits in ``jobs.detail``. Each tick ends by writing ``broker.heartbeat``
+so direct launches can tell the broker is alive.
 
 Workers start through ``scripts/run_worker.py`` with max-wait ``0``, which
 returns at once. The worker runs in its own session, so a broker restart does
@@ -51,6 +53,18 @@ PROXY_STATUS_URL = "http://127.0.0.1:18790/agentq/status"
 RUN_WORKER = Path(__file__).resolve().parents[1] / "scripts" / "run_worker.py"
 DEFAULT_SLOTS = {"light": 40, "tests": 6, "ssh": 8}
 DEFAULT_TIERS = {"pi-kimi": 2, "pi-deepseek-flash": 48}
+DEFAULT_ADAPTIVE = {
+    "enabled": True,
+    "max_waiting_requests": 8,
+    "tests_min_free_pct": 35,
+    "tests_max_load_per_cpu": 1.0,
+    "tests_floor": 4,
+    "light_min_free_pct": 20,
+    "gauge_ttl_s": 15.0,
+}
+TIER_BUDGETS = {"pi-deepseek-flash": ("total", "output"), "pi-kimi": ("total", "uncached")}
+LAPTOP_GATED = ("tests", "light")
+MEMORY_FREE_LINE = re.compile(r"System-wide memory free percentage:\s*(\d+(?:\.\d+)?)%")
 VERDICT_LINE = re.compile(r"^\W*(?:verdict\W*)?(PASS|PARTIAL|BLOCKED)\b", re.IGNORECASE)
 RATE_LIMIT_BODY = re.compile(r"\b429\b\s*[:\-]?\s*\{|Rate limit exceeded", re.IGNORECASE)
 LAUNCH_LINE_PREFIX = "launched "
@@ -89,6 +103,7 @@ def load_config(home) -> dict:
     return {
         "slots": _caps(DEFAULT_SLOTS, data.get("slots")),
         "tiers": _caps(DEFAULT_TIERS, data.get("tiers")),
+        "adaptive": _adaptive(data.get("adaptive")),
     }
 
 
@@ -101,6 +116,109 @@ def _caps(defaults: dict, override) -> dict:
             except (TypeError, ValueError):
                 continue
     return caps
+
+
+def _adaptive(override) -> dict:
+    """Adaptive admission settings. Absent means on with defaults; ``enabled: false`` means fixed caps."""
+    settings = dict(DEFAULT_ADAPTIVE)
+    if isinstance(override, dict):
+        for name, value in override.items():
+            if name not in DEFAULT_ADAPTIVE:
+                continue
+            if name == "enabled":
+                settings[name] = bool(value)
+                continue
+            try:
+                settings[name] = float(value)
+            except (TypeError, ValueError):
+                continue
+    return settings
+
+
+def queued_total(budget: dict) -> int:
+    """Requests waiting on one proxy budget across all three lanes."""
+    queued = budget.get("queued")
+    if not isinstance(queued, dict):
+        return 0
+    return sum(int(count) for count in queued.values() if isinstance(count, int))
+
+
+def morph_hold(tier: str, lane: str, status: dict | None, max_waiting: float) -> str | None:
+    """Why a job for ``tier`` must wait on the Morph proxy, or None when it may launch.
+
+    Urgent jobs never wait here. A normal job waits while a budget its model uses has more
+    than ``max_waiting`` requests queued. A backlog job also waits for every such budget to
+    queue nothing. With no status (proxy down) there is no Morph gate.
+    """
+    if status is None or lane == "urgent":
+        return None
+    budgets = status.get("budgets") if isinstance(status.get("budgets"), dict) else {}
+    for name in TIER_BUDGETS.get(tier, ()):
+        budget = budgets.get(name)
+        if not isinstance(budget, dict):
+            continue
+        waiting = queued_total(budget)
+        if waiting > max_waiting:
+            return f"proxy {name} waiting {waiting} > {max_waiting:g}"
+        if lane == "backlog" and waiting > 0:
+            return f"proxy {name} waiting {waiting}; backlog waits for 0"
+    return None
+
+
+def laptop_hold(res: str, gauges: tuple, running_tests: int, adaptive: dict) -> str | None:
+    """Why a ``tests`` or ``light`` job must wait for laptop headroom, or None.
+
+    ``gauges`` is (memory free percent, load per CPU), either may be None when unreadable.
+    An unreadable gauge means no extra gate: the fixed slot caps apply, as with the proxy.
+    ``tests`` jobs below ``tests_floor`` always launch. ``light`` waits only on memory.
+    """
+    free, load = gauges
+    if res == "tests":
+        if running_tests < adaptive["tests_floor"] or free is None or load is None:
+            return None
+        if free < adaptive["tests_min_free_pct"]:
+            return f"memory free {free:.0f}% < {adaptive['tests_min_free_pct']:.0f}%"
+        if load >= adaptive["tests_max_load_per_cpu"]:
+            return f"load {load:.2f} per cpu >= {adaptive['tests_max_load_per_cpu']:g}"
+        return None
+    if res == "light" and free is not None and free < adaptive["light_min_free_pct"]:
+        return f"memory free {free:.0f}% < {adaptive['light_min_free_pct']:.0f}%"
+    return None
+
+
+def memory_free_pct(run=subprocess.run) -> float | None:
+    """Free system memory percent from macOS ``memory_pressure``, or None when unavailable."""
+    try:
+        out = run(["memory_pressure"], capture_output=True, text=True, timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    match = MEMORY_FREE_LINE.search(out or "")
+    return float(match.group(1)) if match else None
+
+
+class Gauges:
+    """Laptop headroom readings. Memory is a subprocess, so it is cached for ``gauge_ttl_s``."""
+
+    def __init__(self, *, memory=memory_free_pct, loadavg=os.getloadavg, cpus=os.cpu_count,
+                 clock=time.time):
+        self.memory = memory
+        self.loadavg = loadavg
+        self.cpus = cpus
+        self.clock = clock
+        self._free: float | None = None
+        self._free_at: float | None = None
+
+    def read(self, ttl_s: float) -> tuple[float | None, float | None]:
+        """(memory free percent, 1-minute load per CPU); each is None when unreadable."""
+        now = self.clock()
+        if self._free_at is None or now - self._free_at >= ttl_s:
+            self._free = self.memory()
+            self._free_at = now
+        try:
+            load = self.loadavg()[0] / (self.cpus() or 1)
+        except (OSError, IndexError):
+            load = None
+        return self._free, load
 
 
 def queue_rank(job: dict, now: float) -> int:
@@ -405,19 +523,21 @@ def cancel(conn, job: dict, now: float) -> str | None:
         else:
             action = "process already gone"
     moved = db.transition(conn, job["id"], OPEN, now, "cancel", action,
-                          state="cancelled", finished_at=now)  # fmt: skip
+                          state="cancelled", finished_at=now, detail=None)  # fmt: skip
     return action if moved else None
 
 
 class Broker:
     """One broker over one agentq home. ``launcher``, ``now`` and ``proxy`` are injectable."""
 
-    def __init__(self, home, *, launcher=None, now=time.time, proxy=None):
+    def __init__(self, home, *, launcher=None, now=time.time, proxy=None, gauges=None):
         self.home = Path(home)
         self.launcher = launcher or run_worker_launcher
         self.now = now
         self.proxy = proxy or proxy_status
+        self.gauges = gauges or Gauges(clock=now)
         self._saturated_last = False
+        self._holds: dict[str, tuple[str, str]] = {}
 
     def log(self, message: str) -> None:
         log_line(self.home, message)
@@ -428,7 +548,7 @@ class Broker:
         try:
             now = self.now()
             self.reconcile(conn, now)
-            launched = self.launch_ready(conn, now, saturated=self._is_saturated())
+            launched = self.launch_ready(conn, now, status=self._proxy_status())
         finally:
             conn.close()
         write_heartbeat(self.home)
@@ -452,51 +572,99 @@ class Broker:
         for job in db.select_jobs(conn, "state = 'running'"):
             self._reconcile_one(conn, job, now)
 
-    def launch_ready(self, conn, now: float, saturated: bool = False) -> list[str]:
+    def launch_ready(self, conn, now: float, status: dict | None = None) -> list[str]:
+        """Launch every ready job that passes its gates. ``status`` is the proxy status, or None."""
         cfg = load_config(self.home)
+        adaptive = cfg["adaptive"]
+        on = adaptive["enabled"]
         running = db.select_jobs(conn, "state = 'running'")
         ready = [
             job for job in db.select_jobs(conn, "state = 'queued'") if job["not_before"] <= now
         ]
         slots_free = dict(cfg["slots"])
         tier_used: dict[str, int] = {}
+        res_used: dict[str, int] = {}
         for job in running:
             slots_free[job["res"]] = slots_free.get(job["res"], 0) - 1
             tier_used[job["tier"]] = tier_used.get(job["tier"], 0) + 1
+            res_used[job["res"]] = res_used.get(job["res"], 0) + 1
         busy_workspaces = {job["workspace"] for job in running if job["kind"] == "write"}
         urgent_running = sum(1 for job in running if job["lane"] == "urgent")
         urgent_cap = max(1, sum(cfg["slots"].values()) // 2)
         others_waiting = any(job["lane"] != "urgent" for job in ready)
+        saturated = bool(status and status.get("saturated"))
+        gauge_reading: list[tuple] = []
+
+        def laptop() -> tuple:
+            if not gauge_reading:
+                gauge_reading.append(self.gauges.read(adaptive["gauge_ttl_s"]))
+            return gauge_reading[0]
+
+        holds: dict[str, tuple[str, str]] = {}
         launched: list[str] = []
         for job in order_queue(ready, now):
-            if saturated and job["lane"] == "backlog":
-                continue
-            if job["lane"] == "urgent" and others_waiting and urgent_running >= urgent_cap:
-                continue
-            if job["kind"] == "write" and job["workspace"] in busy_workspaces:
-                continue
-            if slots_free.get(job["res"], 0) <= 0:
-                continue
+            name, reason = job["res"], None
+            if on:
+                reason = morph_hold(job["tier"], job["lane"], status, adaptive["max_waiting_requests"])
+                if reason:
+                    name = job["tier"]
+            elif saturated and job["lane"] == "backlog":
+                name, reason = job["tier"], "proxy saturated"
+            if reason is None and job["lane"] == "urgent" and others_waiting and urgent_running >= urgent_cap:
+                reason = "urgent share full"
+            if reason is None and job["kind"] == "write" and job["workspace"] in busy_workspaces:
+                reason = "workspace busy"
+            if reason is None and slots_free.get(job["res"], 0) <= 0:
+                reason = "slots full"
             tier_cap = cfg["tiers"].get(job["tier"])
-            if tier_cap is not None and tier_used.get(job["tier"], 0) >= tier_cap:
+            if reason is None and tier_cap is not None and tier_used.get(job["tier"], 0) >= tier_cap:
+                name, reason = job["tier"], "tier cap full"
+            if reason is None and on and job["res"] in LAPTOP_GATED:
+                reason = laptop_hold(job["res"], laptop(), res_used.get("tests", 0), adaptive)
+            if reason:
+                holds[job["id"]] = (name, reason)
                 continue
             slots_free[job["res"]] -= 1
             tier_used[job["tier"]] = tier_used.get(job["tier"], 0) + 1
+            res_used[job["res"]] = res_used.get(job["res"], 0) + 1
             if job["kind"] == "write":
                 busy_workspaces.add(job["workspace"])
             if job["lane"] == "urgent":
                 urgent_running += 1
             if self._launch(conn, job, now):
                 launched.append(job["id"])
+            self._holds.pop(job["id"], None)
+        self._record_holds(conn, now, ready, holds)
         return launched
 
-    def _is_saturated(self) -> bool:
+    def _record_holds(self, conn, now: float, ready: list[dict], holds: dict) -> None:
+        """Write each queued job's hold reason to ``jobs.detail`` and log it, only when it changes."""
+        ready_ids = {job["id"] for job in ready}
+        for job_id in [job_id for job_id in self._holds if job_id not in ready_ids]:
+            del self._holds[job_id]
+            db.transition(conn, job_id, ("queued",), now, None, "", detail=None)
+        for job in ready:
+            job_id = job["id"]
+            hold = holds.get(job_id)
+            if hold == self._holds.get(job_id):
+                continue
+            if hold is None:
+                self._holds.pop(job_id, None)
+                db.transition(conn, job_id, ("queued",), now, None, "", detail=None)
+                continue
+            self._holds[job_id] = hold
+            text = f"hold {hold[0]}: {hold[1]}"
+            db.transition(conn, job_id, ("queued",), now, None, "", detail=text)
+            self.log(f"{text} (job {job_id})")
+
+    def _proxy_status(self) -> dict | None:
+        """The proxy status for this tick (None when down). Logs each change of its saturated flag."""
         status = self.proxy()
         saturated = bool(status and status.get("saturated"))
         if saturated != self._saturated_last:
             self.log(f"proxy saturated={saturated}")
         self._saturated_last = saturated
-        return saturated
+        return status
 
     def _move(self, conn, job_id: str, from_states, now: float, kind: str | None, note: str, **fields) -> bool:
         moved = db.transition(conn, job_id, from_states, now, kind, note, **fields)
@@ -631,6 +799,7 @@ class Broker:
         if not self._move(
             conn, job["id"], ("queued",), now, "launch", f"tier {job['tier']} attempt {job['attempt'] + 1}",
             state="running", run_dir=str(run_dir), pid=None, pgid=None, pid_start=None, started_at=now,
+            detail=None,
         ):  # fmt: skip
             return False
         env = dict(os.environ, AGENTQ_JOB=job["id"], AGENTQ_HOME=str(self.home))
