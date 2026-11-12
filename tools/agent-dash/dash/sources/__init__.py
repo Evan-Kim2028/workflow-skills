@@ -58,9 +58,11 @@ BACKOFF_AFTER = 3
 BACKOFF_MAX_S = 300.0
 
 # Cadence policy, read from cfg. ``load_cfg`` supplies the production defaults
-# (floor 15 s, idle after 300 s, factor 8, 3 concurrent polls). A cfg without
-# these keys keeps each source's declared interval, no idle mode and no cap.
+# (floor 15 s, duty factor 8, idle after 300 s, idle factor 8, 2 concurrent
+# polls). A cfg without these keys keeps each source's declared interval, the
+# old duty gap of 2 x its last duration, no idle mode and no cap.
 IDLE_FACTOR_DEFAULT = 8.0
+DUTY_FACTOR_DEFAULT = 2.0
 
 
 def _cfg_number(cfg, key: str):
@@ -74,6 +76,17 @@ def poll_floor_s(cfg) -> float:
     """``poll_interval_floor_s``: no source polls more often than this."""
     value = _cfg_number(cfg, "poll_interval_floor_s")
     return max(0.0, value) if value is not None else 0.0
+
+
+def poll_duty_factor(cfg) -> float:
+    """``poll_duty_factor``: the gap is at least this many times the last poll's duration.
+
+    A source that is polled again only after ``factor x duration`` scans for
+    about ``1 / factor`` of the wall time (start-to-start gap). 0 leaves only
+    the interval.
+    """
+    value = _cfg_number(cfg, "poll_duty_factor")
+    return max(0.0, value) if value is not None else DUTY_FACTOR_DEFAULT
 
 
 def idle_after_s(cfg):
@@ -119,6 +132,14 @@ def _stall_base(source, state: dict) -> float:
     except (TypeError, ValueError):
         gap = 0.0
     return max(_interval_s(source), gap)
+
+
+def _next_due_in(state: dict, now: float):
+    """Seconds until a non-signal source's next scheduled start, or None (signal-driven or not yet scheduled)."""
+    next_due = state.get("next_due")
+    if next_due is None:
+        return None
+    return max(0.0, float(next_due) - now)
 
 
 def _alive(thread) -> bool:
@@ -383,6 +404,7 @@ class Registry:
                     "last_duration_s": state.get("last_duration_s"),
                     "interval_s": source.INTERVAL_S,
                     "effective_interval_s": effective_interval_s(source, cfg_seen, mult),
+                    "next_due_in_s": _next_due_in(state, now),
                     "idle": idle_now,
                     "stalled": stalled,
                     "state": name,
@@ -402,6 +424,7 @@ class Registry:
             "sources": sources,
             "slow_sources": slow,
             "idle_mode": idle_now,
+            "duty_factor": poll_duty_factor(cfg_seen),
             "wake_pending": wake_pending,
             "polls_running": running,
             "max_concurrent_polls": cap,
@@ -564,18 +587,20 @@ def signal_token(source, cfg):
 
 
 def _set_next_due(source, state: dict, now: float, duration: float, cfg=None, mult: float = 1.0) -> None:
-    """Earliest next start for a source without signals: twice its own duration.
+    """Earliest next start for a source without signals: ``poll_duty_factor`` x its duration.
 
     A poll that outlasts its interval is due again the moment it returns, so
     a heavy source ran back to back and contended on the store lock. The
-    delay is measured from the poll start (``now``), so a source gets at
-    least its own duration of quiet between starts. The floor and the idle
-    multiplier scale the whole gap. Signal-backed sources keep their signal
-    and dormant-backoff cadence.
+    delay is measured from the poll start (``now``): the gap is at least
+    ``poll_duty_factor`` times the last duration, so the source scans for
+    about ``1 / factor`` of the wall time. The floor and the idle multiplier
+    scale the whole gap. Signal-backed sources keep their signal and
+    dormant-backoff cadence; they never read the duration.
     """
     if declares_signals(source):
         return
-    gap = max(effective_interval_s(source, cfg), duration * 2.0) * mult
+    factor = poll_duty_factor(cfg)
+    gap = max(effective_interval_s(source, cfg), duration * factor) * mult
     state["next_due"] = now + gap
     state["gap_s"] = gap
 

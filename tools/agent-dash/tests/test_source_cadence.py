@@ -26,8 +26,9 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+import agent_dash  # noqa: E402
 from dash.server import DashServer  # noqa: E402
-from dash.sources import Registry, effective_interval_s  # noqa: E402
+from dash.sources import Registry, _set_next_due, effective_interval_s, max_concurrent_polls  # noqa: E402
 
 T0 = 1_792_000_000.0
 
@@ -259,6 +260,60 @@ class HealthFieldTests(unittest.TestCase):
         self.assertEqual(body["polls_running"], 0)
         self.assertEqual(body["max_concurrent_polls"], 3)
         self.assertTrue(reg.health(T0 + 400)["idle_mode"])
+
+
+class DutyFactorTests(unittest.TestCase):
+    def _gap(self, cfg, duration, mult=1.0, interval=2):
+        src = _Source("slow", interval)
+        state = Registry([src]).state["slow"]
+        _set_next_due(src, state, T0, duration, cfg, mult)
+        return state["next_due"] - T0
+
+    def test_gap_is_factor_times_the_last_duration(self):
+        self.assertEqual(self._gap({"poll_duty_factor": 8}, 10.0), 80.0)
+
+    def test_duty_is_one_over_the_factor(self):
+        for factor in (2, 4, 8):
+            gap = self._gap({"poll_duty_factor": factor}, 10.0)
+            self.assertAlmostEqual(10.0 / gap, 1.0 / factor)
+
+    def test_factor_2_and_the_absent_key_restore_the_old_gap(self):
+        self.assertEqual(self._gap({"poll_duty_factor": 2}, 10.0), 20.0)
+        self.assertEqual(self._gap({}, 10.0), 20.0)
+
+    def test_factor_0_leaves_only_the_interval(self):
+        self.assertEqual(self._gap({"poll_duty_factor": 0}, 10.0), 2.0)
+
+    def test_floor_still_applies_under_the_factor(self):
+        self.assertEqual(self._gap({"poll_duty_factor": 8, "poll_interval_floor_s": 15}, 1.0), 15.0)
+
+    def test_idle_multiplier_applies_on_top_of_the_factor(self):
+        self.assertEqual(self._gap({"poll_duty_factor": 8}, 10.0, mult=8.0), 640.0)
+
+    def test_signal_driven_sources_do_not_read_the_duration(self):
+        src = _Source("sig", 2)
+        src.signal_paths = lambda cfg: []
+        state = Registry([src]).state["sig"]
+        _set_next_due(src, state, T0, 10.0, {"poll_duty_factor": 8}, 1.0)
+        self.assertIsNone(state.get("next_due"))
+
+    def test_health_reports_the_factor_and_time_to_next_start(self):
+        src = _Source("fast", 2)
+        reg = Registry([src])
+        reg._born = T0 - 3600
+        cfg = {"poll_duty_factor": 8, "poll_interval_floor_s": 15}
+        reg.tick(None, cfg, T0)
+        _join_all(reg)
+        body = reg.health(T0 + 5)
+        self.assertEqual(body["duty_factor"], 8)
+        self.assertAlmostEqual(body["sources"][0]["next_due_in_s"], 10.0, places=2)
+        self.assertEqual(reg.health(T0 + 100)["sources"][0]["next_due_in_s"], 0.0)
+
+    def test_production_defaults_are_factor_8_and_two_slots(self):
+        cfg = agent_dash.load_cfg()
+        self.assertEqual(cfg["poll_duty_factor"], 8)
+        self.assertEqual(cfg["max_concurrent_polls"], 2)
+        self.assertIsNone(max_concurrent_polls({}))
 
 
 class RequestActivityTests(unittest.TestCase):
