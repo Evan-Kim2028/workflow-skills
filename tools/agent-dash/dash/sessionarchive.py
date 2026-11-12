@@ -776,6 +776,8 @@ def verify_archive(path: str, records: list[dict]) -> None:
                     digest.update(chunk)
                     size += len(chunk)
                 seen[info.name] = (size, digest.hexdigest())
+        while proc.stdout.read(READ_CHUNK):
+            pass
     finally:
         proc.stdout.close()
         rc = proc.wait()
