@@ -15,6 +15,11 @@ ancestors. Fast-forward merges read as fresh and are kept; that is the
 safe direction, and ``git branch -d`` would refuse nothing here because
 removal is skipped first.
 
+A detached HEAD has no branch, so its proof is simpler: the HEAD commit
+is an ancestor of the main ref, which means nothing on it is missing from
+main. Such a worktree is reaped under the same clean, idle, process and
+age guards, and no branch is deleted for it.
+
 Removal uses ``git worktree remove`` without ``--force`` and
 ``git branch -d`` without ``-D``, so git itself refuses anything
 unexpected. Process checks read per-process cwd entries with bounded
@@ -41,15 +46,16 @@ WORKTREES_USAGE = """agent-dash worktrees reaper
 Dry-run by default: prints what would go, removes nothing. Pass --apply
 to remove worktrees and delete their branches. Every guard must hold:
 clean status, branch merged into origin/main with a real contribution
-(or a merged pull request), no process cwd or command line points at
-it, older than --min-age (default 3h, the worker timeout), and not on
-the skip list. Durations look like 30s, 90m, 3h, 2d, or bare seconds.
+(or a merged pull request; a detached HEAD on origin/main), no process
+cwd or command line points at it, older than --min-age (default 3h, the
+worker timeout), and not on the skip list. Durations look like 30s, 90m, 3h, 2d, or bare seconds.
 """
 
 MAIN_REF = "origin/main"
 DEFAULT_MIN_AGE_S = 3.0 * 3600.0
 GIT_TIMEOUT_S = 30
-GH_TIMEOUT_S = 15
+GH_TIMEOUT_S = 60
+MERGED_PR_LOOKBACK = 1000
 PS_TIMEOUT_S = 10
 MAX_PIDS = 4096
 
@@ -114,9 +120,13 @@ def list_worktrees(repo: str | Path) -> list[dict]:
             current = {
                 "path": os.path.realpath(line[len("worktree "):].strip()),
                 "branch": None,
+                "head": None,
                 "bare": False,
                 "detached": False,
             }
+        elif line.startswith("HEAD "):
+            if current is not None:
+                current["head"] = line[len("HEAD "):].strip() or None
         elif line == "bare":
             if current is not None:
                 current["bare"] = True
@@ -196,26 +206,45 @@ def first_parent_set(repo: str | Path, ref: str = MAIN_REF) -> set[str] | None:
     return set((proc.stdout or "").split())
 
 
-def gh_pr_merged(repo: str | Path, branch: str) -> bool:
-    """True when ``gh`` reports a merged pull request for ``branch``."""
+_MERGED_HEADS: dict[str, frozenset[str]] = {}
+
+
+def merged_pr_heads(repo: str | Path) -> frozenset[str]:
+    """Head branch names of the recent merged pull requests, one ``gh`` call per repo per run.
+
+    A failed or timed-out lookup reads as no merged pull requests, which
+    keeps worktrees rather than removing them. The result is cached for the
+    life of the process, so a sweep of hundreds of worktrees costs one call.
+    """
+    key = os.path.realpath(str(repo))
+    if key in _MERGED_HEADS:
+        return _MERGED_HEADS[key]
+    heads: frozenset[str] = frozenset()
     try:
         proc = subprocess.run(
-            ["gh", "pr", "list", "--state", "merged", "--head", branch, "--json", "number", "--limit", "1"],
+            ["gh", "pr", "list", "--state", "merged", "--limit", str(MERGED_PR_LOOKBACK),
+             "--json", "headRefName"],
             check=False,
             capture_output=True,
             text=True,
             timeout=GH_TIMEOUT_S,
             cwd=str(repo),
         )
-    except (OSError, subprocess.TimeoutExpired):
-        return False
-    if proc.returncode != 0:
-        return False
-    try:
-        payload = json.loads(proc.stdout or "[]")
-    except ValueError:
-        return False
-    return isinstance(payload, list) and len(payload) > 0
+        if proc.returncode == 0:
+            payload = json.loads(proc.stdout or "[]")
+            if isinstance(payload, list):
+                heads = frozenset(
+                    str(item.get("headRefName", "")) for item in payload if isinstance(item, dict)
+                )
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        heads = frozenset()
+    _MERGED_HEADS[key] = heads
+    return heads
+
+
+def gh_pr_merged(repo: str | Path, branch: str) -> bool:
+    """True when a merged pull request has ``branch`` as its head."""
+    return branch in merged_pr_heads(repo)
 
 
 def merged_state(repo: str | Path, branch: str) -> tuple[bool, str]:
@@ -236,6 +265,13 @@ def merged_state(repo: str | Path, branch: str) -> tuple[bool, str]:
     if gh_pr_merged(repo, branch):
         return True, "pull request merged for " + branch
     return False, "tip is not an ancestor of " + MAIN_REF + " (unmerged)"
+
+
+def detached_state(repo: str | Path, head: str) -> tuple[bool, str]:
+    """Merged verdict for a detached HEAD: its commit is already on the main ref."""
+    if is_ancestor(repo, head):
+        return True, "detached HEAD is an ancestor of " + MAIN_REF
+    return False, "detached HEAD is not on " + MAIN_REF + " (unmerged)"
 
 
 def _proc_pids() -> list[int]:
@@ -411,13 +447,11 @@ def decide(
     path = entry.get("path", "")
     branch = entry.get("branch")
     row = {"path": path, "branch": branch or "-", "decision": "keep", "reason": ""}
-    if not branch:
-        if entry.get("bare"):
-            row["reason"] = "bare entry holds no checkout"
-        elif entry.get("detached"):
-            row["reason"] = "detached HEAD has no branch to verify"
-        else:
-            row["reason"] = "no branch to verify"
+    if entry.get("bare"):
+        row["reason"] = "bare entry holds no checkout"
+        return row
+    if not branch and not entry.get("head"):
+        row["reason"] = "no branch or HEAD to verify"
         return row
     if path == top:
         row["reason"] = "is the main checkout"
@@ -445,7 +479,10 @@ def decide(
     if age < min_age_s:
         row["reason"] = "younger than the minimum age"
         return row
-    merged, why = merged_state(repo, branch)
+    if branch:
+        merged, why = merged_state(repo, branch)
+    else:
+        merged, why = detached_state(repo, entry["head"])
     if not merged:
         row["reason"] = why
         return row
@@ -511,6 +548,9 @@ def apply_reaps(top: str, rows: list[dict], dry_run: bool) -> list[dict]:
             row["reason"] = detail
             continue
         branch = row.get("branch", "")
+        if branch in ("", "-"):
+            row["reason"] = "removed detached worktree; no branch to delete"
+            continue
         good, gone = delete_branch(top, branch)
         if good:
             row["reason"] = "removed worktree and deleted branch"
