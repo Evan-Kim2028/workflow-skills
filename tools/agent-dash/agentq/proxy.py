@@ -48,6 +48,7 @@ DEFAULT_CONFIG = {
     "window_s": 60.0,
     "start_target": 0.95,
     "target_floor": 0.6,
+    "target_ceiling": 1.5,
     "target_cut": 0.97,
     "target_step_up": 0.02,
     "default_output_tokens": 800,
@@ -467,7 +468,8 @@ class Governor:
                 continue
             budget.limit = int(spec.get("limit", budget.limit))
             floor = float(self.config["target_floor"])
-            budget.target = min(1.0, max(floor, float(spec.get("target_frac", budget.target))))
+            ceiling = float(self.config.get("target_ceiling", 1.0))
+            budget.target = min(ceiling, max(floor, float(spec.get("target_frac", budget.target))))
 
     def snapshot_state(self) -> dict:
         return {
@@ -747,10 +749,11 @@ class Governor:
         now = self.clock()
         window = self.window
         step = float(self.config["target_step_up"])
+        ceiling = float(self.config.get("target_ceiling", 1.0))
         for budget in self.budgets.values():
             quiet = now - budget.last_429 >= window and now - budget.last_grow >= window
-            if budget.saturated and budget.target < 1.0 and quiet:
-                budget.target = min(1.0, budget.target + step)
+            if budget.saturated and budget.target < ceiling and quiet:
+                budget.target = min(ceiling, budget.target + step)
                 budget.last_grow = now
                 self.state_dirty = True
                 self.log("target_raised", budget=budget.name, target=round(budget.target, 4))

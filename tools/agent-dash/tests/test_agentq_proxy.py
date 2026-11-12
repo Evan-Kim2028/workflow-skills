@@ -756,6 +756,57 @@ class EstimateTest(unittest.TestCase):
         self.assertIsNone(parse_stated_limit('{"code":"service_overloaded"}'))
 
 
+class TargetCeilingTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.home = Path(self.tmp.name) / "agentq"
+        self.home.mkdir(parents=True)
+        self.now = [1000.0]
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def governor(self, config: dict) -> Governor:
+        return Governor(self.home, config, clock=lambda: self.now[0], log=quiet)
+
+    def test_tick_raises_past_one_and_stops_at_the_ceiling(self) -> None:
+        gov = self.governor(config_with())
+        output = gov.budgets["output"]
+        output.target = 1.4
+        output.saturated = True
+        self.now[0] += 60
+        gov.tick()
+        self.assertAlmostEqual(output.target, 1.42, places=6)
+        for _ in range(10):
+            self.now[0] += 60
+            gov.tick()
+        self.assertEqual(output.target, 1.5)
+
+    def test_tick_stops_at_one_when_an_older_config_has_no_ceiling(self) -> None:
+        config = config_with()
+        del config["target_ceiling"]
+        gov = self.governor(config)
+        output = gov.budgets["output"]
+        output.target = 0.99
+        output.saturated = True
+        self.now[0] += 60
+        gov.tick()
+        self.assertEqual(output.target, 1.0)
+
+    def test_429_above_one_cuts_by_target_cut(self) -> None:
+        gov = self.governor(config_with())
+        gov.budgets["output"].target = 1.4
+        gov.learn_from_429(make_ticket(gov, max_tokens=800), "Limit: 60000 output tokens/minute.")
+        self.assertAlmostEqual(gov.budgets["output"].target, 1.4 * 0.97, places=6)
+
+    def test_state_file_target_clamps_to_floor_and_ceiling(self) -> None:
+        state = {"budgets": {"output": {"target_frac": 1.3}, "total": {"target_frac": 9.0}}}
+        (self.home / "proxy_state.json").write_text(json.dumps(state))
+        gov = self.governor(config_with())
+        self.assertEqual(gov.budgets["output"].target, 1.3)
+        self.assertEqual(gov.budgets["total"].target, 1.5)
+
+
 class StateTest(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
