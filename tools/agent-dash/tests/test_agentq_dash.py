@@ -1311,7 +1311,7 @@ class LimitedByTest(unittest.TestCase):
         self.assertEqual(result["chip"], "Laptop")
         self.assertEqual(
             result["text"],
-            "1 DeepSeek jobs held for laptop headroom: 1 light job (CPU 95% busy, limit 92%).",
+            "1 light job waiting for laptop headroom (CPU 95% busy, limit 92%).",
         )
 
     def test_a_ready_job_held_on_a_proxy_budget_is_not_a_laptop_verdict_even_under_pressure(self) -> None:
@@ -1371,13 +1371,13 @@ class LimitedByTest(unittest.TestCase):
     def test_proxy_pacing_names_the_deepseek_budget_with_waiting_requests(self) -> None:
         result = verdict_for(five_minutes(total=4_100_000), live=live_queued(total=2))
         self.assertEqual(result["key"], "proxy_pacing")
-        self.assertEqual(result["chip"], "Proxy pacing")
-        self.assertEqual(result["text"], "Proxy pacing: DeepSeek requests are waiting on Total pool while the pool is at 41%.")
+        self.assertEqual(result["chip"], "Proxy waiting")
+        self.assertEqual(result["text"], "DeepSeek requests are waiting at the proxy on Total pool while the pool is at 41%.")
 
     def test_proxy_pacing_names_deepseek_uncached_input_when_that_budget_waits(self) -> None:
         result = verdict_for(five_minutes(total=4_100_000), live=live_queued(uncached_ds=3))
         self.assertEqual(result["key"], "proxy_pacing")
-        self.assertIn("waiting on DeepSeek uncached input", result["text"])
+        self.assertIn("waiting at the proxy on DeepSeek uncached input", result["text"])
 
     def test_a_waiting_kimi_request_is_not_deepseek_pacing(self) -> None:
         live = live_queued(total=1, uncached=1)
@@ -1410,9 +1410,9 @@ class LimitedByTest(unittest.TestCase):
         self.assertEqual(result["chip"], "Laptop")
         self.assertEqual(
             result["text"],
-            "6 DeepSeek jobs held for laptop headroom: 4 test jobs (CPU 90% busy, limit 80%); "
-            "2 jobs waiting for a production ssh slot (8 in use).",
+            "4 test jobs waiting for laptop headroom (CPU 90% busy, limit 80%).",
         )
+        self.assertEqual(result["secondary"], "Also: 2 jobs waiting for a production ssh slot (8 in use).")
 
     def test_all_jobs_held_on_ssh_slots_name_the_ssh_chip(self) -> None:
         result = dash.verdict(
@@ -1438,7 +1438,11 @@ class LimitedByTest(unittest.TestCase):
             ds_holds=["hold pi-deepseek-flash: proxy total waiting 3 > 0"],
         )
         self.assertEqual(held_proxy["key"], "held_proxy")
-        self.assertEqual(held_proxy["chip"], "Proxy pacing")
+        self.assertEqual(held_proxy["chip"], "Proxy waiting")
+        self.assertEqual(
+            held_proxy["text"],
+            "1 DeepSeek job waiting to launch behind 3 requests waiting at the proxy on the Morph total pool.",
+        )
 
     def test_headroom_when_the_pool_is_below_85_and_nothing_waits(self) -> None:
         result = verdict_for(five_minutes(total=4_100_000))
@@ -1546,7 +1550,7 @@ class SummaryVerdictTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             home = make_home(Path(tmp))
             summary = dash.build_summary(home, 6, now=NOW, fetch_live=proxy_status, laptop=CALM)
-        self.assertIn(summary["verdict"]["key"], {"morph_limit", "morph_slow", "laptop", "near_capacity", "proxy_pacing", "launching", "headroom", "held_laptop", "held_ssh", "held_proxy", "held_workspace", "held_other"})
+        self.assertIn(summary["verdict"]["key"], {"morph_limit", "morph_slow", "laptop", "near_capacity", "proxy_pacing", "launching", "headroom", "held_pacing", "held_laptop", "held_ssh", "held_slots", "held_proxy", "held_workspace", "held_tier", "held_other"})
         self.assertIn("text", summary["room"])
         self.assertIn("tokens_5m", summary["activity"])
         self.assertEqual(summary["token_bucket_s"], 300)
@@ -2481,3 +2485,84 @@ class LogPollingTest(unittest.TestCase):
         start = html.index("function refreshLog()")
         self.assertIn("log.fetchedAt = Date.now();", html[start:start + 200])
         self.assertIn("if (Date.now() - log.fetchedAt >= LOG_POLL_MS) refreshLog();", html)
+
+
+LIVE_PACING_DETAILS = [
+    "hold proxy: proxy uncached pacing: 34,977 uncached this minute (store), 0 pending launch(es) at 40,000 each, cap 320,000",
+    "hold proxy: proxy uncached pacing: 120,445 uncached this minute (store), 0 pending launch(es) at 40,000 each, cap 320,000",
+    "hold proxy: proxy uncached pacing: 242,985 uncached this minute (store), 0 pending launch(es) at 40,000 each, cap 320,000",
+    "hold proxy: proxy uncached pacing: 184,363 uncached this minute (store), 0 pending launch(es) at 40,000 each, cap 320,000",
+    "hold proxy: proxy uncached pacing: 165,352 uncached this minute (store), 0 pending launch(es) at 40,000 each, cap 320,000",
+    "hold proxy: proxy uncached pacing: 32,300 uncached this minute (proxy), 0 pending launch(es) at 40,000 each, cap 320,000",
+    "hold proxy: proxy uncached pacing: 207,010 uncached this minute (proxy), 0 pending launch(es) at 40,000 each, cap 320,000",
+    "hold proxy: proxy uncached pacing: 98,533 uncached this minute (proxy), 0 pending launch(es) at 40,000 each, cap 320,000",
+]
+# The live queue held eight distinct strings; the owner's report named seventeen. The other nine follow the same template.
+SYNTHESIZED_PACING_DETAILS = [
+    f"hold proxy: proxy uncached pacing: {current:,} uncached this minute ({source}), 0 pending launch(es) at 40,000 each, cap 320,000"
+    for current, source in (
+        (11_204, "store"), (18_870, "proxy"), (26_417, "store"), (41_992, "proxy"), (57_618, "store"),
+        (66_301, "proxy"), (79_455, "store"), (88_016, "proxy"), (101_739, "store"),
+    )
+]
+
+
+class HeadlineCleanTest(unittest.TestCase):
+    def verdict_with(self, details, ssh_in_use=8, **kwargs):
+        return dash.verdict(
+            five_minutes(total=4_100_000), UNTIL, LIMITS_NOW, IDLE_LIVE, kimi_jobs_waiting=0, budget_429s={},
+            laptop=CALM, ds_jobs_ready=len(details), slow=None, ds_holds=details, ssh_in_use=ssh_in_use, **kwargs,
+        )
+
+    def test_seventeen_live_pacing_strings_make_one_clause_with_count_seventeen(self) -> None:
+        details = LIVE_PACING_DETAILS + SYNTHESIZED_PACING_DETAILS
+        self.assertEqual(len(set(details)), 17)
+        rows = dash.hold_summary(details, 8)
+        self.assertEqual([(group, count) for group, _key, count, _clause in rows], [("pacing", 17)])
+        result = self.verdict_with(details)
+        self.assertEqual(result["key"], "held_pacing")
+        self.assertEqual(result["chip"], "Launch pacing")
+        self.assertEqual(
+            result["text"],
+            "Launch pacing: 17 DeepSeek jobs waiting to launch under Morph's uncached-input limit "
+            "(243k of 320k this minute).",
+        )
+        self.assertIsNone(result["secondary"])
+        self.assertNotIn("proxy", result["text"].lower())
+
+    def test_mixed_holds_put_the_biggest_first_and_never_exceed_three_clauses(self) -> None:
+        details = (
+            LIVE_PACING_DETAILS + SYNTHESIZED_PACING_DETAILS
+            + ["hold tests: cpu 90% busy >= 80%"] * 4
+            + ["hold ssh: slots full"] * 3
+            + ["hold pi-deepseek-flash: workspace busy"] * 2
+            + ["hold pi-deepseek-flash: proxy total waiting 3 > 2"]
+            + ["hold pi-deepseek-flash: tier cap full"]
+        )
+        result = self.verdict_with(details)
+        self.assertTrue(result["text"].startswith("Launch pacing: 17 DeepSeek jobs"))
+        self.assertTrue(result["secondary"].startswith("Also: 4 test jobs waiting for laptop headroom"))
+        clauses = [result["text"]] + result["secondary"][len("Also: "):].rstrip(".").split("; ")
+        self.assertEqual(len(clauses), 3, clauses)
+        self.assertNotIn("workspace", " ".join(clauses))
+        self.assertNotIn("Worker pool", result["secondary"])
+
+    def test_proxy_held_jobs_say_waiting_at_the_proxy_and_launch_held_jobs_do_not(self) -> None:
+        proxy = self.verdict_with(["hold pi-deepseek-flash: proxy total waiting 9 > 8"])
+        self.assertIn("requests waiting at the proxy", proxy["text"])
+        self.assertEqual(proxy["chip"], "Proxy waiting")
+        launch = self.verdict_with(LIVE_PACING_DETAILS[:1])
+        self.assertIn("waiting to launch", launch["text"])
+        self.assertNotIn("at the proxy", launch["text"])
+        self.assertEqual(launch["chip"], "Launch pacing")
+
+    def test_the_pacing_clause_names_the_largest_current_figure_across_the_group(self) -> None:
+        result = self.verdict_with(LIVE_PACING_DETAILS[:3])
+        self.assertIn("(243k of 320k this minute)", result["text"])
+
+    def test_the_room_line_is_still_one_line(self) -> None:
+        room = dash.room(five_minutes(total=1_000_000, ds_uncached=100_000), UNTIL, LIMITS_NOW,
+                         active_ds_workers=10, laptop=CALM)
+        self.assertNotIn("\n", room["text"])
+
+
